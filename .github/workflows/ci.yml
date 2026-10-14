@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test-core:
+    # The pure detection core and the RTPS parser build and test without a
+    # kernel or a robot, so CI runs them on a stock runner.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test pure core
+        run: cargo test -p robodr-events
+      - name: Test RTPS parser
+        run: cargo test -p robodr-sensor-ros2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy (core crates)
+        run: cargo clippy -p robodr-events -p robodr-sensor-ros2 -- -D warnings

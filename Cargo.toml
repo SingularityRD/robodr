@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/robodr-events",
+    "crates/robodr-sensor-ros2",
+]
+# Pulsar is a git submodule with its own workspace; keep it out of ours.
+exclude = ["vendor"]
+
+[workspace.package]
+version = "0.1.0-alpha.1"
+edition = "2021"
+license = "Apache-2.0 WITH BPF probes exception under GPL-2.0"
+repository = "https://github.com/SingularityRD/robodr"
+authors = ["Singularity RD"]
+
+[workspace.dependencies]
+# RoboDR crates
+robodr-events = { path = "crates/robodr-events" }
+
+# Pulsar is vendored as a git submodule under vendor/pulsar (see README).
+# We build on pulsar-core's module ABI (PulsarModule / SimplePulsarModule).
+pulsar-core = { path = "vendor/pulsar/crates/pulsar-core" }
+
+# External
+anyhow = "1"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
+
+[profile.release]
+# Runs on a robot controller: favour small, predictable binaries.
+opt-level = 2
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

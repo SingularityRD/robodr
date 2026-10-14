@@ -1,0 +1,3 @@
+[submodule "vendor/pulsar"]
+	path = vendor/pulsar
+	url = https://github.com/exein-io/pulsar

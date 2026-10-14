@@ -1,0 +1,19 @@
+{
+  "model": "amr-forklift-v2",
+  "locked": false,
+  "participants": [
+    "0103a5f21b4c7d8e9f001122"
+  ],
+  "writer_topics": [
+    "/cmd_vel",
+    "/odom",
+    "/tf",
+    "/scan"
+  ],
+  "motion_envelopes": {
+    "/cmd_vel": {
+      "max_linear_speed": 0.5,
+      "max_joint_speed": null
+    }
+  }
+}

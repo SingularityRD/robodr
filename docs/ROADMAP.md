@@ -1,0 +1,224 @@
+# RoboDR engineering roadmap
+
+This is the build plan: what we are defending against, the architecture, the
+components in dependency order, and the phases with their exit criteria. It is
+written to be executed, not admired — every phase ends in something that runs on
+a real robot and something a customer can see.
+
+The guiding principle is **earn each layer**. We ship the smallest thing that
+protects a real robot against a real, demonstrated attack, then widen. We do not
+build the foundation model before we have the telemetry to train it, and we do
+not build inline enforcement before passive detection is trusted on a line.
+
+---
+
+## 0. The threat landscape we are building against
+
+Every component below traces to a demonstrated attack. This is the evidence base
+that makes RoboDR a response to reality, not a feature list.
+
+| Attack | What it showed | RoboDR answer |
+|---|---|---|
+| **RoboPAIR** (Robey et al., 2024) | Jailbreaking an LLM planner drove a Unitree Go2, a Clearpath Jackal and an NVIDIA self-driving stack to harmful physical actions, often at 100% success. | Motion Firewall: the planner's output is checked against a physical envelope regardless of how it was produced. |
+| **UniPwn** (Makris & Finisterre, 2025) | Hardcoded BLE keys gave root on Unitree Go2/B2/G1/H1; wormable across a fleet over the air. | Attestation (catch rooted/modified firmware), network sensor (catch the BLE/Wi-Fi setup path and lateral scan). |
+| **Secure ROS 2 keystore exfiltration** (Sakib et al., MILCOM 2025) | A trojaned Debian package leaked SROS 2 keystores; the attacker rejoined as an *authenticated* participant and published spoofed stop-sign and motion messages. | ROS 2 graph sensor (a key-valid but profile-unknown participant is still flagged) + Robot Analyzer (catch the trojaned package pre-deploy). |
+| **"Seeing is Not Believing"** (Shen et al., 2026) | One env var loaded a hook into Secure ROS 2 that injected fabricated telemetry *and* control, fooling an AI detector 87% of the time on a real Franka arm. | Motion/feedback consistency check + attestation of the runtime, not just the host. Telemetry we verify is sensor-authored, not process-authored. |
+| **BadVLA / SilentDrift** (2025–26) | Near-100% backdoors in vision-language-action models, stealthy and surviving fine-tuning; SilentDrift hides in the action-chunk approach phase. | AI Guard (AIDR) on VLA/LLM robots + Motion Firewall as the backstop the model cannot talk its way past. |
+
+Two lessons set the architecture:
+
+1. **Authentication is not authorization.** SROS 2 and DDS Security verify *who*
+   signed a message, not whether the message is *plausible* for this robot now.
+   Every demonstrated 2025–26 attack that mattered was authenticated. RoboDR's
+   job is the plausibility layer: the model profile and the motion envelope.
+2. **The host can be clean while the robot is compromised.** Defence must reach
+   the DDS graph, the motion path and the hardware root of trust — not stop at
+   process/file/network. That is precisely the gap above Pulsar.
+
+---
+
+## 1. Architecture principles (the non-negotiables)
+
+1. **Platform-shaped sensors, one brain.** Four collector forms — Full Agent
+   (Linux), Lite SDK (RTOS/MCU), Sentinel Box (agentless, for closed
+   controllers), Bus Tap (fieldbus) — feed one event model, one detection core,
+   one console. New robot kinds are new sensors, not new products.
+2. **The detection core is pure and portable.** `robodr-events` has no I/O. The
+   same `Profile::evaluate` runs on the controller, in the Sentinel Box and in
+   CI. Decisions are testable without a robot.
+3. **Safety-aware response, never safety-replacing.** RoboDR proposes and, at
+   most, requests a safe state. The functional-safety system (e-stop, safety
+   PLC, per ISO 10218 / ISO 13849 / IEC 61508) is always the final authority.
+   RoboDR is not a safety-rated component and never claims to be.
+4. **Observe before enforce.** A fresh install reports only. Enforcement for a
+   robot model is turned on by the OEM, per action class, after the profile is
+   locked and false-negative bounds hold.
+5. **Offline by default.** Detection and response run on the robot. The cloud is
+   for visibility, policy and analysis — removable without losing protection.
+6. **Deterministic on the control path.** Only the Motion Firewall sits in-path,
+   with a fixed latency budget and no dynamic allocation in the hot loop.
+
+---
+
+## 2. Component map (dependency order)
+
+```
+                 ┌─────────────────────── robodr-events (pure core) ✓ built
+                 │   RobotEvent taxonomy · Profile · Deviation · graph
+                 ▼
+ ┌───────────────────────────── sensors ──────────────────────────────┐
+ │ robodr-sensor-ros2   DDS/RTPS graph        (Full Agent)   ◐ in progress
+ │ robodr-sensor-ebpf   process/file/net+LSM  (reuse Pulsar) ○ next
+ │ robodr-sensor-motion motion cmd + feedback (Full Agent)   ○
+ │ robodr-sensor-bus    CAN/EtherCAT/MAVLink  (Bus Tap)       ○
+ │ robodr-attest        TPM/IMA measured boot                 ○
+ └─────────────────────────────────────────────────────────────────────┘
+                 │ all emit RobotEvent / Pulsar threats
+                 ▼
+ robodr-firewall   Motion Firewall (in-path, deterministic)   ○
+                 │
+                 ▼
+ robodr-responder  Cyber-Jidoka: graded, safety-aware response ○
+                 │ signed evidence ↕ signed policy/rules
+                 ▼
+ robodr-fleet      control plane · attestation verifier · console ○
+                 │ OCSF findings
+                 ▼
+ AutoSecOps AI SOC  triage · hunt · workflows (see main design doc) ○
+```
+
+`✓ built · ◐ in progress · ○ planned`
+
+---
+
+## 3. Phases
+
+Each phase names its deliverable, the exit criteria that let us move on, and the
+customer-visible result. Durations are deliberately omitted; the exit criteria,
+not a calendar, gate each phase.
+
+### Phase 1 — Detect on one robot kind (MVP)
+
+**Goal:** On a ROS 2 Linux AMR, detect an unknown DDS participant, an
+unauthorized motion publisher, and a host compromise, and surface them in one
+place.
+
+- `robodr-events` pure core with model profile + envelope. **[done]**
+- `robodr-sensor-ros2` passive SPDP sensor raising profile deviations. **[in progress]**
+- Reuse Pulsar's process/file/network + LSM probes unchanged; add `rules/robot.toml`.
+- Observe-mode profile learning: a commissioning tool records the graph and
+  envelopes over a clean run, emits a `profile.json`, the OEM locks it.
+- Bridge threats to AutoSecOps over the existing Kafka/adapter path (robot
+  source-trust map + `robotics` category, per the main design doc).
+
+**Exit criteria.** On a real AMR: a foreign `cmd_vel` publisher is flagged
+Critical; a rogue participant is flagged High; a reverse shell on the controller
+is flagged; false positives on a 72-hour clean run are under an agreed bound.
+Complete the RTPS DATA(w)/DATA(r) parser so writer/reader topic events are real,
+not just participants (`rtps::walk_submessages` TODO).
+
+**Customer-visible:** a design-partner OEM sees their robot's live security
+posture in the console; a red-team spoofed command is caught.
+
+### Phase 2 — Respond safely, and reach closed controllers
+
+**Goal:** Turn detection into graded, safety-aware response, and cover robots we
+cannot put an agent inside.
+
+- `robodr-firewall` (Motion Firewall), v1 as a ROS 2 command gateway: every
+  motion command passes through, is checked against the envelope and the allowed
+  source set, and is passed / limited / rejected. Deterministic, fixed latency
+  budget, fail-safe behaviour defined per model by the OEM.
+- `robodr-responder` (Cyber-Jidoka): the five-step graded ladder (record →
+  restrict → limit motion → safe pause → request safe state), choosing by
+  deviation severity × current safety state. Response profiles validated per
+  model with the OEM.
+- `robodr-sensor-motion`: the motion/feedback consistency check that catches the
+  "Seeing is Not Believing" injected-telemetry class.
+- **Sentinel Box**: agentless appliance for closed controllers (KUKA, FANUC,
+  ABB, Yaskawa). Passive network + vendor control-API connectors + black-box
+  recorder. Pure detection core reused unchanged; only the sensors differ.
+- Signed, hash-chained black-box evidence; evidence links ride on every finding.
+
+**Exit criteria.** Motion Firewall holds its latency budget under load with
+zero control-loop jitter regression (agent on vs off). A staged over-envelope
+command is limited without stopping a healthy line. Sentinel Box flags an
+out-of-window program change on one closed-controller brand via its vendor API.
+
+### Phase 3 — Attestation, air-gap, and the second robot family
+
+**Goal:** Trust the robot's identity, run with no network at all, and extend off
+Linux.
+
+- `robodr-attest`: TPM 2.0 measured boot + Linux IMA, verified by the fleet
+  attestation verifier (Keylime-based). A robot with no hardware root of trust
+  is never shown at the same trust level; a disconnected robot decays to
+  `Unknown`. Catches the UniPwn rooted-firmware class.
+- **Air-gapped deployment**: single-box control plane inside the isolated
+  network; signed, versioned, rollback-able update bundles carried by data diode
+  or vetted media through an entry station (every bundle scanned by Robot
+  Analyzer); evidence out via diode. Local time source for the evidence chain.
+- `robodr-sensor-bus` (Bus Tap) + Lite SDK (RTOS/MCU, Zephyr/FreeRTOS/NuttX,
+  PX4/ArduPilot): the drone and defence-UGV family. CAN/EtherCAT/MAVLink/1553.
+- **IEC 62443-4-2** evidence package for the agent itself; CRA reporting workflow
+  (obligations began 11 Sep 2026; full application 11 Dec 2027) and alignment
+  with ISO 10218-2:2025's new cybersecurity-relevant control-function
+  requirements and the EU Machinery Regulation 2023/1230 (applies 20 Jan 2027).
+
+**Exit criteria.** A tampered firmware image fails attestation and the robot
+shows `Deviation`. A full air-gapped install detects and responds with no
+outbound connectivity. The Lite SDK detects an unsigned MAVLink mode change on a
+PX4 flight controller.
+
+### Phase 4 — AI-robot security and the frontier lab
+
+**Goal:** Secure LLM/VLA-driven robots, and turn our fleet telemetry into a
+research and model advantage no one else can match.
+
+- **AI Guard (AIDR)** on VLA/LLM robots: policy over the planner's tool calls and
+  tasks; the Motion Firewall is the backstop a jailbroken or backdoored model
+  cannot talk past (RoboPAIR, BadVLA, SilentDrift).
+- **RoboDR foundation model**: trained on the robot-behaviour telemetry our fleet
+  produces (graph, motion, feedback, bus) — a data asset that, like Exein's, is
+  hard to replicate, but robot-behaviour-native rather than firmware-generic.
+- **Agentic robot SOC**: robot-specific hunt/root-cause workflows in AutoSecOps;
+  a confirmed root cause ships a signed new rule to the whole fleet (poka-yoke).
+- White-label console and OEM edition: the OEM ships RoboDR inside the robot and
+  sells the posture to their own customers.
+
+**Exit criteria.** A jailbroken planner's unsafe command is blocked by the
+firewall and explained by the SOC. The foundation model beats the rule+profile
+baseline on a held-out attack corpus (our own eval set, with injection tests
+placed in ROS node and topic names, mirroring AutoSecOps' eval discipline).
+
+---
+
+## 4. What makes this a frontier lab, not a me-too EDR
+
+- **A public robot-attack eval corpus and benchmark.** We reproduce RoboPAIR,
+  the SROS 2 keystore attack, the telemetry-injection attack and VLA backdoors
+  in a lab, and publish a benchmark RoboDR and others are measured against.
+  Owning the benchmark is how a lab leads a field.
+- **Robot-behaviour foundation model.** Firmware-generic runtime models already
+  exist. A model that knows what *this class of robot doing this task* should
+  look like — and flags the subtle drift SilentDrift hides in the approach phase
+  — does not. That is our moat and it compounds with every robot we protect.
+- **Deterministic safety-aware response as a researched discipline.** Cyber-
+  Jidoka — graded response conditioned on physical safety state, provably never
+  overriding the safety system — is a publishable contribution, not just a
+  feature. It is also what makes OEMs willing to let us act at all.
+- **Open where it builds trust, closed where it is the moat.** Sensors and the
+  event model open (community and scrutiny, like Pulsar); the foundation model,
+  the fleet analytics and the response engine commercial.
+
+## 5. Immediate next actions
+
+1. Finish `rtps::walk_submessages`: DATA(w)/DATA(r) inline-QoS parse for
+   `PID_TOPIC_NAME` / `PID_TYPE_NAME` / endpoint GUID, with fuzz tests on
+   captured SPDP/SEDP traffic. Promotes writer/reader detection from scaffold to
+   real.
+2. Build the observe-mode commissioning tool that emits `profile.json`.
+3. Stand up the lab: one ROS 2 AMR (or Gazebo + a real controller) and one
+   closed-controller brand, so detection is measured against real traffic.
+4. Land the AutoSecOps robot source-trust map + `robotics` category (main design
+   doc checklist) so Phase 1 findings flow into the SOC.

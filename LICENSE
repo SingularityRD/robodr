@@ -1,0 +1,10 @@
+RoboDR is dual-licensed, mirroring the Pulsar base it builds on:
+
+  - RoboDR userspace code is licensed under Apache License 2.0.
+  - Any eBPF probe code (`*.bpf.c` and generated skeletons) is licensed under
+    GPL-2.0, as required for programs that load into the Linux kernel.
+
+See LICENSES/LICENSE-APACHE-2.0 and LICENSES/LICENSE-GPL-2.0 for the full texts.
+
+Pulsar (vendored under vendor/pulsar) is Copyright Exein and licensed under the
+same Apache-2.0 / GPL-2.0 split; see vendor/pulsar/LICENSE.
