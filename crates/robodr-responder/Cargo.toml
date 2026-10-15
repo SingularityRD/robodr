@@ -8,3 +8,5 @@ description = "Cyber-Jidoka responder (pure): graded, safety-aware response plan
 
 [dependencies]
 robodr-events = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
