@@ -1,68 +1,135 @@
 //! RoboDR ROS 2 / DDS graph sensor, packaged as a Pulsar module.
 //!
-//! It passively joins the SPDP discovery multicast group, parses participant
-//! announcements, and checks each one against the robot's locked model profile
-//! ([`robodr_events::profile::Profile`]). A deviation becomes a Pulsar threat
-//! on the shared bus, where the rules engine, the loggers, and the AutoSecOps
-//! bridge already consume threats — so this sensor needs no new plumbing
-//! downstream.
+//! **Pulsar-dependent crate**: this file needs `pulsar-core` and `tokio` and
+//! is excluded from the offline build. The logic lives in Pulsar-independent
+//! submodules that are unit-tested on their own:
+//!
+//! - [`pipeline`]: datagram -> RTPS events -> profile deviations -> bounded
+//!   dedup -> sanitised findings (observe-mode tagging included), plus the
+//!   [`DatagramSource`] seam for `robodr-capture`;
+//! - [`config`]: the `[module.robodr-sensor-ros2]` section and its validation
+//!   (domain-id-derived SPDP port);
+//! - [`socket`]: the receive-only, `SO_REUSEADDR`, group-bound SPDP socket.
+//!
+//! This file is only the glue: implement `SimplePulsarModule`, open the
+//! sources, and turn every [`Finding`] into one `ModuleContext::send_threat`
+//! call. Every Pulsar item used here was checked against `vendor/pulsar` at
+//! commit 4796504 — see docs/PULSAR-INTEGRATION.md for the file-by-file list.
 //!
 //! It is **read-only on the network**: it opens one receive socket and never
 //! transmits. Enforcement (restricting motion, rejecting a participant) is the
 //! Motion Firewall's and the responder's job, never this sensor's.
 //!
+//! ## Observe mode
+//!
+//! While `profile.locked == false` every threat description starts with
+//! `[observe-only] ` and `extra` carries `mode = "observe"`,
+//! `observe_only = true`; a module warning is also raised (shown by
+//! `pulsar status`). Consumers must not drive a response from such threats.
+//!
 //! ## Known gap: SEDP is usually unicast
 //!
-//! The parser (`rtps`) handles both SPDP participant and SEDP writer/reader
-//! announcements. This listener, however, binds the SPDP **multicast** group,
-//! and most DDS implementations send SEDP **unicast** to each participant's
-//! metatraffic port. So today this module reliably reports *participants*;
-//! writer/reader (topic-level) detection needs a capture-based listener that
-//! sees unicast metatraffic on the robot's interfaces and loopback (AF_PACKET or
-//! an eBPF socket filter feeding the same `rtps::parse_datagram`). That is the
-//! next sensor task (docs/SPRINTS.md, Sprint 2). Whether a given DDS vendor
-//! moves local discovery onto shared memory is a lab-validation item, per vendor.
+//! The SPDP **multicast** socket reliably shows *participants*; most DDS
+//! implementations send SEDP (writer/reader announcements) **unicast** to each
+//! participant's metatraffic port, which this socket does not see. Topic-level
+//! detection needs the capture-based listener (`robodr-capture`) feeding the
+//! same pipeline through [`Ros2Sensor::with_external_source`].
 
-use std::collections::HashSet;
-use std::net::Ipv4Addr;
-use std::path::PathBuf;
+pub mod config;
+pub mod pipeline;
+pub mod socket;
+
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 use pulsar_core::event::Value;
 use pulsar_core::pdk::{ModuleContext, ModuleError, SimplePulsarModule};
 use pulsar_core::{Pid, Timestamp};
 use robodr_events::profile::Profile;
-use robodr_rtps as rtps;
-use serde::Deserialize;
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::task::JoinHandle;
 
-/// Config block (under `[robodr-sensor-ros2]` in the Pulsar config).
-#[derive(Debug, Clone, Deserialize)]
-pub struct Config {
-    /// Path to the locked model profile (JSON). See `config/profile.example.json`.
-    pub profile_path: PathBuf,
-    /// SPDP multicast group. DDS default is 239.255.0.1.
-    #[serde(default = "default_group")]
-    pub spdp_group: Ipv4Addr,
-    /// SPDP port. For RTPS domain 0 the discovery port is 7400.
-    #[serde(default = "default_port")]
-    pub spdp_port: u16,
-    /// Local interface address to join the group on (0.0.0.0 = default route).
-    #[serde(default = "default_iface")]
-    pub interface: Ipv4Addr,
+pub use config::Config;
+pub use pipeline::{Datagram, DatagramSource, Finding, Pipeline, ProfileMode};
+
+/// Module name, i.e. the `[module.<name>]` section in `pulsar.toml`.
+pub const MODULE_NAME: &str = "robodr-sensor-ros2";
+
+/// Largest UDP payload; RTPS datagrams are at most this long.
+const RECV_BUF_LEN: usize = 65_535;
+
+/// Pause after a socket receive error so a persistent error cannot spin.
+const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Receiving end of an external datagram source, shared so the module can be
+/// stopped and restarted by the daemon (each start re-acquires the lock; the
+/// previous listener releases it when aborted).
+type SharedReceiver = Arc<Mutex<mpsc::Receiver<Datagram>>>;
+
+/// The Pulsar module. Register it with
+/// `PulsarDaemonStarter::add_module(Ros2Sensor::new())` (see `robodr-pulsard`).
+#[derive(Default)]
+pub struct Ros2Sensor {
+    external: Option<SharedReceiver>,
 }
 
-fn default_group() -> Ipv4Addr {
-    Ipv4Addr::new(239, 255, 0, 1)
-}
-fn default_port() -> u16 {
-    7400
-}
-fn default_iface() -> Ipv4Addr {
-    Ipv4Addr::UNSPECIFIED
+impl Ros2Sensor {
+    /// SPDP multicast socket only.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Also consume datagrams from another source (e.g. `robodr-capture`), in
+    /// addition to the SPDP socket unless `listen_spdp = false`.
+    pub fn with_external_source(rx: mpsc::Receiver<Datagram>) -> Self {
+        Self {
+            external: Some(Arc::new(Mutex::new(rx))),
+        }
+    }
 }
 
-pub struct Ros2Sensor;
+/// Run a blocking [`DatagramSource`] on a dedicated OS thread and return the
+/// channel to pass to [`Ros2Sensor::with_external_source`]. The thread ends
+/// when the source finishes or fails, or when the receiver is dropped.
+///
+/// Backpressure: the channel is bounded (`capacity`, min 1); when the sensor
+/// falls behind, the source thread blocks. A capture source that must never
+/// block should buffer or drop internally.
+pub fn spawn_blocking_source<S>(
+    source: S,
+    capacity: usize,
+) -> std::io::Result<mpsc::Receiver<Datagram>>
+where
+    S: DatagramSource + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel(capacity.max(1));
+    std::thread::Builder::new()
+        .name("robodr-dgram-src".into())
+        .spawn(move || {
+            let mut source = source;
+            loop {
+                match source.recv() {
+                    Ok(Some(d)) => {
+                        if tx.blocking_send(d).is_err() {
+                            break; // sensor gone
+                        }
+                    }
+                    Ok(None) => {
+                        log::info!(target: MODULE_NAME, "external datagram source finished");
+                        break;
+                    }
+                    Err(e) => {
+                        log::error!(target: MODULE_NAME, "external datagram source failed: {e}");
+                        break;
+                    }
+                }
+            }
+        })?;
+    Ok(rx)
+}
 
 pub struct State {
     listener: JoinHandle<()>,
@@ -72,7 +139,7 @@ impl SimplePulsarModule for Ros2Sensor {
     type Config = Config;
     type State = State;
 
-    const MODULE_NAME: &'static str = "robodr-sensor-ros2";
+    const MODULE_NAME: &'static str = MODULE_NAME;
     const DEFAULT_ENABLED: bool = false;
 
     async fn init_state(
@@ -80,18 +147,62 @@ impl SimplePulsarModule for Ros2Sensor {
         config: &Self::Config,
         ctx: &ModuleContext,
     ) -> Result<Self::State, ModuleError> {
-        let profile = load_profile(&config.profile_path)?;
-        if !profile.locked {
-            log::warn!(
-                "robodr: profile '{}' is NOT locked — running in observe mode, \
-                 reporting deviations only",
-                profile.model
+        let (settings, warnings) = config.validate()?;
+        for w in &warnings {
+            log::warn!(target: MODULE_NAME, "{w}");
+        }
+        if settings.spdp.is_none() && self.external.is_none() {
+            return Err(
+                "listen_spdp = false but no external datagram source is attached; \
+                        the sensor would see nothing"
+                    .into(),
             );
         }
 
-        let socket = bind_spdp(config).await?;
-        let ctx = ctx.clone();
-        let listener = tokio::spawn(listen_loop(socket, profile, ctx));
+        let profile = load_profile(&settings.profile_path)?;
+        let pipeline = Pipeline::new(profile, settings.dedup_capacity);
+        if pipeline.mode().is_observe() {
+            let msg = format!(
+                "profile '{}' is NOT locked: observe mode, deviations are tagged observe-only",
+                pipeline::sanitize(&pipeline.profile().model)
+            );
+            log::warn!(target: MODULE_NAME, "{msg}");
+            ctx.raise_warning(msg).await;
+        }
+
+        let socket = match settings.spdp {
+            Some(spdp) => {
+                let std_socket = socket::bind_spdp_multicast(spdp.group, spdp.port, spdp.interface)
+                    .map_err(|e| {
+                        format!(
+                            "binding SPDP {}:{} on {}: {e}",
+                            spdp.group, spdp.port, spdp.interface
+                        )
+                    })?;
+                let socket = UdpSocket::from_std(std_socket)
+                    .map_err(|e| format!("registering SPDP socket with tokio: {e}"))?;
+                log::info!(
+                    target: MODULE_NAME,
+                    "listening for SPDP on {}:{} (domain {}, interface {})",
+                    spdp.group,
+                    spdp.port,
+                    settings.domain_id,
+                    spdp.interface
+                );
+                Some(socket)
+            }
+            None => None,
+        };
+        if self.external.is_some() {
+            log::info!(target: MODULE_NAME, "consuming an external datagram source");
+        }
+
+        let listener = tokio::spawn(listen_loop(
+            socket,
+            self.external.clone(),
+            pipeline,
+            ctx.clone(),
+        ));
         Ok(State { listener })
     }
 
@@ -101,7 +212,7 @@ impl SimplePulsarModule for Ros2Sensor {
     }
 }
 
-fn load_profile(path: &PathBuf) -> Result<Profile, ModuleError> {
+fn load_profile(path: &Path) -> Result<Profile, ModuleError> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| format!("reading profile {}: {e}", path.display()))?;
     let profile: Profile = serde_json::from_str(&raw)
@@ -109,63 +220,98 @@ fn load_profile(path: &PathBuf) -> Result<Profile, ModuleError> {
     Ok(profile)
 }
 
-async fn bind_spdp(config: &Config) -> Result<UdpSocket, ModuleError> {
-    // Bind to the SPDP port on all interfaces, then join the multicast group.
-    let bind_addr = (Ipv4Addr::UNSPECIFIED, config.spdp_port);
-    let socket = UdpSocket::bind(bind_addr)
-        .await
-        .map_err(|e| format!("binding SPDP {}: {e}", config.spdp_port))?;
-    socket
-        .join_multicast_v4(config.spdp_group, config.interface)
-        .map_err(|e| format!("joining SPDP group {}: {e}", config.spdp_group))?;
-    log::info!(
-        "robodr: ROS 2 sensor listening on {}:{}",
-        config.spdp_group,
-        config.spdp_port
-    );
-    Ok(socket)
+/// Await the next SPDP datagram, or forever when there is no socket.
+async fn recv_spdp(
+    socket: Option<&UdpSocket>,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, std::net::SocketAddr)> {
+    match socket {
+        Some(s) => s.recv_from(buf).await,
+        None => std::future::pending().await,
+    }
 }
 
-/// Upper bound on remembered deviations. Discovery beacons repeat every few
-/// seconds, so without dedup one rogue participant would raise a threat per
-/// beacon; without a bound, an attacker spraying random GUIDs onto the bus
-/// could grow the set until the sensor runs out of memory. When the bound is
-/// hit the set is cleared: worst case, a still-present deviation is reported
-/// again, which is the safe direction to fail.
-const MAX_SEEN: usize = 4096;
+/// Await the next external datagram, or forever when there is no source.
+/// `None` means the source closed.
+async fn recv_external(rx: Option<&mut mpsc::Receiver<Datagram>>) -> Option<Datagram> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
 
-/// Receive loop: parse each datagram, evaluate against the profile, raise a
-/// threat per *new* deviation.
-async fn listen_loop(socket: UdpSocket, profile: Profile, ctx: ModuleContext) {
-    let mut buf = vec![0u8; 65_535];
-    let mut seen: HashSet<String> = HashSet::new();
+/// Receive loop over both sources; one threat per *new* deviation.
+async fn listen_loop(
+    socket: Option<UdpSocket>,
+    external: Option<SharedReceiver>,
+    mut pipeline: Pipeline,
+    ctx: ModuleContext,
+) {
+    // Held for the lifetime of this task; released when it is aborted.
+    let mut external: Option<OwnedMutexGuard<mpsc::Receiver<Datagram>>> = match external {
+        Some(shared) => Some(shared.lock_owned().await),
+        None => None,
+    };
+    let mut buf = vec![0u8; RECV_BUF_LEN];
     loop {
-        let (len, peer) = match socket.recv_from(&mut buf).await {
-            Ok(v) => v,
+        if socket.is_none() && external.is_none() {
+            let msg = "no datagram source left; the ROS 2 sensor is blind".to_string();
+            log::error!(target: MODULE_NAME, "{msg}");
+            ctx.raise_warning(msg).await;
+            return;
+        }
+        // Collect the outcome first and handle it after `select!` has
+        // returned, so no branch future still borrows `buf` or `external`.
+        let next = tokio::select! {
+            r = recv_spdp(socket.as_ref(), &mut buf) => Next::Spdp(r),
+            d = recv_external(external.as_deref_mut()) => Next::External(d),
+        };
+        match next {
+            Next::Spdp(Ok((len, peer))) => {
+                report(&mut pipeline, &ctx, &buf[..len], &peer.ip().to_string());
+            }
+            Next::Spdp(Err(e)) => {
+                log::warn!(target: MODULE_NAME, "SPDP receive error: {e}");
+                tokio::time::sleep(RECV_ERROR_BACKOFF).await;
+            }
+            Next::External(Some(d)) => report(&mut pipeline, &ctx, &d.payload, &d.src_ip),
+            Next::External(None) => {
+                log::warn!(target: MODULE_NAME, "external datagram source closed");
+                external = None;
+            }
+        }
+    }
+}
+
+/// One step of the receive loop.
+enum Next {
+    Spdp(std::io::Result<(usize, std::net::SocketAddr)>),
+    External(Option<Datagram>),
+}
+
+/// Run one datagram through the pipeline and raise a threat per finding.
+fn report(pipeline: &mut Pipeline, ctx: &ModuleContext, payload: &[u8], src_ip: &str) {
+    for finding in pipeline.process(payload, src_ip) {
+        let description = finding.description();
+        // `Value::try_from` is pulsar-core's inherent fn (serialises through
+        // TOML), not `TryFrom`. A failure only drops the structured part.
+        let extra = match Value::try_from(finding.extra()) {
+            Ok(v) => Some(v),
             Err(e) => {
-                log::warn!("robodr: SPDP recv error: {e}");
-                continue;
+                log::warn!(target: MODULE_NAME, "threat extra not serialisable: {e}");
+                None
             }
         };
-        let src_ip = peer.ip().to_string();
-        for event in rtps::parse_datagram(&buf[..len], &src_ip) {
-            let Some(dev) = profile.evaluate(&event) else {
-                continue;
-            };
-            // Dedup on the deviation itself (rule + detail, which names the
-            // GUID, topic and source), so each distinct deviation is reported
-            // once, not once per beacon — and two different rogue topics from
-            // the same host are still two reports.
-            if seen.len() >= MAX_SEEN {
-                log::warn!("robodr: dedup set reached {MAX_SEEN}, clearing");
-                seen.clear();
-            }
-            if !seen.insert(format!("{}|{}", dev.rule, dev.detail)) {
-                continue;
-            }
-            let extra = Value::try_from(&dev).ok();
-            ctx.send_threat(Pid::this(), Timestamp::now(), dev.detail.clone(), extra);
-            log::info!("robodr: [{}] {}", dev.rule, dev.detail);
+        // A network peer has no local pid: attribute the threat to the daemon
+        // itself (the process tracker knows it once process-monitor has
+        // scanned /proc; otherwise Pulsar logs a lookup error and still sends
+        // the threat with an empty image).
+        let pid = Pid::from_raw(std::process::id() as i32);
+        ctx.send_threat(pid, Timestamp::now(), description.clone(), extra);
+        if finding.mode.is_observe() {
+            log::info!(target: MODULE_NAME, "[{}] {description}", finding.deviation.rule);
+        } else {
+            log::warn!(target: MODULE_NAME, "[{}] {description}", finding.deviation.rule);
         }
     }
 }

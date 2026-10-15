@@ -6,11 +6,14 @@ license.workspace = true
 repository.workspace = true
 description = "RoboDR ROS 2 / DDS graph sensor, as a Pulsar module."
 
+# PULSAR-DEPENDENT CRATE: needs pulsar-core + tokio (crates.io), so it is
+# skipped by the offline build. Its Pulsar-independent logic lives in
+# src/pipeline.rs, src/config.rs and src/socket.rs. See docs/PULSAR-INTEGRATION.md.
+
 [dependencies]
 robodr-events = { workspace = true }
 robodr-rtps = { workspace = true }
 pulsar-core = { workspace = true }
-anyhow = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
