@@ -3,13 +3,17 @@
 # Drop these blocks into the Pulsar config (/etc/pulsar/pulsar.toml, or the
 # file given with --config-file). Pulsar reads module settings from
 # `[module.<module-name>]` sections. RoboDR modules are OFF by default; enable
-# only the ones this robot needs.
+# only the ones this robot needs. Unknown keys are warned about, not rejected:
+# check the daemon log for "Ignoring unknown key" after editing.
 
 [module.robodr-sensor-ros2]
 # Consumed by Pulsar itself (overrides the module's DEFAULT_ENABLED = false).
 enabled = true
-# Absolute path to the model profile for THIS robot model. While the profile
-# has "locked": false, every threat is tagged [observe-only].
+# Absolute path to the model profile for THIS robot model.
+#  - "locked": false        -> observe mode: every threat is [observe-only].
+#  - fails validation       -> REFUSED for enforcement: errors are logged and
+#                              raised as a warning + one robot.ros2.profile_refused
+#                              threat; the sensor runs observe-only.
 profile_path = "/etc/robodr/profile.json"
 # ROS_DOMAIN_ID of the robot. The SPDP port is derived from it:
 #   port = 7400 + 250 * domain_id      (domain_id 0..=232)
@@ -20,8 +24,32 @@ spdp_group = "239.255.0.1"
 # Interface address to join the multicast group on; 0.0.0.0 lets the kernel
 # choose (the default-route interface).
 interface = "0.0.0.0"
-# Listen on the SPDP multicast socket. false only with an external datagram
-# source attached (capture-based listener).
+# Listen on the SPDP multicast socket (sees participants, not unicast SEDP).
 listen_spdp = true
-# Max distinct deviations remembered for de-duplication (1..=1048576).
+# Max distinct findings remembered for de-duplication (1..=1048576).
 dedup_capacity = 4096
+# Low-severity protocol findings (malformed discovery, fragmented discovery).
+# Rejected discovery fragments (evasion attempts) are always reported.
+report_anomalies = true
+report_fragmentation = true
+
+# Passive capture: sees the unicast SEDP announcements (who writes which
+# topic, e.g. a foreign writer on rt/cmd_vel) and loopback traffic that the
+# SPDP socket cannot. Read-only AF_PACKET; the daemon needs CAP_NET_RAW.
+# Shared-memory DDS transports are invisible to it (see robodr-capture docs).
+[module.robodr-sensor-ros2.capture]
+enabled = false
+# Interfaces to capture on. Omit for ["lo", <default-route interface>]
+# (air-gapped robots often have no default route: then only "lo", with a
+# warning - list the DDS interface(s) explicitly). [] = every interface.
+# interfaces = ["lo", "eth0"]
+# Domains whose well-known RTPS ports are captured. Omit for [domain_id].
+# RTPS on any other port is still caught by the "RTPS" payload magic.
+# domain_ids = [0]
+# LAB ONLY: replay a pcap/pcapng file instead of capturing live (absolute
+# path). While set, the robot's live traffic is NOT watched by capture.
+# pcap_replay = "/var/lib/robodr/lab/discovery.pcapng"
+# Live read timeout (stop latency), 10..=5000 ms.
+read_timeout_ms = 500
+# Datagrams buffered between the capture thread and the sensor (1..=65536).
+queue_capacity = 1024

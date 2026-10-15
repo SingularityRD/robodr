@@ -1,0 +1,70 @@
+//! Pulsar-independent ROS 2 / DDS detection pipeline for RoboDR.
+//!
+//! This crate is everything the ROS 2 sensor does **except** talking to
+//! Pulsar: it depends only on `std`, `robodr-events`, `robodr-rtps`,
+//! `robodr-capture` and serde, so it builds and is tested offline, and the
+//! same code runs inside the Pulsar module (`robodr-sensor-ros2`), in the lab
+//! tool [`robodr-ros2-watch`](#the-robodr-ros2-watch-tool) and in CI.
+//!
+//! ```text
+//!  SPDP multicast socket ─┐            (socket.rs, async glue in the sensor)
+//!  live AF_PACKET capture ┼─ Datagram ─► Pipeline ─► Finding ─► threat / JSON line
+//!  pcap / pcapng replay ──┘  (source.rs)  (pipeline.rs)
+//! ```
+//!
+//! - [`source`]: the blocking, std-only [`DatagramSource`] seam and
+//!   [`CaptureDatagramSource`], an adapter over `robodr-capture`'s
+//!   `rtps_datagrams` for live `AF_PACKET` and pcap/pcapng files.
+//! - [`pipeline`]: [`Pipeline`] = detailed RTPS parse with one long-lived,
+//!   bounded `FragmentReassembler` -> `Profile::evaluate` + removal,
+//!   anomaly and fragmentation findings -> bounded dedup -> [`Finding`]s
+//!   stamped observe / enforce. The profile is validated at load
+//!   (`Profile::validate`); an invalid profile is **refused for enforcement**
+//!   and the pipeline runs observe-only (see [`pipeline`] for why).
+//! - [`config`]: the `[module.robodr-sensor-ros2]` section (incl. the
+//!   `capture` sub-table) and its validation: domain id -> SPDP port, capture
+//!   [`RtpsPortMap`](robodr_capture::RtpsPortMap), default interfaces.
+//! - [`socket`]: the receive-only, `SO_REUSEADDR`, group-bound SPDP socket.
+//! - [`sanitize()`] and [`dedup`]: attacker-controlled text and memory bounds.
+//! - [`watch`]: argument parsing and the run loop of `robodr-ros2-watch`.
+//!
+//! # Read-only
+//!
+//! Nothing here transmits on the network. Enforcement (restricting motion,
+//! requesting a safe state) is the Motion Firewall's and the responder's job;
+//! this crate only reports, and marks what must never be acted upon.
+//!
+//! # The `robodr-ros2-watch` tool
+//!
+//! Runs the pipeline over a capture file or (Linux, `CAP_NET_RAW`) a live
+//! interface and prints one JSON object per finding (the [`ThreatExtra`]
+//! fields) on stdout. See `robodr-ros2-watch --help` and the README.
+//!
+//! # Limits
+//!
+//! Shared-memory DDS transports, RTPS over TCP and DDS-Security-protected
+//! discovery are invisible or opaque (see `robodr-capture` / `robodr-rtps`).
+//! The RTPS parser and this pipeline have only been exercised on synthetic
+//! datagrams, not on captures from real DDS stacks yet.
+
+pub mod config;
+pub mod dedup;
+pub mod pipeline;
+pub mod sanitize;
+pub mod socket;
+pub mod source;
+pub mod watch;
+
+pub use config::{CaptureConfig, CaptureInput, CaptureSettings, Config, Settings, SpdpSettings};
+pub use dedup::DedupSet;
+pub use pipeline::{
+    load_profile, rules, Finding, Pipeline, PipelineOptions, PipelineStats, ProfileStatus,
+    ThreatExtra, OBSERVE_ONLY_TAG,
+};
+pub use sanitize::{sanitize, MAX_TEXT_CHARS};
+pub use source::{CaptureDatagramSource, Datagram, DatagramSource, VecDatagramSource};
+
+// Re-exported so the Pulsar glue needs no direct dependency on these crates.
+pub use robodr_capture::RtpsPortMap;
+pub use robodr_events::{Deviation, Mode, Severity};
+pub use robodr_rtps::ReassemblyLimits;

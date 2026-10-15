@@ -1,0 +1,427 @@
+//! `robodr-ros2-watch`: run the pipeline over a capture file or a live
+//! interface and print findings as JSON lines. Lab tool, usable before the
+//! Pulsar daemon is built. Argument parsing is std-only and lives here so it
+//! is unit-tested; `src/bin/robodr-ros2-watch.rs` is a thin `main`.
+//!
+//! Output contract:
+//! - **stdout**: one JSON object per finding, one per line, fields of
+//!   [`ThreatExtra`](crate::ThreatExtra) (flushed per line, so it can be piped).
+//! - **stderr**: human-readable status (profile warnings and errors, capture
+//!   errors) and, with `--stats`, one final JSON object `{"pipeline": ..,
+//!   "capture": ..}`.
+//! - Exit code: `0` done, `1` runtime error (profile unreadable, capture
+//!   cannot be opened, capture file truncated/corrupt), `2` usage error.
+//!
+//! Read-only: replay reads a file; live capture uses the same passive
+//! `AF_PACKET` reader as the sensor (needs `CAP_NET_RAW`, never transmits).
+
+use std::io::{self, Write};
+use std::path::PathBuf;
+use std::time::Duration;
+
+use serde::Serialize;
+
+use crate::config::{capture_port_map, valid_ifname, CaptureInput, DEFAULT_READ_TIMEOUT_MS};
+use crate::pipeline::{load_profile, Pipeline, PipelineOptions, PipelineStats};
+use crate::sanitize::sanitize;
+use crate::source::{CaptureDatagramSource, DatagramSource};
+
+pub const USAGE: &str = "\
+robodr-ros2-watch: run the RoboDR ROS 2 detection pipeline over captured RTPS
+traffic and print each finding as one JSON line on stdout. Read-only.
+
+USAGE:
+    robodr-ros2-watch --profile <profile.json> --pcap <file>
+    robodr-ros2-watch --profile <profile.json> --interface <name> [--interface <name>...]
+
+INPUT (exactly one kind):
+    --pcap <file>          replay a pcap or pcapng file
+    --interface <name>     live capture on an interface (Linux, CAP_NET_RAW);
+                           repeatable; 'any' = every interface
+
+OPTIONS:
+    --profile <file>       model profile (JSON). An invalid profile is reported
+                           and the run is observe-only (never enforcing)
+    --domain <id>          ROS_DOMAIN_ID whose well-known ports are captured
+                           (repeatable, 0..=232; default 0). RTPS on other
+                           ports is still caught by the 'RTPS' magic
+    --dedup <n>            dedup capacity (default 4096)
+    --no-anomalies         do not report RTPS parse anomalies
+    --no-fragmentation     do not report fragmented discovery (rejected
+                           fragments are always reported)
+    --duration <secs>      live only: stop after this many seconds (then
+                           --stats is printed); default: run until killed
+    --stats                print final counters as JSON on stderr
+    -h, --help             this help
+    -V, --version          version
+
+EXIT: 0 done, 1 runtime error, 2 usage error.
+";
+
+/// What the command line asks for.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Command {
+    Help,
+    Version,
+    Run(WatchArgs),
+}
+
+/// Parsed arguments of a run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WatchArgs {
+    pub profile: PathBuf,
+    pub input: CaptureInput,
+    pub domain_ids: Vec<u16>,
+    pub options: PipelineOptions,
+    pub stats: bool,
+    pub read_timeout: Duration,
+    /// Live only: stop after this long.
+    pub duration: Option<Duration>,
+}
+
+/// Parse `args` (without the program name).
+pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String> {
+    let mut profile = None;
+    let mut pcap: Option<PathBuf> = None;
+    let mut interfaces: Vec<String> = Vec::new();
+    let mut any_interface = false;
+    let mut domain_ids: Vec<u16> = Vec::new();
+    let mut options = PipelineOptions::default();
+    let mut stats = false;
+    let mut duration = None;
+
+    let mut it = args.into_iter();
+    while let Some(arg) = it.next() {
+        let (flag, inline) = match arg.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f.to_string(), Some(v.to_string())),
+            _ => (arg.clone(), None),
+        };
+        let mut value = |name: &str| -> Result<String, String> {
+            match inline.clone().or_else(|| it.next()) {
+                Some(v) if !v.is_empty() => Ok(v),
+                _ => Err(format!("{name} needs a value")),
+            }
+        };
+        match flag.as_str() {
+            "-h" | "--help" => return Ok(Command::Help),
+            "-V" | "--version" => return Ok(Command::Version),
+            "--profile" => {
+                if profile
+                    .replace(PathBuf::from(value("--profile")?))
+                    .is_some()
+                {
+                    return Err("--profile given twice".into());
+                }
+            }
+            "--pcap" => {
+                if pcap.replace(PathBuf::from(value("--pcap")?)).is_some() {
+                    return Err("--pcap given twice".into());
+                }
+            }
+            "--interface" => {
+                let name = value("--interface")?;
+                if name == "any" {
+                    any_interface = true;
+                } else if !valid_ifname(&name) {
+                    return Err(format!("invalid interface name {:?}", sanitize(&name)));
+                } else if !interfaces.contains(&name) {
+                    interfaces.push(name);
+                }
+            }
+            "--domain" => {
+                let v = value("--domain")?;
+                let d: u16 = v
+                    .parse()
+                    .ok()
+                    .filter(|d| u32::from(*d) <= crate::config::MAX_DOMAIN_ID)
+                    .ok_or_else(|| {
+                        format!("--domain {:?}: must be an integer 0..=232", sanitize(&v))
+                    })?;
+                if !domain_ids.contains(&d) {
+                    domain_ids.push(d);
+                }
+            }
+            "--dedup" => {
+                let v = value("--dedup")?;
+                options.dedup_capacity = v
+                    .parse()
+                    .ok()
+                    .filter(|n| (1..=crate::dedup::MAX_DEDUP_CAPACITY).contains(n))
+                    .ok_or_else(|| {
+                        format!(
+                            "--dedup {:?}: must be 1..={}",
+                            sanitize(&v),
+                            crate::dedup::MAX_DEDUP_CAPACITY
+                        )
+                    })?;
+            }
+            "--no-anomalies" if inline.is_none() => options.report_anomalies = false,
+            "--no-fragmentation" if inline.is_none() => options.report_fragmentation = false,
+            "--stats" if inline.is_none() => stats = true,
+            "--duration" => {
+                let v = value("--duration")?;
+                let secs: u64 = v
+                    .parse()
+                    .ok()
+                    .filter(|s| (1..=31_536_000).contains(s))
+                    .ok_or_else(|| {
+                        format!("--duration {:?}: seconds, 1..=31536000", sanitize(&v))
+                    })?;
+                duration = Some(Duration::from_secs(secs));
+            }
+            _ => return Err(format!("unknown argument {:?}", sanitize(&arg))),
+        }
+    }
+
+    let profile = profile.ok_or("--profile is required")?;
+    let input = match (pcap, interfaces.is_empty() && !any_interface) {
+        (Some(_), false) => return Err("--pcap and --interface are mutually exclusive".into()),
+        (Some(path), true) => CaptureInput::Replay { path },
+        (None, true) => return Err("one of --pcap or --interface is required".into()),
+        (None, false) => {
+            if any_interface && !interfaces.is_empty() {
+                return Err("--interface any cannot be combined with named interfaces".into());
+            }
+            CaptureInput::Live { interfaces }
+        }
+    };
+    if domain_ids.is_empty() {
+        domain_ids.push(0);
+    }
+    if duration.is_some() && matches!(input, CaptureInput::Replay { .. }) {
+        return Err("--duration only applies to live capture".into());
+    }
+    Ok(Command::Run(WatchArgs {
+        profile,
+        input,
+        domain_ids,
+        options,
+        stats,
+        read_timeout: Duration::from_millis(DEFAULT_READ_TIMEOUT_MS),
+        duration,
+    }))
+}
+
+/// Result of a run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Summary {
+    pub findings: u64,
+    pub stats: PipelineStats,
+    /// The source ended with an error (e.g. truncated file) after
+    /// delivering what it could.
+    pub source_error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct FinalStats<'a> {
+    pipeline: &'a PipelineStats,
+}
+
+/// Feed every datagram of `source` through `pipeline`, writing findings as
+/// JSON lines to `out`. Returns when the source ends.
+pub fn run_source(
+    pipeline: &mut Pipeline,
+    source: &mut dyn DatagramSource,
+    out: &mut dyn Write,
+) -> io::Result<(u64, Option<String>)> {
+    let mut n = 0u64;
+    for f in pipeline.status_findings() {
+        write_line(out, &f)?;
+        n += 1;
+    }
+    loop {
+        match source.recv() {
+            Ok(Some(d)) => {
+                for f in pipeline.process_datagram(&d) {
+                    write_line(out, &f)?;
+                    n += 1;
+                }
+            }
+            Ok(None) => return Ok((n, None)),
+            Err(e) => return Ok((n, Some(sanitize(&e.to_string())))),
+        }
+    }
+}
+
+fn write_line(out: &mut dyn Write, f: &crate::Finding) -> io::Result<()> {
+    let line = serde_json::to_string(&f.extra()).map_err(io::Error::other)?;
+    writeln!(out, "{line}")?;
+    out.flush()
+}
+
+/// Run a parsed command line. `Err` = runtime error (exit code 1).
+pub fn run(args: &WatchArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<Summary, String> {
+    let profile = load_profile(&args.profile)?;
+    let mut pipeline = Pipeline::new(profile, args.options);
+    if let Some(msg) = pipeline.status_message() {
+        let _ = writeln!(err, "robodr-ros2-watch: warning: {msg}");
+    }
+    let port_map = capture_port_map(&args.domain_ids);
+    let mut source: Box<dyn DatagramSource> = match &args.input {
+        CaptureInput::Replay { path } => Box::new(
+            CaptureDatagramSource::open_file(path, port_map)
+                .map_err(|e| sanitize(&e.to_string()))?,
+        ),
+        CaptureInput::Live { interfaces } => {
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            if let Some(d) = args.duration {
+                let flag = stop.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(d);
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                });
+            }
+            let settings = crate::config::CaptureSettings {
+                input: CaptureInput::Live {
+                    interfaces: interfaces.clone(),
+                },
+                domain_ids: args.domain_ids.clone(),
+                port_map,
+                read_timeout: args.read_timeout,
+                queue_capacity: 1,
+            };
+            let src = settings.open(stop).map_err(|e| {
+                format!(
+                    "opening live capture on {}: {} (live capture needs CAP_NET_RAW)",
+                    if interfaces.is_empty() {
+                        "all interfaces".to_string()
+                    } else {
+                        interfaces.join(",")
+                    },
+                    sanitize(&e.to_string())
+                )
+            })?;
+            let _ = writeln!(
+                err,
+                "robodr-ros2-watch: capturing live (read-only); Ctrl-C or --duration to stop"
+            );
+            src
+        }
+    };
+    let (findings, source_error) =
+        run_source(&mut pipeline, &mut source, out).map_err(|e| format!("writing output: {e}"))?;
+    if let Some(e) = &source_error {
+        let _ = writeln!(err, "robodr-ros2-watch: capture ended with an error: {e}");
+    }
+    if args.stats {
+        let s = serde_json::to_string(&FinalStats {
+            pipeline: pipeline.stats(),
+        })
+        .unwrap_or_default();
+        let _ = writeln!(err, "{s}");
+    }
+    Ok(Summary {
+        findings,
+        stats: *pipeline.stats(),
+        source_error,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(args: &[&str]) -> Result<Command, String> {
+        parse_args(args.iter().map(|s| s.to_string()))
+    }
+
+    fn run_args(args: &[&str]) -> WatchArgs {
+        match p(args).unwrap() {
+            Command::Run(a) => a,
+            other => panic!("expected run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn help_and_version() {
+        assert_eq!(p(&["--help"]).unwrap(), Command::Help);
+        assert_eq!(p(&["-h", "--bogus"]).unwrap(), Command::Help);
+        assert_eq!(p(&["-V"]).unwrap(), Command::Version);
+    }
+
+    #[test]
+    fn pcap_run_with_defaults() {
+        let a = run_args(&["--profile", "/p.json", "--pcap", "x.pcap"]);
+        assert_eq!(a.profile, PathBuf::from("/p.json"));
+        assert_eq!(
+            a.input,
+            CaptureInput::Replay {
+                path: "x.pcap".into()
+            }
+        );
+        assert_eq!(a.domain_ids, vec![0]);
+        assert_eq!(a.options, PipelineOptions::default());
+        assert!(!a.stats);
+    }
+
+    #[test]
+    fn live_run_with_options_and_equals_form() {
+        let a = run_args(&[
+            "--profile=/p.json",
+            "--interface",
+            "lo",
+            "--interface=eth0",
+            "--interface",
+            "lo",
+            "--domain",
+            "3",
+            "--domain=3",
+            "--domain",
+            "232",
+            "--dedup",
+            "10",
+            "--no-anomalies",
+            "--no-fragmentation",
+            "--stats",
+        ]);
+        assert_eq!(
+            a.input,
+            CaptureInput::Live {
+                interfaces: vec!["lo".into(), "eth0".into()]
+            }
+        );
+        assert_eq!(a.domain_ids, vec![3, 232]);
+        assert_eq!(a.options.dedup_capacity, 10);
+        assert!(!a.options.report_anomalies && !a.options.report_fragmentation);
+        assert!(a.stats);
+        let a = run_args(&["--profile", "/p", "--interface", "any", "--duration", "5"]);
+        assert_eq!(a.input, CaptureInput::Live { interfaces: vec![] });
+        assert_eq!(a.duration, Some(Duration::from_secs(5)));
+        assert!(p(&["--profile", "/p", "--pcap", "x", "--duration", "5"]).is_err());
+        assert!(p(&["--profile", "/p", "--interface", "lo", "--duration", "0"]).is_err());
+    }
+
+    #[test]
+    fn usage_errors() {
+        for bad in [
+            &[][..],
+            &["--pcap", "x"],
+            &["--profile", "/p"],
+            &["--profile", "/p", "--pcap", "x", "--interface", "lo"],
+            &["--profile", "/p", "--pcap"],
+            &["--profile", "/p", "--pcap="],
+            &["--profile", "/p", "--profile", "/q", "--pcap", "x"],
+            &["--profile", "/p", "--pcap", "x", "--pcap", "y"],
+            &["--profile", "/p", "--pcap", "x", "--domain", "233"],
+            &["--profile", "/p", "--pcap", "x", "--domain", "-1"],
+            &["--profile", "/p", "--pcap", "x", "--dedup", "0"],
+            &["--profile", "/p", "--interface", "a/b"],
+            &["--profile", "/p", "--interface", "any", "--interface", "lo"],
+            &["--profile", "/p", "--pcap", "x", "--stats=yes"],
+            &["--profile", "/p", "--pcap", "x", "extra"],
+            &["--profile", "/p", "--pcap", "x", "--evil\n\u{1b}"],
+        ] {
+            let e = p(bad).unwrap_err();
+            assert!(!e.chars().any(char::is_control), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn run_reports_missing_profile_and_capture() {
+        let a = run_args(&["--profile", "/nonexistent/p.json", "--pcap", "/x"]);
+        let (mut o, mut e) = (Vec::new(), Vec::new());
+        assert!(run(&a, &mut o, &mut e)
+            .unwrap_err()
+            .contains("reading profile"));
+    }
+}

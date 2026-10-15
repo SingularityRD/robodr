@@ -16,7 +16,15 @@
 //! [module.robodr-sensor-ros2]
 //! enabled = true
 //! profile_path = "/etc/robodr/profile.json"
+//!
+//! [module.robodr-sensor-ros2.capture]
+//! enabled = true   # passive capture: sees unicast SEDP (needs CAP_NET_RAW)
 //! ```
+//!
+//! The capture source needs no registration here: the sensor opens it from
+//! its own config section in `init_state` (see `robodr_ros2_pipeline`).
+//! The daemon must hold `CAP_NET_RAW` for live capture (it already runs as
+//! root for eBPF).
 
 use std::sync::OnceLock;
 
@@ -34,8 +42,10 @@ async fn main() -> anyhow::Result<()> {
     // Same shape as upstream pulsard: report and exit(1) on error.
     #[allow(clippy::blocks_in_conditions)]
     match pulsar::pulsard::pulsar_daemon_run(&opts.daemon_opts, |starter| {
-        // Future: a capture-fed sensor would be registered here as
-        // `Ros2Sensor::with_external_source(robodr_sensor_ros2::spawn_blocking_source(..)?)`.
+        // SPDP socket and passive capture are both configured in
+        // `[module.robodr-sensor-ros2]`; an additional, non-configured
+        // source could be attached with
+        // `Ros2Sensor::with_external_source(robodr_sensor_ros2::spawn_blocking_source(src, n)?)`.
         starter.add_module(Ros2Sensor::new())?;
         Ok(())
     })
