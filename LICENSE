@@ -1,8 +1,20 @@
 RoboDR is dual-licensed, mirroring the Pulsar base it builds on:
 
-  - RoboDR userspace code is licensed under Apache License 2.0.
+  - RoboDR userspace code (every Rust crate in this workspace) is licensed
+    under the Apache License 2.0. SPDX: Apache-2.0. This is the `license`
+    value in Cargo.toml, so cargo, cargo-deny and the SBOM all see a valid
+    SPDX expression.
   - Any eBPF probe code (`*.bpf.c` and generated skeletons) is licensed under
-    GPL-2.0, as required for programs that load into the Linux kernel.
+    GPL-2.0 (SPDX: GPL-2.0-only), as required for programs that load into the
+    Linux kernel and use GPL-only BPF helpers. Each probe source carries its
+    own `SPDX-License-Identifier: GPL-2.0-only` header. Probes are separate
+    programs loaded into the kernel; they are not linked into the Apache-2.0
+    userspace code as Rust code.
+
+Pulsar describes the same split with the free-text string "Apache-2.0 WITH BPF
+probes exception under GPL-2.0", which is not a valid SPDX expression; RoboDR
+uses "Apache-2.0" in Cargo metadata and documents the probe licensing here.
+GPL-licensed *userspace* dependencies are rejected by CI (see deny.toml).
 
 See LICENSES/LICENSE-APACHE-2.0 and LICENSES/LICENSE-GPL-2.0 for the full texts.
 

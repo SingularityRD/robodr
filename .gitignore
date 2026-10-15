@@ -1,1 +1,19 @@
+# Build outputs
 /target
+/fuzz/target
+/dist
+
+# Local/air-gapped cargo configuration (template: .cargo/config.toml.example)
+/.cargo/config.toml
+# Vendored crates for offline builds (docs/BUILD.md); travel as a tarball.
+/third_party/cargo-vendor
+
+# Cargo.lock IS committed: this workspace ships binaries and builds must be
+# reproducible. It must be generated against crates.io or the internal mirror;
+# a lock generated with [patch] to local paths (e.g. the dev sandbox's
+# offline-cargo.sh) must never be committed. CI enforces this
+# (scripts/ci-check-lockfile.py).
+
+# cargo-cyclonedx writes SBOMs next to each manifest; scripts/sbom.sh collects them.
+*.cdx.json
+*.cdx.xml

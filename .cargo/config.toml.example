@@ -1,0 +1,44 @@
+# Example Cargo configuration for air-gapped builds. NOT active by default.
+#
+# Copy to `.cargo/config.toml` (repo-local, git-ignored) or to
+# `$CARGO_HOME/config.toml` (host-wide) on a build host that must never reach
+# the public internet. See docs/BUILD.md ("Air-gapped builds").
+#
+# Cargo.lock keeps recording crates as coming from crates.io; source
+# replacement only changes *where* they are fetched from. Checksums in
+# Cargo.lock are still verified, so a tampered mirror is detected.
+
+# ---------------------------------------------------------------------------
+# Option A: internal registry mirror (preferred inside the lab network)
+# ---------------------------------------------------------------------------
+[source.crates-io]
+replace-with = "internal"
+
+[source.internal]
+registry = "sparse+https://crates.mirror.internal/index/"
+
+# If the mirror uses a private CA, point cargo at it:
+# [http]
+# cainfo = "/etc/pki/robodr/internal-ca.pem"
+
+# Refuse any network access that is not the mirror (belt and braces):
+# [net]
+# offline = false          # set to true for fully vendored builds (Option B)
+# git-fetch-with-cli = false
+
+# ---------------------------------------------------------------------------
+# Option B: vendored sources carried through the entry station (no network)
+# ---------------------------------------------------------------------------
+# On a connected machine:
+#     cargo vendor --locked --versioned-dirs third_party/cargo-vendor > /dev/null
+# (Do NOT vendor into `vendor/`: that directory holds the Pulsar submodule.)
+# Carry the tarball in, unpack at the repo root, then replace Option A with:
+#
+# [source.crates-io]
+# replace-with = "vendored-sources"
+#
+# [source.vendored-sources]
+# directory = "third_party/cargo-vendor"
+#
+# [net]
+# offline = true

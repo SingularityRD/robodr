@@ -18,7 +18,14 @@ exclude = ["vendor"]
 [workspace.package]
 version = "0.1.0-alpha.1"
 edition = "2021"
-license = "Apache-2.0 WITH BPF probes exception under GPL-2.0"
+# Valid SPDX for every Rust (userspace) crate in this workspace. eBPF probe
+# sources (`*.bpf.c`) are GPL-2.0 and are not Rust crates; see LICENSE and
+# docs/BUILD.md ("Licensing"). cargo-deny (deny.toml) rejects GPL in userspace.
+license = "Apache-2.0"
+# MSRV: 1.85 is the floor imposed by Pulsar (edition 2024). The toolchain that
+# builds releases is pinned separately in rust-toolchain.toml (= Pulsar's pin).
+# Crates opt in with `rust-version.workspace = true`; CI's `msrv` job checks it.
+rust-version = "1.85"
 repository = "https://github.com/SingularityRD/robodr"
 authors = ["Singularity RD"]
 
@@ -48,8 +55,13 @@ thiserror = "2"
 
 [profile.release]
 # Runs on a robot controller: favour small, predictable binaries.
+# Reproducibility (docs/BUILD.md): codegen-units = 1, no incremental, no debug
+# info and stripped symbols remove the usual sources of build-to-build drift;
+# path prefixes are remapped via RUSTFLAGS by scripts/ci-repro.sh.
 opt-level = 2
 lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = true
+debug = false
+incremental = false

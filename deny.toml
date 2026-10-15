@@ -1,0 +1,116 @@
+# cargo-deny policy for RoboDR (https://embarkstudios.github.io/cargo-deny/).
+#
+#   cargo deny check advisories bans licenses sources
+#
+# CI runs this on every push/PR (job `deny`). On an air-gapped host, mirror the
+# RustSec advisory DB (https://github.com/rustsec/advisory-db) into the
+# internal git server, point `db-urls` at it, or run with `--disable-fetch`
+# against a DB carried in through the entry station (docs/BUILD.md).
+
+[graph]
+# Targets we ship for: robot companion computers are x86_64 or aarch64 Linux.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+all-features = false
+
+[advisories]
+# Vulnerabilities, unsound and unmaintained crates are errors by default.
+# Every entry added to `ignore` needs an issue link and an expiry review.
+ignore = []
+yanked = "deny"
+
+[licenses]
+# Userspace crates must be permissively licensed. GPL/LGPL/AGPL are not on
+# this list, so a GPL *userspace* dependency fails CI. eBPF probe C sources
+# (GPL-2.0) are not Rust crates and are not evaluated here; see LICENSE.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CDLA-Permissive-2.0",
+    "Unlicense",
+]
+# MPL-2.0 (file-level weak copyleft) is deliberately NOT allowed globally: if
+# a dependency needs it, add a per-crate entry under `exceptions` after legal
+# review, e.g. { allow = ["MPL-2.0"], crate = "some-crate" }.
+exceptions = []
+confidence-threshold = 0.93
+
+# Pulsar declares the free-text license "Apache-2.0 WITH BPF probes exception
+# under GPL-2.0", which is not valid SPDX. Its Rust crates are Apache-2.0
+# (vendor/pulsar/LICENSE); its eBPF C probes are GPL-2.0 and are not Rust
+# code. Clarify the crates pulsar-core pulls in so cargo-deny can evaluate them.
+[[licenses.clarify]]
+crate = "pulsar-core"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+crate = "bpf-common"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+crate = "validatron"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+crate = "validatron-derive"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+crate = "bpf-features"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+crate = "bpf-feature-autodetect"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+crate = "bpf-features-macros"
+expression = "Apache-2.0"
+license-files = []
+
+[licenses.private]
+# Workspace crates are not published; their license is checked by cargo
+# metadata / the SBOM, not by cargo-deny.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+# `*` version requirements are banned; path dependencies (workspace crates,
+# vendored Pulsar) are fine because they are not published.
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+deny = [
+    # Defence posture: no telemetry/phone-home or remote-code crates. Extend
+    # with concrete crate names as the dependency review progresses.
+]
+
+[sources]
+# Only crates.io (served through the internal mirror via source replacement,
+# see .cargo/config.toml.example; Cargo.lock still records the crates.io
+# source) and the internal mirror itself. No git dependencies.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = [
+    "https://github.com/rust-lang/crates.io-index",
+    "sparse+https://crates.mirror.internal/index/",
+]
+allow-git = []

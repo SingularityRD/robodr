@@ -1,25 +1,333 @@
+# RoboDR CI. Policy and procedures: docs/BUILD.md.
+#
+# Every job is required unless marked "informational". Actions are pinned by
+# full commit SHA (resolved with `git ls-remote --tags`); the comment gives the
+# tag. Tools installed with `cargo install` are pinned by version + --locked.
+#
+# Air-gapped runners: set the repository variable ROBODR_CRATES_MIRROR to the
+# internal sparse index (e.g. sparse+https://crates.mirror.internal/index/)
+# and switch `runs-on` to the self-hosted label; scripts/ci-setup.sh then
+# routes every crate download through the mirror.
 name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly, to pick up new RustSec advisories against an unchanged tree.
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  ROBODR_CRATES_MIRROR: ${{ vars.ROBODR_CRATES_MIRROR }}
+  # Pinned tool versions.
+  CARGO_DENY_VERSION: 0.20.2
+  CARGO_CYCLONEDX_VERSION: 0.5.9
+  CARGO_FUZZ_VERSION: 0.13.1
+  # cargo-fuzz needs nightly (-Zsanitizer). Pinned to a dated nightly so fuzz
+  # results are comparable run to run; bump deliberately.
+  FUZZ_TOOLCHAIN: nightly-2026-09-01
+  # Minimum supported Rust version, = [workspace.package] rust-version.
+  MSRV: "1.85.0"
 
 jobs:
-  test-core:
-    # The pure detection core and the RTPS parser build and test without a
-    # kernel or a robot, so CI runs them on a stock runner.
-    runs-on: ubuntu-latest
+  # ---------------------------------------------------------------------------
+  lockfile:
+    name: Cargo.lock policy
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Test pure core
-        run: cargo test -p robodr-events
-      - name: Test RTPS parser
-        run: cargo test -p robodr-sensor-ros2
-      - name: Format
+          persist-credentials: false
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Is Cargo.lock committed?
+        id: lock
+        run: |
+          if git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
+            echo "committed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Configure mirror
+        run: scripts/ci-setup.sh
+      - name: Check committed Cargo.lock has no local/patched sources
+        if: steps.lock.outputs.committed == 'true'
+        run: python3 scripts/ci-check-lockfile.py Cargo.lock --root .
+      - name: No Cargo.lock committed yet - generate one for the maintainers
+        id: gen
+        if: steps.lock.outputs.committed != 'true'
+        run: |
+          echo "generated=true" >> "$GITHUB_OUTPUT"
+          echo "::warning file=Cargo.lock::Cargo.lock is not committed. Builds are not reproducible until it is. Download the 'Cargo.lock-generated' artifact of this run, review it and commit it (docs/BUILD.md)."
+          cargo generate-lockfile
+          python3 scripts/ci-check-lockfile.py Cargo.lock --root .
+      - name: Upload generated Cargo.lock
+        if: steps.gen.outputs.generated == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Cargo.lock-generated
+          path: Cargo.lock
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  scripts:
+    name: CI scripts (self-tests, shellcheck)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Python self-tests
+        run: |
+          python3 scripts/metadata_to_cyclonedx.py --self-test
+          python3 scripts/ci-check-lockfile.py --self-test
+          python3 scripts/ci-pure-excludes.py --self-test
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+
+  # ---------------------------------------------------------------------------
+  pure:
+    name: Pure crates (fmt, clippy, test)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # pulsar-core is a path dependency of the workspace, so cargo needs
+          # the submodule to load the manifest even when it is excluded.
+          submodules: recursive
+          persist-credentials: false
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: pure
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Setup (mirror, --locked, Pulsar-bound excludes)
+        run: scripts/ci-setup.sh
+      - name: rustfmt
         run: cargo fmt --all -- --check
-      - name: Clippy (core crates)
-        run: cargo clippy -p robodr-events -p robodr-sensor-ros2 -- -D warnings
+      - name: clippy
+        # PURE_EXCLUDES only names members that exist (older cargo errors on
+        # `--exclude` of an unknown package), see scripts/ci-pure-excludes.py.
+        run: cargo clippy --workspace $PURE_EXCLUDES $CARGO_LOCKED --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace $PURE_EXCLUDES $CARGO_LOCKED
+      - name: Build did not modify tracked files
+        run: |
+          git status --porcelain
+          test -z "$(git status --porcelain --untracked-files=no)"
+
+  # ---------------------------------------------------------------------------
+  pulsar:
+    # Required. Builds the crates that link pulsar-core with the system
+    # packages Pulsar's own CI installs (vendor/pulsar/Cross.toml: clang-20,
+    # lld-20, llvm-20, libssl-dev, libsqlite3-dev). It builds and unit-tests;
+    # it does NOT load eBPF into a kernel (that needs a privileged VM job).
+    name: Pulsar-bound crates (build, clippy, test)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install Pulsar build dependencies
+        run: |
+          sudo apt-get update
+          if sudo apt-get install -y --no-install-recommends clang-20 lld-20 llvm-20; then
+            sudo ln -sf /usr/bin/clang-20 /usr/local/bin/clang
+            sudo ln -sf /usr/bin/llvm-strip-20 /usr/local/bin/llvm-strip
+          else
+            echo "::warning::clang-20 not available from the runner's apt sources; using the distribution clang/llvm (Pulsar pins 20)"
+            sudo apt-get install -y --no-install-recommends clang lld llvm
+          fi
+          sudo apt-get install -y --no-install-recommends libssl-dev libsqlite3-dev pkg-config
+          clang --version
+          llvm-strip --version
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: pulsar
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Setup (mirror, --locked, Pulsar-bound excludes)
+        run: scripts/ci-setup.sh
+      - name: Build, lint and test every Pulsar-bound member
+        run: |
+          pkgs=$(printf '%s\n' $PURE_EXCLUDES | grep -v '^--exclude$' || true)
+          if [ -z "$pkgs" ]; then
+            echo "::error::no Pulsar-bound workspace members found (expected robodr-sensor-ros2)"
+            exit 1
+          fi
+          args=""
+          for p in $pkgs; do args="$args -p $p"; done
+          echo "Pulsar-bound members:$args"
+          cargo build $args $CARGO_LOCKED --all-targets
+          cargo clippy $args $CARGO_LOCKED --all-targets -- -D warnings
+          cargo test $args $CARGO_LOCKED
+
+  # ---------------------------------------------------------------------------
+  msrv:
+    # Informational until crates opt in with `rust-version.workspace = true`
+    # (then flip continue-on-error off). Checks the pure crates on the MSRV.
+    name: MSRV check (informational)
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install toolchains
+        run: |
+          rustup toolchain install
+          rustup toolchain install "$MSRV" --profile minimal
+      - name: Setup (mirror, --locked, Pulsar-bound excludes)
+        run: scripts/ci-setup.sh
+      - name: cargo check on MSRV
+        run: cargo "+$MSRV" check --workspace $PURE_EXCLUDES $CARGO_LOCKED
+
+  # ---------------------------------------------------------------------------
+  deny:
+    name: cargo-deny (advisories, bans, licenses, sources)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: tools-deny
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Setup (mirror)
+        run: scripts/ci-setup.sh
+      - name: Install cargo-deny
+        run: |
+          if ! cargo deny --version 2>/dev/null | grep -q " $CARGO_DENY_VERSION"; then
+            cargo install cargo-deny --locked --version "$CARGO_DENY_VERSION"
+          fi
+      - name: cargo deny check
+        run: cargo deny check advisories bans licenses sources
+
+  # ---------------------------------------------------------------------------
+  sbom:
+    name: SBOM (CycloneDX)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: tools-sbom
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Setup (mirror)
+        run: scripts/ci-setup.sh
+      - name: Install cargo-cyclonedx
+        run: |
+          if ! cargo cyclonedx --version 2>/dev/null | grep -q "$CARGO_CYCLONEDX_VERSION"; then
+            cargo install cargo-cyclonedx --locked --version "$CARGO_CYCLONEDX_VERSION"
+          fi
+      - name: Generate SBOMs
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          # Primary: cargo-cyclonedx, one SBOM per crate.
+          SBOM_TOOL=cyclonedx scripts/sbom.sh dist/sbom/cyclonedx
+          # Fallback generator, run too so the air-gapped path stays tested.
+          SBOM_TOOL=metadata CARGO_METADATA_ARGS="$CARGO_LOCKED" scripts/sbom.sh dist/sbom/metadata
+      - name: Upload SBOMs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom-${{ github.sha }}
+          path: dist/sbom
+          if-no-files-found: error
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  fuzz:
+    name: Fuzz smoke (60 s per target)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Detect fuzz/ targets
+        id: detect
+        run: |
+          if [ -f fuzz/Cargo.toml ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no fuzz/ directory; fuzz smoke skipped"
+          fi
+      - name: Install toolchains + cargo-fuzz
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          rustup toolchain install
+          rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
+          cargo install cargo-fuzz --locked --version "$CARGO_FUZZ_VERSION"
+      - name: Setup (mirror)
+        if: steps.detect.outputs.present == 'true'
+        run: scripts/ci-setup.sh
+      - name: Run each fuzz target for 60 s
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          targets=$(cargo "+$FUZZ_TOOLCHAIN" fuzz list)
+          if [ -z "$targets" ]; then echo "::error::fuzz/ exists but has no targets"; exit 1; fi
+          for t in $targets; do
+            echo "::group::fuzz $t"
+            cargo "+$FUZZ_TOOLCHAIN" fuzz run "$t" -- -max_total_time=60
+            echo "::endgroup::"
+          done
+      - name: Upload crash artifacts
+        if: failure() && steps.detect.outputs.present == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-artifacts-${{ github.sha }}
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  reproducible:
+    name: Reproducible release build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          # Shallow is enough: SOURCE_DATE_EPOCH is HEAD's commit time.
+          persist-credentials: false
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Setup (mirror)
+        run: scripts/ci-setup.sh
+      - name: Build twice from different paths and compare robodr-* binaries
+        run: scripts/ci-repro.sh dist/repro
+      - name: Upload binary hashes
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-sha256-${{ github.sha }}
+          path: dist/repro/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 90
