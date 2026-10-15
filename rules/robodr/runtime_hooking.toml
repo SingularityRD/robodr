@@ -1,0 +1,135 @@
+# RoboDR host rules: runtime hooking of the ROS 2 / DDS stack.
+#
+# Threat: "Seeing is Not Believing" (Shen et al., 2026) -- ONE environment
+# variable made Secure ROS 2 load a hook library that forged telemetry and
+# control. Pulsar's Exec event has no environment (pulsar-core event.rs
+# Payload::Exec = filename, argc, argv), so LD_PRELOAD / RMW_IMPLEMENTATION
+# cannot be matched directly. These rules catch the hook where it is visible:
+# the dynamic loader OPENING the library (FileOpened), the library being
+# written, and the persistent forms (/etc/ld.so.preload, ld.so.conf.d).
+#
+# Pulsar already ships, and these do not duplicate:
+#   privilege_escalation/ld_preload_shared_object_modif.toml  (write/rename of /etc/ld.so.preload)
+#   credential_access/credential_dumping.toml  (/proc/*/maps|mem reads, strace -p 1, gcore)
+#
+# TUNE markers: see ros2_stack.toml.
+
+[[rules]]
+name = "RoboDR: ROS 2 process loaded a library from outside the allowlisted library paths"
+type = "FileOpened"
+category = "defense_evasion"
+severity = "high"
+description = "A ROS 2 node (ROS install tree, robot workspace, or the Python interpreter that runs rclpy nodes) opened a shared object outside the system, ROS and workspace library directories. This is what an LD_PRELOAD or LD_LIBRARY_PATH hook looks like from the file system: the loader opens the injected .so. Pip --user installs under ~/.local also trigger this and should not exist on a fielded unit."
+# TUNE: add the robot's vendor SDK library directories to the NOT list.
+condition = '''
+(header.image STARTS_WITH "/opt/ros/" OR header.image STARTS_WITH "/opt/robot_ws/install/" OR header.image STARTS_WITH "/usr/bin/python3")
+AND (payload.filename ENDS_WITH ".so" OR payload.filename CONTAINS ".so.")
+AND NOT (
+  payload.filename STARTS_WITH "/usr/lib/"
+  OR payload.filename STARTS_WITH "/lib/"
+  OR payload.filename STARTS_WITH "/usr/lib64/"
+  OR payload.filename STARTS_WITH "/lib64/"
+  OR payload.filename STARTS_WITH "/usr/local/lib/"
+  OR payload.filename STARTS_WITH "/opt/ros/"
+  OR payload.filename STARTS_WITH "/opt/robot_ws/install/"
+  OR payload.filename == "/etc/ld.so.cache"
+  OR payload.filename == "/etc/ld.so.preload"
+)
+'''
+
+[[rules]]
+name = "RoboDR: ROS 2 process loaded /etc/ld.so.preload"
+type = "FileOpened"
+category = "defense_evasion"
+severity = "high"
+description = "A ROS 2 process opened /etc/ld.so.preload. glibc's loader only opens this file when it exists, so every ROS node start will report this while a system-wide preload is installed: every node is running with an injected library (persistent form of the one-env-var hook)."
+condition = '''
+payload.filename == "/etc/ld.so.preload"
+AND (header.image STARTS_WITH "/opt/ros/" OR header.image STARTS_WITH "/opt/robot_ws/install/" OR header.image STARTS_WITH "/usr/bin/python3")
+'''
+
+[[rules]]
+name = "RoboDR: Unexpected ROS 2 middleware (RMW) library loaded"
+type = "FileOpened"
+category = "defense_evasion"
+severity = "high"
+description = "A process opened an RMW implementation library that is not the one commissioned for this robot. RMW_IMPLEMENTATION is an environment variable that selects which librmw_*.so rmw_implementation dlopen()s; pointing it at a malicious RMW gives full read/write over every topic, below SROS 2. Default allowlist is Fast DDS (rmw_fastrtps_cpp) plus the shared helper libraries."
+# TUNE: set the allowlist to the robot's RMW (e.g. librmw_cyclonedds_cpp.so)
+# and verify the library names against the installed ROS distro.
+condition = '''
+payload.filename CONTAINS "/librmw_" AND payload.filename ENDS_WITH ".so"
+AND NOT (
+  payload.filename ENDS_WITH "/librmw_implementation.so"
+  OR payload.filename ENDS_WITH "/librmw_dds_common.so"
+  OR payload.filename ENDS_WITH "/librmw_security_common.so"
+  OR payload.filename ENDS_WITH "/librmw_fastrtps_cpp.so"
+  OR payload.filename ENDS_WITH "/librmw_fastrtps_shared_cpp.so"
+)
+'''
+
+[[rules]]
+name = "RoboDR: Shared library opened from a temporary directory"
+type = "FileOpened"
+category = "defense_evasion"
+severity = "high"
+description = "A shared object was opened from /tmp, /var/tmp, /dev/shm or /run/user. Hook libraries are staged in world-writable locations; legitimate robot software loads libraries from package-managed paths. Self-extracting bundles (PyInstaller onefile, some vendor installers) also do this."
+condition = '''
+(payload.filename STARTS_WITH "/tmp/" OR payload.filename STARTS_WITH "/var/tmp/" OR payload.filename STARTS_WITH "/dev/shm/" OR payload.filename STARTS_WITH "/run/user/")
+AND (payload.filename ENDS_WITH ".so" OR payload.filename CONTAINS ".so.")
+'''
+
+[[rules]]
+name = "RoboDR: Program executed from a temporary directory"
+type = "Exec"
+category = "execution"
+severity = "high"
+description = "A program was executed from /tmp, /var/tmp, /dev/shm or /run/user. Droppers and implants run from world-writable staging directories; fielded robot software does not."
+condition = '''
+payload.filename STARTS_WITH "/tmp/" OR payload.filename STARTS_WITH "/var/tmp/" OR payload.filename STARTS_WITH "/dev/shm/" OR payload.filename STARTS_WITH "/run/user/"
+'''
+
+[[rules]]
+name = "RoboDR: Shared library written into a system library path outside the package manager"
+type = "FileCreated"
+category = "persistence"
+severity = "high"
+description = "A shared object was created under /usr/lib, /lib, /usr/local/lib or /usr/lib64 by something other than dpkg. A hook placed in a trusted library directory evades the 'library outside allowlisted paths' rule, so creation there is flagged instead."
+condition = '''
+(payload.filename STARTS_WITH "/usr/lib/" OR payload.filename STARTS_WITH "/lib/" OR payload.filename STARTS_WITH "/usr/local/lib/" OR payload.filename STARTS_WITH "/usr/lib64/")
+AND (payload.filename ENDS_WITH ".so" OR payload.filename CONTAINS ".so.")
+AND NOT header.image ENDS_WITH "/dpkg"
+'''
+
+[[rules]]
+name = "RoboDR: Dynamic linker search path changed"
+type = "FileOpened"
+category = "persistence"
+severity = "high"
+description = "/etc/ld.so.conf or a file in /etc/ld.so.conf.d was opened for writing by something other than dpkg. Adding a directory to the linker search path lets a planted library shadow a real one for every ROS node (LD_LIBRARY_PATH made persistent)."
+condition = '''
+(payload.filename == "/etc/ld.so.conf" OR payload.filename STARTS_WITH "/etc/ld.so.conf.d/")
+AND (payload.flags CONTAINS "O_WRONLY" OR payload.flags CONTAINS "O_RDWR")
+AND NOT header.image ENDS_WITH "/dpkg"
+'''
+
+[[rules]]
+name = "RoboDR: Process memory written through /proc"
+type = "FileOpened"
+category = "defense_evasion"
+severity = "high"
+description = "/proc/<pid>/mem was opened for writing. This is code injection into a running process (MITRE T1055.009) without ptrace attach -- e.g. patching a running ROS node's publisher or controller in memory. Pulsar has no ptrace event; debuggers (gdb) also write here and should not run on a fielded unit."
+condition = '''
+payload.filename STARTS_WITH "/proc/" AND payload.filename ENDS_WITH "/mem"
+AND (payload.flags CONTAINS "O_WRONLY" OR payload.flags CONTAINS "O_RDWR")
+'''
+
+[[rules]]
+name = "RoboDR: Debugger or tracer started on robot controller"
+type = "Exec"
+category = "credential_access"
+severity = "medium"
+description = "gdb, gdbserver, strace, ltrace or frida was executed. These attach to running processes with ptrace and can read keys out of, or patch, ROS nodes. Pulsar has no ptrace event, so the tool's execution is the observable."
+condition = '''
+payload.filename ENDS_WITH "/gdb" OR payload.filename ENDS_WITH "/gdbserver" OR payload.filename ENDS_WITH "/strace"
+OR payload.filename ENDS_WITH "/ltrace" OR payload.filename ENDS_WITH "/frida" OR payload.filename ENDS_WITH "/frida-server"
+'''

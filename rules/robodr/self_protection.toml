@@ -1,0 +1,60 @@
+# RoboDR host rules: tampering with RoboDR and Pulsar on the robot.
+#
+# /etc/robodr holds the locked model profile (profile.json) that the ROS 2
+# graph sensor and the motion envelope check against; /etc/pulsar holds the
+# daemon config and these rules. Editing either blinds detection: a widened
+# profile accepts the attacker's participant, a deleted rule file stops alerts
+# after the next daemon restart (rules are loaded once at start-up).
+#
+# TUNE: when the signed update agent is installed, exclude it by header.image
+# in the first three rules (and only it). Service names in the last rule
+# depend on how RoboDR packages the daemon (Pulsar ships no systemd unit).
+
+[[rules]]
+name = "RoboDR: RoboDR profile or Pulsar configuration written"
+type = "FileOpened"
+category = "defense_evasion"
+severity = "high"
+description = "A file under /etc/robodr (model profile, envelope) or /etc/pulsar (daemon config, rules) was opened for writing. These are provisioned at commissioning and changed only by the signed update path."
+condition = '''
+(payload.filename STARTS_WITH "/etc/robodr/" OR payload.filename STARTS_WITH "/etc/pulsar/")
+AND (payload.flags CONTAINS "O_WRONLY" OR payload.flags CONTAINS "O_RDWR")
+'''
+
+[[rules]]
+name = "RoboDR: RoboDR profile or Pulsar configuration deleted"
+type = "FileDeleted"
+category = "defense_evasion"
+severity = "high"
+description = "A file under /etc/robodr or /etc/pulsar was deleted (e.g. a rule file, to stop alerts after the next restart)."
+condition = 'payload.filename STARTS_WITH "/etc/robodr/" OR payload.filename STARTS_WITH "/etc/pulsar/"'
+
+[[rules]]
+name = "RoboDR: RoboDR profile or Pulsar configuration renamed"
+type = "FileRename"
+category = "defense_evasion"
+severity = "high"
+description = "A file was renamed into or out of /etc/robodr or /etc/pulsar (atomic replacement of the profile, or moving a rule file away)."
+condition = '''
+payload.source STARTS_WITH "/etc/robodr/" OR payload.source STARTS_WITH "/etc/pulsar/"
+OR payload.destination STARTS_WITH "/etc/robodr/" OR payload.destination STARTS_WITH "/etc/pulsar/"
+'''
+
+[[rules]]
+name = "RoboDR: Attempt to stop the Pulsar or RoboDR service"
+type = "Exec"
+category = "defense_evasion"
+severity = "high"
+description = "systemctl stop/disable/mask/kill, or kill-by-name (pkill/killall), was run against the Pulsar daemon or a RoboDR service. Stopping the sensor is the first step before tampering with the robot."
+condition = '''
+(
+  payload.filename ENDS_WITH "/systemctl"
+  AND (payload.argv CONTAINS "stop" OR payload.argv CONTAINS "disable" OR payload.argv CONTAINS "mask" OR payload.argv CONTAINS "kill")
+  AND (payload.argv CONTAINS "pulsar" OR payload.argv CONTAINS "pulsar.service" OR payload.argv CONTAINS "pulsard"
+       OR payload.argv CONTAINS "pulsard.service" OR payload.argv CONTAINS "robodr" OR payload.argv CONTAINS "robodr.service")
+)
+OR (
+  (payload.filename ENDS_WITH "/pkill" OR payload.filename ENDS_WITH "/killall")
+  AND (payload.argv CONTAINS "pulsard" OR payload.argv CONTAINS "pulsar")
+)
+'''

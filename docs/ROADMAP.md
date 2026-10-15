@@ -138,7 +138,7 @@ everything running with no outbound connectivity.
 
 - `robodr-events` pure core with model profile + envelope. **[done]**
 - `robodr-sensor-ros2` passive SPDP sensor raising profile deviations. **[in progress]**
-- Reuse Pulsar's process/file/network + LSM probes unchanged; add `rules/robot.toml`.
+- Reuse Pulsar's process/file/network + LSM probes unchanged; add `rules/robodr/*.toml` (Pulsar TOML rules, see `rules/README.md`).
 - Observe-mode profile learning: a commissioning tool records the graph and
   envelopes over a clean run, emits a `profile.json`, the OEM locks it.
 - Bridge threats to AutoSecOps over the existing Kafka/adapter path (robot

@@ -1,0 +1,75 @@
+# RoboDR host rules: the ROS 2 control stack itself.
+#
+# Format: Pulsar rules-engine TOML (crates/modules/rules-engine/src/engine.rs).
+# Deploy to /etc/pulsar/rules/robodr/ next to Pulsar's own rules. Validate with
+# scripts/validate_rules.py before every deploy: ONE invalid rule anywhere under
+# rules_path makes the whole rules-engine module fail to start.
+#
+# TUNE markers: values to set per robot during commissioning (rules/README.md).
+#   /opt/ros/               ROS 2 binary install prefix (apt install of ros-<distro>-*)
+#   /opt/robot_ws/install/  the robot's own colcon workspace install prefix
+#
+# Replaces the four rules of the former rules/robot.toml, which did not load
+# (no severity/description, category "robotics") and, once loadable, would not
+# have matched (header.image on Exec is the new image, not the parent; IpAddr
+# has no STARTS_WITH).
+
+[[rules]]
+name = "RoboDR: Interactive shell started on robot controller"
+type = "Exec"
+category = "execution"
+severity = "medium"
+description = "A shell was started with -i (interactive). On a fielded robot controller nobody should open interactive shells; 'sh -i' / 'bash -i' is the classic reverse-shell form. Pulsar's Exec event does not carry the parent image, so this cannot be limited to shells spawned by ROS nodes; correlate header.parent_pid with the process tree in the SOC."
+condition = '''
+(payload.filename ENDS_WITH "/sh" OR payload.filename ENDS_WITH "/bash" OR payload.filename ENDS_WITH "/dash" OR payload.filename ENDS_WITH "/zsh" OR payload.filename ENDS_WITH "/ash" OR payload.filename ENDS_WITH "/busybox")
+AND payload.argv CONTAINS "-i"
+'''
+
+[[rules]]
+name = "RoboDR: ROS 2 process connects outside the robot's networks"
+type = "Connect"
+category = "command_and_control"
+severity = "high"
+description = "A process running from the ROS 2 install tree or the robot workspace opened a connection to an address outside loopback, RFC 1918, link-local and IPv6 ULA/link-local space. An air-gapped robot's control stack only talks to its own cell; anything else is a C2 or exfiltration channel. Python (rclpy) nodes run as /usr/bin/python3.x and are NOT covered unless added during commissioning."
+# TUNE: replace the private ranges with the robot's real cell/fleet subnets.
+# IpAddr supports only ==, !=, <, >, <=, >= (no STARTS_WITH): CIDRs are written
+# as inclusive ranges. In Rust's IpAddr ordering every IPv4 address sorts
+# before every IPv6 address, so the v4 ranges never match a v6 address.
+condition = '''
+(header.image STARTS_WITH "/opt/ros/" OR header.image STARTS_WITH "/opt/robot_ws/install/")
+AND NOT (
+  (payload.destination.ip >= "127.0.0.0" AND payload.destination.ip <= "127.255.255.255")
+  OR (payload.destination.ip >= "10.0.0.0" AND payload.destination.ip <= "10.255.255.255")
+  OR (payload.destination.ip >= "172.16.0.0" AND payload.destination.ip <= "172.31.255.255")
+  OR (payload.destination.ip >= "192.168.0.0" AND payload.destination.ip <= "192.168.255.255")
+  OR (payload.destination.ip >= "169.254.0.0" AND payload.destination.ip <= "169.254.255.255")
+  OR (payload.destination.ip >= "224.0.0.0" AND payload.destination.ip <= "239.255.255.255")
+  OR payload.destination.ip == "::1"
+  OR (payload.destination.ip >= "fc00::" AND payload.destination.ip <= "fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")
+  OR (payload.destination.ip >= "fe80::" AND payload.destination.ip <= "febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff")
+  OR (payload.destination.ip >= "ff00::" AND payload.destination.ip <= "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")
+)
+'''
+
+[[rules]]
+name = "RoboDR: ROS 2 install tree written outside the package manager"
+type = "FileOpened"
+category = "persistence"
+severity = "high"
+description = "A file under the ROS 2 install prefix or the robot workspace install tree was opened for writing by something other than dpkg. Nodes, launch files, parameter YAML and Python modules (including __pycache__/*.pyc) there define what the robot runs; a field write is tampering. Root-run rclpy nodes can write .pyc caches here: precompile at commissioning (python3 -m compileall) or run nodes unprivileged."
+condition = '''
+(payload.filename STARTS_WITH "/opt/ros/" OR payload.filename STARTS_WITH "/opt/robot_ws/install/")
+AND (payload.flags CONTAINS "O_WRONLY" OR payload.flags CONTAINS "O_RDWR")
+AND NOT header.image ENDS_WITH "/dpkg"
+'''
+
+[[rules]]
+name = "RoboDR: File created or moved into the ROS 2 install tree outside the package manager"
+type = "FileRename"
+category = "persistence"
+severity = "high"
+description = "A file was renamed into the ROS 2 install prefix or the robot workspace install tree by something other than dpkg (atomic replace of a node, launch file or parameter file)."
+condition = '''
+(payload.destination STARTS_WITH "/opt/ros/" OR payload.destination STARTS_WITH "/opt/robot_ws/install/")
+AND NOT header.image ENDS_WITH "/dpkg"
+'''

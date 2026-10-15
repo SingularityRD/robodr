@@ -1,0 +1,35 @@
+# RoboDR host rules: kernel modules on the robot controller.
+#
+# Threat: captured-unit exploitation / rootkits below the ROS stack (ROADMAP.md
+# section 0). A kernel module can hide processes, forge sensor device data and
+# defeat every user-space check, including Pulsar's own probes.
+#
+# Pulsar already ships, and these do not duplicate:
+#   persistence/kernel_module_injection.toml  (insmod / modprobe exec, high)
+#   defense_evasion/kernel_module_removal.toml (rmmod / modprobe -r)
+# Pulsar has no init_module/finit_module event, so a loader that calls the
+# syscall directly (no insmod) is only visible through the module FILE it
+# drops, which is what these rules watch.
+
+[[rules]]
+name = "RoboDR: Kernel module file written outside the package manager"
+type = "FileCreated"
+category = "persistence"
+severity = "high"
+description = "A kernel module file (.ko, .ko.xz, .ko.zst, .ko.gz) was created by something other than dpkg. Fielded robots get kernel modules only from the signed image; a freshly written .ko anywhere is a rootkit staging step. DKMS rebuilds (e.g. GPU drivers after a kernel update) also create .ko files and must happen only in the maintenance pipeline."
+condition = '''
+(payload.filename ENDS_WITH ".ko" OR payload.filename ENDS_WITH ".ko.xz" OR payload.filename ENDS_WITH ".ko.zst" OR payload.filename ENDS_WITH ".ko.gz")
+AND NOT header.image ENDS_WITH "/dpkg"
+'''
+
+[[rules]]
+name = "RoboDR: Kernel module autoload configuration changed"
+type = "FileOpened"
+category = "persistence"
+severity = "medium"
+description = "/etc/modules, /etc/modules-load.d or /etc/modprobe.d was opened for writing by something other than dpkg. These decide which modules load at boot and with which options (including blacklisting security modules)."
+condition = '''
+(payload.filename == "/etc/modules" OR payload.filename STARTS_WITH "/etc/modules-load.d/" OR payload.filename STARTS_WITH "/etc/modprobe.d/")
+AND (payload.flags CONTAINS "O_WRONLY" OR payload.flags CONTAINS "O_RDWR")
+AND NOT header.image ENDS_WITH "/dpkg"
+'''

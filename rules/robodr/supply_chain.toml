@@ -1,0 +1,62 @@
+# RoboDR host rules: software installed on the robot controller in the field.
+#
+# Threat: the SROS 2 keystore exfiltration case (Sakib et al., MILCOM 2025)
+# arrived as a trojaned Debian package; supply-chain / sovereignty threats in
+# ROADMAP.md section 0. Fielded robots are updated only through the signed,
+# offline update bundle, so ANY package install on the unit is an event to
+# record. During an authorised maintenance window these fire as the audit
+# trail; the rules engine has no time windows, so do not try to suppress them.
+#
+# Note on argv: Pulsar's argv CONTAINS matches one whole argument exactly
+# (pulsar-core event.rs Argv). "dpkg -i x.deb" matches "-i"; bundled short
+# options ("dpkg -iE") or "--install=..." forms do not. The file-based rule
+# below is the backstop for those.
+
+[[rules]]
+name = "RoboDR: Debian package installed on robot controller"
+type = "Exec"
+category = "initial_access"
+severity = "high"
+description = "dpkg, apt, apt-get, aptitude or gdebi was run to install, upgrade or unpack packages. A trojaned package is a demonstrated way to steal the SROS 2 keystore; fielded units receive software only through the signed offline bundle."
+condition = '''
+(
+  payload.filename ENDS_WITH "/dpkg"
+  AND (payload.argv CONTAINS "-i" OR payload.argv CONTAINS "--install" OR payload.argv CONTAINS "--unpack")
+)
+OR (
+  (payload.filename ENDS_WITH "/apt" OR payload.filename ENDS_WITH "/apt-get" OR payload.filename ENDS_WITH "/aptitude")
+  AND (payload.argv CONTAINS "install" OR payload.argv CONTAINS "reinstall" OR payload.argv CONTAINS "upgrade"
+       OR payload.argv CONTAINS "dist-upgrade" OR payload.argv CONTAINS "full-upgrade")
+)
+OR payload.filename ENDS_WITH "/gdebi"
+'''
+
+[[rules]]
+name = "RoboDR: Debian package maintainer script executed"
+type = "Exec"
+category = "execution"
+severity = "high"
+description = "A package maintainer script (preinst/postinst/prerm/postrm) was executed from /var/lib/dpkg/info or /var/lib/dpkg/tmp.ci. Trojaned packages act in these scripts, as root, at install time. Fires once per script, independent of which front-end (apt, dpkg, a renamed dpkg) installed the package."
+condition = 'payload.filename STARTS_WITH "/var/lib/dpkg/info/" OR payload.filename STARTS_WITH "/var/lib/dpkg/tmp.ci/"'
+
+[[rules]]
+name = "RoboDR: Debian package database changed"
+type = "FileRename"
+category = "persistence"
+severity = "medium"
+description = "A package file list in /var/lib/dpkg/info was replaced, i.e. a package was installed, upgraded or removed. dpkg writes <pkg>.list-new and renames it to <pkg>.list. Backstop for installs whose command line the Exec rule does not recognise."
+condition = 'payload.destination STARTS_WITH "/var/lib/dpkg/info/" AND payload.destination ENDS_WITH ".list"'
+
+[[rules]]
+name = "RoboDR: Python package installed on robot controller"
+type = "Exec"
+category = "initial_access"
+severity = "high"
+description = "pip install was run (pip/pip3 directly, or python3 -m pip). PyPI typosquats and trojaned wheels are the Python equivalent of a trojaned .deb, and rclpy nodes import from site-packages."
+condition = '''
+(
+  (payload.filename ENDS_WITH "/pip" OR payload.filename ENDS_WITH "/pip3" OR payload.filename CONTAINS "/pip3.")
+  AND payload.argv CONTAINS "install"
+)
+OR (payload.argv CONTAINS "-m" AND payload.argv CONTAINS "pip" AND payload.argv CONTAINS "install")
+'''

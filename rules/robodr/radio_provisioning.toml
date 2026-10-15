@@ -1,0 +1,52 @@
+# RoboDR host rules: Bluetooth / Wi-Fi provisioning path.
+#
+# Threat: UniPwn (Makris & Finisterre, 2025) -- the BLE Wi-Fi provisioning
+# service on Unitree robots ran attacker-supplied commands as root, and an
+# infected robot can scan for and infect others over BLE (wormable).
+# Pulsar's network-monitor sees IP sockets only; Bluetooth (AF_BLUETOOTH)
+# traffic and HCI are invisible to it. These rules watch the user-space tooling
+# and configuration files instead.
+#
+# TUNE: if the robot's own provisioning service legitimately calls one of these
+# tools in the field, exclude it by header.image after confirming the call path
+# during commissioning; prefer removing the tools from the image.
+
+[[rules]]
+name = "RoboDR: Bluetooth tooling executed on robot controller"
+type = "Exec"
+category = "lateral_movement"
+severity = "high"
+description = "A BlueZ command-line tool (bluetoothctl, hciconfig, hcitool, btmgmt, gatttool, btmon, hcidump, rfcomm, sdptool, l2ping) was executed. Fielded robots do not use interactive Bluetooth tools; a compromised unit uses them to discover and attack nearby robots over BLE (the UniPwn worm path)."
+condition = '''
+payload.filename ENDS_WITH "/bluetoothctl" OR payload.filename ENDS_WITH "/hciconfig" OR payload.filename ENDS_WITH "/hcitool"
+OR payload.filename ENDS_WITH "/btmgmt" OR payload.filename ENDS_WITH "/gatttool" OR payload.filename ENDS_WITH "/btmon"
+OR payload.filename ENDS_WITH "/hcidump" OR payload.filename ENDS_WITH "/rfcomm" OR payload.filename ENDS_WITH "/sdptool"
+OR payload.filename ENDS_WITH "/l2ping"
+'''
+
+[[rules]]
+name = "RoboDR: Wi-Fi configuration tooling executed on robot controller"
+type = "Exec"
+category = "command_and_control"
+severity = "medium"
+description = "A Wi-Fi client or access-point tool (wpa_cli, wpa_passphrase, iw, iwconfig, iwlist, nmcli, hostapd_cli) was executed. Joining the robot to an attacker's network, or turning it into an access point, gives a C2 channel around the robot's managed link; UniPwn injected commands through exactly this provisioning path."
+# TUNE: wpa_supplicant/hostapd daemons themselves are started at boot and are
+# deliberately not listed. Remove nmcli if NetworkManager dispatcher scripts
+# on this robot call it.
+condition = '''
+payload.filename ENDS_WITH "/wpa_cli" OR payload.filename ENDS_WITH "/wpa_passphrase" OR payload.filename ENDS_WITH "/iw"
+OR payload.filename ENDS_WITH "/iwconfig" OR payload.filename ENDS_WITH "/iwlist" OR payload.filename ENDS_WITH "/nmcli"
+OR payload.filename ENDS_WITH "/hostapd_cli"
+'''
+
+[[rules]]
+name = "RoboDR: Wireless network configuration modified"
+type = "FileOpened"
+category = "command_and_control"
+severity = "high"
+description = "A wpa_supplicant, hostapd, NetworkManager connection or netplan file was opened for writing. Provisioning a new SSID/PSK is how UniPwn-style attacks persist a network path; fielded units carry fixed, commissioned network config. Atomic writers create a temp file in the same directory, which this prefix match also catches."
+condition = '''
+(payload.filename STARTS_WITH "/etc/wpa_supplicant/" OR payload.filename STARTS_WITH "/etc/hostapd/"
+ OR payload.filename STARTS_WITH "/etc/NetworkManager/system-connections/" OR payload.filename STARTS_WITH "/etc/netplan/")
+AND (payload.flags CONTAINS "O_WRONLY" OR payload.flags CONTAINS "O_RDWR")
+'''
