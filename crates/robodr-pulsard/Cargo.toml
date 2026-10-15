@@ -1,0 +1,39 @@
+[package]
+name = "robodr-pulsard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pulsar daemon with the RoboDR modules registered."
+publish = false
+
+# PULSAR-DEPENDENT CRATE: links the whole Pulsar daemon (vendor/pulsar), so it
+# needs crates.io, clang + llvm-strip (eBPF probes) and Rust >= 1.98.1 (the
+# toolchain vendor/pulsar pins). Skipped by the offline build.
+# See docs/PULSAR-INTEGRATION.md.
+
+[[bin]]
+name = "robodr-pulsard"
+path = "src/main.rs"
+
+[features]
+# Pulsar's own `default` is `full` + `tls-openssl` (all modules incl. desktop
+# and SMTP notifiers). An air-gapped robot needs neither notifier, and dropping
+# them drops the openssl system dependency.
+default = ["pulsar-core-modules", "rules-engine"]
+# process-monitor, network-monitor, file-system-monitor, threat-logger.
+pulsar-core-modules = ["pulsar/core"]
+rules-engine = ["pulsar/rules-engine"]
+# Exactly upstream pulsard's module set.
+pulsar-full = ["pulsar/full", "pulsar/tls-openssl"]
+# Bundle SQLite (used by bpf-common) instead of linking the system library.
+sqlite3-vendored = ["pulsar/sqlite3-vendored"]
+
+[dependencies]
+pulsar = { workspace = true }
+robodr-sensor-ros2 = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+# Same versions as vendor/pulsar's workspace (its pulsard uses both).
+clap = { version = "4.6.7", features = ["derive"] }
+clap-verbosity-flag = "3.0.4"

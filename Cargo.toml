@@ -8,9 +8,11 @@ members = [
     "crates/robodr-firewall",
     "crates/robodr-motion",
     "crates/robodr-ocsf",
+    # Pulsar-dependent (need pulsar + tokio from crates.io; skipped offline):
+    "crates/robodr-pulsard",
     "crates/robodr-responder",
     "crates/robodr-rtps",
-    "crates/robodr-sensor-ros2",
+    "crates/robodr-sensor-ros2", # Pulsar-dependent
 ]
 # Pulsar is a git submodule with its own workspace; keep it out of ours.
 exclude = ["vendor"]
@@ -40,10 +42,14 @@ robodr-firewall = { path = "crates/robodr-firewall" }
 robodr-motion = { path = "crates/robodr-motion" }
 robodr-ocsf = { path = "crates/robodr-ocsf" }
 robodr-responder = { path = "crates/robodr-responder" }
+robodr-sensor-ros2 = { path = "crates/robodr-sensor-ros2" } # Pulsar-dependent
 
 # Pulsar is vendored as a git submodule under vendor/pulsar (see README).
 # We build on pulsar-core's module ABI (PulsarModule / SimplePulsarModule).
 pulsar-core = { path = "vendor/pulsar/crates/pulsar-core" }
+# The pulsard library (PulsarDaemonOpts, pulsar_daemon_run). Features are
+# chosen by robodr-pulsard, so upstream defaults (notifiers, openssl) are off.
+pulsar = { path = "vendor/pulsar", default-features = false }
 
 # External
 anyhow = "1"

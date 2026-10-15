@@ -1,15 +1,27 @@
-# RoboDR configuration overlay for the Pulsar daemon.
+# RoboDR configuration overlay for the Pulsar daemon (robodr-pulsard).
 #
-# Drop these blocks into the Pulsar config (pulsar.toml). RoboDR modules are
-# OFF by default; enable only the ones this robot needs.
+# Drop these blocks into the Pulsar config (/etc/pulsar/pulsar.toml, or the
+# file given with --config-file). Pulsar reads module settings from
+# `[module.<module-name>]` sections. RoboDR modules are OFF by default; enable
+# only the ones this robot needs.
 
-[robodr-sensor-ros2]
+[module.robodr-sensor-ros2]
+# Consumed by Pulsar itself (overrides the module's DEFAULT_ENABLED = false).
 enabled = true
-# Path to the locked model profile for THIS robot model.
+# Absolute path to the model profile for THIS robot model. While the profile
+# has "locked": false, every threat is tagged [observe-only].
 profile_path = "/etc/robodr/profile.json"
-# DDS defaults for RTPS domain 0. Change spdp_port for another domain:
-#   port = 7400 + 250 * domain_id
+# ROS_DOMAIN_ID of the robot. The SPDP port is derived from it:
+#   port = 7400 + 250 * domain_id      (domain_id 0..=232)
+domain_id = 0
+# Only for non-standard DDS port parameters: overrides the derived port.
+# spdp_port = 7400
 spdp_group = "239.255.0.1"
-spdp_port = 7400
-# Interface to join the multicast group on; 0.0.0.0 uses the default route.
+# Interface address to join the multicast group on; 0.0.0.0 lets the kernel
+# choose (the default-route interface).
 interface = "0.0.0.0"
+# Listen on the SPDP multicast socket. false only with an external datagram
+# source attached (capture-based listener).
+listen_spdp = true
+# Max distinct deviations remembered for de-duplication (1..=1048576).
+dedup_capacity = 4096
