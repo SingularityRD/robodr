@@ -8,3 +8,9 @@ description = "Observe-mode commissioning: learns a robot's model profile from c
 
 [dependencies]
 robodr-events = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "robodr-commission"
+path = "src/main.rs"

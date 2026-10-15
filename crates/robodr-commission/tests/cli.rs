@@ -1,0 +1,406 @@
+//! End-to-end tests of the `robodr-commission` binary.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+const BIN: &str = env!("CARGO_BIN_EXE_robodr-commission");
+
+fn example(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join(name)
+}
+
+/// A fresh temp dir per test (process id + counter keeps parallel tests apart).
+fn tmpdir(tag: &str) -> PathBuf {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let d = std::env::temp_dir().join(format!(
+        "robodr-commission-test-{}-{}-{tag}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+fn run(args: &[&str]) -> Output {
+    Command::new(BIN).args(args).output().expect("run binary")
+}
+
+fn s(p: &Path) -> &str {
+    p.to_str().unwrap()
+}
+
+fn code(o: &Output) -> i32 {
+    o.status.code().unwrap_or(-1)
+}
+
+fn learn_clean(dir: &Path, name: &str) -> PathBuf {
+    let out = dir.join(name);
+    let o = run(&[
+        "learn",
+        "--events",
+        s(&example("clean-run.jsonl")),
+        "--model",
+        "ugv-demo-synthetic",
+        "--out",
+        s(&out),
+        "--quiet",
+    ]);
+    assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
+    out
+}
+
+#[test]
+fn demo_learn_lock_check_clean_then_rogue() {
+    let d = tmpdir("demo");
+    let profile = learn_clean(&d, "profile.json");
+    let p: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&profile).unwrap()).unwrap();
+    assert_eq!(p["locked"], false);
+    assert_eq!(p["participants"].as_array().unwrap().len(), 4);
+
+    let locked = d.join("locked.json");
+    let o = run(&["lock", "--in", s(&profile), "--out", s(&locked)]);
+    assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
+
+    // Sprint 3 demo: clean re-run -> zero deviations.
+    let o = run(&[
+        "check",
+        "--profile",
+        s(&locked),
+        "--events",
+        s(&example("clean-run.jsonl")),
+    ]);
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(code(&o), 0, "{out}");
+    assert!(out.contains("0 deviation(s)"), "{out}");
+    assert!(!out.contains("NOT locked"));
+
+    // Rogue participant -> deviations, nonzero exit.
+    let o = run(&[
+        "check",
+        "--profile",
+        s(&locked),
+        "--events",
+        s(&example("rogue-participant.jsonl")),
+    ]);
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(code(&o), 1, "{out}");
+    assert!(out.contains("robot.ros2.unknown_participant"), "{out}");
+    assert!(
+        out.contains("robot.ros2.unauthorized_motion_writer"),
+        "{out}"
+    );
+
+    // JSON output is machine-readable.
+    let o = run(&[
+        "check",
+        "--json",
+        "--profile",
+        s(&locked),
+        "--events",
+        s(&example("rogue-participant.jsonl")),
+    ]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["deviations_total"], 2);
+}
+
+#[test]
+fn learn_is_byte_identical_across_runs() {
+    let d = tmpdir("determinism");
+    let mut outs = Vec::new();
+    for i in 0..2 {
+        let prof = d.join(format!("p{i}.json"));
+        let rep = d.join("report.json");
+        let rep_i = d.join(format!("r{i}.json"));
+        let o = run(&[
+            "learn",
+            "--events",
+            s(&example("clean-run.jsonl")),
+            "--model",
+            "m",
+            "--out",
+            s(&prof),
+            "--report",
+            s(&rep),
+            "--quiet",
+        ]);
+        assert_eq!(code(&o), 0);
+        std::fs::rename(&rep, &rep_i).unwrap();
+        outs.push((
+            std::fs::read(&prof).unwrap(),
+            std::fs::read(&rep_i).unwrap(),
+        ));
+    }
+    assert_eq!(outs[0].0, outs[1].0);
+    assert_eq!(outs[0].1, outs[1].1);
+    let r: serde_json::Value = serde_json::from_slice(&outs[0].1).unwrap();
+    assert_eq!(r["anomalies_total"], 0);
+    assert!(r["motion_channels"]["/cmd_vel"]["linear"]["p99"].is_number());
+}
+
+#[test]
+fn learn_respects_margin_and_ceilings() {
+    let d = tmpdir("ceiling");
+    let out = d.join("p.json");
+    let o = run(&[
+        "learn",
+        "--events",
+        s(&example("clean-run.jsonl")),
+        "--model=m",
+        "--margin",
+        "1.0",
+        "--ceiling-linear",
+        "1.0",
+        "--ceiling-joint=5",
+        "--out",
+        s(&out),
+    ]);
+    assert_eq!(code(&o), 0);
+    let p: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+    assert_eq!(p["motion_envelopes"]["/cmd_vel"]["max_linear_speed"], 1.0);
+    assert_eq!(
+        p["motion_envelopes"]["/mast/pan_tilt_cmd"]["max_joint_speed"],
+        0.749
+    );
+    let text = String::from_utf8_lossy(&o.stdout);
+    assert!(text.contains("observed_exceeds_ceiling"), "{text}");
+}
+
+#[test]
+fn learn_multiple_runs_merges() {
+    let d = tmpdir("multi");
+    let out = d.join("p.json");
+    let rep = d.join("r.json");
+    let o = run(&[
+        "learn",
+        "--events",
+        s(&example("clean-run.jsonl")),
+        "--events",
+        s(&example("rogue-participant.jsonl")),
+        "--model",
+        "m",
+        "--out",
+        s(&out),
+        "--report",
+        s(&rep),
+        "--quiet",
+    ]);
+    assert_eq!(code(&o), 0);
+    let p: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+    assert_eq!(p["participants"].as_array().unwrap().len(), 5);
+    let r: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&rep).unwrap()).unwrap();
+    assert_eq!(r["runs"].as_array().unwrap().len(), 2);
+    // The rogue was seen once: the report must call that out.
+    let warned = r["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|w| w["code"] == "participant_seen_once");
+    assert!(warned);
+}
+
+#[test]
+fn lock_refuses_bad_profiles_and_relock() {
+    let d = tmpdir("lock");
+    let empty = d.join("empty.json");
+    std::fs::write(&empty, r#"{"model":"m"}"#).unwrap();
+    let out = d.join("locked.json");
+    let o = run(&["lock", "--in", s(&empty), "--out", s(&out)]);
+    assert_eq!(code(&o), 1);
+    assert!(String::from_utf8_lossy(&o.stderr).contains("no participants"));
+    assert!(!out.exists());
+
+    let noenv = d.join("noenv.json");
+    std::fs::write(
+        &noenv,
+        r#"{"model":"m","participants":["aaaaaaaaaaaaaaaaaaaaaaaa"],"writer_topics":["/cmd_vel"],
+           "motion_envelopes":{"/cmd_vel":{"max_linear_speed":null,"max_joint_speed":null}}}"#,
+    )
+    .unwrap();
+    let o = run(&["lock", "--in", s(&noenv), "--out", s(&out)]);
+    assert_eq!(code(&o), 1);
+    assert!(String::from_utf8_lossy(&o.stderr).contains("/cmd_vel has no envelope"));
+
+    let good = learn_clean(&d, "p.json");
+    assert_eq!(code(&run(&["lock", "--in", s(&good), "--out", s(&out)])), 0);
+    let o = run(&["lock", "--in", s(&out), "--out", s(&d.join("again.json"))]);
+    assert_eq!(code(&o), 1);
+    assert!(String::from_utf8_lossy(&o.stderr).contains("already locked"));
+}
+
+#[test]
+fn diff_exit_codes_and_output() {
+    let d = tmpdir("diff");
+    let a = learn_clean(&d, "a.json");
+    let b = learn_clean(&d, "b.json");
+    let o = run(&["diff", s(&a), s(&b)]);
+    assert_eq!(code(&o), 0);
+    assert!(String::from_utf8_lossy(&o.stdout).contains("identical"));
+
+    let c = d.join("c.json");
+    let o = run(&[
+        "learn",
+        "--events",
+        s(&example("rogue-participant.jsonl")),
+        "--model",
+        "ugv-demo-synthetic",
+        "--out",
+        s(&c),
+        "--quiet",
+    ]);
+    assert_eq!(code(&o), 0);
+    let o = run(&["diff", s(&a), s(&c)]);
+    assert_eq!(code(&o), 1);
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        out.contains("+ participant 0f0f0f0f0f0f0f0f0f0f0f0f   [LOOSENS]"),
+        "{out}"
+    );
+    let o = run(&["diff", "--json", s(&a), s(&c)]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["participants_added"][0], "0f0f0f0f0f0f0f0f0f0f0f0f");
+}
+
+#[test]
+fn merge_subcommand() {
+    let d = tmpdir("merge");
+    let a = learn_clean(&d, "a.json");
+    let b = d.join("b.json");
+    std::fs::write(
+        &b,
+        r#"{"model":"ugv-demo-synthetic","participants":["bbbbbbbbbbbbbbbbbbbbbbbb"],"writer_topics":["/x"],
+           "motion_envelopes":{"/cmd_vel":{"max_linear_speed":9.0,"max_joint_speed":null}}}"#,
+    )
+    .unwrap();
+    let m = d.join("m.json");
+    let o = run(&["merge", "--out", s(&m), s(&a), s(&b)]);
+    assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
+    let p: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&m).unwrap()).unwrap();
+    assert_eq!(p["participants"].as_array().unwrap().len(), 5);
+    assert_eq!(p["motion_envelopes"]["/cmd_vel"]["max_linear_speed"], 9.0);
+    assert_eq!(p["locked"], false);
+
+    let other = d.join("o.json");
+    std::fs::write(&other, r#"{"model":"different"}"#).unwrap();
+    let o = run(&["merge", "--out", s(&m), s(&a), s(&other)]);
+    assert_eq!(code(&o), 2);
+}
+
+#[test]
+fn usage_and_input_errors_exit_2() {
+    let d = tmpdir("errors");
+    let out = d.join("p.json");
+    let cases: Vec<Vec<String>> = vec![
+        vec![],
+        vec!["frobnicate".into()],
+        vec!["learn".into(), "--out".into(), s(&out).into()],
+        vec!["learn".into(), "--events".into()],
+        vec![
+            "learn".into(),
+            "--events".into(),
+            "/nonexistent/x.jsonl".into(),
+            "--out".into(),
+            s(&out).into(),
+        ],
+        vec![
+            "learn".into(),
+            "--events".into(),
+            s(&example("clean-run.jsonl")).into(),
+            "--margin".into(),
+            "0.5".into(),
+            "--out".into(),
+            s(&out).into(),
+        ],
+        vec![
+            "learn".into(),
+            "--events".into(),
+            s(&example("clean-run.jsonl")).into(),
+            "--margin".into(),
+            "NaN".into(),
+            "--out".into(),
+            s(&out).into(),
+        ],
+        vec![
+            "learn".into(),
+            "--events".into(),
+            s(&example("clean-run.jsonl")).into(),
+            "--ceiling-linear".into(),
+            "fast".into(),
+            "--out".into(),
+            s(&out).into(),
+        ],
+        vec![
+            "learn".into(),
+            "--bogus".into(),
+            "--out".into(),
+            s(&out).into(),
+        ],
+        vec![
+            "learn".into(),
+            "--pcap".into(),
+            "x.pcap".into(),
+            "--out".into(),
+            s(&out).into(),
+        ],
+        vec!["diff".into(), "only-one.json".into()],
+        vec![
+            "check".into(),
+            "--profile".into(),
+            "/nonexistent.json".into(),
+        ],
+        vec![
+            "lock".into(),
+            "--in".into(),
+            "a".into(),
+            "--in".into(),
+            "b".into(),
+        ],
+    ];
+    for c in cases {
+        let o = Command::new(BIN).args(&c).output().unwrap();
+        assert_eq!(
+            code(&o),
+            2,
+            "args {c:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+    assert!(!out.exists(), "no profile may be written on error");
+}
+
+#[test]
+fn malformed_events_file_is_rejected_with_line() {
+    let d = tmpdir("malformed");
+    let bad = d.join("bad.jsonl");
+    std::fs::write(
+        &bad,
+        "{\"kind\":\"ros2_participant_discovered\",\"guid_prefix\":\"aaaaaaaaaaaaaaaaaaaaaaaa\",\"src_ip\":\"1.2.3.4\"}\nnot json\n",
+    )
+    .unwrap();
+    let out = d.join("p.json");
+    let o = run(&["learn", "--events", s(&bad), "--out", s(&out)]);
+    assert_eq!(code(&o), 2);
+    assert!(String::from_utf8_lossy(&o.stderr).contains("bad.jsonl:2"));
+    assert!(!out.exists());
+
+    let p = d.join("p.json");
+    std::fs::write(&p, "{not a profile").unwrap();
+    let o = run(&["lock", "--in", s(&p), "--out", s(&d.join("l.json"))]);
+    assert_eq!(code(&o), 2);
+}
+
+#[test]
+fn help_and_version() {
+    let o = run(&["--help"]);
+    assert_eq!(code(&o), 0);
+    assert!(String::from_utf8_lossy(&o.stdout).contains("learn"));
+    let o = run(&["--version"]);
+    assert_eq!(code(&o), 0);
+}
