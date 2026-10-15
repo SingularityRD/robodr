@@ -1,0 +1,13 @@
+# Pinned to the exact toolchain Pulsar pins (vendor/pulsar/rust-toolchain.toml),
+# because pulsar-core is compiled inside this workspace and Pulsar is only
+# tested on that compiler. Reproducible builds also require a fixed compiler.
+#
+# Air-gapped hosts: install this exact toolchain from the internal mirror
+# (RUSTUP_DIST_SERVER) or from the offline rustup bundle; see docs/BUILD.md.
+# A host that only has another toolchain can override for local work with
+# RUSTUP_TOOLCHAIN=<installed> (release builds must use this pin).
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+profile = "minimal"
