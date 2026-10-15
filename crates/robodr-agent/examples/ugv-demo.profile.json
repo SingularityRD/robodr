@@ -1,0 +1,13 @@
+{
+  "model": "ugv-demo-x1",
+  "locked": true,
+  "participants": [
+    "01103f5a8c2e000000000101",
+    "01103f5a8c2e000000000102",
+    "01103f5a8c2e000000000103"
+  ],
+  "writer_topics": ["/cmd_vel", "/odom", "/tf", "/scan"],
+  "motion_envelopes": {
+    "/cmd_vel": { "max_linear_speed": 0.5, "max_joint_speed": null }
+  }
+}

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/robodr-agent",
     "crates/robodr-blackbox",
     "crates/robodr-capture",
     "crates/robodr-commission",
@@ -33,6 +34,7 @@ authors = ["Singularity RD"]
 
 [workspace.dependencies]
 # RoboDR crates
+robodr-agent = { path = "crates/robodr-agent" }
 robodr-events = { path = "crates/robodr-events" }
 robodr-rtps = { path = "crates/robodr-rtps" }
 robodr-blackbox = { path = "crates/robodr-blackbox" }
