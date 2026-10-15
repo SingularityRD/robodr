@@ -1,0 +1,31 @@
+# cargo-fuzz (libFuzzer) harness for robodr-rtps. NOT a member of the main
+# workspace: the empty [workspace] table below makes this its own workspace
+# root, so `cargo build --workspace` at the repo root never sees it (and never
+# needs libfuzzer-sys or a nightly toolchain). See README.md.
+[package]
+name = "robodr-rtps-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+robodr-rtps = { path = "../crates/robodr-rtps" }
+robodr-events = { path = "../crates/robodr-events" }
+
+[[bin]]
+name = "parse_datagram"
+path = "fuzz_targets/parse_datagram.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1

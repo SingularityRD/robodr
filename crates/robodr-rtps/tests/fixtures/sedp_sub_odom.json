@@ -1,0 +1,12 @@
+[
+  {
+    "guid_prefix": "01105e2b9c41a7d38e6f1c22",
+    "kind": "participant",
+    "topic": null
+  },
+  {
+    "guid_prefix": "01105e2b9c41a7d38e6f1c22",
+    "kind": "reader",
+    "topic": "rt/odom"
+  }
+]
