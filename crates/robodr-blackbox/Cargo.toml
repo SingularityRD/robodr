@@ -8,3 +8,5 @@ description = "Signed, hash-chained black-box evidence recorder for RoboDR."
 
 [dependencies]
 robodr-events = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
