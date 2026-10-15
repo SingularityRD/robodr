@@ -44,7 +44,8 @@ pub struct MotionCommand {
 }
 
 /// Severity of a deviation, mapped 1:1 onto Pulsar/AutoSecOps severities.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Ordered by declaration: `Low < Medium < High < Critical`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Low,
