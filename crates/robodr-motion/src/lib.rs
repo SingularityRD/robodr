@@ -1,1 +1,188 @@
-//! Motion/feedback consistency detection (pure): catches injected telemetry by correlating commands with sensor-authored feedback.
+//! Motion/feedback consistency detection (pure): catches injected telemetry by
+//! correlating commands with sensor-authored feedback.
+//!
+//! # Threat
+//!
+//! *"Seeing is Not Believing"* (Shen et al., 2026) loaded a hook into a Secure
+//! ROS 2 process via one environment variable and injected **fabricated
+//! telemetry and control**: SROS 2 authenticated the messages because they came
+//! from a legitimate, key-holding process. Authentication cannot catch this;
+//! physics can. A robot's motion is constrained by its dynamics, so commands,
+//! feedback and independent sensors must agree. This crate checks that they
+//! do. It covers both directions:
+//!
+//! * telemetry that does not match what was commanded (fake or frozen
+//!   odometry, replayed streams), and
+//! * motion that nobody visibly commanded (a command injected below or beside
+//!   the channel we observe, or a mechanical fault).
+//!
+//! It also covers the roadmap's GNSS/navigation-spoofing case through the
+//! cross-sensor check (GNSS speed vs. odometry vs. IMU).
+//!
+//! The crate is **pure**: no I/O, no clocks, no threads. The motion sensor
+//! (`robodr-sensor-motion`, not in this crate) subscribes to command and
+//! feedback topics, stamps each message with a monotonic observer clock, and
+//! feeds [`ConsistencyMonitor`]. Findings become [`robodr_events::Deviation`]s
+//! via [`Finding::to_deviation`]. RoboDR only detects and reports: the monitor
+//! *reads* the platform's safety-stop state and never sets it.
+//!
+//! # Model
+//!
+//! Per tracked [`Axis`] (forward speed, yaw rate, max joint speed) the expected
+//! motion follows the command through
+//!
+//! 1. a **dead time** somewhere in `[latency_min_ns, latency_max_ns]`
+//!    (actuation latency *plus* feedback transport delay, as seen on the
+//!    observer clock), then
+//! 2. a **rate-limited first-order response**:
+//!    `de/dt = clamp((u - e) / tau, -max_accel, +max_accel)`, solved exactly
+//!    between command changes ([`first_order_step`]).
+//!
+//! The model runs twice, once at each end of the latency window; the
+//! **expected band** is the hull `[lo, hi]` of the two, widened by
+//! `abs_tol + rel_tol * max(|lo|, |hi|)`. A command older than
+//! `command_timeout_ns` (mirror of the base controller's watchdog) counts as
+//! rest; so does "no command seen yet". A command that leaves an axis
+//! unspecified (`None`) removes the expectation for that axis until it is
+//! specified again, after which checks resume only once the true state could
+//! have settled (`5 tau + |u|/max_accel + latency spread`). The first
+//! `warmup_ns` after the first event are never judged (initial state unknown).
+//!
+//! The model uses only the *observer* clock. Source stamps are untrusted and
+//! feed only the integrity checks.
+//!
+//! # Detections
+//!
+//! Every condition below must hold for a [`Persistence`] window (minimum
+//! duration **and** minimum consecutive samples) before it fires, then fires
+//! **once per episode** and re-arms only after `clear_samples` good samples.
+//! Integrity checks (stamps, non-finite) fire immediately but are latched
+//! per source and re-arm after `rearm_clean_samples` clean samples.
+//!
+//! | Rule id | Condition | Severity | Why |
+//! |---|---|---|---|
+//! | `robot.motion.feedback_divergence` | feedback outside the band while a non-rest command is in effect, over/opposite | High | The telemetry or the actuation is not what the command path says; either is an integrity failure on the control loop. |
+//! | ″ | ″ under-motion (moving less than commanded) | High if `safety_stop_signal_wired`, else Medium | An undeclared e-stop, obstacle or stall looks exactly like this. If the integrator wires the safety-stop state, an unexplained stall is suspicious; if not, it is too often legitimate to page at High. |
+//! | `robot.motion.uncommanded_motion` | command at rest (both latency ends) and feedback beyond the decaying band and the noise floor | Critical if `|v| >= uncommanded_critical`, else High | Motion nobody visibly commanded is either a command injected around the observed channel or a mechanical/safety fault; above walking-pace speeds it is a direct physical hazard. |
+//! | `robot.motion.frozen_feedback` (`FrozenValues`) | ≥ `frozen_min_samples` bit-identical samples over ≥ `frozen_min_duration_ns` while the band says the robot is moving | High | Real sensors are noisy; a constant stream while moving is the replay/freeze signature. |
+//! | ″ (`TimestampAnomaly` backwards / future) | stamp earlier than the previous from the same source, or ahead of the observer clock by > `max_future_skew_ns` | High | Replay loops and a second (injected) publisher interleaving with the real one produce backwards stamps; future stamps mean a forged or broken clock. |
+//! | ″ (duplicate / late) | identical stamp; stamp older than `max_stamp_age_ns` on arrival | Medium | Also produced by benign driver bugs and stalled pipelines. Duplicates are dropped from value checks. |
+//! | ″ (`StaleFeedback`) | a source that has reported silent for > `stale_after_ns` while moving (via [`ConsistencyMonitor::tick`]) | Medium | Silence is ambiguous (driver crash vs. suppression). |
+//! | `robot.motion.cross_sensor_disagreement` | two sources' latest readings (received within `cross_max_skew_ns`) differ beyond `cross_abs_tol + cross_rel_tol * max` | High | Fake odometry that mirrors the command passes the command check; it cannot also fool an independent IMU or GNSS. Evidence names the more trusted side. |
+//! | `robot.motion.invalid_feedback` | NaN / ±inf in a feedback value | Medium | Usually a driver fault, but NaN is also a classic way to poison downstream estimators. The value is dropped. |
+//!
+//! Each finding carries a `Copy` [`Evidence`] value with the numbers that
+//! justified it (band, tolerance, measurement, since, sample count, trust).
+//!
+//! ## Safety stop
+//!
+//! [`ConsistencyMonitor::set_safety_stop`] declares the platform's e-stop /
+//! protective-stop state. While active the expected motion is zero,
+//! under-motion is legitimate, and uncommanded-motion checks wait
+//! `safety_stop_grace_ns` for coast-down (after which motion during an
+//! e-stop *is* reported). After release, under-motion is not judged for
+//! `safety_stop_grace_ns` (drive re-enable). Without the signal, an e-stop
+//! while the planner keeps publishing shows up as a **Medium** under-motion
+//! divergence: we cannot tell an e-stop from a stall, and we say so rather
+//! than stay silent.
+//!
+//! ## Sensor-authored vs process-authored
+//!
+//! Telemetry we can trust is telemetry the attacker's process did not author.
+//! Wheel odometry and joint states in ROS 2 are *computed by a controller
+//! process* (e.g. `diff_drive_controller`) in the same software domain as the
+//! command path: the "Seeing is Not Believing" hook can fabricate them.
+//! An IMU is a separate device whose gyro measures rotation directly; a
+//! GNSS receiver is a separate device but listens to an RF signal an outside
+//! adversary can spoof. Default `trust_rank`: IMU 3 > GNSS 2 > wheel odometry
+//! = joint state 1 > other 0. Trust never suppresses a finding; it only
+//! states which side of a disagreement is more believable. Note that today
+//! every source still reaches us through a driver *process*; trust becomes
+//! real only when the IMU/GNSS path is read from the bus (Bus Tap) or
+//! attested. Until then the cross-check raises the attacker's cost (they must
+//! forge every sensor consistently) rather than making forgery impossible.
+//!
+//! # Determinism and allocation
+//!
+//! [`ConsistencyMonitor::new`] allocates the command ring once (`Vec` filled
+//! to `command_capacity`, then written only by index). After that,
+//! `on_command`, `on_feedback`, `tick` and `set_safety_stop` perform **no
+//! heap allocation**: state is fixed-size arrays, findings go to a
+//! caller-supplied `FnMut(Finding)` sink as `Copy` values, and the channel
+//! filter is a borrowed string compare. Cost per event is
+//! `O(command_capacity)` in the worst case (ring scans), constant otherwise.
+//! No clocks, randomness or hash maps: the same input sequence always yields
+//! the same findings. [`Finding::detail`] / [`Finding::to_deviation`] allocate
+//! and belong off the control path. Tests verify all of this with a counting
+//! global allocator.
+//!
+//! Hostile input never panics: non-finite command values count as 0 ("nothing
+//! valid commanded"), non-finite feedback is dropped and reported, all time
+//! arithmetic saturates, observer time regressions are clamped and counted,
+//! and negative wire stamps are rejected at conversion ([`stamp_from_ros`],
+//! [`stamp_from_secs_f64`]).
+//!
+//! # Tuning per platform
+//!
+//! Defaults ([`MonitorConfig::ugv`], [`MonitorConfig::manipulator`]) are
+//! plausible starting points, **not** values fitted to real hardware.
+//!
+//! * **Latency window**: measure command-to-first-motion plus feedback
+//!   transport on the real robot (step tests); set `min` at the 1st and `max`
+//!   at the 99th percentile. Typical: small UGV 20–150 ms, tracked or
+//!   hydraulic platforms 100–400 ms, torque-controlled arms 2–50 ms.
+//! * **`tau_s` / `max_accel`**: fit to step responses on the load and terrain
+//!   the platform actually sees. Set `max_accel` to the *largest* rate the
+//!   platform can achieve in either direction (braking included), otherwise
+//!   hard stops read as under-motion.
+//! * **Tolerances**: `abs_tol` ≥ 3σ of feedback noise at rest; `rel_tol`
+//!   covers model error at speed (20–30 % on rough terrain). GNSS speed is
+//!   poor below ~0.5 m/s: raise linear `cross_abs_tol` if GNSS is
+//!   cross-checked on slow platforms.
+//! * **Persistence**: longer than the longest benign transient (wheel slip
+//!   on the platform's worst surface, bump, docking contact). 0.5 s / 10
+//!   samples is a guess for a 50 Hz UGV.
+//! * **`command_capacity`**: ≥ command rate × `latency_max` × 2; watch
+//!   [`MonitorStats::history_underruns`].
+//! * **`frozen_min_samples`**: drivers that output quantised velocities
+//!   (encoder ticks at constant speed) can repeat values legitimately; raise
+//!   the threshold or disable `frozen_check` for that source.
+//! * Feed the *final* command (after `twist_mux` / safety filters) via
+//!   `command_channels`, or the band follows a command the robot never got.
+//!
+//! # Known limits
+//!
+//! * **Untuned.** Nothing here has seen a real lab trace; all thresholds
+//!   need fitting on the reference UGV (and the Franka arm used in the
+//!   original attack) before the rules leave observe mode.
+//! * One scalar model per axis: no slope/load dependence, no wheel slip
+//!   model, no turning/linear coupling, no per-joint model (joint axis is
+//!   max |speed| only).
+//! * The latency hull is exact for monotone responses; for rapidly reversing
+//!   commands intermediate latencies can fall slightly outside it (absorbed
+//!   by the tolerance).
+//! * An attacker who forges **every** feedback source consistently with a
+//!   fabricated command defeats this check; attestation of the runtime and
+//!   bus-level capture are the answer to that, not this crate.
+//! * Long genuine slip (stuck in mud) or a long stall will raise
+//!   cross-sensor/divergence findings: physically true, not an attack.
+//! * Persistence counts consecutive samples; noise straddling the band edge
+//!   can delay detection (no k-of-n yet).
+//! * IMU linear velocity is only usable if the caller supplies a fused
+//!   estimate; raw accelerometer integration drifts.
+//! * Stamps must share the observer's time base; the sensor must map ROS
+//!   time / sim time to it, or disable `stamp_check`.
+
+mod config;
+mod model;
+mod monitor;
+mod sample;
+
+pub use config::{AxisModel, ConfigError, MonitorConfig, Persistence, SourceConfig, SourceTable};
+pub use model::first_order_step;
+pub use monitor::{
+    rules, ConsistencyMonitor, Direction, Evidence, Finding, MonitorStats, StampAnomaly,
+};
+pub use sample::{
+    stamp_from_ros, stamp_from_secs_f64, Axis, CommandSample, FeedbackSample, FeedbackSource,
+};
