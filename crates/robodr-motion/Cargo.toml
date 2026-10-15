@@ -8,3 +8,7 @@ description = "Motion/feedback consistency detection (pure): catches injected te
 
 [dependencies]
 robodr-events = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
