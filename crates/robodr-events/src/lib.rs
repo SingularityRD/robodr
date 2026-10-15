@@ -86,8 +86,11 @@ pub enum RobotEvent {
 /// A single motion command, normalised across robot kinds.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MotionCommand {
-    /// Topic (ROS 2, de-mangled, e.g. `/cmd_vel`) or bus id the command
-    /// arrived on. Must match a key of `Profile::motion_envelopes` exactly.
+    /// Topic (ROS 2, de-mangled, e.g. `/cmd_vel`) the command arrived on.
+    /// Must match a key of `Profile::motion_envelopes` exactly. Profile keys
+    /// must be well-formed ROS names that are also writer topics (see
+    /// [`profile::Profile::validate`]), so a non-ROS bus id cannot currently
+    /// be given an envelope; a command on one is `robot.motion.unprofiled_channel`.
     pub channel: String,
     /// The announcing endpoint's GUID, if known (ties back to the graph).
     pub source_guid: Option<String>,

@@ -33,7 +33,26 @@
 //! enforced (backward compatible).
 //!
 //! Profile names are always the **de-mangled** ROS names (`/cmd_vel`, not
-//! `rt/cmd_vel`); [`Profile::validate`] rejects mangled or relative names.
+//! `rt/cmd_vel`). [`Profile::validate`] requires every entry of
+//! `writer_topics`, `services`, `actions`, `reader_topics` and every
+//! `motion_envelopes` key to be a well-formed fully qualified ROS name
+//! ([`graph::validate_full_name`](crate::graph::validate_full_name): leading
+//! `/`, no trailing `/`, no `//`, only `[A-Za-z0-9_/]`, no token starting with
+//! a digit). This matters for safety, not just tidiness: matching is exact, so
+//! an envelope keyed `cmd_vel`, `rt/cmd_vel` or `/cmd_vel/` silently never
+//! applies, and a foreign writer on the real `/cmd_vel` would not raise the
+//! Critical `unauthorized_motion_writer`. `raw_dds_topics` is exempt (raw DDS
+//! names are arbitrary; only empty entries are rejected).
+//!
+//! **Motion channels must be writable.** Every `motion_envelopes` key must
+//! also be allowed for writers by the same rule `evaluate` uses: listed in
+//! `writer_topics`, or an action feedback/status topic of an action in
+//! `actions`. Otherwise a *legitimate* profiled publisher of the motion topic
+//! would raise `robot.ros2.unknown_writer_topic` on every discovery (the
+//! unauthorized-motion check only fires for unknown participants; a known
+//! participant falls through to the ordinary topic allowlist), so the profile
+//! is internally inconsistent and is rejected
+//! ([`ProfileError::MotionChannelNotWritable`]).
 //!
 //! # Motion envelope
 //!
@@ -50,7 +69,10 @@
 //! the job of `robodr-motion`. Writers from unknown participants on profiled
 //! non-motion topics/services are reported only via the participant rule.
 
-use crate::graph::{ActionRole, Endpoint, Participant, RosName, RosNameKind};
+use crate::graph::{
+    demangle, validate_full_name, ActionRole, Endpoint, Participant, RosName, RosNameIssue,
+    RosNameKind,
+};
 use crate::{Deviation, Mode, MotionCommand, RobotEvent, Severity};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -143,6 +165,19 @@ pub enum ProfileError {
     NotARosName { set: &'static str, name: String },
     /// An entry of `raw_dds_topics` is empty.
     EmptyRawTopic,
+    /// An entry of a ROS-name set (or a `motion_envelopes` key) starts with
+    /// `/` but is otherwise malformed (`/cmd_vel/`, `//x`, `/a b`, `/1x`, …).
+    /// Empty / not-`/`-prefixed names are reported as
+    /// [`ProfileError::NotARosName`] instead (as before).
+    MalformedRosName {
+        set: &'static str,
+        name: String,
+        issue: RosNameIssue,
+    },
+    /// A `motion_envelopes` key is a valid ROS name but is not allowed for
+    /// writers (not in `writer_topics`, not part of a profiled action): every
+    /// legitimate publisher of it would be reported as an unknown writer.
+    MotionChannelNotWritable { channel: String },
 }
 
 impl fmt::Display for ProfileError {
@@ -167,6 +202,13 @@ impl fmt::Display for ProfileError {
                 "{set} entry {name:?} is not a fully qualified de-mangled ROS name"
             ),
             Self::EmptyRawTopic => write!(f, "raw_dds_topics has an empty entry"),
+            Self::MalformedRosName { set, name, issue } => {
+                write!(f, "{set} entry {name:?} is not a well-formed ROS name: {issue}")
+            }
+            Self::MotionChannelNotWritable { channel } => write!(
+                f,
+                "motion_envelopes channel {channel:?} is not in writer_topics (nor a profiled action topic); its legitimate publishers would be reported as unknown writers"
+            ),
         }
     }
 }
@@ -182,8 +224,23 @@ fn is_guid_prefix(s: &str) -> bool {
     s.len() == 24 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-fn is_ros_name(s: &str) -> bool {
-    s.len() > 1 && s.starts_with('/') && !s.chars().any(|c| c.is_whitespace() || c.is_control())
+/// Map a name in ROS-name set `set` to its validation error, if any. Empty and
+/// non-`/`-prefixed names keep the historic [`ProfileError::NotARosName`].
+fn ros_name_error(set: &'static str, name: &str) -> Option<ProfileError> {
+    match validate_full_name(name) {
+        Ok(()) => None,
+        Err(RosNameIssue::Empty | RosNameIssue::NotFullyQualified) => {
+            Some(ProfileError::NotARosName {
+                set,
+                name: name.to_owned(),
+            })
+        }
+        Err(issue) => Some(ProfileError::MalformedRosName {
+            set,
+            name: name.to_owned(),
+            issue,
+        }),
+    }
 }
 
 impl Profile {
@@ -198,7 +255,8 @@ impl Profile {
 
     /// Load-time validation for the commissioning tool and the sensor. Returns
     /// every problem found (not just the first). Callers must refuse to
-    /// enforce a profile that fails validation.
+    /// enforce a profile that fails validation. See the module docs for the
+    /// ROS-name and motion-channel rules.
     pub fn validate(&self) -> Result<(), Vec<ProfileError>> {
         let mut errs = Vec::new();
         if self.model.trim().is_empty() {
@@ -215,14 +273,7 @@ impl Profile {
             ("actions", &self.actions),
             ("reader_topics", &self.reader_topics),
         ] {
-            for n in names {
-                if !is_ros_name(n) {
-                    errs.push(ProfileError::NotARosName {
-                        set,
-                        name: n.clone(),
-                    });
-                }
-            }
+            errs.extend(names.iter().filter_map(|n| ros_name_error(set, n)));
         }
         if self.raw_dds_topics.iter().any(String::is_empty) {
             errs.push(ProfileError::EmptyRawTopic);
@@ -230,6 +281,14 @@ impl Profile {
         for (channel, env) in &self.motion_envelopes {
             if channel.is_empty() {
                 errs.push(ProfileError::EmptyMotionChannel);
+            } else if let Some(e) = ros_name_error("motion_envelopes", channel) {
+                errs.push(e);
+            } else if !self.name_allowed(&demangle(&format!("rt{channel}")), &self.writer_topics) {
+                // Same predicate check_writer applies to a known participant
+                // publishing `rt<channel>`.
+                errs.push(ProfileError::MotionChannelNotWritable {
+                    channel: channel.clone(),
+                });
             }
             for (field, lim) in [
                 (EnvelopeField::MaxLinearSpeed, env.max_linear_speed),
@@ -835,6 +894,7 @@ mod tests {
         p.participants.insert("abc".into());
         p.writer_topics.insert("rt/cmd_vel".into());
         p.services.insert("add".into());
+        // "/" and "/a b" are now MalformedRosName (were NotARosName).
         p.actions.insert("/".into());
         p.reader_topics.insert("/a b".into());
         p.raw_dds_topics.insert(String::new());
@@ -855,6 +915,178 @@ mod tests {
         let j = serde_json::to_string(&errs).unwrap();
         assert!(j.contains("\"error\":\"invalid_envelope_limit\""), "{j}");
         assert!(j.contains("\"value\":null"), "{j}");
+    }
+
+    #[test]
+    fn validate_rejects_malformed_ros_names_in_every_set() {
+        let bad = [
+            ("cmd_vel", false),
+            ("rt/cmd_vel", false),
+            ("", false),
+            ("/cmd_vel/", true),
+            ("//cmd_vel", true),
+            ("/cmd//vel", true),
+            ("/", true),
+            ("/cmd vel", true),
+            ("/cmd-vel", true),
+            ("/1cmd", true),
+            ("/ns/9x", true),
+            ("/x\u{0}", true),
+        ];
+        for (name, malformed) in bad {
+            for set in ["writer_topics", "services", "actions", "reader_topics"] {
+                let mut p = profile();
+                match set {
+                    "writer_topics" => p.writer_topics.insert(name.into()),
+                    "services" => p.services.insert(name.into()),
+                    "actions" => p.actions.insert(name.into()),
+                    _ => p.reader_topics.insert(name.into()),
+                };
+                let errs = p.validate().unwrap_err();
+                assert_eq!(errs.len(), 1, "{set} {name:?}: {errs:?}");
+                match &errs[0] {
+                    ProfileError::NotARosName { set: s, name: n } => {
+                        assert!(!malformed, "{name:?}");
+                        assert_eq!((*s, n.as_str()), (set, name));
+                    }
+                    ProfileError::MalformedRosName {
+                        set: s, name: n, ..
+                    } => {
+                        assert!(malformed, "{name:?}");
+                        assert_eq!((*s, n.as_str()), (set, name));
+                    }
+                    e => panic!("unexpected {e:?}"),
+                }
+                assert!(errs[0].to_string().contains(&format!("{name:?}")));
+            }
+        }
+        // Raw DDS names are exempt from ROS rules (only empty is rejected).
+        let mut p = profile();
+        for raw in ["rt//cmd_vel", "cmd vel", "/x/", "1abc", "rt/cmd_vel"] {
+            p.raw_dds_topics.insert(raw.into());
+        }
+        assert_eq!(p.validate(), Ok(()));
+        // Accepted edge forms.
+        let mut p = profile();
+        for ok in ["/a__b", "/_hidden", "/robot1/cmd_vel2"] {
+            p.writer_topics.insert(ok.into());
+        }
+        assert_eq!(p.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_malformed_motion_envelope_keys() {
+        for (key, malformed) in [
+            ("cmd_vel", false),
+            ("rt/cmd_vel", false),
+            ("/cmd_vel/", true),
+            ("//cmd_vel", true),
+            ("/cmd_vel ", true),
+            ("/2cmd_vel", true),
+        ] {
+            let mut p = profile();
+            p.motion_envelopes.insert(key.into(), Envelope::default());
+            let errs = p.validate().unwrap_err();
+            assert_eq!(errs.len(), 1, "{key:?}: {errs:?}");
+            let set = match &errs[0] {
+                ProfileError::NotARosName { set, .. } if !malformed => *set,
+                ProfileError::MalformedRosName { set, .. } if malformed => *set,
+                e => panic!("{key:?}: unexpected {e:?}"),
+            };
+            assert_eq!(set, "motion_envelopes");
+        }
+        // Empty key: only the historic EmptyMotionChannel, not doubled.
+        let mut p = profile();
+        p.motion_envelopes
+            .insert(String::new(), Envelope::default());
+        assert_eq!(p.validate(), Err(vec![ProfileError::EmptyMotionChannel]));
+    }
+
+    #[test]
+    fn motion_channel_must_be_writable() {
+        // Inconsistent profile: /arm has an envelope but no writer entry, so
+        // the legitimate (known) publisher raises unknown_writer_topic.
+        let mut p = profile();
+        p.motion_envelopes.insert(
+            "/arm".into(),
+            Envelope {
+                max_linear_speed: None,
+                max_joint_speed: Some(1.0),
+            },
+        );
+        assert_eq!(
+            rule_of(&p, &writer(KNOWN, "rt/arm")).as_deref(),
+            Some("robot.ros2.unknown_writer_topic")
+        );
+        let errs = p.validate().unwrap_err();
+        assert_eq!(
+            errs,
+            vec![ProfileError::MotionChannelNotWritable {
+                channel: "/arm".into()
+            }]
+        );
+        assert!(errs[0].to_string().contains("/arm"));
+        let j = serde_json::to_string(&errs).unwrap();
+        assert!(
+            j.contains("\"error\":\"motion_channel_not_writable\""),
+            "{j}"
+        );
+        // Fixed by listing it: now consistent, known writer clean, foreign
+        // writer Critical.
+        p.writer_topics.insert("/arm".into());
+        assert_eq!(p.validate(), Ok(()));
+        assert!(p.evaluate(&writer(KNOWN, "rt/arm")).is_none());
+        assert_eq!(
+            rule_of(&p, &writer(FOREIGN, "rt/arm")).as_deref(),
+            Some("robot.ros2.unauthorized_motion_writer")
+        );
+        // A motion channel that is an action topic of a profiled action is
+        // writable through `actions` (same predicate as check_writer).
+        let mut q = profile();
+        q.motion_envelopes.insert(
+            "/navigate_to_pose/_action/feedback".into(),
+            Envelope::default(),
+        );
+        assert_eq!(q.validate(), Ok(()));
+        assert!(q
+            .evaluate(&writer(KNOWN, "rt/navigate_to_pose/_action/feedback"))
+            .is_none());
+        // ...but a service name or reader-only topic does not make it writable.
+        let mut r = profile();
+        r.services.insert("/drive".into());
+        r.reader_topics.insert("/drive".into());
+        r.motion_envelopes
+            .insert("/drive".into(), Envelope::default());
+        assert_eq!(
+            r.validate(),
+            Err(vec![ProfileError::MotionChannelNotWritable {
+                channel: "/drive".into()
+            }])
+        );
+    }
+
+    #[test]
+    fn malformed_wire_names_do_not_match_profiled_names() {
+        let p = profile();
+        for t in ["rt//cmd_vel", "rt/cmd_vel/", "rt/cmd_vel//", "rt//odom"] {
+            assert_eq!(
+                rule_of(&p, &writer(KNOWN, t)).as_deref(),
+                Some("robot.dds.unknown_raw_writer"),
+                "{t}"
+            );
+            assert_eq!(
+                rule_of(&p, &writer(FOREIGN, t)).as_deref(),
+                Some("robot.dds.unknown_raw_writer"),
+                "{t}"
+            );
+        }
+        for t in ["rq//add_two_intsRequest", "rr/add_two_ints/Reply"] {
+            assert_eq!(
+                rule_of(&p, &writer(KNOWN, t)).as_deref(),
+                Some("robot.dds.unknown_raw_writer"),
+                "{t}"
+            );
+        }
     }
 
     // ---- serde ----

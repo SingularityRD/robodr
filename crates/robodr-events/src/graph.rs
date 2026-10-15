@@ -36,6 +36,15 @@
 //! The other prefixes reserved by the ROS 2 naming design (`rs`, `rp`, `ra`)
 //! are not used by any shipping rmw; names using them are `Raw`.
 //!
+//! **Well-formedness.** A prefixed name is only de-mangled if the resulting
+//! ROS name (topic name, or service name after the suffix is stripped) is a
+//! well-formed fully qualified ROS name per [`validate_full_name`]. Anything
+//! else (`rt//cmd_vel`, `rt/cmd_vel/`, `rt/1x`, `rq/a bRequest`, …) cannot have
+//! been created by a conformant rmw, so it is classified `Raw` and keeps its
+//! exact spelling: it can never be confused with the profiled ROS name it
+//! resembles (DDS matches topic names byte for byte, so `rt//cmd_vel` does not
+//! reach `/cmd_vel` subscribers either).
+//!
 //! **Raw DDS.** A topic without a ROS prefix (e.g. a vendor DDS tool, or a
 //! name like `rtfoo` with no slash) is `Raw`, keeps its exact spelling, and is
 //! never matched against ROS topic allowlists. ROS nodes cannot receive it as a
@@ -217,6 +226,122 @@ impl fmt::Display for RosName {
     }
 }
 
+/// Why a string is not a well-formed fully qualified ROS name. See
+/// [`validate_full_name`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "issue", rename_all = "snake_case")]
+pub enum RosNameIssue {
+    /// The name is empty.
+    Empty,
+    /// The name does not start with `/` (relative, `~`-private, or still
+    /// DDS-mangled such as `rt/cmd_vel`).
+    NotFullyQualified,
+    /// The name ends with `/` (this includes the bare root `/`).
+    EndsWithSlash,
+    /// The name contains `//` (an empty token).
+    RepeatedSlash,
+    /// A character outside `[A-Za-z0-9_/]` at byte offset `index`.
+    InvalidCharacter { index: usize, ch: char },
+    /// A token (the part after a `/`) starts with a digit, at byte offset
+    /// `index`.
+    TokenStartsWithDigit { index: usize },
+}
+
+impl fmt::Display for RosNameIssue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => write!(f, "name is empty"),
+            Self::NotFullyQualified => {
+                write!(f, "name must start with '/' (fully qualified, de-mangled)")
+            }
+            Self::EndsWithSlash => write!(f, "name must not end with '/'"),
+            Self::RepeatedSlash => write!(f, "name must not contain '//'"),
+            Self::InvalidCharacter { index, ch } => write!(
+                f,
+                "character {ch:?} at byte {index} is not one of [A-Za-z0-9_/]"
+            ),
+            Self::TokenStartsWithDigit { index } => {
+                write!(f, "token at byte {index} starts with a digit")
+            }
+        }
+    }
+}
+
+/// Check that `name` is a well-formed **fully qualified, de-mangled** ROS 2
+/// topic / service / action name, following the rules of rmw's
+/// `rmw_validate_full_topic_name` as we know them (not verified against the
+/// C source here):
+///
+/// * not empty, starts with `/`, does not end with `/` (so `/` alone is
+///   rejected), no `//`;
+/// * only ASCII `[A-Za-z0-9_/]` (no `~`, `{}`: those belong to relative
+///   names before expansion);
+/// * no token starts with a digit (`/1abc`, `/a/2b`).
+///
+/// Deliberately **not** checked, because rmw does not reject them and a
+/// learned profile must be able to list every name a conformant node can put
+/// on the wire: repeated underscores (`__`, discouraged by the ROS 2 naming
+/// design article) and the 247-character `RMW_TOPIC_MAX_NAME_LENGTH`
+/// (whose exact value and enforcement differ between ROS 2 releases). Neither
+/// affects matching, which is exact.
+///
+/// Checks are applied in the order above; the first issue is returned.
+pub fn validate_full_name(name: &str) -> Result<(), RosNameIssue> {
+    if name.is_empty() {
+        return Err(RosNameIssue::Empty);
+    }
+    if !name.starts_with('/') {
+        return Err(RosNameIssue::NotFullyQualified);
+    }
+    if name.ends_with('/') {
+        return Err(RosNameIssue::EndsWithSlash);
+    }
+    if name.contains("//") {
+        return Err(RosNameIssue::RepeatedSlash);
+    }
+    let mut prev_slash = false;
+    for (index, ch) in name.char_indices() {
+        if !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '/') {
+            return Err(RosNameIssue::InvalidCharacter { index, ch });
+        }
+        if prev_slash && ch.is_ascii_digit() {
+            return Err(RosNameIssue::TokenStartsWithDigit { index });
+        }
+        prev_slash = ch == '/';
+    }
+    Ok(())
+}
+
+/// `true` iff [`validate_full_name`] accepts `name`.
+pub fn is_full_name(name: &str) -> bool {
+    validate_full_name(name).is_ok()
+}
+
+/// For a DDS name that carries a ROS prefix (`rt/`, `rq/`, `rr/`) but whose
+/// ROS part is malformed (so [`demangle`] classifies it `Raw`), the issue with
+/// that ROS part; `None` for well-formed ROS names and for names without a ROS
+/// prefix. For `rq/`/`rr/` the `Request`/`Reply` (or `_`) suffix is stripped
+/// first when present.
+///
+/// Intended for commissioning, to report "a node announced something that
+/// looks like a ROS name but cannot be one" instead of silently learning it as
+/// a raw DDS topic.
+pub fn mangled_name_issue(dds: &str) -> Option<RosNameIssue> {
+    let (rest, suffixes): (&str, &[&str]) = if let Some(r) = dds.strip_prefix("rt/") {
+        (r, &[])
+    } else if let Some(r) = dds.strip_prefix("rq/") {
+        (r, &["Request", "Request_"])
+    } else {
+        (dds.strip_prefix("rr/")?, &["Reply", "Reply_"])
+    };
+    let rest = suffixes
+        .iter()
+        .find_map(|s| rest.strip_suffix(s))
+        .unwrap_or(rest);
+    // `rest` lost its leading '/' with the prefix; put it back for the check.
+    validate_full_name(&format!("/{rest}")).err()
+}
+
 /// Strip a two-letter ROS prefix, requiring the following `/` and a
 /// non-empty name after it.
 fn strip_ros_prefix<'a>(dds: &'a str, prefix: &str) -> Option<&'a str> {
@@ -224,12 +349,13 @@ fn strip_ros_prefix<'a>(dds: &'a str, prefix: &str) -> Option<&'a str> {
     (rest.len() > 1 && rest.starts_with('/')).then_some(rest)
 }
 
-/// Strip one of the service suffixes, requiring a non-trivial name remains.
+/// Strip one of the service suffixes, requiring a well-formed ROS name
+/// remains.
 fn strip_service_suffix<'a>(name: &'a str, suffixes: &[&str]) -> Option<&'a str> {
     suffixes
         .iter()
         .find_map(|s| name.strip_suffix(s))
-        .filter(|n| n.len() > 1)
+        .filter(|n| is_full_name(n))
 }
 
 /// Split `/a/b/_action/send_goal` into (`/a/b`, SendGoal).
@@ -243,7 +369,8 @@ fn split_action(name: &str) -> Option<(&str, ActionComponent)> {
 
 /// Classify and de-mangle a DDS topic name as announced in SEDP.
 ///
-/// Never panics; any input that is not a well-formed ROS 2 mangled name is
+/// Never panics; any input that is not a well-formed ROS 2 mangled name
+/// (including a prefixed name whose ROS part fails [`validate_full_name`]) is
 /// returned as [`RosNameKind::Raw`] with the exact input as `name`.
 pub fn demangle(dds: &str) -> RosName {
     let raw = || RosName {
@@ -252,6 +379,9 @@ pub fn demangle(dds: &str) -> RosName {
     };
 
     if let Some(topic) = strip_ros_prefix(dds, "rt") {
+        if !is_full_name(topic) {
+            return raw();
+        }
         let kind = match split_action(topic) {
             Some((action, component)) if !component.is_service() => RosNameKind::ActionPart {
                 action: action.to_owned(),
@@ -396,6 +526,32 @@ mod tests {
             ("ra/foo", Raw, "ra/foo"),
             ("RT/cmd_vel", Raw, "RT/cmd_vel"),
             ("DCPSParticipant", Raw, "DCPSParticipant"),
+            // Prefixed but the ROS part is malformed: Raw, never the
+            // well-formed name it resembles.
+            ("rt//cmd_vel", Raw, "rt//cmd_vel"),
+            ("rt/cmd_vel/", Raw, "rt/cmd_vel/"),
+            ("rt/cmd_vel//", Raw, "rt/cmd_vel//"),
+            ("rt/a//b", Raw, "rt/a//b"),
+            ("rt/1cmd", Raw, "rt/1cmd"),
+            ("rt/ns/2x", Raw, "rt/ns/2x"),
+            ("rt/cmd vel", Raw, "rt/cmd vel"),
+            ("rt/cmd-vel", Raw, "rt/cmd-vel"),
+            ("rt/~/x", Raw, "rt/~/x"),
+            ("rt/cmd_vel\u{0}", Raw, "rt/cmd_vel\u{0}"),
+            ("rt/\u{e9}", Raw, "rt/\u{e9}"),
+            ("rq//addRequest", Raw, "rq//addRequest"),
+            ("rq/add/Request", Raw, "rq/add/Request"),
+            (
+                "rr/a b/_action/send_goalReply",
+                Raw,
+                "rr/a b/_action/send_goalReply",
+            ),
+            ("rt/nav//_action/status", Raw, "rt/nav//_action/status"),
+            ("rt/_action/", Raw, "rt/_action/"),
+            // Digits are fine when not leading a token; `__` is not rejected.
+            ("rt/robot1/cmd_vel2", Topic, "/robot1/cmd_vel2"),
+            ("rt/a__b", Topic, "/a__b"),
+            ("rt/_private", Topic, "/_private"),
         ];
         for (input, kind, name) in cases {
             let got = demangle(input);
@@ -450,8 +606,109 @@ mod tests {
             let _ = demangle(n);
             let _ = demangle(n).to_string();
         }
-        let long = format!("rt/{}", "a/_action/".repeat(10_000));
+        let long = format!("rt/{}x", "a/_action/".repeat(10_000));
         assert_eq!(demangle(&long).kind, RosNameKind::Topic);
+        // Trailing slash makes the same name malformed.
+        let long = format!("rt/{}", "a/_action/".repeat(10_000));
+        assert_eq!(demangle(&long).kind, RosNameKind::Raw);
+    }
+
+    #[test]
+    fn validate_full_name_rules() {
+        use RosNameIssue::*;
+        for ok in [
+            "/a",
+            "/cmd_vel",
+            "/ns/robot1/odom",
+            "/_hidden",
+            "/a__b",
+            "/A/B_9",
+            "/nav/_action/send_goal",
+            "/x/y/z/w",
+        ] {
+            assert_eq!(validate_full_name(ok), Ok(()), "{ok}");
+            assert!(is_full_name(ok));
+        }
+        let cases: Vec<(&str, RosNameIssue)> = vec![
+            ("", Empty),
+            ("cmd_vel", NotFullyQualified),
+            ("rt/cmd_vel", NotFullyQualified),
+            ("~/x", NotFullyQualified),
+            (" /x", NotFullyQualified),
+            ("/", EndsWithSlash),
+            ("/cmd_vel/", EndsWithSlash),
+            ("//", EndsWithSlash),
+            ("//cmd_vel", RepeatedSlash),
+            ("/a//b", RepeatedSlash),
+            ("/a b", InvalidCharacter { index: 2, ch: ' ' }),
+            ("/cmd-vel", InvalidCharacter { index: 4, ch: '-' }),
+            (
+                "/x\u{0}",
+                InvalidCharacter {
+                    index: 2,
+                    ch: '\u{0}',
+                },
+            ),
+            (
+                "/\u{e9}",
+                InvalidCharacter {
+                    index: 1,
+                    ch: '\u{e9}',
+                },
+            ),
+            ("/{ns}/x", InvalidCharacter { index: 1, ch: '{' }),
+            ("/a.b", InvalidCharacter { index: 2, ch: '.' }),
+            ("/1abc", TokenStartsWithDigit { index: 1 }),
+            ("/ns/2x", TokenStartsWithDigit { index: 4 }),
+        ];
+        for (n, issue) in cases {
+            assert_eq!(validate_full_name(n), Err(issue), "{n:?}");
+            assert!(!is_full_name(n));
+            assert!(!issue.to_string().is_empty());
+        }
+        // Never panics on hostile input.
+        for n in [
+            "\u{FFFF}",
+            "/\u{1F600}",
+            &"/".repeat(100_000),
+            &"/a".repeat(100_000),
+        ] {
+            let _ = validate_full_name(n);
+        }
+        assert!(is_full_name(&"/a".repeat(100_000)));
+    }
+
+    #[test]
+    fn mangled_name_issue_reports_malformed_ros_parts() {
+        use RosNameIssue::*;
+        for (n, want) in [
+            ("rt/cmd_vel", None),
+            ("rq/addRequest", None),
+            ("rr/addReply_", None),
+            ("rq/add", None),
+            ("rtfoo", None),
+            ("vendor diag", None),
+            ("/cmd_vel/", None),
+            ("rt//cmd_vel", Some(RepeatedSlash)),
+            ("rt/cmd_vel/", Some(EndsWithSlash)),
+            ("rt/", Some(EndsWithSlash)),
+            ("rt/bad name", Some(InvalidCharacter { index: 4, ch: ' ' })),
+            (
+                "rq/ctl\u{7}Request",
+                Some(InvalidCharacter {
+                    index: 4,
+                    ch: '\u{7}',
+                }),
+            ),
+            ("rr/1xReply", Some(TokenStartsWithDigit { index: 1 })),
+            ("rq/Request", Some(EndsWithSlash)),
+        ] {
+            assert_eq!(mangled_name_issue(n), want, "{n:?}");
+            // Consistent with demangle: an issue implies Raw.
+            if want.is_some() {
+                assert_eq!(demangle(n).kind, RosNameKind::Raw, "{n:?}");
+            }
+        }
     }
 
     #[test]
