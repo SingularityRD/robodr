@@ -15,10 +15,27 @@ Change these and the plan rescales; they are stated so the plan is honest.
   - **E3 — Backend:** fleet control plane, AutoSecOps bridge, console.
   - **E4 — Embedded/HW:** Sentinel Box, Lite SDK (RTOS), attestation, fieldbus.
   - Security research is shared across all four, 1 day/week, feeding the eval corpus.
-- **Lab start:** Gazebo simulation + one real ROS 2 controller; closed-controller
-  and drone hardware arrive at Phase 2/3.
+- **Lab start:** Gazebo simulation of a **defence ground UGV** + one real ROS 2
+  companion computer; a CAN / MIL-STD-1553 lower stack and drone/RTOS hardware
+  arrive at Phase 2/3.
+- **Defence posture (sets the bar from Sprint 1):**
+  - **Air-gapped by default.** The lab and every build run with no outbound
+    connectivity; dependencies (crates, Pulsar, images, models) are mirrored
+    into an internal registry, never pulled from the public internet at build.
+  - **Export control decided first.** An ECCN/ITAR-vs-dual-use and Turkish
+    defence-export classification of RoboDR is produced in Sprint 1, before any
+    code is shared outside the team; it gates what goes in the open-core repo
+    vs. the controlled defence repo.
+  - **Protective scope only.** No attack tooling ships; attack reproduction lives
+    only in the internal eval corpus to validate detection. RoboDR never
+    overrides platform safety/command authority.
+  - **Assurance:** reproducible builds, signed releases, SBOM per build, and a
+    path to the assurance level the customer programme requires.
+- **Team note:** personnel and facility clearances, and which engineers may touch
+  the controlled repo, are a programme prerequisite — assumed in place, not
+  scheduled here.
 - **Definition of Done (every task):** code + unit tests + docs; CI green
-  (`fmt`, `clippy -D warnings`, tests); merged to `main`; demoable.
+  (`fmt`, `clippy -D warnings`, tests); SBOM emitted; merged to `main`; demoable.
 - **Each sprint ends in a demo** — something that runs, not a status update.
 
 The sprint count per phase firms up as the previous phase lands; Phase 1 is
@@ -27,16 +44,28 @@ split into issues at phase start.
 
 ---
 
-## Phase 1 — Detect on one ROS 2 AMR (Sprints 1–5)
+## Phase 1 — Detect on one defence UGV (Sprints 1–5)
 
-Goal of the phase: on a real ROS 2 AMR, catch an unknown participant, an
-unauthorized motion publisher, and a host compromise, visible in one console and
-flowing into AutoSecOps. Exit = the Phase 1 criteria in the roadmap.
+Goal of the phase: on a ROS 2 UGV companion computer, catch an unknown
+participant, an unauthorized motion/command publisher, and a host compromise,
+visible in one console and flowing into AutoSecOps — all air-gapped. Exit = the
+Phase 1 criteria in the roadmap.
 
-### Sprint 1 — Lab up, pipeline green
+Defence note: attestation (Sprint 3 spike → brought forward from Phase 3) and
+air-gapped build/packaging (Sprint 1) lead here because the captured-unit and
+no-cloud threats are Phase 1 realities for a defence platform, not later ones.
 
-Objective: a robot producing real DDS traffic, and the existing code building and
-testing in CI end to end.
+### Sprint 1 — Lab up, pipeline green, air-gapped and classified
+
+Objective: an air-gapped lab with a UGV producing real DDS traffic, the code
+building and testing in CI off an internal mirror, and the export classification
+decided before anything leaves the team.
+
+Added defence tasks this sprint (on top of the general Sprint 1 work below):
+- **E3:** Stand up the internal crate/image mirror; CI builds with no public
+  internet; emit an SBOM per build.
+- **Lead/E1:** Produce the export-control classification memo and split the repo
+  into open-core vs. controlled-defence before any external sharing.
 
 - **E2:** Stand up Gazebo + `turtlebot3` (or equivalent) on ROS 2; capture real
   SPDP/SEDP traffic to `pcap` fixtures checked into `crates/robodr-sensor-ros2/tests/fixtures/`.

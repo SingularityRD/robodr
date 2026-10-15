@@ -25,6 +25,16 @@ that makes RoboDR a response to reality, not a feature list.
 | **"Seeing is Not Believing"** (Shen et al., 2026) | One env var loaded a hook into Secure ROS 2 that injected fabricated telemetry *and* control, fooling an AI detector 87% of the time on a real Franka arm. | Motion/feedback consistency check + attestation of the runtime, not just the host. Telemetry we verify is sensor-authored, not process-authored. |
 | **BadVLA / SilentDrift** (2025–26) | Near-100% backdoors in vision-language-action models, stealthy and surviving fine-tuning; SilentDrift hides in the action-chunk approach phase. | AI Guard (AIDR) on VLA/LLM robots + Motion Firewall as the backstop the model cannot talk its way past. |
 
+Defence-platform threats raise the same two lessons in a harder setting —
+contested comms, no cloud, and an adversary who may physically hold a unit:
+
+| Threat (defence) | What it is | RoboDR answer |
+|---|---|---|
+| **C2 / datalink compromise** | Spoofed or replayed command-and-control over a contested RF link; injected waypoints or mode changes. | Command source + envelope check at the robot; signed-command verification; link-integrity sensor. Enforcement is local, never cloud-dependent. |
+| **GNSS / navigation spoofing** | Falsified position/time drives the platform off-mission. | GNSS-vs-inertial consistency check (sensor-authored vs claimed), flagged as a navigation deviation. |
+| **Captured-unit exploitation** | An adversary physically recovers a platform and extracts keys, firmware or mission data, or re-flashes it. | Measured-boot attestation + sealed keys; tamper response; a unit that fails attestation never rejoins the fleet at trust. (Zeroization/anti-tamper is the platform's job; RoboDR detects and refuses trust.) |
+| **Supply-chain / sovereignty** | Trojaned package or dependency (cf. the SROS 2 keystore case) in a platform that must run with no outside connectivity and under export control. | Entry-station Analyzer scan of every offline bundle; signed, versioned, rollback-able updates; on-prem/air-gapped by default; no component phones home. |
+
 Two lessons set the architecture:
 
 1. **Authentication is not authorization.** SROS 2 and DDS Security verify *who*
@@ -57,6 +67,28 @@ Two lessons set the architecture:
    for visibility, policy and analysis — removable without losing protection.
 6. **Deterministic on the control path.** Only the Motion Firewall sits in-path,
    with a fixed latency budget and no dynamic allocation in the hot loop.
+7. **Protective scope only.** RoboDR defends a platform from compromise. It does
+   not target, it does not control weapons or effects, and it never overrides a
+   platform's safety or weapons-safety interlocks. It detects, refuses trust, and
+   requests a safe state; the platform's own safety and command authority remain
+   final. Attack reproduction lives only in the lab eval corpus, to prove our
+   detection — never shipped as an operational capability.
+8. **Sovereign, air-gapped, export-aware.** For defence the default deployment is
+   on-prem/air-gapped with no outbound connectivity; builds are reproducible from
+   source we hold (Pulsar is vendored, not pulled at build time); crypto and
+   model choices allow a sovereign variant; and export-control classification is
+   decided before anything ships (see §3 and SPRINTS.md).
+
+### Defence-first sequencing
+
+This is a defence company, so the first platform is a **defence ground UGV**
+(Linux + ROS 2 companion computer over a CAN / MIL-STD-1553 lower stack), run
+**air-gapped**, not an industrial AMR. That pulls three things the roadmap
+otherwise placed later into the front: **attestation** (captured-unit threat),
+**air-gapped packaging** (no cloud in the field), and the **Bus Tap** for the
+fieldbus. Industrial/commercial robots become a later, lower-assurance
+derivative of the same core — not the other way round. The phase goals below are
+written for that target; the component dependency order is unchanged.
 
 ---
 
@@ -97,11 +129,12 @@ Each phase names its deliverable, the exit criteria that let us move on, and the
 customer-visible result. Durations are deliberately omitted; the exit criteria,
 not a calendar, gate each phase.
 
-### Phase 1 — Detect on one robot kind (MVP)
+### Phase 1 — Detect on one defence UGV (MVP)
 
-**Goal:** On a ROS 2 Linux AMR, detect an unknown DDS participant, an
-unauthorized motion publisher, and a host compromise, and surface them in one
-place.
+**Goal:** On a ROS 2 Linux UGV companion computer (bench or Gazebo first, then a
+real controller), detect an unknown DDS participant, an unauthorized motion/
+command publisher, and a host compromise, and surface them in one console — with
+everything running with no outbound connectivity.
 
 - `robodr-events` pure core with model profile + envelope. **[done]**
 - `robodr-sensor-ros2` passive SPDP sensor raising profile deviations. **[in progress]**
