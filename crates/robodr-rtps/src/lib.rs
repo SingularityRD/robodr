@@ -1,287 +1,184 @@
-//! A minimal, read-only RTPS discovery parser (SPDP + SEDP).
+//! A read-only RTPS discovery parser (SPDP + SEDP) for RoboDR.
 //!
 //! DDS participants announce themselves with SPDP (Simple Participant Discovery
-//! Protocol), and announce each of their writers and readers with SEDP (Simple
-//! Endpoint Discovery Protocol). Both ride in RTPS datagrams. RoboDR only
-//! *reads* this traffic; it never writes to the bus.
+//! Protocol) and each of their writers and readers with SEDP (Simple Endpoint
+//! Discovery Protocol). Both ride in RTPS datagrams. RoboDR only *reads* this
+//! traffic; it never writes to the bus. This crate is pure: no I/O, no clock,
+//! no global state.
 //!
-//! What we extract:
-//! - From the RTPS header: the sender's 12-byte GUID prefix
-//!   -> `Ros2ParticipantDiscovered`.
-//! - From SEDP DATA submessages sent by the builtin publications writer
-//!   (entity `0x000003c2`) and subscriptions writer (`0x000004c2`): topic name,
-//!   type name and endpoint GUID -> `Ros2WriterDiscovered` /
-//!   `Ros2ReaderDiscovered`.
+//! # API
 //!
-//! Everything else in the datagram (INFO_TS, INFO_DST, HEARTBEAT, ACKNACK,
-//! user data) is skipped. The parser is defensive: every length is checked
-//! against the remaining buffer, so a truncated or crafted packet yields fewer
-//! events, never a panic or an out-of-bounds read.
+//! - [`parse_datagram`]: datagram -> `RobotEvent`s (unchanged signature).
+//! - [`parse_datagram_detailed`]: datagram -> [`DatagramReport`] with the
+//!   full SPDP data ([`SpdpInfo`]: locators, entity name, ROS 2 enclave, domain
+//!   id, vendor, lease), endpoint attribution details ([`EndpointInfo`]),
+//!   dispose/unregister signals ([`EndpointRemoval`], [`ParticipantRemoval`]),
+//!   [`Anomaly`]s and per-submessage [`ParseStats`].
+//! - [`FragmentReassembler`]: optional, stateful, memory-capped DATA_FRAG
+//!   reassembly for large discovery samples.
+//! - [`vendor`]: known DDS vendor ids.
 //!
-//! Reference: OMG DDSI-RTPS 2.2, §8.3 (structure), §8.5 (discovery), §9.4.5.3
-//! (DATA submessage), §9.6.2 (parameter IDs).
+//! # What is parsed
+//!
+//! Submessages are walked per DDSI-RTPS 2.5 §8.3 / §9.4 with per-submessage
+//! endianness (E flag). INFO_SRC changes the *source* GUID prefix for the
+//! submessages that follow it; INFO_DST, INFO_TS, PAD, HEARTBEAT, ACKNACK,
+//! GAP, *_FRAG control, INFO_REPLY*, DDS-Security (0x30..0x34, counted) and
+//! vendor-specific (0x80..) submessages are skipped by length. Per §9.4.5.1.3,
+//! `octetsToNextHeader == 0` means "to end of message" except for PAD and
+//! INFO_TS, where it is an empty body.
+//!
+//! DATA from the builtin SPDP writer (`0x000100c2`) and SEDP publications /
+//! subscriptions writers (`0x000003c2` / `0x000004c2`, plus their DDS-Security
+//! `0xff..` variants when the payload is not encrypted) is decoded as a PL_CDR
+//! (BE or LE) parameter list. DATA_FRAG from those writers is counted
+//! ([`DatagramReport::fragmented_discovery_seen`]) and, with a
+//! [`FragmentReassembler`], reassembled within strict memory caps.
+//!
+//! # Which GUID is authoritative
+//!
+//! Discovery data can be *relayed*: a Fast DDS discovery server re-sends other
+//! participants' SPDP/SEDP from its own builtin writers, and INFO_SRC lets a
+//! message speak for another prefix. So the RTPS header prefix says who sent
+//! the bytes, not who owns the announced entity. The rules:
+//!
+//! - **Endpoint owner** = prefix of `PID_ENDPOINT_GUID`; else the instance key
+//!   (inline `PID_KEY_HASH` or serialized key, which for builtin topics *is* the
+//!   GUID); else prefix of `PID_PARTICIPANT_GUID`; else the current source
+//!   prefix (header, as changed by INFO_SRC). The endpoint GUID wins because
+//!   RTPS requires an endpoint's GUID prefix to equal its participant's and it
+//!   is the GUID that matching and user traffic use. A disagreeing
+//!   `PID_PARTICIPANT_GUID` is flagged ([`EndpointInfo::guid_conflict`],
+//!   [`Anomaly::EndpointParticipantMismatch`]).
+//! - **Participant (SPDP)** = prefix of `PID_PARTICIPANT_GUID`; else the
+//!   instance key; else the source prefix.
+//! - The *sender* is kept separately ([`EndpointInfo::source`],
+//!   [`EndpointInfo::relayed`]).
+//!
+//! None of these are authenticated without DDS-Security: every GUID here is a
+//! *claim*. The attribution only decides whose claim it is.
+//!
+//! # Events
+//!
+//! [`parse_datagram`] emits exactly one `Ros2ParticipantDiscovered` per
+//! distinct participant per datagram: the header prefix (always, as before),
+//! each distinct non-zero INFO_SRC prefix, and each SPDP-announced participant;
+//! the same prefix seen several ways is merged into one event whose `locators`
+//! are the SPDP unicast locators (metatraffic, then default; UDPv4 as
+//! `a.b.c.d:port`, UDPv6 as `[v6]:port`; other kinds such as shared memory are
+//! not rendered but are kept with their `kind` in [`SpdpInfo`]). Then one
+//! writer/reader event per SEDP announcement. Disposed / unregistered
+//! instances (`PID_STATUS_INFO`) produce **no** discovered event; they appear
+//! only in the detailed report. (The header participant of a datagram that
+//! carries its own SPDP dispose is still reported, because it did send the
+//! datagram.)
+//!
+//! # Robustness
+//!
+//! Every length is checked against the remaining buffer; nothing is allocated
+//! in proportion to a claimed length (strings, user data and locators are
+//! copied only after they are known to be inside the datagram; reassembly
+//! buffers are capped). Strictness: parameter lengths must be multiples of 4
+//! (§9.4.2.11), parameter lists must end with a sentinel, CDR strings must
+//! carry exactly one trailing NUL and be UTF-8, `octetsToInlineQos` must cover
+//! the fixed fields, protocol major version must be 2. Anything else yields
+//! fewer events plus an [`Anomaly`], never a panic. Duplicate parameters keep
+//! the first value; a conflicting duplicate is an anomaly.
+//!
+//! # Not handled / not verified
+//!
+//! - XCDR2 (`PL_CDR2`) discovery payloads and `PID_EXTENDED` are not decoded
+//!   (reported as anomalies). Vendor-specific PIDs (bit 15) are ignored.
+//! - Protected (DDS-Security encrypted) discovery is opaque; only counted.
+//! - Verified against hand-built datagrams from the spec layout, not yet
+//!   against pcaps from real Fast DDS / Cyclone / Connext stacks.
+//!
+//! Reference: OMG DDSI-RTPS 2.2 / 2.5, §8.3 (messages), §8.5 (discovery),
+//! §9.4 (submessage encoding), §9.6 (parameter ids, builtin topic data).
 
-use robodr_events::graph::{Endpoint, Participant};
+mod frag;
+mod parse;
+pub mod vendor;
+mod wire;
+
+#[cfg(test)]
+mod discovery_tests;
+#[cfg(test)]
+mod testutil;
+
+pub use frag::{FragmentReassembler, ReassemblyLimits, HARD_MAX_SAMPLE_BYTES};
+pub use parse::{
+    Anomaly, Attribution, DatagramReport, DiscoveryTopic, EndpointInfo, EndpointKind,
+    EndpointRemoval, EntityId, Guid, GuidPrefix, ParseStats, ParticipantRemoval, RtpsDuration,
+    RtpsHeader, SpdpInfo, StatusInfo, ENTITYID_PARTICIPANT,
+    ENTITYID_SEDP_PUBLICATIONS_SECURE_WRITER, ENTITYID_SEDP_PUBLICATIONS_WRITER,
+    ENTITYID_SEDP_SUBSCRIPTIONS_SECURE_WRITER, ENTITYID_SEDP_SUBSCRIPTIONS_WRITER,
+    ENTITYID_SPDP_SECURE_WRITER, ENTITYID_SPDP_WRITER, GUIDPREFIX_UNKNOWN, MAX_ANOMALIES,
+    MAX_LOCATORS_PER_LIST,
+};
+pub use wire::{Locator, LOCATOR_KIND_INVALID, LOCATOR_KIND_UDPV4, LOCATOR_KIND_UDPV6};
+
 use robodr_events::RobotEvent;
 
-/// RTPS datagrams begin with this magic.
-const RTPS_MAGIC: &[u8; 4] = b"RTPS";
-/// Header is magic(4) + version(2) + vendorId(2) + guidPrefix(12) = 20 bytes.
-const RTPS_HEADER_LEN: usize = 20;
-const GUID_PREFIX_LEN: usize = 12;
-
-/// DATA submessage id.
-const SUBMSG_DATA: u8 = 0x15;
-/// Submessage flags (byte 1 of the submessage header).
-const FLAG_E: u8 = 0x01; // endianness: 1 = little-endian
-const FLAG_Q: u8 = 0x02; // inline QoS present
-const FLAG_D: u8 = 0x04; // serialized data present
-
-/// Builtin SEDP writer entity ids (EntityId is an octet array: no endianness).
-const ENTITY_SEDP_PUBLICATIONS_WRITER: [u8; 4] = [0x00, 0x00, 0x03, 0xc2];
-const ENTITY_SEDP_SUBSCRIPTIONS_WRITER: [u8; 4] = [0x00, 0x00, 0x04, 0xc2];
-
-/// Parameter ids we read.
-const PID_SENTINEL: u16 = 0x0001;
-const PID_TOPIC_NAME: u16 = 0x0005;
-const PID_TYPE_NAME: u16 = 0x0007;
-const PID_ENDPOINT_GUID: u16 = 0x005a;
-
-/// Serialized-payload encapsulation identifiers for parameter lists. The
-/// identifier itself is always big-endian on the wire.
-const PL_CDR_BE: u16 = 0x0002;
-const PL_CDR_LE: u16 = 0x0003;
-
 /// Lower-case hex of a 12-byte GUID prefix, no separators.
-pub fn hex12(prefix: &[u8; GUID_PREFIX_LEN]) -> String {
-    let mut s = String::with_capacity(GUID_PREFIX_LEN * 2);
-    for b in prefix {
-        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
-        s.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
-    }
-    s
+pub fn hex12(prefix: &GuidPrefix) -> String {
+    wire::hex(prefix)
+}
+
+/// Lower-case hex of a 16-byte GUID, no separators.
+pub fn hex_guid(guid: &Guid) -> String {
+    wire::hex(guid)
 }
 
 /// Pull the GUID prefix out of a well-formed RTPS header. `None` if the buffer
 /// is too short or the magic is wrong (not RTPS, so not ours to read).
-pub fn guid_prefix(datagram: &[u8]) -> Option<[u8; GUID_PREFIX_LEN]> {
-    if datagram.len() < RTPS_HEADER_LEN || &datagram[0..4] != RTPS_MAGIC {
-        return None;
-    }
-    let mut prefix = [0u8; GUID_PREFIX_LEN];
-    prefix.copy_from_slice(&datagram[8..8 + GUID_PREFIX_LEN]);
-    Some(prefix)
+pub fn guid_prefix(datagram: &[u8]) -> Option<GuidPrefix> {
+    parse::RtpsHeader::parse(datagram).map(|h| h.guid_prefix)
 }
 
-/// Parse one RTPS datagram into robot events: the sending participant, plus one
-/// writer or reader event per SEDP endpoint announcement it carries.
+/// Parse one RTPS datagram into robot events: one participant event per
+/// distinct participant, then one writer or reader event per SEDP endpoint
+/// announcement. Stateless: DATA_FRAG is counted but not reassembled (use
+/// [`FragmentReassembler::parse_datagram`] for that). Non-RTPS input -> empty.
 pub fn parse_datagram(datagram: &[u8], src_ip: &str) -> Vec<RobotEvent> {
-    let Some(prefix) = guid_prefix(datagram) else {
-        return Vec::new();
-    };
-    let mut events = vec![RobotEvent::Ros2ParticipantDiscovered(Participant {
-        guid_prefix: hex12(&prefix),
-        src_ip: src_ip.to_string(),
-        locators: Vec::new(),
-    })];
-    events.extend(walk_submessages(&datagram[RTPS_HEADER_LEN..], &prefix));
-    events
+    parse_datagram_detailed(datagram)
+        .map(|r| r.to_events(src_ip))
+        .unwrap_or_default()
 }
 
-/// Walk the RTPS submessages after the header. Each submessage is:
-/// `submessageId(1) | flags(1) | octetsToNextHeader(2) | body`.
-/// The flags' E bit sets the endianness of the length field and of the body.
-fn walk_submessages(mut buf: &[u8], header_prefix: &[u8; GUID_PREFIX_LEN]) -> Vec<RobotEvent> {
-    let mut events = Vec::new();
-    while buf.len() >= 4 {
-        let id = buf[0];
-        let flags = buf[1];
-        let le = flags & FLAG_E != 0;
-        let len = read_u16(buf, 2, le).unwrap_or(0) as usize;
-        // octetsToNextHeader == 0 means "to end of message" for the last one.
-        let body_len = if len == 0 { buf.len() - 4 } else { len };
-        if 4 + body_len > buf.len() {
-            break; // truncated or crafted length: stop rather than over-read.
-        }
-        let body = &buf[4..4 + body_len];
-        if id == SUBMSG_DATA {
-            if let Some(event) = parse_sedp_data(body, flags, header_prefix) {
-                events.push(event);
-            }
-        }
-        buf = &buf[4 + body_len..];
-    }
-    events
+/// Parse one RTPS datagram into a full [`DatagramReport`]. `None` if it is
+/// not RTPS. Stateless (no DATA_FRAG reassembly).
+pub fn parse_datagram_detailed(datagram: &[u8]) -> Option<DatagramReport> {
+    parse::parse(datagram, None)
 }
 
-/// Which side of the graph an SEDP announcement describes.
-enum EndpointKind {
-    Writer,
-    Reader,
-}
-
-/// Parse a DATA submessage body. Returns an endpoint event only when the DATA
-/// comes from a builtin SEDP writer and carries a topic name; anything else
-/// (SPDP, user data, disposals, malformed input) is `None`.
-///
-/// Body layout: extraFlags(2) | octetsToInlineQos(2) | readerId(4) |
-/// writerId(4) | writerSN(8) | [inlineQos] | [serializedPayload].
-fn parse_sedp_data(
-    body: &[u8],
-    flags: u8,
-    header_prefix: &[u8; GUID_PREFIX_LEN],
-) -> Option<RobotEvent> {
-    let le = flags & FLAG_E != 0;
-    if body.len() < 20 || flags & FLAG_D == 0 {
-        return None; // too short, or no data (e.g. a key-only disposal)
+impl FragmentReassembler {
+    /// Like [`crate::parse_datagram_detailed`], reassembling discovery
+    /// DATA_FRAG across calls.
+    pub fn parse_datagram_detailed(&mut self, datagram: &[u8]) -> Option<DatagramReport> {
+        parse::parse(datagram, Some(self))
     }
 
-    let mut writer_id = [0u8; 4];
-    writer_id.copy_from_slice(&body[8..12]);
-    let kind = match writer_id {
-        ENTITY_SEDP_PUBLICATIONS_WRITER => EndpointKind::Writer,
-        ENTITY_SEDP_SUBSCRIPTIONS_WRITER => EndpointKind::Reader,
-        _ => return None,
-    };
-
-    // octetsToInlineQos counts from the end of its own field (body offset 4).
-    let octets_to_inline_qos = read_u16(body, 2, le)? as usize;
-    let mut pos = 4usize.checked_add(octets_to_inline_qos)?;
-    if flags & FLAG_Q != 0 {
-        pos = skip_parameter_list(body, pos, le)?;
+    /// Like [`crate::parse_datagram`], reassembling discovery DATA_FRAG
+    /// across calls.
+    pub fn parse_datagram(&mut self, datagram: &[u8], src_ip: &str) -> Vec<RobotEvent> {
+        self.parse_datagram_detailed(datagram)
+            .map(|r| r.to_events(src_ip))
+            .unwrap_or_default()
     }
-
-    // Serialized payload: encapsulation id (always BE) + options(2), then a
-    // parameter list in the endianness the id names.
-    let rep = read_u16(body, pos, false)?;
-    let pl_le = match rep {
-        PL_CDR_LE => true,
-        PL_CDR_BE => false,
-        _ => return None,
-    };
-    pos = pos.checked_add(4)?;
-
-    let mut topic = None;
-    let mut type_name = None;
-    let mut endpoint_prefix = None;
-    for (pid, value) in ParameterList::new(body, pos, pl_le) {
-        match pid {
-            PID_TOPIC_NAME => topic = cdr_string(value, pl_le),
-            PID_TYPE_NAME => type_name = cdr_string(value, pl_le),
-            PID_ENDPOINT_GUID if value.len() >= 16 => {
-                let mut p = [0u8; GUID_PREFIX_LEN];
-                p.copy_from_slice(&value[..GUID_PREFIX_LEN]);
-                endpoint_prefix = Some(p);
-            }
-            _ => {}
-        }
-    }
-
-    let endpoint = Endpoint {
-        // Prefer the endpoint's own GUID; fall back to the sending participant.
-        guid_prefix: hex12(endpoint_prefix.as_ref().unwrap_or(header_prefix)),
-        topic: topic?,
-        type_name: type_name.unwrap_or_default(),
-    };
-    Some(match kind {
-        EndpointKind::Writer => RobotEvent::Ros2WriterDiscovered(endpoint),
-        EndpointKind::Reader => RobotEvent::Ros2ReaderDiscovered(endpoint),
-    })
-}
-
-/// Iterator over a parameter list: `(parameterId, value)` pairs until the
-/// sentinel, the end of the buffer, or a length that does not fit.
-struct ParameterList<'a> {
-    buf: &'a [u8],
-    pos: usize,
-    le: bool,
-    done: bool,
-}
-
-impl<'a> ParameterList<'a> {
-    fn new(buf: &'a [u8], pos: usize, le: bool) -> Self {
-        Self {
-            buf,
-            pos,
-            le,
-            done: false,
-        }
-    }
-}
-
-impl<'a> Iterator for ParameterList<'a> {
-    type Item = (u16, &'a [u8]);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-        let pid = read_u16(self.buf, self.pos, self.le);
-        let plen = read_u16(self.buf, self.pos + 2, self.le);
-        let (Some(pid), Some(plen)) = (pid, plen) else {
-            self.done = true;
-            return None;
-        };
-        if pid == PID_SENTINEL {
-            self.done = true;
-            return None;
-        }
-        let start = self.pos + 4;
-        let end = start + plen as usize;
-        if end > self.buf.len() {
-            self.done = true; // length runs past the buffer: stop
-            return None;
-        }
-        self.pos = end;
-        Some((pid, &self.buf[start..end]))
-    }
-}
-
-/// Skip an inline-QoS parameter list; returns the offset just past its sentinel.
-fn skip_parameter_list(buf: &[u8], mut pos: usize, le: bool) -> Option<usize> {
-    loop {
-        let pid = read_u16(buf, pos, le)?;
-        let plen = read_u16(buf, pos + 2, le)? as usize;
-        pos = pos.checked_add(4)?;
-        if pid == PID_SENTINEL {
-            return Some(pos);
-        }
-        pos = pos.checked_add(plen)?;
-        if pos > buf.len() {
-            return None;
-        }
-    }
-}
-
-/// A CDR string: u32 length (including the trailing NUL), then the bytes.
-fn cdr_string(value: &[u8], le: bool) -> Option<String> {
-    let n = read_u32(value, 0, le)? as usize;
-    let bytes = value.get(4..4usize.checked_add(n)?)?;
-    let bytes = bytes.strip_suffix(&[0]).unwrap_or(bytes);
-    String::from_utf8(bytes.to_vec()).ok()
-}
-
-fn read_u16(buf: &[u8], pos: usize, le: bool) -> Option<u16> {
-    let b: [u8; 2] = buf.get(pos..pos.checked_add(2)?)?.try_into().ok()?;
-    Some(if le {
-        u16::from_le_bytes(b)
-    } else {
-        u16::from_be_bytes(b)
-    })
-}
-
-fn read_u32(buf: &[u8], pos: usize, le: bool) -> Option<u32> {
-    let b: [u8; 4] = buf.get(pos..pos.checked_add(4)?)?.try_into().ok()?;
-    Some(if le {
-        u32::from_le_bytes(b)
-    } else {
-        u32::from_be_bytes(b)
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parse::{
+        ENTITYID_SEDP_PUBLICATIONS_WRITER as ENTITY_SEDP_PUBLICATIONS_WRITER,
+        ENTITYID_SEDP_SUBSCRIPTIONS_WRITER as ENTITY_SEDP_SUBSCRIPTIONS_WRITER,
+    };
+    use crate::wire::{
+        cdr_string, FLAG_D, FLAG_E, PID_ENDPOINT_GUID, PID_SENTINEL, PID_TOPIC_NAME, PID_TYPE_NAME,
+        PL_CDR_BE, PL_CDR_LE, SUBMSG_DATA,
+    };
     use robodr_events::profile::{Envelope, Profile};
     use robodr_events::Severity;
 
@@ -302,7 +199,7 @@ mod tests {
         value.extend_from_slice(&((s.len() + 1) as u32).to_le_bytes());
         value.extend_from_slice(s.as_bytes());
         value.push(0);
-        while value.len() % 4 != 0 {
+        while !value.len().is_multiple_of(4) {
             value.push(0);
         }
         let mut p = Vec::new();
