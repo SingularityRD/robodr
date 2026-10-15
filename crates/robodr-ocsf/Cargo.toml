@@ -8,3 +8,5 @@ description = "Maps RoboDR deviations to OCSF findings for the AutoSecOps robot-
 
 [dependencies]
 robodr-events = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
