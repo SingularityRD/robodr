@@ -1,0 +1,22 @@
+[package]
+name = "robodr-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RoboDR decision chain (offline): event -> deviation -> response plan -> black-box evidence -> OCSF finding. Plans only; executes nothing."
+
+[dependencies]
+robodr-events = { workspace = true }
+robodr-responder = { workspace = true }
+robodr-blackbox = { workspace = true }
+robodr-ocsf = { workspace = true }
+robodr-motion = { workspace = true }
+robodr-firewall = { workspace = true }
+robodr-commission = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "robodr-replay"
+path = "src/bin/robodr-replay.rs"

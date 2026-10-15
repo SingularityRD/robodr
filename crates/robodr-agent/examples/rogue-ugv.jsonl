@@ -1,0 +1,22 @@
+# SYNTHETIC demo scenario for robodr-replay (not a capture from a real robot).
+# Known graph comes up, the legitimate planner drives /cmd_vel inside the 0.5 m/s envelope,
+# then a rogue participant joins, announces a /cmd_vel writer and publishes commands,
+# and finally the legitimate source sends one over-envelope command (0.8 m/s).
+{"kind":"ros2_participant_discovered","guid_prefix":"01103f5a8c2e000000000101","src_ip":"10.42.0.11","locators":["10.42.0.11:7411"]}
+{"kind":"ros2_participant_discovered","guid_prefix":"01103f5a8c2e000000000102","src_ip":"10.42.0.12","locators":["10.42.0.12:7411"]}
+{"kind":"ros2_participant_discovered","guid_prefix":"01103f5a8c2e000000000103","src_ip":"10.42.0.13","locators":["10.42.0.13:7411"]}
+{"kind":"ros2_writer_discovered","guid_prefix":"01103f5a8c2e000000000101","topic":"rt/cmd_vel","type_name":"geometry_msgs::msg::dds_::Twist_"}
+{"kind":"ros2_writer_discovered","guid_prefix":"01103f5a8c2e000000000102","topic":"rt/odom","type_name":"nav_msgs::msg::dds_::Odometry_"}
+{"kind":"ros2_reader_discovered","guid_prefix":"01103f5a8c2e000000000102","topic":"rt/cmd_vel","type_name":"geometry_msgs::msg::dds_::Twist_"}
+{"kind":"motion_command","channel":"/cmd_vel","source_guid":"01103f5a8c2e00000000010100000103","linear_speed":0.1,"joint_speed":null}
+{"kind":"motion_command","channel":"/cmd_vel","source_guid":"01103f5a8c2e00000000010100000103","linear_speed":0.2,"joint_speed":null}
+{"kind":"motion_command","channel":"/cmd_vel","source_guid":"01103f5a8c2e00000000010100000103","linear_speed":0.3,"joint_speed":null}
+{"kind":"motion_command","channel":"/cmd_vel","source_guid":"01103f5a8c2e00000000010100000103","linear_speed":0.35,"joint_speed":null}
+{"kind":"motion_command","channel":"/cmd_vel","source_guid":"01103f5a8c2e00000000010100000103","linear_speed":0.4,"joint_speed":null}
+# Attack: rogue participant + foreign writer on the motion topic.
+{"kind":"ros2_participant_discovered","guid_prefix":"0f0f0f0f0f0f0f0f0f0f0f0f","src_ip":"10.42.0.66","locators":["10.42.0.66:7411"]}
+{"kind":"ros2_writer_discovered","guid_prefix":"0f0f0f0f0f0f0f0f0f0f0f0f","topic":"rt/cmd_vel","type_name":"geometry_msgs::msg::dds_::Twist_"}
+{"kind":"motion_command","channel":"/cmd_vel","source_guid":"0f0f0f0f0f0f0f0f0f0f0f0f000001c1","linear_speed":0.45,"joint_speed":null}
+{"kind":"motion_command","channel":"/cmd_vel","source_guid":"01103f5a8c2e00000000010100000103","linear_speed":0.4,"joint_speed":null}
+# Legitimate source exceeds the envelope (0.8 > 0.5 m/s, below the 2x hard-reject factor).
+{"kind":"motion_command","channel":"/cmd_vel","source_guid":"01103f5a8c2e00000000010100000103","linear_speed":0.8,"joint_speed":null}
