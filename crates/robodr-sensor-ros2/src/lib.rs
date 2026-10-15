@@ -23,8 +23,6 @@
 //! next sensor task (docs/SPRINTS.md, Sprint 2). Whether a given DDS vendor
 //! moves local discovery onto shared memory is a lab-validation item, per vendor.
 
-mod rtps;
-
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -33,6 +31,7 @@ use pulsar_core::event::Value;
 use pulsar_core::pdk::{ModuleContext, ModuleError, SimplePulsarModule};
 use pulsar_core::{Pid, Timestamp};
 use robodr_events::profile::Profile;
+use robodr_rtps as rtps;
 use serde::Deserialize;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;

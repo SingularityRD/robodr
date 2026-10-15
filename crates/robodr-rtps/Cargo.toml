@@ -1,0 +1,10 @@
+[package]
+name = "robodr-rtps"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Read-only RTPS discovery (SPDP/SEDP) parser for RoboDR. Pure, no I/O, no Pulsar."
+
+[dependencies]
+robodr-events = { workspace = true }

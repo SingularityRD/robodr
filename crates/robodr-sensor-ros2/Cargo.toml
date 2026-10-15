@@ -8,6 +8,7 @@ description = "RoboDR ROS 2 / DDS graph sensor, as a Pulsar module."
 
 [dependencies]
 robodr-events = { workspace = true }
+robodr-rtps = { workspace = true }
 pulsar-core = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }
