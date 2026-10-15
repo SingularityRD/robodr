@@ -8,11 +8,16 @@
 //! ([`Checker`]).
 //!
 //! Layers:
-//! * [`input`]: where events come from ([`EventSource`] trait; JSONL today,
-//!   pcap seam marked `TODO(pcap)`).
+//! * [`input`]: where events come from ([`EventSource`] trait; JSONL event
+//!   recordings and pcap/pcapng captures via `robodr-capture` +
+//!   `robodr-rtps` with DATA_FRAG reassembly).
 //! * [`learner`]: [`Learner`] accumulates observations deterministically and
 //!   emits a [`Profile`](robodr_events::profile::Profile) and a
-//!   [`CommissioningReport`].
+//!   [`CommissioningReport`]. Endpoint names are routed by kind
+//!   ([`ProfileSlot`]) into `writer_topics`, `services`, `actions`,
+//!   `raw_dds_topics` and (opt-in) `reader_topics`, mirroring
+//!   `Profile::evaluate`, so learn -> lock -> check over the same clean run
+//!   gives zero deviations (property-tested).
 //! * [`ops`]: [`lock`], [`diff`], [`merge_profiles`], [`Checker`].
 //! * [`stats`]: nearest-rank percentiles.
 //!
@@ -24,7 +29,12 @@
 //!   did not exercise (a rarely used topic, a fast manoeuvre) will deviate
 //!   later; merge more missions to widen coverage.
 //! * `RobotEvent` has no timestamps, so first/last-seen are positions in the
-//!   input (run index + line), not times.
+//!   input (run index + line or frame ordinal), not times.
+//! * A pcap gives discovery only; motion envelopes need the sensor's motion
+//!   events (JSONL). Shared-memory transports and DDS-Security protected
+//!   discovery are invisible to a capture (see robodr-capture's limits).
+//! * Validated against synthetic captures built from the RTPS spec layout,
+//!   not yet against captures from real Fast DDS / Cyclone / Connext robots.
 //! * All motion samples are held in memory for percentiles (8 bytes each:
 //!   ~1.4 MB per channel-hour at 50 Hz).
 
@@ -33,10 +43,14 @@ pub mod learner;
 pub mod ops;
 pub mod stats;
 
-pub use input::{EventSource, InputError, InputSpec, JsonlSource, SourcedEvent, VecSource};
+pub use input::{
+    CaptureDiagnostics, EventSource, InputError, InputSpec, JsonlSource, PcapSource, SourcedEvent,
+    VecSource,
+};
 pub use learner::{
-    envelope_bound, Commissioning, CommissioningReport, ConfigError, LearnConfig, Learner, SeenAt,
-    Warning, WarningLevel,
+    envelope_bound, Commissioning, CommissioningReport, ConfigError, LearnConfig, Learner,
+    ProfileSlot, RawTopicReport, SeenAt, ServiceReport, Warning, WarningLevel, PARAMETER_SERVICES,
+    ROS_INTERNAL_RAW_TOPICS,
 };
 pub use ops::{
     check_event, diff, lock, merge_profiles, CheckReport, Checker, LockRefusal, MergeError,

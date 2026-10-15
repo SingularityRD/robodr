@@ -2,12 +2,15 @@
 name = "robodr-commission"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Observe-mode commissioning: learns a robot's model profile from clean-run events and emits profile.json for the OEM to lock."
 
 [dependencies]
 robodr-events = { workspace = true }
+robodr-capture = { workspace = true }
+robodr-rtps = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

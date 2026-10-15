@@ -17,16 +17,21 @@ const USAGE: &str = "\
 robodr-commission: learn, review, lock and verify a RoboDR model profile
 
 USAGE:
-  robodr-commission learn --events <run.jsonl> [--events <run2.jsonl> ...]
+  robodr-commission learn (--events <run.jsonl> | --pcap <run.pcap[ng]>) [...]
                           [--model NAME] [--margin 1.1] [--min-samples 30]
                           [--ceiling-linear M_PER_S] [--ceiling-joint RAD_PER_S]
+                          [--learn-readers]
                           --out profile.json [--report report.json] [--quiet]
   robodr-commission lock  --in profile.json --out locked.json
   robodr-commission diff  <old.json> <new.json> [--json]
-  robodr-commission check --profile locked.json --events <run.jsonl> [...] [--json]
+  robodr-commission check --profile locked.json (--events <f> | --pcap <f>) [...] [--json]
   robodr-commission merge --out merged.json <a.json> <b.json> [...]
 
-  --pcap <file> is accepted wherever --events is, but is not wired yet.
+  --events: JSON Lines of RobotEvent. --pcap: pcap or pcapng capture of the
+  robot bus (discovery only: participants, writers, readers). Both repeat and
+  mix; every file is one run.
+  --learn-readers: also learn reader_topics, which turns reader-topic
+  enforcement on (off by default: a policy choice for the OEM).
 
 EXIT: 0 ok/clean, 1 deviations / differences / lock refused, 2 error.
 ";
@@ -126,7 +131,9 @@ impl Args {
                 .map(|p| InputSpec::Pcap(PathBuf::from(p))),
         );
         if v.is_empty() {
-            return Err("at least one --events <file.jsonl> is required".into());
+            return Err(
+                "at least one --events <file.jsonl> or --pcap <file.pcap> is required".into(),
+            );
         }
         Ok(v)
     }
@@ -211,6 +218,20 @@ fn load_profile(path: &str) -> Result<Profile, String> {
     serde_json::from_str(&s).map_err(|e| format!("{path}: not a profile: {e}"))
 }
 
+/// Load a profile that is about to be enforced (by `check`): it must pass
+/// `Profile::validate`, as the sensor requires at load time.
+fn load_valid_profile(path: &str) -> Result<Profile, String> {
+    let p = load_profile(path)?;
+    if let Err(errs) = p.validate() {
+        let list: Vec<String> = errs.iter().map(|e| format!("  - {e}")).collect();
+        return Err(format!(
+            "{path}: profile fails validation:\n{}",
+            list.join("\n")
+        ));
+    }
+    Ok(p)
+}
+
 fn json<T: serde::Serialize>(v: &T) -> Result<String, String> {
     to_json(v).map_err(|e| format!("serialise: {e}"))
 }
@@ -229,7 +250,7 @@ fn cmd_learn(argv: &[String]) -> Outcome {
             "out",
             "report",
         ],
-        &["quiet"],
+        &["quiet", "learn-readers"],
     )?;
     if let Some(p) = a.positionals.first() {
         return Err(format!("unexpected argument {p:?}").into());
@@ -243,6 +264,7 @@ fn cmd_learn(argv: &[String]) -> Outcome {
     }
     cfg.ceiling_linear = a.f64_opt("ceiling-linear")?;
     cfg.ceiling_joint = a.f64_opt("ceiling-joint")?;
+    cfg.learn_readers = a.switch("learn-readers");
     if let Some(n) = a.one("min-samples")? {
         cfg.min_samples = n
             .parse()
@@ -266,9 +288,14 @@ fn cmd_learn(argv: &[String]) -> Outcome {
     }
     eprintln!(
         "wrote draft profile {out} (locked: false): {} participants, {} writer topics, \
+         {} services, {} actions, {} raw DDS topics, {} reader topics, \
          {} motion channels; {} anomalies, {} warnings need attention",
         c.profile.participants.len(),
         c.profile.writer_topics.len(),
+        c.profile.services.len(),
+        c.profile.actions.len(),
+        c.profile.raw_dds_topics.len(),
+        c.profile.reader_topics.len(),
         c.profile.motion_envelopes.len(),
         c.report.anomalies_total,
         c.report.warn_count()
@@ -327,7 +354,7 @@ fn cmd_check(argv: &[String]) -> Outcome {
     if let Some(p) = a.positionals.first() {
         return Err(format!("unexpected argument {p:?}").into());
     }
-    let profile = load_profile(a.required("profile")?)?;
+    let profile = load_valid_profile(a.required("profile")?)?;
     let inputs = a.inputs()?;
     let mut checker = Checker::new(&profile);
     for spec in &inputs {

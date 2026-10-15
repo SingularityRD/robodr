@@ -1,5 +1,7 @@
 //! End-to-end tests of the `robodr-commission` binary.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -78,6 +80,37 @@ fn demo_learn_lock_check_clean_then_rogue() {
     assert_eq!(code(&o), 0, "{out}");
     assert!(out.contains("0 deviation(s)"), "{out}");
     assert!(!out.contains("NOT locked"));
+
+    // With --learn-readers (reader enforcement on) the clean run is still clean.
+    let pr = d.join("pr.json");
+    let lr = d.join("lr.json");
+    let o = run(&[
+        "learn",
+        "--events",
+        s(&example("clean-run.jsonl")),
+        "--model",
+        "ugv-demo-synthetic",
+        "--learn-readers",
+        "--out",
+        s(&pr),
+        "--quiet",
+    ]);
+    assert_eq!(code(&o), 0);
+    assert_eq!(code(&run(&["lock", "--in", s(&pr), "--out", s(&lr)])), 0);
+    let o = run(&[
+        "check",
+        "--profile",
+        s(&lr),
+        "--events",
+        s(&example("clean-run.jsonl")),
+    ]);
+    assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stdout));
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&pr).unwrap()).unwrap();
+    assert_eq!(v["reader_topics"].as_array().unwrap().len(), 6);
+    assert_eq!(v["services"].as_array().unwrap().len(), 25);
+    assert_eq!(v["actions"][0], "/navigate_to_pose");
+    assert_eq!(v["raw_dds_topics"][0], "ros_discovery_info");
 
     // Rogue participant -> deviations, nonzero exit.
     let o = run(&[
@@ -345,7 +378,14 @@ fn usage_and_input_errors_exit_2() {
         vec![
             "learn".into(),
             "--pcap".into(),
-            "x.pcap".into(),
+            "/nonexistent/x.pcap".into(),
+            "--out".into(),
+            s(&out).into(),
+        ],
+        vec![
+            "learn".into(),
+            "--pcap".into(),
+            s(&example("clean-run.jsonl")).into(),
             "--out".into(),
             s(&out).into(),
         ],
@@ -403,4 +443,126 @@ fn help_and_version() {
     assert!(String::from_utf8_lossy(&o.stdout).contains("learn"));
     let o = run(&["--version"]);
     assert_eq!(code(&o), 0);
+}
+
+#[test]
+fn learn_from_pcap_then_lock_and_check_it() {
+    let d = tmpdir("pcap");
+    let cap = d.join("discovery.pcap");
+    std::fs::write(&cap, common::pcap(&common::talker_listener(false))).unwrap();
+    let prof = d.join("p.json");
+    let rep = d.join("r.json");
+    let o = run(&[
+        "learn",
+        "--pcap",
+        s(&cap),
+        "--model",
+        "talker-listener",
+        "--out",
+        s(&prof),
+        "--report",
+        s(&rep),
+    ]);
+    assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert!(stdout.contains("Services (12):"), "{stdout}");
+    assert!(stdout.contains("/dock  clients"), "{stdout}");
+    assert!(stdout.contains("capture: "), "{stdout}");
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains("12 services, 1 actions, 1 raw DDS topics"),
+        "{stderr}"
+    );
+
+    let p: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&prof).unwrap()).unwrap();
+    assert_eq!(p["participants"].as_array().unwrap().len(), 2);
+    assert!(p["writer_topics"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("/chatter")));
+    assert!(p["services"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("/talker/get_parameters")));
+    assert_eq!(p["actions"][0], "/dock");
+    assert_eq!(p["raw_dds_topics"][0], "ros_discovery_info");
+    assert_eq!(p["reader_topics"].as_array().unwrap().len(), 0);
+    let r: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&rep).unwrap()).unwrap();
+    assert_eq!(r["runs"][0]["capture"]["discovery_frag_completed"], 1);
+
+    let locked = d.join("locked.json");
+    let o = run(&["lock", "--in", s(&prof), "--out", s(&locked)]);
+    assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
+    let o = run(&["check", "--profile", s(&locked), "--pcap", s(&cap)]);
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(code(&o), 0, "{out}");
+    assert!(out.contains("0 deviation(s)"), "{out}");
+
+    // --learn-readers turns reader enforcement on; diff shows it tightening.
+    let prof_r = d.join("pr.json");
+    let o = run(&[
+        "learn",
+        "--pcap",
+        s(&cap),
+        "--model",
+        "talker-listener",
+        "--learn-readers",
+        "--out",
+        s(&prof_r),
+        "--quiet",
+    ]);
+    assert_eq!(code(&o), 0);
+    let o = run(&["diff", s(&prof), s(&prof_r)]);
+    assert_eq!(code(&o), 1);
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        out.contains("reader-topic enforcement: off -> on   [tightens]"),
+        "{out}"
+    );
+    assert!(out.contains("+ reader topic /chatter\n"), "{out}");
+
+    // A capture that lost a DATA_FRAG: still learns, but warns loudly.
+    let lossy = d.join("lossy.pcap");
+    std::fs::write(&lossy, common::pcap(&common::talker_listener(true))).unwrap();
+    let o = run(&[
+        "learn",
+        "--pcap",
+        s(&lossy),
+        "--model",
+        "m",
+        "--out",
+        s(&d.join("l.json")),
+    ]);
+    assert_eq!(code(&o), 0);
+    assert!(String::from_utf8_lossy(&o.stdout).contains("fragmented_discovery_unreassembled"));
+}
+
+#[test]
+fn lock_and_check_refuse_invalid_profiles() {
+    let d = tmpdir("invalid");
+    let bad = d.join("bad.json");
+    std::fs::write(
+        &bad,
+        r#"{"model":"m","participants":["aaaaaaaaaaaaaaaaaaaaaaaa"],"writer_topics":["rt/cmd_vel"],
+           "services":["get_parameters"]}"#,
+    )
+    .unwrap();
+    let out = d.join("locked.json");
+    let o = run(&["lock", "--in", s(&bad), "--out", s(&out)]);
+    assert_eq!(code(&o), 1);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("writer_topics entry \"rt/cmd_vel\""), "{err}");
+    assert!(err.contains("services entry \"get_parameters\""), "{err}");
+    assert!(!out.exists());
+    let o = run(&[
+        "check",
+        "--profile",
+        s(&bad),
+        "--events",
+        s(&example("clean-run.jsonl")),
+    ]);
+    assert_eq!(code(&o), 2);
+    assert!(String::from_utf8_lossy(&o.stderr).contains("fails validation"));
 }

@@ -2,6 +2,7 @@
 name = "robodr-ocsf"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Maps RoboDR deviations to OCSF findings for the AutoSecOps robot-edr.findings contract."

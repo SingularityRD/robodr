@@ -2,6 +2,7 @@
 name = "robodr-sensor-ros2"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "RoboDR ROS 2 / DDS graph sensor, as a Pulsar module."

@@ -5,7 +5,7 @@
 //! validation; `check` only evaluates and reports.
 
 use crate::input::{EventSource, InputError};
-use robodr_events::profile::{Envelope, Profile};
+use robodr_events::profile::{Envelope, EnvelopeField, Profile, ProfileError};
 use robodr_events::{Deviation, MotionCommand, RobotEvent, Severity};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,7 +14,7 @@ use std::fmt;
 // ---------------------------------------------------------------- lock ----
 
 /// Why a profile cannot be locked.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum LockRefusal {
     AlreadyLocked,
@@ -30,6 +30,11 @@ pub enum LockRefusal {
     InvalidBound {
         channel: String,
         dimension: String,
+    },
+    /// Any other `Profile::validate` error (bad GUID, mangled or relative
+    /// ROS name, empty raw topic or motion channel).
+    InvalidProfile {
+        error: ProfileError,
     },
 }
 
@@ -50,19 +55,20 @@ impl fmt::Display for LockRefusal {
                 f,
                 "motion channel {channel}: {dimension} bound is not a finite, non-negative number"
             ),
+            LockRefusal::InvalidProfile { error } => write!(f, "{error}"),
         }
     }
 }
 
 /// Validate a draft profile and return it with `locked = true`. All reasons
-/// to refuse are collected, so the OEM sees everything at once.
+/// to refuse are collected, so the OEM sees everything at once: the
+/// commissioning checks (already locked, empty, a motion channel without any
+/// bound) and every [`Profile::validate`] error, which the sensor would
+/// otherwise refuse at load time.
 pub fn lock(profile: &Profile) -> Result<Profile, Vec<LockRefusal>> {
     let mut why = Vec::new();
     if profile.locked {
         why.push(LockRefusal::AlreadyLocked);
-    }
-    if profile.model.trim().is_empty() {
-        why.push(LockRefusal::EmptyModel);
     }
     if profile.participants.is_empty() {
         why.push(LockRefusal::NoParticipants);
@@ -76,19 +82,24 @@ pub fn lock(profile: &Profile) -> Result<Profile, Vec<LockRefusal>> {
                 channel: ch.clone(),
             });
         }
-        for (dim, b) in [
-            ("linear", env.max_linear_speed),
-            ("joint", env.max_joint_speed),
-        ] {
-            if let Some(b) = b {
-                if !b.is_finite() || b < 0.0 {
-                    why.push(LockRefusal::InvalidBound {
-                        channel: ch.clone(),
-                        dimension: dim.into(),
-                    });
+    }
+    if let Err(errors) = profile.validate() {
+        why.extend(errors.into_iter().map(|e| {
+            match e {
+                ProfileError::EmptyModel => LockRefusal::EmptyModel,
+                ProfileError::InvalidEnvelopeLimit { channel, field, .. } => {
+                    LockRefusal::InvalidBound {
+                        channel,
+                        dimension: match field {
+                            EnvelopeField::MaxLinearSpeed => "linear",
+                            EnvelopeField::MaxJointSpeed => "joint",
+                        }
+                        .into(),
+                    }
                 }
+                error => LockRefusal::InvalidProfile { error },
             }
-        }
+        }));
     }
     if why.is_empty() {
         let mut p = profile.clone();
@@ -105,6 +116,10 @@ pub fn lock(profile: &Profile) -> Result<Profile, Vec<LockRefusal>> {
 pub enum MergeError {
     NoProfiles,
     ModelMismatch(String, String),
+    /// Some profiles enforce reader topics (non-empty `reader_topics`) and
+    /// some do not: a union would silently start enforcing readers that the
+    /// non-enforcing profiles never recorded.
+    ReaderEnforcementMismatch,
 }
 
 impl fmt::Display for MergeError {
@@ -115,15 +130,22 @@ impl fmt::Display for MergeError {
                 f,
                 "refusing to merge profiles of different models ({a:?} vs {b:?})"
             ),
+            MergeError::ReaderEnforcementMismatch => write!(
+                f,
+                "refusing to merge: some profiles enforce reader_topics and some do not \
+                 (re-learn all missions with or without --learn-readers)"
+            ),
         }
     }
 }
 
 impl std::error::Error for MergeError {}
 
-/// Union already-learned profiles (e.g. one per mission). Participants and
-/// writer topics are unioned; per channel and dimension the larger bound
-/// wins. `None` is read as "not observed" (the learner's meaning), so a bound
+/// Union already-learned profiles (e.g. one per mission). Participants,
+/// writer topics, services, actions, raw DDS topics and reader topics are
+/// unioned (reader topics only if every profile enforces them, or none does:
+/// see [`MergeError::ReaderEnforcementMismatch`]); per channel and dimension
+/// the larger bound wins. `None` is read as "not observed" (the learner's meaning), so a bound
 /// from one profile is kept when the other has none. The result is always
 /// unlocked: a merged profile must be reviewed and locked again.
 ///
@@ -132,6 +154,13 @@ impl std::error::Error for MergeError {}
 /// once. Merging profiles applies whatever margins each profile already had.
 pub fn merge_profiles(profiles: &[Profile]) -> Result<Profile, MergeError> {
     let first = profiles.first().ok_or(MergeError::NoProfiles)?;
+    let enforcing = !first.reader_topics.is_empty();
+    if profiles
+        .iter()
+        .any(|p| p.reader_topics.is_empty() == enforcing)
+    {
+        return Err(MergeError::ReaderEnforcementMismatch);
+    }
     let mut out = Profile {
         model: first.model.clone(),
         locked: false,
@@ -146,6 +175,10 @@ pub fn merge_profiles(profiles: &[Profile]) -> Result<Profile, MergeError> {
         }
         out.participants.extend(p.participants.iter().cloned());
         out.writer_topics.extend(p.writer_topics.iter().cloned());
+        out.services.extend(p.services.iter().cloned());
+        out.actions.extend(p.actions.iter().cloned());
+        out.raw_dds_topics.extend(p.raw_dds_topics.iter().cloned());
+        out.reader_topics.extend(p.reader_topics.iter().cloned());
         for (ch, env) in &p.motion_envelopes {
             let e = out.motion_envelopes.entry(ch.clone()).or_default();
             e.max_linear_speed = max_opt(e.max_linear_speed, env.max_linear_speed);
@@ -192,6 +225,17 @@ pub struct ProfileDiff {
     pub participants_removed: BTreeSet<String>,
     pub writer_topics_added: BTreeSet<String>,
     pub writer_topics_removed: BTreeSet<String>,
+    pub services_added: BTreeSet<String>,
+    pub services_removed: BTreeSet<String>,
+    pub actions_added: BTreeSet<String>,
+    pub actions_removed: BTreeSet<String>,
+    pub raw_dds_topics_added: BTreeSet<String>,
+    pub raw_dds_topics_removed: BTreeSet<String>,
+    pub reader_topics_added: BTreeSet<String>,
+    pub reader_topics_removed: BTreeSet<String>,
+    /// Reader-topic enforcement (non-empty `reader_topics`) switched:
+    /// `(old, new)`. Off -> on tightens; on -> off loosens.
+    pub reader_enforcement: Option<(bool, bool)>,
     pub motion_channels_added: BTreeMap<String, Envelope>,
     pub motion_channels_removed: BTreeMap<String, Envelope>,
     pub envelope_changes: Vec<EnvelopeChange>,
@@ -202,11 +246,22 @@ impl ProfileDiff {
         *self == ProfileDiff::default()
     }
 
+    /// Reader topics added while enforcement was already on (adding the
+    /// first reader topics switches enforcement on, which tightens).
+    pub fn reader_topics_loosen(&self) -> bool {
+        self.reader_enforcement.is_none() && !self.reader_topics_added.is_empty()
+    }
+
     /// Does the new profile permit anything the old one did not? These are
     /// the changes that deserve the hardest look.
     pub fn loosens(&self) -> bool {
         !self.participants_added.is_empty()
             || !self.writer_topics_added.is_empty()
+            || !self.services_added.is_empty()
+            || !self.actions_added.is_empty()
+            || !self.raw_dds_topics_added.is_empty()
+            || self.reader_topics_loosen()
+            || self.reader_enforcement == Some((true, false))
             || !self.motion_channels_added.is_empty()
             || self
                 .envelope_changes
@@ -244,6 +299,21 @@ pub fn diff(old: &Profile, new: &Profile) -> ProfileDiff {
         .difference(&new.writer_topics)
         .cloned()
         .collect();
+    let sets = |a: &BTreeSet<String>, b: &BTreeSet<String>| {
+        (
+            b.difference(a).cloned().collect::<BTreeSet<_>>(),
+            a.difference(b).cloned().collect::<BTreeSet<_>>(),
+        )
+    };
+    (d.services_added, d.services_removed) = sets(&old.services, &new.services);
+    (d.actions_added, d.actions_removed) = sets(&old.actions, &new.actions);
+    (d.raw_dds_topics_added, d.raw_dds_topics_removed) =
+        sets(&old.raw_dds_topics, &new.raw_dds_topics);
+    (d.reader_topics_added, d.reader_topics_removed) = sets(&old.reader_topics, &new.reader_topics);
+    let (eo, en) = (!old.reader_topics.is_empty(), !new.reader_topics.is_empty());
+    if eo != en {
+        d.reader_enforcement = Some((eo, en));
+    }
     for (ch, env) in &new.motion_envelopes {
         match old.motion_envelopes.get(ch) {
             None => {
@@ -314,6 +384,43 @@ impl fmt::Display for ProfileDiff {
         }
         for t in &self.writer_topics_removed {
             writeln!(f, "- writer topic {t}")?;
+        }
+        for (what, added, removed) in [
+            ("service", &self.services_added, &self.services_removed),
+            ("action", &self.actions_added, &self.actions_removed),
+        ] {
+            for n in added {
+                writeln!(f, "+ {what} {n}   [LOOSENS]")?;
+            }
+            for n in removed {
+                writeln!(f, "- {what} {n}")?;
+            }
+        }
+        for n in &self.raw_dds_topics_added {
+            writeln!(f, "+ raw DDS topic {n:?}   [LOOSENS]")?;
+        }
+        for n in &self.raw_dds_topics_removed {
+            writeln!(f, "- raw DDS topic {n:?}")?;
+        }
+        match self.reader_enforcement {
+            Some((false, true)) => {
+                writeln!(f, "~ reader-topic enforcement: off -> on   [tightens]")?
+            }
+            Some((true, false)) => {
+                writeln!(f, "~ reader-topic enforcement: on -> off   [LOOSENS]")?
+            }
+            _ => {}
+        }
+        let mark = if self.reader_topics_loosen() {
+            "   [LOOSENS]"
+        } else {
+            ""
+        };
+        for t in &self.reader_topics_added {
+            writeln!(f, "+ reader topic {t}{mark}")?;
+        }
+        for t in &self.reader_topics_removed {
+            writeln!(f, "- reader topic {t}")?;
         }
         for (c, e) in &self.motion_channels_added {
             writeln!(f, "+ motion channel {c} ({})   [LOOSENS]", env_str(e))?;
@@ -671,6 +778,116 @@ mod tests {
             merge_profiles(&[base(), other]).unwrap_err(),
             MergeError::ModelMismatch(..)
         ));
+    }
+
+    #[test]
+    fn lock_runs_profile_validate() {
+        let mut p = base();
+        p.participants.insert("NOT-A-GUID".into());
+        p.writer_topics.insert("rt/cmd_vel".into());
+        p.services.insert("get_parameters".into());
+        p.actions.insert("/".into());
+        p.reader_topics.insert("/a b".into());
+        p.raw_dds_topics.insert(String::new());
+        let why = lock(&p).unwrap_err();
+        assert_eq!(why.len(), 6, "{why:#?}");
+        assert!(why
+            .iter()
+            .all(|r| matches!(r, LockRefusal::InvalidProfile { .. })));
+        let text: Vec<String> = why.iter().map(ToString::to_string).collect();
+        assert!(
+            text.iter().any(|t| t.contains("\"rt/cmd_vel\"")),
+            "{text:?}"
+        );
+        let j = serde_json::to_string(&why).unwrap();
+        assert!(j.contains("\"reason\":\"invalid_profile\""), "{j}");
+        assert!(j.contains("\"error\":\"not_a_ros_name\""), "{j}");
+
+        // A clean profile with the new sets locks.
+        let mut q = base();
+        q.services.insert("/nav/get_parameters".into());
+        q.actions.insert("/dock".into());
+        q.raw_dds_topics.insert("ros_discovery_info".into());
+        q.reader_topics.insert("/odom".into());
+        let l = lock(&q).unwrap();
+        assert!(l.locked && l.services.len() == 1);
+    }
+
+    #[test]
+    fn diff_covers_new_sets_and_reader_enforcement() {
+        let mut old = base();
+        old.services.insert("/a".into());
+        old.raw_dds_topics.insert("r1".into());
+        let mut new = base();
+        new.services.insert("/b".into());
+        new.actions.insert("/dock".into());
+        new.raw_dds_topics.insert("r2".into());
+        let d = diff(&old, &new);
+        assert!(d.services_added.contains("/b") && d.services_removed.contains("/a"));
+        assert!(d.actions_added.contains("/dock"));
+        assert!(d.raw_dds_topics_added.contains("r2"));
+        assert!(d.raw_dds_topics_removed.contains("r1"));
+        assert!(d.loosens());
+        let s = d.to_string();
+        assert!(s.contains("+ service /b   [LOOSENS]"), "{s}");
+        assert!(s.contains("- service /a\n"), "{s}");
+        assert!(s.contains("+ action /dock   [LOOSENS]"), "{s}");
+        assert!(s.contains("+ raw DDS topic \"r2\"   [LOOSENS]"), "{s}");
+
+        // Only removals: not loosening.
+        let d = diff(&new, &base());
+        assert!(!d.loosens(), "{d}");
+
+        // Reader enforcement off -> on tightens; topics listed without LOOSENS.
+        let mut on = base();
+        on.reader_topics.insert("/odom".into());
+        let d = diff(&base(), &on);
+        assert_eq!(d.reader_enforcement, Some((false, true)));
+        assert!(!d.loosens());
+        let s = d.to_string();
+        assert!(s.contains("off -> on   [tightens]"), "{s}");
+        assert!(s.contains("+ reader topic /odom\n"), "{s}");
+        // on -> off loosens.
+        let d = diff(&on, &base());
+        assert!(d.loosens());
+        assert!(d.to_string().contains("on -> off   [LOOSENS]"));
+        // Adding a reader topic while enforcing loosens.
+        let mut more = on.clone();
+        more.reader_topics.insert("/scan".into());
+        let d = diff(&on, &more);
+        assert!(d.loosens());
+        assert!(d.to_string().contains("+ reader topic /scan   [LOOSENS]"));
+        serde_json::to_string(&d).unwrap();
+    }
+
+    #[test]
+    fn merge_profiles_new_sets_and_reader_mismatch() {
+        let mut a = base();
+        a.services.insert("/a".into());
+        a.raw_dds_topics.insert("r".into());
+        let mut b = base();
+        b.actions.insert("/dock".into());
+        let m = merge_profiles(&[a.clone(), b.clone()]).unwrap();
+        assert!(m.services.contains("/a") && m.actions.contains("/dock"));
+        assert!(m.raw_dds_topics.contains("r") && m.reader_topics.is_empty());
+
+        let mut ra = a.clone();
+        ra.reader_topics.insert("/odom".into());
+        assert_eq!(
+            merge_profiles(&[a.clone(), ra.clone()]).unwrap_err(),
+            MergeError::ReaderEnforcementMismatch
+        );
+        assert_eq!(
+            merge_profiles(&[ra.clone(), b.clone()]).unwrap_err(),
+            MergeError::ReaderEnforcementMismatch
+        );
+        let mut rb = b.clone();
+        rb.reader_topics.insert("/scan".into());
+        let m = merge_profiles(&[ra, rb]).unwrap();
+        assert_eq!(m.reader_topics.len(), 2);
+        assert!(MergeError::ReaderEnforcementMismatch
+            .to_string()
+            .contains("--learn-readers"));
     }
 
     #[test]

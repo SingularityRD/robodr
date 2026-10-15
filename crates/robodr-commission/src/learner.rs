@@ -8,19 +8,54 @@
 //!   announcement. GUIDs seen *only* on endpoints or motion commands are not
 //!   added; they are reported as a warning instead (an endpoint whose
 //!   participant never announced itself is something a human should look at).
-//! * `writer_topics`: the de-mangled topic ([`Endpoint::ros_topic`]) of every
-//!   announced writer.
+//! * Endpoint names, routed by kind exactly as `Profile::evaluate` matches
+//!   them (see [`ProfileSlot`] and the table below), so that learn -> lock ->
+//!   check over the same clean run gives zero deviations (property-tested in
+//!   `tests/roundtrip.rs`).
 //! * `motion_envelopes`: for each motion channel, per dimension (linear m/s,
 //!   joint rad/s), `min(max_observed * margin, ceiling)` where the ceiling is
 //!   the OEM's optional hard limit. See [`envelope_bound`] for the exact math.
 //!   A channel with no valid sample in any dimension gets an empty envelope,
 //!   which [`crate::ops::lock`] refuses: the OEM must decide, not the tool.
 //!
+//! | endpoint name ([`demangle`](robodr_events::graph::demangle))  | learned into      |
+//! |---------------------------------------------------------------|-------------------|
+//! | topic `rt/x` (incl. `rt/rosout`, `rt/parameter_events`)        | `writer_topics` (writers), `reader_topics` (readers, opt-in) |
+//! | service `rq/xRequest`, `rr/xReply`                             | `services` (`/x`) |
+//! | action part (`rq/a/_action/send_goalRequest`, `rt/a/_action/status`, ...) | `actions` (`/a`) |
+//! | raw DDS name (e.g. `ros_discovery_info`, vendor tools)          | `raw_dds_topics` (exact) |
+//!
+//! Every ROS 2 node serves six parameter services
+//! (`/node/get_parameters`, ...), so a real profile always has `services`;
+//! the report warns when a ROS node (a participant writing `/rosout`) serves
+//! none, or a node's set is incomplete: both mean the capture missed part of
+//! discovery and the locked profile would flag healthy nodes.
+//!
+//! Services, actions and raw topics are learned from **writer** endpoints by
+//! default. Both sides of a service or action write something (clients write
+//! requests, servers write replies / feedback / status), so a complete
+//! capture covers every one; a name seen only on readers points at an
+//! incomplete capture and is reported (`reader_only_name`), not learned.
+//!
+//! ## Readers (`learn_readers`, CLI `--learn-readers`, default off)
+//!
+//! `Profile::reader_topics` is enforced only when non-empty. It is **not**
+//! learned by default, because turning it on is a policy decision for the
+//! OEM, not something a recording should decide silently: reader sets are
+//! the noisiest part of a ROS 2 graph (rosbag, rqt and `ros2 topic echo`
+//! subscribe to anything; launch-time-only subscribers are easily missed by
+//! a capture) and a missed subscriber becomes a deviation on every boot. The
+//! report always lists reader topics, and says how many were not learned, so
+//! the OEM can opt in knowingly. With `learn_readers`, reader topics go to
+//! `reader_topics` and reader-side services / actions / raw names are added
+//! to their sets as well, since reader enforcement checks those sets too.
+//!
 //! # Anomalies
 //!
-//! Non-finite or negative speeds, empty topics/channels and GUID prefixes
-//! that are not 24 lower-case hex chars are counted as anomalies and never
-//! feed an envelope. A clean run should have none; the report says so loudly.
+//! Non-finite or negative speeds, empty topics/channels, ROS names that
+//! `Profile::validate` would reject (whitespace or control characters) and
+//! GUID prefixes that are not 24 lower-case hex chars are counted as
+//! anomalies and never feed the profile. A clean run should have none; the report says so loudly.
 //!
 //! # Determinism
 //!
@@ -33,10 +68,12 @@
 //!
 //! `RobotEvent` carries no timestamp, so "first/last seen" are [`SeenAt`]
 //! positions: (run index, position in that run), where position is the JSONL
-//! line number (or event ordinal for in-memory sources).
+//! line number, the frame ordinal for pcap input, or the event ordinal for
+//! in-memory sources.
 
-use crate::input::{EventSource, InputError};
+use crate::input::{CaptureDiagnostics, EventSource, InputError};
 use crate::stats::SpeedStats;
+use robodr_events::graph::{ActionRole, RosName, RosNameKind};
 use robodr_events::profile::{Envelope, Profile};
 use robodr_events::RobotEvent;
 use serde::{Deserialize, Serialize};
@@ -53,6 +90,86 @@ pub const DEFAULT_MIN_SAMPLES: u64 = 30;
 pub const DEFAULT_MODEL: &str = "unnamed-model";
 /// At most this many anomalies are kept verbatim; all are counted.
 pub const MAX_STORED_ANOMALIES: usize = 1000;
+/// The parameter services every ROS 2 node serves (unless started with
+/// `start_parameter_services:=false`), as the last name segment.
+pub const PARAMETER_SERVICES: [&str; 6] = [
+    "describe_parameters",
+    "get_parameter_types",
+    "get_parameters",
+    "list_parameters",
+    "set_parameters",
+    "set_parameters_atomically",
+];
+/// Raw (non-ROS-mangled) DDS topics that ROS 2 itself creates. They are
+/// learned like any raw topic but not flagged as unusual in the report.
+/// `ros_discovery_info` carries the node-to-participant map (rmw_dds_common).
+pub const ROS_INTERNAL_RAW_TOPICS: [&str; 1] = ["ros_discovery_info"];
+
+/// Which profile set admits an endpoint, mirroring the kind-aware matching
+/// of `Profile::evaluate` in robodr-events (writers: topic -> `writer_topics`;
+/// service request/reply -> `services`; any action part -> `actions` by
+/// action name; raw DDS -> `raw_dds_topics`, exact; readers likewise with
+/// `reader_topics` in place of `writer_topics`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProfileSlot {
+    Topic(String),
+    Service(String),
+    Action(String),
+    Raw(String),
+}
+
+impl ProfileSlot {
+    pub fn of(rn: &RosName) -> Self {
+        match &rn.kind {
+            RosNameKind::Topic => Self::Topic(rn.name.clone()),
+            RosNameKind::ServiceRequest | RosNameKind::ServiceReply => {
+                Self::Service(rn.name.clone())
+            }
+            RosNameKind::ActionPart { action, .. } => Self::Action(action.clone()),
+            RosNameKind::Raw => Self::Raw(rn.name.clone()),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Topic(n) | Self::Service(n) | Self::Action(n) | Self::Raw(n) => n,
+        }
+    }
+
+    /// Would `Profile::validate` accept this name in its set? (Same rule:
+    /// ROS names start with `/`, are longer than 1 and carry no whitespace or
+    /// control characters; raw names must be non-empty.)
+    pub fn is_valid(&self) -> bool {
+        match self {
+            Self::Raw(n) => !n.is_empty(),
+            _ => {
+                let n = self.name();
+                n.len() > 1
+                    && n.starts_with('/')
+                    && !n.chars().any(|c| c.is_whitespace() || c.is_control())
+            }
+        }
+    }
+}
+
+/// For a service/action endpoint: is its participant the client side?
+/// Clients write requests and read replies, feedback and status; servers do
+/// the opposite. `None` for plain topics and raw names.
+fn is_client_side(kind: &RosNameKind, is_writer: bool) -> Option<bool> {
+    match kind {
+        RosNameKind::ServiceRequest
+        | RosNameKind::ActionPart {
+            role: ActionRole::Request,
+            ..
+        } => Some(is_writer),
+        RosNameKind::ServiceReply
+        | RosNameKind::ActionPart {
+            role: ActionRole::Reply | ActionRole::Topic,
+            ..
+        } => Some(!is_writer),
+        RosNameKind::Topic | RosNameKind::Raw => None,
+    }
+}
 
 /// Learner configuration.
 #[derive(Debug, Clone, PartialEq)]
@@ -66,6 +183,10 @@ pub struct LearnConfig {
     pub ceiling_joint: Option<f64>,
     /// Minimum valid samples per dimension for an envelope to be trusted.
     pub min_samples: u64,
+    /// Learn `reader_topics` (which turns reader-topic enforcement on) and
+    /// reader-side services / actions / raw names. Off by default; see the
+    /// module docs for why.
+    pub learn_readers: bool,
 }
 
 impl Default for LearnConfig {
@@ -76,6 +197,7 @@ impl Default for LearnConfig {
             ceiling_linear: None,
             ceiling_joint: None,
             min_samples: DEFAULT_MIN_SAMPLES,
+            learn_readers: false,
         }
     }
 }
@@ -234,6 +356,38 @@ struct EndpointAcc {
     type_names: BTreeSet<String>,
 }
 
+/// Services, actions and raw topics: who is on which side.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct RoleAcc {
+    span: Option<Span>,
+    /// Services/actions: client participants. Raw topics: writers.
+    side_a: BTreeSet<String>,
+    /// Services/actions: server participants. Raw topics: readers.
+    side_b: BTreeSet<String>,
+    /// Seen on at least one writer endpoint.
+    written: bool,
+    /// Actions: components seen (`send_goal`, ..., `status`).
+    components: BTreeSet<String>,
+    type_names: BTreeSet<String>,
+}
+
+impl RoleAcc {
+    fn absorb(&mut self, o: &RoleAcc, off: usize) {
+        if let Some(s) = &o.span {
+            let s = s.shifted(off);
+            match &mut self.span {
+                Some(d) => d.absorb(&s),
+                None => self.span = Some(s),
+            }
+        }
+        self.side_a.extend(o.side_a.iter().cloned());
+        self.side_b.extend(o.side_b.iter().cloned());
+        self.written |= o.written;
+        self.components.extend(o.components.iter().cloned());
+        self.type_names.extend(o.type_names.iter().cloned());
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 struct MotionAcc {
     span: Option<Span>,
@@ -258,6 +412,9 @@ pub struct Anomaly {
 pub struct RunSummary {
     pub label: String,
     pub events: u64,
+    /// Present for packet-capture inputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<CaptureDiagnostics>,
 }
 
 /// Learns a draft profile from observed events. See the module docs.
@@ -269,6 +426,9 @@ pub struct Learner {
     participants: BTreeMap<String, ParticipantAcc>,
     writers: BTreeMap<String, EndpointAcc>,
     readers: BTreeMap<String, EndpointAcc>,
+    services: BTreeMap<String, RoleAcc>,
+    actions: BTreeMap<String, RoleAcc>,
+    raw: BTreeMap<String, RoleAcc>,
     motion: BTreeMap<String, MotionAcc>,
     /// GUIDs referenced by endpoints/motion commands (to spot unannounced ones).
     referenced_guids: BTreeMap<String, SeenAt>,
@@ -294,6 +454,9 @@ impl Learner {
             participants: BTreeMap::new(),
             writers: BTreeMap::new(),
             readers: BTreeMap::new(),
+            services: BTreeMap::new(),
+            actions: BTreeMap::new(),
+            raw: BTreeMap::new(),
             motion: BTreeMap::new(),
             referenced_guids: BTreeMap::new(),
             anomalies_total: 0,
@@ -311,6 +474,7 @@ impl Learner {
         self.runs.push(RunSummary {
             label: label.into(),
             events: 0,
+            capture: None,
         });
     }
 
@@ -351,8 +515,7 @@ impl Learner {
             }
             RobotEvent::Ros2WriterDiscovered(e) | RobotEvent::Ros2ReaderDiscovered(e) => {
                 let is_writer = matches!(event, RobotEvent::Ros2WriterDiscovered(_));
-                let topic = e.ros_topic().to_string();
-                if topic.is_empty() {
+                if e.topic.is_empty() {
                     self.anomaly(
                         at,
                         "empty_topic",
@@ -361,16 +524,55 @@ impl Learner {
                     );
                     return;
                 }
+                let rn = e.ros_name();
+                let slot = ProfileSlot::of(&rn);
+                if !slot.is_valid() {
+                    let shown: String = e.topic.chars().take(128).collect();
+                    self.anomaly(
+                        at,
+                        "invalid_ros_name",
+                        &e.guid_prefix,
+                        format!(
+                            "endpoint name {shown:?} is not a valid ROS name (whitespace or \
+                             control characters); not learned"
+                        ),
+                    );
+                    return;
+                }
                 self.check_guid(&e.guid_prefix, at);
                 self.reference(&e.guid_prefix, at);
-                let map = if is_writer {
-                    &mut self.writers
-                } else {
-                    &mut self.readers
+                let guid = e.guid_prefix.clone();
+                let client = is_client_side(&rn.kind, is_writer);
+                let (map, side_a) = match &slot {
+                    ProfileSlot::Topic(topic) => {
+                        let map = if is_writer {
+                            &mut self.writers
+                        } else {
+                            &mut self.readers
+                        };
+                        let acc = map.entry(topic.clone()).or_default();
+                        touch(&mut acc.span, at);
+                        acc.participants.insert(guid);
+                        if !e.type_name.is_empty() {
+                            acc.type_names.insert(e.type_name.clone());
+                        }
+                        return;
+                    }
+                    ProfileSlot::Service(_) => (&mut self.services, client == Some(true)),
+                    ProfileSlot::Action(_) => (&mut self.actions, client == Some(true)),
+                    ProfileSlot::Raw(_) => (&mut self.raw, is_writer),
                 };
-                let acc = map.entry(topic).or_default();
+                let acc = map.entry(slot.name().to_string()).or_default();
                 touch(&mut acc.span, at);
-                acc.participants.insert(e.guid_prefix.clone());
+                if side_a {
+                    acc.side_a.insert(guid);
+                } else {
+                    acc.side_b.insert(guid);
+                }
+                acc.written |= is_writer;
+                if let RosNameKind::ActionPart { component, .. } = &rn.kind {
+                    acc.components.insert(component.as_str().to_string());
+                }
                 if !e.type_name.is_empty() {
                     acc.type_names.insert(e.type_name.clone());
                 }
@@ -410,6 +612,8 @@ impl Learner {
             self.observe_at(&se.event, se.position);
             n += 1;
         }
+        let run = self.runs.len() - 1;
+        self.runs[run].capture = src.capture_diagnostics();
         Ok(n)
     }
 
@@ -447,6 +651,15 @@ impl Learner {
                 merge_span(&mut acc.span, &e.span);
                 acc.participants.extend(e.participants.iter().cloned());
                 acc.type_names.extend(e.type_names.iter().cloned());
+            }
+        }
+        for (mine, theirs) in [
+            (&mut self.services, &other.services),
+            (&mut self.actions, &other.actions),
+            (&mut self.raw, &other.raw),
+        ] {
+            for (n, a) in theirs {
+                mine.entry(n.clone()).or_default().absorb(a, off);
             }
         }
         for (c, m) in &other.motion {
@@ -558,6 +771,19 @@ impl Learner {
         };
         p.participants = self.participants.keys().cloned().collect();
         p.writer_topics = self.writers.keys().cloned().collect();
+        let all = self.config.learn_readers;
+        if all {
+            p.reader_topics = self.readers.keys().cloned().collect();
+        }
+        let learned = |m: &BTreeMap<String, RoleAcc>| -> BTreeSet<String> {
+            m.iter()
+                .filter(|(_, a)| a.written || all)
+                .map(|(n, _)| n.clone())
+                .collect()
+        };
+        p.services = learned(&self.services);
+        p.actions = learned(&self.actions);
+        p.raw_dds_topics = learned(&self.raw);
         for (ch, m) in &self.motion {
             let env = Envelope {
                 max_linear_speed: self
@@ -683,7 +909,8 @@ impl Learner {
         let writer_topics = endpoint_reports(&self.writers);
         let reader_topics = endpoint_reports(&self.readers);
         for t in writer_topics.keys() {
-            if !reader_topics.contains_key(t) {
+            // Nothing subscribes to /rosout on a robot without a log tool.
+            if !reader_topics.contains_key(t) && t != "/rosout" {
                 warn(
                     Info,
                     "writer_without_reader",
@@ -699,6 +926,208 @@ impl Learner {
                     format!(
                         "writers on {t} announce several types: {:?}",
                         self.writers[t].type_names
+                    ),
+                );
+            }
+        }
+
+        // Services, actions, raw DDS topics.
+        let all = self.config.learn_readers;
+        let role_reports = |m: &BTreeMap<String, RoleAcc>| {
+            m.iter()
+                .filter_map(|(n, a)| {
+                    let s = a.span.as_ref()?;
+                    Some((
+                        n.clone(),
+                        ServiceReport {
+                            announcements: s.count,
+                            first_seen: s.first,
+                            last_seen: s.last,
+                            clients: a.side_a.clone(),
+                            servers: a.side_b.clone(),
+                            components: a.components.clone(),
+                            in_profile: a.written || all,
+                        },
+                    ))
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let services = role_reports(&self.services);
+        let actions = role_reports(&self.actions);
+        let mut raw_dds_topics = BTreeMap::new();
+        for (n, a) in &self.raw {
+            let Some(s) = &a.span else { continue };
+            let ros_internal = ROS_INTERNAL_RAW_TOPICS.contains(&n.as_str());
+            raw_dds_topics.insert(
+                n.clone(),
+                RawTopicReport {
+                    announcements: s.count,
+                    first_seen: s.first,
+                    last_seen: s.last,
+                    writers: a.side_a.clone(),
+                    readers: a.side_b.clone(),
+                    type_names: a.type_names.clone(),
+                    ros_internal,
+                    in_profile: a.written || all,
+                },
+            );
+            if !ros_internal {
+                warn(
+                    Info,
+                    "raw_dds_topic",
+                    n,
+                    format!(
+                        "non-ROS DDS topic {n:?} (vendor tool? bridge? legacy DDS app?); \
+                         confirm it belongs on this robot"
+                    ),
+                );
+            }
+        }
+        for (what, m) in [
+            ("service", &self.services),
+            ("action", &self.actions),
+            ("raw DDS topic", &self.raw),
+        ] {
+            for (n, a) in m {
+                // Raw topics may legitimately have only subscribers.
+                if !a.written && !all && what != "raw DDS topic" {
+                    warn(
+                        Warn,
+                        "reader_only_name",
+                        n,
+                        format!(
+                            "{what} {n} seen only on reader endpoints, so it is NOT in the \
+                             profile; its other side always writes, so the capture is \
+                             probably incomplete"
+                        ),
+                    );
+                }
+            }
+        }
+        // Parameter services: per node (service name prefix) and per ROS
+        // participant (one that writes /rosout).
+        let mut nodes: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        let mut param_servers: BTreeSet<&str> = BTreeSet::new();
+        for (n, a) in &self.services {
+            if let Some((node, last)) = n.rsplit_once('/') {
+                if PARAMETER_SERVICES.contains(&last) && !node.is_empty() {
+                    nodes.entry(node).or_default().insert(last);
+                    param_servers.extend(a.side_b.iter().map(String::as_str));
+                }
+            }
+        }
+        for (node, have) in &nodes {
+            if have.len() < PARAMETER_SERVICES.len() {
+                let missing: Vec<&str> = PARAMETER_SERVICES
+                    .iter()
+                    .copied()
+                    .filter(|p| !have.contains(p))
+                    .collect();
+                warn(
+                    Warn,
+                    "incomplete_parameter_services",
+                    node,
+                    format!(
+                        "node {node} serves only {} of {} parameter services (missing {missing:?}); \
+                         likely an incomplete capture",
+                        have.len(),
+                        PARAMETER_SERVICES.len()
+                    ),
+                );
+            }
+        }
+        if let Some(rosout) = self.writers.get("/rosout") {
+            for g in &rosout.participants {
+                if !param_servers.contains(g.as_str()) {
+                    warn(
+                        Warn,
+                        "missing_parameter_services",
+                        g,
+                        format!(
+                            "participant {g} hosts ROS 2 node(s) (writes /rosout) but serves no \
+                             parameter services: capture probably started after discovery or \
+                             missed SEDP (or the node disables parameter services); the locked \
+                             profile would flag its /<node>/get_parameters etc."
+                        ),
+                    );
+                }
+            }
+        }
+        let reader_enforcement = all && !self.readers.is_empty();
+        if !all && !self.readers.is_empty() {
+            warn(
+                Info,
+                "reader_topics_not_learned",
+                "",
+                format!(
+                    "{} reader topics observed but not learned: reader-topic enforcement stays \
+                     off (use --learn-readers to opt in)",
+                    self.readers.len()
+                ),
+            );
+        }
+        // Capture-level problems.
+        for (i, r) in self.runs.iter().enumerate() {
+            let Some(c) = &r.capture else { continue };
+            let subject = format!("run{i}");
+            if c.discovery_reassembly_failed() {
+                warn(
+                    Warn,
+                    "fragmented_discovery_unreassembled",
+                    &subject,
+                    format!(
+                        "{}: fragmented discovery (DATA_FRAG) was seen but not all of it was \
+                         rebuilt ({} rejected, {} evicted, {} incomplete at end): some \
+                         endpoint announcements are missing from the profile",
+                        r.label,
+                        c.discovery_frag_rejected,
+                        c.discovery_frag_evicted,
+                        c.discovery_frag_incomplete
+                    ),
+                );
+            } else if c.discovery_frag_completed > 0 {
+                warn(
+                    Info,
+                    "fragmented_discovery_reassembled",
+                    &subject,
+                    format!(
+                        "{}: {} fragmented discovery sample(s) reassembled",
+                        r.label, c.discovery_frag_completed
+                    ),
+                );
+            }
+            if c.ip_reassembly_dropped > 0 {
+                warn(
+                    Warn,
+                    "ip_reassembly_failed",
+                    &subject,
+                    format!(
+                        "{}: {} IP-fragmented datagram(s) could not be reassembled",
+                        r.label, c.ip_reassembly_dropped
+                    ),
+                );
+            }
+            if c.truncated_frames > 0 {
+                warn(
+                    Warn,
+                    "truncated_frames",
+                    &subject,
+                    format!(
+                        "{}: {} frame(s) cut by the snap length were skipped; capture with \
+                         a full snap length (tcpdump -s 0)",
+                        r.label, c.truncated_frames
+                    ),
+                );
+            }
+            if c.secure_submessages > 0 {
+                warn(
+                    Warn,
+                    "protected_discovery",
+                    &subject,
+                    format!(
+                        "{}: {} DDS-Security protected submessage(s): their endpoints are \
+                         invisible to commissioning",
+                        r.label, c.secure_submessages
                     ),
                 );
             }
@@ -818,6 +1247,7 @@ impl Learner {
                 ceiling_linear: self.config.ceiling_linear,
                 ceiling_joint: self.config.ceiling_joint,
                 min_samples: self.config.min_samples,
+                learn_readers: self.config.learn_readers,
             },
             runs: self.runs.clone(),
             events_total: total,
@@ -825,6 +1255,10 @@ impl Learner {
             participants,
             writer_topics,
             reader_topics,
+            reader_enforcement,
+            services,
+            actions,
+            raw_dds_topics,
             motion_channels,
             anomalies_total: self.anomalies_total,
             anomalies: self.anomalies.clone(),
@@ -865,6 +1299,7 @@ pub struct ReportConfig {
     pub ceiling_linear: Option<f64>,
     pub ceiling_joint: Option<f64>,
     pub min_samples: u64,
+    pub learn_readers: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -884,6 +1319,38 @@ pub struct EndpointReport {
     pub last_seen: SeenAt,
     pub participants: BTreeSet<String>,
     pub type_names: BTreeSet<String>,
+}
+
+/// A ROS 2 service or action as observed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServiceReport {
+    pub announcements: u64,
+    pub first_seen: SeenAt,
+    pub last_seen: SeenAt,
+    /// Participants on the client side (write requests, read replies /
+    /// feedback / status).
+    pub clients: BTreeSet<String>,
+    /// Participants on the server side.
+    pub servers: BTreeSet<String>,
+    /// Actions only: components seen (`send_goal`, ..., `status`).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub components: BTreeSet<String>,
+    /// Learned into the profile.
+    pub in_profile: bool,
+}
+
+/// A raw (non-ROS) DDS topic as observed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RawTopicReport {
+    pub announcements: u64,
+    pub first_seen: SeenAt,
+    pub last_seen: SeenAt,
+    pub writers: BTreeSet<String>,
+    pub readers: BTreeSet<String>,
+    pub type_names: BTreeSet<String>,
+    /// Created by ROS 2 itself (see [`ROS_INTERNAL_RAW_TOPICS`]).
+    pub ros_internal: bool,
+    pub in_profile: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -910,6 +1377,12 @@ pub struct CommissioningReport {
     pub participants: BTreeMap<String, ParticipantReport>,
     pub writer_topics: BTreeMap<String, EndpointReport>,
     pub reader_topics: BTreeMap<String, EndpointReport>,
+    /// The profile's `reader_topics` is non-empty, so reader topics will be
+    /// enforced.
+    pub reader_enforcement: bool,
+    pub services: BTreeMap<String, ServiceReport>,
+    pub actions: BTreeMap<String, ServiceReport>,
+    pub raw_dds_topics: BTreeMap<String, RawTopicReport>,
     pub motion_channels: BTreeMap<String, MotionReport>,
     pub anomalies_total: u64,
     /// First [`MAX_STORED_ANOMALIES`] anomalies, in observation order.
@@ -935,14 +1408,30 @@ impl fmt::Display for CommissioningReport {
         writeln!(f, "RoboDR commissioning report: model {}", self.model)?;
         writeln!(
             f,
-            "  margin x{}  ceiling linear {} m/s  ceiling joint {} rad/s  min samples {}",
+            "  margin x{}  ceiling linear {} m/s  ceiling joint {} rad/s  min samples {}  learn readers {}",
             self.config.margin,
             opt(self.config.ceiling_linear),
             opt(self.config.ceiling_joint),
-            self.config.min_samples
+            self.config.min_samples,
+            self.config.learn_readers
         )?;
         for (i, r) in self.runs.iter().enumerate() {
             writeln!(f, "  run{i}: {} ({} events)", r.label, r.events)?;
+            if let Some(c) = &r.capture {
+                writeln!(
+                    f,
+                    "    capture: {} frames, {} RTPS datagrams, {} IP-reassembled, \
+                     discovery DATA_FRAG {} (rebuilt {}, rejected {}, evicted {}, incomplete {})",
+                    c.frames,
+                    c.rtps_datagrams,
+                    c.ip_reassembled,
+                    c.discovery_data_frag,
+                    c.discovery_frag_completed,
+                    c.discovery_frag_rejected,
+                    c.discovery_frag_evicted,
+                    c.discovery_frag_incomplete
+                )?;
+            }
         }
         writeln!(f, "  events: {} total", self.events_total)?;
         for (k, v) in &self.events_by_kind {
@@ -973,6 +1462,48 @@ impl fmt::Display for CommissioningReport {
                     e.announcements, e.first_seen, e.last_seen, e.participants
                 )?;
             }
+        }
+        writeln!(
+            f,
+            "Reader-topic enforcement: {}",
+            if self.reader_enforcement {
+                "on (reader_topics learned)"
+            } else {
+                "off (reader_topics empty)"
+            }
+        )?;
+        let learned = |b: bool| if b { "" } else { "  [NOT in profile]" };
+        for (title, m) in [("Services", &self.services), ("Actions", &self.actions)] {
+            writeln!(f, "\n{title} ({}):", m.len())?;
+            for (n, r) in m {
+                let comps = if r.components.is_empty() {
+                    String::new()
+                } else {
+                    format!("  parts {:?}", r.components)
+                };
+                writeln!(
+                    f,
+                    "  {n}  clients {:?}  servers {:?}{comps}{}",
+                    r.clients,
+                    r.servers,
+                    learned(r.in_profile)
+                )?;
+            }
+        }
+        writeln!(f, "\nRaw DDS topics ({}):", self.raw_dds_topics.len())?;
+        for (n, r) in &self.raw_dds_topics {
+            writeln!(
+                f,
+                "  {n:?}{}  writers {:?}  readers {:?}{}",
+                if r.ros_internal {
+                    " (ROS 2 internal)"
+                } else {
+                    ""
+                },
+                r.writers,
+                r.readers,
+                learned(r.in_profile)
+            )?;
         }
         writeln!(f, "\nMotion channels ({}):", self.motion_channels.len())?;
         for (c, m) in &self.motion_channels {
@@ -1439,6 +1970,326 @@ mod tests {
         assert_eq!(l.profile().participants.len(), 0);
         assert!(!r.to_string().is_empty());
     }
+
+    fn param_writers(g: &str, node: &str) -> Vec<RobotEvent> {
+        PARAMETER_SERVICES
+            .iter()
+            .flat_map(|svc| {
+                [
+                    writer(g, &format!("rr{node}/{svc}Reply")),
+                    reader(g, &format!("rq{node}/{svc}Request")),
+                ]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn endpoints_are_routed_by_kind_into_profile_sets() {
+        let mut evs = vec![part(A), part(A), part(B), part(B)];
+        evs.extend([
+            writer(A, "rt/rosout"),
+            writer(A, "rt/parameter_events"),
+            reader(A, "rt/parameter_events"),
+            writer(A, "ros_discovery_info"),
+            reader(A, "ros_discovery_info"),
+            writer(B, "vendor_diag"),
+            // Service /set_mode: A client, B server.
+            writer(A, "rq/set_modeRequest"),
+            reader(B, "rq/set_modeRequest"),
+            writer(B, "rr/set_modeReply_"),
+            reader(A, "rr/set_modeReply"),
+            // Action /dock: B server, A client.
+            writer(B, "rr/dock/_action/send_goalReply"),
+            writer(B, "rt/dock/_action/feedback"),
+            writer(A, "rq/dock/_action/send_goalRequest"),
+            reader(A, "rt/dock/_action/status"),
+            // Wrong transport: a plain topic, not an action part.
+            writer(A, "rt/dock/_action/send_goal"),
+            // Reader-only names.
+            reader(A, "rq/ghostRequest"),
+            reader(B, "raw_sub_only"),
+            reader(B, "rt/camera/image"),
+        ]);
+        evs.extend(param_writers(A, "/nav"));
+        let l = learn(cfg(), &evs);
+        let p = l.profile();
+        let v = |s: &BTreeSet<String>| s.iter().cloned().collect::<Vec<_>>();
+        assert_eq!(
+            v(&p.writer_topics),
+            vec!["/dock/_action/send_goal", "/parameter_events", "/rosout"]
+        );
+        assert!(p.services.contains("/set_mode"));
+        assert!(p.services.contains("/nav/get_parameters"));
+        assert_eq!(p.services.len(), 7, "{:?}", p.services);
+        assert!(!p.services.contains("/ghost"), "reader-only not learned");
+        assert_eq!(v(&p.actions), vec!["/dock"]);
+        assert_eq!(
+            v(&p.raw_dds_topics),
+            vec!["ros_discovery_info", "vendor_diag"]
+        );
+        assert!(p.reader_topics.is_empty(), "readers are opt-in");
+        assert_eq!(p.validate(), Ok(()));
+
+        let r = l.report();
+        let svc = &r.services["/set_mode"];
+        assert_eq!(svc.clients.iter().collect::<Vec<_>>(), vec![A]);
+        assert_eq!(svc.servers.iter().collect::<Vec<_>>(), vec![B]);
+        assert!(svc.in_profile);
+        assert!(!r.services["/ghost"].in_profile);
+        let act = &r.actions["/dock"];
+        assert_eq!(act.servers.iter().collect::<Vec<_>>(), vec![B]);
+        assert_eq!(act.clients.iter().collect::<Vec<_>>(), vec![A]);
+        assert_eq!(
+            act.components.iter().collect::<Vec<_>>(),
+            vec!["feedback", "send_goal", "status"]
+        );
+        assert!(r.raw_dds_topics["ros_discovery_info"].ros_internal);
+        assert!(!r.raw_dds_topics["raw_sub_only"].in_profile);
+        assert!(!r.reader_enforcement);
+        let has = |code: &str, subj: &str| {
+            r.warnings
+                .iter()
+                .any(|w| w.code == code && w.subject == subj)
+        };
+        assert!(has("reader_only_name", "/ghost"));
+        assert!(!has("reader_only_name", "raw_sub_only"));
+        assert!(has("raw_dds_topic", "vendor_diag"));
+        assert!(!has("raw_dds_topic", "ros_discovery_info"));
+        assert!(has("reader_topics_not_learned", ""));
+        assert!(!has("missing_parameter_services", A));
+        assert!(!has("incomplete_parameter_services", "/nav"));
+        let text = r.to_string();
+        assert!(text.contains("Services (8):"), "{text}");
+        assert!(text.contains("/ghost  clients"), "{text}");
+        assert!(text.contains("[NOT in profile]"));
+        assert!(text.contains("(ROS 2 internal)"));
+        assert!(text.contains("parts {\"feedback\""), "{text}");
+        assert!(text.contains("Reader-topic enforcement: off"));
+
+        // The clean run evaluates clean against its own profile.
+        for e in &evs {
+            assert!(p.evaluate(e).is_none(), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn learn_readers_fills_reader_sets_and_stays_clean() {
+        let mut evs = vec![part(A), part(B)];
+        evs.extend([
+            writer(A, "rt/odom"),
+            reader(B, "rt/odom"),
+            reader(B, "rt/camera/image"),
+            reader(A, "rq/ghostRequest"),
+            reader(B, "rt/nav/_action/status"),
+            reader(B, "raw_sub_only"),
+        ]);
+        let mut c = cfg();
+        c.learn_readers = true;
+        let l = learn(c, &evs);
+        let p = l.profile();
+        assert_eq!(
+            p.reader_topics.iter().collect::<Vec<_>>(),
+            vec!["/camera/image", "/odom"]
+        );
+        assert!(p.services.contains("/ghost"));
+        assert!(p.actions.contains("/nav"));
+        assert!(p.raw_dds_topics.contains("raw_sub_only"));
+        for e in &evs {
+            assert!(p.evaluate(e).is_none(), "{e:?}");
+        }
+        // Enforcement is live: an unseen reader topic deviates.
+        let d = p.evaluate(&reader(B, "rt/map")).unwrap();
+        assert_eq!(d.rule, "robot.ros2.unknown_reader_topic");
+        let r = l.report();
+        assert!(r.reader_enforcement);
+        assert!(r.config.learn_readers);
+        assert!(!r.warnings.iter().any(|w| w.code == "reader_only_name"));
+        assert!(r.services["/ghost"].in_profile);
+    }
+
+    #[test]
+    fn parameter_service_warnings() {
+        const C: &str = "cccccccccccccccccccccccc";
+        let mut evs = vec![part(A), part(A), part(B), part(B), part(C), part(C)];
+        // A: complete node. B: ROS node without any parameter service.
+        // C: node with an incomplete set.
+        evs.extend([
+            writer(A, "rt/rosout"),
+            writer(B, "rt/rosout"),
+            writer(C, "rt/rosout"),
+        ]);
+        evs.extend(param_writers(A, "/nav"));
+        evs.extend(param_writers(C, "/ns/driver").into_iter().take(6));
+        let r = learn(cfg(), &evs).report();
+        let has = |code: &str, subj: &str| {
+            r.warnings
+                .iter()
+                .any(|w| w.code == code && w.subject == subj && w.level == WarningLevel::Warn)
+        };
+        assert!(!has("missing_parameter_services", A), "{r}");
+        assert!(has("missing_parameter_services", B), "{r}");
+        assert!(!has("missing_parameter_services", C));
+        assert!(has("incomplete_parameter_services", "/ns/driver"), "{r}");
+        assert!(!has("incomplete_parameter_services", "/nav"));
+        let w = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "incomplete_parameter_services")
+            .unwrap();
+        assert!(w.message.contains("3 of 6"), "{}", w.message);
+    }
+
+    #[test]
+    fn invalid_ros_names_are_anomalies_not_learned() {
+        let evs = vec![
+            part(A),
+            writer(A, "rt/bad name"),
+            writer(A, "rq/ctl\u{7}Request"),
+            writer(A, "rt/ok"),
+            // Raw names are exact and may contain anything but must be non-empty.
+            writer(A, "raw with space"),
+        ];
+        let l = learn(cfg(), &evs);
+        let r = l.report();
+        assert_eq!(
+            r.anomalies
+                .iter()
+                .filter(|a| a.kind == "invalid_ros_name")
+                .count(),
+            2
+        );
+        let p = l.profile();
+        assert_eq!(p.writer_topics.iter().collect::<Vec<_>>(), vec!["/ok"]);
+        assert!(p.services.is_empty());
+        assert!(p.raw_dds_topics.contains("raw with space"));
+        assert_eq!(p.validate(), Ok(()));
+    }
+
+    #[test]
+    fn profile_slot_matches_validate_rules() {
+        use robodr_events::graph::demangle;
+        assert_eq!(
+            ProfileSlot::of(&demangle("rq/nav/_action/get_resultRequest")),
+            ProfileSlot::Action("/nav".into())
+        );
+        assert_eq!(
+            ProfileSlot::of(&demangle("rr/addReply_")),
+            ProfileSlot::Service("/add".into())
+        );
+        assert_eq!(
+            ProfileSlot::of(&demangle("rtfoo")),
+            ProfileSlot::Raw("rtfoo".into())
+        );
+        assert!(!ProfileSlot::Raw(String::new()).is_valid());
+        assert!(ProfileSlot::Raw(" x ".into()).is_valid());
+        assert!(!ProfileSlot::Topic("/".into()).is_valid());
+        assert!(!ProfileSlot::Topic("/a\tb".into()).is_valid());
+        assert!(ProfileSlot::Topic("//".into()).is_valid());
+        assert_eq!(ProfileSlot::Service("/s".into()).name(), "/s");
+    }
+
+    #[test]
+    fn merge_unions_services_actions_raw() {
+        let mut a = Learner::new(cfg()).unwrap();
+        a.observe(&part(A));
+        a.observe(&writer(A, "rq/xRequest"));
+        a.observe(&writer(A, "vendor"));
+        let mut b = Learner::new(cfg()).unwrap();
+        b.observe(&part(B));
+        b.observe(&writer(B, "rr/xReply"));
+        b.observe(&writer(B, "rt/nav/_action/status"));
+        b.observe(&reader(B, "rq/yRequest"));
+        let mut ab = a.clone();
+        ab.merge(&b);
+        let mut ba = b.clone();
+        ba.merge(&a);
+        assert_eq!(ab.profile(), ba.profile());
+        let p = ab.profile();
+        assert_eq!(p.services.iter().collect::<Vec<_>>(), vec!["/x"]);
+        assert!(p.actions.contains("/nav") && p.raw_dds_topics.contains("vendor"));
+        let r = ab.report();
+        assert_eq!(r.services["/x"].clients.len(), 1);
+        assert_eq!(r.services["/x"].servers.len(), 1);
+        assert_eq!(r.services["/x"].first_seen.run, 0);
+        assert_eq!(r.services["/x"].last_seen.run, 1);
+        assert!(!r.services["/y"].in_profile);
+    }
+
+    struct FakeCapture(Option<CaptureDiagnostics>, Vec<RobotEvent>);
+    impl EventSource for FakeCapture {
+        fn label(&self) -> &str {
+            "fake.pcap"
+        }
+        fn next_event(&mut self) -> Option<Result<crate::input::SourcedEvent, InputError>> {
+            if self.1.is_empty() {
+                return None;
+            }
+            Some(Ok(crate::input::SourcedEvent {
+                position: 7,
+                event: self.1.remove(0),
+            }))
+        }
+        fn capture_diagnostics(&self) -> Option<CaptureDiagnostics> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn capture_diagnostics_become_warnings() {
+        let bad = CaptureDiagnostics {
+            frames: 10,
+            rtps_datagrams: 9,
+            discovery_data_frag: 4,
+            discovery_frag_incomplete: 1,
+            ip_reassembly_dropped: 2,
+            truncated_frames: 1,
+            secure_submessages: 3,
+            ..Default::default()
+        };
+        let good = CaptureDiagnostics {
+            discovery_data_frag: 2,
+            discovery_frag_completed: 1,
+            ..Default::default()
+        };
+        let mut l = Learner::new(cfg()).unwrap();
+        l.ingest(&mut FakeCapture(Some(bad.clone()), vec![part(A)]))
+            .unwrap();
+        l.ingest(&mut FakeCapture(Some(good), vec![part(A)]))
+            .unwrap();
+        l.ingest(&mut VecSourceAlias::new("x", vec![part(A)]))
+            .unwrap();
+        let r = l.report();
+        assert_eq!(r.runs[0].capture, Some(bad));
+        assert!(r.runs[2].capture.is_none());
+        let has = |code: &str, subj: &str, lvl: WarningLevel| {
+            r.warnings
+                .iter()
+                .any(|w| w.code == code && w.subject == subj && w.level == lvl)
+        };
+        use WarningLevel::{Info, Warn};
+        assert!(
+            has("fragmented_discovery_unreassembled", "run0", Warn),
+            "{r}"
+        );
+        assert!(has("ip_reassembly_failed", "run0", Warn));
+        assert!(has("truncated_frames", "run0", Warn));
+        assert!(has("protected_discovery", "run0", Warn));
+        assert!(has("fragmented_discovery_reassembled", "run1", Info));
+        assert!(!has("fragmented_discovery_unreassembled", "run1", Warn));
+        assert_eq!(r.participants[A].first_seen.position, 7);
+        let text = r.to_string();
+        assert!(
+            text.contains("capture: 10 frames, 9 RTPS datagrams"),
+            "{text}"
+        );
+        // JSON: absent capture is omitted, present one round-trips.
+        let j = serde_json::to_value(&r).unwrap();
+        assert!(j["runs"][2].get("capture").is_none());
+        let back: CommissioningReport = serde_json::from_value(j).unwrap();
+        assert_eq!(back, r);
+    }
+
+    use crate::input::VecSource as VecSourceAlias;
 
     #[test]
     fn human_report_mentions_stats() {
