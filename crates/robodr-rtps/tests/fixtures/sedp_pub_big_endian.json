@@ -1,0 +1,12 @@
+[
+  {
+    "guid_prefix": "0101c0a80a1700002a110001",
+    "kind": "participant",
+    "topic": null
+  },
+  {
+    "guid_prefix": "0101c0a80a1700002a110001",
+    "kind": "writer",
+    "topic": "rt/scan"
+  }
+]

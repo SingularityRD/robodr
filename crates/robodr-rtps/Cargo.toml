@@ -8,3 +8,6 @@ description = "Read-only RTPS discovery (SPDP/SEDP) parser for RoboDR. Pure, no 
 
 [dependencies]
 robodr-events = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

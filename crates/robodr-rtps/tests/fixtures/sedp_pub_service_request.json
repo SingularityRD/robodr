@@ -1,0 +1,12 @@
+[
+  {
+    "guid_prefix": "010f3a7c5509000001000000",
+    "kind": "participant",
+    "topic": null
+  },
+  {
+    "guid_prefix": "010f3a7c5509000001000000",
+    "kind": "writer",
+    "topic": "rq/add_two_intsRequest"
+  }
+]
