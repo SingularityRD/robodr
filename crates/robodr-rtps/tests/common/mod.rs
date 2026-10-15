@@ -685,8 +685,8 @@ pub fn check_invariants(
                     }
                 }
             }
-            RobotEvent::MotionCommand(_) => {
-                return Err("discovery parser emitted a MotionCommand".into());
+            RobotEvent::MotionCommand(_) | RobotEvent::MotionFeedback(_) => {
+                return Err("discovery parser emitted a motion event".into());
             }
         }
     }
@@ -706,6 +706,7 @@ pub fn key(e: &RobotEvent) -> (&'static str, String, Option<String>) {
             ("reader", ep.guid_prefix.clone(), Some(ep.topic.clone()))
         }
         RobotEvent::MotionCommand(m) => ("motion", String::new(), Some(m.channel.clone())),
+        RobotEvent::MotionFeedback(f) => ("feedback", String::new(), Some(f.channel.clone())),
     }
 }
 

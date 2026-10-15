@@ -8,11 +8,11 @@ members = [
     "crates/robodr-firewall",
     "crates/robodr-motion",
     "crates/robodr-ocsf",
-    # Pulsar-dependent (need pulsar + tokio from crates.io; skipped offline):
-    "crates/robodr-pulsard",
     "crates/robodr-responder",
     "crates/robodr-rtps",
-    "crates/robodr-sensor-ros2", # Pulsar-dependent
+    # Pulsar-dependent (need pulsar + tokio; cannot build without crates.io):
+    "crates/robodr-pulsard",
+    "crates/robodr-sensor-ros2",
 ]
 # Pulsar is a git submodule with its own workspace; keep it out of ours.
 exclude = ["vendor"]

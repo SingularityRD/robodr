@@ -384,7 +384,11 @@ pub fn check_event(profile: &Profile, event: &RobotEvent) -> Vec<Deviation> {
 fn anomalous_speed(c: &MotionCommand) -> Option<Deviation> {
     for (dim, v) in [("linear", c.linear_speed), ("joint", c.joint_speed)] {
         if let Some(v) = v {
-            if !v.is_finite() || v < 0.0 {
+            // Non-finite values are already a Critical
+            // `robot.motion.non_finite_command` from `Profile::evaluate`;
+            // only the commissioning-specific negative-magnitude anomaly
+            // is added here.
+            if v.is_finite() && v < 0.0 {
                 return Some(Deviation::new(
                     RULE_ANOMALOUS_SPEED,
                     Severity::High,
@@ -705,17 +709,20 @@ mod tests {
         c.observe("x", 6, &mv(0.6));
         let r = c.finish();
         assert_eq!(r.events, 6);
-        assert_eq!(r.deviations_total, 4);
+        // NaN -> core non_finite_command; -1.0 -> |1.0| over envelope plus
+        // the commissioning negative-magnitude anomaly; 0.6 -> over envelope.
+        assert_eq!(r.deviations_total, 5);
         assert_eq!(r.by_rule["robot.ros2.unknown_participant"], 1);
-        assert_eq!(r.by_rule[RULE_ANOMALOUS_SPEED], 2);
-        assert_eq!(r.by_rule["robot.motion.linear_over_envelope"], 1);
+        assert_eq!(r.by_rule["robot.motion.non_finite_command"], 1);
+        assert_eq!(r.by_rule[RULE_ANOMALOUS_SPEED], 1);
+        assert_eq!(r.by_rule["robot.motion.linear_over_envelope"], 2);
         assert_eq!(r.findings[0].position, 2);
         let s = r.to_string();
         assert!(
             s.contains("x:2: [High] robot.ros2.unknown_participant"),
             "{s}"
         );
-        assert!(s.contains("4 deviation(s) over 6 event(s)"));
+        assert!(s.contains("5 deviation(s) over 6 event(s)"));
         serde_json::to_string(&r).unwrap();
     }
 

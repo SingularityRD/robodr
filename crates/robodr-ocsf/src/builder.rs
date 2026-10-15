@@ -371,6 +371,13 @@ impl<'a> FindingBuilder<'a> {
                 self.subject = Subject::from_command(c);
                 self = self.command(c, None);
             }
+            // Feedback has no source endpoint; the channel is the subject.
+            RobotEvent::MotionFeedback(f) => {
+                self.subject = Subject {
+                    topic: Some(f.channel.clone()),
+                    ..Subject::default()
+                };
+            }
         }
         self
     }
@@ -433,7 +440,7 @@ impl<'a> FindingBuilder<'a> {
 
     /// The deterministic finding uid this builder will produce.
     pub fn finding_uid(&self) -> String {
-        finding_uid(&self.ctx.robot.id, self.dev.rule, &self.subject)
+        finding_uid(&self.ctx.robot.id, self.dev.rule_str(), &self.subject)
     }
 
     /// Assemble and validate. Never panics on hostile input; returns every
@@ -445,7 +452,7 @@ impl<'a> FindingBuilder<'a> {
         };
         let ctx = self.ctx;
         let dev = self.dev;
-        let info = rule_info(dev.rule);
+        let info = rule_info(dev.rule_str());
         let uid = self.finding_uid();
         let robot_id = ctx.robot.id.clone();
 
@@ -594,8 +601,8 @@ impl<'a> FindingBuilder<'a> {
                 first_seen_time: first,
                 last_seen_time: last,
                 analytic: Analytic {
-                    uid: dev.rule.into(),
-                    name: dev.rule.into(),
+                    uid: dev.rule_str().into(),
+                    name: dev.rule_str().into(),
                     type_id: 1,
                     type_: "Rule".into(),
                 },

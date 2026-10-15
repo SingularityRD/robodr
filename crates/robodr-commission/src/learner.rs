@@ -338,6 +338,7 @@ impl Learner {
             RobotEvent::Ros2WriterDiscovered(_) => "ros2_writer_discovered",
             RobotEvent::Ros2ReaderDiscovered(_) => "ros2_reader_discovered",
             RobotEvent::MotionCommand(_) => "motion_command",
+            RobotEvent::MotionFeedback(_) => "motion_feedback",
         };
         *self.events_by_kind.entry(kind.into()).or_insert(0) += 1;
 
@@ -393,6 +394,9 @@ impl Learner {
                 acc.linear.extend(linear);
                 acc.joint.extend(joint);
             }
+            // Feedback is consumed by robodr-motion's consistency monitor; it
+            // carries nothing the allowlist profile learns.
+            RobotEvent::MotionFeedback(_) => {}
         }
     }
 

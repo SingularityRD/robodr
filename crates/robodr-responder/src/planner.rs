@@ -62,7 +62,7 @@ pub(crate) fn plan_with(
     // 2. Rule override.
     let mut cap = Step::RequestSafeState;
     let mut targets = policy.default_restrict.as_slice();
-    if let Some(o) = policy.override_for(deviation.rule) {
+    if let Some(o) = policy.override_for(deviation.rule_str()) {
         // validate() guarantees min <= max; guard anyway so clamp can't panic.
         let (lo, hi) = (o.min_step.min(o.max_step), o.max_step);
         let result = step.clamp(lo, hi);
