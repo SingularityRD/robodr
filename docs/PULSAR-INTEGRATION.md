@@ -18,17 +18,24 @@ exactly what was checked against which Pulsar source file.
 |---|---|---|
 | `robodr-sensor-ros2` | yes (`pulsar-core`, `tokio`) | no. The offline script drops it |
 | `robodr-pulsard` (new binary) | yes (`pulsar`, i.e. the whole daemon) | no. The offline script drops it |
-| `robodr-events`, `robodr-rtps`, ... | no | yes |
+| `robodr-ros2-pipeline` (new) | no | yes, with its tests and the `robodr-ros2-watch` binary |
+| `robodr-events`, `robodr-rtps`, `robodr-capture`, ... | no | yes |
 
-Inside `robodr-sensor-ros2`, the logic is split so that most of it needs
-neither Pulsar nor tokio:
+Everything in the sensor that does not need Pulsar or tokio now lives in the
+pure crate `robodr-ros2-pipeline`. Its only dependencies are std,
+robodr-events, robodr-rtps, robodr-capture and serde:
 
-| File | Depends on | Purpose |
-|---|---|---|
-| `src/pipeline.rs` | std, robodr-events, robodr-rtps, serde | datagram → RTPS events → profile deviations → bounded dedup → sanitised `Finding`s; observe-mode tagging; `Datagram` / `DatagramSource` seam |
-| `src/config.rs` | std, serde | `[module.robodr-sensor-ros2]` config, domain-id → port, validation |
-| `src/socket.rs` | std (+ `socket`/`setsockopt`/`bind` from libc, which std already links) | receive-only SPDP socket with `SO_REUSEADDR`, bound to the group |
-| `src/lib.rs` | pulsar-core, tokio | glue only: `SimplePulsarModule` impl, listener task, `send_threat` |
+| `robodr-ros2-pipeline` module | Purpose |
+|---|---|
+| `pipeline` | datagram → detailed RTPS parse with one long-lived bounded `FragmentReassembler` → profile deviations + removal / anomaly / fragmentation findings → bounded dedup → sanitised `Finding`s stamped enforce/observe; `load_profile`, `ProfileStatus` (profile validated at load, invalid = refused for enforcement) |
+| `config` | `[module.robodr-sensor-ros2]` and its `capture` sub-table, domain-id → SPDP port, capture `RtpsPortMap`, default interfaces, validation |
+| `socket` | receive-only SPDP socket with `SO_REUSEADDR`, bound to the group. Uses `socket`/`setsockopt`/`bind` from libc, which std already links |
+| `source` | `Datagram` / `DatagramSource` seam (std-only, blocking) and `CaptureDatagramSource` over `robodr_capture::rtps_datagrams`, for live `AF_PACKET` and pcap/pcapng |
+| `sanitize`, `dedup`, `watch` | text sanitising, bounded dedup set, the `robodr-ros2-watch` lab tool |
+
+`robodr-sensor-ros2/src/lib.rs` is now glue only: the `SimplePulsarModule`
+impl, the tokio listener task over the SPDP socket, the capture channel and
+an optional external channel, the capture thread, and `send_threat`.
 
 ## 2. Pulsar API items, checked one by one
 
@@ -38,9 +45,9 @@ neither Pulsar nor tokio:
 | Config bound | `pdk/module.rs`, `pdk/config.rs`, `src/pulsard/config.rs` | Config is **serde `Deserialize`** (via `ModuleConfig::parse` with `serde_ignored`), **not** `TryFrom<&ModuleConfig>`. Unknown keys are warned about, not rejected. The section is **`[module.<MODULE_NAME>]`**. `enabled` is consumed by Pulsar's `ModuleSection` and overrides `DEFAULT_ENABLED`. **Fixed:** `config/robodr.toml.example` used `[robodr-sensor-ros2]`, which Pulsar would ignore. |
 | Config of disabled modules | `src/pulsard/daemon.rs` `add_module` | Pulsar parses the config even for disabled modules. If parsing fails, startup aborts only when the module is enabled; otherwise the error is kept until someone starts it. **Fixed:** `profile_path` was a required field. Every field now has a default, so a missing section parses cleanly. |
 | `ModuleContext::send_threat` | `pdk/module_context.rs` | `fn send_threat(&self, process: Pid, timestamp: Timestamp, description: String, extra: Option<Value>)`. It is sync and spawns a task, so it needs a tokio runtime, which the listener task has. It sends `Payload::Empty` with `header.threat = Some(Threat { source: module_name, description, extra })`. **Matches.** |
-| `ModuleContext::raise_warning` | `pdk/module_context.rs`, `module_manager.rs` | `async fn raise_warning(&self, String)`. The warning is appended to `ModuleStatus::Running(warnings)`, which `pulsar status` shows. The signal channel has capacity 8. Pulsar's `threat-logger` also calls it from `init_state`. We use it once for observe mode and once if every datagram source is gone. |
+| `ModuleContext::raise_warning` | `pdk/module_context.rs`, `module_manager.rs` | `async fn raise_warning(&self, String)`. The warning is appended to `ModuleStatus::Running(warnings)`, which `pulsar status` shows. The signal channel has capacity 8. Pulsar's `threat-logger` also calls it from `init_state`. We use it once at start for an observe-only or refused profile, when the capture source ends, and if every datagram source is gone. |
 | `ModuleContext: Clone` | `pdk/module_context.rs` | `#[derive(Clone)]`. We clone it into the listener task. |
-| `event::Value` | `crates/pulsar-core/src/event.rs` | `pub struct Value(toml::Value)`. `Value::try_from<T: Serialize>(value: T) -> Result<Value, String>` is an **inherent** associated fn: it serialises through TOML. It is not `std::convert::TryFrom`, and an inherent fn takes precedence over the trait in `Value::try_from(..)`. Pulsar's own test calls `Value::try_from(&native)` the same way. Because the value goes through TOML, `extra` must be a TOML table. `ThreatExtra` is a flat struct of strings, a bool and a unit enum (`Severity`, which serialises to a lowercase string), so it stays a valid table. **Matches.** |
+| `event::Value` | `crates/pulsar-core/src/event.rs` | `pub struct Value(toml::Value)`. `Value::try_from<T: Serialize>(value: T) -> Result<Value, String>` is an **inherent** associated fn: it serialises through TOML. It is not `std::convert::TryFrom`, and an inherent fn takes precedence over the trait in `Value::try_from(..)`. Pulsar's own test calls `Value::try_from(&native)` the same way. Because the value goes through TOML, `extra` must be a TOML table. `ThreatExtra` is a flat struct of strings, a bool and two unit enums (`Severity` and `Mode`, which serialise to lowercase strings), so it stays a valid table. **Matches.** |
 | `Pid` | `pulsar-core/src/lib.rs` → `bpf-common/src/lib.rs` | `pub use nix::unistd::Pid`. The old `Pid::this()` exists in nix, but we use `Pid::from_raw(std::process::id() as i32)`, the form Pulsar itself uses. |
 | `Timestamp::now()` | `bpf-common/src/time.rs` | Exists. It reads `CLOCK_MONOTONIC` nanoseconds, the same base Pulsar's header conversion expects. |
 | `ModuleError` | `pdk/module.rs` | `Box<dyn Error + Send + Sync + 'static>`. `From<String>` and `From<&str>` come from std, so `?` on `Result<_, String>` works. |
@@ -88,7 +95,24 @@ Enable the sensor in `/etc/pulsar/pulsar.toml`. See
 enabled = true
 profile_path = "/etc/robodr/profile.json"
 domain_id = 0
+
+[module.robodr-sensor-ros2.capture]
+enabled = true            # passive capture, needs CAP_NET_RAW
+# interfaces = ["lo", "eth0"]   default: ["lo", <default-route interface>]
+# domain_ids = [0]              default: [domain_id]
+# pcap_replay = "/lab/x.pcapng" lab only: replay instead of live
 ```
+
+How the nested table reaches the module was checked by reading the code.
+`src/pulsard/config.rs` `ModuleSection` takes `enabled` and keeps the rest
+as a `#[serde(flatten)] toml::Table`. `pdk/config.rs` `ModuleConfig::parse`
+then deserialises the whole table with `serde_ignored`. So
+`[module.robodr-sensor-ros2.capture]` arrives as the `capture` field. Its
+`enabled` key is a field of `CaptureConfig`; it is not Pulsar's
+module-level `enabled`.
+
+`robodr-pulsard` needs no change to register the capture source. The sensor
+opens it from its own config section in `init_state`.
 
 ## 4. Sensor behaviour that was changed or added
 
@@ -99,23 +123,69 @@ domain_id = 0
   - Values in 102..=214 are accepted with a warning: ROS 2 recommends
     0..=101 and 215..=232.
   - `spdp_port` can override the derived port, with a warning.
-- **Validation.** `config.rs` rejects:
+- **Validation.** `robodr_ros2_pipeline::config` rejects:
   - a non-absolute or empty `profile_path`;
   - a non-multicast `spdp_group`;
   - a multicast or broadcast `interface`;
   - `spdp_port = 0`;
-  - `dedup_capacity` outside `1..=1048576`.
+  - `dedup_capacity` outside `1..=1048576`;
+  - when capture is enabled:
+    - `capture.domain_ids` entries outside `0..=232`;
+    - invalid interface names (empty, longer than 15 bytes, `/`, `:`,
+      whitespace or control characters);
+    - `read_timeout_ms` outside 10..=5000;
+    - `queue_capacity` outside 1..=65536;
+    - a relative `pcap_replay`.
 
-  `listen_spdp = false` without an external source is rejected in
+  It warns on:
+  - `pcap_replay`, which replaces live capture;
+  - no default route, in which case capture uses `lo` only (common on
+    air-gapped robots, so list the interfaces);
+  - `interfaces = []`, which means all interfaces;
+  - `domain_ids` that omit `domain_id`.
+
+  No SPDP socket, no capture and no external source is rejected in
   `init_state`.
-- **Observe mode** (`profile.locked == false`):
-  - the threat description starts with `[observe-only] `;
-  - `extra` has `mode = "observe"`, `observe_only = true`;
-  - a module warning is raised.
+- **Observe mode, enforce mode and refused profiles.** The profile is
+  checked with `Profile::validate` when it is loaded:
 
-  Locked profiles produce `mode = "locked"`, `observe_only = false`. The full
-  `extra` table is `rule`, `severity`, `detail`, `mode`, `observe_only`,
-  `src_ip` and `profile_model`. No new event type was added.
+  | Profile | `extra.profile_status` | Threats |
+  |---|---|---|
+  | valid, `locked = true` | `enforcing` | `extra.mode = "enforce"`, `observe_only = false` |
+  | valid, `locked = false` | `observing` | `mode = "observe"`, `observe_only = true`, description starts with `[observe-only] `, module warning raised |
+  | fails validation | `refused` | as observing, plus: every error logged, one module warning, one `robot.ros2.profile_refused` (High, observe-only) threat |
+
+  **Decision (fail closed): a refused profile is never enforced, and the
+  sensor keeps running observe-only.**
+  - It is not enforced because a broken profile is a configuration fault.
+    Escalating it into a safe-state request would let anyone who can corrupt
+    the profile file stop the robot.
+  - It keeps running because refusing to start would blind the sensor.
+  - An unreadable or unparseable profile file is still a start-up error.
+
+  The full `extra` table:
+  - `rule`
+  - `severity`
+  - `detail`
+  - `mode` (`"enforce"`/`"observe"`, as `robodr_events::Mode`). It was
+    `"locked"`/`"observe"` before this change.
+  - `observe_only`
+  - `src_ip`
+  - `profile_model`
+  - `profile_status` (new)
+
+  All are scalars. No new Pulsar event type was added.
+- **New findings from the detailed parse** (`parse_datagram_detailed` via
+  one long-lived `FragmentReassembler`):
+
+  | Rule | Severity | Raised when |
+  |---|---|---|
+  | `robot.ros2.participant_removed` | Medium | a profiled participant is announced as disposed or unregistered |
+  | `robot.rtps.malformed_discovery` | Low | parse anomalies (`report_anomalies`) |
+  | `robot.rtps.fragmented_discovery` | Low | `DATA_FRAG` discovery is seen (`report_fragmentation`) |
+  | `robot.rtps.discovery_fragment_rejected` | Medium | fragments are refused by the reassembler (always reported) |
+
+  Fragmented SEDP is now reassembled and evaluated. Before, it was missed.
 - **Dedup.**
   - It is bounded at `dedup_capacity` entries, evicting the oldest first.
   - It stores a per-process-keyed 64-bit hash (`RandomState`) instead of the
@@ -133,63 +203,87 @@ domain_id = 0
   - Bound to `0.0.0.0`, it could also be handed unicast datagrams meant for a
     DDS participant.
 
-  `socket.rs` sets `SO_REUSEADDR` before `bind`, which `std` and tokio cannot
+  `robodr_ros2_pipeline::socket` sets `SO_REUSEADDR` before `bind`, which `std` and tokio cannot
   do. It deliberately does not set `SO_REUSEPORT`, which load-balances
   unicast between sockets. It binds to the **group address**, so only
   datagrams sent to the group reach the sensor. The socket never transmits.
 
-## 5. Seam for the capture-based listener (`robodr-capture`)
+## 5. Datagram sources: SPDP socket, passive capture, external
 
-`robodr-sensor-ros2` does **not** depend on `robodr-capture`. The seam has
-three parts:
-
-- `pipeline::Datagram { payload: Vec<u8>, src_ip: String }`. The payload is
-  the UDP payload, starting at `RTPS`.
-- `pipeline::DatagramSource`, a std-only blocking trait with
-  `fn recv(&mut self) -> io::Result<Option<Datagram>>`:
-  - `Ok(None)` means the source is finished;
+- **SPDP socket** (`listen_spdp`): bound in `init_state`, then registered
+  with tokio through `UdpSocket::from_std`.
+- **Passive capture** (`capture.enabled`):
+  - `init_state` calls `CaptureSettings::open(stop_flag)`. That returns a
+    `CaptureDatagramSource` over `AfPacketSource` (live), or over
+    `CaptureFile` when `capture.pcap_replay` is set.
+  - `spawn_blocking_source` runs it on an OS thread and feeds a bounded
+    tokio channel of `capture.queue_capacity`.
+  - If the capture cannot be opened, for example without `CAP_NET_RAW`,
+    **module start fails**. An operator who enabled capture must not get a
+    silent blind spot.
+  - `graceful_stop` sets the stop flag, so the thread exits within one
+    `read_timeout_ms`, and aborts the listener, which drops the channel.
+  - When the capture source ends (end of a replay file, socket error), a
+    module warning is raised and the SPDP socket keeps running.
+- **External source:** `Ros2Sensor::with_external_source(rx)` plus
+  `spawn_blocking_source(any DatagramSource, n)` is still available for
+  sources that are not configured. The receiver sits behind
+  `Arc<tokio::sync::Mutex<..>>`, so it survives a module stop and start.
+- `DatagramSource` contract (std-only, blocking):
+  - `Ok(Some)` is a datagram;
+  - `Ok(None)` means finished or stopped;
   - `Err` is terminal;
-  - the implementation must handle transient errors itself.
-
-  `robodr-capture` can implement it with no tokio and no Pulsar.
-- In the glue:
-  - `spawn_blocking_source(source, capacity) -> io::Result<mpsc::Receiver<Datagram>>`
-    runs the source on an OS thread, with bounded backpressure.
-  - `Ros2Sensor::with_external_source(rx)` feeds that channel into the same
-    pipeline, alongside the SPDP socket, or alone if `listen_spdp = false`.
-
-  The receiver sits behind an `Arc<tokio::sync::Mutex<..>>`, so it survives
-  a module stop and start.
-
-Integrator wiring, in `robodr-pulsard`'s closure:
-`starter.add_module(Ros2Sensor::with_external_source(spawn_blocking_source(capture_source, 1024)?))`.
+  - transient conditions (read timeouts, frame budget) are absorbed inside
+    the source.
+- All sources feed **one** `Pipeline`, so dedup and `DATA_FRAG` reassembly
+  span the sources.
+- Without SPDP, capture or an external source, `init_state` fails ("would
+  see nothing").
 
 ## 6. How the parts that could be checked here were checked
 
-- `pipeline.rs`, `config.rs` and `socket.rs` were compiled and tested
-  offline: 30 unit tests pass and clippy `-D warnings` is clean. They were
-  included through `#[path]` into a throwaway crate that depends only on
-  robodr-events, robodr-rtps, serde and serde_json. The socket tests did run
-  real `SO_REUSEADDR` binds and a multicast join on this Linux host.
+- **`robodr-ros2-pipeline`** is a real workspace member. It is built and
+  tested by `tools/offline-cargo.sh` with 73 tests, and is clean under
+  clippy `-D warnings` and `cargo fmt --check`. The tests cover:
+  - end to end: pcap → `CaptureDatagramSource` → `Pipeline`. The scenario
+    is a legit participant and writers plus a rogue participant on
+    `rt/cmd_vel`;
+  - exact deviations;
+  - dedup;
+  - observe-only results;
+  - a refused profile;
+  - `DATA_FRAG` and IP-fragment reassembly;
+  - rejected fragments;
+  - the `robodr-rtps` synthetic fixtures;
+  - the `robodr-ros2-watch` binary, run through `std::process::Command`;
+  - `config/robodr.toml.example` against `Config`;
+  - live `AF_PACKET` capture on `lo`. This test ran as root here; without
+    `CAP_NET_RAW` it is skipped.
 
-  Under `cargo test -p robodr-sensor-ros2` these same tests run as part of
-  the crate once Pulsar's dependencies are available. The offline script
-  cannot run them in place, because it drops the whole crate.
-- `lib.rs` was type-checked, and clippy-checked with `-D warnings`, against
-  **hand-written signature stubs** of `pulsar-core` and tokio. The
-  `pulsar-core` stubs were copied from the files above; the tokio stubs were
-  written from tokio 1.x's public API. This catches signature, borrow and
-  `Send` mistakes in our code. It cannot catch differences between the stubs
-  and the real crates.
-- `robodr-pulsard/src/main.rs` was not compiled at all. It is a near-copy of
-  `vendor/pulsar/src/bin/pulsard.rs` and
-  `examples/pulsar-extension-module/main.rs`.
-- `rustfmt --edition 2021 --check` is clean on all touched `.rs` files.
+  The socket tests ran real `SO_REUSEADDR` binds and a multicast join on
+  this Linux host.
+- **`robodr-sensor-ros2/src/lib.rs`** was clippy-checked with `-D warnings`
+  against **hand-written signature stubs**:
+  - `pulsar-core` stubs, copied from the files in §2: `SimplePulsarModule`
+    with its `Send` future bounds, `ModuleContext::{send_threat,
+    raise_warning}`, `event::Value::try_from`, `Pid::from_raw` and
+    `Timestamp::now`;
+  - tokio 1.x stubs for `mpsc`, `Mutex::lock_owned`, `UdpSocket`, `spawn`
+    with its `Send + 'static` bound, and `time::sleep`;
+  - a `select!` stand-in that creates all three branch futures at once, so
+    their borrows overlap as in real tokio;
+  - `log` macro stubs.
+
+  This catches signature, borrow and `Send` mistakes in our code. It cannot
+  catch differences between the stubs and the real crates.
+- **`robodr-pulsard/src/main.rs`** changed only in comments. It was not
+  compiled.
 
 ## 7. Still unverified until a real build (Linux box with crates.io)
 
-1. A real `cargo build -p robodr-sensor-ros2 -p robodr-pulsard` and
-   `cargo test -p robodr-sensor-ros2`.
+1. A real `cargo build -p robodr-sensor-ros2 -p robodr-pulsard`. The
+   sensor crate has no tests of its own any more; its logic is tested in
+   `robodr-ros2-pipeline`.
 2. Cargo resolution of path deps into the **separate** `vendor/pulsar`
    workspace:
    - The `workspace = true` keys in Pulsar's crates should resolve against
@@ -217,11 +311,21 @@ Integrator wiring, in `robodr-pulsard`'s closure:
    - the process-tracker lookup for the daemon's pid.
 7. End-to-end: a threat from this module shows up in `threat-logger` and the
    rules engine, with `extra` intact.
+8. Capture inside the daemon:
+   - `AF_PACKET` opening under `robodr-pulsard`'s privileges;
+   - capture-thread shutdown on module stop and restart;
+   - behaviour under load (kernel drops are reported by
+     `AfPacketSource::kernel_stats`, but the sensor does not surface them
+     yet);
+   - real DDS traffic, including per-vendor `DATA_FRAG` usage, e.g. Fast DDS
+     type information. Until the lab has run it, the Low
+     `robot.rtps.fragmented_discovery` finding may fire for every
+     participant host.
 
 ## 8. Build prerequisites
 
 - Linux on x86_64, aarch64 or riscv64. These are the only arches Pulsar's
-  `bpf-builder` and our `socket.rs` support.
+  `bpf-builder` and our SPDP socket (`robodr_ros2_pipeline::socket`) support. Live capture also supports x86 and arm.
 - Rust **≥ 1.98.1**:
   - `vendor/pulsar/rust-toolchain.toml` pins 1.98.1, and the Pulsar crates
     are edition 2024.

@@ -1,59 +1,73 @@
 //! RoboDR ROS 2 / DDS graph sensor, packaged as a Pulsar module.
 //!
-//! **Pulsar-dependent crate**: this file needs `pulsar-core` and `tokio` and
-//! is excluded from the offline build. The logic lives in Pulsar-independent
-//! submodules that are unit-tested on their own:
+//! **Pulsar-dependent crate**: needs `pulsar-core` and `tokio` and is
+//! excluded from the offline build. It is deliberately thin: everything that
+//! does not need Pulsar or tokio lives in the pure crate
+//! [`robodr_ros2_pipeline`] (re-exported as [`pipeline`]), which is built and
+//! tested offline:
 //!
-//! - [`pipeline`]: datagram -> RTPS events -> profile deviations -> bounded
-//!   dedup -> sanitised findings (observe-mode tagging included), plus the
-//!   [`DatagramSource`] seam for `robodr-capture`;
-//! - [`config`]: the `[module.robodr-sensor-ros2]` section and its validation
-//!   (domain-id-derived SPDP port);
-//! - [`socket`]: the receive-only, `SO_REUSEADDR`, group-bound SPDP socket.
+//! - the [`Config`] (`[module.robodr-sensor-ros2]`, incl. the `capture`
+//!   sub-table) and its validation;
+//! - the [`Pipeline`] (RTPS parse with DATA_FRAG reassembly -> profile
+//!   deviations + protocol findings -> bounded dedup -> sanitised
+//!   [`Finding`]s, observe / enforce marking, profile validation);
+//! - the receive-only SPDP multicast socket;
+//! - the [`DatagramSource`] seam and the passive-capture adapter (live
+//!   `AF_PACKET` or pcap replay).
 //!
-//! This file is only the glue: implement `SimplePulsarModule`, open the
-//! sources, and turn every [`Finding`] into one `ModuleContext::send_threat`
-//! call. Every Pulsar item used here was checked against `vendor/pulsar` at
-//! commit 4796504 — see docs/PULSAR-INTEGRATION.md for the file-by-file list.
+//! This file only: implements `SimplePulsarModule`, binds the SPDP socket
+//! into tokio, runs the capture source on an OS thread, and turns every
+//! [`Finding`] into one `ModuleContext::send_threat` call. Every Pulsar item
+//! used here was checked against `vendor/pulsar` at commit 4796504 — see
+//! docs/PULSAR-INTEGRATION.md for the file-by-file list.
 //!
-//! It is **read-only on the network**: it opens one receive socket and never
-//! transmits. Enforcement (restricting motion, rejecting a participant) is the
-//! Motion Firewall's and the responder's job, never this sensor's.
+//! It is **read-only on the network**: it opens one receive socket and/or a
+//! passive capture socket and never transmits. Enforcement (restricting
+//! motion, requesting a safe state) is the Motion Firewall's and the
+//! responder's job, never this sensor's.
 //!
-//! ## Observe mode
+//! ## Observe mode and refused profiles
 //!
-//! While `profile.locked == false` every threat description starts with
-//! `[observe-only] ` and `extra` carries `mode = "observe"`,
-//! `observe_only = true`; a module warning is also raised (shown by
-//! `pulsar status`). Consumers must not drive a response from such threats.
+//! Every threat carries `extra.mode` (`"enforce"` / `"observe"`),
+//! `extra.observe_only` and `extra.profile_status` (`"enforcing"`,
+//! `"observing"`, `"refused"`). Observe-only threats' descriptions start
+//! with `[observe-only] `. A profile with `locked = false` is observe-only; a
+//! profile that fails `Profile::validate` is **refused for enforcement**: the
+//! errors are logged, raised as a module warning and sent once as a
+//! `robot.ros2.profile_refused` threat, and the sensor keeps running
+//! observe-only (fail closed: never act on a profile we cannot trust, never
+//! go blind). Consumers must not drive a response from observe-only threats.
 //!
-//! ## Known gap: SEDP is usually unicast
+//! ## Sources
 //!
-//! The SPDP **multicast** socket reliably shows *participants*; most DDS
-//! implementations send SEDP (writer/reader announcements) **unicast** to each
-//! participant's metatraffic port, which this socket does not see. Topic-level
-//! detection needs the capture-based listener (`robodr-capture`) feeding the
-//! same pipeline through [`Ros2Sensor::with_external_source`].
+//! - SPDP multicast socket (`listen_spdp`, default on): reliably shows
+//!   *participants*. Most DDS stacks send SEDP (writer/reader announcements)
+//!   **unicast**, which this socket does not see.
+//! - Passive capture (`capture.enabled`, default off; needs `CAP_NET_RAW`):
+//!   sees unicast SEDP and loopback, i.e. *who writes `rt/cmd_vel`*. Opened
+//!   in `init_state`; failing to open it fails the module start (an operator
+//!   who asked for capture must not silently get a blind spot).
+//! - Any other [`DatagramSource`], via [`Ros2Sensor::with_external_source`].
+//!
+//! All sources feed one [`Pipeline`], so dedup and fragment reassembly span
+//! them.
 
-pub mod config;
-pub mod pipeline;
-pub mod socket;
-
-use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use pulsar_core::event::Value;
 use pulsar_core::pdk::{ModuleContext, ModuleError, SimplePulsarModule};
 use pulsar_core::{Pid, Timestamp};
-use robodr_events::profile::Profile;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::task::JoinHandle;
 
-pub use config::Config;
-pub use pipeline::{Datagram, DatagramSource, Finding, Pipeline, ProfileMode};
+pub use robodr_ros2_pipeline as pipeline;
+pub use robodr_ros2_pipeline::{Config, Datagram, DatagramSource, Finding, Pipeline};
+
+use robodr_ros2_pipeline::{load_profile, sanitize, socket, ProfileStatus};
 
 /// Module name, i.e. the `[module.<name>]` section in `pulsar.toml`.
 pub const MODULE_NAME: &str = "robodr-sensor-ros2";
@@ -77,13 +91,13 @@ pub struct Ros2Sensor {
 }
 
 impl Ros2Sensor {
-    /// SPDP multicast socket only.
+    /// Sources come from the config (SPDP socket and/or capture).
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Also consume datagrams from another source (e.g. `robodr-capture`), in
-    /// addition to the SPDP socket unless `listen_spdp = false`.
+    /// Also consume datagrams from another source, in addition to the
+    /// configured ones.
     pub fn with_external_source(rx: mpsc::Receiver<Datagram>) -> Self {
         Self {
             external: Some(Arc::new(Mutex::new(rx))),
@@ -92,12 +106,11 @@ impl Ros2Sensor {
 }
 
 /// Run a blocking [`DatagramSource`] on a dedicated OS thread and return the
-/// channel to pass to [`Ros2Sensor::with_external_source`]. The thread ends
-/// when the source finishes or fails, or when the receiver is dropped.
-///
-/// Backpressure: the channel is bounded (`capacity`, min 1); when the sensor
-/// falls behind, the source thread blocks. A capture source that must never
-/// block should buffer or drop internally.
+/// receiving end of a bounded channel (`capacity`, min 1). The thread ends
+/// when the source finishes or fails, or when the receiver is dropped (on
+/// the next datagram). Backpressure: when the sensor falls behind, the
+/// source thread blocks (for live capture, the kernel socket buffer then
+/// absorbs or drops; drops are visible in `AfPacketSource::kernel_stats`).
 pub fn spawn_blocking_source<S>(
     source: S,
     capacity: usize,
@@ -118,11 +131,15 @@ where
                         }
                     }
                     Ok(None) => {
-                        log::info!(target: MODULE_NAME, "external datagram source finished");
+                        log::info!(target: MODULE_NAME, "datagram source finished");
                         break;
                     }
                     Err(e) => {
-                        log::error!(target: MODULE_NAME, "external datagram source failed: {e}");
+                        log::error!(
+                            target: MODULE_NAME,
+                            "datagram source failed: {}",
+                            sanitize(&e.to_string())
+                        );
                         break;
                     }
                 }
@@ -133,6 +150,8 @@ where
 
 pub struct State {
     listener: JoinHandle<()>,
+    /// Set on stop so the capture thread exits within one read timeout.
+    capture_stop: Option<Arc<AtomicBool>>,
 }
 
 impl SimplePulsarModule for Ros2Sensor {
@@ -149,23 +168,24 @@ impl SimplePulsarModule for Ros2Sensor {
     ) -> Result<Self::State, ModuleError> {
         let (settings, warnings) = config.validate()?;
         for w in &warnings {
-            log::warn!(target: MODULE_NAME, "{w}");
+            log::warn!(target: MODULE_NAME, "{}", sanitize(w));
         }
-        if settings.spdp.is_none() && self.external.is_none() {
+        if !settings.has_builtin_source() && self.external.is_none() {
             return Err(
-                "listen_spdp = false but no external datagram source is attached; \
-                        the sensor would see nothing"
+                "listen_spdp = false, capture.enabled = false and no external \
+                        datagram source is attached; the sensor would see nothing"
                     .into(),
             );
         }
 
         let profile = load_profile(&settings.profile_path)?;
-        let pipeline = Pipeline::new(profile, settings.dedup_capacity);
-        if pipeline.mode().is_observe() {
-            let msg = format!(
-                "profile '{}' is NOT locked: observe mode, deviations are tagged observe-only",
-                pipeline::sanitize(&pipeline.profile().model)
-            );
+        let pipeline = Pipeline::new(profile, settings.pipeline);
+        if let ProfileStatus::Refused(errors) = pipeline.status() {
+            for e in errors {
+                log::error!(target: MODULE_NAME, "profile error: {}", sanitize(&e.to_string()));
+            }
+        }
+        if let Some(msg) = pipeline.status_message() {
             log::warn!(target: MODULE_NAME, "{msg}");
             ctx.raise_warning(msg).await;
         }
@@ -193,31 +213,55 @@ impl SimplePulsarModule for Ros2Sensor {
             }
             None => None,
         };
+
+        // Opened last: nothing fallible (and no await) follows, so a failed
+        // or cancelled init cannot leak the capture thread.
+        let (capture, capture_stop) = match &settings.capture {
+            Some(c) => {
+                let stop = Arc::new(AtomicBool::new(false));
+                let source = c.open(stop.clone()).map_err(|e| {
+                    format!(
+                        "opening capture {:?}: {} (live capture needs CAP_NET_RAW)",
+                        c.input,
+                        sanitize(&e.to_string())
+                    )
+                })?;
+                let rx = spawn_blocking_source(source, c.queue_capacity)
+                    .map_err(|e| format!("starting capture thread: {e}"))?;
+                log::info!(
+                    target: MODULE_NAME,
+                    "passive capture on {:?} (domains {:?})",
+                    c.input,
+                    c.domain_ids
+                );
+                (Some(rx), Some(stop))
+            }
+            None => (None, None),
+        };
         if self.external.is_some() {
             log::info!(target: MODULE_NAME, "consuming an external datagram source");
         }
 
         let listener = tokio::spawn(listen_loop(
             socket,
+            capture,
             self.external.clone(),
             pipeline,
             ctx.clone(),
         ));
-        Ok(State { listener })
+        Ok(State {
+            listener,
+            capture_stop,
+        })
     }
 
     async fn graceful_stop(state: Self::State) -> Result<(), ModuleError> {
+        if let Some(stop) = &state.capture_stop {
+            stop.store(true, Ordering::Relaxed);
+        }
         state.listener.abort();
         Ok(())
     }
-}
-
-fn load_profile(path: &Path) -> Result<Profile, ModuleError> {
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| format!("reading profile {}: {e}", path.display()))?;
-    let profile: Profile = serde_json::from_str(&raw)
-        .map_err(|e| format!("parsing profile {}: {e}", path.display()))?;
-    Ok(profile)
 }
 
 /// Await the next SPDP datagram, or forever when there is no socket.
@@ -231,22 +275,26 @@ async fn recv_spdp(
     }
 }
 
-/// Await the next external datagram, or forever when there is no source.
-/// `None` means the source closed.
-async fn recv_external(rx: Option<&mut mpsc::Receiver<Datagram>>) -> Option<Datagram> {
+/// Await the next datagram of a channel, or forever when there is none.
+/// `None` means the channel closed (its source ended).
+async fn recv_channel(rx: Option<&mut mpsc::Receiver<Datagram>>) -> Option<Datagram> {
     match rx {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
     }
 }
 
-/// Receive loop over both sources; one threat per *new* deviation.
+/// Receive loop over all sources; one threat per *new* finding.
 async fn listen_loop(
     socket: Option<UdpSocket>,
+    mut capture: Option<mpsc::Receiver<Datagram>>,
     external: Option<SharedReceiver>,
     mut pipeline: Pipeline,
     ctx: ModuleContext,
 ) {
+    for finding in pipeline.status_findings() {
+        send(&ctx, &finding);
+    }
     // Held for the lifetime of this task; released when it is aborted.
     let mut external: Option<OwnedMutexGuard<mpsc::Receiver<Datagram>>> = match external {
         Some(shared) => Some(shared.lock_owned().await),
@@ -254,17 +302,18 @@ async fn listen_loop(
     };
     let mut buf = vec![0u8; RECV_BUF_LEN];
     loop {
-        if socket.is_none() && external.is_none() {
+        if socket.is_none() && capture.is_none() && external.is_none() {
             let msg = "no datagram source left; the ROS 2 sensor is blind".to_string();
             log::error!(target: MODULE_NAME, "{msg}");
             ctx.raise_warning(msg).await;
             return;
         }
         // Collect the outcome first and handle it after `select!` has
-        // returned, so no branch future still borrows `buf` or `external`.
+        // returned, so no branch future still borrows `buf` or a receiver.
         let next = tokio::select! {
             r = recv_spdp(socket.as_ref(), &mut buf) => Next::Spdp(r),
-            d = recv_external(external.as_deref_mut()) => Next::External(d),
+            d = recv_channel(capture.as_mut()) => Next::Capture(d),
+            d = recv_channel(external.as_deref_mut()) => Next::External(d),
         };
         match next {
             Next::Spdp(Ok((len, peer))) => {
@@ -274,7 +323,15 @@ async fn listen_loop(
                 log::warn!(target: MODULE_NAME, "SPDP receive error: {e}");
                 tokio::time::sleep(RECV_ERROR_BACKOFF).await;
             }
-            Next::External(Some(d)) => report(&mut pipeline, &ctx, &d.payload, &d.src_ip),
+            Next::Capture(Some(d)) | Next::External(Some(d)) => {
+                report(&mut pipeline, &ctx, &d.payload, &d.src_ip);
+            }
+            Next::Capture(None) => {
+                let msg = "capture source ended; unicast SEDP is no longer watched".to_string();
+                log::warn!(target: MODULE_NAME, "{msg}");
+                ctx.raise_warning(msg).await;
+                capture = None;
+            }
             Next::External(None) => {
                 log::warn!(target: MODULE_NAME, "external datagram source closed");
                 external = None;
@@ -286,32 +343,39 @@ async fn listen_loop(
 /// One step of the receive loop.
 enum Next {
     Spdp(std::io::Result<(usize, std::net::SocketAddr)>),
+    Capture(Option<Datagram>),
     External(Option<Datagram>),
 }
 
 /// Run one datagram through the pipeline and raise a threat per finding.
 fn report(pipeline: &mut Pipeline, ctx: &ModuleContext, payload: &[u8], src_ip: &str) {
     for finding in pipeline.process(payload, src_ip) {
-        let description = finding.description();
-        // `Value::try_from` is pulsar-core's inherent fn (serialises through
-        // TOML), not `TryFrom`. A failure only drops the structured part.
-        let extra = match Value::try_from(finding.extra()) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                log::warn!(target: MODULE_NAME, "threat extra not serialisable: {e}");
-                None
-            }
-        };
-        // A network peer has no local pid: attribute the threat to the daemon
-        // itself (the process tracker knows it once process-monitor has
-        // scanned /proc; otherwise Pulsar logs a lookup error and still sends
-        // the threat with an empty image).
-        let pid = Pid::from_raw(std::process::id() as i32);
-        ctx.send_threat(pid, Timestamp::now(), description.clone(), extra);
-        if finding.mode.is_observe() {
-            log::info!(target: MODULE_NAME, "[{}] {description}", finding.deviation.rule);
-        } else {
-            log::warn!(target: MODULE_NAME, "[{}] {description}", finding.deviation.rule);
+        send(ctx, &finding);
+    }
+}
+
+/// One finding -> one Pulsar threat.
+fn send(ctx: &ModuleContext, finding: &Finding) {
+    let description = finding.description();
+    // `Value::try_from` is pulsar-core's inherent fn (serialises through
+    // TOML), not `TryFrom`. A failure only drops the structured part.
+    let extra = match Value::try_from(finding.extra()) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            log::warn!(target: MODULE_NAME, "threat extra not serialisable: {e}");
+            None
         }
+    };
+    // A network peer has no local pid: attribute the threat to the daemon
+    // itself (the process tracker knows it once process-monitor has scanned
+    // /proc; otherwise Pulsar logs a lookup error and still sends the threat
+    // with an empty image).
+    let pid = Pid::from_raw(std::process::id() as i32);
+    ctx.send_threat(pid, Timestamp::now(), description.clone(), extra);
+    let rule = sanitize(finding.deviation.rule_str());
+    if finding.is_observe_only() {
+        log::info!(target: MODULE_NAME, "[{rule}] {description}");
+    } else {
+        log::warn!(target: MODULE_NAME, "[{rule}] {description}");
     }
 }
