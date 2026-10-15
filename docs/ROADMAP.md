@@ -144,11 +144,11 @@ everything running with no outbound connectivity.
 - Bridge threats to AutoSecOps over the existing Kafka/adapter path (robot
   source-trust map + `robotics` category, per the main design doc).
 
-**Exit criteria.** On a real AMR: a foreign `cmd_vel` publisher is flagged
-Critical; a rogue participant is flagged High; a reverse shell on the controller
-is flagged; false positives on a 72-hour clean run are under an agreed bound.
-Complete the RTPS DATA(w)/DATA(r) parser so writer/reader topic events are real,
-not just participants (`rtps::walk_submessages` TODO).
+**Exit criteria.** On a real UGV companion computer: a foreign `cmd_vel`
+publisher is flagged Critical *from live traffic* (SEDP parser done; needs the
+capture listener); a rogue participant is flagged High; a reverse shell on the
+controller is flagged; false positives on a 72-hour clean run are under an
+agreed bound.
 
 **Customer-visible:** a design-partner OEM sees their robot's live security
 posture in the console; a red-team spoofed command is caught.
@@ -246,10 +246,10 @@ placed in ROS node and topic names, mirroring AutoSecOps' eval discipline).
 
 ## 5. Immediate next actions
 
-1. Finish `rtps::walk_submessages`: DATA(w)/DATA(r) inline-QoS parse for
-   `PID_TOPIC_NAME` / `PID_TYPE_NAME` / endpoint GUID, with fuzz tests on
-   captured SPDP/SEDP traffic. Promotes writer/reader detection from scaffold to
-   real.
+1. ~~Finish the SEDP parse in `rtps`~~ — **done** (topic/type/endpoint GUID,
+   tested, fuzzed). Next: a capture-based listener (AF_PACKET / eBPF socket
+   filter) so the sensor actually receives SEDP, which most DDS vendors send
+   unicast rather than on the SPDP multicast group.
 2. Build the observe-mode commissioning tool that emits `profile.json`.
 3. Stand up the lab: one ROS 2 AMR (or Gazebo + a real controller) and one
    closed-controller brand, so detection is measured against real traffic.

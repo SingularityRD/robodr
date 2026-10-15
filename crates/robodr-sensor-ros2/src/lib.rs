@@ -10,6 +10,18 @@
 //! It is **read-only on the network**: it opens one receive socket and never
 //! transmits. Enforcement (restricting motion, rejecting a participant) is the
 //! Motion Firewall's and the responder's job, never this sensor's.
+//!
+//! ## Known gap: SEDP is usually unicast
+//!
+//! The parser (`rtps`) handles both SPDP participant and SEDP writer/reader
+//! announcements. This listener, however, binds the SPDP **multicast** group,
+//! and most DDS implementations send SEDP **unicast** to each participant's
+//! metatraffic port. So today this module reliably reports *participants*;
+//! writer/reader (topic-level) detection needs a capture-based listener that
+//! sees unicast metatraffic on the robot's interfaces and loopback (AF_PACKET or
+//! an eBPF socket filter feeding the same `rtps::parse_datagram`). That is the
+//! next sensor task (docs/SPRINTS.md, Sprint 2). Whether a given DDS vendor
+//! moves local discovery onto shared memory is a lab-validation item, per vendor.
 
 mod rtps;
 
@@ -115,9 +127,16 @@ async fn bind_spdp(config: &Config) -> Result<UdpSocket, ModuleError> {
     Ok(socket)
 }
 
+/// Upper bound on remembered deviations. Discovery beacons repeat every few
+/// seconds, so without dedup one rogue participant would raise a threat per
+/// beacon; without a bound, an attacker spraying random GUIDs onto the bus
+/// could grow the set until the sensor runs out of memory. When the bound is
+/// hit the set is cleared: worst case, a still-present deviation is reported
+/// again, which is the safe direction to fail.
+const MAX_SEEN: usize = 4096;
+
 /// Receive loop: parse each datagram, evaluate against the profile, raise a
-/// threat per *new* deviation. A deduplication set keeps a steadily-announcing
-/// participant from raising the same threat on every discovery beacon.
+/// threat per *new* deviation.
 async fn listen_loop(socket: UdpSocket, profile: Profile, ctx: ModuleContext) {
     let mut buf = vec![0u8; 65_535];
     let mut seen: HashSet<String> = HashSet::new();
@@ -134,10 +153,15 @@ async fn listen_loop(socket: UdpSocket, profile: Profile, ctx: ModuleContext) {
             let Some(dev) = profile.evaluate(&event) else {
                 continue;
             };
-            // Dedup on (rule + the event's identity) so each distinct deviation
-            // is reported once per sensor lifetime, not per beacon.
-            let key = format!("{}|{}", dev.rule, src_ip);
-            if !seen.insert(key) {
+            // Dedup on the deviation itself (rule + detail, which names the
+            // GUID, topic and source), so each distinct deviation is reported
+            // once, not once per beacon — and two different rogue topics from
+            // the same host are still two reports.
+            if seen.len() >= MAX_SEEN {
+                log::warn!("robodr: dedup set reached {MAX_SEEN}, clearing");
+                seen.clear();
+            }
+            if !seen.insert(format!("{}|{}", dev.rule, dev.detail)) {
                 continue;
             }
             let extra = Value::try_from(&dev).ok();

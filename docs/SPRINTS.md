@@ -80,15 +80,27 @@ Added defence tasks this sprint (on top of the general Sprint 1 work below):
   through `rtps::parse_datagram` in a test.
 - **Exit:** real `pcap` fixtures exist; CI runs all current tests.
 
-### Sprint 2 — See the whole graph (finish the RTPS parser)
+### Sprint 2 — See the whole graph (capture SEDP, validate on real traffic)
 
-Objective: writer/reader detection becomes real, not scaffold.
+Objective: writer/reader detection becomes real on live traffic, not just in
+unit tests.
 
-- **E1 + E2 (pair):** Implement `rtps::walk_submessages` — DATA(w)/DATA(r) inline
-  QoS parse for `PID_TOPIC_NAME` (0x0005), `PID_TYPE_NAME` (0x0007),
-  `PID_ENDPOINT_GUID` (0x005a); emit `Ros2WriterDiscovered` / `Ros2ReaderDiscovered`.
-- **E1:** Fuzz the parser (`cargo-fuzz`) against the captured `pcap`s and random
-  input; the bounds-safe walk must never panic or over-read.
+- **Done ahead of plan:** SEDP DATA parsing in `rtps` — builtin publications/
+  subscriptions writers, `PID_TOPIC_NAME` / `PID_TYPE_NAME` / `PID_ENDPOINT_GUID`,
+  LE and BE encapsulation, inline-QoS skip; emits `Ros2WriterDiscovered` /
+  `Ros2ReaderDiscovered`. 12 parser tests incl. an end-to-end "foreign `cmd_vel`
+  writer on the wire → Critical"; a 500k-iteration mutation fuzz with overflow
+  checks on found no panics.
+- **E1 + E2 (pair):** Capture-based listener. SEDP is usually *unicast* to each
+  participant's metatraffic port, so the current SPDP multicast socket mostly
+  never sees it. Add an AF_PACKET (or eBPF socket-filter) listener on the
+  robot's interfaces + loopback for the RTPS metatraffic port range, feeding the
+  same `rtps::parse_datagram`. Read-only, no injection.
+- **E2:** Per-vendor validation (Fast DDS, Cyclone DDS, Connext): does local
+  discovery stay on UDP or move to shared memory? Record the answer per vendor;
+  if shared memory, plan the SHM-observation path.
+- **E1:** Port the mutation fuzz into `cargo-fuzz` seeded with the captured
+  `pcap`s, and run it in CI.
 - **E2:** Extend the ROS 2 topic de-mangling (`rt`/`rq`/`rr`) and add fixtures
   for services and actions, not just topics.
 - **E3:** Define the OCSF mapping for robot findings (the schema table from the
