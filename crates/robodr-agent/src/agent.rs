@@ -810,7 +810,10 @@ mod tests {
         let mut pol = ResponsePolicy::conservative_default(PlatformFamily::Ugv);
         pol.oem_validated = true;
         let dev = Deviation::new("robot.x", Severity::High, "d").with_mode(Mode::Observe);
-        let p = plan_stateless(&pol, &dev, "s", SafetyState::MovingSlow, &ctx(true));
+        // The responder itself now refuses to act on an observe-mode
+        // deviation, so build the acting plan from its enforce-mode twin.
+        let acting = dev.clone().with_mode(Mode::Enforce);
+        let p = plan_stateless(&pol, &acting, "s", SafetyState::MovingSlow, &ctx(true));
         assert!(p.max_step > Step::Record);
         let (q, v) = guard(p, &dev, SafetyState::MovingSlow, &ctx(true));
         assert!(v.unwrap().contains("observe-only"));

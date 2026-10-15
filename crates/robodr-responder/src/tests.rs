@@ -1,10 +1,10 @@
 //! Crate tests: matrix, invariants (exhaustive + randomized), escalation and
 //! hysteresis timelines, policy validation, platform differences.
 
-use robodr_events::{Deviation, Severity};
+use robodr_events::{Deviation, Mode, Severity};
 
 use crate::autosecops::{action_class, Approval, ALL_CLASSES, ROBOTICS_CATEGORY};
-use crate::escalation::{MAX_SOURCES, MAX_SOURCE_KEY_LEN, OVERFLOW_SOURCE};
+use crate::escalation::{MAX_REISSUE_KEYS, MAX_SOURCES, MAX_SOURCE_KEY_LEN, OVERFLOW_SOURCE};
 use crate::policy::{MAX_RULE_OVERRIDES, SCHEMA};
 use crate::*;
 
@@ -263,6 +263,11 @@ fn invariants_exhaustive_over_enum_combinations() {
                     for sev in SEVS {
                         let plan = plan_stateless(&p, &dev(sev), "s", state, c);
                         assert_invariants(&plan, &p, state, c);
+                        let od = dev(sev).with_mode(Mode::Observe);
+                        let o = plan_stateless(&p, &od, "s", state, c);
+                        assert_invariants(&o, &p, state, c);
+                        assert_eq!(check_invariants_for_deviation(&o, &od, state, c), Ok(()));
+                        assert!(o.observe_only && o.max_step == Step::Record);
                         n += 1;
                     }
                 }
@@ -338,10 +343,17 @@ fn invariants_randomized_with_escalation_state() {
                 c.platform = policy.platform; // bias towards matching platform
             }
             let rule = if r.bool() { RULE_A } else { RULE_B };
-            let d = Deviation::new(rule, r.pick(&SEVS), "x");
+            let mut d = Deviation::new(rule, r.pick(&SEVS), "x");
+            if r.below(5) == 0 {
+                d = d.with_mode(Mode::Observe);
+            }
             let src = ["a", "b", "c"][r.below(3)];
             let plan = resp.plan(&d, src, state, &c, now);
             assert_invariants(&plan, &policy, state, &c);
+            assert_eq!(check_invariants_for_deviation(&plan, &d, state, &c), Ok(()));
+            if d.is_observe_only() {
+                assert!(plan.observe_only && plan.max_step == Step::Record);
+            }
             if r.below(50) == 0 {
                 resp.acknowledge(if r.bool() { Some(src) } else { None }, now);
             }
@@ -832,25 +844,262 @@ fn escalation_respects_rule_cap_and_ceiling() {
 
 #[test]
 fn hold_and_rate_limit_prevent_oscillation() {
+    // Changed for review finding 2: this test used to open with a Critical
+    // (RequestSafeState, awaiting approval) and expected it to suppress later
+    // plans, including another source's. Counting approval-pending plans as
+    // "issued" and limiting robot-wide was the bug. Now only auto-executable
+    // plans are remembered, per (source, rule); other sources are only subject
+    // to the motion guard, which keeps their Record/Restrict actions.
     let mut r = Responder::new(esc_policy()).unwrap();
     let c = ctx(PlatformFamily::Ugv);
     let s = SafetyState::MovingFast;
-    let crit = r.plan(&dev(Severity::Critical), "g", s, &c, 0);
-    assert_eq!(crit.max_step, Step::RequestSafeState);
-    // Lower-severity repeat within the interval: suppressed to Record.
+    let high = r.plan(&dev(Severity::High), "g", s, &c, 0);
+    assert_eq!(high.max_step, Step::LimitMotion);
+    assert!(!high.requires_human_approval && !high.suppressed);
+    // Lower-severity repeat (same source, same rule) within the interval:
+    // suppressed to Record.
     let low = r.plan(&dev(Severity::Low), "g", s, &c, 500);
     assert!(low.suppressed);
     assert_eq!(low.actions, vec![ResponseAction::Record]);
     assert!(low
         .rationale
         .contains(|x| matches!(x, Reason::RateLimited { since_ms: 500 })));
-    // After the interval: held at RequestSafeState, never de-escalated.
+    // After the interval: held at LimitMotion, never de-escalated.
     let low = r.plan(&dev(Severity::Low), "g", s, &c, 5_000);
-    assert_eq!(low.max_step, Step::RequestSafeState);
+    assert_eq!(low.max_step, Step::LimitMotion);
+    assert!(!low.suppressed);
     assert!(low.rationale.contains(|x| matches!(x, Reason::Held { .. })));
-    // Another source's lower plan right after is suppressed robot-wide.
+    // Another source, higher severity than the in-force motion request (Low,
+    // held): passes in full, never downgraded.
     let other = r.plan(&dev(Severity::High), "h", s, &c, 5_100);
-    assert!(other.suppressed);
+    assert!(!other.suppressed);
+    assert_eq!(other.max_step, Step::LimitMotion);
+    // A third source, same severity and step as the in-force request: its
+    // redundant LimitMotion is dropped, its own Restrict is kept, and it is
+    // not "suppressed".
+    let third = r.plan(&dev(Severity::High), "k", s, &c, 5_200);
+    assert!(!third.suppressed);
+    assert_eq!(third.max_step, Step::Restrict);
+    assert!(third
+        .actions
+        .iter()
+        .any(|a| matches!(a, ResponseAction::Restrict { .. })));
+    assert!(third.rationale.contains(|x| matches!(
+        x,
+        Reason::MotionAlreadyRequested {
+            step: Step::LimitMotion,
+            since_ms: 100
+        }
+    )));
+    // Same source, different rule: not rate limited by the other rule.
+    let rule_b = r.plan(
+        &Deviation::new(RULE_B, Severity::High, ""),
+        "h",
+        s,
+        &c,
+        5_300,
+    );
+    assert!(!rule_b.suppressed);
+    assert_eq!(rule_b.max_step, Step::Restrict);
+    // A plan awaiting approval is never suppressed, and does not count.
+    let crit = r.plan(&dev(Severity::Critical), "k", s, &c, 5_400);
+    assert!(crit.requires_human_approval && !crit.suppressed);
+    assert_eq!(crit.max_step, Step::RequestSafeState);
+    let crit2 = r.plan(&dev(Severity::Critical), "k", s, &c, 5_500);
+    assert!(!crit2.suppressed);
+    assert_eq!(crit2.max_step, Step::RequestSafeState);
+}
+
+#[test]
+fn approval_pending_plans_do_not_mute_other_sources() {
+    // Regression for review finding 2 (see also tests/review_poc.rs).
+    let mut r = Responder::new(esc_policy()).unwrap();
+    let c = ctx(PlatformFamily::Ugv);
+    let s = SafetyState::MovingFast;
+    // 30 rounds x 2 fresh sources stays under MAX_SOURCES, so no source
+    // shares the overflow bucket's escalation state.
+    for k in 0..30u64 {
+        let t = k * 200;
+        let decoy = r.plan(&dev(Severity::Critical), &format!("decoy-{k}"), s, &c, t);
+        assert!(decoy.requires_human_approval);
+        // A fresh real source each time: always gets the full auto plan.
+        let real = r.plan(
+            &Deviation::new(RULE_B, Severity::High, ""),
+            &format!("real-{k}"),
+            s,
+            &c,
+            t + 1,
+        );
+        assert!(!real.suppressed, "k={k}");
+        assert!(!real.requires_human_approval);
+        if k == 0 {
+            assert_eq!(real.max_step, Step::LimitMotion);
+        } else {
+            // Motion already requested by real-0 within the interval or by a
+            // later re-issue; the source-specific Restrict is never dropped.
+            assert!(real.max_step >= Step::Restrict, "k={k}");
+        }
+    }
+}
+
+#[test]
+fn motion_guard_never_downgrades_higher_severity_or_step() {
+    let mut p = esc_policy();
+    p.auto_max_step = Step::RequestSafeState;
+    let mut r = Responder::new(p).unwrap();
+    let c = ctx(PlatformFamily::Ugv);
+    let s = SafetyState::MovingFast;
+    // Decoys keep a High LimitMotion request in force.
+    let d = r.plan(&dev(Severity::High), "decoy", s, &c, 0);
+    assert_eq!(d.max_step, Step::LimitMotion);
+    // Higher step and severity from another source: passes untouched.
+    let crit = r.plan(&dev(Severity::Critical), "real", s, &c, 10);
+    assert_eq!(crit.max_step, Step::RequestSafeState);
+    assert!(!crit.suppressed && !crit.requires_human_approval);
+    // Now the reference is (RequestSafeState, Critical). A High decoy from a
+    // fresh source cannot change it, and the next real Critical from yet
+    // another source keeps only its Restrict (all motion already requested).
+    r.plan(&dev(Severity::High), "decoy2", s, &c, 20);
+    let crit2 = r.plan(&dev(Severity::Critical), "real2", s, &c, 30);
+    assert_eq!(crit2.max_step, Step::Restrict);
+    assert!(!crit2.suppressed);
+    // After the interval the full plan is issued again.
+    let crit3 = r.plan(&dev(Severity::Critical), "real3", s, &c, 2_000);
+    assert_eq!(crit3.max_step, Step::RequestSafeState);
+}
+
+#[test]
+fn rate_limit_memory_is_bounded_and_eviction_is_fail_active() {
+    let mut p = esc_policy();
+    p.escalation.min_reissue_interval_ms = 60_000;
+    // No escalation: sources beyond MAX_SOURCES share the overflow bucket,
+    // which would otherwise escalate; this test is about the rate limiter.
+    p.escalation.max_escalation_steps = 0;
+    let mut r = Responder::new(p).unwrap();
+    let c = ctx(PlatformFamily::Ugv);
+    let s = SafetyState::Idle; // High -> Restrict, auto.
+    for i in 0..(MAX_REISSUE_KEYS as u64 * 4) {
+        let plan = r.plan(&dev(Severity::High), &format!("s{i}"), s, &c, i);
+        assert_eq!(plan.max_step, Step::Restrict);
+        assert!(!plan.suppressed);
+        assert!(r.rate_limit_entries() <= MAX_REISSUE_KEYS);
+    }
+    // "s0" was evicted long ago: its repeat is re-issued, not suppressed.
+    let again = r.plan(&dev(Severity::High), "s0", s, &c, 5_000);
+    assert!(!again.suppressed);
+    // A recent key is still remembered.
+    let recent = r.plan(
+        &dev(Severity::High),
+        &format!("s{}", MAX_REISSUE_KEYS as u64 * 4 - 1),
+        s,
+        &c,
+        5_001,
+    );
+    assert!(recent.suppressed);
+    // Acknowledging a source clears its rate-limit memory.
+    assert!(r.acknowledge(
+        Some(&format!("s{}", MAX_REISSUE_KEYS as u64 * 4 - 1)),
+        5_002
+    ));
+    let after_ack = r.plan(
+        &dev(Severity::High),
+        &format!("s{}", MAX_REISSUE_KEYS as u64 * 4 - 1),
+        s,
+        &c,
+        5_003,
+    );
+    assert!(!after_ack.suppressed);
+}
+
+#[test]
+fn observe_mode_deviation_is_record_only_and_stateless() {
+    // Regression for review finding 1 (see also tests/review_poc.rs).
+    let p = enforced(PlatformFamily::Ugv);
+    let c = ctx(PlatformFamily::Ugv);
+    for state in SafetyState::ALL {
+        for sev in SEVS {
+            let d = dev(sev).with_mode(Mode::Observe);
+            let plan = plan_stateless(&p, &d, "s", state, &c);
+            assert!(plan.observe_only, "{state:?} {sev:?}");
+            assert_eq!(plan.actions, vec![ResponseAction::Record]);
+            assert!(!plan.requires_human_approval);
+            assert!(plan.would_have.is_some());
+            assert!(plan
+                .rationale
+                .contains(|r| *r == Reason::ObserveModeDeviation));
+            assert_eq!(check_invariants_for_deviation(&plan, &d, state, &c), Ok(()));
+        }
+    }
+    // Stateful: observe deviations touch no state, but would_have reflects the
+    // source's current hold.
+    let mut r = Responder::new(esc_policy()).unwrap();
+    let s = SafetyState::MovingFast;
+    for i in 0..10 {
+        let o = r.plan(
+            &dev(Severity::Critical).with_mode(Mode::Observe),
+            &format!("o{i}"),
+            s,
+            &c,
+            i,
+        );
+        assert!(o.observe_only && o.max_step == Step::Record);
+    }
+    assert_eq!(r.tracked_sources(), 0);
+    assert_eq!(r.rate_limit_entries(), 0);
+    r.plan(&dev(Severity::High), "g", s, &c, 100);
+    for i in 0..10 {
+        r.plan(
+            &dev(Severity::Low).with_mode(Mode::Observe),
+            "g",
+            s,
+            &c,
+            101 + i,
+        );
+    }
+    assert_eq!(r.escalation_level("g"), 0);
+    let o = r.plan(
+        &dev(Severity::Low).with_mode(Mode::Observe),
+        "g",
+        s,
+        &c,
+        200,
+    );
+    assert_eq!(o.would_have.as_ref().unwrap().max_step, Step::LimitMotion);
+}
+
+#[test]
+fn check_invariants_for_deviation_rejects_acting_on_observe_deviation() {
+    let p = enforced(PlatformFamily::Ugv);
+    let c = ctx(PlatformFamily::Ugv);
+    let enforce_dev = dev(Severity::High);
+    let observe_dev = dev(Severity::High).with_mode(Mode::Observe);
+    let acting = plan_stateless(&p, &enforce_dev, "s", SafetyState::MovingFast, &c);
+    assert!(acting.max_step > Step::Record);
+    assert_eq!(
+        check_invariants(&acting, SafetyState::MovingFast, &c),
+        Ok(())
+    );
+    assert_eq!(
+        check_invariants_for_deviation(&acting, &observe_dev, SafetyState::MovingFast, &c),
+        Err(Violation::ObserveOnlyDeviationActed)
+    );
+    // Record-only but not flagged observe_only: also rejected.
+    let mut rec = acting.clone();
+    rec.actions = vec![ResponseAction::Record];
+    rec.max_step = Step::Record;
+    assert_eq!(
+        check_invariants_for_deviation(&rec, &observe_dev, SafetyState::MovingFast, &c),
+        Err(Violation::ObserveOnlyDeviationActed)
+    );
+    rec.observe_only = true;
+    assert_eq!(
+        check_invariants_for_deviation(&rec, &observe_dev, SafetyState::MovingFast, &c),
+        Ok(())
+    );
+    // The backstop replaces such a plan with Record + approval, observe_only.
+    let fixed = crate::planner::enforce(acting, &observe_dev, SafetyState::MovingFast, &c);
+    assert_eq!(fixed.actions, vec![ResponseAction::Record]);
+    assert!(fixed.observe_only && fixed.requires_human_approval);
 }
 
 #[test]
@@ -924,12 +1173,24 @@ fn hold_survives_estop_release_until_ack() {
 
 #[test]
 fn deviation_storm_is_bounded_and_monotone() {
-    let mut r = Responder::new(esc_policy()).unwrap();
+    // Changed for review finding 2: this used to assert that at most ~24 plans
+    // above Record were issued robot-wide for 20k deviations from 10k
+    // sources, i.e. that the robot-wide limiter muted almost every source
+    // (the bug). Now every source keeps its own response; what stays bounded
+    // is (a) memory, (b) the robot-wide re-issue of motion-affecting AUTO
+    // steps, which is monotone in (step, severity) within each interval, and
+    // (c) `suppressed` only ever hits a repeat of the same (source, rule).
+    let p = esc_policy();
+    let interval = p.escalation.min_reissue_interval_ms;
+    let mut r = Responder::new(p).unwrap();
     let c = ctx(PlatformFamily::Ugv);
     let mut rng = Rng(42);
     let mut last_issued = Step::Record;
-    let mut issued = 0;
-    for i in 0..20_000u64 {
+    let mut motion_issues = 0;
+    let mut window: Option<(u64, Step, Severity)> = None;
+    let mut auto_seen: std::collections::HashMap<String, (u64, Step)> = Default::default();
+    let n = 20_000u64;
+    for i in 0..n {
         let src = format!("guid-{}", rng.below(10_000));
         let sev = rng.pick(&SEVS);
         let plan = r.plan(
@@ -940,14 +1201,39 @@ fn deviation_storm_is_bounded_and_monotone() {
             i,
         );
         assert!(r.tracked_sources() <= MAX_SOURCES);
-        if plan.max_step > Step::Record {
-            issued += 1;
-            last_issued = last_issued.max(plan.max_step);
+        assert!(r.rate_limit_entries() <= MAX_REISSUE_KEYS);
+        last_issued = last_issued.max(plan.max_step);
+        if plan.suppressed {
+            let (t, step) = auto_seen
+                .get(&src)
+                .copied()
+                .expect("suppressed without prior issue");
+            assert!(i - t < interval, "stale suppression of {src}");
+            assert!(step > Step::Record);
+        }
+        let auto = plan.max_step > Step::Record && !plan.requires_human_approval;
+        if auto {
+            auto_seen.insert(src.clone(), (i, plan.max_step));
+        }
+        if auto && plan.max_step.is_motion_affecting() {
+            motion_issues += 1;
+            if let Some((t, st, sv)) = window {
+                if i - t < interval {
+                    assert!(
+                        plan.max_step > st || plan.severity > sv,
+                        "non-monotone at {i}"
+                    );
+                }
+            }
+            window = Some((i, plan.max_step, plan.severity));
         }
     }
-    // 20k deviations over 20 s with a 1 s re-issue interval: escalations
-    // (<= 4 distinct rungs) plus at most one re-issue per second.
-    assert!(issued <= 4 + 20, "issued {issued}");
+    // Per interval at most |rungs| + |severities| strictly increasing pairs.
+    let intervals = n / interval + 1;
+    assert!(
+        motion_issues <= 7 * intervals,
+        "motion issues {motion_issues}"
+    );
     assert_eq!(last_issued, Step::RequestSafeState);
 }
 
