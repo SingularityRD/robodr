@@ -129,7 +129,8 @@ Objective: a robot's "normal" is captured automatically, not hand-written.
 
 Objective: host-level robot threats and graph deviations both reach the SOC.
 
-- **E1:** Validate `rules/robot.toml` against the real Pulsar rules engine on the
+- **E1:** Run `rules/robodr/*.toml` (offline-validated by `scripts/validate_rules.py`;
+  see `rules/README.md` "Still unverified") on a real Pulsar daemon on the
   controller; tune to the robot's actual control stack to hit the false-positive bound.
 - **E3:** Ship the AutoSecOps robot source-trust map (`core/federation/provenance.py`
   `robot_edr`) and the `robotics` category (`core/contracts/verdict.py`,

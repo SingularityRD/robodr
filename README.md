@@ -47,7 +47,8 @@ crates/
                         logic. No I/O, no Pulsar. Unit-tested anywhere.
   robodr-sensor-ros2/   ROS 2 / DDS discovery sensor, as a Pulsar module.
                         Wraps the RTPS parser + profile check onto the bus.
-rules/                  Robot detection rules in Pulsar rules-engine format.
+rules/robodr/           Robot detection rules in Pulsar rules-engine TOML format
+                        (validate: scripts/validate_rules.py; see rules/README.md).
 config/                 Profile and daemon config examples.
 docs/ROADMAP.md         The engineering plan: phases, components, research.
 vendor/pulsar/          Pulsar, as a git submodule (the base we build on).

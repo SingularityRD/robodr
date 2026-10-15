@@ -1,0 +1,1432 @@
+[
+ {
+  "rule": "RoboDR: Interactive shell started on robot controller",
+  "note": "bash -i reverse shell",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/bash"
+   },
+   "payload": {
+    "filename": "/usr/bin/bash",
+    "argc": 2,
+    "argv": [
+     "bash",
+     "-i"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interactive shell started on robot controller",
+  "note": "busybox sh -i",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/bin/busybox",
+    "argc": 2,
+    "argv": [
+     "sh",
+     "-i"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interactive shell started on robot controller",
+  "note": "non-interactive script",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/bin/sh",
+    "argc": 3,
+    "argv": [
+     "sh",
+     "-c",
+     "echo hi"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interactive shell started on robot controller",
+  "note": "ssh -i key is not a shell",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/ssh",
+    "argc": 4,
+    "argv": [
+     "ssh",
+     "-i",
+     "k",
+     "host"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process connects outside the robot's networks",
+  "note": "node to public IPv4",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/demo_nodes_cpp/talker"
+   },
+   "payload": {
+    "destination": {
+     "ip": "8.8.8.8",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process connects outside the robot's networks",
+  "note": "workspace node to public IPv6",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/robot_ws/install/nav/lib/nav/planner"
+   },
+   "payload": {
+    "destination": {
+     "ip": "2001:db8::1",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process connects outside the robot's networks",
+  "note": "node to cell subnet",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/demo_nodes_cpp/talker"
+   },
+   "payload": {
+    "destination": {
+     "ip": "192.168.10.5",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process connects outside the robot's networks",
+  "note": "node to 172.31 edge",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/x/y"
+   },
+   "payload": {
+    "destination": {
+     "ip": "172.31.255.255",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process connects outside the robot's networks",
+  "note": "node to 172.32 (outside RFC1918)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/x/y"
+   },
+   "payload": {
+    "destination": {
+     "ip": "172.32.0.1",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process connects outside the robot's networks",
+  "note": "node to loopback v6",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/x/y"
+   },
+   "payload": {
+    "destination": {
+     "ip": "::1",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process connects outside the robot's networks",
+  "note": "non-ROS process to public IP",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/curl"
+   },
+   "payload": {
+    "destination": {
+     "ip": "8.8.8.8",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 install tree written outside the package manager",
+  "note": "overwrite node binary",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/opt/ros/humble/lib/x/talker",
+    "flags": [
+     "O_WRONLY",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 install tree written outside the package manager",
+  "note": "rw param yaml in ws",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vim"
+   },
+   "payload": {
+    "filename": "/opt/robot_ws/install/cfg/share/cfg/params.yaml",
+    "flags": [
+     "O_RDWR"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 install tree written outside the package manager",
+  "note": "dpkg upgrade",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "filename": "/opt/ros/humble/lib/x/talker",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 install tree written outside the package manager",
+  "note": "read-only load",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/x/talker"
+   },
+   "payload": {
+    "filename": "/opt/ros/humble/lib/x/talker",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File created or moved into the ROS 2 install tree outside the package manager",
+  "note": "mv into ros tree",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/tmp/x",
+    "destination": "/opt/ros/humble/share/x/launch/a.py"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File created or moved into the ROS 2 install tree outside the package manager",
+  "note": "dpkg rename",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "source": "/opt/ros/humble/lib/x.dpkg-new",
+    "destination": "/opt/ros/humble/lib/x"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: SROS 2 enclave private key read by a process outside the ROS stack",
+  "note": "cat key",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cat"
+   },
+   "payload": {
+    "filename": "/etc/sros2/keystore/enclaves/robot/talker/key.pem",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: SROS 2 enclave private key read by a process outside the ROS stack",
+  "note": "python reads key",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.10"
+   },
+   "payload": {
+    "filename": "/home/u/ks/enclaves/talker/key.pem",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: SROS 2 enclave private key read by a process outside the ROS stack",
+  "note": "C++ node loads own key",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/demo_nodes_cpp/talker"
+   },
+   "payload": {
+    "filename": "/etc/sros2/keystore/enclaves/robot/talker/key.pem",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: SROS 2 enclave private key read by a process outside the ROS stack",
+  "note": "cert is public",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cat"
+   },
+   "payload": {
+    "filename": "/etc/sros2/keystore/enclaves/robot/talker/cert.pem",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: SROS 2 CA private key accessed on robot",
+  "note": "ca key read",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/x/y"
+   },
+   "payload": {
+    "filename": "/etc/sros2/keystore/private/ca.key.pem",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: SROS 2 CA private key accessed on robot",
+  "note": "public ca cert",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cat"
+   },
+   "payload": {
+    "filename": "/etc/sros2/keystore/public/ca.cert.pem",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: SROS 2 keystore file written",
+  "note": "permissions replaced",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/ks/enclaves/robot/talker/permissions.p7s",
+    "flags": [
+     "O_WRONLY",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: SROS 2 keystore file written",
+  "note": "key truncated even if O_RDONLY",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/x"
+   },
+   "payload": {
+    "filename": "/ks/enclaves/talker/key.pem",
+    "flags": [
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: SROS 2 keystore file written",
+  "note": "node reads governance",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/x/y"
+   },
+   "payload": {
+    "filename": "/ks/enclaves/talker/governance.p7s",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: SROS 2 keystore file renamed or replaced",
+  "note": "key moved out",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/ks/enclaves/talker/key.pem",
+    "destination": "/tmp/k"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: SROS 2 keystore file renamed or replaced",
+  "note": "unrelated rename",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/tmp/a",
+    "destination": "/tmp/b"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created to an SROS 2 private key",
+  "note": "symlink to key",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/tmp/innocent",
+    "destination": "/ks/enclaves/talker/key.pem",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created to an SROS 2 private key",
+  "note": "link to cert",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/tmp/c",
+    "destination": "/ks/enclaves/talker/cert.pem",
+    "hard_link": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process loaded a library from outside the allowlisted library paths",
+  "note": "LD_PRELOAD hook in home",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/x/talker"
+   },
+   "payload": {
+    "filename": "/home/robot/.hook/libspoof.so",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process loaded a library from outside the allowlisted library paths",
+  "note": "rclpy node, hook in /srv",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.10"
+   },
+   "payload": {
+    "filename": "/srv/x/libhook.so.1",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process loaded a library from outside the allowlisted library paths",
+  "note": "system lib",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/x/talker"
+   },
+   "payload": {
+    "filename": "/usr/lib/x86_64-linux-gnu/libssl.so.3",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process loaded a library from outside the allowlisted library paths",
+  "note": "ld.so.cache",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/x/talker"
+   },
+   "payload": {
+    "filename": "/etc/ld.so.cache",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process loaded a library from outside the allowlisted library paths",
+  "note": "ros lib",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/x/talker"
+   },
+   "payload": {
+    "filename": "/opt/ros/humble/lib/librclcpp.so",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process loaded a library from outside the allowlisted library paths",
+  "note": "non-ROS process",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/firefox"
+   },
+   "payload": {
+    "filename": "/home/u/libx.so",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process loaded /etc/ld.so.preload",
+  "note": "node start with preload present",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/x/talker"
+   },
+   "payload": {
+    "filename": "/etc/ld.so.preload",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process loaded /etc/ld.so.preload",
+  "note": "other process",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ls"
+   },
+   "payload": {
+    "filename": "/etc/ld.so.preload",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unexpected ROS 2 middleware (RMW) library loaded",
+  "note": "rogue rmw",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/x/talker"
+   },
+   "payload": {
+    "filename": "/opt/evil/lib/librmw_evil_cpp.so",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unexpected ROS 2 middleware (RMW) library loaded",
+  "note": "cyclone not commissioned",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/x/talker"
+   },
+   "payload": {
+    "filename": "/opt/ros/humble/lib/librmw_cyclonedds_cpp.so",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unexpected ROS 2 middleware (RMW) library loaded",
+  "note": "commissioned fastrtps",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/x/talker"
+   },
+   "payload": {
+    "filename": "/opt/ros/humble/lib/librmw_fastrtps_cpp.so",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unexpected ROS 2 middleware (RMW) library loaded",
+  "note": "librmw.so itself",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/x/talker"
+   },
+   "payload": {
+    "filename": "/opt/ros/humble/lib/librmw.so",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shared library opened from a temporary directory",
+  "note": "/dev/shm hook",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/x/talker"
+   },
+   "payload": {
+    "filename": "/dev/shm/.x/libh.so",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shared library opened from a temporary directory",
+  "note": "/tmp versioned",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3"
+   },
+   "payload": {
+    "filename": "/tmp/libh.so.1",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shared library opened from a temporary directory",
+  "note": "tmp data file",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3"
+   },
+   "payload": {
+    "filename": "/tmp/map.yaml",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program executed from a temporary directory",
+  "note": "dropper",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/dev/shm/x",
+    "argc": 1,
+    "argv": [
+     "x"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program executed from a temporary directory",
+  "note": "normal",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/ls",
+    "argc": 1,
+    "argv": [
+     "ls"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shared library written into a system library path outside the package manager",
+  "note": "planted lib",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/usr/lib/x86_64-linux-gnu/libfoo.so.1"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shared library written into a system library path outside the package manager",
+  "note": "dpkg",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "filename": "/usr/lib/x86_64-linux-gnu/libfoo.so.1"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Dynamic linker search path changed",
+  "note": "new conf.d entry",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/tee"
+   },
+   "payload": {
+    "filename": "/etc/ld.so.conf.d/zz.conf",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Dynamic linker search path changed",
+  "note": "ldconfig reads",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/sbin/ldconfig"
+   },
+   "payload": {
+    "filename": "/etc/ld.so.conf.d/x.conf",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Process memory written through /proc",
+  "note": "mem write",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/tmp/inject"
+   },
+   "payload": {
+    "filename": "/proc/4242/mem",
+    "flags": [
+     "O_RDWR"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Process memory written through /proc",
+  "note": "mem read (upstream rule covers)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/x"
+   },
+   "payload": {
+    "filename": "/proc/4242/mem",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Debugger or tracer started on robot controller",
+  "note": "gdb attach",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/gdb",
+    "argc": 3,
+    "argv": [
+     "gdb",
+     "-p",
+     "4242"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Debugger or tracer started on robot controller",
+  "note": "gdb-like name",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/gdbus",
+    "argc": 1,
+    "argv": [
+     "gdbus"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Debian package installed on robot controller",
+  "note": "dpkg -i",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/dpkg",
+    "argc": 3,
+    "argv": [
+     "dpkg",
+     "-i",
+     "x.deb"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Debian package installed on robot controller",
+  "note": "apt install",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/apt-get",
+    "argc": 4,
+    "argv": [
+     "apt-get",
+     "install",
+     "-y",
+     "ros-humble-x"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Debian package installed on robot controller",
+  "note": "dpkg -l query",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/dpkg",
+    "argc": 2,
+    "argv": [
+     "dpkg",
+     "-l"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Debian package installed on robot controller",
+  "note": "apt list",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/apt",
+    "argc": 3,
+    "argv": [
+     "apt",
+     "list",
+     "--installed"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Debian package installed on robot controller",
+  "note": "KNOWN GAP: bundled -iE",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/dpkg",
+    "argc": 3,
+    "argv": [
+     "dpkg",
+     "-iE",
+     "x.deb"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Debian package maintainer script executed",
+  "note": "postinst",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/var/lib/dpkg/info/evil.postinst",
+    "argc": 2,
+    "argv": [
+     "/var/lib/dpkg/info/evil.postinst",
+     "configure"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Debian package maintainer script executed",
+  "note": "preinst",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/var/lib/dpkg/tmp.ci/preinst",
+    "argc": 2,
+    "argv": [
+     "/var/lib/dpkg/tmp.ci/preinst",
+     "install"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Debian package maintainer script executed",
+  "note": "other",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/dpkg",
+    "argc": 2,
+    "argv": [
+     "dpkg",
+     "-l"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Debian package database changed",
+  "note": "list replaced",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "source": "/var/lib/dpkg/info/evil.list-new",
+    "destination": "/var/lib/dpkg/info/evil.list"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Debian package database changed",
+  "note": "status file",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "source": "/var/lib/dpkg/status-new",
+    "destination": "/var/lib/dpkg/status"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed on robot controller",
+  "note": "pip3 install",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/pip3",
+    "argc": 3,
+    "argv": [
+     "pip3",
+     "install",
+     "x"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed on robot controller",
+  "note": "python -m pip install",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3.10",
+    "argc": 5,
+    "argv": [
+     "python3",
+     "-m",
+     "pip",
+     "install",
+     "x"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed on robot controller",
+  "note": "pip list",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/pip3",
+    "argc": 2,
+    "argv": [
+     "pip3",
+     "list"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Bluetooth tooling executed on robot controller",
+  "note": "bluetoothctl scan",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/bluetoothctl",
+    "argc": 3,
+    "argv": [
+     "bluetoothctl",
+     "scan",
+     "on"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Bluetooth tooling executed on robot controller",
+  "note": "unrelated",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/btop",
+    "argc": 1,
+    "argv": [
+     "btop"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Wi-Fi configuration tooling executed on robot controller",
+  "note": "wpa_cli",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/sbin/wpa_cli",
+    "argc": 2,
+    "argv": [
+     "wpa_cli",
+     "add_network"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Wi-Fi configuration tooling executed on robot controller",
+  "note": "iw dev",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/sbin/iw",
+    "argc": 2,
+    "argv": [
+     "iw",
+     "dev"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Wi-Fi configuration tooling executed on robot controller",
+  "note": "ip is not iw",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/sbin/ip",
+    "argc": 2,
+    "argv": [
+     "ip",
+     "a"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Wireless network configuration modified",
+  "note": "wpa conf write",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3"
+   },
+   "payload": {
+    "filename": "/etc/wpa_supplicant/wpa_supplicant.conf",
+    "flags": [
+     "O_WRONLY",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Wireless network configuration modified",
+  "note": "wpa conf read",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/sbin/wpa_supplicant"
+   },
+   "payload": {
+    "filename": "/etc/wpa_supplicant/wpa_supplicant.conf",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Kernel module file written outside the package manager",
+  "note": "rootkit .ko",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/curl"
+   },
+   "payload": {
+    "filename": "/tmp/rk.ko"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Kernel module file written outside the package manager",
+  "note": "compressed module",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/lib/modules/6.1/extra/x.ko.zst"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Kernel module file written outside the package manager",
+  "note": "dpkg kernel update",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "filename": "/lib/modules/6.1/kernel/x.ko"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Kernel module autoload configuration changed",
+  "note": "modules-load.d",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/tee"
+   },
+   "payload": {
+    "filename": "/etc/modules-load.d/rk.conf",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Kernel module autoload configuration changed",
+  "note": "read",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/kmod"
+   },
+   "payload": {
+    "filename": "/etc/modprobe.d/blacklist.conf",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR profile or Pulsar configuration written",
+  "note": "profile widened",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vim"
+   },
+   "payload": {
+    "filename": "/etc/robodr/profile.json",
+    "flags": [
+     "O_WRONLY",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR profile or Pulsar configuration written",
+  "note": "daemon reads config",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/pulsard"
+   },
+   "payload": {
+    "filename": "/etc/pulsar/pulsar.toml",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR profile or Pulsar configuration deleted",
+  "note": "rule file removed",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/rm"
+   },
+   "payload": {
+    "filename": "/etc/pulsar/rules/robodr/ros2_stack.toml"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR profile or Pulsar configuration deleted",
+  "note": "other file",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/rm"
+   },
+   "payload": {
+    "filename": "/etc/hosts"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR profile or Pulsar configuration renamed",
+  "note": "profile replaced",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/tmp/p.json",
+    "destination": "/etc/robodr/profile.json"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR profile or Pulsar configuration renamed",
+  "note": "other",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/tmp/a",
+    "destination": "/tmp/b"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Attempt to stop the Pulsar or RoboDR service",
+  "note": "systemctl stop",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/systemctl",
+    "argc": 3,
+    "argv": [
+     "systemctl",
+     "stop",
+     "pulsard.service"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Attempt to stop the Pulsar or RoboDR service",
+  "note": "pkill",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/pkill",
+    "argc": 2,
+    "argv": [
+     "pkill",
+     "pulsard"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Attempt to stop the Pulsar or RoboDR service",
+  "note": "restart other",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/systemctl",
+    "argc": 3,
+    "argv": [
+     "systemctl",
+     "stop",
+     "nginx"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Attempt to stop the Pulsar or RoboDR service",
+  "note": "status pulsard",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/systemctl",
+    "argc": 3,
+    "argv": [
+     "systemctl",
+     "status",
+     "pulsard"
+    ]
+   }
+  }
+ }
+]
