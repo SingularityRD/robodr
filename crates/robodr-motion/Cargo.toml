@@ -1,0 +1,10 @@
+[package]
+name = "robodr-motion"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Motion/feedback consistency detection (pure): catches injected telemetry by correlating commands with sensor-authored feedback."
+
+[dependencies]
+robodr-events = { workspace = true }

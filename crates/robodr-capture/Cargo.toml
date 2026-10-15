@@ -1,0 +1,10 @@
+[package]
+name = "robodr-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Passive packet capture for RoboDR: Ethernet/IP/UDP frame decoding, pcap replay, and a Linux AF_PACKET reader feeding the RTPS parser. Read-only."
+
+[dependencies]
+robodr-events = { workspace = true }

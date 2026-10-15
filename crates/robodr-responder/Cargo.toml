@@ -1,0 +1,10 @@
+[package]
+name = "robodr-responder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cyber-Jidoka responder (pure): graded, safety-aware response planning. Never overrides the platform safety system."
+
+[dependencies]
+robodr-events = { workspace = true }

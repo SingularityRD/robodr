@@ -1,0 +1,10 @@
+[package]
+name = "robodr-commission"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Observe-mode commissioning: learns a robot's model profile from clean-run events and emits profile.json for the OEM to lock."
+
+[dependencies]
+robodr-events = { workspace = true }

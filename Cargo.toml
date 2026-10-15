@@ -1,7 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/robodr-blackbox",
+    "crates/robodr-capture",
+    "crates/robodr-commission",
     "crates/robodr-events",
+    "crates/robodr-firewall",
+    "crates/robodr-motion",
+    "crates/robodr-ocsf",
+    "crates/robodr-responder",
     "crates/robodr-rtps",
     "crates/robodr-sensor-ros2",
 ]
@@ -19,6 +26,13 @@ authors = ["Singularity RD"]
 # RoboDR crates
 robodr-events = { path = "crates/robodr-events" }
 robodr-rtps = { path = "crates/robodr-rtps" }
+robodr-blackbox = { path = "crates/robodr-blackbox" }
+robodr-capture = { path = "crates/robodr-capture" }
+robodr-commission = { path = "crates/robodr-commission" }
+robodr-firewall = { path = "crates/robodr-firewall" }
+robodr-motion = { path = "crates/robodr-motion" }
+robodr-ocsf = { path = "crates/robodr-ocsf" }
+robodr-responder = { path = "crates/robodr-responder" }
 
 # Pulsar is vendored as a git submodule under vendor/pulsar (see README).
 # We build on pulsar-core's module ABI (PulsarModule / SimplePulsarModule).
