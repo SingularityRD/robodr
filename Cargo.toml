@@ -26,11 +26,14 @@ edition = "2021"
 # sources (`*.bpf.c`) are GPL-2.0 and are not Rust crates; see LICENSE and
 # docs/BUILD.md ("Licensing"). cargo-deny (deny.toml) rejects GPL in userspace.
 license = "Apache-2.0"
-# MSRV: 1.87, because robodr-capture, -rtps, -blackbox, -firewall and -motion
-# use `u*::is_multiple_of` (stable since 1.87). Pulsar's own floor is 1.85
-# (edition 2024). The toolchain that builds releases is pinned separately in
-# rust-toolchain.toml (= Pulsar's pin, 1.98.1 >= this MSRV).
-# Crates opt in with `rust-version.workspace = true`; CI's `msrv` job checks it.
+# MSRV: 1.87, because `u*::is_multiple_of` (stable since 1.87) is used in
+# library code of robodr-capture, -rtps, -blackbox and -commission, and in
+# tests/examples of -firewall, -motion and -ros2-pipeline. Pulsar's own floor
+# is 1.85 (edition 2024). The toolchain that builds releases is pinned
+# separately in rust-toolchain.toml (= Pulsar's pin, 1.98.1 >= this MSRV).
+# Every crate inherits it (`rust-version.workspace = true`), so clippy's
+# `incompatible_msrv` lint flags std APIs newer than this; CI's `msrv` job
+# compiles the pure crates with 1.87 itself.
 rust-version = "1.87"
 repository = "https://github.com/SingularityRD/robodr"
 authors = ["Singularity RD"]

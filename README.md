@@ -17,10 +17,10 @@ security for Linux), vendored under `vendor/pulsar`. RoboDR adds the robot layer
 Pulsar does not have: the ROS 2 / DDS graph, the motion envelope, device
 attestation, and a safety-aware responder (*Cyber-Jidoka*).
 
-> **Status: alpha, under active development.** The pure detection core
-> (`robodr-events`) and the RTPS parser are unit-tested. The ROS 2 sensor module
-> compiles against Pulsar's module ABI; end-to-end bring-up on a controller is
-> in progress. This is a frontier research codebase, not yet a product release.
+> **Status: alpha, research codebase, not a product release.** Everything that
+> is verified so far is verified *offline* on synthetic data; nothing has yet run
+> against a real robot, real DDS stack or real Pulsar build. See
+> [Status](#status) for the exact line.
 
 ## Why not just Pulsar, Exein or Alias?
 
@@ -43,33 +43,114 @@ real (see [`docs/ROADMAP.md`](docs/ROADMAP.md) §0). RoboDR's differentiators:
 
 ```
 crates/
-  robodr-events/        Pure robot event taxonomy + model-profile detection
-                        logic. No I/O, no Pulsar. Unit-tested anywhere.
-  robodr-sensor-ros2/   ROS 2 / DDS discovery sensor, as a Pulsar module.
-                        Wraps the RTPS parser + profile check onto the bus.
+  robodr-events/          Pure event taxonomy (RobotEvent, Deviation, Severity),
+                          DDS graph model + ROS 2 name de-mangling, model profile
+                          and Profile::evaluate (the detection core). No I/O.
+  robodr-rtps/            Read-only RTPS discovery parser: SPDP + SEDP, LE/BE,
+                          inline QoS, bounded DATA_FRAG reassembly. No I/O.
+  robodr-capture/         Passive capture: Ethernet/IP/UDP decode, IP reassembly,
+                          pcap/pcapng replay, Linux AF_PACKET reader. Never sends.
+  robodr-ros2-pipeline/   Pulsar-independent ROS 2 sensor pipeline: datagram
+                          sources -> RTPS parse -> profile deviations -> dedup ->
+                          sanitised findings. Binary: robodr-ros2-watch (lab tool).
+  robodr-commission/      Observe-mode commissioning: learn a draft profile.json
+                          from a clean run, diff / merge / lock / check it.
+                          Binary: robodr-commission.
+  robodr-firewall/        Motion Firewall decision core: pass / limit / reject a
+                          motion command against the locked envelope. Pure,
+                          allocation-free hot path; no ROS 2 gateway yet.
+  robodr-motion/          Motion/feedback consistency detector (injected or frozen
+                          telemetry, uncommanded motion, GNSS vs odom vs IMU). Pure.
+  robodr-responder/       Cyber-Jidoka response *planner*: graded, safety-state-aware
+                          plans; executes nothing, never overrides the safety system.
+  robodr-blackbox/        Signed (interim HMAC-SHA256), hash-chained evidence
+                          recorder with append-only segments and export bundles.
+  robodr-ocsf/            Deviation -> OCSF Detection Finding for the AutoSecOps
+                          robot-edr.findings contract; Kafka key/partition helpers
+                          (no Kafka client).
+  robodr-agent/           Offline decision chain composing the crates above
+                          (event -> deviation -> plan -> evidence -> finding).
+                          Binary: robodr-replay (JSONL replay). Executes nothing.
+  robodr-sensor-ros2/     Thin Pulsar module wrapping robodr-ros2-pipeline.
+                          Pulsar-dependent; not built or tested offline.
+  robodr-pulsard/         Pulsar daemon with the RoboDR module registered.
+                          Pulsar-dependent; not built or tested offline.
 rules/robodr/           Robot detection rules in Pulsar rules-engine TOML format
                         (validate: scripts/validate_rules.py; see rules/README.md).
-config/                 Profile and daemon config examples.
+config/                 Profile, response-policy and daemon config examples.
 docs/ROADMAP.md         The engineering plan: phases, components, research.
+docs/SPRINTS.md         The roadmap broken into sprints, with status.
+docs/BUILD.md           Toolchain, MSRV, Cargo.lock policy, air-gapped builds, CI.
+docs/PULSAR-INTEGRATION.md  Every Pulsar item the Pulsar-bound crates use.
+docs/contracts/         robot-edr.findings topic contract + JSON Schema.
+fuzz/                   cargo-fuzz harness for robodr-rtps (own workspace).
 vendor/pulsar/          Pulsar, as a git submodule (the base we build on).
 ```
 
+**In progress (being added in parallel, not yet on this branch):**
+
+- `robodr-agentd` — the runtime daemon that hosts the decision chain.
+- `robodr-cdr` — ROS 2 CDR decoder for motion messages (feeds the firewall
+  and the motion monitor from real topics).
+- `robodr-diode` — one-way evidence/finding export for air-gapped sites.
+
+## Status
+
+**Verified offline** (dev sandbox: no network, Rust stable 1.97, Pulsar-bound
+members dropped from the workspace, serde patched to local checkouts; no kernel
+module, no robot):
+
+- The 11 pure crates build, pass `clippy -D warnings` and pass their tests:
+  ~900 unit + integration tests (903 passing, 1 long fuzz run `#[ignore]`d at
+  the time of writing).
+- All inputs are **synthetic**: RTPS datagrams and pcap/pcapng files are
+  generated byte by byte from the DDSI-RTPS spec by test generators
+  (`crates/robodr-rtps/tests/fixtures/README.md` says so explicitly). No
+  capture from a real DDS stack is checked in.
+- Live `AF_PACKET` capture is exercised only on the loopback interface with
+  test-generated datagrams, and only when the test has `CAP_NET_RAW` (it
+  prints `SKIPPED` and passes otherwise).
+
+**Not verified:**
+
+- The Pulsar-bound crates (`robodr-sensor-ros2`, `robodr-pulsard`) have never
+  been compiled here (they need `pulsar-core`, tokio and crates.io / a mirror)
+  and have no tests of their own.
+- No real robot, no real Fast DDS / Cyclone DDS / Connext traffic, no Gazebo
+  run, no controller hardware, no TPM. False-positive rates are unmeasured.
+- `rules/robodr/*.toml` are checked by `scripts/validate_rules.py` only, not
+  loaded into a running Pulsar rules engine.
+- The firewall, motion monitor, responder, black box and OCSF mapper are wired
+  together only in the offline `robodr-agent` chain; nothing feeds them live
+  ROS 2 motion traffic yet, and nothing executes a response.
+- The black box signs with HMAC-SHA256 as a placeholder; production needs an
+  asymmetric, non-exportable key.
+
 ## Build
 
-RoboDR needs the Pulsar submodule and a Rust toolchain with crates.io access.
+Two paths; [`docs/BUILD.md`](docs/BUILD.md) is authoritative for both.
+
+- **Connected lab host:** Rust toolchain from `rust-toolchain.toml`, crates
+  from crates.io (or the internal mirror).
+- **Air-gapped host:** no crates.io at all — crates from the internal mirror
+  or a vendored tarball, `--locked --offline`, toolchain from the offline
+  bundle (BUILD.md, "Air-gapped builds").
 
 ```bash
 git clone --recurse-submodules https://github.com/SingularityRD/robodr.git
 cd robodr
 # or, if already cloned:  git submodule update --init --recursive
 
-# The pure core builds and tests with no kernel and no robot:
-cargo test -p robodr-events
-cargo test -p robodr-sensor-ros2   # RTPS parser tests
+# Pure crates: build and test with no kernel and no robot. (Cargo still
+# resolves the whole workspace, so this needs the submodule and the crates
+# pinned in Cargo.lock, from crates.io or the mirror.)
+cargo test --workspace --exclude robodr-sensor-ros2 --exclude robodr-pulsard
+cargo test -p robodr-rtps          # RTPS discovery parser
+cargo test -p robodr-ros2-pipeline # sensor pipeline (what the Pulsar module runs)
 
-# The full module links against Pulsar (needs its eBPF build toolchain; see
+# Pulsar-bound crates link all of Pulsar (needs its eBPF build toolchain; see
 # vendor/pulsar/README.md for kernel 5.5+, BTF, clang requirements):
-cargo build -p robodr-sensor-ros2
+cargo build -p robodr-sensor-ros2 -p robodr-pulsard
 ```
 
 ## License

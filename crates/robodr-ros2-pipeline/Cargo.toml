@@ -2,6 +2,7 @@
 name = "robodr-ros2-pipeline"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Pulsar-independent ROS 2 / DDS detection pipeline for RoboDR: datagram sources (multicast socket, passive capture, pcap replay), RTPS parsing, profile deviations, bounded dedup, sanitised findings."

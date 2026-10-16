@@ -19,7 +19,7 @@ Contents: [Toolchain](#toolchain) · [Developer build](#developer-build) ·
 | What | Value | Where |
 |---|---|---|
 | Release toolchain | Rust **1.98.1** (same pin as Pulsar) | `rust-toolchain.toml` |
-| MSRV | **1.87** (`u*::is_multiple_of`; Pulsar's own floor is 1.85, edition 2024) | `[workspace.package] rust-version` |
+| MSRV | **1.87** (`u*::is_multiple_of`; Pulsar's own floor is 1.85, edition 2024) | `[workspace.package] rust-version`, `MSRV` in `.github/workflows/ci.yml` |
 | Edition (RoboDR crates) | 2021 | `[workspace.package]` |
 | Targets | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` | `rust-toolchain.toml` |
 
@@ -27,16 +27,21 @@ Contents: [Toolchain](#toolchain) · [Developer build](#developer-build) ·
 `vendor/pulsar` submodule), so RoboDR pins exactly the compiler Pulsar is tested
 with. A fixed compiler is also a precondition for reproducible builds.
 
-The MSRV applies to crates that opt in with `rust-version.workspace = true`
-(robodr-commission, -events, -ocsf, -responder, -pulsard and -sensor-ros2 do;
-see [Verification status](#verification-status)). The `msrv` CI job checks
-the pure crates with 1.87.
+Every workspace crate inherits the MSRV with `rust-version.workspace = true`
+(all 13 members; the separate `fuzz/` workspace does not, it needs nightly).
+Why 1.87: `u*::is_multiple_of` is used in library code of `robodr-capture`,
+`-rtps`, `-blackbox` and `-commission` (and in tests/examples of
+`-firewall`, `-motion`, `-ros2-pipeline`). Because the crates declare it,
+clippy's `incompatible_msrv` lint (on by default, an error under
+`-D warnings`) rejects any std API newer than 1.87. The `msrv` CI job
+compiles the pure crates with 1.87 itself; it is still marked informational
+in `ci.yml` (see [Verification status](#verification-status)).
 
 A host that does not have 1.98.1 (for example the dev sandbox, which only has
 a newer stable and no network) can override **for local work only**:
 
 ```bash
-RUSTUP_TOOLCHAIN=stable cargo test --workspace --exclude robodr-sensor-ros2
+RUSTUP_TOOLCHAIN=stable cargo test --workspace --exclude robodr-sensor-ros2 --exclude robodr-pulsard
 ```
 
 Release artefacts must be built with the pinned toolchain.
@@ -288,7 +293,7 @@ comment. Workflow token permissions are `contents: read`.
 ## Verification status
 
 Be precise about what has and has not been exercised. Last updated with the CI
-rewrite (feat/ci).
+rewrite (feat/ci); MSRV entry updated 2026-10-16 (w3-docs).
 
 **Verified in the dev sandbox** (no network, Rust 1.97.0 stable, no
 cargo-cyclonedx / cargo-deny / shellcheck installed):
@@ -326,8 +331,15 @@ cargo-cyclonedx / cargo-deny / shellcheck installed):
   crates.io), so CI fails by design until a maintainer commits the
   bootstrap lock from the `lockfile` job (see [Cargo.lock
   policy](#cargolock-policy)).
-- Only six crates inherit `rust-version.workspace = true`; for the others the
-  MSRV is declared but not enforced by cargo.
+- MSRV (2026-10-16): all crates now inherit `rust-version.workspace = true`.
+  In the sandbox (Rust 1.97 only) `clippy -D warnings` of the pure crates is
+  clean at `rust-version = "1.87"`, and fails at `"1.86"` on
+  `is_multiple_of` (first hit `robodr-capture/src/ports.rs`) — so 1.87 is the
+  floor *for std APIs*. Language features are not covered by that lint, and no
+  1.87 compiler was available, so an actual 1.87 build is unverified until the
+  `msrv` CI job runs. Once it has passed, flip its `continue-on-error` off in
+  `ci.yml` (its comment says to do so when every crate opts in, which is now
+  the case). The Pulsar-bound crates were not checked at all.
 - The air-gapped procedures (mirror, vendored tarball, offline toolchain,
   advisory-DB snapshot) are documented, not yet rehearsed in the lab.
 - Release signing is not implemented. Reproducibility of the Pulsar-bound
