@@ -26,10 +26,12 @@ edition = "2021"
 # sources (`*.bpf.c`) are GPL-2.0 and are not Rust crates; see LICENSE and
 # docs/BUILD.md ("Licensing"). cargo-deny (deny.toml) rejects GPL in userspace.
 license = "Apache-2.0"
-# MSRV: 1.85 is the floor imposed by Pulsar (edition 2024). The toolchain that
-# builds releases is pinned separately in rust-toolchain.toml (= Pulsar's pin).
+# MSRV: 1.87, because robodr-capture, -rtps, -blackbox, -firewall and -motion
+# use `u*::is_multiple_of` (stable since 1.87). Pulsar's own floor is 1.85
+# (edition 2024). The toolchain that builds releases is pinned separately in
+# rust-toolchain.toml (= Pulsar's pin, 1.98.1 >= this MSRV).
 # Crates opt in with `rust-version.workspace = true`; CI's `msrv` job checks it.
-rust-version = "1.85"
+rust-version = "1.87"
 repository = "https://github.com/SingularityRD/robodr"
 authors = ["Singularity RD"]
 
@@ -55,7 +57,14 @@ pulsar-core = { path = "vendor/pulsar/crates/pulsar-core" }
 # chosen by robodr-pulsard, so upstream defaults (notifiers, openssl) are off.
 pulsar = { path = "vendor/pulsar", default-features = false }
 
-# External
+# External. Requirements here are deliberately loose (caret); the EXACT
+# versions and checksums are pinned by the committed Cargo.lock, which every CI
+# and release build uses with --locked (scripts/ci-setup.sh refuses to build
+# without it; scripts/ci-check-lockfile.py rejects path/git/unknown sources and
+# registry crates without a checksum; docs/BUILD.md "Cargo.lock policy").
+# Pulsar's own vendor/pulsar/Cargo.lock is NOT used for our build: Pulsar's
+# dependencies are resolved into OUR lock, so review that lock's diff against
+# Pulsar's when bumping the submodule.
 anyhow = "1"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }

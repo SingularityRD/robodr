@@ -33,8 +33,19 @@ through a ``None`` Option evaluates to false).
 
 If the Pulsar source tree is present (default ``vendor/pulsar`` or
 ``--pulsar-src``) the script additionally:
-  * re-extracts the Payload / Header field lists from event.rs and fails if
-    they drifted from the embedded schema, and
+  * re-extracts the Payload / Header / Host / ContainerInfo fields, the
+    Category / Severity enums and the UserRule keys and fails if they drifted
+    from the embedded schema;
+  * checks the grammar itself (dsl.lalrpop): the exact operator token set, the
+    keywords, every plain terminal, and fingerprints of the productions this
+    parser hard-codes (AND/OR equal precedence, NOT on one simple condition,
+    IN, literal regexes, trim_matches without unescaping, identifiers, '?');
+  * checks the operator families each field type accepts against the
+    Validatron impls (builtins.rs String/IpAddr/bool/numeric, event.rs Argv /
+    FileFlags, pdk/module.rs ModuleName) and the FileFlags name tables;
+  * runs a mutation test proving those drift checks fire on in-memory edits
+    (renamed/added operator, changed precedence, IpAddr gaining STARTS_WITH,
+    ...), and
   * validates Pulsar's OWN shipped rules (``<pulsar>/rules``), which upstream's
     ``shipped_rules_are_valid`` test proves compile in the real engine. They
     must all pass here too; that calibrates this checker against the engine.
@@ -171,7 +182,7 @@ class RuleError(Exception):
 # keyword is also a valid identifier, so "AND" is a keyword but "ANDx" an ident.
 _TOKEN_RE = re.compile(
     r"""
-    (?P<ws>\s+)
+    (?P<ws>[\t\n\x0b\x0c\r\x20\x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+)
   | (?P<string>"(?:[^"\\]|\\.)*")
   | (?P<ident>[a-zA-Z]+\w*)
   | (?P<num>[0-9]+)
@@ -179,6 +190,9 @@ _TOKEN_RE = re.compile(
     """,
     re.VERBOSE,
 )
+# ws: the Rust regex crate's Unicode \s (White_Space property), which LALRPOP's
+# lexer skips. Python's \s is str.isspace() and ALSO matches \x1c-\x1f, which
+# Rust would reject as an unexpected character -- so the set is spelled out.
 KEYWORDS = {"AND", "OR", "NOT", "IN", "STARTS_WITH", "ENDS_WITH", "CONTAINS"}
 OPERATORS = REL_OPS | STR_OPS | {"CONTAINS"}
 
@@ -425,26 +439,96 @@ def resolve_type(path: Path_, event_type: str) -> str:
     return cur
 
 
+# Literal parsers that mirror the Rust ``FromStr`` impls validatron calls
+# (validatron/src/builtins.rs). Python's own int()/ipaddress are MORE lenient
+# (int() takes "1_000", " 7 ", full-width digits; ipaddress takes "fe80::1%eth0")
+# and anything the Rust side rejects makes RuleEngine::new fail, which disables
+# EVERY rule, Pulsar's included. So these are strict, ASCII-only, and are
+# differentially tested against the Rust std parsers (see --self-test and
+# rules/README.md "Validator vs. Rust parsing").
+
+# core::num from_str_radix(10): optional single '+' (or '-' for signed types),
+# then >= 1 ASCII digit. No whitespace, no '_', no Unicode digits. Leading zeros
+# are fine. fullmatch(), never '$' (which also matches before a trailing "\n").
+_RUST_UINT_RE = re.compile(r"\+?[0-9]+")
+_RUST_SINT_RE = re.compile(r"[+-]?[0-9]+")
+_SIGNED = {"i32"}
+
+
+def rust_parse_int(ty: str, value: str) -> int | None:
+    rx = _RUST_SINT_RE if ty in _SIGNED else _RUST_UINT_RE
+    if not rx.fullmatch(value):
+        return None
+    n = int(value, 10)  # safe now: ASCII digits with optional sign only
+    lo, hi = INT_RANGES[ty]
+    return n if lo <= n <= hi else None
+
+
+# core::net::parser (std::net::IpAddr::from_str).
+_V4_OCTET = re.compile(r"0|[1-9][0-9]{0,2}")
+_V6_GROUP = re.compile(r"[0-9a-fA-F]{1,4}")
+
+
+def _rust_v4(s: str) -> bool:
+    parts = s.split(".")
+    return len(parts) == 4 and all(_V4_OCTET.fullmatch(p) and int(p) <= 255 for p in parts)
+
+
+def _rust_v6_groups(s: str, allow_v4_tail: bool) -> int | None:
+    """Number of 16-bit groups in a ':'-separated run, or None if malformed."""
+    if s == "":
+        return 0
+    parts = s.split(":")
+    n = 0
+    for i, p in enumerate(parts):
+        if i == len(parts) - 1 and allow_v4_tail and "." in p:
+            if not _rust_v4(p):
+                return None
+            n += 2
+        elif _V6_GROUP.fullmatch(p):
+            n += 1
+        else:
+            return None
+    return n
+
+
+def rust_parse_ip(value: str) -> bool:
+    if not value.isascii():
+        return False
+    if _rust_v4(value):
+        return True
+    if value.count("::") > 1 or ":::" in value:
+        return False
+    if "::" in value:
+        head, tail = value.split("::")
+        h = _rust_v6_groups(head, allow_v4_tail=False)
+        t = _rust_v6_groups(tail, allow_v4_tail=True)
+        # "::" stands for at least one zero group.
+        return h is not None and t is not None and h + t <= 7
+    return _rust_v6_groups(value, allow_v4_tail=True) == 8
+
+
 def check_literal(ty: str, value: str, dotted: str) -> None:
     if ty in INT_RANGES:
-        lo, hi = INT_RANGES[ty]
-        try:
-            n = int(value, 10)
-        except ValueError:
-            raise RuleError(f"'{dotted}' is {ty}; {value!r} does not parse") from None
-        if not lo <= n <= hi:
-            raise RuleError(f"'{dotted}' is {ty}; {value} is out of range")
+        if rust_parse_int(ty, value) is None:
+            if (_RUST_SINT_RE if ty in _SIGNED else _RUST_UINT_RE).fullmatch(value):
+                raise RuleError(f"'{dotted}' is {ty}; {value} is out of range")
+            raise RuleError(f"'{dotted}' is {ty}; {value!r} does not parse "
+                            "(Rust from_str: ASCII digits, optional sign, nothing else)")
     elif ty == "bool":
+        # bool::from_str: exactly "true" / "false".
         if value not in ("true", "false"):
             raise RuleError(f"'{dotted}' is bool; use \"true\" / \"false\", got {value!r}")
     elif ty == "IpAddr":
-        try:
-            ipaddress.ip_address(value)
-        except ValueError:
-            raise RuleError(f"'{dotted}' is IpAddr; {value!r} is not an IP address") from None
+        if not rust_parse_ip(value):
+            raise RuleError(f"'{dotted}' is IpAddr; {value!r} is not an IP address "
+                            "(Rust std::net: ASCII only, no zone id '%', no leading zeros in IPv4)")
     elif ty == "FileFlags":
+        # event.rs FileFlags parser: exact name match.
         if value not in ACC_MODE_FLAGS + OTHER_FLAGS:
             raise RuleError(f"'{dotted}' is FileFlags; unknown flag {value!r}")
+    # String / ModuleName / Argv: infallible from_str (String::from_str,
+    # ModuleName(Cow::Owned), Argv(vec![s])) -- any literal loads.
 
 
 def typecheck(cond, event_type: str, warnings: list[str]) -> None:
@@ -737,6 +821,180 @@ def drift_check(pulsar: Path, report: Report) -> None:
         report.errors.append(f"drift: UserRule keys are {sorted(keys)}")
     if 'RULE_EXTENSION: &str = "toml"' not in eng:
         report.errors.append("drift: RULE_EXTENSION is no longer \"toml\"")
+    sm = re.search(r"pub enum Severity \{(.*?)\}", eng, re.S)
+    sev = {s.lower() for s in re.findall(r"(\w+),", sm.group(1))} if sm else set()
+    if sev != SEVERITIES:
+        report.errors.append(f"drift: Severity enum is {sorted(sev)}")
+
+    # The DSL grammar itself: operator tokens, keywords, precedence shape,
+    # literal and identifier regexes, and the no-unescape value handling.
+    lal = (pulsar / "crates/modules/rules-engine/src/dsl.lalrpop").read_text(encoding="utf-8")
+    report.errors.extend(f"drift: dsl.lalrpop: {e}" for e in grammar_drift(lal))
+
+    # FileFlags names (the only literals FileFlags accepts) and the operator
+    # families each field type accepts.
+    report.errors.extend(f"drift: {e}" for e in flags_drift(ev))
+    bi = (pulsar / "crates/validatron/src/builtins.rs").read_text(encoding="utf-8")
+    mod = (pulsar / "crates/pulsar-core/src/pdk/module.rs").read_text(encoding="utf-8")
+    report.errors.extend(f"drift: {e}" for e in operator_drift(bi, ev, mod))
+    cont = pulsar / "crates/bpf-common/src/containers/mod.rs"
+    if cont.exists():
+        cm2 = re.search(r"pub struct ContainerInfo \{(.*?)\n\}", cont.read_text(encoding="utf-8"), re.S)
+        cf = _struct_fields(cm2.group(1)) if cm2 else {}
+        if cf != STRUCTS["ContainerInfo"]:
+            report.errors.append(f"drift: ContainerInfo fields {cf} != embedded {STRUCTS['ContainerInfo']}")
+    else:
+        report.errors.append("drift: bpf-common/src/containers/mod.rs not found")
+
+
+# Grammar fragments this checker's parser hard-codes (whitespace-normalised).
+_GRAMMAR_FINGERPRINT = (
+    # AND and OR in ONE production, both left-recursive over SignedCondition:
+    # equal precedence, left-associative.
+    '<l:Condition> "AND" <r:SignedCondition> => Condition::And',
+    '<l:Condition> "OR" <r:SignedCondition> => Condition::Or',
+    # NOT applies to a SimpleCondition only.
+    '"NOT" <b:SimpleCondition> => Condition::Not',
+    '<f: FieldPath> "IN" <list: ValueList>',
+    '"(" <Condition> ")"',
+    # Literal value forms; escapes are not processed.
+    r'''r#""([^"\\]|\\.)*""# => <>.trim_matches('"').to_string()''',
+    'r"[0-9]+" => <>.to_string()',
+    # Identifiers and method calls.
+    r'r"[a-zA-Z]+\w*" => Identifier::Field',
+    r'<r"[a-zA-Z]+\w*">"()" => Identifier::MethodCall',
+    '"?" => OptCheck',
+)
+
+
+def _strip_actions(lal: str) -> str:
+    """Drop Rust action code (`=> expr` / `=>? { .. }`) and `extern { .. }`."""
+    out, i, n = [], 0, len(lal)
+    while i < n:
+        if lal.startswith("extern", i) or lal.startswith("=>", i):
+            j = i + (6 if lal.startswith("extern", i) else 2)
+            if lal.startswith("?", j):
+                j += 1
+            while j < n and lal[j] in " \t":
+                j += 1
+            if j < n and lal[j] == "{":
+                depth = 0
+                while j < n:
+                    depth += {"{": 1, "}": -1}.get(lal[j], 0)
+                    j += 1
+                    if depth == 0:
+                        break
+            else:
+                while j < n and lal[j] != "\n":
+                    j += 1
+            i = j
+            continue
+        out.append(lal[i])
+        i += 1
+    return "".join(out)
+
+
+def grammar_drift(lal: str) -> list[str]:
+    errs = []
+    norm = re.sub(r"\s+", " ", lal)
+    for frag in _GRAMMAR_FINGERPRINT:
+        if re.sub(r"\s+", " ", frag) not in norm:
+            errs.append(f"grammar fragment changed or missing: {frag}")
+    ops = set(re.findall(r'"([^"]+)"\s*=>\s*Operator::', lal))
+    if ops != OPERATORS:
+        errs.append(f"operator tokens are {sorted(ops)}, checker knows {sorted(OPERATORS)}")
+    # Production lines only (before "=>"): every quoted terminal must be one
+    # the tokenizer knows, so a new keyword or punctuation fails loudly.
+    terms = set()
+    # Raw-string regex terminals (r#"..."#, r"...") are checked by the
+    # fingerprint above; drop them before scanning for plain terminals.
+    plain = re.sub(r'r"[^"]*"', "", re.sub(r'r#".*?"#', "", _strip_actions(lal)))
+    for line in plain.splitlines():
+        if line.lstrip().startswith(("//", "use ", "grammar", "type ")):
+            continue
+        terms |= set(re.findall(r'(?<![#r\w])"([^"\s]+)"(?![#\w])', line))
+    known = KEYWORDS | OPERATORS | {"(", ")", "[", "]", ",", ".", "?", "()"}
+    if terms - known:
+        errs.append(f"unknown grammar terminals {sorted(terms - known)}")
+    for kw in ("AND", "OR", "NOT", "IN"):
+        if f'"{kw}"' not in lal:
+            errs.append(f"keyword {kw} no longer in the grammar")
+    return errs
+
+
+def flags_drift(ev: str) -> list[str]:
+    got = {}
+    for name in ("ACC_MODE_FLAGS", "OTHER_FLAGS"):
+        m = re.search(name + r"\s*:\s*\[[^\]]*\]\s*=\s*\[(.*?)\];", ev, re.S)
+        got[name] = tuple(re.findall(r'\("(\w+)"', m.group(1))) if m else None
+    errs = []
+    if got["ACC_MODE_FLAGS"] != ACC_MODE_FLAGS:
+        errs.append(f"FileFlags::ACC_MODE_FLAGS is {got['ACC_MODE_FLAGS']}")
+    if got["OTHER_FLAGS"] != OTHER_FLAGS:
+        errs.append(f"FileFlags::OTHER_FLAGS is {got['OTHER_FLAGS']}")
+    return errs
+
+
+_FAMILY = {"Relational": REL_OPS, "String": STR_OPS, "Multi": {"CONTAINS"}}
+
+
+def _impl_block(src: str, header_re: str) -> str | None:
+    """Text of the first `impl ... {` block matching header_re (brace-balanced)."""
+    m = re.search(header_re, src)
+    if not m:
+        return None
+    i = src.index("{", m.end() - 1)
+    depth = 0
+    for j in range(i, len(src)):
+        if src[j] == "{":
+            depth += 1
+        elif src[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[i:j + 1]
+    return None
+
+
+def _families(block: str) -> set[str]:
+    """Operator families with an `Ok(...)` arm in an operator factory block."""
+    fams = set()
+    for fam in _FAMILY:
+        # `Operator::Fam(op) => Ok(..)` or `=> match op { ... Ok(` -- i.e. the
+        # family is matched explicitly; families only reached through `_ =>`
+        # fall into the Err arm.
+        if re.search(r"Operator::" + fam + r"\(", block):
+            fams.add(fam)
+    return fams
+
+
+def operator_drift(builtins: str, ev: str, module: str) -> list[str]:
+    """Check TYPE_OPS against the Validatron impls that define it."""
+    errs = []
+    blocks = {
+        "String": _impl_block(builtins, r"impl Validatron for String\s*\{"),
+        "IpAddr": _impl_block(builtins, r"impl Validatron for IpAddr\s*\{"),
+        "bool": _impl_block(builtins, r"impl Validatron for bool\s*\{"),
+        "ints": _impl_block(builtins, r"macro_rules! impl_numeric\s*\{"),
+        "Argv": _impl_block(ev, r"impl Validatron for Argv\s*\{"),
+        "FileFlags": _impl_block(ev, r"impl Validatron for FileFlags\s*\{"),
+        "ModuleName": _impl_block(module, r"impl Validatron for ModuleName\s*\{"),
+    }
+    for ty, block in blocks.items():
+        if block is None:
+            errs.append(f"Validatron impl for {ty} not found")
+            continue
+        want = TYPE_OPS["u32" if ty == "ints" else ty]
+        fams = _families(block)
+        ops = set().union(*(_FAMILY[f] for f in fams)) if fams else set()
+        if ty == "bool":
+            # Relational family, but only Equals / NotEquals get an Ok arm.
+            arms = set(re.findall(r"RelationalOperator::(\w+)\s*=>\s*Ok", block))
+            ops = {"==" if a == "Equals" else "!=" if a == "NotEquals" else a for a in arms}
+        if ops != want:
+            errs.append(f"{ty} accepts {sorted(ops)} in the source, checker assumes {sorted(want)}")
+    if not re.search(r"impl_numeric!\[i8, i16, i32, i64", builtins):
+        errs.append("impl_numeric! no longer covers i32")
+    return errs
 
 
 # ---------------------------------------------------------------------------
@@ -770,6 +1028,27 @@ def _rule(cond: str, ty: str = "Exec", cat: str = "execution") -> str:
             f'description = "d"\ncondition = \'{cond}\'\n')
 
 
+# (type, literal, does Rust std from_str accept it) -- generated with rustc 1.97.
+_RUST_ORACLE = [
+    ('u32', '1_000', False), ('i32', ' \uff10 ', False), ('i32', '\uff10', False),
+    ('u32', ' 7', False), ('u32', '7 ', False), ('u32', '7\n', False), ('u32', '+7', True),
+    ('u32', '-0', False), ('i32', '-0', True), ('i32', '+-1', False), ('u32', '+', False),
+    ('i32', '-', False), ('u32', '', False), ('u32', '007', True), ('u32', '4294967295', True),
+    ('u32', '4294967296', False), ('i32', '-2147483648', True), ('i32', '-2147483649', False),
+    ('u16', '65536', False), ('usize', '18446744073709551615', True), ('u32', '\u0663', False),
+    ('u32', '1e3', False), ('u32', '0x10', False),
+    ('IpAddr', 'fe80::1%eth0', False), ('IpAddr', 'fe80::1%1', False),
+    ('IpAddr', '10.0.0.1', True), ('IpAddr', '010.0.0.1', False), ('IpAddr', '10.0.0', False),
+    ('IpAddr', '256.0.0.1', False), ('IpAddr', '::', True), ('IpAddr', '::ffff:1.2.3.4', True),
+    ('IpAddr', '::ffff:01.2.3.4', False), ('IpAddr', '1:2:3:4:5:6:7::', True),
+    ('IpAddr', '1:2:3:4:5:6:7:8::', False), ('IpAddr', '1:2:3:4:5:6:1.2.3.4', True),
+    ('IpAddr', '1.2.3.4::', False), ('IpAddr', 'FE80::0001', True),
+    ('IpAddr', 'fe80::00001', False), ('IpAddr', '\uff11.2.3.4', False),
+    ('IpAddr', ' 1.2.3.4', False), ('IpAddr', '1.2.3.4\n', False), ('IpAddr', '[::1]', False),
+    ('bool', 'True', False), ('bool', 'true', True), ('bool', ' false', False),
+]
+
+
 def self_test() -> int:
     cases = [
         # (toml, expect_ok, substring expected in the first error)
@@ -798,6 +1077,22 @@ def self_test() -> int:
         (_rule('header.image == payload.filename'), True, ""),
         (_rule('header.uid == payload.filename'), False, "compared to field"),
         (_rule('payload.filename == "a"', ty="Network"), False, "PayloadDiscriminant"),
+        # Review PoC (rules-fool/fool.toml): Python int()/ipaddress accepted these,
+        # Rust from_str rejects them -> the whole rules-engine would fail to load.
+        (_rule('header.uid == "1_000"'), False, "does not parse"),
+        (_rule('header.pid == " \uff10 "'), False, "does not parse"),
+        (_rule('payload.destination.ip == "fe80::1%eth0"', ty="Connect"), False, "not an IP"),
+        (_rule('header.uid == "-0"'), False, "does not parse"),
+        (_rule('header.pid == "-0"'), True, ""),
+        (_rule('header.uid == "4294967296"'), False, "out of range"),
+        (_rule('payload.destination.port == "+80"', ty="Connect"), True, ""),
+        (_rule('payload.destination.ip == "010.0.0.1"', ty="Connect"), False, "not an IP"),
+        (_rule('payload.is_tcp == "True"', ty="Connect"), False, "bool"),
+        # TOML basic-string escape smuggles U+001C into the condition.
+        (_rule('header.uid == 0').replace("condition = 'header.uid == 0'",
+                                          'condition = "header.uid ==\\u001c0"'),
+         False, "unexpected character"),
+        (_rule('header.uid ==\u30000'), True, ""),
         ("rules = []\n", True, ""),
         ("[rule]\nname='x'\n", False, "missing top-level"),
     ]
@@ -831,8 +1126,59 @@ def self_test() -> int:
     ):
         print("self-test FileFlags semantics failed")
         fails += 1
-    total = len(cases) + 4
+    # Differential corpus: expected values were produced by Rust 1.97 std
+    # (u32/i32/u16/usize/bool/IpAddr ::from_str), the parsers validatron uses.
+    # A 420k-case random differential run found no further disagreement.
+    for ty, value, rust_ok in _RUST_ORACLE:
+        if ty == "IpAddr":
+            got = rust_parse_ip(value)
+        elif ty == "bool":
+            got = value in ("true", "false")
+        else:
+            got = rust_parse_int(ty, value) is not None
+        if got != rust_ok:
+            print(f"self-test oracle: {ty} {value!r}: validator {got}, Rust {rust_ok}")
+            fails += 1
+    total = len(cases) + 4 + len(_RUST_ORACLE)
     print(f"self-test: {total - fails}/{total} passed")
+    return 1 if fails else 0
+
+
+def drift_mutation_test(pulsar: Path) -> int:
+    """The drift checks must notice grammar / type changes (mutated in memory)."""
+    lal = (pulsar / "crates/modules/rules-engine/src/dsl.lalrpop").read_text(encoding="utf-8")
+    ev = (pulsar / "crates/pulsar-core/src/event.rs").read_text(encoding="utf-8")
+    bi = (pulsar / "crates/validatron/src/builtins.rs").read_text(encoding="utf-8")
+    mod = (pulsar / "crates/pulsar-core/src/pdk/module.rs").read_text(encoding="utf-8")
+    ip_hdr = "impl Validatron for IpAddr {"
+    argv_hdr = "impl Validatron for Argv {"
+    cases = [
+        ("operator token renamed", grammar_drift(lal.replace('"ENDS_WITH" =>', '"ENDSWITH" =>'))),
+        ("new operator added", grammar_drift(lal.replace(
+            '"CONTAINS" =>', '"MATCHES" => Operator::String(StringOperator::Regex),\n    "CONTAINS" =>'))),
+        ("OR given its own precedence level", grammar_drift(lal.replace(
+            '<l:Condition> "OR" <r:SignedCondition>', '<l:Condition> "OR" <r:AndCondition>'))),
+        ("NOT widened to a condition", grammar_drift(lal.replace(
+            '"NOT" <b:SimpleCondition>', '"NOT" <b:Condition>'))),
+        ("string escapes now processed", grammar_drift(lal.replace(".trim_matches('\"')", ".unescape()"))),
+        ("new keyword", grammar_drift(lal.replace('"IN" <list: ValueList>', '"WITHIN" <list: ValueList>'))),
+        ("FileFlags lost O_TRUNC", flags_drift(ev.replace('("O_TRUNC"', '("O_TRUNCATE"'))),
+        ("IpAddr gained STARTS_WITH", operator_drift(
+            bi.replace(ip_hdr, ip_hdr + " // Operator::String(op) => Ok\n"), ev, mod)),
+        ("Argv gained relational ops", operator_drift(
+            bi, ev.replace(argv_hdr, argv_hdr + " // Operator::Relational(op) => Ok\n"), mod)),
+    ]
+    fails = 0
+    for label, errs in cases:
+        if not errs:
+            print(f"drift mutation test: '{label}' was NOT detected")
+            fails += 1
+    for label, errs in (("grammar", grammar_drift(lal)), ("flags", flags_drift(ev)),
+                        ("operators", operator_drift(bi, ev, mod))):
+        if errs:
+            print(f"drift mutation test: unmutated {label} reports {errs}")
+            fails += 1
+    print(f"drift mutation test: {len(cases) + 3 - fails}/{len(cases) + 3} passed")
     return 1 if fails else 0
 
 
@@ -858,8 +1204,13 @@ def main(argv: list[str]) -> int:
     if pulsar is None:
         cand = root / "vendor/pulsar"
         pulsar = cand if (cand / "crates/pulsar-core/src/event.rs").exists() else None
+    if pulsar is not None and not (pulsar / "crates/pulsar-core/src/event.rs").exists():
+        print(f"ERROR: --pulsar-src {pulsar} has no crates/pulsar-core/src/event.rs "
+              "(submodule not checked out?)")
+        return 1
     if pulsar is not None:
         rep = Report()
+        rc |= drift_mutation_test(pulsar)
         drift_check(pulsar, rep)
         validate_dir(pulsar / "rules", rep)
         for e in rep.errors:

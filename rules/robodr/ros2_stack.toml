@@ -19,10 +19,22 @@ name = "RoboDR: Interactive shell started on robot controller"
 type = "Exec"
 category = "execution"
 severity = "medium"
-description = "A shell was started with -i (interactive). On a fielded robot controller nobody should open interactive shells; 'sh -i' / 'bash -i' is the classic reverse-shell form. Pulsar's Exec event does not carry the parent image, so this cannot be limited to shells spawned by ROS nodes; correlate header.parent_pid with the process tree in the SOC."
+# Pulsar's argv CONTAINS matches one WHOLE argv element, so bundled short
+# options must be listed one by one. The common bundles of -i with l/c/s/e/x/v/m/p
+# are listed; rarer orderings (e.g. "-xvi", "-o", "--rcfile x -i" is fine) are a
+# documented gap -- see rules/README.md "Bypass analysis".
+description = "A shell was started with -i (interactive), alone or bundled with common short options (-il, -ic, -li, -ilc, ...). On a fielded robot controller nobody should open interactive shells; 'sh -i' / 'bash -i' is the classic reverse-shell form. Pulsar's Exec event does not carry the parent image, so this cannot be limited to shells spawned by ROS nodes; correlate header.parent_pid with the process tree in the SOC."
 condition = '''
-(payload.filename ENDS_WITH "/sh" OR payload.filename ENDS_WITH "/bash" OR payload.filename ENDS_WITH "/dash" OR payload.filename ENDS_WITH "/zsh" OR payload.filename ENDS_WITH "/ash" OR payload.filename ENDS_WITH "/busybox")
-AND payload.argv CONTAINS "-i"
+(payload.filename ENDS_WITH "/sh" OR payload.filename ENDS_WITH "/bash" OR payload.filename ENDS_WITH "/dash" OR payload.filename ENDS_WITH "/zsh" OR payload.filename ENDS_WITH "/ash" OR payload.filename ENDS_WITH "/busybox"
+ OR payload.filename ENDS_WITH "/ksh" OR payload.filename ENDS_WITH "/mksh")
+AND (
+  payload.argv CONTAINS "-i"
+  OR payload.argv CONTAINS "-il" OR payload.argv CONTAINS "-li" OR payload.argv CONTAINS "-ic" OR payload.argv CONTAINS "-ci"
+  OR payload.argv CONTAINS "-is" OR payload.argv CONTAINS "-si" OR payload.argv CONTAINS "-ie" OR payload.argv CONTAINS "-ei"
+  OR payload.argv CONTAINS "-ix" OR payload.argv CONTAINS "-xi" OR payload.argv CONTAINS "-iv" OR payload.argv CONTAINS "-vi"
+  OR payload.argv CONTAINS "-im" OR payload.argv CONTAINS "-mi" OR payload.argv CONTAINS "-ip" OR payload.argv CONTAINS "-pi"
+  OR payload.argv CONTAINS "-ilc" OR payload.argv CONTAINS "-lic" OR payload.argv CONTAINS "-lci" OR payload.argv CONTAINS "-cli"
+)
 '''
 
 [[rules]]
@@ -56,11 +68,11 @@ name = "RoboDR: ROS 2 install tree written outside the package manager"
 type = "FileOpened"
 category = "persistence"
 severity = "high"
-description = "A file under the ROS 2 install prefix or the robot workspace install tree was opened for writing by something other than dpkg. Nodes, launch files, parameter YAML and Python modules (including __pycache__/*.pyc) there define what the robot runs; a field write is tampering. Root-run rclpy nodes can write .pyc caches here: precompile at commissioning (python3 -m compileall) or run nodes unprivileged."
+description = "A file under the ROS 2 install prefix or the robot workspace install tree was opened for writing by something other than dpkg (exact image /usr/bin/dpkg or /bin/dpkg; a binary merely named dpkg does not count). Nodes, launch files, parameter YAML and Python modules (including __pycache__/*.pyc) there define what the robot runs; a field write is tampering. Root-run rclpy nodes can write .pyc caches here: precompile at commissioning (python3 -m compileall) or run nodes unprivileged."
 condition = '''
 (payload.filename STARTS_WITH "/opt/ros/" OR payload.filename STARTS_WITH "/opt/robot_ws/install/")
 AND (payload.flags CONTAINS "O_WRONLY" OR payload.flags CONTAINS "O_RDWR")
-AND NOT header.image ENDS_WITH "/dpkg"
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
 '''
 
 [[rules]]
@@ -68,8 +80,32 @@ name = "RoboDR: File created or moved into the ROS 2 install tree outside the pa
 type = "FileRename"
 category = "persistence"
 severity = "high"
-description = "A file was renamed into the ROS 2 install prefix or the robot workspace install tree by something other than dpkg (atomic replace of a node, launch file or parameter file)."
+description = "A file was renamed into the ROS 2 install prefix or the robot workspace install tree by something other than dpkg (exact image path) (atomic replace of a node, launch file or parameter file)."
 condition = '''
 (payload.destination STARTS_WITH "/opt/ros/" OR payload.destination STARTS_WITH "/opt/robot_ws/install/")
-AND NOT header.image ENDS_WITH "/dpkg"
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
+'''
+
+[[rules]]
+name = "RoboDR: Link created inside the ROS 2 install tree outside the package manager"
+type = "FileLink"
+category = "persistence"
+severity = "high"
+description = "A hard or symbolic link was created inside the ROS 2 install prefix or the robot workspace install tree by something other than dpkg. A symlink there pointing at an attacker binary makes it run under an /opt/ros/... image path, which other rules (e.g. the enclave-key reader allowlist) trust; a hard link swaps a node without a write or rename event. Pulsar FileLink: 'source' is the new link."
+condition = '''
+(payload.source STARTS_WITH "/opt/ros/" OR payload.source STARTS_WITH "/opt/robot_ws/install/")
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
+'''
+
+[[rules]]
+name = "RoboDR: Shell or netcat-style tool opened a network connection"
+type = "Connect"
+category = "command_and_control"
+severity = "high"
+description = "A shell (bash, sh, dash, zsh, ksh, busybox) or a raw socket tool (nc, ncat, netcat, socat) opened a network connection. Shells only do this for reverse shells ('bash -i >& /dev/tcp/host/port 0>&1', 'exec 3<>/dev/tcp/...'), which need no -i and no extra binary, so the interactive-shell rule can miss them. Destinations inside the robot's networks are NOT excluded: an attacker on the cell network is the expected case. Pulsar's own telnet rule covers telnet."
+condition = '''
+header.image ENDS_WITH "/sh" OR header.image ENDS_WITH "/bash" OR header.image ENDS_WITH "/dash" OR header.image ENDS_WITH "/zsh"
+OR header.image ENDS_WITH "/ksh" OR header.image ENDS_WITH "/mksh" OR header.image ENDS_WITH "/busybox"
+OR header.image ENDS_WITH "/nc" OR header.image ENDS_WITH "/ncat" OR header.image ENDS_WITH "/netcat"
+OR header.image ENDS_WITH "/nc.openbsd" OR header.image ENDS_WITH "/nc.traditional" OR header.image ENDS_WITH "/socat"
 '''

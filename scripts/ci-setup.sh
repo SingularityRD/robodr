@@ -5,8 +5,11 @@
 #    same name on a self-hosted, air-gapped runner), write a CARGO_HOME config
 #    that replaces crates.io with that sparse index, so the job never reaches
 #    the public registry.
+#  * Require a committed Cargo.lock (docs/BUILD.md "Cargo.lock policy"). If it
+#    is missing the job FAILS, unless ROBODR_ALLOW_MISSING_LOCK=1 (set only by
+#    the `lockfile` job, which generates the bootstrap lock and then fails).
 #  * Export, via $GITHUB_ENV when present (else print):
-#      CARGO_LOCKED   "--locked" when Cargo.lock is committed, else empty
+#      CARGO_LOCKED   "--locked" (empty only under ROBODR_ALLOW_MISSING_LOCK=1)
 #      PURE_EXCLUDES  "--exclude <pkg> ..." for Pulsar-bound members
 set -euo pipefail
 
@@ -36,8 +39,20 @@ EOF
 fi
 
 locked=""
-[[ -f Cargo.lock ]] && locked="--locked"
-excludes="$(cargo metadata --no-deps --format-version 1 | python3 "$here/ci-pure-excludes.py" -)"
+if [[ -f Cargo.lock ]]; then
+    locked="--locked"
+elif [[ "${ROBODR_ALLOW_MISSING_LOCK:-0}" == 1 ]]; then
+    echo "ci-setup: no Cargo.lock (allowed for this job only: ROBODR_ALLOW_MISSING_LOCK=1)" >&2
+else
+    echo "ci-setup: Cargo.lock is not committed; refusing to build with an unpinned resolution." >&2
+    echo "ci-setup: bootstrap it from the 'Cargo.lock-generated' artifact of the lockfile job (docs/BUILD.md)." >&2
+    [[ -n "${GITHUB_ACTIONS:-}" ]] && echo "::error file=Cargo.lock::Cargo.lock is not committed (docs/BUILD.md, Cargo.lock policy)"
+    exit 1
+fi
+# --no-deps metadata needs no registry access; with --locked it also refuses
+# to rewrite a stale lock.
+# shellcheck disable=SC2086 # $locked is empty or one flag
+excludes="$(cargo metadata --no-deps --format-version 1 $locked | python3 "$here/ci-pure-excludes.py" -)"
 
 emit() {
     if [[ -n "${GITHUB_ENV:-}" ]]; then
