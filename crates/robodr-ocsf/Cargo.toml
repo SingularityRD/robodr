@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Maps RoboDR deviations to OCSF findings for the AutoSecOps robot-edr.findings contract."
 
 [dependencies]
+robodr-blackbox = { workspace = true }
 robodr-events = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

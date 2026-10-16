@@ -17,6 +17,9 @@ pub mod header {
     pub const ROBOT_ID: &str = "robot-id";
     pub const SEVERITY: &str = "severity";
     pub const EVENT_UID: &str = "event-uid";
+    /// Detached finding signature (contract 1.2, optional; see [`crate::sig`]).
+    /// Not emitted by [`super::headers`]; added by [`crate::sig::sign_record`].
+    pub const FINDING_SIG: &str = crate::sig::SIG_HEADER;
 }
 
 /// One ready-to-send record.

@@ -12,8 +12,14 @@
 //! * [`validate`](mod@validate) — strict validator for outgoing and replayed findings.
 //! * [`kafka`] — record key, headers, partitioning by robot id.
 //! * [`hash`] — std-only SHA-256 and Kafka murmur2 (vector-tested).
+//! * [`sig`] — detached per-finding Ed25519 signatures (contract 1.2):
+//!   signed bytes = the exact record value; carried in the
+//!   `robodr-finding-sig` header; [`parse_and_validate_signed`] binds the
+//!   key to the unit the finding names.
 //!
-//! The crate is pure: no I/O, no clock, no network. Given the same inputs it
+//! The crate is pure: no I/O, no clock, no network (signing goes through the
+//! `robodr-blackbox` [`Signer`](robodr_blackbox::Signer) /
+//! [`Verifier`](robodr_blackbox::Verifier) traits). Given the same inputs it
 //! produces byte-identical JSON. The JSON Schema in
 //! `docs/contracts/robot-edr-finding.schema.json` and the example in
 //! `docs/contracts/robot-edr-finding.example.json` are checked against the
@@ -28,6 +34,7 @@ pub mod builder;
 pub mod hash;
 pub mod kafka;
 pub mod model;
+pub mod sig;
 pub mod taint;
 pub mod validate;
 
@@ -37,5 +44,10 @@ pub use builder::{
 };
 pub use kafka::{dedup_key, headers, partition_for, record, record_key, to_json, Record};
 pub use model::*;
+pub use sig::{
+    parse_and_validate_signed, record_signed, sign_record, sign_value, signature_header,
+    verify_record, FindingSignature, ReplayKey, SignatureError, SignaturePolicy, SignatureStatus,
+    VerifiedFinding, VerifierByUnit, SIG_HEADER,
+};
 pub use taint::{Charset, Provenance, Tainted, TAINT_LABEL};
 pub use validate::{parse_and_validate, validate, validate_for_emit, ValidationError};
