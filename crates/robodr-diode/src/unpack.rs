@@ -117,8 +117,25 @@ pub const QUARANTINE_ENTRY: &str = "entry";
 /// Name of the reason file inside each `quarantine/<unique>/`.
 pub const REASON_FILE: &str = "reason.json";
 const READ_CHUNK: usize = 64 * 1024;
-/// Prefix of the temp files parity repair writes inside an inbox entry.
+/// Prefix of the temp files parity repair writes inside an inbox entry
+/// (`.fec-<pid>-<nonce>-<n>.tmp`: unique per repair, never derived from a
+/// file name, so a name planted in the entry cannot block a repair).
 const REPAIR_TMP_PREFIX: &str = ".fec-";
+
+/// A repair temp name no earlier repair (or planted entry) can hold.
+fn repair_tmp_name(n: usize) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    format!(
+        "{REPAIR_TMP_PREFIX}{}-{nanos:x}-{}-{n}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
 
 /// Verifiers for batch manifests, each bound to the unit it may sign for;
 /// black-box bundle verifiers, each bound to a unit; and per-unit allow-lists
@@ -1239,11 +1256,18 @@ impl Importer {
         if m.total_size() > self.cfg.max_batch_bytes {
             return Ok(Ok(Vec::new())); // verify_files reports batch_too_large
         }
-        // Temp files of an interrupted earlier repair.
-        for f in &m.files {
-            let t = c.path.join(format!("{REPAIR_TMP_PREFIX}{}", f.name));
-            if fs::symlink_metadata(&t).is_ok_and(|md| !md.is_dir()) {
-                fs::remove_file(&t)?;
+        // Temp files of an interrupted earlier repair: regular files and
+        // symlinks with the prefix are removed; anything else (a planted
+        // directory) is left for step 3 to quarantine (unexpected file).
+        if let Ok(rd) = fs::read_dir(&c.path) {
+            for e in rd.flatten() {
+                let stale = e
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with(REPAIR_TMP_PREFIX));
+                if stale && fs::symlink_metadata(e.path()).is_ok_and(|md| !md.is_dir()) {
+                    let _ = fs::remove_file(e.path());
+                }
             }
         }
         let mut erased = Vec::new();
@@ -1287,17 +1311,27 @@ impl Importer {
                 Err(e) => return data_read_error(f, e).map(|r| r.map(|x| match x {})),
             }
         }
-        let tmps: Vec<PathBuf> = erased
-            .iter()
-            .map(|&p| {
-                c.path
-                    .join(format!("{REPAIR_TMP_PREFIX}{}", m.files[p].name))
-            })
+        let tmps: Vec<PathBuf> = (0..erased.len())
+            .map(|i| c.path.join(repair_tmp_name(i)))
             .collect();
+        let mut created = 0usize;
         let res = (|| -> Checked<()> {
             let mut outs = Vec::with_capacity(erased.len());
-            for t in &tmps {
-                outs.push((BufWriter::new(fsutil::create_new(t)?), Sha256::new()));
+            for (t, &pos) in tmps.iter().zip(&erased) {
+                // A temp that cannot be created (name taken, read-only
+                // entry, ...) fails this batch's repair: quarantined, never
+                // an error that would leave the batch stuck in the inbox.
+                match fsutil::create_new(t) {
+                    Ok(f) => {
+                        created += 1;
+                        outs.push((BufWriter::new(f), Sha256::new()));
+                    }
+                    Err(_) => {
+                        return Ok(Err(Q::FecFailed {
+                            name: m.files[pos].name.clone(),
+                        }))
+                    }
+                }
             }
             let mut inbufs = vec![vec![0u8; READ_CHUNK]; readers.len()];
             let mut outbufs = vec![vec![0u8; READ_CHUNK]; erased.len()];
@@ -1354,7 +1388,9 @@ impl Importer {
             Ok(Ok(()))
         })();
         if !matches!(res, Ok(Ok(()))) {
-            for t in &tmps {
+            // Only the temps this repair created (never someone else's
+            // entry that happens to share a name).
+            for t in tmps.iter().take(created) {
                 let _ = fs::remove_file(t);
             }
         }

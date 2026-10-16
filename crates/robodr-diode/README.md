@@ -80,8 +80,10 @@ wrong size or of the wrong SHA-256 is an erasure; **any `M` erasures (data
 or parity files) are rebuilt**, each rebuilt file is accepted only if its
 size and SHA-256 equal the manifest's (and only after the files it was
 rebuilt from re-verify), it replaces the damaged one in the inbox entry
-(temp `.fec-<name>` + rename), and then the batch is verified exactly as an
-undamaged one. The report lists rebuilt files under `accepted[].repaired`.
+(unique temp `.fec-<pid>-<nonce>-<n>.tmp` + rename; a repair that cannot
+create its temp quarantines the batch as `fec_failed` instead of retrying
+forever, and a planted `.fec-*` directory is quarantined as an unexpected
+file), and then the batch is verified exactly as an undamaged one. The report lists rebuilt files under `accepted[].repaired`.
 More than `M` erasures → quarantine `fec_unrecoverable` (`damaged` lists the
 files); a rebuild that misses the manifest hash (impossible unless files
 change during repair, or the producer wrote parity that does not match its

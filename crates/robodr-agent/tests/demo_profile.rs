@@ -40,6 +40,7 @@ fn demo_profile() -> Profile {
             locked_by: "RoboDR demo (synthetic)".into(),
             locked_at: 1_767_225_600,
             parent_digest: None,
+            attestation: None,
         }),
         ..Default::default()
     };

@@ -15,7 +15,7 @@
 //! expect_platform = "ugv-x1"                        # optional
 //! expect_unit_id = "ugv-007"                        # optional
 //! trust_roots = "/etc/robodr/trust-roots.json"      # robodr-trust-roots/v1
-//! revocation_list = "/etc/robodr/revocations.json"  # robodr-profile-revocations/v1
+//! revocation_list = "/etc/robodr/revocations.json"  # robodr-profile-revocations/v2
 //! revocation_policy = "optional"                    # or "required"
 //! # allow_rollback = "sha256:<digest of the one older file to accept>"
 //! ```
@@ -97,7 +97,7 @@ pub struct ProfileTrustConfig {
     /// and a trust-file `min_profile_version` (disjoint from the profile
     /// keys).
     pub trust_roots: Option<PathBuf>,
-    /// `robodr-profile-revocations/v1` file (needs `trust_roots`).
+    /// `robodr-profile-revocations/v2` file (needs `trust_roots`).
     pub revocation_list: Option<PathBuf>,
     /// What a missing `revocation_list` file means: `"optional"` (default)
     /// or `"required"` (every locked profile refused).
@@ -360,6 +360,7 @@ mod tests {
                 locked_by: "op".into(),
                 locked_at: 1_790_000_000,
                 parent_digest: None,
+                attestation: None,
             }),
             ..Default::default()
         };
@@ -596,15 +597,40 @@ mod tests {
         .unwrap();
         t.trust_roots = Some(r);
         t.revocation_list = Some(dir.join("revocations.json"));
+        // With roots the trust file must be root-signed; these hand-made
+        // profiles carry no operator attestation, so the file opts out.
+        let tf = robodr_commission::trust::trust_file_text_with(
+            &[key().verifying_key()],
+            &robodr_commission::trust::TrustFileOptions {
+                require_attestation: Some(false),
+                ..Default::default()
+            },
+        );
+        let tp = t.trusted_keys.clone().unwrap();
+        std::fs::write(&tp, &tf).unwrap();
+        let sig = ProfileSignature::create_for(
+            robodr_commission::trust::SigKind::TrustFile,
+            tf.as_bytes(),
+            &root(),
+        )
+        .unwrap();
+        std::fs::write(sig_path_for(&tp), sig.to_text()).unwrap();
         t
     }
 
+    /// A list for "ugv-x1"; `keys` name keys ("oem" is `key()`), revoked
+    /// by fingerprint.
     fn write_list(t: &ProfileTrustConfig, serial: u64, digests: &[&str], keys: &[&str]) {
+        let fp = |k: &str| match k {
+            "oem" => robodr_commission::trust::key_fingerprint(key().verifying_key().as_bytes()),
+            other => file_digest(other.as_bytes()),
+        };
         let l = robodr_commission::trust::RevocationList::create(
             serial,
             1,
+            "ugv-x1",
             digests.iter().map(|s| s.to_string()),
-            keys.iter().map(|s| s.to_string()),
+            keys.iter().map(|k| fp(k)),
             &root(),
         )
         .unwrap();
@@ -632,7 +658,13 @@ mod tests {
         assert_eq!(p.status_findings().len(), 1);
         assert!(p.status_message().unwrap().contains("revoked"));
         write_list(&t, 2, &[], &["oem"]);
-        refused_because(status(&v1, &t), "signing key \"oem\" is revoked");
+        refused_because(status(&v1, &t), "signing key \"oem\" (sha256:");
+        // The trust file without its root signature: refused.
+        let tp = t.trusted_keys.clone().unwrap();
+        let sig = std::fs::read(sig_path_for(&tp)).unwrap();
+        std::fs::remove_file(sig_path_for(&tp)).unwrap();
+        refused_because(status(&v1, &t), "must be signed");
+        std::fs::write(sig_path_for(&tp), sig).unwrap();
         // A clean newer list: enforced, serial recorded.
         write_list(&t, 3, &[], &[]);
         assert_eq!(status(&v1, &t), ProfileStatus::Enforcing);

@@ -61,11 +61,11 @@ OPTIONS:
                            accept this exact (older) profile file once
     --expect-platform <p>  the profile's metadata.platform must be <p>
     --expect-unit <id>     the profile's metadata.unit_id must be null or <id>
-    --trust-roots <file>   trust roots (robodr-trust-roots/v1): verify the
-                           trust file's signed min_profile_version floor and
-                           the revocation list
+    --trust-roots <file>   trust roots (robodr-trust-roots/v1): the trust
+                           file must then be root-signed (floor, operators)
+                           and the revocation list is verified
     --revocations <file>   signed profile revocation list
-                           (robodr-profile-revocations/v1; needs --trust-roots)
+                           (robodr-profile-revocations/v2; needs --trust-roots)
     --revocations-required refuse every locked profile while the list file
                            is missing (default: optional until one was
                            accepted)

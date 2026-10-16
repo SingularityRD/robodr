@@ -373,6 +373,30 @@ fn repair_does_not_touch_symlinks_and_cleans_stale_temps() {
     assert_eq!(r.accepted[0].repaired, vec!["bundle-0001.rbbx".to_string()]);
 }
 
+/// Regression: a directory planted at the old, predictable repair temp
+/// name (`.fec-<file>`) made every repair fail with an I/O error, so the
+/// batch stuck in the inbox for good. Temps now have unique names; the
+/// batch is repaired, and the planted entry gets it quarantined (an
+/// unexpected file), once, instead of an error on every run.
+#[test]
+fn planted_fec_directory_cannot_block_repair() {
+    let pb = ParityBatch::new("par-plant", 2);
+    let high = Site::new("par-plant-hi");
+    let dir = high.inbox().join(&pb.name);
+    copy_dir(&pb.site.outbox.join(&pb.name), &dir);
+    fs::create_dir(dir.join(".fec-bundle-0001.rbbx")).unwrap();
+    fs::write(dir.join(".fec-bundle-0001.rbbx").join("x"), b"x").unwrap();
+    fs::remove_file(dir.join("bundle-0001.rbbx")).unwrap();
+    let r = high.importer().run(NOW).unwrap();
+    assert_eq!(codes(&r), vec!["unexpected_file"], "{r:?}");
+    assert!(!dir.exists(), "moved out of the inbox, not stuck");
+    // Nothing left to retry.
+    let r = high.importer().run(NOW).unwrap();
+    assert!(r.quarantined.is_empty() && r.accepted.is_empty(), "{r:?}");
+    let q = high.importer().run(NOW).unwrap();
+    assert!(q.is_clean(), "{q:?}");
+}
+
 /// A damaged re-delivery of an already accepted batch is repaired and
 /// filed as a duplicate, not quarantined.
 #[test]

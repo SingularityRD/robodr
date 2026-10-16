@@ -41,15 +41,15 @@ use robodr_commission::ops::{
 };
 use robodr_commission::profile_file::{check_destination, read_regular_file, MAX_PROFILE_BYTES};
 use robodr_commission::signoff::{
-    required_items, satisfies, sha256_hex, signoff_file_digest, signoff_sig_path, OperatorTrust,
-    SignoffSignatures, MAX_OPERATORS_BYTES,
+    draft_digest, required_items, satisfies, sha256_hex, signoff_file_digest, signoff_sig_path,
+    OperatorTrust, SignoffSignatures, MAX_OPERATORS_BYTES,
 };
 use robodr_commission::trust::{
-    evaluate_profile_trust, file_digest, load_revocation_list, load_signing_key, load_state,
-    load_trust_keys, load_trust_roots, new_signing_key, sig_path_for, trust_file_text,
-    trust_keys_text, trust_roots_text, validate_rollback_flag, verify_profile_file,
-    verifying_keys_from_public_files, ProfileSignature, RevocationList, RevocationPolicy, SigKind,
-    TrustInputs, TrustPolicy,
+    attestation_for, evaluate_profile_trust, file_digest, key_fingerprint, load_revocation_list,
+    load_signing_key, load_state, load_trust_keys, load_trust_roots, new_signing_key, sig_path_for,
+    trust_file_text_with, trust_keys_text, trust_roots_text, validate_rollback_flag,
+    verify_attestation, verify_profile_file, verifying_keys_from_public_files, ProfileSignature,
+    RevocationList, RevocationPolicy, SigKind, TrustFileOptions, TrustInputs, TrustPolicy,
 };
 use robodr_commission::{
     diff, merge_profiles_with_caps, parse_profile_text, sealed_text, to_json, write_files_atomic,
@@ -73,7 +73,7 @@ USAGE:
                           [--outlier-ratio 3]
                           [--accept-participant GUID]... [--motion-topic /T]...
                           [--discovery-server PREFIX|PREFIX@IP|IP]...
-                          [--trusted-discovery-server PREFIX|PREFIX@IP|IP]...
+                          [--trusted-discovery-server PREFIX@IP|IP]...
                           [--learn-readers]
                           --out profile.json [--signoff signoff.json]
                           [--report report.json] [--quiet] [--force]
@@ -84,7 +84,8 @@ USAGE:
                           [--sign-key signing.key] [--trusted-keys trust.json]
                           [--locked-at UNIX_SECS]
                           [--hard-cap-linear 10] [--hard-cap-joint 10] [--force]
-  robodr-commission sign    --profile locked.json --sign-key signing.key [--force]
+  robodr-commission sign    --profile locked.json --sign-key signing.key
+                          [--operators operators.json] [--allow-unattested] [--force]
   robodr-commission verify-profile --profile locked.json --trusted-keys trust.json
                           [--expect-platform P] [--expect-unit U]
                           [--state profile-state.json] [--allow-rollback sha256:HEX]
@@ -92,9 +93,12 @@ USAGE:
                            [--revocations-required]]] [--json]
   robodr-commission keygen  --out signing.key --trust-out trust.json [--key-id ID] [--roots]
   robodr-commission trust-keys --out trust.json --pub KEY.pub [--pub KEY2.pub]... [--force]
-                          [--roots | [--min-profile-version N] [--sign-key ROOT.key]]
-  robodr-commission revoke  --sign-key ROOT.key --out revocations.json
-                          [--digest sha256:HEX]... [--revoke-profile FILE]... [--key-id ID]...
+                          [--roots | [--min-profile-version N] [--sign-key ROOT.key]
+                           [--operators operators.json]
+                           [--require-attestation | --no-require-attestation]]
+  robodr-commission revoke  --sign-key ROOT.key --out revocations.json --platform P
+                          [--digest sha256:HEX]... [--revoke-profile FILE]...
+                          [--revoke-key KEY.pub]... [--key-fingerprint sha256:HEX]...
                           [--base previous.json --trust-roots roots.json]
                           [--serial N] [--issued-at UNIX_SECS] [--force]
   robodr-commission verify-revocations --list revocations.json --trust-roots roots.json
@@ -132,7 +136,8 @@ USAGE:
   configured discovery server: --discovery-server (known: relayed copies of
   the owner's own announcements are not flagged) or
   --trusted-discovery-server (relayed endpoints of accepted participants
-  are learned).
+  are learned; a trusted server must be pinned by IP (PREFIX@IP or IP):
+  a GUID prefix alone is forgeable by any host).
   learn writes a sign-off list (default <out>.signoff.json) and, last, the
   manifest <out>.manifest.json binding draft, list and report; lock and
   check refuse a draft whose companion files do not match it (lock
@@ -152,21 +157,30 @@ USAGE:
   the parent's, and the parent's file digest is recorded (rollback lineage).
   --sign-key writes <out>.sig (Ed25519 over the exact sealed bytes) with
   the profile; loaders refuse a locked profile without a valid signature
-  from a trusted key. keygen makes an Ed25519 key file (mode 0600), its
+  from a trusted key. lock also embeds the signed sign-off and its operator
+  signatures in metadata.attestation, which loaders verify against the
+  trust file's operators and motion_quorum (two-person rule on the unit;
+  required by default with trust roots). sign refuses a profile without
+  that attestation unless --allow-unattested (--operators: verify it). keygen makes an Ed25519 key file (mode 0600), its
   public key file <out>.pub and a trust file holding the public key. Key
   files are robodr-blackbox's (robodr-blackbox-key/v2): a key from
   `robodr-blackbox keygen` signs profiles too. trust-keys builds a trust
   file from Ed25519 .pub files (secret key files are refused). verify-profile is read-only (exit 0
   trusted, 1 refused).
   Trust roots (keygen/trust-keys --roots: robodr-trust-roots/v1) sign the
-  revocation list and a trust file's min_profile_version; they must differ
-  from every profile signing key. trust-keys --min-profile-version N
-  --sign-key ROOT.key writes trust.json plus trust.json.sig (a floor no
-  loader accepts unsigned, not overridable by allow_rollback). revoke signs
-  a robodr-profile-revocations/v1 list of revoked profile digests and
-  signing key ids; --base carries over a previous list (verified under
-  --trust-roots) and the serial defaults to its serial + 1 (else 1); a
-  loader refuses a list older than the last accepted one.
+  revocation list and the trust file; they must differ from every profile
+  signing key and operator key. With trust roots configured a loader
+  refuses an unsigned trust file. trust-keys --sign-key ROOT.key writes
+  trust.json plus trust.json.sig; --min-profile-version N adds a floor (no
+  loader accepts it unsigned, not overridable by allow_rollback, never
+  lowered by an older trust file); --operators embeds the operators list
+  (who may attest; required with roots unless --no-require-attestation).
+  revoke signs a robodr-profile-revocations/v2 list for one --platform of
+  revoked profile digests and signing keys by public-key fingerprint
+  (--revoke-key KEY.pub or --key-fingerprint; keygen prints it); --base
+  carries over a previous list (verified under --trust-roots) and the
+  serial defaults to its serial + 1 (else 1); a loader refuses a list
+  older than the last accepted one or for another platform.
   verify-revocations checks a list (exit 0 valid and not older than
   --state, 1 refused). migrate-legacy re-issues a locked profile from
   before metadata existed (content unchanged, its digest recorded as
@@ -770,6 +784,7 @@ fn lock_metadata(a: &Args, draft: &Profile, operator: &str) -> Result<ProfileMet
         locked_by: operator.trim().to_string(),
         locked_at: locked_at(a)?,
         parent_digest,
+        attestation: None,
     };
     let errs = meta.validate();
     if !errs.is_empty() {
@@ -865,7 +880,16 @@ fn cmd_lock(argv: &[String]) -> Outcome {
     };
     match result {
         Ok((mut locked, signoff)) => {
-            locked.metadata = Some(lock_metadata(&a, &parsed, &signoff.operator)?);
+            let mut meta = lock_metadata(&a, &parsed, &signoff.operator)?;
+            let sigs = sigs.as_ref().ok_or_else(|| {
+                "internal: lock succeeded without operator signatures".to_string()
+            })?;
+            meta.attestation = Some(attestation_for(&signoff_text, sigs));
+            locked.metadata = Some(meta);
+            // The unit will verify exactly this; never write a profile that
+            // would fail it.
+            verify_attestation(&locked, &trust)
+                .map_err(|e| format!("internal: the embedded attestation does not verify: {e}"))?;
             if let Err(errs) = locked.validate() {
                 let list: Vec<String> = errs.iter().map(ToString::to_string).collect();
                 return Err(format!("locked profile fails validation: {}", list.join("; ")).into());
@@ -875,7 +899,7 @@ fn cmd_lock(argv: &[String]) -> Outcome {
             let m = locked.metadata.as_ref().expect("set above");
             eprintln!(
                 "locked profile {} -> {out} (sealed; profile_version {}, platform {}; signed off \
-                 by {:?}; digest {})",
+                 by {:?}, operator signatures embedded as attestation; digest {})",
                 locked.model,
                 m.profile_version,
                 m.platform,
@@ -905,25 +929,58 @@ fn cmd_lock(argv: &[String]) -> Outcome {
 }
 
 fn cmd_sign(argv: &[String]) -> Outcome {
-    let a = Args::parse(argv, &["profile", "sign-key"], &["force"])?;
+    let a = Args::parse(
+        argv,
+        &["profile", "sign-key", "operators"],
+        &["force", "allow-unattested"],
+    )?;
     if let Some(p) = a.positionals.first() {
         return Err(format!("unexpected argument {p:?}").into());
     }
     let profile = a.required("profile")?;
     let key_path = a.required("sign-key")?;
+    let operators = a.one("operators")?;
     let sig_out = sig_path_for(Path::new(profile)).display().to_string();
-    distinct_paths(&[sig_out.as_str()], &[profile, key_path])?;
+    let mut inputs = vec![profile, key_path];
+    inputs.extend(operators);
+    distinct_paths(&[sig_out.as_str()], &inputs)?;
     let key = load_signing_key(Path::new(key_path))?;
     let text = read_text(profile, MAX_PROFILE_BYTES)?;
     let p = parse_profile_text(&text).map_err(|e| format!("{profile}: {e}"))?;
     if !p.locked {
         return Err(format!("{profile}: not locked (drafts are not signed)").into());
     }
-    if p.metadata.is_none() {
+    let Some(meta) = p.metadata.as_ref() else {
         return Err(format!(
             "{profile}: legacy locked profile without metadata; use `migrate-legacy`"
         )
         .into());
+    };
+    // Never put a profile key's signature on a profile without operator
+    // sign-off evidence, unless explicitly asked (units with trust roots
+    // refuse it anyway).
+    match (&meta.attestation, a.switch("allow-unattested")) {
+        (None, false) => {
+            return Err(format!(
+                "{profile}: carries no operator sign-off attestation (not produced by `lock`): \
+                 refusing to sign; units that require attestation (the default with trust \
+                 roots) refuse it. Pass --allow-unattested to sign it anyway"
+            )
+            .into())
+        }
+        (None, true) => {
+            eprintln!("warning: {profile} is unattested: units that require attestation refuse it")
+        }
+        (Some(_), _) => {}
+    }
+    if let (Some(_), Some(ops)) = (&meta.attestation, operators) {
+        let trust = OperatorTrust::load(Path::new(ops))?;
+        let s = verify_attestation(&p, &trust)
+            .map_err(|e| format!("{profile}: refusing to sign: {e}"))?;
+        eprintln!(
+            "attestation verified against {ops}: operator {:?}, signers {:?}",
+            s.operator, s.signers
+        );
     }
     let sig = ProfileSignature::create(text.as_bytes(), &key).map_err(|e| e.to_string())?;
     write_file(&sig_out, &sig.to_text(), a.switch("force"))?;
@@ -945,6 +1002,8 @@ struct VerifyReport {
     platform: Option<String>,
     unit_id: Option<String>,
     signed_by: Option<String>,
+    signer_fingerprint: Option<String>,
+    attested_by: Option<Vec<String>>,
     rollback: Option<String>,
     revocation_serial: Option<u64>,
     refused: Option<String>,
@@ -1012,6 +1071,8 @@ fn cmd_verify_profile(argv: &[String]) -> Outcome {
         platform: None,
         unit_id: None,
         signed_by: None,
+        signer_fingerprint: None,
+        attested_by: None,
         rollback: None,
         revocation_serial: None,
         refused: None,
@@ -1026,6 +1087,11 @@ fn cmd_verify_profile(argv: &[String]) -> Outcome {
             r.platform = m.map(|m| m.platform.clone());
             r.unit_id = m.and_then(|m| m.unit_id.clone());
             r.signed_by = v.signed_by.clone();
+            r.signer_fingerprint = v.signer_fingerprint.clone();
+            r.attested_by = v
+                .attestation
+                .as_ref()
+                .map(|s| s.signers.iter().cloned().collect());
             r.rollback = acc.decision.map(|d| format!("{d:?}"));
             r.revocation_serial = acc.record.as_ref().and_then(|s| s.revocation_serial);
             r.trusted = v.profile.locked;
@@ -1040,12 +1106,16 @@ fn cmd_verify_profile(argv: &[String]) -> Outcome {
     } else if r.trusted {
         println!(
             "TRUSTED {path}: model {:?}, profile_version {}, platform {:?}, unit {:?}, signed by \
-             {:?}, digest {}{}{}",
+             {:?}{}, digest {}{}{}",
             r.model.as_deref().unwrap_or_default(),
             r.profile_version.unwrap_or_default(),
             r.platform.as_deref().unwrap_or_default(),
             r.unit_id,
             r.signed_by.as_deref().unwrap_or_default(),
+            r.signer_fingerprint
+                .as_deref()
+                .map(|f| format!(" ({f})"))
+                .unwrap_or_default(),
             r.digest.as_deref().unwrap_or_default(),
             r.rollback
                 .as_ref()
@@ -1055,6 +1125,9 @@ fn cmd_verify_profile(argv: &[String]) -> Outcome {
                 .map(|n| format!(", revocation list serial {n}"))
                 .unwrap_or_default()
         );
+        if let Some(ops) = &r.attested_by {
+            println!("  attested by operators {ops:?}");
+        }
     } else {
         println!(
             "REFUSED {path}: {}",
@@ -1082,6 +1155,7 @@ fn cmd_keygen(argv: &[String]) -> Outcome {
     distinct_paths(&[out, pub_out.as_str(), trust_out], &[])?;
     precheck_outputs(&[out, pub_out.as_str(), trust_out], false)?;
     let (kf, vk) = new_signing_key(a.one("key-id")?)?;
+    let fingerprint = key_fingerprint(vk.as_bytes());
     let public = kf.to_public().map_err(|e| e.to_string())?;
     kf.write_new(Path::new(out))
         .map_err(|e| format!("{out}: {e}"))?;
@@ -1101,14 +1175,15 @@ fn cmd_keygen(argv: &[String]) -> Outcome {
         return Err(e.into());
     }
     eprintln!(
-        "wrote Ed25519 {} key {out} (mode 0600, key id {}), its public key {pub_out} and {} \
-         {trust_out}; keep the key off the robot, install the {} on it",
+        "wrote Ed25519 {} key {out} (mode 0600, key id {}, fingerprint {}), its public key \
+         {pub_out} and {} {trust_out}; keep the key off the robot, install the {} on it",
         if roots {
             "trust-root"
         } else {
             "profile signing"
         },
         kf.key_id,
+        fingerprint,
         if roots {
             "trust-roots file"
         } else {
@@ -1122,8 +1197,13 @@ fn cmd_keygen(argv: &[String]) -> Outcome {
 fn cmd_trust_keys(argv: &[String]) -> Outcome {
     let a = Args::parse(
         argv,
-        &["out", "pub", "min-profile-version", "sign-key"],
-        &["force", "roots"],
+        &["out", "pub", "min-profile-version", "sign-key", "operators"],
+        &[
+            "force",
+            "roots",
+            "require-attestation",
+            "no-require-attestation",
+        ],
     )?;
     if let Some(p) = a.positionals.first() {
         return Err(format!("unexpected argument {p:?}").into());
@@ -1135,11 +1215,32 @@ fn cmd_trust_keys(argv: &[String]) -> Outcome {
     }
     let floor = a.u64_opt("min-profile-version")?;
     let sign_key = a.one("sign-key")?;
+    let operators_path = a.one("operators")?;
     let roots = a.switch("roots");
-    if roots && (floor.is_some() || sign_key.is_some()) {
+    let require_attestation = match (
+        a.switch("require-attestation"),
+        a.switch("no-require-attestation"),
+    ) {
+        (true, true) => {
+            return Err(
+                "--require-attestation and --no-require-attestation are exclusive"
+                    .to_string()
+                    .into(),
+            )
+        }
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        (false, false) => None,
+    };
+    if roots
+        && (floor.is_some()
+            || sign_key.is_some()
+            || operators_path.is_some()
+            || require_attestation.is_some())
+    {
         return Err(
-            "--roots writes a trust-roots file; --min-profile-version / --sign-key belong to a \
-             profile trust file"
+            "--roots writes a trust-roots file; --min-profile-version / --sign-key / --operators \
+             / --(no-)require-attestation belong to a profile trust file"
                 .to_string()
                 .into(),
         );
@@ -1158,6 +1259,7 @@ fn cmd_trust_keys(argv: &[String]) -> Outcome {
     let sig_out = sig_path_for(Path::new(out)).display().to_string();
     let mut inputs = pubs.clone();
     inputs.extend(sign_key);
+    inputs.extend(operators_path);
     let outputs: Vec<&str> = if sign_key.is_some() {
         vec![out, sig_out.as_str()]
     } else {
@@ -1175,13 +1277,46 @@ fn cmd_trust_keys(argv: &[String]) -> Outcome {
         );
         return Ok(());
     }
-    let text = trust_file_text(&keys, floor);
+    let operators = operators_path
+        .map(|p| OperatorTrust::load(Path::new(p)))
+        .transpose()?;
+    if require_attestation == Some(true) && operators.is_none() {
+        return Err("--require-attestation needs --operators operators.json"
+            .to_string()
+            .into());
+    }
+    let text = trust_file_text_with(
+        &keys,
+        &TrustFileOptions {
+            min_profile_version: floor,
+            require_attestation,
+            operators: operators.as_ref(),
+        },
+    );
+    // Check what a unit will check (without roots here: the root signature
+    // is checked below by construction).
+    if let Err(e) = robodr_commission::trust::parse_trust_file(&text, None, "(new)", None) {
+        let e = e.to_string();
+        if !(floor.is_some() && e.contains("min_profile_version is set")) {
+            return Err(e.into());
+        }
+    }
     match sign_key {
         None => {
             write_file(out, &text, a.switch("force"))?;
             eprintln!(
-                "wrote trust file {out} with {} key(s); install it on the robot",
-                keys.len()
+                "wrote trust file {out} with {} key(s){}; install it on the robot. It is NOT \
+                 signed: a unit with trust roots configured refuses it (sign it with --sign-key \
+                 ROOT.key)",
+                keys.len(),
+                operators
+                    .as_ref()
+                    .map(|o| format!(
+                        ", {} operator(s), motion_quorum {}",
+                        o.operators().len(),
+                        o.motion_quorum()
+                    ))
+                    .unwrap_or_default()
             );
         }
         Some(k) => {
@@ -1192,6 +1327,12 @@ fn cmd_trust_keys(argv: &[String]) -> Outcome {
                 )
                 .into());
             }
+            if operators
+                .as_ref()
+                .is_some_and(|o| o.public_keys().any(|p| p.as_bytes() == &root.public_key()))
+            {
+                return Err(format!("{k}: the trust root must not be an operator key").into());
+            }
             let sig = ProfileSignature::create_for(SigKind::TrustFile, text.as_bytes(), &root)
                 .map_err(|e| e.to_string())?;
             write_files(
@@ -1199,14 +1340,29 @@ fn cmd_trust_keys(argv: &[String]) -> Outcome {
                 a.switch("force"),
             )?;
             eprintln!(
-                "wrote trust file {out} with {} key(s){} and its root signature {sig_out} (by \
+                "wrote trust file {out} with {} key(s){}{} and its root signature {sig_out} (by \
                  {}); install both on the robot",
                 keys.len(),
                 floor
                     .map(|f| format!(", min_profile_version {f}"))
                     .unwrap_or_default(),
+                operators
+                    .as_ref()
+                    .map(|o| format!(
+                        ", {} operator(s), motion_quorum {}",
+                        o.operators().len(),
+                        o.motion_quorum()
+                    ))
+                    .unwrap_or_default(),
                 sig.key_id
             );
+            if operators.is_none() && require_attestation != Some(false) {
+                eprintln!(
+                    "warning: no --operators: with trust roots configured a unit requires \
+                     operator attestation by default and refuses this trust file; add \
+                     --operators operators.json (or --no-require-attestation)"
+                );
+            }
         }
     }
     Ok(())
@@ -1220,7 +1376,9 @@ fn cmd_revoke(argv: &[String]) -> Outcome {
             "out",
             "digest",
             "revoke-profile",
-            "key-id",
+            "revoke-key",
+            "key-fingerprint",
+            "platform",
             "base",
             "trust-roots",
             "serial",
@@ -1240,6 +1398,8 @@ fn cmd_revoke(argv: &[String]) -> Outcome {
     inputs.extend(roots_path);
     let profiles: Vec<&str> = a.all("revoke-profile").iter().map(String::as_str).collect();
     inputs.extend(profiles.iter().copied());
+    let key_pubs: Vec<&str> = a.all("revoke-key").iter().map(String::as_str).collect();
+    inputs.extend(key_pubs.iter().copied());
     distinct_paths(&[out], &inputs)?;
     precheck_outputs(&[out], a.switch("force"))?;
     let root = load_signing_key(Path::new(key_path))?;
@@ -1279,9 +1439,25 @@ fn cmd_revoke(argv: &[String]) -> Outcome {
         .as_ref()
         .map(|l| l.revoked_digests.clone())
         .unwrap_or_default();
-    let mut key_ids: Vec<String> = base
+    let platform = match (a.one("platform")?, &base) {
+        (Some(p), Some(b)) if p != b.platform => {
+            return Err(format!(
+                "--platform {p:?} differs from the base list's platform {:?}",
+                b.platform
+            )
+            .into())
+        }
+        (Some(p), _) => p.to_string(),
+        (None, Some(b)) => b.platform.clone(),
+        (None, None) => {
+            return Err("--platform is required (the list is bound to one platform)"
+                .to_string()
+                .into())
+        }
+    };
+    let mut keys: Vec<String> = base
         .as_ref()
-        .map(|l| l.revoked_key_ids.clone())
+        .map(|l| l.revoked_keys.clone())
         .unwrap_or_default();
     for d in a.all("digest") {
         validate_rollback_flag(d).map_err(|_| {
@@ -1293,7 +1469,19 @@ fn cmd_revoke(argv: &[String]) -> Outcome {
         let bytes = std::fs::read(p).map_err(|e| format!("{p}: {e}"))?;
         digests.push(file_digest(&bytes));
     }
-    key_ids.extend(a.all("key-id").iter().cloned());
+    let pub_paths: Vec<&Path> = key_pubs.iter().map(|p| Path::new(*p)).collect();
+    for vk in verifying_keys_from_public_files(&pub_paths)? {
+        keys.push(key_fingerprint(vk.as_bytes()));
+    }
+    for f in a.all("key-fingerprint") {
+        validate_rollback_flag(f).map_err(|_| {
+            format!(
+                "--key-fingerprint {f:?} must be sha256:<64 lower-case hex> (keygen and \
+                 verify-profile print it)"
+            )
+        })?;
+        keys.push(f.clone());
+    }
     let base_serial = base.as_ref().map(|l| l.serial).unwrap_or(0);
     let serial = match a.u64_opt("serial")? {
         Some(n) if n <= base_serial => {
@@ -1311,14 +1499,16 @@ fn cmd_revoke(argv: &[String]) -> Outcome {
         Some(t) => t,
         None => now_unix()?,
     };
-    let list = RevocationList::create(serial, issued_at, digests, key_ids, &root)?;
+    let list = RevocationList::create(serial, issued_at, &platform, digests, keys, &root)?;
     write_file(out, &list.to_text(), a.switch("force"))?;
     eprintln!(
-        "wrote revocation list {out}: serial {}, {} revoked digest(s), {} revoked key id(s), \
-         signed by {}, digest {}; install it on every robot (profile_trust.revocation_list)",
+        "wrote revocation list {out}: platform {}, serial {}, {} revoked digest(s), {} revoked \
+         key(s), signed by {}, digest {}; install it on every robot of the platform \
+         (profile_trust.revocation_list)",
+        list.platform,
         list.serial,
         list.revoked_digests.len(),
-        list.revoked_key_ids.len(),
+        list.revoked_keys.len(),
         list.signature.key_id,
         list.digest()
     );
@@ -1333,8 +1523,9 @@ struct RevocationReport {
     issued_at: Option<u64>,
     digest: Option<String>,
     signed_by: Option<String>,
+    platform: Option<String>,
     revoked_digests: Vec<String>,
-    revoked_key_ids: Vec<String>,
+    revoked_keys: Vec<String>,
     accepted_serial: Option<u64>,
     refused: Option<String>,
 }
@@ -1359,8 +1550,9 @@ fn cmd_verify_revocations(argv: &[String]) -> Outcome {
         issued_at: None,
         digest: None,
         signed_by: None,
+        platform: None,
         revoked_digests: Vec::new(),
-        revoked_key_ids: Vec::new(),
+        revoked_keys: Vec::new(),
         accepted_serial: state.as_ref().and_then(|s| s.revocation_serial),
         refused: None,
     };
@@ -1372,8 +1564,9 @@ fn cmd_verify_revocations(argv: &[String]) -> Outcome {
             r.issued_at = Some(l.issued_at);
             r.digest = Some(l.digest());
             r.signed_by = Some(l.signature.key_id.clone());
+            r.platform = Some(l.platform.clone());
             r.revoked_digests = l.revoked_digests.clone();
-            r.revoked_key_ids = l.revoked_key_ids.clone();
+            r.revoked_keys = l.revoked_keys.clone();
             r.valid = true;
             let accepted = state
                 .as_ref()
@@ -1398,12 +1591,13 @@ fn cmd_verify_revocations(argv: &[String]) -> Outcome {
         print!("{}", json(&r)?);
     } else if r.valid {
         println!(
-            "VALID {path}: serial {}, issued_at {}, {} revoked digest(s), {} revoked key id(s), \
-             signed by {:?}, digest {}",
+            "VALID {path}: platform {:?}, serial {}, issued_at {}, {} revoked digest(s), {} \
+             revoked key(s), signed by {:?}, digest {}",
+            r.platform.as_deref().unwrap_or_default(),
             r.serial.unwrap_or_default(),
             r.issued_at.unwrap_or_default(),
             r.revoked_digests.len(),
-            r.revoked_key_ids.len(),
+            r.revoked_keys.len(),
             r.signed_by.as_deref().unwrap_or_default(),
             r.digest.as_deref().unwrap_or_default()
         );
@@ -1462,6 +1656,7 @@ fn cmd_migrate_legacy(argv: &[String]) -> Outcome {
         locked_by: a.required("operator")?.trim().to_string(),
         locked_at: locked_at(&a)?,
         parent_digest: Some(file_digest(text.as_bytes())),
+        attestation: None,
     };
     p.metadata = Some(meta);
     if let Err(errs) = p.validate() {
@@ -1475,6 +1670,11 @@ fn cmd_migrate_legacy(argv: &[String]) -> Outcome {
          digest {}; new digest {})",
         file_digest(text.as_bytes()),
         file_digest(out_text.as_bytes())
+    );
+    eprintln!(
+        "warning: a migrated profile carries no operator sign-off attestation: units that \
+         require attestation (the default with trust roots) refuse it; re-commission it \
+         (learn/signoff/lock) for those"
     );
     Ok(())
 }
@@ -1585,10 +1785,10 @@ fn cmd_signoff(argv: &[String]) -> Outcome {
         .is_some_and(|m| m.draft.sha256 != sha256_hex(text.as_bytes()));
     let replace_manifest = force || stale;
     precheck_outputs(&[manifest.as_str()], replace_manifest)?;
-    let mut s = Signoff::for_profile(&p);
-    // Bind to the bytes on disk (they may differ from our canonical form if
-    // the draft was edited by hand).
-    s.rebind(sha256_hex(text.as_bytes()));
+    // Bound to the draft's canonical content (`draft_digest`), not to the
+    // bytes on disk (a hand-edited draft may differ in layout): that is
+    // what the unit verifies the attestation of the locked profile against.
+    let s = Signoff::for_profile(&p);
     let list = json(&s)?;
     publish_with_manifest(
         &[(out, list.as_str())],
@@ -1654,7 +1854,9 @@ fn cmd_signoff_sign(a: &Args) -> Outcome {
     if let Some(input) = a.one("in")? {
         let draft = read_text(input, MAX_PROFILE_BYTES)?;
         let p = parse_profile_text(&draft).map_err(|e| format!("{input}: {e}"))?;
-        if so.profile_sha256 != sha256_hex(draft.as_bytes()) {
+        if so.profile_sha256 != sha256_hex(draft.as_bytes())
+            && so.profile_sha256 != draft_digest(&p)
+        {
             why.push(format!(
                 "the sign-off does not belong to {input} (profile_sha256 differs)"
             ));

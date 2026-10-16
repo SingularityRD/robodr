@@ -132,7 +132,13 @@
 //!    Trusting a server means trusting whatever it relays (as the sensor
 //!    does); prefer the known-server mode with a capture point that also
 //!    sees the participants' own announcements (on the server host or a
-//!    mirror port).
+//!    mirror port). A **trusted** server must be pinned by source IP
+//!    (`PREFIX@IP` or `IP`): the RTPS header prefix is written by the
+//!    sender, so any host could claim a prefix-only server's prefix and have
+//!    its own participants and endpoints (or endpoints it attributes to a
+//!    legitimate participant) learned as relays. A prefix-only server is
+//!    accepted as **known** only, where a relay never gets anything learned
+//!    on its own (it is at most a copy of the owner's direct announcement).
 //! 5. **Bounded memory**: every map and set has a cap (see [`Limits`]);
 //!    entries past a cap are dropped (fail-closed: they later deviate),
 //!    counted, and turned into a `capacity_exceeded` sign-off item. Motion
@@ -332,7 +338,8 @@ pub struct DiscoveryServer {
     pub ip: Option<std::net::IpAddr>,
     /// Trusted: relayed endpoints are learned for accepted owners without a
     /// direct announcement, and relayed participant announcements count
-    /// for the gate.
+    /// for the gate. A trusted server must have an `ip` (see
+    /// [`DiscoveryServer::parse`]).
     pub trusted: bool,
 }
 
@@ -341,7 +348,10 @@ fn canonical_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
 }
 
 impl DiscoveryServer {
-    /// Parse `PREFIX`, `PREFIX@IP`, `@IP` or a bare `IP`.
+    /// Parse `PREFIX`, `PREFIX@IP`, `@IP` or a bare `IP`. A trusted server
+    /// must include the IP: `PREFIX` alone is refused for `trusted` (the
+    /// header prefix is sender-controlled and would let any host launder
+    /// spoofed relays); it is fine for a known server.
     pub fn parse(spec: &str, trusted: bool) -> Result<Self, ConfigError> {
         let bad = || ConfigError::InvalidDiscoveryServer(spec.chars().take(128).collect());
         let (prefix, ip) = match spec.split_once('@') {
@@ -358,6 +368,12 @@ impl DiscoveryServer {
             ip,
             trusted,
         };
+        if trusted && s.ip.is_none() && s.prefix.is_some() {
+            return Err(ConfigError::InvalidDiscoveryServer(format!(
+                "{} (a trusted discovery server must be pinned by IP: PREFIX@IP or IP)",
+                spec.chars().take(128).collect::<String>()
+            )));
+        }
         s.validate().map_err(|_| bad())?;
         Ok(s)
     }
@@ -372,6 +388,12 @@ impl DiscoveryServer {
         }
         if self.ip.is_some_and(|i| i.is_unspecified()) {
             return Err(bad());
+        }
+        if self.trusted && self.ip.is_none() {
+            return Err(ConfigError::InvalidDiscoveryServer(format!(
+                "{} (a trusted discovery server must be pinned by IP: PREFIX@IP or IP)",
+                self.label()
+            )));
         }
         Ok(())
     }
@@ -5382,11 +5404,23 @@ mod tests {
         assert!(ConfigError::InvalidDiscoveryServer("x".into())
             .to_string()
             .contains("PREFIX@IP"));
+        // A trusted server must be pinned by IP; prefix-only is refused for
+        // trusted (by parse and by validate), fine for known.
+        let e = DiscoveryServer::parse(S, true).unwrap_err();
+        assert!(e.to_string().contains("pinned by IP"), "{e}");
+        assert!(DiscoveryServer::parse(&format!("@{SIP}"), true).is_ok());
+        let mut c = cfg();
+        c.discovery_servers = vec![DiscoveryServer {
+            prefix: Some(S.into()),
+            ip: None,
+            trusted: true,
+        }];
+        assert!(c.validate().is_err());
         // A trusted match wins over a known one.
         let mut c = cfg();
         c.discovery_servers = vec![
             DiscoveryServer::parse(SIP, false).unwrap(),
-            DiscoveryServer::parse(S, true).unwrap(),
+            DiscoveryServer::parse(&format!("{S}@{SIP}"), true).unwrap(),
         ];
         assert!(c.discovery_server_for(&o(S, SIP)).unwrap().trusted);
         assert!(!c.discovery_server_for(&o(B, SIP)).unwrap().trusted);
@@ -5554,5 +5588,57 @@ mod tests {
             .anomalies
             .iter()
             .any(|a| a.detail.contains("relayed_endpoint_sources")));
+    }
+
+    // ------------------------------------- security review regression --
+
+    /// Regression (was a PoC): a trusted discovery server given by GUID
+    /// prefix only was matched on the RTPS header prefix alone, which any
+    /// host can put in its packets, so an intruder at an unrelated IP got
+    /// its own participant and endpoints, and endpoints it attributed to
+    /// the legitimate A, learned with no sign-off item. Now a prefix-only
+    /// trusted server is refused at configuration, the same prefix as a
+    /// *known* server launders nothing, and pinned by IP the spoofed
+    /// traffic is refused and reported.
+    #[test]
+    fn prefix_only_trusted_server_cannot_launder_spoofed_relays() {
+        const X: &str = "dddddddddddddddddddddddd";
+        const EVIL_IP: &str = "10.6.6.6";
+        let spoofed = || {
+            vec![
+                sourced(part_ip(X, EVIL_IP), 20, S, EVIL_IP),
+                sourced(writer(X, "rt/intruder_topic"), 21, S, EVIL_IP),
+                sourced(writer(A, "rt/laundered_for_a"), 22, S, EVIL_IP),
+                sourced(part_ip(X, EVIL_IP), 90, S, EVIL_IP),
+            ]
+        };
+        assert!(matches!(
+            DiscoveryServer::parse(S, true),
+            Err(ConfigError::InvalidDiscoveryServer(_))
+        ));
+        // Hand-built, bypassing parse: the learner refuses the config.
+        let bypass = LearnConfig {
+            model: "m".into(),
+            discovery_servers: vec![DiscoveryServer {
+                prefix: Some(S.into()),
+                ip: None,
+                trusted: true,
+            }],
+            ..Default::default()
+        };
+        assert!(Learner::new(bypass).is_err());
+        // The prefix as a known server: nothing of the spoofer is learned.
+        let known = DiscoveryServer::parse(S, false).unwrap();
+        let c = ds_run(vec![known], spoofed()).finish();
+        assert!(!c.profile.participants.contains(X), "intruder not accepted");
+        assert!(!c.profile.writer_topics.contains("/intruder_topic"));
+        assert!(!c.profile.writer_topics.contains("/laundered_for_a"));
+        assert!(!relay_items(&c).is_empty());
+        // Pinned by IP as trusted: the same traffic is refused and reported.
+        let pinned = DiscoveryServer::parse(&format!("{S}@{SIP}"), true).unwrap();
+        let c = ds_run(vec![pinned], spoofed()).finish();
+        assert!(!c.profile.writer_topics.contains("/intruder_topic"));
+        assert!(!c.profile.writer_topics.contains("/laundered_for_a"));
+        assert!(!relay_items(&c).is_empty());
     }
 }

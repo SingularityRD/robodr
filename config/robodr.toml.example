@@ -121,13 +121,16 @@ state_file = "/var/lib/robodr/profile-state-pulsard/pulsard.json"
 # (printed by `robodr-commission verify-profile`). Remove after it loaded.
 # allow_rollback = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 # robodr-trust-roots/v1 file: the trust-root PUBLIC key(s) that sign the
-# revocation list and a trust-file min_profile_version (`robodr-commission
-# keygen --roots`). Must differ from every profile signing key.
+# trust file (then mandatory: <trusted_keys>.sig) and the revocation list
+# (`robodr-commission keygen --roots`). Must differ from every profile
+# signing key and operator key. With roots, a locked profile must also
+# carry a valid operator attestation unless the root-signed trust file says
+# require_attestation = false (docs/OPERATIONS.md 5.4).
 # trust_roots = "/etc/robodr/trust-roots.json"
-# Signed robodr-profile-revocations/v1 list (`robodr-commission revoke`):
-# revoked profile digests / signing key ids. Needs trust_roots. A list older
-# than the last accepted one, or a missing list after one was accepted, is
-# refused.
+# Signed robodr-profile-revocations/v2 list (`robodr-commission revoke`):
+# for one platform, revoked profile digests / signing key fingerprints.
+# Needs trust_roots. A list older than the last accepted one, for another
+# platform, or a missing list after one was accepted, is refused.
 # revocation_list = "/etc/robodr/profile-revocations.json"
 # "optional" (default): no list file yet is fine. "required": no list file
 # means every locked profile is refused.

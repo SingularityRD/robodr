@@ -201,6 +201,10 @@ pub enum LockRefusal {
     ManifestMismatch {
         detail: String,
     },
+    /// The sign-off is bound to the raw bytes of a draft that is not in
+    /// canonical form, so the unit could not verify the attestation the
+    /// locked profile carries (see `trust::attestation`).
+    SignoffNotCanonical,
 }
 
 impl fmt::Display for LockRefusal {
@@ -271,6 +275,13 @@ impl fmt::Display for LockRefusal {
                 "the sign-off names operator {operator:?}, but the valid signatures are by \
                  {signers:?}: the named operator must sign it"
             ),
+            LockRefusal::SignoffNotCanonical => write!(
+                f,
+                "the sign-off is bound to the draft's raw bytes, which are not the canonical \
+                 form the unit verifies the attestation against: regenerate the list with \
+                 `robodr-commission signoff --in <draft> --out <signoff>` (binds the content), \
+                 confirm and sign it again"
+            ),
             LockRefusal::MotionQuorumNotMet { have, need } => write!(
                 f,
                 "two-person rule: the sign-off has motion items, so {need} distinct operators \
@@ -301,12 +312,14 @@ pub fn lock_with_caps(
     signoff: &Signoff,
     caps: &HardCaps,
 ) -> Result<Profile, Vec<LockRefusal>> {
-    lock_with_digest(profile, signoff, &draft_digest(profile), caps)
+    lock_with_digest(profile, signoff, &[draft_digest(profile)], caps)
 }
 
 /// [`lock`] for a draft read from disk: the sign-off is checked against the
-/// SHA-256 of `draft_text` itself, and the text must parse strictly
-/// (`profile_file::parse_profile_text`: all keys, no unknown keys).
+/// SHA-256 of `draft_text` itself or of its canonical form
+/// ([`draft_digest`] of the parsed draft: the same content), and the text
+/// must parse strictly (`profile_file::parse_profile_text`: all keys, no
+/// unknown keys).
 pub fn lock_draft_text(draft_text: &str, signoff: &Signoff) -> Result<Profile, Vec<LockRefusal>> {
     lock_draft_text_with_caps(draft_text, signoff, &HardCaps::default())
 }
@@ -322,13 +335,14 @@ pub fn lock_draft_text_with_caps(
             error: e.to_string(),
         }]
     })?;
-    lock_with_digest(&profile, signoff, &sha256_hex(draft_text.as_bytes()), caps)
+    let digests = [sha256_hex(draft_text.as_bytes()), draft_digest(&profile)];
+    lock_with_digest(&profile, signoff, &digests, caps)
 }
 
 fn lock_with_digest(
     profile: &Profile,
     signoff: &Signoff,
-    digest: &str,
+    digests: &[String],
     caps: &HardCaps,
 ) -> Result<Profile, Vec<LockRefusal>> {
     let mut why = lockable_with_caps(profile, caps);
@@ -341,7 +355,7 @@ fn lock_with_digest(
             profile: profile.model.clone(),
         });
     }
-    if signoff.profile_sha256 != digest {
+    if !digests.contains(&signoff.profile_sha256) {
         why.push(LockRefusal::SignoffDigestMismatch);
     }
     if signoff.operator.trim().is_empty() {
@@ -433,8 +447,11 @@ pub fn signature_refusals(
 
 /// The full lock the CLI performs: [`lock_draft_text_with_caps`] (content,
 /// confirmations, item digest, floor, caps) plus [`signature_refusals`] over
-/// the exact sign-off bytes. Every reason is collected. On success returns
-/// the locked profile and the parsed sign-off.
+/// the exact sign-off bytes, plus the sign-off bound to the draft's
+/// canonical content (so the attestation the CLI embeds,
+/// `trust::attestation_for`, verifies on the unit). Every reason is
+/// collected. On success returns the locked profile and the parsed
+/// sign-off.
 pub fn lock_signed_draft(
     draft_text: &str,
     signoff_text: &str,
@@ -455,6 +472,11 @@ pub fn lock_signed_draft(
             None
         }
     };
+    if let Some(p) = &locked {
+        if signoff.profile_sha256 != crate::trust::content_digest(p) {
+            why.push(LockRefusal::SignoffNotCanonical);
+        }
+    }
     why.extend(signature_refusals(&signoff, signoff_text, sigs, policy));
     match locked {
         Some(p) if why.is_empty() => Ok((p, signoff)),
@@ -1427,10 +1449,20 @@ mod tests {
         let so = Signoff::for_profile(&p).confirm_all("op");
         assert!(lock_draft_text(&text, &so).unwrap().locked);
         // Same content, different bytes (re-indented by an editor): the
-        // sign-off no longer matches.
+        // sign-off still matches through the canonical content digest (what
+        // the unit verifies the attestation against) ...
         let edited = text.replace("  ", "    ");
+        assert!(lock_draft_text(&edited, &so).unwrap().locked);
+        // ... and one bound to the edited raw bytes matches those bytes.
+        let mut raw = so.clone();
+        raw.rebind(sha256_hex(edited.as_bytes()));
+        assert!(lock_draft_text(&edited, &raw).unwrap().locked);
+        // Other content: no match either way.
+        let mut other = p.clone();
+        other.writer_topics.insert("/odom".into());
+        let other_text = crate::to_json(&other).unwrap();
         assert_eq!(
-            lock_draft_text(&edited, &so).unwrap_err(),
+            lock_draft_text(&other_text, &so).unwrap_err(),
             vec![LockRefusal::SignoffDigestMismatch]
         );
         // Partially written draft.
@@ -1805,6 +1837,38 @@ mod tests {
             min_motion_quorum: min,
         };
         lock_signed_draft(draft, so, sigs, &policy, &HardCaps::default())
+    }
+
+    #[test]
+    fn signed_lock_requires_a_canonically_bound_signoff() {
+        let o = ops(1);
+        let (draft, _) = signed_case();
+        // A hand-edited (re-indented) draft with a sign-off bound to its raw
+        // bytes: the unit could not verify the attestation, so the CLI lock
+        // path refuses it ...
+        let edited = draft.replace("  ", "    ");
+        let mut raw = Signoff::for_profile(&base()).confirm_all("alice");
+        raw.rebind(sha256_hex(edited.as_bytes()));
+        let raw = crate::to_json(&raw).unwrap();
+        let why =
+            signed_lock(&edited, &raw, Some(&sign(&raw, &[&o.alice])), &o.trust, 1).unwrap_err();
+        assert_eq!(why, vec![LockRefusal::SignoffNotCanonical]);
+        assert!(why[0].to_string().contains("signoff --in"));
+        // ... while a sign-off bound to the content (what `signoff --in`
+        // writes) locks the same edited bytes.
+        let canon = crate::to_json(&Signoff::for_profile(&base()).confirm_all("alice")).unwrap();
+        let (p, _) = signed_lock(
+            &edited,
+            &canon,
+            Some(&sign(&canon, &[&o.alice])),
+            &o.trust,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::trust::content_digest(&p),
+            Signoff::for_profile(&base()).profile_sha256
+        );
     }
 
     #[test]

@@ -117,10 +117,10 @@ commissioning (section 5).
 | Release key | entry station only | verifying releases (section 2) |
 | Profile signing key (Ed25519, private) | commissioning station only, **never on the robot** | signing locked profiles (section 4.4, 5) |
 | Profile trust file (Ed25519, public) | `/etc/robodr/profile-trust.json` (`0644 root:root`) | the sensor / agentd accept only profiles signed by these keys |
-| Trust roots (Ed25519, private) | offline signing station / token, **never on the robot**, separate from the profile key | signing revocation lists and the trust file's `min_profile_version` floor (4.4, 5.3) |
-| Trust roots file (public) | `/etc/robodr/trust-roots.json` (`0644`) | verifying revocation lists and the signed floor |
+| Trust roots (Ed25519, private) | offline signing station / token, **never on the robot**, separate from the profile key and every operator key | signing the profile trust file (required on a unit with roots) and revocation lists (4.4, 5.3, 5.4) |
+| Trust roots file (public) | `/etc/robodr/trust-roots.json` (`0644`) | verifying the trust file's signature, revocation lists and the signed floor |
 | Operator sign-off keys (Ed25519, one per operator) | each operator's own token / home on the commissioning station | signing a confirmed sign-off list (section 5, step 3) |
-| Operators trust list (public) | commissioning station (`operators.json`, not group/other-writable) | `lock --operators` accepts only sign-offs signed by these operators |
+| Operators trust list (public) | commissioning station (`operators.json`, not group/other-writable), and embedded in the root-signed profile trust file on every robot | `lock --operators` accepts only sign-offs signed by these operators; the robot verifies the embedded attestation against them (5.4) |
 | Finding key of `robodr-agentd` (Ed25519 secret, optional) | `/etc/robodr/keys/agentd-finding.key` (`0600 root:root`) | per-finding signatures, header `robodr-finding-sig` (6.4) |
 | Its public key | SOC finding keyring, bound to the unit id | verifying findings on connected paths (contract §2a) |
 
@@ -286,20 +286,34 @@ out, re-sign the current profile with the new key
 then remove the old entry. **Revocation** of a key or of a single profile
 file is done with a signed revocation list (section 5.3); removing the entry
 from the trust file still works but needs a new trust file on every robot.
-If a signing key is compromised, revoke its key id at once and re-sign with
-a new key: until the list is installed an attacker holding it can make the
-robot enforce a profile of their choosing. There is no expiry.
+If a signing key is compromised, revoke it at once (by its public-key
+fingerprint, which `keygen` prints and `verify-profile` reports) and re-sign
+with a new key: until the list is installed an attacker holding it can make
+the robot enforce a profile of their choosing (but only one that also
+carries a valid operator attestation, section 5.4). There is no expiry.
 
 **Trust roots** are a second, separate Ed25519 key pair (or several) that
-sign only revocation lists and the trust file's `min_profile_version`
-floor, never profiles. Keep them offline, on a different station or token
-than the profile signing key; a key that is both a root and a profile key
-is refused by every loader.
+sign only the profile trust file and revocation lists, never profiles.
+**Once trust roots are configured on a robot, its profile trust file must
+be root-signed** (`profile-trust.json.sig`): an unsigned or badly signed
+trust file is refused (fail closed), so whoever can write
+`/etc/robodr/profile-trust.json` can neither add a key nor strip the floor
+or the operators list. Keep the roots offline, on a different station or
+token than the profile signing key; a key that is both a root and a profile
+key (or an operator key) is refused by every loader.
 
 ```sh
 robodr-commission keygen --out /secure/oem-root.key --trust-out trust-roots.json \
     --key-id oem-root-2026 --roots
+# the robot's trust file: profile key(s) + operators, signed by a root
+robodr-commission trust-keys --out profile-trust.json --pub oem-profile.key.pub \
+    --operators operators.json --sign-key /secure/oem-root.key   # .json + .json.sig
 ```
+
+With roots configured a robot also **requires operator attestation** by
+default (section 5.4), so the trust file must carry `--operators` (or,
+for a fleet that cannot yet re-commission its profiles, the root-signed
+opt-out `--no-require-attestation`; see 5.4 for what that gives up).
 
 The Ed25519 implementation is RoboDR's own std-only one (crates.io is not
 reachable in this build), pinned to the RFC 8032 test vectors but **not
@@ -341,8 +355,13 @@ Work in `/var/lib/robodr/commission/<date>/` as root.
    manifest is missing or does not match (`--no-manifest` only for drafts
    made before manifests existed). If the robot uses a DDS **discovery
    server**, name it (`--discovery-server PREFIX|PREFIX@IP|IP`, or
-   `--trusted-discovery-server` to learn the endpoints it relays for
-   accepted owners); otherwise every relayed announcement is a sign-off item.
+   `--trusted-discovery-server PREFIX@IP|IP` to learn the endpoints it
+   relays for accepted owners); otherwise every relayed announcement is a
+   sign-off item. A **trusted** server must be pinned by its IP: a GUID
+   prefix alone is refused, because any host can write that prefix into
+   its packets and would get its own participants and endpoints learned as
+   "relayed". A prefix-only server is accepted as a known server, which
+   never gets anything learned on its own.
 
 3. **Review and sign off.** Open `draft.json.signoff.json`. For every item,
    check it against the OEM's documentation of the robot (nodes, topics,
@@ -350,7 +369,10 @@ Work in `/var/lib/robodr/commission/<date>/` as root.
    `"operator"`. If you edit `draft.json` by hand or merge drafts
    (`robodr-commission merge`), regenerate the list with
    `robodr-commission signoff --in draft.json --out signoff.json` and review
-   it again.
+   it again. (The list is bound to the draft's *content*, in canonical
+   form, which is what the robot re-checks; a list bound to the raw bytes
+   of a re-formatted draft is refused by `lock` with "not the canonical
+   form": regenerate it with `signoff --in`.)
 
    Then **sign** the confirmed list with your own operator key. The security
    officer keeps an operators trust list binding each operator's public key
@@ -389,21 +411,29 @@ Work in `/var/lib/robodr/commission/<date>/` as root.
    It stamps `metadata` into the profile: `schema_version`,
    `profile_version` (monotonic, never reuse a number), `platform`,
    `unit_id` (only for a profile made for one robot; leave it out for a
-   fleet-wide profile), `locked_by` (the sign-off operator), `locked_at`
-   and `parent_digest`. It writes `locked.json` and the detached signature
+   fleet-wide profile), `locked_by` (the sign-off operator), `locked_at`,
+   `parent_digest` and **`attestation`**: the exact confirmed sign-off and
+   its operator signatures (`<signoff>.sig`), which the robot verifies at
+   load (section 5.4). It writes `locked.json` and the detached signature
    `locked.json.sig` (Ed25519 over the exact sealed bytes) together. On a
    signing station separate from the review station, lock without
-   `--sign-key` and sign later with `robodr-commission sign`.
+   `--sign-key` and sign later with `robodr-commission sign` (add
+   `--operators operators.json` to re-verify the attestation before
+   signing). `sign` refuses a locked profile that carries no attestation
+   (not made by `lock`) unless `--allow-unattested` is given; robots that
+   require attestation refuse such a profile anyway.
 
    **Check the signature** the way the robot will:
 
    ```sh
    robodr-commission verify-profile --profile locked.json \
-       --trusted-keys profile-trust.json --expect-platform ugv-x1
+       --trusted-keys profile-trust.json --expect-platform ugv-x1 \
+       --trust-roots trust-roots.json
    ```
 
-   It prints the profile version and the file digest (`sha256:...`). Record
-   both in the robot's commissioning file.
+   It prints the profile version, the signing key and its fingerprint, the
+   operators who attested it and the file digest (`sha256:...`). Record
+   them in the robot's commissioning file.
 
 5. **Check** the locked profile against a run that was *not* used for
    learning:
@@ -421,6 +451,8 @@ Work in `/var/lib/robodr/commission/<date>/` as root.
    sudo install -m 0640 -o root -g robodr locked.json /etc/robodr/profile.json
    sudo install -m 0640 -o root -g robodr locked.json.sig /etc/robodr/profile.json.sig
    sudo install -m 0644 -o root -g root profile-trust.json /etc/robodr/profile-trust.json
+   # with trust roots the trust file's root signature is mandatory:
+   sudo install -m 0644 -o root -g root profile-trust.json.sig /etc/robodr/profile-trust.json.sig
    # with trust roots / revocation (section 5.3):
    sudo install -m 0644 -o root -g root trust-roots.json /etc/robodr/trust-roots.json
    sudo install -m 0644 -o root -g root revocations-N.json /etc/robodr/profile-revocations.json
@@ -453,7 +485,9 @@ Work in `/var/lib/robodr/commission/<date>/` as root.
    An unlocked, missing or invalid profile, or a locked profile that is not
    trusted (no or bad signature, key not in the trust file, no metadata,
    wrong platform/unit, older than the last accepted version, below the
-   signed floor, revoked, or a revocation list that is invalid, older than
+   signed floor, revoked, no or an invalid operator attestation where one
+   is required, an unsigned trust file while trust roots are configured,
+   or a revocation list that is invalid, for another platform, older than
    the accepted one or missing when required) makes the
    sensor run observe-only (every finding is marked `[observe-only]`) and
    is reported as `robot.ros2.profile_refused` with the reason. This is how
@@ -499,11 +533,18 @@ After the daemon has loaded it, the state records the older version; remove
 never writes the state; only a starting daemon does, atomically.
 
 **The black box is the second witness.** `robodr-agentd` records every
-accepted locked profile (version, digest, revocation-list serial) in the
-signed black-box chain: a `robodr.profile_accepted` note at start and the
-same `profile_accepted` object in every heartbeat. At the next start it
-reads the newest such record (it must verify under the daemon's own
-black-box key) and compares it with the state file:
+accepted locked profile (version, digest, revocation-list serial, trust
+floor) in the signed black-box chain: a `robodr.profile_accepted` note at
+start and the same `profile_accepted` object in every heartbeat. At the
+next start it reads **every** such record that verifies under the daemon's
+own black-box key, in the order of their signed sequence numbers (not file
+order), and takes as the baseline the highest accepted version, the
+highest revocation serial and the highest floor; a record that lowers the
+version is followed only if it records an operator rollback
+(`allow_rollback`). Any other drop (a replayed old segment, a rewritten
+record) and any break in the chain linkage is logged as a `CRITICAL:`
+warning (`--check-config` shows it) and ignored for the baseline. It then
+compares the baseline with the state file:
 
 - state file **missing**, or **behind** the record (lower version, other
   digest for the same version, older revocation serial): the record is the
@@ -525,20 +566,30 @@ only when the trust file is signed by a trust root (`<trust>.sig`):
 
 ```sh
 robodr-commission trust-keys --out profile-trust.json --pub oem-profile.key.pub \
-    --min-profile-version 4 --sign-key /secure/oem-root.key   # writes .json + .json.sig
+    --operators operators.json --min-profile-version 4 \
+    --sign-key /secure/oem-root.key                            # writes .json + .json.sig
 ```
 
 A locked profile below the floor is refused and `allow_rollback` cannot
 override it; a floor without a valid root signature (or without
-`trust_roots` configured) makes the whole trust file invalid. The floor is
-what remains if root deletes both the state file and the black box.
+`trust_roots` configured) makes the whole trust file invalid, and with
+`trust_roots` configured an unsigned trust file is refused whatever it
+holds (so the floor cannot be stripped by deleting it and the `.sig`). The
+highest floor ever accepted is also remembered in the state file and the
+black-box record (`trust_floor`), so an older root-signed trust file with a
+lower floor (a replay) never lowers it. The floor is what remains if root
+deletes both the state file and the black box.
 
 Limits: the state file is plain JSON; root can still delete it **and** the
 black box directory (the gap is visible off-unit in the exported chain, not
-on the unit), leaving only the signed floor. An older root-signed trust file
-with a lower floor still verifies (trust files have no serial; revocation
-lists do). Cyclic retention or export pruning can drop old segments; the
-heartbeat re-records the profile so the newest segment carries it. The
+on the unit), leaving only the signed floor of the installed trust file.
+An older root-signed trust file still verifies (trust files have no
+serial): it cannot lower the remembered floor, but it can bring back a
+profile key it listed, so retire keys with the revocation list (5.3), not
+only by removing them from the trust file. Deleting the newest black-box
+segments (truncation) is not detectable on the unit. Cyclic retention or
+export pruning can drop old segments; the heartbeat re-records the profile
+so the newest segment carries it. The
 Pulsar sensor and `robodr-ros2-watch` have no black box and use the state
 file and floor only. A hardware monotonic counter (TPM) is the planned fix.
 A corrupt or unreadable state file is not reset silently: the profile is
@@ -559,27 +610,39 @@ robodr-commission migrate-legacy --in legacy-locked.json --out locked.json \
 ```
 
 The content is unchanged; the legacy file's digest becomes
-`parent_digest`. Then install as in step 6.
+`parent_digest`. Then install as in step 6. A migrated profile carries **no
+operator attestation**: a robot that requires attestation (the default with
+trust roots, section 5.4) refuses it. Re-commission it (learn, sign off,
+lock) for such robots, or ship a root-signed trust file with
+`require_attestation: false` until you can.
 
 ### 5.3 Revocation list
 
-A revocation list withdraws profile files (by digest) and profile signing
-keys (by key id) without touching the trust file. It is signed by a trust
-root (section 4.4) and carries a monotonic `serial` and `issued_at`
-(informational: no expiry).
+A revocation list (`robodr-profile-revocations/v2`) withdraws profile files
+(by digest) and profile signing keys (by **public-key fingerprint**,
+`sha256:` of the 32 raw Ed25519 public-key bytes) without touching the
+trust file. It is bound to one `platform` (the `metadata.platform` of the
+profiles it governs), signed by a trust root (section 4.4) and carries a
+monotonic `serial` and `issued_at` (informational: no expiry). Keys are
+revoked by fingerprint, not by key id, because a key id is only a label:
+the same key re-listed under another id stays revoked.
 
 ```sh
 # on the offline signing station
 robodr-commission revoke --sign-key /secure/oem-root.key --out revocations-1.json \
-    --revoke-profile locked-v3.json            # or --digest sha256:<hex>, --key-id oem-2025
+    --platform ugv-x1 --revoke-profile locked-v3.json   # or --digest sha256:<hex>
 robodr-commission revoke --sign-key /secure/oem-root.key --out revocations-2.json \
-    --base revocations-1.json --trust-roots trust-roots.json --key-id oem-ugv-x1-2025
+    --base revocations-1.json --trust-roots trust-roots.json \
+    --revoke-key oem-ugv-x1-2025.key.pub                # or --key-fingerprint sha256:<hex>
 robodr-commission verify-revocations --list revocations-2.json --trust-roots trust-roots.json
 ```
 
-`--base` carries over the previous list's entries (after verifying it) and
-the serial defaults to its serial + 1. Install the list and the roots file
-on every robot:
+`--base` carries over the previous list's entries and platform (after
+verifying it) and the serial defaults to its serial + 1. **Lists in the
+old `robodr-profile-revocations/v1` format (key ids) are refused**:
+re-issue them with `revoke --platform ... --revoke-key KEY.pub` (one list
+per platform) before upgrading the robots. Install the list and the roots
+file on every robot of the platform:
 
 ```json
 "profile_trust": { "trust_roots": "/etc/robodr/trust-roots.json",
@@ -587,8 +650,9 @@ on every robot:
                    "revocation_policy": "optional" }
 ```
 
-A locked profile whose file digest or signing key id is listed is refused
-(observe-only, `robot.ros2.profile_refused`). The list itself is
+A locked profile whose file digest or signing key fingerprint is listed is
+refused (observe-only, `robot.ros2.profile_refused`), and so is every
+locked profile when the list is for another platform. The list itself is
 anti-rollback protected: its serial and digest are kept in the state file
 and the black-box record, and the loaders refuse a list with a **lower**
 serial, the **same** serial with other content, or a **missing** list after
@@ -602,6 +666,69 @@ malformed) is always refused. `verify-profile --trust-roots ...
 
 Limits: a trust root cannot be revoked by the list it signs (replace the
 roots file instead); `issued_at` is not checked against a clock.
+
+### 5.4 Operator attestation (two-person rule on the robot)
+
+`lock` enforces the operator sign-off (every item confirmed, valid operator
+signatures, `motion_quorum` distinct operators for motion items) on the
+commissioning station. A profile signing key alone could otherwise build a
+locked profile by hand, seal it and sign it, and the robot would never know
+that no operator signed anything. So `lock` embeds the evidence in the
+profile (`metadata.attestation`: the exact sign-off text and its operator
+signature bundle), and every loader verifies it against the **operators
+list in the trust file**:
+
+- the sign-off is well formed, fully confirmed, names an operator, has an
+  intact item digest and is for this model;
+- it is bound to this profile's **content** (its `profile_sha256` equals the
+  canonical digest of the profile as a draft), so evidence copied from
+  another profile does not fit;
+- the floor recomputed from the content (a confirmed review of every motion
+  channel, every unbounded dimension) is met;
+- every signature is valid over the exact sign-off bytes under a listed
+  operator key (any unknown or bad one refuses), the sign-off's operator
+  signed and is the profile's `locked_by`;
+- with motion items, at least the trust file's `motion_quorum` distinct
+  operators signed.
+
+**Setup** (security officer, on the offline signing station):
+
+```sh
+robodr-commission operators --out operators.json \
+    --operator Alice=alice.key.pub --operator Bob=bob.key.pub --motion-quorum 2
+robodr-commission trust-keys --out profile-trust.json --pub oem-profile.key.pub \
+    --operators operators.json --sign-key /secure/oem-root.key
+```
+
+Install `profile-trust.json` **and** `profile-trust.json.sig` on every robot
+(step 6). Operator keys must differ from profile signing keys and trust
+roots (refused otherwise: one person would both sign off and sign). On a
+change of staff, issue a new operators list and a new root-signed trust
+file; profiles already locked keep verifying as long as their signers stay
+listed.
+
+**When it is required.** With `trust_roots` configured, attestation is
+required by default, and a trust file without `operators` is refused (every
+locked profile then runs observe-only, with the reason). The root-signed
+trust file can opt out (`trust-keys ... --no-require-attestation`, i.e.
+`"require_attestation": false`) for a transition period, e.g. while
+migrated legacy profiles (5.2) are re-commissioned; the opt-out gives the
+two-person rule up on those robots. Without trust roots, attestation is
+checked only if the trust file asks for it (`--require-attestation`), since
+an unsigned trust file can be rewritten anyway.
+
+**Upgrading a fleet:** (1) re-issue revocation lists as v2 (5.3); (2) build
+the operators list and a root-signed trust file with `--operators`; (3)
+re-lock every profile with this `robodr-commission` (profiles locked by an
+older version carry no attestation and are refused) or ship the opt-out
+first; (4) install trust file + `.sig`, profile + `.sig`, roots, list.
+`verify-profile --trust-roots ...` shows the result offline before rollout.
+
+Limits: the attestation proves that listed operators signed this exact
+content; it cannot prove they reviewed it carefully, and colluding
+operators (as many as `motion_quorum`) can still attest anything. The
+operators list is only as trustworthy as the trust file: root-signed with
+trust roots, editable by whoever can write it without.
 
 ## 6. Running
 

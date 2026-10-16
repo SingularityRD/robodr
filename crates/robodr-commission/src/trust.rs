@@ -45,24 +45,39 @@
 //!    deleted or rewritten; the chain's record is then the baseline (a lower
 //!    version stays refused) and a [`StateAlarm`] is raised (agentd reports
 //!    it as a Critical, observe-only finding).
-//! 6. **Monotonic floor** ([`load_trust_file`]): the trust file may carry
-//!    `min_profile_version`. It is honoured only when the trust file is
-//!    signed (`<trust>.sig`, domain [`TRUST_SIG_DOMAIN`]) by a **trust
-//!    root** key ([`load_trust_roots`], `robodr-trust-roots/v1`); a floor
-//!    without a valid root signature makes the trust file invalid (fail
-//!    closed). A locked profile below the floor is refused and
-//!    `allow_rollback` cannot override it: the floor survives the loss of
-//!    both the state file and the black box.
-//! 7. **Revocation list** ([`revocation`]): a `robodr-profile-revocations/v1`
-//!    file of revoked profile digests and revoked signing key ids, with a
-//!    monotonic `serial` and `issued_at`, signed by a trust root (never by a
-//!    profile signing key: roots and profile keys must be disjoint). A
-//!    revoked profile or a profile signed by a revoked key is refused. The
+//! 6. **Root-signed trust file and monotonic floor** ([`load_trust_file`]):
+//!    whenever **trust roots** are configured ([`load_trust_roots`],
+//!    `robodr-trust-roots/v1`), the trust file must be signed by one of them
+//!    (`<trust>.sig`, domain [`TRUST_SIG_DOMAIN`]); an unsigned or badly
+//!    signed trust file is invalid (fail closed), so whoever can rewrite it
+//!    can neither add a profile key nor strip what it carries. It may carry
+//!    `min_profile_version`, which is honoured only when root-signed (a
+//!    floor without roots is invalid). A locked profile below the floor is
+//!    refused and `allow_rollback` cannot override it. The highest floor
+//!    ever accepted is also kept in the state file and the black-box record
+//!    ([`AcceptedState::trust_floor`]): an older root-signed trust file with
+//!    a lower floor (replay) never lowers the effective floor.
+//! 7. **Revocation list** ([`revocation`]): a `robodr-profile-revocations/v2`
+//!    file bound to one `platform`, of revoked profile digests and revoked
+//!    signing keys **by public-key fingerprint** ([`key_fingerprint`]), with
+//!    a monotonic `serial` and `issued_at`, signed by a trust root (never by
+//!    a profile signing key: roots and profile keys must be disjoint). A
+//!    revoked profile, a profile signed by a revoked key (whatever `key_id`
+//!    it is listed under) or a list for another platform is refused. The
 //!    list itself is anti-rollback protected: its serial and digest are
 //!    kept in the state file and the black-box record, and an older serial,
 //!    the same serial with other content, or a missing list after one was
 //!    accepted is refused. A missing list is otherwise allowed or refused by
 //!    [`RevocationPolicy`].
+//! 8. **Operator attestation** ([`attestation`]): a locked profile carries
+//!    its operator sign-off and the operators' signatures
+//!    (`metadata.attestation`, embedded by `lock`); the loader verifies them
+//!    against the `operators` (and `motion_quorum`) of the trust file, so
+//!    the two-person rule is enforced on the unit, not only by the honest
+//!    `lock` path. Required by default whenever trust roots are configured
+//!    (`require_attestation` in the root-signed trust file can say
+//!    otherwise); an unattested profile is then refused
+//!    ([`ProfileTrustError::Unattested`]).
 //!
 //! The whole decision is [`evaluate_profile_trust`]; every loader (sensor
 //! pipeline, agentd, replay, `verify-profile`) calls it.
@@ -91,9 +106,11 @@
 //!   newest segment carries it. A hardware monotonic counter (TPM NV index)
 //!   is the real fix (Phase 2/3). An unreadable or malformed state file
 //!   fails closed (refused), it is never silently reset.
-//! * The trust-file floor is protected against forgery, not replay: an
-//!   older root-signed trust file with a lower floor verifies. Revocation
-//!   lists carry a serial for that reason; trust files do not.
+//! * The trust file is protected against forgery, not replay: an older
+//!   root-signed trust file verifies (with its older key list). Its floor
+//!   cannot be lowered that way (the highest accepted floor is remembered,
+//!   see 6.), but a re-added profile key must be revoked through the
+//!   revocation list, which carries a serial for that reason.
 //! * Trust roots cannot be revoked by the list they sign; replace the roots
 //!   file instead. `issued_at` is informational (air-gapped units have no
 //!   trusted clock): there is no expiry.
@@ -115,11 +132,15 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+pub mod attestation;
 pub mod revocation;
 
+use crate::signoff::{OperatorKeyJson, OperatorTrust};
+pub use attestation::{attestation_for, content_digest, verify_attestation, AttestationSummary};
 pub use revocation::{
-    load_revocation_list, RevocationList, RevocationPolicy, RevocationSignature,
+    key_fingerprint, load_revocation_list, RevocationList, RevocationPolicy, RevocationSignature,
     MAX_REVOCATION_BYTES, MAX_REVOKED_ENTRIES, REVOCATION_DOMAIN, REVOCATION_FORMAT,
+    REVOCATION_FORMAT_V1,
 };
 
 /// Domain separation prefix of the signed message.
@@ -213,8 +234,14 @@ pub enum ProfileTrustError {
     RevocationListMissing { path: String },
     /// The profile file's digest is revoked.
     RevokedProfile { digest: String, serial: u64 },
-    /// The key that signed the profile is revoked.
-    RevokedKey { key_id: String, serial: u64 },
+    /// The key that signed the profile is revoked (by fingerprint).
+    RevokedKey {
+        key_id: String,
+        fingerprint: String,
+        serial: u64,
+    },
+    /// The revocation list is for another platform than the profile.
+    RevocationPlatformMismatch { list: String, profile: String },
     /// The revocation list is older than the last accepted one.
     RevocationRollback {
         accepted_serial: u64,
@@ -225,8 +252,17 @@ pub enum ProfileTrustError {
     /// A revocation list was accepted before and is now missing.
     RevocationListRemoved { accepted_serial: u64 },
     /// `profile_version` is below the root-signed `min_profile_version` of
-    /// the trust file (not overridable by `allow_rollback`).
+    /// the trust file, or below the highest floor accepted before (not
+    /// overridable by `allow_rollback`).
     BelowFloor { floor: u64, offered_version: u64 },
+    /// Attestation is required and the locked profile carries none (no
+    /// operator sign-off evidence: legacy, migrated or hand-made).
+    Unattested,
+    /// The attestation does not verify (see [`attestation`]).
+    BadAttestation { detail: String },
+    /// Fewer distinct operators signed than the trust file's
+    /// `motion_quorum` (sign-off with motion items).
+    AttestationQuorumNotMet { have: usize, need: usize },
 }
 
 impl fmt::Display for ProfileTrustError {
@@ -309,9 +345,18 @@ impl fmt::Display for ProfileTrustError {
                 f,
                 "profile {digest} is revoked (revocation list serial {serial})"
             ),
-            Self::RevokedKey { key_id, serial } => write!(
+            Self::RevokedKey {
+                key_id,
+                fingerprint,
+                serial,
+            } => write!(
                 f,
-                "signing key {key_id:?} is revoked (revocation list serial {serial})"
+                "signing key {key_id:?} ({fingerprint}) is revoked (revocation list serial \
+                 {serial})"
+            ),
+            Self::RevocationPlatformMismatch { list, profile } => write!(
+                f,
+                "revocation list is for platform {list:?}, the profile is for {profile:?}"
             ),
             Self::RevocationRollback {
                 accepted_serial,
@@ -335,8 +380,20 @@ impl fmt::Display for ProfileTrustError {
                 offered_version,
             } => write!(
                 f,
-                "profile_version {offered_version} is below the trust file's signed \
-                 min_profile_version {floor}"
+                "profile_version {offered_version} is below the signed min_profile_version \
+                 {floor} (trust file, or the highest floor accepted before)"
+            ),
+            Self::Unattested => write!(
+                f,
+                "locked profile carries no operator sign-off attestation (re-lock it with \
+                 `robodr-commission lock`, which embeds the signed sign-off); this unit requires \
+                 attestation"
+            ),
+            Self::BadAttestation { detail } => write!(f, "operator attestation: {detail}"),
+            Self::AttestationQuorumNotMet { have, need } => write!(
+                f,
+                "operator attestation: {have} distinct operator(s) signed a sign-off with motion \
+                 items; the trust file's motion_quorum is {need} (two-person rule)"
             ),
         }
     }
@@ -545,17 +602,35 @@ struct TrustJson {
     format: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     min_profile_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    require_attestation: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    motion_quorum: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operators: Option<Vec<OperatorKeyJson>>,
     keys: Vec<TrustKeyJson>,
+}
+
+/// A parsed key-list file.
+struct KeyList {
+    keys: Vec<Ed25519VerifyingKey>,
+    floor: Option<u64>,
+    require_attestation: Option<bool>,
+    operators: Option<OperatorTrust>,
+}
+
+impl KeyList {
+    fn has_trust_file_members(&self) -> bool {
+        self.floor.is_some() || self.require_attestation.is_some() || self.operators.is_some()
+    }
 }
 
 /// Parse a key-list file (`format` must be `expected`): at least one key,
 /// at most [`MAX_TRUST_KEYS`], Ed25519 only, canonical non-small-order
-/// public keys, no duplicate key id or public key. Returns the keys and the
-/// optional `min_profile_version`.
-fn parse_key_list(
-    text: &str,
-    expected: &str,
-) -> Result<(Vec<Ed25519VerifyingKey>, Option<u64>), String> {
+/// public keys, no duplicate key id or public key; the optional members
+/// (`min_profile_version`, `require_attestation`, `operators` +
+/// `motion_quorum`, checked by [`OperatorTrust::from_entries`]).
+fn parse_key_list(text: &str, expected: &str) -> Result<KeyList, String> {
     crate::profile_file::reject_duplicate_keys(text).map_err(|e| e.to_string())?;
     let j: TrustJson = serde_json::from_str(text).map_err(|e| e.to_string())?;
     if j.format != expected {
@@ -593,7 +668,32 @@ fn parse_key_list(
         }
         out.push(vk);
     }
-    Ok((out, j.min_profile_version))
+    let operators = match (j.operators, j.motion_quorum) {
+        (None, None) => None,
+        (None, Some(_)) => return Err("motion_quorum without operators".into()),
+        (Some(ops), q) => Some(
+            OperatorTrust::from_entries(ops, q.unwrap_or(1))
+                .map_err(|e| format!("operators: {e}"))?,
+        ),
+    };
+    if let Some(ops) = &operators {
+        if let Some(k) = ops
+            .public_keys()
+            .find(|o| out.iter().any(|k| k.as_bytes() == o.as_bytes()))
+        {
+            return Err(format!(
+                "operators: key {:?} is also a profile signing key (operators and profile keys \
+                 must be distinct: one person would both sign off and sign)",
+                Verifier::key_id(k)
+            ));
+        }
+    }
+    Ok(KeyList {
+        keys: out,
+        floor: j.min_profile_version,
+        require_attestation: j.require_attestation,
+        operators,
+    })
 }
 
 fn ring_of(keys: &[Ed25519VerifyingKey]) -> Result<Keyring, String> {
@@ -613,8 +713,8 @@ fn ring_of(keys: &[Ed25519VerifyingKey]) -> Result<Keyring, String> {
 /// signature.
 pub fn parse_trust_keys(text: &str) -> Result<Keyring, ProfileTrustError> {
     let bad = |detail: String| ProfileTrustError::TrustFile { detail };
-    let (keys, _) = parse_key_list(text, TRUST_FORMAT).map_err(bad)?;
-    ring_of(&keys).map_err(bad)
+    let l = parse_key_list(text, TRUST_FORMAT).map_err(bad)?;
+    ring_of(&l.keys).map_err(bad)
 }
 
 /// Read a trust-anchor file: regular file (not a symlink), not writable by
@@ -636,10 +736,13 @@ pub fn trust_keys_text(keys: &[Ed25519VerifyingKey]) -> String {
     trust_file_text(keys, None)
 }
 
-fn key_list_text(format: &str, keys: &[Ed25519VerifyingKey], floor: Option<u64>) -> String {
+fn key_list_text(format: &str, keys: &[Ed25519VerifyingKey], opt: &TrustFileOptions<'_>) -> String {
     let j = TrustJson {
         format: format.into(),
-        min_profile_version: floor,
+        min_profile_version: opt.min_profile_version,
+        require_attestation: opt.require_attestation,
+        motion_quorum: opt.operators.map(OperatorTrust::motion_quorum),
+        operators: opt.operators.map(OperatorTrust::entries),
         keys: keys
             .iter()
             .map(|k| TrustKeyJson {
@@ -657,7 +760,31 @@ fn key_list_text(format: &str, keys: &[Ed25519VerifyingKey], floor: Option<u64>)
 /// [`ProfileSignature::create_for`] with [`SigKind::TrustFile`] over these
 /// exact bytes, written to [`sig_path_for`] the trust file).
 pub fn trust_file_text(keys: &[Ed25519VerifyingKey], floor: Option<u64>) -> String {
-    key_list_text(TRUST_FORMAT, keys, floor)
+    trust_file_text_with(
+        keys,
+        &TrustFileOptions {
+            min_profile_version: floor,
+            ..Default::default()
+        },
+    )
+}
+
+/// Optional members of a trust file ([`trust_file_text_with`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TrustFileOptions<'a> {
+    /// `min_profile_version` (needs a root signature).
+    pub min_profile_version: Option<u64>,
+    /// `require_attestation` (`None`: required iff trust roots are
+    /// configured on the unit).
+    pub require_attestation: Option<bool>,
+    /// `operators` and `motion_quorum`: who may attest a profile.
+    pub operators: Option<&'a OperatorTrust>,
+}
+
+/// The text of a trust file listing `keys` with the optional members of
+/// `opt`.
+pub fn trust_file_text_with(keys: &[Ed25519VerifyingKey], opt: &TrustFileOptions<'_>) -> String {
+    key_list_text(TRUST_FORMAT, keys, opt)
 }
 
 /// Trust roots: the keys that sign revocation lists and trust-file floors
@@ -693,13 +820,15 @@ impl TrustRoots {
 /// as a trust file, no `min_profile_version`).
 pub fn parse_trust_roots(text: &str) -> Result<TrustRoots, ProfileTrustError> {
     let bad = |detail: String| ProfileTrustError::TrustRoots { detail };
-    let (keys, floor) = parse_key_list(text, ROOTS_FORMAT).map_err(bad)?;
-    if floor.is_some() {
-        return Err(bad("min_profile_version belongs in the trust file".into()));
+    let l = parse_key_list(text, ROOTS_FORMAT).map_err(bad)?;
+    if l.has_trust_file_members() {
+        return Err(bad(
+            "min_profile_version / require_attestation / operators belong in the trust file".into(),
+        ));
     }
     Ok(TrustRoots {
-        keys: ring_of(&keys).map_err(bad)?,
-        public_keys: keys,
+        keys: ring_of(&l.keys).map_err(bad)?,
+        public_keys: l.keys,
     })
 }
 
@@ -718,27 +847,37 @@ pub fn load_trust_roots(path: &Path) -> Result<TrustRoots, ProfileTrustError> {
 
 /// The text of a trust-roots file listing `keys`.
 pub fn trust_roots_text(keys: &[Ed25519VerifyingKey]) -> String {
-    key_list_text(ROOTS_FORMAT, keys, None)
+    key_list_text(ROOTS_FORMAT, keys, &TrustFileOptions::default())
 }
 
-/// A trust-anchor file with its optional signed floor.
+/// A trust-anchor file with its optional signed members.
 #[derive(Debug)]
 pub struct TrustFile {
     pub keys: Keyring,
     pub public_keys: Vec<Ed25519VerifyingKey>,
     /// Root-signed `min_profile_version` (`None`: no floor).
     pub min_profile_version: Option<u64>,
-    /// Trust root that signed the file (`None`: unsigned).
+    /// Trust root that signed the file (`None`: unsigned, only possible
+    /// without trust roots).
     pub signed_by: Option<String>,
+    /// Who may attest a locked profile (`operators` + `motion_quorum`).
+    pub operators: Option<OperatorTrust>,
+    /// Whether a locked profile must carry a valid operator attestation:
+    /// `require_attestation` if the file says, else `true` exactly when
+    /// trust roots are configured.
+    pub require_attestation: bool,
 }
 
 /// Parse a trust file and check its detached signature `sig_text` (the
 /// `<trust>.sig` content, if any) against `roots`:
 ///
-/// * a `min_profile_version` needs a valid signature by a root (no roots
-///   configured, no signature or a bad one: error, fail closed);
-/// * a signature present while roots are configured must verify;
-/// * with roots, no profile key may be a root ([`TrustRoots::check_disjoint`]).
+/// * with roots configured the file **must** be signed by one of them (no
+///   signature or a bad one: error, fail closed), and no profile key may be
+///   a root ([`TrustRoots::check_disjoint`]) or an operator;
+/// * without roots, a `min_profile_version` is refused (it cannot be
+///   authenticated);
+/// * attestation is required when the file says so, by default when roots
+///   are configured; then `operators` must be listed.
 pub fn parse_trust_file(
     text: &str,
     sig_text: Option<&str>,
@@ -746,12 +885,25 @@ pub fn parse_trust_file(
     roots: Option<&TrustRoots>,
 ) -> Result<TrustFile, ProfileTrustError> {
     let bad = |detail: String| ProfileTrustError::TrustFile { detail };
-    let (keys, floor) = parse_key_list(text, TRUST_FORMAT).map_err(bad)?;
-    if floor == Some(0) {
+    let l = parse_key_list(text, TRUST_FORMAT).map_err(bad)?;
+    if l.floor == Some(0) {
         return Err(bad("min_profile_version must be >= 1".into()));
     }
     if let Some(r) = roots {
-        r.check_disjoint(&keys).map_err(bad)?;
+        r.check_disjoint(&l.keys).map_err(bad)?;
+        if let Some(ops) = &l.operators {
+            let ops: Vec<Ed25519VerifyingKey> = ops.public_keys().cloned().collect();
+            if let Some(o) = ops
+                .iter()
+                .find(|o| r.public_keys.iter().any(|k| k.as_bytes() == o.as_bytes()))
+            {
+                return Err(bad(format!(
+                    "operator key {:?} is also a trust root: roots and operator keys must be \
+                     distinct",
+                    Verifier::key_id(o)
+                )));
+            }
+        }
     }
     let signed_by = match (sig_text, roots) {
         (Some(st), Some(r)) => {
@@ -761,19 +913,36 @@ pub fn parse_trust_file(
                 .map_err(|e| bad(format!("{sig_name}: {e} (trust roots)")))?;
             Some(sig.key_id)
         }
-        _ => None,
+        (None, Some(_)) => {
+            return Err(bad(format!(
+                "trust roots are configured, so the trust file must be signed by one \
+                 ({sig_name} is missing; `robodr-commission trust-keys ... --sign-key ROOT.key`)"
+            )))
+        }
+        (_, None) => None,
     };
-    if floor.is_some() && signed_by.is_none() {
+    if l.floor.is_some() && signed_by.is_none() {
         return Err(bad(format!(
             "min_profile_version is set but the file is not signed by a trust root \
              ({sig_name} missing, or no trust_roots configured)"
         )));
     }
+    let require_attestation = l.require_attestation.unwrap_or(roots.is_some());
+    if require_attestation && l.operators.is_none() {
+        return Err(bad(
+            "operator attestation is required (the default with trust roots) but the file lists \
+             no operators: add them (`trust-keys --operators operators.json`) or set \
+             require_attestation: false"
+                .into(),
+        ));
+    }
     Ok(TrustFile {
-        keys: ring_of(&keys).map_err(bad)?,
-        public_keys: keys,
-        min_profile_version: floor,
+        keys: ring_of(&l.keys).map_err(bad)?,
+        public_keys: l.keys,
+        min_profile_version: l.floor,
         signed_by,
+        operators: l.operators,
+        require_attestation,
     })
 }
 
@@ -935,6 +1104,15 @@ pub struct TrustPolicy {
     pub expect_platform: Option<String>,
     /// `metadata.unit_id` must be `None` (fleet-wide) or equal this, if set.
     pub expect_unit_id: Option<String>,
+    /// The public keys behind `anchors` (gives
+    /// [`VerifiedProfile::signer_fingerprint`], which revocation needs).
+    pub anchor_keys: Vec<Ed25519VerifyingKey>,
+    /// Require a valid operator attestation on a locked profile, verified
+    /// against `operators` (missing operators: every locked profile is
+    /// refused).
+    pub require_attestation: bool,
+    /// Who may attest (the trust file's `operators` / `motion_quorum`).
+    pub operators: Option<OperatorTrust>,
 }
 
 /// A profile that passed [`verify_profile_text`].
@@ -945,6 +1123,12 @@ pub struct VerifiedProfile {
     pub digest: String,
     /// Key id that signed it (`None` for a draft).
     pub signed_by: Option<String>,
+    /// [`key_fingerprint`] of the signing key (`None` for a draft, or when
+    /// the policy did not provide the public keys).
+    pub signer_fingerprint: Option<String>,
+    /// The verified operator attestation (`None` when not required or a
+    /// draft).
+    pub attestation: Option<AttestationSummary>,
 }
 
 impl VerifiedProfile {
@@ -970,6 +1154,8 @@ pub fn verify_profile_text(
             profile,
             digest,
             signed_by: None,
+            signer_fingerprint: None,
+            attestation: None,
         });
     }
     let Some(meta) = profile.metadata.as_ref() else {
@@ -1003,10 +1189,28 @@ pub fn verify_profile_text(
             .into());
         }
     }
+    let signer_fingerprint = policy
+        .anchor_keys
+        .iter()
+        .find(|k| Verifier::key_id(*k) == sig.key_id)
+        .map(|k| key_fingerprint(k.as_bytes()));
+    let attestation = if policy.require_attestation {
+        let Some(ops) = &policy.operators else {
+            return Err(ProfileTrustError::BadAttestation {
+                detail: "attestation is required but no operators are configured".into(),
+            }
+            .into());
+        };
+        Some(verify_attestation(&profile, ops)?)
+    } else {
+        None
+    };
     Ok(VerifiedProfile {
         profile,
         digest,
         signed_by: Some(sig.key_id),
+        signer_fingerprint,
+        attestation,
     })
 }
 
@@ -1086,6 +1290,10 @@ pub struct AcceptedState {
     /// [`RevocationList::digest`] of that list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revocation_digest: Option<String>,
+    /// The highest root-signed `min_profile_version` accepted so far
+    /// (`None`: none). A trust file with a lower floor never lowers it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_floor: Option<u64>,
 }
 
 impl AcceptedState {
@@ -1102,10 +1310,11 @@ impl AcceptedState {
             digest: v.digest.clone(),
             revocation_serial: None,
             revocation_digest: None,
+            trust_floor: None,
         })
     }
 
-    /// Structural check (format, digests, version, revocation pair).
+    /// Structural check (format, digests, version, revocation pair, floor).
     pub fn validate(&self) -> Result<(), String> {
         if self.format != STATE_FORMAT {
             return Err(format!(
@@ -1115,6 +1324,9 @@ impl AcceptedState {
         }
         if !is_sha256_digest(&self.digest) || self.profile_version == 0 {
             return Err("malformed digest or version".into());
+        }
+        if self.trust_floor == Some(0) {
+            return Err("trust_floor must be >= 1".into());
         }
         match (&self.revocation_serial, &self.revocation_digest) {
             (None, None) => Ok(()),
@@ -1298,8 +1510,8 @@ pub enum StateAlarmReason {
     /// No state file, but the black box recorded an accepted profile.
     StateMissing,
     /// The state file is older than the black box's record (lower
-    /// version, other digest for the same version, or an older revocation
-    /// list).
+    /// version, other digest for the same version, an older revocation
+    /// list, or a lower trust floor).
     StateBehindChain,
 }
 
@@ -1348,9 +1560,9 @@ impl fmt::Display for StateAlarm {
 /// a [`StateAlarm`]. The profile part of the baseline is the chain's when
 /// the state is missing or behind it (lower version, or same version and
 /// other digest), else the state's; the revocation part is the higher
-/// serial (the chain's on a tie with other content). A state *ahead* of
-/// the chain is normal (accepted, then stopped before the note was
-/// written) and raises nothing.
+/// serial (the chain's on a tie with other content); the trust floor is
+/// the higher one. A state *ahead* of the chain is normal (accepted, then
+/// stopped before the note was written) and raises nothing.
 pub fn reconcile_with_chain(
     state: Option<&AcceptedState>,
     chain: Option<&AcceptedState>,
@@ -1375,11 +1587,13 @@ pub fn reconcile_with_chain(
         (None, Some(_)) => true,
         (Some((ss, sd)), Some((cs, cd))) => cs > ss || (cs == ss && cd != sd),
     };
+    let floor_behind = c.trust_floor > s.trust_floor;
     let mut base = if profile_behind { c.clone() } else { s.clone() };
     let rev_src = if rev_behind { c } else { s };
     base.revocation_serial = rev_src.revocation_serial;
     base.revocation_digest = rev_src.revocation_digest.clone();
-    let alarm = (profile_behind || rev_behind).then(|| StateAlarm {
+    base.trust_floor = s.trust_floor.max(c.trust_floor);
+    let alarm = (profile_behind || rev_behind || floor_behind).then(|| StateAlarm {
         reason: StateAlarmReason::StateBehindChain,
         state: Some(s.clone()),
         chain: c.clone(),
@@ -1396,7 +1610,7 @@ pub struct TrustInputs<'a> {
     pub trusted_keys: Option<&'a Path>,
     /// `robodr-trust-roots/v1` file (signs revocation lists and floors).
     pub trust_roots: Option<&'a Path>,
-    /// `robodr-profile-revocations/v1` file.
+    /// `robodr-profile-revocations/v2` file.
     pub revocation_list: Option<&'a Path>,
     /// What a missing revocation list means.
     pub revocation_policy: RevocationPolicy,
@@ -1476,23 +1690,33 @@ fn evaluate_inner(
     base: Option<Baseline>,
 ) -> Result<Accepted, ProfileFileError> {
     let roots = inp.trust_roots.map(load_trust_roots);
-    let (anchors, floor, setup_err) = match inp.trusted_keys {
-        None => (None, None, None),
-        Some(p) => {
-            let r = match &roots {
-                Some(Ok(r)) => Some(r),
-                _ => None,
-            };
-            match load_trust_file(p, r) {
-                Ok(tf) => (Some(tf.keys), tf.min_profile_version, None),
-                Err(e) => (None, None, Some(e)),
-            }
-        }
+    let tf = inp.trusted_keys.map(|p| match &roots {
+        // Roots are configured but unusable: the trust file cannot be
+        // authenticated (reported as the roots error for a locked profile
+        // below).
+        Some(Err(e)) => Err(e.clone()),
+        Some(Ok(r)) => load_trust_file(p, Some(r)),
+        None => load_trust_file(p, None),
+    });
+    let (policy, floor, setup_err) = match tf {
+        None => (TrustPolicy::default(), None, None),
+        Some(Ok(tf)) => (
+            TrustPolicy {
+                anchors: Some(tf.keys),
+                anchor_keys: tf.public_keys,
+                require_attestation: tf.require_attestation,
+                operators: tf.operators,
+                ..Default::default()
+            },
+            tf.min_profile_version,
+            None,
+        ),
+        Some(Err(e)) => (TrustPolicy::default(), None, Some(e)),
     };
     let policy = TrustPolicy {
-        anchors,
         expect_platform: inp.expect_platform.map(str::to_string),
         expect_unit_id: inp.expect_unit_id.map(str::to_string),
+        ..policy
     };
     let sig_path = sig_path_for(path);
     let sig_name = sig_path.display().to_string();
@@ -1518,6 +1742,16 @@ fn evaluate_inner(
         (v, _) => v?,
     };
     let locked = verified.profile.locked;
+    // The baseline (state file reconciled with the black box), if any.
+    let (current, baseline) = match base {
+        None => (None, None),
+        Some(b) => {
+            let (c, bl, _) = b?;
+            (Some(c), Some(bl))
+        }
+    };
+    let remembered_floor = baseline.as_ref().and_then(|b| b.as_ref()?.trust_floor);
+    let floor = floor.max(remembered_floor);
     let mut revocation: Option<(u64, String)> = None;
     if locked {
         let roots = match roots {
@@ -1573,9 +1807,10 @@ fn evaluate_inner(
                 s.revocation_serial = Some(*serial);
                 s.revocation_digest = Some(digest.clone());
             }
+            s.trust_floor = floor;
             s
         });
-    let Some(base) = base else {
+    let Some(baseline) = baseline else {
         return Ok(Accepted {
             verified,
             decision: None,
@@ -1583,7 +1818,6 @@ fn evaluate_inner(
             record,
         });
     };
-    let (current, baseline, _) = base?;
     if locked {
         if let Some((bs, bd)) = baseline.as_ref().and_then(AcceptedState::revocation) {
             match &revocation {
@@ -1608,6 +1842,7 @@ fn evaluate_inner(
         }
     }
     let decision = check_rollback(baseline.as_ref(), &verified, inp.allow_rollback)?;
+    let current = current.flatten();
     let state_write = match &record {
         Some(r) if current.as_ref() != Some(r) => Some(r.clone()),
         _ => None,
@@ -1625,7 +1860,9 @@ mod tests {
     use super::*;
     use crate::profile_file::sealed_text;
     use robodr_blackbox::sign_ed25519::derive_key_id;
-    use robodr_events::profile::{Envelope, ProfileMetadata, PROFILE_SCHEMA_VERSION};
+    use robodr_events::profile::{
+        Envelope, ProfileAttestation, ProfileMetadata, PROFILE_SCHEMA_VERSION,
+    };
 
     fn key(n: u8) -> Ed25519SigningKey {
         Ed25519SigningKey::from_seed(format!("k{n}"), &[n; 32]).unwrap()
@@ -1655,6 +1892,7 @@ mod tests {
                 locked_by: "op".into(),
                 locked_at: 1_790_000_000,
                 parent_digest: None,
+                attestation: None,
             }),
             ..Default::default()
         };
@@ -2014,6 +2252,8 @@ mod tests {
             digest: file_digest(format!("{version}{salt}").as_bytes()),
             profile: p,
             signed_by: Some("k1".into()),
+            signer_fingerprint: Some(kfp("k1")),
+            attestation: None,
         }
     }
 
@@ -2031,6 +2271,7 @@ mod tests {
             digest: file_digest(b"x"),
             revocation_serial: None,
             revocation_digest: None,
+            trust_floor: Some(2),
         })
         .unwrap();
         let anchors = ring(&[&k]);
@@ -2234,6 +2475,14 @@ mod tests {
         parse_trust_roots(&trust_roots_text(&vks)).unwrap()
     }
 
+    /// Fingerprint of test key `kN`.
+    fn kfp(id: &str) -> String {
+        let n: u8 = id[1..].parse().unwrap();
+        key_fingerprint(key(n).verifying_key().as_bytes())
+    }
+
+    /// A list for platform "ugv" revoking `digests` and the keys named
+    /// `kN` (by fingerprint).
     fn rl(
         serial: u64,
         digests: &[&str],
@@ -2243,8 +2492,9 @@ mod tests {
         RevocationList::create(
             serial,
             1_790_000_000,
+            "ugv",
             digests.iter().map(|s| s.to_string()),
-            key_ids.iter().map(|s| s.to_string()),
+            key_ids.iter().map(|s| kfp(s)),
             k,
         )
         .unwrap()
@@ -2258,7 +2508,10 @@ mod tests {
         let l = rl(3, &[&d, &d], &["k9", "k1"], &r);
         // Sorted and deduplicated.
         assert_eq!(l.revoked_digests, vec![d.clone()]);
-        assert_eq!(l.revoked_key_ids, vec!["k1".to_string(), "k9".to_string()]);
+        let mut want = vec![kfp("k1"), kfp("k9")];
+        want.sort();
+        assert_eq!(l.revoked_keys, want);
+        assert_eq!(l.platform, "ugv");
         let text = l.to_text();
         let p = RevocationList::parse(&text).unwrap();
         p.verify(&rs).unwrap();
@@ -2273,8 +2526,9 @@ mod tests {
         for edit in [
             text.replace("\"serial\": 3", "\"serial\": 4"),
             text.replace("1790000000", "1790000001"),
-            text.replace("\"k9\"", "\"k8\""),
+            text.replace(&kfp("k9"), &kfp("k8")),
             text.replace(&d, &file_digest(b"q")),
+            text.replace("\"platform\": \"ugv\"", "\"platform\": \"ugw\""),
         ] {
             let t = RevocationList::parse(&edit).unwrap();
             assert!(
@@ -2294,8 +2548,13 @@ mod tests {
         assert!(rl(3, &[], &[], &imp).verify(&rs).is_err());
         // HMAC signer refused at creation.
         let h = robodr_blackbox::HmacSha256Key::new("root1", &[7; 32]).unwrap();
-        assert!(RevocationList::create(1, 0, [], [], &h).is_err());
-        assert!(RevocationList::create(0, 0, [], [], &r).is_err());
+        assert!(RevocationList::create(1, 0, "ugv", [], [], &h).is_err());
+        assert!(RevocationList::create(0, 0, "ugv", [], [], &r).is_err());
+        // A key id (label) where a fingerprint belongs, or a bad platform.
+        assert!(RevocationList::create(1, 0, "ugv", [], ["k1".to_string()], &r).is_err());
+        assert!(RevocationList::create(1, 0, "u g v", [], [], &r).is_err());
+        assert!(RevocationList::create(1, 0, "", [], [], &r).is_err());
+        assert_eq!(kfp("k1"), file_digest(key(1).verifying_key().as_bytes()));
     }
 
     #[test]
@@ -2311,8 +2570,16 @@ mod tests {
             text.replace("\"serial\": 2", "\"serial\": -1"),
             text.replace("\"serial\": 2", "\"serial\": 1e400"),
             text.replace("sha256:", "md5:"),
-            text.replace("\"k1\"", "\"\""),
-            text.replace("\"k1\"", "\"k1\", \"k1\""),
+            text.replace(&format!("\"{}\"", kfp("k1")), "\"\""),
+            text.replace(&format!("\"{}\"", kfp("k1")), "\"k1\""),
+            text.replace(
+                &format!("\"{}\"", kfp("k1")),
+                &format!("\"{0}\", \"{0}\"", kfp("k1")),
+            ),
+            text.replace("\"platform\": \"ugv\"", "\"platform\": \"\""),
+            text.replace("\"platform\": \"ugv\",", ""),
+            // A v1 list (revoked keys by key id) is refused outright.
+            text.replace(REVOCATION_FORMAT, REVOCATION_FORMAT_V1),
             text.replace("\"serial\"", "\"extra\": 1,\n  \"serial\""),
             text.replace("\"serial\"", "\"serial\": 5,\n  \"serial\""),
             text.replace("\"ed25519\"", "\"hmac-sha256\""),
@@ -2328,8 +2595,16 @@ mod tests {
         for n in 0..text.trim_end().len() {
             assert!(RevocationList::parse(&text[..n]).is_err(), "prefix {n}");
         }
-        let many: Vec<String> = (0..=MAX_REVOKED_ENTRIES).map(|i| format!("k{i}")).collect();
-        assert!(RevocationList::create(1, 0, [], many, &r).is_err());
+        let many: Vec<String> = (0..=MAX_REVOKED_ENTRIES)
+            .map(|i| file_digest(format!("{i}").as_bytes()))
+            .collect();
+        assert!(RevocationList::create(1, 0, "ugv", [], many, &r).is_err());
+        assert!(
+            RevocationList::parse(&text.replace(REVOCATION_FORMAT, REVOCATION_FORMAT_V1))
+                .unwrap_err()
+                .to_string()
+                .contains("re-issue")
+        );
         // Byte flips never panic.
         let mut x: u32 = 0x1234_5678;
         for _ in 0..500 {
@@ -2347,12 +2622,48 @@ mod tests {
         }
     }
 
+    /// Operator keys (distinct from profile keys and roots).
+    fn op(n: u8) -> Ed25519SigningKey {
+        Ed25519SigningKey::from_seed(format!("op{n}"), &[50 + n; 32]).unwrap()
+    }
+
+    /// alice (op1) and bob (op2), motion_quorum 2.
+    fn operators() -> OperatorTrust {
+        OperatorTrust::new(
+            vec![
+                ("alice".into(), op(1).verifying_key()),
+                ("bob".into(), op(2).verifying_key()),
+            ],
+            2,
+        )
+        .unwrap()
+    }
+
+    /// A trust file with `keys`, `floor` and the [`operators`].
+    fn tf_text(keys: &[Ed25519VerifyingKey], floor: Option<u64>) -> String {
+        let ops = operators();
+        trust_file_text_with(
+            keys,
+            &TrustFileOptions {
+                min_profile_version: floor,
+                operators: Some(&ops),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn root_sig(text: &str, r: &Ed25519SigningKey) -> String {
+        ProfileSignature::create_for(SigKind::TrustFile, text.as_bytes(), r)
+            .unwrap()
+            .to_text()
+    }
+
     #[test]
     fn trust_file_floor_needs_root_signature() {
         let k = key(1);
         let r = root(1);
         let rs = roots(&[&r]);
-        let floored = trust_file_text(&[k.verifying_key()], Some(5));
+        let floored = tf_text(&[k.verifying_key()], Some(5));
         let sig = ProfileSignature::create_for(SigKind::TrustFile, floored.as_bytes(), &r)
             .unwrap()
             .to_text();
@@ -2377,21 +2688,113 @@ mod tests {
         // Floor 0, a root among the profile keys, a floor in the roots file.
         let zero = trust_file_text(&[k.verifying_key()], Some(0));
         assert!(parse_trust_file(&zero, None, "t", None).is_err());
-        let overlap = trust_file_text(&[k.verifying_key(), r.verifying_key()], None);
-        assert!(parse_trust_file(&overlap, None, "t", Some(&rs))
-            .unwrap_err()
-            .to_string()
-            .contains("distinct"));
+        let overlap = tf_text(&[k.verifying_key(), r.verifying_key()], None);
+        assert!(
+            parse_trust_file(&overlap, Some(&root_sig(&overlap, &r)), "t", Some(&rs))
+                .unwrap_err()
+                .to_string()
+                .contains("distinct")
+        );
         let roots_with_floor = trust_roots_text(&[r.verifying_key()])
             .replace("\"keys\"", "\"min_profile_version\": 2,\n  \"keys\"");
         assert!(parse_trust_roots(&roots_with_floor).is_err());
         // The roots file and a trust file are not interchangeable.
         assert!(parse_trust_roots(&trust_keys_text(&[r.verifying_key()])).is_err());
         assert!(parse_trust_keys(&trust_roots_text(&[r.verifying_key()])).is_err());
-        // Unsigned, no floor: fine, with or without roots.
+        // Unsigned, no floor: fine without roots only (see
+        // `unsigned_trust_file_cannot_strip_the_signed_floor`).
         let plain = trust_keys_text(&[k.verifying_key()]);
-        assert!(parse_trust_file(&plain, None, "t", Some(&rs)).is_ok());
         assert!(parse_trust_file(&plain, None, "t", None).is_ok());
+        assert!(
+            parse_trust_file(&tf_text(&[k.verifying_key()], None), None, "t", Some(&rs))
+                .unwrap_err()
+                .to_string()
+                .contains("must be signed")
+        );
+    }
+
+    #[test]
+    fn trust_file_operators_and_attestation_requirement() {
+        let k = key(1);
+        let r = root(1);
+        let rs = roots(&[&r]);
+        let vk = [k.verifying_key()];
+        // With roots, attestation is required by default: operators needed.
+        let plain = trust_keys_text(&vk);
+        let e = parse_trust_file(&plain, Some(&root_sig(&plain, &r)), "t", Some(&rs)).unwrap_err();
+        assert!(e.to_string().contains("no operators"), "{e}");
+        let with_ops = tf_text(&vk, None);
+        let tf =
+            parse_trust_file(&with_ops, Some(&root_sig(&with_ops, &r)), "t", Some(&rs)).unwrap();
+        assert!(tf.require_attestation);
+        assert_eq!(tf.operators.as_ref().unwrap().motion_quorum(), 2);
+        // A root-signed explicit opt-out.
+        let opt_out = trust_file_text_with(
+            &vk,
+            &TrustFileOptions {
+                require_attestation: Some(false),
+                ..Default::default()
+            },
+        );
+        let tf = parse_trust_file(&opt_out, Some(&root_sig(&opt_out, &r)), "t", Some(&rs)).unwrap();
+        assert!(!tf.require_attestation && tf.operators.is_none());
+        // Without roots: not required unless the file says so.
+        assert!(
+            !parse_trust_file(&with_ops, None, "t", None)
+                .unwrap()
+                .require_attestation
+        );
+        let req = trust_file_text_with(
+            &vk,
+            &TrustFileOptions {
+                require_attestation: Some(true),
+                ..Default::default()
+            },
+        );
+        assert!(
+            parse_trust_file(&req, None, "t", None).is_err(),
+            "required, no operators"
+        );
+        // Operators must be distinct from profile keys and from roots.
+        let self_op = OperatorTrust::new(vec![("mallory".into(), k.verifying_key())], 1).unwrap();
+        let t = trust_file_text_with(
+            &vk,
+            &TrustFileOptions {
+                operators: Some(&self_op),
+                ..Default::default()
+            },
+        );
+        assert!(parse_trust_file(&t, None, "t", None)
+            .unwrap_err()
+            .to_string()
+            .contains("also a profile signing key"));
+        let root_op = OperatorTrust::new(vec![("rooty".into(), r.verifying_key())], 1).unwrap();
+        let t = trust_file_text_with(
+            &vk,
+            &TrustFileOptions {
+                operators: Some(&root_op),
+                ..Default::default()
+            },
+        );
+        assert!(
+            parse_trust_file(&t, Some(&root_sig(&t, &r)), "t", Some(&rs))
+                .unwrap_err()
+                .to_string()
+                .contains("also a trust root")
+        );
+        // Malformed operator sections; members that belong to trust files
+        // are refused in a roots file.
+        for bad in [
+            with_ops.replace("\"motion_quorum\": 2", "\"motion_quorum\": 3"),
+            with_ops.replace("\"motion_quorum\": 2", "\"motion_quorum\": 0"),
+            plain.replace("\"keys\"", "\"motion_quorum\": 1,\n  \"keys\""),
+            with_ops.replace("\"alice\"", "\" alice\""),
+        ] {
+            assert!(parse_trust_file(&bad, None, "t", None).is_err(), "{bad}");
+        }
+        let roots_with_ops = trust_roots_text(&[r.verifying_key()])
+            .replace("\"keys\"", "\"require_attestation\": false,\n  \"keys\"");
+        assert!(parse_trust_roots(&roots_with_ops).is_err());
     }
 
     fn st(version: u64, salt: &str, rev: Option<(u64, &str)>) -> AcceptedState {
@@ -2446,6 +2849,18 @@ mod tests {
             reconcile_with_chain(Some(&s3r2), Some(&s3r2)),
             (Some(s3r2.clone()), None)
         );
+        // Trust floor: the higher one wins; a lower state floor is behind.
+        let mut f5 = s3.clone();
+        f5.trust_floor = Some(5);
+        let (b, a) = reconcile_with_chain(Some(&s3), Some(&f5));
+        assert_eq!(b.unwrap().trust_floor, Some(5));
+        assert_eq!(a.unwrap().reason, StateAlarmReason::StateBehindChain);
+        let (b, a) = reconcile_with_chain(Some(&f5), Some(&s3));
+        assert_eq!(b.unwrap().trust_floor, Some(5));
+        assert!(a.is_none(), "state ahead of the chain is normal");
+        let mut zero = s3.clone();
+        zero.trust_floor = Some(0);
+        assert!(zero.validate().is_err());
     }
 
     #[test]
@@ -2490,18 +2905,41 @@ mod tests {
         state: PathBuf,
     }
 
+    /// Embed an operator attestation in locked `p`: a confirmed sign-off
+    /// for its content (operator alice, = `locked_by`) signed by `signers`.
+    fn attest(p: &mut Profile, signers: &[&Ed25519SigningKey]) {
+        let text = signoff_text_for(p, "alice");
+        let mut sigs = crate::signoff::SignoffSignatures::new(text.as_bytes());
+        for k in signers {
+            sigs.add(text.as_bytes(), *k).unwrap();
+        }
+        let m = p.metadata.as_mut().unwrap();
+        m.locked_by = "alice".into();
+        m.attestation = Some(attestation_for(&text, &sigs));
+    }
+
+    /// The confirmed sign-off text `lock` would have used for `p`.
+    fn signoff_text_for(p: &Profile, operator: &str) -> String {
+        let mut d = p.clone();
+        d.locked = false;
+        d.metadata = None;
+        crate::to_json(&crate::signoff::Signoff::for_profile(&d).confirm_all(operator)).unwrap()
+    }
+
+    /// `locked(version)` attested by alice and bob.
+    fn attested(version: u64) -> Profile {
+        let mut p = locked(version);
+        attest(&mut p, &[&op(1), &op(2)]);
+        p
+    }
+
     impl Fx {
         fn new(tag: &str, floor: Option<u64>) -> Self {
             let dir = tmpdir(tag);
             let trust = dir.join("trust.json");
-            let text = trust_file_text(&[key(1).verifying_key(), key(2).verifying_key()], floor);
+            let text = tf_text(&[key(1).verifying_key(), key(2).verifying_key()], floor);
             std::fs::write(&trust, &text).unwrap();
-            if floor.is_some() {
-                let sig =
-                    ProfileSignature::create_for(SigKind::TrustFile, text.as_bytes(), &root(1))
-                        .unwrap();
-                std::fs::write(sig_path_for(&trust), sig.to_text()).unwrap();
-            }
+            std::fs::write(sig_path_for(&trust), root_sig(&text, &root(1))).unwrap();
             let roots = dir.join("roots.json");
             std::fs::write(&roots, trust_roots_text(&[root(1).verifying_key()])).unwrap();
             Self {
@@ -2514,7 +2952,11 @@ mod tests {
         }
 
         fn profile(&self, name: &str, version: u64, k: &Ed25519SigningKey) -> (PathBuf, String) {
-            let (text, sig) = signed(&locked(version), k);
+            self.write(name, &attested(version), k)
+        }
+
+        fn write(&self, name: &str, p: &Profile, k: &Ed25519SigningKey) -> (PathBuf, String) {
+            let (text, sig) = signed(p, k);
             let p = self.dir.join(name);
             std::fs::write(&p, &text).unwrap();
             std::fs::write(sig_path_for(&p), sig).unwrap();
@@ -2592,6 +3034,7 @@ mod tests {
             refused(&eval(&p, &text, &fx.inputs())),
             ProfileTrustError::RevokedKey {
                 key_id: "k1".into(),
+                fingerprint: kfp("k1"),
                 serial: 2
             }
         );
@@ -2626,7 +3069,7 @@ mod tests {
         );
         // Tampered list (valid JSON, signature broken).
         let good = rl(3, &[], &["k1"], &root(1)).to_text();
-        std::fs::write(&fx.revs, good.replace("\"k1\"", "\"k0\"")).unwrap();
+        std::fs::write(&fx.revs, good.replace(&kfp("k1"), &kfp("k7"))).unwrap();
         assert!(matches!(
             refused(&eval(&p2, &t2, &fx.inputs())),
             ProfileTrustError::Revocations { .. }
@@ -2782,5 +3225,277 @@ mod tests {
         // A broken roots file refuses locked profiles.
         std::fs::write(&fx.roots, "{").unwrap();
         assert!(evaluate_profile_trust(&p3, &t3, &i).result.is_err());
+    }
+
+    // ------------------------------------ security review regressions --
+    // Each was a PoC that passed while the weakness existed; they now
+    // assert the fixed behaviour.
+
+    /// With trust roots configured an unsigned trust file was accepted, so
+    /// whoever could rewrite it stripped the root-signed floor. Now it is
+    /// refused, and the highest floor ever accepted is remembered in the
+    /// state file and the black-box record, so neither an unsigned file
+    /// nor an older root-signed one (replay) lowers it.
+    #[test]
+    fn unsigned_trust_file_cannot_strip_the_signed_floor() {
+        let fx = Fx::new("reg-floor-strip", Some(3));
+        let (p2, t2) = fx.profile("v2.json", 2, &key(1));
+        let (p3, t3) = fx.profile("v3.json", 3, &key(1));
+        let mut i = fx.inputs();
+        i.state_file = None;
+        assert!(matches!(
+            refused(&evaluate_profile_trust(&p2, &t2, &i)),
+            ProfileTrustError::BelowFloor { .. }
+        ));
+        // Accept v3 with state: the floor is recorded.
+        let rec = eval(&p3, &t3, &fx.inputs()).result.unwrap().record.unwrap();
+        assert_eq!(rec.trust_floor, Some(3));
+        assert_eq!(load_state(&fx.state).unwrap().unwrap().trust_floor, Some(3));
+        // Attacker: same keys, no floor, no signature.
+        let stripped = tf_text(&[key(1).verifying_key(), key(2).verifying_key()], None);
+        std::fs::write(&fx.trust, &stripped).unwrap();
+        std::fs::remove_file(sig_path_for(&fx.trust)).unwrap();
+        let e = evaluate_profile_trust(&p2, &t2, &i);
+        assert!(
+            matches!(refused(&e), ProfileTrustError::TrustFile { ref detail } if detail.contains("must be signed")),
+            "{:?}",
+            e.result
+        );
+        // An older root-signed trust file without the floor (replay): the
+        // remembered floor still holds (state) ...
+        std::fs::write(sig_path_for(&fx.trust), root_sig(&stripped, &root(1))).unwrap();
+        assert!(evaluate_profile_trust(&p3, &t3, &fx.inputs())
+            .result
+            .is_ok());
+        assert_eq!(
+            refused(&evaluate_profile_trust(&p2, &t2, &fx.inputs())),
+            ProfileTrustError::BelowFloor {
+                floor: 3,
+                offered_version: 2
+            }
+        );
+        // ... and with the state deleted, the black-box record carries it.
+        std::fs::remove_file(&fx.state).unwrap();
+        let mut c = fx.inputs();
+        c.chain = Some(&rec);
+        let e = evaluate_profile_trust(&p2, &t2, &c);
+        assert!(matches!(
+            refused(&e),
+            ProfileTrustError::BelowFloor { floor: 3, .. }
+        ));
+        assert!(e.alarm.is_some());
+        // The accepted record keeps the floor although the file has none.
+        let a = evaluate_profile_trust(&p3, &t3, &c).result.unwrap();
+        assert_eq!(a.record.unwrap().trust_floor, Some(3));
+    }
+
+    /// Key revocation was by `key_id` label, which neither the profile
+    /// signature nor the trust file binds to the key: re-listing the
+    /// revoked key under another id (and editing the `.sig`'s `key_id`)
+    /// loaded a profile signed by it. Now keys are revoked by public-key
+    /// fingerprint, and the list is bound to a platform.
+    #[test]
+    fn key_revocation_survives_renaming_the_key_id() {
+        let fx = Fx::new("reg-rev-rename", None);
+        let (p, text) = fx.profile("p.json", 2, &key(1));
+        fx.list(&rl(1, &[], &["k1"], &root(1)));
+        let mut i = fx.inputs();
+        i.state_file = None;
+        assert!(matches!(
+            refused(&evaluate_profile_trust(&p, &text, &i)),
+            ProfileTrustError::RevokedKey { .. }
+        ));
+        // The revoked key re-listed as "k1-reissued" (even in a properly
+        // root-signed trust file) and the .sig edited to match.
+        let renamed = robodr_blackbox::Ed25519VerifyingKey::from_bytes(
+            "k1-reissued",
+            key(1).verifying_key().as_bytes(),
+        )
+        .unwrap();
+        let t = tf_text(&[renamed], None);
+        std::fs::write(&fx.trust, &t).unwrap();
+        std::fs::write(sig_path_for(&fx.trust), root_sig(&t, &root(1))).unwrap();
+        let sig = std::fs::read_to_string(sig_path_for(&p))
+            .unwrap()
+            .replace("\"k1\"", "\"k1-reissued\"");
+        std::fs::write(sig_path_for(&p), sig).unwrap();
+        assert_eq!(
+            refused(&evaluate_profile_trust(&p, &text, &i)),
+            ProfileTrustError::RevokedKey {
+                key_id: "k1-reissued".into(),
+                fingerprint: kfp("k1"),
+                serial: 1
+            }
+        );
+        // A list issued for another platform is refused, whatever it holds.
+        let other = RevocationList::create(2, 0, "drone", [], [], &root(1)).unwrap();
+        fx.list(&other);
+        assert_eq!(
+            refused(&evaluate_profile_trust(&p, &text, &i)),
+            ProfileTrustError::RevocationPlatformMismatch {
+                list: "drone".into(),
+                profile: "ugv".into()
+            }
+        );
+        // A signed profile whose key's public bytes are unknown to the
+        // policy cannot be checked against a list: refused.
+        let v = VerifiedProfile {
+            signer_fingerprint: None,
+            ..verified(2, "")
+        };
+        assert!(matches!(
+            rl(1, &[], &[], &root(1)).check(&v),
+            Err(ProfileTrustError::Revocations { .. })
+        ));
+    }
+
+    /// The unit never saw the operator sign-off: a hand-built locked
+    /// profile that one profile-key holder sealed and signed was fully
+    /// trusted, so the two-person rule bound only the honest `lock` path.
+    /// Now the profile must carry the signed sign-off (attestation) and it
+    /// is verified against the trust file's operators and motion quorum.
+    #[test]
+    fn signed_profile_needs_operator_attestation() {
+        let fx = Fx::new("reg-no-signoff", None);
+        let mut i = fx.inputs();
+        i.state_file = None;
+        // Hand-made: no attestation at all.
+        let mut p = locked(1);
+        p.metadata.as_mut().unwrap().locked_by = "nobody-signed-off".into();
+        p.participants.insert("e".repeat(24));
+        let (path, text) = fx.write("handmade.json", &p, &key(1));
+        assert_eq!(
+            refused(&evaluate_profile_trust(&path, &text, &i)),
+            ProfileTrustError::Unattested
+        );
+        // A genuine attestation (of v1) copied onto other content.
+        let genuine = attested(1);
+        let mut forged = p.clone();
+        forged.metadata = genuine.metadata.clone();
+        let (path, text) = fx.write("forged.json", &forged, &key(1));
+        let e = refused(&evaluate_profile_trust(&path, &text, &i));
+        assert!(
+            matches!(&e, ProfileTrustError::BadAttestation { detail } if detail.contains("other content")),
+            "{e}"
+        );
+        // One operator signs alone a sign-off with motion items.
+        let mut solo = locked(1);
+        attest(&mut solo, &[&op(1)]);
+        let (path, text) = fx.write("solo.json", &solo, &key(1));
+        assert_eq!(
+            refused(&evaluate_profile_trust(&path, &text, &i)),
+            ProfileTrustError::AttestationQuorumNotMet { have: 1, need: 2 }
+        );
+        // A signature by a key that is not an operator (e.g. the profile key).
+        let mut rogue = locked(1);
+        attest(&mut rogue, &[&op(1), &op(2), &key(1)]);
+        let (path, text) = fx.write("rogue.json", &rogue, &key(1));
+        assert!(matches!(
+            refused(&evaluate_profile_trust(&path, &text, &i)),
+            ProfileTrustError::BadAttestation { .. }
+        ));
+        // locked_by is not the sign-off's operator.
+        let mut renamed = attested(1);
+        renamed.metadata.as_mut().unwrap().locked_by = "bob".into();
+        let (path, text) = fx.write("renamed.json", &renamed, &key(1));
+        assert!(matches!(
+            refused(&evaluate_profile_trust(&path, &text, &i)),
+            ProfileTrustError::BadAttestation { detail } if detail.contains("locked_by")
+        ));
+        // The properly attested profile loads and says who attested.
+        let (path, text) = fx.profile("good.json", 1, &key(1));
+        let a = evaluate_profile_trust(&path, &text, &i).result.unwrap();
+        let att = a.verified.attestation.unwrap();
+        assert_eq!(att.operator, "alice");
+        assert_eq!(att.signers.len(), 2);
+        assert_eq!(att.quorum, 2);
+        assert_eq!(a.verified.signer_fingerprint, Some(kfp("k1")));
+        // A root-signed opt-out accepts the unattested profile.
+        let opt_out = trust_file_text_with(
+            &[key(1).verifying_key(), key(2).verifying_key()],
+            &TrustFileOptions {
+                require_attestation: Some(false),
+                ..Default::default()
+            },
+        );
+        std::fs::write(&fx.trust, &opt_out).unwrap();
+        std::fs::write(sig_path_for(&fx.trust), root_sig(&opt_out, &root(1))).unwrap();
+        let (path, text) = fx.write("handmade2.json", &p, &key(1));
+        assert!(evaluate_profile_trust(&path, &text, &i).result.is_ok());
+    }
+
+    #[test]
+    fn attestation_verification_edge_cases() {
+        let ops = operators();
+        let good = attested(1);
+        assert!(verify_attestation(&good, &ops).is_ok());
+        let edit = |f: &dyn Fn(&mut ProfileAttestation)| {
+            let mut p = good.clone();
+            f(p.metadata.as_mut().unwrap().attestation.as_mut().unwrap());
+            verify_attestation(&p, &ops)
+        };
+        // The sign-off edited after signing (a confirmation flipped).
+        assert!(edit(&|a| a.signoff = a.signoff.replacen("true", "false", 1)).is_err());
+        // Garbage, truncated and duplicate-key texts.
+        assert!(edit(&|a| a.signoff = "{".into()).is_err());
+        assert!(edit(&|a| a.signatures = "[]".into()).is_err());
+        assert!(edit(&|a| a.signoff = a.signoff[..a.signoff.len() / 2].to_string()).is_err());
+        assert!(edit(&|a| {
+            a.signoff = a
+                .signoff
+                .replacen("\"model\"", "\"model\": \"x\", \"model\"", 1)
+        })
+        .is_err());
+        // No signatures at all.
+        assert!(edit(&|a| {
+            let so = a.signoff.clone();
+            a.signatures = crate::signoff::SignoffSignatures::new(so.as_bytes()).to_text();
+        })
+        .is_err());
+        // An unconfirmed list signed by both (honestly signed, still refused).
+        let mut p = locked(1);
+        let mut d = p.clone();
+        d.locked = false;
+        d.metadata = None;
+        let mut so = crate::signoff::Signoff::for_profile(&d).confirm_all("alice");
+        so.items[0].confirmed = false;
+        let text = crate::to_json(&so).unwrap();
+        let mut sigs = crate::signoff::SignoffSignatures::new(text.as_bytes());
+        sigs.add(text.as_bytes(), &op(1)).unwrap();
+        sigs.add(text.as_bytes(), &op(2)).unwrap();
+        let m = p.metadata.as_mut().unwrap();
+        m.locked_by = "alice".into();
+        m.attestation = Some(attestation_for(&text, &sigs));
+        assert!(verify_attestation(&p, &ops)
+            .unwrap_err()
+            .to_string()
+            .contains("not confirmed"));
+        // No motion channel: no quorum, one operator suffices.
+        let mut calm = locked(1);
+        calm.motion_envelopes.clear();
+        attest(&mut calm, &[&op(1)]);
+        let s = verify_attestation(&calm, &ops).unwrap();
+        assert_eq!((s.motion_items, s.quorum), (0, 0));
+        // Unattested and legacy.
+        assert_eq!(
+            verify_attestation(&locked(1), &ops),
+            Err(ProfileTrustError::Unattested)
+        );
+        let mut legacy = locked(1);
+        legacy.metadata = None;
+        assert_eq!(
+            verify_attestation(&legacy, &ops),
+            Err(ProfileTrustError::LegacyUnversioned)
+        );
+        // Through verify_profile_text: required, operators missing.
+        let (t, sig) = signed(&good, &key(1));
+        let mut pol = policy(&[&key(1)]);
+        pol.require_attestation = true;
+        assert!(matches!(
+            untrusted(verify_profile_text(&t, Some(&sig), "x", &pol)),
+            ProfileTrustError::BadAttestation { .. }
+        ));
+        pol.operators = Some(ops);
+        assert!(verify_profile_text(&t, Some(&sig), "x", &pol).is_ok());
     }
 }
