@@ -207,14 +207,13 @@ impl MonitorSettings {
     }
 }
 
-/// Angular speed bound (rad/s) that [`FirewallSettings::from_profile`] puts
-/// on Twist channels. The profile has no angular field, and a missing bound
-/// means "unlimited": a conservative explicit value for demos and replays.
-/// Production must set the OEM's value.
-pub const DEFAULT_MAX_ANGULAR_SPEED: f64 = 1.0;
-
 /// Motion Firewall settings: per-platform behaviour plus one spec per
 /// profiled motion channel (the firewall refuses a policy that misses one).
+///
+/// The platform defaults are the firewall's: a command from a source not
+/// allowed on the channel is dropped (`ForeignSourceAction::Drop`, the
+/// spoofer gets no effect on the output, the deviation is still recorded),
+/// and `Policy::compile` runs `Profile::validate` on the profile.
 #[derive(Debug, Clone)]
 pub struct FirewallSettings {
     pub platform: PlatformConfig,
@@ -231,36 +230,63 @@ impl FirewallSettings {
     /// `allowed[channel]`; a channel without an entry allows **every
     /// participant in the profile** — permissive, meant for demos and
     /// replays. Production must list the real writer GUIDs.
-    pub fn from_profile(profile: &Profile, allowed: &BTreeMap<String, Vec<String>>) -> Self {
-        let channels = profile
-            .motion_envelopes
-            .iter()
-            .map(|(name, env)| {
-                let kind = if env.max_linear_speed.is_some() || env.max_joint_speed.is_none() {
-                    ChannelKind::Twist
-                } else {
-                    ChannelKind::Joints { count: 1 }
-                };
-                let allowed_sources = allowed
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_else(|| profile.participants.iter().cloned().collect());
-                (
-                    name.clone(),
-                    ChannelSpec {
-                        kind,
-                        allowed_sources,
-                        max_angular_speed: (kind == ChannelKind::Twist)
-                            .then_some(DEFAULT_MAX_ANGULAR_SPEED),
-                        ..ChannelSpec::default()
-                    },
-                )
-            })
-            .collect();
-        Self {
+    ///
+    /// Angular limit: the profile envelope has no angular field, and the
+    /// firewall treats a missing limit as unlimited, so every Twist channel
+    /// needs an explicit `max_angular[channel]` (rad/s) from the agent
+    /// configuration (the OEM's value; `robodr-replay
+    /// --firewall-max-angular CHANNEL=RAD_S`). Fails closed with a
+    /// configuration error if one is missing, or if `max_angular` names a
+    /// channel that is not a profiled Twist channel (typo protection).
+    pub fn from_profile(
+        profile: &Profile,
+        allowed: &BTreeMap<String, Vec<String>>,
+        max_angular: &BTreeMap<String, f64>,
+    ) -> Result<Self, AgentError> {
+        let mut channels = BTreeMap::new();
+        for (name, env) in &profile.motion_envelopes {
+            let kind = if env.max_linear_speed.is_some() || env.max_joint_speed.is_none() {
+                ChannelKind::Twist
+            } else {
+                ChannelKind::Joints { count: 1 }
+            };
+            let allowed_sources = allowed
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| profile.participants.iter().cloned().collect());
+            let max_angular_speed = match kind {
+                ChannelKind::Twist => Some(
+                    *max_angular
+                        .get(name)
+                        .ok_or_else(|| AgentError::Config(missing_angular(name)))?,
+                ),
+                ChannelKind::Joints { .. } => None,
+            };
+            channels.insert(
+                name.clone(),
+                ChannelSpec {
+                    kind,
+                    allowed_sources,
+                    max_angular_speed,
+                    ..ChannelSpec::default()
+                },
+            );
+        }
+        if let Some(extra) = max_angular
+            .keys()
+            .find(|k| !matches!(channels.get(*k), Some(c) if c.kind == ChannelKind::Twist))
+        {
+            return Err(AgentError::Config(format!(
+                "firewall max_angular_speed given for {extra:?}, which is not a profiled Twist \
+                 motion channel"
+            )));
+        }
+        let fs = Self {
             platform: PlatformConfig::default(),
             channels,
-        }
+        };
+        fs.validate().map_err(AgentError::Config)?;
+        Ok(fs)
     }
 
     /// Refuse limits the firewall would accept but that disable protection:
@@ -292,6 +318,9 @@ impl FirewallSettings {
                     }
                 }
             }
+            if c.kind == ChannelKind::Twist && c.max_angular_speed.is_none() {
+                return Err(missing_angular(name));
+            }
             if !c.hard_reject_factor.is_finite() || c.hard_reject_factor < 1.0 {
                 return Err(format!(
                     "firewall channel {name:?}: hard_reject_factor must be finite and >= 1, got {}",
@@ -301,6 +330,15 @@ impl FirewallSettings {
         }
         Ok(())
     }
+}
+
+fn missing_angular(channel: &str) -> String {
+    format!(
+        "firewall channel {channel:?} is a Twist channel and needs an explicit max_angular_speed \
+         (rad/s): the profile envelope has no angular limit and a missing one means unlimited; \
+         set the OEM's value in the agent config (robodr-replay: --firewall-max-angular \
+         {channel}=RAD_PER_S)"
+    )
 }
 
 /// SHA-256 (hex) of the profile's canonical JSON (serde_json of the parsed
@@ -357,6 +395,8 @@ mod tests {
             ..Profile::default()
         };
         p.participants.insert("0102030405060708090a0b0c".into());
+        p.writer_topics.insert("/cmd_vel".into());
+        p.writer_topics.insert("/arm".into());
         p.motion_envelopes.insert(
             "/cmd_vel".into(),
             Envelope {
@@ -373,14 +413,38 @@ mod tests {
         );
         let mut allowed = BTreeMap::new();
         allowed.insert("/arm".to_string(), vec!["aa".to_string()]);
-        let fw = FirewallSettings::from_profile(&p, &allowed);
+        let angular = BTreeMap::from([("/cmd_vel".to_string(), 0.8)]);
+        let fw = FirewallSettings::from_profile(&p, &allowed, &angular).unwrap();
         assert_eq!(fw.channels["/cmd_vel"].kind, ChannelKind::Twist);
+        assert_eq!(fw.channels["/cmd_vel"].max_angular_speed, Some(0.8));
+        assert_eq!(fw.channels["/arm"].max_angular_speed, None);
         assert_eq!(
             fw.channels["/cmd_vel"].allowed_sources,
             vec!["0102030405060708090a0b0c".to_string()]
         );
         assert_eq!(fw.channels["/arm"].kind, ChannelKind::Joints { count: 1 });
         assert_eq!(fw.channels["/arm"].allowed_sources, vec!["aa".to_string()]);
+
+        // Fail closed: a Twist channel without an angular bound.
+        let e = FirewallSettings::from_profile(&p, &allowed, &BTreeMap::new()).unwrap_err();
+        assert!(e.to_string().contains("max_angular_speed"), "{e}");
+        assert!(e.to_string().contains("/cmd_vel"), "{e}");
+        // A bound for a joint channel or an unknown channel is a typo.
+        for bad in ["/arm", "/cmd_vell"] {
+            let mut a = angular.clone();
+            a.insert(bad.to_string(), 1.0);
+            let e = FirewallSettings::from_profile(&p, &allowed, &a).unwrap_err();
+            assert!(e.to_string().contains(bad), "{e}");
+        }
+        // Non-finite / negative bounds are refused.
+        for v in [f64::NAN, f64::INFINITY, -1.0] {
+            let a = BTreeMap::from([("/cmd_vel".to_string(), v)]);
+            assert!(FirewallSettings::from_profile(&p, &allowed, &a).is_err());
+        }
+        // validate() also catches a hand-built Twist spec without one.
+        let mut fw = fw;
+        fw.channels.get_mut("/cmd_vel").unwrap().max_angular_speed = None;
+        assert!(fw.validate().unwrap_err().contains("max_angular_speed"));
     }
 
     #[test]

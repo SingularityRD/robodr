@@ -112,7 +112,7 @@ impl<T: Copy> SampleBuffer<T> {
     pub fn push(&mut self, v: T, cap: usize) {
         let cap = cap.max(2);
         let stride = self.stride.max(1);
-        if self.offered % stride == 0 {
+        if self.offered.is_multiple_of(stride) {
             if self.retained.len() >= cap {
                 // Keep every 2nd retained sample: they are exactly the
                 // offered samples at multiples of 2 * stride.
@@ -124,7 +124,7 @@ impl<T: Copy> SampleBuffer<T> {
                 });
                 self.stride = stride.saturating_mul(2);
             }
-            if self.offered % self.stride.max(1) == 0 && self.retained.len() < cap {
+            if self.offered.is_multiple_of(self.stride.max(1)) && self.retained.len() < cap {
                 self.retained.push(v);
             }
         }

@@ -24,7 +24,7 @@ pub fn hex(p: [u8; 12]) -> String {
 
 fn param(pid: u16, value: &[u8]) -> Vec<u8> {
     let mut v = value.to_vec();
-    while v.len() % 4 != 0 {
+    while !v.len().is_multiple_of(4) {
         v.push(0);
     }
     let mut p = pid.to_le_bytes().to_vec();
@@ -217,7 +217,7 @@ pub fn pcap(frames: &[Vec<u8>]) -> Vec<u8> {
 pub fn pcapng(frames: &[Vec<u8>]) -> Vec<u8> {
     fn block(out: &mut Vec<u8>, t: u32, body: &[u8]) {
         let mut body = body.to_vec();
-        while body.len() % 4 != 0 {
+        while !body.len().is_multiple_of(4) {
             body.push(0);
         }
         let len = (12 + body.len()) as u32;

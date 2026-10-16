@@ -587,6 +587,7 @@ mod tests {
             ..Default::default()
         };
         p.participants.insert(P.into());
+        p.writer_topics.insert("/cmd_vel".into());
         p.motion_envelopes.insert(
             "/cmd_vel".into(),
             Envelope {
@@ -757,6 +758,7 @@ mod tests {
         assert!(e.unwrap_err().to_string().contains("max_angular_speed"));
         // Joint channels have no angular group: not required there.
         let mut p = profile();
+        p.writer_topics.insert("/arm".into());
         p.motion_envelopes.insert(
             "/arm".into(),
             Envelope {

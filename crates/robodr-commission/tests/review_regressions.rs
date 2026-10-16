@@ -12,7 +12,7 @@ use robodr_commission::{
     InputError, LearnConfig, Learner, LockRefusal, ParticipantStatus, PcapSource, ProfileFileError,
     Signoff, VecSource,
 };
-use robodr_events::graph::Participant;
+use robodr_events::graph::{Endpoint, Participant};
 use robodr_events::profile::Profile;
 use robodr_events::{MotionCommand, RobotEvent};
 use std::net::Ipv4Addr;
@@ -260,9 +260,15 @@ fn injected_fast_motion_never_widens_envelope_past_cap() {
             source_guid: Some(a.into()),
             linear_speed: Some(v),
             joint_speed: Some(v),
+            angular_speed: None,
         })
     };
-    let mut evs = vec![part(), part()];
+    let writer = RobotEvent::Ros2WriterDiscovered(Endpoint {
+        guid_prefix: a.into(),
+        topic: "rt/cmd_vel".into(),
+        type_name: "geometry_msgs::msg::dds_::Twist_".into(),
+    });
+    let mut evs = vec![part(), part(), writer];
     evs.extend((0..50).map(|i| mv(0.01 * f64::from(i))));
     for v in [
         f64::NAN,
@@ -401,7 +407,7 @@ fn pcap_header(linktype: u32) -> Vec<u8> {
 
 fn ng_block(out: &mut Vec<u8>, t: u32, body: &[u8]) {
     let mut body = body.to_vec();
-    while body.len() % 4 != 0 {
+    while !body.len().is_multiple_of(4) {
         body.push(0);
     }
     let len = (12 + body.len()) as u32;

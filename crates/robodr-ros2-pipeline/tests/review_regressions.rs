@@ -395,11 +395,13 @@ fn f4a_ambiguous_unannounced_writer_is_high() {
     assert_eq!(u[0].deviation.severity, Severity::High, "{f:#?}");
 }
 
-/// F4b: interior NUL in the topic: the parser drops the announcement; the
-/// pipeline reports it as not inspected (Medium) even with anomaly
-/// reporting off.
+/// F4b: interior NUL in the topic. The parser reads the name up to the first
+/// NUL (as a C-string based stack does) and flags it non-canonical; the
+/// pipeline inspects the announcement (the rogue `cmd_vel` writer is
+/// caught) and raises a High ambiguity finding even with anomaly reporting
+/// off, because a length-based stack reads a different name.
 #[test]
-fn f4b_interior_nul_topic_is_not_silently_dropped() {
+fn f4b_interior_nul_topic_is_inspected_and_ambiguous() {
     let mut v = 13u32.to_le_bytes().to_vec();
     v.extend_from_slice(b"rt/cmd_vel\0x\0");
     while !v.len().is_multiple_of(4) {
@@ -416,14 +418,21 @@ fn f4b_interior_nul_topic_is_not_silently_dropped() {
         ..Default::default()
     });
     let f = p.process(&d, XIP);
-    let n = with_rule(&f, rules::DISCOVERY_NOT_INSPECTED);
-    assert_eq!(n.len(), 1, "{f:#?}");
-    assert_eq!(n[0].deviation.severity, Severity::Medium);
+    let a = with_rule(&f, rules::AMBIGUOUS_DISCOVERY);
+    assert_eq!(a.len(), 1, "{f:#?}");
+    assert_eq!(a[0].deviation.severity, Severity::High);
+    assert!(a[0].deviation.detail.contains("PID_TOPIC_NAME"));
+    let w = with_rule(&f, "robot.ros2.unauthorized_motion_writer");
+    assert_eq!(w.len(), 1, "{f:#?}");
+    assert_eq!(w[0].deviation.severity, Severity::Critical);
 }
 
-/// F4c: a parameter length that is not a multiple of 4.
+/// F4c: a parameter length that is not a multiple of 4. The parser accepts
+/// it the way Fast DDS does (next parameter read right after it) and flags
+/// it: the announcement is inspected (rogue `cmd_vel` writer caught) and the
+/// anomaly is reported.
 #[test]
-fn f4c_unaligned_parameter_is_not_silently_dropped() {
+fn f4c_unaligned_parameter_is_inspected_and_flagged() {
     let mut params = param(0x005a, &guid(ROGUE, ROGUE_ENTITY));
     params.extend_from_slice(&0x0005u16.to_le_bytes());
     params.extend_from_slice(&15u16.to_le_bytes());
@@ -432,9 +441,15 @@ fn f4c_unaligned_parameter_is_not_silently_dropped() {
     let d = datagram(ROGUE, &[data(ENTITY_SEDP_PUB_WRITER, 1, &pl_raw(&params))]);
     let mut p = pipeline();
     let f = p.process(&d, XIP);
-    let n = with_rule(&f, rules::DISCOVERY_NOT_INSPECTED);
-    assert_eq!(n.len(), 1, "{f:#?}");
-    assert!(n[0].deviation.detail.contains("MalformedParameterList"));
+    let w = with_rule(&f, "robot.ros2.unauthorized_motion_writer");
+    assert_eq!(w.len(), 1, "{f:#?}");
+    assert_eq!(w[0].deviation.severity, Severity::Critical);
+    let m = with_rule(&f, rules::MALFORMED_DISCOVERY);
+    assert!(
+        m.iter()
+            .any(|x| x.deviation.detail.contains("MisalignedParameterLength")),
+        "{f:#?}"
+    );
 }
 
 // ----------------------------------------------------------------- F5 ----

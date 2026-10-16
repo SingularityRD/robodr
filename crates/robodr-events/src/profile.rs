@@ -71,10 +71,13 @@
 //! # Motion envelope
 //!
 //! See the crate docs for the NaN / negative / invalid-limit rules. Checks run
-//! in this order and the first hit is returned: non-finite command (Critical),
+//! in this order and the first hit is returned: non-finite command (linear,
+//! joint or angular; Critical),
 //! unprofiled channel (High), invalid envelope limit (High, profile error),
 //! linear over envelope (Critical), joint over envelope (Critical). `None` as a
-//! limit means "not constrained"; use `None`, not `+inf`, for that.
+//! limit means "not constrained"; use `None`, not `+inf`, for that. The
+//! envelope has no angular field: a finite yaw rate is bounded by the Motion
+//! Firewall's per-channel `max_angular_speed`, not here.
 //!
 //! # Limits
 //!
@@ -486,7 +489,11 @@ impl Profile {
     fn check_motion(&self, c: &MotionCommand) -> Option<Deviation> {
         // 1. Hostile floats first: NaN compares false with everything, so it
         //    must never reach a `>` check.
-        for (dim, v) in [("linear", c.linear_speed), ("joint", c.joint_speed)] {
+        for (dim, v) in [
+            ("linear", c.linear_speed),
+            ("joint", c.joint_speed),
+            ("angular", c.angular_speed),
+        ] {
             if let Some(v) = v.filter(|v| !v.is_finite()) {
                 return Some(Deviation::new(
                     "robot.motion.non_finite_command",
@@ -602,7 +609,17 @@ mod tests {
             source_guid: Some(KNOWN.into()),
             linear_speed: lin,
             joint_speed: joint,
+            angular_speed: None,
         })
+    }
+    fn with_angular(e: RobotEvent, a: f64) -> RobotEvent {
+        match e {
+            RobotEvent::MotionCommand(c) => RobotEvent::MotionCommand(MotionCommand {
+                angular_speed: Some(a),
+                ..c
+            }),
+            other => other,
+        }
     }
     fn rule_of(p: &Profile, e: &RobotEvent) -> Option<String> {
         p.evaluate(e).map(|d| d.rule.into_owned())
@@ -810,6 +827,8 @@ mod tests {
                 cmd("/cmd_vel", Some(0.1), Some(bad)),
                 // Even on an unprofiled channel, the hostile float wins.
                 cmd("/nowhere", Some(bad), None),
+                // Yaw rate: no envelope limit, but never a hostile float.
+                with_angular(cmd("/cmd_vel", Some(0.1), None), bad),
             ] {
                 let d = p.evaluate(&e).expect("NaN/inf must deviate");
                 assert_eq!(d.rule, "robot.motion.non_finite_command");
@@ -826,6 +845,10 @@ mod tests {
         );
         assert!(q
             .evaluate(&cmd("/free", Some(1e300), Some(-1e300)))
+            .is_none());
+        // A finite signed yaw rate is not judged by the profile (no limit).
+        assert!(q
+            .evaluate(&with_angular(cmd("/free", Some(-0.2), None), -3.0))
             .is_none());
     }
 
@@ -901,6 +924,9 @@ mod tests {
             channel: "/unknown".into(),
             measured_linear_speed: Some(f64::NAN),
             measured_joint_speed: None,
+            linear_velocity: None,
+            angular_velocity: None,
+            publisher_guid: None,
             timestamp_ns: 0,
         });
         assert!(profile().evaluate(&fb).is_none());

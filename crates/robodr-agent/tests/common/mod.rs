@@ -44,6 +44,14 @@ pub fn tmpdir(tag: &str) -> PathBuf {
     d
 }
 
+/// The OEM angular bound (rad/s) the tests configure for the demo's Twist
+/// channel (the profile envelope has none; the firewall requires one).
+pub const DEMO_MAX_ANGULAR: f64 = 1.0;
+
+pub fn demo_angular() -> std::collections::BTreeMap<String, f64> {
+    std::collections::BTreeMap::from([("/cmd_vel".to_string(), DEMO_MAX_ANGULAR)])
+}
+
 pub fn demo_profile(locked: bool) -> Profile {
     let text = std::fs::read_to_string(examples().join("ugv-demo.profile.json")).unwrap();
     let mut p: Profile = serde_json::from_str(&text).unwrap();
@@ -133,6 +141,7 @@ pub fn cmd(source: &str, v: f64) -> RobotEvent {
         source_guid: Some(source.into()),
         linear_speed: Some(v),
         joint_speed: None,
+        angular_speed: None,
     })
 }
 

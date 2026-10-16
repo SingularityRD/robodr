@@ -214,13 +214,16 @@ opens it from its own config section in `init_state`.
   No SPDP socket, no capture and no external source is rejected in
   `init_state`.
 - **Observe mode, enforce mode and refused profiles.** The profile is
-  checked with `Profile::validate` when it is loaded:
+  checked with `Profile::validate` when it is loaded, and a locked profile
+  file must also pass `robodr_commission::parse_profile_text` (strict keys
+  and the lock seal written by `robodr-commission lock`):
 
   | Profile | `extra.profile_status` | Threats |
   |---|---|---|
   | valid, `locked = true` | `enforcing` | `extra.mode = "enforce"`, `observe_only = false` |
   | valid, `locked = false` | `observing` | `mode = "observe"`, `observe_only = true`, description starts with `[observe-only] `, module warning raised |
   | fails validation | `refused` | as observing, plus: every error logged, one module warning, one `robot.ros2.profile_refused` (High, observe-only) threat |
+  | `locked = true`, file check fails (edited after lock, no seal) | `refused` | same as above, with the file-check reason |
 
   **Decision (fail closed): a refused profile is never enforced, and the
   sensor keeps running observe-only.**
@@ -360,6 +363,9 @@ opens it from its own config section in `init_state`.
     - `mpsc`, `Mutex::lock_owned` / `OwnedMutexGuard`, `UdpSocket`, and
       `spawn` with its `Send + 'static` bounds;
     - `JoinHandle::abort`, `time::sleep` and `#[tokio::main]`;
+    - `time::interval` (panics on a zero period), `Interval::tick`,
+      `Interval::set_missed_tick_behavior` and `MissedTickBehavior`, for the
+      1 s housekeeping branch (`Pipeline::tick` + capture-health findings);
     - auto traits match the real ones: channel ends and `Mutex` are
       `Send`/`Sync` only when `T: Send`;
     - a `select!` stand-in that keeps all branch futures alive at once and
@@ -454,7 +460,8 @@ in this file.
    Expected compiler-visible risk points:
    - the `async fn` impls against the `impl Future + Send` trait
      signatures;
-   - `tokio::select!` over three `Option` sources;
+   - `tokio::select!` over three `Option` sources plus the housekeeping
+     `Interval::tick` branch;
    - `Value::try_from(finding.extra())`.
 5. `cargo clippy -p robodr-sensor-ros2 -p robodr-pulsard --all-targets -- -D warnings`.
 6. `cargo build -p robodr-pulsard` (default features: `pulsar/core` and

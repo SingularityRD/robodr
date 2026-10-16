@@ -1,7 +1,8 @@
 //! `config/robodr.toml.example` stays in sync with [`Config`]: every key of
-//! the `[module.robodr-sensor-ros2]` section (and its `capture` sub-table),
-//! including the commented-out examples, is a known field and the result
-//! deserialises and validates.
+//! the `[module.robodr-sensor-ros2]` section (and its `capture` and
+//! `binding` sub-tables, incl. `binding.participant_ips`), including the
+//! commented-out examples, is a known field and the result deserialises and
+//! validates.
 //!
 //! No TOML parser is available offline, so this uses a minimal line parser
 //! for the flat `key = value` subset the example uses (strings, integers,
@@ -22,7 +23,11 @@ const TOP_KEYS: &[&str] = &[
     "dedup_capacity",
     "report_anomalies",
     "report_fragmentation",
+    "max_findings_per_datagram",
+    "rate_limit_burst",
+    "rate_limit_interval_ms",
 ];
+const BINDING_KEYS: &[&str] = &["enabled", "hold_ms", "max_participants", "discovery_server"];
 const CAPTURE_KEYS: &[&str] = &[
     "enabled",
     "interfaces",
@@ -53,16 +58,33 @@ fn toml_value(raw: &str) -> Option<Value> {
     }
 }
 
-/// (section, include commented-out `# key = value` lines) -> JSON object.
-fn sections(text: &str, uncomment: bool) -> (Map<String, Value>, Map<String, Value>) {
-    let (mut top, mut cap) = (Map::new(), Map::new());
+#[derive(Default)]
+struct Sections {
+    top: Map<String, Value>,
+    cap: Map<String, Value>,
+    binding: Map<String, Value>,
+    pins: Map<String, Value>,
+}
+
+/// (sections, include commented-out `# key = value` lines) -> JSON objects.
+fn sections(text: &str, uncomment: bool) -> Sections {
+    let mut out = Sections::default();
     let mut current: Option<&str> = None;
     for line in text.lines() {
         let line = line.trim();
-        if line.starts_with('[') {
+        // A commented-out section header (`# [robodr-agent.firewall]`) also
+        // ends the current section when uncommenting.
+        let header = match line.strip_prefix('#') {
+            Some(c) if uncomment && c.trim_start().starts_with('[') => c.trim_start(),
+            _ => line,
+        };
+        if header.starts_with('[') {
+            let line = header;
             current = Some(match line {
                 "[module.robodr-sensor-ros2]" => "top",
                 "[module.robodr-sensor-ros2.capture]" => "capture",
+                "[module.robodr-sensor-ros2.binding]" => "binding",
+                "[module.robodr-sensor-ros2.binding.participant_ips]" => "pins",
                 _ => "other",
             });
             continue;
@@ -76,6 +98,11 @@ fn sections(text: &str, uncomment: bool) -> (Map<String, Value>, Map<String, Val
             continue;
         };
         let k = k.trim();
+        // Quoted keys (GUID prefixes in participant_ips).
+        let k = k
+            .strip_prefix('"')
+            .and_then(|x| x.strip_suffix('"'))
+            .unwrap_or(k);
         if k.contains(' ') || k.is_empty() {
             continue; // prose in a comment
         }
@@ -86,15 +113,21 @@ fn sections(text: &str, uncomment: bool) -> (Map<String, Value>, Map<String, Val
         };
         match current {
             Some("top") if k != "enabled" => {
-                top.insert(k.into(), v);
+                out.top.insert(k.into(), v);
             }
             Some("capture") => {
-                cap.insert(k.into(), v);
+                out.cap.insert(k.into(), v);
+            }
+            Some("binding") => {
+                out.binding.insert(k.into(), v);
+            }
+            Some("pins") => {
+                out.pins.insert(k.into(), v);
             }
             _ => {}
         }
     }
-    (top, cap)
+    out
 }
 
 fn example() -> String {
@@ -106,8 +139,32 @@ fn example() -> String {
 fn example_keys_are_known_and_parse() {
     let text = example();
     for uncomment in [false, true] {
-        let (top, cap) = sections(&text, uncomment);
-        assert!(top.len() >= 8, "{top:?}");
+        let Sections {
+            top,
+            cap,
+            mut binding,
+            pins,
+        } = sections(&text, uncomment);
+        assert!(top.len() >= 11, "{top:?}");
+        for k in [
+            "max_findings_per_datagram",
+            "rate_limit_burst",
+            "rate_limit_interval_ms",
+        ] {
+            assert!(top.contains_key(k), "{k} missing from the example");
+        }
+        for k in binding.keys() {
+            assert!(
+                BINDING_KEYS.contains(&k.as_str()),
+                "unknown binding key {k}"
+            );
+        }
+        for k in ["enabled", "hold_ms", "max_participants"] {
+            assert!(
+                binding.contains_key(k),
+                "binding.{k} missing from the example"
+            );
+        }
         for k in top.keys() {
             assert!(TOP_KEYS.contains(&k.as_str()), "unknown key {k}");
         }
@@ -122,9 +179,15 @@ fn example_keys_are_known_and_parse() {
                 assert!(cap.contains_key(k), "commented example for {k} not seen");
             }
             assert!(top.contains_key("spdp_port"));
+            assert!(binding.contains_key("discovery_server"));
+            assert_eq!(pins.len(), 1, "commented participant_ips example not seen");
+        } else {
+            assert!(pins.is_empty());
         }
+        binding.insert("participant_ips".into(), Value::Object(pins));
         let mut obj = top.clone();
         obj.insert("capture".into(), Value::Object(cap));
+        obj.insert("binding".into(), Value::Object(binding));
         let cfg: Config = serde_json::from_value(Value::Object(obj)).unwrap();
         let (settings, _warnings) = cfg.validate_with(|| Some("eth0".into())).unwrap();
         if uncomment {

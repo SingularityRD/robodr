@@ -78,12 +78,12 @@ internal problem cannot by itself cause a motion request.
 
 | Failure | Behaviour |
 |---|---|
-| Black-box I/O failure (recorder poisoned, rotation fails) | Drop the recorder, reopen the directory (resume + quarantine of a torn tail, signed `Resume`), retry once; at most one reopen per second of monotonic time. Detections, plans and findings continue without links meanwhile. `evidence_recovered` note with the number of lost appends when it works again. |
+| Black-box I/O failure (recorder poisoned, rotation fails) | Drop the recorder, reopen the directory (resume + quarantine of a torn tail, signed `Resume`), retry once; at most one reopen per second of monotonic time. Detections, plans and findings continue without links meanwhile. `evidence_recovered` note with the number of lost appends when it works again. The reopen authenticates the chain tail and the signed export-cursor / checkpoint files with the agent's key (`Signer::verify_own`, or the verifier given to `Agent::new_with_verifier` for a signer that cannot verify); a tail that is not a crash artefact (complete frame with a bad hash or signature) is refused (`Corrupt`), and the agent stays degraded (`evidence_recovery_failed`). A recovered torn tail is a verifier **Warning**: the report is intact but not clean. |
 | Signer failure | Nothing written; same outage accounting, no reopen. |
 | Monotonic clock goes backwards | Held at the last value (`TimeGuard`); `clock_regression` fault. |
 | Wall time disagrees with monotonic progress by > `clock_jump_tolerance_ns` (default 1 s) | Wall time kept as reported (evidence), `wall_clock_jump` fault. Rate limits and escalation windows use monotonic time only, so a wall jump cannot shorten them (tested). |
 | Responder plan violates an invariant | Replaced by `Record` + approval; the rejected plan is kept in the black-box plan note. |
-| Configuration that would weaken detection | Refused at start: unknown fields in profile / monitor files, `+inf` or NaN firewall limits, `kafka_partitions = 0`, labels that cannot form a valid finding (probed at start). |
+| Configuration that would weaken detection | Refused at start: unknown fields in profile / monitor files, `+inf` or NaN firewall limits, a firewall Twist channel without an explicit `max_angular_speed`, `kafka_partitions = 0`, labels that cannot form a valid finding (probed at start). |
 
 The release profile uses `panic = "abort"`; a panic cannot be caught, so the
 chain is written and tested not to panic on hostile input. The platform's
@@ -120,7 +120,8 @@ E=crates/robodr-agent/examples
 cargo run -p robodr-agent --bin robodr-replay -- \
   --events $E/rogue-ugv.jsonl --profile $E/ugv-demo.profile.json \
   --policy $E/policy-oem-validated.json --blackbox /tmp/bb --key-hex $KEY \
-  --robot-id ugv-007 --safety-state moving_slow --firewall \
+  --robot-id ugv-007 --safety-state moving_slow \
+  --firewall --firewall-max-angular /cmd_vel=1.0 \
   --out /tmp/findings.jsonl --outcomes /tmp/outcomes.jsonl --log-plans
 
 # 2. Verify on its own (as a receiving side would), then tamper and verify again
@@ -135,13 +136,15 @@ cargo run -p robodr-agent --bin robodr-replay -- \
   --events $E/motion-injection.jsonl --profile $E/ugv-demo.profile.json \
   --policy $E/policy-oem-validated.json --blackbox /tmp/bb-motion --key-hex $KEY \
   --robot-id ugv-007 --safety-state moving_slow --step-ms 20 \
-  --monitor --feedback-source /odom=wheel_odometry --firewall
+  --monitor --feedback-source /odom=wheel_odometry \
+  --firewall --firewall-max-angular /cmd_vel=1.0
 
 # 4. Same scenario as 1 with the repository's (not OEM-validated) policy: observe only
 cargo run -p robodr-agent --bin robodr-replay -- \
   --events $E/rogue-ugv.jsonl --profile $E/ugv-demo.profile.json \
   --policy config/response-policy.example.json --blackbox /tmp/bb-observe \
-  --key-hex $KEY --robot-id ugv-007 --firewall --log-plans
+  --key-hex $KEY --robot-id ugv-007 --log-plans \
+  --firewall --firewall-max-angular /cmd_vel=1.0
 ```
 
 Output of run 1 on stderr (findings go to `--out` or stdout):
@@ -178,9 +181,11 @@ limiting. Use `--step-ms 6000` to see each one graded on its own.
   is observed at `k * --step-ms` (default 20 ms).
   `MotionFeedback.timestamp_ns` must use this monotonic base, or the
   monitor's stamp checks will fire.
-- `--firewall` builds one spec per envelope channel with default limits and,
-  on twist channels, an explicit angular bound of 1 rad/s
-  (`DEFAULT_MAX_ANGULAR_SPEED`; the profile has no angular field).
+- `--firewall` builds one spec per envelope channel with default limits.
+  Twist channels need an explicit angular bound from the operator,
+  `--firewall-max-angular CHANNEL=RAD_PER_S` (the OEM's value; the profile
+  envelope has no angular field and a missing bound would mean unlimited):
+  without it the replay refuses to start, naming the channel.
   Without `--firewall-allow CHANNEL=GUID,...`, it allows **every profile
   participant** on the channel. This is a permissive demo default; in
   production, list the real writer GUIDs. A listed participant prefix

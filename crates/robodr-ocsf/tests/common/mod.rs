@@ -53,6 +53,7 @@ pub fn motion(channel: &str, linear: Option<f64>) -> MotionCommand {
         source_guid: Some("0102030405060708090a0b0c".into()),
         linear_speed: linear,
         joint_speed: None,
+        angular_speed: None,
     }
 }
 

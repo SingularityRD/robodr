@@ -32,6 +32,16 @@ dedup_capacity = 4096
 # Rejected discovery fragments (evasion attempts) are always reported.
 report_anomalies = true
 report_fragmentation = true
+# Findings cap: at most this many new findings per input (datagram, the 1 s
+# housekeeping tick, capture-health update), most severe first; the rest are
+# summarised in one robot.sensor.findings_capped finding (1..=4096).
+max_findings_per_datagram = 64
+# Rate limit of the noisy protocol rules (robot.rtps.*, robot.capture.*,
+# robot.sensor.*): a burst of this many findings per rule (1..=10000) ...
+rate_limit_burst = 20
+# ... then one more per rule per this many ms (1..=3600000). Profile and
+# binding rules (robot.ros2.*) are never rate limited.
+rate_limit_interval_ms = 6000
 
 # Passive capture: sees the unicast SEDP announcements (who writes which
 # topic, e.g. a foreign writer on rt/cmd_vel) and loopback traffic that the
@@ -53,3 +63,62 @@ enabled = false
 read_timeout_ms = 500
 # Datagrams buffered between the capture thread and the sensor (1..=65536).
 queue_capacity = 1024
+
+# Participant <-> source-IP binding: SEDP endpoint announcements are judged
+# against the IPs / locators their participant's SPDP came from, so a rogue
+# host announcing a cmd_vel writer under a profiled GUID prefix is caught
+# (robot.ros2.endpoint_source_mismatch, Critical for motion writers).
+[module.robodr-sensor-ros2.binding]
+# Off = spoofed endpoint attribution is NOT detected.
+enabled = true
+# Hold window (ms) for SEDP seen before its participant's SPDP; then it is
+# reported as robot.ros2.endpoint_unannounced_participant (0..=600000).
+hold_ms = 30000
+# Max learned participants (1..=65536); profiled ones are evicted last.
+max_participants = 1024
+# Trusted Fast DDS discovery servers / relays whose relayed announcements
+# are accepted. Empty (default) = none.
+# discovery_server = ["10.0.0.2"]
+
+# Optional commissioning item: pin a participant GUID prefix (24 hex digits)
+# to the ONLY source IPs allowed to speak for it. List every address the
+# participant can use (DHCP, several interfaces, VPN, containers), or its own
+# announcements are reported as mismatches. Absent = learn from SPDP only.
+[module.robodr-sensor-ros2.binding.participant_ips]
+# "010f3a7c2104000001000000" = ["192.168.50.10", "10.8.0.10"]
+
+# ---------------------------------------------------------------------------
+# Motion Firewall and motion monitor (robodr-agent). NOT Pulsar module keys:
+# the agent is not a Pulsar module yet; today these are set through
+# robodr-replay flags / AgentConfig. Listed here so the OEM values are
+# recorded next to the sensor configuration. Kept commented out (Pulsar would
+# warn about an unknown section).
+#
+# [robodr-agent.firewall]
+# # REQUIRED for every Twist motion channel of the locked profile: the OEM's
+# # yaw-rate bound in rad/s. The profile envelope has no angular field and a
+# # missing bound would mean "unlimited", so the agent refuses to start
+# # without it (robodr-replay: --firewall-max-angular /cmd_vel=1.0).
+# max_angular_speed = { "/cmd_vel" = 1.0 }
+# # Writer GUIDs allowed per channel (robodr-replay: --firewall-allow).
+# # Without an entry every profile participant is allowed (demo only).
+# allowed_sources = { "/cmd_vel" = ["01103f5a8c2e00000000010100000103"] }
+# # A command from a source not allowed on the channel: "drop" (default; the
+# # spoofer gets no effect on the output, the deviation is still recorded) or
+# # "substitute" (emit the zero/hold substitute, at most once per
+# # foreign_substitute_min_interval_ms per channel; lets any bus writer force
+# # a stop, so opt in only where a foreign writer must always mean "stop").
+# foreign_source_action = "drop"
+# foreign_substitute_min_interval_ms = 1000
+#
+# [robodr-agent.motion]
+# # Feedback channel -> provenance (wheel_odometry | imu | joint_state |
+# # gnss | other; robodr-replay: --feedback-source /odom=wheel_odometry).
+# # Unmapped channels count as "other" (not compared against commands).
+# feedback_sources = { "/odom" = "wheel_odometry" }
+# # Values are signed body-frame velocities (REP 103): MotionCommand carries
+# # Twist linear.x / angular.z, MotionFeedback should carry linear_velocity /
+# # angular_velocity. A magnitude-only feedback sample (measured_linear_speed)
+# # is only used for sources configured unsigned (GNSS); for signed sources
+# # its linear axis is withheld and counted (feedback_magnitude_dropped).
+# compare_magnitudes = false

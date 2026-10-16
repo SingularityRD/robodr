@@ -375,8 +375,8 @@ fn write_line(out: &mut dyn Write, f: &crate::Finding) -> io::Result<()> {
 
 /// Run a parsed command line. `Err` = runtime error (exit code 1).
 pub fn run(args: &WatchArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<Summary, String> {
-    let profile = load_profile(&args.profile)?;
-    let mut pipeline = Pipeline::new(profile, args.options.clone());
+    let loaded = load_profile(&args.profile)?;
+    let mut pipeline = Pipeline::from_loaded(loaded, args.options.clone());
     if let Some(msg) = pipeline.status_message() {
         let _ = writeln!(err, "robodr-ros2-watch: warning: {msg}");
     }

@@ -24,6 +24,7 @@ fn run_demo(dir: &Path, extra: &[&str]) -> Output {
         .arg(dir)
         .args(["--key-hex", &key_hex(), "--robot-id", ROBOT])
         .args(["--safety-state", "moving_slow", "--firewall"])
+        .args(["--firewall-max-angular", "/cmd_vel=1.0"])
         .args(extra);
     c.output().unwrap()
 }
@@ -114,6 +115,8 @@ fn motion_demo_reports_injected_telemetry() {
             "--feedback-source",
             "/odom=wheel_odometry",
             "--firewall",
+            "--firewall-max-angular",
+            "/cmd_vel=1.0",
         ])
         .output()
         .unwrap();
@@ -144,6 +147,7 @@ fn observe_mode_demo_with_the_unvalidated_example_policy() {
         .arg("--blackbox")
         .arg(&dir)
         .args(["--key-hex", &key_hex(), "--robot-id", ROBOT, "--firewall"])
+        .args(["--firewall-max-angular", "/cmd_vel=1.0"])
         .arg("--outcomes")
         .arg(&outcomes)
         .output()

@@ -17,14 +17,14 @@
 //! | an SPDP for a bound participant from outside its binding, or relayed by a non-discovery-server IP | [`rules::PARTICIPANT_SOURCE_MISMATCH`] | High (profiled) / Medium |
 //! | a *profiled* participant announced as disposed / unregistered | [`rules::PARTICIPANT_REMOVED`] | Medium |
 //! | any other dispose / unregister (unprofiled participant, endpoint) | [`rules::DISCOVERY_REMOVAL`] | Low; Medium when sent from an IP outside the owner's binding |
-//! | conflicting duplicate identity parameters (topic, type, GUIDs, key hash, status) | [`rules::AMBIGUOUS_DISCOVERY`] | High (writers in it are then judged as motion writers by the binding check) |
+//! | conflicting duplicate identity parameters (topic, type, GUIDs, key hash, status), or a non-canonical topic / type string (embedded / missing NUL; parsed up to the first NUL) | [`rules::AMBIGUOUS_DISCOVERY`] | High (writers in it are then judged as motion writers by the binding check) |
 //! | an anomaly after which the parser dropped content (version, truncation, malformed PL, bad value, no topic, anomaly overflow) | [`rules::DISCOVERY_NOT_INSPECTED`] | Medium, always |
-//! | any other parse [`Anomaly`](robodr_rtps::Anomaly) (if `report_anomalies`) | [`rules::MALFORMED_DISCOVERY`] | Low |
+//! | any other parse [`Anomaly`] (if `report_anomalies`) | [`rules::MALFORMED_DISCOVERY`] | Low |
 //! | discovery `DATA_FRAG` seen (if `report_fragmentation`) | [`rules::FRAGMENTED_DISCOVERY`] | Low |
-//! | discovery fragments refused by the reassembler (always) | [`rules::DISCOVERY_FRAGMENT_REJECTED`] | Medium |
+//! | discovery fragments refused by the reassembler, or overlapping received bytes with conflicting content (first copy inspected) (always) | [`rules::DISCOVERY_FRAGMENT_REJECTED`] | Medium |
 //! | partially reassembled discovery samples evicted by the reassembler (always) | [`rules::DISCOVERY_FRAGMENT_EVICTED`] | Medium |
 //! | capture-layer counters grew ([`Pipeline::capture_findings`]) | `robot.capture.*` ([`rules::CAPTURE_MALFORMED_FRAMES`], [`rules::CAPTURE_IP_FRAGMENT_CONFLICT`], [`rules::CAPTURE_IP_REASSEMBLY_DROPPED`], [`rules::CAPTURE_IP_REASSEMBLY_EVICTED`]) | Low / Medium |
-//! | the profile failed `Profile::validate` (once, [`Pipeline::status_findings`]) | [`rules::PROFILE_REFUSED`] | High |
+//! | the profile failed `Profile::validate`, or a locked profile file failed the commissioning file check (seal: edited after `lock`) (once, [`Pipeline::status_findings`]) | [`rules::PROFILE_REFUSED`] | High |
 //! | one input produced more than `max_findings_per_datagram` new findings | [`rules::FINDINGS_CAPPED`] | most severe suppressed, >= Medium |
 //!
 //! Every finding is de-duplicated on (rule, detail). In addition, the noisy
@@ -91,6 +91,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use robodr_commission::{parse_profile_text, ProfileFileError};
 use robodr_events::profile::{Profile, ProfileError};
 use robodr_events::{Deviation, Mode, Severity};
 use robodr_rtps::{
@@ -149,9 +150,24 @@ fn pid_name(pid: u16) -> String {
         .map_or_else(|| format!("PID 0x{pid:04x}"), |(_, n)| (*n).to_string())
 }
 
+/// An identity parameter that DDS stacks may read differently: repeated with
+/// conflicting values, or a topic / type name whose CDR string is not
+/// canonical (embedded or missing NUL, wrong length; the parser reads it up
+/// to the first NUL like a C-string based stack, a length-based stack reads
+/// something else).
 fn is_identity_conflict(a: &Anomaly) -> bool {
-    matches!(a, Anomaly::ConflictingDuplicateParameter(pid)
-        if IDENTITY_PIDS.iter().any(|(p, _)| p == pid))
+    identity_conflict_pid(a).is_some()
+}
+
+fn identity_conflict_pid(a: &Anomaly) -> Option<u16> {
+    match a {
+        Anomaly::ConflictingDuplicateParameter(pid) | Anomaly::NonCanonicalString(pid)
+            if IDENTITY_PIDS.iter().any(|(p, _)| p == pid) =>
+        {
+            Some(*pid)
+        }
+        _ => None,
+    }
 }
 
 /// Anomalies after which the parser dropped (part of) the content: a
@@ -177,7 +193,8 @@ fn drops_content(a: &Anomaly) -> bool {
 /// Is the datagram's discovery content ambiguous (see [`IDENTITY_PIDS`])?
 #[derive(Debug, Default)]
 struct Ambiguity {
-    /// Identity PIDs repeated with conflicting values (sorted, distinct).
+    /// Identity PIDs repeated with conflicting values or carried as a
+    /// non-canonical string (sorted, distinct).
     conflicting_pids: Vec<u16>,
     /// More anomalies than the parser records: an identity conflict cannot
     /// be ruled out (an attacker could pad the list with junk first).
@@ -189,11 +206,7 @@ impl Ambiguity {
         let mut pids: Vec<u16> = report
             .anomalies
             .iter()
-            .filter(|a| is_identity_conflict(a))
-            .filter_map(|a| match a {
-                Anomaly::ConflictingDuplicateParameter(p) => Some(*p),
-                _ => None,
-            })
+            .filter_map(identity_conflict_pid)
             .collect();
         pids.sort_unstable();
         pids.dedup();
@@ -300,6 +313,11 @@ pub enum ProfileStatus {
     Observing,
     /// Failed validation: not enforced, findings are [`Mode::Observe`].
     Refused(Vec<ProfileError>),
+    /// A locked profile file that fails the commissioning file check
+    /// (`robodr_commission::parse_profile_text`: seal missing or not
+    /// matching, i.e. edited after `lock`; unknown / missing keys): not
+    /// enforced, findings are [`Mode::Observe`]. Carries the reason.
+    FileRejected(String),
 }
 
 impl ProfileStatus {
@@ -316,16 +334,17 @@ impl ProfileStatus {
     pub fn mode(&self) -> Mode {
         match self {
             Self::Enforcing => Mode::Enforce,
-            Self::Observing | Self::Refused(_) => Mode::Observe,
+            Self::Observing | Self::Refused(_) | Self::FileRejected(_) => Mode::Observe,
         }
     }
 
-    /// `"enforcing"`, `"observing"` or `"refused"`.
+    /// `"enforcing"`, `"observing"` or `"refused"` (validation or file
+    /// check failed).
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Enforcing => "enforcing",
             Self::Observing => "observing",
-            Self::Refused(_) => "refused",
+            Self::Refused(_) | Self::FileRejected(_) => "refused",
         }
     }
 
@@ -338,11 +357,39 @@ impl ProfileStatus {
     }
 }
 
-/// Read and parse a profile (JSON). Validation is **not** done here; it is
-/// done by [`Pipeline::new`] so that an invalid profile still yields an
-/// observe-only pipeline instead of a blind sensor. An unreadable or
-/// unparseable file is an error (there is nothing to observe against).
-pub fn load_profile(path: &Path) -> Result<Profile, String> {
+/// A profile file as loaded by [`load_profile`]: the parsed profile and
+/// the result of the commissioning file check.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoadedProfile {
+    pub profile: Profile,
+    /// `robodr_commission::parse_profile_text` on the file's exact text:
+    /// strict keys, and for a locked profile a valid lock seal (an edited
+    /// locked file fails here) plus `Profile::validate`.
+    pub file_check: Result<(), ProfileFileError>,
+}
+
+impl LoadedProfile {
+    /// An in-memory profile with no file behind it (tests, tools); its
+    /// status is decided by `Profile::validate` alone.
+    pub fn unchecked(profile: Profile) -> Self {
+        Self {
+            profile,
+            file_check: Ok(()),
+        }
+    }
+}
+
+/// Read and parse a profile file (JSON) and run the commissioning file check
+/// on it ([`LoadedProfile::file_check`]). Neither the check nor validation
+/// makes this fail: [`Pipeline::from_loaded`] decides, so that a profile we
+/// cannot enforce still yields an observe-only pipeline instead of a blind
+/// sensor. An unreadable or unparseable file is an error (there is nothing
+/// to observe against).
+///
+/// The parse itself stays lenient (robodr-events tolerates unknown keys and
+/// the `seal` member) so an old or hand-written draft can still be observed
+/// against; enforcement requires the strict, sealed form.
+pub fn load_profile(path: &Path) -> Result<LoadedProfile, String> {
     let file = std::fs::File::open(path)
         .map_err(|e| format!("reading profile {}: {e}", path.display()))?;
     let mut raw = String::new();
@@ -355,7 +402,13 @@ pub fn load_profile(path: &Path) -> Result<Profile, String> {
             path.display()
         ));
     }
-    serde_json::from_str(&raw).map_err(|e| format!("parsing profile {}: {e}", path.display()))
+    let profile: Profile = serde_json::from_str(&raw)
+        .map_err(|e| format!("parsing profile {}: {e}", path.display()))?;
+    let file_check = parse_profile_text(&raw).map(|_| ());
+    Ok(LoadedProfile {
+        profile,
+        file_check,
+    })
 }
 
 /// A new (not previously reported) finding, ready to become one threat.
@@ -463,6 +516,9 @@ pub struct PipelineStats {
 pub struct Pipeline {
     profile: Profile,
     status: ProfileStatus,
+    /// File-check problem of an unlocked profile (observe mode anyway),
+    /// shown in [`Pipeline::status_message`].
+    file_note: Option<String>,
     seen: DedupSet,
     reassembler: FragmentReassembler,
     binding: BindingTable,
@@ -492,9 +548,37 @@ impl fmt::Debug for Pipeline {
 
 impl Pipeline {
     /// Validate the profile ([`ProfileStatus::of`]) and build the pipeline.
+    /// For a profile read from a file use [`Pipeline::from_loaded`], which
+    /// also enforces the commissioning file check (lock seal).
     pub fn new(profile: Profile, opts: PipelineOptions) -> Self {
+        Self::from_loaded(LoadedProfile::unchecked(profile), opts)
+    }
+
+    /// Build from a [`load_profile`] result. Status: `Refused` if
+    /// `Profile::validate` fails; otherwise, for a locked profile whose file
+    /// check failed (edited after `lock`, missing seal, strict-key errors),
+    /// `FileRejected` (observe-only: never enforce a profile that is not the
+    /// one the OEM locked, never go blind); otherwise as [`ProfileStatus::of`].
+    /// A file-check problem of an unlocked profile is only a note in
+    /// [`Pipeline::status_message`].
+    pub fn from_loaded(loaded: LoadedProfile, opts: PipelineOptions) -> Self {
+        let LoadedProfile {
+            profile,
+            file_check,
+        } = loaded;
+        let mut status = ProfileStatus::of(&profile);
+        let mut file_note = None;
+        if let Err(e) = file_check {
+            let msg = e.to_string();
+            match status {
+                ProfileStatus::Enforcing => status = ProfileStatus::FileRejected(msg),
+                ProfileStatus::Observing => file_note = Some(msg),
+                _ => {}
+            }
+        }
         Self {
-            status: ProfileStatus::of(&profile),
+            status,
+            file_note,
             seen: DedupSet::new(opts.dedup_capacity),
             reassembler: FragmentReassembler::new(opts.reassembly),
             binding: BindingTable::new(opts.binding.clone(), &profile),
@@ -550,8 +634,22 @@ impl Pipeline {
         let model = sanitize(&self.profile.model);
         match &self.status {
             ProfileStatus::Enforcing => None,
-            ProfileStatus::Observing => Some(format!(
-                "profile '{model}' is NOT locked: observe mode, findings are tagged observe-only"
+            ProfileStatus::Observing => Some(match &self.file_note {
+                None => format!(
+                    "profile '{model}' is NOT locked: observe mode, findings are tagged \
+                     observe-only"
+                ),
+                Some(n) => format!(
+                    "profile '{model}' is NOT locked: observe mode, findings are tagged \
+                     observe-only (profile file check: {})",
+                    sanitize(n)
+                ),
+            }),
+            ProfileStatus::FileRejected(why) => Some(format!(
+                "profile '{model}' REFUSED for enforcement (locked profile file check failed: \
+                 {}); running observe-only until the sealed profile from `robodr-commission \
+                 lock` is loaded",
+                sanitize(why)
             )),
             ProfileStatus::Refused(errors) => Some(format!(
                 "profile '{model}' REFUSED for enforcement ({} validation error(s): {}); \
@@ -569,8 +667,8 @@ impl Pipeline {
     }
 
     /// Findings about the profile itself: one [`rules::PROFILE_REFUSED`]
-    /// finding when it failed validation, otherwise none. Report these once
-    /// at start-up.
+    /// finding when it failed validation or (locked) the file check,
+    /// otherwise none. Report these once at start-up.
     pub fn status_findings(&self) -> Vec<Finding> {
         match &self.status {
             ProfileStatus::Refused(errors) => {
@@ -583,6 +681,17 @@ impl Pipeline {
                         .map(ToString::to_string)
                         .collect::<Vec<_>>()
                         .join("; ")
+                );
+                vec![self.finding(
+                    Deviation::new(rules::PROFILE_REFUSED, Severity::High, detail),
+                    LOCAL_SOURCE,
+                )]
+            }
+            ProfileStatus::FileRejected(why) => {
+                let detail = format!(
+                    "locked model profile '{}' failed the profile file check and is not \
+                     enforced: {why}",
+                    self.profile.model
                 );
                 vec![self.finding(
                     Deviation::new(rules::PROFILE_REFUSED, Severity::High, detail),
@@ -1002,9 +1111,9 @@ impl Pipeline {
                 .collect::<Vec<_>>()
                 .join(", ");
             let detail = format!(
-                "discovery from {src_ip} repeats {pids} with conflicting values; other DDS stacks \
-                 may act on a different value than the one inspected (parsed topic(s): [{topics}]); \
-                 writers in it are judged as motion writers"
+                "discovery from {src_ip} carries {pids} with conflicting (repeated) or \
+                 non-canonical values; other DDS stacks may act on a different value than the one \
+                 inspected (parsed topic(s): [{topics}]); writers in it are judged as motion writers"
             );
             self.push(
                 out,
@@ -1060,6 +1169,24 @@ impl Pipeline {
                     src_ip,
                 );
             }
+        }
+        // The reassembler keeps the first copy of conflicting overlapping
+        // fragments (robodr-rtps); a stack that keeps the last copy would see
+        // a different announcement than the one inspected.
+        if report
+            .anomalies
+            .iter()
+            .any(|a| matches!(a, Anomaly::ConflictingDiscoveryFragment))
+        {
+            let detail = format!(
+                "discovery fragments from {src_ip} overlap received bytes with conflicting \
+                 content; the first copy was inspected, a DDS stack may reassemble the other"
+            );
+            self.push(
+                out,
+                Deviation::new(rules::DISCOVERY_FRAGMENT_REJECTED, Severity::Medium, detail),
+                src_ip,
+            );
         }
         if s.frag_rejected > 0 {
             let detail = format!(
@@ -1278,6 +1405,7 @@ mod tests {
     fn invalid_locked_profile_is_refused_and_observe_only() {
         let mut prof = profile(true);
         prof.participants.insert("NOT-A-GUID\n".into());
+        prof.writer_topics.insert("/cmd_vel".into());
         prof.motion_envelopes.insert(
             "/cmd_vel".into(),
             Envelope {
@@ -1395,13 +1523,77 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let ok = dir.join("ok.json");
         std::fs::write(&ok, r#"{"model":"m","locked":true}"#).unwrap();
-        assert!(load_profile(&ok).unwrap().locked);
+        let l = load_profile(&ok).unwrap();
+        assert!(l.profile.locked);
+        // Locked but unsealed (and keys missing): fails the file check.
+        assert!(l.file_check.is_err());
         let bad = dir.join("bad.json");
         std::fs::write(&bad, "{not json").unwrap();
         assert!(load_profile(&bad).unwrap_err().contains("parsing profile"));
         assert!(load_profile(&dir.join("missing.json"))
             .unwrap_err()
             .contains("reading profile"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn edited_locked_profile_file_is_refused_observe_only() {
+        let dir = std::env::temp_dir().join(format!("robodr-pl-seal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut prof = profile(true);
+        prof.writer_topics.insert("/cmd_vel".into());
+        let sealed = robodr_commission::sealed_text(&prof).unwrap();
+
+        // The file `robodr-commission lock` wrote: enforced.
+        let good = dir.join("sealed.json");
+        std::fs::write(&good, &sealed).unwrap();
+        let p = Pipeline::from_loaded(load_profile(&good).unwrap(), PipelineOptions::default());
+        assert_eq!(p.status(), &ProfileStatus::Enforcing);
+        assert!(p.status_findings().is_empty());
+
+        // A participant added by hand after locking: seal mismatch.
+        let edited = dir.join("edited.json");
+        let text = sealed.replace(KNOWN_HEX, "eeeeeeeeeeeeeeeeeeeeeeee");
+        assert_ne!(text, sealed);
+        std::fs::write(&edited, &text).unwrap();
+        let loaded = load_profile(&edited).unwrap();
+        assert!(loaded.profile.locked);
+        let mut p = Pipeline::from_loaded(loaded, PipelineOptions::default());
+        let ProfileStatus::FileRejected(why) = p.status().clone() else {
+            panic!("expected file rejection, got {:?}", p.status());
+        };
+        assert!(why.contains("seal"), "{why}");
+        assert_eq!(p.mode(), Mode::Observe);
+        assert!(p.status_message().unwrap().contains("REFUSED"));
+        let sf = p.status_findings();
+        assert_eq!(sf.len(), 1);
+        assert_eq!(sf[0].deviation.rule, rules::PROFILE_REFUSED);
+        assert_eq!(sf[0].profile_status, "refused");
+        // Still watching, observe-only.
+        let f = p.process(&header([0xff; 12]), "10.0.0.9");
+        assert_eq!(f.len(), 1);
+        assert!(f[0].is_observe_only());
+
+        // Locked flipped on by hand (no seal): refused too.
+        let flipped = dir.join("flipped.json");
+        let mut draft = prof.clone();
+        draft.locked = false;
+        let text = serde_json::to_string_pretty(&draft)
+            .unwrap()
+            .replace("\"locked\": false", "\"locked\": true");
+        std::fs::write(&flipped, text).unwrap();
+        let p = Pipeline::from_loaded(load_profile(&flipped).unwrap(), PipelineOptions::default());
+        assert!(matches!(p.status(), ProfileStatus::FileRejected(_)));
+
+        // An unlocked draft with a file problem is observed, with a note.
+        let draft_file = dir.join("draft.json");
+        std::fs::write(&draft_file, r#"{"model":"m","locked":false}"#).unwrap();
+        let p = Pipeline::from_loaded(
+            load_profile(&draft_file).unwrap(),
+            PipelineOptions::default(),
+        );
+        assert_eq!(p.status(), &ProfileStatus::Observing);
+        assert!(p.status_message().unwrap().contains("profile file check"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

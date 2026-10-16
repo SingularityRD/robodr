@@ -33,8 +33,8 @@ is tested offline. The same code runs in three places:
 | `robot.ros2.participant_removed` | Medium | a **profiled** participant is announced disposed or unregistered (`relayed by …` when someone else sent it) |
 | `robot.rtps.malformed_discovery` | Low | one per parse-anomaly kind and source IP (`report_anomalies`) |
 | `robot.rtps.fragmented_discovery` | Low | one per source IP sending discovery `DATA_FRAG` (`report_fragmentation`) |
-| `robot.rtps.discovery_fragment_rejected` | Medium | the reassembler refused fragments: over a cap, bad geometry or conflicting overlap. That announcement was **not** inspected. Always reported. |
-| `robot.ros2.profile_refused` | High | once at start, when the profile fails `Profile::validate` |
+| `robot.rtps.discovery_fragment_rejected` | Medium | the reassembler refused fragments (over a cap, bad geometry; that announcement was **not** inspected), or fragments overlapped with conflicting content (the first copy was inspected; a stack keeping the other copy sees a different announcement). Always reported. |
+| `robot.ros2.profile_refused` | High | once at start, when the profile fails `Profile::validate`, or a locked profile file fails the seal / strict file check |
 | `robot.ros2.endpoint_source_mismatch` | Critical (writer on a motion topic, or any writer in an ambiguous announcement when the profile has motion topics) / High | an SEDP endpoint attributed to a participant was announced from an IP not bound to it (not its SPDP source, an advertised locator, or a `participant_ips` pin), or relayed / GUID-conflicting from a non-discovery-server IP. See `src/binding.rs`. |
 | `robot.ros2.endpoint_unannounced_participant` | Medium (High for a motion-capable writer) | an SEDP endpoint whose participant sent no SPDP within `binding.hold_ms` (or before the end of a replay) |
 | `robot.ros2.participant_source_mismatch` | High (profiled) / Medium | SPDP for a bound participant from outside its binding, or relayed by a non-discovery-server IP; not learned |
@@ -72,6 +72,14 @@ eviction can only cause a re-report.
 | valid, `locked: true` | `enforcing` | `mode = "enforce"` |
 | valid, `locked: false` | `observing` | `mode = "observe"`, description prefixed `[observe-only] ` |
 | fails `Profile::validate` (locked or not) | `refused` | errors reported, one `robot.ros2.profile_refused` finding; **observe-only** |
+| `locked: true` but the file fails the commissioning check (`robodr_commission::parse_profile_text`: lock seal missing or not matching, i.e. edited after `robodr-commission lock`; unknown / missing keys) | `refused` | reason reported, one `robot.ros2.profile_refused` finding; **observe-only** |
+
+The file check lives in `robodr-commission`, which owns the profile file
+format it writes (strict keys + seal). The pipeline depends on it rather than
+duplicating the format and its SHA-256 in `robodr-events` (which cannot depend
+on `robodr-blackbox`'s crypto without a cycle). An unlocked draft that fails
+the strict check is still observed; the problem is shown in the status
+message.
 
 **Decision: a refused profile runs the sensor observe-only. It does not stop
 the sensor.**

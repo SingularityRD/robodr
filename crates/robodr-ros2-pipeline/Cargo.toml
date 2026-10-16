@@ -13,6 +13,10 @@ description = "Pulsar-independent ROS 2 / DDS detection pipeline for RoboDR: dat
 robodr-events = { workspace = true }
 robodr-rtps = { workspace = true }
 robodr-capture = { workspace = true }
+# The profile file format (strict keys + lock seal) is owned by the
+# commissioning crate that writes it; the sensor refuses an edited locked
+# profile with the same check (`parse_profile_text`).
+robodr-commission = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

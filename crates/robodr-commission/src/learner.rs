@@ -127,7 +127,7 @@ use crate::input::{CaptureDiagnostics, EventSource, InputError};
 use crate::signoff::{Signoff, SignoffItem};
 use crate::stats::{SampleBuffer, SpeedStats};
 use robodr_events::graph::{ActionRole, RosName, RosNameKind};
-use robodr_events::profile::{Envelope, Profile};
+use robodr_events::profile::{Envelope, Profile, ProfileError};
 use robodr_events::RobotEvent;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1544,7 +1544,32 @@ impl Learner {
             };
             p.motion_envelopes.insert(ch.clone(), env);
         }
+        // A motion channel whose writers were not learned (no accepted
+        // participant announced a writer on it) cannot be enveloped: every
+        // legitimate publisher would be an unknown writer, and
+        // `Profile::validate` rejects the profile
+        // (`MotionChannelNotWritable`). Leave it out, fail closed: commands on
+        // it are then reported as an unprofiled channel. `build_report` warns
+        // (`motion_envelope_dropped_no_writer`).
+        for ch in Self::unwritable_motion_channels(&p) {
+            p.motion_envelopes.remove(&ch);
+        }
         p
+    }
+
+    /// Envelope channels of `p` that `Profile::validate` reports as not
+    /// writable (same predicate as the runtime writer check).
+    fn unwritable_motion_channels(p: &Profile) -> Vec<String> {
+        match p.validate() {
+            Ok(()) => Vec::new(),
+            Err(errs) => errs
+                .into_iter()
+                .filter_map(|e| match e {
+                    ProfileError::MotionChannelNotWritable { channel } => Some(channel),
+                    _ => None,
+                })
+                .collect(),
+        }
     }
 
     /// The draft profile (`locked: false`).
@@ -1881,6 +1906,24 @@ impl Learner {
                 })
                 .collect::<BTreeMap<_, _>>()
         };
+        // Channels with accepted commands that `build_profile` left out
+        // because no accepted writer was learned on them.
+        for (ch, m) in &self.motion {
+            if Self::accepted_motion(m, &accepted).2 > 0
+                && !profile.motion_envelopes.contains_key(ch)
+            {
+                warn(
+                    Warn,
+                    "motion_envelope_dropped_no_writer",
+                    ch,
+                    format!(
+                        "commands seen on {ch} but no learned writer announced it: no envelope \
+                         learned (commands on it will be reported as an unprofiled channel); \
+                         check discovery coverage (capture) before locking"
+                    ),
+                );
+            }
+        }
         let writer_topics = endpoint_reports(&self.writers, true);
         let reader_topics = endpoint_reports(&self.readers, self.config.learn_readers);
         let not_learned: Vec<&String> = writer_topics
@@ -2777,6 +2820,7 @@ mod tests {
             source_guid: Some(A.into()),
             linear_speed: lin,
             joint_speed: joint,
+            angular_speed: None,
         })
     }
 
@@ -2868,6 +2912,7 @@ mod tests {
         c.ceiling_linear = Some(0.3);
         c.ceiling_joint = Some(10.0);
         let mut evs = clean();
+        evs.push(writer(A, "rt/arm"));
         evs.extend((0..40).map(|_| mv("/arm", None, Some(1.0))));
         let l = learn(c, &evs);
         let p = l.profile();
@@ -2968,6 +3013,7 @@ mod tests {
     #[test]
     fn channel_without_valid_samples_has_empty_envelope() {
         let mut evs = clean();
+        evs.push(writer(A, "rt/arm"));
         evs.push(mv("/arm", Some(f64::NAN), None));
         evs.push(mv("/arm", None, None));
         let l = learn(cfg(), &evs);
@@ -3315,7 +3361,32 @@ mod tests {
     }
 
     #[test]
-    fn invalid_ros_names_are_anomalies_not_learned() {
+    fn motion_channel_without_learned_writer_gets_no_envelope() {
+        let mut evs = clean();
+        // Commands on /arm, but no accepted participant announced a writer.
+        evs.extend((0..40).map(|_| mv("/arm", None, Some(1.0))));
+        let out = learn(cfg(), &evs).finish();
+        assert!(!out.profile.motion_envelopes.contains_key("/arm"));
+        assert!(out.profile.motion_envelopes.contains_key("/cmd_vel"));
+        assert_eq!(out.profile.validate(), Ok(()));
+        assert!(out
+            .report
+            .warnings
+            .iter()
+            .any(|w| w.code == "motion_envelope_dropped_no_writer" && w.subject == "/arm"));
+        assert!(!out
+            .report
+            .warnings
+            .iter()
+            .any(|w| w.code == "motion_envelope_dropped_no_writer" && w.subject == "/cmd_vel"));
+    }
+
+    #[test]
+    fn malformed_ros_names_are_never_learned_as_ros_names() {
+        // robodr-events `demangle` classifies a prefixed name whose ROS part
+        // is malformed (whitespace, control characters) as a raw DDS topic
+        // with the exact input as its name, so it can only ever match the
+        // raw set verbatim: never a ROS topic / service.
         let evs = vec![
             part(A),
             writer(A, "rt/bad name"),
@@ -3325,18 +3396,12 @@ mod tests {
             writer(A, "raw with space"),
         ];
         let l = learn(cfg(), &evs);
-        let r = l.report();
-        assert_eq!(
-            r.anomalies
-                .iter()
-                .filter(|a| a.kind == "invalid_ros_name")
-                .count(),
-            2
-        );
         let p = l.profile();
         assert_eq!(p.writer_topics.iter().collect::<Vec<_>>(), vec!["/ok"]);
         assert!(p.services.is_empty());
         assert!(p.raw_dds_topics.contains("raw with space"));
+        assert!(p.raw_dds_topics.contains("rt/bad name"));
+        assert!(p.raw_dds_topics.contains("rq/ctl\u{7}Request"));
         assert_eq!(p.validate(), Ok(()));
     }
 
@@ -3501,12 +3566,14 @@ mod tests {
                 source_guid: Some(EVIL.into()),
                 linear_speed: Some(9.0),
                 joint_speed: None,
+                angular_speed: None,
             }),
             RobotEvent::MotionCommand(MotionCommand {
                 channel: "/evil_channel".into(),
                 source_guid: Some(EVIL.into()),
                 linear_speed: Some(5.0),
                 joint_speed: None,
+                angular_speed: None,
             }),
         ];
         for (i, e) in evil.into_iter().enumerate() {
@@ -3649,13 +3716,14 @@ mod tests {
 
     #[test]
     fn unattributed_and_thin_motion_need_signoff() {
-        let mut evs = vec![part(A), part(A)];
+        let mut evs = vec![part(A), part(A), writer(A, "rt/cmd_vel")];
         evs.extend((0..5).map(|_| {
             RobotEvent::MotionCommand(MotionCommand {
                 channel: "/cmd_vel".into(),
                 source_guid: None,
                 linear_speed: Some(0.5),
                 joint_speed: None,
+                angular_speed: None,
             })
         }));
         let ids: Vec<String> = learn(defaults(), &evs)
@@ -3760,7 +3828,7 @@ mod tests {
 
     #[test]
     fn hard_cap_bounds_every_envelope() {
-        let mut evs = vec![part(A), part(A)];
+        let mut evs = vec![part(A), part(A), writer(A, "rt/cmd_vel")];
         evs.extend((0..40).map(|_| mv("/cmd_vel", Some(1e300), Some(f64::MAX))));
         evs.push(part(A));
         let out = learn(defaults(), &evs).finish();
@@ -3886,6 +3954,7 @@ mod tests {
                 source_guid: Some(g.clone()),
                 linear_speed: Some(0.2),
                 joint_speed: None,
+                angular_speed: None,
             }));
         }
         for _ in 0..100_000 {
@@ -3976,6 +4045,7 @@ mod tests {
             source_guid: Some("NOT-A-GUID".into()),
             linear_speed: Some(7.0),
             joint_speed: None,
+            angular_speed: None,
         }));
         let l = learn(defaults(), &evs);
         assert_eq!(

@@ -84,6 +84,13 @@ pub enum RobotEvent {
 }
 
 /// A single motion command, normalised across robot kinds.
+///
+/// Linear and angular values are **signed body-frame velocities** taken from
+/// the command message as is (`geometry_msgs/Twist` `linear.x` and
+/// `angular.z`, ROS REP 103: +x forward, +yaw counter-clockwise). Producers
+/// must keep the sign: the motion monitor uses it to see a robot driving or
+/// turning against its command, and a magnitude sent for a reversing command
+/// would look like a direction reversal. Envelope checks compare `|v|`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MotionCommand {
     /// Topic (ROS 2, de-mangled, e.g. `/cmd_vel`) the command arrived on.
@@ -94,17 +101,31 @@ pub struct MotionCommand {
     pub channel: String,
     /// The announcing endpoint's GUID, if known (ties back to the graph).
     pub source_guid: Option<String>,
-    /// Commanded linear speed in m/s, as a magnitude. Negative values are
-    /// compared by absolute value; non-finite values are a Critical deviation.
+    /// Commanded forward velocity in m/s, signed (`Twist.linear.x`).
+    /// Envelopes compare the absolute value; non-finite values are a
+    /// Critical deviation.
     pub linear_speed: Option<f64>,
     /// Commanded joint speed in rad/s (max magnitude across joints). Same
     /// sign / finiteness rules as `linear_speed`.
     pub joint_speed: Option<f64>,
+    /// Commanded yaw rate in rad/s, signed (`Twist.angular.z`); `None` when
+    /// the command says nothing about rotation. The profile envelope has no
+    /// angular limit (the Motion Firewall's per-channel `max_angular_speed`
+    /// bounds it); a non-finite value is a Critical deviation.
+    #[serde(default)]
+    pub angular_speed: Option<f64>,
 }
 
 /// Measured motion reported by the platform (e.g. from `/odom` or
 /// `/joint_states`), used by `robodr-motion` to check that the robot actually
 /// does what it was commanded to do.
+///
+/// `measured_linear_speed` is a **magnitude** (kept for producers that only
+/// have a speed, e.g. GNSS speed over ground). Producers that have the
+/// velocity vector (`nav_msgs/Odometry` `twist.twist`, IMU yaw rate) should
+/// also fill the signed `linear_velocity` / `angular_velocity`: the motion
+/// monitor compares signed values by default and only uses the magnitude for
+/// sources configured as unsigned.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MotionFeedback {
     /// Topic or bus id the feedback arrived on.
@@ -115,6 +136,17 @@ pub struct MotionFeedback {
     /// Measured joint speed in rad/s (max magnitude across joints), if applicable.
     #[serde(default)]
     pub measured_joint_speed: Option<f64>,
+    /// Measured forward velocity in m/s, signed (body frame, REP 103).
+    #[serde(default)]
+    pub linear_velocity: Option<f64>,
+    /// Measured yaw rate in rad/s, signed (REP 103).
+    #[serde(default)]
+    pub angular_velocity: Option<f64>,
+    /// GUID of the DDS writer that published this sample, if known. Lets the
+    /// motion monitor keep per-publisher state and see a second (injected)
+    /// publisher interleaving on the same feedback topic.
+    #[serde(default)]
+    pub publisher_guid: Option<String>,
     /// Measurement time, nanoseconds (monotonic or epoch — the producer must
     /// document which; `robodr-motion` only uses differences).
     pub timestamp_ns: u64,
@@ -267,11 +299,15 @@ mod tests {
                 source_guid: None,
                 linear_speed: Some(-0.25),
                 joint_speed: None,
+                angular_speed: None,
             }),
             RobotEvent::MotionFeedback(MotionFeedback {
                 channel: "/odom".into(),
                 measured_linear_speed: Some(0.2),
                 measured_joint_speed: None,
+                linear_velocity: None,
+                angular_velocity: None,
+                publisher_guid: None,
                 timestamp_ns: 1_700_000_000_000_000_000,
             }),
         ];
@@ -294,6 +330,9 @@ mod tests {
                 channel: "/odom".into(),
                 measured_linear_speed: None,
                 measured_joint_speed: None,
+                linear_velocity: None,
+                angular_velocity: None,
+                publisher_guid: None,
                 timestamp_ns: 5,
             })
         );

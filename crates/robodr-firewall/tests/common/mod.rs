@@ -34,6 +34,7 @@ pub fn profile(locked: bool) -> Profile {
         ..Default::default()
     };
     p.participants.insert(PREFIX.into());
+    p.writer_topics.insert("/cmd_vel".into());
     p.motion_envelopes.insert(
         "/cmd_vel".into(),
         Envelope {
@@ -41,6 +42,7 @@ pub fn profile(locked: bool) -> Profile {
             max_joint_speed: None,
         },
     );
+    p.writer_topics.insert("/arm/cmd".into());
     p.motion_envelopes.insert(
         "/arm/cmd".into(),
         Envelope {

@@ -171,6 +171,13 @@ fn clean_run(r: &mut Rng) -> Vec<RobotEvent> {
     }
     let channels: Vec<String> = (0..r.below(4)).map(|_| path(r)).collect();
     for ch in &channels {
+        // A clean run discovers the writer of every channel it commands
+        // (`Profile::validate` requires enveloped channels to be writable).
+        evs.push(RobotEvent::Ros2WriterDiscovered(Endpoint {
+            guid_prefix: r.pick(&guids).clone(),
+            topic: format!("rt{ch}"),
+            type_name: "geometry_msgs::msg::dds_::Twist_".into(),
+        }));
         for _ in 0..1 + r.below(30) {
             let (mut lin, joint) = (speed(r), speed(r));
             if lin.is_none() && joint.is_none() {
@@ -181,6 +188,7 @@ fn clean_run(r: &mut Rng) -> Vec<RobotEvent> {
                 source_guid: r.chance(2, 3).then(|| r.pick(&guids).clone()),
                 linear_speed: lin,
                 joint_speed: joint,
+                angular_speed: None,
             }));
         }
     }
@@ -189,6 +197,9 @@ fn clean_run(r: &mut Rng) -> Vec<RobotEvent> {
             channel: path(r),
             measured_linear_speed: Some(*r.pick(&[f64::NAN, -1.0, f64::INFINITY, 0.3])),
             measured_joint_speed: None,
+            linear_velocity: None,
+            angular_velocity: None,
+            publisher_guid: None,
             timestamp_ns: r.next(),
         }));
     }

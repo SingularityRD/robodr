@@ -19,6 +19,7 @@ fn profile(lin: Option<f64>, locked: bool) -> Profile {
         ..Default::default()
     };
     p.participants.insert(PREFIX.into());
+    p.writer_topics.insert("/cmd_vel".into());
     p.motion_envelopes.insert(
         "/cmd_vel".into(),
         Envelope {

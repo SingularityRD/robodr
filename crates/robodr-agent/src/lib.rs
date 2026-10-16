@@ -64,7 +64,7 @@ pub use clock::{
 };
 pub use config::{
     profile_sha256, strict_from_str, AgentConfig, AgentError, FirewallSettings, MonitorSettings,
-    DEFAULT_MAX_ANGULAR_SPEED, MAX_TRACKED_FINDINGS,
+    MAX_TRACKED_FINDINGS,
 };
 pub use evidence::{finding_refs, resolve_links, verify_blackbox, LinkReport};
 pub use executor::{ExecutionRequest, Executor, LoggingExecutor, NoopExecutor};

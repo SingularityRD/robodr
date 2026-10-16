@@ -424,6 +424,7 @@ fn minimal_and_maximal_findings_match_schema() {
         source_guid: Some("aa".into()),
         linear_speed: Some(2.0),
         joint_speed: Some(0.5),
+        angular_speed: None,
     };
     let dev = Deviation::new("robot.motion.linear_over_envelope", Severity::High, "x");
     let env = robodr_events::profile::Envelope {

@@ -24,13 +24,16 @@ fn lines(out: &Output) -> Vec<Value> {
         .collect()
 }
 
+/// A locked profile is written sealed, exactly as `robodr-commission lock`
+/// writes it (the sensor refuses to enforce an unsealed locked file).
 fn write_profile(path: &Path, locked: bool) {
-    write(
-        path,
-        serde_json::to_string_pretty(&robot_profile(locked))
-            .unwrap()
-            .as_bytes(),
-    );
+    let p = robot_profile(locked);
+    let text = if locked {
+        robodr_commission::sealed_text(&p).unwrap()
+    } else {
+        serde_json::to_string_pretty(&p).unwrap()
+    };
+    write(path, text.as_bytes());
 }
 
 #[test]
@@ -163,7 +166,15 @@ fn rtps_fixture_pcap_with_empty_profile() {
     let pcap_path = dir.join("fixtures.pcap");
     write(&pcap_path, &pcap(&frames));
     let prof = dir.join("empty.json");
-    write(&prof, br#"{"model": "empty", "locked": true}"#);
+    let empty = robodr_events::profile::Profile {
+        model: "empty".into(),
+        locked: true,
+        ..Default::default()
+    };
+    write(
+        &prof,
+        robodr_commission::sealed_text(&empty).unwrap().as_bytes(),
+    );
     let out = watch(&[
         "--profile",
         prof.to_str().unwrap(),

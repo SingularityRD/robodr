@@ -5,7 +5,6 @@ mod common;
 
 use common::*;
 use robodr_capture::{synth, CaptureFile, RtpsPortMap};
-use robodr_events::profile::Profile;
 use robodr_events::{Mode, Severity};
 use robodr_ros2_pipeline::{
     rules, CaptureDatagramSource, DatagramSource, Finding, Pipeline, PipelineOptions, ProfileStatus,
@@ -109,10 +108,10 @@ fn invalid_profile_is_refused_and_runs_observe_only() {
         .max_linear_speed = Some(-1.0);
     prof.writer_topics.insert("rt/cmd_vel".into());
     write(&path, serde_json::to_string(&prof).unwrap().as_bytes());
-    let loaded: Profile = robodr_ros2_pipeline::load_profile(&path).unwrap();
-    assert!(loaded.locked);
+    let loaded = robodr_ros2_pipeline::load_profile(&path).unwrap();
+    assert!(loaded.profile.locked);
 
-    let mut p = Pipeline::new(loaded, PipelineOptions::default());
+    let mut p = Pipeline::from_loaded(loaded, PipelineOptions::default());
     let ProfileStatus::Refused(errors) = p.status().clone() else {
         panic!("expected refused, got {:?}", p.status());
     };

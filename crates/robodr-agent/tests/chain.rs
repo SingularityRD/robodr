@@ -167,10 +167,9 @@ fn a_locked_profile_rogue_participant_and_foreign_writer() {
 fn b_unlocked_profile_is_observe_only_everywhere() {
     let dir = tmpdir("b");
     let mut cfg = config(&dir, demo_profile(false), validated_policy());
-    cfg.firewall = Some(FirewallSettings::from_profile(
-        &cfg.profile,
-        &BTreeMap::new(),
-    ));
+    cfg.firewall = Some(
+        FirewallSettings::from_profile(&cfg.profile, &BTreeMap::new(), &demo_angular()).unwrap(),
+    );
     cfg.monitor = Some(MonitorSettings::new(MonitorConfig::ugv("ugv-demo-x1")));
     let cap = Capture::default();
     let mut agent = build(cfg).with_executor(Box::new(cap.clone()));
@@ -251,7 +250,8 @@ fn firewall_agent(dir: &std::path::Path) -> Agent {
     let mut cfg = config(dir, demo_profile(true), validated_policy());
     let mut allow = BTreeMap::new();
     allow.insert("/cmd_vel".to_string(), vec![LEGIT_WRITER.to_string()]);
-    cfg.firewall = Some(FirewallSettings::from_profile(&cfg.profile, &allow));
+    cfg.firewall =
+        Some(FirewallSettings::from_profile(&cfg.profile, &allow, &demo_angular()).unwrap());
     build(cfg)
 }
 
@@ -410,9 +410,28 @@ fn c_non_finite_command_is_rejected_and_still_reported() {
 
 // (d) ------------------------------------------------------------------------
 
-/// Commands at 0.4 m/s every 40 ms; honest odometry follows a first-order
-/// response; between `inject.0` and `inject.1` (s) odometry reports 1.2 m/s.
-fn motion_run(dir: &std::path::Path, inject: Option<(f64, f64)>) -> Vec<Outcome> {
+/// Odometry writer GUID used by the motion runs.
+const ODOM_WRITER: &str = "01103f5a8c2e00000000010200000203";
+
+/// How the motion runs' odometry is published.
+#[derive(Clone, Copy, PartialEq)]
+enum Odom {
+    /// Signed `linear_velocity` (plus the magnitude), with its writer GUID.
+    Signed,
+    /// Only the magnitude `measured_linear_speed`, no writer GUID.
+    MagnitudeOnly,
+}
+
+/// Commands at `0.4 * dir` m/s every 40 ms (`dir` = +1 forward, -1
+/// reversing); honest odometry follows a first-order response; between
+/// `inject.0` and `inject.1` (s) odometry reports 1.2 m/s in the commanded
+/// direction.
+fn motion_run_with(
+    dir: &std::path::Path,
+    inject: Option<(f64, f64)>,
+    sign: f64,
+    odom: Odom,
+) -> (Vec<Outcome>, AgentStats) {
     let mut cfg = config(dir, demo_profile(true), validated_policy());
     let mut mc = MonitorConfig::ugv("ugv-demo-x1");
     mc.command_channels = vec!["/cmd_vel".into()];
@@ -425,7 +444,7 @@ fn motion_run(dir: &std::path::Path, inject: Option<(f64, f64)>) -> Vec<Outcome>
     for k in 1..=300u64 {
         let t = k * 20 * MS;
         let e = if k % 2 == 1 {
-            cmd(LEGIT_WRITER, 0.4)
+            cmd(LEGIT_WRITER, 0.4 * sign)
         } else {
             let ts = t as f64 / 1e9;
             let mut v = if ts < 0.1 {
@@ -439,22 +458,31 @@ fn motion_run(dir: &std::path::Path, inject: Option<(f64, f64)>) -> Vec<Outcome>
                     v = 1.2 + 0.004 * (k as f64 * 0.7).sin();
                 }
             }
+            let v = v * sign;
             RobotEvent::MotionFeedback(MotionFeedback {
                 channel: "/odom".into(),
-                measured_linear_speed: Some(v),
+                measured_linear_speed: Some(v.abs()),
                 measured_joint_speed: None,
+                linear_velocity: (odom == Odom::Signed).then_some(v),
+                angular_velocity: None,
+                publisher_guid: (odom == Odom::Signed).then(|| ODOM_WRITER.to_string()),
                 timestamp_ns: t,
             })
         };
         outs.extend(agent.handle(at(t), &e, SafetyState::MovingSlow));
     }
+    let stats = agent.stats();
     let fin = agent.finish().unwrap();
     assert!(
         verify_blackbox(dir, &verifier(), Some(fin.checkpoint), None)
             .unwrap()
             .is_clean()
     );
-    outs
+    (outs, stats)
+}
+
+fn motion_run(dir: &std::path::Path, inject: Option<(f64, f64)>) -> Vec<Outcome> {
+    motion_run_with(dir, inject, 1.0, Odom::Signed).0
 }
 
 #[test]
@@ -497,6 +525,79 @@ fn d_honest_feedback_raises_nothing() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[test]
+fn d_reversing_with_signed_odometry_raises_nothing() {
+    // Signed command and signed feedback agree on the direction.
+    let dir = tmpdir("d3");
+    let (outs, stats) = motion_run_with(&dir, None, -1.0, Odom::Signed);
+    assert!(
+        outs.is_empty(),
+        "{:#?}",
+        outs.iter().map(|o| &o.deviation).collect::<Vec<_>>()
+    );
+    assert_eq!(stats.feedback_magnitude_dropped, 0);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn d_interleaved_second_feedback_publisher_is_reported() {
+    // An injected second writer on /odom, interleaving with the real one:
+    // the writer GUID reaches the monitor (on_feedback_from).
+    let dir = tmpdir("d5");
+    let mut cfg = config(&dir, demo_profile(true), validated_policy());
+    let mut mc = MonitorConfig::ugv("ugv-demo-x1");
+    mc.command_channels = vec!["/cmd_vel".into()];
+    let mut ms = MonitorSettings::new(mc);
+    ms.feedback_sources
+        .insert("/odom".into(), FeedbackSource::WheelOdometry);
+    cfg.monitor = Some(ms);
+    let mut agent = build(cfg);
+    let mut outs = Vec::new();
+    for k in 1..=300u64 {
+        let t = k * 20 * MS;
+        let e = if k % 2 == 1 {
+            cmd(LEGIT_WRITER, 0.4)
+        } else {
+            let publisher = if k % 4 == 0 { ODOM_WRITER } else { ROGUE };
+            RobotEvent::MotionFeedback(MotionFeedback {
+                channel: "/odom".into(),
+                measured_linear_speed: Some(0.4),
+                measured_joint_speed: None,
+                linear_velocity: Some(0.4),
+                angular_velocity: None,
+                publisher_guid: Some(publisher.to_string()),
+                timestamp_ns: t,
+            })
+        };
+        outs.extend(agent.handle(at(t), &e, SafetyState::MovingSlow));
+    }
+    assert!(
+        outs.iter()
+            .any(|o| o.deviation.rule_str() == "robot.motion.multiple_feedback_publishers"),
+        "{:#?}",
+        outs.iter().map(|o| &o.deviation).collect::<Vec<_>>()
+    );
+    agent.finish().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn d_magnitude_only_feedback_is_withheld_for_a_signed_source() {
+    // Wheel odometry is a signed source: a magnitude against a reversing
+    // command must not read as "moving against the command". The linear
+    // axis is withheld and counted instead.
+    let dir = tmpdir("d4");
+    let (outs, stats) = motion_run_with(&dir, None, -1.0, Odom::MagnitudeOnly);
+    assert!(
+        outs.iter()
+            .all(|o| o.deviation.rule_str() != "robot.motion.feedback_divergence"),
+        "{:#?}",
+        outs.iter().map(|o| &o.deviation).collect::<Vec<_>>()
+    );
+    assert_eq!(stats.feedback_magnitude_dropped, 150);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 // (e) ------------------------------------------------------------------------
 
 fn replay_opts(dir: &std::path::Path, key: Vec<u8>) -> ReplayOptions {
@@ -511,6 +612,7 @@ fn replay_opts(dir: &std::path::Path, key: Vec<u8>) -> ReplayOptions {
     );
     o.safety = SafetyState::MovingSlow;
     o.firewall = true;
+    o.firewall_max_angular = demo_angular();
     o
 }
 
@@ -623,10 +725,9 @@ fn f_same_inputs_same_clock_give_byte_identical_output() {
 fn hostile_names_never_panic_and_findings_stay_valid() {
     let dir = tmpdir("hostile");
     let mut cfg = config(&dir, demo_profile(true), validated_policy());
-    cfg.firewall = Some(FirewallSettings::from_profile(
-        &cfg.profile,
-        &BTreeMap::new(),
-    ));
+    cfg.firewall = Some(
+        FirewallSettings::from_profile(&cfg.profile, &BTreeMap::new(), &demo_angular()).unwrap(),
+    );
     cfg.monitor = Some(MonitorSettings::new(MonitorConfig::ugv("m")));
     let mut agent = build(cfg);
     let nasty = format!(
@@ -642,17 +743,22 @@ fn hostile_names_never_panic_and_findings_stay_valid() {
             source_guid: Some(nasty.clone()),
             linear_speed: Some(f64::MAX),
             joint_speed: Some(-0.0),
+            angular_speed: None,
         }),
         RobotEvent::MotionCommand(robodr_events::MotionCommand {
             channel: "/cmd_vel".into(),
             source_guid: None,
             linear_speed: None,
             joint_speed: Some(f64::NAN),
+            angular_speed: None,
         }),
         RobotEvent::MotionFeedback(MotionFeedback {
             channel: nasty.clone(),
             measured_linear_speed: Some(f64::NEG_INFINITY),
             measured_joint_speed: Some(f64::NAN),
+            linear_velocity: None,
+            angular_velocity: None,
+            publisher_guid: None,
             timestamp_ns: u64::MAX,
         }),
     ];
@@ -666,6 +772,24 @@ fn hostile_names_never_panic_and_findings_stay_valid() {
                 finding(&o);
                 let f = o.finding.as_ref().unwrap();
                 assert!(f.value.len() <= robodr_ocsf::validate::MAX_FINDING_BYTES);
+                // Attacker-derived text is neutralised: the `display` form
+                // is ASCII-safe, and a hostile name is flagged suspicious.
+                let env = finding(&o);
+                let ros = &env.entity_context.ros;
+                for t in [&ros.participant_guid, &ros.topic, &ros.src_ip]
+                    .into_iter()
+                    .flatten()
+                {
+                    assert!(t.display.is_ascii(), "{t:?}");
+                    if t.value.contains("script") || t.value.contains('\u{202e}') {
+                        assert!(t.suspicious, "{t:?}");
+                    }
+                }
+                // Published mode = effective mode (observe wins).
+                assert_eq!(
+                    env.entity_context.mode,
+                    robodr_ocsf::effective_mode(robodr_ocsf::Mode::Enforce, &o.deviation)
+                );
                 if s.safety_system_engaged() {
                     assert_eq!(o.plan.actions, vec![ResponseAction::Record]);
                 }
@@ -797,7 +921,7 @@ fn invalid_configuration_is_refused() {
     let mut c = config(&dir, demo_profile(true), validated_policy());
     let mut allow = BTreeMap::new();
     allow.insert("/cmd_vel".to_string(), vec![ROGUE.to_string()]);
-    c.firewall = Some(FirewallSettings::from_profile(&c.profile, &allow));
+    c.firewall = Some(FirewallSettings::from_profile(&c.profile, &allow, &demo_angular()).unwrap());
     assert!(matches!(
         Agent::new(c, signer(), clock()),
         Err(AgentError::Firewall(_))

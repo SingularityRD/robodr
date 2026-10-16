@@ -2,7 +2,8 @@
 //!
 //! This crate is everything the ROS 2 sensor does **except** talking to
 //! Pulsar: it depends only on `std`, `robodr-events`, `robodr-rtps`,
-//! `robodr-capture` and serde, so it builds and is tested offline, and the
+//! `robodr-capture`, `robodr-commission` (profile file check) and serde, so
+//! it builds and is tested offline, and the
 //! same code runs inside the Pulsar module (`robodr-sensor-ros2`), in the lab
 //! tool [`robodr-ros2-watch`](#the-robodr-ros2-watch-tool) and in CI.
 //!
@@ -19,8 +20,12 @@
 //!   bounded `FragmentReassembler` -> `Profile::evaluate` + removal,
 //!   anomaly and fragmentation findings -> bounded dedup -> [`Finding`]s
 //!   stamped observe / enforce. The profile is validated at load
-//!   (`Profile::validate`); an invalid profile is **refused for enforcement**
-//!   and the pipeline runs observe-only (see [`pipeline`] for why).
+//!   (`Profile::validate`) and a locked profile file must pass the
+//!   commissioning file check (`robodr_commission::parse_profile_text`:
+//!   strict keys and the lock seal, so a locked profile edited after
+//!   `robodr-commission lock` is refused); a profile that fails either is
+//!   **refused for enforcement** and the pipeline runs observe-only (see
+//!   [`pipeline`] for why).
 //! - [`binding`]: the participant ↔ source-IP binding table. SEDP endpoint
 //!   announcements are judged against the IPs and locators their
 //!   participant's SPDP came from (or `participant_ips` pins), so a rogue
@@ -30,7 +35,7 @@
 //!   `robot.capture.*` findings.
 //! - [`config`]: the `[module.robodr-sensor-ros2]` section (incl. the
 //!   `capture` sub-table) and its validation: domain id -> SPDP port, capture
-//!   [`RtpsPortMap`](robodr_capture::RtpsPortMap), default interfaces.
+//!   [`RtpsPortMap`], default interfaces.
 //! - [`socket`]: the receive-only, `SO_REUSEADDR`, group-bound SPDP socket.
 //! - [`sanitize()`] and [`dedup`]: attacker-controlled text and memory bounds.
 //! - [`watch`]: argument parsing and the run loop of `robodr-ros2-watch`.
@@ -70,8 +75,8 @@ pub use config::{
 };
 pub use dedup::DedupSet;
 pub use pipeline::{
-    load_profile, rules, Finding, Pipeline, PipelineOptions, PipelineStats, ProfileStatus,
-    ThreatExtra, OBSERVE_ONLY_TAG,
+    load_profile, rules, Finding, LoadedProfile, Pipeline, PipelineOptions, PipelineStats,
+    ProfileStatus, ThreatExtra, OBSERVE_ONLY_TAG,
 };
 pub use sanitize::{sanitize, MAX_TEXT_CHARS};
 pub use source::{

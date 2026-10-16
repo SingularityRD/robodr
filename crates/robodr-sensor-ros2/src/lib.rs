@@ -32,7 +32,10 @@
 //! `extra.observe_only` and `extra.profile_status` (`"enforcing"`,
 //! `"observing"`, `"refused"`). Observe-only threats' descriptions start
 //! with `[observe-only] `. A profile with `locked = false` is observe-only; a
-//! profile that fails `Profile::validate` is **refused for enforcement**: the
+//! profile that fails `Profile::validate`, or a `locked` profile file that
+//! fails the commissioning file check (strict keys + the lock seal of
+//! `robodr-commission lock`, so a locked profile edited by hand is caught),
+//! is **refused for enforcement**: the
 //! errors are logged, raised as a module warning and sent once as a
 //! `robot.ros2.profile_refused` threat, and the sensor keeps running
 //! observe-only (fail closed: never act on a profile we cannot trust, never
@@ -51,6 +54,17 @@
 //!
 //! All sources feed one [`Pipeline`], so dedup and fragment reassembly span
 //! them.
+//!
+//! ## Housekeeping
+//!
+//! Every second (`HOUSEKEEPING_PERIOD`) the receive loop calls
+//! [`Pipeline::tick`], so SEDP announcements held for a participant that
+//! never sends SPDP are reported even when the bus goes quiet, and
+//! [`Pipeline::capture_findings`] on the capture thread's latest
+//! [`pipeline::SharedHealth`] snapshot (published after every datagram), so
+//! traffic the capture layer could not inspect (truncated / malformed
+//! frames, IP fragment conflicts and drops) becomes `robot.capture.*`
+//! findings. External sources have no health counters.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -67,7 +81,7 @@ use tokio::task::JoinHandle;
 pub use robodr_ros2_pipeline as pipeline;
 pub use robodr_ros2_pipeline::{Config, Datagram, DatagramSource, Finding, Pipeline};
 
-use robodr_ros2_pipeline::{load_profile, sanitize, socket, ProfileStatus};
+use robodr_ros2_pipeline::{load_profile, sanitize, socket, ProfileStatus, SharedHealth};
 
 /// Module name, i.e. the `[module.<name>]` section in `pulsar.toml`.
 pub const MODULE_NAME: &str = "robodr-sensor-ros2";
@@ -77,6 +91,13 @@ const RECV_BUF_LEN: usize = 65_535;
 
 /// Pause after a socket receive error so a persistent error cannot spin.
 const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Period of the pipeline housekeeping in the receive loop:
+/// [`Pipeline::tick`] (SEDP announcements whose participant never sent SPDP
+/// within the hold window are reported even on an idle bus) and
+/// [`Pipeline::capture_findings`] on the capture thread's latest
+/// [`SharedHealth`] snapshot (traffic the capture layer could not inspect).
+const HOUSEKEEPING_PERIOD: Duration = Duration::from_secs(1);
 
 /// Receiving end of an external datagram source, shared so the module can be
 /// stopped and restarted by the daemon (each start re-acquires the lock; the
@@ -118,13 +139,30 @@ pub fn spawn_blocking_source<S>(
 where
     S: DatagramSource + Send + 'static,
 {
+    spawn_blocking_source_with_health(source, capacity, SharedHealth::new())
+}
+
+/// [`spawn_blocking_source`], also publishing the source's cumulative
+/// [`DatagramSource::capture_health`] into `health` after every datagram and
+/// once when the source ends (the receive loop turns increases into
+/// `robot.capture.*` findings).
+pub fn spawn_blocking_source_with_health<S>(
+    source: S,
+    capacity: usize,
+    health: SharedHealth,
+) -> std::io::Result<mpsc::Receiver<Datagram>>
+where
+    S: DatagramSource + Send + 'static,
+{
     let (tx, rx) = mpsc::channel(capacity.max(1));
     std::thread::Builder::new()
         .name("robodr-dgram-src".into())
         .spawn(move || {
             let mut source = source;
             loop {
-                match source.recv() {
+                let next = source.recv();
+                health.publish(source.capture_health());
+                match next {
                     Ok(Some(d)) => {
                         if tx.blocking_send(d).is_err() {
                             break; // sensor gone
@@ -197,12 +235,21 @@ impl SimplePulsarModule for Ros2Sensor {
             );
         }
 
-        let profile = load_profile(&settings.profile_path)?;
-        let pipeline = Pipeline::new(profile, settings.pipeline);
-        if let ProfileStatus::Refused(errors) = pipeline.status() {
-            for e in errors {
-                log::error!(target: MODULE_NAME, "profile error: {}", sanitize(&e.to_string()));
+        // Strict file check + lock seal (robodr-commission's format): a
+        // locked profile edited after `robodr-commission lock` is refused
+        // for enforcement (observe-only), like one failing validation.
+        let loaded = load_profile(&settings.profile_path)?;
+        let pipeline = Pipeline::from_loaded(loaded, settings.pipeline.clone());
+        match pipeline.status() {
+            ProfileStatus::Refused(errors) => {
+                for e in errors {
+                    log::error!(target: MODULE_NAME, "profile error: {}", sanitize(&e.to_string()));
+                }
             }
+            ProfileStatus::FileRejected(why) => {
+                log::error!(target: MODULE_NAME, "profile file rejected: {}", sanitize(why));
+            }
+            _ => {}
         }
         if let Some(msg) = pipeline.status_message() {
             log::warn!(target: MODULE_NAME, "{msg}");
@@ -235,9 +282,10 @@ impl SimplePulsarModule for Ros2Sensor {
 
         // Opened last: nothing fallible (and no await) follows, so a failed
         // or cancelled init cannot leak the capture thread.
-        let (capture, capture_stop) = match &settings.capture {
+        let (capture, capture_stop, capture_health) = match &settings.capture {
             Some(c) => {
                 let stop = Arc::new(AtomicBool::new(false));
+                let health = SharedHealth::new();
                 let source = c.open(stop.clone()).map_err(|e| {
                     format!(
                         "opening capture {:?}: {} (live capture needs CAP_NET_RAW)",
@@ -245,17 +293,18 @@ impl SimplePulsarModule for Ros2Sensor {
                         sanitize(&e.to_string())
                     )
                 })?;
-                let rx = spawn_blocking_source(source, c.queue_capacity)
-                    .map_err(|e| format!("starting capture thread: {e}"))?;
+                let rx =
+                    spawn_blocking_source_with_health(source, c.queue_capacity, health.clone())
+                        .map_err(|e| format!("starting capture thread: {e}"))?;
                 log::info!(
                     target: MODULE_NAME,
                     "passive capture on {:?} (domains {:?})",
                     c.input,
                     c.domain_ids
                 );
-                (Some(rx), Some(stop))
+                (Some(rx), Some(stop), Some(health))
             }
-            None => (None, None),
+            None => (None, None, None),
         };
         if self.external.is_some() {
             log::info!(target: MODULE_NAME, "consuming an external datagram source");
@@ -264,6 +313,7 @@ impl SimplePulsarModule for Ros2Sensor {
         let listener = tokio::spawn(listen_loop(
             socket,
             capture,
+            capture_health,
             self.external.clone(),
             pipeline,
             ctx.clone(),
@@ -306,6 +356,7 @@ async fn recv_channel(rx: Option<&mut mpsc::Receiver<Datagram>>) -> Option<Datag
 async fn listen_loop(
     socket: Option<UdpSocket>,
     mut capture: Option<mpsc::Receiver<Datagram>>,
+    capture_health: Option<SharedHealth>,
     external: Option<SharedReceiver>,
     mut pipeline: Pipeline,
     ctx: ModuleContext,
@@ -319,6 +370,9 @@ async fn listen_loop(
         None => None,
     };
     let mut buf = vec![0u8; RECV_BUF_LEN];
+    // First tick completes at once; a late tick is delayed, not bunched.
+    let mut housekeeping = tokio::time::interval(HOUSEKEEPING_PERIOD);
+    housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         if socket.is_none() && capture.is_none() && external.is_none() {
             // A blind sensor must not look healthy. `raise_warning` would
@@ -336,6 +390,7 @@ async fn listen_loop(
             r = recv_spdp(socket.as_ref(), &mut buf) => Next::Spdp(r),
             d = recv_channel(capture.as_mut()) => Next::Capture(d),
             d = recv_channel(external.as_deref_mut()) => Next::External(d),
+            _ = housekeeping.tick() => Next::Housekeeping,
         };
         match next {
             Next::Spdp(Ok((len, peer))) => {
@@ -348,7 +403,12 @@ async fn listen_loop(
             Next::Capture(Some(d)) | Next::External(Some(d)) => {
                 report(&mut pipeline, &ctx, &d.payload, &d.src_ip);
             }
+            Next::Housekeeping => {
+                housekeeping_findings(&mut pipeline, &ctx, capture_health.as_ref())
+            }
             Next::Capture(None) => {
+                // Last counters of the ended source (published on exit).
+                housekeeping_findings(&mut pipeline, &ctx, capture_health.as_ref());
                 let msg = "capture source ended; unicast SEDP is no longer watched".to_string();
                 log::warn!(target: MODULE_NAME, "{msg}");
                 ctx.raise_warning(msg).await;
@@ -367,6 +427,25 @@ enum Next {
     Spdp(std::io::Result<(usize, std::net::SocketAddr)>),
     Capture(Option<Datagram>),
     External(Option<Datagram>),
+    /// [`HOUSEKEEPING_PERIOD`] elapsed.
+    Housekeeping,
+}
+
+/// Periodic pipeline work: expire held SEDP announcements
+/// ([`Pipeline::tick`]) and report capture-layer counter increases
+/// ([`Pipeline::capture_findings`]); one threat per new finding.
+fn housekeeping_findings(
+    pipeline: &mut Pipeline,
+    ctx: &ModuleContext,
+    capture_health: Option<&SharedHealth>,
+) {
+    let mut found = pipeline.tick();
+    if let Some(h) = capture_health.and_then(SharedHealth::latest) {
+        found.extend(pipeline.capture_findings(&h));
+    }
+    for finding in found {
+        send(ctx, &finding);
+    }
 }
 
 /// Run one datagram through the pipeline and raise a threat per finding.

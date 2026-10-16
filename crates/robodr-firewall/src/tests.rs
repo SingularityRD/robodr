@@ -15,6 +15,7 @@ fn firewall(platform: PlatformConfig, locked: bool) -> (Firewall, SourceId, Chan
         ..Default::default()
     };
     p.participants.insert(P.into());
+    p.writer_topics.insert("/cmd_vel".into());
     p.motion_envelopes.insert(
         "/cmd_vel".into(),
         Envelope {

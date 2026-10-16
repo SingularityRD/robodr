@@ -19,7 +19,7 @@ Contents: [Toolchain](#toolchain) · [Developer build](#developer-build) ·
 | What | Value | Where |
 |---|---|---|
 | Release toolchain | Rust **1.98.1** (same pin as Pulsar) | `rust-toolchain.toml` |
-| MSRV | **1.85** (Pulsar's floor: edition 2024) | `[workspace.package] rust-version` |
+| MSRV | **1.87** (`u*::is_multiple_of`; Pulsar's own floor is 1.85, edition 2024) | `[workspace.package] rust-version` |
 | Edition (RoboDR crates) | 2021 | `[workspace.package]` |
 | Targets | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` | `rust-toolchain.toml` |
 
@@ -28,8 +28,9 @@ Contents: [Toolchain](#toolchain) · [Developer build](#developer-build) ·
 with. A fixed compiler is also a precondition for reproducible builds.
 
 The MSRV applies to crates that opt in with `rust-version.workspace = true`
-(none do yet; see [Verification status](#verification-status)). The `msrv` CI
-job checks the pure crates with 1.85.
+(robodr-commission, -events, -ocsf, -responder, -pulsard and -sensor-ros2 do;
+see [Verification status](#verification-status)). The `msrv` CI job checks
+the pure crates with 1.87.
 
 A host that does not have 1.98.1 (for example the dev sandbox, which only has
 a newer stable and no network) can override **for local work only**:
@@ -107,10 +108,14 @@ CI build uses `--locked`.
   no checksum. **It must never be committed.** `scripts/ci-check-lockfile.py`
   fails CI if a non-local package has no source, any source is `path+`/`git+`
   or an unknown registry, or a registry package lacks a checksum.
-- Until the first real lock is committed, the CI `lockfile` job generates one,
-  validates it, uploads it as the `Cargo.lock-generated` artifact and raises a
-  warning. A maintainer reviews that file and commits it; from then on every
-  job runs with `--locked` automatically (`scripts/ci-setup.sh`).
+- A committed `Cargo.lock` is **required**. `scripts/ci-setup.sh` makes every
+  CI job fail if it is missing and passes `--locked` to every cargo command
+  (`CARGO_LOCKED`), so a stale lock fails the build instead of being
+  rewritten. The only exception is the `lockfile` job
+  (`ROBODR_ALLOW_MISSING_LOCK=1`): when no lock is committed it generates one,
+  validates it with `scripts/ci-check-lockfile.py`, uploads it as the
+  `Cargo.lock-generated` artifact and then **fails**. Bootstrap: download that
+  artifact, check its `sha256sum` against the job log, review it, commit it.
 - `.gitattributes` marks `Cargo.lock merge=binary`: resolve lock conflicts by
   regenerating, never by hand-merging.
 
@@ -233,7 +238,7 @@ paths of different length, and requires every executable
 | Source of drift | Control |
 |---|---|
 | Compiler | `rust-toolchain.toml` pin |
-| Dependency versions | committed `Cargo.lock`, `--locked` (one shared resolution if none is committed yet) |
+| Dependency versions | committed `Cargo.lock` (required), `--locked` |
 | Absolute paths (checkout, `CARGO_HOME`) | `--remap-path-prefix` to `/build/robodr` and `/cargo` |
 | Timestamps | `SOURCE_DATE_EPOCH` = HEAD commit time |
 | Codegen non-determinism | `codegen-units = 1`, `incremental = false`, `CARGO_INCREMENTAL=0` |
@@ -266,11 +271,11 @@ checked separately.
 
 | Job | Required | What |
 |---|---|---|
-| `lockfile` | yes | Committed `Cargo.lock` has no local/patched/git/unknown sources; if none is committed, generate + upload one (warning) |
+| `lockfile` | yes | Committed `Cargo.lock` has no local/patched/git/unknown sources; if none is committed, generate + upload the bootstrap lock and **fail** (every other job also fails without it) |
 | `scripts` | yes | Python self-tests of the CI scripts, `shellcheck scripts/*.sh` |
 | `pure` | yes | `fmt --check`, `clippy -D warnings`, `test` for every member except Pulsar-bound ones |
 | `pulsar` | yes | Installs Pulsar's build packages, then `build` / `clippy -D warnings` / `test` of every Pulsar-bound member (`robodr-sensor-ros2`, later `robodr-pulsard`). No kernel load |
-| `msrv` | informational | `cargo +1.85.0 check` of the pure crates |
+| `msrv` | informational | `cargo +1.87.0 check` of the pure crates |
 | `deny` | yes | `cargo deny check advisories bans licenses sources` (`deny.toml`) |
 | `sbom` | yes | CycloneDX via cargo-cyclonedx **and** the std-only fallback; uploaded as artifact |
 | `fuzz` | yes | If `fuzz/` exists: every `cargo fuzz` target for 60 s on a pinned nightly; crashes uploaded |
@@ -315,12 +320,14 @@ cargo-cyclonedx / cargo-deny / shellcheck installed):
   crates, `sparse+` entries in `allow-registry`), which licenses the full
   dependency graph actually carries (the allow-list may need additions after
   the first run), that the pinned nightly `nightly-2026-09-01` and
-  cargo-fuzz 0.13.1 work together, and that 1.85 really builds the pure crates.
+  cargo-fuzz 0.13.1 work together, and that 1.87 really builds the pure crates.
 - `shellcheck` was not available in the sandbox; CI runs it.
 - No `Cargo.lock` is committed yet (none could be generated here without
-  crates.io); builds are not reproducible across machines until it is.
-- No crate inherits `rust-version.workspace = true` yet, so the MSRV is
-  declared but not enforced by cargo.
+  crates.io), so CI fails by design until a maintainer commits the
+  bootstrap lock from the `lockfile` job (see [Cargo.lock
+  policy](#cargolock-policy)).
+- Only six crates inherit `rust-version.workspace = true`; for the others the
+  MSRV is declared but not enforced by cargo.
 - The air-gapped procedures (mirror, vendored tarball, offline toolchain,
   advisory-DB snapshot) are documented, not yet rehearsed in the lab.
 - Release signing is not implemented. Reproducibility of the Pulsar-bound

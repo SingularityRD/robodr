@@ -133,6 +133,9 @@ impl Signer for FlakySigner {
         }
         self.key.sign(m)
     }
+    fn verify_own(&self, m: &[u8], sig: &[u8]) -> Option<bool> {
+        self.key.verify_own(m, sig)
+    }
 }
 
 #[test]
@@ -254,6 +257,7 @@ fn replay_opts(dir: &std::path::Path) -> ReplayOptions {
     );
     o.safety = SafetyState::MovingSlow;
     o.firewall = true;
+    o.firewall_max_angular = demo_angular();
     o
 }
 
@@ -406,13 +410,15 @@ fn configuration_that_would_disable_protection_is_refused() {
     };
     // An infinite firewall limit (the firewall itself would accept it).
     let mut c = config(&dir, demo_profile(true), validated_policy());
-    let mut fw = FirewallSettings::from_profile(&c.profile, &BTreeMap::new());
+    let mut fw =
+        FirewallSettings::from_profile(&c.profile, &BTreeMap::new(), &demo_angular()).unwrap();
     fw.channels.get_mut("/cmd_vel").unwrap().max_linear_speed = Some(f64::INFINITY);
     c.firewall = Some(fw);
     assert!(bad(c).contains("max_linear_speed"));
     // NaN hard-reject factor.
     let mut c = config(&dir, demo_profile(true), validated_policy());
-    let mut fw = FirewallSettings::from_profile(&c.profile, &BTreeMap::new());
+    let mut fw =
+        FirewallSettings::from_profile(&c.profile, &BTreeMap::new(), &demo_angular()).unwrap();
     fw.channels.get_mut("/cmd_vel").unwrap().hard_reject_factor = f64::NAN;
     c.firewall = Some(fw);
     assert!(bad(c).contains("hard_reject_factor"));
@@ -443,11 +449,96 @@ fn configuration_that_would_disable_protection_is_refused() {
 }
 
 #[test]
-fn firewall_twist_channels_get_an_explicit_angular_bound() {
+fn firewall_twist_channels_need_an_explicit_angular_bound() {
     let p = demo_profile(true);
-    let fw = FirewallSettings::from_profile(&p, &BTreeMap::new());
+    // Taken from the agent config, never a built-in default.
+    let fw = FirewallSettings::from_profile(&p, &BTreeMap::new(), &demo_angular()).unwrap();
     let spec = &fw.channels["/cmd_vel"];
     assert_eq!(spec.kind, ChannelKind::Twist);
-    assert_eq!(spec.max_angular_speed, Some(DEFAULT_MAX_ANGULAR_SPEED));
+    assert_eq!(spec.max_angular_speed, Some(DEMO_MAX_ANGULAR));
     fw.validate().unwrap();
+    // Absent: fail closed with a configuration error naming the channel.
+    match FirewallSettings::from_profile(&p, &BTreeMap::new(), &BTreeMap::new()) {
+        Err(AgentError::Config(m)) => {
+            assert!(
+                m.contains("/cmd_vel") && m.contains("max_angular_speed"),
+                "{m}"
+            )
+        }
+        other => panic!("accepted: {other:?}"),
+    }
+    // A hand-built settings value without it is refused by Agent::new.
+    let dir = tmpdir("fs-ang");
+    let mut c = config(&dir, demo_profile(true), validated_policy());
+    let mut fw = fw;
+    fw.channels.get_mut("/cmd_vel").unwrap().max_angular_speed = None;
+    c.firewall = Some(fw);
+    match Agent::new(c, signer(), clock()) {
+        Err(AgentError::Config(m)) => assert!(m.contains("max_angular_speed"), "{m}"),
+        other => panic!("accepted: {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A signer that cannot check its own signatures (like a hardware key whose
+/// public half is configured separately).
+struct OpaqueSigner(HmacSha256Key);
+
+impl Signer for OpaqueSigner {
+    fn algorithm(&self) -> &str {
+        self.0.algorithm()
+    }
+    fn key_id(&self) -> &str {
+        self.0.key_id()
+    }
+    fn sign(&self, m: &[u8]) -> Result<Vec<u8>, SignError> {
+        self.0.sign(m)
+    }
+}
+
+#[test]
+fn signer_without_self_verification_needs_an_explicit_verifier() {
+    let dir = tmpdir("fs-opaque");
+    let opaque = || Box::new(OpaqueSigner(HmacSha256Key::new("test-key", &KEY).unwrap()));
+    // Refused: the black box could not authenticate the chain it resumes.
+    match Agent::new(
+        config(&dir, demo_profile(true), validated_policy()),
+        opaque(),
+        clock(),
+    ) {
+        Err(AgentError::BlackBox(e)) => assert!(e.to_string().contains("verify"), "{e}"),
+        other => panic!("accepted: {other:?}"),
+    }
+    // A verifier for another key is refused too.
+    let wrong = Arc::new(HmacSha256Key::new("other-key", &[7u8; 32]).unwrap());
+    assert!(Agent::new_with_verifier(
+        config(&dir, demo_profile(true), validated_policy()),
+        opaque(),
+        wrong,
+        clock(),
+    )
+    .is_err());
+    // With the matching verifier it runs, and reopens (resume) work too.
+    let verifier = Arc::new(HmacSha256Key::new("test-key", &KEY).unwrap());
+    for _ in 0..2 {
+        let mut agent = Agent::new_with_verifier(
+            config(&dir, demo_profile(true), validated_policy()),
+            opaque(),
+            verifier.clone(),
+            clock(),
+        )
+        .unwrap();
+        let o = agent.handle(
+            at(1_000 * MS),
+            &rogue_participant(),
+            SafetyState::MovingSlow,
+        );
+        assert!(
+            !o[0].evidence.refs().is_empty(),
+            "{:?}",
+            o[0].evidence.errors
+        );
+        agent.finish().unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

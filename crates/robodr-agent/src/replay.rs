@@ -82,6 +82,10 @@ pub struct ReplayOptions {
     /// Per-channel allowed writer GUIDs for the firewall (see
     /// [`FirewallSettings::from_profile`] for the permissive default).
     pub firewall_allow: BTreeMap<String, Vec<String>>,
+    /// Per-channel angular speed bound (rad/s) for the firewall's Twist
+    /// channels. Required for every one of them (see
+    /// [`FirewallSettings::from_profile`]).
+    pub firewall_max_angular: BTreeMap<String, f64>,
     pub monitor: Option<MonitorConfig>,
     pub feedback_sources: BTreeMap<String, FeedbackSource>,
     pub record_all_events: bool,
@@ -123,6 +127,7 @@ impl ReplayOptions {
             step_ns: 20_000_000,
             firewall: false,
             firewall_allow: BTreeMap::new(),
+            firewall_max_angular: BTreeMap::new(),
             monitor: None,
             feedback_sources: BTreeMap::new(),
             record_all_events: false,
@@ -259,10 +264,14 @@ pub fn build_agent(opts: &ReplayOptions) -> Result<Agent, ReplayError> {
     cfg.kafka_partitions = opts.kafka_partitions;
     cfg.record_all_events = opts.record_all_events;
     if opts.firewall {
-        cfg.firewall = Some(FirewallSettings::from_profile(
-            &cfg.profile,
-            &opts.firewall_allow,
-        ));
+        cfg.firewall = Some(
+            FirewallSettings::from_profile(
+                &cfg.profile,
+                &opts.firewall_allow,
+                &opts.firewall_max_angular,
+            )
+            .map_err(ReplayError::Agent)?,
+        );
     }
     if let Some(mc) = &opts.monitor {
         let mut ms = MonitorSettings::new(mc.clone());

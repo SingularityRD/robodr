@@ -30,6 +30,7 @@ USAGE:
                 [--site NAME] [--model NAME] [--profile-version V] [--boot-id ID]
                 [--key-id ID] [--start-ms EPOCH_MS] [--step-ms MS]
                 [--firewall] [--firewall-allow CHANNEL=GUID[,GUID...]]...
+                [--firewall-max-angular CHANNEL=RAD_PER_S]...
                 [--monitor | --monitor-config FILE] [--feedback-source CHANNEL=SOURCE]...
                 [--record-all-events] [--partitions N] [--log-plans]
   robodr-replay verify --blackbox DIR (--key-hex HEX | --key-file FILE)
@@ -39,6 +40,8 @@ USAGE:
           estop_active | safe_state_active | unknown (default unknown)
   SOURCE: wheel_odometry | imu | joint_state | gnss | other
   Findings go to stdout unless --out is given; the summary goes to stderr.
+  --firewall needs --firewall-max-angular for every Twist channel of the
+  profile (the OEM's yaw-rate bound; the profile has none).
   The HMAC key (>= 32 bytes) is a placeholder authenticator (see robodr-blackbox).
   --blackbox must be absent or empty (a replay starts a fresh chain).
   A replay never acts: --log-plans only prints what would have been requested.
@@ -68,6 +71,7 @@ const VALUED: &[&str] = &[
     "start-ms",
     "step-ms",
     "firewall-allow",
+    "firewall-max-angular",
     "monitor-config",
     "feedback-source",
     "partitions",
@@ -223,7 +227,22 @@ fn options(a: &Args) -> Result<ReplayOptions, String> {
             .filter(|n| *n > 0)
             .ok_or("--step-ms must be > 0 and fit in u64 ns")?;
     }
-    o.firewall = a.has("firewall") || !a.all("firewall-allow").is_empty();
+    o.firewall = a.has("firewall")
+        || !a.all("firewall-allow").is_empty()
+        || !a.all("firewall-max-angular").is_empty();
+    for v in a.all("firewall-max-angular") {
+        let (ch, rad) = kv("--firewall-max-angular", v)?;
+        let rad: f64 = rad
+            .parse()
+            .ok()
+            .filter(|x: &f64| x.is_finite() && *x >= 0.0)
+            .ok_or_else(|| {
+                format!("--firewall-max-angular {ch}: {rad:?} is not a finite rad/s >= 0")
+            })?;
+        if o.firewall_max_angular.insert(ch.clone(), rad).is_some() {
+            return Err(format!("--firewall-max-angular {ch} given more than once"));
+        }
+    }
     for v in a.all("firewall-allow") {
         let (ch, guids) = kv("--firewall-allow", v)?;
         o.firewall_allow

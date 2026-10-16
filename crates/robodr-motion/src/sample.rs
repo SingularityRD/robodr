@@ -13,10 +13,12 @@
 //! opposite way to its command. The joint axis is a magnitude by nature.
 //! Two exceptions are declared rather than guessed:
 //!
-//! * a command whose source only carries magnitudes (such as
-//!   [`robodr_events::MotionCommand`]) sets [`CommandSample::direction_known`]
-//!   to `false`; while it is in effect the monitor compares magnitudes and
-//!   **cannot** detect a reversal on that command;
+//! * a command whose source only carries magnitudes sets
+//!   [`CommandSample::direction_known`] to `false`; while it is in effect the
+//!   monitor compares magnitudes and **cannot** detect a reversal on that
+//!   command ([`CommandSample::from_motion_command`] does this
+//!   conservatively; `robodr-agent` builds signed samples instead, since
+//!   [`robodr_events::MotionCommand`] carries the signed `Twist` values);
 //! * a feedback source that only measures magnitude (GNSS speed over ground)
 //!   is declared with `SourceConfig::signed = false`.
 //!
@@ -180,12 +182,14 @@ impl<'a> CommandSample<'a> {
         }
     }
 
-    /// Build from the shared event type. `MotionCommand` carries magnitudes
-    /// only (no sign, no yaw rate), so `angular` is `None` and
-    /// `direction_known` is `false`: the monitor compares magnitudes for this
-    /// command and **cannot detect a direction reversal** from it. Feed
-    /// signed [`CommandSample`]s built from the `Twist` itself to get the
-    /// reversal check.
+    /// Build from the shared event type, conservatively: `angular` is `None`
+    /// and `direction_known` is `false`, so the monitor compares magnitudes
+    /// for this command and **cannot detect a direction reversal** from it.
+    /// Use this only when the producer may have sent magnitudes.
+    /// `MotionCommand` is specified as carrying the signed `Twist` values
+    /// (`linear_speed` = `linear.x`, `angular_speed` = `angular.z`); build a
+    /// [`CommandSample`] from those with `direction_known: true` (as
+    /// `robodr-agent` does) to get the reversal check.
     pub fn from_motion_command(cmd: &'a MotionCommand, t_ns: u64) -> Self {
         CommandSample {
             t_ns,
@@ -323,6 +327,7 @@ mod tests {
             source_guid: Some("01.0f".into()),
             linear_speed: Some(0.8),
             joint_speed: None,
+            angular_speed: None,
         };
         let c: CommandSample = (&mc, 42).into();
         assert_eq!(c.t_ns, 42);

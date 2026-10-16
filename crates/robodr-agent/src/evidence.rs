@@ -10,9 +10,21 @@
 //! recomputes from the record's fields, and that its signature verifies.
 //! Together: a finding's evidence is exactly what the signed chain holds.
 //!
+//! Reading the report: [`Report::is_intact`] (no `Tamper` finding) is what
+//! [`crate::replay::ReplaySummary::verified`] requires. A crash recovery the
+//! recorder performed on reopen (torn tail quarantined, signed `Recovery`
+//! record) is a `Warning`, so such a chain is intact but not
+//! [`Report::is_clean`]: the discarded newest records cannot be told apart
+//! from a deliberate truncation of an unsynced tail. The export cursor and
+//! checkpoint files in the directory are signed by the unit key and only
+//! trusted by the recorder if they authenticate; the verifier itself should
+//! still be given an off-unit checkpoint.
+//!
 //! Limits: the HMAC key that verifies is also the key that signs (see the
 //! `robodr-blackbox` README); a holder of the key can rewrite history. The
 //! checkpoint passed to [`verify_blackbox`] should come from off the unit.
+//! A signer that cannot verify its own signatures (hardware key) is opened
+//! with [`crate::Agent::new_with_verifier`].
 
 use std::collections::BTreeMap;
 use std::io;

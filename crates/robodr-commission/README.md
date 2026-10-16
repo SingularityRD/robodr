@@ -108,6 +108,10 @@ always printed to stdout. The report contains:
   `few_motion_samples` (< `--min-samples`, default 30: envelope not trustworthy),
   `participant_seen_once` (transient? tool?), `writer_without_reader`,
   `unannounced_participant`, `motion_channel_without_writer`,
+  `motion_envelope_dropped_no_writer` (commands from accepted sources on a
+  channel no accepted participant announced a writer on: no envelope is
+  learned, because `Profile::validate` requires an enveloped channel to be a
+  writer topic; commands on it are reported as an unprofiled channel),
   `motion_channel_without_envelope`, `observed_exceeds_ceiling`,
   `margin_capped_by_ceiling`, `zero_envelope`, `mangled_motion_channel`,
   `topic_type_conflict`, `anomalies_present`, `default_model_name`, `no_events`,

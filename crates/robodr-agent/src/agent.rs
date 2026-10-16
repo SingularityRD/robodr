@@ -65,21 +65,48 @@
 //! [`crate::clock::TimeGuard`]: `mono_ns` never goes backwards and wall jumps
 //! are reported (see [`crate::clock`]).
 //!
-//! # Mapping `MotionCommand` to the firewall
+//! # Mapping `MotionCommand` to the firewall and the motion monitor
 //!
-//! `MotionCommand` carries magnitudes only and no source stamp:
-//! * Twist channel: `linear = (linear_speed, 0, 0)`, angular zero. A command
-//!   with only `joint_speed` becomes a 1-joint command (kind mismatch → reject).
+//! `MotionCommand` carries the command's signed body-frame values
+//! (`Twist.linear.x` as `linear_speed`, `Twist.angular.z` as
+//! `angular_speed`, REP 103) and the max joint speed, but no source stamp:
+//! * Twist channel: `linear = (linear_speed, 0, 0)`, `angular = (0, 0,
+//!   angular_speed)` (an absent axis is 0 for the firewall). A command with
+//!   only `joint_speed` becomes a 1-joint command (kind mismatch → reject).
+//!   Every Twist channel has an explicit `max_angular_speed` (see
+//!   [`crate::FirewallSettings::from_profile`]).
 //! * Joint channel with `count` joints: every joint gets `joint_speed` (the
 //!   max |joint speed|; the firewall's per-joint limit sees the same maximum).
 //!   A command with only `linear_speed` becomes a twist (kind mismatch).
 //! * Source: `source_guid` resolved by the firewall policy (exact GUID, else
 //!   its 24-char participant prefix, so a spec listing a participant
 //!   authorises all of that participant's writers), else `SourceId::UNKNOWN`.
+//!   A command from a source not allowed on the channel is dropped by the
+//!   firewall (its default `ForeignSourceAction::Drop`) and reported.
 //!   Unknown channel: an id no policy channel has.
 //! * Stamp = observation time (`mono_ns`), so the firewall's stale / future
 //!   checks cannot fire here; out-of-order still fires for two commands from
 //!   one source at the same `mono_ns`.
+//!
+//! The motion monitor gets the same signed values as a `CommandSample` with
+//! `direction_known: true` (an axis the command does not mention stays
+//! `None`, "no expectation", not zero), so it can see a robot moving against
+//! its command.
+//!
+//! # Motion feedback
+//!
+//! `MotionFeedback.measured_linear_speed` is a magnitude, while the monitor
+//! compares signed values by default (`SourceConfig::signed`). The agent
+//! feeds the signed `linear_velocity` / `angular_velocity` when the producer
+//! gives them. A magnitude-only sample is used only for a source the monitor
+//! compares by magnitude (`signed = false`, e.g. GNSS, or
+//! `compare_magnitudes`); otherwise its linear axis is withheld and counted
+//! in [`AgentStats::feedback_magnitude_dropped`] (a magnitude against a
+//! signed reversing command would be a false "moving against its command").
+//! `publisher_guid` is interned to a dense id (bounded by
+//! [`MAX_INTERNED_PUBLISHERS`]) and passed to `on_feedback_from`, so an
+//! injected second publisher on a feedback topic is seen; samples without
+//! it use `on_feedback` (one shared slot).
 //!
 //! In the finding, commanded speeds are reported as magnitudes and a
 //! non-finite value is omitted (the findings contract accepts only finite,
@@ -93,7 +120,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use robodr_blackbox::crypto::to_hex;
 use robodr_blackbox::sign::SignError;
 use robodr_blackbox::{
-    AppendOutcome, Checkpoint, Clock, Recorder, RecorderConfig, Signer, Timestamp,
+    AppendOutcome, Checkpoint, Clock, Recorder, RecorderConfig, Signer, Timestamp, Verifier,
 };
 use robodr_events::profile::Profile;
 use robodr_events::{Deviation, MotionCommand, RobotEvent, Severity};
@@ -148,6 +175,13 @@ pub struct AgentStats {
     pub faults_dropped: u64,
     /// Successful black-box reopens after a failure.
     pub blackbox_reopens: u64,
+    /// Feedback samples whose linear axis was not given to the motion
+    /// monitor: only the magnitude (`measured_linear_speed`) was present and
+    /// the monitor compares signed values for that source (see
+    /// [`crate::agent`], "Motion feedback").
+    pub feedback_magnitude_dropped: u64,
+    /// Feedback publishers beyond [`MAX_INTERNED_PUBLISHERS`] (hashed ids).
+    pub publishers_hashed: u64,
 }
 
 /// A signer shared between the agent and every recorder it opens, so a
@@ -182,6 +216,57 @@ impl Signer for SharedSigner {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .sign(message)
+    }
+    // Forwarded so a self-verifying signer (HMAC) still opens with
+    // `Recorder::open`: the recorder authenticates the existing chain tail
+    // and its signed state files (export cursor, checkpoint) with it.
+    fn verify_own(&self, message: &[u8], signature: &[u8]) -> Option<bool> {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .verify_own(message, signature)
+    }
+}
+
+/// A verifier for the recorder's own key, shared between every recorder the
+/// agent opens (signers that cannot self-verify, e.g. a TPM-held key whose
+/// public half is configured separately).
+#[derive(Clone)]
+struct SharedVerifier(Arc<dyn Verifier + Send + Sync>);
+
+impl Verifier for SharedVerifier {
+    fn algorithm(&self) -> &str {
+        self.0.algorithm()
+    }
+    fn key_id(&self) -> &str {
+        self.0.key_id()
+    }
+    fn verify(&self, message: &[u8], signature: &[u8]) -> bool {
+        self.0.verify(message, signature)
+    }
+}
+
+/// Open (or resume) the black box with the agent's key. A signer that can
+/// check its own signatures needs no verifier; otherwise the configured one
+/// is used ([`Recorder::open_with_verifier`]).
+fn open_recorder(
+    cfg: &RecorderConfig,
+    signer: &SharedSigner,
+    verifier: Option<&SharedVerifier>,
+    clock: &FollowClock,
+) -> Result<Recorder, robodr_blackbox::Error> {
+    match verifier {
+        None => Recorder::open(
+            cfg.clone(),
+            Box::new(signer.clone()),
+            Box::new(clock.clone()),
+        ),
+        Some(v) => Recorder::open_with_verifier(
+            cfg.clone(),
+            Box::new(signer.clone()),
+            Box::new(v.clone()),
+            Box::new(clock.clone()),
+        ),
     }
 }
 
@@ -224,6 +309,38 @@ struct FirewallState {
 struct MonitorState {
     monitor: ConsistencyMonitor,
     settings: MonitorSettings,
+    publishers: PublisherIds,
+}
+
+/// Most distinct feedback publisher GUIDs given a dense id; beyond it,
+/// [`robodr_motion::publisher_id`] (a 32-bit hash) is used and counted in
+/// [`AgentStats::publishers_hashed`].
+pub const MAX_INTERNED_PUBLISHERS: usize = 1024;
+
+/// Interned feedback-publisher ids for
+/// [`ConsistencyMonitor::on_feedback_from`]. Dense ids (1, 2, ...) cannot
+/// be collided on purpose, unlike a hash of an attacker-chosen GUID; the
+/// table is bounded, and an overflow falls back to the hash (counted).
+#[derive(Default)]
+struct PublisherIds {
+    ids: BTreeMap<String, u32>,
+}
+
+impl PublisherIds {
+    fn intern(&mut self, guid: &str, stats: &mut AgentStats) -> u32 {
+        let key = guid.to_ascii_lowercase();
+        if let Some(id) = self.ids.get(&key) {
+            return *id;
+        }
+        if self.ids.len() < MAX_INTERNED_PUBLISHERS {
+            // 0 is PUBLISHER_UNKNOWN; the table never exceeds u32 range.
+            let id = u32::try_from(self.ids.len() + 1).unwrap_or(u32::MAX);
+            self.ids.insert(key, id);
+            return id;
+        }
+        stats.publishers_hashed = stats.publishers_hashed.saturating_add(1);
+        robodr_motion::publisher_id(key.as_bytes())
+    }
 }
 
 /// The RoboDR agent for one robot. See the module docs.
@@ -239,6 +356,8 @@ pub struct Agent {
     recorder: Option<Recorder>,
     blackbox_cfg: RecorderConfig,
     signer: SharedSigner,
+    /// Explicit verifier for `signer`'s key, if the signer cannot verify.
+    verifier: Option<SharedVerifier>,
     /// Monotonic time of the first failure of the current outage.
     blackbox_down_since: Option<u64>,
     last_reopen_attempt: Option<u64>,
@@ -279,9 +398,35 @@ pub struct Finished {
 impl Agent {
     /// Validate everything, open (or resume) the black box and build the
     /// detectors. Reads `clock` once for the black box's opening records.
+    ///
+    /// `signer` must be able to verify its own signatures
+    /// ([`Signer::verify_own`], e.g. the HMAC key): the black box
+    /// authenticates the chain it resumes. Otherwise use
+    /// [`Agent::new_with_verifier`].
     pub fn new(
         cfg: AgentConfig,
         signer: Box<dyn Signer>,
+        clock: Box<dyn Clock>,
+    ) -> Result<Self, AgentError> {
+        Self::build(cfg, signer, None, clock)
+    }
+
+    /// [`Agent::new`] for a signer that cannot verify its own signatures:
+    /// `verifier` checks the signer's key (same key id and algorithm) when
+    /// the black box is opened and every time it is reopened.
+    pub fn new_with_verifier(
+        cfg: AgentConfig,
+        signer: Box<dyn Signer>,
+        verifier: Arc<dyn Verifier + Send + Sync>,
+        clock: Box<dyn Clock>,
+    ) -> Result<Self, AgentError> {
+        Self::build(cfg, signer, Some(SharedVerifier(verifier)), clock)
+    }
+
+    fn build(
+        cfg: AgentConfig,
+        signer: Box<dyn Signer>,
+        verifier: Option<SharedVerifier>,
         clock: Box<dyn Clock>,
     ) -> Result<Self, AgentError> {
         cfg.validate()?;
@@ -308,6 +453,7 @@ impl Agent {
                 monitor: ConsistencyMonitor::new(settings.config.clone())
                     .map_err(AgentError::Monitor)?,
                 settings,
+                publishers: PublisherIds::default(),
             }),
         };
         let mode = if cfg.profile.locked {
@@ -329,12 +475,8 @@ impl Agent {
         probe_finding(&ocsf, start, cfg.kafka_partitions).map_err(AgentError::Config)?;
         let follow = FollowClock::new(start);
         let signer = SharedSigner::new(signer);
-        let recorder = Recorder::open(
-            cfg.blackbox.clone(),
-            Box::new(signer.clone()),
-            Box::new(follow.clone()),
-        )
-        .map_err(AgentError::BlackBox)?;
+        let recorder = open_recorder(&cfg.blackbox, &signer, verifier.as_ref(), &follow)
+            .map_err(AgentError::BlackBox)?;
         let context = OperationalContext {
             profile_locked: cfg.profile.locked,
             ..cfg.context
@@ -350,6 +492,7 @@ impl Agent {
             recorder: Some(recorder),
             blackbox_cfg: cfg.blackbox,
             signer,
+            verifier,
             blackbox_down_since: None,
             last_reopen_attempt: None,
             lost_while_down: 0,
@@ -467,18 +610,29 @@ impl Agent {
             match event {
                 RobotEvent::MotionCommand(c) => ms
                     .monitor
-                    .on_command(&CommandSample::from_motion_command(c, mono), |f| {
-                        hits.push(f)
-                    }),
+                    .on_command(&command_sample(c, mono), |f| hits.push(f)),
                 RobotEvent::MotionFeedback(f) => {
+                    let source = ms.settings.source_for(&f.channel);
+                    let (linear, magnitude_dropped) = feedback_linear(&ms.monitor, source, f);
+                    if magnitude_dropped {
+                        self.stats.feedback_magnitude_dropped =
+                            self.stats.feedback_magnitude_dropped.saturating_add(1);
+                    }
                     let sample = FeedbackSample {
                         t_ns: f.timestamp_ns,
-                        source: ms.settings.source_for(&f.channel),
-                        linear: f.measured_linear_speed,
-                        angular: None,
+                        source,
+                        linear,
+                        angular: f.angular_velocity,
                         joint_speed_max: f.measured_joint_speed,
                     };
-                    ms.monitor.on_feedback(mono, &sample, |x| hits.push(x));
+                    match f.publisher_guid.as_deref() {
+                        Some(g) => {
+                            let id = ms.publishers.intern(g, &mut self.stats);
+                            ms.monitor
+                                .on_feedback_from(mono, id, &sample, |x| hits.push(x));
+                        }
+                        None => ms.monitor.on_feedback(mono, &sample, |x| hits.push(x)),
+                    }
                 }
                 _ => ms.monitor.tick(mono, |x| hits.push(x)),
             }
@@ -697,10 +851,11 @@ impl Agent {
         self.last_reopen_attempt = Some(now.mono_ns);
         // Single writer: the old recorder (and its file handle) goes first.
         self.recorder = None;
-        match Recorder::open(
-            self.blackbox_cfg.clone(),
-            Box::new(self.signer.clone()),
-            Box::new(self.follow.clone()),
+        match open_recorder(
+            &self.blackbox_cfg,
+            &self.signer,
+            self.verifier.as_ref(),
+            &self.follow,
         ) {
             Ok(r) => {
                 self.recorder = Some(r);
@@ -996,7 +1151,10 @@ fn to_firewall_command(fs: &FirewallState, c: &MotionCommand, now: u64) -> Comma
         })
         .unwrap_or(SourceId::UNKNOWN);
     let channel = fs.fw.channel_id(&c.channel).unwrap_or(ChannelId(u16::MAX));
-    let twist = |v: f64| Motion::Twist(Twist::new(Vec3::new(v, 0.0, 0.0), Vec3::ZERO));
+    // Signed body-frame values, as on the wire (REP 103).
+    let yaw = c.angular_speed.unwrap_or(0.0);
+    let twist =
+        |v: f64| Motion::Twist(Twist::new(Vec3::new(v, 0.0, 0.0), Vec3::new(0.0, 0.0, yaw)));
     let joints = |n: usize, v: f64| {
         Motion::Joints(
             JointVelocities::from_slice(&vec![v; n.clamp(1, robodr_firewall::MAX_JOINTS)])
@@ -1018,6 +1176,44 @@ fn to_firewall_command(fs: &FirewallState, c: &MotionCommand, now: u64) -> Comma
         channel,
         stamp_ns: now,
         motion,
+    }
+}
+
+/// The motion monitor's view of a command: the same signed values the
+/// firewall's `Twist` carries (`linear.x`, `angular.z`), with an axis the
+/// command does not mention left as "no expectation" (`None`) rather than
+/// zero.
+fn command_sample(c: &MotionCommand, now: u64) -> CommandSample<'_> {
+    CommandSample {
+        t_ns: now,
+        channel: &c.channel,
+        linear: c.linear_speed,
+        angular: c.angular_speed,
+        joint_speed_max: c.joint_speed,
+        direction_known: true,
+    }
+}
+
+/// Linear feedback for the monitor: the signed `linear_velocity` when given;
+/// the magnitude `measured_linear_speed` only when the monitor compares
+/// magnitudes for `source` (unsigned source, or `compare_magnitudes`).
+/// Otherwise the axis is withheld (`None`, and `true` is returned so it is
+/// counted): a magnitude compared against a signed command would turn every
+/// reversing manoeuvre into a "robot moves against its command" finding.
+fn feedback_linear(
+    monitor: &ConsistencyMonitor,
+    source: robodr_motion::FeedbackSource,
+    f: &robodr_events::MotionFeedback,
+) -> (Option<f64>, bool) {
+    if f.linear_velocity.is_some() {
+        return (f.linear_velocity, false);
+    }
+    let cfg = monitor.config();
+    let magnitudes_ok = cfg.compare_magnitudes || !cfg.sources.get(source).signed;
+    match f.measured_linear_speed {
+        Some(m) if magnitudes_ok => (Some(m), false),
+        Some(_) => (None, true),
+        None => (None, false),
     }
 }
 
@@ -1162,6 +1358,7 @@ mod tests {
             source_guid: Some("0F0F0F0F0F0F0F0F0F0F0F0F000001c1".into()),
             linear_speed: Some(1.0),
             joint_speed: None,
+            angular_speed: None,
         };
         assert_eq!(
             source_key(&RobotEvent::MotionCommand(c.clone())),
@@ -1181,8 +1378,49 @@ mod tests {
             source_guid: Some("ééééééééééééééé".into()),
             linear_speed: None,
             joint_speed: None,
+            angular_speed: None,
         };
         assert!(source_key(&RobotEvent::MotionCommand(weird)).starts_with("participant:"));
+    }
+
+    #[test]
+    fn publisher_ids_are_dense_case_insensitive_and_bounded() {
+        let mut ids = PublisherIds::default();
+        let mut st = AgentStats::default();
+        let a = ids.intern("AA00", &mut st);
+        assert_eq!(a, 1);
+        assert_eq!(ids.intern("aa00", &mut st), 1);
+        assert_eq!(ids.intern("bb00", &mut st), 2);
+        for i in 0..MAX_INTERNED_PUBLISHERS {
+            ids.intern(&format!("g{i}"), &mut st);
+        }
+        assert_eq!(ids.ids.len(), MAX_INTERNED_PUBLISHERS);
+        let h = ids.intern("overflow", &mut st);
+        assert_ne!(h, robodr_motion::PUBLISHER_UNKNOWN);
+        assert!(st.publishers_hashed >= 1);
+        // Known ids keep resolving after the overflow.
+        assert_eq!(ids.intern("AA00", &mut st), 1);
+    }
+
+    #[test]
+    fn command_sample_keeps_sign_and_absent_axes() {
+        let c = MotionCommand {
+            channel: "/cmd_vel".into(),
+            source_guid: None,
+            linear_speed: Some(-0.3),
+            joint_speed: None,
+            angular_speed: Some(0.2),
+        };
+        let s = command_sample(&c, 7);
+        assert_eq!(s.linear, Some(-0.3));
+        assert_eq!(s.angular, Some(0.2));
+        assert_eq!(s.joint_speed_max, None);
+        assert!(s.direction_known);
+        let no_yaw = MotionCommand {
+            angular_speed: None,
+            ..c
+        };
+        assert_eq!(command_sample(&no_yaw, 7).angular, None);
     }
 
     #[test]

@@ -432,7 +432,7 @@ fn merge_subcommand() {
     write_profile(
         &b,
         serde_json::json!({"model":"ugv-demo-synthetic","participants":["bbbbbbbbbbbbbbbbbbbbbbbb"],
-           "writer_topics":["/x"],
+           "writer_topics":["/x", "/cmd_vel"],
            "motion_envelopes":{"/cmd_vel":{"max_linear_speed":9.0,"max_joint_speed":null}}}),
     );
     let m = d.join("m.json");

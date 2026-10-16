@@ -770,6 +770,8 @@ mod tests {
         assert!(why.contains(&LockRefusal::NoWriterTopics));
 
         let mut p = base();
+        p.writer_topics.insert("/arm".into());
+        p.writer_topics.insert("/bad".into());
         p.motion_envelopes
             .insert("/arm".into(), Envelope::default());
         p.motion_envelopes.insert(
@@ -967,6 +969,7 @@ mod tests {
             },
         );
         let mut c = lk(&base()).unwrap();
+        c.writer_topics.insert("/arm".into());
         c.motion_envelopes.insert(
             "/arm".into(),
             Envelope {
@@ -977,7 +980,7 @@ mod tests {
         let m = merge_profiles(&[a.clone(), b.clone(), c.clone()]).unwrap();
         assert!(!m.locked);
         assert_eq!(m.participants.len(), 2);
-        assert_eq!(m.writer_topics.len(), 2);
+        assert_eq!(m.writer_topics.len(), 3);
         assert_eq!(
             m.motion_envelopes["/cmd_vel"],
             Envelope {
@@ -1139,6 +1142,7 @@ mod tests {
                 source_guid: None,
                 linear_speed: Some(v),
                 joint_speed: None,
+                angular_speed: None,
             })
         };
         c.observe("x", 3, &mv(0.4));

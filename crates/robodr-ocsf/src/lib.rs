@@ -9,7 +9,7 @@
 //!   trusted rule catalog, severity mapping.
 //! * [`taint`] — SR-TAINT: neutralising attacker-controlled ROS/DDS strings
 //!   before they reach an LLM-based SOC.
-//! * [`validate`] — strict validator for outgoing and replayed findings.
+//! * [`validate`](mod@validate) — strict validator for outgoing and replayed findings.
 //! * [`kafka`] — record key, headers, partitioning by robot id.
 //! * [`hash`] — std-only SHA-256 and Kafka murmur2 (vector-tested).
 //!
