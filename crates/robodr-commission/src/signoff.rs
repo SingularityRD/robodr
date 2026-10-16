@@ -41,21 +41,80 @@
 //! list from the profile alone (every participant and every motion channel
 //! must be confirmed), because the learner's provenance is gone.
 //!
-//! # Limits
+//! # Operator signatures (who confirmed it)
 //!
-//! The sign-off is an integrity and process control, not authentication:
-//! anyone who can write the files can also write `"confirmed": true`, or
-//! recompute `items_sha256` after deleting items (it is a plain hash, not a
-//! signature). It forces a named human decision on every risky item and
-//! makes a silent skip impossible; it cannot stop a careless or malicious
-//! operator.
+//! `items_sha256` and `profile_sha256` are plain hashes: anyone who can
+//! write the files can recompute them after deleting an item or flipping
+//! `"confirmed"`. What makes the confirmation an authenticated decision is
+//! the operator's **Ed25519 signature** over the exact bytes of the
+//! confirmed sign-off file ([`SignoffSignatures`], `<signoff>.sig`):
+//!
+//! * The operator reviews and confirms the list, then runs
+//!   `robodr-commission signoff --signoff S --sign-key OP.key`. The tool
+//!   refuses to sign a list that is not fully confirmed, names no operator,
+//!   has a broken item digest or (with `--in`) belongs to another draft. The
+//!   signature covers [`SIGNOFF_SIG_DOMAIN`] followed by the file bytes, so
+//!   one changed byte voids it; every later signer signs the same bytes.
+//! * Operator keys are robodr-blackbox key files (`robodr-blackbox-key/v2`,
+//!   Ed25519, secret file mode 0600; `robodr-commission keygen` or
+//!   `robodr-blackbox keygen`). Their public halves are listed, each bound
+//!   to an operator name, in an **operators trust list**
+//!   ([`OperatorTrust`], `robodr-operators/v1`, built by
+//!   `robodr-commission operators`). The list is refused when it is a
+//!   symlink or writable by group/others, lists a key id or a public key
+//!   twice, or asks for a quorum it cannot meet.
+//! * `lock --operators operators.json` verifies every signature in
+//!   `<signoff>.sig` ([`verify_signoff_signatures`]): any malformed, unknown
+//!   or invalid signature refuses the lock (fail closed), at least one
+//!   valid signature is required, the sign-off's `operator` must be the
+//!   name bound to one of the valid signers (so `locked_by` in the locked
+//!   profile is an authenticated identity), and if the list has motion
+//!   items ([`MOTION_REVIEW_KINDS`]) at least `motion_quorum` **distinct
+//!   operators** (names, not keys) must have signed: the two-person rule
+//!   (`motion_quorum` in the trust list, raised per lock with
+//!   `--motion-quorum`).
+//!
+//! # The floor: what the draft itself requires
+//!
+//! The learner's item list rests on evidence (the run) that `lock` cannot
+//! see again. What it can recompute from the draft bytes, which the list is
+//! bound to by `profile_sha256`, it does ([`required_items`]): every motion
+//! channel needs a confirmed motion review item and every motion dimension
+//! left `null` (unlimited) needs a confirmed `envelope_dimension_unbounded`
+//! item, whatever the list says. A recomputed (forged) list therefore can
+//! drop learner findings (late participants, outliers) but never the motion
+//! review, and it still needs an authorised operator's signature over the
+//! list it ends up with.
+//!
+//! # Trust model and limits
+//!
+//! * Trusted: the operators trust list (installed by the OEM's security
+//!   officer, as integrity-protected as the profile trust file), the
+//!   operators' secret keys, and the commissioning workstation while
+//!   `learn` runs (the learner is not a separate signing identity: a learner
+//!   key on the same workstation would add no assurance over the operator
+//!   signature that follows it).
+//! * Not trusted: anyone with write access to the draft, the sign-off or the
+//!   `.sig` file. They can delete items and recompute the digests, but the
+//!   result has no valid operator signature, or (if an operator signs it)
+//!   the operator signed exactly the list they were shown.
+//! * Limits: a careless or colluding operator (or, with a quorum, colluding
+//!   operators) can still confirm anything; the signature makes that a
+//!   named, non-repudiable decision, not a correct one. Ed25519 is
+//!   robodr-blackbox's std-only implementation (RFC 8032 vectors, not
+//!   audited). No key expiry or revocation list: revoke by removing the key
+//!   from the trust list.
 
 use crate::to_json;
-use robodr_blackbox::crypto::{sha256, to_hex};
+use robodr_blackbox::crypto::{from_hex, sha256, to_hex};
+use robodr_blackbox::sign_ed25519::{ED25519, PUBLIC_KEY_LEN, SIGNATURE_LEN};
+use robodr_blackbox::{Ed25519VerifyingKey, Signer, Verifier};
 use robodr_events::profile::Profile;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 
 /// Value of [`Signoff::format`].
 pub const SIGNOFF_FORMAT: &str = "robodr-commission-signoff/1";
@@ -134,25 +193,79 @@ pub const MOTION_REVIEW_KINDS: [&str; 3] = [
     "motion_channel_unreviewed",
 ];
 
+/// Kind of the item that must confirm a `null` (unlimited) motion
+/// dimension ([`required_items`]).
+pub const UNBOUNDED_DIMENSION_KIND: &str = "envelope_dimension_unbounded";
+
+/// One entry of the floor recomputed from a draft ([`required_items`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Requirement {
+    /// A motion channel, or `"<channel> <dimension>"`.
+    pub subject: String,
+    /// Item kinds that satisfy it.
+    pub kinds: &'static [&'static str],
+    /// `true`: the item's subject must equal `subject`; `false`: it may
+    /// also extend it (`"<subject> <rest>"`, e.g. `motion_writer` items
+    /// name the channel and the writer).
+    pub exact: bool,
+    pub why: String,
+}
+
 /// What every sign-off for `profile` must contain, confirmed, whatever list
-/// was generated: one item per motion channel `ch` whose kind is in
-/// [`MOTION_REVIEW_KINDS`] and whose subject is `ch` or starts with
-/// `"<ch> "`. Returns `(channel, why)` for each requirement.
-pub fn required_items(profile: &Profile) -> Vec<(String, String)> {
-    profile
-        .motion_envelopes
-        .keys()
-        .map(|ch| {
-            (
-                ch.clone(),
-                format!(
-                    "motion channel {ch} is in the draft, so a confirmed review of who may \
-                     command it ({}) is required",
-                    MOTION_REVIEW_KINDS.join(" / ")
-                ),
-            )
-        })
-        .collect()
+/// was generated (the floor `lock` recomputes from the draft bytes):
+/// * per motion channel `ch`: an item whose kind is in
+///   [`MOTION_REVIEW_KINDS`] and whose subject is `ch` or starts with
+///   `"<ch> "`;
+/// * per motion dimension left `null` (unlimited) on a channel that bounds
+///   the other one: an [`UNBOUNDED_DIMENSION_KIND`] item for
+///   `"<ch> <dimension>"`. (A channel bounding neither is refused by
+///   `lock` outright.)
+pub fn required_items(profile: &Profile) -> Vec<Requirement> {
+    let mut out = Vec::new();
+    for (ch, env) in &profile.motion_envelopes {
+        out.push(Requirement {
+            subject: ch.clone(),
+            kinds: &MOTION_REVIEW_KINDS,
+            exact: false,
+            why: format!(
+                "motion channel {ch} is in the draft, so a confirmed review of who may command \
+                 it ({}) is required",
+                MOTION_REVIEW_KINDS.join(" / ")
+            ),
+        });
+        let dims = [
+            ("linear", env.max_linear_speed),
+            ("joint", env.max_joint_speed),
+        ];
+        if dims.iter().any(|(_, b)| b.is_some()) {
+            for (dim, b) in dims {
+                if b.is_none() {
+                    out.push(Requirement {
+                        subject: format!("{ch} {dim}"),
+                        kinds: &[UNBOUNDED_DIMENSION_KIND],
+                        exact: true,
+                        why: format!(
+                            "{ch} has no {dim} bound (null = unlimited), so a confirmed \
+                             {UNBOUNDED_DIMENSION_KIND} item for it is required"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Does `item` (confirmed) satisfy `req`?
+pub fn satisfies(item: &SignoffItem, req: &Requirement) -> bool {
+    item.confirmed
+        && req.kinds.contains(&item.kind.as_str())
+        && (item.subject == req.subject
+            || (!req.exact
+                && item
+                    .subject
+                    .strip_prefix(req.subject.as_str())
+                    .is_some_and(|rest| rest.starts_with(' '))))
 }
 
 /// Does `item` (confirmed) satisfy the floor requirement for `channel`?
@@ -232,7 +345,7 @@ impl Signoff {
             ] {
                 if b.is_none() {
                     items.push(SignoffItem::new(
-                        "envelope_dimension_unbounded",
+                        UNBOUNDED_DIMENSION_KIND,
                         &format!("{ch} {dim}"),
                         format!(
                             "{ch} has no {dim} bound (null = unlimited): confirm that {dim} \
@@ -313,6 +426,418 @@ impl fmt::Display for Signoff {
         }
         Ok(())
     }
+}
+
+// ------------------------------------------------- operator signatures --
+
+/// Domain separation prefix of a sign-off signature.
+pub const SIGNOFF_SIG_DOMAIN: &[u8] = b"robodr-signoff-sig/v1\0";
+/// Value of [`SignoffSignatures::format`].
+pub const SIGNOFF_SIGS_FORMAT: &str = "robodr-signoff-sigs/v1";
+/// Value of the operators trust list's `format`.
+pub const OPERATORS_FORMAT: &str = "robodr-operators/v1";
+/// Max keys in an operators trust list.
+pub const MAX_OPERATOR_KEYS: usize = 64;
+/// Max signatures on one sign-off.
+pub const MAX_SIGNOFF_SIGNATURES: usize = 64;
+/// Max size of an operators trust list or a signature file.
+pub const MAX_OPERATORS_BYTES: u64 = 256 * 1024;
+
+/// The signature file of a sign-off: the file name with `.sig` appended.
+pub fn signoff_sig_path(signoff: &Path) -> PathBuf {
+    let mut s = signoff.as_os_str().to_os_string();
+    s.push(".sig");
+    PathBuf::from(s)
+}
+
+/// The message an operator signs: [`SIGNOFF_SIG_DOMAIN`] followed by the
+/// exact bytes of the confirmed sign-off file.
+pub fn signoff_signed_message(signoff_bytes: &[u8]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(SIGNOFF_SIG_DOMAIN.len() + signoff_bytes.len());
+    m.extend_from_slice(SIGNOFF_SIG_DOMAIN);
+    m.extend_from_slice(signoff_bytes);
+    m
+}
+
+/// `sha256:<hex>` of the sign-off bytes (diagnostics and binding of the
+/// signature file to one exact version of the list).
+pub fn signoff_file_digest(bytes: &[u8]) -> String {
+    format!("sha256:{}", sha256_hex(bytes))
+}
+
+/// One operator's signature over a sign-off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorSignature {
+    pub algorithm: String,
+    pub key_id: String,
+    pub signature_hex: String,
+}
+
+/// The signature file of a sign-off (`<signoff>.sig`,
+/// `robodr-signoff-sigs/v1`): every operator who signed these exact bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignoffSignatures {
+    pub format: String,
+    /// [`signoff_file_digest`] of the signed bytes.
+    pub signoff_digest: String,
+    pub signatures: Vec<OperatorSignature>,
+}
+
+impl SignoffSignatures {
+    /// An empty signature set for these sign-off bytes.
+    pub fn new(signoff_bytes: &[u8]) -> Self {
+        Self {
+            format: SIGNOFF_SIGS_FORMAT.into(),
+            signoff_digest: signoff_file_digest(signoff_bytes),
+            signatures: Vec::new(),
+        }
+    }
+
+    /// Add `signer`'s signature over `signoff_bytes`. Refuses bytes other
+    /// than the ones the set is for, a non-Ed25519 signer, a key that
+    /// already signed and more than [`MAX_SIGNOFF_SIGNATURES`] signatures.
+    pub fn add(&mut self, signoff_bytes: &[u8], signer: &dyn Signer) -> Result<(), String> {
+        if self.signoff_digest != signoff_file_digest(signoff_bytes) {
+            return Err(format!(
+                "the existing signatures are for sign-off {}, this file is {}: the list changed \
+                 after it was signed, so those signatures are void",
+                self.signoff_digest,
+                signoff_file_digest(signoff_bytes)
+            ));
+        }
+        if signer.algorithm() != ED25519 {
+            return Err(format!(
+                "key algorithm {:?} cannot sign a sign-off (need {ED25519:?})",
+                signer.algorithm()
+            ));
+        }
+        if self.signatures.iter().any(|s| s.key_id == signer.key_id()) {
+            return Err(format!(
+                "key {:?} has already signed this sign-off",
+                signer.key_id()
+            ));
+        }
+        if self.signatures.len() >= MAX_SIGNOFF_SIGNATURES {
+            return Err(format!("more than {MAX_SIGNOFF_SIGNATURES} signatures"));
+        }
+        let sig = signer
+            .sign(&signoff_signed_message(signoff_bytes))
+            .map_err(|e| e.to_string())?;
+        self.signatures.push(OperatorSignature {
+            algorithm: signer.algorithm().into(),
+            key_id: signer.key_id().into(),
+            signature_hex: to_hex(&sig),
+        });
+        Ok(())
+    }
+
+    /// Parse a signature file (strict: unknown or duplicate keys refused,
+    /// format and digest shape checked, at most
+    /// [`MAX_SIGNOFF_SIGNATURES`] entries). Signatures themselves are
+    /// checked by [`verify_signoff_signatures`].
+    pub fn parse(text: &str) -> Result<Self, String> {
+        crate::profile_file::reject_duplicate_keys(text).map_err(|e| e.to_string())?;
+        let s: Self = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        if s.format != SIGNOFF_SIGS_FORMAT {
+            return Err(format!(
+                "format {:?}, expected {SIGNOFF_SIGS_FORMAT:?}",
+                s.format
+            ));
+        }
+        if !s
+            .signoff_digest
+            .strip_prefix("sha256:")
+            .is_some_and(is_hex64)
+        {
+            return Err("signoff_digest is not sha256:<64 hex>".into());
+        }
+        if s.signatures.len() > MAX_SIGNOFF_SIGNATURES {
+            return Err(format!("more than {MAX_SIGNOFF_SIGNATURES} signatures"));
+        }
+        Ok(s)
+    }
+
+    /// The file text (pretty JSON, trailing newline).
+    pub fn to_text(&self) -> String {
+        to_json(self).unwrap_or_default()
+    }
+}
+
+fn is_hex64(v: &str) -> bool {
+    v.len() == 64 && v.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperatorKeyJson {
+    operator: String,
+    algorithm: String,
+    key_id: String,
+    public_hex: String,
+}
+
+fn one() -> usize {
+    1
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperatorsJson {
+    format: String,
+    /// Distinct operators who must sign a sign-off with motion items.
+    #[serde(default = "one")]
+    motion_quorum: usize,
+    operators: Vec<OperatorKeyJson>,
+}
+
+/// The operators trust list (`robodr-operators/v1`): which Ed25519 keys may
+/// sign a sign-off, the operator name each is bound to, and the two-person
+/// rule for motion items (`motion_quorum`, default 1). See the module docs.
+#[derive(Debug, Clone)]
+pub struct OperatorTrust {
+    keys: BTreeMap<String, (String, Ed25519VerifyingKey)>,
+    motion_quorum: usize,
+}
+
+impl OperatorTrust {
+    /// Build a trust list from `(operator, key)` pairs. Refuses an empty
+    /// list, more than [`MAX_OPERATOR_KEYS`] keys, an empty or padded
+    /// operator name, a key id or a public key listed twice, and a quorum
+    /// of 0 or above the number of distinct operators.
+    pub fn new(
+        entries: Vec<(String, Ed25519VerifyingKey)>,
+        motion_quorum: usize,
+    ) -> Result<Self, String> {
+        if entries.is_empty() {
+            return Err("no operators".into());
+        }
+        if entries.len() > MAX_OPERATOR_KEYS {
+            return Err(format!("more than {MAX_OPERATOR_KEYS} operator keys"));
+        }
+        let mut keys = BTreeMap::new();
+        let mut publics = BTreeSet::new();
+        for (op, vk) in entries {
+            if op.trim().is_empty() || op.trim() != op || op.chars().any(char::is_control) {
+                return Err(format!(
+                    "operator name {op:?} must be non-empty, without surrounding spaces or \
+                     control characters"
+                ));
+            }
+            let id = Verifier::key_id(&vk).to_string();
+            if !publics.insert(*vk.as_bytes()) {
+                return Err(format!(
+                    "key {id:?}: the same public key is listed twice (one person would count \
+                     as two operators)"
+                ));
+            }
+            if keys.insert(id.clone(), (op, vk)).is_some() {
+                return Err(format!("key id {id:?} listed twice"));
+            }
+        }
+        let t = Self {
+            keys,
+            motion_quorum,
+        };
+        let distinct = t.operators().len();
+        if motion_quorum == 0 || motion_quorum > distinct {
+            return Err(format!(
+                "motion_quorum {motion_quorum} must be between 1 and the number of distinct \
+                 operators ({distinct})"
+            ));
+        }
+        Ok(t)
+    }
+
+    /// Parse a trust list's text (strict JSON, see [`OperatorTrust::new`];
+    /// keys must be valid Ed25519 public keys).
+    pub fn parse(text: &str) -> Result<Self, String> {
+        crate::profile_file::reject_duplicate_keys(text).map_err(|e| e.to_string())?;
+        let j: OperatorsJson = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        if j.format != OPERATORS_FORMAT {
+            return Err(format!(
+                "format {:?}, expected {OPERATORS_FORMAT:?}",
+                j.format
+            ));
+        }
+        if j.operators.len() > MAX_OPERATOR_KEYS {
+            return Err(format!("more than {MAX_OPERATOR_KEYS} operator keys"));
+        }
+        let mut entries = Vec::with_capacity(j.operators.len());
+        for k in j.operators {
+            if k.algorithm != ED25519 {
+                return Err(format!(
+                    "key {:?}: algorithm {:?} is not supported (only {ED25519:?})",
+                    k.key_id, k.algorithm
+                ));
+            }
+            let public: [u8; PUBLIC_KEY_LEN] = from_hex(&k.public_hex)
+                .and_then(|b| b.try_into().ok())
+                .ok_or_else(|| {
+                    format!(
+                        "key {:?}: public_hex is not {PUBLIC_KEY_LEN} bytes of hex",
+                        k.key_id
+                    )
+                })?;
+            let vk = Ed25519VerifyingKey::from_bytes(k.key_id.clone(), &public)
+                .map_err(|e| format!("key {:?}: {e}", k.key_id))?;
+            entries.push((k.operator, vk));
+        }
+        Self::new(entries, j.motion_quorum)
+    }
+
+    /// Read a trust list: not a symlink, a regular file, not writable by
+    /// group or others, at most [`MAX_OPERATORS_BYTES`]; then
+    /// [`OperatorTrust::parse`].
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let text = read_protected(path, MAX_OPERATORS_BYTES)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        Self::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// The trust list's file text.
+    pub fn to_text(&self) -> String {
+        let j = OperatorsJson {
+            format: OPERATORS_FORMAT.into(),
+            motion_quorum: self.motion_quorum,
+            operators: self
+                .keys
+                .iter()
+                .map(|(id, (op, vk))| OperatorKeyJson {
+                    operator: op.clone(),
+                    algorithm: ED25519.into(),
+                    key_id: id.clone(),
+                    public_hex: to_hex(vk.as_bytes()),
+                })
+                .collect(),
+        };
+        to_json(&j).unwrap_or_default()
+    }
+
+    /// The operator a key id is bound to.
+    pub fn operator_of(&self, key_id: &str) -> Option<&str> {
+        self.keys.get(key_id).map(|(op, _)| op.as_str())
+    }
+
+    /// Distinct operator names.
+    pub fn operators(&self) -> BTreeSet<&str> {
+        self.keys.values().map(|(op, _)| op.as_str()).collect()
+    }
+
+    /// Distinct operators who must sign a sign-off with motion items.
+    pub fn motion_quorum(&self) -> usize {
+        self.motion_quorum
+    }
+}
+
+/// Result of [`verify_signoff_signatures`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SignatureVerdict {
+    /// Operator name -> key ids with a valid signature.
+    pub signers: BTreeMap<String, BTreeSet<String>>,
+    /// Every signature that is not valid, and why (any entry refuses a
+    /// lock: fail closed).
+    pub problems: Vec<String>,
+}
+
+/// Check every signature in `sigs` over `signoff_bytes` against `trust`.
+pub fn verify_signoff_signatures(
+    signoff_bytes: &[u8],
+    sigs: &SignoffSignatures,
+    trust: &OperatorTrust,
+) -> SignatureVerdict {
+    let mut v = SignatureVerdict::default();
+    let digest = signoff_file_digest(signoff_bytes);
+    if sigs.signoff_digest != digest {
+        v.problems.push(format!(
+            "the signatures are for sign-off {}, the file given is {digest}: it was changed \
+             after signing (signatures void; re-sign)",
+            sigs.signoff_digest
+        ));
+        return v;
+    }
+    let msg = signoff_signed_message(signoff_bytes);
+    let mut seen = BTreeSet::new();
+    for s in &sigs.signatures {
+        let id: String = s.key_id.chars().take(128).collect();
+        if !seen.insert(s.key_id.as_str()) {
+            v.problems.push(format!("key {id:?} signed twice"));
+            continue;
+        }
+        let Some((op, key)) = trust.keys.get(&s.key_id) else {
+            v.problems
+                .push(format!("key {id:?} is not in the operators trust list"));
+            continue;
+        };
+        let sig = from_hex(&s.signature_hex).filter(|b| b.len() == SIGNATURE_LEN);
+        match sig {
+            Some(sig) if s.algorithm == ED25519 && key.verify(&msg, &sig) => {
+                v.signers
+                    .entry(op.clone())
+                    .or_default()
+                    .insert(s.key_id.clone());
+            }
+            _ => v.problems.push(format!(
+                "signature by key {id:?} ({op}) does not verify over this sign-off"
+            )),
+        }
+    }
+    v
+}
+
+/// Items that review who may command motion ([`MOTION_REVIEW_KINDS`]):
+/// the ones the two-person rule applies to.
+pub fn motion_items(s: &Signoff) -> impl Iterator<Item = &SignoffItem> {
+    s.items
+        .iter()
+        .filter(|i| MOTION_REVIEW_KINDS.contains(&i.kind.as_str()))
+}
+
+/// Read a file others must not be able to modify: no symlink at `path`, a
+/// regular file, `mode & 0o022 == 0` (Unix), at most `max` bytes.
+pub(crate) fn read_protected(path: &Path, max: u64) -> io::Result<String> {
+    let lmeta = std::fs::symlink_metadata(path)?;
+    if lmeta.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "is a symbolic link (refused)",
+        ));
+    }
+    let f = std::fs::File::open(path)?;
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.ino() != lmeta.ino() || meta.dev() != lmeta.dev() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file changed while opening",
+            ));
+        }
+        let mode = meta.mode() & 0o7777;
+        if mode & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("mode {mode:04o} lets group/others modify it; chmod go-w"),
+            ));
+        }
+    }
+    let mut s = String::new();
+    f.take(max + 1).read_to_string(&mut s)?;
+    if s.len() as u64 > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("larger than {max} bytes"),
+        ));
+    }
+    Ok(s)
 }
 
 #[cfg(test)]
@@ -437,8 +962,36 @@ mod tests {
     #[test]
     fn floor_requires_a_review_per_motion_channel() {
         let req = required_items(&prof());
-        assert_eq!(req.len(), 1);
-        assert_eq!(req[0].0, "/cmd_vel");
+        // The channel, and its unbounded joint dimension.
+        assert_eq!(req.len(), 2);
+        assert_eq!(req[0].subject, "/cmd_vel");
+        assert_eq!(req[1].subject, "/cmd_vel joint");
+        let mut unb = SignoffItem::new(UNBOUNDED_DIMENSION_KIND, "/cmd_vel joint", "r");
+        assert!(!satisfies(&unb, &req[1]));
+        unb.confirmed = true;
+        assert!(satisfies(&unb, &req[1]));
+        assert!(!satisfies(&unb, &req[0]), "wrong kind");
+        // Exact subject for dimensions: no prefix matching.
+        let mut longer = SignoffItem::new(UNBOUNDED_DIMENSION_KIND, "/cmd_vel joint x", "r");
+        longer.confirmed = true;
+        assert!(!satisfies(&longer, &req[1]));
+        // Both dimensions bounded: no dimension requirement; neither
+        // bounded: none either (lock refuses the channel outright).
+        let mut p = prof();
+        p.motion_envelopes
+            .get_mut("/cmd_vel")
+            .unwrap()
+            .max_joint_speed = Some(1.0);
+        assert_eq!(required_items(&p).len(), 1);
+        p.motion_envelopes
+            .get_mut("/cmd_vel")
+            .unwrap()
+            .max_joint_speed = None;
+        p.motion_envelopes
+            .get_mut("/cmd_vel")
+            .unwrap()
+            .max_linear_speed = None;
+        assert_eq!(required_items(&p).len(), 1);
         let mut it = SignoffItem::new("motion_writer", "/cmd_vel aaaa", "r");
         assert!(!covers(&it, "/cmd_vel"), "unconfirmed does not cover");
         it.confirmed = true;
@@ -451,5 +1004,228 @@ mod tests {
         let mut exact = SignoffItem::new("motion_channel_unreviewed", "/cmd_vel", "r");
         exact.confirmed = true;
         assert!(covers(&exact, "/cmd_vel"));
+    }
+
+    // ---------------------------------------------- operator signatures --
+
+    fn key(id: &str, seed: u8) -> robodr_blackbox::Ed25519SigningKey {
+        robodr_blackbox::Ed25519SigningKey::from_seed(id, &[seed; 32]).unwrap()
+    }
+
+    fn trust(entries: &[(&str, &robodr_blackbox::Ed25519SigningKey)], q: usize) -> OperatorTrust {
+        OperatorTrust::new(
+            entries
+                .iter()
+                .map(|(n, k)| (n.to_string(), k.verifying_key()))
+                .collect(),
+            q,
+        )
+        .unwrap()
+    }
+
+    fn confirmed_text() -> String {
+        to_json(&Signoff::for_profile(&prof()).confirm_all("alice")).unwrap()
+    }
+
+    #[test]
+    fn signatures_verify_and_bind_the_exact_bytes() {
+        let (ka, kb, kx) = (key("ka", 1), key("kb", 2), key("kx", 3));
+        let t = trust(&[("alice", &ka), ("bob", &kb)], 2);
+        let text = confirmed_text();
+        let mut sigs = SignoffSignatures::new(text.as_bytes());
+        sigs.add(text.as_bytes(), &ka).unwrap();
+        sigs.add(text.as_bytes(), &kb).unwrap();
+        assert!(sigs
+            .add(text.as_bytes(), &ka)
+            .unwrap_err()
+            .contains("already signed"));
+        let back = SignoffSignatures::parse(&sigs.to_text()).unwrap();
+        assert_eq!(back, sigs);
+        let v = verify_signoff_signatures(text.as_bytes(), &back, &t);
+        assert!(v.problems.is_empty(), "{:?}", v.problems);
+        assert_eq!(
+            v.signers.keys().cloned().collect::<Vec<_>>(),
+            ["alice", "bob"]
+        );
+
+        // One changed byte (a space) voids every signature.
+        let edited = text.replacen("  ", "   ", 1);
+        let v = verify_signoff_signatures(edited.as_bytes(), &back, &t);
+        assert!(v.signers.is_empty());
+        assert!(v.problems[0].contains("changed after signing"));
+        assert!(sigs
+            .clone()
+            .add(edited.as_bytes(), &kx)
+            .unwrap_err()
+            .contains("void"));
+
+        // Digest swapped to the edited bytes: the signatures fail.
+        let mut forged = back.clone();
+        forged.signoff_digest = signoff_file_digest(edited.as_bytes());
+        let v = verify_signoff_signatures(edited.as_bytes(), &forged, &t);
+        assert!(v.signers.is_empty());
+        assert_eq!(v.problems.len(), 2, "{:?}", v.problems);
+
+        // Unknown key, garbage signature, wrong algorithm, duplicate entry.
+        let mut other = SignoffSignatures::new(text.as_bytes());
+        other.add(text.as_bytes(), &kx).unwrap();
+        other.signatures.push(OperatorSignature {
+            algorithm: ED25519.into(),
+            key_id: "ka".into(),
+            signature_hex: "00".repeat(SIGNATURE_LEN),
+        });
+        other.signatures.push(OperatorSignature {
+            algorithm: "hmac-sha256".into(),
+            key_id: "kb".into(),
+            signature_hex: "zz".into(),
+        });
+        other.signatures.push(other.signatures[1].clone());
+        let v = verify_signoff_signatures(text.as_bytes(), &other, &t);
+        assert!(v.signers.is_empty());
+        assert_eq!(v.problems.len(), 4, "{:?}", v.problems);
+        assert!(v.problems[0].contains("not in the operators trust list"));
+        assert!(v.problems[3].contains("signed twice"));
+
+        // HMAC signers are refused.
+        let hk = robodr_blackbox::HmacSha256Key::new("h", &[9; 32]).unwrap();
+        assert!(SignoffSignatures::new(text.as_bytes())
+            .add(text.as_bytes(), &hk)
+            .unwrap_err()
+            .contains("cannot sign"));
+        assert_eq!(
+            signoff_sig_path(Path::new("/x/so.json")),
+            PathBuf::from("/x/so.json.sig")
+        );
+    }
+
+    #[test]
+    fn signature_file_parse_is_strict() {
+        let text = confirmed_text();
+        let mut sigs = SignoffSignatures::new(text.as_bytes());
+        sigs.add(text.as_bytes(), &key("ka", 1)).unwrap();
+        let good = sigs.to_text();
+        assert!(SignoffSignatures::parse(&good).is_ok());
+        for bad in [
+            good.replace(SIGNOFF_SIGS_FORMAT, "robodr-signoff-sigs/v0"),
+            good.replace("\"signatures\"", "\"signatures\": [], \"signatures\""),
+            good.replace("\"format\"", "\"extra\": 1, \"format\""),
+            good.replace("sha256:", "md5:"),
+            "{}".into(),
+            "[".into(),
+        ] {
+            assert!(SignoffSignatures::parse(&bad).is_err(), "{bad}");
+        }
+        let mut many = sigs.clone();
+        many.signatures = vec![sigs.signatures[0].clone(); MAX_SIGNOFF_SIGNATURES + 1];
+        assert!(SignoffSignatures::parse(&many.to_text()).is_err());
+        let mut full = SignoffSignatures::new(text.as_bytes());
+        full.signatures = vec![sigs.signatures[0].clone(); MAX_SIGNOFF_SIGNATURES];
+        assert!(full
+            .add(text.as_bytes(), &key("new", 4))
+            .unwrap_err()
+            .contains("more than"));
+    }
+
+    #[test]
+    fn operator_trust_list_rules() {
+        let (ka, ka2, kb) = (key("ka", 1), key("ka2", 5), key("kb", 2));
+        let t = trust(&[("alice", &ka), ("alice", &ka2), ("bob", &kb)], 2);
+        assert_eq!(t.operators().len(), 2, "two keys, one person");
+        assert_eq!(t.operator_of("ka2"), Some("alice"));
+        assert_eq!(t.operator_of("nope"), None);
+        let back = OperatorTrust::parse(&t.to_text()).unwrap();
+        assert_eq!(back.to_text(), t.to_text());
+        assert_eq!(back.motion_quorum(), 2);
+        // motion_quorum defaults to 1.
+        let one = t.to_text().replace("  \"motion_quorum\": 2,\n", "");
+        assert_eq!(OperatorTrust::parse(&one).unwrap().motion_quorum(), 1);
+
+        let vk = |k: &robodr_blackbox::Ed25519SigningKey| k.verifying_key();
+        let same_pub =
+            robodr_blackbox::Ed25519VerifyingKey::from_bytes("other", vk(&ka).as_bytes()).unwrap();
+        for (entries, q, want) in [
+            (vec![], 1, "no operators"),
+            (vec![("a".to_string(), vk(&ka))], 0, "between 1"),
+            (
+                vec![("a".into(), vk(&ka)), ("a".into(), vk(&kb))],
+                2,
+                "between 1",
+            ),
+            (
+                vec![("a".into(), vk(&ka)), ("b".into(), same_pub)],
+                1,
+                "listed twice",
+            ),
+            (
+                vec![
+                    ("a".into(), vk(&ka)),
+                    ("b".into(), key("ka", 9).verifying_key()),
+                ],
+                1,
+                "listed twice",
+            ),
+            (vec![(" a".into(), vk(&ka))], 1, "operator name"),
+            (vec![("".into(), vk(&ka))], 1, "operator name"),
+            (vec![("a\u{7}".into(), vk(&ka))], 1, "operator name"),
+        ] {
+            let e = OperatorTrust::new(entries, q).unwrap_err();
+            assert!(e.contains(want), "{e}");
+        }
+        let good = t.to_text();
+        for bad in [
+            good.replace(OPERATORS_FORMAT, "robodr-operators/v0"),
+            good.replace("\"ed25519\"", "\"hmac-sha256\""),
+            good.replace("\"format\"", "\"x\": 1, \"format\""),
+            good.replace("\"format\"", "\"format\": \"a\", \"format\""),
+            good.replacen(&to_hex(vk(&ka).as_bytes()), "00", 1),
+            // Not a valid curve point (small order / non-canonical).
+            good.replacen(&to_hex(vk(&ka).as_bytes()), &"ff".repeat(32), 1),
+        ] {
+            assert!(OperatorTrust::parse(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operator_trust_file_must_be_protected() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("robodr-ops-trust-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let t = trust(&[("alice", &key("ka", 1))], 1);
+        let f = d.join("operators.json");
+        std::fs::write(&f, t.to_text()).unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(OperatorTrust::load(&f).is_ok());
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(OperatorTrust::load(&f)
+            .unwrap_err()
+            .contains("group/others"));
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = d.join("link.json");
+        std::os::unix::fs::symlink(&f, &link).unwrap();
+        assert!(OperatorTrust::load(&link)
+            .unwrap_err()
+            .contains("symbolic link"));
+        assert!(OperatorTrust::load(&d).is_err(), "a directory");
+        assert!(OperatorTrust::load(&d.join("missing")).is_err());
+        let big = d.join("big.json");
+        std::fs::write(&big, vec![b' '; MAX_OPERATORS_BYTES as usize + 1]).unwrap();
+        assert!(OperatorTrust::load(&big).unwrap_err().contains("larger"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn motion_items_are_the_motion_review_kinds() {
+        let s = Signoff::new(
+            &prof(),
+            [
+                SignoffItem::new("motion_writer", "/cmd_vel aaaa", "r"),
+                SignoffItem::new("participant_late", "aaaa", "r"),
+                SignoffItem::new("motion_channel_unreviewed", "/cmd_vel", "r"),
+            ],
+        );
+        assert_eq!(motion_items(&s).count(), 2);
+        assert_eq!(motion_items(&Signoff::new(&prof(), [])).count(), 0);
     }
 }

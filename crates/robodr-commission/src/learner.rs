@@ -104,10 +104,35 @@
 //!    operator-accepted participant has all its IPs commissioned. Event
 //!    recordings (JSONL) carry no sender, so this check does not apply to
 //!    them (the sensor that produced them is trusted for attribution).
-//!    Limit: a discovery-server relay re-sends other participants'
-//!    announcements under its own prefix; those relayed copies are not
-//!    learned for their owners (each owner's own announcements are), and
-//!    show up as mismatch items for the operator to explain.
+//!
+//!    **Discovery servers** ([`LearnConfig::discovery_servers`], CLI
+//!    `--discovery-server` / `--trusted-discovery-server`, mirroring the
+//!    sensor pipeline's `discovery_servers` binding option). A discovery
+//!    server re-sends other participants' announcements under its own
+//!    prefix. A relayed announcement (sender prefix != claimed owner) whose
+//!    sender matches a configured server ([`DiscoveryServer`]: GUID prefix
+//!    and/or source IP) is attributed to its owner, never to the server,
+//!    and never binds the server's IP to the owner:
+//!    * from a **known** server, a relayed endpoint is accepted only as a
+//!      copy: no item if the owner is accepted and announced the same
+//!      endpoint *directly* (from a commissioned IP); otherwise it is not
+//!      learned and is an `endpoint_sender_mismatch` item naming the
+//!      server. Relayed participant announcements are ignored (they neither
+//!      count for nor against the gate).
+//!    * from a **trusted** server, a relayed endpoint is learned for its
+//!      owner if the owner is accepted, even if the owner never announced
+//!      it directly (the server vouches); relayed participant announcements
+//!      count for the owner's gate under the pseudo-address
+//!      `relay:<server>` (shown in the report's source IPs, not counted as
+//!      a second IP). An endpoint relayed for an owner that is not accepted
+//!      is still an `endpoint_sender_mismatch` item.
+//!    * a relay from a sender that matches no configured server is
+//!      `endpoint_sender_mismatch`, as before.
+//!
+//!    Trusting a server means trusting whatever it relays (as the sensor
+//!    does); prefer the known-server mode with a capture point that also
+//!    sees the participants' own announcements (on the server host or a
+//!    mirror port).
 //! 5. **Bounded memory**: every map and set has a cap (see [`Limits`]);
 //!    entries past a cap are dropped (fail-closed: they later deviate),
 //!    counted, and turned into a `capacity_exceeded` sign-off item. Motion
@@ -290,6 +315,88 @@ fn is_client_side(kind: &RosNameKind, is_writer: bool) -> Option<bool> {
     }
 }
 
+/// Prefix of the pseudo-address under which announcements relayed by a
+/// *trusted* discovery server are recorded (see [`DiscoveryServer`]).
+pub const RELAY_MARK: &str = "relay:";
+/// Max configured discovery servers (as the sensor pipeline).
+pub const MAX_DISCOVERY_SERVERS: usize = 32;
+
+/// A configured discovery server (or other relay): announcements it sends
+/// on behalf of other participants are attributed to their owners. See the
+/// module docs, "Endpoint provenance".
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DiscoveryServer {
+    /// The server's GUID prefix (the RTPS sender prefix of what it relays).
+    pub prefix: Option<String>,
+    /// The server's source IP.
+    pub ip: Option<std::net::IpAddr>,
+    /// Trusted: relayed endpoints are learned for accepted owners without a
+    /// direct announcement, and relayed participant announcements count
+    /// for the gate.
+    pub trusted: bool,
+}
+
+fn canonical_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    ip.to_canonical()
+}
+
+impl DiscoveryServer {
+    /// Parse `PREFIX`, `PREFIX@IP`, `@IP` or a bare `IP`.
+    pub fn parse(spec: &str, trusted: bool) -> Result<Self, ConfigError> {
+        let bad = || ConfigError::InvalidDiscoveryServer(spec.chars().take(128).collect());
+        let (prefix, ip) = match spec.split_once('@') {
+            Some((p, i)) => (Some(p).filter(|p| !p.is_empty()), Some(i)),
+            None if is_guid_prefix(spec) => (Some(spec), None),
+            None => (None, Some(spec)),
+        };
+        let ip = ip
+            .map(|i| i.parse::<std::net::IpAddr>().map_err(|_| bad()))
+            .transpose()?
+            .map(canonical_ip);
+        let s = Self {
+            prefix: prefix.map(str::to_string),
+            ip,
+            trusted,
+        };
+        s.validate().map_err(|_| bad())?;
+        Ok(s)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = || ConfigError::InvalidDiscoveryServer(self.label());
+        if self.prefix.is_none() && self.ip.is_none() {
+            return Err(bad());
+        }
+        if self.prefix.as_deref().is_some_and(|p| !is_guid_prefix(p)) {
+            return Err(bad());
+        }
+        if self.ip.is_some_and(|i| i.is_unspecified()) {
+            return Err(bad());
+        }
+        Ok(())
+    }
+
+    /// Did this server send a message with origin `o`? Every configured
+    /// part (prefix, IP) must match.
+    pub fn matches(&self, o: &Origin) -> bool {
+        self.prefix.as_deref().is_none_or(|p| p == o.sender_prefix)
+            && self.ip.is_none_or(|ip| {
+                o.src_ip
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|x| canonical_ip(x) == ip)
+            })
+    }
+
+    /// `prefix@ip`, `prefix` or `@ip`.
+    pub fn label(&self) -> String {
+        format!(
+            "{}{}",
+            self.prefix.as_deref().unwrap_or(""),
+            self.ip.map(|i| format!("@{i}")).unwrap_or_default()
+        )
+    }
+}
+
 fn is_guid_prefix(g: &str) -> bool {
     g.len() == 24 && g.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
@@ -363,6 +470,10 @@ pub struct LearnConfig {
     pub accept_participants: BTreeSet<String>,
     /// Extra topics whose writers need sign-off (de-mangled ROS names).
     pub motion_topics: BTreeSet<String>,
+    /// Discovery servers whose relayed announcements are attributed to
+    /// their owners (see the module docs). At most
+    /// [`MAX_DISCOVERY_SERVERS`].
+    pub discovery_servers: Vec<DiscoveryServer>,
     pub limits: Limits,
 }
 
@@ -387,6 +498,7 @@ impl Default for LearnConfig {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            discovery_servers: Vec::new(),
             limits: Limits::default(),
         }
     }
@@ -397,14 +509,28 @@ impl Default for LearnConfig {
 pub enum ConfigError {
     EmptyModel,
     InvalidMargin(f64),
-    InvalidCeiling { dimension: &'static str, value: f64 },
-    InvalidHardCap { dimension: &'static str, value: f64 },
-    InvalidFraction { name: &'static str, value: f64 },
+    InvalidCeiling {
+        dimension: &'static str,
+        value: f64,
+    },
+    InvalidHardCap {
+        dimension: &'static str,
+        value: f64,
+    },
+    InvalidFraction {
+        name: &'static str,
+        value: f64,
+    },
     InvalidOutlierRatio(f64),
     InvalidMinAnnouncements,
-    InvalidLimit { name: &'static str },
+    InvalidLimit {
+        name: &'static str,
+    },
     InvalidAcceptedParticipant(String),
     InvalidMotionTopic(String),
+    /// A discovery server spec that names neither a valid GUID prefix nor a
+    /// valid IP, or too many servers.
+    InvalidDiscoveryServer(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -441,6 +567,11 @@ impl fmt::Display for ConfigError {
             ConfigError::InvalidMotionTopic(t) => write!(
                 f,
                 "motion topic {t:?} is not a fully qualified ROS name (e.g. /cmd_vel)"
+            ),
+            ConfigError::InvalidDiscoveryServer(d) => write!(
+                f,
+                "discovery server {d:?} invalid: give PREFIX (24 lower-case hex chars), \
+                 PREFIX@IP or IP, at most {MAX_DISCOVERY_SERVERS} servers"
             ),
         }
     }
@@ -510,7 +641,28 @@ impl LearnConfig {
         {
             return Err(ConfigError::InvalidMotionTopic(t.clone()));
         }
+        if self.discovery_servers.len() > MAX_DISCOVERY_SERVERS {
+            return Err(ConfigError::InvalidDiscoveryServer(format!(
+                "{} servers",
+                self.discovery_servers.len()
+            )));
+        }
+        for d in &self.discovery_servers {
+            d.validate()?;
+        }
         Ok(())
+    }
+
+    /// The configured discovery server that sent `o`, if any (a trusted
+    /// match wins over a known one).
+    pub fn discovery_server_for(&self, o: &Origin) -> Option<&DiscoveryServer> {
+        let mut found: Option<&DiscoveryServer> = None;
+        for d in self.discovery_servers.iter().filter(|d| d.matches(o)) {
+            if found.is_none_or(|f| !f.trusted && d.trusted) {
+                found = Some(d);
+            }
+        }
+        found
     }
 
     /// The cap actually applied to one dimension: the OEM ceiling if it is
@@ -746,6 +898,19 @@ struct MismatchAcc {
     names: BTreeSet<String>,
 }
 
+/// Announcements relayed for `owner` by a configured discovery server.
+#[derive(Debug, Clone, PartialEq)]
+struct RelayAcc {
+    owner: String,
+    sender: String,
+    src_ip: String,
+    server: String,
+    trusted: bool,
+    span: Span,
+    /// `(slot, is_writer)` of every relayed endpoint (capped).
+    endpoints: BTreeSet<(ProfileSlot, bool)>,
+}
+
 /// Services, actions and raw topics: who is on which side.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct RoleAcc {
@@ -872,6 +1037,12 @@ pub struct Learner {
     /// Endpoint announcements not learned because their claimed owner is
     /// not the participant that sent them, keyed by sign-off subject.
     sender_mismatch: BTreeMap<String, MismatchAcc>,
+    /// Endpoint announcements relayed by a configured discovery server,
+    /// keyed by sign-off subject.
+    relayed: BTreeMap<String, RelayAcc>,
+    /// Participant announcements relayed by a known (untrusted) discovery
+    /// server: ignored by the gate, counted per server.
+    relayed_spdp_ignored: BTreeMap<String, u64>,
 }
 
 /// The three artefacts of commissioning.
@@ -921,9 +1092,10 @@ impl Gate<'_> {
     /// information (`""`: the sensor's own event recording).
     fn vouches(&self, origins: &Origins, g: &str) -> bool {
         self.accepted.contains(g)
-            && origins
-                .get(g)
-                .is_some_and(|ips| ips.iter().any(|ip| ip.is_empty() || self.ip_ok(g, ip)))
+            && origins.get(g).is_some_and(|ips| {
+                ips.iter()
+                    .any(|ip| ip.is_empty() || ip.starts_with(RELAY_MARK) || self.ip_ok(g, ip))
+            })
     }
 }
 
@@ -1023,6 +1195,8 @@ impl Learner {
             anomalies_total: 0,
             anomalies: Vec::new(),
             sender_mismatch: BTreeMap::new(),
+            relayed: BTreeMap::new(),
+            relayed_spdp_ignored: BTreeMap::new(),
         })
     }
 
@@ -1099,6 +1273,31 @@ impl Learner {
                 if !self.check_guid(&p.guid_prefix, at) {
                     return;
                 }
+                if p.src_ip.starts_with(RELAY_MARK) {
+                    let g: String = p.guid_prefix.chars().take(64).collect();
+                    self.anomaly(
+                        at,
+                        "invalid_src_ip",
+                        &g,
+                        format!("source address may not start with {RELAY_MARK:?}; not learned"),
+                    );
+                    return;
+                }
+                let mut src_ip = p.src_ip.clone();
+                if let Some(o) = origin.filter(|o| o.sender_prefix != p.guid_prefix) {
+                    if let Some(ds) = self.config.discovery_server_for(o) {
+                        if ds.trusted {
+                            // Counts for the owner, under the server's
+                            // pseudo-address (never the server's IP).
+                            src_ip = format!("{RELAY_MARK}{}", ds.label());
+                        } else {
+                            let label = ds.label();
+                            let n = self.relayed_spdp_ignored.entry(label).or_insert(0);
+                            *n = n.saturating_add(1);
+                            return;
+                        }
+                    }
+                }
                 let Some(acc) = admit(&mut self.participants, &p.guid_prefix, lim.max_participants)
                 else {
                     self.overflowed(at, "participants", &p.guid_prefix);
@@ -1106,8 +1305,8 @@ impl Learner {
                 };
                 touch(&mut acc.span, at);
                 acc.runs.entry(run).or_default().update(position, ts);
-                if insert_capped(&mut acc.src_ips, &p.src_ip, lim.max_set_entries) {
-                    let ip = acc.ip_presence.entry(p.src_ip.clone()).or_default();
+                if insert_capped(&mut acc.src_ips, &src_ip, lim.max_set_entries) {
+                    let ip = acc.ip_presence.entry(src_ip).or_default();
                     ip.count = ip.count.saturating_add(1);
                     ip.runs.entry(run).or_default().update(position, ts);
                 } else {
@@ -1140,17 +1339,37 @@ impl Learner {
                 if !self.check_guid(&e.guid_prefix, at) {
                     return;
                 }
+                let mut relay_via: Option<String> = None;
                 if let Some(o) = origin {
                     if o.sender_prefix != e.guid_prefix {
-                        // Claims a GUID other than its sender's: quarantined
-                        // (never learned), reported, and a sign-off item.
-                        self.sender_mismatched(at, &e.guid_prefix, o, slot.name());
-                        return;
+                        match self.config.discovery_server_for(o).cloned() {
+                            Some(ds) => {
+                                // Relayed by a configured server: judged at
+                                // finish (see `relay_verdicts`); a trusted
+                                // server's copy is also recorded for the
+                                // owner under the relay pseudo-address.
+                                self.relayed_endpoint(at, &e.guid_prefix, o, &ds, &slot, is_writer);
+                                if !ds.trusted {
+                                    return;
+                                }
+                                relay_via = Some(format!("{RELAY_MARK}{}", ds.label()));
+                            }
+                            None => {
+                                // Claims a GUID other than its sender's:
+                                // quarantined (never learned), reported, and
+                                // a sign-off item.
+                                self.sender_mismatched(at, &e.guid_prefix, o, slot.name());
+                                return;
+                            }
+                        }
                     }
                 }
                 self.reference(&e.guid_prefix, at);
                 let guid = e.guid_prefix.as_str();
-                let via = origin.map_or("", |o| o.src_ip.as_str());
+                let via = match &relay_via {
+                    Some(v) => v.as_str(),
+                    None => origin.map_or("", |o| o.src_ip.as_str()),
+                };
                 let client = is_client_side(&rn.kind, is_writer);
                 let mut dropped: Vec<&'static str> = Vec::new();
                 match &slot {
@@ -1473,6 +1692,32 @@ impl Learner {
                 dropped.push(("endpoint_sender_mismatch", k.clone(), 1));
             }
         }
+        for (k, m) in &other.relayed {
+            let span = m.span.shifted(off);
+            if let Some(mine) = self.relayed.get_mut(k) {
+                mine.span.absorb(&span);
+                for ep in &m.endpoints {
+                    if mine.endpoints.contains(ep) {
+                        continue;
+                    }
+                    if mine.endpoints.len() >= cap {
+                        dropped.push(("relayed_endpoints", k.clone(), 1));
+                    } else {
+                        mine.endpoints.insert(ep.clone());
+                    }
+                }
+            } else if self.relayed.len() < lim.max_participants {
+                let mut m = m.clone();
+                m.span = span;
+                self.relayed.insert(k.clone(), m);
+            } else {
+                dropped.push(("relayed_endpoint_sources", k.clone(), 1));
+            }
+        }
+        for (k, v) in &other.relayed_spdp_ignored {
+            let n = self.relayed_spdp_ignored.entry(k.clone()).or_insert(0);
+            *n = n.saturating_add(*v);
+        }
         for (k, v) in &other.overflow {
             let n = self.overflow.entry(k.clone()).or_insert(0);
             *n = n.saturating_add(*v);
@@ -1532,6 +1777,47 @@ impl Learner {
             );
         } else {
             self.overflowed(at, "endpoint_sender_mismatch", &key);
+        }
+    }
+
+    /// An endpoint announcement relayed for `owner` by configured server
+    /// `ds`.
+    fn relayed_endpoint(
+        &mut self,
+        at: SeenAt,
+        owner: &str,
+        o: &Origin,
+        ds: &DiscoveryServer,
+        slot: &ProfileSlot,
+        is_writer: bool,
+    ) {
+        let key = mismatch_subject(owner, &o.sender_prefix, &o.src_ip);
+        let cap = self.config.limits.max_set_entries;
+        let ep = (slot.clone(), is_writer);
+        if let Some(m) = self.relayed.get_mut(&key) {
+            m.span.hit(at);
+            if !m.endpoints.contains(&ep) {
+                if m.endpoints.len() >= cap {
+                    self.overflowed(at, "relayed_endpoints", &key);
+                } else {
+                    m.endpoints.insert(ep);
+                }
+            }
+        } else if self.relayed.len() < self.config.limits.max_participants {
+            self.relayed.insert(
+                key,
+                RelayAcc {
+                    owner: owner.to_string(),
+                    sender: o.sender_prefix.clone(),
+                    src_ip: o.src_ip.clone(),
+                    server: ds.label(),
+                    trusted: ds.trusted,
+                    span: Span::new(at),
+                    endpoints: [ep].into_iter().collect(),
+                },
+            );
+        } else {
+            self.overflowed(at, "relayed_endpoint_sources", &key);
         }
     }
 
@@ -1657,13 +1943,18 @@ impl Learner {
                     ),
                 ));
             }
-            if acc.src_ips.len() > 1 {
+            let real_ips: BTreeSet<&String> = acc
+                .src_ips
+                .iter()
+                .filter(|ip| !ip.starts_with(RELAY_MARK))
+                .collect();
+            if real_ips.len() > 1 {
                 flags.push((
                     "participant_multiple_ips",
                     format!(
                         "announced from {} source IPs {:?}: GUID spoofing or a multi-homed host",
-                        acc.src_ips.len(),
-                        acc.src_ips
+                        real_ips.len(),
+                        real_ips
                     ),
                 ));
             }
@@ -1811,7 +2102,7 @@ impl Learner {
                     continue;
                 }
                 for ip in ips {
-                    if !ip.is_empty() && !gate.ip_ok(g, ip) {
+                    if !ip.is_empty() && !ip.starts_with(RELAY_MARK) && !gate.ip_ok(g, ip) {
                         out.entry((g.clone(), ip.clone()))
                             .or_default()
                             .insert(name.to_string());
@@ -1829,6 +2120,87 @@ impl Learner {
                 scan(&a.writer_origins, n);
                 scan(&a.reader_origins, n);
             }
+        }
+        out
+    }
+
+    /// Was `(slot, is_writer)` announced for `owner` with provenance the
+    /// gate accepts (directly from a commissioned IP, from sender-less
+    /// input, or relayed by a trusted discovery server)?
+    fn endpoint_vouched(
+        &self,
+        gate: &Gate<'_>,
+        slot: &ProfileSlot,
+        is_writer: bool,
+        owner: &str,
+    ) -> bool {
+        match slot {
+            ProfileSlot::Topic(t) => {
+                let m = if is_writer {
+                    &self.writers
+                } else {
+                    &self.readers
+                };
+                m.get(t).is_some_and(|a| gate.vouches(&a.origins, owner))
+            }
+            _ => {
+                let m = match slot {
+                    ProfileSlot::Service(_) => &self.services,
+                    ProfileSlot::Action(_) => &self.actions,
+                    _ => &self.raw,
+                };
+                m.get(slot.name()).is_some_and(|a| {
+                    gate.vouches(
+                        if is_writer {
+                            &a.writer_origins
+                        } else {
+                            &a.reader_origins
+                        },
+                        owner,
+                    )
+                })
+            }
+        }
+    }
+
+    /// Every relayed set: `(subject, acc, attributed?, why not)`. Attributed
+    /// = the owner is accepted and every relayed endpoint is vouched for
+    /// (see [`Self::endpoint_vouched`]): a copy of a direct announcement,
+    /// or (trusted server) relayed for an accepted owner.
+    fn relay_verdicts<'s>(&'s self, gate: &Gate<'_>) -> Vec<(String, &'s RelayAcc, bool, String)> {
+        let mut out = Vec::new();
+        for (subject, r) in &self.relayed {
+            let (ok, why) = if !gate.accepted.contains(r.owner.as_str()) {
+                (
+                    false,
+                    format!(
+                        "the owner {} is not an accepted participant (quarantined or never \
+                         announced itself)",
+                        r.owner
+                    ),
+                )
+            } else {
+                let missing: Vec<String> = r
+                    .endpoints
+                    .iter()
+                    .filter(|(slot, w)| !self.endpoint_vouched(gate, slot, *w, &r.owner))
+                    .map(|(slot, w)| format!("{} {}", if *w { "W" } else { "R" }, slot.name()))
+                    .collect();
+                if missing.is_empty() {
+                    (true, String::new())
+                } else {
+                    let (n, ex) = examples(&missing);
+                    (
+                        false,
+                        format!(
+                            "the owner never announced {n} of them directly from a commissioned \
+                             IP ({ex}); a known (untrusted) server's relay only confirms direct \
+                             announcements"
+                        ),
+                    )
+                }
+            };
+            out.push((subject.clone(), r, ok, why));
         }
         out
     }
@@ -2200,6 +2572,32 @@ impl Learner {
                 ),
             ));
         }
+        for (subject, r, ok, why) in self.relay_verdicts(gate) {
+            if ok {
+                continue;
+            }
+            let names: BTreeSet<String> = r
+                .endpoints
+                .iter()
+                .map(|(slot, w)| format!("{} {}", if *w { "W" } else { "R" }, slot.name()))
+                .collect();
+            let (n, ex) = examples(&names);
+            out.push((
+                subject,
+                format!(
+                    "{} endpoint announcement(s) ({n} endpoint(s): {ex}) relayed for participant \
+                     {} by the configured {} discovery server {} (sender {} from {}, first at \
+                     {}): {why}; NOT learned from the relay. Investigate before locking",
+                    r.span.count,
+                    r.owner,
+                    if r.trusted { "trusted" } else { "known" },
+                    r.server,
+                    r.sender,
+                    r.src_ip,
+                    r.span.first
+                ),
+            ));
+        }
         for ((g, ip), names) in self.ip_mismatches(gate) {
             let (n, ex) = examples(&names);
             out.push((
@@ -2384,6 +2782,41 @@ impl Learner {
         }
         for (subject, reason) in self.mismatch_items(&gate) {
             warn(Warn, "endpoint_sender_mismatch", &subject, reason);
+        }
+        for (subject, r, ok, _) in self.relay_verdicts(&gate) {
+            if ok {
+                warn(
+                    Info,
+                    "discovery_relay_attributed",
+                    &subject,
+                    format!(
+                        "{} announcement(s) of {} endpoint(s) relayed for {} by the {} discovery \
+                         server {} were attributed to their owner ({})",
+                        r.span.count,
+                        r.endpoints.len(),
+                        r.owner,
+                        if r.trusted { "trusted" } else { "known" },
+                        r.server,
+                        if r.trusted {
+                            "trusted relay of an accepted participant"
+                        } else {
+                            "copies of the owner's direct announcements"
+                        }
+                    ),
+                );
+            }
+        }
+        for (server, n) in &self.relayed_spdp_ignored {
+            warn(
+                Info,
+                "discovery_relay_participants_ignored",
+                server,
+                format!(
+                    "{n} participant announcement(s) relayed by the known discovery server \
+                     {server} were ignored by the anti-poisoning gate (only participants' own \
+                     announcements count; trust the server to count them)"
+                ),
+            );
         }
         // Run-level gate diagnostics.
         let discovery_runs: BTreeSet<usize> = self
@@ -4835,5 +5268,291 @@ mod tests {
         l.observe_at_time(&part(A), 1, Some(t(5)));
         l.observe_at_time(&part(B), 500, Some(t(5)));
         assert!(l.assess()[B].flags.is_empty());
+    }
+
+    // ------------------------------------------- discovery-server relay ---
+
+    const S: &str = "cccccccccccccccccccccccc";
+    const SIP: &str = "10.0.0.9";
+
+    /// [`provenance_run`] with discovery servers configured.
+    fn ds_run(servers: Vec<DiscoveryServer>, extra: Vec<SourcedEvent>) -> Learner {
+        let mut l = Learner::new(LearnConfig {
+            model: "m".into(),
+            discovery_servers: servers,
+            ..Default::default()
+        })
+        .unwrap();
+        l.start_run("cap");
+        let mut evs = vec![
+            sourced(part_ip(A, "10.0.0.1"), 1, A, "10.0.0.1"),
+            sourced(writer(A, "rt/odom"), 1, A, "10.0.0.1"),
+            sourced(part_ip(A, "10.0.0.1"), 100, A, "10.0.0.1"),
+        ];
+        evs.extend(extra);
+        evs.sort_by_key(|e| e.position);
+        for e in &evs {
+            l.observe_sourced(e);
+        }
+        l
+    }
+
+    fn relay_items(c: &Commissioning) -> Vec<&SignoffItem> {
+        c.signoff
+            .items
+            .iter()
+            .filter(|i| i.kind == "endpoint_sender_mismatch")
+            .collect()
+    }
+
+    /// The server relays A's /odom (a copy of a direct announcement) and a
+    /// /relayed_only writer A never announced itself.
+    fn relays_of_a() -> Vec<SourcedEvent> {
+        vec![
+            sourced(writer(A, "rt/odom"), 10, S, SIP),
+            sourced(writer(A, "rt/relayed_only"), 11, S, SIP),
+        ]
+    }
+
+    #[test]
+    fn discovery_server_spec_parsing() {
+        let d = DiscoveryServer::parse(S, false).unwrap();
+        assert_eq!(d.prefix.as_deref(), Some(S));
+        assert!(d.ip.is_none() && !d.trusted);
+        let d = DiscoveryServer::parse(&format!("{S}@{SIP}"), true).unwrap();
+        assert_eq!(d.label(), format!("{S}@{SIP}"));
+        assert!(d.trusted);
+        let d = DiscoveryServer::parse("@::ffff:10.0.0.9", false).unwrap();
+        assert_eq!(
+            d.ip,
+            Some("10.0.0.9".parse().unwrap()),
+            "v4-mapped canonical"
+        );
+        assert_eq!(
+            DiscoveryServer::parse("10.0.0.9", false).unwrap().label(),
+            "@10.0.0.9"
+        );
+        for bad in [
+            "",
+            "@",
+            "nope",
+            "CCCCCCCCCCCCCCCCCCCCCCCC",
+            "ccc@10.0.0.9",
+            &format!("{S}@not-an-ip"),
+            "0.0.0.0",
+            "@::",
+        ] {
+            assert!(
+                matches!(
+                    DiscoveryServer::parse(bad, false),
+                    Err(ConfigError::InvalidDiscoveryServer(_))
+                ),
+                "{bad:?}"
+            );
+        }
+        // Matching: every configured part must match.
+        let both = DiscoveryServer::parse(&format!("{S}@{SIP}"), false).unwrap();
+        let o = |p: &str, ip: &str| Origin {
+            sender_prefix: p.into(),
+            src_ip: ip.into(),
+        };
+        assert!(both.matches(&o(S, SIP)));
+        assert!(!both.matches(&o(S, "10.0.0.8")));
+        assert!(!both.matches(&o(B, SIP)));
+        assert!(!both.matches(&o(S, "garbage")));
+        let ip_only = DiscoveryServer::parse(SIP, false).unwrap();
+        assert!(ip_only.matches(&o(B, SIP)));
+        assert!(ip_only.matches(&o(S, "::ffff:10.0.0.9")));
+        // Config validation: count and hand-built invalid entries.
+        let mut c = cfg();
+        c.discovery_servers = vec![ip_only.clone(); MAX_DISCOVERY_SERVERS + 1];
+        assert!(c.validate().is_err());
+        c.discovery_servers = vec![DiscoveryServer {
+            prefix: None,
+            ip: None,
+            trusted: true,
+        }];
+        assert!(Learner::new(c.clone()).is_err());
+        c.discovery_servers = vec![DiscoveryServer {
+            prefix: Some("xyz".into()),
+            ip: None,
+            trusted: false,
+        }];
+        assert!(c.validate().is_err());
+        assert!(ConfigError::InvalidDiscoveryServer("x".into())
+            .to_string()
+            .contains("PREFIX@IP"));
+        // A trusted match wins over a known one.
+        let mut c = cfg();
+        c.discovery_servers = vec![
+            DiscoveryServer::parse(SIP, false).unwrap(),
+            DiscoveryServer::parse(S, true).unwrap(),
+        ];
+        assert!(c.discovery_server_for(&o(S, SIP)).unwrap().trusted);
+        assert!(!c.discovery_server_for(&o(B, SIP)).unwrap().trusted);
+        assert!(c.discovery_server_for(&o(B, "10.1.1.1")).is_none());
+    }
+
+    #[test]
+    fn unconfigured_relay_is_still_a_mismatch() {
+        let c = ds_run(Vec::new(), relays_of_a()).finish();
+        assert!(!c.profile.writer_topics.contains("/relayed_only"));
+        let items = relay_items(&c);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].subject, format!("{A} sent by {S} from {SIP}"));
+        assert!(items[0].reason.contains("GUID spoofing"));
+    }
+
+    #[test]
+    fn known_server_confirms_copies_and_flags_the_rest() {
+        let known = DiscoveryServer::parse(&format!("{S}@{SIP}"), false).unwrap();
+        // Copy of a direct announcement only: attributed, no item.
+        let only_copy = vec![sourced(writer(A, "rt/odom"), 10, S, SIP)];
+        let c = ds_run(vec![known.clone()], only_copy).finish();
+        assert!(relay_items(&c).is_empty(), "{:?}", relay_items(&c));
+        assert!(c.profile.writer_topics.contains("/odom"));
+        assert!(c
+            .report
+            .warnings
+            .iter()
+            .any(|w| w.code == "discovery_relay_attributed"));
+        // Plus an endpoint A never announced directly: flagged, not learned.
+        let c = ds_run(vec![known.clone()], relays_of_a()).finish();
+        assert!(!c.profile.writer_topics.contains("/relayed_only"));
+        let items = relay_items(&c);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].reason.contains("known discovery server"));
+        assert!(
+            items[0].reason.contains("W /relayed_only"),
+            "{}",
+            items[0].reason
+        );
+        assert!(
+            items[0].reason.contains("never announced 1 of them"),
+            "{}",
+            items[0].reason
+        );
+        // A known server's relayed SPDP is ignored: B, seen only through
+        // the server, is not a participant; its relayed endpoints flagged.
+        let b_only = vec![
+            sourced(part_ip(B, SIP), 20, S, SIP),
+            sourced(part_ip(B, SIP), 90, S, SIP),
+            sourced(writer(B, "rt/scan"), 21, S, SIP),
+        ];
+        let c = ds_run(vec![known], b_only).finish();
+        assert!(!c.profile.participants.contains(B));
+        assert!(!c.profile.writer_topics.contains("/scan"));
+        let items = relay_items(&c);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].reason.contains("not an accepted participant"));
+        assert!(c
+            .report
+            .warnings
+            .iter()
+            .any(|w| w.code == "discovery_relay_participants_ignored"));
+        // A's IPs do not include the server's.
+        assert!(!c.report.participants[A].src_ips.contains(SIP));
+    }
+
+    #[test]
+    fn trusted_server_attributes_relays_of_accepted_owners() {
+        let trusted = DiscoveryServer::parse(SIP, true).unwrap();
+        let c = ds_run(vec![trusted.clone()], relays_of_a()).finish();
+        assert!(c.profile.writer_topics.contains("/relayed_only"));
+        assert!(relay_items(&c).is_empty(), "{:?}", relay_items(&c));
+        // Relayed SPDP counts for B under the relay pseudo-address (never
+        // the server's IP), so B is accepted and its relayed writer learned;
+        // the pseudo-address is not a second IP.
+        let b_relayed = vec![
+            sourced(part_ip(B, SIP), 20, S, SIP),
+            sourced(part_ip(B, "10.0.0.2"), 30, B, "10.0.0.2"),
+            sourced(part_ip(B, SIP), 90, S, SIP),
+            sourced(writer(B, "rt/scan"), 21, S, SIP),
+        ];
+        let c = ds_run(vec![trusted.clone()], b_relayed).finish();
+        assert!(c.profile.participants.contains(B));
+        assert!(c.profile.writer_topics.contains("/scan"));
+        let pr = &c.report.participants[B];
+        assert!(pr.src_ips.contains(&format!("{RELAY_MARK}@{SIP}")));
+        assert!(!pr.src_ips.contains(SIP));
+        assert!(!pr.flags.iter().any(|f| f == "participant_multiple_ips"));
+        assert!(relay_items(&c).is_empty());
+        // Owner announced once (quarantined): relayed endpoints flagged,
+        // not learned, even from a trusted server.
+        let q = vec![
+            sourced(part_ip(B, SIP), 20, S, SIP),
+            sourced(writer(B, "rt/scan"), 21, S, SIP),
+        ];
+        let c = ds_run(vec![trusted], q).finish();
+        assert!(!c.profile.writer_topics.contains("/scan"));
+        let items = relay_items(&c);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].reason.contains("trusted discovery server"));
+        assert!(items[0].reason.contains("not an accepted participant"));
+    }
+
+    #[test]
+    fn relays_survive_merge_and_marker_addresses_are_refused() {
+        let known = DiscoveryServer::parse(S, false).unwrap();
+        let mut left = ds_run(vec![known.clone()], Vec::new());
+        let mut right = Learner::new(LearnConfig {
+            model: "m".into(),
+            discovery_servers: vec![known],
+            ..Default::default()
+        })
+        .unwrap();
+        right.start_run("cap2");
+        for e in relays_of_a() {
+            right.observe_sourced(&e);
+        }
+        right.observe_sourced(&sourced(part_ip(B, SIP), 5, S, SIP));
+        left.merge(&right);
+        let c = left.finish();
+        assert_eq!(relay_items(&c).len(), 1);
+        assert!(!c.profile.writer_topics.contains("/relayed_only"));
+        assert!(c
+            .report
+            .warnings
+            .iter()
+            .any(|w| w.code == "discovery_relay_participants_ignored"));
+        // An input that claims the relay pseudo-address as a source IP
+        // (JSONL is free text) is an anomaly, not learned.
+        let mut l = Learner::new(cfg()).unwrap();
+        l.observe(&part_ip(A, &format!("{RELAY_MARK}x")));
+        let r = l.report();
+        assert!(r.anomalies.iter().any(|a| a.kind == "invalid_src_ip"));
+        assert!(!r.participants.contains_key(A));
+    }
+
+    #[test]
+    fn relayed_endpoint_caps_are_counted() {
+        let known = DiscoveryServer::parse(S, false).unwrap();
+        let mut l = Learner::new(LearnConfig {
+            model: "m".into(),
+            discovery_servers: vec![known],
+            limits: Limits {
+                max_set_entries: 2,
+                max_participants: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+        for i in 0..4 {
+            l.observe_sourced(&sourced(writer(A, &format!("rt/t{i}")), i, S, SIP));
+        }
+        for g in ["dddddddddddddddddddddddd", "eeeeeeeeeeeeeeeeeeeeeeee"] {
+            l.observe_sourced(&sourced(writer(g, "rt/x"), 9, S, SIP));
+        }
+        let r = l.report();
+        assert!(r
+            .anomalies
+            .iter()
+            .any(|a| a.subject.contains("relayed_endpoints")
+                || a.detail.contains("relayed_endpoints")));
+        assert!(r
+            .anomalies
+            .iter()
+            .any(|a| a.detail.contains("relayed_endpoint_sources")));
     }
 }

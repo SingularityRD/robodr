@@ -127,7 +127,8 @@ always printed to stdout. The report contains:
   captures, `fragmented_discovery_unreassembled` (DATA_FRAG seen but not all
   rebuilt, so endpoints are missing), `fragmented_discovery_reassembled`,
   `ip_reassembly_failed`, `truncated_frames` and `protected_discovery`;
-  `endpoint_sender_mismatch`, `envelope_outlier`,
+  `endpoint_sender_mismatch`, `discovery_relay_attributed` (info),
+  `discovery_relay_participants_ignored` (info), `envelope_outlier`,
   `envelope_dimension_unobserved` (info) and `presence_measured_by_position`
   (info: a run without timestamps, see below).
 
@@ -156,10 +157,13 @@ robodr-commission learn (--events run.jsonl | --pcap run.pcapng) [...] [--model 
                         [--min-announcements 2] [--min-duration SECS]
                         [--outlier-ratio 3]
                         [--accept-participant GUID]... [--motion-topic /T]...
+                        [--discovery-server PREFIX|PREFIX@IP|IP]...
+                        [--trusted-discovery-server PREFIX|PREFIX@IP|IP]...
                         [--learn-readers]
                         --out profile.json [--signoff signoff.json]
                         [--report report.json] [--quiet] [--force]
 robodr-commission lock    --in profile.json --signoff signoff.json --out locked.json
+                          --operators operators.json [--motion-quorum N] [--no-manifest]
                           (--parent previous-locked.json | --platform P --profile-version N)
                           [--unit-id U] [--sign-key signing.key] [--trusted-keys trust.json]
                           [--locked-at UNIX_SECS]
@@ -174,6 +178,10 @@ robodr-commission migrate-legacy --in legacy-locked.json --out locked.json
                           --platform P --profile-version N --operator NAME
                           --sign-key signing.key [--unit-id U] [--locked-at UNIX_SECS]
 robodr-commission signoff --in profile.json --out signoff.json [--force]
+robodr-commission signoff --signoff signoff.json --sign-key operator.key
+                          [--in profile.json] [--operators operators.json] [--force]
+robodr-commission operators --out operators.json --operator NAME=KEY.pub [...]
+                          [--motion-quorum N] [--force]
 robodr-commission diff    old.json new.json [--json]
 robodr-commission check   --profile locked.json (--events run.jsonl | --pcap run.pcap) [...] [--json]
 robodr-commission merge   --out merged.json a.json b.json [...]
@@ -196,7 +204,18 @@ failed `learn` writes nothing: every output path is checked before the
 inputs are read, and the draft, sign-off list and report are published as a
 unit (all temp files written first; if one publish fails, the ones already
 published are removed or restored). A power loss in the middle of the
-publish step can still leave a subset. Profile inputs must be regular files
+publish step can still leave a subset, so `learn` then writes an **output
+manifest** `<out>.manifest.json` last (after removing a stale one, and only
+once the other files are durable): the draft's and the report's SHA-256 and
+the sign-off's `profile_sha256` / `items_sha256` (the operator edits
+`confirmed` and `operator`, so the list's file hash cannot be recorded).
+`lock` refuses a draft whose manifest is missing or does not match the
+draft, the sign-off or the report (a new draft next to an old list, or a
+stale report the operator would review); `check` refuses a draft whose
+manifest does not match (a draft without one, e.g. from `merge`, is checked
+with a note). `signoff --in/--out` writes the manifest for the conservative
+list. `lock --no-manifest` skips the check for drafts made before manifests
+existed. A manifest detects torn and mixed-up sets, not forgery. Profile inputs must be regular files
 (no FIFOs or devices) of at most 64 MiB and are parsed strictly: every key
 present, no unknown keys, and no duplicate keys at any depth, compared after
 JSON unescaping (`"/cmd_vel"` and `"/cmd\u005fvel"` are the same key), and a
@@ -233,7 +252,14 @@ valid seal if locked.
     (ids and reasons) to the draft; only `confirmed` and `operator` may change
   * independently of the list, every motion channel of the draft must be
     covered by a confirmed `motion_writer`, `motion_unattributed` or
-    `motion_channel_unreviewed` item (a floor recomputed from the draft)
+    `motion_channel_unreviewed` item, and every motion dimension left `null`
+    (unlimited) by a confirmed `envelope_dimension_unbounded` item (a floor
+    recomputed from the draft)
+  * the list is not **signed** (see "Signed operator sign-off" below): no
+    valid signature from a key in `--operators`, any invalid or unknown
+    signature, the named `operator` not among the signers, or fewer than
+    `motion_quorum` distinct operators when the list has motion items
+  * the output manifest is missing or does not match (unless `--no-manifest`)
   * a bound above `--hard-cap-linear` / `--hard-cap-joint` (default 10 m/s,
     10 rad/s; pass the values used for `learn` on a faster platform)
   * the profile is already locked
@@ -273,7 +299,59 @@ valid seal if locked.
   ignores the extra member.
 * **signoff** writes a conservative sign-off list for a draft that was edited
   by hand or produced by `merge` (every participant and motion channel must be
-  confirmed individually, because the learner's provenance is gone).
+  confirmed individually, because the learner's provenance is gone), and the
+  draft's output manifest (a stale one is replaced; one that still matches
+  needs `--force`). With `--sign-key` it signs a confirmed list instead.
+* **operators** builds the operators trust list from public key files.
+
+### Signed operator sign-off (trust model)
+
+`items_sha256` and `profile_sha256` are plain hashes: anyone with write
+access could delete an item and recompute them. The confirmation becomes an
+authenticated decision through the operator's **Ed25519 signature** over
+the exact bytes of the confirmed list:
+
+1. Each operator has a robodr-blackbox key file (`robodr-blackbox-key/v2`,
+   Ed25519, secret file mode 0600; `robodr-commission keygen` or
+   `robodr-blackbox keygen`). The security officer lists the public halves,
+   each bound to an operator name, in an operators trust list:
+   `robodr-commission operators --out operators.json --operator
+   Alice=alice.key.pub --operator Bob=bob.key.pub --motion-quorum 2`
+   (`robodr-operators/v1`). It is refused at load if it is a symlink or
+   writable by group/others, lists a key id or a public key twice (one
+   person counted twice), or asks for a quorum above its number of distinct
+   operators.
+2. After review: `robodr-commission signoff --signoff S --sign-key alice.key
+   [--in draft.json] [--operators operators.json]` refuses a list that is
+   not fully confirmed, names no operator, has a broken item digest or
+   (with `--in`) belongs to another draft or misses a floor item, and
+   otherwise adds the signature over `robodr-signoff-sig/v1\0 || <bytes>` to
+   `S.sig` (`robodr-signoff-sigs/v1`). Further operators sign the same
+   bytes. Editing the list afterwards voids all signatures (re-signing then
+   needs `--force`, which discards them).
+3. `lock --operators operators.json` verifies `S.sig`: every signature must
+   verify under a listed key (fail closed), at least one must, the list's
+   `operator` must be the name bound to one of the signers (so the locked
+   profile's `locked_by` is an authenticated identity), and if the list has
+   motion items (`motion_writer`, `motion_unattributed`,
+   `motion_channel_unreviewed`) at least `motion_quorum` distinct operators
+   (names, not keys) must have signed: the **two-person rule**.
+   `--motion-quorum N` raises it for one lock, never lowers it.
+
+What is trusted: the operators trust list (install it with the same care as
+the profile trust file), the operators' secret keys, and the commissioning
+workstation while `learn` runs. The learner is not a separate signing
+identity (a learner key on the same workstation would add nothing over the
+operator signature that follows); instead, what `lock` can recompute from
+the digest-bound draft it does (the floor above), so a rewritten list can
+drop learner findings only by getting an authorised operator to sign the
+list they are shown. Limits: a careless or colluding operator (or quorum)
+can still confirm anything, the signature makes it a named decision; no key
+expiry or revocation list (remove the key from the trust list); the Ed25519
+code is robodr-blackbox's, not audited. The library's `lock` /
+`lock_draft_text` check content and confirmations only, for embedders that
+authenticate the operator themselves; `lock_signed_draft` is what the CLI
+runs.
 * **check** refuses (exit 2) a profile that fails `Profile::validate`.
 * **diff** lists every change in participants, writer topics, services,
   actions, raw DDS topics, reader topics, motion channels and envelope bounds.
@@ -310,8 +388,30 @@ the `learner` module docs):
   Anything else is not learned and becomes `endpoint_sender_mismatch` (owner,
   sender, IP, names). An intruder can therefore not get a topic learned by
   writing a legitimate participant's GUID into `PID_ENDPOINT_GUID`. JSONL
-  events carry no sender, so the check does not apply to them. A discovery
-  server relaying others' announcements produces mismatch items too.
+  events carry no sender, so the check does not apply to them.
+* **Discovery servers** (`--discovery-server`, `--trusted-discovery-server`;
+  `PREFIX`, `PREFIX@IP` or `IP`, mirroring the sensor pipeline's
+  `discovery_servers` binding option). A server re-sends other participants'
+  announcements under its own prefix. A relay whose sender matches a
+  configured server is attributed to the owner, never to the server, and
+  never binds the server's IP to the owner. From a **known** server a
+  relayed endpoint only confirms the owner's own announcement: no item if
+  the owner is accepted and announced the same endpoint directly from a
+  commissioned IP, otherwise it is not learned and becomes an
+  `endpoint_sender_mismatch` item naming the server; participant
+  announcements it relays are ignored by the gate (info
+  `discovery_relay_participants_ignored`). From a **trusted** server,
+  relayed participant announcements count for the owner's gate (under the
+  pseudo-address `relay:<server>`, shown in the report, not counted as a
+  second IP) and relayed endpoints of accepted owners are learned. Relays
+  for owners that are not accepted are flagged either way; relays from
+  unconfigured senders stay `endpoint_sender_mismatch`. Attributed relays
+  are listed as info `discovery_relay_attributed`. Trusting a server means
+  trusting whatever it relays; prefer the known mode with a capture point
+  that also sees the participants' own traffic. (The RTPS layer also
+  reports a relayed announcement as the relaying participant's own
+  endpoint, as the sensor does; the server is gated and reviewed like any
+  participant.)
 * **Sign-off list** (`<out>.signoff.json`): every participant that writes a
   motion topic (learned channel, `--motion-topic`, or a name containing
   `cmd`/`command`/`twist`/`trajectory`) or sends motion commands; participants
@@ -319,7 +419,9 @@ the `learner` module docs):
   runs; unattributed motion commands; thin envelopes; samples above the cap;
   unobserved dimensions; outlier maxima; endpoint sender mismatches;
   capacity overflow; anomalies. `lock` refuses until a named operator has
-  confirmed every item, and refuses a list with items removed.
+  confirmed every item and signed the list with a key from the operators
+  trust list (two distinct operators for motion items with
+  `motion_quorum: 2`), and refuses a list with items removed.
 * **Hard caps**: no envelope exceeds `--hard-cap-linear` / `--hard-cap-joint`
   (default 10 m/s, 10 rad/s) or the tighter OEM ceiling; NaN, infinite and
   negative speeds are never learned; `lock` and `merge` enforce the same
@@ -335,10 +437,12 @@ the `learner` module docs):
 
 What this cannot catch: an intruder present from the very start for the whole
 run, announcing normally from one IP and not touching motion topics. Only the
-operator's review of the participant list catches that. The seal and the
-sign-off digests are hashes, not signatures: they detect edits, deletions and
-corruption, not a forger who recomputes them (the motion-channel floor at
-`lock` still applies to a recomputed list).
+operator's review of the participant list catches that. The seal, the
+sign-off digests and the output manifest are hashes, not signatures: they
+detect edits, deletions, torn writes and corruption, not a forger who
+recomputes them. What stops the forger is the operator signature on the
+sign-off (and the OEM signature on the locked profile); the floor at `lock`
+still applies to any list.
 
 ## Demo (synthetic data)
 
@@ -377,17 +481,24 @@ Warnings: 1 (0 need attention)
   [info] reader_topics_not_learned: 6 reader topics observed but not learned: reader-topic enforcement stays off (use --learn-readers to opt in)
 wrote draft profile profile.json (locked: false): 4 participants, 7 writer topics, 25 services, 1 actions, 1 raw DDS topics, 0 reader topics, 2 motion channels; 0 anomalies, 0 warnings need attention
 
-$ robodr-commission lock --in profile.json --signoff profile.json.signoff.json --out locked.json
+$ robodr-commission keygen --out alice.key --trust-out alice.trust.json --key-id alice
+$ robodr-commission operators --out operators.json --operator Alice=alice.key.pub
+$ robodr-commission lock --in profile.json --signoff profile.json.signoff.json --out locked.json \
+    --operators operators.json --platform ugv-demo --profile-version 1
 refusing to lock profile.json:
   - sign-off has no operator name (fill in "operator")
   - not confirmed by the operator: motion_writer:/cmd_vel 01103f5a8c2e000000000101 (...)
   ...
-$ $EDITOR profile.json.signoff.json   # review each item, set "confirmed": true, fill "operator"
+  - the sign-off carries no valid operator signature: ...
+$ $EDITOR profile.json.signoff.json   # review each item, set "confirmed": true, "operator": "Alice"
+$ robodr-commission signoff --signoff profile.json.signoff.json --sign-key alice.key \
+    --in profile.json --operators operators.json
+signed profile.json.signoff.json as key alice (operator "Alice") -> profile.json.signoff.json.sig ...
 $ robodr-commission keygen --out oem.key --trust-out trust.json --key-id oem-demo
 # oem.key (secret, 0600) + oem.key.pub (public, 0644): robodr-blackbox-key/v2,
 # the same key file format as robodr-blackbox keygen (either can sign).
 $ robodr-commission lock --in profile.json --signoff profile.json.signoff.json --out locked.json \
-    --platform ugv-demo --profile-version 1 --sign-key oem.key
+    --operators operators.json --platform ugv-demo --profile-version 1 --sign-key oem.key
 locked profile ugv-demo-synthetic -> locked.json (sealed; profile_version 1, platform ugv-demo; ...)
 signed by oem-demo -> locked.json.sig
 $ robodr-commission verify-profile --profile locked.json --trusted-keys trust.json

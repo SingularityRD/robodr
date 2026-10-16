@@ -17,6 +17,16 @@
 //! [`write_files_atomic`](robodr_commission::write_files_atomic) (all temps
 //! first; a failed publish rolls back what was already published).
 //!
+//! After its companion files, `learn` (and `signoff` in list mode) writes
+//! an output manifest `<draft>.manifest.json` last (see
+//! `robodr_commission::ops`, "Output manifest"); `lock` and `check` refuse a
+//! draft whose manifest is missing or does not match.
+//!
+//! Operator sign-off is signed: `signoff --signoff S --sign-key OP.key`
+//! adds the operator's Ed25519 signature over the confirmed list's exact
+//! bytes to `S.sig`; `lock --operators operators.json` requires valid
+//! signatures from listed operators (see `robodr_commission::signoff`).
+//!
 //! Signing: `lock --sign-key` (and `sign`, `migrate-legacy`) write the
 //! detached Ed25519 signature `<out>.sig` over the exact sealed bytes, as a
 //! unit with the profile. `verify-profile` runs the same trust check the
@@ -25,7 +35,15 @@
 
 use robodr_blackbox::keys::public_key_path;
 use robodr_commission::input::{self, InputSpec};
+use robodr_commission::learner::DiscoveryServer;
+use robodr_commission::ops::{
+    lock_signed_draft, manifest_path_for, verify_manifest, Manifest, OperatorPolicy,
+};
 use robodr_commission::profile_file::{check_destination, read_regular_file, MAX_PROFILE_BYTES};
+use robodr_commission::signoff::{
+    required_items, satisfies, sha256_hex, signoff_file_digest, signoff_sig_path, OperatorTrust,
+    SignoffSignatures, MAX_OPERATORS_BYTES,
+};
 use robodr_commission::trust::{
     evaluate_profile_trust, file_digest, load_revocation_list, load_signing_key, load_state,
     load_trust_keys, load_trust_roots, new_signing_key, sig_path_for, trust_file_text,
@@ -34,8 +52,8 @@ use robodr_commission::trust::{
     TrustInputs, TrustPolicy,
 };
 use robodr_commission::{
-    diff, lock_draft_text_with_caps, merge_profiles_with_caps, parse_profile_text, sealed_text,
-    to_json, write_files_atomic, Checker, HardCaps, LearnConfig, Learner, Signoff,
+    diff, merge_profiles_with_caps, parse_profile_text, sealed_text, to_json, write_files_atomic,
+    Checker, HardCaps, LearnConfig, Learner, LockRefusal, Signoff,
 };
 use robodr_events::profile::{Profile, ProfileMetadata, PROFILE_SCHEMA_VERSION};
 use std::collections::BTreeMap;
@@ -54,10 +72,13 @@ USAGE:
                           [--min-announcements 2] [--min-duration SECS]
                           [--outlier-ratio 3]
                           [--accept-participant GUID]... [--motion-topic /T]...
+                          [--discovery-server PREFIX|PREFIX@IP|IP]...
+                          [--trusted-discovery-server PREFIX|PREFIX@IP|IP]...
                           [--learn-readers]
                           --out profile.json [--signoff signoff.json]
                           [--report report.json] [--quiet] [--force]
   robodr-commission lock    --in profile.json --signoff signoff.json --out locked.json
+                          --operators operators.json [--motion-quorum N] [--no-manifest]
                           (--parent previous-locked.json | --platform P --profile-version N)
                           [--platform P] [--unit-id U] [--profile-version N]
                           [--sign-key signing.key] [--trusted-keys trust.json]
@@ -83,6 +104,10 @@ USAGE:
                           --sign-key signing.key [--unit-id U] [--locked-at UNIX_SECS]
                           [--force]
   robodr-commission signoff --in profile.json --out signoff.json [--force]
+  robodr-commission signoff --signoff signoff.json --sign-key operator.key
+                          [--in profile.json] [--operators operators.json] [--force]
+  robodr-commission operators --out operators.json --operator NAME=KEY.pub [...]
+                          [--motion-quorum N] [--force]
   robodr-commission diff    <old.json> <new.json> [--json]
   robodr-commission check   --profile locked.json (--events <f> | --pcap <f>) [...] [--json]
   robodr-commission merge   --out merged.json <a.json> <b.json> [...]
@@ -103,10 +128,24 @@ USAGE:
   (deny), never left unlimited. --outlier-ratio: max > ratio x p99 on an
   envelope needs sign-off. Endpoints announced under another participant's
   GUID, or from an IP that is not one of the owner's commissioned IPs, are
-  not learned (sign-off item endpoint_sender_mismatch).
-  learn writes a sign-off list (default <out>.signoff.json); lock refuses
-  until a named \"operator\" has set \"confirmed\": true on every item.
-  signoff builds a conservative list for an edited or merged draft.
+  not learned (sign-off item endpoint_sender_mismatch), unless relayed by a
+  configured discovery server: --discovery-server (known: relayed copies of
+  the owner's own announcements are not flagged) or
+  --trusted-discovery-server (relayed endpoints of accepted participants
+  are learned).
+  learn writes a sign-off list (default <out>.signoff.json) and, last, the
+  manifest <out>.manifest.json binding draft, list and report; lock and
+  check refuse a draft whose companion files do not match it (lock
+  --no-manifest: drafts from before manifests). lock refuses until a named
+  \"operator\" has set \"confirmed\": true on every item AND signed the
+  list: signoff --signoff S --sign-key OP.key appends the operator's
+  Ed25519 signature over the list's exact bytes to S.sig; lock --operators
+  requires valid signatures from keys in that trust list (built by
+  `operators`), the named operator among the signers, and motion_quorum
+  distinct operators when the list has motion items (two-person rule;
+  --motion-quorum can only raise it).
+  signoff --in/--out builds a conservative list for an edited or merged
+  draft (and writes its manifest).
   lock stamps metadata (schema/profile version, platform, unit, locked_by =
   sign-off operator, locked_at, parent digest): with --parent the version
   defaults to the parent's + 1 and must be higher, platform/unit default to
@@ -298,6 +337,7 @@ fn main() -> ExitCode {
         "check" => cmd_check(rest),
         "merge" => cmd_merge(rest),
         "signoff" => cmd_signoff(rest),
+        "operators" => cmd_operators(rest),
         "help" | "--help" | "-h" => {
             print!("{USAGE}");
             Ok(())
@@ -332,6 +372,37 @@ fn write_files(files: &[(&str, &str)], force: bool) -> Result<(), String> {
 
 fn write_file(path: &str, contents: &str, force: bool) -> Result<(), String> {
     write_files(&[(path, contents)], force)
+}
+
+/// Publish `files` as a unit, then the manifest built by `make` (after the
+/// files are durable). An existing manifest is removed before anything is
+/// published (it would describe the previous output set).
+fn publish_with_manifest(
+    files: &[(&str, &str)],
+    manifest: &str,
+    force: bool,
+    replace_manifest: bool,
+    make: impl FnOnce(&Path) -> Manifest,
+) -> Result<(), String> {
+    let mp = Path::new(manifest);
+    for (p, _) in files {
+        check_destination(Path::new(p), force).map_err(|e| format!("{p}: {e}"))?;
+    }
+    check_destination(mp, replace_manifest).map_err(|e| format!("{manifest}: {e}"))?;
+    match std::fs::symlink_metadata(mp) {
+        Ok(m) if m.is_file() => {
+            std::fs::remove_file(mp).map_err(|e| format!("{manifest}: {e}"))?;
+            if let Some(d) = mp.parent().filter(|d| !d.as_os_str().is_empty()) {
+                if let Ok(d) = std::fs::File::open(d) {
+                    let _ = d.sync_all();
+                }
+            }
+        }
+        _ => {}
+    }
+    write_files(files, force)?;
+    let text = make(mp).to_text();
+    write_file(manifest, &text, false)
 }
 
 /// Fail early (before reading inputs) if an output could not be written.
@@ -408,9 +479,15 @@ fn load_profile(path: &str) -> Result<Profile, String> {
     parse_profile_text(&text).map_err(|e| format!("{path}: {e}"))
 }
 
-fn load_signoff(path: &str) -> Result<Signoff, String> {
-    let text = read_text(path, MAX_SIGNOFF_BYTES)?;
-    serde_json::from_str(&text).map_err(|e| format!("{path}: not a sign-off file: {e}"))
+/// The operator signatures of a sign-off (`None` if the file is absent).
+fn load_signoff_sigs(path: &str) -> Result<Option<SignoffSignatures>, String> {
+    match read_regular_file(Path::new(path), MAX_OPERATORS_BYTES) {
+        Ok(t) => SignoffSignatures::parse(&t)
+            .map(Some)
+            .map_err(|e| format!("{path}: not a sign-off signature file: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{path}: {e}")),
+    }
 }
 
 /// Load a profile that is about to be enforced (by `check`): it must pass
@@ -452,6 +529,8 @@ fn cmd_learn(argv: &[String]) -> Outcome {
             "accept-participant",
             "motion-topic",
             "outlier-ratio",
+            "discovery-server",
+            "trusted-discovery-server",
         ],
         &["quiet", "learn-readers", "force"],
     )?;
@@ -492,6 +571,15 @@ fn cmd_learn(argv: &[String]) -> Outcome {
     cfg.accept_participants = a.all("accept-participant").iter().cloned().collect();
     cfg.motion_topics
         .extend(a.all("motion-topic").iter().cloned());
+    for (name, trusted) in [
+        ("discovery-server", false),
+        ("trusted-discovery-server", true),
+    ] {
+        for spec in a.all(name) {
+            cfg.discovery_servers
+                .push(DiscoveryServer::parse(spec, trusted).map_err(|e| format!("--{name}: {e}"))?);
+        }
+    }
     let force = a.switch("force");
     let out = a.required("out")?;
     let signoff_path = match a.one("signoff")? {
@@ -499,6 +587,7 @@ fn cmd_learn(argv: &[String]) -> Outcome {
         None => format!("{out}.signoff.json"),
     };
     let report_path = a.one("report")?;
+    let manifest = manifest_path_for(Path::new(out)).display().to_string();
     let inputs = a.inputs()?;
     let input_paths: Vec<&str> = a
         .all("events")
@@ -506,7 +595,7 @@ fn cmd_learn(argv: &[String]) -> Outcome {
         .chain(a.all("pcap"))
         .map(String::as_str)
         .collect();
-    let mut outputs = vec![out, signoff_path.as_str()];
+    let mut outputs = vec![out, signoff_path.as_str(), manifest.as_str()];
     outputs.extend(report_path);
     distinct_paths(&outputs, &input_paths)?;
     // Refuse now, not after learning (and never leave a partial set).
@@ -529,7 +618,17 @@ fn cmd_learn(argv: &[String]) -> Outcome {
     if let Some(r) = report_path {
         files.push((r, report_text.as_str()));
     }
-    write_files(&files, force)?;
+    // The manifest goes last: a stale one is removed first, so a crash in
+    // between leaves no manifest (lock refuses) rather than an old one.
+    publish_with_manifest(&files, &manifest, force, force, |m| {
+        Manifest::new(
+            m,
+            &c.profile.model,
+            (Path::new(out), profile_text.as_bytes()),
+            Some((Path::new(&signoff_path), &c.signoff)),
+            report_path.map(|r| (Path::new(r), report_text.as_bytes())),
+        )
+    })?;
     if !a.switch("quiet") {
         print!("{}", c.report);
     }
@@ -696,8 +795,10 @@ fn cmd_lock(argv: &[String]) -> Outcome {
             "sign-key",
             "trusted-keys",
             "locked-at",
+            "operators",
+            "motion-quorum",
         ],
-        &["force"],
+        &["force", "no-manifest"],
     )?;
     if let Some(p) = a.positionals.first() {
         return Err(format!("unexpected argument {p:?}").into());
@@ -706,11 +807,32 @@ fn cmd_lock(argv: &[String]) -> Outcome {
     let input = a.required("in")?;
     let out = a.required("out")?;
     let signoff_path = a.required("signoff")?;
+    let operators_path = a.required("operators")?;
+    let min_quorum = match a.u64_opt("motion-quorum")? {
+        None => 1,
+        Some(0) => return Err("--motion-quorum must be at least 1".to_string().into()),
+        Some(n) => usize::try_from(n).map_err(|_| "--motion-quorum is too large".to_string())?,
+    };
     let sig_out = sig_path_for(Path::new(out)).display().to_string();
-    let mut inputs = vec![input, signoff_path];
+    let signoff_sigs = signoff_sig_path(Path::new(signoff_path))
+        .display()
+        .to_string();
+    let mut inputs = vec![input, signoff_path, operators_path, signoff_sigs.as_str()];
     inputs.extend(a.one("parent")?);
     inputs.extend(a.one("sign-key")?);
     distinct_paths(&[out, sig_out.as_str()], &inputs)?;
+    let trust = OperatorTrust::load(Path::new(operators_path))?;
+    if min_quorum > trust.operators().len() {
+        return Err(format!(
+            "--motion-quorum {min_quorum} exceeds the {} operator(s) in {operators_path}",
+            trust.operators().len()
+        )
+        .into());
+    }
+    let policy = OperatorPolicy {
+        trust: &trust,
+        min_motion_quorum: min_quorum,
+    };
     let key = a
         .one("sign-key")?
         .map(|k| load_signing_key(Path::new(k)))
@@ -718,13 +840,31 @@ fn cmd_lock(argv: &[String]) -> Outcome {
     let draft = read_text(input, MAX_PROFILE_BYTES)?;
     // An unreadable draft is an input error (exit 2), not a refusal.
     let parsed = parse_profile_text(&draft).map_err(|e| format!("{input}: {e}"))?;
-    let signoff = load_signoff(signoff_path)?;
+    let signoff_text = read_text(signoff_path, MAX_SIGNOFF_BYTES)?;
+    let signoff: Signoff = serde_json::from_str(&signoff_text)
+        .map_err(|e| format!("{signoff_path}: not a sign-off file: {e}"))?;
+    let sigs = load_signoff_sigs(&signoff_sigs)?;
     // Flag / parent errors are usage errors (exit 2) and are reported
     // before the lock decision; the operator name is checked by the lock
     // itself (a refusal, exit 1), so a placeholder stands in for it here.
     lock_metadata(&a, &parsed, "pending-sign-off")?;
-    match lock_draft_text_with_caps(&draft, &signoff, &caps) {
-        Ok(mut locked) => {
+    let manifest_refusals = if a.switch("no-manifest") {
+        eprintln!("warning: --no-manifest: not checking {input} against its output manifest");
+        Vec::new()
+    } else {
+        verify_manifest(Path::new(input), draft.as_bytes(), Some(&signoff))
+    };
+    let result = lock_signed_draft(&draft, &signoff_text, sigs.as_ref(), &policy, &caps);
+    let result = match (result, manifest_refusals.is_empty()) {
+        (Ok(v), true) => Ok(v),
+        (Ok(_), false) => Err(manifest_refusals),
+        (Err(mut r), _) => {
+            r.splice(0..0, manifest_refusals);
+            Err(r)
+        }
+    };
+    match result {
+        Ok((mut locked, signoff)) => {
             locked.metadata = Some(lock_metadata(&a, &parsed, &signoff.operator)?);
             if let Err(errs) = locked.validate() {
                 let list: Vec<String> = errs.iter().map(ToString::to_string).collect();
@@ -1366,7 +1506,29 @@ fn cmd_check(argv: &[String]) -> Outcome {
     if let Some(p) = a.positionals.first() {
         return Err(format!("unexpected argument {p:?}").into());
     }
-    let profile = load_valid_profile(a.required("profile")?)?;
+    let profile_path = a.required("profile")?;
+    let profile = load_valid_profile(profile_path)?;
+    if !profile.locked {
+        // A draft is only meaningful with the output set it was written
+        // with: refuse a torn or mixed-up set.
+        let text = read_text(profile_path, MAX_PROFILE_BYTES)?;
+        let mut why = verify_manifest(Path::new(profile_path), text.as_bytes(), None);
+        if matches!(why.as_slice(), [LockRefusal::ManifestMissing { .. }]) {
+            eprintln!(
+                "note: draft {profile_path} has no output manifest (merged, hand-written or \
+                 older draft): companion files not checked"
+            );
+            why.clear();
+        }
+        if !why.is_empty() {
+            let list: Vec<String> = why.iter().map(|w| format!("  - {w}")).collect();
+            return Err(format!(
+                "{profile_path}: draft does not match its output manifest:\n{}",
+                list.join("\n")
+            )
+            .into());
+        }
+    }
     let inputs = a.inputs()?;
     let mut checker = Checker::new(&profile);
     for spec in &inputs {
@@ -1387,27 +1549,221 @@ fn cmd_check(argv: &[String]) -> Outcome {
 }
 
 fn cmd_signoff(argv: &[String]) -> Outcome {
-    let a = Args::parse(argv, &["in", "out"], &["force"])?;
+    let a = Args::parse(
+        argv,
+        &["in", "out", "signoff", "sign-key", "operators"],
+        &["force"],
+    )?;
     if let Some(p) = a.positionals.first() {
         return Err(format!("unexpected argument {p:?}").into());
     }
+    if a.one("sign-key")?.is_some() {
+        return cmd_signoff_sign(&a);
+    }
+    for f in ["signoff", "operators"] {
+        if a.one(f)?.is_some() {
+            return Err(format!("--{f} is only valid with --sign-key").into());
+        }
+    }
     let input = a.required("in")?;
     let out = a.required("out")?;
-    distinct_paths(&[out], &[input])?;
+    let manifest = manifest_path_for(Path::new(input)).display().to_string();
+    distinct_paths(&[out, manifest.as_str()], &[input])?;
+    let force = a.switch("force");
+    precheck_outputs(&[out], force)?;
     let text = read_text(input, MAX_PROFILE_BYTES)?;
     let p = parse_profile_text(&text).map_err(|e| format!("{input}: {e}"))?;
     if p.locked {
         return Err(format!("{input}: already locked").into());
     }
+    // A manifest that no longer matches the draft (it was edited after
+    // learn) describes an output set that is gone: replacing it needs no
+    // --force. One that still matches is learn's and is kept unless --force.
+    let stale = read_regular_file(Path::new(&manifest), MAX_SIGNOFF_BYTES)
+        .ok()
+        .and_then(|t| Manifest::parse(&t).ok())
+        .is_some_and(|m| m.draft.sha256 != sha256_hex(text.as_bytes()));
+    let replace_manifest = force || stale;
+    precheck_outputs(&[manifest.as_str()], replace_manifest)?;
     let mut s = Signoff::for_profile(&p);
     // Bind to the bytes on disk (they may differ from our canonical form if
     // the draft was edited by hand).
-    s.rebind(robodr_commission::signoff::sha256_hex(text.as_bytes()));
-    write_file(out, &json(&s)?, a.switch("force"))?;
+    s.rebind(sha256_hex(text.as_bytes()));
+    let list = json(&s)?;
+    publish_with_manifest(
+        &[(out, list.as_str())],
+        &manifest,
+        force,
+        replace_manifest,
+        |m| {
+            Manifest::new(
+                m,
+                &p.model,
+                (Path::new(input), text.as_bytes()),
+                Some((Path::new(out), &s)),
+                None,
+            )
+        },
+    )?;
     eprintln!(
-        "wrote conservative sign-off list {out} ({} item(s)): review each, set \"confirmed\": \
-         true and fill \"operator\"",
+        "wrote conservative sign-off list {out} ({} item(s)) and manifest {manifest}: review \
+         each item, set \"confirmed\": true, fill \"operator\", then sign it \
+         (`robodr-commission signoff --signoff {out} --sign-key <operator.key>`)",
         s.items.len()
+    );
+    Ok(())
+}
+
+/// `signoff --signoff S --sign-key K`: the operator signs the confirmed
+/// list (exact bytes) and the signature is added to `S.sig`.
+fn cmd_signoff_sign(a: &Args) -> Outcome {
+    if let Some(o) = a.one("out")? {
+        return Err(format!(
+            "--out {o:?} is not used with --sign-key (the signature goes to <signoff>.sig)"
+        )
+        .into());
+    }
+    let so_path = a.required("signoff")?;
+    let key_path = a.required("sign-key")?;
+    let sig_out = signoff_sig_path(Path::new(so_path)).display().to_string();
+    let mut inputs = vec![so_path, key_path];
+    inputs.extend(a.one("in")?);
+    inputs.extend(a.one("operators")?);
+    distinct_paths(&[sig_out.as_str()], &inputs)?;
+    let key = load_signing_key(Path::new(key_path))?;
+    let key_id = robodr_blackbox::Signer::key_id(&key).to_string();
+    let text = read_text(so_path, MAX_SIGNOFF_BYTES)?;
+    let so: Signoff =
+        serde_json::from_str(&text).map_err(|e| format!("{so_path}: not a sign-off file: {e}"))?;
+    // Never sign what lock would refuse for content reasons.
+    let mut why: Vec<String> = Vec::new();
+    if let Err(e) = so.check_shape() {
+        why.push(e);
+    }
+    if !so.items_intact() {
+        why.push(
+            "items were deleted, added or reworded (items_sha256 differs); refusing to sign".into(),
+        );
+    }
+    if so.operator.trim().is_empty() {
+        why.push("no operator name (fill in \"operator\")".into());
+    }
+    for i in so.unconfirmed() {
+        why.push(format!("not confirmed: {}", i.id));
+    }
+    if let Some(input) = a.one("in")? {
+        let draft = read_text(input, MAX_PROFILE_BYTES)?;
+        let p = parse_profile_text(&draft).map_err(|e| format!("{input}: {e}"))?;
+        if so.profile_sha256 != sha256_hex(draft.as_bytes()) {
+            why.push(format!(
+                "the sign-off does not belong to {input} (profile_sha256 differs)"
+            ));
+        }
+        for req in required_items(&p) {
+            if !so.items.iter().any(|i| satisfies(i, &req)) {
+                why.push(format!(
+                    "required item missing for {}: {}",
+                    req.subject, req.why
+                ));
+            }
+        }
+    }
+    let mut signer_name = None;
+    if let Some(op) = a.one("operators")? {
+        let trust = OperatorTrust::load(Path::new(op))?;
+        match trust.operator_of(&key_id) {
+            None => why.push(format!(
+                "key {key_id:?} is not in the operators trust list {op}"
+            )),
+            Some(name) => signer_name = Some(name.to_string()),
+        }
+    }
+    if !why.is_empty() {
+        eprintln!("refusing to sign {so_path}:");
+        for w in why {
+            eprintln!("  - {w}");
+        }
+        return Err(Failure::Negative);
+    }
+    let force = a.switch("force");
+    let existing = load_signoff_sigs(&sig_out)?;
+    let existed = existing.is_some();
+    let mut sigs = match existing {
+        Some(s) if s.signoff_digest == signoff_file_digest(text.as_bytes()) => s,
+        Some(s) if force => {
+            eprintln!(
+                "warning: discarding {} signature(s) in {sig_out} made over an earlier version \
+                 of the list",
+                s.signatures.len()
+            );
+            SignoffSignatures::new(text.as_bytes())
+        }
+        Some(_) => {
+            return Err(format!(
+                "{sig_out}: its signatures are over an earlier version of {so_path} (the list \
+                 changed after it was signed, so they are void); pass --force to discard them \
+                 and start over"
+            )
+            .into())
+        }
+        None => SignoffSignatures::new(text.as_bytes()),
+    };
+    sigs.add(text.as_bytes(), &key)?;
+    // Adding to the signature file is the point of this command, so an
+    // existing one (validated above) is replaced atomically.
+    write_file(&sig_out, &sigs.to_text(), existed)?;
+    eprintln!(
+        "signed {so_path} as key {key_id}{} -> {sig_out} ({} signature(s) now; operator named \
+         in the list: {:?})",
+        signer_name
+            .map(|n| format!(" (operator {n:?})"))
+            .unwrap_or_default(),
+        sigs.signatures.len(),
+        so.operator
+    );
+    Ok(())
+}
+
+/// `operators`: build the operators trust list from public key files.
+fn cmd_operators(argv: &[String]) -> Outcome {
+    let a = Args::parse(argv, &["out", "operator", "motion-quorum"], &["force"])?;
+    if let Some(p) = a.positionals.first() {
+        return Err(format!("unexpected argument {p:?}").into());
+    }
+    let out = a.required("out")?;
+    let specs = a.all("operator");
+    if specs.is_empty() {
+        return Err("--operator NAME=KEY.pub is required (one per operator key)"
+            .to_string()
+            .into());
+    }
+    let mut entries = Vec::new();
+    let mut pubs: Vec<&str> = Vec::new();
+    for spec in specs {
+        let (name, path) = spec
+            .split_once('=')
+            .ok_or_else(|| format!("--operator {spec:?}: expected NAME=KEY.pub"))?;
+        let keys = verifying_keys_from_public_files(&[Path::new(path)])?;
+        let vk = keys
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("{path}: no key"))?;
+        entries.push((name.to_string(), vk));
+        pubs.push(path);
+    }
+    distinct_paths(&[out], &pubs)?;
+    let quorum = match a.u64_opt("motion-quorum")? {
+        None => 1,
+        Some(n) => usize::try_from(n).map_err(|_| "--motion-quorum is too large".to_string())?,
+    };
+    let trust = OperatorTrust::new(entries, quorum)?;
+    write_file(out, &trust.to_text(), a.switch("force"))?;
+    eprintln!(
+        "wrote operators trust list {out}: {} key(s), {} operator(s), motion quorum {}; keep \
+         it where only the security officer can write it (lock refuses it if group/others can)",
+        specs.len(),
+        trust.operators().len(),
+        trust.motion_quorum()
     );
     Ok(())
 }
