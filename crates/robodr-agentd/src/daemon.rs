@@ -69,6 +69,19 @@
 //! verdict is a recorded *would-have* (`enforcing: false` in the black box),
 //! never an output. Enforcement belongs in a gateway on the command path.
 //!
+//! # Safety state
+//!
+//! Every plan is graded by the robot's safety state. With a `safety_feed`
+//! ([`crate::safety`]) it is re-evaluated before each deviation is
+//! planned and on every tick (so staleness is noticed on a quiet bus):
+//! each datagram first goes through the pipeline (which updates the
+//! binding table), then through the feed's passive tap, so an e-stop
+//! sample grades the motion commands of the same datagram. Every change is
+//! a `robodr.safety_state_transition` note in the black box, the current
+//! view is `safety_feed` in `status.json`, and the feed's findings
+//! (untrusted writer, undecodable or unmapped value) go through the agent
+//! like the pipeline's. Without a feed, `context.safety_state` is used.
+//!
 //! # What the daemon does with a plan
 //!
 //! Nothing. The agent's executor is the default `NoopExecutor`: plans
@@ -90,7 +103,7 @@ use robodr_blackbox::{Clock, RecorderConfig, SystemClock, TimeSource, Timestamp}
 use robodr_events::profile::Profile;
 use robodr_firewall::FailBehaviour;
 use robodr_ocsf::{AttestationStatus, PlatformFamily as OcsfPlatform, RobotInfo, Subject};
-use robodr_responder::OperationalContext;
+use robodr_responder::{OperationalContext, SafetyState};
 use robodr_ros2_pipeline::config::CaptureInput;
 use robodr_ros2_pipeline::{
     sanitize, Finding, MotionSample, Pipeline, PipelineStats, ProfileStatus, SharedHealth,
@@ -103,6 +116,7 @@ use crate::health::{
 };
 use crate::input::{self, Feed, InputStats, Msg, Payload, QueueBudget};
 use crate::notify::{monotonic_ms, Notifier};
+use crate::safety::{FeedFinding, FeedStatus, SafetyFeed, Transition};
 use crate::spool::{Spool, SpoolError, SpoolStats};
 
 /// Most queued items handled between two clock checks.
@@ -255,6 +269,11 @@ struct InputStatus<'a> {
 
 #[derive(Serialize)]
 struct Status<'a> {
+    /// The safety state plans are graded by right now.
+    safety_state: SafetyState,
+    /// The live feed's view (absent without `safety_feed`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    safety_feed: Option<FeedStatus>,
     kind: &'static str,
     robot_id: &'a str,
     wall_ms: u64,
@@ -314,6 +333,8 @@ struct Daemon<'a> {
     /// Every sender of the queue is gone (all input threads exited).
     inputs_gone: bool,
     notifier: Notifier,
+    /// The live safety-state feed, if configured.
+    feed: Option<SafetyFeed>,
     health: HealthMonitor,
     last_state: HealthState,
     stats: DaemonStats,
@@ -559,6 +580,24 @@ impl<'a> Daemon<'a> {
                 }
             }
         }
+        let feed = r.safety_feed.clone().map(SafetyFeed::new);
+        if let Some(sock) = r.safety_feed.as_ref().and_then(|f| f.socket.as_ref()) {
+            let l = input::bind_event_socket(&sock.path).map_err(|e| {
+                DaemonError::Io(format!("safety socket {}: {e}", sock.path.display()))
+            })?;
+            let input_feed = add(
+                format!("safety:{}", sock.path.display()),
+                InputKind::Events,
+                true,
+            );
+            let (stop, max) = (stop_inputs.clone(), sock.max_connections);
+            spawns.push((
+                input_feed,
+                Box::new(move |f| {
+                    input::run_unix_listener_with(l, max, stop, f, input::parse_safety_line)
+                }),
+            ));
+        }
         drop(tx);
         for (i, (feed, body)) in spawns.into_iter().enumerate() {
             let h = std::thread::Builder::new()
@@ -592,6 +631,7 @@ impl<'a> Daemon<'a> {
             budget,
             inputs_gone: false,
             notifier,
+            feed,
             health,
             last_state: HealthState {
                 state: State::Unknown,
@@ -610,6 +650,7 @@ impl<'a> Daemon<'a> {
             inputs: Vec<&'b str>,
             safety_state: robodr_responder::SafetyState,
         }
+        let initial_safety = d.safety();
         let note = StartNote {
             kind: "robodr.agentd_start",
             version: env!("CARGO_PKG_VERSION"),
@@ -617,7 +658,7 @@ impl<'a> Daemon<'a> {
             profile_model: &d.pipeline.profile().model,
             profile_status: d.pipeline.status().as_str(),
             inputs: d.inputs.iter().map(|i| i.name.as_str()).collect(),
-            safety_state: cfg.context.safety_state,
+            safety_state: initial_safety,
         };
         let now = d.clock.now();
         if let Err(e) = d.agent.record_note(now, "start note", &note, true) {
@@ -745,15 +786,36 @@ impl<'a> Daemon<'a> {
                 self.stats.datagrams += 1;
                 let capture_ns = self.clock.now().mono_ns;
                 let out = self.pipeline.process_datagram_with_motion(&d, capture_ns);
+                // The feed's tap after the pipeline (binding updated from
+                // this datagram), before anything of it is planned.
+                let now_ms = self.now_ms();
+                let fed = match self.feed.as_mut() {
+                    Some(f) => f.observe_datagram(
+                        &d,
+                        self.pipeline.profile(),
+                        self.pipeline.binding(),
+                        now_ms,
+                    ),
+                    None => Vec::new(),
+                };
+                self.feed_findings(fed);
                 self.sensor_findings(out.findings);
                 for s in out.motion {
                     self.motion_sample(s);
                 }
             }
+            Payload::Safety(report) => {
+                let now_ms = self.now_ms();
+                if let Some(f) = self.feed.as_mut() {
+                    f.observe_report(report, now_ms);
+                }
+                // Record a transition now, not at the next plan.
+                self.safety();
+            }
             Payload::Event(ev) => {
                 self.stats.events += 1;
+                let safety = self.safety();
                 let now = self.clock.now();
-                let safety = self.r.config.context.safety_state;
                 let outs = self.agent.handle(now, &ev, safety);
                 for o in outs {
                     self.emit(o);
@@ -766,8 +828,8 @@ impl<'a> Daemon<'a> {
     /// motion monitor) -> spool.
     fn motion_sample(&mut self, s: MotionSample) {
         self.stats.motion_events += 1;
+        let safety = self.safety();
         let now = self.clock.now();
-        let safety = self.r.config.context.safety_state;
         let outs = self.agent.handle(now, &s.event, safety);
         for o in outs {
             self.emit(o);
@@ -776,11 +838,83 @@ impl<'a> Daemon<'a> {
 
     /// Pipeline findings -> agent -> spool.
     fn sensor_findings(&mut self, found: Vec<Finding>) {
-        let safety = self.r.config.context.safety_state;
         for f in found {
+            let safety = self.safety();
             let now = self.clock.now();
             let subject = Subject {
                 src_ip: Some(f.src_ip.clone()),
+                ..Subject::default()
+            };
+            let source = format!("src:{}", f.src_ip);
+            let o = self.agent.handle_external(
+                now,
+                Detector::Sensor,
+                &source,
+                subject,
+                f.deviation,
+                safety,
+            );
+            self.emit(o);
+        }
+    }
+
+    /// The safety state to grade a plan by now: the feed's (re-evaluated,
+    /// a change recorded) or the configured one.
+    fn safety(&mut self) -> SafetyState {
+        let now_ms = self.now_ms();
+        let Some(feed) = self.feed.as_mut() else {
+            return self.r.config.context.safety_state;
+        };
+        let transition = feed.evaluate(now_ms);
+        let state = feed.state();
+        if let Some(t) = transition {
+            self.transition_note(&t);
+        }
+        state
+    }
+
+    fn transition_note(&mut self, t: &Transition) {
+        let _ = writeln!(
+            self.log,
+            "robodr-agentd: safety state {} -> {}{}",
+            t.from.as_str(),
+            t.to.as_str(),
+            if t.conflict {
+                " (sources disagree: most conservative taken)"
+            } else {
+                ""
+            }
+        );
+        // Engaged / unknown ends are durable evidence (fsync).
+        let critical = [t.from, t.to].iter().any(|c| {
+            matches!(c, crate::safety::Claim::State(s)
+                if s.safety_system_engaged() || *s == SafetyState::Unknown)
+        });
+        let now = self.clock.now();
+        if self
+            .agent
+            .record_note(now, "safety transition", t, critical)
+            .is_err()
+        {
+            self.stats.note_errors += 1;
+        }
+    }
+
+    /// Safety-feed findings -> agent -> spool.
+    fn feed_findings(&mut self, found: Vec<FeedFinding>) {
+        for f in found {
+            let _ = writeln!(
+                self.log,
+                "robodr-agentd: safety feed: {}: {}",
+                f.deviation.rule_str(),
+                sanitize(&f.deviation.detail)
+            );
+            let safety = self.safety();
+            let now = self.clock.now();
+            let subject = Subject {
+                src_ip: Some(f.src_ip.clone()),
+                topic: Some(f.topic.clone()),
+                participant_guid: f.writer.get(..24).map(str::to_string),
                 ..Subject::default()
             };
             let source = format!("src:{}", f.src_ip);
@@ -845,8 +979,8 @@ impl<'a> Daemon<'a> {
             topic: issue.input().map(str::to_string),
             ..Subject::default()
         };
+        let safety = self.safety();
         let now = self.clock.now();
-        let safety = self.r.config.context.safety_state;
         let o =
             self.agent
                 .handle_external(now, Detector::SelfHealth, &source, subject, dev, safety);
@@ -906,6 +1040,8 @@ impl<'a> Daemon<'a> {
 
     fn tick(&mut self, delay_ms: u64) {
         self.stats.ticks += 1;
+        // Staleness is noticed (and recorded) even on a quiet bus.
+        self.safety();
         let mut found = self.pipeline.tick();
         if let Some(h) = self.capture_health.latest() {
             found.extend(self.pipeline.capture_findings(&h));
@@ -1003,7 +1139,11 @@ impl<'a> Daemon<'a> {
 
     fn write_status(&mut self, running: bool) {
         let wall_ms = self.clock.now().wall_ns / 1_000_000;
+        let safety_state = self.safety();
+        let now_ms = self.now_ms();
         let status = Status {
+            safety_state,
+            safety_feed: self.feed.as_ref().map(|f| f.status(now_ms)),
             kind: "robodr.agentd_status",
             robot_id: &self.r.config.robot.id,
             wall_ms,

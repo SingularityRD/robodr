@@ -40,7 +40,8 @@ must be absolute.
 | `blackbox` | `dir`, `key_file`, optional `key_id`, optional `boot_id` (default `/proc/sys/kernel/random/boot_id`) |
 | `spool` | `dir`, `max_bytes` (default 64 MiB), `max_files` (default 10000) |
 | `event_inputs` | `[{"kind":"stdin"}]` and/or `[{"kind":"unix_socket","path":...,"max_connections":4}]` |
-| `context` | `safety_state` (default `unknown`), `control`, `phase`, `connectivity`, `operator_present` |
+| `context` | `safety_state` (default `unknown`; must stay `unknown` when `safety_feed` is set), `control`, `phase`, `connectivity`, `operator_present` |
+| `safety_feed` | Optional. The live safety-state feed (see below): `stale_after_ms` (default 1000), `topics` (ROS topics decoded from the captured bus) and/or `socket` (a local safety-PLC gateway socket). |
 | `firewall` | Optional. `max_angular` (rad/s for every profiled Twist channel) and `allow` (writer GUIDs per channel). Runs **recording-only** (see below). |
 | `motion_monitor` | Optional. `config_path` (strict `MonitorConfig`; default: the UGV defaults on the profile's motion channels) and `feedback_sources`. Feedback sources that are ROS topic names (`/odom`) are also decoded from the bus. |
 | `sensor.motion` | Optional. The live motion decode path: `enabled` (default true), `feedback_topics` (e.g. `["/odom"]`), `max_writers`, `max_samples_per_datagram` (`evaluate_commands` is accepted but the daemon always lets the agent evaluate). Unknown keys are refused. |
@@ -102,6 +103,68 @@ recorded (never executed, as before).
 `status.json` and the heartbeat carry `daemon.motion_events` and
 `pipeline.motion` counters (decoded commands / feedback, undecodable,
 unattributed, known writers, ...).
+
+## Live safety state
+
+Every plan is graded by the robot's safety state (`idle`, `moving_slow`,
+`moving_fast`, `collaborative_human_nearby`, `estop_active`,
+`safe_state_active`, `unknown`). Without `safety_feed` it is the static
+`context.safety_state`. With it, `src/safety.rs` reads it live and **only
+reads**: nothing is published, subscribed or sent to the robot or its
+safety system.
+
+```json
+"safety_feed": {
+  "stale_after_ms": 1000,
+  "topics": [
+    { "topic": "/estop", "type": "std_msgs/msg/Bool",
+      "values": { "true": "estop_active", "false": "none" } },
+    { "topic": "/robot_mode", "type": "std_msgs/msg/UInt8",
+      "values": { "0": "idle", "1": "moving_slow", "4": "safe_state_active" } },
+    { "topic": "/mode_name", "type": "std_msgs/msg/String",
+      "values": { "AUTO": "none", "PROTECTIVE_STOP": "safe_state_active" } },
+    { "topic": "/odom", "type": "nav_msgs/msg/Odometry",
+      "motion": { "moving_above": 0.05, "fast_above": 1.0, "hysteresis": 0.02 } }
+  ],
+  "socket": { "path": "/run/robodr/safety.sock", "max_connections": 2 }
+}
+```
+
+- **Topics** are decoded from RTPS user DATA in the captured traffic
+  (needs `sensor.capture`), by the type SEDP announced, with
+  `robodr-cdr`'s `std_msgs` decoders (`Bool`, `UInt8`, `String` bounded to
+  256 bytes) or its `Odometry` decoder. A value maps to a state or to
+  `none` ("says nothing", e.g. e-stop released). A value the mapping does
+  not list reads `unknown` (`robot.safety_state.unmapped_value`, Low).
+  Odometry gives `idle` / `moving_slow` / `moving_fast` from
+  `‖twist.linear‖` (and optionally `angular_moving_above`), with
+  hysteresis; a non-finite speed reads `unknown`.
+- **Socket**: JSON lines `{"state":"estop_active"}` (strict) from a local
+  gateway; created mode 0600 like the event socket. Malformed lines are
+  counted as malformed input, never applied.
+- **Freshness**: a source with no reading younger than its
+  `stale_after_ms` reads `unknown`. Publishers must publish periodically; a
+  latched, publish-on-change topic reads `unknown` between changes.
+- **Conflicts**: the most conservative claim of all sources (and of all
+  writers of one source) wins: `estop_active` > `safe_state_active` >
+  `unknown` > `collaborative_human_nearby` > `moving_fast` > `moving_slow`
+  > `idle`. The planner caps plans at Record while the safety system is
+  engaged and gates every motion-affecting step on human approval when
+  `unknown`, so no source, and no stale source, can make RoboDR act more
+  than the others allow. If nothing claims a state the result is `unknown`.
+- **Spoofing**: a bus sample is used only if its writer was announced via
+  SEDP unambiguously with the configured type, its participant is in the
+  profile, the topic is a profiled writer topic, it matches the optional
+  `writers` allowlist, and its datagram's IP is not outside the
+  participant's binding. Otherwise it is ignored and reported once per
+  writer and reason (`robot.safety_state.untrusted_source`, High). An
+  ignored sample never refreshes a source, so a spoofer can at most make
+  it go stale (`unknown`). An undecodable trusted sample reads `unknown`
+  (`robot.safety_state.undecodable_sample`, Medium).
+- **Recording**: each change of the combined state is a
+  `robodr.safety_state_transition` note in the black box (from, to,
+  whether fresh sources disagreed, each source's claim, freshness and
+  age); `status.json` carries `safety_state` and `safety_feed`.
 
 ## Outputs
 
@@ -207,6 +270,7 @@ request.
 | `tests/motion_live.rs` | A synthetic pcap with SEDP plus CDR `Twist` on `rt/cmd_vel` (0.4 m/s, then 2.5 m/s against a 1.0 m/s envelope) and CDR `Odometry` on `rt/odom`: three motion events reach the agent, exactly one Critical `robot.motion.linear_over_envelope` finding is spooled, the black box holds the decoded command (with its writer GUID) and a firewall verdict with `enforcing: false`, and verifies. A garbage payload on `rt/cmd_vel` yields one Medium `robot.motion.undecodable_sample` and the next good command still flows. `sensor.motion` keys are strict. |
 | `tests/review_regressions.rs` | Fourth-review fixes: no busy loop once every input ended (thread CPU < 25% of wall, state `unknown`); a malformed-only stream is never `ok` (`input_silent` + `input_malformed`); `..` and a late symlink cannot alias spool and black box; a live event socket is not stolen and cleanup checks the inode; the queue's byte budget; `READY`/`WATCHDOG`/`STATUS`/`STOPPING` over a notify socket and stale or other-boot `status.json` read as `unknown`; hostile event lines do not panic. |
 | `tests/agent_api.rs` | `Agent::handle_external`: sensor deviations get real plans when enforcing. Self-health and observe-mode deviations never get an action plan. |
+| `tests/safety_feed.rs` | The live safety feed: Bool / UInt8 / String / Odometry mappings (with hysteresis, non-finite speed), staleness to `unknown`, conflicts to the most conservative state, unprofiled / IP-spoofed / wrong-type / non-allowlisted writers ignored with a High finding, undecodable and unmapped values read `unknown`. End to end through the daemon: an e-stop on the bus turns the plan for a Critical over-envelope command into Record (`request_safe_state` with the e-stop released); a rogue writer's "release" is reported and ignored; the PLC socket feed grades plans, goes stale to `unknown` (approval-gated plan) and every transition is in the black box. |
 | unit tests | Config strictness and key file checks, spool atomicity and bounds, the line reader (CRLF, overlong lines, timeouts, a full queue), the unix socket, and the health state machine. |
 
 ## Limits (honest)
@@ -227,9 +291,16 @@ request.
   (black-box default), so a flood of critical deviations is limited by
   storage latency. Under such a flood the queue drops items (counted and
   reported) instead of growing.
-- **Safety state is static.** It is configuration; there is no live feed
-  from the platform yet, so plans use the configured value (default
-  `unknown`).
+- **Safety state: live feed only on synthetic traffic.** The feed was run
+  against hand-built RTPS / CDR and a local socket, not a real RMW, safety
+  PLC or e-stop. Its discovery of safety writers is parsed a second time
+  (own reassembler and user-DATA walker), because the pipeline's motion
+  path keeps only motion / feedback topics. A safety writer announced
+  before the daemon started is unknown until it re-announces, so its
+  source reads `unknown`. The rest of the operational context (`control`,
+  `phase`, `connectivity`, `operator_present`) is still configuration.
+  The new rule ids are not in `robodr-ocsf`'s rule catalog yet (generic
+  title / description in findings).
 - **Plans are never executed.** The agent's executor is `NoopExecutor`.
   Dispositions are recorded and reported only.
 - **No exporter is included.** The rename-to-`acked/` acknowledgement is the

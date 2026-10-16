@@ -15,6 +15,13 @@ topics: XCDR1 / XCDR2 serialized payloads of
 Dependencies: `std` and `robodr-events` only. Read-only: nothing is encoded or
 sent.
 
+Separately (not motion messages, not in `MessageKind` / `Registry`):
+`std_msgs::msg::dds_::Bool_`, `UInt8_` and `String_` (`std_msgs` module,
+`decode_std` / `decode_std_by_type_name` -> `StdValue`), for robots that
+publish an e-stop flag or an operating mode. A boolean octet other than 0
+or 1 is rejected (`StdDecodeError::InvalidBool`); strings obey
+`Limits::max_string_len`. `robodr-agentd`'s safety-state feed uses them.
+
 ## API
 
 ```rust
