@@ -85,7 +85,7 @@ fn reviewer_poc_interleaved_fakes_no_longer_hide_critical_uncommanded_motion() {
         Evidence::UncommandedMotion { measured, .. } => assert!(measured >= 0.36 - 1e-9),
         e => panic!("unexpected evidence {e:?}"),
     }
-    assert_eq!(f.publisher, Some(0x1111));
+    assert_eq!(f.publisher, Some(PublisherKey::Id(0x1111)));
     // Detected about as fast as without the injector.
     let c = critical_uncommanded(&ctl).unwrap();
     assert!(f.t_ns <= c.t_ns + 100 * MS, "{} vs {}", f.t_ns, c.t_ns);
@@ -236,11 +236,13 @@ fn honest_run(seed: u64, sigma: f64, q: f64, period_ms: u64) -> Vec<Finding> {
 #[test]
 fn honest_gaussian_noise_and_quantisation_raise_nothing() {
     // sigma up to 0.02 m/s (abs_tol 0.10 is 5 sigma), quantisation up to
-    // 0.01 m/s, 10 Hz .. 200 Hz. (Noise-free quantised output at constant
-    // speed repeats bit-identical values and is a documented frozen-check
-    // tuning case, not covered here.)
+    // 0.01 m/s, 10 Hz .. 200 Hz. Noise-free quantised output repeats
+    // bit-identical values at a steady cruise; the frozen check only judges
+    // runs during which the expectation changed, so it stays quiet too.
     for (i, &(sigma, q)) in [
         (0.0, 0.0),
+        (0.0, 0.005),
+        (0.0, 0.01),
         (0.005, 0.0),
         (0.01, 0.0),
         (0.02, 0.0),

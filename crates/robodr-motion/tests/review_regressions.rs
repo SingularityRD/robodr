@@ -329,7 +329,7 @@ fn interleaved_fake_feedback_distinct_publisher_is_isolated_and_flagged() {
     assert_eq!(u.severity, Severity::Critical);
     assert_eq!(
         u.publisher,
-        Some(0x1111),
+        Some(PublisherKey::Id(0x1111)),
         "attributed to the real publisher"
     );
     let mp: Vec<_> = f
@@ -390,8 +390,16 @@ fn publisher_flood_is_bounded_and_does_not_panic() {
         );
     }
     assert!(m.stats().publisher_overflow > 900);
+    // Flagged once as interleaving and once as overflow.
     assert_eq!(
         count(&out, rules::MULTIPLE_FEEDBACK_PUBLISHERS),
+        2,
+        "{out:#?}"
+    );
+    assert_eq!(
+        out.iter()
+            .filter(|x| matches!(x.evidence, Evidence::PublisherOverflow { .. }))
+            .count(),
         1,
         "{out:#?}"
     );

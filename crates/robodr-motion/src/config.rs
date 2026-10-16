@@ -108,9 +108,10 @@ impl AxisModel {
 /// Good samples interleaved between bad ones therefore cannot reset the run
 /// (a second publisher injecting "all is well" values between real ones only
 /// dilutes the fraction). Samples with no basis to judge (NaN, warm-up) are
-/// neither good nor bad. For the `divergence` and `uncommanded` rules, good
-/// samples within [`MonitorConfig::episode_hold_ns`] of the latest bad one
-/// are neutral as well, so they cannot dilute at all.
+/// neither good nor bad. For the `divergence`, `uncommanded` and
+/// `cross_sensor` rules, good samples within
+/// [`MonitorConfig::episode_hold_ns`] of the latest bad one are neutral as
+/// well, so they cannot dilute at all.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Persistence {
@@ -139,7 +140,7 @@ impl Default for Persistence {
 
 /// Default `min_bad_fraction`. On its own an injector sending four "at
 /// rest" samples per real one would stay under it; `episode_hold_ns` closes
-/// that for the command-model rules.
+/// that for the command-model and cross-sensor rules.
 const DEFAULT_BAD_FRACTION: f64 = 0.25;
 
 /// Which checks apply to one feedback source, and how far it is trusted.
@@ -288,6 +289,16 @@ pub struct MonitorConfig {
     /// Frozen-feedback: identical consecutive samples while moving.
     pub frozen_min_samples: u32,
     pub frozen_min_duration_ns: u64,
+    /// A frozen run fires only once the expected motion changed during it:
+    /// the band midpoint on some reported axis moved by at least
+    /// `frozen_change_factor * abs_tol` (the robot should have sped up,
+    /// slowed down or turned, which a live sensor would show). A steady
+    /// cruise on a noise-free quantised sensor repeats values legitimately
+    /// and is not flagged; a stream frozen at steady cruise is caught when
+    /// the command next changes (and by the stamp / cross-sensor checks).
+    /// `0` restores the old rule (any identical run while moving). Must be
+    /// finite and >= 0.
+    pub frozen_change_factor: f64,
     /// Stamp more than this ahead of the observer clock = "future".
     pub max_future_skew_ns: u64,
     /// Stamp more than this behind the observer clock = "late" (replay with
@@ -304,8 +315,8 @@ pub struct MonitorConfig {
     pub nan_rate_high: f64,
     /// Samples (1..=64) the NaN-rate window must hold before it is judged.
     pub nan_rate_min_samples: u32,
-    /// Hold for the command-model episodes (uncommanded motion,
-    /// divergence): a good sample within this long (observer clock) of the
+    /// Hold for the command-model and cross-sensor episodes (uncommanded
+    /// motion, divergence, cross-sensor disagreement): a good sample within this long (observer clock) of the
     /// latest bad sample of an open episode is neutral, neither diluting it
     /// nor counting toward `clear_samples`. Episodes are then judged on the
     /// stream's worst sample per hold window, so interleaving any number of
@@ -366,6 +377,7 @@ impl Default for MonitorConfig {
             cross_max_skew_ns: 100 * MS,
             frozen_min_samples: 20,
             frozen_min_duration_ns: 500 * MS,
+            frozen_change_factor: 1.0,
             max_future_skew_ns: 50 * MS,
             max_stamp_age_ns: Some(1_000 * MS),
             rearm_clean_samples: 10,
@@ -466,6 +478,7 @@ impl MonitorConfig {
             nonneg("cross_rel_tol", m.cross_rel_tol)?;
         }
         nonneg("rest_command_eps", self.rest_command_eps)?;
+        nonneg("frozen_change_factor", self.frozen_change_factor)?;
         if self.latency_min_ns > self.latency_max_ns {
             return Err(ConfigError::LatencyWindow);
         }
@@ -615,6 +628,20 @@ mod tests {
         assert_eq!(c.validate(), Err(ConfigError::Zero("jump_window_ns")));
         let mut c = MonitorConfig::default();
         c.jump_min_count = 0; // disables the check: valid
+        assert_eq!(c.validate(), Ok(()));
+
+        let mut c = MonitorConfig::default();
+        c.frozen_change_factor = f64::NAN;
+        assert_eq!(
+            c.validate(),
+            Err(ConfigError::NonFinite("frozen_change_factor"))
+        );
+        c.frozen_change_factor = -1.0;
+        assert_eq!(
+            c.validate(),
+            Err(ConfigError::Negative("frozen_change_factor"))
+        );
+        c.frozen_change_factor = 0.0; // legacy rule: valid
         assert_eq!(c.validate(), Ok(()));
 
         let mut c = MonitorConfig::default();

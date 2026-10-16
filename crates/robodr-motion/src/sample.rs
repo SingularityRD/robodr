@@ -247,6 +247,86 @@ impl FeedbackSample {
 /// [`crate::ConsistencyMonitor::on_feedback`].
 pub const PUBLISHER_UNKNOWN: u32 = 0;
 
+/// Identity of a feedback publisher, as the monitor keys its per-publisher
+/// state.
+///
+/// * [`PublisherKey::Guid`] carries the **full 16-byte DDS writer GUID**
+///   (12-byte prefix + 4-byte entity id). Two keys are the same publisher
+///   only if all 16 bytes match: an adversary choosing its own GUID cannot
+///   collide with the real writer (it would have to *be* the real writer's
+///   GUID, which the multiple-publishers check then sees as interleaving).
+/// * [`PublisherKey::Id`] is a caller-chosen `u32` (an interned dense id,
+///   or the legacy [`publisher_id`] hash). It lives in a separate namespace:
+///   an `Id` never equals a `Guid`.
+///
+/// The monitor stores keys inline in a fixed table (no allocation, see
+/// [`crate::ConsistencyMonitor::on_feedback_key`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublisherKey {
+    /// Caller-chosen id ([`PUBLISHER_UNKNOWN`] = unknown / single publisher).
+    Id(u32),
+    /// Full 16-byte DDS writer GUID.
+    Guid([u8; 16]),
+}
+
+impl PublisherKey {
+    /// "Unknown / single publisher" (what
+    /// [`crate::ConsistencyMonitor::on_feedback`] uses).
+    pub const UNKNOWN: PublisherKey = PublisherKey::Id(PUBLISHER_UNKNOWN);
+
+    /// Parse a textual GUID: exactly 32 hex digits (either case), optionally
+    /// separated by `.`, `:`, `-`, `_` or spaces (e.g. the 32-character
+    /// lowercase form `robodr-rtps` emits, or `01.0f.aa...`). `None` for
+    /// anything else (wrong length, other characters). Allocation-free.
+    pub fn from_guid_str(s: &str) -> Option<PublisherKey> {
+        let mut out = [0u8; 16];
+        let mut n = 0usize;
+        for c in s.bytes() {
+            let d = match c {
+                b'0'..=b'9' => c - b'0',
+                b'a'..=b'f' => c - b'a' + 10,
+                b'A'..=b'F' => c - b'A' + 10,
+                b'.' | b':' | b'-' | b'_' | b' ' => continue,
+                _ => return None,
+            };
+            if n >= 32 {
+                return None;
+            }
+            out[n / 2] = (out[n / 2] << 4) | d;
+            n += 1;
+        }
+        (n == 32).then_some(PublisherKey::Guid(out))
+    }
+}
+
+impl From<u32> for PublisherKey {
+    fn from(id: u32) -> Self {
+        PublisherKey::Id(id)
+    }
+}
+
+impl From<[u8; 16]> for PublisherKey {
+    fn from(guid: [u8; 16]) -> Self {
+        PublisherKey::Guid(guid)
+    }
+}
+
+impl std::fmt::Display for PublisherKey {
+    /// `Id`: `0x%08x`; `Guid`: 32 lowercase hex digits.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PublisherKey::Id(id) => write!(f, "{id:#010x}"),
+            PublisherKey::Guid(g) => {
+                for b in g {
+                    write!(f, "{b:02x}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Convenience publisher id from a publisher identity (e.g. the 16-byte DDS
 /// writer GUID, or its textual form): 32-bit FNV-1a, never
 /// [`PUBLISHER_UNKNOWN`].
@@ -254,8 +334,9 @@ pub const PUBLISHER_UNKNOWN: u32 = 0;
 /// A 32-bit hash can be collided on purpose by an attacker who controls
 /// their GUID prefix; two colliding publishers share one state slot and lose
 /// the per-publisher separation (the time-windowed persistence still
-/// applies). Prefer interning: the sensor keeps its own GUID -> dense `u32`
-/// table and passes those ids.
+/// applies). **Prefer [`PublisherKey::Guid`]** (full GUID, collision-free)
+/// via [`crate::ConsistencyMonitor::on_feedback_guid`]; this hash is kept
+/// for backward compatibility.
 pub fn publisher_id(identity: &[u8]) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
     for &b in identity {
@@ -336,6 +417,46 @@ mod tests {
         assert_eq!(c.axis(Axis::Angular), None);
         assert_eq!(c.axis(Axis::Joint), None);
         assert!(!c.direction_known);
+    }
+
+    #[test]
+    fn guid_parsing() {
+        let g = PublisherKey::from_guid_str("010f0a0b0c0d0e0f1011121300000103").unwrap();
+        assert_eq!(
+            g,
+            PublisherKey::Guid([
+                0x01, 0x0f, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0, 0, 1, 3
+            ])
+        );
+        assert_eq!(g.to_string(), "010f0a0b0c0d0e0f1011121300000103");
+        assert_eq!(
+            PublisherKey::from_guid_str("01.0F.0a.0b.0c.0d.0e.0f.10.11.12.13.00.00.01.03"),
+            Some(g)
+        );
+        assert_eq!(
+            PublisherKey::from_guid_str("010f0a0b-0c0d0e0f:10111213 00000103"),
+            Some(g)
+        );
+        for bad in [
+            "",
+            "010f",
+            "010f0a0b0c0d0e0f101112130000010",   // 31 digits
+            "010f0a0b0c0d0e0f10111213000001030", // 33 digits
+            "010f0a0b0c0d0e0f1011121300000g03",
+            "010f0a0b0c0d0e0f1011121300000103\0",
+            "\u{e9}10f0a0b0c0d0e0f1011121300000103",
+        ] {
+            assert_eq!(PublisherKey::from_guid_str(bad), None, "{bad:?}");
+        }
+        // Namespaces never collide, and a one-byte difference is distinct.
+        assert_ne!(PublisherKey::Id(1), PublisherKey::Guid([0; 16]));
+        let mut h = [0u8; 16];
+        h[15] = 1;
+        assert_ne!(PublisherKey::Guid(h), PublisherKey::Guid([0; 16]));
+        assert_eq!(PublisherKey::Id(0x11).to_string(), "0x00000011");
+        assert_eq!(PublisherKey::UNKNOWN, PublisherKey::Id(PUBLISHER_UNKNOWN));
+        let j = serde_json::to_string(&g).unwrap();
+        assert_eq!(serde_json::from_str::<PublisherKey>(&j).unwrap(), g);
     }
 
     #[test]

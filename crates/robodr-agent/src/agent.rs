@@ -103,10 +103,13 @@
 //! `compare_magnitudes`); otherwise its linear axis is withheld and counted
 //! in [`AgentStats::feedback_magnitude_dropped`] (a magnitude against a
 //! signed reversing command would be a false "moving against its command").
-//! `publisher_guid` is interned to a dense id (bounded by
-//! [`MAX_INTERNED_PUBLISHERS`]) and passed to `on_feedback_from`, so an
-//! injected second publisher on a feedback topic is seen; samples without
-//! it use `on_feedback` (one shared slot).
+//! A `publisher_guid` that parses as a 16-byte GUID is passed whole to
+//! `on_feedback_guid` (compared exactly by the monitor, so an attacker
+//! cannot collide with the real writer by choosing its GUID); any other
+//! string is interned to a dense id (bounded by
+//! [`MAX_INTERNED_PUBLISHERS`]) and passed to `on_feedback_from`. Either
+//! way an injected second publisher on a feedback topic is seen; samples
+//! without a GUID use `on_feedback` (one shared slot).
 //!
 //! In the finding, commanded speeds are reported as magnitudes and a
 //! non-finite value is omitted (the findings contract accepts only finite,
@@ -622,11 +625,16 @@ impl Agent {
                         joint_speed_max: f.measured_joint_speed,
                     };
                     match f.publisher_guid.as_deref() {
-                        Some(g) => {
-                            let id = ms.publishers.intern(g, &mut self.stats);
-                            ms.monitor
-                                .on_feedback_from(mono, id, &sample, |x| hits.push(x));
-                        }
+                        Some(g) => match robodr_motion::PublisherKey::from_guid_str(g) {
+                            Some(key) => ms
+                                .monitor
+                                .on_feedback_key(mono, key, &sample, |x| hits.push(x)),
+                            None => {
+                                let id = ms.publishers.intern(g, &mut self.stats);
+                                ms.monitor
+                                    .on_feedback_from(mono, id, &sample, |x| hits.push(x));
+                            }
+                        },
                         None => ms.monitor.on_feedback(mono, &sample, |x| hits.push(x)),
                     }
                 }
