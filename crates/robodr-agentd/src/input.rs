@@ -7,6 +7,7 @@
 //! | SPDP multicast socket, from `sensor.listen_spdp` | `recv_from` with a read timeout | error / stop |
 //! | JSONL `RobotEvent`s on stdin | bounded line reader | EOF / error |
 //! | JSONL `RobotEvent`s on a unix socket | listener + one reader per connection | error / stop |
+//! | JSONL safety reports (`{"state":"estop_active"}`) on the `safety_feed` socket | same listener, [`parse_safety_line`] | error / stop |
 //!
 //! # Backpressure and memory bound
 //!
@@ -134,6 +135,26 @@ impl Drop for Charge {
 pub enum Payload {
     Datagram(Datagram),
     Event(Box<RobotEvent>),
+    /// A line of the safety-state socket (see [`crate::safety`]).
+    Safety(crate::safety::SafetyReport),
+}
+
+/// Turns one trimmed, non-empty, non-comment line into a payload, or says
+/// why it is malformed.
+pub type LineParser = fn(&str) -> Result<Payload, String>;
+
+/// [`LineParser`] of the event inputs: a `RobotEvent`.
+pub fn parse_event_line(t: &str) -> Result<Payload, String> {
+    serde_json::from_str::<RobotEvent>(t)
+        .map(|ev| Payload::Event(Box::new(ev)))
+        .map_err(|e| format!("not a RobotEvent: {e}"))
+}
+
+/// [`LineParser`] of the safety socket: a [`crate::safety::SafetyReport`].
+pub fn parse_safety_line(t: &str) -> Result<Payload, String> {
+    serde_json::from_str::<crate::safety::SafetyReport>(t)
+        .map(Payload::Safety)
+        .map_err(|e| format!("not a safety report: {e}"))
 }
 
 /// One queued item.
@@ -244,7 +265,7 @@ impl Feed {
     pub fn send(&self, payload: Payload) -> bool {
         let size = match &payload {
             Payload::Datagram(d) => d.payload.capacity().saturating_add(d.src_ip.capacity()),
-            Payload::Event(_) => EVENT_ESTIMATE_BYTES,
+            Payload::Event(_) | Payload::Safety(_) => EVENT_ESTIMATE_BYTES,
         };
         self.send_sized(payload, size)
     }
@@ -360,6 +381,16 @@ pub fn run_udp(sock: std::net::UdpSocket, stop: Arc<AtomicBool>, feed: Feed) {
 /// daemon going away or `stop` (checked whenever a read times out). Never
 /// buffers more than [`MAX_EVENT_LINE_BYTES`] + 1 bytes.
 pub fn read_event_lines<R: Read>(r: R, stop: &AtomicBool, feed: &Feed) -> io::Result<()> {
+    read_lines(r, stop, feed, parse_event_line)
+}
+
+/// [`read_event_lines`] with any [`LineParser`].
+pub fn read_lines<R: Read>(
+    r: R,
+    stop: &AtomicBool,
+    feed: &Feed,
+    parse: LineParser,
+) -> io::Result<()> {
     let mut reader = BufReader::with_capacity(16 * 1024, r);
     let mut buf: Vec<u8> = Vec::new();
     let mut discarding = false;
@@ -371,7 +402,7 @@ pub fn read_event_lines<R: Read>(r: R, stop: &AtomicBool, feed: &Feed) -> io::Re
         match (&mut reader).take(room).read_until(b'\n', &mut buf) {
             Ok(0) => {
                 // EOF (room is never 0: a full buffer is handled below).
-                if !discarding && !buf.is_empty() && !handle_line(&buf, feed) {
+                if !discarding && !buf.is_empty() && !handle_line(&buf, feed, parse) {
                     return Ok(());
                 }
                 return Ok(());
@@ -381,7 +412,7 @@ pub fn read_event_lines<R: Read>(r: R, stop: &AtomicBool, feed: &Feed) -> io::Re
                     buf.pop();
                     if discarding {
                         discarding = false;
-                    } else if !handle_line(&buf, feed) {
+                    } else if !handle_line(&buf, feed, parse) {
                         return Ok(());
                     }
                     buf.clear();
@@ -412,7 +443,7 @@ pub fn read_event_lines<R: Read>(r: R, stop: &AtomicBool, feed: &Feed) -> io::Re
 }
 
 /// Parse one line; `false` when the daemon is gone.
-fn handle_line(line: &[u8], feed: &Feed) -> bool {
+fn handle_line(line: &[u8], feed: &Feed, parse: LineParser) -> bool {
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     let Ok(text) = std::str::from_utf8(line) else {
         feed.malformed("line is not valid UTF-8");
@@ -422,10 +453,10 @@ fn handle_line(line: &[u8], feed: &Feed) -> bool {
     if t.is_empty() || t.starts_with('#') {
         return true;
     }
-    match serde_json::from_str::<RobotEvent>(t) {
-        Ok(ev) => feed.send_sized(Payload::Event(Box::new(ev)), line.len()),
+    match parse(t) {
+        Ok(p) => feed.send_sized(p, line.len()),
         Err(e) => {
-            feed.malformed(&format!("not a RobotEvent: {e}"));
+            feed.malformed(&e);
             true
         }
     }
@@ -529,6 +560,17 @@ pub fn run_unix_listener(
     stop: Arc<AtomicBool>,
     feed: Feed,
 ) {
+    run_unix_listener_with(sock, max_connections, stop, feed, parse_event_line);
+}
+
+/// [`run_unix_listener`] with any [`LineParser`] (the safety socket).
+pub fn run_unix_listener_with(
+    sock: EventSocket,
+    max_connections: usize,
+    stop: Arc<AtomicBool>,
+    feed: Feed,
+    parse: LineParser,
+) {
     let listener = &sock.listener;
     let active = Arc::new(AtomicUsize::new(0));
     let mut readers: Vec<JoinHandle<()>> = Vec::new();
@@ -548,7 +590,7 @@ pub fn run_unix_listener(
                 let spawned = std::thread::Builder::new()
                     .name("agentd-sock-conn".into())
                     .spawn(move || {
-                        serve_connection(conn, &c_stop, &c_feed);
+                        serve_connection(conn, &c_stop, &c_feed, parse);
                         c_active.fetch_sub(1, Ordering::SeqCst);
                     });
                 match spawned {
@@ -581,13 +623,13 @@ pub fn run_unix_listener(
     feed.end(None);
 }
 
-fn serve_connection(conn: UnixStream, stop: &AtomicBool, feed: &Feed) {
+fn serve_connection(conn: UnixStream, stop: &AtomicBool, feed: &Feed, parse: LineParser) {
     // The listener is non-blocking; accepted sockets inherit nothing on
     // Linux, but be explicit.
     if conn.set_nonblocking(false).is_err() || conn.set_read_timeout(Some(SOCKET_POLL)).is_err() {
         return;
     }
-    if let Err(e) = read_event_lines(conn, stop, feed) {
+    if let Err(e) = read_lines(conn, stop, feed, parse) {
         feed.malformed(&format!("connection error: {e}"));
     }
 }
@@ -738,6 +780,31 @@ mod tests {
         assert!(st.ended.load(Ordering::SeqCst));
         assert!(!path.exists(), "socket removed at stop");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn safety_lines_are_parsed_strictly() {
+        let (f, rx, st) = feed(16);
+        let input = "{\"state\":\"estop_active\"}\n{\"state\":\"none\"}\n# c\n\
+                     {\"kind\":\"motion_command\",\"channel\":\"/c\"}\n{\"state\":\"idle\"}\n";
+        read_lines(
+            input.as_bytes(),
+            &AtomicBool::new(false),
+            &f,
+            parse_safety_line,
+        )
+        .unwrap();
+        let got: Vec<_> = rx
+            .try_iter()
+            .filter_map(|m| match m.payload {
+                Payload::Safety(r) => Some(r.state),
+                _ => None,
+            })
+            .collect();
+        use robodr_responder::SafetyState as S;
+        assert_eq!(got, vec![S::EStopActive, S::Idle]);
+        assert_eq!(st.malformed.load(Ordering::Relaxed), 2);
+        assert!(st.last_malformed().unwrap().contains("safety report"));
     }
 
     #[test]

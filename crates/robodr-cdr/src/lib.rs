@@ -21,6 +21,11 @@
 //! | `sensor_msgs::msg::dds_::Imu_` | `sensor_msgs/msg/Imu` | feedback |
 //! | `sensor_msgs::msg::dds_::JointState_` | `sensor_msgs/msg/JointState` | feedback |
 //!
+//! Separately from the motion types (not in [`MessageKind`] / [`Registry`]),
+//! [`std_msgs`] decodes `std_msgs/msg/Bool`, `UInt8` and `String` (bounded),
+//! the scalar types robots use to publish e-stop flags and operating modes
+//! ([`decode_std`]); `robodr-agentd`'s safety-state feed reads them.
+//!
 //! # Encodings
 //!
 //! Identifiers follow DDS-XTypes 1.3 Table 60 (the values Cyclone DDS
@@ -111,6 +116,7 @@ pub mod event;
 pub mod msgs;
 mod reader;
 pub mod registry;
+pub mod std_msgs;
 
 pub use encap::{Encapsulation, Endian, Representation, XcdrVersion};
 pub use error::DecodeError;
@@ -122,6 +128,9 @@ pub use msgs::{
 };
 pub use reader::CdrStr;
 pub use registry::{DecodeFn, Registry};
+pub use std_msgs::{
+    decode_std, decode_std_by_type_name, StdDecodeError, StdDecoded, StdKind, StdValue,
+};
 
 use reader::Reader;
 

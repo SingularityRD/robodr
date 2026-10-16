@@ -29,6 +29,12 @@
 //! * [`health`]: self-protection. The robot's state is `unknown` whenever
 //!   the agent is blind (an input silent or ended, no data yet, pipeline
 //!   lagging), never `ok`; issues become observe-only findings.
+//! * [`safety`]: the live safety-state feed (e-stop / mode / odometry
+//!   topics decoded passively from the bus, or a safety-PLC gateway's
+//!   unix socket): freshness -> `unknown`, conflicts -> the most
+//!   conservative state, unprofiled writers ignored and reported,
+//!   transitions in the black box. Without it the configured
+//!   `context.safety_state` is used.
 //! * [`spool`]: atomic, bounded findings spool; acked records are pruned
 //!   oldest first, unacked ones never.
 //! * [`notify`]: `sd_notify` (`READY=1`, `WATCHDOG=1` from the main loop,
@@ -54,8 +60,12 @@
 //! Verified with synthetic pcaps, in-process and with the real binary under
 //! SIGTERM; **not** verified on a robot, with real DDS stacks, with live
 //! `AF_PACKET` at line rate (needs `CAP_NET_RAW`), or against a real
-//! exporter. The safety state is static configuration (no live feed). The
-//! black box uses the HMAC placeholder key.
+//! exporter. The safety state comes from the live feed ([`safety`]) when
+//! one is configured, else from static configuration; the feed was only
+//! run against synthetic traffic, not a real safety PLC or e-stop. The
+//! rest of the operational context (control mode, mission phase,
+//! connectivity) is still static configuration. The black box uses the
+//! HMAC placeholder key.
 
 pub mod config;
 pub mod daemon;
@@ -63,6 +73,7 @@ pub mod health;
 pub mod input;
 pub mod notify;
 pub mod profile_chain;
+pub mod safety;
 pub mod signal;
 pub mod spool;
 
@@ -71,4 +82,5 @@ pub use daemon::{
     agent_profile, effective_state, run, run_with, DaemonError, DaemonStats, StopReason, Summary,
 };
 pub use health::{HealthState, State};
+pub use safety::{SafetyFeed, SafetyReport};
 pub use spool::{Spool, SpoolRecord, SpoolStats};

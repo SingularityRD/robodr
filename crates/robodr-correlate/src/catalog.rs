@@ -141,11 +141,13 @@ pub const PULSAR_RULES: &[&str] = &[
     "RoboDR: Package manager loaded a library from outside the system library paths",
     "RoboDR: Package manager mapped an ELF from outside the system paths",
     // self_protection.toml
-    "RoboDR: RoboDR profile or Pulsar configuration written",
-    "RoboDR: RoboDR profile or Pulsar configuration deleted",
-    "RoboDR: RoboDR profile or Pulsar configuration renamed",
-    "RoboDR: File or device node created in the RoboDR or Pulsar configuration",
-    "RoboDR: Link created in or to the RoboDR or Pulsar configuration",
+    "RoboDR: RoboDR or Pulsar protected file written",
+    "RoboDR: RoboDR or Pulsar protected file deleted",
+    "RoboDR: RoboDR or Pulsar protected file or directory renamed",
+    "RoboDR: File or device node created in a RoboDR or Pulsar protected path",
+    "RoboDR: Link created in or to a RoboDR or Pulsar protected path",
+    "RoboDR: Directory created in a RoboDR or Pulsar protected path",
+    "RoboDR: RoboDR or Pulsar protected directory deleted",
     "RoboDR: Attempt to stop the Pulsar or RoboDR service",
     // sros2_keystore.toml
     "RoboDR: SROS 2 enclave private key read by a process outside the ROS stack",
@@ -160,6 +162,11 @@ pub const PULSAR_RULES: &[&str] = &[
     "RoboDR: Debian package maintainer script executed",
     "RoboDR: Debian package database changed",
     "RoboDR: Python package installed on robot controller",
+    "RoboDR: Python package installed with uv, pipx, poetry or conda/mamba",
+    "RoboDR: Node.js package installed with npm, npx, pnpm or yarn",
+    "RoboDR: File created in the system or ROS Python environment outside the package manager",
+    "RoboDR: File moved into the system or ROS Python environment outside the package manager",
+    "RoboDR: Link created in the system or ROS Python environment outside the package manager",
 ];
 
 /// Is `id` a known signal id (either list)?

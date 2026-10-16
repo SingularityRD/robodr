@@ -179,9 +179,10 @@
             "domain": "host",
             "rules": [
               "RoboDR: Attempt to stop the Pulsar or RoboDR service",
-              "RoboDR: RoboDR profile or Pulsar configuration written",
-              "RoboDR: RoboDR profile or Pulsar configuration deleted",
-              "RoboDR: RoboDR profile or Pulsar configuration renamed"
+              "RoboDR: RoboDR or Pulsar protected file written",
+              "RoboDR: RoboDR or Pulsar protected file deleted",
+              "RoboDR: RoboDR or Pulsar protected file or directory renamed",
+              "RoboDR: RoboDR or Pulsar protected directory deleted"
             ]
           },
           {

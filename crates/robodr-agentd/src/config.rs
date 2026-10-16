@@ -16,6 +16,9 @@
 //!   "spool":    { "dir": "/var/spool/robodr/findings", "max_bytes": 67108864 },
 //!   "event_inputs": [ { "kind": "unix_socket", "path": "/run/robodr/events.sock" } ],
 //!   "context":  { "safety_state": "unknown", "control": "autonomous" },
+//!   "safety_feed": { "stale_after_ms": 1000,
+//!                    "topics": [ { "topic": "/estop", "type": "std_msgs/msg/Bool",
+//!                                  "values": { "true": "estop_active", "false": "none" } } ] },
 //!   "firewall": { "max_angular": { "/cmd_vel": 1.0 } },
 //!   "daemon":   { "tick_ms": 1000, "heartbeat_ms": 10000, "silence_ms": 30000 }
 //! }
@@ -71,6 +74,11 @@
 //!   ([`resolve_path`]: symlinks of the existing part followed, `.` / `..`
 //!   folded) here, and again on canonical paths in the daemon after the
 //!   directories exist, so neither `..` nor a symlink can alias them.
+//! * `safety_feed` (optional, [`crate::safety::SafetyFeedSection`]) replaces
+//!   the static `context.safety_state` with a live feed read from the bus
+//!   and / or a local socket; see [`crate::safety`]. With a feed,
+//!   `context.safety_state` must be left `unknown` (it would be ignored),
+//!   and the feed's socket path must differ from every event socket.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -182,6 +190,10 @@ pub struct DaemonConfig {
     pub motion_monitor: Option<MonitorSection>,
     #[serde(default)]
     pub daemon: DaemonSection,
+    /// Live safety-state feed (see [`crate::safety`]); `None` = the static
+    /// `context.safety_state`.
+    #[serde(default)]
+    pub safety_feed: Option<crate::safety::SafetyFeedSection>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -259,8 +271,9 @@ fn default_connections() -> usize {
     4
 }
 
-/// Platform context. The daemon has no live safety-state feed yet: the
-/// configured value is used for every plan (default `unknown`).
+/// Platform context. Without a `safety_feed`, the configured
+/// `safety_state` is used for every plan (default `unknown`); with one, the
+/// feed decides and this must stay `unknown`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextSection {
@@ -406,6 +419,8 @@ pub struct Resolved {
     /// else `None` (derived from the key).
     pub key_id: Option<String>,
     pub boot_id: String,
+    /// The validated live safety-state feed, if configured.
+    pub safety_feed: Option<crate::safety::FeedSpec>,
     /// Non-fatal warnings to log at start.
     pub warnings: Vec<String>,
 }
@@ -580,11 +595,7 @@ pub fn sensor_settings(v: &serde_json::Value) -> Result<(Settings, Vec<String>),
     cfg.validate().map_err(|e| format!("sensor: {e}"))
 }
 
-/// A fully qualified, plain ROS topic name (`/odom`).
-fn is_ros_topic(name: &str) -> bool {
-    let rn = robodr_events::graph::demangle(&format!("rt{name}"));
-    name.starts_with('/') && rn.kind == robodr_events::graph::RosNameKind::Topic && rn.name == name
-}
+use crate::safety::is_ros_topic;
 
 /// Validate the daemon section's numbers.
 pub fn validate_daemon(d: &DaemonSection) -> Result<(), String> {
@@ -781,6 +792,38 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
     if let Some(a) = &t.alarm {
         warnings.push(format!("CRITICAL: {a}"));
     }
+    let safety_feed = match &config.safety_feed {
+        None => None,
+        Some(f) => {
+            if config.context.safety_state != SafetyState::Unknown {
+                return Err(
+                    "context.safety_state is static configuration and cannot be combined with \
+                     safety_feed (the feed decides; leave it unknown)"
+                        .into(),
+                );
+            }
+            let (spec, mut w) = f.resolve(&t.loaded.profile)?;
+            if let Some(sock) = &spec.socket {
+                let clash = config.event_inputs.iter().any(|i| {
+                    matches!(i, EventInputConfig::UnixSocket { path, .. } if *path == sock.path)
+                });
+                if clash {
+                    return Err(
+                        "safety_feed.socket.path is also an event_inputs socket path".into(),
+                    );
+                }
+            }
+            if !spec.topics.is_empty() && sensor.capture.is_none() {
+                w.push(
+                    "safety_feed.topics are read from captured user DATA, but sensor.capture is \
+                     off: those sources will stay unknown"
+                        .into(),
+                );
+            }
+            warnings.append(&mut w);
+            Some(spec)
+        }
+    };
     let monitor = match &config.motion_monitor {
         None => None,
         Some(m) => Some(match &m.config_path {
@@ -812,6 +855,7 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         key_algorithm,
         key_id,
         boot_id,
+        safety_feed,
         warnings,
     })
 }
@@ -1305,6 +1349,15 @@ mod tests {
         assert!(c.robot.profile_version.is_none());
         assert_eq!(c.event_inputs.len(), 1);
         assert_eq!(c.firewall.unwrap().max_angular["/cmd_vel"], 1.0);
+        let mut p = robodr_events::profile::Profile::default();
+        for t in ["/estop", "/robot_mode", "/odom"] {
+            p.writer_topics.insert(t.into());
+        }
+        let (feed, warnings) = c.safety_feed.unwrap().resolve(&p).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(feed.topics.len(), 3);
+        assert!(feed.socket.is_some());
+        assert_eq!(c.context.safety_state, SafetyState::Unknown);
     }
 
     #[test]

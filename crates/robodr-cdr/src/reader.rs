@@ -135,6 +135,12 @@ impl<'a> Reader<'a> {
         <[u8; N]>::try_from(b).map_err(|_| DecodeError::Truncated { at, need: N })
     }
 
+    /// One octet (`octet`, `uint8`, `boolean`): no alignment.
+    pub(crate) fn u8(&mut self) -> Result<u8, DecodeError> {
+        let [b] = self.array::<1>()?;
+        Ok(b)
+    }
+
     pub(crate) fn u32(&mut self) -> Result<u32, DecodeError> {
         let b = self.array::<4>()?;
         Ok(match self.endian {

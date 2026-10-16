@@ -12,6 +12,10 @@ description = "RoboDR live daemon: capture / pcap / JSONL events -> ROS 2 pipeli
 [dependencies]
 robodr-agent = { workspace = true }
 robodr-blackbox = { workspace = true }
+# std_msgs / Odometry decoders of the live safety-state feed.
+robodr-cdr = { workspace = true }
+# Passive SEDP + user-DATA walk for safety-state topics (`safety`).
+robodr-rtps = { workspace = true }
 # Profile trust (signature, version label); already a dependency of the
 # pipeline.
 robodr-commission = { workspace = true }
@@ -26,7 +30,6 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 robodr-capture = { workspace = true }
-robodr-cdr = { workspace = true }
 
 [[bin]]
 name = "robodr-agentd"

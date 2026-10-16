@@ -48,6 +48,19 @@
   "motion_monitor": {
     "feedback_sources": { "/odom": "wheel_odometry" }
   },
+  "safety_feed": {
+    "stale_after_ms": 1000,
+    "topics": [
+      { "topic": "/estop", "type": "std_msgs/msg/Bool",
+        "values": { "true": "estop_active", "false": "none" } },
+      { "topic": "/robot_mode", "type": "std_msgs/msg/UInt8",
+        "values": { "0": "idle", "1": "moving_slow", "2": "moving_fast",
+                    "3": "collaborative_human_nearby", "4": "safe_state_active" } },
+      { "topic": "/odom", "type": "nav_msgs/msg/Odometry",
+        "motion": { "moving_above": 0.05, "fast_above": 1.0, "hysteresis": 0.02 } }
+    ],
+    "socket": { "path": "/run/robodr/safety.sock", "max_connections": 2 }
+  },
   "daemon": {
     "queue_capacity": 4096,
     "tick_ms": 1000,
