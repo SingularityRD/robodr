@@ -56,12 +56,21 @@
 //! [`SourcedEvent::ts`]; the learner uses it for minimum-observation-duration
 //! checks. JSONL recordings carry none (`RobotEvent` has no timestamp), so
 //! duration checks do not apply to them. Capture timestamps come from the
-//! file and are not trusted for ordering; they only ever make the learner
-//! *more* conservative (see `learner`).
+//! file (written by the commissioning host, not by bus participants); the
+//! learner uses them for minimum duration and for the late/brief flags, so a
+//! frame flood cannot dilute those (see `learner`).
+//!
+//! # Senders
+//!
+//! Packet-capture events also carry an [`Origin`]: the GUID prefix the RTPS
+//! message was sent under (header or INFO_SRC) and the source IP. Endpoint
+//! events are emitted per announcement with that announcement's own sender,
+//! so the learner can refuse endpoints whose claimed owner did not send
+//! them (`endpoint_sender_mismatch`).
 
 use robodr_capture::{CaptureError, CaptureFile, RtpsDatagrams};
 use robodr_events::RobotEvent;
-use robodr_rtps::FragmentReassembler;
+use robodr_rtps::{hex12, EndpointKind, FragmentReassembler};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fmt;
@@ -82,6 +91,24 @@ pub struct SourcedEvent {
     /// Capture time of the frame that carried the event (packet captures
     /// only; `None` for JSONL and in-memory sources).
     pub ts: Option<Duration>,
+    /// Who sent the datagram that carried the event (packet captures only;
+    /// `None` for JSONL and in-memory sources, whose events carry no sender).
+    pub origin: Option<Origin>,
+}
+
+/// The sender of the RTPS message an event was decoded from.
+///
+/// `RobotEvent` endpoints only carry the GUID prefix the announcement
+/// *claims* (`PID_ENDPOINT_GUID`, unauthenticated). The learner compares it
+/// with the sender (see `learner`, "endpoint provenance") so a participant
+/// cannot get endpoints learned under another participant's GUID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Origin {
+    /// GUID prefix the message was sent under: the RTPS header prefix, as
+    /// changed by a preceding INFO_SRC (24 lower-case hex chars).
+    pub sender_prefix: String,
+    /// Source IP address of the datagram.
+    pub src_ip: String,
 }
 
 /// A stream of robot events. Pull-based so sources can be files, captures or
@@ -240,6 +267,7 @@ impl<R: BufRead> EventSource for JsonlSource<R> {
                     position: self.line,
                     event,
                     ts: None,
+                    origin: None,
                 })),
                 Err(e) => {
                     let (source, line) = (self.label.clone(), self.line);
@@ -283,6 +311,7 @@ impl EventSource for VecSource {
             position: self.position,
             event,
             ts: None,
+            origin: None,
         }))
     }
 }
@@ -469,16 +498,44 @@ impl<R: Read> EventSource for PcapSource<R> {
             self.anomalies += u64::from(st.anomalies);
             let src_ip = pkt.src.to_string();
             let ts = Some(pkt.ts);
+            let header = Origin {
+                sender_prefix: hex12(&report.header.guid_prefix),
+                src_ip: src_ip.clone(),
+            };
+            // Participants exactly as the sensor sees them ...
             self.queue.extend(
                 report
                     .to_events(&src_ip)
                     .into_iter()
+                    .filter(|e| matches!(e, RobotEvent::Ros2ParticipantDiscovered(_)))
                     .map(|event| SourcedEvent {
                         position,
                         event,
                         ts,
+                        origin: Some(header.clone()),
                     }),
             );
+            // ... and endpoints (same readings as `to_events`, including the
+            // copies attributed to a relaying sender), each tagged with the
+            // prefix that actually sent its announcement.
+            for e in &report.endpoints {
+                let origin = Origin {
+                    sender_prefix: hex12(&e.source),
+                    src_ip: src_ip.clone(),
+                };
+                for ep in e.to_endpoints() {
+                    let event = match e.kind {
+                        EndpointKind::Writer => RobotEvent::Ros2WriterDiscovered(ep),
+                        EndpointKind::Reader => RobotEvent::Ros2ReaderDiscovered(ep),
+                    };
+                    self.queue.push_back(SourcedEvent {
+                        position,
+                        event,
+                        ts,
+                        origin: Some(origin.clone()),
+                    });
+                }
+            }
         }
     }
 

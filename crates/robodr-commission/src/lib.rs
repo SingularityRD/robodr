@@ -37,7 +37,11 @@
 //!   did not exercise (a rarely used topic, a fast manoeuvre) will deviate
 //!   later; merge more missions to widen coverage.
 //! * `RobotEvent` has no timestamps, so first/last-seen are positions in the
-//!   input (run index + line or frame ordinal), not times.
+//!   input (run index + line or frame ordinal), not times. The gate's
+//!   late/brief/duration checks use capture timestamps where the input has
+//!   them (pcap); JSONL input falls back to positions and is flagged.
+//! * Endpoint provenance (claimed GUID == sender, sender IP commissioned)
+//!   is only checkable on packet captures; JSONL events carry no sender.
 //! * A pcap gives discovery only; motion envelopes need the sensor's motion
 //!   events (JSONL). Shared-memory transports and DDS-Security protected
 //!   discovery are invisible to a capture (see robodr-capture's limits).
@@ -60,8 +64,8 @@ pub mod signoff;
 pub mod stats;
 
 pub use input::{
-    CaptureDiagnostics, EventSource, InputError, InputSpec, JsonlSource, PcapSource, SourcedEvent,
-    VecSource,
+    CaptureDiagnostics, EventSource, InputError, InputSpec, JsonlSource, Origin, PcapSource,
+    SourcedEvent, VecSource,
 };
 pub use learner::{
     envelope_bound, is_motion_like, Commissioning, CommissioningReport, ConfigError, LearnConfig,
@@ -69,10 +73,13 @@ pub use learner::{
     Warning, WarningLevel, PARAMETER_SERVICES, ROS_INTERNAL_RAW_TOPICS,
 };
 pub use ops::{
-    check_event, diff, lock, lock_draft_text, lockable, merge_profiles, CheckReport, Checker,
+    check_event, diff, lock, lock_draft_text, lock_draft_text_with_caps, lock_with_caps, lockable,
+    lockable_with_caps, merge_profiles, merge_profiles_with_caps, CheckReport, Checker, HardCaps,
     LockRefusal, MergeError, ProfileDiff,
 };
-pub use profile_file::{parse_profile_text, sealed_text, write_file_atomic, ProfileFileError};
+pub use profile_file::{
+    parse_profile_text, sealed_text, write_file_atomic, write_files_atomic, ProfileFileError,
+};
 pub use signoff::{Signoff, SignoffItem};
 pub use stats::{SampleBuffer, SpeedStats};
 

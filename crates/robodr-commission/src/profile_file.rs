@@ -9,8 +9,11 @@
 //! typo (`"locked ": true`), or a dropped key would load as a *different*
 //! profile without complaint. The commissioning tool therefore requires
 //! every `Profile` key to be present, rejects unknown keys (top level and in
-//! envelopes), rejects duplicate keys, and runs `Profile::validate` on every
-//! locked profile.
+//! envelopes), rejects duplicate keys **at every depth** (compared after JSON
+//! unescaping, so `"/cmd_vel"` and `"/cmd\u005fvel"` are the same key: two
+//! entries for one motion channel, where a reviewer sees the first and the
+//! parser keeps the last, are refused), and runs `Profile::validate` on
+//! every locked profile.
 //!
 //! # The seal
 //!
@@ -33,11 +36,22 @@
 //! check-then-write race) or with `rename` when overwriting is allowed. A
 //! symlink at the destination is refused in both modes, and only regular
 //! files may be overwritten.
+//!
+//! [`write_files_atomic`] does the same for a set of files that belong
+//! together (draft + sign-off + report): every destination is checked
+//! first, every temp file is written and fsynced, and only then is anything
+//! published. If a publish fails, the files already published by this call
+//! are rolled back (removed, or restored from a hard-link backup when
+//! overwriting), and all temps are removed. Limits: a crash (power loss)
+//! during the publish phase can leave a subset published, and rollback
+//! cannot undo a concurrent writer's change to the same paths.
 
 use crate::signoff::sha256_hex;
 use crate::to_json;
 use robodr_events::profile::{Profile, ProfileError};
+use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::Serialize;
+use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -137,6 +151,65 @@ impl fmt::Display for ProfileFileError {
 
 impl std::error::Error for ProfileFileError {}
 
+/// A JSON value walker that fails on a duplicate object key at any depth.
+/// Keys arrive unescaped from serde_json, so escape spellings of one key
+/// collide. Depth is bounded by serde_json's recursion limit.
+struct NoDuplicateKeys;
+
+impl<'de> Deserialize<'de> for NoDuplicateKeys {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(NoDuplicateKeysVisitor)
+    }
+}
+
+struct NoDuplicateKeysVisitor;
+
+impl<'de> Visitor<'de> for NoDuplicateKeysVisitor {
+    type Value = NoDuplicateKeys;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(NoDuplicateKeys)
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(NoDuplicateKeys)
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(NoDuplicateKeys)
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(NoDuplicateKeys)
+    }
+    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(NoDuplicateKeys)
+    }
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(NoDuplicateKeys)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
+        while a.next_element::<NoDuplicateKeys>()?.is_some() {}
+        Ok(NoDuplicateKeys)
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
+        let mut seen = HashSet::new();
+        while let Some(k) = a.next_key::<String>()? {
+            if !seen.insert(k.clone()) {
+                let shown: String = k.chars().take(128).collect();
+                return Err(de::Error::custom(format!("duplicate key {shown:?}")));
+            }
+            a.next_value::<NoDuplicateKeys>()?;
+        }
+        Ok(NoDuplicateKeys)
+    }
+}
+
+/// Refuse JSON text with a duplicate object key at any depth.
+pub fn reject_duplicate_keys(text: &str) -> Result<(), serde_json::Error> {
+    serde_json::from_str::<NoDuplicateKeys>(text).map(|_| ())
+}
+
 /// Split a sealed text into `(seal hex, body)`; `None` if not sealed in the
 /// canonical position.
 fn split_seal(text: &str) -> Option<(&str, String)> {
@@ -151,6 +224,9 @@ pub fn parse_profile_text(text: &str) -> Result<Profile, ProfileFileError> {
     let json_err = |e: serde_json::Error| ProfileFileError::Json {
         message: e.to_string(),
     };
+    // Duplicate keys first: the `Value` pass below and the typed maps
+    // (`motion_envelopes`) would silently keep only the last one.
+    reject_duplicate_keys(text).map_err(json_err)?;
     let value: serde_json::Value = serde_json::from_str(text).map_err(json_err)?;
     let obj = value.as_object().ok_or(ProfileFileError::NotAnObject)?;
     for k in obj.keys() {
@@ -186,8 +262,7 @@ pub fn parse_profile_text(text: &str) -> Result<Profile, ProfileFileError> {
             }
         }
     }
-    // Typed parse straight from the text: serde's derive rejects duplicate
-    // fields, which the `Value` pass above silently collapses.
+    // Typed parse straight from the text (duplicates were refused above).
     let profile: Profile = serde_json::from_str(text).map_err(json_err)?;
 
     let sealed = obj.contains_key(SEAL_KEY);
@@ -246,6 +321,10 @@ pub fn read_regular_file(path: &Path, max: u64) -> io::Result<String> {
 /// without clobbering an existing file unless `overwrite`. See the module
 /// docs.
 pub fn write_file_atomic(path: &Path, contents: &[u8], overwrite: bool) -> io::Result<()> {
+    write_files_atomic(&[(path, contents)], overwrite)
+}
+
+fn split_path(path: &Path) -> io::Result<(&Path, &std::ffi::OsStr)> {
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a file path"))?;
@@ -253,14 +332,17 @@ pub fn write_file_atomic(path: &Path, contents: &[u8], overwrite: bool) -> io::R
         Some(d) if !d.as_os_str().is_empty() => d,
         _ => Path::new("."),
     };
-    check_destination(path, overwrite)?;
+    Ok((dir, name))
+}
 
-    // Fresh temp file next to the destination (same filesystem).
-    let mut tmp = None;
+/// Create a fresh `.<name>.<tag>-<pid>-<n>` file next to `path`
+/// (`O_CREAT|O_EXCL`: never follows a planted symlink).
+fn fresh_sibling(path: &Path, tag: &str) -> io::Result<(std::path::PathBuf, File)> {
+    let (dir, name) = split_path(path)?;
     for n in 0..1000u32 {
         let mut tn = std::ffi::OsString::from(".");
         tn.push(name);
-        tn.push(format!(".tmp-{}-{n}", std::process::id()));
+        tn.push(format!(".{tag}-{}-{n}", std::process::id()));
         let candidate = dir.join(tn);
         let mut oo = OpenOptions::new();
         oo.write(true).create_new(true);
@@ -270,53 +352,154 @@ pub fn write_file_atomic(path: &Path, contents: &[u8], overwrite: bool) -> io::R
             oo.mode(0o644);
         }
         match oo.open(&candidate) {
-            Ok(f) => {
-                tmp = Some((candidate, f));
-                break;
-            }
+            Ok(f) => return Ok((candidate, f)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
     }
-    let (tmp_path, mut f) = tmp.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::AlreadyExists, "could not create a temp file")
-    })?;
-    let result = (|| {
-        f.write_all(contents)?;
-        f.sync_all()?;
-        drop(f);
-        if overwrite {
-            // Re-check right before publishing; rename replaces a symlink
-            // itself (never writes through it), so a racing symlink cannot
-            // redirect the write either way.
-            check_destination(path, true)?;
-            fs::rename(&tmp_path, path)
-        } else {
-            match fs::hard_link(&tmp_path, path) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "already exists (refusing to overwrite)",
-                )),
-                // Filesystems without hard links: best effort, re-check and
-                // rename (a narrow race remains; documented).
-                Err(_) => {
-                    check_destination(path, false)?;
-                    fs::rename(&tmp_path, path)
-                }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not create a temp file",
+    ))
+}
+
+/// A free sibling name for a hard-link backup (`hard_link` refuses to
+/// replace, so a racing file at the name only makes us try the next one).
+fn backup_link(path: &Path) -> io::Result<std::path::PathBuf> {
+    let (dir, name) = split_path(path)?;
+    for n in 0..1000u32 {
+        let mut tn = std::ffi::OsString::from(".");
+        tn.push(name);
+        tn.push(format!(".bak-{}-{n}", std::process::id()));
+        let candidate = dir.join(tn);
+        match fs::hard_link(path, &candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not create a backup link",
+    ))
+}
+
+/// Publish one written temp file at `path` (see the module docs).
+fn publish(tmp_path: &Path, path: &Path, overwrite: bool) -> io::Result<()> {
+    if overwrite {
+        // Re-check right before publishing; rename replaces a symlink
+        // itself (never writes through it), so a racing symlink cannot
+        // redirect the write either way.
+        check_destination(path, true)?;
+        fs::rename(tmp_path, path)
+    } else {
+        match fs::hard_link(tmp_path, path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "already exists (refusing to overwrite)",
+            )),
+            // Filesystems without hard links: best effort, re-check and
+            // rename (a narrow race remains; documented).
+            Err(_) => {
+                check_destination(path, false)?;
+                fs::rename(tmp_path, path)
             }
         }
-    })();
-    let _ = fs::remove_file(&tmp_path);
-    result?;
-    // Make the new directory entry durable too (best effort).
-    if let Ok(d) = File::open(dir) {
-        let _ = d.sync_all();
+    }
+}
+
+/// Write several files as one unit: all destinations are checked, all
+/// temps written and fsynced, then all are published; on any failure
+/// nothing this call published remains (see the module docs). Errors name
+/// the failing path.
+pub fn write_files_atomic(files: &[(&Path, &[u8])], overwrite: bool) -> io::Result<()> {
+    let named = |p: &Path, e: io::Error| io::Error::new(e.kind(), format!("{}: {e}", p.display()));
+    // 1. Every destination first: nothing is created if one is refused.
+    for (i, (p, _)) in files.iter().enumerate() {
+        split_path(p).map_err(|e| named(p, e))?;
+        if files[..i].iter().any(|(q, _)| q == p) {
+            return Err(named(
+                p,
+                io::Error::new(io::ErrorKind::InvalidInput, "named twice"),
+            ));
+        }
+        check_destination(p, overwrite).map_err(|e| named(p, e))?;
+    }
+    // 2. All temps, written and fsynced.
+    let mut temps: Vec<std::path::PathBuf> = Vec::new();
+    let mut backups: Vec<Option<std::path::PathBuf>> = Vec::new();
+    let cleanup = |temps: &[std::path::PathBuf], backups: &[Option<std::path::PathBuf>]| {
+        for t in temps.iter().chain(backups.iter().flatten()) {
+            let _ = fs::remove_file(t);
+        }
+    };
+    for (p, contents) in files {
+        let r = fresh_sibling(p, "tmp").and_then(|(tp, mut f)| {
+            temps.push(tp);
+            f.write_all(contents)?;
+            f.sync_all()
+        });
+        if let Err(e) = r {
+            cleanup(&temps, &backups);
+            return Err(named(p, e));
+        }
+    }
+    // 3. Overwrite mode: hard-link backups of existing destinations, so a
+    //    failed publish can be undone.
+    if overwrite {
+        for (p, _) in files {
+            let b = match fs::symlink_metadata(p) {
+                Ok(m) if m.is_file() => match backup_link(p) {
+                    Ok(b) => Some(b),
+                    Err(e) => {
+                        cleanup(&temps, &backups);
+                        return Err(named(p, e));
+                    }
+                },
+                _ => None,
+            };
+            backups.push(b);
+        }
+    } else {
+        backups.resize(files.len(), None);
+    }
+    // 4. Publish; roll back on the first failure.
+    for (i, ((p, _), tp)) in files.iter().zip(&temps).enumerate() {
+        if let Err(e) = publish(tp, p, overwrite) {
+            for ((q, _), b) in files[..i].iter().zip(&backups) {
+                match b {
+                    Some(b) => {
+                        let _ = fs::rename(b, q);
+                    }
+                    None => {
+                        let _ = fs::remove_file(q);
+                    }
+                }
+            }
+            cleanup(&temps, &backups);
+            return Err(named(p, e));
+        }
+    }
+    cleanup(&temps, &backups);
+    // Make the new directory entries durable too (best effort).
+    let mut dirs: Vec<&Path> = files
+        .iter()
+        .filter_map(|(p, _)| split_path(p).ok().map(|(d, _)| d))
+        .collect();
+    dirs.dedup();
+    for d in dirs {
+        if let Ok(d) = File::open(d) {
+            let _ = d.sync_all();
+        }
     }
     Ok(())
 }
 
-fn check_destination(path: &Path, overwrite: bool) -> io::Result<()> {
+/// Would [`write_file_atomic`] accept `path` as a destination right now
+/// (not a symlink; absent, or a regular file and `overwrite`)? For callers
+/// that want to fail before doing expensive work; the write re-checks.
+pub fn check_destination(path: &Path, overwrite: bool) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_symlink() => Err(io::Error::new(
             io::ErrorKind::InvalidInput,

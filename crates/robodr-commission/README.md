@@ -79,6 +79,13 @@ the same clean run gives zero deviations. `tests/roundtrip.rs` checks this on
   reported as `unannounced_participant` instead.
 * If a motion channel has no valid sample in either dimension, it gets an empty
   envelope. `lock` refuses that, so a human has to set the bound.
+* If a channel has samples in one dimension only, the other dimension is
+  **not** left `null` (which means unlimited): it is set to the OEM ceiling
+  for that dimension if one was given, else to `0` (deny any non-zero
+  command), and becomes the sign-off item `envelope_dimension_unobserved`.
+* If an envelope's observed maximum is more than `--outlier-ratio` (default
+  3) times its 99th percentile, one stray (or injected) command is setting
+  the bound: sign-off item `envelope_outlier` with max and p99.
 
 ### Anomalies (a clean run should have none)
 
@@ -119,11 +126,17 @@ always printed to stdout. The report contains:
   `reader_only_name`, `raw_dds_topic`, `reader_topics_not_learned`, and, for
   captures, `fragmented_discovery_unreassembled` (DATA_FRAG seen but not all
   rebuilt, so endpoints are missing), `fragmented_discovery_reassembled`,
-  `ip_reassembly_failed`, `truncated_frames` and `protected_discovery`.
+  `ip_reassembly_failed`, `truncated_frames` and `protected_discovery`;
+  `endpoint_sender_mismatch`, `envelope_outlier`,
+  `envelope_dimension_unobserved` (info) and `presence_measured_by_position`
+  (info: a run without timestamps, see below).
 
 `RobotEvent` has no timestamps. "First and last seen" are therefore positions,
 written as `runN:POS`. POS is the line number for JSONL and the frame ordinal
-for a capture.
+for a capture. The gate's late/brief fractions and minimum duration use the
+capture timestamps when the input has them (pcap), so a flood of frames
+cannot dilute them; JSONL runs fall back to line positions and the report
+notes it (`presence_measured_by_position`).
 
 ### Determinism
 
@@ -141,15 +154,18 @@ robodr-commission learn (--events run.jsonl | --pcap run.pcapng) [...] [--model 
                         [--ceiling-linear M_PER_S] [--ceiling-joint RAD_PER_S]
                         [--hard-cap-linear 10] [--hard-cap-joint 10]
                         [--min-announcements 2] [--min-duration SECS]
+                        [--outlier-ratio 3]
                         [--accept-participant GUID]... [--motion-topic /T]...
                         [--learn-readers]
                         --out profile.json [--signoff signoff.json]
                         [--report report.json] [--quiet] [--force]
-robodr-commission lock    --in profile.json --signoff signoff.json --out locked.json [--force]
+robodr-commission lock    --in profile.json --signoff signoff.json --out locked.json
+                          [--hard-cap-linear 10] [--hard-cap-joint 10] [--force]
 robodr-commission signoff --in profile.json --out signoff.json [--force]
 robodr-commission diff    old.json new.json [--json]
 robodr-commission check   --profile locked.json (--events run.jsonl | --pcap run.pcap) [...] [--json]
-robodr-commission merge   --out merged.json a.json b.json [...] [--force]
+robodr-commission merge   --out merged.json a.json b.json [...]
+                          [--hard-cap-linear 10] [--hard-cap-joint 10] [--force]
 ```
 
 Exit codes:
@@ -163,9 +179,15 @@ Every output is written to a fresh temp file in the destination directory
 exist yet, `rename` with `--force`). An existing file is never overwritten
 without `--force`, a symlink at the output path is refused even with
 `--force`, and outputs must differ from each other and from the inputs. A
-failed `learn` writes nothing. Profile inputs must be regular files (no
-FIFOs or devices) of at most 64 MiB and are parsed strictly: every key
-present, no unknown or duplicate keys, a valid seal if locked.
+failed `learn` writes nothing: every output path is checked before the
+inputs are read, and the draft, sign-off list and report are published as a
+unit (all temp files written first; if one publish fails, the ones already
+published are removed or restored). A power loss in the middle of the
+publish step can still leave a subset. Profile inputs must be regular files
+(no FIFOs or devices) of at most 64 MiB and are parsed strictly: every key
+present, no unknown keys, and no duplicate keys at any depth, compared after
+JSON unescaping (`"/cmd_vel"` and `"/cmd\u005fvel"` are the same key), and a
+valid seal if locked.
 
 * **Input**: JSON Lines of `RobotEvent` in the serde tagged format, for example
   `{"kind":"motion_command","channel":"/cmd_vel","source_guid":"…","linear_speed":0.4,"joint_speed":null}`.
@@ -194,6 +216,13 @@ present, no unknown or duplicate keys, a valid seal if locked.
   * the sign-off is malformed, is for another model, does not match the
     SHA-256 of the draft bytes (the draft was edited after the list was
     made), has no `operator`, or has an item with `"confirmed": false`
+  * items were deleted, added or reworded: `items_sha256` binds the item set
+    (ids and reasons) to the draft; only `confirmed` and `operator` may change
+  * independently of the list, every motion channel of the draft must be
+    covered by a confirmed `motion_writer`, `motion_unattributed` or
+    `motion_channel_unreviewed` item (a floor recomputed from the draft)
+  * a bound above `--hard-cap-linear` / `--hard-cap-joint` (default 10 m/s,
+    10 rad/s; pass the values used for `learn` on a faster platform)
   * the profile is already locked
   * there are no participants
   * there are no writer topics
@@ -219,7 +248,9 @@ present, no unknown or duplicate keys, a valid seal if locked.
   is `reader-topic enforcement: off -> on [tightens]`. Removing all of them
   switches it off, which is `[LOOSENS]`. Adding reader topics while
   enforcement is already on is `[LOOSENS]`.
-* **merge** also unions services, actions, raw DDS topics and reader topics.
+* **merge** refuses an input with a bound above the hard caps (same flags as
+  `lock`), so "larger bound wins" cannot carry a hand-edited `1e300` into the
+  result. It also unions services, actions, raw DDS topics and reader topics.
   It refuses to mix profiles that enforce reader topics with profiles that do
   not, because the union would start enforcing readers that the other
   missions never recorded.
@@ -238,16 +269,27 @@ the `learner` module docs):
   operator can override with `--accept-participant GUID`, which itself needs
   sign-off. Endpoints announced only by quarantined or unannounced GUIDs, and
   motion commands from them, are never learned.
+* **Endpoint provenance** (captures): an endpoint is learned for the GUID it
+  claims only if that GUID is the prefix the RTPS message was sent under
+  (header / INFO_SRC) and the datagram came from one of that participant's
+  commissioned IPs (IPs from which it passes the quarantine gate itself).
+  Anything else is not learned and becomes `endpoint_sender_mismatch` (owner,
+  sender, IP, names). An intruder can therefore not get a topic learned by
+  writing a legitimate participant's GUID into `PID_ENDPOINT_GUID`. JSONL
+  events carry no sender, so the check does not apply to them. A discovery
+  server relaying others' announcements produces mismatch items too.
 * **Sign-off list** (`<out>.signoff.json`): every participant that writes a
   motion topic (learned channel, `--motion-topic`, or a name containing
   `cmd`/`command`/`twist`/`trajectory`) or sends motion commands; participants
   that joined late, were present briefly, came from several IPs or missed
   runs; unattributed motion commands; thin envelopes; samples above the cap;
+  unobserved dimensions; outlier maxima; endpoint sender mismatches;
   capacity overflow; anomalies. `lock` refuses until a named operator has
-  confirmed every item.
+  confirmed every item, and refuses a list with items removed.
 * **Hard caps**: no envelope exceeds `--hard-cap-linear` / `--hard-cap-joint`
   (default 10 m/s, 10 rad/s) or the tighter OEM ceiling; NaN, infinite and
-  negative speeds are never learned.
+  negative speeds are never learned; `lock` and `merge` enforce the same
+  caps on hand-edited drafts.
 * **Bounded memory**: participants (4096), names per kind (16384), motion
   channels (256), inner sets (256) and retained samples per channel and
   dimension (16384, then decimated; count/min/max stay exact) are capped;
@@ -259,8 +301,10 @@ the `learner` module docs):
 
 What this cannot catch: an intruder present from the very start for the whole
 run, announcing normally from one IP and not touching motion topics. Only the
-operator's review of the participant list catches that. The seal is a hash,
-not a signature: it detects edits and corruption, not a forger.
+operator's review of the participant list catches that. The seal and the
+sign-off digests are hashes, not signatures: they detect edits, deletions and
+corruption, not a forger who recomputes them (the motion-channel floor at
+`lock` still applies to a recomputed list).
 
 ## Demo (synthetic data)
 
