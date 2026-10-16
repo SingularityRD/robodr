@@ -26,17 +26,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use robodr_capture::reassembly::ReassemblyStats;
+
+pub use crate::binding::Ingress;
 use robodr_capture::{
     CaptureError, CaptureFile, CaptureStats, MatchMode, PacketSource, RtpsDatagrams, RtpsFilter,
     RtpsPortMap,
 };
 
 /// One received datagram (UDP payload, starting at `RTPS`) with the source
-/// IP it came from, as text (the form `robodr_rtps` reports).
+/// IP it came from, as text (the form `robodr_rtps` reports), and the kind
+/// of interface it arrived on when the source knows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Datagram {
     pub payload: Vec<u8>,
     pub src_ip: String,
+    /// See [`Ingress`]; [`Ingress::Unknown`] from [`Datagram::new`].
+    pub ingress: Ingress,
 }
 
 impl Datagram {
@@ -44,7 +49,45 @@ impl Datagram {
         Self {
             payload,
             src_ip: src_ip.into(),
+            ingress: Ingress::Unknown,
         }
+    }
+
+    /// Tag the datagram with the kind of interface it arrived on.
+    #[must_use]
+    pub fn with_ingress(mut self, ingress: Ingress) -> Self {
+        self.ingress = ingress;
+        self
+    }
+}
+
+/// Is the named interface a loopback interface? Linux: `ARPHRD_LOOPBACK`
+/// (772) in `/sys/class/net/<name>/type`; elsewhere, or when sysfs is not
+/// readable, the name `lo`. Names with `/` or `..` are never loopback.
+pub fn is_loopback_interface(name: &str) -> bool {
+    if name.is_empty() || name.contains('/') || name.contains("..") {
+        return false;
+    }
+    match std::fs::read_to_string(format!("/sys/class/net/{name}/type")) {
+        Ok(t) => t.trim() == "772",
+        Err(_) => name == "lo",
+    }
+}
+
+/// The [`Ingress`] of a capture bound to `interfaces`: all loopback ->
+/// `Loopback`, all non-loopback -> `External`, empty (every interface) or
+/// mixed -> `Unknown`.
+pub fn ingress_of_interfaces(interfaces: &[String], is_loopback: impl Fn(&str) -> bool) -> Ingress {
+    if interfaces.is_empty() {
+        return Ingress::Unknown;
+    }
+    let lo = interfaces.iter().filter(|i| is_loopback(i)).count();
+    if lo == interfaces.len() {
+        Ingress::Loopback
+    } else if lo == 0 {
+        Ingress::External
+    } else {
+        Ingress::Unknown
     }
 }
 
@@ -111,13 +154,27 @@ pub struct CaptureHealth {
     pub ip_fragment_timeouts: u64,
     /// IP datagrams evicted to keep reassembly memory bounded.
     pub ip_fragment_evicted: u64,
-    // TODO(capture-hardening): the parallel robodr-capture work adds UDP
-    // checksum-failure and eviction counters to CaptureStats. When they land,
-    // add them here (e.g. a `udp_checksum_failures` field) and map them in
-    // `from_stats` and in `Pipeline::capture_findings`. Not guessed now.
+    /// IP fragments refused because their destination's reassembly budget
+    /// was full (or nothing was evictable): not inspected.
+    pub ip_fragment_refused: u64,
+    /// Duplicate IP fragments whose bytes differ from the queued copy (the
+    /// first copy is kept): an overlap-evasion trait.
+    pub ip_fragment_duplicate_conflicts: u64,
+    /// IPv4 datagrams restarted by the `max_dist` rule.
+    pub ip_fragment_too_far: u64,
+    /// IPv4 packets with a wrong header checksum (dropped).
+    pub bad_ip_checksum: u64,
+    /// UDP datagrams with a wrong checksum (dropped).
+    pub bad_udp_checksum: u64,
+    /// IP packets that were not UDP (not inspected).
+    pub not_udp: u64,
 }
 
 impl CaptureHealth {
+    /// Every counter of `robodr-capture` that means "not inspected" or
+    /// "tampered with below RTPS". Not mapped (benign or informational):
+    /// `duplicates` without conflict, `udp_checksum_partial` / `_none` /
+    /// `_unverified`, `filtered_out`, `not_ip`, `ipv6_long_ext_chains`.
     pub fn from_stats(c: &CaptureStats, r: &ReassemblyStats) -> Self {
         Self {
             truncated: c.truncated,
@@ -126,6 +183,45 @@ impl CaptureHealth {
             ip_fragment_invalid: r.dropped_invalid,
             ip_fragment_timeouts: r.dropped_timeout,
             ip_fragment_evicted: r.dropped_capacity,
+            ip_fragment_refused: r.refused_capacity,
+            ip_fragment_duplicate_conflicts: r.duplicate_conflicts,
+            ip_fragment_too_far: r.dropped_too_far,
+            bad_ip_checksum: c.bad_ip_checksum,
+            bad_udp_checksum: c.bad_udp_checksum,
+            not_udp: c.not_udp,
+        }
+    }
+
+    /// Field-wise saturating sum (several capture sources).
+    #[must_use]
+    pub fn saturating_add(&self, o: &Self) -> Self {
+        Self {
+            truncated: self.truncated.saturating_add(o.truncated),
+            malformed: self.malformed.saturating_add(o.malformed),
+            ip_fragment_conflicts: self
+                .ip_fragment_conflicts
+                .saturating_add(o.ip_fragment_conflicts),
+            ip_fragment_invalid: self
+                .ip_fragment_invalid
+                .saturating_add(o.ip_fragment_invalid),
+            ip_fragment_timeouts: self
+                .ip_fragment_timeouts
+                .saturating_add(o.ip_fragment_timeouts),
+            ip_fragment_evicted: self
+                .ip_fragment_evicted
+                .saturating_add(o.ip_fragment_evicted),
+            ip_fragment_refused: self
+                .ip_fragment_refused
+                .saturating_add(o.ip_fragment_refused),
+            ip_fragment_duplicate_conflicts: self
+                .ip_fragment_duplicate_conflicts
+                .saturating_add(o.ip_fragment_duplicate_conflicts),
+            ip_fragment_too_far: self
+                .ip_fragment_too_far
+                .saturating_add(o.ip_fragment_too_far),
+            bad_ip_checksum: self.bad_ip_checksum.saturating_add(o.bad_ip_checksum),
+            bad_udp_checksum: self.bad_udp_checksum.saturating_add(o.bad_udp_checksum),
+            not_udp: self.not_udp.saturating_add(o.not_udp),
         }
     }
 }
@@ -173,6 +269,129 @@ impl DatagramSource for VecDatagramSource {
     }
 }
 
+/// Bounded queue between the threads of a [`MergedDatagramSource`] and its
+/// reader, per sub-source (backpressure: a sub-source blocks when full).
+pub const MERGED_QUEUE_PER_SOURCE: usize = 256;
+
+enum MergedMsg {
+    Data(Datagram),
+    End,
+    Err(io::Error),
+}
+
+/// Several blocking sources merged into one: each runs on its own OS thread
+/// and feeds a bounded channel. Used to capture loopback and non-loopback
+/// interfaces separately (so every datagram carries a known [`Ingress`])
+/// while the consumer still sees a single [`DatagramSource`].
+///
+/// - Ends (`Ok(None)`) when every sub-source has ended.
+/// - The first sub-source error is returned (terminal, per the trait
+///   contract) and `stop` is set so the others wind down.
+/// - [`capture_health`](DatagramSource::capture_health) is the field-wise
+///   sum of the sub-sources' latest snapshots.
+/// - Dropping it sets `stop` (the sub-sources must honour that flag, as
+///   [`CaptureDatagramSource::with_stop_flag`] does); threads are detached,
+///   not joined, so a drop never blocks for a read timeout.
+pub struct MergedDatagramSource {
+    rx: std::sync::mpsc::Receiver<MergedMsg>,
+    health: Arc<Mutex<Vec<Option<CaptureHealth>>>>,
+    live: usize,
+    stop: Arc<AtomicBool>,
+    reported_end: bool,
+}
+
+impl std::fmt::Debug for MergedDatagramSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MergedDatagramSource")
+            .field("live", &self.live)
+            .field("reported_end", &self.reported_end)
+            .finish()
+    }
+}
+
+impl MergedDatagramSource {
+    /// Start one thread per source. `stop` is the flag the sub-sources were
+    /// built with.
+    pub fn new(
+        sources: Vec<Box<dyn DatagramSource + Send>>,
+        stop: Arc<AtomicBool>,
+    ) -> io::Result<Self> {
+        let n = sources.len();
+        let (tx, rx) =
+            std::sync::mpsc::sync_channel(MERGED_QUEUE_PER_SOURCE.saturating_mul(n.max(1)));
+        let health = Arc::new(Mutex::new(vec![None; n]));
+        for (i, mut src) in sources.into_iter().enumerate() {
+            let tx = tx.clone();
+            let health = health.clone();
+            std::thread::Builder::new()
+                .name(format!("robodr-capture-{i}"))
+                .spawn(move || loop {
+                    let r = src.recv();
+                    if let Some(h) = src.capture_health() {
+                        let mut g = health.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(slot) = g.get_mut(i) {
+                            *slot = Some(h);
+                        }
+                    }
+                    let msg = match r {
+                        Ok(Some(d)) => MergedMsg::Data(d),
+                        Ok(None) => MergedMsg::End,
+                        Err(e) => MergedMsg::Err(e),
+                    };
+                    let last = !matches!(msg, MergedMsg::Data(_));
+                    if tx.send(msg).is_err() || last {
+                        return;
+                    }
+                })?;
+        }
+        Ok(Self {
+            rx,
+            health,
+            live: n,
+            stop,
+            reported_end: n == 0,
+        })
+    }
+}
+
+impl DatagramSource for MergedDatagramSource {
+    fn recv(&mut self) -> io::Result<Option<Datagram>> {
+        while !self.reported_end {
+            match self.rx.recv() {
+                Ok(MergedMsg::Data(d)) => return Ok(Some(d)),
+                Ok(MergedMsg::End) => {
+                    self.live = self.live.saturating_sub(1);
+                    if self.live == 0 {
+                        self.reported_end = true;
+                    }
+                }
+                Ok(MergedMsg::Err(e)) => {
+                    self.reported_end = true;
+                    self.stop.store(true, Ordering::Relaxed);
+                    return Err(e);
+                }
+                Err(_) => self.reported_end = true,
+            }
+        }
+        Ok(None)
+    }
+
+    fn capture_health(&self) -> Option<CaptureHealth> {
+        let g = self.health.lock().unwrap_or_else(|e| e.into_inner());
+        g.iter()
+            .flatten()
+            .fold(None, |acc: Option<CaptureHealth>, h| {
+                Some(acc.map_or(*h, |a| a.saturating_add(h)))
+            })
+    }
+}
+
+impl Drop for MergedDatagramSource {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Consecutive non-RTPS frames after which a live capture returns control to
 /// [`CaptureDatagramSource::recv`] so the stop flag is checked even under a
 /// flood that never lets the read time out.
@@ -192,6 +411,7 @@ pub struct CaptureDatagramSource<S> {
     inner: RtpsDatagrams<S>,
     stop: Option<Arc<AtomicBool>>,
     reported_end: bool,
+    ingress: Ingress,
 }
 
 /// The RTPS filter used for a port map: well-known ports **or** the `RTPS`
@@ -207,6 +427,7 @@ impl<S: PacketSource> CaptureDatagramSource<S> {
             inner: RtpsDatagrams::new(source, filter),
             stop: None,
             reported_end: false,
+            ingress: Ingress::Unknown,
         }
     }
 
@@ -217,6 +438,7 @@ impl<S: PacketSource> CaptureDatagramSource<S> {
             inner: RtpsDatagrams::new(source, filter).with_frame_budget(LIVE_FRAME_BUDGET),
             stop: None,
             reported_end: false,
+            ingress: Ingress::Unknown,
         }
     }
 
@@ -226,6 +448,19 @@ impl<S: PacketSource> CaptureDatagramSource<S> {
     pub fn with_stop_flag(mut self, flag: Arc<AtomicBool>) -> Self {
         self.stop = Some(flag);
         self
+    }
+
+    /// Tag every datagram with `ingress` (set by
+    /// [`CaptureDatagramSource::open_live`] from the interface list).
+    #[must_use]
+    pub fn with_ingress(mut self, ingress: Ingress) -> Self {
+        self.ingress = ingress;
+        self
+    }
+
+    /// The [`Ingress`] this source tags its datagrams with.
+    pub fn ingress(&self) -> Ingress {
+        self.ingress
     }
 
     /// Capture counters (frames, filtered, truncated, reassembled, ...).
@@ -278,6 +513,10 @@ impl CaptureDatagramSource<robodr_capture::afpacket::AfPacketSource> {
     /// `interfaces` empty = all interfaces. The kernel BPF filter is compiled
     /// from the same port map; if it cannot be built or attached, the
     /// user-space filter does all the work (the source still works).
+    /// Datagrams are tagged with [`ingress_of_interfaces`] (only loopback
+    /// interfaces -> `Loopback`, only others -> `External`, else
+    /// `Unknown`); [`crate::config::CaptureSettings::open`] splits a mixed
+    /// list into two sources so ingress is known.
     pub fn open_live(
         interfaces: &[String],
         port_map: RtpsPortMap,
@@ -292,7 +531,8 @@ impl CaptureDatagramSource<robodr_capture::afpacket::AfPacketSource> {
             ..AfPacketConfig::default()
         };
         let src = AfPacketSource::open(&cfg).map_err(|e| capture_to_io(&e))?;
-        Ok(Self::new_live(src, filter))
+        Ok(Self::new_live(src, filter)
+            .with_ingress(ingress_of_interfaces(interfaces, is_loopback_interface)))
     }
 }
 
@@ -303,7 +543,9 @@ impl<S: PacketSource> DatagramSource for CaptureDatagramSource<S> {
                 return Ok(None);
             }
             if let Some(p) = self.inner.next_packet() {
-                return Ok(Some(Datagram::new(p.payload, p.src.to_string())));
+                return Ok(Some(
+                    Datagram::new(p.payload, p.src.to_string()).with_ingress(self.ingress),
+                ));
             }
             if self.inner.is_finished() {
                 self.reported_end = true;
@@ -487,6 +729,180 @@ mod tests {
         let e = CaptureDatagramSource::open_file(&dir, RtpsPortMap::default()).unwrap_err();
         std::fs::remove_file(&dir).ok();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn health_maps_every_not_inspected_counter() {
+        let c = CaptureStats {
+            truncated: 1,
+            malformed: 2,
+            bad_ip_checksum: 3,
+            bad_udp_checksum: 4,
+            not_udp: 5,
+            udp_checksum_partial: 99,
+            filtered_out: 99,
+            ..Default::default()
+        };
+        let r = ReassemblyStats {
+            dropped_overlap: 6,
+            dropped_invalid: 7,
+            dropped_timeout: 8,
+            dropped_capacity: 9,
+            refused_capacity: 10,
+            duplicate_conflicts: 11,
+            dropped_too_far: 12,
+            duplicates: 99,
+            ..Default::default()
+        };
+        let h = CaptureHealth::from_stats(&c, &r);
+        assert_eq!(
+            h,
+            CaptureHealth {
+                truncated: 1,
+                malformed: 2,
+                ip_fragment_conflicts: 6,
+                ip_fragment_invalid: 7,
+                ip_fragment_timeouts: 8,
+                ip_fragment_evicted: 9,
+                ip_fragment_refused: 10,
+                ip_fragment_duplicate_conflicts: 11,
+                ip_fragment_too_far: 12,
+                bad_ip_checksum: 3,
+                bad_udp_checksum: 4,
+                not_udp: 5,
+            }
+        );
+        let sum = h.saturating_add(&h);
+        assert_eq!(sum.not_udp, 10);
+        assert_eq!(sum.ip_fragment_refused, 20);
+        let max = CaptureHealth {
+            bad_ip_checksum: u64::MAX,
+            ..Default::default()
+        };
+        assert_eq!(max.saturating_add(&h).bad_ip_checksum, u64::MAX);
+    }
+
+    #[test]
+    fn ingress_tagging() {
+        assert_eq!(Datagram::new(vec![], "a").ingress, Ingress::Unknown);
+        assert_eq!(
+            Datagram::new(vec![], "a")
+                .with_ingress(Ingress::Loopback)
+                .ingress,
+            Ingress::Loopback
+        );
+        let mut s = CaptureDatagramSource::new(
+            VecSource::new(vec![frame(7410, &rtps(1))]),
+            RtpsFilter::default(),
+        )
+        .with_ingress(Ingress::External);
+        assert_eq!(s.ingress(), Ingress::External);
+        assert_eq!(s.recv().unwrap().unwrap().ingress, Ingress::External);
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let lo = |n: &str| n.starts_with("lo");
+        assert_eq!(ingress_of_interfaces(&[], lo), Ingress::Unknown);
+        assert_eq!(ingress_of_interfaces(&v(&["lo"]), lo), Ingress::Loopback);
+        assert_eq!(
+            ingress_of_interfaces(&v(&["lo", "lo2"]), lo),
+            Ingress::Loopback
+        );
+        assert_eq!(
+            ingress_of_interfaces(&v(&["eth0", "wlan0"]), lo),
+            Ingress::External
+        );
+        assert_eq!(
+            ingress_of_interfaces(&v(&["lo", "eth0"]), lo),
+            Ingress::Unknown
+        );
+        assert!(is_loopback_interface("lo"));
+        assert!(!is_loopback_interface("robodr-no-such-if0"));
+        assert!(!is_loopback_interface(""));
+        assert!(!is_loopback_interface("../lo"));
+        assert!(!is_loopback_interface("lo/.."));
+    }
+
+    /// Reports a fixed health snapshot, then its datagrams, then ends or fails.
+    struct Scripted(VecDeque<Datagram>, Option<io::ErrorKind>, CaptureHealth);
+    impl DatagramSource for Scripted {
+        fn recv(&mut self) -> io::Result<Option<Datagram>> {
+            match self.0.pop_front() {
+                Some(d) => Ok(Some(d)),
+                None => match self.1.take() {
+                    Some(k) => Err(io::Error::new(k, "scripted")),
+                    None => Ok(None),
+                },
+            }
+        }
+        fn capture_health(&self) -> Option<CaptureHealth> {
+            Some(self.2)
+        }
+    }
+
+    fn dgs(tag: &str, n: usize, ing: Ingress) -> VecDeque<Datagram> {
+        (0..n)
+            .map(|i| Datagram::new(vec![i as u8], tag).with_ingress(ing))
+            .collect()
+    }
+
+    #[test]
+    fn merged_source_interleaves_keeps_ingress_and_sums_health() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let h = CaptureHealth {
+            not_udp: 2,
+            ..Default::default()
+        };
+        let mut m = MergedDatagramSource::new(
+            vec![
+                Box::new(Scripted(dgs("lo", 300, Ingress::Loopback), None, h)),
+                Box::new(Scripted(dgs("eth", 300, Ingress::External), None, h)),
+                Box::new(VecDatagramSource::default()),
+            ],
+            stop.clone(),
+        )
+        .unwrap();
+        let (mut lo, mut eth) = (0, 0);
+        while let Some(d) = m.recv().unwrap() {
+            match d.src_ip.as_str() {
+                "lo" => {
+                    assert_eq!(d.ingress, Ingress::Loopback);
+                    lo += 1
+                }
+                _ => {
+                    assert_eq!(d.ingress, Ingress::External);
+                    eth += 1
+                }
+            }
+        }
+        assert_eq!((lo, eth), (300, 300));
+        assert!(m.recv().unwrap().is_none(), "ended stays ended");
+        assert_eq!(m.capture_health().unwrap().not_udp, 4);
+        assert!(!stop.load(Ordering::Relaxed));
+        drop(m);
+        assert!(stop.load(Ordering::Relaxed), "drop stops the sub-sources");
+    }
+
+    #[test]
+    fn merged_source_reports_the_first_error_and_stops() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut m = MergedDatagramSource::new(
+            vec![Box::new(Scripted(
+                dgs("a", 1, Ingress::Unknown),
+                Some(io::ErrorKind::PermissionDenied),
+                CaptureHealth::default(),
+            ))],
+            stop.clone(),
+        )
+        .unwrap();
+        assert!(m.recv().unwrap().is_some());
+        assert_eq!(
+            m.recv().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(stop.load(Ordering::Relaxed));
+        assert!(m.recv().unwrap().is_none());
+        let mut empty = MergedDatagramSource::new(Vec::new(), stop).unwrap();
+        assert!(empty.recv().unwrap().is_none());
+        assert_eq!(empty.capture_health(), None);
     }
 
     #[test]

@@ -29,6 +29,9 @@
 //! hold_ms = 30000
 //! max_participants = 1024
 //! # discovery_server = ["10.0.0.2"]
+//! detect_local_addresses = true   # this host's IPs from /proc
+//! # local_addresses = ["192.168.50.10"]
+//! strict_loopback_ingress = false
 //!
 //! [module.robodr-sensor-ros2.binding.participant_ips]
 //! # "010f3a7c2104000001000000" = ["192.168.50.10", "10.8.0.10"]
@@ -43,6 +46,11 @@
 //! learning only), otherwise their own announcements are reported as
 //! mismatches. `discovery_server` lists the IPs of trusted Fast DDS
 //! discovery servers / relays whose relayed announcements are accepted.
+//! `local_addresses` / `detect_local_addresses` tell the sensor which
+//! addresses are this host's, so same-host participants talking over `lo`
+//! (Fast DDS sends unicast to local peers from `127.0.0.1`) are not reported;
+//! `strict_loopback_ingress` (see [`crate::binding`]) is for deployments
+//! whose capture always knows the ingress interface.
 //!
 //! ## Ports
 //!
@@ -167,6 +175,15 @@ pub struct BindingConfig {
     pub discovery_server: Vec<IpAddr>,
     /// Optional pins: GUID prefix (24 hex digits) -> allowed source IPs.
     pub participant_ips: BTreeMap<String, Vec<IpAddr>>,
+    /// This host's addresses, in addition to the detected ones: participants
+    /// bound to them are same-host, so their traffic over loopback is
+    /// accepted (see [`crate::binding`]).
+    pub local_addresses: Vec<IpAddr>,
+    /// Detect this host's addresses from `/proc` at start (default on).
+    pub detect_local_addresses: bool,
+    /// Judge loopback-sourced datagrams of unknown ingress like any other
+    /// source (default off; see [`crate::binding`]).
+    pub strict_loopback_ingress: bool,
 }
 
 impl Default for BindingConfig {
@@ -177,6 +194,9 @@ impl Default for BindingConfig {
             max_participants: binding::DEFAULT_MAX_PARTICIPANTS,
             discovery_server: Vec::new(),
             participant_ips: BTreeMap::new(),
+            local_addresses: Vec::new(),
+            detect_local_addresses: true,
+            strict_loopback_ingress: false,
         }
     }
 }
@@ -276,6 +296,33 @@ impl BindingConfig {
                 ));
             }
         }
+        if self.local_addresses.len() > binding::MAX_LOCAL_ADDRESSES {
+            return Err(format!(
+                "binding.local_addresses has {} entries, at most {}",
+                self.local_addresses.len(),
+                binding::MAX_LOCAL_ADDRESSES
+            ));
+        }
+        let mut local: Vec<IpAddr> = Vec::new();
+        for ip in &self.local_addresses {
+            if !valid_peer_ip(*ip) {
+                return Err(format!(
+                    "binding.local_addresses entry {ip} is not a unicast address"
+                ));
+            }
+            let ip = binding::canonical_ip(*ip);
+            if !local.contains(&ip) {
+                local.push(ip);
+            }
+        }
+        if self.strict_loopback_ingress {
+            warnings.push(
+                "binding.strict_loopback_ingress = true: loopback-sourced discovery from a \
+                 capture that cannot tell its interface is judged like remote traffic \
+                 (same-host SEDP over lo may be reported as a mismatch)"
+                    .into(),
+            );
+        }
         Ok(BindingOptions {
             enabled: self.enabled,
             discovery_servers: servers,
@@ -283,6 +330,9 @@ impl BindingConfig {
             hold: Duration::from_millis(self.hold_ms),
             max_participants: self.max_participants,
             max_pending: binding::DEFAULT_MAX_PENDING,
+            local_addresses: local,
+            detect_local_addresses: self.detect_local_addresses,
+            strict_loopback_ingress: self.strict_loopback_ingress,
         })
     }
 }
@@ -687,6 +737,18 @@ impl CaptureSettings {
     }
 }
 
+/// Split a live interface list into (loopback, other) so each capture knows
+/// its [`crate::binding::Ingress`]. `None` = do not split (empty = every
+/// interface, or only one kind).
+pub fn split_by_ingress(
+    interfaces: &[String],
+    is_loopback: impl Fn(&str) -> bool,
+) -> Option<(Vec<String>, Vec<String>)> {
+    let (lo, other): (Vec<String>, Vec<String>) =
+        interfaces.iter().cloned().partition(|i| is_loopback(i));
+    (!lo.is_empty() && !other.is_empty()).then_some((lo, other))
+}
+
 #[cfg(all(
     target_os = "linux",
     any(
@@ -703,9 +765,22 @@ fn open_live(
     timeout: Duration,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<Box<dyn crate::DatagramSource + Send>> {
+    use crate::source::{is_loopback_interface, CaptureDatagramSource, MergedDatagramSource};
+    // A mixed list (the default `["lo", <default-route>]`) becomes two
+    // captures, so a loopback source address can be told apart from a forged
+    // one on the wire (crate::binding, "Same-host traffic over loopback").
+    if let Some((lo, other)) = split_by_ingress(interfaces, is_loopback_interface) {
+        let a = CaptureDatagramSource::open_live(&lo, port_map.clone(), timeout)?
+            .with_stop_flag(stop.clone());
+        let b = CaptureDatagramSource::open_live(&other, port_map, timeout)?
+            .with_stop_flag(stop.clone());
+        return Ok(Box::new(MergedDatagramSource::new(
+            vec![Box::new(a), Box::new(b)],
+            stop,
+        )?));
+    }
     Ok(Box::new(
-        crate::source::CaptureDatagramSource::open_live(interfaces, port_map, timeout)?
-            .with_stop_flag(stop),
+        CaptureDatagramSource::open_live(interfaces, port_map, timeout)?.with_stop_flag(stop),
     ))
 }
 
@@ -772,7 +847,11 @@ mod tests {
             })
         );
         assert!(s.capture.is_none());
-        assert_eq!(s.pipeline, PipelineOptions::default());
+        // The deployed sensor detects this host's addresses; the library
+        // default (tests, replays of other hosts' captures) does not.
+        let mut expected = PipelineOptions::default();
+        expected.binding.detect_local_addresses = true;
+        assert_eq!(s.pipeline, expected);
         assert!(s.has_builtin_source());
     }
 
@@ -982,7 +1061,13 @@ mod tests {
     fn binding_defaults_and_values_reach_pipeline_options() {
         let (s, w) = validate("{}").unwrap();
         assert!(w.is_empty());
-        assert_eq!(s.pipeline.binding, BindingOptions::default());
+        assert_eq!(
+            s.pipeline.binding,
+            BindingOptions {
+                detect_local_addresses: true,
+                ..BindingOptions::default()
+            }
+        );
         let (s, w) = validate(
             r#"{"binding": {"hold_ms": 0, "max_participants": 8,
                 "discovery_server": ["10.0.0.2", "::ffff:10.0.0.2"],
@@ -1006,6 +1091,59 @@ mod tests {
         let (s, w) = validate(r#"{"binding": {"enabled": false}}"#).unwrap();
         assert!(!s.pipeline.binding.enabled);
         assert_eq!(w.len(), 1);
+    }
+
+    #[test]
+    fn binding_local_addresses_and_loopback_policy() {
+        let (s, w) = validate(
+            r#"{"binding": {"local_addresses": ["192.168.50.10", "::ffff:192.168.50.10", "fd00::1"],
+                "detect_local_addresses": false, "strict_loopback_ingress": true}}"#,
+        )
+        .unwrap();
+        let b = &s.pipeline.binding;
+        assert_eq!(
+            b.local_addresses,
+            vec![
+                IpAddr::from([192, 168, 50, 10]),
+                "fd00::1".parse::<IpAddr>().unwrap()
+            ]
+        );
+        assert!(!b.detect_local_addresses);
+        assert!(b.strict_loopback_ingress);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("strict_loopback_ingress"));
+        for bad in [
+            r#"{"binding": {"local_addresses": ["0.0.0.0"]}}"#,
+            r#"{"binding": {"local_addresses": ["239.255.0.1"]}}"#,
+            r#"{"binding": {"local_addresses": ["255.255.255.255"]}}"#,
+        ] {
+            assert!(validate(bad).is_err(), "{bad}");
+        }
+        assert!(serde_json::from_str::<Config>(
+            r#"{"binding": {"local_addresses": ["not-an-ip"]}}"#
+        )
+        .is_err());
+        let many: Vec<String> = (0..=binding::MAX_LOCAL_ADDRESSES)
+            .map(|i| format!("\"10.1.{}.{}\"", i / 250, i % 250 + 1))
+            .collect();
+        let json = format!(
+            r#"{{"binding": {{"local_addresses": [{}]}}}}"#,
+            many.join(",")
+        );
+        assert!(validate(&json).unwrap_err().contains("at most"));
+    }
+
+    #[test]
+    fn mixed_interface_lists_are_split_by_ingress() {
+        let lo = |n: &str| n == "lo";
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            split_by_ingress(&v(&["lo", "eth0", "wlan0"]), lo),
+            Some((v(&["lo"]), v(&["eth0", "wlan0"])))
+        );
+        assert_eq!(split_by_ingress(&v(&["lo"]), lo), None);
+        assert_eq!(split_by_ingress(&v(&["eth0"]), lo), None);
+        assert_eq!(split_by_ingress(&[], lo), None);
     }
 
     #[test]

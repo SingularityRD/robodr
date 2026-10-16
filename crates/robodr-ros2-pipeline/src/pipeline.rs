@@ -12,7 +12,7 @@
 //! | Source | Rule | Severity |
 //! |---|---|---|
 //! | every `RobotEvent` from the report, through `Profile::evaluate` | the profile's rules (`robot.ros2.unknown_participant`, `robot.ros2.unauthorized_motion_writer`, ...) | as the profile says |
-//! | an SEDP endpoint announced from an IP not bound to its participant, or relayed / GUID-conflicting from a non-discovery-server IP ([`crate::binding`]) | [`rules::ENDPOINT_SOURCE_MISMATCH`] | Critical (writer on a motion topic) / High |
+//! | an SEDP endpoint announced from an IP not bound to its participant, or relayed / GUID-conflicting from a non-discovery-server IP ([`crate::binding`]) | [`rules::ENDPOINT_SOURCE_MISMATCH`] | Critical (writer on a motion topic, or any endpoint with a loopback source seen on a non-loopback interface) / High |
 //! | an SEDP endpoint whose participant never sent SPDP within the hold window | [`rules::ENDPOINT_UNANNOUNCED_PARTICIPANT`] | Medium |
 //! | an SPDP for a bound participant from outside its binding, or relayed by a non-discovery-server IP | [`rules::PARTICIPANT_SOURCE_MISMATCH`] | High (profiled) / Medium |
 //! | a *profiled* participant announced as disposed / unregistered | [`rules::PARTICIPANT_REMOVED`] | Medium |
@@ -21,9 +21,12 @@
 //! | an anomaly after which the parser dropped content (version, truncation, malformed PL, bad value, no topic, anomaly overflow) | [`rules::DISCOVERY_NOT_INSPECTED`] | Medium, always |
 //! | any other parse [`Anomaly`] (if `report_anomalies`) | [`rules::MALFORMED_DISCOVERY`] | Low |
 //! | discovery `DATA_FRAG` seen (if `report_fragmentation`) | [`rules::FRAGMENTED_DISCOVERY`] | Low |
-//! | discovery fragments refused by the reassembler, or overlapping received bytes with conflicting content (first copy inspected) (always) | [`rules::DISCOVERY_FRAGMENT_REJECTED`] | Medium |
+//! | discovery fragments refused by the reassembler (always) | [`rules::DISCOVERY_FRAGMENT_REJECTED`] | Medium |
+//! | discovery fragments overlapping received bytes with conflicting content (first copy inspected; writers in that datagram judged as motion writers) (always, even with `report_anomalies = false`) | [`rules::DISCOVERY_FRAGMENT_CONFLICT`] | Medium |
 //! | partially reassembled discovery samples evicted by the reassembler (always) | [`rules::DISCOVERY_FRAGMENT_EVICTED`] | Medium |
-//! | capture-layer counters grew ([`Pipeline::capture_findings`]) | `robot.capture.*` ([`rules::CAPTURE_MALFORMED_FRAMES`], [`rules::CAPTURE_IP_FRAGMENT_CONFLICT`], [`rules::CAPTURE_IP_REASSEMBLY_DROPPED`], [`rules::CAPTURE_IP_REASSEMBLY_EVICTED`]) | Low / Medium |
+//! | capture-layer counters grew ([`Pipeline::capture_findings`]) | `robot.capture.*`: [`rules::CAPTURE_IP_FRAGMENT_CONFLICT`], [`rules::CAPTURE_IP_FRAGMENT_DUPLICATE_CONFLICT`], [`rules::CAPTURE_IP_FRAGMENT_REFUSED`], [`rules::CAPTURE_IP_REASSEMBLY_EVICTED`] | Medium |
+//! | | [`rules::CAPTURE_MALFORMED_FRAMES`], [`rules::CAPTURE_IP_REASSEMBLY_DROPPED`] (geometry, timeout, distance rule), [`rules::CAPTURE_NOT_UDP`] | Low |
+//! | | [`rules::CAPTURE_BAD_CHECKSUM`] | Low; Medium when bursty |
 //! | the profile failed `Profile::validate`, or a locked profile file failed the commissioning file check (seal: edited after `lock`) (once, [`Pipeline::status_findings`]) | [`rules::PROFILE_REFUSED`] | High |
 //! | one input produced more than `max_findings_per_datagram` new findings | [`rules::FINDINGS_CAPPED`] | most severe suppressed, >= Medium |
 //!
@@ -95,11 +98,14 @@ use robodr_commission::{parse_profile_text, ProfileFileError};
 use robodr_events::profile::{Profile, ProfileError};
 use robodr_events::{Deviation, Mode, Severity};
 use robodr_rtps::{
-    hex12, hex_guid, Anomaly, DatagramReport, EndpointKind, FragmentReassembler, ReassemblyLimits,
+    hex12, hex_guid, Anomaly, DatagramReport, EndpointKind, FragmentEventKind, FragmentReassembler,
+    ReassemblyLimits,
 };
 use serde::Serialize;
 
-use crate::binding::{parse_src_ip, BindingFinding, BindingOptions, BindingStats, BindingTable};
+use crate::binding::{
+    parse_src_ip, BindingFinding, BindingOptions, BindingStats, BindingTable, Ingress,
+};
 use crate::dedup::DedupSet;
 use crate::ratelimit::{self, RateLimiter};
 use crate::sanitize::sanitize;
@@ -124,6 +130,12 @@ pub const CAPTURE_SOURCE: &str = "capture";
 pub const DEFAULT_MAX_FINDINGS_PER_DATAGRAM: usize = 64;
 /// Largest [`PipelineOptions::max_findings_per_datagram`].
 pub const MAX_FINDINGS_PER_DATAGRAM: usize = 4096;
+/// Checksum failures within [`CHECKSUM_BURST_WINDOW`] from which
+/// [`rules::CAPTURE_BAD_CHECKSUM`] is Medium instead of Low.
+pub const CHECKSUM_BURST_THRESHOLD: u64 = 32;
+/// Window of the checksum burst detection.
+pub const CHECKSUM_BURST_WINDOW: Duration = Duration::from_secs(10);
+
 /// Distinct rule ids listed in a [`rules::FINDINGS_CAPPED`] summary.
 const MAX_CAPPED_RULES_LISTED: usize = 16;
 
@@ -199,6 +211,10 @@ struct Ambiguity {
     /// More anomalies than the parser records: an identity conflict cannot
     /// be ruled out (an attacker could pad the list with junk first).
     anomalies_truncated: bool,
+    /// Discovery fragments overlapped with conflicting bytes: the sample
+    /// was reassembled from the first copy, a last-copy-wins stack may see
+    /// a different announcement.
+    fragment_conflict: bool,
 }
 
 impl Ambiguity {
@@ -213,11 +229,16 @@ impl Ambiguity {
         Self {
             conflicting_pids: pids,
             anomalies_truncated: report.stats.anomalies as usize > report.anomalies.len(),
+            fragment_conflict: report.stats.frag_conflicts > 0
+                || report
+                    .anomalies
+                    .iter()
+                    .any(|a| matches!(a, Anomaly::ConflictingDiscoveryFragment)),
         }
     }
 
     fn any(&self) -> bool {
-        !self.conflicting_pids.is_empty() || self.anomalies_truncated
+        !self.conflicting_pids.is_empty() || self.anomalies_truncated || self.fragment_conflict
     }
 }
 
@@ -232,9 +253,15 @@ pub mod rules {
     pub const MALFORMED_DISCOVERY: &str = "robot.rtps.malformed_discovery";
     /// Discovery data arrives fragmented (DATA_FRAG); reassembled here.
     pub const FRAGMENTED_DISCOVERY: &str = "robot.rtps.fragmented_discovery";
-    /// Discovery fragments were refused (over a cap, bad geometry or a
-    /// conflicting overlap): that announcement was **not** inspected.
+    /// Discovery fragments were refused (over a cap, bad geometry, no
+    /// capacity): that announcement was **not** inspected.
     pub const DISCOVERY_FRAGMENT_REJECTED: &str = "robot.rtps.discovery_fragment_rejected";
+    /// Discovery fragments overlapped already received bytes with
+    /// **different** content (robodr-rtps `frag_conflicts`): the first copy
+    /// was inspected, a DDS stack that keeps the last copy reassembles a
+    /// different announcement. Medium, always (not gated by
+    /// `report_anomalies`), rate limited in its own bucket.
+    pub const DISCOVERY_FRAGMENT_CONFLICT: &str = "robot.rtps.discovery_fragment_conflict";
     /// Partially reassembled discovery samples were evicted to stay within
     /// the reassembler's caps: those announcements were **not** inspected.
     pub const DISCOVERY_FRAGMENT_EVICTED: &str = "robot.rtps.discovery_fragment_evicted";
@@ -248,6 +275,21 @@ pub mod rules {
     pub const CAPTURE_IP_REASSEMBLY_DROPPED: &str = "robot.capture.ip_reassembly_dropped";
     /// IP datagrams evicted from reassembly to bound memory.
     pub const CAPTURE_IP_REASSEMBLY_EVICTED: &str = "robot.capture.ip_reassembly_evicted";
+    /// IP fragments refused because the reassembly budget was full: those
+    /// datagrams were not inspected (a flood aimed at blinding the sensor).
+    pub const CAPTURE_IP_FRAGMENT_REFUSED: &str = "robot.capture.ip_fragment_refused";
+    /// Duplicate IP fragments whose bytes differ from the queued copy (first
+    /// copy kept): what was inspected may differ from what a host accepts.
+    pub const CAPTURE_IP_FRAGMENT_DUPLICATE_CONFLICT: &str =
+        "robot.capture.ip_fragment_duplicate_conflict";
+    /// IPv4 header or UDP checksum failures (the robot's kernel drops these
+    /// too): injection attempts aimed at the sensor, or a broken NIC. Low;
+    /// Medium when bursty ([`super::CHECKSUM_BURST_THRESHOLD`] within
+    /// [`super::CHECKSUM_BURST_WINDOW`]).
+    pub const CAPTURE_BAD_CHECKSUM: &str = "robot.capture.bad_checksum";
+    /// IP packets that were not UDP reached the user-space filter (the
+    /// kernel filter should only pass UDP): not inspected.
+    pub const CAPTURE_NOT_UDP: &str = "robot.capture.not_udp";
     /// A discovery announcement repeats an identity parameter (topic, type,
     /// GUID, key hash, status) with conflicting values: DDS stacks differ on
     /// which value wins, so what was inspected may not be what a stack acts
@@ -497,6 +539,8 @@ pub struct PipelineStats {
     pub discovery_fragments: u64,
     pub fragment_samples_completed: u64,
     pub fragments_rejected: u64,
+    /// Discovery fragments that overlapped with conflicting content.
+    pub fragment_conflicts: u64,
     /// Partial discovery samples evicted by the reassembler.
     pub fragment_evictions: u64,
     /// `robot.rtps.*` / `robot.capture.*` findings suppressed by the rate
@@ -527,6 +571,8 @@ pub struct Pipeline {
     frag_evicted_seen: u64,
     /// Last capture health snapshot already turned into findings.
     last_health: Option<CaptureHealth>,
+    /// Checksum failures seen in the current burst window (start, count).
+    checksum_window: Option<(Instant, u64)>,
     opts: PipelineOptions,
     stats: PipelineStats,
 }
@@ -585,6 +631,7 @@ impl Pipeline {
             limiter: RateLimiter::new(opts.rate_limit_burst, opts.rate_limit_interval),
             frag_evicted_seen: 0,
             last_health: None,
+            checksum_window: None,
             profile,
             opts,
             stats: PipelineStats::default(),
@@ -830,7 +877,23 @@ impl Pipeline {
     }
 
     /// [`Pipeline::process`] at an explicit time (monotonic across calls).
+    /// The ingress interface is unknown ([`Ingress::Unknown`]); see
+    /// [`Pipeline::process_from_at`].
     pub fn process_at(&mut self, payload: &[u8], src_ip: &str, now: Instant) -> Vec<Finding> {
+        self.process_from_at(payload, src_ip, Ingress::Unknown, now)
+    }
+
+    /// [`Pipeline::process_at`] for a datagram whose source knows which kind
+    /// of interface it arrived on: a loopback source address is then judged
+    /// as same-host traffic ([`Ingress::Loopback`]) or as forged
+    /// ([`Ingress::External`]); see [`crate::binding`].
+    pub fn process_from_at(
+        &mut self,
+        payload: &[u8],
+        src_ip: &str,
+        ingress: Ingress,
+        now: Instant,
+    ) -> Vec<Finding> {
         self.stats.datagrams += 1;
         let mut out = Vec::new();
         self.expire_into(now, &mut out);
@@ -841,8 +904,8 @@ impl Pipeline {
         let ip = parse_src_ip(src_ip);
         let ambiguity = Ambiguity::of(&report);
         self.profile_findings(&report, src_ip, &mut out);
-        self.binding_findings(&report, ip, ambiguity.any(), &mut out, now);
-        self.removal_findings(&report, src_ip, ip, &mut out);
+        self.binding_findings(&report, ip, ingress, ambiguity.any(), &mut out, now);
+        self.removal_findings(&report, src_ip, ip, ingress, &mut out);
         self.protocol_findings(&report, src_ip, &ambiguity, &mut out);
         self.emit(out, now)
     }
@@ -880,8 +943,15 @@ impl Pipeline {
         self.emit(out, Instant::now())
     }
 
+    /// Process a [`Datagram`] from a [`crate::DatagramSource`], including
+    /// its [`Ingress`].
     pub fn process_datagram(&mut self, datagram: &Datagram) -> Vec<Finding> {
-        self.process(&datagram.payload, &datagram.src_ip)
+        self.process_from_at(
+            &datagram.payload,
+            &datagram.src_ip,
+            datagram.ingress,
+            Instant::now(),
+        )
     }
 
     fn profile_findings(
@@ -905,6 +975,7 @@ impl Pipeline {
         &mut self,
         report: &DatagramReport,
         ip: Option<IpAddr>,
+        ingress: Ingress,
         ambiguous: bool,
         out: &mut Vec<Candidate>,
         now: Instant,
@@ -912,11 +983,18 @@ impl Pipeline {
         let mut found = Vec::new();
         for spdp in &report.participants {
             self.binding
-                .observe_spdp(&self.profile, spdp, ip, now, &mut found);
+                .observe_spdp(&self.profile, spdp, ip, ingress, now, &mut found);
         }
         for ep in &report.endpoints {
-            self.binding
-                .observe_endpoint(&self.profile, ep, ip, ambiguous, now, &mut found);
+            self.binding.observe_endpoint(
+                &self.profile,
+                ep,
+                ip,
+                ingress,
+                ambiguous,
+                now,
+                &mut found,
+            );
         }
         self.push_binding(out, found);
     }
@@ -926,6 +1004,7 @@ impl Pipeline {
         report: &DatagramReport,
         src_ip: &str,
         ip: Option<IpAddr>,
+        ingress: Ingress,
         out: &mut Vec<Candidate>,
     ) {
         for r in &report.removed_participants {
@@ -942,7 +1021,7 @@ impl Pipeline {
                 format!(" (relayed by {})", hex12(&r.source))
             };
             // Judged before the binding may be dropped by this removal.
-            let consistent = self.binding.observe_participant_removal(r, ip);
+            let consistent = self.binding.observe_participant_removal(r, ip, ingress);
             self.stats.binding = *self.binding.stats();
             let unbound = if consistent == Some(false) {
                 ", an IP outside its binding"
@@ -987,7 +1066,7 @@ impl Pipeline {
             };
             let id = r.guid.map(|g| hex_guid(&g)).unwrap_or_else(|| "?".into());
             let spoofed = ip
-                .and_then(|ip| self.binding.allows(&r.participant, ip))
+                .and_then(|ip| self.binding.allows_from(&r.participant, ip, ingress))
                 .is_some_and(|ok| !ok)
                 || (r.source != r.participant
                     && !ip.is_some_and(|ip| self.opts.binding.discovery_servers.contains(&ip))
@@ -1031,6 +1110,9 @@ impl Pipeline {
         }
         let d = |new: u64, old: u64| new.saturating_sub(old);
         let h = health;
+        let checksum_delta = d(h.bad_ip_checksum, prev.bad_ip_checksum)
+            .saturating_add(d(h.bad_udp_checksum, prev.bad_udp_checksum));
+        let checksum_sev = self.checksum_severity(checksum_delta, now);
         let checks = [
             (
                 d(h.truncated, prev.truncated).saturating_add(d(h.malformed, prev.malformed)),
@@ -1063,8 +1145,49 @@ impl Pipeline {
                 Severity::Medium,
                 "partially reassembled IP datagram(s) evicted to bound memory; not inspected",
             ),
-            // TODO(capture-hardening): UDP checksum failures (and capture
-            // evictions) once robodr-capture exposes them via CaptureHealth.
+            (
+                d(h.ip_fragment_refused, prev.ip_fragment_refused),
+                h.ip_fragment_refused,
+                rules::CAPTURE_IP_FRAGMENT_REFUSED,
+                Severity::Medium,
+                "IP fragment(s) refused because the reassembly budget was full; those \
+                 datagrams were not inspected",
+            ),
+            (
+                d(
+                    h.ip_fragment_duplicate_conflicts,
+                    prev.ip_fragment_duplicate_conflicts,
+                ),
+                h.ip_fragment_duplicate_conflicts,
+                rules::CAPTURE_IP_FRAGMENT_DUPLICATE_CONFLICT,
+                Severity::Medium,
+                "duplicate IP fragment(s) with bytes differing from the queued copy (first \
+                 copy inspected; a host may have accepted the other)",
+            ),
+            (
+                d(h.ip_fragment_too_far, prev.ip_fragment_too_far),
+                h.ip_fragment_too_far,
+                rules::CAPTURE_IP_REASSEMBLY_DROPPED,
+                Severity::Low,
+                "IPv4 datagram(s) restarted by the reassembly distance rule (fragments too far \
+                 apart, as Linux ipfrag_max_dist); partly not inspected",
+            ),
+            (
+                checksum_delta,
+                h.bad_ip_checksum.saturating_add(h.bad_udp_checksum),
+                rules::CAPTURE_BAD_CHECKSUM,
+                checksum_sev,
+                "packet(s) with a bad IPv4 header or UDP checksum (dropped by the robot's \
+                 kernel too: injection attempts aimed at the sensor, or a faulty NIC)",
+            ),
+            (
+                d(h.not_udp, prev.not_udp),
+                h.not_udp,
+                rules::CAPTURE_NOT_UDP,
+                Severity::Low,
+                "IP packet(s) that are not UDP reached the RTPS filter (the kernel filter \
+                 should only pass UDP); not inspected",
+            ),
         ];
         let mut out = Vec::new();
         for (delta, total, rule, sev, what) in checks {
@@ -1076,6 +1199,29 @@ impl Pipeline {
             self.push(&mut out, Deviation::new(rule, sev, detail), CAPTURE_SOURCE);
         }
         self.emit(out, now)
+    }
+
+    /// Low, or Medium when at least [`CHECKSUM_BURST_THRESHOLD`] checksum
+    /// failures arrived within [`CHECKSUM_BURST_WINDOW`] (a fixed window that
+    /// restarts at the first failure after it ended).
+    fn checksum_severity(&mut self, delta: u64, now: Instant) -> Severity {
+        if delta == 0 {
+            return Severity::Low;
+        }
+        let (start, count) = match self.checksum_window {
+            Some((start, count))
+                if now.saturating_duration_since(start) <= CHECKSUM_BURST_WINDOW =>
+            {
+                (start, count.saturating_add(delta))
+            }
+            _ => (now, delta),
+        };
+        self.checksum_window = Some((start, count));
+        if count >= CHECKSUM_BURST_THRESHOLD {
+            Severity::Medium
+        } else {
+            Severity::Low
+        }
     }
 
     fn protocol_findings(
@@ -1090,6 +1236,7 @@ impl Pipeline {
         self.stats.discovery_fragments += u64::from(s.discovery_data_frag);
         self.stats.fragment_samples_completed += u64::from(s.frag_completed);
         self.stats.fragments_rejected += u64::from(s.frag_rejected);
+        self.stats.fragment_conflicts += u64::from(s.frag_conflicts);
 
         // Conflicting duplicate identity parameters: always reported, never
         // rate limited (robot.ros2.*): DDS stacks differ on first- vs
@@ -1171,27 +1318,35 @@ impl Pipeline {
             }
         }
         // The reassembler keeps the first copy of conflicting overlapping
-        // fragments (robodr-rtps); a stack that keeps the last copy would see
-        // a different announcement than the one inspected.
-        if report
-            .anomalies
-            .iter()
-            .any(|a| matches!(a, Anomaly::ConflictingDiscoveryFragment))
-        {
+        // fragments (robodr-rtps `frag_conflicts`, also recorded as an
+        // anomaly, but the anomaly list is bounded and the counter is not);
+        // a stack that keeps the last copy would see a different
+        // announcement than the one inspected. Always reported.
+        if ambiguity.fragment_conflict {
+            let samples = report
+                .fragment_events
+                .iter()
+                .filter(|e| e.kind == FragmentEventKind::ConflictingOverlap)
+                .take(4)
+                .map(|e| format!("{:?} sample sn {} of {}", e.topic, e.sn, hex12(&e.source)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let n = s.frag_conflicts.max(1);
             let detail = format!(
-                "discovery fragments from {src_ip} overlap received bytes with conflicting \
-                 content; the first copy was inspected, a DDS stack may reassemble the other"
+                "{n} discovery fragment(s) from {src_ip} overlap received bytes with conflicting \
+                 content [{samples}]; the first copy was inspected, a DDS stack may reassemble \
+                 the other (writers in it are judged as motion writers)"
             );
             self.push(
                 out,
-                Deviation::new(rules::DISCOVERY_FRAGMENT_REJECTED, Severity::Medium, detail),
+                Deviation::new(rules::DISCOVERY_FRAGMENT_CONFLICT, Severity::Medium, detail),
                 src_ip,
             );
         }
         if s.frag_rejected > 0 {
             let detail = format!(
                 "discovery fragments from {src_ip} refused by the reassembler (over a size cap, \
-                 inconsistent geometry or conflicting overlap); that announcement was not inspected"
+                 inconsistent geometry or no capacity); that announcement was not inspected"
             );
             self.push(
                 out,
@@ -1298,6 +1453,23 @@ mod tests {
         d.extend_from_slice(&(body.len() as u16).to_le_bytes());
         d.extend_from_slice(&body);
         d
+    }
+
+    /// R3-P1 (pipeline side): once robodr-rtps reports a conflicting
+    /// PID_STATUS_INFO (duplicate-fragment / inline-QoS status smuggling) as
+    /// an identity-parameter conflict, it is High `ambiguous_discovery` and
+    /// makes writers in the datagram motion writers for the binding check.
+    #[test]
+    fn status_info_conflict_is_an_identity_conflict() {
+        let a = Anomaly::ConflictingDuplicateParameter(0x0071);
+        assert!(is_identity_conflict(&a));
+        assert_eq!(pid_name(0x0071), "PID_STATUS_INFO");
+        assert!(is_identity_conflict(&Anomaly::NonCanonicalString(0x0005)));
+        assert!(!is_identity_conflict(
+            &Anomaly::ConflictingDuplicateParameter(0x0002)
+        ));
+        assert_eq!(pid_name(0x0002), "PID 0x0002");
+        assert!(!drops_content(&a));
     }
 
     #[test]
