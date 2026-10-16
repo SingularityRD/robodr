@@ -39,6 +39,69 @@ fn code(o: &Output) -> i32 {
     o.status.code().unwrap_or(-1)
 }
 
+/// Write a profile file, filling every key the strict loader requires.
+fn write_profile(path: &Path, partial: serde_json::Value) {
+    let mut v = serde_json::json!({
+        "model": "m", "locked": false, "participants": [], "writer_topics": [],
+        "motion_envelopes": {}, "services": [], "actions": [], "reader_topics": [],
+        "raw_dds_topics": []
+    });
+    for (k, val) in partial.as_object().unwrap() {
+        v[k] = val.clone();
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+}
+
+/// Operator review: confirm every item and sign.
+fn confirm(signoff: &Path) {
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(signoff).unwrap()).unwrap();
+    v["operator"] = "Test Operator".into();
+    for i in v["items"].as_array_mut().unwrap() {
+        i["confirmed"] = true.into();
+    }
+    std::fs::write(signoff, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+}
+
+/// Sign-off path `learn` writes by default.
+fn signoff_of(profile: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.signoff.json", profile.display()))
+}
+
+/// Confirm the learned sign-off and lock.
+fn lock_learned(profile: &Path, out: &Path) -> Output {
+    confirm(&signoff_of(profile));
+    run(&[
+        "lock",
+        "--in",
+        s(profile),
+        "--signoff",
+        s(&signoff_of(profile)),
+        "--out",
+        s(out),
+    ])
+}
+
+/// Build a conservative sign-off with the `signoff` subcommand, confirm, lock.
+fn lock_any(profile: &Path, out: &Path) -> Output {
+    let so = PathBuf::from(format!("{}.so.json", out.display()));
+    let _ = std::fs::remove_file(&so);
+    let o = run(&["signoff", "--in", s(profile), "--out", s(&so)]);
+    if code(&o) != 0 {
+        return o;
+    }
+    confirm(&so);
+    run(&[
+        "lock",
+        "--in",
+        s(profile),
+        "--signoff",
+        s(&so),
+        "--out",
+        s(out),
+    ])
+}
+
 fn learn_clean(dir: &Path, name: &str) -> PathBuf {
     let out = dir.join(name);
     let o = run(&[
@@ -65,7 +128,24 @@ fn demo_learn_lock_check_clean_then_rogue() {
     assert_eq!(p["participants"].as_array().unwrap().len(), 4);
 
     let locked = d.join("locked.json");
-    let o = run(&["lock", "--in", s(&profile), "--out", s(&locked)]);
+    // Unconfirmed sign-off: refused.
+    let o = run(&[
+        "lock",
+        "--in",
+        s(&profile),
+        "--signoff",
+        s(&signoff_of(&profile)),
+        "--out",
+        s(&locked),
+    ]);
+    assert_eq!(code(&o), 1);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("not confirmed by the operator: motion_writer:/cmd_vel"),
+        "{err}"
+    );
+    assert!(!locked.exists());
+    let o = lock_learned(&profile, &locked);
     assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
 
     // Sprint 3 demo: clean re-run -> zero deviations.
@@ -96,7 +176,7 @@ fn demo_learn_lock_check_clean_then_rogue() {
         "--quiet",
     ]);
     assert_eq!(code(&o), 0);
-    assert_eq!(code(&run(&["lock", "--in", s(&pr), "--out", s(&lr)])), 0);
+    assert_eq!(code(&lock_learned(&pr, &lr)), 0);
     let o = run(&[
         "check",
         "--profile",
@@ -226,46 +306,63 @@ fn learn_multiple_runs_merges() {
     assert_eq!(code(&o), 0);
     let p: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
-    assert_eq!(p["participants"].as_array().unwrap().len(), 5);
+    // The rogue announced once: quarantined, not learned.
+    assert_eq!(p["participants"].as_array().unwrap().len(), 4);
     let r: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&rep).unwrap()).unwrap();
     assert_eq!(r["runs"].as_array().unwrap().len(), 2);
-    // The rogue was seen once: the report must call that out.
-    let warned = r["warnings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|w| w["code"] == "participant_seen_once");
-    assert!(warned);
+    assert_eq!(
+        r["participants"]["0f0f0f0f0f0f0f0f0f0f0f0f"]["status"],
+        "quarantined"
+    );
+    let warned = |code: &str| {
+        r["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == code)
+    };
+    assert!(warned("participant_seen_once"));
+    assert!(warned("quarantined_participant"));
 }
 
 #[test]
 fn lock_refuses_bad_profiles_and_relock() {
     let d = tmpdir("lock");
     let empty = d.join("empty.json");
-    std::fs::write(&empty, r#"{"model":"m"}"#).unwrap();
+    write_profile(&empty, serde_json::json!({}));
     let out = d.join("locked.json");
-    let o = run(&["lock", "--in", s(&empty), "--out", s(&out)]);
+    let o = lock_any(&empty, &out);
     assert_eq!(code(&o), 1);
     assert!(String::from_utf8_lossy(&o.stderr).contains("no participants"));
     assert!(!out.exists());
 
     let noenv = d.join("noenv.json");
-    std::fs::write(
+    write_profile(
         &noenv,
-        r#"{"model":"m","participants":["aaaaaaaaaaaaaaaaaaaaaaaa"],"writer_topics":["/cmd_vel"],
-           "motion_envelopes":{"/cmd_vel":{"max_linear_speed":null,"max_joint_speed":null}}}"#,
-    )
-    .unwrap();
-    let o = run(&["lock", "--in", s(&noenv), "--out", s(&out)]);
+        serde_json::json!({"participants":["aaaaaaaaaaaaaaaaaaaaaaaa"],"writer_topics":["/cmd_vel"],
+           "motion_envelopes":{"/cmd_vel":{"max_linear_speed":null,"max_joint_speed":null}}}),
+    );
+    let o = lock_any(&noenv, &out);
     assert_eq!(code(&o), 1);
     assert!(String::from_utf8_lossy(&o.stderr).contains("/cmd_vel has no envelope"));
 
     let good = learn_clean(&d, "p.json");
-    assert_eq!(code(&run(&["lock", "--in", s(&good), "--out", s(&out)])), 0);
-    let o = run(&["lock", "--in", s(&out), "--out", s(&d.join("again.json"))]);
+    assert_eq!(code(&lock_learned(&good, &out)), 0);
+    let o = run(&[
+        "lock",
+        "--in",
+        s(&out),
+        "--signoff",
+        s(&signoff_of(&good)),
+        "--out",
+        s(&d.join("again.json")),
+    ]);
     assert_eq!(code(&o), 1);
     assert!(String::from_utf8_lossy(&o.stderr).contains("already locked"));
+    // The signoff subcommand refuses a locked profile.
+    let o = run(&["signoff", "--in", s(&out), "--out", s(&d.join("x.json"))]);
+    assert_eq!(code(&o), 2);
 }
 
 #[test]
@@ -277,7 +374,8 @@ fn diff_exit_codes_and_output() {
     assert_eq!(code(&o), 0);
     assert!(String::from_utf8_lossy(&o.stdout).contains("identical"));
 
-    let c = d.join("c.json");
+    // The rogue run learns the same profile (rogue quarantined)...
+    let c0 = d.join("c0.json");
     let o = run(&[
         "learn",
         "--events",
@@ -285,10 +383,35 @@ fn diff_exit_codes_and_output() {
         "--model",
         "ugv-demo-synthetic",
         "--out",
+        s(&c0),
+        "--quiet",
+    ]);
+    assert_eq!(code(&o), 0);
+    assert_eq!(code(&run(&["diff", s(&a), s(&c0)])), 0);
+    // ... unless the operator explicitly accepts it.
+    let c = d.join("c.json");
+    let o = run(&[
+        "learn",
+        "--events",
+        s(&example("rogue-participant.jsonl")),
+        "--model",
+        "ugv-demo-synthetic",
+        "--accept-participant",
+        "0f0f0f0f0f0f0f0f0f0f0f0f",
+        "--out",
         s(&c),
         "--quiet",
     ]);
     assert_eq!(code(&o), 0);
+    let so = std::fs::read_to_string(signoff_of(&c)).unwrap();
+    assert!(
+        so.contains("participant_operator_accepted:0f0f0f0f0f0f0f0f0f0f0f0f"),
+        "{so}"
+    );
+    assert!(
+        so.contains("motion_writer:/cmd_vel 0f0f0f0f0f0f0f0f0f0f0f0f"),
+        "{so}"
+    );
     let o = run(&["diff", s(&a), s(&c)]);
     assert_eq!(code(&o), 1);
     let out = String::from_utf8_lossy(&o.stdout);
@@ -306,24 +429,43 @@ fn merge_subcommand() {
     let d = tmpdir("merge");
     let a = learn_clean(&d, "a.json");
     let b = d.join("b.json");
-    std::fs::write(
+    write_profile(
         &b,
-        r#"{"model":"ugv-demo-synthetic","participants":["bbbbbbbbbbbbbbbbbbbbbbbb"],"writer_topics":["/x"],
-           "motion_envelopes":{"/cmd_vel":{"max_linear_speed":9.0,"max_joint_speed":null}}}"#,
-    )
-    .unwrap();
+        serde_json::json!({"model":"ugv-demo-synthetic","participants":["bbbbbbbbbbbbbbbbbbbbbbbb"],
+           "writer_topics":["/x"],
+           "motion_envelopes":{"/cmd_vel":{"max_linear_speed":9.0,"max_joint_speed":null}}}),
+    );
     let m = d.join("m.json");
     let o = run(&["merge", "--out", s(&m), s(&a), s(&b)]);
     assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("signoff --in"));
     let p: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&m).unwrap()).unwrap();
     assert_eq!(p["participants"].as_array().unwrap().len(), 5);
     assert_eq!(p["motion_envelopes"]["/cmd_vel"]["max_linear_speed"], 9.0);
     assert_eq!(p["locked"], false);
+    // The learned sign-off of `a` does not cover the merged draft...
+    let o = run(&[
+        "lock",
+        "--in",
+        s(&m),
+        "--signoff",
+        s(&signoff_of(&a)),
+        "--out",
+        s(&d.join("ml.json")),
+    ]);
+    assert_eq!(code(&o), 1);
+    assert!(String::from_utf8_lossy(&o.stderr).contains("does not belong to this draft"));
+    // ... a conservative one does, once every participant is confirmed.
+    assert_eq!(code(&lock_any(&m, &d.join("ml.json"))), 0);
 
     let other = d.join("o.json");
-    std::fs::write(&other, r#"{"model":"different"}"#).unwrap();
-    let o = run(&["merge", "--out", s(&m), s(&a), s(&other)]);
+    write_profile(&other, serde_json::json!({"model":"different"}));
+    let o = run(&["merge", "--force", "--out", s(&m), s(&a), s(&other)]);
     assert_eq!(code(&o), 2);
+    // Merging into an existing file without --force: refused.
+    let o = run(&["merge", "--out", s(&m), s(&a), s(&b)]);
+    assert_eq!(code(&o), 2);
+    assert!(String::from_utf8_lossy(&o.stderr).contains("refusing to overwrite"));
 }
 
 #[test]
@@ -402,6 +544,41 @@ fn usage_and_input_errors_exit_2() {
             "--in".into(),
             "b".into(),
         ],
+        // lock without --signoff
+        vec![
+            "lock".into(),
+            "--in".into(),
+            s(&example("clean-run.jsonl")).into(),
+            "--out".into(),
+            s(&out).into(),
+        ],
+        vec![
+            "learn".into(),
+            "--events".into(),
+            s(&example("clean-run.jsonl")).into(),
+            "--hard-cap-linear".into(),
+            "inf".into(),
+            "--out".into(),
+            s(&out).into(),
+        ],
+        vec![
+            "learn".into(),
+            "--events".into(),
+            s(&example("clean-run.jsonl")).into(),
+            "--accept-participant".into(),
+            "not-a-guid".into(),
+            "--out".into(),
+            s(&out).into(),
+        ],
+        vec![
+            "learn".into(),
+            "--events".into(),
+            s(&example("clean-run.jsonl")).into(),
+            "--min-duration".into(),
+            "-1".into(),
+            "--out".into(),
+            s(&out).into(),
+        ],
     ];
     for c in cases {
         let o = Command::new(BIN).args(&c).output().unwrap();
@@ -432,7 +609,17 @@ fn malformed_events_file_is_rejected_with_line() {
 
     let p = d.join("p.json");
     std::fs::write(&p, "{not a profile").unwrap();
-    let o = run(&["lock", "--in", s(&p), "--out", s(&d.join("l.json"))]);
+    let so = d.join("so.json");
+    std::fs::write(&so, "{}").unwrap();
+    let o = run(&[
+        "lock",
+        "--in",
+        s(&p),
+        "--signoff",
+        s(&so),
+        "--out",
+        s(&d.join("l.json")),
+    ]);
     assert_eq!(code(&o), 2);
 }
 
@@ -493,7 +680,7 @@ fn learn_from_pcap_then_lock_and_check_it() {
     assert_eq!(r["runs"][0]["capture"]["discovery_frag_completed"], 1);
 
     let locked = d.join("locked.json");
-    let o = run(&["lock", "--in", s(&prof), "--out", s(&locked)]);
+    let o = lock_learned(&prof, &locked);
     assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
     let o = run(&["check", "--profile", s(&locked), "--pcap", s(&cap)]);
     let out = String::from_utf8_lossy(&o.stdout);
@@ -543,14 +730,13 @@ fn learn_from_pcap_then_lock_and_check_it() {
 fn lock_and_check_refuse_invalid_profiles() {
     let d = tmpdir("invalid");
     let bad = d.join("bad.json");
-    std::fs::write(
+    write_profile(
         &bad,
-        r#"{"model":"m","participants":["aaaaaaaaaaaaaaaaaaaaaaaa"],"writer_topics":["rt/cmd_vel"],
-           "services":["get_parameters"]}"#,
-    )
-    .unwrap();
+        serde_json::json!({"participants":["aaaaaaaaaaaaaaaaaaaaaaaa"],"writer_topics":["rt/cmd_vel"],
+           "services":["get_parameters"]}),
+    );
     let out = d.join("locked.json");
-    let o = run(&["lock", "--in", s(&bad), "--out", s(&out)]);
+    let o = lock_any(&bad, &out);
     assert_eq!(code(&o), 1);
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(err.contains("writer_topics entry \"rt/cmd_vel\""), "{err}");

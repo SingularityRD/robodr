@@ -87,7 +87,8 @@ fn pcap_learn_lock_check_is_clean_and_reassembles_fragmented_sedp() {
     assert!(r.participants[&t].first_seen.position >= 1);
 
     // lock -> check over the same capture: zero deviations.
-    let locked = lock(&p).unwrap();
+    let signoff = l.finish().signoff.confirm_all("test");
+    let locked = lock(&p, &signoff).unwrap();
     let mut chk = Checker::new(&locked);
     chk.ingest(&mut PcapSource::new("mem.pcap", &bytes[..]).unwrap())
         .unwrap();
@@ -104,7 +105,8 @@ fn pcap_learn_lock_check_is_clean_and_reassembles_fragmented_sedp() {
     .unwrap();
     l2.ingest(&mut PcapSource::new("mem.pcap", &bytes[..]).unwrap())
         .unwrap();
-    let p2 = lock(&l2.profile()).unwrap();
+    let c2 = l2.finish();
+    let p2 = lock(&c2.profile, &c2.signoff.confirm_all("test")).unwrap();
     assert!(p2.reader_topics.contains("/chatter"));
     let mut chk = Checker::new(&p2);
     chk.ingest(&mut PcapSource::new("mem.pcap", &bytes[..]).unwrap())

@@ -11,6 +11,8 @@ description = "Observe-mode commissioning: learns a robot's model profile from c
 robodr-events = { workspace = true }
 robodr-capture = { workspace = true }
 robodr-rtps = { workspace = true }
+# std-only SHA-256 (profile seal, sign-off binding).
+robodr-blackbox = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
