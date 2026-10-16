@@ -41,8 +41,22 @@
 //! a digit). This matters for safety, not just tidiness: matching is exact, so
 //! an envelope keyed `cmd_vel`, `rt/cmd_vel` or `/cmd_vel/` silently never
 //! applies, and a foreign writer on the real `/cmd_vel` would not raise the
-//! Critical `unauthorized_motion_writer`. `raw_dds_topics` is exempt (raw DDS
-//! names are arbitrary; only empty entries are rejected).
+//! Critical `unauthorized_motion_writer`. `raw_dds_topics` is exempt from the
+//! ROS-name rules (raw DDS names are arbitrary) with two exceptions: empty
+//! entries are rejected, and so is an entry that [`demangle`] classifies as a
+//! ROS name (`rt/cmd_vel`): it could never match (ROS-prefixed names are
+//! checked against the ROS sets) and almost certainly means the author meant
+//! the ROS name ([`ProfileError::RawTopicIsRosName`]). A *malformed* prefixed
+//! name such as `rt//cmd_vel` is genuinely raw and stays allowed.
+//!
+//! **Defence in depth for refused profiles.** A profile that fails
+//! `validate` is not enforced, but the sensor may still evaluate it in observe
+//! mode for visibility. For that case only, the unauthorized-motion check also
+//! treats a *malformed* envelope key as naming the ROS topic it obviously
+//! means (`cmd_vel`, `rt/cmd_vel`, `/cmd_vel/`, ` /cmd_vel`, `//cmd_vel` ->
+//! `/cmd_vel`): a foreign writer on `rt/cmd_vel` is still Critical instead of
+//! silent. This lenient reading can only *add* detections; it never makes an
+//! endpoint allowed. Well-formed keys are matched exactly as always.
 //!
 //! **Motion channels must be writable.** Every `motion_envelopes` key must
 //! also be allowed for writers by the same rule `evaluate` uses: listed in
@@ -70,8 +84,8 @@
 //! non-motion topics/services are reported only via the participant rule.
 
 use crate::graph::{
-    demangle, validate_full_name, ActionRole, Endpoint, Participant, RosName, RosNameIssue,
-    RosNameKind,
+    demangle, is_full_name, validate_full_name, ActionRole, Endpoint, Participant, RosName,
+    RosNameIssue, RosNameKind,
 };
 use crate::{Deviation, Mode, MotionCommand, RobotEvent, Severity};
 use serde::{Deserialize, Serialize};
@@ -178,6 +192,11 @@ pub enum ProfileError {
     /// writers (not in `writer_topics`, not part of a profiled action): every
     /// legitimate publisher of it would be reported as an unknown writer.
     MotionChannelNotWritable { channel: String },
+    /// A `raw_dds_topics` entry is a well-formed ROS-mangled name (`rt/x`,
+    /// `rq/xRequest`, ...). Such names are always checked against the ROS
+    /// sets, so the raw entry can never match: list the de-mangled name in
+    /// the proper ROS set instead.
+    RawTopicIsRosName { name: String },
 }
 
 impl fmt::Display for ProfileError {
@@ -208,6 +227,10 @@ impl fmt::Display for ProfileError {
             Self::MotionChannelNotWritable { channel } => write!(
                 f,
                 "motion_envelopes channel {channel:?} is not in writer_topics (nor a profiled action topic); its legitimate publishers would be reported as unknown writers"
+            ),
+            Self::RawTopicIsRosName { name } => write!(
+                f,
+                "raw_dds_topics entry {name:?} is a ROS-mangled name and can never match; list the de-mangled ROS name in writer_topics/services/actions instead"
             ),
         }
     }
@@ -241,6 +264,20 @@ fn ros_name_error(set: &'static str, name: &str) -> Option<ProfileError> {
             issue,
         }),
     }
+}
+
+/// Best-effort reading of a malformed profile name as the ROS topic its
+/// author meant: trim whitespace, drop a `rt/` mangling prefix, drop empty
+/// tokens (leading/trailing/repeated `/`), re-qualify with `/`. `None` if
+/// nothing is left. Used only to *add* detections on invalid profiles.
+fn lenient_ros_name(key: &str) -> Option<String> {
+    let t = key.trim();
+    let t = t.strip_prefix("rt/").unwrap_or(t);
+    let tokens: Vec<&str> = t.split('/').filter(|s| !s.is_empty()).collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    Some(format!("/{}", tokens.join("/")))
 }
 
 impl Profile {
@@ -277,6 +314,11 @@ impl Profile {
         }
         if self.raw_dds_topics.iter().any(String::is_empty) {
             errs.push(ProfileError::EmptyRawTopic);
+        }
+        for raw in &self.raw_dds_topics {
+            if demangle(raw).is_ros() {
+                errs.push(ProfileError::RawTopicIsRosName { name: raw.clone() });
+            }
         }
         for (channel, env) in &self.motion_envelopes {
             if channel.is_empty() {
@@ -363,6 +405,18 @@ impl Profile {
         }
     }
 
+    /// Is the de-mangled ROS topic `name` a motion channel? Exact key match,
+    /// or (defence in depth for profiles that failed validation) a malformed
+    /// key whose lenient reading is `name`. See the module docs.
+    fn is_motion_topic(&self, name: &str) -> bool {
+        self.motion_envelopes.contains_key(name)
+            || self
+                .motion_envelopes
+                .keys()
+                .filter(|k| !is_full_name(k))
+                .any(|k| lenient_ros_name(k).as_deref() == Some(name))
+    }
+
     fn check_writer(&self, e: &Endpoint) -> Option<Deviation> {
         let rn = e.ros_name();
         let known_participant = self.participants.contains(&e.guid_prefix);
@@ -374,7 +428,7 @@ impl Profile {
                     ..
                 }
         );
-        let publishes_motion = topic_transport && self.motion_envelopes.contains_key(&rn.name);
+        let publishes_motion = topic_transport && self.is_motion_topic(&rn.name);
 
         // A writer to a motion topic from a participant not in the profile is
         // the RoboPAIR / spoofed-command case: highest severity.
@@ -962,10 +1016,26 @@ mod tests {
         }
         // Raw DDS names are exempt from ROS rules (only empty is rejected).
         let mut p = profile();
-        for raw in ["rt//cmd_vel", "cmd vel", "/x/", "1abc", "rt/cmd_vel"] {
+        for raw in ["rt//cmd_vel", "cmd vel", "/x/", "1abc", "rtcmd_vel"] {
             p.raw_dds_topics.insert(raw.into());
         }
         assert_eq!(p.validate(), Ok(()));
+        // ...but a well-formed ROS-mangled name can never match as raw.
+        for ros in [
+            "rt/cmd_vel",
+            "rq/add_two_intsRequest",
+            "rr/xReply_",
+            "rt/nav/_action/status",
+        ] {
+            let mut q = profile();
+            q.raw_dds_topics.insert(ros.into());
+            assert_eq!(
+                q.validate(),
+                Err(vec![ProfileError::RawTopicIsRosName { name: ros.into() }]),
+                "{ros}"
+            );
+            assert!(q.validate().unwrap_err()[0].to_string().contains(ros));
+        }
         // Accepted edge forms.
         let mut p = profile();
         for ok in ["/a__b", "/_hidden", "/robot1/cmd_vel2"] {
@@ -1063,6 +1133,46 @@ mod tests {
                 channel: "/drive".into()
             }])
         );
+    }
+
+    #[test]
+    fn malformed_envelope_key_still_flags_foreign_motion_writer() {
+        // Validation refuses these profiles, but a refused profile may still be
+        // evaluated (observe mode): it must not be silent about a foreign
+        // motion writer.
+        for key in [
+            "cmd_vel",
+            "rt/cmd_vel",
+            "/cmd_vel/",
+            "//cmd_vel",
+            " /cmd_vel",
+            "/cmd_vel\t",
+            "rt//cmd_vel/",
+        ] {
+            let mut p = profile();
+            p.motion_envelopes.clear();
+            p.motion_envelopes.insert(key.into(), Envelope::default());
+            assert!(p.validate().is_err(), "{key:?}");
+            let d = p.evaluate(&writer(FOREIGN, "rt/cmd_vel")).unwrap();
+            assert_eq!(d.rule, "robot.ros2.unauthorized_motion_writer", "{key:?}");
+            assert_eq!(d.severity, Severity::Critical);
+            // Lenient reading never *allows* anything: known writer still
+            // clean (via writer_topics), other topics unchanged.
+            assert!(p.evaluate(&writer(KNOWN, "rt/cmd_vel")).is_none());
+            assert!(p.evaluate(&writer(FOREIGN, "rt/odom")).is_none());
+            assert_eq!(
+                rule_of(&p, &writer(FOREIGN, "rt/cmd_vel2")).as_deref(),
+                Some("robot.ros2.unknown_writer_topic")
+            );
+        }
+        // Degenerate keys read as nothing and match nothing.
+        for key in ["/", "//", "rt/", "   "] {
+            assert_eq!(lenient_ros_name(key), None, "{key:?}");
+            let mut p = profile();
+            p.motion_envelopes.insert(key.into(), Envelope::default());
+            assert!(p.evaluate(&writer(FOREIGN, "rt/odom")).is_none());
+        }
+        assert_eq!(lenient_ros_name("a//b/").as_deref(), Some("/a/b"));
     }
 
     #[test]

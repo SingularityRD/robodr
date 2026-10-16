@@ -81,13 +81,17 @@ pub struct Endpoint {
 impl Endpoint {
     /// The de-mangled ROS 2 *topic* name: `rt/cmd_vel` -> `/cmd_vel`.
     ///
-    /// Only the exact `rt/` prefix is stripped (the leading `/` is kept). Any
-    /// other name — services (`rq/…`, `rr/…`) and raw DDS topics such as
-    /// `rtfoo` — is returned unchanged. Use [`Endpoint::ros_name`] to classify
-    /// services, actions and raw topics properly.
+    /// Only the exact `rt/` prefix is stripped (the leading `/` is kept), and
+    /// only when the remainder is a well-formed ROS name, i.e. exactly when
+    /// [`demangle`] classifies the name as a topic (or action topic). Any
+    /// other name — services (`rq/…`, `rr/…`), raw DDS topics such as
+    /// `rtfoo`, and malformed lookalikes such as `rt//cmd_vel` or
+    /// `rt/cmd_vel/` — is returned unchanged, so this never yields a string
+    /// that collides with a profiled ROS name the wire name does not reach.
+    /// Use [`Endpoint::ros_name`] to classify services, actions and raw topics.
     pub fn ros_topic(&self) -> &str {
         match self.topic.strip_prefix("rt") {
-            Some(rest) if rest.starts_with('/') => rest,
+            Some(rest) if rest.starts_with('/') && is_full_name(rest) => rest,
             _ => &self.topic,
         }
     }
@@ -587,6 +591,15 @@ mod tests {
         assert_eq!(ep("rt").ros_topic(), "rt");
         assert_eq!(ep("rq/addRequest").ros_topic(), "rq/addRequest");
         assert_eq!(ep("").ros_topic(), "");
+        // Consistent with demangle: malformed lookalikes stay verbatim.
+        for t in ["rt//cmd_vel", "rt/cmd_vel/", "rt/", "rt/1x", "rt/a b"] {
+            assert_eq!(ep(t).ros_topic(), t, "{t}");
+            assert_eq!(demangle(t).kind, RosNameKind::Raw);
+        }
+        assert_eq!(
+            ep("rt/nav/_action/status").ros_topic(),
+            "/nav/_action/status"
+        );
     }
 
     #[test]

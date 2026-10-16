@@ -108,3 +108,63 @@ fn writer_topic_entries_are_checked_too() {
         issue: RosNameIssue::RepeatedSlash,
     }));
 }
+
+/// The reviewer's PoC, inverted: with each bad key the profile is refused by
+/// `validate()`, AND (defence in depth, a refused profile may still be
+/// evaluated in observe mode) the foreign motion writer is still Critical
+/// instead of silent.
+#[test]
+fn poc_non_ros_envelope_key_no_longer_silences_unauthorized_motion_writer() {
+    for key in ["cmd_vel", "rt/cmd_vel", "/cmd_vel/"] {
+        let p = prof(key);
+        assert!(p.validate().is_err(), "{key} must be refused by validate");
+        let d = p
+            .evaluate(&foreign_writer("rt/cmd_vel"))
+            .unwrap_or_else(|| panic!("foreign motion writer silent with key {key}"));
+        assert_eq!(d.rule, "robot.ros2.unauthorized_motion_writer", "{key}");
+        assert_eq!(d.severity, Severity::Critical, "{key}");
+    }
+}
+
+/// Sibling: a ROS-mangled name in `raw_dds_topics` can never match (the wire
+/// name is classified as a ROS topic) and is refused.
+#[test]
+fn ros_mangled_raw_entry_is_refused() {
+    let mut p = prof("/cmd_vel");
+    p.raw_dds_topics.insert("rt/cmd_vel".into());
+    assert_eq!(
+        p.validate(),
+        Err(vec![ProfileError::RawTopicIsRosName {
+            name: "rt/cmd_vel".into()
+        }])
+    );
+    // The raw entry does not allow the foreign writer either way.
+    assert_eq!(
+        p.evaluate(&foreign_writer("rt/cmd_vel")).unwrap().rule,
+        "robot.ros2.unauthorized_motion_writer"
+    );
+}
+
+/// Sibling: `Endpoint::ros_topic` agrees with `demangle` on malformed names.
+#[test]
+fn ros_topic_agrees_with_demangle() {
+    for t in [
+        "rt/cmd_vel",
+        "rt//cmd_vel",
+        "rt/cmd_vel/",
+        "rtcmd_vel",
+        "RT/cmd_vel",
+    ] {
+        let e = Endpoint {
+            guid_prefix: FOREIGN.into(),
+            topic: t.into(),
+            type_name: String::new(),
+        };
+        let rn = demangle(t);
+        if rn.kind == RosNameKind::Topic {
+            assert_eq!(e.ros_topic(), rn.name, "{t}");
+        } else {
+            assert_eq!(e.ros_topic(), t, "{t}");
+        }
+    }
+}
