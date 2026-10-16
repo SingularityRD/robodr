@@ -32,6 +32,10 @@ robodr\-commission \- learn, review, lock and verify a RoboDR model profile
 .IR GUID ]...
 .RB [ \-\-motion\-topic
 .IR /T ]...
+.RB [ \-\-discovery\-server
+.IR PREFIX | PREFIX@IP | IP ]...
+.RB [ \-\-trusted\-discovery\-server
+.IR PREFIX | PREFIX@IP | IP ]...
 .RB [ \-\-learn\-readers ]
 .B \-\-out
 .I profile.json
@@ -49,6 +53,11 @@ robodr\-commission \- learn, review, lock and verify a RoboDR model profile
 .I signoff.json
 .B \-\-out
 .I locked.json
+.B \-\-operators
+.I operators.json
+.RB [ \-\-motion\-quorum
+.IR N ]
+.RB [ \-\-no\-manifest ]
 .RB ( \-\-parent
 .IR previous\-locked.json " | "
 .B \-\-platform
@@ -130,6 +139,26 @@ robodr\-commission \- learn, review, lock and verify a RoboDR model profile
 .I profile.json
 .B \-\-out
 .I signoff.json
+.RB [ \-\-force ]
+.PP
+.B robodr\-commission signoff
+.B \-\-signoff
+.I signoff.json
+.B \-\-sign\-key
+.I operator.key
+.RB [ \-\-in
+.IR profile.json ]
+.RB [ \-\-operators
+.IR operators.json ]
+.RB [ \-\-force ]
+.PP
+.B robodr\-commission operators
+.B \-\-out
+.I operators.json
+.B \-\-operator
+.IR NAME = KEY.pub " ..."
+.RB [ \-\-motion\-quorum
+.IR N ]
 .RB [ \-\-force ]
 .PP
 .B robodr\-commission diff
@@ -219,6 +248,26 @@ sign\-off item.
 .BI \-\-motion\-topic " /T"
 Treat this topic as a motion channel (repeatable).
 .TP
+.BI \-\-discovery\-server " PREFIX|PREFIX@IP|IP"
+A known discovery server (repeatable; at most 32): an endpoint it relays
+for another participant is attributed to that owner, never to the server,
+and is not flagged when the owner is accepted and announced the same
+endpoint itself from a commissioned IP. Anything else it relays is not
+learned and becomes an
+.B endpoint_sender_mismatch
+sign\-off item naming the server. Participant announcements it relays are
+ignored by the anti\-poisoning gate.
+.TP
+.BI \-\-trusted\-discovery\-server " PREFIX|PREFIX@IP|IP"
+A trusted discovery server: its relayed participant announcements count
+for the owner's gate (as the pseudo\-address
+.BR relay: \fIserver\fR,
+never the server's IP), and endpoints it relays for an accepted owner are
+learned. Relays for owners that are not accepted are still flagged. Mirrors
+the sensor pipeline's
+.B discovery_servers
+binding option; trusting a server means trusting whatever it relays.
+.TP
 .B \-\-learn\-readers
 Also learn reader_topics, which turns reader\-topic enforcement on (off by
 default: a policy choice for the OEM).
@@ -238,16 +287,126 @@ Machine\-readable learning report.
 Do not print the report on stdout.
 .SH SIGN-OFF AND LOCK
 .B learn
-writes a sign\-off list;
-.B lock
-refuses until a named
-.B \(dqoperator\(dq
-has set
+writes a sign\-off list (one item per risky finding: motion writers, late,
+brief or multi\-IP participants, outliers, sender mismatches, ...), bound to
+the exact draft bytes
+.RB ( profile_sha256 )
+and to its own item set
+.RB ( items_sha256 ).
+The operator reviews every item, sets
 .B \(dqconfirmed\(dq: true
-on every item.
-.B signoff
-builds a conservative list for an edited or merged draft. A locked profile is
-sealed; the sensor refuses a locked profile whose seal does not match.
+and fills
+.BR \(dqoperator\(dq .
+.PP
+Those digests are plain hashes: anyone who can write the files can recompute
+them. The decision is made authentic by the operator's
+.B signature:
+.PP
+.RS
+.B robodr\-commission signoff \-\-signoff
+.I S
+.B \-\-sign\-key
+.I OP.key
+.RE
+.PP
+signs the exact bytes of the confirmed list (Ed25519, robodr\-blackbox key
+file
+.BR robodr\-blackbox\-key/v2 ,
+secret file mode 0600, from
+.B keygen
+or
+.BR "robodr\-blackbox keygen" )
+and adds the signature to
+.IB S .sig
+.RB ( robodr\-signoff\-sigs/v1 ).
+It refuses a list that is not fully confirmed, names no operator, has a
+broken item digest, or (with
+.BR \-\-in )
+belongs to another draft or lacks a required item; with
+.B \-\-operators
+it also refuses a key that is not listed. Further operators sign the same
+bytes. Editing the list afterwards voids every signature; re\-signing then
+needs
+.B \-\-force
+(discarding the old signatures).
+.PP
+.B robodr\-commission operators
+builds the
+.B operators trust list
+.RB ( robodr\-operators/v1 )
+from public key files, binding each key to an operator name, with
+.B motion_quorum
+(default 1). It is refused at load if it is a symlink or writable by
+group/others, lists a key id or a public key twice, or asks for a quorum
+above its number of distinct operators.
+.PP
+.B lock \-\-operators
+.I operators.json
+refuses (exit 1, every reason listed) unless the list belongs to the draft,
+names an operator and confirms every item, its item set is intact, the
+floor recomputed from the draft is covered (a confirmed motion review per
+motion channel, a confirmed
+.B envelope_dimension_unbounded
+item per motion dimension left unlimited), every signature in
+.IB S .sig
+verifies under a listed key (one bad or unknown signature refuses: fail
+closed), the named operator is among the signers (so
+.B locked_by
+is an authenticated identity), and, when the list has motion items
+.RB ( motion_writer ,
+.BR motion_unattributed ,
+.BR motion_channel_unreviewed ),
+at least
+.B motion_quorum
+distinct operators (names, not keys) signed: the two\-person rule.
+.B \-\-motion\-quorum
+raises the quorum for one lock, never lowers it.
+.PP
+.B Output manifest.
+Each output is published atomically, but a power loss between files could
+leave a new draft beside an old list or report. So
+.B learn
+writes
+.IB out .manifest.json
+.B last
+(after removing a stale one): the draft's and report's SHA\-256 and the
+list's
+.B profile_sha256
+and
+.BR items_sha256 .
+.B lock
+refuses a draft whose manifest is missing or does not match the draft, the
+list or the report;
+.B check
+refuses a draft whose manifest does not match (a draft without one, e.g.
+from
+.BR merge ,
+is checked with a note).
+.B lock \-\-no\-manifest
+skips the check for drafts made before manifests existed. A manifest
+detects torn and mixed\-up sets, not forgery.
+.PP
+.B signoff \-\-in
+.I profile.json
+.B \-\-out
+.I S
+builds a conservative list for an edited or merged draft (every participant
+and motion channel confirmed individually) and writes the draft's manifest
+(replacing a stale one; a manifest that still matches needs
+.BR \-\-force ).
+.PP
+Trust model: trusted are the operators trust list (install it as carefully
+as the profile trust file), the operators' secret keys and the
+commissioning workstation while
+.B learn
+runs. Anyone else with write access can delete items and recompute the
+digests, but cannot produce a valid operator signature. A careless or
+colluding operator (or quorum) can still confirm anything: the signature
+makes it a named decision, not a correct one. No key expiry or revocation
+list (remove the key from the list). The Ed25519 code is not audited.
+.PP
+A locked profile is sealed; the sensor refuses a locked profile whose seal
+does not match.
 .SH VERSIONING AND SIGNING
 .B lock
 stamps the profile with
@@ -338,7 +497,9 @@ Outputs never overwrite an existing file or follow a symlink unless
 (temporary file, fsync, rename). The outputs of one command must be distinct
 from each other and from its inputs. A failed
 .B learn
-writes nothing. Profiles are loaded strictly (regular file, size cap, no
+writes nothing; its output manifest is written last (see
+.BR "SIGN-OFF AND LOCK" ).
+Profiles are loaded strictly (regular file, size cap, no
 unknown keys, sealed if locked, metadata only on locked profiles).
 .SH EXIT STATUS
 .TP
@@ -356,17 +517,24 @@ Usage, input or I/O error.
 robodr\-commission learn \-\-pcap run1.pcapng \-\-pcap run2.pcapng \e
     \-\-model ugv\-x \-\-out draft.json \-\-report report.json
 $EDITOR draft.json.signoff.json      # review, confirm, set operator
+robodr\-commission keygen \-\-out alice.key \-\-trust\-out /dev/null \-\-key\-id alice
+robodr\-commission operators \-\-out operators.json \e
+    \-\-operator Alice=alice.key.pub \-\-operator Bob=bob.key.pub \-\-motion\-quorum 2
+robodr\-commission signoff \-\-signoff draft.json.signoff.json \e
+    \-\-sign\-key alice.key \-\-in draft.json \-\-operators operators.json
+robodr\-commission signoff \-\-signoff draft.json.signoff.json \-\-sign\-key bob.key
 robodr\-commission keygen \-\-out oem\-profile.key \e
     \-\-trust\-out profile\-trust.json \-\-key\-id oem\-ugv\-x\-2026
 robodr\-commission lock \-\-in draft.json \e
-    \-\-signoff draft.json.signoff.json \-\-out locked.json \e
+    \-\-signoff draft.json.signoff.json \-\-operators operators.json \e
+    \-\-out locked.json \e
     \-\-platform ugv\-x \-\-profile\-version 1 \-\-sign\-key oem\-profile.key
 robodr\-commission verify\-profile \-\-profile locked.json \e
     \-\-trusted\-keys profile\-trust.json
 robodr\-commission check \-\-profile locked.json \-\-pcap run3.pcapng
 # next version of the same lineage
 robodr\-commission lock \-\-in draft2.json \-\-signoff draft2.json.signoff.json \e
-    \-\-out locked2.json \-\-parent locked.json \-\-sign\-key oem\-profile.key
+    \-\-operators operators.json \-\-out locked2.json \-\-parent locked.json \-\-sign\-key oem\-profile.key
 .fi
 .SH SEE ALSO
 .BR robodr\-ros2\-watch (1),

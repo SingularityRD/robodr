@@ -23,19 +23,49 @@
 //!   `learn` applies): a hand-edited `1e300` m/s cannot be locked. [`merge_profiles`]
 //!   enforces the same caps.
 //!
+//! [`lock_signed_draft`] (what the CLI uses) adds the operator signatures
+//! of the sign-off (see `signoff`: a valid signature from a key in the
+//! operators trust list, the sign-off's `operator` among the signers, and
+//! `motion_quorum` distinct operators when the list has motion items).
+//! [`lock`] / [`lock_draft_text`] check content and confirmations only:
+//! callers that embed the library and authenticate the operator themselves.
+//!
 //! The CLI then writes the result sealed (see `profile_file`), so the
 //! locked file cannot be edited or half-written without `check`, `diff`
 //! and `merge` refusing it.
+//!
+//! # Output manifest (multi-file publish)
+//!
+//! `learn` writes three files (draft, sign-off list, report) and `signoff`
+//! two. Each file is published atomically, but a power loss between two
+//! publishes can leave a new draft next to an old sign-off or report (the
+//! operator would review a stale report). So the producing command writes a
+//! [`Manifest`] **last** (`<draft>.manifest.json`, after removing any old
+//! one and after the companion files are fsynced): the draft's SHA-256, the
+//! report's SHA-256 and the sign-off's invariant digests (`profile_sha256`,
+//! `items_sha256`; `confirmed` / `operator` change on review, so the file
+//! hash cannot be recorded). [`verify_manifest`] (used by `lock`, and by
+//! `check` on a draft) refuses a draft whose manifest is missing, malformed
+//! or does not match the draft, the sign-off or the report. A manifest is
+//! not a signature: it detects torn and mixed-up outputs, not forgery
+//! (that is the operator signature's job). `lock --no-manifest` skips it
+//! for drafts made before manifests existed or edited by hand (their
+//! sign-off is then the conservative `signoff` list, which writes a fresh
+//! manifest).
 
 use crate::input::{EventSource, InputError};
 use crate::learner::{DEFAULT_HARD_CAP_JOINT, DEFAULT_HARD_CAP_LINEAR};
 use crate::profile_file::parse_profile_text;
-use crate::signoff::{covers, draft_digest, required_items, sha256_hex, Signoff};
+use crate::signoff::{
+    draft_digest, motion_items, required_items, satisfies, sha256_hex, verify_signoff_signatures,
+    OperatorTrust, Signoff, SignoffSignatures,
+};
 use robodr_events::profile::{Envelope, EnvelopeField, Profile, ProfileError};
 use robodr_events::{Deviation, MotionCommand, RobotEvent, Severity};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------- caps ----
 
@@ -146,6 +176,31 @@ pub enum LockRefusal {
         value: f64,
         cap: f64,
     },
+    /// No valid operator signature over the sign-off.
+    OperatorSignatureMissing,
+    /// A signature that is malformed, by an unlisted key, or invalid.
+    OperatorSignatureInvalid {
+        detail: String,
+    },
+    /// The sign-off's `operator` is not one of the operators who signed it.
+    OperatorNotASigner {
+        operator: String,
+        signers: Vec<String>,
+    },
+    /// Too few distinct operators signed a sign-off with motion items.
+    MotionQuorumNotMet {
+        have: usize,
+        need: usize,
+    },
+    /// The draft has no output manifest.
+    ManifestMissing {
+        path: String,
+    },
+    /// The manifest is malformed or the draft / sign-off / report do not
+    /// match it.
+    ManifestMismatch {
+        detail: String,
+    },
 }
 
 impl fmt::Display for LockRefusal {
@@ -202,6 +257,32 @@ impl fmt::Display for LockRefusal {
                 "motion channel {channel}: {dimension} bound {value} exceeds the hard cap {cap} \
                  (pass --hard-cap-{dimension} if the platform really is that fast)"
             ),
+            LockRefusal::OperatorSignatureMissing => write!(
+                f,
+                "the sign-off carries no valid operator signature: the operator must sign the \
+                 confirmed list (`robodr-commission signoff --signoff <file> --sign-key \
+                 <operator.key>`) with a key in the operators trust list"
+            ),
+            LockRefusal::OperatorSignatureInvalid { detail } => {
+                write!(f, "operator signature: {detail}")
+            }
+            LockRefusal::OperatorNotASigner { operator, signers } => write!(
+                f,
+                "the sign-off names operator {operator:?}, but the valid signatures are by \
+                 {signers:?}: the named operator must sign it"
+            ),
+            LockRefusal::MotionQuorumNotMet { have, need } => write!(
+                f,
+                "two-person rule: the sign-off has motion items, so {need} distinct operators \
+                 must sign it ({have} did)"
+            ),
+            LockRefusal::ManifestMissing { path } => write!(
+                f,
+                "no output manifest {path}: the learn/signoff output set is incomplete (power \
+                 loss or interrupted write?); re-run the command, or pass --no-manifest for a \
+                 draft made before manifests existed"
+            ),
+            LockRefusal::ManifestMismatch { detail } => write!(f, "manifest: {detail}"),
         }
     }
 }
@@ -275,11 +356,11 @@ fn lock_with_digest(
             why: i.reason.clone(),
         });
     }
-    for (subject, reason) in required_items(profile) {
-        if !signoff.items.iter().any(|i| covers(i, &subject)) {
+    for req in required_items(profile) {
+        if !signoff.items.iter().any(|i| satisfies(i, &req)) {
             why.push(LockRefusal::RequiredItemMissing {
-                subject,
-                why: reason,
+                subject: req.subject,
+                why: req.why,
             });
         }
     }
@@ -289,6 +370,313 @@ fn lock_with_digest(
         Ok(p)
     } else {
         Err(why)
+    }
+}
+
+/// Who may sign a sign-off, and the two-person rule ([`lock_signed_draft`]).
+#[derive(Debug, Clone, Copy)]
+pub struct OperatorPolicy<'a> {
+    pub trust: &'a OperatorTrust,
+    /// Raise the trust list's `motion_quorum` for this lock (the effective
+    /// quorum is the larger of the two; it can never be lowered here).
+    pub min_motion_quorum: usize,
+}
+
+impl OperatorPolicy<'_> {
+    /// Distinct operators required for a sign-off with motion items.
+    pub fn motion_quorum(&self) -> usize {
+        self.trust
+            .motion_quorum()
+            .max(self.min_motion_quorum)
+            .max(1)
+    }
+}
+
+/// The operator-signature checks of [`lock_signed_draft`] alone: every
+/// signature valid, at least one, `signoff.operator` among the signers,
+/// and the motion quorum. `sigs == None`: no signature file.
+pub fn signature_refusals(
+    signoff: &Signoff,
+    signoff_text: &str,
+    sigs: Option<&SignoffSignatures>,
+    policy: &OperatorPolicy<'_>,
+) -> Vec<LockRefusal> {
+    let mut why = Vec::new();
+    let Some(sigs) = sigs else {
+        why.push(LockRefusal::OperatorSignatureMissing);
+        return why;
+    };
+    let v = verify_signoff_signatures(signoff_text.as_bytes(), sigs, policy.trust);
+    for detail in v.problems {
+        why.push(LockRefusal::OperatorSignatureInvalid { detail });
+    }
+    if v.signers.is_empty() {
+        why.push(LockRefusal::OperatorSignatureMissing);
+        return why;
+    }
+    let operator = signoff.operator.trim();
+    if !operator.is_empty() && !v.signers.contains_key(operator) {
+        why.push(LockRefusal::OperatorNotASigner {
+            operator: operator.to_string(),
+            signers: v.signers.keys().cloned().collect(),
+        });
+    }
+    let need = policy.motion_quorum();
+    if motion_items(signoff).next().is_some() && v.signers.len() < need {
+        why.push(LockRefusal::MotionQuorumNotMet {
+            have: v.signers.len(),
+            need,
+        });
+    }
+    why
+}
+
+/// The full lock the CLI performs: [`lock_draft_text_with_caps`] (content,
+/// confirmations, item digest, floor, caps) plus [`signature_refusals`] over
+/// the exact sign-off bytes. Every reason is collected. On success returns
+/// the locked profile and the parsed sign-off.
+pub fn lock_signed_draft(
+    draft_text: &str,
+    signoff_text: &str,
+    sigs: Option<&SignoffSignatures>,
+    policy: &OperatorPolicy<'_>,
+    caps: &HardCaps,
+) -> Result<(Profile, Signoff), Vec<LockRefusal>> {
+    let signoff: Signoff = serde_json::from_str(signoff_text).map_err(|e| {
+        vec![LockRefusal::SignoffInvalid {
+            error: e.to_string(),
+        }]
+    })?;
+    let mut why = Vec::new();
+    let locked = match lock_draft_text_with_caps(draft_text, &signoff, caps) {
+        Ok(p) => Some(p),
+        Err(r) => {
+            why.extend(r);
+            None
+        }
+    };
+    why.extend(signature_refusals(&signoff, signoff_text, sigs, policy));
+    match locked {
+        Some(p) if why.is_empty() => Ok((p, signoff)),
+        _ => Err(why),
+    }
+}
+
+// ------------------------------------------------------------ manifest ---
+
+/// Value of [`Manifest::format`].
+pub const MANIFEST_FORMAT: &str = "robodr-commission-manifest/v1";
+/// Max manifest size.
+pub const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+/// Max size of a report the manifest check reads back.
+pub const MAX_REPORT_BYTES: u64 = 256 << 20;
+
+/// The manifest path of a draft: the file name with `.manifest.json`
+/// appended.
+pub fn manifest_path_for(draft: &Path) -> PathBuf {
+    let mut s = draft.as_os_str().to_os_string();
+    s.push(".manifest.json");
+    PathBuf::from(s)
+}
+
+/// One file of an output set and the SHA-256 of its bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestFile {
+    /// Relative to the manifest's directory when in the same directory,
+    /// else absolute.
+    pub path: String,
+    pub sha256: String,
+}
+
+/// The sign-off of an output set: its invariant digests (the operator
+/// edits `confirmed` and `operator`, so the file hash would not survive
+/// review).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestSignoff {
+    pub path: String,
+    pub profile_sha256: String,
+    pub items_sha256: String,
+}
+
+/// The output manifest written last by `learn` and `signoff`; see the
+/// module docs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Manifest {
+    pub format: String,
+    pub model: String,
+    pub draft: ManifestFile,
+    pub signoff: Option<ManifestSignoff>,
+    pub report: Option<ManifestFile>,
+}
+
+/// How `file` is recorded in a manifest at `manifest`: its file name when
+/// both are in the same directory, else its absolute path.
+pub fn manifest_entry_path(manifest: &Path, file: &Path) -> String {
+    let dir = |p: &Path| {
+        let d = p.parent().filter(|d| !d.as_os_str().is_empty());
+        std::fs::canonicalize(d.unwrap_or(Path::new("."))).ok()
+    };
+    match (dir(manifest), dir(file), file.file_name()) {
+        (Some(a), Some(b), Some(n)) if a == b => n.to_string_lossy().into_owned(),
+        (_, Some(b), Some(n)) => b.join(n).to_string_lossy().into_owned(),
+        _ => file.to_string_lossy().into_owned(),
+    }
+}
+
+impl Manifest {
+    /// The manifest of an output set: `draft` and `report` are
+    /// `(path, exact bytes)`.
+    pub fn new(
+        manifest: &Path,
+        model: &str,
+        draft: (&Path, &[u8]),
+        signoff: Option<(&Path, &Signoff)>,
+        report: Option<(&Path, &[u8])>,
+    ) -> Self {
+        let file = |(p, b): (&Path, &[u8])| ManifestFile {
+            path: manifest_entry_path(manifest, p),
+            sha256: sha256_hex(b),
+        };
+        Self {
+            format: MANIFEST_FORMAT.into(),
+            model: model.into(),
+            draft: file(draft),
+            signoff: signoff.map(|(p, s)| ManifestSignoff {
+                path: manifest_entry_path(manifest, p),
+                profile_sha256: s.profile_sha256.clone(),
+                items_sha256: s.items_sha256.clone(),
+            }),
+            report: report.map(file),
+        }
+    }
+
+    /// Strict parse (unknown / duplicate keys refused, format checked).
+    pub fn parse(text: &str) -> Result<Self, String> {
+        crate::profile_file::reject_duplicate_keys(text).map_err(|e| e.to_string())?;
+        let m: Self = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        if m.format != MANIFEST_FORMAT {
+            return Err(format!(
+                "format {:?}, expected {MANIFEST_FORMAT:?}",
+                m.format
+            ));
+        }
+        Ok(m)
+    }
+
+    pub fn to_text(&self) -> String {
+        crate::to_json(self).unwrap_or_default()
+    }
+
+    /// Where a recorded path lives, given the manifest's own path.
+    pub fn resolve(manifest: &Path, recorded: &str) -> PathBuf {
+        let p = Path::new(recorded);
+        if p.is_absolute() {
+            return p.to_path_buf();
+        }
+        manifest
+            .parent()
+            .map_or_else(|| p.to_path_buf(), |d| d.join(p))
+    }
+
+    /// Mismatches between this manifest and the draft bytes, the sign-off
+    /// (if given; else the recorded sign-off file is read) and the report
+    /// file on disk.
+    pub fn problems(
+        &self,
+        manifest: &Path,
+        draft_bytes: &[u8],
+        signoff: Option<&Signoff>,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.draft.sha256 != sha256_hex(draft_bytes) {
+            out.push(format!(
+                "the draft does not match the manifest (recorded {}, the file is {}): it was \
+                 replaced or edited after the output set was written",
+                self.draft.sha256,
+                sha256_hex(draft_bytes)
+            ));
+        }
+        if let Some(ms) = &self.signoff {
+            let read;
+            let so = match signoff {
+                Some(s) => Some(s),
+                None => {
+                    let p = Self::resolve(manifest, &ms.path);
+                    read = crate::profile_file::read_regular_file(&p, MAX_MANIFEST_BYTES << 8)
+                        .map_err(|e| format!("{}: {e}", p.display()))
+                        .and_then(|t| {
+                            serde_json::from_str::<Signoff>(&t)
+                                .map_err(|e| format!("{}: {e}", p.display()))
+                        });
+                    match &read {
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            out.push(format!("recorded sign-off unreadable: {e}"));
+                            None
+                        }
+                    }
+                }
+            };
+            if let Some(so) = so {
+                if so.profile_sha256 != ms.profile_sha256 || so.items_sha256 != ms.items_sha256 {
+                    out.push(format!(
+                        "the sign-off is not the one written with this draft (manifest records \
+                         {}); a stale or foreign list",
+                        ms.path
+                    ));
+                }
+            }
+        }
+        if let Some(r) = &self.report {
+            let p = Self::resolve(manifest, &r.path);
+            match crate::profile_file::read_regular_file(&p, MAX_REPORT_BYTES) {
+                Ok(b) if sha256_hex(b.as_bytes()) == r.sha256 => {}
+                Ok(_) => out.push(format!(
+                    "the report {} does not match the manifest: the operator would review a \
+                     stale or edited report",
+                    p.display()
+                )),
+                Err(e) => out.push(format!("the report {} is missing: {e}", p.display())),
+            }
+        }
+        out
+    }
+}
+
+/// [`Manifest`] checks for a draft at `draft_path`: the manifest
+/// (`<draft>.manifest.json`) must exist, parse, and match the draft bytes,
+/// the sign-off (when given) and the report. Empty = consistent.
+pub fn verify_manifest(
+    draft_path: &Path,
+    draft_bytes: &[u8],
+    signoff: Option<&Signoff>,
+) -> Vec<LockRefusal> {
+    let mp = manifest_path_for(draft_path);
+    let text = match crate::profile_file::read_regular_file(&mp, MAX_MANIFEST_BYTES) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return vec![LockRefusal::ManifestMissing {
+                path: mp.display().to_string(),
+            }]
+        }
+        Err(e) => {
+            return vec![LockRefusal::ManifestMismatch {
+                detail: format!("{}: {e}", mp.display()),
+            }]
+        }
+    };
+    match Manifest::parse(&text) {
+        Err(e) => vec![LockRefusal::ManifestMismatch {
+            detail: format!("{}: {e}", mp.display()),
+        }],
+        Ok(m) => m
+            .problems(&mp, draft_bytes, signoff)
+            .into_iter()
+            .map(|detail| LockRefusal::ManifestMismatch { detail })
+            .collect(),
     }
 }
 
@@ -1346,5 +1734,324 @@ mod tests {
         let r = Checker::new(&p).finish();
         assert!(r.to_string().contains("NOT locked"));
         assert!(r.to_string().contains("0 deviation(s)"));
+    }
+
+    // ------------------------------------------------ signed lock ---
+
+    fn opkey(id: &str, seed: u8) -> robodr_blackbox::Ed25519SigningKey {
+        robodr_blackbox::Ed25519SigningKey::from_seed(id, &[seed; 32]).unwrap()
+    }
+
+    struct Ops {
+        alice: robodr_blackbox::Ed25519SigningKey,
+        alice2: robodr_blackbox::Ed25519SigningKey,
+        bob: robodr_blackbox::Ed25519SigningKey,
+        trust: OperatorTrust,
+    }
+
+    fn ops(quorum: usize) -> Ops {
+        let (alice, alice2, bob) = (opkey("alice-1", 1), opkey("alice-2", 2), opkey("bob-1", 3));
+        let trust = OperatorTrust::new(
+            vec![
+                ("alice".into(), alice.verifying_key()),
+                ("alice".into(), alice2.verifying_key()),
+                ("bob".into(), bob.verifying_key()),
+            ],
+            quorum,
+        )
+        .unwrap();
+        Ops {
+            alice,
+            alice2,
+            bob,
+            trust,
+        }
+    }
+
+    /// Draft text and a confirmed sign-off text (operator alice).
+    fn signed_case() -> (String, String) {
+        let p = base();
+        let draft = crate::to_json(&p).unwrap();
+        let so = Signoff::for_profile(&p).confirm_all("alice");
+        (draft, crate::to_json(&so).unwrap())
+    }
+
+    fn sign(text: &str, keys: &[&robodr_blackbox::Ed25519SigningKey]) -> SignoffSignatures {
+        let mut s = SignoffSignatures::new(text.as_bytes());
+        for k in keys {
+            s.add(text.as_bytes(), *k).unwrap();
+        }
+        s
+    }
+
+    fn signed_lock(
+        draft: &str,
+        so: &str,
+        sigs: Option<&SignoffSignatures>,
+        trust: &OperatorTrust,
+        min: usize,
+    ) -> Result<(Profile, Signoff), Vec<LockRefusal>> {
+        let policy = OperatorPolicy {
+            trust,
+            min_motion_quorum: min,
+        };
+        lock_signed_draft(draft, so, sigs, &policy, &HardCaps::default())
+    }
+
+    #[test]
+    fn signed_lock_requires_a_valid_listed_signature() {
+        let o = ops(1);
+        let (draft, so) = signed_case();
+        let (p, s) = signed_lock(&draft, &so, Some(&sign(&so, &[&o.alice])), &o.trust, 1).unwrap();
+        assert!(p.locked);
+        assert_eq!(s.operator, "alice");
+        // No signature file / empty signature list.
+        assert_eq!(
+            signed_lock(&draft, &so, None, &o.trust, 1).unwrap_err(),
+            vec![LockRefusal::OperatorSignatureMissing]
+        );
+        assert_eq!(
+            signed_lock(&draft, &so, Some(&sign(&so, &[])), &o.trust, 1).unwrap_err(),
+            vec![LockRefusal::OperatorSignatureMissing]
+        );
+        // A key outside the trust list: invalid and missing.
+        let stranger = opkey("mallory", 9);
+        let why =
+            signed_lock(&draft, &so, Some(&sign(&so, &[&stranger])), &o.trust, 1).unwrap_err();
+        assert!(matches!(
+            why[0],
+            LockRefusal::OperatorSignatureInvalid { .. }
+        ));
+        assert!(why.contains(&LockRefusal::OperatorSignatureMissing));
+        // A valid signature plus a bad one: fail closed.
+        let mut mixed = sign(&so, &[&o.alice]);
+        mixed.add(so.as_bytes(), &stranger).unwrap();
+        let why = signed_lock(&draft, &so, Some(&mixed), &o.trust, 1).unwrap_err();
+        assert_eq!(why.len(), 1, "{why:?}");
+        assert!(why[0]
+            .to_string()
+            .contains("not in the operators trust list"));
+        // Signed by bob, but the list names alice.
+        let why = signed_lock(&draft, &so, Some(&sign(&so, &[&o.bob])), &o.trust, 1).unwrap_err();
+        assert_eq!(
+            why,
+            vec![LockRefusal::OperatorNotASigner {
+                operator: "alice".into(),
+                signers: vec!["bob".into()]
+            }]
+        );
+        // The list was edited after signing (operator renamed): void.
+        let edited = so.replace("\"alice\"", "\"bob\"");
+        let why =
+            signed_lock(&draft, &edited, Some(&sign(&so, &[&o.bob])), &o.trust, 1).unwrap_err();
+        assert!(why
+            .iter()
+            .any(|r| r.to_string().contains("changed after signing")));
+        // Content refusals and signature refusals are reported together.
+        let unconfirmed = crate::to_json(&{
+            let mut s = Signoff::for_profile(&base());
+            s.operator = "alice".into();
+            s
+        })
+        .unwrap();
+        let why = signed_lock(&draft, &unconfirmed, None, &o.trust, 1).unwrap_err();
+        assert!(why
+            .iter()
+            .any(|r| matches!(r, LockRefusal::Unconfirmed { .. })));
+        assert!(why.contains(&LockRefusal::OperatorSignatureMissing));
+        // Not a sign-off at all.
+        assert!(matches!(
+            signed_lock(&draft, "{", None, &o.trust, 1).unwrap_err()[0],
+            LockRefusal::SignoffInvalid { .. }
+        ));
+        for r in &why {
+            assert!(!r.to_string().is_empty());
+        }
+        serde_json::to_string(&why).unwrap();
+    }
+
+    #[test]
+    fn forged_list_with_recomputed_digests_still_needs_a_signature() {
+        // Someone with write access deletes the motion item and recomputes
+        // items_sha256: the digest check passes, the floor and the missing
+        // signature still refuse.
+        let o = ops(1);
+        let (draft, so) = signed_case();
+        let mut forged: Signoff = serde_json::from_str(&so).unwrap();
+        forged.items.retain(|i| i.kind == "participant_unreviewed");
+        let digest = forged.profile_sha256.clone();
+        forged.rebind(digest);
+        assert!(forged.items_intact());
+        let text = crate::to_json(&forged).unwrap();
+        let why = signed_lock(&draft, &text, None, &o.trust, 1).unwrap_err();
+        assert!(why
+            .iter()
+            .any(|r| matches!(r, LockRefusal::RequiredItemMissing { .. })));
+        assert!(why.contains(&LockRefusal::OperatorSignatureMissing));
+        // The signatures over the genuine list do not carry over.
+        let why =
+            signed_lock(&draft, &text, Some(&sign(&so, &[&o.alice])), &o.trust, 1).unwrap_err();
+        assert!(why
+            .iter()
+            .any(|r| r.to_string().contains("changed after signing")));
+    }
+
+    #[test]
+    fn two_person_rule_counts_distinct_operators() {
+        let o = ops(2);
+        let (draft, so) = signed_case();
+        // The conservative list has a motion item: two operators needed.
+        let one = sign(&so, &[&o.alice]);
+        assert_eq!(
+            signed_lock(&draft, &so, Some(&one), &o.trust, 1).unwrap_err(),
+            vec![LockRefusal::MotionQuorumNotMet { have: 1, need: 2 }]
+        );
+        // Two keys of the same person are one operator.
+        let same = sign(&so, &[&o.alice, &o.alice2]);
+        assert_eq!(
+            signed_lock(&draft, &so, Some(&same), &o.trust, 1).unwrap_err(),
+            vec![LockRefusal::MotionQuorumNotMet { have: 1, need: 2 }]
+        );
+        let two = sign(&so, &[&o.alice, &o.bob]);
+        assert!(signed_lock(&draft, &so, Some(&two), &o.trust, 1).is_ok());
+        // The per-lock minimum raises a trust list's quorum of 1, never
+        // lowers it.
+        let o1 = ops(1);
+        let one = sign(&so, &[&o1.alice]);
+        assert!(signed_lock(&draft, &so, Some(&one), &o1.trust, 1).is_ok());
+        assert_eq!(
+            signed_lock(&draft, &so, Some(&one), &o1.trust, 2).unwrap_err(),
+            vec![LockRefusal::MotionQuorumNotMet { have: 1, need: 2 }]
+        );
+        let policy = OperatorPolicy {
+            trust: &o.trust,
+            min_motion_quorum: 0,
+        };
+        assert_eq!(policy.motion_quorum(), 2);
+        // A draft without motion channels has no motion items: one signer.
+        let mut p = base();
+        p.motion_envelopes.clear();
+        let d2 = crate::to_json(&p).unwrap();
+        let s2 = crate::to_json(&Signoff::for_profile(&p).confirm_all("bob")).unwrap();
+        assert!(signed_lock(&d2, &s2, Some(&sign(&s2, &[&o.bob])), &o.trust, 1).is_ok());
+    }
+
+    // ------------------------------------------------------ manifest ---
+
+    fn mdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("robodr-manifest-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A learn-like output set in `d`: draft, sign-off, report, manifest.
+    fn output_set(d: &Path) -> (PathBuf, String, Signoff) {
+        let p = base();
+        let draft = d.join("draft.json");
+        let text = crate::to_json(&p).unwrap();
+        let so = Signoff::for_profile(&p);
+        let so_path = d.join("draft.json.signoff.json");
+        let report = d.join("report.json");
+        std::fs::write(&draft, &text).unwrap();
+        std::fs::write(&so_path, crate::to_json(&so).unwrap()).unwrap();
+        std::fs::write(&report, "{\"r\": 1}\n").unwrap();
+        let mp = manifest_path_for(&draft);
+        let m = Manifest::new(
+            &mp,
+            &p.model,
+            (&draft, text.as_bytes()),
+            Some((&so_path, &so)),
+            Some((&report, b"{\"r\": 1}\n".as_slice())),
+        );
+        assert_eq!(m.draft.path, "draft.json", "same dir: relative");
+        std::fs::write(&mp, m.to_text()).unwrap();
+        (draft, text, so)
+    }
+
+    #[test]
+    fn manifest_binds_the_output_set() {
+        let d = mdir("set");
+        let (draft, text, so) = output_set(&d);
+        assert!(verify_manifest(&draft, text.as_bytes(), Some(&so)).is_empty());
+        // Recorded sign-off read from disk when none is given.
+        assert!(verify_manifest(&draft, text.as_bytes(), None).is_empty());
+        // Confirming does not break the binding.
+        let c = so.clone().confirm_all("alice");
+        assert!(verify_manifest(&draft, text.as_bytes(), Some(&c)).is_empty());
+
+        // Draft replaced (new learn published, manifest from the old one).
+        let other = text.replace("\"ugv\"", "\"ugv2\"");
+        let why = verify_manifest(&draft, other.as_bytes(), Some(&so));
+        assert!(
+            why[0].to_string().contains("draft does not match"),
+            "{why:?}"
+        );
+        // A sign-off of another draft.
+        let mut q = base();
+        q.writer_topics.insert("/odom".into());
+        let foreign = Signoff::for_profile(&q);
+        let why = verify_manifest(&draft, text.as_bytes(), Some(&foreign));
+        assert!(why[0].to_string().contains("stale or foreign"), "{why:?}");
+        // Report edited, then missing.
+        std::fs::write(d.join("report.json"), "{}\n").unwrap();
+        let why = verify_manifest(&draft, text.as_bytes(), Some(&so));
+        assert!(
+            why[0].to_string().contains("stale or edited report"),
+            "{why:?}"
+        );
+        std::fs::remove_file(d.join("report.json")).unwrap();
+        let why = verify_manifest(&draft, text.as_bytes(), Some(&so));
+        assert!(why[0].to_string().contains("missing"), "{why:?}");
+        // Recorded sign-off missing (none given).
+        std::fs::remove_file(d.join("draft.json.signoff.json")).unwrap();
+        let why = verify_manifest(&draft, text.as_bytes(), None);
+        assert!(why
+            .iter()
+            .any(|r| r.to_string().contains("sign-off unreadable")));
+        // Malformed / foreign-format / missing manifest.
+        let mp = manifest_path_for(&draft);
+        std::fs::write(&mp, "{").unwrap();
+        assert!(matches!(
+            verify_manifest(&draft, text.as_bytes(), Some(&so))[0],
+            LockRefusal::ManifestMismatch { .. }
+        ));
+        std::fs::write(&mp, "{\"format\": \"x\"}").unwrap();
+        assert!(Manifest::parse("{\"format\": \"x\"}").is_err());
+        std::fs::remove_file(&mp).unwrap();
+        let why = verify_manifest(&draft, text.as_bytes(), Some(&so));
+        assert!(matches!(why[0], LockRefusal::ManifestMissing { .. }));
+        assert!(why[0].to_string().contains("--no-manifest"));
+        // A manifest that is a directory.
+        std::fs::create_dir(&mp).unwrap();
+        assert!(matches!(
+            verify_manifest(&draft, text.as_bytes(), Some(&so))[0],
+            LockRefusal::ManifestMismatch { .. }
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn manifest_paths_and_strict_parse() {
+        let d = mdir("paths");
+        let sub = d.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let mp = d.join("a.json.manifest.json");
+        assert_eq!(manifest_entry_path(&mp, &d.join("a.json")), "a.json");
+        let other = manifest_entry_path(&mp, &sub.join("r.json"));
+        assert!(Path::new(&other).is_absolute(), "{other}");
+        assert_eq!(Manifest::resolve(&mp, &other), PathBuf::from(&other));
+        assert_eq!(Manifest::resolve(&mp, "a.json"), d.join("a.json"));
+        assert_eq!(
+            manifest_path_for(Path::new("x/p.json")),
+            PathBuf::from("x/p.json.manifest.json")
+        );
+        let m = Manifest::new(&mp, "m", (&d.join("a.json"), b"x"), None, None);
+        let t = m.to_text();
+        assert_eq!(Manifest::parse(&t).unwrap(), m);
+        assert!(Manifest::parse(&t.replace("\"model\"", "\"x\": 1, \"model\"")).is_err());
+        assert!(Manifest::parse(&t.replace("\"model\"", "\"model\": \"y\", \"model\"")).is_err());
+        assert!(Manifest::parse(&t.replace(MANIFEST_FORMAT, "v0")).is_err());
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -669,7 +669,12 @@ fn f7_cli_merge_and_lock_take_hard_cap_flags() {
         .max_linear_speed = Some(25.0);
     std::fs::write(&a, to_json(&base).unwrap()).unwrap();
     std::fs::write(&b, to_json(&fast).unwrap()).unwrap();
-    let run = |args: &[&str]| Command::new(BIN).args(args).output().unwrap();
+    let run = |args: &[&str]| {
+        Command::new(BIN)
+            .args(common::with_operator_signature(args))
+            .output()
+            .unwrap()
+    };
     let s = |p: &Path| p.to_str().unwrap().to_string();
     let m = d.join("m.json");
     let o = run(&["merge", "--out", &s(&m), &s(&a), &s(&b)]);

@@ -292,3 +292,63 @@ pub fn talker_listener(drop_frag: bool) -> Vec<Vec<u8>> {
     out.extend(frames(TALKER, &dgrams));
     out
 }
+
+// ------------------------------------------------ operator sign-off ---
+
+/// Seed of the test operator key (tests only).
+pub const TEST_OPERATOR_SEED: [u8; 32] = [7; 32];
+pub const TEST_OPERATOR_KEY_ID: &str = "test-operator";
+
+/// Test operator signing key.
+pub fn test_operator_key() -> robodr_blackbox::Ed25519SigningKey {
+    robodr_blackbox::Ed25519SigningKey::from_seed(TEST_OPERATOR_KEY_ID, &TEST_OPERATOR_SEED)
+        .unwrap()
+}
+
+/// For the CLI tests written before sign-offs were signed: a `lock`
+/// without `--operators` gets the sign-off signed by a test operator key
+/// (bound to the name the sign-off gives, so `operator` matches), an
+/// operators trust list next to it, and `--no-manifest` when the draft has
+/// no manifest (hand-written drafts). Other commands pass through. The
+/// signing ignores confirmations on purpose: lock must still refuse
+/// unconfirmed lists by itself.
+pub fn with_operator_signature(args: &[&str]) -> Vec<String> {
+    use robodr_commission::ops::manifest_path_for;
+    use robodr_commission::signoff::{signoff_sig_path, OperatorTrust, SignoffSignatures};
+    use std::path::{Path, PathBuf};
+    let mut v: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    if v.first().map(String::as_str) != Some("lock") || v.iter().any(|a| a == "--operators") {
+        return v;
+    }
+    let get = |v: &[String], name: &str| {
+        v.iter()
+            .position(|a| a == name)
+            .and_then(|i| v.get(i + 1))
+            .cloned()
+    };
+    if let Some(so) = get(&v, "--signoff") {
+        let so = PathBuf::from(so);
+        if let Ok(bytes) = std::fs::read(&so) {
+            let name = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|j| j["operator"].as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "Test Operator".into());
+            let key = test_operator_key();
+            let trust = OperatorTrust::new(vec![(name, key.verifying_key())], 1).unwrap();
+            let ops = PathBuf::from(format!("{}.operators.json", so.display()));
+            std::fs::write(&ops, trust.to_text()).unwrap();
+            let mut sigs = SignoffSignatures::new(&bytes);
+            sigs.add(&bytes, &key).unwrap();
+            std::fs::write(signoff_sig_path(&so), sigs.to_text()).unwrap();
+            v.push("--operators".into());
+            v.push(ops.display().to_string());
+        }
+    }
+    if let Some(input) = get(&v, "--in") {
+        if !manifest_path_for(Path::new(&input)).exists() {
+            v.push("--no-manifest".into());
+        }
+    }
+    v
+}

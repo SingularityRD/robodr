@@ -28,7 +28,10 @@ fn tmpdir(tag: &str) -> PathBuf {
 }
 
 fn run(args: &[&str]) -> Output {
-    Command::new(BIN).args(args).output().expect("run binary")
+    Command::new(BIN)
+        .args(common::with_operator_signature(args))
+        .output()
+        .expect("run binary")
 }
 
 fn s(p: &Path) -> &str {
