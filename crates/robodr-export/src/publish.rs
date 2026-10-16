@@ -26,12 +26,29 @@
 //!
 //! Diode batches are processed in name order (= per unit, sequence order).
 //! Records are sent in chunks of `chunk_records`; after a chunk is fully
-//! acknowledged (`acks=all`), `<state>/progress.json` = `{batch,
-//! lines_committed}` is replaced atomically. A finished batch gets a marker
-//! `<state>/done/<batch>` (fsynced) and is skipped from then on. After a
-//! crash, a batch resumes after its last committed line, so at most one
-//! chunk (plus whatever a lost Produce response covered) is re-sent.
-//! Consumers drop duplicates on `event-uid`.
+//! acknowledged (`acks=all`), `<state>/progress.json` is replaced
+//! atomically. It keeps a committed line count **per batch** (`in_flight`:
+//! batch name -> lines acknowledged), so a batch interrupted mid-way keeps
+//! its offset even when other batches (e.g. another unit's, whose name
+//! sorts first) are published before it resumes. A finished batch gets a
+//! marker `<state>/done/<batch>` (fsynced), its `in_flight` entry is
+//! removed, and it is skipped from then on. After a crash, every batch
+//! resumes after its last committed line, so at most one chunk per
+//! interrupted batch (plus whatever a lost Produce response covered) is
+//! re-sent. Consumers drop duplicates on `event-uid`.
+//!
+//! `in_flight` is bounded ([`MAX_IN_FLIGHT`] entries): entries of batches
+//! that are done or no longer in `out/` are pruned at every run, and if the
+//! bound is still exceeded the entry with the fewest committed lines is
+//! dropped (that batch is then re-sent from its start: duplicates, never
+//! loss). A version-1 progress file (`{batch, lines_committed}`) is
+//! migrated on open.
+//!
+//! The dead-letter file is deduplicated on `(source, position)`: a record
+//! dead-lettered in a chunk whose progress was not saved before a crash is
+//! processed again after restart, but appended only once. The index of
+//! existing entries is loaded from the file on the first dead letter of a
+//! publisher (memory: 16 bytes per entry).
 //!
 //! For a spool source the commit is the rename `ready/ → acked/` of the
 //! chunk's files (dead-lettered ones go to `<spool>/rejected/`).
@@ -41,12 +58,18 @@ use crate::kafka::{Outcome, ProduceError, ProduceRecord, Producer};
 use robodr_agentd::spool::SpoolRecord;
 use robodr_ocsf::KAFKA_TOPIC;
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
-const STATE_FORMAT: &str = "robodr-kafka-publish-state/1";
+const STATE_FORMAT: &str = "robodr-kafka-publish-state/2";
+const STATE_FORMAT_V1: &str = "robodr-kafka-publish-state/1";
+/// Most batches with a persisted partial offset (see the module docs).
+pub const MAX_IN_FLIGHT: usize = 1024;
 /// File name of the importer's per-batch records.
 pub const RECORDS_FILE: &str = robodr_diode::unpack::RECORDS_FILE;
 pub const PROGRESS_FILE: &str = "progress.json";
@@ -158,12 +181,99 @@ impl From<ProduceError> for PublishError {
 #[serde(deny_unknown_fields)]
 pub struct Progress {
     pub format: String,
-    /// Batch being published, if any.
-    pub batch: Option<String>,
-    /// Lines of `batch` acknowledged (1-based count from the top).
-    pub lines_committed: u64,
+    /// Lines acknowledged (count from the top) of each diode batch that was
+    /// started but is not yet marked done. At most [`MAX_IN_FLIGHT`].
+    pub in_flight: BTreeMap<String, u64>,
     pub published_total: u64,
     pub dead_lettered_total: u64,
+}
+
+impl Progress {
+    fn empty() -> Self {
+        Self {
+            format: STATE_FORMAT.into(),
+            in_flight: BTreeMap::new(),
+            published_total: 0,
+            dead_lettered_total: 0,
+        }
+    }
+
+    /// Lines of `batch` acknowledged so far (0 if none / unknown).
+    pub fn lines_committed(&self, batch: &str) -> u64 {
+        self.in_flight.get(batch).copied().unwrap_or(0)
+    }
+
+    /// Record `lines` acknowledged for `batch`, keeping the map bounded.
+    fn set_committed(&mut self, batch: &str, lines: u64) {
+        self.in_flight.insert(batch.to_string(), lines);
+        while self.in_flight.len() > MAX_IN_FLIGHT {
+            let victim = self
+                .in_flight
+                .iter()
+                .filter(|(k, _)| k.as_str() != batch)
+                .min_by_key(|(_, v)| **v)
+                .map(|(k, _)| k.clone());
+            match victim {
+                Some(k) => {
+                    self.in_flight.remove(&k);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Parse a progress file (current format, or version 1 migrated).
+    fn parse(bytes: &[u8]) -> Result<Self, String> {
+        #[derive(Deserialize)]
+        struct Fmt {
+            format: String,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct V1 {
+            #[allow(dead_code)]
+            format: String,
+            batch: Option<String>,
+            lines_committed: u64,
+            published_total: u64,
+            dead_lettered_total: u64,
+        }
+        let f: Fmt = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        match f.format.as_str() {
+            STATE_FORMAT => {
+                let p: Progress = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+                if p.in_flight.len() > MAX_IN_FLIGHT {
+                    return Err(format!("more than {MAX_IN_FLIGHT} in-flight batches"));
+                }
+                Ok(p)
+            }
+            STATE_FORMAT_V1 => {
+                let v: V1 = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+                let mut p = Progress::empty();
+                p.published_total = v.published_total;
+                p.dead_lettered_total = v.dead_lettered_total;
+                if let Some(b) = v.batch {
+                    if v.lines_committed > 0 {
+                        p.in_flight.insert(b, v.lines_committed);
+                    }
+                }
+                Ok(p)
+            }
+            other => Err(format!("unknown format {other:?}")),
+        }
+    }
+}
+
+/// 128-bit key of a dead-letter entry: `(source, position)`.
+fn dead_key(source: &str, pos: u64) -> u128 {
+    let h = |salt: u8| {
+        let mut st = DefaultHasher::new();
+        salt.hash(&mut st);
+        source.hash(&mut st);
+        pos.hash(&mut st);
+        st.finish()
+    };
+    (u128::from(h(1)) << 64) | u128::from(h(2))
 }
 
 /// What one run did.
@@ -215,6 +325,9 @@ pub struct Publisher<S: Sink> {
     sink: S,
     progress: Progress,
     chunks_sent: u64,
+    /// `(source, position)` keys already in the dead-letter file; loaded on
+    /// the first dead letter.
+    dead_seen: Option<HashSet<u128>>,
 }
 
 fn valid_batch_name(n: &str) -> bool {
@@ -260,24 +373,9 @@ impl<S: Sink> Publisher<S> {
         }
         let path = cfg.state_dir.join(PROGRESS_FILE);
         let progress = match fsutil::read_capped(&path, 1024 * 1024) {
-            Ok(b) => {
-                let p: Progress = serde_json::from_slice(&b)
-                    .map_err(|e| PublishError::State(format!("{}: {e}", path.display())))?;
-                if p.format != STATE_FORMAT {
-                    return Err(PublishError::State(format!(
-                        "unknown format {:?}",
-                        p.format
-                    )));
-                }
-                p
-            }
-            Err(ReadError::Missing) => Progress {
-                format: STATE_FORMAT.into(),
-                batch: None,
-                lines_committed: 0,
-                published_total: 0,
-                dead_lettered_total: 0,
-            },
+            Ok(b) => Progress::parse(&b)
+                .map_err(|e| PublishError::State(format!("{}: {e}", path.display())))?,
+            Err(ReadError::Missing) => Progress::empty(),
             Err(e) => return Err(PublishError::State(format!("{}: {e}", path.display()))),
         };
         Ok(Self {
@@ -285,6 +383,7 @@ impl<S: Sink> Publisher<S> {
             sink,
             progress,
             chunks_sent: 0,
+            dead_seen: None,
         })
     }
 
@@ -307,6 +406,29 @@ impl<S: Sink> Publisher<S> {
         Ok(())
     }
 
+    /// Keys of the entries already in the dead-letter file (unparsable
+    /// lines are ignored).
+    fn load_dead_keys(&self) -> Result<HashSet<u128>, PublishError> {
+        #[derive(Deserialize)]
+        struct Key {
+            source: String,
+            position: u64,
+        }
+        let mut seen = HashSet::new();
+        let path = self.cfg.state_dir.join(DEAD_LETTER_FILE);
+        let f = match fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(seen),
+            Err(e) => return Err(e.into()),
+        };
+        for line in BufReader::new(f).split(b'\n') {
+            if let Ok(k) = serde_json::from_slice::<Key>(&line?) {
+                seen.insert(dead_key(&k.source, k.position));
+            }
+        }
+        Ok(seen)
+    }
+
     fn dead_letter(
         &mut self,
         context: &str,
@@ -315,6 +437,17 @@ impl<S: Sink> Publisher<S> {
         raw: &[u8],
         report: &mut PublishReport,
     ) -> Result<(), PublishError> {
+        if self.dead_seen.is_none() {
+            self.dead_seen = Some(self.load_dead_keys()?);
+        }
+        let key = dead_key(context, pos);
+        // Counted either way: the earlier append's count was never saved
+        // (its chunk's progress was lost, or we would not be here again).
+        self.progress.dead_lettered_total += 1;
+        report.dead_lettered += 1;
+        if self.dead_seen.as_ref().is_some_and(|s| s.contains(&key)) {
+            return Ok(());
+        }
         let raw = String::from_utf8_lossy(&raw[..raw.len().min(self.cfg.max_record_bytes)]);
         let mut line = serde_json::to_vec(&serde_json::json!({
             "source": context,
@@ -326,8 +459,9 @@ impl<S: Sink> Publisher<S> {
         .map_err(|e| PublishError::State(e.to_string()))?;
         line.push(b'\n');
         fsutil::append_durable(&self.cfg.state_dir.join(DEAD_LETTER_FILE), &line)?;
-        self.progress.dead_lettered_total += 1;
-        report.dead_lettered += 1;
+        if let Some(s) = self.dead_seen.as_mut() {
+            s.insert(key);
+        }
         Ok(())
     }
 
@@ -496,15 +630,23 @@ impl<S: Sink> Publisher<S> {
             names.push(name);
         }
         names.sort();
+        let done_dir = self.cfg.state_dir.join(DONE_DIR);
+        // Prune offsets of batches that are done or gone from out/.
+        let before = self.progress.in_flight.len();
+        self.progress.in_flight.retain(|b, _| {
+            names.binary_search(b).is_ok() && fs::symlink_metadata(done_dir.join(b)).is_err()
+        });
+        if self.progress.in_flight.len() != before {
+            self.save()?;
+        }
         for name in names {
-            let marker = self.cfg.state_dir.join(DONE_DIR).join(&name);
+            let marker = done_dir.join(&name);
             if fs::symlink_metadata(&marker).is_ok() {
                 continue;
             }
             self.publish_batch(out, &name, report)?;
             fsutil::atomic_write(&marker, b"")?;
-            self.progress.batch = None;
-            self.progress.lines_committed = 0;
+            self.progress.in_flight.remove(&name);
             self.save()?;
             report.batches_done.push(name);
         }
@@ -530,13 +672,7 @@ impl<S: Sink> Publisher<S> {
             }
             Err(e) => return Err(e.into()),
         };
-        let skip = if self.progress.batch.as_deref() == Some(name) {
-            self.progress.lines_committed
-        } else {
-            self.progress.batch = Some(name.to_string());
-            self.progress.lines_committed = 0;
-            0
-        };
+        let skip = self.progress.lines_committed(name);
         report.resumed_after += skip;
         let cap = self.cfg.max_record_bytes as u64;
         let mut reader = BufReader::new(file);
@@ -593,8 +729,9 @@ impl<S: Sink> Publisher<S> {
         report: &mut PublishReport,
     ) -> Result<(), PublishError> {
         self.send_chunk(name, chunk, report)?;
-        self.progress.batch = Some(name.to_string());
-        self.progress.lines_committed = chunk.last().map_or(0, |i| i.pos);
+        if let Some(last) = chunk.last() {
+            self.progress.set_committed(name, last.pos);
+        }
         self.save()
     }
 
@@ -679,5 +816,64 @@ mod tests {
         assert!(!valid_batch_name("a/b"));
         assert!(!valid_batch_name(""));
         assert!(!valid_batch_name(&"a".repeat(200)));
+    }
+
+    #[test]
+    fn in_flight_map_is_bounded() {
+        let mut p = Progress::empty();
+        for i in 0..MAX_IN_FLIGHT as u64 {
+            p.set_committed(&format!("b{i:05}"), i + 10);
+        }
+        assert_eq!(p.in_flight.len(), MAX_IN_FLIGHT);
+        // One more: the entry with the fewest committed lines goes.
+        p.set_committed("new", 1);
+        assert_eq!(p.in_flight.len(), MAX_IN_FLIGHT);
+        assert_eq!(p.lines_committed("new"), 1, "the batch being saved stays");
+        assert_eq!(p.lines_committed("b00000"), 0, "smallest evicted");
+        assert_eq!(p.lines_committed("b00001"), 11);
+        // Updating an existing entry never evicts.
+        p.set_committed("b00001", 99);
+        assert_eq!(p.in_flight.len(), MAX_IN_FLIGHT);
+    }
+
+    #[test]
+    fn progress_parsing() {
+        let v2 = Progress::parse(
+            br#"{"format":"robodr-kafka-publish-state/2","in_flight":{"a":3},"published_total":3,"dead_lettered_total":1}"#,
+        )
+        .unwrap();
+        assert_eq!(v2.lines_committed("a"), 3);
+        let v1 = Progress::parse(
+            br#"{"format":"robodr-kafka-publish-state/1","batch":null,"lines_committed":0,"published_total":7,"dead_lettered_total":0}"#,
+        )
+        .unwrap();
+        assert!(v1.in_flight.is_empty());
+        assert_eq!(v1.published_total, 7);
+        assert_eq!(v1.format, STATE_FORMAT, "migrated");
+        for bad in [
+            &b"{}"[..],
+            b"not json",
+            br#"{"format":"robodr-kafka-publish-state/9"}"#,
+            br#"{"format":"robodr-kafka-publish-state/2","in_flight":{"a":-1},"published_total":0,"dead_lettered_total":0}"#,
+            br#"{"format":"robodr-kafka-publish-state/2","in_flight":{},"published_total":0,"dead_lettered_total":0,"x":1}"#,
+        ] {
+            assert!(Progress::parse(bad).is_err(), "{}", String::from_utf8_lossy(bad));
+        }
+        let mut huge = String::from(r#"{"format":"robodr-kafka-publish-state/2","in_flight":{"#);
+        for i in 0..=MAX_IN_FLIGHT {
+            if i > 0 {
+                huge.push(',');
+            }
+            huge.push_str(&format!("\"b{i}\":1"));
+        }
+        huge.push_str(r#"},"published_total":0,"dead_lettered_total":0}"#);
+        assert!(Progress::parse(huge.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn dead_keys_distinguish_source_and_position() {
+        assert_eq!(dead_key("a", 1), dead_key("a", 1));
+        assert_ne!(dead_key("a", 1), dead_key("a", 2));
+        assert_ne!(dead_key("a", 1), dead_key("b", 1));
     }
 }
