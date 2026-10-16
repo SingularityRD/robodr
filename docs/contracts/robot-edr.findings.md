@@ -275,6 +275,41 @@ close a finding by trusting them.*
 * Map `robot_edr` fields per the trust map below; in particular a field the map
   does not list is treated as adversary.
 
+**Consumer parsing rules (normative).** A consumer that does
+not run `robodr_ocsf::parse_and_validate` must enforce at least these:
+
+* **Reject duplicate object keys** at any depth (including escape-equivalent
+  spellings such as `"a"` / `"\u0061"`). JSON parsers disagree on duplicates
+  (last-wins, first-wins, error), so a duplicated `title` or `display` could
+  show one value to the validator and another to the consumer or to the
+  LLM. The reference validator rejects such messages; a consumer must not
+  "repair" them.
+* **Prompts use `display`, never a re-rendering of `value`.** `display` is
+  validated as the exact ASCII-safe rendering of the decoded `value`; feed
+  that, delimited as data, to an LLM.
+* **Contract 1.0 messages** carry no `display` and no flags. The reference
+  validator rejects any 1.0 message that carries one of the 1.1 tainted-value
+  fields (`display`, `non_ascii`, `mixed_script`, `injection_hint`,
+  `suspicious`) — present at all, even at a default value — because 1.0 has
+  no checks for them and a downgraded `contract_version` would otherwise
+  smuggle a forged `display` or a cleared `suspicious`. For an accepted 1.0
+  message, treat every tainted value as `suspicious: true` and render it from
+  `value` (kept escaped) only. Producers never emit 1.0
+  (`robodr_ocsf::validate_for_emit` / `to_json` refuse it).
+* **Catalog constants are exact.** `title`, the leading catalog sentence of
+  `description`, `finding_info.types` (`["robot_deviation", <data source>]`),
+  `finding_info.data_sources` (`[<data source>]`), the ATT&CK lists
+  (`mitre_predictions[].technique_id/technique_name`, `attacks[].technique`)
+  must be exactly what the rule catalog (`robodr_ocsf::rule_info(rule_id)`)
+  gives for `entity_context.rule_id`, and `resources[].labels` must be exactly
+  `["taint:adversary"]`. A message with anything else (e.g. prose in
+  `types`) is rejected, so these sensor-provenance fields cannot carry
+  free text. Data sources: `ros2_dds_discovery`, `ros2_motion_commands`,
+  `robodr` (rule not in the catalog). Techniques: T0848 Rogue Master, T0855
+  Unauthorized Command Message, T0801 Monitor Process State, T0831
+  Manipulation of Control. Adding a catalog entry is a contract minor bump
+  and needs the validator updated on both sides of the diode in step.
+
 ## 4. Ordering and partitioning
 
 * Partition = `toPositive(murmur2(utf8(robot_id))) % partitions` — Kafka's
@@ -371,6 +406,17 @@ Consumer acceptance checks for this contract:
 - [ ] `evidence_links` resolved through the control plane's black-box API (not fetched directly from robots).
 
 ## 10. Changelog
+
+* **1.1.0, rev3 tightening** (validator and contract text only; the wire
+  format and `contract_version: "1.1.0"` are unchanged — every message the
+  builder ever produced still validates):
+  - Duplicate object keys are rejected at any depth.
+  - Contract 1.0 messages carrying any 1.1 tainted-value field are rejected
+    (previously the 1.1 checks were skipped while the fields were still
+    parsed and carried); 1.0 is parse-only and never emitted.
+  - `title`, `description` prefix, `finding_info.types`/`data_sources`,
+    ATT&CK technique ids/names and `resources[].labels` must match the rule
+    catalog exactly; the JSON Schema now uses `enum`/`const` for them.
 
 * **1.1.0** — SR-TAINT hardening and safety fix after independent review.
   - Neutralisation moved from a deny-list to the allow-lists in §3; more

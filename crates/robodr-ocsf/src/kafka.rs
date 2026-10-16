@@ -6,7 +6,7 @@
 
 use crate::hash::kafka_murmur2;
 use crate::model::{FindingEnvelope, CONTRACT_VERSION, DATA_SOURCE, KAFKA_TOPIC, OCSF_VERSION};
-use crate::validate::{validate, ValidationError};
+use crate::validate::{validate_for_emit, ValidationError};
 
 /// Header names, all lower-case ASCII.
 pub mod header {
@@ -32,9 +32,10 @@ pub struct Record {
     pub headers: Vec<(&'static str, String)>,
 }
 
-/// Validate and serialise to compact, deterministic JSON.
+/// Validate ([`validate_for_emit`]: contract 1.0 is never emitted) and
+/// serialise to compact, deterministic JSON.
 pub fn to_json(env: &FindingEnvelope) -> Result<String, Vec<ValidationError>> {
-    validate(env)?;
+    validate_for_emit(env)?;
     serde_json::to_string(env).map_err(|e| vec![ValidationError::Parse(e.to_string())])
 }
 
