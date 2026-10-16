@@ -60,8 +60,8 @@
 //! `min_bad_fraction` (default 25 %) of its samples. Interleaved good samples
 //! therefore only dilute an episode, they cannot reset it; samples with no
 //! basis to judge (NaN, unspecified axis) are neither good nor bad.
-//! For the command-model rules (divergence, uncommanded motion) a good
-//! sample arriving within `episode_hold_ns` (default 200 ms) of the latest
+//! For the command-model rules (divergence, uncommanded motion) and the
+//! cross-sensor rule a good sample arriving within `episode_hold_ns` (default 200 ms) of the latest
 //! bad one is also **neutral**: the episode is judged on the stream's worst
 //! sample per hold window (an upper envelope), not on the per-sample
 //! majority, so no mixing ratio of plausible values interleaved between
@@ -73,17 +73,17 @@
 //! | Rule id | Condition | Severity | Why |
 //! |---|---|---|---|
 //! | `robot.motion.feedback_divergence` | feedback outside the band while a non-rest command is in effect, over | High | The telemetry or the actuation is not what the command path says; either is an integrity failure on the control loop. |
-//! | ″ | opposite (signed feedback on the other side of zero from a signed command) | Critical if `|v| >= uncommanded_critical`, else High | Driving / turning against the command is as hazardous as uncommanded motion. |
+//! | ″ | opposite (signed feedback on the other side of zero from a signed command) | Critical once `min_samples` of the episode's opposite-direction samples are `>= uncommanded_critical` (or the firing sample itself is), else High; a latched High/Medium divergence episode escalates to Critical once when that count is reached later (hold-protected, evidence reports the opposite-direction peak) | Driving / turning against the command is as hazardous as uncommanded motion; an injector cannot pre-open a mild episode to mask a later reversal. |
 //! | ″ | ″ under-motion (moving less than commanded) | High if `safety_stop_signal_wired`, else Medium | An undeclared e-stop, obstacle or stall looks exactly like this. If the integrator wires the safety-stop state, an unexplained stall is suspicious; if not, it is too often legitimate to page at High. |
 //! | `robot.motion.uncommanded_motion` | command at rest (both latency ends) and feedback beyond the decaying band and the noise floor | Critical once `min_samples` of the episode's bad samples are `>= uncommanded_critical` (a latched High episode escalates to Critical, once), else High; evidence reports the episode's peak | Motion nobody visibly commanded is either a command injected around the observed channel or a mechanical/safety fault; above walking-pace speeds it is a direct physical hazard. |
-//! | `robot.motion.frozen_feedback` (`FrozenValues`) | ≥ `frozen_min_samples` bit-identical samples over ≥ `frozen_min_duration_ns` while the band says the robot is moving | High | Real sensors are noisy; a constant stream while moving is the replay/freeze signature. |
+//! | `robot.motion.frozen_feedback` (`FrozenValues`) | ≥ `frozen_min_samples` bit-identical samples over ≥ `frozen_min_duration_ns` while the band says the robot is moving **and** the band midpoint moved by ≥ `frozen_change_factor * abs_tol` during the run | High | A live sensor shows a commanded speed change; a stream that stays bit-identical through one is frozen or replayed. A steady cruise is not judged (noise-free quantised odometry repeats values there legitimately). |
 //! | ″ (`TimestampAnomaly` backwards / future) | stamp earlier than the previous from the same source, or ahead of the observer clock by > `max_future_skew_ns` | High | Replay loops and a second (injected) publisher interleaving with the real one produce backwards stamps; future stamps mean a forged or broken clock. |
 //! | ″ (duplicate / late) | identical stamp; stamp older than `max_stamp_age_ns` on arrival | Medium | Also produced by benign driver bugs and stalled pipelines. Duplicates are dropped from value checks. |
 //! | ″ (`StaleFeedback`) | a source that has reported silent for > `stale_after_ns` while moving (via [`ConsistencyMonitor::tick`]) | Medium | Silence is ambiguous (driver crash vs. suppression). |
-//! | `robot.motion.cross_sensor_disagreement` | two sources' latest readings (received within `cross_max_skew_ns`) differ beyond `cross_abs_tol + cross_rel_tol * max` | High | Fake odometry that mirrors the command passes the command check; it cannot also fool an independent IMU or GNSS. Evidence names the more trusted side. |
+//! | `robot.motion.cross_sensor_disagreement` | two sources' latest readings (received within `cross_max_skew_ns`) differ beyond `cross_abs_tol + cross_rel_tol * max` (hold-protected episode) | High | Fake odometry that mirrors the command passes the command check; it cannot also fool an independent IMU or GNSS. Evidence names the more trusted side. |
 //! | `robot.motion.invalid_feedback` (`NonFiniteFeedback`) | NaN / ±inf in a feedback value | Medium | Usually a driver fault, but NaN is also a classic way to poison downstream estimators. The value is dropped. |
 //! | ″ (`NonFiniteRate`) | ≥ `nan_rate_high` of a stream's last 64 samples on an axis non-finite (after `nan_rate_min_samples`), while motion is expected, observed or an episode is open, **or** the whole window is non-finite | High | A NaN stream blinds every motion check. An all-invalid stream means "motion state unknown", which is never reported as fine, even at rest. |
-//! | `robot.motion.multiple_feedback_publishers` | a publisher resumes on a source type after another, still-active publisher sent samples (interleaving) | High | Two writers on one telemetry topic is the injection signature. A clean hand-over (driver restart) does not fire. |
+//! | `robot.motion.multiple_feedback_publishers` | a publisher resumes on a source type after another, still-active publisher sent samples (interleaving); or (`PublisherOverflow`) more than [`PUBLISHER_SLOTS`] concurrent publishers on a source type | High | Two writers on one telemetry topic is the injection signature. A clean hand-over (driver restart) does not fire. |
 //! | `robot.motion.inconsistent_feedback_stream` | ≥ `jump_min_count` jumps within one (source, publisher) stream, each larger than the cross tolerance **and** `jump_accel_factor * max_accel * dt`, with gaps < `jump_window_ns` between jumps | High | Catches an injector the caller cannot attribute (same publisher id): every real <-> fake transition implies an acceleration the platform cannot produce, however many fakes it sends per real sample. |
 //!
 //! Each finding carries a `Copy` [`Evidence`] value with the numbers that
@@ -104,16 +104,25 @@
 //!
 //! Feedback state (stamps, frozen, NaN window, persistence, cross-check) is
 //! kept per **(source type, publisher)** in a fixed table of
-//! [`PUBLISHER_SLOTS`] slots per source type when the caller uses
-//! [`ConsistencyMonitor::on_feedback_from`] with the writer's identity
-//! (interned id, or [`publisher_id`] of the DDS writer GUID). An injected
-//! second publisher then cannot dilute the real one's detectors, findings
-//! carry the publisher id, and the interleaving itself is a finding.
-//! [`ConsistencyMonitor::on_feedback`] uses [`PUBLISHER_UNKNOWN`]: all
-//! samples share one slot, and only episode dilution limits plus the
+//! [`PUBLISHER_SLOTS`] slots per source type, keyed by a [`PublisherKey`]
+//! stored inline and compared exactly. Prefer
+//! [`ConsistencyMonitor::on_feedback_guid`] with the **full 16-byte DDS
+//! writer GUID** ([`PublisherKey::from_guid_str`] parses the textual form):
+//! an adversary choosing its own GUID cannot collide with the real writer.
+//! [`ConsistencyMonitor::on_feedback_from`] (a caller `u32`: interned id or
+//! the legacy [`publisher_id`] hash) is kept for compatibility; `Id` and
+//! `Guid` keys never collide with each other. An injected second publisher
+//! cannot dilute the real one's detectors, findings carry the publisher,
+//! and the interleaving itself is a finding.
+//! [`ConsistencyMonitor::on_feedback`] uses [`PublisherKey::UNKNOWN`]: all
+//! samples share one slot, and only the episode hold plus the
 //! inconsistent-stream check protect it. Slots expire after
-//! `publisher_expiry_ns` of silence; beyond [`PUBLISHER_SLOTS`] active
-//! publishers the last slot is shared ([`MonitorStats::publisher_overflow`]).
+//! `publisher_expiry_ns` of silence; beyond [`PUBLISHER_SLOTS`] concurrent
+//! publishers the extra ones share a dedicated **overflow slot** per source
+//! type (never a tracked publisher's slot, so a flood cannot dilute the real
+//! writer), counted in [`MonitorStats::publisher_overflow`] and flagged once
+//! (`PublisherOverflow`) until the overflow slot has been silent for
+//! `publisher_expiry_ns`.
 //!
 //! ## Safety stop
 //!
@@ -186,9 +195,11 @@
 //!   samples is a guess for a 50 Hz UGV.
 //! * **`command_capacity`**: ≥ command rate × `latency_max` × 2; watch
 //!   [`MonitorStats::history_underruns`].
-//! * **`frozen_min_samples`**: drivers that output quantised velocities
-//!   (encoder ticks at constant speed) can repeat values legitimately; raise
-//!   the threshold or disable `frozen_check` for that source.
+//! * **Frozen check**: drivers that output quantised velocities (encoder
+//!   ticks at constant speed) repeat values legitimately at a steady
+//!   cruise; the check only judges runs during which the expectation moved
+//!   by `frozen_change_factor * abs_tol`, so this needs no tuning unless
+//!   the quantum exceeds `abs_tol` (then raise the factor).
 //! * Feed the *final* command (after `twist_mux` / safety filters) via
 //!   `command_channels`, or the band follows a command the robot never got.
 //!
@@ -224,14 +235,25 @@
 //!   untuned: very noisy high-rate sensors (vibration, wheel slip spikes)
 //!   may need a larger `jump_accel_factor`. Neither check looks for
 //!   bimodality below the jump tolerance; the hold makes that unnecessary
-//!   for the command-model rules, but the cross-sensor rule still judges
-//!   the per-sample majority.
+//!   for the command-model and cross-sensor rules. For the cross-sensor
+//!   rule the hold must exceed the slowest honest period of the
+//!   cross-checked sources (a 1 Hz GNSS needs a hold above 1 s for its
+//!   disagreements not to be diluted by interleaved agreeing samples).
 //! * The hold also delays the end of a genuine episode by up to
 //!   `episode_hold_ns`, and a sensor that produces an out-of-band sample at
 //!   least every `episode_hold_ns` (e.g. > 5 sigma spikes several times a
 //!   second) is reported even if those samples are a small fraction.
 //! * [`publisher_id`] is a 32-bit FNV-1a hash; an adversary choosing its GUID
-//!   can collide with the real writer. Prefer interning GUIDs.
+//!   can collide with the real writer. Use [`ConsistencyMonitor::on_feedback_guid`]
+//!   (full GUID); `robodr-agent` does whenever `publisher_guid` parses as a
+//!   GUID.
+//! * A feedback stream frozen at a **steady cruise** is not reported until
+//!   the expected motion next changes (indistinguishable from a noise-free
+//!   quantised sensor by values alone); stamp checks (replays) and the
+//!   cross-sensor check still apply meanwhile.
+//! * More than [`PUBLISHER_SLOTS`] concurrent publishers of one source type
+//!   share its overflow slot: they lose separation from *each other* (not
+//!   from the tracked publishers), and the overflow is reported.
 //! * Commands built from [`robodr_events::MotionCommand`] carry no sign: no
 //!   direction-reversal detection on them.
 //! * IMU linear velocity is only usable if the caller supplies a fused
@@ -252,5 +274,5 @@ pub use monitor::{
 };
 pub use sample::{
     publisher_id, stamp_from_ros, stamp_from_secs_f64, Axis, CommandSample, FeedbackSample,
-    FeedbackSource, PUBLISHER_UNKNOWN,
+    FeedbackSource, PublisherKey, PUBLISHER_UNKNOWN,
 };

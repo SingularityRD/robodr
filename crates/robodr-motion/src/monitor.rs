@@ -8,12 +8,16 @@
 //! choice and happens off the per-sample path.
 //!
 //! Feedback state is kept per **(source type, publisher)** in a fixed table
-//! of [`PUBLISHER_SLOTS`] slots per source type, so a second publisher on the
-//! same topic cannot reset or dilute the real publisher's detector state.
+//! of [`PUBLISHER_SLOTS`] slots per source type, keyed by the full
+//! [`PublisherKey`] (16-byte GUID or caller id, compared exactly), so a
+//! second publisher on the same topic cannot reset or dilute the real
+//! publisher's detector state. Publishers beyond the table share one
+//! dedicated **overflow** slot per source type (never a real publisher's),
+//! and the overflow itself is a finding.
 
 use crate::config::{ConfigError, MonitorConfig, Persistence};
 use crate::model::{first_order_step, CmdRec, CommandRing};
-use crate::sample::{Axis, CommandSample, FeedbackSample, FeedbackSource, PUBLISHER_UNKNOWN};
+use crate::sample::{Axis, CommandSample, FeedbackSample, FeedbackSource, PublisherKey};
 use robodr_events::{Deviation, Severity};
 use serde::{Deserialize, Serialize};
 
@@ -39,12 +43,17 @@ pub mod rules {
 }
 
 /// Distinct publishers tracked per feedback source type. Further publishers
-/// share the last slot (counted in [`MonitorStats::publisher_overflow`]).
+/// share a dedicated overflow slot of that source type (never a tracked
+/// publisher's slot), are counted in [`MonitorStats::publisher_overflow`]
+/// and flagged once ([`Evidence::PublisherOverflow`]).
 pub const PUBLISHER_SLOTS: usize = 4;
 
 const N_SRC: usize = 5;
 const N_AXIS: usize = 3;
-const N_ENT: usize = N_SRC * PUBLISHER_SLOTS;
+/// State entities per source type: the tracked slots plus the overflow slot.
+const ENT_PER_SRC: usize = PUBLISHER_SLOTS + 1;
+const OVERFLOW_SLOT: usize = PUBLISHER_SLOTS;
+const N_ENT: usize = N_SRC * ENT_PER_SRC;
 const N_EPAIR: usize = N_ENT * (N_ENT - 1) / 2;
 const NS_PER_S: f64 = 1e9;
 
@@ -160,10 +169,19 @@ pub enum Evidence {
     /// type: two concurrent publishers.
     MultiplePublishers {
         source: FeedbackSource,
-        publisher: u32,
-        other: u32,
+        publisher: PublisherKey,
+        other: PublisherKey,
         /// Publishers active within `publisher_expiry_ns`.
         active: u32,
+    },
+    /// More than [`PUBLISHER_SLOTS`] publishers active on one source type:
+    /// the extra ones share the overflow slot (flood / GUID churn).
+    PublisherOverflow {
+        source: FeedbackSource,
+        /// The publisher that did not get a slot of its own.
+        publisher: PublisherKey,
+        /// Tracked slots per source type ([`PUBLISHER_SLOTS`]).
+        slots: u32,
     },
     /// Repeated physically implausible jumps within one (source, publisher)
     /// stream.
@@ -202,10 +220,10 @@ pub struct Finding {
     pub severity: Severity,
     pub t_ns: u64,
     pub evidence: Evidence,
-    /// Publisher id of the feedback sample that triggered the finding, if
-    /// it came from one ([`PUBLISHER_UNKNOWN`] when the caller used
+    /// Publisher of the feedback sample that triggered the finding, if it
+    /// came from one ([`PublisherKey::UNKNOWN`] when the caller used
     /// [`ConsistencyMonitor::on_feedback`]).
-    pub publisher: Option<u32>,
+    pub publisher: Option<PublisherKey>,
 }
 
 impl Finding {
@@ -217,8 +235,8 @@ impl Finding {
         let age = |since: u64| ms(self.t_ns.saturating_sub(since));
         let mut s = self.detail_core(age, ms);
         if let Some(p) = self.publisher {
-            if p != PUBLISHER_UNKNOWN {
-                s.push_str(&format!(" [publisher {p:#010x}]"));
+            if p != PublisherKey::UNKNOWN {
+                s.push_str(&format!(" [publisher {p}]"));
             }
         }
         s
@@ -349,12 +367,23 @@ impl Finding {
                 other,
                 active,
             } => format!(
-                "{} feedback from {} interleaved publishers (publisher {:#010x} resumed after \
-                 {:#010x}): possible injected second publisher",
+                "{} feedback from {} interleaved publishers (publisher {} resumed after \
+                 {}): possible injected second publisher",
                 source.as_str(),
                 active,
                 publisher,
                 other
+            ),
+            Evidence::PublisherOverflow {
+                source,
+                publisher,
+                slots,
+            } => format!(
+                "{} feedback from more than {} concurrent publishers (publisher {} has no slot \
+                 of its own): publisher flood or GUID churn, possible injection",
+                source.as_str(),
+                slots,
+                publisher
             ),
             Evidence::InconsistentStream {
                 source,
@@ -436,7 +465,7 @@ pub struct MonitorStats {
     /// Non-finite feedback values (dropped).
     pub invalid_feedback_values: u64,
     /// Feedback from a publisher beyond [`PUBLISHER_SLOTS`] for its source
-    /// type (shares the last slot).
+    /// type (shares that source type's overflow slot).
     pub publisher_overflow: u64,
 }
 
@@ -456,7 +485,8 @@ pub struct MonitorStats {
 /// outliers into a finding: `min_samples` still counts genuinely bad
 /// samples only.
 ///
-/// For the uncommanded rule the episode also counts its samples at or above
+/// For the uncommanded and divergence rules (divergence: opposite-direction
+/// samples only) the episode also counts its samples at or above
 /// a **critical level**: it reports `Critical` once `min_samples` of them
 /// were seen, and a latched non-critical episode is **escalated** (fires a
 /// second time, once) when that count is reached later. An injector cannot
@@ -492,9 +522,10 @@ struct Fire {
 }
 
 impl Persist {
-    /// Feed one observation without a hold or critical level. Returns
-    /// `Some((since, bad_samples))` exactly once per episode, when the
-    /// condition first satisfies the rule.
+    /// Feed one observation without a hold or critical level (unit tests).
+    /// Returns `Some((since, bad_samples))` exactly once per episode, when
+    /// the condition first satisfies the rule.
+    #[cfg(test)]
     fn observe(&mut self, bad: bool, now: u64, p: &Persistence) -> Option<(u64, u32)> {
         self.observe_held(bad, 0.0, f64::INFINITY, now, 0, p)
             .map(|f| (f.since, f.bad))
@@ -574,6 +605,12 @@ impl Persist {
         None
     }
 
+    /// Record that the latest firing was reported as critical by the caller
+    /// (a per-sample criterion), so no second escalation follows.
+    fn mark_critical(&mut self) {
+        self.crit_fired = true;
+    }
+
     /// End the episode without counting a good sample (no basis to judge:
     /// warm-up, settling, stale partner). A latched finding stays latched.
     fn interrupt(&mut self) {
@@ -617,15 +654,18 @@ struct SourceAgg {
     last_rx: u64,
     reported: [bool; N_AXIS],
     stale_latched: bool,
-    last_pub: Option<u32>,
+    last_pub: Option<PublisherKey>,
     multi_latched: bool,
     multi_clean: u32,
+    /// An overflow finding was reported; re-armed once the overflow slot
+    /// has been silent for `publisher_expiry_ns`.
+    overflow_latched: bool,
 }
 
 /// Per (source type, publisher) slot.
 #[derive(Debug, Clone, Copy, Default)]
 struct EntityState {
-    publisher: Option<u32>,
+    publisher: Option<PublisherKey>,
     seen: bool,
     last_rx: u64,
     last_stamp: Option<u64>,
@@ -636,6 +676,10 @@ struct EntityState {
     frozen_count: u32,
     frozen_since: u64,
     frozen_latched: bool,
+    /// Range `(min, max)` of the expected-band midpoint per axis over the
+    /// current frozen run: a run only fires once the expectation moved by
+    /// at least `frozen_change_factor * abs_tol` on some axis.
+    frozen_mid: [Option<(f64, f64)>; N_AXIS],
     stamp_latch: [Latch; 4],
     nonfinite_latch: [Latch; N_AXIS],
     /// Last 64 samples per axis, bit set = non-finite.
@@ -677,7 +721,8 @@ pub struct ConsistencyMonitor {
     stop_active: bool,
     stop_changed_at: Option<u64>,
     agg: [SourceAgg; N_SRC],
-    /// Indexed by entity `source * PUBLISHER_SLOTS + slot`.
+    /// Indexed by entity `source * (PUBLISHER_SLOTS + 1) + slot` (the last
+    /// slot of each source type is the shared overflow slot).
     ent: [EntityState; N_ENT],
     div: [[Persist; N_AXIS]; N_ENT],
     unc: [[Persist; N_AXIS]; N_ENT],
@@ -825,22 +870,54 @@ impl ConsistencyMonitor {
     }
 
     /// Process one feedback sample received at observer time `now_ns`, from
-    /// an unknown / single publisher ([`PUBLISHER_UNKNOWN`]). Prefer
+    /// an unknown / single publisher ([`PublisherKey::UNKNOWN`]). Prefer
     /// [`Self::on_feedback_from`] whenever the publisher identity is known.
     pub fn on_feedback<F: FnMut(Finding)>(&mut self, now_ns: u64, fb: &FeedbackSample, sink: F) {
-        self.on_feedback_from(now_ns, PUBLISHER_UNKNOWN, fb, sink);
+        self.on_feedback_key(now_ns, PublisherKey::UNKNOWN, fb, sink);
     }
 
-    /// Process one feedback sample received at observer time `now_ns` from
-    /// publisher `publisher` (an interned id or [`crate::publisher_id`] of
-    /// the DDS writer GUID). All per-sample state (stamps, frozen, NaN,
-    /// command and cross-sensor persistence) is kept per (source type,
-    /// publisher), and publishers interleaving on one source type raise
-    /// `robot.motion.multiple_feedback_publishers`.
+    /// Process one feedback sample from the publisher with DDS writer GUID
+    /// `guid` (all 16 bytes: prefix + entity id). Preferred: GUIDs are
+    /// compared exactly, so an adversary cannot share the real writer's
+    /// state slot by choosing a colliding GUID. Same as
+    /// [`Self::on_feedback_key`] with [`PublisherKey::Guid`].
+    pub fn on_feedback_guid<F: FnMut(Finding)>(
+        &mut self,
+        now_ns: u64,
+        guid: &[u8; 16],
+        fb: &FeedbackSample,
+        sink: F,
+    ) {
+        self.on_feedback_key(now_ns, PublisherKey::Guid(*guid), fb, sink);
+    }
+
+    /// Backward-compatible form of [`Self::on_feedback_key`] with a
+    /// caller-chosen `u32` id (an interned dense id, or the legacy
+    /// [`crate::publisher_id`] hash, which an adversary choosing its GUID
+    /// can collide: prefer [`Self::on_feedback_guid`]). `Id` keys never
+    /// collide with `Guid` keys.
     pub fn on_feedback_from<F: FnMut(Finding)>(
         &mut self,
         now_ns: u64,
         publisher: u32,
+        fb: &FeedbackSample,
+        sink: F,
+    ) {
+        self.on_feedback_key(now_ns, PublisherKey::Id(publisher), fb, sink);
+    }
+
+    /// Process one feedback sample received at observer time `now_ns` from
+    /// `publisher`. All per-sample state (stamps, frozen, NaN, command and
+    /// cross-sensor persistence) is kept per (source type, publisher) in a
+    /// fixed table that stores the key inline and compares it exactly (no
+    /// hashing, no allocation). Publishers interleaving on one source type
+    /// raise `robot.motion.multiple_feedback_publishers`; more than
+    /// [`PUBLISHER_SLOTS`] concurrent publishers share a dedicated overflow
+    /// slot and raise it too ([`Evidence::PublisherOverflow`]).
+    pub fn on_feedback_key<F: FnMut(Finding)>(
+        &mut self,
+        now_ns: u64,
+        publisher: PublisherKey,
         fb: &FeedbackSample,
         mut sink: F,
     ) {
@@ -850,8 +927,24 @@ impl ConsistencyMonitor {
         let si = fb.source.index();
         let sc = *self.cfg.sources.get(fb.source);
         let rearm = self.cfg.rearm_clean_samples;
-        let e = si * PUBLISHER_SLOTS + self.slot_for(si, publisher, now);
+        let slot = self.slot_for(si, publisher, now);
+        let e = si * ENT_PER_SRC + slot;
         let pubtag = Some(publisher);
+        if slot == OVERFLOW_SLOT && !self.agg[si].overflow_latched {
+            self.agg[si].overflow_latched = true;
+            self.emit(
+                &mut sink,
+                rules::MULTIPLE_FEEDBACK_PUBLISHERS,
+                Severity::High,
+                now,
+                Evidence::PublisherOverflow {
+                    source: fb.source,
+                    publisher,
+                    slots: PUBLISHER_SLOTS as u32,
+                },
+                pubtag,
+            );
+        }
 
         // 0. Publisher interleaving.
         self.check_publishers(si, e, publisher, now, fb.source, &mut sink);
@@ -963,7 +1056,7 @@ impl ConsistencyMonitor {
         //    cannot break a frozen run either.
         if !any_invalid {
             if sc.frozen_check {
-                self.check_frozen(e, fb.source, now, bits, pubtag, &mut sink);
+                self.check_frozen(e, fb.source, sc.signed, now, bits, pubtag, &mut sink);
             }
             self.ent[e].prev_bits = Some(bits);
         }
@@ -1001,7 +1094,7 @@ impl ConsistencyMonitor {
         severity: Severity,
         t_ns: u64,
         evidence: Evidence,
-        publisher: Option<u32>,
+        publisher: Option<PublisherKey>,
     ) {
         self.stats.findings = self.stats.findings.saturating_add(1);
         sink(Finding {
@@ -1023,15 +1116,20 @@ impl ConsistencyMonitor {
     }
 
     /// The state slot for `publisher` on source `si`: its own slot, else a
-    /// free or expired one (reset), else the shared overflow slot.
-    fn slot_for(&mut self, si: usize, publisher: u32, now: u64) -> usize {
-        let base = si * PUBLISHER_SLOTS;
+    /// free or expired one (reset), else the source type's overflow slot,
+    /// which no single publisher ever owns. Keys are compared exactly.
+    fn slot_for(&mut self, si: usize, publisher: PublisherKey, now: u64) -> usize {
+        let base = si * ENT_PER_SRC;
+        let expiry = self.cfg.publisher_expiry_ns;
+        let ov = &self.ent[base + OVERFLOW_SLOT];
+        if !ov.seen || now.saturating_sub(ov.last_rx) > expiry {
+            self.agg[si].overflow_latched = false;
+        }
         if let Some(k) =
             (0..PUBLISHER_SLOTS).find(|&k| self.ent[base + k].publisher == Some(publisher))
         {
             return k;
         }
-        let expiry = self.cfg.publisher_expiry_ns;
         for k in 0..PUBLISHER_SLOTS {
             let st = &self.ent[base + k];
             if st.publisher.is_none() || now.saturating_sub(st.last_rx) > expiry {
@@ -1041,7 +1139,7 @@ impl ConsistencyMonitor {
             }
         }
         self.stats.publisher_overflow = self.stats.publisher_overflow.saturating_add(1);
-        PUBLISHER_SLOTS - 1
+        OVERFLOW_SLOT
     }
 
     fn reset_entity(&mut self, e: usize) {
@@ -1063,14 +1161,14 @@ impl ConsistencyMonitor {
         &mut self,
         si: usize,
         e: usize,
-        publisher: u32,
+        publisher: PublisherKey,
         now: u64,
         source: FeedbackSource,
         sink: &mut F,
     ) {
         let expiry = self.cfg.publisher_expiry_ns;
-        let base = si * PUBLISHER_SLOTS;
-        let active_others = (base..base + PUBLISHER_SLOTS)
+        let base = si * ENT_PER_SRC;
+        let active_others = (base..base + ENT_PER_SRC)
             .filter(|&o| {
                 o != e && self.ent[o].seen && now.saturating_sub(self.ent[o].last_rx) <= expiry
             })
@@ -1092,7 +1190,7 @@ impl ConsistencyMonitor {
                 Evidence::MultiplePublishers {
                     source,
                     publisher,
-                    other: ag.last_pub.unwrap_or(PUBLISHER_UNKNOWN),
+                    other: ag.last_pub.unwrap_or(PublisherKey::UNKNOWN),
                     active: active_others.saturating_add(1).max(2),
                 },
                 Some(publisher),
@@ -1121,7 +1219,7 @@ impl ConsistencyMonitor {
         invalid: bool,
         now: u64,
         source: FeedbackSource,
-        publisher: Option<u32>,
+        publisher: Option<PublisherKey>,
         sink: &mut F,
     ) {
         let ai = a.index();
@@ -1173,7 +1271,7 @@ impl ConsistencyMonitor {
         stamp: u64,
         now: u64,
         source: FeedbackSource,
-        publisher: Option<u32>,
+        publisher: Option<PublisherKey>,
         sink: &mut F,
     ) {
         let ai = a.index();
@@ -1383,7 +1481,7 @@ impl ConsistencyMonitor {
         a: Axis,
         val: Option<f64>,
         now: u64,
-        publisher: Option<u32>,
+        publisher: Option<PublisherKey>,
         sink: &mut F,
     ) {
         let ai = a.index();
@@ -1483,17 +1581,43 @@ impl ConsistencyMonitor {
                 publisher,
             );
         }
+        // The divergence episode counts its *opposite-direction* samples at
+        // or above `uncommanded_critical` (other directions contribute 0):
+        // `min_samples` of them make it Critical, and a latched High/Medium
+        // episode (e.g. one pre-opened by mild under-motion) escalates once.
+        // With the hold, interleaved plausible samples cannot dilute it.
         let p_div = self.cfg.divergence;
-        if let Some(Fire { since, bad: n, .. }) =
-            self.div[si][ai].observe_held(divergence, m, f64::INFINITY, now, hold, &p_div)
+        let opp_mag = if direction == Some(Direction::Opposite) {
+            m.abs()
+        } else {
+            0.0
+        };
+        if let Some(fire) =
+            self.div[si][ai].observe_held(divergence, opp_mag, critical, now, hold, &p_div)
         {
-            let dir = direction.unwrap_or(Direction::Over);
-            let sev = match dir {
-                Direction::Under if !self.cfg.safety_stop_signal_wired => Severity::Medium,
-                // Driving / turning against the command at speed is as
-                // hazardous as uncommanded motion.
-                Direction::Opposite if m.abs() >= critical => Severity::Critical,
-                _ => Severity::High,
+            let (since, n) = (fire.since, fire.bad);
+            let mut dir = direction.unwrap_or(Direction::Over);
+            let mut measured = m;
+            let sev = if fire.critical {
+                // Report the episode's opposite-direction peak (the sample
+                // completing the rule may be a different, milder one).
+                dir = Direction::Opposite;
+                if measured.abs() < fire.peak || direction != Some(Direction::Opposite) {
+                    measured = if lo >= 0.0 { -fire.peak } else { fire.peak };
+                }
+                Severity::Critical
+            } else {
+                match dir {
+                    Direction::Under if !self.cfg.safety_stop_signal_wired => Severity::Medium,
+                    // Driving / turning against the command at speed is as
+                    // hazardous as uncommanded motion: a firing sample at
+                    // that speed is Critical at once.
+                    Direction::Opposite if m.abs() >= critical => {
+                        self.div[si][ai].mark_critical();
+                        Severity::Critical
+                    }
+                    _ => Severity::High,
+                }
             };
             self.emit(
                 sink,
@@ -1508,7 +1632,7 @@ impl ConsistencyMonitor {
                     expected_lo: lo,
                     expected_hi: hi,
                     tolerance: tol,
-                    measured: m,
+                    measured,
                     since_ns: since,
                     samples: n,
                 },
@@ -1517,13 +1641,22 @@ impl ConsistencyMonitor {
         }
     }
 
+    /// Frozen values: a run of bit-identical samples while the band says
+    /// the robot moves. A steady cruise legitimately repeats values on a
+    /// noise-free quantised sensor, so the run fires only once the
+    /// *expectation* changed during it (the band midpoint on some reported
+    /// axis moved by at least `frozen_change_factor * abs_tol`): the robot
+    /// should have accelerated / decelerated / turned, and a live sensor
+    /// would have shown it.
+    #[allow(clippy::too_many_arguments)]
     fn check_frozen<F: FnMut(Finding)>(
         &mut self,
         si: usize,
         source: FeedbackSource,
+        signed: bool,
         now: u64,
         bits: [Option<u64>; N_AXIS],
-        publisher: Option<u32>,
+        publisher: Option<PublisherKey>,
         sink: &mut F,
     ) {
         let any = bits.iter().any(Option::is_some);
@@ -1531,6 +1664,33 @@ impl ConsistencyMonitor {
         let moving = (0..N_AXIS).any(|ai| bits[ai].is_some() && self.moving_expected(now, ai))
             && !self.stop_active;
         if identical && moving {
+            let factor = self.cfg.frozen_change_factor;
+            let mut changed = false;
+            for a in Axis::ALL {
+                let ai = a.index();
+                if bits[ai].is_none() {
+                    continue;
+                }
+                let Some((lo, hi)) = self.band(now, ai) else {
+                    continue;
+                };
+                let (lo, hi) = if signed && a != Axis::Joint {
+                    (lo, hi)
+                } else {
+                    abs_band(lo, hi)
+                };
+                let mid = (lo + hi) / 2.0;
+                let st = &mut self.ent[si];
+                let r = match st.frozen_mid[ai] {
+                    // A new run (count 0) starts its range afresh.
+                    Some((mn, mx)) if st.frozen_count > 0 => (mn.min(mid), mx.max(mid)),
+                    _ => (mid, mid),
+                };
+                st.frozen_mid[ai] = Some(r);
+                if r.1 - r.0 >= factor * self.cfg.axis(a).abs_tol {
+                    changed = true;
+                }
+            }
             let st = &mut self.ent[si];
             if st.frozen_count == 0 {
                 st.frozen_since = now;
@@ -1538,6 +1698,7 @@ impl ConsistencyMonitor {
             st.frozen_count = st.frozen_count.saturating_add(1);
             let (count, since) = (st.frozen_count, st.frozen_since);
             if !st.frozen_latched
+                && changed
                 && count >= self.cfg.frozen_min_samples
                 && now.saturating_sub(since) >= self.cfg.frozen_min_duration_ns
             {
@@ -1558,6 +1719,7 @@ impl ConsistencyMonitor {
         } else {
             let st = &mut self.ent[si];
             st.frozen_count = 0;
+            st.frozen_mid = [None; N_AXIS];
             if !identical {
                 st.frozen_latched = false;
             }
@@ -1575,14 +1737,15 @@ impl ConsistencyMonitor {
         signed: bool,
         vals: [Option<f64>; N_AXIS],
         now: u64,
-        publisher: Option<u32>,
+        publisher: Option<PublisherKey>,
         sink: &mut F,
     ) {
         let skew = self.cfg.cross_max_skew_ns;
         let p = self.cfg.cross_sensor;
+        let hold = self.cfg.episode_hold_ns;
         let si = source.index();
         for oe in 0..N_ENT {
-            let other = FeedbackSource::ALL[oe / PUBLISHER_SLOTS];
+            let other = FeedbackSource::ALL[oe / ENT_PER_SRC];
             let osc = *self.cfg.sources.get(other);
             if other.index() == si || !osc.cross_check || !self.ent[oe].seen {
                 continue;
@@ -1606,8 +1769,15 @@ impl ConsistencyMonitor {
                 };
                 let model = self.cfg.axis(a);
                 let tol = model.cross_abs_tol + model.cross_rel_tol * mine.abs().max(theirs.abs());
-                let bad = (mine - theirs).abs() > tol;
-                if let Some((since, n)) = self.cross[pi][ai].observe(bad, now, &p) {
+                let diff = (mine - theirs).abs();
+                let bad = diff > tol;
+                // Hold-protected like the command-model rules: agreeing
+                // samples within `episode_hold_ns` of a disagreeing one are
+                // neutral, so interleaved fakes that agree with the other
+                // sensor cannot dilute a real disagreement at any ratio.
+                if let Some(Fire { since, bad: n, .. }) =
+                    self.cross[pi][ai].observe_held(bad, diff, f64::INFINITY, now, hold, &p)
+                {
                     let (sa, va, sb, vb) = if si < other.index() {
                         (source, mine, other, theirs)
                     } else {

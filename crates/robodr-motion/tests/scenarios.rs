@@ -497,8 +497,112 @@ fn gnss_spoof_is_the_odd_one_out() {
 #[test]
 fn frozen_feedback_while_moving_is_detected() {
     // At 6 s the odometry stream freezes on its last value (replayed /
-    // stuck publisher) while the robot keeps driving at 1 m/s. The frozen
-    // value is still inside the band, so only the frozen check sees it.
+    // stuck publisher); at 6.2 s the robot is commanded down to 0.8 m/s.
+    // The frozen value stays inside the (tolerance-widened) band, so only
+    // the frozen check sees it: the expectation moved by 0.2 m/s (> abs_tol)
+    // while the stream stayed bit-identical.
+    let sensors = |t: f64, i: Truth, a: Truth, r: &mut Rng, out: &mut Vec<FeedbackSample>| {
+        honest(t, i, a, r, out);
+        if t >= 6.0 {
+            out[0].linear = Some(0.987_654);
+            out[0].angular = Some(0.301_234);
+        }
+    };
+    let cmd = |t: f64| {
+        Some((
+            Some(if t < 3.0 {
+                0.0
+            } else if t < 6.2 {
+                1.0
+            } else {
+                0.8
+            }),
+            Some(if t < 3.0 { 0.0 } else { 0.3 }),
+        ))
+    };
+    let mut w = World::new(&cmd);
+    w.sensors = &sensors;
+    let (f, _) = w.run(ugv(), 10.0);
+    assert!(
+        f.iter().all(|x| x.rule == rules::FROZEN_FEEDBACK),
+        "only the frozen check sees it: {f:#?}"
+    );
+    let fr = first(&f, rules::FROZEN_FEEDBACK);
+    assert_eq!(fr.severity, Severity::High);
+    match fr.evidence {
+        Evidence::FrozenValues {
+            source, repeats, ..
+        } => {
+            assert_eq!(source, FeedbackSource::WheelOdometry);
+            assert!(repeats >= 20);
+        }
+        e => panic!("{e:?}"),
+    }
+    assert!(fr.t_ns >= ns(6.5) && fr.t_ns < ns(7.0), "{}", fr.t_ns);
+    assert_eq!(
+        f.iter()
+            .filter(|x| x.rule == rules::FROZEN_FEEDBACK)
+            .count(),
+        1,
+        "latched"
+    );
+}
+
+/// Odometry from 6 s on is bit-identical at `frozen` (lin) / 0.3 (ang);
+/// the command is 1.0 / 0.3 from 3 s, and changes to `later` m/s at
+/// `change_at` s (if any).
+fn frozen_cruise_run(change: Option<(f64, f64)>) -> Vec<Finding> {
+    let sensors = |t: f64, i: Truth, a: Truth, r: &mut Rng, out: &mut Vec<FeedbackSample>| {
+        honest(t, i, a, r, out);
+        if t >= 6.0 {
+            out[0].linear = Some(0.987_654);
+            out[0].angular = Some(0.301_234);
+        }
+    };
+    let cmd = move |t: f64| {
+        let lin = match change {
+            _ if t < 3.0 => 0.0,
+            Some((at, v)) if t >= at => v,
+            _ => 1.0,
+        };
+        Some((Some(lin), Some(if t < 3.0 { 0.0 } else { 0.3 })))
+    };
+    let mut w = World::new(&cmd);
+    w.sensors = &sensors;
+    w.run(ugv(), 14.0).0
+}
+
+#[test]
+fn frozen_at_steady_cruise_waits_for_a_command_change() {
+    // Documented trade-off: a stream frozen during a steady cruise looks
+    // exactly like noise-free quantised odometry, so it is not reported...
+    let f = frozen_cruise_run(None);
+    assert!(f.is_empty(), "{f:#?}");
+    // ...until the expectation changes: the run is still open and fires
+    // within the persistence of the change becoming visible.
+    let f = frozen_cruise_run(Some((11.0, 0.8)));
+    let fr = first(&f, rules::FROZEN_FEEDBACK);
+    assert!(fr.t_ns > ns(11.0) && fr.t_ns < ns(11.6), "{}", fr.t_ns);
+    match fr.evidence {
+        Evidence::FrozenValues {
+            source,
+            repeats,
+            since_ns,
+        } => {
+            assert_eq!(source, FeedbackSource::WheelOdometry);
+            // The run counted from the freeze, not from the change.
+            assert!(repeats > 200, "{repeats}");
+            assert!(since_ns < ns(6.1));
+        }
+        e => panic!("{e:?}"),
+    }
+    // A change smaller than abs_tol (0.10) is not enough.
+    let f = frozen_cruise_run(Some((11.0, 0.95)));
+    assert!(f.is_empty(), "{f:#?}");
+}
+
+#[test]
+fn frozen_change_factor_zero_restores_the_old_rule() {
     let sensors = |t: f64, i: Truth, a: Truth, r: &mut Rng, out: &mut Vec<FeedbackSample>| {
         honest(t, i, a, r, out);
         if t >= 6.0 {
@@ -514,26 +618,46 @@ fn frozen_feedback_while_moving_is_detected() {
     };
     let mut w = World::new(&cmd);
     w.sensors = &sensors;
-    let (f, _) = w.run(ugv(), 10.0);
+    let mut cfg = ugv();
+    cfg.frozen_change_factor = 0.0;
+    let (f, _) = w.run(cfg, 10.0);
     let fr = first(&f, rules::FROZEN_FEEDBACK);
-    assert_eq!(fr.severity, Severity::High);
-    match fr.evidence {
-        Evidence::FrozenValues {
-            source, repeats, ..
-        } => {
-            assert_eq!(source, FeedbackSource::WheelOdometry);
-            assert!(repeats >= 20);
-        }
-        e => panic!("{e:?}"),
-    }
     assert!(fr.t_ns >= ns(6.5) && fr.t_ns < ns(7.0));
-    assert_eq!(
-        f.iter()
-            .filter(|x| x.rule == rules::FROZEN_FEEDBACK)
-            .count(),
-        1,
-        "latched"
-    );
+}
+
+#[test]
+fn noise_free_quantised_odometry_at_cruise_is_not_frozen() {
+    // An encoder-tick driver: exact multiples of 0.01 m/s / 0.01 rad/s,
+    // no noise. At a steady cruise it repeats bit-identical values for
+    // seconds; during speed changes it moves. Honest: nothing to report.
+    let sensors = |t: f64, _: Truth, a: Truth, _: &mut Rng, out: &mut Vec<FeedbackSample>| {
+        let q = |v: f64| (v / 0.01).round() * 0.01;
+        out.push(fb(
+            t,
+            FeedbackSource::WheelOdometry,
+            Some(q(a.lin)),
+            Some(q(a.ang)),
+        ));
+        out.push(fb(t, FeedbackSource::Imu, None, Some(q(a.ang))));
+    };
+    for profile in [&busy_profile as &dyn Fn(f64) -> Cmd, &keep_driving] {
+        let mut w = World::new(profile);
+        w.sensors = &sensors;
+        let (f, _) = w.run(ugv(), 22.0);
+        assert!(f.is_empty(), "{f:#?}");
+        // The old rule flags this exact trace.
+        let (f, _) = w.run(
+            MonitorConfig {
+                frozen_change_factor: 0.0,
+                ..ugv()
+            },
+            22.0,
+        );
+        assert!(
+            f.iter().any(|x| x.rule == rules::FROZEN_FEEDBACK),
+            "control: {f:#?}"
+        );
+    }
 }
 
 #[test]

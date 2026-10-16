@@ -119,3 +119,57 @@ fn per_event_path_is_allocation_free() {
     assert!(worst >= Severity::High);
     assert_eq!(mon.command_capacity(), cap);
 }
+
+#[test]
+fn guid_keyed_feedback_and_publisher_overflow_are_allocation_free() {
+    // Full-GUID keys, a flood beyond PUBLISHER_SLOTS (overflow slot +
+    // flagged finding), cross-sensor and frozen paths, all alloc-free.
+    let mut mon = ConsistencyMonitor::new(MonitorConfig::ugv("alloc-guid")).unwrap();
+    let mut findings = 0u64;
+    let before = allocs();
+    for k in 0..50_000u64 {
+        let t = 1_000 * MS + k * 5 * MS;
+        let cmd = if (k / 400) % 2 == 0 { 0.0 } else { 0.8 };
+        mon.on_command(
+            &CommandSample {
+                t_ns: t,
+                channel: "/cmd_vel",
+                linear: Some(cmd),
+                angular: Some(0.0),
+                joint_speed_max: None,
+                direction_known: true,
+            },
+            |_| findings += 1,
+        );
+        let mut guid = [0xA5u8; 16];
+        guid[15] = (k % 11) as u8; // 11 writers: > PUBLISHER_SLOTS
+        let lin = if k % 3 == 0 { 0.5 } else { cmd };
+        mon.on_feedback_guid(
+            t,
+            &guid,
+            &FeedbackSample {
+                t_ns: t,
+                source: FeedbackSource::WheelOdometry,
+                linear: Some(lin),
+                angular: Some(0.0),
+                joint_speed_max: None,
+            },
+            |_| findings += 1,
+        );
+        mon.on_feedback_key(
+            t,
+            PublisherKey::Id(7),
+            &FeedbackSample {
+                t_ns: t,
+                source: FeedbackSource::Gnss,
+                linear: Some(if k % 7 == 0 { 2.0 } else { cmd }),
+                angular: None,
+                joint_speed_max: None,
+            },
+            |_| findings += 1,
+        );
+    }
+    assert_eq!(allocs() - before, 0, "per-event path allocated");
+    assert!(findings > 0);
+    assert!(mon.stats().publisher_overflow > 0);
+}
