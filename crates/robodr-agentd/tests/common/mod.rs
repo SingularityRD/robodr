@@ -65,6 +65,7 @@ pub fn metadata(version: u64) -> robodr_events::profile::ProfileMetadata {
         locked_by: "Test Operator".into(),
         locked_at: 1_790_000_000,
         parent_digest: None,
+        attestation: None,
     }
 }
 

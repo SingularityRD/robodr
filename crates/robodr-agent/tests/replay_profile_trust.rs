@@ -188,6 +188,7 @@ fn opt_in_anti_rollback_state() {
         digest: format!("sha256:{}", "0".repeat(64)),
         revocation_serial: None,
         revocation_digest: None,
+        trust_floor: None,
     };
     std::fs::write(&state, robodr_commission::to_json(&st).unwrap()).unwrap();
     let mut o = opts(&dir.join("bb1"), &profile);
@@ -230,10 +231,23 @@ fn opt_in_anti_rollback_state() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// The demo's public key from its (unsigned) example trust file.
+fn demo_key() -> robodr_blackbox::Ed25519VerifyingKey {
+    let (_, trust) = demo();
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(trust).unwrap()).unwrap();
+    let k = &v["keys"][0];
+    let bytes: [u8; 32] = robodr_blackbox::crypto::from_hex(k["public_hex"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    robodr_blackbox::Ed25519VerifyingKey::from_bytes(k["key_id"].as_str().unwrap(), &bytes).unwrap()
+}
+
 #[test]
 fn revocation_list_in_replays() {
     let dir = tmpdir("rpt-revoke");
-    let (profile, trust) = demo();
+    let (profile, unsigned_trust) = demo();
     let root = robodr_blackbox::Ed25519SigningKey::from_seed("root", &[0x55; 32]).unwrap();
     let roots = dir.join("roots.json");
     std::fs::write(
@@ -241,25 +255,60 @@ fn revocation_list_in_replays() {
         robodr_commission::trust::trust_roots_text(&[root.verifying_key()]),
     )
     .unwrap();
-    let revs = dir.join("revocations.json");
-    let sig: robodr_commission::ProfileSignature = serde_json::from_str(
-        &std::fs::read_to_string(examples().join("ugv-demo.profile.json.sig")).unwrap(),
+    // With trust roots the trust file must be root-signed. The demo profile
+    // predates operator attestation: the root-signed file opts out.
+    let tf = robodr_commission::trust::trust_file_text_with(
+        &[demo_key()],
+        &robodr_commission::trust::TrustFileOptions {
+            require_attestation: Some(false),
+            ..Default::default()
+        },
+    );
+    let trust = dir.join("trust.json");
+    std::fs::write(&trust, &tf).unwrap();
+    std::fs::write(
+        robodr_commission::sig_path_for(&trust),
+        robodr_commission::ProfileSignature::create_for(
+            robodr_commission::trust::SigKind::TrustFile,
+            tf.as_bytes(),
+            &root,
+        )
+        .unwrap()
+        .to_text(),
     )
     .unwrap();
-    let list = |serial: u64, keys: &[&str]| {
+    let revs = dir.join("revocations.json");
+    let list = |serial: u64, keys: &[String]| {
         robodr_commission::trust::RevocationList::create(
             serial,
             1_790_000_000,
+            "ugv-demo",
             [],
-            keys.iter().map(|s| s.to_string()),
+            keys.iter().cloned(),
             &root,
         )
         .unwrap()
         .to_text()
     };
-    // The demo's signing key revoked: observe-only with the reason.
-    std::fs::write(&revs, list(1, &[&sig.key_id])).unwrap();
+    let demo_fp = robodr_commission::trust::key_fingerprint(demo_key().as_bytes());
+    // The unsigned example trust file is refused once roots are configured.
+    let mut o = opts(&dir.join("bb0"), &profile);
+    o.trusted_keys = Some(unsigned_trust.clone());
+    o.trust_roots = Some(roots.clone());
+    let sum = replay::run(&o, &mut Vec::new(), None, None).unwrap();
+    assert!(
+        sum.profile_refused
+            .as_deref()
+            .unwrap()
+            .contains("must be signed"),
+        "{:?}",
+        sum.profile_refused
+    );
+    // The demo's signing key revoked (by fingerprint): observe-only with
+    // the reason.
+    std::fs::write(&revs, list(1, &[demo_fp])).unwrap();
     let mut o = opts(&dir.join("bb1"), &profile);
+    o.trusted_keys = Some(trust.clone());
     o.trust_roots = Some(roots.clone());
     o.revocation_list = Some(revs.clone());
     let sum = replay::run(&o, &mut Vec::new(), None, None).unwrap();
@@ -269,8 +318,13 @@ fn revocation_list_in_replays() {
         sum.profile_refused
     );
     // A list revoking something else: enforced.
-    std::fs::write(&revs, list(2, &["someone-else"])).unwrap();
+    std::fs::write(
+        &revs,
+        list(2, &[robodr_commission::file_digest(b"someone else")]),
+    )
+    .unwrap();
     let mut o = opts(&dir.join("bb2"), &profile);
+    o.trusted_keys = Some(trust.clone());
     o.trust_roots = Some(roots.clone());
     o.revocation_list = Some(revs.clone());
     assert!(replay::run(&o, &mut Vec::new(), None, None)

@@ -863,6 +863,11 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
                 for s in &scan.skipped {
                     warnings.push(format!("black box segment skipped: {}", sanitize_path(s)));
                 }
+                // A replayed or rewritten accepted-profile record: the
+                // baseline ignores it, the operator must hear of it.
+                for a in scan.alarms() {
+                    warnings.push(format!("CRITICAL: {}", robodr_ros2_pipeline::sanitize(&a)));
+                }
                 scan.latest
             }
             Err(e) => {

@@ -124,7 +124,9 @@
 //! locked it (`locked_by`, the sign-off operator) and when (`locked_at`,
 //! Unix seconds, UTC), and `parent_digest`, the `sha256:<hex>` of the exact
 //! locked file this version supersedes (rollback lineage; `None` for the
-//! first version). The metadata is optional here (drafts and legacy
+//! first version), and optionally `attestation` ([`ProfileAttestation`]:
+//! the operator sign-off and its signatures, verified by the loaders in
+//! `robodr-commission`). The metadata is optional here (drafts and legacy
 //! profiles have none) and [`Profile::validate`] checks it only when
 //! present ([`ProfileMetadata::validate`]); whether a locked profile *must*
 //! carry it, and the signature and anti-rollback rules built on it, are
@@ -220,10 +222,27 @@ pub const PROFILE_SCHEMA_VERSION: u32 = 1;
 pub const MAX_LABEL_LEN: usize = 64;
 /// Longest `locked_by` value.
 pub const MAX_LOCKED_BY_LEN: usize = 128;
+/// Longest text in a [`ProfileAttestation`] member.
+pub const MAX_ATTESTATION_TEXT_LEN: usize = 4 << 20;
+
+/// Operator sign-off evidence a locked profile carries
+/// ([`ProfileMetadata::attestation`]): the exact text of the confirmed
+/// sign-off file and of its operator signature bundle, embedded by
+/// `robodr-commission lock`. This crate only carries it (pure: no crypto);
+/// `robodr-commission`'s trust module verifies it at load time against the
+/// operators listed in the root-signed trust file (two-person rule).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileAttestation {
+    /// Exact text of the sign-off file the operators signed.
+    pub signoff: String,
+    /// Exact text of the sign-off's signature file (`<signoff>.sig`).
+    pub signatures: String,
+}
 
 /// Artifact metadata of a locked profile (see the module docs). Every key
 /// is always serialised (`null` for an absent optional), so a strict loader
-/// can require all of them.
+/// can require all of them, except `attestation`, which is omitted when
+/// absent so profiles locked before it existed keep their exact bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileMetadata {
     /// File-format version; must equal [`PROFILE_SCHEMA_VERSION`].
@@ -246,6 +265,11 @@ pub struct ProfileMetadata {
     /// supersedes; `None` for the first version of a lineage.
     #[serde(default)]
     pub parent_digest: Option<String>,
+    /// Operator sign-off evidence (see [`ProfileAttestation`]); `None` for
+    /// an unattested profile (legacy, migrated, or hand-made), which a
+    /// loader that requires attestation refuses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<ProfileAttestation>,
 }
 
 /// `sha256:` followed by exactly 64 lower-case hex digits.
@@ -307,6 +331,15 @@ impl ProfileMetadata {
                 errs.push(bad(
                     "parent_digest",
                     "must be sha256:<64 lower-case hex> (or null)",
+                ));
+            }
+        }
+        if let Some(a) = &self.attestation {
+            let ok = |t: &str| !t.trim().is_empty() && t.len() <= MAX_ATTESTATION_TEXT_LEN;
+            if !ok(&a.signoff) || !ok(&a.signatures) {
+                errs.push(bad(
+                    "attestation",
+                    "signoff and signatures must be non-empty texts of at most 4 MiB",
                 ));
             }
         }
@@ -1996,6 +2029,7 @@ mod metadata_tests {
             locked_by: "A. Operator".into(),
             locked_at: 1_790_000_000,
             parent_digest: Some(format!("sha256:{}", "ab".repeat(32))),
+            attestation: None,
         }
     }
 
@@ -2024,6 +2058,17 @@ mod metadata_tests {
         let v = serde_json::to_value(&m).unwrap();
         assert!(v["unit_id"].is_null() && v["parent_digest"].is_null());
         assert!(m.validate().is_empty());
+        // ... except the attestation, which is omitted when absent (older
+        // locked files keep their exact bytes) and round-trips when set.
+        assert!(v.get("attestation").is_none());
+        m.attestation = Some(ProfileAttestation {
+            signoff: "{}".into(),
+            signatures: "{}".into(),
+        });
+        assert!(m.validate().is_empty());
+        let back: ProfileMetadata =
+            serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
     }
 
     #[test]
@@ -2046,9 +2091,13 @@ mod metadata_tests {
             locked_by: "x\u{1b}[31m".into(),
             locked_at: 0,
             parent_digest: Some("sha256:ABC".into()),
+            attestation: Some(ProfileAttestation {
+                signoff: " ".into(),
+                signatures: "x".into(),
+            }),
         };
         let errs = m.validate();
-        assert_eq!(errs.len(), 7, "{errs:?}");
+        assert_eq!(errs.len(), 8, "{errs:?}");
         assert!(errs.contains(&ProfileError::UnsupportedSchemaVersion {
             found: 2,
             supported: 1
@@ -2068,12 +2117,13 @@ mod metadata_tests {
                 "unit_id",
                 "locked_by",
                 "locked_at",
-                "parent_digest"
+                "parent_digest",
+                "attestation"
             ]
         );
         // Profile::validate carries them.
         let p = profile(Some(m));
-        assert_eq!(p.validate().unwrap_err().len(), 7);
+        assert_eq!(p.validate().unwrap_err().len(), 8);
         for e in errs {
             assert!(!e.to_string().is_empty());
         }

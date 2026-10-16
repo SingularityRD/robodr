@@ -158,7 +158,7 @@ robodr-commission learn (--events run.jsonl | --pcap run.pcapng) [...] [--model 
                         [--outlier-ratio 3]
                         [--accept-participant GUID]... [--motion-topic /T]...
                         [--discovery-server PREFIX|PREFIX@IP|IP]...
-                        [--trusted-discovery-server PREFIX|PREFIX@IP|IP]...
+                        [--trusted-discovery-server PREFIX@IP|IP]...
                         [--learn-readers]
                         --out profile.json [--signoff signoff.json]
                         [--report report.json] [--quiet] [--force]
@@ -168,12 +168,20 @@ robodr-commission lock    --in profile.json --signoff signoff.json --out locked.
                           [--unit-id U] [--sign-key signing.key] [--trusted-keys trust.json]
                           [--locked-at UNIX_SECS]
                           [--hard-cap-linear 10] [--hard-cap-joint 10] [--force]
-robodr-commission sign    --profile locked.json --sign-key signing.key [--force]
+robodr-commission sign    --profile locked.json --sign-key signing.key
+                          [--operators operators.json] [--allow-unattested] [--force]
 robodr-commission verify-profile --profile locked.json --trusted-keys trust.json
                           [--expect-platform P] [--expect-unit U]
                           [--state profile-state.json] [--allow-rollback sha256:HEX] [--json]
 robodr-commission keygen  --out signing.key --trust-out trust.json [--key-id ID]
 robodr-commission trust-keys --out trust.json --pub KEY.pub [--pub KEY2.pub]... [--force]
+                          [--roots | [--min-profile-version N] [--sign-key ROOT.key]
+                           [--operators operators.json]
+                           [--require-attestation | --no-require-attestation]]
+robodr-commission revoke  --sign-key ROOT.key --out revocations.json --platform P
+                          [--digest sha256:HEX]... [--revoke-profile FILE]...
+                          [--revoke-key KEY.pub]... [--key-fingerprint sha256:HEX]...
+                          [--base previous.json --trust-roots roots.json] [--serial N]
 robodr-commission migrate-legacy --in legacy-locked.json --out locked.json
                           --platform P --profile-version N --operator NAME
                           --sign-key signing.key [--unit-id U] [--locked-at UNIX_SECS]
@@ -282,15 +290,25 @@ valid seal if locked.
   file, and (with a state file) refuses a lower `profile_version` unless the
   operator names the exact file digest. A locked profile without metadata
   (locked before versioning) is refused; `migrate-legacy` re-issues it.
-  Trust roots (`keygen --roots`, never profile keys) sign a revocation list
-  (`revoke`, `verify-revocations`: revoked digests / key ids, monotonic
-  serial, itself anti-rollback protected) and an optional trust-file
-  `min_profile_version` floor (`trust-keys --min-profile-version --sign-key`).
-  agentd records each accepted profile in the black box and flags a deleted
-  or rewritten state file (Critical `robot.ros2.profile_state_tampered`).
+  Trust roots (`keygen --roots`, never profile or operator keys) sign the
+  trust file (mandatory once roots are configured: an unsigned trust file
+  is refused) and a revocation list (`revoke`, `verify-revocations`:
+  `robodr-profile-revocations/v2`, bound to one platform, revoked digests
+  and signing keys by public-key fingerprint, monotonic serial, itself
+  anti-rollback protected); the trust file may carry a
+  `min_profile_version` floor (`trust-keys --min-profile-version
+  --sign-key`), remembered in the state and the black box so a replayed
+  older trust file never lowers it. `lock` embeds the signed sign-off in
+  `metadata.attestation`; loaders verify it against the trust file's
+  `operators` / `motion_quorum` (two-person rule on the unit; required by
+  default with roots; `sign` refuses unattested profiles unless
+  `--allow-unattested`). agentd records each accepted profile in the black
+  box and flags a deleted or rewritten state file (Critical
+  `robot.ros2.profile_state_tampered`).
   Limits: the Ed25519 code is not audited; root can delete both the state
   file and the black box (only the signed floor remains on the unit); an
-  older root-signed trust file (lower floor) can be replayed; no expiry.
+  older root-signed trust file can be replayed (its floor cannot lower the
+  remembered one, but keys it lists come back: revoke them); no expiry.
 
   The locked file is **sealed**: its first member is
   `"seal": "sha256:<hex>"` over the rest of the file. `check`, `diff` and
@@ -391,7 +409,8 @@ the `learner` module docs):
   events carry no sender, so the check does not apply to them.
 * **Discovery servers** (`--discovery-server`, `--trusted-discovery-server`;
   `PREFIX`, `PREFIX@IP` or `IP`, mirroring the sensor pipeline's
-  `discovery_servers` binding option). A server re-sends other participants'
+  `discovery_servers` binding option; a **trusted** server must include the
+  IP, since a header prefix alone is forgeable by any host). A server re-sends other participants'
   announcements under its own prefix. A relay whose sender matches a
   configured server is attributed to the owner, never to the server, and
   never binds the server's IP to the owner. From a **known** server a

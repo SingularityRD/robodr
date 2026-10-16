@@ -36,6 +36,12 @@
 //!   names it (`motion_writer`, `motion_unattributed` or
 //!   `motion_channel_unreviewed`), whatever the list says.
 //!
+//! The list binds the draft by `profile_sha256`: the SHA-256 of the draft
+//! bytes `learn` wrote, which is its canonical serialisation
+//! ([`draft_digest`]); `lock` also accepts the digest of the draft's exact
+//! bytes. [`Signoff::for_profile`] (`signoff --in`) binds the canonical
+//! form, which is what the unit re-checks when it verifies the attestation.
+//!
 //! A draft edited by hand or produced by `merge` no longer matches its
 //! learned sign-off. [`Signoff::for_profile`] then builds a conservative
 //! list from the profile alone (every participant and every motion channel
@@ -73,6 +79,11 @@
 //!   operators** (names, not keys) must have signed: the two-person rule
 //!   (`motion_quorum` in the trust list, raised per lock with
 //!   `--motion-quorum`).
+//! * The unit enforces the same rule: `lock` embeds the exact sign-off and
+//!   its signature bundle in the locked profile (`metadata.attestation`),
+//!   and the loaders verify it against the operators list carried in the
+//!   (root-signed) profile trust file (`crate::trust::attestation`), so a
+//!   profile signing key alone cannot produce an enforceable profile.
 //!
 //! # The floor: what the draft itself requires
 //!
@@ -569,13 +580,15 @@ fn is_hex64(v: &str) -> bool {
     v.len() == 64 && v.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-#[derive(Serialize, Deserialize)]
+/// One entry of an operators list as stored in JSON (the operators trust
+/// list, and the `operators` member of a profile trust file).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OperatorKeyJson {
-    operator: String,
-    algorithm: String,
-    key_id: String,
-    public_hex: String,
+pub struct OperatorKeyJson {
+    pub operator: String,
+    pub algorithm: String,
+    pub key_id: String,
+    pub public_hex: String,
 }
 
 fn one() -> usize {
@@ -661,11 +674,20 @@ impl OperatorTrust {
                 j.format
             ));
         }
-        if j.operators.len() > MAX_OPERATOR_KEYS {
+        Self::from_entries(j.operators, j.motion_quorum)
+    }
+
+    /// Build a trust list from its JSON entries (see [`OperatorTrust::new`];
+    /// keys must be valid Ed25519 public keys).
+    pub fn from_entries(
+        entries: Vec<OperatorKeyJson>,
+        motion_quorum: usize,
+    ) -> Result<Self, String> {
+        if entries.len() > MAX_OPERATOR_KEYS {
             return Err(format!("more than {MAX_OPERATOR_KEYS} operator keys"));
         }
-        let mut entries = Vec::with_capacity(j.operators.len());
-        for k in j.operators {
+        let mut out = Vec::with_capacity(entries.len());
+        for k in entries {
             if k.algorithm != ED25519 {
                 return Err(format!(
                     "key {:?}: algorithm {:?} is not supported (only {ED25519:?})",
@@ -682,9 +704,27 @@ impl OperatorTrust {
                 })?;
             let vk = Ed25519VerifyingKey::from_bytes(k.key_id.clone(), &public)
                 .map_err(|e| format!("key {:?}: {e}", k.key_id))?;
-            entries.push((k.operator, vk));
+            out.push((k.operator, vk));
         }
-        Self::new(entries, j.motion_quorum)
+        Self::new(out, motion_quorum)
+    }
+
+    /// The JSON entries of this list (sorted by key id).
+    pub fn entries(&self) -> Vec<OperatorKeyJson> {
+        self.keys
+            .iter()
+            .map(|(id, (op, vk))| OperatorKeyJson {
+                operator: op.clone(),
+                algorithm: ED25519.into(),
+                key_id: id.clone(),
+                public_hex: to_hex(vk.as_bytes()),
+            })
+            .collect()
+    }
+
+    /// Every operator public key.
+    pub fn public_keys(&self) -> impl Iterator<Item = &Ed25519VerifyingKey> {
+        self.keys.values().map(|(_, vk)| vk)
     }
 
     /// Read a trust list: not a symlink, a regular file, not writable by
@@ -701,16 +741,7 @@ impl OperatorTrust {
         let j = OperatorsJson {
             format: OPERATORS_FORMAT.into(),
             motion_quorum: self.motion_quorum,
-            operators: self
-                .keys
-                .iter()
-                .map(|(id, (op, vk))| OperatorKeyJson {
-                    operator: op.clone(),
-                    algorithm: ED25519.into(),
-                    key_id: id.clone(),
-                    public_hex: to_hex(vk.as_bytes()),
-                })
-                .collect(),
+            operators: self.entries(),
         };
         to_json(&j).unwrap_or_default()
     }

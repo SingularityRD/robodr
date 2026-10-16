@@ -47,6 +47,7 @@ fn write_signed(path: &Path, mut p: robodr_events::profile::Profile) {
         locked_by: "test".into(),
         locked_at: 1_790_000_000,
         parent_digest: None,
+        attestation: None,
     });
     let text = robodr_commission::sealed_text(&p).unwrap();
     write(path, text.as_bytes());

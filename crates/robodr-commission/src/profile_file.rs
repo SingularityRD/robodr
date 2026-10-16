@@ -35,7 +35,8 @@
 //! The optional top-level `metadata` member (`ProfileMetadata`: schema and
 //! profile version, platform / unit, locked_by / locked_at, parent digest)
 //! is written by `lock`. When present it must be an object with exactly
-//! [`METADATA_KEYS`] (all present, nothing else), and it is only allowed on
+//! [`METADATA_KEYS`] (all present, nothing else but the optional
+//! [`OPTIONAL_METADATA_KEYS`] `attestation`), and it is only allowed on
 //! a locked profile ([`ProfileFileError::MetadataOnDraft`]): a draft has
 //! not been locked by anyone. A locked file *without* metadata is a legacy
 //! (pre-versioning) profile: it still parses here, so `check`, `diff` and
@@ -97,6 +98,9 @@ pub const METADATA_KEYS: [&str; 7] = [
     "locked_at",
     "parent_digest",
 ];
+/// Optional key of the `metadata` object (the operator sign-off evidence,
+/// `{"signoff": "<text>", "signatures": "<text>"}`, written by `lock`).
+pub const OPTIONAL_METADATA_KEYS: [&str; 1] = ["attestation"];
 /// Keys of one envelope object; both must be present.
 pub const ENVELOPE_KEYS: [&str; 2] = ["max_linear_speed", "max_joint_speed"];
 /// Optional per-axis limit keys of an envelope (number or null when
@@ -344,13 +348,29 @@ pub fn parse_profile_text(text: &str) -> Result<Profile, ProfileFileError> {
             .as_object()
             .ok_or_else(|| bad("not an object".into()))?;
         for k in m.keys() {
-            if !METADATA_KEYS.contains(&k.as_str()) {
+            if !METADATA_KEYS.contains(&k.as_str()) && !OPTIONAL_METADATA_KEYS.contains(&k.as_str())
+            {
                 return Err(bad(format!("unknown key {k:?}")));
             }
         }
         for k in METADATA_KEYS {
             if !m.contains_key(k) {
                 return Err(bad(format!("missing key {k:?}")));
+            }
+        }
+        if let Some(a) = m.get("attestation") {
+            let a = a
+                .as_object()
+                .ok_or_else(|| bad("attestation is not an object".into()))?;
+            for k in a.keys() {
+                if k != "signoff" && k != "signatures" {
+                    return Err(bad(format!("attestation: unknown key {k:?}")));
+                }
+            }
+            for k in ["signoff", "signatures"] {
+                if !a.get(k).is_some_and(serde_json::Value::is_string) {
+                    return Err(bad(format!("attestation: {k:?} missing or not a string")));
+                }
             }
         }
     }
@@ -787,6 +807,7 @@ mod tests {
             locked_by: "op".into(),
             locked_at: 1_790_000_000,
             parent_digest: None,
+            attestation: None,
         }
     }
 
@@ -849,6 +870,41 @@ mod tests {
             }));
             assert!(e.is_err(), "{bad}");
         }
+        // The optional attestation: round-trips; strict shape when present.
+        let mut att = p.clone();
+        att.metadata.as_mut().unwrap().attestation =
+            Some(robodr_events::profile::ProfileAttestation {
+                signoff: "so\n".into(),
+                signatures: "sigs".into(),
+            });
+        let t = sealed_text(&att).unwrap();
+        assert_eq!(parse_profile_text(&t).unwrap(), att);
+        for (from, to, what) in [
+            (
+                "\"signatures\": \"sigs\"",
+                "\"signatures\": 3",
+                "not a string",
+            ),
+            (
+                "\"signatures\": \"sigs\"",
+                "\"signatures\": \"sigs\", \"x\": \"y\"",
+                "unknown key",
+            ),
+            ("\"signatures\": \"sigs\"", "\"z\": \"sigs\"", "unknown key"),
+        ] {
+            let e = parse_profile_text(&reseal(&att, &|t: &str| t.replace(from, to))).unwrap_err();
+            assert!(
+                matches!(&e, ProfileFileError::BadMetadata { detail } if detail.contains(what)),
+                "{e:?}"
+            );
+        }
+        let e = parse_profile_text(&reseal(&att, &|t: &str| {
+            let i = t.find("\"attestation\": {").unwrap();
+            let j = i + t[i..].find('}').unwrap() + 1;
+            format!("{}\"attestation\": []{}", &t[..i], &t[j..])
+        }))
+        .unwrap_err();
+        assert!(matches!(e, ProfileFileError::BadMetadata { .. }), "{e:?}");
         // Invalid metadata on a locked profile: refused by validate.
         let mut bad = p.clone();
         bad.metadata.as_mut().unwrap().profile_version = 0;

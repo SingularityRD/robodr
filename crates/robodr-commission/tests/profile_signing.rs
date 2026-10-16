@@ -355,6 +355,7 @@ fn lineage_parent_versions_and_rollback_state() {
         digest: v2_digest.clone(),
         revocation_serial: None,
         revocation_digest: None,
+        trust_floor: None,
     };
     std::fs::write(&state, to_json(&st).unwrap()).unwrap();
     let before = std::fs::read(&state).unwrap();
@@ -618,6 +619,46 @@ fn root_keygen(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
     (key, roots)
 }
 
+/// The operators list the `lock`s of these tests are signed under (see
+/// `common::with_operator_signature`): "Test Operator", quorum 1.
+fn test_operators(dir: &Path) -> PathBuf {
+    let p = dir.join("test-operators.json");
+    let t = robodr_commission::signoff::OperatorTrust::new(
+        vec![(
+            "Test Operator".into(),
+            common::test_operator_key().verifying_key(),
+        )],
+        1,
+    )
+    .unwrap();
+    std::fs::write(&p, t.to_text()).unwrap();
+    p
+}
+
+/// A trust file for `pubk`, carrying the test operators, signed by the
+/// trust root `root` (what a unit with trust roots requires).
+fn signed_trust(dir: &Path, pubk: &Path, root: &Path, extra: &[&str]) -> PathBuf {
+    let ops = test_operators(dir);
+    let trust = dir.join("signed-trust.json");
+    let mut a = vec![
+        "trust-keys",
+        "--out",
+        s(&trust),
+        "--pub",
+        s(pubk),
+        "--sign-key",
+        s(root),
+        "--operators",
+        s(&ops),
+        "--force",
+    ];
+    a.extend_from_slice(extra);
+    let o = run(&a);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(sig_of(&trust).exists());
+    trust
+}
+
 /// Learn, sign off and lock version `v` signed by `key` into `dir/name`.
 fn locked_profile(dir: &Path, name: &str, v: u64, key: &Path) -> PathBuf {
     let work = dir.join(format!("{name}.draft"));
@@ -647,8 +688,10 @@ fn locked_profile(dir: &Path, name: &str, v: u64, key: &Path) -> PathBuf {
 #[test]
 fn revoke_and_verify_revocations_cli() {
     let d = tmpdir("revoke");
-    let (key, trust) = keygen(&d, "oem-a");
+    let (key, unsigned_trust) = keygen(&d, "oem-a");
     let (root, roots) = root_keygen(&d, "root-a");
+    let pubk = d.join("oem-a.key.pub");
+    let trust = signed_trust(&d, &pubk, &root, &[]);
     assert!(std::fs::read_to_string(&roots)
         .unwrap()
         .contains("robodr-trust-roots/v1"));
@@ -670,8 +713,30 @@ fn revoke_and_verify_revocations_cli() {
         a.extend_from_slice(extra);
         run(&a)
     };
-    // No list yet: optional passes, required refuses.
-    assert_eq!(code(&rv(&[])), 0);
+    // With trust roots, the unsigned trust file from keygen is refused.
+    let o = verify(
+        &v1,
+        &unsigned_trust,
+        &["--trust-roots", s(&roots), "--json"],
+    );
+    assert_eq!(code(&o), 1);
+    assert!(
+        report(&o)["refused"]
+            .as_str()
+            .unwrap()
+            .contains("must be signed"),
+        "{}",
+        out(&o)
+    );
+    // No list yet: optional passes (attested by the test operator),
+    // required refuses.
+    let o = rv(&["--json"]);
+    assert_eq!(code(&o), 0, "{}", out(&o));
+    assert_eq!(report(&o)["attested_by"][0], "Test Operator");
+    let fp = report(&o)["signer_fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let o = rv(&["--revocations-required", "--json"]);
     assert_eq!(code(&o), 1);
     assert!(report(&o)["refused"].as_str().unwrap().contains("required"));
@@ -684,6 +749,8 @@ fn revoke_and_verify_revocations_cli() {
         s(&revs),
         "--revoke-profile",
         s(&v1),
+        "--platform",
+        "ugv",
         "--issued-at",
         "1790000000",
     ]);
@@ -707,8 +774,9 @@ fn revoke_and_verify_revocations_cli() {
     let r = report(&o);
     assert_eq!(r["serial"], 1);
     assert_eq!(r["revoked_digests"][0], v1_digest.as_str());
-    // Next list from the base: serial 2, revokes the key instead (the
-    // digest is carried over).
+    assert_eq!(r["platform"], "ugv");
+    // Next list from the base: serial 2, revokes the key instead (by its
+    // public key's fingerprint; the digest and platform are carried over).
     let revs2 = d.join("revocations2.json");
     let o = run(&[
         "revoke",
@@ -720,8 +788,8 @@ fn revoke_and_verify_revocations_cli() {
         s(&revs),
         "--trust-roots",
         s(&roots),
-        "--key-id",
-        "oem-a",
+        "--revoke-key",
+        s(&pubk),
     ]);
     assert_eq!(code(&o), 0, "{}", err(&o));
     let o = run(&[
@@ -734,7 +802,49 @@ fn revoke_and_verify_revocations_cli() {
     ]);
     let r = report(&o);
     assert_eq!(r["serial"], 2);
-    assert_eq!(r["revoked_key_ids"][0], "oem-a");
+    assert_eq!(r["revoked_keys"][0], fp.as_str());
+    assert_eq!(r["platform"], "ugv");
+    // Another profile signed by the key is refused (revoked by
+    // fingerprint, not by its digest).
+    let v2 = locked_profile(&d, "v2.json", 2, &key);
+    let o = verify(
+        &v2,
+        &trust,
+        &[
+            "--trust-roots",
+            s(&roots),
+            "--revocations",
+            s(&revs2),
+            "--json",
+        ],
+    );
+    assert_eq!(code(&o), 1);
+    assert!(report(&o)["refused"]
+        .as_str()
+        .unwrap()
+        .contains("signing key"));
+    // A label is not accepted where a key belongs; the platform must match
+    // the base's.
+    let yout = d.join("y.json");
+    for bad in [
+        vec!["--key-id", "oem-a"],
+        vec!["--key-fingerprint", "oem-a"],
+        vec!["--platform", "drone"],
+    ] {
+        let mut a = vec![
+            "revoke",
+            "--sign-key",
+            s(&root),
+            "--out",
+            s(&yout),
+            "--base",
+            s(&revs2),
+            "--trust-roots",
+            s(&roots),
+        ];
+        a.extend(bad.iter().copied());
+        assert_eq!(code(&run(&a)), 2, "{a:?}");
+    }
     assert_eq!(r["revoked_digests"][0], v1_digest.as_str());
     // The base must verify and the serial must grow; a profile key cannot
     // sign revocations for these roots.
@@ -774,7 +884,7 @@ fn revoke_and_verify_revocations_cli() {
     // Tampered list.
     let text = std::fs::read_to_string(&revs2).unwrap();
     let tampered = d.join("tampered.json");
-    std::fs::write(&tampered, text.replace("\"oem-a\"", "\"oem-b\"")).unwrap();
+    std::fs::write(&tampered, text.replace("\"ugv\"", "\"ugw\"")).unwrap();
     let o = run(&[
         "verify-revocations",
         "--list",
@@ -799,6 +909,7 @@ fn revoke_and_verify_revocations_cli() {
                 .unwrap()
                 .digest(),
         ),
+        trust_floor: None,
     };
     std::fs::write(&state, to_json(&st).unwrap()).unwrap();
     let vr = |list: &Path| {
@@ -850,6 +961,8 @@ fn signed_floor_in_the_trust_file_cli() {
         s(&root),
     ]);
     assert_eq!(code(&o), 2);
+    // Root-signed but without operators: written (with a warning), and a
+    // unit with trust roots refuses it (attestation is required by default).
     let o = run(&[
         "trust-keys",
         "--out",
@@ -860,6 +973,25 @@ fn signed_floor_in_the_trust_file_cli() {
         "2",
         "--sign-key",
         s(&root),
+    ]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(err(&o).contains("no --operators"), "{}", err(&o));
+    let no_ops = d.join("no-ops.json");
+    std::fs::rename(&trust, &no_ops).unwrap();
+    std::fs::rename(sig_of(&trust), sig_of(&no_ops)).unwrap();
+    let ops = test_operators(&d);
+    let o = run(&[
+        "trust-keys",
+        "--out",
+        s(&trust),
+        "--pub",
+        s(&pubk),
+        "--min-profile-version",
+        "2",
+        "--sign-key",
+        s(&root),
+        "--operators",
+        s(&ops),
     ]);
     assert_eq!(code(&o), 0, "{}", err(&o));
     assert!(sig_of(&trust).exists());
@@ -890,6 +1022,28 @@ fn signed_floor_in_the_trust_file_cli() {
     let d1 = file_digest(&std::fs::read(&v1).unwrap());
     assert_eq!(code(&vf(&v1, &["--allow-rollback", &d1])), 1);
     assert_eq!(code(&vf(&v2, &[])), 0);
+    let o = verify(&v2, &no_ops, &["--trust-roots", s(&roots), "--json"]);
+    assert_eq!(code(&o), 1);
+    assert!(report(&o)["refused"]
+        .as_str()
+        .unwrap()
+        .contains("no operators"));
+    // An unsigned copy of the floored file (the .sig deleted, floor
+    // stripped) is refused with roots configured.
+    let stripped = d.join("stripped.json");
+    std::fs::write(
+        &stripped,
+        std::fs::read_to_string(&trust)
+            .unwrap()
+            .replace("  \"min_profile_version\": 2,\n", ""),
+    )
+    .unwrap();
+    let o = verify(&v1, &stripped, &["--trust-roots", s(&roots), "--json"]);
+    assert_eq!(code(&o), 1);
+    assert!(report(&o)["refused"]
+        .as_str()
+        .unwrap()
+        .contains("must be signed"));
     // Without roots the floored trust file is not accepted at all.
     let o = verify(&v2, &trust, &["--json"]);
     assert_eq!(code(&o), 1);
@@ -897,4 +1051,95 @@ fn signed_floor_in_the_trust_file_cli() {
         .as_str()
         .unwrap()
         .contains("not signed by a trust root"));
+}
+
+/// `lock` embeds the signed sign-off (attestation); `sign` refuses a
+/// locked profile without one (what a single profile-key holder would
+/// hand-build) unless explicitly told, and with `--operators` verifies it.
+#[test]
+fn lock_embeds_attestation_and_sign_refuses_unattested_cli() {
+    let d = tmpdir("attest");
+    let (key, _) = keygen(&d, "oem-a");
+    let (root, roots) = root_keygen(&d, "root-a");
+    let trust = signed_trust(&d, &d.join("oem-a.key.pub"), &root, &[]);
+    let v1 = locked_profile(&d, "v1.json", 1, &key);
+    let m: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&v1).unwrap()).unwrap();
+    let att = &m["metadata"]["attestation"];
+    assert!(att["signoff"]
+        .as_str()
+        .unwrap()
+        .contains("robodr-commission-signoff/1"));
+    assert!(att["signatures"]
+        .as_str()
+        .unwrap()
+        .contains("robodr-signoff-sigs/v1"));
+    assert_eq!(code(&verify(&v1, &trust, &["--trust-roots", s(&roots)])), 0);
+    // sign with --operators verifies the attestation first.
+    let ops = test_operators(&d);
+    let o = run(&[
+        "sign",
+        "--profile",
+        s(&v1),
+        "--sign-key",
+        s(&key),
+        "--operators",
+        s(&ops),
+        "--force",
+    ]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(err(&o).contains("attestation verified"), "{}", err(&o));
+    // ... and refuses it against an operators list that does not hold the
+    // signer.
+    let other = d.join("other-ops.json");
+    let k = robodr_blackbox::Ed25519SigningKey::from_seed("someone", &[77; 32]).unwrap();
+    std::fs::write(
+        &other,
+        robodr_commission::signoff::OperatorTrust::new(
+            vec![("Test Operator".into(), k.verifying_key())],
+            1,
+        )
+        .unwrap()
+        .to_text(),
+    )
+    .unwrap();
+    let o = run(&[
+        "sign",
+        "--profile",
+        s(&v1),
+        "--sign-key",
+        s(&key),
+        "--operators",
+        s(&other),
+        "--force",
+    ]);
+    assert_eq!(code(&o), 2, "{}", err(&o));
+    // A hand-built locked profile: same content, attestation stripped.
+    let mut prof: robodr_events::profile::Profile =
+        serde_json::from_str(&std::fs::read_to_string(&v1).unwrap()).unwrap();
+    prof.metadata.as_mut().unwrap().attestation = None;
+    prof.participants.insert("e".repeat(24));
+    let hand = d.join("handmade.json");
+    std::fs::write(&hand, sealed_text(&prof).unwrap()).unwrap();
+    let o = run(&["sign", "--profile", s(&hand), "--sign-key", s(&key)]);
+    assert_eq!(code(&o), 2);
+    assert!(err(&o).contains("attestation"), "{}", err(&o));
+    assert!(!sig_of(&hand).exists());
+    let o = run(&[
+        "sign",
+        "--profile",
+        s(&hand),
+        "--sign-key",
+        s(&key),
+        "--allow-unattested",
+    ]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    // Signed or not, a unit with trust roots refuses it.
+    let o = verify(&hand, &trust, &["--trust-roots", s(&roots), "--json"]);
+    assert_eq!(code(&o), 1);
+    assert!(report(&o)["refused"]
+        .as_str()
+        .unwrap()
+        .contains("attestation"));
+    let _ = std::fs::remove_dir_all(&d);
 }

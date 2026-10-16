@@ -257,11 +257,40 @@ fn revocation_list_and_config_keys() {
         robodr_commission::trust::trust_roots_text(&[root.verifying_key()]),
     )
     .unwrap();
+    // With trust roots the trust file must be root-signed (this
+    // hand-written profile carries no operator attestation: the root-signed
+    // trust file opts out of requiring one).
+    let tf = robodr_commission::trust::trust_file_text_with(
+        &[profile_key().verifying_key()],
+        &robodr_commission::trust::TrustFileOptions {
+            require_attestation: Some(false),
+            ..Default::default()
+        },
+    );
+    let tpath = s.dir.join("profile-trust.json");
+    std::fs::write(&tpath, &tf).unwrap();
+    std::fs::write(
+        robodr_commission::sig_path_for(&tpath),
+        robodr_commission::ProfileSignature::create_for(
+            robodr_commission::trust::SigKind::TrustFile,
+            tf.as_bytes(),
+            &root,
+        )
+        .unwrap()
+        .to_text(),
+    )
+    .unwrap();
     let revs = s.dir.join("revocations.json");
     let digest = robodr_commission::file_digest(&std::fs::read(&s.profile).unwrap());
-    let list =
-        robodr_commission::trust::RevocationList::create(1, 1_790_000_000, [digest], [], &root)
-            .unwrap();
+    let list = robodr_commission::trust::RevocationList::create(
+        1,
+        1_790_000_000,
+        "ugv-lab",
+        [digest],
+        [],
+        &root,
+    )
+    .unwrap();
     std::fs::write(&revs, list.to_text()).unwrap();
     let mut cfg = s.config(
         serde_json::json!({}),
@@ -274,6 +303,16 @@ fn revocation_list_and_config_keys() {
     let r = s.resolve(&cfg);
     let p = Pipeline::from_loaded(r.profile.clone(), r.sensor.pipeline.clone());
     assert!(matches!(p.status(), ProfileStatus::FileRejected(w) if w.contains("revoked")));
+    // The trust file without its root signature: refused (roots configured).
+    let sig = std::fs::read(robodr_commission::sig_path_for(&tpath)).unwrap();
+    std::fs::remove_file(robodr_commission::sig_path_for(&tpath)).unwrap();
+    let r = s.resolve(&cfg);
+    assert!(
+        matches!(&r.profile.file_check, Err(e) if e.to_string().contains("must be signed")),
+        "{:?}",
+        r.profile.file_check
+    );
+    std::fs::write(robodr_commission::sig_path_for(&tpath), sig).unwrap();
     // Required but missing.
     std::fs::remove_file(&revs).unwrap();
     let r = s.resolve(&cfg);
