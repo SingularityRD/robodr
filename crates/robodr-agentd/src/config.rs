@@ -291,8 +291,8 @@ pub struct BlackboxSection {
     /// daemon logs a warning at start and reports `"anchored": false` in
     /// its status: a cut of the newest records combined with a rollback of
     /// `head.json`, or a wiped store, is then not detectable on the unit.
-    /// A deployment against an attacker with write access needs a TPM NV
-    /// counter or a remote receiver (integration work, not offered here).
+    /// A deployment against an attacker with write access needs the
+    /// `tpm_nv_counter` kind (or a remote receiver, not offered here).
     #[serde(default)]
     pub head_anchor: Option<HeadAnchorConfig>,
 }
@@ -306,6 +306,33 @@ pub enum HeadAnchorConfig {
     /// file lives on: useful on a separately mounted, write-restricted or
     /// off-unit replicated filesystem, worthless on the log's own.
     File { path: PathBuf },
+    /// `robodr_blackbox::TpmNvCounterAnchor`: a TPM 2.0 NV counter
+    /// (provisioned with `robodr-blackbox tpm-anchor-init`) plus a sidecar
+    /// file signed with the black-box key. Rollback and truncation become
+    /// detectable on the unit; see `docs/OPERATIONS.md`.
+    TpmNvCounter {
+        /// NV index handle, `"0x01500020"` form.
+        nv_index: String,
+        /// Sidecar file (absolute; outside `blackbox.dir` and `spool.dir`;
+        /// its directory must exist).
+        sidecar_path: PathBuf,
+        /// `TPM2TOOLS_TCTI`; default `device:/dev/tpmrm0`.
+        #[serde(default)]
+        tcti: Option<String>,
+        /// Directory of the `tpm2_*` binaries (absolute); default `/usr/bin`.
+        #[serde(default)]
+        tools_dir: Option<PathBuf>,
+        /// The index's authorization value (absolute file); default empty.
+        #[serde(default)]
+        auth_file: Option<PathBuf>,
+        /// At most one counter increment per this interval (NV endurance);
+        /// default 60000, max 86400000. 0 = every mark.
+        #[serde(default)]
+        min_increment_interval_ms: Option<u64>,
+        /// Bound on one tool invocation; default 2000, 100..=30000.
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
 }
 
 impl HeadAnchorConfig {
@@ -313,7 +340,62 @@ impl HeadAnchorConfig {
     pub fn kind(&self) -> &'static str {
         match self {
             HeadAnchorConfig::File { .. } => "file",
+            HeadAnchorConfig::TpmNvCounter { .. } => "tpm_nv_counter",
         }
+    }
+
+    /// The anchor settings of a `tpm_nv_counter` (validated; does not touch
+    /// the TPM). `None` for other kinds.
+    pub fn tpm_config(&self) -> Option<Result<robodr_blackbox::TpmAnchorConfig, String>> {
+        let HeadAnchorConfig::TpmNvCounter {
+            nv_index,
+            sidecar_path,
+            tcti,
+            tools_dir,
+            auth_file,
+            min_increment_interval_ms,
+            timeout_ms,
+        } = self
+        else {
+            return None;
+        };
+        Some((|| {
+            use robodr_blackbox::tpm_anchor as t;
+            let index = t::parse_nv_index(nv_index)
+                .map_err(|e| format!("blackbox.head_anchor.nv_index: {e}"))?;
+            require_abs("blackbox.head_anchor.sidecar_path", sidecar_path)?;
+            let mut c = robodr_blackbox::TpmAnchorConfig::new(index, sidecar_path);
+            if let Some(d) = tools_dir {
+                require_abs("blackbox.head_anchor.tools_dir", d)?;
+                c.tools_dir = d.clone();
+            }
+            if let Some(f) = auth_file {
+                require_abs("blackbox.head_anchor.auth_file", f)?;
+                c.auth_file = Some(f.clone());
+            }
+            if let Some(x) = tcti {
+                c.tcti = x.clone();
+            }
+            match *min_increment_interval_ms {
+                Some(ms) if ms > 86_400_000 => {
+                    return Err(
+                        "blackbox.head_anchor.min_increment_interval_ms must be <= 86400000".into(),
+                    )
+                }
+                Some(ms) => c.min_increment_interval = std::time::Duration::from_millis(ms),
+                None => {}
+            }
+            match *timeout_ms {
+                Some(ms) if !(100..=30_000).contains(&ms) => {
+                    return Err("blackbox.head_anchor.timeout_ms must be 100..=30000".into())
+                }
+                Some(ms) => c.timeout = std::time::Duration::from_millis(ms),
+                None => {}
+            }
+            t::Tpm2Tools::new(&c.tools_dir, &c.tcti, c.timeout)
+                .map_err(|e| format!("blackbox.head_anchor: {e}"))?;
+            Ok(c)
+        })())
     }
 }
 
@@ -987,6 +1069,28 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
                  it lives on; deployment needs a TPM NV counter or a remote anchor",
                 sanitize_path(&path.display().to_string())
             ));
+        }
+        Some(a @ HeadAnchorConfig::TpmNvCounter { .. }) => {
+            let tc = a
+                .tpm_config()
+                .unwrap_or_else(|| Err("not a TPM anchor".into()))?;
+            // The sidecar is signed and the counter exposes an older copy,
+            // but a wiped log directory must not take the sidecar with it.
+            let p = resolve_path(&tc.sidecar);
+            let mut inside = vec![("blackbox.head_anchor.sidecar_path", p)];
+            if let Some(f) = &tc.auth_file {
+                inside.push(("blackbox.head_anchor.auth_file", resolve_path(f)));
+            }
+            for (field, p) in inside {
+                for (what, d) in [
+                    ("spool.dir", &config.spool.dir),
+                    ("blackbox.dir", &config.blackbox.dir),
+                ] {
+                    if p.starts_with(resolve_path(d)) {
+                        return Err(format!("{field} must not be inside {what}"));
+                    }
+                }
+            }
         }
     }
     Ok(Resolved {

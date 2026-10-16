@@ -873,8 +873,80 @@ false}`: `head.json` alone cannot reveal a cut of the newest records
 together with a rolled-back `head.json`, or a wiped store.
 `{"kind": "file", "path": "/abs/path"}` keeps the mark in a file outside
 `blackbox.dir` and `spool.dir`; it is only as strong as the storage it
-lives on. **A deployment must anchor to a TPM NV monotonic counter or a
-remote receiver** (integration work, not shipped yet).
+lives on. **A deployment must anchor to a TPM NV monotonic counter** (kind
+`tpm_nv_counter`, below) or a remote receiver (not implemented).
+
+**TPM NV counter anchor** (`tpm_nv_counter`). The TPM counter counts the
+black box's head marks and can never go back; a sidecar file signed with
+the black-box key binds the count to the newest mark. An attacker who
+cuts the log and restores older copies of `head.json`, `checkpoint.json`
+and the sidecar is caught: the counter is ahead of the sidecar, and agentd
+raises Critical `robot.agent.evidence_truncated`. A deleted or forged
+sidecar, a redefined index or a cleared TPM cannot be bounded: the open
+counts an anchor failure (`status.json` `anchor_failures`) and names it in
+the black box's signed `Resume` record; treat that as tamper evidence.
+Needs `tpm2-tools` 5.x and access to the TPM (`/dev/tpmrm0`).
+
+Provision once per unit (as root, before the first start with the anchor):
+
+```sh
+# Pick a free owner NV index (tpm2_getcap handles-nv-index lists used ones).
+robodr-blackbox tpm-anchor-init --index 0x01500020
+#   [--owner-auth-file /path/owner.auth]   owner hierarchy password, if set
+#   [--index-auth-file /path/index.auth]   optional index password
+robodr-blackbox tpm-anchor-check --index 0x01500020
+# Strongly recommended: set owner and lockout authorization and keep the
+# values off the unit, so root cannot undefine the index or clear the TPM:
+#   tpm2_changeauth -c owner file:...; tpm2_changeauth -c lockout file:...
+```
+
+The index gets `authread|authwrite|nt=counter|no_da`, size 8: a counter
+(only increments), read and incremented with the index's own
+authorization (empty unless `--index-auth-file`), so agentd needs neither
+the owner password nor any policy session; `no_da` keeps wrong index
+passwords from triggering the TPM's dictionary-attack lockout (which
+would affect every other TPM user; a guessed index password only allows
+increments, i.e. false alarms). It is not `orderly`: an orderly counter
+jumps forward after each power loss, which would read as a truncation.
+The command refuses an index that already exists.
+
+```json
+"blackbox": {
+  "dir": "/var/lib/robodr/blackbox/agentd",
+  "key_file": "/run/credentials/robodr-agentd.service/blackbox.key",
+  "head_anchor": {
+    "kind": "tpm_nv_counter",
+    "nv_index": "0x01500020",
+    "sidecar_path": "/var/lib/robodr/anchor/blackbox-tpm-sidecar.json",
+    "tcti": "device:/dev/tpmrm0",
+    "tools_dir": "/usr/bin",
+    "auth_file": "/etc/robodr/keys/tpm-index.auth",
+    "min_increment_interval_ms": 60000,
+    "timeout_ms": 2000
+  }
+}
+```
+
+Only `kind`, `nv_index` and `sidecar_path` are required; the rest show
+the defaults (`auth_file`: none, empty authorization). `sidecar_path` must
+be absolute and outside `blackbox.dir` and `spool.dir` (a wiped log
+directory must not take the sidecar with it); its directory must exist
+(create it 0700). `min_increment_interval_ms` (0..=86400000) bounds NV
+wear: one increment per interval at most (60 s = about 525,000 a year;
+check the NV write endurance in your TPM's datasheet and raise it if
+needed). A longer interval only widens the window in which a restored
+sidecar of the same count goes unnoticed. Each tool call is killed after
+`timeout_ms` (100..=30000). A TPM error never stops recording.
+Re-provisioning (new index, or `tpm2_nvundefine` + init): also move the
+old sidecar away, or the next open reports the anchor as reset.
+
+Limits: tested against swtpm (`scripts/swtpm-anchor-it.sh`), not yet on a
+hardware TPM. Root on the unit can still use the index; the guarantee is
+that rollback and truncation become detectable, not that they are
+prevented. The window is the newest marks: records after the last mark
+(at most 16 records or 1 s, see the black-box README) and, against an
+attacker who restores a sidecar of the same count, up to
+`min_increment_interval_ms`.
 
 ## 7. Upgrade and rollback
 
