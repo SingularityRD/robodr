@@ -12,6 +12,37 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Added
 
+- Host-side (Pulsar) threats reach `robodr-agentd`, so the host-dependent
+  correlation rules (`coordinated_intrusion`, `credential_theft`,
+  `trojaned_package_key_access`, `defense_tampering`,
+  `host_process_persistence`) can fire in the daemon:
+  - New Pulsar module `robodr-threat-forward` (registered by
+    `robodr-pulsard`, off by default, `[module.robodr-threat-forward]
+    socket_path`): forwards every Pulsar threat except
+    `robodr-sensor-ros2`'s own as one JSON line (rule name, source module,
+    severity / category from the rule metadata, time, pid / ppid / uid /
+    gid, bounded sanitised image) to a unix socket; bounded queue with
+    counted drops, never blocks the bus, reconnects with backoff, heartbeat
+    with its counters.
+  - `robodr-agentd` `host_threats` section: binds the socket (`0600` or
+    `0660`; refuses a group/world-writable or foreign-owned directory and a
+    path that is not its own socket), accepts only peers with uid 0 or
+    `allowed_uids` (`SO_PEERCRED`), parses lines strictly (4 KiB, no unknown
+    or duplicate keys, bounded strings, no control characters; refused lines
+    are `robot.agent.input_malformed`). Each threat is a
+    `robot.host.pulsar_threat` finding and a `Signal::host(<rule name>)`
+    with the pid as its process entity. Heartbeats are the input's
+    liveness (a configured but silent host input reads `unknown`); the
+    forwarder's losses are reported as queue drops. `status.json` shows
+    connections, `upstream_dropped` and the host-threat counters.
+  - OCSF catalog (contract 1.3, unreleased): `robot.host.pulsar_threat` with
+    the new data source `host_runtime` (schema enums updated).
+  - Packaging: `config/robodr.toml.example` (hence `/etc/robodr/pulsar.toml`)
+    gains the disabled `[module.robodr-threat-forward]` section,
+    `config/agentd.full.example.json` the `host_threats` key, and the
+    drop-in example `robodr-pulsard.service.d/30-host-threats.conf.example`
+    (`SupplementaryGroups=robodr`, since pulsard has no
+    `CAP_DAC_OVERRIDE`).
 - Wave 6 (integrated on `integrate-w6`):
   - `robodr-agentd` live safety-state feed (`safety_feed`): ROS 2 topics
     decoded passively from captured user DATA (`std_msgs` Bool / UInt8 /

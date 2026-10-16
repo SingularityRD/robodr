@@ -828,14 +828,60 @@ and is observe-only whenever one of them was. Add site rules with
 with the shipped rules; a rule file that does not load refuses the
 configuration), drop the shipped ones with `"include_default_rules": false`,
 or turn it off with `"enabled": false`. The rules are engineering defaults,
-not tuned on fleet data: run the first field period observe-only. Host
-(Pulsar) detections do not reach agentd yet, so rules that need them do not
-fire. `robot.agent.correlation_pressure` (observe-only) means the engine had
+not tuned on fleet data: run the first field period observe-only. Rules
+that need host (Pulsar) detections fire only with `host_threats` (below).
+`robot.agent.correlation_pressure` (observe-only) means the engine had
 to evict pending state: many fresh source addresses or participants within
 a window. Pending state of the robot's own entities (profiled participants,
 IPs bound or pinned to them) and of High / Critical first steps is
 protected from such floods; when evidence is evicted anyway, the
 observe-only `robot.correlate.correlation_state_evicted` names the rule.
+
+**Host threats (`host_threats`, optional).** Hands every Pulsar threat
+(the RoboDR host rules in `/usr/share/robodr/rules/robodr` and Pulsar's own)
+to agentd, so the host-dependent correlation rules (`coordinated_intrusion`,
+`credential_theft`, `trojaned_package_key_access`, `defense_tampering`,
+`host_process_persistence`) can fire. The Pulsar module
+`robodr-threat-forward` (in `robodr-pulsard`) writes one JSON line per
+threat to a unix socket agentd binds; it skips the ROS 2 sensor's own
+threats (agentd sees those through its own capture). Enable both ends:
+
+```sh
+# 1. agentd.json (socket under agentd's RuntimeDirectory):
+#    "host_threats": { "socket_path": "/run/robodr-agentd/host-threats.sock",
+#                      "socket_mode": "0660" }
+sudo robodr-agentd --config /etc/robodr/agentd.json --check-config
+# 2. robodr-pulsard may reach the 0660 socket only through agentd's group
+#    (it has no CAP_DAC_OVERRIDE):
+sudo install -D -m 0644 /usr/share/doc/robodr/examples/robodr-pulsard.service.d/30-host-threats.conf.example \
+    /etc/systemd/system/robodr-pulsard.service.d/30-host-threats.conf
+# 3. /etc/robodr/pulsar.toml:
+#    [module.robodr-threat-forward]
+#    enabled = true
+#    socket_path = "/run/robodr-agentd/host-threats.sock"
+sudo systemctl daemon-reload && sudo systemctl restart robodr-agentd robodr-pulsard
+```
+
+agentd refuses to start if the socket's directory is writable by group or
+others or not owned by root / `robodr`, or if the path is something other
+than a socket of its own. Only peers with uid 0 (or `allowed_uids`) may
+send (`SO_PEERCRED`); other connections are closed and counted
+(`rejected_connections`) and reported as `robot.agent.input_malformed`.
+Each threat becomes a `robot.host.pulsar_threat` finding (the Pulsar rule
+name and the process are in its detail; severity from the rule) and a
+correlation signal named by the Pulsar rule, grouped by process
+(pid). The forwarder writes a heartbeat at connect and every
+`heartbeat_ms` (default 5 s) when idle: with `host_threats` configured and
+`robodr-pulsard` stopped or the module disabled, the input goes silent,
+`robot.agent.input_silent` is raised and the state is `unknown`, never
+`ok`. Threats the forwarder could not deliver (queue full while agentd was
+away) arrive as its `dropped` count and are reported like queue drops
+(`robot.agent.queue_overflow`). `status.json` shows the input
+(`host:<path>`: `received`, `malformed`, `rejected_connections`,
+`connections`, `upstream_dropped`) and `daemon.host_threats`,
+`host_heartbeats`, `host_threats_own_skipped`. Process-to-socket
+attribution does not exist yet: unit-scoped rules join host and network
+evidence by time window only.
 
 **Finding signatures (`finding_signing`, optional).** Signs every finding
 with a dedicated Ed25519 key (contract §2a); the signature is the spooled

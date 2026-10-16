@@ -33,6 +33,7 @@ sqlite3-vendored = ["pulsar/sqlite3-vendored"]
 [dependencies]
 pulsar = { workspace = true }
 robodr-sensor-ros2 = { workspace = true }
+robodr-threat-forward = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 # Same versions as vendor/pulsar's workspace (its pulsard uses both).

@@ -136,6 +136,25 @@ state_file = "/var/lib/robodr/profile-state-pulsard/pulsard.json"
 # means every locked profile is refused.
 # revocation_policy = "optional"
 
+# Pulsar threats -> robodr-agentd (crates/robodr-threat-forward). Every
+# Pulsar threat except this sensor's own is written, one JSON line each, to
+# agentd's `host_threats` socket, so agentd's host-dependent correlation
+# rules (coordinated_intrusion, credential_theft, defense_tampering, ...)
+# can fire. Never blocks the Pulsar bus: a bounded queue, losses counted and
+# reported in the heartbeat; reconnects with backoff while agentd is away.
+# Needs agentd's "host_threats" section and, with the shipped units,
+# socket_mode "0660" there plus the drop-in
+# robodr-pulsard.service.d/30-host-threats.conf.example (docs/OPERATIONS.md 6.4).
+[module.robodr-threat-forward]
+enabled = false
+socket_path = "/run/robodr-agentd/host-threats.sock"
+# Threats held while agentd is away or slow (1..=65536).
+# queue_capacity = 1024
+# Liveness line when idle; keep it well below agentd's daemon.silence_ms.
+# heartbeat_ms = 5000
+# A write blocked this long drops the connection (then reconnect).
+# write_timeout_ms = 1000
+
 # ---------------------------------------------------------------------------
 # Motion Firewall and motion monitor (robodr-agent). NOT Pulsar module keys:
 # the agent is not a Pulsar module yet; today these are set through

@@ -21,6 +21,16 @@
 //! enabled = true   # passive capture: sees unicast SEDP (needs CAP_NET_RAW)
 //! ```
 //!
+//! `robodr-threat-forward` (also `DEFAULT_ENABLED = false`) hands every
+//! Pulsar threat except the sensor's own to robodr-agentd's host-threat
+//! socket, so agentd's host-dependent correlation rules can fire:
+//!
+//! ```toml
+//! [module.robodr-threat-forward]
+//! enabled = true
+//! socket_path = "/run/robodr-agentd/host-threats.sock"
+//! ```
+//!
 //! The capture source needs no registration here: the sensor opens it from
 //! its own config section in `init_state` (see `robodr_ros2_pipeline`).
 //! The daemon must hold `CAP_NET_RAW` for live capture (it already runs as
@@ -32,6 +42,7 @@ use clap::Parser;
 use clap_verbosity_flag::{InfoLevel, Verbosity};
 use pulsar::pulsard::PulsarDaemonOpts;
 use robodr_sensor_ros2::Ros2Sensor;
+use robodr_threat_forward::ThreatForwarder;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -47,6 +58,8 @@ async fn main() -> anyhow::Result<()> {
         // source could be attached with
         // `Ros2Sensor::with_external_source(robodr_sensor_ros2::spawn_blocking_source(src, n)?)`.
         starter.add_module(Ros2Sensor::new())?;
+        // Pulsar threats -> robodr-agentd (host-side correlation signals).
+        starter.add_module(ThreatForwarder)?;
         Ok(())
     })
     .await

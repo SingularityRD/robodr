@@ -90,6 +90,10 @@
 //!   (not the black-box key, not HMAC, not inside the spool or black-box
 //!   directory; same file checks as the black-box key, see [`finding_key`]).
 //!   Every finding then carries the contract §2a `robodr-finding-sig` header.
+//! * `host_threats` (optional, [`crate::host::HostThreatsSection`]):
+//!   `{"socket_path": "/run/robodr-agentd/host-threats.sock"}`, the socket
+//!   the `robodr-threat-forward` Pulsar module writes Pulsar threats to (see
+//!   [`crate::host`]). Its path must differ from every other socket input.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -212,6 +216,10 @@ pub struct DaemonConfig {
     /// are emitted unsigned.
     #[serde(default)]
     pub finding_signing: Option<FindingSigningSection>,
+    /// Pulsar threats from `robodr-threat-forward` (see [`crate::host`]);
+    /// `None` = no host-side signals.
+    #[serde(default)]
+    pub host_threats: Option<crate::host::HostThreatsSection>,
 }
 
 /// `correlation`: the `robodr-correlate` engine over every finding the
@@ -510,6 +518,8 @@ pub struct Resolved {
     pub correlation: Option<robodr_correlate::RuleSet>,
     /// The dedicated finding-signing key: Ed25519 seed and key id.
     pub finding_key: Option<(KeyBytes, String)>,
+    /// The validated host-threat socket, if configured.
+    pub host_threats: Option<crate::host::HostThreatsSpec>,
     /// Non-fatal warnings to log at start.
     pub warnings: Vec<String>,
 }
@@ -942,6 +952,41 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         }),
     };
     let correlation = correlation_rules(&config.correlation, &mut warnings)?;
+    let host_threats = match &config.host_threats {
+        None => None,
+        Some(h) => {
+            let spec = h.resolve()?;
+            let clash = config.event_inputs.iter().any(
+                |i| matches!(i, EventInputConfig::UnixSocket { path, .. } if *path == spec.path),
+            ) || safety_feed
+                .as_ref()
+                .and_then(|f| f.socket.as_ref())
+                .is_some_and(|s| s.path == spec.path);
+            if clash {
+                return Err(
+                    "host_threats.socket_path is also an event_inputs or safety_feed socket path"
+                        .into(),
+                );
+            }
+            for (what, d) in [
+                ("spool.dir", &config.spool.dir),
+                ("blackbox.dir", &config.blackbox.dir),
+            ] {
+                if resolve_path(&spec.path).starts_with(resolve_path(d)) {
+                    return Err(format!(
+                        "host_threats.socket_path must not be inside {what}"
+                    ));
+                }
+            }
+            if correlation.is_none() {
+                warnings.push(
+                    "host_threats is configured but correlation is disabled: host threats are                      reported as findings only"
+                        .into(),
+                );
+            }
+            Some(spec)
+        }
+    };
     let finding_key = match &config.finding_signing {
         None => None,
         Some(fs) => {
@@ -1007,6 +1052,7 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         safety_feed,
         correlation,
         finding_key,
+        host_threats,
         warnings,
     })
 }

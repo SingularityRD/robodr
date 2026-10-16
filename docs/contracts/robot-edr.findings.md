@@ -387,7 +387,9 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
   `robodr` (rule not in the catalog), and since 1.3 `robodr_correlation`
   (`robot.correlate.*`), `robot_safety_state` (`robot.safety_state.*`) and
   `robodr_agent` (`robot.agent.*`, `robot.ros2.profile_state_tampered`,
-  `robot.ros2.profile_refused`). Since 1.3 every `robot.*` id an in-repo
+  `robot.ros2.profile_refused`) and `host_runtime`
+  (`robot.host.pulsar_threat`: a Pulsar host rule forwarded to agentd; the
+  Pulsar rule name is in the description, since it is not a rule id). Since 1.3 every `robot.*` id an in-repo
   detector emits has its own entry (sensor discovery, capture and source
   binding ids under `ros2_dds_discovery`; motion decode, motion monitor and
   firewall ids under `ros2_motion_commands`); `robodr` is left for ids a
@@ -664,10 +666,12 @@ Consumer acceptance checks for this contract:
   `robot.profile.invalid_envelope`), sensor pipeline (`robot.ros2.*`
   profile/binding ids, `robot.rtps.*`, `robot.capture.*`,
   `robot.sensor.findings_capped`, motion decode `robot.motion.*`), motion
-  monitor (`robot.motion.*`) and firewall (`robot.firewall.*`). No new data
-  source or technique beyond those listed here.
+  monitor (`robot.motion.*`) and firewall (`robot.firewall.*`). Also in the
+  same cycle `robot.host.pulsar_threat` (Pulsar threats forwarded to
+  robodr-agentd) with the data source `host_runtime`. No new data source or
+  technique beyond those listed here.
   New data sources `robodr_correlation`, `robot_safety_state`,
-  `robodr_agent`; new technique T0856 Spoof Reporting Message. Value format
+  `robodr_agent`, `host_runtime`; new technique T0856 Spoof Reporting Message. Value format
   otherwise unchanged; the validator checks catalog constants against the
   catalog of the message's own minor, so 1.2 messages stay valid. Schema
   `$id` → `/1.3.0`.

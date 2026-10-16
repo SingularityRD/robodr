@@ -214,7 +214,7 @@ fn queue_is_bounded_in_bytes() {
         .try_iter()
         .map(|m| match m.payload {
             Payload::Datagram(d) => d.payload.len(),
-            Payload::Event(_) | Payload::Safety(_) => 0,
+            Payload::Event(_) | Payload::Safety(_) | Payload::Host(_) => 0,
         })
         .sum();
     assert!(held <= d.queue_bytes, "held {held} bytes");

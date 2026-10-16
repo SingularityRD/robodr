@@ -35,6 +35,7 @@ first real build (§7) is what settles it.
 |---|---|---|
 | `robodr-sensor-ros2` | yes (`pulsar-core`, `tokio`) | no. The offline script drops it |
 | `robodr-pulsard` (new binary) | yes (`pulsar`, i.e. the whole daemon) | no. The offline script drops it |
+| `robodr-threat-forward` | yes (`pulsar-core`) | no. The offline script drops it (Pulsar-bound in `scripts/ci-pure-excludes.py`) |
 | `robodr-ros2-pipeline` (new) | no | yes, with its tests and the `robodr-ros2-watch` binary |
 | `robodr-events`, `robodr-rtps`, `robodr-capture`, ... | no | yes |
 
@@ -180,6 +181,57 @@ module-level `enabled`.
 
 `robodr-pulsard` needs no change to register the capture source. The sensor
 opens it from its own config section in `init_state`.
+
+### 3a. Threat forwarder (`robodr-threat-forward`)
+
+`robodr-pulsard` also registers `robodr_threat_forward::ThreatForwarder`
+(`starter.add_module(ThreatForwarder)`, `DEFAULT_ENABLED = false`). It hands
+every Pulsar threat to `robodr-agentd`'s `host_threats` socket, so agentd's
+host-dependent correlation rules can fire (`crates/robodr-correlate/README.md`,
+"Integration"). Built and unit-tested against the vendored `pulsar-core`
+(`cargo build -p robodr-pulsard`, `cargo test -p robodr-threat-forward`).
+
+- **Pulsar items used.** `SimplePulsarModule` with `on_event` overridden
+  (`pdk/module.rs`), so the module receives every bus event like Pulsar's
+  `threat-logger`; it keeps those with `event.header().threat`
+  (`event.rs`: `Header { image, pid, parent_pid, uid, gid, container,
+  threat, timestamp, .. }`, `Threat { source, description, extra }`). For
+  the rules-engine, `description` is the rule `name` and `extra` its
+  metadata (`category`, `severity`, ...; `rules-engine/src/engine.rs`
+  `send_threat_derived`), so `rule` on the wire is exactly the host rule id
+  of `rules/robodr/*.toml`.
+- **Own threats skipped.** Threats whose `source` is `robodr-sensor-ros2`
+  are counted (`skipped_own`) and not forwarded: agentd sees those findings
+  through its own capture, and forwarding them would count them twice.
+  agentd drops them as well if they arrive.
+- **Never stalls the bus.** `on_event` serialises the line and `try_send`s
+  it into a bounded std queue (`queue_capacity`, default 1024); full means
+  dropped and counted. An OS thread owns the `UnixStream` (write timeout
+  `write_timeout_ms`), reconnects with backoff (100 ms to 5 s) while agentd
+  is away (queued threats are delivered after the reconnect) and writes a
+  heartbeat (`{"kind":"heartbeat","v":1,"sent":..,"dropped":..,"skipped_own":..}`)
+  at connect and every `heartbeat_ms` (default 5 s) when idle. A failed
+  write drops that line (never retried: part of it may have arrived).
+- **Bounded strings.** `rule` and `image` at most 256 bytes, `source` and
+  `category` 64, control characters replaced by `?`; the longest possible
+  line stays under agentd's 4 KiB limit (unit test). A dev-dependency test
+  runs every line the forwarder writes through agentd's own parser.
+- **State lifecycle.** The writer thread stops when `State` drops (stop flag
+  plus a disconnected queue), also when Pulsar drops the state without
+  `graceful_stop` (§2a).
+
+```toml
+[module.robodr-threat-forward]
+enabled = true
+socket_path = "/run/robodr-agentd/host-threats.sock"
+# queue_capacity = 1024
+# heartbeat_ms = 5000       # well below agentd's daemon.silence_ms
+# write_timeout_ms = 1000
+```
+
+agentd's side (`"host_threats"`, peer-uid check, socket permissions) and
+the systemd drop-in that lets `robodr-pulsard` reach a `0660` socket are in
+`docs/OPERATIONS.md` 6.4.
 
 ## 4. Sensor behaviour that was changed or added
 
