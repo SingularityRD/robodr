@@ -236,6 +236,16 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Fixed
 
+- CI: first local run of every `ci.yml` job and of the `release.yml`
+  build/package steps (2026-10-17, Debian 13 / WSL2; record in
+  `docs/BUILD.md`, "Local CI verification"). Fixed what failed: shellcheck
+  findings in `packaging/install-bundle.sh` and `packaging/make-bundle.sh`;
+  `cargo deny` licenses (license clarifications for the remaining Pulsar
+  crates, a scoped CC0-1.0 exception for the compile-time-only
+  `tiny-keccak`), bans (every RoboDR crate is now `publish = false`; Pulsar's
+  path crates are skipped for the wildcard lint) and advisories
+  (RUSTSEC-2021-0139, unmaintained `ansi_term` via Pulsar, ignored with a
+  documented reason and review date). No source code or `Cargo.lock` change.
 - `robodr-agentd` e2e test `hostile_datagrams_and_event_lines_never_stop_the_daemon`
   could stop the daemon before housekeeping raised `robot.agent.input_malformed`;
   it now waits until both expected findings are in the spool.

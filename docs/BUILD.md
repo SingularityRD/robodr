@@ -10,6 +10,7 @@ Contents: [Toolchain](#toolchain) · [Developer build](#developer-build) ·
 [Cargo.lock policy](#cargolock-policy) · [Air-gapped builds](#air-gapped-builds) ·
 [SBOM](#sbom) · [Reproducible builds](#reproducible-builds) ·
 [Licensing](#licensing) · [CI jobs](#ci-jobs) ·
+[Local CI verification](#local-ci-verification) ·
 [Verification status](#verification-status)
 
 ---
@@ -300,6 +301,65 @@ All third-party actions are pinned by full commit SHA (resolved with
 `git ls-remote --tags` from the upstream repositories), with the tag in a
 comment. Workflow token permissions are `contents: read`.
 
+## Local CI verification
+
+GitHub Actions has not run for this repository yet (the organisation's
+Actions are blocked by billing). On **2026-10-17** every job of `ci.yml`, and
+the build/package part of `release.yml`, was run locally, step by step with
+the workflow's own commands and environment (`CARGO_INCREMENTAL=0`,
+`scripts/ci-setup.sh` exports applied as `$GITHUB_ENV` would), on the commit
+that introduced this section.
+
+Host: Debian 13.5 (trixie) under WSL2 (kernel 6.18.33.2-microsoft-standard-WSL2),
+x86_64, 8 vCPU, crates.io reachable (no mirror). Toolchains: Rust 1.98.1
+(`rust-toolchain.toml`), 1.87.0 (MSRV), `nightly-2026-09-01`
+(1.100.0-nightly 0dfb098f3). Tools: cargo-deny 0.20.2, cargo-cyclonedx 0.5.9,
+cargo-fuzz 0.13.1 (each `cargo install --locked --version` as in `ci.yml`),
+shellcheck 0.10.0, Python 3.13.5, clang/lld/llvm 19.1.7.
+
+| Job | Result | Notes |
+|---|---|---|
+| `lockfile` | pass | Cargo.lock committed; `ci-check-lockfile.py`: OK (363 packages) |
+| `scripts` | pass after fix | Self-tests 18 + 13 + 5 OK; `validate_rules.py --strict`: 62 rules, 429 fixtures, 0 errors/warnings; shellcheck failed on 4 info-level findings (SC2015 in `install-bundle.sh`, SC2094 in `make-bundle.sh`), fixed |
+| `pure` | pass | `fmt --check`, `clippy -D warnings`, `test` (1883 passed, 0 failed, 1 ignored); no tracked file modified |
+| `pulsar` | pass | `robodr-pulsard`, `robodr-sensor-ros2`: build, clippy `-D warnings`, test. Only a deprecation warning inside vendored `bpf-common` (tokio `AsyncFd::with_interest`), not a workspace lint |
+| `msrv` | pass | `cargo +1.87.0 check` of the pure crates is clean |
+| `deny` | pass after fix | Initially advisories, bans and licenses failed (see below); `Cargo.lock` unchanged |
+| `sbom` | pass | 18 cargo-cyclonedx SBOMs + the fallback `robodr.cdx.json` (304 components), all pass `--check` against Cargo.lock; Cargo.lock unchanged |
+| `fuzz` | pass | All 11 targets, 60 s each, no crash (0.3 M to 9.3 M executions per target) |
+| `reproducible` | pass | 9 pure `robodr-*` binaries bit-identical across the two paths |
+| release `build` (amd64, no upload) | pass | repro proof; release build; released pure binaries == reproduced hashes; Cargo.lock unchanged; SBOM; `.deb` with every `ROBODR_DEB_REQUIRE` binary; offline bundle (`install-bundle.sh verify` OK on the extracted bundle, rejects an unlisted file); SBOM tarball; `SHA256SUMS-amd64` |
+
+Fixes made by that run:
+
+- `packaging/install-bundle.sh`, `packaging/make-bundle.sh`: shellcheck
+  SC2015 (`A && B || die` rewritten as `if`) and SC2094 (SHA256SUMS is
+  now written outside the tree being hashed, then moved in).
+- `cargo deny`, licenses: the Pulsar crates of the daemon library
+  (`pulsar`, `engine-api`, `bpf-builder`, `bpf-filtering`, the three
+  monitors, `rules-engine`, `threat-logger`) were unlicensed (non-SPDX
+  string) and got the same `[[licenses.clarify]]` as the others;
+  `tiny-keccak` (CC0-1.0, compile-time only, via a proc-macro) got a
+  per-crate exception.
+- `cargo deny`, bans: `allow-wildcard-paths` only applies to
+  `publish = false` crates, so every RoboDR crate now declares
+  `publish = false`; Pulsar's path crates (not editable) are listed under
+  `[bans] skip` with the reason in `deny.toml`.
+- `cargo deny`, advisories: RUSTSEC-2021-0139 (`ansi_term` unmaintained, no
+  fix; only via Pulsar `bpf-common` -> `nut`) ignored with a reason and a
+  review date (2027-04-17) in `deny.toml`.
+
+Differences from the ubuntu-24.04 runner, not reflected in the workflow:
+
+- Debian 13 has no `clang-20`/`lld-20`/`llvm-20` in its default archive, so
+  the run used the workflow's fallback path (distribution clang/lld/llvm 19).
+  Whether the runner gets clang-20 from its apt sources is still unverified.
+- arm64 (`ubuntu-24.04-arm`) was not built. The `prepare` (tag/draft
+  release) and `publish` (minisign, upload) jobs need GitHub and secrets and
+  were not run; nor were the `upload-artifact` steps.
+- The fuzz job writes newly found inputs into the tracked `fuzz/corpus/`
+  directories; harmless on a runner, but clean them up after a local run.
+
 ## Verification status
 
 Be precise about what has and has not been exercised. Last updated with the CI
@@ -327,21 +387,18 @@ cargo-cyclonedx / cargo-deny / shellcheck installed):
 
 **Not verified** (needs network, the pinned toolchain or a kernel):
 
-- No CI run has happened yet. In particular unverified: that `clang-20` /
-  `llvm-20` install from the ubuntu-24.04 runner's apt sources (the job falls
-  back to the distribution clang with a warning), that the Pulsar-bound build
-  passes, cargo-cyclonedx 0.5.9 flags/output names, the cargo-deny 0.20.2
-  config keys (`[[licenses.clarify]]` with empty `license-files` for path
-  crates, `sparse+` entries in `allow-registry`), which licenses the full
-  dependency graph actually carries (the allow-list may need additions after
-  the first run), that the pinned nightly `nightly-2026-09-01` and
-  cargo-fuzz 0.13.1 work together, and that 1.87 really builds the pure crates.
-- `shellcheck` was not available in the sandbox; CI runs it.
-- No `Cargo.lock` is committed yet (none could be generated here without
-  crates.io), so CI fails by design until a maintainer commits the
-  bootstrap lock from the `lockfile` job (see [Cargo.lock
-  policy](#cargolock-policy)).
-- MSRV (2026-10-16): all crates now inherit `rust-version.workspace = true`.
+- No GitHub Actions run has happened yet. Since 2026-10-17 every job has
+  passed locally ([Local CI verification](#local-ci-verification)): the
+  Pulsar-bound build, cargo-cyclonedx 0.5.9, the cargo-deny 0.20.2 config,
+  the full graph's licenses, `nightly-2026-09-01` + cargo-fuzz 0.13.1,
+  shellcheck, and a real 1.87 build of the pure crates. Still unverified:
+  that `clang-20` / `llvm-20` install from the ubuntu-24.04 runner's apt
+  sources (the local run used the fallback, clang 19), and the arm64 runner.
+- `Cargo.lock` is committed (2026-10-17); the bootstrap path of the
+  `lockfile` job is therefore no longer exercised.
+- MSRV: passed `cargo +1.87.0 check` locally on 2026-10-17; the job is still
+  `continue-on-error` until it has passed on the runners. Earlier note
+  (2026-10-16): all crates now inherit `rust-version.workspace = true`.
   In the sandbox (Rust 1.97 only) `clippy -D warnings` of the pure crates is
   clean at `rust-version = "1.87"`, and fails at `"1.86"` on
   `is_multiple_of` (first hit `robodr-capture/src/ports.rs`) — so 1.87 is the
