@@ -909,7 +909,7 @@
      }
     },
     {
-     "note": "CMake FindPython probe",
+     "note": "CMake FindPython probe (excluded: exact argv)",
      "type": "Exec",
      "header": {
       "image": "/usr/bin/python3.10",
@@ -924,11 +924,7 @@
        "-c",
        "import sys; sys.stdout.write(sys.abiflags)"
       ]
-     },
-     "allow": [
-      "RoboDR: Interpreter one-liner executed"
-     ],
-     "reason": "Known, documented FP (rules/README.md): CMake 3.x FindPython runs ~17 version-specific 'python -c' probes per configure; they are not expressible as a safe exclusion and building on a fielded unit is out of policy."
+     }
     },
     {
      "note": "ament_cmake package.xml parser",
@@ -2000,6 +1996,398 @@
        "--user",
        "restart",
        "robot-bringup.service"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "scenario": "CMake 3.28 FindPython configure (every probe text, argv traced with strace on CMake 3.28.3)",
+   "events": [
+    {
+     "note": "cmake configure",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/cmake",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/cmake",
+      "argc": 5,
+      "argv": [
+       "/usr/bin/cmake",
+       "-S",
+       ".",
+       "-B",
+       "build"
+      ]
+     }
+    },
+    {
+     "note": "FindPython version check",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/python3",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/python3",
+      "argc": 2,
+      "argv": [
+       "/usr/bin/python3",
+       "-V"
+      ]
+     }
+    },
+    {
+     "note": "FindPython probe 1/19 (excluded)",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/python3",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/python3",
+      "argc": 3,
+      "argv": [
+       "/usr/bin/python3",
+       "-c",
+       "import sys\ntry:\n   import sysconfig\n   sys.stdout.write(';'.join([sysconfig.get_config_var('base') or '', sysconfig.get_config_var('installed_base') or '']))\nexcept Exception:\n   from distutils import sysconfig\n   sys.stdout.write(';'.join([sysconfig.PREFIX,sysconfig.EXEC_PREFIX,sysconfig.BASE_EXEC_PREFIX]))"
+      ]
+     }
+    },
+    {
+     "note": "FindPython probe 2/19 (excluded)",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/python3.12",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/python3.12",
+      "argc": 3,
+      "argv": [
+       "/usr/bin/python3.12",
+       "-c",
+       "import sys\ntry:\n   import sysconfig\n   sys.stdout.write(';'.join([sysconfig.get_path('platinclude'),sysconfig.get_path('platinclude','posix_prefix'),sysconfig.get_path('include'),sysconfig.get_path('include','posix_prefix')]))\nexcept Exception:\n   from distutils import sysconfig\n   sys.stdout.write(';'.join([sysconfig.get_python_inc(plat_specific=True),sysconfig.get_python_inc(plat_specific=False)]))"
+      ]
+     }
+    },
+    {
+     "note": "FindPython probe 3/19 (excluded)",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/python3.10",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/python3.10",
+      "argc": 3,
+      "argv": [
+       "/usr/bin/python3.10",
+       "-c",
+       "import sys\ntry:\n   import sysconfig\n   sys.stdout.write(sysconfig.get_config_var('EXT_SUFFIX') or '')\nexcept Exception:\n   from distutils import sysconfig;sys.stdout.write(sysconfig.get_config_var('EXT_SUFFIX') or '')"
+      ]
+     }
+    },
+    {
+     "note": "FindPython probe 4/19 (excluded)",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/python3",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/python3",
+      "argc": 3,
+      "argv": [
+       "/usr/bin/python3",
+       "-c",
+       "import sys\ntry:\n   import sysconfig\n   sys.stdout.write(';'.join([sysconfig.get_config_var('SOABI') or '',sysconfig.get_config_var('SO') or '']))\nexcept Exception:\n   from distutils import sysconfig;sys.stdout.write(';'.join([sysconfig.get_config_var('SOABI') or '',sysconfig.get_config_var('SO') or '']))"
+      ]
+     }
+    },
+    {
+     "note": "FindPython probe 5/19 (not excludable)",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/python3.12",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/python3.12",
+      "argc": 3,
+      "argv": [
+       "/usr/bin/python3.12",
+       "-c",
+       "import sys\nimport re\nimport importlib.machinery\nsys.stdout.write(next(filter(lambda x: re.search('^\\.abi', x), importlib.machinery.EXTENSION_SUFFIXES)))"
+      ]
+     },
+     "allow": [
+      "RoboDR: Interpreter one-liner executed"
+     ],
+     "reason": "Documented residual (runtime_hooking.toml, rules/README.md): this CMake 3.28 FindPython probe contains a backslash (validator --strict rejects backslashes in literals), so it cannot be an exact-argv exclusion. Building on a fielded unit is out of policy."
+    },
+    {
+     "note": "FindPython probe 6/19 (excluded)",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/python3.10",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/python3.10",
+      "argc": 3,
+      "argv": [
+       "/usr/bin/python3.10",
+       "-c",
+       "import sys\ntry:\n   import sysconfig\n   sys.stdout.write(sysconfig.get_config_var('ABIFLAGS'))\nexcept Exception:\n   from distutils import sysconfig\n   sys.stdout.write(sysconfig.get_config_var('ABIFLAGS'))"
+      ]
+     }
+    },
+    {
+     "note": "FindPython probe 7/19 (excluded)",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/python3",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/python3",
+      "argc": 3,
+      "argv": [
+       "/usr/bin/python3",
+       "-c",
+       "import sys\ntry:\n   import sysconfig\n   sys.stdout.write(sysconfig.get_config_var('LIBPL'))\nexcept Exception:\n   from distutils import sysconfig\n   sys.stdout.write(sysconfig.get_config_var('LIBPL'))"
+      ]
+     }
+    },
+    {
+     "note": "FindPython probe 8/19 (excluded)",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/python3.12",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/python3.12",
+      "argc": 3,
+      "argv": [
+       "/usr/bin/python3.12",
+       "-c",
+       "import sys\ntry:\n   import sysconfig\n   sys.stdout.write(sysconfig.get_config_var('LIBS'))\nexcept Exception:\n   from distutils import sysconfig\n   sys.stdout.write(sysconfig.get_config_var('LIBS'))"
+      ]
+     }
+    },
+    {
+     "note": "FindPython probe 9/19 (excluded)",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/python3.10",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/python3.10",
+      "argc": 3,
+      "argv": [
+       "/usr/bin/python3.10",
+       "-c",
+       "import sys; sys.stdout.write(sys.abiflags)"
+      ]
+     }
+    },
+    {
+     "note": "FindPython probe 10/19 (excluded)",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/python3",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/python3",
+      "argc": 3,
+      "argv": [
+       "/usr/bin/python3",
+       "-c",
+       "import sys; sys.stdout.write('.'.join([str(x) for x in sys.version_info[:3]]))"
+      ]
+     }
+    },
+    {
+     "note": "FindPython probe 11/19 (excluded)",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/python3.12",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/python3.12",
+      "argc": 3,
+      "argv": [
+       "/usr/bin/python3.12",
+       "-c",
+       "import sys; sys.stdout.write(str(sys.version_info[0]))"
+      ]
+     }
+    },
+    {
+     "note": "FindPython probe 12/19 (not excludable)",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/python3.10",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/python3.10",
+      "argc": 3,
+      "argv": [
+       "/usr/bin/python3.10",
+       "-c",
+       "import sys, struct; sys.stdout.write(str(struct.calcsize(\"P\")))"
+      ]
+     },
+     "allow": [
+      "RoboDR: Interpreter one-liner executed"
+     ],
+     "reason": "Documented residual (runtime_hooking.toml, rules/README.md): this CMake 3.28 FindPython probe contains a double quote, so it cannot be an exact-argv exclusion. Building on a fielded unit is out of policy."
+    },
+    {
+     "note": "FindPython probe 13/19 (excluded)",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/python3",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/python3",
+      "argc": 3,
+      "argv": [
+       "/usr/bin/python3",
+       "-c",
+       "import sys, sysconfig; sys.stdout.write(sysconfig.get_platform())"
+      ]
+     }
+    },
+    {
+     "note": "FindPython probe 14/19 (excluded)",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/python3.12",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/python3.12",
+      "argc": 3,
+      "argv": [
+       "/usr/bin/python3.12",
+       "-c",
+       "import sys; sys.stdout.write(str(sys.maxsize > 2**32))"
+      ]
+     }
+    },
+    {
+     "note": "FindPython probe 15/19 (excluded)",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/python3.10",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/python3.10",
+      "argc": 3,
+      "argv": [
+       "/usr/bin/python3.10",
+       "-c",
+       "import sys; import sysconfig; sys.stdout.write(sysconfig.get_platform())"
+      ]
+     }
+    },
+    {
+     "note": "FindPython probe 16/19 (excluded)",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/python3",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/python3",
+      "argc": 3,
+      "argv": [
+       "/usr/bin/python3",
+       "-c",
+       "import sys; sys.stdout.write(sys.copyright)"
+      ]
+     }
+    },
+    {
+     "note": "FindPython probe 17/19 (excluded)",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/python3.12",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/python3.12",
+      "argc": 3,
+      "argv": [
+       "/usr/bin/python3.12",
+       "-c",
+       "import sys\nif sys.version_info >= (3,10):\n   import sysconfig\n   sys.stdout.write(';'.join([sysconfig.get_path('stdlib'),sysconfig.get_path('platstdlib'),sysconfig.get_path('purelib'),sysconfig.get_path('platlib')]))\nelse:\n   from distutils import sysconfig\n   sys.stdout.write(';'.join([sysconfig.get_python_lib(plat_specific=False,standard_lib=True),sysconfig.get_python_lib(plat_specific=True,standard_lib=True),sysconfig.get_python_lib(plat_specific=False,standard_lib=False),sysconfig.get_python_lib(plat_specific=True,standard_lib=False)]))"
+      ]
+     }
+    },
+    {
+     "note": "FindPython probe 18/19 (excluded)",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/python3.10",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/python3.10",
+      "argc": 3,
+      "argv": [
+       "/usr/bin/python3.10",
+       "-c",
+       "import sys\ntry: import numpy; sys.stdout.write(numpy.get_include())\nexcept:pass\n"
+      ]
+     }
+    },
+    {
+     "note": "FindPython probe 19/19 (excluded)",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/python3",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/python3",
+      "argc": 3,
+      "argv": [
+       "/usr/bin/python3",
+       "-c",
+       "import sys\ntry: import numpy; sys.stdout.write(numpy.__version__)\nexcept:pass\n"
       ]
      }
     }

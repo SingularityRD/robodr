@@ -4331,8 +4331,8 @@
  },
  {
   "rule": "RoboDR: Interpreter one-liner executed",
-  "note": "KNOWN FP: CMake FindPython probe during colcon build",
-  "expect": true,
+  "note": "CMake FindPython probe during colcon build (excluded: exact argv, argc 3)",
+  "expect": false,
   "event": {
    "header": {},
    "payload": {
@@ -5447,6 +5447,194 @@
      "systemctl",
      "stop",
      "robodr-*"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interpreter one-liner executed",
+  "note": "FindPython probe (version) on /usr/bin/python3: excluded",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3",
+    "argc": 3,
+    "argv": [
+     "/usr/bin/python3",
+     "-c",
+     "import sys; sys.stdout.write(str(sys.version_info[0]))"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interpreter one-liner executed",
+  "note": "FindPython multi-line probe (PREFIX) on python3.12: excluded",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3.12",
+    "argc": 3,
+    "argv": [
+     "/usr/bin/python3.12",
+     "-c",
+     "import sys\ntry:\n   import sysconfig\n   sys.stdout.write(';'.join([sysconfig.get_config_var('base') or '', sysconfig.get_config_var('installed_base') or '']))\nexcept Exception:\n   from distutils import sysconfig\n   sys.stdout.write(';'.join([sysconfig.PREFIX,sysconfig.EXEC_PREFIX,sysconfig.BASE_EXEC_PREFIX]))"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interpreter one-liner executed",
+  "note": "FindPython numpy probe on python3.10: excluded",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3.10",
+    "argc": 3,
+    "argv": [
+     "/usr/bin/python3.10",
+     "-c",
+     "import sys\ntry: import numpy; sys.stdout.write(numpy.__version__)\nexcept:pass\n"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interpreter one-liner executed",
+  "note": "probe text plus an extra argv element (argc 4)",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3",
+    "argc": 4,
+    "argv": [
+     "/usr/bin/python3",
+     "-c",
+     "import sys; sys.stdout.write(sys.abiflags)",
+     "import os"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interpreter one-liner executed",
+  "note": "probe text with code appended in the same element",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3",
+    "argc": 3,
+    "argv": [
+     "/usr/bin/python3",
+     "-c",
+     "import sys; sys.stdout.write(sys.abiflags); import os"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interpreter one-liner executed",
+  "note": "probe text from a non-system interpreter path",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/tmp/x/python3",
+    "argc": 3,
+    "argv": [
+     "/tmp/x/python3",
+     "-c",
+     "import sys; sys.stdout.write(sys.abiflags)"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interpreter one-liner executed",
+  "note": "probe text with a different argv[0] (sys.prefix from argv[0])",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3",
+    "argc": 3,
+    "argv": [
+     "/home/robot/venv/bin/python3",
+     "-c",
+     "import sys; sys.stdout.write(sys.abiflags)"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interpreter one-liner executed",
+  "note": "probe text on an unlisted interpreter version",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3.11",
+    "argc": 3,
+    "argv": [
+     "/usr/bin/python3.11",
+     "-c",
+     "import sys; sys.stdout.write(sys.abiflags)"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interpreter one-liner executed",
+  "note": "probe text with -Ic instead of -c",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3",
+    "argc": 3,
+    "argv": [
+     "/usr/bin/python3",
+     "-Ic",
+     "import sys; sys.stdout.write(sys.abiflags)"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interpreter one-liner executed",
+  "note": "KNOWN FP: FindPython probe not expressible as exclusion (backslash)",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3",
+    "argc": 3,
+    "argv": [
+     "/usr/bin/python3",
+     "-c",
+     "import sys\nimport re\nimport importlib.machinery\nsys.stdout.write(next(filter(lambda x: re.search('^\\.abi', x), importlib.machinery.EXTENSION_SUFFIXES)))"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interpreter one-liner executed",
+  "note": "KNOWN FP: FindPython probe not expressible as exclusion (double quote)",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3",
+    "argc": 3,
+    "argv": [
+     "/usr/bin/python3",
+     "-c",
+     "import sys, struct; sys.stdout.write(str(struct.calcsize(\"P\")))"
     ]
    }
   }

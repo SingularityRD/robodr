@@ -365,15 +365,39 @@ name = "RoboDR: Interpreter one-liner executed"
 type = "Exec"
 category = "execution"
 severity = "medium"
-description = "python, perl, ruby, node or php was run with inline code (-c, -e, -E, --eval, -r and common bundles such as -Ic, -we, -wle). Reverse shells and pty upgrades (python3 -c 'import pty; pty.spawn(...)', perl -e ...) take this form, and the shell they spawn usually has no -i, so the interactive-shell rule does not see it. Fielded robot software runs scripts from files. Known false positives: CMake's FindPython probes ('python3 -c \"import sys; ...\"', dozens per configure) during colcon build on the unit, python3 -E (ignore environment) and node -r (preload) running a script file. Known misses: code glued to the option ('-cimport os', '-e'print'') and bundles not listed, because argv CONTAINS can only compare whole elements."
+description = "python, perl, ruby, node or php was run with inline code (-c, -e, -E, --eval, -r and common bundles such as -Ic, -we, -wle). Reverse shells and pty upgrades (python3 -c 'import pty; pty.spawn(...)', perl -e ...) take this form, and the shell they spawn usually has no -i, so the interactive-shell rule does not see it. Fielded robot software runs scripts from files. CMake 3.28's FindPython probes (/usr/bin/python3, python3.10 or python3.12 with exactly '-c' and one of 17 known probe texts, argc 3) are excluded; two more probe texts cannot be (one contains a double quote, one a backslash; rules/README.md) and still fire during a colcon build on the unit. Known false positives: those two probes, other CMake versions' probes, python3 -E (ignore environment) and node -r (preload) running a script file. Known misses: code glued to the option ('-cimport os', '-e'print'') and bundles not listed, because argv CONTAINS can only compare whole elements."
 # Shells with -c are deliberately not covered: system()/popen() run 'sh -c'
-# constantly. The CMake FindPython probes are NOT excluded: their text differs
-# per CMake version (17 distinct strings in 3.28, some interpolated, one with
-# a double quote the DSL cannot express), and building on a fielded unit is
-# out of policy anyway (rules/README.md). TUNE: exclude exact helper
-# invocations found during commissioning, and only with argc pinned and every
-# argv element named (an extra element can carry the real code).
-condition = '''
+# constantly.
+#
+# CMake FindPython exclusion (CMake 3.28.3, Modules/FindPython/Support.cmake;
+# verified by tracing a real configure with strace). Every probe is
+#   execve("<interpreter>", ["<interpreter>", "-c", "<probe text>"])
+# so the exclusion pins ALL of it: argc == 3, the exec path AND argv[0] equal
+# to one of the exact system interpreters, the element "-c", and the probe
+# text as one whole argv element (Argv CONTAINS is exact-element equality, so
+# appending code to a probe text breaks the match). With argc pinned, the
+# three named elements are the whole argv: there is no slot left for code.
+# argv[0] is pinned too because CPython derives sys.prefix (and so the
+# site-packages it imports from, and any pyvenv.cfg it honours) from it.
+# 19 distinct probe texts exist in 3.28 (${_scheme} is always 'posix_prefix'
+# on Linux; ${config_flag} takes ABIFLAGS, LIBPL and LIBS). 17 are excluded
+# below. Not expressible / not excluded:
+#   * 'import sys, struct; sys.stdout.write(str(struct.calcsize("P")))'
+#     contains a double quote; the DSL literal regex has no way to put one
+#     in a value (escapes are kept verbatim, never unescaped).
+#   * the SOSABI probe ("...re.search('^\.abi', x)...") contains a backslash.
+#     The engine would keep it verbatim (which is what argv holds), but
+#     scripts/validate_rules.py --strict rejects every backslash in a literal
+#     as a probable mistaken escape, so it is left out rather than weakening
+#     the validator.
+# Both still fire during a configure (benign corpus allow-lists them).
+# Not covered: other CMake versions (texts change between releases), a
+# CMAKE_CROSSCOMPILING_EMULATOR / interpreter launcher (argv[0] becomes the
+# launcher), venv or /usr/local interpreters, and interpreter-affecting
+# environment variables, which Pulsar does not capture (rules/README.md,
+# residual gaps). TUNE: exclude other exact helper invocations found during
+# commissioning the same way: argc pinned and every argv element named.
+condition = """
 (payload.filename ENDS_WITH "/python" OR payload.filename ENDS_WITH "/python3" OR payload.filename CONTAINS "/python3."
  OR payload.filename ENDS_WITH "/python2" OR payload.filename CONTAINS "/python2."
  OR payload.filename ENDS_WITH "/perl" OR payload.filename CONTAINS "/perl5" OR payload.filename ENDS_WITH "/ruby"
@@ -390,7 +414,34 @@ AND (
   OR payload.argv CONTAINS "-lane" OR payload.argv CONTAINS "-wE" OR payload.argv CONTAINS "-wlE" OR payload.argv CONTAINS "-nE"
   OR payload.argv CONTAINS "-lE" OR payload.argv CONTAINS "-Te" OR payload.argv CONTAINS "-tE"
 )
-'''
+AND NOT (
+  payload.argc == 3 AND payload.argv CONTAINS "-c"
+  AND (
+    (payload.filename == "/usr/bin/python3" AND payload.argv CONTAINS "/usr/bin/python3")
+    OR (payload.filename == "/usr/bin/python3.10" AND payload.argv CONTAINS "/usr/bin/python3.10")
+    OR (payload.filename == "/usr/bin/python3.12" AND payload.argv CONTAINS "/usr/bin/python3.12")
+  )
+  AND (
+    payload.argv CONTAINS "import sys\ntry:\n   import sysconfig\n   sys.stdout.write(';'.join([sysconfig.get_config_var('base') or '', sysconfig.get_config_var('installed_base') or '']))\nexcept Exception:\n   from distutils import sysconfig\n   sys.stdout.write(';'.join([sysconfig.PREFIX,sysconfig.EXEC_PREFIX,sysconfig.BASE_EXEC_PREFIX]))"
+    OR payload.argv CONTAINS "import sys\ntry:\n   import sysconfig\n   sys.stdout.write(';'.join([sysconfig.get_path('platinclude'),sysconfig.get_path('platinclude','posix_prefix'),sysconfig.get_path('include'),sysconfig.get_path('include','posix_prefix')]))\nexcept Exception:\n   from distutils import sysconfig\n   sys.stdout.write(';'.join([sysconfig.get_python_inc(plat_specific=True),sysconfig.get_python_inc(plat_specific=False)]))"
+    OR payload.argv CONTAINS "import sys\ntry:\n   import sysconfig\n   sys.stdout.write(sysconfig.get_config_var('EXT_SUFFIX') or '')\nexcept Exception:\n   from distutils import sysconfig;sys.stdout.write(sysconfig.get_config_var('EXT_SUFFIX') or '')"
+    OR payload.argv CONTAINS "import sys\ntry:\n   import sysconfig\n   sys.stdout.write(';'.join([sysconfig.get_config_var('SOABI') or '',sysconfig.get_config_var('SO') or '']))\nexcept Exception:\n   from distutils import sysconfig;sys.stdout.write(';'.join([sysconfig.get_config_var('SOABI') or '',sysconfig.get_config_var('SO') or '']))"
+    OR payload.argv CONTAINS "import sys\ntry:\n   import sysconfig\n   sys.stdout.write(sysconfig.get_config_var('ABIFLAGS'))\nexcept Exception:\n   from distutils import sysconfig\n   sys.stdout.write(sysconfig.get_config_var('ABIFLAGS'))"
+    OR payload.argv CONTAINS "import sys\ntry:\n   import sysconfig\n   sys.stdout.write(sysconfig.get_config_var('LIBPL'))\nexcept Exception:\n   from distutils import sysconfig\n   sys.stdout.write(sysconfig.get_config_var('LIBPL'))"
+    OR payload.argv CONTAINS "import sys\ntry:\n   import sysconfig\n   sys.stdout.write(sysconfig.get_config_var('LIBS'))\nexcept Exception:\n   from distutils import sysconfig\n   sys.stdout.write(sysconfig.get_config_var('LIBS'))"
+    OR payload.argv CONTAINS "import sys; sys.stdout.write(sys.abiflags)"
+    OR payload.argv CONTAINS "import sys; sys.stdout.write('.'.join([str(x) for x in sys.version_info[:3]]))"
+    OR payload.argv CONTAINS "import sys; sys.stdout.write(str(sys.version_info[0]))"
+    OR payload.argv CONTAINS "import sys, sysconfig; sys.stdout.write(sysconfig.get_platform())"
+    OR payload.argv CONTAINS "import sys; sys.stdout.write(str(sys.maxsize > 2**32))"
+    OR payload.argv CONTAINS "import sys; import sysconfig; sys.stdout.write(sysconfig.get_platform())"
+    OR payload.argv CONTAINS "import sys; sys.stdout.write(sys.copyright)"
+    OR payload.argv CONTAINS "import sys\nif sys.version_info >= (3,10):\n   import sysconfig\n   sys.stdout.write(';'.join([sysconfig.get_path('stdlib'),sysconfig.get_path('platstdlib'),sysconfig.get_path('purelib'),sysconfig.get_path('platlib')]))\nelse:\n   from distutils import sysconfig\n   sys.stdout.write(';'.join([sysconfig.get_python_lib(plat_specific=False,standard_lib=True),sysconfig.get_python_lib(plat_specific=True,standard_lib=True),sysconfig.get_python_lib(plat_specific=False,standard_lib=False),sysconfig.get_python_lib(plat_specific=True,standard_lib=False)]))"
+    OR payload.argv CONTAINS "import sys\ntry: import numpy; sys.stdout.write(numpy.get_include())\nexcept:pass\n"
+    OR payload.argv CONTAINS "import sys\ntry: import numpy; sys.stdout.write(numpy.__version__)\nexcept:pass\n"
+  )
+)
+"""
 
 [[rules]]
 name = "RoboDR: Interactive or stdin-fed Python interpreter started"

@@ -80,7 +80,7 @@ The harness uses only the Python standard library (3.11+ for `tomllib`). It:
 3. Type-checks every `header.*` / `payload.*` path, operator and literal
    against a schema embedded in the script. Each entry carries a comment with
    the Pulsar source file and line it came from.
-4. Runs `scripts/rules_fixtures.json`: 418 sample events, with at least one
+4. Runs `scripts/rules_fixtures.json`: 429 sample events, with at least one
    positive and one negative per rule. They are evaluated with the engine's
    matching semantics. Fixtures marked `KNOWN GAP` document misses on purpose,
    `KNOWN FP` / `KNOWN NOISE` document accepted hits.
@@ -103,7 +103,7 @@ The harness uses only the Python standard library (3.11+ for `tomllib`). It:
    and a check that the benign-corpus runner reports a false positive, a
    stale allowance and an incomplete event.
 7. Runs the **benign corpus** `scripts/rules_benign_corpus.json` (mandatory;
-   a missing file is an error): 180 events in seven scenarios (`ros2 launch`
+   a missing file is an error): 201 events in eight scenarios (`ros2 launch`
    with dict parameters and SROS 2, `ros2 bag` record/play from `/tmp`, an
    rclpy node loading torch weights, `colcon build` in a dev workspace,
    `apt-get upgrade` with a kernel (dpkg, depmod, update-initramfs, ldconfig
@@ -111,23 +111,25 @@ The harness uses only the Python standard library (3.11+ for `tomllib`). It:
    signed-bundle upgrade: `dpkg -i`, `.dpkg-new` + rename of both daemons,
    the units, a rule file and the `pulsar.toml` conffile, postinst
    `try-restart`, PID 1 starting the units (credentials, invocation link,
-   propagate dir) and both daemons reading their config and rules). **Every**
+   propagate dir) and both daemons reading their config and rules, and a
+   CMake 3.28 FindPython configure with every probe text). **Every**
    rule of the event's type is evaluated against every event, not just the
    rule a fixture names. Any hit fails, unless the event lists that rule in
    `allow` with a `reason`; an `allow` entry that no longer fires also fails,
-   so allowances cannot pile up. The 13 allowed hits are the apt and
+   so allowances cannot pile up. The 14 allowed hits are the apt and
    RoboDR-bundle audit trail (package install, maintainer script, package
    database: 7), py3compile's `.pyc` writes in `/usr/lib/python3` (4: the
    library rules and the Python-environment rules, deliberate, see below),
-   one CMake FindPython probe and one `python3 setup.py` from the dev source
-   tree.
+   the two CMake FindPython probes that cannot be excluded, and one
+   `python3 setup.py` from the dev source tree.
    The events are modelled on the named tools' behaviour (sources and
    local traces listed in the file header), **not** captured from pulsard.
 
 The last run gave: self-test 88/88; drift mutation test 12/12; 89/89
 upstream rules accepted; no schema or grammar drift; 62 RoboDR rules in 7
-files; 418/418 fixtures pass; benign corpus 180 events, 0 false positives,
-13 allow-listed hits; 0 errors and 0 warnings (`--strict`). Mutation checks showed the harness catches problems: flipping every
+files; 429/429 fixtures pass; benign corpus 201 events, 0 false positives,
+14 allow-listed hits; 0 errors and 17 warnings (all "argv literal contains
+a space" on the FindPython exclusion, see the CMake note below). Mutation checks showed the harness catches problems: flipping every
 negative fixture gave 44 errors, and changing `argv: Argv` in a copy of
 `event.rs` was reported as drift.
 
@@ -312,11 +314,14 @@ needs prevention (hardening) or a probe change.
   exact interpreter path and `argv[0]`, `-c`, the whole probe text); one
   contains a `"` (no DSL literal can hold one) and one a backslash (the
   engine keeps it verbatim, but `validate_rules.py --strict` rejects every
-  backslash in a literal). The 17-probe exclusion is prepared on branch
-  `w6-rules-findpython` but **not** merged here: every probe text contains
-  spaces, and the validator warns on every `argv CONTAINS` literal with a
-  space, so `--strict` fails until the validator accepts deliberate
-  exact-element literals (e.g. when `argc` is pinned in the same rule).
+  backslash in a literal). The 17 are excluded in the one-liner rule
+  (fixtures show that an extra element, appended code, another interpreter
+  path or `argv[0]`, or `-Ic` still fire); the other two still fire and are
+  allow-listed in the benign corpus. **Validator note:** every probe text
+  contains spaces and `validate_rules.py` warns on every `argv CONTAINS`
+  literal with a space, so this branch gives 17 warnings and `--strict`
+  fails until the validator accepts deliberate exact-element literals (for
+  example when `argc` is pinned in the same rule).
 * **No environment, no parent image.** Pulsar's `Exec` event has neither.
   `ROS_SECURITY_ENABLE=false` / `ROS_SECURITY_STRATEGY=Permissive` (security
   switched off) leave **no** file trace at all: nothing is opened. Inline DDS
@@ -434,7 +439,7 @@ effect: the loader opening the library.
 | Program executed from a file descriptor or /proc path | memfd / `fexecve` fileless payloads, `/proc/self/exe` re-exec that escapes path scopes | systemd >= 255 unit starts from PID 1 and from the user managers of the TUNE uid list (excluded; spoofable, see table above), root's own user manager, runc. |
 | Program executed through a non-canonical path | `//opt/ros/...`, `/usr/../tmp/x`: respelt exec paths that dodge scopes and prefixes | Shell scripts that exec `$(dirname "$0")/../bin/x`. |
 | ROS 2 process imported Python code from outside allowlisted paths | `PYTHONPATH` / `sitecustomize` / `.pth` / user site-packages hook inside an rclpy node or the `ros2` CLI | Python run on scripts outside the allowlisted trees; robot Python packages outside them (TUNE). |
-| Interpreter one-liner executed | `python3 -c` pty upgrade, `perl -e` reverse shell | Helper scripts using `python3 -c` (maintainer scripts using `perl -e` during apt), CMake FindPython probes during `colcon build`; rare `python3 -E` / `node -r`. Unverified: whether the `ros2` CLI spawns its daemon with `python3 -c` on the robot's distro (check during commissioning). |
+| Interpreter one-liner executed | `python3 -c` pty upgrade, `perl -e` reverse shell | Helper scripts using `python3 -c` (maintainer scripts using `perl -e` during apt), 2 of 19 CMake 3.28 FindPython probes during `colcon build` (17 excluded by exact argv), other CMake versions' probes; rare `python3 -E` / `node -r`. Unverified: whether the `ros2` CLI spawns its daemon with `python3 -c` on the robot's distro (check during commissioning). |
 | Interactive or stdin-fed Python interpreter started | REPL / stdin code inside an interpreter (pty upgrade, `PYTHONINSPECT`-style prompt) | Interactive debugging on the unit. py3compile's `-m py_compile -` worker excluded. |
 | Pseudo-terminal wrapper executed | `script -qc` / `expect` / `unbuffer` giving a pty to a trusted interpreter (`PYTHONINSPECT`), pty upgrades | Terminal multiplexers used by operators (should not exist on a fielded unit). |
 | Package manager loaded a library / mapped an ELF from outside the system paths (2 rules) | `LD_PRELOAD` into the real dpkg to borrow the image every write rule trusts | `dpkg --verify` of packages that ship ELF/.so outside the system and `/opt/ros` trees. |
@@ -518,6 +523,7 @@ record the concrete cases.
 | Installer launched under another name or through its interpreter with an unlisted form | Exec rules match tool names and whole argv elements | The site-packages file rules (by effect) |
 | Packages installed into environments outside the watched trees (venv, conda prefix, user site) | Not the system/ROS environment | Python-import rule fires when a ROS process imports from there |
 | Env-var influence on an excluded or allow-listed command (interpreter variables, installer config) | Pulsar does not capture the environment | Env-capture follow-up (below) |
+| FindPython-excluded commands run with interpreter environment variables set | Exact argv says nothing about the environment | Pty-wrapper / login-shell / Python-import rules; env-capture follow-up |
 | Pre-existing dpkg trust | dpkg (exact image) is excluded everywhere | Supply-chain rules record every install; `LD_PRELOAD`-into-dpkg rules |
 
 ## Commissioning: tuning per robot
