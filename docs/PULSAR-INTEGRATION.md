@@ -7,23 +7,23 @@ exactly what was checked against which Pulsar source file.
 - Pulsar reference: `vendor/pulsar` at commit **4796504**
   (`4796504895ce42f95ffc1e414be19a5d7f40fc0a`, `chore(github): Update PR
   template`), Pulsar version `0.11.0-alpha.1`, toolchain pin 1.98.1.
-- None of the Pulsar-dependent code has been through a real `cargo build`
-  yet. This environment has no crates.io access, so tokio and Pulsar's
-  dependency tree cannot be fetched. Everything below marked **verified by
-  reading** was checked line by line against the Pulsar source, not by a
-  compiler run against real Pulsar.
+- **2026-10-17: first real build and run.** Both Pulsar-bound crates were
+  built against the real Pulsar, tokio and clap (crates.io, committed
+  `Cargo.lock`), linted, and `robodr-pulsard` was run as root with its eBPF
+  probes loaded. The outcome of every §7a step is in §7b. Sections 2-6 below
+  describe the earlier review by reading; keep them as the rationale.
 
 ## 0. Verification status (read this first)
 
-**Verified against Pulsar commit 4796504 by reading its source and by a
-stub type-check. Not yet compiled against the real Pulsar, tokio or clap.**
+**Verified against Pulsar commit 4796504 by reading its source, by a stub
+type-check, and (2026-10-17) by a real build and a root smoke test (§7b).**
 
 | What | How | Result |
 |---|---|---|
 | Every Pulsar item used by `robodr-sensor-ros2` and `robodr-pulsard` | read in `vendor/pulsar` (files listed in §2 and §3) | signatures match; 2 lifecycle mismatches found and fixed (§2a) |
 | Both crates' Rust code | `cargo check` + `cargo clippy --all-targets -D warnings` + `cargo doc -D warnings` against hand-written stubs (§6) | clean |
 | Cargo manifests (dependency names, Pulsar feature names, versions) | read against `vendor/pulsar/Cargo.toml`. The stub `pulsar` crate declares the same feature names, so a typo would fail resolution | match |
-| Real build, link, eBPF probes, runtime | not possible here | **open**, see the checklist in §7 |
+| Real build, link, eBPF probes, runtime | Debian 13 x86_64 (WSL2, kernel 6.18), toolchain 1.98.1, crates.io; root smoke test with pcap replay and live capture on `lo` (§7b) | builds first time, clippy clean; probes load; threats reach `threat-logger`; stop/start leaves no thread behind. Robot runtime items (§7 item 6) still open |
 
 The stubs can only catch mistakes in *our* code relative to the signatures
 copied into them. If a stub is wrong, the check is wrong in the same way. The
@@ -269,6 +269,7 @@ opens it from its own config section in `init_state`.
   | Rule | Severity | Raised when |
   |---|---|---|
   | `robot.ros2.participant_removed` | Medium | a profiled participant is announced as disposed or unregistered |
+  | `robot.ros2.identity_instances_exceeded` | High | a participant matches a profile identity whose every `max_instances` slot is held by a live participant |
   | `robot.rtps.malformed_discovery` | Low | parse anomalies (`report_anomalies`) |
   | `robot.rtps.fragmented_discovery` | Low | `DATA_FRAG` discovery is seen (`report_fragmentation`) |
   | `robot.rtps.discovery_fragment_rejected` | Medium | fragments are refused by the reassembler (always reported) |
@@ -402,6 +403,11 @@ opens it from its own config section in `init_state`.
 
 ## 7. Still unverified until a real build (Linux box with crates.io)
 
+> **Status 2026-10-17 (§7b):** items 1, 2, 3, 4, 5 and 7 are settled by the
+> first real build and smoke test; item 8 is settled for capture-thread
+> shutdown and real (lab) DDS traffic, not for load. Item 6 (robot runtime)
+> and item 9 remain open.
+
 1. A real `cargo build -p robodr-sensor-ros2 -p robodr-pulsard`. The
    sensor crate has no tests of its own any more; its logic is tested in
    `robodr-ros2-pipeline`.
@@ -515,6 +521,30 @@ in this file.
     the list above (multicast join on the real interface, coexistence with
     each DDS vendor, tracker lookup) and point 8 (capture under load) on the
     robot.
+
+### 7b. First real build: outcome (2026-10-17)
+
+Host: Debian 13.5 under WSL2, kernel `6.18.33.2-microsoft-standard-WSL2`
+(BTF at `/sys/kernel/btf/vmlinux`, no LSM: `bpf_feature_autodetect` warns
+"LSM not supported"), clang/llvm 19, toolchain 1.98.1, crates.io.
+
+| Step | Outcome |
+|---|---|
+| 1. submodule | `vendor/pulsar` at `4796504895ce42f95ffc1e414be19a5d7f40fc0a` |
+| 2. `cargo metadata` | resolves; `Cargo.lock` generated and committed (363 packages, later 378 with ed25519-dalek) |
+| 3. `cargo tree -p robodr-pulsard -d` | one `tokio`, one `clap`, one `pulsar-core` |
+| 4. `cargo build -p robodr-sensor-ros2` | builds on the first try (no change to the glue); one upstream deprecation warning in `bpf-common` (`AsyncFd::with_interest`) |
+| 5. clippy `-D warnings` on both crates | clean (the upstream warning is not ours and does not fail the lint) |
+| 6. `cargo build -p robodr-pulsard` (default, and `--features pulsar-full`) | builds, eBPF probes compiled; needs `libsqlite3-dev` (or `sqlite3-vendored`) |
+| 7. `--version` | `robodr-pulsard 0.1.0-alpha.1` / `pulsar: 0.11.0-alpha.1 (commit 4796504895ce42f95ffc1e414be19a5d7f40fc0a)` |
+| 8. TOML round trip of `extra` | unit test `robodr-sensor-ros2::tests::threat_extra_round_trips_through_pulsar_value` against the real `pulsar_core::event::Value`: one flat table, `severity = "critical"`, `mode = "enforce"`, `observe_only = false`, ...; a detail containing `"` becomes a TOML literal string (`'...'`) |
+| 9. root smoke test, pcap replay | `fixtures/captures/ros2-jazzy/fastrtps_rogue_cmd_vel.pcap`, profile learned from the baseline capture (unlocked): the API (`GET /modules` on the API socket) lists `robodr-sensor-ros2` `Running` with the "NOT locked" warning, then `Failed("no datagram source left; the ROS 2 sensor is blind")` after the file ends; 39 threats from source `robodr-sensor-ros2` in `threat-logger`, including `unauthorized_motion_writer` and `linear_over_envelope` (3.0 m/s over 0.33) for the rogue only. `Process not found in tracker <pid>` is logged per threat while process-monitor has not scanned the daemon yet; the threat is still sent. `threat-logger`'s console format prints the payload (`Empty`), not `extra` |
+| 9. Pulsar's own modules | `process-monitor`, `file-system-monitor`, `network-monitor`, `rules-engine`, `threat-logger` all `Running` (eBPF works in WSL2 6.18). Once, on a host busy with parallel builds, `process-monitor` failed with "Error initializing process filtering" (a `/proc` scan race in upstream Pulsar); the next start was fine |
+| 10. stop / start / restart (`POST /modules/robodr-sensor-ros2/{stop,start,restart}`) | live capture on `lo` + SPDP socket: one `robodr-dgram-src` thread while running, none after `stop`, exactly one after each `start` / `restart`. With pcap replay, `start` after the `Failed` state replays once more (39 -> 78 threats, no duplicates) |
+| 11. robot runtime (multicast join on the robot's interface, coexistence with each DDS vendor on the same host, capture under load) | **open**: WSL2 is not a robot. The SPDP socket joined `239.255.0.1:7400` on `0.0.0.0` |
+
+Not done: arm64, a systemd unit run, `pulsar` CLI subcommands (the HTTP API
+behind them was used directly).
 
 ## 8. Build prerequisites
 

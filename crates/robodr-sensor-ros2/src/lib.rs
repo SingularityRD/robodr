@@ -515,3 +515,51 @@ fn send(ctx: &ModuleContext, finding: &Finding) {
         log::warn!(target: MODULE_NAME, "[{rule}] {description}");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use robodr_ros2_pipeline::{Deviation, Mode, Severity};
+
+    fn finding(mode: Mode) -> Finding {
+        Finding {
+            deviation: Deviation::new(
+                "robot.ros2.unauthorized_motion_writer",
+                Severity::Critical,
+                "participant 010ff3a00100758600000000 not in profile is publishing motion \
+                 topic /cmd_vel \"quoted\"",
+            )
+            .with_mode(mode),
+            src_ip: "10.77.10.66".into(),
+            profile_model: "lab-ugv".into(),
+            profile_status: "enforcing",
+        }
+    }
+
+    /// PULSAR-INTEGRATION §7a item 8: the threat `extra` goes through
+    /// pulsar-core's TOML-backed `Value` and renders as one flat table.
+    #[test]
+    fn threat_extra_round_trips_through_pulsar_value() {
+        for (mode, m, observe) in [
+            (Mode::Enforce, "enforce", false),
+            (Mode::Observe, "observe", true),
+        ] {
+            let v = Value::try_from(finding(mode).extra()).expect("serialisable");
+            let s = v.to_string();
+            assert!(!s.contains('\n'), "{s}");
+            for want in [
+                "rule = \"robot.ros2.unauthorized_motion_writer\"".to_string(),
+                "severity = \"critical\"".to_string(),
+                format!("mode = \"{m}\""),
+                format!("observe_only = {observe}"),
+                "src_ip = \"10.77.10.66\"".to_string(),
+                "profile_model = \"lab-ugv\"".to_string(),
+                "profile_status = \"enforcing\"".to_string(),
+            ] {
+                assert!(s.contains(&want), "{want} missing in {s}");
+            }
+            // A detail with double quotes becomes a TOML literal string.
+            assert!(s.contains("/cmd_vel \"quoted\"'"), "{s}");
+        }
+    }
+}

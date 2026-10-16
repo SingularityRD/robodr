@@ -12,6 +12,26 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Added
 
+- Real ROS 2 Jazzy captures (Fast DDS 2.14, Cyclone DDS 0.10) under
+  `fixtures/captures/ros2-jazzy/` with the container lab that produced them
+  (`tools/lab-capture/`) and end-to-end tests
+  (`robodr-ros2-pipeline/tests/real_captures.rs`).
+- Participant identities (`Profile::participant_identities`: source IPs,
+  RTPS vendor, enclave, nodes, `max_instances`): DDS draws a new GUID prefix
+  per process start, so a GUID-only profile matched none of the robot's
+  participants after a restart. The pipeline resolves fresh prefixes at SPDP
+  time (`robodr-ros2-pipeline::identity`, new rule
+  `robot.ros2.identity_instances_exceeded`); `robodr-commission learn`
+  writes identities (`--no-identities` to opt out), each one a sign-off item
+  and a lock floor requirement; `check` resolves them; Motion Firewall
+  `allowed_sources` and agentd `safety_feed` writers accept
+  `identity:<name>`.
+- `robodr-commission learn --pcap` decodes `Twist` / `TwistStamped` /
+  `JointTrajectory` samples of announced writers (same decoder as the
+  sensor), so a capture alone yields motion envelopes.
+- `robodr-sensor-ros2`: first unit test (threat `extra` through the real
+  `pulsar_core::event::Value`).
+
 - Wave 6 (integrated on `integrate-w6`):
   - `robodr-agentd` live safety-state feed (`safety_feed`): ROS 2 topics
     decoded passively from captured user DATA (`std_msgs` Bool / UInt8 /
@@ -251,6 +271,9 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   `RuntimeDirectory=robodr-agentd` for a unix-socket event input.
 
 ### Fixed
+
+- Cyclone DDS's 1-byte shutdown wake-up datagram is no longer counted as
+  malformed RTPS by `learn --pcap`.
 
 - CI: first local run of every `ci.yml` job and of the `release.yml`
   build/package steps (2026-10-17, Debian 13 / WSL2; record in
