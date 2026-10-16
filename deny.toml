@@ -18,7 +18,17 @@ all-features = false
 [advisories]
 # Vulnerabilities, unsound and unmaintained crates are errors by default.
 # Every entry added to `ignore` needs an issue link and an expiry review.
-ignore = []
+ignore = [
+    # ansi_term 0.12.1 is UNMAINTAINED (informational advisory, no
+    # vulnerability, no fixed release: the crate is deprecated). It is pulled
+    # in only by Pulsar: vendor/pulsar bpf-common -> nut 0.1.4 (latest) ->
+    # ansi_term, i.e. only into robodr-pulsard; we cannot replace it without
+    # patching the submodule. It only formats ANSI colour codes. Added
+    # 2026-10-17 in the first local CI run (docs/BUILD.md, "Local CI
+    # verification"); review by 2027-04-17 or on the next Pulsar bump.
+    # https://rustsec.org/advisories/RUSTSEC-2021-0139
+    { id = "RUSTSEC-2021-0139", reason = "unmaintained, no fix; transitive via Pulsar bpf-common -> nut; review 2027-04-17" },
+]
 yanked = "deny"
 
 [licenses]
@@ -44,13 +54,22 @@ allow = [
 # MPL-2.0 (file-level weak copyleft) is deliberately NOT allowed globally: if
 # a dependency needs it, add a per-crate entry under `exceptions` after legal
 # review, e.g. { allow = ["MPL-2.0"], crate = "some-crate" }.
-exceptions = []
+exceptions = [
+    # CC0-1.0 is a public-domain dedication (no copyleft, no attribution
+    # duty). tiny-keccak is reached only through the const-random-macro
+    # proc-macro (Pulsar bpf-common -> rust-ini -> ordered-multimap -> dlv-list
+    # -> const-random), so it runs at compile time and is not linked into any
+    # shipped binary. Scoped to this one crate rather than allowed globally.
+    { allow = ["CC0-1.0"], crate = "tiny-keccak" },
+]
 confidence-threshold = 0.93
 
 # Pulsar declares the free-text license "Apache-2.0 WITH BPF probes exception
 # under GPL-2.0", which is not valid SPDX. Its Rust crates are Apache-2.0
 # (vendor/pulsar/LICENSE); its eBPF C probes are GPL-2.0 and are not Rust
-# code. Clarify the crates pulsar-core pulls in so cargo-deny can evaluate them.
+# code. Clarify every Pulsar crate in our graph (pulsar-core's, and those of
+# the `pulsar` daemon library robodr-pulsard links) so cargo-deny can
+# evaluate them; a new Pulsar crate shows up as `unlicensed` until added here.
 [[licenses.clarify]]
 crate = "pulsar-core"
 expression = "Apache-2.0"
@@ -86,6 +105,51 @@ crate = "bpf-features-macros"
 expression = "Apache-2.0"
 license-files = []
 
+[[licenses.clarify]]
+crate = "bpf-builder"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+crate = "bpf-filtering"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+crate = "engine-api"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+crate = "file-system-monitor"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+crate = "network-monitor"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+crate = "process-monitor"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+crate = "pulsar"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+crate = "rules-engine"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+crate = "threat-logger"
+expression = "Apache-2.0"
+license-files = []
+
 [licenses.private]
 # Workspace crates are not published; their license is checked by cargo
 # metadata / the SBOM, not by cargo-deny.
@@ -93,11 +157,39 @@ ignore = true
 
 [bans]
 multiple-versions = "warn"
-# `*` version requirements are banned; path dependencies (workspace crates,
-# vendored Pulsar) are fine because they are not published.
+# `*` version requirements are banned. Path dependencies are fine, but
+# cargo-deny only honours allow-wildcard-paths for crates that are
+# `publish = false`: every RoboDR crate sets that. Pulsar's crates (submodule,
+# not editable here) are publishable on paper and use version-less
+# `{ workspace = true }` path dependencies on each other, so they are listed
+# under `skip` below; that exempts exactly those path crates from the
+# wildcard (and duplicate-version) lint, nothing else. Their registry
+# dependencies are still pinned by our Cargo.lock and audited by
+# advisories/licenses/sources. cargo-deny 0.20 reports each of these as
+# `warning[unnecessary-skip]` (it expects skip for duplicates only); that
+# warning is expected and harmless, the entries are what suppress the
+# wildcard errors (verified 2026-10-17: removing them fails `bans`).
 wildcards = "deny"
 allow-wildcard-paths = true
 highlight = "all"
+skip = [
+    { crate = "bpf-builder", reason = "Pulsar path crate (vendor/pulsar)" },
+    { crate = "bpf-common", reason = "Pulsar path crate (vendor/pulsar)" },
+    { crate = "bpf-feature-autodetect", reason = "Pulsar path crate (vendor/pulsar)" },
+    { crate = "bpf-features", reason = "Pulsar path crate (vendor/pulsar)" },
+    { crate = "bpf-features-macros", reason = "Pulsar path crate (vendor/pulsar)" },
+    { crate = "bpf-filtering", reason = "Pulsar path crate (vendor/pulsar)" },
+    { crate = "engine-api", reason = "Pulsar path crate (vendor/pulsar)" },
+    { crate = "file-system-monitor", reason = "Pulsar path crate (vendor/pulsar)" },
+    { crate = "network-monitor", reason = "Pulsar path crate (vendor/pulsar)" },
+    { crate = "process-monitor", reason = "Pulsar path crate (vendor/pulsar)" },
+    { crate = "pulsar", reason = "Pulsar path crate (vendor/pulsar)" },
+    { crate = "pulsar-core", reason = "Pulsar path crate (vendor/pulsar)" },
+    { crate = "rules-engine", reason = "Pulsar path crate (vendor/pulsar)" },
+    { crate = "threat-logger", reason = "Pulsar path crate (vendor/pulsar)" },
+    { crate = "validatron", reason = "Pulsar path crate (vendor/pulsar)" },
+    { crate = "validatron-derive", reason = "Pulsar path crate (vendor/pulsar)" },
+]
 deny = [
     # Defence posture: no telemetry/phone-home or remote-code crates. Extend
     # with concrete crate names as the dependency review progresses.
