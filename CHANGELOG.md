@@ -12,6 +12,23 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Added
 
+- Live motion path: RTPS user DATA on the profile's motion channels and on
+  `motion.feedback_topics` is decoded (`robodr-cdr`) into `MotionCommand` /
+  `MotionFeedback` (`robodr_ros2_pipeline::motion`,
+  `Pipeline::process_datagram_with_motion`) and fed by `robodr-agentd` to
+  the agent (envelope, Motion Firewall recording-only, motion monitor).
+  Config sub-table `motion` / agentd `sensor.motion`. Verified on synthetic
+  RTPS / CDR only.
+- Ed25519 is the default key type: `robodr-blackbox-key/v2` secret (0600)
+  and public `.pub` (0644) key files, `robodr-blackbox keygen --alg
+  ed25519|hmac` (default ed25519) and `export-pub`. The diode packer signs
+  with Ed25519; the SOC importer holds public keys only (HMAC only with
+  `--allow-hmac`). `robodr-agentd` and `robodr-replay` load Ed25519 keys;
+  `robodr-replay verify` accepts the `.pub`.
+- `robodr-commission trust-keys --out trust.json --pub KEY.pub...` builds a
+  profile trust file from Ed25519 public key files; `keygen` also writes
+  `<out>.pub`.
+
 - Signed, versioned model profiles. `robodr-commission lock` stamps
   `metadata` (schema / monotonic profile version, platform, unit,
   locked_by, locked_at, parent digest; `--parent` for lineage) and with
@@ -46,6 +63,21 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Changed
 
+- One key file format: profile signing keys are robodr-blackbox `KeyFile`s
+  (`robodr-commission keygen` now writes v2 secret + `.pub`; a key from
+  `robodr-blackbox keygen` signs profiles too; older v1 Ed25519 signing
+  keys still load). A `.pub` given as `--sign-key` is refused.
+- `robodr-sensor-ros2` loads the profile with
+  `load_profile_with_trust(profile_path, profile_trust)` and logs the
+  `profile_trust` warnings, so a signed profile is enforced under Pulsar
+  (before, it ran observe-only). Decoded motion samples are not forwarded to
+  the Pulsar bus (documented); their envelope findings are.
+- Packaging: `tmpfiles.d` creates `/var/lib/robodr/profile-state`
+  (`robodr:robodr`, agentd) and `/var/lib/robodr/profile-state-pulsard`
+  (`root:robodr`); each unit lists its directory in `ReadWritePaths=`. The
+  example sensor `state_file` moved to
+  `/var/lib/robodr/profile-state-pulsard/pulsard.json`.
+
 - **Breaking:** a locked profile without metadata and a valid signature is
   no longer enforced (observe-only + `robot.ros2.profile_refused`);
   migrate with `robodr-commission migrate-legacy` (OPERATIONS.md 5.2).
@@ -76,6 +108,12 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 - `robodr-agentd.service`: `ProcSubset=pid` removed (the daemon reads
   `/proc/sys/kernel/random/boot_id` and `/proc/net/*`), no restart on exit 2,
   `RuntimeDirectory=robodr-agentd` for a unix-socket event input.
+
+### Fixed
+
+- `robodr-agentd` test `queue_overflow_is_counted_and_reported` was flaky:
+  it stopped the daemon before the socket reader had read every line. It
+  now waits for `received == 5000` in the status file first.
 
 ## [0.1.0-alpha.1] - 2026-10-16
 

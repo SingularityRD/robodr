@@ -288,6 +288,16 @@ fn queue_overflow_is_counted_and_reported() {
             .any(|r| r == "robot.agent.queue_overflow")
             .then_some(())
     });
+    // Stop only once the reader has taken every line off the socket (the
+    // periodic status shows it): stopping earlier makes the input thread
+    // exit with lines still unread, so `received` < 5000 (flaky). After
+    // this, shutdown joins the reader and drains the queue, so every line
+    // is either processed or counted as dropped.
+    wait_for(20, "all lines received", || {
+        status(&s.spool)
+            .filter(|st| st["inputs"][0]["received"].as_u64() == Some(5000))
+            .map(|_| ())
+    });
     stop.store(true, Ordering::SeqCst);
     let (res, log) = h.join().unwrap();
     let sum = res.unwrap_or_else(|e| panic!("{e}\n{log}"));

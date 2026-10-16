@@ -94,7 +94,10 @@ PrivateTmp=yes
 # (single writer per black box: the recorder takes a lock per directory) and
 # its runtime dir for the Pulsar API socket. Set in /etc/robodr/pulsar.toml:
 #   [pulsar] api_socket_path = "/run/robodr-pulsard/pulsar.sock"
-ReadWritePaths=/var/lib/robodr/blackbox/pulsard /var/lib/robodr/spool/pulsard
+# profile-state-pulsard: anti-rollback state of the ROS 2 sensor
+# ([module.robodr-sensor-ros2.profile_trust] state_file), written at module
+# start; without it a locked profile runs observe-only (fail closed).
+ReadWritePaths=/var/lib/robodr/blackbox/pulsard /var/lib/robodr/spool/pulsard /var/lib/robodr/profile-state-pulsard
 RuntimeDirectory=robodr-pulsard
 RuntimeDirectoryMode=0750
 # Keys are handed over by systemd, never read from /etc/robodr/keys by the

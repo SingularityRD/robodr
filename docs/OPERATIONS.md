@@ -262,8 +262,13 @@ robodr-commission keygen --out /secure/oem-profile.key \
     --trust-out profile-trust.json --key-id oem-ugv-x1-2026
 ```
 
-`oem-profile.key` is a `robodr-blackbox-key/v1` file with
-`"algorithm": "ed25519"` (mode `0600`, never overwritten). Keep it on the
+`oem-profile.key` is a `robodr-blackbox-key/v2` secret key file with
+`"algorithm": "ed25519"` (mode `0600`, never overwritten), the same single
+key file format the black box uses (section 4); keygen also writes its public
+half `oem-profile.key.pub` (`0644`). A key made with `robodr-blackbox keygen`
+signs profiles as well; build the trust file from public key files with
+`robodr-commission trust-keys --out profile-trust.json --pub oem-profile.key.pub`
+(secret files are refused). Keep it on the
 commissioning station (offline, encrypted at rest); it never goes to a robot.
 `profile-trust.json` (`robodr-profile-trust/v1`) holds only the public key; it
 is installed on every robot of the fleet (section 5, step 6).
@@ -364,7 +369,7 @@ Work in `/var/lib/robodr/commission/<date>/` as root.
    sudo install -m 0640 -o root -g robodr locked.json /etc/robodr/profile.json
    sudo install -m 0640 -o root -g robodr locked.json.sig /etc/robodr/profile.json.sig
    sudo install -m 0644 -o root -g root profile-trust.json /etc/robodr/profile-trust.json
-   sudo install -d -m 0750 -o robodr -g robodr /var/lib/robodr/profile-state
+   # profile-state dirs come from tmpfiles.d/robodr.conf (systemd-tmpfiles --create)
    sudoedit /etc/robodr/pulsar.toml      # domain_id, capture, binding, profile_trust
    sudoedit /etc/robodr/agentd.json      # robot id, policy, paths, sensor.profile_trust
    sudo robodr-agentd --config /etc/robodr/agentd.json --check-config
@@ -380,11 +385,14 @@ Work in `/var/lib/robodr/commission/<date>/` as root.
    `robot.profile_version` in `agentd.json` was removed: the version in
    findings is the signed `metadata.profile_version`; delete the key.
 
-   The anti-rollback state file must be writable by the daemon. The
-   shipped systemd unit does not yet list `/var/lib/robodr/profile-state` in
-   `ReadWritePaths=` (packaging follow-up); until it does, add it with a
-   drop-in, otherwise the daemon cannot record the accepted version and,
-   failing closed, runs observe-only.
+   The anti-rollback state file must be writable by the daemon. The package
+   creates `/var/lib/robodr/profile-state` (`robodr:robodr`, agentd's
+   `agentd.json`) and `/var/lib/robodr/profile-state-pulsard` (`root:robodr`,
+   the Pulsar sensor's `pulsard.json`; separate so the `robodr` user cannot
+   rewrite the root daemon's floor), and each unit lists its directory in
+   `ReadWritePaths=`. A state path outside them cannot be written; the
+   daemon then cannot record the accepted version and, failing closed, runs
+   observe-only.
 
    An unlocked, missing or invalid profile, or a locked profile that is not
    trusted (no or bad signature, key not in the trust file, no metadata,

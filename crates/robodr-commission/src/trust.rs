@@ -36,10 +36,16 @@
 //!    persisted atomically (temp file, fsync, rename; see
 //!    [`crate::write_file_atomic`]).
 //!
-//! Signing keys are `robodr-blackbox-key/v1` key files with
-//! `"algorithm": "ed25519"` and the 32-byte seed as `secret_hex`
-//! ([`load_signing_key`], [`new_signing_key`]); they are loaded with the
-//! blackbox's permission checks (mode 0600, no symlink).
+//! Signing keys use the **one** RoboDR key file format, robodr-blackbox's
+//! `KeyFile` (`robodr-blackbox-key/v2`, `"kind": "secret"`,
+//! `"algorithm": "ed25519"`, 32-byte seed as `secret_hex` plus
+//! `public_hex`), so a key from `robodr-commission keygen` or from
+//! `robodr-blackbox keygen` (default Ed25519) signs profiles alike
+//! ([`load_signing_key`], [`new_signing_key`]). They are loaded with the
+//! blackbox's secret-key checks (no symlink, no group/other access, owner
+//! the effective user or root). The matching `.pub` public key file
+//! (`"kind": "public"`) is what goes into a trust file
+//! ([`verifying_keys_from_public_files`]).
 //!
 //! # Limits (honest list)
 //!
@@ -61,9 +67,7 @@ use crate::profile_file::{
 use crate::signoff::sha256_hex;
 use robodr_blackbox::crypto::{from_hex, to_hex};
 use robodr_blackbox::sign::SignError;
-use robodr_blackbox::sign_ed25519::{
-    derive_key_id, random_seed, ED25519, PUBLIC_KEY_LEN, SEED_LEN, SIGNATURE_LEN,
-};
+use robodr_blackbox::sign_ed25519::{ED25519, PUBLIC_KEY_LEN, SEED_LEN, SIGNATURE_LEN};
 use robodr_blackbox::{Ed25519SigningKey, Ed25519VerifyingKey, KeyFile, Keyring, Signer, Verifier};
 use robodr_events::profile::{is_sha256_digest, Profile};
 use serde::{Deserialize, Serialize};
@@ -472,11 +476,14 @@ fn read_protected(path: &Path, max: u64) -> io::Result<String> {
 
 // --------------------------------------------------------- signing keys --
 
-/// Load an Ed25519 signing key from a `robodr-blackbox-key/v1` key file
-/// (`"algorithm": "ed25519"`, 32-byte seed; mode 0600, no symlink, checked
-/// by `KeyFile::load`).
+/// Load an Ed25519 signing key from a secret key file
+/// (`robodr-blackbox-key/v2`, `"kind": "secret"`, `"algorithm": "ed25519"`,
+/// as written by `robodr-commission keygen` or `robodr-blackbox keygen`; the
+/// older v1 Ed25519 layout is still read). The blackbox's checks apply
+/// (`KeyFile::load_secret`: no symlink, mode without group/other bits,
+/// owned by the effective user or root). A `.pub` file is refused.
 pub fn load_signing_key(path: &Path) -> Result<Ed25519SigningKey, String> {
-    let kf = KeyFile::load(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let kf = KeyFile::load_secret(path).map_err(|e| format!("{}: {e}", path.display()))?;
     signing_key_from_file(&kf).map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -488,22 +495,20 @@ pub fn signing_key_from_file(kf: &KeyFile) -> Result<Ed25519SigningKey, String> 
             kf.algorithm
         ));
     }
-    let seed: &[u8; SEED_LEN] = kf
-        .secret()
-        .try_into()
-        .map_err(|_| format!("an {ED25519} key is a {SEED_LEN}-byte seed"))?;
-    Ed25519SigningKey::from_seed(kf.key_id.clone(), seed).map_err(|e| e.to_string())
+    if kf.is_public() {
+        return Err("a public key file cannot sign profiles (need the secret key file)".into());
+    }
+    kf.ed25519_signing_key().map_err(|e| e.to_string())
 }
 
-/// A fresh Ed25519 signing key as a key file (write it with
-/// `KeyFile::write_new`, mode 0600) plus its verifying key for the trust
-/// file. Without `key_id` the id is derived from the public key.
+/// A fresh Ed25519 signing key as a blackbox key file (write it with
+/// `KeyFile::write_new`: format v2, mode 0600; `KeyFile::to_public` gives
+/// the `.pub` file) plus its verifying key for the trust file. Without
+/// `key_id` the id is derived from the public key.
 pub fn new_signing_key(key_id: Option<&str>) -> Result<(KeyFile, Ed25519VerifyingKey), String> {
-    let mut seed = random_seed().map_err(|e| e.to_string())?;
-    let r = key_file_for_seed(&seed, key_id);
-    seed.fill(0);
-    std::hint::black_box(&seed);
-    r
+    let kf = KeyFile::generate_ed25519(key_id).map_err(|e| e.to_string())?;
+    let vk = kf.ed25519_verifying_key().map_err(|e| e.to_string())?;
+    Ok((kf, vk))
 }
 
 /// The key file for an existing seed (tests, re-imports).
@@ -511,29 +516,37 @@ pub fn key_file_for_seed(
     seed: &[u8; SEED_LEN],
     key_id: Option<&str>,
 ) -> Result<(KeyFile, Ed25519VerifyingKey), String> {
-    let sk = match key_id {
-        Some(id) => Ed25519SigningKey::from_seed(id, seed).map_err(|e| e.to_string())?,
-        None => Ed25519SigningKey::from_seed(derive_key_id(&public_of(seed)), seed)
-            .map_err(|e| e.to_string())?,
-    };
-    // `KeyFile` has no Ed25519 constructor; build its JSON (best-effort
-    // wipe of the temporary text afterwards).
-    let text = serde_json::json!({
-        "format": robodr_blackbox::keys::KEY_FILE_FORMAT,
-        "algorithm": ED25519,
-        "key_id": Signer::key_id(&sk),
-        "secret_hex": to_hex(seed),
-    })
-    .to_string();
-    let kf = KeyFile::from_json(&text).map_err(|e| e.to_string());
-    let mut bytes = text.into_bytes();
-    bytes.fill(0);
-    std::hint::black_box(&bytes);
-    Ok((kf?, sk.verifying_key()))
+    let kf = KeyFile::ed25519_from_seed(seed, key_id).map_err(|e| e.to_string())?;
+    let vk = kf.ed25519_verifying_key().map_err(|e| e.to_string())?;
+    Ok((kf, vk))
 }
 
-fn public_of(seed: &[u8; SEED_LEN]) -> [u8; PUBLIC_KEY_LEN] {
-    robodr_blackbox::sign_ed25519::public_key_from_seed(seed)
+/// Trusted verifying keys from Ed25519 **public** key files (`.pub`,
+/// `robodr-blackbox-key/v2` `"kind": "public"`), for [`trust_keys_text`].
+/// A file with secret material, an HMAC key or a duplicate key id is
+/// refused.
+pub fn verifying_keys_from_public_files(
+    paths: &[&Path],
+) -> Result<Vec<Ed25519VerifyingKey>, String> {
+    let mut out: Vec<Ed25519VerifyingKey> = Vec::new();
+    for p in paths {
+        let kf = KeyFile::load_public(p).map_err(|e| format!("{}: {e}", p.display()))?;
+        let vk = kf
+            .ed25519_verifying_key()
+            .map_err(|e| format!("{}: {e}", p.display()))?;
+        if out
+            .iter()
+            .any(|k| Verifier::key_id(k) == Verifier::key_id(&vk))
+        {
+            return Err(format!(
+                "{}: key id {:?} listed twice",
+                p.display(),
+                Verifier::key_id(&vk)
+            ));
+        }
+        out.push(vk);
+    }
+    Ok(out)
 }
 
 // --------------------------------------------------------- verification --
@@ -841,6 +854,7 @@ pub fn enforce_rollback(
 mod tests {
     use super::*;
     use crate::profile_file::sealed_text;
+    use robodr_blackbox::sign_ed25519::derive_key_id;
     use robodr_events::profile::{Envelope, ProfileMetadata, PROFILE_SCHEMA_VERSION};
 
     fn key(n: u8) -> Ed25519SigningKey {
@@ -1170,6 +1184,55 @@ mod tests {
             signing_key_from_file(&fresh).unwrap().public_key(),
             *fvk.as_bytes()
         );
+        // One format: the blackbox KeyFile v2 (secret + .pub).
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            text.contains(robodr_blackbox::keys::KEY_FILE_FORMAT_V2),
+            "{text}"
+        );
+        let pubp = robodr_blackbox::keys::public_key_path(&p);
+        kf.to_public().unwrap().write_new(&pubp).unwrap();
+        // A public key file cannot sign...
+        let e = load_signing_key(&pubp).unwrap_err();
+        assert!(e.contains("secret") || e.contains("no secret"), "{e}");
+        assert!(signing_key_from_file(&kf.to_public().unwrap()).is_err());
+        // ... but builds a trust file that verifies the secret's signatures.
+        let vks = verifying_keys_from_public_files(&[pubp.as_path()]).unwrap();
+        assert_eq!(vks[0].as_bytes(), vk.as_bytes());
+        let ring = parse_trust_keys(&trust_keys_text(&vks)).unwrap();
+        let sig = sk.sign(b"m").unwrap();
+        assert!(ring.verify_as(Signer::key_id(&sk), b"m", &sig));
+        // Secret files, duplicates and HMAC keys are refused as trust input.
+        assert!(verifying_keys_from_public_files(&[p.as_path()]).is_err());
+        assert!(verifying_keys_from_public_files(&[pubp.as_path(), pubp.as_path()]).is_err());
+        // A key written by the blackbox's own generator signs profiles too.
+        let bb = KeyFile::generate_ed25519(Some("bb-key")).unwrap();
+        let bbp = d.join("bb.key");
+        bb.write_new(&bbp).unwrap();
+        assert_eq!(
+            load_signing_key(&bbp).unwrap().public_key(),
+            bb.public_key().unwrap()
+        );
+        // Legacy v1 Ed25519 layout (written before KeyFile v2) still loads.
+        let v1 = d.join("v1.key");
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&v1)
+                .unwrap();
+            write!(
+                f,
+                "{{\"format\":\"robodr-blackbox-key/v1\",\"algorithm\":\"ed25519\",\
+                 \"key_id\":\"old\",\"secret_hex\":\"{}\"}}",
+                to_hex(&[5; 32])
+            )
+            .unwrap();
+        }
+        assert_eq!(load_signing_key(&v1).unwrap().public_key(), *vk.as_bytes());
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -23,12 +23,13 @@
 //! loaders run (see `robodr_commission::trust`). Signing keys are read only
 //! from mode-0600 key files, never from the command line.
 
+use robodr_blackbox::keys::public_key_path;
 use robodr_commission::input::{self, InputSpec};
 use robodr_commission::profile_file::{check_destination, read_regular_file, MAX_PROFILE_BYTES};
 use robodr_commission::trust::{
     check_rollback, file_digest, load_signing_key, load_state, load_trust_keys, new_signing_key,
-    sig_path_for, trust_keys_text, validate_rollback_flag, verify_profile_file, ProfileSignature,
-    TrustPolicy,
+    sig_path_for, trust_keys_text, validate_rollback_flag, verify_profile_file,
+    verifying_keys_from_public_files, ProfileSignature, TrustPolicy,
 };
 use robodr_commission::{
     diff, lock_draft_text_with_caps, merge_profiles_with_caps, parse_profile_text, sealed_text,
@@ -65,6 +66,7 @@ USAGE:
                           [--expect-platform P] [--expect-unit U]
                           [--state profile-state.json] [--allow-rollback sha256:HEX] [--json]
   robodr-commission keygen  --out signing.key --trust-out trust.json [--key-id ID]
+  robodr-commission trust-keys --out trust.json --pub KEY.pub [--pub KEY2.pub]... [--force]
   robodr-commission migrate-legacy --in legacy-locked.json --out locked.json
                           --platform P --profile-version N --operator NAME
                           --sign-key signing.key [--unit-id U] [--locked-at UNIX_SECS]
@@ -100,8 +102,11 @@ USAGE:
   the parent's, and the parent's file digest is recorded (rollback lineage).
   --sign-key writes <out>.sig (Ed25519 over the exact sealed bytes) with
   the profile; loaders refuse a locked profile without a valid signature
-  from a trusted key. keygen makes an Ed25519 key file (mode 0600) and a
-  trust file holding its public key. verify-profile is read-only (exit 0
+  from a trusted key. keygen makes an Ed25519 key file (mode 0600), its
+  public key file <out>.pub and a trust file holding the public key. Key
+  files are robodr-blackbox's (robodr-blackbox-key/v2): a key from
+  `robodr-blackbox keygen` signs profiles too. trust-keys builds a trust
+  file from Ed25519 .pub files (secret key files are refused). verify-profile is read-only (exit 0
   trusted, 1 refused). migrate-legacy re-issues a locked profile from
   before metadata existed (content unchanged, its digest recorded as
   parent).
@@ -263,6 +268,7 @@ fn main() -> ExitCode {
         "sign" => cmd_sign(rest),
         "verify-profile" => cmd_verify_profile(rest),
         "keygen" => cmd_keygen(rest),
+        "trust-keys" => cmd_trust_keys(rest),
         "migrate-legacy" => cmd_migrate_legacy(rest),
         "diff" => cmd_diff(rest),
         "check" => cmd_check(rest),
@@ -891,19 +897,48 @@ fn cmd_keygen(argv: &[String]) -> Outcome {
     }
     let out = a.required("out")?;
     let trust_out = a.required("trust-out")?;
-    distinct_paths(&[out, trust_out], &[])?;
-    precheck_outputs(&[out, trust_out], false)?;
+    let pub_out = public_key_path(Path::new(out)).display().to_string();
+    distinct_paths(&[out, pub_out.as_str(), trust_out], &[])?;
+    precheck_outputs(&[out, pub_out.as_str(), trust_out], false)?;
     let (kf, vk) = new_signing_key(a.one("key-id")?)?;
+    let public = kf.to_public().map_err(|e| e.to_string())?;
     kf.write_new(Path::new(out))
         .map_err(|e| format!("{out}: {e}"))?;
+    if let Err(e) = public.write_new(Path::new(&pub_out)) {
+        let _ = std::fs::remove_file(out);
+        return Err(format!("{pub_out}: {e}").into());
+    }
     if let Err(e) = write_file(trust_out, &trust_keys_text(&[vk]), false) {
         let _ = std::fs::remove_file(out);
+        let _ = std::fs::remove_file(&pub_out);
         return Err(e.into());
     }
     eprintln!(
-        "wrote Ed25519 profile signing key {out} (mode 0600, key id {}) and trust file \
-         {trust_out}; keep the key off the robot, install the trust file on it",
+        "wrote Ed25519 profile signing key {out} (mode 0600, key id {}), its public key \
+         {pub_out} and trust file {trust_out}; keep the key off the robot, install the trust \
+         file on it",
         kf.key_id
+    );
+    Ok(())
+}
+
+fn cmd_trust_keys(argv: &[String]) -> Outcome {
+    let a = Args::parse(argv, &["out", "pub"], &["force"])?;
+    if let Some(p) = a.positionals.first() {
+        return Err(format!("unexpected argument {p:?}").into());
+    }
+    let out = a.required("out")?;
+    let pubs: Vec<&str> = a.all("pub").iter().map(String::as_str).collect();
+    if pubs.is_empty() {
+        return Err("--pub is required (one per trusted key)".to_string().into());
+    }
+    distinct_paths(&[out], &pubs)?;
+    let paths: Vec<&Path> = pubs.iter().map(|p| Path::new(*p)).collect();
+    let keys = verifying_keys_from_public_files(&paths)?;
+    write_file(out, &trust_keys_text(&keys), a.switch("force"))?;
+    eprintln!(
+        "wrote trust file {out} with {} key(s); install it on the robot",
+        keys.len()
     );
     Ok(())
 }

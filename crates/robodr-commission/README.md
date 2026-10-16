@@ -169,6 +169,7 @@ robodr-commission verify-profile --profile locked.json --trusted-keys trust.json
                           [--expect-platform P] [--expect-unit U]
                           [--state profile-state.json] [--allow-rollback sha256:HEX] [--json]
 robodr-commission keygen  --out signing.key --trust-out trust.json [--key-id ID]
+robodr-commission trust-keys --out trust.json --pub KEY.pub [--pub KEY2.pub]... [--force]
 robodr-commission migrate-legacy --in legacy-locked.json --out locked.json
                           --platform P --profile-version N --operator NAME
                           --sign-key signing.key [--unit-id U] [--locked-at UNIX_SECS]
@@ -376,6 +377,8 @@ refusing to lock profile.json:
   ...
 $ $EDITOR profile.json.signoff.json   # review each item, set "confirmed": true, fill "operator"
 $ robodr-commission keygen --out oem.key --trust-out trust.json --key-id oem-demo
+# oem.key (secret, 0600) + oem.key.pub (public, 0644): robodr-blackbox-key/v2,
+# the same key file format as robodr-blackbox keygen (either can sign).
 $ robodr-commission lock --in profile.json --signoff profile.json.signoff.json --out locked.json \
     --platform ugv-demo --profile-version 1 --sign-key oem.key
 locked profile ugv-demo-synthetic -> locked.json (sealed; profile_version 1, platform ugv-demo; ...)

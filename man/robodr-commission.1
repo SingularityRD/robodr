@@ -99,6 +99,13 @@ robodr\-commission \- learn, review, lock and verify a RoboDR model profile
 .RB [ \-\-key\-id
 .IR ID ]
 .PP
+.B robodr\-commission trust\-keys
+.B \-\-out
+.I trust.json
+.B \-\-pub
+.IR KEY.pub " ..."
+.RB [ \-\-force ]
+.PP
 .B robodr\-commission migrate\-legacy
 .B \-\-in
 .I legacy\-locked.json
@@ -280,14 +287,24 @@ writes the detached signature
 together with the profile: Ed25519 over the domain tag
 .B robodr\-profile\-sig/v1
 and the exact sealed bytes. The signing key is a
-.B robodr\-blackbox\-key/v1
-file with
-.B \(dqalgorithm\(dq: \(dqed25519\(dq
-(mode 0600; made by
+.BR robodr\-blackbox (1)
+key file
+.RB ( robodr\-blackbox\-key/v2 ,
+.BR \(dqkind\(dq: \(dqsecret\(dq ,
+.BR \(dqalgorithm\(dq: \(dqed25519\(dq ;
+mode 0600), the one RoboDR key format: made by
 .BR keygen ,
-which also writes the
+which also writes its public key file
+.IB signing.key .pub
+(mode 0644) and the
 .B robodr\-profile\-trust/v1
-file holding its public key). Keep the signing key on the commissioning
+file holding the public key, or by
+.BR "robodr\-blackbox keygen" .
+.B trust\-keys
+builds a trust file from one or more Ed25519
+.B .pub
+files (a file with secret material is refused). A public key file cannot
+sign. Keep the signing key on the commissioning
 station, never on the robot; install only the trust file on the robot.
 .B sign
 signs an already locked profile (offline signing station).

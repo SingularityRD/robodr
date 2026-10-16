@@ -115,8 +115,9 @@ The scenario files are synthetic and live in `examples/`:
 | `motion-injection.jsonl` | `/cmd_vel` 0.4 m/s with honest `/odom`, then fabricated 1.2 m/s odometry from t=4.0 s to t=5.5 s |
 
 ```sh
-# A fresh HMAC key file (robodr-blackbox-key/v1, mode 0600). Keys are never
-# passed on the command line (argv is readable through /proc).
+# A fresh Ed25519 key file (robodr-blackbox-key/v2, mode 0600) plus
+# /tmp/demo.key.pub. Keys are never passed on the command line (argv is
+# readable through /proc).
 cargo run -p robodr-blackbox --bin robodr-blackbox -- keygen --out /tmp/demo.key --key-id demo-key
 KEY=/tmp/demo.key
 E=crates/robodr-agent/examples
@@ -131,8 +132,9 @@ cargo run -p robodr-agent --bin robodr-replay -- \
   --out /tmp/findings.jsonl --outcomes /tmp/outcomes.jsonl --log-plans
 
 # 2. Verify on its own (as a receiving side would), then tamper and verify again
+# (the receiving side needs only the public key: --key-file $KEY.pub)
 cargo run -p robodr-agent --bin robodr-replay -- verify --blackbox /tmp/bb \
-  --key-file $KEY --robot-id ugv-007 --findings /tmp/findings.jsonl
+  --key-file $KEY.pub --robot-id ugv-007 --findings /tmp/findings.jsonl
 printf '\xff' | dd of=/tmp/bb/seg-0000000000000000.rbb bs=1 seek=4700 conv=notrunc
 cargo run -p robodr-agent --bin robodr-replay -- verify --blackbox /tmp/bb \
   --key-file $KEY --robot-id ugv-007 --findings /tmp/findings.jsonl   # exit 1
@@ -210,10 +212,13 @@ limiting. Use `--step-ms 6000` to see each one graded on its own.
   only prints what a live executor would have been offered.
 - `--monitor-config` and `--profile` are parsed strictly (unknown fields are
   errors). At most 10 000 outcomes are kept in memory; all are counted.
-- Keys: `--key-file FILE` only, a `robodr-blackbox-key/v1` file
-  (`robodr-blackbox keygen --out FILE [--key-id ID]`), loaded with
-  `KeyFile::load`: a symlink, a non-regular file or a mode with group/other
-  bits is refused, and the key id is the file's. `--key-hex` and `--key-id`
+- Keys: `--key-file FILE` only, a robodr-blackbox key file
+  (`robodr-blackbox keygen --out FILE [--key-id ID]`: Ed25519 secret `FILE`,
+  `robodr-blackbox-key/v2`, plus public `FILE.pub`; legacy HMAC v1 files
+  still load with a warning). `run` needs the secret file
+  (`KeyFile::load_secret`: a symlink, a non-regular file or a mode with
+  group/other bits is refused); `verify` also accepts `FILE.pub` at any mode.
+  The key id is the file's. `--key-hex` and `--key-id`
   were removed (argv is readable by every process through `/proc`); giving
   them is a usage error that says so.
 - Exit codes: 0 verified, 1 verification failed, 2 usage, input or I/O error
@@ -284,13 +289,18 @@ firewall limits, zero partitions and unusable labels are refused.
 
 **Not verified:**
 
-- No real robot, ROS 2 graph, DDS capture or sensor feeds this agent.
-  `robodr-sensor-ros2` and the Pulsar glue do not call it yet.
+- No real robot, ROS 2 graph or real DDS capture has fed this agent. Its
+  live caller is `robodr-agentd`, which feeds it RobotEvents from the sensor
+  pipeline (discovery and, through the live motion path, `MotionCommand` /
+  `MotionFeedback` decoded from RTPS user DATA), but only synthetic pcaps
+  have been run through it. The Pulsar module (`robodr-sensor-ros2`) does
+  not call the agent: it only raises Pulsar threats.
 - Policy matrix, monitor thresholds and firewall limits are unvalidated
   defaults. `policy-oem-validated.json` is a simulated sign-off for the demo.
-- The black box uses HMAC (a shared key, so the verifier can forge). It is a
-  placeholder for an asymmetric TPM-held key. No external checkpoint store
-  exists. The replay verifies against the checkpoint it just produced.
+- The black box signs with an Ed25519 key file (`robodr-blackbox keygen`,
+  default) or, legacy, HMAC (a shared key, so the verifier can forge; warned).
+  The Ed25519 seed is a file, not a TPM-held key, and the implementation is
+  std-only and unaudited. No external checkpoint store exists. The replay verifies against the checkpoint it just produced.
 - Findings were not checked against an OCSF schema server, a Kafka broker or
   AutoSecOps. Nothing is published to Kafka.
 - No executor exists. Nothing is requested from DDS, the host, the Motion

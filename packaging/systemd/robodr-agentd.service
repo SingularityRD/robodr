@@ -14,8 +14,11 @@
 #       "blackbox": { "dir": "/var/lib/robodr/blackbox/agentd",
 #                     "key_file": "/run/credentials/robodr-agentd.service/blackbox.key" },
 #       "spool":    { "dir": "/var/lib/robodr/spool/agentd" }
-#     The key file may be a `robodr-blackbox keygen` file (key id taken from
-#     it) or legacy hex; agentd refuses it unless it is a regular file, mode
+#     The key file is a `robodr-blackbox keygen` secret key file (Ed25519 by
+#     default, robodr-blackbox-key/v2; key id taken from it; verifiers get
+#     only the FILE.pub). Legacy HMAC files and bare hex still load, with a
+#     start-up warning (the verifier could forge). A .pub file is refused.
+#     agentd refuses the key unless it is a regular file, mode
 #     without group/other bits and owned by root or the daemon's uid, which
 #     the systemd credential copy satisfies. An optional unix_socket event
 #     input belongs under /run/robodr-agentd/ (RuntimeDirectory= below; the
@@ -73,7 +76,11 @@ ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
 DevicePolicy=closed
-ReadWritePaths=/var/lib/robodr/blackbox/agentd /var/lib/robodr/spool/agentd
+# profile-state: the anti-rollback state (sensor.profile_trust.state_file,
+# /var/lib/robodr/profile-state/agentd.json), written atomically at start.
+# Without it the daemon cannot record the accepted profile and, failing
+# closed, runs observe-only.
+ReadWritePaths=/var/lib/robodr/blackbox/agentd /var/lib/robodr/spool/agentd /var/lib/robodr/profile-state
 # For an optional unix_socket event input (/run/robodr-agentd/events.sock).
 RuntimeDirectory=robodr-agentd
 RuntimeDirectoryMode=0750

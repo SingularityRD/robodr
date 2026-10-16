@@ -45,7 +45,7 @@
 //!
 //! [module.robodr-sensor-ros2.profile_trust]
 //! trusted_keys = "/etc/robodr/profile-trust.json"
-//! state_file = "/var/lib/robodr/profile-state/pulsard.json"
+//! state_file = "/var/lib/robodr/profile-state-pulsard/pulsard.json"
 //! # expect_platform = "ugv-x1"
 //! # expect_unit_id = "ugv-007"
 //! # allow_rollback = "sha256:<digest>"   # one deliberate rollback, then remove

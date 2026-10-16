@@ -98,6 +98,8 @@ send `READY=1` and `WATCHDOG=1`, then switch to `Type=notify` and
 ├── spool/                       0750 root:robodr   OCSF findings awaiting export
 │   ├── agentd/                  0750 robodr:robodr
 │   └── pulsard/                 0750 root:robodr
+├── profile-state/               0750 robodr:robodr profile anti-rollback state of robodr-agentd
+├── profile-state-pulsard/       0750 root:robodr   profile anti-rollback state of the Pulsar sensor
 ├── commission/                  0750 root:robodr   operator workspace: runs, drafts, sign-offs
 ├── export/                      0750 root:robodr   bundles staged for the diode / media
 ├── archive/                     0750 root:robodr   black boxes closed by a key rotation
@@ -138,7 +140,7 @@ choice here is **root-only files, handed to each service by systemd**
    root:robodr` file, every one of them could read the key.
 2. **The service cannot change or delete its own key.** A compromised agent
    can neither swap the key nor destroy it. Destroying it would make past
-   evidence unverifiable while HMAC is in use.
+   evidence unverifiable (with HMAC, the only copy of the verifying key).
 3. **No group membership to manage.** Root-owned files need no group
    membership, which could drift or be granted by mistake.
 4. **`InaccessiblePaths=-/etc/robodr/keys`** in both units hides the directory
@@ -148,13 +150,17 @@ Fallback for systemd < 247 (no `LoadCredential=`; Ubuntu 22.04 has 249 and
 24.04 has 255, so this should not arise): `0640 root:robodr`, and accept
 point 1 above.
 
-**While HMAC-SHA256 is the authenticator, the key is a shared secret.** Whoever
-can read it can forge evidence as well as verify it. Treat each key copy, on
-the robot and at the verifier, as forging capability. The planned move to
-Ed25519 or a TPM-held ECDSA key (`crates/robodr-blackbox/README.md`) removes
-this: the unit will hold a non-exportable signing key, and verifiers will need
-only the public half. The `LoadCredential=` path stays the same, and with a
-TPM, `LoadCredentialEncrypted=` can seal the key to the machine.
+**Ed25519 is the default** (`robodr-blackbox keygen` writes the secret
+`FILE`, `0600`, and the public `FILE.pub`). Only the secret goes into
+`/etc/robodr/keys/` and through `LoadCredential=`; verifiers (the SOC, the
+diode importer, `robodr-replay verify`) get only `FILE.pub` and cannot forge
+evidence. **A legacy HMAC-SHA256 key is a shared secret** and still loads,
+with a warning: whoever can read it can forge evidence as well as verify it,
+so treat every HMAC key copy, on the robot and at the verifier, as forging
+capability. Remaining limit: the Ed25519 seed is still a file that root on
+the unit can read. A TPM-held, non-exportable key is the planned fix; the
+`LoadCredential=` path stays the same, and with a TPM,
+`LoadCredentialEncrypted=` can seal the key to the machine.
 
 ## Building a package locally
 

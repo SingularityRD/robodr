@@ -26,6 +26,22 @@
 //! motion, requesting a safe state) is the Motion Firewall's and the
 //! responder's job, never this sensor's.
 //!
+//! ## Motion
+//!
+//! The pipeline decodes RTPS user DATA on the profile's motion channels and
+//! `motion.feedback_topics` (`robodr_ros2_pipeline::motion`); with
+//! `motion.evaluate_commands` (default on) every decoded command outside the
+//! envelope becomes a finding and so a threat here. The decoded
+//! `MotionCommand` / `MotionFeedback` samples themselves
+//! (`Pipeline::process_datagram_with_motion`) are **not forwarded** by this
+//! module: Pulsar has no payload type for them (only the untyped
+//! `Payload::Custom`), no Pulsar module consumes them, and at command rates
+//! (tens of Hz per topic, up to `max_samples_per_datagram` per datagram)
+//! they would load the broadcast bus that also carries the threats, where a
+//! lagging receiver loses events. The consumer of decoded samples is
+//! `robodr-agentd`, which feeds them to the agent (motion monitor, Motion
+//! Firewall). Under Pulsar only the envelope check runs.
+//!
 //! ## Observe mode and refused profiles
 //!
 //! Every threat carries `extra.mode` (`"enforce"` / `"observe"`),
@@ -34,8 +50,10 @@
 //! with `[observe-only] `. A profile with `locked = false` is observe-only; a
 //! profile that fails `Profile::validate`, or a `locked` profile file that
 //! fails the commissioning file check (strict keys + the lock seal of
-//! `robodr-commission lock`, so a locked profile edited by hand is caught),
-//! is **refused for enforcement**: the
+//! `robodr-commission lock`, so a locked profile edited by hand is caught)
+//! or the trust check (`profile_trust`: detached Ed25519 signature from a
+//! trusted key, metadata, anti-rollback; no `trusted_keys` means no locked
+//! profile is enforced), is **refused for enforcement**: the
 //! errors are logged, raised as a module warning and sent once as a
 //! `robot.ros2.profile_refused` threat, and the sensor keeps running
 //! observe-only (fail closed: never act on a profile we cannot trust, never
@@ -81,7 +99,9 @@ use tokio::task::JoinHandle;
 pub use robodr_ros2_pipeline as pipeline;
 pub use robodr_ros2_pipeline::{Config, Datagram, DatagramSource, Finding, Pipeline};
 
-use robodr_ros2_pipeline::{load_profile, sanitize, socket, ProfileStatus, SharedHealth};
+use robodr_ros2_pipeline::{
+    load_profile_with_trust, sanitize, socket, ProfileStatus, SharedHealth,
+};
 
 /// Module name, i.e. the `[module.<name>]` section in `pulsar.toml`.
 pub const MODULE_NAME: &str = "robodr-sensor-ros2";
@@ -235,10 +255,15 @@ impl SimplePulsarModule for Ros2Sensor {
             );
         }
 
-        // Strict file check + lock seal (robodr-commission's format): a
-        // locked profile edited after `robodr-commission lock` is refused
-        // for enforcement (observe-only), like one failing validation.
-        let loaded = load_profile(&settings.profile_path)?;
+        // Strict file check + lock seal (robodr-commission's format) + trust
+        // (detached Ed25519 signature from `profile_trust.trusted_keys`,
+        // metadata / platform binding, anti-rollback state, written here at
+        // load time): a locked profile that fails any of them is refused for
+        // enforcement (observe-only), like one failing validation.
+        for w in settings.profile_trust.warnings() {
+            log::warn!(target: MODULE_NAME, "{}", sanitize(&w));
+        }
+        let loaded = load_profile_with_trust(&settings.profile_path, &settings.profile_trust)?;
         let pipeline = Pipeline::from_loaded(loaded, settings.pipeline.clone());
         match pipeline.status() {
             ProfileStatus::Refused(errors) => {
@@ -407,6 +432,9 @@ async fn listen_loop(
                 // Ingress-aware: a capture source tags the interface kind,
                 // so a loopback source address seen on an external
                 // interface is judged as spoofed (review-3 R3-P4).
+                // Decoded motion samples are dropped here on purpose (see
+                // "Motion" in the crate docs); their envelope deviations are
+                // in `found`.
                 let found = pipeline.process_datagram(&d);
                 report(&ctx, found);
             }

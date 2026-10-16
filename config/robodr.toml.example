@@ -113,7 +113,7 @@ max_samples_per_datagram = 256
 trusted_keys = "/etc/robodr/profile-trust.json"
 # Last accepted profile_version + digest. A lower version, or the same
 # version with different bytes, is refused. Must be writable by the daemon.
-state_file = "/var/lib/robodr/profile-state/pulsard.json"
+state_file = "/var/lib/robodr/profile-state-pulsard/pulsard.json"
 # metadata.platform / metadata.unit_id the profile must carry (optional).
 # expect_platform = "ugv-x1"
 # expect_unit_id = "ugv-007"

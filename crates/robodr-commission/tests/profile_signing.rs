@@ -486,3 +486,109 @@ fn unsigned_lock_warns_and_legacy_migration() {
     assert_eq!(code(&o), 2);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// One key format: `keygen` writes a blackbox KeyFile v2 secret + `.pub`; a
+/// key from robodr-blackbox's generator signs profiles too, and
+/// `trust-keys` builds the trust file from `.pub` files only.
+#[test]
+fn blackbox_v2_keys_sign_profiles_and_trust_keys_builds_trust_files() {
+    use robodr_blackbox::keys::{public_key_path, KEY_FILE_FORMAT_V2};
+    use robodr_blackbox::KeyFile;
+    let d = tmpdir("v2");
+    let (key, trust) = keygen(&d, "oem-a");
+    let pubk = public_key_path(&key);
+    let pub_text = std::fs::read_to_string(&pubk).unwrap();
+    assert!(pub_text.contains(KEY_FILE_FORMAT_V2) && pub_text.contains("\"public\""));
+    assert!(!pub_text.contains("secret_hex"), "{pub_text}");
+    assert!(std::fs::read_to_string(&key)
+        .unwrap()
+        .contains(KEY_FILE_FORMAT_V2));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&pubk).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+    }
+    // keygen refuses when only the .pub exists already (nothing written).
+    let k2 = d.join("k2.key");
+    std::fs::write(public_key_path(&k2), "x").unwrap();
+    let o = run(&["keygen", "--out", s(&k2), "--trust-out", s(&d.join("t2"))]);
+    assert_eq!(code(&o), 2, "{}", err(&o));
+    assert!(!k2.exists() && !d.join("t2").exists());
+
+    // trust-keys from keygen's .pub == keygen's trust file.
+    let rebuilt = d.join("rebuilt.json");
+    let o = run(&["trust-keys", "--out", s(&rebuilt), "--pub", s(&pubk)]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(
+        std::fs::read_to_string(&rebuilt).unwrap(),
+        std::fs::read_to_string(&trust).unwrap()
+    );
+    // Secret key files and missing --pub are refused.
+    let o = run(&[
+        "trust-keys",
+        "--out",
+        s(&d.join("bad.json")),
+        "--pub",
+        s(&key),
+    ]);
+    assert_eq!(code(&o), 2, "{}", err(&o));
+    assert!(!d.join("bad.json").exists());
+    assert_eq!(
+        code(&run(&["trust-keys", "--out", s(&d.join("bad.json"))])),
+        2
+    );
+
+    // A key written by robodr-blackbox (as `robodr-blackbox keygen` does).
+    let bb = KeyFile::generate_ed25519(Some("bb-oem")).unwrap();
+    let bb_key = d.join("bb.key");
+    bb.write_new(&bb_key).unwrap();
+    let bb_pub = public_key_path(&bb_key);
+    bb.to_public().unwrap().write_new(&bb_pub).unwrap();
+    let both = d.join("both.json");
+    let o = run(&[
+        "trust-keys",
+        "--out",
+        s(&both),
+        "--pub",
+        s(&pubk),
+        "--pub",
+        s(&bb_pub),
+    ]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+
+    let (p, so) = draft(&d);
+    let locked = d.join("locked.json");
+    let o = run(&[
+        "lock",
+        "--in",
+        s(&p),
+        "--signoff",
+        s(&so),
+        "--out",
+        s(&locked),
+        "--platform",
+        "ugv-x1",
+        "--profile-version",
+        "1",
+        "--sign-key",
+        s(&bb_key),
+    ]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let r = report(&verify(&locked, &both, &["--json"]));
+    assert_eq!(r["trusted"], true, "{r}");
+    assert_eq!(r["signed_by"], "bb-oem");
+    // keygen's own trust file does not list the blackbox key.
+    assert_eq!(code(&verify(&locked, &trust, &[])), 1);
+    // A .pub cannot sign.
+    let o = run(&[
+        "sign",
+        "--profile",
+        s(&locked),
+        "--sign-key",
+        s(&bb_pub),
+        "--force",
+    ]);
+    assert_eq!(code(&o), 2, "{}", err(&o));
+    let _ = std::fs::remove_dir_all(&d);
+}

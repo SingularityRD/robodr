@@ -229,14 +229,19 @@ opens it from its own config section in `init_state`.
   Profile trust is configured in `[module.robodr-sensor-ros2.profile_trust]`
   (`robodr_ros2_pipeline::ProfileTrustConfig`, see
   `config/robodr.toml.example`) and checked by
-  `robodr_ros2_pipeline::load_profile_with_trust`. **Integration
-  follow-up:** `robodr-sensor-ros2` still calls the trust-less
-  `load_profile` (it cannot be built in the offline environment where the
-  trust check was added), which trusts no key, so a locked profile runs
-  observe-only under Pulsar until that call becomes
-  `load_profile_with_trust(&settings.profile_path, &settings.profile_trust)`
-  and `settings.profile_trust.warnings()` are logged. `robodr-agentd`
-  is wired.
+  `robodr_ros2_pipeline::load_profile_with_trust`, which
+  `robodr-sensor-ros2` calls in `init_state` (after logging
+  `settings.profile_trust.warnings()`; the anti-rollback state is written
+  there, so `robodr-pulsard.service` lists `/var/lib/robodr/profile-state-pulsard`
+  in `ReadWritePaths=`). Stub type-checked only. `robodr-agentd` is wired
+  the same way.
+
+  Live motion decode runs inside the pipeline under Pulsar too
+  (`[module.robodr-sensor-ros2.motion]`): commands outside the envelope
+  become threats. The decoded `MotionCommand` / `MotionFeedback` samples are
+  **not** put on the Pulsar bus (no typed payload, no consumer, and command
+  rates would load the broadcast bus that carries the threats); see the
+  `robodr-sensor-ros2` crate docs, "Motion".
 
   **Decision (fail closed): a refused profile is never enforced, and the
   sensor keeps running observe-only.**

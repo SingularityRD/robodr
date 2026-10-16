@@ -10,7 +10,7 @@
 //!   "sensor":  { "profile_path": "/etc/robodr/profile.json", "listen_spdp": false,
 //!                "capture": { "enabled": true, "interfaces": ["eth0"] },
 //!                "profile_trust": { "trusted_keys": "/etc/robodr/profile-trust.json",
-//!                                   "state_file": "/var/lib/robodr/profile-state.json" } },
+//!                                   "state_file": "/var/lib/robodr/profile-state/agentd.json" } },
 //!   "policy_path": "/etc/robodr/policy.json",
 //!   "blackbox": { "dir": "/var/lib/robodr/blackbox", "key_file": "/etc/robodr/blackbox.key" },
 //!   "spool":    { "dir": "/var/spool/robodr/findings", "max_bytes": 67108864 },
@@ -941,10 +941,46 @@ mod tests {
         .unwrap();
         assert!(unit.contains("ExecStart=/usr/sbin/robodr-agentd --config /etc/robodr/agentd.json"));
         assert!(unit.contains("LoadCredential=blackbox.key:"));
-        assert!(unit.contains(
-            "ReadWritePaths=/var/lib/robodr/blackbox/agentd /var/lib/robodr/spool/agentd"
-        ));
+        // Every directory the daemon writes is in ReadWritePaths= (exact
+        // entries), the anti-rollback state included: a state file the unit
+        // cannot write makes the daemon run observe-only.
+        let rw: Vec<&str> = unit
+            .lines()
+            .filter_map(|l| l.strip_prefix("ReadWritePaths="))
+            .flat_map(str::split_whitespace)
+            .collect();
+        let state = s.profile_trust.state_file.as_deref().unwrap();
+        assert_eq!(
+            state,
+            Path::new("/var/lib/robodr/profile-state/agentd.json")
+        );
+        for dir in [
+            c.blackbox.dir.as_path(),
+            c.spool.dir.as_path(),
+            state.parent().unwrap(),
+        ] {
+            assert!(
+                rw.iter().any(|p| Path::new(p) == dir),
+                "{dir:?} not in ReadWritePaths= {rw:?}"
+            );
+        }
         assert!(unit.contains("RuntimeDirectory=robodr-agentd"));
+        // ... and tmpfiles.d creates the state directory for User=robodr.
+        let tmpfiles = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/tmpfiles.d/robodr.conf"),
+        )
+        .unwrap();
+        assert!(
+            tmpfiles.lines().any(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                f.len() >= 5
+                    && f[0] == "d"
+                    && Path::new(f[1]) == state.parent().unwrap()
+                    && f[3] == "robodr"
+            }),
+            "tmpfiles.d does not create {:?} for robodr",
+            state.parent()
+        );
     }
 
     #[test]

@@ -47,12 +47,15 @@ must be absolute.
 | `daemon` | `queue_capacity` 4096, `tick_ms` 1000, `heartbeat_ms` 10000, `silence_ms` 30000, `lag_ms` 2000, `health_report_ms` 10000, `exit_when_inputs_end` false |
 
 **Key.** Keys are never accepted on the command line. `blackbox.key_file`
-is either a `robodr-blackbox-key/v1` key file as written by
-`robodr-blackbox keygen --out FILE` (HMAC-SHA256 only; its `key_id` is used
-unless `blackbox.key_id` is set, and a `blackbox.key_id` that differs from it
-is a configuration error), or, as in 0.1.0-alpha.1, a bare hex HMAC key of at
-least 32 bytes (key id from `blackbox.key_id`, else derived from the key).
-The daemon refuses the file if it
+is either a secret key file as written by `robodr-blackbox keygen --out FILE`
+(Ed25519 by default, `robodr-blackbox-key/v2`; a legacy HMAC-SHA256 v1 file
+still loads with a start-up warning; its `key_id` is used unless
+`blackbox.key_id` is set, and a `blackbox.key_id` that differs from it is a
+configuration error), or, as in 0.1.0-alpha.1, a bare hex HMAC key of at
+least 32 bytes (key id from `blackbox.key_id`, else derived from the key;
+also warned about). With Ed25519 the evidence is verified with `FILE.pub`
+alone (`robodr-blackbox verify --keyring FILE.pub`), so a verifier cannot
+forge it. The daemon refuses the file if it is a public key file (`.pub`),
 is a symlink, is not a regular file, is accessible by group or others (it
 must be `chmod 600`), is owned by a uid other than the daemon's or root, or
 is larger than 4 KiB. The checks run on the opened descriptor, and that
@@ -66,7 +69,9 @@ than the last accepted one (or the same version with other bytes, or a draft
 replacing a locked profile) is refused unless `allow_rollback` names its
 exact digest. `--check-config` makes the decision but never writes the state;
 the daemon writes it atomically at start, and if it cannot, it does not
-enforce. An unlocked profile observes. A locked profile that fails the
+enforce. The shipped unit can write `/var/lib/robodr/profile-state/` (created
+by `packaging/tmpfiles.d`, owner `robodr`), where `config/agentd.example.json`
+puts `agentd.json`. An unlocked profile observes. A locked profile that fails the
 commissioning file check (`robodr-commission lock` seal) or the trust check
 runs observe-only. A profile that fails validation is replaced in the
 agent by an empty, unlocked profile: everything is reported, nothing is acted
@@ -203,9 +208,11 @@ request.
   Dispositions are recorded and reported only.
 - **No exporter is included.** The rename-to-`acked/` acknowledgement is the
   whole contract, and it has not been run against a real Kafka producer.
-- **The key is a placeholder.** The black box uses the HMAC key from the
-  file (the same key verifies and signs; see `robodr-blackbox`). There is no
-  TPM. Wall time is recorded with `TimeSource::Unknown`.
+- **The key is a file, not a TPM.** The Ed25519 seed sits in a 0600 file
+  (handed over by systemd `LoadCredential=`); root on the unit can read it
+  and sign as the unit. The Ed25519 implementation is RoboDR's own std-only
+  one (RFC 8032 vectors, not audited). HMAC keys still load (warned: the
+  verifier can forge). Wall time is recorded with `TimeSource::Unknown`.
 - **A dead daemon reports nothing.** If the process dies, nothing inside it
   can report that. A console must treat a missing or stale `status.json` or
   heartbeat as `unknown`. There is no systemd watchdog integration yet.
