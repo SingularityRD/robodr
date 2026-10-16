@@ -24,6 +24,47 @@ crate, or ECDSA with the private key held in the TPM. The `Signer` and
 both for the new backend changes nothing else: format, chain, storage and
 verifier stay the same. Signatures are length-prefixed, up to 1024 bytes.
 
+## Keys and the `robodr-blackbox` tool
+
+```
+robodr-blackbox keygen  --out FILE [--key-id ID]
+robodr-blackbox verify  DIR --keyring FILE [--keyring FILE]... [--checkpoint FILE]
+                        [--device ID] [--strict] [--json]
+robodr-blackbox inspect DIR|SEGMENT [--json] [--limit N]
+```
+
+Exit codes: `0` verified intact (warnings allowed unless `--strict`), `1`
+verification failed, `2` usage, I/O or key error. Secrets are never taken
+from the command line (argv is readable by every process via `/proc`).
+
+- **Key file** (`robodr-blackbox-key/v1`, `src/keys.rs`):
+  `{"format":"robodr-blackbox-key/v1","algorithm":"hmac-sha256","key_id":"...","secret_hex":"..."}`.
+  `keygen` draws 32 bytes from `/dev/urandom` (it fails rather than fall
+  back), derives `key_id` from the key unless `--key-id` is given, creates
+  the file with `O_CREAT|O_EXCL|O_NOFOLLOW` and mode 0600, and prints only
+  the key id. It never overwrites a file and never writes through a
+  symlink. `KeyFile::load` (and every `--keyring`) refuses a symlink, a
+  non-regular file, and any file with group/other permission bits
+  (`mode & 0o077 != 0`). Unknown JSON fields are rejected.
+- **Keyring** (`Keyring`, file format `robodr-blackbox-keyring/v1`:
+  `{"format":"robodr-blackbox-keyring/v1","keys":[<key objects>]}`) maps
+  `key_id` to a verifier. `Verifier::verify_as(key_id, ..)` (a new default
+  method; plain verifiers accept only their own id) picks the key for
+  checkpoints, which name their key. Duplicate key ids are refused.
+- **Rotation**: `Recorder::rotate_key(new_signer, new_verifier, reason)`
+  writes a `KeyRotation` record signed by the old key, switches to the new
+  key and seals. The chain id keeps binding the first key; later
+  `SegmentStart` records name the current key (`signing_key`). After a
+  restart, open with `Recorder::open_with_keys(cfg, new_signer, None,
+  Some(Box::new(keyring_of_old_keys)), clock)` while segments signed by an
+  old key are retained; once they have rotated out, `open` with the new key
+  alone works. Verify a log, directory or bundle spanning a rotation with a
+  keyring holding both keys (`verify DIR --keyring old.key --keyring new.key`).
+- **Limit:** `Keyring::verify` (used for records, which do not name their
+  key) accepts a signature from *any* key in the ring. Keep one keyring per
+  unit (or fleet trust domain). With HMAC every key file is a forging key on
+  the verifying side too.
+
 ## Usage
 
 ```rust
@@ -84,7 +125,8 @@ flag bits are rejected, as are trailing bytes. As a result, decoding and
 re-encoding a record always gives back the same bytes.
 
 Kinds: `0` Genesis, `1` SegmentStart, `2` Seal, `3` Resume, `4` Recovery,
-`5` SegmentDropped, `6` Saturation, `7` SaturationCleared (control records);
+`5` SegmentDropped, `6` Saturation, `7` SaturationCleared, `8`
+TruncationDetected, `9` KeyRotation (control records);
 `16` Event (`RobotEvent` JSON), `17` Deviation (`Deviation` JSON), `18` Note
 (free-form JSON).
 
@@ -177,18 +219,43 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
   `export-cursor.json`, `export-ack.json` and `checkpoint.json` are used only
   if they authenticate and match the chain; rejected ones are listed in the
   `Resume` record (`rejected_state`).
-- **Crash recovery:** on open, the last segment is scanned. Only an
-  **incomplete frame or a zero-filled tail, with nothing valid after it**, is
-  treated as a crash artefact: the bytes are copied to `quarantine/`, the file
-  is truncated to the last good frame, and a signed `Recovery` record is
-  appended with the offset, length, SHA-256 of the discarded bytes and the
-  quarantine file name. Recovery is never silent and the verifier rates it a
-  **warning** (`is_clean()` is false). Anything else is `Error::Corrupt` and
-  nothing is touched: a complete frame whose hash or signature fails (a crash
-  cannot produce one, because the hash is computed before the frame is
-  written), a record that does not link, non-zero bytes that are not a frame,
-  or corruption followed by valid frames. A write or fsync error poisons the
-  recorder until it is reopened, and the reopen recovers the log.
+- **Crash recovery:** on open, the last segment is scanned. Crash artefacts
+  are copied to `quarantine/`, the file is truncated to the last good frame,
+  and a signed `Recovery` record is appended with the offset, length, SHA-256
+  of the discarded bytes and the quarantine file name. Recovery is never
+  silent. Two cases:
+  - an **incomplete frame or a zero-filled tail, with nothing valid after
+    it** (torn write): severity medium, verifier **warning**;
+  - **zero-filled damage followed by valid frames** (a lost page under
+    `SealsOnly`/`Every(n)` while a later page reached disk; the damage holds
+    a run of at least 16 zero bytes): the whole suffix is quarantined. The
+    record names the authentic records lost with it (`discarded_records`,
+    `discarded_seqs`) and those seqs are never reused (the next record jumps
+    past them and declares it in `Resume.skipped_seqs`). If nothing after
+    the hole was durably synced, a crash explains it: severity high, verifier
+    **warning**, and the declared gap is not reported as `Deleted`. If a
+    synced record follows (seal, control record, critical record under
+    `fsync_critical`, any record under `Always`), it cannot be a crash:
+    severity critical, verifier **tamper** (`DamageQuarantined` plus
+    `Deleted`). The recorder keeps recording in both cases.
+
+  Anything else is `Error::Corrupt` and nothing is touched: a complete frame
+  whose hash or signature fails without zero evidence (a crash cannot
+  produce one, because the hash is computed before the frame is written), a
+  record that does not link, non-zero bytes that are not a frame, or damage
+  in a closed segment. A write or fsync error poisons the recorder until it
+  is reopened, and the reopen recovers the log.
+- **Truncation evidence:** an authentic `checkpoint.json` or
+  `export-cursor.json` naming a seq **beyond** the head proves the tail was
+  cut at a frame boundary. The recorder does not brick and does not hide it:
+  it copies the state file to `quarantine/state-*.json` (SHA-256 recorded),
+  numbers the next record *after* the highest seq that state names (no seq
+  is ever reused, so no silent fork), lists the file in
+  `Resume.rejected_state` and writes a critical `TruncationDetected` record
+  (verifier: `TruncationRecorded` + `Deleted`, tamper). Only then can the
+  next seal replace `checkpoint.json`. An authentic checkpoint naming a seq
+  the log has, with a different hash, means history was rewritten under the
+  chain key: `open` refuses with `Error::Untrusted` and touches nothing.
   Limit: someone who rewrites the newest frame's length prefix makes it look
   torn; the bytes are then quarantined (hash recorded) and the event is a
   warning, not a tamper finding. Only an exported checkpoint turns that into
@@ -222,7 +289,9 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
   When those are full too, critical appends return `Refused(Full)` and are
   counted. `prune_exported()` deletes fully exported segments (each deletion is
   recorded) and, if that frees space, writes `SaturationCleared` with the
-  refusal counts.
+  refusal counts. The counters are persisted in every `Seal` and `Resume`
+  record and restored at open, so the totals survive restarts; refusals
+  after the last such record are lost in a crash (`close()` seals them).
 - **Store-and-forward:** `export_pending` first writes an export seal, then
   bundles every record after the cursor. `mark_exported` advances the cursor
   (atomic replace) once the bundle has left the unit; the bundle end must be
@@ -263,6 +332,8 @@ location (segment name and position, byte offset, global position, seq).
 | history rewritten under a known checkpoint | `CheckpointMismatch`                        |
 | garbage bytes / broken frames              | `Malformed`, `TrailingGarbage`              |
 | interrupted write never recovered          | `TornTail` (warning)                        |
+| tail cut below an authentic local checkpoint/cursor, found by the recorder | `TruncationRecorded` + `Deleted` |
+| hole before a synced record, quarantined by the recorder | `DamageQuarantined` + `Deleted` |
 
 `is_intact()` means there are no tamper findings. `is_clean()` means there
 are also no warnings. Crash recovery is a warning (the discarded newest
@@ -322,9 +393,13 @@ tamper finding.
 - fsync durability semantics were tested only for logic (torn writes are
   simulated by writing partial or zero bytes). Power-loss behaviour on the
   target filesystem and storage hardware has not been tested.
-- If the recorder finds corruption in the middle of the active segment, it
-  refuses to open. Moving the directory aside and starting a fresh chain is an
-  operator or integrator decision.
+- Zero-filled damage in the active segment is quarantined and recording
+  continues. Non-zero corruption (a flipped bit from failing storage looks
+  the same as tampering), damage in a closed segment, and an authentic
+  checkpoint that contradicts the log still make `open` refuse. Moving the
+  directory aside and starting a fresh chain is then an operator decision.
+- Key files hold HMAC secrets in plain JSON (mode 0600). Sealing them to a
+  TPM is not implemented. The permission check does not check the owner.
 - `export_pending` reads the retained segments into memory to build a bundle.
   Size bundles with `max_records` on constrained units.
 - A segment always takes at least one caller record after its header. A single

@@ -14,6 +14,9 @@
 //!   [`sign::HmacSha256Key`]. **HMAC is a placeholder**: production must
 //!   use an asymmetric, non-exportable key (Ed25519 via an audited crate or
 //!   TPM-backed ECDSA) behind the same traits.
+//! - [`keys`]: key files (`robodr-blackbox-key/v1`, mode 0600, permission
+//!   checked) and [`keys::Keyring`] (key id -> verifier) for verifying across
+//!   a [`Recorder::rotate_key`].
 //! - [`record`]: canonical record encoding and framing.
 //! - [`time`]: timestamps with a time-source tag (no NTP on air-gapped units).
 //! - [`store`]: the [`Recorder`].
@@ -51,6 +54,7 @@
 
 pub mod crypto;
 pub mod export;
+pub mod keys;
 pub mod record;
 pub mod sign;
 pub mod store;
@@ -58,6 +62,7 @@ pub mod time;
 pub mod verify;
 
 pub use export::{Ack, Anchor, Bundle, Checkpoint, Receiver, SignedCursor};
+pub use keys::{KeyFile, KeyFileError, Keyring};
 pub use record::{ChainIdentity, Hash, Record, RecordKind};
 pub use sign::{HmacSha256Key, Signer, Verifier};
 pub use store::{

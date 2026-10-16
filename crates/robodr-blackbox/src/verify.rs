@@ -43,13 +43,21 @@
 //! 7. Every segment except the last must end with a seal (`SegmentUnsealed`).
 //! 8. With a checkpoint, records missing after it are a `TruncatedTail`, and
 //!    a different hash at its seq is `CheckpointMismatch`.
+//! 9. Recorder-side discoveries are reported from their signed records: a
+//!    `TruncationDetected` is `TruncationRecorded` (tamper; the skipped seqs
+//!    also show as `Deleted`), a `Recovery` that a crash cannot explain is
+//!    `DamageQuarantined` (tamper). A crash-plausible `Recovery` that names
+//!    the quarantined seqs (`discarded_seqs`) explains exactly that gap,
+//!    which is then a warning (`RecoveryRecorded`), not `Deleted`.
+//!    `KeyRotation` records are `KeyRotationRecorded` (info); verify a chain
+//!    spanning a rotation with a [`crate::keys::Keyring`] holding both keys.
 
 use crate::crypto::to_hex;
 use crate::export::{Anchor, Checkpoint};
 use crate::record::{
-    scan_frames, short_hex, signing_message, ChainIdentity, GenesisPayload, Hash, Record,
-    RecordKind, RecoveryPayload, ScanItem, SegmentDroppedPayload, SegmentStartPayload, TailKind,
-    ZERO_HASH,
+    scan_frames, short_hex, signing_message, ChainIdentity, GenesisPayload, Hash,
+    KeyRotationPayload, Record, RecordKind, RecoveryPayload, ScanItem, SegmentDroppedPayload,
+    SegmentStartPayload, TailKind, TruncationPayload, ZERO_HASH,
 };
 use crate::sign::Verifier;
 use crate::store::{list_segments, parse_segment_file_name, CHECKPOINT_FILE};
@@ -223,6 +231,26 @@ pub enum FindingKind {
     SaturationRecorded {
         seq: u64,
     },
+    /// The recorder found authentic state (checkpoint, export cursor)
+    /// beyond the log's head at open: records were truncated.
+    TruncationRecorded {
+        seq: u64,
+        head_seq: u64,
+        first_skipped: u64,
+        last_skipped: u64,
+    },
+    /// The recorder quarantined damage that a crash cannot explain (a
+    /// durably synced record followed it).
+    DamageQuarantined {
+        seq: u64,
+        discarded_bytes: u64,
+        discarded_records: u64,
+    },
+    KeyRotationRecorded {
+        seq: u64,
+        from_key_id: String,
+        to_key_id: String,
+    },
     TimeRegression {
         seq: u64,
         prev_mono_ns: u64,
@@ -247,7 +275,8 @@ impl FindingKind {
             | CheckpointNotRetained { .. }
             | UnsealedTail { .. }
             | SegmentDropRecorded { .. }
-            | SaturationRecorded { .. } => FindingLevel::Info,
+            | SaturationRecorded { .. }
+            | KeyRotationRecorded { .. } => FindingLevel::Info,
             _ => FindingLevel::Tamper,
         }
     }
@@ -374,6 +403,30 @@ impl fmt::Display for FindingKind {
                 "segment {segment_index} dropped (record {seq}, exported: {exported})"
             ),
             SaturationRecorded { seq } => write!(f, "storage saturated (record {seq})"),
+            TruncationRecorded {
+                seq,
+                head_seq,
+                first_skipped,
+                last_skipped,
+            } => write!(
+                f,
+                "recorder found the log truncated after {head_seq} (record {seq}); \
+                 seqs {first_skipped}..={last_skipped} lost"
+            ),
+            DamageQuarantined {
+                seq,
+                discarded_bytes,
+                discarded_records,
+            } => write!(
+                f,
+                "record {seq}: {discarded_bytes} B with {discarded_records} records quarantined; \
+                 a crash cannot explain the damage"
+            ),
+            KeyRotationRecorded {
+                seq,
+                from_key_id,
+                to_key_id,
+            } => write!(f, "signing key rotated {from_key_id} -> {to_key_id} (record {seq})"),
             TimeRegression {
                 seq,
                 prev_mono_ns,
@@ -858,7 +911,16 @@ pub fn verify_segments(
         cx.add(FindingKind::Empty, None);
     }
 
-    // 6b. Gaps and links.
+    // 6b. Gaps and links. A gap is explained only by a signed, crash-
+    //     plausible `Recovery` that names exactly those seqs as quarantined
+    //     with a lost page (B3); everything else is `Deleted`.
+    let explained_gaps: Vec<[u64; 2]> = order
+        .iter()
+        .filter(|&&p| cx.rec(p).kind == RecordKind::Recovery)
+        .filter_map(|&p| cx.rec(p).payload_json::<RecoveryPayload>())
+        .filter(|rp| rp.crash_plausible)
+        .filter_map(|rp| rp.discarded_seqs)
+        .collect();
     for w in order.windows(2) {
         let (pa, pb) = (w[0], w[1]);
         let (a, b) = (cx.rec(pa), cx.rec(pb));
@@ -875,7 +937,8 @@ pub fn verify_segments(
             let missing = b.seq - a.seq - 1;
             let (lo, hi) = (pa.min(pb), pa.max(pb));
             let explained = (lo + 1..hi).filter(|&k| invalid[k]).count() as u64;
-            if explained < missing {
+            let recovered = explained_gaps.contains(&[a.seq + 1, b.seq - 1]);
+            if explained < missing && !recovered {
                 let kind = FindingKind::Deleted {
                     first_missing: a.seq + 1,
                     last_missing: b.seq - 1,
@@ -938,13 +1001,48 @@ pub fn verify_segments(
             }
             RecordKind::Recovery => {
                 let seq = r.seq;
-                let discarded_bytes = r
-                    .payload_json::<RecoveryPayload>()
-                    .map_or(0, |x| x.discarded_bytes);
-                cx.add(
-                    FindingKind::RecoveryRecorded {
+                let rp = r.payload_json::<RecoveryPayload>();
+                let discarded_bytes = rp.as_ref().map_or(0, |x| x.discarded_bytes);
+                let kind = match rp {
+                    Some(x) if !x.crash_plausible => FindingKind::DamageQuarantined {
                         seq,
                         discarded_bytes,
+                        discarded_records: x.discarded_records,
+                    },
+                    _ => FindingKind::RecoveryRecorded {
+                        seq,
+                        discarded_bytes,
+                    },
+                };
+                cx.add(kind, Some(p));
+            }
+            RecordKind::TruncationDetected => {
+                let seq = r.seq;
+                let (head_seq, [first_skipped, last_skipped]) = r
+                    .payload_json::<TruncationPayload>()
+                    .map_or((0, [0, 0]), |t| (t.head_seq, t.skipped_seqs));
+                cx.add(
+                    FindingKind::TruncationRecorded {
+                        seq,
+                        head_seq,
+                        first_skipped,
+                        last_skipped,
+                    },
+                    Some(p),
+                );
+            }
+            RecordKind::KeyRotation => {
+                let seq = r.seq;
+                let (from_key_id, to_key_id) = r
+                    .payload_json::<KeyRotationPayload>()
+                    .map_or((String::new(), String::new()), |k| {
+                        (k.from.key_id, k.to.key_id)
+                    });
+                cx.add(
+                    FindingKind::KeyRotationRecorded {
+                        seq,
+                        from_key_id,
+                        to_key_id,
                     },
                     Some(p),
                 );
@@ -1119,4 +1217,445 @@ pub fn verify_dir(
         ));
     }
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::record::{RecoveryPayload, TruncationPayload};
+    use crate::sign::{HmacSha256Key, Signer};
+    use crate::time::{TimeSource, Timestamp};
+    use robodr_events::Severity;
+
+    fn key() -> HmacSha256Key {
+        HmacSha256Key::new("k", &[3; 32]).unwrap()
+    }
+
+    fn ident() -> ChainIdentity {
+        ChainIdentity {
+            device_id: "ugv-1".into(),
+            boot_id: "b".into(),
+            key_id: "k".into(),
+            algorithm: "hmac-sha256".into(),
+            created_wall_ns: 5,
+        }
+    }
+
+    /// A signed chain builder: genesis, then whatever is pushed.
+    struct Chain {
+        key: HmacSha256Key,
+        id: ChainIdentity,
+        recs: Vec<Record>,
+    }
+
+    impl Chain {
+        fn new() -> Self {
+            let mut c = Chain {
+                key: key(),
+                id: ident(),
+                recs: Vec::new(),
+            };
+            let g = serde_json::to_vec(&GenesisPayload {
+                identity: c.id.clone(),
+                recorder_version: "t".into(),
+                format_version: 1,
+            })
+            .unwrap();
+            c.push_at(0, RecordKind::Genesis, g);
+            c
+        }
+        fn push_at(&mut self, seq: u64, kind: RecordKind, payload: Vec<u8>) {
+            let prev = self.recs.last().map_or(ZERO_HASH, |r| r.hash);
+            let mut r = Record {
+                chain_id: self.id.chain_id(),
+                seq,
+                time: Timestamp {
+                    wall_ns: 1_000 + seq,
+                    mono_ns: 10 + seq,
+                    source: TimeSource::Gps,
+                },
+                kind,
+                critical: kind.is_control(),
+                payload,
+                prev_hash: prev,
+                hash: ZERO_HASH,
+                sig: Vec::new(),
+            };
+            r.hash = r.compute_hash();
+            r.sig = self.key.sign(&signing_message(&r.hash)).unwrap();
+            self.recs.push(r);
+        }
+        fn note(&mut self) {
+            let seq = self.recs.last().map_or(0, |r| r.seq + 1);
+            self.push_at(seq, RecordKind::Note, br#"{"n":1}"#.to_vec());
+        }
+        fn seg(&self, name: &str) -> SegmentData {
+            SegmentData {
+                name: name.into(),
+                bytes: self.recs.iter().flat_map(|r| r.encode_frame()).collect(),
+            }
+        }
+    }
+
+    fn kinds(r: &Report) -> Vec<&FindingKind> {
+        r.findings.iter().map(|f| &f.kind).collect()
+    }
+
+    #[test]
+    fn level_classifies_every_family() {
+        use FindingKind::*;
+        assert_eq!(HashMismatch { seq: 1 }.level(), FindingLevel::Tamper);
+        assert_eq!(
+            Deleted {
+                first_missing: 1,
+                last_missing: 2
+            }
+            .level(),
+            FindingLevel::Tamper
+        );
+        assert_eq!(TornTail { len: 1 }.level(), FindingLevel::Warning);
+        assert_eq!(
+            RecoveryRecorded {
+                seq: 1,
+                discarded_bytes: 2
+            }
+            .level(),
+            FindingLevel::Warning
+        );
+        assert_eq!(Empty.level(), FindingLevel::Warning);
+        assert_eq!(SaturationRecorded { seq: 1 }.level(), FindingLevel::Info);
+        assert_eq!(
+            KeyRotationRecorded {
+                seq: 1,
+                from_key_id: "a".into(),
+                to_key_id: "b".into()
+            }
+            .level(),
+            FindingLevel::Info
+        );
+        assert_eq!(
+            TruncationRecorded {
+                seq: 9,
+                head_seq: 3,
+                first_skipped: 4,
+                last_skipped: 8
+            }
+            .level(),
+            FindingLevel::Tamper
+        );
+        assert_eq!(
+            DamageQuarantined {
+                seq: 1,
+                discarded_bytes: 1,
+                discarded_records: 1
+            }
+            .level(),
+            FindingLevel::Tamper
+        );
+        assert!(FindingLevel::Info < FindingLevel::Warning);
+        assert!(FindingLevel::Warning < FindingLevel::Tamper);
+    }
+
+    #[test]
+    fn finding_new_takes_level_from_kind_and_displays_location() {
+        let loc = Location {
+            segment: "s".into(),
+            segment_position: 0,
+            offset: 12,
+            position: 3,
+            seq: Some(7),
+        };
+        let f = Finding::new(FindingKind::BadSignature { seq: 7 }, Some(loc));
+        assert_eq!(f.level, FindingLevel::Tamper);
+        let s = f.to_string();
+        assert!(
+            s.contains("Tamper") && s.contains("s+12") && s.contains("seq Some(7)"),
+            "{s}"
+        );
+        let g = Finding::new(FindingKind::Empty, None);
+        assert_eq!(g.level, FindingLevel::Warning);
+        assert_eq!(g.to_string(), "[Warning] no records");
+    }
+
+    #[test]
+    fn report_predicates() {
+        let mut r = Report::default();
+        assert!(r.is_intact() && r.is_clean());
+        assert!(r.first_at_least(FindingLevel::Info).is_none());
+        r.push(Finding::new(
+            FindingKind::SaturationRecorded { seq: 1 },
+            None,
+        ));
+        assert!(r.is_intact() && r.is_clean());
+        r.push(Finding::new(FindingKind::TornTail { len: 3 }, None));
+        assert!(r.is_intact() && !r.is_clean());
+        assert_eq!(r.tamper().count(), 0);
+        assert!(matches!(
+            r.first_at_least(FindingLevel::Warning).map(|f| &f.kind),
+            Some(FindingKind::TornTail { .. })
+        ));
+        r.push(Finding::new(FindingKind::HashMismatch { seq: 2 }, None));
+        r.push(Finding::new(
+            FindingKind::Fork {
+                seq: 3,
+                other_position: 0,
+            },
+            None,
+        ));
+        assert!(!r.is_intact() && !r.is_clean());
+        let t: Vec<_> = r.tamper().map(|f| f.kind.clone()).collect();
+        assert_eq!(
+            t,
+            vec![
+                FindingKind::HashMismatch { seq: 2 },
+                FindingKind::Fork {
+                    seq: 3,
+                    other_position: 0
+                }
+            ]
+        );
+        assert!(matches!(
+            r.first_at_least(FindingLevel::Tamper).map(|f| &f.kind),
+            Some(FindingKind::HashMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn verify_segments_clean_and_basic_tampering() {
+        let mut c = Chain::new();
+        for _ in 0..4 {
+            c.note();
+        }
+        let ok = verify_segments(&[c.seg("seg")], &c.key, &VerifyOptions::default());
+        assert!(ok.is_intact() && ok.is_clean(), "{:?}", kinds(&ok));
+        assert_eq!((ok.first_seq, ok.last_seq), (Some(0), Some(4)));
+        assert_eq!(ok.verified_records, 5);
+        assert_eq!(ok.identity.as_ref(), Some(&ident()));
+
+        // One byte of a payload flipped.
+        let mut s = c.seg("seg");
+        let start = s.bytes.len() - c.recs[4].encode_frame().len();
+        s.bytes[start + 8 + 64 + 2] ^= 1; // inside the JSON payload
+        let r = verify_segments(&[s], &c.key, &VerifyOptions::default());
+        assert!(kinds(&r)
+            .iter()
+            .any(|k| matches!(k, FindingKind::HashMismatch { seq: 4 })));
+        assert!(!r.is_intact());
+
+        // Wrong key: one KeyMismatch, not five bad signatures.
+        let other = HmacSha256Key::new("x", &[9; 32]).unwrap();
+        let r = verify_segments(&[c.seg("seg")], &other, &VerifyOptions::default());
+        let km = kinds(&r)
+            .iter()
+            .filter(|k| matches!(k, FindingKind::KeyMismatch { .. }))
+            .count();
+        assert_eq!(km, 1);
+        assert!(!kinds(&r)
+            .iter()
+            .any(|k| matches!(k, FindingKind::BadSignature { .. })));
+
+        // A record removed from the middle.
+        let mut d = Chain::new();
+        for _ in 0..4 {
+            d.note();
+        }
+        d.recs.remove(2);
+        let r = verify_segments(&[d.seg("seg")], &d.key, &VerifyOptions::default());
+        assert!(kinds(&r).contains(&&FindingKind::Deleted {
+            first_missing: 2,
+            last_missing: 2
+        }));
+
+        // Device pinning.
+        let r = verify_segments(
+            &[c.seg("seg")],
+            &c.key,
+            &VerifyOptions {
+                expected_device_id: Some("other".into()),
+                ..Default::default()
+            },
+        );
+        assert!(kinds(&r)
+            .iter()
+            .any(|k| matches!(k, FindingKind::WrongDevice { .. })));
+
+        // Nothing at all.
+        let r = verify_segments(&[], &c.key, &VerifyOptions::default());
+        assert_eq!(kinds(&r), vec![&FindingKind::Empty]);
+        // Pure noise never panics and is never intact-and-clean.
+        let noise = SegmentData {
+            name: "n".into(),
+            bytes: (0..2000u32).map(|i| (i * 7919 % 251) as u8).collect(),
+        };
+        let r = verify_segments(&[noise], &c.key, &VerifyOptions::default());
+        assert!(!r.is_clean());
+    }
+
+    fn recovery(seqs: Option<[u64; 2]>, plausible: bool) -> Vec<u8> {
+        serde_json::to_vec(&RecoveryPayload {
+            segment_index: 0,
+            offset: 100,
+            discarded_bytes: 300,
+            discarded_sha256: "00".into(),
+            reason: "t".into(),
+            quarantine_file: None,
+            discarded_records: 2,
+            discarded_seqs: seqs,
+            crash_plausible: plausible,
+            severity: Some(Severity::High),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn crash_plausible_recovery_explains_exactly_its_gap() {
+        let mut c = Chain::new();
+        c.note(); // 1
+        c.push_at(5, RecordKind::Resume, b"{}".to_vec()); // skips 2..=4
+        c.push_at(6, RecordKind::Recovery, recovery(Some([2, 4]), true));
+        let r = verify_segments(&[c.seg("s")], &c.key, &VerifyOptions::default());
+        assert!(r.is_intact(), "{:?}", kinds(&r));
+        assert!(!r.is_clean());
+        assert!(kinds(&r)
+            .iter()
+            .any(|k| matches!(k, FindingKind::RecoveryRecorded { seq: 6, .. })));
+
+        // A range that does not match the gap explains nothing.
+        let mut c = Chain::new();
+        c.note();
+        c.push_at(5, RecordKind::Resume, b"{}".to_vec());
+        c.push_at(6, RecordKind::Recovery, recovery(Some([2, 3]), true));
+        let r = verify_segments(&[c.seg("s")], &c.key, &VerifyOptions::default());
+        assert!(kinds(&r).contains(&&FindingKind::Deleted {
+            first_missing: 2,
+            last_missing: 4
+        }));
+
+        // Not crash-plausible: tamper, and the gap stays unexplained.
+        let mut c = Chain::new();
+        c.note();
+        c.push_at(5, RecordKind::Resume, b"{}".to_vec());
+        c.push_at(6, RecordKind::Recovery, recovery(Some([2, 4]), false));
+        let r = verify_segments(&[c.seg("s")], &c.key, &VerifyOptions::default());
+        assert!(!r.is_intact());
+        assert!(kinds(&r)
+            .iter()
+            .any(|k| matches!(k, FindingKind::DamageQuarantined { seq: 6, .. })));
+        assert!(kinds(&r)
+            .iter()
+            .any(|k| matches!(k, FindingKind::Deleted { .. })));
+    }
+
+    #[test]
+    fn truncation_record_is_tamper() {
+        let mut c = Chain::new();
+        c.note();
+        c.push_at(9, RecordKind::Resume, b"{}".to_vec());
+        let t = serde_json::to_vec(&TruncationPayload {
+            head_seq: 1,
+            head_hash: "00".into(),
+            evidence: Vec::new(),
+            skipped_seqs: [2, 8],
+            severity: Severity::Critical,
+        })
+        .unwrap();
+        c.push_at(10, RecordKind::TruncationDetected, t);
+        let r = verify_segments(&[c.seg("s")], &c.key, &VerifyOptions::default());
+        assert!(!r.is_intact());
+        assert!(kinds(&r).contains(&&FindingKind::TruncationRecorded {
+            seq: 10,
+            head_seq: 1,
+            first_skipped: 2,
+            last_skipped: 8
+        }));
+        assert!(kinds(&r).contains(&&FindingKind::Deleted {
+            first_missing: 2,
+            last_missing: 8
+        }));
+    }
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let d = std::env::temp_dir().join(format!(
+            "robodr-bb-verify-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn read_segments_orders_by_index_and_ignores_other_files() {
+        let d = tmpdir("read");
+        std::fs::write(d.join("seg-0000000000000002.rbb"), b"b").unwrap();
+        std::fs::write(d.join("seg-0000000000000000.rbb"), b"a").unwrap();
+        std::fs::write(d.join("seg-2.rbb"), b"x").unwrap();
+        std::fs::write(d.join("checkpoint.json"), b"{}").unwrap();
+        std::fs::create_dir(d.join("seg-0000000000000005.rbb")).unwrap();
+        let s = read_segments(&d).unwrap();
+        let names: Vec<_> = s.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["seg-0000000000000000.rbb", "seg-0000000000000002.rbb"]
+        );
+        assert_eq!(s[0].bytes, b"a");
+        assert!(read_segments(&d.join("missing")).is_err());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn verify_dir_uses_its_checkpoint_file() {
+        let d = tmpdir("dir");
+        let mut c = Chain::new();
+        for _ in 0..3 {
+            c.note();
+        }
+        std::fs::write(d.join("seg-0000000000000000.rbb"), c.seg("x").bytes).unwrap();
+        assert!(verify_dir(&d, &c.key, &VerifyOptions::default())
+            .unwrap()
+            .is_clean());
+        // A checkpoint beyond the stored head: truncation.
+        let last = c.recs.last().unwrap();
+        let cp = Checkpoint {
+            chain_id: c.id.chain_id(),
+            seq: last.seq + 2,
+            hash: [1; 32],
+            key_id: "k".into(),
+            sig: c.key.sign(&signing_message(&[1; 32])).unwrap(),
+        };
+        std::fs::write(d.join(CHECKPOINT_FILE), cp.to_json()).unwrap();
+        let r = verify_dir(&d, &c.key, &VerifyOptions::default()).unwrap();
+        assert!(kinds(&r)
+            .iter()
+            .any(|k| matches!(k, FindingKind::TruncatedTail { .. })));
+        // An explicit checkpoint wins over the file.
+        let good = Checkpoint {
+            chain_id: c.id.chain_id(),
+            seq: last.seq,
+            hash: last.hash,
+            key_id: "k".into(),
+            sig: last.sig.clone(),
+        };
+        let r = verify_dir(
+            &d,
+            &c.key,
+            &VerifyOptions {
+                checkpoint: Some(good),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(r.is_intact(), "{:?}", kinds(&r));
+        // Unparseable checkpoint file: reported, not fatal.
+        std::fs::write(d.join(CHECKPOINT_FILE), b"\xff garbage").unwrap();
+        let r = verify_dir(&d, &c.key, &VerifyOptions::default()).unwrap();
+        assert!(kinds(&r)
+            .iter()
+            .any(|k| matches!(k, FindingKind::CheckpointInvalid { .. })));
+        assert!(verify_dir(&d.join("nope"), &c.key, &VerifyOptions::default()).is_err());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
 }
