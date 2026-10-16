@@ -60,6 +60,8 @@ pub mod engine;
 pub mod rules;
 pub mod signal;
 
-pub use engine::{Contribution, CorrelatedFinding, Correlator, Limits, Stats};
+pub use engine::{
+    Contribution, CorrelatedFinding, Correlator, Limits, Stats, EVICTED_RULE_ID, MAX_KNOWN_ENTITIES,
+};
 pub use rules::{bump, Rule, RuleError, RuleFile, RuleSet, DEFAULT_RULES_JSON, RULE_ID_PREFIX};
 pub use signal::{Domain, Entity, EntityKind, Signal};

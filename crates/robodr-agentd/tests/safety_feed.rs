@@ -98,6 +98,19 @@ fn sample(prefix: [u8; 12], writer: [u8; 4], sn: u32, payload: &[u8]) -> Vec<u8>
     datagram(prefix, &[user_data(writer, [0; 4], sn, payload, true)])
 }
 
+/// `feed` with the legit participant as the commissioned writer of every
+/// topic that names none (writers are mandatory).
+fn with_writers(mut feed: serde_json::Value) -> serde_json::Value {
+    if let Some(ts) = feed.get_mut("topics").and_then(|t| t.as_array_mut()) {
+        for t in ts {
+            if t.get("writers").is_none() {
+                t["writers"] = serde_json::json!([LEGIT_HEX]);
+            }
+        }
+    }
+    feed
+}
+
 fn estop_values() -> serde_json::Value {
     serde_json::json!({"true": "estop_active", "false": "none"})
 }
@@ -128,7 +141,7 @@ struct Bus {
 impl Bus {
     fn new(feed: serde_json::Value) -> Self {
         let p = profile(false);
-        let sec: SafetyFeedSection = serde_json::from_value(feed).unwrap();
+        let sec: SafetyFeedSection = serde_json::from_value(with_writers(feed)).unwrap();
         let (spec, _) = sec.resolve(&p).unwrap();
         let mut b = Bus {
             pipeline: Pipeline::new(p, PipelineOptions::default()),
@@ -375,9 +388,9 @@ fn allowlist_and_unprofiled_topic() {
 
     // A topic the profile does not list: every writer is untrusted.
     let p = robot_profile(false);
-    let sec: SafetyFeedSection = serde_json::from_value(serde_json::json!({
+    let sec: SafetyFeedSection = serde_json::from_value(with_writers(serde_json::json!({
         "topics": [{"topic": "/estop", "type": "std_msgs/msg/Bool", "values": estop_values()}]
-    }))
+    })))
     .unwrap();
     let (spec, warnings) = sec.resolve(&p).unwrap();
     assert!(warnings[0].contains("not a writer topic"), "{warnings:?}");
@@ -487,14 +500,14 @@ fn replay_with_estop(estop: u8, tag: &str) -> (Pairs, Pairs) {
         serde_json::json!({"exit_when_inputs_end": true}),
     );
     cfg["context"] = serde_json::json!({});
-    cfg["safety_feed"] = serde_json::json!({
+    cfg["safety_feed"] = with_writers(serde_json::json!({
         "stale_after_ms": 60000,
         "topics": [
             {"topic": "/estop", "type": "std_msgs/msg/Bool", "values": estop_values()},
             {"topic": "/odom", "type": "nav_msgs/msg/Odometry",
              "motion": {"moving_above": 0.05, "fast_above": 1.0}}
         ]
-    });
+    }));
     let r = s.resolve(&cfg);
     let mut log = Vec::new();
     let sum = robodr_agentd::run(&r, &|| false, &mut log).unwrap();
@@ -572,10 +585,10 @@ fn spoofed_release_on_the_bus_is_reported_and_ignored_end_to_end() {
         serde_json::json!({"exit_when_inputs_end": true}),
     );
     cfg["context"] = serde_json::json!({});
-    cfg["safety_feed"] = serde_json::json!({
+    cfg["safety_feed"] = with_writers(serde_json::json!({
         "stale_after_ms": 60000,
         "topics": [{"topic": "/estop", "type": "std_msgs/msg/Bool", "values": estop_values()}]
-    });
+    }));
     let r = s.resolve(&cfg);
     let mut log = Vec::new();
     let sum = robodr_agentd::run(&r, &|| false, &mut log).unwrap();
@@ -748,6 +761,9 @@ fn feed_configuration_errors() {
     // Topics without capture: a warning (the sources stay unknown).
     cfg["safety_feed"] = serde_json::json!({"topics": [
         {"topic": "/estop", "type": "std_msgs/msg/Bool", "values": estop_values()}]});
+    let e = robodr_agentd::load(&s.write_config(&cfg)).unwrap_err();
+    assert!(e.contains("writers"), "{e}");
+    cfg["safety_feed"] = with_writers(cfg["safety_feed"].clone());
     let r = robodr_agentd::load(&s.write_config(&cfg)).unwrap();
     assert!(
         r.warnings

@@ -151,10 +151,24 @@
 //!   must be commissioned: either static addressing, or `participant_ips`
 //!   pins listing every address the participant can use, or a
 //!   `discovery_server` list. This is a **commissioning item**.
-//! - The first SPDP wins: an attacker who announces a profiled prefix before
-//!   the real participant ever did binds it; the real participant's SPDP is
-//!   then the one reported (`participant_source_mismatch`), which still
-//!   surfaces the conflict. Pin the profiled prefixes to close this.
+//! - **Contested prefixes.** RoboDR cannot tell which of two hosts is the
+//!   real owner of a GUID prefix: the first SPDP is not more trustworthy than
+//!   the second (an attacker who announces a profiled prefix before the real
+//!   participant ever did would otherwise keep it). So when a live
+//!   (unexpired) binding of a **profiled** prefix is claimed by an SPDP from
+//!   an IP outside it, the prefix becomes **contested**: a Critical
+//!   [`rules::PARTICIPANT_SOURCE_MISMATCH`] is raised and from then on
+//!   [`BindingTable::allows_from`] answers `Some(false)` for **every** IP
+//!   (the first host's included), so endpoints, motion samples and
+//!   safety-state samples attributed to the prefix are untrusted (endpoint
+//!   mismatches are Critical). It stays contested for the life of the table
+//!   (expiry, dispose and eviction do not clear it); the operator resolves it
+//!   by pinning the prefix (`participant_ips`), which takes precedence. An
+//!   attacker who can send one SPDP can therefore make a profiled participant
+//!   untrusted (fail closed, loudly) but can never make a forged one
+//!   trusted. Unprofiled prefixes keep the first-come binding (their
+//!   conflicting SPDP is reported, High / Medium, and not learned).
+//!   Pin the profiled prefixes to close all of this up front.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::IpAddr;
@@ -311,6 +325,8 @@ pub struct BindingStats {
     pub spoofed_loopback: u64,
     /// Local addresses learned from traffic on the loopback interface.
     pub local_learned: u64,
+    /// Profiled prefixes that became contested (claimed by a second host).
+    pub contested: u64,
 }
 
 /// Is `ip` a loopback address (`127.0.0.0/8`, `::1`, or an IPv4-mapped
@@ -489,6 +505,7 @@ enum Mismatch {
     Relayed,
     GuidConflict,
     SpoofedLoopback,
+    Contested,
 }
 
 impl Mismatch {
@@ -504,6 +521,10 @@ impl Mismatch {
             }
             Self::SpoofedLoopback => {
                 "a loopback source address received on a non-loopback interface (forged source)"
+            }
+            Self::Contested => {
+                "but its GUID prefix is contested (announced by SPDP from more than one host): \
+                 no source is trusted for it until it is pinned in participant_ips"
             }
         }
     }
@@ -530,6 +551,9 @@ pub struct BindingTable {
     /// Held announcements per participant, so the per-SPDP / per-SEDP
     /// "anything held for it?" checks are O(1) instead of a queue scan.
     held_count: HashMap<GuidPrefix, usize>,
+    /// Profiled, unpinned prefixes claimed by SPDP from two hosts (module
+    /// docs, "Contested prefixes"). Bounded by the profile's participants.
+    contested: BTreeSet<GuidPrefix>,
     /// This host's addresses (configured, detected, learned on loopback).
     local: Vec<IpAddr>,
     stats: BindingStats,
@@ -604,6 +628,7 @@ impl BindingTable {
             order: BTreeSet::new(),
             held: VecDeque::new(),
             held_count: HashMap::new(),
+            contested: BTreeSet::new(),
             stats: BindingStats::default(),
         }
     }
@@ -635,6 +660,42 @@ impl BindingTable {
         self.entries.contains_key(prefix) || self.opts.participant_ips.contains_key(prefix)
     }
 
+    /// Is `prefix` contested (a profiled, unpinned prefix claimed by SPDP
+    /// from more than one host)? Its every source is untrusted until it is
+    /// pinned. See the module docs.
+    pub fn is_contested(&self, prefix: &GuidPrefix) -> bool {
+        self.contested.contains(prefix) && !self.opts.participant_ips.contains_key(prefix)
+    }
+
+    /// Every contested prefix (see [`BindingTable::is_contested`]).
+    pub fn contested(&self) -> impl Iterator<Item = &GuidPrefix> {
+        self.contested
+            .iter()
+            .filter(|p| !self.opts.participant_ips.contains_key(*p))
+    }
+
+    /// The source IPs currently trusted for **profiled** participants: their
+    /// pins, and the bound SPDP source / locator IPs of live, uncontested
+    /// learned entries. For consumers that want to tell known robot
+    /// addresses from fresh ones (e.g. correlation-state protection). Small:
+    /// bounded by the profile's participants times the per-entry caps.
+    pub fn profiled_ips(&self, now: Instant) -> BTreeSet<IpAddr> {
+        let mut out = BTreeSet::new();
+        for p in &self.profiled {
+            if let Some(pins) = self.opts.participant_ips.get(p) {
+                out.extend(pins.iter().copied());
+                continue;
+            }
+            if self.contested.contains(p) {
+                continue;
+            }
+            if let Some(e) = self.entries.get(p).filter(|e| !e.expired(now)) {
+                out.extend(e.bound_ips.iter().chain(&e.locator_ips).copied());
+            }
+        }
+        out
+    }
+
     /// Would `ip` be accepted as a source for `prefix`, ingress unknown?
     /// `None` = no binding. See [`BindingTable::allows_from`].
     pub fn allows(&self, prefix: &GuidPrefix, ip: IpAddr) -> Option<bool> {
@@ -644,7 +705,8 @@ impl BindingTable {
     /// Would `ip`, received with `ingress`, be accepted as a source for
     /// `prefix`? `None` = no binding. A loopback source on a non-loopback
     /// interface is never accepted; one on loopback is accepted for a
-    /// same-host participant (module docs).
+    /// same-host participant (module docs). A contested prefix (unless
+    /// pinned) accepts no source: `Some(false)`.
     pub fn allows_from(&self, prefix: &GuidPrefix, ip: IpAddr, ingress: Ingress) -> Option<bool> {
         let ip = canonical_ip(ip);
         if self.spoofed_loopback(ip, ingress) {
@@ -655,6 +717,9 @@ impl BindingTable {
             return Some(
                 pins.contains(&ip) || (same_host && pins.iter().any(|p| self.is_local(*p))),
             );
+        }
+        if self.contested.contains(prefix) {
+            return Some(false);
         }
         self.entries
             .get(prefix)
@@ -732,6 +797,9 @@ impl BindingTable {
             self.stats.spoofed_loopback += 1;
             return Verdict::Mismatch(Mismatch::SpoofedLoopback);
         }
+        if self.is_contested(participant) {
+            return Verdict::Mismatch(Mismatch::Contested);
+        }
         if relayed || conflict {
             if self.trusted_relay(ip, ingress) {
                 return Verdict::Ok;
@@ -775,7 +843,7 @@ impl BindingTable {
         ambiguous: bool,
     ) -> BindingFinding {
         self.stats.endpoint_mismatches += 1;
-        let severity = if why == Mismatch::SpoofedLoopback
+        let severity = if matches!(why, Mismatch::SpoofedLoopback | Mismatch::Contested)
             || motion_capable_writer(profile, kind, topic, ambiguous)
         {
             Severity::Critical
@@ -874,7 +942,7 @@ impl BindingTable {
         let reject = |this: &mut Self, why: &str, out: &mut Vec<BindingFinding>| {
             this.stats.spdp_mismatches += 1;
             let profiled = this.profiled.contains(&p);
-            let severity = if this.spoofed_loopback(ip, ingress) {
+            let severity = if this.spoofed_loopback(ip, ingress) || this.is_contested(&p) {
                 Severity::Critical
             } else if profiled {
                 Severity::High
@@ -950,6 +1018,16 @@ impl BindingTable {
             return;
         }
 
+        if self.contested.contains(&p) {
+            reject(
+                self,
+                "but its GUID prefix is contested (announced from more than one host); no source \
+                 is trusted for it until it is pinned in participant_ips",
+                out,
+            );
+            return;
+        }
+
         let allowed = self.allows_from(&p, ip, ingress) == Some(true);
         match self.entries.get_mut(&p) {
             Some(e) if allowed => {
@@ -962,11 +1040,25 @@ impl BindingTable {
                 self.reindex(p, Some(old), Some(now));
             }
             Some(e) if !e.expired(now) => {
-                reject(
-                    self,
-                    "which is outside its current binding (another host claims its GUID prefix)",
-                    out,
-                );
+                if self.profiled.contains(&p) {
+                    // Two hosts claim a profiled prefix: neither is trusted
+                    // (the first one is not more credible than the second).
+                    self.contested.insert(p);
+                    self.stats.contested += 1;
+                    reject(
+                        self,
+                        "which is outside its current binding: another host claims its GUID \
+                         prefix, which is now contested (no source is trusted for it, the bound \
+                         one included, until it is pinned in participant_ips)",
+                        out,
+                    );
+                } else {
+                    reject(
+                        self,
+                        "which is outside its current binding (another host claims its GUID prefix)",
+                        out,
+                    );
+                }
                 return;
             }
             Some(e) => {
@@ -1576,14 +1668,101 @@ mod tests {
         let mut t = T::new(BindingOptions::default());
         t.spdp(&spdp(P1, &[], None), ip(RIP));
         t.spdp(&spdp(P2, &[], None), ip(RIP));
+        // A profiled prefix claimed by a second host: Critical, contested.
         let f = t.spdp(&spdp(P1, &[XIP], None), ip(XIP));
-        one(&f, rules::PARTICIPANT_SOURCE_MISMATCH, Severity::High);
+        one(&f, rules::PARTICIPANT_SOURCE_MISMATCH, Severity::Critical);
+        assert!(f[0].0.detail.contains("contested"), "{f:#?}");
+        // An unprofiled one keeps first-come (reported, not learned).
         let f = t.spdp(&spdp(P2, &[XIP], None), ip(XIP));
         one(&f, rules::PARTICIPANT_SOURCE_MISMATCH, Severity::Medium);
         assert_eq!(t.b.allows(&P1, ip(XIP)), Some(false));
+        assert_eq!(t.b.allows(&P2, ip(XIP)), Some(false));
+        assert_eq!(t.b.allows(&P2, ip(RIP)), Some(true));
+        assert!(!t.b.is_contested(&P2));
         assert_eq!(t.b.stats().spdp_mismatches, 2);
         // The rejected SPDP's locators were not learned either.
         assert!(!t.ep(&writer(P1), ip(XIP)).is_empty());
+    }
+
+    /// Finding 2b: whoever announced a profiled prefix first, once a second
+    /// host claims it neither is trusted, for endpoints and samples alike,
+    /// until the operator pins it.
+    #[test]
+    fn contested_profiled_prefix_trusts_no_source() {
+        for rogue_first in [true, false] {
+            let mut t = T::new(BindingOptions::default());
+            let (first, second) = if rogue_first { (XIP, RIP) } else { (RIP, XIP) };
+            assert!(t.spdp(&spdp(P1, &[first], None), ip(first)).is_empty());
+            assert_eq!(t.b.allows(&P1, ip(first)), Some(true));
+            let f = t.spdp(&spdp(P1, &[second], None), ip(second));
+            one(&f, rules::PARTICIPANT_SOURCE_MISMATCH, Severity::Critical);
+            assert!(t.b.is_contested(&P1));
+            assert_eq!(t.b.contested().count(), 1);
+            assert_eq!(t.b.stats().contested, 1);
+            // Both hosts are untrusted now, the first-bound one included.
+            for a in [RIP, XIP] {
+                assert_eq!(t.b.allows(&P1, ip(a)), Some(false), "{a:?}");
+                let f = t.ep(&writer(P1), ip(a));
+                one(&f, rules::ENDPOINT_SOURCE_MISMATCH, Severity::Critical);
+                assert!(f[0].0.detail.contains("contested"), "{f:#?}");
+                // Even a non-motion reader announcement is Critical.
+                let f = t.ep(&ep(P1, EndpointKind::Reader, "rt/odom"), ip(a));
+                one(&f, rules::ENDPOINT_SOURCE_MISMATCH, Severity::Critical);
+                // Further SPDP from either host refreshes nothing.
+                let f = t.spdp(&spdp(P1, &[a], None), ip(a));
+                one(&f, rules::PARTICIPANT_SOURCE_MISMATCH, Severity::Critical);
+            }
+            assert!(t.b.profiled_ips(t.now).is_empty());
+            // Expiry, dispose and re-announcement do not clear it.
+            t.advance(MAX_LEASE * 2);
+            let f = t.spdp(&spdp(P1, &[RIP], None), ip(RIP));
+            one(&f, rules::PARTICIPANT_SOURCE_MISMATCH, Severity::Critical);
+            assert_eq!(
+                t.b.observe_participant_removal(&removal(P1, P1), Some(ip(RIP)), Ingress::Unknown),
+                Some(false)
+            );
+            assert!(t.b.is_contested(&P1));
+            // Held announcements resolve to a contested mismatch too.
+            assert_eq!(t.b.allows(&P1, lo4()), Some(false));
+        }
+    }
+
+    #[test]
+    fn contested_prefix_is_resolved_only_by_a_pin() {
+        let mut t = T::new(BindingOptions::default());
+        t.spdp(&spdp(P1, &[], None), ip(XIP));
+        t.spdp(&spdp(P1, &[], None), ip(RIP));
+        assert!(t.b.is_contested(&P1));
+        // The operator pins it (config reload = a new table with pins); the
+        // pin is authoritative over a contest recorded in the same table too.
+        let mut pins = BTreeMap::new();
+        pins.insert(P1, vec![ip(RIP)]);
+        t.b.opts.participant_ips = pins;
+        assert!(!t.b.is_contested(&P1));
+        assert_eq!(t.b.contested().count(), 0);
+        assert_eq!(t.b.allows(&P1, ip(RIP)), Some(true));
+        assert_eq!(t.b.allows(&P1, ip(XIP)), Some(false));
+        assert!(t.ep(&writer(P1), ip(RIP)).is_empty());
+        assert_eq!(t.b.profiled_ips(t.now), [ip(RIP)].into_iter().collect());
+    }
+
+    #[test]
+    fn multi_homed_refresh_does_not_contest() {
+        // A second interface advertised as a locator is the same host.
+        let mut t = T::new(BindingOptions::default());
+        t.spdp(&spdp(P1, &[RIP, RLOC], None), ip(RIP));
+        assert!(t.spdp(&spdp(P1, &[RIP, RLOC], None), ip(RLOC)).is_empty());
+        assert!(!t.b.is_contested(&P1));
+        assert_eq!(
+            t.b.profiled_ips(t.now),
+            [ip(RIP), ip(RLOC)].into_iter().collect()
+        );
+        // An unprofiled prefix is never in profiled_ips.
+        t.spdp(&spdp(P2, &[], None), ip(XIP));
+        assert!(!t.b.profiled_ips(t.now).contains(&ip(XIP)));
+        // Expired entries drop out.
+        t.advance(MAX_LEASE * 2);
+        assert!(t.b.profiled_ips(t.now).is_empty());
     }
 
     #[test]

@@ -97,6 +97,11 @@
 //! engine's expiry runs on every tick, its counters are in `status.json`
 //! and the heartbeat, and a rising eviction / refusal count is reported as
 //! the observe-only self-health finding `robot.agent.correlation_pressure`.
+//! The engine is told, every tick, which entities are the robot's own (the
+//! profile's participants and the IPs bound or pinned to them), so their
+//! pending state is protected from eviction by a flood of fresh entities;
+//! evicting pending evidence anyway is reported per rule as the
+//! observe-only correlated finding `robot.correlate.correlation_state_evicted`.
 //! Correlation only adds findings; nothing is suppressed. Host-side (Pulsar)
 //! signals are not delivered to agentd yet, so the host-dependent default
 //! rules cannot fire here.
@@ -916,6 +921,9 @@ impl<'a> Daemon<'a> {
 
     fn handle(&mut self, m: Msg) {
         let age = ms(m.at.elapsed());
+        // Receipt time (when the input queued it), not processing time:
+        // queue lag must not make a safety reading look fresher.
+        let received_ms = ms(m.at.saturating_duration_since(self.epoch));
         self.tick_max_age_ms = self.tick_max_age_ms.max(age);
         self.stats.max_queue_age_ms = self.stats.max_queue_age_ms.max(age);
         match m.payload {
@@ -925,13 +933,12 @@ impl<'a> Daemon<'a> {
                 let out = self.pipeline.process_datagram_with_motion(&d, capture_ns);
                 // The feed's tap after the pipeline (binding updated from
                 // this datagram), before anything of it is planned.
-                let now_ms = self.now_ms();
                 let fed = match self.feed.as_mut() {
                     Some(f) => f.observe_datagram(
                         &d,
                         self.pipeline.profile(),
                         self.pipeline.binding(),
-                        now_ms,
+                        received_ms,
                     ),
                     None => Vec::new(),
                 };
@@ -942,12 +949,13 @@ impl<'a> Daemon<'a> {
                 }
             }
             Payload::Safety(report) => {
-                let now_ms = self.now_ms();
-                if let Some(f) = self.feed.as_mut() {
-                    f.observe_report(report, now_ms);
-                }
+                let fed = match self.feed.as_mut() {
+                    Some(f) => f.observe_report_from(m.conn, report, received_ms),
+                    None => Vec::new(),
+                };
                 // Record a transition now, not at the next plan.
                 self.safety();
+                self.feed_findings(fed);
             }
             Payload::Event(ev) => {
                 self.stats.events += 1;
@@ -1048,13 +1056,23 @@ impl<'a> Daemon<'a> {
             );
             let safety = self.safety();
             let now = self.clock.now();
+            // Socket-source findings have no IP (a local gateway).
+            let from_bus = !f.src_ip.is_empty();
             let subject = Subject {
-                src_ip: Some(f.src_ip.clone()),
+                src_ip: from_bus.then(|| f.src_ip.clone()),
                 topic: Some(f.topic.clone()),
-                participant_guid: f.writer.get(..24).map(str::to_string),
+                participant_guid: if from_bus {
+                    f.writer.get(..24).map(str::to_string)
+                } else {
+                    None
+                },
                 ..Subject::default()
             };
-            let source = format!("src:{}", f.src_ip);
+            let source = if from_bus {
+                format!("src:{}", f.src_ip)
+            } else {
+                "agentd:safety_socket".to_string()
+            };
             let o = self.agent.handle_external(
                 now,
                 Detector::Sensor,
@@ -1120,12 +1138,33 @@ impl<'a> Daemon<'a> {
             sig = sig.with_evidence_ref(r.uri(&self.r.config.robot.id));
         }
         let found = match self.correlator.as_mut() {
-            Some(c) => c.observe(&sig),
+            Some(c) => {
+                let mut f = c.observe(&sig);
+                // Eviction notices (observe-only) are reported like findings.
+                f.extend(c.take_notices());
+                f
+            }
             None => Vec::new(),
         };
         for f in found {
             self.correlated(f);
         }
+    }
+
+    /// Tell the correlator which entities are the robot's own (profiled
+    /// participants, IPs bound or pinned to them): their pending state is
+    /// best protected from eviction.
+    fn correlation_known(&mut self) {
+        let Some(c) = self.correlator.as_mut() else {
+            return;
+        };
+        let participants = self.pipeline.profile().participants.clone();
+        c.set_known_entities(EntityKind::Participant, participants);
+        let ips = self
+            .pipeline
+            .binding()
+            .profiled_ips(std::time::Instant::now());
+        c.set_known_entities(EntityKind::Ip, ips.iter().map(|ip| ip.to_string()));
     }
 
     /// A correlated finding: the full record (every contributing signal)
@@ -1231,6 +1270,7 @@ impl<'a> Daemon<'a> {
     /// counters).
     fn correlation_tick(&mut self) {
         let now_ns = self.clock.now().mono_ns;
+        self.correlation_known();
         let Some(c) = self.correlator.as_mut() else {
             return;
         };

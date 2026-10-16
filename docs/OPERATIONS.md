@@ -658,9 +658,23 @@ user DATA (`std_msgs/Bool`, `UInt8`, `String` mapped to states;
 fast), and/or a `0600` unix socket of JSON lines from a safety-PLC gateway
 (`{"state":"estop_active"}`; put it under `/run/robodr-agentd/`, the
 gateway must run as `robodr`). A stale source reads `unknown`; disagreeing
-sources resolve to the most conservative state. Samples from writers the
-locked profile does not vouch for are ignored and raise
-`robot.safety_state.untrusted_source` (High). Leave `context.safety_state`
+sources resolve to the most conservative state. Every topic source must
+list its commissioned `writers` (GUID prefixes or writer GUIDs; the
+configuration is refused without them). A sample is used only if its
+writer is profiled, in that list, and arrived from an IP bound to its
+participant (SPDP seen since start-up, or pinned in
+`sensor.binding.participant_ips`); anything else is ignored and raises
+`robot.safety_state.untrusted_source` (High). Pin the safety writers'
+participants: after a restart an unpinned source reads `unknown` until its
+participant's next SPDP, and a profiled prefix announced from two hosts
+becomes *contested* (Critical `robot.ros2.participant_source_mismatch`):
+no source is trusted for it until it is pinned. More fresh writers (or
+socket connections) than a source keeps raise
+`robot.safety_state.writer_overflow` (High) and read `unknown`; a more
+conservative reading is never evicted for a less conservative one. Each
+socket connection is a separate writer (redundant gateways combine
+most-conservative). Odometry sources treat turning on the spot as moving
+(`angular_moving_above`, default 0.1 rad/s). Leave `context.safety_state`
 at `unknown` when a feed is configured (the configuration is refused
 otherwise). Every change of the combined state is a
 `robodr.safety_state_transition` note in the black box; `status.json`
@@ -681,7 +695,10 @@ not tuned on fleet data: run the first field period observe-only. Host
 (Pulsar) detections do not reach agentd yet, so rules that need them do not
 fire. `robot.agent.correlation_pressure` (observe-only) means the engine had
 to evict pending state: many fresh source addresses or participants within
-a window.
+a window. Pending state of the robot's own entities (profiled participants,
+IPs bound or pinned to them) and of High / Critical first steps is
+protected from such floods; when evidence is evicted anyway, the
+observe-only `robot.correlate.correlation_state_evicted` names the rule.
 
 **Finding signatures (`finding_signing`, optional).** Signs every finding
 with a dedicated Ed25519 key (contract §2a); the signature is the spooled

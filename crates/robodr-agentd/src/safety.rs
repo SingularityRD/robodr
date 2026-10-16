@@ -21,12 +21,23 @@
 //!   * `std_msgs/msg/String`: `values` maps exact strings (at most
 //!     [`MAX_VALUE_KEY_LEN`] bytes, compared as bytes) to claims;
 //!   * `nav_msgs/msg/Odometry`: `motion` thresholds derive `idle` /
-//!     `moving_slow` / `moving_fast` from `‖twist.linear‖` (and optionally
-//!     `|twist.angular|`) with hysteresis ([`next_level`]).
+//!     `moving_slow` / `moving_fast` from `‖twist.linear‖` and
+//!     `‖twist.angular‖` with hysteresis ([`next_level`]). Turning on the
+//!     spot is moving: `angular_moving_above` defaults to
+//!     [`DEFAULT_ANGULAR_MOVING_ABOVE`] rad/s, it cannot be switched off.
 //! * **A unix socket** (`safety_feed.socket`): JSON lines
 //!   `{"state":"estop_active"}` from a local safety-PLC gateway. The socket
 //!   is created mode 0600 (only the daemon's user and root can connect),
-//!   like the event socket.
+//!   like the event socket. Every connection is its own writer
+//!   ([`SafetyFeed::observe_report_from`]): redundant gateways are combined
+//!   most-conservative like topic writers, each with its own staleness, so
+//!   a fresh `estop_active` from one connection is never overwritten by
+//!   `idle` from another. A closed connection's last report counts until it
+//!   goes stale.
+//!
+//! Readings are stamped with the time the daemon **received** them (when
+//! the input thread queued the message), not when the main loop got to
+//! them, so queue lag cannot make a reading look fresher than it is.
 //!
 //! A claim is a [`SafetyState`] or `none` ("this value says nothing", e.g.
 //! e-stop released). A value that the mapping does not list is **not**
@@ -41,7 +52,8 @@
 //!    source's `stale_after_ms`. A source with no fresh reading claims
 //!    **`unknown`** (a silent, latched-only or dead publisher is not
 //!    "fine"); a source whose writers disagree claims the most
-//!    conservative of them;
+//!    conservative of them; a source whose writer table overflowed within
+//!    the last `stale_after_ms` claims at least `unknown` (below);
 //! 2. over all sources: the most conservative claim; `none` claims are
 //!    skipped; if nothing claims a state, the result is `unknown`.
 //!
@@ -74,11 +86,33 @@
 //!   type;
 //! * the writer's participant (GUID prefix) is in `profile.participants` and
 //!   the topic is in `profile.writer_topics`;
-//! * if the source lists `writers` (GUID prefixes or full GUIDs), the writer
-//!   matches one;
-//! * the datagram's source IP is not outside the participant's binding
+//! * the writer matches the source's **`writers`** allowlist (GUID prefixes
+//!   or full GUIDs). It is **mandatory**: the commissioning names which
+//!   participant(s) publish each safety topic. (The profile only says that
+//!   *some* profiled writer may publish a topic, not which participant;
+//!   without the allowlist any profiled node, e.g. a perception node, could
+//!   claim the robot idle. Once the profile binds writer topics to
+//!   participants, the allowlist can default to that binding.)
+//! * the datagram's source IP **is bound** to the participant
 //!   (`robodr-ros2-pipeline`'s binding table, which the pipeline updated
-//!   from the same datagram just before).
+//!   from the same datagram just before: SPDP source / advertised locator,
+//!   or a `participant_ips` pin). A participant with no binding yet (its
+//!   SPDP not seen since the daemon started), a source IP that does not
+//!   parse, and a **contested** prefix (claimed by SPDP from two hosts, see
+//!   the binding module) are all untrusted.
+//!
+//! # Bounded writer tables
+//!
+//! A source keeps the latest claim of at most [`MAX_WRITERS_PER_SOURCE`]
+//! writers. When a new writer arrives and the table is full, a **stale**
+//! reading is evicted first (oldest first). If every reading is fresh, the
+//! table has **overflowed** ([`rules::WRITER_OVERFLOW`], High): the least
+//! conservative fresh reading (`none` < `idle` < ... < `estop_active`,
+//! oldest first) is evicted only if the newcomer's claim is at least as
+//! conservative, otherwise the newcomer is dropped, so an overflow can never
+//! replace a more conservative fresh claim by a less conservative one. And
+//! for `stale_after_ms` after an overflow the source claims at least
+//! `unknown`.
 //!
 //! A writer that was never announced cannot be attributed to a topic at
 //! all: its samples are not decoded (the pipeline reports unknown
@@ -111,9 +145,13 @@
 //!   RMW, a real safety PLC or real e-stop hardware.
 //! * Only the safety state is live; the rest of the operational context
 //!   (control mode, mission phase, connectivity) is still configuration.
+//! * A topic source trusts nothing until its writer's participant has sent
+//!   SPDP since the daemon started (or is pinned): after a restart, sources
+//!   read `unknown` for up to one SPDP period. Pin the safety writers'
+//!   participants (`participant_ips`) to avoid that window and to make a
+//!   contested prefix trusted again.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::net::IpAddr;
 use std::path::PathBuf;
 
 use robodr_cdr::{decode_payload, decode_std, Limits, MessageKind, MotionMessage, StdKind};
@@ -122,6 +160,7 @@ use robodr_events::graph::{demangle, RosNameKind};
 use robodr_events::profile::Profile;
 use robodr_events::{Deviation, Severity};
 use robodr_responder::SafetyState;
+use robodr_ros2_pipeline::binding::parse_src_ip;
 use robodr_ros2_pipeline::{sanitize, BindingTable, Datagram};
 use robodr_rtps::{
     hex12, hex_guid, EndpointKind, FragmentReassembler, Guid, PayloadKind, ReassemblyLimits,
@@ -141,6 +180,9 @@ pub mod rules {
     /// A trusted writer sent a value the mapping does not list: its claim
     /// becomes `unknown`. Low.
     pub const UNMAPPED_VALUE: &str = "robot.safety_state.unmapped_value";
+    /// More fresh writers (or socket connections) than a source keeps: the
+    /// source claims at least `unknown` for `stale_after_ms`. High.
+    pub const WRITER_OVERFLOW: &str = "robot.safety_state.writer_overflow";
 }
 
 /// Default `stale_after_ms` of every source.
@@ -156,8 +198,12 @@ pub const MAX_VALUES: usize = 64;
 pub const MAX_VALUE_KEY_LEN: usize = 64;
 /// Most entries of one `writers` allowlist.
 pub const MAX_ALLOWED_WRITERS: usize = 64;
-/// Writers whose latest claim is kept per source (least recent evicted).
+/// Writers whose latest claim is kept per source (see the module docs,
+/// "Bounded writer tables").
 pub const MAX_WRITERS_PER_SOURCE: usize = 8;
+/// Default `motion.angular_moving_above` (rad/s): turning on the spot
+/// faster than this is moving.
+pub const DEFAULT_ANGULAR_MOVING_ABOVE: f64 = 0.1;
 /// SEDP writers on safety topics remembered (least recent evicted).
 pub const MAX_KNOWN_WRITERS: usize = 256;
 /// Distinct (topic, type) readings kept per writer.
@@ -166,8 +212,6 @@ const MAX_READINGS_PER_WRITER: usize = 4;
 const MAX_REPORTED: usize = 1024;
 /// Most connections on the safety socket.
 pub const MAX_SOCKET_CONNECTIONS: usize = 8;
-/// Writer key of the socket source.
-const SOCKET_WRITER: &str = "socket";
 
 // ------------------------------------------------------------------ claims --
 
@@ -278,8 +322,8 @@ pub struct TopicSourceSection {
     /// Speed thresholds (`Odometry`).
     #[serde(default)]
     pub motion: Option<MotionThresholds>,
-    /// Optional allowlist: GUID prefixes (24 hex) or full writer GUIDs (32
-    /// hex). Empty = every profiled writer on the topic.
+    /// The commissioned writers of this topic: GUID prefixes (24 hex) or
+    /// full writer GUIDs (32 hex). Required (non-empty).
     #[serde(default)]
     pub writers: Vec<String>,
     #[serde(default)]
@@ -296,8 +340,9 @@ pub struct MotionThresholds {
     #[serde(default)]
     pub fast_above: Option<f64>,
     /// `‖angular‖` above this (rad/s) = moving (turning on the spot).
-    #[serde(default)]
-    pub angular_moving_above: Option<f64>,
+    /// Default [`DEFAULT_ANGULAR_MOVING_ABOVE`].
+    #[serde(default = "default_angular")]
+    pub angular_moving_above: f64,
     /// A level is left only once the value falls this far below the
     /// threshold that entered it (same units as the threshold).
     #[serde(default = "default_hysteresis")]
@@ -306,6 +351,10 @@ pub struct MotionThresholds {
 
 fn default_hysteresis() -> f64 {
     0.02
+}
+
+fn default_angular() -> f64 {
+    DEFAULT_ANGULAR_MOVING_ABOVE
 }
 
 /// The safety-PLC gateway socket.
@@ -361,7 +410,9 @@ impl Decoder {
 pub struct TopicSpec {
     pub topic: String,
     pub decoder: Decoder,
-    /// Lower-case hex prefixes / GUIDs; empty = no allowlist.
+    /// Lower-case hex prefixes / GUIDs of the commissioned writers
+    /// (non-empty after [`SafetyFeedSection::resolve`]; an empty set trusts
+    /// no writer).
     pub writers: BTreeSet<String>,
     pub stale_after_ms: u64,
 }
@@ -435,12 +486,8 @@ fn check_motion(what: &str, m: &MotionThresholds) -> Result<(), String> {
             ));
         }
     }
-    if let Some(a) = m.angular_moving_above {
-        pos("angular_moving_above", a)?;
-    }
-    let min_threshold = m
-        .angular_moving_above
-        .map_or(m.moving_above, |a| a.min(m.moving_above));
+    pos("angular_moving_above", m.angular_moving_above)?;
+    let min_threshold = m.angular_moving_above.min(m.moving_above);
     if !(m.hysteresis.is_finite() && m.hysteresis >= 0.0 && m.hysteresis < min_threshold) {
         return Err(format!(
             "{what}.motion.hysteresis must be finite, >= 0 and below every threshold"
@@ -557,6 +604,14 @@ impl SafetyFeedSection {
                     "{what}.writers: at most {MAX_ALLOWED_WRITERS} entries"
                 ));
             }
+            if t.writers.is_empty() {
+                return Err(format!(
+                    "{what}.writers: name the commissioned writer(s) of {} (GUID prefixes or \
+                     writer GUIDs); without them any profiled participant could set the safety \
+                     state",
+                    t.topic
+                ));
+            }
             let mut writers = BTreeSet::new();
             for w in &t.writers {
                 let w = w.to_ascii_lowercase();
@@ -564,6 +619,13 @@ impl SafetyFeedSection {
                     return Err(format!(
                         "{what}.writers: {:?} is not a GUID prefix (24 hex) or a GUID (32 hex)",
                         sanitize(&w)
+                    ));
+                }
+                if !profile.participants.contains(&w[..24]) {
+                    warnings.push(format!(
+                        "{what}.writers: {} is not a participant of the profile: its samples \
+                         will be ignored as unprofiled",
+                        &w[..24]
                     ));
                 }
                 writers.insert(w);
@@ -644,8 +706,12 @@ pub fn next_level(prev: Level, speed: f64, angular: f64, t: &MotionThresholds) -
     let h = t.hysteresis;
     let fast_on = t.fast_above.is_some_and(|f| speed > f);
     let fast_hold = t.fast_above.is_some_and(|f| speed > f - h);
-    let ang_on = t.angular_moving_above.is_some_and(|a| angular > a);
-    let ang_hold = t.angular_moving_above.is_some_and(|a| angular > a - h);
+    // A non-finite or non-positive configured threshold (only possible
+    // when built without `resolve`) counts any rotation as moving.
+    let a = t.angular_moving_above;
+    let a = if a.is_finite() && a > 0.0 { a } else { 0.0 };
+    let ang_on = angular > a;
+    let ang_hold = angular > a - h;
     let slow_on = speed > t.moving_above || ang_on;
     let slow_hold = speed > t.moving_above - h || ang_hold;
     match prev {
@@ -666,12 +732,32 @@ struct Reading {
     level: Level,
 }
 
+/// Eviction rank of a claim: `none` lowest, then [`conservativeness`].
+fn rank(c: Claim) -> u8 {
+    match c {
+        Claim::None => 0,
+        Claim::State(s) => 1 + conservativeness(s),
+    }
+}
+
+/// What [`Source::set`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetOutcome {
+    Stored,
+    /// The table was full of fresh readings (module docs, "Bounded writer
+    /// tables"); the source claims at least `unknown` for a while.
+    Overflow,
+}
+
 #[derive(Debug)]
 struct Source {
     name: String,
     stale_after_ms: u64,
     readings: BTreeMap<String, Reading>,
     evicted: u64,
+    /// Time of the last overflow, if any.
+    overflow_at: Option<u64>,
+    overflows: u64,
 }
 
 impl Source {
@@ -681,6 +767,8 @@ impl Source {
             stale_after_ms,
             readings: BTreeMap::new(),
             evicted: 0,
+            overflow_at: None,
+            overflows: 0,
         }
     }
 
@@ -688,8 +776,15 @@ impl Source {
         now_ms.saturating_sub(r.at_ms) <= self.stale_after_ms
     }
 
+    /// Overflowed within the last `stale_after_ms`.
+    fn overflowing(&self, now_ms: u64) -> bool {
+        self.overflow_at
+            .is_some_and(|t| now_ms.saturating_sub(t) <= self.stale_after_ms)
+    }
+
     /// The source's claim: `unknown` without a fresh reading, else the most
-    /// conservative fresh state claim (`none` if every fresh one is none).
+    /// conservative fresh state claim (`none` if every fresh one is none),
+    /// and at least `unknown` while overflowing.
     fn claim(&self, now_ms: u64) -> Claim {
         let fresh: Vec<&Reading> = self
             .readings
@@ -699,35 +794,63 @@ impl Source {
         if fresh.is_empty() {
             return Claim::State(SafetyState::Unknown);
         }
-        match most_conservative(fresh.iter().filter_map(|r| match r.claim {
-            Claim::State(s) => Some(s),
-            Claim::None => None,
-        })) {
+        let overflow = self.overflowing(now_ms).then_some(SafetyState::Unknown);
+        match most_conservative(
+            fresh
+                .iter()
+                .filter_map(|r| match r.claim {
+                    Claim::State(s) => Some(s),
+                    Claim::None => None,
+                })
+                .chain(overflow),
+        ) {
             Some(s) => Claim::State(s),
             None => Claim::None,
         }
     }
 
-    fn set(&mut self, writer: &str, claim: Claim, level: Level, now_ms: u64) {
-        if !self.readings.contains_key(writer) && self.readings.len() >= MAX_WRITERS_PER_SOURCE {
-            let oldest = self
-                .readings
-                .iter()
-                .min_by_key(|(_, r)| r.at_ms)
-                .map(|(k, _)| k.clone());
-            if let Some(k) = oldest {
+    /// Record `writer`'s latest claim. See the module docs ("Bounded writer
+    /// tables") for what happens when the table is full.
+    fn set(&mut self, writer: &str, claim: Claim, level: Level, now_ms: u64) -> SetOutcome {
+        let reading = Reading {
+            claim,
+            at_ms: now_ms,
+            level,
+        };
+        if self.readings.contains_key(writer) || self.readings.len() < MAX_WRITERS_PER_SOURCE {
+            self.readings.insert(writer.to_string(), reading);
+            return SetOutcome::Stored;
+        }
+        // Stale first (oldest first): it no longer counts anyway.
+        let stale = self
+            .readings
+            .iter()
+            .filter(|(_, r)| !self.fresh(r, now_ms))
+            .min_by_key(|(k, r)| (r.at_ms, (*k).clone()))
+            .map(|(k, _)| k.clone());
+        if let Some(k) = stale {
+            self.readings.remove(&k);
+            self.evicted += 1;
+            self.readings.insert(writer.to_string(), reading);
+            return SetOutcome::Stored;
+        }
+        // Every reading is fresh: overflow. Never trade a more conservative
+        // fresh claim for a less conservative one.
+        self.overflow_at = Some(now_ms);
+        self.overflows += 1;
+        let victim = self
+            .readings
+            .iter()
+            .min_by_key(|(k, r)| (rank(r.claim), r.at_ms, (*k).clone()))
+            .map(|(k, r)| (k.clone(), r.claim));
+        if let Some((k, c)) = victim {
+            if rank(claim) >= rank(c) {
                 self.readings.remove(&k);
                 self.evicted += 1;
+                self.readings.insert(writer.to_string(), reading);
             }
         }
-        self.readings.insert(
-            writer.to_string(),
-            Reading {
-                claim,
-                at_ms: now_ms,
-                level,
-            },
-        );
+        SetOutcome::Overflow
     }
 }
 
@@ -742,6 +865,9 @@ pub struct SourceView {
     /// Age of the newest reading, if any.
     pub age_ms: Option<u64>,
     pub writers: usize,
+    /// The writer table overflowed within `stale_after_ms` (the source
+    /// claims at least `unknown`).
+    pub overflow: bool,
 }
 
 /// A change of the combined state (black-box note).
@@ -773,6 +899,8 @@ pub struct FeedStats {
     pub transitions: u64,
     pub writers_known: u64,
     pub writers_evicted: u64,
+    /// Writer-table overflows over all sources (module docs).
+    pub source_overflows: u64,
 }
 
 /// The feed's current view (status file).
@@ -927,6 +1055,7 @@ impl SafetyFeed {
         let mut s = self.stats;
         s.writers_known = self.tap.writers.len() as u64;
         s.writers_evicted = self.tap.evicted;
+        s.source_overflows = self.sources.iter().map(|x| x.overflows).sum();
         s
     }
 
@@ -943,6 +1072,7 @@ impl SafetyFeed {
                     .map(|r| now_ms.saturating_sub(r.at_ms))
                     .min(),
                 writers: s.readings.len(),
+                overflow: s.overflowing(now_ms),
             })
             .collect()
     }
@@ -1003,21 +1133,64 @@ impl SafetyFeed {
         })
     }
 
-    /// A report from the safety socket.
-    pub fn observe_report(&mut self, report: SafetyReport, now_ms: u64) {
+    /// A report from the safety socket, as if from connection 0 (a single
+    /// gateway). See [`SafetyFeed::observe_report_from`].
+    pub fn observe_report(&mut self, report: SafetyReport, now_ms: u64) -> Vec<FeedFinding> {
+        self.observe_report_from(0, report, now_ms)
+    }
+
+    /// A report from safety-socket connection `conn` (an id unique per
+    /// accepted connection for the daemon's lifetime), received at `now_ms`.
+    /// Each connection is its own writer: fresh connections are combined
+    /// most-conservative, each goes stale on its own.
+    pub fn observe_report_from(
+        &mut self,
+        conn: u64,
+        report: SafetyReport,
+        now_ms: u64,
+    ) -> Vec<FeedFinding> {
+        let mut out = Vec::new();
         self.stats.socket_reports += 1;
         if self.spec.socket.is_none() {
-            return;
+            return out;
         }
-        if let Some(src) = self.sources.last_mut() {
-            src.set(
-                SOCKET_WRITER,
-                Claim::State(report.state),
-                Level::Idle,
-                now_ms,
-            );
-            self.stats.applied += 1;
+        let Some(idx) = self.sources.len().checked_sub(1) else {
+            return out;
+        };
+        let writer = format!("conn:{conn}");
+        let outcome =
+            self.sources[idx].set(&writer, Claim::State(report.state), Level::Idle, now_ms);
+        self.stats.applied += 1;
+        if outcome == SetOutcome::Overflow {
+            self.overflow_finding(&mut out, idx, "", &writer);
         }
+        out
+    }
+
+    fn overflow_finding(
+        &mut self,
+        out: &mut Vec<FeedFinding>,
+        idx: usize,
+        src_ip: &str,
+        writer: &str,
+    ) {
+        let (source, stale) = match self.sources.get(idx) {
+            Some(s) => (s.name.clone(), s.stale_after_ms),
+            None => return,
+        };
+        let dev = Deviation::new(
+            rules::WRITER_OVERFLOW,
+            Severity::High,
+            format!(
+                "safety-state source {} has more than {MAX_WRITERS_PER_SOURCE} fresh writers \
+                 (latest: {}); no more conservative reading was dropped, and the source reads \
+                 at least unknown for {stale} ms",
+                short(&source),
+                short(writer)
+            ),
+        );
+        let key = format!("o|{source}");
+        self.finding(out, key, dev, src_ip, &source, writer);
     }
 
     fn finding(
@@ -1076,21 +1249,29 @@ impl SafetyFeed {
         if !profile.writer_topics.contains(&spec.topic) {
             return Some("the profile does not allow writers on this topic".into());
         }
-        if !spec.writers.is_empty()
-            && !spec.writers.contains(&prefix_hex)
-            && !spec.writers.contains(&hex_guid(guid))
-        {
+        if !spec.writers.contains(&prefix_hex) && !spec.writers.contains(&hex_guid(guid)) {
             return Some("it is not in the safety_feed writers allowlist".into());
         }
-        if let Ok(ip) = datagram.src_ip.parse::<IpAddr>() {
-            if binding.allows_from(&prefix, ip, datagram.ingress) == Some(false) {
-                return Some(format!(
-                    "it arrived from {}, an IP not bound to its participant",
-                    short(&datagram.src_ip)
-                ));
+        let Some(ip) = parse_src_ip(&datagram.src_ip) else {
+            return Some("its datagram's source IP could not be parsed".into());
+        };
+        if binding.is_contested(&prefix) {
+            return Some(
+                "its participant's GUID prefix is contested (announced from more than one host; \
+                 pin it in participant_ips)"
+                    .into(),
+            );
+        }
+        match binding.allows_from(&prefix, ip, datagram.ingress) {
+            Some(true) => None,
+            Some(false) => Some(format!(
+                "it arrived from {}, an IP not bound to its participant",
+                short(&datagram.src_ip)
+            )),
+            None => {
+                Some("its participant has no binding yet (no SPDP seen from it, not pinned)".into())
             }
         }
-        None
     }
 
     /// Learn this datagram's SEDP and apply its samples on safety topics.
@@ -1219,8 +1400,11 @@ impl SafetyFeed {
                         (Claim::State(SafetyState::Unknown), prev)
                     }
                 };
-                self.sources[idx].set(&writer, claim, level, now_ms);
+                let outcome = self.sources[idx].set(&writer, claim, level, now_ms);
                 self.stats.applied += 1;
+                if outcome == SetOutcome::Overflow {
+                    self.overflow_finding(&mut out, idx, &datagram.src_ip, &writer);
+                }
             }
         }
         out
@@ -1290,7 +1474,7 @@ mod tests {
         MotionThresholds {
             moving_above: 0.05,
             fast_above: Some(1.0),
-            angular_moving_above: Some(0.1),
+            angular_moving_above: 0.1,
             hysteresis: 0.02,
         }
     }
@@ -1457,18 +1641,138 @@ mod tests {
         assert_eq!(f.sources[0].readings.len(), MAX_WRITERS_PER_SOURCE);
         assert!(f.sources[0].readings.contains_key("w49"));
         assert!(!f.sources[0].readings.contains_key("w0"));
+        // All of them fresh: an overflow, so the source reads unknown.
+        assert_eq!(f.sources[0].claim(49), Claim::State(SafetyState::Unknown));
     }
+
+    /// Finding 1: a full writer table never drops a more conservative fresh
+    /// reading for a less conservative one; stale readings go first; an
+    /// overflow reads unknown for one stale period.
+    #[test]
+    fn eviction_keeps_the_most_conservative_fresh_reading() {
+        let estop = Claim::State(SafetyState::EStopActive);
+        let idle = Claim::State(SafetyState::Idle);
+        let mut src = Source::new("/estop".into(), 100);
+        assert_eq!(src.set("legit", estop, Level::Idle, 0), SetOutcome::Stored);
+        for i in 1..MAX_WRITERS_PER_SOURCE {
+            assert_eq!(
+                src.set(&format!("n{i}"), Claim::None, Level::Idle, 10),
+                SetOutcome::Stored
+            );
+        }
+        assert_eq!(src.claim(10), estop);
+        // Full of fresh readings: newcomers claiming less never displace the
+        // e-stop; "none"s are traded for each other.
+        for i in 0..20 {
+            let c = if i % 2 == 0 { Claim::None } else { idle };
+            assert_eq!(
+                src.set(&format!("x{i}"), c, Level::Idle, 20),
+                SetOutcome::Overflow
+            );
+            assert_eq!(src.readings["legit"].claim, estop);
+            assert_eq!(src.claim(20), estop);
+        }
+        assert_eq!(src.readings.len(), MAX_WRITERS_PER_SOURCE);
+        assert_eq!(src.overflows, 20);
+        // An unknown newcomer may displace an idle one, never the e-stop.
+        let unknown = Claim::State(SafetyState::Unknown);
+        assert_eq!(src.set("u", unknown, Level::Idle, 30), SetOutcome::Overflow);
+        assert!(src.readings.contains_key("u"));
+        assert_eq!(src.readings["legit"].claim, estop);
+        // A more conservative newcomer than everything else is never lost.
+        let mut src2 = Source::new("/m".into(), 100);
+        for i in 0..MAX_WRITERS_PER_SOURCE {
+            src2.set(&format!("i{i}"), idle, Level::Idle, 0);
+        }
+        assert_eq!(src2.set("s", estop, Level::Idle, 1), SetOutcome::Overflow);
+        assert_eq!(src2.readings["s"].claim, estop);
+        assert_eq!(src2.claim(1), estop);
+        // Overflow alone (no e-stop): at least unknown while it is fresh,
+        // then back to the readings once the overflow is stale.
+        let mut src3 = Source::new("/m".into(), 100);
+        for i in 0..=MAX_WRITERS_PER_SOURCE {
+            src3.set(&format!("i{i}"), idle, Level::Idle, i as u64);
+        }
+        assert_eq!(src3.claim(50), Claim::State(SafetyState::Unknown));
+        src3.set("i1", idle, Level::Idle, 150);
+        src3.set("i2", idle, Level::Idle, 150);
+        assert_eq!(src3.claim(108), Claim::State(SafetyState::Unknown));
+        assert_eq!(src3.claim(109), idle);
+        // Stale readings are evicted first, without an overflow.
+        let mut src4 = Source::new("/m".into(), 100);
+        src4.set("old", estop, Level::Idle, 0);
+        for i in 1..MAX_WRITERS_PER_SOURCE {
+            src4.set(&format!("i{i}"), idle, Level::Idle, 150);
+        }
+        assert_eq!(src4.set("new", idle, Level::Idle, 200), SetOutcome::Stored);
+        assert!(!src4.readings.contains_key("old"));
+        assert_eq!(src4.overflows, 0);
+        assert_eq!(src4.claim(200), idle);
+    }
+
+    /// Finding 3: socket connections are separate writers, combined most
+    /// conservatively, each with its own staleness.
+    #[test]
+    fn socket_connections_are_combined_most_conservative() {
+        let mut f = SafetyFeed::new(FeedSpec {
+            topics: Vec::new(),
+            socket: Some(SocketSpec {
+                path: "/run/x.sock".into(),
+                max_connections: 2,
+                stale_after_ms: 100,
+            }),
+        });
+        let r = |state| SafetyReport { state };
+        assert!(f
+            .observe_report_from(1, r(SafetyState::EStopActive), 0)
+            .is_empty());
+        f.observe_report_from(2, r(SafetyState::Idle), 1);
+        f.evaluate(1);
+        assert_eq!(f.state(), SafetyState::EStopActive);
+        // Connection 1 goes silent: its claim ages out on its own.
+        f.observe_report_from(2, r(SafetyState::Idle), 101);
+        f.evaluate(101);
+        assert_eq!(f.state(), SafetyState::Idle);
+        // Many short-lived connections: an overflow is reported once and the
+        // source reads at least unknown.
+        let mut found = Vec::new();
+        for c in 3..30 {
+            found.extend(f.observe_report_from(c, r(SafetyState::Idle), 110));
+        }
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].deviation.rule_str(), rules::WRITER_OVERFLOW);
+        assert_eq!(found[0].src_ip, "");
+        f.evaluate(110);
+        assert_eq!(f.state(), SafetyState::Unknown);
+        assert!(f.status(110).sources[0].overflow);
+        assert!(f.stats().source_overflows > 0);
+    }
+
+    const W: &str = "aaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn section(v: serde_json::Value) -> Result<(FeedSpec, Vec<String>), String> {
         let s: SafetyFeedSection = serde_json::from_value(v).map_err(|e| e.to_string())?;
         let mut p = Profile::default();
         p.writer_topics.insert("/estop".into());
+        p.participants.insert(W.into());
         s.resolve(&p)
+    }
+
+    /// `v` with `writers: [W]` on every topic that has none.
+    fn with_writers(mut v: serde_json::Value) -> serde_json::Value {
+        if let Some(ts) = v.get_mut("topics").and_then(|t| t.as_array_mut()) {
+            for t in ts {
+                if t.get("writers").is_none() {
+                    t["writers"] = serde_json::json!([W]);
+                }
+            }
+        }
+        v
     }
 
     #[test]
     fn config_validation() {
-        let (spec, w) = section(serde_json::json!({
+        let (spec, w) = section(with_writers(serde_json::json!({
             "topics": [
                 {"topic": "/estop", "type": "std_msgs/msg/Bool",
                  "values": {"true": "estop_active", "false": "none"},
@@ -1482,7 +1786,7 @@ mod tests {
                  "motion": {"moving_above": 0.05, "fast_above": 1.0}}
             ],
             "socket": {"path": "/run/robodr/safety.sock"}
-        }))
+        })))
         .unwrap();
         assert_eq!(spec.topics.len(), 4);
         assert_eq!(
@@ -1498,6 +1802,29 @@ mod tests {
         assert_eq!(spec.socket.as_ref().unwrap().max_connections, 2);
         // Three topics are not profiled writer topics.
         assert_eq!(w.len(), 3, "{w:?}");
+        // The angular threshold defaults; spinning in place is moving.
+        match &spec.topics[3].decoder {
+            Decoder::Odometry(m) => {
+                assert_eq!(m.angular_moving_above, DEFAULT_ANGULAR_MOVING_ABOVE);
+                assert_eq!(next_level(Level::Idle, 0.0, 2.0, m), Level::Slow);
+            }
+            d => panic!("{d:?}"),
+        }
+        // Writers are mandatory (finding 1); one outside the profile's
+        // participants is a warning.
+        let e = section(serde_json::json!({"topics": [{"topic": "/estop",
+            "type": "std_msgs/msg/Bool", "values": {"true": "estop_active", "false": "none"}}]}))
+        .unwrap_err();
+        assert!(e.contains("writers"), "{e}");
+        let (_, w) = section(serde_json::json!({"topics": [{"topic": "/estop",
+            "type": "std_msgs/msg/Bool", "values": {"true": "estop_active", "false": "none"},
+            "writers": ["bbbbbbbbbbbbbbbbbbbbbbbb00000103"]}]}))
+        .unwrap();
+        assert!(
+            w.iter()
+                .any(|w| w.contains("not a participant of the profile")),
+            "{w:?}"
+        );
 
         let bad = [
             serde_json::json!({}),
@@ -1522,6 +1849,14 @@ mod tests {
                 "motion": {"moving_above": 0.5, "fast_above": 0.4}}]}),
             serde_json::json!({"topics": [{"topic": "/odom", "type": "nav_msgs/msg/Odometry",
                 "motion": {"moving_above": 0.05, "hysteresis": 0.05}}]}),
+            serde_json::json!({"topics": [{"topic": "/odom", "type": "nav_msgs/msg/Odometry",
+                "motion": {"moving_above": 0.5, "angular_moving_above": 0.01}}]}),
+            serde_json::json!({"topics": [{"topic": "/odom", "type": "nav_msgs/msg/Odometry",
+                "motion": {"moving_above": 0.5, "angular_moving_above": 0.0}}]}),
+            serde_json::json!({"topics": [{"topic": "/odom", "type": "nav_msgs/msg/Odometry",
+                "motion": {"moving_above": 0.5, "angular_moving_above": null}}]}),
+            serde_json::json!({"topics": [{"topic": "/estop", "type": "std_msgs/msg/Bool",
+                "values": {"true": "estop_active", "false": "none"}, "writers": []}]}),
             serde_json::json!({"topics": [{"topic": "/s", "type": "std_msgs/msg/String",
                 "values": {"a\u{1b}": "idle"}}]}),
             serde_json::json!({"topics": [{"topic": "/estop", "type": "std_msgs/msg/Bool",
@@ -1543,7 +1878,9 @@ mod tests {
             serde_json::json!({"socket": {"path": "/a.sock"}, "stale_after_ms": 999999999}),
         ];
         for b in bad {
-            assert!(section(b.clone()).is_err(), "{b}");
+            // With writers added, each still fails for its own reason (an
+            // explicit "writers": [] stays empty).
+            assert!(section(with_writers(b.clone())).is_err(), "{b}");
         }
     }
 

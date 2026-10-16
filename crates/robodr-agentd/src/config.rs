@@ -18,7 +18,8 @@
 //!   "context":  { "safety_state": "unknown", "control": "autonomous" },
 //!   "safety_feed": { "stale_after_ms": 1000,
 //!                    "topics": [ { "topic": "/estop", "type": "std_msgs/msg/Bool",
-//!                                  "values": { "true": "estop_active", "false": "none" } } ] },
+//!                                  "values": { "true": "estop_active", "false": "none" },
+//!                                  "writers": [ "0110a2b3c4d5e6f701000000" ] } ] },
 //!   "firewall": { "max_angular": { "/cmd_vel": 1.0 } },
 //!   "daemon":   { "tick_ms": 1000, "heartbeat_ms": 10000, "silence_ms": 30000 }
 //! }
@@ -879,6 +880,13 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
                         .into(),
                 );
             }
+            if !spec.topics.is_empty() && !sensor.pipeline.binding.enabled {
+                w.push(
+                    "safety_feed.topics trust a sample only from an IP bound to its participant, \
+                     but sensor.binding is disabled: every topic source will stay unknown"
+                        .into(),
+                );
+            }
             warnings.append(&mut w);
             Some(spec)
         }
@@ -1549,6 +1557,7 @@ mod tests {
         for t in ["/estop", "/robot_mode", "/odom"] {
             p.writer_topics.insert(t.into());
         }
+        p.participants.insert("0110a2b3c4d5e6f701000000".into());
         let (feed, warnings) = c.safety_feed.unwrap().resolve(&p).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(feed.topics.len(), 3);

@@ -55,12 +55,16 @@
     "stale_after_ms": 1000,
     "topics": [
       { "topic": "/estop", "type": "std_msgs/msg/Bool",
-        "values": { "true": "estop_active", "false": "none" } },
+        "values": { "true": "estop_active", "false": "none" },
+        "writers": ["0110a2b3c4d5e6f701000000"] },
       { "topic": "/robot_mode", "type": "std_msgs/msg/UInt8",
         "values": { "0": "idle", "1": "moving_slow", "2": "moving_fast",
-                    "3": "collaborative_human_nearby", "4": "safe_state_active" } },
+                    "3": "collaborative_human_nearby", "4": "safe_state_active" },
+        "writers": ["0110a2b3c4d5e6f701000000"] },
       { "topic": "/odom", "type": "nav_msgs/msg/Odometry",
-        "motion": { "moving_above": 0.05, "fast_above": 1.0, "hysteresis": 0.02 } }
+        "motion": { "moving_above": 0.05, "fast_above": 1.0, "angular_moving_above": 0.1,
+                    "hysteresis": 0.02 },
+        "writers": ["0110a2b3c4d5e6f701000000"] }
     ],
     "socket": { "path": "/run/robodr/safety.sock", "max_connections": 2 }
   },

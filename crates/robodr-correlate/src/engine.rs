@@ -28,16 +28,40 @@
 //!
 //! # Eviction and fairness
 //!
-//! When a rule's group table is full and a signal needs a new group, the
-//! engine first drops expired state, then considers the group with the
-//! *least progress* (fewest held signals), least recently touched first.
-//! It is evicted only if its progress is at most 1, i.e. it holds no more
-//! evidence than the newcomer would. Otherwise the newcomer is refused
-//! ([`Stats::groups_refused`]). Consequence: an attacker flooding new
-//! entities (fresh GUIDs, spoofed IPs) churns only single-signal groups;
-//! a group that has already accumulated two or more signals can only be
-//! removed by expiry or by firing. Each eviction is counted
-//! ([`Stats::groups_evicted`]) so the flood itself is visible.
+//! Every group gets a **protection tier** when it is created:
+//!
+//! * **2, known**: its group entity is a *known* one, i.e. the integrator
+//!   registered it with [`Correlator::set_known_entities`] (agentd: the
+//!   profile's participants and the IPs bound to them);
+//! * **1, severe**: the signal that started it (step 0) is High or
+//!   Critical;
+//! * **0**: anything else (an unknown entity, Low / Medium).
+//!
+//! Tiers 1 and 2 are *protected*. Each rule reserves
+//! [`Limits::protected_reserve_pct`] percent of its table for protected
+//! groups: unprotected groups may hold at most the rest.
+//!
+//! When a signal needs a new group and the table (or, for an unprotected
+//! newcomer, the unprotected share) is full, the engine first drops expired
+//! state, then evicts the first group in the order (tier, progress, least
+//! recently touched) that holds at most one signal (no more evidence than
+//! the newcomer would) and whose tier is not above the newcomer's. So
+//! unknown-entity, low-severity groups go first, and an unprotected
+//! newcomer can never displace a protected group. Without such a victim
+//! the newcomer is refused ([`Stats::groups_refused`]). Consequence: a
+//! flood of fresh entities churns only single-signal groups of its own
+//! tier or below; a group that has accumulated two or more signals can
+//! only be removed by expiry or by firing.
+//!
+//! Evictions are counted globally ([`Stats::groups_evicted`]) and per rule
+//! ([`Correlator::evictions_of`]). Evicting a group that held evidence also
+//! queues an observe-only notice, `robot.correlate.correlation_state_evicted`
+//! ([`EVICTED_RULE_ID`], Medium), naming the rule and citing the evicted
+//! evidence, at most once per rule per rule window; the integrator collects
+//! notices with [`Correlator::take_notices`] and reports them like
+//! findings. (A flood of the *same* tier, e.g. High-severity mismatches from
+//! fresh spoofed IPs against a group whose entity is not known, can still
+//! evict it; the notice makes that visible instead of silent.)
 //!
 //! # Cooldown
 //!
@@ -54,7 +78,7 @@ use robodr_events::{Deviation, Mode, Severity};
 use serde::Serialize;
 
 use crate::rules::{Pattern, Rule, RuleSet, MAX_ID_LEN, RULE_ID_PREFIX};
-use crate::signal::{bounded_entities, truncate_in_place, Domain, Entity, Signal};
+use crate::signal::{bounded_entities, truncate_in_place, Domain, Entity, EntityKind, Signal};
 
 /// Engine-wide memory bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +89,10 @@ pub struct Limits {
     pub max_entities_per_signal: usize,
     /// Longest entity value / evidence ref kept, bytes.
     pub max_value_len: usize,
+    /// Percent (0..=100, larger is clamped) of each rule's group table that
+    /// unprotected groups cannot use (module docs, "Eviction and
+    /// fairness"). Always leaves at least one unprotected slot.
+    pub protected_reserve_pct: u8,
 }
 
 impl Default for Limits {
@@ -73,9 +101,25 @@ impl Default for Limits {
             max_groups_per_rule: 256,
             max_entities_per_signal: 8,
             max_value_len: 256,
+            protected_reserve_pct: 25,
         }
     }
 }
+
+impl Limits {
+    /// Slots of a rule's table reserved for protected groups.
+    pub fn protected_reserve(&self) -> usize {
+        let cap = self.max_groups_per_rule.max(1);
+        (cap * usize::from(self.protected_reserve_pct.min(100)) / 100).min(cap - 1)
+    }
+}
+
+/// Rule id of the eviction notice ([`Correlator::take_notices`]).
+pub const EVICTED_RULE_ID: &str = "robot.correlate.correlation_state_evicted";
+/// Most known entities per [`EntityKind`] ([`Correlator::set_known_entities`]).
+pub const MAX_KNOWN_ENTITIES: usize = 4096;
+/// Most notices queued between two [`Correlator::take_notices`] calls.
+pub const MAX_PENDING_NOTICES: usize = 64;
 
 /// Counters. All saturating.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -100,8 +144,16 @@ pub struct Stats {
     pub groups_expired: u64,
     /// Groups with pending state evicted to make room (LRU, lowest progress).
     pub groups_evicted: u64,
-    /// New groups refused because every live group held more evidence.
+    /// New groups refused because every live group held more evidence (or
+    /// was better protected).
     pub groups_refused: u64,
+    /// Eviction notices queued ([`Correlator::take_notices`]).
+    pub eviction_notices: u64,
+    /// Eviction notices not queued: rate limit (one per rule per window)
+    /// or a full queue.
+    pub eviction_notices_suppressed: u64,
+    /// Known-entity values beyond [`MAX_KNOWN_ENTITIES`], ignored.
+    pub known_entities_dropped: u64,
     /// Matching signals ignored because the group was in cooldown.
     pub suppressed_cooldown: u64,
 }
@@ -190,6 +242,22 @@ impl GroupState {
         }
     }
 
+    /// Every held contribution, by `seq`, without duplicates.
+    fn contributions(&self) -> Vec<Arc<Contribution>> {
+        let mut all: Vec<Arc<Contribution>> = match self {
+            GroupState::Seq(ps) => ps
+                .iter()
+                .flatten()
+                .flat_map(|p| p.contribs.iter().cloned())
+                .collect(),
+            GroupState::Slots(ss) => ss.iter().flat_map(|s| s.iter().cloned()).collect(),
+            GroupState::Distinct(m) => m.values().cloned().collect(),
+        };
+        all.sort_by_key(|c| c.seq);
+        all.dedup_by_key(|c| c.seq);
+        all
+    }
+
     /// Drop everything older than `window` before `now`.
     fn expire(&mut self, now: u64, window: u64) {
         let live = |t: u64| now.saturating_sub(t) <= window;
@@ -226,6 +294,8 @@ struct Group {
     state: GroupState,
     cooldown_until: Option<u64>,
     touch: u64,
+    /// Protection tier (module docs): 0 unprotected, 1 severe, 2 known.
+    tier: u8,
     /// `(progress, touch)` as currently stored in the rule's index.
     indexed: (usize, u64),
 }
@@ -246,28 +316,55 @@ impl Group {
 #[derive(Debug, Clone, Default)]
 struct RuleState {
     groups: BTreeMap<String, Group>,
-    /// `(progress, touch, key)` for eviction order.
-    index: BTreeSet<(usize, u64, String)>,
+    /// `(tier, progress, touch, key)` for eviction order.
+    index: BTreeSet<(u8, usize, u64, String)>,
+    /// Live groups of tier 0.
+    unprotected: usize,
+    /// Groups of this rule evicted so far.
+    evictions: u64,
+    /// When an eviction notice was last queued for this rule.
+    notice_at: Option<u64>,
 }
 
 impl RuleState {
+    fn insert(&mut self, key: &str, g: Group) {
+        self.index
+            .insert((g.tier, g.indexed.0, g.indexed.1, key.to_string()));
+        if g.tier == 0 {
+            self.unprotected += 1;
+        }
+        if let Some(old) = self.groups.insert(key.to_string(), g) {
+            // Not reached (callers insert new keys only); keep the counts
+            // right anyway.
+            self.index
+                .remove(&(old.tier, old.indexed.0, old.indexed.1, key.to_string()));
+            if old.tier == 0 {
+                self.unprotected = self.unprotected.saturating_sub(1);
+            }
+        }
+    }
+
     fn sync(&mut self, key: &str) {
         if let Some(g) = self.groups.get_mut(key) {
             let now_idx = (g.state.progress(), g.touch);
             if now_idx != g.indexed {
                 self.index
-                    .remove(&(g.indexed.0, g.indexed.1, key.to_string()));
-                self.index.insert((now_idx.0, now_idx.1, key.to_string()));
+                    .remove(&(g.tier, g.indexed.0, g.indexed.1, key.to_string()));
+                self.index
+                    .insert((g.tier, now_idx.0, now_idx.1, key.to_string()));
                 g.indexed = now_idx;
             }
         }
     }
 
-    fn remove(&mut self, key: &str) {
-        if let Some(g) = self.groups.remove(key) {
-            self.index
-                .remove(&(g.indexed.0, g.indexed.1, key.to_string()));
+    fn remove(&mut self, key: &str) -> Option<Group> {
+        let g = self.groups.remove(key)?;
+        self.index
+            .remove(&(g.tier, g.indexed.0, g.indexed.1, key.to_string()));
+        if g.tier == 0 {
+            self.unprotected = self.unprotected.saturating_sub(1);
         }
+        Some(g)
     }
 
     /// Expire every group; remove dead ones. Returns how many were removed.
@@ -302,6 +399,10 @@ pub struct Correlator {
     now: Option<u64>,
     seq: u64,
     touch: u64,
+    /// Known entity values per kind (tier 2).
+    known: BTreeMap<EntityKind, BTreeSet<String>>,
+    /// Eviction notices not yet taken.
+    notices: Vec<CorrelatedFinding>,
 }
 
 enum Applied {
@@ -325,6 +426,8 @@ impl Correlator {
             now: None,
             seq: 0,
             touch: 0,
+            known: BTreeMap::new(),
+            notices: Vec::new(),
         }
     }
 
@@ -361,6 +464,56 @@ impl Correlator {
             .iter()
             .position(|r| r.id == id)
             .map_or(0, |i| self.states[i].groups.len())
+    }
+
+    /// Replace the set of *known* values of entity `kind` (module docs,
+    /// "Eviction and fairness"): groups created for them are best
+    /// protected. At most [`MAX_KNOWN_ENTITIES`] values are kept (the rest
+    /// are counted in [`Stats::known_entities_dropped`]); values are
+    /// compared exactly as signals carry them. Existing groups keep the tier
+    /// they were created with.
+    pub fn set_known_entities<I, V>(&mut self, kind: EntityKind, values: I)
+    where
+        I: IntoIterator<Item = V>,
+        V: Into<String>,
+    {
+        let mut set = BTreeSet::new();
+        let mut dropped = 0u64;
+        for v in values {
+            let v: String = v.into();
+            if set.len() >= MAX_KNOWN_ENTITIES && !set.contains(&v) {
+                dropped += 1;
+                continue;
+            }
+            set.insert(v);
+        }
+        self.stats.known_entities_dropped =
+            self.stats.known_entities_dropped.saturating_add(dropped);
+        if set.is_empty() {
+            self.known.remove(&kind);
+        } else {
+            self.known.insert(kind, set);
+        }
+    }
+
+    /// Is `value` a known entity of `kind`?
+    pub fn is_known(&self, kind: EntityKind, value: &str) -> bool {
+        self.known.get(&kind).is_some_and(|s| s.contains(value))
+    }
+
+    /// Groups of rule `id` evicted so far (0 if unknown).
+    pub fn evictions_of(&self, id: &str) -> u64 {
+        self.rules
+            .iter()
+            .position(|r| r.id == id)
+            .map_or(0, |i| self.states[i].evictions)
+    }
+
+    /// Take the queued eviction notices (`robot.correlate.correlation_state_evicted`,
+    /// observe-only; see the module docs). Each names the rule whose pending
+    /// state was evicted and cites the evicted evidence.
+    pub fn take_notices(&mut self) -> Vec<CorrelatedFinding> {
+        std::mem::take(&mut self.notices)
     }
 
     /// Does rule `id` hold pending state for group key `key` (`""` for a
@@ -505,18 +658,27 @@ impl Correlator {
             if !Self::starts_state(&self.rules[ri], full_rule, c) {
                 return;
             }
-            if !self.make_room(ri, now) {
+            let known = self.rules[ri]
+                .group_by
+                .is_some_and(|kind| self.is_known(kind, key));
+            let tier = if known {
+                2
+            } else if c.severity >= Severity::High {
+                1
+            } else {
+                0
+            };
+            if !self.make_room(ri, now, tier) {
                 return;
             }
             let g = Group {
                 state: GroupState::new(&self.rules[ri].pattern),
                 cooldown_until: None,
                 touch: 0,
+                tier,
                 indexed: (0, 0),
             };
-            let st = &mut self.states[ri];
-            st.groups.insert(key.to_string(), g);
-            st.index.insert((0, 0, key.to_string()));
+            self.states[ri].insert(key, g);
             self.stats.groups_created = self.stats.groups_created.saturating_add(1);
         }
 
@@ -547,32 +709,87 @@ impl Correlator {
         }
     }
 
-    /// Make room for one new group in rule `ri`. Returns false (and counts
-    /// a refusal) if the newcomer must be refused.
-    fn make_room(&mut self, ri: usize, now: u64) -> bool {
+    /// Make room for one new group of protection `tier` in rule `ri`
+    /// (module docs, "Eviction and fairness"). Returns false (and counts a
+    /// refusal) if the newcomer must be refused.
+    fn make_room(&mut self, ri: usize, now: u64, tier: u8) -> bool {
         let cap = self.limits.max_groups_per_rule;
+        let unprotected_cap = cap - self.limits.protected_reserve();
         let window = self.rules[ri].window_ns;
+        let full = |st: &RuleState| {
+            st.groups.len() >= cap || (tier == 0 && st.unprotected >= unprotected_cap)
+        };
         let st = &mut self.states[ri];
-        if st.groups.len() < cap {
+        if !full(st) {
             return true;
         }
         let n = st.sweep(now, window);
         self.stats.groups_expired = self.stats.groups_expired.saturating_add(n);
-        if st.groups.len() < cap {
+        if !full(st) {
             return true;
         }
-        let victim = st.index.iter().next().cloned();
-        match victim {
-            Some((progress, _, key)) if progress <= 1 => {
-                st.remove(&key);
-                self.stats.groups_evicted = self.stats.groups_evicted.saturating_add(1);
-                true
-            }
-            _ => {
-                self.stats.groups_refused = self.stats.groups_refused.saturating_add(1);
-                false
-            }
+        // Lowest tier, least progress, least recently touched first; never
+        // above the newcomer's tier, never more evidence than it brings.
+        let victim = st
+            .index
+            .iter()
+            .find(|(t, progress, _, _)| *t <= tier && *progress <= 1)
+            .map(|(_, _, _, k)| k.clone());
+        let Some(key) = victim else {
+            self.stats.groups_refused = self.stats.groups_refused.saturating_add(1);
+            return false;
+        };
+        let evicted = st.remove(&key);
+        st.evictions = st.evictions.saturating_add(1);
+        self.stats.groups_evicted = self.stats.groups_evicted.saturating_add(1);
+        if let Some(g) = evicted {
+            self.eviction_notice(ri, &key, &g, now);
         }
+        true
+    }
+
+    /// Queue an eviction notice for rule `ri` (rate-limited).
+    fn eviction_notice(&mut self, ri: usize, key: &str, g: &Group, now: u64) {
+        let contribs = g.state.contributions();
+        if contribs.is_empty() {
+            // A group in cooldown held no evidence: nothing was lost.
+            return;
+        }
+        let rule = &self.rules[ri];
+        let st = &mut self.states[ri];
+        let due = st
+            .notice_at
+            .is_none_or(|t| now.saturating_sub(t) > rule.window_ns);
+        if !due || self.notices.len() >= MAX_PENDING_NOTICES {
+            self.stats.eviction_notices_suppressed =
+                self.stats.eviction_notices_suppressed.saturating_add(1);
+            return;
+        }
+        st.notice_at = Some(now);
+        let observe_only = Mode::Observe;
+        let detail = format!(
+            "pending state of correlation rule {} ({} held signal(s)) was evicted to make room \
+             for a new group; {} group(s) of this rule evicted so far: many fresh entities \
+             within its window, possibly a flood aimed at hiding a correlation",
+            rule.id,
+            contribs.len(),
+            st.evictions
+        );
+        self.notices.push(CorrelatedFinding {
+            rule: EVICTED_RULE_ID.to_string(),
+            title: "Pending correlation state evicted".to_string(),
+            severity: Severity::Medium,
+            mode: observe_only,
+            at_ns: now,
+            group: rule.group_by.map(|kind| Entity {
+                kind,
+                value: key.to_string(),
+            }),
+            window_ns: rule.window_ns,
+            contributors: contribs.iter().map(|c| (**c).clone()).collect(),
+            detail,
+        });
+        self.stats.eviction_notices = self.stats.eviction_notices.saturating_add(1);
     }
 }
 

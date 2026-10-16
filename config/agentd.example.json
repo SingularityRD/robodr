@@ -26,7 +26,8 @@
     "stale_after_ms": 1000,
     "topics": [
       { "topic": "/estop", "type": "std_msgs/msg/Bool",
-        "values": { "true": "estop_active", "false": "none" } }
+        "values": { "true": "estop_active", "false": "none" },
+        "writers": ["0110a2b3c4d5e6f701000000"] }
     ],
     "socket": { "path": "/run/robodr-agentd/safety.sock", "max_connections": 2 }
   },

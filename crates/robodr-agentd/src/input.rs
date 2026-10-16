@@ -162,8 +162,13 @@ pub fn parse_safety_line(t: &str) -> Result<Payload, String> {
 pub struct Msg {
     /// Index of the input in the daemon's input list.
     pub input: usize,
-    /// When it was queued (queue latency = pipeline lag).
+    /// When it was queued (queue latency = pipeline lag); also the receipt
+    /// time the safety feed stamps readings with.
     pub at: Instant,
+    /// The unix-socket connection it came from: unique per accepted
+    /// connection of a listener for the daemon's lifetime (1, 2, ...); 0 for
+    /// every other input. The safety feed keys socket writers by it.
+    pub conn: u64,
     pub payload: Payload,
     /// The item's share of the queue's byte budget, released when the
     /// message is dropped (after it was handled).
@@ -223,6 +228,8 @@ pub struct Feed {
     stats: Arc<InputStats>,
     epoch: Instant,
     budget: Arc<QueueBudget>,
+    /// Connection id stamped on every message ([`Msg::conn`]).
+    conn: u64,
 }
 
 impl Feed {
@@ -251,6 +258,16 @@ impl Feed {
             stats,
             epoch,
             budget,
+            conn: 0,
+        }
+    }
+
+    /// This feed for one accepted connection: its messages carry `conn`.
+    #[must_use]
+    pub fn for_connection(&self, conn: u64) -> Self {
+        Self {
+            conn,
+            ..self.clone()
         }
     }
 
@@ -285,6 +302,7 @@ impl Feed {
         let msg = Msg {
             input: self.input,
             at: Instant::now(),
+            conn: self.conn,
             payload,
             charge,
         };
@@ -574,6 +592,7 @@ pub fn run_unix_listener_with(
     let listener = &sock.listener;
     let active = Arc::new(AtomicUsize::new(0));
     let mut readers: Vec<JoinHandle<()>> = Vec::new();
+    let mut next_conn: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((conn, _)) => {
@@ -586,7 +605,9 @@ pub fn run_unix_listener_with(
                     continue;
                 }
                 active.fetch_add(1, Ordering::SeqCst);
-                let (c_stop, c_feed, c_active) = (stop.clone(), feed.clone(), active.clone());
+                next_conn = next_conn.saturating_add(1);
+                let (c_stop, c_feed, c_active) =
+                    (stop.clone(), feed.for_connection(next_conn), active.clone());
                 let spawned = std::thread::Builder::new()
                     .name("agentd-sock-conn".into())
                     .spawn(move || {
@@ -779,6 +800,73 @@ mod tests {
         assert_eq!(st.rejected_connections.load(Ordering::Relaxed), 1);
         assert!(st.ended.load(Ordering::SeqCst));
         assert!(!path.exists(), "socket removed at stop");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Messages carry their connection id and the time they were queued
+    /// (the safety feed's receipt time).
+    #[test]
+    fn connection_feeds_stamp_conn_and_receipt_time() {
+        let (f, rx, _) = feed(4);
+        let before = Instant::now();
+        let report = crate::safety::SafetyReport {
+            state: robodr_responder::SafetyState::Idle,
+        };
+        assert!(f.send(Payload::Safety(report)));
+        assert!(f.for_connection(7).send(Payload::Safety(report)));
+        std::thread::sleep(Duration::from_millis(20));
+        let msgs: Vec<Msg> = rx.try_iter().collect();
+        assert_eq!(msgs.iter().map(|m| m.conn).collect::<Vec<_>>(), [0, 7]);
+        for m in &msgs {
+            assert!(m.at >= before);
+            assert!(
+                m.at.elapsed() >= Duration::from_millis(20),
+                "queued, not handled, time"
+            );
+        }
+    }
+
+    /// Each accepted connection of a listener gets its own id.
+    #[test]
+    fn listener_connections_get_distinct_ids() {
+        use std::collections::BTreeSet;
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!(
+            "robodr-agentd-conn-ids-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.sock");
+        let sock = bind_event_socket(&path).unwrap();
+        let (f, rx, _) = feed(16);
+        let stop = Arc::new(AtomicBool::new(false));
+        let s2 = stop.clone();
+        let h = std::thread::spawn(move || {
+            run_unix_listener_with(sock, 4, s2, f, parse_safety_line);
+        });
+        let mut a = UnixStream::connect(&path).unwrap();
+        writeln!(a, "{{\"state\":\"estop_active\"}}").unwrap();
+        let mut b = UnixStream::connect(&path).unwrap();
+        writeln!(b, "{{\"state\":\"idle\"}}").unwrap();
+        writeln!(a, "{{\"state\":\"estop_active\"}}").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut got: Vec<(u64, robodr_responder::SafetyState)> = Vec::new();
+        while got.len() < 3 && Instant::now() < deadline {
+            for m in rx.try_iter() {
+                if let Payload::Safety(r) = m.payload {
+                    got.push((m.conn, r.state));
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        stop.store(true, Ordering::Relaxed);
+        h.join().unwrap();
+        assert_eq!(got.len(), 3, "{got:?}");
+        let conns: BTreeSet<u64> = got.iter().map(|(c, _)| *c).collect();
+        assert_eq!(conns.len(), 2, "{got:?}");
+        assert!(conns.iter().all(|c| *c >= 1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

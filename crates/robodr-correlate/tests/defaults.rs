@@ -494,6 +494,8 @@ fn full_table_of_progressed_groups_refuses_newcomers() {
         persistence_only(),
         Limits {
             max_groups_per_rule: cap,
+            // Every slot usable by these (unprotected, Medium) groups.
+            protected_reserve_pct: 0,
             ..Limits::default()
         },
     );
@@ -581,4 +583,168 @@ fn custom_rules_from_json() {
         c.observe(&p(S, "02.0f")).is_empty(),
         "02.0f's first signal has expired"
     );
+}
+
+// ---- review finding 5: protected pending state under a fresh-IP flood ----
+
+const SPOOFED: &str = "robot.correlate.spoofed_motion_source";
+const ENDPOINT_MISMATCH: &str = "robot.ros2.endpoint_source_mismatch";
+
+/// Port of the review PoC F5 with the shipped rules and default limits: a
+/// step-0 signal for A, then 256 step-0 signals from fresh IPs. A low /
+/// medium-severity flood can no longer evict A's High step 0 (tier 1), and
+/// the sequence still fires.
+#[test]
+fn low_severity_flood_cannot_evict_severe_pending_sequence() {
+    let a = "192.168.50.66";
+    let mut c = Correlator::with_defaults();
+    c.observe(&net_ip(1, SRC_MISMATCH, Severity::High, a));
+    for i in 0..1024u32 {
+        let ip = format!("10.{}.{}.1", i / 256, i % 256);
+        c.observe(&net_ip(2, ENDPOINT_MISMATCH, Severity::Medium, &ip));
+        assert!(c.groups_of(SPOOFED) <= 256);
+    }
+    assert!(c.has_group(SPOOFED, a));
+    // The unprotected flood was confined to its share of the table.
+    let reserve = Limits::default().protected_reserve();
+    assert_eq!(c.groups_of(SPOOFED), 256 - reserve + 1);
+    assert!(c.evictions_of(SPOOFED) > 0);
+    let f = c.observe(&net_ip(3, MOTION_WRITER, Severity::Critical, a));
+    assert!(ids(&f).contains(&SPOOFED), "{f:?}");
+}
+
+/// A group whose entity is known (a robot IP / profiled participant) cannot
+/// be evicted by a flood of unknown entities, even a High / Critical one.
+#[test]
+fn known_entity_survives_a_severe_flood() {
+    let a = "192.168.50.10";
+    let mut c = Correlator::with_defaults();
+    c.set_known_entities(EntityKind::Ip, [a]);
+    assert!(c.is_known(EntityKind::Ip, a));
+    c.observe(&net_ip(1, SRC_MISMATCH, Severity::Low, a));
+    for i in 0..1024u32 {
+        let ip = format!("10.{}.{}.1", i / 256, i % 256);
+        c.observe(&net_ip(2, ENDPOINT_MISMATCH, Severity::Critical, &ip));
+    }
+    assert!(c.has_group(SPOOFED, a));
+    let f = c.observe(&net_ip(3, MOTION_WRITER, Severity::High, a));
+    assert!(ids(&f).contains(&SPOOFED), "{f:?}");
+}
+
+/// The PoC exactly (same-tier flood: High mismatches from fresh IPs against
+/// an unknown IP). Eviction can still happen, but no longer silently: it is
+/// counted per rule and an observe-only notice names the rule and cites the
+/// lost evidence, once per rule window.
+#[test]
+fn same_tier_eviction_is_reported_per_rule() {
+    let a = "192.168.50.66";
+    let mut c = Correlator::with_defaults();
+    c.observe(&net_ip(1, SRC_MISMATCH, Severity::High, a));
+    for i in 0..300u32 {
+        let ip = format!("10.{}.{}.1", i / 256, i % 256);
+        c.observe(&net_ip(2, ENDPOINT_MISMATCH, Severity::High, &ip));
+    }
+    assert!(!c.has_group(SPOOFED, a));
+    assert_eq!(c.evictions_of(SPOOFED), 300 - 255);
+    assert_eq!(c.evictions_of("robot.correlate.no_such_rule"), 0);
+    let n = c.take_notices();
+    assert_eq!(n.len(), 1, "rate-limited to one per rule window: {n:?}");
+    assert!(c.take_notices().is_empty(), "taken");
+    let n = &n[0];
+    assert_eq!(n.rule, robodr_correlate::EVICTED_RULE_ID);
+    assert_eq!(n.mode, robodr_events::Mode::Observe);
+    assert_eq!(n.severity, Severity::Medium);
+    assert!(n.detail.contains(SPOOFED), "{}", n.detail);
+    assert_eq!(n.group.as_ref().unwrap().value, a);
+    assert_eq!(n.contributors.len(), 1);
+    assert_eq!(n.contributors[0].rule, SRC_MISMATCH);
+    assert_eq!(c.stats().eviction_notices, 1);
+    assert!(c.stats().eviction_notices_suppressed >= 1);
+    // The notice is observe-only as a deviation too.
+    assert_eq!(n.to_deviation().mode, robodr_events::Mode::Observe);
+    // After a rule window, a new eviction is reported again.
+    c.observe(&net_ip(40 * S, SRC_MISMATCH, Severity::High, "10.200.0.1"));
+    c.tick(40 * S);
+    for i in 0..300u32 {
+        let ip = format!("10.{}.{}.2", 100 + i / 256, i % 256);
+        c.observe(&net_ip(41 * S, ENDPOINT_MISMATCH, Severity::High, &ip));
+    }
+    assert_eq!(c.take_notices().len(), 1);
+}
+
+/// Unprotected newcomers never displace protected groups, even when the
+/// table is full; protected newcomers displace unprotected ones first.
+#[test]
+fn tiers_order_eviction() {
+    let cap = 8;
+    let mut c = Correlator::new(
+        RuleSet::default_rules(),
+        Limits {
+            max_groups_per_rule: cap,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(c.limits().protected_reserve(), 2);
+    // Fill with protected (High) groups.
+    for i in 0..cap {
+        c.observe(&net_ip(1, SRC_MISMATCH, Severity::High, &format!("h{i}")));
+    }
+    assert_eq!(c.groups_of(SPOOFED), cap);
+    // Low newcomers are refused, nothing evicted.
+    let refused = c.stats().groups_refused;
+    c.observe(&net_ip(2, SRC_MISMATCH, Severity::Low, "low"));
+    assert!(!c.has_group(SPOOFED, "low"));
+    assert!(c.stats().groups_refused > refused);
+    // Known newcomer: evicts the least recently used severe group.
+    c.set_known_entities(EntityKind::Ip, ["k"]);
+    c.observe(&net_ip(3, SRC_MISMATCH, Severity::Low, "k"));
+    assert!(c.has_group(SPOOFED, "k"));
+    assert!(!c.has_group(SPOOFED, "h0"));
+    // Unknown, unprotected groups go first.
+    let mut c = Correlator::new(
+        RuleSet::default_rules(),
+        Limits {
+            max_groups_per_rule: cap,
+            ..Limits::default()
+        },
+    );
+    for i in 0..(cap - 2) {
+        c.observe(&net_ip(1, SRC_MISMATCH, Severity::Low, &format!("l{i}")));
+    }
+    // The unprotected share is full: a 7th low group evicts a low one.
+    c.observe(&net_ip(1, SRC_MISMATCH, Severity::Low, "l-new"));
+    assert_eq!(c.groups_of(SPOOFED), cap - 2);
+    assert!(!c.has_group(SPOOFED, "l0"));
+    for i in 0..2 {
+        c.observe(&net_ip(2, SRC_MISMATCH, Severity::High, &format!("h{i}")));
+    }
+    assert_eq!(c.groups_of(SPOOFED), cap);
+    // A further severe group evicts an unprotected one, not a severe one.
+    c.observe(&net_ip(3, SRC_MISMATCH, Severity::Critical, "h2"));
+    assert!(c.has_group(SPOOFED, "h0") && c.has_group(SPOOFED, "h1"));
+    assert!(c.has_group(SPOOFED, "h2"));
+    assert_eq!(c.groups_of(SPOOFED), cap);
+}
+
+#[test]
+fn known_entity_sets_are_bounded_and_replaceable() {
+    let mut c = Correlator::with_defaults();
+    c.set_known_entities(
+        EntityKind::Participant,
+        (0..robodr_correlate::MAX_KNOWN_ENTITIES + 10).map(|i| format!("p{i}")),
+    );
+    assert_eq!(c.stats().known_entities_dropped, 10);
+    assert!(c.is_known(EntityKind::Participant, "p0"));
+    assert!(!c.is_known(EntityKind::Ip, "p0"));
+    c.set_known_entities(EntityKind::Participant, Vec::<String>::new());
+    assert!(!c.is_known(EntityKind::Participant, "p0"));
+    // Reserve arithmetic never leaves zero unprotected slots.
+    for (cap, pct) in [(1usize, 100u8), (2, 255), (4, 25), (0, 50)] {
+        let l = Limits {
+            max_groups_per_rule: cap,
+            protected_reserve_pct: pct,
+            ..Limits::default()
+        };
+        assert!(l.protected_reserve() < cap.max(1), "{cap} {pct}");
+    }
 }

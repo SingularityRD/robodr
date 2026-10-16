@@ -129,6 +129,7 @@ fn zero_group_cap_is_treated_as_one() {
             max_groups_per_rule: 0,
             max_entities_per_signal: 0,
             max_value_len: 0,
+            protected_reserve_pct: 0,
         },
     );
     assert_eq!(c.limits().max_groups_per_rule, 1);

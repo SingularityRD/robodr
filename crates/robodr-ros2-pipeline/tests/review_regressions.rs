@@ -166,22 +166,52 @@ fn unannounced_motion_writer_is_high_on_expiry_and_on_finish() {
 }
 
 /// A rogue SPDP claiming the profiled prefix after it is bound is reported
-/// and not learned: the real participant keeps its binding.
+/// and not learned; since RoboDR cannot tell which host is the real one, the
+/// prefix becomes contested (Critical): the robot's own IP is no longer
+/// trusted for it either, until it is pinned (finding 2b of the safety
+/// review; previously the first-come binding was kept, which kept a rogue
+/// that announced first trusted).
 #[test]
-fn spoofed_spdp_does_not_steal_a_live_binding() {
+fn spoofed_spdp_contests_a_live_profiled_binding() {
     let t = Instant::now();
     let mut p = pipeline();
     bind_legit(&mut p, t);
     let f = p.process_at(&spdp_datagram(LEGIT, ROGUE_IP), XIP, t);
     let m = with_rule(&f, rules::PARTICIPANT_SOURCE_MISMATCH);
     assert_eq!(m.len(), 1, "{f:#?}");
-    assert_eq!(m[0].deviation.severity, Severity::High);
-    // Still judged against the robot's IP.
-    assert!(p
-        .process_at(&sedp_datagram(LEGIT, "rt/cmd_vel", TWIST), RIP, t)
-        .is_empty());
+    assert_eq!(m[0].deviation.severity, Severity::Critical);
+    assert!(p.binding().is_contested(&LEGIT));
+    // Neither host is trusted for the prefix now.
+    let f = p.process_at(&sedp_datagram(LEGIT, "rt/cmd_vel", TWIST), RIP, t);
+    let m = with_rule(&f, rules::ENDPOINT_SOURCE_MISMATCH);
+    assert_eq!(m.len(), 1, "{f:#?}");
+    assert_eq!(m[0].deviation.severity, Severity::Critical);
     let f = p.process_at(&sedp_from(LEGIT, LEGIT, "rt/cmd_vel"), XIP, t);
     assert_eq!(with_rule(&f, rules::ENDPOINT_SOURCE_MISMATCH).len(), 1);
+}
+
+/// The same with the order reversed (finding 2b): the rogue announces the
+/// profiled prefix first, the real participant second. The rogue's IP must
+/// not stay trusted.
+#[test]
+fn rogue_first_spdp_does_not_keep_the_prefix() {
+    let t = Instant::now();
+    let mut p = pipeline();
+    let f = p.process_at(&spdp_datagram(LEGIT, ROGUE_IP), XIP, t);
+    assert!(with_rule(&f, rules::PARTICIPANT_SOURCE_MISMATCH).is_empty());
+    let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+    assert_eq!(p.binding().allows(&LEGIT, ip(XIP)), Some(true));
+    let f = p.process_at(&spdp_datagram(LEGIT, ROBOT_IP), RIP, t);
+    let m = with_rule(&f, rules::PARTICIPANT_SOURCE_MISMATCH);
+    assert_eq!(m.len(), 1, "{f:#?}");
+    assert_eq!(m[0].deviation.severity, Severity::Critical);
+    assert!(p.binding().is_contested(&LEGIT));
+    assert_eq!(p.binding().allows(&LEGIT, ip(XIP)), Some(false));
+    assert_eq!(p.binding().allows(&LEGIT, ip(RIP)), Some(false));
+    let f = p.process_at(&sedp_from(LEGIT, LEGIT, "rt/cmd_vel"), XIP, t);
+    let m = with_rule(&f, rules::ENDPOINT_SOURCE_MISMATCH);
+    assert_eq!(m.len(), 1, "{f:#?}");
+    assert_eq!(m[0].deviation.severity, Severity::Critical);
 }
 
 /// A pinned prefix cannot be bound first by an attacker ("first SPDP wins"

@@ -101,6 +101,7 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     "robot.safety_state.untrusted_source",
     "robot.safety_state.undecodable_sample",
     "robot.safety_state.unmapped_value",
+    "robot.safety_state.writer_overflow",
 ];
 
 /// Names of the host-side Pulsar rules in `rules/robodr/*.toml`.
