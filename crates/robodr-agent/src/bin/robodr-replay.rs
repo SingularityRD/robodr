@@ -40,6 +40,8 @@ USAGE:
                 [--site NAME] [--model NAME] [--boot-id ID]
                 [--trusted-keys trust.json] [--profile-state FILE]
                 [--allow-profile-rollback sha256:HEX]
+                [--trust-roots roots.json [--revocations revocations.json
+                 [--revocations-required]]]
                 [--start-ms EPOCH_MS] [--step-ms MS]
                 [--firewall] [--firewall-allow CHANNEL=GUID[,GUID...]]...
                 [--firewall-max-angular CHANNEL=RAD_PER_S]...
@@ -67,6 +69,10 @@ USAGE:
   profile version in findings comes from the signed profile's metadata.
   --profile-state enables anti-rollback (off by default: replays of old
   recordings legitimately use old profiles).
+  --trust-roots (robodr-trust-roots/v1) verifies a signed min_profile_version
+  in the trust file and the signed revocation list given by --revocations
+  (robodr-profile-revocations/v1): a revoked profile digest or signing key
+  is refused. A missing list is allowed unless --revocations-required.
   A replay never acts: --log-plans only prints what would have been requested.
 
 EXIT: 0 ok and verified, 1 verification failed, 2 error,
@@ -92,6 +98,8 @@ const VALUED: &[&str] = &[
     "trusted-keys",
     "profile-state",
     "allow-profile-rollback",
+    "trust-roots",
+    "revocations",
     "start-ms",
     "step-ms",
     "firewall-allow",
@@ -107,6 +115,7 @@ const SWITCHES: &[&str] = &[
     "record-all-events",
     "log-plans",
     "no-operator",
+    "revocations-required",
     "help",
 ];
 
@@ -276,6 +285,17 @@ fn options(a: &Args) -> Result<ReplayOptions, String> {
     o.allow_profile_rollback = a.one("allow-profile-rollback")?.map(str::to_string);
     if let Some(f) = &o.allow_profile_rollback {
         robodr_commission::trust::validate_rollback_flag(f)?;
+    }
+    o.trust_roots = a.one("trust-roots")?.map(PathBuf::from);
+    o.revocation_list = a.one("revocations")?.map(PathBuf::from);
+    if o.revocation_list.is_some() && o.trust_roots.is_none() {
+        return Err("--revocations needs --trust-roots (the keys that sign it)".into());
+    }
+    if a.has("revocations-required") {
+        if o.revocation_list.is_none() {
+            return Err("--revocations-required needs --revocations".into());
+        }
+        o.revocation_policy = robodr_commission::trust::RevocationPolicy::Required;
     }
     if let Some(v) = a.one("boot-id")? {
         o.boot_id = v.into();

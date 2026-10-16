@@ -166,3 +166,127 @@ fn trust_config_errors_and_removed_profile_version() {
     let r = load(&c).unwrap();
     assert!(r.profile.file_check.is_ok());
 }
+
+#[test]
+fn deleted_state_file_is_detected_through_the_black_box() {
+    // v3 accepted: state written and the acceptance recorded in the black
+    // box (start note + heartbeats).
+    let mut v3 = robot_profile(true);
+    v3.metadata = Some(metadata(3));
+    let s = setup("trust-chain", &v3);
+    let _ = run_capture(&s);
+    let state = s.dir.join("profile-state.json");
+    let accepted = robodr_commission::trust::load_state(&state)
+        .unwrap()
+        .unwrap();
+    let notes: Vec<_> = records(&s.blackbox)
+        .iter()
+        .filter_map(|r| robodr_commission::trust::accepted_from_note(&r.payload))
+        .collect();
+    assert!(!notes.is_empty());
+    assert!(notes.iter().all(|n| *n == accepted));
+
+    // Root deletes the state file and installs the older v2 (still validly
+    // signed). The black box is kept.
+    std::fs::remove_file(&state).unwrap();
+    let mut v2 = robot_profile(true);
+    v2.metadata = Some(metadata(2));
+    write_profile(&s.profile, &v2);
+    std::fs::remove_dir_all(&s.spool).unwrap();
+    let cfg = s.config(
+        serde_json::json!({}),
+        serde_json::json!([{"kind": "stdin"}]),
+        serde_json::json!({}),
+    );
+    // --check-config already sees it.
+    let r = s.resolve(&cfg);
+    assert!(r.profile_alarm.is_some());
+    assert!(r.profile.file_check.is_err());
+    assert!(r
+        .warnings
+        .iter()
+        .any(|w| w.starts_with("CRITICAL") && w.contains("missing")));
+    let (found, log) = run_capture(&s);
+    let rs = rules(&found);
+    assert!(
+        rs.contains(&"robot.ros2.profile_refused".to_string()),
+        "{rs:?}"
+    );
+    let tamper: Vec<_> = found
+        .iter()
+        .filter(|(_, e)| e.entity_context.rule_id == "robot.ros2.profile_state_tampered")
+        .collect();
+    assert_eq!(tamper.len(), 1, "{rs:?}");
+    assert_eq!(tamper[0].1.severity, robodr_events::Severity::Critical);
+    assert_eq!(tamper[0].1.entity_context.mode, Mode::Observe);
+    assert!(
+        log.contains("rollback refused") && log.contains("CRITICAL"),
+        "{log}"
+    );
+    assert!(found
+        .iter()
+        .all(|(_, e)| e.entity_context.mode == Mode::Observe));
+    assert!(!state.exists(), "a refused profile never writes the state");
+
+    // v3 back: enforced again, the alarm is reported once more and the
+    // state is restored from the black-box record; the next start is quiet.
+    write_profile(&s.profile, &v3);
+    std::fs::remove_dir_all(&s.spool).unwrap();
+    let (found, _) = run_capture(&s);
+    assert!(rules(&found).contains(&"robot.ros2.profile_state_tampered".to_string()));
+    assert_eq!(
+        robodr_commission::trust::load_state(&state).unwrap(),
+        Some(accepted)
+    );
+    std::fs::remove_dir_all(&s.spool).unwrap();
+    let r = s.resolve(&cfg);
+    assert!(r.profile_alarm.is_none() && r.profile.file_check.is_ok());
+    let (found, _) = run_capture(&s);
+    assert!(!rules(&found).contains(&"robot.ros2.profile_state_tampered".to_string()));
+}
+
+#[test]
+fn revocation_list_and_config_keys() {
+    let mut v1 = robot_profile(true);
+    v1.metadata = Some(metadata(1));
+    let s = setup("trust-revoke", &v1);
+    let root = robodr_blackbox::Ed25519SigningKey::from_seed("root", &[0x77; 32]).unwrap();
+    let roots = s.dir.join("roots.json");
+    std::fs::write(
+        &roots,
+        robodr_commission::trust::trust_roots_text(&[root.verifying_key()]),
+    )
+    .unwrap();
+    let revs = s.dir.join("revocations.json");
+    let digest = robodr_commission::file_digest(&std::fs::read(&s.profile).unwrap());
+    let list =
+        robodr_commission::trust::RevocationList::create(1, 1_790_000_000, [digest], [], &root)
+            .unwrap();
+    std::fs::write(&revs, list.to_text()).unwrap();
+    let mut cfg = s.config(
+        serde_json::json!({}),
+        serde_json::json!([{"kind": "stdin"}]),
+        serde_json::json!({}),
+    );
+    cfg["sensor"]["profile_trust"]["trust_roots"] = roots.to_str().unwrap().into();
+    cfg["sensor"]["profile_trust"]["revocation_list"] = revs.to_str().unwrap().into();
+    cfg["sensor"]["profile_trust"]["revocation_policy"] = "required".into();
+    let r = s.resolve(&cfg);
+    let p = Pipeline::from_loaded(r.profile.clone(), r.sensor.pipeline.clone());
+    assert!(matches!(p.status(), ProfileStatus::FileRejected(w) if w.contains("revoked")));
+    // Required but missing.
+    std::fs::remove_file(&revs).unwrap();
+    let r = s.resolve(&cfg);
+    assert!(r.profile.file_check.is_err());
+    // Bad policy value / list without roots: configuration errors.
+    let load = |c: &serde_json::Value| robodr_agentd::load(&s.write_config(c));
+    let mut c = cfg.clone();
+    c["sensor"]["profile_trust"]["revocation_policy"] = "sometimes".into();
+    assert!(load(&c).is_err());
+    let mut c = cfg.clone();
+    c["sensor"]["profile_trust"]
+        .as_object_mut()
+        .unwrap()
+        .remove("trust_roots");
+    assert!(load(&c).unwrap_err().contains("trust_roots"));
+}

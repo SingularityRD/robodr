@@ -35,6 +35,37 @@
 //!    file digest in an explicit rollback flag. An accepted change is
 //!    persisted atomically (temp file, fsync, rename; see
 //!    [`crate::write_file_atomic`]).
+//! 5. **Black-box witness** ([`reconcile_with_chain`], [`accepted_note`],
+//!    [`accepted_from_note`]): every accepted locked profile is also
+//!    recorded in the signed, hash-chained black box (a note carrying a
+//!    `profile_accepted` object; agentd writes it at start and in every
+//!    heartbeat). At the next start the latest such record is the second
+//!    witness: a state file that is **missing** or **behind** it (lower
+//!    version, other digest, older revocation serial) means the state was
+//!    deleted or rewritten; the chain's record is then the baseline (a lower
+//!    version stays refused) and a [`StateAlarm`] is raised (agentd reports
+//!    it as a Critical, observe-only finding).
+//! 6. **Monotonic floor** ([`load_trust_file`]): the trust file may carry
+//!    `min_profile_version`. It is honoured only when the trust file is
+//!    signed (`<trust>.sig`, domain [`TRUST_SIG_DOMAIN`]) by a **trust
+//!    root** key ([`load_trust_roots`], `robodr-trust-roots/v1`); a floor
+//!    without a valid root signature makes the trust file invalid (fail
+//!    closed). A locked profile below the floor is refused and
+//!    `allow_rollback` cannot override it: the floor survives the loss of
+//!    both the state file and the black box.
+//! 7. **Revocation list** ([`revocation`]): a `robodr-profile-revocations/v1`
+//!    file of revoked profile digests and revoked signing key ids, with a
+//!    monotonic `serial` and `issued_at`, signed by a trust root (never by a
+//!    profile signing key: roots and profile keys must be disjoint). A
+//!    revoked profile or a profile signed by a revoked key is refused. The
+//!    list itself is anti-rollback protected: its serial and digest are
+//!    kept in the state file and the black-box record, and an older serial,
+//!    the same serial with other content, or a missing list after one was
+//!    accepted is refused. A missing list is otherwise allowed or refused by
+//!    [`RevocationPolicy`].
+//!
+//! The whole decision is [`evaluate_profile_trust`]; every loader (sensor
+//! pipeline, agentd, replay, `verify-profile`) calls it.
 //!
 //! Signing keys use the **one** RoboDR key file format, robodr-blackbox's
 //! `KeyFile` (`robodr-blackbox-key/v2`, `"kind": "secret"`,
@@ -51,15 +82,23 @@
 //!
 //! * The Ed25519 implementation is robodr-blackbox's std-only one: pinned
 //!   to RFC 8032 vectors but **not audited** (see that module's docs).
-//! * The state file is plain JSON on the unit. Anyone who can delete or
-//!   rewrite it (root on the unit) resets anti-rollback; a hardware
-//!   monotonic counter (TPM NV index) is the real fix (Phase 2/3). An
-//!   unreadable or malformed state file fails closed (refused), it is
-//!   never silently reset.
+//! * The state file is plain JSON on the unit. Deleting or rewriting it is
+//!   now **detected** through the black-box record, not prevented: root can
+//!   also delete the black box (detectable off-unit through the export
+//!   chain, not on the unit) and then only the signed trust-file floor
+//!   remains. Cyclic retention or export pruning can drop old records;
+//!   agentd re-records the accepted profile in every heartbeat so the
+//!   newest segment carries it. A hardware monotonic counter (TPM NV index)
+//!   is the real fix (Phase 2/3). An unreadable or malformed state file
+//!   fails closed (refused), it is never silently reset.
+//! * The trust-file floor is protected against forgery, not replay: an
+//!   older root-signed trust file with a lower floor verifies. Revocation
+//!   lists carry a serial for that reason; trust files do not.
+//! * Trust roots cannot be revoked by the list they sign; replace the roots
+//!   file instead. `issued_at` is informational (air-gapped units have no
+//!   trusted clock): there is no expiry.
 //! * Trust-anchor files are checked for symlinks and group/other write
 //!   permission, not for ownership.
-//! * Revocation is by removing a key from the trust file; there is no
-//!   revocation list or expiry.
 
 use crate::profile_file::{
     parse_profile_text, read_regular_file, write_file_atomic, ProfileFileError,
@@ -76,12 +115,31 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+pub mod revocation;
+
+pub use revocation::{
+    load_revocation_list, RevocationList, RevocationPolicy, RevocationSignature,
+    MAX_REVOCATION_BYTES, MAX_REVOKED_ENTRIES, REVOCATION_DOMAIN, REVOCATION_FORMAT,
+};
+
 /// Domain separation prefix of the signed message.
 pub const SIG_DOMAIN: &[u8] = b"robodr-profile-sig/v1\0";
 /// `format` of a signature file.
 pub const SIG_FORMAT: &str = "robodr-profile-sig/v1";
 /// `format` of a trust-anchor file.
 pub const TRUST_FORMAT: &str = "robodr-profile-trust/v1";
+/// `format` of a trust-roots file (keys that sign revocation lists and
+/// trust-file floors; never profiles).
+pub const ROOTS_FORMAT: &str = "robodr-trust-roots/v1";
+/// `format` of a trust file's detached signature (`<trust>.sig`).
+pub const TRUST_SIG_FORMAT: &str = "robodr-profile-trust-sig/v1";
+/// Domain separation prefix of a trust file's signed message.
+pub const TRUST_SIG_DOMAIN: &[u8] = b"robodr-profile-trust-sig/v1\0";
+/// `kind` of the black-box note recording an accepted profile.
+pub const ACCEPTED_NOTE_KIND: &str = "robodr.profile_accepted";
+/// Top-level member of a black-box note that carries an [`AcceptedState`]
+/// (the [`ACCEPTED_NOTE_KIND`] note and agentd's heartbeats).
+pub const ACCEPTED_NOTE_FIELD: &str = "profile_accepted";
 /// `format` of the anti-rollback state file.
 pub const STATE_FORMAT: &str = "robodr-profile-state/v1";
 /// Largest signature file read.
@@ -145,6 +203,30 @@ pub enum ProfileTrustError {
     /// The anti-rollback state file is unreadable, malformed or could not
     /// be written.
     State { detail: String },
+    /// The trust-roots file could not be read or is malformed, or a key is
+    /// both a root and a profile signing key.
+    TrustRoots { detail: String },
+    /// The revocation list is unreadable, malformed, not signed by a trust
+    /// root, or cannot be checked (no roots configured).
+    Revocations { detail: String },
+    /// `revocation_policy = "required"` and the list file does not exist.
+    RevocationListMissing { path: String },
+    /// The profile file's digest is revoked.
+    RevokedProfile { digest: String, serial: u64 },
+    /// The key that signed the profile is revoked.
+    RevokedKey { key_id: String, serial: u64 },
+    /// The revocation list is older than the last accepted one.
+    RevocationRollback {
+        accepted_serial: u64,
+        offered_serial: u64,
+    },
+    /// Same revocation serial as the accepted list, different content.
+    RevocationEquivocation { serial: u64 },
+    /// A revocation list was accepted before and is now missing.
+    RevocationListRemoved { accepted_serial: u64 },
+    /// `profile_version` is below the root-signed `min_profile_version` of
+    /// the trust file (not overridable by `allow_rollback`).
+    BelowFloor { floor: u64, offered_version: u64 },
 }
 
 impl fmt::Display for ProfileTrustError {
@@ -217,6 +299,45 @@ impl fmt::Display for ProfileTrustError {
                  it deliberately, name it: allow_rollback = {offered_digest:?}"
             ),
             Self::State { detail } => write!(f, "anti-rollback state: {detail}"),
+            Self::TrustRoots { detail } => write!(f, "trust roots: {detail}"),
+            Self::Revocations { detail } => write!(f, "revocation list: {detail}"),
+            Self::RevocationListMissing { path } => write!(
+                f,
+                "revocation list {path:?} is missing and revocation_policy is \"required\""
+            ),
+            Self::RevokedProfile { digest, serial } => write!(
+                f,
+                "profile {digest} is revoked (revocation list serial {serial})"
+            ),
+            Self::RevokedKey { key_id, serial } => write!(
+                f,
+                "signing key {key_id:?} is revoked (revocation list serial {serial})"
+            ),
+            Self::RevocationRollback {
+                accepted_serial,
+                offered_serial,
+            } => write!(
+                f,
+                "revocation list rollback refused: serial {offered_serial} < last accepted \
+                 {accepted_serial}"
+            ),
+            Self::RevocationEquivocation { serial } => write!(
+                f,
+                "revocation list serial {serial} was already accepted with other content"
+            ),
+            Self::RevocationListRemoved { accepted_serial } => write!(
+                f,
+                "a revocation list (serial {accepted_serial}) was accepted before and is now \
+                 missing; install it (or a newer one)"
+            ),
+            Self::BelowFloor {
+                floor,
+                offered_version,
+            } => write!(
+                f,
+                "profile_version {offered_version} is below the trust file's signed \
+                 min_profile_version {floor}"
+            ),
         }
     }
 }
@@ -245,15 +366,53 @@ pub fn sig_path_for(profile: &Path) -> PathBuf {
 
 /// The message that is signed: [`SIG_DOMAIN`] followed by the exact bytes.
 pub fn signed_message(profile_bytes: &[u8]) -> Vec<u8> {
-    let mut m = Vec::with_capacity(SIG_DOMAIN.len() + profile_bytes.len());
-    m.extend_from_slice(SIG_DOMAIN);
-    m.extend_from_slice(profile_bytes);
+    signed_message_for(SigKind::Profile, profile_bytes)
+}
+
+/// What a detached signature file signs: a profile or a trust file. Each
+/// has its own `format` and domain, so one can never stand in for the
+/// other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigKind {
+    /// `<profile>.sig` ([`SIG_FORMAT`], [`SIG_DOMAIN`]).
+    Profile,
+    /// `<trust>.sig` ([`TRUST_SIG_FORMAT`], [`TRUST_SIG_DOMAIN`]).
+    TrustFile,
+}
+
+impl SigKind {
+    /// The signature file's `format`.
+    pub fn format(self) -> &'static str {
+        match self {
+            Self::Profile => SIG_FORMAT,
+            Self::TrustFile => TRUST_SIG_FORMAT,
+        }
+    }
+
+    /// The domain prefix of the signed message.
+    pub fn domain(self) -> &'static [u8] {
+        match self {
+            Self::Profile => SIG_DOMAIN,
+            Self::TrustFile => TRUST_SIG_DOMAIN,
+        }
+    }
+}
+
+/// `kind.domain() || bytes`.
+pub fn signed_message_for(kind: SigKind, bytes: &[u8]) -> Vec<u8> {
+    let d = kind.domain();
+    let mut m = Vec::with_capacity(d.len() + bytes.len());
+    m.extend_from_slice(d);
+    m.extend_from_slice(bytes);
     m
 }
 
 // ------------------------------------------------------------ signature --
 
-/// A detached profile signature (`robodr-profile-sig/v1`).
+/// A detached signature file: `robodr-profile-sig/v1` for a profile,
+/// `robodr-profile-trust-sig/v1` for a trust file ([`SigKind`]).
+/// `profile_digest` is the [`file_digest`] of the signed file, whichever
+/// kind it is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileSignature {
@@ -268,9 +427,18 @@ pub struct ProfileSignature {
 impl ProfileSignature {
     /// Sign the exact bytes of a (sealed) profile file.
     pub fn create(profile_bytes: &[u8], signer: &dyn Signer) -> Result<Self, SignError> {
-        let sig = signer.sign(&signed_message(profile_bytes))?;
+        Self::create_for(SigKind::Profile, profile_bytes, signer)
+    }
+
+    /// Sign the exact bytes of a file of `kind`.
+    pub fn create_for(
+        kind: SigKind,
+        profile_bytes: &[u8],
+        signer: &dyn Signer,
+    ) -> Result<Self, SignError> {
+        let sig = signer.sign(&signed_message_for(kind, profile_bytes))?;
         Ok(Self {
-            format: SIG_FORMAT.into(),
+            format: kind.format().into(),
             algorithm: signer.algorithm().into(),
             key_id: signer.key_id().into(),
             profile_digest: file_digest(profile_bytes),
@@ -283,15 +451,23 @@ impl ProfileSignature {
         crate::to_json(self).unwrap_or_default()
     }
 
-    /// Parse a `.sig` file (unknown keys and duplicate keys refused).
+    /// Parse a profile `.sig` file (unknown keys and duplicate keys
+    /// refused).
     pub fn parse(text: &str) -> Result<Self, ProfileTrustError> {
+        Self::parse_for(SigKind::Profile, text)
+    }
+
+    /// Parse a `.sig` file of `kind` (errors are
+    /// [`ProfileTrustError::MalformedSignature`]).
+    pub fn parse_for(kind: SigKind, text: &str) -> Result<Self, ProfileTrustError> {
         let bad = |detail: String| ProfileTrustError::MalformedSignature { detail };
         crate::profile_file::reject_duplicate_keys(text).map_err(|e| bad(e.to_string()))?;
         let s: Self = serde_json::from_str(text).map_err(|e| bad(e.to_string()))?;
-        if s.format != SIG_FORMAT {
+        if s.format != kind.format() {
             return Err(bad(format!(
-                "format {:?}, expected {SIG_FORMAT:?}",
-                s.format
+                "format {:?}, expected {:?}",
+                s.format,
+                kind.format()
             )));
         }
         if s.algorithm != ED25519 {
@@ -317,6 +493,17 @@ impl ProfileSignature {
     /// Check this signature against `profile_bytes` under the trusted key
     /// it names.
     pub fn verify(&self, profile_bytes: &[u8], anchors: &Keyring) -> Result<(), ProfileTrustError> {
+        self.verify_for(SigKind::Profile, profile_bytes, anchors)
+    }
+
+    /// Check this signature against the bytes of a file of `kind` under the
+    /// key of `anchors` it names.
+    pub fn verify_for(
+        &self,
+        kind: SigKind,
+        profile_bytes: &[u8],
+        anchors: &Keyring,
+    ) -> Result<(), ProfileTrustError> {
         let digest = file_digest(profile_bytes);
         if self.profile_digest != digest {
             return Err(ProfileTrustError::DigestMismatch {
@@ -330,7 +517,10 @@ impl ProfileSignature {
             });
         };
         let sig = from_hex(&self.signature_hex).unwrap_or_default();
-        if key.algorithm() != self.algorithm || !key.verify(&signed_message(profile_bytes), &sig) {
+        if self.format != kind.format()
+            || key.algorithm() != self.algorithm
+            || !key.verify(&signed_message_for(kind, profile_bytes), &sig)
+        {
             return Err(ProfileTrustError::BadSignature {
                 key_id: self.key_id.clone(),
             });
@@ -353,54 +543,83 @@ struct TrustKeyJson {
 #[serde(deny_unknown_fields)]
 struct TrustJson {
     format: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    min_profile_version: Option<u64>,
     keys: Vec<TrustKeyJson>,
 }
 
-/// Parse a trust-anchor file's text into a keyring of Ed25519 verifying
-/// keys. Refuses an empty list, a duplicate key id, a non-Ed25519 key and
-/// an invalid (non-canonical or small-order) public key.
-pub fn parse_trust_keys(text: &str) -> Result<Keyring, ProfileTrustError> {
-    let bad = |detail: String| ProfileTrustError::TrustFile { detail };
-    crate::profile_file::reject_duplicate_keys(text).map_err(|e| bad(e.to_string()))?;
-    let j: TrustJson = serde_json::from_str(text).map_err(|e| bad(e.to_string()))?;
-    if j.format != TRUST_FORMAT {
-        return Err(bad(format!(
-            "format {:?}, expected {TRUST_FORMAT:?}",
-            j.format
-        )));
+/// Parse a key-list file (`format` must be `expected`): at least one key,
+/// at most [`MAX_TRUST_KEYS`], Ed25519 only, canonical non-small-order
+/// public keys, no duplicate key id or public key. Returns the keys and the
+/// optional `min_profile_version`.
+fn parse_key_list(
+    text: &str,
+    expected: &str,
+) -> Result<(Vec<Ed25519VerifyingKey>, Option<u64>), String> {
+    crate::profile_file::reject_duplicate_keys(text).map_err(|e| e.to_string())?;
+    let j: TrustJson = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    if j.format != expected {
+        return Err(format!("format {:?}, expected {expected:?}", j.format));
     }
     if j.keys.is_empty() {
-        return Err(bad("no keys".into()));
+        return Err("no keys".into());
     }
     if j.keys.len() > MAX_TRUST_KEYS {
-        return Err(bad(format!("more than {MAX_TRUST_KEYS} keys")));
+        return Err(format!("more than {MAX_TRUST_KEYS} keys"));
     }
-    let mut ring = Keyring::new();
+    let mut out: Vec<Ed25519VerifyingKey> = Vec::with_capacity(j.keys.len());
     for k in j.keys {
         if k.algorithm != ED25519 {
-            return Err(bad(format!(
+            return Err(format!(
                 "key {:?}: algorithm {:?} is not supported (only {ED25519:?})",
                 k.key_id, k.algorithm
-            )));
+            ));
         }
         let public: [u8; PUBLIC_KEY_LEN] = from_hex(&k.public_hex)
             .and_then(|b| b.try_into().ok())
             .ok_or_else(|| {
-                bad(format!(
+                format!(
                     "key {:?}: public_hex is not {PUBLIC_KEY_LEN} bytes of hex",
                     k.key_id
-                ))
+                )
             })?;
         let vk = Ed25519VerifyingKey::from_bytes(k.key_id.clone(), &public)
-            .map_err(|e| bad(format!("key {:?}: {e}", k.key_id)))?;
-        ring.add(Box::new(vk))
-            .map_err(|e| bad(format!("key {:?}: {e}", k.key_id)))?;
+            .map_err(|e| format!("key {:?}: {e}", k.key_id))?;
+        if out
+            .iter()
+            .any(|o| Verifier::key_id(o) == k.key_id || o.as_bytes() == vk.as_bytes())
+        {
+            return Err(format!("key {:?}: listed twice", k.key_id));
+        }
+        out.push(vk);
+    }
+    Ok((out, j.min_profile_version))
+}
+
+fn ring_of(keys: &[Ed25519VerifyingKey]) -> Result<Keyring, String> {
+    let mut ring = Keyring::new();
+    for k in keys {
+        ring.add(Box::new(k.clone()))
+            .map_err(|e| format!("key {:?}: {e}", Verifier::key_id(k)))?;
     }
     Ok(ring)
 }
 
+/// Parse a trust-anchor file's text into a keyring of Ed25519 verifying
+/// keys. Refuses an empty list, a duplicate key id, a non-Ed25519 key and
+/// an invalid (non-canonical or small-order) public key. A
+/// `min_profile_version` is parsed but not returned: use
+/// [`parse_trust_file`] / [`load_trust_file`], which also check its
+/// signature.
+pub fn parse_trust_keys(text: &str) -> Result<Keyring, ProfileTrustError> {
+    let bad = |detail: String| ProfileTrustError::TrustFile { detail };
+    let (keys, _) = parse_key_list(text, TRUST_FORMAT).map_err(bad)?;
+    ring_of(&keys).map_err(bad)
+}
+
 /// Read a trust-anchor file: regular file (not a symlink), not writable by
-/// group or others, size-capped; then [`parse_trust_keys`].
+/// group or others, size-capped; then [`parse_trust_keys`]. Ignores a
+/// `min_profile_version` (use [`load_trust_file`] for the full check).
 pub fn load_trust_keys(path: &Path) -> Result<Keyring, ProfileTrustError> {
     let bad = |detail: String| ProfileTrustError::TrustFile {
         detail: format!("{}: {detail}", path.display()),
@@ -414,8 +633,13 @@ pub fn load_trust_keys(path: &Path) -> Result<Keyring, ProfileTrustError> {
 
 /// The text of a trust-anchor file listing `keys`.
 pub fn trust_keys_text(keys: &[Ed25519VerifyingKey]) -> String {
+    trust_file_text(keys, None)
+}
+
+fn key_list_text(format: &str, keys: &[Ed25519VerifyingKey], floor: Option<u64>) -> String {
     let j = TrustJson {
-        format: TRUST_FORMAT.into(),
+        format: format.into(),
+        min_profile_version: floor,
         keys: keys
             .iter()
             .map(|k| TrustKeyJson {
@@ -426,6 +650,156 @@ pub fn trust_keys_text(keys: &[Ed25519VerifyingKey]) -> String {
             .collect(),
     };
     crate::to_json(&j).unwrap_or_default()
+}
+
+/// The text of a trust-anchor file listing `keys`, with an optional
+/// `min_profile_version` floor (which must then be signed by a trust root:
+/// [`ProfileSignature::create_for`] with [`SigKind::TrustFile`] over these
+/// exact bytes, written to [`sig_path_for`] the trust file).
+pub fn trust_file_text(keys: &[Ed25519VerifyingKey], floor: Option<u64>) -> String {
+    key_list_text(TRUST_FORMAT, keys, floor)
+}
+
+/// Trust roots: the keys that sign revocation lists and trust-file floors
+/// (`robodr-trust-roots/v1`). They never sign profiles.
+#[derive(Debug)]
+pub struct TrustRoots {
+    pub keys: Keyring,
+    pub public_keys: Vec<Ed25519VerifyingKey>,
+}
+
+impl TrustRoots {
+    /// Refuse a profile key that is also a root (same id or same public
+    /// key): one key compromise must not defeat both signature and
+    /// revocation.
+    pub fn check_disjoint(&self, profile_keys: &[Ed25519VerifyingKey]) -> Result<(), String> {
+        for p in profile_keys {
+            if let Some(r) = self.public_keys.iter().find(|r| {
+                Verifier::key_id(*r) == Verifier::key_id(p) || r.as_bytes() == p.as_bytes()
+            }) {
+                return Err(format!(
+                    "profile key {:?} is also trust root {:?}: roots and profile signing keys \
+                     must be distinct",
+                    Verifier::key_id(p),
+                    Verifier::key_id(r)
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Parse a trust-roots file (`robodr-trust-roots/v1`, same key-list layout
+/// as a trust file, no `min_profile_version`).
+pub fn parse_trust_roots(text: &str) -> Result<TrustRoots, ProfileTrustError> {
+    let bad = |detail: String| ProfileTrustError::TrustRoots { detail };
+    let (keys, floor) = parse_key_list(text, ROOTS_FORMAT).map_err(bad)?;
+    if floor.is_some() {
+        return Err(bad("min_profile_version belongs in the trust file".into()));
+    }
+    Ok(TrustRoots {
+        keys: ring_of(&keys).map_err(bad)?,
+        public_keys: keys,
+    })
+}
+
+/// Read a trust-roots file with the trust-file protections (no symlink,
+/// regular file, not writable by group/others, size cap).
+pub fn load_trust_roots(path: &Path) -> Result<TrustRoots, ProfileTrustError> {
+    let bad = |detail: String| ProfileTrustError::TrustRoots {
+        detail: format!("{}: {detail}", path.display()),
+    };
+    let text = read_protected(path, MAX_TRUST_BYTES).map_err(|e| bad(e.to_string()))?;
+    parse_trust_roots(&text).map_err(|e| match e {
+        ProfileTrustError::TrustRoots { detail } => bad(detail),
+        other => other,
+    })
+}
+
+/// The text of a trust-roots file listing `keys`.
+pub fn trust_roots_text(keys: &[Ed25519VerifyingKey]) -> String {
+    key_list_text(ROOTS_FORMAT, keys, None)
+}
+
+/// A trust-anchor file with its optional signed floor.
+#[derive(Debug)]
+pub struct TrustFile {
+    pub keys: Keyring,
+    pub public_keys: Vec<Ed25519VerifyingKey>,
+    /// Root-signed `min_profile_version` (`None`: no floor).
+    pub min_profile_version: Option<u64>,
+    /// Trust root that signed the file (`None`: unsigned).
+    pub signed_by: Option<String>,
+}
+
+/// Parse a trust file and check its detached signature `sig_text` (the
+/// `<trust>.sig` content, if any) against `roots`:
+///
+/// * a `min_profile_version` needs a valid signature by a root (no roots
+///   configured, no signature or a bad one: error, fail closed);
+/// * a signature present while roots are configured must verify;
+/// * with roots, no profile key may be a root ([`TrustRoots::check_disjoint`]).
+pub fn parse_trust_file(
+    text: &str,
+    sig_text: Option<&str>,
+    sig_name: &str,
+    roots: Option<&TrustRoots>,
+) -> Result<TrustFile, ProfileTrustError> {
+    let bad = |detail: String| ProfileTrustError::TrustFile { detail };
+    let (keys, floor) = parse_key_list(text, TRUST_FORMAT).map_err(bad)?;
+    if floor == Some(0) {
+        return Err(bad("min_profile_version must be >= 1".into()));
+    }
+    if let Some(r) = roots {
+        r.check_disjoint(&keys).map_err(bad)?;
+    }
+    let signed_by = match (sig_text, roots) {
+        (Some(st), Some(r)) => {
+            let sig = ProfileSignature::parse_for(SigKind::TrustFile, st)
+                .map_err(|e| bad(format!("{sig_name}: {e}")))?;
+            sig.verify_for(SigKind::TrustFile, text.as_bytes(), &r.keys)
+                .map_err(|e| bad(format!("{sig_name}: {e} (trust roots)")))?;
+            Some(sig.key_id)
+        }
+        _ => None,
+    };
+    if floor.is_some() && signed_by.is_none() {
+        return Err(bad(format!(
+            "min_profile_version is set but the file is not signed by a trust root \
+             ({sig_name} missing, or no trust_roots configured)"
+        )));
+    }
+    Ok(TrustFile {
+        keys: ring_of(&keys).map_err(bad)?,
+        public_keys: keys,
+        min_profile_version: floor,
+        signed_by,
+    })
+}
+
+/// Read a trust file (protected like [`load_trust_keys`]) and its optional
+/// `<trust>.sig`, then [`parse_trust_file`].
+pub fn load_trust_file(
+    path: &Path,
+    roots: Option<&TrustRoots>,
+) -> Result<TrustFile, ProfileTrustError> {
+    let bad = |detail: String| ProfileTrustError::TrustFile {
+        detail: format!("{}: {detail}", path.display()),
+    };
+    let text = read_protected(path, MAX_TRUST_BYTES).map_err(|e| bad(e.to_string()))?;
+    let sig_path = sig_path_for(path);
+    let sig =
+        read_optional_sig(&sig_path).map_err(|e| bad(format!("{}: {e}", sig_path.display())))?;
+    parse_trust_file(
+        &text,
+        sig.as_deref(),
+        &sig_path.display().to_string(),
+        roots,
+    )
+    .map_err(|e| match e {
+        ProfileTrustError::TrustFile { detail } => bad(detail),
+        other => other,
+    })
 }
 
 /// Read a file that others must not be able to modify: no symlink at
@@ -666,7 +1040,12 @@ pub fn verify_profile_file(
 
 /// The `.sig` file's text; `Ok(None)` if it does not exist.
 pub fn read_optional_sig(path: &Path) -> io::Result<Option<String>> {
-    match read_regular_file(path, MAX_SIG_BYTES) {
+    read_optional_text(path, MAX_SIG_BYTES)
+}
+
+/// A regular file's text (size-capped); `Ok(None)` if it does not exist.
+fn read_optional_text(path: &Path, max: u64) -> io::Result<Option<String>> {
+    match read_regular_file(path, max) {
         Ok(s) => Ok(Some(s)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
@@ -701,10 +1080,17 @@ pub struct AcceptedState {
     pub profile_version: u64,
     /// [`file_digest`] of the accepted file.
     pub digest: String,
+    /// `serial` of the last accepted revocation list (`None`: none yet).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocation_serial: Option<u64>,
+    /// [`RevocationList::digest`] of that list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocation_digest: Option<String>,
 }
 
 impl AcceptedState {
-    /// The state recording `v` (a locked, verified profile).
+    /// The state recording `v` (a locked, verified profile), with no
+    /// revocation list.
     pub fn of(v: &VerifiedProfile) -> Option<Self> {
         let m = v.profile.metadata.as_ref()?;
         Some(Self {
@@ -714,7 +1100,31 @@ impl AcceptedState {
             unit_id: m.unit_id.clone(),
             profile_version: m.profile_version,
             digest: v.digest.clone(),
+            revocation_serial: None,
+            revocation_digest: None,
         })
+    }
+
+    /// Structural check (format, digests, version, revocation pair).
+    pub fn validate(&self) -> Result<(), String> {
+        if self.format != STATE_FORMAT {
+            return Err(format!(
+                "format {:?}, expected {STATE_FORMAT:?}",
+                self.format
+            ));
+        }
+        if !is_sha256_digest(&self.digest) || self.profile_version == 0 {
+            return Err("malformed digest or version".into());
+        }
+        match (&self.revocation_serial, &self.revocation_digest) {
+            (None, None) => Ok(()),
+            (Some(s), Some(d)) if *s >= 1 && is_sha256_digest(d) => Ok(()),
+            _ => Err("malformed revocation_serial / revocation_digest".into()),
+        }
+    }
+
+    fn revocation(&self) -> Option<(u64, &str)> {
+        Some((self.revocation_serial?, self.revocation_digest.as_deref()?))
     }
 }
 
@@ -810,15 +1220,7 @@ pub fn load_state(path: &Path) -> Result<Option<AcceptedState>, ProfileTrustErro
     };
     crate::profile_file::reject_duplicate_keys(&text).map_err(|e| bad(e.to_string()))?;
     let s: AcceptedState = serde_json::from_str(&text).map_err(|e| bad(e.to_string()))?;
-    if s.format != STATE_FORMAT {
-        return Err(bad(format!(
-            "format {:?}, expected {STATE_FORMAT:?}",
-            s.format
-        )));
-    }
-    if !is_sha256_digest(&s.digest) || s.profile_version == 0 {
-        return Err(bad("malformed digest or version".into()));
-    }
+    s.validate().map_err(bad)?;
     Ok(Some(s))
 }
 
@@ -848,6 +1250,374 @@ pub fn enforce_rollback(
         }
     }
     Ok(d)
+}
+
+// ------------------------------------------------- black-box witness --
+
+/// The black-box note recording an accepted profile ([`ACCEPTED_NOTE_KIND`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptedNote {
+    pub kind: String,
+    /// What was accepted (the same record the state file holds).
+    pub profile_accepted: AcceptedState,
+    /// Key id that signed the profile.
+    pub signed_by: Option<String>,
+    /// [`RollbackDecision`] of this load, as text (`None` without
+    /// anti-rollback state).
+    pub decision: Option<String>,
+}
+
+/// The note to append to the black box when `accepted` is enforced.
+pub fn accepted_note(
+    accepted: &AcceptedState,
+    signed_by: Option<&str>,
+    decision: Option<RollbackDecision>,
+) -> AcceptedNote {
+    AcceptedNote {
+        kind: ACCEPTED_NOTE_KIND.into(),
+        profile_accepted: accepted.clone(),
+        signed_by: signed_by.map(str::to_string),
+        decision: decision.map(|d| format!("{d:?}")),
+    }
+}
+
+/// The [`AcceptedState`] a black-box note payload carries in its top-level
+/// [`ACCEPTED_NOTE_FIELD`] member (an [`AcceptedNote`] or an agentd
+/// heartbeat), if any and well formed. Never panics on hostile bytes.
+pub fn accepted_from_note(payload: &[u8]) -> Option<AcceptedState> {
+    let v: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    let a = v.as_object()?.get(ACCEPTED_NOTE_FIELD)?;
+    let s: AcceptedState = serde_json::from_value(a.clone()).ok()?;
+    s.validate().ok().map(|()| s)
+}
+
+/// Why the state file disagrees with the black box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StateAlarmReason {
+    /// No state file, but the black box recorded an accepted profile.
+    StateMissing,
+    /// The state file is older than the black box's record (lower
+    /// version, other digest for the same version, or an older revocation
+    /// list).
+    StateBehindChain,
+}
+
+/// Evidence that the anti-rollback state was deleted or rewritten (see the
+/// module docs). Report it as Critical; it never by itself requests any
+/// action on the robot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StateAlarm {
+    pub reason: StateAlarmReason,
+    /// The state file's content (`None`: missing).
+    pub state: Option<AcceptedState>,
+    /// The latest black-box record.
+    pub chain: AcceptedState,
+}
+
+impl fmt::Display for StateAlarm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let c = &self.chain;
+        match (&self.reason, &self.state) {
+            (StateAlarmReason::StateMissing, _) | (_, None) => write!(
+                f,
+                "anti-rollback state file is missing but the black box recorded accepted \
+                 profile_version {} ({}): the state was deleted; the recorded version is \
+                 enforced as the floor",
+                c.profile_version, c.digest
+            ),
+            (StateAlarmReason::StateBehindChain, Some(s)) => write!(
+                f,
+                "anti-rollback state (profile_version {}, {}, revocation serial {:?}) is behind \
+                 the black box record (profile_version {}, {}, revocation serial {:?}): the \
+                 state was rewritten or an operator rollback did not complete; the black-box \
+                 record is the baseline",
+                s.profile_version,
+                s.digest,
+                s.revocation_serial,
+                c.profile_version,
+                c.digest,
+                c.revocation_serial
+            ),
+        }
+    }
+}
+
+/// Combine the state file with the latest black-box record: the effective
+/// anti-rollback baseline and, if they disagree in the state's disfavour,
+/// a [`StateAlarm`]. The profile part of the baseline is the chain's when
+/// the state is missing or behind it (lower version, or same version and
+/// other digest), else the state's; the revocation part is the higher
+/// serial (the chain's on a tie with other content). A state *ahead* of
+/// the chain is normal (accepted, then stopped before the note was
+/// written) and raises nothing.
+pub fn reconcile_with_chain(
+    state: Option<&AcceptedState>,
+    chain: Option<&AcceptedState>,
+) -> (Option<AcceptedState>, Option<StateAlarm>) {
+    let Some(c) = chain else {
+        return (state.cloned(), None);
+    };
+    let Some(s) = state else {
+        return (
+            Some(c.clone()),
+            Some(StateAlarm {
+                reason: StateAlarmReason::StateMissing,
+                state: None,
+                chain: c.clone(),
+            }),
+        );
+    };
+    let profile_behind = c.profile_version > s.profile_version
+        || (c.profile_version == s.profile_version && c.digest != s.digest);
+    let rev_behind = match (s.revocation(), c.revocation()) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some((ss, sd)), Some((cs, cd))) => cs > ss || (cs == ss && cd != sd),
+    };
+    let mut base = if profile_behind { c.clone() } else { s.clone() };
+    let rev_src = if rev_behind { c } else { s };
+    base.revocation_serial = rev_src.revocation_serial;
+    base.revocation_digest = rev_src.revocation_digest.clone();
+    let alarm = (profile_behind || rev_behind).then(|| StateAlarm {
+        reason: StateAlarmReason::StateBehindChain,
+        state: Some(s.clone()),
+        chain: c.clone(),
+    });
+    (Some(base), alarm)
+}
+
+// ------------------------------------------------------------ evaluator --
+
+/// Everything [`evaluate_profile_trust`] reads, as configured.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TrustInputs<'a> {
+    /// `robodr-profile-trust/v1` file (`None`: no locked profile trusted).
+    pub trusted_keys: Option<&'a Path>,
+    /// `robodr-trust-roots/v1` file (signs revocation lists and floors).
+    pub trust_roots: Option<&'a Path>,
+    /// `robodr-profile-revocations/v1` file.
+    pub revocation_list: Option<&'a Path>,
+    /// What a missing revocation list means.
+    pub revocation_policy: RevocationPolicy,
+    pub expect_platform: Option<&'a str>,
+    pub expect_unit_id: Option<&'a str>,
+    /// Anti-rollback state file (`None`: no rollback check, the chain is
+    /// not consulted either).
+    pub state_file: Option<&'a Path>,
+    /// Operator rollback flag (exact digest).
+    pub allow_rollback: Option<&'a str>,
+    /// Latest accepted-profile record from the black box (see
+    /// [`reconcile_with_chain`]).
+    pub chain: Option<&'a AcceptedState>,
+}
+
+/// A profile [`evaluate_profile_trust`] accepts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Accepted {
+    pub verified: VerifiedProfile,
+    /// The rollback decision (`None` without a state file).
+    pub decision: Option<RollbackDecision>,
+    /// The state file content to persist before enforcing (`None`:
+    /// unchanged). A failed write must refuse the profile.
+    pub state_write: Option<AcceptedState>,
+    /// What to record in the black box once enforcing ([`accepted_note`]);
+    /// `Some` for every accepted locked profile.
+    pub record: Option<AcceptedState>,
+}
+
+/// The outcome of [`evaluate_profile_trust`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrustEvaluation {
+    pub result: Result<Accepted, ProfileFileError>,
+    /// The state file disagrees with the black box (reported whatever the
+    /// result).
+    pub alarm: Option<StateAlarm>,
+}
+
+/// The full trust decision for the profile at `path` whose exact text is
+/// `raw` (the `.sig` is read next to it): strict file check, signature
+/// under the trust file's keys, trust roots and the trust file's signed
+/// floor, revocation list (validity, freshness, revoked digest / key),
+/// platform / unit, and anti-rollback against the state file reconciled
+/// with the black-box record. Nothing is written. Drafts need neither
+/// signature nor revocation check (they are observe-only); a broken trust
+/// configuration matters only for a locked profile.
+pub fn evaluate_profile_trust(path: &Path, raw: &str, inp: &TrustInputs<'_>) -> TrustEvaluation {
+    let base = inp.state_file.map(|sp| {
+        load_state(sp).map(|cur| {
+            let (b, a) = reconcile_with_chain(cur.as_ref(), inp.chain);
+            (cur, b, a)
+        })
+    });
+    let alarm = match &base {
+        Some(Ok((_, _, a))) => a.clone(),
+        _ => None,
+    };
+    TrustEvaluation {
+        result: evaluate_inner(path, raw, inp, base),
+        alarm,
+    }
+}
+
+type Baseline = Result<
+    (
+        Option<AcceptedState>,
+        Option<AcceptedState>,
+        Option<StateAlarm>,
+    ),
+    ProfileTrustError,
+>;
+
+fn evaluate_inner(
+    path: &Path,
+    raw: &str,
+    inp: &TrustInputs<'_>,
+    base: Option<Baseline>,
+) -> Result<Accepted, ProfileFileError> {
+    let roots = inp.trust_roots.map(load_trust_roots);
+    let (anchors, floor, setup_err) = match inp.trusted_keys {
+        None => (None, None, None),
+        Some(p) => {
+            let r = match &roots {
+                Some(Ok(r)) => Some(r),
+                _ => None,
+            };
+            match load_trust_file(p, r) {
+                Ok(tf) => (Some(tf.keys), tf.min_profile_version, None),
+                Err(e) => (None, None, Some(e)),
+            }
+        }
+    };
+    let policy = TrustPolicy {
+        anchors,
+        expect_platform: inp.expect_platform.map(str::to_string),
+        expect_unit_id: inp.expect_unit_id.map(str::to_string),
+    };
+    let sig_path = sig_path_for(path);
+    let sig_name = sig_path.display().to_string();
+    let verified = match read_optional_sig(&sig_path) {
+        Ok(sig) => verify_profile_text(raw, sig.as_deref(), &sig_name, &policy),
+        Err(e) => match verify_profile_text(raw, None, &sig_name, &policy) {
+            Err(ProfileFileError::Untrusted {
+                reason: ProfileTrustError::MissingSignature { .. },
+            }) if policy.anchors.is_some() => Err(ProfileTrustError::MalformedSignature {
+                detail: format!("{sig_name}: {e}"),
+            }
+            .into()),
+            other => other,
+        },
+    };
+    let verified = match (verified, setup_err) {
+        (
+            Err(ProfileFileError::Untrusted {
+                reason: ProfileTrustError::NoTrustAnchors,
+            }),
+            Some(e),
+        ) => return Err(e.into()),
+        (v, _) => v?,
+    };
+    let locked = verified.profile.locked;
+    let mut revocation: Option<(u64, String)> = None;
+    if locked {
+        let roots = match roots {
+            None => None,
+            Some(Ok(r)) => Some(r),
+            Some(Err(e)) => return Err(e.into()),
+        };
+        match inp.revocation_list {
+            Some(p) => {
+                let Some(r) = roots.as_ref() else {
+                    return Err(ProfileTrustError::Revocations {
+                        detail: "no trust_roots configured: the list cannot be authenticated"
+                            .into(),
+                    }
+                    .into());
+                };
+                match load_revocation_list(p, r)? {
+                    Some(list) => {
+                        list.check(&verified)?;
+                        revocation = Some((list.serial, list.digest()));
+                    }
+                    None if inp.revocation_policy == RevocationPolicy::Required => {
+                        return Err(ProfileTrustError::RevocationListMissing {
+                            path: p.display().to_string(),
+                        }
+                        .into())
+                    }
+                    None => {}
+                }
+            }
+            None if inp.revocation_policy == RevocationPolicy::Required => {
+                return Err(ProfileTrustError::RevocationListMissing {
+                    path: "(revocation_list not configured)".into(),
+                }
+                .into())
+            }
+            None => {}
+        }
+        if let (Some(f), Some(v)) = (floor, verified.version()) {
+            if v < f {
+                return Err(ProfileTrustError::BelowFloor {
+                    floor: f,
+                    offered_version: v,
+                }
+                .into());
+            }
+        }
+    }
+    let record = AcceptedState::of(&verified)
+        .filter(|_| locked)
+        .map(|mut s| {
+            if let Some((serial, digest)) = &revocation {
+                s.revocation_serial = Some(*serial);
+                s.revocation_digest = Some(digest.clone());
+            }
+            s
+        });
+    let Some(base) = base else {
+        return Ok(Accepted {
+            verified,
+            decision: None,
+            state_write: None,
+            record,
+        });
+    };
+    let (current, baseline, _) = base?;
+    if locked {
+        if let Some((bs, bd)) = baseline.as_ref().and_then(AcceptedState::revocation) {
+            match &revocation {
+                None => {
+                    return Err(ProfileTrustError::RevocationListRemoved {
+                        accepted_serial: bs,
+                    }
+                    .into())
+                }
+                Some((s, _)) if *s < bs => {
+                    return Err(ProfileTrustError::RevocationRollback {
+                        accepted_serial: bs,
+                        offered_serial: *s,
+                    }
+                    .into())
+                }
+                Some((s, d)) if *s == bs && d != bd => {
+                    return Err(ProfileTrustError::RevocationEquivocation { serial: bs }.into())
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    let decision = check_rollback(baseline.as_ref(), &verified, inp.allow_rollback)?;
+    let state_write = match &record {
+        Some(r) if current.as_ref() != Some(r) => Some(r.clone()),
+        _ => None,
+    };
+    Ok(Accepted {
+        verified,
+        decision: Some(decision),
+        state_write,
+        record,
+    })
 }
 
 #[cfg(test)]
@@ -1259,6 +2029,8 @@ mod tests {
             unit_id: None,
             profile_version: 1,
             digest: file_digest(b"x"),
+            revocation_serial: None,
+            revocation_digest: None,
         })
         .unwrap();
         let anchors = ring(&[&k]);
@@ -1449,5 +2221,566 @@ mod tests {
             Path::new("/a/b.json.sig")
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ------------------------------------------- roots, floor, revocations --
+
+    fn root(n: u8) -> Ed25519SigningKey {
+        Ed25519SigningKey::from_seed(format!("root{n}"), &[100 + n; 32]).unwrap()
+    }
+
+    fn roots(keys: &[&Ed25519SigningKey]) -> TrustRoots {
+        let vks: Vec<_> = keys.iter().map(|k| k.verifying_key()).collect();
+        parse_trust_roots(&trust_roots_text(&vks)).unwrap()
+    }
+
+    fn rl(
+        serial: u64,
+        digests: &[&str],
+        key_ids: &[&str],
+        k: &Ed25519SigningKey,
+    ) -> RevocationList {
+        RevocationList::create(
+            serial,
+            1_790_000_000,
+            digests.iter().map(|s| s.to_string()),
+            key_ids.iter().map(|s| s.to_string()),
+            k,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn revocation_list_round_trip_and_tamper() {
+        let r = root(1);
+        let rs = roots(&[&r]);
+        let d = file_digest(b"p");
+        let l = rl(3, &[&d, &d], &["k9", "k1"], &r);
+        // Sorted and deduplicated.
+        assert_eq!(l.revoked_digests, vec![d.clone()]);
+        assert_eq!(l.revoked_key_ids, vec!["k1".to_string(), "k9".to_string()]);
+        let text = l.to_text();
+        let p = RevocationList::parse(&text).unwrap();
+        p.verify(&rs).unwrap();
+        assert_eq!(p.digest(), l.digest());
+        // Whitespace does not change the identity; content does.
+        let compact = serde_json::to_string(&p).unwrap();
+        assert_eq!(
+            RevocationList::parse(&compact).unwrap().digest(),
+            l.digest()
+        );
+        // Tampering with any signed value breaks the signature.
+        for edit in [
+            text.replace("\"serial\": 3", "\"serial\": 4"),
+            text.replace("1790000000", "1790000001"),
+            text.replace("\"k9\"", "\"k8\""),
+            text.replace(&d, &file_digest(b"q")),
+        ] {
+            let t = RevocationList::parse(&edit).unwrap();
+            assert!(
+                matches!(t.verify(&rs), Err(ProfileTrustError::Revocations { .. })),
+                "{edit}"
+            );
+        }
+        // Signed by a key that is not a root (e.g. a profile key).
+        let forged = rl(3, &[], &[], &key(1));
+        assert!(forged
+            .verify(&rs)
+            .unwrap_err()
+            .to_string()
+            .contains("not a trust root"));
+        // Impostor claiming the root's key id.
+        let imp = Ed25519SigningKey::from_seed("root1", &[7; 32]).unwrap();
+        assert!(rl(3, &[], &[], &imp).verify(&rs).is_err());
+        // HMAC signer refused at creation.
+        let h = robodr_blackbox::HmacSha256Key::new("root1", &[7; 32]).unwrap();
+        assert!(RevocationList::create(1, 0, [], [], &h).is_err());
+        assert!(RevocationList::create(0, 0, [], [], &r).is_err());
+    }
+
+    #[test]
+    fn revocation_list_malformed_and_hostile() {
+        let r = root(1);
+        let text = rl(2, &[&file_digest(b"p")], &["k1"], &r).to_text();
+        for bad in [
+            String::new(),
+            "{}".into(),
+            "[]".into(),
+            text.replace(REVOCATION_FORMAT, "robodr-profile-revocations/v9"),
+            text.replace("\"serial\": 2", "\"serial\": 0"),
+            text.replace("\"serial\": 2", "\"serial\": -1"),
+            text.replace("\"serial\": 2", "\"serial\": 1e400"),
+            text.replace("sha256:", "md5:"),
+            text.replace("\"k1\"", "\"\""),
+            text.replace("\"k1\"", "\"k1\", \"k1\""),
+            text.replace("\"serial\"", "\"extra\": 1,\n  \"serial\""),
+            text.replace("\"serial\"", "\"serial\": 5,\n  \"serial\""),
+            text.replace("\"ed25519\"", "\"hmac-sha256\""),
+        ] {
+            assert!(
+                matches!(
+                    RevocationList::parse(&bad),
+                    Err(ProfileTrustError::Revocations { .. })
+                ),
+                "{bad}"
+            );
+        }
+        for n in 0..text.trim_end().len() {
+            assert!(RevocationList::parse(&text[..n]).is_err(), "prefix {n}");
+        }
+        let many: Vec<String> = (0..=MAX_REVOKED_ENTRIES).map(|i| format!("k{i}")).collect();
+        assert!(RevocationList::create(1, 0, [], many, &r).is_err());
+        // Byte flips never panic.
+        let mut x: u32 = 0x1234_5678;
+        for _ in 0..500 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            let mut b = text.clone().into_bytes();
+            let i = x as usize % b.len();
+            b[i] = (x >> 8) as u8;
+            if let Ok(t) = String::from_utf8(b) {
+                if let Ok(l) = RevocationList::parse(&t) {
+                    let _ = l.verify(&roots(&[&r]));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trust_file_floor_needs_root_signature() {
+        let k = key(1);
+        let r = root(1);
+        let rs = roots(&[&r]);
+        let floored = trust_file_text(&[k.verifying_key()], Some(5));
+        let sig = ProfileSignature::create_for(SigKind::TrustFile, floored.as_bytes(), &r)
+            .unwrap()
+            .to_text();
+        let tf = parse_trust_file(&floored, Some(&sig), "t.sig", Some(&rs)).unwrap();
+        assert_eq!(tf.min_profile_version, Some(5));
+        assert_eq!(tf.signed_by.as_deref(), Some("root1"));
+        // No signature, no roots, or a bad signature: refused.
+        assert!(parse_trust_file(&floored, None, "t.sig", Some(&rs)).is_err());
+        assert!(parse_trust_file(&floored, Some(&sig), "t.sig", None).is_err());
+        let other = ProfileSignature::create_for(SigKind::TrustFile, floored.as_bytes(), &root(2))
+            .unwrap()
+            .to_text();
+        assert!(parse_trust_file(&floored, Some(&other), "t.sig", Some(&rs)).is_err());
+        // A profile signature cannot stand in for a trust-file signature.
+        let psig = ProfileSignature::create(floored.as_bytes(), &r)
+            .unwrap()
+            .to_text();
+        assert!(parse_trust_file(&floored, Some(&psig), "t.sig", Some(&rs)).is_err());
+        // Signature over other bytes (floor lowered after signing).
+        let lowered = floored.replace("\"min_profile_version\": 5", "\"min_profile_version\": 1");
+        assert!(parse_trust_file(&lowered, Some(&sig), "t.sig", Some(&rs)).is_err());
+        // Floor 0, a root among the profile keys, a floor in the roots file.
+        let zero = trust_file_text(&[k.verifying_key()], Some(0));
+        assert!(parse_trust_file(&zero, None, "t", None).is_err());
+        let overlap = trust_file_text(&[k.verifying_key(), r.verifying_key()], None);
+        assert!(parse_trust_file(&overlap, None, "t", Some(&rs))
+            .unwrap_err()
+            .to_string()
+            .contains("distinct"));
+        let roots_with_floor = trust_roots_text(&[r.verifying_key()])
+            .replace("\"keys\"", "\"min_profile_version\": 2,\n  \"keys\"");
+        assert!(parse_trust_roots(&roots_with_floor).is_err());
+        // The roots file and a trust file are not interchangeable.
+        assert!(parse_trust_roots(&trust_keys_text(&[r.verifying_key()])).is_err());
+        assert!(parse_trust_keys(&trust_roots_text(&[r.verifying_key()])).is_err());
+        // Unsigned, no floor: fine, with or without roots.
+        let plain = trust_keys_text(&[k.verifying_key()]);
+        assert!(parse_trust_file(&plain, None, "t", Some(&rs)).is_ok());
+        assert!(parse_trust_file(&plain, None, "t", None).is_ok());
+    }
+
+    fn st(version: u64, salt: &str, rev: Option<(u64, &str)>) -> AcceptedState {
+        let mut s = AcceptedState::of(&verified(version, salt)).unwrap();
+        if let Some((n, d)) = rev {
+            s.revocation_serial = Some(n);
+            s.revocation_digest = Some(file_digest(d.as_bytes()));
+        }
+        s
+    }
+
+    #[test]
+    fn chain_reconciliation() {
+        let s3 = st(3, "", None);
+        assert_eq!(reconcile_with_chain(None, None), (None, None));
+        assert_eq!(
+            reconcile_with_chain(Some(&s3), None),
+            (Some(s3.clone()), None)
+        );
+        // State deleted.
+        let (b, a) = reconcile_with_chain(None, Some(&s3));
+        assert_eq!(b, Some(s3.clone()));
+        assert_eq!(a.unwrap().reason, StateAlarmReason::StateMissing);
+        // State ahead of the chain (stopped before the note): normal.
+        let s4 = st(4, "", None);
+        assert_eq!(
+            reconcile_with_chain(Some(&s4), Some(&s3)),
+            (Some(s4.clone()), None)
+        );
+        // State behind: lower version, or same version other digest.
+        let (b, a) = reconcile_with_chain(Some(&s3), Some(&s4));
+        assert_eq!(b, Some(s4.clone()));
+        assert_eq!(a.unwrap().reason, StateAlarmReason::StateBehindChain);
+        let other3 = st(3, "x", None);
+        let (b, a) = reconcile_with_chain(Some(&other3), Some(&s3));
+        assert_eq!(b, Some(s3.clone()));
+        assert!(a.is_some());
+        // Revocation serial behind (profile equal): revocation from chain.
+        let s3r1 = st(3, "", Some((1, "a")));
+        let s3r2 = st(3, "", Some((2, "b")));
+        let (b, a) = reconcile_with_chain(Some(&s3r1), Some(&s3r2));
+        assert_eq!(b, Some(s3r2.clone()));
+        assert!(a.is_some());
+        // Profile ahead in state, revocation ahead in chain: mixed.
+        let s4r1 = st(4, "", Some((1, "a")));
+        let (b, a) = reconcile_with_chain(Some(&s4r1), Some(&s3r2));
+        let b = b.unwrap();
+        assert_eq!((b.profile_version, b.revocation_serial), (4, Some(2)));
+        assert!(a.unwrap().to_string().contains("behind"));
+        // Same everything: nothing.
+        assert_eq!(
+            reconcile_with_chain(Some(&s3r2), Some(&s3r2)),
+            (Some(s3r2.clone()), None)
+        );
+    }
+
+    #[test]
+    fn accepted_notes_round_trip_and_hostile_payloads() {
+        let s = st(7, "", Some((2, "x")));
+        let n = accepted_note(&s, Some("k1"), Some(RollbackDecision::Upgrade));
+        let bytes = serde_json::to_vec(&n).unwrap();
+        assert_eq!(accepted_from_note(&bytes), Some(s.clone()));
+        // A heartbeat carrying the same member.
+        let hb = serde_json::json!({"kind": "robodr.agentd_heartbeat", "profile_accepted": s});
+        assert_eq!(
+            accepted_from_note(&serde_json::to_vec(&hb).unwrap()),
+            Some(s.clone())
+        );
+        for bad in [
+            &b""[..],
+            b"null",
+            b"[]",
+            b"{\"profile_accepted\": 1}",
+            b"{\"profile_accepted\": {\"format\": \"x\"}}",
+            b"{\"kind\": \"robodr.agentd_heartbeat\"}",
+            b"\xff\xfe",
+        ] {
+            assert_eq!(accepted_from_note(bad), None);
+        }
+        let mut zero = s.clone();
+        zero.profile_version = 0;
+        let v = serde_json::json!({ "profile_accepted": zero });
+        assert_eq!(accepted_from_note(&serde_json::to_vec(&v).unwrap()), None);
+        let mut half = s;
+        half.revocation_digest = None;
+        let v = serde_json::json!({ "profile_accepted": half });
+        assert_eq!(accepted_from_note(&serde_json::to_vec(&v).unwrap()), None);
+    }
+
+    /// Files for evaluator tests: trust file, roots, profiles, lists.
+    struct Fx {
+        dir: PathBuf,
+        trust: PathBuf,
+        roots: PathBuf,
+        revs: PathBuf,
+        state: PathBuf,
+    }
+
+    impl Fx {
+        fn new(tag: &str, floor: Option<u64>) -> Self {
+            let dir = tmpdir(tag);
+            let trust = dir.join("trust.json");
+            let text = trust_file_text(&[key(1).verifying_key(), key(2).verifying_key()], floor);
+            std::fs::write(&trust, &text).unwrap();
+            if floor.is_some() {
+                let sig =
+                    ProfileSignature::create_for(SigKind::TrustFile, text.as_bytes(), &root(1))
+                        .unwrap();
+                std::fs::write(sig_path_for(&trust), sig.to_text()).unwrap();
+            }
+            let roots = dir.join("roots.json");
+            std::fs::write(&roots, trust_roots_text(&[root(1).verifying_key()])).unwrap();
+            Self {
+                revs: dir.join("revocations.json"),
+                state: dir.join("state.json"),
+                dir,
+                trust,
+                roots,
+            }
+        }
+
+        fn profile(&self, name: &str, version: u64, k: &Ed25519SigningKey) -> (PathBuf, String) {
+            let (text, sig) = signed(&locked(version), k);
+            let p = self.dir.join(name);
+            std::fs::write(&p, &text).unwrap();
+            std::fs::write(sig_path_for(&p), sig).unwrap();
+            (p, text)
+        }
+
+        fn list(&self, l: &RevocationList) {
+            std::fs::write(&self.revs, l.to_text()).unwrap();
+        }
+
+        fn inputs(&self) -> TrustInputs<'_> {
+            TrustInputs {
+                trusted_keys: Some(&self.trust),
+                trust_roots: Some(&self.roots),
+                revocation_list: Some(&self.revs),
+                state_file: Some(&self.state),
+                ..Default::default()
+            }
+        }
+    }
+
+    impl Drop for Fx {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn refused(e: &TrustEvaluation) -> ProfileTrustError {
+        match &e.result {
+            Err(ProfileFileError::Untrusted { reason }) => reason.clone(),
+            other => panic!("expected a trust refusal, got {other:?}"),
+        }
+    }
+
+    /// Evaluate and persist the state write (as a loader would).
+    fn eval(p: &Path, text: &str, i: &TrustInputs<'_>) -> TrustEvaluation {
+        let e = evaluate_profile_trust(p, text, i);
+        if let Ok(a) = &e.result {
+            if let (Some(w), Some(sp)) = (&a.state_write, i.state_file) {
+                store_state(sp, w).unwrap();
+            }
+        }
+        e
+    }
+
+    #[test]
+    fn evaluator_revocations() {
+        let fx = Fx::new("eval-rev", None);
+        let (p, text) = fx.profile("p.json", 2, &key(1));
+        let digest = file_digest(text.as_bytes());
+        // Optional policy, no list: accepted.
+        let e = eval(&p, &text, &fx.inputs());
+        let a = e.result.unwrap();
+        assert_eq!(a.record.as_ref().unwrap().revocation_serial, None);
+        assert!(e.alarm.is_none());
+        // Required policy, no list: refused.
+        let mut req = fx.inputs();
+        req.revocation_policy = RevocationPolicy::Required;
+        assert!(matches!(
+            refused(&evaluate_profile_trust(&p, &text, &req)),
+            ProfileTrustError::RevocationListMissing { .. }
+        ));
+        // Revoked digest.
+        fx.list(&rl(1, &[&digest], &[], &root(1)));
+        assert_eq!(
+            refused(&eval(&p, &text, &fx.inputs())),
+            ProfileTrustError::RevokedProfile {
+                digest: digest.clone(),
+                serial: 1
+            }
+        );
+        // Revoked signing key (the profile itself is not listed).
+        fx.list(&rl(2, &[], &["k1"], &root(1)));
+        assert_eq!(
+            refused(&eval(&p, &text, &fx.inputs())),
+            ProfileTrustError::RevokedKey {
+                key_id: "k1".into(),
+                serial: 2
+            }
+        );
+        // A profile signed by another, unrevoked key is accepted and the
+        // list's serial is recorded in the state.
+        let (p2, t2) = fx.profile("p2.json", 3, &key(2));
+        let a = eval(&p2, &t2, &fx.inputs()).result.unwrap();
+        assert_eq!(a.decision, Some(RollbackDecision::Upgrade));
+        let saved = load_state(&fx.state).unwrap().unwrap();
+        assert_eq!(saved.revocation_serial, Some(2));
+        // An older list is refused (anti-rollback for the list itself).
+        let old = rl(1, &[], &[], &root(1));
+        fx.list(&old);
+        assert_eq!(
+            refused(&eval(&p2, &t2, &fx.inputs())),
+            ProfileTrustError::RevocationRollback {
+                accepted_serial: 2,
+                offered_serial: 1
+            }
+        );
+        // Same serial, other content.
+        fx.list(&rl(2, &[], &["k1", "k7"], &root(1)));
+        assert_eq!(
+            refused(&eval(&p2, &t2, &fx.inputs())),
+            ProfileTrustError::RevocationEquivocation { serial: 2 }
+        );
+        // The list deleted after one was accepted (optional policy).
+        std::fs::remove_file(&fx.revs).unwrap();
+        assert_eq!(
+            refused(&eval(&p2, &t2, &fx.inputs())),
+            ProfileTrustError::RevocationListRemoved { accepted_serial: 2 }
+        );
+        // Tampered list (valid JSON, signature broken).
+        let good = rl(3, &[], &["k1"], &root(1)).to_text();
+        std::fs::write(&fx.revs, good.replace("\"k1\"", "\"k0\"")).unwrap();
+        assert!(matches!(
+            refused(&eval(&p2, &t2, &fx.inputs())),
+            ProfileTrustError::Revocations { .. }
+        ));
+        // A list signed by a profile key, not a root.
+        fx.list(&rl(3, &[], &["k1"], &key(2)));
+        assert!(refused(&eval(&p2, &t2, &fx.inputs()))
+            .to_string()
+            .contains("not a trust root"));
+        // Newer valid list: accepted, state advanced (profile unchanged).
+        fx.list(&rl(3, &[], &["k1"], &root(1)));
+        let a = eval(&p2, &t2, &fx.inputs()).result.unwrap();
+        assert_eq!(a.decision, Some(RollbackDecision::Same));
+        assert!(a.state_write.is_some());
+        assert_eq!(
+            load_state(&fx.state).unwrap().unwrap().revocation_serial,
+            Some(3)
+        );
+        // Again: nothing to write.
+        assert!(eval(&p2, &t2, &fx.inputs())
+            .result
+            .unwrap()
+            .state_write
+            .is_none());
+        // A list without roots configured cannot be checked.
+        let mut nr = fx.inputs();
+        nr.trust_roots = None;
+        assert!(matches!(
+            refused(&evaluate_profile_trust(&p2, &t2, &nr)),
+            ProfileTrustError::Revocations { .. }
+        ));
+        // Drafts ignore revocation (observe-only anyway) but not rollback.
+        let mut d = locked(1);
+        d.locked = false;
+        d.metadata = None;
+        let dt = crate::to_json(&d).unwrap();
+        let dp = fx.dir.join("draft.json");
+        std::fs::write(&dp, &dt).unwrap();
+        let mut ns = fx.inputs();
+        ns.state_file = None;
+        assert!(evaluate_profile_trust(&dp, &dt, &ns).result.is_ok());
+    }
+
+    #[test]
+    fn evaluator_state_deleted_but_chain_has_higher_version() {
+        let fx = Fx::new("eval-chain", None);
+        let (p1, t1) = fx.profile("v1.json", 1, &key(1));
+        let (p3, t3) = fx.profile("v3.json", 3, &key(1));
+        let rec3 = eval(&p3, &t3, &fx.inputs()).result.unwrap().record.unwrap();
+        // The attacker deletes the state and offers v1.
+        std::fs::remove_file(&fx.state).unwrap();
+        let mut i = fx.inputs();
+        i.chain = Some(&rec3);
+        let e = eval(&p1, &t1, &i);
+        assert!(matches!(
+            refused(&e),
+            ProfileTrustError::Rollback {
+                accepted_version: 3,
+                offered_version: 1,
+                ..
+            }
+        ));
+        assert_eq!(
+            e.alarm.as_ref().unwrap().reason,
+            StateAlarmReason::StateMissing
+        );
+        assert!(!fx.state.exists(), "a refusal writes nothing");
+        // The state rewritten to v1 instead of deleted: same outcome.
+        let s1 = AcceptedState::of(
+            &verify_profile_text(
+                &t1,
+                Some(&std::fs::read_to_string(sig_path_for(&p1)).unwrap()),
+                "x",
+                &policy(&[&key(1)]),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        store_state(&fx.state, &s1).unwrap();
+        let e = eval(&p1, &t1, &i);
+        assert!(matches!(refused(&e), ProfileTrustError::Rollback { .. }));
+        assert_eq!(
+            e.alarm.as_ref().unwrap().reason,
+            StateAlarmReason::StateBehindChain
+        );
+        // The real profile still loads; the alarm is reported and the state
+        // repaired from the chain.
+        std::fs::remove_file(&fx.state).unwrap();
+        let e = eval(&p3, &t3, &i);
+        assert!(e.alarm.is_some());
+        let a = e.result.unwrap();
+        assert_eq!(a.decision, Some(RollbackDecision::Same));
+        assert_eq!(a.state_write.as_ref(), Some(&rec3));
+        assert_eq!(load_state(&fx.state).unwrap(), Some(rec3.clone()));
+        // Consistent again: no alarm.
+        assert!(eval(&p3, &t3, &i).alarm.is_none());
+        // The operator's explicit rollback flag still works against the
+        // chain baseline.
+        std::fs::remove_file(&fx.state).unwrap();
+        let d1 = file_digest(t1.as_bytes());
+        i.allow_rollback = Some(&d1);
+        let a = eval(&p1, &t1, &i).result.unwrap();
+        assert_eq!(a.decision, Some(RollbackDecision::OperatorRollback));
+        // Without a state file configured the chain is not consulted.
+        let mut ns = fx.inputs();
+        ns.state_file = None;
+        ns.chain = Some(&rec3);
+        let e = evaluate_profile_trust(&p1, &t1, &ns);
+        assert!(e.result.is_ok() && e.alarm.is_none());
+    }
+
+    #[test]
+    fn evaluator_signed_floor() {
+        let fx = Fx::new("eval-floor", Some(3));
+        let (p2, t2) = fx.profile("v2.json", 2, &key(1));
+        let (p3, t3) = fx.profile("v3.json", 3, &key(1));
+        let d2 = file_digest(t2.as_bytes());
+        let mut i = fx.inputs();
+        i.state_file = None;
+        assert_eq!(
+            refused(&evaluate_profile_trust(&p2, &t2, &i)),
+            ProfileTrustError::BelowFloor {
+                floor: 3,
+                offered_version: 2
+            }
+        );
+        // allow_rollback cannot lower the floor.
+        let mut j = fx.inputs();
+        j.allow_rollback = Some(&d2);
+        assert!(matches!(
+            refused(&evaluate_profile_trust(&p2, &t2, &j)),
+            ProfileTrustError::BelowFloor { .. }
+        ));
+        assert!(evaluate_profile_trust(&p3, &t3, &i).result.is_ok());
+        // The floor without its root signature: trust file invalid.
+        std::fs::remove_file(sig_path_for(&fx.trust)).unwrap();
+        assert!(matches!(
+            refused(&evaluate_profile_trust(&p3, &t3, &i)),
+            ProfileTrustError::TrustFile { .. }
+        ));
+        // Floor signed but roots not configured: invalid too.
+        let text = std::fs::read_to_string(&fx.trust).unwrap();
+        let sig =
+            ProfileSignature::create_for(SigKind::TrustFile, text.as_bytes(), &root(1)).unwrap();
+        std::fs::write(sig_path_for(&fx.trust), sig.to_text()).unwrap();
+        let mut nr = i;
+        nr.trust_roots = None;
+        nr.revocation_list = None;
+        assert!(matches!(
+            refused(&evaluate_profile_trust(&p3, &t3, &nr)),
+            ProfileTrustError::TrustFile { .. }
+        ));
+        // A broken roots file refuses locked profiles.
+        std::fs::write(&fx.roots, "{").unwrap();
+        assert!(evaluate_profile_trust(&p3, &t3, &i).result.is_err());
     }
 }
