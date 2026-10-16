@@ -50,9 +50,17 @@ If the Pulsar source tree is present (default ``vendor/pulsar`` or
     ``shipped_rules_are_valid`` test proves compile in the real engine. They
     must all pass here too; that calibrates this checker against the engine.
 
+Finally it runs EVERY rule against the benign event corpus
+(``scripts/rules_benign_corpus.json``: ros2 launch, ros2 bag, torch model
+load, colcon build, apt upgrade with update-initramfs, systemd user units)
+and fails if any rule fires on a benign event, unless that event allow-lists
+the rule with a reason (audit-trail rules such as "Debian package installed"
+on apt-get upgrade). Stale allowances fail too. See ``run_benign``.
+
 Usage:
   scripts/validate_rules.py [--rules-dir rules] [--pulsar-src vendor/pulsar]
-                            [--fixtures scripts/rules_fixtures.json] [--strict]
+                            [--fixtures scripts/rules_fixtures.json]
+                            [--benign scripts/rules_benign_corpus.json] [--strict]
   scripts/validate_rules.py --self-test
 
 Exit status 0 = everything loads, type-checks and fixtures match.
@@ -764,6 +772,103 @@ def run_fixtures(fixtures_path: Path, rules: list[LoadedRule], report: Report) -
     return len(fixtures)
 
 
+HEADER_DEFAULT = {"image": "", "pid": 1000, "parent_pid": 1, "uid": 0, "gid": 0,
+                  "container": None, "source": "test"}
+
+
+def run_benign(corpus_path: Path, rules: list[LoadedRule], report: Report) -> tuple[int, int]:
+    """Evaluate EVERY rule against every event of the benign corpus.
+
+    A benign event must fire no rule at all, except the rules it lists in
+    ``allow`` (each with a ``reason``): those are maintenance actions whose
+    alert IS the audit trail (``apt-get upgrade`` -> "Debian package
+    installed") or documented, accepted noise. Any other hit is an error, and
+    so is an ``allow`` entry that no longer fires (stale allowance), so the
+    list cannot silently grow into a blanket exclusion. Events must carry
+    every payload field of their type, so every rule can be evaluated.
+    Returns (events, allowed hits).
+    """
+    try:
+        doc = json.loads(corpus_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        report.errors.append(f"{corpus_path}: cannot load benign corpus: {e}")
+        return 0, 0
+    by_name = {r.name: r for r in rules}
+    n_events = n_allowed = 0
+    for si, sc in enumerate(doc.get("scenarios", [])):
+        sname = sc.get("scenario", f"#{si}")
+        for ei, ev in enumerate(sc.get("events", [])):
+            n_events += 1
+            label = f"{corpus_path.name}: [{sname}] #{ei} ({ev.get('note', '')})"
+            ty = ev.get("type")
+            if ty not in PAYLOADS:
+                report.errors.append(f"{label}: unknown event type {ty!r}")
+                continue
+            payload = ev.get("payload", {})
+            if set(payload) != set(PAYLOADS[ty]):
+                report.errors.append(f"{label}: payload fields {sorted(payload)} != "
+                                     f"{ty} fields {sorted(PAYLOADS[ty])}")
+                continue
+            hdr = ev.get("header", {})
+            if set(hdr) - set(HEADER_DEFAULT):
+                report.errors.append(f"{label}: unknown header fields {sorted(set(hdr) - set(HEADER_DEFAULT))}")
+                continue
+            header = dict(HEADER_DEFAULT)
+            header.update(hdr)
+            event = {"header": header, "payload": payload}
+            allow = ev.get("allow", [])
+            for a in allow:
+                if a not in by_name:
+                    report.errors.append(f"{label}: allow names unknown rule {a!r}")
+            if allow and not ev.get("reason"):
+                report.errors.append(f"{label}: 'allow' needs a 'reason'")
+            fired = set()
+            for r in rules:
+                if r.type != ty:
+                    continue
+                try:
+                    if evaluate(r.ast, event, ty):
+                        fired.add(r.name)
+                except RuleError as e:
+                    report.errors.append(f"{label}: rule {r.name!r}: {e}")
+            for name in sorted(fired - set(allow)):
+                report.errors.append(f"{label}: FALSE POSITIVE: rule {name!r} fired on a benign event")
+            for name in sorted(set(allow) - fired):
+                if name in by_name:
+                    report.errors.append(f"{label}: stale allowance: rule {name!r} no longer fires")
+            n_allowed += len(fired & set(allow))
+    if n_events == 0:
+        report.errors.append(f"{corpus_path}: benign corpus has no events")
+    return n_events, n_allowed
+
+
+def _benign_selftest() -> int:
+    """run_benign must report an unexpected hit, a stale allowance and an
+    incomplete payload (in-memory corpus)."""
+    import tempfile
+    rep = Report()
+    validate_text(_rule('payload.filename ENDS_WITH "/sh"'), "t", rep)
+    corpus = {"scenarios": [{"scenario": "s", "events": [
+        {"note": "fires", "type": "Exec", "payload": {"filename": "/bin/sh", "argc": 1, "argv": ["sh"]}},
+        {"note": "stale", "type": "Exec", "allow": ["x"], "reason": "r",
+         "payload": {"filename": "/bin/ls", "argc": 1, "argv": ["ls"]}},
+        {"note": "incomplete", "type": "Exec", "payload": {"filename": "/bin/ls"}},
+        {"note": "allowed", "type": "Exec", "allow": ["x"], "reason": "r",
+         "payload": {"filename": "/bin/sh", "argc": 1, "argv": ["sh"]}},
+    ]}]}
+    with tempfile.TemporaryDirectory() as td:
+        cp = Path(td) / "c.json"
+        cp.write_text(json.dumps(corpus), encoding="utf-8")
+        out = Report()
+        n, allowed = run_benign(cp, rep.rules, out)
+    want = ["FALSE POSITIVE", "stale allowance", "payload fields"]
+    ok = (n == 4 and allowed == 1 and len(out.errors) == 3
+          and all(any(w in e for e in out.errors) for w in want))
+    if not ok:
+        print(f"self-test benign corpus checker failed: {out.errors}")
+    return 0 if ok else 1
+
+
 # ---------------------------------------------------------------------------
 # Drift check against the vendored Pulsar source
 # ---------------------------------------------------------------------------
@@ -1139,7 +1244,8 @@ def self_test() -> int:
         if got != rust_ok:
             print(f"self-test oracle: {ty} {value!r}: validator {got}, Rust {rust_ok}")
             fails += 1
-    total = len(cases) + 4 + len(_RUST_ORACLE)
+    fails += _benign_selftest()
+    total = len(cases) + 5 + len(_RUST_ORACLE)
     print(f"self-test: {total - fails}/{total} passed")
     return 1 if fails else 0
 
@@ -1191,6 +1297,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--pulsar-src", type=Path, default=None,
                     help="Pulsar checkout (default: vendor/pulsar if populated)")
     ap.add_argument("--fixtures", type=Path, default=root / "scripts/rules_fixtures.json")
+    ap.add_argument("--benign", type=Path, default=root / "scripts/rules_benign_corpus.json",
+                    help="benign event corpus: ANY rule firing on it (outside its 'allow' list) fails")
     ap.add_argument("--strict", action="store_true", help="treat warnings as errors")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args(argv)
@@ -1226,11 +1334,16 @@ def main(argv: list[str]) -> int:
     rep = Report()
     validate_dir(args.rules_dir, rep)
     nfx = run_fixtures(args.fixtures, rep.rules, rep) if args.fixtures.exists() else 0
+    # The benign corpus is mandatory: a missing file is an error, not a skip.
+    nben, nallowed = run_benign(args.benign, rep.rules, rep)
     for w in rep.warnings:
         print(f"WARN: {w}")
     for e in rep.errors:
         print(f"ERROR: {e}")
     files = len({r.file for r in rep.rules})
+    print(f"benign corpus: {nben} events x every rule of their type, "
+          f"{nallowed} audited/accepted hits (allow-listed), "
+          f"{sum('FALSE POSITIVE' in e for e in rep.errors)} false positives")
     print(f"{args.rules_dir}: {len(rep.rules)} rules in {files} files, {nfx} fixtures, "
           f"{len(rep.errors)} errors, {len(rep.warnings)} warnings")
     if rep.errors or (args.strict and rep.warnings):

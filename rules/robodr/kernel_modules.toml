@@ -19,16 +19,30 @@
 # execve path verbatim, so "ENDS_WITH /dpkg" let any binary named dpkg write
 # modules (review finding); writing /usr/bin/dpkg itself needs root and is
 # visible to Pulsar's own rules.
+#
+# update-initramfs (run by apt on every kernel, firmware or initramfs hook
+# upgrade) copies the running kernel's modules with cp into
+# /var/tmp/mkinitramfs_XXXXXX as root. That one form is excluded from the
+# write rule: uid 0, exact cp image, path under /var/tmp/mkinitramfs_. A .ko
+# staged there by root under cp still has to be loaded (finit_module from a
+# file the ELF rules see, or insmod which Pulsar flags) or moved into
+# /lib/modules (rename/link rules below); see rules/README.md
+# "Maintenance-time exclusions".
 
 [[rules]]
 name = "RoboDR: Kernel module file written outside the package manager"
 type = "FileCreated"
 category = "persistence"
 severity = "high"
-description = "A kernel module file (.ko, .ko.xz, .ko.zst, .ko.gz) was created by something other than dpkg (exact image /usr/bin/dpkg or /bin/dpkg). Fielded robots get kernel modules only from the signed image; a freshly written .ko anywhere is a rootkit staging step. DKMS rebuilds (e.g. GPU drivers after a kernel update) also create .ko files and must happen only in the maintenance pipeline."
+description = "A kernel module file (.ko, .ko.xz, .ko.zst, .ko.gz) was created by something other than dpkg (exact image /usr/bin/dpkg or /bin/dpkg). Fielded robots get kernel modules only from the signed image; a freshly written .ko anywhere is a rootkit staging step. update-initramfs copying modules into its staging tree (root, exact cp image, /var/tmp/mkinitramfs_*) is excluded. DKMS rebuilds (e.g. GPU drivers after a kernel update) also create .ko files and must happen only in the maintenance pipeline."
 condition = '''
 (payload.filename ENDS_WITH ".ko" OR payload.filename ENDS_WITH ".ko.xz" OR payload.filename ENDS_WITH ".ko.zst" OR payload.filename ENDS_WITH ".ko.gz")
 AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
+AND NOT (
+  header.uid == 0
+  AND payload.filename STARTS_WITH "/var/tmp/mkinitramfs_"
+  AND (header.image == "/usr/bin/cp" OR header.image == "/bin/cp")
+)
 '''
 
 [[rules]]
@@ -52,5 +66,17 @@ description = "A file was renamed to a kernel module name (.ko, .ko.xz, .ko.zst,
 condition = '''
 (payload.destination ENDS_WITH ".ko" OR payload.destination ENDS_WITH ".ko.xz" OR payload.destination ENDS_WITH ".ko.zst" OR payload.destination ENDS_WITH ".ko.gz"
  OR payload.destination == "/etc/modules" OR payload.destination STARTS_WITH "/etc/modules-load.d/" OR payload.destination STARTS_WITH "/etc/modprobe.d/")
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
+'''
+
+[[rules]]
+name = "RoboDR: Kernel module file or autoload configuration linked into place outside the package manager"
+type = "FileLink"
+category = "persistence"
+severity = "high"
+description = "A hard or symbolic link with a kernel module name (.ko, .ko.xz, .ko.zst, .ko.gz), or in /etc/modules, /etc/modules-load.d or /etc/modprobe.d, was created by something other than dpkg. 'ln /var/lib/x/rk.bin /lib/modules/$(uname -r)/extra/rk.ko', a symlink to an attacker file, or open(O_TMPFILE)+linkat() put a module or an autoload entry in place without any FileCreated, write-open or rename event. Pulsar FileLink: 'source' is the new link."
+condition = '''
+(payload.source ENDS_WITH ".ko" OR payload.source ENDS_WITH ".ko.xz" OR payload.source ENDS_WITH ".ko.zst" OR payload.source ENDS_WITH ".ko.gz"
+ OR payload.source == "/etc/modules" OR payload.source STARTS_WITH "/etc/modules-load.d/" OR payload.source STARTS_WITH "/etc/modprobe.d/")
 AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
 '''

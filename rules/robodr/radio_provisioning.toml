@@ -50,3 +50,27 @@ condition = '''
  OR payload.filename STARTS_WITH "/etc/NetworkManager/system-connections/" OR payload.filename STARTS_WITH "/etc/netplan/")
 AND (payload.flags CONTAINS "O_WRONLY" OR payload.flags CONTAINS "O_RDWR")
 '''
+
+[[rules]]
+name = "RoboDR: Wireless network configuration moved into or out of place"
+type = "FileRename"
+category = "command_and_control"
+severity = "high"
+description = "A file was renamed into (or out of) the wpa_supplicant, hostapd, NetworkManager system-connections or netplan configuration directories. 'mv /home/x/evil.yaml /etc/netplan/99-x.yaml' writes the content elsewhere, so the write-open rule never sees the target directory. NetworkManager itself saves connections by write-to-temp-and-rename, so a connection change made through NetworkManager also matches (same as the write rule)."
+condition = '''
+payload.destination STARTS_WITH "/etc/wpa_supplicant/" OR payload.destination STARTS_WITH "/etc/hostapd/"
+OR payload.destination STARTS_WITH "/etc/NetworkManager/system-connections/" OR payload.destination STARTS_WITH "/etc/netplan/"
+OR payload.source STARTS_WITH "/etc/wpa_supplicant/" OR payload.source STARTS_WITH "/etc/hostapd/"
+OR payload.source STARTS_WITH "/etc/NetworkManager/system-connections/" OR payload.source STARTS_WITH "/etc/netplan/"
+'''
+
+[[rules]]
+name = "RoboDR: Link created in a wireless network configuration directory"
+type = "FileLink"
+category = "command_and_control"
+severity = "high"
+description = "A hard or symbolic link was created in the wpa_supplicant, hostapd, NetworkManager system-connections or netplan configuration directories (e.g. /etc/wpa_supplicant/wpa_supplicant.conf -> /home/robot/w.conf), which provisions a rogue network with no write-open or rename on the configuration path. Pulsar FileLink: 'source' is the new link."
+condition = '''
+payload.source STARTS_WITH "/etc/wpa_supplicant/" OR payload.source STARTS_WITH "/etc/hostapd/"
+OR payload.source STARTS_WITH "/etc/NetworkManager/system-connections/" OR payload.source STARTS_WITH "/etc/netplan/"
+'''

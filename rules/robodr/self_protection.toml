@@ -6,8 +6,11 @@
 # profile accepts the attacker's participant, a deleted rule file stops alerts
 # after the next daemon restart (rules are loaded once at start-up).
 #
+# Every way a file can appear or change under these directories is watched:
+# write-open, create (incl. mknod FIFOs/devices), delete, rename and link.
+#
 # TUNE: when the signed update agent is installed, exclude it by header.image
-# in the first three rules (and only it). Service names in the last rule
+# in the file rules (and only it). Service names in the last rule
 # depend on how RoboDR packages the daemon (Pulsar ships no systemd unit).
 
 [[rules]]
@@ -38,6 +41,25 @@ description = "A file was renamed into or out of /etc/robodr or /etc/pulsar (ato
 condition = '''
 payload.source STARTS_WITH "/etc/robodr/" OR payload.source STARTS_WITH "/etc/pulsar/"
 OR payload.destination STARTS_WITH "/etc/robodr/" OR payload.destination STARTS_WITH "/etc/pulsar/"
+'''
+
+[[rules]]
+name = "RoboDR: File or device node created in the RoboDR or Pulsar configuration"
+type = "FileCreated"
+category = "defense_evasion"
+severity = "high"
+description = "A new file system object was created under /etc/robodr or /etc/pulsar. Pulsar reports both open(O_CREAT) and mknod(2) as FileCreated, so this catches a FIFO or device node dropped into the rules directory (mkfifo /etc/pulsar/rules/zz.toml: the rules engine blocks reading it at the next start), as well as new rule files that disable or shadow detection after a restart. Only the signed update path adds files here."
+condition = 'payload.filename STARTS_WITH "/etc/robodr/" OR payload.filename STARTS_WITH "/etc/pulsar/"'
+
+[[rules]]
+name = "RoboDR: Link created in or to the RoboDR or Pulsar configuration"
+type = "FileLink"
+category = "defense_evasion"
+severity = "high"
+description = "A hard or symbolic link was created under /etc/robodr or /etc/pulsar (e.g. /etc/pulsar/rules/zz.toml -> /dev/null or -> a huge file, which makes the rules engine fail or hang at start, or a planted rule file linked in from elsewhere), or a hard link to a file in those directories was created elsewhere (an alias through which the file can later be rewritten without a write-open under /etc/pulsar, because Pulsar reports the path the file was opened by). Pulsar FileLink: 'source' is the new link, 'destination' the target; for symlinks the target is the raw string, so only hard-link targets are matched."
+condition = '''
+payload.source STARTS_WITH "/etc/robodr/" OR payload.source STARTS_WITH "/etc/pulsar/"
+OR (payload.hard_link == "true" AND (payload.destination STARTS_WITH "/etc/robodr/" OR payload.destination STARTS_WITH "/etc/pulsar/"))
 '''
 
 [[rules]]
