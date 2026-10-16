@@ -139,14 +139,42 @@ impl StatusInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct InlineQos {
     pub key_hash: Option<Guid>,
+    /// The primary `PID_STATUS_INFO` reading (first occurrence; for
+    /// DATA_FRAG the fragment that created the sample). `None` = alive.
     pub status: Option<StatusInfo>,
+    /// Another status reading that some DDS stack uses, present only when it
+    /// differs from `status` (an all-zero value stands for "no status",
+    /// i.e. alive): the last occurrence of a repeated `PID_STATUS_INFO` in
+    /// one list (last-wins stacks), or the inline QoS of a DATA_FRAG's
+    /// fragment 1 when another fragment created the sample.
+    pub alt_status: Option<StatusInfo>,
 }
 
 impl InlineQos {
-    /// Fill in what we do not have yet (DATA_FRAG: QoS may ride on any fragment).
-    pub(crate) fn merge(&mut self, other: &InlineQos) {
+    /// Add the readings of `other` (a DATA_FRAG's fragment 1): the key hash
+    /// fills a gap, a differing status becomes [`InlineQos::alt_status`].
+    pub(crate) fn with_reading(mut self, other: &InlineQos) -> Self {
         self.key_hash = self.key_hash.or(other.key_hash);
-        self.status = self.status.or(other.status);
+        let mine = self.status.unwrap_or_default();
+        let theirs = other.status.unwrap_or_default();
+        if self.alt_status.is_none() && mine != theirs {
+            self.alt_status = Some(theirs);
+        }
+        self
+    }
+
+    /// Some reading says the instance is alive (an announcement).
+    pub(crate) fn alive_reading(&self) -> bool {
+        !self.status.unwrap_or_default().is_removal()
+            || self.alt_status.is_some_and(|a| !a.is_removal())
+    }
+
+    /// The first reading that says disposed / unregistered, if any.
+    pub(crate) fn removal_reading(&self) -> Option<StatusInfo> {
+        self.status
+            .into_iter()
+            .chain(self.alt_status)
+            .find(StatusInfo::is_removal)
     }
 }
 
@@ -691,6 +719,10 @@ impl Report {
                 self.stats.frag_conflicts = self.stats.frag_conflicts.saturating_add(1);
                 self.anomaly(Anomaly::ConflictingDiscoveryFragment);
             }
+            FragmentEventKind::ConflictingInlineQos(pid) => {
+                self.stats.frag_conflicts = self.stats.frag_conflicts.saturating_add(1);
+                self.anomaly(Anomaly::ConflictingDuplicateParameter(pid));
+            }
         }
         if self.fragment_events.len() < MAX_FRAGMENT_EVENTS {
             self.fragment_events.push(e);
@@ -752,16 +784,36 @@ impl Report {
             return Some((InlineQos::default(), pos));
         }
         let mut q = InlineQos::default();
+        // Last-occurrence status (what a last-wins stack applies).
+        let mut last_status: Option<StatusInfo> = None;
         let mut it = ParameterList::new(body, pos, le);
         for (pid, v) in it.by_ref() {
             match pid {
-                PID_KEY_HASH => q.key_hash = q.key_hash.or_else(|| read_array(v, 0)),
-                PID_STATUS_INFO => {
-                    q.status = q
-                        .status
-                        .or_else(|| read_array(v, 0).map(|raw| StatusInfo { raw }))
-                }
+                PID_KEY_HASH => match (q.key_hash, read_array::<16>(v, 0)) {
+                    (_, None) => self.anomaly(Anomaly::BadParameterValue(pid)),
+                    (None, Some(k)) => q.key_hash = Some(k),
+                    (Some(old), Some(k)) if old != k => {
+                        self.anomaly(Anomaly::ConflictingDuplicateParameter(pid))
+                    }
+                    _ => {}
+                },
+                PID_STATUS_INFO => match read_array(v, 0).map(|raw| StatusInfo { raw }) {
+                    None => self.anomaly(Anomaly::BadParameterValue(pid)),
+                    Some(st) => {
+                        if last_status.is_some_and(|l| l != st) || q.status.is_some_and(|f| f != st)
+                        {
+                            self.anomaly(Anomaly::ConflictingDuplicateParameter(pid));
+                        }
+                        q.status.get_or_insert(st);
+                        last_status = Some(st);
+                    }
+                },
                 _ => {}
+            }
+        }
+        if let (Some(first), Some(last)) = (q.status, last_status) {
+            if first != last {
+                q.alt_status = Some(last);
             }
         }
         if it.misaligned() {
@@ -971,8 +1023,23 @@ impl Report {
     fn handle_sample(&mut self, s: Sample<'_>) {
         let mut raw_key = None;
         let params = self.decode_payload(&s, &mut raw_key);
-        let status = s.inline.status.unwrap_or_default();
-        let removal = status.is_removal();
+        // Status readings (see `InlineQos::alt_status`). A sample is a
+        // removal only if no reading says alive. When the readings disagree
+        // and the sample can be read as an announcement, it is one (the
+        // conflict itself was flagged as ConflictingDuplicateParameter):
+        // missing a live rogue endpoint is worse than missing a removal.
+        // Otherwise (key-only / no usable payload) the removal reading is
+        // recorded.
+        let removal_reading = s.inline.removal_reading();
+        let announceable = s.inline.alive_reading()
+            && !s.key_only
+            && params.as_ref().is_some_and(|p| {
+                s.topic == DiscoveryTopic::Participant || !p.topic.vals.is_empty()
+            });
+        let (removal, status) = match removal_reading {
+            Some(st) if !announceable => (true, st),
+            _ => (false, s.inline.status.unwrap_or_default()),
+        };
         let key = s
             .inline
             .key_hash
@@ -1268,4 +1335,401 @@ pub(crate) fn parse(
         buf = &buf[4 + body_len..];
     }
     Some(r)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const A: GuidPrefix = [0xa1; 12];
+    const B: GuidPrefix = [0xb2; 12];
+
+    fn guid(prefix: GuidPrefix, entity: EntityId) -> Guid {
+        let mut g = [0u8; 16];
+        g[..12].copy_from_slice(&prefix);
+        g[12..].copy_from_slice(&entity);
+        g
+    }
+
+    fn v4(ip: [u8; 4], port: u32) -> Locator {
+        let mut address = [0u8; 16];
+        address[12..].copy_from_slice(&ip);
+        Locator {
+            kind: LOCATOR_KIND_UDPV4,
+            port,
+            address,
+        }
+    }
+
+    fn spdp(prefix: GuidPrefix, source: GuidPrefix) -> SpdpInfo {
+        SpdpInfo {
+            guid_prefix: prefix,
+            attribution: Attribution::ParticipantGuid,
+            source,
+            participant_entity: Some(ENTITYID_PARTICIPANT),
+            protocol_version: Some((2, 3)),
+            vendor_id: None,
+            domain_id: None,
+            domain_tag: None,
+            entity_name: None,
+            user_data: None,
+            lease_duration: None,
+            metatraffic_unicast: Vec::new(),
+            metatraffic_multicast: Vec::new(),
+            default_unicast: Vec::new(),
+            default_multicast: Vec::new(),
+            alternate_guid_prefixes: Vec::new(),
+            from_fragments: false,
+        }
+    }
+
+    fn endpoint(participant: GuidPrefix, source: GuidPrefix) -> EndpointInfo {
+        EndpointInfo {
+            kind: EndpointKind::Writer,
+            guid: Some(guid(participant, [0, 0, 1, 3])),
+            participant,
+            attribution: Attribution::EndpointGuid,
+            source,
+            participant_guid_param: None,
+            guid_conflict: false,
+            topic: "rt/cmd_vel".into(),
+            type_name: "T".into(),
+            topics: vec!["rt/cmd_vel".into()],
+            type_names: vec!["T".into()],
+            alternates: Vec::new(),
+            from_fragments: false,
+        }
+    }
+
+    fn header(prefix: GuidPrefix) -> RtpsHeader {
+        RtpsHeader {
+            version: (2, 3),
+            vendor_id: [0x01, 0x0f],
+            guid_prefix: prefix,
+        }
+    }
+
+    #[test]
+    fn discovery_topic_from_writer() {
+        use DiscoveryTopic::*;
+        for (id, want) in [
+            (ENTITYID_SPDP_WRITER, Some(Participant)),
+            (ENTITYID_SPDP_SECURE_WRITER, Some(Participant)),
+            (ENTITYID_SEDP_PUBLICATIONS_WRITER, Some(Publications)),
+            (ENTITYID_SEDP_PUBLICATIONS_SECURE_WRITER, Some(Publications)),
+            (ENTITYID_SEDP_SUBSCRIPTIONS_WRITER, Some(Subscriptions)),
+            (
+                ENTITYID_SEDP_SUBSCRIPTIONS_SECURE_WRITER,
+                Some(Subscriptions),
+            ),
+            (ENTITYID_PARTICIPANT, None),
+            ([0, 0, 0x03, 0xc7], None), // SEDP publications *reader*
+            ([0, 0, 1, 3], None),       // user writer
+            ([0xff; 4], None),
+        ] {
+            assert_eq!(DiscoveryTopic::from_writer(id), want, "{id:02x?}");
+        }
+    }
+
+    #[test]
+    fn rtps_header_parse_and_vendor() {
+        let mut d = b"RTPS\x02\x03\x01\x0f".to_vec();
+        d.extend_from_slice(&A);
+        let h = RtpsHeader::parse(&d).unwrap();
+        assert_eq!(h, header(A));
+        assert!(h.vendor_name().is_some_and(|n| n.contains("Fast DDS")));
+        assert_eq!(
+            RtpsHeader {
+                vendor_id: [0xee, 0xee],
+                ..h
+            }
+            .vendor_name(),
+            None
+        );
+        // Too short, wrong magic, empty.
+        assert_eq!(RtpsHeader::parse(&d[..19]), None);
+        assert_eq!(RtpsHeader::parse(b"RTPX\x02\x03\x01\x0f"), None);
+        assert_eq!(RtpsHeader::parse(&[]), None);
+        // Extra bytes are fine.
+        d.extend_from_slice(&[0; 7]);
+        assert_eq!(RtpsHeader::parse(&d), Some(header(A)));
+    }
+
+    #[test]
+    fn status_info_flags() {
+        let s = |b: u8| StatusInfo { raw: [0, 0, 0, b] };
+        assert!(!s(0).is_removal());
+        assert!(s(1).disposed() && !s(1).unregistered() && s(1).is_removal());
+        assert!(s(2).unregistered() && !s(2).disposed() && s(2).is_removal());
+        assert!(s(3).disposed() && s(3).unregistered());
+        assert!(s(4).filtered() && !s(4).is_removal());
+        // Only the last octet carries flags.
+        let high = StatusInfo {
+            raw: [0xff, 0xff, 0xff, 0],
+        };
+        assert!(!high.is_removal() && !high.filtered());
+        assert_eq!(StatusInfo::default(), s(0));
+    }
+
+    #[test]
+    fn inline_qos_readings() {
+        let st = |b: u8| Some(StatusInfo { raw: [0, 0, 0, b] });
+        let q = |status| InlineQos {
+            status,
+            ..Default::default()
+        };
+        assert!(q(None).alive_reading());
+        assert_eq!(q(None).removal_reading(), None);
+        assert!(!q(st(1)).alive_reading());
+        assert_eq!(q(st(1)).removal_reading(), st(1));
+        // A differing fragment-1 reading becomes the alternate.
+        let m = q(st(1)).with_reading(&q(None));
+        assert_eq!(m.alt_status, st(0));
+        assert!(m.alive_reading());
+        assert_eq!(m.removal_reading(), st(1));
+        let m = q(None).with_reading(&q(st(2)));
+        assert_eq!((m.status, m.alt_status), (None, st(2)));
+        assert!(m.alive_reading());
+        assert_eq!(m.removal_reading(), st(2));
+        // Same reading: no alternate; absent and explicit zero are the same.
+        assert_eq!(q(st(1)).with_reading(&q(st(1))).alt_status, None);
+        assert_eq!(q(None).with_reading(&q(st(0))).alt_status, None);
+        // Key hash fills a gap only.
+        let k1 = InlineQos {
+            key_hash: Some([1; 16]),
+            ..Default::default()
+        };
+        let k2 = InlineQos {
+            key_hash: Some([2; 16]),
+            ..Default::default()
+        };
+        assert_eq!(q(None).with_reading(&k2).key_hash, Some([2; 16]));
+        assert_eq!(k1.with_reading(&k2).key_hash, Some([1; 16]));
+    }
+
+    #[test]
+    fn rtps_duration_conversion() {
+        let d = |seconds, fraction| RtpsDuration { seconds, fraction };
+        assert!(d(i32::MAX, u32::MAX).is_infinite());
+        assert_eq!(d(i32::MAX, u32::MAX).to_std(), None);
+        assert!(!d(i32::MAX, 0).is_infinite());
+        assert_eq!(
+            d(i32::MAX, 0).to_std(),
+            Some(Duration::from_secs(i32::MAX as u64))
+        );
+        assert_eq!(d(-1, 0).to_std(), None);
+        assert_eq!(d(i32::MIN, u32::MAX).to_std(), None);
+        assert_eq!(d(0, 0).to_std(), Some(Duration::ZERO));
+        assert_eq!(d(10, 1 << 31).to_std(), Some(Duration::from_millis(10_500)));
+        // The largest fraction stays below one second.
+        let max = d(0, u32::MAX).to_std().unwrap();
+        assert!(max < Duration::from_secs(1) && max > Duration::from_millis(999));
+    }
+
+    #[test]
+    fn endpoint_views() {
+        let e = endpoint(A, A);
+        assert!(!e.relayed());
+        assert!(!e.ambiguous());
+        let want = Endpoint {
+            guid_prefix: hex(&A),
+            topic: "rt/cmd_vel".into(),
+            type_name: "T".into(),
+        };
+        assert_eq!(e.to_endpoint(), want);
+        assert_eq!(e.to_endpoints(), vec![want.clone()]);
+
+        // Unknown source: no sender copy.
+        let e = endpoint(A, GUIDPREFIX_UNKNOWN);
+        assert!(e.relayed());
+        assert_eq!(e.to_endpoints(), vec![want.clone()]);
+
+        // Relayed: each reading again, attributed to the sender.
+        let mut e = endpoint(A, B);
+        assert!(e.relayed());
+        let alt = EndpointAlternate {
+            guid: None,
+            participant: A,
+            topic: "rt/other".into(),
+            type_name: "T".into(),
+        };
+        e.alternates.push(alt.clone());
+        e.alternates.push(alt.clone()); // duplicate reading is de-duplicated
+        assert!(e.ambiguous());
+        assert_eq!(alt.to_endpoint().topic, "rt/other");
+        let got = e.to_endpoints();
+        let sender = |ep: &Endpoint| Endpoint {
+            guid_prefix: hex(&B),
+            ..ep.clone()
+        };
+        assert_eq!(
+            got,
+            vec![
+                want.clone(),
+                alt.to_endpoint(),
+                sender(&want),
+                sender(&alt.to_endpoint())
+            ]
+        );
+        // An alternate that names the sender itself is not doubled.
+        let mut e = endpoint(A, B);
+        e.alternates.push(EndpointAlternate {
+            participant: B,
+            ..alt
+        });
+        assert_eq!(e.to_endpoints().len(), 3);
+    }
+
+    #[test]
+    fn spdp_views() {
+        let mut p = spdp(A, A);
+        assert!(!p.relayed());
+        assert!(spdp(A, B).relayed());
+        assert_eq!(p.enclave(), None);
+        assert_eq!(p.vendor_name(), None);
+        p.vendor_id = Some([0x01, 0x10]);
+        assert!(p.vendor_name().is_some());
+        for (ud, want) in [
+            (&b"enclave=/robot;"[..], Some("/robot")),
+            (b"securitycontext=/old;", Some("/old")),
+            (b"foo=bar;enclave=/x;\0\0", Some("/x")),
+            (b"enclave=/;", Some("/")),
+            (b"nothing here", None),
+            (b"", None),
+            (b"\xff\xfe enclave=/x;", None), // not UTF-8
+        ] {
+            p.user_data = Some(ud.to_vec());
+            assert_eq!(p.enclave(), want, "{ud:?}");
+        }
+        p.metatraffic_unicast = vec![v4([10, 0, 0, 5], 7410), v4([10, 0, 0, 5], 0)];
+        p.default_unicast = vec![
+            v4([10, 0, 0, 5], 7410), // duplicate of metatraffic
+            v4([10, 0, 0, 5], 7411),
+            Locator {
+                kind: LOCATOR_KIND_UDPV6,
+                port: 7412,
+                address: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            },
+            Locator {
+                kind: 99,
+                port: 1,
+                address: [0; 16],
+            },
+            v4([10, 0, 0, 5], 70_000),
+        ];
+        assert_eq!(
+            p.unicast_locator_strings(),
+            vec!["10.0.0.5:7410", "10.0.0.5:7411", "[::1]:7412"]
+        );
+    }
+
+    #[test]
+    fn report_to_events_merges_participants() {
+        let mut r = DatagramReport::new(header(A));
+        assert!(!r.fragmented_discovery_seen());
+        r.stats.discovery_data_frag = 1;
+        assert!(r.fragmented_discovery_seen());
+        r.sources.push(B);
+        let mut pa = spdp(A, A);
+        pa.metatraffic_unicast = vec![v4([10, 0, 0, 1], 7410)];
+        pa.alternate_guid_prefixes = vec![[0xcc; 12], B];
+        let mut pa2 = spdp(A, B);
+        pa2.default_unicast = vec![v4([10, 0, 0, 1], 7410), v4([10, 0, 0, 2], 7411)];
+        r.participants = vec![pa, pa2];
+        r.endpoints = vec![endpoint(A, A), {
+            let mut e = endpoint(B, B);
+            e.kind = EndpointKind::Reader;
+            e
+        }];
+        let ev = r.to_events("192.0.2.1");
+        let parts: Vec<&Participant> = ev
+            .iter()
+            .filter_map(|e| match e {
+                RobotEvent::Ros2ParticipantDiscovered(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(parts.len(), 3, "A, B, cc: one event each");
+        assert_eq!(parts[0].guid_prefix, hex(&A));
+        assert_eq!(parts[0].locators, vec!["10.0.0.1:7410", "10.0.0.2:7411"]);
+        assert_eq!(parts[1].guid_prefix, hex(&B));
+        assert_eq!(parts[2].guid_prefix, hex(&[0xcc; 12]));
+        assert!(parts.iter().all(|p| p.src_ip == "192.0.2.1"));
+        let writers = ev
+            .iter()
+            .filter(|e| matches!(e, RobotEvent::Ros2WriterDiscovered(_)))
+            .count();
+        let readers = ev
+            .iter()
+            .filter(|e| matches!(e, RobotEvent::Ros2ReaderDiscovered(_)))
+            .count();
+        assert_eq!((writers, readers), (1, 1));
+        // Participants come before endpoints.
+        assert!(matches!(ev[3], RobotEvent::Ros2WriterDiscovered(_)));
+    }
+
+    #[test]
+    fn report_anomalies_and_multi_values_are_bounded() {
+        let mut r = DatagramReport::new(header(A));
+        for _ in 0..(MAX_ANOMALIES + 10) {
+            r.anomaly(Anomaly::TooManyLocators);
+        }
+        assert_eq!(r.anomalies.len(), MAX_ANOMALIES);
+        assert_eq!(r.stats.anomalies as usize, MAX_ANOMALIES + 10);
+
+        let mut r = DatagramReport::new(header(A));
+        let mut m: Multi<u32> = Multi::default();
+        assert_eq!(m.first(), None);
+        r.push_multi(&mut m, 1, 7);
+        r.push_multi(&mut m, 1, 7);
+        assert!(r.anomalies.is_empty(), "same value is no conflict");
+        for v in 2..10 {
+            r.push_multi(&mut m, v, 7);
+        }
+        assert_eq!(m.vals.len(), MAX_PARAMETER_VALUES);
+        assert_eq!(m.first(), Some(1));
+        assert_eq!(m.vals[m.last], 9, "latest value always kept");
+        assert!(r
+            .anomalies
+            .contains(&Anomaly::ConflictingDuplicateParameter(7)));
+        assert!(r.anomalies.contains(&Anomaly::TooManyParameterValues(7)));
+        // Re-seeing a kept value moves `last` to it.
+        r.push_multi(&mut m, 1, 7);
+        assert_eq!(m.last, 0);
+    }
+
+    #[test]
+    fn report_sources_are_distinct_and_skip_unknown() {
+        let mut r = DatagramReport::new(header(A));
+        let mut seen = HashSet::from([A]);
+        r.add_source(&mut seen, A);
+        r.add_source(&mut seen, GUIDPREFIX_UNKNOWN);
+        r.add_source(&mut seen, B);
+        r.add_source(&mut seen, B);
+        assert_eq!(r.sources, vec![A, B]);
+    }
+
+    #[test]
+    fn parse_rejects_non_rtps_and_survives_garbage() {
+        assert!(parse(b"", None).is_none());
+        assert!(parse(b"RTP", None).is_none());
+        assert!(parse(&[0u8; 64], None).is_none());
+        let mut d = b"RTPS\x02\x03\x01\x0f".to_vec();
+        d.extend_from_slice(&A);
+        let r = parse(&d, None).unwrap();
+        assert_eq!(r.sources, vec![A]);
+        assert_eq!(r.stats, ParseStats::default());
+        // Every one-byte tail and a few junk tails: no panic, flagged.
+        for tail in [&[0x15u8][..], &[0x15, 0x01], &[0x15, 0x01, 0xff, 0xff]] {
+            let mut x = d.clone();
+            x.extend_from_slice(tail);
+            let r = parse(&x, None).unwrap();
+            assert_eq!(r.anomalies, vec![Anomaly::TruncatedSubmessage]);
+        }
+        // Major version 1: flagged but parsed.
+        let mut v1 = d.clone();
+        v1[4] = 1;
+        let r = parse(&v1, None).unwrap();
+        assert_eq!(r.anomalies, vec![Anomaly::UnsupportedProtocolVersion(1, 3)]);
+    }
 }

@@ -89,6 +89,28 @@
 //! splicing content into another participant's announcement). A fragment
 //! whose `sampleSize` / `fragmentSize` / key flag disagrees with the pending
 //! sample is refused on its own; the pending sample is left untouched.
+//!
+//! # Inline QoS of fragmented samples
+//!
+//! A DATA_FRAG may carry inline QoS (`PID_STATUS_INFO`, `PID_KEY_HASH`).
+//! A fragment that brings no new bytes (a duplicate or retransmission) is
+//! dropped whole by DDS stacks, inline QoS included, so it is here too: an
+//! attacker cannot turn a live announcement into a "removal" by replaying
+//! one of its fragments with a disposed / unregistered status. Among the
+//! fragments that do bring new bytes, stacks differ on whose inline QoS
+//! counts: some take the fragment that created the sample (the first one
+//! accepted), some the one at offset 0 (fragment 1). Both readings are kept
+//! (the second as an alternate status when it differs), and the decoder
+//! treats a sample with any live reading as an announcement, not a removal.
+//! Inline QoS on any other fragment is ignored.
+//!
+//! A fragment whose inline QoS disagrees with what was recorded is reported
+//! as [`FragmentEventKind::ConflictingInlineQos`] (and as an
+//! [`crate::Anomaly::ConflictingDuplicateParameter`] for that PID): a copy
+//! of the creating fragment or of fragment 1 must repeat its status exactly
+//! (absent counts as alive), any other fragment conflicts only when it
+//! carries a present, different status or key hash (stacks that put inline
+//! QoS on fragment 1 only are honest).
 
 use std::collections::HashMap;
 
@@ -168,6 +190,11 @@ pub enum FragmentEventKind {
     /// A fragment overlapped received bytes with different content; the
     /// first copy was kept, the new bytes for those fragments ignored.
     ConflictingOverlap,
+    /// A fragment carried an inline QoS parameter (the PID:
+    /// `PID_STATUS_INFO` 0x0071 or `PID_KEY_HASH` 0x0070) whose value differs
+    /// from the one already recorded for the sample. See the module docs for
+    /// which value is used.
+    ConflictingInlineQos(u16),
 }
 
 /// A discovery sample the reassembler could not (fully) take in. For
@@ -214,8 +241,8 @@ pub(crate) struct FragIn<'a> {
 pub(crate) enum FragOutcome {
     /// Stored; the sample is not complete yet.
     Pending,
-    /// The sample is complete: its serialized payload, merged inline QoS and
-    /// whether it is a key-only sample.
+    /// The sample is complete: its serialized payload, its inline QoS
+    /// readings (see the module docs) and whether it is a key-only sample.
     Complete(Vec<u8>, InlineQos, bool),
     /// Refused (see the [`FragmentEvent`] pushed alongside).
     Rejected,
@@ -231,7 +258,13 @@ struct Pending {
     got_bytes: usize,
     buf: Vec<u8>,
     received: Vec<u64>,
+    /// Inline QoS of the fragment that created the sample.
     inline: InlineQos,
+    /// Inline QoS of the fragment that delivered fragment 1 (offset 0), once
+    /// it arrived.
+    head_inline: Option<InlineQos>,
+    /// Zero-based fragment range `[first, last)` of the creating DATA_FRAG.
+    creator_range: (usize, usize),
     key_only: bool,
     /// Creation order (monotonic).
     created: u64,
@@ -316,7 +349,8 @@ impl FragmentReassembler {
         self.evicted
     }
 
-    /// Fragments that overlapped received bytes with different content.
+    /// Conflicting fragments: overlapping bytes with different content, or
+    /// a different inline status / key hash (one count per parameter).
     pub fn conflicts(&self) -> u64 {
         self.conflicts
     }
@@ -490,7 +524,9 @@ impl FragmentReassembler {
                     got_bytes: 0,
                     buf: vec![0; sample_size],
                     received: vec![0; words],
-                    inline: InlineQos::default(),
+                    inline: f.inline,
+                    head_inline: None,
+                    creator_range: (first, last),
                     key_only: f.key_only,
                     created: self.created,
                     last_progress: self.clock,
@@ -506,6 +542,7 @@ impl FragmentReassembler {
         let p = &mut self.pending[idx];
         let mut conflict = false;
         let mut progressed = false;
+        let delivers_head = first == 0 && !p.has(0);
         for n in first..last {
             let lo = n * frag_size - offset;
             let hi = ((n + 1) * frag_size).min(sample_size) - offset;
@@ -522,16 +559,62 @@ impl FragmentReassembler {
         if progressed {
             p.last_progress = clock;
         }
-        p.inline.merge(&f.inline);
+        // Inline QoS: compare against every value recorded so far (any
+        // fragment, duplicates included), but only record it from the
+        // creator (done above) or the fragment that delivered offset 0.
+        let mut qos_conflicts: Vec<u16> = Vec::new();
+        {
+            // A copy of the creating fragment or of fragment 1 must repeat
+            // its status exactly (absent = alive); other fragments only
+            // conflict on a present, different value (stacks that send
+            // inline QoS on fragment 1 only are honest).
+            let strict_creator = (first, last) == p.creator_range;
+            let strict_head = first == 0;
+            let recorded = [
+                (Some(&p.inline), strict_creator),
+                (p.head_inline.as_ref(), strict_head),
+            ];
+            let (mut st, mut kh) = (false, false);
+            for (r, strict) in recorded {
+                let Some(r) = r else { continue };
+                st |= match (f.inline.status, r.status) {
+                    (Some(a), Some(b)) => a != b,
+                    (a, b) if strict => a.unwrap_or_default() != b.unwrap_or_default(),
+                    _ => false,
+                };
+                kh |= matches!((f.inline.key_hash, r.key_hash), (Some(a), Some(b)) if a != b);
+            }
+            if st {
+                qos_conflicts.push(crate::wire::PID_STATUS_INFO);
+            }
+            if kh {
+                qos_conflicts.push(crate::wire::PID_KEY_HASH);
+            }
+        }
+        if delivers_head {
+            p.head_inline = Some(f.inline);
+        }
         if conflict {
             self.conflicts += 1;
             let ev = Self::event_for(&self.pending[idx], FragmentEventKind::ConflictingOverlap);
             events.push(ev);
         }
+        for pid in qos_conflicts {
+            self.conflicts += 1;
+            let ev = Self::event_for(
+                &self.pending[idx],
+                FragmentEventKind::ConflictingInlineQos(pid),
+            );
+            events.push(ev);
+        }
         if self.pending[idx].got == self.pending[idx].nfrags {
             let p = self.remove(idx);
             self.completed += 1;
-            return FragOutcome::Complete(p.buf, p.inline, p.key_only);
+            let inline = match p.head_inline {
+                Some(h) => p.inline.with_reading(&h),
+                None => p.inline,
+            };
+            return FragOutcome::Complete(p.buf, inline, p.key_only);
         }
         FragOutcome::Pending
     }

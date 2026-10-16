@@ -39,8 +39,14 @@
 //!   RFC 6946) is decoded as an ordinary packet.
 //!
 //! Transport: only UDP. The UDP length must be >= 8 and fit the IP payload;
-//! bytes after the UDP length are trimmed. The UDP checksum is not verified
-//! here (same reason as above).
+//! bytes after the UDP length are trimmed. Over IPv6 a UDP length of 0 means
+//! "the whole remaining payload", as in Linux `__udp6_lib_rcv` (the returned
+//! segment then covers the payload, so the checksum is verified with that
+//! length). The UDP checksum is not verified here (same reason as above).
+//!
+//! The next-header field of an IPv6 Fragment header is only checked on the
+//! offset-0 fragment: Linux ignores it in every other fragment and takes the
+//! reassembled datagram's protocol from the first one.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -563,7 +569,12 @@ fn walk_ipv6(
                     nh = frag_nh;
                     continue;
                 }
-                if frag_nh != IPPROTO_UDP && !is_ipv6_ext_header(frag_nh) {
+                // Linux (ip6_frag_queue / ip6_frag_reasm) takes the
+                // upper-layer protocol from the offset-0 fragment only and
+                // ignores this field in every other fragment, so only the
+                // first fragment can rule the datagram out here; the
+                // reassembler uses the first fragment's value.
+                if offset == 0 && frag_nh != IPPROTO_UDP && !is_ipv6_ext_header(frag_nh) {
                     return Err(DecodeError::NotUdp);
                 }
                 return Ok(Detail {
@@ -631,7 +642,13 @@ pub(crate) fn udp_segment_inner(
     }
     let src_port = be16(seg, 0).ok_or(DecodeError::Truncated(L))?;
     let dst_port = be16(seg, 2).ok_or(DecodeError::Truncated(L))?;
-    let len = usize::from(be16(seg, 4).ok_or(DecodeError::Truncated(L))?);
+    let mut len = usize::from(be16(seg, 4).ok_or(DecodeError::Truncated(L))?);
+    if len == 0 && src.is_ipv6() {
+        // Linux __udp6_lib_rcv: a zero UDP length over IPv6 means "the rest
+        // of the IPv6 payload" (RFC 2675 jumbograms, but the kernel applies
+        // it to any size). The checksum pseudo-header then uses that length.
+        len = seg.len();
+    }
     if len < 8 {
         return Err(DecodeError::Malformed(L, "length below 8"));
     }
@@ -925,6 +942,64 @@ mod tests {
         let mut shorter = ip;
         shorter[24..26].copy_from_slice(&11u16.to_be_bytes());
         assert_eq!(decode_udp(LinkType::RAW, &shorter).unwrap().payload, b"abc");
+        // UDP length 0 over IPv4 is malformed (Linux drops it).
+        let mut zero = v4_packet(b"abcdef");
+        zero[24..26].copy_from_slice(&[0, 0]);
+        assert!(matches!(
+            decode_udp(LinkType::RAW, &zero),
+            Err(DecodeError::Malformed(Layer::Udp, _))
+        ));
+    }
+
+    /// Linux `__udp6_lib_rcv`: UDP length 0 over IPv6 = the IPv6 payload.
+    #[test]
+    fn ipv6_udp_length_zero_uses_the_payload_length() {
+        let mut p = synth::ipv6_udp(src6(), dst6(), 40000, 7410, &[], b"abcdefgh");
+        p[44..46].copy_from_slice(&[0, 0]);
+        let d = decode_frame_detail(LinkType::RAW, &p).unwrap();
+        match d.decoded {
+            Decoded::Udp(u) => assert_eq!(u.payload, b"abcdefgh"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(d.udp_segment.unwrap().len(), 16);
+        // Also behind extension headers and after reassembly.
+        let seg = &p[40..];
+        let u = decode_ipv6_upper(IpAddr::V6(src6()), IpAddr::V6(dst6()), 17, seg).unwrap();
+        assert_eq!(u.payload, b"abcdefgh");
+        // Zero length with fewer than 8 bytes is still too short.
+        assert!(decode_udp_segment(IpAddr::V6(src6()), IpAddr::V6(dst6()), &[0; 7]).is_err());
+        // A bare 8-byte header with length 0: empty payload.
+        let mut hdr = [0u8; 8];
+        hdr[1] = 1;
+        let u = decode_udp_segment(IpAddr::V6(src6()), IpAddr::V6(dst6()), &hdr).unwrap();
+        assert!(u.payload.is_empty());
+    }
+
+    /// Linux reads the Fragment header's next header from the offset-0
+    /// fragment only.
+    #[test]
+    fn ipv6_non_first_fragment_next_header_is_ignored() {
+        let p = synth::ipv6_udp(src6(), dst6(), 40000, 7410, &[], &[7u8; 64]);
+        let frags = synth::ipv6_fragment(&p, 32, 9);
+        assert!(frags.len() >= 2);
+        for nh in [59u8, 6, 58, 50, 255] {
+            let mut f = frags[1].clone();
+            f[40] = nh;
+            match decode_frame(LinkType::RAW, &f).unwrap() {
+                Decoded::Fragment(fr) => {
+                    assert!(fr.offset > 0);
+                    assert_eq!(fr.protocol, nh);
+                }
+                other => panic!("{other:?}"),
+            }
+            // The first fragment still decides.
+            let mut first = frags[0].clone();
+            first[40] = nh;
+            assert_eq!(
+                decode_frame(LinkType::RAW, &first),
+                Err(DecodeError::NotUdp)
+            );
+        }
     }
 
     #[test]

@@ -87,6 +87,18 @@
 //! carries its own SPDP dispose is still reported, because it did send the
 //! datagram.)
 //!
+//! When DDS stacks may read the status differently (`PID_STATUS_INFO`
+//! repeated with different values in one inline QoS: first-wins vs.
+//! last-wins stacks; or a DATA_FRAG sample whose creating fragment and
+//! fragment 1 carry different statuses, see the `frag` module docs), the
+//! sample is a removal only if *every* reading is one. If any reading says
+//! alive and the payload is a usable announcement, it is reported as an
+//! announcement (a hidden live writer is worse than a missed removal) and
+//! the disagreement is flagged as
+//! [`Anomaly::ConflictingDuplicateParameter`]`(0x0071)`. Inline QoS of a
+//! duplicate DATA_FRAG fragment (no new bytes) is ignored, as DDS stacks
+//! drop such fragments whole.
+//!
 //! # Robustness
 //!
 //! Every length is checked against the remaining buffer; nothing is allocated
@@ -151,6 +163,8 @@ mod wire;
 
 #[cfg(test)]
 mod discovery_tests;
+#[cfg(test)]
+mod review3_regressions;
 #[cfg(test)]
 mod review_regressions;
 #[cfg(test)]

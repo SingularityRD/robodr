@@ -77,18 +77,39 @@
 //! - **Global per IP version** ([`ReassemblyLimits::max_bytes`], 32 MiB;
 //!   [`ReassemblyLimits::max_datagrams`], 65 536): bounds the sensor's own
 //!   memory when it sees traffic for many hosts (a SPAN port, or fragments
-//!   with spoofed destination addresses that no kernel would queue). Above
-//!   it, the oldest datagram of the **heaviest destination** is evicted
-//!   ([`ReassemblyStats::dropped_capacity`]) — unless the arriving fragment
-//!   belongs to that heaviest destination, in which case the fragment is
-//!   refused instead. Whoever consumes the most pays: a flood (aimed at one
-//!   or at many fake destinations) evicts or refuses itself, and the robot's
-//!   state is only at risk if the robot's own bucket is the largest, i.e. the
-//!   flood targets the robot, where the per-destination rule (which the
-//!   kernel shares) applies first.
+//!   with spoofed destination addresses that no kernel would queue). This
+//!   limit has no kernel counterpart, so it **never refuses** a fragment
+//!   whose destination is within its own budget: the arriving fragment is
+//!   always admitted and room is made by evicting other datagrams
+//!   ([`ReassemblyStats::dropped_capacity`]). The victim is the datagram of
+//!   that IP version that has gone longest without receiving new bytes
+//!   ("least recently progressed"; a duplicate is not progress), never the
+//!   arriving fragment's own datagram. (An earlier policy evicted from the
+//!   heaviest destination or refused the fragment if it was the arriving
+//!   one's: an attacker that made the robot's bucket the heaviest, with
+//!   1 MiB of junk the robot's kernel happily queues, and spread 31 MiB over
+//!   lighter fake destinations, made the sensor refuse the robot's real
+//!   fragment.) Only a fragment that cannot fit even after evicting
+//!   everything else (zero limits) is refused
+//!   ([`ReassemblyStats::refused_capacity`]).
+//!
+//! ## What an attacker can still do (honest)
+//! A finite table fed by spoofable traffic cannot be eviction-proof. To get
+//! a queued datagram `D` evicted, the table must be over the global limit
+//! and **every other** queued datagram of that IP version must have
+//! received new bytes after `D`'s latest fragment. Since one datagram holds
+//! at most 64 KiB, a full table (32 MiB) holds at least ~500 datagrams, so
+//! at least ~500 fragments with new bytes (65 535 with the datagram-count
+//! limit) must arrive between two consecutive fragments of `D`. Junk queued
+//! at leisure *before* `D` is always evicted before `D`. A real datagram's
+//! fragments leave the sender back to back (microseconds apart on a LAN),
+//! so the attacker has to win a tight race, with sustained traffic, and
+//! every eviction is counted in `dropped_capacity`. The pipeline should
+//! raise a finding on any increase of `dropped_capacity` or
+//! `refused_capacity`.
 //!
 //! All bookkeeping is O(log n) per fragment (no scans of the table under a
-//! flood), apart from amortised compaction of the order queues.
+//! flood), apart from amortised compaction of the expiry queue.
 //!
 //! Known differences (all in the "sensor sees a superset" direction, which is
 //! a false positive at worst, never an evasion): non-UDP IPv4 fragments are
@@ -99,7 +120,7 @@
 //! are not rejected. Non-default kernel sysctls must be mirrored in
 //! [`ReassemblyLimits`] by the integrator.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -128,9 +149,8 @@ pub struct ReassemblyLimits {
     /// One destination's bucket (the receiving host's `ipfrag_high_thresh`):
     /// while above it, new fragments to that destination are refused.
     pub max_bytes_per_dst: usize,
-    /// All destinations together (sensor memory bound); above it the
-    /// heaviest destination is evicted (or, if that is the arriving
-    /// fragment's, the fragment is refused).
+    /// All destinations together (sensor memory bound); above it the least
+    /// recently progressed datagram (not the arriving fragment's) is evicted.
     pub max_bytes: usize,
     /// Datagrams in flight, all destinations (same eviction rule).
     pub max_datagrams: usize,
@@ -171,8 +191,9 @@ pub struct ReassemblyStats {
     pub dropped_invalid: u64,
     /// Datagrams that did not complete within the timeout.
     pub dropped_timeout: u64,
-    /// Datagrams **evicted** under global memory pressure (always from the
-    /// heaviest destination, never the arriving fragment's).
+    /// Datagrams **evicted** under global memory pressure (the least
+    /// recently progressed one of the IP version, never the arriving
+    /// fragment's).
     pub dropped_capacity: u64,
     /// Legacy (poisoned-datagram tombstones were removed to match Linux):
     /// always 0.
@@ -184,7 +205,8 @@ pub struct ReassemblyStats {
     /// IPv4 datagrams restarted by the `max_dist` rule.
     pub dropped_too_far: u64,
     /// Fragments refused because their destination's budget was full (the
-    /// kernel drops them too) or nothing was evictable.
+    /// kernel drops them too), or because they could not fit under the
+    /// global limit even after evicting every other datagram (zero limits).
     pub refused_capacity: u64,
 }
 
@@ -256,6 +278,9 @@ struct Entry {
     protocol: Option<u8>,
     /// Per-pair fragment counter value at the last fragment (max_dist).
     rid: u32,
+    /// Reassembler fragment clock when this datagram last received new
+    /// bytes (or was created): its key in [`Family::lru`].
+    progress: u64,
 }
 
 /// One destination's bucket.
@@ -263,9 +288,6 @@ struct Entry {
 struct DstUse {
     bytes: usize,
     datagrams: usize,
-    /// Creation order of this destination's datagrams, for eviction. May hold
-    /// stale records (generation mismatch); compacted when it grows.
-    order: VecDeque<(u64, Key)>,
 }
 
 /// Per-(src, dst) state for `max_dist`.
@@ -283,8 +305,9 @@ struct Family {
     bytes: usize,
     datagrams: usize,
     dsts: HashMap<IpAddr, DstUse>,
-    /// (bytes, destination) for every destination in `dsts`: heaviest last.
-    by_weight: BTreeSet<(usize, IpAddr)>,
+    /// Every live datagram by its last progress (least recently progressed
+    /// first): the eviction order under global pressure.
+    lru: BTreeMap<u64, Key>,
 }
 
 fn family(addr: &IpAddr) -> usize {
@@ -300,6 +323,8 @@ pub struct Reassembler {
     families: [Family; 2],
     peers: HashMap<Pair, PeerUse>,
     next_generation: u64,
+    /// Fragments pushed so far (the progress clock).
+    clock: u64,
     now: Duration,
     stats: ReassemblyStats,
 }
@@ -324,6 +349,7 @@ impl Reassembler {
             families: Default::default(),
             peers: HashMap::new(),
             next_generation: 0,
+            clock: 0,
             now: Duration::ZERO,
             stats: ReassemblyStats::default(),
         }
@@ -363,10 +389,20 @@ impl Reassembler {
         let f = &mut self.families[family(&key.dst)];
         f.bytes = f.bytes + add - sub;
         if let Some(d) = f.dsts.get_mut(&key.dst) {
-            f.by_weight.remove(&(d.bytes, key.dst));
             d.bytes = d.bytes + add - sub;
-            f.by_weight.insert((d.bytes, key.dst));
         }
+    }
+
+    /// Record that `key` just received new bytes.
+    fn touch(&mut self, key: &Key) {
+        let clock = self.clock;
+        let Some(e) = self.entries.get_mut(key) else {
+            return;
+        };
+        let f = &mut self.families[family(&key.dst)];
+        f.lru.remove(&e.progress);
+        e.progress = clock;
+        f.lru.insert(clock, *key);
     }
 
     fn remove(&mut self, key: &Key) -> Option<Entry> {
@@ -375,10 +411,10 @@ impl Reassembler {
         let e = self.entries.remove(key)?;
         let f = &mut self.families[family(&key.dst)];
         f.datagrams -= 1;
+        f.lru.remove(&e.progress);
         if let Some(d) = f.dsts.get_mut(&key.dst) {
             d.datagrams -= 1;
             if d.datagrams == 0 {
-                f.by_weight.remove(&(d.bytes, key.dst));
                 f.dsts.remove(&key.dst);
             }
         }
@@ -422,52 +458,35 @@ impl Reassembler {
         }
     }
 
-    /// Record a (new or restarted) datagram generation in the order queues.
+    /// Record a (new or restarted) datagram generation in the expiry queue.
     fn track(&mut self, key: Key, generation: u64) {
         let now = self.now;
-        let f = &mut self.families[family(&key.dst)];
-        f.order.push_back((now, generation, key));
-        let d = f.dsts.entry(key.dst).or_default();
-        d.order.push_back((generation, key));
-        if d.order.len() > 2 * d.datagrams + 16 {
-            let entries = &self.entries;
-            d.order.retain(|(g, k)| Self::is_live(entries, k, *g));
-        }
+        self.families[family(&key.dst)]
+            .order
+            .push_back((now, generation, key));
     }
 
-    /// Evict the oldest datagram of the heaviest destination (same IP
-    /// version). Returns false, evicting nothing, when that destination is
-    /// `arriving` itself (the heaviest consumer is the one refused) or when
-    /// the table is empty.
-    fn evict_heaviest(&mut self, fi: usize, arriving: IpAddr) -> bool {
-        let f = &mut self.families[fi];
-        let Some(&(_, victim)) = f.by_weight.last() else {
-            return false;
-        };
-        if victim == arriving {
-            return false;
-        }
-        let Some(d) = f.dsts.get_mut(&victim) else {
-            return false;
-        };
-        let mut found = None;
-        while let Some((g, k)) = d.order.pop_front() {
-            if Self::is_live(&self.entries, &k, g) {
-                found = Some(k);
-                break;
-            }
-        }
-        match found {
+    /// Evict the least recently progressed datagram of family `fi` other
+    /// than `arriving`. False when there is none.
+    fn evict_lru(&mut self, fi: usize, arriving: &Key) -> bool {
+        let victim = self.families[fi]
+            .lru
+            .values()
+            .take(2)
+            .find(|k| *k != arriving)
+            .copied();
+        match victim {
             Some(k) => {
                 self.remove(&k);
                 self.stats.dropped_capacity += 1;
                 true
             }
-            None => false, // unreachable while the invariants hold
+            None => false,
         }
     }
 
-    /// Kernel `inet_frag_find` threshold check, see the module docs.
+    /// Kernel `inet_frag_find` threshold check plus the sensor's global
+    /// bound, see the module docs.
     fn admit(&mut self, key: &Key, exists: bool) -> bool {
         let fi = family(&key.dst);
         let dst_bytes = self.families[fi].dsts.get(&key.dst).map_or(0, |d| d.bytes);
@@ -482,7 +501,7 @@ impl Reassembler {
             if !full {
                 return true;
             }
-            if !self.evict_heaviest(fi, key.dst) {
+            if !self.evict_lru(fi, key) {
                 return false;
             }
         }
@@ -503,13 +522,13 @@ impl Reassembler {
                 charge: 0,
                 protocol: None,
                 rid: 0,
+                progress: self.clock,
             },
         );
         let f = &mut self.families[family(&key.dst)];
         f.datagrams += 1;
-        let d = f.dsts.entry(key.dst).or_default();
-        d.datagrams += 1;
-        f.by_weight.insert((d.bytes, key.dst));
+        f.lru.insert(self.clock, key);
+        f.dsts.entry(key.dst).or_default().datagrams += 1;
         self.peers.entry((key.src, key.dst)).or_default().datagrams += 1;
         self.track(key, generation);
         self.recharge(&key, DATAGRAM_OVERHEAD, 0);
@@ -539,6 +558,7 @@ impl Reassembler {
     /// completes its datagram.
     pub fn push(&mut self, ts: Duration, frag: &IpFragment<'_>) -> Option<Reassembled> {
         self.stats.fragments += 1;
+        self.clock += 1;
         self.now = self.now.max(ts);
         self.expire();
 
@@ -642,6 +662,7 @@ impl Reassembler {
         }
         e.meat += data.len();
         self.recharge(&key, data.len() + FRAGMENT_OVERHEAD, 0);
+        self.touch(&key);
         self.finish_if_complete(&key, v4)
     }
 
@@ -729,9 +750,11 @@ impl Reassembler {
                 .collect();
             assert_eq!(f.datagrams, live.len());
             assert_eq!(f.bytes, live.iter().map(|(_, e)| e.charge).sum::<usize>());
-            assert_eq!(f.by_weight.len(), f.dsts.len());
+            assert_eq!(f.lru.len(), live.len());
+            for (k, e) in &live {
+                assert_eq!(f.lru.get(&e.progress), Some(*k));
+            }
             for (dst, d) in &f.dsts {
-                assert!(f.by_weight.contains(&(d.bytes, *dst)));
                 let mine = live.iter().filter(|(k, _)| k.dst == *dst);
                 assert_eq!(d.datagrams, mine.clone().count());
                 assert_eq!(d.bytes, mine.map(|(_, e)| e.charge).sum::<usize>());
@@ -1064,48 +1087,86 @@ mod tests {
         r.check_invariants();
     }
 
-    /// Global pressure evicts the heaviest destination, or refuses the
-    /// fragment when it belongs to the heaviest one: the robot's small
-    /// bucket survives floods to one or many other destinations.
+    /// Global pressure never refuses a fragment whose destination is within
+    /// its budget; it evicts the least recently progressed other datagram,
+    /// so junk queued before a real datagram goes first.
     #[test]
-    fn global_pressure_evicts_the_heaviest_destination() {
+    fn global_pressure_evicts_the_least_recently_progressed() {
         let mut r = Reassembler::new(ReassemblyLimits {
             max_bytes: 8 * 1024,
             max_dist: 0,
             ..Default::default()
         });
         let robot = ip(2);
-        r.push(secs(0), &frag(1, 0, true, &[1; 8]));
+        // A flood to 50 destinations fills the table and churns through it.
         for j in 0..2000u32 {
             let dst = IpAddr::V4(Ipv4Addr::new(10, 1, (j % 50) as u8, 1));
             r.push(secs(0), &to(ip(66), dst, j, 0, true, &[0; 64]));
             assert!(r.buffered_bytes() <= 8 * 1024 + 64 + FRAGMENT_OVERHEAD + DATAGRAM_OVERHEAD);
         }
         assert!(r.stats().dropped_capacity > 0);
-        assert!(r.buffered_bytes_for(robot) > 0, "robot state kept");
-        // The robot's datagram completes even though the table is full: the
-        // flood is evicted to make room.
+        assert_eq!(r.stats().refused_capacity, 0, "never refused");
+        // The robot's datagram arrives into the full table and survives a
+        // burst of further junk smaller than the table.
+        r.push(secs(0), &frag(1, 0, true, &[1; 8]));
+        assert!(r.buffered_bytes_for(robot) > 0);
+        let in_table = r.in_flight();
+        for j in 0..(in_table as u32 - 2) {
+            r.push(secs(0), &to(ip(66), ip(77), 5000 + j, 0, true, &[0; 64]));
+        }
         assert!(r.push(secs(0), &frag(1, 8, false, &[2; 8])).is_some());
+        // A datagram that keeps progressing is never the victim; once every
+        // other datagram has progressed after it, it is (the documented
+        // limit), and that is counted.
+        r.push(secs(0), &frag(2, 0, true, &[1; 8]));
+        let before = r.stats().dropped_capacity;
+        for j in 0..(2 * in_table as u32) {
+            r.push(secs(0), &to(ip(66), ip(77), 9000 + j, 0, true, &[0; 64]));
+        }
+        assert_eq!(r.buffered_bytes_for(robot), 0, "evicted after a full churn");
+        assert!(r.stats().dropped_capacity > before);
+        r.check_invariants();
+
         // Datagram-count pressure works the same way.
         let mut r = Reassembler::new(ReassemblyLimits {
             max_datagrams: 16,
             max_dist: 0,
             ..Default::default()
         });
-        r.push(secs(0), &frag(1, 0, true, &[1; 8]));
         for j in 0..100u32 {
             r.push(secs(0), &to(ip(66), ip(200), j, 0, true, &[0; 8]));
             assert!(r.in_flight() <= 16);
         }
-        // The flood's destination is the heaviest: refused, nothing evicted.
-        assert!(r.stats().refused_capacity > 0);
-        assert_eq!(r.stats().dropped_capacity, 0);
-        // A new robot datagram evicts from the flood's destination.
-        let before = r.stats().dropped_capacity;
+        assert_eq!(r.stats().refused_capacity, 0);
+        assert_eq!(r.stats().dropped_capacity, 84);
+        // The robot's datagrams evict the oldest junk and survive a burst of
+        // up to 14 further junk datagrams.
+        r.push(secs(0), &frag(1, 0, true, &[1; 8]));
         r.push(secs(0), &frag(2, 0, true, &[1; 8]));
-        assert_eq!(r.stats().dropped_capacity, before + 1);
+        for j in 0..14u32 {
+            r.push(secs(0), &to(ip(66), ip(200), 1000 + j, 0, true, &[0; 8]));
+        }
         assert!(r.push(secs(0), &frag(1, 8, false, &[2; 8])).is_some());
         assert!(r.push(secs(0), &frag(2, 8, false, &[2; 8])).is_some());
+        // Duplicates are not progress: re-sending a junk fragment does not
+        // protect that datagram, it is still the oldest.
+        assert_eq!(r.in_flight(), 14);
+        r.push(secs(0), &frag(3, 0, true, &[1; 8]));
+        r.push(secs(0), &to(ip(66), ip(200), 2000, 0, true, &[0; 8]));
+        r.push(secs(0), &to(ip(66), ip(200), 1000, 0, true, &[0; 8])); // dup
+        assert_eq!(r.stats().duplicates, 1);
+        let before = r.stats().dropped_capacity;
+        r.push(secs(0), &to(ip(66), ip(201), 77, 0, true, &[0; 8]));
+        assert_eq!(r.stats().dropped_capacity, before + 1);
+        // Junk 1001 was not the victim (it completes), junk 1000 was: its
+        // last fragment no longer completes it.
+        assert!(r
+            .push(secs(0), &to(ip(66), ip(200), 1001, 8, false, &[0; 8]))
+            .is_some());
+        assert!(r
+            .push(secs(0), &to(ip(66), ip(200), 1000, 8, false, &[0; 8]))
+            .is_none());
+        assert!(r.push(secs(0), &frag(3, 8, false, &[2; 8])).is_some());
         // IPv4 pressure never evicts IPv6 state.
         r.push(secs(0), &frag_from(v6(1), 7, 0, true, &[1; 8]));
         for j in 0..100u32 {
