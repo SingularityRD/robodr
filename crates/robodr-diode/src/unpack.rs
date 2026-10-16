@@ -49,6 +49,21 @@
 //!    batch hash>/`. A batch is never reported as accepted without its own
 //!    records on disk.
 //!
+//! **Parity repair** (batches packed with parity, see [`crate::fec`]): before
+//! step 3, every listed file (data and parity) is hashed; a file that is
+//! missing, of the wrong size or of the wrong SHA-256 is an *erasure*. Up to
+//! `m` erasures are rebuilt from the other files, each rebuilt file is
+//! accepted only if its size and SHA-256 equal the signed manifest's, and
+//! it then replaces the damaged one in the inbox entry (temp file + rename);
+//! step 3 then verifies everything exactly as for any other batch. More
+//! than `m` erasures quarantine the batch as `fec_unrecoverable`, naming the
+//! damaged files. Entries that are not regular files (symlinks,
+//! directories) are never "repaired": they fail step 3 as before.
+//!
+//! **Single instance**: [`Importer::open`] takes an exclusive `flock` on
+//! `<state>.lock` for the importer's lifetime; a second importer on the same
+//! state fails with [`ImportError::Locked`].
+//!
 //! Anything that fails a check is moved to `quarantine/<unique>/entry`, with
 //! `quarantine/<unique>/reason.json` beside it (a separate directory per
 //! entry, so inbox names cannot collide with or impersonate reason files);
@@ -62,6 +77,7 @@
 //! quarantined as `unreadable`), and the run continues with the next entry.
 //! Only failing to list the inbox itself is a run error.
 
+use crate::fec::ReedSolomon;
 use crate::fsutil::{self, ReadError};
 use crate::manifest::{
     batch_dir_name, batch_hash, file_sha256, is_hex_digest, manifest_signing_message, trunc,
@@ -101,6 +117,8 @@ pub const QUARANTINE_ENTRY: &str = "entry";
 /// Name of the reason file inside each `quarantine/<unique>/`.
 pub const REASON_FILE: &str = "reason.json";
 const READ_CHUNK: usize = 64 * 1024;
+/// Prefix of the temp files parity repair writes inside an inbox entry.
+const REPAIR_TMP_PREFIX: &str = ".fec-";
 
 /// Verifiers for batch manifests, each bound to the unit it may sign for;
 /// black-box bundle verifiers, each bound to a unit; and per-unit allow-lists
@@ -406,6 +424,18 @@ pub enum QuarantineReason {
     OutputConflict {
         output: String,
     },
+    /// More files are missing or damaged than the batch's parity can
+    /// rebuild (`damaged` lists them, data and parity files alike).
+    FecUnrecoverable {
+        damaged: Vec<String>,
+        parity_shards: u32,
+    },
+    /// Parity reconstruction produced a file whose size or SHA-256 differs
+    /// from the signed manifest (files changed during repair, or a bug);
+    /// nothing reconstructed was kept.
+    FecFailed {
+        name: String,
+    },
 }
 
 impl fmt::Display for QuarantineReason {
@@ -431,6 +461,8 @@ pub struct AcceptedBatch {
     /// `out/<batch>/`, or `out/<batch>.<hash16>/` when `out/<batch>/` held
     /// another batch's output.
     pub output: PathBuf,
+    /// Files rebuilt from parity before verification (empty if none).
+    pub repaired: Vec<String>,
 }
 
 /// A batch identified only by name, unit and seq.
@@ -524,6 +556,8 @@ impl Default for ImportState {
 pub enum ImportError {
     Config(String),
     State(String),
+    /// Another importer holds the lock on this state file.
+    Locked(PathBuf),
     Io(io::Error),
 }
 
@@ -532,6 +566,11 @@ impl fmt::Display for ImportError {
         match self {
             Self::Config(m) => write!(f, "configuration: {m}"),
             Self::State(m) => write!(f, "importer state: {m}"),
+            Self::Locked(p) => write!(
+                f,
+                "another robodr-diode-unpack instance holds {} (one importer per state file)",
+                p.display()
+            ),
             Self::Io(e) => write!(f, "I/O: {e}"),
         }
     }
@@ -634,12 +673,14 @@ fn data_read_error(f: &FileEntry, e: ReadError) -> Checked<std::convert::Infalli
     }))
 }
 
-/// The SOC-side importer. One instance per state file; concurrent runs on
-/// the same directories are not supported.
+/// The SOC-side importer. One instance per state file, enforced by an
+/// exclusive lock on `<state>.lock` held while the importer lives.
 pub struct Importer {
     cfg: ImportConfig,
     keyring: Keyring,
     state: ImportState,
+    /// The `flock` on `<state>.lock`; released on drop.
+    _lock: fs::File,
 }
 
 impl Importer {
@@ -686,6 +727,8 @@ impl Importer {
                 "the state file must not be inside the inbox".into(),
             ));
         }
+        let lock_path = fsutil::lock_path(&cfg.state_path);
+        let lock = fsutil::try_lock(&lock_path)?.ok_or(ImportError::Locked(lock_path))?;
         let state = match fsutil::read_capped(&cfg.state_path, MAX_STATE_BYTES) {
             Ok(b) => {
                 let s: ImportState = serde_json::from_slice(&b)
@@ -711,6 +754,7 @@ impl Importer {
             cfg,
             keyring,
             state,
+            _lock: lock,
         })
     }
 
@@ -960,7 +1004,11 @@ impl Importer {
             match known {
                 Some(h) if h == c.hash => {
                     // Nothing is re-emitted, but a corrupted copy is still
-                    // reported rather than silently filed away.
+                    // reported rather than silently filed away (after the
+                    // same parity repair an accepted batch gets).
+                    if let Err(r) = self.repair(&c)? {
+                        return self.quarantine(&c.path, &c.name, r, now_ms, report);
+                    }
                     if let Err(r) = self.verify_files(&c, None)? {
                         return self.quarantine(&c.path, &c.name, r, now_ms, report);
                     }
@@ -1033,6 +1081,10 @@ impl Importer {
             return Ok(());
         }
 
+        let repaired = match self.repair(&c)? {
+            Ok(r) => r,
+            Err(r) => return self.quarantine(&c.path, &c.name, r, now_ms, report),
+        };
         let (output, verified) = match self.emit(&c)? {
             Ok(v) => v,
             Err(r) => return self.quarantine(&c.path, &c.name, r, now_ms, report),
@@ -1078,6 +1130,7 @@ impl Importer {
             bundles_verified: verified.bundles_verified,
             gap_accepted: gap,
             output,
+            repaired,
         });
         // A failure here leaves an accepted batch in the inbox; the next run
         // sees it as a duplicate and files it then.
@@ -1144,6 +1197,24 @@ impl Importer {
                     }
                     bundles += 1;
                 }
+                // Parity is verified like any file but not emitted: it has
+                // done its job once the data files verify.
+                FileKind::Parity => match fsutil::hash_file(&c.path.join(&f.name), f.size) {
+                    Ok((len, _)) if len != f.size => {
+                        return Ok(Err(Q::SizeMismatch {
+                            name: f.name.clone(),
+                            expected: f.size,
+                            actual: len,
+                        }))
+                    }
+                    Ok((_, sha)) if sha != f.sha256 => {
+                        return Ok(Err(Q::HashMismatch {
+                            name: f.name.clone(),
+                        }))
+                    }
+                    Ok(_) => {}
+                    Err(e) => return data_read_error(f, e).map(|r| r.map(|x| match x {})),
+                },
             }
         }
         if let Some(w) = records {
@@ -1153,6 +1224,141 @@ impl Importer {
             bundles,
             bundles_verified,
         }))
+    }
+
+    /// Parity repair (see the module docs). `Ok(Ok(names))`: the files
+    /// rebuilt (empty when nothing was damaged, the batch has no parity, or
+    /// a damage is of a kind repair must not paper over — step 3 then
+    /// reports it).
+    fn repair(&self, c: &Candidate) -> Checked<Vec<String>> {
+        use QuarantineReason as Q;
+        let m = &c.manifest;
+        let Some(spec) = &m.parity else {
+            return Ok(Ok(Vec::new()));
+        };
+        if m.total_size() > self.cfg.max_batch_bytes {
+            return Ok(Ok(Vec::new())); // verify_files reports batch_too_large
+        }
+        // Temp files of an interrupted earlier repair.
+        for f in &m.files {
+            let t = c.path.join(format!("{REPAIR_TMP_PREFIX}{}", f.name));
+            if fs::symlink_metadata(&t).is_ok_and(|md| !md.is_dir()) {
+                fs::remove_file(&t)?;
+            }
+        }
+        let mut erased = Vec::new();
+        for (pos, f) in m.files.iter().enumerate() {
+            match fsutil::hash_file(&c.path.join(&f.name), f.size) {
+                Ok((len, sha)) if len == f.size && sha == f.sha256 => {}
+                Ok(_) | Err(ReadError::Missing) | Err(ReadError::TooLarge(_)) => erased.push(pos),
+                // Symlinks, directories, devices: hostile, not lossy.
+                Err(ReadError::NotRegular) => return Ok(Ok(Vec::new())),
+                Err(ReadError::Io(e)) => {
+                    return match unreadable(&e) {
+                        Some(_) => Ok(Ok(Vec::new())), // reported by step 3
+                        None => Err(e),
+                    };
+                }
+            }
+        }
+        if erased.is_empty() {
+            return Ok(Ok(Vec::new()));
+        }
+        let k = spec.data_shards as usize;
+        let mp = spec.parity_shards as usize;
+        if erased.len() > mp {
+            return Ok(Err(Q::FecUnrecoverable {
+                damaged: erased.iter().map(|&p| m.files[p].name.clone()).collect(),
+                parity_shards: spec.parity_shards,
+            }));
+        }
+        let rs = ReedSolomon::new(k, mp).map_err(|e| fsutil::invalid(e.to_string()))?;
+        let dec = rs
+            .decoder(&erased)
+            .map_err(|e| fsutil::invalid(e.to_string()))?;
+        let plen = m.parity_files().map(|f| f.size).max().unwrap_or(0);
+        // Open the intact files (re-checked against the manifest at the end
+        // of the repair and again by step 3).
+        let mut readers = Vec::with_capacity(dec.known().len());
+        for &pos in dec.known() {
+            let f = &m.files[pos];
+            match fsutil::open_capped(&c.path.join(&f.name), f.size) {
+                Ok((file, _)) => readers.push((file.take(f.size), f.size)),
+                Err(e) => return data_read_error(f, e).map(|r| r.map(|x| match x {})),
+            }
+        }
+        let tmps: Vec<PathBuf> = erased
+            .iter()
+            .map(|&p| {
+                c.path
+                    .join(format!("{REPAIR_TMP_PREFIX}{}", m.files[p].name))
+            })
+            .collect();
+        let res = (|| -> Checked<()> {
+            let mut outs = Vec::with_capacity(erased.len());
+            for t in &tmps {
+                outs.push((BufWriter::new(fsutil::create_new(t)?), Sha256::new()));
+            }
+            let mut inbufs = vec![vec![0u8; READ_CHUNK]; readers.len()];
+            let mut outbufs = vec![vec![0u8; READ_CHUNK]; erased.len()];
+            let mut off = 0u64;
+            while off < plen {
+                let n = (plen - off).min(READ_CHUNK as u64) as usize;
+                for ((r, size), buf) in readers.iter_mut().zip(inbufs.iter_mut()) {
+                    // Bytes of this file inside [off, off + n); zero beyond its end.
+                    let have = size.saturating_sub(off).min(n as u64) as usize;
+                    r.read_exact(&mut buf[..have])?;
+                    buf[have..n].fill(0);
+                }
+                {
+                    let known: Vec<&[u8]> = inbufs.iter().map(|b| &b[..n]).collect();
+                    let mut out: Vec<&mut [u8]> = outbufs.iter_mut().map(|b| &mut b[..n]).collect();
+                    dec.reconstruct(&known, &mut out)
+                        .map_err(|e| fsutil::invalid(e.to_string()))?;
+                }
+                for ((&pos, (w, h)), buf) in erased.iter().zip(outs.iter_mut()).zip(&outbufs) {
+                    let size = m.files[pos].size;
+                    let keep = size.saturating_sub(off).min(n as u64) as usize;
+                    w.write_all(&buf[..keep])?;
+                    h.update(&buf[..keep]);
+                }
+                off += n as u64;
+            }
+            let mut finished = Vec::with_capacity(outs.len());
+            for (&pos, (w, h)) in erased.iter().zip(outs) {
+                w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+                if to_hex(&h.finalize()) != m.files[pos].sha256 {
+                    return Ok(Err(Q::FecFailed {
+                        name: m.files[pos].name.clone(),
+                    }));
+                }
+                finished.push(pos);
+            }
+            // Never install anything unless the intact files are still the
+            // ones the manifest describes.
+            for &pos in dec.known() {
+                let f = &m.files[pos];
+                match fsutil::hash_file(&c.path.join(&f.name), f.size) {
+                    Ok((len, sha)) if len == f.size && sha == f.sha256 => {}
+                    _ => {
+                        return Ok(Err(Q::FecFailed {
+                            name: f.name.clone(),
+                        }))
+                    }
+                }
+            }
+            for (&pos, t) in finished.iter().zip(&tmps) {
+                fs::rename(t, c.path.join(&m.files[pos].name))?;
+            }
+            fsutil::fsync_dir(&c.path)?;
+            Ok(Ok(()))
+        })();
+        if !matches!(res, Ok(Ok(()))) {
+            for t in &tmps {
+                let _ = fs::remove_file(t);
+            }
+        }
+        Ok(res?.map(|()| erased.iter().map(|&p| m.files[p].name.clone()).collect()))
     }
 
     /// Read, hash-check, parse and (if a key bound to this unit is known)

@@ -1,6 +1,9 @@
 //! `robodr-diode-pack`: low-side packer (see the crate README).
 //!
-//! Exit codes: 0 ok, 1 error, 2 usage.
+//! `robodr-diode-pack resend ...` re-emits an archived batch.
+//!
+//! Exit codes: 0 ok, 1 error (including "another instance holds the
+//! lock"), 2 usage.
 
 use robodr_diode::cli::{self, MAX_INPUT_FILE};
 use robodr_diode::pack::{PackConfig, Packer};
@@ -11,7 +14,9 @@ const USAGE: &str = "\
 usage: robodr-diode-pack --outbox DIR --state FILE --unit UNIT_ID \\
          --key-file SECRET_KEY_FILE [--key-id KEY_ID] [--allow-hmac] \\
          [--findings FINDINGS.jsonl]... [--bundle BUNDLE.rbbx]... \\
-         [--max-batch-bytes N] [--max-findings N] [--now-ms MS]
+         [--max-batch-bytes N] [--max-findings N] [--now-ms MS] \
+         [--parity M] [--shard-size BYTES] [--archive-keep N]
+       robodr-diode-pack resend --outbox DIR --state FILE --unit UNIT_ID --seq N
 
 --key-file is a robodr-blackbox secret key file (`robodr-blackbox keygen`,
 ed25519; mode 0600, owned by this user or root, else refused). --key-id, if
@@ -21,7 +26,18 @@ unless --allow-hmac is given (symmetric: the SOC could forge batches).
 Validates every finding (robodr_ocsf::parse_and_validate) and bundle, then
 writes signed, sequence-numbered batches into OUTBOX (atomic rename; the
 transfer agent must ignore dot-entries). Prints the published batches as JSON.
-Any invalid input aborts before anything is written.";
+Any invalid input aborts before anything is written.
+
+--parity M (default 0 = off, max 32) adds M Reed-Solomon parity files to
+every batch, so the importer can rebuild any M missing or corrupt files of
+it; each parity file is the largest data file rounded up to --shard-size
+(default 65536) and counts against --max-batch-bytes.
+--archive-keep N (default 64, 0 = off) keeps the newest N batches in
+STATE.archive/ for `resend`, which copies batch SEQ back into OUTBOX byte for
+byte (no key needed; a no-op if an identical copy is already there).
+Only one packer may use a state file at a time (flock on STATE.lock).";
+
+const RESEND_FLAGS: &[&str] = &["outbox", "state", "unit", "seq"];
 
 const FLAGS: &[&str] = &[
     "outbox",
@@ -34,12 +50,42 @@ const FLAGS: &[&str] = &[
     "max-batch-bytes",
     "max-findings",
     "now-ms",
+    "parity",
+    "shard-size",
+    "archive-keep",
 ];
 
 const SWITCHES: &[&str] = &["allow-hmac"];
 
 fn main() -> ExitCode {
-    let args = match cli::argv().and_then(|v| cli::parse_args_with_switches(v, FLAGS, SWITCHES)) {
+    let argv = match cli::argv() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    if argv.first().map(String::as_str) == Some("resend") {
+        let args = match cli::parse_args(argv.into_iter().skip(1), RESEND_FLAGS) {
+            Ok(a) => a,
+            Err(e) if e == "help" => {
+                println!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                eprintln!("error: {e}\n\n{USAGE}");
+                return ExitCode::from(2);
+            }
+        };
+        return match resend(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(1)
+            }
+        };
+    }
+    let args = match cli::parse_args_with_switches(argv, FLAGS, SWITCHES) {
         Ok(a) => a,
         Err(e) if e == "help" => {
             println!("{USAGE}");
@@ -74,6 +120,15 @@ fn run(args: &cli::Args) -> Result<(), String> {
     }
     if let Some(n) = args.num("max-findings")? {
         cfg.max_findings_per_batch = n;
+    }
+    if let Some(n) = args.num("parity")? {
+        cfg.parity_shards = n;
+    }
+    if let Some(n) = args.num("shard-size")? {
+        cfg.shard_size = n;
+    }
+    if let Some(n) = args.num("archive-keep")? {
+        cfg.archive_keep = n;
     }
     let now = args.num("now-ms")?.unwrap_or_else(cli::now_ms);
 
@@ -112,6 +167,21 @@ fn run(args: &cli::Args) -> Result<(), String> {
     println!(
         "{}",
         serde_json::to_string_pretty(&published).map_err(|e| e.to_string())?
+    );
+    Ok(())
+}
+
+fn resend(args: &cli::Args) -> Result<(), String> {
+    let seq: u64 = args
+        .num("seq")?
+        .ok_or_else(|| "--seq is required".to_string())?;
+    let mut packer =
+        Packer::open_for_resend(args.req("outbox")?, args.req("state")?, args.req("unit")?)
+            .map_err(|e| e.to_string())?;
+    let r = packer.resend(seq).map_err(|e| e.to_string())?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?
     );
     Ok(())
 }

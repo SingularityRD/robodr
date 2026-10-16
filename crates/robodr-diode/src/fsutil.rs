@@ -133,6 +133,66 @@ pub(crate) fn read_capped(p: &Path, max: u64) -> Result<Vec<u8>, ReadError> {
     Ok(buf)
 }
 
+/// Size and lower-case hex SHA-256 of a regular, non-symlink file of at
+/// most `max` bytes, streamed in 64 KiB chunks (never more than `max + 1`
+/// bytes are read, so a file that grows is reported as too large).
+pub(crate) fn hash_file(p: &Path, max: u64) -> Result<(u64, String), ReadError> {
+    let (f, _) = open_capped(p, max)?;
+    let mut r = f.take(max.saturating_add(1));
+    let mut h = robodr_blackbox::crypto::Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(ReadError::Io(e)),
+        };
+        h.update(&buf[..n]);
+        total += n as u64;
+    }
+    if total > max {
+        return Err(ReadError::TooLarge(total));
+    }
+    Ok((total, robodr_blackbox::crypto::to_hex(&h.finalize())))
+}
+
+/// Copy the regular, non-symlink file `src` (at most `max` bytes) to the new
+/// file `dst` ([`create_new`]), `fsync` it, and return its size and hex
+/// SHA-256. On any failure `dst` is removed.
+pub(crate) fn copy_hashed(src: &Path, dst: &Path, max: u64) -> Result<(u64, String), ReadError> {
+    let (f, _) = open_capped(src, max)?;
+    // Only a file we created is removed on failure.
+    let mut out = create_new(dst).map_err(ReadError::Io)?;
+    let res = (|| {
+        let mut r = f.take(max.saturating_add(1));
+        let mut h = robodr_blackbox::crypto::Sha256::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut total = 0u64;
+        loop {
+            let n = match r.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(ReadError::Io(e)),
+            };
+            h.update(&buf[..n]);
+            total += n as u64;
+            if total > max {
+                return Err(ReadError::TooLarge(total));
+            }
+            out.write_all(&buf[..n]).map_err(ReadError::Io)?;
+        }
+        out.sync_all().map_err(ReadError::Io)?;
+        Ok((total, robodr_blackbox::crypto::to_hex(&h.finalize())))
+    })();
+    if res.is_err() {
+        let _ = fs::remove_file(dst);
+    }
+    res
+}
+
 /// Create a new file for writing (`O_CREAT|O_EXCL|O_NOFOLLOW`: never through
 /// a symlink, never an existing file).
 pub(crate) fn create_new(p: &Path) -> io::Result<File> {
@@ -153,6 +213,55 @@ pub(crate) fn write_new(p: &Path, bytes: &[u8]) -> io::Result<()> {
 /// `fsync` a directory so a rename/creation in it is durable.
 pub(crate) fn fsync_dir(p: &Path) -> io::Result<()> {
     File::open(p)?.sync_all()
+}
+
+mod sys {
+    //! `flock(2)`, declared by hand like `robodr-blackbox` does (no libc
+    //! crate offline); std links libc on every unix target.
+    pub const LOCK_EX: i32 = 2;
+    pub const LOCK_NB: i32 = 4;
+    extern "C" {
+        pub fn flock(fd: i32, operation: i32) -> i32;
+    }
+}
+
+/// `<p>.lock`: the lock file guarding the state file `p`.
+pub(crate) fn lock_path(p: &Path) -> PathBuf {
+    let mut s = p.as_os_str().to_os_string();
+    s.push(".lock");
+    PathBuf::from(s)
+}
+
+/// Take an exclusive, non-blocking `flock` on `p` (created mode 0600 if
+/// missing, never through a symlink, never truncated or removed). `Ok(None)`
+/// if another process (or another open file description in this one) holds
+/// it. The lock lives as long as the returned file; the kernel drops it when
+/// the process dies, so a crash never leaves a stale lock behind.
+pub(crate) fn try_lock(p: &Path) -> io::Result<Option<File>> {
+    use std::os::unix::io::AsRawFd;
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(O_NOFOLLOW)
+        .open(p)?;
+    if !f.metadata()?.is_file() {
+        return Err(invalid(format!("{} is not a regular file", p.display())));
+    }
+    // SAFETY: `flock` only reads its two integer arguments; the descriptor
+    // is owned by `f`, which outlives the call.
+    let rc = unsafe { sys::flock(f.as_raw_fd(), sys::LOCK_EX | sys::LOCK_NB) };
+    if rc == 0 {
+        return Ok(Some(f));
+    }
+    let e = io::Error::last_os_error();
+    if e.kind() == io::ErrorKind::WouldBlock {
+        Ok(None)
+    } else {
+        Err(e)
+    }
 }
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -308,6 +417,24 @@ mod tests {
         atomic_write(&d.join("state"), b"1").unwrap();
         atomic_write(&d.join("state"), b"2").unwrap();
         assert_eq!(fs::read(d.join("state")).unwrap(), b"2");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn lock_is_exclusive_and_released_on_drop() {
+        let d = tmpdir("lock");
+        let lp = lock_path(&d.join("state.json"));
+        assert_eq!(lp, d.join("state.json.lock"));
+        let held = try_lock(&lp).unwrap().expect("first lock");
+        // flock locks belong to the open file description, so a second open
+        // in the same process contends just like another process would.
+        assert!(try_lock(&lp).unwrap().is_none());
+        drop(held);
+        let again = try_lock(&lp).unwrap();
+        assert!(again.is_some());
+        // Never through a symlink.
+        std::os::unix::fs::symlink(&lp, d.join("ln.lock")).unwrap();
+        assert!(try_lock(&d.join("ln.lock")).is_err());
         fs::remove_dir_all(&d).unwrap();
     }
 

@@ -128,6 +128,7 @@ fn soc_cannot_forge_a_batch() {
     let r = imp.run(NOW).unwrap();
     assert_eq!(codes(&r), vec!["bad_signature"], "{r:?}");
     assert!(r.accepted.is_empty());
+    drop(imp);
 
     // 2. Downgrade: an HMAC tag under the Ed25519 key id is refused by
     //    algorithm before any MAC is computed.
@@ -137,6 +138,7 @@ fn soc_cannot_forge_a_batch() {
     let mut imp = Importer::open(site.import_cfg(), public_ring(UNIT)).unwrap();
     let r = imp.run(NOW).unwrap();
     assert_eq!(codes(&r), vec!["algorithm_mismatch"], "{r:?}");
+    drop(imp);
 
     // 3. The genuine batch still imports (state was never advanced).
     let _ = fs::remove_dir_all(&dir);

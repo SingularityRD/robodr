@@ -12,6 +12,19 @@
 //! The batch hash ([`batch_hash`]) is a domain-separated SHA-256 of the raw
 //! manifest bytes. Because the manifest commits to every file's hash and to
 //! the previous batch's hash, the batch hashes form a per-unit hash chain.
+//!
+//! ## Optional parity (forward error correction)
+//!
+//! A manifest may carry `parity` ([`ParitySpec`]) and list `m` parity files
+//! `parity-01.rbpar` … after the data files. The data files (in manifest
+//! order) are the `k` data shards and the parity files the `m` parity shards
+//! of a Reed-Solomon code over GF(2^8) ([`crate::fec`], scheme
+//! [`PARITY_SCHEME`]): byte `o` of every shard forms one codeword, data
+//! shards are zero-padded to the parity length, and the parity length is
+//! the largest data file rounded up to a multiple of `shard_size` (the
+//! stripe height). Parity files are listed with size and SHA-256 like any
+//! other file, so they are covered by the signature. A manifest without
+//! parity serialises exactly as before the field existed.
 
 use robodr_blackbox::crypto::{sha256, to_hex};
 use robodr_ocsf::validate::{is_valid_robot_id, MAX_TIME_MS, MIN_TIME_MS};
@@ -35,6 +48,14 @@ pub const MAX_FILES: usize = 256;
 pub const MAX_SIG_LEN: usize = robodr_blackbox::record::MAX_SIG_LEN;
 /// Hard cap on key ids (matches the black-box signer).
 pub const MAX_KEY_ID_LEN: usize = robodr_blackbox::sign::MAX_KEY_ID_LEN;
+/// Most parity files a batch may carry.
+pub const MAX_PARITY_SHARDS: usize = 32;
+/// Smallest / largest `shard_size` (stripe height) of a parity batch.
+pub const MIN_SHARD_SIZE: u64 = 512;
+pub const MAX_SHARD_SIZE: u64 = 16 * 1024 * 1024;
+/// The only parity scheme: RS over GF(2^8)/0x11D, generator roots
+/// `α^0..α^(m-1)`, codeword = data files then parity files (manifest order).
+pub const PARITY_SCHEME: &str = "rs-gf256-0x11d/1";
 /// Longest data file name accepted.
 pub const MAX_FILE_NAME: usize = 64;
 /// Largest `batch_seq` (the 16 decimal digits of [`batch_dir_name`]). Keeps
@@ -52,6 +73,34 @@ pub enum FileKind {
     Findings,
     /// A `robodr-blackbox` export bundle (`RBBXBND1` bytes).
     BlackboxBundle,
+    /// A Reed-Solomon parity shard (`parity-NN.rbpar`); see [`ParitySpec`].
+    Parity,
+}
+
+/// Parity parameters of a batch (see the module docs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParitySpec {
+    /// [`PARITY_SCHEME`].
+    pub scheme: String,
+    /// `k`: number of data files.
+    pub data_shards: u32,
+    /// `m`: number of parity files (`1..=`[`MAX_PARITY_SHARDS`], `k + m <= 255`).
+    pub parity_shards: u32,
+    /// Stripe height in bytes: every parity file is the largest data file
+    /// rounded up to a multiple of this.
+    pub shard_size: u64,
+}
+
+/// Length of every parity file for data files of at most `max_data_len`
+/// bytes (rounded up to a multiple of `shard_size`, which must be > 0).
+pub fn parity_len(max_data_len: u64, shard_size: u64) -> u64 {
+    max_data_len.div_ceil(shard_size).saturating_mul(shard_size)
+}
+
+/// Name of the `j`-th (1-based) parity file: `parity-01.rbpar`.
+pub fn parity_file_name(j: usize) -> String {
+    format!("parity-{j:02}.rbpar")
 }
 
 /// One data file of a batch.
@@ -90,7 +139,12 @@ pub struct Manifest {
     /// Min / max `ocsf.time` of the findings, `None` when there are none.
     pub first_time: Option<u64>,
     pub last_time: Option<u64>,
+    /// Data files, then (with `parity`) the parity files in order.
     pub files: Vec<FileEntry>,
+    /// Reed-Solomon parity over the data files; absent (not `null`) when
+    /// the batch has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parity: Option<ParitySpec>,
 }
 
 /// Contents of [`SIGNATURE_FILE`].
@@ -222,6 +276,7 @@ impl Manifest {
         }
         let mut names = std::collections::BTreeSet::new();
         let mut findings_files = 0;
+        let mut parity_files = 0usize;
         for f in &self.files {
             if !is_safe_file_name(&f.name) {
                 return Err(format!("unsafe file name {:?}", trunc(&f.name)));
@@ -229,6 +284,10 @@ impl Manifest {
             let ok = match f.kind {
                 FileKind::Findings => f.name == FINDINGS_FILE,
                 FileKind::BlackboxBundle => is_bundle_name(&f.name),
+                FileKind::Parity => {
+                    parity_files += 1;
+                    f.name == parity_file_name(parity_files)
+                }
             };
             if !ok {
                 return Err(format!("file name {:?} does not match its kind", f.name));
@@ -238,6 +297,9 @@ impl Manifest {
             }
             if !is_hex_digest(&f.sha256) {
                 return Err(format!("bad sha256 for {:?}", f.name));
+            }
+            if f.kind != FileKind::Parity && parity_files > 0 {
+                return Err("data file listed after a parity file".into());
             }
             if f.kind == FileKind::Findings {
                 findings_files += 1;
@@ -258,10 +320,55 @@ impl Manifest {
             },
             _ => return Err("finding_count does not match the findings file".into()),
         }
+        self.check_parity(parity_files)
+    }
+
+    fn check_parity(&self, parity_files: usize) -> Result<(), String> {
+        let Some(p) = &self.parity else {
+            return if parity_files == 0 {
+                Ok(())
+            } else {
+                Err("parity files without a parity section".into())
+            };
+        };
+        if p.scheme != PARITY_SCHEME {
+            return Err(format!("unsupported parity scheme {:?}", trunc(&p.scheme)));
+        }
+        let k = self.files.len() - parity_files;
+        let m = parity_files;
+        if p.parity_shards as usize != m || p.data_shards as usize != k {
+            return Err("parity shard counts do not match the listed files".into());
+        }
+        if !(1..=MAX_PARITY_SHARDS).contains(&m) || k == 0 || k + m > crate::fec::MAX_SHARDS {
+            return Err(format!(
+                "parity needs 1..={MAX_PARITY_SHARDS} parity files and k + m <= {}",
+                crate::fec::MAX_SHARDS
+            ));
+        }
+        if !(MIN_SHARD_SIZE..=MAX_SHARD_SIZE).contains(&p.shard_size) {
+            return Err(format!(
+                "shard_size must be in {MIN_SHARD_SIZE}..={MAX_SHARD_SIZE}"
+            ));
+        }
+        let max_data = self.data_files().map(|f| f.size).max().unwrap_or(0);
+        let plen = parity_len(max_data, p.shard_size);
+        if self.parity_files().any(|f| f.size != plen) {
+            return Err(format!("parity files must be {plen} bytes"));
+        }
         Ok(())
     }
 
-    /// Sum of declared data file sizes (saturating).
+    /// The data files (everything but parity), in manifest order.
+    pub fn data_files(&self) -> impl Iterator<Item = &FileEntry> {
+        self.files.iter().filter(|f| f.kind != FileKind::Parity)
+    }
+
+    /// The parity files, in manifest order.
+    pub fn parity_files(&self) -> impl Iterator<Item = &FileEntry> {
+        self.files.iter().filter(|f| f.kind == FileKind::Parity)
+    }
+
+    /// Sum of declared file sizes, parity included (saturating).
     pub fn total_size(&self) -> u64 {
         self.files
             .iter()
@@ -309,7 +416,112 @@ mod tests {
                 size: 10,
                 sha256: "ab".repeat(32),
             }],
+            parity: None,
         }
+    }
+
+    fn with_parity(np: u32) -> Manifest {
+        let mut x = m();
+        x.files[0].size = 1000;
+        for j in 1..=np as usize {
+            x.files.push(FileEntry {
+                name: parity_file_name(j),
+                kind: FileKind::Parity,
+                size: 1024,
+                sha256: "cd".repeat(32),
+            });
+        }
+        x.parity = Some(ParitySpec {
+            scheme: PARITY_SCHEME.into(),
+            data_shards: 1,
+            parity_shards: np,
+            shard_size: 512,
+        });
+        x
+    }
+
+    #[test]
+    fn parity_manifests() {
+        with_parity(1).check().unwrap();
+        with_parity(MAX_PARITY_SHARDS as u32).check().unwrap();
+        assert_eq!(parity_len(1000, 512), 1024);
+        assert_eq!(parity_len(1024, 512), 1024);
+        assert_eq!(parity_len(0, 512), 0);
+        assert_eq!(parity_file_name(3), "parity-03.rbpar");
+        // A manifest without parity has no `parity` key at all (byte
+        // compatible with batches written before the field existed).
+        let v = serde_json::to_value(m()).unwrap();
+        assert!(v.get("parity").is_none());
+        let back: Manifest = serde_json::from_value(v).unwrap();
+        assert_eq!(back.parity, None);
+        let cases: Vec<(&str, Mutation)> = vec![
+            (
+                "scheme",
+                Box::new(|m| m.parity.as_mut().unwrap().scheme = "x".into()),
+            ),
+            (
+                "k",
+                Box::new(|m| m.parity.as_mut().unwrap().data_shards = 2),
+            ),
+            (
+                "m",
+                Box::new(|m| m.parity.as_mut().unwrap().parity_shards = 3),
+            ),
+            (
+                "shard small",
+                Box::new(|m| m.parity.as_mut().unwrap().shard_size = 511),
+            ),
+            (
+                "shard big",
+                Box::new(|m| m.parity.as_mut().unwrap().shard_size = MAX_SHARD_SIZE + 1),
+            ),
+            ("parity len", Box::new(|m| m.files[1].size = 1000)),
+            (
+                "parity name",
+                Box::new(|m| m.files[1].name = "parity-02.rbpar".into()),
+            ),
+            ("order", Box::new(|m| m.files.swap(0, 1))),
+            ("no section", Box::new(|m| m.parity = None)),
+            (
+                "too many",
+                Box::new(|m| {
+                    for j in 3..=MAX_PARITY_SHARDS + 1 {
+                        m.files.push(FileEntry {
+                            name: parity_file_name(j),
+                            kind: FileKind::Parity,
+                            size: 1024,
+                            sha256: "cd".repeat(32),
+                        });
+                    }
+                    m.parity.as_mut().unwrap().parity_shards = MAX_PARITY_SHARDS as u32 + 1;
+                }),
+            ),
+            (
+                "data after parity",
+                Box::new(|m| {
+                    m.files.push(FileEntry {
+                        name: bundle_file_name(1),
+                        kind: FileKind::BlackboxBundle,
+                        size: 1,
+                        sha256: "ab".repeat(32),
+                    });
+                    m.parity.as_mut().unwrap().data_shards = 2;
+                }),
+            ),
+        ];
+        for (name, f) in cases {
+            let mut x = with_parity(2);
+            f(&mut x);
+            assert!(x.check().is_err(), "{name} accepted");
+        }
+        // Parity files without a section.
+        let mut x = with_parity(1);
+        x.parity = None;
+        assert!(x.check().is_err());
+        // Unknown fields inside the parity section are rejected.
+        let mut v = serde_json::to_value(with_parity(1)).unwrap();
+        v["parity"]["extra"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<Manifest>(v).is_err());
     }
 
     #[test]

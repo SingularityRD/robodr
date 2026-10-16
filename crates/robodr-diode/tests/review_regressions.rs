@@ -222,6 +222,7 @@ fn f1b_bundle_key_must_be_bound_to_the_unit() {
     let rf = reason_json(&r.quarantined[0]);
     assert_eq!(rf["reason"]["key_unit"], "ugv-008");
     assert_eq!(rf["reason"]["unit_id"], UNIT);
+    drop(imp);
 
     // The same key cannot be registered for two units.
     let mut imp = Importer::open(site.import_cfg(), ed_ring()).unwrap();
