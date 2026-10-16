@@ -107,8 +107,11 @@ fn round_trip_findings_and_bundle() {
     );
 
     // State survives a restart; a second run with an empty inbox is a no-op.
+    // (One importer per state file: the first must be closed first.)
+    let before = imp.state().clone();
+    drop(imp);
     let mut again = site.importer();
-    assert_eq!(again.state(), imp.state());
+    assert_eq!(again.state(), &before);
     let r2 = again.run(NOW).unwrap();
     assert!(r2.accepted.is_empty() && r2.is_clean());
 }
@@ -297,6 +300,7 @@ fn first_contact_must_start_at_one_unless_gap_accepted() {
     let r = imp.run(NOW).unwrap();
     assert_eq!(r.accepted[0].gap_accepted, Some((1, 2)));
     assert_eq!(imp.state().units[UNIT].accepted_gaps, vec![(1, 2)]);
+    drop(imp);
 
     // A skipped batch arriving later cannot be slotted in: replay.
     site.transfer(&pubd[1].name);
@@ -681,6 +685,7 @@ fn packer_rejects_bad_input_before_writing() {
     assert!(site.outbox_batches().is_empty());
     assert_eq!(p.state().next_seq, 1);
     assert!(!site.pack_state.exists());
+    drop(p);
 
     // Oversized bundle.
     let mut cfg = PackConfig::new(UNIT);
@@ -692,8 +697,9 @@ fn packer_rejects_bad_input_before_writing() {
         p.pack(&[], &[huge], NOW),
         Err(PackError::BundleTooLarge { .. })
     ));
+    drop(p);
 
-    // Bad configs.
+    // Bad configs (refused as configuration errors, not by the lock).
     for (unit, bytes, n) in [
         ("a/b", MIN_BATCH_BYTES, 1),
         (UNIT, 10, 1),
@@ -702,7 +708,10 @@ fn packer_rejects_bad_input_before_writing() {
         let mut cfg = PackConfig::new(unit);
         cfg.max_batch_bytes = bytes;
         cfg.max_findings_per_batch = n;
-        assert!(Packer::open(&site.outbox, &site.pack_state, cfg, signer()).is_err());
+        assert!(matches!(
+            Packer::open(&site.outbox, &site.pack_state, cfg, signer()),
+            Err(PackError::Config(_))
+        ));
     }
 }
 

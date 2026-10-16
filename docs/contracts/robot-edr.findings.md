@@ -372,14 +372,18 @@ records to Kafka are outside the crate (no network code).
 * **Batch = one directory** `rdd_<unit_id>_<batch_seq, 16 digits>/` holding
   `findings.jsonl` (each value compact JSON, one per `\n`-terminated line,
   validated with `robodr_ocsf::to_json` before packing), optional black-box
-  export bundles `bundle-NNNN.rbbx`, `MANIFEST.json` and `MANIFEST.sig`.
+  export bundles `bundle-NNNN.rbbx`, optional Reed-Solomon parity files
+  `parity-NN.rbpar`, `MANIFEST.json` and `MANIFEST.sig`.
   `unit_id` is the exporting robot or site console (`[A-Za-z0-9._-]{1,64}`).
 * **Manifest** (`deny_unknown_fields`, ≤ 128 KiB, ≤ 256 files):
   `{format: "robodr-diode/1", contract_version, unit_id, batch_seq (1-based),
   prev_batch_hash, created_at (RFC 3339 ms), created_at_ms, key_id, algorithm,
-  finding_count, first_time, last_time, files: [{name, kind, size, sha256}]}`.
+  finding_count, first_time, last_time, files: [{name, kind, size, sha256}],
+  parity?}` (`kind`: `findings` | `blackbox_bundle` | `parity`; `parity`
+  only in parity batches, absent otherwise, so batches without parity keep
+  the original byte format).
   `first_time`/`last_time` are min/max `ocsf.time`. File names are
-  allow-listed (`findings.jsonl`, `bundle-NNNN.rbbx`); anything with a path
+  allow-listed (`findings.jsonl`, `bundle-NNNN.rbbx`, `parity-NN.rbpar`); anything with a path
   separator, `..`, a leading dot or upper case is rejected.
 * **Signature**: the raw manifest bytes are signed through the black-box
   crate's `Signer` over `"robodr-diode/manifest/v1\0" || manifest`;
@@ -394,11 +398,31 @@ records to Kafka are outside the crate (no network code).
   inputs are split into several consecutive batches. The importer rejects
   batches above its `max_batch_bytes` (default 256 MiB = the packer's
   ceiling); keep the packer setting ≤ the importer's.
+* **Forward error correction (optional, `--parity M`)**: the batch's data
+  files (manifest order) and `M ≤ 32` parity files are the shards of a
+  systematic Reed-Solomon code over GF(2^8) (`0x11D`, `α = 2`, generator
+  roots `α^0…α^(M-1)`, `k + M ≤ 255`; scheme `rs-gf256-0x11d/1`, the QR-code
+  RS code, implemented in std). Byte `o` of every file is one codeword; data
+  files are zero-padded to the parity length = largest data file rounded up
+  to `parity.shard_size`. Parity files are listed and hashed in the signed
+  manifest and count against the batch size limit. The importer treats every
+  missing / wrong-size / wrong-SHA-256 file as an erasure, rebuilds up to
+  `M` of them, installs a rebuilt file only if its size and SHA-256 equal
+  the manifest's, and then verifies the batch exactly as an undamaged one
+  (report: `accepted[].repaired`). More than `M` damaged files →
+  `fec_unrecoverable`; a rebuild missing the manifest hash → `fec_failed`.
 * **Low side (export)**: stage in `outbox/.tmp-<batch>/`, `fsync`, commit
   (`next_seq`, chain head) to the packer state file atomically, then `rename`
   into the outbox. The transfer agent must ignore dot-entries. A crash
   between commit and rename is finished on the next start; sequence numbers
-  are never reused for different visible content.
+  are never reused for different visible content. Each batch is also
+  archived (before commit) in `<state>.archive/` (newest 64 by default);
+  `robodr-diode-pack resend --seq N` re-emits an archived batch byte for
+  byte for manual retransmission, after checking the archive chains to the
+  packer state; resending is idempotent.
+* **Single instance**: packer and importer each hold an exclusive `flock`
+  on `<state>.lock` while running; a second instance on the same state file
+  fails with a clear error (exit 1).
 * **High side (import)**: authenticate the manifest bytes with the keyring
   key named in `MANIFEST.sig` *before* parsing them; the key must belong to the
   manifest's unit and the directory name must match. Then, per unit:
@@ -433,9 +457,10 @@ records to Kafka are outside the crate (no network code).
   `quarantine/<unique>/entry` with `quarantine/<unique>/reason.json`
   (`reason.code`, e.g. `bad_signature`, `hash_mismatch`, `size_mismatch`,
   `invalid_finding`, `robot_not_allowed`, `manifest_invalid`, `symlink`,
-  `conflict`, `unreadable`); importer state does not advance, so an intact
-  re-send of the same batch is accepted later (whole-file / whole-batch
-  retransmission is the forward-error strategy; no application-level FEC).
+  `conflict`, `unreadable`, `fec_unrecoverable`, `fec_failed`); importer state does not advance, so an intact
+  re-send of the same batch is accepted later (parity repair within a
+  batch, then whole-batch retransmission via `resend`, is the forward-error
+  strategy).
   A failure on one inbox entry (I/O, permissions) is reported per entry and
   never stops the other entries or units from being imported.
 * Because `finding_id` and `event-uid` are deterministic, re-publishing an

@@ -10,7 +10,8 @@ diode or on controlled removable media.
  ─────────────────────                         ───────────────
  findings ──► Packer ──► outbox/rdd_<unit>_<seq>/ ══ diode / media ══► inbox/
  bundles  ──┘   │                                                    │
-                └ pack-state.json                       Importer ◄───┘
+                ├ pack-state.json (+ .lock)             Importer ◄───┘
+                └ pack-state.json.archive/  (resend)      │  (state.json.lock)
                                                           │  ├─► out/<batch>/records.jsonl  ─► Kafka producer
                                                           │  ├─► processed/<batch>
                                                           │  └─► quarantine/<entry>/{entry, reason.json}
@@ -29,6 +30,7 @@ One directory per batch, named `rdd_<unit_id>_<seq as 16 digits>`:
 | --- | --- |
 | `findings.jsonl` | optional; validated finding values, compact JSON, one per `\n`-terminated line |
 | `bundle-0001.rbbx`, … | optional; `robodr-blackbox` export bundles (`RBBXBND1`) |
+| `parity-01.rbpar`, … | optional; Reed-Solomon parity files (see *Parity* below) |
 | `MANIFEST.json` | the manifest; its **raw bytes** are signed and hashed |
 | `MANIFEST.sig` | `{format, algorithm, key_id, sig}` (hex signature) |
 
@@ -36,23 +38,64 @@ Manifest fields: `format`, `contract_version` (findings contract, must be
 `1.y.z`), `unit_id`, `batch_seq` (1-based, per unit), `prev_batch_hash`
 (absent only for seq 1), `created_at` / `created_at_ms`, `key_id`,
 `algorithm`, `finding_count`, `first_time` / `last_time` (min/max
-`ocsf.time`), `files[] = {name, kind: findings|blackbox_bundle, size, sha256}`.
-Unknown fields are rejected.
+`ocsf.time`), `files[] = {name, kind: findings|blackbox_bundle|parity, size, sha256}` (data
+files first, then parity files), and — only in parity batches —
+`parity = {scheme, data_shards, parity_shards, shard_size}`. A batch without
+parity has no `parity` key at all, so its manifest is byte-identical to the
+pre-parity format. Unknown fields are rejected.
 
 * Signed message: `"robodr-diode/manifest/v1\0" || MANIFEST.json bytes`.
 * Batch hash: `SHA-256("robodr-diode/batch-hash/v1\0" || MANIFEST.json bytes)`.
   It commits to every file (sizes and hashes are in the manifest) and to the
   previous batch, so batch hashes form a per-unit chain.
-* Limits: manifest ≤ 128 KiB, signature file ≤ 4 KiB, ≤ 256 files, file names
-  `findings.jsonl` / `bundle-NNNN.rbbx` only (allow-list `[a-z0-9][a-z0-9._-]{0,63}`,
+* Limits: manifest ≤ 128 KiB, signature file ≤ 4 KiB, ≤ 256 files (≤ 255
+  data + parity in a parity batch), file names
+  `findings.jsonl` / `bundle-NNNN.rbbx` / `parity-NN.rbpar` only (allow-list `[a-z0-9][a-z0-9._-]{0,63}`,
   no `..`; separators, absolute paths, NUL, hidden and upper-case names are
   impossible). `batch_seq` 1 … 9 999 999 999 999 999 (16 digits).
   Packer: data per batch 64 KiB + 1 … 256 MiB (default 16 MiB), findings per
   batch ≥ 1 (default 10 000). Importer: declared data per batch ≤ 256 MiB by
   default (`--max-batch-bytes`). The packer's ceiling **equals** the
   importer's default, so no packer setting produces a batch that a
-  default-configured importer rejects; if you lower the importer's limit,
+  default-configured importer rejects (parity files count against the
+  limit on both sides); if you lower the importer's limit,
   lower the packer's `--max-batch-bytes` to match (or below).
+
+### Parity (`rs-gf256-0x11d/1`)
+
+Optional forward error correction for links that lose or damage files
+(`--parity M`, default off). The `k` data files of a batch, in manifest
+order, and its `M` parity files are the shards of a systematic Reed-Solomon
+code over GF(2^8) (reducing polynomial `0x11D`, `α = 2`, generator
+`(x-α^0)…(x-α^(M-1))`, `k + M ≤ 255`, `M ≤ 32`) — the code of QR codes,
+implemented in std in `src/fec.rs` and tested against published QR
+vectors. Byte `o` of every file forms one codeword; data files are
+zero-padded to the parity length, which is the largest data file rounded up
+to `shard_size` (`--shard-size`, 512 B … 16 MiB, default 64 KiB; the stripe
+height). Parity files are listed with size and SHA-256 in the signed
+manifest like every other file.
+
+The importer hashes every listed file first. A file that is missing, of the
+wrong size or of the wrong SHA-256 is an erasure; **any `M` erasures (data
+or parity files) are rebuilt**, each rebuilt file is accepted only if its
+size and SHA-256 equal the manifest's (and only after the files it was
+rebuilt from re-verify), it replaces the damaged one in the inbox entry
+(temp `.fec-<name>` + rename), and then the batch is verified exactly as an
+undamaged one. The report lists rebuilt files under `accepted[].repaired`.
+More than `M` erasures → quarantine `fec_unrecoverable` (`damaged` lists the
+files); a rebuild that misses the manifest hash (impossible unless files
+change during repair, or the producer wrote parity that does not match its
+data) → `fec_failed`, nothing installed. A symlink or directory in place of
+a listed file is never "repaired" (it is hostile, not lossy) and fails the
+normal checks.
+
+Costs and limits: every parity file is as large as the batch's largest data
+file, so `M` parity files cost `M ×` that (counted against
+`--max-batch-bytes`); parity is cheapest when a batch holds several similar
+files. Recovery granularity is whole files: a batch whose only data file is
+lost needs `M ≥ 1` full-size parity files, i.e. it degenerates into
+replication. A batch packed with parity is rejected by importers older than
+this version (`manifest_invalid`, unknown field) — upgrade the SOC first.
 
 ## Low side: `Packer` / `robodr-diode-pack`
 
@@ -60,8 +103,32 @@ Unknown fields are rejected.
 robodr-blackbox keygen --out diode-ugv-007.key --key-id diode-ugv-007   # once; writes .key + .key.pub
 robodr-diode-pack --outbox OUT --state pack-state.json --unit ugv-007 \
   --key-file diode-ugv-007.key [--key-id diode-ugv-007] [--allow-hmac] \
-  --findings findings.jsonl [--bundle export.rbbx]... [--max-batch-bytes N] [--max-findings N]
+  --findings findings.jsonl [--bundle export.rbbx]... [--max-batch-bytes N] [--max-findings N] \
+  [--parity M] [--shard-size BYTES] [--archive-keep N]
+robodr-diode-pack resend --outbox OUT --state pack-state.json --unit ugv-007 --seq N
 ```
+
+* **Single instance**: the packer (and `resend`) takes an exclusive
+  `flock` on `<state>.lock` (beside the state file; created 0600, never
+  through a symlink, never deleted) for as long as it runs. A second
+  instance on the same state file exits 1 with "another robodr-diode-pack
+  instance holds …". The kernel drops the lock when the process dies, so
+  there is never a stale lock to clean up. The state file must not be inside
+  the outbox (its lock and archive would be transferred).
+* **Archive and resend**: before a batch is committed, a copy goes to
+  `<state>.archive/<batch>/`; the newest `--archive-keep` batches (default
+  64, `0` = no archive) are kept. `robodr-diode-pack resend --seq N` (no key
+  needed) re-emits batch `N` into the outbox **byte for byte** — same
+  manifest, signature, data and parity — for manual retransmission after the
+  SOC reports a gap or a quarantine. It first checks that the archived
+  manifests from `N` to the newest batch chain to the state's head and that
+  every file matches its manifest hash (while copying, via
+  `outbox/.resend-<batch>/` and a rename). If an identical copy is already in
+  the outbox it does nothing (`already_present: true`); a different entry of
+  that name is an error. The importer files a re-delivered batch it already
+  has as a duplicate, so resending is always safe. Crash leftovers
+  (`.resend-*`, archive temps, archive copies of never-committed batches) are
+  removed on the next open.
 
 * **Key**: `--key-file` is a `robodr-blackbox` **secret** key file, Ed25519
   by default (`robodr-blackbox keygen`). It is refused — not merely warned
@@ -121,6 +188,10 @@ entries and units; an entry the importer may not read (permissions) is
 quarantined as `unreadable` (or, if it cannot even be moved, listed under
 `errors`). Only failing to list the inbox itself fails the run.
 
+**Single instance**: the importer takes an exclusive `flock` on
+`<state>.lock` for its lifetime; a second instance on the same state file
+exits 1 with "another robodr-diode-unpack instance holds …".
+
 Per inbox entry:
 
 1. Read `MANIFEST.sig` (≤ 4 KiB) and `MANIFEST.json` (≤ 128 KiB) — regular
@@ -148,7 +219,8 @@ Per inbox entry:
    the run after the missing batch arrives. Dot-entries (in transit) older
    than `--in-transit-max-age-s` (default 24 h) are quarantined as
    `stale_in_transit`. `0` disables either expiry.
-3. File checks: no entries besides the listed files and the two manifest
+3. Parity repair (parity batches only; see *Parity* above), then file
+   checks: no entries besides the listed files and the two manifest
    files; each listed file regular, exact size, exact SHA-256 (read capped at
    the declared size). Each findings line is re-validated with
    `robodr_ocsf::parse_and_validate` and its robot id checked against the
@@ -181,13 +253,21 @@ re-send of the same batch is accepted later.
 ## Forward-error strategy
 
 A one-way link cannot request retransmission. This crate makes **whole
-files and whole batches** the unit of loss and repair: each file is verified
-on its own (the reason file names the damaged one), a bad batch never advances
-state, and re-sending a batch or the entire outbox history is harmless
-(duplicates are recognised by hash; Kafka consumers additionally dedupe on
-the deterministic `finding_id` / `event-uid`). Operational recommendation:
-send each batch twice (or rely on the diode vendor's FEC), and keep the
-outbox until the SOC confirms receipt out of band.
+files and whole batches** the unit of loss and repair:
+
+1. **Parity** (`--parity M`): up to `M` lost or corrupt files per batch are
+   rebuilt on the high side without any back channel.
+2. **Resend**: anything worse is quarantined (or held, for a missing batch)
+   with a reason naming the damage; the operator re-emits that batch with
+   `robodr-diode-pack resend --seq N` and it is accepted on arrival (a bad
+   batch never advances state).
+3. Re-sending a batch or the entire outbox history is harmless (duplicates
+   are recognised by hash; Kafka consumers additionally dedupe on the
+   deterministic `finding_id` / `event-uid`).
+
+Operational recommendation: enable parity sized to the link's observed file
+loss, keep `--archive-keep` larger than the number of batches produced
+between SOC receipt confirmations (out of band), and resend on demand.
 
 ## Honest limits
 
@@ -203,8 +283,18 @@ outbox until the SOC confirms receipt out of band.
   public key for the same unit" (several keys per unit are allowed; the
   packer state chains batches across a key change). Keys are files, not
   TPM-held.
-* **No application-level FEC** (parity/erasure files). Loss of any file
-  loses its batch until it is re-sent.
+* **FEC is erasure-only and file-granular.** Parity rebuilds whole files
+  identified as damaged by SHA-256; it does not locate errors on its own,
+  and more than `M` damaged files lose the batch until it is resent. The
+  Reed-Solomon code is in-crate (tested against QR-code vectors and
+  exhaustive small erasure patterns), not a third-party library. Repair
+  rewrites the damaged files inside the inbox entry, so the quarantined or
+  processed copy holds the rebuilt (manifest-verified) bytes, not the
+  damaged originals.
+* **Archive** copies are written next to the state file (disk usage ≈
+  `--archive-keep` × batch size) and are only as trustworthy as that
+  directory: resend verifies them against the state's chain head, which
+  catches corruption, but whoever can write the state can also rewrite both.
 * **Packer state loss** restarts the unit at `batch_seq` 1 with no
   predecessor; the importer then quarantines the new batches (`conflict` /
   `replay`). Recovery is a manual decision: back up `pack-state.json` with the
@@ -224,8 +314,10 @@ outbox until the SOC confirms receipt out of band.
 * **Bundle chain continuity** across batches is not tracked here: bundles
   are parsed (and verified individually with `--bundle-key`), but per-chain
   anchors belong in the evidence store (`robodr_blackbox::Receiver`).
-* **Single instance**: one packer per state file and one importer per state
-  file at a time; there is no lock file. The inbox must be writable (batches
+* **Single instance** is enforced per *state file* (`flock` on
+  `<state>.lock`, advisory, local filesystems; `flock` over NFS depends on
+  the server). Two importers with *different* state files on the same inbox
+  are not detected — do not configure that. The inbox must be writable (batches
   are moved out of it) and on the same filesystem as `processed/` and
   `quarantine/` (`rename`).
 * **Transfer completeness**: the importer treats every non-dot inbox entry
