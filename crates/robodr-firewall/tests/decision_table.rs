@@ -85,8 +85,8 @@ fn unknown_source_rejected() {
     for src in [SourceId::UNKNOWN, SourceId(200), SourceId::FIREWALL] {
         let v = f.fw.check(&twist_cmd(src, f.base, T0, vx(0.1)), T0);
         assert_eq!(reason(&v), RejectReason::UnknownSource);
-        // Default ForeignSourceAction::Substitute + ZeroVelocity.
-        assert!(v.output().unwrap().motion.is_zero());
+        // Default ForeignSourceAction::Drop: nothing emitted.
+        assert_eq!(v.output(), None);
     }
     assert_eq!(f.fw.source_id(&guid("deadbeef")), None);
 }
@@ -338,11 +338,17 @@ fn replay_and_reorder_rejected_per_source() {
 }
 
 #[test]
-fn replay_of_hard_rejected_command_is_still_a_replay() {
+fn hard_rejected_command_does_not_advance_last_stamp() {
     let mut f = default_fx();
     let v = f.fw.check(&twist_cmd(f.nav, f.base, T0, vx(50.0)), T0);
     assert_eq!(reason(&v), RejectReason::OverHardLimit);
-    let v = f.fw.check(&twist_cmd(f.nav, f.base, T0, vx(0.1)), T0 + 1);
+    // A replay of the refused command is refused again, for the same reason.
+    let v = f.fw.check(&twist_cmd(f.nav, f.base, T0, vx(50.0)), T0 + 1);
+    assert_eq!(reason(&v), RejectReason::OverHardLimit);
+    // Only accepted commands set the source's last stamp.
+    let v = f.fw.check(&twist_cmd(f.nav, f.base, T0, vx(0.1)), T0 + 2);
+    assert!(v.is_passed(), "{v:?}");
+    let v = f.fw.check(&twist_cmd(f.nav, f.base, T0, vx(0.1)), T0 + 3);
     assert_eq!(reason(&v), RejectReason::OutOfOrder);
 }
 
@@ -505,17 +511,26 @@ fn stage_precedence() {
 }
 
 #[test]
-fn rate_limit_precedes_content_checks() {
+fn rate_limit_precedes_content_checks_but_only_accepts_consume() {
     let mut f = build(PlatformConfig::default(), true, |b, _| {
         b.rate_limit = Some(RateLimit {
             per_second: 1,
             burst: 1,
         })
     });
-    let v = f.fw.check(&twist_cmd(f.nav, f.base, T0, vx(f64::NAN)), T0);
-    assert_eq!(reason(&v), RejectReason::NonFinite); // consumed the token
+    // Refused commands do not consume the token.
+    for k in 0..3 {
+        let v =
+            f.fw.check(&twist_cmd(f.nav, f.base, T0 + k, vx(f64::NAN)), T0 + k);
+        assert_eq!(reason(&v), RejectReason::NonFinite);
+    }
+    assert!(f
+        .fw
+        .check(&twist_cmd(f.nav, f.base, T0 + 3, vx(0.1)), T0 + 3)
+        .is_passed());
+    // Bucket empty: the rate stage now fires before the content checks.
     let v =
-        f.fw.check(&twist_cmd(f.nav, f.base, T0 + 1, vx(f64::NAN)), T0 + 1);
+        f.fw.check(&twist_cmd(f.nav, f.base, T0 + 4, vx(f64::NAN)), T0 + 4);
     assert_eq!(reason(&v), RejectReason::RateLimited);
 }
 
@@ -803,11 +818,24 @@ fn hold_last_for_joints() {
     let mut f = hold_fx(1_000 * MS);
     let good = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
     f.fw.check(&joint_cmd(f.arm_src, f.arm, T0, &good), T0);
-    let v = f.fw.check(
-        &joint_cmd(f.arm_src, f.arm, T0 + 1, &[f64::NAN; ARM_JOINTS]),
-        T0 + 1,
-    );
+    // Same direction, far over the hard limit: holding is a deceleration.
+    let far = good.map(|x| x * 1_000.0);
+    let v =
+        f.fw.check(&joint_cmd(f.arm_src, f.arm, T0 + 1, &far), T0 + 1);
+    assert_eq!(reason(&v), RejectReason::OverHardLimit);
     assert_eq!(out_joints(&v), good.to_vec());
+    // Unreadable intent (NaN): zero, never the held motion.
+    let v = f.fw.check(
+        &joint_cmd(f.arm_src, f.arm, T0 + 2, &[f64::NAN; ARM_JOINTS]),
+        T0 + 2,
+    );
+    assert_eq!(out_joints(&v), vec![0.0; ARM_JOINTS]);
+    // One joint reversed: zero.
+    let mut rev = far;
+    rev[2] = -rev[2];
+    let v =
+        f.fw.check(&joint_cmd(f.arm_src, f.arm, T0 + 3, &rev), T0 + 3);
+    assert_eq!(out_joints(&v), vec![0.0; ARM_JOINTS]);
 }
 
 #[test]
@@ -909,7 +937,7 @@ fn deviations_have_rules_severities_and_names() {
     assert_eq!(devs[0].severity, Severity::Critical);
     assert!(devs[0].detail.contains("/cmd_vel"));
     assert!(devs[0].detail.contains("<unknown source>"));
-    assert!(devs[0].detail.contains("zero velocity emitted"));
+    assert!(devs[0].detail.contains("rejected, nothing emitted"));
     assert_eq!(devs[1].rule, "robot.firewall.limited_speed");
     assert_eq!(devs[1].severity, Severity::High);
     assert!(devs[1].detail.contains(&guid("00000103")));

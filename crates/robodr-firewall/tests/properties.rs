@@ -42,6 +42,7 @@ fn random_cfg(r: &mut Rng) -> Cfg {
             } else {
                 ForeignSourceAction::Substitute
             },
+            foreign_substitute_min_interval_ns: if r.chance(0.3) { 0 } else { r.below(200) * MS },
             event_capacity: 64,
             ..Default::default()
         },
@@ -131,6 +132,7 @@ fn step_mags(prev: &[f64], out: &[f64], twist: bool) -> (f64, f64) {
 struct ChanModel {
     last_out: Option<(Vec<f64>, u64)>,
     last_accepted: Option<Vec<f64>>,
+    last_foreign_sub: Option<u64>,
 }
 
 #[test]
@@ -226,6 +228,22 @@ fn randomized_invariants_enforcing() {
                     assert_eq!((out.source, out.stamp_ns), (cmd.source, cmd.stamp_ns));
                 }
                 Verdict::Rejected { reason, substitute } => {
+                    if reason.is_foreign_source() {
+                        let window_open = match m.last_foreign_sub {
+                            Some(t) => {
+                                now.saturating_sub(t)
+                                    >= cfg.platform.foreign_substitute_min_interval_ns
+                            }
+                            None => true,
+                        };
+                        let expect = cfg.platform.foreign_source_action
+                            == ForeignSourceAction::Substitute
+                            && window_open;
+                        assert_eq!(substitute.is_some(), expect, "{}", ctx());
+                        if expect {
+                            m.last_foreign_sub = Some(now);
+                        }
+                    }
                     if let Some(s) = substitute {
                         assert_eq!(s.cmd.source, SourceId::FIREWALL, "{}", ctx());
                         assert_eq!(s.cmd.stamp_ns, now, "{}", ctx());
@@ -234,19 +252,35 @@ fn randomized_invariants_enforcing() {
                             SubstituteKind::Zero => {
                                 assert!(s.cmd.motion.is_zero(), "{}", ctx())
                             }
-                            SubstituteKind::HoldLast => assert_eq!(
-                                Some(&sv),
-                                m.last_accepted.as_ref(),
-                                "hold must repeat the last accepted output: {}",
-                                ctx()
-                            ),
+                            SubstituteKind::HoldLast => {
+                                assert_eq!(
+                                    Some(&sv),
+                                    m.last_accepted.as_ref(),
+                                    "hold must repeat the last accepted output: {}",
+                                    ctx()
+                                );
+                                // A hold is only ever a deceleration of
+                                // readable, own intent: never more motion
+                                // than the rejected command asked for.
+                                assert!(!reason.is_foreign_source(), "{}", ctx());
+                                assert!(cmd.motion.is_finite(), "{}", ctx());
+                                assert_eq!(
+                                    std::mem::discriminant(&cmd.motion),
+                                    std::mem::discriminant(&s.cmd.motion),
+                                    "{}",
+                                    ctx()
+                                );
+                                assert_eq!(raw(&cmd.motion).len(), sv.len(), "{}", ctx());
+                                assert!(
+                                    decelerates(&raw(&cmd.motion), &sv),
+                                    "hold exceeds the rejected request: {}",
+                                    ctx()
+                                );
+                            }
                         }
                     } else {
                         assert!(
-                            reason == RejectReason::UnknownChannel
-                                || (reason.is_foreign_source()
-                                    && cfg.platform.foreign_source_action
-                                        == ForeignSourceAction::Drop),
+                            reason == RejectReason::UnknownChannel || reason.is_foreign_source(),
                             "{}",
                             ctx()
                         );
@@ -307,6 +341,7 @@ fn randomized_invariants_enforcing() {
                 ..
             } = v
             {
+                // Whatever was emitted is the base of the next ramp.
                 m.last_out = Some((raw(&s.cmd.motion), now));
             }
         }

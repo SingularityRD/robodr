@@ -115,6 +115,9 @@ fn cfg(fail_behaviour: FailBehaviour, drop_foreign: bool, fault: FaultPolicy) ->
         } else {
             ForeignSourceAction::Substitute
         },
+        // Short enough that both the emitted and the suppressed
+        // foreign-substitute paths are exercised.
+        foreign_substitute_min_interval_ns: 3_000_000,
         event_capacity: 32,
     }
 }
