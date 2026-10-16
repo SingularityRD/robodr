@@ -14,43 +14,79 @@ Dependencies: std, `serde`/`serde_json`, `robodr-events`. No crypto crates are
 available offline, so SHA-256 and HMAC-SHA256 are implemented in `src/crypto.rs`
 and pinned to the NIST FIPS 180-4 examples and RFC 4231 test cases 1 to 7.
 
-## Status: HMAC is a placeholder
+## Status: Ed25519 is the default; HMAC is legacy
 
-Records are currently authenticated with **HMAC-SHA256**, which is a
-*shared-key* MAC. Anyone who can verify a tag can also forge one. Production
-must sign with an **asymmetric, non-exportable key**: Ed25519 from an audited
-crate, or ECDSA with the private key held in the TPM. The `Signer` and
-`Verifier` traits (`src/sign.rs`) are the seam for this change. Implementing
-both for the new backend changes nothing else: format, chain, storage and
-verifier stay the same. Signatures are length-prefixed, up to 1024 bytes.
+Records are signed with **Ed25519** (RFC 8032, `src/sign_ed25519.rs`) by
+default: the unit holds the 32-byte seed, every verifier (fleet console, SOC,
+auditor) holds only the public key and **cannot forge** evidence. The
+implementation is in-crate std-only Rust (crates.io is unreachable here),
+pinned to the RFC 8032 vectors, but **not audited and not verified to be
+constant-time**: replace it with `ed25519-dalek` (`verify_strict`) when
+crates.io is available, keeping `Ed25519SigningKey` / `Ed25519VerifyingKey`
+as thin wrappers so the key file and signature formats do not change. The
+seed is a file on disk, not a TPM-sealed or non-exportable key: root on the
+unit can still copy it (see the threat model).
+
+**HMAC-SHA256** (`sign.rs`, `HmacSha256Key`) remains as the legacy
+*shared-key* placeholder: anyone who can verify a tag can also forge one. It
+is still accepted (old chains, old key files), but `keygen` produces it only
+with `--alg hmac`, and the tools warn whenever it is used. The `Signer` and
+`Verifier` traits (`src/sign.rs`) are the seam: format, chain, storage and
+verifier are the same for both. Signatures are length-prefixed, up to 1024
+bytes.
 
 ## Keys and the `robodr-blackbox` tool
 
 ```
-robodr-blackbox keygen  --out FILE [--key-id ID]
-robodr-blackbox verify  DIR --keyring FILE [--keyring FILE]... [--checkpoint FILE]
-                        [--device ID] [--strict] [--json]
-robodr-blackbox inspect DIR|SEGMENT [--json] [--limit N]
+robodr-blackbox keygen     --out FILE [--alg ed25519|hmac] [--key-id ID] [--pub-out FILE]
+robodr-blackbox export-pub KEYFILE [--out FILE]
+robodr-blackbox verify     DIR --keyring FILE [--keyring FILE]... [--checkpoint FILE]
+                           [--device ID] [--strict] [--json]
+robodr-blackbox inspect    DIR|SEGMENT [--json] [--limit N]
 ```
 
 Exit codes: `0` verified intact (warnings allowed unless `--strict`), `1`
 verification failed, `2` usage, I/O or key error. Secrets are never taken
 from the command line (argv is readable by every process via `/proc`).
 
-- **Key file** (`robodr-blackbox-key/v1`, `src/keys.rs`):
-  `{"format":"robodr-blackbox-key/v1","algorithm":"hmac-sha256","key_id":"...","secret_hex":"..."}`.
-  `keygen` draws 32 bytes from `/dev/urandom` (it fails rather than fall
-  back), derives `key_id` from the key unless `--key-id` is given, creates
-  the file with `O_CREAT|O_EXCL|O_NOFOLLOW` and mode 0600, and prints only
-  the key id. It never overwrites a file and never writes through a
-  symlink. `KeyFile::load` (and every `--keyring`) refuses a symlink, a
-  non-regular file, and any file with group/other permission bits
-  (`mode & 0o077 != 0`). Unknown JSON fields are rejected.
+- **Key files** (`src/keys.rs`). Format v2 (`robodr-blackbox-key/v2`):
+  - secret: `{"format":"robodr-blackbox-key/v2","kind":"secret","algorithm":"ed25519","key_id":"...","public_hex":"...","secret_hex":"<seed>"}`
+    (`public_hex` is a consistency check; a mismatch is refused);
+  - public: `{"format":"robodr-blackbox-key/v2","kind":"public","algorithm":"ed25519","key_id":"...","public_hex":"..."}`
+    (validated: canonical, not of small order).
+  Legacy HMAC keys keep format v1
+  (`{"format":"robodr-blackbox-key/v1","algorithm":"hmac-sha256","key_id":"...","secret_hex":"..."}`,
+  byte-for-byte as before); v2 `kind:"secret"` HMAC files are read too.
+  HMAC has no public half. Unknown JSON fields are rejected.
+- **`keygen`** draws the seed (or the HMAC key) from `/dev/urandom` (it
+  fails rather than fall back), derives `key_id` from the public key
+  (`ed25519:<16 hex>`; HMAC: `hmac-sha256:<16 hex>`) unless `--key-id` is
+  given, and creates the secret file with `O_CREAT|O_EXCL|O_NOFOLLOW`, mode
+  0600, and for Ed25519 the public file `FILE.pub` (or `--pub-out`), mode
+  0644. If either target exists nothing is written; it never writes through
+  a symlink. It prints only the key id. **`export-pub`** re-derives the
+  public file from a secret file (to stdout, or `--out`, never overwriting).
+- **Permission rule.** Every load refuses a symlink, a non-regular file and
+  files over 256 KiB. A file that holds *secret* material (an Ed25519 seed,
+  any HMAC key, a keyring containing either) is also refused if group or
+  others have any access (`mode & 0o077 != 0`) or if it is owned by neither
+  the effective user nor root. Public key files load whatever their mode.
+  `KeyFile::load_public` / `Keyring::load_public_file` refuse secrets
+  outright, for verifiers that must never hold signing keys.
 - **Keyring** (`Keyring`, file format `robodr-blackbox-keyring/v1`:
-  `{"format":"robodr-blackbox-keyring/v1","keys":[<key objects>]}`) maps
-  `key_id` to a verifier. `Verifier::verify_as(key_id, ..)` (a new default
-  method; plain verifiers accept only their own id) picks the key for
-  checkpoints, which name their key. Duplicate key ids are refused.
+  `{"format":"robodr-blackbox-keyring/v1","keys":[<key objects>]}`, any mix
+  of public and secret key objects) maps `key_id` to a verifier.
+  `Verifier::verify_as(key_id, ..)` picks the key for checkpoints, which
+  name their key. Duplicate key ids are refused (nothing from that file is
+  added). `verify` prints a warning when the ring holds an HMAC key.
+- **API** (additive; nothing renamed): `KeyFile::{generate, generate_ed25519,
+  ed25519_from_seed, ed25519_public, kind, is_public, is_symmetric,
+  public_key, to_public, ed25519_signing_key, ed25519_verifying_key, signer,
+  verifier, load_public, load_secret}`, `keys::{public_key_path, KeyKind,
+  KEY_FILE_FORMAT_V2}`, `Keyring::{load_public_file, symmetric_key_ids}`, new
+  `KeyFileError` variants (`Owner`, `Ed25519`, `PublicKeyMismatch`,
+  `NoPublicKey`, `NoSecret`, `NotPublic`). `KeyFile::secret()` is the seed
+  for an Ed25519 secret file and empty for a public one.
 - **Rotation**: `Recorder::rotate_key(new_signer, new_verifier, reason)`
   writes a `KeyRotation` record signed by the old key, switches to the new
   key and seals. The chain id keeps binding the first key; later
@@ -59,7 +95,8 @@ from the command line (argv is readable by every process via `/proc`).
   Some(Box::new(keyring_of_old_keys)), clock)` while segments signed by an
   old key are retained; once they have rotated out, `open` with the new key
   alone works. Verify a log, directory or bundle spanning a rotation with a
-  keyring holding both keys (`verify DIR --keyring old.key --keyring new.key`).
+  keyring holding both keys (`verify DIR --keyring old.key.pub --keyring
+  new.key.pub`). Rotation is also the HMAC-to-Ed25519 migration path.
 - **Limit:** `Keyring::verify` (used for records, which do not name their
   key) accepts a signature from *any* key in the ring. Keep one keyring per
   unit (or fleet trust domain). With HMAC every key file is a forging key on
@@ -377,13 +414,15 @@ tamper finding.
 
 **Does not protect against:**
 
-- **An attacker with root and the HMAC key** can rewrite the entire history
-  with valid tags. The same holds for anyone else holding the key, including
-  a fleet verifier. This is the main reason HMAC is a placeholder.
-  Asymmetric keys held in the TPM (non-exportable, so they sign but cannot be
-  extracted) remove key theft. Frequent export plus fleet-side checkpoints
-  bound how much history even a live key-holding attacker can rewrite: only
-  what has not yet left the unit.
+- **An attacker with root on the unit** can read the Ed25519 seed (a 0600
+  file, not a TPM-held key) or the HMAC key and rewrite the unit's history
+  with valid signatures. With **Ed25519** this needs the unit's secret: a
+  fleet verifier, SOC or auditor holding only the `.pub` file cannot forge.
+  With **HMAC** every verifier holds a forging key, which is why HMAC is
+  legacy and warned about. Non-exportable keys (TPM) would remove key theft
+  on the unit. Frequent export plus fleet-side checkpoints bound how much
+  history even a live key-holding attacker can rewrite: only what has not
+  yet left the unit.
 - **Truncation of the newest records with no external checkpoint.** A
   shortened log is still a valid chain. The local `checkpoint.json` helps only
   against an attacker who forgets it, since it can be deleted or replaced by an
@@ -404,9 +443,11 @@ tamper finding.
 
 ## Limits and what is not verified
 
-- No asymmetric signer exists yet, and the TPM integration (sealing the HMAC
-  key, NV-index checkpoints) is not implemented. Both need real hardware or
-  audited crates.
+- The Ed25519 signer is an in-crate implementation, tested against RFC 8032
+  and OpenSSL-derived vectors but **not audited** and not verified to be
+  constant-time on any target CPU; swap in an audited crate when one is
+  available offline. TPM integration (sealing the seed, NV-index
+  checkpoints) is not implemented; it needs real hardware.
 - fsync durability semantics were tested only for logic (torn writes are
   simulated by writing partial or zero bytes). Power-loss behaviour on the
   target filesystem and storage hardware has not been tested.
@@ -415,8 +456,9 @@ tamper finding.
   the same as tampering), damage in a closed segment, and an authentic
   checkpoint that contradicts the log still make `open` refuse. Moving the
   directory aside and starting a fresh chain is then an operator decision.
-- Key files hold HMAC secrets in plain JSON (mode 0600). Sealing them to a
-  TPM is not implemented. The permission check does not check the owner.
+- Secret key files hold the Ed25519 seed (or HMAC key) in plain JSON
+  (mode 0600, owner = the loading user or root, both checked). Sealing them
+  to a TPM is not implemented. Secret buffers are wiped best-effort only.
 - `export_pending` reads the retained segments into memory to build a bundle.
   Size bundles with `max_records` on constrained units.
 - A segment always takes at least one caller record after its header. A single

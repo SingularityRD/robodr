@@ -9,9 +9,14 @@ use std::process::ExitCode;
 
 const USAGE: &str = "\
 usage: robodr-diode-pack --outbox DIR --state FILE --unit UNIT_ID \\
-         --key-id KEY_ID --key-file HEX_KEY_FILE \\
+         --key-file SECRET_KEY_FILE [--key-id KEY_ID] [--allow-hmac] \\
          [--findings FINDINGS.jsonl]... [--bundle BUNDLE.rbbx]... \\
          [--max-batch-bytes N] [--max-findings N] [--now-ms MS]
+
+--key-file is a robodr-blackbox secret key file (`robodr-blackbox keygen`,
+ed25519; mode 0600, owned by this user or root, else refused). --key-id, if
+given, must equal the file's key id. Legacy hmac-sha256 key files are refused
+unless --allow-hmac is given (symmetric: the SOC could forge batches).
 
 Validates every finding (robodr_ocsf::parse_and_validate) and bundle, then
 writes signed, sequence-numbered batches into OUTBOX (atomic rename; the
@@ -31,8 +36,10 @@ const FLAGS: &[&str] = &[
     "now-ms",
 ];
 
+const SWITCHES: &[&str] = &["allow-hmac"];
+
 fn main() -> ExitCode {
-    let args = match cli::argv().and_then(|v| cli::parse_args(v, FLAGS)) {
+    let args = match cli::argv().and_then(|v| cli::parse_args_with_switches(v, FLAGS, SWITCHES)) {
         Ok(a) => a,
         Err(e) if e == "help" => {
             println!("{USAGE}");
@@ -53,11 +60,14 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &cli::Args) -> Result<(), String> {
-    let key_path = Path::new(args.req("key-file")?);
-    if let Some(w) = cli::key_file_mode_warning(key_path) {
+    let (key, warning) = cli::load_signer(
+        Path::new(args.req("key-file")?),
+        args.one("key-id")?,
+        args.flag("allow-hmac"),
+    )?;
+    if let Some(w) = warning {
         eprintln!("{w}");
     }
-    let key = cli::load_hmac_key(args.req("key-id")?, key_path)?;
     let mut cfg = PackConfig::new(args.req("unit")?);
     if let Some(n) = args.num("max-batch-bytes")? {
         cfg.max_batch_bytes = n;
@@ -89,7 +99,7 @@ fn run(args: &cli::Args) -> Result<(), String> {
         bundles.push(cli::read_file(Path::new(b), MAX_INPUT_FILE)?);
     }
 
-    let mut packer = Packer::open(args.req("outbox")?, args.req("state")?, cfg, Box::new(key))
+    let mut packer = Packer::open(args.req("outbox")?, args.req("state")?, cfg, key)
         .map_err(|e| e.to_string())?;
     let published = packer
         .pack_lines(&lines, &bundles, now)

@@ -9,10 +9,12 @@
 //! incomplete. 1 takes precedence over 3. Argument parsing is std-only by
 //! design.
 //!
-//! The black-box key is read only from a key file (`--key-file`, a
-//! `robodr-blackbox-key/v1` file as written by `robodr-blackbox keygen`),
-//! permission-checked by `robodr_blackbox::KeyFile::load` (regular file, no
-//! symlink, mode without group/other bits); its key id comes from the file.
+//! The black-box key is read only from a key file (`--key-file`, as written
+//! by `robodr-blackbox keygen`: Ed25519 by default, or legacy HMAC),
+//! checked by `robodr_blackbox::KeyFile::load` (regular file, no symlink;
+//! a file with secret material must have no group/other bits and be owned
+//! by this user or root); its key id comes from the file. `run` needs the
+//! secret key file; `verify` also accepts the public `.pub` file.
 //! Keys are never accepted on the command line: argv is readable by every
 //! process through /proc.
 
@@ -50,10 +52,12 @@ USAGE:
   Findings go to stdout unless --out is given; the summary goes to stderr.
   --firewall needs --firewall-max-angular for every Twist channel of the
   profile (the OEM's yaw-rate bound; the profile has none).
-  --key-file is a robodr-blackbox-key/v1 file (create one with
-  `robodr-blackbox keygen --out FILE`); it must be mode 0600 or stricter,
-  and its key id is used. Keys are never taken on the command line.
-  The HMAC key (>= 32 bytes) is a placeholder authenticator (see robodr-blackbox).
+  --key-file is a robodr-blackbox key file (create one with
+  `robodr-blackbox keygen --out FILE`: ed25519 secret FILE + public FILE.pub).
+  run needs the secret file (mode 0600 or stricter, own user or root);
+  verify also accepts the public FILE.pub (any mode). Its key id is used.
+  Keys are never taken on the command line. Legacy hmac-sha256 key files
+  still work but are symmetric (whoever verifies can forge).
   --blackbox must be absent or empty (a replay starts a fresh chain).
   A replay never acts: --log-plans only prints what would have been requested.
 
@@ -187,14 +191,33 @@ fn parse_u64(what: &str, v: &str) -> Result<u64, String> {
         .map_err(|_| format!("invalid {what} {v:?}"))
 }
 
-/// Load the black-box key from `--key-file` (permission-checked, HMAC
-/// only). Returns the key material and the key id from the file.
-fn key_from(a: &Args) -> Result<(Vec<u8>, String), String> {
+/// Load the black-box signing key from `--key-file` (secret key file,
+/// permission-checked; Ed25519 or HMAC). Returns the key material, the key
+/// id from the file and the algorithm.
+fn key_from(a: &Args) -> Result<(Vec<u8>, String, String), String> {
     let p = a.req("key-file")?;
-    let kf = robodr_blackbox::KeyFile::load(p.as_ref()).map_err(|e| format!("{p}: {e}"))?;
-    // Refuses non-HMAC algorithms and re-checks the key length.
-    kf.hmac().map_err(|e| format!("{p}: {e}"))?;
-    Ok((kf.secret().to_vec(), kf.key_id.clone()))
+    let kf = robodr_blackbox::KeyFile::load_secret(p.as_ref()).map_err(|e| format!("{p}: {e}"))?;
+    // Refuses unknown algorithms and re-checks the key length.
+    kf.signer().map_err(|e| format!("{p}: {e}"))?;
+    if kf.is_symmetric() {
+        eprintln!(
+            "robodr-replay: warning: {p} is an hmac-sha256 key (symmetric placeholder; \
+             use `robodr-blackbox keygen` for ed25519)"
+        );
+    }
+    Ok((
+        kf.secret().to_vec(),
+        kf.key_id.clone(),
+        kf.algorithm.clone(),
+    ))
+}
+
+/// The verifier for `verify`: a secret or public key file.
+fn verifier_from(a: &Args) -> Result<Box<dyn robodr_blackbox::Verifier>, String> {
+    let p = a.req("key-file")?;
+    robodr_blackbox::KeyFile::load(p.as_ref())
+        .and_then(|kf| kf.verifier())
+        .map_err(|e| format!("{p}: {e}"))
 }
 
 fn kv(what: &str, v: &str) -> Result<(String, String), String> {
@@ -211,9 +234,10 @@ fn options(a: &Args) -> Result<ReplayOptions, String> {
         a.req("policy")?,
         a.req("blackbox")?,
     );
-    let (key, key_id) = key_from(a)?;
+    let (key, key_id, algorithm) = key_from(a)?;
     let mut o = ReplayOptions::new(events, profile, policy, blackbox, key, a.req("robot-id")?);
     o.key_id = Some(key_id);
+    o.key_algorithm = algorithm;
     if let Some(v) = a.one("safety-state")? {
         o.safety = parse_enum("safety state", v)?;
     }
@@ -384,12 +408,11 @@ fn run_cmd(a: &Args) -> Result<Verdict, String> {
 
 fn verify_cmd(a: &Args) -> Result<Verdict, String> {
     let dir = PathBuf::from(a.req("blackbox")?);
-    let (key, key_id) = key_from(a)?;
+    let verifier = verifier_from(a)?;
     let findings = a.one("findings")?.map(PathBuf::from);
-    let v = replay::verify(
+    let v = replay::verify_with(
         &dir,
-        &key,
-        Some(&key_id),
+        verifier.as_ref(),
         a.one("robot-id")?,
         findings.as_deref(),
     )

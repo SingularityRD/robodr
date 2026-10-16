@@ -12,10 +12,11 @@ robodr\-diode\-pack \- pack RoboDR findings and black\-box bundles into signed b
 .I FILE
 .B \-\-unit
 .I UNIT_ID
-.B \-\-key\-id
-.I KEY_ID
 .B \-\-key\-file
-.I HEX_KEY_FILE
+.I SECRET_KEY_FILE
+.RB [ \-\-key\-id
+.IR KEY_ID ]
+.RB [ \-\-allow\-hmac ]
 .RB [ \-\-findings
 .IR FINDINGS.jsonl ]...
 .RB [ \-\-bundle
@@ -50,10 +51,23 @@ Packer state (next sequence number, last batch hash), committed atomically.
 .BI \-\-unit " UNIT_ID"
 Unit id written into every manifest.
 .TP
-.BI \-\-key\-id " KEY_ID\fR, " \-\-key\-file " HEX_KEY_FILE"
-HMAC\-SHA256 signing key: id, and a file holding the key as hex (at most
-4096 bytes). A warning is printed if the file is accessible by group or
-others. Keys are never taken on the command line.
+.BI \-\-key\-file " SECRET_KEY_FILE"
+The unit's signing key: a
+.BR robodr\-blackbox (1)
+secret key file, Ed25519 by default
+.RB ( "robodr\-blackbox keygen" ).
+It is refused if it is a symlink or not a regular file, if group or others
+can access it, or if it is owned by neither the current user nor root.
+Public key files and bare hex keys are refused. Keys are never taken on the
+command line.
+.TP
+.BI \-\-key\-id " KEY_ID"
+Optional; must equal the key file's id.
+.TP
+.B \-\-allow\-hmac
+Accept a legacy HMAC\-SHA256 key file (refused otherwise). A warning is
+printed: with HMAC the receiving side holds the same secret and could forge
+batches.
 .TP
 .BI \-\-findings " FINDINGS.jsonl"
 Findings to export, one JSON value per line (repeatable).
@@ -79,6 +93,12 @@ Error (invalid input, key, I/O).
 .TP
 .B 2
 Usage error, including an argument that is not valid UTF\-8.
+.SH NOTES
+Give the SOC only the public key file
+.RI ( SECRET_KEY_FILE .pub,
+or
+.BR "robodr\-blackbox export\-pub" ).
+The Ed25519 implementation is in\-crate and not audited.
 .SH SEE ALSO
 .BR robodr\-diode\-unpack (1),
 .BR robodr\-blackbox (1),

@@ -29,7 +29,9 @@ use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use robodr_blackbox::{HmacSha256Key, RecorderConfig, Report, TimeSource};
+use robodr_blackbox::{
+    HmacSha256Key, KeyFile, RecorderConfig, Report, Signer, TimeSource, Verifier,
+};
 use robodr_commission::{EventSource, JsonlSource};
 use robodr_events::profile::Profile;
 use robodr_motion::{FeedbackSource, MonitorConfig};
@@ -61,10 +63,13 @@ pub struct ReplayOptions {
     pub profile: PathBuf,
     pub policy: PathBuf,
     pub blackbox: PathBuf,
-    /// HMAC key bytes (>= 32). Placeholder authenticator; see robodr-blackbox.
+    /// Key bytes: an HMAC key (>= 32 bytes, the placeholder authenticator)
+    /// or a 32-byte Ed25519 seed, per [`ReplayOptions::key_algorithm`].
     pub key: Vec<u8>,
     /// Key id; `None` derives one from the key.
     pub key_id: Option<String>,
+    /// `"hmac-sha256"` (default, for compatibility) or `"ed25519"`.
+    pub key_algorithm: String,
     pub robot_id: String,
     pub site: String,
     /// Robot model for the finding; `None` uses the profile's model.
@@ -112,6 +117,7 @@ impl ReplayOptions {
             blackbox: blackbox.into(),
             key,
             key_id: None,
+            key_algorithm: robodr_blackbox::sign::HMAC_SHA256.into(),
             robot_id: robot_id.into(),
             site: "replay".into(),
             model: None,
@@ -246,6 +252,47 @@ fn hmac_key(key: &[u8], key_id: Option<&str>) -> Result<HmacSha256Key, ReplayErr
     .map_err(|e| ReplayError::Config(format!("black-box key: {e}")))
 }
 
+/// The key of `opts` as a key file (Ed25519 seed or HMAC key).
+fn key_file(
+    opts_key: &[u8],
+    key_id: Option<&str>,
+    algorithm: &str,
+) -> Result<KeyFile, ReplayError> {
+    let r = match algorithm {
+        robodr_blackbox::sign_ed25519::ED25519 => {
+            let seed: &[u8; 32] = opts_key.try_into().map_err(|_| {
+                ReplayError::Config("black-box key: an ed25519 seed is 32 bytes".into())
+            })?;
+            KeyFile::ed25519_from_seed(seed, key_id)
+        }
+        robodr_blackbox::sign::HMAC_SHA256 => {
+            // Same checks and id derivation as before.
+            let k = hmac_key(opts_key, key_id)?;
+            KeyFile::hmac_from_secret(opts_key, Some(Signer::key_id(&k)))
+        }
+        a => {
+            return Err(ReplayError::Config(format!(
+                "black-box key: unsupported algorithm {a:?}"
+            )))
+        }
+    };
+    r.map_err(|e| ReplayError::Config(format!("black-box key: {e}")))
+}
+
+/// Signer for the replay's black box.
+fn signer_for(opts: &ReplayOptions) -> Result<Box<dyn Signer>, ReplayError> {
+    key_file(&opts.key, opts.key_id.as_deref(), &opts.key_algorithm)?
+        .signer()
+        .map_err(|e| ReplayError::Config(format!("black-box key: {e}")))
+}
+
+/// Verifier matching [`signer_for`].
+fn verifier_for(opts: &ReplayOptions) -> Result<Box<dyn Verifier>, ReplayError> {
+    key_file(&opts.key, opts.key_id.as_deref(), &opts.key_algorithm)?
+        .verifier()
+        .map_err(|e| ReplayError::Config(format!("black-box key: {e}")))
+}
+
 /// Build the agent for `opts` (exposed for tests that drive it by hand).
 pub fn build_agent(opts: &ReplayOptions) -> Result<Agent, ReplayError> {
     if opts.step_ns == 0 {
@@ -294,15 +341,14 @@ pub fn build_agent(opts: &ReplayOptions) -> Result<Agent, ReplayError> {
         ms.feedback_sources = opts.feedback_sources.clone();
         cfg.monitor = Some(ms);
     }
-    let signer = hmac_key(&opts.key, opts.key_id.as_deref())?;
+    let signer = signer_for(opts)?;
     let clock = ReplayClock::new(
         opts.start_wall_ms.saturating_mul(1_000_000),
         0,
         opts.step_ns,
         TimeSource::Unknown,
     );
-    let mut agent =
-        Agent::new(cfg, Box::new(signer), Box::new(clock)).map_err(ReplayError::Agent)?;
+    let mut agent = Agent::new(cfg, signer, Box::new(clock)).map_err(ReplayError::Agent)?;
     agent.mark_replay();
     Ok(agent)
 }
@@ -405,16 +451,16 @@ pub fn run(
     if let Some(e) = input_error {
         return Err(ReplayError::Input(e));
     }
-    let verifier = hmac_key(&opts.key, opts.key_id.as_deref())?;
+    let verifier = verifier_for(opts)?;
     let report = verify_blackbox(
         &opts.blackbox,
-        &verifier,
+        verifier.as_ref(),
         Some(finished.checkpoint),
         Some(&opts.robot_id),
     )
     .map_err(|e| ReplayError::Io(format!("{}: {e}", opts.blackbox.display())))?;
     let refs: Vec<_> = refs.into_iter().collect();
-    let links = resolve_links(&opts.blackbox, &verifier, &refs)
+    let links = resolve_links(&opts.blackbox, verifier.as_ref(), &refs)
         .map_err(|e| ReplayError::Io(format!("{}: {e}", opts.blackbox.display())))?;
     Ok(ReplaySummary {
         events,
@@ -457,7 +503,19 @@ pub fn verify(
     findings: Option<&Path>,
 ) -> Result<VerifySummary, ReplayError> {
     let verifier = hmac_key(key, key_id)?;
-    let report = verify_blackbox(blackbox, &verifier, None, robot_id)
+    verify_with(blackbox, &verifier, robot_id, findings)
+}
+
+/// [`verify`] with any verifier, e.g. an Ed25519 public key
+/// ([`robodr_blackbox::KeyFile::verifier`] of a `.pub` file) or a keyring:
+/// verification needs no secret.
+pub fn verify_with(
+    blackbox: &Path,
+    verifier: &dyn Verifier,
+    robot_id: Option<&str>,
+    findings: Option<&Path>,
+) -> Result<VerifySummary, ReplayError> {
+    let report = verify_blackbox(blackbox, verifier, None, robot_id)
         .map_err(|e| ReplayError::Io(format!("{}: {e}", blackbox.display())))?;
     let mut invalid = Vec::new();
     let links = match findings {
@@ -490,7 +548,7 @@ pub fn verify(
                 }
             }
             Some(
-                resolve_links(blackbox, &verifier, &refs)
+                resolve_links(blackbox, verifier, &refs)
                     .map_err(|e| ReplayError::Io(format!("{}: {e}", blackbox.display())))?,
             )
         }

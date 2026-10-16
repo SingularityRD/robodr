@@ -27,9 +27,12 @@
 //!   `listen_spdp` defaults to `true` there; set it to `false` when capture
 //!   is enabled (capture sees SPDP too).
 //! * The black-box key is read from `blackbox.key_file`, never from the
-//!   command line: either a `robodr-blackbox-key/v1` JSON key file (as
-//!   written by `robodr-blackbox keygen`; HMAC-SHA256 only, its `key_id` is
-//!   used) or bare hex (>= 32 bytes; legacy 0.1.0-alpha.1 format). The file
+//!   command line: either a `robodr-blackbox` **secret** key file (as
+//!   written by `robodr-blackbox keygen`: Ed25519 by default, format v2, or
+//!   a legacy HMAC-SHA256 v1 file; its `key_id` is used) or bare hex
+//!   (>= 32 bytes HMAC; legacy 0.1.0-alpha.1 format). A public key file
+//!   (`.pub`) is refused: the recorder needs the secret. HMAC keys load
+//!   with a start-up warning (symmetric: every verifier can forge). The file
 //!   must be a regular file (not a symlink), owned by the daemon's effective
 //!   user or root, and not accessible by group or others (`chmod 600`); see
 //!   [`read_key_file`]. A `blackbox.key_id` that contradicts the key file's
@@ -142,8 +145,8 @@ fn default_profile_version() -> String {
 #[serde(deny_unknown_fields)]
 pub struct BlackboxSection {
     pub dir: PathBuf,
-    /// HMAC key file: `robodr-blackbox-key/v1` JSON or hex (see
-    /// [`read_key_file`]).
+    /// Secret key file: `robodr-blackbox` JSON key file (Ed25519 or HMAC)
+    /// or legacy hex HMAC (see [`read_key`]).
     pub key_file: PathBuf,
     /// Key id. Default: the key file's `key_id` (JSON key file), else
     /// derived from the key. Must equal the JSON key file's id if both are
@@ -313,8 +316,11 @@ pub struct Resolved {
     pub profile: LoadedProfile,
     pub policy: ResponsePolicy,
     pub monitor: Option<MonitorConfig>,
-    /// Black-box key bytes (never printed by `Debug`).
+    /// Black-box key bytes: the HMAC key or the Ed25519 seed (never
+    /// printed by `Debug`).
     pub key: KeyBytes,
+    /// Algorithm of `key`: `"ed25519"` or `"hmac-sha256"`.
+    pub key_algorithm: String,
     /// Effective key id: `blackbox.key_id`, else the JSON key file's id,
     /// else `None` (derived from the key).
     pub key_id: Option<String>,
@@ -521,7 +527,18 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
             }
         }
     }
-    let (key, file_key_id) = read_key_material(&config.blackbox.key_file)?;
+    let KeyMaterial {
+        key,
+        key_id: file_key_id,
+        algorithm: key_algorithm,
+    } = read_key(&config.blackbox.key_file)?;
+    if key_algorithm == robodr_blackbox::sign::HMAC_SHA256 {
+        warnings.push(
+            "black-box key is hmac-sha256, the symmetric placeholder: whoever verifies the \
+             evidence can also forge it; generate an ed25519 key (robodr-blackbox keygen)"
+                .into(),
+        );
+    }
     let key_id = match (&config.blackbox.key_id, file_key_id) {
         (Some(cfg), Some(file)) if *cfg != file => {
             return Err(format!(
@@ -544,6 +561,7 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         policy,
         monitor,
         key,
+        key_algorithm,
         key_id,
         boot_id,
         warnings,
@@ -574,15 +592,32 @@ pub fn read_key_file(path: &Path) -> Result<KeyBytes, String> {
     read_key_material(path).map(|(k, _)| k)
 }
 
-/// Read the black-box HMAC key from `path`: a `robodr-blackbox-key/v1` JSON
-/// key file (HMAC-SHA256 only; returns its key id too) or bare hex
-/// (returns no key id). Refuses a file that is a
+/// A loaded black-box signing key.
+#[derive(Debug, Clone)]
+pub struct KeyMaterial {
+    /// HMAC key or Ed25519 seed.
+    pub key: KeyBytes,
+    /// The JSON key file's id (`None` for legacy bare hex).
+    pub key_id: Option<String>,
+    /// `"ed25519"` or `"hmac-sha256"`.
+    pub algorithm: String,
+}
+
+/// [`read_key`] without the algorithm (key bytes and key id).
+pub fn read_key_material(path: &Path) -> Result<(KeyBytes, Option<String>), String> {
+    read_key(path).map(|m| (m.key, m.key_id))
+}
+
+/// Read the black-box signing key from `path`: a `robodr-blackbox` JSON
+/// secret key file (Ed25519 v2 or HMAC-SHA256 v1/v2; returns its key id
+/// too) or bare hex HMAC (returns no key id). Refuses a file that is a
 /// symlink or not a regular file, is readable or writable by group or
 /// others, is not owned by the effective user (or root), or is larger than
-/// [`MAX_KEY_FILE_BYTES`]. The file is opened once and the checks run on
-/// the opened file (`fstat`), compared against the path's `lstat`, so it
-/// cannot be swapped between check and read.
-pub fn read_key_material(path: &Path) -> Result<(KeyBytes, Option<String>), String> {
+/// [`MAX_KEY_FILE_BYTES`]; and refuses a public key file (it cannot sign).
+/// The file is opened once and the checks run on the opened file (`fstat`),
+/// compared against the path's `lstat`, so it cannot be swapped between
+/// check and read.
+pub fn read_key(path: &Path) -> Result<KeyMaterial, String> {
     let shown = path.display();
     let lmeta = std::fs::symlink_metadata(path).map_err(|e| format!("key file {shown}: {e}"))?;
     if !lmeta.file_type().is_file() {
@@ -623,8 +658,13 @@ pub fn read_key_material(path: &Path) -> Result<(KeyBytes, Option<String>), Stri
         let parsed = robodr_blackbox::KeyFile::from_json(&text);
         wipe_text(&mut text);
         let kf = parsed.map_err(|e| format!("key file {shown}: {e}"))?;
-        kf.hmac().map_err(|e| format!("key file {shown}: {e}"))?;
-        return Ok((KeyBytes(kf.secret().to_vec()), Some(kf.key_id.clone())));
+        // Refuses public key files and unknown algorithms; re-checks lengths.
+        kf.signer().map_err(|e| format!("key file {shown}: {e}"))?;
+        return Ok(KeyMaterial {
+            key: KeyBytes(kf.secret().to_vec()),
+            key_id: Some(kf.key_id.clone()),
+            algorithm: kf.algorithm.clone(),
+        });
     }
     let key = robodr_blackbox::crypto::from_hex(text.trim());
     wipe_text(&mut text);
@@ -635,7 +675,38 @@ pub fn read_key_material(path: &Path) -> Result<(KeyBytes, Option<String>), Stri
             key.len()
         ));
     }
-    Ok((KeyBytes(key), None))
+    Ok(KeyMaterial {
+        key: KeyBytes(key),
+        key_id: None,
+        algorithm: robodr_blackbox::sign::HMAC_SHA256.into(),
+    })
+}
+
+/// The recorder signer for a resolved key (Ed25519 seed or HMAC key).
+pub fn signer_for(
+    algorithm: &str,
+    key: &KeyBytes,
+    key_id: Option<&str>,
+) -> Result<Box<dyn robodr_blackbox::Signer>, String> {
+    match algorithm {
+        robodr_blackbox::sign_ed25519::ED25519 => {
+            let seed: &[u8; 32] = key
+                .0
+                .as_slice()
+                .try_into()
+                .map_err(|_| "ed25519 seed must be 32 bytes".to_string())?;
+            robodr_blackbox::KeyFile::ed25519_from_seed(seed, key_id)
+                .and_then(|k| k.signer())
+                .map_err(|e| e.to_string())
+        }
+        robodr_blackbox::sign::HMAC_SHA256 => match key_id {
+            Some(id) => robodr_blackbox::HmacSha256Key::new(id, &key.0),
+            None => robodr_blackbox::HmacSha256Key::with_derived_id(&key.0),
+        }
+        .map(|k| Box::new(k) as Box<dyn robodr_blackbox::Signer>)
+        .map_err(|e| e.to_string()),
+        a => Err(format!("unsupported key algorithm {a:?}")),
+    }
 }
 
 /// Best-effort overwrite of a string that held key material.
@@ -705,9 +776,53 @@ mod tests {
         let json_open = d.join("json-open.key");
         write_mode(&json_open, &kf.to_json(), 0o644);
         assert!(read_key_file(&json_open).unwrap_err().contains("chmod 600"));
+        assert_eq!(read_key(&json).unwrap().algorithm, "hmac-sha256");
+        assert_eq!(read_key(&good).unwrap().algorithm, "hmac-sha256");
+        // Ed25519 secret key file (keygen's default): accepted, seed + id.
         let ed = d.join("ed.key");
-        write_mode(&ed, &kf.to_json().replace("hmac-sha256", "ed25519"), 0o600);
-        assert!(read_key_file(&ed).unwrap_err().contains("unsupported"));
+        let ekf =
+            robodr_blackbox::KeyFile::ed25519_from_seed(&[0x11; 32], Some("ugv-07-ed")).unwrap();
+        ekf.write_new(&ed).unwrap();
+        let m = read_key(&ed).unwrap();
+        assert_eq!(
+            (m.algorithm.as_str(), m.key_id.as_deref()),
+            ("ed25519", Some("ugv-07-ed"))
+        );
+        assert_eq!(m.key.0, vec![0x11; 32]);
+        let signer = signer_for(&m.algorithm, &m.key, m.key_id.as_deref()).unwrap();
+        assert_eq!(signer.algorithm(), "ed25519");
+        assert_eq!(signer.key_id(), "ugv-07-ed");
+        let sig = signer.sign(b"m").unwrap();
+        assert!(ekf
+            .to_public()
+            .unwrap()
+            .verifier()
+            .unwrap()
+            .verify(b"m", &sig));
+        // ...but its public half cannot sign, and loose modes are refused.
+        let edpub = d.join("ed.key.pub");
+        ekf.to_public().unwrap().write_new(&edpub).unwrap();
+        std::fs::set_permissions(&edpub, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_key(&edpub).unwrap_err().contains("public key file"));
+        let ed_open = d.join("ed-open.key");
+        write_mode(&ed_open, &ekf.to_json(), 0o640);
+        assert!(read_key(&ed_open).unwrap_err().contains("chmod 600"));
+        // Unknown algorithms (parsed from v1) cannot sign.
+        let odd = d.join("odd.key");
+        write_mode(
+            &odd,
+            &kf.to_json().replace("hmac-sha256", "tpm-ecdsa"),
+            0o600,
+        );
+        assert!(read_key_file(&odd).unwrap_err().contains("unsupported"));
+        assert!(signer_for("tpm-ecdsa", &m.key, None).is_err());
+        assert!(signer_for("ed25519", &KeyBytes(vec![1; 31]), None).is_err());
+        assert_eq!(
+            signer_for("hmac-sha256", &KeyBytes(vec![1; 32]), None)
+                .unwrap()
+                .algorithm(),
+            "hmac-sha256"
+        );
         let junk = d.join("junk.key");
         write_mode(&junk, "{\"format\":\"x\"}", 0o600);
         assert!(read_key_file(&junk).unwrap_err().contains("malformed"));

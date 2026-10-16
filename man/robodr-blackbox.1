@@ -7,8 +7,17 @@ robodr\-blackbox \- create black\-box keys, verify and inspect RoboDR black\-box
 .B robodr\-blackbox keygen
 .B \-\-out
 .I FILE
+.RB [ \-\-alg
+.BR ed25519 | hmac ]
 .RB [ \-\-key\-id
 .IR ID ]
+.RB [ \-\-pub\-out
+.IR FILE ]
+.PP
+.B robodr\-blackbox export\-pub
+.I KEYFILE
+.RB [ \-\-out
+.IR FILE ]
 .PP
 .B robodr\-blackbox verify
 .I DIR
@@ -37,25 +46,50 @@ process through
 .SH COMMANDS
 .TP
 .B keygen
-Write a new HMAC\-SHA256 key file
+Write a new key. With
+.B \-\-alg ed25519
+(the default) two files are written: the secret key file
+.I FILE
+.RI ( robodr\-blackbox\-key/v2 ,
+JSON, the 32\-byte Ed25519 seed, mode 0600) and the public key file
+.IR FILE .pub
+(or
+.BR \-\-pub\-out ;
+mode 0644), which can verify but never sign and is safe to distribute.
+.B \-\-alg hmac
+writes a legacy HMAC\-SHA256 key file
 .RI ( robodr\-blackbox\-key/v1 ,
-JSON) to
-.IR FILE .
-32 bytes are drawn from
+0600, no public half) and prints a warning.
+Key material is drawn from
 .IR /dev/urandom ;
-the command fails rather than fall back to weaker randomness. The file is
-created exclusively with mode 0600; an existing file or symlink is never
-overwritten or written through. Without
+the command fails rather than fall back to weaker randomness. Files are
+created exclusively; an existing file or symlink is never overwritten or
+written through, and if either target exists nothing is written. Without
 .BR \-\-key\-id ,
-the key id is derived from the key. Prints the key id, never the secret.
+the key id is derived from the key
+.RI ( ed25519: "<16 hex>)."
+Prints the key id, never the secret.
+.TP
+.B export\-pub
+Write the public key file of the Ed25519 secret key file
+.I KEYFILE
+to
+.I FILE
+(created exclusively, mode 0644; prints the key id) or, without
+.BR \-\-out ,
+to standard output. An HMAC key has no public half and is refused.
 .TP
 .B verify
 Verify the log in
 .I DIR
 with every key in the given key or keyring files
 .RI ( robodr\-blackbox\-keyring/v1 ),
-so a log that spans a key rotation verifies. Key files that are symlinks, not
-regular files, or accessible by group or others are refused.
+so a log that spans a key rotation verifies. Public key files
+.RI ( FILE .pub)
+are accepted whatever their mode. Files holding secret material are refused
+if group or others can access them or if they are owned by neither the
+current user nor root. Symlinks and non\-regular files are always refused.
+A warning is printed when an HMAC key is used.
 .B \-\-checkpoint
 names a trusted checkpoint held off the unit; without it the directory's own
 .I checkpoint.json
@@ -89,9 +123,11 @@ Verification failed (tampering, or warnings with
 .B 2
 Usage, I/O or key error, including an argument that is not valid UTF\-8.
 .SH NOTES
-HMAC\-SHA256 is a placeholder authenticator: whoever holds the key can verify
-and also forge evidence. Keep exactly one copy on the robot and one in the
-verifier's protected store.
+Ed25519 is the default: the robot keeps the secret file, verifiers get only
+.IR FILE .pub
+and cannot forge evidence. The Ed25519 implementation is in\-crate and not
+audited. HMAC\-SHA256 is the legacy symmetric placeholder: whoever holds the
+key can verify and also forge evidence; migrate at the next key rotation.
 .SH SEE ALSO
 .BR robodr\-agentd (8),
 .BR robodr\-replay (1),

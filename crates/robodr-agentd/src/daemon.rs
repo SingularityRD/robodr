@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 use robodr_agent::{
     Agent, AgentConfig, AgentStats, Detector, Finished, FirewallSettings, MonitorSettings, Outcome,
 };
-use robodr_blackbox::{Clock, HmacSha256Key, RecorderConfig, SystemClock, TimeSource, Timestamp};
+use robodr_blackbox::{Clock, RecorderConfig, SystemClock, TimeSource, Timestamp};
 use robodr_events::profile::Profile;
 use robodr_ocsf::{AttestationStatus, PlatformFamily as OcsfPlatform, RobotInfo, Subject};
 use robodr_responder::OperationalContext;
@@ -315,13 +315,10 @@ impl<'a> Daemon<'a> {
             ms.feedback_sources = m.feedback_sources.clone();
             acfg.monitor = Some(ms);
         }
-        let signer = match &r.key_id {
-            Some(id) => HmacSha256Key::new(id.as_str(), &r.key.0),
-            None => HmacSha256Key::with_derived_id(&r.key.0),
-        }
-        .map_err(|e| DaemonError::Config(format!("black-box key: {e}")))?;
-        let agent = Agent::new(acfg, Box::new(signer), Box::new(clock.clone()))
-            .map_err(DaemonError::Agent)?;
+        let signer = crate::config::signer_for(&r.key_algorithm, &r.key, r.key_id.as_deref())
+            .map_err(|e| DaemonError::Config(format!("black-box key: {e}")))?;
+        let agent =
+            Agent::new(acfg, signer, Box::new(clock.clone())).map_err(DaemonError::Agent)?;
 
         let spool = Spool::open(&cfg.spool.dir, cfg.spool.max_bytes, cfg.spool.max_files)
             .map_err(|e| DaemonError::Io(format!("spool {}: {e}", cfg.spool.dir.display())))?;

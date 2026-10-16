@@ -11,10 +11,16 @@ use std::process::ExitCode;
 const USAGE: &str = "\
 usage: robodr-diode-unpack --inbox DIR --out DIR --quarantine DIR \\
          --processed DIR --state FILE --keyring FILE \\
-         [--bundle-key KEY_ID:HEX_KEY_FILE]... [--partitions N] \\
+         [--bundle-key PUBLIC_KEY_FILE]... [--allow-hmac] [--partitions N] \\
          [--accept-gap UNIT:SEQ]... [--max-batch-bytes N]
 
-Keyring file: one `<unit_id> <key_id> <hex-key-file>` per line (# comments).
+Keyring file: one `<unit_id> <public-key-file>` per line (# comments; the
+older `<unit_id> <key_id> <key-file>` also works, the id must match the
+file). Key files are robodr-blackbox ed25519 PUBLIC key files
+(`robodr-blackbox export-pub`); an ed25519 secret key file is refused, so the
+SOC holds no key that can sign batches. Legacy hmac-sha256 key files (secret,
+mode 0600) are refused unless --allow-hmac is given. --bundle-key adds a
+black-box key (same rules) used to verify bundles inside batches.
 Accepted batches go to OUT/<batch>/records.jsonl (one Kafka record per line),
 rejected ones to QUARANTINE/ with a .reason.json. Prints a JSON report.
 --accept-gap accepts batch SEQ of UNIT although earlier batches are missing
@@ -33,8 +39,10 @@ const FLAGS: &[&str] = &[
     "max-batch-bytes",
 ];
 
+const SWITCHES: &[&str] = &["allow-hmac"];
+
 fn main() -> ExitCode {
-    let args = match cli::argv().and_then(|v| cli::parse_args(v, FLAGS)) {
+    let args = match cli::argv().and_then(|v| cli::parse_args_with_switches(v, FLAGS, SWITCHES)) {
         Ok(a) => a,
         Err(e) if e == "help" => {
             println!("{USAGE}");
@@ -56,7 +64,8 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &cli::Args) -> Result<bool, String> {
-    let (keyring, warnings) = cli::load_keyring(Path::new(args.req("keyring")?))?;
+    let allow_hmac = args.flag("allow-hmac");
+    let (keyring, warnings) = cli::load_keyring(Path::new(args.req("keyring")?), allow_hmac)?;
     for w in warnings {
         eprintln!("{w}");
     }
@@ -75,10 +84,11 @@ fn run(args: &cli::Args) -> Result<bool, String> {
     }
     let mut importer = Importer::open(cfg, keyring).map_err(|e| e.to_string())?;
     for bk in args.all("bundle-key") {
-        let (id, file) = bk
-            .split_once(':')
-            .ok_or_else(|| format!("--bundle-key expects KEY_ID:FILE, got {bk:?}"))?;
-        importer.add_bundle_verifier(Box::new(cli::load_hmac_key(id, Path::new(file))?));
+        let (v, w) = cli::load_verifier(Path::new(bk), allow_hmac)?;
+        if let Some(w) = w {
+            eprintln!("{w}");
+        }
+        importer.add_bundle_verifier(v);
     }
     let report = importer.run(cli::now_ms()).map_err(|e| e.to_string())?;
     println!(

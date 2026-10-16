@@ -19,7 +19,8 @@ robodr\-diode\-unpack \- verify and import RoboDR export batches on the receivin
 .B \-\-keyring
 .I FILE
 .RB [ \-\-bundle\-key
-.IR KEY_ID : HEX_KEY_FILE ]...
+.IR PUBLIC_KEY_FILE ]...
+.RB [ \-\-allow\-hmac ]
 .RB [ \-\-partitions
 .IR N ]
 .RB [ \-\-accept\-gap
@@ -57,15 +58,32 @@ gaps), updated atomically.
 .TP
 .BI \-\-keyring " FILE"
 One
-.RI \(lq unit_id " " key_id " " hex\-key\-file \(rq
+.RI \(lq unit_id " " public\-key\-file \(rq
 per line
 .RB ( #
-comments); relative key paths are resolved against the keyring's directory.
+comments; the older
+.RI \(lq unit_id " " key_id " " key\-file \(rq
+form also works, and the id must match the file); relative key paths are
+resolved against the keyring's directory. Each key file must be an Ed25519
+.B public
+key file
+.RB ( "robodr\-blackbox keygen" 's
+.IR .pub ,
+or
+.BR "robodr\-blackbox export\-pub" ),
+accepted whatever its mode. An Ed25519 secret key file is refused, so the
+receiving side never holds a key that can sign batches. Several keys per
+unit are allowed (rotation); a key belongs to one unit only.
 .TP
-.BI \-\-bundle\-key " KEY_ID:HEX_KEY_FILE"
-A black\-box key used to verify bundles signed with
-.I KEY_ID
-(repeatable).
+.BI \-\-bundle\-key " PUBLIC_KEY_FILE"
+A black\-box public key used to verify bundles signed with its key id
+(repeatable; same rules as the keyring).
+.TP
+.B \-\-allow\-hmac
+Accept legacy HMAC\-SHA256 key files in the keyring and as
+.B \-\-bundle\-key
+(refused otherwise; they must be mode 0600 and owned by the current user or
+root). A warning is printed.
 .TP
 .BI \-\-partitions " N"
 Kafka partition count used to compute each record's partition.
@@ -94,8 +112,12 @@ Usage error, including an argument that is not valid UTF\-8.
 .B 3
 Something was quarantined or held (gap).
 .SH NOTES
-HMAC\-SHA256 is a placeholder: the receiving side holds the same secret as
-the unit and could forge batches.
+With Ed25519 keys the receiving side holds only public keys and cannot forge
+batches; whoever holds a unit's secret key file can, for that unit. With
+legacy HMAC keys
+.RB ( \-\-allow\-hmac )
+the receiving side holds the same secret as the unit and could forge
+batches. The Ed25519 implementation is in\-crate and not audited.
 .SH SEE ALSO
 .BR robodr\-diode\-pack (1),
 .BR robodr\-blackbox (1),
