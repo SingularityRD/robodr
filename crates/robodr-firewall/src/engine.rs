@@ -6,7 +6,9 @@
 //! - **No panics**: no `unwrap`/`expect`, no slice indexing (only `get`,
 //!   iterators and array destructuring), saturating/checked integer maths.
 //! - **Bounded work**: every loop is over at most [`MAX_JOINTS`] elements or a
-//!   constant number of iterations; no recursion, no search over sources.
+//!   constant number of iterations, except recording an event, which scans
+//!   the fixed-capacity event buffer once (coalesce / evict, at most
+//!   `event_capacity` entries); no recursion, no search over sources.
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -358,12 +360,18 @@ impl Firewall {
     pub fn drain_deviations(&mut self) -> Vec<Deviation> {
         let mut out = Vec::with_capacity(self.events.len().saturating_add(1));
         let policy = &self.policy;
+        // Severity of the drop report: at least Medium, and as high as the
+        // most severe event that was lost.
+        let sev = self
+            .events
+            .dropped_max_severity()
+            .map_or(Severity::Medium, |s| s.max(Severity::Medium));
         let dropped = self.events.drain_with(|e| out.push(e.to_deviation(policy)));
         if dropped > 0 {
             out.push(
                 Deviation::new(
                     rules::EVENTS_DROPPED,
-                    Severity::Medium,
+                    sev,
                     format!("{dropped} firewall events dropped: output buffer full"),
                 )
                 .with_mode(policy_mode(policy)),
@@ -638,6 +646,13 @@ impl Firewall {
         value: f64,
         limit: f64,
     ) {
+        let authorised = cmd.source != SourceId::UNKNOWN
+            && usize::from(cmd.source.0) < self.nsrc
+            && self
+                .policy
+                .channels
+                .get(usize::from(cmd.channel.0))
+                .is_some_and(|ch| ch.allows(cmd.source));
         self.events.push(FirewallEvent {
             rule,
             severity: sev,
@@ -647,6 +662,9 @@ impl Firewall {
             action,
             value,
             limit,
+            authorised,
+            count: 1,
+            last_at_ns: now,
         });
     }
 
@@ -769,17 +787,82 @@ impl Firewall {
         }
     }
 
+    /// The value a `HoldLast` substitute may hold on channel `ch_idx` at
+    /// `now`, or `None` when only zero is safe.
+    ///
+    /// The hold must never cause more motion than what was **last emitted**
+    /// downstream (an earlier substitute may already have stopped the
+    /// platform), nor more than the last **accepted** output. The result is
+    /// `s·v` — the last accepted output `v` uniformly scaled (direction and
+    /// curvature preserved) by the largest `s ∈ (0, 1]` that makes it a
+    /// component-wise deceleration of the last emitted output. Being a pure
+    /// deceleration from the last emitted output, it is subject to exactly
+    /// the treatment the acceleration stage gives any stop: it can never step
+    /// the output *up* (e.g. 0 → 0.9 m/s after a zero substitute).
+    ///
+    /// `None` ("if in doubt, emit zero") when: nothing was accepted; the
+    /// accepted output is older than `max_hold_ns`; `now` is before the last
+    /// acceptance or emission (clock regression: the age cannot be trusted);
+    /// the last emission is older than the channel's reset gap (the platform
+    /// may have stopped on its own); a component of the last emitted output
+    /// is zero or of opposite sign where the accepted one is not; or the
+    /// rounding guard fails.
+    fn hold_value(&self, ch_idx: usize, now: u64, max_hold_ns: u64) -> Option<Raw> {
+        let ch = self.policy.channels.get(ch_idx)?;
+        let st = self.chans.get(ch_idx)?;
+        let (v, at) = st.accepted?;
+        if now.checked_sub(at)? > max_hold_ns {
+            return None;
+        }
+        if now.checked_sub(st.last_out_at?)? > ch.reset_after_ns {
+            return None;
+        }
+        let len = width(ch.kind);
+        let o = &st.last_out;
+        let mut s = 1.0_f64;
+        for (vi, oi) in v.iter().zip(o).take(len) {
+            if *vi == 0.0 {
+                continue;
+            }
+            let p = vi * oi;
+            if p.is_nan() || p <= 0.0 {
+                return None;
+            }
+            let r = oi / vi;
+            if r < s {
+                s = r;
+            }
+        }
+        if !s.is_finite() || s <= 0.0 {
+            return None;
+        }
+        let mut h = v;
+        if s < 1.0 {
+            // Few-ulp margin so the deceleration check holds after rounding.
+            scale(&mut h, len, s * (1.0 - 8.0 * f64::EPSILON));
+        }
+        let nonzero = h.iter().take(len).any(|x| *x != 0.0);
+        let safe = h.iter().all(|x| x.is_finite())
+            && only_decelerates(o, &h, len)
+            && only_decelerates(&v, &h, len);
+        (nonzero && safe).then_some(h)
+    }
+
     /// The substitute for a rejected `cmd`.
     ///
     /// `HoldLast` rule — a rejected command must never cause more motion
-    /// than a stop would: the last accepted output is held only if the
-    /// rejected command is **readable intent of an authorised source**
-    /// (`trust_content`, source allowed on the channel, right kind, finite)
-    /// and the held output is a component-wise deceleration of it (each
-    /// component zero, or same sign and magnitude ≤ requested). In every
-    /// other case — a stop or slow-down rejected as rate-limited, stale, out
-    /// of order or in the future; a reversal; NaN/kind-mismatch content whose
-    /// intent is unknown; a foreign source — zero is emitted instead.
+    /// than a stop would. A hold is granted only if `allow_hold` (not an
+    /// internal fault, not a gateway clock regression) and the rejected
+    /// command is **readable intent of an authorised source**
+    /// (`trust_content`, source allowed on the channel, right kind, finite);
+    /// the held value is [`Self::hold_value`] (never more than the last
+    /// emitted *or* the last accepted output) and must be a component-wise
+    /// deceleration of the rejected command (each component zero, or same
+    /// sign and magnitude ≤ requested). In every other case — a stop or
+    /// slow-down rejected as rate-limited, stale, out of order or in the
+    /// future; a reversal; NaN/kind-mismatch content whose intent is
+    /// unknown; a foreign source; a channel already stopped by an earlier
+    /// substitute — zero is emitted instead.
     fn substitute(
         &self,
         cmd: &Command,
@@ -789,7 +872,6 @@ impl Firewall {
         trust_content: bool,
     ) -> Option<(Substitute, Raw)> {
         let ch = self.policy.channels.get(ch_idx)?;
-        let st = self.chans.get(ch_idx)?;
         let hold_ok = |held: &Raw| {
             trust_content
                 && cmd.source != SourceId::UNKNOWN
@@ -800,12 +882,12 @@ impl Firewall {
                 && only_decelerates(&to_raw(&cmd.motion), held, width(ch.kind))
         };
         let (kind, raw) = match self.policy.platform.fail_behaviour {
-            FailBehaviour::HoldLast { max_hold_ns } if allow_hold => match st.accepted {
-                Some((v, at)) if now.saturating_sub(at) <= max_hold_ns && hold_ok(&v) => {
-                    (SubstituteKind::HoldLast, v)
+            FailBehaviour::HoldLast { max_hold_ns } if allow_hold => {
+                match self.hold_value(ch_idx, now, max_hold_ns) {
+                    Some(h) if hold_ok(&h) => (SubstituteKind::HoldLast, h),
+                    _ => (SubstituteKind::Zero, ZERO_RAW),
                 }
-                _ => (SubstituteKind::Zero, ZERO_RAW),
-            },
+            }
             _ => (SubstituteKind::Zero, ZERO_RAW),
         };
         Some((
@@ -857,7 +939,10 @@ impl Firewall {
                 _ => None,
             }
         } else {
-            self.substitute(cmd, now, ch_idx, true, true)
+            // Under a gateway clock regression the hold age cannot be
+            // measured, so never hold (F2): zero only.
+            let allow_hold = rej.reason != RejectReason::ClockRegression;
+            self.substitute(cmd, now, ch_idx, allow_hold, true)
         };
         if let Some((s, raw)) = sub {
             if foreign {

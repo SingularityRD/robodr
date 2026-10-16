@@ -118,7 +118,9 @@ fn cfg(fail_behaviour: FailBehaviour, drop_foreign: bool, fault: FaultPolicy) ->
         // Short enough that both the emitted and the suppressed
         // foreign-substitute paths are exercised.
         foreign_substitute_min_interval_ns: 3_000_000,
-        event_capacity: 32,
+        // Small: identical events coalesce, so only a small buffer
+        // overflows and exercises the eviction / drop paths.
+        event_capacity: 8,
     }
 }
 

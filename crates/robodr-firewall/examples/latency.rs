@@ -1,7 +1,17 @@
-//! Micro-benchmark: per-call latency of `Firewall::check` (std only).
+//! Latency / jitter harness for `Firewall::check` (std only).
 //!
-//! Run with: `cargo run --release -p robodr-firewall --example latency`
-//! Optional arg: number of commands (default 1_000_000).
+//! Run with: `cargo run --release -p robodr-firewall --example latency -- [N] [budgets]`
+//! - `N`: number of commands (default 1_000_000).
+//! - Budgets (all optional, nanoseconds; also read from the environment as
+//!   `ROBODR_FW_BUDGET_P50_NS`, `..._P99_NS`, `..._MAX_NS`, `..._JITTER_NS`,
+//!   flags win): `--budget-p50-ns X`, `--budget-p99-ns X`,
+//!   `--budget-max-ns X`, `--budget-jitter-ns X` (jitter = p99 - p50).
+//!
+//! Prints p50 / p99 / p99.9 / max / jitter and a histogram, then a
+//! `BUDGET:` line per configured budget. Exits with code **1** if any
+//! configured budget is exceeded, **2** on a usage error, 0 otherwise. With
+//! no budget configured it is a pure report. See the crate README: this is
+//! a report-only gate until it runs on the target controller.
 //!
 //! Commands are pre-generated (so generation and allocation are outside the
 //! timed region) as a realistic mix on a twist and a 6-joint channel: mostly
@@ -42,6 +52,8 @@ fn firewall() -> Firewall {
         ..Default::default()
     };
     p.participants.insert(P.into());
+    p.writer_topics.insert("/cmd_vel".into());
+    p.writer_topics.insert("/arm/cmd".into());
     p.motion_envelopes.insert(
         "/cmd_vel".into(),
         Envelope {
@@ -90,11 +102,61 @@ fn firewall() -> Firewall {
     Firewall::new(Policy::compile(&p, platform, &specs).expect("policy"))
 }
 
+/// Latency budgets in ns; `None` = not gated.
+#[derive(Default)]
+struct Budgets {
+    p50: Option<u64>,
+    p99: Option<u64>,
+    max: Option<u64>,
+    jitter: Option<u64>,
+}
+
+fn parse_args() -> Result<(usize, Budgets), String> {
+    let env = |k: &str| -> Result<Option<u64>, String> {
+        match std::env::var(k) {
+            Ok(v) => v
+                .parse()
+                .map(Some)
+                .map_err(|_| format!("{k}={v}: not an integer")),
+            Err(_) => Ok(None),
+        }
+    };
+    let mut b = Budgets {
+        p50: env("ROBODR_FW_BUDGET_P50_NS")?,
+        p99: env("ROBODR_FW_BUDGET_P99_NS")?,
+        max: env("ROBODR_FW_BUDGET_MAX_NS")?,
+        jitter: env("ROBODR_FW_BUDGET_JITTER_NS")?,
+    };
+    let mut n = 1_000_000usize;
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        let slot = match a.as_str() {
+            "--budget-p50-ns" => &mut b.p50,
+            "--budget-p99-ns" => &mut b.p99,
+            "--budget-max-ns" => &mut b.max,
+            "--budget-jitter-ns" => &mut b.jitter,
+            _ => {
+                n = a.parse().map_err(|_| format!("unknown argument {a:?}"))?;
+                if n == 0 {
+                    return Err("N must be >= 1".into());
+                }
+                continue;
+            }
+        };
+        let v = args.next().ok_or_else(|| format!("{a} needs a value"))?;
+        *slot = Some(v.parse().map_err(|_| format!("{a} {v}: not an integer"))?);
+    }
+    Ok((n, b))
+}
+
 fn main() {
-    let n: usize = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1_000_000);
+    let (n, budgets) = match parse_args() {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("latency: {e}");
+            std::process::exit(2);
+        }
+    };
     let mut fw = firewall();
     let nav = fw.source_id(&format!("{P}00000103")).expect("nav");
     let arm_src = fw.source_id(&format!("{P}00000303")).expect("arm");
@@ -215,6 +277,10 @@ fn main() {
         wall.as_nanos() as f64 / n as f64
     );
 
+    let (p50, p99, max) = (pct(&lat, 0.5), pct(&lat, 0.99), lat[lat.len() - 1]);
+    let jitter = p99.saturating_sub(p50);
+    println!("jitter (p99 - p50): {jitter} ns");
+
     // Log2 histogram.
     let mut buckets = [0usize; 24];
     for &x in &lat {
@@ -237,5 +303,27 @@ fn main() {
             c,
             100.0 * c as f64 / n as f64
         );
+    }
+
+    // Budget gate (report-only until measured on the target controller).
+    let mut over = false;
+    for (name, got, budget) in [
+        ("p50", p50, budgets.p50),
+        ("p99", p99, budgets.p99),
+        ("max", max, budgets.max),
+        ("jitter", jitter, budgets.jitter),
+    ] {
+        if let Some(b) = budget {
+            let ok = got <= b;
+            over |= !ok;
+            println!(
+                "BUDGET: {name} {got} ns <= {b} ns: {}",
+                if ok { "ok" } else { "OVER" }
+            );
+        }
+    }
+    if over {
+        eprintln!("latency: budget exceeded");
+        std::process::exit(1);
     }
 }

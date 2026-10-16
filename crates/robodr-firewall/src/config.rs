@@ -43,8 +43,10 @@ pub enum FailBehaviour {
     ZeroVelocity,
     /// Re-emit the last **accepted** output on that channel, but only while it
     /// is younger than `max_hold_ns` (measured from when it was accepted, so a
-    /// run of consecutive rejections cannot extend it); afterwards, or if
-    /// nothing was accepted yet, emit zero.
+    /// run of consecutive rejections cannot extend it), never more than the
+    /// last **emitted** output (scaled down to a deceleration of it; zero if
+    /// zero was emitted last), and never under a gateway clock regression;
+    /// otherwise, or if nothing was accepted yet, emit zero.
     HoldLast { max_hold_ns: u64 },
     /// Enforcement disabled on this platform even with a locked profile: every
     /// command is forwarded unchanged and the would-have verdict is recorded
@@ -113,8 +115,12 @@ pub struct PlatformConfig {
     /// clock, between two foreign-triggered substitutes on one channel.
     /// `0` = no bound (every foreign command triggers one). Default 1 s.
     pub foreign_substitute_min_interval_ns: u64,
-    /// Capacity of the deviation output buffer (allocated once). Events beyond
-    /// it are dropped and counted until the caller drains.
+    /// Capacity of the deviation output buffer (allocated once). Identical
+    /// events coalesce; at most half of it may hold events from sources not
+    /// authorised on the channel; when full, lower-severity events are
+    /// evicted first and the rest dropped and counted until the caller drains
+    /// (see [`crate::EventBuffer`]). Each event push scans the buffer once,
+    /// so keep this in the hundreds.
     pub event_capacity: usize,
 }
 

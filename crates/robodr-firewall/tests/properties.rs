@@ -276,6 +276,17 @@ fn randomized_invariants_enforcing() {
                                     "hold exceeds the rejected request: {}",
                                     ctx()
                                 );
+                                // Nor more than what was last emitted
+                                // downstream, which must be recent (rev3
+                                // F1): a hold never steps the output up.
+                                let last = m.last_out.as_ref().filter(|(_, at)| {
+                                    now >= *at && now - at <= spec.state_reset_after_ns
+                                });
+                                assert!(
+                                    last.is_some_and(|(p, _)| decelerates(p, &sv)),
+                                    "hold exceeds the last emitted output: {}",
+                                    ctx()
+                                );
                             }
                         }
                     } else {
