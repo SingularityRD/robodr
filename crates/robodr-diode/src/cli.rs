@@ -24,6 +24,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 const MAX_KEYRING_FILE: u64 = 1024 * 1024;
+/// Keyring directive for a unit's robot-id allow-list.
+pub const ROBOTS_DIRECTIVE: &str = "robots:";
 /// Largest findings input file the pack CLI reads (1 GiB).
 pub const MAX_INPUT_FILE: u64 = 1024 * 1024 * 1024;
 
@@ -194,7 +196,14 @@ pub fn load_verifier(
 /// `<unit_id> <key_id> <key-file>`, where the key id must equal the
 /// file's) per line; `#` comments. Relative key-file paths are resolved
 /// against the keyring's directory. Each key file is loaded with
-/// [`load_verifier`]. Returns the keyring and warnings to print.
+/// [`load_verifier`].
+///
+/// A line `robots: <unit_id> <robot_id>...` lets batches of `unit_id`
+/// carry findings (and bundles) about those robots as well (a site console
+/// exporting for its fleet). Without such a line a unit may only report on
+/// itself. (`robots:` cannot be a unit id: `:` is not allowed in one.)
+///
+/// Returns the keyring and warnings to print.
 pub fn load_keyring(path: &Path, allow_hmac: bool) -> Result<(Keyring, Vec<String>), String> {
     let bytes = fsutil::read_capped(path, MAX_KEYRING_FILE)
         .map_err(|e| format!("keyring {}: {}", path.display(), read_err(e)))?;
@@ -208,6 +217,25 @@ pub fn load_keyring(path: &Path, allow_hmac: bool) -> Result<(Keyring, Vec<Strin
             continue;
         }
         let f: Vec<&str> = line.split_whitespace().collect();
+        if f.first() == Some(&ROBOTS_DIRECTIVE) {
+            let [_, unit, robots @ ..] = f.as_slice() else {
+                return Err(format!(
+                    "keyring line {}: expected `{ROBOTS_DIRECTIVE} <unit_id> <robot_id>...`",
+                    i + 1
+                ));
+            };
+            if robots.is_empty() {
+                return Err(format!(
+                    "keyring line {}: expected `{ROBOTS_DIRECTIVE} <unit_id> <robot_id>...`",
+                    i + 1
+                ));
+            }
+            for r in robots {
+                ring.allow_robot(unit, r)
+                    .map_err(|e| format!("keyring line {}: {e}", i + 1))?;
+            }
+            continue;
+        }
         let (unit, key_id, file) = match f.as_slice() {
             [u, file] => (*u, None, *file),
             [u, id, file] => (*u, Some(*id), *file),
@@ -244,6 +272,17 @@ fn resolve(base: &Path, p: &str) -> PathBuf {
     } else {
         base.join(p)
     }
+}
+
+/// `UNIT:FILE` (the unit id cannot contain `:`, the path may).
+pub fn parse_unit_file(s: &str) -> Result<(String, PathBuf), String> {
+    let (u, f) = s
+        .split_once(':')
+        .ok_or_else(|| format!("expected <unit>:<key-file>, got {s:?}"))?;
+    if !robodr_ocsf::validate::is_valid_robot_id(u) || f.is_empty() {
+        return Err(format!("bad <unit>:<key-file> {s:?}"));
+    }
+    Ok((u.to_string(), PathBuf::from(f)))
 }
 
 /// `unit:seq`.
@@ -306,6 +345,17 @@ mod tests {
         assert!(parse_args_with_switches(s(&["--x", "--x"]), &["a"], &["x"]).is_err());
         assert!(!parse_args(s(&["--a", "1"]), &["a"]).unwrap().flag("x"));
         assert!(parse_args(s(&["--x"]), &["a"]).is_err());
+    }
+
+    #[test]
+    fn unit_file() {
+        assert_eq!(
+            parse_unit_file("ugv-1:/k/a:b.pub").unwrap(),
+            ("ugv-1".into(), PathBuf::from("/k/a:b.pub"))
+        );
+        assert!(parse_unit_file("/k/a.pub").is_err());
+        assert!(parse_unit_file("ugv-1:").is_err());
+        assert!(parse_unit_file("a b:x").is_err());
     }
 
     #[test]

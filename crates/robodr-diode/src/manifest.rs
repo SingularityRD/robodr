@@ -37,6 +37,9 @@ pub const MAX_SIG_LEN: usize = robodr_blackbox::record::MAX_SIG_LEN;
 pub const MAX_KEY_ID_LEN: usize = robodr_blackbox::sign::MAX_KEY_ID_LEN;
 /// Longest data file name accepted.
 pub const MAX_FILE_NAME: usize = 64;
+/// Largest `batch_seq` (the 16 decimal digits of [`batch_dir_name`]). Keeps
+/// `seq + 1` far from overflow on both sides.
+pub const MAX_BATCH_SEQ: u64 = 9_999_999_999_999_999;
 
 const MANIFEST_DOMAIN: &[u8] = b"robodr-diode/manifest/v1\0";
 const BATCH_HASH_DOMAIN: &[u8] = b"robodr-diode/batch-hash/v1\0";
@@ -191,6 +194,9 @@ impl Manifest {
         }
         if self.batch_seq == 0 {
             return Err("batch_seq must be >= 1".into());
+        }
+        if self.batch_seq > MAX_BATCH_SEQ {
+            return Err(format!("batch_seq > {MAX_BATCH_SEQ}"));
         }
         match (&self.prev_batch_hash, self.batch_seq) {
             (None, 1) => {}
@@ -349,6 +355,13 @@ mod tests {
             ("semver", Box::new(|m| m.contract_version = "1.1".into())),
             ("unit", Box::new(|m| m.unit_id = "a/b".into())),
             ("seq0", Box::new(|m| m.batch_seq = 0)),
+            (
+                "seq max",
+                Box::new(|m| {
+                    m.batch_seq = u64::MAX;
+                    m.prev_batch_hash = Some("ab".repeat(32))
+                }),
+            ),
             (
                 "prev on 1",
                 Box::new(|m| m.prev_batch_hash = Some("ab".repeat(32))),

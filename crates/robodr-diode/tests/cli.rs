@@ -302,7 +302,8 @@ fn importer_holds_public_keys_only() {
     }
     // As a bundle key too.
     let pring = k.ring("pub.ring", &format!("{UNIT} unit.pub\n"));
-    let o = k.unpack(&pring, &["--bundle-key", sk.to_str().unwrap()]);
+    let bk = format!("{UNIT}:{}", sk.display());
+    let o = k.unpack(&pring, &["--bundle-key", &bk]);
     assert_eq!(o.status.code(), Some(1), "{}", err(&o));
 
     // Three-column form: the key id must match the file.
@@ -316,7 +317,8 @@ fn importer_holds_public_keys_only() {
     // The public key, world-readable: accepted.
     set_mode(&pk, 0o644);
     let three = k.ring("three.ring", &format!("{UNIT} {} unit.pub\n", kf.key_id));
-    let o = k.unpack(&three, &["--bundle-key", pk.to_str().unwrap()]);
+    let bk = format!("{UNIT}:{}", pk.display());
+    let o = k.unpack(&three, &["--bundle-key", &bk]);
     assert!(o.status.success(), "{}", err(&o));
     let rep: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(rep["accepted"].as_array().unwrap().len(), 1);
@@ -348,4 +350,47 @@ fn wrong_unit_key_is_quarantined_by_the_binary() {
     let rep: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(rep["quarantined"][0]["reason"]["code"], "unit_key_mismatch");
     assert!(rep["accepted"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn keyring_robots_directive_and_unit_bound_bundle_keys() {
+    let k = Keys::new("cli-robots");
+    let sk = k.path("unit.key");
+    let kf = KeyFile::generate_ed25519(None).unwrap();
+    kf.write_new(&sk).unwrap();
+    kf.to_public()
+        .unwrap()
+        .write_new(&k.path("unit.pub"))
+        .unwrap();
+    assert!(k.pack(&sk, &[]).status.success());
+    k.site.transfer_all();
+
+    // Malformed directives are configuration errors.
+    for body in [
+        format!("{UNIT} unit.pub\nrobots:\n"),
+        format!("{UNIT} unit.pub\nrobots: {UNIT}\n"),
+        format!("{UNIT} unit.pub\nrobots: {UNIT} a/b\n"),
+    ] {
+        let ring = k.ring("bad.ring", &body);
+        let o = k.unpack(&ring, &[]);
+        assert_eq!(o.status.code(), Some(1), "{body}: {}", err(&o));
+    }
+    // A bundle key must name its unit.
+    let ring = k.ring(
+        "ok.ring",
+        &format!(
+            "# console may report on two robots\n{UNIT} unit.pub\nrobots: {UNIT} ugv-100 ugv-101\n"
+        ),
+    );
+    let pk = k.path("unit.pub");
+    let o = k.unpack(&ring, &["--bundle-key", pk.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert!(err(&o).contains("<unit>:<key-file>"), "{}", err(&o));
+
+    let bk = format!("{UNIT}:{}", pk.display());
+    let o = k.unpack(&ring, &["--bundle-key", &bk, "--held-max-age-s", "0"]);
+    assert!(o.status.success(), "{}", err(&o));
+    let rep: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(rep["accepted"].as_array().unwrap().len(), 1);
+    assert_eq!(rep["errors"].as_array().unwrap().len(), 0);
 }

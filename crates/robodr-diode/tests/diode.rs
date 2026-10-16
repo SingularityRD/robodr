@@ -8,7 +8,7 @@ use robodr_diode::manifest::{
     batch_dir_name, FINDINGS_FILE, MANIFEST_FILE, MAX_MANIFEST_BYTES, SIGNATURE_FILE,
 };
 use robodr_diode::pack::MIN_BATCH_BYTES;
-use robodr_diode::unpack::RECORDS_FILE;
+use robodr_diode::unpack::{QUARANTINE_ENTRY, REASON_FILE, RECORDS_FILE};
 use robodr_diode::{ImportReport, Importer, Keyring, PackConfig, PackError, Packer};
 use std::fs;
 use std::os::unix::fs::symlink;
@@ -36,14 +36,12 @@ fn expect_quarantine(site: &Site, code: &str) -> ImportReport {
     assert_eq!(codes(&r), vec![code.to_string()], "{r:?}");
     assert!(imp.state().units.is_empty());
     let q = &r.quarantined[0];
-    assert!(q.moved_to.exists());
-    let reason_file = format!(
-        "{}.reason.json",
-        q.moved_to.file_name().unwrap().to_string_lossy()
-    );
+    assert!(fs::symlink_metadata(&q.moved_to).is_ok());
+    assert_eq!(q.moved_to.file_name().unwrap(), QUARANTINE_ENTRY);
+    let qdir = q.moved_to.parent().unwrap();
+    assert_eq!(qdir.parent().unwrap(), site.high.join("quarantine"));
     let rf: serde_json::Value =
-        serde_json::from_slice(&fs::read(site.high.join("quarantine").join(reason_file)).unwrap())
-            .unwrap();
+        serde_json::from_slice(&fs::read(qdir.join(REASON_FILE)).unwrap()).unwrap();
     assert_eq!(rf["reason"]["code"], code);
     assert!(site.inbox_entries().is_empty());
     r
@@ -66,7 +64,11 @@ fn round_trip_findings_and_bundle() {
     let mut cfg = site.import_cfg();
     cfg.partitions = Some(12);
     let mut imp = Importer::open(cfg, keyring()).unwrap();
-    imp.add_bundle_verifier(Box::new(HmacSha256Key::new(BB_KEY_ID, &BB_KEY).unwrap()));
+    imp.add_bundle_verifier(
+        UNIT,
+        Box::new(HmacSha256Key::new(BB_KEY_ID, &BB_KEY).unwrap()),
+    )
+    .unwrap();
     let r = imp.run(NOW).unwrap();
     assert!(r.is_clean(), "{r:?}");
     assert_eq!(r.accepted.len(), 1);
@@ -631,7 +633,11 @@ fn bundles_are_parsed_and_optionally_verified() {
     site.packer().pack(&[], &[bundle(2)], NOW).unwrap();
     site.transfer_all();
     let mut imp = site.importer();
-    imp.add_bundle_verifier(Box::new(HmacSha256Key::new(BB_KEY_ID, &[1; 32]).unwrap()));
+    imp.add_bundle_verifier(
+        UNIT,
+        Box::new(HmacSha256Key::new(BB_KEY_ID, &[1; 32]).unwrap()),
+    )
+    .unwrap();
     let r = imp.run(NOW).unwrap();
     assert_eq!(codes(&r), vec!["bundle_verify_failed"]);
 

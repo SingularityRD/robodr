@@ -13,7 +13,7 @@ diode or on controlled removable media.
                 └ pack-state.json                       Importer ◄───┘
                                                           │  ├─► out/<batch>/records.jsonl  ─► Kafka producer
                                                           │  ├─► processed/<batch>
-                                                          │  └─► quarantine/<batch> + .reason.json
+                                                          │  └─► quarantine/<entry>/{entry, reason.json}
                                                           └ state.json
 ```
 
@@ -46,9 +46,13 @@ Unknown fields are rejected.
 * Limits: manifest ≤ 128 KiB, signature file ≤ 4 KiB, ≤ 256 files, file names
   `findings.jsonl` / `bundle-NNNN.rbbx` only (allow-list `[a-z0-9][a-z0-9._-]{0,63}`,
   no `..`; separators, absolute paths, NUL, hidden and upper-case names are
-  impossible). Packer: data per batch 64 KiB + 1 … 1 GiB (default 16 MiB),
-  findings per batch ≥ 1 (default 10 000). Importer: declared data per batch
-  ≤ 256 MiB by default.
+  impossible). `batch_seq` 1 … 9 999 999 999 999 999 (16 digits).
+  Packer: data per batch 64 KiB + 1 … 256 MiB (default 16 MiB), findings per
+  batch ≥ 1 (default 10 000). Importer: declared data per batch ≤ 256 MiB by
+  default (`--max-batch-bytes`). The packer's ceiling **equals** the
+  importer's default, so no packer setting produces a batch that a
+  default-configured importer rejects; if you lower the importer's limit,
+  lower the packer's `--max-batch-bytes` to match (or below).
 
 ## Low side: `Packer` / `robodr-diode-pack`
 
@@ -83,7 +87,8 @@ robodr-diode-pack --outbox OUT --state pack-state.json --unit ugv-007 \
 ```
 robodr-diode-unpack --inbox IN --out OUT --quarantine Q --processed P \
   --state state.json --keyring keyring [--partitions 12] \
-  [--bundle-key bb-ugv-007.key.pub]... [--accept-gap ugv-007:42]... [--allow-hmac]
+  [--bundle-key ugv-007:bb-ugv-007.key.pub]... [--accept-gap ugv-007:42]... \
+  [--max-accept-gap N] [--held-max-age-s N] [--in-transit-max-age-s N] [--allow-hmac]
 ```
 
 Keyring file: one `<unit_id> <public-key-file>` per line (`#` comments;
@@ -94,12 +99,27 @@ Ed25519 *public* key file (`<key>.pub` from `keygen`, or `robodr-blackbox
 export-pub`), accepted whatever its mode; an Ed25519 *secret* key file is
 refused, so the SOC never holds a key that can sign a batch. Legacy HMAC key
 files (secret, 0600, owner-checked) are accepted only with `--allow-hmac`,
-with a warning; `--bundle-key FILE` (black-box keys for bundle verification)
-follows the same rules. A batch signed with an HMAC tag under an Ed25519 key
+with a warning; `--bundle-key UNIT:FILE` (a black-box key for bundle
+verification, **bound to UNIT**) follows the same rules.
+
+**Robot allow-list.** By default a unit's batches may only carry findings
+whose `entity_context.robot.id` is the unit itself, and bundles whose chain
+`device_id` is the unit; anything else is quarantined (`robot_not_allowed`,
+`bundle_device_not_allowed`), so a unit's key cannot speak for other robots.
+A unit that legitimately exports for others (a site console) gets a keyring
+line `robots: <unit_id> <robot_id>...` (library: `Keyring::allow_robot`). A batch signed with an HMAC tag under an Ed25519 key
 id is quarantined as `algorithm_mismatch` before any MAC is computed. Exit code 0
 when everything was accepted or a duplicate, 3 when something was quarantined
-or held, 1 on error, 2 on usage. The JSON report lists `accepted`,
-`duplicates`, `held`, `quarantined` and `in_transit` (dot-entries).
+or held or an entry hit an I/O error, 1 on error, 2 on usage. The JSON report
+lists `accepted`, `duplicates`, `held`, `quarantined`, `in_transit`
+(dot-entries) and `errors` (per-entry I/O failures).
+
+**One bad entry never stops the run.** An I/O error while handling an
+entry (e.g. a full `out/` disk) is listed under `errors`, the entry stays in
+the inbox for the next run, and the importer carries on with the remaining
+entries and units; an entry the importer may not read (permissions) is
+quarantined as `unreadable` (or, if it cannot even be moved, listed under
+`errors`). Only failing to list the inbox itself fails the run.
 
 Per inbox entry:
 
@@ -120,26 +140,43 @@ Per inbox entry:
    | `seq ≤ last`, different hash | quarantine `conflict` |
    | `seq ≤ last`, hash unknown (older than window, or in an accepted gap) | quarantine `replay` |
    | `seq > last+1` (or first contact with `seq > 1`) | **held** in the inbox, reported as a gap |
+   | same, held longer than `--held-max-age-s` (default 30 days, by directory mtime) | quarantine `held_expired` |
    | same, operator passed `--accept-gap unit:seq` | accept; gap recorded in state |
+   | same, but the gap skips more than `--max-accept-gap` (default 100 000) batches | quarantine `gap_too_large` |
 
    Batches are processed in sequence order, so reordered deliveries heal on
-   the run after the missing batch arrives.
+   the run after the missing batch arrives. Dot-entries (in transit) older
+   than `--in-transit-max-age-s` (default 24 h) are quarantined as
+   `stale_in_transit`. `0` disables either expiry.
 3. File checks: no entries besides the listed files and the two manifest
    files; each listed file regular, exact size, exact SHA-256 (read capped at
    the declared size). Each findings line is re-validated with
-   `robodr_ocsf::parse_and_validate`; count and time range must match. Each
-   bundle is parsed; if a black-box verifier for its key id is configured
-   (`--bundle-key`), its signatures and chain are verified too.
+   `robodr_ocsf::parse_and_validate` and its robot id checked against the
+   unit's allow-list; count and time range must match. Each bundle is parsed
+   and its `device_id` checked the same way; if a black-box key with its key
+   id is configured (`--bundle-key`) it must be bound to this batch's unit
+   (else `bundle_key_unit_mismatch`), and its signatures and chain are
+   verified. Files are checked and copied one at a time; findings are read in
+   64 KiB chunks (lines ≤ 64 KiB) and their records streamed to the staging
+   directory, so memory stays around one bundle / one chunk, not the batch.
 4. Emit `out/<batch>/` via a staging directory and `rename`: `records.jsonl`
    (one record per line: `{topic, partition, key, headers, value, diode:
    {unit_id, batch_seq, batch_hash, line}}`, same key/partition/headers as
    `robodr_ocsf::record`), the bundles, and copies of the signed manifest and
    signature. Then atomically update the state, then move the batch to
-   `processed/`. Re-running after a crash at any point is idempotent.
+   `processed/`. Re-running after a crash at any point is idempotent. If
+   `out/<batch>/` already exists, its `MANIFEST.json` decides: the same bytes
+   → output of an interrupted earlier run, reused; different bytes (e.g. a
+   new batch 1 after a deliberate state reset) → this batch is emitted as
+   `out/<batch>.<first 16 hex of its batch hash>/`. An accepted batch always
+   has its own records on disk; the report's `output` names the directory.
 
-Anything failing a check goes to `quarantine/<name>` (suffixed `.1`, `.2`, …
-if taken) with `<name>.reason.json` (`reason.code`); the state does not
-advance, so an intact re-send of the same batch is accepted later.
+Anything failing a check goes to its own directory `quarantine/<name>/`
+(or `<name>.<ns>-<pid>-<n>` if taken) holding the entry as `entry` and the
+reason as `reason.json` (`reason.code`). Inbox names therefore cannot
+collide with, or masquerade as, reason files, and earlier quarantines can
+never exhaust the namespace. The state does not advance, so an intact
+re-send of the same batch is accepted later.
 
 ## Forward-error strategy
 
@@ -172,7 +209,14 @@ outbox until the SOC confirms receipt out of band.
   predecessor; the importer then quarantines the new batches (`conflict` /
   `replay`). Recovery is a manual decision: back up `pack-state.json` with the
   black-box key material, or reset that unit's entry in the importer state
-  deliberately. Likewise an accepted gap cannot be filled later.
+  deliberately (the new batches are then emitted under hash-suffixed `out/`
+  names next to the old ones). Likewise an accepted gap cannot be filled
+  later.
+* **Robot binding** is by id only: a unit key (or a console allowed to
+  report on a robot) can still assert anything *about* that robot. The
+  allow-list limits which robots a compromised unit key can speak for.
+* **Expiry** uses the entry's mtime, which whoever writes the inbox
+  controls; it bounds clutter, it is not a security control.
 * **Freshness**: a captured old batch replayed into the inbox is recognised
   as a duplicate only while its hash is in the 1024-batch window; older ones
   are quarantined as `replay`, never re-emitted. `created_at` comes from the
