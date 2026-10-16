@@ -60,8 +60,10 @@ if [[ -n "$sbom_dir" ]]; then
     find "$sbom_dir" -maxdepth 1 -type f -name '*.cdx.json' -exec install -m 0644 {} "$b/sbom/" \;
 fi
 
-(cd "$b" && find . -type f ! -name SHA256SUMS -printf '%P\n' | LC_ALL=C sort |
-    xargs -r -d '\n' sha256sum >SHA256SUMS)
+# Hash into a file outside the tree being hashed, then move it in.
+(cd "$b" && find . -type f -printf '%P\n' | LC_ALL=C sort |
+    xargs -r -d '\n' sha256sum >"$stage/SHA256SUMS")
+mv "$stage/SHA256SUMS" "$b/SHA256SUMS"
 
 find "$b" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 tarball="$out/$name-offline.tar.gz"
