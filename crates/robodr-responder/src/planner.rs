@@ -12,10 +12,12 @@
 //! 6. approval gates: unknown state, human in command, take-off/landing,
 //!    above `auto_max_step`;
 //! 7. build the cumulative action list (Record .. max step);
-//! 8. observe mode (profile unlocked or policy not OEM-validated) → Record
-//!    only, with the would-have plan attached;
-//! 9. invariant backstop: [`check_invariants`]; on violation the plan is
-//!    replaced by Record + approval (never reached with a validated policy).
+//! 8. observe mode (deviation in [`robodr_events::Mode::Observe`], profile
+//!    unlocked or policy not OEM-validated) → Record only, with the
+//!    would-have plan attached;
+//! 9. invariant backstop: [`check_invariants_for_deviation`]; on violation the
+//!    plan is replaced by Record + approval (never reached with a validated
+//!    policy).
 
 use std::fmt;
 
@@ -200,8 +202,11 @@ pub(crate) fn plan_with(
         rationale: why,
     };
 
-    // 8. Observe mode.
-    let observe_reason = if !ctx.profile_locked {
+    // 8. Observe mode. The deviation's own mode comes first: a detector that
+    //    reports in observe mode is never acted upon, whatever the context.
+    let observe_reason = if deviation.is_observe_only() {
+        Some(Reason::ObserveModeDeviation)
+    } else if !ctx.profile_locked {
         Some(Reason::ObserveModeProfileUnlocked)
     } else if !policy.oem_validated {
         Some(Reason::ObserveModePolicyNotValidated)
@@ -223,7 +228,7 @@ pub(crate) fn plan_with(
     }
 
     // 9. Backstop.
-    (enforce(plan, state, ctx), desired)
+    (enforce(plan, deviation, state, ctx), desired)
 }
 
 /// Replace a plan that violates an invariant with Record + approval. With a
@@ -231,15 +236,17 @@ pub(crate) fn plan_with(
 /// only ever make the response *less* active.
 pub(crate) fn enforce(
     plan: ResponsePlan,
+    deviation: &Deviation,
     state: SafetyState,
     ctx: &OperationalContext,
 ) -> ResponsePlan {
-    match check_invariants(&plan, state, ctx) {
+    match check_invariants_for_deviation(&plan, deviation, state, ctx) {
         Ok(()) => plan,
         Err(_) => ResponsePlan {
             max_step: Step::Record,
             actions: vec![ResponseAction::Record],
             requires_human_approval: true,
+            observe_only: plan.observe_only || deviation.is_observe_only(),
             would_have: None,
             ..plan
         },
@@ -260,6 +267,9 @@ pub enum Violation {
     BadLimitFactor,
     SafeBehaviourInvalidForPlatform,
     NestedWouldHave,
+    /// The deviation was raised in observe mode but the plan is not an
+    /// observe-only, Record-only plan.
+    ObserveOnlyDeviationActed,
 }
 
 impl fmt::Display for Violation {
@@ -268,9 +278,31 @@ impl fmt::Display for Violation {
     }
 }
 
+/// [`check_invariants`] plus the invariants that depend on the deviation the
+/// plan answers. Currently: a deviation in [`robodr_events::Mode::Observe`]
+/// must get an `observe_only` plan whose actions are `Record` only
+/// ([`Violation::ObserveOnlyDeviationActed`]). Prefer this over
+/// [`check_invariants`] whenever the deviation is at hand.
+pub fn check_invariants_for_deviation(
+    plan: &ResponsePlan,
+    deviation: &Deviation,
+    state: SafetyState,
+    ctx: &OperationalContext,
+) -> Result<(), Violation> {
+    check_invariants(plan, state, ctx)?;
+    if deviation.is_observe_only()
+        && (!plan.observe_only || plan.actions.iter().any(|a| a.step() != Step::Record))
+    {
+        return Err(Violation::ObserveOnlyDeviationActed);
+    }
+    Ok(())
+}
+
 /// Check every code-level invariant of a plan against the state and context
 /// it was made for. Public so an executor can re-check a plan it received
-/// (e.g. from the fleet) before acting on it.
+/// (e.g. from the fleet) before acting on it. It does not see the deviation,
+/// so it cannot check the deviation's observe mode; use
+/// [`check_invariants_for_deviation`] for that.
 pub fn check_invariants(
     plan: &ResponsePlan,
     state: SafetyState,

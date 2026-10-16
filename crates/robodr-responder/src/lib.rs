@@ -26,12 +26,14 @@
 //!   authority.
 //! * `Unknown` safety state, a human in command (teleop/manual) or a transient
 //!   phase (take-off/landing) → motion-affecting steps need human approval.
-//! * Observe mode (profile not locked, or policy not OEM-validated) → Record
-//!   only, with the would-have plan attached.
+//! * Observe mode (deviation raised in `Mode::Observe`, profile not locked, or
+//!   policy not OEM-validated) → Record only, with the would-have plan
+//!   attached.
 //! * Safe behaviours must be valid for the platform family.
 //!
 //! The policy is validated at load ([`ResponsePolicy::validate`]) and the
-//! plan is re-checked at the end of planning ([`check_invariants`]); a
+//! plan is re-checked at the end of planning
+//! ([`check_invariants_for_deviation`]); a
 //! violating plan is replaced by Record + approval, so failure modes only ever
 //! make the response *less* active.
 //!
@@ -50,7 +52,7 @@ pub use action::{
 };
 pub use autosecops::{action_class, ActionClass, Approval, Reversibility};
 pub use escalation::Responder;
-pub use planner::{check_invariants, plan_stateless, Violation};
+pub use planner::{check_invariants, check_invariants_for_deviation, plan_stateless, Violation};
 pub use policy::{
     EscalationPolicy, Matrix, PolicyError, ResponsePolicy, RuleOverride, SeverityRow,
 };

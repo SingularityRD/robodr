@@ -213,12 +213,27 @@ pub enum Reason {
     InvalidLimitFactor,
     /// A configured safe behaviour is not valid for the platform; dropped.
     InvalidSafeBehaviour { behaviour: SafeBehaviour },
+    /// The deviation itself was raised in observe mode
+    /// (`robodr_events::Mode::Observe`): informational, never acted upon.
+    ObserveModeDeviation,
     /// Profile not locked: observe mode.
     ObserveModeProfileUnlocked,
     /// Policy not OEM-validated: observe mode.
     ObserveModePolicyNotValidated,
-    /// An equal-or-lower plan was issued within the re-issue interval.
+    /// An equal-or-higher auto-executable plan was issued for the same
+    /// (source, rule) within the re-issue interval: reduced to Record.
     RateLimited { since_ms: u64 },
+    /// An equal-or-higher motion-affecting step, from a plan of equal-or-higher
+    /// severity, was issued robot-wide within the re-issue interval and is
+    /// still in force (plans never relax). This plan's redundant
+    /// motion-affecting actions were dropped; its Record/Restrict actions,
+    /// which target its own source, are kept.
+    MotionAlreadyRequested { step: Step, since_ms: u64 },
+    /// The source shares the overflow bucket (source table full). Its shared
+    /// escalation `level` / hold `held` would have made the plan await
+    /// approval; the plan a fresh source gets (`result`, auto-executable) was
+    /// used instead, so a flood cannot make a response less automatic.
+    OverflowStateNotApplied { level: u8, held: Step, result: Step },
 }
 
 impl fmt::Display for Reason {
@@ -264,13 +279,29 @@ impl fmt::Display for Reason {
                     "safe behaviour {behaviour:?} invalid for platform: dropped"
                 )
             }
+            Reason::ObserveModeDeviation => write!(f, "observe mode (deviation is observe-only)"),
             Reason::ObserveModeProfileUnlocked => write!(f, "observe mode (profile unlocked)"),
             Reason::ObserveModePolicyNotValidated => {
                 write!(f, "observe mode (policy not OEM-validated)")
             }
             Reason::RateLimited { since_ms } => {
-                write!(f, "rate limited ({since_ms} ms since last issue)")
+                write!(
+                    f,
+                    "rate limited ({since_ms} ms since last issue for this source and rule)"
+                )
             }
+            Reason::MotionAlreadyRequested { step, since_ms } => write!(
+                f,
+                "{step:?} already requested robot-wide {since_ms} ms ago: motion part dropped"
+            ),
+            Reason::OverflowStateNotApplied {
+                level,
+                held,
+                result,
+            } => write!(
+                f,
+                "shared overflow state (+{level}, held {held:?}) not applied: fresh-source plan {result:?}"
+            ),
         }
     }
 }
@@ -308,7 +339,8 @@ impl fmt::Display for Rationale {
 ///
 /// Execution contract for whoever consumes it:
 /// * `observe_only` → only `Record` is in `actions`; `would_have` holds the
-///   plan that enforcement mode would have produced.
+///   plan that enforcement mode would have produced. Always the case for a
+///   deviation raised in observe mode.
 /// * `requires_human_approval` → only `Record` may be executed before a human
 ///   approves; everything else waits.
 /// * Plans are cumulative and never relax anything: a later, lower plan does
@@ -325,7 +357,9 @@ pub struct ResponsePlan {
     pub actions: Vec<ResponseAction>,
     pub requires_human_approval: bool,
     pub observe_only: bool,
-    /// Set when the rate limiter reduced this plan to Record.
+    /// Set when the rate limiter reduced this plan to Record because the same
+    /// (source, rule) got an equal-or-higher auto-executable plan within the
+    /// re-issue interval. Never set because of another source's activity.
     pub suppressed: bool,
     /// In observe mode: what enforcement mode would have done.
     pub would_have: Option<Box<ResponsePlan>>,
