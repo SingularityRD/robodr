@@ -275,6 +275,10 @@ fn open_recorder(
     }
 }
 
+/// Message signed by a would-be finding key to prove it is not the
+/// black-box key (domain-separated: neither a record nor a finding).
+const KEY_SEPARATION_PROBE: &[u8] = b"robodr-agent/finding-key-separation-probe/v1\0";
+
 /// Note payload for an agent fault in the black box.
 #[derive(Serialize)]
 struct FaultNote<'a> {
@@ -556,12 +560,38 @@ impl Agent {
     /// Sign every finding record with `signer` (detached signature in the
     /// `robodr-finding-sig` header; see `robodr_ocsf::sig`). Must be an
     /// Ed25519 key; it is probed once here so a broken backend fails at
-    /// start. Use a key dedicated to findings, not the black-box key.
+    /// start. It must be a key dedicated to findings: the black-box key is
+    /// refused ([`AgentError::Config`]), by key id and by a signature test
+    /// (a probe signed with the finding key that the black-box key's own
+    /// verifier accepts is the same key under another name). Findings leave
+    /// the unit; a shared key would let anyone who obtains it from a
+    /// finding consumer's side of the deployment forge evidence too, and
+    /// the two keys rotate on different schedules.
     ///
     /// If signing a finding later fails, the finding is still emitted
     /// **unsigned** and the failure is reported in the outcome's errors:
     /// strict consumers will drop it, the black box still has the evidence.
     pub fn with_finding_signer(mut self, signer: Box<dyn Signer>) -> Result<Self, AgentError> {
+        if signer.key_id() == self.signer.key_id() {
+            return Err(AgentError::Config(format!(
+                "finding signer: key id {:?} is the black-box key; use a dedicated finding key",
+                signer.key_id()
+            )));
+        }
+        let probe = signer
+            .sign(KEY_SEPARATION_PROBE)
+            .map_err(|e| AgentError::Config(format!("finding signer: {e}")))?;
+        let same = match &self.verifier {
+            Some(v) => v.verify(KEY_SEPARATION_PROBE, &probe),
+            None => self.signer.verify_own(KEY_SEPARATION_PROBE, &probe) == Some(true),
+        };
+        if same {
+            return Err(AgentError::Config(
+                "finding signer: it is the black-box key under another key id; use a \
+                 dedicated finding key"
+                    .into(),
+            ));
+        }
         robodr_ocsf::sign_value("", signer.as_ref())
             .map_err(|e| AgentError::Config(format!("finding signer: {e}")))?;
         self.finding_signer = Some(signer);
@@ -618,6 +648,29 @@ impl Agent {
         self.recorder
             .as_ref()
             .map_or(&[], Recorder::quarantined_at_open)
+    }
+
+    /// Evidence trouble the current recorder found when it was opened (or
+    /// last reopened after an outage): quarantined segments with the
+    /// recorder's severity, damage quarantined from the active segment,
+    /// truncation (always critical). Empty while the black box is
+    /// unavailable.
+    pub fn blackbox_open_incidents(&self) -> &[robodr_blackbox::OpenIncident] {
+        self.recorder.as_ref().map_or(&[], Recorder::open_incidents)
+    }
+
+    /// Whether the black box has an external head anchor configured
+    /// (`RecorderConfig::head_anchor`). Without one, a cut of the newest
+    /// records combined with a rollback of `head.json` (or a wiped store)
+    /// is not detectable on the unit.
+    pub fn blackbox_anchored(&self) -> bool {
+        self.blackbox_cfg.head_anchor.is_some()
+    }
+
+    /// Failed writes / reads of the external head anchor by the current
+    /// recorder (0 while the black box is unavailable).
+    pub fn blackbox_anchor_failures(&self) -> u64 {
+        self.recorder.as_ref().map_or(0, Recorder::anchor_failures)
     }
 
     /// `head.json` marks the current recorder could not write.

@@ -22,6 +22,8 @@
 //! | queue latency or tick delay > `lag_ms` | [`rules::PIPELINE_LAG`] | Medium | once per lag episode |
 //! | spool full / spool write errors | [`rules::SPOOL_FULL`] | High | on increase, at most every `health_report_ms` |
 //! | black box failing (evidence lost) | [`rules::EVIDENCE_DEGRADED`] | High | once per outage |
+//! | black box quarantined evidence at open | [`rules::EVIDENCE_QUARANTINED`] | the recorder's (High / Critical) | once per recorder open (daemon) |
+//! | black box found its tail cut at open | [`rules::EVIDENCE_TRUNCATED`] | Critical | once per recorder open (daemon) |
 //!
 //! The daemon hands these to `Agent::handle_external` as
 //! `Detector::SelfHealth`, which stamps them observe-only: a health problem
@@ -43,8 +45,12 @@ pub mod rules {
     pub const PIPELINE_LAG: &str = "robot.agent.pipeline_lag";
     pub const SPOOL_FULL: &str = "robot.agent.spool_full";
     pub const EVIDENCE_DEGRADED: &str = "robot.agent.evidence_degraded";
-    /// The black box quarantined damaged closed segments when it was opened.
+    /// The black box quarantined damaged segments (or damage in its active
+    /// segment) when it was opened; severity is the recorder's.
     pub const EVIDENCE_QUARANTINED: &str = "robot.agent.evidence_quarantined";
+    /// The black box found authentic proof that its newest records were cut
+    /// (`TruncationDetected`) when it was opened. Always Critical.
+    pub const EVIDENCE_TRUNCATED: &str = "robot.agent.evidence_truncated";
     /// The correlation engine evicted or refused pending state.
     pub const CORRELATION_PRESSURE: &str = "robot.agent.correlation_pressure";
 }

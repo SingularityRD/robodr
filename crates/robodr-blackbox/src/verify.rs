@@ -90,6 +90,7 @@
 //! that a hard failure.
 
 use crate::crypto::to_hex;
+use crate::export::{cursor_signing_message, SignedCursor};
 use crate::export::{Anchor, Checkpoint};
 use crate::record::{
     scan_frames, short_hex, signing_message, ChainIdentity, GenesisPayload, Hash, KeyRef,
@@ -97,7 +98,10 @@ use crate::record::{
     SegmentStartPayload, TailKind, TruncationPayload, ZERO_HASH,
 };
 use crate::sign::Verifier;
-use crate::store::{list_segments, parse_segment_file_name, CHECKPOINT_FILE, HEAD_FILE};
+use crate::store::{
+    list_segments, parse_segment_file_name, CHECKPOINT_FILE, CURSOR_FILE, HEAD_FILE,
+    RECOVERY_PIN_FILE,
+};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -1478,7 +1482,11 @@ pub fn read_segments(dir: &Path) -> std::io::Result<Vec<SegmentData>> {
 /// Verify a recorder directory. If `opts.checkpoint` is unset, the
 /// directory's own `checkpoint.json` (written at every seal) is used, or
 /// its `head.json` high-water mark (written every few records, see
-/// [`crate::store`]) when that one authenticates and names a later record.
+/// [`crate::store`]) or `recovery-pin.json` when one of those authenticates
+/// and names a later record. An authentic `export-cursor.json` beyond the
+/// stored head is reported as a `TruncatedTail` too. These are the state
+/// files [`crate::Recorder::open`] treats as truncation proof, so a
+/// directory is not "intact" here and truncated at its next open.
 /// Both are only as trustworthy as the directory, so keep an external copy
 /// (or a [`crate::store::HeadAnchor`]) too.
 pub fn verify_dir(
@@ -1506,7 +1514,17 @@ pub fn verify_dir(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e),
         };
-        if let Some(m) = mark.filter(|m| m.verify(verifier)) {
+        // The recovery pin (left by a crash between a recovery cut and its
+        // record) is truncation proof to the recorder; same rule.
+        let pin = match std::fs::read(dir.join(RECOVERY_PIN_FILE)) {
+            Ok(b) => std::str::from_utf8(&b).ok().and_then(Checkpoint::from_json),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        for m in [mark, pin].into_iter().flatten() {
+            if !m.verify(verifier) {
+                continue;
+            }
             let newer = match &o.checkpoint {
                 Some(c) if c.chain_id == m.chain_id && c.verify(verifier) => m.seq > c.seq,
                 _ => true,
@@ -1516,7 +1534,37 @@ pub fn verify_dir(
             }
         }
     }
+    // The export cursor: an authentic position beyond the stored head is
+    // truncation to the recorder (it is signed over a different message,
+    // so it cannot stand in for the checkpoint).
+    let cursor = match std::fs::read(dir.join(CURSOR_FILE)) {
+        Ok(b) => std::str::from_utf8(&b)
+            .ok()
+            .and_then(SignedCursor::from_json)
+            .filter(|c| verifier.verify_any(&cursor_signing_message(&c.anchor), &c.sig)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
     let mut report = verify_segments(&segments, verifier, &o);
+    if let Some(c) = cursor {
+        let chain = to_hex(&c.anchor.chain_id);
+        let shown = report.findings.iter().any(|f| {
+            matches!(f.kind, FindingKind::TruncatedTail { checkpoint_seq, .. }
+                if checkpoint_seq >= c.anchor.seq)
+        });
+        if report.chain_id.as_deref() == Some(chain.as_str())
+            && report.last_seq.is_none_or(|l| c.anchor.seq > l)
+            && !shown
+        {
+            report.push(Finding::new(
+                FindingKind::TruncatedTail {
+                    checkpoint_seq: c.anchor.seq,
+                    last_seq: report.last_seq,
+                },
+                None,
+            ));
+        }
+    }
     if unreadable {
         report.push(Finding::new(
             FindingKind::CheckpointInvalid {

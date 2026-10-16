@@ -110,10 +110,20 @@
 //!
 //! Every tick writes the black box's `head.json` high-water mark if records
 //! were appended since the last one (`Agent::mark_blackbox_head`), bounding
-//! the unmarked tail in time on a quiet bus. Damaged closed segments that
-//! the recorder quarantined when it opened (or reopened after an outage)
-//! are reported once as the High, observe-only self-health finding
-//! `robot.agent.evidence_quarantined`.
+//! the unmarked tail in time on a quiet bus. What the recorder found when it
+//! opened (or reopened after an outage) is reported once per recorder as
+//! observe-only self-health findings with the recorder's own severity:
+//! quarantined segments and damage as `robot.agent.evidence_quarantined`
+//! (High = failing media, Critical = tampering, e.g. a stray segment file
+//! or a closed segment cut on a frame boundary), truncation as Critical
+//! `robot.agent.evidence_truncated`.
+//!
+//! Without `blackbox.head_anchor` the daemon warns at start and the status
+//! file says `"blackbox": {"anchored": false, ...}`: `head.json` alone
+//! cannot reveal a cut of the newest records combined with a rollback of
+//! `head.json`, or a wiped store. The `file` anchor is only as strong as
+//! the storage it lives on; a deployment needs a TPM NV counter or a
+//! remote receiver behind `robodr_blackbox::HeadAnchor`.
 //!
 //! # Finding signatures
 //!
@@ -315,6 +325,21 @@ struct InputStatus<'a> {
     end_error: Option<String>,
 }
 
+/// The black box's external high-water-mark anchor, as configured.
+#[derive(Serialize)]
+struct BlackboxStatus {
+    /// An external head anchor is configured. `false` = a cut of the
+    /// newest records plus a rolled-back `head.json`, or a wiped store,
+    /// cannot be detected on the unit. Never `true` without one.
+    anchored: bool,
+    /// `"none"` or the configured kind (`"file"`).
+    anchor_kind: &'static str,
+    /// Failed anchor reads/writes by the current recorder.
+    anchor_failures: u64,
+    /// `head.json` marks the current recorder could not write.
+    mark_failures: u64,
+}
+
 #[derive(Serialize)]
 struct Status<'a> {
     /// The safety state plans are graded by right now.
@@ -346,6 +371,8 @@ struct Status<'a> {
     /// Findings carry a `robodr-finding-sig` signature.
     signs_findings: bool,
     evidence_degraded: bool,
+    /// Black-box anchoring (see `blackbox.head_anchor`).
+    blackbox: BlackboxStatus,
     queue_bytes: usize,
     queue_bytes_max: usize,
 }
@@ -402,8 +429,9 @@ struct Daemon<'a> {
     correlation_pressure_reported: u64,
     /// When the last pressure finding was raised (daemon ms).
     correlation_pressure_at_ms: Option<u64>,
-    /// Quarantined segment list last reported.
-    quarantine_reported: Vec<u64>,
+    /// Recorder generation (`AgentStats::blackbox_reopens`) whose open
+    /// incidents were last reported.
+    incidents_reported: Option<u64>,
 }
 
 fn ms(d: Duration) -> u64 {
@@ -507,13 +535,17 @@ impl<'a> Daemon<'a> {
             site: cfg.robot.site.clone(),
             firmware: None,
         };
-        let mut acfg = AgentConfig::new(
-            robot,
-            profile,
-            r.policy.clone(),
-            context,
-            RecorderConfig::new(&cfg.blackbox.dir, &cfg.robot.id, &r.boot_id),
-        );
+        let mut bcfg = RecorderConfig::new(&cfg.blackbox.dir, &cfg.robot.id, &r.boot_id);
+        match &cfg.blackbox.head_anchor {
+            Some(crate::config::HeadAnchorConfig::File { path }) => {
+                let a = robodr_blackbox::FileHeadAnchor::new(path)
+                    .map_err(|e| DaemonError::Config(format!("blackbox.head_anchor: {e}")))?;
+                bcfg.head_anchor = Some(Arc::new(a));
+            }
+            // Never claim anchoring without one (status: anchored false).
+            None => {}
+        }
+        let mut acfg = AgentConfig::new(robot, profile, r.policy.clone(), context, bcfg);
         acfg.profile_version = robodr_commission::trust::version_label(
             pipeline.profile(),
             pipeline.status() == &ProfileStatus::Enforcing,
@@ -721,7 +753,7 @@ impl<'a> Daemon<'a> {
             correlator,
             correlation_pressure_reported: 0,
             correlation_pressure_at_ms: None,
-            quarantine_reported: Vec::new(),
+            incidents_reported: None,
         };
         #[derive(Serialize)]
         struct StartNote<'b> {
@@ -753,7 +785,7 @@ impl<'a> Daemon<'a> {
             let _ = writeln!(d.log, "robodr-agentd: start note not recorded: {e:?}");
         }
         d.profile_witness(accepted_ok);
-        d.evidence_quarantine();
+        d.evidence_incidents();
         let names: Vec<String> = d.inputs.iter().map(|i| sanitize(&i.name)).collect();
         let _ = writeln!(
             d.log,
@@ -1242,27 +1274,66 @@ impl<'a> Daemon<'a> {
         self.emit(o);
     }
 
-    /// Report newly quarantined black-box segments (once per recorder open).
-    fn evidence_quarantine(&mut self) {
-        let q = self.agent.blackbox_quarantined();
-        if q.is_empty() || q == self.quarantine_reported.as_slice() {
+    /// Report what the black box found when it was opened (or reopened
+    /// after an outage), once per recorder: quarantined segments and
+    /// damage as `robot.agent.evidence_quarantined` with the highest
+    /// severity the recorder gave them (High = failing media, Critical =
+    /// tampering), truncation as Critical `robot.agent.evidence_truncated`.
+    /// Both are observe-only self-health findings.
+    fn evidence_incidents(&mut self) {
+        use robodr_blackbox::OpenIncident;
+        let generation = self.agent.stats().blackbox_reopens;
+        if self.incidents_reported == Some(generation) {
             return;
         }
-        let q = q.to_vec();
-        let detail = format!(
-            "the black box found {} damaged closed segment(s) ({}) when it was opened; they \
-             were copied to quarantine/ and documented by a signed recovery record, and \
-             recording continued: the storage is failing or the log was edited",
-            q.len(),
-            q.iter().map(u64::to_string).collect::<Vec<_>>().join(", ")
-        );
-        self.quarantine_reported = q;
-        let dev = robodr_events::Deviation::new(
-            health_rules::EVIDENCE_QUARANTINED,
-            robodr_events::Severity::High,
-            detail,
-        );
-        self.self_health("agentd:blackbox", dev);
+        let incidents = self.agent.blackbox_open_incidents().to_vec();
+        if self.agent.evidence_degraded() && incidents.is_empty() {
+            // No recorder right now: look again once it is back.
+            return;
+        }
+        self.incidents_reported = Some(generation);
+        let (trunc, damage): (Vec<_>, Vec<_>) = incidents
+            .iter()
+            .partition(|i| matches!(i, OpenIncident::TruncationDetected { .. }));
+        if let Some(sev) = damage.iter().map(|i| i.severity()).max() {
+            let list = damage
+                .iter()
+                .map(|i| format!("[{:?}] {i}", i.severity()))
+                .collect::<Vec<_>>()
+                .join("; ");
+            let detail = format!(
+                "the black box quarantined {} damaged evidence item(s) when it was opened; \
+                 they were copied to quarantine/ and documented by signed recovery records, and \
+                 recording continued: {}: {list}",
+                damage.len(),
+                if sev >= robodr_events::Severity::Critical {
+                    "the log was edited (tampering), not plausible storage failure"
+                } else {
+                    "the storage is failing or the log was edited"
+                }
+            );
+            let dev =
+                robodr_events::Deviation::new(health_rules::EVIDENCE_QUARANTINED, sev, detail);
+            self.self_health("agentd:blackbox", dev);
+        }
+        if !trunc.is_empty() {
+            let list = trunc
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ");
+            let detail = format!(
+                "the black box found authentic evidence of records beyond its head when it was \
+                 opened: the log was cut (signed TruncationDetected record written, sequence \
+                 numbers not reused): {list}"
+            );
+            let dev = robodr_events::Deviation::new(
+                health_rules::EVIDENCE_TRUNCATED,
+                robodr_events::Severity::Critical,
+                detail,
+            );
+            self.self_health("agentd:blackbox", dev);
+        }
     }
 
     /// Correlation housekeeping: expire state on a quiet bus; report a
@@ -1449,7 +1520,7 @@ impl<'a> Daemon<'a> {
             self.recovery_note(&r);
         }
         self.correlation_tick();
-        self.evidence_quarantine();
+        self.evidence_incidents();
         self.mark_head();
         for f in self.agent.take_faults() {
             let _ = writeln!(
@@ -1536,6 +1607,18 @@ impl<'a> Daemon<'a> {
             correlation: self.correlator.as_ref().map(|c| *c.stats()),
             signs_findings: self.agent.signs_findings(),
             evidence_degraded: self.agent.evidence_degraded(),
+            blackbox: BlackboxStatus {
+                anchored: self.agent.blackbox_anchored(),
+                anchor_kind: self
+                    .r
+                    .config
+                    .blackbox
+                    .head_anchor
+                    .as_ref()
+                    .map_or("none", |a| a.kind()),
+                anchor_failures: self.agent.blackbox_anchor_failures(),
+                mark_failures: self.agent.blackbox_mark_failures(),
+            },
             queue_bytes: self.budget.used(),
             queue_bytes_max: self.budget.max(),
         };

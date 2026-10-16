@@ -314,9 +314,13 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
      names the file, its SHA-256 and size, the count of frames in it with a
      valid hash and this chain's id, the lowest/highest of them whose
      signature verified (`discarded_seqs`), `crash_plausible: false` and a
-     severity: `high` for framing/hash damage (what failing media produces),
+     severity: `high` only for framing/hash damage (what failing media
+     produces) in a segment older than the one the recorder chains onto;
      `critical` for authentic-looking records that do not belong (foreign
-     chain, bad signature, broken cross-segment link, missing seal);
+     chain, bad signature, broken cross-segment link), for a segment that
+     parses cleanly but holds no records or lacks its final seal (frames
+     removed on a frame boundary), and for any damaged segment newer than
+     the newest intact one;
   3. only then is the original unlinked.
 
   A crash between 1 and 2 leaves an extra copy in `quarantine/` and the step
@@ -332,6 +336,18 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
   damage (it is a missing `previous_keys` after a rotation): open refuses.
   Open also refuses when the active segment is empty and no closed segment
   is intact (no trustworthy head).
+
+  **Stray segment files** (rev5): if the newest segment file holding
+  records does not end with a seal, it is the live segment (a successor is
+  created only after a seal is fsynced), and every file above it (empty,
+  zeros or garbage) is quarantined the same way as a *critical* stray
+  file, instead of turning the live segment into a "closed segment without
+  a seal". More than 64 stray files refuse open. Signature work on
+  untrusted frames (a damaged segment, the frames after a hole in the
+  active segment) is capped at 32 frames from each end; a forged frame
+  among those makes the hole not crash-plausible.
+  `Recorder::open_incidents()` lists what an open found (quarantines with
+  their severity, truncation) for the host to report.
 - **High-water mark (`head.json`) and external anchor:** checkpoints exist
   only at seals, so a tail cut after the newest seal used to leave no trace.
   `head.json` is a `Checkpoint` of the newest record (self-authenticating
@@ -363,8 +379,12 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
   `TruncationDetected`), and numbering continues above the mark (a counter
   never goes down). Anchor errors never stop recording
   (`anchor_failures()`, `last_anchor_error()`). `MemoryHeadAnchor` is an
-  in-memory reference implementation for tests; the TPM and remote
-  implementations are integration work (not done here).
+  in-memory reference implementation for tests. `FileHeadAnchor` keeps
+  the mark in one file (atomic replace, never decreasing); it is only as
+  strong as the storage that file lives on and adds nothing on the log's
+  own filesystem. **Deployment requires a TPM NV monotonic counter or a
+  remote receiver behind `HeadAnchor`**; those implementations are
+  integration work (not done here).
 
   **Remaining window:** records written after the newest mark and cut with
   the tail leave no local trace and their seqs may be reused: at most
@@ -388,8 +408,15 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
   chain key: `open` refuses with `Error::Untrusted` and touches nothing.
   `head.json` and the external anchor are checked the same way, and the
   evidence lists every file that proved the cut. A position that the
-  quarantined bytes themselves account for (records cut out by a recovery or
-  held by a quarantined closed segment) is not counted as truncation.
+  quarantined bytes themselves account for is not counted as truncation,
+  but only when the damage is crash- or media-plausible (a crash-plausible
+  hole in the active segment, a `high` quarantine). A `critical`
+  quarantine explains nothing: the state beyond the head still raises
+  `TruncationDetected`, whose evidence also lists the authentic records
+  beyond the head the quarantine removed (`file` = the segment,
+  `preserved_as` = its copy). `verify_dir` honours `recovery-pin.json` and
+  `export-cursor.json` the same way open does (an authentic position
+  beyond the stored head is `TruncatedTail`).
   Limit: someone who rewrites the newest frame's length prefix makes it look
   torn; the bytes are then quarantined (hash recorded) and the event is a
   warning, not a tamper finding, unless a mark already covered that frame.

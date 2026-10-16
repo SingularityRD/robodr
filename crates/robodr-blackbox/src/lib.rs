@@ -73,8 +73,8 @@ pub use record::{ChainIdentity, Hash, Record, RecordKind};
 pub use sign::{HmacSha256Key, Signer, Verifier};
 pub use sign_ed25519::{Ed25519SigningKey, Ed25519VerifyingKey};
 pub use store::{
-    AnchoredHead, AppendOutcome, EntryKind, Error, FsyncPolicy, HeadAnchor, MemoryHeadAnchor,
-    Recorder, RecorderConfig, Refusal, RetentionMode,
+    AnchoredHead, AppendOutcome, EntryKind, Error, FileHeadAnchor, FsyncPolicy, HeadAnchor,
+    MemoryHeadAnchor, OpenIncident, Recorder, RecorderConfig, Refusal, RetentionMode,
 };
 pub use time::{Clock, SteppingClock, SystemClock, TimeSource, Timestamp};
 pub use verify::{
