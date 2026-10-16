@@ -1,0 +1,109 @@
+.\" robodr-agentd(8). Source of truth: the USAGE text in
+.\" crates/robodr-agentd/src/bin/robodr-agentd.rs and the configuration
+.\" reference in crates/robodr-agentd/README.md. Keep them in sync.
+.TH ROBODR\-AGENTD 8 "2026-10-16" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
+.SH NAME
+robodr\-agentd \- RoboDR live daemon: ROS 2 discovery and events \(-> decision chain \(-> signed black box \(-> OCSF findings spool
+.SH SYNOPSIS
+.B robodr\-agentd
+.B \-\-config
+.I agentd.json
+.RB [ \-\-check\-config ]
+.PP
+.B robodr\-agentd
+.RB ( \-h | \-\-help | \-V | \-\-version )
+.SH DESCRIPTION
+.B robodr\-agentd
+reads RTPS discovery traffic (live AF_PACKET capture or a pcap replay) and
+RobotEvent JSON Lines (standard input or a unix socket), runs them through
+the ROS 2 pipeline and the RoboDR decision chain, records evidence in a signed
+black box and writes validated OCSF findings to a spool directory. It reports
+its own health and is never "OK" while blind.
+.PP
+It is read\-only on networks and protective only: response plans are
+recorded, never executed. It does not override the platform's safety system,
+e\-stop or command authority.
+.PP
+Normally started by
+.BR systemd (1)
+as
+.IR robodr\-agentd.service ,
+with
+.I /etc/robodr/agentd.json
+and the black\-box key handed over as a systemd credential.
+.SH OPTIONS
+.TP
+.BI \-\-config " file"
+The daemon configuration (JSON). Parsing is strict: unknown keys are refused at
+every level, and every path must be absolute. See
+.I /usr/share/doc/robodr/examples/agentd.example.json
+and the crate README for the sections
+.RI ( robot ", " sensor ", " policy_path ", " blackbox ", " spool ", "
+.IR event_inputs ", " context ", " firewall ", " motion_monitor ", " daemon ).
+.TP
+.B \-\-check\-config
+Validate the configuration and load every file it names (profile, policy,
+monitor config, key file), print warnings, then exit without starting.
+.TP
+.BR \-h ", " \-\-help
+Print the usage and exit 0.
+.TP
+.BR \-V ", " \-\-version
+Print the version and exit 0.
+.SH KEY
+Keys are never accepted on the command line.
+.B blackbox.key_file
+is either a
+.I robodr\-blackbox\-key/v1
+file as written by
+.B robodr\-blackbox keygen
+(HMAC\-SHA256 only; its key id is used, and a
+.B blackbox.key_id
+that contradicts it is a configuration error) or a bare hex HMAC key of at
+least 32 bytes (0.1.0\-alpha.1 format). The file is refused if it is a
+symlink or not a regular file, if group or others have any access to it, if
+it is owned by a uid other than the daemon's or root, or if it is larger than
+4 KiB. HMAC is a placeholder authenticator: the verifying side holds the same
+secret.
+.SH SIGNALS
+.B SIGTERM
+and
+.B SIGINT
+stop the daemon cleanly: the black box is sealed and its checkpoint is copied
+to the spool.
+.SH EXIT STATUS
+.TP
+.B 0
+Clean stop (signal, or every input ended with
+.BR daemon.exit_when_inputs_end ).
+.TP
+.B 1
+Runtime failure (for example the black box could not be sealed).
+.TP
+.B 2
+Usage or configuration error, including an argument that is not valid UTF\-8;
+nothing was started. The systemd unit does not restart on this status.
+.SH FILES
+.TP
+.I /etc/robodr/agentd.json
+Configuration (operator\-created, 0640 root:robodr).
+.TP
+.I /etc/robodr/keys/agentd\-blackbox.key
+Black\-box key (0600 root:root); the unit exposes a copy at
+.IR /run/credentials/robodr\-agentd.service/blackbox.key .
+.TP
+.I /var/lib/robodr/blackbox/agentd/
+Black\-box segments and checkpoint (single writer).
+.TP
+.I /var/lib/robodr/spool/agentd/
+OCSF findings spool.
+.TP
+.I /run/robodr\-agentd/
+Runtime directory for an optional unix\-socket event input (socket mode 0600).
+.SH SEE ALSO
+.BR robodr\-blackbox (1),
+.BR robodr\-replay (1),
+.BR robodr\-commission (1),
+.BR robodr\-diode\-pack (1),
+.BR robodr\-pulsard (8),
+/usr/share/doc/robodr/OPERATIONS.md

@@ -14,10 +14,8 @@ robodr\-replay \- offline RoboDR decision chain (event \(-> deviation \(-> plan 
 .I policy.json
 .B \-\-blackbox
 .I DIR
-.RB ( \-\-key\-hex
-.IR HEX " | "
 .B \-\-key\-file
-.IR FILE )
+.I FILE
 .B \-\-robot\-id
 .I ID
 [\fIoptions\fR]
@@ -25,12 +23,8 @@ robodr\-replay \- offline RoboDR decision chain (event \(-> deviation \(-> plan 
 .B robodr\-replay verify
 .B \-\-blackbox
 .I DIR
-.RB ( \-\-key\-hex
-.IR HEX " | "
 .B \-\-key\-file
-.IR FILE )
-.RB [ \-\-key\-id
-.IR ID ]
+.I FILE
 .RB [ \-\-robot\-id
 .IR ID ]
 .RB [ \-\-findings
@@ -54,13 +48,27 @@ Input events, model profile and response policy (required).
 .BI \-\-blackbox " DIR"
 Black\-box directory. Must be absent or empty (a replay starts a fresh chain).
 .TP
-.BI \-\-key\-hex " HEX\fR | " \-\-key\-file " FILE"
-The HMAC key (at least 32 bytes), as hex on the command line or in a file
-(hex plus whitespace, at most 4096 bytes). Exactly one is required. HMAC is a
-placeholder authenticator (see robodr\-blackbox). Prefer
-.BR \-\-key\-file :
-a command line is visible to other users in
-.IR /proc .
+.BI \-\-key\-file " FILE"
+The black\-box key (required): a
+.I robodr\-blackbox\-key/v1
+file as written by
+.BR "robodr\-blackbox keygen \-\-out" " \fIFILE\fR."
+It is refused if it is a symlink or not a regular file, or if its mode gives
+group or others any access (it must be
+.BR "chmod 600" ).
+Only hmac\-sha256 keys (at least 32 bytes) are accepted. The key id recorded in
+the chain is the file's
+.IR key_id .
+Keys are never accepted on the command line (a command line is visible to
+other users in
+.IR /proc );
+the former
+.B \-\-key\-hex
+and
+.B \-\-key\-id
+options were removed and are usage errors. HMAC is a placeholder
+authenticator (see
+.BR robodr\-blackbox (1)).
 .TP
 .BI \-\-robot\-id " ID"
 Robot identity bound into the chain (required).
@@ -84,11 +92,9 @@ estop_active | safe_state_active | unknown (default unknown).
 .B \-\-no\-operator
 No operator present.
 .TP
-.BI \-\-site " NAME\fR, " \-\-model " NAME\fR, " \-\-profile\-version " V\fR, " \-\-boot\-id " ID\fR, " \-\-key\-id " ID"
+.BI \-\-site " NAME\fR, " \-\-model " NAME\fR, " \-\-profile\-version " V\fR, " \-\-boot\-id " ID"
 Context and identity fields recorded with the evidence and findings.
 Without
-.BR \-\-key\-id ,
-the key id is derived from the key; without
 .BR \-\-model ,
 the profile's model is used.
 .TP
@@ -129,8 +135,19 @@ OK and verified.
 Verification failed (black box or an evidence link).
 .TP
 .B 2
-Usage, input, config or I/O error.
+Usage, input, config, key file or I/O error, including an argument that is not
+valid UTF\-8.
+.TP
+.B 3
+.RB ( run
+only) The evidence that was written verifies, but findings were lost: they
+failed OCSF validation (for example a synthetic clock past what a finding can
+carry) and were not written, so the findings output is incomplete. The summary
+says
+.BR "NOT VERIFIED" .
+Exit 1 takes precedence over 3.
 .SH SEE ALSO
+.BR robodr\-blackbox (1),
 .BR robodr\-commission (1),
 .BR robodr\-pulsard (8),
 /usr/share/doc/robodr/OPERATIONS.md

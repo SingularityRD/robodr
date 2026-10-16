@@ -27,7 +27,20 @@ EXIT: 0 clean stop, 1 runtime failure, 2 usage or configuration error.
 fn main() -> ExitCode {
     let mut config: Option<PathBuf> = None;
     let mut check = false;
-    let mut args = std::env::args().skip(1);
+    // args_os: std::env::args() panics on an argument that is not valid
+    // Unicode; that is a usage error here.
+    let argv: Vec<String> = match std::env::args_os()
+        .skip(1)
+        .map(|a| a.into_string())
+        .collect::<Result<_, _>>()
+    {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("error: an argument is not valid UTF-8\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut args = argv.into_iter();
     while let Some(a) = args.next() {
         match a.as_str() {
             "-h" | "--help" => {

@@ -1,0 +1,85 @@
+.\" robodr-diode-pack(1). Source of truth: the USAGE text in
+.\" crates/robodr-diode/src/bin/robodr-diode-pack.rs and the crate README.
+.\" Keep them in sync.
+.TH ROBODR\-DIODE\-PACK 1 "2026-10-16" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
+.SH NAME
+robodr\-diode\-pack \- pack RoboDR findings and black\-box bundles into signed batches for one\-way export
+.SH SYNOPSIS
+.B robodr\-diode\-pack
+.B \-\-outbox
+.I DIR
+.B \-\-state
+.I FILE
+.B \-\-unit
+.I UNIT_ID
+.B \-\-key\-id
+.I KEY_ID
+.B \-\-key\-file
+.I HEX_KEY_FILE
+.RB [ \-\-findings
+.IR FINDINGS.jsonl ]...
+.RB [ \-\-bundle
+.IR BUNDLE.rbbx ]...
+.RB [ \-\-max\-batch\-bytes
+.IR N ]
+.RB [ \-\-max\-findings
+.IR N ]
+.RB [ \-\-now\-ms
+.IR MS ]
+.SH DESCRIPTION
+Low\-side (air\-gapped) packer of the RoboDR one\-way export
+.RI ( robodr\-diode/1 ).
+It validates every finding (OCSF contract) and every black\-box export bundle,
+then writes signed, sequence\-numbered batch directories
+.RI ( rdd_ UNIT _ SEQ )
+into
+.IR DIR .
+Batches are staged in dot\-directories and published by an atomic rename:
+.B the transfer agent must ignore dot\-entries.
+Any invalid input aborts before anything is written. The published batches are
+printed as JSON. There is no network code; a diode transfer agent or a person
+with media moves the batches.
+.SH OPTIONS
+.TP
+.BI \-\-outbox " DIR"
+Output directory (a symlinked outbox is refused).
+.TP
+.BI \-\-state " FILE"
+Packer state (next sequence number, last batch hash), committed atomically.
+.TP
+.BI \-\-unit " UNIT_ID"
+Unit id written into every manifest.
+.TP
+.BI \-\-key\-id " KEY_ID\fR, " \-\-key\-file " HEX_KEY_FILE"
+HMAC\-SHA256 signing key: id, and a file holding the key as hex (at most
+4096 bytes). A warning is printed if the file is accessible by group or
+others. Keys are never taken on the command line.
+.TP
+.BI \-\-findings " FINDINGS.jsonl"
+Findings to export, one JSON value per line (repeatable).
+.TP
+.BI \-\-bundle " BUNDLE.rbbx"
+Black\-box export bundle to export (repeatable).
+.TP
+.BI \-\-max\-batch\-bytes " N"
+Data per batch, 64 KiB + 1 to 1 GiB (default 16 MiB).
+.TP
+.BI \-\-max\-findings " N"
+Findings per batch, at least 1 (default 10000).
+.TP
+.BI \-\-now\-ms " MS"
+Creation time (Unix ms) written into the manifests; default: now.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Error (invalid input, key, I/O).
+.TP
+.B 2
+Usage error, including an argument that is not valid UTF\-8.
+.SH SEE ALSO
+.BR robodr\-diode\-unpack (1),
+.BR robodr\-blackbox (1),
+/usr/share/doc/robodr/OPERATIONS.md

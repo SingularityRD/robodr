@@ -26,10 +26,14 @@
 //!   which only warns, unknown keys are refused here ([`SENSOR_KEYS`]).
 //!   `listen_spdp` defaults to `true` there; set it to `false` when capture
 //!   is enabled (capture sees SPDP too).
-//! * The black-box key is read from `blackbox.key_file` (hex, >= 32 bytes),
-//!   never from the command line. The file must be a regular file (not a
-//!   symlink), owned by the daemon's effective user or root, and not
-//!   accessible by group or others (`chmod 600`); see [`read_key_file`].
+//! * The black-box key is read from `blackbox.key_file`, never from the
+//!   command line: either a `robodr-blackbox-key/v1` JSON key file (as
+//!   written by `robodr-blackbox keygen`; HMAC-SHA256 only, its `key_id` is
+//!   used) or bare hex (>= 32 bytes; legacy 0.1.0-alpha.1 format). The file
+//!   must be a regular file (not a symlink), owned by the daemon's effective
+//!   user or root, and not accessible by group or others (`chmod 600`); see
+//!   [`read_key_file`]. A `blackbox.key_id` that contradicts the key file's
+//!   own id is a configuration error.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -45,7 +49,7 @@ use serde::Deserialize;
 
 /// Max size of the daemon config, the policy and a monitor config file.
 pub const MAX_CONFIG_BYTES: u64 = 4 << 20;
-/// Max size of the key file (a hex key plus whitespace).
+/// Max size of the key file (a JSON key file or a hex key plus whitespace).
 pub const MAX_KEY_FILE_BYTES: u64 = 4096;
 /// Most event inputs.
 pub const MAX_EVENT_INPUTS: usize = 8;
@@ -138,9 +142,12 @@ fn default_profile_version() -> String {
 #[serde(deny_unknown_fields)]
 pub struct BlackboxSection {
     pub dir: PathBuf,
-    /// Hex HMAC key file (see [`read_key_file`]).
+    /// HMAC key file: `robodr-blackbox-key/v1` JSON or hex (see
+    /// [`read_key_file`]).
     pub key_file: PathBuf,
-    /// Key id; default: derived from the key.
+    /// Key id. Default: the key file's `key_id` (JSON key file), else
+    /// derived from the key. Must equal the JSON key file's id if both are
+    /// given.
     #[serde(default)]
     pub key_id: Option<String>,
     /// Boot id; default: `/proc/sys/kernel/random/boot_id`.
@@ -308,6 +315,9 @@ pub struct Resolved {
     pub monitor: Option<MonitorConfig>,
     /// Black-box key bytes (never printed by `Debug`).
     pub key: KeyBytes,
+    /// Effective key id: `blackbox.key_id`, else the JSON key file's id,
+    /// else `None` (derived from the key).
+    pub key_id: Option<String>,
     pub boot_id: String,
     /// Non-fatal warnings to log at start.
     pub warnings: Vec<String>,
@@ -511,7 +521,18 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
             }
         }
     }
-    let key = read_key_file(&config.blackbox.key_file)?;
+    let (key, file_key_id) = read_key_material(&config.blackbox.key_file)?;
+    let key_id = match (&config.blackbox.key_id, file_key_id) {
+        (Some(cfg), Some(file)) if *cfg != file => {
+            return Err(format!(
+                "blackbox.key_id {:?} contradicts the key file's key_id {:?}",
+                robodr_ros2_pipeline::sanitize(cfg),
+                robodr_ros2_pipeline::sanitize(&file)
+            ))
+        }
+        (Some(cfg), _) => Some(cfg.clone()),
+        (None, file) => file,
+    };
     let boot_id = match &config.blackbox.boot_id {
         Some(b) => b.clone(),
         None => read_boot_id(),
@@ -523,6 +544,7 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         policy,
         monitor,
         key,
+        key_id,
         boot_id,
         warnings,
     })
@@ -547,13 +569,20 @@ pub fn effective_uid() -> u32 {
     unsafe { geteuid() }
 }
 
-/// Read the black-box HMAC key (hex) from `path`, refusing a file that is a
+/// [`read_key_material`] without the key id.
+pub fn read_key_file(path: &Path) -> Result<KeyBytes, String> {
+    read_key_material(path).map(|(k, _)| k)
+}
+
+/// Read the black-box HMAC key from `path`: a `robodr-blackbox-key/v1` JSON
+/// key file (HMAC-SHA256 only; returns its key id too) or bare hex
+/// (returns no key id). Refuses a file that is a
 /// symlink or not a regular file, is readable or writable by group or
 /// others, is not owned by the effective user (or root), or is larger than
 /// [`MAX_KEY_FILE_BYTES`]. The file is opened once and the checks run on
 /// the opened file (`fstat`), compared against the path's `lstat`, so it
 /// cannot be swapped between check and read.
-pub fn read_key_file(path: &Path) -> Result<KeyBytes, String> {
+pub fn read_key_material(path: &Path) -> Result<(KeyBytes, Option<String>), String> {
     let shown = path.display();
     let lmeta = std::fs::symlink_metadata(path).map_err(|e| format!("key file {shown}: {e}"))?;
     if !lmeta.file_type().is_file() {
@@ -588,15 +617,33 @@ pub fn read_key_file(path: &Path) -> Result<KeyBytes, String> {
     f.take(MAX_KEY_FILE_BYTES + 1)
         .read_to_string(&mut text)
         .map_err(|e| format!("key file {shown}: {e}"))?;
-    let key = robodr_blackbox::crypto::from_hex(text.trim())
-        .ok_or_else(|| format!("key file {shown}: not valid hex"))?;
+    if text.trim_start().starts_with('{') {
+        // The permission checks above already ran on this descriptor;
+        // `from_json` only parses (strict, unknown fields refused).
+        let parsed = robodr_blackbox::KeyFile::from_json(&text);
+        wipe_text(&mut text);
+        let kf = parsed.map_err(|e| format!("key file {shown}: {e}"))?;
+        kf.hmac().map_err(|e| format!("key file {shown}: {e}"))?;
+        return Ok((KeyBytes(kf.secret().to_vec()), Some(kf.key_id.clone())));
+    }
+    let key = robodr_blackbox::crypto::from_hex(text.trim());
+    wipe_text(&mut text);
+    let key = key.ok_or_else(|| format!("key file {shown}: not valid hex"))?;
     if key.len() < 32 {
         return Err(format!(
             "key file {shown}: key is {} bytes, at least 32 needed",
             key.len()
         ));
     }
-    Ok(KeyBytes(key))
+    Ok((KeyBytes(key), None))
+}
+
+/// Best-effort overwrite of a string that held key material.
+fn wipe_text(s: &mut String) {
+    let n = s.len();
+    s.clear();
+    s.extend(std::iter::repeat_n('0', n));
+    s.clear();
 }
 
 #[cfg(test)]
@@ -646,12 +693,62 @@ mod tests {
         write_mode(&big, &"a".repeat(5000), 0o600);
         assert!(read_key_file(&big).unwrap_err().contains("larger"));
 
+        // robodr-blackbox-key/v1 JSON (as `robodr-blackbox keygen` writes).
+        let json = d.join("json.key");
+        let kf =
+            robodr_blackbox::KeyFile::hmac_from_secret(&[0xcd; 32], Some("ugv-07-bb")).unwrap();
+        kf.write_new(&json).unwrap();
+        let (k, id) = read_key_material(&json).unwrap();
+        assert_eq!(k.0, vec![0xcd; 32]);
+        assert_eq!(id.as_deref(), Some("ugv-07-bb"));
+        assert_eq!(read_key_material(&good).unwrap().1, None);
+        let json_open = d.join("json-open.key");
+        write_mode(&json_open, &kf.to_json(), 0o644);
+        assert!(read_key_file(&json_open).unwrap_err().contains("chmod 600"));
+        let ed = d.join("ed.key");
+        write_mode(&ed, &kf.to_json().replace("hmac-sha256", "ed25519"), 0o600);
+        assert!(read_key_file(&ed).unwrap_err().contains("unsupported"));
+        let junk = d.join("junk.key");
+        write_mode(&junk, "{\"format\":\"x\"}", 0o600);
+        assert!(read_key_file(&junk).unwrap_err().contains("malformed"));
+
         let link = d.join("link.key");
         std::os::unix::fs::symlink(&good, &link).unwrap();
         assert!(read_key_file(&link).unwrap_err().contains("symlink"));
         assert!(read_key_file(&d).unwrap_err().contains("regular file"));
         assert!(read_key_file(&d.join("missing")).is_err());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `config/agentd.example.json` (shipped as an example and matching
+    /// `packaging/systemd/robodr-agentd.service`) parses strictly, its
+    /// sections validate, and it uses the unit's paths.
+    #[test]
+    fn shipped_example_config_parses() {
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/agentd.example.json"),
+        )
+        .unwrap();
+        let c = parse(&text).unwrap();
+        sensor_settings(&c.sensor).unwrap();
+        validate_daemon(&c.daemon).unwrap();
+        assert_eq!(
+            c.blackbox.key_file,
+            Path::new("/run/credentials/robodr-agentd.service/blackbox.key")
+        );
+        assert_eq!(c.blackbox.dir, Path::new("/var/lib/robodr/blackbox/agentd"));
+        assert_eq!(c.spool.dir, Path::new("/var/lib/robodr/spool/agentd"));
+        let unit = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../packaging/systemd/robodr-agentd.service"),
+        )
+        .unwrap();
+        assert!(unit.contains("ExecStart=/usr/sbin/robodr-agentd --config /etc/robodr/agentd.json"));
+        assert!(unit.contains("LoadCredential=blackbox.key:"));
+        assert!(unit.contains(
+            "ReadWritePaths=/var/lib/robodr/blackbox/agentd /var/lib/robodr/spool/agentd"
+        ));
+        assert!(unit.contains("RuntimeDirectory=robodr-agentd"));
     }
 
     #[test]

@@ -180,8 +180,8 @@ jobs:
           SBOM_TOOL=cyclonedx scripts/sbom.sh dist/sbom
       - name: Debian package
         env:
-          # A release must never ship without the daemon.
-          ROBODR_DEB_REQUIRE: robodr-pulsard
+          # A release must never ship without the daemons and their tools.
+          ROBODR_DEB_REQUIRE: robodr-pulsard robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack
         run: |
           export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           packaging/build-deb.sh --bin-dir target/release --arch "$ARCH" --out dist/release

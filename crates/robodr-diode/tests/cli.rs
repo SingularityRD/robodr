@@ -106,3 +106,23 @@ fn pack_and_unpack_binaries() {
     assert_eq!(rep["quarantined"][0]["reason"]["code"], "hash_mismatch");
     assert_eq!(rep["duplicates"].as_array().unwrap().len(), 1);
 }
+
+/// An argument that is not valid UTF-8 is a usage error (exit 2), never a
+/// panic.
+#[test]
+fn non_utf8_argument_is_a_usage_error() {
+    use std::os::unix::ffi::OsStrExt;
+    for bin in [
+        env!("CARGO_BIN_EXE_robodr-diode-pack"),
+        env!("CARGO_BIN_EXE_robodr-diode-unpack"),
+    ] {
+        let o = Command::new(bin)
+            .args(["--state"])
+            .arg(std::ffi::OsStr::from_bytes(b"/tmp/\xff"))
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(2), "{bin}: {err}");
+        assert!(err.contains("not valid UTF-8"), "{bin}: {err}");
+    }
+}

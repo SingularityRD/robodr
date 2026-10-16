@@ -2,8 +2,19 @@
 //! offline, record evidence in a black box, write findings, and verify.
 //!
 //! Exit codes: 0 success and everything verified; 1 the black box or an
-//! evidence link failed verification; 2 usage, input, config or I/O error.
-//! Argument parsing is std-only by design.
+//! evidence link failed verification; 2 usage, input, config or I/O error
+//! (including an argument that is not valid UTF-8); 3 (`run` only) the
+//! evidence that was written verifies, but findings were lost (they failed
+//! OCSF validation and were not written), so the findings output is
+//! incomplete. 1 takes precedence over 3. Argument parsing is std-only by
+//! design.
+//!
+//! The black-box key is read only from a key file (`--key-file`, a
+//! `robodr-blackbox-key/v1` file as written by `robodr-blackbox keygen`),
+//! permission-checked by `robodr_blackbox::KeyFile::load` (regular file, no
+//! symlink, mode without group/other bits); its key id comes from the file.
+//! Keys are never accepted on the command line: argv is readable by every
+//! process through /proc.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -14,27 +25,24 @@ use std::process::ExitCode;
 use robodr_agent::replay::{self, ReplayOptions};
 use robodr_motion::{FeedbackSource, MonitorConfig};
 
-/// Max size of a key file (a hex key plus whitespace).
-const MAX_KEY_FILE_BYTES: u64 = 4096;
-
 const USAGE: &str = "\
 robodr-replay: offline RoboDR decision chain (event -> deviation -> plan -> black box -> finding)
 
 USAGE:
   robodr-replay [run] --events run.jsonl --profile profile.json --policy policy.json
-                --blackbox DIR (--key-hex HEX | --key-file FILE) --robot-id ID
+                --blackbox DIR --key-file FILE --robot-id ID
                 [--out findings.jsonl] [--outcomes outcomes.jsonl]
                 [--safety-state STATE] [--control autonomous|teleop|manual]
                 [--phase parked|transit|task|takeoff|landing|unknown]
                 [--connectivity connected|degraded|disconnected] [--no-operator]
                 [--site NAME] [--model NAME] [--profile-version V] [--boot-id ID]
-                [--key-id ID] [--start-ms EPOCH_MS] [--step-ms MS]
+                [--start-ms EPOCH_MS] [--step-ms MS]
                 [--firewall] [--firewall-allow CHANNEL=GUID[,GUID...]]...
                 [--firewall-max-angular CHANNEL=RAD_PER_S]...
                 [--monitor | --monitor-config FILE] [--feedback-source CHANNEL=SOURCE]...
                 [--record-all-events] [--partitions N] [--log-plans]
-  robodr-replay verify --blackbox DIR (--key-hex HEX | --key-file FILE)
-                [--key-id ID] [--robot-id ID] [--findings findings.jsonl]
+  robodr-replay verify --blackbox DIR --key-file FILE
+                [--robot-id ID] [--findings findings.jsonl]
 
   STATE:  idle | moving_slow | moving_fast | collaborative_human_nearby |
           estop_active | safe_state_active | unknown (default unknown)
@@ -42,11 +50,15 @@ USAGE:
   Findings go to stdout unless --out is given; the summary goes to stderr.
   --firewall needs --firewall-max-angular for every Twist channel of the
   profile (the OEM's yaw-rate bound; the profile has none).
+  --key-file is a robodr-blackbox-key/v1 file (create one with
+  `robodr-blackbox keygen --out FILE`); it must be mode 0600 or stricter,
+  and its key id is used. Keys are never taken on the command line.
   The HMAC key (>= 32 bytes) is a placeholder authenticator (see robodr-blackbox).
   --blackbox must be absent or empty (a replay starts a fresh chain).
   A replay never acts: --log-plans only prints what would have been requested.
 
-EXIT: 0 ok and verified, 1 verification failed, 2 error.
+EXIT: 0 ok and verified, 1 verification failed, 2 error,
+      3 (run) evidence verified but findings were lost (output incomplete).
 ";
 
 const VALUED: &[&str] = &[
@@ -54,9 +66,7 @@ const VALUED: &[&str] = &[
     "profile",
     "policy",
     "blackbox",
-    "key-hex",
     "key-file",
-    "key-id",
     "robot-id",
     "out",
     "outcomes",
@@ -85,6 +95,22 @@ const SWITCHES: &[&str] = &[
     "no-operator",
     "help",
 ];
+
+/// Options that no longer exist, with the reason (reported as usage errors).
+const REMOVED: &[(&str, &str)] = &[
+    (
+        "key-hex",
+        "--key-hex was removed: argv is visible to every process; use --key-file \
+         (create one with `robodr-blackbox keygen --out FILE`)",
+    ),
+    (
+        "key-id",
+        "--key-id was removed: the key id comes from the --key-file",
+    ),
+];
+
+/// Exit code of a `run` whose evidence verifies but that lost findings.
+const EXIT_FINDINGS_LOST: u8 = 3;
 
 struct Args {
     opts: BTreeMap<String, Vec<String>>,
@@ -120,6 +146,8 @@ impl Args {
                         .ok_or_else(|| format!("--{name} needs a value"))?,
                 };
                 a.opts.entry(name.to_string()).or_default().push(v);
+            } else if let Some((_, why)) = REMOVED.iter().find(|(n, _)| *n == name) {
+                return Err((*why).to_string());
             } else {
                 return Err(format!("unknown option --{name}"));
             }
@@ -159,23 +187,14 @@ fn parse_u64(what: &str, v: &str) -> Result<u64, String> {
         .map_err(|_| format!("invalid {what} {v:?}"))
 }
 
-fn key_from(a: &Args) -> Result<Vec<u8>, String> {
-    let hex = match (a.one("key-hex")?, a.one("key-file")?) {
-        (Some(h), None) => h.to_string(),
-        (None, Some(p)) => {
-            let len = std::fs::metadata(p).map_err(|e| format!("{p}: {e}"))?.len();
-            if len > MAX_KEY_FILE_BYTES {
-                return Err(format!(
-                    "{p}: key file larger than {MAX_KEY_FILE_BYTES} bytes"
-                ));
-            }
-            std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?
-        }
-        (Some(_), Some(_)) => return Err("give --key-hex or --key-file, not both".into()),
-        (None, None) => return Err("--key-hex or --key-file is required".into()),
-    };
-    robodr_blackbox::crypto::from_hex(hex.trim())
-        .ok_or_else(|| "black-box key is not valid hex".to_string())
+/// Load the black-box key from `--key-file` (permission-checked, HMAC
+/// only). Returns the key material and the key id from the file.
+fn key_from(a: &Args) -> Result<(Vec<u8>, String), String> {
+    let p = a.req("key-file")?;
+    let kf = robodr_blackbox::KeyFile::load(p.as_ref()).map_err(|e| format!("{p}: {e}"))?;
+    // Refuses non-HMAC algorithms and re-checks the key length.
+    kf.hmac().map_err(|e| format!("{p}: {e}"))?;
+    Ok((kf.secret().to_vec(), kf.key_id.clone()))
 }
 
 fn kv(what: &str, v: &str) -> Result<(String, String), String> {
@@ -186,15 +205,15 @@ fn kv(what: &str, v: &str) -> Result<(String, String), String> {
 }
 
 fn options(a: &Args) -> Result<ReplayOptions, String> {
-    let mut o = ReplayOptions::new(
+    let (events, profile, policy, blackbox) = (
         a.req("events")?,
         a.req("profile")?,
         a.req("policy")?,
         a.req("blackbox")?,
-        key_from(a)?,
-        a.req("robot-id")?,
     );
-    o.key_id = a.one("key-id")?.map(str::to_string);
+    let (key, key_id) = key_from(a)?;
+    let mut o = ReplayOptions::new(events, profile, policy, blackbox, key, a.req("robot-id")?);
+    o.key_id = Some(key_id);
     if let Some(v) = a.one("safety-state")? {
         o.safety = parse_enum("safety state", v)?;
     }
@@ -269,7 +288,15 @@ fn options(a: &Args) -> Result<ReplayOptions, String> {
     Ok(o)
 }
 
-fn run_cmd(a: &Args) -> Result<bool, String> {
+/// Verdict of a command: exit 0, 1 or [`EXIT_FINDINGS_LOST`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Verified,
+    Failed,
+    FindingsLost,
+}
+
+fn run_cmd(a: &Args) -> Result<Verdict, String> {
     let mut o = options(a)?;
     if a.has("monitor") && o.monitor.is_none() {
         // UGV defaults, correlating the profile's motion channels.
@@ -336,25 +363,33 @@ fn run_cmd(a: &Args) -> Result<bool, String> {
     for p in &summary.links.problems {
         eprintln!("  {p}");
     }
-    eprintln!(
-        "{}",
-        if summary.verified() {
-            "VERIFIED: evidence chain intact end to end"
-        } else {
-            "NOT VERIFIED"
-        }
-    );
-    Ok(summary.verified())
+    let verdict = if !summary.evidence_verified() {
+        Verdict::Failed
+    } else if summary.findings_lost() > 0 {
+        Verdict::FindingsLost
+    } else {
+        Verdict::Verified
+    };
+    match verdict {
+        Verdict::Verified => eprintln!("VERIFIED: evidence chain intact end to end"),
+        Verdict::Failed => eprintln!("NOT VERIFIED"),
+        Verdict::FindingsLost => eprintln!(
+            "NOT VERIFIED: evidence chain intact, but {} finding(s) were lost \
+             (failed validation, not written); the findings output is incomplete",
+            summary.findings_lost()
+        ),
+    }
+    Ok(verdict)
 }
 
-fn verify_cmd(a: &Args) -> Result<bool, String> {
+fn verify_cmd(a: &Args) -> Result<Verdict, String> {
     let dir = PathBuf::from(a.req("blackbox")?);
-    let key = key_from(a)?;
+    let (key, key_id) = key_from(a)?;
     let findings = a.one("findings")?.map(PathBuf::from);
     let v = replay::verify(
         &dir,
         &key,
-        a.one("key-id")?,
+        Some(&key_id),
         a.one("robot-id")?,
         findings.as_deref(),
     )
@@ -380,11 +415,27 @@ fn verify_cmd(a: &Args) -> Result<bool, String> {
             "NOT VERIFIED"
         }
     );
-    Ok(v.verified())
+    Ok(if v.verified() {
+        Verdict::Verified
+    } else {
+        Verdict::Failed
+    })
 }
 
 fn main() -> ExitCode {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // args_os: std::env::args() panics on an argument that is not valid
+    // Unicode; that must be a usage error (exit 2), not an abort.
+    let argv: Vec<String> = match std::env::args_os()
+        .skip(1)
+        .map(|a| a.into_string())
+        .collect::<Result<_, _>>()
+    {
+        Ok(v) => v,
+        Err(bad) => {
+            eprintln!("error: argument {bad:?} is not valid UTF-8\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
     let (cmd, rest) = match argv.first().map(String::as_str) {
         Some("verify") => ("verify", &argv[1..]),
         Some("run") => ("run", &argv[1..]),
@@ -407,8 +458,9 @@ fn main() -> ExitCode {
         run_cmd(&args)
     };
     match res {
-        Ok(true) => ExitCode::SUCCESS,
-        Ok(false) => ExitCode::from(1),
+        Ok(Verdict::Verified) => ExitCode::SUCCESS,
+        Ok(Verdict::Failed) => ExitCode::from(1),
+        Ok(Verdict::FindingsLost) => ExitCode::from(EXIT_FINDINGS_LOST),
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::from(2)

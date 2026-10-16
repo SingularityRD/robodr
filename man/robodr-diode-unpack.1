@@ -1,0 +1,102 @@
+.\" robodr-diode-unpack(1). Source of truth: the USAGE text in
+.\" crates/robodr-diode/src/bin/robodr-diode-unpack.rs and the crate README.
+.\" Keep them in sync.
+.TH ROBODR\-DIODE\-UNPACK 1 "2026-10-16" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
+.SH NAME
+robodr\-diode\-unpack \- verify and import RoboDR export batches on the receiving (SOC) side
+.SH SYNOPSIS
+.B robodr\-diode\-unpack
+.B \-\-inbox
+.I DIR
+.B \-\-out
+.I DIR
+.B \-\-quarantine
+.I DIR
+.B \-\-processed
+.I DIR
+.B \-\-state
+.I FILE
+.B \-\-keyring
+.I FILE
+.RB [ \-\-bundle\-key
+.IR KEY_ID : HEX_KEY_FILE ]...
+.RB [ \-\-partitions
+.IR N ]
+.RB [ \-\-accept\-gap
+.IR UNIT : SEQ ]...
+.RB [ \-\-max\-batch\-bytes
+.IR N ]
+.SH DESCRIPTION
+High\-side importer of the RoboDR one\-way export
+.RI ( robodr\-diode/1 ).
+For every batch in the inbox it verifies the manifest signature with the
+unit's key before parsing anything, checks the per\-unit sequence and hash
+chain, the exact size and SHA\-256 of every file, re\-validates every finding
+and parses every bundle (and verifies its signatures when a
+.B \-\-bundle\-key
+for its key id is given).
+.PP
+Accepted batches go to
+.IR OUT / batch /records.jsonl
+(one Kafka record per line) and then to the processed directory; duplicates
+are recognised by hash and not re\-emitted; anything that fails a check goes
+to the quarantine directory with a
+.I .reason.json
+file. A batch whose predecessors are missing is held in the inbox and
+reported as a gap. Re\-running after a crash is idempotent. A JSON report is
+printed.
+.SH OPTIONS
+.TP
+.BI \-\-inbox " DIR\fR, " \-\-out " DIR\fR, " \-\-quarantine " DIR\fR, " \-\-processed " DIR"
+Where batches arrive, where accepted output is written, where rejected
+batches are moved, and where imported batches are kept.
+.TP
+.BI \-\-state " FILE"
+Importer state (per unit: last sequence, last hash, recent hashes, accepted
+gaps), updated atomically.
+.TP
+.BI \-\-keyring " FILE"
+One
+.RI \(lq unit_id " " key_id " " hex\-key\-file \(rq
+per line
+.RB ( #
+comments); relative key paths are resolved against the keyring's directory.
+.TP
+.BI \-\-bundle\-key " KEY_ID:HEX_KEY_FILE"
+A black\-box key used to verify bundles signed with
+.I KEY_ID
+(repeatable).
+.TP
+.BI \-\-partitions " N"
+Kafka partition count used to compute each record's partition.
+.TP
+.BI \-\-accept\-gap " UNIT:SEQ"
+Accept batch
+.I SEQ
+of
+.I UNIT
+although earlier batches are missing (recorded in the state; the skipped
+batches are refused afterwards). An operator decision.
+.TP
+.BI \-\-max\-batch\-bytes " N"
+Largest declared data per batch (default 256 MiB).
+.SH EXIT STATUS
+.TP
+.B 0
+Everything was accepted or was a duplicate.
+.TP
+.B 1
+Error.
+.TP
+.B 2
+Usage error, including an argument that is not valid UTF\-8.
+.TP
+.B 3
+Something was quarantined or held (gap).
+.SH NOTES
+HMAC\-SHA256 is a placeholder: the receiving side holds the same secret as
+the unit and could forge batches.
+.SH SEE ALSO
+.BR robodr\-diode\-pack (1),
+.BR robodr\-blackbox (1),
+/usr/share/doc/robodr/OPERATIONS.md

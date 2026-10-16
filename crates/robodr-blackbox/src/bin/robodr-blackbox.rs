@@ -112,7 +112,19 @@ impl From<String> for Fail {
 }
 
 fn main() -> ExitCode {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // args_os: std::env::args() panics on an argument that is not valid
+    // Unicode; that is a usage error (exit 2).
+    let argv: Vec<String> = match std::env::args_os()
+        .skip(1)
+        .map(|a| a.into_string())
+        .collect::<Result<_, _>>()
+    {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("robodr-blackbox: an argument is not valid UTF-8\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
     let res = match argv.first().map(String::as_str) {
         Some("keygen") => keygen(&argv[1..]),
         Some("verify") => verify(&argv[1..]),

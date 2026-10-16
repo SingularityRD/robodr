@@ -1,0 +1,99 @@
+.\" robodr-blackbox(1). Source of truth: the USAGE text in
+.\" crates/robodr-blackbox/src/bin/robodr-blackbox.rs. Keep the two in sync.
+.TH ROBODR\-BLACKBOX 1 "2026-10-16" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
+.SH NAME
+robodr\-blackbox \- create black\-box keys, verify and inspect RoboDR black\-box logs
+.SH SYNOPSIS
+.B robodr\-blackbox keygen
+.B \-\-out
+.I FILE
+.RB [ \-\-key\-id
+.IR ID ]
+.PP
+.B robodr\-blackbox verify
+.I DIR
+.B \-\-keyring
+.I FILE
+.RB [ \-\-keyring
+.IR FILE ]...
+.RB [ \-\-checkpoint
+.IR FILE ]
+.RB [ \-\-device
+.IR ID ]
+.RB [ \-\-strict ]
+.RB [ \-\-json ]
+.PP
+.B robodr\-blackbox inspect
+.IR DIR | SEGMENT
+.RB [ \-\-json ]
+.RB [ \-\-limit
+.IR N ]
+.SH DESCRIPTION
+The RoboDR black box is an append\-only, hash\-chained, signed log of evidence
+records split into segment files. This tool manages its keys and checks logs.
+Secrets are never accepted on the command line (argv is readable by every
+process through
+.IR /proc ).
+.SH COMMANDS
+.TP
+.B keygen
+Write a new HMAC\-SHA256 key file
+.RI ( robodr\-blackbox\-key/v1 ,
+JSON) to
+.IR FILE .
+32 bytes are drawn from
+.IR /dev/urandom ;
+the command fails rather than fall back to weaker randomness. The file is
+created exclusively with mode 0600; an existing file or symlink is never
+overwritten or written through. Without
+.BR \-\-key\-id ,
+the key id is derived from the key. Prints the key id, never the secret.
+.TP
+.B verify
+Verify the log in
+.I DIR
+with every key in the given key or keyring files
+.RI ( robodr\-blackbox\-keyring/v1 ),
+so a log that spans a key rotation verifies. Key files that are symlinks, not
+regular files, or accessible by group or others are refused.
+.B \-\-checkpoint
+names a trusted checkpoint held off the unit; without it the directory's own
+.I checkpoint.json
+is used.
+.B \-\-device
+requires the chain's device id.
+.B \-\-strict
+also fails on warnings (for example a recovered torn tail).
+.B \-\-json
+prints the full report as JSON.
+.TP
+.B inspect
+List the frames of a log directory or of one segment file (sequence number,
+kind, flags, time, payload preview), at most
+.I N
+with
+.BR \-\-limit .
+No signature is checked: it is a viewer, not a verdict.
+.SH EXIT STATUS
+.TP
+.B 0
+Success; for
+.BR verify :
+intact (warnings allowed unless
+.BR \-\-strict ).
+.TP
+.B 1
+Verification failed (tampering, or warnings with
+.BR \-\-strict ).
+.TP
+.B 2
+Usage, I/O or key error, including an argument that is not valid UTF\-8.
+.SH NOTES
+HMAC\-SHA256 is a placeholder authenticator: whoever holds the key can verify
+and also forge evidence. Keep exactly one copy on the robot and one in the
+verifier's protected store.
+.SH SEE ALSO
+.BR robodr\-agentd (8),
+.BR robodr\-replay (1),
+.BR robodr\-diode\-unpack (1),
+/usr/share/doc/robodr/OPERATIONS.md

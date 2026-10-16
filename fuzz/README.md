@@ -111,6 +111,11 @@ All seeds are SYNTHETIC (no real robot data):
 * `blackbox_segments/`: real `Recorder` output (HMAC key = the harness key,
   so records verify): one segment, a rotated two-segment chain with its
   `checkpoint.json`, an export bundle, a single frame body, a checkpoint.
+  The rotated chain was recorded before the recorder reserved room for its
+  closing seals, so its first segment is 4291 bytes with
+  `max_segment_bytes = 4096` (one seal frame over; see
+  `crates/robodr-blackbox/README.md`, "Segment size"). It still verifies and
+  is kept as a seed for exactly that shape.
 * `ocsf_parse_and_validate/`: `docs/contracts/robot-edr-finding.example.json`
   (pretty and minified).
 * `events_profile/`: `config/profile.example.json`,

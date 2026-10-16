@@ -394,14 +394,21 @@ async fn listen_loop(
         };
         match next {
             Next::Spdp(Ok((len, peer))) => {
-                report(&mut pipeline, &ctx, &buf[..len], &peer.ip().to_string());
+                // The SPDP socket does not say which interface a datagram
+                // came in on: ingress unknown.
+                let found = pipeline.process(&buf[..len], &peer.ip().to_string());
+                report(&ctx, found);
             }
             Next::Spdp(Err(e)) => {
                 log::warn!(target: MODULE_NAME, "SPDP receive error: {e}");
                 tokio::time::sleep(RECV_ERROR_BACKOFF).await;
             }
             Next::Capture(Some(d)) | Next::External(Some(d)) => {
-                report(&mut pipeline, &ctx, &d.payload, &d.src_ip);
+                // Ingress-aware: a capture source tags the interface kind,
+                // so a loopback source address seen on an external
+                // interface is judged as spoofed (review-3 R3-P4).
+                let found = pipeline.process_datagram(&d);
+                report(&ctx, found);
             }
             Next::Housekeeping => {
                 housekeeping_findings(&mut pipeline, &ctx, capture_health.as_ref())
@@ -448,9 +455,9 @@ fn housekeeping_findings(
     }
 }
 
-/// Run one datagram through the pipeline and raise a threat per finding.
-fn report(pipeline: &mut Pipeline, ctx: &ModuleContext, payload: &[u8], src_ip: &str) {
-    for finding in pipeline.process(payload, src_ip) {
+/// Raise a threat per finding of one datagram.
+fn report(ctx: &ModuleContext, findings: Vec<Finding>) {
+    for finding in findings {
         send(ctx, &finding);
     }
 }

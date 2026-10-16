@@ -45,7 +45,12 @@ must be absolute.
 | `daemon` | `queue_capacity` 4096, `tick_ms` 1000, `heartbeat_ms` 10000, `silence_ms` 30000, `lag_ms` 2000, `health_report_ms` 10000, `exit_when_inputs_end` false |
 
 **Key.** Keys are never accepted on the command line. `blackbox.key_file`
-holds a hex HMAC key of at least 32 bytes. The daemon refuses the file if it
+is either a `robodr-blackbox-key/v1` key file as written by
+`robodr-blackbox keygen --out FILE` (HMAC-SHA256 only; its `key_id` is used
+unless `blackbox.key_id` is set, and a `blackbox.key_id` that differs from it
+is a configuration error), or, as in 0.1.0-alpha.1, a bare hex HMAC key of at
+least 32 bytes (key id from `blackbox.key_id`, else derived from the key).
+The daemon refuses the file if it
 is a symlink, is not a regular file, is accessible by group or others (it
 must be `chmod 600`), is owned by a uid other than the daemon's or root, or
 is larger than 4 KiB. The checks run on the opened descriptor, and that

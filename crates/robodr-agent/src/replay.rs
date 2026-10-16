@@ -180,9 +180,25 @@ pub struct ReplaySummary {
 }
 
 impl ReplaySummary {
-    /// Chain intact and every evidence link resolves.
-    pub fn verified(&self) -> bool {
+    /// The evidence that was written is sound: chain intact and every
+    /// evidence link of every finding written resolves. Says nothing about
+    /// findings that were never written (see [`Self::findings_lost`]).
+    pub fn evidence_verified(&self) -> bool {
         self.report.is_intact() && self.links.is_ok()
+    }
+
+    /// Findings produced but not written (they failed OCSF validation, e.g.
+    /// a replay clock past what a finding can carry). Their deviations are
+    /// in the black box; the findings output is incomplete.
+    pub fn findings_lost(&self) -> u64 {
+        self.stats.finding_errors
+    }
+
+    /// Fully verified: [`Self::evidence_verified`] and no finding lost. A
+    /// replay that dropped findings is never reported as verified, however
+    /// intact the chain is (`robodr-replay` exits 3 for that case).
+    pub fn verified(&self) -> bool {
+        self.evidence_verified() && self.findings_lost() == 0
     }
 }
 

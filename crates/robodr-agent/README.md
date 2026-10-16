@@ -113,28 +113,31 @@ The scenario files are synthetic and live in `examples/`:
 | `motion-injection.jsonl` | `/cmd_vel` 0.4 m/s with honest `/odom`, then fabricated 1.2 m/s odometry from t=4.0 s to t=5.5 s |
 
 ```sh
-KEY=$(printf '42%.0s' $(seq 32))        # demo key only; 32-byte HMAC key in hex
+# A fresh HMAC key file (robodr-blackbox-key/v1, mode 0600). Keys are never
+# passed on the command line (argv is readable through /proc).
+cargo run -p robodr-blackbox --bin robodr-blackbox -- keygen --out /tmp/demo.key --key-id demo-key
+KEY=/tmp/demo.key
 E=crates/robodr-agent/examples
 
 # 1. Rogue participant + foreign cmd_vel writer + over-envelope command
 cargo run -p robodr-agent --bin robodr-replay -- \
   --events $E/rogue-ugv.jsonl --profile $E/ugv-demo.profile.json \
-  --policy $E/policy-oem-validated.json --blackbox /tmp/bb --key-hex $KEY \
+  --policy $E/policy-oem-validated.json --blackbox /tmp/bb --key-file $KEY \
   --robot-id ugv-007 --safety-state moving_slow \
   --firewall --firewall-max-angular /cmd_vel=1.0 \
   --out /tmp/findings.jsonl --outcomes /tmp/outcomes.jsonl --log-plans
 
 # 2. Verify on its own (as a receiving side would), then tamper and verify again
 cargo run -p robodr-agent --bin robodr-replay -- verify --blackbox /tmp/bb \
-  --key-hex $KEY --robot-id ugv-007 --findings /tmp/findings.jsonl
+  --key-file $KEY --robot-id ugv-007 --findings /tmp/findings.jsonl
 printf '\xff' | dd of=/tmp/bb/seg-0000000000000000.rbb bs=1 seek=4700 conv=notrunc
 cargo run -p robodr-agent --bin robodr-replay -- verify --blackbox /tmp/bb \
-  --key-hex $KEY --robot-id ugv-007 --findings /tmp/findings.jsonl   # exit 1
+  --key-file $KEY --robot-id ugv-007 --findings /tmp/findings.jsonl   # exit 1
 
 # 3. Injected telemetry caught by the motion monitor
 cargo run -p robodr-agent --bin robodr-replay -- \
   --events $E/motion-injection.jsonl --profile $E/ugv-demo.profile.json \
-  --policy $E/policy-oem-validated.json --blackbox /tmp/bb-motion --key-hex $KEY \
+  --policy $E/policy-oem-validated.json --blackbox /tmp/bb-motion --key-file $KEY \
   --robot-id ugv-007 --safety-state moving_slow --step-ms 20 \
   --monitor --feedback-source /odom=wheel_odometry \
   --firewall --firewall-max-angular /cmd_vel=1.0
@@ -143,7 +146,7 @@ cargo run -p robodr-agent --bin robodr-replay -- \
 cargo run -p robodr-agent --bin robodr-replay -- \
   --events $E/rogue-ugv.jsonl --profile $E/ugv-demo.profile.json \
   --policy config/response-policy.example.json --blackbox /tmp/bb-observe \
-  --key-hex $KEY --robot-id ugv-007 --log-plans \
+  --key-file $KEY --robot-id ugv-007 --log-plans \
   --firewall --firewall-max-angular /cmd_vel=1.0
 ```
 
@@ -202,7 +205,20 @@ limiting. Use `--step-ms 6000` to see each one graded on its own.
   only prints what a live executor would have been offered.
 - `--monitor-config` and `--profile` are parsed strictly (unknown fields are
   errors). At most 10 000 outcomes are kept in memory; all are counted.
-- Exit codes: 0 verified, 1 verification failed, 2 usage, input or I/O error.
+- Keys: `--key-file FILE` only, a `robodr-blackbox-key/v1` file
+  (`robodr-blackbox keygen --out FILE [--key-id ID]`), loaded with
+  `KeyFile::load`: a symlink, a non-regular file or a mode with group/other
+  bits is refused, and the key id is the file's. `--key-hex` and `--key-id`
+  were removed (argv is readable by every process through `/proc`); giving
+  them is a usage error that says so.
+- Exit codes: 0 verified, 1 verification failed, 2 usage, input or I/O error
+  (also an argument that is not valid UTF-8), 3 (`run` only) the evidence
+  that was written verifies but findings were lost: they failed OCSF
+  validation (for example a replay clock past what a finding can carry) and
+  were not written, so the findings output is incomplete. The summary then
+  says `NOT VERIFIED: evidence chain intact, but N finding(s) were lost`.
+  1 takes precedence over 3. `ReplaySummary::verified()` is false in both
+  cases; `evidence_verified()` and `findings_lost()` tell them apart.
   A malformed JSONL line aborts the run with exit 2. The black box is still
   sealed and verifiable.
 

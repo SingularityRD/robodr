@@ -2,8 +2,16 @@
   "format": "robodr-commission-signoff/1",
   "model": "ugv-fuzz-x1",
   "profile_sha256": "54f88eaab6d5f8044c4509bb10aef51cdbd88fa7a37ce7b39432fbad6718141b",
+  "items_sha256": "607895e57781853c49c8a77415fdd8cdd539893236c5255c035fcd604fcc38b6",
   "operator": "",
   "items": [
+    {
+      "id": "envelope_dimension_unbounded:/cmd_vel joint",
+      "kind": "envelope_dimension_unbounded",
+      "subject": "/cmd_vel joint",
+      "reason": "/cmd_vel has no joint bound (null = unlimited): confirm that joint commands on it must not be limited, or set a bound",
+      "confirmed": false
+    },
     {
       "id": "motion_channel_unreviewed:/cmd_vel",
       "kind": "motion_channel_unreviewed",

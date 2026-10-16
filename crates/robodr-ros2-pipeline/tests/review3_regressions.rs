@@ -109,14 +109,11 @@ fn r3p1_fragmented_f3_is_critical() {
 
 /// R3-P1, pipeline side: a datagram whose discovery content carries
 /// conflicting PID_STATUS_INFO values is surfaced as a High
-/// `ambiguous_discovery`, never left as a Medium/Low removal only. The
-/// pipeline maps `Anomaly::ConflictingDuplicateParameter(PID_STATUS_INFO)`
-/// to that finding (unit test `status_info_conflict_is_an_identity_conflict`
-/// in `pipeline.rs`), but robodr-rtps does not yet report duplicate
-/// *inline-QoS* parameters (the first STATUS_INFO silently wins), so this
-/// end-to-end check waits for the robodr-rtps fix as well.
+/// `ambiguous_discovery`, never left as a Medium/Low removal only.
+/// robodr-rtps reports the duplicate inline-QoS parameter as
+/// `Anomaly::ConflictingDuplicateParameter(PID_STATUS_INFO)`, which the
+/// pipeline maps to that finding.
 #[test]
-#[ignore = "needs robodr-rtps to report conflicting inline-QoS PID_STATUS_INFO (R3-R1)"]
 fn r3p1_status_conflict_reported_by_rtps_is_high() {
     let t = Instant::now();
     let mut p = bound_pipeline(t);
@@ -143,24 +140,21 @@ fn r3p1_status_conflict_reported_by_rtps_is_high() {
 }
 
 /// R3-P1 end to end: the duplicate-fragment status smuggling must not
-/// downgrade F3. Needs the robodr-rtps fix (another agent): today the
-/// reassembler merges the duplicate fragment's inline QoS silently, so the
-/// report holds only an endpoint *removal* and the pipeline has nothing to
-/// judge but a Medium `discovery_removal`. Once robodr-rtps reports the
-/// conflicting status (as an identity-parameter conflict, a fragment event or
-/// by treating the sample as an announcement), this test passes through
-/// `r3p1_status_conflict_reported_by_rtps_is_high` or the Critical binding
-/// mismatch; remove the `ignore` then.
+/// downgrade F3. robodr-rtps reports the conflicting PID_STATUS_INFO of the
+/// duplicate fragment (`FragmentEventKind::ConflictingInlineQos(0x0071)` and
+/// `Anomaly::ConflictingDuplicateParameter(0x0071)`); the pipeline maps it to
+/// a High `ambiguous_discovery` naming PID_STATUS_INFO.
 #[test]
-#[ignore = "needs the robodr-rtps duplicate-fragment status fix (R3-R1)"]
 fn r3p1_status_smuggling_does_not_downgrade_f3() {
     let t = Instant::now();
     let mut p = bound_pipeline(t);
     let f = p.process_at(&f3_frags(true), XIP, t + Duration::from_secs(1));
     assert!(max_sev(&f) >= Some(Severity::High), "{f:#?}");
+    let amb = with_rule(&f, rules::AMBIGUOUS_DISCOVERY);
+    assert_eq!(amb.len(), 1, "{f:#?}");
+    assert_eq!(amb[0].deviation.severity, Severity::High);
     assert!(
-        !with_rule(&f, rules::ENDPOINT_SOURCE_MISMATCH).is_empty()
-            || !with_rule(&f, rules::AMBIGUOUS_DISCOVERY).is_empty(),
+        amb[0].deviation.detail.contains("PID_STATUS_INFO"),
         "{f:#?}"
     );
 }

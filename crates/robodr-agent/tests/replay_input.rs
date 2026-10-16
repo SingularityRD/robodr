@@ -426,17 +426,12 @@ fn saturating_clock_never_panics_and_the_chain_still_verifies() {
     assert!(res.is_err());
 }
 
-/// BUG (not fixed here: changes the CLI exit-code contract, needs the
-/// integrator's decision). When the replay clock runs past what an OCSF
-/// finding can carry (large `--step-ms`, or a start time close to the
-/// limit), the deviation is recorded in the black box but its finding fails
-/// validation and is dropped. `ReplaySummary::verified()` (and therefore the
-/// `robodr-replay` exit code 0 / "VERIFIED") ignores
-/// `stats.finding_errors`, so a run that lost every finding still reports
-/// success. Expected: a run with finding errors is not reported as fully
-/// verified (or exits non-zero).
+/// When the replay clock runs past what an OCSF finding can carry (large
+/// `--step-ms`, or a start time close to the limit), the deviation is
+/// recorded in the black box but its finding fails validation and is
+/// dropped. Such a run is never reported as verified (`robodr-replay` exits
+/// 3, see the CLI test), even though the evidence that was written is sound.
 #[test]
-#[ignore = "known gap: verified() ignores lost findings (finding_errors > 0)"]
 fn lost_findings_are_not_reported_as_verified() {
     let (_run, res) = replay_bytes("lost", rogue(1).as_bytes(), |o| {
         o.step_ns = 18_446_744_073_709 * MS;
@@ -446,6 +441,8 @@ fn lost_findings_are_not_reported_as_verified() {
         sum.stats.finding_errors, 1,
         "precondition: the finding was lost"
     );
+    assert_eq!(sum.findings_lost(), 1);
+    assert!(sum.evidence_verified(), "{:?} {:?}", sum.report, sum.links);
     assert!(!sum.verified(), "a run that lost findings must not verify");
 }
 

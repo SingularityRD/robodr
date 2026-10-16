@@ -6,13 +6,24 @@
 # system, the e-stop or the platform's command authority, and nothing in the
 # robot's motion stack may depend on this unit being up.
 #
-# INTEGRATOR: robodr-agentd was written in parallel with this unit. Confirm
-# against the merged binary:
-#   * the config flag (assumed `--config <file.json>` below),
-#   * that the config can point the black-box key at the systemd credential
-#     path /run/credentials/robodr-agentd.service/blackbox.key,
-#   * the black-box and OCSF spool directories it writes (assumed below),
-#   * whether it calls sd_notify (if yes: Type=notify + WatchdogSec=).
+# Checked against the merged robodr-agentd (crates/robodr-agentd):
+#   * CLI: `robodr-agentd --config <agentd.json> [--check-config]`; exit 0
+#     clean stop (SIGTERM/SIGINT seal the black box), 1 runtime failure,
+#     2 usage/configuration error (nothing started; not restarted, below).
+#   * /etc/robodr/agentd.json must set (absolute paths, strict JSON):
+#       "blackbox": { "dir": "/var/lib/robodr/blackbox/agentd",
+#                     "key_file": "/run/credentials/robodr-agentd.service/blackbox.key" },
+#       "spool":    { "dir": "/var/lib/robodr/spool/agentd" }
+#     The key file may be a `robodr-blackbox keygen` file (key id taken from
+#     it) or legacy hex; agentd refuses it unless it is a regular file, mode
+#     without group/other bits and owned by root or the daemon's uid, which
+#     the systemd credential copy satisfies. An optional unix_socket event
+#     input belongs under /run/robodr-agentd/ (RuntimeDirectory= below; the
+#     socket is created 0600, so producers must run as User=robodr).
+#   * It does not call sd_notify: Type=simple, no WatchdogSec=.
+#   * It reads /proc/sys/kernel/random/boot_id (chain identity) and
+#     /proc/net/{route,fib_trie,if_inet6} (default capture interfaces, local
+#     addresses for the binding check), so ProcSubset=pid must NOT be set.
 #
 # Verify after editing: systemd-analyze verify robodr-agentd.service
 #                       systemd-analyze security robodr-agentd.service
@@ -30,6 +41,8 @@ Type=simple
 ExecStart=/usr/sbin/robodr-agentd --config /etc/robodr/agentd.json
 Restart=on-failure
 RestartSec=5s
+# Exit 2 = usage or configuration error: restarting cannot fix it.
+RestartPreventExitStatus=2
 TimeoutStopSec=30s
 # No WatchdogSec= until the daemon sends WATCHDOG=1 (it would be killed).
 OOMScoreAdjust=-500
@@ -61,8 +74,12 @@ PrivateTmp=yes
 PrivateDevices=yes
 DevicePolicy=closed
 ReadWritePaths=/var/lib/robodr/blackbox/agentd /var/lib/robodr/spool/agentd
+# For an optional unix_socket event input (/run/robodr-agentd/events.sock).
+RuntimeDirectory=robodr-agentd
+RuntimeDirectoryMode=0750
 ProtectProc=invisible
-ProcSubset=pid
+# No ProcSubset=pid: agentd reads /proc/sys/kernel/random/boot_id and
+# /proc/net/{route,fib_trie,if_inet6} (see the header).
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes

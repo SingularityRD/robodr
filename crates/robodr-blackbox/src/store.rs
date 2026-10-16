@@ -145,8 +145,21 @@ pub const QUARANTINE_DIR: &str = "quarantine";
 
 const SEG_PREFIX: &str = "seg-";
 const SEG_SUFFIX: &str = ".rbb";
-/// Allowance for the signature when estimating a frame's size.
+/// Allowance for the signature when estimating a frame's size (covers
+/// HMAC-SHA256, 32 bytes, and Ed25519, 64 bytes).
 const SIG_ESTIMATE: u64 = 72;
+/// Upper bound of a [`SealPayload`]'s JSON (every counter at `u64::MAX` and
+/// the longest reason is under 200 bytes; tested).
+const SEAL_PAYLOAD_MAX: u64 = 256;
+/// Estimated size of a frame carrying `payload_len` payload bytes.
+const fn frame_estimate(payload_len: u64) -> u64 {
+    (FRAME_HEADER_LEN + FIXED_FIELDS_LEN + 32 + 2) as u64 + payload_len + SIG_ESTIMATE
+}
+/// Room kept free in a segment for the seals that may follow the last
+/// caller record into it: a periodic seal right after that record, then the
+/// rotation (or shutdown) seal. Without it a full segment ended
+/// `max_segment_bytes` + one seal frame long.
+const SEAL_RESERVE: u64 = 2 * frame_estimate(SEAL_PAYLOAD_MAX);
 
 /// File name of segment `idx`.
 pub fn segment_file_name(idx: u64) -> String {
@@ -2091,9 +2104,10 @@ impl Recorder {
             self.refused_noncritical += 1;
             return Ok(AppendOutcome::Refused(Refusal::Saturated));
         }
-        let est = (FRAME_HEADER_LEN + FIXED_FIELDS_LEN + 32 + 2) as u64
-            + payload.len() as u64
-            + SIG_ESTIMATE;
+        // The record plus the seals that may still have to go into this
+        // segment after it (see `SEAL_RESERVE` and the README, "Segment
+        // size").
+        let est = frame_estimate(payload.len() as u64) + SEAL_RESERVE;
         // A segment always takes at least one caller record after its header.
         let full = self.seg_len + est > self.cfg.max_segment_bytes && self.seg_records > 1;
         if full {
@@ -2437,6 +2451,29 @@ mod tests {
             None
         );
         assert_eq!(parse_segment_file_name("checkpoint.json"), None);
+    }
+
+    #[test]
+    fn seal_payload_fits_its_reserve() {
+        for reason in [
+            SealReason::Periodic,
+            SealReason::Rotation,
+            SealReason::Export,
+            SealReason::Shutdown,
+            SealReason::Manual,
+            SealReason::KeyRotation,
+        ] {
+            let p = to_json(&SealPayload {
+                reason,
+                segment_index: u64::MAX,
+                records_since_last_seal: u64::MAX,
+                prev_seal_seq: Some(u64::MAX),
+                refused_noncritical: u64::MAX,
+                refused_critical: u64::MAX,
+            })
+            .unwrap();
+            assert!(p.len() as u64 <= SEAL_PAYLOAD_MAX, "{} bytes", p.len());
+        }
     }
 
     #[test]

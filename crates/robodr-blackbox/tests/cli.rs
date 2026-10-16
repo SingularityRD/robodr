@@ -264,3 +264,18 @@ fn inspect_lists_frames_without_verdict() {
         Some(2)
     );
 }
+
+/// An argument that is not valid UTF-8 is a usage error (exit 2), never a
+/// panic.
+#[test]
+fn non_utf8_argument_is_a_usage_error() {
+    use std::os::unix::ffi::OsStrExt;
+    for args in [vec![&b"\xff"[..]], vec![b"verify", b"/tmp/\xc0"]] {
+        let o = bin()
+            .args(args.iter().map(|a| std::ffi::OsStr::from_bytes(a)))
+            .output()
+            .unwrap();
+        assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+        assert!(!text(&o).contains("panicked"), "{}", text(&o));
+    }
+}

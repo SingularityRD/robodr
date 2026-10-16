@@ -1,0 +1,17 @@
+{
+  "robot": { "id": "ugv-007", "site": "site-a", "profile_version": "v1" },
+  "sensor": {
+    "profile_path": "/etc/robodr/profile.json",
+    "listen_spdp": false,
+    "capture": { "enabled": true, "interfaces": ["eth0"] }
+  },
+  "policy_path": "/etc/robodr/response-policy.json",
+  "blackbox": {
+    "dir": "/var/lib/robodr/blackbox/agentd",
+    "key_file": "/run/credentials/robodr-agentd.service/blackbox.key"
+  },
+  "spool": { "dir": "/var/lib/robodr/spool/agentd" },
+  "event_inputs": [ { "kind": "unix_socket", "path": "/run/robodr-agentd/events.sock" } ],
+  "context": { "safety_state": "unknown", "control": "autonomous" },
+  "daemon": { "tick_ms": 1000, "heartbeat_ms": 10000, "silence_ms": 30000 }
+}

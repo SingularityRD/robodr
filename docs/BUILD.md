@@ -54,13 +54,23 @@ cd robodr
 
 # Pure crates: no kernel, no robot, no Pulsar toolchain needed.
 cargo fmt --all -- --check
-cargo clippy --workspace --exclude robodr-sensor-ros2 --all-targets -- -D warnings
-cargo test   --workspace --exclude robodr-sensor-ros2
+cargo clippy --workspace --exclude robodr-sensor-ros2 --exclude robodr-pulsard --all-targets -- -D warnings
+cargo test   --workspace --exclude robodr-sensor-ros2 --exclude robodr-pulsard
 
 # Pulsar-bound crates (need the packages listed in the next section).
-cargo build -p robodr-sensor-ros2
-cargo test  -p robodr-sensor-ros2
+cargo build -p robodr-sensor-ros2 -p robodr-pulsard
+cargo test  -p robodr-sensor-ros2 -p robodr-pulsard
 ```
+
+The pure set is every other member: `robodr-agent`, `-agentd`, `-blackbox`,
+`-capture`, `-cdr`, `-commission`, `-diode`, `-events`, `-firewall`,
+`-motion`, `-ocsf`, `-responder`, `-ros2-pipeline`, `-rtps`. CI covers them
+workspace-wide (no list to maintain).
+
+Binaries built from the pure set (all shipped in the `.deb`, all checked by
+`scripts/ci-repro.sh`): `robodr-replay`, `robodr-agentd`, `robodr-blackbox`,
+`robodr-commission`, `robodr-diode-pack`, `robodr-diode-unpack`,
+`robodr-ros2-watch`. Pulsar-bound: `robodr-pulsard`.
 
 The submodule must be checked out even for the pure crates: cargo loads the
 whole workspace manifest, and `pulsar-core` is a path dependency.
@@ -277,9 +287,9 @@ checked separately.
 | Job | Required | What |
 |---|---|---|
 | `lockfile` | yes | Committed `Cargo.lock` has no local/patched/git/unknown sources; if none is committed, generate + upload the bootstrap lock and **fail** (every other job also fails without it) |
-| `scripts` | yes | Python self-tests of the CI scripts, `shellcheck scripts/*.sh` |
+| `scripts` | yes | Python self-tests of the CI scripts, Pulsar rule validation, `shellcheck scripts/*.sh packaging/*.sh` |
 | `pure` | yes | `fmt --check`, `clippy -D warnings`, `test` for every member except Pulsar-bound ones |
-| `pulsar` | yes | Installs Pulsar's build packages, then `build` / `clippy -D warnings` / `test` of every Pulsar-bound member (`robodr-sensor-ros2`, later `robodr-pulsard`). No kernel load |
+| `pulsar` | yes | Installs Pulsar's build packages, then `build` / `clippy -D warnings` / `test` of every Pulsar-bound member (`robodr-sensor-ros2`, `robodr-pulsard`). No kernel load |
 | `msrv` | informational | `cargo +1.87.0 check` of the pure crates |
 | `deny` | yes | `cargo deny check advisories bans licenses sources` (`deny.toml`) |
 | `sbom` | yes | CycloneDX via cargo-cyclonedx **and** the std-only fallback; uploaded as artifact |

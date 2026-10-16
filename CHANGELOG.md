@@ -19,13 +19,43 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   `.deb` builder; an offline install bundle with verify/install/rollback
   (`packaging/`).
 - Man pages for `robodr-commission(1)`, `robodr-replay(1)`,
-  `robodr-ros2-watch(1)` and `robodr-pulsard(8)` (`man/`).
+  `robodr-ros2-watch(1)`, `robodr-pulsard(8)`, `robodr-agentd(8)`,
+  `robodr-blackbox(1)`, `robodr-diode-pack(1)` and `robodr-diode-unpack(1)`
+  (`man/`).
+- `config/agentd.example.json`, matching the `robodr-agentd` unit's paths.
+- `robodr-agentd` accepts a `robodr-blackbox keygen` key file
+  (`robodr-blackbox-key/v1`; key id taken from it) besides bare hex.
 - Tag-triggered release workflow: `--locked` build, reproducibility check
   of the released binaries, CycloneDX SBOM, SHA-256 checksums, minisign
   signatures, offline bundle per architecture (amd64, arm64).
 - `SECURITY.md`, this changelog, and `docs/OPERATIONS.md` (air-gapped
   install, key generation and rotation, commissioning, upgrade and rollback,
   evidence export).
+
+### Changed
+
+- **Breaking (`robodr-replay`)**: `--key-hex` and `--key-id` are removed (a
+  key on argv is readable through `/proc`). `--key-file` now takes a
+  `robodr-blackbox-key/v1` file (`robodr-blackbox keygen`), permission-checked
+  by `KeyFile::load`; the key id comes from the file.
+- `robodr-replay run` exits 3 (not 0, never "VERIFIED") when findings were
+  lost (failed OCSF validation); `ReplaySummary::verified()` is false then,
+  `evidence_verified()` / `findings_lost()` tell the cases apart.
+- Every RoboDR binary reports a non-UTF-8 argument as a usage error (exit 2)
+  instead of panicking.
+- `robodr-ros2-pipeline`: conflicting inline QoS between the fragments of
+  one discovery sample (`FragmentEventKind::ConflictingInlineQos`) is a High
+  `robot.ros2.ambiguous_discovery`, read from the fragment events as well as
+  the (bounded) anomaly list.
+- `robodr-sensor-ros2` passes captured datagrams to the pipeline with their
+  ingress (`Pipeline::process_datagram`), so loopback spoofing on an external
+  interface is judged as such.
+- `robodr-blackbox`: rotation keeps room for the two seals that may follow
+  the last record, so segments no longer end one seal frame past
+  `max_segment_bytes` (remaining exceptions documented in its README).
+- `robodr-agentd.service`: `ProcSubset=pid` removed (the daemon reads
+  `/proc/sys/kernel/random/boot_id` and `/proc/net/*`), no restart on exit 2,
+  `RuntimeDirectory=robodr-agentd` for a unix-socket event input.
 
 ## [0.1.0-alpha.1] - 2026-10-16
 

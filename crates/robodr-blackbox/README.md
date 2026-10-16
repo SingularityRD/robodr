@@ -265,9 +265,26 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
   `Error::Locked` if another recorder (in any process, including this one)
   holds it. The kernel releases it when the recorder is dropped or the process
   dies. On non-unix targets there is no lock.
-- **Rotation:** when the next record would push the segment past
-  `max_segment_bytes`, the recorder writes a rotation seal, creates the next
-  segment and writes `SegmentStart` into it.
+- **Rotation:** when the next record, plus room for two seal frames (a
+  periodic seal that may follow it and the rotation or shutdown seal that
+  closes the segment), would push the segment past `max_segment_bytes`, the
+  recorder writes a rotation seal, creates the next segment and writes
+  `SegmentStart` into it.
+- **Segment size:** `max_segment_bytes` is a rotation threshold, not a hard
+  cap enforced on every write. With signatures of at most 72 bytes
+  (HMAC-SHA256: 32, Ed25519: 64) a segment stays within it, *except*:
+  (1) a single caller record that does not fit even in a fresh segment (a
+  segment always takes one caller record after its header; payloads are
+  capped by `max_payload_bytes`); (2) housekeeping records beyond the two
+  reserved seals that must go into the current segment: a `Saturation`
+  record when no reserve segment is left, extra `seal()` / export seals,
+  key-rotation records and their seal, and the resume / quarantine records
+  written at `open`; (3) a signer whose signatures exceed 72 bytes (up to
+  1024 are accepted), which makes every size estimate low. Each exception
+  adds at most one frame per such record. Earlier builds (before the
+  two-seal reserve) let every full segment end about one seal frame (about
+  200 bytes) past the threshold, e.g. 4291 bytes with
+  `max_segment_bytes = 4096`; such logs verify unchanged.
 - **Cyclic mode:** this is a ring of `max_segments`. Before the oldest segment
   is deleted, a signed `SegmentDropped` record is written. It names the
   segment, its seq range, the hash of its last record, and whether it had been

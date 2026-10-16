@@ -113,10 +113,16 @@ jobs:
         # One rule that fails to load disables Pulsar's whole rules-engine.
         run: python3 scripts/validate_rules.py --pulsar-src vendor/pulsar --strict
       - name: shellcheck
-        run: shellcheck scripts/*.sh
+        # CI scripts and the packaging scripts that run on the robot
+        # (install-bundle.sh) or build the release (build-deb.sh, make-bundle.sh).
+        run: shellcheck scripts/*.sh packaging/*.sh
 
   # ---------------------------------------------------------------------------
   pure:
+    # Workspace-wide minus the Pulsar-bound members (scripts/ci-pure-excludes.py),
+    # so every pure crate is covered without a list to maintain: robodr-agent,
+    # -agentd, -blackbox, -capture, -cdr, -commission, -diode, -events,
+    # -firewall, -motion, -ocsf, -responder, -ros2-pipeline, -rtps.
     name: Pure crates (fmt, clippy, test)
     runs-on: ubuntu-24.04
     steps:
@@ -197,8 +203,9 @@ jobs:
 
   # ---------------------------------------------------------------------------
   msrv:
-    # Informational until every crate opts in with `rust-version.workspace = true`
-    # (then flip continue-on-error off). Checks the pure crates on the MSRV.
+    # Informational. Every crate now opts in with `rust-version.workspace = true`;
+    # flip continue-on-error off once this job has passed on the runners (it has
+    # not been run on 1.87 outside CI). Checks the pure crates on the MSRV.
     name: MSRV check (informational)
     runs-on: ubuntu-24.04
     continue-on-error: true

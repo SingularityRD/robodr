@@ -32,8 +32,8 @@ fn base(bb: &Path) -> Vec<String> {
         p(ex.join("policy-oem-validated.json")),
         "--blackbox".into(),
         p(bb.to_path_buf()),
-        "--key-hex".into(),
-        key_hex(),
+        "--key-file".into(),
+        key_arg(),
         "--robot-id".into(),
         ROBOT.into(),
         "--safety-state".into(),
@@ -60,9 +60,7 @@ const VALUED: &[&str] = &[
     "profile",
     "policy",
     "blackbox",
-    "key-hex",
     "key-file",
-    "key-id",
     "robot-id",
     "out",
     "outcomes",
@@ -132,12 +130,11 @@ fn single_valued_options_cannot_repeat() {
         ("start-ms", "1"),
         ("step-ms", "1"),
         ("partitions", "1"),
-        ("key-hex", "00"),
-        ("key-id", "k"),
+        ("key-file", "k"),
         ("out", "x"),
     ] {
         let mut extra = vec![format!("--{name}"), v.to_string()];
-        if !["events", "robot-id", "safety-state", "key-hex"].contains(&name) {
+        if !["events", "robot-id", "safety-state", "key-file"].contains(&name) {
             extra.extend([format!("--{name}"), v.to_string()]);
         }
         let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
@@ -290,51 +287,98 @@ fn key_sources_are_validated() {
         "--robot-id".into(),
         ROBOT.into(),
     ];
-    let big = dir.join("big.key");
-    std::fs::write(&big, "4".repeat(5000)).unwrap();
-    let good_file = dir.join("good.key");
-    std::fs::write(&good_file, format!("  {}\r\n\n", key_hex())).unwrap();
-    let bad_file = dir.join("bad.key");
-    std::fs::write(&bad_file, "zz".repeat(32)).unwrap();
+    let k = |name: &str, text: &str, mode: u32| {
+        let p = dir.join(name);
+        write_mode(&p, text, mode);
+        p
+    };
+    let good = key_json("hmac-sha256", "site-key-1", &key_hex());
+    let big = k("big.key", &"4".repeat(300 * 1024), 0o600);
+    let raw_hex = k("raw.key", &format!("{}\n", key_hex()), 0o600);
+    let bad_hex = k(
+        "badhex.key",
+        &key_json("hmac-sha256", "k", &"zz".repeat(32)),
+        0o600,
+    );
+    let short = k(
+        "short.key",
+        &key_json("hmac-sha256", "k", &"ab".repeat(16)),
+        0o600,
+    );
+    let ed = k("ed.key", &key_json("ed25519", "k", &"ab".repeat(32)), 0o600);
+    let unknown = k(
+        "unknown.key",
+        &good.replace("\"secret_hex\"", "\"extra\":1,\"secret_hex\""),
+        0o600,
+    );
+    let group = k("group.key", &good, 0o640);
+    let world = k("world.key", &good, 0o604);
+    let link = dir.join("link.key");
+    let target = k("target.key", &good, 0o600);
+    std::os::unix::fs::symlink(&target, &link).unwrap();
     let missing = dir.join("missing.key");
     let s = |p: &Path| p.to_string_lossy().into_owned();
     for (args, needle) in [
-        (vec![], "--key-hex or --key-file is required".to_string()),
+        (vec![], "--key-file is required".to_string()),
         (
-            vec![
-                "--key-hex".into(),
-                key_hex(),
-                "--key-file".into(),
-                s(&good_file),
-            ],
-            "not both".to_string(),
+            vec!["--key-hex".into(), key_hex()],
+            "--key-hex was removed".into(),
         ),
         (
-            vec!["--key-hex".into(), "xyz".into()],
-            "not valid hex".into(),
+            vec!["--key-id".into(), "k".into()],
+            "--key-id was removed".into(),
+        ),
+        (vec!["--key-file".into(), s(&big)], "exceeds".into()),
+        (
+            vec!["--key-file".into(), s(&raw_hex)],
+            "malformed key file".into(),
         ),
         (
-            vec!["--key-hex".into(), "abc".into()],
-            "not valid hex".into(),
+            vec!["--key-file".into(), s(&bad_hex)],
+            "secret_hex is not hex".into(),
         ),
-        (vec!["--key-hex".into(), "".into()], "key".into()),
-        (vec!["--key-hex".into(), "ab".repeat(16 - 1)], "key".into()),
-        (vec!["--key-file".into(), s(&big)], "larger than".into()),
+        (vec!["--key-file".into(), s(&short)], "at least".into()),
         (
-            vec!["--key-file".into(), s(&bad_file)],
-            "not valid hex".into(),
+            vec!["--key-file".into(), s(&ed)],
+            "unsupported key algorithm".into(),
+        ),
+        (
+            vec!["--key-file".into(), s(&unknown)],
+            "malformed key file".into(),
+        ),
+        (vec!["--key-file".into(), s(&group)], "chmod 600".into()),
+        (vec!["--key-file".into(), s(&world)], "chmod 600".into()),
+        (
+            vec!["--key-file".into(), s(&link)],
+            "not a regular file".into(),
         ),
         (vec!["--key-file".into(), s(&missing)], "missing.key".into()),
-        (vec!["--key-file".into(), s(&dir)], "".into()),
+        (
+            vec!["--key-file".into(), s(&dir)],
+            "not a regular file".into(),
+        ),
     ] {
         let o = bin().args(&common).args(&args).output().unwrap();
         assert_usage_error(&o, &bb, &needle, &format!("{args:?}"));
     }
-    // A key file with surrounding whitespace and CRLF is accepted.
+    // A good key file (mode 0600, explicit key id) is accepted, and the key
+    // id from the file is the one the chain is bound to.
+    let good_file = k("good.key", &good, 0o600);
     let o = bin()
         .args(&common)
         .args(["--key-file".into(), s(&good_file)])
         .args(["--safety-state", "moving_slow"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let o = bin()
+        .args([
+            "verify",
+            "--blackbox",
+            &s(&bb),
+            "--key-file",
+            &s(&good_file),
+        ])
         .output()
         .unwrap();
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
@@ -431,7 +475,7 @@ fn accepted_forms_inline_values_explicit_run_and_valid_enums() {
             ex.join("policy-oem-validated.json").display()
         ))
         .arg(format!("--blackbox={}", bb.display()))
-        .arg(format!("--key-hex={}", key_hex()))
+        .arg(format!("--key-file={}", key_arg()))
         .arg(format!("--robot-id={ROBOT}"))
         .arg("--safety-state=collaborative_human_nearby")
         .arg("--control=teleop")
@@ -450,8 +494,8 @@ fn accepted_forms_inline_values_explicit_run_and_valid_enums() {
         .arg(format!("--out={}", out.display()))
         .output()
         .unwrap();
-    // Valid usage: the run happens (exit 0 or 1, never 2).
-    assert!(matches!(o.status.code(), Some(0 | 1)), "{}", stderr(&o));
+    // Valid usage: the run happens (exit 0, 1 or 3, never 2).
+    assert!(matches!(o.status.code(), Some(0 | 1 | 3)), "{}", stderr(&o));
     assert!(bb.exists());
     // Every safety state is accepted.
     for (i, s) in [
@@ -497,7 +541,7 @@ fn help_and_empty_invocations() {
     }
     // `verify` requires its own options.
     let o = bin()
-        .args(["verify", "--key-hex", &key_hex()])
+        .args(["verify", "--key-file", &key_arg()])
         .output()
         .unwrap();
     assert_eq!(o.status.code(), Some(2));
@@ -508,25 +552,51 @@ fn help_and_empty_invocations() {
             "verify",
             "--blackbox",
             "/nonexistent/robodr-bb",
-            "--key-hex",
+            "--key-file",
         ])
-        .arg(key_hex())
+        .arg(key_arg())
         .output()
         .unwrap();
     assert_ne!(o.status.code(), Some(0), "{}", stderr(&o));
 }
 
-/// BUG (not fixed here: `src/bin/robodr-replay.rs` is outside this task's
-/// scope). `main` collects `std::env::args()`, which panics on an argument
-/// that is not valid Unicode, so the binary aborts with exit code 101 and a
-/// panic message instead of a usage error (exit 2). Fix: use
-/// `std::env::args_os()` and report non-UTF-8 arguments as usage errors.
+/// An argument that is not valid Unicode is a usage error (exit 2), never
+/// a panic (101): `main` reads `std::env::args_os()`.
 #[cfg(unix)]
 #[test]
-#[ignore = "known bug: non-UTF-8 argv panics (exit 101) instead of exit 2"]
 fn non_utf8_argument_is_a_usage_error() {
     use std::os::unix::ffi::OsStrExt;
     let arg = std::ffi::OsStr::from_bytes(b"--events=\xff\xfe");
     let o = bin().arg(arg).output().unwrap();
     assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    assert!(stderr(&o).contains("not valid UTF-8"), "{}", stderr(&o));
+    assert!(!stderr(&o).contains("panicked"), "{}", stderr(&o));
+    // Also in a value position and after the subcommand.
+    let o = bin()
+        .arg("verify")
+        .arg("--blackbox")
+        .arg(std::ffi::OsStr::from_bytes(b"/tmp/\xc0"))
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+}
+
+/// A run whose findings could not all be written (the replay clock ran
+/// past what an OCSF finding can carry) is not reported as VERIFIED and
+/// exits 3, distinct from a verification failure (1) and an error (2).
+#[test]
+fn lost_findings_exit_3_and_are_not_verified() {
+    let dir = tmpdir("flags-lost");
+    let bb = dir.join("bb");
+    let mut args = base(&bb);
+    args.extend(["--step-ms".to_string(), "18446744073709".to_string()]);
+    let o = bin().args(&args).output().unwrap();
+    let err = stderr(&o);
+    assert_eq!(o.status.code(), Some(3), "{err}");
+    assert!(err.contains("finding(s) were lost"), "{err}");
+    assert!(
+        !err.contains("VERIFIED: evidence chain intact end to end"),
+        "{err}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
 }

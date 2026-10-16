@@ -315,7 +315,7 @@ impl<'a> Daemon<'a> {
             ms.feedback_sources = m.feedback_sources.clone();
             acfg.monitor = Some(ms);
         }
-        let signer = match &cfg.blackbox.key_id {
+        let signer = match &r.key_id {
             Some(id) => HmacSha256Key::new(id.as_str(), &r.key.0),
             None => HmacSha256Key::with_derived_id(&r.key.0),
         }

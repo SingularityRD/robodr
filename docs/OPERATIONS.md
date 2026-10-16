@@ -121,33 +121,37 @@ private copy (`/run/credentials/<unit>/blackbox.key`). The reasons are in
 > the black-box key is a *shared secret*. Whoever holds it can verify
 > evidence, and can also **forge** it. Keep exactly two copies: one on the
 > robot, and one in the verifier's protected store on the high side. Never
-> put it in a ticket, a chat, a command line (`--key-hex` is visible in
-> `/proc`) or a backup that is not encrypted. An asymmetric backend (Ed25519
+> put it in a ticket, a chat, a command line (argv is visible in `/proc`;
+> no RoboDR tool accepts a key on its command line) or a backup that is not encrypted. An asymmetric backend (Ed25519
 > or a TPM-held key) is planned. With it, the verifier holds only a public key.
 
 ### 4.2 Generate a key
 
-**available from 0.1.0-alpha.2**: `robodr-blackbox keygen`. Run
-`robodr-blackbox keygen --help` for its exact flags. It writes a new random
-key in the format the recorder reads, with owner-only permissions:
-
-```sh
-sudo sh -c 'umask 077; robodr-blackbox keygen ... > /etc/robodr/keys/agentd-blackbox.key'
-```
-
-**0.1.0-alpha.1 (interim, coreutils only)**: the recorder accepts a hex key
-of at least 32 bytes. `robodr-replay --key-file` reads hex plus whitespace.
-
-```sh
-sudo sh -c 'umask 077; od -An -tx1 -N32 /dev/urandom | tr -d " \n" > /etc/robodr/keys/agentd-blackbox.key'
-sudo chown root:root /etc/robodr/keys/agentd-blackbox.key
-sudo chmod 0600 /etc/robodr/keys/agentd-blackbox.key
-```
+**available**: `robodr-blackbox keygen`. It draws 32 bytes from
+`/dev/urandom` (and fails rather than fall back to weaker randomness), writes
+a `robodr-blackbox-key/v1` key file with mode `0600`, never overwrites an
+existing file, never writes through a symlink, and prints only the key id.
 
 Choose a **key id**: printable, no spaces, at most 128 characters, for example
 `ugv-07-bb-2026q4`. It is recorded in the chain identity, and the verifier
-uses it to pick the right key. Record it in the robot's commissioning file and
-set it in the agent config (`/etc/robodr/agentd.json`).
+uses it to pick the right key. Record it in the robot's commissioning file.
+
+```sh
+sudo robodr-blackbox keygen --out /etc/robodr/keys/agentd-blackbox.key --key-id ugv-07-bb-2026q4
+sudo chown root:root /etc/robodr/keys/agentd-blackbox.key   # keygen already sets 0600
+```
+
+`robodr-agentd` reads this file directly (`blackbox.key_file`; the key id
+comes from the file, so `blackbox.key_id` in `/etc/robodr/agentd.json` can be
+left out, and if it is set it must match). `robodr-replay --key-file` and
+`robodr-blackbox verify --keyring` read the same file. All of them refuse a
+key file that is a symlink or that group or others can access.
+
+*Legacy 0.1.0-alpha.1 key files* (bare hex, made with `od ... /dev/urandom`)
+are still accepted by `robodr-agentd` (key id from `blackbox.key_id`, else
+derived from the key), but not by `robodr-replay` or `robodr-blackbox`.
+Convert one by generating a new key at the next rotation (4.3); do not
+hand-write JSON around an old secret on a shared terminal.
 
 Then copy the key to the verifier's protected store on the high side, using
 vetted media. The diode is one-way, so the key cannot cross it.
@@ -172,13 +176,14 @@ one**. No evidence is lost or rewritten.
    sudo systemd-tmpfiles --create robodr.conf   # recreates blackbox/agentd with the right owner
    ```
 
-4. Generate the new key (4.2), set the new key id in `/etc/robodr/agentd.json`,
-   and copy the key to the verifier.
+4. Generate the new key (4.2) with a new key id (if `blackbox.key_id` is set
+   in `/etc/robodr/agentd.json`, update it to match), and copy the key to the
+   verifier.
 5. `sudo systemctl start robodr-agentd`, then check the journal for the new
    chain's genesis.
 6. Verify the archived chain once more with the retired key
-   (`robodr-replay verify --blackbox <archive dir> --key-file <retired key>
-   --key-id <old>`). Then follow the site's retention rule: keep the retired
+   (`robodr-blackbox verify <archive dir> --keyring <retired key>`). The key
+   id is read from the retired key file. Then follow the site's retention rule: keep the retired
    key as long as the archived evidence has to remain verifiable.
 
 **Suspected key compromise:** follow the same steps, but treat every record
@@ -371,8 +376,7 @@ Far side, with the verifier's copy of the key:
 ```sh
 sha256sum -c SHA256SUMS-$ts
 mkdir bb && tar -C bb -xzf blackbox-agentd-$ts.tar.gz
-robodr-replay verify --blackbox bb/agentd --key-file /secure/agentd-blackbox.key \
-    --key-id <key-id> --robot-id <robot-id>
+robodr-blackbox verify bb/agentd --keyring /secure/agentd-blackbox.key --device <robot-id>
 ```
 
 A copy taken while the agent is writing can end in a half-written frame. The

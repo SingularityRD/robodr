@@ -22,7 +22,7 @@ fn run_demo(dir: &Path, extra: &[&str]) -> Output {
         .arg(ex.join("policy-oem-validated.json"))
         .arg("--blackbox")
         .arg(dir)
-        .args(["--key-hex", &key_hex(), "--robot-id", ROBOT])
+        .args(["--key-file", &key_arg(), "--robot-id", ROBOT])
         .args(["--safety-state", "moving_slow", "--firewall"])
         .args(["--firewall-max-angular", "/cmd_vel=1.0"])
         .args(extra);
@@ -66,7 +66,7 @@ fn demo_run_writes_valid_findings_and_verifies() {
     let v = bin()
         .args(["verify", "--blackbox"])
         .arg(&dir2)
-        .args(["--key-hex", &key_hex(), "--robot-id", ROBOT, "--findings"])
+        .args(["--key-file", &key_arg(), "--robot-id", ROBOT, "--findings"])
         .arg(&findings)
         .output()
         .unwrap();
@@ -82,7 +82,7 @@ fn demo_run_writes_valid_findings_and_verifies() {
     let v = bin()
         .args(["verify", "--blackbox"])
         .arg(&dir2)
-        .args(["--key-hex", &key_hex(), "--findings"])
+        .args(["--key-file", &key_arg(), "--findings"])
         .arg(&findings)
         .output()
         .unwrap();
@@ -108,7 +108,7 @@ fn motion_demo_reports_injected_telemetry() {
         .arg(ex.join("policy-oem-validated.json"))
         .arg("--blackbox")
         .arg(&dir)
-        .args(["--key-hex", &key_hex(), "--robot-id", ROBOT])
+        .args(["--key-file", &key_arg(), "--robot-id", ROBOT])
         .args(["--safety-state", "moving_slow", "--step-ms", "20"])
         .args([
             "--monitor",
@@ -146,7 +146,7 @@ fn observe_mode_demo_with_the_unvalidated_example_policy() {
         .arg(policy)
         .arg("--blackbox")
         .arg(&dir)
-        .args(["--key-hex", &key_hex(), "--robot-id", ROBOT, "--firewall"])
+        .args(["--key-file", &key_arg(), "--robot-id", ROBOT, "--firewall"])
         .args(["--firewall-max-angular", "/cmd_vel=1.0"])
         .arg("--outcomes")
         .arg(&outcomes)
@@ -174,7 +174,7 @@ fn usage_and_input_errors_exit_2() {
     assert_eq!(bin().output().unwrap().status.code(), Some(2));
     // Help.
     assert_eq!(bin().arg("--help").output().unwrap().status.code(), Some(0));
-    // Unknown option / bad enum / short key / bad hex / zero step.
+    // Unknown option / bad enum / zero step / bad pairs and numbers.
     for extra in [
         vec!["--bogus", "1"],
         vec!["--safety-state", "flying"],
@@ -185,6 +185,13 @@ fn usage_and_input_errors_exit_2() {
         let out = run_demo(&dir, &extra);
         assert_eq!(out.status.code(), Some(2), "{extra:?}: {}", stderr(&out));
     }
+    // A key file whose secret is too short (16 bytes).
+    let short_key = dir.with_extension("short.key");
+    write_mode(
+        &short_key,
+        &key_json("hmac-sha256", "k", &"ab".repeat(16)),
+        0o600,
+    );
     let short = bin()
         .args([
             "--events",
@@ -196,10 +203,14 @@ fn usage_and_input_errors_exit_2() {
             "--blackbox",
         ])
         .arg(&dir)
-        .args(["--key-hex", "abcd", "--robot-id", ROBOT])
+        .arg("--key-file")
+        .arg(&short_key)
+        .args(["--robot-id", ROBOT])
         .output()
         .unwrap();
-    assert_eq!(short.status.code(), Some(2));
+    assert_eq!(short.status.code(), Some(2), "{}", stderr(&short));
+    assert!(stderr(&short).contains("at least"), "{}", stderr(&short));
+    std::fs::remove_file(&short_key).unwrap();
     // Missing events file.
     let ex = examples();
     let missing = bin()
@@ -209,7 +220,7 @@ fn usage_and_input_errors_exit_2() {
         .arg(ex.join("policy-oem-validated.json"))
         .arg("--blackbox")
         .arg(dir.join("bb-missing"))
-        .args(["--key-hex", &key_hex(), "--robot-id", ROBOT])
+        .args(["--key-file", &key_arg(), "--robot-id", ROBOT])
         .output()
         .unwrap();
     assert_eq!(missing.status.code(), Some(2), "{}", stderr(&missing));
@@ -233,7 +244,7 @@ fn malformed_input_aborts_but_the_black_box_stays_verifiable() {
         .arg(ex.join("policy-oem-validated.json"))
         .arg("--blackbox")
         .arg(&bb)
-        .args(["--key-hex", &key_hex(), "--robot-id", ROBOT])
+        .args(["--key-file", &key_arg(), "--robot-id", ROBOT])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
@@ -245,7 +256,7 @@ fn malformed_input_aborts_but_the_black_box_stays_verifiable() {
     let v = bin()
         .args(["verify", "--blackbox"])
         .arg(&bb)
-        .args(["--key-hex", &key_hex()])
+        .args(["--key-file", &key_arg()])
         .output()
         .unwrap();
     assert_eq!(v.status.code(), Some(0), "{}", stderr(&v));

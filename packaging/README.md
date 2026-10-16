@@ -165,9 +165,11 @@ packaging/make-bundle.sh --deb dist/robodr_*_amd64.deb --sbom-dir dist/sbom --ou
 ```
 
 `build-deb.sh` requires `robodr-commission`, `robodr-replay` and
-`robodr-ros2-watch`. It adds `robodr-pulsard`, `robodr-agentd` and
-`robodr-blackbox` if they were built, and installs each unit only together with
-its binary. The release workflow sets `ROBODR_DEB_REQUIRE=robodr-pulsard`.
+`robodr-ros2-watch`. It adds `robodr-pulsard`, `robodr-agentd`,
+`robodr-blackbox`, `robodr-diode-pack` and `robodr-diode-unpack` if they were
+built, and installs each unit (and each man page) only together with its
+binary. The release workflow sets `ROBODR_DEB_REQUIRE` to all five, so a
+release cannot silently ship without them.
 Building twice with the same `SOURCE_DATE_EPOCH` gives an identical `.deb`;
 this was checked with stub binaries.
 
@@ -177,8 +179,11 @@ this was checked with stub binaries.
   unverified: the capability set, `SystemCallFilter=`, the read-only `/sys`
   together with Pulsar's "multiple bpf fs mounts" check, and AF_PACKET
   capture under `IPAddressDeny=any`.
-- `robodr-agentd`'s flags, config path, key path and spool layout are
-  assumptions that its author must confirm. They are marked `INTEGRATOR` in
-  the unit.
+- `robodr-agentd`'s flags, config path, key path and directories were
+  checked against the merged daemon (the unit's header lists them).
+  `config/agentd.example.json` (installed under
+  `/usr/share/doc/robodr/examples/`) uses exactly the unit's paths; a unit
+  test in `robodr-agentd` keeps the two in sync. The daemon itself has not
+  run under this unit on a real host (see the first point).
 - `install-bundle.sh install` and `rollback` have not been run against `dpkg`
   on a target. Only `verify` and the bundle round-trip were exercised.

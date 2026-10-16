@@ -206,7 +206,9 @@ fn drops_content(a: &Anomaly) -> bool {
 #[derive(Debug, Default)]
 struct Ambiguity {
     /// Identity PIDs repeated with conflicting values or carried as a
-    /// non-canonical string (sorted, distinct).
+    /// non-canonical string, and inline-QoS PIDs that conflict between the
+    /// fragments of one sample (`FragmentEventKind::ConflictingInlineQos`)
+    /// (sorted, distinct).
     conflicting_pids: Vec<u16>,
     /// More anomalies than the parser records: an identity conflict cannot
     /// be ruled out (an attacker could pad the list with junk first).
@@ -224,6 +226,15 @@ impl Ambiguity {
             .iter()
             .filter_map(identity_conflict_pid)
             .collect();
+        // Fragments of one sample whose inline QoS (PID_STATUS_INFO /
+        // PID_KEY_HASH) disagree: status smuggling through a duplicate or
+        // later fragment (R3-R1). robodr-rtps also records the anomaly, but
+        // the anomaly list is bounded and the fragment events are not
+        // crowded out by it, so both are read.
+        pids.extend(report.fragment_events.iter().filter_map(|e| match e.kind {
+            FragmentEventKind::ConflictingInlineQos(pid) => Some(pid),
+            _ => None,
+        }));
         pids.sort_unstable();
         pids.dedup();
         Self {
@@ -1455,9 +1466,9 @@ mod tests {
         d
     }
 
-    /// R3-P1 (pipeline side): once robodr-rtps reports a conflicting
-    /// PID_STATUS_INFO (duplicate-fragment / inline-QoS status smuggling) as
-    /// an identity-parameter conflict, it is High `ambiguous_discovery` and
+    /// R3-P1 (pipeline side): a conflicting PID_STATUS_INFO reported by
+    /// robodr-rtps (duplicate-fragment / inline-QoS status smuggling) as
+    /// an identity-parameter conflict is High `ambiguous_discovery` and
     /// makes writers in the datagram motion writers for the binding check.
     #[test]
     fn status_info_conflict_is_an_identity_conflict() {

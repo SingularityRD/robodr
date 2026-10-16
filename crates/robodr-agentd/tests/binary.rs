@@ -80,6 +80,59 @@ fn usage_and_config_errors_exit_2() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("tick_msec"));
 }
 
+/// `blackbox.key_file` may be a `robodr-blackbox-key/v1` file as written by
+/// `robodr-blackbox keygen`; its key id is used, and a `blackbox.key_id`
+/// that contradicts it is a configuration error. A non-UTF-8 argument is a
+/// usage error, never a panic.
+#[test]
+fn json_key_files_and_non_utf8_arguments() {
+    use std::os::unix::ffi::OsStrExt;
+    let out = Command::new(BIN)
+        .arg(std::ffi::OsStr::from_bytes(b"--config=\xff"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("panicked"));
+
+    let s = setup("bin-jsonkey", &robot_profile(true));
+    std::fs::remove_file(&s.key).unwrap();
+    robodr_blackbox::KeyFile::hmac_from_secret(&KEY, Some(KEY_ID))
+        .unwrap()
+        .write_new(&s.key)
+        .unwrap();
+    let mut cfg = s.config(
+        serde_json::json!({}),
+        serde_json::json!([{"kind": "stdin"}]),
+        serde_json::json!({}),
+    );
+    let check = |cfg: &serde_json::Value| {
+        Command::new(BIN)
+            .arg("--config")
+            .arg(s.write_config(cfg))
+            .arg("--check-config")
+            .output()
+            .unwrap()
+    };
+    // Same id in both places, and the id only in the key file.
+    let out = check(&cfg);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    cfg["blackbox"].as_object_mut().unwrap().remove("key_id");
+    let r = s.resolve(&cfg);
+    assert_eq!(r.key_id.as_deref(), Some(KEY_ID));
+    assert_eq!(r.key.0, KEY.to_vec());
+    // Contradicting ids.
+    cfg["blackbox"]["key_id"] = serde_json::json!("other-key");
+    let out = check(&cfg);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("contradicts"));
+    let _ = std::fs::remove_dir_all(&s.dir);
+}
+
 fn graceful_stop(sig: i32, tag: &str) {
     let s = setup(tag, &robot_profile(true));
     let cfg = s.config(

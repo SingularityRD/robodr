@@ -34,7 +34,7 @@ const FLAGS: &[&str] = &[
 ];
 
 fn main() -> ExitCode {
-    let args = match cli::parse_args(std::env::args().skip(1), FLAGS) {
+    let args = match cli::argv().and_then(|v| cli::parse_args(v, FLAGS)) {
         Ok(a) => a,
         Err(e) if e == "help" => {
             println!("{USAGE}");

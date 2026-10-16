@@ -22,6 +22,19 @@ pub struct Args {
 
 /// Parse `--flag value` pairs; every flag must be in `known`.
 /// `--help`/`-h` yields `Err("help")`.
+/// The process arguments (without the program name) as UTF-8 strings. An
+/// argument that is not valid UTF-8 is an error (a usage error for the
+/// binaries), never a panic as with `std::env::args()`.
+pub fn argv() -> Result<Vec<String>, String> {
+    std::env::args_os()
+        .skip(1)
+        .map(|a| {
+            a.into_string()
+                .map_err(|a| format!("argument {a:?} is not valid UTF-8"))
+        })
+        .collect()
+}
+
 pub fn parse_args(args: impl IntoIterator<Item = String>, known: &[&str]) -> Result<Args, String> {
     let mut it = args.into_iter();
     let mut out = Args::default();

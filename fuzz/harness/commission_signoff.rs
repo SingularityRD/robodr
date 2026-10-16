@@ -4,8 +4,13 @@
 //!
 //! Input: arbitrary bytes, tried as JSON. Invariants beyond "no panic":
 //! `lock` succeeds only for a sign-off whose shape is valid, that is bound
-//! to the draft's digest, names an operator and has every item confirmed;
-//! a successful lock yields a locked profile.
+//! to the draft's digest, whose `items_sha256` seals the items present
+//! (nothing deleted, added or reworded), names an operator and has every
+//! item confirmed; a successful lock yields a locked profile.
+//!
+//! Seeds (`fuzz/corpus/commission_signoff/`) are `Signoff::for_profile(&draft())`
+//! serialised as-is (unconfirmed) and after `confirm_all("op-1")`; regenerate
+//! them that way whenever the sign-off format changes.
 #![allow(dead_code)]
 
 use robodr_commission::signoff::draft_digest;
@@ -48,6 +53,7 @@ pub fn run(data: &[u8]) {
             draft_digest(&p),
             "lock ignored the digest"
         );
+        assert!(so.items_intact(), "lock accepted a tampered item set");
         assert!(!so.operator.trim().is_empty(), "lock accepted no operator");
         assert_eq!(
             so.unconfirmed().count(),

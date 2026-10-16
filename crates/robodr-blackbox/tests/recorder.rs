@@ -473,3 +473,32 @@ fn saturation_state_survives_reopen() {
     r.close().unwrap();
     assert!(verify_path(d.path()).is_intact());
 }
+
+/// Segment size: with an HMAC (or Ed25519) key, a periodic seal after the
+/// last record and the rotation / shutdown seal still fit, so no segment of
+/// a normally written log exceeds `max_segment_bytes` (README "Segment
+/// size" lists the remaining exceptions).
+#[test]
+fn segments_stay_within_max_segment_bytes() {
+    for seal_every in [0, 1, 3] {
+        let d = TestDir::new("segsize");
+        let mut c = cfg(d.path(), big());
+        c.seal_every_records = seal_every;
+        let max = c.max_segment_bytes;
+        let mut r = open(c);
+        for i in 0..200 {
+            recorded(r.append_note(&note(i), i % 7 == 0).unwrap());
+        }
+        r.close().unwrap();
+        let all = segs(d.path());
+        assert!(all.len() > 3, "rotated ({} segments)", all.len());
+        for s in &all {
+            assert!(
+                s.bytes.len() as u64 <= max,
+                "seal_every {seal_every}: {} is {} bytes > {max}",
+                s.name,
+                s.bytes.len()
+            );
+        }
+    }
+}

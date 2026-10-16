@@ -31,6 +31,50 @@ pub fn key_hex() -> String {
     "42".repeat(32)
 }
 
+/// A `robodr-blackbox-key/v1` file holding [`KEY`] (key id derived from the
+/// key), mode 0600, created once per test process. `robodr-replay` takes
+/// keys only from such a file (`--key-file`).
+pub fn key_file() -> PathBuf {
+    static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let p = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("robodr-replay-test-{}.key", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        robodr_blackbox::KeyFile::hmac_from_secret(&KEY, None)
+            .unwrap()
+            .write_new(&p)
+            .unwrap();
+        p
+    })
+    .clone()
+}
+
+/// [`key_file`] as an argument string.
+pub fn key_arg() -> String {
+    key_file().to_string_lossy().into_owned()
+}
+
+/// Write `text` to a new file with mode `mode` (for hand-made key files).
+pub fn write_mode(path: &Path, text: &str, mode: u32) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let _ = std::fs::remove_file(path);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)
+        .unwrap();
+    f.write_all(text.as_bytes()).unwrap();
+}
+
+/// A key file's JSON text with the given fields.
+pub fn key_json(algorithm: &str, key_id: &str, secret_hex: &str) -> String {
+    format!(
+        r#"{{"format":"robodr-blackbox-key/v1","algorithm":"{algorithm}","key_id":"{key_id}","secret_hex":"{secret_hex}"}}"#
+    )
+}
+
 /// A fresh, empty directory under the system temp dir.
 pub fn tmpdir(tag: &str) -> PathBuf {
     static N: AtomicU64 = AtomicU64::new(0);
