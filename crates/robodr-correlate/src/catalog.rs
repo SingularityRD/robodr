@@ -33,8 +33,10 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     "robot.profile.invalid_envelope",
     "robot.motion.linear_over_envelope",
     "robot.motion.joint_over_envelope",
+    "robot.motion.angular_over_envelope",
     // robodr-ros2-pipeline
     "robot.ros2.profile_refused",
+    "robot.ros2.profile_state_tampered",
     "robot.ros2.participant_removed",
     "robot.rtps.malformed_discovery",
     "robot.rtps.fragmented_discovery",
@@ -94,6 +96,11 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     "robot.agent.pipeline_lag",
     "robot.agent.spool_full",
     "robot.agent.evidence_degraded",
+    "robot.agent.evidence_quarantined",
+    // robodr-agentd live safety-state feed
+    "robot.safety_state.untrusted_source",
+    "robot.safety_state.undecodable_sample",
+    "robot.safety_state.unmapped_value",
 ];
 
 /// Names of the host-side Pulsar rules in `rules/robodr/*.toml`.

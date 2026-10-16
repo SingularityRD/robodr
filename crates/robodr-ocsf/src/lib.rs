@@ -39,8 +39,8 @@ pub mod taint;
 pub mod validate;
 
 pub use builder::{
-    effective_mode, finding_uid, ocsf_severity_id, ocsf_severity_name, rule_info, FindingBuilder,
-    RobotContext, RuleInfo, Subject,
+    effective_mode, finding_uid, ocsf_severity_id, ocsf_severity_name, rule_info,
+    rule_info_for_contract, FindingBuilder, RobotContext, RuleInfo, Subject,
 };
 pub use kafka::{dedup_key, headers, partition_for, record, record_key, to_json, Record};
 pub use model::*;

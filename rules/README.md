@@ -128,8 +128,9 @@ The harness uses only the Python standard library (3.11+ for `tomllib`). It:
 The last run gave: self-test 88/88; drift mutation test 12/12; 89/89
 upstream rules accepted; no schema or grammar drift; 62 RoboDR rules in 7
 files; 429/429 fixtures pass; benign corpus 201 events, 0 false positives,
-14 allow-listed hits; 0 errors and 17 warnings (all "argv literal contains
-a space" on the FindPython exclusion, see the CMake note below). Mutation checks showed the harness catches problems: flipping every
+14 allow-listed hits; 0 errors and 0 warnings (`--strict`; the FindPython
+exclusion's literals with spaces are accepted because the same AND chain pins
+`payload.argc == 3`, see the CMake note below). Mutation checks showed the harness catches problems: flipping every
 negative fixture gave 44 errors, and changing `argv: Argv` in a copy of
 `event.rs` was reported as drift.
 
@@ -196,9 +197,10 @@ image, uid or path still fires.
 
 Deliberately **not** excluded, and allow-listed in the benign corpus with
 the reason: py3compile writing `__pycache__/*.pyc` into `/usr/lib/python3`
-(a forged `.pyc` is a code hook; precompile at commissioning), CMake's
-FindPython `python -c` probes (see the one-liner rule), and the apt/dpkg
-audit-trail rules.
+(a forged `.pyc` is a code hook; precompile at commissioning), the two
+CMake 3.28 FindPython `python3 -c` probes that no DSL literal can express
+(17 of the 19 probe texts **are** excluded by exact argv in the one-liner
+rule; see the CMake note below), and the apt/dpkg audit-trail rules.
 
 ## Deployment: ELF check and noexec (needed for full hook coverage)
 
@@ -318,10 +320,12 @@ needs prevention (hardening) or a probe change.
   (fixtures show that an extra element, appended code, another interpreter
   path or `argv[0]`, or `-Ic` still fire); the other two still fire and are
   allow-listed in the benign corpus. **Validator note:** every probe text
-  contains spaces and `validate_rules.py` warns on every `argv CONTAINS`
-  literal with a space, so this branch gives 17 warnings and `--strict`
-  fails until the validator accepts deliberate exact-element literals (for
-  example when `argc` is pinned in the same rule).
+  contains spaces. `validate_rules.py` warns on an `argv CONTAINS` literal
+  with a space (it is one whole element, never a command-line substring)
+  *unless* an enclosing AND chain of the same rule requires
+  `payload.argc == N`; the exclusion pins `argc == 3`, so it is accepted and
+  `--strict` is clean. A literal with a space without a pinned argc, or
+  with the pin only in an OR sibling, is still warned about.
 * **No environment, no parent image.** Pulsar's `Exec` event has neither.
   `ROS_SECURITY_ENABLE=false` / `ROS_SECURITY_STRATEGY=Permissive` (security
   switched off) leave **no** file trace at all: nothing is opened. Inline DDS

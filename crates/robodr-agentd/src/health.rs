@@ -43,6 +43,10 @@ pub mod rules {
     pub const PIPELINE_LAG: &str = "robot.agent.pipeline_lag";
     pub const SPOOL_FULL: &str = "robot.agent.spool_full";
     pub const EVIDENCE_DEGRADED: &str = "robot.agent.evidence_degraded";
+    /// The black box quarantined damaged closed segments when it was opened.
+    pub const EVIDENCE_QUARANTINED: &str = "robot.agent.evidence_quarantined";
+    /// The correlation engine evicted or refused pending state.
+    pub const CORRELATION_PRESSURE: &str = "robot.agent.correlation_pressure";
 }
 
 /// Thresholds (milliseconds).

@@ -1,0 +1,125 @@
+.\" robodr-kafka-publish(1). Source of truth: the USAGE text in
+.\" crates/robodr-export/src/bin/robodr-kafka-publish.rs and the crate README.
+.\" Keep them in sync.
+.TH ROBODR\-KAFKA\-PUBLISH 1 "2026-10-16" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
+.SH NAME
+robodr\-kafka\-publish \- publish RoboDR findings to the robot\-edr.findings Kafka topic
+.SH SYNOPSIS
+.B robodr\-kafka\-publish
+.B \-\-bootstrap
+.I HOST:PORT
+.RB [ \-\-bootstrap
+.IR HOST:PORT ]...
+.B \-\-state\-dir
+.I DIR
+.RB ( \-\-diode\-out
+.I DIR
+|
+.B \-\-spool
+.IR DIR )
+.RB [ \-\-topic
+.IR T ]
+.RB [ \-\-chunk
+.IR N ]
+.RB [ \-\-client\-id
+.IR S ]
+.RB [ \-\-request\-timeout\-ms
+.IR N ]
+.RB [ \-\-delivery\-timeout\-ms
+.IR N ]
+.RB [ \-\-retries
+.IR N ]
+.RB [ \-\-max\-request\-bytes
+.IR N ]
+.RB [ \-\-interval\-ms
+.IR N ]
+.RB [ \-\-once ]
+.SH DESCRIPTION
+SOC\-side (high side) publisher. It reads either the
+.BR robodr\-diode\-unpack (1)
+importer's
+.IB DIR /<batch>/records.jsonl
+.RB ( \-\-diode\-out )
+or a connected site's
+.BR robodr\-agentd (8)
+spool
+.RB ( \-\-spool ),
+re\-validates every finding, requires its key and headers to be exactly those
+derived from the value (contract \(sc2), computes the partition from the robot
+id and the topic's current partition count (contract \(sc4) and produces the
+record value byte for byte. An optional per\-finding signature header
+.B robodr\-finding\-sig
+(contract \(sc2a) must be the last header; it is shape\-checked and forwarded
+verbatim, for the consumer to verify. Invalid or broker\-rejected records go to
+a dead\-letter file; progress (committed line count per batch, done markers)
+is replaced atomically after each acknowledged chunk.
+.PP
+Producer settings: acks=all, idempotence off (at\-least\-once delivery:
+consumers drop duplicates on
+.BR event\-uid ),
+one request in flight, no compression.
+.B No TLS or SASL:
+run it on an isolated SOC network or through a local TLS proxy.
+Not yet tested against a real Kafka broker.
+.PP
+Without
+.B \-\-once
+it publishes every
+.B \-\-interval\-ms
+and retries after an error; each step that published, dead\-lettered or
+finished a batch prints a JSON report on stdout.
+.SH OPTIONS
+.TP
+.BI \-\-bootstrap " HOST:PORT"
+Bootstrap broker (repeatable, at least one).
+.TP
+.BI \-\-state\-dir " DIR"
+Progress, done markers and dead letters.
+.TP
+.BI \-\-diode\-out " DIR\fR | " \-\-spool " DIR"
+The input (exactly one).
+.TP
+.BI \-\-topic " T"
+Topic (default
+.BR robot\-edr.findings ).
+.TP
+.BI \-\-chunk " N"
+Records per produce request (default 500).
+.TP
+.BI \-\-client\-id " S"
+Kafka client id (default
+.BR robodr\-kafka\-publish ).
+.TP
+.BI \-\-request\-timeout\-ms " N\fR, " \-\-delivery\-timeout\-ms " N"
+Per\-request deadline (default 30000) and total delivery deadline per chunk
+(default 120000).
+.TP
+.BI \-\-retries " N"
+Retries of retriable errors (default 10, exponential backoff).
+.TP
+.BI \-\-max\-request\-bytes " N"
+Largest produce request (default 1 MiB).
+.TP
+.BI \-\-interval\-ms " N"
+Loop interval, > 0 (default 2000).
+.TP
+.B \-\-once
+One pass, then exit.
+.SH EXIT STATUS
+.TP
+.B 0
+Success
+.RB ( \-\-once ).
+.TP
+.B 1
+Error with
+.B \-\-once
+(without it, errors are printed and retried).
+.TP
+.B 2
+Usage error.
+.SH SEE ALSO
+.BR robodr\-spool\-export (1),
+.BR robodr\-diode\-unpack (1),
+.BR robodr\-agentd (8),
+/usr/share/doc/robodr/OPERATIONS.md

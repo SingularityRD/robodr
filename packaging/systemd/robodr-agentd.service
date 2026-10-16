@@ -22,7 +22,11 @@
 #     without group/other bits and owned by root or the daemon's uid, which
 #     the systemd credential copy satisfies. An optional unix_socket event
 #     input belongs under /run/robodr-agentd/ (RuntimeDirectory= below; the
-#     socket is created 0600, so producers must run as User=robodr).
+#     socket is created 0600, so producers must run as User=robodr); so does
+#     the optional safety_feed socket (safety-PLC gateway).
+#   * Optional per-finding signing key (finding_signing.key_file): installed
+#     with the drop-in example 20-finding-key.conf.example (LoadCredential=
+#     finding.key), never the black-box key.
 #   * sd_notify (std-only, crates/robodr-agentd/src/notify.rs): READY=1 once
 #     started (Type=notify), WATCHDOG=1 from the main loop at most every 1 s,
 #     STATUS=state <ok|degraded|unknown> each tick, STOPPING=1 at shutdown.

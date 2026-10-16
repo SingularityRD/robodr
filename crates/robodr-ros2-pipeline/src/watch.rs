@@ -61,6 +61,14 @@ OPTIONS:
                            accept this exact (older) profile file once
     --expect-platform <p>  the profile's metadata.platform must be <p>
     --expect-unit <id>     the profile's metadata.unit_id must be null or <id>
+    --trust-roots <file>   trust roots (robodr-trust-roots/v1): verify the
+                           trust file's signed min_profile_version floor and
+                           the revocation list
+    --revocations <file>   signed profile revocation list
+                           (robodr-profile-revocations/v1; needs --trust-roots)
+    --revocations-required refuse every locked profile while the list file
+                           is missing (default: optional until one was
+                           accepted)
     --domain <id>          ROS_DOMAIN_ID whose well-known ports are captured
                            (repeatable, 0..=232; default 0). RTPS on other
                            ports is still caught by the 'RTPS' magic
@@ -214,6 +222,27 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, St
                 {
                     return Err("--expect-unit given twice".into());
                 }
+            }
+            "--trust-roots" => {
+                if trust
+                    .trust_roots
+                    .replace(abs(value("--trust-roots")?))
+                    .is_some()
+                {
+                    return Err("--trust-roots given twice".into());
+                }
+            }
+            "--revocations" => {
+                if trust
+                    .revocation_list
+                    .replace(abs(value("--revocations")?))
+                    .is_some()
+                {
+                    return Err("--revocations given twice".into());
+                }
+            }
+            "--revocations-required" if inline.is_none() => {
+                trust.revocation_policy = robodr_commission::trust::RevocationPolicy::Required;
             }
             "--pcap" => {
                 if pcap.replace(PathBuf::from(value("--pcap")?)).is_some() {
@@ -527,6 +556,68 @@ mod tests {
             Command::Run(a) => *a,
             other => panic!("expected run, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn revocation_and_trust_root_flags() {
+        let a = run_args(&[
+            "--profile",
+            "p.json",
+            "--pcap",
+            "x.pcap",
+            "--trust-roots",
+            "/etc/robodr/trust-roots.json",
+            "--revocations=/etc/robodr/profile-revocations.json",
+            "--revocations-required",
+        ]);
+        assert_eq!(
+            a.trust.trust_roots.as_deref(),
+            Some(std::path::Path::new("/etc/robodr/trust-roots.json"))
+        );
+        assert_eq!(
+            a.trust.revocation_list.as_deref(),
+            Some(std::path::Path::new("/etc/robodr/profile-revocations.json"))
+        );
+        assert_eq!(
+            a.trust.revocation_policy,
+            robodr_commission::trust::RevocationPolicy::Required
+        );
+        // Relative paths are made absolute (the trust config requires it).
+        let a = run_args(&[
+            "--profile",
+            "p.json",
+            "--pcap",
+            "x.pcap",
+            "--trust-roots",
+            "roots.json",
+            "--revocations",
+            "rev.json",
+        ]);
+        assert!(a.trust.trust_roots.unwrap().is_absolute());
+        assert_eq!(
+            a.trust.revocation_policy,
+            robodr_commission::trust::RevocationPolicy::Optional
+        );
+        // A list needs roots; required needs a list; no duplicates.
+        assert!(
+            p(&["--profile", "p", "--pcap", "x", "--revocations", "/r.json"])
+                .unwrap_err()
+                .contains("trust_roots")
+        );
+        assert!(p(&["--profile", "p", "--pcap", "x", "--revocations-required"]).is_err());
+        assert!(p(&[
+            "--profile",
+            "p",
+            "--pcap",
+            "x",
+            "--trust-roots",
+            "/a",
+            "--trust-roots",
+            "/b"
+        ])
+        .unwrap_err()
+        .contains("twice"));
+        assert!(USAGE.contains("--revocations-required"));
     }
 
     #[test]

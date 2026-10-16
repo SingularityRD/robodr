@@ -592,6 +592,39 @@ impl Agent {
         self.recorder.as_ref().and_then(Recorder::head)
     }
 
+    /// Write the black box's `head.json` high-water mark now if records were
+    /// appended since the last mark (`Recorder::mark_head`). Call it from a
+    /// housekeeping timer so the unmarked tail is bounded in time while no
+    /// records arrive. `Ok(true)` = a mark was written, `Ok(false)` =
+    /// nothing new to mark, `Err` = the black box is unavailable or the
+    /// mark failed (recording goes on; see `Recorder::mark_failures`).
+    pub fn mark_blackbox_head(&mut self) -> Result<bool, String> {
+        let Some(rec) = self.recorder.as_mut() else {
+            return Err("black box unavailable".into());
+        };
+        let Some((seq, _)) = rec.head() else {
+            return Ok(false);
+        };
+        if rec.head_mark().is_some_and(|m| m >= seq) {
+            return Ok(false);
+        }
+        rec.mark_head().map(|()| true).map_err(|e| e.to_string())
+    }
+
+    /// Closed black-box segments the current recorder found damaged and
+    /// quarantined when it was opened (or last reopened after an outage).
+    /// Empty while the black box is unavailable.
+    pub fn blackbox_quarantined(&self) -> &[u64] {
+        self.recorder
+            .as_ref()
+            .map_or(&[], Recorder::quarantined_at_open)
+    }
+
+    /// `head.json` marks the current recorder could not write.
+    pub fn blackbox_mark_failures(&self) -> u64 {
+        self.recorder.as_ref().map_or(0, Recorder::mark_failures)
+    }
+
     /// Handle `event` at the injected clock's current time.
     pub fn tick(&mut self, event: &RobotEvent, safety: SafetyState) -> Vec<Outcome> {
         let now = self.clock.now();

@@ -8,6 +8,7 @@ operator installs on a robot. The procedures that use it are in
 |---|---|---|
 | `systemd/robodr-pulsard.service` | `/usr/lib/systemd/system/` | eBPF + ROS 2 sensor daemon |
 | `systemd/robodr-agentd.service` | `/usr/lib/systemd/system/` | decision chain, black box, OCSF spool (only if the binary is built) |
+| `systemd/robodr-agentd.service.d/20-finding-key.conf.example` | `/usr/share/doc/robodr/examples/` | optional drop-in: `LoadCredential=` for the per-finding signing key (OPERATIONS 6.4) |
 | `systemd/robodr-pulsard.service.d/10-cap-sys-admin.conf.example` | `/usr/share/doc/robodr/examples/` | opt-in for kernels < 5.8 |
 | `tmpfiles.d/robodr.conf` | `/usr/lib/tmpfiles.d/` | directories, modes, owners |
 | `sysusers.d/robodr.conf` | `/usr/lib/sysusers.d/` | the `robodr` system user |
@@ -91,6 +92,7 @@ Neither watchdog has been exercised under a real systemd yet.
 ├── response-policy.json         0640 root:robodr   response policy (operator-created)
 └── keys/                        0700 root:root     key material, root only
     ├── agentd-blackbox.key      0600 root:root     black-box key of robodr-agentd
+    ├── agentd-finding.key       0600 root:root     optional per-finding signing key (drop-in 20-finding-key)
     ├── pulsard-blackbox.key     0600 root:root     (when the Pulsar module records)
     └── retired/                 0700 root:root     rotated keys kept for verification
 /var/lib/robodr/                 0750 root:robodr
@@ -174,10 +176,14 @@ packaging/make-bundle.sh --deb dist/robodr_*_amd64.deb --sbom-dir dist/sbom --ou
 
 `build-deb.sh` requires `robodr-commission`, `robodr-replay` and
 `robodr-ros2-watch`. It adds `robodr-pulsard`, `robodr-agentd`,
-`robodr-blackbox`, `robodr-diode-pack` and `robodr-diode-unpack` if they were
-built, and installs each unit (and each man page) only together with its
-binary. The release workflow sets `ROBODR_DEB_REQUIRE` to all five, so a
-release cannot silently ship without them.
+`robodr-blackbox`, `robodr-diode-pack`, `robodr-diode-unpack`,
+`robodr-spool-export` (robot side: agentd spool -> diode outbox) and
+`robodr-kafka-publish` (SOC side: importer output or a connected spool ->
+Kafka) if they were built, and installs each unit (and each man page) only
+together with its binary. The release workflow sets `ROBODR_DEB_REQUIRE` to
+all seven, so a release cannot silently ship without them. The two exporters
+ship without systemd units (run them from a timer or the transfer procedure;
+see `docs/OPERATIONS.md`).
 Building twice with the same `SOURCE_DATE_EPOCH` gives an identical `.deb`;
 this was checked with stub binaries.
 

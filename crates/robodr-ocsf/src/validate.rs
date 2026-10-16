@@ -46,7 +46,7 @@
 //! * **Raw document** ([`parse_and_validate`]): duplicate object keys are
 //!   rejected at any depth (serde_json would silently keep the last one).
 
-use crate::builder::{ocsf_severity_id, ocsf_severity_name, rfc3339_ms, rule_info};
+use crate::builder::{ocsf_severity_id, ocsf_severity_name, rfc3339_ms, rule_info_for_contract};
 use crate::hash::{hex, sha256};
 use crate::model::*;
 use crate::taint::{
@@ -589,7 +589,9 @@ pub fn validate(env: &FindingEnvelope) -> Result<(), Vec<ValidationError>> {
     // Constant-like fields are derived from the trusted rule catalog by the
     // builder; anything else (e.g. prose aimed at an LLM triage step in a
     // forged or replayed message) is rejected, not merely charset-checked.
-    let info = rule_info(&ec.rule_id);
+    // The catalog of the message's own contract minor (entries added later
+    // were not available to its producer).
+    let info = rule_info_for_contract(&ec.rule_id, &env.contract_version);
     c.eq(
         env.title.as_str(),
         info.title,

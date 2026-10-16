@@ -11,7 +11,8 @@
 #   required: robodr-commission robodr-replay robodr-ros2-watch
 #   optional: robodr-pulsard (Pulsar-bound; needs the clang/eBPF toolchain)
 #             robodr-agentd, robodr-blackbox, robodr-diode-pack,
-#             robodr-diode-unpack (pure crates; the release requires them)
+#             robodr-diode-unpack, robodr-spool-export,
+#             robodr-kafka-publish (pure crates; the release requires them)
 # A unit file is only installed together with its binary. ROBODR_DEB_REQUIRE
 # (space separated) makes optional binaries mandatory; the release workflow
 # sets it so a release can never silently ship without the daemon.
@@ -80,7 +81,7 @@ install_bin() { # name dest-dir required(0/1)
 for b in robodr-commission robodr-replay robodr-ros2-watch; do
     install_bin "$b" usr/bin 1
 done
-for b in robodr-blackbox robodr-diode-pack robodr-diode-unpack; do
+for b in robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish; do
     install_bin "$b" usr/bin 0 || true
 done
 
@@ -106,6 +107,8 @@ if install_bin robodr-pulsard usr/sbin 0; then
 fi
 if install_bin robodr-agentd usr/sbin 0; then
     install -D -m 0644 "$here/systemd/robodr-agentd.service" "$pkg/$units/robodr-agentd.service"
+    install -D -m 0644 "$here/systemd/robodr-agentd.service.d/20-finding-key.conf.example" \
+        "$pkg/usr/share/doc/robodr/examples/robodr-agentd.service.d/20-finding-key.conf.example"
 fi
 
 install -D -m 0644 "$here/tmpfiles.d/robodr.conf" "$pkg/usr/lib/tmpfiles.d/robodr.conf"

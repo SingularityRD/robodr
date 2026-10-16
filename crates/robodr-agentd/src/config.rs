@@ -79,6 +79,16 @@
 //!   and / or a local socket; see [`crate::safety`]. With a feed,
 //!   `context.safety_state` must be left `unknown` (it would be ignored),
 //!   and the feed's socket path must differ from every event socket.
+//! * `correlation` (optional, [`CorrelationSection`]; on by default):
+//!   `{"enabled": true, "rules_path": null, "include_default_rules": true}`.
+//!   The shipped `robodr-correlate` rules plus an optional rule file,
+//!   validated as one set ([`correlation_rules`]); a file that does not load
+//!   refuses the configuration (never a partial set). See the daemon docs.
+//! * `finding_signing` (optional, [`FindingSigningSection`]):
+//!   `{"key_file": "/etc/robodr/finding.key"}`, a dedicated Ed25519 key
+//!   (not the black-box key, not HMAC, not inside the spool or black-box
+//!   directory; same file checks as the black-box key, see [`finding_key`]).
+//!   Every finding then carries the contract §2a `robodr-finding-sig` header.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -194,6 +204,51 @@ pub struct DaemonConfig {
     /// `context.safety_state`.
     #[serde(default)]
     pub safety_feed: Option<crate::safety::SafetyFeedSection>,
+    /// Weak-signal correlation over every finding (see [`CorrelationSection`]).
+    #[serde(default)]
+    pub correlation: CorrelationSection,
+    /// Dedicated per-finding signing key (contract §2a); `None` = findings
+    /// are emitted unsigned.
+    #[serde(default)]
+    pub finding_signing: Option<FindingSigningSection>,
+}
+
+/// `correlation`: the `robodr-correlate` engine over every finding the
+/// daemon reports. On by default with the shipped rule set.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CorrelationSection {
+    /// `false` turns correlation off (every finding is still reported on
+    /// its own).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Additional rules (`robodr-correlate` JSON rule file, version 1). Each
+    /// id must be unique across the shipped and the added rules.
+    #[serde(default)]
+    pub rules_path: Option<PathBuf>,
+    /// `false` = use only `rules_path` (the shipped rules are dropped).
+    #[serde(default = "default_true")]
+    pub include_default_rules: bool,
+}
+
+impl Default for CorrelationSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            rules_path: None,
+            include_default_rules: true,
+        }
+    }
+}
+
+/// `finding_signing`: sign every finding record with a dedicated Ed25519
+/// key (`robodr-blackbox keygen` secret key file, same permission rules as
+/// the black-box key). The signature travels in the `robodr-finding-sig`
+/// header of the spooled Kafka record (contract §2a).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FindingSigningSection {
+    pub key_file: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -421,6 +476,10 @@ pub struct Resolved {
     pub boot_id: String,
     /// The validated live safety-state feed, if configured.
     pub safety_feed: Option<crate::safety::FeedSpec>,
+    /// The correlation rules (`None` = correlation disabled).
+    pub correlation: Option<robodr_correlate::RuleSet>,
+    /// The dedicated finding-signing key: Ed25519 seed and key id.
+    pub finding_key: Option<(KeyBytes, String)>,
     /// Non-fatal warnings to log at start.
     pub warnings: Vec<String>,
 }
@@ -840,6 +899,26 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
             }
         }),
     };
+    let correlation = correlation_rules(&config.correlation, &mut warnings)?;
+    let finding_key = match &config.finding_signing {
+        None => None,
+        Some(fs) => {
+            require_abs("finding_signing.key_file", &fs.key_file)?;
+            // The exporter ships the spool; the recorder owns its directory.
+            let k = resolve_path(&fs.key_file);
+            for (what, d) in [
+                ("spool.dir", &config.spool.dir),
+                ("blackbox.dir", &config.blackbox.dir),
+            ] {
+                if k.starts_with(resolve_path(d)) {
+                    return Err(format!(
+                        "finding_signing.key_file must not be inside {what}"
+                    ));
+                }
+            }
+            Some(finding_key(&fs.key_file, &key, key_id.as_deref())?)
+        }
+    };
     Ok(Resolved {
         config,
         sensor,
@@ -856,8 +935,91 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         key_id,
         boot_id,
         safety_feed,
+        correlation,
+        finding_key,
         warnings,
     })
+}
+
+/// Build the correlation rule set from the `correlation` section: the
+/// shipped rules and / or `rules_path`, validated as one set (unique ids,
+/// at most `robodr_correlate` limits). A rule file that does not load
+/// refuses the configuration (never a partial set).
+pub fn correlation_rules(
+    c: &CorrelationSection,
+    warnings: &mut Vec<String>,
+) -> Result<Option<robodr_correlate::RuleSet>, String> {
+    use robodr_correlate::{RuleFile, RuleSet, DEFAULT_RULES_JSON};
+    if !c.enabled {
+        if c.rules_path.is_some() {
+            warnings.push("correlation.rules_path is ignored: correlation is disabled".into());
+        }
+        return Ok(None);
+    }
+    let mut file = RuleFile {
+        version: 1,
+        rules: Vec::new(),
+    };
+    if c.include_default_rules {
+        let d: RuleFile = serde_json::from_str(DEFAULT_RULES_JSON)
+            .map_err(|e| format!("shipped correlation rules: {e}"))?;
+        file.rules.extend(d.rules);
+    }
+    if let Some(p) = &c.rules_path {
+        require_abs("correlation.rules_path", p)?;
+        let text = read_capped(p, MAX_CONFIG_BYTES)?;
+        // Validate the file on its own first (size, version, strict parse).
+        RuleSet::from_json(&text).map_err(|e| format!("{}: {e}", p.display()))?;
+        let extra: RuleFile =
+            serde_json::from_str(&text).map_err(|e| format!("{}: {e}", p.display()))?;
+        file.rules.extend(extra.rules);
+    }
+    if file.rules.is_empty() {
+        return Err(
+            "correlation: no rules (include_default_rules is false and no rules_path);              set enabled = false to turn correlation off"
+                .into(),
+        );
+    }
+    let (set, w) = RuleSet::from_file(&file).map_err(|e| format!("correlation rules: {e}"))?;
+    warnings.extend(w.into_iter().map(|w| format!("correlation rules: {w}")));
+    Ok(Some(set))
+}
+
+/// Load the dedicated finding-signing key: an Ed25519 `robodr-blackbox`
+/// secret key file (same file checks as [`read_key`]) with a key id. Refused
+/// if it is HMAC (a symmetric key lets every verifier forge findings), has
+/// no key id, or is the black-box key itself (by bytes or key id: findings
+/// and evidence must not share a key).
+pub fn finding_key(
+    path: &Path,
+    blackbox_key: &KeyBytes,
+    blackbox_key_id: Option<&str>,
+) -> Result<(KeyBytes, String), String> {
+    require_abs("finding_signing.key_file", path)?;
+    let m = read_key(path)?;
+    if m.algorithm != robodr_blackbox::sign_ed25519::ED25519 {
+        return Err(format!(
+            "finding_signing.key_file {}: must be an ed25519 key (got {}); generate one with \
+             `robodr-blackbox keygen`",
+            path.display(),
+            robodr_ros2_pipeline::sanitize(&m.algorithm)
+        ));
+    }
+    let Some(id) = m.key_id else {
+        return Err(format!(
+            "finding_signing.key_file {}: no key_id",
+            path.display()
+        ));
+    };
+    if m.key.0 == blackbox_key.0 || blackbox_key_id == Some(id.as_str()) {
+        return Err(
+            "finding_signing.key_file is the black-box key: use a dedicated finding key".into(),
+        );
+    }
+    // Probe: the key must produce a valid finding signature.
+    let signer = signer_for(&m.algorithm, &m.key, Some(&id))?;
+    robodr_ocsf::sign_value("", signer.as_ref()).map_err(|e| format!("finding key: {e}"))?;
+    Ok((m.key, id))
 }
 
 fn sanitize_path(s: &str) -> String {
@@ -1215,6 +1377,40 @@ mod tests {
             "tmpfiles.d does not create {:?} for robodr",
             state.parent()
         );
+        // Wave-6 keys: revocation / trust roots, safety feed on the unit's
+        // runtime directory, correlation, and the finding key through the
+        // shipped drop-in's credential.
+        assert!(s.profile_trust.trust_roots.is_some());
+        assert!(s.profile_trust.revocation_list.is_some());
+        let feed = c.safety_feed.as_ref().expect("safety_feed");
+        let sock = feed.socket.as_ref().expect("safety_feed.socket");
+        assert!(sock.path.starts_with("/run/robodr-agentd/"), "{sock:?}");
+        assert_eq!(c.context.safety_state, SafetyState::Unknown);
+        assert!(c.correlation.enabled && c.correlation.include_default_rules);
+        let mut w = Vec::new();
+        let rules = correlation_rules(&c.correlation, &mut w).unwrap().unwrap();
+        assert_eq!(
+            rules.len(),
+            robodr_correlate::RuleSet::default_rules().len()
+        );
+        assert!(w.is_empty(), "{w:?}");
+        let fk = &c
+            .finding_signing
+            .as_ref()
+            .expect("finding_signing")
+            .key_file;
+        assert_eq!(
+            fk,
+            Path::new("/run/credentials/robodr-agentd.service/finding.key")
+        );
+        let dropin =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                "../../packaging/systemd/robodr-agentd.service.d/20-finding-key.conf.example",
+            ))
+            .unwrap();
+        assert!(dropin
+            .lines()
+            .any(|l| l.starts_with("LoadCredential=finding.key:/etc/robodr/keys/")));
     }
 
     #[test]
@@ -1358,6 +1554,9 @@ mod tests {
         assert_eq!(feed.topics.len(), 3);
         assert!(feed.socket.is_some());
         assert_eq!(c.context.safety_state, SafetyState::Unknown);
+        assert!(s.profile_trust.trust_roots.is_some() && s.profile_trust.revocation_list.is_some());
+        assert!(c.correlation.enabled && c.correlation.rules_path.is_some());
+        assert!(c.finding_signing.is_some());
     }
 
     #[test]

@@ -392,6 +392,19 @@ fn hostile_datagrams_and_event_lines_never_stop_the_daemon() {
             st["inputs"][1]["received"].as_u64()? + st["inputs"][1]["malformed"].as_u64()?;
         (pcap_done && lines >= 102).then_some(())
     });
+    // The malformed-input self-health finding is raised by housekeeping,
+    // after the counters in status.json moved: wait for both findings to be
+    // spooled before stopping, so the test does not race the timer.
+    wait_for(
+        20,
+        "unknown_participant and input_malformed spooled",
+        || {
+            let r = rules(&spooled(&s.spool));
+            (r.iter().any(|x| x == "robot.ros2.unknown_participant")
+                && r.iter().any(|x| x == "robot.agent.input_malformed"))
+            .then_some(())
+        },
+    );
     stop.store(true, Ordering::SeqCst);
     let (res, log) = h.join().unwrap();
     let sum = res.unwrap_or_else(|e| panic!("{e}\n{log}"));

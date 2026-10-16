@@ -1,0 +1,128 @@
+.\" robodr-spool-export(1). Source of truth: the USAGE text in
+.\" crates/robodr-export/src/bin/robodr-spool-export.rs and the crate README.
+.\" Keep them in sync.
+.TH ROBODR\-SPOOL\-EXPORT 1 "2026-10-16" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
+.SH NAME
+robodr\-spool\-export \- move robodr\-agentd findings from its spool into signed one\-way export batches
+.SH SYNOPSIS
+.B robodr\-spool\-export
+.B \-\-spool
+.I DIR
+.B \-\-outbox
+.I DIR
+.B \-\-state
+.I FILE
+.B \-\-pack\-state
+.I FILE
+.B \-\-unit
+.I ID
+.B \-\-key\-file
+.I FILE
+.RB [ \-\-key\-id
+.IR ID ]
+.RB [ \-\-allow\-hmac ]
+.RB [ \-\-max\-batch\-bytes
+.IR N ]
+.RB [ \-\-max\-findings
+.IR N ]
+.RB [ \-\-rejected\-dir
+.IR DIR ]
+.RB [ \-\-interval\-ms
+.IR N ]
+.RB [ \-\-once ]
+.SH DESCRIPTION
+Robot\-side (low side) exporter. It takes the records in
+.IB DIR /ready/
+of a
+.BR robodr\-agentd (8)
+findings spool in name order, re\-validates each finding (OCSF contract),
+packs them into one signed
+.BR robodr\-diode\-pack (1)
+batch per step in the outbox, and renames the records into
+.IB DIR /acked/
+only after the batch has been committed and renamed into the outbox. An intent
+journal in the
+.B \-\-state
+file makes every crash point recoverable without loss or re\-packing. Records
+leave
+.I ready/
+only by rename, never by deletion: an invalid record is moved to the rejected
+directory with a reason file.
+.PP
+Without
+.B \-\-once
+it runs one step every
+.B \-\-interval\-ms
+and, after an error, re\-opens the packer and the exporter (which finish a
+half\-written batch) and retries. Each step that exported, rejected or
+recovered something prints a JSON report on stdout.
+.PP
+Per\-finding signatures
+.RB ( robodr\-finding\-sig ,
+contract \(sc2a) are
+.B not
+carried across the diode: the batch format holds finding values only and is
+authenticated by the batch signature.
+.SH OPTIONS
+.TP
+.BI \-\-spool " DIR"
+The agentd spool root (it must be able to rename inside it: run as the
+daemon's user).
+.TP
+.BI \-\-outbox " DIR"
+Diode outbox (as \fBrobodr\-diode\-pack \-\-outbox\fR).
+.TP
+.BI \-\-state " FILE"
+Exporter state and intent journal.
+.TP
+.BI \-\-pack\-state " FILE"
+Packer state (next batch sequence, last batch hash), as
+\fBrobodr\-diode\-pack \-\-state\fR.
+.TP
+.BI \-\-unit " ID"
+Unit id written into every manifest.
+.TP
+.BI \-\-key\-file " FILE"
+The unit's diode signing key, a
+.BR robodr\-blackbox (1)
+secret key file (Ed25519 by default); the same file checks as
+.BR robodr\-diode\-pack (1).
+.TP
+.BI \-\-key\-id " ID"
+Key id (default: the key file's).
+.TP
+.B \-\-allow\-hmac
+Accept a legacy HMAC\-SHA256 key file (a warning is printed).
+.TP
+.BI \-\-max\-batch\-bytes " N\fR, " \-\-max\-findings " N"
+Batch limits, as for
+.BR robodr\-diode\-pack (1)
+(defaults 16 MiB and 10000).
+.TP
+.BI \-\-rejected\-dir " DIR"
+Where invalid records go (default \fIspool\fB/rejected/\fR).
+.TP
+.BI \-\-interval\-ms " N"
+Loop interval, > 0 (default 5000).
+.TP
+.B \-\-once
+One step, then exit.
+.SH EXIT STATUS
+.TP
+.B 0
+Success
+.RB ( \-\-once ).
+.TP
+.B 1
+Error with
+.B \-\-once
+(without it, errors are printed and retried).
+.TP
+.B 2
+Usage error.
+.SH SEE ALSO
+.BR robodr\-agentd (8),
+.BR robodr\-diode\-pack (1),
+.BR robodr\-diode\-unpack (1),
+.BR robodr\-kafka\-publish (1),
+/usr/share/doc/robodr/OPERATIONS.md

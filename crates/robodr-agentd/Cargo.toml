@@ -19,6 +19,8 @@ robodr-rtps = { workspace = true }
 # Profile trust (signature, version label); already a dependency of the
 # pipeline.
 robodr-commission = { workspace = true }
+# Weak-signal correlation over every finding the daemon reports.
+robodr-correlate = { workspace = true }
 robodr-events = { workspace = true }
 robodr-firewall = { workspace = true }
 robodr-motion = { workspace = true }

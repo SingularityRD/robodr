@@ -163,14 +163,157 @@ const T0855: (&str, &str) = ("T0855", "Unauthorized Command Message");
 const T0831: (&str, &str) = ("T0831", "Manipulation of Control");
 const T0848: (&str, &str) = ("T0848", "Rogue Master");
 const T0801: (&str, &str) = ("T0801", "Monitor Process State");
+const T0856: (&str, &str) = ("T0856", "Spoof Reporting Message");
 
-/// The trusted rule catalog. Unknown rule ids get a generic entry (the rule id
-/// itself is a `&'static str` from the detection core and is charset-checked
-/// by the validator).
+/// The generic entry for a rule id without a catalog entry.
+const GENERIC: RuleInfo = RuleInfo {
+    title: "RoboDR model-profile deviation",
+    desc: "The detection core reported a deviation from the locked model profile for a rule without a catalog entry.",
+    data_source: "robodr",
+    techniques: &[],
+};
+
+/// Contract minor version that added [`catalog_1_3`]'s entries.
+pub const CATALOG_1_3_MINOR: u64 = 3;
+
+/// The trusted rule catalog of the current contract. Unknown rule ids get a
+/// generic entry (the rule id itself is a `&'static str` from the detection
+/// core and is charset-checked by the validator).
 pub fn rule_info(rule: &str) -> RuleInfo {
+    catalog_1_0(rule)
+        .or_else(|| catalog_1_3(rule))
+        .unwrap_or(GENERIC)
+}
+
+/// The catalog as a validator for a message of `contract_version` must
+/// apply it: entries added in a later contract minor than the message's are
+/// not used (a 1.2 producer built such a finding with the generic entry, and
+/// it stays valid). A malformed version gets the current catalog.
+pub fn rule_info_for_contract(rule: &str, contract_version: &str) -> RuleInfo {
+    let minor = contract_version
+        .split('.')
+        .nth(1)
+        .and_then(|m| m.parse::<u64>().ok());
+    if minor.is_some_and(|m| m < CATALOG_1_3_MINOR) {
+        catalog_1_0(rule).unwrap_or(GENERIC)
+    } else {
+        rule_info(rule)
+    }
+}
+
+/// Entries added in contract 1.3: wave-6 detectors (correlation engine,
+/// live safety-state feed, profile anti-rollback witness, agentd evidence
+/// and correlation health).
+fn catalog_1_3(rule: &str) -> Option<RuleInfo> {
+    const CORRELATE: &str = "robodr_correlation";
+    const SAFETY: &str = "robot_safety_state";
+    const AGENT: &str = "robodr_agent";
+    Some(match rule {
+        "robot.correlate.coordinated_intrusion" => RuleInfo {
+            title: "Correlated intrusion: unknown participant, foreign motion writer and host anomaly",
+            desc: "Within one minute an unknown DDS participant, an unauthorized motion writer and a host process anomaly were each detected; the correlation cites every contributing detection.",
+            data_source: CORRELATE,
+            techniques: &[T0848, T0855],
+        },
+        "robot.correlate.sensor_evasion" => RuleInfo {
+            title: "Correlated sensor evasion: capture refusals with uninspected discovery",
+            desc: "Repeated capture or fragment refusals coincided with discovery traffic the sensor could not inspect, a pattern consistent with an attempt to blind the sensor.",
+            data_source: CORRELATE,
+            techniques: &[],
+        },
+        "robot.correlate.credential_theft" => RuleInfo {
+            title: "Correlated credential theft: SROS 2 key read, then a foreign participant",
+            desc: "An SROS 2 private key was read outside the ROS stack and an unknown or source-mismatched participant appeared afterwards within the correlation window.",
+            data_source: CORRELATE,
+            techniques: &[T0848],
+        },
+        "robot.correlate.trojaned_package_key_access" => RuleInfo {
+            title: "Correlated supply-chain compromise: package install, then key access",
+            desc: "A package install or maintainer script was followed by an SROS 2 private key read within the correlation window.",
+            data_source: CORRELATE,
+            techniques: &[],
+        },
+        "robot.correlate.spoofed_motion_source" => RuleInfo {
+            title: "Correlated spoofed motion source from one address",
+            desc: "A participant or endpoint source mismatch was followed by an unauthorized motion writer from the same source address within the correlation window.",
+            data_source: CORRELATE,
+            techniques: &[T0855],
+        },
+        "robot.correlate.motion_hijack" => RuleInfo {
+            title: "Correlated motion hijack: foreign motion source, then unexpected motion",
+            desc: "A foreign motion writer or a firewall source rejection was followed by uncommanded motion, feedback divergence or a second feedback publisher within the correlation window.",
+            data_source: CORRELATE,
+            techniques: &[T0855, T0831],
+        },
+        "robot.correlate.defense_tampering" => RuleInfo {
+            title: "Correlated defense tampering: protected file or service change with a silent input",
+            desc: "A host rule saw a RoboDR or Pulsar protected file change or a service stop while the agent reported an input silent or ended; observe-only by construction.",
+            data_source: CORRELATE,
+            techniques: &[],
+        },
+        "robot.correlate.discovery_flood" => RuleInfo {
+            title: "Correlated discovery flood: unknown participants from many addresses",
+            desc: "Unknown DDS participants were announced from many distinct source addresses within the correlation window: a discovery flood or scan.",
+            data_source: CORRELATE,
+            techniques: &[T0848],
+        },
+        "robot.correlate.host_process_persistence" => RuleInfo {
+            title: "Correlated host activity: one process tripped several host rules",
+            desc: "The same host process raised several host-side detections within the correlation window.",
+            data_source: CORRELATE,
+            techniques: &[],
+        },
+        r if r.starts_with("robot.correlate.") => RuleInfo {
+            title: "Correlated RoboDR detection",
+            desc: "A deployment-specific correlation rule combined several detections that were each reported on their own; the correlation cites every contributing detection.",
+            data_source: CORRELATE,
+            techniques: &[],
+        },
+        "robot.safety_state.untrusted_source" => RuleInfo {
+            title: "Safety-state sample from an untrusted writer",
+            desc: "A safety-state sample came from a writer the locked model profile does not vouch for; it was ignored and the safety state was not taken from it.",
+            data_source: SAFETY,
+            techniques: &[T0856],
+        },
+        "robot.safety_state.undecodable_sample" => RuleInfo {
+            title: "Undecodable safety-state sample",
+            desc: "A safety-state sample from a trusted writer could not be decoded; that source reads unknown until a valid sample arrives.",
+            data_source: SAFETY,
+            techniques: &[],
+        },
+        "robot.safety_state.unmapped_value" => RuleInfo {
+            title: "Safety-state value outside the configured mapping",
+            desc: "A trusted safety-state source carried a value the configured mapping does not cover; that source reads unknown.",
+            data_source: SAFETY,
+            techniques: &[],
+        },
+        "robot.ros2.profile_state_tampered" => RuleInfo {
+            title: "Profile anti-rollback state missing or behind the black box",
+            desc: "The profile anti-rollback state file is missing or older than the newest accepted-profile record in the black box; the black-box record was used as the baseline.",
+            data_source: AGENT,
+            techniques: &[],
+        },
+        "robot.agent.evidence_quarantined" => RuleInfo {
+            title: "Damaged black-box segment quarantined",
+            desc: "Opening the black box found closed segments that failed verification; they were copied to quarantine and recording continued without reusing sequence numbers.",
+            data_source: AGENT,
+            techniques: &[],
+        },
+        "robot.agent.correlation_pressure" => RuleInfo {
+            title: "Correlation engine state under pressure",
+            desc: "The correlation engine evicted or refused pending correlation state, which happens when many fresh entities arrive within a window (possibly a flood aimed at hiding a correlation).",
+            data_source: AGENT,
+            techniques: &[],
+        },
+        _ => return None,
+    })
+}
+
+/// The contract 1.0 - 1.2 catalog.
+fn catalog_1_0(rule: &str) -> Option<RuleInfo> {
     const GRAPH: &str = "ros2_dds_discovery";
     const MOTION: &str = "ros2_motion_commands";
-    match rule {
+    Some(match rule {
         "robot.ros2.unknown_participant" => RuleInfo {
             title: "Unknown DDS participant joined the robot graph",
             desc: "A DDS participant that is not in the locked model profile announced itself on the robot's RTPS discovery bus.",
@@ -219,13 +362,8 @@ pub fn rule_info(rule: &str) -> RuleInfo {
             data_source: MOTION,
             techniques: &[T0831],
         },
-        _ => RuleInfo {
-            title: "RoboDR model-profile deviation",
-            desc: "The detection core reported a deviation from the locked model profile for a rule without a catalog entry.",
-            data_source: "robodr",
-            techniques: &[],
-        },
-    }
+        _ => return None,
+    })
 }
 
 /// OCSF `severity_id` for a RoboDR severity.

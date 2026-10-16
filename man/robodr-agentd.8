@@ -101,6 +101,57 @@ The profile version in findings is the signed
 .BR metadata.profile_version ;
 .B robot.profile_version
 was removed and is refused with a message saying so.
+.B trust_roots
+(a
+.I robodr\-trust\-roots/v1
+file) enables the root\-signed
+.B min_profile_version
+floor and the signed revocation list
+.B revocation_list
+.RB ( revocation_policy :
+.B optional
+or
+.BR required ).
+With
+.BR state_file ,
+the newest accepted\-profile record in the black box is a second witness: a
+state file that is missing or behind it raises the Critical, observe\-only
+finding
+.BR robot.ros2.profile_state_tampered .
+.SH SAFETY STATE, CORRELATION, SIGNATURES
+.B safety_feed
+reads the robot's safety state passively from ROS 2 topics in the captured
+traffic and/or a 0600 unix socket of JSON lines from a safety\-PLC gateway;
+with a feed,
+.B context.safety_state
+must stay
+.BR unknown .
+Untrusted writers raise
+.BR robot.safety_state.untrusted_source .
+Nothing is ever sent to the robot or its safety system.
+.PP
+.B correlation
+(on by default:
+.BR enabled ,
+.BR rules_path ,
+.BR include_default_rules )
+combines reported findings into
+.B robot.correlate.*
+findings, each recorded with every contributing finding in the black box;
+observe\-only inputs make the correlation observe\-only. A rule file that
+does not load is a configuration error.
+.PP
+.B finding_signing.key_file
+names a dedicated Ed25519 key (not the black\-box key, not HMAC, same file
+checks); every finding then carries a detached signature in the spooled
+record's last header,
+.BR robodr\-finding\-sig .
+.PP
+Each tick writes the black box's high\-water mark
+.RI ( head.json )
+when records were added; damaged closed segments quarantined at open raise
+the High, observe\-only finding
+.BR robot.agent.evidence_quarantined .
 .SH SIGNALS
 .B SIGTERM
 and
@@ -145,12 +196,24 @@ writable).
 Anti\-rollback state (suggested path; the directory must be writable by the
 daemon).
 .TP
+.I /etc/robodr/keys/agentd\-finding.key
+Optional per\-finding signing key (0600 root:root); with the shipped drop\-in
+example
+.I 20\-finding\-key.conf.example
+the unit exposes it at
+.IR /run/credentials/robodr\-agentd.service/finding.key .
+.TP
+.I /etc/robodr/trust\-roots.json\fR, \fI/etc/robodr/profile\-revocations.json
+Trust roots and the signed revocation list (public; 0644 root:root).
+.TP
 .I /run/robodr\-agentd/
-Runtime directory for an optional unix\-socket event input (socket mode 0600).
+Runtime directory for optional unix\-socket event and safety\-feed inputs
+(socket mode 0600).
 .SH SEE ALSO
 .BR robodr\-blackbox (1),
 .BR robodr\-replay (1),
 .BR robodr\-commission (1),
 .BR robodr\-diode\-pack (1),
+.BR robodr\-spool\-export (1),
 .BR robodr\-pulsard (8),
 /usr/share/doc/robodr/OPERATIONS.md

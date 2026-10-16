@@ -117,6 +117,12 @@ commissioning (section 5).
 | Release key | entry station only | verifying releases (section 2) |
 | Profile signing key (Ed25519, private) | commissioning station only, **never on the robot** | signing locked profiles (section 4.4, 5) |
 | Profile trust file (Ed25519, public) | `/etc/robodr/profile-trust.json` (`0644 root:root`) | the sensor / agentd accept only profiles signed by these keys |
+| Trust roots (Ed25519, private) | offline signing station / token, **never on the robot**, separate from the profile key | signing revocation lists and the trust file's `min_profile_version` floor (4.4, 5.3) |
+| Trust roots file (public) | `/etc/robodr/trust-roots.json` (`0644`) | verifying revocation lists and the signed floor |
+| Operator sign-off keys (Ed25519, one per operator) | each operator's own token / home on the commissioning station | signing a confirmed sign-off list (section 5, step 3) |
+| Operators trust list (public) | commissioning station (`operators.json`, not group/other-writable) | `lock --operators` accepts only sign-offs signed by these operators |
+| Finding key of `robodr-agentd` (Ed25519 secret, optional) | `/etc/robodr/keys/agentd-finding.key` (`0600 root:root`) | per-finding signatures, header `robodr-finding-sig` (6.4) |
+| Its public key | SOC finding keyring, bound to the unit id | verifying findings on connected paths (contract §2a) |
 
 Services never read `/etc/robodr/keys` themselves. systemd hands each one a
 private copy (`/run/credentials/<unit>/blackbox.key`). The reasons are in
@@ -330,6 +336,14 @@ Work in `/var/lib/robodr/commission/<date>/` as root.
    `--accept-participant GUID` only if you can account for it. Every accepted
    participant becomes a sign-off item.
 
+   `learn` also writes `draft.json.manifest.json` last (SHA-256 of the
+   draft, the report and the sign-off list); `lock` refuses a draft whose
+   manifest is missing or does not match (`--no-manifest` only for drafts
+   made before manifests existed). If the robot uses a DDS **discovery
+   server**, name it (`--discovery-server PREFIX|PREFIX@IP|IP`, or
+   `--trusted-discovery-server` to learn the endpoints it relays for
+   accepted owners); otherwise every relayed announcement is a sign-off item.
+
 3. **Review and sign off.** Open `draft.json.signoff.json`. For every item,
    check it against the OEM's documentation of the robot (nodes, topics,
    services, motion envelopes), set `"confirmed": true`, and put your name in
@@ -338,15 +352,40 @@ Work in `/var/lib/robodr/commission/<date>/` as root.
    `robodr-commission signoff --in draft.json --out signoff.json` and review
    it again.
 
+   Then **sign** the confirmed list with your own operator key. The security
+   officer keeps an operators trust list binding each operator's public key
+   to a name (once, and on every change of staff):
+
+   ```sh
+   robodr-blackbox keygen --out ~/alice.key --key-id op-alice          # each operator, once
+   robodr-commission operators --out operators.json \
+       --operator Alice=alice.key.pub --operator Bob=bob.key.pub --motion-quorum 2
+   robodr-commission signoff --signoff draft.json.signoff.json --sign-key ~/alice.key \
+       --in draft.json --operators operators.json                      # writes <list>.sig
+   robodr-commission signoff --signoff draft.json.signoff.json --sign-key ~/bob.key \
+       --in draft.json --operators operators.json                      # second operator
+   ```
+
+   Signing refuses a list that is not fully confirmed, names no operator or
+   belongs to another draft. Editing the list afterwards voids every
+   signature.
+
 4. **Lock**, which versions, seals and signs the profile:
 
    ```sh
    robodr-commission lock --in draft.json --signoff draft.json.signoff.json \
-       --out locked.json --platform ugv-x1 --profile-version 1 \
+       --operators operators.json --out locked.json --platform ugv-x1 --profile-version 1 \
        [--unit-id ugv-007] --sign-key /secure/oem-profile.key
    ```
 
-   Lock refuses (exit 1) until every item is confirmed by a named operator.
+   `--operators` is **required**. Lock refuses (exit 1) unless every item is
+   confirmed, every signature in `<signoff>.sig` verifies under a key in the
+   operators list (fail closed; at least one must), the list's `operator` is
+   one of the signers, and, when the list has motion items, at least
+   `motion_quorum` distinct operators signed (the **two-person rule**;
+   `--motion-quorum N` can raise it for one lock, never lower it). A null
+   motion dimension also needs its own confirmed
+   `envelope_dimension_unbounded` item.
    It stamps `metadata` into the profile: `schema_version`,
    `profile_version` (monotonic, never reuse a number), `platform`,
    `unit_id` (only for a profile made for one robot; leave it out for a
@@ -382,6 +421,9 @@ Work in `/var/lib/robodr/commission/<date>/` as root.
    sudo install -m 0640 -o root -g robodr locked.json /etc/robodr/profile.json
    sudo install -m 0640 -o root -g robodr locked.json.sig /etc/robodr/profile.json.sig
    sudo install -m 0644 -o root -g root profile-trust.json /etc/robodr/profile-trust.json
+   # with trust roots / revocation (section 5.3):
+   sudo install -m 0644 -o root -g root trust-roots.json /etc/robodr/trust-roots.json
+   sudo install -m 0644 -o root -g root revocations-N.json /etc/robodr/profile-revocations.json
    # profile-state dirs come from tmpfiles.d/robodr.conf (systemd-tmpfiles --create)
    sudoedit /etc/robodr/pulsar.toml      # domain_id, capture, binding, profile_trust
    sudoedit /etc/robodr/agentd.json      # robot id, policy, paths, sensor.profile_trust
@@ -424,8 +466,8 @@ profile it replaces:
 
 ```sh
 robodr-commission lock --in draft2.json --signoff draft2.json.signoff.json \
-    --out locked2.json --parent locked.json --trusted-keys profile-trust.json \
-    --sign-key /secure/oem-profile.key
+    --operators operators.json --out locked2.json --parent locked.json \
+    --trusted-keys profile-trust.json --sign-key /secure/oem-profile.key
 ```
 
 `--parent` sets `profile_version` to the parent's + 1 (an explicit
@@ -602,6 +644,71 @@ sudo systemctl daemon-reload && sudo systemctl restart robodr-pulsard
 Record the reason in the robot's commissioning file. `CAP_SYS_ADMIN` is close
 to full root.
 
+### 6.4 agentd features (`/etc/robodr/agentd.json`)
+
+Every key below is in `config/agentd.example.json` (installed under
+`/usr/share/doc/robodr/examples/`); check every edit with
+`robodr-agentd --config /etc/robodr/agentd.json --check-config`.
+
+**Live safety state (`safety_feed`).** Plans are graded by the robot's
+safety state. Without a feed, the static `context.safety_state` is used.
+With one, agentd reads it **passively**: ROS 2 topics decoded from captured
+user DATA (`std_msgs/Bool`, `UInt8`, `String` mapped to states;
+`nav_msgs/Odometry` speed with hysteresis to idle / moving slow / moving
+fast), and/or a `0600` unix socket of JSON lines from a safety-PLC gateway
+(`{"state":"estop_active"}`; put it under `/run/robodr-agentd/`, the
+gateway must run as `robodr`). A stale source reads `unknown`; disagreeing
+sources resolve to the most conservative state. Samples from writers the
+locked profile does not vouch for are ignored and raise
+`robot.safety_state.untrusted_source` (High). Leave `context.safety_state`
+at `unknown` when a feed is configured (the configuration is refused
+otherwise). Every change of the combined state is a
+`robodr.safety_state_transition` note in the black box; `status.json`
+shows `safety_state` and the feed view. Nothing is ever published to the
+robot or its safety system. Verified on synthetic traffic only.
+
+**Correlation (`correlation`, on by default).** Combines findings that were
+each reported on their own into `robot.correlate.*` findings (discovery
+flood, spoofed motion source, motion hijack, ...; the full list is in
+`crates/robodr-correlate/README.md`). Each correlated finding cites every
+contributing finding (a `robodr.correlated_finding` note in the black box)
+and is observe-only whenever one of them was. Add site rules with
+`"rules_path": "/etc/robodr/correlation-rules.json"` (validated together
+with the shipped rules; a rule file that does not load refuses the
+configuration), drop the shipped ones with `"include_default_rules": false`,
+or turn it off with `"enabled": false`. The rules are engineering defaults,
+not tuned on fleet data: run the first field period observe-only. Host
+(Pulsar) detections do not reach agentd yet, so rules that need them do not
+fire. `robot.agent.correlation_pressure` (observe-only) means the engine had
+to evict pending state: many fresh source addresses or participants within
+a window.
+
+**Finding signatures (`finding_signing`, optional).** Signs every finding
+with a dedicated Ed25519 key (contract §2a); the signature is the spooled
+record's last header, `robodr-finding-sig`, and `robodr-kafka-publish
+--spool` forwards it. Never reuse the black-box key (refused):
+
+```sh
+sudo robodr-blackbox keygen --out /etc/robodr/keys/agentd-finding.key --key-id finding:ugv-07:1
+sudo install -D -m 0644 /usr/share/doc/robodr/examples/robodr-agentd.service.d/20-finding-key.conf.example \
+    /etc/systemd/system/robodr-agentd.service.d/20-finding-key.conf
+# agentd.json: "finding_signing": { "key_file": "/run/credentials/robodr-agentd.service/finding.key" }
+sudo systemctl daemon-reload && sudo systemctl restart robodr-agentd
+```
+
+Give the `.pub` to the SOC's finding keyring for this unit id. Across the
+diode the per-finding signature is **not** carried (the batch is signed
+instead; contract §8), so diode-side consumers must verify in `Optional`
+mode.
+
+**Black-box upkeep.** Every tick writes the black box's `head.json`
+high-water mark when records were added since the last one. If the
+recorder found damaged closed segments when it opened, they are moved to
+`<blackbox>/quarantine/` (with a signed recovery record) and agentd raises
+`robot.agent.evidence_quarantined` (High, observe-only): the storage is
+failing or someone edited the log. Keep the quarantined files for the
+investigation.
+
 ## 7. Upgrade and rollback
 
 **Upgrade** (available). Verify the new release (section 2), then run
@@ -651,8 +758,8 @@ through the diode.
 
 | Data | Location | Integrity |
 |---|---|---|
-| Black-box chain | `/var/lib/robodr/blackbox/<service>/` | hash-chained, signed (HMAC placeholder), checkpointed |
-| OCSF findings | `/var/lib/robodr/spool/<service>/` | validated by `robodr-ocsf`; carry evidence links into the black box |
+| Black-box chain | `/var/lib/robodr/blackbox/<service>/` | hash-chained, signed (Ed25519; legacy HMAC), checkpointed |
+| OCSF findings | `/var/lib/robodr/spool/<service>/` | validated by `robodr-ocsf`; carry evidence links into the black box; optionally signed per finding (6.4); diode batches signed by the unit's diode key (8.3) |
 | Journal | `journalctl -u 'robodr-*'` | none of its own; corroborating only |
 
 ### 8.2 Black-box bundles
@@ -701,11 +808,40 @@ mode comes with the bundle exporter.
 
 ### 8.3 Findings batches
 
-**planned.** The diode batch format (`robot-edr-findings_<site>_<batch_seq>.jsonl`
-plus a signed manifest) is specified in
-`docs/contracts/robot-edr.findings.md`, section 8. It is not implemented yet.
-Until then, the spool tarball above carries the findings, and the importer runs
-`robodr_ocsf::parse_and_validate` on every line.
+**available (not yet run against a real Kafka broker).** Two binaries carry
+agentd's findings to the SOC (contract section 8.1):
+
+```sh
+# Robot side (low side): spool -> signed diode batches in the outbox.
+# Runs as robodr (it renames ready/ -> acked/ in agentd's spool).
+sudo -u robodr robodr-spool-export --spool /var/lib/robodr/spool/agentd \
+    --outbox /var/lib/robodr/export/diode --state /var/lib/robodr/export/spool-export-state.json \
+    --pack-state /var/lib/robodr/export/pack-state.json --unit ugv-07 \
+    --key-file /etc/robodr/keys/diode-ugv-07.key [--interval-ms 5000] [--once]
+
+# SOC side (high side), after robodr-diode-unpack has imported the batches:
+robodr-kafka-publish --bootstrap kafka1:9092 --state-dir /var/lib/robodr-soc/publish \
+    --diode-out /var/lib/robodr-soc/import/out [--once]
+# A connected site publishes straight from a spool copy instead: --spool DIR
+```
+
+`robodr-spool-export` takes `ready/` records in order, re-validates them,
+packs one diode batch per step with `robodr-diode-pack`'s format (Ed25519
+key file, section 4.4; `--allow-hmac` only for legacy keys) and moves the
+records to `acked/` only once the batch is durably in the outbox; an intent
+journal makes every crash point recoverable without loss or re-packing.
+Invalid records go to `<spool>/rejected/` with a reason file, never deleted.
+Without `--once` it loops every `--interval-ms` (default 5000).
+
+`robodr-kafka-publish` re-validates every record, re-derives key, headers
+and partition from the value (contract §2, §4), sends with `acks=all`, and
+persists per-batch progress after each acknowledged chunk; invalid or
+broker-rejected records go to a dead-letter file. **No TLS / SASL** and
+**idempotence off** (at-least-once: consumers drop duplicates on
+`event-uid`): run it on an isolated SOC network or through a local TLS
+proxy. Without `--once` it loops every `--interval-ms` (default 2000).
+Neither binary ships a systemd unit; run them from the site's transfer
+procedure or a timer.
 
 ### 8.4 Journal
 
@@ -736,6 +872,10 @@ The package never deletes evidence or keys, not even on `apt purge`.
 | probes fail with `EPERM` | kernel < 5.8, or an LSM policy | section 6.3 |
 | `Multiple bpf fs mounts detected` | several bpffs mounts in the namespace | report it (unverified interaction with `ProtectKernelTunables=`) |
 | agent: `log is keyed X, signer is Y` | key changed without rotation | section 4.3 |
+| `lock: --operators is required` / `no valid operator signature` | sign-off list not signed, or signed by a key not in the operators list | section 5, step 3 |
+| High `robot.agent.evidence_quarantined` | a closed black-box segment failed verification at open | section 6.4: keep `<blackbox>/quarantine/`, check the storage, treat as possible tampering |
+| `finding_signing.key_file ... black-box key` / `must be an ed25519 key` | finding key reused or HMAC | section 6.4: generate a dedicated Ed25519 key |
+| `correlation rules: ...` at start | site rule file invalid or duplicates a shipped id | fix the file, or `--check-config` to see every problem |
 | every finding `[observe-only]` | profile unlocked, missing or invalid | section 5 |
 | Critical `robot.ros2.profile_state_tampered` | anti-rollback state file deleted or rewritten (or agentd stopped mid operator rollback) | section 5.1: investigate; reinstall the recorded profile or roll back with `allow_rollback` |
 | `revocation list ... rollback refused` / `now missing` | an older list, or none, replaced the accepted one | section 5.3: install the newest list |

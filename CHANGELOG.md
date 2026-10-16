@@ -12,6 +12,65 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Added
 
+- Wave 6 (integrated on `integrate-w6`):
+  - `robodr-agentd` live safety-state feed (`safety_feed`): ROS 2 topics
+    decoded passively from captured user DATA (`std_msgs` Bool / UInt8 /
+    String, Odometry speed with hysteresis) and/or a `0600` unix socket of
+    JSON lines from a safety-PLC gateway; stale -> unknown, conflicts -> most
+    conservative; untrusted writers ignored and reported
+    (`robot.safety_state.untrusted_source`). `robodr-cdr` gained bounded
+    `std_msgs` decoders. Read-only; synthetic traffic only.
+  - `robodr-correlate`: weak-signal correlation engine (JSON rules: sequence,
+    co-occurrence, threshold, distinct sources; bounded memory, LRU eviction
+    that cannot evict multi-signal state). Wired into `robodr-agentd`
+    (`correlation`, on by default; optional site rule file validated with
+    the shipped rules): every reported finding is a signal, correlated
+    `robot.correlate.*` findings are recorded with all contributors
+    (`robodr.correlated_finding` note) and stay observe-only if any input
+    was; eviction pressure raises `robot.agent.correlation_pressure`.
+  - Per-finding Ed25519 signatures (contract 1.2, header
+    `robodr-finding-sig`); `robodr-agentd` signs with a dedicated key
+    (`finding_signing.key_file`; HMAC, the black-box key and keys inside the
+    spool / black box are refused; systemd drop-in example
+    `20-finding-key.conf.example`). `robodr-kafka-publish --spool` forwards
+    the header verbatim. Not carried across the diode (contract §8).
+  - OCSF contract 1.3.0: catalog entries for `robot.correlate.*`,
+    `robot.safety_state.*`, `robot.ros2.profile_state_tampered`,
+    `robot.agent.evidence_quarantined`, `robot.agent.correlation_pressure`
+    (data sources `robodr_correlation`, `robot_safety_state`,
+    `robodr_agent`; technique T0856). The validator applies the catalog of
+    each message's own minor, so 1.2 messages stay valid.
+  - `robodr-export`: `robodr-spool-export` (agentd spool -> signed diode
+    batches, crash-safe intent journal) and `robodr-kafka-publish` (importer
+    output or a connected spool -> Kafka; std-only client, `acks=all`,
+    idempotence off, no TLS/SASL; tested against a fake broker only). Both
+    shipped in the `.deb` and required by the release workflow; man pages
+    `robodr-spool-export(1)`, `robodr-kafka-publish(1)`.
+  - Black box: damaged closed segments are quarantined instead of bricking
+    the recorder, `head.json` high-water mark, crash-safe rotation.
+    `robodr-agentd` marks the head on every tick when records were added and
+    reports quarantined segments (`robot.agent.evidence_quarantined`, High,
+    observe-only).
+  - Profile trust: trust roots, root-signed `min_profile_version` floor,
+    signed revocation lists, black box as second anti-rollback witness
+    (`robot.ros2.profile_state_tampered`). `robodr-ros2-watch` gained
+    `--trust-roots`, `--revocations`, `--revocations-required`.
+  - Commissioning: operator-signed sign-off (`signoff --sign-key`,
+    `operators`, two-person rule for motion items), discovery-server relay
+    attribution, output manifest checked by `lock` / `check`.
+  - Diode: single-instance lock, Reed-Solomon parity (`--parity`), `resend`.
+  - Capture: per-packet ingress (interface, loopback, packet type) for
+    strict loopback trust.
+  - Events / CDR: holonomic per-axis motion fields and envelope limits
+    (`robot.motion.angular_over_envelope`).
+  - Motion monitor: hold-protected cross-sensor disagreement, opposite-
+    direction escalation, full-GUID publisher keys, frozen-at-cruise fix.
+  - Rules: self-protection of the installed layout and service names,
+    installer coverage (uv, pipx, poetry, conda, npm, ...), CMake 3.28
+    FindPython probes excluded by exact argv. `validate_rules.py` accepts an
+    `argv CONTAINS` literal with spaces without a warning when the same AND
+    chain pins `payload.argc == N`.
+
 - Live motion path: RTPS user DATA on the profile's motion channels and on
   `motion.feedback_topics` is decoded (`robodr-cdr`) into `MotionCommand` /
   `MotionFeedback` (`robodr_ros2_pipeline::motion`,
@@ -63,6 +122,15 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Changed
 
+- **Breaking (`robodr-commission lock`)**: `--operators operators.json` is
+  required; every sign-off must carry valid operator signatures
+  (`<signoff>.sig`), and motion items need `motion_quorum` distinct
+  operators. `lock` also refuses a draft without a matching output manifest
+  (`--no-manifest` for older drafts). See OPERATIONS.md section 5.
+- **Breaking (findings contract 1.3.0)**: findings for the newly catalogued
+  rule ids carry their own title / description / data source instead of the
+  generic entry; consumers must run the 1.3 validator (it still accepts 1.2
+  messages).
 - One key file format: profile signing keys are robodr-blackbox `KeyFile`s
   (`robodr-commission keygen` now writes v2 secret + `.pub`; a key from
   `robodr-blackbox keygen` signs profiles too; older v1 Ed25519 signing
@@ -111,6 +179,11 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Fixed
 
+- `robodr-agentd` e2e test `hostile_datagrams_and_event_lines_never_stop_the_daemon`
+  could stop the daemon before housekeeping raised `robot.agent.input_malformed`;
+  it now waits until both expected findings are in the spool.
+- `robodr-kafka-publish` dead-lettered every signed finding ("headers
+  disagree with the value"); the signature header is now carried.
 - `robodr-agentd` test `queue_overflow_is_counted_and_reported` was flaky:
   it stopped the daemon before the socket reader had read every line. It
   now waits for `received == 5000` in the status file first.

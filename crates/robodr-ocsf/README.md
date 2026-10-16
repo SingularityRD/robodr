@@ -122,7 +122,23 @@ dedup.insert(v.replay_key());   // replay detection is the consumer's job
 | `robot.motion.linear_over_envelope` | Linear speed command exceeds the motion envelope | T0831 Manipulation of Control |
 | `robot.motion.angular_over_envelope` | Roll/pitch rate command exceeds the motion envelope | T0831 |
 | `robot.motion.joint_over_envelope` | Joint speed command exceeds the motion envelope | T0831 |
+| *since contract 1.3:* | | |
+| `robot.correlate.coordinated_intrusion` | Correlated intrusion: unknown participant, foreign motion writer and host anomaly | T0848, T0855 |
+| `robot.correlate.credential_theft` | Correlated credential theft: SROS 2 key read, then a foreign participant | T0848 |
+| `robot.correlate.spoofed_motion_source` | Correlated spoofed motion source from one address | T0855 |
+| `robot.correlate.motion_hijack` | Correlated motion hijack: foreign motion source, then unexpected motion | T0855, T0831 |
+| `robot.correlate.discovery_flood` | Correlated discovery flood: unknown participants from many addresses | T0848 |
+| `robot.correlate.{sensor_evasion, trojaned_package_key_access, defense_tampering, host_process_persistence}` | (own titles, data source `robodr_correlation`) | — |
+| any other `robot.correlate.*` | Correlated RoboDR detection | — |
+| `robot.safety_state.untrusted_source` | Safety-state sample from an untrusted writer | T0856 Spoof Reporting Message |
+| `robot.safety_state.{undecodable_sample, unmapped_value}` | (own titles, data source `robot_safety_state`) | — |
+| `robot.ros2.profile_state_tampered` | Profile anti-rollback state missing or behind the black box | — |
+| `robot.agent.{evidence_quarantined, correlation_pressure}` | (own titles, data source `robodr_agent`) | — |
 | anything else | RoboDR model-profile deviation | — |
+
+The validator applies the catalog of the message's own `contract_version`
+(`rule_info_for_contract`): a 1.2 finding for an id that only gained an
+entry in 1.3 keeps the generic entry and stays valid.
 
 ¹ Not in the design doc's robotics technique list (T0855, T0831, T0836, T0843,
 T0889, T0856). Our mapping choice; AutoSecOps `categories.py` must add them or

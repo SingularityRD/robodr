@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://singularityrd.example/robodr/contracts/robot-edr-finding/1.2.0",
-  "title": "RoboDR robot-edr.findings message (contract 1.2.0)",
+  "$id": "https://singularityrd.example/robodr/contracts/robot-edr-finding/1.3.0",
+  "title": "RoboDR robot-edr.findings message (contract 1.3.0)",
   "description": "One Kafka value on topic robot-edr.findings: AutoSecOps ingestion envelope + OCSF 1.1 Detection Finding (class_uid 2004). Maintained alongside crates/robodr-ocsf/src/model.rs; the crate's tests check that produced findings contain every required key here and no undeclared key. Strings carrying attacker-controlled data are objects of type TaintedName/TaintedText or OCSF resources labelled taint:adversary. SR-TAINT: every string has a pattern; every string is printable ASCII (U+0020-U+007E) without < > or backtick, and tainted values are restricted to the allow-list of their escaping scheme (see robot-edr.findings.md section 3), so raw bidi/format/newline characters and Markdown/HTML markup are rejected by a schema-only consumer. Since 1.2 a finding may carry a detached Ed25519 signature in the Kafka header robodr-finding-sig (NOT in this value); its header value is described by $defs/FindingSignatureHeader and is signed over the exact bytes of this value (robot-edr.findings.md section 2a).",
   "type": "object",
   "additionalProperties": false,
@@ -28,8 +28,8 @@
         "additionalProperties": false,
         "required": ["technique_id", "technique_name", "framework", "provenance"],
         "properties": {
-          "technique_id": { "enum": ["T0848", "T0855", "T0801", "T0831"] },
-          "technique_name": { "enum": ["Rogue Master", "Unauthorized Command Message", "Monitor Process State", "Manipulation of Control"] },
+          "technique_id": { "enum": ["T0848", "T0855", "T0801", "T0831", "T0856"] },
+          "technique_name": { "enum": ["Rogue Master", "Unauthorized Command Message", "Monitor Process State", "Manipulation of Control", "Spoof Reporting Message"] },
           "framework": { "const": "attack_ics" },
           "provenance": { "const": "sensor" }
         }
@@ -232,7 +232,7 @@
             "uid": { "type": "string", "pattern": "^rf1-[0-9a-f]{32}$" },
             "title": { "type": "string", "maxLength": 256, "pattern": "^[ -;=?-_a-~]*$" },
             "desc": { "type": "string", "maxLength": 2048, "pattern": "^[ -;=?-_a-~]*$" },
-            "types": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "enum": ["robot_deviation", "ros2_dds_discovery", "ros2_motion_commands", "robodr"] } },
+            "types": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "enum": ["robot_deviation", "ros2_dds_discovery", "ros2_motion_commands", "robodr", "robodr_correlation", "robot_safety_state", "robodr_agent"] } },
             "first_seen_time": { "type": "integer" },
             "last_seen_time": { "type": "integer" },
             "analytic": {
@@ -258,14 +258,14 @@
                     "additionalProperties": false,
                     "required": ["uid", "name"],
                     "properties": {
-                      "uid": { "enum": ["T0848", "T0855", "T0801", "T0831"] },
-                      "name": { "enum": ["Rogue Master", "Unauthorized Command Message", "Monitor Process State", "Manipulation of Control"] }
+                      "uid": { "enum": ["T0848", "T0855", "T0801", "T0831", "T0856"] },
+                      "name": { "enum": ["Rogue Master", "Unauthorized Command Message", "Monitor Process State", "Manipulation of Control", "Spoof Reporting Message"] }
                     }
                   }
                 }
               }
             },
-            "data_sources": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "enum": ["ros2_dds_discovery", "ros2_motion_commands", "robodr"] } }
+            "data_sources": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "enum": ["ros2_dds_discovery", "ros2_motion_commands", "robodr", "robodr_correlation", "robot_safety_state", "robodr_agent"] } }
           }
         },
         "device": {

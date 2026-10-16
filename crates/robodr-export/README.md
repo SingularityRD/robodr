@@ -84,6 +84,12 @@ robodr-kafka-publish --bootstrap kafka-1:9092 [--bootstrap kafka-2:9092] \
   headers must equal what `robodr_ocsf::record` derives from the value
   (contract §2: the value is authoritative), the topic must be the
   configured one. The **bytes on disk** are what is sent as the value.
+  A per-finding signature header `robodr-finding-sig` (contract §2a, agentd
+  `finding_signing`) is the one exception: it must be the last header, is
+  shape-checked (`FindingSignature::from_header_value`) and forwarded
+  verbatim; it is verified by the consumer, which holds the unit's finding
+  key. `robodr-spool-export` (diode path) does **not** carry it: the diode
+  batch format holds values only (contract §8).
 * **Partition** = `toPositive(murmur2(robot_id)) % partitions`, with the
   topic's *current* partition count from Metadata (contract §4). An input
   partition computed for another count is overridden (`partition_overridden`

@@ -1,0 +1,16 @@
+# EXAMPLE drop-in, not active as shipped. To use it:
+#   install -D -m 0644 20-finding-key.conf.example \
+#       /etc/systemd/system/robodr-agentd.service.d/20-finding-key.conf
+#   systemctl daemon-reload && systemctl restart robodr-agentd
+#
+# Hands robodr-agentd its dedicated per-finding signing key (contract §2a,
+# docs/OPERATIONS.md section 6.4) the same way as the black-box key: systemd
+# (PID 1) reads the root-only file and exposes a private copy at
+#   /run/credentials/robodr-agentd.service/finding.key
+# which agentd.json then names:
+#   "finding_signing": { "key_file": "/run/credentials/robodr-agentd.service/finding.key" }
+# The key must be an Ed25519 `robodr-blackbox keygen` secret key file, not the
+# black-box key. If the source file is missing, the unit fails to start, so
+# install this drop-in only together with the key.
+[Service]
+LoadCredential=finding.key:/etc/robodr/keys/agentd-finding.key

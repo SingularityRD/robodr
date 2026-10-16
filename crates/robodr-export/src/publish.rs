@@ -355,9 +355,32 @@ impl<S: Sink> Publisher<S> {
         if rec.key != want.key {
             return Err("key is not the finding id".into());
         }
-        let same_headers = rec.headers.len() == want.headers.len()
-            && rec
-                .headers
+        // An optional detached finding signature (contract §2a) is carried
+        // verbatim as the last header; every other header is re-derived from
+        // the value and must match. The signature is checked for shape here
+        // and verified by the consumer (it needs the unit's finding key).
+        let sig = robodr_ocsf::signature_header(&rec.headers)
+            .map_err(|e| format!("finding signature header: {e}"))?;
+        let base = match sig {
+            Some(v) => {
+                robodr_ocsf::FindingSignature::from_header_value(v)
+                    .map_err(|e| format!("finding signature header: {e}"))?;
+                let last_is_sig = rec
+                    .headers
+                    .last()
+                    .is_some_and(|(k, _)| k == robodr_ocsf::SIG_HEADER);
+                if !last_is_sig {
+                    return Err(format!(
+                        "{} must be the last header",
+                        robodr_ocsf::SIG_HEADER
+                    ));
+                }
+                &rec.headers[..rec.headers.len() - 1]
+            }
+            None => &rec.headers[..],
+        };
+        let same_headers = base.len() == want.headers.len()
+            && base
                 .iter()
                 .zip(&want.headers)
                 .all(|((k, v), (wk, wv))| k == wk && v == wv);

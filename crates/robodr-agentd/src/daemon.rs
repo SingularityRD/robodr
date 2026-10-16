@@ -82,6 +82,41 @@
 //! (untrusted writer, undecodable or unmapped value) go through the agent
 //! like the pipeline's. Without a feed, `context.safety_state` is used.
 //!
+//! # Correlation
+//!
+//! With `correlation` enabled (the default), every outcome the daemon
+//! reports (pipeline and safety-feed findings, the agent's own profile /
+//! firewall / motion-monitor deviations, self-health issues) is also fed
+//! to a `robodr_correlate::Correlator` as a signal: rule, severity, the
+//! deviation's (already stricter) mode, the source IP (`src:<ip>`) or
+//! participant (`participant:<guid prefix>`) entity, and the deviation's
+//! black-box record as evidence reference. A correlated finding
+//! (`robot.correlate.*`) is recorded in full (every contributing signal) as
+//! a `robodr.correlated_finding` note, then handed to the agent like a
+//! sensor finding; it is observe-only whenever any contributor was. The
+//! engine's expiry runs on every tick, its counters are in `status.json`
+//! and the heartbeat, and a rising eviction / refusal count is reported as
+//! the observe-only self-health finding `robot.agent.correlation_pressure`.
+//! Correlation only adds findings; nothing is suppressed. Host-side (Pulsar)
+//! signals are not delivered to agentd yet, so the host-dependent default
+//! rules cannot fire here.
+//!
+//! # Evidence store upkeep
+//!
+//! Every tick writes the black box's `head.json` high-water mark if records
+//! were appended since the last one (`Agent::mark_blackbox_head`), bounding
+//! the unmarked tail in time on a quiet bus. Damaged closed segments that
+//! the recorder quarantined when it opened (or reopened after an outage)
+//! are reported once as the High, observe-only self-health finding
+//! `robot.agent.evidence_quarantined`.
+//!
+//! # Finding signatures
+//!
+//! With `finding_signing`, the agent signs every finding with the dedicated
+//! Ed25519 finding key (`Agent::with_finding_signer`); the detached
+//! signature is the spooled record's last header, `robodr-finding-sig`
+//! (contract §2a).
+//!
 //! # What the daemon does with a plan
 //!
 //! Nothing. The agent's executor is the default `NoopExecutor`: plans
@@ -100,6 +135,7 @@ use robodr_agent::{
     Agent, AgentConfig, AgentStats, Detector, Finished, FirewallSettings, MonitorSettings, Outcome,
 };
 use robodr_blackbox::{Clock, RecorderConfig, SystemClock, TimeSource, Timestamp};
+use robodr_correlate::{CorrelatedFinding, Correlator, EntityKind, Limits, Signal};
 use robodr_events::profile::Profile;
 use robodr_firewall::FailBehaviour;
 use robodr_ocsf::{AttestationStatus, PlatformFamily as OcsfPlatform, RobotInfo, Subject};
@@ -112,7 +148,8 @@ use serde::Serialize;
 
 use crate::config::{check_daemon_dirs, resolve_path, EventInputConfig, Resolved};
 use crate::health::{
-    DaemonSnapshot, HealthConfig, HealthMonitor, HealthState, InputSnapshot, Issue, Recovery, State,
+    rules as health_rules, DaemonSnapshot, HealthConfig, HealthMonitor, HealthState, InputSnapshot,
+    Issue, Recovery, State,
 };
 use crate::input::{self, Feed, InputStats, Msg, Payload, QueueBudget};
 use crate::notify::{monotonic_ms, Notifier};
@@ -177,6 +214,12 @@ pub struct DaemonStats {
     /// Heartbeat / status notes the black box did not take.
     pub note_errors: u64,
     pub max_queue_age_ms: u64,
+    /// Correlated findings (`robot.correlate.*`) handed to the agent.
+    pub correlated_findings: u64,
+    /// `head.json` high-water marks written by the housekeeping timer.
+    pub head_marks: u64,
+    /// High-water marks the timer could not write.
+    pub head_mark_errors: u64,
 }
 
 /// Why the daemon stopped.
@@ -292,6 +335,11 @@ struct Status<'a> {
     pipeline: &'a PipelineStats,
     agent: AgentStats,
     spool: SpoolStats,
+    /// Correlation engine counters (absent when correlation is disabled).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    correlation: Option<robodr_correlate::Stats>,
+    /// Findings carry a `robodr-finding-sig` signature.
+    signs_findings: bool,
     evidence_degraded: bool,
     queue_bytes: usize,
     queue_bytes_max: usize,
@@ -343,6 +391,14 @@ struct Daemon<'a> {
     /// The enforced locked profile's anti-rollback record, re-recorded in
     /// every heartbeat (see [`crate::profile_chain`]).
     profile_accepted: Option<robodr_commission::trust::AcceptedState>,
+    /// The correlation engine (`None` = disabled).
+    correlator: Option<Correlator>,
+    /// `groups_evicted + groups_refused` at the last pressure report.
+    correlation_pressure_reported: u64,
+    /// When the last pressure finding was raised (daemon ms).
+    correlation_pressure_at_ms: Option<u64>,
+    /// Quarantined segment list last reported.
+    quarantine_reported: Vec<u64>,
 }
 
 fn ms(d: Duration) -> u64 {
@@ -483,8 +539,21 @@ impl<'a> Daemon<'a> {
         }
         let signer = crate::config::signer_for(&r.key_algorithm, &r.key, r.key_id.as_deref())
             .map_err(|e| DaemonError::Config(format!("black-box key: {e}")))?;
-        let agent =
+        let mut agent =
             Agent::new(acfg, signer, Box::new(clock.clone())).map_err(DaemonError::Agent)?;
+        if let Some((key, key_id)) = &r.finding_key {
+            let fs = crate::config::signer_for(
+                robodr_blackbox::sign_ed25519::ED25519,
+                key,
+                Some(key_id),
+            )
+            .map_err(|e| DaemonError::Config(format!("finding key: {e}")))?;
+            agent = agent.with_finding_signer(fs).map_err(DaemonError::Agent)?;
+        }
+        let correlator = r
+            .correlation
+            .clone()
+            .map(|rules| Correlator::new(rules, Limits::default()));
 
         let spool = Spool::open(&cfg.spool.dir, cfg.spool.max_bytes, cfg.spool.max_files)
             .map_err(|e| DaemonError::Io(format!("spool {}: {e}", cfg.spool.dir.display())))?;
@@ -644,6 +713,10 @@ impl<'a> Daemon<'a> {
             stats: DaemonStats::default(),
             tick_max_age_ms: 0,
             profile_accepted: None,
+            correlator,
+            correlation_pressure_reported: 0,
+            correlation_pressure_at_ms: None,
+            quarantine_reported: Vec::new(),
         };
         #[derive(Serialize)]
         struct StartNote<'b> {
@@ -654,6 +727,8 @@ impl<'a> Daemon<'a> {
             profile_status: &'b str,
             inputs: Vec<&'b str>,
             safety_state: robodr_responder::SafetyState,
+            correlation_rules: Option<usize>,
+            signs_findings: bool,
         }
         let initial_safety = d.safety();
         let note = StartNote {
@@ -664,6 +739,8 @@ impl<'a> Daemon<'a> {
             profile_status: d.pipeline.status().as_str(),
             inputs: d.inputs.iter().map(|i| i.name.as_str()).collect(),
             safety_state: initial_safety,
+            correlation_rules: d.correlator.as_ref().map(|c| c.rules().len()),
+            signs_findings: d.agent.signs_findings(),
         };
         let now = d.clock.now();
         if let Err(e) = d.agent.record_note(now, "start note", &note, true) {
@@ -671,6 +748,7 @@ impl<'a> Daemon<'a> {
             let _ = writeln!(d.log, "robodr-agentd: start note not recorded: {e:?}");
         }
         d.profile_witness(accepted_ok);
+        d.evidence_quarantine();
         let names: Vec<String> = d.inputs.iter().map(|i| sanitize(&i.name)).collect();
         let _ = writeln!(
             d.log,
@@ -1018,6 +1096,194 @@ impl<'a> Daemon<'a> {
                 sanitize(&o.evidence.errors.join("; "))
             );
         }
+        self.correlate(&o);
+    }
+
+    /// Feed one reported outcome to the correlation engine and report what
+    /// it completes. Correlated findings and the engine's own health
+    /// finding are not fed back.
+    fn correlate(&mut self, o: &Outcome) {
+        let rule = o.deviation.rule_str();
+        if self.correlator.is_none()
+            || rule.starts_with(robodr_correlate::RULE_ID_PREFIX)
+            || rule == health_rules::CORRELATION_PRESSURE
+        {
+            return;
+        }
+        let mut sig = Signal::from_deviation(self.clock.now().mono_ns, &o.deviation);
+        if let Some(ip) = o.source.strip_prefix("src:") {
+            sig = sig.with_entity(EntityKind::Ip, ip);
+        } else if let Some(p) = o.source.strip_prefix("participant:") {
+            sig = sig.with_entity(EntityKind::Participant, p);
+        }
+        if let Some(r) = &o.evidence.deviation {
+            sig = sig.with_evidence_ref(r.uri(&self.r.config.robot.id));
+        }
+        let found = match self.correlator.as_mut() {
+            Some(c) => c.observe(&sig),
+            None => Vec::new(),
+        };
+        for f in found {
+            self.correlated(f);
+        }
+    }
+
+    /// A correlated finding: the full record (every contributing signal)
+    /// as a black-box note, then the agent (plan, finding) and the spool.
+    fn correlated(&mut self, f: CorrelatedFinding) {
+        #[derive(Serialize)]
+        struct Note<'b> {
+            kind: &'static str,
+            #[serde(flatten)]
+            finding: &'b CorrelatedFinding,
+        }
+        self.stats.correlated_findings += 1;
+        let _ = writeln!(
+            self.log,
+            "robodr-agentd: correlation: {}: {}",
+            f.rule,
+            sanitize(&f.detail)
+        );
+        let now = self.clock.now();
+        let critical = f.severity >= robodr_events::Severity::High;
+        let note = Note {
+            kind: "robodr.correlated_finding",
+            finding: &f,
+        };
+        if self
+            .agent
+            .record_note(now, "correlated finding", &note, critical)
+            .is_err()
+        {
+            self.stats.note_errors += 1;
+        }
+        let mut subject = Subject::default();
+        match &f.group {
+            Some(g) if g.kind == EntityKind::Ip => subject.src_ip = Some(g.value.clone()),
+            Some(g) if g.kind == EntityKind::Participant => {
+                subject.participant_guid = Some(g.value.clone());
+            }
+            _ => {}
+        }
+        let source = match &f.group {
+            Some(g) => format!("correlate:{}:{}:{}", f.rule, g.kind.as_str(), g.value),
+            None => format!("correlate:{}", f.rule),
+        };
+        let safety = self.safety();
+        let now = self.clock.now();
+        let o = self.agent.handle_external(
+            now,
+            Detector::Sensor,
+            &source,
+            subject,
+            f.to_deviation(),
+            safety,
+        );
+        self.emit(o);
+    }
+
+    /// Raise an observe-only self-health deviation (not an input issue).
+    fn self_health(&mut self, source: &str, dev: robodr_events::Deviation) {
+        self.stats.health_findings += 1;
+        let _ = writeln!(
+            self.log,
+            "robodr-agentd: health: {}: {}",
+            dev.rule_str(),
+            sanitize(&dev.detail)
+        );
+        let subject = Subject {
+            node: Some("robodr-agentd".into()),
+            ..Subject::default()
+        };
+        let safety = self.safety();
+        let now = self.clock.now();
+        let o = self
+            .agent
+            .handle_external(now, Detector::SelfHealth, source, subject, dev, safety);
+        self.emit(o);
+    }
+
+    /// Report newly quarantined black-box segments (once per recorder open).
+    fn evidence_quarantine(&mut self) {
+        let q = self.agent.blackbox_quarantined();
+        if q.is_empty() || q == self.quarantine_reported.as_slice() {
+            return;
+        }
+        let q = q.to_vec();
+        let detail = format!(
+            "the black box found {} damaged closed segment(s) ({}) when it was opened; they \
+             were copied to quarantine/ and documented by a signed recovery record, and \
+             recording continued: the storage is failing or the log was edited",
+            q.len(),
+            q.iter().map(u64::to_string).collect::<Vec<_>>().join(", ")
+        );
+        self.quarantine_reported = q;
+        let dev = robodr_events::Deviation::new(
+            health_rules::EVIDENCE_QUARANTINED,
+            robodr_events::Severity::High,
+            detail,
+        );
+        self.self_health("agentd:blackbox", dev);
+    }
+
+    /// Correlation housekeeping: expire state on a quiet bus; report a
+    /// rising eviction / refusal count (rate-limited like other health
+    /// counters).
+    fn correlation_tick(&mut self) {
+        let now_ns = self.clock.now().mono_ns;
+        let Some(c) = self.correlator.as_mut() else {
+            return;
+        };
+        c.tick(now_ns);
+        let st = *c.stats();
+        let pressure = st.groups_evicted.saturating_add(st.groups_refused);
+        if pressure <= self.correlation_pressure_reported {
+            return;
+        }
+        let now_ms = self.now_ms();
+        let every = self.r.config.daemon.health_report_ms;
+        if self
+            .correlation_pressure_at_ms
+            .is_some_and(|t| now_ms.saturating_sub(t) < every)
+        {
+            return;
+        }
+        let delta = pressure - self.correlation_pressure_reported;
+        self.correlation_pressure_reported = pressure;
+        self.correlation_pressure_at_ms = Some(now_ms);
+        let dev = robodr_events::Deviation::new(
+            health_rules::CORRELATION_PRESSURE,
+            robodr_events::Severity::Medium,
+            format!(
+                "the correlation engine evicted {} and refused {} pending groups ({delta} since \
+                 the last report): many fresh entities within a window, possibly a flood \
+                 aimed at hiding a correlation",
+                st.groups_evicted, st.groups_refused
+            ),
+        );
+        self.self_health("agentd:correlation", dev);
+    }
+
+    /// Write the black box's high-water mark if records were appended since
+    /// the last one.
+    fn mark_head(&mut self) {
+        match self.agent.mark_blackbox_head() {
+            Ok(true) => self.stats.head_marks += 1,
+            Ok(false) => {}
+            // An unavailable black box is already reported (evidence_degraded).
+            Err(_) if self.agent.evidence_degraded() => {}
+            Err(e) => {
+                self.stats.head_mark_errors += 1;
+                if self.stats.head_mark_errors.is_power_of_two() {
+                    let _ = writeln!(
+                        self.log,
+                        "robodr-agentd: black-box high-water mark not written ({} so far): {}",
+                        self.stats.head_mark_errors,
+                        sanitize(&e)
+                    );
+                }
+            }
+        }
     }
 
     fn health_issue(&mut self, issue: Issue) {
@@ -1142,6 +1408,9 @@ impl<'a> Daemon<'a> {
         for r in recoveries {
             self.recovery_note(&r);
         }
+        self.correlation_tick();
+        self.evidence_quarantine();
+        self.mark_head();
         for f in self.agent.take_faults() {
             let _ = writeln!(
                 self.log,
@@ -1224,6 +1493,8 @@ impl<'a> Daemon<'a> {
             pipeline: self.pipeline.stats(),
             agent: self.agent.stats(),
             spool: self.spool.stats(),
+            correlation: self.correlator.as_ref().map(|c| *c.stats()),
+            signs_findings: self.agent.signs_findings(),
             evidence_degraded: self.agent.evidence_degraded(),
             queue_bytes: self.budget.used(),
             queue_bytes_max: self.budget.max(),
@@ -1250,6 +1521,8 @@ impl<'a> Daemon<'a> {
             spool: SpoolStats,
             #[serde(skip_serializing_if = "Option::is_none")]
             profile_accepted: Option<&'b robodr_commission::trust::AcceptedState>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            correlation: Option<robodr_correlate::Stats>,
         }
         self.stats.heartbeats += 1;
         let stats = self.stats;
@@ -1263,6 +1536,7 @@ impl<'a> Daemon<'a> {
             agent: self.agent.stats(),
             spool: self.spool.stats(),
             profile_accepted: self.profile_accepted.as_ref(),
+            correlation: self.correlator.as_ref().map(|c| *c.stats()),
         };
         // Serialise first: `hb` borrows self immutably.
         let value = serde_json::to_value(&hb).unwrap_or(serde_json::Value::Null);

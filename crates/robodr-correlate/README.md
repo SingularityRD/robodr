@@ -136,39 +136,41 @@ These are warnings:
   signals are ignored for `cooldown_secs`. If a group in cooldown is
   evicted, the result can only be an extra finding, never a missed one.
 
-## Integration guide (agentd)
+## Integration (agentd)
 
-This crate is not wired into the daemon. The integrator needs to do the
-following:
+`robodr-agentd` runs the engine (`correlation` section of its configuration;
+on by default with the shipped rules, plus an optional rule file validated
+together with them as one set; see `docs/OPERATIONS.md`):
 
-1. **Construct.** Call `Correlator::with_defaults()` in the daemon, or
-   `RuleSet::from_json` on a file from the signed configuration bundle. Log
-   load warnings. On a load error, refuse to start or fall back to
-   `RuleSet::empty()`. Never fall back to a partial set.
-2. **Feed.** In `sensor_findings`, after `Agent::handle_external` for each
-   pipeline `Finding`, pass
-   `Signal::from_deviation(mono_ns, &f.deviation).with_entity(EntityKind::Ip, &f.src_ip)`,
-   with the outcome's black-box deviation reference as `evidence_ref`. Add
-   `EntityKind::Participant` when the finding names a GUID prefix. Feed
-   agent-detected deviations from `motion_sample` and self-health issues the
-   same way. Use the same monotonic clock as the agent.
-3. **Host side.** When Pulsar threats reach agentd, feed
-   `Signal::host(t, threat.rule_name, sev)` with
-   `EntityKind::Process` set to `"<pid>:<image>"`. This path does not exist
-   yet.
-4. **Emit.** Hand each `CorrelatedFinding` to
-   `agent.handle_external(now, Detector::Sensor, "correlate:<rule>", subject, f.to_deviation(), safety)`.
-   A dedicated `Detector::Correlation` variant would need a change in
-   `robodr-agent`. Also record the full `CorrelatedFinding`, including its
-   contributors, with `Agent::record_note`, so the evidence chain is in the
-   black box. The agent keeps the stricter of the deviation's mode and the
-   profile's mode, so observe-only stays observe-only.
-5. **Ticks and health.** Call `tick(mono_ns)` from the daemon's housekeeping
-   tick so that state expires while traffic is idle. Export `Stats`. A
-   rising `groups_evicted` or `groups_refused` means someone is flooding
-   entities. That is worth an observe-only self-health finding.
-6. **OCSF catalog.** Add `robot.correlate.*` entries to the `robodr-ocsf`
-   rule catalog. Until then, findings get the generic "unknown rule" entry.
+1. **Construct.** `Correlator::new(rules, Limits::default())` from
+   `RuleSet::from_file` over the shipped rules and/or `correlation.rules_path`.
+   A rule file that does not load refuses the configuration; load warnings
+   are logged at start.
+2. **Feed.** Every outcome the daemon reports goes in as
+   `Signal::from_deviation(mono_ns, &outcome.deviation)` (the deviation's mode
+   is already the stricter of profile and deviation), with
+   `EntityKind::Ip` for `src:<ip>` sources (pipeline and safety-feed
+   findings), `EntityKind::Participant` for `participant:<guid prefix>`
+   sources (the agent's profile / firewall / motion-monitor deviations), and
+   the deviation's black-box record URI as `evidence_ref`. Self-health issues
+   (observe-only) go in without an entity. Correlated findings and the
+   engine's own health finding are not fed back.
+3. **Host side.** Not yet: nothing delivers Pulsar threats to agentd, so the
+   host-dependent default rules (`coordinated_intrusion`,
+   `credential_theft`, `trojaned_package_key_access`, `defense_tampering`,
+   `host_process_persistence`) cannot fire in the daemon today.
+4. **Emit.** Each `CorrelatedFinding` is recorded in full (every
+   contributor) as a `robodr.correlated_finding` black-box note, then handed
+   to `Agent::handle_external(now, Detector::Sensor, "correlate:<rule>[:<group>]",
+   subject, f.to_deviation(), safety)`; observe-only stays observe-only.
+5. **Ticks and health.** `tick(mono_ns)` on every housekeeping tick;
+   `Stats` in `status.json` and the heartbeat; a rising
+   `groups_evicted + groups_refused` raises the observe-only self-health
+   finding `robot.agent.correlation_pressure` (rate-limited by
+   `daemon.health_report_ms`).
+6. **OCSF catalog.** `robot.correlate.*` entries are in the `robodr-ocsf`
+   catalog since contract 1.3 (a custom rule id gets the generic
+   "Correlated RoboDR detection" entry).
 
 ## Not verified
 
@@ -178,7 +180,8 @@ following:
 - Unit-scoped rules (`group_by: null`) join host and network signals that
   share no entity. RoboDR has no process↔socket attribution yet, so on a
   busy unit two unrelated events inside a window will correlate.
-- Host signals are synthetic in the tests, because nothing delivers Pulsar
-  threats to agentd yet. Throughput was not benchmarked. The cost per signal
+- Host signals are synthetic in the engine's tests, because nothing delivers
+  Pulsar threats to agentd yet; the daemon tests exercise network-only rules
+  (discovery flood, a per-IP sequence) on synthetic captures. Throughput was not benchmarked. The cost per signal
   is O(rules × groups-per-signal × steps), plus an O(groups) sweep whenever
   a rule's table is full.

@@ -68,6 +68,26 @@ its
 must be null or
 .IR id .
 .TP
+.BI \-\-trust\-roots " file"
+Trust roots
+.RI ( robodr\-trust\-roots/v1 ):
+verify the trust file's root\-signed
+.B min_profile_version
+floor and the revocation list.
+.TP
+.BI \-\-revocations " file"
+Signed profile revocation list
+.RI ( robodr\-profile\-revocations/v1 ;
+needs
+.BR \-\-trust\-roots ).
+A revoked profile digest or signing key id is refused; with
+.BR \-\-profile\-state ,
+an older or missing list after one was accepted is refused too.
+.TP
+.B \-\-revocations\-required
+Refuse every locked profile while the list file is missing (default: optional
+until a list has been accepted).
+.TP
 .BI \-\-domain " id"
 ROS_DOMAIN_ID whose well\-known ports are captured (repeatable, 0..=232;
 default 0). RTPS on other ports is still caught by the

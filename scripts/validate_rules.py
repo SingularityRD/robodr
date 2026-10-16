@@ -31,6 +31,12 @@ the engine's matching semantics (Argv CONTAINS = exact element; FileFlags
 CONTAINS = access-mode equality or bit test; IpAddr ordering V4 < V6; a path
 through a ``None`` Option evaluates to false).
 
+Lint: an ``argv CONTAINS`` literal containing a space is warned about (it
+matches one whole argv element, never a command-line substring), unless an
+enclosing AND chain of the same rule also requires ``payload.argc == N``:
+with the count pinned the literal is a deliberate exact-element match (the
+CMake FindPython probe exclusions in runtime_hooking.toml).
+
 If the Pulsar source tree is present (default ``vendor/pulsar`` or
 ``--pulsar-src``) the script additionally:
   * re-extracts the Payload / Header / Host / ContainerInfo fields, the
@@ -539,12 +545,43 @@ def check_literal(ty: str, value: str, dotted: str) -> None:
     # ModuleName(Cow::Owned), Argv(vec![s])) -- any literal loads.
 
 
-def typecheck(cond, event_type: str, warnings: list[str]) -> None:
+def _and_conjuncts(cond) -> list:
+    """The conjuncts of an AND chain (through parentheses, not through OR/NOT)."""
+    if isinstance(cond, Group):
+        return _and_conjuncts(cond.inner)
+    if isinstance(cond, BoolOp) and cond.op == "AND":
+        return _and_conjuncts(cond.left) + _and_conjuncts(cond.right)
+    return [cond]
+
+
+def _is_argc_pin(cond, event_type: str) -> bool:
+    """`payload.argc == <literal>` on an Exec event: the argument count is exact."""
+    return (
+        event_type == "Exec"
+        and isinstance(cond, Binary)
+        and cond.op == "=="
+        and cond.left.parts == [("field", "payload"), ("field", "argc")]
+        and isinstance(cond.right, str)
+    )
+
+
+def typecheck(cond, event_type: str, warnings: list[str], argc_pinned: bool = False) -> None:
+    """Type-check `cond`; lint warnings go to `warnings`.
+
+    `argc_pinned` is true when an enclosing AND chain also requires
+    `payload.argc == N`. Every event the sub-condition can match then has
+    exactly N argv elements, so an argv literal with spaces is a deliberate
+    exact-element match (e.g. a whole `python3 -c "<probe>"` text), not a
+    mistaken attempt at a command-line substring; the warning is skipped.
+    An OR sibling does not pin (the other branch can match any argc).
+    """
     if isinstance(cond, (BoolOp,)):
-        typecheck(cond.left, event_type, warnings)
-        typecheck(cond.right, event_type, warnings)
+        if cond.op == "AND" and not argc_pinned:
+            argc_pinned = any(_is_argc_pin(c, event_type) for c in _and_conjuncts(cond))
+        typecheck(cond.left, event_type, warnings, argc_pinned)
+        typecheck(cond.right, event_type, warnings, argc_pinned)
     elif isinstance(cond, (Not, Group)):
-        typecheck(cond.inner, event_type, warnings)
+        typecheck(cond.inner, event_type, warnings, argc_pinned)
     elif isinstance(cond, Unary):
         ty = resolve_type(cond.path, event_type)
         if ty != "bool":
@@ -565,10 +602,11 @@ def typecheck(cond, event_type: str, warnings: list[str]) -> None:
                 raise RuleError(f"'{dotted}' ({ty}) compared to field of type {rty}")
         else:
             check_literal(ty, cond.right, dotted)
-            if ty == "Argv" and " " in cond.right:
+            if ty == "Argv" and " " in cond.right and not argc_pinned:
                 warnings.append(
                     f"argv CONTAINS {cond.right!r}: matches one whole argv element, "
-                    "never a substring of the command line"
+                    "never a substring of the command line (pin payload.argc == N in "
+                    "the same AND chain if an exact element is intended)"
                 )
         if event_type == "Exec" and cond.left.parts[:2] == [("field", "header"), ("field", "image")]:
             warnings.append(
@@ -1128,6 +1166,12 @@ def _errs(text: str) -> list[str]:
     return rep.errors
 
 
+def _warns(text: str) -> list[str]:
+    rep = Report()
+    validate_text(text, "t", rep)
+    return [w for w in rep.warnings if "argv CONTAINS" in w]
+
+
 def _rule(cond: str, ty: str = "Exec", cat: str = "execution") -> str:
     return (f'[[rules]]\nname = "x"\ntype = "{ty}"\ncategory = "{cat}"\nseverity = "low"\n'
             f'description = "d"\ncondition = \'{cond}\'\n')
@@ -1209,6 +1253,27 @@ def self_test() -> int:
             fails += 1
         elif not ok and (not errs or needle not in errs[0]):
             print(f"self-test {i}: expected error containing {needle!r}, got {errs}")
+            fails += 1
+    # Argv literals with spaces: warned unless the same AND chain pins argc.
+    for cond, warned in [
+        ('payload.argv CONTAINS "a b"', True),
+        ('payload.argc == 2 AND payload.argv CONTAINS "a b"', False),
+        ('payload.argc == 3 AND payload.argv CONTAINS "-c" AND (payload.argv CONTAINS "x y" '
+         'OR payload.argv CONTAINS "p q")', False),
+        ('NOT (payload.argc == 3 AND (payload.argv CONTAINS "x y"))', False),
+        ('payload.argc == 3 AND NOT payload.argv CONTAINS "x y"', False),
+        ('payload.argc == 2 OR payload.argv CONTAINS "a b"', True),
+        ('payload.argc >= 2 AND payload.argv CONTAINS "a b"', True),
+        ('NOT payload.argc == 2 AND payload.argv CONTAINS "a b"', True),
+        ('(payload.argc == 2 OR header.uid == 0) AND payload.argv CONTAINS "a b"', True),
+        # Equal precedence, left-assoc: (argc OR uid) AND argv -> not pinned.
+        ('payload.argc == 2 OR header.uid == 0 AND payload.argv CONTAINS "a b"', True),
+        # (uid OR argv) AND argc -> pinned for both branches.
+        ('header.uid == 0 OR payload.argv CONTAINS "a b" AND payload.argc == 2', False),
+    ]:
+        got = bool(_warns(_rule(cond)))
+        if got != warned:
+            print(f"self-test argv pin: {cond!r}: warned={got}, expected {warned}")
             fails += 1
     # Precedence: 'a OR b AND c' must evaluate as '(a OR b) AND c'.
     ast = Parser('payload.filename == "a" OR payload.filename == "b" AND header.uid == 5').parse()

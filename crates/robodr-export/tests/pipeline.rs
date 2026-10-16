@@ -496,3 +496,82 @@ fn publisher_stops_on_fatal_kafka_error_without_committing() {
     // Fixed (ACL granted): the same publisher goes on.
     assert_eq!(p.run_once().unwrap().published, 3);
 }
+
+/// Per-finding signatures (contract §2a) on the connected path: the
+/// `robodr-finding-sig` header agentd spools is published verbatim (last
+/// header, value bytes unchanged) and verifies at the consumer; a malformed
+/// or misplaced signature header is dead-lettered, never forwarded.
+#[test]
+fn publisher_carries_finding_signatures_from_a_spool() {
+    const FSEED: [u8; 32] = [0x42; 32];
+    const FKEY: &str = "finding:ugv-007:1";
+    let r = Robot::new("pub-sig");
+    let fsigner = Ed25519SigningKey::from_seed(FKEY, &FSEED).unwrap();
+    let mut s = Spool::open(&r.spool, 1 << 30, 1_000_000).unwrap();
+    let out = |rec: robodr_ocsf::Record| FindingOutput {
+        topic: rec.topic.to_string(),
+        key: rec.key,
+        partition: rec.partition,
+        value: rec.value,
+        headers: rec
+            .headers
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+    };
+    for i in 0..3 {
+        let mut rec = robodr_ocsf::record(&finding(i), Some(12)).unwrap();
+        robodr_ocsf::sign_record(&mut rec, &fsigner).unwrap();
+        s.write(&out(rec), false).unwrap();
+    }
+    // Signature header moved first: refused.
+    let mut rec = robodr_ocsf::record(&finding(3), Some(12)).unwrap();
+    robodr_ocsf::sign_record(&mut rec, &fsigner).unwrap();
+    let mut o = out(rec);
+    let sig = o.headers.pop().unwrap();
+    o.headers.insert(0, sig);
+    s.write(&o, false).unwrap();
+    // Malformed signature header: refused.
+    let rec = robodr_ocsf::record(&finding(4), Some(12)).unwrap();
+    let mut o = out(rec);
+    o.headers
+        .push((robodr_ocsf::SIG_HEADER.into(), "{\"alg\":\"hmac\"}".into()));
+    s.write(&o, false).unwrap();
+    drop(s);
+
+    let c = Cluster::start(1, 3);
+    let cfg = PublishConfig::new(Source::Spool(r.spool.clone()), &r.soc_state);
+    let mut p = Publisher::open(cfg, producer(&c)).unwrap();
+    let rep = p.run_once().unwrap();
+    assert_eq!(rep.published, 3);
+    assert_eq!(rep.dead_lettered, 2);
+
+    let pk = robodr_blackbox::KeyFile::ed25519_from_seed(&FSEED, Some(FKEY))
+        .unwrap()
+        .to_public()
+        .unwrap()
+        .ed25519_verifying_key()
+        .unwrap();
+    let mut keys: std::collections::BTreeMap<String, Box<dyn robodr_blackbox::Verifier>> =
+        std::collections::BTreeMap::new();
+    keys.insert(UNIT.into(), Box::new(pk));
+    let recs = c.all_records();
+    assert_eq!(recs.len(), 3);
+    for (_, d) in recs {
+        let value = String::from_utf8(d.value.clone().unwrap()).unwrap();
+        let last = d.headers.last().unwrap();
+        assert_eq!(last.0, robodr_ocsf::SIG_HEADER);
+        let sig = header(&d, robodr_ocsf::SIG_HEADER);
+        let v = robodr_ocsf::parse_and_validate_signed(
+            &value,
+            sig.as_deref(),
+            &keys,
+            robodr_ocsf::SignaturePolicy::Strict,
+        )
+        .unwrap();
+        assert!(matches!(
+            v.signature,
+            robodr_ocsf::SignatureStatus::Verified { .. }
+        ));
+    }
+}

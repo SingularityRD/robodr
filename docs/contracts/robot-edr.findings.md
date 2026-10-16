@@ -2,7 +2,7 @@
 
 | | |
 | --- | --- |
-| Contract version | **1.2.0** (`contract_version` field, `robodr-contract-version` header); changes in §10 |
+| Contract version | **1.3.0** (`contract_version` field, `robodr-contract-version` header); changes in §10 |
 | Producer | RoboDR control plane (Kafka publisher, Sprint 4); diode importer on air-gapped sites |
 | Consumer | AutoSecOps `core/ingestion/kafka_consumer_service.py` |
 | Value schema | [`robot-edr-finding.schema.json`](robot-edr-finding.schema.json) (JSON Schema 2020-12) |
@@ -73,7 +73,7 @@ listed in `crates/robodr-ocsf/README.md` (*OCSF-UNCERTAIN*).
 | Header | Value |
 | --- | --- |
 | `content-type` | `application/json` |
-| `robodr-contract-version` | `1.2.0` |
+| `robodr-contract-version` | `1.3.0` |
 | `ocsf-version` | `1.1.0` |
 | `data-source` | `robot_edr` |
 | `robot-id` | robot id (`[A-Za-z0-9._-]{1,64}`) |
@@ -88,7 +88,7 @@ not trust a header that disagrees with the value.
 
 ```json
 {
-  "contract_version": "1.2.0",
+  "contract_version": "1.3.0",
   "finding_id": "rf1-0d7e79aac05cfd23bcfbdd38ef617eba",
   "external_id": "ugv-007:rf1-0d7e79aac05cfd23bcfbdd38ef617eba",
   "data_source": "robot_edr",
@@ -384,10 +384,20 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
   `["taint:adversary"]`. A message with anything else (e.g. prose in
   `types`) is rejected, so these sensor-provenance fields cannot carry
   free text. Data sources: `ros2_dds_discovery`, `ros2_motion_commands`,
-  `robodr` (rule not in the catalog). Techniques: T0848 Rogue Master, T0855
-  Unauthorized Command Message, T0801 Monitor Process State, T0831
-  Manipulation of Control. Adding a catalog entry is a contract minor bump
-  and needs the validator updated on both sides of the diode in step.
+  `robodr` (rule not in the catalog), and since 1.3 `robodr_correlation`
+  (`robot.correlate.*`), `robot_safety_state` (`robot.safety_state.*`) and
+  `robodr_agent` (`robot.ros2.profile_state_tampered`,
+  `robot.agent.evidence_quarantined`, `robot.agent.correlation_pressure`).
+  Techniques: T0848 Rogue Master, T0855 Unauthorized Command Message, T0801
+  Monitor Process State, T0831 Manipulation of Control, and since 1.3 T0856
+  Spoof Reporting Message (untrusted safety-state writer). Adding a catalog
+  entry is a contract minor bump and needs the validator updated on both
+  sides of the diode in step. The validator applies the catalog **of the
+  message's own `contract_version`** (`robodr_ocsf::rule_info_for_contract`):
+  a 1.2 finding for a rule that only gained an entry in 1.3 carries the
+  generic entry and stays valid; a 1.3 finding must carry the new entry.
+  Any `robot.correlate.*` id without its own entry (a deployment's custom
+  correlation rule) gets the generic correlation entry.
 
 ## 4. Ordering and partitioning
 
@@ -547,14 +557,22 @@ records to Kafka are outside the crate (no network code).
   never stops the other entries or units from being imported.
 * Because `finding_id` and `event-uid` are deterministic, re-publishing an
   already-imported finding remains idempotent for the consumer.
-* **Finding signatures (§2a) across the diode — integrator TODO.** Today
-  `findings.jsonl` carries values only and the importer re-serialises the
-  parsed value (`robodr_ocsf::record`), so per-finding signatures are not
-  carried across the diode; the batch is authenticated by `MANIFEST.sig`
-  instead. To keep end-to-end per-finding signatures the packer must carry
-  each `robodr-finding-sig` header and the importer must emit the original
-  value bytes verbatim with that header (re-serialisation is byte-identical
-  for builder output today — tested — but that is not a contract guarantee).
+* **Finding signatures (§2a) and the diode — not carried (open item).**
+  agentd spools each signed finding with its `robodr-finding-sig` header
+  (the spool record *is* the Kafka record), and on a **connected** path
+  `robodr-kafka-publish --spool` forwards that header verbatim as the last
+  header (shape-checked; a malformed or misplaced signature header is
+  dead-lettered). Across the **diode** the signature is dropped:
+  `robodr-spool-export` packs the validated values, `findings.jsonl` carries
+  values only and the importer re-serialises the parsed value
+  (`robodr_ocsf::record`). There the batch is authenticated by
+  `MANIFEST.sig` (unit-bound diode key) instead, so SOC consumers behind a
+  diode must run the §2a check in `Optional` mode or rely on the importer's
+  batch verification. Carrying it would need a signed per-finding sidecar
+  (e.g. `finding-sigs.jsonl` listed and hashed in the manifest) and an
+  importer that emits the original value bytes verbatim with the header
+  (re-serialisation is byte-identical for builder output today — tested —
+  but that is not a contract guarantee); not done in this release.
 
 ### 8.1 Exporters (`crates/robodr-export`)
 
@@ -571,7 +589,9 @@ The two hops around the diode are implemented in `crates/robodr-export`
 * **`robodr-kafka-publish`** (SOC side) publishes the importer's
   `out/<batch>/records.jsonl` (or a connected site's spool) to this topic
   with the §2 key and headers (re-derived from the validated value and
-  required to match the input) and the §4 partition rule, computed with the
+  required to match the input; an optional `robodr-finding-sig` header is
+  carried verbatim as the last header, §2a) and the §4 partition rule,
+  computed with the
   topic's current partition count. CreateTime is the publish time (the
   finding time is `ocsf.time`). Progress is a per-batch committed line count
   replaced atomically after each acknowledged chunk, plus a done marker per
@@ -612,6 +632,17 @@ Consumer acceptance checks for this contract:
 - [ ] `robodr-finding-sig` verified over the raw value bytes with the key registered for `entity_context.robot.id` (§2a); strict mode on connected paths once all producers sign; dedup on `event-uid` (signatures do not stop replay).
 
 ## 10. Changelog
+
+* **1.3.0** — rule catalog entries for the wave-6 detectors: the nine default
+  `robot.correlate.*` rules plus a generic entry for any other
+  `robot.correlate.*` id, `robot.safety_state.{untrusted_source,
+  undecodable_sample, unmapped_value}`, `robot.ros2.profile_state_tampered`,
+  `robot.agent.evidence_quarantined` and `robot.agent.correlation_pressure`.
+  New data sources `robodr_correlation`, `robot_safety_state`,
+  `robodr_agent`; new technique T0856 Spoof Reporting Message. Value format
+  otherwise unchanged; the validator checks catalog constants against the
+  catalog of the message's own minor, so 1.2 messages stay valid. Schema
+  `$id` → `/1.3.0`.
 
 * **1.2.0** — optional detached per-finding Ed25519 signature (§2a) in the
   new Kafka header `robodr-finding-sig`; signed bytes = the record value

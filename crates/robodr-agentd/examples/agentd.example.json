@@ -19,7 +19,10 @@
     "profile_trust": {
       "trusted_keys": "/etc/robodr/profile-trust.json",
       "state_file": "/var/lib/robodr/profile-state/agentd.json",
-      "expect_platform": "ugv-x1"
+      "expect_platform": "ugv-x1",
+      "trust_roots": "/etc/robodr/trust-roots.json",
+      "revocation_list": "/etc/robodr/profile-revocations.json",
+      "revocation_policy": "optional"
     }
   },
   "policy_path": "/etc/robodr/policy.json",
@@ -60,6 +63,14 @@
         "motion": { "moving_above": 0.05, "fast_above": 1.0, "hysteresis": 0.02 } }
     ],
     "socket": { "path": "/run/robodr/safety.sock", "max_connections": 2 }
+  },
+  "correlation": {
+    "enabled": true,
+    "rules_path": "/etc/robodr/correlation-rules.json",
+    "include_default_rules": true
+  },
+  "finding_signing": {
+    "key_file": "/etc/robodr/keys/agentd-finding.key"
   },
   "daemon": {
     "queue_capacity": 4096,
