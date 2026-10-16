@@ -141,7 +141,10 @@ fn decoders_and_reassembler_never_panic() {
     let mut reasm = Reassembler::new(ReassemblyLimits {
         max_datagrams: 16,
         max_bytes: 64 * 1024,
+        max_bytes_per_dst: 32 * 1024,
         timeout: Duration::from_secs(2),
+        timeout_v6: Duration::from_secs(3),
+        ..Default::default()
     });
     let mut decoded = 0usize;
     for i in 0..iters() {
@@ -182,7 +185,9 @@ fn decoders_and_reassembler_never_panic() {
                 data: &data,
             };
             let _ = reasm.push(ts, &frag);
-            assert!(reasm.in_flight() <= 16);
+            // max_datagrams applies per IP version.
+            assert!(reasm.in_flight() <= 32);
+            assert!(reasm.buffered_bytes() <= 2 * (64 * 1024 + 70_000 + 256));
         }
     }
     assert!(

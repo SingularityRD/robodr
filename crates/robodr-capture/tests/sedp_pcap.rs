@@ -219,23 +219,60 @@ fn fragmented_sedp_is_reassembled() {
     assert_eq!(it.stats().fragments as usize, frags.len());
 }
 
+fn replay(frags: &[Vec<u8>]) -> Vec<u8> {
+    let mut w = PcapWriter::new(Vec::new(), LinkType::RAW, 65535, false).unwrap();
+    for f in frags {
+        w.write_packet(Duration::ZERO, f, f.len() as u32).unwrap();
+    }
+    w.into_inner()
+}
+
 /// Overlapping fragments with conflicting bytes (the classic "sensor and host
-/// reassemble differently" trick) are dropped and counted, never parsed.
+/// reassemble differently" trick) are resolved exactly like Linux: an exact
+/// duplicate is ignored (first copy wins, conflict counted), a partial
+/// overlap drops the datagram, and a forged first copy is caught by the UDP
+/// checksum of the reassembled datagram (which the robot's stack checks too).
 #[test]
-fn conflicting_overlap_is_dropped_and_counted() {
+fn conflicting_overlap_is_resolved_like_the_kernel() {
     let sedp = sedp_writer_datagram([0xee; 12], "rt/cmd_vel", TWIST, 600);
-    let ip = synth::ipv4_udp(ATTACKER, ROBOT, 49152, 7412, &sedp);
-    let mut frags = synth::ipv4_fragment(&ip, 256);
-    // A rewritten copy of fragment 1 with different payload bytes.
+    let ip = synth::ipv4_udp_checksummed(ATTACKER, ROBOT, 49152, 7412, &sedp);
+    let frags = synth::ipv4_fragment(&ip, 256);
+    // A rewritten copy of fragment 1 with different payload bytes (valid IP
+    // header checksum: the kernel would queue it).
     let mut evil = frags[1].clone();
     let n = evil.len();
     evil[n - 1] ^= 0xff;
-    frags.insert(2, evil);
-    let mut w = PcapWriter::new(Vec::new(), LinkType::RAW, 65535, false).unwrap();
-    for f in &frags {
-        w.write_packet(Duration::ZERO, f, f.len() as u32).unwrap();
-    }
-    let file = w.into_inner();
+
+    // Late conflicting duplicate: ignored, the real datagram is delivered.
+    let mut late = frags.clone();
+    late.insert(2, evil.clone());
+    let file = replay(&late);
+    let mut it = rtps_datagrams(CaptureFile::new(&file[..]).unwrap());
+    assert_cmd_vel_writer(&events_from(&mut it), "192.168.50.66");
+    assert_eq!(it.reassembly_stats().duplicate_conflicts, 1);
+    assert_eq!(it.reassembly_stats().dropped_overlap, 0);
+
+    // Early forged copy: it wins reassembly, but the UDP checksum fails, so
+    // neither the robot nor the sensor accepts the datagram.
+    let mut early = frags.clone();
+    early.insert(0, evil);
+    let file = replay(&early);
+    let mut it = rtps_datagrams(CaptureFile::new(&file[..]).unwrap());
+    assert!(events_from(&mut it).is_empty());
+    assert_eq!(it.reassembly_stats().duplicate_conflicts, 1);
+    assert_eq!(it.stats().bad_udp_checksum, 1);
+
+    // Partial overlap: fragment 1 re-sent 8 bytes further on, extending past
+    // the queued data -> the whole datagram is dropped (RFC 5722 / Linux).
+    let mut shifted = frags[1].clone();
+    let fo = u16::from_be_bytes([shifted[6], shifted[7]]);
+    shifted[6..8].copy_from_slice(&(fo + 1).to_be_bytes());
+    shifted[10..12].copy_from_slice(&[0, 0]);
+    let c = robodr_capture::checksum::internet_checksum(&shifted[..20]);
+    shifted[10..12].copy_from_slice(&c.to_be_bytes());
+    let mut partial = frags[..2].to_vec();
+    partial.push(shifted);
+    let file = replay(&partial);
     let mut it = rtps_datagrams(CaptureFile::new(&file[..]).unwrap());
     assert!(events_from(&mut it).is_empty());
     assert_eq!(it.reassembly_stats().dropped_overlap, 1);

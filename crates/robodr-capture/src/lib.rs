@@ -52,12 +52,17 @@
 //! 2. [`decode`]: Ethernet II (+ up to two VLAN tags), Linux cooked SLL/SLL2,
 //!    raw IP, BSD NULL/LOOP -> IPv4 / IPv6 (extension headers walked) -> UDP.
 //!    Pure functions, no `unsafe`, bounds-checked, fuzzed.
-//! 3. [`reassembly`]: bounded IPv4/IPv6 fragment reassembly, so a large or
-//!    deliberately fragmented SEDP announcement is not missed. Conflicting
-//!    overlaps drop the datagram (and are counted).
-//! 4. [`ports`]: [`RtpsFilter`] = DDSI-RTPS well-known ports and/or the
+//! 3. [`checksum`]: IPv4 header checksums are verified *before* reassembly
+//!    and UDP checksums after it, so the sensor drops what the robot's IP
+//!    stack drops (forged packets or fragments only the detector would see).
+//! 4. [`reassembly`]: bounded IPv4/IPv6 fragment reassembly mirroring the
+//!    Linux rules (first copy wins on exact duplicates, partial overlaps
+//!    drop the datagram, per-destination memory budgets that refuse rather
+//!    than evict), so a large or deliberately fragmented SEDP announcement is
+//!    neither missed nor hideable by a flood.
+//! 5. [`ports`]: [`RtpsFilter`] = DDSI-RTPS well-known ports and/or the
 //!    `"RTPS"` magic (see the module docs for the trade-off).
-//! 5. [`RtpsDatagrams`]: the glue iterator yielding `(src_ip, payload)`.
+//! 6. [`RtpsDatagrams`]: the glue iterator yielding `(src_ip, payload)`.
 //!    [`bpf`] compiles the same filter to a kernel socket filter.
 //!
 //! # Read-only guarantee
@@ -85,8 +90,10 @@
 //! - Jumbograms, IPsec ESP and tunnels other than VLAN are not decoded.
 //! - Snap-length-limited captures (`tcpdump -s 96`) yield truncated frames,
 //!   which are counted and dropped, not parsed.
-//! - IP/UDP checksums are not verified (offload makes them unreliable on the
-//!   capturing host).
+//! - UDP checksums holding the offload pseudo-header sum are accepted in the
+//!   default [`UdpChecksumMode::Auto`] (same-host traffic carries them); see
+//!   [`checksum`] for the residual risk and [`UdpChecksumMode::Always`] for
+//!   SPAN/TAP captures.
 
 #![deny(unsafe_code)]
 
@@ -103,6 +110,7 @@
 #[allow(unsafe_code)]
 pub mod afpacket;
 pub mod bpf;
+pub mod checksum;
 pub mod decode;
 pub mod pcap;
 pub mod ports;
@@ -113,6 +121,7 @@ pub mod synth;
 use std::net::IpAddr;
 use std::time::Duration;
 
+pub use checksum::{UdpChecksumMode, UdpChecksumStatus};
 pub use decode::{decode_frame, decode_udp, DecodeError, Decoded, LinkType, UdpDatagram};
 pub use pcap::{CaptureFile, PcapNgReader, PcapReader, PcapWriter};
 pub use ports::{MatchMode, PortClass, PortKind, RtpsFilter, RtpsPortMap};
@@ -154,6 +163,24 @@ pub struct CaptureStats {
     pub timeouts: u64,
     /// Calls that returned early because the frame budget ran out.
     pub budget_yields: u64,
+    /// IPv4 packets (or fragments, checked before reassembly) dropped for a
+    /// wrong header checksum. The robot's kernel drops these too: non-zero
+    /// means injection attempts aimed at the sensor, or a broken NIC.
+    pub bad_ip_checksum: u64,
+    /// UDP datagrams dropped for a wrong UDP checksum (or zero over IPv6).
+    pub bad_udp_checksum: u64,
+    /// UDP datagrams accepted with the offload pseudo-header sum in the
+    /// checksum field ([`UdpChecksumMode::Auto`]). Expected on loopback,
+    /// veth and the capturing host's outgoing traffic; suspicious otherwise.
+    pub udp_checksum_partial: u64,
+    /// IPv4 UDP datagrams without a checksum (field 0, legal).
+    pub udp_checksum_none: u64,
+    /// UDP datagrams not verified because of [`UdpChecksumMode::Never`].
+    pub udp_checksum_unverified: u64,
+    /// IPv6 packets with more than
+    /// [`decode::SUSPICIOUS_IPV6_EXT_HEADERS`] extension headers (decoded,
+    /// since Linux delivers them, but a typical evasion trait).
+    pub ipv6_long_ext_chains: u64,
 }
 
 /// Iterator glue: packet source -> decoders -> reassembly -> RTPS filter.
@@ -173,6 +200,7 @@ pub struct RtpsDatagrams<S> {
     source: S,
     filter: RtpsFilter,
     reassembler: Reassembler,
+    udp_checksum: UdpChecksumMode,
     stats: CaptureStats,
     last_error: Option<CaptureError>,
     finished: bool,
@@ -191,6 +219,7 @@ impl<S: PacketSource> RtpsDatagrams<S> {
             source,
             filter,
             reassembler: Reassembler::default(),
+            udp_checksum: UdpChecksumMode::default(),
             stats: CaptureStats::default(),
             last_error: None,
             finished: false,
@@ -209,6 +238,13 @@ impl<S: PacketSource> RtpsDatagrams<S> {
 
     pub fn with_reassembly_limits(mut self, limits: ReassemblyLimits) -> Self {
         self.reassembler = Reassembler::new(limits);
+        self
+    }
+
+    /// Which UDP checksums to verify (default [`UdpChecksumMode::Auto`]).
+    /// IPv4 header checksums are always verified.
+    pub fn with_udp_checksum_mode(mut self, mode: UdpChecksumMode) -> Self {
+        self.udp_checksum = mode;
         self
     }
 
@@ -268,6 +304,7 @@ impl<S: PacketSource> RtpsDatagrams<S> {
             };
             let out = process(
                 &self.filter,
+                self.udp_checksum,
                 &mut self.reassembler,
                 &mut self.stats,
                 pkt.ts,
@@ -289,8 +326,37 @@ impl<S: PacketSource> Iterator for RtpsDatagrams<S> {
     }
 }
 
+/// Apply the UDP checksum policy; false = drop (counted).
+fn udp_checksum_ok(
+    mode: UdpChecksumMode,
+    stats: &mut CaptureStats,
+    u: &UdpDatagram<'_>,
+    segment: &[u8],
+) -> bool {
+    if mode == UdpChecksumMode::Never {
+        stats.udp_checksum_unverified += 1;
+        return true;
+    }
+    match checksum::udp_checksum_status(u.src, u.dst, segment) {
+        UdpChecksumStatus::Valid => true,
+        UdpChecksumStatus::NotComputed => {
+            stats.udp_checksum_none += 1;
+            true
+        }
+        UdpChecksumStatus::Partial if mode == UdpChecksumMode::Auto => {
+            stats.udp_checksum_partial += 1;
+            true
+        }
+        UdpChecksumStatus::Partial | UdpChecksumStatus::Bad => {
+            stats.bad_udp_checksum += 1;
+            false
+        }
+    }
+}
+
 fn process(
     filter: &RtpsFilter,
+    udp_mode: UdpChecksumMode,
     reassembler: &mut Reassembler,
     stats: &mut CaptureStats,
     ts: Duration,
@@ -298,7 +364,10 @@ fn process(
     data: &[u8],
 ) -> Option<RtpsPacket> {
     stats.frames += 1;
-    let accept = |stats: &mut CaptureStats, u: &UdpDatagram<'_>, reassembled: bool| {
+    let accept = |stats: &mut CaptureStats, u: &UdpDatagram<'_>, segment: &[u8], reassembled| {
+        if !udp_checksum_ok(udp_mode, stats, u, segment) {
+            return None;
+        }
         stats.udp += 1;
         if !filter.matches(u) {
             stats.filtered_out += 1;
@@ -316,27 +385,54 @@ fn process(
             payload: u.payload.to_vec(),
         })
     };
-    match decode_frame(link, data) {
-        Ok(Decoded::Udp(u)) => accept(stats, &u, false),
-        Ok(Decoded::Fragment(f)) => {
+    let d = match decode::decode_frame_detail(link, data) {
+        Ok(d) => d,
+        Err(e) => {
+            count_error(stats, e);
+            return None;
+        }
+    };
+    // The kernel verifies the IPv4 header checksum before anything else,
+    // fragments included (ip_rcv_core runs before ip_defrag).
+    if let Some(h) = d.ipv4_header {
+        if !checksum::ipv4_header_valid(h) {
+            stats.bad_ip_checksum += 1;
+            return None;
+        }
+    }
+    if d.ext_headers > decode::SUSPICIOUS_IPV6_EXT_HEADERS {
+        stats.ipv6_long_ext_chains += 1;
+    }
+    match d.decoded {
+        Decoded::Udp(u) => {
+            let segment = d.udp_segment.unwrap_or_default();
+            accept(stats, &u, segment, false)
+        }
+        Decoded::Fragment(f) => {
             stats.fragments += 1;
             let r = reassembler.push(ts, &f)?;
             stats.reassembled += 1;
             let udp = match r.src {
-                IpAddr::V4(_) => decode::decode_udp_segment(r.src, r.dst, &r.payload),
-                IpAddr::V6(_) => decode::decode_ipv6_upper(r.src, r.dst, r.protocol, &r.payload),
+                IpAddr::V4(_) => decode::udp_segment_inner(r.src, r.dst, &r.payload),
+                IpAddr::V6(_) => decode::decode_ipv6_upper_detail(
+                    r.src, r.dst, r.protocol, &r.payload,
+                )
+                .map(|(u, seg, n)| {
+                    if d.ext_headers + n > decode::SUSPICIOUS_IPV6_EXT_HEADERS
+                        && d.ext_headers <= decode::SUSPICIOUS_IPV6_EXT_HEADERS
+                    {
+                        stats.ipv6_long_ext_chains += 1;
+                    }
+                    (u, seg)
+                }),
             };
             match udp {
-                Ok(u) => accept(stats, &u, true),
+                Ok((u, seg)) => accept(stats, &u, seg, true),
                 Err(e) => {
                     count_error(stats, e);
                     None
                 }
             }
-        }
-        Err(e) => {
-            count_error(stats, e);
-            None
         }
     }
 }
