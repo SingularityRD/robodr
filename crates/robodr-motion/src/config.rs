@@ -96,14 +96,31 @@ impl AxisModel {
 
 /// How long a condition must hold before it fires, and how long it must be
 /// clear before the same detector can fire again (one finding per episode).
+///
+/// An **episode** starts at the first bad sample and lasts until
+/// `clear_samples` *consecutive* good samples have been seen. It fires (once)
+/// when, on a bad sample,
+///
+/// * the episode is at least `min_duration_ns` old,
+/// * it holds at least `min_samples` bad samples, and
+/// * bad samples are at least `min_bad_fraction` of all samples in it.
+///
+/// Good samples interleaved between bad ones therefore cannot reset the run
+/// (a second publisher injecting "all is well" values between real ones only
+/// dilutes the fraction). Samples with no basis to judge (NaN, warm-up) are
+/// neither good nor bad.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Persistence {
-    /// The condition must have held continuously for at least this long.
+    /// The episode must be at least this old.
     pub min_duration_ns: u64,
-    /// ... and over at least this many consecutive samples.
+    /// ... contain at least this many bad samples ...
     pub min_samples: u32,
-    /// Consecutive good samples needed to re-arm after firing.
+    /// ... which are at least this fraction (0, 1] of its samples. `1.0`
+    /// demands an unbroken run.
+    pub min_bad_fraction: f64,
+    /// Consecutive good samples that end an episode (and re-arm after
+    /// firing).
     pub clear_samples: u32,
 }
 
@@ -112,10 +129,15 @@ impl Default for Persistence {
         Persistence {
             min_duration_ns: 500 * MS,
             min_samples: 10,
+            min_bad_fraction: DEFAULT_BAD_FRACTION,
             clear_samples: 10,
         }
     }
 }
+
+/// Default `min_bad_fraction`: an injector must send at least four
+/// "at rest" samples per real one to stay under it.
+const DEFAULT_BAD_FRACTION: f64 = 0.25;
 
 /// Which checks apply to one feedback source, and how far it is trusted.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -134,6 +156,10 @@ pub struct SourceConfig {
     /// Higher = more trusted. Used to say which side of a cross-sensor
     /// disagreement is more believable; it never suppresses a finding.
     pub trust_rank: u8,
+    /// The source reports signed body-frame velocities. `false` for
+    /// magnitude-only measurements (GNSS speed over ground): the monitor
+    /// then compares magnitudes against it.
+    pub signed: bool,
 }
 
 impl Default for SourceConfig {
@@ -145,6 +171,7 @@ impl Default for SourceConfig {
             stamp_check: true,
             stale_after_ns: Some(500 * MS),
             trust_rank: 1,
+            signed: true,
         }
     }
 }
@@ -179,6 +206,8 @@ impl Default for SourceTable {
                 frozen_check: false,
                 stale_after_ns: None,
                 trust_rank: 2,
+                // Speed over ground has no sign.
+                signed: false,
                 ..SourceConfig::default()
             },
             other: SourceConfig {
@@ -224,9 +253,12 @@ pub struct MonitorConfig {
     /// Mirror of the platform's command watchdog: a command older than this
     /// counts as "rest". `None` = commands hold forever.
     pub command_timeout_ns: Option<u64>,
-    /// Compare |values| (default; required when commands come from
-    /// `MotionCommand`, which carries magnitudes). Set `false` only if all
-    /// commands and feedback are signed body-frame velocities.
+    /// Force magnitude comparison everywhere (legacy behaviour). Default
+    /// `false`: values are signed body-frame velocities and a robot moving
+    /// against its command is reported. Magnitude-only inputs are handled
+    /// without this switch (`CommandSample::direction_known = false`,
+    /// `SourceConfig::signed = false`). Setting it `true` makes direction
+    /// reversals undetectable.
     pub compare_magnitudes: bool,
     /// The integrator feeds `set_safety_stop`. When `true`, a robot that
     /// moves less than commanded without a declared stop is `High`;
@@ -260,6 +292,31 @@ pub struct MonitorConfig {
     pub max_stamp_age_ns: Option<u64>,
     /// Clean samples needed to re-arm a latched integrity finding.
     pub rearm_clean_samples: u32,
+    /// A feedback publisher silent for longer than this no longer counts as
+    /// active, and its state slot may be reused by a new publisher.
+    pub publisher_expiry_ns: u64,
+    /// Fraction (0, 1] of non-finite values among a source's last 64
+    /// samples on an axis that escalates `invalid_feedback` to High while
+    /// motion is expected or observed.
+    pub nan_rate_high: f64,
+    /// Samples (1..=64) the NaN-rate window must hold before it is judged.
+    pub nan_rate_min_samples: u32,
+    /// Implausible-jump check on each (source, publisher) stream: two
+    /// consecutive finite samples whose difference exceeds the cross-sensor
+    /// tolerance **and** `jump_accel_factor * max_accel * dt` (dt = the larger
+    /// of the stamp and arrival gaps) imply an acceleration the platform
+    /// cannot produce. One such jump is a bump; many in a row are two
+    /// streams interleaved on one topic (an injected publisher the caller
+    /// could not attribute) or a corrupted driver. Must be >= 1. Axes with
+    /// `max_accel = None` are not checked.
+    pub jump_accel_factor: f64,
+    /// Implausible jumps within one episode that raise
+    /// `robot.motion.inconsistent_feedback_stream`. `0` disables the check.
+    pub jump_min_count: u32,
+    /// An episode of implausible jumps ends (and the check re-arms) after
+    /// this long without one. Good samples in between do not end it, so an
+    /// injector cannot hide behind many "at rest" samples per real one.
+    pub jump_window_ns: u64,
     pub sources: SourceTable,
 }
 
@@ -272,7 +329,7 @@ impl Default for MonitorConfig {
             latency_min_ns: 20 * MS,
             latency_max_ns: 150 * MS,
             command_timeout_ns: Some(500 * MS),
-            compare_magnitudes: true,
+            compare_magnitudes: false,
             safety_stop_signal_wired: false,
             safety_stop_grace_ns: 3_000 * MS,
             warmup_ns: 2_000 * MS,
@@ -284,11 +341,13 @@ impl Default for MonitorConfig {
             uncommanded: Persistence {
                 min_duration_ns: 300 * MS,
                 min_samples: 5,
+                min_bad_fraction: DEFAULT_BAD_FRACTION,
                 clear_samples: 10,
             },
             cross_sensor: Persistence {
                 min_duration_ns: 1_000 * MS,
                 min_samples: 10,
+                min_bad_fraction: DEFAULT_BAD_FRACTION,
                 clear_samples: 10,
             },
             cross_max_skew_ns: 100 * MS,
@@ -297,6 +356,12 @@ impl Default for MonitorConfig {
             max_future_skew_ns: 50 * MS,
             max_stamp_age_ns: Some(1_000 * MS),
             rearm_clean_samples: 10,
+            publisher_expiry_ns: 2_000 * MS,
+            nan_rate_high: 0.1,
+            nan_rate_min_samples: 16,
+            jump_accel_factor: 10.0,
+            jump_min_count: 10,
+            jump_window_ns: 1_000 * MS,
             sources: SourceTable::default(),
         }
     }
@@ -325,11 +390,13 @@ impl MonitorConfig {
             divergence: Persistence {
                 min_duration_ns: 200 * MS,
                 min_samples: 20,
+                min_bad_fraction: DEFAULT_BAD_FRACTION,
                 clear_samples: 20,
             },
             uncommanded: Persistence {
                 min_duration_ns: 100 * MS,
                 min_samples: 10,
+                min_bad_fraction: DEFAULT_BAD_FRACTION,
                 clear_samples: 20,
             },
             frozen_min_samples: 50,
@@ -356,6 +423,14 @@ impl MonitorConfig {
                 Err(ConfigError::NonFinite(name))
             } else if v < 0.0 {
                 Err(ConfigError::Negative(name))
+            } else {
+                Ok(())
+            }
+        }
+        fn fraction(name: &'static str, v: f64) -> Result<(), ConfigError> {
+            nonneg(name, v)?;
+            if v == 0.0 || v > 1.0 {
+                Err(ConfigError::Fraction(name))
             } else {
                 Ok(())
             }
@@ -391,6 +466,21 @@ impl MonitorConfig {
             if p.min_samples == 0 || p.clear_samples == 0 {
                 return Err(ConfigError::Zero(name));
             }
+            fraction("min_bad_fraction", p.min_bad_fraction)?;
+        }
+        fraction("nan_rate_high", self.nan_rate_high)?;
+        if !(1..=64).contains(&self.nan_rate_min_samples) {
+            return Err(ConfigError::Range("nan_rate_min_samples"));
+        }
+        nonneg("jump_accel_factor", self.jump_accel_factor)?;
+        if self.jump_accel_factor < 1.0 {
+            return Err(ConfigError::Range("jump_accel_factor"));
+        }
+        if self.jump_window_ns == 0 {
+            return Err(ConfigError::Zero("jump_window_ns"));
+        }
+        if self.publisher_expiry_ns == 0 {
+            return Err(ConfigError::Zero("publisher_expiry_ns"));
         }
         if self.frozen_min_samples == 0 {
             return Err(ConfigError::Zero("frozen_min_samples"));
@@ -410,6 +500,10 @@ pub enum ConfigError {
     Zero(&'static str),
     LatencyWindow,
     Capacity(usize),
+    /// A fraction outside (0, 1].
+    Fraction(&'static str),
+    /// A parameter outside its documented range.
+    Range(&'static str),
 }
 
 impl fmt::Display for ConfigError {
@@ -419,6 +513,8 @@ impl fmt::Display for ConfigError {
             ConfigError::Negative(n) => write!(f, "parameter {n} is negative"),
             ConfigError::Zero(n) => write!(f, "parameter {n} must be non-zero"),
             ConfigError::LatencyWindow => write!(f, "latency_min_ns > latency_max_ns"),
+            ConfigError::Fraction(n) => write!(f, "parameter {n} must be in (0, 1]"),
+            ConfigError::Range(n) => write!(f, "parameter {n} is outside its valid range"),
             ConfigError::Capacity(c) => {
                 write!(f, "command_capacity {c} outside 2..=65536")
             }
@@ -471,6 +567,47 @@ mod tests {
         assert_eq!(c.validate(), Err(ConfigError::Zero("uncommanded")));
 
         let mut c = MonitorConfig::default();
+        c.divergence.min_bad_fraction = 0.0;
+        assert_eq!(c.validate(), Err(ConfigError::Fraction("min_bad_fraction")));
+        c.divergence.min_bad_fraction = 1.5;
+        assert_eq!(c.validate(), Err(ConfigError::Fraction("min_bad_fraction")));
+        c.divergence.min_bad_fraction = f64::NAN;
+        assert_eq!(
+            c.validate(),
+            Err(ConfigError::NonFinite("min_bad_fraction"))
+        );
+
+        let mut c = MonitorConfig::default();
+        c.nan_rate_high = 0.0;
+        assert_eq!(c.validate(), Err(ConfigError::Fraction("nan_rate_high")));
+
+        let mut c = MonitorConfig::default();
+        c.nan_rate_min_samples = 65;
+        assert_eq!(
+            c.validate(),
+            Err(ConfigError::Range("nan_rate_min_samples"))
+        );
+
+        let mut c = MonitorConfig::default();
+        c.jump_accel_factor = 0.5;
+        assert_eq!(c.validate(), Err(ConfigError::Range("jump_accel_factor")));
+        c.jump_accel_factor = f64::INFINITY;
+        assert_eq!(
+            c.validate(),
+            Err(ConfigError::NonFinite("jump_accel_factor"))
+        );
+        let mut c = MonitorConfig::default();
+        c.jump_window_ns = 0;
+        assert_eq!(c.validate(), Err(ConfigError::Zero("jump_window_ns")));
+        let mut c = MonitorConfig::default();
+        c.jump_min_count = 0; // disables the check: valid
+        assert_eq!(c.validate(), Ok(()));
+
+        let mut c = MonitorConfig::default();
+        c.publisher_expiry_ns = 0;
+        assert_eq!(c.validate(), Err(ConfigError::Zero("publisher_expiry_ns")));
+
+        let mut c = MonitorConfig::default();
         c.rest_command_eps = f64::NEG_INFINITY;
         assert!(c.validate().is_err());
         assert!(!c.validate().unwrap_err().to_string().is_empty());
@@ -497,6 +634,12 @@ mod tests {
         let t = SourceTable::default();
         assert_eq!(t.get(FeedbackSource::Imu).trust_rank, 3);
         assert!(!t.get(FeedbackSource::Gnss).command_check);
+        assert!(!t.get(FeedbackSource::Gnss).signed);
+        assert!(t.get(FeedbackSource::WheelOdometry).signed && t.get(FeedbackSource::Imu).signed);
+        assert!(
+            !MonitorConfig::default().compare_magnitudes,
+            "direction checks on by default"
+        );
         assert!(t.get(FeedbackSource::Imu).trust_rank > t.get(FeedbackSource::Gnss).trust_rank);
         assert!(
             t.get(FeedbackSource::Gnss).trust_rank

@@ -61,6 +61,7 @@ fn per_event_path_is_allocation_free() {
                 linear: Some(cmd),
                 angular: Some(cmd * 0.3),
                 joint_speed_max: None,
+                direction_known: true,
             },
             |f| {
                 findings += 1;

@@ -53,11 +53,13 @@ pub fn first_order_step(e: f64, u: f64, dt_s: f64, tau_s: f64, max_rate: Option<
 }
 
 /// One recorded command: observer time and per-axis value (`None` =
-/// unspecified axis). Values are already sanitised (finite).
+/// unspecified axis). Values are already sanitised (finite), and are
+/// magnitudes when `signed` is `false`.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct CmdRec {
     pub t: u64,
     pub v: [Option<f64>; 3],
+    pub signed: bool,
 }
 
 /// Fixed-capacity ring of commands, oldest first, sorted by `t` (the monitor
@@ -230,6 +232,7 @@ mod tests {
             r.push(CmdRec {
                 t,
                 v: [Some(t as f64), None, None],
+                signed: true,
             });
         }
         assert_eq!(r.len(), 3);
