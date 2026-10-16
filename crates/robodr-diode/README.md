@@ -53,10 +53,18 @@ Unknown fields are rejected.
 ## Low side: `Packer` / `robodr-diode-pack`
 
 ```
+robodr-blackbox keygen --out diode-ugv-007.key --key-id diode-ugv-007   # once; writes .key + .key.pub
 robodr-diode-pack --outbox OUT --state pack-state.json --unit ugv-007 \
-  --key-id diode-ugv-007 --key-file diode.key \
+  --key-file diode-ugv-007.key [--key-id diode-ugv-007] [--allow-hmac] \
   --findings findings.jsonl [--bundle export.rbbx]... [--max-batch-bytes N] [--max-findings N]
 ```
+
+* **Key**: `--key-file` is a `robodr-blackbox` **secret** key file, Ed25519
+  by default (`robodr-blackbox keygen`). It is refused — not merely warned
+  about — if it is a symlink, group/other-accessible, or owned by another
+  user (root excepted). `--key-id`, if given, must equal the file's id. A
+  legacy HMAC key file is refused unless `--allow-hmac` is given, and then a
+  warning is printed. Bare hex key files are no longer read.
 
 * Every finding is re-validated (`parse_and_validate`, then `to_json`); every
   bundle is parsed. Any invalid input aborts **before** anything is written.
@@ -75,10 +83,20 @@ robodr-diode-pack --outbox OUT --state pack-state.json --unit ugv-007 \
 ```
 robodr-diode-unpack --inbox IN --out OUT --quarantine Q --processed P \
   --state state.json --keyring keyring [--partitions 12] \
-  [--bundle-key bb-ugv-007:bb.key]... [--accept-gap ugv-007:42]...
+  [--bundle-key bb-ugv-007.key.pub]... [--accept-gap ugv-007:42]... [--allow-hmac]
 ```
 
-Keyring file: one `<unit_id> <key_id> <hex-key-file>` per line. Exit code 0
+Keyring file: one `<unit_id> <public-key-file>` per line (`#` comments;
+relative paths are resolved against the keyring's directory). The older
+`<unit_id> <key_id> <key-file>` form still works; the key id must then match
+the file's. **The importer holds only public keys**: each entry must be an
+Ed25519 *public* key file (`<key>.pub` from `keygen`, or `robodr-blackbox
+export-pub`), accepted whatever its mode; an Ed25519 *secret* key file is
+refused, so the SOC never holds a key that can sign a batch. Legacy HMAC key
+files (secret, 0600, owner-checked) are accepted only with `--allow-hmac`,
+with a warning; `--bundle-key FILE` (black-box keys for bundle verification)
+follows the same rules. A batch signed with an HMAC tag under an Ed25519 key
+id is quarantined as `algorithm_mismatch` before any MAC is computed. Exit code 0
 when everything was accepted or a duplicate, 3 when something was quarantined
 or held, 1 on error, 2 on usage. The JSON report lists `accepted`,
 `duplicates`, `held`, `quarantined` and `in_transit` (dot-entries).
@@ -136,15 +154,18 @@ outbox until the SOC confirms receipt out of band.
 
 ## Honest limits
 
-* **HMAC placeholder.** The only signer available offline is
-  `robodr_blackbox::HmacSha256Key`. It is symmetric: the SOC needs the same
-  secret to verify, so a compromised SOC (or anyone with the keyring) could
-  forge batches, and there is no non-repudiation. Production must plug an
-  asymmetric `Signer`/`Verifier` (Ed25519 from an audited crate, or a
-  TPM-resident ECDSA key) — the format already carries `algorithm`/`key_id`
-  and signatures up to 1024 bytes. The CLIs only load HMAC keys (hex files)
-  and warn when a key file is group/other-readable; key distribution,
-  rotation and revocation are not implemented.
+* **Signatures.** Batches are signed with Ed25519 (`robodr_blackbox`'s
+  in-crate RFC 8032 implementation: tested against the RFC vectors, **not
+  audited**, not verified constant-time). The SOC verifies with public keys
+  only, so a compromised SOC or keyring can no longer forge batches; whoever
+  holds a unit's secret key file (root on the low side) still can, for that
+  unit. HMAC remains available behind `--allow-hmac` for migration, with the
+  old limit (symmetric: the SOC could forge, no non-repudiation). Key
+  distribution is manual (copy `.pub` files across on vetted media);
+  revocation is "remove the line from the keyring"; rotation is "add the new
+  public key for the same unit" (several keys per unit are allowed; the
+  packer state chains batches across a key change). Keys are files, not
+  TPM-held.
 * **No application-level FEC** (parity/erasure files). Loss of any file
   loses its batch until it is re-sent.
 * **Packer state loss** restarts the unit at `batch_seq` 1 with no

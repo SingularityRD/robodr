@@ -56,17 +56,22 @@ Print the version and exit 0.
 Keys are never accepted on the command line.
 .B blackbox.key_file
 is either a
-.I robodr\-blackbox\-key/v1
-file as written by
+.BR robodr\-blackbox (1)
+secret key file as written by
 .B robodr\-blackbox keygen
-(HMAC\-SHA256 only; its key id is used, and a
+(Ed25519 by default, or a legacy HMAC\-SHA256 key file; its key id is used,
+and a
 .B blackbox.key_id
 that contradicts it is a configuration error) or a bare hex HMAC key of at
 least 32 bytes (0.1.0\-alpha.1 format). The file is refused if it is a
 symlink or not a regular file, if group or others have any access to it, if
-it is owned by a uid other than the daemon's or root, or if it is larger than
-4 KiB. HMAC is a placeholder authenticator: the verifying side holds the same
-secret.
+it is owned by a uid other than the daemon's or root, if it is larger than
+4 KiB, or if it is a public key file
+.RI ( .pub ).
+With Ed25519 the evidence is verified with the public key file alone
+.RB ( "robodr\-blackbox verify \-\-keyring" " \fIFILE\fR.pub)"
+and verifiers cannot forge it. HMAC keys load with a start\-up warning: the
+verifying side holds the same secret and could forge evidence.
 .SH PROFILE TRUST
 .B sensor.profile_trust
 decides whether a locked profile is enforced:

@@ -37,9 +37,16 @@
 //! Application-level FEC (e.g. parity files) is **not** implemented; use the
 //! diode vendor's FEC and send each batch more than once if the link is lossy.
 //!
+//! ## Keys
+//!
+//! The binaries ([`cli`]) sign with a unit's Ed25519 secret key file and
+//! verify with Ed25519 **public** key files only, so the SOC holds no key
+//! that can sign batches; legacy symmetric HMAC keys need an explicit
+//! `--allow-hmac`. The library itself is algorithm-agnostic: any
+//! `robodr_blackbox::Signer` / `Verifier`.
+//!
 //! See `README.md` in this crate for the threat model and honest limits
-//! (notably: the only signer available offline is the black-box crate's
-//! HMAC placeholder, which is symmetric).
+//! (notably: the Ed25519 implementation is in-crate and not audited).
 
 pub mod cli;
 mod fsutil;

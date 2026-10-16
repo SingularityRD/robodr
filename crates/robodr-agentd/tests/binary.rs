@@ -210,3 +210,102 @@ fn sigterm_stops_gracefully_with_a_sealed_black_box() {
 fn sigint_stops_gracefully_with_a_sealed_black_box() {
     graceful_stop(2, "sigint");
 }
+
+/// The daemon signs with an Ed25519 key file made the way
+/// `robodr-blackbox keygen` makes it (secret + `.pub`); the black box it
+/// leaves verifies with the PUBLIC key file alone (world-readable, loaded
+/// exactly as `robodr-blackbox verify --keyring FILE.pub` loads it), and
+/// every finding's evidence links resolve under it.
+#[test]
+fn ed25519_key_file_black_box_verifies_with_the_public_key_only() {
+    use robodr_blackbox::keys::{public_key_path, KeyFile, Keyring};
+    let s = setup("bin-ed25519", &robot_profile(true));
+    std::fs::remove_file(&s.key).unwrap();
+    let kf = KeyFile::generate_ed25519(None).unwrap();
+    kf.write_new(&s.key).unwrap();
+    let pub_path = public_key_path(&s.key);
+    kf.to_public().unwrap().write_new(&pub_path).unwrap();
+    std::fs::set_permissions(&pub_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let mut cfg = s.config(
+        serde_json::json!({}),
+        serde_json::json!([{"kind": "stdin"}]),
+        serde_json::json!({"exit_when_inputs_end": true}),
+    );
+    // The key id comes from the key file.
+    cfg["blackbox"].as_object_mut().unwrap().remove("key_id");
+    let path = s.write_config(&cfg);
+    let mut child = Command::new(BIN)
+        .arg("--config")
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        writeln!(
+            stdin,
+            "{{\"kind\":\"ros2_participant_discovered\",\"guid_prefix\":\"eeeeeeeeeeeeeeeeeeeeeeee\",\"src_ip\":\"192.168.50.66\",\"locators\":[]}}"
+        )
+        .unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(!err.contains("hmac-sha256"), "no HMAC warning: {err}");
+
+    let mut ring = Keyring::new();
+    ring.load_file(&pub_path).unwrap();
+    assert!(ring.symmetric_key_ids().is_empty());
+    let report = robodr_blackbox::verify::verify_dir(
+        &s.blackbox,
+        &ring,
+        &robodr_blackbox::VerifyOptions {
+            expected_device_id: Some(ROBOT.into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(report.is_intact(), "{report:#?}");
+    let id = report.identity.as_ref().unwrap();
+    assert_eq!(id.algorithm, "ed25519");
+    assert_eq!(id.key_id, kf.key_id);
+    assert!(report.verified_records > 0);
+    let found = spooled(&s.spool);
+    assert!(rules(&found)
+        .iter()
+        .any(|r| r == "robot.ros2.unknown_participant"));
+    let refs: Vec<_> = found
+        .iter()
+        .flat_map(|(_, e)| robodr_agent::finding_refs(e))
+        .collect();
+    assert!(!refs.is_empty());
+    let links = robodr_agent::resolve_links(&s.blackbox, &ring, &refs).unwrap();
+    assert!(links.is_ok(), "{links:#?}");
+
+    // Another unit's public key does not verify it.
+    let other = KeyFile::generate_ed25519(Some(&kf.key_id)).unwrap();
+    let mut wrong = Keyring::new();
+    wrong.add_key_file(&other.to_public().unwrap()).unwrap();
+    let report = robodr_blackbox::verify::verify_dir(
+        &s.blackbox,
+        &wrong,
+        &robodr_blackbox::VerifyOptions::default(),
+    )
+    .unwrap();
+    assert!(!report.is_intact());
+
+    // The daemon refuses the public key file as its signing key.
+    cfg["blackbox"]["key_file"] = serde_json::json!(pub_path);
+    std::fs::set_permissions(&pub_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let out = Command::new(BIN)
+        .arg("--config")
+        .arg(s.write_config(&cfg))
+        .arg("--check-config")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("public key file"));
+    let _ = std::fs::remove_dir_all(&s.dir);
+}

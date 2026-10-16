@@ -311,7 +311,14 @@ fn key_sources_are_validated() {
         &key_json("hmac-sha256", "k", &"ab".repeat(16)),
         0o600,
     );
-    let ed = k("ed.key", &key_json("ed25519", "k", &"ab".repeat(32)), 0o600);
+    let ed = k(
+        "tpm.key",
+        &key_json("tpm-ecdsa", "k", &"ab".repeat(32)),
+        0o600,
+    );
+    // An Ed25519 key file is a signing key, but its public half is not.
+    let edkf = robodr_blackbox::KeyFile::ed25519_from_seed(&[0x5a; 32], Some("ed")).unwrap();
+    let ed_pub = k("ed.pub", &edkf.to_public().unwrap().to_json(), 0o600);
     let unknown = k(
         "unknown.key",
         &good.replace("\"secret_hex\"", "\"extra\":1,\"secret_hex\""),
@@ -351,6 +358,10 @@ fn key_sources_are_validated() {
         (
             vec!["--key-file".into(), s(&unknown)],
             "malformed key file".into(),
+        ),
+        (
+            vec!["--key-file".into(), s(&ed_pub)],
+            "public key file".into(),
         ),
         (vec!["--key-file".into(), s(&group)], "chmod 600".into()),
         (vec!["--key-file".into(), s(&world)], "chmod 600".into()),
@@ -608,5 +619,67 @@ fn lost_findings_exit_3_and_are_not_verified() {
         !err.contains("VERIFIED: evidence chain intact end to end"),
         "{err}"
     );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// `robodr-replay run` with an Ed25519 key file pair (as
+/// `robodr-blackbox keygen` writes it) leaves a black box that verifies with
+/// the public key alone: through `robodr-replay verify --key-file FILE.pub`
+/// and through the keyring code `robodr-blackbox verify --keyring FILE.pub`
+/// uses. The wrong public key fails.
+#[test]
+fn ed25519_key_file_run_verifies_with_the_public_key_only() {
+    use robodr_blackbox::keys::{public_key_path, KeyFile, Keyring};
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmpdir("flags-ed25519");
+    let bb = dir.join("bb");
+    let sk = dir.join("unit.key");
+    let kf = KeyFile::generate_ed25519(None).unwrap();
+    kf.write_new(&sk).unwrap();
+    let pk = public_key_path(&sk);
+    kf.to_public().unwrap().write_new(&pk).unwrap();
+    std::fs::set_permissions(&pk, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let s = |p: &Path| p.to_string_lossy().into_owned();
+    let findings = dir.join("findings.jsonl");
+    let mut args: Vec<String> = base(&bb)
+        .into_iter()
+        .filter(|a| a != "--key-file" && a != &key_arg())
+        .collect();
+    args.extend(["--key-file".into(), s(&sk), "--out".into(), s(&findings)]);
+    let o = bin().args(&args).output().unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(!stderr(&o).contains("hmac"), "{}", stderr(&o));
+    assert!(std::fs::metadata(&findings).unwrap().len() > 0);
+
+    // robodr-replay verify with the public key file (world-readable).
+    let verify = |key: &Path| {
+        bin()
+            .args(["verify", "--blackbox", &s(&bb), "--key-file", &s(key)])
+            .args(["--robot-id", ROBOT, "--findings", &s(&findings)])
+            .output()
+            .unwrap()
+    };
+    let o = verify(&pk);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(stderr(&o).contains("VERIFIED"));
+
+    // The keyring path of `robodr-blackbox verify --keyring unit.key.pub`.
+    let mut ring = Keyring::new();
+    ring.load_file(&pk).unwrap();
+    let rep = robodr_blackbox::verify::verify_dir(&bb, &ring, &Default::default()).unwrap();
+    assert!(rep.is_intact(), "{rep:#?}");
+    assert_eq!(rep.identity.as_ref().unwrap().algorithm, "ed25519");
+    assert_eq!(rep.identity.as_ref().unwrap().key_id, kf.key_id);
+
+    // Another key's public file (even under the same id) does not verify.
+    let other = dir.join("other.pub");
+    KeyFile::generate_ed25519(Some(&kf.key_id))
+        .unwrap()
+        .to_public()
+        .unwrap()
+        .write_new(&other)
+        .unwrap();
+    let o = verify(&other);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
     std::fs::remove_dir_all(&dir).unwrap();
 }

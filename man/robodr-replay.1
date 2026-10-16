@@ -49,15 +49,20 @@ Input events, model profile and response policy (required).
 Black\-box directory. Must be absent or empty (a replay starts a fresh chain).
 .TP
 .BI \-\-key\-file " FILE"
-The black\-box key (required): a
-.I robodr\-blackbox\-key/v1
-file as written by
-.BR "robodr\-blackbox keygen \-\-out" " \fIFILE\fR."
-It is refused if it is a symlink or not a regular file, or if its mode gives
-group or others any access (it must be
-.BR "chmod 600" ).
-Only hmac\-sha256 keys (at least 32 bytes) are accepted. The key id recorded in
-the chain is the file's
+The black\-box key (required): a key file as written by
+.BR "robodr\-blackbox keygen \-\-out" " \fIFILE\fR"
+(Ed25519 by default; legacy HMAC\-SHA256 key files are accepted with a
+warning). A
+.B run
+needs the secret key file, which is refused if it is a symlink or not a
+regular file, if its mode gives group or others any access (it must be
+.BR "chmod 600" ),
+or if it is owned by neither the current user nor root.
+.B verify
+also accepts the public key file
+.IR FILE .pub
+(any mode), so evidence can be checked without the secret. The key id
+recorded in the chain is the file's
 .IR key_id .
 Keys are never accepted on the command line (a command line is visible to
 other users in
@@ -66,9 +71,8 @@ the former
 .B \-\-key\-hex
 and
 .B \-\-key\-id
-options were removed and are usage errors. HMAC is a placeholder
-authenticator (see
-.BR robodr\-blackbox (1)).
+options were removed and are usage errors. See
+.BR robodr\-blackbox (1).
 .TP
 .BI \-\-robot\-id " ID"
 Robot identity bound into the chain (required).

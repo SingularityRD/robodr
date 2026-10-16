@@ -1,20 +1,29 @@
 //! `robodr-blackbox`: key and evidence tooling for the black-box recorder.
 //!
 //! ```text
-//! robodr-blackbox keygen  --out FILE [--key-id ID]
-//! robodr-blackbox verify  DIR --keyring FILE [--keyring FILE]... [--checkpoint FILE]
-//!                         [--device ID] [--strict] [--json]
-//! robodr-blackbox inspect DIR|SEGMENT [--json] [--limit N]
+//! robodr-blackbox keygen     --out FILE [--alg ed25519|hmac] [--key-id ID] [--pub-out FILE]
+//! robodr-blackbox export-pub KEYFILE [--out FILE]
+//! robodr-blackbox verify     DIR --keyring FILE [--keyring FILE]... [--checkpoint FILE]
+//!                            [--device ID] [--strict] [--json]
+//! robodr-blackbox inspect    DIR|SEGMENT [--json] [--limit N]
 //! ```
 //!
-//! - `keygen` writes a new HMAC-SHA256 key file (`robodr-blackbox-key/v1`)
-//!   with mode 0600. It refuses to overwrite anything and never writes
-//!   through a symlink. It prints the key id, never the secret.
+//! - `keygen` writes a new key. Default `--alg ed25519`: the secret seed
+//!   file (`robodr-blackbox-key/v2`, mode 0600) at `--out` and the public
+//!   key file (mode 0644, safe to distribute) at `--pub-out`, default
+//!   `<out>.pub`. `--alg hmac` writes a legacy symmetric HMAC-SHA256 key
+//!   (`robodr-blackbox-key/v1`, 0600, no public half) and warns. Nothing
+//!   is ever overwritten or written through a symlink; if either target
+//!   exists nothing is written. It prints the key id, never the secret.
+//! - `export-pub` writes (or prints) the public key file of an Ed25519
+//!   secret key file. HMAC keys have no public half and are refused.
 //! - `verify` checks a log directory with every key in the given key or
-//!   keyring files (so a log spanning a key rotation verifies). Key files
-//!   readable by group or others are refused. `--checkpoint` is a trusted
-//!   checkpoint held off the unit; without it the directory's own
-//!   `checkpoint.json` is used.
+//!   keyring files (so a log spanning a key rotation verifies). Public key
+//!   files are accepted whatever their mode; files holding a secret are
+//!   refused if group or others can access them or if they are owned by
+//!   another user (root excepted). `--checkpoint` is a trusted checkpoint
+//!   held off the unit; without it the directory's own `checkpoint.json`
+//!   is used.
 //! - `inspect` lists frames (seq, kind, flags, time, payload) without
 //!   checking any signature: it is a viewer, not a verdict.
 //!
@@ -25,7 +34,7 @@
 //! process through /proc).
 
 use robodr_blackbox::crypto::to_hex;
-use robodr_blackbox::keys::{KeyFile, Keyring};
+use robodr_blackbox::keys::{public_key_path, KeyFile, Keyring};
 use robodr_blackbox::record::{scan_frames, ScanItem};
 use robodr_blackbox::store::CHECKPOINT_FILE;
 use robodr_blackbox::verify::{read_segments, verify_dir, SegmentData, VerifyOptions};
@@ -35,11 +44,18 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const USAGE: &str = "usage:
-  robodr-blackbox keygen  --out FILE [--key-id ID]
-  robodr-blackbox verify  DIR --keyring FILE [--keyring FILE]... [--checkpoint FILE]
-                          [--device ID] [--strict] [--json]
-  robodr-blackbox inspect DIR|SEGMENT [--json] [--limit N]
+  robodr-blackbox keygen     --out FILE [--alg ed25519|hmac] [--key-id ID] [--pub-out FILE]
+  robodr-blackbox export-pub KEYFILE [--out FILE]
+  robodr-blackbox verify     DIR --keyring FILE [--keyring FILE]... [--checkpoint FILE]
+                             [--device ID] [--strict] [--json]
+  robodr-blackbox inspect    DIR|SEGMENT [--json] [--limit N]
+keygen defaults to ed25519 (secret FILE, 0600; public FILE.pub, safe to share).
+--keyring accepts secret key files (0600, own user or root) and public key
+files (any mode).
 exit: 0 intact, 1 verification failed, 2 usage/IO/key error";
+
+const HMAC_WARNING: &str = "warning: hmac-sha256 is the legacy symmetric placeholder: every \
+holder of this key can also forge evidence. Use ed25519 for production.";
 
 const MAX_CHECKPOINT_BYTES: u64 = 64 * 1024;
 const PAYLOAD_PREVIEW: usize = 160;
@@ -127,6 +143,7 @@ fn main() -> ExitCode {
     };
     let res = match argv.first().map(String::as_str) {
         Some("keygen") => keygen(&argv[1..]),
+        Some("export-pub") => export_pub(&argv[1..]),
         Some("verify") => verify(&argv[1..]),
         Some("inspect") => inspect(&argv[1..]),
         Some("-h" | "--help" | "help") => {
@@ -146,17 +163,78 @@ fn main() -> ExitCode {
 }
 
 fn keygen(raw: &[String]) -> Result<(), Fail> {
-    let a = Args::parse(raw, &["out", "key-id"], &[])?;
+    let a = Args::parse(raw, &["out", "key-id", "alg", "pub-out"], &[])?;
     if !a.positional.is_empty() {
         return Err("keygen takes no positional arguments".to_string().into());
     }
-    let out = a
-        .one("out")?
-        .ok_or_else(|| "--out FILE is required".to_string())?;
-    let key = KeyFile::generate_hmac(a.one("key-id")?).map_err(|e| e.to_string())?;
-    key.write_new(Path::new(out))
-        .map_err(|e| format!("{out}: {e}"))?;
+    let out = Path::new(
+        a.one("out")?
+            .ok_or_else(|| "--out FILE is required".to_string())?,
+    );
+    let alg = match a.one("alg")?.unwrap_or("ed25519") {
+        "ed25519" => "ed25519",
+        "hmac" | "hmac-sha256" => "hmac-sha256",
+        other => return Err(format!("--alg {other:?}: expected ed25519 or hmac").into()),
+    };
+    let pub_out = match (alg, a.one("pub-out")?) {
+        ("ed25519", Some(p)) => Some(PathBuf::from(p)),
+        ("ed25519", None) => Some(public_key_path(out)),
+        (_, Some(_)) => {
+            return Err("--pub-out: an hmac key has no public half"
+                .to_string()
+                .into())
+        }
+        (_, None) => None,
+    };
+    if let Some(p) = &pub_out {
+        if p == out {
+            return Err("--pub-out must differ from --out".to_string().into());
+        }
+        // Refuse before writing anything, so a half-made pair never exists.
+        if std::fs::symlink_metadata(p).is_ok() {
+            return Err(format!("{}: refusing to overwrite an existing file", p.display()).into());
+        }
+    }
+    let key = KeyFile::generate(alg, a.one("key-id")?).map_err(|e| e.to_string())?;
+    key.write_new(out)
+        .map_err(|e| format!("{}: {e}", out.display()))?;
+    if let Some(p) = &pub_out {
+        let res = key
+            .to_public()
+            .and_then(|pk| pk.write_new(p))
+            .map_err(|e| format!("{}: {e}", p.display()));
+        if let Err(e) = res {
+            // Never leave a secret without its public half (and no stray
+            // secret either): undo the secret file.
+            let _ = std::fs::remove_file(out);
+            return Err(e.into());
+        }
+        eprintln!(
+            "wrote secret key {} (mode 0600, keep on the unit) and public key {} (safe to distribute)",
+            out.display(),
+            p.display()
+        );
+    } else {
+        eprintln!("{HMAC_WARNING}");
+    }
     println!("{}", key.key_id);
+    Ok(())
+}
+
+fn export_pub(raw: &[String]) -> Result<(), Fail> {
+    let a = Args::parse(raw, &["out"], &[])?;
+    let src = a.single_positional("key file")?;
+    let key = KeyFile::load(Path::new(src)).map_err(|e| format!("{src}: {e}"))?;
+    let public = key.to_public().map_err(|e| format!("{src}: {e}"))?;
+    match a.one("out")? {
+        Some(out) => {
+            public
+                .write_new(Path::new(out))
+                .map_err(|e| format!("{out}: {e}"))?;
+            println!("{}", public.key_id);
+        }
+        None => print!("{}", public.to_json()),
+    }
     Ok(())
 }
 
@@ -175,6 +253,13 @@ fn verify(raw: &[String]) -> Result<(), Fail> {
     for f in files {
         ring.load_file(Path::new(f))
             .map_err(|e| format!("{f}: {e}"))?;
+    }
+    let symmetric = ring.symmetric_key_ids();
+    if !symmetric.is_empty() {
+        eprintln!(
+            "warning: symmetric (hmac-sha256) key(s) {}: anyone holding them can also forge",
+            symmetric.join(", ")
+        );
     }
     let mut opts = VerifyOptions {
         expected_device_id: a.one("device")?.map(str::to_string),

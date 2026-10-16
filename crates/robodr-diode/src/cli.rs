@@ -1,15 +1,28 @@
 //! Helpers shared by the `robodr-diode-pack` / `robodr-diode-unpack` binaries:
 //! a tiny `--flag value` parser and key/keyring loading. Not a stable API.
+//!
+//! # Keys
+//!
+//! All keys are `robodr-blackbox` key files ([`robodr_blackbox::KeyFile`],
+//! made with `robodr-blackbox keygen`), loaded with its checks: symlinks and
+//! non-regular files are refused, and a file holding **secret** material is
+//! refused (not merely warned about) when group or others can access it or
+//! when it is owned by another user (root excepted).
+//!
+//! * The packer signs with an **Ed25519 secret** key file.
+//! * The importer verifies with **Ed25519 public** key files only: an
+//!   Ed25519 secret key file in the importer keyring is refused, so the SOC
+//!   never holds a key that can sign batches.
+//! * Legacy symmetric HMAC-SHA256 key files are accepted on either side only
+//!   with an explicit `--allow-hmac`, and each use prints a warning: with
+//!   HMAC the importer's key can forge batches.
 
 use crate::fsutil::{self, ReadError};
 use crate::unpack::Keyring;
-use robodr_blackbox::crypto::from_hex;
-use robodr_blackbox::HmacSha256Key;
-use std::os::unix::fs::PermissionsExt;
+use robodr_blackbox::{KeyFile, Signer, Verifier};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-const MAX_KEY_FILE: u64 = 4096;
 const MAX_KEYRING_FILE: u64 = 1024 * 1024;
 /// Largest findings input file the pack CLI reads (1 GiB).
 pub const MAX_INPUT_FILE: u64 = 1024 * 1024 * 1024;
@@ -18,6 +31,7 @@ pub const MAX_INPUT_FILE: u64 = 1024 * 1024 * 1024;
 #[derive(Debug, Default)]
 pub struct Args {
     pairs: Vec<(String, String)>,
+    switches: Vec<String>,
 }
 
 /// Parse `--flag value` pairs; every flag must be in `known`.
@@ -36,6 +50,15 @@ pub fn argv() -> Result<Vec<String>, String> {
 }
 
 pub fn parse_args(args: impl IntoIterator<Item = String>, known: &[&str]) -> Result<Args, String> {
+    parse_args_with_switches(args, known, &[])
+}
+
+/// [`parse_args`] plus value-less `--switch`es (each at most once).
+pub fn parse_args_with_switches(
+    args: impl IntoIterator<Item = String>,
+    known: &[&str],
+    switches: &[&str],
+) -> Result<Args, String> {
     let mut it = args.into_iter();
     let mut out = Args::default();
     while let Some(a) = it.next() {
@@ -45,6 +68,13 @@ pub fn parse_args(args: impl IntoIterator<Item = String>, known: &[&str]) -> Res
         let Some(flag) = a.strip_prefix("--") else {
             return Err(format!("unexpected argument {a:?}"));
         };
+        if switches.contains(&flag) {
+            if out.switches.iter().any(|s| s == flag) {
+                return Err(format!("--{flag} given more than once"));
+            }
+            out.switches.push(flag.to_string());
+            continue;
+        }
         if !known.contains(&flag) {
             return Err(format!("unknown flag --{flag}"));
         }
@@ -78,6 +108,11 @@ impl Args {
             .collect()
     }
 
+    /// `true` if the value-less `--flag` was given.
+    pub fn flag(&self, flag: &str) -> bool {
+        self.switches.iter().any(|s| s == flag)
+    }
+
     pub fn num<T: FromStr>(&self, flag: &str) -> Result<Option<T>, String> {
         self.one(flag)?
             .map(|v| {
@@ -88,33 +123,79 @@ impl Args {
     }
 }
 
-/// Load an HMAC key (hex, >= 32 bytes, whitespace ignored) from `path`.
-pub fn load_hmac_key(key_id: &str, path: &Path) -> Result<HmacSha256Key, String> {
-    let bytes = fsutil::read_capped(path, MAX_KEY_FILE)
-        .map_err(|e| format!("key file {}: {}", path.display(), read_err(e)))?;
-    let text = std::str::from_utf8(&bytes).map_err(|_| "key file is not UTF-8".to_string())?;
-    let hex: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    let mut key = from_hex(&hex).ok_or_else(|| "key file is not hex".to_string())?;
-    let k = HmacSha256Key::new(key_id, &key).map_err(|e| e.to_string());
-    key.iter_mut().for_each(|b| *b = 0);
-    k
+/// Warning printed whenever an HMAC key is used.
+pub const HMAC_WARNING: &str = "warning: hmac-sha256 key in use (allowed by --allow-hmac): it is \
+symmetric, so whoever can verify these batches can also forge them. Migrate to ed25519 \
+(`robodr-blackbox keygen`).";
+
+fn hmac_gate(kf: &KeyFile, path: &Path, allow_hmac: bool) -> Result<Option<String>, String> {
+    if !kf.is_symmetric() {
+        return Ok(None);
+    }
+    if !allow_hmac {
+        return Err(format!(
+            "key file {}: hmac-sha256 key refused (symmetric: the verifying side could forge); \
+             use an ed25519 key, or pass --allow-hmac to accept it knowingly",
+            path.display()
+        ));
+    }
+    Ok(Some(format!("{HMAC_WARNING} [{}]", path.display())))
 }
 
-/// A warning if `path` is readable by group or others.
-pub fn key_file_mode_warning(path: &Path) -> Option<String> {
-    let m = std::fs::metadata(path).ok()?;
-    (m.permissions().mode() & 0o077 != 0).then(|| {
-        format!(
-            "warning: key file {} is accessible by group/others (mode {:o})",
+/// Load the packer's signing key: a secret key file (Ed25519; HMAC only
+/// with `allow_hmac`). `expected_key_id`, if given, must equal the file's.
+/// Returns the signer and any warning to print.
+pub fn load_signer(
+    path: &Path,
+    expected_key_id: Option<&str>,
+    allow_hmac: bool,
+) -> Result<(Box<dyn Signer>, Option<String>), String> {
+    let kf = KeyFile::load_secret(path).map_err(|e| format!("key file {}: {e}", path.display()))?;
+    if let Some(id) = expected_key_id {
+        if id != kf.key_id {
+            return Err(format!(
+                "key file {}: --key-id {id:?} contradicts the file's key id {:?}",
+                path.display(),
+                kf.key_id
+            ));
+        }
+    }
+    let warning = hmac_gate(&kf, path, allow_hmac)?;
+    let signer = kf
+        .signer()
+        .map_err(|e| format!("key file {}: {e}", path.display()))?;
+    Ok((signer, warning))
+}
+
+/// Load a verifying key for the importer: an Ed25519 **public** key file
+/// (any mode), or a legacy HMAC key file with `allow_hmac`. An Ed25519
+/// secret key file is refused: the high side must not hold signing keys.
+pub fn load_verifier(
+    path: &Path,
+    allow_hmac: bool,
+) -> Result<(Box<dyn Verifier>, Option<String>), String> {
+    let kf = KeyFile::load(path).map_err(|e| format!("key file {}: {e}", path.display()))?;
+    let warning = hmac_gate(&kf, path, allow_hmac)?;
+    if !kf.is_symmetric() && !kf.is_public() {
+        return Err(format!(
+            "key file {}: contains the secret signing key {:?}; the importer needs only the \
+             public key (`robodr-blackbox export-pub`) and refuses to hold the secret",
             path.display(),
-            m.permissions().mode() & 0o777
-        )
-    })
+            kf.key_id
+        ));
+    }
+    let v = kf
+        .verifier()
+        .map_err(|e| format!("key file {}: {e}", path.display()))?;
+    Ok((v, warning))
 }
 
-/// Keyring file: one `<unit_id> <key_id> <key-file>` per line; `#` comments.
-/// Relative key-file paths are resolved against the keyring's directory.
-pub fn load_keyring(path: &Path) -> Result<(Keyring, Vec<String>), String> {
+/// Keyring file: one `<unit_id> <key-file>` (or the older
+/// `<unit_id> <key_id> <key-file>`, where the key id must equal the
+/// file's) per line; `#` comments. Relative key-file paths are resolved
+/// against the keyring's directory. Each key file is loaded with
+/// [`load_verifier`]. Returns the keyring and warnings to print.
+pub fn load_keyring(path: &Path, allow_hmac: bool) -> Result<(Keyring, Vec<String>), String> {
     let bytes = fsutil::read_capped(path, MAX_KEYRING_FILE)
         .map_err(|e| format!("keyring {}: {}", path.display(), read_err(e)))?;
     let text = std::str::from_utf8(&bytes).map_err(|_| "keyring is not UTF-8".to_string())?;
@@ -127,18 +208,30 @@ pub fn load_keyring(path: &Path) -> Result<(Keyring, Vec<String>), String> {
             continue;
         }
         let f: Vec<&str> = line.split_whitespace().collect();
-        if f.len() != 3 {
-            return Err(format!(
-                "keyring line {}: expected `<unit_id> <key_id> <key-file>`",
-                i + 1
-            ));
+        let (unit, key_id, file) = match f.as_slice() {
+            [u, file] => (*u, None, *file),
+            [u, id, file] => (*u, Some(*id), *file),
+            _ => {
+                return Err(format!(
+                    "keyring line {}: expected `<unit_id> <key-file>`",
+                    i + 1
+                ))
+            }
+        };
+        let kp = resolve(base, file);
+        let (v, w) =
+            load_verifier(&kp, allow_hmac).map_err(|e| format!("keyring line {}: {e}", i + 1))?;
+        if let Some(id) = key_id {
+            if id != v.key_id() {
+                return Err(format!(
+                    "keyring line {}: key id {id:?} contradicts the file's key id {:?}",
+                    i + 1,
+                    v.key_id()
+                ));
+            }
         }
-        let kp = resolve(base, f[2]);
-        if let Some(w) = key_file_mode_warning(&kp) {
-            warnings.push(w);
-        }
-        let key = load_hmac_key(f[1], &kp).map_err(|e| format!("keyring line {}: {e}", i + 1))?;
-        ring.add(f[0], Box::new(key))
+        warnings.extend(w);
+        ring.add(unit, v)
             .map_err(|e| format!("keyring line {}: {e}", i + 1))?;
     }
     Ok((ring, warnings))
@@ -206,6 +299,13 @@ mod tests {
         assert!(parse_args(s(&["--a"]), &["a"]).is_err());
         assert!(parse_args(s(&["pos"]), &["a"]).is_err());
         assert_eq!(parse_args(s(&["-h"]), &["a"]).unwrap_err(), "help");
+        // Switches take no value and appear at most once.
+        let a = parse_args_with_switches(s(&["--x", "--a", "1"]), &["a"], &["x"]).unwrap();
+        assert!(a.flag("x") && !a.flag("a"));
+        assert_eq!(a.one("a").unwrap(), Some("1"));
+        assert!(parse_args_with_switches(s(&["--x", "--x"]), &["a"], &["x"]).is_err());
+        assert!(!parse_args(s(&["--a", "1"]), &["a"]).unwrap().flag("x"));
+        assert!(parse_args(s(&["--x"]), &["a"]).is_err());
     }
 
     #[test]

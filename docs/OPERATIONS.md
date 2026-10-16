@@ -109,7 +109,10 @@ commissioning (section 5).
 
 | Key | Where | Used for |
 |---|---|---|
-| Black-box key of `robodr-agentd` | `/etc/robodr/keys/agentd-blackbox.key` (`0600 root:root`) | signing the evidence chain |
+| Black-box key of `robodr-agentd` (Ed25519 secret) | `/etc/robodr/keys/agentd-blackbox.key` (`0600 root:root`) | signing the evidence chain |
+| Its public key | `/etc/robodr/keys/agentd-blackbox.key.pub` (`0644`), copied to every verifier | verifying the chain (cannot sign) |
+| Diode signing key of the unit (Ed25519 secret) | `/etc/robodr/keys/diode-<unit>.key` (`0600`) | `robodr-diode-pack` batch signatures (4.4) |
+| Its public key | SOC importer keyring | `robodr-diode-unpack` (cannot sign) |
 | Black-box key of `robodr-pulsard` | `/etc/robodr/keys/pulsard-blackbox.key` | reserved, used once the Pulsar module records evidence |
 | Release key | entry station only | verifying releases (section 2) |
 | Profile signing key (Ed25519, private) | commissioning station only, **never on the robot** | signing locked profiles (section 4.4, 5) |
@@ -119,44 +122,63 @@ Services never read `/etc/robodr/keys` themselves. systemd hands each one a
 private copy (`/run/credentials/<unit>/blackbox.key`). The reasons are in
 `packaging/README.md`, "Key material".
 
-> **Important while the authenticator is HMAC-SHA256 (current releases):**
-> the black-box key is a *shared secret*. Whoever holds it can verify
-> evidence, and can also **forge** it. Keep exactly two copies: one on the
-> robot, and one in the verifier's protected store on the high side. Never
-> put it in a ticket, a chat, a command line (argv is visible in `/proc`;
-> no RoboDR tool accepts a key on its command line) or a backup that is not encrypted. An asymmetric backend (Ed25519
-> or a TPM-held key) is planned. With it, the verifier holds only a public key.
+> **Ed25519 (default since this release):** the robot holds the secret seed;
+> verifiers (fleet console, SOC, auditors) hold only the **public** key
+> file, which can verify but never sign, so it may be distributed freely
+> (its integrity still matters: whoever swaps the `.pub` a verifier trusts
+> can make it accept their own evidence — copy it on vetted media and
+> compare the key id). The secret never leaves the robot. Never put it in a
+> ticket, a chat, a command line (argv is visible in `/proc`; no RoboDR tool
+> accepts a key on its command line) or a backup that is not encrypted.
+>
+> **Legacy HMAC-SHA256 keys** (`keygen --alg hmac`, and every key made
+> before this release) are a *shared secret*: whoever can verify can also
+> **forge**. They still work (the tools print a warning; the diode needs
+> `--allow-hmac`), but migrate at the next rotation (4.3). The Ed25519 code
+> is in-crate and **not audited**; a TPM-held, non-exportable key is still
+> planned.
 
 ### 4.2 Generate a key
 
-**available**: `robodr-blackbox keygen`. It draws 32 bytes from
-`/dev/urandom` (and fails rather than fall back to weaker randomness), writes
-a `robodr-blackbox-key/v1` key file with mode `0600`, never overwrites an
-existing file, never writes through a symlink, and prints only the key id.
+**available**: `robodr-blackbox keygen` (Ed25519 by default). It draws a
+32-byte seed from `/dev/urandom` (and fails rather than fall back to weaker
+randomness) and writes two files: the secret key file
+(`robodr-blackbox-key/v2`, mode `0600`) and the public key file
+`<file>.pub` (mode `0644`). It never overwrites an existing file (if either
+exists, nothing is written), never writes through a symlink, and prints only
+the key id.
 
 Choose a **key id**: printable, no spaces, at most 128 characters, for example
 `ugv-07-bb-2026q4`. It is recorded in the chain identity, and the verifier
 uses it to pick the right key. Record it in the robot's commissioning file.
+Without `--key-id` it is derived from the public key (`ed25519:<16 hex>`).
 
 ```sh
 sudo robodr-blackbox keygen --out /etc/robodr/keys/agentd-blackbox.key --key-id ugv-07-bb-2026q4
 sudo chown root:root /etc/robodr/keys/agentd-blackbox.key   # keygen already sets 0600
+# (lost the .pub? re-derive it: robodr-blackbox export-pub /etc/robodr/keys/agentd-blackbox.key --out FILE)
 ```
 
-`robodr-agentd` reads this file directly (`blackbox.key_file`; the key id
-comes from the file, so `blackbox.key_id` in `/etc/robodr/agentd.json` can be
-left out, and if it is set it must match). `robodr-replay --key-file` and
-`robodr-blackbox verify --keyring` read the same file. All of them refuse a
-key file that is a symlink or that group or others can access.
+`robodr-agentd` reads the secret file directly (`blackbox.key_file`; the key
+id comes from the file, so `blackbox.key_id` in `/etc/robodr/agentd.json`
+can be left out, and if it is set it must match). `robodr-replay --key-file`
+reads it too. Every tool refuses a secret key file that is a symlink, that
+group or others can access, or that is owned by another user (root
+excepted), and refuses a `.pub` where a signing key is needed. Verifiers
+(`robodr-blackbox verify --keyring`, `robodr-replay verify --key-file`)
+take the **`.pub`** file, whatever its mode.
 
-*Legacy 0.1.0-alpha.1 key files* (bare hex, made with `od ... /dev/urandom`)
-are still accepted by `robodr-agentd` (key id from `blackbox.key_id`, else
-derived from the key), but not by `robodr-replay` or `robodr-blackbox`.
-Convert one by generating a new key at the next rotation (4.3); do not
-hand-write JSON around an old secret on a shared terminal.
+*Legacy key files*: HMAC JSON key files (`robodr-blackbox-key/v1`) are still
+accepted by `robodr-agentd`, `robodr-replay` and `robodr-blackbox`, with a
+warning. Bare hex (0.1.0-alpha.1, made with `od ... /dev/urandom`) is still
+accepted by `robodr-agentd` only (key id from `blackbox.key_id`, else derived
+from the key). Replace either with an Ed25519 key at the next rotation (4.3);
+do not hand-write JSON around an old secret on a shared terminal.
 
-Then copy the key to the verifier's protected store on the high side, using
-vetted media. The diode is one-way, so the key cannot cross it.
+Then copy the **public** key file to each verifier (fleet console, the SOC's
+evidence store) using vetted media. The diode is one-way, so nothing comes
+back. Only legacy HMAC keys require copying the secret itself to the
+verifier's protected store.
 
 ### 4.3 Rotate a key
 
@@ -175,22 +197,59 @@ one**. No evidence is lost or rewritten.
    ts=$(date -u +%Y%m%dT%H%M%SZ); old=<old-key-id>
    sudo mv /var/lib/robodr/blackbox/agentd /var/lib/robodr/archive/blackbox-agentd-$old-$ts
    sudo mv /etc/robodr/keys/agentd-blackbox.key /etc/robodr/keys/retired/agentd-blackbox-$old.key
+   sudo mv /etc/robodr/keys/agentd-blackbox.key.pub /etc/robodr/keys/retired/agentd-blackbox-$old.key.pub
    sudo systemd-tmpfiles --create robodr.conf   # recreates blackbox/agentd with the right owner
    ```
 
 4. Generate the new key (4.2) with a new key id (if `blackbox.key_id` is set
-   in `/etc/robodr/agentd.json`, update it to match), and copy the key to the
-   verifier.
+   in `/etc/robodr/agentd.json`, update it to match), and copy its `.pub` to
+   the verifiers. This is also how an HMAC unit moves to Ed25519.
 5. `sudo systemctl start robodr-agentd`, then check the journal for the new
    chain's genesis.
 6. Verify the archived chain once more with the retired key
-   (`robodr-blackbox verify <archive dir> --keyring <retired key>`). The key
-   id is read from the retired key file. Then follow the site's retention rule: keep the retired
-   key as long as the archived evidence has to remain verifiable.
+   (`robodr-blackbox verify <archive dir> --keyring <retired key>.pub`, or
+   the retired HMAC key file). The key id is read from the key file. Then
+   follow the site's retention rule: keep the retired public key (HMAC: the
+   key) as long as the archived evidence has to remain verifiable. An
+   Ed25519 secret that is retired can be destroyed (`shred -u`); its public
+   key still verifies the archive.
 
 **Suspected key compromise:** follow the same steps, but treat every record
-signed after the suspected time as unauthenticated. With HMAC, a holder of the
-key can forge records. Report it as described in `SECURITY.md`.
+signed after the suspected time as unauthenticated. With Ed25519 only the
+robot's secret matters (a leaked `.pub` is harmless); with HMAC, any holder of
+the key, including a verifier, can forge records. Report it as described in
+`SECURITY.md`.
+
+### 4.4 Diode signing keys (`robodr-diode-pack` / `-unpack`)
+
+**available.** Each exporting unit signs its diode batches with its own
+Ed25519 key; the SOC importer holds only the units' public keys, so the SOC
+**cannot forge** a batch.
+
+```sh
+# low side, once per unit
+sudo robodr-blackbox keygen --out /etc/robodr/keys/diode-ugv-07.key --key-id diode-ugv-07-2026q4
+robodr-diode-pack --outbox OUT --state pack-state.json --unit ugv-07 \
+  --key-file /etc/robodr/keys/diode-ugv-07.key --findings findings.jsonl
+# carry /etc/robodr/keys/diode-ugv-07.key.pub to the SOC on vetted media
+```
+
+SOC keyring file (one line per unit key; several keys per unit during a
+rotation are fine):
+
+```text
+# unit      public key file (relative to this file)
+ugv-07      diode-ugv-07.key.pub
+```
+
+`robodr-diode-unpack --keyring <that file> ...` refuses an Ed25519 *secret*
+key file in the keyring (or as `--bundle-key`): copy only `.pub` files to
+the SOC. The packer refuses a key file with loose permissions or a foreign
+owner (it used to only warn) and no longer reads bare hex keys. Legacy HMAC
+key files work on either side only with `--allow-hmac` (a warning is printed
+each run); migrate by generating an Ed25519 key, adding its `.pub` to the
+SOC keyring next to the old key, and switching the packer's `--key-file`: the
+batch sequence and chain continue across the key change.
 
 ### 4.4 Profile signing key
 
@@ -508,12 +567,13 @@ sudo tar -C /var/lib/robodr/spool    -czf /var/lib/robodr/export/spool-agentd-$t
 # hand /var/lib/robodr/export/*-$ts* to the diode / media
 ```
 
-Far side, with the verifier's copy of the key:
+Far side, with the robot's public key file (legacy HMAC: the verifier's copy
+of the key):
 
 ```sh
 sha256sum -c SHA256SUMS-$ts
 mkdir bb && tar -C bb -xzf blackbox-agentd-$ts.tar.gz
-robodr-blackbox verify bb/agentd --keyring /secure/agentd-blackbox.key --device <robot-id>
+robodr-blackbox verify bb/agentd --keyring /secure/agentd-blackbox.key.pub --device <robot-id>
 ```
 
 A copy taken while the agent is writing can end in a half-written frame. The
