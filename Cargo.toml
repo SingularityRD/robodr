@@ -10,6 +10,7 @@ members = [
     "crates/robodr-correlate",
     "crates/robodr-diode",
     "crates/robodr-events",
+    "crates/robodr-export",
     "crates/robodr-firewall",
     "crates/robodr-motion",
     "crates/robodr-ocsf",
@@ -47,6 +48,7 @@ authors = ["Singularity RD"]
 robodr-agent = { path = "crates/robodr-agent" }
 robodr-agentd = { path = "crates/robodr-agentd" }
 robodr-events = { path = "crates/robodr-events" }
+robodr-export = { path = "crates/robodr-export" }
 robodr-rtps = { path = "crates/robodr-rtps" }
 robodr-blackbox = { path = "crates/robodr-blackbox" }
 robodr-capture = { path = "crates/robodr-capture" }

@@ -441,6 +441,33 @@ records to Kafka are outside the crate (no network code).
 * Because `finding_id` and `event-uid` are deterministic, re-publishing an
   already-imported finding remains idempotent for the consumer.
 
+### 8.1 Exporters (`crates/robodr-export`)
+
+The two hops around the diode are implemented in `crates/robodr-export`
+(details and limits in its README):
+
+* **`robodr-spool-export`** (robot side) takes agentd's spool
+  `ready/<seq>.json` records in order, re-validates them, packs them with
+  `robodr_diode::Packer` (one diode batch per step) and renames them into
+  `acked/` only after the batch is committed and renamed into the outbox. An
+  intent journal (`{batch_seq, spool_seqs}`) makes a crash at any point
+  recoverable without loss or re-packing; records leave `ready/` only by
+  rename (to `acked/`, or to `rejected/` if invalid), never by deletion.
+* **`robodr-kafka-publish`** (SOC side) publishes the importer's
+  `out/<batch>/records.jsonl` (or a connected site's spool) to this topic
+  with the §2 key and headers (re-derived from the validated value and
+  required to match the input) and the §4 partition rule, computed with the
+  topic's current partition count. CreateTime is the publish time (the
+  finding time is `ocsf.time`). Progress is a per-batch committed line count
+  replaced atomically after each acknowledged chunk, plus a done marker per
+  batch; invalid or broker-rejected records go to a dead-letter file.
+* **Producer settings actually used** (std-only client, not yet tested
+  against a real broker): `acks=all`, **idempotence off**, one request in
+  flight, no compression, **no TLS/SASL** (isolated network or local TLS
+  proxy). This deviates from §4's `enable.idempotence=true`: delivery is
+  at-least-once and consumers must drop duplicates on `event-uid`.
+  Per-partition order is preserved.
+
 ## 9. AutoSecOps-side checklist (from the design doc)
 
 Quoted from *Yapılacak işler* (to-do), with what this contract needs from each:

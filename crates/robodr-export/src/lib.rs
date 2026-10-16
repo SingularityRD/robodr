@@ -1,0 +1,39 @@
+//! # robodr-export
+//!
+//! The two missing hops of the `robot-edr.findings` path
+//! (`docs/contracts/robot-edr.findings.md`):
+//!
+//! ```text
+//!  robot (air-gapped)                                     SOC
+//!  agentd spool ──► spool_export ──► diode outbox ══ diode ══► importer out/ ──► publish ──► Kafka
+//!  ready/ → acked/   (robodr-spool-export)                         (robodr-kafka-publish)
+//!                                                connected site: agentd spool ──► publish ──┘
+//! ```
+//!
+//! * [`spool_export`] (robot side): agentd's spool `ready/` files, in order,
+//!   into `robodr_diode::Packer` batches; records are renamed into `acked/`
+//!   only after their batch is durably published. Crash-safe and idempotent
+//!   on restart via an intent journal (see the module docs).
+//! * [`publish`] (SOC side): the importer's `out/<batch>/records.jsonl` (or
+//!   a connected site's spool) to Kafka, with the contract's key, partition
+//!   rule and headers; per-batch committed offsets persisted atomically;
+//!   at-least-once with at most one chunk re-sent after a crash.
+//! * [`kafka`]: a minimal std-only Kafka producer (ApiVersions, Metadata,
+//!   Produce v3+ with RecordBatch v2 and CRC-32C ([`crc32c`]), `acks=all`,
+//!   no compression, no idempotence, **no TLS/SASL**).
+//!
+//! Honest limits (details in README): the Kafka client is tested only
+//! against an in-process fake broker, never against a real Kafka; no TLS
+//! or SASL (use a local TLS proxy or an isolated SOC network); idempotent
+//! production is off, so delivery is at-least-once and consumers dedupe on
+//! `event-uid`.
+
+pub mod crc32c;
+mod fsutil;
+pub mod kafka;
+pub mod publish;
+pub mod spool_export;
+
+pub use fsutil::now_ms;
+pub use publish::{PublishConfig, PublishError, PublishReport, Publisher, Sink, Source};
+pub use spool_export::{ExportConfig, ExportError, ExportReport, Exporter};
