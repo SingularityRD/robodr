@@ -49,6 +49,15 @@ pub enum Detector {
     Firewall,
     /// `robodr_motion::ConsistencyMonitor` (commands vs feedback).
     MotionMonitor,
+    /// A deviation raised outside the agent by the ROS 2 detection pipeline
+    /// (`robodr-ros2-pipeline`: profile, binding, protocol and capture
+    /// findings), handed in with [`crate::Agent::handle_external`].
+    Sensor,
+    /// A deviation about the host process itself (input silent, pipeline
+    /// lagging, queue overflow, ...), raised by a daemon such as
+    /// `robodr-agentd` and handed in with [`crate::Agent::handle_external`].
+    /// Always observe-only: it never feeds an action.
+    SelfHealth,
 }
 
 /// How a plan may be handled downstream. Derived from the plan only; the
