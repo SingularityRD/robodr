@@ -19,7 +19,11 @@
 //!   from accepted sources, where `effective_cap` is the OEM ceiling if set
 //!   and never more than the configured **hard cap** (see
 //!   [`envelope_bound`]). A channel with no valid sample in any dimension
-//!   gets an empty envelope, which `lock` refuses: the OEM must decide.
+//!   gets an empty envelope, which `lock` refuses: the OEM must decide. A
+//!   dimension never exercised on a channel that has samples in the other
+//!   one is **never left `None` (= unlimited)**: it is bounded at the OEM
+//!   ceiling if one is configured, else at 0 (deny), and listed for sign-off
+//!   (`envelope_dimension_unobserved`).
 //!
 //! | endpoint name ([`demangle`](robodr_events::graph::demangle))  | learned into      |
 //! |---------------------------------------------------------------|-------------------|
@@ -77,14 +81,34 @@
 //!    or were missing from some runs; **every participant that writes a
 //!    motion topic or sends motion commands**; motion commands without a
 //!    source; motion channels with fewer than `min_samples` samples;
-//!    envelope-relevant samples above the hard cap; capacity overflow;
-//!    anomalies.
+//!    envelope-relevant samples above the hard cap; envelopes whose maximum
+//!    is more than `outlier_ratio` (default 3) times their 99th percentile
+//!    (`envelope_outlier`: one stray or injected command set the bound);
+//!    capacity overflow; anomalies.
 //! 3. **Envelope hard cap**: no envelope is ever wider than
 //!    `hard_cap_linear` / `hard_cap_joint` (or the tighter OEM ceiling),
 //!    whatever was observed; NaN, infinite and negative speeds are never
 //!    learned; samples from quarantined, unannounced or malformed sources
 //!    never widen an envelope.
-//! 4. **Bounded memory**: every map and set has a cap (see [`Limits`]);
+//! 4. **Endpoint provenance** (packet captures): an endpoint announcement
+//!    is learned for the GUID it claims only if (a) that GUID prefix is the
+//!    prefix the RTPS message was sent under (header, as changed by
+//!    INFO_SRC; see [`Origin`]) and (b) its source IP is one of the owner's
+//!    *commissioned IPs*: the IPs from which the owner itself passes the
+//!    gate of 1. (announcement count, duration). Otherwise it is not learned
+//!    and becomes an `endpoint_sender_mismatch` sign-off item naming the
+//!    claimed owner, the sender, the IP and the endpoint names. So an
+//!    intruder cannot get a topic learned by naming a legitimate
+//!    participant's GUID in `PID_ENDPOINT_GUID`, nor by spoofing that
+//!    participant's header prefix from its own host a few times. An
+//!    operator-accepted participant has all its IPs commissioned. Event
+//!    recordings (JSONL) carry no sender, so this check does not apply to
+//!    them (the sensor that produced them is trusted for attribution).
+//!    Limit: a discovery-server relay re-sends other participants'
+//!    announcements under its own prefix; those relayed copies are not
+//!    learned for their owners (each owner's own announcements are), and
+//!    show up as mismatch items for the operator to explain.
+//! 5. **Bounded memory**: every map and set has a cap (see [`Limits`]);
 //!    entries past a cap are dropped (fail-closed: they later deviate),
 //!    counted, and turned into a `capacity_exceeded` sign-off item. Motion
 //!    samples live in decimating [`SampleBuffer`]s; envelopes use exact
@@ -95,11 +119,14 @@
 //! from a single IP and not touching motion topics is indistinguishable
 //! from a legitimate node by traffic alone; only the operator's review of
 //! the participant list (which the report gives with IPs and topics) can
-//! catch it. "Late" and "brief" are measured in input positions (frame
-//! ordinals, JSONL lines) because `RobotEvent` has no timestamps; durations
-//! use capture timestamps, which come from the file and are only used to
-//! make the gate *stricter*. With caps hit, which entries got in depends on
-//! arrival order.
+//! catch it. "Late" and "brief" are measured in **capture time** when the
+//! input has timestamps (packet captures), so flooding the bus with frames
+//! cannot dilute them; for timestamp-less input (JSONL lines) they fall back
+//! to input positions, which a flood of input can skew, and the report says
+//! so (`presence_measured_by_position`, info). Capture timestamps come from
+//! the capture file (written by the commissioning host, not by bus
+//! participants). With caps hit, which entries got in depends on arrival
+//! order.
 //!
 //! # Anomalies
 //!
@@ -118,12 +145,12 @@
 //!
 //! # Positions
 //!
-//! `RobotEvent` carries no timestamp, so "first/last seen" are [`SeenAt`]
-//! positions: (run index, position in that run), where position is the JSONL
+//! `RobotEvent` carries no timestamp, so "first/last seen" in the report are
+//! [`SeenAt`] positions: (run index, position in that run), where position is the JSONL
 //! line number, the frame ordinal for pcap input, or the event ordinal for
 //! in-memory sources.
 
-use crate::input::{CaptureDiagnostics, EventSource, InputError};
+use crate::input::{CaptureDiagnostics, EventSource, InputError, Origin, SourcedEvent};
 use crate::signoff::{Signoff, SignoffItem};
 use crate::stats::{SampleBuffer, SpeedStats};
 use robodr_events::graph::{ActionRole, RosName, RosNameKind};
@@ -158,6 +185,10 @@ pub const DEFAULT_MIN_PARTICIPANT_DURATION: Duration = Duration::from_secs(5);
 pub const DEFAULT_LATE_FRACTION: f64 = 0.25;
 /// Present for less than this fraction of the run: flagged "brief".
 pub const DEFAULT_BRIEF_FRACTION: f64 = 0.5;
+/// An envelope dimension whose observed maximum exceeds this many times its
+/// 99th percentile needs sign-off (`envelope_outlier`): one stray (or
+/// injected) sample is setting the bound.
+pub const DEFAULT_OUTLIER_RATIO: f64 = 3.0;
 /// Topics always treated as motion topics (writers need sign-off), in
 /// addition to learned motion channels and the name heuristic in
 /// [`is_motion_like`].
@@ -324,6 +355,9 @@ pub struct LearnConfig {
     pub late_fraction: f64,
     /// Present for less than this fraction of a run: flagged brief.
     pub brief_fraction: f64,
+    /// `max > p99 * outlier_ratio` on an envelope dimension raises the
+    /// `envelope_outlier` sign-off item. Finite, `>= 1`.
+    pub outlier_ratio: f64,
     /// Operator override: learn these participants even if quarantined
     /// (each becomes a sign-off item).
     pub accept_participants: BTreeSet<String>,
@@ -347,6 +381,7 @@ impl Default for LearnConfig {
             min_participant_duration: DEFAULT_MIN_PARTICIPANT_DURATION,
             late_fraction: DEFAULT_LATE_FRACTION,
             brief_fraction: DEFAULT_BRIEF_FRACTION,
+            outlier_ratio: DEFAULT_OUTLIER_RATIO,
             accept_participants: BTreeSet::new(),
             motion_topics: DEFAULT_MOTION_TOPICS
                 .iter()
@@ -365,6 +400,7 @@ pub enum ConfigError {
     InvalidCeiling { dimension: &'static str, value: f64 },
     InvalidHardCap { dimension: &'static str, value: f64 },
     InvalidFraction { name: &'static str, value: f64 },
+    InvalidOutlierRatio(f64),
     InvalidMinAnnouncements,
     InvalidLimit { name: &'static str },
     InvalidAcceptedParticipant(String),
@@ -390,6 +426,9 @@ impl fmt::Display for ConfigError {
             ),
             ConfigError::InvalidFraction { name, value } => {
                 write!(f, "{name} {value} invalid: must be in [0, 1]")
+            }
+            ConfigError::InvalidOutlierRatio(v) => {
+                write!(f, "outlier ratio {v} invalid: must be finite and >= 1")
             }
             ConfigError::InvalidMinAnnouncements => {
                 write!(f, "minimum participant announcements must be at least 1")
@@ -442,6 +481,9 @@ impl LearnConfig {
             if !(0.0..=1.0).contains(&value) {
                 return Err(ConfigError::InvalidFraction { name, value });
             }
+        }
+        if !self.outlier_ratio.is_finite() || self.outlier_ratio < 1.0 {
+            return Err(ConfigError::InvalidOutlierRatio(self.outlier_ratio));
         }
         if self.min_participant_announcements == 0 {
             return Err(ConfigError::InvalidMinAnnouncements);
@@ -639,6 +681,50 @@ struct ParticipantAcc {
     src_ips: BTreeSet<String>,
     /// Presence per run index.
     runs: BTreeMap<usize, Extent>,
+    /// Presence per source IP (same keys as `src_ips`): the anti-poisoning
+    /// gate is applied to every (participant, IP) pair to decide which IPs
+    /// are the participant's *commissioned* IPs.
+    ip_presence: BTreeMap<String, IpAcc>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct IpAcc {
+    count: u64,
+    runs: BTreeMap<usize, Extent>,
+}
+
+impl IpAcc {
+    fn absorb(&mut self, o: &IpAcc, off: usize) {
+        self.count = self.count.saturating_add(o.count);
+        for (r, e) in &o.runs {
+            self.runs.entry(r + off).or_default().absorb(e);
+        }
+    }
+}
+
+/// Endpoint provenance: claimed owner GUID -> source IPs the announcement
+/// came from (`""` = the input carries no sender, e.g. a JSONL recording of
+/// the sensor's events). See [`Learner`] docs, "endpoint provenance".
+type Origins = BTreeMap<String, BTreeSet<String>>;
+
+/// Record that `guid` was announced from `ip`; `false` if a cap was hit.
+fn note_origin(map: &mut Origins, guid: &str, ip: &str, cap: usize) -> bool {
+    if !map.contains_key(guid) && map.len() >= cap {
+        return false;
+    }
+    insert_capped(map.entry(guid.to_string()).or_default(), ip, cap)
+}
+
+fn merge_origins(dst: &mut Origins, src: &Origins, cap: usize) -> u64 {
+    let mut dropped = 0;
+    for (g, ips) in src {
+        for ip in ips {
+            if !note_origin(dst, g, ip, cap) {
+                dropped += 1;
+            }
+        }
+    }
+    dropped
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -646,6 +732,18 @@ struct EndpointAcc {
     span: Option<Span>,
     participants: BTreeSet<String>,
     type_names: BTreeSet<String>,
+    origins: Origins,
+}
+
+/// Endpoint announcements whose claimed owner is not their sender.
+#[derive(Debug, Clone, PartialEq)]
+struct MismatchAcc {
+    owner: String,
+    sender: String,
+    src_ip: String,
+    span: Span,
+    /// Endpoint names (capped).
+    names: BTreeSet<String>,
 }
 
 /// Services, actions and raw topics: who is on which side.
@@ -661,6 +759,9 @@ struct RoleAcc {
     /// Actions: components seen (`send_goal`, ..., `status`).
     components: BTreeSet<String>,
     type_names: BTreeSet<String>,
+    /// Provenance of writer-side and reader-side announcements.
+    writer_origins: Origins,
+    reader_origins: Origins,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -768,6 +869,9 @@ pub struct Learner {
     overflow: BTreeMap<String, u64>,
     anomalies_total: u64,
     anomalies: Vec<Anomaly>,
+    /// Endpoint announcements not learned because their claimed owner is
+    /// not the participant that sent them, keyed by sign-off subject.
+    sender_mismatch: BTreeMap<String, MismatchAcc>,
 }
 
 /// The three artefacts of commissioning.
@@ -789,6 +893,38 @@ pub enum ParticipantStatus {
     OperatorAccepted,
     /// Not learned (nor its endpoints and motion samples).
     Quarantined,
+}
+
+/// Presence of a participant (or one of its IPs); see `Learner::presence`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Presence {
+    observed: Option<Duration>,
+    duration_applicable: bool,
+    max_frac_presence: f64,
+    min_first_frac: f64,
+}
+
+/// Accepted participants and their commissioned IPs (see `Learner::gate`).
+struct Gate<'a> {
+    accepted: BTreeSet<&'a str>,
+    ips: BTreeMap<&'a str, BTreeSet<&'a str>>,
+}
+
+impl Gate<'_> {
+    fn ip_ok(&self, g: &str, ip: &str) -> bool {
+        self.ips.get(g).is_some_and(|s| s.contains(ip))
+    }
+
+    /// May an endpoint announced by `g` (with provenance `origins`) be
+    /// learned? `g` must be accepted and at least one announcement must come
+    /// from a commissioned IP of `g`, or from input without sender
+    /// information (`""`: the sensor's own event recording).
+    fn vouches(&self, origins: &Origins, g: &str) -> bool {
+        self.accepted.contains(g)
+            && origins
+                .get(g)
+                .is_some_and(|ips| ips.iter().any(|ip| ip.is_empty() || self.ip_ok(g, ip)))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -844,6 +980,12 @@ fn admit<'m, V: Default>(
     map.get_mut(key)
 }
 
+/// Sign-off subject of an `endpoint_sender_mismatch` item.
+fn mismatch_subject(owner: &str, sender: &str, ip: &str) -> String {
+    let ip: String = ip.chars().take(64).collect();
+    format!("{owner} sent by {sender} from {ip}")
+}
+
 fn examples<'a>(names: impl IntoIterator<Item = &'a String>) -> (usize, String) {
     let all: Vec<&String> = names.into_iter().collect();
     let shown: Vec<&str> = all
@@ -880,6 +1022,7 @@ impl Learner {
             overflow: BTreeMap::new(),
             anomalies_total: 0,
             anomalies: Vec::new(),
+            sender_mismatch: BTreeMap::new(),
         })
     }
 
@@ -918,8 +1061,24 @@ impl Learner {
     }
 
     /// Observe one event at an explicit position with an optional capture
-    /// timestamp (used for minimum-duration checks).
+    /// timestamp (used for minimum-duration and late/brief checks).
     pub fn observe_at_time(&mut self, event: &RobotEvent, position: u64, ts: Option<Duration>) {
+        self.observe_from(event, position, ts, None);
+    }
+
+    /// Observe one event from a source, with its timestamp and sender
+    /// ([`Origin`]) when the source has them (packet captures).
+    pub fn observe_sourced(&mut self, se: &SourcedEvent) {
+        self.observe_from(&se.event, se.position, se.ts, se.origin.as_ref());
+    }
+
+    fn observe_from(
+        &mut self,
+        event: &RobotEvent,
+        position: u64,
+        ts: Option<Duration>,
+        origin: Option<&Origin>,
+    ) {
         let run = self.current_run();
         self.runs[run].events = self.runs[run].events.saturating_add(1);
         self.extents[run].update(position, ts);
@@ -947,7 +1106,11 @@ impl Learner {
                 };
                 touch(&mut acc.span, at);
                 acc.runs.entry(run).or_default().update(position, ts);
-                if !insert_capped(&mut acc.src_ips, &p.src_ip, lim.max_set_entries) {
+                if insert_capped(&mut acc.src_ips, &p.src_ip, lim.max_set_entries) {
+                    let ip = acc.ip_presence.entry(p.src_ip.clone()).or_default();
+                    ip.count = ip.count.saturating_add(1);
+                    ip.runs.entry(run).or_default().update(position, ts);
+                } else {
                     self.overflowed(at, "participant_src_ips", &p.guid_prefix);
                 }
             }
@@ -977,8 +1140,17 @@ impl Learner {
                 if !self.check_guid(&e.guid_prefix, at) {
                     return;
                 }
+                if let Some(o) = origin {
+                    if o.sender_prefix != e.guid_prefix {
+                        // Claims a GUID other than its sender's: quarantined
+                        // (never learned), reported, and a sign-off item.
+                        self.sender_mismatched(at, &e.guid_prefix, o, slot.name());
+                        return;
+                    }
+                }
                 self.reference(&e.guid_prefix, at);
                 let guid = e.guid_prefix.as_str();
+                let via = origin.map_or("", |o| o.src_ip.as_str());
                 let client = is_client_side(&rn.kind, is_writer);
                 let mut dropped: Vec<&'static str> = Vec::new();
                 match &slot {
@@ -995,6 +1167,13 @@ impl Learner {
                                 if !insert_capped(&mut acc.participants, guid, lim.max_set_entries)
                                 {
                                     dropped.push("topic_participants");
+                                } else if !note_origin(
+                                    &mut acc.origins,
+                                    guid,
+                                    via,
+                                    lim.max_set_entries,
+                                ) {
+                                    dropped.push("endpoint_origins");
                                 }
                                 if !e.type_name.is_empty()
                                     && !insert_capped(
@@ -1037,6 +1216,17 @@ impl Learner {
                                 }
                                 if !ok {
                                     dropped.push("name_participants");
+                                } else if !note_origin(
+                                    if is_writer {
+                                        &mut acc.writer_origins
+                                    } else {
+                                        &mut acc.reader_origins
+                                    },
+                                    guid,
+                                    via,
+                                    lim.max_set_entries,
+                                ) {
+                                    dropped.push("endpoint_origins");
                                 }
                                 if let RosNameKind::ActionPart { component, .. } = &rn.kind {
                                     // A fixed, small set of component names.
@@ -1109,7 +1299,7 @@ impl Learner {
         let mut n: u64 = 0;
         while let Some(r) = src.next_event() {
             let se = r?;
-            self.observe_at_time(&se.event, se.position, se.ts);
+            self.observe_sourced(&se);
             n = n.saturating_add(1);
         }
         let run = self.runs.len() - 1;
@@ -1139,7 +1329,27 @@ impl Learner {
                 continue;
             };
             merge_span(&mut acc.span, &p.span, off);
-            let d = extend_capped(&mut acc.src_ips, &p.src_ips, cap);
+            let mut d = 0;
+            for (ip, pres) in &p.ip_presence {
+                if insert_capped(&mut acc.src_ips, ip, cap) {
+                    acc.ip_presence
+                        .entry(ip.clone())
+                        .or_default()
+                        .absorb(pres, off);
+                } else {
+                    d += 1;
+                }
+            }
+            // IPs without presence data (none today; kept for safety).
+            for ip in p
+                .src_ips
+                .iter()
+                .filter(|ip| !p.ip_presence.contains_key(*ip))
+            {
+                if !insert_capped(&mut acc.src_ips, ip, cap) {
+                    d += 1;
+                }
+            }
             if d > 0 {
                 dropped.push(("participant_src_ips", g.clone(), d));
             }
@@ -1162,6 +1372,10 @@ impl Learner {
                 if d > 0 {
                     dropped.push(("topic_participants", t.clone(), d));
                 }
+                let d = merge_origins(&mut acc.origins, &e.origins, cap);
+                if d > 0 {
+                    dropped.push(("endpoint_origins", t.clone(), d));
+                }
             }
         }
         for (mine, theirs, cat) in [
@@ -1182,6 +1396,11 @@ impl Learner {
                 acc.components.extend(a.components.iter().cloned());
                 if d > 0 {
                     dropped.push(("name_participants", n.clone(), d));
+                }
+                let d = merge_origins(&mut acc.writer_origins, &a.writer_origins, cap)
+                    + merge_origins(&mut acc.reader_origins, &a.reader_origins, cap);
+                if d > 0 {
+                    dropped.push(("endpoint_origins", n.clone(), d));
                 }
             }
         }
@@ -1225,6 +1444,22 @@ impl Learner {
                 dropped.push(("referenced_guids", g.clone(), 1));
             }
         }
+        for (k, m) in &other.sender_mismatch {
+            let span = m.span.shifted(off);
+            if let Some(mine) = self.sender_mismatch.get_mut(k) {
+                mine.span.absorb(&span);
+                let d = extend_capped(&mut mine.names, &m.names, cap);
+                if d > 0 {
+                    dropped.push(("endpoint_sender_mismatch_names", k.clone(), d));
+                }
+            } else if self.sender_mismatch.len() < lim.max_participants {
+                let mut m = m.clone();
+                m.span = span;
+                self.sender_mismatch.insert(k.clone(), m);
+            } else {
+                dropped.push(("endpoint_sender_mismatch", k.clone(), 1));
+            }
+        }
         for (k, v) in &other.overflow {
             let n = self.overflow.entry(k.clone()).or_insert(0);
             *n = n.saturating_add(*v);
@@ -1256,6 +1491,34 @@ impl Learner {
             self.referenced_guids.insert(guid.to_string(), at);
         } else {
             self.overflowed(at, "referenced_guids", guid);
+        }
+    }
+
+    /// An endpoint announcement whose claimed owner is not its sender.
+    fn sender_mismatched(&mut self, at: SeenAt, owner: &str, o: &Origin, name: &str) {
+        let key = mismatch_subject(owner, &o.sender_prefix, &o.src_ip);
+        let cap = self.config.limits.max_set_entries;
+        let shown: String = name.chars().take(256).collect();
+        if let Some(m) = self.sender_mismatch.get_mut(&key) {
+            m.span.hit(at);
+            if !insert_capped(&mut m.names, &shown, cap) {
+                self.overflowed(at, "endpoint_sender_mismatch_names", &key);
+            }
+        } else if self.sender_mismatch.len() < self.config.limits.max_participants {
+            let mut names = BTreeSet::new();
+            names.insert(shown);
+            self.sender_mismatch.insert(
+                key,
+                MismatchAcc {
+                    owner: owner.to_string(),
+                    sender: o.sender_prefix.clone(),
+                    src_ip: o.src_ip.clone(),
+                    span: Span::new(at),
+                    names,
+                },
+            );
+        } else {
+            self.overflowed(at, "endpoint_sender_mismatch", &key);
         }
     }
 
@@ -1353,39 +1616,11 @@ impl Learner {
                     span.count, c.min_participant_announcements
                 ));
             }
-            // Duration: only where the run has timestamps and is long
-            // enough for anyone to meet the minimum.
-            let mut observed: Option<Duration> = None;
-            let mut duration_applicable = false;
-            let mut max_frac_presence: f64 = 0.0;
-            let mut min_first_frac: f64 = 1.0;
-            for (r, e) in &acc.runs {
-                let run = self.extents.get(*r).copied().unwrap_or_default();
-                if let Some(d) = e.duration() {
-                    observed = Some(observed.map_or(d, |o| o.max(d)));
-                }
-                if let Some(rd) = run.duration() {
-                    if !c.min_participant_duration.is_zero() && rd >= c.min_participant_duration {
-                        duration_applicable = true;
-                    }
-                }
-                let rs = run.pos_span();
-                let (presence, first) = if rs == 0 {
-                    (1.0, 0.0)
-                } else {
-                    let rmin = run.min_pos.unwrap_or(0);
-                    let f = e.min_pos.unwrap_or(rmin).saturating_sub(rmin) as f64 / rs as f64;
-                    (e.pos_span() as f64 / rs as f64, f)
-                };
-                max_frac_presence = max_frac_presence.max(presence);
-                min_first_frac = min_first_frac.min(first);
-            }
-            if duration_applicable && observed.unwrap_or_default() < c.min_participant_duration {
-                quarantine.push(format!(
-                    "observed for {:.1}s (< {:.1}s required)",
-                    observed.unwrap_or_default().as_secs_f64(),
-                    c.min_participant_duration.as_secs_f64()
-                ));
+            let pr = self.presence(&acc.runs);
+            let (observed, min_first_frac, max_frac_presence) =
+                (pr.observed, pr.min_first_frac, pr.max_frac_presence);
+            if let Some(why) = self.too_short(&pr) {
+                quarantine.push(why);
             }
             if min_first_frac > c.late_fraction {
                 flags.push((
@@ -1457,6 +1692,134 @@ impl Learner {
         out
     }
 
+    /// Presence of one participant (or one participant IP) over its runs.
+    ///
+    /// Late / brief fractions use capture time when the run and the
+    /// participant both have timestamps (packet captures), so flooding the
+    /// capture with frames cannot move the fractions; they fall back to input
+    /// positions only for timestamp-less input (JSONL), which the report
+    /// flags (`presence_measured_by_position`).
+    fn presence(&self, runs: &BTreeMap<usize, Extent>) -> Presence {
+        let c = &self.config;
+        let mut pr = Presence {
+            observed: None,
+            duration_applicable: false,
+            max_frac_presence: 0.0,
+            min_first_frac: 1.0,
+        };
+        for (r, e) in runs {
+            let run = self.extents.get(*r).copied().unwrap_or_default();
+            if let Some(d) = e.duration() {
+                pr.observed = Some(pr.observed.map_or(d, |o| o.max(d)));
+            }
+            if let Some(rd) = run.duration() {
+                if !c.min_participant_duration.is_zero() && rd >= c.min_participant_duration {
+                    pr.duration_applicable = true;
+                }
+            }
+            let (presence, first) = match (run.duration(), run.min_ts, e.min_ts, e.duration()) {
+                (Some(rd), Some(rmin), Some(emin), Some(ed)) => {
+                    if rd.is_zero() {
+                        (1.0, 0.0)
+                    } else {
+                        let rd = rd.as_secs_f64();
+                        (
+                            ed.as_secs_f64() / rd,
+                            emin.saturating_sub(rmin).as_secs_f64() / rd,
+                        )
+                    }
+                }
+                _ => {
+                    let rs = run.pos_span();
+                    if rs == 0 {
+                        (1.0, 0.0)
+                    } else {
+                        let rmin = run.min_pos.unwrap_or(0);
+                        let f = e.min_pos.unwrap_or(rmin).saturating_sub(rmin) as f64 / rs as f64;
+                        (e.pos_span() as f64 / rs as f64, f)
+                    }
+                }
+            };
+            pr.max_frac_presence = pr.max_frac_presence.max(presence);
+            pr.min_first_frac = pr.min_first_frac.min(first);
+        }
+        pr
+    }
+
+    /// The minimum-duration quarantine reason, if it applies.
+    fn too_short(&self, pr: &Presence) -> Option<String> {
+        let min = self.config.min_participant_duration;
+        (pr.duration_applicable && pr.observed.unwrap_or_default() < min).then(|| {
+            format!(
+                "observed for {:.1}s (< {:.1}s required)",
+                pr.observed.unwrap_or_default().as_secs_f64(),
+                min.as_secs_f64()
+            )
+        })
+    }
+
+    /// The anti-poisoning gate, applied to `(participant, IP)` pairs: the
+    /// IPs from which each accepted participant itself passes the gate
+    /// (announced at least `min_participant_announcements` times from that
+    /// IP and, with timestamps, present long enough). An operator-accepted
+    /// participant has all its IPs commissioned. Endpoints announced from any
+    /// other IP are not learned (`endpoint_sender_mismatch`).
+    fn gate<'a>(&'a self, assessed: &'a BTreeMap<String, Assessment>) -> Gate<'a> {
+        let accepted = Self::accepted_set(assessed);
+        let mut ips = BTreeMap::new();
+        for g in &accepted {
+            let Some(acc) = self.participants.get(*g) else {
+                continue;
+            };
+            let all = assessed
+                .get(*g)
+                .is_some_and(|a| a.status == ParticipantStatus::OperatorAccepted);
+            let ok: BTreeSet<&'a str> = acc
+                .ip_presence
+                .iter()
+                .filter(|(_, p)| {
+                    all || (p.count >= self.config.min_participant_announcements
+                        && self.too_short(&self.presence(&p.runs)).is_none())
+                })
+                .map(|(ip, _)| ip.as_str())
+                .collect();
+            ips.insert(*g, ok);
+        }
+        Gate { accepted, ips }
+    }
+
+    /// Accepted announcements whose sender IP is not a commissioned IP of
+    /// the claimed owner: `(owner, ip) -> endpoint names`.
+    fn ip_mismatches(&self, gate: &Gate<'_>) -> BTreeMap<(String, String), BTreeSet<String>> {
+        let mut out: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+        let mut scan = |origins: &Origins, name: &str| {
+            for (g, ips) in origins {
+                if !gate.accepted.contains(g.as_str()) {
+                    continue;
+                }
+                for ip in ips {
+                    if !ip.is_empty() && !gate.ip_ok(g, ip) {
+                        out.entry((g.clone(), ip.clone()))
+                            .or_default()
+                            .insert(name.to_string());
+                    }
+                }
+            }
+        };
+        for m in [&self.writers, &self.readers] {
+            for (t, e) in m {
+                scan(&e.origins, t);
+            }
+        }
+        for m in [&self.services, &self.actions, &self.raw] {
+            for (n, a) in m {
+                scan(&a.writer_origins, n);
+                scan(&a.reader_origins, n);
+            }
+        }
+        out
+    }
+
     fn accepted_set(assessed: &BTreeMap<String, Assessment>) -> BTreeSet<&str> {
         assessed
             .iter()
@@ -1473,9 +1836,59 @@ impl Learner {
         }
     }
 
-    fn role_learned(&self, a: &RoleAcc, accepted: &BTreeSet<&str>) -> bool {
-        let any = |s: &BTreeSet<String>| s.iter().any(|g| accepted.contains(g.as_str()));
-        any(&a.writer_guids) || (self.config.learn_readers && (any(&a.side_a) || any(&a.side_b)))
+    fn role_learned(&self, a: &RoleAcc, gate: &Gate<'_>) -> bool {
+        let writers = |s: &BTreeSet<String>| s.iter().any(|g| gate.vouches(&a.writer_origins, g));
+        let any = |s: &BTreeSet<String>| {
+            s.iter()
+                .any(|g| gate.vouches(&a.writer_origins, g) || gate.vouches(&a.reader_origins, g))
+        };
+        writers(&a.writer_guids)
+            || (self.config.learn_readers && (any(&a.side_a) || any(&a.side_b)))
+    }
+
+    /// Accepted per-dimension speed statistics of a channel (exact count,
+    /// min and max; percentiles from the retained samples).
+    fn accepted_stats(
+        m: &MotionAcc,
+        accepted: &BTreeSet<&str>,
+    ) -> (Option<SpeedStats>, Option<SpeedStats>) {
+        let (l, j, _) = Self::accepted_motion(m, accepted);
+        let idx: BTreeSet<u32> = m
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| Self::source_accepted(s, accepted))
+            .map(|(i, _)| i as u32)
+            .collect();
+        let stats = |buf: &SampleBuffer<(f64, u32)>, d: &DimStat| {
+            let retained: Vec<f64> = buf
+                .retained()
+                .iter()
+                .filter(|(_, t)| idx.contains(t))
+                .map(|(v, _)| *v)
+                .collect();
+            SpeedStats::from_parts(d.n, d.min, d.max, &retained, buf.is_decimated())
+        };
+        (stats(&m.linear, &l), stats(&m.joint, &j))
+    }
+
+    /// Bound written for a dimension the run never exercised on a channel
+    /// that has an envelope: the OEM ceiling if one is configured, else 0
+    /// (deny). Never `None`, which would mean "unlimited".
+    pub fn unobserved_bound(&self, joint: bool) -> f64 {
+        let ceiling = if joint {
+            self.config.ceiling_joint
+        } else {
+            self.config.ceiling_linear
+        };
+        ceiling.map_or(0.0, |c| c.min(self.config.effective_cap(joint)))
+    }
+
+    /// `(max, p99)` when the maximum is more than `outlier_ratio` times the
+    /// 99th percentile.
+    fn outlier(&self, st: &Option<SpeedStats>) -> Option<(f64, f64)> {
+        let st = st.as_ref()?;
+        (st.samples >= 2 && st.max > st.p99 * self.config.outlier_ratio).then_some((st.max, st.p99))
     }
 
     /// Accepted per-dimension stats of a channel: `(linear, joint, commands)`.
@@ -1501,7 +1914,8 @@ impl Learner {
     }
 
     fn build_profile(&self, assessed: &BTreeMap<String, Assessment>) -> Profile {
-        let accepted = Self::accepted_set(assessed);
+        let gate = self.gate(assessed);
+        let accepted = &gate.accepted;
         let mut p = Profile {
             model: self.config.model.clone(),
             locked: false,
@@ -1509,7 +1923,7 @@ impl Learner {
         };
         p.participants = accepted.iter().map(|g| g.to_string()).collect();
         let topic_learned =
-            |e: &EndpointAcc| e.participants.iter().any(|g| accepted.contains(g.as_str()));
+            |e: &EndpointAcc| e.participants.iter().any(|g| gate.vouches(&e.origins, g));
         p.writer_topics = self
             .writers
             .iter()
@@ -1526,7 +1940,7 @@ impl Learner {
         }
         let learned = |m: &BTreeMap<String, RoleAcc>| -> BTreeSet<String> {
             m.iter()
-                .filter(|(_, a)| self.role_learned(a, &accepted))
+                .filter(|(_, a)| self.role_learned(a, &gate))
                 .map(|(n, _)| n.clone())
                 .collect()
         };
@@ -1534,13 +1948,23 @@ impl Learner {
         p.actions = learned(&self.actions);
         p.raw_dds_topics = learned(&self.raw);
         for (ch, m) in &self.motion {
-            let (l, j, n) = Self::accepted_motion(m, &accepted);
+            let (l, j, n) = Self::accepted_motion(m, accepted);
             if n == 0 {
                 continue; // only excluded sources: channel not learned
             }
+            // A dimension never exercised gets an explicit bound (ceiling or
+            // 0 = deny), never `None` = unlimited; sign-off item
+            // `envelope_dimension_unobserved`. A channel with no valid sample
+            // at all keeps an empty envelope, which `lock` refuses.
+            let observed_any = l.n > 0 || j.n > 0;
+            let bound = |d: &DimStat, joint: bool| match self.dim_bound(d, joint) {
+                Some(t) => Some(t.1),
+                None if observed_any => Some(self.unobserved_bound(joint)),
+                None => None,
+            };
             let env = Envelope {
-                max_linear_speed: self.dim_bound(&l, false).map(|t| t.1),
-                max_joint_speed: self.dim_bound(&j, true).map(|t| t.1),
+                max_linear_speed: bound(&l, false),
+                max_joint_speed: bound(&j, true),
             };
             p.motion_envelopes.insert(ch.clone(), env);
         }
@@ -1590,7 +2014,8 @@ impl Learner {
         profile: &Profile,
         assessed: &BTreeMap<String, Assessment>,
     ) -> Vec<SignoffItem> {
-        let accepted = Self::accepted_set(assessed);
+        let gate = self.gate(assessed);
+        let accepted = &gate.accepted;
         let mut items = Vec::new();
         for (g, a) in assessed {
             if !a.accepted() {
@@ -1609,7 +2034,7 @@ impl Learner {
                 for g in e
                     .participants
                     .iter()
-                    .filter(|g| accepted.contains(g.as_str()))
+                    .filter(|g| gate.vouches(&e.origins, g))
                 {
                     items.push(SignoffItem::new(
                         "motion_writer",
@@ -1650,8 +2075,43 @@ impl Learner {
                     Some(_) => {}
                 }
             }
-            let (l, j, _) = Self::accepted_motion(m, &accepted);
-            for (dim, d, joint) in [("linear", l, false), ("joint", j, true)] {
+            let (l, j, _) = Self::accepted_motion(m, accepted);
+            let (ls, js) = Self::accepted_stats(m, accepted);
+            let env = &profile.motion_envelopes[ch];
+            for (dim, d, st, bound, joint, unit) in [
+                ("linear", l, &ls, env.max_linear_speed, false, "m/s"),
+                ("joint", j, &js, env.max_joint_speed, true, "rad/s"),
+            ] {
+                if d.n == 0 {
+                    if let Some(b) = bound {
+                        items.push(SignoffItem::new(
+                            "envelope_dimension_unobserved",
+                            &format!("{ch} {dim}"),
+                            format!(
+                                "no {dim} speed was observed on {ch}; its {dim} bound is set to \
+                                 {b} {unit} ({}): confirm, or record a run that exercises it",
+                                if b == 0.0 {
+                                    "deny: any non-zero command deviates"
+                                } else {
+                                    "the configured OEM ceiling"
+                                }
+                            ),
+                        ));
+                    }
+                }
+                if let Some((max, p99)) = self.outlier(st) {
+                    items.push(SignoffItem::new(
+                        "envelope_outlier",
+                        &format!("{ch} {dim}"),
+                        format!(
+                            "{ch} {dim}: max {max} {unit} is more than {}x the p99 {p99} {unit}; \
+                             the envelope {} {unit} rests on outlier sample(s) (a stray or \
+                             injected command?): confirm the maximum, or re-commission",
+                            self.config.outlier_ratio,
+                            bound.map_or_else(|| "-".to_string(), |b| b.to_string())
+                        ),
+                    ));
+                }
                 if d.n > 0 && d.n < self.config.min_samples {
                     items.push(SignoffItem::new(
                         "few_motion_samples",
@@ -1677,6 +2137,13 @@ impl Learner {
                 }
             }
         }
+        for (subject, reason) in self.mismatch_items(&gate) {
+            items.push(SignoffItem::new(
+                "endpoint_sender_mismatch",
+                &subject,
+                reason,
+            ));
+        }
         for (cat, n) in &self.overflow {
             items.push(SignoffItem::new(
                 "capacity_exceeded",
@@ -1698,6 +2165,40 @@ impl Learner {
             ));
         }
         items
+    }
+
+    /// `(subject, reason)` of every `endpoint_sender_mismatch`: endpoint
+    /// announcements claiming a GUID other than their sender's, and
+    /// announcements from an IP that is not a commissioned IP of their
+    /// owner. None of them were learned.
+    fn mismatch_items(&self, gate: &Gate<'_>) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for (subject, m) in &self.sender_mismatch {
+            let (n, ex) = examples(&m.names);
+            out.push((
+                subject.clone(),
+                format!(
+                    "{} endpoint announcement(s) ({n} name(s): {ex}) sent by participant {} from \
+                     {} claim to belong to participant {} (first at {}): NOT learned. A \
+                     participant announcing endpoints under another's GUID is GUID spoofing (or \
+                     a discovery relay); investigate before locking",
+                    m.span.count, m.sender, m.src_ip, m.owner, m.span.first
+                ),
+            ));
+        }
+        for ((g, ip), names) in self.ip_mismatches(gate) {
+            let (n, ex) = examples(&names);
+            out.push((
+                mismatch_subject(&g, &g, &ip),
+                format!(
+                    "endpoint announcement(s) of participant {g} ({n} name(s): {ex}) came from \
+                     {ip}, which is not one of its commissioned IPs (it did not pass the \
+                     anti-poisoning gate from there): not learned from that IP; GUID spoofing \
+                     from another host?"
+                ),
+            ));
+        }
+        out
     }
 
     /// The commissioning report.
@@ -1727,7 +2228,8 @@ impl Learner {
         profile: &Profile,
         signoff: &Signoff,
     ) -> CommissioningReport {
-        let accepted = Self::accepted_set(assessed);
+        let gate = self.gate(assessed);
+        let accepted = &gate.accepted;
         let mut warnings = Vec::new();
         let mut warn = |level: WarningLevel, code: &str, subject: &str, message: String| {
             warnings.push(Warning {
@@ -1866,7 +2368,29 @@ impl Learner {
                 );
             }
         }
+        for (subject, reason) in self.mismatch_items(&gate) {
+            warn(Warn, "endpoint_sender_mismatch", &subject, reason);
+        }
         // Run-level gate diagnostics.
+        let discovery_runs: BTreeSet<usize> = self
+            .participants
+            .values()
+            .flat_map(|p| p.runs.keys().copied())
+            .collect();
+        for i in discovery_runs {
+            if self.extents.get(i).is_some_and(|e| e.min_ts.is_none()) {
+                warn(
+                    Info,
+                    "presence_measured_by_position",
+                    &format!("run{i}"),
+                    format!(
+                        "run{i} has no timestamps (event recording): late/brief participant \
+                         flags are measured in input positions (lines), which a flood of input \
+                         can skew; prefer a packet capture for the participant review"
+                    ),
+                );
+            }
+        }
         for (i, e) in self.extents.iter().enumerate() {
             if let Some(d) = e.duration() {
                 let min = self.config.min_participant_duration;
@@ -1900,7 +2424,7 @@ impl Learner {
                             participants: e.participants.clone(),
                             type_names: e.type_names.clone(),
                             in_profile: learned
-                                && e.participants.iter().any(|g| accepted.contains(g.as_str())),
+                                && e.participants.iter().any(|g| gate.vouches(&e.origins, g)),
                         },
                     ))
                 })
@@ -1909,7 +2433,7 @@ impl Learner {
         // Channels with accepted commands that `build_profile` left out
         // because no accepted writer was learned on them.
         for (ch, m) in &self.motion {
-            if Self::accepted_motion(m, &accepted).2 > 0
+            if Self::accepted_motion(m, accepted).2 > 0
                 && !profile.motion_envelopes.contains_key(ch)
             {
                 warn(
@@ -1981,7 +2505,7 @@ impl Learner {
                             clients: a.side_a.clone(),
                             servers: a.side_b.clone(),
                             components: a.components.clone(),
-                            in_profile: self.role_learned(a, &accepted),
+                            in_profile: self.role_learned(a, &gate),
                         },
                     ))
                 })
@@ -1993,7 +2517,7 @@ impl Learner {
         for (n, a) in &self.raw {
             let Some(s) = &a.span else { continue };
             let ros_internal = ROS_INTERNAL_RAW_TOPICS.contains(&n.as_str());
-            let in_profile = self.role_learned(a, &accepted);
+            let in_profile = self.role_learned(a, &gate);
             raw_dds_topics.insert(
                 n.clone(),
                 RawTopicReport {
@@ -2038,7 +2562,7 @@ impl Learner {
                              probably incomplete"
                         ),
                     );
-                } else if !a.writer_guids.is_empty() && !self.role_learned(a, &accepted) {
+                } else if !a.writer_guids.is_empty() && !self.role_learned(a, &gate) {
                     gated.push(n);
                 }
             }
@@ -2231,13 +2755,6 @@ impl Learner {
         for (ch, m) in &self.motion {
             let Some(span) = &m.span else { continue };
             let in_profile = profile.motion_envelopes.contains_key(ch);
-            let accepted_idx: BTreeSet<u32> = m
-                .sources
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| Self::source_accepted(s, &accepted))
-                .map(|(i, _)| i as u32)
-                .collect();
             let excluded_sources: BTreeSet<String> = m
                 .sources
                 .iter()
@@ -2245,7 +2762,8 @@ impl Learner {
                 .filter(|g| !accepted.contains(g.as_str()))
                 .cloned()
                 .collect();
-            let (l, j, cmds) = Self::accepted_motion(m, &accepted);
+            let (l, j, cmds) = Self::accepted_motion(m, accepted);
+            let (ls, js) = Self::accepted_stats(m, accepted);
             let excluded_commands = span.count.saturating_sub(cmds);
             if !excluded_sources.is_empty() {
                 warn(
@@ -2347,6 +2865,38 @@ impl Learner {
                     let _ = bound;
                 }
             }
+            for (dim, d, st, b) in [
+                ("linear", &l, &ls, env.max_linear_speed),
+                ("joint", &j, &js, env.max_joint_speed),
+            ] {
+                if !in_profile {
+                    break;
+                }
+                if d.n == 0 && b.is_some() {
+                    warn(
+                        Info,
+                        "envelope_dimension_unobserved",
+                        ch,
+                        format!(
+                            "{ch}: no {dim} sample observed; {dim} bound set to {} (0 = deny), \
+                             never left unlimited",
+                            opt(b)
+                        ),
+                    );
+                }
+                if let Some((max, p99)) = self.outlier(st) {
+                    warn(
+                        Warn,
+                        "envelope_outlier",
+                        ch,
+                        format!(
+                            "{ch}: {dim} max {max} is more than {}x the p99 {p99}: the envelope \
+                             rests on outlier sample(s)",
+                            self.config.outlier_ratio
+                        ),
+                    );
+                }
+            }
             if in_profile && l.n == 0 && j.n == 0 {
                 warn(
                     Warn,
@@ -2355,15 +2905,6 @@ impl Learner {
                     format!("{ch}: no valid speed sample; envelope empty, lock will refuse"),
                 );
             }
-            let stats = |buf: &SampleBuffer<(f64, u32)>, d: &DimStat| {
-                let retained: Vec<f64> = buf
-                    .retained()
-                    .iter()
-                    .filter(|(_, t)| accepted_idx.contains(t))
-                    .map(|(v, _)| *v)
-                    .collect();
-                SpeedStats::from_parts(d.n, d.min, d.max, &retained, buf.is_decimated())
-            };
             motion_channels.insert(
                 ch.clone(),
                 MotionReport {
@@ -2371,8 +2912,8 @@ impl Learner {
                     first_seen: span.first,
                     last_seen: span.last,
                     sources: m.sources.iter().flatten().cloned().collect(),
-                    linear: stats(&m.linear, &l),
-                    joint: stats(&m.joint, &j),
+                    linear: ls,
+                    joint: js,
                     envelope: env,
                     linear_capped_by_ceiling: capped_flags[0],
                     joint_capped_by_ceiling: capped_flags[1],
@@ -2400,6 +2941,7 @@ impl Learner {
                 .unwrap_or(u64::MAX),
                 late_fraction: self.config.late_fraction,
                 brief_fraction: self.config.brief_fraction,
+                outlier_ratio: self.config.outlier_ratio,
                 accept_participants: self.config.accept_participants.clone(),
                 motion_topics: self.config.motion_topics.clone(),
                 limits: self.config.limits.clone(),
@@ -2455,6 +2997,7 @@ pub struct ReportConfig {
     pub min_participant_duration_ms: u64,
     pub late_fraction: f64,
     pub brief_fraction: f64,
+    pub outlier_ratio: f64,
     pub accept_participants: BTreeSet<String>,
     pub motion_topics: BTreeSet<String>,
     pub limits: Limits,
@@ -2870,7 +3413,8 @@ mod tests {
         let env = &p.motion_envelopes["/cmd_vel"];
         // max 0.39 * 1.1 = 0.429
         assert_eq!(env.max_linear_speed, Some(0.429));
-        assert_eq!(env.max_joint_speed, None);
+        // Never exercised: deny (0), not unlimited (None).
+        assert_eq!(env.max_joint_speed, Some(0.0));
         let r = l.report();
         assert_eq!(r.anomalies_total, 0);
         assert_eq!(r.warn_count(), 0, "{r}");
@@ -2992,7 +3536,7 @@ mod tests {
         let l = learn(cfg(), &evs);
         let p = l.profile();
         assert_eq!(p.motion_envelopes["/cmd_vel"].max_linear_speed, Some(0.429));
-        assert_eq!(p.motion_envelopes["/cmd_vel"].max_joint_speed, None);
+        assert_eq!(p.motion_envelopes["/cmd_vel"].max_joint_speed, Some(0.0));
         let r = l.report();
         assert_eq!(r.anomalies_total, 4);
         let kinds: Vec<_> = r.anomalies.iter().map(|a| a.kind.as_str()).collect();
@@ -3468,6 +4012,7 @@ mod tests {
                 position: 7,
                 event: self.1.remove(0),
                 ts: None,
+                origin: None,
             }))
         }
         fn capture_diagnostics(&self) -> Option<CaptureDiagnostics> {
@@ -4057,5 +4602,181 @@ mod tests {
             .anomalies
             .iter()
             .any(|a| a.kind == "malformed_guid_prefix"));
+    }
+
+    // ---------------------------------------------- review 3 (F1, F2) ---
+
+    /// One event as a capture would deliver it: sender prefix and IP.
+    fn sourced(ev: RobotEvent, pos: u64, sender: &str, ip: &str) -> SourcedEvent {
+        SourcedEvent {
+            position: pos,
+            event: ev,
+            ts: Some(Duration::from_secs(pos)),
+            origin: Some(Origin {
+                sender_prefix: sender.into(),
+                src_ip: ip.into(),
+            }),
+        }
+    }
+    fn part_ip(g: &str, ip: &str) -> RobotEvent {
+        RobotEvent::Ros2ParticipantDiscovered(Participant {
+            guid_prefix: g.into(),
+            src_ip: ip.into(),
+            locators: vec![],
+        })
+    }
+
+    /// A from 10.0.0.1 for 100 s (two announcements), plus `extra`.
+    fn provenance_run(extra: Vec<SourcedEvent>) -> Learner {
+        let mut l = Learner::new(LearnConfig {
+            model: "m".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        l.start_run("cap");
+        let mut evs = vec![
+            sourced(part_ip(A, "10.0.0.1"), 1, A, "10.0.0.1"),
+            sourced(writer(A, "rt/odom"), 1, A, "10.0.0.1"),
+            sourced(writer(A, "rq/a/get_parametersRequest"), 1, A, "10.0.0.1"),
+            sourced(part_ip(A, "10.0.0.1"), 100, A, "10.0.0.1"),
+        ];
+        evs.extend(extra);
+        evs.sort_by_key(|e| e.position);
+        for e in &evs {
+            l.observe_sourced(e);
+        }
+        l
+    }
+
+    #[test]
+    fn endpoint_provenance_applies_to_services_and_merges() {
+        let x = "eeeeeeeeeeeeeeeeeeeeeeee";
+        // A service request writer claiming A, sent by x; and a topic writer
+        // claiming A from an uncommissioned IP (header spoof).
+        let attack = vec![
+            sourced(part_ip(x, "10.9.9.9"), 50, x, "10.9.9.9"),
+            sourced(writer(A, "rq/evil/setRequest"), 50, x, "10.9.9.9"),
+            sourced(part_ip(A, "10.9.9.9"), 51, A, "10.9.9.9"),
+            sourced(writer(A, "rt/exfil"), 51, A, "10.9.9.9"),
+        ];
+        let l = provenance_run(attack.clone());
+        let out = l.finish();
+        let p = &out.profile;
+        assert!(p.writer_topics.contains("/odom"));
+        assert!(p.services.contains("/a/get_parameters"));
+        assert!(!p.services.contains("/evil/set"));
+        assert!(!p.writer_topics.contains("/exfil"));
+        let subjects: Vec<&str> = out
+            .signoff
+            .items
+            .iter()
+            .filter(|i| i.kind == "endpoint_sender_mismatch")
+            .map(|i| i.subject.as_str())
+            .collect();
+        assert_eq!(
+            subjects,
+            vec![
+                format!("{A} sent by {A} from 10.9.9.9"),
+                format!("{A} sent by {x} from 10.9.9.9"),
+            ]
+        );
+        assert!(!out.report.writer_topics["/exfil"].in_profile);
+        // A claimed-but-not-sent announcement is not even recorded.
+        assert!(!out.report.services.contains_key("/evil/set"));
+
+        // Merging learners keeps provenance and mismatches.
+        let mut left = provenance_run(Vec::new());
+        let mut right = Learner::new(LearnConfig {
+            model: "m".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        right.start_run("cap2");
+        for e in &attack {
+            right.observe_sourced(e);
+        }
+        left.merge(&right);
+        let m = left.finish();
+        assert!(!m.profile.writer_topics.contains("/exfil"));
+        assert!(!m.profile.services.contains("/evil/set"));
+        assert_eq!(
+            m.signoff
+                .items
+                .iter()
+                .filter(|i| i.kind == "endpoint_sender_mismatch")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn operator_accepted_participant_has_all_ips_commissioned() {
+        let extra = vec![
+            sourced(part_ip(A, "10.0.0.2"), 60, A, "10.0.0.2"),
+            sourced(writer(A, "rt/second_nic"), 60, A, "10.0.0.2"),
+        ];
+        // Gate-accepted: the second IP is not commissioned.
+        let l = provenance_run(extra.clone());
+        assert!(!l.profile().writer_topics.contains("/second_nic"));
+        // Operator-accepted (A quarantined by a strict gate, then accepted):
+        // every IP of A counts.
+        let mut l = Learner::new(LearnConfig {
+            model: "m".into(),
+            min_participant_announcements: 10,
+            accept_participants: [A.to_string()].into_iter().collect(),
+            ..Default::default()
+        })
+        .unwrap();
+        l.start_run("cap");
+        for e in [
+            sourced(part_ip(A, "10.0.0.1"), 1, A, "10.0.0.1"),
+            sourced(writer(A, "rt/odom"), 1, A, "10.0.0.1"),
+            sourced(part_ip(A, "10.0.0.2"), 60, A, "10.0.0.2"),
+            sourced(writer(A, "rt/second_nic"), 60, A, "10.0.0.2"),
+            sourced(part_ip(A, "10.0.0.1"), 100, A, "10.0.0.1"),
+        ] {
+            l.observe_sourced(&e);
+        }
+        let out = l.finish();
+        assert_eq!(
+            out.report.participants[A].status,
+            ParticipantStatus::OperatorAccepted
+        );
+        assert!(out.profile.writer_topics.contains("/second_nic"));
+        assert!(!out
+            .signoff
+            .items
+            .iter()
+            .any(|i| i.kind == "endpoint_sender_mismatch"));
+    }
+
+    #[test]
+    fn late_and_brief_use_capture_time_not_positions() {
+        // Positions say "early and long" (B appears at frame 2 and stays to
+        // frame 9000), timestamps say "late and brief" (90 s .. 95 s of a
+        // 100 s run): timestamps win.
+        let mut l = Learner::new(LearnConfig {
+            model: "m".into(),
+            min_participant_duration: Duration::ZERO,
+            ..Default::default()
+        })
+        .unwrap();
+        l.start_run("cap");
+        let t = Duration::from_secs;
+        l.observe_at_time(&part(A), 1, Some(t(0)));
+        l.observe_at_time(&part(B), 2, Some(t(90)));
+        l.observe_at_time(&part(B), 9000, Some(t(95)));
+        l.observe_at_time(&part(A), 9001, Some(t(100)));
+        let a = l.assess();
+        let kinds: Vec<&str> = a[B].flags.iter().map(|(k, _)| *k).collect();
+        assert!(kinds.contains(&"participant_late"), "{kinds:?}");
+        assert!(kinds.contains(&"participant_brief"), "{kinds:?}");
+        assert!(a[A].flags.is_empty(), "{:?}", a[A].flags);
+        // Identical timestamps: everyone present for the whole (zero) run.
+        let mut l = Learner::new(cfg()).unwrap();
+        l.start_run("cap");
+        l.observe_at_time(&part(A), 1, Some(t(5)));
+        l.observe_at_time(&part(B), 500, Some(t(5)));
+        assert!(l.assess()[B].flags.is_empty());
     }
 }

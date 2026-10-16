@@ -14,7 +14,9 @@
 //! The PRNG is a std-only SplitMix64 with fixed seeds, so failures are
 //! reproducible: the failing seed is printed.
 
-use robodr_commission::{lock, Checker, Commissioning, LearnConfig, Learner, VecSource};
+use robodr_commission::{
+    lock_with_caps, Checker, Commissioning, HardCaps, LearnConfig, Learner, VecSource,
+};
 use robodr_events::graph::{Endpoint, Participant};
 use robodr_events::profile::Profile;
 use robodr_events::{MotionCommand, MotionFeedback, RobotEvent};
@@ -296,7 +298,13 @@ fn learn_lock_check_over_clean_runs_gives_zero_deviations() {
 
         assert_eq!(profile.validate(), Ok(()), "seed {seed}");
         let signoff = c.signoff.confirm_all("prop-test");
-        let locked = lock(&profile, &signoff).unwrap_or_else(|why| panic!("seed {seed}: {why:?}"));
+        // Lock with the caps the run was learned with (lock enforces them).
+        let caps = HardCaps {
+            linear: cfg.hard_cap_linear,
+            joint: cfg.hard_cap_joint,
+        };
+        let locked = lock_with_caps(&profile, &signoff, &caps)
+            .unwrap_or_else(|why| panic!("seed {seed}: {why:?}"));
         // Through JSON, exactly as the CLI hands it to `check`.
         let json = serde_json::to_string(&locked).unwrap();
         let locked: Profile = serde_json::from_str(&json).unwrap();

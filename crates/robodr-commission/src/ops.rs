@@ -13,20 +13,75 @@
 //!   writer topics, gives every motion channel at least one bound, and
 //!   passes `Profile::validate` (the sensor's own load-time check);
 //! * a [`Signoff`] is supplied for *this* draft: same model, same SHA-256
-//!   of the draft bytes, a non-empty operator and every item confirmed.
+//!   of the draft bytes, a non-empty operator and every item confirmed;
+//! * the sign-off's item set is the one generated for the draft
+//!   (`items_sha256`, so items cannot be deleted) and covers the floor
+//!   recomputed from the draft itself ([`required_items`]: every motion
+//!   channel reviewed);
+//! * no envelope bound exceeds the [`HardCaps`] (default
+//!   [`DEFAULT_HARD_CAP_LINEAR`] / [`DEFAULT_HARD_CAP_JOINT`], the same caps
+//!   `learn` applies): a hand-edited `1e300` m/s cannot be locked. [`merge_profiles`]
+//!   enforces the same caps.
 //!
 //! The CLI then writes the result sealed (see `profile_file`), so the
 //! locked file cannot be edited or half-written without `check`, `diff`
 //! and `merge` refusing it.
 
 use crate::input::{EventSource, InputError};
+use crate::learner::{DEFAULT_HARD_CAP_JOINT, DEFAULT_HARD_CAP_LINEAR};
 use crate::profile_file::parse_profile_text;
-use crate::signoff::{draft_digest, sha256_hex, Signoff};
+use crate::signoff::{covers, draft_digest, required_items, sha256_hex, Signoff};
 use robodr_events::profile::{Envelope, EnvelopeField, Profile, ProfileError};
 use robodr_events::{Deviation, MotionCommand, RobotEvent, Severity};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+
+// ---------------------------------------------------------------- caps ----
+
+/// Absolute upper bounds on any envelope a profile may be locked or merged
+/// with. Defaults match `learn`'s hard caps; a platform commissioned with
+/// higher `--hard-cap-*` values passes the same values to `lock` / `merge`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HardCaps {
+    /// m/s.
+    pub linear: f64,
+    /// rad/s.
+    pub joint: f64,
+}
+
+impl Default for HardCaps {
+    fn default() -> Self {
+        Self {
+            linear: DEFAULT_HARD_CAP_LINEAR,
+            joint: DEFAULT_HARD_CAP_JOINT,
+        }
+    }
+}
+
+/// One bound above a hard cap: `(channel, dimension, value, cap)`.
+fn over_caps(p: &Profile, caps: &HardCaps) -> Vec<(String, &'static str, f64, f64)> {
+    let mut out = Vec::new();
+    for (ch, env) in &p.motion_envelopes {
+        for (dim, v, cap) in [
+            ("linear", env.max_linear_speed, caps.linear),
+            ("joint", env.max_joint_speed, caps.joint),
+        ] {
+            // NaN / negative bounds are reported by `Profile::validate`;
+            // a NaN cap (caller bug) refuses everything.
+            if let Some(v) = v.filter(|v| v.is_finite()) {
+                // Not `v <= cap` (false for a NaN cap: refuse).
+                if !matches!(
+                    v.partial_cmp(&cap),
+                    Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+                ) {
+                    out.push((ch.clone(), dim, v, cap));
+                }
+            }
+        }
+    }
+    out
+}
 
 // ---------------------------------------------------------------- lock ----
 
@@ -75,6 +130,22 @@ pub enum LockRefusal {
         id: String,
         why: String,
     },
+    /// The sign-off's items are not the set generated for this draft
+    /// (`items_sha256` mismatch: an item was deleted, added or reworded).
+    SignoffItemsTampered,
+    /// The draft requires a confirmed review the sign-off lacks (see
+    /// `signoff::required_items`).
+    RequiredItemMissing {
+        subject: String,
+        why: String,
+    },
+    /// An envelope bound above the hard cap.
+    ExceedsHardCap {
+        channel: String,
+        dimension: String,
+        value: f64,
+        cap: f64,
+    },
 }
 
 impl fmt::Display for LockRefusal {
@@ -113,6 +184,24 @@ impl fmt::Display for LockRefusal {
             LockRefusal::Unconfirmed { id, why } => {
                 write!(f, "not confirmed by the operator: {id} ({why})")
             }
+            LockRefusal::SignoffItemsTampered => write!(
+                f,
+                "sign-off items were deleted, added or reworded (items_sha256 differs): confirm \
+                 items, do not remove them; re-run learn or `robodr-commission signoff`"
+            ),
+            LockRefusal::RequiredItemMissing { subject, why } => {
+                write!(f, "required sign-off missing for {subject}: {why}")
+            }
+            LockRefusal::ExceedsHardCap {
+                channel,
+                dimension,
+                value,
+                cap,
+            } => write!(
+                f,
+                "motion channel {channel}: {dimension} bound {value} exceeds the hard cap {cap} \
+                 (pass --hard-cap-{dimension} if the platform really is that fast)"
+            ),
         }
     }
 }
@@ -122,27 +211,46 @@ impl fmt::Display for LockRefusal {
 /// sees everything at once (see the module docs). The sign-off is bound to
 /// [`draft_digest`]`(profile)`, i.e. the bytes `learn` writes.
 pub fn lock(profile: &Profile, signoff: &Signoff) -> Result<Profile, Vec<LockRefusal>> {
-    lock_with_digest(profile, signoff, &draft_digest(profile))
+    lock_with_caps(profile, signoff, &HardCaps::default())
+}
+
+/// [`lock`] with explicit hard caps.
+pub fn lock_with_caps(
+    profile: &Profile,
+    signoff: &Signoff,
+    caps: &HardCaps,
+) -> Result<Profile, Vec<LockRefusal>> {
+    lock_with_digest(profile, signoff, &draft_digest(profile), caps)
 }
 
 /// [`lock`] for a draft read from disk: the sign-off is checked against the
 /// SHA-256 of `draft_text` itself, and the text must parse strictly
 /// (`profile_file::parse_profile_text`: all keys, no unknown keys).
 pub fn lock_draft_text(draft_text: &str, signoff: &Signoff) -> Result<Profile, Vec<LockRefusal>> {
+    lock_draft_text_with_caps(draft_text, signoff, &HardCaps::default())
+}
+
+/// [`lock_draft_text`] with explicit hard caps.
+pub fn lock_draft_text_with_caps(
+    draft_text: &str,
+    signoff: &Signoff,
+    caps: &HardCaps,
+) -> Result<Profile, Vec<LockRefusal>> {
     let profile = parse_profile_text(draft_text).map_err(|e| {
         vec![LockRefusal::UnreadableDraft {
             error: e.to_string(),
         }]
     })?;
-    lock_with_digest(&profile, signoff, &sha256_hex(draft_text.as_bytes()))
+    lock_with_digest(&profile, signoff, &sha256_hex(draft_text.as_bytes()), caps)
 }
 
 fn lock_with_digest(
     profile: &Profile,
     signoff: &Signoff,
     digest: &str,
+    caps: &HardCaps,
 ) -> Result<Profile, Vec<LockRefusal>> {
-    let mut why = lockable(profile);
+    let mut why = lockable_with_caps(profile, caps);
     if let Err(error) = signoff.check_shape() {
         why.push(LockRefusal::SignoffInvalid { error });
     }
@@ -158,11 +266,22 @@ fn lock_with_digest(
     if signoff.operator.trim().is_empty() {
         why.push(LockRefusal::SignoffNoOperator);
     }
+    if !signoff.items_intact() {
+        why.push(LockRefusal::SignoffItemsTampered);
+    }
     for i in signoff.unconfirmed() {
         why.push(LockRefusal::Unconfirmed {
             id: i.id.clone(),
             why: i.reason.clone(),
         });
+    }
+    for (subject, reason) in required_items(profile) {
+        if !signoff.items.iter().any(|i| covers(i, &subject)) {
+            why.push(LockRefusal::RequiredItemMissing {
+                subject,
+                why: reason,
+            });
+        }
     }
     if why.is_empty() {
         let mut p = profile.clone();
@@ -174,9 +293,15 @@ fn lock_with_digest(
 }
 
 /// The content checks of [`lock`] alone (no sign-off): already locked,
-/// empty, a motion channel without any bound, and every
-/// [`Profile::validate`] error. Empty means the content is lockable.
+/// empty, a motion channel without any bound, a bound above the default
+/// [`HardCaps`], and every [`Profile::validate`] error. Empty means the
+/// content is lockable.
 pub fn lockable(profile: &Profile) -> Vec<LockRefusal> {
+    lockable_with_caps(profile, &HardCaps::default())
+}
+
+/// [`lockable`] with explicit hard caps.
+pub fn lockable_with_caps(profile: &Profile, caps: &HardCaps) -> Vec<LockRefusal> {
     let mut why = Vec::new();
     if profile.locked {
         why.push(LockRefusal::AlreadyLocked);
@@ -193,6 +318,14 @@ pub fn lockable(profile: &Profile) -> Vec<LockRefusal> {
                 channel: ch.clone(),
             });
         }
+    }
+    for (channel, dim, value, cap) in over_caps(profile, caps) {
+        why.push(LockRefusal::ExceedsHardCap {
+            channel,
+            dimension: dim.into(),
+            value,
+            cap,
+        });
     }
     if let Err(errors) = profile.validate() {
         why.extend(errors.into_iter().map(|e| {
@@ -217,7 +350,7 @@ pub fn lockable(profile: &Profile) -> Vec<LockRefusal> {
 
 // ---------------------------------------------------------------- merge ---
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MergeError {
     NoProfiles,
     ModelMismatch(String, String),
@@ -230,6 +363,14 @@ pub enum MergeError {
     InvalidInput {
         index: usize,
         errors: Vec<String>,
+    },
+    /// An input has an envelope bound above the hard cap.
+    ExceedsHardCap {
+        index: usize,
+        channel: String,
+        dimension: String,
+        value: f64,
+        cap: f64,
     },
 }
 
@@ -252,6 +393,18 @@ impl fmt::Display for MergeError {
                 index + 1,
                 errors.join("; ")
             ),
+            MergeError::ExceedsHardCap {
+                index,
+                channel,
+                dimension,
+                value,
+                cap,
+            } => write!(
+                f,
+                "refusing to merge: profile #{} channel {channel}: {dimension} bound {value} \
+                 exceeds the hard cap {cap}",
+                index + 1
+            ),
         }
     }
 }
@@ -270,12 +423,31 @@ impl std::error::Error for MergeError {}
 /// computes percentiles and warnings over all samples, and applies the margin
 /// once. Merging profiles applies whatever margins each profile already had.
 pub fn merge_profiles(profiles: &[Profile]) -> Result<Profile, MergeError> {
+    merge_profiles_with_caps(profiles, &HardCaps::default())
+}
+
+/// [`merge_profiles`] with explicit hard caps: an input with a bound above
+/// a cap is refused ([`MergeError::ExceedsHardCap`]), so the "larger bound
+/// wins" rule can never carry an unbounded value into the result.
+pub fn merge_profiles_with_caps(
+    profiles: &[Profile],
+    caps: &HardCaps,
+) -> Result<Profile, MergeError> {
     let first = profiles.first().ok_or(MergeError::NoProfiles)?;
     for (index, p) in profiles.iter().enumerate() {
         if let Err(errs) = p.validate() {
             return Err(MergeError::InvalidInput {
                 index,
                 errors: errs.iter().map(ToString::to_string).collect(),
+            });
+        }
+        if let Some((channel, dim, value, cap)) = over_caps(p, caps).into_iter().next() {
+            return Err(MergeError::ExceedsHardCap {
+                index,
+                channel,
+                dimension: dim.into(),
+                value,
+                cap,
             });
         }
     }

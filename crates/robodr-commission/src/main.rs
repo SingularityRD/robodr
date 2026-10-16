@@ -10,14 +10,18 @@
 //! fsync + atomic publish, never through a symlink, never clobbering an
 //! existing file unless `--force`); the outputs of one command must be
 //! distinct from each other and from its inputs. Profiles are loaded
-//! strictly (regular file, size cap, all keys, no unknown keys, sealed if
-//! locked). A failed `learn` writes nothing.
+//! strictly (regular file, size cap, all keys, no unknown or duplicate keys,
+//! sealed if locked). A failed `learn` writes nothing: every output path is
+//! checked before the inputs are read, and the draft, sign-off and report
+//! are published together by
+//! [`write_files_atomic`](robodr_commission::write_files_atomic) (all temps
+//! first; a failed publish rolls back what was already published).
 
 use robodr_commission::input::{self, InputSpec};
-use robodr_commission::profile_file::{read_regular_file, MAX_PROFILE_BYTES};
+use robodr_commission::profile_file::{check_destination, read_regular_file, MAX_PROFILE_BYTES};
 use robodr_commission::{
-    diff, lock_draft_text, merge_profiles, parse_profile_text, sealed_text, to_json,
-    write_file_atomic, Checker, LearnConfig, Learner, Signoff,
+    diff, lock_draft_text_with_caps, merge_profiles_with_caps, parse_profile_text, sealed_text,
+    to_json, write_files_atomic, Checker, HardCaps, LearnConfig, Learner, Signoff,
 };
 use robodr_events::profile::Profile;
 use std::collections::BTreeMap;
@@ -34,15 +38,18 @@ USAGE:
                           [--ceiling-linear M_PER_S] [--ceiling-joint RAD_PER_S]
                           [--hard-cap-linear 10] [--hard-cap-joint 10]
                           [--min-announcements 2] [--min-duration SECS]
+                          [--outlier-ratio 3]
                           [--accept-participant GUID]... [--motion-topic /T]...
                           [--learn-readers]
                           --out profile.json [--signoff signoff.json]
                           [--report report.json] [--quiet] [--force]
-  robodr-commission lock    --in profile.json --signoff signoff.json --out locked.json [--force]
+  robodr-commission lock    --in profile.json --signoff signoff.json --out locked.json
+                          [--hard-cap-linear 10] [--hard-cap-joint 10] [--force]
   robodr-commission signoff --in profile.json --out signoff.json [--force]
   robodr-commission diff    <old.json> <new.json> [--json]
   robodr-commission check   --profile locked.json (--events <f> | --pcap <f>) [...] [--json]
-  robodr-commission merge   --out merged.json <a.json> <b.json> [...] [--force]
+  robodr-commission merge   --out merged.json <a.json> <b.json> [...]
+                          [--hard-cap-linear 10] [--hard-cap-joint 10] [--force]
 
   --events: JSON Lines of RobotEvent. --pcap: pcap or pcapng capture of the
   robot bus (discovery only: participants, writers, readers). Both repeat and
@@ -53,7 +60,13 @@ USAGE:
   times (or, in captures, seen for less than --min-duration seconds) are
   quarantined: not learned, nor their endpoints or motion samples. Use
   --accept-participant to override (it becomes a sign-off item). No
-  envelope exceeds --hard-cap-linear / --hard-cap-joint.
+  envelope exceeds --hard-cap-linear / --hard-cap-joint, and lock and merge
+  refuse any bound above them (pass the same values used for learn). A
+  dimension never observed on a channel is bounded at its ceiling or 0
+  (deny), never left unlimited. --outlier-ratio: max > ratio x p99 on an
+  envelope needs sign-off. Endpoints announced under another participant's
+  GUID, or from an IP that is not one of the owner's commissioned IPs, are
+  not learned (sign-off item endpoint_sender_mismatch).
   learn writes a sign-off list (default <out>.signoff.json); lock refuses
   until a named \"operator\" has set \"confirmed\": true on every item.
   signoff builds a conservative list for an edited or merged draft.
@@ -238,10 +251,43 @@ fn main() -> ExitCode {
     }
 }
 
-/// Atomic, symlink-refusing, no-clobber (unless `force`) write.
+/// Atomic, symlink-refusing, no-clobber (unless `force`) write of one or
+/// more files as a unit (see `write_files_atomic`).
+fn write_files(files: &[(&str, &str)], force: bool) -> Result<(), String> {
+    let v: Vec<(&Path, &[u8])> = files
+        .iter()
+        .map(|(p, c)| (Path::new(*p), c.as_bytes()))
+        .collect();
+    write_files_atomic(&v, force).map_err(|e| e.to_string())
+}
+
 fn write_file(path: &str, contents: &str, force: bool) -> Result<(), String> {
-    write_file_atomic(Path::new(path), contents.as_bytes(), force)
-        .map_err(|e| format!("{path}: {e}"))
+    write_files(&[(path, contents)], force)
+}
+
+/// Fail early (before reading inputs) if an output could not be written.
+fn precheck_outputs(paths: &[&str], force: bool) -> Result<(), String> {
+    for p in paths {
+        check_destination(Path::new(p), force).map_err(|e| format!("{p}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// `--hard-cap-linear` / `--hard-cap-joint` (defaults: learn's defaults).
+fn hard_caps(a: &Args) -> Result<HardCaps, String> {
+    let mut caps = HardCaps::default();
+    for (name, slot) in [
+        ("hard-cap-linear", &mut caps.linear),
+        ("hard-cap-joint", &mut caps.joint),
+    ] {
+        if let Some(v) = a.f64_opt(name)? {
+            if v <= 0.0 {
+                return Err(format!("--{name}: {v} must be > 0"));
+            }
+            *slot = v;
+        }
+    }
+    Ok(caps)
 }
 
 /// Identity of a path for "same file" checks: the canonical path of an
@@ -336,6 +382,7 @@ fn cmd_learn(argv: &[String]) -> Outcome {
             "min-duration",
             "accept-participant",
             "motion-topic",
+            "outlier-ratio",
         ],
         &["quiet", "learn-readers", "force"],
     )?;
@@ -360,6 +407,9 @@ fn cmd_learn(argv: &[String]) -> Outcome {
     }
     if let Some(v) = a.f64_opt("hard-cap-joint")? {
         cfg.hard_cap_joint = v;
+    }
+    if let Some(v) = a.f64_opt("outlier-ratio")? {
+        cfg.outlier_ratio = v;
     }
     if let Some(n) = a.u64_opt("min-announcements")? {
         cfg.min_participant_announcements = n;
@@ -390,6 +440,8 @@ fn cmd_learn(argv: &[String]) -> Outcome {
     let mut outputs = vec![out, signoff_path.as_str()];
     outputs.extend(report_path);
     distinct_paths(&outputs, &input_paths)?;
+    // Refuse now, not after learning (and never leave a partial set).
+    precheck_outputs(&outputs, force)?;
 
     let mut learner = Learner::new(cfg).map_err(|e| e.to_string())?;
     for spec in &inputs {
@@ -401,11 +453,14 @@ fn cmd_learn(argv: &[String]) -> Outcome {
     let profile_text = json(&c.profile)?;
     let signoff_text = json(&c.signoff)?;
     let report_text = json(&c.report)?;
-    write_file(out, &profile_text, force)?;
-    write_file(&signoff_path, &signoff_text, force)?;
+    let mut files = vec![
+        (out, profile_text.as_str()),
+        (signoff_path.as_str(), signoff_text.as_str()),
+    ];
     if let Some(r) = report_path {
-        write_file(r, &report_text, force)?;
+        files.push((r, report_text.as_str()));
     }
+    write_files(&files, force)?;
     if !a.switch("quiet") {
         print!("{}", c.report);
     }
@@ -434,10 +489,15 @@ fn cmd_learn(argv: &[String]) -> Outcome {
 }
 
 fn cmd_lock(argv: &[String]) -> Outcome {
-    let a = Args::parse(argv, &["in", "out", "signoff"], &["force"])?;
+    let a = Args::parse(
+        argv,
+        &["in", "out", "signoff", "hard-cap-linear", "hard-cap-joint"],
+        &["force"],
+    )?;
     if let Some(p) = a.positionals.first() {
         return Err(format!("unexpected argument {p:?}").into());
     }
+    let caps = hard_caps(&a)?;
     let input = a.required("in")?;
     let out = a.required("out")?;
     let signoff_path = a.required("signoff")?;
@@ -446,7 +506,7 @@ fn cmd_lock(argv: &[String]) -> Outcome {
     // An unreadable draft is an input error (exit 2), not a refusal.
     parse_profile_text(&draft).map_err(|e| format!("{input}: {e}"))?;
     let signoff = load_signoff(signoff_path)?;
-    match lock_draft_text(&draft, &signoff) {
+    match lock_draft_text_with_caps(&draft, &signoff, &caps) {
         Ok(locked) => {
             let text = sealed_text(&locked).map_err(|e| format!("serialise: {e}"))?;
             write_file(out, &text, a.switch("force"))?;
@@ -529,7 +589,7 @@ fn cmd_signoff(argv: &[String]) -> Outcome {
     let mut s = Signoff::for_profile(&p);
     // Bind to the bytes on disk (they may differ from our canonical form if
     // the draft was edited by hand).
-    s.profile_sha256 = robodr_commission::signoff::sha256_hex(text.as_bytes());
+    s.rebind(robodr_commission::signoff::sha256_hex(text.as_bytes()));
     write_file(out, &json(&s)?, a.switch("force"))?;
     eprintln!(
         "wrote conservative sign-off list {out} ({} item(s)): review each, set \"confirmed\": \
@@ -540,7 +600,12 @@ fn cmd_signoff(argv: &[String]) -> Outcome {
 }
 
 fn cmd_merge(argv: &[String]) -> Outcome {
-    let a = Args::parse(argv, &["out"], &["force"])?;
+    let a = Args::parse(
+        argv,
+        &["out", "hard-cap-linear", "hard-cap-joint"],
+        &["force"],
+    )?;
+    let caps = hard_caps(&a)?;
     let out = a.required("out")?;
     if a.positionals.is_empty() {
         return Err("merge needs at least one profile file".to_string().into());
@@ -552,7 +617,7 @@ fn cmd_merge(argv: &[String]) -> Outcome {
         .iter()
         .map(|p| load_profile(p))
         .collect::<Result<Vec<_>, _>>()?;
-    let m = merge_profiles(&profiles).map_err(|e| e.to_string())?;
+    let m = merge_profiles_with_caps(&profiles, &caps).map_err(|e| e.to_string())?;
     write_file(out, &json(&m)?, a.switch("force"))?;
     eprintln!(
         "merged {} profiles -> {out} (locked: false; provenance is lost: create a sign-off \
