@@ -32,9 +32,7 @@ fn opts(a: &Args) -> Result<Opts, String> {
     if let Some(n) = a.num("max-findings")? {
         pack.max_findings_per_batch = n;
     }
-    let mut cfg = ExportConfig::new(a.req("spool")?, a.req("state")?);
-    cfg.max_batch_bytes = pack.max_batch_bytes;
-    cfg.max_findings_per_batch = pack.max_findings_per_batch;
+    let mut cfg = ExportConfig::for_packer(a.req("spool")?, a.req("state")?, &pack);
     if let Some(d) = a.one("rejected-dir")? {
         cfg.rejected_dir = d.into();
     }
@@ -62,7 +60,8 @@ fn run_one(o: &Opts) -> Result<(), String> {
     }
     let packer = Packer::open(&o.outbox, &o.pack_state, o.pack.clone(), signer)
         .map_err(|e| format!("packer: {e}"))?;
-    let mut x = Exporter::open(o.cfg.clone(), packer).map_err(|e| e.to_string())?;
+    let mut x =
+        Exporter::open_checked(o.cfg.clone(), &o.pack, packer).map_err(|e| e.to_string())?;
     loop {
         let r = x.run_once(now_ms()).map_err(|e| e.to_string())?;
         if r.exported > 0 || !r.rejected.is_empty() || r.recovered.is_some() {

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 const USAGE: &str = "usage: robodr-kafka-publish --bootstrap HOST:PORT [--bootstrap ...] \
 --state-dir DIR (--diode-out DIR | --spool DIR) [--topic T] [--chunk N] [--client-id S] \
-[--request-timeout-ms N] [--delivery-timeout-ms N] [--retries N] [--max-request-bytes N] \
+[--request-timeout-ms N] [--produce-timeout-ms N] [--delivery-timeout-ms N] [--retries N] [--max-request-bytes N] \
 [--interval-ms N] [--once]\n\
 No TLS/SASL: run on an isolated SOC network or through a local TLS proxy (stunnel).";
 
@@ -31,6 +31,9 @@ fn opts(a: &Args) -> Result<Opts, String> {
     }
     if let Some(n) = a.num::<u64>("request-timeout-ms")? {
         p.request_timeout = Duration::from_millis(n);
+    }
+    if let Some(n) = a.num::<i32>("produce-timeout-ms")? {
+        p.produce_timeout_ms = n;
     }
     if let Some(n) = a.num::<u64>("delivery-timeout-ms")? {
         p.delivery_timeout = Duration::from_millis(n);
@@ -93,6 +96,7 @@ fn main() -> ExitCode {
                 "chunk",
                 "client-id",
                 "request-timeout-ms",
+                "produce-timeout-ms",
                 "delivery-timeout-ms",
                 "retries",
                 "max-request-bytes",

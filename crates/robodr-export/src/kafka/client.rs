@@ -25,7 +25,20 @@
 //!   the call: [`ProduceError::Fatal`].
 //! * Bounds: requests ≤ `max_request_bytes`, response frames ≤
 //!   `max_response_bytes`, connect/request timeouts with a hard deadline per
-//!   request (a slow-dripping broker cannot extend it).
+//!   request covering both writing the request and reading the response (a
+//!   slow-draining or slow-dripping broker cannot extend it). The request
+//!   deadline must exceed the broker-side `produce_timeout_ms` (default
+//!   30 s + 5 s), or a slow but healthy acknowledgement would be cut off and
+//!   re-sent. The broker list learnt from metadata is replaced (not merged)
+//!   on every refresh and capped at [`MAX_BROKERS`] entries.
+//! * Name resolution: IP-literal addresses (`10.0.0.5:9092`,
+//!   `[fd00::5]:9092`) are used directly. Host names are resolved by the
+//!   system resolver on a helper thread, waited for at most
+//!   `connect_timeout`; a resolver that hangs longer fails the attempt (the
+//!   thread is abandoned and finishes on its own) and at most
+//!   [`MAX_RESOLVER_THREADS`] such threads may be outstanding at once, so a
+//!   dead DNS server cannot pile up threads. On an air-gapped SOC network,
+//!   prefer IP literals (and advertised listeners that are IP literals).
 
 use super::batch::{encode_batch, ProduceRecord, BATCH_OVERHEAD};
 use super::errors::{self, classify, ErrorClass};
@@ -34,8 +47,16 @@ use super::wire::DecodeError;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::io::{self, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
+
+/// Most brokers kept from a metadata response.
+pub const MAX_BROKERS: usize = 1024;
+/// Most outstanding name-resolution helper threads (process-wide).
+pub const MAX_RESOLVER_THREADS: usize = 4;
+static RESOLVERS: AtomicUsize = AtomicUsize::new(0);
 
 /// Producer settings. [`ProducerConfig::new`] gives safe defaults.
 #[derive(Debug, Clone)]
@@ -68,7 +89,8 @@ impl ProducerConfig {
             bootstrap,
             client_id: "robodr-kafka-publish".into(),
             connect_timeout: Duration::from_secs(10),
-            request_timeout: Duration::from_secs(30),
+            // Must exceed produce_timeout_ms (checked).
+            request_timeout: Duration::from_secs(35),
             produce_timeout_ms: 30_000,
             delivery_timeout: Duration::from_secs(120),
             max_request_bytes: 1024 * 1024,
@@ -99,6 +121,12 @@ impl ProducerConfig {
         }
         if self.request_timeout.is_zero() || self.connect_timeout.is_zero() {
             return bad("timeouts must be > 0");
+        }
+        if self.request_timeout <= Duration::from_millis(self.produce_timeout_ms as u64) {
+            return bad(
+                "request_timeout must exceed produce_timeout_ms (the broker may wait that long \
+                 for acknowledgements before answering)",
+            );
         }
         Ok(())
     }
@@ -203,6 +231,77 @@ struct Conn {
     metadata_v: i16,
 }
 
+/// Write all of `buf` before `deadline` (the write timeout is re-armed with
+/// the remaining time before every `write`, so a peer that drains slowly
+/// cannot extend the exchange).
+fn write_all_deadline(s: &mut TcpStream, mut buf: &[u8], deadline: Instant) -> io::Result<()> {
+    while !buf.is_empty() {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "request timed out"));
+        }
+        s.set_write_timeout(Some(deadline - now))?;
+        match s.write(buf) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "broker closed the connection",
+                ))
+            }
+            Ok(n) => buf = &buf[n..],
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "request timed out"))
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Resolve `addr` (`host:port`). IP literals never touch the resolver;
+/// host names are resolved on a helper thread waited for at most `timeout`
+/// (see the module docs).
+fn resolve(addr: &str, timeout: Duration) -> io::Result<Vec<SocketAddr>> {
+    if let Ok(a) = addr.parse::<SocketAddr>() {
+        return Ok(vec![a]);
+    }
+    // Claim a resolver slot.
+    let mut cur = RESOLVERS.load(Ordering::Acquire);
+    loop {
+        if cur >= MAX_RESOLVER_THREADS {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{addr}: too many name lookups outstanding (resolver hanging?)"),
+            ));
+        }
+        match RESOLVERS.compare_exchange(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => break,
+            Err(v) => cur = v,
+        }
+    }
+    let (tx, rx) = mpsc::channel();
+    let owned = addr.to_string();
+    let spawned = std::thread::Builder::new()
+        .name("robodr-kafka-dns".into())
+        .spawn(move || {
+            let r = owned.to_socket_addrs().map(|i| i.collect::<Vec<_>>());
+            RESOLVERS.fetch_sub(1, Ordering::AcqRel);
+            let _ = tx.send(r);
+        });
+    if let Err(e) = spawned {
+        RESOLVERS.fetch_sub(1, Ordering::AcqRel);
+        return Err(e);
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(r) => r,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("{addr}: name resolution timed out"),
+        )),
+    }
+}
+
 fn read_exact_deadline(s: &mut TcpStream, buf: &mut [u8], deadline: Instant) -> io::Result<()> {
     let mut off = 0;
     while off < buf.len() {
@@ -248,9 +347,7 @@ impl Conn {
             )));
         }
         let deadline = Instant::now() + cfg.request_timeout;
-        self.stream.set_write_timeout(Some(cfg.request_timeout))?;
-        self.stream.write_all(&frame)?;
-        self.stream.flush()?;
+        write_all_deadline(&mut self.stream, &frame, deadline)?;
         let mut len = [0u8; 4];
         read_exact_deadline(&mut self.stream, &mut len, deadline)?;
         let n = i32::from_be_bytes(len);
@@ -271,7 +368,7 @@ impl Conn {
 
     fn open(addr: &str, cfg: &ProducerConfig, corr: &mut i32) -> Result<Conn, NetError> {
         let mut last = None;
-        let addrs = addr.to_socket_addrs()?;
+        let addrs = resolve(addr, cfg.connect_timeout)?;
         let mut stream = None;
         for a in addrs {
             match TcpStream::connect_timeout(&a, cfg.connect_timeout) {
@@ -465,8 +562,14 @@ impl Producer {
     }
 
     fn apply_metadata(&mut self, topic: &str, m: proto::MetadataResponse) -> Result<(), Retry> {
+        // The response's broker list replaces ours (bounded): brokers that
+        // left the cluster are forgotten, with their connections.
+        let mut fresh: HashMap<i32, String> = HashMap::new();
         for b in &m.brokers {
-            if !(1..=65535).contains(&b.port) || b.host.is_empty() {
+            if fresh.len() >= MAX_BROKERS {
+                break;
+            }
+            if !(1..=65535).contains(&b.port) || b.host.is_empty() || b.host.len() > 255 {
                 continue;
             }
             let addr = if b.host.contains(':') && !b.host.starts_with('[') {
@@ -474,12 +577,15 @@ impl Producer {
             } else {
                 format!("{}:{}", b.host, b.port)
             };
-            if self.brokers.get(&b.node_id) != Some(&addr) {
-                // Address changed: drop a connection to the old one.
-                self.conns.remove(&b.node_id);
-                self.brokers.insert(b.node_id, addr);
-            }
+            fresh.insert(b.node_id, addr);
         }
+        // Keep a connection only to a broker still listed at the same address.
+        self.conns.retain(|id, _| {
+            fresh
+                .get(id)
+                .is_some_and(|a| self.brokers.get(id) == Some(a))
+        });
+        self.brokers = fresh;
         let Some(t) = m.topics.iter().find(|t| t.name == topic) else {
             return Err(Retry::Again(format!("metadata did not include {topic}")));
         };
@@ -884,6 +990,85 @@ mod tests {
         assert!(Producer::new(c).is_err());
         let c = ProducerConfig::new(vec!["127.0.0.1:1".into()]);
         assert!(Producer::new(c).is_ok());
+    }
+
+    #[test]
+    fn request_timeout_must_exceed_produce_timeout() {
+        let d = ProducerConfig::new(vec!["127.0.0.1:1".into()]);
+        assert!(
+            d.request_timeout > Duration::from_millis(d.produce_timeout_ms as u64),
+            "defaults are consistent"
+        );
+        let mut c = d.clone();
+        c.request_timeout = Duration::from_millis(c.produce_timeout_ms as u64);
+        assert!(matches!(Producer::new(c), Err(ProduceError::Config(_))));
+        let mut c = d.clone();
+        c.request_timeout = Duration::from_secs(1);
+        c.produce_timeout_ms = 999;
+        assert!(Producer::new(c).is_ok());
+        let mut c = d;
+        c.produce_timeout_ms = i32::MAX;
+        assert!(Producer::new(c).is_err());
+    }
+
+    #[test]
+    fn ip_literals_skip_the_resolver() {
+        let t = Duration::from_millis(1);
+        assert_eq!(
+            resolve("10.0.0.5:9092", t).unwrap(),
+            vec!["10.0.0.5:9092".parse::<SocketAddr>().unwrap()]
+        );
+        assert_eq!(
+            resolve("[fd00::5]:9092", t).unwrap(),
+            vec!["[fd00::5]:9092".parse::<SocketAddr>().unwrap()]
+        );
+        // Malformed: an error, never a panic.
+        assert!(resolve("no-port", Duration::from_secs(2)).is_err());
+    }
+
+    fn meta(brokers: Vec<proto::Broker>) -> proto::MetadataResponse {
+        proto::MetadataResponse {
+            brokers,
+            topics: vec![proto::TopicMeta {
+                error_code: 0,
+                name: "t".into(),
+                partitions: vec![proto::PartitionMeta {
+                    error_code: 0,
+                    partition: 0,
+                    leader: 1,
+                }],
+            }],
+        }
+    }
+
+    fn broker(id: i32, host: &str) -> proto::Broker {
+        proto::Broker {
+            node_id: id,
+            host: host.into(),
+            port: 9092,
+        }
+    }
+
+    #[test]
+    fn broker_map_is_replaced_and_capped() {
+        let mut p = Producer::new(ProducerConfig::new(vec!["127.0.0.1:1".into()])).unwrap();
+        // A hostile response with a huge broker list is capped.
+        let many: Vec<_> = (0..(MAX_BROKERS as i32 + 500))
+            .map(|i| broker(i, "10.0.0.1"))
+            .collect();
+        assert!(p.apply_metadata("t", meta(many)).is_ok());
+        assert_eq!(p.brokers.len(), MAX_BROKERS);
+        // The next refresh replaces the list: departed brokers are gone.
+        let r = p.apply_metadata("t", meta(vec![broker(1, "10.0.0.2"), broker(7, "fd00::7")]));
+        assert!(r.is_ok());
+        assert_eq!(p.brokers.len(), 2);
+        assert_eq!(p.brokers[&1], "10.0.0.2:9092");
+        assert_eq!(p.brokers[&7], "[fd00::7]:9092");
+        // Invalid entries are skipped.
+        let mut bad = broker(3, "");
+        bad.port = 0;
+        assert!(p.apply_metadata("t", meta(vec![bad])).is_ok());
+        assert!(p.brokers.is_empty());
     }
 
     #[test]

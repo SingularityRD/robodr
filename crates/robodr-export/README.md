@@ -45,8 +45,11 @@ half-finished batch).
    `robodr_ocsf::parse_and_validate`. A failing record is **moved** to
    `<spool>/rejected/` (with `<name>.reason.json`), never deleted.
 2. Cut the batch exactly as the packer's planner would (data bytes and
-   finding count), so that one `Packer::pack` call writes **one** diode
-   batch. (`--max-batch-bytes` / `--max-findings` set both sides.)
+   finding count, parity included), so that one `Packer::pack` call writes
+   **one** diode batch. (`--max-batch-bytes` / `--max-findings` set both
+   sides; the binary opens with `Exporter::open_checked`, which refuses an
+   `ExportConfig` whose limits differ from the `PackConfig`, or a packer
+   state of another unit. Library users: `ExportConfig::for_packer`.)
 3. Write the intent `{batch_seq: packer.next_seq, spool_seqs}` to the state
    file (atomic replace).
 4. `Packer::pack`: stage, commit the packer state, rename, fsync.
@@ -58,13 +61,16 @@ half-finished batch).
 | before 3 | nothing to do; records still in `ready/` |
 | after 3, before the packer commit | `packer.next_seq == intent.batch_seq`: intent dropped, records re-packed under the **same** diode sequence (that number was never visible) |
 | after the packer commit, before its rename | `Packer::open` publishes the staged batch; then as below |
-| after 4 (batch published), before/while 5 | `packer.next_seq > intent.batch_seq`: records acknowledged, **not** re-packed |
+| after 4 (batch published), before/while 5 | `packer.next_seq > intent.batch_seq`: a record is acknowledged only if its exact packed line is in a committed batch `intent.batch_seq..next_seq` read back from the outbox or the packer archive (`findings.jsonl` checked against `MANIFEST.json` size + SHA-256); proven records are **not** re-packed |
+| a split `pack` (limits differ) failing after its first batch | the records of the committed batch(es) are acknowledged, the rest stay in `ready/` (`recovered: "partial"`) |
+| committed batch neither in the outbox nor in the archive (`archive_keep = 0`, already transferred) | its records cannot be proven; they stay in `ready/` and are packed again (duplicate, never loss) |
 | after 5 | intent cleared or re-acknowledged idempotently (a record already in `acked/`, or pruned from it by agentd, counts as done) |
 
 Every case is a test in `tests/pipeline.rs` (fail points `AfterIntent`,
 `AfterPack`, `AfterFirstAck`, and a hand-rewound "committed but not
 renamed" outbox), each followed by a diode import that must yield every
-finding exactly once.
+finding exactly once; the split-pack cases are in
+`tests/review_regressions.rs`.
 
 ## `robodr-kafka-publish` (SOC side)
 
@@ -72,7 +78,7 @@ finding exactly once.
 robodr-kafka-publish --bootstrap kafka-1:9092 [--bootstrap kafka-2:9092] \
   --state-dir /var/lib/robodr/publish (--diode-out /srv/diode/out | --spool /srv/site/spool) \
   [--topic robot-edr.findings] [--chunk 500] [--client-id S] [--request-timeout-ms N] \
-  [--delivery-timeout-ms N] [--retries N] [--max-request-bytes N] [--interval-ms 2000] [--once]
+  [--produce-timeout-ms N] [--delivery-timeout-ms N] [--retries N] [--max-request-bytes N] [--interval-ms 2000] [--once]
 ```
 
 * **Input.** Diode: every non-dot directory of the importer's `out/`
@@ -98,17 +104,27 @@ robodr-kafka-publish --bootstrap kafka-1:9092 [--bootstrap kafka-2:9092] \
   a diode must not arrive already past a 7-day retention; the finding's own
   time is `ocsf.time` in the value.
 * **Commit.** Records go out in chunks of `--chunk`; once a chunk is fully
-  acknowledged (`acks=all`), `<state>/progress.json` `{batch,
-  lines_committed}` is replaced atomically. A finished batch gets
-  `<state>/done/<batch>` and is skipped from then on. After a crash a batch
-  resumes after its last committed line: at most one chunk (plus whatever a
-  lost Produce response covered) is sent twice. For a spool source the
-  commit is the rename to `acked/`.
+  acknowledged (`acks=all`), `<state>/progress.json` (format
+  `robodr-kafka-publish-state/2`, `{in_flight: {batch: lines_committed}}`)
+  is replaced atomically. The offset is kept **per batch**, so a batch
+  imported (and published) while another one was half-done does not reset
+  it. A finished batch gets `<state>/done/<batch>`, loses its `in_flight`
+  entry and is skipped from then on; entries of batches gone from `out/`
+  are pruned, and the map is capped at 1024 entries (beyond that the entry
+  with the fewest committed lines is dropped: that batch is re-sent, never
+  lost). After a crash each batch resumes after its last committed line: at
+  most one chunk per interrupted batch (plus whatever a lost Produce
+  response covered) is sent twice. A version-1 file (`{batch,
+  lines_committed}`) is migrated on open. For a spool source the commit is
+  the rename to `acked/`.
 * **Dead letters.** A record that fails validation, or that Kafka rejects
   as a record (`MESSAGE_TOO_LARGE`, `INVALID_RECORD`, ...), is appended to
   `<state>/dead-letter.jsonl` (`{source, position, reason, record, at_ms}`)
-  and skipped (spool source: moved to `<spool>/rejected/`). Any other Kafka
-  error stops the run without committing; the next run retries.
+  and skipped (spool source: moved to `<spool>/rejected/`). Entries are
+  deduplicated on `(source, position)`, so a chunk re-processed after a
+  crash does not append its dead letters again (the index is read from the
+  file on the first dead letter of a run; 16 bytes per entry). Any other
+  Kafka error stops the run without committing; the next run retries.
 
 ## The Kafka client (`src/kafka/`)
 
@@ -118,7 +134,7 @@ robodr-kafka-publish --bootstrap kafka-1:9092 [--bootstrap kafka-2:9092] \
 | `wire` | int8/16/32/64, STRING, NULLABLE_STRING, NULLABLE_BYTES, ARRAY, zig-zag VARINT/VARLONG; bounds-checked reader (array counts checked against remaining bytes) |
 | `batch` | RecordBatch v2: magic 2, CRC-32C over attributes..end, attributes 0 (no compression, CreateTime, non-transactional), producerId/epoch/baseSequence -1, per-record varints, headers. Decoder (for tests/fake broker) verifies CRC and lengths |
 | `proto` | ApiVersions v0; Metadata v1–8; Produce v3–8 (all non-flexible); request header v1, response header v0 |
-| `client` | `Producer`: connect timeout, hard per-request deadline, `max_request_bytes` (1 MiB) and `max_response_bytes` (16 MiB) bounds, correlation-id check, version negotiation per connection, metadata (no auto-create), leader routing, `acks=-1`, one request in flight, retries with exponential backoff (100 ms … 10 s, 10 rounds without progress), `delivery_timeout` (120 s), record-level errors narrowed down by re-sending one record at a time |
+| `client` | `Producer`: connect timeout, hard per-request deadline covering the request write and the response read (default 35 s, must exceed `produce_timeout_ms`, default 30 s; checked), name resolution on a bounded helper thread (≤ 4 outstanding, waited ≤ `connect_timeout`; IP literals bypass it), broker list replaced on every metadata refresh and capped at 1024, `max_request_bytes` (1 MiB) and `max_response_bytes` (16 MiB) bounds, correlation-id check, version negotiation per connection, metadata (no auto-create), leader routing, `acks=-1`, one request in flight, retries with exponential backoff (100 ms … 10 s, 10 rounds without progress), `delivery_timeout` (120 s), record-level errors narrowed down by re-sending one record at a time |
 
 Error handling: `NOT_LEADER_OR_FOLLOWER`, `LEADER_NOT_AVAILABLE`,
 `UNKNOWN_TOPIC_OR_PARTITION`, `NETWORK_EXCEPTION`, `KAFKA_STORAGE_ERROR`,
@@ -181,6 +197,11 @@ the connection and retry.
   partition still holds (one request in flight), but a lost response
   duplicates a request's records. Consumers must drop duplicates on
   `event-uid` (contract §2 already allows it).
+* **DNS.** Host names (bootstrap and advertised listeners) go through the
+  system resolver on a helper thread; a lookup that outlives
+  `connect_timeout` fails the attempt and its thread is abandoned (at most
+  4 at a time, further lookups fail fast until they finish). On an
+  air-gapped SOC network use IP literals.
 * Only non-flexible API versions (Metadata ≤ 8, Produce ≤ 8). A broker
   that no longer offers them is refused (`Unsupported`), not mis-spoken to.
 * No compression; no transactions; one request in flight, single thread —

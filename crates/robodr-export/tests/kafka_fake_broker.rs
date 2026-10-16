@@ -13,6 +13,7 @@ fn cfg(c: &Cluster) -> ProducerConfig {
     p.retry_backoff = Duration::from_millis(5);
     p.retry_backoff_max = Duration::from_millis(50);
     p.request_timeout = Duration::from_secs(5);
+    p.produce_timeout_ms = 1_000;
     p.delivery_timeout = Duration::from_secs(30);
     p
 }
@@ -188,6 +189,7 @@ fn hostile_or_silent_broker_times_out_and_recovers() {
     c.script([Action::Garbage, Action::Hang]);
     let mut cf = cfg(&c);
     cf.request_timeout = Duration::from_millis(300);
+    cf.produce_timeout_ms = 100;
     let mut p = Producer::new(cf).unwrap();
     let out = p.send(TOPIC, &recs(2, 1)).unwrap();
     assert_eq!(delivered(&out), 2);

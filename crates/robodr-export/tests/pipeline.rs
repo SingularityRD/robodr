@@ -403,7 +403,8 @@ fn publisher_crash_after_send_duplicates_at_most_one_chunk() {
     let mut cfg = PublishConfig::new(Source::DiodeOut(out), &r.soc_state);
     cfg.chunk_records = 3;
     let mut p = Publisher::open(cfg, producer(&c)).unwrap();
-    assert_eq!(p.progress().lines_committed, 3);
+    let batch = Robot::names(&r.high.join("out")).pop().unwrap();
+    assert_eq!(p.progress().lines_committed(&batch), 3);
     let rep = p.run_once().unwrap();
     assert_eq!(rep.resumed_after, 3);
     assert_eq!(rep.published, 7);
@@ -488,7 +489,7 @@ fn publisher_stops_on_fatal_kafka_error_without_committing() {
     )
     .unwrap();
     assert!(p.run_once().is_err());
-    assert_eq!(p.progress().lines_committed, 0);
+    assert!(p.progress().in_flight.is_empty());
     assert!(fs::read_dir(r.soc_state.join("done"))
         .unwrap()
         .next()

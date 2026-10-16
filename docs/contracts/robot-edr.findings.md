@@ -584,8 +584,14 @@ The two hops around the diode are implemented in `crates/robodr-export`
   `robodr_diode::Packer` (one diode batch per step) and renames them into
   `acked/` only after the batch is committed and renamed into the outbox. An
   intent journal (`{batch_seq, spool_seqs}`) makes a crash at any point
-  recoverable without loss or re-packing; records leave `ready/` only by
-  rename (to `acked/`, or to `rejected/` if invalid), never by deletion.
+  recoverable without loss; on recovery a record is acknowledged only if it
+  is proven to be in a committed batch (its packed line read back from the
+  outbox or the packer archive and checked against the manifest), so a
+  `pack` that the packer split and that failed half-way never acknowledges
+  unpacked records (unprovable ones are packed again: a duplicate, never a
+  loss). The binary refuses exporter planner limits that differ from the
+  packer's. Records leave `ready/` only by rename (to `acked/`, or to
+  `rejected/` if invalid), never by deletion.
 * **`robodr-kafka-publish`** (SOC side) publishes the importer's
   `out/<batch>/records.jsonl` (or a connected site's spool) to this topic
   with the §2 key and headers (re-derived from the validated value and
@@ -593,13 +599,17 @@ The two hops around the diode are implemented in `crates/robodr-export`
   carried verbatim as the last header, §2a) and the §4 partition rule,
   computed with the
   topic's current partition count. CreateTime is the publish time (the
-  finding time is `ocsf.time`). Progress is a per-batch committed line count
-  replaced atomically after each acknowledged chunk, plus a done marker per
-  batch; invalid or broker-rejected records go to a dead-letter file.
+  finding time is `ocsf.time`). Progress is a committed line count kept per
+  batch (a bounded map, so interleaved batches never reset each other's
+  offsets) replaced atomically after each acknowledged chunk, plus a done
+  marker per batch; invalid or broker-rejected records go to a dead-letter
+  file, deduplicated on (batch, line) across crashes.
 * **Producer settings actually used** (std-only client, not yet tested
   against a real broker): `acks=all`, **idempotence off**, one request in
   flight, no compression, **no TLS/SASL** (isolated network or local TLS
-  proxy). This deviates from §4's `enable.idempotence=true`: delivery is
+  proxy); a per-request deadline covering writes and reads that exceeds the
+  broker-side produce timeout; host names resolved with a timeout (IP
+  literals recommended). This deviates from §4's `enable.idempotence=true`: delivery is
   at-least-once and consumers must drop duplicates on `event-uid`.
   Per-partition order is preserved.
 

@@ -28,14 +28,45 @@
 //!
 //! Recovery on [`Exporter::open`]: `Packer::open` first finishes a batch
 //! that was committed but not renamed. Then, if an intent is pending:
-//! `packer.next_seq > intent.batch_seq` means step 3 committed, so the
-//! records are acknowledged (step 4, idempotent: a record already in
-//! `acked/` counts as done); otherwise nothing was published and the intent
-//! is dropped (the records are still in `ready/` and are packed again, under
-//! the same diode sequence number, which was never visible).
+//!
+//! * `packer.next_seq <= intent.batch_seq`: nothing was committed; the
+//!   intent is dropped (the records are still in `ready/` and are packed
+//!   again, under the same diode sequence number, which was never visible).
+//! * otherwise at least one batch was committed. A record is acknowledged
+//!   only if it is **proven** to be in a committed batch: the batches
+//!   `intent.batch_seq .. packer.next_seq` (at most one per intent record)
+//!   are read back from the outbox or, once the transfer agent has taken
+//!   them, from the packer archive (`<pack-state>.archive/`); the
+//!   `findings.jsonl` must match its `MANIFEST.json` entry (size and
+//!   SHA-256) and the manifest must name this unit and sequence. A record
+//!   still in `ready/` is acknowledged iff its exact packed line
+//!   ([`robodr_ocsf::to_json`] of the re-validated value) occurs in one of
+//!   them; a record already in `acked/` counts as done. Everything else
+//!   stays in `ready/` and is packed again (`recovered = "partial"`).
+//!
+//! This matters when the packer splits one exporter step into several
+//! batches (its limits differ from the exporter's) and a later batch of the
+//! same `pack` call fails: the records of the failed batch were never
+//! packed and must not be acknowledged. If a committed batch can be found
+//! neither in the outbox nor in the archive (`archive_keep = 0` and already
+//! transferred), its records cannot be proven and are packed again: a
+//! duplicate, never a loss (consumers deduplicate on `event-uid`).
 //!
 //! `ready/` is never deleted from; records leave it only by rename (to
 //! `acked/` after publication, or to `rejected/`).
+//!
+//! # Planner limits
+//!
+//! The exporter cuts each step with the packer's planner rule, so the
+//! packer writes it as one batch. [`Exporter::open_checked`] (used by the
+//! `robodr-spool-export` binary) refuses an [`ExportConfig`] whose limits
+//! (`max_batch_bytes`, `max_findings_per_batch`, `parity_shards`,
+//! `shard_size`) differ from the [`PackConfig`] the packer was opened with,
+//! or a packer state of another unit; [`ExportConfig::for_packer`] derives
+//! matching limits. [`Exporter::open`] cannot check (`Packer` does not
+//! expose its configuration); a mismatch there is detected after the first
+//! split `pack` (an error is returned) and, thanks to the proof-based
+//! recovery above, never loses records.
 //!
 //! # Limits
 //!
@@ -48,9 +79,14 @@
 
 use crate::fsutil::{self, ReadError};
 use robodr_agentd::spool::{SpoolRecord, SPOOL_SCHEMA};
-use robodr_diode::{PackError, Packer, PublishedBatch};
+use robodr_diode::manifest::{
+    batch_dir_name, file_sha256, parity_len, FileKind, Manifest, FINDINGS_FILE, MANIFEST_FILE,
+    MAX_MANIFEST_BYTES,
+};
+use robodr_diode::{PackConfig, PackError, Packer, PublishedBatch};
 use robodr_ocsf::{FindingEnvelope, KAFKA_TOPIC};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -86,6 +122,11 @@ pub struct ExportConfig {
     pub max_batch_bytes: u64,
     /// Must equal the packer's `max_findings_per_batch`.
     pub max_findings_per_batch: usize,
+    /// Must equal the packer's `parity_shards` (parity counts against
+    /// `max_batch_bytes`).
+    pub parity_shards: usize,
+    /// Must equal the packer's `shard_size` (used only with parity).
+    pub shard_size: u64,
     #[doc(hidden)]
     pub fail_point: Option<FailPoint>,
 }
@@ -101,8 +142,74 @@ impl ExportConfig {
             state_path: state_path.into(),
             max_batch_bytes: robodr_diode::pack::DEFAULT_MAX_BATCH_BYTES,
             max_findings_per_batch: robodr_diode::pack::DEFAULT_MAX_FINDINGS_PER_BATCH,
+            parity_shards: 0,
+            shard_size: robodr_diode::pack::DEFAULT_SHARD_SIZE,
             fail_point: None,
         }
+    }
+
+    /// [`ExportConfig::new`] with the planner limits taken from `pack`.
+    pub fn for_packer(
+        spool: impl Into<PathBuf>,
+        state_path: impl Into<PathBuf>,
+        pack: &PackConfig,
+    ) -> Self {
+        let mut c = Self::new(spool, state_path);
+        c.max_batch_bytes = pack.max_batch_bytes;
+        c.max_findings_per_batch = pack.max_findings_per_batch;
+        c.parity_shards = pack.parity_shards;
+        c.shard_size = pack.shard_size;
+        c
+    }
+
+    /// `Err` naming every planner limit that differs from `pack`.
+    pub fn check_against(&self, pack: &PackConfig) -> Result<(), ExportError> {
+        let mut diff = Vec::new();
+        if self.max_batch_bytes != pack.max_batch_bytes {
+            diff.push(format!(
+                "max_batch_bytes {} != packer {}",
+                self.max_batch_bytes, pack.max_batch_bytes
+            ));
+        }
+        if self.max_findings_per_batch != pack.max_findings_per_batch {
+            diff.push(format!(
+                "max_findings_per_batch {} != packer {}",
+                self.max_findings_per_batch, pack.max_findings_per_batch
+            ));
+        }
+        if self.parity_shards != pack.parity_shards {
+            diff.push(format!(
+                "parity_shards {} != packer {}",
+                self.parity_shards, pack.parity_shards
+            ));
+        }
+        if self.parity_shards > 0 && self.shard_size != pack.shard_size {
+            diff.push(format!(
+                "shard_size {} != packer {}",
+                self.shard_size, pack.shard_size
+            ));
+        }
+        if diff.is_empty() {
+            Ok(())
+        } else {
+            Err(ExportError::Config(format!(
+                "exporter planner limits differ from the packer's ({}); use \
+                 ExportConfig::for_packer",
+                diff.join(", ")
+            )))
+        }
+    }
+
+    /// Bytes a findings-only batch of `data` bytes occupies with parity
+    /// (the packer's rule: one data file, so parity files are `data` long,
+    /// rounded up to `shard_size`).
+    fn batch_size(&self, data: u64) -> u64 {
+        if self.parity_shards == 0 || self.shard_size == 0 {
+            return data;
+        }
+        data.saturating_add(
+            (self.parity_shards as u64).saturating_mul(parity_len(data, self.shard_size)),
+        )
     }
 }
 
@@ -177,8 +284,9 @@ pub struct ExportReport {
     pub batches: Vec<PublishedBatch>,
     pub exported: u64,
     pub rejected: Vec<Rejected>,
-    /// A pending intent found at open: `"acked"` (batch had been published)
-    /// or `"dropped"` (it had not).
+    /// A pending intent found at open: `"acked"` (every record proven
+    /// published), `"partial"` (some could not be proven and stay in
+    /// `ready/`) or `"dropped"` (nothing had been committed).
     pub recovered: Option<String>,
 }
 
@@ -223,14 +331,95 @@ fn list_ready(dir: &Path) -> io::Result<Vec<(u64, String)>> {
     Ok(v)
 }
 
+fn exists_nofollow(p: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(p) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// The `findings.jsonl` text of batch directory `dir`, if it holds the
+/// committed batch `seq` of `unit`: the manifest names that unit and
+/// sequence, and the findings file matches its manifest entry (size and
+/// SHA-256). `None` when absent, unreadable or not matching (callers then
+/// treat its records as unproven, which is safe). The signature is not
+/// checked: the exporter only reads back what its own packer wrote.
+fn read_verified_findings(dir: &Path, unit: &str, seq: u64) -> io::Result<Option<String>> {
+    let mbytes = match fsutil::read_capped(&dir.join(MANIFEST_FILE), MAX_MANIFEST_BYTES as u64) {
+        Ok(b) => b,
+        Err(ReadError::Io(e)) => return Err(e),
+        Err(_) => return Ok(None),
+    };
+    let Ok(m) = serde_json::from_slice::<Manifest>(&mbytes) else {
+        return Ok(None);
+    };
+    if m.unit_id != unit || m.batch_seq != seq {
+        return Ok(None);
+    }
+    let Some(entry) = m
+        .files
+        .iter()
+        .find(|f| f.name == FINDINGS_FILE && f.kind == FileKind::Findings)
+    else {
+        // A bundle-only batch holds none of our records.
+        return Ok(Some(String::new()));
+    };
+    let max = entry.size.min(robodr_diode::pack::MAX_BATCH_BYTES);
+    let data = match fsutil::read_capped(&dir.join(FINDINGS_FILE), max) {
+        Ok(b) => b,
+        Err(ReadError::Io(e)) => return Err(e),
+        Err(_) => return Ok(None),
+    };
+    if data.len() as u64 != entry.size || file_sha256(&data) != entry.sha256 {
+        return Ok(None);
+    }
+    Ok(String::from_utf8(data).ok())
+}
+
 impl Exporter {
+    /// [`Exporter::open`] after checking that `cfg`'s planner limits equal
+    /// `pack` (the configuration `packer` was opened with) and that the
+    /// packer state belongs to `pack.unit_id`; a mismatch is refused with
+    /// [`ExportError::Config`] before anything is touched.
+    pub fn open_checked(
+        cfg: ExportConfig,
+        pack: &PackConfig,
+        packer: Packer,
+    ) -> Result<Self, ExportError> {
+        cfg.check_against(pack)?;
+        if packer.state().unit_id != pack.unit_id {
+            return Err(ExportError::Config(format!(
+                "packer state is for unit {:?}, configuration for {:?}",
+                packer.state().unit_id,
+                pack.unit_id
+            )));
+        }
+        Self::open(cfg, packer)
+    }
+
     /// Open the packer (which finishes a committed batch) and the exporter
     /// state, then resolve a pending intent (see the module docs).
+    ///
+    /// The planner limits cannot be compared with `packer`'s here; prefer
+    /// [`Exporter::open_checked`].
     pub fn open(cfg: ExportConfig, packer: Packer) -> Result<Self, ExportError> {
         if cfg.max_findings_per_batch == 0 {
             return Err(ExportError::Config(
                 "max_findings_per_batch must be >= 1".into(),
             ));
+        }
+        let (lo, hi) = (
+            robodr_diode::pack::MIN_BATCH_BYTES,
+            robodr_diode::pack::MAX_BATCH_BYTES,
+        );
+        if !(lo..=hi).contains(&cfg.max_batch_bytes) {
+            return Err(ExportError::Config(format!(
+                "max_batch_bytes must be in {lo}..={hi}"
+            )));
+        }
+        if cfg.parity_shards > 0 && cfg.shard_size == 0 {
+            return Err(ExportError::Config("shard_size must be > 0".into()));
         }
         let ready = cfg.spool.join("ready");
         let acked = cfg.spool.join("acked");
@@ -273,9 +462,10 @@ impl Exporter {
         };
         if let Some(intent) = x.state.pending.clone() {
             if x.packer.state().next_seq > intent.batch_seq {
-                x.ack(&intent.spool_seqs, false)?;
-                x.state.exported += intent.spool_seqs.len() as u64;
-                x.recovered = Some("acked".into());
+                let (proven, unproven) = x.proven_records(&intent)?;
+                x.ack(&proven, false)?;
+                x.state.exported += proven.len() as u64;
+                x.recovered = Some(if unproven == 0 { "acked" } else { "partial" }.into());
             } else {
                 x.recovered = Some("dropped".into());
             }
@@ -287,6 +477,65 @@ impl Exporter {
 
     pub fn packer(&self) -> &Packer {
         &self.packer
+    }
+
+    /// The recovery verdict of [`Exporter::open`] (see
+    /// [`ExportReport::recovered`]) until the next [`Exporter::run_once`]
+    /// reports it.
+    pub fn recovered(&self) -> Option<&str> {
+        self.recovered.as_deref()
+    }
+
+    /// Split a pending intent whose batch(es) were (at least partly)
+    /// committed into `(records proven published, count left in ready/)`.
+    fn proven_records(&self, intent: &Intent) -> Result<(Vec<u64>, usize), ExportError> {
+        // A split cannot produce more batches than records; a larger gap
+        // means someone else used the packer, and those batches are not ours.
+        let end = self.packer.state().next_seq.min(
+            intent
+                .batch_seq
+                .saturating_add(intent.spool_seqs.len() as u64),
+        );
+        let mut lines: HashSet<String> = HashSet::new();
+        for seq in intent.batch_seq..end {
+            self.committed_lines(seq, &mut lines)?;
+        }
+        let mut proven = Vec::new();
+        let mut unproven = 0;
+        for &seq in &intent.spool_seqs {
+            let name = record_name(seq);
+            if !exists_nofollow(&self.ready.join(&name))? {
+                // Already acknowledged (or pruned from acked/ by agentd).
+                proven.push(seq);
+                continue;
+            }
+            match self.load(seq, &name)? {
+                Ok((_, line)) if lines.contains(&line) => proven.push(seq),
+                // Not in a committed batch, or no longer valid (run_once
+                // rejects it): leave it in ready/.
+                _ => unproven += 1,
+            }
+        }
+        Ok((proven, unproven))
+    }
+
+    /// Add the findings lines of committed batch `seq` to `out`, read from
+    /// the outbox or else the packer archive and checked against the batch
+    /// manifest. A batch found in neither (or failing the check) adds
+    /// nothing: its records are then not proven and get packed again.
+    fn committed_lines(&self, seq: u64, out: &mut HashSet<String>) -> Result<(), ExportError> {
+        let unit = &self.packer.state().unit_id;
+        let name = batch_dir_name(unit, seq);
+        for dir in [
+            self.packer.outbox().join(&name),
+            self.packer.archive().join(&name),
+        ] {
+            if let Some(text) = read_verified_findings(&dir, unit, seq)? {
+                out.extend(text.lines().map(str::to_string));
+                return Ok(());
+            }
+        }
+        Ok(())
     }
 
     fn save(&self) -> Result<(), ExportError> {
@@ -345,12 +594,13 @@ impl Exporter {
         Ok(())
     }
 
-    /// Check one spool file; `Err(reason)` rejects it.
+    /// Check one spool file; `Err(reason)` rejects it. `Ok` carries the
+    /// exact line the packer will write for it (without the newline).
     fn load(
         &self,
         seq: u64,
         name: &str,
-    ) -> Result<Result<(FindingEnvelope, usize), String>, ExportError> {
+    ) -> Result<Result<(FindingEnvelope, String), String>, ExportError> {
         let bytes = match fsutil::read_capped(&self.ready.join(name), MAX_SPOOL_FILE) {
             Ok(b) => b,
             Err(ReadError::Io(e)) => return Err(e.into()),
@@ -391,7 +641,7 @@ impl Exporter {
             Ok(l) => l,
             Err(_) => return Ok(Err("finding cannot be emitted (to_json)".into())),
         };
-        Ok(Ok((env, line.len() + 1)))
+        Ok(Ok((env, line)))
     }
 
     /// Export everything currently in `ready/`. `now_ms` is the batches'
@@ -423,12 +673,12 @@ impl Exporter {
                             self.reject(&name, reason, &mut report)?;
                         }
                     }
-                    Ok((env, len)) => {
-                        let len = len as u64;
+                    Ok((env, line)) => {
+                        let len = line.len() as u64 + 1;
                         // The packer's planner: start a new batch when this
                         // finding would overflow either bound.
                         if !envs.is_empty()
-                            && (bytes + len > self.cfg.max_batch_bytes
+                            && (self.cfg.batch_size(bytes + len) > self.cfg.max_batch_bytes
                                 || envs.len() >= self.cfg.max_findings_per_batch)
                         {
                             break;
