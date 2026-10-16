@@ -60,6 +60,13 @@
 //! `min_bad_fraction` (default 25 %) of its samples. Interleaved good samples
 //! therefore only dilute an episode, they cannot reset it; samples with no
 //! basis to judge (NaN, unspecified axis) are neither good nor bad.
+//! For the command-model rules (divergence, uncommanded motion) a good
+//! sample arriving within `episode_hold_ns` (default 200 ms) of the latest
+//! bad one is also **neutral**: the episode is judged on the stream's worst
+//! sample per hold window (an upper envelope), not on the per-sample
+//! majority, so no mixing ratio of plausible values interleaved between
+//! real samples can dilute it. Neutral samples never count as bad, so the
+//! hold does not amplify sparse honest outliers.
 //! Integrity checks (stamps, non-finite) fire immediately but are latched
 //! per source and re-arm after `rearm_clean_samples` clean samples.
 //!
@@ -68,7 +75,7 @@
 //! | `robot.motion.feedback_divergence` | feedback outside the band while a non-rest command is in effect, over | High | The telemetry or the actuation is not what the command path says; either is an integrity failure on the control loop. |
 //! | ″ | opposite (signed feedback on the other side of zero from a signed command) | Critical if `|v| >= uncommanded_critical`, else High | Driving / turning against the command is as hazardous as uncommanded motion. |
 //! | ″ | ″ under-motion (moving less than commanded) | High if `safety_stop_signal_wired`, else Medium | An undeclared e-stop, obstacle or stall looks exactly like this. If the integrator wires the safety-stop state, an unexplained stall is suspicious; if not, it is too often legitimate to page at High. |
-//! | `robot.motion.uncommanded_motion` | command at rest (both latency ends) and feedback beyond the decaying band and the noise floor | Critical if `|v| >= uncommanded_critical`, else High | Motion nobody visibly commanded is either a command injected around the observed channel or a mechanical/safety fault; above walking-pace speeds it is a direct physical hazard. |
+//! | `robot.motion.uncommanded_motion` | command at rest (both latency ends) and feedback beyond the decaying band and the noise floor | Critical once `min_samples` of the episode's bad samples are `>= uncommanded_critical` (a latched High episode escalates to Critical, once), else High; evidence reports the episode's peak | Motion nobody visibly commanded is either a command injected around the observed channel or a mechanical/safety fault; above walking-pace speeds it is a direct physical hazard. |
 //! | `robot.motion.frozen_feedback` (`FrozenValues`) | ≥ `frozen_min_samples` bit-identical samples over ≥ `frozen_min_duration_ns` while the band says the robot is moving | High | Real sensors are noisy; a constant stream while moving is the replay/freeze signature. |
 //! | ″ (`TimestampAnomaly` backwards / future) | stamp earlier than the previous from the same source, or ahead of the observer clock by > `max_future_skew_ns` | High | Replay loops and a second (injected) publisher interleaving with the real one produce backwards stamps; future stamps mean a forged or broken clock. |
 //! | ″ (duplicate / late) | identical stamp; stamp older than `max_stamp_age_ns` on arrival | Medium | Also produced by benign driver bugs and stalled pipelines. Duplicates are dropped from value checks. |
@@ -206,12 +213,23 @@
 //!   multiple-publishers finding. Only the command check (if the fake is
 //!   inconsistent with commands) and the cross-check against an independent
 //!   sensor remain.
-//! * Without publisher attribution, an injector sending ≥ 4 "at rest"
-//!   samples per real one dilutes the uncommanded episode below 25 %; it is
-//!   then reported as `inconsistent_feedback_stream` (High), not as
-//!   uncommanded motion (Critical). The jump check needs `max_accel` on the
-//!   axis and is untuned: very noisy high-rate sensors (vibration, wheel
-//!   slip spikes) may need a larger `jump_accel_factor`.
+//! * Without publisher attribution, an injector interleaving "at rest"
+//!   samples with the real ones (same publisher id, any ratio, any level,
+//!   each jump below the jump tolerance) no longer dilutes the command-model
+//!   episodes **as long as real samples keep arriving at least every
+//!   `episode_hold_ns`**: set it above the slowest honest feedback period.
+//!   An injector that also *suppresses* real samples for longer than the
+//!   hold is a replacement, not an interleaving (see above). The jump check
+//!   (`inconsistent_feedback_stream`) needs `max_accel` on the axis and is
+//!   untuned: very noisy high-rate sensors (vibration, wheel slip spikes)
+//!   may need a larger `jump_accel_factor`. Neither check looks for
+//!   bimodality below the jump tolerance; the hold makes that unnecessary
+//!   for the command-model rules, but the cross-sensor rule still judges
+//!   the per-sample majority.
+//! * The hold also delays the end of a genuine episode by up to
+//!   `episode_hold_ns`, and a sensor that produces an out-of-band sample at
+//!   least every `episode_hold_ns` (e.g. > 5 sigma spikes several times a
+//!   second) is reported even if those samples are a small fraction.
 //! * [`publisher_id`] is a 32-bit FNV-1a hash; an adversary choosing its GUID
 //!   can collide with the real writer. Prefer interning GUIDs.
 //! * Commands built from [`robodr_events::MotionCommand`] carry no sign: no

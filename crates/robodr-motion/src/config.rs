@@ -108,7 +108,9 @@ impl AxisModel {
 /// Good samples interleaved between bad ones therefore cannot reset the run
 /// (a second publisher injecting "all is well" values between real ones only
 /// dilutes the fraction). Samples with no basis to judge (NaN, warm-up) are
-/// neither good nor bad.
+/// neither good nor bad. For the `divergence` and `uncommanded` rules, good
+/// samples within [`MonitorConfig::episode_hold_ns`] of the latest bad one
+/// are neutral as well, so they cannot dilute at all.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Persistence {
@@ -135,8 +137,9 @@ impl Default for Persistence {
     }
 }
 
-/// Default `min_bad_fraction`: an injector must send at least four
-/// "at rest" samples per real one to stay under it.
+/// Default `min_bad_fraction`. On its own an injector sending four "at
+/// rest" samples per real one would stay under it; `episode_hold_ns` closes
+/// that for the command-model rules.
 const DEFAULT_BAD_FRACTION: f64 = 0.25;
 
 /// Which checks apply to one feedback source, and how far it is trusted.
@@ -301,6 +304,16 @@ pub struct MonitorConfig {
     pub nan_rate_high: f64,
     /// Samples (1..=64) the NaN-rate window must hold before it is judged.
     pub nan_rate_min_samples: u32,
+    /// Hold for the command-model episodes (uncommanded motion,
+    /// divergence): a good sample within this long (observer clock) of the
+    /// latest bad sample of an open episode is neutral, neither diluting it
+    /// nor counting toward `clear_samples`. Episodes are then judged on the
+    /// stream's worst sample per hold window, so interleaving any number of
+    /// plausible values between real ones (any ratio, any level) cannot hide
+    /// a real excursion. Must exceed the slowest honest feedback period;
+    /// neutral samples never count as bad, so sparse honest outliers are not
+    /// amplified. `0` disables (per-sample majority, as before).
+    pub episode_hold_ns: u64,
     /// Implausible-jump check on each (source, publisher) stream: two
     /// consecutive finite samples whose difference exceeds the cross-sensor
     /// tolerance **and** `jump_accel_factor * max_accel * dt` (dt = the larger
@@ -359,6 +372,7 @@ impl Default for MonitorConfig {
             publisher_expiry_ns: 2_000 * MS,
             nan_rate_high: 0.1,
             nan_rate_min_samples: 16,
+            episode_hold_ns: 200 * MS,
             jump_accel_factor: 10.0,
             jump_min_count: 10,
             jump_window_ns: 1_000 * MS,
