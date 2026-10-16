@@ -1,0 +1,56 @@
+{
+  "robot": {
+    "id": "ugv-007",
+    "site": "depot-north",
+    "profile_version": "2026.10-r3",
+    "kafka_partitions": 12
+  },
+  "sensor": {
+    "profile_path": "/etc/robodr/profile.json",
+    "domain_id": 0,
+    "listen_spdp": false,
+    "capture": {
+      "enabled": true,
+      "interfaces": ["lo", "eth0"]
+    },
+    "binding": {
+      "enabled": true,
+      "hold_ms": 30000
+    }
+  },
+  "policy_path": "/etc/robodr/policy.json",
+  "blackbox": {
+    "dir": "/var/lib/robodr/blackbox",
+    "key_file": "/etc/robodr/blackbox.key"
+  },
+  "spool": {
+    "dir": "/var/spool/robodr/findings",
+    "max_bytes": 67108864,
+    "max_files": 10000
+  },
+  "event_inputs": [
+    { "kind": "unix_socket", "path": "/run/robodr/events.sock", "max_connections": 4 }
+  ],
+  "context": {
+    "safety_state": "unknown",
+    "control": "autonomous",
+    "phase": "unknown",
+    "connectivity": "connected",
+    "operator_present": true
+  },
+  "firewall": {
+    "max_angular": { "/cmd_vel": 1.0 }
+  },
+  "motion_monitor": {
+    "feedback_sources": { "/odom": "wheel_odometry" }
+  },
+  "daemon": {
+    "queue_capacity": 4096,
+    "tick_ms": 1000,
+    "heartbeat_ms": 10000,
+    "silence_ms": 30000,
+    "lag_ms": 2000,
+    "health_report_ms": 10000,
+    "exit_when_inputs_end": false
+  }
+}

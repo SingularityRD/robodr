@@ -15,7 +15,11 @@
 //! ```
 //!
 //! * [`Agent`] — the chain for one robot ([`agent`] module docs list the
-//!   invariants it holds).
+//!   invariants it holds). [`Agent::handle_external`] runs the response
+//!   half for deviations raised elsewhere (the ROS 2 pipeline, a daemon's
+//!   self-health checks; the latter are always observe-only), and
+//!   [`Agent::record_note`] appends a free-form note (e.g. a heartbeat). The
+//!   live daemon around it is `robodr-agentd`.
 //! * [`Executor`] — the seam for a future executor; [`NoopExecutor`] and
 //!   [`LoggingExecutor`] act on nothing. A real executor must re-run
 //!   [`robodr_responder::check_invariants`] ([`ExecutionRequest::recheck`]).

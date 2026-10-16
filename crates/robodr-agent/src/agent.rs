@@ -123,7 +123,7 @@ use robodr_blackbox::{
     AppendOutcome, Checkpoint, Clock, Recorder, RecorderConfig, Signer, Timestamp, Verifier,
 };
 use robodr_events::profile::Profile;
-use robodr_events::{Deviation, MotionCommand, RobotEvent, Severity};
+use robodr_events::{Deviation, Mode, MotionCommand, RobotEvent, Severity};
 use robodr_firewall::{
     ChannelId, ChannelKind, Command, Firewall, JointVelocities, LimitReasons, Motion, Policy,
     SourceId, SubstituteKind, Twist, Vec3, Verdict,
@@ -131,7 +131,7 @@ use robodr_firewall::{
 use robodr_motion::{CommandSample, ConsistencyMonitor, FeedbackSample};
 use robodr_ocsf::{
     BlackBoxRef, FindingBuilder, HumanProximity, Mode as OcsfMode, MotionState, ProfileRef,
-    RobotContext,
+    RobotContext, Subject,
 };
 use robodr_responder::{
     check_invariants, OperationalContext, Responder, ResponseAction, ResponsePlan, SafetyState,
@@ -578,11 +578,7 @@ impl Agent {
         event: &RobotEvent,
         safety: SafetyState,
     ) -> Vec<Outcome> {
-        let (now, anomaly) = self.time.observe(now);
-        self.follow.set(now);
-        if let Some(a) = anomaly {
-            self.clock_fault(now, a);
-        }
+        let now = self.observe_time(now);
         self.stats.events = self.stats.events.saturating_add(1);
         let mono = now.mono_ns;
         let mode = self.profile.mode();
@@ -674,83 +670,180 @@ impl Agent {
         // 3. Per deviation: plan, evidence, finding, executor.
         let mut outcomes = Vec::with_capacity(found.len());
         for (detector, dev) in found {
-            self.stats.deviations = self.stats.deviations.saturating_add(1);
             let source = source_key(event);
-            let ctx = OperationalContext {
-                profile_locked: self.profile.locked && !dev.is_observe_only(),
-                ..self.context
-            };
-            let proposed = self
-                .responder
-                .plan(&dev, &source, safety, &ctx, mono / 1_000_000);
-            let (plan, guard_violation) = guard(proposed.clone(), &dev, safety, &ctx);
-            if guard_violation.is_some() {
-                self.stats.guard_violations = self.stats.guard_violations.saturating_add(1);
-            }
-            let disposition = Disposition::of(&plan);
-
-            let mut evidence = EvidenceLinks {
+            let is_fw = detector == Detector::Firewall;
+            let evidence = EvidenceLinks {
                 event: event_ref.clone(),
-                firewall_verdict: if detector == Detector::Firewall {
-                    verdict_ref.clone()
-                } else {
-                    None
-                },
+                firewall_verdict: if is_fw { verdict_ref.clone() } else { None },
                 errors: shared_errors.clone(),
                 ..EvidenceLinks::default()
             };
-            evidence.deviation = self.append("deviation", &mut evidence.errors, |r| {
-                r.append_deviation(&dev)
-            });
-            let note = PlanNote {
-                kind: "robodr.response_plan",
-                deviation: evidence.deviation.as_ref(),
-                disposition,
-                guard_violation: guard_violation.as_deref(),
-                plan: &plan,
-                rejected_plan: guard_violation.is_some().then_some(&proposed),
-            };
-            let critical = plan.max_step > Step::Record || dev.severity >= Severity::High;
-            let mut errs = Vec::new();
-            evidence.plan = self.append("plan", &mut errs, |r| r.append_note(&note, critical));
-            evidence.errors.extend(errs);
-
-            let refs = evidence.refs();
-            let (finding, finding_errors) = self.build_finding(&dev, event, safety, now, &refs);
-            if finding.is_some() {
-                self.stats.findings = self.stats.findings.saturating_add(1);
-            } else {
-                self.stats.finding_errors = self.stats.finding_errors.saturating_add(1);
-            }
-
-            self.executor.submit(&ExecutionRequest {
-                plan: &plan,
-                disposition,
-                safety_state: safety,
-                context: &ctx,
-                evidence: &refs,
-                finding_id: finding.as_ref().map(|f| f.key.as_str()),
-                replay: self.replay,
-            });
-
-            outcomes.push(Outcome {
+            outcomes.push(self.respond(
+                now,
+                safety,
                 detector,
                 source,
-                deviation: dev,
-                plan,
-                disposition,
-                guard_violation,
+                dev,
+                FindingSubject::Event(event),
                 evidence,
-                firewall: if detector == Detector::Firewall {
-                    verdict.clone()
-                } else {
-                    None
-                },
-                finding,
-                finding_errors,
-            });
+                if is_fw { verdict.clone() } else { None },
+            ));
         }
         outcomes
+    }
+
+    /// Run the response half of the chain for a deviation raised **outside**
+    /// the agent: the ROS 2 detection pipeline ([`Detector::Sensor`]) or a
+    /// daemon's own health checks ([`Detector::SelfHealth`]).
+    ///
+    /// The deviation is planned, recorded (deviation + plan note) and turned
+    /// into a validated finding exactly like one the agent detected itself,
+    /// with the same invariants:
+    ///
+    /// * **Mode.** The deviation keeps the stricter of its own mode and the
+    ///   profile's (observe wins), so a pipeline running observe-only (e.g.
+    ///   profile refused) can never yield an action plan here.
+    /// * **Self-health is never acted on.** A [`Detector::SelfHealth`]
+    ///   deviation is always stamped observe-only: an agent-internal problem
+    ///   (or an attacker starving an input) cannot by itself cause a motion
+    ///   request. It is still recorded and reported.
+    ///
+    /// `source` is the responder's escalation key (e.g. `src:<ip>` or
+    /// `input:<name>`); `subject` feeds the finding's subject and uid.
+    /// Never panics; never executes anything.
+    pub fn handle_external(
+        &mut self,
+        now: Timestamp,
+        detector: Detector,
+        source: &str,
+        subject: Subject,
+        dev: Deviation,
+        safety: SafetyState,
+    ) -> Outcome {
+        let now = self.observe_time(now);
+        let observe = detector == Detector::SelfHealth
+            || dev.is_observe_only()
+            || self.profile.mode() == Mode::Observe;
+        let dev = dev.with_mode(if observe {
+            Mode::Observe
+        } else {
+            Mode::Enforce
+        });
+        self.respond(
+            now,
+            safety,
+            detector,
+            source.to_string(),
+            dev,
+            FindingSubject::Explicit(subject),
+            EvidenceLinks::default(),
+            None,
+        )
+    }
+
+    /// Append a free-form JSON note to the black box at `now` (e.g. a
+    /// daemon heartbeat). Goes through the same outage handling as every
+    /// other append (reopen with backoff, `evidence_recovered` fault).
+    /// Returns the record's reference, or why it was not written.
+    pub fn record_note<T: Serialize>(
+        &mut self,
+        now: Timestamp,
+        what: &str,
+        note: &T,
+        critical: bool,
+    ) -> Result<BlackBoxRef, Vec<String>> {
+        self.observe_time(now);
+        let mut errors = Vec::new();
+        self.append(what, &mut errors, |r| r.append_note(note, critical))
+            .ok_or(errors)
+    }
+
+    /// Sanitise `now` through the time guard, move the recorder's clock and
+    /// record any clock anomaly.
+    fn observe_time(&mut self, now: Timestamp) -> Timestamp {
+        let (now, anomaly) = self.time.observe(now);
+        self.follow.set(now);
+        if let Some(a) = anomaly {
+            self.clock_fault(now, a);
+        }
+        now
+    }
+
+    /// Plan, record, report and submit one deviation (time already
+    /// sanitised). `evidence` carries the links already written for the
+    /// triggering event / verdict and their errors.
+    #[allow(clippy::too_many_arguments)]
+    fn respond(
+        &mut self,
+        now: Timestamp,
+        safety: SafetyState,
+        detector: Detector,
+        source: String,
+        dev: Deviation,
+        subject: FindingSubject<'_>,
+        mut evidence: EvidenceLinks,
+        firewall: Option<FirewallVerdictRecord>,
+    ) -> Outcome {
+        self.stats.deviations = self.stats.deviations.saturating_add(1);
+        let ctx = OperationalContext {
+            profile_locked: self.profile.locked && !dev.is_observe_only(),
+            ..self.context
+        };
+        let proposed = self
+            .responder
+            .plan(&dev, &source, safety, &ctx, now.mono_ns / 1_000_000);
+        let (plan, guard_violation) = guard(proposed.clone(), &dev, safety, &ctx);
+        if guard_violation.is_some() {
+            self.stats.guard_violations = self.stats.guard_violations.saturating_add(1);
+        }
+        let disposition = Disposition::of(&plan);
+
+        evidence.deviation = self.append("deviation", &mut evidence.errors, |r| {
+            r.append_deviation(&dev)
+        });
+        let note = PlanNote {
+            kind: "robodr.response_plan",
+            deviation: evidence.deviation.as_ref(),
+            disposition,
+            guard_violation: guard_violation.as_deref(),
+            plan: &plan,
+            rejected_plan: guard_violation.is_some().then_some(&proposed),
+        };
+        let critical = plan.max_step > Step::Record || dev.severity >= Severity::High;
+        let mut errs = Vec::new();
+        evidence.plan = self.append("plan", &mut errs, |r| r.append_note(&note, critical));
+        evidence.errors.extend(errs);
+
+        let refs = evidence.refs();
+        let (finding, finding_errors) = self.build_finding(&dev, subject, safety, now, &refs);
+        if finding.is_some() {
+            self.stats.findings = self.stats.findings.saturating_add(1);
+        } else {
+            self.stats.finding_errors = self.stats.finding_errors.saturating_add(1);
+        }
+
+        self.executor.submit(&ExecutionRequest {
+            plan: &plan,
+            disposition,
+            safety_state: safety,
+            context: &ctx,
+            evidence: &refs,
+            finding_id: finding.as_ref().map(|f| f.key.as_str()),
+            replay: self.replay,
+        });
+
+        Outcome {
+            detector,
+            source,
+            deviation: dev,
+            plan,
+            disposition,
+            guard_violation,
+            evidence,
+            firewall,
+            finding,
+            finding_errors,
+        }
     }
 
     /// Seal and close the black box. Returns the final checkpoint. If the
@@ -973,17 +1066,26 @@ impl Agent {
     fn build_finding(
         &mut self,
         dev: &Deviation,
-        event: &RobotEvent,
+        subject: FindingSubject<'_>,
         safety: SafetyState,
         now: Timestamp,
         refs: &[BlackBoxRef],
     ) -> (Option<FindingOutput>, Vec<String>) {
         let wall_ms = now.wall_ns / 1_000_000;
         let mut b = FindingBuilder::from_deviation(dev, &self.ocsf)
-            .event(event)
             .safety_state(ocsf_safety(safety))
             .attestation(self.attestation);
-        if let RobotEvent::MotionCommand(c) = event {
+        let event = match subject {
+            FindingSubject::Event(ev) => {
+                b = b.event(ev);
+                Some(ev)
+            }
+            FindingSubject::Explicit(s) => {
+                b = b.subject(s);
+                None
+            }
+        };
+        if let Some(RobotEvent::MotionCommand(c)) = event {
             // The findings contract only carries finite, non-negative speeds.
             // Commands are magnitudes (sign is ignored by detection), so send
             // |v|; a non-finite value is omitted here and survives verbatim in
@@ -1036,6 +1138,13 @@ impl Agent {
             Err(errs) => (None, errs.iter().map(ToString::to_string).collect()),
         }
     }
+}
+
+/// What a finding is about: the triggering event (subject and command taken
+/// from it) or an explicit subject (externally raised deviations).
+enum FindingSubject<'a> {
+    Event(&'a RobotEvent),
+    Explicit(Subject),
 }
 
 /// Build and validate one finding from the trusted configuration alone.
