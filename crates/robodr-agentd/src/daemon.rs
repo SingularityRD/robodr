@@ -19,6 +19,24 @@
 //!    black box (state, reasons, per-input counters, pipeline / agent /
 //!    spool counters).
 //!
+//! When every input has ended and `exit_when_inputs_end` is off (a live
+//! daemon whose capture died, stdin EOF), the queue reports `Disconnected`
+//! immediately; the loop then sleeps until its next deadline instead of
+//! spinning, keeps ticking (status, heartbeat, watchdog) and reports the
+//! state `unknown` ("every input has ended"). An input thread that vanished
+//! without reporting its end (a panic) is marked ended with an error, so it
+//! raises `robot.agent.input_ended`.
+//!
+//! # Liveness and staleness
+//!
+//! The main loop sends `WATCHDOG=1` to systemd (when `NOTIFY_SOCKET` is
+//! set; see [`crate::notify`]) at most every [`WATCHDOG_PING`], `READY=1`
+//! after start and `STOPPING=1` at shutdown. `status.json` carries
+//! `updated_mono_ms` (`CLOCK_MONOTONIC`), `boot_id` and `stale_after_ms`
+//! (2 x `tick_ms` + `lag_ms`): if the loop stalls (slow fsync, a hang), the
+//! file stops changing and a consumer must read it as `unknown`
+//! ([`effective_state`]), never trust a stale `ok`.
+//!
 //! # Shutdown
 //!
 //! When `should_stop()` returns `true` (SIGTERM/SIGINT in the binary) or,
@@ -59,7 +77,6 @@
 //! follow `robodr_agent::executor`'s contract.
 
 use std::io::Write;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
 use std::sync::Arc;
@@ -80,11 +97,12 @@ use robodr_ros2_pipeline::{
 };
 use serde::Serialize;
 
-use crate::config::{EventInputConfig, Resolved};
+use crate::config::{check_daemon_dirs, resolve_path, EventInputConfig, Resolved};
 use crate::health::{
     DaemonSnapshot, HealthConfig, HealthMonitor, HealthState, InputSnapshot, Issue, Recovery, State,
 };
-use crate::input::{self, Feed, InputStats, Msg, Payload};
+use crate::input::{self, Feed, InputStats, Msg, Payload, QueueBudget};
+use crate::notify::{monotonic_ms, Notifier};
 use crate::spool::{Spool, SpoolError, SpoolStats};
 
 /// Most queued items handled between two clock checks.
@@ -95,6 +113,37 @@ pub const STATUS_FILE: &str = "status.json";
 pub const CHECKPOINT_FILE: &str = "checkpoint.json";
 /// Model label used for the agent when the profile failed validation.
 pub const UNVALIDATED_MODEL: &str = "unvalidated-profile";
+/// Most time between two `WATCHDOG=1` keep-alives from a healthy main loop
+/// (`WatchdogSec=` must be well above it).
+pub const WATCHDOG_PING: Duration = Duration::from_secs(1);
+/// Longest sleep of the main loop (signal / stop latency).
+const MAX_WAIT: Duration = Duration::from_millis(50);
+
+/// The state a consumer should show for a `status.json` read at
+/// `now_mono_ms` (`CLOCK_MONOTONIC`, ms; see [`crate::notify::monotonic_ms`])
+/// on the boot `boot_id`: the file's `state`, unless the daemon is not
+/// running, the status is from another boot, it is older than its
+/// `stale_after_ms`, or a field is missing or malformed, in which case
+/// [`State::Unknown`].
+pub fn effective_state(status: &serde_json::Value, now_mono_ms: u64, boot_id: &str) -> State {
+    let fresh = status["running"].as_bool() == Some(true)
+        && status["boot_id"].as_str() == Some(boot_id)
+        && match (
+            status["updated_mono_ms"].as_u64(),
+            status["stale_after_ms"].as_u64(),
+        ) {
+            (Some(at), Some(stale)) => now_mono_ms.saturating_sub(at) <= stale,
+            _ => false,
+        };
+    if !fresh {
+        return State::Unknown;
+    }
+    match status["state"].as_str() {
+        Some("ok") => State::Ok,
+        Some("degraded") => State::Degraded,
+        _ => State::Unknown,
+    }
+}
 
 /// Daemon counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -196,6 +245,7 @@ struct InputStatus<'a> {
     name: &'a str,
     received: u64,
     dropped: u64,
+    budget_drops: u64,
     malformed: u64,
     rejected_connections: u64,
     last_rx_age_ms: Option<u64>,
@@ -209,6 +259,11 @@ struct Status<'a> {
     robot_id: &'a str,
     wall_ms: u64,
     uptime_ms: u64,
+    /// `CLOCK_MONOTONIC` (ms) when this status was written.
+    updated_mono_ms: u64,
+    boot_id: &'a str,
+    /// Older than this (by `CLOCK_MONOTONIC`) = stale = unknown.
+    stale_after_ms: u64,
     running: bool,
     #[serde(flatten)]
     health: &'a HealthState,
@@ -219,6 +274,8 @@ struct Status<'a> {
     agent: AgentStats,
     spool: SpoolStats,
     evidence_degraded: bool,
+    queue_bytes: usize,
+    queue_bytes_max: usize,
 }
 
 /// The agent's view of the profile: what the pipeline enforces. A profile
@@ -253,6 +310,10 @@ struct Daemon<'a> {
     capture_health: SharedHealth,
     rx: Receiver<Msg>,
     stop_inputs: Arc<AtomicBool>,
+    budget: Arc<QueueBudget>,
+    /// Every sender of the queue is gone (all input threads exited).
+    inputs_gone: bool,
+    notifier: Notifier,
     health: HealthMonitor,
     last_state: HealthState,
     stats: DaemonStats,
@@ -265,24 +326,62 @@ fn ms(d: Duration) -> u64 {
 }
 
 /// Build everything, run until stopped, shut down in order.
+/// `sd_notify` goes to `NOTIFY_SOCKET` from the environment, if set.
 pub fn run(
     r: &Resolved,
     should_stop: &dyn Fn() -> bool,
     log: &mut dyn Write,
 ) -> Result<Summary, DaemonError> {
-    let mut d = Daemon::start(r, log)?;
+    run_with(r, should_stop, log, Notifier::from_env())
+}
+
+/// [`run`] with an explicit `sd_notify` target.
+pub fn run_with(
+    r: &Resolved,
+    should_stop: &dyn Fn() -> bool,
+    log: &mut dyn Write,
+    notifier: Notifier,
+) -> Result<Summary, DaemonError> {
+    let mut d = Daemon::start(r, log, notifier)?;
+    d.notifier.notify("READY=1\nSTATUS=started");
     let reason = d.main_loop(should_stop);
+    d.notifier.notify("STOPPING=1");
     d.shutdown(reason)
 }
 
 impl<'a> Daemon<'a> {
-    fn start(r: &'a Resolved, log: &'a mut dyn Write) -> Result<Self, DaemonError> {
+    fn start(
+        r: &'a Resolved,
+        log: &'a mut dyn Write,
+        notifier: Notifier,
+    ) -> Result<Self, DaemonError> {
         let epoch = Instant::now();
         let clock = SharedClock(Arc::new(SystemClock::new(TimeSource::Unknown)));
         let cfg = &r.config;
         for w in &r.warnings {
             let _ = writeln!(log, "robodr-agentd: warning: {}", sanitize(w));
         }
+        // Create the black-box and spool directories (0700, as the recorder
+        // and the spool would) and re-check that they are apart on their
+        // canonical paths: a symlink or `..` the configuration check could
+        // not see (created since, or racing) must not alias them.
+        for d in [&cfg.blackbox.dir, &cfg.spool.dir] {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(d)
+                .map_err(|e| DaemonError::Io(format!("creating {}: {e}", d.display())))?;
+        }
+        check_daemon_dirs(cfg, r.sensor.profile_trust.state_file.as_deref(), |p| {
+            match std::fs::canonicalize(p) {
+                Ok(c) => Ok(c),
+                // The state directory may not exist yet.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(resolve_path(p)),
+                Err(e) => Err(format!("{}: {e}", p.display())),
+            }
+        })
+        .map_err(DaemonError::Config)?;
         // Persist the anti-rollback state the accepted profile implies
         // before enforcing it; if that fails, do not enforce (fail closed).
         let mut loaded = r.profile.clone();
@@ -367,12 +466,19 @@ impl<'a> Daemon<'a> {
 
         // Inputs.
         let (tx, rx) = sync_channel::<Msg>(cfg.daemon.queue_capacity);
+        let budget = QueueBudget::new(cfg.daemon.queue_bytes);
         let stop_inputs = Arc::new(AtomicBool::new(false));
         let capture_health = SharedHealth::new();
         let mut inputs: Vec<InputHandle> = Vec::new();
         let mut add = |name: String, kind: InputKind, joinable: bool| {
             let stats = Arc::new(InputStats::default());
-            let feed = Feed::new(tx.clone(), inputs.len(), stats.clone(), epoch);
+            let feed = Feed::with_budget(
+                tx.clone(),
+                inputs.len(),
+                stats.clone(),
+                epoch,
+                budget.clone(),
+            );
             inputs.push(InputHandle {
                 name,
                 kind,
@@ -445,11 +551,10 @@ impl<'a> Daemon<'a> {
                         InputKind::Events,
                         true,
                     );
-                    let (stop, path, max): (_, PathBuf, usize) =
-                        (stop_inputs.clone(), path.clone(), *max_connections);
+                    let (stop, max) = (stop_inputs.clone(), *max_connections);
                     spawns.push((
                         feed,
-                        Box::new(move |f| input::run_unix_listener(l, path, max, stop, f)),
+                        Box::new(move |f| input::run_unix_listener(l, max, stop, f)),
                     ));
                 }
             }
@@ -484,6 +589,9 @@ impl<'a> Daemon<'a> {
             capture_health,
             rx,
             stop_inputs,
+            budget,
+            inputs_gone: false,
+            notifier,
             health,
             last_state: HealthState {
                 state: State::Unknown,
@@ -540,29 +648,25 @@ impl<'a> Daemon<'a> {
         let heartbeat = Duration::from_millis(self.r.config.daemon.heartbeat_ms);
         let mut next_tick = Instant::now() + tick;
         let mut next_heartbeat = Instant::now();
+        let mut next_ping = Instant::now();
         loop {
             if should_stop() {
                 return StopReason::Requested;
             }
+            if Instant::now() >= next_ping {
+                // From the loop itself: a stalled loop stops the pings.
+                self.notifier.notify("WATCHDOG=1");
+                next_ping = Instant::now() + WATCHDOG_PING;
+            }
             let wait = next_tick
                 .saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(50));
-            match self.rx.recv_timeout(wait) {
-                Ok(m) => {
-                    self.handle(m);
-                    for _ in 1..BATCH {
-                        // Housekeeping first when it is due (slow items,
-                        // e.g. fsync of critical evidence, add up).
-                        if Instant::now() >= next_tick {
-                            break;
-                        }
-                        match self.rx.try_recv() {
-                            Ok(m) => self.handle(m),
-                            Err(_) => break,
-                        }
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => {}
+                .min(MAX_WAIT);
+            if self.inputs_gone {
+                // Nothing can arrive any more: sleep instead of polling a
+                // disconnected queue (which returns at once).
+                std::thread::sleep(wait);
+            } else {
+                self.receive(wait, next_tick);
             }
             let now = Instant::now();
             if now >= next_tick {
@@ -585,6 +689,51 @@ impl<'a> Daemon<'a> {
                 }
             }
         }
+    }
+
+    /// Wait up to `wait` for an item, then handle up to [`BATCH`] items, but
+    /// not past `next_tick`.
+    fn receive(&mut self, wait: Duration, next_tick: Instant) {
+        match self.rx.recv_timeout(wait) {
+            Ok(m) => {
+                self.handle(m);
+                for _ in 1..BATCH {
+                    // Housekeeping first when it is due (slow items,
+                    // e.g. fsync of critical evidence, add up).
+                    if Instant::now() >= next_tick {
+                        break;
+                    }
+                    match self.rx.try_recv() {
+                        Ok(m) => self.handle(m),
+                        Err(_) => break,
+                    }
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => self.on_disconnected(),
+        }
+    }
+
+    fn on_disconnected(&mut self) {
+        if std::mem::replace(&mut self.inputs_gone, true) {
+            return;
+        }
+        // Every feed was dropped, so every input thread is done. One that
+        // did not report its end (a panic) is marked ended with an error.
+        for i in &self.inputs {
+            if !i.stats.ended.load(Ordering::SeqCst) {
+                *i.stats
+                    .end_error
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some("input thread exited without reporting an end".into());
+                i.stats.ended.store(true, Ordering::SeqCst);
+            }
+        }
+        let _ = writeln!(
+            self.log,
+            "robodr-agentd: every input has ended; the agent receives nothing"
+        );
     }
 
     fn handle(&mut self, m: Msg) {
@@ -772,6 +921,7 @@ impl<'a> Daemon<'a> {
             spool_write_errors: spool.write_errors,
             evidence_degraded: self.agent.evidence_degraded(),
             profile_not_enforced: self.pipeline.status() != &ProfileStatus::Enforcing,
+            all_inputs_gone: self.inputs_gone,
         };
         let inputs = self.snapshots();
         let (state, issues, recoveries) = self.health.evaluate(self.now_ms(), &inputs, &snap);
@@ -785,6 +935,12 @@ impl<'a> Daemon<'a> {
             );
         }
         self.last_state = state;
+        let st = match self.last_state.state {
+            State::Ok => "ok",
+            State::Degraded => "degraded",
+            State::Unknown => "unknown",
+        };
+        self.notifier.notify(&format!("STATUS=state {st}"));
         for i in issues {
             self.health_issue(i);
         }
@@ -835,6 +991,7 @@ impl<'a> Daemon<'a> {
                 name: &i.name,
                 received: i.stats.received.load(Ordering::Relaxed),
                 dropped: i.stats.dropped.load(Ordering::Relaxed),
+                budget_drops: i.stats.budget_drops.load(Ordering::Relaxed),
                 malformed: i.stats.malformed.load(Ordering::Relaxed),
                 rejected_connections: i.stats.rejected_connections.load(Ordering::Relaxed),
                 last_rx_age_ms: i.stats.last_rx_ms().map(|t| now.saturating_sub(t)),
@@ -851,6 +1008,15 @@ impl<'a> Daemon<'a> {
             robot_id: &self.r.config.robot.id,
             wall_ms,
             uptime_ms: self.now_ms(),
+            updated_mono_ms: monotonic_ms(),
+            boot_id: &self.r.boot_id,
+            stale_after_ms: self
+                .r
+                .config
+                .daemon
+                .tick_ms
+                .saturating_mul(2)
+                .saturating_add(self.r.config.daemon.lag_ms),
             running,
             health: &self.last_state,
             profile_status: self.pipeline.status().as_str(),
@@ -860,6 +1026,8 @@ impl<'a> Daemon<'a> {
             agent: self.agent.stats(),
             spool: self.spool.stats(),
             evidence_degraded: self.agent.evidence_degraded(),
+            queue_bytes: self.budget.used(),
+            queue_bytes_max: self.budget.max(),
         };
         let res = serde_json::to_vec_pretty(&status)
             .map_err(std::io::Error::other)

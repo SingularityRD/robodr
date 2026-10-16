@@ -57,6 +57,12 @@
 //!   user or root, and not accessible by group or others (`chmod 600`); see
 //!   [`read_key_file`]. A `blackbox.key_id` that contradicts the key file's
 //!   own id is a configuration error.
+//! * `spool.dir` and `blackbox.dir` must not be equal or contain each
+//!   other, and `sensor.profile_trust.state_file` must not be inside either.
+//!   The check ([`check_daemon_dirs`]) runs on resolved paths
+//!   ([`resolve_path`]: symlinks of the existing part followed, `.` / `..`
+//!   folded) here, and again on canonical paths in the daemon after the
+//!   directories exist, so neither `..` nor a symlink can alias them.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -78,6 +84,11 @@ pub const MAX_KEY_FILE_BYTES: u64 = 4096;
 pub const MAX_EVENT_INPUTS: usize = 8;
 /// Most concurrent connections on one unix-socket event input.
 pub const MAX_SOCKET_CONNECTIONS: usize = 64;
+/// Largest `daemon.queue_capacity` (items).
+pub const MAX_QUEUE_CAPACITY: usize = 65_536;
+/// Bounds of `daemon.queue_bytes`.
+pub const MIN_QUEUE_BYTES: usize = 1 << 20;
+pub const MAX_QUEUE_BYTES: usize = 256 << 20;
 
 /// The keys of the `sensor` section (`robodr_ros2_pipeline::Config`), its
 /// `capture` and its `binding` sub-tables. `Config` ignores unknown keys (it
@@ -308,9 +319,15 @@ pub struct MonitorSection {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct DaemonSection {
-    /// Bound of the input -> pipeline queue (shared by all inputs). A full
-    /// queue drops the newest item and counts it (see `health`).
+    /// Bound of the input -> pipeline queue in items (shared by all
+    /// inputs), 1..=[`MAX_QUEUE_CAPACITY`]. A full queue drops the newest
+    /// item and counts it (see `health`).
     pub queue_capacity: usize,
+    /// Bound of the same queue in bytes (payloads + per-item overhead),
+    /// [`MIN_QUEUE_BYTES`]..=[`MAX_QUEUE_BYTES`], default
+    /// [`crate::input::DEFAULT_QUEUE_BYTES`]. Whichever bound is hit first
+    /// drops the item.
+    pub queue_bytes: usize,
     /// Housekeeping period: `Pipeline::tick`, capture health, self-health,
     /// status file, spool pruning. 1000 ms = the 1 Hz the pipeline expects.
     pub tick_ms: u64,
@@ -334,6 +351,7 @@ impl Default for DaemonSection {
     fn default() -> Self {
         Self {
             queue_capacity: 4096,
+            queue_bytes: crate::input::DEFAULT_QUEUE_BYTES,
             tick_ms: 1000,
             heartbeat_ms: 10_000,
             silence_ms: 30_000,
@@ -414,6 +432,89 @@ fn require_abs(what: &str, p: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Lexically fold `.` and `..` (`..` at the root stays at the root).
+fn normalize_lexically(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The path `p` will name once created: the longest existing ancestor is
+/// canonicalised (symlinks followed, `..` resolved by the kernel), the
+/// missing rest is folded lexically (correct once it is created as plain
+/// directories, which is what the daemon does). `p` must be absolute.
+pub fn resolve_path(p: &Path) -> PathBuf {
+    let mut existing = p.to_path_buf();
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(c) = std::fs::canonicalize(&existing) {
+            let mut out = c;
+            for r in rest.iter().rev() {
+                out.push(r);
+            }
+            return normalize_lexically(&out);
+        }
+        match (existing.file_name(), existing.parent()) {
+            (Some(name), Some(parent)) => {
+                rest.push(name.to_os_string());
+                existing = parent.to_path_buf();
+            }
+            // `..` / `.` as the last component, or the root: fold it all.
+            _ => return normalize_lexically(p),
+        }
+    }
+}
+
+/// Check the directories the daemon writes, after mapping each through
+/// `resolve` ([`resolve_path`] at configuration time, `canonicalize` once
+/// they exist): `spool.dir` and `blackbox.dir` must not be equal or contain
+/// each other, and the profile-state file must not live in (or under)
+/// either of them (the exporter would ship or prune it, the recorder owns
+/// its directory). A state directory that *contains* them is allowed (e.g.
+/// `/var/lib/robodr`).
+pub fn check_daemon_dirs(
+    config: &DaemonConfig,
+    state_file: Option<&Path>,
+    resolve: impl Fn(&Path) -> Result<PathBuf, String>,
+) -> Result<(), String> {
+    let spool = resolve(&config.spool.dir)?;
+    let blackbox = resolve(&config.blackbox.dir)?;
+    let shown = |a: &Path, b: &Path| {
+        format!(
+            "({} vs {}, after resolving symlinks and ..)",
+            a.display(),
+            b.display()
+        )
+    };
+    if spool.starts_with(&blackbox) || blackbox.starts_with(&spool) {
+        return Err(format!(
+            "spool.dir and blackbox.dir must not contain each other {}",
+            shown(&spool, &blackbox)
+        ));
+    }
+    if let Some(dir) = state_file.and_then(Path::parent) {
+        let state = resolve(dir)?;
+        for (what, d) in [("spool.dir", &spool), ("blackbox.dir", &blackbox)] {
+            if state.starts_with(d) {
+                return Err(format!(
+                    "sensor.profile_trust.state_file must not be inside {what} {}",
+                    shown(&state, d)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Refuse keys `allowed` does not list in a JSON object.
 fn check_keys(what: &str, v: &serde_json::Value, allowed: &[&str]) -> Result<(), String> {
     let Some(obj) = v.as_object() else {
@@ -472,7 +573,18 @@ pub fn validate_daemon(d: &DaemonSection) -> Result<(), String> {
             Err(format!("daemon.{what} = {v}: must be {lo}..={hi}"))
         }
     };
-    range("queue_capacity", d.queue_capacity as u64, 1, 1 << 20)?;
+    range(
+        "queue_capacity",
+        d.queue_capacity as u64,
+        1,
+        MAX_QUEUE_CAPACITY as u64,
+    )?;
+    range(
+        "queue_bytes",
+        d.queue_bytes as u64,
+        MIN_QUEUE_BYTES as u64,
+        MAX_QUEUE_BYTES as u64,
+    )?;
     range("tick_ms", d.tick_ms, 10, 60_000)?;
     range("heartbeat_ms", d.heartbeat_ms, d.tick_ms, 3_600_000)?;
     range("silence_ms", d.silence_ms, d.tick_ms, 86_400_000)?;
@@ -508,12 +620,7 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
     if config.spool.max_files == 0 {
         return Err("spool.max_files must be >= 1".into());
     }
-    if config.spool.dir == config.blackbox.dir
-        || config.spool.dir.starts_with(&config.blackbox.dir)
-        || config.blackbox.dir.starts_with(&config.spool.dir)
-    {
-        return Err("spool.dir and blackbox.dir must not contain each other".into());
-    }
+    check_daemon_dirs(&config, None, |p| Ok(resolve_path(p)))?;
     validate_daemon(&config.daemon)?;
     if config.event_inputs.len() > MAX_EVENT_INPUTS {
         return Err(format!("at most {MAX_EVENT_INPUTS} event_inputs"));
@@ -547,6 +654,9 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
 
     let (mut sensor, mut w) = sensor_settings(&config.sensor)?;
     warnings.append(&mut w);
+    check_daemon_dirs(&config, sensor.profile_trust.state_file.as_deref(), |p| {
+        Ok(resolve_path(p))
+    })?;
     // The motion monitor's feedback channels are decoded from the bus too
     // (in addition to `sensor.motion.feedback_topics`).
     if let Some(m) = &config.motion_monitor {
@@ -965,6 +1075,23 @@ mod tests {
             );
         }
         assert!(unit.contains("RuntimeDirectory=robodr-agentd"));
+        // The daemon sends READY=1 / WATCHDOG=1 (crate::notify), so the unit
+        // is Type=notify with a watchdog well above the 1 s ping.
+        let value = |k: &str| {
+            unit.lines()
+                .filter_map(|l| l.strip_prefix(k))
+                .next_back()
+                .map(str::trim)
+        };
+        assert_eq!(value("Type="), Some("notify"));
+        let wd = value("WatchdogSec=").expect("WatchdogSec=");
+        let secs: u64 = wd.trim_end_matches('s').parse().unwrap();
+        assert!(secs >= 10 * crate::daemon::WATCHDOG_PING.as_secs(), "{wd}");
+        // Never shield agentd from the OOM killer at the motion stack's
+        // expense; cap it instead.
+        let oom: i32 = value("OOMScoreAdjust=").unwrap().parse().unwrap();
+        assert!(oom >= 0, "OOMScoreAdjust={oom}");
+        assert!(value("MemoryMax=").is_some());
         // ... and tmpfiles.d creates the state directory for User=robodr.
         let tmpfiles = std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/tmpfiles.d/robodr.conf"),
@@ -1144,5 +1271,104 @@ mod tests {
         let mut c = base("/var/bb", "/var/spool");
         c.event_inputs.clear();
         assert!(resolve(c).unwrap_err().contains("no input"));
+    }
+
+    #[test]
+    fn queue_bounds_are_capped() {
+        let d = DaemonSection::default();
+        assert_eq!(d.queue_bytes, 32 << 20);
+        for (bad, needle) in [
+            (
+                DaemonSection {
+                    queue_capacity: MAX_QUEUE_CAPACITY + 1,
+                    ..d.clone()
+                },
+                "queue_capacity",
+            ),
+            (
+                DaemonSection {
+                    queue_bytes: MIN_QUEUE_BYTES - 1,
+                    ..d.clone()
+                },
+                "queue_bytes",
+            ),
+            (
+                DaemonSection {
+                    queue_bytes: MAX_QUEUE_BYTES + 1,
+                    ..d.clone()
+                },
+                "queue_bytes",
+            ),
+        ] {
+            assert!(validate_daemon(&bad).unwrap_err().contains(needle));
+        }
+        let ok = DaemonSection {
+            queue_capacity: MAX_QUEUE_CAPACITY,
+            queue_bytes: MAX_QUEUE_BYTES,
+            ..d
+        };
+        validate_daemon(&ok).unwrap();
+    }
+
+    #[test]
+    fn resolve_path_folds_dotdot_and_follows_symlinks() {
+        let d = std::env::temp_dir().join(format!("robodr-agentd-rp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("real")).unwrap();
+        let d = std::fs::canonicalize(&d).unwrap();
+        std::os::unix::fs::symlink(d.join("real"), d.join("link")).unwrap();
+        assert_eq!(resolve_path(&d.join("x/../bb")), d.join("bb"));
+        assert_eq!(resolve_path(&d.join("x/./y/../../bb/")), d.join("bb"));
+        assert_eq!(resolve_path(&d.join("link/spool")), d.join("real/spool"));
+        assert_eq!(resolve_path(&d.join("link/../real")), d.join("real"));
+        assert_eq!(resolve_path(Path::new("/../..")), Path::new("/"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn daemon_dirs_must_not_alias() {
+        let d = std::env::temp_dir().join(format!("robodr-agentd-dirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("bb")).unwrap();
+        let d = std::fs::canonicalize(&d).unwrap();
+        std::os::unix::fs::symlink(d.join("bb"), d.join("alias")).unwrap();
+        let text = |bb: &Path, spool: &Path| {
+            format!(
+                r#"{{"robot":{{"id":"r1","site":"s"}},"sensor":{{}},"policy_path":"/p",
+                "blackbox":{{"dir":{bb:?},"key_file":"/k"}},"spool":{{"dir":{spool:?}}}}}"#
+            )
+        };
+        let res = |p: &Path| Ok(resolve_path(p));
+        let bb = d.join("bb");
+        let ok = parse(&text(&bb, &d.join("spool"))).unwrap();
+        check_daemon_dirs(&ok, None, res).unwrap();
+        // The state directory may contain both (/var/lib/robodr) ...
+        check_daemon_dirs(&ok, Some(&d.join("state.json")), res).unwrap();
+        // ... but the state file may not live in either.
+        for st in [bb.join("state.json"), d.join("alias/sub/state.json")] {
+            let e = check_daemon_dirs(&ok, Some(&st), res).unwrap_err();
+            assert!(
+                e.contains("state_file") && e.contains("blackbox.dir"),
+                "{e}"
+            );
+        }
+        let e = check_daemon_dirs(&ok, Some(&d.join("spool/s.json")), res).unwrap_err();
+        assert!(e.contains("spool.dir"), "{e}");
+        for spool in [
+            d.join("x/../bb"),
+            d.join("alias"),
+            d.join("alias/spool"),
+            d.join("bb/./spool"),
+        ] {
+            let c = parse(&text(&bb, &spool)).unwrap();
+            let e = check_daemon_dirs(&c, None, res).unwrap_err();
+            assert!(e.contains("must not contain"), "{spool:?}: {e}");
+        }
+        // The blackbox inside the spool, through a symlink, too.
+        std::fs::create_dir_all(d.join("sp")).unwrap();
+        std::os::unix::fs::symlink(d.join("sp"), d.join("sp-link")).unwrap();
+        let c = parse(&text(&d.join("sp-link/bb"), &d.join("sp"))).unwrap();
+        assert!(check_daemon_dirs(&c, None, res).is_err());
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

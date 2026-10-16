@@ -31,6 +31,9 @@
 //!   lagging), never `ok`; issues become observe-only findings.
 //! * [`spool`]: atomic, bounded findings spool; acked records are pruned
 //!   oldest first, unacked ones never.
+//! * [`notify`]: `sd_notify` (`READY=1`, `WATCHDOG=1` from the main loop,
+//!   `STOPPING=1`) with std only, and the `CLOCK_MONOTONIC` stamp that lets
+//!   a consumer tell a stale `status.json` from a live one.
 //! * [`signal`]: SIGTERM / SIGINT through `extern "C"` `signal(2)` and an
 //!   `AtomicBool`.
 //!
@@ -55,10 +58,13 @@ pub mod config;
 pub mod daemon;
 pub mod health;
 pub mod input;
+pub mod notify;
 pub mod signal;
 pub mod spool;
 
 pub use config::{load, DaemonConfig, Resolved};
-pub use daemon::{agent_profile, run, DaemonError, DaemonStats, StopReason, Summary};
+pub use daemon::{
+    agent_profile, effective_state, run, run_with, DaemonError, DaemonStats, StopReason, Summary,
+};
 pub use health::{HealthState, State};
 pub use spool::{Spool, SpoolRecord, SpoolStats};

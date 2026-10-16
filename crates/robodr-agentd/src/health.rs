@@ -3,11 +3,15 @@
 //!
 //! Design rule (design document, "Kara kutu ve öz koruma"): when the agent
 //! is blind its robot is **Unknown**, never OK. [`HealthState`] is therefore
-//! `ok` only when every input has delivered data within `silence_ms`, none
-//! has ended, the pipeline is not lagging and nothing was lost since the
-//! last evaluation. Before an input has delivered anything the state is
-//! `unknown` too ("no data yet"); a finding is raised only after
-//! `silence_ms`.
+//! `ok` only when every input has delivered **valid** data within
+//! `silence_ms`, none has ended, the pipeline is not lagging and nothing was
+//! lost since the last evaluation. Before an input has delivered anything
+//! the state is `unknown` too ("no data yet"); a finding is raised only
+//! after `silence_ms`. Malformed items are not data: an input that sends
+//! only junk goes silent like one that sends nothing (the finding says how
+//! many malformed items were skipped meanwhile). When every input thread is
+//! gone ([`DaemonSnapshot::all_inputs_gone`]) and that was not expected, the
+//! state is `unknown` too.
 //!
 //! | Issue | Rule | Severity | Raised |
 //! |---|---|---|---|
@@ -77,6 +81,9 @@ pub struct DaemonSnapshot {
     /// The profile is not enforced (observe-only, refused or file check
     /// failed).
     pub profile_not_enforced: bool,
+    /// Every input thread has exited (the queue's senders are all gone):
+    /// nothing can arrive any more.
+    pub all_inputs_gone: bool,
 }
 
 /// The robot's monitoring state, as a console should show it.
@@ -107,6 +114,9 @@ pub enum Issue {
         input: String,
         for_ms: u64,
         never: bool,
+        /// Malformed items skipped on the input so far (they do not count
+        /// as data).
+        malformed: u64,
     },
     InputEnded {
         input: String,
@@ -162,21 +172,29 @@ impl Issue {
                 input,
                 for_ms,
                 never,
-            } => Deviation::new(
-                rules::INPUT_SILENT,
-                Severity::High,
-                if *never {
-                    format!(
-                        "input {input} has delivered nothing since the agent started {for_ms} ms \
-                         ago; the agent is blind on it (robot state unknown)"
-                    )
+                malformed,
+            } => {
+                let junk = if *malformed > 0 {
+                    format!(" ({malformed} malformed item(s) skipped on it so far)")
                 } else {
-                    format!(
-                        "input {input} has delivered nothing for {for_ms} ms; the agent is blind \
-                         on it (robot state unknown)"
-                    )
-                },
-            ),
+                    String::new()
+                };
+                Deviation::new(
+                    rules::INPUT_SILENT,
+                    Severity::High,
+                    if *never {
+                        format!(
+                            "input {input} has delivered no valid data since the agent started \
+                             {for_ms} ms ago{junk}; the agent is blind on it (robot state unknown)"
+                        )
+                    } else {
+                        format!(
+                            "input {input} has delivered no valid data for {for_ms} ms{junk}; the \
+                             agent is blind on it (robot state unknown)"
+                        )
+                    },
+                )
+            }
             Issue::InputEnded { input, error } => Deviation::new(
                 rules::INPUT_ENDED,
                 Severity::High,
@@ -330,7 +348,14 @@ impl HealthMonitor {
                 if snap.last_rx_ms.is_none() {
                     raise(
                         State::Unknown,
-                        format!("input {name}: no data yet"),
+                        if snap.malformed > 0 {
+                            format!(
+                                "input {name}: no valid data yet ({} malformed)",
+                                snap.malformed
+                            )
+                        } else {
+                            format!("input {name}: no data yet")
+                        },
                         &mut state,
                     );
                 } else if idle >= self.cfg.silence_ms {
@@ -347,6 +372,7 @@ impl HealthMonitor {
                         input: name.clone(),
                         for_ms: idle,
                         never: snap.last_rx_ms.is_none(),
+                        malformed: snap.malformed,
                     });
                 } else if !silent_now && tr.silent {
                     tr.silent = false;
@@ -372,8 +398,9 @@ impl HealthMonitor {
                     tr.dropped_last_report = Some(now_ms);
                 }
             }
-            // Malformed input (not a state change: hostile peers can send
-            // garbage, the agent still sees the rest).
+            // Malformed input (not a state change by itself: hostile peers
+            // can send garbage, the agent still sees the rest; junk alone
+            // does not keep an input from going silent, above).
             if snap.malformed > tr.malformed_reported
                 && due(tr.malformed_last_report, now_ms, self.cfg.report_ms)
             {
@@ -386,6 +413,13 @@ impl HealthMonitor {
                 tr.malformed_reported = snap.malformed;
                 tr.malformed_last_report = Some(now_ms);
             }
+        }
+        if d.all_inputs_gone && !self.cfg.ends_expected {
+            raise(
+                State::Unknown,
+                "every input has ended: the agent receives nothing".into(),
+                &mut state,
+            );
         }
         // Lag: raise above lag_ms, clear below half of it (hysteresis).
         let lag = d.max_queue_age_ms.max(d.tick_delay_ms);
@@ -482,7 +516,8 @@ mod tests {
             vec![Issue::InputSilent {
                 input: "capture".into(),
                 for_ms: 1_200,
-                never: true
+                never: true,
+                malformed: 0,
             }]
         );
         let dev = i[0].deviation();
@@ -635,6 +670,66 @@ mod tests {
         assert_eq!(st.state, State::Ok);
         assert!(i.is_empty());
         assert_eq!(r, vec![Recovery::EvidenceRecovered]);
+    }
+
+    /// Malformed-only input is blind: unknown, then a silence finding that
+    /// counts the junk; never ok.
+    #[test]
+    fn malformed_only_input_is_never_ok() {
+        let mut h = HealthMonitor::new(CFG, 1);
+        let d = DaemonSnapshot::default();
+        let mut s = snap("sock", None);
+        s.malformed = 50;
+        s.last_malformed = Some("not a RobotEvent".into());
+        let (st, i, _) = h.evaluate(500, &[s.clone()], &d);
+        assert_eq!(st.state, State::Unknown);
+        assert!(st.reasons[0].contains("no valid data yet (50 malformed)"));
+        assert!(matches!(&i[..], [Issue::InputMalformed { .. }]));
+        s.malformed = 90;
+        let (st, i, _) = h.evaluate(1_500, &[s.clone()], &d);
+        assert_eq!(st.state, State::Unknown);
+        let silent = i
+            .iter()
+            .find(|x| matches!(x, Issue::InputSilent { .. }))
+            .unwrap();
+        let dev = silent.deviation();
+        assert_eq!(dev.severity, Severity::High);
+        assert!(dev.detail.contains("90 malformed"), "{}", dev.detail);
+        // Valid data then junk only: silent again after silence_ms.
+        s.last_rx_ms = Some(1_600);
+        assert_eq!(h.evaluate(1_700, &[s.clone()], &d).0.state, State::Ok);
+        s.malformed = 500;
+        let (st, i, _) = h.evaluate(2_700, &[s], &d);
+        assert_eq!(st.state, State::Unknown);
+        assert!(i.iter().any(|x| matches!(
+            x,
+            Issue::InputSilent {
+                never: false,
+                malformed: 500,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn all_inputs_gone_is_unknown_unless_expected() {
+        let s = [snap("x", Some(0))];
+        let gone = DaemonSnapshot {
+            all_inputs_gone: true,
+            ..Default::default()
+        };
+        let mut h = HealthMonitor::new(CFG, 1);
+        let (st, _, _) = h.evaluate(10, &s, &gone);
+        assert_eq!(st.state, State::Unknown);
+        assert!(st.reasons.iter().any(|r| r.contains("every input")));
+        let mut h = HealthMonitor::new(
+            HealthConfig {
+                ends_expected: true,
+                ..CFG
+            },
+            1,
+        );
+        assert_eq!(h.evaluate(10, &s, &gone).0.state, State::Ok);
     }
 
     #[test]

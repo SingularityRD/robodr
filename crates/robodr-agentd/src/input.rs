@@ -8,13 +8,31 @@
 //! | JSONL `RobotEvent`s on stdin | bounded line reader | EOF / error |
 //! | JSONL `RobotEvent`s on a unix socket | listener + one reader per connection | error / stop |
 //!
-//! # Backpressure
+//! # Backpressure and memory bound
 //!
 //! Inputs never block on the queue: [`Feed::send`] uses `try_send`; when the
 //! queue is full the item is dropped and counted in
 //! [`InputStats::dropped`] (the daemon turns increases into
 //! `robot.agent.queue_overflow` findings). Blocking would stall a live
 //! capture inside the kernel ring, where losses are invisible.
+//!
+//! The queue is bounded twice: by item count (the channel capacity) **and**
+//! by bytes, through a [`QueueBudget`] shared by every input. Each queued
+//! [`Msg`] holds a [`Charge`] on the budget (datagram payload + source
+//! string + the `Msg` itself; for a JSON event the line length + the `Msg`),
+//! released when the daemon drops the message after handling it (or when
+//! `try_send` fails). An item that does not fit is dropped and counted in
+//! both [`InputStats::dropped`] and [`InputStats::budget_drops`]. So a flood
+//! of 64 KiB datagrams while the pipeline lags pins at most the budget
+//! (default [`DEFAULT_QUEUE_BYTES`]), not `capacity x 64 KiB`.
+//!
+//! # Liveness
+//!
+//! Only **valid** items (a datagram, a parsed `RobotEvent`) count as
+//! activity ([`InputStats::last_rx_ms`]). Malformed lines are counted but do
+//! not reset the silence timer: a stream of nothing but junk (a producer on
+//! a newer schema, or a local process keeping the input "busy") leaves the
+//! agent blind, and health reports it as silent (`unknown`).
 //!
 //! # Hostile input
 //!
@@ -25,7 +43,7 @@
 //! which never panics and bounds its own memory and output.
 
 use std::io::{self, BufRead, BufReader, Read};
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -41,6 +59,75 @@ use robodr_ros2_pipeline::{sanitize, Datagram, DatagramSource, SharedHealth};
 pub const MAX_EVENT_LINE_BYTES: usize = 64 * 1024;
 /// Read timeout of socket readers (stop-flag latency).
 pub const SOCKET_POLL: Duration = Duration::from_millis(200);
+/// Default byte budget of the input queue (all inputs together).
+pub const DEFAULT_QUEUE_BYTES: usize = 32 << 20;
+/// Budget charged for a `RobotEvent` queued through [`Feed::send`] (the
+/// line readers charge the actual line length instead).
+pub const EVENT_ESTIMATE_BYTES: usize = 1024;
+
+/// A byte budget shared by every input feeding one queue.
+#[derive(Debug)]
+pub struct QueueBudget {
+    max: usize,
+    used: AtomicUsize,
+}
+
+impl QueueBudget {
+    pub fn new(max_bytes: usize) -> Arc<Self> {
+        Arc::new(Self {
+            max: max_bytes,
+            used: AtomicUsize::new(0),
+        })
+    }
+
+    /// Bytes currently charged.
+    pub fn used(&self) -> usize {
+        self.used.load(Ordering::Acquire)
+    }
+
+    pub fn max(&self) -> usize {
+        self.max
+    }
+
+    /// Reserve `bytes`, or `None` if that would exceed the budget.
+    pub fn try_charge(self: &Arc<Self>, bytes: usize) -> Option<Charge> {
+        let mut cur = self.used.load(Ordering::Acquire);
+        loop {
+            let next = cur.checked_add(bytes).filter(|n| *n <= self.max)?;
+            match self
+                .used
+                .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    return Some(Charge {
+                        budget: self.clone(),
+                        bytes,
+                    })
+                }
+                Err(now) => cur = now,
+            }
+        }
+    }
+}
+
+/// Bytes reserved on a [`QueueBudget`]; released on drop.
+#[derive(Debug)]
+pub struct Charge {
+    budget: Arc<QueueBudget>,
+    bytes: usize,
+}
+
+impl Charge {
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
 
 /// What an input delivers.
 #[derive(Debug)]
@@ -57,6 +144,9 @@ pub struct Msg {
     /// When it was queued (queue latency = pipeline lag).
     pub at: Instant,
     pub payload: Payload,
+    /// The item's share of the queue's byte budget, released when the
+    /// message is dropped (after it was handled).
+    pub charge: Charge,
 }
 
 /// Counters shared between an input thread and the daemon.
@@ -64,14 +154,17 @@ pub struct Msg {
 pub struct InputStats {
     /// Items delivered by the source (queued or dropped).
     pub received: AtomicU64,
-    /// Items dropped because the queue was full.
+    /// Items dropped because the queue was full (item count or bytes).
     pub dropped: AtomicU64,
+    /// Of `dropped`: items dropped because the queue's byte budget was
+    /// exhausted.
+    pub budget_drops: AtomicU64,
     /// Lines that were too long, not UTF-8 or not a `RobotEvent`.
     pub malformed: AtomicU64,
     /// Rejected connections (unix socket over `max_connections`).
     pub rejected_connections: AtomicU64,
-    /// Milliseconds since the daemon epoch of the last item, plus one
-    /// (0 = never).
+    /// Milliseconds since the daemon epoch of the last **valid** item, plus
+    /// one (0 = never). Malformed items do not update it.
     pub last_rx_ms1: AtomicU64,
     /// The input has ended (EOF, error or stop).
     pub ended: AtomicBool,
@@ -108,15 +201,35 @@ pub struct Feed {
     input: usize,
     stats: Arc<InputStats>,
     epoch: Instant,
+    budget: Arc<QueueBudget>,
 }
 
 impl Feed {
+    /// A feed with its own [`DEFAULT_QUEUE_BYTES`] budget (tests, single
+    /// input). The daemon shares one budget: [`Feed::with_budget`].
     pub fn new(tx: SyncSender<Msg>, input: usize, stats: Arc<InputStats>, epoch: Instant) -> Self {
+        Self::with_budget(
+            tx,
+            input,
+            stats,
+            epoch,
+            QueueBudget::new(DEFAULT_QUEUE_BYTES),
+        )
+    }
+
+    pub fn with_budget(
+        tx: SyncSender<Msg>,
+        input: usize,
+        stats: Arc<InputStats>,
+        epoch: Instant,
+        budget: Arc<QueueBudget>,
+    ) -> Self {
         Self {
             tx,
             input,
             stats,
             epoch,
+            budget,
         }
     }
 
@@ -126,14 +239,33 @@ impl Feed {
     }
 
     /// Queue `payload` without blocking. `false` when the daemon is gone
-    /// (the input thread should stop).
+    /// (the input thread should stop). A datagram is charged its payload and
+    /// source size, an event [`EVENT_ESTIMATE_BYTES`] (plus the `Msg`).
     pub fn send(&self, payload: Payload) -> bool {
+        let size = match &payload {
+            Payload::Datagram(d) => d.payload.capacity().saturating_add(d.src_ip.capacity()),
+            Payload::Event(_) => EVENT_ESTIMATE_BYTES,
+        };
+        self.send_sized(payload, size)
+    }
+
+    /// [`Feed::send`] charging `size` bytes (plus the `Msg` itself).
+    pub fn send_sized(&self, payload: Payload, size: usize) -> bool {
         self.stats.received.fetch_add(1, Ordering::Relaxed);
         self.touch();
+        let bytes = size.saturating_add(std::mem::size_of::<Msg>());
+        // (If the daemon is gone, its queue was discarded with the receiver,
+        // so the budget is free again and `try_send` reports it below.)
+        let Some(charge) = self.budget.try_charge(bytes) else {
+            self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+            self.stats.budget_drops.fetch_add(1, Ordering::Relaxed);
+            return true;
+        };
         let msg = Msg {
             input: self.input,
             at: Instant::now(),
             payload,
+            charge,
         };
         match self.tx.try_send(msg) {
             Ok(()) => true,
@@ -145,10 +277,10 @@ impl Feed {
         }
     }
 
-    /// Count one malformed item (activity: the source is not silent).
+    /// Count one malformed item. Not activity: a malformed-only stream is
+    /// as blind as a silent one (see the module docs).
     pub fn malformed(&self, why: &str) {
         self.stats.malformed.fetch_add(1, Ordering::Relaxed);
-        self.touch();
         *self
             .stats
             .last_malformed
@@ -291,7 +423,7 @@ fn handle_line(line: &[u8], feed: &Feed) -> bool {
         return true;
     }
     match serde_json::from_str::<RobotEvent>(t) {
-        Ok(ev) => feed.send(Payload::Event(Box::new(ev))),
+        Ok(ev) => feed.send_sized(Payload::Event(Box::new(ev)), line.len()),
         Err(e) => {
             feed.malformed(&format!("not a RobotEvent: {e}"));
             true
@@ -306,13 +438,62 @@ pub fn run_stdin(stop: Arc<AtomicBool>, feed: Feed) {
     feed.end(res.err().map(|e| format!("stdin: {e}")));
 }
 
-/// Bind the event socket: a stale socket at `path` is replaced, any other
-/// file there is refused. The socket is made mode 0600 (the parent
-/// directory should be private too: there is a short window between bind
-/// and chmod).
-pub fn bind_event_socket(path: &Path) -> io::Result<UnixListener> {
+/// A bound event socket and the identity (device, inode) of the socket
+/// file this process created, so that only that file is ever removed.
+#[derive(Debug)]
+pub struct EventSocket {
+    pub listener: UnixListener,
+    pub path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+impl EventSocket {
+    /// Remove the socket file if it is still the one this process created
+    /// (same device and inode). A file another instance bound at the path
+    /// since (after this one's was removed) is left alone. `true` if
+    /// removed. There is a small check-then-unlink window; the socket
+    /// directory is private to the daemon's user (`RuntimeDirectory=`).
+    pub fn remove_if_ours(&self) -> bool {
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(m) if m.dev() == self.dev && m.ino() == self.ino => {
+                std::fs::remove_file(&self.path).is_ok()
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Bind the event socket at `path`, mode 0600.
+///
+/// * Nothing there: bind.
+/// * A socket nobody listens on (`connect` is refused): stale, replaced.
+/// * A socket that accepts a connection: another live instance owns it;
+///   refused with `AddrInUse` (it is never unlinked from under it).
+/// * Anything else (a file, a directory, a symlink): refused.
+///
+/// The parent directory should be private too: there is a short window
+/// between bind and chmod.
+pub fn bind_event_socket(path: &Path) -> io::Result<EventSocket> {
     match std::fs::symlink_metadata(path) {
-        Ok(m) if m.file_type().is_socket() => std::fs::remove_file(path)?,
+        Ok(m) if m.file_type().is_socket() => match UnixStream::connect(path) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!(
+                        "{} is in use: another process is listening on it",
+                        path.display()
+                    ),
+                ))
+            }
+            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => std::fs::remove_file(path)?,
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("{}: probing the existing socket: {e}", path.display()),
+                ))
+            }
+        },
         Ok(_) => {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -322,22 +503,33 @@ pub fn bind_event_socket(path: &Path) -> io::Result<UnixListener> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    let l = UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    l.set_nonblocking(true)?;
-    Ok(l)
+    let listener = UnixListener::bind(path)?;
+    let meta = std::fs::symlink_metadata(path)?;
+    let sock = EventSocket {
+        listener,
+        path: path.to_path_buf(),
+        dev: meta.dev(),
+        ino: meta.ino(),
+    };
+    let res = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .and_then(|()| sock.listener.set_nonblocking(true));
+    if let Err(e) = res {
+        sock.remove_if_ours();
+        return Err(e);
+    }
+    Ok(sock)
 }
 
-/// Accept connections on `listener` (at most `max_connections` at once;
-/// more are closed and counted), one reader thread each, until `stop`.
-/// Removes the socket file on exit.
+/// Accept connections on `sock` (at most `max_connections` at once; more
+/// are closed and counted), one reader thread each, until `stop`. Removes
+/// the socket file on exit, if it is still the one `sock` created.
 pub fn run_unix_listener(
-    listener: UnixListener,
-    path: PathBuf,
+    sock: EventSocket,
     max_connections: usize,
     stop: Arc<AtomicBool>,
     feed: Feed,
 ) {
+    let listener = &sock.listener;
     let active = Arc::new(AtomicUsize::new(0));
     let mut readers: Vec<JoinHandle<()>> = Vec::new();
     while !stop.load(Ordering::Relaxed) {
@@ -376,8 +568,8 @@ pub fn run_unix_listener(
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => {
-                feed.end(Some(format!("{}: accept: {e}", path.display())));
-                let _ = std::fs::remove_file(&path);
+                feed.end(Some(format!("{}: accept: {e}", sock.path.display())));
+                sock.remove_if_ours();
                 return;
             }
         }
@@ -385,7 +577,7 @@ pub fn run_unix_listener(
     for h in readers {
         let _ = h.join();
     }
-    let _ = std::fs::remove_file(&path);
+    sock.remove_if_ours();
     feed.end(None);
 }
 
@@ -521,7 +713,8 @@ mod tests {
         let (f, rx, st) = feed(64);
         let stop = Arc::new(AtomicBool::new(false));
         let (s2, p2) = (stop.clone(), path.clone());
-        let h = std::thread::spawn(move || run_unix_listener(l, p2, 1, s2, f));
+        assert_eq!(l.path, p2);
+        let h = std::thread::spawn(move || run_unix_listener(l, 1, s2, f));
         let mut c = UnixStream::connect(&path).unwrap();
         use std::io::Write;
         writeln!(c, "{CMD}").unwrap();
@@ -544,6 +737,92 @@ mod tests {
         assert_eq!(st.rejected_connections.load(Ordering::Relaxed), 1);
         assert!(st.ended.load(Ordering::SeqCst));
         assert!(!path.exists(), "socket removed at stop");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_lines_are_not_activity() {
+        let (f, rx, st) = feed(16);
+        let junk = "not json\n{\"kind\":\"motion_command_v2\"}\n".repeat(20);
+        read_event_lines(junk.as_bytes(), &AtomicBool::new(false), &f).unwrap();
+        assert_eq!(events(&rx), 0);
+        assert_eq!(st.malformed.load(Ordering::Relaxed), 40);
+        assert_eq!(st.last_rx_ms(), None, "junk must not reset silence");
+        read_event_lines(format!("{CMD}\n").as_bytes(), &AtomicBool::new(false), &f).unwrap();
+        assert!(st.last_rx_ms().is_some());
+    }
+
+    #[test]
+    fn byte_budget_bounds_the_queue_and_is_released() {
+        let (tx, rx) = sync_channel(10_000);
+        let st = Arc::new(InputStats::default());
+        let budget = QueueBudget::new(1 << 20);
+        let f = Feed::with_budget(tx, 0, st.clone(), Instant::now(), budget.clone());
+        for _ in 0..100 {
+            assert!(f.send(Payload::Datagram(Datagram::new(
+                vec![0; 65_000],
+                "10.0.0.9"
+            ))));
+        }
+        let held = budget.used();
+        assert!(held <= 1 << 20, "{held}");
+        let queued = st.received.load(Ordering::Relaxed) - st.dropped.load(Ordering::Relaxed);
+        assert_eq!(queued, 16, "1 MiB / ~64 KiB");
+        assert_eq!(st.dropped.load(Ordering::Relaxed), 84);
+        assert_eq!(st.budget_drops.load(Ordering::Relaxed), 84);
+        // Handling (dropping) the messages frees the budget.
+        let msgs: Vec<Msg> = rx.try_iter().collect();
+        assert_eq!(msgs.len(), 16);
+        assert!(msgs.iter().all(|m| m.charge.bytes() > 65_000));
+        drop(msgs);
+        assert_eq!(budget.used(), 0);
+        assert!(f.send(Payload::Datagram(Datagram::new(vec![0; 10], "x"))));
+        assert_eq!(budget.used(), rx.try_recv().unwrap().charge.bytes());
+        // An item larger than the whole budget never fits.
+        let tiny = QueueBudget::new(100);
+        assert!(tiny.try_charge(101).is_none());
+        let c = tiny.try_charge(100).unwrap();
+        assert!(tiny.try_charge(1).is_none());
+        drop(c);
+        assert!(tiny.try_charge(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn full_channel_releases_the_charge() {
+        let (tx, _rx) = sync_channel(1);
+        let st = Arc::new(InputStats::default());
+        let budget = QueueBudget::new(1 << 20);
+        let f = Feed::with_budget(tx, 0, st.clone(), Instant::now(), budget.clone());
+        for _ in 0..5 {
+            f.send(Payload::Datagram(Datagram::new(vec![0; 1000], "x")));
+        }
+        assert_eq!(st.dropped.load(Ordering::Relaxed), 4);
+        assert_eq!(st.budget_drops.load(Ordering::Relaxed), 0);
+        assert!(budget.used() < 2000, "only the queued item is charged");
+    }
+
+    #[test]
+    fn live_socket_is_not_stolen_and_cleanup_checks_the_inode() {
+        let dir = std::env::temp_dir().join(format!("robodr-agentd-steal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ev.sock");
+        let first = bind_event_socket(&path).unwrap();
+        let e = bind_event_socket(&path).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AddrInUse, "{e}");
+        assert!(UnixStream::connect(&path).is_ok(), "first still reachable");
+        // Someone else replaces the file: the first instance's cleanup
+        // leaves the newcomer's socket alone.
+        std::fs::remove_file(&path).unwrap();
+        let other = UnixListener::bind(&path).unwrap();
+        assert!(!first.remove_if_ours());
+        assert!(path.exists());
+        drop(other);
+        // Stale (nobody listening): replaced, and removed by its owner.
+        let second = bind_event_socket(&path).unwrap();
+        assert!(second.remove_if_ours());
+        assert!(!path.exists());
+        assert!(!second.remove_if_ours());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

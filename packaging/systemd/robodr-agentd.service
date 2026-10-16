@@ -23,7 +23,12 @@
 #     the systemd credential copy satisfies. An optional unix_socket event
 #     input belongs under /run/robodr-agentd/ (RuntimeDirectory= below; the
 #     socket is created 0600, so producers must run as User=robodr).
-#   * It does not call sd_notify: Type=simple, no WatchdogSec=.
+#   * sd_notify (std-only, crates/robodr-agentd/src/notify.rs): READY=1 once
+#     started (Type=notify), WATCHDOG=1 from the main loop at most every 1 s,
+#     STATUS=state <ok|degraded|unknown> each tick, STOPPING=1 at shutdown.
+#     A main loop stalled for WatchdogSec= (slow fsync, hang) is killed and
+#     restarted. status.json carries updated_mono_ms / boot_id /
+#     stale_after_ms: consumers treat a stale status as `unknown`.
 #   * It reads /proc/sys/kernel/random/boot_id (chain identity) and
 #     /proc/net/{route,fib_trie,if_inet6} (default capture interfaces, local
 #     addresses for the binding check), so ProcSubset=pid must NOT be set.
@@ -40,15 +45,35 @@ StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 ExecStart=/usr/sbin/robodr-agentd --config /etc/robodr/agentd.json
 Restart=on-failure
 RestartSec=5s
 # Exit 2 = usage or configuration error: restarting cannot fix it.
 RestartPreventExitStatus=2
 TimeoutStopSec=30s
-# No WatchdogSec= until the daemon sends WATCHDOG=1 (it would be killed).
-OOMScoreAdjust=-500
+# The main loop pings every <= 1 s; 60 s leaves room for a slow (but
+# progressing) fsync of critical evidence before the loop is declared hung.
+WatchdogSec=60s
+
+# --- Memory ------------------------------------------------------------------
+# agentd must never be the reason the motion stack is OOM-killed:
+#   * OOMScoreAdjust is POSITIVE: under system-wide memory pressure the
+#     kernel picks agentd before the platform's processes (default 0). Losing
+#     the monitor is visible (stale status.json, missing heartbeats, the
+#     watchdog/restart); losing the motion stack is a safety event.
+#   * MemoryMax= caps the whole unit, so a runaway agentd hits its own
+#     cgroup limit (and only agentd is killed, then restarted by
+#     Restart=on-failure) long before it can pressure the rest of the robot.
+#     Budget: input queue <= daemon.queue_bytes (default 32 MiB, max 256 MiB),
+#     pipeline/agent state bounded by their own caps, the black box streams
+#     to disk. MemoryHigh= throttles (reclaim) before the hard cap.
+#     These figures are estimates, not measured on the target: size them
+#     from the commissioning run (systemctl show -p MemoryPeak).
+OOMScoreAdjust=200
+MemoryHigh=384M
+MemoryMax=512M
 
 # --- Identity and capabilities ---------------------------------------------
 # Dedicated, unprivileged system user (packaging/sysusers.d/robodr.conf).

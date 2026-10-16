@@ -44,7 +44,7 @@ must be absolute.
 | `firewall` | Optional. `max_angular` (rad/s for every profiled Twist channel) and `allow` (writer GUIDs per channel). Runs **recording-only** (see below). |
 | `motion_monitor` | Optional. `config_path` (strict `MonitorConfig`; default: the UGV defaults on the profile's motion channels) and `feedback_sources`. Feedback sources that are ROS topic names (`/odom`) are also decoded from the bus. |
 | `sensor.motion` | Optional. The live motion decode path: `enabled` (default true), `feedback_topics` (e.g. `["/odom"]`), `max_writers`, `max_samples_per_datagram` (`evaluate_commands` is accepted but the daemon always lets the agent evaluate). Unknown keys are refused. |
-| `daemon` | `queue_capacity` 4096, `tick_ms` 1000, `heartbeat_ms` 10000, `silence_ms` 30000, `lag_ms` 2000, `health_report_ms` 10000, `exit_when_inputs_end` false |
+| `daemon` | `queue_capacity` 4096 (max 65536), `queue_bytes` 33554432 (32 MiB; 1 MiB..=256 MiB), `tick_ms` 1000, `heartbeat_ms` 10000, `silence_ms` 30000, `lag_ms` 2000, `health_report_ms` 10000, `exit_when_inputs_end` false |
 
 **Key.** Keys are never accepted on the command line. `blackbox.key_file`
 is either a secret key file as written by `robodr-blackbox keygen --out FILE`
@@ -124,7 +124,13 @@ unattributed, known writers, ...).
     is not spooled: it is counted, it stays in the black box, and the daemon
     raises a `robot.agent.spool_full` finding. Health findings can use a
     small reserve.
-  - `status.json` is rewritten every tick. `checkpoint.json` is the final
+  - `status.json` is rewritten every tick. It carries `updated_mono_ms`
+    (`CLOCK_MONOTONIC`, ms), `boot_id` and `stale_after_ms` (2 x `tick_ms`
+    + `lag_ms`). **A consumer must show `unknown`** when `running` is false,
+    the boot id is not the current one, or the status is older than
+    `stale_after_ms` (a stalled main loop leaves its last `ok` behind);
+    `robodr_agentd::effective_state` implements that rule.
+    `checkpoint.json` is the final
     black-box seal, written at shutdown so the exporter can take it
     off-unit.
 
@@ -133,12 +139,15 @@ unattributed, known writers, ...).
 The robot's state in `status.json` and in the heartbeat is one of three
 values:
 
-- `ok`: every input delivered data within `silence_ms`, nothing was dropped,
-  no lag, and the profile is enforced.
+- `ok`: every input delivered **valid** data within `silence_ms`, nothing
+  was dropped, no lag, and the profile is enforced. Malformed lines are
+  counted (`input_malformed`) but are not data: an input that sends only
+  junk goes silent (`input_silent`, `unknown`).
 - `degraded`: queue drops, a profile that is not enforced, spool trouble, or
   black-box trouble.
-- `unknown`: an input is silent, ended, or has sent **no data yet**, or the
-  pipeline lags.
+- `unknown`: an input is silent, ended, or has sent **no data yet**, every
+  input has ended (live mode: the daemon keeps running, idle, and says so),
+  or the pipeline lags.
 
 The state is never `ok` before data has arrived.
 
@@ -155,14 +164,30 @@ request.
 
 ## Robustness
 
-- **Bounded memory.** The queue holds at most `queue_capacity` items. When
-  it is full, the item is dropped and counted; a capture thread is never
-  blocked.
+- **Bounded memory.** The queue holds at most `queue_capacity` items **and**
+  at most `queue_bytes` bytes (payloads plus per-item overhead, one budget
+  shared by all inputs). When either is exhausted, the item is dropped and
+  counted (`dropped`, and `budget_drops` for the byte bound); a capture
+  thread is never blocked. The systemd unit adds `MemoryMax=` and a
+  positive `OOMScoreAdjust=` so agentd, not the motion stack, is the one
+  that goes under memory pressure.
+- **No busy loop.** When every input has ended in live mode, the loop
+  sleeps to its next deadline instead of polling the disconnected queue.
+- **Watchdog.** `READY=1`, `WATCHDOG=1` (from the main loop, every <= 1 s),
+  `STATUS=` and `STOPPING=1` go to `NOTIFY_SOCKET` (std `UnixDatagram`,
+  path or abstract); the unit is `Type=notify` with `WatchdogSec=60s`.
 - **JSON line limits.** Lines are capped at 64 KiB, and an overlong line is
   skipped without being buffered. Non-UTF-8 or non-`RobotEvent` lines are
   counted and skipped. A stream does not end on bad data.
 - **Socket limits.** Unix-socket connections are capped. The socket is
-  created with mode 0600.
+  created with mode 0600. A socket at the path that still accepts
+  connections belongs to a live instance and is refused (never unlinked);
+  only a stale one (connection refused) is replaced. At exit the file is
+  removed only if it is still the inode this process created.
+- **Directory aliasing.** `spool.dir` and `blackbox.dir` may not overlap and
+  the profile state file may not live in either, compared after resolving
+  symlinks and `..` (at configuration time and again on the created
+  directories).
 - **Datagrams** go through the pipeline, which never panics and bounds its
   own memory and output.
 - **Housekeeping under load.** The main loop handles at most 256 items, and
@@ -180,6 +205,7 @@ request.
 | `tests/health.rs` | A silent input reads `unknown` (never `ok`) with an observe-only High finding. Live data turns the state `ok`. Silence again raises a new finding with the same id and a higher count. |
 | `tests/binary.rs` | The real binary: exit code 2 on usage and configuration errors, on a 0644 key file and on an unknown key. SIGTERM and SIGINT give exit 0, a sealed black box that verifies with the spool's `checkpoint.json`, and a stop note. |
 | `tests/motion_live.rs` | A synthetic pcap with SEDP plus CDR `Twist` on `rt/cmd_vel` (0.4 m/s, then 2.5 m/s against a 1.0 m/s envelope) and CDR `Odometry` on `rt/odom`: three motion events reach the agent, exactly one Critical `robot.motion.linear_over_envelope` finding is spooled, the black box holds the decoded command (with its writer GUID) and a firewall verdict with `enforcing: false`, and verifies. A garbage payload on `rt/cmd_vel` yields one Medium `robot.motion.undecodable_sample` and the next good command still flows. `sensor.motion` keys are strict. |
+| `tests/review_regressions.rs` | Fourth-review fixes: no busy loop once every input ended (thread CPU < 25% of wall, state `unknown`); a malformed-only stream is never `ok` (`input_silent` + `input_malformed`); `..` and a late symlink cannot alias spool and black box; a live event socket is not stolen and cleanup checks the inode; the queue's byte budget; `READY`/`WATCHDOG`/`STATUS`/`STOPPING` over a notify socket and stale or other-boot `status.json` read as `unknown`; hostile event lines do not panic. |
 | `tests/agent_api.rs` | `Agent::handle_external`: sensor deviations get real plans when enforcing. Self-health and observe-mode deviations never get an action plan. |
 | unit tests | Config strictness and key file checks, spool atomicity and bounds, the line reader (CRLF, overlong lines, timeouts, a full queue), the unix socket, and the health state machine. |
 
@@ -215,7 +241,9 @@ request.
   verifier can forge). Wall time is recorded with `TimeSource::Unknown`.
 - **A dead daemon reports nothing.** If the process dies, nothing inside it
   can report that. A console must treat a missing or stale `status.json` or
-  heartbeat as `unknown`. There is no systemd watchdog integration yet.
+  heartbeat as `unknown`. The systemd watchdog restarts a hung loop; the
+  watchdog itself is untested under real systemd here (the protocol is
+  tested against a local datagram socket).
 - **Stdin can block shutdown's join.** The stdin reader blocks in `read` and
   is not joined at shutdown. Socket and capture readers poll with timeouts
   (at most about 0.5 s).
