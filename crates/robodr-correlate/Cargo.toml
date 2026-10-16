@@ -1,0 +1,13 @@
+[package]
+name = "robodr-correlate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Correlation engine (pure, deterministic, bounded memory): combines weak host-side (Pulsar) and network-side (ROS 2 graph) signals into stronger findings with cited evidence."
+
+[dependencies]
+robodr-events = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
