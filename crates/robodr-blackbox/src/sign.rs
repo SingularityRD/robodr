@@ -84,6 +84,32 @@ pub trait Verifier {
     fn verify_as(&self, key_id: &str, message: &[u8], signature: &[u8]) -> bool {
         self.key_id() == key_id && self.verify(message, signature)
     }
+    /// `true` iff `signature` is valid for `message` under the key named
+    /// `key_id` **and** that key's algorithm is `algorithm`. This is what
+    /// record verification uses: the evidence names the key (chain
+    /// identity, `KeyRotation`), and only that key, of that algorithm, may
+    /// vouch for it. The default accepts only this verifier's own key id
+    /// and algorithm; a [`crate::keys::Keyring`] looks the key up.
+    fn verify_key(&self, key_id: &str, algorithm: &str, message: &[u8], signature: &[u8]) -> bool {
+        self.algorithm() == algorithm && self.verify_as(key_id, message, signature)
+    }
+    /// The device (unit) the key `key_id` is bound to, if this verifier
+    /// knows one (a key file's `device_id`, kept by a
+    /// [`crate::keys::Keyring`]). A bound key verifies only chains whose
+    /// identity names that device. `None` (the default): not bound.
+    fn key_device(&self, key_id: &str) -> Option<&str> {
+        let _ = key_id;
+        None
+    }
+    /// `true` iff *any* key this verifier holds accepts `signature`. Only
+    /// for trusted local inputs where every key is known to belong to the
+    /// caller (the recorder's own `previous_keys`,
+    /// [`crate::Recorder::open_with_keys`]); never for evidence from
+    /// elsewhere, which must name its key ([`Verifier::verify_key`]). The
+    /// default is [`Verifier::verify`].
+    fn verify_any(&self, message: &[u8], signature: &[u8]) -> bool {
+        self.verify(message, signature)
+    }
 }
 
 /// Why an HMAC key was rejected.

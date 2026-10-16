@@ -2,9 +2,10 @@
 //!
 //! ```text
 //! robodr-blackbox keygen     --out FILE [--alg ed25519|hmac] [--key-id ID] [--pub-out FILE]
+//!                            [--device ID]
 //! robodr-blackbox export-pub KEYFILE [--out FILE]
 //! robodr-blackbox verify     DIR --keyring FILE [--keyring FILE]... [--checkpoint FILE]
-//!                            [--device ID] [--strict] [--json]
+//!                            [--device ID] [--allow-mixed-algorithms] [--strict] [--json]
 //! robodr-blackbox inspect    DIR|SEGMENT [--json] [--limit N]
 //! ```
 //!
@@ -15,6 +16,8 @@
 //!   (`robodr-blackbox-key/v1`, 0600, no public half) and warns. Nothing
 //!   is ever overwritten or written through a symlink; if either target
 //!   exists nothing is written. It prints the key id, never the secret.
+//!   `--device ID` binds the key to that unit (`device_id` in both files):
+//!   verifiers then accept it only for chains of that device.
 //! - `export-pub` writes (or prints) the public key file of an Ed25519
 //!   secret key file. HMAC keys have no public half and are refused.
 //! - `verify` checks a log directory with every key in the given key or
@@ -23,7 +26,10 @@
 //!   refused if group or others can access them or if they are owned by
 //!   another user (root excepted). `--checkpoint` is a trusted checkpoint
 //!   held off the unit; without it the directory's own `checkpoint.json`
-//!   is used.
+//!   is used. Each record is checked under the key its chain names (see
+//!   `robodr_blackbox::verify`), never under "any key given". Mixing HMAC
+//!   and Ed25519 keys is refused unless `--allow-mixed-algorithms` (needed
+//!   only for a log that rotated from a legacy HMAC key to Ed25519).
 //! - `inspect` lists frames (seq, kind, flags, time, payload) without
 //!   checking any signature: it is a viewer, not a verdict.
 //!
@@ -45,9 +51,10 @@ use std::process::ExitCode;
 
 const USAGE: &str = "usage:
   robodr-blackbox keygen     --out FILE [--alg ed25519|hmac] [--key-id ID] [--pub-out FILE]
+                             [--device ID]
   robodr-blackbox export-pub KEYFILE [--out FILE]
   robodr-blackbox verify     DIR --keyring FILE [--keyring FILE]... [--checkpoint FILE]
-                             [--device ID] [--strict] [--json]
+                             [--device ID] [--allow-mixed-algorithms] [--strict] [--json]
   robodr-blackbox inspect    DIR|SEGMENT [--json] [--limit N]
 keygen defaults to ed25519 (secret FILE, 0600; public FILE.pub, safe to share).
 --keyring accepts secret key files (0600, own user or root) and public key
@@ -163,7 +170,7 @@ fn main() -> ExitCode {
 }
 
 fn keygen(raw: &[String]) -> Result<(), Fail> {
-    let a = Args::parse(raw, &["out", "key-id", "alg", "pub-out"], &[])?;
+    let a = Args::parse(raw, &["out", "key-id", "alg", "pub-out", "device"], &[])?;
     if !a.positional.is_empty() {
         return Err("keygen takes no positional arguments".to_string().into());
     }
@@ -195,7 +202,10 @@ fn keygen(raw: &[String]) -> Result<(), Fail> {
             return Err(format!("{}: refusing to overwrite an existing file", p.display()).into());
         }
     }
-    let key = KeyFile::generate(alg, a.one("key-id")?).map_err(|e| e.to_string())?;
+    let device = a.one("device")?;
+    let key = KeyFile::generate(alg, a.one("key-id")?)
+        .and_then(|k| k.with_device_id(device))
+        .map_err(|e| e.to_string())?;
     key.write_new(out)
         .map_err(|e| format!("{}: {e}", out.display()))?;
     if let Some(p) = &pub_out {
@@ -242,7 +252,7 @@ fn verify(raw: &[String]) -> Result<(), Fail> {
     let a = Args::parse(
         raw,
         &["keyring", "checkpoint", "device"],
-        &["strict", "json"],
+        &["strict", "json", "allow-mixed-algorithms"],
     )?;
     let dir = PathBuf::from(a.single_positional("log directory")?);
     let files = a.all("keyring");
@@ -250,6 +260,7 @@ fn verify(raw: &[String]) -> Result<(), Fail> {
         return Err("--keyring FILE is required".to_string().into());
     }
     let mut ring = Keyring::new();
+    ring.set_allow_mixed_algorithms(a.flag("allow-mixed-algorithms"));
     for f in files {
         ring.load_file(Path::new(f))
             .map_err(|e| format!("{f}: {e}"))?;

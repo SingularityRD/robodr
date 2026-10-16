@@ -25,7 +25,9 @@
 //! 2. Recomputed hash != stored hash: `HashMismatch` (content modified).
 //! 3. Hash fine, signature invalid: `BadSignature` (modified and re-hashed, or
 //!    forged/inserted without the key). If *no* record verifies, a single
-//!    `KeyMismatch` is reported instead.
+//!    `KeyMismatch` is reported instead. Each record is checked under exactly
+//!    the key the evidence names for it, never under "any key the verifier
+//!    holds" (see *Which key signs a record* below).
 //! 4. Records whose `chain_id` differs from the chain's: `ForeignChain`
 //!    (replayed from another device, boot or chain).
 //! 5. Among authentic records of the chain: same seq twice with the same
@@ -51,18 +53,53 @@
 //!    which is then a warning (`RecoveryRecorded`), not `Deleted`.
 //!    `KeyRotation` records are `KeyRotationRecorded` (info); verify a chain
 //!    spanning a rotation with a [`crate::keys::Keyring`] holding both keys.
+//!
+//! # Which key signs a record
+//!
+//! Records do not name their key; the chain does. Every record carries its
+//! `chain_id`, which is the hash of a [`ChainIdentity`] naming the chain's
+//! first key (`key_id` **and** `algorithm`). Per chain, in log order:
+//!
+//! - The starting key is [`VerifyOptions::signing_key`] (trusted: e.g. a
+//!   receiver's state after an earlier bundle) or else the identity's key
+//!   (from any `Genesis`/`SegmentStart` that hashes to the chain id, or
+//!   [`VerifyOptions::identity`] for a bundle).
+//! - A `KeyRotation` that verifies under the current key and whose `from` is
+//!   the current key switches to its `to` key. This is the only way an
+//!   established key changes.
+//! - A `SegmentStart` names the key of its segment (`signing_key`, or the
+//!   identity's key). It may set the key when none is established by the
+//!   evidence yet (a retained tail after cyclic retention dropped the
+//!   rotation). If it names a key other than the identity's, that key is
+//!   *unproven*: unless the verifier binds it to the chain's device
+//!   ([`Verifier::key_device`]), records it signs give one
+//!   `SigningKeyUnproven` warning. A `SegmentStart` (or `Genesis`) that
+//!   names another key than an established one is `KeySwitchRefused`
+//!   (tamper) and its records are checked under the established key.
+//! - Each record is checked with [`Verifier::verify_key`]: that key id, that
+//!   algorithm. A key the verifier binds to another device than the chain's
+//!   never verifies (`KeyDeviceMismatch`, tamper).
+//! - With no identity at all for a chain, the record is checked with
+//!   [`Verifier::verify`], which a multi-key keyring refuses (ambiguous).
+//!
+//! So a keyring that holds unit B's key (or an HMAC key the verifying
+//! station could sign with) does not authenticate a log whose identity
+//! says `ed25519` / unit A. The remaining limit: an *unbound* key that the
+//! evidence itself names in a `SegmentStart` is reported only as a warning;
+//! bind fleet keys to their units (`device_id` in the key file) to make
+//! that a hard failure.
 
 use crate::crypto::to_hex;
 use crate::export::{Anchor, Checkpoint};
 use crate::record::{
-    scan_frames, short_hex, signing_message, ChainIdentity, GenesisPayload, Hash,
+    scan_frames, short_hex, signing_message, ChainIdentity, GenesisPayload, Hash, KeyRef,
     KeyRotationPayload, Record, RecordKind, RecoveryPayload, ScanItem, SegmentDroppedPayload,
     SegmentStartPayload, TailKind, TruncationPayload, ZERO_HASH,
 };
 use crate::sign::Verifier;
 use crate::store::{list_segments, parse_segment_file_name, CHECKPOINT_FILE};
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 
@@ -84,6 +121,15 @@ pub struct VerifyOptions {
     pub trusted_anchor: Option<Anchor>,
     /// Trusted checkpoint that must still be present.
     pub checkpoint: Option<Checkpoint>,
+    /// Chain identity to use when the evidence holds no `Genesis` or
+    /// `SegmentStart` for a chain (an export bundle). Not trusted on its own:
+    /// it applies only to records whose `chain_id` it hashes to.
+    pub identity: Option<ChainIdentity>,
+    /// Trusted key that signs the first records of the expected chain (the
+    /// key in effect right after the trusted anchor, e.g.
+    /// [`Report::signing_key`] of the previous bundle). Default: the chain
+    /// identity's key.
+    pub signing_key: Option<KeyRef>,
 }
 
 /// Seriousness of a finding.
@@ -256,6 +302,28 @@ pub enum FindingKind {
         prev_mono_ns: u64,
         mono_ns: u64,
     },
+    /// A record names a key the verifier binds to another device.
+    KeyDeviceMismatch {
+        seq: u64,
+        key_id: String,
+        key_device: String,
+        chain_device: String,
+    },
+    /// A `Genesis`/`SegmentStart` names another signing key than the one
+    /// already established for the chain (only an authenticated
+    /// `KeyRotation` may change it).
+    KeySwitchRefused {
+        seq: u64,
+        established_key_id: String,
+        named_key_id: String,
+    },
+    /// Records verify under a key named only by a `SegmentStart` (no
+    /// authenticated rotation to it in the evidence) and not bound to the
+    /// chain's device: the key id attributes them, nothing else does.
+    SigningKeyUnproven {
+        seq: u64,
+        key_id: String,
+    },
     Empty,
 }
 
@@ -269,6 +337,7 @@ impl FindingKind {
             | CheckpointInvalid { .. }
             | TimeRegression { .. }
             | RecoveryRecorded { .. }
+            | SigningKeyUnproven { .. }
             | Empty => FindingLevel::Warning,
             HeadDropRecorded { .. }
             | AnchorUnverified { .. }
@@ -435,6 +504,30 @@ impl fmt::Display for FindingKind {
                 f,
                 "record {seq} monotonic time {mono_ns} < previous {prev_mono_ns}"
             ),
+            KeyDeviceMismatch {
+                seq,
+                key_id,
+                key_device,
+                chain_device,
+            } => write!(
+                f,
+                "record {seq}: key {key_id} belongs to device {key_device}, \
+                 the chain to {chain_device}"
+            ),
+            KeySwitchRefused {
+                seq,
+                established_key_id,
+                named_key_id,
+            } => write!(
+                f,
+                "record {seq} names key {named_key_id} but {established_key_id} is the \
+                 established key (no authenticated rotation)"
+            ),
+            SigningKeyUnproven { seq, key_id } => write!(
+                f,
+                "records from {seq} are signed by {key_id}, named only by a segment start \
+                 (no rotation record retained, key not bound to the device)"
+            ),
             Empty => write!(f, "no records"),
         }
     }
@@ -489,6 +582,9 @@ pub struct Report {
     pub chain_id: Option<String>,
     pub identity: Option<ChainIdentity>,
     pub last_seal_seq: Option<u64>,
+    /// Key in effect after the last record of the expected chain (pass it
+    /// as [`VerifyOptions::signing_key`] when verifying what follows).
+    pub signing_key: Option<KeyRef>,
 }
 
 impl Report {
@@ -551,6 +647,31 @@ impl Ctx<'_> {
     }
     fn rec(&self, pos: usize) -> &Record {
         self.items[pos].rec.as_ref().expect("record item")
+    }
+}
+
+/// How far the evidence establishes the current signing key of a chain.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Trust {
+    /// The chain identity's key (or none), not yet confirmed by position:
+    /// a `SegmentStart` may still name another one.
+    Initial,
+    /// Established (genesis, authenticated rotation, trusted option, or a
+    /// key bound to the chain's device); only a rotation changes it.
+    Proven,
+    /// Named only by a `SegmentStart`.
+    Unproven,
+}
+
+struct KeyState {
+    key: Option<KeyRef>,
+    trust: Trust,
+}
+
+fn key_of(id: &ChainIdentity) -> KeyRef {
+    KeyRef {
+        key_id: id.key_id.clone(),
+        algorithm: id.algorithm.clone(),
     }
 }
 
@@ -642,15 +763,137 @@ pub fn verify_segments(
         }
     }
 
-    // 3. Signatures.
-    let mut sig_ok = vec![false; n];
-    let mut recorded_key_id = None;
+    // 3. Signatures, each under the key the evidence names for its record
+    //    (see "Which key signs a record" in the module docs).
+    let mut chain_ids: HashMap<Hash, ChainIdentity> = HashMap::new();
     for pos in 0..n {
         if hash_ok[pos] {
             let r = cx.rec(pos);
-            sig_ok[pos] = verifier.verify(&signing_message(&r.hash), &r.sig);
-            if recorded_key_id.is_none() {
-                recorded_key_id = identity_of(r).map(|i| i.key_id);
+            if let Some(id) = identity_of(r).filter(|i| i.chain_id() == r.chain_id) {
+                chain_ids.entry(r.chain_id).or_insert(id);
+            }
+        }
+    }
+    if let Some(id) = &opts.identity {
+        chain_ids.entry(id.chain_id()).or_insert_with(|| id.clone());
+    }
+    let mut states: HashMap<Hash, KeyState> = HashMap::new();
+    // Key findings, emitted once the expected chain is known: (pos, chain, kind).
+    let mut key_findings: Vec<(usize, Hash, FindingKind)> = Vec::new();
+    let mut reported_keys: HashSet<(Hash, String, u8)> = HashSet::new();
+    let mut sig_ok = vec![false; n];
+    let mut recorded_key_id = None;
+    for pos in 0..n {
+        if !hash_ok[pos] {
+            continue;
+        }
+        let r = cx.rec(pos);
+        let chain = r.chain_id;
+        let chain_identity = chain_ids.get(&chain);
+        let st = states
+            .entry(chain)
+            .or_insert_with(|| match &opts.signing_key {
+                Some(k) if opts.expected_chain_id.is_none_or(|c| c == chain) => KeyState {
+                    key: Some(k.clone()),
+                    trust: Trust::Proven,
+                },
+                _ => KeyState {
+                    key: chain_identity.map(key_of),
+                    trust: Trust::Initial,
+                },
+            });
+        if recorded_key_id.is_none() {
+            recorded_key_id = identity_of(r).map(|i| i.key_id);
+        }
+        // A Genesis / SegmentStart names the key of what follows.
+        if let Some(id) = identity_of(r).filter(|i| i.chain_id() == chain) {
+            let chain_key = key_of(&id);
+            let named = match r.kind {
+                RecordKind::SegmentStart => r
+                    .payload_json::<SegmentStartPayload>()
+                    .and_then(|p| p.signing_key)
+                    .unwrap_or_else(|| chain_key.clone()),
+                _ => chain_key.clone(),
+            };
+            if st.key.as_ref() != Some(&named) {
+                if st.trust == Trust::Proven && st.key.is_some() {
+                    key_findings.push((
+                        pos,
+                        chain,
+                        FindingKind::KeySwitchRefused {
+                            seq: r.seq,
+                            established_key_id: st
+                                .key
+                                .as_ref()
+                                .map(|k| k.key_id.clone())
+                                .unwrap_or_default(),
+                            named_key_id: named.key_id.clone(),
+                        },
+                    ));
+                } else {
+                    st.trust = if named == chain_key {
+                        Trust::Initial
+                    } else {
+                        Trust::Unproven
+                    };
+                    st.key = Some(named);
+                }
+            }
+            if r.kind == RecordKind::Genesis && st.key.as_ref() == Some(&chain_key) {
+                st.trust = Trust::Proven;
+            }
+        }
+        let msg = signing_message(&r.hash);
+        let mut ok = match &st.key {
+            Some(k) => verifier.verify_key(&k.key_id, &k.algorithm, &msg, &r.sig),
+            None => verifier.verify(&msg, &r.sig),
+        };
+        if let (true, Some(k)) = (ok, &st.key) {
+            let chain_device = chain_identity.map(|i| i.device_id.as_str());
+            match (verifier.key_device(&k.key_id), chain_device) {
+                (Some(kd), Some(cd)) if kd != cd => {
+                    ok = false;
+                    if reported_keys.insert((chain, k.key_id.clone(), 0)) {
+                        key_findings.push((
+                            pos,
+                            chain,
+                            FindingKind::KeyDeviceMismatch {
+                                seq: r.seq,
+                                key_id: k.key_id.clone(),
+                                key_device: kd.to_string(),
+                                chain_device: cd.to_string(),
+                            },
+                        ));
+                    }
+                }
+                // Bound to this very device: as good as a rotation.
+                (Some(_), Some(_)) if st.trust == Trust::Unproven => st.trust = Trust::Proven,
+                _ => {}
+            }
+            if ok
+                && st.trust == Trust::Unproven
+                && reported_keys.insert((chain, k.key_id.clone(), 1))
+            {
+                key_findings.push((
+                    pos,
+                    chain,
+                    FindingKind::SigningKeyUnproven {
+                        seq: r.seq,
+                        key_id: k.key_id.clone(),
+                    },
+                ));
+            }
+        }
+        sig_ok[pos] = ok;
+        // An authenticated rotation away from the current key.
+        if ok && r.kind == RecordKind::KeyRotation {
+            if let Some(p) = r.payload_json::<KeyRotationPayload>() {
+                if st.key.as_ref() == Some(&p.from) {
+                    st.key = Some(p.to);
+                    if st.trust == Trust::Initial {
+                        st.trust = Trust::Proven;
+                    }
+                }
             }
         }
     }
@@ -722,6 +965,14 @@ pub fn verify_segments(
             );
         }
     }
+    for (pos, chain, kind) in key_findings {
+        if Some(chain) == expected_chain {
+            cx.add(kind, Some(pos));
+        }
+    }
+    let signing_key = expected_chain
+        .and_then(|c| states.get(&c))
+        .and_then(|st| st.key.clone());
     let mut usable = authentic.clone();
     for pos in 0..n {
         if !authentic[pos] {
@@ -1072,6 +1323,17 @@ pub fn verify_segments(
                 },
                 None,
             );
+        } else if let Some(kd) = verifier.key_device(&cp.key_id).filter(|kd| {
+            identity
+                .as_ref()
+                .is_some_and(|id| id.device_id.as_str() != *kd)
+        }) {
+            cx.add(
+                FindingKind::CheckpointInvalid {
+                    reason: format!("checkpoint key {} belongs to device {kd}", cp.key_id),
+                },
+                None,
+            );
         } else {
             match by_seq.get(&cp.seq).filter(|&&p| usable[p]) {
                 Some(&p) => {
@@ -1168,6 +1430,7 @@ pub fn verify_segments(
         chain_id: expected_chain.map(|c| to_hex(&c)),
         identity,
         last_seal_seq: last_seal,
+        signing_key,
     }
 }
 
@@ -1352,6 +1615,31 @@ mod tests {
             .level(),
             FindingLevel::Tamper
         );
+        assert_eq!(
+            SigningKeyUnproven {
+                seq: 1,
+                key_id: "k".into()
+            }
+            .level(),
+            FindingLevel::Warning
+        );
+        assert_eq!(
+            KeySwitchRefused {
+                seq: 1,
+                established_key_id: "a".into(),
+                named_key_id: "b".into()
+            }
+            .level(),
+            FindingLevel::Tamper
+        );
+        let kd = KeyDeviceMismatch {
+            seq: 1,
+            key_id: "k".into(),
+            key_device: "x".into(),
+            chain_device: "y".into(),
+        };
+        assert_eq!(kd.level(), FindingLevel::Tamper);
+        assert!(kd.to_string().contains("belongs to device x"));
         assert!(FindingLevel::Info < FindingLevel::Warning);
         assert!(FindingLevel::Warning < FindingLevel::Tamper);
     }
@@ -1489,6 +1777,51 @@ mod tests {
         };
         let r = verify_segments(&[noise], &c.key, &VerifyOptions::default());
         assert!(!r.is_clean());
+    }
+
+    #[test]
+    fn records_verify_only_under_the_named_key_and_algorithm() {
+        let mut c = Chain::new();
+        c.note();
+        let ok = verify_segments(&[c.seg("s")], &c.key, &VerifyOptions::default());
+        assert!(ok.is_clean(), "{:?}", kinds(&ok));
+        assert_eq!(
+            ok.signing_key,
+            Some(KeyRef {
+                key_id: "k".into(),
+                algorithm: "hmac-sha256".into()
+            })
+        );
+        // Same key material and id, but claiming another algorithm.
+        struct Claims(HmacSha256Key);
+        impl Verifier for Claims {
+            fn algorithm(&self) -> &str {
+                "ed25519"
+            }
+            fn key_id(&self) -> &str {
+                "k"
+            }
+            fn verify(&self, m: &[u8], s: &[u8]) -> bool {
+                Verifier::verify(&self.0, m, s)
+            }
+        }
+        let r = verify_segments(&[c.seg("s")], &Claims(key()), &VerifyOptions::default());
+        assert!(kinds(&r)
+            .iter()
+            .any(|k| matches!(k, FindingKind::KeyMismatch { .. })));
+        // A trusted signing_key for the chain overrides the identity's.
+        let r = verify_segments(
+            &[c.seg("s")],
+            &c.key,
+            &VerifyOptions {
+                signing_key: Some(KeyRef {
+                    key_id: "other".into(),
+                    algorithm: "hmac-sha256".into(),
+                }),
+                ..Default::default()
+            },
+        );
+        assert!(!r.is_intact());
     }
 
     fn recovery(seqs: Option<[u64; 2]>, plausible: bool) -> Vec<u8> {
