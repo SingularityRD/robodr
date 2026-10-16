@@ -1745,7 +1745,8 @@
       "filename": "/usr/lib/python3/dist-packages/yaml/__pycache__/__init__.cpython-312.pyc.140230"
      },
      "allow": [
-      "RoboDR: Shared library written into a system library path outside the package manager"
+      "RoboDR: Shared library written into a system library path outside the package manager",
+      "RoboDR: File created in the system or ROS Python environment outside the package manager"
      ],
      "reason": "Documented: py3compile byte-compiles into /usr/lib/python3 as root; a forged .pyc there is a code hook, so it is deliberately not excluded (precompile at commissioning)."
     },
@@ -1775,7 +1776,8 @@
       "destination": "/usr/lib/python3/dist-packages/yaml/__pycache__/__init__.cpython-312.pyc"
      },
      "allow": [
-      "RoboDR: File moved into a system library path or linker configuration outside the package manager"
+      "RoboDR: File moved into a system library path or linker configuration outside the package manager",
+      "RoboDR: File moved into the system or ROS Python environment outside the package manager"
      ],
      "reason": "Documented: py3compile byte-compiles into /usr/lib/python3 as root; a forged .pyc there is a code hook, so it is deliberately not excluded (precompile at commissioning)."
     },
@@ -1998,6 +2000,687 @@
        "--user",
        "restart",
        "robot-bringup.service"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "scenario": "RoboDR signed bundle upgrade (install-bundle.sh: dpkg -i, postinst try-restart, both daemons start)",
+   "events": [
+    {
+     "note": "install-bundle.sh installs the verified release",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "filename": "/usr/bin/dpkg",
+      "argc": 3,
+      "argv": [
+       "dpkg",
+       "-i",
+       "/var/lib/robodr/releases/robodr_0.6.0_amd64.deb"
+      ]
+     },
+     "allow": [
+      "RoboDR: Debian package installed on robot controller"
+     ],
+     "reason": "Maintenance action: this alert is the audit trail of the install (supply_chain.toml header)."
+    },
+    {
+     "note": "dpkg unpacks /usr/sbin/robodr-agentd",
+     "type": "FileCreated",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "filename": "/usr/sbin/robodr-agentd.dpkg-new"
+     }
+    },
+    {
+     "note": "dpkg writes /usr/sbin/robodr-agentd.dpkg-new",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "filename": "/usr/sbin/robodr-agentd.dpkg-new",
+      "flags": [
+       "O_WRONLY",
+       "O_CREAT",
+       "O_EXCL"
+      ]
+     }
+    },
+    {
+     "note": "dpkg renames into place /usr/sbin/robodr-agentd",
+     "type": "FileRename",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "source": "/usr/sbin/robodr-agentd.dpkg-new",
+      "destination": "/usr/sbin/robodr-agentd"
+     }
+    },
+    {
+     "note": "dpkg unpacks /usr/sbin/robodr-pulsard",
+     "type": "FileCreated",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "filename": "/usr/sbin/robodr-pulsard.dpkg-new"
+     }
+    },
+    {
+     "note": "dpkg writes /usr/sbin/robodr-pulsard.dpkg-new",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "filename": "/usr/sbin/robodr-pulsard.dpkg-new",
+      "flags": [
+       "O_WRONLY",
+       "O_CREAT",
+       "O_EXCL"
+      ]
+     }
+    },
+    {
+     "note": "dpkg renames into place /usr/sbin/robodr-pulsard",
+     "type": "FileRename",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "source": "/usr/sbin/robodr-pulsard.dpkg-new",
+      "destination": "/usr/sbin/robodr-pulsard"
+     }
+    },
+    {
+     "note": "dpkg unpacks /usr/lib/systemd/system/robodr-pulsard.service",
+     "type": "FileCreated",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "filename": "/usr/lib/systemd/system/robodr-pulsard.service.dpkg-new"
+     }
+    },
+    {
+     "note": "dpkg writes /usr/lib/systemd/system/robodr-pulsard.service.dpkg-new",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "filename": "/usr/lib/systemd/system/robodr-pulsard.service.dpkg-new",
+      "flags": [
+       "O_WRONLY",
+       "O_CREAT",
+       "O_EXCL"
+      ]
+     }
+    },
+    {
+     "note": "dpkg renames into place /usr/lib/systemd/system/robodr-pulsard.service",
+     "type": "FileRename",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "source": "/usr/lib/systemd/system/robodr-pulsard.service.dpkg-new",
+      "destination": "/usr/lib/systemd/system/robodr-pulsard.service"
+     }
+    },
+    {
+     "note": "dpkg unpacks /usr/lib/systemd/system/robodr-agentd.service",
+     "type": "FileCreated",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "filename": "/usr/lib/systemd/system/robodr-agentd.service.dpkg-new"
+     }
+    },
+    {
+     "note": "dpkg writes /usr/lib/systemd/system/robodr-agentd.service.dpkg-new",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "filename": "/usr/lib/systemd/system/robodr-agentd.service.dpkg-new",
+      "flags": [
+       "O_WRONLY",
+       "O_CREAT",
+       "O_EXCL"
+      ]
+     }
+    },
+    {
+     "note": "dpkg renames into place /usr/lib/systemd/system/robodr-agentd.service",
+     "type": "FileRename",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "source": "/usr/lib/systemd/system/robodr-agentd.service.dpkg-new",
+      "destination": "/usr/lib/systemd/system/robodr-agentd.service"
+     }
+    },
+    {
+     "note": "dpkg unpacks /usr/share/robodr/rules/robodr/self_protection.toml",
+     "type": "FileCreated",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "filename": "/usr/share/robodr/rules/robodr/self_protection.toml.dpkg-new"
+     }
+    },
+    {
+     "note": "dpkg writes /usr/share/robodr/rules/robodr/self_protection.toml.dpkg-new",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "filename": "/usr/share/robodr/rules/robodr/self_protection.toml.dpkg-new",
+      "flags": [
+       "O_WRONLY",
+       "O_CREAT",
+       "O_EXCL"
+      ]
+     }
+    },
+    {
+     "note": "dpkg renames into place /usr/share/robodr/rules/robodr/self_protection.toml",
+     "type": "FileRename",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "source": "/usr/share/robodr/rules/robodr/self_protection.toml.dpkg-new",
+      "destination": "/usr/share/robodr/rules/robodr/self_protection.toml"
+     }
+    },
+    {
+     "note": "dpkg unpacks /etc/robodr/pulsar.toml",
+     "type": "FileCreated",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "filename": "/etc/robodr/pulsar.toml.dpkg-new"
+     }
+    },
+    {
+     "note": "dpkg writes /etc/robodr/pulsar.toml.dpkg-new",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "filename": "/etc/robodr/pulsar.toml.dpkg-new",
+      "flags": [
+       "O_WRONLY",
+       "O_CREAT",
+       "O_EXCL"
+      ]
+     }
+    },
+    {
+     "note": "dpkg renames into place /etc/robodr/pulsar.toml",
+     "type": "FileRename",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "source": "/etc/robodr/pulsar.toml.dpkg-new",
+      "destination": "/etc/robodr/pulsar.toml"
+     }
+    },
+    {
+     "note": "dpkg creates a new rules subdirectory",
+     "type": "DirCreated",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "dirname": "/usr/share/robodr/rules/pulsar"
+     }
+    },
+    {
+     "note": "dpkg removes a rule file the new release dropped",
+     "type": "FileDeleted",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "filename": "/usr/share/robodr/rules/robodr/old_rule.toml"
+     }
+    },
+    {
+     "note": "dpkg removes the emptied directory",
+     "type": "DirDeleted",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "dirname": "/usr/share/robodr/rules/old"
+     }
+    },
+    {
+     "note": "dpkg package list",
+     "type": "FileRename",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "source": "/var/lib/dpkg/info/robodr.list-new",
+      "destination": "/var/lib/dpkg/info/robodr.list"
+     },
+     "allow": [
+      "RoboDR: Debian package database changed"
+     ],
+     "reason": "Maintenance action: this alert is the audit trail of the install (supply_chain.toml header)."
+    },
+    {
+     "note": "robodr postinst",
+     "type": "Exec",
+     "header": {
+      "image": "/var/lib/dpkg/info/robodr.postinst"
+     },
+     "payload": {
+      "filename": "/var/lib/dpkg/info/robodr.postinst",
+      "argc": 4,
+      "argv": [
+       "/bin/sh",
+       "/var/lib/dpkg/info/robodr.postinst",
+       "configure",
+       "0.5.0"
+      ]
+     },
+     "allow": [
+      "RoboDR: Debian package maintainer script executed"
+     ],
+     "reason": "Maintenance action: this alert is the audit trail of the install (supply_chain.toml header)."
+    },
+    {
+     "note": "postinst: sysusers",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/systemd-sysusers"
+     },
+     "payload": {
+      "filename": "/usr/bin/systemd-sysusers",
+      "argc": 2,
+      "argv": [
+       "systemd-sysusers",
+       "/usr/lib/sysusers.d/robodr.conf"
+      ]
+     }
+    },
+    {
+     "note": "postinst: tmpfiles (directories exist on upgrade: no mkdir)",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/systemd-tmpfiles"
+     },
+     "payload": {
+      "filename": "/usr/bin/systemd-tmpfiles",
+      "argc": 3,
+      "argv": [
+       "systemd-tmpfiles",
+       "--create",
+       "/usr/lib/tmpfiles.d/robodr.conf"
+      ]
+     }
+    },
+    {
+     "note": "postinst: daemon-reload",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/systemctl"
+     },
+     "payload": {
+      "filename": "/usr/bin/systemctl",
+      "argc": 2,
+      "argv": [
+       "systemctl",
+       "daemon-reload"
+      ]
+     }
+    },
+    {
+     "note": "postinst: try-restart robodr-pulsard.service",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/systemctl"
+     },
+     "payload": {
+      "filename": "/usr/bin/systemctl",
+      "argc": 3,
+      "argv": [
+       "systemctl",
+       "try-restart",
+       "robodr-pulsard.service"
+      ]
+     }
+    },
+    {
+     "note": "postinst: try-restart robodr-agentd.service",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/systemctl"
+     },
+     "payload": {
+      "filename": "/usr/bin/systemctl",
+      "argc": 3,
+      "argv": [
+       "systemctl",
+       "try-restart",
+       "robodr-agentd.service"
+      ]
+     }
+    },
+    {
+     "note": "PID 1 starts the restarted unit",
+     "type": "Exec",
+     "header": {
+      "image": "/proc/self/fd/3",
+      "uid": 0,
+      "parent_pid": 1
+     },
+     "payload": {
+      "filename": "/proc/self/fd/3",
+      "argc": 7,
+      "argv": [
+       "/usr/lib/systemd/systemd-executor",
+       "--deserialize",
+       "41",
+       "--log-level",
+       "info",
+       "--log-target",
+       "journal-or-kmsg"
+      ]
+     }
+    },
+    {
+     "note": "PID 1 invocation-id link",
+     "type": "FileLink",
+     "header": {
+      "image": "/usr/lib/systemd/systemd"
+     },
+     "payload": {
+      "source": "/run/systemd/units/invocation:robodr-agentd.service",
+      "destination": "8f1c2a9b0d3e4f5a6b7c8d9e0f1a2b3c",
+      "hard_link": false
+     }
+    },
+    {
+     "note": "PID 1 credentials directory",
+     "type": "DirCreated",
+     "header": {
+      "image": "/usr/lib/systemd/systemd"
+     },
+     "payload": {
+      "dirname": "/run/credentials/robodr-agentd.service"
+     }
+    },
+    {
+     "note": "PID 1 LoadCredential= copy",
+     "type": "FileCreated",
+     "header": {
+      "image": "/usr/lib/systemd/systemd"
+     },
+     "payload": {
+      "filename": "/run/credentials/robodr-agentd.service/blackbox.key"
+     }
+    },
+    {
+     "note": "PID 1 reads the key for LoadCredential=",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/lib/systemd/systemd"
+     },
+     "payload": {
+      "filename": "/etc/robodr/keys/agentd-blackbox.key",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "PID 1 propagate directory",
+     "type": "DirCreated",
+     "header": {
+      "image": "/usr/lib/systemd/systemd"
+     },
+     "payload": {
+      "dirname": "/run/systemd/propagate/robodr-agentd.service"
+     }
+    },
+    {
+     "note": "PID 1 reads the unit and drop-in dirs",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/lib/systemd/systemd"
+     },
+     "payload": {
+      "filename": "/usr/lib/systemd/system/robodr-pulsard.service",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "agentd starts",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/sbin/robodr-agentd",
+      "uid": 998
+     },
+     "payload": {
+      "filename": "/usr/sbin/robodr-agentd",
+      "argc": 3,
+      "argv": [
+       "/usr/sbin/robodr-agentd",
+       "--config",
+       "/etc/robodr/agentd.json"
+      ]
+     }
+    },
+    {
+     "note": "agentd reads /etc/robodr/agentd.json",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/sbin/robodr-agentd",
+      "uid": 998
+     },
+     "payload": {
+      "filename": "/etc/robodr/agentd.json",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "agentd reads /etc/robodr/profile.json",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/sbin/robodr-agentd",
+      "uid": 998
+     },
+     "payload": {
+      "filename": "/etc/robodr/profile.json",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "agentd reads /etc/robodr/profile-trust.json",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/sbin/robodr-agentd",
+      "uid": 998
+     },
+     "payload": {
+      "filename": "/etc/robodr/profile-trust.json",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "agentd reads /etc/robodr/policy.json",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/sbin/robodr-agentd",
+      "uid": 998
+     },
+     "payload": {
+      "filename": "/etc/robodr/policy.json",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "agentd reads /run/credentials/robodr-agentd.service/blackbox.key",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/sbin/robodr-agentd",
+      "uid": 998
+     },
+     "payload": {
+      "filename": "/run/credentials/robodr-agentd.service/blackbox.key",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "agentd blackbox segment",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/sbin/robodr-agentd",
+      "uid": 998
+     },
+     "payload": {
+      "filename": "/var/lib/robodr/blackbox/agentd/seg-000042.log",
+      "flags": [
+       "O_WRONLY",
+       "O_CREAT",
+       "O_APPEND"
+      ]
+     }
+    },
+    {
+     "note": "agentd profile anti-rollback state",
+     "type": "FileRename",
+     "header": {
+      "image": "/usr/sbin/robodr-agentd",
+      "uid": 998
+     },
+     "payload": {
+      "source": "/var/lib/robodr/profile-state/state.json.tmp",
+      "destination": "/var/lib/robodr/profile-state/state.json"
+     }
+    },
+    {
+     "note": "pulsard starts",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/sbin/robodr-pulsard"
+     },
+     "payload": {
+      "filename": "/usr/sbin/robodr-pulsard",
+      "argc": 3,
+      "argv": [
+       "/usr/sbin/robodr-pulsard",
+       "--config-file",
+       "/etc/robodr/pulsar.toml"
+      ]
+     }
+    },
+    {
+     "note": "pulsard reads its config",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/sbin/robodr-pulsard"
+     },
+     "payload": {
+      "filename": "/etc/robodr/pulsar.toml",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "pulsard lists rules_path",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/sbin/robodr-pulsard"
+     },
+     "payload": {
+      "filename": "/usr/share/robodr/rules/pulsar",
+      "flags": [
+       "O_RDONLY",
+       "O_DIRECTORY"
+      ]
+     }
+    },
+    {
+     "note": "pulsard loads a rule file",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/sbin/robodr-pulsard"
+     },
+     "payload": {
+      "filename": "/usr/share/robodr/rules/robodr/self_protection.toml",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "operator checks status",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/systemctl"
+     },
+     "payload": {
+      "filename": "/usr/bin/systemctl",
+      "argc": 4,
+      "argv": [
+       "systemctl",
+       "status",
+       "robodr-pulsard.service",
+       "robodr-agentd.service"
+      ]
+     }
+    },
+    {
+     "note": "operator reads the journal",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/journalctl"
+     },
+     "payload": {
+      "filename": "/usr/bin/journalctl",
+      "argc": 5,
+      "argv": [
+       "journalctl",
+       "-u",
+       "robodr-agentd.service",
+       "-n",
+       "50"
       ]
      }
     }

@@ -61,3 +61,130 @@ condition = '''
 OR (payload.argv CONTAINS "-m" AND payload.argv CONTAINS "pip" AND payload.argv CONTAINS "install")
 OR (payload.argv CONTAINS "-mpip" AND payload.argv CONTAINS "install")
 '''
+
+# ---------------------------------------------------------------------------
+# Other Python and Node.js installers. Same policy as pip: a fielded unit gets
+# software only from the signed bundle, so every install is recorded, whatever
+# environment it targets. argv cannot reliably tell where an installer writes
+# (uv/pipx/poetry/conda pick the target from config files and environment
+# variables Pulsar does not capture), so the target is not part of the Exec
+# conditions; the file rules below are what proves that the ROS / system
+# Python environment itself changed. Same argv limits as above: bundled or
+# '--opt=value' spellings and renamed launchers are not matched.
+
+[[rules]]
+name = "RoboDR: Python package installed with uv, pipx, poetry or conda/mamba"
+type = "Exec"
+category = "initial_access"
+severity = "high"
+description = "A Python package manager other than pip installed or fetched packages: uv (pip install/sync, add, sync, tool install, tool run) and uvx, pipx (install, inject, upgrade, reinstall, run), poetry (install, add, update, sync), conda/mamba/micromamba (install, create, update), directly or as 'python3 -m <tool>'. 'uv pip install --system', 'pipx --global', a poetry/conda environment pointed at the system interpreter, or PIP_* / UV_* environment variables write into the same site-packages that rclpy nodes import from; a trojaned wheel there runs inside every node. uvx / 'pipx run' / 'uv tool run' download and execute a package in one step. Fielded units receive software only through the signed offline bundle."
+condition = '''
+(
+  payload.filename ENDS_WITH "/uv"
+  AND (payload.argv CONTAINS "install" OR payload.argv CONTAINS "sync" OR payload.argv CONTAINS "add"
+       OR (payload.argv CONTAINS "tool" AND payload.argv CONTAINS "run"))
+)
+OR payload.filename ENDS_WITH "/uvx"
+OR (
+  payload.filename ENDS_WITH "/pipx"
+  AND (payload.argv CONTAINS "install" OR payload.argv CONTAINS "install-all" OR payload.argv CONTAINS "inject"
+       OR payload.argv CONTAINS "upgrade" OR payload.argv CONTAINS "upgrade-all" OR payload.argv CONTAINS "reinstall"
+       OR payload.argv CONTAINS "reinstall-all" OR payload.argv CONTAINS "run")
+)
+OR (
+  payload.filename ENDS_WITH "/poetry"
+  AND (payload.argv CONTAINS "install" OR payload.argv CONTAINS "add" OR payload.argv CONTAINS "update" OR payload.argv CONTAINS "sync")
+)
+OR (
+  (payload.filename ENDS_WITH "/conda" OR payload.filename ENDS_WITH "/mamba" OR payload.filename ENDS_WITH "/micromamba")
+  AND (payload.argv CONTAINS "install" OR payload.argv CONTAINS "create" OR payload.argv CONTAINS "update" OR payload.argv CONTAINS "upgrade")
+)
+OR (
+  (payload.argv CONTAINS "-m" AND (payload.argv CONTAINS "uv" OR payload.argv CONTAINS "pipx" OR payload.argv CONTAINS "poetry"
+                                   OR payload.argv CONTAINS "conda" OR payload.argv CONTAINS "mamba"))
+  AND (payload.argv CONTAINS "install" OR payload.argv CONTAINS "sync" OR payload.argv CONTAINS "add" OR payload.argv CONTAINS "inject"
+       OR payload.argv CONTAINS "update" OR payload.argv CONTAINS "create" OR payload.argv CONTAINS "run")
+)
+'''
+
+[[rules]]
+name = "RoboDR: Node.js package installed with npm, npx, pnpm or yarn"
+type = "Exec"
+category = "initial_access"
+severity = "high"
+description = "npm (install/i/ci/add/update/exec/x/link and the install-test forms), npx, pnpm or yarn (install/add/dlx) installed or fetched-and-ran a Node.js package. 'npm install -g' writes into /usr/lib/node_modules and /usr/bin on the controller (rosbridge / web dashboards are the usual reason node exists on a robot), lifecycle scripts (preinstall/postinstall) run as the installing user at install time, and npx downloads and executes in one step. Fielded units receive software only through the signed offline bundle. Not seen: a bare 'yarn' (installs with no verb) and npm-cli.js run through node directly."
+condition = '''
+(
+  payload.filename ENDS_WITH "/npm"
+  AND (payload.argv CONTAINS "install" OR payload.argv CONTAINS "i" OR payload.argv CONTAINS "ci" OR payload.argv CONTAINS "add"
+       OR payload.argv CONTAINS "update" OR payload.argv CONTAINS "exec" OR payload.argv CONTAINS "x" OR payload.argv CONTAINS "link"
+       OR payload.argv CONTAINS "it" OR payload.argv CONTAINS "install-test" OR payload.argv CONTAINS "install-ci-test")
+)
+OR payload.filename ENDS_WITH "/npx"
+OR (
+  (payload.filename ENDS_WITH "/pnpm" OR payload.filename ENDS_WITH "/yarn")
+  AND (payload.argv CONTAINS "install" OR payload.argv CONTAINS "i" OR payload.argv CONTAINS "add" OR payload.argv CONTAINS "dlx")
+)
+'''
+
+# ---------------------------------------------------------------------------
+# Backstop by effect: whatever installed it (pip, uv's hard links, conda,
+# 'python3 setup.py install', a tarball unpacked by hand, a renamed
+# installer), new code in the interpreter's own trees changes every rclpy
+# node and the ros2 CLI. Watched: the system interpreters' trees
+# (/usr/lib/python3*, /usr/local/lib/python3*, /usr/lib64/python3*, the
+# Debian sitecustomize target /etc/python3*) and any site-packages /
+# dist-packages under /usr or /opt/ros (TUNE: the ROS prefix). Overlaps on
+# purpose with the system-library and ROS-install-tree rules, which are not
+# Python-specific; the duplicate alert names the Python environment.
+# dpkg (exact image) is excluded; py3compile and root-run interpreters that
+# byte-compile into these trees are NOT (a forged .pyc is a code hook):
+# precompile at commissioning, as for the library rules.
+
+[[rules]]
+name = "RoboDR: File created in the system or ROS Python environment outside the package manager"
+type = "FileCreated"
+category = "persistence"
+severity = "high"
+description = "A file was created in the system Python trees (/usr/lib/python3*, /usr/local/lib/python3*, /usr/lib64/python3*, /etc/python3*) or in a site-packages / dist-packages directory under /usr or /opt/ros, by something other than dpkg (exact image /usr/bin/dpkg or /bin/dpkg). That is where pip --break-system-packages, 'uv pip install --system', 'sudo poetry/conda' against the system interpreter and hand-copied packages land, and where a .pth, sitecustomize or module shadow runs inside every rclpy node and the ros2 CLI. Known noise: py3compile byte-compiling during apt and root-run Python writing __pycache__ (precompile at commissioning)."
+condition = '''
+(
+  payload.filename STARTS_WITH "/usr/lib/python3" OR payload.filename STARTS_WITH "/usr/local/lib/python3"
+  OR payload.filename STARTS_WITH "/usr/lib64/python3" OR payload.filename STARTS_WITH "/etc/python3"
+  OR ((payload.filename STARTS_WITH "/usr/" OR payload.filename STARTS_WITH "/opt/ros/")
+      AND (payload.filename CONTAINS "/site-packages/" OR payload.filename CONTAINS "/dist-packages/"))
+)
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
+'''
+
+[[rules]]
+name = "RoboDR: File moved into the system or ROS Python environment outside the package manager"
+type = "FileRename"
+category = "persistence"
+severity = "high"
+description = "A file or directory was renamed into the system Python trees or a site-packages / dist-packages directory under /usr or /opt/ros by something other than dpkg (installers that unpack to a temporary name and rename into place, or a package directory moved in whole: a directory rename raises no FileCreated for the files inside it). Same scope and noise as the creation rule."
+condition = '''
+(
+  payload.destination STARTS_WITH "/usr/lib/python3" OR payload.destination STARTS_WITH "/usr/local/lib/python3"
+  OR payload.destination STARTS_WITH "/usr/lib64/python3" OR payload.destination STARTS_WITH "/etc/python3"
+  OR ((payload.destination STARTS_WITH "/usr/" OR payload.destination STARTS_WITH "/opt/ros/")
+      AND (payload.destination CONTAINS "/site-packages/" OR payload.destination CONTAINS "/dist-packages/"))
+)
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
+'''
+
+[[rules]]
+name = "RoboDR: Link created in the system or ROS Python environment outside the package manager"
+type = "FileLink"
+category = "persistence"
+severity = "high"
+description = "A hard or symbolic link was created in the system Python trees or a site-packages / dist-packages directory under /usr or /opt/ros by something other than dpkg. uv (default link mode on Linux: hard links from its cache) and conda install packages by linking, so they raise FileLink rather than FileCreated; a symlinked .pth, module or package directory pointing into a user-writable tree has the same effect. Pulsar FileLink: 'source' is the new link."
+condition = '''
+(
+  payload.source STARTS_WITH "/usr/lib/python3" OR payload.source STARTS_WITH "/usr/local/lib/python3"
+  OR payload.source STARTS_WITH "/usr/lib64/python3" OR payload.source STARTS_WITH "/etc/python3"
+  OR ((payload.source STARTS_WITH "/usr/" OR payload.source STARTS_WITH "/opt/ros/")
+      AND (payload.source CONTAINS "/site-packages/" OR payload.source CONTAINS "/dist-packages/"))
+)
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
+'''

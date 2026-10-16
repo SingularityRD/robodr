@@ -19,8 +19,13 @@ Everything below was checked against the vendored Pulsar at rev `4796504`
   recursively (`crates/modules/rules-engine/src/engine.rs:14,113`). The default
   `rules_path` is `/etc/pulsar/rules`, and Pulsar's installer puts its own rules
   there.
-* **Deploy:** copy `rules/robodr/` to `/etc/pulsar/rules/robodr/`, next to
-  Pulsar's rules, then restart `pulsard`. Rules are read only at module start.
+* **Deploy:** the RoboDR package (`packaging/build-deb.sh`) installs these
+  files to `/usr/share/robodr/rules/robodr/` and Pulsar's own rules to
+  `/usr/share/robodr/rules/pulsar/`, and sets `rules_path =
+  "/usr/share/robodr/rules"` in `/etc/robodr/pulsar.toml`; the daemon is
+  `robodr-pulsard.service`. With upstream Pulsar instead, copy `rules/robodr/`
+  to `/etc/pulsar/rules/robodr/`. Restart the daemon after a change: rules are
+  read only at module start.
 * **Document:** `[[rules]]` tables. Every rule needs all six string keys:
   `name`, `type`, `category`, `severity`, `description` and `condition`
   (`engine.rs:23-30`). Pulsar silently ignores any other key.
@@ -75,7 +80,7 @@ The harness uses only the Python standard library (3.11+ for `tomllib`). It:
 3. Type-checks every `header.*` / `payload.*` path, operator and literal
    against a schema embedded in the script. Each entry carries a comment with
    the Pulsar source file and line it came from.
-4. Runs `scripts/rules_fixtures.json`: 275 sample events, with at least one
+4. Runs `scripts/rules_fixtures.json`: 418 sample events, with at least one
    positive and one negative per rule. They are evaluated with the engine's
    matching semantics. Fixtures marked `KNOWN GAP` document misses on purpose,
    `KNOWN FP` / `KNOWN NOISE` document accepted hits.
@@ -98,25 +103,31 @@ The harness uses only the Python standard library (3.11+ for `tomllib`). It:
    and a check that the benign-corpus runner reports a false positive, a
    stale allowance and an incomplete event.
 7. Runs the **benign corpus** `scripts/rules_benign_corpus.json` (mandatory;
-   a missing file is an error): 130 events in six scenarios (`ros2 launch`
+   a missing file is an error): 180 events in seven scenarios (`ros2 launch`
    with dict parameters and SROS 2, `ros2 bag` record/play from `/tmp`, an
    rclpy node loading torch weights, `colcon build` in a dev workspace,
    `apt-get upgrade` with a kernel (dpkg, depmod, update-initramfs, ldconfig
-   trigger, py3compile, service restart) and systemd user units). **Every**
+   trigger, py3compile, service restart), systemd user units, and a RoboDR
+   signed-bundle upgrade: `dpkg -i`, `.dpkg-new` + rename of both daemons,
+   the units, a rule file and the `pulsar.toml` conffile, postinst
+   `try-restart`, PID 1 starting the units (credentials, invocation link,
+   propagate dir) and both daemons reading their config and rules). **Every**
    rule of the event's type is evaluated against every event, not just the
    rule a fixture names. Any hit fails, unless the event lists that rule in
    `allow` with a `reason`; an `allow` entry that no longer fires also fails,
-   so allowances cannot pile up. The 8 allowed hits are the apt audit trail
-   (package install, maintainer script, package database), py3compile's
-   `.pyc` writes in `/usr/lib/python3` (2, deliberate, see below), one CMake
-   FindPython probe and one `python3 setup.py` from the dev source tree.
+   so allowances cannot pile up. The 13 allowed hits are the apt and
+   RoboDR-bundle audit trail (package install, maintainer script, package
+   database: 7), py3compile's `.pyc` writes in `/usr/lib/python3` (4: the
+   library rules and the Python-environment rules, deliberate, see below),
+   one CMake FindPython probe and one `python3 setup.py` from the dev source
+   tree.
    The events are modelled on the named tools' behaviour (sources and
    local traces listed in the file header), **not** captured from pulsard.
 
 The last run gave: self-test 88/88; drift mutation test 12/12; 89/89
-upstream rules accepted; no schema or grammar drift; 55 RoboDR rules in 7
-files; 275/275 fixtures pass; benign corpus 130 events, 0 false positives,
-8 allow-listed hits; 0 errors and 0 warnings (`--strict`). Mutation checks showed the harness catches problems: flipping every
+upstream rules accepted; no schema or grammar drift; 62 RoboDR rules in 7
+files; 418/418 fixtures pass; benign corpus 180 events, 0 false positives,
+13 allow-listed hits; 0 errors and 0 warnings (`--strict`). Mutation checks showed the harness catches problems: flipping every
 negative fixture gave 44 errors, and changing `argv: Argv` in a copy of
 `event.rs` was reported as drift.
 
@@ -248,7 +259,8 @@ comes from. Two very different sources:
 | Binary *named* `dpkg` (`/root/.cache/dpkg`) writing modules/libraries/nodes | Exact-path `header.image == "/usr/bin/dpkg"` exclusions everywhere (review finding). |
 | Hook library without `.so` in its name (`/home/robot/.cache/hook`) | `ElfOpened` rules (by content; need `elf_check`); noexec staging mounts. The name-based any-file arm was removed (it fired on every `ros2 launch`). |
 | Hard link / symlink / `open(O_TMPFILE)`+`linkat()` that puts a `.ko`, a library, a linker or module-autoload config, a wireless config, an enclave file or a Pulsar/RoboDR file in place with no create, write or rename event | `FileLink` rule beside every `FileRename` rule (`source` is the new link), plus the in-place write rule for library directories (catches the `O_TMPFILE` open and `cp` over an existing library). |
-| `mkfifo /etc/pulsar/rules/zz.toml` / symlink to `/dev/null` so the rules engine hangs or fails at the next start | **File or device node created** and **Link created in or to** the RoboDR/Pulsar configuration. |
+| `mkfifo /etc/pulsar/rules/zz.toml` / symlink to `/dev/null` so the rules engine hangs or fails at the next start | **File or device node created** and **Link created in or to** a RoboDR/Pulsar protected path (now also `/usr/share/robodr/rules`, the real `rules_path`). |
+| Moving or deleting a protected *directory* (`/etc/pulsar`, `/usr/share/robodr/rules`) instead of its files; a systemd drop-in, mask link or `set-property` override for `robodr-*.service` | Directory **renamed** / **created** / **deleted** rules and the systemd unit paths in every self-protection rule. |
 | `PYTHONINSPECT=1 script -qc /opt/ros/humble/bin/ros2 /dev/null`: a Python prompt inside the trusted `/opt/ros` image after the CLI exits | Partly: **Pseudo-terminal wrapper executed** (`script`, `expect`, `unbuffer`, `empty`, `screen`, `tmux`, `dtach`), **Login shell started** (sshd/getty/`su -`/`sudo -i` sessions, the pty you need without a wrapper), **Interactive or stdin-fed Python interpreter** (`python3 -i`, bare `python3`, `python3 -`), `python3 -c 'import pty...'` (one-liner rule), `PYTHONSTARTUP=*.py` (Python-import rule). See the residual below. |
 | `/usr/../tmp/x`, `//tmp/x`, `/./tmp/x` to dodge "executed from a temporary directory" | **Program executed through a non-canonical path.** |
 | `//opt/ros/...` or `/opt/ros/a/../a/...` so a hooked ROS node falls outside the `/opt/ros/` scope | Same rule (fires at exec); the enclave-key allowlist also rejects `/../`. |
@@ -293,11 +305,18 @@ needs prevention (hardening) or a probe change.
   mitigate with per-node file ownership of `key.pem` (only the node's uid
   can read its own enclave key), no interactive accounts on fielded units,
   and the env-capture follow-up below.
-* **CMake FindPython probes** (`python3 -c "import sys; ..."`, ~17
-  version-specific strings per configure in CMake 3.28, some interpolated,
-  one containing a `"` that the DSL cannot express) fire the one-liner rule
-  during `colcon build` on the unit. They are not excluded: a safe exclusion
-  needs argc pinned and every argv element named, per CMake version.
+* **CMake FindPython probes** (`python3 -c "import sys; ..."`) fire the
+  one-liner rule during `colcon build` on the unit. CMake 3.28.3 has 19
+  distinct probe texts (traced with strace and derived from
+  `Support.cmake`): 17 can be written as exact-argv exclusions (argc 3,
+  exact interpreter path and `argv[0]`, `-c`, the whole probe text); one
+  contains a `"` (no DSL literal can hold one) and one a backslash (the
+  engine keeps it verbatim, but `validate_rules.py --strict` rejects every
+  backslash in a literal). The 17-probe exclusion is prepared on branch
+  `w6-rules-findpython` but **not** merged here: every probe text contains
+  spaces, and the validator warns on every `argv CONTAINS` literal with a
+  space, so `--strict` fails until the validator accepts deliberate
+  exact-element literals (e.g. when `argc` is pinned in the same rule).
 * **No environment, no parent image.** Pulsar's `Exec` event has neither.
   `ROS_SECURITY_ENABLE=false` / `ROS_SECURITY_STRATEGY=Permissive` (security
   switched off) leave **no** file trace at all: nothing is opened. Inline DDS
@@ -354,7 +373,8 @@ TUNE values that must be set per robot during commissioning:
 * `/opt/robot_ws/install/`: the robot's colcon workspace install prefix.
 * The cell and fleet subnets.
 * The commissioned RMW library.
-* Service names.
+* The service and daemon names in the stop-service rule (default: the
+  packaged `robodr-pulsard` / `robodr-agentd`).
 * The image of the signed update agent.
 * `/opt/robot_keystore/`: the commissioned SROS 2 keystore root.
 * The systemd-executor exclusion (systemd >= 255 only), including the uid
@@ -427,6 +447,9 @@ effect: the loader opening the library.
 | Package maintainer script executed | Malicious `postinst` / `preinst` running as root | Every legitimate install or remove. Pair it with a maintenance-window record. |
 | Debian package database changed | Backstop for renamed or unrecognised dpkg front-ends | Same. |
 | Python package installed | Trojaned wheel / typosquat | Commissioning-time `pip install`, which should be built into the image instead. |
+| Python package installed with uv, pipx, poetry or conda/mamba | Same, through the other installers (`uv pip install --system`, `pipx --global`, poetry/conda against the system interpreter), plus fetch-and-run (`uvx`, `pipx run`, `uv tool run`); also `python3 -m <tool>` | Developer tooling on a non-fielded unit. The target environment is not visible in argv; the file rules below show whether the system/ROS environment changed. |
+| Node.js package installed with npm, npx, pnpm or yarn | Trojaned npm package (global install into `/usr/lib/node_modules`, lifecycle scripts as root), `npx` fetch-and-run | rosbridge / web-dashboard maintenance. |
+| File created / moved / linked into the system or ROS Python environment (3 rules) | Backstop by effect for every installer, renamed or not: new files in `/usr/lib/python3*`, `/usr/local/lib/python3*`, `/usr/lib64/python3*`, `/etc/python3*` (Debian `sitecustomize`), and any `site-packages`/`dist-packages` under `/usr` or `/opt/ros`. The link rule catches uv and conda, which install by hard link | py3compile during apt and root-run Python writing `__pycache__` (deliberately not excluded; precompile at commissioning). Overlaps on purpose with the system-library and ROS-install-tree rules; one install raises one alert per file. |
 
 ### `radio_provisioning.toml`: BLE / Wi-Fi provisioning (UniPwn 2025)
 
@@ -460,10 +483,42 @@ here.
 
 | Rule | Threat | False positives / notes |
 |---|---|---|
-| Profile or Pulsar config written / deleted / renamed (3 rules) | Widening the locked profile; deleting rules so detection is blind after restart | The signed update agent. Exclude it by `header.image` once it exists. |
-| File or device node created in the RoboDR or Pulsar configuration | `mkfifo`/`mknod` in the rules directory (engine hangs at start), new rule files that shadow or disable detection | Same. |
-| Link created in or to the RoboDR or Pulsar configuration | Symlink rule file -> `/dev/null` or a huge file (engine fails to start); hard-link alias that lets a file be rewritten under another path | Same. |
-| Attempt to stop the Pulsar or RoboDR service | Turning the sensor off | Planned maintenance. Unit names are placeholders, because Pulsar ships no systemd unit. |
+Protected paths (all rules below; dpkg by exact image is excluded, so the
+signed bundle installed with `dpkg -i` does not alert beyond the
+supply-chain audit trail): `/etc/robodr`, `/etc/pulsar`, `/usr/share/robodr`
+(the real `rules_path`), `/usr/sbin/robodr-pulsard`,
+`/usr/sbin/robodr-agentd` (and `/sbin/` spellings), every `robodr-*` path
+under `/usr/lib/systemd`, `/lib/systemd`, `/etc/systemd`,
+`/run/systemd/system{,.control}` and `/run/systemd/transient` (units,
+`*.service.d` drop-ins, `*.wants` enablement links, `mask` links,
+`set-property` drop-ins), and the top-level `service.d` drop-in
+directories, which apply to every service.
+
+| Rule | Threat | False positives / notes |
+|---|---|---|
+| Protected file written / deleted (2 rules) | Widening the locked profile; deleting or editing rules so detection is blind after restart; overwriting a daemon binary or unit | Operator edits and `systemctl edit` (the audit trail); a future non-dpkg update agent (exclude by exact image). |
+| Protected file or directory renamed | Atomic replacement of profile, rule file, unit or daemon; moving `/etc/pulsar`, `/etc/robodr` or `/usr/share/robodr/rules` away as a whole | Same. |
+| File or device node created in a protected path | `mkfifo`/`mknod` in the rules directory (engine hangs at start), new rule files, override units, drop-in `.conf` files | Same; also robodr-commission writing keys under `/etc/robodr/keys`. |
+| Link created in or to a protected path | Symlink rule file -> `/dev/null`; `systemctl mask`; enablement links; hard-link alias of a protected file | `systemctl enable` at commissioning (PID 1 makes the link). PID 1's own `/run/systemd/units/invocation:*` links do not match. |
+| Directory created in a protected path | New `robodr-*.service.d` / `service.d` / `system.control` drop-in directory that precedes an override | `systemctl edit` / `set-property` by an operator; systemd-tmpfiles recreating a deleted `/etc/robodr/keys`. |
+| Protected directory deleted | Last step of a recursive delete of rules, config or drop-in directories | Operator clean-up. |
+| Attempt to stop the Pulsar or RoboDR service | `systemctl stop/disable/mask/kill/freeze/set-property/edit`, `service ... stop`, `pkill`/`killall` against `robodr-pulsard`, `robodr-agentd` (with or without `.service`) or an upstream Pulsar unit | The package prerm on **removal** (upgrade only `try-restart`s); planned maintenance. |
+
+### Residual gaps of the self-protection and installer rules (summary)
+
+Detail is deliberately kept at this level; the fixtures marked `KNOWN GAP`
+record the concrete cases.
+
+| Gap | Why | Mitigation |
+|---|---|---|
+| Stop by PID, unit glob or unlisted verb/spelling | argv is matched per whole element; no glob or PID context | Sensor heartbeat at the SOC; systemd `RefuseManualStop=` where acceptable |
+| Rename or bind-mount of an *ancestor* directory (`/usr/share`, `/etc/systemd/system`) | Rules match the protected paths, not every parent | Read-only `/usr`; no unprivileged user namespaces |
+| `chmod`/`chown`/`chattr`, `truncate(2)` by path, writes through an fd opened before pulsard started | No Pulsar hook (see above) | Heartbeat; file integrity check at boot |
+| Unit behaviour changed from outside the protected paths (e.g. generators, `/etc/environment`, global systemd config) | Not robodr-named paths | Out of scope here; covered only by general persistence rules |
+| Installer launched under another name or through its interpreter with an unlisted form | Exec rules match tool names and whole argv elements | The site-packages file rules (by effect) |
+| Packages installed into environments outside the watched trees (venv, conda prefix, user site) | Not the system/ROS environment | Python-import rule fires when a ROS process imports from there |
+| Env-var influence on an excluded or allow-listed command (interpreter variables, installer config) | Pulsar does not capture the environment | Env-capture follow-up (below) |
+| Pre-existing dpkg trust | dpkg (exact image) is excluded everywhere | Supply-chain rules record every install; `LD_PRELOAD`-into-dpkg rules |
 
 ## Commissioning: tuning per robot
 
@@ -535,6 +590,14 @@ probes emit. The following need checking on the target controller, with
   locally: ldconfig's unlink+symlink (strace, Ubuntu 24.04), py3compile's
   `python3.X -m py_compile -` worker (source), CMake 3.28 FindPython probes
   (source). The `PYTHONINSPECT` path needing a pty is the reviewer's repro.
+* The systemd and installer behaviour the self-protection and installer
+  rules assume: that PID 1 (image `/usr/lib/systemd/systemd`) makes the
+  `enable`/`mask` links and `set-property` drop-ins, the paths of its
+  per-start `/run/systemd/units/invocation:*` links, `/run/systemd/propagate/`
+  and `/run/credentials/` directories, that dpkg replaces the daemons and
+  units via `.dpkg-new` + rename, and that uv and conda install by hard link
+  on the target file system. These are modelled from documentation and
+  source, not captured from pulsard.
 * Event volume. The library-load rules evaluate on every `FileOpened` event.
   Measure CPU on the controller.
 * The false-positive rate on the real robot over a 72-hour clean run.

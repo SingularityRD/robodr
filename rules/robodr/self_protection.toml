@@ -1,65 +1,251 @@
 # RoboDR host rules: tampering with RoboDR and Pulsar on the robot.
 #
-# /etc/robodr holds the locked model profile (profile.json) that the ROS 2
-# graph sensor and the motion envelope check against; /etc/pulsar holds the
-# daemon config and these rules. Editing either blinds detection: a widened
-# profile accepts the attacker's participant, a deleted rule file stops alerts
-# after the next daemon restart (rules are loaded once at start-up).
+# Protected paths (the real installed layout, packaging/build-deb.sh):
+#   /etc/robodr/          model profile, trust keys, pulsar.toml (rules_path), agentd.json, keys/
+#   /etc/pulsar/          legacy / upstream Pulsar config and rules location
+#   /usr/share/robodr/    rules_path = /usr/share/robodr/rules (RoboDR + upstream Pulsar rules)
+#   /usr/sbin/robodr-pulsard, /usr/sbin/robodr-agentd (and /sbin/ spellings, plus
+#                         siblings such as robodr-agentd.dpkg-new / .bak)
+#   robodr-* systemd units: /usr/lib/systemd/system (where the package installs
+#                         them), /lib/systemd/system, /etc/systemd/** (overrides,
+#                         robodr-*.service.d drop-ins, *.wants enablement links,
+#                         'systemctl mask' links, system.control set-property
+#                         drop-ins), /run/systemd/system{,.control} (--runtime
+#                         variants), /run/systemd/transient
+#   top-level service.d/ drop-in directories (they apply to EVERY service,
+#                         robodr-* included)
+# Editing any of these blinds detection: a widened profile accepts the
+# attacker's participant, a deleted or emptied rule file stops alerts after
+# the next restart (rules load once at start-up), a drop-in can replace
+# ExecStart or add ExecStartPre=/bin/false, a mask link stops the daemon from
+# ever starting again, and a replaced daemon binary hands the sensor itself to
+# the attacker.
 #
-# Every way a file can appear or change under these directories is watched:
-# write-open, create (incl. mknod FIFOs/devices), delete, rename and link.
+# Every way a file system object can appear, change or go away there is
+# watched: write-open, create (incl. mknod FIFOs/devices), delete, rename
+# (file AND directory, source or destination, including the directories
+# themselves: 'mv /etc/robodr /etc/robodr.old'), link, mkdir (a new drop-in
+# directory) and rmdir.
 #
-# TUNE: when the signed update agent is installed, exclude it by header.image
-# in the file rules (and only it). Service names in the last rule
-# depend on how RoboDR packages the daemon (Pulsar ships no systemd unit).
+# Exclusion: dpkg by EXACT image path (/usr/bin/dpkg, /bin/dpkg), as in every
+# other RoboDR write rule. The signed offline bundle (install-bundle.sh) is
+# installed with dpkg, so the package's own writes (*.dpkg-new + rename) do
+# not alert; the install itself is recorded by supply_chain.toml. Everything
+# else that writes here (operator edits, 'systemctl edit', 'systemctl
+# enable/mask/set-property' (performed by PID 1), systemd-tmpfiles creating a
+# missing /etc/robodr/keys on first install, robodr-commission rotating keys)
+# fires and is the audit trail.
+# TUNE: when a signed update agent other than dpkg exists, exclude it by exact
+# header.image here (and only it).
 
 [[rules]]
-name = "RoboDR: RoboDR profile or Pulsar configuration written"
+name = "RoboDR: RoboDR or Pulsar protected file written"
 type = "FileOpened"
 category = "defense_evasion"
 severity = "high"
-description = "A file under /etc/robodr (model profile, envelope) or /etc/pulsar (daemon config, rules) was opened for writing. These are provisioned at commissioning and changed only by the signed update path."
+description = "A protected RoboDR/Pulsar file was opened for writing by something other than dpkg (exact image). Protected: /etc/robodr, /etc/pulsar, /usr/share/robodr (rules_path), /usr/sbin/robodr-pulsard and /usr/sbin/robodr-agentd, the robodr-* systemd units with their drop-ins, enablement and mask links under /usr/lib/systemd, /lib/systemd, /etc/systemd and /run/systemd, and the top-level service.d drop-in directories (see the file header). These are provisioned at commissioning and changed only by the signed update path."
 condition = '''
-(payload.filename STARTS_WITH "/etc/robodr/" OR payload.filename STARTS_WITH "/etc/pulsar/")
+(
+  payload.filename == "/etc/robodr" OR payload.filename STARTS_WITH "/etc/robodr/"
+  OR payload.filename == "/etc/pulsar" OR payload.filename STARTS_WITH "/etc/pulsar/"
+  OR payload.filename == "/usr/share/robodr" OR payload.filename STARTS_WITH "/usr/share/robodr/"
+  OR payload.filename STARTS_WITH "/usr/sbin/robodr-pulsard" OR payload.filename STARTS_WITH "/usr/sbin/robodr-agentd"
+  OR payload.filename STARTS_WITH "/sbin/robodr-pulsard" OR payload.filename STARTS_WITH "/sbin/robodr-agentd"
+  OR (payload.filename STARTS_WITH "/usr/lib/systemd/" AND payload.filename CONTAINS "/robodr-")
+  OR (payload.filename STARTS_WITH "/lib/systemd/" AND payload.filename CONTAINS "/robodr-")
+  OR (payload.filename STARTS_WITH "/etc/systemd/" AND payload.filename CONTAINS "/robodr-")
+  OR (payload.filename STARTS_WITH "/run/systemd/system/" AND payload.filename CONTAINS "/robodr-")
+  OR (payload.filename STARTS_WITH "/run/systemd/system.control/" AND payload.filename CONTAINS "/robodr-")
+  OR payload.filename STARTS_WITH "/run/systemd/transient/robodr-"
+  OR payload.filename STARTS_WITH "/etc/systemd/system/service.d" OR payload.filename STARTS_WITH "/run/systemd/system/service.d"
+  OR payload.filename STARTS_WITH "/usr/lib/systemd/system/service.d" OR payload.filename STARTS_WITH "/lib/systemd/system/service.d"
+)
 AND (payload.flags CONTAINS "O_WRONLY" OR payload.flags CONTAINS "O_RDWR")
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
 '''
 
 [[rules]]
-name = "RoboDR: RoboDR profile or Pulsar configuration deleted"
+name = "RoboDR: RoboDR or Pulsar protected file deleted"
 type = "FileDeleted"
 category = "defense_evasion"
 severity = "high"
-description = "A file under /etc/robodr or /etc/pulsar was deleted (e.g. a rule file, to stop alerts after the next restart)."
-condition = 'payload.filename STARTS_WITH "/etc/robodr/" OR payload.filename STARTS_WITH "/etc/pulsar/"'
-
-[[rules]]
-name = "RoboDR: RoboDR profile or Pulsar configuration renamed"
-type = "FileRename"
-category = "defense_evasion"
-severity = "high"
-description = "A file was renamed into or out of /etc/robodr or /etc/pulsar (atomic replacement of the profile, or moving a rule file away)."
+description = "A protected RoboDR/Pulsar file was deleted by something other than dpkg (e.g. a rule file, to stop alerts after the next restart; a drop-in or unit file; the daemon binary). Protected: /etc/robodr, /etc/pulsar, /usr/share/robodr (rules_path), /usr/sbin/robodr-pulsard and /usr/sbin/robodr-agentd, the robodr-* systemd units with their drop-ins, enablement and mask links under /usr/lib/systemd, /lib/systemd, /etc/systemd and /run/systemd, and the top-level service.d drop-in directories (see the file header)."
 condition = '''
-payload.source STARTS_WITH "/etc/robodr/" OR payload.source STARTS_WITH "/etc/pulsar/"
-OR payload.destination STARTS_WITH "/etc/robodr/" OR payload.destination STARTS_WITH "/etc/pulsar/"
+(
+  payload.filename == "/etc/robodr" OR payload.filename STARTS_WITH "/etc/robodr/"
+  OR payload.filename == "/etc/pulsar" OR payload.filename STARTS_WITH "/etc/pulsar/"
+  OR payload.filename == "/usr/share/robodr" OR payload.filename STARTS_WITH "/usr/share/robodr/"
+  OR payload.filename STARTS_WITH "/usr/sbin/robodr-pulsard" OR payload.filename STARTS_WITH "/usr/sbin/robodr-agentd"
+  OR payload.filename STARTS_WITH "/sbin/robodr-pulsard" OR payload.filename STARTS_WITH "/sbin/robodr-agentd"
+  OR (payload.filename STARTS_WITH "/usr/lib/systemd/" AND payload.filename CONTAINS "/robodr-")
+  OR (payload.filename STARTS_WITH "/lib/systemd/" AND payload.filename CONTAINS "/robodr-")
+  OR (payload.filename STARTS_WITH "/etc/systemd/" AND payload.filename CONTAINS "/robodr-")
+  OR (payload.filename STARTS_WITH "/run/systemd/system/" AND payload.filename CONTAINS "/robodr-")
+  OR (payload.filename STARTS_WITH "/run/systemd/system.control/" AND payload.filename CONTAINS "/robodr-")
+  OR payload.filename STARTS_WITH "/run/systemd/transient/robodr-"
+  OR payload.filename STARTS_WITH "/etc/systemd/system/service.d" OR payload.filename STARTS_WITH "/run/systemd/system/service.d"
+  OR payload.filename STARTS_WITH "/usr/lib/systemd/system/service.d" OR payload.filename STARTS_WITH "/lib/systemd/system/service.d"
+)
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
 '''
 
 [[rules]]
-name = "RoboDR: File or device node created in the RoboDR or Pulsar configuration"
+name = "RoboDR: RoboDR or Pulsar protected file or directory renamed"
+type = "FileRename"
+category = "defense_evasion"
+severity = "high"
+description = "A file or directory was renamed into, out of, or within the protected RoboDR/Pulsar paths by something other than dpkg: atomic replacement of the profile, a rule file or the daemon binary, moving a rule file away, or renaming a protected directory itself ('/etc/pulsar' -> '/etc/pulsar.old', '/usr/share/robodr/rules' -> elsewhere) so the daemon finds nothing at start. Protected: /etc/robodr, /etc/pulsar, /usr/share/robodr (rules_path), /usr/sbin/robodr-pulsard and /usr/sbin/robodr-agentd, the robodr-* systemd units with their drop-ins, enablement and mask links under /usr/lib/systemd, /lib/systemd, /etc/systemd and /run/systemd, and the top-level service.d drop-in directories (see the file header)."
+condition = '''
+(
+(
+  payload.source == "/etc/robodr" OR payload.source STARTS_WITH "/etc/robodr/"
+  OR payload.source == "/etc/pulsar" OR payload.source STARTS_WITH "/etc/pulsar/"
+  OR payload.source == "/usr/share/robodr" OR payload.source STARTS_WITH "/usr/share/robodr/"
+  OR payload.source STARTS_WITH "/usr/sbin/robodr-pulsard" OR payload.source STARTS_WITH "/usr/sbin/robodr-agentd"
+  OR payload.source STARTS_WITH "/sbin/robodr-pulsard" OR payload.source STARTS_WITH "/sbin/robodr-agentd"
+  OR (payload.source STARTS_WITH "/usr/lib/systemd/" AND payload.source CONTAINS "/robodr-")
+  OR (payload.source STARTS_WITH "/lib/systemd/" AND payload.source CONTAINS "/robodr-")
+  OR (payload.source STARTS_WITH "/etc/systemd/" AND payload.source CONTAINS "/robodr-")
+  OR (payload.source STARTS_WITH "/run/systemd/system/" AND payload.source CONTAINS "/robodr-")
+  OR (payload.source STARTS_WITH "/run/systemd/system.control/" AND payload.source CONTAINS "/robodr-")
+  OR payload.source STARTS_WITH "/run/systemd/transient/robodr-"
+  OR payload.source STARTS_WITH "/etc/systemd/system/service.d" OR payload.source STARTS_WITH "/run/systemd/system/service.d"
+  OR payload.source STARTS_WITH "/usr/lib/systemd/system/service.d" OR payload.source STARTS_WITH "/lib/systemd/system/service.d"
+)
+OR (
+  payload.destination == "/etc/robodr" OR payload.destination STARTS_WITH "/etc/robodr/"
+  OR payload.destination == "/etc/pulsar" OR payload.destination STARTS_WITH "/etc/pulsar/"
+  OR payload.destination == "/usr/share/robodr" OR payload.destination STARTS_WITH "/usr/share/robodr/"
+  OR payload.destination STARTS_WITH "/usr/sbin/robodr-pulsard" OR payload.destination STARTS_WITH "/usr/sbin/robodr-agentd"
+  OR payload.destination STARTS_WITH "/sbin/robodr-pulsard" OR payload.destination STARTS_WITH "/sbin/robodr-agentd"
+  OR (payload.destination STARTS_WITH "/usr/lib/systemd/" AND payload.destination CONTAINS "/robodr-")
+  OR (payload.destination STARTS_WITH "/lib/systemd/" AND payload.destination CONTAINS "/robodr-")
+  OR (payload.destination STARTS_WITH "/etc/systemd/" AND payload.destination CONTAINS "/robodr-")
+  OR (payload.destination STARTS_WITH "/run/systemd/system/" AND payload.destination CONTAINS "/robodr-")
+  OR (payload.destination STARTS_WITH "/run/systemd/system.control/" AND payload.destination CONTAINS "/robodr-")
+  OR payload.destination STARTS_WITH "/run/systemd/transient/robodr-"
+  OR payload.destination STARTS_WITH "/etc/systemd/system/service.d" OR payload.destination STARTS_WITH "/run/systemd/system/service.d"
+  OR payload.destination STARTS_WITH "/usr/lib/systemd/system/service.d" OR payload.destination STARTS_WITH "/lib/systemd/system/service.d"
+)
+)
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
+'''
+
+[[rules]]
+name = "RoboDR: File or device node created in a RoboDR or Pulsar protected path"
 type = "FileCreated"
 category = "defense_evasion"
 severity = "high"
-description = "A new file system object was created under /etc/robodr or /etc/pulsar. Pulsar reports both open(O_CREAT) and mknod(2) as FileCreated, so this catches a FIFO or device node dropped into the rules directory (mkfifo /etc/pulsar/rules/zz.toml: the rules engine blocks reading it at the next start), as well as new rule files that disable or shadow detection after a restart. Only the signed update path adds files here."
-condition = 'payload.filename STARTS_WITH "/etc/robodr/" OR payload.filename STARTS_WITH "/etc/pulsar/"'
+description = "A new file system object was created in a protected RoboDR/Pulsar path by something other than dpkg. Pulsar reports both open(O_CREAT) and mknod(2) as FileCreated, so this catches a FIFO or device node dropped into the rules directory (the rules engine blocks reading it at the next start), new rule files that disable or shadow detection after a restart, a new robodr-*.service override or drop-in .conf, and a planted daemon binary. Protected: /etc/robodr, /etc/pulsar, /usr/share/robodr (rules_path), /usr/sbin/robodr-pulsard and /usr/sbin/robodr-agentd, the robodr-* systemd units with their drop-ins, enablement and mask links under /usr/lib/systemd, /lib/systemd, /etc/systemd and /run/systemd, and the top-level service.d drop-in directories (see the file header)."
+condition = '''
+(
+  payload.filename == "/etc/robodr" OR payload.filename STARTS_WITH "/etc/robodr/"
+  OR payload.filename == "/etc/pulsar" OR payload.filename STARTS_WITH "/etc/pulsar/"
+  OR payload.filename == "/usr/share/robodr" OR payload.filename STARTS_WITH "/usr/share/robodr/"
+  OR payload.filename STARTS_WITH "/usr/sbin/robodr-pulsard" OR payload.filename STARTS_WITH "/usr/sbin/robodr-agentd"
+  OR payload.filename STARTS_WITH "/sbin/robodr-pulsard" OR payload.filename STARTS_WITH "/sbin/robodr-agentd"
+  OR (payload.filename STARTS_WITH "/usr/lib/systemd/" AND payload.filename CONTAINS "/robodr-")
+  OR (payload.filename STARTS_WITH "/lib/systemd/" AND payload.filename CONTAINS "/robodr-")
+  OR (payload.filename STARTS_WITH "/etc/systemd/" AND payload.filename CONTAINS "/robodr-")
+  OR (payload.filename STARTS_WITH "/run/systemd/system/" AND payload.filename CONTAINS "/robodr-")
+  OR (payload.filename STARTS_WITH "/run/systemd/system.control/" AND payload.filename CONTAINS "/robodr-")
+  OR payload.filename STARTS_WITH "/run/systemd/transient/robodr-"
+  OR payload.filename STARTS_WITH "/etc/systemd/system/service.d" OR payload.filename STARTS_WITH "/run/systemd/system/service.d"
+  OR payload.filename STARTS_WITH "/usr/lib/systemd/system/service.d" OR payload.filename STARTS_WITH "/lib/systemd/system/service.d"
+)
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
+'''
 
 [[rules]]
-name = "RoboDR: Link created in or to the RoboDR or Pulsar configuration"
+name = "RoboDR: Link created in or to a RoboDR or Pulsar protected path"
 type = "FileLink"
 category = "defense_evasion"
 severity = "high"
-description = "A hard or symbolic link was created under /etc/robodr or /etc/pulsar (e.g. /etc/pulsar/rules/zz.toml -> /dev/null or -> a huge file, which makes the rules engine fail or hang at start, or a planted rule file linked in from elsewhere), or a hard link to a file in those directories was created elsewhere (an alias through which the file can later be rewritten without a write-open under /etc/pulsar, because Pulsar reports the path the file was opened by). Pulsar FileLink: 'source' is the new link, 'destination' the target; for symlinks the target is the raw string, so only hard-link targets are matched."
+description = "A hard or symbolic link was created in a protected RoboDR/Pulsar path (a rule file -> /dev/null or a huge file, which makes the rules engine fail or hang at start; 'systemctl mask' / a manual robodr-*.service -> /dev/null link; a *.wants enablement link added or replaced; a daemon path pointed at another binary), or a hard link to a protected file was created elsewhere (an alias through which it can later be rewritten without a write-open under the protected path, because Pulsar reports the path the file was opened by), by something other than dpkg. Pulsar FileLink: 'source' is the new link, 'destination' the target; for symlinks the target is the raw string, so only hard-link targets are matched. Protected: /etc/robodr, /etc/pulsar, /usr/share/robodr (rules_path), /usr/sbin/robodr-pulsard and /usr/sbin/robodr-agentd, the robodr-* systemd units with their drop-ins, enablement and mask links under /usr/lib/systemd, /lib/systemd, /etc/systemd and /run/systemd, and the top-level service.d drop-in directories (see the file header)."
 condition = '''
-payload.source STARTS_WITH "/etc/robodr/" OR payload.source STARTS_WITH "/etc/pulsar/"
-OR (payload.hard_link == "true" AND (payload.destination STARTS_WITH "/etc/robodr/" OR payload.destination STARTS_WITH "/etc/pulsar/"))
+(
+(
+  payload.source == "/etc/robodr" OR payload.source STARTS_WITH "/etc/robodr/"
+  OR payload.source == "/etc/pulsar" OR payload.source STARTS_WITH "/etc/pulsar/"
+  OR payload.source == "/usr/share/robodr" OR payload.source STARTS_WITH "/usr/share/robodr/"
+  OR payload.source STARTS_WITH "/usr/sbin/robodr-pulsard" OR payload.source STARTS_WITH "/usr/sbin/robodr-agentd"
+  OR payload.source STARTS_WITH "/sbin/robodr-pulsard" OR payload.source STARTS_WITH "/sbin/robodr-agentd"
+  OR (payload.source STARTS_WITH "/usr/lib/systemd/" AND payload.source CONTAINS "/robodr-")
+  OR (payload.source STARTS_WITH "/lib/systemd/" AND payload.source CONTAINS "/robodr-")
+  OR (payload.source STARTS_WITH "/etc/systemd/" AND payload.source CONTAINS "/robodr-")
+  OR (payload.source STARTS_WITH "/run/systemd/system/" AND payload.source CONTAINS "/robodr-")
+  OR (payload.source STARTS_WITH "/run/systemd/system.control/" AND payload.source CONTAINS "/robodr-")
+  OR payload.source STARTS_WITH "/run/systemd/transient/robodr-"
+  OR payload.source STARTS_WITH "/etc/systemd/system/service.d" OR payload.source STARTS_WITH "/run/systemd/system/service.d"
+  OR payload.source STARTS_WITH "/usr/lib/systemd/system/service.d" OR payload.source STARTS_WITH "/lib/systemd/system/service.d"
+)
+OR (payload.hard_link == "true" AND (
+    payload.destination == "/etc/robodr" OR payload.destination STARTS_WITH "/etc/robodr/"
+    OR payload.destination == "/etc/pulsar" OR payload.destination STARTS_WITH "/etc/pulsar/"
+    OR payload.destination == "/usr/share/robodr" OR payload.destination STARTS_WITH "/usr/share/robodr/"
+    OR payload.destination STARTS_WITH "/usr/sbin/robodr-pulsard" OR payload.destination STARTS_WITH "/usr/sbin/robodr-agentd"
+    OR payload.destination STARTS_WITH "/sbin/robodr-pulsard" OR payload.destination STARTS_WITH "/sbin/robodr-agentd"
+    OR (payload.destination STARTS_WITH "/usr/lib/systemd/" AND payload.destination CONTAINS "/robodr-")
+    OR (payload.destination STARTS_WITH "/lib/systemd/" AND payload.destination CONTAINS "/robodr-")
+    OR (payload.destination STARTS_WITH "/etc/systemd/" AND payload.destination CONTAINS "/robodr-")
+    OR (payload.destination STARTS_WITH "/run/systemd/system/" AND payload.destination CONTAINS "/robodr-")
+    OR (payload.destination STARTS_WITH "/run/systemd/system.control/" AND payload.destination CONTAINS "/robodr-")
+    OR payload.destination STARTS_WITH "/run/systemd/transient/robodr-"
+    OR payload.destination STARTS_WITH "/etc/systemd/system/service.d" OR payload.destination STARTS_WITH "/run/systemd/system/service.d"
+    OR payload.destination STARTS_WITH "/usr/lib/systemd/system/service.d" OR payload.destination STARTS_WITH "/lib/systemd/system/service.d"
+  ))
+)
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
+'''
+
+[[rules]]
+name = "RoboDR: Directory created in a RoboDR or Pulsar protected path"
+type = "DirCreated"
+category = "defense_evasion"
+severity = "high"
+description = "A directory was created in a protected RoboDR/Pulsar path by something other than dpkg: typically a systemd drop-in directory (robodr-pulsard.service.d, robodr-agentd.service.d, a top-level service.d, or the system.control directory 'systemctl set-property' writes to) that precedes an override of ExecStart, the environment or resource limits, or a new rules subdirectory. systemd-tmpfiles recreating a deleted /etc/robodr/keys at boot also fires (the deletion already did). Protected: /etc/robodr, /etc/pulsar, /usr/share/robodr (rules_path), /usr/sbin/robodr-pulsard and /usr/sbin/robodr-agentd, the robodr-* systemd units with their drop-ins, enablement and mask links under /usr/lib/systemd, /lib/systemd, /etc/systemd and /run/systemd, and the top-level service.d drop-in directories (see the file header)."
+condition = '''
+(
+  payload.dirname == "/etc/robodr" OR payload.dirname STARTS_WITH "/etc/robodr/"
+  OR payload.dirname == "/etc/pulsar" OR payload.dirname STARTS_WITH "/etc/pulsar/"
+  OR payload.dirname == "/usr/share/robodr" OR payload.dirname STARTS_WITH "/usr/share/robodr/"
+  OR payload.dirname STARTS_WITH "/usr/sbin/robodr-pulsard" OR payload.dirname STARTS_WITH "/usr/sbin/robodr-agentd"
+  OR payload.dirname STARTS_WITH "/sbin/robodr-pulsard" OR payload.dirname STARTS_WITH "/sbin/robodr-agentd"
+  OR (payload.dirname STARTS_WITH "/usr/lib/systemd/" AND payload.dirname CONTAINS "/robodr-")
+  OR (payload.dirname STARTS_WITH "/lib/systemd/" AND payload.dirname CONTAINS "/robodr-")
+  OR (payload.dirname STARTS_WITH "/etc/systemd/" AND payload.dirname CONTAINS "/robodr-")
+  OR (payload.dirname STARTS_WITH "/run/systemd/system/" AND payload.dirname CONTAINS "/robodr-")
+  OR (payload.dirname STARTS_WITH "/run/systemd/system.control/" AND payload.dirname CONTAINS "/robodr-")
+  OR payload.dirname STARTS_WITH "/run/systemd/transient/robodr-"
+  OR payload.dirname STARTS_WITH "/etc/systemd/system/service.d" OR payload.dirname STARTS_WITH "/run/systemd/system/service.d"
+  OR payload.dirname STARTS_WITH "/usr/lib/systemd/system/service.d" OR payload.dirname STARTS_WITH "/lib/systemd/system/service.d"
+)
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
+'''
+
+[[rules]]
+name = "RoboDR: RoboDR or Pulsar protected directory deleted"
+type = "DirDeleted"
+category = "defense_evasion"
+severity = "high"
+description = "A directory in, or one of, the protected RoboDR/Pulsar paths was removed by something other than dpkg (rmdir only succeeds on an empty directory, so a recursive delete of /usr/share/robodr/rules or /etc/robodr also raises one FileDeleted per file; this is the last event of that sequence, and the only one for an already empty drop-in or rules directory). Protected: /etc/robodr, /etc/pulsar, /usr/share/robodr (rules_path), /usr/sbin/robodr-pulsard and /usr/sbin/robodr-agentd, the robodr-* systemd units with their drop-ins, enablement and mask links under /usr/lib/systemd, /lib/systemd, /etc/systemd and /run/systemd, and the top-level service.d drop-in directories (see the file header)."
+condition = '''
+(
+  payload.dirname == "/etc/robodr" OR payload.dirname STARTS_WITH "/etc/robodr/"
+  OR payload.dirname == "/etc/pulsar" OR payload.dirname STARTS_WITH "/etc/pulsar/"
+  OR payload.dirname == "/usr/share/robodr" OR payload.dirname STARTS_WITH "/usr/share/robodr/"
+  OR payload.dirname STARTS_WITH "/usr/sbin/robodr-pulsard" OR payload.dirname STARTS_WITH "/usr/sbin/robodr-agentd"
+  OR payload.dirname STARTS_WITH "/sbin/robodr-pulsard" OR payload.dirname STARTS_WITH "/sbin/robodr-agentd"
+  OR (payload.dirname STARTS_WITH "/usr/lib/systemd/" AND payload.dirname CONTAINS "/robodr-")
+  OR (payload.dirname STARTS_WITH "/lib/systemd/" AND payload.dirname CONTAINS "/robodr-")
+  OR (payload.dirname STARTS_WITH "/etc/systemd/" AND payload.dirname CONTAINS "/robodr-")
+  OR (payload.dirname STARTS_WITH "/run/systemd/system/" AND payload.dirname CONTAINS "/robodr-")
+  OR (payload.dirname STARTS_WITH "/run/systemd/system.control/" AND payload.dirname CONTAINS "/robodr-")
+  OR payload.dirname STARTS_WITH "/run/systemd/transient/robodr-"
+  OR payload.dirname STARTS_WITH "/etc/systemd/system/service.d" OR payload.dirname STARTS_WITH "/run/systemd/system/service.d"
+  OR payload.dirname STARTS_WITH "/usr/lib/systemd/system/service.d" OR payload.dirname STARTS_WITH "/lib/systemd/system/service.d"
+)
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
 '''
 
 [[rules]]
@@ -67,16 +253,26 @@ name = "RoboDR: Attempt to stop the Pulsar or RoboDR service"
 type = "Exec"
 category = "defense_evasion"
 severity = "high"
-description = "systemctl stop/disable/mask/kill, or kill-by-name (pkill/killall), was run against the Pulsar daemon or a RoboDR service. Stopping the sensor is the first step before tampering with the robot."
+description = "systemctl stop/disable/mask/kill/freeze/set-property/edit, 'service ... stop', or kill-by-name (pkill/killall), was run against the RoboDR daemons (robodr-pulsard.service, robodr-agentd.service, the robodr-pulsard / robodr-agentd binaries) or an upstream Pulsar unit. Stopping, freezing or starving the sensor is the first step before tampering with the robot. The package's own prerm stops both units on removal (not on upgrade): that is the audit trail of a removal. Not seen: kill by PID, unit globs ('robodr-*'), and argv forms not listed (see rules/README.md); the dead sensor then has to be noticed by its missing heartbeat."
 condition = '''
 (
   payload.filename ENDS_WITH "/systemctl"
-  AND (payload.argv CONTAINS "stop" OR payload.argv CONTAINS "disable" OR payload.argv CONTAINS "mask" OR payload.argv CONTAINS "kill")
-  AND (payload.argv CONTAINS "pulsar" OR payload.argv CONTAINS "pulsar.service" OR payload.argv CONTAINS "pulsard"
+  AND (payload.argv CONTAINS "stop" OR payload.argv CONTAINS "disable" OR payload.argv CONTAINS "mask" OR payload.argv CONTAINS "kill"
+       OR payload.argv CONTAINS "freeze" OR payload.argv CONTAINS "set-property" OR payload.argv CONTAINS "edit")
+  AND (payload.argv CONTAINS "robodr-pulsard.service" OR payload.argv CONTAINS "robodr-pulsard"
+       OR payload.argv CONTAINS "robodr-agentd.service" OR payload.argv CONTAINS "robodr-agentd"
+       OR payload.argv CONTAINS "pulsar" OR payload.argv CONTAINS "pulsar.service" OR payload.argv CONTAINS "pulsard"
        OR payload.argv CONTAINS "pulsard.service" OR payload.argv CONTAINS "robodr" OR payload.argv CONTAINS "robodr.service")
 )
 OR (
+  payload.filename ENDS_WITH "/service"
+  AND payload.argv CONTAINS "stop"
+  AND (payload.argv CONTAINS "robodr-pulsard" OR payload.argv CONTAINS "robodr-agentd" OR payload.argv CONTAINS "pulsar"
+       OR payload.argv CONTAINS "pulsard" OR payload.argv CONTAINS "robodr")
+)
+OR (
   (payload.filename ENDS_WITH "/pkill" OR payload.filename ENDS_WITH "/killall")
-  AND (payload.argv CONTAINS "pulsard" OR payload.argv CONTAINS "pulsar")
+  AND (payload.argv CONTAINS "robodr-pulsard" OR payload.argv CONTAINS "robodr-agentd" OR payload.argv CONTAINS "robodr"
+       OR payload.argv CONTAINS "pulsard" OR payload.argv CONTAINS "pulsar")
 )
 '''
