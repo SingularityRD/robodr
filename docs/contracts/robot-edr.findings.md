@@ -363,20 +363,67 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
 ## 8. Air-gapped transport (diode export batches)
 
 Defence sites run the console air-gapped; findings may have to cross a
-one-way data diode to reach an AutoSecOps instance. *Not implemented in this
-crate — the format below is the contract for whoever builds the exporter/importer.*
+one-way data diode (or controlled removable media) to reach an AutoSecOps
+instance. **Implemented in `crates/robodr-diode`** (`Packer` / `Importer`,
+CLIs `robodr-diode-pack` / `robodr-diode-unpack`; format and limits in that
+crate's README). Moving files across the diode and producing the emitted
+records to Kafka are outside the crate (no network code).
 
-* **Low side (export):** append each validated value (compact JSON, one per
-  line) to a JSON Lines batch `robot-edr-findings_<site>_<batch_seq>.jsonl`,
-  plus a manifest `{contract_version, site, batch_seq, count, first_time,
-  last_time, sha256}` where `sha256` covers the `.jsonl` bytes. The manifest
-  should be signed with the black-box signing key (signature scheme is the
-  black-box crate's, out of scope here).
-* **High side (import):** verify manifest signature and hash, then for every
-  line run `robodr_ocsf::parse_and_validate` and republish with the **same**
-  key, partition rule and headers. Because `finding_id` and `event-uid` are
-  deterministic, re-sending a batch is idempotent for the consumer.
-* Batches are ordered by `batch_seq`; a gap is reported, never silently skipped.
+* **Batch = one directory** `rdd_<unit_id>_<batch_seq, 16 digits>/` holding
+  `findings.jsonl` (each value compact JSON, one per `\n`-terminated line,
+  validated with `robodr_ocsf::to_json` before packing), optional black-box
+  export bundles `bundle-NNNN.rbbx`, `MANIFEST.json` and `MANIFEST.sig`.
+  `unit_id` is the exporting robot or site console (`[A-Za-z0-9._-]{1,64}`).
+* **Manifest** (`deny_unknown_fields`, ≤ 128 KiB, ≤ 256 files):
+  `{format: "robodr-diode/1", contract_version, unit_id, batch_seq (1-based),
+  prev_batch_hash, created_at (RFC 3339 ms), created_at_ms, key_id, algorithm,
+  finding_count, first_time, last_time, files: [{name, kind, size, sha256}]}`.
+  `first_time`/`last_time` are min/max `ocsf.time`. File names are
+  allow-listed (`findings.jsonl`, `bundle-NNNN.rbbx`); anything with a path
+  separator, `..`, a leading dot or upper case is rejected.
+* **Signature**: the raw manifest bytes are signed through the black-box
+  crate's `Signer` over `"robodr-diode/manifest/v1\0" || manifest`;
+  `MANIFEST.sig` = `{format, algorithm, key_id, sig (hex)}`. Batch hash =
+  SHA-256(`"robodr-diode/batch-hash/v1\0" || manifest`); each manifest carries
+  the previous batch's hash, so batches form a per-unit hash chain.
+  **Interim:** the only signer available offline is HMAC-SHA256 (symmetric:
+  the SOC holding the key could forge batches). Production needs an
+  asymmetric signer behind the same trait.
+* **Size bounds**: data bytes per batch (default 16 MiB, ≥ 64 KiB + 1) and
+  findings per batch (default 10 000); larger inputs are split into several
+  consecutive batches.
+* **Low side (export)**: stage in `outbox/.tmp-<batch>/`, `fsync`, commit
+  (`next_seq`, chain head) to the packer state file atomically, then `rename`
+  into the outbox. The transfer agent must ignore dot-entries. A crash
+  between commit and rename is finished on the next start; sequence numbers
+  are never reused for different visible content.
+* **High side (import)**: authenticate the manifest bytes with the keyring
+  key named in `MANIFEST.sig` *before* parsing them; the key must belong to the
+  manifest's unit and the directory name must match. Then, per unit:
+  `seq = last+1` with the right `prev_batch_hash` → verify every file
+  (regular file, no symlink, exact size and SHA-256, no unlisted entries),
+  run `robodr_ocsf::parse_and_validate` on every line, parse (and, with a
+  black-box verifier configured, verify) every bundle, and emit
+  `out/<batch>/records.jsonl` — one Kafka record per line with the **same**
+  key, partition rule and headers as §2/§4 (`{topic, partition, key, headers,
+  value, diode: {unit_id, batch_seq, batch_hash, line}}`).
+* **Ordering**: batches are processed in `batch_seq` order. A gap is
+  **reported and the later batches held** in the inbox until the missing ones
+  arrive (reordering heals itself) or an operator explicitly accepts that gap
+  (`--accept-gap unit:seq`, recorded in the importer state); never silently
+  skipped. An identical re-send (same batch hash) is a duplicate: verified,
+  filed under `processed/`, nothing re-emitted. A different batch for an
+  already-used `seq` (conflict), an old `seq` outside the remembered window
+  or inside an accepted gap (replay), or a wrong `prev_batch_hash` (chain
+  break) is quarantined.
+* **Quarantine**: any failed check moves the batch to `quarantine/` with a
+  `<name>.reason.json` (`reason.code`, e.g. `bad_signature`, `hash_mismatch`,
+  `size_mismatch`, `invalid_finding`, `manifest_invalid`, `symlink`,
+  `conflict`); importer state does not advance, so an intact re-send of the
+  same batch is accepted later (whole-file / whole-batch retransmission is the
+  forward-error strategy; no application-level FEC).
+* Because `finding_id` and `event-uid` are deterministic, re-publishing an
+  already-imported finding remains idempotent for the consumer.
 
 ## 9. AutoSecOps-side checklist (from the design doc)
 
