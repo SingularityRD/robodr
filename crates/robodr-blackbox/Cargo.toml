@@ -2,6 +2,7 @@
 name = "robodr-blackbox"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Signed, hash-chained black-box evidence recorder for RoboDR."

@@ -2,6 +2,7 @@
 name = "robodr-firewall"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Motion Firewall core (pure, deterministic, allocation-free hot path): pass / limit / reject each motion command against the locked envelope."

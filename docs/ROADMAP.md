@@ -95,31 +95,48 @@ written for that target; the component dependency order is unchanged.
 ## 2. Component map (dependency order)
 
 ```
-                 ┌─────────────────────── robodr-events (pure core) ✓ built
+                 ┌──────────── robodr-events (pure core)                   [P]
                  │   RobotEvent taxonomy · Profile · Deviation · graph
                  ▼
- ┌───────────────────────────── sensors ──────────────────────────────┐
- │ robodr-sensor-ros2   DDS/RTPS graph        (Full Agent)   ◐ in progress
- │ robodr-sensor-ebpf   process/file/net+LSM  (reuse Pulsar) ○ next
- │ robodr-sensor-motion motion cmd + feedback (Full Agent)   ○
- │ robodr-sensor-bus    CAN/EtherCAT/MAVLink  (Bus Tap)       ○
- │ robodr-attest        TPM/IMA measured boot                 ○
- └─────────────────────────────────────────────────────────────────────┘
+ ┌───────────────────────────── sensors ──────────────────────────────────────┐
+ │ robodr-sensor-ros2   DDS/RTPS graph        (Full Agent)   [P] [I-unbuilt]
+ │   ├ robodr-rtps          SPDP/SEDP parser + DATA_FRAG                [P]
+ │   ├ robodr-capture       pcap replay + AF_PACKET (passive)           [P]
+ │   └ robodr-ros2-pipeline parse → profile → dedup → findings          [P]
+ │ robodr-sensor-ebpf   process/file/net+LSM  (reuse Pulsar)  [~] rules only
+ │ robodr-sensor-motion motion cmd + feedback (Full Agent)    [P] detector
+ │   ├ robodr-motion        consistency detector                        [P]
+ │   └ robodr-cdr           ROS 2 CDR motion decoder                    [~]
+ │ robodr-sensor-bus    CAN/EtherCAT/MAVLink  (Bus Tap)        [ ]
+ │ robodr-attest        TPM/IMA measured boot                  [ ]
+ └─────────────────────────────────────────────────────────────────────────────┘
                  │ all emit RobotEvent / Pulsar threats
                  ▼
- robodr-firewall   Motion Firewall (in-path, deterministic)   ○
+ robodr-firewall   Motion Firewall decision core              [P] (no gateway)
                  │
                  ▼
- robodr-responder  Cyber-Jidoka: graded, safety-aware response ○
+ robodr-responder  Cyber-Jidoka response planner              [P] (no executor)
+ robodr-blackbox   signed, hash-chained evidence              [P] (HMAC interim)
+ robodr-agent      offline chain: event→plan→evidence→finding [P]
+ robodr-agentd     runtime daemon hosting the chain           [~]
                  │ signed evidence ↕ signed policy/rules
                  ▼
- robodr-fleet      control plane · attestation verifier · console ○
-                 │ OCSF findings
+ robodr-diode      one-way export (air-gap)                   [~]
+ robodr-fleet      control plane · attestation verifier · console [ ]
+                 │ OCSF findings  (robodr-ocsf mapper          [P])
                  ▼
- AutoSecOps AI SOC  triage · hunt · workflows (see main design doc) ○
+ AutoSecOps AI SOC  triage · hunt · workflows (see main design doc) [ ]
 ```
 
-`✓ built · ◐ in progress · ○ planned`
+Legend (status as of 2026-10-16):
+
+| Tag | Meaning |
+|---|---|
+| `[P]` | **Pure logic done**: the crate exists, is unit/integration-tested offline on synthetic inputs. No live I/O path proven. |
+| `[I]` | **Integrated**: wired into a runnable sensor/daemon, built, and exercised end to end on a host. `[I-unbuilt]` = integration code written but never compiled (Pulsar-bound crates cannot be built in the offline sandbox). |
+| `[F]` | **Field-verified**: shown on real robot / real DDS traffic / real hardware. **Nothing is `[F]` yet.** |
+| `[~]` | In progress (crate being written). |
+| `[ ]` | Planned; no code. |
 
 ---
 
@@ -136,13 +153,23 @@ real controller), detect an unknown DDS participant, an unauthorized motion/
 command publisher, and a host compromise, and surface them in one console — with
 everything running with no outbound connectivity.
 
-- `robodr-events` pure core with model profile + envelope. **[done]**
-- `robodr-sensor-ros2` passive SPDP sensor raising profile deviations. **[in progress]**
+- `robodr-events` pure core with model profile + envelope. **[P]**
+- `robodr-sensor-ros2` passive SPDP + SEDP sensor raising profile deviations.
+  **[P]** for the pipeline (`robodr-rtps`, `robodr-capture`,
+  `robodr-ros2-pipeline`, incl. live AF_PACKET on loopback in tests);
+  **[I-unbuilt]** for the Pulsar module (`robodr-sensor-ros2`,
+  `robodr-pulsard`: written, never compiled, no tests).
 - Reuse Pulsar's process/file/network + LSM probes unchanged; add `rules/robodr/*.toml` (Pulsar TOML rules, see `rules/README.md`).
+  **[~]** rules written and checked by `scripts/validate_rules.py`; never
+  loaded into a Pulsar rules engine.
 - Observe-mode profile learning: a commissioning tool records the graph and
   envelopes over a clean run, emits a `profile.json`, the OEM locks it.
+  **[P]** `robodr-commission` (`learn` / `diff` / `merge` / `lock` / `check`,
+  from JSONL event recordings or pcap/pcapng); never run on a real robot.
 - Bridge threats to AutoSecOps over the existing Kafka/adapter path (robot
   source-trust map + `robotics` category, per the main design doc).
+  **[P]** for the OCSF mapping and topic contract (`robodr-ocsf`,
+  `docs/contracts/`); no Kafka client, AutoSecOps side not done.
 
 **Exit criteria.** On a real UGV companion computer: a foreign `cmd_vel`
 publisher is flagged Critical *from live traffic* (SEDP parser done; needs the
@@ -158,20 +185,25 @@ posture in the console; a red-team spoofed command is caught.
 **Goal:** Turn detection into graded, safety-aware response, and cover robots we
 cannot put an agent inside.
 
-- `robodr-firewall` (Motion Firewall), v1 as a ROS 2 command gateway: every
+- `robodr-firewall` (Motion Firewall), v1 as a ROS 2 command gateway
+  (**[P]** decision core only; the gateway and CDR decoding, `robodr-cdr`
+  **[~]**, are not done): every
   motion command passes through, is checked against the envelope and the allowed
   source set, and is passed / limited / rejected. Deterministic, fixed latency
   budget, fail-safe behaviour defined per model by the OEM.
 - `robodr-responder` (Cyber-Jidoka): the five-step graded ladder (record →
   restrict → limit motion → safe pause → request safe state), choosing by
   deviation severity × current safety state. Response profiles validated per
-  model with the OEM.
+  model with the OEM. **[P]** planner only; executes nothing (no executor).
 - `robodr-sensor-motion`: the motion/feedback consistency check that catches the
-  "Seeing is Not Believing" injected-telemetry class.
+  "Seeing is Not Believing" injected-telemetry class. **[P]** detector
+  (`robodr-motion`); no topic subscription yet.
 - **Sentinel Box**: agentless appliance for closed controllers (KUKA, FANUC,
   ABB, Yaskawa). Passive network + vendor control-API connectors + black-box
   recorder. Pure detection core reused unchanged; only the sensors differ.
 - Signed, hash-chained black-box evidence; evidence links ride on every finding.
+  **[P]** `robodr-blackbox` (HMAC-SHA256 placeholder signer) and evidence
+  links in `robodr-agent` / `robodr-ocsf`.
 
 **Exit criteria.** Motion Firewall holds its latency budget under load with
 zero control-loop jitter regression (agent on vs off). A staged over-envelope
@@ -246,12 +278,17 @@ placed in ROS node and topic names, mirroring AutoSecOps' eval discipline).
 
 ## 5. Immediate next actions
 
-1. ~~Finish the SEDP parse in `rtps`~~ — **done** (topic/type/endpoint GUID,
-   tested, fuzzed). Next: a capture-based listener (AF_PACKET / eBPF socket
-   filter) so the sensor actually receives SEDP, which most DDS vendors send
-   unicast rather than on the SPDP multicast group.
-2. Build the observe-mode commissioning tool that emits `profile.json`.
-3. Stand up the lab: one ROS 2 AMR (or Gazebo + a real controller) and one
+1. ~~Finish the SEDP parse in `rtps`~~ — **done [P]** (topic/type/endpoint
+   GUID, DATA_FRAG reassembly, tested, fuzzed). ~~Capture-based listener~~ —
+   **done [P]**: `robodr-capture` (AF_PACKET + pcap, read-only) feeding
+   `robodr-ros2-pipeline`; wired into the Pulsar module but **unbuilt**.
+   Remaining: build the Pulsar-bound crates on a connected host and run them
+   on real traffic.
+2. ~~Build the observe-mode commissioning tool that emits `profile.json`~~ —
+   **done [P]** (`robodr-commission`). Remaining: a commissioning run on a
+   real or Gazebo robot.
+3. Stand up the lab (**not started**; every test so far uses synthetic
+   inputs): one ROS 2 AMR (or Gazebo + a real controller) and one
    closed-controller brand, so detection is measured against real traffic.
 4. Land the AutoSecOps robot source-trust map + `robotics` category (main design
    doc checklist) so Phase 1 findings flow into the SOC.
