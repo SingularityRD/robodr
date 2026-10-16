@@ -148,10 +148,29 @@ where
     Ok(rx)
 }
 
+/// Running state of the module: the listener task and the capture stop flag.
+///
+/// Teardown is in [`Drop`], not only in `graceful_stop`: Pulsar's module
+/// manager (`src/pulsard/module_manager.rs`) calls `graceful_stop` only on a
+/// clean shutdown signal. When the module loop is aborted after the 5 s stop
+/// timeout, or exits with an error, the state is simply dropped. Dropping a
+/// tokio `JoinHandle` detaches the task rather than cancelling it, so without
+/// this `Drop` the listener (and the capture thread) would outlive the module.
+/// They would keep sending threats, and a restart would run a second
+/// listener next to the first.
 pub struct State {
     listener: JoinHandle<()>,
     /// Set on stop so the capture thread exits within one read timeout.
     capture_stop: Option<Arc<AtomicBool>>,
+}
+
+impl Drop for State {
+    fn drop(&mut self) {
+        if let Some(stop) = &self.capture_stop {
+            stop.store(true, Ordering::Relaxed);
+        }
+        self.listener.abort();
+    }
 }
 
 impl SimplePulsarModule for Ros2Sensor {
@@ -256,10 +275,9 @@ impl SimplePulsarModule for Ros2Sensor {
     }
 
     async fn graceful_stop(state: Self::State) -> Result<(), ModuleError> {
-        if let Some(stop) = &state.capture_stop {
-            stop.store(true, Ordering::Relaxed);
-        }
-        state.listener.abort();
+        // Teardown (stop flag + abort) is in `State::drop`, so it also runs
+        // when Pulsar drops the state without calling this.
+        drop(state);
         Ok(())
     }
 }
@@ -303,9 +321,13 @@ async fn listen_loop(
     let mut buf = vec![0u8; RECV_BUF_LEN];
     loop {
         if socket.is_none() && capture.is_none() && external.is_none() {
-            let msg = "no datagram source left; the ROS 2 sensor is blind".to_string();
+            // A blind sensor must not look healthy. `raise_warning` would
+            // leave the module in `Running`; `raise_error` makes Pulsar's
+            // module manager stop it (calling `graceful_stop`) and report it
+            // as `Failed` in `pulsar status`.
+            let msg = "no datagram source left; the ROS 2 sensor is blind";
             log::error!(target: MODULE_NAME, "{msg}");
-            ctx.raise_warning(msg).await;
+            ctx.raise_error(msg.into());
             return;
         }
         // Collect the outcome first and handle it after `select!` has

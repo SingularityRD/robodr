@@ -5,12 +5,29 @@ and `robodr-pulsard` (the daemon binary that ships it) plug into Pulsar, and
 exactly what was checked against which Pulsar source file.
 
 - Pulsar reference: `vendor/pulsar` at commit **4796504**
-  (`chore(github): Update PR template`), Pulsar version `0.11.0-alpha.1`.
+  (`4796504895ce42f95ffc1e414be19a5d7f40fc0a`, `chore(github): Update PR
+  template`), Pulsar version `0.11.0-alpha.1`, toolchain pin 1.98.1.
 - None of the Pulsar-dependent code has been through a real `cargo build`
   yet. This environment has no crates.io access, so tokio and Pulsar's
   dependency tree cannot be fetched. Everything below marked **verified by
   reading** was checked line by line against the Pulsar source, not by a
   compiler run against real Pulsar.
+
+## 0. Verification status (read this first)
+
+**Verified against Pulsar commit 4796504 by reading its source and by a
+stub type-check. Not yet compiled against the real Pulsar, tokio or clap.**
+
+| What | How | Result |
+|---|---|---|
+| Every Pulsar item used by `robodr-sensor-ros2` and `robodr-pulsard` | read in `vendor/pulsar` (files listed in §2 and §3) | signatures match; 2 lifecycle mismatches found and fixed (§2a) |
+| Both crates' Rust code | `cargo check` + `cargo clippy --all-targets -D warnings` + `cargo doc -D warnings` against hand-written stubs (§6) | clean |
+| Cargo manifests (dependency names, Pulsar feature names, versions) | read against `vendor/pulsar/Cargo.toml`. The stub `pulsar` crate declares the same feature names, so a typo would fail resolution | match |
+| Real build, link, eBPF probes, runtime | not possible here | **open**, see the checklist in §7 |
+
+The stubs can only catch mistakes in *our* code relative to the signatures
+copied into them. If a stub is wrong, the check is wrong in the same way. The
+first real build (§7) is what settles it.
 
 ## 1. Crates and their Pulsar dependency
 
@@ -45,14 +62,64 @@ an optional external channel, the capture thread, and `send_threat`.
 | Config bound | `pdk/module.rs`, `pdk/config.rs`, `src/pulsard/config.rs` | Config is **serde `Deserialize`** (via `ModuleConfig::parse` with `serde_ignored`), **not** `TryFrom<&ModuleConfig>`. Unknown keys are warned about, not rejected. The section is **`[module.<MODULE_NAME>]`**. `enabled` is consumed by Pulsar's `ModuleSection` and overrides `DEFAULT_ENABLED`. **Fixed:** `config/robodr.toml.example` used `[robodr-sensor-ros2]`, which Pulsar would ignore. |
 | Config of disabled modules | `src/pulsard/daemon.rs` `add_module` | Pulsar parses the config even for disabled modules. If parsing fails, startup aborts only when the module is enabled; otherwise the error is kept until someone starts it. **Fixed:** `profile_path` was a required field. Every field now has a default, so a missing section parses cleanly. |
 | `ModuleContext::send_threat` | `pdk/module_context.rs` | `fn send_threat(&self, process: Pid, timestamp: Timestamp, description: String, extra: Option<Value>)`. It is sync and spawns a task, so it needs a tokio runtime, which the listener task has. It sends `Payload::Empty` with `header.threat = Some(Threat { source: module_name, description, extra })`. **Matches.** |
-| `ModuleContext::raise_warning` | `pdk/module_context.rs`, `module_manager.rs` | `async fn raise_warning(&self, String)`. The warning is appended to `ModuleStatus::Running(warnings)`, which `pulsar status` shows. The signal channel has capacity 8. Pulsar's `threat-logger` also calls it from `init_state`. We use it once at start for an observe-only or refused profile, when the capture source ends, and if every datagram source is gone. |
+| `ModuleContext::raise_warning` | `pdk/module_context.rs`, `module_manager.rs` | `async fn raise_warning(&self, String)`. The warning is appended to `ModuleStatus::Running(warnings)`, which `pulsar status` shows. The signal channel has capacity 8. Pulsar's `threat-logger` also calls it from `init_state`. We use it once at start for an observe-only or refused profile, and when the capture source ends while another source remains. When every source is gone we use `raise_error` instead (§2a). |
 | `ModuleContext: Clone` | `pdk/module_context.rs` | `#[derive(Clone)]`. We clone it into the listener task. |
 | `event::Value` | `crates/pulsar-core/src/event.rs` | `pub struct Value(toml::Value)`. `Value::try_from<T: Serialize>(value: T) -> Result<Value, String>` is an **inherent** associated fn: it serialises through TOML. It is not `std::convert::TryFrom`, and an inherent fn takes precedence over the trait in `Value::try_from(..)`. Pulsar's own test calls `Value::try_from(&native)` the same way. Because the value goes through TOML, `extra` must be a TOML table. `ThreatExtra` is a flat struct of strings, a bool and two unit enums (`Severity` and `Mode`, which serialise to lowercase strings), so it stays a valid table. **Matches.** |
 | `Pid` | `pulsar-core/src/lib.rs` → `bpf-common/src/lib.rs` | `pub use nix::unistd::Pid`. The old `Pid::this()` exists in nix, but we use `Pid::from_raw(std::process::id() as i32)`, the form Pulsar itself uses. |
 | `Timestamp::now()` | `bpf-common/src/time.rs` | Exists. It reads `CLOCK_MONOTONIC` nanoseconds, the same base Pulsar's header conversion expects. |
 | `ModuleError` | `pdk/module.rs` | `Box<dyn Error + Send + Sync + 'static>`. `From<String>` and `From<&str>` come from std, so `?` on `Result<_, String>` works. |
 | Process attribution | `pdk/module_context.rs` `send_internal`, `pdk/process_tracker.rs`, `bpf-filtering/src/initializer.rs` | `send_threat` looks the pid up in the process tracker. A network peer has no local pid, so we attribute threats to the daemon's own pid. `process-monitor` seeds the tracker from `/proc` at startup, so the lookup should succeed. If it fails, Pulsar logs `Process not found in tracker` after about 100 ms and **still sends** the threat, with an empty image. |
-| Lifecycle | `src/pulsard/module_manager.rs` | `init_state` runs inside a `select!` against a stop command. We spawn the listener only at the end of `init_state`, so a cancelled init leaks nothing. `graceful_stop` aborts the listener. On restart, `init_state` runs again with `&self`. |
+| Lifecycle | `src/pulsard/module_manager.rs` | `init_state` runs inside a `select!` against a stop command. We spawn the listener only at the end of `init_state`, with no `.await` after the capture thread starts, so a cancelled init leaks nothing. On restart, `init_state` runs again with `&self`. **Fixed:** teardown now lives in `Drop for State`. See §2a. |
+| `ModuleContext::raise_error` | `pdk/module_context.rs`, `module_manager.rs` `handle_module_error` | `fn raise_error(&self, ModuleError)`. It is sync (`try_send`). When the module is `Running`, the manager sends the shutdown signal, so `graceful_stop` runs, and the status becomes `Failed(err)`. **Changed:** used when every datagram source is gone. See §2a. |
+| Warnings raised during `init_state` | `module_manager.rs` `handle_cmd` / `run_module_manager_actor` | The actor drains the signal channel only after `handle_cmd` returns. By then the status is `Running`, so a warning raised in `init_state` is buffered (capacity 8) and kept. We raise at most one there, so it cannot block. |
+| Who consumes our threats | `crates/modules/rules-engine/src/engine.rs` `process`, `crates/modules/threat-logger/src/lib.rs` | The rules engine **skips every event that already carries a threat** (`if event.header().threat.is_none()`), to avoid loops. So RoboDR threats are **not** re-evaluated by Pulsar rules. They reach `threat-logger` (stdout/syslog), the desktop and SMTP notifiers when built, and engine-api subscribers. The earlier text of this page said "threat-logger and the rules engine", which was wrong. |
+| `Pid` | `bpf-common/src/lib.rs` | It is nix 0.31's `Pid`. `const fn from_raw(pid_t)` exists. |
+
+### 2a. Mismatches found by this review and fixed
+
+1. **The listener and capture thread outlived the module when Pulsar
+   skipped `graceful_stop`.** `run_module_loop` calls
+   `T::graceful_stop(state)` only on the shutdown signal. In two cases the
+   state is just dropped:
+   - the stop command's 5 s timeout fires and the module task is
+     `abort()`ed;
+   - the loop returns an error.
+
+   Our `State` held a tokio `JoinHandle`, and dropping a `JoinHandle`
+   **detaches** the task rather than cancelling it. The listener would then
+   keep sending threats from a module Pulsar reports as stopped or failed.
+   On restart, a second listener would run next to the first. An external
+   source's receiver lock would also stay held for good, so the new
+   listener would block on it.
+
+   **Fix:** `impl Drop for State` sets the capture stop flag and aborts
+   the listener. `graceful_stop` now only drops the state.
+2. **A blind sensor reported itself as healthy.** When every datagram
+   source had ended, the listener called `raise_warning` and returned. The
+   module stayed in `Running` with a warning that is easy to miss.
+
+   **Fix:** it now calls `raise_error`. Pulsar stops the module, which runs
+   `graceful_stop`, and `pulsar status` shows `Failed("no datagram source
+   left; ...")`.
+   - Consequence: in a lab, a `pcap_replay` run with `listen_spdp = false`
+     now ends with the module in `Failed` once the file is consumed. That is
+     expected.
+   - When only the capture source ends and SPDP is still listening, the
+     module still raises a warning and keeps running.
+
+Re-verified, no change needed:
+- the `SimplePulsarModule` / `PulsarModule` blanket impl and its `Send`
+  future bounds;
+- the `send_threat` and `raise_warning` signatures;
+- `Value::try_from`, an inherent fn that still wins over the `TryFrom`
+  that the `impl<T: Into<toml::Value>> From<T> for Value` blanket implies.
+  The stub includes that blanket, so this was compiler-checked;
+- config extraction (`ModuleSection` with flatten, then
+  `ModuleConfig::parse`);
+- `add_module`;
+- `pulsar_daemon_run`;
+- the feature names;
+- the clap derives in `robodr-pulsard`.
 
 ## 3. Registration into the daemon (`robodr-pulsard`)
 
@@ -221,8 +288,10 @@ opens it from its own config section in `init_state`.
   - If the capture cannot be opened, for example without `CAP_NET_RAW`,
     **module start fails**. An operator who enabled capture must not get a
     silent blind spot.
-  - `graceful_stop` sets the stop flag, so the thread exits within one
-    `read_timeout_ms`, and aborts the listener, which drops the channel.
+  - Dropping the module `State` sets the stop flag, so the thread exits
+    within one `read_timeout_ms`, and aborts the listener, which drops the
+    channel. This happens on `graceful_stop` and also when Pulsar drops the
+    state without calling it (§2a).
   - When the capture source ends (end of a replay file, socket error), a
     module warning is raised and the SPDP socket keeps running.
 - **External source:** `Ros2Sensor::with_external_source(rx)` plus
@@ -262,22 +331,50 @@ opens it from its own config section in `init_state`.
 
   The socket tests ran real `SO_REUSEADDR` binds and a multicast join on
   this Linux host.
-- **`robodr-sensor-ros2/src/lib.rs`** was clippy-checked with `-D warnings`
-  against **hand-written signature stubs**:
-  - `pulsar-core` stubs, copied from the files in §2: `SimplePulsarModule`
-    with its `Send` future bounds, `ModuleContext::{send_threat,
-    raise_warning}`, `event::Value::try_from`, `Pid::from_raw` and
-    `Timestamp::now`;
-  - tokio 1.x stubs for `mpsc`, `Mutex::lock_owned`, `UdpSocket`, `spawn`
-    with its `Send + 'static` bound, and `time::sleep`;
-  - a `select!` stand-in that creates all three branch futures at once, so
-    their borrows overlap as in real tokio;
-  - `log` macro stubs.
+- **`robodr-sensor-ros2/src/lib.rs` and `robodr-pulsard/src/main.rs`** were
+  type-checked unchanged, from their real `Cargo.toml`s:
+  - `cargo check`;
+  - `cargo clippy --all-targets -- -D warnings`;
+  - `cargo doc -D warnings` (sensor).
 
-  This catches signature, borrow and `Send` mistakes in our code. It cannot
-  catch differences between the stubs and the real crates.
-- **`robodr-pulsard/src/main.rs`** changed only in comments. It was not
-  compiled.
+  The check ran in a scratch workspace outside the repo whose `pulsar-core`,
+  `pulsar`, `tokio`, `log`, `anyhow`, `clap` and `clap-verbosity-flag` are
+  hand-written stubs. They are wired in through workspace deps and
+  `[patch.crates-io]`. The stubs mirror the real items as follows:
+  - **pulsar-core** (edition 2024, like the real crate):
+    - `PulsarModule`, `SimplePulsarModule` and the blanket impl are copied
+      **verbatim** from `pdk/module.rs`, including the default `on_event`
+      that calls `ctx.stop_event_recv()`;
+    - `ModuleContext` (`Clone`, `Send + Sync`, `send_threat`,
+      `raise_warning`, `raise_error`);
+    - `event::Value` with the inherent `try_from` **and** the
+      `From<T: Into<toml::Value>>` blanket;
+    - nix-style `Pid` and `Timestamp::now`.
+  - **pulsar**:
+    - `pulsard::{PulsarDaemonOpts (clap::Args), PulsarDaemonStarter::add_module<T: PulsarModule + 'static>, pulsar_daemon_run}`.
+      `add_module` also asserts `T: Send + 'static`, because the real
+      manager moves the module into a spawned actor;
+    - `init_logger`, `utils::report_error`, `metadata::{VERSION, GIT_SHA}`;
+    - every cargo feature name of `vendor/pulsar/Cargo.toml`.
+  - **tokio**:
+    - `mpsc`, `Mutex::lock_owned` / `OwnedMutexGuard`, `UdpSocket`, and
+      `spawn` with its `Send + 'static` bounds;
+    - `JoinHandle::abort`, `time::sleep` and `#[tokio::main]`;
+    - auto traits match the real ones: channel ends and `Mutex` are
+      `Send`/`Sync` only when `T: Send`;
+    - a `select!` stand-in that keeps all branch futures alive at once and
+      drops them before the handler runs, as the real macro does.
+  - **clap**: the `Parser`/`Args` derives check that every
+    `#[command(flatten)]` field implements `clap::Args` and that
+    `version = ..` is a `&'static str`.
+
+  Negative controls confirmed that the stubs bite:
+  - an `Rc` held across an await in the listener fails with "future cannot
+    be sent between threads safely";
+  - a non-`Args` flatten field fails.
+
+  This catches signature, borrow, `Send` and path mistakes in our code. It
+  cannot catch differences between the stubs and the real crates.
 
 ## 7. Still unverified until a real build (Linux box with crates.io)
 
@@ -309,11 +406,12 @@ opens it from its own config section in `init_state`.
      DDS, Connext). This is a per-vendor lab item; if a vendor binds with
      `SO_REUSEPORT` only, our bind fails, which is the safe direction;
    - the process-tracker lookup for the daemon's pid.
-7. End-to-end: a threat from this module shows up in `threat-logger` and the
-   rules engine, with `extra` intact.
+7. End-to-end: a threat from this module shows up in `threat-logger` with
+   `extra` intact. The rules engine does not see it by design (§2).
 8. Capture inside the daemon:
    - `AF_PACKET` opening under `robodr-pulsard`'s privileges;
-   - capture-thread shutdown on module stop and restart;
+   - capture-thread shutdown on module stop and restart, including the
+     forced-abort path that `Drop for State` now covers (§2a);
    - behaviour under load (kernel drops are reported by
      `AfPacketSource::kernel_stats`, but the sensor does not surface them
      yet);
@@ -321,6 +419,77 @@ opens it from its own config section in `init_state`.
      type information. Until the lab has run it, the Low
      `robot.rtps.fragmented_discovery` finding may fire for every
      participant host.
+
+9. Toolchain and MSRV. `robodr-sensor-ros2` and `robodr-pulsard` inherit
+   `rust-version = "1.85"` from the workspace, but their dependency tree
+   (Pulsar is edition 2024 and pins 1.98.1; tokio, toml and others) is only
+   known to build on Pulsar's 1.98.1. CI's `msrv` job checks only the pure
+   crates, so nothing is wrong today. Do not read 1.85 as a promise for
+   these two crates.
+10. Version floors. The root `Cargo.toml` asks for `tokio = "1"`,
+    `log = "0.4"` and `anyhow = "1"`. Pulsar asks for tokio `1.53.1`,
+    log `0.4.34` and anyhow `1.0.104`. Cargo unifies to one version that
+    satisfies both, so this is fine. Only a `-Z minimal-versions` build
+    would differ.
+
+### 7a. First real build: checklist
+
+Run this on a Linux x86_64 host with crates.io (or the internal mirror),
+clang, llvm-strip and the 1.98.1 toolchain. Record the outcome of each step
+in this file.
+
+1. `git submodule update --init --recursive` and check that
+   `git -C vendor/pulsar rev-parse HEAD` is
+   `4796504895ce42f95ffc1e414be19a5d7f40fc0a`. If it differs, re-read the
+   files in §2 and §3 before going on.
+2. `cargo metadata --format-version 1 >/dev/null`. This confirms the path
+   deps into the separate Pulsar workspace resolve: `workspace = true`
+   inheritance, `exclude = ["vendor"]`, and the feature names `core`,
+   `rules-engine`, `full`, `tls-openssl` and `sqlite3-vendored`.
+3. `cargo tree -p robodr-pulsard -d`. Confirm there is a single `tokio`,
+   `clap` and `pulsar-core` in the graph. Two copies of `pulsar-core`
+   would mean `Ros2Sensor` implements a different `PulsarModule` than the
+   one `add_module` wants.
+4. `cargo build -p robodr-sensor-ros2` first: the glue only, no eBPF.
+   Expected compiler-visible risk points:
+   - the `async fn` impls against the `impl Future + Send` trait
+     signatures;
+   - `tokio::select!` over three `Option` sources;
+   - `Value::try_from(finding.extra())`.
+5. `cargo clippy -p robodr-sensor-ros2 -p robodr-pulsard --all-targets -- -D warnings`.
+6. `cargo build -p robodr-pulsard` (default features: `pulsar/core` and
+   `pulsar/rules-engine`). This compiles the eBPF probes; it needs clang and
+   llvm-strip, and also needs `libsqlite3-dev`, or `--features
+   sqlite3-vendored`. Then build again with `--features pulsar-full` to
+   check the upstream module set.
+7. `./target/debug/robodr-pulsard --version` must print the RoboDR version
+   and `pulsar: 0.11.0-alpha.1 (commit 4796504...)`. A placeholder SHA
+   means vergen found no `.git` (item 5 above).
+8. TOML round trip of `extra`, before any robot work. In a scratch test
+   that depends on `pulsar-core`, run
+   `Value::try_from(ThreatExtra { .. })` and then format it with `Display`. Expect a
+   one-line table like `{ rule = "...", severity = "high", mode =
+   "enforce", observe_only = false, ... }`.
+9. Smoke test as root, with a test profile and `[module.robodr-sensor-ros2]
+   enabled = true`:
+   - `pulsar status` lists `robodr-sensor-ros2` as `Running`, with one
+     warning if the profile is unlocked;
+   - a pcap replay (`capture.pcap_replay`, `listen_spdp = false`) of the
+     rogue-`cmd_vel` fixture yields `threat-logger` lines from source
+     `robodr-sensor-ros2`;
+   - after the file ends, the module shows `Failed("no datagram source
+     left; ...")` (§2a);
+   - with no process-monitor running, a `Process not found in tracker` log
+     line is expected and the threat is still sent.
+10. Stop and restart: `pulsar stop robodr-sensor-ros2`, then
+    `pulsar start robodr-sensor-ros2` (the `pulsar` CLI subcommands, from
+    `src/pulsar.rs`). Check, for example with `ps -T`, that no `robodr-dgram-src`
+    thread is left from the first run, and that a single listener is running
+    (no duplicate threats).
+11. Only after the steps above, go on to the runtime items in point 6 of
+    the list above (multicast join on the real interface, coexistence with
+    each DDS vendor, tracker lookup) and point 8 (capture under load) on the
+    robot.
 
 ## 8. Build prerequisites
 
