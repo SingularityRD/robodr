@@ -108,12 +108,15 @@ fn mutated_valid_payloads_never_panic() {
         max_string_len: 16,
         max_sequence_len: 8,
         max_trajectory_points: 4,
+        // Fuzz the other D_CDR2 nesting mode too.
+        d_cdr2_nesting: robodr_cdr::DelimitedNesting::TopLevelOnly,
     };
     let loose = Limits {
         max_payload_len: usize::MAX,
         max_string_len: u32::MAX,
         max_sequence_len: u32::MAX,
         max_trajectory_points: u32::MAX,
+        d_cdr2_nesting: robodr_cdr::DelimitedNesting::AllStructs,
     };
     for round in 0..400 {
         for seed in seeds(&mut rng) {

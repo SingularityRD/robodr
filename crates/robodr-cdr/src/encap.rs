@@ -33,7 +33,20 @@ pub enum XcdrVersion {
     Xcdr2,
 }
 
-/// The known representation identifiers.
+/// The known representation identifiers (DDS-XTypes 1.3 §7.6.3.1.2,
+/// Table 60; the same values as Cyclone DDS `DDSI_RTPS_*` and Fast CDR).
+///
+/// | id | name | encoding |
+/// |---|---|---|
+/// | `0x0000` / `0x0001` | `CDR_BE` / `CDR_LE` | XCDR1 plain |
+/// | `0x0002` / `0x0003` | `PL_CDR_BE` / `PL_CDR_LE` | XCDR1 parameter list |
+/// | `0x0004` | `XML` | |
+/// | `0x0006` / `0x0007` | `CDR2_BE` / `CDR2_LE` | XCDR2 plain (final types) |
+/// | `0x0008` / `0x0009` | `D_CDR2_BE` / `D_CDR2_LE` | XCDR2 delimited (appendable types) |
+/// | `0x000a` / `0x000b` | `PL_CDR2_BE` / `PL_CDR2_LE` | XCDR2 parameter list (mutable types) |
+///
+/// Any other identifier (including `0x0005` and the `0x0010..` range,
+/// which no standard assigns) is [`DecodeError::UnknownRepresentation`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Representation {
     /// `0x0000` CDR_BE (XCDR1, final/appendable).
@@ -46,17 +59,17 @@ pub enum Representation {
     PlCdrLe,
     /// `0x0004` XML.
     Xml,
-    /// `0x0010` CDR2_BE (XCDR2 plain, final types).
+    /// `0x0006` CDR2_BE (XCDR2 plain, final types).
     Cdr2Be,
-    /// `0x0011` CDR2_LE.
+    /// `0x0007` CDR2_LE.
     Cdr2Le,
-    /// `0x0012` PL_CDR2_BE (XCDR2 parameter list, mutable types).
+    /// `0x000a` PL_CDR2_BE (XCDR2 parameter list, mutable types).
     PlCdr2Be,
-    /// `0x0013` PL_CDR2_LE.
+    /// `0x000b` PL_CDR2_LE.
     PlCdr2Le,
-    /// `0x0014` D_CDR2_BE (XCDR2 delimited, appendable types).
+    /// `0x0008` D_CDR2_BE (XCDR2 delimited, appendable types).
     DCdr2Be,
-    /// `0x0015` D_CDR2_LE.
+    /// `0x0009` D_CDR2_LE.
     DCdr2Le,
 }
 
@@ -69,12 +82,12 @@ impl Representation {
             0x0002 => Self::PlCdrBe,
             0x0003 => Self::PlCdrLe,
             0x0004 => Self::Xml,
-            0x0010 => Self::Cdr2Be,
-            0x0011 => Self::Cdr2Le,
-            0x0012 => Self::PlCdr2Be,
-            0x0013 => Self::PlCdr2Le,
-            0x0014 => Self::DCdr2Be,
-            0x0015 => Self::DCdr2Le,
+            0x0006 => Self::Cdr2Be,
+            0x0007 => Self::Cdr2Le,
+            0x000a => Self::PlCdr2Be,
+            0x000b => Self::PlCdr2Le,
+            0x0008 => Self::DCdr2Be,
+            0x0009 => Self::DCdr2Le,
             _ => return None,
         })
     }
@@ -87,12 +100,12 @@ impl Representation {
             Self::PlCdrBe => 0x0002,
             Self::PlCdrLe => 0x0003,
             Self::Xml => 0x0004,
-            Self::Cdr2Be => 0x0010,
-            Self::Cdr2Le => 0x0011,
-            Self::PlCdr2Be => 0x0012,
-            Self::PlCdr2Le => 0x0013,
-            Self::DCdr2Be => 0x0014,
-            Self::DCdr2Le => 0x0015,
+            Self::Cdr2Be => 0x0006,
+            Self::Cdr2Le => 0x0007,
+            Self::PlCdr2Be => 0x000a,
+            Self::PlCdr2Le => 0x000b,
+            Self::DCdr2Be => 0x0008,
+            Self::DCdr2Le => 0x0009,
         }
     }
 

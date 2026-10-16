@@ -23,24 +23,40 @@
 //!
 //! # Encodings
 //!
-//! * `CDR_BE` / `CDR_LE` (XCDR1): primitives align to `min(size, 8)`
-//!   relative to the first octet after the encapsulation header.
-//! * `CDR2_BE` / `CDR2_LE` (XCDR2 plain): primitives align to
+//! Identifiers follow DDS-XTypes 1.3 Table 60 (the values Cyclone DDS
+//! `DDSI_RTPS_*` and Fast CDR use): see [`Representation`]. Any other
+//! identifier is [`DecodeError::UnknownRepresentation`], which the pipeline
+//! reports as an undecodable sample.
+//!
+//! * `CDR_BE` / `CDR_LE` (`0x0000` / `0x0001`, XCDR1): primitives align to
+//!   `min(size, 8)` relative to the first octet after the encapsulation
+//!   header.
+//! * `CDR2_BE` / `CDR2_LE` (`0x0006` / `0x0007`, XCDR2 plain): primitives align to
 //!   `min(size, 4)` (so `double` is 4-aligned); a sequence whose element type
 //!   is not primitive (`string[]`, `JointTrajectoryPoint[]`) is preceded by a
 //!   DHEADER (`uint32` byte size of the sequence).
-//! * `D_CDR2_BE` / `D_CDR2_LE` (XCDR2 delimited): as plain XCDR2, and every
-//!   struct (top-level and nested) is preceded by a DHEADER, because ROS IDL
-//!   types have no extensibility annotation and are therefore `@appendable`.
-//!   Members past those this crate knows (a newer appendable version) are
-//!   skipped by the DHEADER.
+//! * `D_CDR2_BE` / `D_CDR2_LE` (`0x0008` / `0x0009`, XCDR2 delimited): as
+//!   plain XCDR2, and the top-level struct is preceded by a DHEADER. Whether
+//!   **nested** structs (`Vector3` inside `Twist`, `Header`, `Time`, ...)
+//!   carry one too depends on their extensibility, which the ROS IDL does not
+//!   annotate: by XTypes 1.3 an unannotated type is `@appendable`, so every
+//!   nested struct gets a DHEADER ([`DelimitedNesting::AllStructs`], the
+//!   default). An RMW / IDL generator that marks the nested types `@final`
+//!   would send DHEADERs on the top level only
+//!   ([`DelimitedNesting::TopLevelOnly`]). This cannot be settled offline;
+//!   choose with [`Limits::d_cdr2_nesting`] after checking a real capture. A
+//!   wrong choice makes samples fail to decode (reported as undecodable), it
+//!   never silently decodes wrong values for the common sizes, because the
+//!   DHEADER values are checked against the bytes. Members past those this
+//!   crate knows (a newer appendable version) are skipped by the DHEADER.
 //! * `PL_CDR*` (mutable) and XML are recognised and rejected as
 //!   [`DecodeError::UnsupportedRepresentation`]: ROS motion types are never
 //!   mutable, so such a payload on a motion topic is itself suspicious.
 //!
 //! Strings: `uint32` length including the NUL, the bytes, the NUL. A length
-//! of 0 is accepted as empty (some writers emit it); a non-empty string must
-//! end in NUL. Bytes are kept as sent ([`CdrStr`]); UTF-8 is not required.
+//! of 0 is malformed ([`DecodeError::StringLengthZero`]: the minimum, for
+//! `""`, is 1); the last byte must be NUL. Bytes are kept as sent
+//! ([`CdrStr`]); UTF-8 is not required.
 //!
 //! # Hostile input
 //!
@@ -55,7 +71,14 @@
 //! * NaN / ±inf are decoded faithfully and exposed; the consumer decides.
 //!   Aggregates ([`F64Seq::max_abs`], [`Vector3::norm`]) propagate them.
 //! * Trailing bytes after the message are allowed (XCDR padding, appended
-//!   members) and reported in [`Decoded::trailing_bytes`].
+//!   members) and reported in [`Decoded::trailing_bytes`]. More than
+//!   [`MAX_END_PADDING`] (3, the most XCDR end padding can be) is a
+//!   [`DecodeAnomaly::ExcessTrailingBytes`] ([`Decoded::anomalies`]): a
+//!   DDS reader ignores those bytes, but nothing standard puts them there.
+//! * A command whose speed cannot be bounded from the message (a
+//!   `JointTrajectory` with no velocities and no two timed points to derive
+//!   one from) is a [`DecodeAnomaly::UnverifiableCommand`], never a silent
+//!   `None`.
 //!
 //! # Not verified
 //!
@@ -64,8 +87,11 @@
 //! tests. They have **not** been checked against captures from Fast DDS or
 //! Cyclone DDS (none are available in this environment). In particular,
 //! whether an RMW sends `CDR2` or `D_CDR2` for ROS types, and whether it
-//! wraps nested structs in DHEADERs, must be confirmed on a real capture
-//! before relying on XCDR2. Default ROS 2 RMWs send XCDR1 (`CDR_LE`).
+//! wraps nested structs in DHEADERs ([`Limits::d_cdr2_nesting`]), must be
+//! confirmed on a real capture before relying on XCDR2. Default ROS 2 RMWs
+//! send XCDR1 (`CDR_LE`). The encapsulation identifiers are those of XTypes
+//! 1.3 Table 60 (the values Cyclone DDS and Fast CDR define); they were not
+//! checked against a live stack here.
 
 #![cfg_attr(
     not(test),
@@ -111,6 +137,21 @@ pub struct Limits {
     pub max_sequence_len: u32,
     /// Max `JointTrajectory::points` count.
     pub max_trajectory_points: u32,
+    /// Which structs carry a DHEADER under `D_CDR2_*` (see the crate docs).
+    /// Not a cap, but kept here so that it travels with every decode call.
+    pub d_cdr2_nesting: DelimitedNesting,
+}
+
+/// Which structs carry an XCDR2 DHEADER in a `D_CDR2_*` payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum DelimitedNesting {
+    /// The top-level struct and every nested struct (XTypes 1.3: types
+    /// without an extensibility annotation, as ROS IDL types are, are
+    /// `@appendable`). The default.
+    #[default]
+    AllStructs,
+    /// Only the top-level struct; nested structs are treated as `@final`.
+    TopLevelOnly,
 }
 
 impl Default for Limits {
@@ -122,6 +163,7 @@ impl Default for Limits {
             max_string_len: 256,
             max_sequence_len: 1024,
             max_trajectory_points: 1024,
+            d_cdr2_nesting: DelimitedNesting::AllStructs,
         }
     }
 }
@@ -213,6 +255,20 @@ pub enum MotionMessage<'a> {
 }
 
 impl MotionMessage<'_> {
+    /// Why this command's speed cannot be bounded, if so: a non-empty
+    /// `JointTrajectory` with no velocities and no pair of points to derive
+    /// a speed from (see [`JointTrajectory::max_joint_speed`]). `None` for
+    /// feedback types and for every command whose speed is known.
+    pub fn unverifiable_reason(&self) -> Option<&'static str> {
+        match self {
+            MotionMessage::JointTrajectory(j) if j.max_joint_speed().is_none() => Some(
+                "JointTrajectory has no velocities and fewer than two points with positions \
+                 (the start position is not in the message)",
+            ),
+            _ => None,
+        }
+    }
+
     pub fn kind(&self) -> MessageKind {
         match self {
             MotionMessage::Twist(_) => MessageKind::Twist,
@@ -233,9 +289,58 @@ pub struct Decoded<'a> {
     /// Body bytes consumed by the message.
     pub consumed: usize,
     /// Body bytes left after the message. XCDR end padding (see
-    /// [`Encapsulation::padding`]) shows up here; more than a few bytes is
-    /// unusual and may be worth reporting, but is not an error.
+    /// [`Encapsulation::padding`]) shows up here; more than
+    /// [`MAX_END_PADDING`] is a [`DecodeAnomaly::ExcessTrailingBytes`].
     pub trailing_bytes: usize,
+}
+
+/// The most end padding XCDR can add (to round the payload up to a multiple
+/// of 4; XTypes 1.3 announces it in the options' two low bits).
+pub const MAX_END_PADDING: usize = 3;
+
+/// Something odd about a payload that decoded fine. Consumers report these
+/// (the ROS 2 pipeline raises `robot.motion.decode_anomaly` /
+/// `robot.motion.unverifiable_command`); they never block decoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DecodeAnomaly {
+    /// More bytes after the message than XCDR end padding can explain.
+    /// A DDS reader ignores them; they may hide data (a covert channel, or
+    /// members of a different type version than the one announced).
+    ExcessTrailingBytes { trailing: usize, allowed: usize },
+    /// A command whose speed cannot be bounded from the message, so no
+    /// envelope can check it (see [`MotionMessage::unverifiable_reason`]).
+    UnverifiableCommand { reason: &'static str },
+}
+
+impl std::fmt::Display for DecodeAnomaly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecodeAnomaly::ExcessTrailingBytes { trailing, allowed } => write!(
+                f,
+                "{trailing} bytes after the message (XCDR end padding is at most {allowed})"
+            ),
+            DecodeAnomaly::UnverifiableCommand { reason } => {
+                write!(f, "command speed cannot be verified: {reason}")
+            }
+        }
+    }
+}
+
+impl Decoded<'_> {
+    /// The anomalies of this decode (empty for a well-formed sample).
+    pub fn anomalies(&self) -> Vec<DecodeAnomaly> {
+        let mut v = Vec::new();
+        if self.trailing_bytes > MAX_END_PADDING {
+            v.push(DecodeAnomaly::ExcessTrailingBytes {
+                trailing: self.trailing_bytes,
+                allowed: MAX_END_PADDING,
+            });
+        }
+        if let Some(reason) = self.message.unverifiable_reason() {
+            v.push(DecodeAnomaly::UnverifiableCommand { reason });
+        }
+        v
+    }
 }
 
 /// Decodes one serialized payload (encapsulation header included) as `kind`.
