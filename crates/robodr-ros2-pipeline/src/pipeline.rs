@@ -1153,8 +1153,11 @@ impl Pipeline {
         for spdp in &report.participants {
             let p = spdp.guid_prefix;
             let g = hex12(&p);
-            if self.static_participants.contains(&g)
-                || spdp.source != p
+            // A statically profiled prefix (the learned run's own process)
+            // resolves too, so it holds its identity for `identity:<name>`
+            // rights; it stays profiled whatever the resolver says.
+            let is_static = self.static_participants.contains(&g);
+            if spdp.source != p
                 || !spdp.alternate_guid_prefixes.is_empty()
                 || (ip.is_loopback() && ingress == Ingress::External)
                 || self.binding.is_contested(&p)
@@ -1168,6 +1171,7 @@ impl Pipeline {
                     self.profile.participants.insert(g);
                     self.binding.set_profiled(p, true);
                 }
+                Resolution::PoolFull { .. } if is_static => {}
                 Resolution::PoolFull {
                     identity,
                     max,
