@@ -20,6 +20,12 @@
 //!   IPv4 fragments with a bad header checksum *before* reassembly (the
 //!   kernel never queues those) and verifies the UDP checksum of the
 //!   reassembled datagram (as the receiving socket layer does).
+//! - **Ingress.** [`Reassembler::push_with_ingress`] also tracks the
+//!   interface every *queued* fragment arrived on and reports the merge
+//!   ([`IngressInfo::merge_fragment`]): if any fragment of a datagram came in
+//!   on a non-loopback interface, so did the datagram. Ignored duplicates do
+//!   not contribute (their bytes are not used either). A restart
+//!   (`max_dist`) forgets the dropped fragments' ingress with their bytes.
 //! - **Partial overlaps kill the datagram** (`IPFRAG_OVERLAP`, RFC 5722 for
 //!   IPv6, "ipfrag: drop overlapping fragments" for IPv4), counted in
 //!   [`ReassemblyStats::dropped_overlap`]. As in Linux there is **no
@@ -125,6 +131,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use crate::decode::IpFragment;
+use crate::ingress::IngressInfo;
 
 /// Largest reassembled payload (IPv4 total length / IPv6 payload length max).
 pub const MAX_DATAGRAM: usize = 65_535;
@@ -281,6 +288,8 @@ struct Entry {
     /// Reassembler fragment clock when this datagram last received new
     /// bytes (or was created): its key in [`Family::lru`].
     progress: u64,
+    /// Merged ingress of the queued fragments (`None` before the first).
+    ingress: Option<IngressInfo>,
 }
 
 /// One destination's bucket.
@@ -523,6 +532,7 @@ impl Reassembler {
                 protocol: None,
                 rid: 0,
                 progress: self.clock,
+                ingress: None,
             },
         );
         let f = &mut self.families[family(&key.dst)];
@@ -549,6 +559,7 @@ impl Reassembler {
             e.last_in = false;
             e.meat = 0;
             e.protocol = None;
+            e.ingress = None;
             e.generation = generation;
         }
         self.track(*key, generation);
@@ -557,6 +568,19 @@ impl Reassembler {
     /// Add one fragment. Returns the reassembled payload when this fragment
     /// completes its datagram.
     pub fn push(&mut self, ts: Duration, frag: &IpFragment<'_>) -> Option<Reassembled> {
+        self.push_with_ingress(ts, frag, &IngressInfo::default())
+            .map(|(r, _)| r)
+    }
+
+    /// [`push`](Self::push) for a fragment that arrived on `ingress`; a
+    /// completed datagram comes with the merged ingress of its fragments
+    /// (see the module docs).
+    pub fn push_with_ingress(
+        &mut self,
+        ts: Duration,
+        frag: &IpFragment<'_>,
+        ingress: &IngressInfo,
+    ) -> Option<(Reassembled, IngressInfo)> {
         self.stats.fragments += 1;
         self.clock += 1;
         self.now = self.now.max(ts);
@@ -566,12 +590,15 @@ impl Reassembler {
         if !v4 && frag.offset == 0 && !frag.more {
             // RFC 6946 atomic fragment: processed in isolation.
             self.stats.completed += 1;
-            return Some(Reassembled {
-                src: frag.src,
-                dst: frag.dst,
-                protocol: frag.protocol,
-                payload: frag.data.to_vec(),
-            });
+            return Some((
+                Reassembled {
+                    src: frag.src,
+                    dst: frag.dst,
+                    protocol: frag.protocol,
+                    payload: frag.data.to_vec(),
+                },
+                ingress.clone(),
+            ));
         }
         let key = Key {
             src: frag.src,
@@ -660,19 +687,23 @@ impl Reassembler {
             e.first_in = true;
             e.protocol = Some(frag.protocol);
         }
+        match &mut e.ingress {
+            Some(m) => m.merge_fragment(ingress),
+            None => e.ingress = Some(ingress.clone()),
+        }
         e.meat += data.len();
         self.recharge(&key, data.len() + FRAGMENT_OVERHEAD, 0);
         self.touch(&key);
         self.finish_if_complete(&key, v4)
     }
 
-    fn kill_invalid(&mut self, key: &Key) -> Option<Reassembled> {
+    fn kill_invalid<T>(&mut self, key: &Key) -> Option<T> {
         self.remove(key);
         self.stats.dropped_invalid += 1;
         None
     }
 
-    fn finish_if_complete(&mut self, key: &Key, v4: bool) -> Option<Reassembled> {
+    fn finish_if_complete(&mut self, key: &Key, v4: bool) -> Option<(Reassembled, IngressInfo)> {
         let e = self.entries.get(key)?;
         if !(e.first_in && e.last_in && e.meat == e.len) {
             return None;
@@ -688,12 +719,15 @@ impl Reassembler {
             payload.extend_from_slice(&r.bytes);
         }
         self.stats.completed += 1;
-        Some(Reassembled {
-            src: key.src,
-            dst: key.dst,
-            protocol: e.protocol.unwrap_or(key.protocol),
-            payload,
-        })
+        Some((
+            Reassembled {
+                src: key.src,
+                dst: key.dst,
+                protocol: e.protocol.unwrap_or(key.protocol),
+                payload,
+            },
+            e.ingress.unwrap_or_default(),
+        ))
     }
 
     /// `inet_frag_queue_insert`.

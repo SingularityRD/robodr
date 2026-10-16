@@ -10,8 +10,8 @@
 //!
 //! # Read-only guarantee
 //! The only libc symbols declared are `socket`, `bind`, `setsockopt`,
-//! `getsockopt`, `recvfrom` and `if_nametoindex`; the descriptor is closed by
-//! [`OwnedFd`]. There is no `send`, `sendto`, `write` or `PACKET_TX_RING` in
+//! `getsockopt`, `recvfrom`, `if_nametoindex` and `if_indextoname`; the
+//! descriptor is closed by [`OwnedFd`]. There is no `send`, `sendto`, `write` or `PACKET_TX_RING` in
 //! this crate, so it cannot inject. The socket does not enable promiscuous
 //! mode, so it sees what this host sends and receives (plus broadcast and
 //! subscribed multicast) — exactly the robot's own DDS traffic. Watching a
@@ -33,6 +33,16 @@
 //! - Bound to all interfaces, a packet crossing a bridge/veth pair (e.g.
 //!   containers) can appear once per interface. Discovery events are
 //!   idempotent for graph building, so this only inflates counters.
+//! - Per-packet ingress ([`Packet::ingress`]): every frame carries the
+//!   `sockaddr_ll` the kernel filled in on `recvfrom` — `sll_ifindex`,
+//!   `sll_pkttype`, and `sll_hatype`, from which the loopback flag is taken
+//!   (`ARPHRD_LOOPBACK`). This holds for a socket bound to all interfaces
+//!   too, so the consumer can tell a loopback source address on `lo` from a
+//!   forged one on `eth0` without splitting the capture. The interface name
+//!   is resolved with `if_indextoname` once per ifindex and cached (at most
+//!   [`crate::ingress::MAX_CACHED_INTERFACES`] entries, cleared when full);
+//!   a later rename is not noticed, and the loopback flag never depends on
+//!   the name. See [`crate::ingress`].
 //! - Timestamps are user-space receive time (`SystemTime::now()`), not kernel
 //!   timestamps.
 //! - If the kernel filter cannot be attached, the source still works and
@@ -43,13 +53,14 @@
 //!   blinding the sensor shows up there).
 //!
 //! # Unsafe surface
-//! Confined to this module: six FFI calls and one `OwnedFd::from_raw_fd`, each
+//! Confined to this module: seven FFI calls and one `OwnedFd::from_raw_fd`, each
 //! with a `SAFETY` comment. All structs passed to the kernel are `#[repr(C)]`
 //! with compile-time size checks. Supported architectures are those where
 //! `SO_RCVTIMEO`/`SO_RCVBUF` have the generic Linux values (x86, x86_64, arm,
 //! aarch64, riscv64).
 
-use std::ffi::CString;
+use std::collections::HashMap;
+use std::ffi::{CStr, CString};
 use std::io;
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -58,6 +69,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::bpf::{BpfProgram, SockFilter};
 use crate::decode::LinkType;
+use crate::ingress::{PacketIngress, PacketType, ARPHRD_LOOPBACK, MAX_CACHED_INTERFACES};
 use crate::source::{CaptureError, Packet, PacketSource};
 
 mod sys {
@@ -90,6 +102,7 @@ mod sys {
             addrlen: *mut u32,
         ) -> isize;
         pub fn if_nametoindex(name: *const c_char) -> c_uint;
+        pub fn if_indextoname(index: c_uint, name: *mut c_char) -> *mut c_char;
     }
 }
 
@@ -107,7 +120,8 @@ const SOL_PACKET: c_int = 263;
 const PACKET_STATISTICS: c_int = 6;
 const MSG_TRUNC: c_int = 0x20;
 const PACKET_OUTGOING: u8 = 4;
-const ARPHRD_LOOPBACK: u16 = 772;
+/// `IF_NAMESIZE` (including the terminating NUL).
+const IF_NAMESIZE: usize = 16;
 
 /// Receive buffer: larger than any IP packet (64 KiB) incl. loopback GSO.
 const RECV_BUF: usize = 1 << 18;
@@ -194,6 +208,27 @@ pub fn interface_index(name: &str) -> Result<u32, CaptureError> {
     Ok(idx)
 }
 
+/// Resolve an interface index to its name (`None` if there is no such
+/// interface, e.g. it was removed).
+pub fn interface_name(index: u32) -> Option<String> {
+    if index == 0 {
+        return None;
+    }
+    let mut buf = [0 as c_char; IF_NAMESIZE];
+    // SAFETY: `buf` is IF_NAMESIZE bytes, the size if_indextoname requires;
+    // it writes a NUL-terminated name of at most IF_NAMESIZE bytes (or
+    // nothing and returns NULL).
+    let p = unsafe { sys::if_indextoname(index, buf.as_mut_ptr()) };
+    if p.is_null() {
+        return None;
+    }
+    // Bounded by the buffer even if the C library misbehaved.
+    let bytes: Vec<u8> = buf.iter().map(|&c| c as u8).collect();
+    CStr::from_bytes_until_nul(&bytes)
+        .ok()
+        .map(|c| c.to_string_lossy().into_owned())
+}
+
 /// Configuration for [`AfPacketSource::open`].
 #[derive(Clone, Debug)]
 pub struct AfPacketConfig {
@@ -243,6 +278,8 @@ pub struct AfPacketSource {
     filter_attached: bool,
     filter_error: Option<String>,
     stats: AfPacketStats,
+    /// ifindex -> name (`None` = lookup failed), bounded.
+    names: HashMap<i32, Option<String>>,
 }
 
 impl AfPacketSource {
@@ -327,6 +364,7 @@ impl AfPacketSource {
             filter_attached,
             filter_error,
             stats: AfPacketStats::default(),
+            names: HashMap::new(),
         })
     }
 
@@ -366,7 +404,7 @@ impl AfPacketSource {
 
 impl PacketSource for AfPacketSource {
     fn next_packet(&mut self) -> Result<Option<Packet<'_>>, CaptureError> {
-        let len = loop {
+        let (len, addr) = loop {
             let mut addr = SockaddrLl::default();
             let mut alen = size_of::<SockaddrLl>() as u32;
             // SAFETY: `buf` is valid writable memory of `buf.len()` bytes;
@@ -408,7 +446,7 @@ impl PacketSource for AfPacketSource {
                 self.stats.skipped_interface += 1;
                 continue;
             }
-            break n as usize;
+            break (n as usize, addr);
         };
         if len > self.buf.len() {
             self.stats.truncated += 1;
@@ -417,11 +455,27 @@ impl PacketSource for AfPacketSource {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO);
+        let ifindex = u32::try_from(addr.ifindex).ok().filter(|&i| i != 0);
+        if let Some(i) = ifindex {
+            if !self.names.contains_key(&addr.ifindex) {
+                if self.names.len() >= MAX_CACHED_INTERFACES {
+                    self.names.clear();
+                }
+                self.names.insert(addr.ifindex, interface_name(i));
+            }
+        }
+        let name = self.names.get(&addr.ifindex).and_then(|n| n.as_deref());
         Ok(Some(Packet {
             ts,
             linktype: LinkType::RAW,
             data: &self.buf[..len.min(self.buf.len())],
             orig_len: u32::try_from(len).unwrap_or(u32::MAX),
+            ingress: PacketIngress {
+                ifindex,
+                name,
+                loopback: Some(addr.hatype == ARPHRD_LOOPBACK),
+                pkttype: Some(PacketType::from_linux(u16::from(addr.pkttype))),
+            },
         }))
     }
 }
@@ -472,5 +526,13 @@ mod tests {
             Err(CaptureError::Unsupported(_))
         ));
         assert!(interface_index("lo").is_ok());
+    }
+
+    #[test]
+    fn index_to_name_roundtrip() {
+        let lo = interface_index("lo").unwrap();
+        assert_eq!(interface_name(lo).as_deref(), Some("lo"));
+        assert_eq!(interface_name(0), None);
+        assert_eq!(interface_name(u32::MAX), None);
     }
 }

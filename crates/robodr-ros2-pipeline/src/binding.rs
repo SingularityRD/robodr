@@ -75,16 +75,27 @@
 //!   topic. (Linux also drops such IPv4 packets as martians unless
 //!   `route_localnet` is set; IPv6 `::1` handling was not verified, which is
 //!   why the sensor does not rely on the kernel.)
-//! - When the source cannot tell the interface ([`Ingress::Unknown`]: a
-//!   capture bound to several interfaces of both kinds, a pcap replay, the
-//!   SPDP socket) a loopback source is treated as same-host traffic by
-//!   default — an attacker who forges `127.0.0.1` from the wire reaches the
-//!   sensor but (IPv4) not the robot's DDS stack, so the miss is of an
-//!   attack that cannot land. `strict_loopback_ingress = true` judges such
-//!   datagrams against the binding instead (then same-host SEDP over `lo`
-//!   is a mismatch again: only use it with ingress-aware sources).
-//!   [`crate::config::CaptureSettings::open`] splits a mixed interface list
-//!   into a loopback and a non-loopback capture so ingress is known.
+//! - Passive capture reports the ingress **per packet**
+//!   ([`crate::source::ingress_of_packet`]): live `AF_PACKET` from the
+//!   kernel's `sockaddr_ll` (hardware type `ARPHRD_LOOPBACK` or not, also
+//!   when bound to every interface), pcapng from each packet's Interface
+//!   Description Block (`if_name`), and Linux cooked captures
+//!   (`tcpdump -i any`, SLL/SLL2) from the frame header. Those datagrams
+//!   are `Loopback` or `External`, never `Unknown`, so the forged case above
+//!   is caught without `strict_loopback_ingress`.
+//! - When the source cannot tell the interface ([`Ingress::Unknown`]: the
+//!   SPDP socket, a classic pcap of Ethernet/raw-IP frames whose interface
+//!   was not named, a pcapng interface without `if_name`) a loopback source
+//!   is treated as same-host traffic by default — an attacker who forges
+//!   `127.0.0.1` from the wire reaches the sensor but (IPv4) not the robot's
+//!   DDS stack, so the miss is of an attack that cannot land.
+//!   `strict_loopback_ingress = true` judges such datagrams against the
+//!   binding instead (then same-host SEDP over `lo` received on the SPDP
+//!   socket is a mismatch again: only use it when every source is
+//!   ingress-aware). Interface names in capture *files* are the capturing
+//!   host's and the loopback flag derived from them is a heuristic
+//!   (`robodr_capture::ingress::loopback_by_name`); live capture and cooked
+//!   headers do not depend on names.
 //!
 //! # Bootstrapping decision (SEDP before SPDP)
 //!
@@ -256,7 +267,8 @@ impl Default for BindingOptions {
 /// docs, "Same-host traffic over loopback").
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum Ingress {
-    /// Not known (multi-interface capture, file replay, SPDP socket).
+    /// Not known (SPDP socket, capture files that do not record the
+    /// interface; see the module docs).
     #[default]
     Unknown,
     /// A loopback interface (`lo`): only this host can send there.

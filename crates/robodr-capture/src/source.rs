@@ -5,6 +5,7 @@ use std::io;
 use std::time::Duration;
 
 use crate::decode::LinkType;
+use crate::ingress::{IngressInfo, PacketIngress};
 
 /// One captured frame, borrowed from the source's internal buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,6 +18,9 @@ pub struct Packet<'a> {
     pub data: &'a [u8],
     /// Length of the frame on the wire.
     pub orig_len: u32,
+    /// What the source knows about the interface the frame was captured on
+    /// (see [`crate::ingress`]). All `None` when it knows nothing.
+    pub ingress: PacketIngress<'a>,
 }
 
 impl Packet<'_> {
@@ -108,12 +112,24 @@ impl<S: PacketSource + ?Sized> PacketSource for Box<S> {
 /// frames obtained elsewhere.
 #[derive(Clone, Debug, Default)]
 pub struct VecSource {
-    frames: std::collections::VecDeque<(Duration, LinkType, Vec<u8>)>,
-    current: Option<(Duration, LinkType, Vec<u8>)>,
+    frames: std::collections::VecDeque<(Duration, LinkType, Vec<u8>, IngressInfo)>,
+    current: Option<(Duration, LinkType, Vec<u8>, IngressInfo)>,
 }
 
 impl VecSource {
+    /// Frames without ingress information.
     pub fn new(frames: impl IntoIterator<Item = (Duration, LinkType, Vec<u8>)>) -> Self {
+        Self::with_ingress(
+            frames
+                .into_iter()
+                .map(|(ts, lt, d)| (ts, lt, d, IngressInfo::default())),
+        )
+    }
+
+    /// Frames each tagged with the interface it was captured on.
+    pub fn with_ingress(
+        frames: impl IntoIterator<Item = (Duration, LinkType, Vec<u8>, IngressInfo)>,
+    ) -> Self {
         Self {
             frames: frames.into_iter().collect(),
             current: None,
@@ -124,11 +140,12 @@ impl VecSource {
 impl PacketSource for VecSource {
     fn next_packet(&mut self) -> Result<Option<Packet<'_>>, CaptureError> {
         self.current = self.frames.pop_front();
-        Ok(self.current.as_ref().map(|(ts, lt, data)| Packet {
+        Ok(self.current.as_ref().map(|(ts, lt, data, ing)| Packet {
             ts: *ts,
             linktype: *lt,
             data,
             orig_len: u32::try_from(data.len()).unwrap_or(u32::MAX),
+            ingress: ing.as_packet_ingress(),
         }))
     }
 }

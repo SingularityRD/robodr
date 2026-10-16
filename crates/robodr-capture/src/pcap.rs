@@ -16,6 +16,14 @@
 //!   must be multiples of 4, at least 12, at most [`MAX_BLOCK_LEN`], and the
 //!   trailing copy of the length must match.
 //!
+//! Interface ingress ([`crate::ingress`]): each packet reports the name of
+//! its pcapng interface (`if_name`, cut to
+//! [`crate::ingress::MAX_INTERFACE_NAME`] bytes) with a loopback flag
+//! derived from that name, and the direction from the EPB's `epb_flags`
+//! option when present. Classic pcap records no interface; name it with
+//! [`PcapReader::with_interface`] / [`CaptureFile::with_default_interface`]
+//! or the ingress stays unknown.
+//!
 //! A file that ends in the middle of a header or record yields
 //! [`CaptureError::Truncated`] (everything before it has been delivered).
 //! [`CaptureFile`] sniffs the magic and picks the right reader.
@@ -26,6 +34,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::decode::LinkType;
+use crate::ingress::{bounded_name, loopback_by_name, IngressInfo, PacketType};
 use crate::source::{CaptureError, Packet, PacketSource};
 
 /// Largest classic pcap record we accept (256 KiB, matching libpcap's
@@ -113,6 +122,17 @@ pub struct PcapReader<R> {
     snaplen: u32,
     linktype: LinkType,
     buf: Vec<u8>,
+    /// Classic pcap records carry no interface: whatever the caller says.
+    interface: IngressInfo,
+}
+
+/// Ingress of a capture interface known only by name (capture files).
+fn named_interface(name: &str) -> IngressInfo {
+    IngressInfo {
+        name: Some(bounded_name(name.as_bytes())),
+        loopback: loopback_by_name(name),
+        ..Default::default()
+    }
 }
 
 impl<R: Read> PcapReader<R> {
@@ -148,7 +168,27 @@ impl<R: Read> PcapReader<R> {
             snaplen,
             linktype,
             buf: Vec::new(),
+            interface: IngressInfo::default(),
         })
+    }
+
+    /// Name the (single) interface this classic pcap was captured on, e.g.
+    /// `"lo"` or `"eth0"`; the loopback flag is derived from the name with
+    /// [`loopback_by_name`]. The format does not record it, so without this
+    /// every packet's ingress is unknown (except Linux cooked frames, whose
+    /// header carries it).
+    #[must_use]
+    pub fn with_interface(mut self, name: &str) -> Self {
+        self.interface = named_interface(name);
+        self
+    }
+
+    /// Set the interface ingress explicitly (e.g. a loopback flag known from
+    /// commissioning).
+    #[must_use]
+    pub fn with_ingress(mut self, ingress: IngressInfo) -> Self {
+        self.interface = ingress;
+        self
     }
 
     pub fn linktype(&self) -> LinkType {
@@ -194,6 +234,7 @@ impl<R: Read> PacketSource for PcapReader<R> {
             linktype: self.linktype,
             data: &self.buf,
             orig_len: orig,
+            ingress: self.interface.as_packet_ingress(),
         }))
     }
 }
@@ -247,13 +288,15 @@ impl<W: Write> PcapWriter<W> {
 
 // ---------------------------------------------------------------- pcapng
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Interface {
     linktype: LinkType,
     snaplen: u32,
     /// `if_tsresol` byte: MSB clear -> 10^-n, set -> 2^-n.
     tsresol: u8,
     tsoffset: i64,
+    /// From `if_name` (or the reader's fallback name).
+    ingress: IngressInfo,
 }
 
 /// Streaming reader for pcapng files.
@@ -265,6 +308,8 @@ pub struct PcapNgReader<R> {
     block: Vec<u8>,
     /// SHB magic already consumed by [`CaptureFile`] sniffing.
     pending_shb: bool,
+    /// Ingress for interfaces without an `if_name` option.
+    fallback: IngressInfo,
 }
 
 impl<R: Read> PcapNgReader<R> {
@@ -285,12 +330,28 @@ impl<R: Read> PcapNgReader<R> {
             interfaces: Vec::new(),
             block: Vec::new(),
             pending_shb: true,
+            fallback: IngressInfo::default(),
         }
+    }
+
+    /// Name for interfaces whose Interface Description Block has no
+    /// `if_name` option (the loopback flag is derived from it with
+    /// [`loopback_by_name`]). Applies to interfaces declared after the call.
+    #[must_use]
+    pub fn with_default_interface(mut self, name: &str) -> Self {
+        self.fallback = named_interface(name);
+        self
     }
 
     /// Link types of the interfaces declared so far in the current section.
     pub fn interfaces(&self) -> impl Iterator<Item = LinkType> + '_ {
         self.interfaces.iter().map(|i| i.linktype)
+    }
+
+    /// Ingress (name, loopback flag) of the interfaces declared so far in
+    /// the current section, by interface id.
+    pub fn interface_ingress(&self) -> impl Iterator<Item = &IngressInfo> + '_ {
+        self.interfaces.iter().map(|i| &i.ingress)
     }
 
     /// Read the next block into `self.block` (whole block, header to trailer).
@@ -362,6 +423,7 @@ impl<R: Read> PcapNgReader<R> {
             snaplen: e.u32(body, 4),
             tsresol: 6,
             tsoffset: 0,
+            ingress: self.fallback.clone(),
         };
         let mut opts = &body[8..];
         while opts.len() >= 4 {
@@ -376,6 +438,11 @@ impl<R: Read> PcapNgReader<R> {
             }
             let val = &opts[4..4 + olen];
             match code {
+                2 if olen >= 1 => {
+                    // if_name (UTF-8, not necessarily NUL-terminated).
+                    let name = bounded_name(val);
+                    iface.ingress = named_interface(&name);
+                }
                 9 if olen >= 1 => iface.tsresol = val[0],
                 14 if olen >= 8 => iface.tsoffset = e.u64(val, 0) as i64,
                 _ => {}
@@ -389,10 +456,9 @@ impl<R: Read> PcapNgReader<R> {
         Ok(())
     }
 
-    fn iface(&self, id: usize) -> Result<Interface, CaptureError> {
+    fn iface(&self, id: usize) -> Result<&Interface, CaptureError> {
         self.interfaces
             .get(id)
-            .copied()
             .ok_or_else(|| CaptureError::Format(format!("packet for undeclared interface {id}")))
     }
 }
@@ -422,6 +488,27 @@ fn pcapng_ts(units: u64, tsresol: u8, tsoffset: i64) -> Result<Duration, Capture
     Ok(Duration::new(secs, sub))
 }
 
+/// pcapng `epb_flags` from an Enhanced Packet Block's options (`opts` =
+/// the bytes after the padded packet data). Malformed options end the scan.
+fn epb_flags(e: Endian, mut opts: &[u8]) -> Option<u32> {
+    while opts.len() >= 4 {
+        let code = e.u16(opts, 0);
+        let olen = usize::from(e.u16(opts, 2));
+        if code == 0 {
+            return None; // opt_endofopt
+        }
+        let padded = (olen + 3) & !3;
+        if 4 + padded > opts.len() {
+            return None;
+        }
+        if code == 2 && olen == 4 {
+            return Some(e.u32(opts, 4));
+        }
+        opts = &opts[4 + padded..];
+    }
+    None
+}
+
 impl<R: Read> PacketSource for PcapNgReader<R> {
     fn next_packet(&mut self) -> Result<Option<Packet<'_>>, CaptureError> {
         loop {
@@ -431,8 +518,8 @@ impl<R: Read> PacketSource for PcapNgReader<R> {
             let e = self.endian;
             let blen = self.block.len();
             let body_end = blen - 4;
-            // (iface, ts, data range, orig_len)
-            let (iface, ts, start, caplen, orig) = match btype {
+            // (iface id, ts, data range, orig_len, pkttype)
+            let (id, ts, start, caplen, orig, pkttype) = match btype {
                 PCAPNG_SHB => {
                     self.parse_shb()?;
                     continue;
@@ -459,7 +546,15 @@ impl<R: Read> PacketSource for PcapNgReader<R> {
                         return Err(CaptureError::Format("captured length exceeds block".into()));
                     }
                     let ts = pcapng_ts(units, iface.tsresol, iface.tsoffset)?;
-                    (iface, ts, 28, caplen, orig)
+                    let pkttype = if btype == PCAPNG_EPB {
+                        let opts_at = (28 + caplen + 3) & !3;
+                        b.get(opts_at..body_end)
+                            .and_then(|o| epb_flags(e, o))
+                            .and_then(PacketType::from_epb_flags)
+                    } else {
+                        None
+                    };
+                    (id, ts, 28, caplen, orig, pkttype)
                 }
                 PCAPNG_SPB => {
                     if body_end < 12 {
@@ -471,15 +566,19 @@ impl<R: Read> PacketSource for PcapNgReader<R> {
                     if iface.snaplen != 0 {
                         caplen = caplen.min(iface.snaplen as usize);
                     }
-                    (iface, Duration::ZERO, 12, caplen, orig)
+                    (0, Duration::ZERO, 12, caplen, orig, None)
                 }
                 _ => continue, // unknown / unneeded block: skip
             };
+            let iface = self.iface(id)?;
+            let mut ingress = iface.ingress.as_packet_ingress();
+            ingress.pkttype = pkttype;
             return Ok(Some(Packet {
                 ts,
                 linktype: iface.linktype,
                 data: &self.block[start..start + caplen],
                 orig_len: orig,
+                ingress,
             }));
         }
     }
@@ -502,6 +601,26 @@ impl<R: Read> CaptureFile<R> {
             Ok(Self::PcapNg(PcapNgReader::after_magic(r)))
         } else {
             PcapReader::after_magic(magic, r).map(Self::Pcap)
+        }
+    }
+}
+
+impl<R> CaptureFile<R> {
+    /// Name the capture interface where the file does not: the single
+    /// interface of a classic pcap, or pcapng interfaces without `if_name`
+    /// (see [`PcapReader::with_interface`] /
+    /// [`PcapNgReader::with_default_interface`]).
+    #[must_use]
+    pub fn with_default_interface(self, name: &str) -> Self {
+        match self {
+            Self::Pcap(mut p) => {
+                p.interface = named_interface(name);
+                Self::Pcap(p)
+            }
+            Self::PcapNg(mut p) => {
+                p.fallback = named_interface(name);
+                Self::PcapNg(p)
+            }
         }
     }
 }
@@ -602,6 +721,41 @@ pub(crate) mod tests {
             }
             body.extend_from_slice(&[0, 0, 0, 0]); // opt_endofopt
             self.block(PCAPNG_IDB, &body);
+        }
+        /// IDB with an `if_name` option.
+        pub fn idb_named(&mut self, linktype: u16, name: &[u8]) {
+            let mut body = self.u16(linktype).to_vec();
+            body.extend_from_slice(&[0, 0]);
+            body.extend_from_slice(&self.u32(0));
+            body.extend_from_slice(&self.u16(2));
+            body.extend_from_slice(&self.u16(name.len() as u16));
+            body.extend_from_slice(name);
+            while !body.len().is_multiple_of(4) {
+                body.push(0);
+            }
+            body.extend_from_slice(&[0, 0, 0, 0]);
+            self.block(PCAPNG_IDB, &body);
+        }
+        /// EPB with raw option bytes after the (padded) packet data.
+        pub fn epb_opts(&mut self, iface: u32, data: &[u8], opts: &[u8]) {
+            let mut body = self.u32(iface).to_vec();
+            body.extend_from_slice(&[0; 8]);
+            body.extend_from_slice(&self.u32(data.len() as u32));
+            body.extend_from_slice(&self.u32(data.len() as u32));
+            body.extend_from_slice(data);
+            while !body.len().is_multiple_of(4) {
+                body.push(0);
+            }
+            body.extend_from_slice(opts);
+            self.block(PCAPNG_EPB, &body);
+        }
+        /// EPB with an `epb_flags` option.
+        pub fn epb_flags(&mut self, iface: u32, data: &[u8], flags: u32) {
+            let mut o = self.u16(2).to_vec();
+            o.extend_from_slice(&self.u16(4));
+            o.extend_from_slice(&self.u32(flags));
+            o.extend_from_slice(&[0; 4]);
+            self.epb_opts(iface, data, &o);
         }
         pub fn epb(&mut self, iface: u32, ts_units: u64, data: &[u8], orig: u32) {
             let mut body = self.u32(iface).to_vec();
@@ -937,6 +1091,128 @@ pub(crate) mod tests {
         assert!(pcapng_ts(1, 39, 0).is_err());
         assert!(pcapng_ts(u64::MAX, 0x80 | 127, 0).is_ok());
         assert!(pcapng_ts(u64::MAX, 38, 0).is_ok());
+    }
+
+    type WithIngress = Vec<(LinkType, Vec<u8>, IngressInfo)>;
+
+    fn collect_ingress<S: PacketSource>(mut s: S) -> (WithIngress, Option<CaptureError>) {
+        let mut v = Vec::new();
+        loop {
+            match s.next_packet() {
+                Ok(Some(p)) => v.push((p.linktype, p.data.to_vec(), p.ingress.to_info())),
+                Ok(None) => return (v, None),
+                Err(e) => return (v, Some(e)),
+            }
+        }
+    }
+
+    fn named(name: &str, lo: Option<bool>, pt: Option<PacketType>) -> IngressInfo {
+        IngressInfo {
+            ifindex: None,
+            name: Some(name.into()),
+            loopback: lo,
+            pkttype: pt,
+        }
+    }
+
+    #[test]
+    fn pcapng_per_interface_ingress_and_epb_flags() {
+        for le in [true, false] {
+            let mut b = NgBuilder::new(le);
+            b.idb_named(1, b"lo"); // 0
+            b.idb_named(1, b"eth0"); // 1
+            b.idb_named(276, b"any"); // 2
+            b.idb(101, 0, None, None); // 3: no name
+            b.idb_named(1, b"eth1\0\0"); // 4: NUL-padded name
+            b.epb(0, 1, b"a", 1);
+            b.epb(1, 1, b"b", 1);
+            b.epb_flags(1, b"c", 2); // outbound
+            b.epb_flags(0, b"d", 1 | (1 << 2)); // inbound unicast
+            b.epb(2, 1, b"e", 1);
+            b.epb(3, 1, b"f", 1);
+            b.epb(4, 1, b"g", 1);
+            b.obsolete_pb(1, 1, b"h");
+            let (pkts, err) = collect_ingress(CaptureFile::new(&b.out[..]).unwrap());
+            assert!(err.is_none(), "{err:?}");
+            let ing: Vec<_> = pkts.iter().map(|p| p.2.clone()).collect();
+            assert_eq!(ing[0], named("lo", Some(true), None));
+            assert_eq!(ing[1], named("eth0", Some(false), None));
+            assert_eq!(
+                ing[2],
+                named("eth0", Some(false), Some(PacketType::Outgoing))
+            );
+            assert_eq!(ing[3], named("lo", Some(true), Some(PacketType::Host)));
+            // "any" is passed through here; the pipeline resolves it with
+            // the cooked header (crate::ingress::resolve).
+            assert_eq!(ing[4], named("any", None, None));
+            assert!(ing[5].is_unknown());
+            assert_eq!(ing[6], named("eth1", Some(false), None));
+            assert_eq!(ing[7], named("eth0", Some(false), None));
+            assert_eq!(pkts[4].0, LinkType::LINUX_SLL2);
+        }
+    }
+
+    #[test]
+    fn pcapng_fallback_name_and_hostile_options() {
+        let mut b = NgBuilder::new(true);
+        b.idb(1, 0, None, None);
+        b.idb_named(1, &[b'x'; 200]);
+        b.epb(0, 1, b"a", 1);
+        b.epb(1, 1, b"b", 1);
+        // Option length running past the block: ignored, no panic.
+        b.epb_opts(0, b"c", &[2, 0, 0xff, 0x7f, 1, 0, 0, 0]);
+        // Unknown option, then flags.
+        b.epb_opts(
+            0,
+            b"d",
+            &[9, 0, 1, 0, 7, 0, 0, 0, 2, 0, 4, 0, 2, 0, 0, 0, 0, 0, 0, 0],
+        );
+        // epb_flags of the wrong length: ignored.
+        b.epb_opts(0, b"e", &[2, 0, 2, 0, 2, 0, 0, 0]);
+        b.spb(b"spb", 3);
+        let r = PcapNgReader::new(&b.out[..])
+            .unwrap()
+            .with_default_interface("lo0");
+        let (pkts, err) = collect_ingress(r);
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(pkts[0].2, named("lo0", Some(true), None));
+        assert_eq!(
+            pkts[1].2.name.as_deref().map(str::len),
+            Some(crate::ingress::MAX_INTERFACE_NAME)
+        );
+        assert_eq!(pkts[2].2.pkttype, None);
+        assert_eq!(pkts[3].2.pkttype, Some(PacketType::Outgoing));
+        assert_eq!(pkts[4].2.pkttype, None);
+        assert_eq!(pkts[5].2, named("lo0", Some(true), None));
+        let r = PcapNgReader::new(&b.out[..]).unwrap();
+        let (pkts, _) = collect_ingress(r);
+        assert!(pkts[0].2.is_unknown());
+    }
+
+    #[test]
+    fn classic_pcap_interface_only_when_configured() {
+        let f = classic(true, false, 1, 65535, &[(1, 0, b"abc", 3)]);
+        let (pkts, _) = collect_ingress(PcapReader::new(&f[..]).unwrap());
+        assert!(pkts[0].2.is_unknown());
+        let (pkts, _) = collect_ingress(PcapReader::new(&f[..]).unwrap().with_interface("eth0"));
+        assert_eq!(pkts[0].2, named("eth0", Some(false), None));
+        let (pkts, _) = collect_ingress(
+            CaptureFile::new(&f[..])
+                .unwrap()
+                .with_default_interface("lo"),
+        );
+        assert_eq!(pkts[0].2, named("lo", Some(true), None));
+        let custom = IngressInfo {
+            ifindex: Some(3),
+            loopback: Some(true),
+            ..Default::default()
+        };
+        let (pkts, _) = collect_ingress(
+            PcapReader::new(&f[..])
+                .unwrap()
+                .with_ingress(custom.clone()),
+        );
+        assert_eq!(pkts[0].2, custom);
     }
 
     #[test]
