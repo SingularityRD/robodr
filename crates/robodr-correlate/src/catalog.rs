@@ -1,0 +1,206 @@
+//! The signal vocabulary the correlation rules are validated against.
+//!
+//! Two sources, both kept in sync with the rest of the repository by the
+//! `catalog_drift` integration test:
+//!
+//! * [`NETWORK_AND_AGENT_RULES`]: the `robot.*` deviation rule ids raised by
+//!   the in-repo detectors (`robodr-events` profile, `robodr-ros2-pipeline`,
+//!   `robodr-firewall`, `robodr-motion`, `robodr-agentd` self-health). The
+//!   test checks each one still appears as a string literal in some other
+//!   crate's `src/`.
+//! * [`PULSAR_RULES`]: the `name` of every rule in `rules/robodr/*.toml`, i.e.
+//!   what Pulsar's rule engine puts in a threat for a host-side detection.
+//!   The test checks the two lists are equal in both directions, so a new
+//!   host rule cannot be added without the catalog noticing.
+//!
+//! An id outside the catalog is *allowed* in a correlation rule (a
+//! deployment may add its own Pulsar rules); [`crate::RuleSet::from_json`]
+//! reports it as a warning, because a typo there silently disables a rule.
+
+/// `robot.*` rule ids produced by RoboDR's own detectors.
+pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
+    // robodr-events profile
+    "robot.ros2.unknown_participant",
+    "robot.ros2.unauthorized_motion_writer",
+    "robot.ros2.unknown_writer_topic",
+    "robot.ros2.unknown_service",
+    "robot.ros2.unknown_action",
+    "robot.dds.unknown_raw_writer",
+    "robot.ros2.unknown_reader",
+    "robot.ros2.unknown_reader_topic",
+    "robot.motion.non_finite_command",
+    "robot.motion.unprofiled_channel",
+    "robot.profile.invalid_envelope",
+    "robot.motion.linear_over_envelope",
+    "robot.motion.joint_over_envelope",
+    // robodr-ros2-pipeline
+    "robot.ros2.profile_refused",
+    "robot.ros2.participant_removed",
+    "robot.rtps.malformed_discovery",
+    "robot.rtps.fragmented_discovery",
+    "robot.rtps.discovery_fragment_rejected",
+    "robot.rtps.discovery_fragment_conflict",
+    "robot.rtps.discovery_fragment_evicted",
+    "robot.rtps.discovery_removal",
+    "robot.capture.malformed_frames",
+    "robot.capture.ip_fragment_conflict",
+    "robot.capture.ip_reassembly_dropped",
+    "robot.capture.ip_reassembly_evicted",
+    "robot.capture.ip_fragment_refused",
+    "robot.capture.ip_fragment_duplicate_conflict",
+    "robot.capture.bad_checksum",
+    "robot.capture.not_udp",
+    "robot.ros2.ambiguous_discovery",
+    "robot.rtps.discovery_not_inspected",
+    "robot.sensor.findings_capped",
+    "robot.ros2.endpoint_source_mismatch",
+    "robot.ros2.endpoint_unannounced_participant",
+    "robot.ros2.participant_source_mismatch",
+    "robot.motion.undecodable_sample",
+    "robot.motion.unattributed_sample",
+    "robot.motion.sample_source_mismatch",
+    "robot.motion.unverifiable_command",
+    "robot.motion.decode_anomaly",
+    // robodr-firewall
+    "robot.firewall.rejected_clock_regression",
+    "robot.firewall.rejected_unknown_channel",
+    "robot.firewall.rejected_unknown_source",
+    "robot.firewall.rejected_unauthorized_source",
+    "robot.firewall.rejected_rate_limited",
+    "robot.firewall.rejected_kind_mismatch",
+    "robot.firewall.rejected_non_finite",
+    "robot.firewall.rejected_future_timestamp",
+    "robot.firewall.rejected_stale",
+    "robot.firewall.rejected_out_of_order",
+    "robot.firewall.rejected_over_hard_limit",
+    "robot.firewall.internal_fault",
+    "robot.firewall.limited_speed",
+    "robot.firewall.limited_acceleration",
+    "robot.firewall.limited_jerk",
+    "robot.firewall.events_dropped",
+    // robodr-motion consistency monitor
+    "robot.motion.feedback_divergence",
+    "robot.motion.uncommanded_motion",
+    "robot.motion.frozen_feedback",
+    "robot.motion.cross_sensor_disagreement",
+    "robot.motion.invalid_feedback",
+    "robot.motion.multiple_feedback_publishers",
+    "robot.motion.inconsistent_feedback_stream",
+    // robodr-agentd self-health (always observe-only downstream)
+    "robot.agent.input_silent",
+    "robot.agent.input_ended",
+    "robot.agent.queue_overflow",
+    "robot.agent.input_malformed",
+    "robot.agent.pipeline_lag",
+    "robot.agent.spool_full",
+    "robot.agent.evidence_degraded",
+];
+
+/// Names of the host-side Pulsar rules in `rules/robodr/*.toml`.
+pub const PULSAR_RULES: &[&str] = &[
+    // kernel_modules.toml
+    "RoboDR: Kernel module file written outside the package manager",
+    "RoboDR: Kernel module autoload configuration changed",
+    "RoboDR: Kernel module file or autoload configuration moved into place outside the package manager",
+    "RoboDR: Kernel module file or autoload configuration linked into place outside the package manager",
+    // radio_provisioning.toml
+    "RoboDR: Bluetooth tooling executed on robot controller",
+    "RoboDR: Wi-Fi configuration tooling executed on robot controller",
+    "RoboDR: Wireless network configuration modified",
+    "RoboDR: Wireless network configuration moved into or out of place",
+    "RoboDR: Link created in a wireless network configuration directory",
+    // ros2_stack.toml
+    "RoboDR: Interactive shell started on robot controller",
+    "RoboDR: Login shell started on robot controller",
+    "RoboDR: ROS 2 process connects outside the robot's networks",
+    "RoboDR: ROS 2 install tree written outside the package manager",
+    "RoboDR: File created or moved into the ROS 2 install tree outside the package manager",
+    "RoboDR: Link created inside the ROS 2 install tree outside the package manager",
+    "RoboDR: Shell or netcat-style tool opened a network connection",
+    // runtime_hooking.toml
+    "RoboDR: ROS 2 process loaded a library from outside the allowlisted library paths",
+    "RoboDR: ROS 2 process mapped an ELF from outside the allowlisted paths",
+    "RoboDR: ELF opened from a world-writable or user cache directory",
+    "RoboDR: ROS 2 process loaded /etc/ld.so.preload",
+    "RoboDR: Unexpected ROS 2 middleware (RMW) library loaded",
+    "RoboDR: Shared library opened from a temporary directory",
+    "RoboDR: Program executed from a temporary directory",
+    "RoboDR: Shared library written into a system library path outside the package manager",
+    "RoboDR: File moved into a system library path or linker configuration outside the package manager",
+    "RoboDR: Link created in a system library path or linker configuration outside the package manager",
+    "RoboDR: Existing file in a system library path opened for writing outside the package manager",
+    "RoboDR: Dynamic linker search path changed",
+    "RoboDR: Process memory written through /proc",
+    "RoboDR: Debugger or tracer started on robot controller",
+    "RoboDR: Program executed from a file descriptor or /proc path",
+    "RoboDR: Program executed through a non-canonical path",
+    "RoboDR: ROS 2 process imported Python code from outside the allowlisted paths",
+    "RoboDR: Interpreter one-liner executed",
+    "RoboDR: Interactive or stdin-fed Python interpreter started",
+    "RoboDR: Pseudo-terminal wrapper executed on robot controller",
+    "RoboDR: Package manager loaded a library from outside the system library paths",
+    "RoboDR: Package manager mapped an ELF from outside the system paths",
+    // self_protection.toml
+    "RoboDR: RoboDR profile or Pulsar configuration written",
+    "RoboDR: RoboDR profile or Pulsar configuration deleted",
+    "RoboDR: RoboDR profile or Pulsar configuration renamed",
+    "RoboDR: File or device node created in the RoboDR or Pulsar configuration",
+    "RoboDR: Link created in or to the RoboDR or Pulsar configuration",
+    "RoboDR: Attempt to stop the Pulsar or RoboDR service",
+    // sros2_keystore.toml
+    "RoboDR: SROS 2 enclave private key read by a process outside the ROS stack",
+    "RoboDR: SROS 2 CA private key accessed on robot",
+    "RoboDR: SROS 2 keystore file written",
+    "RoboDR: SROS 2 keystore file renamed or replaced",
+    "RoboDR: Link created to an SROS 2 private key",
+    "RoboDR: Link created inside an SROS 2 enclave directory",
+    "RoboDR: SROS 2 security files loaded from outside the commissioned keystore",
+    // supply_chain.toml
+    "RoboDR: Debian package installed on robot controller",
+    "RoboDR: Debian package maintainer script executed",
+    "RoboDR: Debian package database changed",
+    "RoboDR: Python package installed on robot controller",
+];
+
+/// Is `id` a known signal id (either list)?
+pub fn is_known(id: &str) -> bool {
+    NETWORK_AND_AGENT_RULES.contains(&id) || PULSAR_RULES.contains(&id)
+}
+
+/// Does `prefix` match at least one known signal id?
+pub fn prefix_matches_known(prefix: &str) -> bool {
+    NETWORK_AND_AGENT_RULES
+        .iter()
+        .chain(PULSAR_RULES.iter())
+        .any(|id| id.starts_with(prefix))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn no_duplicates() {
+        let mut seen = BTreeSet::new();
+        for id in NETWORK_AND_AGENT_RULES.iter().chain(PULSAR_RULES.iter()) {
+            assert!(seen.insert(*id), "duplicate catalog id {id}");
+        }
+    }
+
+    #[test]
+    fn shapes() {
+        for id in NETWORK_AND_AGENT_RULES {
+            assert!(id.starts_with("robot."), "{id}");
+            assert!(!id.starts_with("robot.correlate."), "{id}");
+        }
+        for id in PULSAR_RULES {
+            assert!(id.starts_with("RoboDR: "), "{id}");
+        }
+        assert!(is_known("robot.ros2.unknown_participant"));
+        assert!(!is_known("robot.ros2.unknown_participan"));
+        assert!(prefix_matches_known("robot.capture."));
+        assert!(prefix_matches_known("RoboDR: SROS 2 "));
+        assert!(!prefix_matches_known("robot.nope."));
+    }
+}
