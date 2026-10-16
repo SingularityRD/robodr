@@ -52,9 +52,23 @@ DDS writer GUIDs and republishes verdicts is a later step (see "Integration" bel
   limit comes only from the spec, because `Envelope` has no angular field.
 - **Events without allocation.** `Deviation` holds a `String`, so `check` never
   builds one. Instead it writes a `Copy` `FirewallEvent` into a fixed-capacity
-  buffer and counts the drop when the buffer is full. The caller drains the buffer
-  outside the control loop. `drain_deviations()` calls `Deviation::new` there, and
-  if any events were dropped it adds a `robot.firewall.events_dropped` deviation.
+  buffer. The caller drains the buffer outside the control loop.
+  `drain_deviations()` calls `Deviation::new` there, and if any events were lost
+  it adds a `robot.firewall.events_dropped` deviation whose severity is at least
+  Medium and as high as the worst event lost.
+- **Flood-resistant event retention.** A spoofer can cause one event per packet, so
+  the buffer (rev3 finding 4):
+  - **coalesces** identical events (same rule, channel, source, action) into one
+    record with a `count`, first/last time and the worst value;
+  - **reserves capacity by source class**: events whose source is not authorised
+    on the channel (`authorised == false`) may fill at most half the buffer;
+  - when full, **evicts by priority** (severity, then authorised over not), the
+    oldest of the lowest first, and only for a strictly higher-priority event.
+    A pending Critical from an authorised source is therefore never evicted, and
+    never in favour of an unknown-source event.
+
+  All of this is allocation-free and bounded: one scan of the buffer per event,
+  so `event_capacity` should stay in the hundreds.
 
 ## Decision semantics
 
@@ -109,7 +123,15 @@ Rejection substitutes, set per platform by `FailBehaviour`:
 - **`ZeroVelocity`** (default): emit an all-zero command of the channel's kind.
 - **`HoldLast { max_hold_ns }`**: re-emit the last **accepted** output while it is
   younger than `max_hold_ns`, then emit zero. The age is measured from when that
-  output was accepted, so a run of rejections cannot stretch the hold.
+  output was accepted, so a run of rejections cannot stretch the hold. The hold is
+  only granted if it is a component-wise deceleration of the rejected command
+  (own source, readable content), and it is **never more than what was last
+  emitted downstream** (rev3 finding 2): the accepted output is scaled down to a
+  deceleration of the last emission, so after a zero substitute every further
+  hold is zero and the output can only rise again through accepted, acceleration
+  limited commands. No hold is granted if the last emission is older than the
+  channel's `state_reset_after_ns`, nor under a gateway clock regression (rev3
+  finding 3: the hold age cannot be measured then), so zero is emitted.
 - **`PassThroughObserveOnly`**: no enforcement on this platform. It behaves exactly
   like observe mode. Limiting is switched off as well, so a 1.5× command is never
   treated more strictly than a 3× one.
@@ -152,6 +174,8 @@ gateway must be deployed so that this timeout exists.
 | Emitted output is always finite and within every speed limit (independent naive norm) | `tests/properties.rs` (24 random configs × 20 000 commands, NaN/inf/`f64::MAX`/subnormals/replays/stale/future/foreign sources) |
 | `Passed` (enforcing) is bit-exact and has no `would_have` | properties, decision table |
 | A rejection never forwards the rejected values: the substitute is zero or exactly the last accepted output | properties |
+| A hold never exceeds the last emitted output, so the emitted stream never steps up past the acceleration limit; no hold under clock regression | properties, `tests/rev3_regressions.rs` |
+| A foreign-source flood cannot evict an authorised source's Critical event; floods coalesce; drop reports carry the worst lost severity | `tests/rev3_regressions.rs`, `events::tests` |
 | Unknown source, non-finite, stale or future commands never pass or get limited | properties, decision table |
 | The output stays inside the hull of {previous output, 0, input}, so it is never motion nobody asked for | properties |
 | The acceleration bound holds for every accepted step except pure decelerations | properties (a mutation that loosens λ fails the test) |
@@ -164,50 +188,56 @@ gateway must be deployed so that this timeout exists.
 | No `unwrap`/`expect`/`panic!`/slice indexing/unchecked integer arithmetic in hot-path modules | `#![deny(clippy::{unwrap_used, expect_used, panic, indexing_slicing, arithmetic_side_effects})]` on `engine`, `command`, `events`, `verdict`; confirmed to fire on a deliberate probe |
 | Policy compilation rejects every class of malformed config | `config::tests` |
 
-Total: 67 tests. Every loop in `check` runs over at most `MAX_JOINTS` (32)
+Total: 99 tests. Every loop in `check` runs over at most `MAX_JOINTS` (32)
 elements or a constant 4 rounds. There is no recursion and no search over sources.
 
-## Latency
+## Latency and jitter harness
 
-Run the benchmark with `cargo run --release -p robodr-firewall --example latency [N]`.
-It times 10⁶ pre-generated commands one by one with `Instant`. The command mix:
+`examples/latency.rs` is a std-only harness (`Instant`, no external crates):
+
+    cargo run --release -p robodr-firewall --example latency -- [N] \
+        [--budget-p50-ns X] [--budget-p99-ns X] [--budget-max-ns X] [--budget-jitter-ns X]
+
+Budgets can also come from `ROBODR_FW_BUDGET_{P50,P99,MAX,JITTER}_NS` (flags win).
+It times N (default 10⁶) pre-generated commands one by one and prints p50, p99,
+p99.9, max, mean, jitter (p99 − p50), the `Instant` overhead and a log2 histogram,
+then one `BUDGET:` line per configured budget. **Exit code 1 if any configured
+budget is exceeded**, 2 on a usage error, 0 otherwise.
+
+**Gate status: report-only.** Until the harness runs on the target controller (RT
+kernel, pinned core, frequency fixed) the numbers below are not a budget, and CI
+must not fail on them: run it without budgets (pure report), or with budgets and
+treat a non-zero exit as a warning. Once target hardware exists, set the budgets
+from the design doc's control-path allowance and make the exit code blocking.
+
+The command mix:
 
 - a 1 kHz ±50 µs stream, two thirds of it twists on a channel with accel, jerk and rate limits;
 - one third joint commands for a 6-joint arm;
-- smooth random-walk targets with rare jumps, plus about 7 % rejections (unknown source, NaN, stale, over-hard).
+- smooth random-walk targets with rare jumps, plus about 7 % rejections (unknown source, NaN, stale, over-hard);
+- `HoldLast` fail behaviour, 1024-entry event buffer drained every 512 commands.
 
-The resulting verdicts: about 76 % passed, 18 % limited and 7 % rejected.
+The resulting verdicts: about 3 % passed, 91 % limited and 7 % rejected (the
+tight angular/jerk limits make most random-walk steps limited, which exercises
+the slowest accept path).
 
-Measured 2026-10-16 in the development sandbox: a 2-vCPU VM on an Intel Xeon @ 2.80 GHz, release profile, four runs:
+Measured 2026-10-16 in the development sandbox: a 2-vCPU VM on an Intel Xeon @ 2.80 GHz, release profile:
 
-| p50 | p99 | p99.9 | max | Timer overhead (`Instant` pair) |
-|---|---|---|---|---|
-| 181–198 ns | 488–593 ns | 0.79–0.96 µs (one noisy run: 4.0 µs) | 0.15–4.1 ms | 19–31 ns (p50) |
-
-```
-        32..63           35525   3.553% ###
-        64..127          50973   5.097% ####
-       128..255         787223  78.722% ##################################################
-       256..511         118240  11.824% ########
-       512..1023          7453   0.745% #
-      1024..2047           103   0.010% #
-      4096..8191           199   0.020% #
-     16384..32767          211   0.021% #
-     32768..65535           29   0.003% #
-    131072..262143           6   0.001% #
-    524288..1048575          1   0.000% #
-```
+| p50 | p99 | p99.9 | max | jitter (p99 − p50) | Timer overhead (`Instant` pair) |
+|---|---|---|---|---|---|
+| 180–200 ns | 470–550 ns | 0.8–3.5 µs | 12–20 ms (preemption) | 290–350 ns | 19 ns (p50) |
 
 **Machine caveat.** These numbers come from a shared, non-isolated VM with no RT
 kernel, no CPU pinning and no frequency control.
 
-- **The tail is the environment, not the algorithm.** The 4 µs–4 ms outliers
-  (fewer than 0.05 % in typical runs) are preemption, page faults and timer interrupts. `check`
+- **The tail is the environment, not the algorithm.** The µs–ms outliers
+  (fewer than 0.1 % in typical runs) are preemption, page faults and timer interrupts. `check`
   itself has no data-dependent unbounded work.
 - **The numbers are not a latency budget for the robot.** The budget (the design
   doc's target is < 1 ms added in the control path) must be measured on the target
   controller, with the gateway, under load, with the firewall on and off. That is
-  the Sprint 7 jitter harness, which this example does not replace.
+  the Sprint 7 jitter harness; this example is its library-level half (the
+  gateway-in-the-loop measurement is still to do).
 
 ## Integration (not done here)
 

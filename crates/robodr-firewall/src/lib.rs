@@ -105,7 +105,13 @@
 //!   which the held output is a component-wise deceleration (each component
 //!   zero, or same sign and no larger). A rejected stop, slow-down or
 //!   reversal, unreadable content (NaN, wrong kind) and foreign sources all
-//!   get zero.
+//!   get zero. The held value is also never more than what was **last
+//!   emitted** downstream (it is the accepted output scaled down, if needed,
+//!   to a component-wise deceleration of the last emission; zero if the last
+//!   emission was zero or is older than the channel's reset gap), so a hold
+//!   can never step the output up past the acceleration limit. Under a
+//!   gateway clock regression the hold age cannot be measured, so no hold is
+//!   granted.
 //! - `PassThroughObserveOnly`: no enforcement on this platform; behaves like
 //!   observe mode.
 //!

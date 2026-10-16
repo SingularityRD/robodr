@@ -160,6 +160,12 @@ fn holdlast_holds_only_when_it_is_no_more_than_requested() {
     assert!(f
         .check(&Command::twist(s, c, t, tw(0.6, 0.2)), t)
         .is_passed());
+    // Stale, same direction and at least as fast: the hold (0.6, 0.2) is
+    // a deceleration of what was asked, so it is allowed.
+    t += 10 * MS;
+    let v = f.check(&Command::twist(s, c, t - 150 * MS, tw(0.8, 0.2)), t);
+    assert_eq!(sub_kind(&v), SubstituteKind::HoldLast);
+    assert_eq!(out_twist(&v), tw(0.6, 0.2));
     // Stale, slower: zero.
     t += 10 * MS;
     let v = f.check(&Command::twist(s, c, t - 150 * MS, tw(0.3, 0.1)), t);
@@ -169,12 +175,11 @@ fn holdlast_holds_only_when_it_is_no_more_than_requested() {
     t += 10 * MS;
     let v = f.check(&Command::twist(s, c, t - 150 * MS, tw(-0.6, 0.2)), t);
     assert_eq!(sub_kind(&v), SubstituteKind::Zero);
-    // Stale, same direction and at least as fast: the hold (0.6, 0.2) is
-    // a deceleration of what was asked, so it is allowed.
+    // Same direction again, but zero was emitted last: the hold may never
+    // exceed what was last emitted downstream (rev3 F1), so zero.
     t += 10 * MS;
     let v = f.check(&Command::twist(s, c, t - 150 * MS, tw(0.8, 0.2)), t);
-    assert_eq!(sub_kind(&v), SubstituteKind::HoldLast);
-    assert_eq!(out_twist(&v), tw(0.6, 0.2));
+    assert_eq!(sub_kind(&v), SubstituteKind::Zero);
     // Unreadable own content (NaN, wrong kind): intent unknown, so zero.
     t += 10 * MS;
     let v = f.check(&Command::twist(s, c, t, tw(f64::NAN, 0.0)), t);
@@ -285,7 +290,8 @@ fn observe_events_are_observe_deviations() {
     let (mut f, s, c) = fw(Some(0.5), false, pf, spec());
     assert!(!f.is_enforcing());
     let _ = f.check(&Command::twist(s, c, T0, tw(5.0, 0.0)), T0);
-    let _ = f.check(&Command::twist(s, c, T0 + MS, tw(5.0, 0.0)), T0 + MS);
+    // A distinct (lower-severity) event: the buffer is full, it is dropped.
+    let _ = f.check(&Command::twist(s, c, T0 + MS, tw(0.6, 0.0)), T0 + MS);
     let devs = f.drain_deviations();
     assert_eq!(devs.len(), 2, "{devs:?}");
     assert!(devs.iter().any(|d| d.rule == rules::EVENTS_DROPPED));
@@ -384,7 +390,9 @@ fn spoofer_cannot_pin_robot_with_default_platform() {
         .iter()
         .filter(|d| d.rule == rules::REJECTED_UNKNOWN_SOURCE)
         .collect();
-    assert_eq!(foreign.len(), 10, "every attempt recorded: {devs:?}");
+    // Every attempt recorded, coalesced into one record with a count.
+    assert_eq!(foreign.len(), 1, "{devs:?}");
+    assert!(foreign[0].detail.contains(" x10 "), "{devs:?}");
     assert!(foreign
         .iter()
         .all(|d| d.severity == robodr_events::Severity::Critical && d.mode == Mode::Enforce));
@@ -415,12 +423,17 @@ fn opt_in_foreign_substitute_is_bounded() {
         assert!(*x >= prev && *x - prev <= 0.05 + 1e-9, "{k}: {outs:?}");
         prev = *x;
     }
-    // All ten are still recorded.
-    let n = f
-        .drain_deviations()
-        .iter()
-        .filter(|d| d.rule == rules::REJECTED_UNKNOWN_SOURCE)
-        .count();
+    // All ten are still recorded (one coalesced record per action: the
+    // emitted zero and the nine suppressed ones).
+    let n: u32 = {
+        let mut n = 0;
+        f.drain_events(|e| {
+            if e.rule == rules::REJECTED_UNKNOWN_SOURCE {
+                n += e.count;
+            }
+        });
+        n
+    };
     assert_eq!(n, 10);
     // After the interval, another one is allowed.
     let later = t + 2_000 * MS;

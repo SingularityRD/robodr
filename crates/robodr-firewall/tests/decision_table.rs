@@ -708,9 +708,11 @@ fn jerk_bounds_growth_of_acceleration() {
     // 0.6 + 0.4 reaches the target exactly: passes.
     let v = f.fw.check(&twist_cmd(f.nav, f.base, t, vx(LIN)), t);
     assert!(v.is_passed(), "{v:?}");
+    // Identical events coalesce into one record with a count.
     let ev = f.fw.events().as_slice();
-    assert_eq!(ev.len(), 3);
-    assert!(ev.iter().all(|e| e.rule == rules::LIMITED_JERK));
+    assert_eq!(ev.len(), 1);
+    assert_eq!(ev[0].rule, rules::LIMITED_JERK);
+    assert_eq!(ev[0].count, 3);
 }
 
 #[test]
@@ -957,22 +959,68 @@ fn full_event_buffer_drops_and_reports() {
         true,
         |_, _| {},
     );
+    // A flood of identical events coalesces into one record.
     for i in 0..10 {
         f.fw.check(
             &twist_cmd(SourceId::UNKNOWN, f.base, T0 + i, vx(0.0)),
             T0 + i,
         );
     }
+    assert_eq!(f.fw.events().len(), 1);
+    assert_eq!(f.fw.events().as_slice()[0].count, 10);
+    assert!(!f.fw.events().as_slice()[0].authorised);
+    assert_eq!(f.fw.events().dropped(), 0);
+    f.fw.drain_deviations();
+
+    // Distinct events from the authorised source overflow the buffer.
+    let t = T0 + 1_000 * MS;
+    let j1 = JointVelocities::from_slice(&[0.1]).unwrap();
+    let cmds = [
+        (twist_cmd(f.nav, f.base, 0, vx(0.1)), RejectReason::Stale), // Medium
+        (
+            twist_cmd(f.nav, f.base, u64::MAX, vx(0.1)),
+            RejectReason::FutureTimestamp,
+        ), // High
+        (
+            Command::joints(f.nav, f.base, t, j1),
+            RejectReason::KindMismatch,
+        ), // High
+        (
+            twist_cmd(f.nav, f.base, t, vx(f64::NAN)),
+            RejectReason::NonFinite,
+        ), // Critical
+        // Full: over-hard (Critical) evicts the Medium stale event.
+        (
+            twist_cmd(f.nav, f.base, t, vx(100.0)),
+            RejectReason::OverHardLimit,
+        ),
+        // Full: an unauthorised-class High ranks below every pending event
+        // and is dropped.
+        (
+            twist_cmd(f.nav, ChannelId(99), t, vx(0.1)),
+            RejectReason::UnknownChannel,
+        ),
+    ];
+    for (c, why) in cmds {
+        assert_eq!(f.fw.check(&c, t).reject_reason(), Some(why));
+    }
     assert_eq!(f.fw.events().len(), 4);
-    assert_eq!(f.fw.events().dropped(), 6);
+    assert_eq!(f.fw.events().dropped(), 2);
+    assert!(f
+        .fw
+        .events()
+        .as_slice()
+        .iter()
+        .all(|e| e.rule != rules::REJECTED_STALE));
     let devs = f.fw.drain_deviations();
     assert_eq!(devs.len(), 5);
     assert_eq!(devs[4].rule, rules::EVENTS_DROPPED);
-    assert!(devs[4].detail.starts_with("6 "));
+    assert_eq!(devs[4].severity, Severity::High);
+    assert!(devs[4].detail.starts_with("2 "));
     // Drained: buffer usable again, counter reset.
     f.fw.check(
-        &twist_cmd(SourceId::UNKNOWN, f.base, T0 + 20, vx(0.0)),
-        T0 + 20,
+        &twist_cmd(SourceId::UNKNOWN, f.base, t + MS, vx(0.0)),
+        t + MS,
     );
     let mut n = 0;
     assert_eq!(f.fw.drain_events(|_| n += 1), 0);
