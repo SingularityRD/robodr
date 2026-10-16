@@ -57,13 +57,29 @@ let rec = robodr_ocsf::record(&finding, Some(partitions))?; // key, partition, h
 * **SR-TAINT** (security requirement). ROS node/topic/type names, GUIDs, source
   IPs and `detail` are attacker-controlled and reach an LLM-based SOC. They are
   placed only in typed `Tainted` fields (`taint: "adversary"`) or OCSF resources
-  labelled `taint:adversary`, listed in `adversary_controlled_fields`, have
-  control / Unicode-format / markup (`<>` and backtick) characters rewritten as
-  visible `\u{XXXX}` escapes (backslash doubled, so it is injective), and are
-  length-capped with the raw length and SHA-256 kept. Injected natural-language
-  instructions are **not** filtered (undecidable) — they remain inert, clearly
-  tainted data. The validator rejects any raw control/format/markup character
-  in *any* string of the message, including unknown fields on parse.
+  labelled `taint:adversary`, listed in `adversary_controlled_fields`, and
+  neutralised by **allow-list**: ROS/DDS identifiers keep only
+  `[A-Za-z0-9_/.:-]` raw, the free-text `detail` keeps printable ASCII minus
+  Markdown/HTML/template metacharacters; everything else (all non-ASCII, all
+  control/format characters, homoglyphs, markup) becomes a visible canonical
+  `\u{XXXX}` escape (backslash as `\\`), which is unambiguous and reversible
+  (`taint::unescape`). Each tainted value carries two renderings: `value`,
+  the **lossless escaped original** (hash-verified by the validator while not
+  truncated), and `display`, an **ASCII-safe rendering** (allow-listed chars
+  kept, everything else `?`). Flags `escaped`, `truncated`, `non_ascii`,
+  `mixed_script` (homoglyph hint), `injection_hint` (keyword heuristic:
+  `SYSTEM:`, "ignore…", verdict words, URLs, Markdown/HTML/JSON syntax) and
+  their OR `suspicious` mark anything altered or suspicious. Values are
+  capped by raw characters (256 / 64 / 400) with the raw length and SHA-256
+  kept. Injected
+  natural-language instructions are **not** filtered (undecidable) — they
+  remain inert, clearly tainted data. The validator re-checks canonical
+  encoding per charset and requires *every* string of the message (unknown
+  fields on parse included) to be printable ASCII without `<>` or backtick;
+  the JSON Schema carries the same rules as `pattern`s.
+* **Mode.** `entity_context.mode` is `observe` if the robot context *or* the
+  deviation says observe (`effective_mode`); an observe-only deviation is
+  never published as `enforce`.
 * **Trusted config is rejected, not escaped.** A robot id, model, site, rule id
   or hash that fails its charset/format is a configuration bug; `build()` fails.
 * **Partitioning** by robot id with Kafka's murmur2, key = finding id.
@@ -113,13 +129,26 @@ first_seen_time, last_seen_time, analytic, data_sources}`, `analytic.type_id`
 
 * Verified (unit/integration tests): severity mapping, determinism, dedup-key
   stability, uid sensitivity, hostile-string neutralisation (control chars,
-  bidi, zero-width, tag chars, markup, 1 MB names), validator rejection of 27
-  tampering cases, round-trip, schema required/undeclared keys, golden example,
+  bidi, zero-width, tag chars, markup, 1 MB names, and every bypass from the
+  wave-2 review: Arabic/musical/Egyptian format chars, Mongolian FVS, braille
+  blank, exotic spaces, private-use, unassigned, combining marks, Cyrillic
+  homoglyphs, Markdown image links, HTML entities, JSON quote/brace and
+  fake-field text; `tests/review_regressions.rs` pins value, display and
+  every flag per case), escape round-trip and canonicality, display/flag/hash
+  consistency, worst-case size (every tainted field at max escape length),
+  validator rejection of 27 + 17 tampering cases, observe-mode propagation, round-trip, schema
+  required/undeclared keys **and every `pattern`** (hand-written matcher for
+  the regex subset the schema uses), golden example,
   SHA-256 and murmur2 against published vectors.
 * **Not** verified: against the real OCSF schema/validator, against a running
   AutoSecOps `kafka_consumer_service.py`, against a Kafka broker, or the exact
   AutoSecOps expectations for `severity`/`timestamp`/`mitre_predictions` value
   formats (assumed: lower-case string, RFC 3339 string, list of objects).
-  The JSON Schema's `pattern` keywords are not evaluated by the in-repo test
-  checker (no regex engine); the Rust validator enforces those formats.
+  The schema `pattern`s are evaluated with an in-repo matcher, not a real
+  ECMA-262 engine; they were written in a portable subset (anchors, classes,
+  groups, simple quantifiers) but not run through a third-party JSON Schema
+  validator. `injection_hint` is a fixed keyword heuristic (false positives
+  and negatives expected; protection does not depend on it).
+  `mixed_script` is a code-point-range heuristic, not Unicode
+  script detection (no Unicode tables offline).
 * Diode export/import is specified in the contract but not implemented.

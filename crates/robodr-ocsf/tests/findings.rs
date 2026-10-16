@@ -342,8 +342,10 @@ fn hostile_topic_and_node_names_stay_inert_typed_data() {
             (&f.entity_context.detail, taint::caps::DETAIL),
         ] {
             assert_eq!(t.taint, Provenance::Adversary);
-            assert!(t.value.len() <= cap);
-            assert!(taint::is_neutral(&t.value));
+            assert!(t.value.len() <= taint::escaped_cap(cap));
+            assert!(t.display.len() <= cap);
+            assert!(taint::is_neutral(&t.value) && taint::is_neutral(&t.display));
+            assert!(t.suspicious, "hostile value must be flagged suspicious");
             assert_eq!(t.original_sha256.len(), 64);
         }
         for r in &f.ocsf.resources {
@@ -377,7 +379,9 @@ fn injected_plain_text_instructions_are_preserved_verbatim_as_data() {
         .unwrap();
     let t = f.entity_context.ros.topic.as_ref().unwrap();
     assert_eq!(t.value, raw);
+    assert_eq!(t.display, raw);
     assert!(!t.escaped && !t.truncated);
+    assert!(t.injection_hint && t.suspicious);
 }
 
 fn assert_no_raw_hostile(v: &serde_json::Value) {
