@@ -185,7 +185,7 @@ use crate::input::{CaptureDiagnostics, EventSource, InputError, Origin, SourcedE
 use crate::signoff::{Signoff, SignoffItem};
 use crate::stats::{SampleBuffer, SpeedStats};
 use robodr_events::graph::{ActionRole, RosName, RosNameKind};
-use robodr_events::profile::{Envelope, Profile, ProfileError};
+use robodr_events::profile::{Envelope, ParticipantIdentity, Profile, ProfileError};
 use robodr_events::RobotEvent;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -497,6 +497,9 @@ pub struct LearnConfig {
     /// [`MAX_DISCOVERY_SERVERS`].
     pub discovery_servers: Vec<DiscoveryServer>,
     pub limits: Limits,
+    /// Do not write `participant_identities` (GUID matching only: the
+    /// profile then matches only the processes of the learned run).
+    pub no_identities: bool,
 }
 
 impl Default for LearnConfig {
@@ -522,6 +525,7 @@ impl Default for LearnConfig {
                 .collect(),
             discovery_servers: Vec::new(),
             limits: Limits::default(),
+            no_identities: false,
         }
     }
 }
@@ -2114,6 +2118,105 @@ impl Learner {
         Gate { accepted, ips }
     }
 
+    /// Stable identities of the accepted participants
+    /// (`Profile::participant_identities`): DDS draws a new GUID prefix per
+    /// process start, so the GUIDs in `participants` only match this run.
+    ///
+    /// Accepted participants are grouped by (commissioned source IPs, RTPS
+    /// vendor id = first two bytes of the prefix, ROS nodes they serve
+    /// parameters for). The same node seen in several runs (each with its
+    /// own prefix) is one identity; `max_instances` is the most members of
+    /// a group present in one run. A participant without a commissioned IP
+    /// (sensor recordings without sender, relayed only) gets none.
+    fn identities(&self, gate: &Gate<'_>) -> BTreeMap<String, ParticipantIdentity> {
+        let mut nodes: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+        for (name, a) in &self.services {
+            let Some(node) = name.strip_suffix("/get_parameters") else {
+                continue;
+            };
+            if node.is_empty() || robodr_events::graph::validate_full_name(node).is_err() {
+                continue;
+            }
+            for g in &a.side_b {
+                nodes.entry(g.as_str()).or_default().insert(node.to_owned());
+            }
+        }
+        type Key = (BTreeSet<String>, String, BTreeSet<String>);
+        let mut groups: BTreeMap<Key, Vec<&str>> = BTreeMap::new();
+        for g in &gate.accepted {
+            let ips: BTreeSet<String> = gate
+                .ips
+                .get(g)
+                .into_iter()
+                .flatten()
+                .filter(|ip| ip.parse::<std::net::IpAddr>().is_ok())
+                .take(robodr_events::profile::MAX_IDENTITY_IPS)
+                .map(|ip| ip.to_string())
+                .collect();
+            if ips.is_empty() || g.len() != 24 {
+                continue;
+            }
+            let n: BTreeSet<String> = nodes
+                .get(g)
+                .into_iter()
+                .flatten()
+                .take(robodr_events::profile::MAX_IDENTITY_NODES)
+                .cloned()
+                .collect();
+            groups
+                .entry((ips, g[..4].to_owned(), n))
+                .or_default()
+                .push(g);
+        }
+        let mut out = BTreeMap::new();
+        for ((ips, vendor, nodes), members) in groups {
+            if out.len() >= robodr_events::profile::MAX_IDENTITIES {
+                break;
+            }
+            let mut per_run: BTreeMap<usize, u32> = BTreeMap::new();
+            for m in &members {
+                if let Some(acc) = self.participants.get(*m) {
+                    for r in acc.runs.keys() {
+                        *per_run.entry(*r).or_default() += 1;
+                    }
+                }
+            }
+            let max_instances = per_run
+                .values()
+                .copied()
+                .max()
+                .unwrap_or(1)
+                .clamp(1, robodr_events::profile::MAX_IDENTITY_INSTANCES);
+            let base: String = nodes
+                .iter()
+                .next()
+                .map(|n| n.trim_start_matches('/').replace('/', "."))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("participant-{}", &members[0][..8]))
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+                .take(56)
+                .collect();
+            let mut name = base.clone();
+            let mut i = 2;
+            while out.contains_key(&name) {
+                name = format!("{base}-{i}");
+                i += 1;
+            }
+            out.insert(
+                name,
+                ParticipantIdentity {
+                    ips,
+                    vendor,
+                    enclave: None,
+                    nodes,
+                    max_instances,
+                },
+            );
+        }
+        out
+    }
+
     /// Accepted announcements whose sender IP is not a commissioned IP of
     /// the claimed owner: `(owner, ip) -> endpoint names`.
     fn ip_mismatches(&self, gate: &Gate<'_>) -> BTreeMap<(String, String), BTreeSet<String>> {
@@ -2329,6 +2432,9 @@ impl Learner {
             ..Default::default()
         };
         p.participants = accepted.iter().map(|g| g.to_string()).collect();
+        if !self.config.no_identities {
+            p.participant_identities = self.identities(&gate);
+        }
         let topic_learned =
             |e: &EndpointAcc| e.participants.iter().any(|g| gate.vouches(&e.origins, g));
         p.writer_topics = self
@@ -2432,6 +2538,12 @@ impl Learner {
             for (kind, reason) in &a.flags {
                 items.push(SignoffItem::new(kind, g, reason.clone()));
             }
+        }
+        // Every identity: from now on any process matching it is accepted
+        // with a fresh GUID, including as a writer of whatever its learned
+        // participants wrote (motion topics included).
+        for (name, id) in &profile.participant_identities {
+            items.push(crate::signoff::identity_item(name, id));
         }
         // Motion writers: topic writers on motion topics...
         for t in &profile.writer_topics {

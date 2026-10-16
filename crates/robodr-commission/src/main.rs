@@ -74,7 +74,7 @@ USAGE:
                           [--accept-participant GUID]... [--motion-topic /T]...
                           [--discovery-server PREFIX|PREFIX@IP|IP]...
                           [--trusted-discovery-server PREFIX@IP|IP]...
-                          [--learn-readers]
+                          [--learn-readers] [--no-identities]
                           --out profile.json [--signoff signoff.json]
                           [--report report.json] [--quiet] [--force]
   robodr-commission lock    --in profile.json --signoff signoff.json --out locked.json
@@ -118,10 +118,16 @@ USAGE:
                           [--hard-cap-linear 10] [--hard-cap-joint 10] [--force]
 
   --events: JSON Lines of RobotEvent. --pcap: pcap or pcapng capture of the
-  robot bus (discovery only: participants, writers, readers). Both repeat and
+  robot bus (discovery, plus Twist / TwistStamped / JointTrajectory commands
+  decoded from user data for envelopes). Both repeat and
   mix; every file is one run.
   --learn-readers: also learn reader_topics, which turns reader-topic
   enforcement on (off by default: a policy choice for the OEM).
+  Identities: DDS draws a new GUID prefix per process start, so learn also
+  writes participant_identities (source IPs + RTPS vendor + ROS nodes per
+  accepted participant); the sensor maps a restarted process's new GUID to
+  them. Each identity is a sign-off item. --no-identities: GUIDs only (the
+  profile then matches only the processes of the learned run).
   Anti-poisoning: participants announced fewer than --min-announcements
   times (or, in captures, seen for less than --min-duration seconds) are
   quarantined: not learned, nor their endpoints or motion samples. Use
@@ -546,7 +552,7 @@ fn cmd_learn(argv: &[String]) -> Outcome {
             "discovery-server",
             "trusted-discovery-server",
         ],
-        &["quiet", "learn-readers", "force"],
+        &["quiet", "learn-readers", "no-identities", "force"],
     )?;
     if let Some(p) = a.positionals.first() {
         return Err(format!("unexpected argument {p:?}").into());
@@ -561,6 +567,7 @@ fn cmd_learn(argv: &[String]) -> Outcome {
     cfg.ceiling_linear = a.f64_opt("ceiling-linear")?;
     cfg.ceiling_joint = a.f64_opt("ceiling-joint")?;
     cfg.learn_readers = a.switch("learn-readers");
+    cfg.no_identities = a.switch("no-identities");
     if let Some(n) = a.u64_opt("min-samples")? {
         cfg.min_samples = n;
     }

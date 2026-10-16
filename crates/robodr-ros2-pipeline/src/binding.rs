@@ -660,6 +660,26 @@ impl BindingTable {
         self.entries.contains_key(prefix) || self.opts.participant_ips.contains_key(prefix)
     }
 
+    /// Mark `prefix` as profiled (or not) after the table was built: a
+    /// prefix resolved to a profile identity at run time
+    /// ([`crate::identity`]) gets the same eviction protection and
+    /// severities as a statically profiled one.
+    pub fn set_profiled(&mut self, prefix: GuidPrefix, profiled: bool) {
+        if self.profiled.contains(&prefix) == profiled {
+            return;
+        }
+        let at = self.entries.get(&prefix).map(|e| e.last_refresh);
+        if let Some(at) = at {
+            self.order.remove(&(!profiled, at, prefix));
+            self.order.insert((profiled, at, prefix));
+        }
+        if profiled {
+            self.profiled.insert(prefix);
+        } else {
+            self.profiled.remove(&prefix);
+        }
+    }
+
     /// Is `prefix` contested (a profiled, unpinned prefix claimed by SPDP
     /// from more than one host)? Its every source is untrusted until it is
     /// pinned. See the module docs.

@@ -86,8 +86,12 @@ pub const PROFILE_KEYS: [&str; 9] = [
     "reader_topics",
     "raw_dds_topics",
 ];
-/// Optional top-level keys (written by `lock`).
-pub const OPTIONAL_PROFILE_KEYS: [&str; 1] = ["metadata"];
+/// Optional top-level keys (`metadata` is written by `lock`;
+/// `participant_identities` by `learn`, omitted when empty).
+pub const OPTIONAL_PROFILE_KEYS: [&str; 2] = ["metadata", "participant_identities"];
+/// Keys of one `participant_identities` entry; `ips` and `vendor` are
+/// required, the rest optional.
+pub const IDENTITY_KEYS: [&str; 5] = ["ips", "vendor", "enclave", "nodes", "max_instances"];
 /// Keys of the `metadata` object; all must be present.
 pub const METADATA_KEYS: [&str; 7] = [
     "schema_version",
@@ -157,6 +161,12 @@ pub enum ProfileFileError {
     BadMetadata {
         detail: String,
     },
+    /// A `participant_identities` entry has unknown or missing keys
+    /// ([`IDENTITY_KEYS`]); its values are checked by `Profile::validate`.
+    BadIdentity {
+        name: String,
+        detail: String,
+    },
     /// `metadata` on an unlocked profile (only `lock` writes it).
     MetadataOnDraft,
     /// The file is well formed but not trusted for enforcement: signature,
@@ -194,6 +204,9 @@ impl fmt::Display for ProfileFileError {
                 "sealed file has \"locked\": false (edited after locking)"
             ),
             Self::BadMetadata { detail } => write!(f, "metadata: {detail}"),
+            Self::BadIdentity { name, detail } => {
+                write!(f, "participant_identities {name:?}: {detail}")
+            }
             Self::MetadataOnDraft => write!(
                 f,
                 "\"metadata\" on an unlocked profile: only `lock` writes it; remove it from \
@@ -338,6 +351,31 @@ pub fn parse_profile_text(text: &str) -> Result<Profile, ProfileFileError> {
                         return Err(bad(format!("{k} is not a number or null")))
                     }
                     _ => {}
+                }
+            }
+        }
+    }
+    if let Some(ids) = obj.get("participant_identities") {
+        let ids = ids
+            .as_object()
+            .ok_or_else(|| ProfileFileError::BadIdentity {
+                name: String::new(),
+                detail: "participant_identities is not an object".into(),
+            })?;
+        for (name, id) in ids {
+            let bad = |detail: String| ProfileFileError::BadIdentity {
+                name: name.clone(),
+                detail,
+            };
+            let o = id.as_object().ok_or_else(|| bad("not an object".into()))?;
+            for k in o.keys() {
+                if !IDENTITY_KEYS.contains(&k.as_str()) {
+                    return Err(bad(format!("unknown key {k:?}")));
+                }
+            }
+            for k in ["ips", "vendor"] {
+                if !o.contains_key(k) {
+                    return Err(bad(format!("missing key {k:?}")));
                 }
             }
         }

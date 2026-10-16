@@ -58,6 +58,7 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     "robot.ros2.endpoint_source_mismatch",
     "robot.ros2.endpoint_unannounced_participant",
     "robot.ros2.participant_source_mismatch",
+    "robot.ros2.identity_instances_exceeded",
     "robot.motion.undecodable_sample",
     "robot.motion.unattributed_sample",
     "robot.motion.sample_source_mismatch",

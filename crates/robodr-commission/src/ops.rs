@@ -1221,8 +1221,17 @@ fn anomalous_speed(c: &MotionCommand) -> Option<Deviation> {
 }
 
 /// Streams events through a profile and collects deviations.
+///
+/// Participant identities (`Profile::participant_identities`): a
+/// participant whose prefix is not in `participants` but whose source IP and
+/// RTPS vendor (the prefix's first two bytes) match an identity is treated
+/// as profiled from then on, as the sensor does after a restart. This
+/// offline review does not enforce `max_instances` (events carry no lease
+/// or dispose); the sensor does.
 pub struct Checker<'p> {
     profile: &'p Profile,
+    /// `profile` plus the prefixes resolved to an identity so far.
+    working: Profile,
     report: CheckReport,
 }
 
@@ -1230,6 +1239,7 @@ impl<'p> Checker<'p> {
     pub fn new(profile: &'p Profile) -> Self {
         Self {
             profile,
+            working: profile.clone(),
             report: CheckReport {
                 model: profile.model.clone(),
                 profile_locked: profile.locked,
@@ -1238,9 +1248,30 @@ impl<'p> Checker<'p> {
         }
     }
 
+    fn resolve_identity(&mut self, event: &RobotEvent) {
+        let RobotEvent::Ros2ParticipantDiscovered(p) = event else {
+            return;
+        };
+        if self.working.participants.contains(&p.guid_prefix) || p.guid_prefix.len() != 24 {
+            return;
+        }
+        let ip = p.src_ip.parse::<std::net::IpAddr>().ok();
+        let matches = self.profile.participant_identities.values().any(|id| {
+            p.guid_prefix.get(..4) == Some(id.vendor.as_str())
+                && id
+                    .ips
+                    .iter()
+                    .any(|i| i.parse::<std::net::IpAddr>().ok() == ip && ip.is_some())
+        });
+        if matches {
+            self.working.participants.insert(p.guid_prefix.clone());
+        }
+    }
+
     pub fn observe(&mut self, source: &str, position: u64, event: &RobotEvent) {
         self.report.events += 1;
-        for deviation in check_event(self.profile, event) {
+        self.resolve_identity(event);
+        for deviation in check_event(&self.working, event) {
             self.report.deviations_total += 1;
             *self
                 .report

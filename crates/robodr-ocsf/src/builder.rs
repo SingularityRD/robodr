@@ -561,6 +561,12 @@ fn catalog_1_3_wave7(rule: &str) -> Option<RuleInfo> {
             GRAPH,
             &[T0848],
         ),
+        "robot.ros2.identity_instances_exceeded" => e(
+            "Extra DDS participant claims a robot identity",
+            "A participant matched a stable identity of the profile (source IP, DDS vendor, enclave) whose allowed instances are all held by live participants; it is not trusted.",
+            GRAPH,
+            &[T0848],
+        ),
         "robot.ros2.endpoint_source_mismatch" => e(
             "DDS endpoint announced from an unbound address",
             "An endpoint announcement for a participant came from an address not bound to it, or was relayed or GUID-conflicting from an untrusted address.",

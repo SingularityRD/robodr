@@ -313,6 +313,10 @@ struct VerdictNote<'a> {
 struct FirewallState {
     fw: Firewall,
     kinds: BTreeMap<String, ChannelKind>,
+    /// Participant prefix (24 hex) -> the profile identity it holds right
+    /// now ([`Agent::set_source_identities`]): a restarted writer with a
+    /// fresh GUID is matched against `identity:<name>` sources.
+    identities: BTreeMap<String, String>,
 }
 
 struct MonitorState {
@@ -456,6 +460,7 @@ impl Agent {
                 Some(FirewallState {
                     fw: Firewall::new(policy),
                     kinds,
+                    identities: BTreeMap::new(),
                 })
             }
         };
@@ -601,6 +606,15 @@ impl Agent {
     /// Whether findings are signed ([`Agent::with_finding_signer`]).
     pub fn signs_findings(&self) -> bool {
         self.finding_signer.is_some()
+    }
+
+    /// The participant identities currently held, prefix (24 hex) ->
+    /// identity name, as resolved by the sensor pipeline. Used by the Motion
+    /// Firewall for `identity:<name>` sources; replaces the previous map.
+    pub fn set_source_identities(&mut self, held: BTreeMap<String, String>) {
+        if let Some(fs) = self.firewall.as_mut() {
+            fs.identities = held;
+        }
     }
 
     pub fn stats(&self) -> AgentStats {
@@ -1378,6 +1392,7 @@ pub fn ocsf_safety(s: SafetyState) -> robodr_ocsf::SafetyState {
 fn to_firewall_command(fs: &FirewallState, c: &MotionCommand, now: u64) -> Command {
     // Exact endpoint GUID first; then its 24-hex-char participant prefix, so
     // a spec that lists a participant authorises that participant's writers.
+    // Last, the participant identity its prefix holds (`identity:<name>`).
     let source = c
         .source_guid
         .as_deref()
@@ -1385,6 +1400,13 @@ fn to_firewall_command(fs: &FirewallState, c: &MotionCommand, now: u64) -> Comma
             fs.fw
                 .source_id(g)
                 .or_else(|| g.get(..24).and_then(|p| fs.fw.source_id(p)))
+                .or_else(|| {
+                    let name = fs.identities.get(&g.get(..24)?.to_ascii_lowercase())?;
+                    fs.fw.source_id(&format!(
+                        "{}{name}",
+                        robodr_firewall::IDENTITY_SOURCE_PREFIX
+                    ))
+                })
         })
         .unwrap_or(SourceId::UNKNOWN);
     let channel = fs.fw.channel_id(&c.channel).unwrap_or(ChannelId(u16::MAX));

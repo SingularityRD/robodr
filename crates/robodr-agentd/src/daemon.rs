@@ -416,6 +416,8 @@ struct Daemon<'a> {
     notifier: Notifier,
     /// The live safety-state feed, if configured.
     feed: Option<SafetyFeed>,
+    /// Identity counters last handed to the agent / feed.
+    identity_seen: robodr_ros2_pipeline::IdentityStats,
     health: HealthMonitor,
     last_state: HealthState,
     stats: DaemonStats,
@@ -743,6 +745,7 @@ impl<'a> Daemon<'a> {
             inputs_gone: false,
             notifier,
             feed,
+            identity_seen: Default::default(),
             health,
             last_state: HealthState {
                 state: State::Unknown,
@@ -976,6 +979,7 @@ impl<'a> Daemon<'a> {
                     None => Vec::new(),
                 };
                 self.feed_findings(fed);
+                self.sync_identities();
                 self.sensor_findings(out.findings);
                 for s in out.motion {
                     self.motion_sample(s);
@@ -999,6 +1003,26 @@ impl<'a> Daemon<'a> {
                     self.emit(o);
                 }
             }
+        }
+    }
+
+    /// Hand the participant identities the pipeline resolved (fresh GUIDs
+    /// of restarted processes) to the Motion Firewall and the safety feed,
+    /// when they changed.
+    fn sync_identities(&mut self) {
+        let st = self.pipeline.stats().identity;
+        if st == self.identity_seen {
+            return;
+        }
+        self.identity_seen = st;
+        let held = self.pipeline.identity_holders();
+        self.agent.set_source_identities(
+            held.iter()
+                .map(|(p, n)| (robodr_rtps::hex12(p), n.clone()))
+                .collect(),
+        );
+        if let Some(f) = self.feed.as_mut() {
+            f.set_identities(held.into_iter().collect());
         }
     }
 
@@ -1490,6 +1514,7 @@ impl<'a> Daemon<'a> {
         // Staleness is noticed (and recorded) even on a quiet bus.
         self.safety();
         let mut found = self.pipeline.tick();
+        self.sync_identities();
         if let Some(h) = self.capture_health.latest() {
             found.extend(self.pipeline.capture_findings(&h));
         }

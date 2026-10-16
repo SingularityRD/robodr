@@ -243,9 +243,15 @@ fn signoff_lists_motion_writers_and_lock_requires_every_confirmation() {
     // Refused until every item is confirmed, one by one.
     let mut so = out.signoff.clone();
     so.operator = "op".into();
+    // Identity items are also floor requirements (RequiredItemMissing while
+    // unconfirmed): count the per-item refusals.
     for k in 0..so.items.len() {
         let why = lock(&out.profile, &so).unwrap_err();
-        assert_eq!(why.len(), so.items.len() - k, "{why:?}");
+        let unconfirmed = why
+            .iter()
+            .filter(|w| matches!(w, LockRefusal::Unconfirmed { .. }))
+            .count();
+        assert_eq!(unconfirmed, so.items.len() - k, "{why:?}");
         so.items[k].confirmed = true;
     }
     assert!(lock(&out.profile, &so).unwrap().locked);
