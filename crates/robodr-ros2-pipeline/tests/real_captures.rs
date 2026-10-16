@@ -24,13 +24,17 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn learn(vendor: &str) -> Profile {
+    learn_file(&format!("{vendor}_baseline.pcap"))
+}
+
+fn learn_file(file: &str) -> Profile {
     let cfg = LearnConfig {
         model: "lab-ugv".into(),
         ..LearnConfig::default()
     };
     let mut l = Learner::new(cfg).unwrap();
-    let path = fixture(&format!("{vendor}_baseline.pcap"));
-    l.ingest(&mut PcapSource::open(&path).unwrap()).unwrap();
+    l.ingest(&mut PcapSource::open(&fixture(file)).unwrap())
+        .unwrap();
     l.finish().profile
 }
 
@@ -201,5 +205,57 @@ fn without_identities_the_restarted_robot_is_unknown() {
             )),
             "{v}"
         );
+    }
+}
+
+#[test]
+fn several_processes_on_one_host_each_get_their_own_identity() {
+    // Run 2 starts the robot's three processes in reverse order: at SPDP
+    // time they take slots provisionally, node evidence puts each on the
+    // identity of its own node.
+    for v in VENDORS {
+        let profile = learn_file(&format!("{v}_multi_run1.pcap"));
+        let robot: BTreeSet<String> = profile
+            .participant_identities
+            .iter()
+            .filter(|(_, id)| id.ips.contains(ROBOT_IP))
+            .map(|(n, _)| n.clone())
+            .collect();
+        assert_eq!(
+            robot,
+            [
+                "add_two_ints_server",
+                "base_controller",
+                "fibonacci_action_server"
+            ]
+            .map(String::from)
+            .into(),
+            "{v}"
+        );
+        let nodes: std::collections::BTreeMap<String, BTreeSet<String>> = profile
+            .participant_identities
+            .iter()
+            .map(|(n, id)| (n.clone(), id.nodes.clone()))
+            .collect();
+        let (f, p) = replay(profile, &format!("{v}_multi_run2.pcap"));
+        assert_eq!(
+            notable(&f),
+            [(
+                rules::PARTICIPANT_REMOVED.to_string(),
+                TELEOP_IP.to_string()
+            )]
+            .into(),
+            "{v}: {f:#?}"
+        );
+        let held: BTreeSet<String> = p.identity_holders().into_iter().map(|(_, n)| n).collect();
+        assert_eq!(held, robot, "{v}: every robot process confirmed");
+        assert!(
+            p.stats().identity.moved >= 1,
+            "{v}: {:?}",
+            p.stats().identity
+        );
+        for (name, n) in &nodes {
+            assert_eq!(n, &[format!("/{name}")].into(), "{v}");
+        }
     }
 }
