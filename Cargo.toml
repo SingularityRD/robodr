@@ -84,6 +84,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 thiserror = "2"
+# Ed25519 for robodr-blackbox (audited; replaces the earlier in-crate code).
+# `fast` (precomputed basepoint tables), `std` and `zeroize` (signing key
+# wiped on drop) are its defaults, spelled out. No `rand_core`: seeds come
+# from getrandom(2) via robodr_blackbox::crypto::fill_random.
+ed25519-dalek = { version = "2.1", default-features = false, features = ["fast", "std", "zeroize"] }
+# SHA-512 (the same implementation ed25519-dalek uses internally).
+sha2 = "0.10"
 
 [profile.release]
 # Runs on a robot controller: favour small, predictable binaries.

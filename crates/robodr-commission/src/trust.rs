@@ -95,8 +95,9 @@
 //!
 //! # Limits (honest list)
 //!
-//! * The Ed25519 implementation is robodr-blackbox's std-only one: pinned
-//!   to RFC 8032 vectors but **not audited** (see that module's docs).
+//! * The Ed25519 implementation is robodr-blackbox's wrapper over the
+//!   audited `ed25519-dalek` crate (see that module's docs); keys are files,
+//!   not TPM-held.
 //! * The state file is plain JSON on the unit. Deleting or rewriting it is
 //!   now **detected** through the black-box record, not prevented: root can
 //!   also delete the black box (detectable off-unit through the export

@@ -87,8 +87,8 @@
 //! and the signatures of its first and last record and of every
 //! `SegmentDropped`, `Recovery` and `KeyRotation` record in it (all
 //! signatures with [`RecorderConfig::verify_closed_signatures`]; off by
-//! default because the in-crate Ed25519 verifies about 1 ms per record, so
-//! a full 64 MiB store would take minutes).
+//! default to bound start-up time on large stores; `ed25519-dalek`
+//! verifies in about 25 µs per record on x86-64 in release builds).
 //!
 //! A closed segment that fails is **quarantined** and the recorder keeps
 //! recording: its bytes are copied to `quarantine/damaged-seg<idx>.rbb`

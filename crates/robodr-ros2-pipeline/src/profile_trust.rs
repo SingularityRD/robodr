@@ -56,7 +56,7 @@
 //!   have only the state file and the signed floor.
 //! * Drafts (unlocked) need no signature: they are observe-only anyway.
 //!
-//! Limits: see `robodr_commission::trust` (unaudited Ed25519, a root who
+//! Limits: see `robodr_commission::trust` (file-held keys, a root who
 //! deletes both state and black box leaves only the signed floor, trust
 //! files can be replayed, no expiry).
 

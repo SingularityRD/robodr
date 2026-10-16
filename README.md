@@ -65,8 +65,8 @@ crates/
                           telemetry, uncommanded motion, GNSS vs odom vs IMU). Pure.
   robodr-responder/       Cyber-Jidoka response *planner*: graded, safety-state-aware
                           plans; executes nothing, never overrides the safety system.
-  robodr-blackbox/        Signed (Ed25519 by default, unaudited std-only
-                          implementation; legacy HMAC-SHA256 warned),
+  robodr-blackbox/        Signed (Ed25519 by default, via the audited
+                          ed25519-dalek crate; legacy HMAC-SHA256 warned),
                           hash-chained evidence recorder with append-only
                           segments and export bundles. Owns the one key file
                           format (robodr-blackbox-key/v2 secret + .pub) also
@@ -185,8 +185,8 @@ module, no robot):
   `participant_ips`).
 - Evidence (black box, diode bundles) and profiles are signed with Ed25519
   key files (`robodr-blackbox-key/v2`; HMAC still loads, with a warning). The
-  Ed25519 code is RoboDR's own std-only implementation, checked against RFC
-  8032 vectors but not audited, and keys are files, not TPM-held;
+  Ed25519 arithmetic is the audited `ed25519-dalek` crate (strict
+  verification, pinned to the RFC 8032 vectors), but keys are files, not TPM-held;
   anti-rollback state is a plain file.
 
 ## Build

@@ -175,6 +175,22 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Changed
 
+- **Security (`robodr-blackbox`)**: Ed25519 now uses the audited
+  `ed25519-dalek` 2.x crate (`curve25519-dalek` 4, `zeroize`; SHA-512 from
+  RustCrypto `sha2` 0.10) instead of the hand-written, unaudited field /
+  curve / scalar / SHA-512 code, which is deleted. `sign_ed25519` keeps its
+  public API as thin wrappers, so key files (`robodr-blackbox-key/v2` and
+  `.pub`), derived key ids (`ed25519:<16 hex>`), the 64-byte `R || S`
+  signature layout and the strict verification rules (`verify_strict`:
+  canonical `S`, no small-order `A` / `R`, cofactorless; plus a
+  canonical-encoding check on public keys) are unchanged, and the RFC 8032,
+  OpenSSL cross-check and rev4 regression vectors still pass. Seeds still
+  come from `getrandom(2)` (no `rand_core`). Verification is about 50x
+  faster (about 25 µs instead of about 1.3 ms in release on x86-64).
+  `sign_ed25519::Sha512::new` is no longer a `const fn`. New dependencies
+  (BSD-3-Clause / MIT OR Apache-2.0) are allowed by `deny.toml`; all build
+  on the 1.87 MSRV.
+
 - **Breaking (`robodr-commission lock`)**: `--operators operators.json` is
   required; every sign-off must carry valid operator signatures
   (`<signoff>.sig`), and motion items need `motion_quorum` distinct

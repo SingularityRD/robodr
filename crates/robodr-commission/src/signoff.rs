@@ -112,8 +112,8 @@
 //! * Limits: a careless or colluding operator (or, with a quorum, colluding
 //!   operators) can still confirm anything; the signature makes that a
 //!   named, non-repudiable decision, not a correct one. Ed25519 is
-//!   robodr-blackbox's std-only implementation (RFC 8032 vectors, not
-//!   audited). No key expiry or revocation list: revoke by removing the key
+//!   robodr-blackbox's wrapper over the audited `ed25519-dalek` crate. No
+//!   key expiry or revocation list: revoke by removing the key
 //!   from the trust list.
 
 use crate::to_json;

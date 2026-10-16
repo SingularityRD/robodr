@@ -13,8 +13,8 @@
 //!   `std::hint::black_box`, which is best-effort, not a guarantee.
 //! - Key material is wiped with volatile writes followed by a compiler fence
 //!   ([`wipe`]); the hashers wipe their chaining state, buffered input and
-//!   message schedule on drop, so an HMAC key (or an Ed25519 seed fed to
-//!   SHA-512) does not linger in a dropped hasher. This is still best
+//!   message schedule on drop, so an HMAC key does not linger in a dropped
+//!   hasher (Ed25519 and its SHA-512 come from `ed25519-dalek` / `sha2`). This is still best
 //!   effort: copies the compiler makes in registers or spilled stack slots,
 //!   and pages swapped out before the wipe, are not covered.
 //! - [`fill_random`] reads the kernel CSPRNG with `getrandom(2)` (blocking
@@ -25,7 +25,7 @@
 //! HMAC is a **placeholder authenticity mechanism**: anyone who holds the key
 //! can both create and verify tags, so it only proves "written by a holder of
 //! the shared key". Production deployments must sign with an asymmetric key
-//! (Ed25519 from an audited crate, or TPM-backed ECDSA) through the
+//! (Ed25519 via `crate::sign_ed25519`, or TPM-backed ECDSA) through the
 //! [`crate::sign::Signer`] / [`crate::sign::Verifier`] traits.
 
 /// SHA-256 round constants (FIPS 180-4 §4.2.2).

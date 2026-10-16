@@ -200,5 +200,6 @@ first_seen_time, last_seen_time, analytic, data_sources}`, `analytic.type_id`
   script detection (no Unicode tables offline).
 * Diode export/import lives in `crates/robodr-diode`; it does not yet carry
   per-finding signatures (contract §8, integrator TODO).
-* Ed25519 comes from `robodr-blackbox`'s in-crate RFC 8032 implementation
-  (vector-tested, not audited); not tested against an external verifier.
+* Ed25519 comes from `robodr-blackbox` (a wrapper over the audited
+  `ed25519-dalek` crate, vector-tested); finding signatures were not tested
+  against an external verifier.
