@@ -1460,8 +1460,8 @@
  },
  {
   "rule": "RoboDR: ROS 2 process loaded a library from outside the allowlisted library paths",
-  "note": "REVIEW PoC: preload lib without .so",
-  "expect": true,
+  "note": "RE-REVIEW: plain read of a non-.so name is no longer a name match (launch params/bags/weights); same hook is caught by content (ElfOpened fixtures) -- was: REVIEW PoC: preload lib without .so",
+  "expect": false,
   "event": {
    "header": {
     "image": "/opt/ros/humble/lib/talker"
@@ -1767,8 +1767,8 @@
  },
  {
   "rule": "RoboDR: ROS 2 process loaded a library from outside the allowlisted library paths",
-  "note": "hook in /tmp without .so",
-  "expect": true,
+  "note": "RE-REVIEW: plain read of a non-.so name is no longer a name match (launch params/bags/weights); same hook is caught by content (ElfOpened fixtures) -- was: hook in /tmp without .so",
+  "expect": false,
   "event": {
    "header": {
     "image": "/usr/bin/python3.10"
@@ -2198,9 +2198,11 @@
    },
    "payload": {
     "filename": "/proc/self/fd/7",
-    "argc": 1,
+    "argc": 3,
     "argv": [
-     "/usr/lib/systemd/systemd-executor"
+     "/usr/lib/systemd/systemd-executor",
+     "--deserialize",
+     "4"
     ]
    }
   }
@@ -2441,8 +2443,8 @@
  },
  {
   "rule": "RoboDR: ROS 2 process loaded a library from outside the allowlisted library paths",
-  "note": "any-name hook in /var/crash",
-  "expect": true,
+  "note": "RE-REVIEW: plain read of a non-.so name is no longer a name match (launch params/bags/weights); same hook is caught by content (ElfOpened fixtures) -- was: any-name hook in /var/crash",
+  "expect": false,
   "event": {
    "header": {
     "image": "/opt/ros/humble/lib/x/node"
@@ -2867,6 +2869,1496 @@
     "argv": [
      "kworker",
      "-i"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process loaded a library from outside the allowlisted library paths",
+  "note": "ros2 launch: node reads /tmp/launch_params_* (--params-file)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/rclcpp_components/component_container"
+   },
+   "payload": {
+    "filename": "/tmp/launch_params_k2j3h4",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process loaded a library from outside the allowlisted library paths",
+  "note": "ros2 bag play from /tmp",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/bin/ros2"
+   },
+   "payload": {
+    "filename": "/tmp/bag_2026/bag_0.mcap",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process loaded a library from outside the allowlisted library paths",
+  "note": "torch weights ~/.cache/torch/hub/checkpoints/*.pth",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/opt/robot_ws/install/perception/lib/perception/detector"
+   },
+   "payload": {
+    "filename": "/home/robot/.cache/torch/hub/checkpoints/resnet50-0676ba61.pth",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process loaded a library from outside the allowlisted library paths",
+  "note": "LD_PRELOAD hook named *.so in /tmp still matches by name",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/x/node"
+   },
+   "payload": {
+    "filename": "/tmp/.x/h.so",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process mapped an ELF from outside the allowlisted paths",
+  "note": "REVIEW PoC by content: preload ELF without .so in ~/.cache",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/talker"
+   },
+   "payload": {
+    "filename": "/home/robot/.cache/hook",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process mapped an ELF from outside the allowlisted paths",
+  "note": "by content: ELF hook /tmp/.x/h in python3 node",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.10"
+   },
+   "payload": {
+    "filename": "/tmp/.x/h",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process mapped an ELF from outside the allowlisted paths",
+  "note": "by content: ELF hook in /var/crash",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/x/node"
+   },
+   "payload": {
+    "filename": "/var/crash/h",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ELF opened from a world-writable or user cache directory",
+  "note": "by content: ELF hook /var/crash/h (any process)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/x/node"
+   },
+   "payload": {
+    "filename": "/var/crash/h",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process imported Python code from outside the allowlisted paths",
+  "note": "torch weights *.pth outside site-packages are data",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.10"
+   },
+   "payload": {
+    "filename": "/home/robot/.cache/torch/hub/checkpoints/resnet50-0676ba61.pth",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process imported Python code from outside the allowlisted paths",
+  "note": ".pth in user site-packages runs code at interpreter start",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.10"
+   },
+   "payload": {
+    "filename": "/home/robot/.local/lib/python3.10/site-packages/zz.pth",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process imported Python code from outside the allowlisted paths",
+  "note": ".pth in a PYTHONHOME dist-packages",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/bin/ros2"
+   },
+   "payload": {
+    "filename": "/var/tmp/ph/lib/python3/dist-packages/x.pth",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process imported Python code from outside the allowlisted paths",
+  "note": "PYTHONSTARTUP=*.py read by trusted image",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/bin/ros2"
+   },
+   "payload": {
+    "filename": "/home/robot/.s.py",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Kernel module file written outside the package manager",
+  "note": "update-initramfs: cp copies .ko into staging (root)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp",
+    "uid": 0
+   },
+   "payload": {
+    "filename": "/var/tmp/mkinitramfs_Ab12Cd/usr/lib/modules/6.8.0-45-generic/kernel/drivers/net/e1000e.ko"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Kernel module file written outside the package manager",
+  "note": "cp into a mkinitramfs_ path as non-root is NOT excluded",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp",
+    "uid": 1000
+   },
+   "payload": {
+    "filename": "/var/tmp/mkinitramfs_Ab12Cd/rk.ko"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Kernel module file written outside the package manager",
+  "note": "other tool writing .ko into the staging path is NOT excluded",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/curl",
+    "uid": 0
+   },
+   "payload": {
+    "filename": "/var/tmp/mkinitramfs_Ab12Cd/rk.ko"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Kernel module file written outside the package manager",
+  "note": "cp writing .ko elsewhere in /var/tmp is NOT excluded",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp",
+    "uid": 0
+   },
+   "payload": {
+    "filename": "/var/tmp/x/rk.ko"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ELF opened from a world-writable or user cache directory",
+  "note": "update-initramfs: depmod -b reads staged .ko",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/sbin/depmod",
+    "uid": 0
+   },
+   "payload": {
+    "filename": "/var/tmp/mkinitramfs_Ab12Cd/usr/lib/modules/6.8.0-45-generic/kernel/drivers/net/e1000e.ko",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ELF opened from a world-writable or user cache directory",
+  "note": "update-initramfs: cpio packs staged ELF",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cpio",
+    "uid": 0
+   },
+   "payload": {
+    "filename": "/var/tmp/mkinitramfs_Ab12Cd/usr/bin/busybox",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ELF opened from a world-writable or user cache directory",
+  "note": "assembler writes /tmp/cc*.o (write open, async ELF check)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/x86_64-linux-gnu-as"
+   },
+   "payload": {
+    "filename": "/tmp/ccAbCd.o",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ELF opened from a world-writable or user cache directory",
+  "note": "cp writes ELF into staging (write open)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp",
+    "uid": 0
+   },
+   "payload": {
+    "filename": "/var/tmp/mkinitramfs_Ab12Cd/usr/lib/x86_64-linux-gnu/libc.so.6",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ELF opened from a world-writable or user cache directory",
+  "note": "cp READING an ELF from the staging path is NOT excluded",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp",
+    "uid": 0
+   },
+   "payload": {
+    "filename": "/var/tmp/mkinitramfs_Ab12Cd/x",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ELF opened from a world-writable or user cache directory",
+  "note": "ld.so loading an implant from /tmp (read-only)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/lib64/ld-linux-x86-64.so.2"
+   },
+   "payload": {
+    "filename": "/tmp/impl",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shared library opened from a temporary directory",
+  "note": "update-initramfs: ldconfig -r reads staged libs",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/sbin/ldconfig.real",
+    "uid": 0
+   },
+   "payload": {
+    "filename": "/var/tmp/mkinitramfs_Ab12Cd/usr/lib/x86_64-linux-gnu/libz.so.1",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shared library opened from a temporary directory",
+  "note": "update-initramfs: cp writes libc into staging",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp",
+    "uid": 0
+   },
+   "payload": {
+    "filename": "/var/tmp/mkinitramfs_Ab12Cd/usr/lib/x86_64-linux-gnu/libc.so.6",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shared library opened from a temporary directory",
+  "note": "ldconfig image as non-root reading .so in staging path is NOT excluded",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/sbin/ldconfig.real",
+    "uid": 1000
+   },
+   "payload": {
+    "filename": "/var/tmp/mkinitramfs_Ab12Cd/h.so",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shared library opened from a temporary directory",
+  "note": "python loads a .so from /var/tmp/mkinitramfs_x (not an excluded image)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3",
+    "uid": 0
+   },
+   "payload": {
+    "filename": "/var/tmp/mkinitramfs_Ab12Cd/h.so",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shared library written into a system library path outside the package manager",
+  "note": "depmod writes modules.dep.tmp during kernel upgrade",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/sbin/depmod"
+   },
+   "payload": {
+    "filename": "/usr/lib/modules/6.8.0-45-generic/modules.dep.tmp"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shared library written into a system library path outside the package manager",
+  "note": "depmod image writing elsewhere in /usr/lib is NOT excluded",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/sbin/depmod"
+   },
+   "payload": {
+    "filename": "/usr/lib/x86_64-linux-gnu/libz.so.1"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shared library written into a system library path outside the package manager",
+  "note": "KNOWN NOISE: py3compile worker writes .pyc in dist-packages (forged .pyc is a hook)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.12"
+   },
+   "payload": {
+    "filename": "/usr/lib/python3/dist-packages/yaml/__pycache__/x.cpython-312.pyc.123"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File moved into a system library path or linker configuration outside the package manager",
+  "note": "depmod renames modules.dep.tmp -> modules.dep",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/sbin/depmod"
+   },
+   "payload": {
+    "source": "/usr/lib/modules/6.8.0-45-generic/modules.dep.tmp",
+    "destination": "/usr/lib/modules/6.8.0-45-generic/modules.dep"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File moved into a system library path or linker configuration outside the package manager",
+  "note": "depmod image renaming a .so into /usr/lib is NOT excluded",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/sbin/depmod"
+   },
+   "payload": {
+    "source": "/tmp/h",
+    "destination": "/usr/lib/x86_64-linux-gnu/libz.so.1"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in a system library path or linker configuration outside the package manager",
+  "note": "symlink planted into /usr/lib",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/usr/lib/x86_64-linux-gnu/libpwn.so",
+    "destination": "/home/robot/.x/h.so",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in a system library path or linker configuration outside the package manager",
+  "note": "O_TMPFILE + linkat into /usr/lib",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/home/robot/x"
+   },
+   "payload": {
+    "source": "/usr/lib/x86_64-linux-gnu/libpwn.so",
+    "destination": "/usr/lib/x86_64-linux-gnu/#4711",
+    "hard_link": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in a system library path or linker configuration outside the package manager",
+  "note": "symlink /etc/ld.so.conf.d/x.conf",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/home/robot/x"
+   },
+   "payload": {
+    "source": "/etc/ld.so.conf.d/x.conf",
+    "destination": "/home/robot/l.conf",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in a system library path or linker configuration outside the package manager",
+  "note": "ldconfig soname symlink (relative, same dir)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/sbin/ldconfig.real"
+   },
+   "payload": {
+    "source": "/usr/lib/x86_64-linux-gnu/libfoo.so.1",
+    "destination": "libfoo.so.1.2.3",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in a system library path or linker configuration outside the package manager",
+  "note": "ldconfig image making an absolute symlink is NOT excluded",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/sbin/ldconfig.real"
+   },
+   "payload": {
+    "source": "/usr/lib/x86_64-linux-gnu/libfoo.so.1",
+    "destination": "/home/x/h.so",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in a system library path or linker configuration outside the package manager",
+  "note": "ldconfig image making a HARD link is NOT excluded",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/sbin/ldconfig.real"
+   },
+   "payload": {
+    "source": "/usr/lib/x86_64-linux-gnu/libfoo.so.1",
+    "destination": "libfoo.so.1.2.3",
+    "hard_link": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in a system library path or linker configuration outside the package manager",
+  "note": "ldconfig image linking into ld.so.conf.d is NOT excluded",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/sbin/ldconfig.real"
+   },
+   "payload": {
+    "source": "/etc/ld.so.conf.d/x.conf",
+    "destination": "x",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in a system library path or linker configuration outside the package manager",
+  "note": "dpkg unpacks a symlink",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "source": "/usr/lib/x86_64-linux-gnu/libfoo.so.dpkg-new",
+    "destination": "libfoo.so.1",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Existing file in a system library path opened for writing outside the package manager",
+  "note": "cp over an existing library (O_WRONLY|O_TRUNC, no O_CREAT)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/usr/lib/x86_64-linux-gnu/libz.so.1.3",
+    "flags": [
+     "O_WRONLY",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Existing file in a system library path opened for writing outside the package manager",
+  "note": "O_TMPFILE in /usr/lib",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/home/robot/x"
+   },
+   "payload": {
+    "filename": "/usr/lib/x86_64-linux-gnu/#4711",
+    "flags": [
+     "O_RDWR",
+     "O_DIRECTORY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Existing file in a system library path opened for writing outside the package manager",
+  "note": "new file (O_CREAT) is the FileCreated rule's job",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.12"
+   },
+   "payload": {
+    "filename": "/usr/lib/python3/dist-packages/x/__pycache__/a.pyc.1",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_EXCL"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Existing file in a system library path opened for writing outside the package manager",
+  "note": "read-only open of a library",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/x/node"
+   },
+   "payload": {
+    "filename": "/usr/lib/x86_64-linux-gnu/libz.so.1",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Kernel module file or autoload configuration linked into place outside the package manager",
+  "note": "hardlink staged rk.bin to /lib/modules/.../rk.ko",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/usr/lib/modules/6.8.0-45-generic/extra/rk.ko",
+    "destination": "/var/lib/x/rk.bin",
+    "hard_link": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Kernel module file or autoload configuration linked into place outside the package manager",
+  "note": "O_TMPFILE+linkat .ko",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/home/robot/x"
+   },
+   "payload": {
+    "source": "/usr/lib/modules/6.8.0-45-generic/extra/rk.ko",
+    "destination": "/usr/lib/modules/6.8.0-45-generic/extra/#1234",
+    "hard_link": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Kernel module file or autoload configuration linked into place outside the package manager",
+  "note": "symlink /etc/modules-load.d/x.conf",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/home/robot/x"
+   },
+   "payload": {
+    "source": "/etc/modules-load.d/x.conf",
+    "destination": "/home/robot/m.conf",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Kernel module file or autoload configuration linked into place outside the package manager",
+  "note": "symlink /etc/modprobe.d/x.conf",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/home/robot/x"
+   },
+   "payload": {
+    "source": "/etc/modprobe.d/x.conf",
+    "destination": "/home/robot/m.conf",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Kernel module file or autoload configuration linked into place outside the package manager",
+  "note": "dpkg links a module",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "source": "/usr/lib/modules/6.8.0-45-generic/kernel/x.ko",
+    "destination": "x.ko.zst",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Kernel module file or autoload configuration linked into place outside the package manager",
+  "note": "unrelated symlink",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/update-alternatives"
+   },
+   "payload": {
+    "source": "/etc/alternatives/x",
+    "destination": "/usr/bin/y",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Wireless network configuration moved into or out of place",
+  "note": "netplan via rename (atomic mv)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/home/robot/x.yaml",
+    "destination": "/etc/netplan/99-evil.yaml"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Wireless network configuration moved into or out of place",
+  "note": "NetworkManager connection via rename",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/home/robot/x",
+    "destination": "/etc/NetworkManager/system-connections/evil.nmconnection"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Wireless network configuration moved into or out of place",
+  "note": "moved out of /etc/wpa_supplicant",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/etc/wpa_supplicant/wpa_supplicant.conf",
+    "destination": "/tmp/w"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Wireless network configuration moved into or out of place",
+  "note": "unrelated rename",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/etc/hosts.tmp",
+    "destination": "/etc/hosts"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in a wireless network configuration directory",
+  "note": "wpa_supplicant via symlink",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/etc/wpa_supplicant/wpa_supplicant.conf",
+    "destination": "/home/robot/w.conf",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in a wireless network configuration directory",
+  "note": "hostapd via hard link",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/etc/hostapd/hostapd.conf",
+    "destination": "/home/robot/h.conf",
+    "hard_link": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in a wireless network configuration directory",
+  "note": "link elsewhere",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/home/robot/w.conf",
+    "destination": "/etc/wpa_supplicant/wpa_supplicant.conf",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created inside an SROS 2 enclave directory",
+  "note": "symlink permissions.p7s to attacker file",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/opt/robot_keystore/enclaves/talker/permissions.p7s",
+    "destination": "/home/x/p.p7s",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created inside an SROS 2 enclave directory",
+  "note": "link elsewhere",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/home/robot/a",
+    "destination": "/home/robot/b",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File or device node created in the RoboDR or Pulsar configuration",
+  "note": "mknod FIFO /etc/pulsar/rules/zz.toml",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mknod"
+   },
+   "payload": {
+    "filename": "/etc/pulsar/rules/zz.toml"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File or device node created in the RoboDR or Pulsar configuration",
+  "note": "new file in /etc/robodr",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/etc/robodr/profile.json.new"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File or device node created in the RoboDR or Pulsar configuration",
+  "note": "file created elsewhere",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/etc/pulsar.bak"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in or to the RoboDR or Pulsar configuration",
+  "note": "symlink /etc/pulsar/rules/zz.toml -> /dev/null",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/etc/pulsar/rules/zz.toml",
+    "destination": "/dev/null",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in or to the RoboDR or Pulsar configuration",
+  "note": "hardlink a rule file in from elsewhere",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/etc/pulsar/rules/zz.toml",
+    "destination": "/home/robot/zz.toml",
+    "hard_link": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in or to the RoboDR or Pulsar configuration",
+  "note": "hard link alias of a rule file created outside",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/home/robot/alias.toml",
+    "destination": "/etc/pulsar/rules/robodr/ros2_stack.toml",
+    "hard_link": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in or to the RoboDR or Pulsar configuration",
+  "note": "symlink outside pointing INTO /etc/pulsar (writes resolve to the real path; not matched)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/home/robot/p",
+    "destination": "/etc/pulsar/pulsar.ini",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Pseudo-terminal wrapper executed on robot controller",
+  "note": "PYTHONINSPECT=1 script -qc /opt/ros/humble/bin/ros2 /dev/null",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/script",
+    "argc": 4,
+    "argv": [
+     "script",
+     "-qc",
+     "/opt/ros/humble/bin/ros2",
+     "/dev/null"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Pseudo-terminal wrapper executed on robot controller",
+  "note": "expect",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/expect",
+    "argc": 3,
+    "argv": [
+     "expect",
+     "-f",
+     "x.exp"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Pseudo-terminal wrapper executed on robot controller",
+  "note": "unbuffer",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/unbuffer",
+    "argc": 2,
+    "argv": [
+     "unbuffer",
+     "/opt/ros/humble/bin/ros2"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Pseudo-terminal wrapper executed on robot controller",
+  "note": "ROS package executable named script",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/opt/robot_ws/install/tools/lib/tools/script",
+    "argc": 1,
+    "argv": [
+     "script"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Pseudo-terminal wrapper executed on robot controller",
+  "note": "unrelated binary",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/scriptreplay",
+    "argc": 1,
+    "argv": [
+     "scriptreplay"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interactive or stdin-fed Python interpreter started",
+  "note": "python3 -i",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3",
+    "argc": 2,
+    "argv": [
+     "python3",
+     "-i"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interactive or stdin-fed Python interpreter started",
+  "note": "bare python3 (REPL or code on stdin)",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3.12",
+    "argc": 1,
+    "argv": [
+     "python3"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interactive or stdin-fed Python interpreter started",
+  "note": "python3 - (program from stdin)",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3",
+    "argc": 2,
+    "argv": [
+     "python3",
+     "-"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interactive or stdin-fed Python interpreter started",
+  "note": "python3 -iu x.py",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3",
+    "argc": 3,
+    "argv": [
+     "python3",
+     "-iu",
+     "x.py"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interactive or stdin-fed Python interpreter started",
+  "note": "py3compile worker: python3.12 -m py_compile -",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3.12",
+    "argc": 4,
+    "argv": [
+     "/usr/bin/python3.12",
+     "-m",
+     "py_compile",
+     "-"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interactive or stdin-fed Python interpreter started",
+  "note": "python3 script.py",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3",
+    "argc": 2,
+    "argv": [
+     "python3",
+     "/opt/robot_ws/install/x/lib/x/node"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interactive or stdin-fed Python interpreter started",
+  "note": "KNOWN GAP: stdin program disguised with -m py_compile elements",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3",
+    "argc": 4,
+    "argv": [
+     "python3",
+     "-",
+     "-m",
+     "py_compile"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Login shell started on robot controller",
+  "note": "sshd login shell -bash",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/bash",
+    "argc": 1,
+    "argv": [
+     "-bash"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Login shell started on robot controller",
+  "note": "sudo -i / su - (-sh)",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/bin/sh",
+    "argc": 1,
+    "argv": [
+     "-sh"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Login shell started on robot controller",
+  "note": "bash --login",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/bin/bash",
+    "argc": 2,
+    "argv": [
+     "bash",
+     "--login"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Login shell started on robot controller",
+  "note": "sh -c from system()",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/bin/sh",
+    "argc": 3,
+    "argv": [
+     "sh",
+     "-c",
+     "true"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Login shell started on robot controller",
+  "note": "KNOWN GAP: ssh -t host cmd runs bash -c with a pty, no login shell",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/bin/bash",
+    "argc": 3,
+    "argv": [
+     "bash",
+     "-c",
+     "PYTHONINSPECT=1 ros2 topic list"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program executed from a file descriptor or /proc path",
+  "note": "systemd-executor under the commissioned user's manager (uid 1000)",
+  "expect": false,
+  "event": {
+   "header": {
+    "parent_pid": 1234,
+    "uid": 1000
+   },
+   "payload": {
+    "filename": "/proc/self/fd/3",
+    "argc": 5,
+    "argv": [
+     "/usr/lib/systemd/systemd-executor",
+     "--deserialize",
+     "4",
+     "--log-level",
+     "info"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program executed from a file descriptor or /proc path",
+  "note": "executor argv mimicked by another uid (e.g. a daemon account)",
+  "expect": true,
+  "event": {
+   "header": {
+    "parent_pid": 1234,
+    "uid": 33
+   },
+   "payload": {
+    "filename": "/proc/self/fd/3",
+    "argc": 3,
+    "argv": [
+     "/usr/lib/systemd/systemd-executor",
+     "--deserialize",
+     "4"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program executed from a file descriptor or /proc path",
+  "note": "root user manager (user@0, parent not PID 1) fires",
+  "expect": true,
+  "event": {
+   "header": {
+    "parent_pid": 777,
+    "uid": 0
+   },
+   "payload": {
+    "filename": "/proc/self/fd/3",
+    "argc": 3,
+    "argv": [
+     "/usr/lib/systemd/systemd-executor",
+     "--deserialize",
+     "4"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program executed from a file descriptor or /proc path",
+  "note": "executor argv without --deserialize is NOT excluded",
+  "expect": true,
+  "event": {
+   "header": {
+    "parent_pid": 1234,
+    "uid": 1000
+   },
+   "payload": {
+    "filename": "/proc/self/fd/3",
+    "argc": 1,
+    "argv": [
+     "/usr/lib/systemd/systemd-executor"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program executed from a file descriptor or /proc path",
+  "note": "KNOWN GAP: code running as uid 1000 mimics the user executor (fexecve + copied argv)",
+  "expect": false,
+  "event": {
+   "header": {
+    "parent_pid": 4321,
+    "uid": 1000
+   },
+   "payload": {
+    "filename": "/proc/self/fd/9",
+    "argc": 3,
+    "argv": [
+     "/usr/lib/systemd/systemd-executor",
+     "--deserialize",
+     "1"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interpreter one-liner executed",
+  "note": "perl -we",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/perl",
+    "argc": 3,
+    "argv": [
+     "perl",
+     "-we",
+     "x"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interpreter one-liner executed",
+  "note": "perl -wle",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/perl",
+    "argc": 3,
+    "argv": [
+     "perl",
+     "-wle",
+     "x"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interpreter one-liner executed",
+  "note": "perl -lane",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/perl",
+    "argc": 3,
+    "argv": [
+     "perl",
+     "-lane",
+     "x"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interpreter one-liner executed",
+  "note": "python3 -OOc",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3",
+    "argc": 3,
+    "argv": [
+     "python3",
+     "-OOc",
+     "x"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interpreter one-liner executed",
+  "note": "KNOWN GAP: glued python3 -cimport (argv CONTAINS is whole-element)",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3",
+    "argc": 2,
+    "argv": [
+     "python3",
+     "-cimport pty;pty.spawn('/bin/sh')"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interpreter one-liner executed",
+  "note": "KNOWN FP: CMake FindPython probe during colcon build",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3.12",
+    "argc": 3,
+    "argv": [
+     "/usr/bin/python3.12",
+     "-c",
+     "import sys; sys.stdout.write(sys.abiflags)"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interpreter one-liner executed",
+  "note": "perl script with -w",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/perl",
+    "argc": 3,
+    "argv": [
+     "perl",
+     "-w",
+     "/usr/sbin/needrestart"
     ]
    }
   }

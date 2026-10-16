@@ -1,0 +1,2007 @@
+{
+ "_doc": [
+  "Benign event corpus for scripts/validate_rules.py (--benign). EVERY RoboDR rule of the event's type is evaluated",
+  "against every event; any hit that is not in the event's 'allow' list fails CI, and so does an 'allow' entry",
+  "that no longer fires. 'allow' is only for maintenance actions whose alert is the audit trail, or for",
+  "documented, accepted noise; each needs a 'reason'. Header fields default to image '', pid 1000,",
+  "parent_pid 1, uid 0, gid 0, container null. Events are modelled on the exec/open sequences of the named",
+  "tools (launch_ros, rosbag2, CMake 3.28 FindPython, gcc, initramfs-tools mkinitramfs, kmod depmod,",
+  "glibc ldconfig, dh-python py3compile, systemd >= 255); they are NOT captures from a running pulsard.",
+  "Generated once; edit the JSON directly."
+ ],
+ "scenarios": [
+  {
+   "scenario": "ros2 launch (C++ components, workspace C++ and rclpy nodes, dict params, SROS 2)",
+   "events": [
+    {
+     "note": "ros2 launch (console script, shebang python3)",
+     "type": "Exec",
+     "header": {
+      "image": "/opt/ros/humble/bin/ros2",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/opt/ros/humble/bin/ros2",
+      "argc": 5,
+      "argv": [
+       "/usr/bin/python3",
+       "/opt/ros/humble/bin/ros2",
+       "launch",
+       "robot_bringup",
+       "bringup.launch.py"
+      ]
+     }
+    },
+    {
+     "note": "launch file read",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/ros/humble/bin/ros2",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/opt/robot_ws/install/robot_bringup/share/robot_bringup/launch/bringup.launch.py",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "launch package import",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/ros/humble/bin/ros2",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/opt/ros/humble/lib/python3.10/site-packages/launch/__init__.py",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "launch_ros bytecode",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/ros/humble/bin/ros2",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/opt/ros/humble/lib/python3.10/site-packages/launch_ros/__pycache__/__init__.cpython-310.pyc",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "system dist-packages import",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/ros/humble/bin/ros2",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/usr/lib/python3/dist-packages/yaml/__init__.py",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "stdlib bytecode",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/ros/humble/bin/ros2",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/usr/lib/python3.10/encodings/__pycache__/utf_8.cpython-310.pyc",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "site .pth in system dist-packages",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/ros/humble/bin/ros2",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/usr/lib/python3/dist-packages/distutils-precedence.pth",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "C extension from dist-packages",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/ros/humble/bin/ros2",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/usr/lib/python3/dist-packages/_yaml.cpython-310-x86_64-linux-gnu.so",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "launch_ros writes dict params to a NamedTemporaryFile",
+     "type": "FileCreated",
+     "header": {
+      "image": "/opt/ros/humble/bin/ros2",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/tmp/launch_params_k2j3h4"
+     }
+    },
+    {
+     "note": "launch_ros param temp file (write)",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/ros/humble/bin/ros2",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/tmp/launch_params_k2j3h4",
+      "flags": [
+       "O_RDWR",
+       "O_CREAT",
+       "O_EXCL"
+      ]
+     }
+    },
+    {
+     "note": "launch log",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/ros/humble/bin/ros2",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/home/robot/.ros/log/2026-10-16-12-00-00-000000-robot-1234/launch.log",
+      "flags": [
+       "O_WRONLY",
+       "O_CREAT",
+       "O_APPEND"
+      ]
+     }
+    },
+    {
+     "note": "component container started with --params-file",
+     "type": "Exec",
+     "header": {
+      "image": "/opt/ros/humble/lib/rclcpp_components/component_container",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/opt/ros/humble/lib/rclcpp_components/component_container",
+      "argc": 6,
+      "argv": [
+       "/opt/ros/humble/lib/rclcpp_components/component_container",
+       "--ros-args",
+       "-r",
+       "__node:=camera_container",
+       "--params-file",
+       "/tmp/launch_params_k2j3h4"
+      ]
+     }
+    },
+    {
+     "note": "loader cache",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/ros/humble/lib/rclcpp_components/component_container",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/etc/ld.so.cache",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "ROS library",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/ros/humble/lib/rclcpp_components/component_container",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/opt/ros/humble/lib/librclcpp.so",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "ROS library (elf_check)",
+     "type": "ElfOpened",
+     "header": {
+      "image": "/opt/ros/humble/lib/rclcpp_components/component_container",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/opt/ros/humble/lib/librclcpp.so",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "system library",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/ros/humble/lib/rclcpp_components/component_container",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/usr/lib/x86_64-linux-gnu/libstdc++.so.6",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "system library (elf_check)",
+     "type": "ElfOpened",
+     "header": {
+      "image": "/opt/ros/humble/lib/rclcpp_components/component_container",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/usr/lib/x86_64-linux-gnu/libstdc++.so.6",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "rmw_implementation",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/ros/humble/lib/rclcpp_components/component_container",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/opt/ros/humble/lib/librmw_implementation.so",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "commissioned RMW",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/ros/humble/lib/rclcpp_components/component_container",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/opt/ros/humble/lib/librmw_fastrtps_cpp.so",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "node reads its --params-file from /tmp (re-review FP)",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/ros/humble/lib/rclcpp_components/component_container",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/tmp/launch_params_k2j3h4",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "param YAML from workspace",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/ros/humble/lib/rclcpp_components/component_container",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/opt/robot_ws/install/robot_bringup/share/robot_bringup/config/camera.yaml",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "SROS 2 node loads its enclave key",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/ros/humble/lib/rclcpp_components/component_container",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/opt/robot_keystore/enclaves/robot/controller/key.pem",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "enclave cert",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/ros/humble/lib/rclcpp_components/component_container",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/opt/robot_keystore/enclaves/robot/controller/cert.pem",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "governance",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/ros/humble/lib/rclcpp_components/component_container",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/opt/robot_keystore/enclaves/robot/controller/governance.p7s",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "permissions",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/ros/humble/lib/rclcpp_components/component_container",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/opt/robot_keystore/enclaves/robot/controller/permissions.p7s",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "identity CA cert",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/ros/humble/lib/rclcpp_components/component_container",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/opt/robot_keystore/enclaves/robot/controller/identity_ca.cert.pem",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "Fast DDS shared-memory port",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/ros/humble/lib/rclcpp_components/component_container",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/dev/shm/fastrtps_port7413",
+      "flags": [
+       "O_RDWR",
+       "O_CREAT"
+      ]
+     }
+    },
+    {
+     "note": "Fast DDS shm segment created",
+     "type": "FileCreated",
+     "header": {
+      "image": "/opt/ros/humble/lib/rclcpp_components/component_container",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/dev/shm/fastrtps_port7413"
+     }
+    },
+    {
+     "note": "Fast DDS shm mutex",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/ros/humble/lib/rclcpp_components/component_container",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/dev/shm/sem.fastrtps_port7413_mutex",
+      "flags": [
+       "O_RDWR"
+      ]
+     }
+    },
+    {
+     "note": "DDS loopback",
+     "type": "Connect",
+     "header": {
+      "image": "/opt/ros/humble/lib/rclcpp_components/component_container",
+      "uid": 1000
+     },
+     "payload": {
+      "destination": {
+       "ip": "127.0.0.1",
+       "port": 7400
+      },
+      "is_tcp": false
+     }
+    },
+    {
+     "note": "DDS discovery multicast",
+     "type": "Connect",
+     "header": {
+      "image": "/opt/ros/humble/lib/rclcpp_components/component_container",
+      "uid": 1000
+     },
+     "payload": {
+      "destination": {
+       "ip": "239.255.0.1",
+       "port": 7400
+      },
+      "is_tcp": false
+     }
+    },
+    {
+     "note": "DDS peer on the cell network",
+     "type": "Connect",
+     "header": {
+      "image": "/opt/ros/humble/lib/rclcpp_components/component_container",
+      "uid": 1000
+     },
+     "payload": {
+      "destination": {
+       "ip": "10.20.0.5",
+       "port": 7411
+      },
+      "is_tcp": false
+     }
+    },
+    {
+     "note": "workspace C++ node",
+     "type": "Exec",
+     "header": {
+      "image": "/opt/robot_ws/install/my_pkg/lib/my_pkg/controller",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/opt/robot_ws/install/my_pkg/lib/my_pkg/controller",
+      "argc": 4,
+      "argv": [
+       "/opt/robot_ws/install/my_pkg/lib/my_pkg/controller",
+       "--ros-args",
+       "--params-file",
+       "/tmp/launch_params_x9y8z7"
+      ]
+     }
+    },
+    {
+     "note": "workspace node reads --params-file from /tmp (re-review FP)",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/robot_ws/install/my_pkg/lib/my_pkg/controller",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/tmp/launch_params_x9y8z7",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "workspace library",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/robot_ws/install/my_pkg/lib/my_pkg/controller",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/opt/robot_ws/install/my_pkg/lib/libmy_pkg_core.so",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "rclpy node (console script)",
+     "type": "Exec",
+     "header": {
+      "image": "/opt/robot_ws/install/my_pkg/lib/my_pkg/py_node",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/opt/robot_ws/install/my_pkg/lib/my_pkg/py_node",
+      "argc": 5,
+      "argv": [
+       "/usr/bin/python3",
+       "/opt/robot_ws/install/my_pkg/lib/my_pkg/py_node",
+       "--ros-args",
+       "--params-file",
+       "/tmp/launch_params_aa11bb"
+      ]
+     }
+    },
+    {
+     "note": "rclpy node imports its package",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/robot_ws/install/my_pkg/lib/my_pkg/py_node",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/opt/robot_ws/install/my_pkg/lib/python3.10/site-packages/my_pkg/node.py",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "rclpy C extension",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/robot_ws/install/my_pkg/lib/my_pkg/py_node",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/opt/ros/humble/local/lib/python3.10/dist-packages/rclpy/_rclpy_pybind11.cpython-310-x86_64-linux-gnu.so",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "rclpy node reads --params-file from /tmp",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/robot_ws/install/my_pkg/lib/my_pkg/py_node",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/tmp/launch_params_aa11bb",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "launch ExecuteProcess(shell=True)",
+     "type": "Exec",
+     "header": {
+      "image": "/bin/sh",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/bin/sh",
+      "argc": 3,
+      "argv": [
+       "/bin/sh",
+       "-c",
+       "ros2 param set /x y 1"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "scenario": "ros2 bag record / play",
+   "events": [
+    {
+     "note": "ros2 bag play from /tmp",
+     "type": "Exec",
+     "header": {
+      "image": "/opt/ros/humble/bin/ros2",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/opt/ros/humble/bin/ros2",
+      "argc": 5,
+      "argv": [
+       "/usr/bin/python3",
+       "/opt/ros/humble/bin/ros2",
+       "bag",
+       "play",
+       "/tmp/bag_2026"
+      ]
+     }
+    },
+    {
+     "note": "bag metadata",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/ros/humble/bin/ros2",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/tmp/bag_2026/metadata.yaml",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "bag file in /tmp (re-review FP)",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/ros/humble/bin/ros2",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/tmp/bag_2026/bag_2026_0.mcap",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "storage plugin",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/ros/humble/bin/ros2",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/opt/ros/humble/lib/librosbag2_storage_mcap.so",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "ros2 bag record",
+     "type": "Exec",
+     "header": {
+      "image": "/opt/ros/humble/bin/ros2",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/opt/ros/humble/bin/ros2",
+      "argc": 7,
+      "argv": [
+       "/usr/bin/python3",
+       "/opt/ros/humble/bin/ros2",
+       "bag",
+       "record",
+       "-o",
+       "/home/robot/bags/rosbag2_2026",
+       "/scan"
+      ]
+     }
+    },
+    {
+     "note": "bag created",
+     "type": "FileCreated",
+     "header": {
+      "image": "/opt/ros/humble/bin/ros2",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/home/robot/bags/rosbag2_2026/rosbag2_2026_0.mcap"
+     }
+    },
+    {
+     "note": "bag written",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/ros/humble/bin/ros2",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/home/robot/bags/rosbag2_2026/rosbag2_2026_0.mcap",
+      "flags": [
+       "O_RDWR",
+       "O_CREAT",
+       "O_TRUNC"
+      ]
+     }
+    },
+    {
+     "note": "metadata finalised",
+     "type": "FileRename",
+     "header": {
+      "image": "/opt/ros/humble/bin/ros2",
+      "uid": 1000
+     },
+     "payload": {
+      "source": "/home/robot/bags/rosbag2_2026/metadata.yaml.tmp",
+      "destination": "/home/robot/bags/rosbag2_2026/metadata.yaml"
+     }
+    }
+   ]
+  },
+  {
+   "scenario": "rclpy perception node loads a torch model",
+   "events": [
+    {
+     "note": "perception rclpy node",
+     "type": "Exec",
+     "header": {
+      "image": "/opt/robot_ws/install/perception/lib/perception/detector",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/opt/robot_ws/install/perception/lib/perception/detector",
+      "argc": 3,
+      "argv": [
+       "/usr/bin/python3",
+       "/opt/robot_ws/install/perception/lib/perception/detector",
+       "--ros-args"
+      ]
+     }
+    },
+    {
+     "note": "torch import (pip into /usr/local at image build)",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/robot_ws/install/perception/lib/perception/detector",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/usr/local/lib/python3.10/dist-packages/torch/__init__.py",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "site .pth under /usr/local",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/robot_ws/install/perception/lib/perception/detector",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/usr/local/lib/python3.10/dist-packages/distutils-precedence.pth",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "torch native library",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/robot_ws/install/perception/lib/perception/detector",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/usr/local/lib/python3.10/dist-packages/torch/lib/libtorch_cpu.so",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "torch native library (elf_check)",
+     "type": "ElfOpened",
+     "header": {
+      "image": "/opt/robot_ws/install/perception/lib/perception/detector",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/usr/local/lib/python3.10/dist-packages/torch/lib/libtorch_cpu.so",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "torch.load of cached weights (*.pth = zip, re-review FP)",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/robot_ws/install/perception/lib/perception/detector",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/home/robot/.cache/torch/hub/checkpoints/resnet50-0676ba61.pth",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "same, node run as python3 script",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/python3.10",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/home/robot/.cache/torch/hub/checkpoints/resnet50-0676ba61.pth",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "model weights from workspace",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/robot_ws/install/perception/lib/perception/detector",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/opt/robot_ws/install/perception/share/perception/models/yolov8n.pt",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "onnx model",
+     "type": "FileOpened",
+     "header": {
+      "image": "/opt/robot_ws/install/perception/lib/perception/detector",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/home/robot/models/segformer.onnx",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "scenario": "colcon build in a dev workspace",
+   "events": [
+    {
+     "note": "colcon build in a dev workspace",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/colcon",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/colcon",
+      "argc": 4,
+      "argv": [
+       "/usr/bin/python3",
+       "/usr/bin/colcon",
+       "build",
+       "--symlink-install"
+      ]
+     }
+    },
+    {
+     "note": "cmake configure",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/cmake",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/cmake",
+      "argc": 3,
+      "argv": [
+       "/usr/bin/cmake",
+       "/home/robot/dev_ws/src/my_pkg",
+       "-DCMAKE_INSTALL_PREFIX=/home/robot/dev_ws/install/my_pkg"
+      ]
+     }
+    },
+    {
+     "note": "CMake FindPython probe",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/python3.10",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/python3.10",
+      "argc": 3,
+      "argv": [
+       "/usr/bin/python3.10",
+       "-c",
+       "import sys; sys.stdout.write(sys.abiflags)"
+      ]
+     },
+     "allow": [
+      "RoboDR: Interpreter one-liner executed"
+     ],
+     "reason": "Known, documented FP (rules/README.md): CMake 3.x FindPython runs ~17 version-specific 'python -c' probes per configure; they are not expressible as a safe exclusion and building on a fielded unit is out of policy."
+    },
+    {
+     "note": "ament_cmake package.xml parser",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/python3",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/python3",
+      "argc": 4,
+      "argv": [
+       "/usr/bin/python3",
+       "/opt/ros/humble/share/ament_cmake_core/cmake/core/package_xml_2_cmake.py",
+       "/home/robot/dev_ws/src/my_pkg/package.xml",
+       "/home/robot/dev_ws/build/my_pkg/ament_cmake_core/package.cmake"
+      ]
+     }
+    },
+    {
+     "note": "ament script read from /opt/ros",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/python3",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/opt/ros/humble/share/ament_cmake_core/cmake/core/package_xml_2_cmake.py",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "compile",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/c++",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/c++",
+      "argc": 6,
+      "argv": [
+       "/usr/bin/c++",
+       "-O2",
+       "-c",
+       "/home/robot/dev_ws/src/my_pkg/src/controller.cpp",
+       "-o",
+       "CMakeFiles/controller.dir/src/controller.cpp.o"
+      ]
+     }
+    },
+    {
+     "note": "cc1plus writes assembler temp",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/lib/gcc/x86_64-linux-gnu/11/cc1plus",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/tmp/ccAbCd.s",
+      "flags": [
+       "O_WRONLY",
+       "O_CREAT",
+       "O_TRUNC"
+      ]
+     }
+    },
+    {
+     "note": "assembler temp created",
+     "type": "FileCreated",
+     "header": {
+      "image": "/usr/lib/gcc/x86_64-linux-gnu/11/cc1plus",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/tmp/ccAbCd.s"
+     }
+    },
+    {
+     "note": "as reads it",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/x86_64-linux-gnu-as",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/tmp/ccAbCd.s",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "object written in build dir",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/x86_64-linux-gnu-as",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/home/robot/dev_ws/build/my_pkg/CMakeFiles/controller.dir/src/controller.cpp.o",
+      "flags": [
+       "O_WRONLY",
+       "O_CREAT",
+       "O_TRUNC"
+      ]
+     }
+    },
+    {
+     "note": "as writes an ELF object to /tmp (async elf_check sees ELF)",
+     "type": "ElfOpened",
+     "header": {
+      "image": "/usr/bin/x86_64-linux-gnu-as",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/tmp/ccXyZw.o",
+      "flags": [
+       "O_WRONLY",
+       "O_CREAT",
+       "O_TRUNC"
+      ]
+     }
+    },
+    {
+     "note": "linker reads objects",
+     "type": "ElfOpened",
+     "header": {
+      "image": "/usr/bin/x86_64-linux-gnu-ld.bfd",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/home/robot/dev_ws/build/my_pkg/CMakeFiles/controller.dir/src/controller.cpp.o",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "linker reads ROS libs",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/x86_64-linux-gnu-ld.bfd",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/opt/ros/humble/lib/librclcpp.so",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "linker writes .so in build dir",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/x86_64-linux-gnu-ld.bfd",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/home/robot/dev_ws/build/my_pkg/libmy_pkg_core.so",
+      "flags": [
+       "O_RDWR",
+       "O_CREAT",
+       "O_TRUNC"
+      ]
+     }
+    },
+    {
+     "note": "--symlink-install",
+     "type": "FileLink",
+     "header": {
+      "image": "/usr/bin/colcon",
+      "uid": 1000
+     },
+     "payload": {
+      "source": "/home/robot/dev_ws/install/my_pkg/share/my_pkg/launch",
+      "destination": "/home/robot/dev_ws/src/my_pkg/launch",
+      "hard_link": false
+     }
+    },
+    {
+     "note": "ament_python setup.py",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/python3",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/python3",
+      "argc": 5,
+      "argv": [
+       "/usr/bin/python3",
+       "setup.py",
+       "egg_info",
+       "--egg-base",
+       "/home/robot/dev_ws/build/my_py_pkg"
+      ]
+     }
+    },
+    {
+     "note": "python3 runs setup.py from the dev source tree",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/python3",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/home/robot/dev_ws/src/my_py_pkg/setup.py",
+      "flags": [
+       "O_RDONLY"
+      ]
+     },
+     "allow": [
+      "RoboDR: ROS 2 process imported Python code from outside the allowlisted paths"
+     ],
+     "reason": "Documented: the Python-import rule reports any python3 process executing code outside the allowlisted trees; a dev workspace on the unit is out of policy (or add it as TUNE)."
+    }
+   ]
+  },
+  {
+   "scenario": "apt-get upgrade with a kernel (dpkg, depmod, update-initramfs, ldconfig, py3compile, service restart)",
+   "events": [
+    {
+     "note": "apt-get upgrade",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/apt-get"
+     },
+     "payload": {
+      "filename": "/usr/bin/apt-get",
+      "argc": 3,
+      "argv": [
+       "apt-get",
+       "-y",
+       "upgrade"
+      ]
+     },
+     "allow": [
+      "RoboDR: Debian package installed on robot controller"
+     ],
+     "reason": "Maintenance action: this alert is the audit trail of the install (supply_chain.toml header)."
+    },
+    {
+     "note": "apt runs dpkg --unpack",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "filename": "/usr/bin/dpkg",
+      "argc": 7,
+      "argv": [
+       "/usr/bin/dpkg",
+       "--status-fd",
+       "23",
+       "--no-triggers",
+       "--unpack",
+       "--auto-deconfigure",
+       "/var/cache/apt/archives/linux-image-6.8.0-45-generic.deb"
+      ]
+     },
+     "allow": [
+      "RoboDR: Debian package installed on robot controller"
+     ],
+     "reason": "Maintenance action: this alert is the audit trail of the install (supply_chain.toml header)."
+    },
+    {
+     "note": "dpkg loads system libraries",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "filename": "/usr/lib/x86_64-linux-gnu/libselinux.so.1",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "dpkg unpacks a module",
+     "type": "FileCreated",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "filename": "/usr/lib/modules/6.8.0-45-generic/kernel/drivers/net/e1000e.ko.zst.dpkg-new"
+     }
+    },
+    {
+     "note": "dpkg moves it into place",
+     "type": "FileRename",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "source": "/usr/lib/modules/6.8.0-45-generic/kernel/drivers/net/e1000e.ko.zst.dpkg-new",
+      "destination": "/usr/lib/modules/6.8.0-45-generic/kernel/drivers/net/e1000e.ko.zst"
+     }
+    },
+    {
+     "note": "dpkg unpacks a symlink",
+     "type": "FileLink",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "source": "/usr/lib/x86_64-linux-gnu/libfoo.so.1.dpkg-new",
+      "destination": "libfoo.so.1.2.3",
+      "hard_link": false
+     }
+    },
+    {
+     "note": "dpkg package list",
+     "type": "FileRename",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "source": "/var/lib/dpkg/info/linux-image-6.8.0-45-generic.list-new",
+      "destination": "/var/lib/dpkg/info/linux-image-6.8.0-45-generic.list"
+     },
+     "allow": [
+      "RoboDR: Debian package database changed"
+     ],
+     "reason": "Maintenance action: this alert is the audit trail of the install (supply_chain.toml header)."
+    },
+    {
+     "note": "kernel postinst",
+     "type": "Exec",
+     "header": {
+      "image": "/var/lib/dpkg/info/linux-image-6.8.0-45-generic.postinst"
+     },
+     "payload": {
+      "filename": "/var/lib/dpkg/info/linux-image-6.8.0-45-generic.postinst",
+      "argc": 4,
+      "argv": [
+       "/bin/sh",
+       "/var/lib/dpkg/info/linux-image-6.8.0-45-generic.postinst",
+       "configure",
+       ""
+      ]
+     },
+     "allow": [
+      "RoboDR: Debian package maintainer script executed"
+     ],
+     "reason": "Maintenance action: this alert is the audit trail of the install (supply_chain.toml header)."
+    },
+    {
+     "note": "depmod for the new kernel",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/sbin/depmod"
+     },
+     "payload": {
+      "filename": "/usr/sbin/depmod",
+      "argc": 5,
+      "argv": [
+       "depmod",
+       "-a",
+       "-F",
+       "/boot/System.map-6.8.0-45-generic",
+       "6.8.0-45-generic"
+      ]
+     }
+    },
+    {
+     "note": "depmod reads modules",
+     "type": "ElfOpened",
+     "header": {
+      "image": "/usr/sbin/depmod"
+     },
+     "payload": {
+      "filename": "/usr/lib/modules/6.8.0-45-generic/kernel/drivers/net/e1000e.ko.zst",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "depmod writes index temp",
+     "type": "FileCreated",
+     "header": {
+      "image": "/usr/sbin/depmod"
+     },
+     "payload": {
+      "filename": "/usr/lib/modules/6.8.0-45-generic/modules.dep.tmp"
+     }
+    },
+    {
+     "note": "depmod index temp write-open",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/sbin/depmod"
+     },
+     "payload": {
+      "filename": "/usr/lib/modules/6.8.0-45-generic/modules.dep.tmp",
+      "flags": [
+       "O_WRONLY",
+       "O_CREAT",
+       "O_TRUNC"
+      ]
+     }
+    },
+    {
+     "note": "depmod renames index into place",
+     "type": "FileRename",
+     "header": {
+      "image": "/usr/sbin/depmod"
+     },
+     "payload": {
+      "source": "/usr/lib/modules/6.8.0-45-generic/modules.dep.tmp",
+      "destination": "/usr/lib/modules/6.8.0-45-generic/modules.dep"
+     }
+    },
+    {
+     "note": "depmod alias index",
+     "type": "FileRename",
+     "header": {
+      "image": "/usr/sbin/depmod"
+     },
+     "payload": {
+      "source": "/usr/lib/modules/6.8.0-45-generic/modules.alias.bin.tmp",
+      "destination": "/usr/lib/modules/6.8.0-45-generic/modules.alias.bin"
+     }
+    },
+    {
+     "note": "update-initramfs",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/sbin/update-initramfs"
+     },
+     "payload": {
+      "filename": "/usr/sbin/update-initramfs",
+      "argc": 5,
+      "argv": [
+       "/bin/sh",
+       "/usr/sbin/update-initramfs",
+       "-c",
+       "-k",
+       "6.8.0-45-generic"
+      ]
+     }
+    },
+    {
+     "note": "mkinitramfs",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/sbin/mkinitramfs"
+     },
+     "payload": {
+      "filename": "/usr/sbin/mkinitramfs",
+      "argc": 5,
+      "argv": [
+       "/bin/sh",
+       "/usr/sbin/mkinitramfs",
+       "-o",
+       "/boot/initrd.img-6.8.0-45-generic.new",
+       "6.8.0-45-generic"
+      ]
+     }
+    },
+    {
+     "note": "copy_file",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/cp"
+     },
+     "payload": {
+      "filename": "/usr/bin/cp",
+      "argc": 4,
+      "argv": [
+       "cp",
+       "-pL",
+       "/usr/lib/modules/6.8.0-45-generic/kernel/drivers/net/e1000e.ko.zst",
+       "/var/tmp/mkinitramfs_Ab12Cd/usr/lib/modules/6.8.0-45-generic/kernel/drivers/net/"
+      ]
+     }
+    },
+    {
+     "note": "cp copies a module into staging (re-review FP)",
+     "type": "FileCreated",
+     "header": {
+      "image": "/usr/bin/cp"
+     },
+     "payload": {
+      "filename": "/var/tmp/mkinitramfs_Ab12Cd/usr/lib/modules/6.8.0-45-generic/kernel/drivers/net/e1000e.ko.zst"
+     }
+    },
+    {
+     "note": "cp copies an uncompressed .ko into staging",
+     "type": "FileCreated",
+     "header": {
+      "image": "/usr/bin/cp"
+     },
+     "payload": {
+      "filename": "/var/tmp/mkinitramfs_Ab12Cd/usr/lib/modules/6.8.0-45-generic/kernel/drivers/block/nbd.ko"
+     }
+    },
+    {
+     "note": "copy_exec copies libc into staging (re-review FP)",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/cp"
+     },
+     "payload": {
+      "filename": "/var/tmp/mkinitramfs_Ab12Cd/usr/lib/x86_64-linux-gnu/libc.so.6",
+      "flags": [
+       "O_WRONLY",
+       "O_CREAT",
+       "O_EXCL"
+      ]
+     }
+    },
+    {
+     "note": "same, seen by elf_check",
+     "type": "ElfOpened",
+     "header": {
+      "image": "/usr/bin/cp"
+     },
+     "payload": {
+      "filename": "/var/tmp/mkinitramfs_Ab12Cd/usr/lib/x86_64-linux-gnu/libc.so.6",
+      "flags": [
+       "O_WRONLY",
+       "O_CREAT",
+       "O_EXCL"
+      ]
+     }
+    },
+    {
+     "note": "libc created in staging",
+     "type": "FileCreated",
+     "header": {
+      "image": "/usr/bin/cp"
+     },
+     "payload": {
+      "filename": "/var/tmp/mkinitramfs_Ab12Cd/usr/lib/x86_64-linux-gnu/libc.so.6"
+     }
+    },
+    {
+     "note": "cp reads the source",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/cp"
+     },
+     "payload": {
+      "filename": "/usr/lib/x86_64-linux-gnu/libc.so.6",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "usr-merge symlink in staging",
+     "type": "FileLink",
+     "header": {
+      "image": "/usr/bin/ln"
+     },
+     "payload": {
+      "source": "/var/tmp/mkinitramfs_Ab12Cd/lib",
+      "destination": "usr/lib",
+      "hard_link": false
+     }
+    },
+    {
+     "note": "depmod -b staging",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/sbin/depmod"
+     },
+     "payload": {
+      "filename": "/usr/sbin/depmod",
+      "argc": 5,
+      "argv": [
+       "depmod",
+       "-a",
+       "-b",
+       "/var/tmp/mkinitramfs_Ab12Cd",
+       "6.8.0-45-generic"
+      ]
+     }
+    },
+    {
+     "note": "depmod -b reads staged .ko (re-review FP)",
+     "type": "ElfOpened",
+     "header": {
+      "image": "/usr/sbin/depmod"
+     },
+     "payload": {
+      "filename": "/var/tmp/mkinitramfs_Ab12Cd/usr/lib/modules/6.8.0-45-generic/kernel/drivers/block/nbd.ko",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "depmod -b writes staged index",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/sbin/depmod"
+     },
+     "payload": {
+      "filename": "/var/tmp/mkinitramfs_Ab12Cd/usr/lib/modules/6.8.0-45-generic/modules.dep.tmp",
+      "flags": [
+       "O_WRONLY",
+       "O_CREAT",
+       "O_TRUNC"
+      ]
+     }
+    },
+    {
+     "note": "ldconfig -r staging",
+     "type": "Exec",
+     "header": {
+      "image": "/sbin/ldconfig.real"
+     },
+     "payload": {
+      "filename": "/sbin/ldconfig.real",
+      "argc": 3,
+      "argv": [
+       "/sbin/ldconfig.real",
+       "-r",
+       "/var/tmp/mkinitramfs_Ab12Cd"
+      ]
+     }
+    },
+    {
+     "note": "ldconfig -r reads staged libs (re-review FP)",
+     "type": "FileOpened",
+     "header": {
+      "image": "/sbin/ldconfig.real"
+     },
+     "payload": {
+      "filename": "/var/tmp/mkinitramfs_Ab12Cd/usr/lib/x86_64-linux-gnu/libz.so.1",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "same, seen by elf_check",
+     "type": "ElfOpened",
+     "header": {
+      "image": "/sbin/ldconfig.real"
+     },
+     "payload": {
+      "filename": "/var/tmp/mkinitramfs_Ab12Cd/usr/lib/x86_64-linux-gnu/libz.so.1",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "same under the wrapper name (reviewer repro image)",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/sbin/ldconfig"
+     },
+     "payload": {
+      "filename": "/var/tmp/mkinitramfs_Ab12Cd/usr/lib/x86_64-linux-gnu/libz.so.1",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "cpio packs staged .so",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/cpio"
+     },
+     "payload": {
+      "filename": "/var/tmp/mkinitramfs_Ab12Cd/usr/lib/x86_64-linux-gnu/libc.so.6",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "cpio packs staged ELF",
+     "type": "ElfOpened",
+     "header": {
+      "image": "/usr/bin/cpio"
+     },
+     "payload": {
+      "filename": "/var/tmp/mkinitramfs_Ab12Cd/usr/bin/busybox",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "dpkg ldconfig trigger",
+     "type": "Exec",
+     "header": {
+      "image": "/sbin/ldconfig.real"
+     },
+     "payload": {
+      "filename": "/sbin/ldconfig.real",
+      "argc": 1,
+      "argv": [
+       "/sbin/ldconfig.real"
+      ]
+     }
+    },
+    {
+     "note": "ldconfig replaces a stale soname link (unlink)",
+     "type": "FileDeleted",
+     "header": {
+      "image": "/sbin/ldconfig.real"
+     },
+     "payload": {
+      "filename": "/usr/lib/x86_64-linux-gnu/libfoo.so.1"
+     }
+    },
+    {
+     "note": "ldconfig soname symlink",
+     "type": "FileLink",
+     "header": {
+      "image": "/sbin/ldconfig.real"
+     },
+     "payload": {
+      "source": "/usr/lib/x86_64-linux-gnu/libfoo.so.1",
+      "destination": "libfoo.so.1.2.3",
+      "hard_link": false
+     }
+    },
+    {
+     "note": "ldconfig cache temp",
+     "type": "FileOpened",
+     "header": {
+      "image": "/sbin/ldconfig.real"
+     },
+     "payload": {
+      "filename": "/etc/ld.so.cache~",
+      "flags": [
+       "O_WRONLY",
+       "O_CREAT",
+       "O_TRUNC"
+      ]
+     }
+    },
+    {
+     "note": "ldconfig cache rename",
+     "type": "FileRename",
+     "header": {
+      "image": "/sbin/ldconfig.real"
+     },
+     "payload": {
+      "source": "/etc/ld.so.cache~",
+      "destination": "/etc/ld.so.cache"
+     }
+    },
+    {
+     "note": "ldconfig reads its config",
+     "type": "FileOpened",
+     "header": {
+      "image": "/sbin/ldconfig.real"
+     },
+     "payload": {
+      "filename": "/etc/ld.so.conf.d/x86_64-linux-gnu.conf",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "py3compile from postinst",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/py3compile"
+     },
+     "payload": {
+      "filename": "/usr/bin/py3compile",
+      "argc": 4,
+      "argv": [
+       "/usr/bin/python3",
+       "/usr/bin/py3compile",
+       "-p",
+       "python3-yaml"
+      ]
+     }
+    },
+    {
+     "note": "py3compile worker reads file names on stdin",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/python3.12"
+     },
+     "payload": {
+      "filename": "/usr/bin/python3.12",
+      "argc": 4,
+      "argv": [
+       "/usr/bin/python3.12",
+       "-m",
+       "py_compile",
+       "-"
+      ]
+     }
+    },
+    {
+     "note": "py_compile atomic write temp",
+     "type": "FileCreated",
+     "header": {
+      "image": "/usr/bin/python3.12"
+     },
+     "payload": {
+      "filename": "/usr/lib/python3/dist-packages/yaml/__pycache__/__init__.cpython-312.pyc.140230"
+     },
+     "allow": [
+      "RoboDR: Shared library written into a system library path outside the package manager"
+     ],
+     "reason": "Documented: py3compile byte-compiles into /usr/lib/python3 as root; a forged .pyc there is a code hook, so it is deliberately not excluded (precompile at commissioning)."
+    },
+    {
+     "note": "py_compile temp write-open",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/python3.12"
+     },
+     "payload": {
+      "filename": "/usr/lib/python3/dist-packages/yaml/__pycache__/__init__.cpython-312.pyc.140230",
+      "flags": [
+       "O_WRONLY",
+       "O_CREAT",
+       "O_EXCL"
+      ]
+     }
+    },
+    {
+     "note": "py_compile os.replace",
+     "type": "FileRename",
+     "header": {
+      "image": "/usr/bin/python3.12"
+     },
+     "payload": {
+      "source": "/usr/lib/python3/dist-packages/yaml/__pycache__/__init__.cpython-312.pyc.140230",
+      "destination": "/usr/lib/python3/dist-packages/yaml/__pycache__/__init__.cpython-312.pyc"
+     },
+     "allow": [
+      "RoboDR: File moved into a system library path or linker configuration outside the package manager"
+     ],
+     "reason": "Documented: py3compile byte-compiles into /usr/lib/python3 as root; a forged .pyc there is a code hook, so it is deliberately not excluded (precompile at commissioning)."
+    },
+    {
+     "note": "py_compile reads source",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/python3.12"
+     },
+     "payload": {
+      "filename": "/usr/lib/python3/dist-packages/yaml/__init__.py",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "systemd reload",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/systemctl"
+     },
+     "payload": {
+      "filename": "/usr/bin/systemctl",
+      "argc": 2,
+      "argv": [
+       "systemctl",
+       "daemon-reload"
+      ]
+     }
+    },
+    {
+     "note": "service restart from postinst",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/deb-systemd-invoke"
+     },
+     "payload": {
+      "filename": "/usr/bin/deb-systemd-invoke",
+      "argc": 4,
+      "argv": [
+       "/usr/bin/perl",
+       "/usr/bin/deb-systemd-invoke",
+       "restart",
+       "chrony.service"
+      ]
+     }
+    },
+    {
+     "note": "PID 1 starts the restarted unit",
+     "type": "Exec",
+     "header": {
+      "image": "/proc/self/fd/3",
+      "uid": 0,
+      "parent_pid": 1
+     },
+     "payload": {
+      "filename": "/proc/self/fd/3",
+      "argc": 7,
+      "argv": [
+       "/usr/lib/systemd/systemd-executor",
+       "--deserialize",
+       "37",
+       "--log-level",
+       "info",
+       "--log-target",
+       "journal-or-kmsg"
+      ]
+     }
+    },
+    {
+     "note": "needrestart scans processes",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/sbin/needrestart"
+     },
+     "payload": {
+      "filename": "/proc/1234/maps",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "scenario": "systemd user units (systemd >= 255)",
+   "events": [
+    {
+     "note": "PID 1 starts user@1000.service",
+     "type": "Exec",
+     "header": {
+      "image": "/proc/self/fd/3",
+      "uid": 0,
+      "parent_pid": 1
+     },
+     "payload": {
+      "filename": "/proc/self/fd/3",
+      "argc": 7,
+      "argv": [
+       "/usr/lib/systemd/systemd-executor",
+       "--deserialize",
+       "12",
+       "--log-level",
+       "info",
+       "--log-target",
+       "journal-or-kmsg"
+      ]
+     }
+    },
+    {
+     "note": "user manager",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/lib/systemd/systemd",
+      "uid": 1000,
+      "parent_pid": 1
+     },
+     "payload": {
+      "filename": "/usr/lib/systemd/systemd",
+      "argc": 2,
+      "argv": [
+       "/usr/lib/systemd/systemd",
+       "--user"
+      ]
+     }
+    },
+    {
+     "note": "user unit file read",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/lib/systemd/systemd",
+      "uid": 1000,
+      "parent_pid": 1
+     },
+     "payload": {
+      "filename": "/home/robot/.config/systemd/user/robot-bringup.service",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "user manager starts a user unit (re-review storm)",
+     "type": "Exec",
+     "header": {
+      "image": "/proc/self/fd/3",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/proc/self/fd/3",
+      "argc": 7,
+      "argv": [
+       "/usr/lib/systemd/systemd-executor",
+       "--deserialize",
+       "4",
+       "--log-level",
+       "info",
+       "--log-target",
+       "auto"
+      ]
+     }
+    },
+    {
+     "note": "unit ExecStart: ros2 launch",
+     "type": "Exec",
+     "header": {
+      "image": "/opt/ros/humble/bin/ros2",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/opt/ros/humble/bin/ros2",
+      "argc": 5,
+      "argv": [
+       "/usr/bin/python3",
+       "/opt/ros/humble/bin/ros2",
+       "launch",
+       "robot_bringup",
+       "bringup.launch.py"
+      ]
+     }
+    },
+    {
+     "note": "user timer unit fires",
+     "type": "Exec",
+     "header": {
+      "image": "/proc/self/fd/3",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/proc/self/fd/3",
+      "argc": 7,
+      "argv": [
+       "/usr/lib/systemd/systemd-executor",
+       "--deserialize",
+       "5",
+       "--log-level",
+       "info",
+       "--log-target",
+       "auto"
+      ]
+     }
+    },
+    {
+     "note": "operator restarts the user unit",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/bin/systemctl",
+      "uid": 1000,
+      "parent_pid": 1234
+     },
+     "payload": {
+      "filename": "/usr/bin/systemctl",
+      "argc": 4,
+      "argv": [
+       "systemctl",
+       "--user",
+       "restart",
+       "robot-bringup.service"
+      ]
+     }
+    }
+   ]
+  }
+ ]
+}

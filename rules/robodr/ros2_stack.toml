@@ -38,6 +38,22 @@ AND (
 '''
 
 [[rules]]
+name = "RoboDR: Login shell started on robot controller"
+type = "Exec"
+category = "execution"
+severity = "medium"
+description = "A shell was started as a login shell: argv[0] begins with '-' ('-bash', '-sh', ...), which is how sshd, login/getty, 'su -' and 'sudo -i' start the user's shell. A login shell is the pty-backed session from which 'PYTHONINSPECT=1 ros2 ...' turns a trusted /opt/ros interpreter into a Python prompt with no wrapper binary and no argv trace (re-review finding); it is not matched by the -i rule. Maintenance logins also fire, and should be rare and recorded on a fielded unit. 'ssh -t host cmd' (no login shell) is NOT seen."
+condition = '''
+(payload.filename ENDS_WITH "/sh" OR payload.filename ENDS_WITH "/bash" OR payload.filename ENDS_WITH "/dash" OR payload.filename ENDS_WITH "/zsh"
+ OR payload.filename ENDS_WITH "/ksh" OR payload.filename ENDS_WITH "/mksh" OR payload.filename ENDS_WITH "/fish")
+AND (
+  payload.argv CONTAINS "-sh" OR payload.argv CONTAINS "-bash" OR payload.argv CONTAINS "-dash" OR payload.argv CONTAINS "-zsh"
+  OR payload.argv CONTAINS "-ksh" OR payload.argv CONTAINS "-mksh" OR payload.argv CONTAINS "-fish"
+  OR payload.argv CONTAINS "--login" OR payload.argv CONTAINS "-l"
+)
+'''
+
+[[rules]]
 name = "RoboDR: ROS 2 process connects outside the robot's networks"
 type = "Connect"
 category = "command_and_control"

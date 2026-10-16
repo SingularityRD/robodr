@@ -21,8 +21,22 @@
 #   2. ElfOpened rules below: content-based (ELF magic), name-independent.
 #      They need `elf_check = true` under [module.file-system-monitor] in
 #      pulsar.toml (default false; see rules/README.md for cost and limits).
-#   3. FileOpened rules: name/directory-based fallback that works with the
-#      default Pulsar config.
+#   3. FileOpened rules: name-based fallback (*.so / *.so.N) that works with
+#      the default Pulsar config. It deliberately does NOT flag plain reads of
+#      arbitrary files from /tmp: ros2 launch hands every node a
+#      /tmp/launch_params_* file (--params-file), ros2 bag plays from /tmp, and
+#      perception nodes read model weights from ~/.cache (re-review finding).
+#      A hook WITHOUT a .so name is therefore caught by content (layer 2) or
+#      prevented (layer 1) -- elf_check is a deployment requirement, not an
+#      option (rules/README.md "Deployment").
+#
+# update-initramfs (every kernel/firmware upgrade) copies modules and
+# libraries into /var/tmp/mkinitramfs_XXXXXX and runs cp, depmod -b,
+# ldconfig -r and cpio on that tree as root. The temp-directory rules exclude
+# exactly that: uid 0, path under /var/tmp/mkinitramfs_, and the exact image
+# of the one tool that touches the tree in that way (rules/README.md
+# "Maintenance-time exclusions"). If TMPDIR is set for apt on the robot the
+# staging tree moves and these exclusions must follow it (TUNE).
 # FileOpened/FileCreated/FileRename paths are kernel-resolved (get_path_str
 # walks the dentry), so directory prefixes on payload.filename cannot be
 # dodged with "..". header.image is NOT resolved for absolute execs (it is
@@ -35,18 +49,11 @@ name = "RoboDR: ROS 2 process loaded a library from outside the allowlisted libr
 type = "FileOpened"
 category = "defense_evasion"
 severity = "high"
-description = "A ROS 2 node (ROS install tree, robot workspace, or the Python interpreter that runs rclpy nodes) opened a shared object outside the system, ROS and workspace library directories, or opened ANY file read-only from a hook staging directory (/tmp, /var/tmp, /run/user, /run/lock, /var/crash, a ~/.cache tree). This is what an LD_PRELOAD or LD_LIBRARY_PATH hook looks like from the file system: the loader opens the injected file, and it need not be called .so. Pip --user installs under ~/.local and nodes that read their own data from /tmp also trigger this and should not exist on a fielded unit. /dev/shm is deliberately not in the any-name arm (DDS shared-memory transports live there): mount it noexec and/or enable the ElfOpened rules."
+description = "A ROS 2 node (ROS install tree, robot workspace, or the Python interpreter that runs rclpy nodes) opened a shared object (*.so, *.so.N) outside the system, ROS and workspace library directories. This is what an LD_PRELOAD or LD_LIBRARY_PATH hook with a library name looks like from the file system: the loader opens the injected file. A hook with any other name is caught by content by the ElfOpened rules (elf_check = true is required) or prevented by noexec staging mounts; plain data reads (ros2 launch --params-file /tmp/launch_params_*, bags, model weights) are not flagged. Pip --user installs under ~/.local also trigger this and should not exist on a fielded unit."
 # TUNE: add the robot's vendor SDK library directories to the NOT list.
 condition = '''
 (header.image STARTS_WITH "/opt/ros/" OR header.image STARTS_WITH "/opt/robot_ws/install/" OR header.image STARTS_WITH "/usr/bin/python3" OR header.image STARTS_WITH "/bin/python3")
-AND (
-  payload.filename ENDS_WITH ".so" OR payload.filename CONTAINS ".so."
-  OR (
-    (payload.filename STARTS_WITH "/tmp/" OR payload.filename STARTS_WITH "/var/tmp/" OR payload.filename STARTS_WITH "/run/user/"
-     OR payload.filename STARTS_WITH "/run/lock/" OR payload.filename STARTS_WITH "/var/crash/" OR payload.filename CONTAINS "/.cache/")
-    AND payload.flags CONTAINS "O_RDONLY"
-  )
-)
+AND (payload.filename ENDS_WITH ".so" OR payload.filename CONTAINS ".so.")
 AND NOT (
   payload.filename STARTS_WITH "/usr/lib/"
   OR payload.filename STARTS_WITH "/lib/"
@@ -90,11 +97,20 @@ name = "RoboDR: ELF opened from a world-writable or user cache directory"
 type = "ElfOpened"
 category = "defense_evasion"
 severity = "high"
-description = "Any process opened an ELF object (by content, not name) from /tmp, /var/tmp, /dev/shm, /run/user, /run/lock, /var/crash or a ~/.cache tree. Hook libraries and implants are staged in user-writable locations under arbitrary names. Compilers writing object files to /tmp also trigger this; there are none on a fielded unit. /dev/shm is only seen if elf_check_whitelist does not contain /dev (Pulsar's default does)."
+description = "Any process opened, read-only, an ELF object (by content, not name) from /tmp, /var/tmp, /dev/shm, /run/user, /run/lock, /var/crash or a ~/.cache tree. Hook libraries and implants are staged in user-writable locations under arbitrary names and are loaded read-only. Write opens are not flagged (the async ELF check would otherwise report the assembler writing /tmp/cc*.o and cp filling the initramfs staging tree). update-initramfs reading its own staging tree as root (depmod -b, ldconfig -r, cpio; exact images) is excluded. Linking in one gcc step (and -flto) reads ELF objects from /tmp and still matches. /dev/shm is only seen if elf_check_whitelist does not contain /dev (Pulsar's default does)."
 condition = '''
-payload.filename STARTS_WITH "/tmp/" OR payload.filename STARTS_WITH "/var/tmp/" OR payload.filename STARTS_WITH "/dev/shm/"
-OR payload.filename STARTS_WITH "/run/user/" OR payload.filename STARTS_WITH "/run/lock/" OR payload.filename STARTS_WITH "/var/crash/"
-OR payload.filename CONTAINS "/.cache/"
+(payload.filename STARTS_WITH "/tmp/" OR payload.filename STARTS_WITH "/var/tmp/" OR payload.filename STARTS_WITH "/dev/shm/"
+ OR payload.filename STARTS_WITH "/run/user/" OR payload.filename STARTS_WITH "/run/lock/" OR payload.filename STARTS_WITH "/var/crash/"
+ OR payload.filename CONTAINS "/.cache/")
+AND payload.flags CONTAINS "O_RDONLY"
+AND NOT (
+  header.uid == 0
+  AND payload.filename STARTS_WITH "/var/tmp/mkinitramfs_"
+  AND (header.image == "/usr/sbin/depmod" OR header.image == "/sbin/depmod"
+       OR header.image == "/usr/sbin/ldconfig" OR header.image == "/sbin/ldconfig"
+       OR header.image == "/usr/sbin/ldconfig.real" OR header.image == "/sbin/ldconfig.real"
+       OR header.image == "/usr/bin/cpio" OR header.image == "/bin/cpio")
+)
 '''
 
 [[rules]]
@@ -135,11 +151,19 @@ name = "RoboDR: Shared library opened from a temporary directory"
 type = "FileOpened"
 category = "defense_evasion"
 severity = "high"
-description = "A shared object was opened from /tmp, /var/tmp, /dev/shm, /run/user, /run/lock or /var/crash (the world-writable directories of a stock Ubuntu image). Hook libraries are staged in world-writable locations; legitimate robot software loads libraries from package-managed paths. Self-extracting bundles (PyInstaller onefile, some vendor installers) also do this."
+description = "A shared object was opened read-only (as the dynamic loader does) from /tmp, /var/tmp, /dev/shm, /run/user, /run/lock or /var/crash (the world-writable directories of a stock Ubuntu image). Hook libraries are staged in world-writable locations; legitimate robot software loads libraries from package-managed paths. Writes are not flagged (the later load is). update-initramfs reading its staging tree as root (ldconfig -r, cpio; exact images) is excluded. Self-extracting bundles (PyInstaller onefile, some vendor installers) also match."
 condition = '''
 (payload.filename STARTS_WITH "/tmp/" OR payload.filename STARTS_WITH "/var/tmp/" OR payload.filename STARTS_WITH "/dev/shm/" OR payload.filename STARTS_WITH "/run/user/"
  OR payload.filename STARTS_WITH "/run/lock/" OR payload.filename STARTS_WITH "/var/crash/")
 AND (payload.filename ENDS_WITH ".so" OR payload.filename CONTAINS ".so.")
+AND payload.flags CONTAINS "O_RDONLY"
+AND NOT (
+  header.uid == 0
+  AND payload.filename STARTS_WITH "/var/tmp/mkinitramfs_"
+  AND (header.image == "/usr/sbin/ldconfig" OR header.image == "/sbin/ldconfig"
+       OR header.image == "/usr/sbin/ldconfig.real" OR header.image == "/sbin/ldconfig.real"
+       OR header.image == "/usr/bin/cpio" OR header.image == "/bin/cpio")
+)
 '''
 
 [[rules]]
@@ -158,11 +182,16 @@ name = "RoboDR: Shared library written into a system library path outside the pa
 type = "FileCreated"
 category = "persistence"
 severity = "high"
-description = "A file was created under /usr/lib, /lib, /usr/lib64, /lib64 or /usr/local/lib by something other than dpkg (exact image /usr/bin/dpkg or /bin/dpkg). A hook placed in a trusted library directory evades the 'library outside allowlisted paths' rules, and the loader does not care about the name, so ANY new file there is flagged, not only *.so. Byte-compiling Python as root (py3compile in a postinst, a root-run node importing a module without a .pyc) also creates files here; precompile at commissioning."
+description = "A file was created under /usr/lib, /lib, /usr/lib64, /lib64 or /usr/local/lib by something other than dpkg (exact image /usr/bin/dpkg or /bin/dpkg). A hook placed in a trusted library directory evades the 'library outside allowlisted paths' rules, and the loader does not care about the name, so ANY new file there is flagged, not only *.so. depmod (exact image) writing its modules.* index files under /lib/modules/<version>/ is excluded (every kernel upgrade). Byte-compiling Python as root (py3compile in a postinst, a root-run node importing a module without a .pyc) also creates files here; this is deliberately NOT excluded, because a forged .pyc in dist-packages is itself a code hook. Precompile at commissioning."
 condition = '''
 (payload.filename STARTS_WITH "/usr/lib/" OR payload.filename STARTS_WITH "/lib/" OR payload.filename STARTS_WITH "/usr/local/lib/"
  OR payload.filename STARTS_WITH "/usr/lib64/" OR payload.filename STARTS_WITH "/lib64/")
 AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
+AND NOT (
+  (header.image == "/usr/sbin/depmod" OR header.image == "/sbin/depmod")
+  AND (payload.filename STARTS_WITH "/usr/lib/modules/" OR payload.filename STARTS_WITH "/lib/modules/")
+  AND payload.filename CONTAINS "/modules."
+)
 '''
 
 [[rules]]
@@ -170,11 +199,50 @@ name = "RoboDR: File moved into a system library path or linker configuration ou
 type = "FileRename"
 category = "persistence"
 severity = "high"
-description = "A file was renamed into /usr/lib, /lib, /usr/lib64, /lib64, /usr/local/lib, /etc/ld.so.conf or /etc/ld.so.conf.d by something other than dpkg. Creating a file elsewhere and renaming it in produces no FileCreated/FileOpened event on the target path, so the creation and write rules alone miss it."
+description = "A file was renamed into /usr/lib, /lib, /usr/lib64, /lib64, /usr/local/lib, /etc/ld.so.conf or /etc/ld.so.conf.d by something other than dpkg. Creating a file elsewhere and renaming it in produces no FileCreated/FileOpened event on the target path, so the creation and write rules alone miss it. depmod (exact image) renaming its modules.*.tmp index files into place is excluded."
 condition = '''
 (payload.destination STARTS_WITH "/usr/lib/" OR payload.destination STARTS_WITH "/lib/" OR payload.destination STARTS_WITH "/usr/local/lib/"
  OR payload.destination STARTS_WITH "/usr/lib64/" OR payload.destination STARTS_WITH "/lib64/"
  OR payload.destination == "/etc/ld.so.conf" OR payload.destination STARTS_WITH "/etc/ld.so.conf.d/")
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
+AND NOT (
+  (header.image == "/usr/sbin/depmod" OR header.image == "/sbin/depmod")
+  AND (payload.destination STARTS_WITH "/usr/lib/modules/" OR payload.destination STARTS_WITH "/lib/modules/")
+  AND payload.destination CONTAINS "/modules."
+)
+'''
+
+[[rules]]
+name = "RoboDR: Link created in a system library path or linker configuration outside the package manager"
+type = "FileLink"
+category = "persistence"
+severity = "high"
+description = "A hard or symbolic link was created in /usr/lib, /lib, /usr/lib64, /lib64, /usr/local/lib, or as /etc/ld.so.conf or a file in /etc/ld.so.conf.d, by something other than dpkg. A symlink 'libfoo.so.1 -> /home/x/hook' or a hard link of a staged file puts a hook where every library allowlist trusts it, and open(O_TMPFILE)+linkat() materialises a file there with no FileCreated or rename event at all. ldconfig (exact images) creating its soname symlinks is excluded only for symlinks whose target is a bare file name in the same directory (that is all ldconfig ever creates). Pulsar FileLink: 'source' is the new link, 'destination' the target (raw string for symlinks)."
+condition = '''
+(payload.source STARTS_WITH "/usr/lib/" OR payload.source STARTS_WITH "/lib/" OR payload.source STARTS_WITH "/usr/local/lib/"
+ OR payload.source STARTS_WITH "/usr/lib64/" OR payload.source STARTS_WITH "/lib64/"
+ OR payload.source == "/etc/ld.so.conf" OR payload.source STARTS_WITH "/etc/ld.so.conf.d/")
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
+AND NOT (
+  payload.hard_link == "false"
+  AND NOT payload.destination CONTAINS "/"
+  AND NOT payload.source STARTS_WITH "/etc/"
+  AND (header.image == "/sbin/ldconfig.real" OR header.image == "/usr/sbin/ldconfig.real"
+       OR header.image == "/sbin/ldconfig" OR header.image == "/usr/sbin/ldconfig")
+)
+'''
+
+[[rules]]
+name = "RoboDR: Existing file in a system library path opened for writing outside the package manager"
+type = "FileOpened"
+category = "persistence"
+severity = "high"
+description = "A file under /usr/lib, /lib, /usr/lib64, /lib64 or /usr/local/lib was opened for writing WITHOUT O_CREAT by something other than dpkg: an in-place overwrite of an existing library ('cp hook.so /usr/lib/.../libfoo.so.1' over the real one opens it O_WRONLY|O_TRUNC and raises no FileCreated), or an open(O_TMPFILE) in a library directory that will be linkat()ed into place. dpkg never writes installed files in place (it writes *.dpkg-new and renames). New files are the FileCreated rule's job."
+condition = '''
+(payload.filename STARTS_WITH "/usr/lib/" OR payload.filename STARTS_WITH "/lib/" OR payload.filename STARTS_WITH "/usr/local/lib/"
+ OR payload.filename STARTS_WITH "/usr/lib64/" OR payload.filename STARTS_WITH "/lib64/")
+AND (payload.flags CONTAINS "O_WRONLY" OR payload.flags CONTAINS "O_RDWR")
+AND NOT payload.flags CONTAINS "O_CREAT"
 AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
 '''
 
@@ -224,20 +292,33 @@ name = "RoboDR: Program executed from a file descriptor or /proc path"
 type = "Exec"
 category = "defense_evasion"
 severity = "high"
-description = "A program was executed through /dev/fd/N (fexecve/execveat on an fd, including memfd_create 'fileless' payloads) or a /proc path (/proc/self/exe, /proc/<pid>/exe, /proc/<pid>/fd/N, /proc/<pid>/root/...). The new process has an image path that names no file on disk, so every path-scoped rule (ROS-node scope, temp-dir exec, allowlists) is blind to it. systemd >= 255 starts every unit through its pinned systemd-executor as /proc/self/fd/N; that one form is excluded (see the TUNE note)."
-# TUNE: the systemd-executor exclusion trusts argv (attacker-chosen) and
-# parent_pid 1 (a double-forked root process is re-parented to PID 1), so a
-# root attacker who mimics it exactly is not flagged; it exists because the
-# rule would fire on every unit start on Ubuntu 24.04 without it. On
-# systemd < 255 delete the exclusion. Container runtimes (runc re-execs
-# /proc/self/exe) also match: exclude them only if the robot runs containers.
+description = "A program was executed through /dev/fd/N (fexecve/execveat on an fd, including memfd_create 'fileless' payloads) or a /proc path (/proc/self/exe, /proc/<pid>/exe, /proc/<pid>/fd/N, /proc/<pid>/root/...). The new process has an image path that names no file on disk, so every path-scoped rule (ROS-node scope, temp-dir exec, allowlists) is blind to it. systemd >= 255 starts every unit through its pinned systemd-executor as /proc/self/fd/N; that form is excluded for the system manager (root, parent PID 1) and for the user managers of the commissioned service accounts (see the TUNE note)."
+# TUNE: systemd >= 255 execs '/proc/self/fd/N' with argv
+# [/usr/lib/systemd/systemd-executor, --deserialize, N, ...] for every unit,
+# from PID 1 (system units, uid 0) AND from every 'systemd --user' manager
+# (user units: uid = the account, parent = that account's manager, not PID 1).
+# Exclusion 1 (system manager): uid 0 and parent PID 1. Exclusion 2 (user
+# managers): ONLY the uids listed below -- the robot's service accounts that
+# run ROS under 'systemd --user' (lingering). Default 1000, the first account
+# on an Ubuntu image; set it to the commissioned uid(s) and delete it if no
+# user manager runs on the robot. Every other uid, and root's own user
+# manager (user@0, parent is not PID 1), still fires.
+# Both exclusions trust argv (attacker-chosen): root can mimic #1 by double
+# forking to PID 1, and code already running as a listed uid can mimic #2
+# with fexecve + a copied argv. Pulsar has no parent image to tell the real
+# manager apart. On systemd < 255 delete both. Container runtimes (runc
+# re-execs /proc/self/exe) also match: exclude them only if the robot runs
+# containers.
 condition = '''
 (payload.filename STARTS_WITH "/dev/fd/" OR payload.filename STARTS_WITH "/proc/")
 AND NOT (
   payload.filename STARTS_WITH "/proc/self/fd/"
   AND payload.argv CONTAINS "/usr/lib/systemd/systemd-executor"
-  AND header.parent_pid == 1
-  AND header.uid == 0
+  AND payload.argv CONTAINS "--deserialize"
+  AND (
+    (header.parent_pid == 1 AND header.uid == 0)
+    OR (header.parent_pid != 1 AND header.uid == 1000)
+  )
 )
 '''
 
@@ -261,11 +342,14 @@ name = "RoboDR: ROS 2 process imported Python code from outside the allowlisted 
 type = "FileOpened"
 category = "defense_evasion"
 severity = "high"
-description = "A ROS 2 node or the Python interpreter read a Python source, bytecode or .pth file outside the system Python, ROS and workspace trees. This is the Python form of the one-environment-variable hook: PYTHONPATH, PYTHONHOME, a user site-packages directory (~/.local) or a planted sitecustomize/usercustomize/.pth runs attacker code INSIDE a trusted rclpy node (or the ros2 CLI), which then reads keys or publishes under that node's identity and its trusted /opt/ros image path. No ELF is loaded, so the library rules cannot see it."
+description = "A ROS 2 node or the Python interpreter read a Python source or bytecode file, or a site-packages/dist-packages .pth file, outside the system Python, ROS and workspace trees. This is the Python form of the one-environment-variable hook: PYTHONPATH, PYTHONHOME, PYTHONSTARTUP (*.py), a user site-packages directory (~/.local) or a planted sitecustomize/usercustomize/.pth runs attacker code INSIDE a trusted rclpy node (or the ros2 CLI), which then reads keys or publishes under that node's identity and its trusted /opt/ros image path. No ELF is loaded, so the library rules cannot see it. Python only executes .pth files found directly in a site directory, so .pth is matched only under */site-packages/ or */dist-packages/: PyTorch weights (*.pth in ~/.cache/torch) are data and do not match."
 # TUNE: add the robot's own Python package directories to the NOT list.
 condition = '''
 (header.image STARTS_WITH "/opt/ros/" OR header.image STARTS_WITH "/opt/robot_ws/install/" OR header.image STARTS_WITH "/usr/bin/python3" OR header.image STARTS_WITH "/bin/python3")
-AND (payload.filename ENDS_WITH ".py" OR payload.filename ENDS_WITH ".pyc" OR payload.filename ENDS_WITH ".pth")
+AND (
+  payload.filename ENDS_WITH ".py" OR payload.filename ENDS_WITH ".pyc"
+  OR (payload.filename ENDS_WITH ".pth" AND (payload.filename CONTAINS "/site-packages/" OR payload.filename CONTAINS "/dist-packages/"))
+)
 AND payload.flags CONTAINS "O_RDONLY"
 AND NOT (
   payload.filename STARTS_WITH "/usr/lib/python3"
@@ -281,9 +365,14 @@ name = "RoboDR: Interpreter one-liner executed"
 type = "Exec"
 category = "execution"
 severity = "medium"
-description = "python, perl, ruby, node or php was run with inline code (-c, -e, -E, --eval, -r and common bundles such as -Ic). Reverse shells and pty upgrades (python3 -c 'import pty; pty.spawn(...)', perl -e ...) take this form, and the shell they spawn usually has no -i, so the interactive-shell rule does not see it. Fielded robot software runs scripts from files. Rare false positives: python3 -E (ignore environment) and node -r (preload) running a script file."
+description = "python, perl, ruby, node or php was run with inline code (-c, -e, -E, --eval, -r and common bundles such as -Ic, -we, -wle). Reverse shells and pty upgrades (python3 -c 'import pty; pty.spawn(...)', perl -e ...) take this form, and the shell they spawn usually has no -i, so the interactive-shell rule does not see it. Fielded robot software runs scripts from files. Known false positives: CMake's FindPython probes ('python3 -c \"import sys; ...\"', dozens per configure) during colcon build on the unit, python3 -E (ignore environment) and node -r (preload) running a script file. Known misses: code glued to the option ('-cimport os', '-e'print'') and bundles not listed, because argv CONTAINS can only compare whole elements."
 # Shells with -c are deliberately not covered: system()/popen() run 'sh -c'
-# constantly. TUNE: exclude exact helper invocations found during commissioning.
+# constantly. The CMake FindPython probes are NOT excluded: their text differs
+# per CMake version (17 distinct strings in 3.28, some interpolated, one with
+# a double quote the DSL cannot express), and building on a fielded unit is
+# out of policy anyway (rules/README.md). TUNE: exclude exact helper
+# invocations found during commissioning, and only with argc pinned and every
+# argv element named (an extra element can carry the real code).
 condition = '''
 (payload.filename ENDS_WITH "/python" OR payload.filename ENDS_WITH "/python3" OR payload.filename CONTAINS "/python3."
  OR payload.filename ENDS_WITH "/python2" OR payload.filename CONTAINS "/python2."
@@ -294,7 +383,45 @@ AND (
   OR payload.argv CONTAINS "-Bc" OR payload.argv CONTAINS "-Ec" OR payload.argv CONTAINS "-sc" OR payload.argv CONTAINS "-Esc"
   OR payload.argv CONTAINS "-e" OR payload.argv CONTAINS "-ne" OR payload.argv CONTAINS "-pe" OR payload.argv CONTAINS "-le"
   OR payload.argv CONTAINS "-lne" OR payload.argv CONTAINS "-E" OR payload.argv CONTAINS "--eval" OR payload.argv CONTAINS "-r"
+  OR payload.argv CONTAINS "-Oc" OR payload.argv CONTAINS "-OOc" OR payload.argv CONTAINS "-qc" OR payload.argv CONTAINS "-bc"
+  OR payload.argv CONTAINS "-Pc" OR payload.argv CONTAINS "-IPc" OR payload.argv CONTAINS "-ISc" OR payload.argv CONTAINS "-Euc"
+  OR payload.argv CONTAINS "-we" OR payload.argv CONTAINS "-wle" OR payload.argv CONTAINS "-lwe" OR payload.argv CONTAINS "-wne"
+  OR payload.argv CONTAINS "-wpe" OR payload.argv CONTAINS "-wlne" OR payload.argv CONTAINS "-wlpe" OR payload.argv CONTAINS "-ane"
+  OR payload.argv CONTAINS "-lane" OR payload.argv CONTAINS "-wE" OR payload.argv CONTAINS "-wlE" OR payload.argv CONTAINS "-nE"
+  OR payload.argv CONTAINS "-lE" OR payload.argv CONTAINS "-Te" OR payload.argv CONTAINS "-tE"
 )
+'''
+
+[[rules]]
+name = "RoboDR: Interactive or stdin-fed Python interpreter started"
+type = "Exec"
+category = "execution"
+severity = "medium"
+description = "A Python interpreter was started interactively (-i or a bundle such as -iu/-Ii/-qi, or with no arguments at all) or told to read its program from stdin ('-'). The REPL and stdin programs run code that never touches the file system or argv, so the import and one-liner rules cannot see it; with a pty this is how arbitrary code runs inside a trusted interpreter. Fielded robot software runs scripts from files. The '-' arm excludes py3compile's worker ('python3.X -m py_compile -', every apt run that ships Python); adding '-m' and 'py_compile' elements to a stdin program evades it. PYTHONINSPECT=1 (the env-var form of -i) is invisible here: see the pty-wrapper and login-shell rules and rules/README.md."
+condition = '''
+(payload.filename ENDS_WITH "/python" OR payload.filename ENDS_WITH "/python3" OR payload.filename CONTAINS "/python3."
+ OR payload.filename ENDS_WITH "/python2" OR payload.filename CONTAINS "/python2.")
+AND (
+  payload.argc == 1
+  OR payload.argv CONTAINS "-i" OR payload.argv CONTAINS "-iu" OR payload.argv CONTAINS "-ui" OR payload.argv CONTAINS "-Ii"
+  OR payload.argv CONTAINS "-iI" OR payload.argv CONTAINS "-qi" OR payload.argv CONTAINS "-iq" OR payload.argv CONTAINS "-Ei"
+  OR payload.argv CONTAINS "-iE" OR payload.argv CONTAINS "-Si" OR payload.argv CONTAINS "-iS" OR payload.argv CONTAINS "-Bi"
+  OR payload.argv CONTAINS "-iB" OR payload.argv CONTAINS "-ic" OR payload.argv CONTAINS "-im"
+  OR (payload.argv CONTAINS "-" AND NOT (payload.argv CONTAINS "-m" AND payload.argv CONTAINS "py_compile"))
+)
+'''
+
+[[rules]]
+name = "RoboDR: Pseudo-terminal wrapper executed on robot controller"
+type = "Exec"
+category = "execution"
+severity = "medium"
+description = "script, expect, unbuffer, empty, screen, tmux or dtach was executed. These give a program a pseudo-terminal without a login. The PYTHONINSPECT=1 attack (re-review finding) needs exactly that: 'PYTHONINSPECT=1 script -qc /opt/ros/humble/bin/ros2 /dev/null' drops into a Python prompt INSIDE the trusted /opt/ros image after the CLI exits, where it can read enclave keys under the allowlisted image. Reverse-shell pty upgrades use the same tools. Fielded units run no terminal multiplexers. Executables with these names inside the ROS and workspace install trees are not matched."
+condition = '''
+(payload.filename ENDS_WITH "/script" OR payload.filename ENDS_WITH "/expect" OR payload.filename ENDS_WITH "/unbuffer"
+ OR payload.filename ENDS_WITH "/empty" OR payload.filename ENDS_WITH "/screen" OR payload.filename ENDS_WITH "/tmux"
+ OR payload.filename ENDS_WITH "/dtach")
+AND NOT (payload.filename STARTS_WITH "/opt/ros/" OR payload.filename STARTS_WITH "/opt/robot_ws/install/")
 '''
 
 # ---------------------------------------------------------------------------
