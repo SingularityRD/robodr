@@ -1,0 +1,21 @@
+#!/bin/sh
+# robodr prerm. Stops the services on removal; on upgrade they keep running
+# until postinst try-restarts them on the new binaries.
+set -e
+
+case "$1" in
+remove | deconfigure)
+    if [ -d /run/systemd/system ]; then
+        for u in robodr-agentd.service robodr-pulsard.service; do
+            systemctl stop "$u" 2>/dev/null || true
+        done
+    fi
+    ;;
+upgrade | failed-upgrade) ;;
+*)
+    echo "prerm called with unknown argument '$1'" >&2
+    exit 1
+    ;;
+esac
+
+exit 0

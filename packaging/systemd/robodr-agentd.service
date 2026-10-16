@@ -1,0 +1,94 @@
+# robodr-agentd: RoboDR decision chain (event -> deviation -> plan -> black
+# box -> OCSF finding) as a long-running daemon.
+#
+# PROTECTIVE ONLY. The agent detects, records evidence and *requests* a safe
+# state through the platform's own interface; it never overrides the safety
+# system, the e-stop or the platform's command authority, and nothing in the
+# robot's motion stack may depend on this unit being up.
+#
+# INTEGRATOR: robodr-agentd was written in parallel with this unit. Confirm
+# against the merged binary:
+#   * the config flag (assumed `--config <file.json>` below),
+#   * that the config can point the black-box key at the systemd credential
+#     path /run/credentials/robodr-agentd.service/blackbox.key,
+#   * the black-box and OCSF spool directories it writes (assumed below),
+#   * whether it calls sd_notify (if yes: Type=notify + WatchdogSec=).
+#
+# Verify after editing: systemd-analyze verify robodr-agentd.service
+#                       systemd-analyze security robodr-agentd.service
+
+[Unit]
+Description=RoboDR agent (decision chain, black box, OCSF spool)
+Documentation=file:/usr/share/doc/robodr/OPERATIONS.md
+AssertPathExists=/etc/robodr/agentd.json
+After=local-fs.target network.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/robodr-agentd --config /etc/robodr/agentd.json
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+# No WatchdogSec= until the daemon sends WATCHDOG=1 (it would be killed).
+OOMScoreAdjust=-500
+
+# --- Identity and capabilities ---------------------------------------------
+# Dedicated, unprivileged system user (packaging/sysusers.d/robodr.conf).
+User=robodr
+Group=robodr
+# The only privilege: read-only passive capture (AF_PACKET) of the robot's
+# DDS traffic. Ambient so the unprivileged process actually holds it;
+# bounded so it can never hold anything else.
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+NoNewPrivileges=yes
+UMask=0027
+
+# --- Key material ------------------------------------------------------------
+# systemd (PID 1, root) reads the root-only key file and exposes a copy to
+# this service alone, on a non-swappable ramfs, readable only by User=:
+#   /run/credentials/robodr-agentd.service/blackbox.key
+# The robodr user itself has no access to /etc/robodr/keys.
+LoadCredential=blackbox.key:/etc/robodr/keys/agentd-blackbox.key
+InaccessiblePaths=-/etc/robodr/keys
+
+# --- Filesystem --------------------------------------------------------------
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ReadWritePaths=/var/lib/robodr/blackbox/agentd /var/lib/robodr/spool/agentd
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# --- Network -----------------------------------------------------------------
+# Read-only on networks: AF_PACKET for capture, AF_NETLINK/AF_UNIX for
+# interface lookup and the journal. AF_INET is kept only because interface
+# lookups (if_nametoindex/ioctl) may need a datagram socket; IPAddressDeny=
+# blocks all IP traffic from this unit (AF_PACKET capture is not affected).
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_PACKET AF_INET AF_INET6
+IPAddressDeny=any
+
+# --- Kernel interfaces / syscalls -------------------------------------------
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete @mount @swap @reboot @raw-io @cpu-emulation @clock @module @debug
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

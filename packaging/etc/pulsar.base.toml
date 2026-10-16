@@ -1,0 +1,27 @@
+# /etc/robodr/pulsar.toml - configuration of robodr-pulsard.
+#
+# Generated at package build time: this header (packaging/etc/pulsar.base.toml)
+# followed by config/robodr.toml.example. It is a dpkg conffile: local edits
+# survive upgrades, and dpkg asks before replacing an edited file.
+# Restart after editing: systemctl restart robodr-pulsard
+# Unknown keys are only warned about: check the journal for
+# "Ignoring unknown key" after every edit.
+
+[pulsar]
+# The unit only allows writes to its RuntimeDirectory, not to /var/run.
+# The `pulsar` CLI must be pointed at this socket explicitly.
+api_socket_path = "/run/robodr-pulsard/pulsar.sock"
+
+[module.rules-engine]
+# Read-only, shipped by the package: RoboDR rules (rules/robodr) and the
+# Pulsar upstream rules (vendor/pulsar/rules), both validated in CI by
+# scripts/validate_rules.py. Loaded recursively (<rules_path>/**/*.toml).
+rules_path = "/usr/share/robodr/rules"
+
+[module.threat-logger]
+# Under systemd stderr is the journal; threat-logger detects that itself.
+console = true
+
+# ---------------------------------------------------------------------------
+# RoboDR sensor sections (from config/robodr.toml.example) follow.
+# ---------------------------------------------------------------------------

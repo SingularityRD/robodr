@@ -1,0 +1,15 @@
+# EXAMPLE drop-in, not active as shipped. To use it:
+#   install -D -m 0644 10-cap-sys-admin.conf.example \
+#       /etc/systemd/system/robodr-pulsard.service.d/10-cap-sys-admin.conf
+#   systemctl daemon-reload && systemctl restart robodr-pulsard
+#
+# Use it only if the journal shows Pulsar probes failing to load with EPERM
+# and one of these holds:
+#   * the kernel is older than 5.8 (no CAP_BPF / CAP_PERFMON: the kernel
+#     checks CAP_SYS_ADMIN instead), or
+#   * kernel.unprivileged_bpf_disabled / LSM policy on the target still
+#     requires CAP_SYS_ADMIN for a program type Pulsar loads.
+# CAP_SYS_ADMIN is close to full root; record the reason in the robot's
+# commissioning file when you enable this.
+[Service]
+CapabilityBoundingSet=CAP_SYS_ADMIN

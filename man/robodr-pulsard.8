@@ -1,0 +1,84 @@
+.\" robodr-pulsard(8). Source of truth: the clap definitions in
+.\" crates/robodr-pulsard/src/main.rs (Opts) and vendor/pulsar
+.\" (PulsarDaemonOpts), plus clap-verbosity-flag. Keep in sync.
+.TH ROBODR\-PULSARD 8 "2026-10-16" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
+.SH NAME
+robodr\-pulsard \- RoboDR: Pulsar runtime security agent with robot sensors
+.SH SYNOPSIS
+.B robodr\-pulsard
+.RB [ \-\-config\-file
+.IR FILE ]
+.RB [ \-v ...]
+.RB [ \-q ...]
+.PP
+.B robodr\-pulsard
+.RB ( \-h | \-\-help | \-V | \-\-version )
+.SH DESCRIPTION
+.B robodr\-pulsard
+is the Pulsar eBPF runtime\-security daemon with the RoboDR modules
+registered (today the ROS 2 sensor,
+.BR robodr\-sensor\-ros2 ).
+Pulsar's process, file\-system and network probes and its rules engine run as
+upstream; the RoboDR sensor watches ROS 2 discovery (SPDP socket and,
+optionally, passive AF_PACKET capture) against the locked model profile.
+.PP
+RoboDR is protective only: it detects and reports. It never overrides the
+robot's safety system, e\-stop or command authority.
+.PP
+It must run as root (Pulsar refuses otherwise). Under systemd the shipped
+unit confines that root process with a capability bounding set and a
+read\-only file system; see
+.I /usr/lib/systemd/system/robodr\-pulsard.service
+and
+.IR /usr/share/doc/robodr/PACKAGING.md .
+.SH OPTIONS
+.TP
+.BI \-\-config\-file " FILE"
+Pulsar configuration file (TOML). Default
+.IR /etc/pulsar/pulsar.toml ;
+the shipped unit passes
+.IR /etc/robodr/pulsar.toml .
+RoboDR modules are off unless enabled in
+.BI [module. name ]
+sections. Unknown keys are only warned about.
+.TP
+.BR \-v ", " \-\-verbose
+Increase logging verbosity (repeatable). Default level: info.
+.TP
+.BR \-q ", " \-\-quiet
+Decrease logging verbosity (repeatable).
+.TP
+.BR \-h ", " \-\-help
+Print help.
+.TP
+.BR \-V ", " \-\-version
+Print the RoboDR version plus the Pulsar version and commit it embeds.
+.SH FILES
+.TP
+.I /etc/robodr/pulsar.toml
+Daemon configuration (dpkg conffile).
+.TP
+.I /etc/robodr/profile.json
+Locked model profile (from
+.BR robodr\-commission (1)).
+Missing, unlocked or invalid: the sensor runs observe\-only.
+.TP
+.I /usr/share/robodr/rules/
+Pulsar rules (RoboDR and upstream), read at module start.
+.TP
+.I /run/robodr\-pulsard/pulsar.sock
+Pulsar API socket (as configured by the shipped
+.IR pulsar.toml ).
+.SH REQUIREMENTS
+Linux 5.5 or newer with BPF and BTF
+.RI ( /sys/kernel/btf/vmlinux ),
+and a bpf file system mounted at
+.IR /sys/fs/bpf .
+Live capture needs CAP_NET_RAW.
+.SH EXIT STATUS
+0 on a clean shutdown, 1 on error (reported on stderr).
+.SH SEE ALSO
+.BR robodr\-commission (1),
+.BR robodr\-ros2\-watch (1),
+.BR systemd.exec (5),
+/usr/share/doc/robodr/OPERATIONS.md

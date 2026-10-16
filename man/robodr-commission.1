@@ -1,0 +1,207 @@
+.\" robodr-commission(1). Source of truth: the USAGE text in
+.\" crates/robodr-commission/src/main.rs. Keep the two in sync.
+.TH ROBODR\-COMMISSION 1 "2026-10-16" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
+.SH NAME
+robodr\-commission \- learn, review, lock and verify a RoboDR model profile
+.SH SYNOPSIS
+.B robodr\-commission learn
+.RB ( \-\-events
+.IR run.jsonl " | "
+.B \-\-pcap
+.IR run.pcap[ng] )
+\&...
+.RB [ \-\-model
+.IR NAME ]
+.RB [ \-\-margin
+.IR 1.1 ]
+.RB [ \-\-min\-samples
+.IR 30 ]
+.RB [ \-\-ceiling\-linear
+.IR M_PER_S ]
+.RB [ \-\-ceiling\-joint
+.IR RAD_PER_S ]
+.RB [ \-\-hard\-cap\-linear
+.IR 10 ]
+.RB [ \-\-hard\-cap\-joint
+.IR 10 ]
+.RB [ \-\-min\-announcements
+.IR 2 ]
+.RB [ \-\-min\-duration
+.IR SECS ]
+.RB [ \-\-accept\-participant
+.IR GUID ]...
+.RB [ \-\-motion\-topic
+.IR /T ]...
+.RB [ \-\-learn\-readers ]
+.B \-\-out
+.I profile.json
+.RB [ \-\-signoff
+.IR signoff.json ]
+.RB [ \-\-report
+.IR report.json ]
+.RB [ \-\-quiet ]
+.RB [ \-\-force ]
+.PP
+.B robodr\-commission lock
+.B \-\-in
+.I profile.json
+.B \-\-signoff
+.I signoff.json
+.B \-\-out
+.I locked.json
+.RB [ \-\-force ]
+.PP
+.B robodr\-commission signoff
+.B \-\-in
+.I profile.json
+.B \-\-out
+.I signoff.json
+.RB [ \-\-force ]
+.PP
+.B robodr\-commission diff
+.I old.json new.json
+.RB [ \-\-json ]
+.PP
+.B robodr\-commission check
+.B \-\-profile
+.I locked.json
+.RB ( \-\-events
+.IR f " | "
+.B \-\-pcap
+.IR f )
+\&...
+.RB [ \-\-json ]
+.PP
+.B robodr\-commission merge
+.B \-\-out
+.I merged.json
+.I a.json b.json
+\&...
+.RB [ \-\-force ]
+.PP
+.B robodr\-commission
+.RB ( help " | " \-\-help " | " \-h " | " version " | " \-\-version )
+.SH DESCRIPTION
+.B robodr\-commission
+builds the model profile that RoboDR enforces for one robot model.
+It is an offline, operator\-run tool, not a service: it reads recorded runs
+and writes files, and never touches the robot bus or the running daemons.
+.PP
+The workflow is
+.B learn
+(observe a clean run and write a draft profile plus a sign\-off list),
+human review of the sign\-off list,
+.B lock
+(seal the reviewed draft), then
+.B check
+(replay further runs against the locked profile).
+.B diff
+compares two profiles,
+.B merge
+combines drafts, and
+.B signoff
+creates a conservative sign\-off list for an edited or merged draft.
+.SH INPUTS
+.TP
+.BI \-\-events " file"
+JSON Lines of RobotEvent.
+.TP
+.BI \-\-pcap " file"
+pcap or pcapng capture of the robot bus (discovery only: participants,
+writers, readers).
+.PP
+Both repeat and mix; every file is one run.
+.SH LEARN OPTIONS
+.TP
+.BI \-\-model " NAME"
+Model name recorded in the profile.
+.TP
+.BI \-\-margin " F"
+Margin applied to learned motion envelopes (shown default: 1.1).
+.TP
+.BI \-\-min\-samples " N"
+Minimum motion samples per channel (shown default: 30).
+.TP
+.BI \-\-ceiling\-linear " M_PER_S\fR, " \-\-ceiling\-joint " RAD_PER_S"
+Ceilings for learned linear and joint envelopes.
+.TP
+.BI \-\-hard\-cap\-linear " V\fR, " \-\-hard\-cap\-joint " V"
+No envelope exceeds these hard caps (shown default: 10).
+.TP
+.BI \-\-min\-announcements " N\fR, " \-\-min\-duration " SECS"
+Anti\-poisoning: participants announced fewer than
+.B \-\-min\-announcements
+times (shown default: 2), or, in captures, seen for less than
+.B \-\-min\-duration
+seconds (0 to 86400), are quarantined: not learned, nor their endpoints or
+motion samples.
+.TP
+.BI \-\-accept\-participant " GUID"
+Override the quarantine for a participant (repeatable). It becomes a
+sign\-off item.
+.TP
+.BI \-\-motion\-topic " /T"
+Treat this topic as a motion channel (repeatable).
+.TP
+.B \-\-learn\-readers
+Also learn reader_topics, which turns reader\-topic enforcement on (off by
+default: a policy choice for the OEM).
+.TP
+.BI \-\-out " profile.json"
+Draft profile (required). Written with
+.BR locked:\ false .
+.TP
+.BI \-\-signoff " signoff.json"
+Sign\-off list (default
+.IB out .signoff.json\fR).
+.TP
+.BI \-\-report " report.json"
+Machine\-readable learning report.
+.TP
+.B \-\-quiet
+Do not print the report on stdout.
+.SH SIGN-OFF AND LOCK
+.B learn
+writes a sign\-off list;
+.B lock
+refuses until a named
+.B \(dqoperator\(dq
+has set
+.B \(dqconfirmed\(dq: true
+on every item.
+.B signoff
+builds a conservative list for an edited or merged draft. A locked profile is
+sealed; the sensor refuses a locked profile whose seal does not match.
+.SH FILE HANDLING
+Outputs never overwrite an existing file or follow a symlink unless
+.B \-\-force
+(symlinks are refused even then). Every output is written atomically
+(temporary file, fsync, rename). The outputs of one command must be distinct
+from each other and from its inputs. A failed
+.B learn
+writes nothing. Profiles are loaded strictly (regular file, size cap, no
+unknown keys, sealed if locked).
+.SH EXIT STATUS
+.TP
+.B 0
+OK / clean.
+.TP
+.B 1
+Negative result: deviations found, profiles differ, lock refused.
+.TP
+.B 2
+Usage, input or I/O error.
+.SH EXAMPLES
+.nf
+robodr\-commission learn \-\-pcap run1.pcapng \-\-pcap run2.pcapng \e
+    \-\-model ugv\-x \-\-out draft.json \-\-report report.json
+$EDITOR draft.json.signoff.json      # review, confirm, set operator
+robodr\-commission lock \-\-in draft.json \e
+    \-\-signoff draft.json.signoff.json \-\-out locked.json
+robodr\-commission check \-\-profile locked.json \-\-pcap run3.pcapng
+.fi
+.SH SEE ALSO
+.BR robodr\-ros2\-watch (1),
+.BR robodr\-replay (1),
+.BR robodr\-pulsard (8),
+/usr/share/doc/robodr/OPERATIONS.md

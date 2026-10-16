@@ -1,0 +1,101 @@
+.\" robodr-ros2-watch(1). Source of truth: USAGE in
+.\" crates/robodr-ros2-pipeline/src/watch.rs. Keep the two in sync.
+.TH ROBODR\-ROS2\-WATCH 1 "2026-10-16" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
+.SH NAME
+robodr\-ros2\-watch \- run the RoboDR ROS 2 detection pipeline over captured RTPS traffic
+.SH SYNOPSIS
+.B robodr\-ros2\-watch
+.B \-\-profile
+.I profile.json
+.B \-\-pcap
+.I file
+[\fIoptions\fR]
+.PP
+.B robodr\-ros2\-watch
+.B \-\-profile
+.I profile.json
+.B \-\-interface
+.I name
+.RB [ \-\-interface
+.IR name ]...
+[\fIoptions\fR]
+.SH DESCRIPTION
+.B robodr\-ros2\-watch
+runs the RoboDR ROS 2 detection pipeline over captured RTPS traffic and prints
+each finding as one JSON line on stdout. It is read\-only: it never sends on the
+robot bus.
+.SH INPUT
+Exactly one kind:
+.TP
+.BI \-\-pcap " file"
+Replay a pcap or pcapng file.
+.TP
+.BI \-\-interface " name"
+Live capture on an interface (Linux, needs CAP_NET_RAW); repeatable;
+.B any
+= every interface.
+.SH OPTIONS
+.TP
+.BI \-\-profile " file"
+Model profile (JSON). An invalid profile is reported and the run is
+observe\-only (never enforcing).
+.TP
+.BI \-\-domain " id"
+ROS_DOMAIN_ID whose well\-known ports are captured (repeatable, 0..=232;
+default 0). RTPS on other ports is still caught by the
+.B RTPS
+magic.
+.TP
+.BI \-\-dedup " n"
+Dedup capacity (default 4096).
+.TP
+.B \-\-no\-anomalies
+Do not report RTPS parse anomalies.
+.TP
+.B \-\-no\-fragmentation
+Do not report fragmented discovery (rejected fragments are always reported).
+.TP
+.BI \-\-discovery\-server " ip"
+Trust announcements relayed from this IP (repeatable).
+.TP
+.BI \-\-participant\-ip " prefix" = ip
+Pin a GUID prefix (24 hex digits) to a source IP (repeatable; several IPs per
+prefix allowed).
+.TP
+.BI \-\-hold\-ms " ms"
+How long SEDP from a participant without SPDP is held before it is reported
+(default 30000; replays report what is still held at the end).
+.TP
+.B \-\-no\-binding
+Disable the participant/source\-IP binding check.
+.TP
+.BI \-\-duration " secs"
+Live only: stop after this many seconds (then
+.B \-\-stats
+is printed); default: run until killed.
+.TP
+.B \-\-stats
+Print final counters as JSON on stderr.
+.TP
+.BR \-h ", " \-\-help
+This help.
+.TP
+.BR \-V ", " \-\-version
+Version.
+.SH EXIT STATUS
+.TP
+.B 0
+Done.
+.TP
+.B 1
+Runtime error.
+.TP
+.B 2
+Usage error.
+.SH EXAMPLES
+.nf
+robodr\-ros2\-watch \-\-profile /etc/robodr/profile.json \-\-pcap lab.pcapng \-\-stats
+.fi
+.SH SEE ALSO
+.BR robodr\-commission (1),
+.BR robodr\-pulsard (8)

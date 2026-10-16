@@ -1,0 +1,32 @@
+#!/bin/sh
+# robodr postrm.
+#
+# Evidence and keys are NEVER deleted by the package manager, not even on
+# purge: /var/lib/robodr holds the signed black box (possibly the only record
+# of an incident) and /etc/robodr/keys the material needed to verify it.
+# Deleting them is a deliberate, documented operator action
+# (OPERATIONS.md, "Decommissioning").
+set -e
+
+case "$1" in
+purge)
+    if [ -d /var/lib/robodr ] || [ -d /etc/robodr ]; then
+        echo "robodr: purge keeps /var/lib/robodr (evidence) and /etc/robodr (keys, profile)."
+        echo "robodr: export and archive them first; see OPERATIONS.md, 'Decommissioning'."
+    fi
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+    fi
+    ;;
+remove | upgrade | failed-upgrade | abort-install | abort-upgrade | disappear)
+    if [ "$1" = remove ] && [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+    fi
+    ;;
+*)
+    echo "postrm called with unknown argument '$1'" >&2
+    exit 1
+    ;;
+esac
+
+exit 0

@@ -1,0 +1,147 @@
+# robodr-pulsard: Pulsar eBPF runtime-security daemon with the RoboDR
+# ROS 2 sensor registered (crates/robodr-pulsard).
+#
+# PROTECTIVE ONLY. This service detects and reports. It is not in the robot's
+# safety path and must never be made a dependency of the motion stack, the
+# e-stop or the platform's command authority: if it fails, the robot runs on
+# exactly as it would without RoboDR (and the failure is visible in the
+# journal and on the fleet side as missing heartbeats).
+#
+# Privilege model (see packaging/README.md, "Why robodr-pulsard runs as root"):
+#  * Pulsar refuses to start unless euid == 0
+#    (vendor/pulsar/src/pulsard.rs: `ensure!(geteuid().is_root(), ...)`), so
+#    there is no User= here. Instead the root process is confined: the
+#    capability bounding set below is all it can ever hold, it cannot gain
+#    more (NoNewPrivileges), and it sees a read-only OS.
+#  * vendor/pulsar ships no systemd unit and no capability list (its README
+#    says "with administrator privileges"). The set below is DERIVED from what
+#    Pulsar's code does; it has NOT been exercised on a kernel yet. If a probe
+#    fails to load with EPERM on the target, see the drop-in example
+#    robodr-pulsard.service.d/10-cap-sys-admin.conf.example.
+#
+# Verify after editing: systemd-analyze verify robodr-pulsard.service
+#                       systemd-analyze security robodr-pulsard.service
+
+[Unit]
+Description=RoboDR runtime security agent (Pulsar eBPF + ROS 2 sensor)
+Documentation=man:robodr-pulsard(8) file:/usr/share/doc/robodr/OPERATIONS.md
+# Pulsar needs a bpf filesystem at /sys/fs/bpf. systemd mounts it at boot;
+# Pulsar would otherwise try to mount it itself, which this unit does not
+# allow (no @mount syscalls, read-only /sys). Fail loudly, not silently.
+AssertPathIsMountPoint=/sys/fs/bpf
+# BTF is required by Pulsar (CO-RE probes); see docs/BUILD.md "To run".
+AssertPathExists=/sys/kernel/btf/vmlinux
+AssertPathExists=/etc/robodr/pulsar.toml
+After=local-fs.target network.target
+Wants=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/robodr-pulsard --config-file /etc/robodr/pulsar.toml
+# Pulsar does not call sd_notify(), so neither Type=notify nor WatchdogSec=
+# can be used yet: with WatchdogSec= set, systemd would kill a healthy daemon
+# every period. Follow-up: send READY=1 after modules start and WATCHDOG=1
+# from the bus loop, then switch to Type=notify + WatchdogSec=30s.
+Restart=on-failure
+RestartSec=5s
+# Probes are detached on SIGTERM; give the daemon time to do it cleanly.
+TimeoutStopSec=30s
+# Detection should survive memory pressure longer than ordinary services,
+# but never outlive the robot's own control stack (do not use -1000).
+OOMScoreAdjust=-500
+
+# --- Identity and capabilities ---------------------------------------------
+# User=root (implicit; Pulsar asserts euid 0). Bounding set = everything the
+# process can ever hold, even as root:
+#   CAP_BPF            load BPF programs and maps (kernel >= 5.8)
+#   CAP_PERFMON        kprobes/tracepoints, perf event buffers (kernel >= 5.8)
+#   CAP_SYS_RESOURCE   Pulsar raises RLIMIT_MEMLOCK to infinity at start
+#                      (bpf_common::bump_memlock_rlimit); LimitMEMLOCK below
+#                      makes that a no-op, the cap keeps it from failing on
+#                      kernels that still charge BPF memory to the rlimit
+#   CAP_IPC_LOCK       locked perf ring buffers beyond perf_event_mlock_kb
+#   CAP_NET_RAW        read-only AF_PACKET passive capture of RTPS
+#                      ([module.robodr-sensor-ros2.capture])
+#   CAP_SYS_PTRACE     readlink /proc/<pid>/{exe,cwd,fd/*} of every process
+#                      (bpf-filtering process tree, procfs parsing)
+#   CAP_DAC_READ_SEARCH read other users' /proc entries and container
+#                      metadata (bpf-common/src/containers) without
+#                      CAP_DAC_OVERRIDE (no write bypass)
+#   CAP_MAC_ADMIN      BPF-LSM programs, used where the kernel has BPF LSM
+#                      enabled (bpf-feature-autodetect/src/lsm.rs).
+#                      Conservative; drop it if probes load without it.
+# Deliberately NOT granted: CAP_SYS_ADMIN (kernels < 5.8 need it instead of
+# CAP_BPF/CAP_PERFMON: use the drop-in example), CAP_DAC_OVERRIDE, CAP_FOWNER,
+# CAP_SETUID/SETGID, CAP_SYS_MODULE, CAP_NET_ADMIN, CAP_KILL, CAP_SYS_BOOT.
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_IPC_LOCK CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_MAC_ADMIN
+# Root already has these in its effective set; listing them as ambient is
+# not needed and is omitted on purpose.
+# NoNewPrivileges only blocks gaining privileges through execve()
+# (setuid/file caps). It does not affect bpf() or perf_event_open(), and
+# Pulsar never execs, so it is compatible with eBPF.
+NoNewPrivileges=yes
+SecureBits=noroot-locked
+LimitMEMLOCK=infinity
+UMask=0027
+
+# --- Filesystem --------------------------------------------------------------
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# Writable: only this daemon's own evidence and spool subdirectories
+# (single writer per black box: the recorder takes a lock per directory) and
+# its runtime dir for the Pulsar API socket. Set in /etc/robodr/pulsar.toml:
+#   [pulsar] api_socket_path = "/run/robodr-pulsard/pulsar.sock"
+ReadWritePaths=/var/lib/robodr/blackbox/pulsard /var/lib/robodr/spool/pulsard
+RuntimeDirectory=robodr-pulsard
+RuntimeDirectoryMode=0750
+# Keys are handed over by systemd, never read from /etc/robodr/keys by the
+# daemon itself (see packaging/README.md, "Key material"). The Pulsar module
+# does not record to a black box yet; when it does, add
+#   LoadCredential=blackbox.key:/etc/robodr/keys/pulsard-blackbox.key
+# (a missing source file makes the unit fail to start, so it is not listed
+# before the code uses it) and point the module at
+# /run/credentials/robodr-pulsard.service/blackbox.key.
+InaccessiblePaths=-/etc/robodr/keys
+# Pulsar must see every process: keep /proc fully visible (no ProtectProc=
+# invisible, no ProcSubset=pid).
+ProtectProc=default
+ProcSubset=all
+# Read-only /proc/sys, /sys. Pulsar only reads /sys (BTF, securityfs/lsm,
+# kprobe PMU type). Kernels without the perf kprobe PMU (< 4.17) would need
+# writable tracefs kprobe_events: unsupported here.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+# A private /dev with only API pseudo-devices. Pulsar's threat-logger detects
+# the journal on stderr and skips /dev/log (threat-logger/src/lib.rs).
+PrivateDevices=yes
+DevicePolicy=closed
+
+# --- Kernel interfaces / syscalls -------------------------------------------
+# AF_UNIX: API socket, journal. AF_INET/6: SPDP multicast listener.
+# AF_NETLINK: interface enumeration. AF_PACKET: passive capture.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+# @system-service + the two syscalls eBPF needs. bpf is in @privileged and
+# perf_event_open in @debug; we add the single calls, not those groups.
+# @mount is NOT allowed (bpffs must already be mounted, asserted above).
+SystemCallFilter=@system-service bpf perf_event_open
+SystemCallFilter=~@obsolete @swap @reboot @raw-io @cpu-emulation @clock @module
+SystemCallErrorNumber=EPERM
+# MemoryDenyWriteExecute applies to this process's own mappings only. The BPF
+# JIT runs in the kernel and is unaffected, and the Rust binary has no JIT.
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target
