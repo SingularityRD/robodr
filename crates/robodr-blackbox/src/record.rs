@@ -615,10 +615,23 @@ pub struct RecoveryPayload {
     /// quarantined, `critical` when the damage is not crash-plausible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub severity: Option<Severity>,
+    /// The whole *closed* segment `segment_index` failed verification at
+    /// open and was moved to `quarantine_file` (`offset` is 0,
+    /// `discarded_bytes` its size, `discarded_sha256` the hash of the
+    /// file). `discarded_records` then counts frames with a valid hash and
+    /// this chain's id; `discarded_seqs` spans the lowest and highest of them
+    /// whose signature verified. Never crash-plausible: a closed segment was
+    /// fsynced before its successor was created. Omitted when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub quarantined_segment: bool,
 }
 
 fn yes() -> bool {
     true
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 /// One piece of authenticated local state that points beyond the head.

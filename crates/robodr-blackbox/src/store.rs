@@ -7,10 +7,13 @@
 //! <dir>/seg-0000000000000000.rbb   segment files (length-prefixed binary frames)
 //! <dir>/seg-0000000000000001.rbb
 //! <dir>/checkpoint.json            latest seal checkpoint (atomic replace)
+//! <dir>/head.json                  high-water mark: newest durable record (atomic replace)
+//! <dir>/recovery-pin.json          only between a recovery cut and its record
 //! <dir>/export-cursor.json         last exported position (atomic replace)
 //! <dir>/export-ack.json            last receiver acknowledgement (ack mode)
 //! <dir>/recorder.lock              single-writer lock (flock)
-//! <dir>/quarantine/                bytes removed by crash recovery
+//! <dir>/quarantine/                bytes removed by crash recovery, damaged
+//!                                  closed segments, superseded state files
 //! ```
 //!
 //! Files and directories the recorder creates are mode 0600 / 0700, created
@@ -34,8 +37,8 @@
 //! Before chaining onto anything, [`Recorder::open`] authenticates it with
 //! the recorder's own key ([`Signer::verify_own`] or the verifier passed to
 //! [`Recorder::open_with_verifier`]): hash, linkage and signature of every
-//! record in the active segment; hash, signature, kind and index of the first
-//! record of every retained segment; and the drop records that anchor the
+//! record in the active segment; every retained closed segment as described
+//! under *Damaged closed segments*; and the drop records that anchor the
 //! oldest one. It refuses ([`Error::Corrupt`]) to extend a forged head.
 //! Segment indices that should be there but are not (a gap, or a missing
 //! predecessor of the oldest segment with no recorded drop) are reported in
@@ -62,14 +65,50 @@
 //!   under `fsync_critical`, or any record under `Always` follows; fsync
 //!   flushes every earlier page) it cannot be a crash: severity critical,
 //!   verifier tamper (`DamageQuarantined`). Either way the recorder keeps
-//!   recording instead of refusing to start.
+//!   recording instead of refusing to start. Before the cut, the highest
+//!   authentic record in the suffix is pinned in [`RECOVERY_PIN_FILE`]
+//!   (removed once the `Recovery` record is durable), so a crash between
+//!   the cut and the record still proves the loss at the next open.
 //!
-//! Anything else is [`Error::Corrupt`] and nothing is touched: a *complete*
-//! frame whose hash or signature fails without zero evidence (a crash
-//! cannot produce one: the hash is computed before the frame is written), a
-//! record that does not link, non-zero bytes that do not start a frame, or
-//! damage in a closed segment. An operator must then move the directory
-//! aside (a fresh chain starts).
+//! Anything else in the **active** segment is [`Error::Corrupt`] and nothing
+//! is touched: a *complete* frame whose hash or signature fails without zero
+//! evidence (a crash cannot produce one: the hash is computed before the
+//! frame is written), a record that does not link, non-zero bytes that do
+//! not start a frame. The active segment holds the head the recorder would
+//! chain onto, so it is never "repaired". An operator must then move the
+//! directory aside (a fresh chain starts).
+//!
+//! # Damaged closed segments (never brick on failing storage)
+//!
+//! Every retained *closed* segment is verified at open: strict framing,
+//! the hash and in-segment linkage of every record, the chain id of every
+//! record, its first record (genesis / its own `SegmentStart`), a final
+//! `Seal`, that its last record is the one the next segment chains onto,
+//! and the signatures of its first and last record and of every
+//! `SegmentDropped`, `Recovery` and `KeyRotation` record in it (all
+//! signatures with [`RecorderConfig::verify_closed_signatures`]; off by
+//! default because the in-crate Ed25519 verifies about 1 ms per record, so
+//! a full 64 MiB store would take minutes).
+//!
+//! A closed segment that fails is **quarantined** and the recorder keeps
+//! recording: its bytes are copied to `quarantine/damaged-seg<idx>.rbb`
+//! (fsynced), a signed `Recovery` record with `quarantined_segment: true`,
+//! the file's SHA-256, size, the count and authenticated seq range of the
+//! frames in it, `crash_plausible: false` and severity `high` (framing or
+//! hash damage, what failing media produces) or `critical` (authentic-
+//! looking records that do not belong: foreign chain, bad signature, broken
+//! cross-segment link, missing seal) is written, and only then is the
+//! original unlinked. The verifier reports it as `SegmentQuarantined`
+//! (tamper) and the missing seqs as `Deleted`. Sequence numbers are never
+//! reused: a quarantined segment between retained ones is bounded by its
+//! successor, and if it was the newest closed segment (active segment
+//! still empty) numbering continues after its highest authentic seq.
+//!
+//! Open still refuses when the head itself cannot be trusted: the active
+//! segment is corrupt (above), it is empty and no closed segment is intact,
+//! a signature fails under a key that verifies nothing in the log (a
+//! missing `previous_keys`, not damage), or authentic state contradicts
+//! the log (below).
 //!
 //! # Truncation evidence (never reuse a sequence number)
 //!
@@ -85,9 +124,43 @@
 //! only come from a key holder rewriting history: open refuses with
 //! [`Error::Untrusted`] and touches nothing.
 //!
-//! Limit: records written after the newest checkpoint/cursor and destroyed
-//! with the tail leave no trace the recorder can see; their seqs may be
-//! reused. Only an off-unit copy of their content could then show a `Fork`.
+//! # High-water mark (`head.json`) and external anchors
+//!
+//! Checkpoints are written only at seals, so a tail cut after the newest
+//! seal used to leave no trace. The recorder therefore also keeps a
+//! lightweight high-water mark: `head.json`, a [`Checkpoint`] of the newest
+//! record (its own signature makes it self-authenticating, no extra signing
+//! key operation). It is rewritten atomically every
+//! [`RecorderConfig::head_mark_every_records`] records (default 16) or when
+//! [`RecorderConfig::head_mark_interval_ns`] (default 1 s, measured on the
+//! records' monotonic clock) has passed at the next append, at every seal,
+//! at open and at close, and on demand with [`Recorder::mark_head`]. The
+//! segment is fsynced *before* the mark is written, so a mark never names a
+//! record a crash can take away: a mark beyond the head at open is
+//! truncation (`TruncationDetected`, critical, numbering continues after the
+//! mark), a mark naming a seq the log holds with another hash refuses open
+//! ([`Error::Untrusted`]). The mark also proves the records up to it were
+//! synced, so a zero-filled hole before it is not crash-plausible.
+//!
+//! An optional [`HeadAnchor`] ([`RecorderConfig::head_anchor`]) receives
+//! every mark too, e.g. a TPM NV monotonic counter or a remote receiver, and
+//! is consulted at open the same way. It survives an attacker who rewrites
+//! or deletes the whole directory, which `head.json` does not: a store with
+//! no segments while the anchor holds a mark starts a new chain that
+//! declares the gap (`Resume` + `TruncationDetected`), so a wiped store is
+//! reported, not silently restarted. Anchor failures never stop recording;
+//! they are counted ([`Recorder::anchor_failures`]).
+//!
+//! Remaining window: records written after the newest mark and destroyed
+//! with the tail (by an attacker with write access, or by losing unsynced
+//! data in a crash, which is not tampering) leave no trace locally; their
+//! seqs may be reused. That is at most `head_mark_every_records` records or
+//! `head_mark_interval_ns` of recording (plus records written after the
+//! last append while the recorder idles: call [`Recorder::mark_head`] from a
+//! timer to bound it in time). An attacker who can rewrite `head.json` can
+//! roll it back to an older authentic mark (they cannot forge one); only an
+//! external anchor closes that. Only an off-unit copy of lost content could
+//! then show a `Fork`.
 //!
 //! # Saturation counters
 //!
@@ -126,11 +199,163 @@ use crate::sign::{SignError, Signer, Verifier};
 use crate::time::Clock;
 use robodr_events::{Deviation, RobotEvent, Severity};
 use serde::Serialize;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+/// A position held by a [`HeadAnchor`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchoredHead {
+    /// Chain the position belongs to, if the anchor stores it (a bare
+    /// monotonic counter does not).
+    pub chain_id: Option<Hash>,
+    /// Highest sequence number the anchor has seen.
+    pub seq: u64,
+    /// Hash of record `seq`, if the anchor stores it.
+    pub hash: Option<Hash>,
+}
+
+/// An external, tamper-resistant home for the high-water mark: e.g. a TPM
+/// NV monotonic counter (holds only `seq`) or a remote receiver (can hold
+/// the whole signed mark). The anchor is a *trusted* input: what
+/// [`HeadAnchor::current`] returns is believed without a signature.
+///
+/// Implementations use interior mutability; calls come from the recorder's
+/// thread, at most once per mark. Neither call may block for long (they run
+/// inside `append`).
+pub trait HeadAnchor: Send + Sync + fmt::Debug {
+    /// Durably record that the log has reached `mark` (a [`Checkpoint`] of
+    /// its newest record, already fsynced). Called with increasing `seq`
+    /// only. An error is counted, never fatal; the next mark retries.
+    fn advance(&self, mark: &Checkpoint) -> Result<(), String>;
+    /// The highest mark held, if any. Read once at open.
+    fn current(&self) -> Result<Option<AnchoredHead>, String>;
+}
+
+/// In-memory [`HeadAnchor`]: a reference implementation for tests and
+/// simulation (it does not survive the process). [`MemoryHeadAnchor::counter`]
+/// behaves like a monotonic counter: it stores only `seq` and refuses to go
+/// down.
+#[derive(Debug, Default)]
+pub struct MemoryHeadAnchor {
+    held: Mutex<Option<AnchoredHead>>,
+    counter_only: bool,
+}
+
+impl MemoryHeadAnchor {
+    /// Stores the full mark (chain, seq, hash).
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Stores only the sequence number, never decreasing.
+    pub fn counter() -> Self {
+        Self {
+            held: Mutex::new(None),
+            counter_only: true,
+        }
+    }
+    /// What the anchor holds now.
+    pub fn get(&self) -> Option<AnchoredHead> {
+        self.held.lock().map(|g| g.clone()).unwrap_or(None)
+    }
+    /// Overwrite what the anchor holds (tests: simulate a remote copy).
+    pub fn set(&self, v: Option<AnchoredHead>) {
+        if let Ok(mut g) = self.held.lock() {
+            *g = v;
+        }
+    }
+}
+
+impl HeadAnchor for MemoryHeadAnchor {
+    fn advance(&self, mark: &Checkpoint) -> Result<(), String> {
+        let mut g = self
+            .held
+            .lock()
+            .map_err(|_| "anchor lock poisoned".to_string())?;
+        if self.counter_only {
+            if g.as_ref().is_some_and(|h| h.seq > mark.seq) {
+                return Err("monotonic counter cannot decrease".into());
+            }
+            *g = Some(AnchoredHead {
+                chain_id: None,
+                seq: mark.seq,
+                hash: None,
+            });
+        } else {
+            *g = Some(AnchoredHead {
+                chain_id: Some(mark.chain_id),
+                seq: mark.seq,
+                hash: Some(mark.hash),
+            });
+        }
+        Ok(())
+    }
+    fn current(&self) -> Result<Option<AnchoredHead>, String> {
+        Ok(self.get())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fault injection (unit tests only): simulate the process dying at a step.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::{Cell, RefCell};
+    use std::io;
+
+    thread_local! {
+        static ARMED: RefCell<Option<(String, u32)>> = const { RefCell::new(None) };
+        static FIRED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Fail the `nth` (1-based) time `point` is reached on this thread.
+    pub fn arm(point: &str, nth: u32) {
+        ARMED.with(|a| *a.borrow_mut() = Some((point.to_string(), nth.max(1))));
+        FIRED.with(|f| f.set(false));
+    }
+    pub fn disarm() {
+        ARMED.with(|a| *a.borrow_mut() = None);
+    }
+    pub fn fired() -> bool {
+        FIRED.with(|f| f.get())
+    }
+    pub fn hit(point: &str) -> io::Result<()> {
+        ARMED.with(|a| {
+            let mut a = a.borrow_mut();
+            if let Some((p, n)) = a.as_mut() {
+                if p == point {
+                    if *n <= 1 {
+                        *a = None;
+                        FIRED.with(|f| f.set(true));
+                        return Err(io::Error::other(format!("injected crash at {point}")));
+                    }
+                    *n -= 1;
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+/// A crash point. In unit tests an armed point fails here (the recorder is
+/// then dropped: no further disk effects, like a process killed at that
+/// step); otherwise a no-op.
+#[inline]
+fn fault(point: &str) -> io::Result<()> {
+    #[cfg(test)]
+    {
+        fault::hit(point)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = point;
+        Ok(())
+    }
+}
 
 /// Latest checkpoint file name.
 pub const CHECKPOINT_FILE: &str = "checkpoint.json";
@@ -142,6 +367,16 @@ pub const ACK_FILE: &str = "export-ack.json";
 pub const LOCK_FILE: &str = "recorder.lock";
 /// Quarantine directory name.
 pub const QUARANTINE_DIR: &str = "quarantine";
+/// High-water mark file name (a [`Checkpoint`] of the newest durable record).
+pub const HEAD_FILE: &str = "head.json";
+/// Pin written by crash recovery right before it cuts authentic records out
+/// of the active segment (a [`Checkpoint`] of the highest one), removed once
+/// the `Recovery` record is durable. If a crash falls in between, it is the
+/// evidence (and the seq floor) for the next open. Unlike [`HEAD_FILE`] it
+/// proves nothing about fsync order.
+pub const RECOVERY_PIN_FILE: &str = "recovery-pin.json";
+/// Name of the external anchor in [`StateEvidence::file`] and rejection notes.
+pub const EXTERNAL_ANCHOR: &str = "external-anchor";
 
 const SEG_PREFIX: &str = "seg-";
 const SEG_SUFFIX: &str = ".rbb";
@@ -235,11 +470,27 @@ pub struct RecorderConfig {
     pub max_payload_bytes: usize,
     /// Deviations at or above this severity are critical.
     pub critical_severity: Severity,
+    /// Rewrite the `head.json` high-water mark after this many records
+    /// (0 = only at seals, open and close). Each mark costs an fsync of the
+    /// segment plus an atomic file replace.
+    pub head_mark_every_records: u64,
+    /// Also rewrite it at the first append once this much monotonic time
+    /// (ns) has passed since the last mark (0 = no time trigger).
+    pub head_mark_interval_ns: u64,
+    /// Optional external anchor that receives every mark and is checked at
+    /// open (see the module docs).
+    pub head_anchor: Option<Arc<dyn HeadAnchor>>,
+    /// Verify the signature of every record of every closed segment at open
+    /// (default: only the first and last record and the control records the
+    /// recorder relies on; hashes and links are always checked in full).
+    pub verify_closed_signatures: bool,
 }
 
 impl RecorderConfig {
     /// Defaults: cyclic, 8 x 8 MiB, fsync every 16 records and every critical
-    /// one, seal every 256 records, 64 KiB payloads, High+ deviations critical.
+    /// one, seal every 256 records, 64 KiB payloads, High+ deviations
+    /// critical, high-water mark every 16 records or 1 s, no external anchor,
+    /// closed segments' signatures sampled (first, last, control records).
     pub fn new(
         dir: impl Into<PathBuf>,
         device_id: impl Into<String>,
@@ -256,6 +507,10 @@ impl RecorderConfig {
             seal_every_records: 256,
             max_payload_bytes: 64 * 1024,
             critical_severity: Severity::High,
+            head_mark_every_records: 16,
+            head_mark_interval_ns: 1_000_000_000,
+            head_anchor: None,
+            verify_closed_signatures: false,
         }
     }
 
@@ -560,13 +815,45 @@ fn atomic_write(dir: &Path, name: &str, data: &[u8]) -> io::Result<()> {
         let mut f = create_new_private(&tmp, false)?;
         f.write_all(data)?;
         f.sync_all()?;
+        fault("atomic.after_tmp")?;
         fs::rename(&tmp, dir.join(name))
     })();
     if res.is_err() {
-        let _ = fs::remove_file(&tmp);
+        // A process killed here leaves the temp file behind (removed at the
+        // next open); an injected crash must leave it too.
+        #[cfg(test)]
+        let killed = fault::fired();
+        #[cfg(not(test))]
+        let killed = false;
+        if !killed {
+            let _ = fs::remove_file(&tmp);
+        }
     }
     res?;
+    fault("atomic.after_rename")?;
     sync_dir(dir)
+}
+
+/// Remove temp files a crash left behind in [`atomic_write`] (names
+/// `.<state file>.<hex>.tmp`). Called with the lock held. Best effort.
+fn remove_stale_tmp(dir: &Path) {
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some(n) = name.to_str() else { continue };
+        let ours = [
+            CHECKPOINT_FILE,
+            CURSOR_FILE,
+            ACK_FILE,
+            HEAD_FILE,
+            RECOVERY_PIN_FILE,
+        ]
+        .iter()
+        .any(|f| n.starts_with(&format!(".{f}.")));
+        if ours && n.ends_with(".tmp") {
+            let _ = fs::remove_file(e.path());
+        }
+    }
 }
 
 /// Take the single-writer lock on `dir` (`flock(LOCK_EX | LOCK_NB)` on
@@ -908,6 +1195,122 @@ enum PosCheck {
     Beyond(String),
     Mismatch(String),
     Unknown(String),
+    /// Inside the seq range of a segment quarantined at open: it existed,
+    /// but cannot be re-read from the log.
+    Quarantined,
+}
+
+/// A closed segment as read at open.
+struct ClosedSeg {
+    idx: u64,
+    path: PathBuf,
+    bytes: Vec<u8>,
+    /// Strictly parsed records (empty when structurally damaged).
+    records: Vec<Record>,
+    /// Why it must be quarantined, and how severe that is.
+    damage: Option<(String, Severity)>,
+    /// Authentic drop / segment-quarantine records it holds.
+    drops: Vec<SegmentDroppedPayload>,
+    quarantine_records: Vec<RecoveryPayload>,
+}
+
+/// A damaged closed segment about to be quarantined.
+struct QInfo {
+    pos: usize,
+    reason: String,
+    severity: Severity,
+    sha: String,
+    /// Frames with a valid hash and this chain's id.
+    records: u64,
+    /// Lowest and highest of them whose signature verified.
+    range: Option<[u64; 2]>,
+    /// Highest authentic record, if the segment is newer than the tail.
+    max_auth: Option<Record>,
+    /// An authentic `Recovery` already records this exact file (an earlier
+    /// open crashed before unlinking it).
+    recorded: bool,
+}
+
+/// Authentic state that names a position beyond the head.
+struct Beyond {
+    file: String,
+    seq: u64,
+    hash: Option<Hash>,
+    text: String,
+}
+
+/// Strict structure of a closed segment: whole frames only, every hash and
+/// in-segment link valid, at least one record, ending with a seal (every
+/// rotation seals and fsyncs before the next segment is created).
+fn closed_structure(name: &str, bytes: &[u8]) -> Result<Vec<Record>, String> {
+    let a = analyze_segment(name, bytes).map_err(|e| e.to_string())?;
+    if let Some(c) = a.cut {
+        return Err(format!("damaged at offset {}: {}", c.offset, c.reason));
+    }
+    match a.good.last() {
+        None => Err("holds no records".into()),
+        Some(r) if r.kind != RecordKind::Seal => {
+            Err(format!("does not end with a seal (last record {})", r.seq))
+        }
+        Some(_) => Ok(a.good),
+    }
+}
+
+/// Key id expected to sign each record of a segment (its `SegmentStart`
+/// names it, a `KeyRotation` changes it for the records after it).
+fn expected_keys(identity: &ChainIdentity, recs: &[Record]) -> Vec<String> {
+    let mut k = identity.key_id.clone();
+    let mut out = Vec::with_capacity(recs.len());
+    for r in recs {
+        if r.kind == RecordKind::SegmentStart {
+            k = r
+                .payload_json::<SegmentStartPayload>()
+                .and_then(|p| p.signing_key)
+                .map_or_else(|| identity.key_id.clone(), |sk| sk.key_id);
+        }
+        out.push(k.clone());
+        if r.kind == RecordKind::KeyRotation {
+            if let Some(p) = r.payload_json::<KeyRotationPayload>() {
+                k = p.to.key_id;
+            }
+        }
+    }
+    out
+}
+
+/// Collect an (already authenticated) drop or segment-quarantine record.
+fn collect_control(
+    r: &Record,
+    drops: &mut Vec<SegmentDroppedPayload>,
+    quarantines: &mut Vec<RecoveryPayload>,
+) {
+    match r.kind {
+        RecordKind::SegmentDropped => {
+            if let Some(d) = r.payload_json::<SegmentDroppedPayload>() {
+                drops.push(d);
+            }
+        }
+        RecordKind::Recovery => {
+            if let Some(q) = r
+                .payload_json::<RecoveryPayload>()
+                .filter(|q| q.quarantined_segment)
+            {
+                quarantines.push(q);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Evidence text for a mark held by an external anchor.
+fn anchor_evidence_json(h: &AnchoredHead) -> String {
+    serde_json::json!({
+        "source": EXTERNAL_ANCHOR,
+        "chain_id": h.chain_id.map(|c| to_hex(&c)),
+        "seq": h.seq,
+        "hash": h.hash.map(|x| to_hex(&x)),
+    })
+    .to_string()
 }
 
 /// Largest index gap the recorder will record as missing segments; a larger
@@ -950,6 +1353,21 @@ pub struct Recorder {
     /// Lowest seq the next record may take (set at open when records beyond
     /// the head are known to have existed; consumed by the next write).
     seq_floor: Option<u64>,
+    /// Signature and monotonic time of the head record (for marks).
+    head_sig: Vec<u8>,
+    head_mono: u64,
+    /// Last high-water mark written (or authenticated at open).
+    mark_seq: Option<u64>,
+    since_mark: u64,
+    last_mark_mono: u64,
+    mark_failures: u64,
+    anchor_failures: u64,
+    last_anchor_error: Option<String>,
+    /// `[first, last]` authenticated seq ranges of segments quarantined at
+    /// open (positions inside them cannot be re-read).
+    quarantined_ranges: Vec<[u64; 2]>,
+    /// Indices of the closed segments quarantined by this open.
+    quarantined_now: Vec<u64>,
 }
 
 impl fmt::Debug for Recorder {
@@ -961,6 +1379,7 @@ impl fmt::Debug for Recorder {
             .field("head", &self.head.map(|(s, _)| s))
             .field("saturated", &self.saturated)
             .field("ack_mode", &self.ack_verifier.is_some())
+            .field("head_mark", &self.mark_seq)
             .finish_non_exhaustive()
     }
 }
@@ -1083,6 +1502,7 @@ impl Recorder {
         }
         create_dir_private(&cfg.dir)?;
         let lock = lock_dir(&cfg.dir)?;
+        remove_stale_tmp(&cfg.dir);
         let segs = list_segments(&cfg.dir)?;
         let parts = Parts {
             cfg,
@@ -1162,17 +1582,91 @@ impl Recorder {
             last_checkpoint: None,
             poisoned: false,
             seq_floor: None,
+            head_sig: Vec::new(),
+            head_mono: 0,
+            mark_seq: None,
+            since_mark: 0,
+            last_mark_mono: 0,
+            mark_failures: 0,
+            anchor_failures: 0,
+            last_anchor_error: None,
+            quarantined_ranges: Vec::new(),
+            quarantined_now: Vec::new(),
         };
         let genesis = to_json(&GenesisPayload {
             identity,
             recorder_version: env!("CARGO_PKG_VERSION").to_string(),
             format_version: FORMAT_VERSION,
         })?;
-        r.write_record(RecordKind::Genesis, genesis, true, true)?;
+        let g = r.write_record(RecordKind::Genesis, genesis, true, true)?;
         if let Some(rec) = recovery {
             r.write_record(RecordKind::Recovery, to_json(&rec)?, true, true)?;
         }
+        r.check_anchor_fresh(g.hash)?;
+        r.mark_best_effort();
         Ok(r)
+    }
+
+    /// A new chain while the external anchor holds a mark: the store was
+    /// wiped or replaced. Declare the anchor's seqs as skipped (never reuse
+    /// them: a counter anchor only goes up) and record the truncation.
+    fn check_anchor_fresh(&mut self, genesis_hash: Hash) -> Result<(), Error> {
+        let Some(anchor) = self.cfg.head_anchor.clone() else {
+            return Ok(());
+        };
+        let held = match anchor.current() {
+            Ok(Some(h)) if h.seq > 0 => h,
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                self.anchor_failures += 1;
+                self.last_anchor_error = Some(e);
+                return Ok(());
+            }
+        };
+        let floor = held
+            .seq
+            .checked_add(1)
+            .ok_or_else(|| Error::Config("external anchor at the end of seq space".into()))?;
+        let text = anchor_evidence_json(&held);
+        let preserved_as = Some(Self::preserve(
+            &self.cfg,
+            &format!("state-{EXTERNAL_ANCHOR}-seq{}", held.seq),
+            "json",
+            text.as_bytes(),
+        )?);
+        let skipped = [1, held.seq];
+        self.seq_floor = Some(floor);
+        let resume = ResumePayload {
+            boot_id: self.cfg.boot_id.clone(),
+            chain_boot_id: self.identity.boot_id.clone(),
+            resumed_after_seq: 0,
+            recovered: false,
+            missing_segments: Vec::new(),
+            rejected_state: vec![format!(
+                "{EXTERNAL_ANCHOR}: holds seq {} but the log directory held no chain: \
+                 the store was wiped or replaced (see the TruncationDetected record)",
+                held.seq
+            )],
+            skipped_seqs: Some(skipped),
+            refused_noncritical: 0,
+            refused_critical: 0,
+        };
+        self.write_record(RecordKind::Resume, to_json(&resume)?, true, true)?;
+        let p = to_json(&TruncationPayload {
+            head_seq: 0,
+            head_hash: to_hex(&genesis_hash),
+            evidence: vec![StateEvidence {
+                file: EXTERNAL_ANCHOR.into(),
+                seq: held.seq,
+                hash: held.hash.map(|h| to_hex(&h)).unwrap_or_default(),
+                preserved_as,
+                sha256: to_hex(&sha256(text.as_bytes())),
+            }],
+            skipped_seqs: skipped,
+            severity: Severity::Critical,
+        })?;
+        self.write_record(RecordKind::TruncationDetected, p, true, true)?;
+        Ok(())
     }
 
     /// Create a new, uniquely named file `quarantine/<base>[-n].<ext>`.
@@ -1211,6 +1705,11 @@ impl Recorder {
 
     /// Move `bytes[cut..]` of segment `seg_idx` to `quarantine/` and truncate
     /// the segment to `cut`.
+    ///
+    /// `mark`: a high-water mark naming the highest authentic record about
+    /// to be cut away, written *before* the truncation, so that a crash
+    /// between the truncation and the `Recovery` record still leaves
+    /// evidence (and a seq floor) for the next open.
     fn quarantine(
         cfg: &RecorderConfig,
         seg_idx: u64,
@@ -1218,6 +1717,7 @@ impl Recorder {
         bytes: &[u8],
         cut: u64,
         reason: String,
+        mark: Option<&Checkpoint>,
     ) -> Result<RecoveryPayload, Error> {
         let discarded = &bytes[cut as usize..];
         let file = Self::preserve(
@@ -1226,11 +1726,17 @@ impl Recorder {
             "bin",
             discarded,
         )?;
+        fault("recovery.after_preserve")?;
+        if let Some(m) = mark {
+            atomic_write(&cfg.dir, RECOVERY_PIN_FILE, m.to_json().as_bytes())?;
+            fault("recovery.after_mark")?;
+        }
         let mut o = OpenOptions::new();
         o.write(true);
         let f = private(&mut o).open(path)?;
         f.set_len(cut)?;
         f.sync_all()?;
+        fault("recovery.after_truncate")?;
         Ok(RecoveryPayload {
             segment_index: seg_idx,
             offset: cut,
@@ -1242,6 +1748,7 @@ impl Recorder {
             discarded_seqs: None,
             crash_plausible: true,
             severity: Some(Severity::Medium),
+            quarantined_segment: false,
         })
     }
 
@@ -1258,7 +1765,8 @@ impl Recorder {
         let (last_idx, last_path) = segs.last().cloned().expect("non-empty");
         let last_name = segment_file_name(last_idx);
         let bytes = fs::read(&last_path)?;
-        // 1. Structure, hashes and linkage of the active segment (no writes yet).
+        // 1. Structure, hashes and linkage of the active segment (no writes
+        //    yet). Damage here is refused: it holds the head.
         let Analysis { good, cut } = analyze_segment(&last_name, &bytes)?;
 
         if good.is_empty() && segs.len() == 1 {
@@ -1274,7 +1782,7 @@ impl Recorder {
             let recovery = match cut {
                 Some(c) => {
                     let mut rp = Self::quarantine(
-                        &parts.cfg, last_idx, &last_path, &bytes, c.offset, c.reason,
+                        &parts.cfg, last_idx, &last_path, &bytes, c.offset, c.reason, None,
                     )?;
                     if !c.after.is_empty() {
                         rp.discarded_records = c.after.len() as u64;
@@ -1288,30 +1796,55 @@ impl Recorder {
             return Self::start_chain(parts, file, recovery);
         }
 
-        // 2. The records we will chain onto: the active segment, or (if it is
-        //    empty) the whole previous segment.
-        let (tail, tail_name, tail_idx, need_segment_start) = if good.is_empty() {
-            let (pidx, ppath) = &segs[segs.len() - 2];
-            let pname = segment_file_name(*pidx);
-            let pbytes = fs::read(ppath)?;
-            let pa = analyze_segment(&pname, &pbytes)?;
-            if let Some(c) = pa.cut {
+        // 2. Strict structure of every closed segment (no writes yet). A
+        //    closed segment was fsynced before its successor was created:
+        //    no crash explains damage in it.
+        let mut closed: Vec<ClosedSeg> = Vec::with_capacity(segs.len() - 1);
+        for (idx, path) in &segs[..segs.len() - 1] {
+            let b = fs::read(path)?;
+            let (records, damage) = match closed_structure(&segment_file_name(*idx), &b) {
+                Ok(r) => (r, None),
+                Err(why) => (Vec::new(), Some((why, Severity::High))),
+            };
+            closed.push(ClosedSeg {
+                idx: *idx,
+                path: path.clone(),
+                bytes: b,
+                records,
+                damage,
+                drops: Vec::new(),
+                quarantine_records: Vec::new(),
+            });
+        }
+
+        // 3. The records we will chain onto: the active segment, or (if it
+        //    is empty) the newest intact closed segment. Damaged closed
+        //    segments newer than it are quarantined below.
+        let (tail, tail_name, tail_idx, need_segment_start, tail_pos) = if good.is_empty() {
+            let Some(p) = closed.iter().rposition(|c| c.damage.is_none()) else {
+                let why = closed
+                    .last()
+                    .and_then(|c| c.damage.as_ref())
+                    .map_or_else(String::new, |(w, _)| w.clone());
                 return Err(Error::Corrupt {
-                    segment: pname,
-                    offset: c.offset,
-                    reason: format!("closed segment damaged: {}", c.reason),
-                });
-            }
-            if pa.good.is_empty() {
-                return Err(Error::Corrupt {
-                    segment: pname,
+                    segment: segment_file_name(closed.last().map_or(last_idx, |c| c.idx)),
                     offset: 0,
-                    reason: "previous segment is empty".into(),
+                    reason: format!(
+                        "active segment is empty and no closed segment is intact ({why}): \
+                         no trustworthy head to chain onto"
+                    ),
                 });
-            }
-            (pa.good, pname, *pidx, true)
+            };
+            let c = &closed[p];
+            (
+                c.records.clone(),
+                segment_file_name(c.idx),
+                c.idx,
+                true,
+                Some(p),
+            )
         } else {
-            (good, last_name.clone(), last_idx, false)
+            (good, last_name.clone(), last_idx, false, None)
         };
         let identity = segment_identity(&tail_name, tail_idx, &tail[0])?;
         let key = current_key(&identity, &tail);
@@ -1329,7 +1862,7 @@ impl Recorder {
         }
         let chain_id = identity.chain_id();
         let keys = parts.keys();
-        // 3. Authenticate every record we chain onto: never extend a forged head.
+        // 4. Authenticate every record we chain onto: never extend a forged head.
         for r in &tail {
             if r.chain_id != chain_id {
                 return Err(Error::Corrupt {
@@ -1350,57 +1883,187 @@ impl Recorder {
                 });
             }
         }
-
-        // 4. Every retained segment: authenticated first record (kind, index,
-        //    chain), plus every authentic drop record (for head anchoring).
-        let mut infos: VecDeque<SegInfo> = VecDeque::with_capacity(segs.len());
-        let mut drops: Vec<SegmentDroppedPayload> = Vec::new();
-        for (i, (idx, path)) in segs.iter().enumerate() {
-            let is_last = i + 1 == segs.len();
-            let name = segment_file_name(*idx);
-            let owned;
-            let seg_bytes: &[u8] = if is_last {
-                // Only the part we keep (a cut suffix is quarantined).
-                let end = cut.as_ref().map_or(bytes.len(), |c| c.offset as usize);
-                &bytes[..end]
-            } else {
-                owned = fs::read(path)?;
-                &owned
-            };
-            let mut start = None;
-            for it in scan_frames(seg_bytes).items {
-                let ScanItem::Record(sr) = it else { continue };
-                let r = &sr.record;
-                if start.is_none() {
-                    if !keys.record(r) || r.chain_id != chain_id {
-                        return Err(Error::Corrupt {
-                            segment: name,
-                            offset: sr.offset,
-                            reason: "first record does not authenticate".into(),
-                        });
-                    }
-                    segment_identity(&name, *idx, r)?;
-                    start = Some((r.seq, r.prev_hash));
-                }
-                if r.kind == RecordKind::SegmentDropped && r.chain_id == chain_id && keys.record(r)
-                {
-                    if let Some(d) = r.payload_json::<SegmentDroppedPayload>() {
-                        drops.push(d);
-                    }
-                }
-            }
-            if start.is_none() && !is_last {
-                return Err(Error::Corrupt {
-                    segment: name,
-                    offset: 0,
-                    reason: "closed segment holds no records".into(),
-                });
-            }
-            infos.push_back(SegInfo { index: *idx, start });
+        // Keys proven present: any key that verified some record.
+        let mut verified_keys: HashSet<String> =
+            expected_keys(&identity, &tail).into_iter().collect();
+        let mut tail_drops: Vec<SegmentDroppedPayload> = Vec::new();
+        let mut tail_quarantines: Vec<RecoveryPayload> = Vec::new();
+        for r in &tail {
+            collect_control(r, &mut tail_drops, &mut tail_quarantines);
         }
 
-        // 5. Expected segment indices: gaps, and the oldest one's predecessor.
-        let reported = |idx: u64| drops.iter().any(|d| d.segment_index == idx && d.missing);
+        // 5. Every other closed segment: chain, identity, signatures.
+        let verify_all = parts.cfg.verify_closed_signatures;
+        let mut sig_failures: Vec<(usize, u64, String)> = Vec::new();
+        for (ci, c) in closed.iter_mut().enumerate() {
+            if c.damage.is_some() || Some(ci) == tail_pos {
+                continue;
+            }
+            let name = segment_file_name(c.idx);
+            if let Some(r) = c.records.iter().find(|r| r.chain_id != chain_id) {
+                c.damage = Some((
+                    format!("record {} belongs to another chain", r.seq),
+                    Severity::Critical,
+                ));
+                continue;
+            }
+            if let Err(e) = segment_identity(&name, c.idx, &c.records[0]) {
+                c.damage = Some((e.to_string(), Severity::Critical));
+                continue;
+            }
+            let ks = expected_keys(&identity, &c.records);
+            let n = c.records.len();
+            let mut fail = None;
+            for (i, (r, k)) in c.records.iter().zip(ks).enumerate() {
+                let control = matches!(
+                    r.kind,
+                    RecordKind::SegmentDropped | RecordKind::Recovery | RecordKind::KeyRotation
+                );
+                if !(verify_all || i == 0 || i + 1 == n || control) {
+                    continue;
+                }
+                if keys.sig(&signing_message(&r.hash), &r.sig) {
+                    verified_keys.insert(k);
+                    collect_control(r, &mut c.drops, &mut c.quarantine_records);
+                } else if fail.is_none() {
+                    fail = Some((r.seq, k));
+                }
+            }
+            if let Some((seq, k)) = fail {
+                sig_failures.push((ci, seq, k));
+            }
+        }
+        for (ci, seq, k) in sig_failures {
+            if !verified_keys.contains(&k) {
+                // Not damage we can tell from a missing key: refuse, as for
+                // the head (pass the old key to open_with_keys).
+                return Err(Error::Corrupt {
+                    segment: segment_file_name(closed[ci].idx),
+                    offset: 0,
+                    reason: format!(
+                        "record {seq} signature does not verify (with this key or any \
+                         previous key given to open_with_keys; key {k} verifies no record); \
+                         refusing to open"
+                    ),
+                });
+            }
+            closed[ci].damage = Some((
+                format!("record {seq} signature does not verify under key {k}"),
+                Severity::Critical,
+            ));
+        }
+
+        // 6. Cross-segment links, newest first: a closed segment must end
+        //    with the record its retained successor chains onto.
+        let active_first = (!need_segment_start).then(|| (tail[0].seq, tail[0].prev_hash));
+        for ci in (0..closed.len()).rev() {
+            if closed[ci].damage.is_some() || Some(ci) == tail_pos {
+                continue;
+            }
+            let idx = closed[ci].idx;
+            let next = match closed.get(ci + 1) {
+                Some(n) if n.idx == idx + 1 && n.damage.is_none() => {
+                    Some((n.records[0].seq, n.records[0].prev_hash))
+                }
+                Some(_) => None,
+                None if last_idx == idx + 1 => active_first,
+                None => None,
+            };
+            if let Some((s, prev)) = next {
+                let l = closed[ci].records.last().expect("non-empty");
+                if prev != l.hash || s <= l.seq {
+                    closed[ci].damage = Some((
+                        format!(
+                            "its last record {} is not the record segment {} chains onto",
+                            l.seq,
+                            idx + 1
+                        ),
+                        Severity::Critical,
+                    ));
+                }
+            }
+        }
+
+        // 7. Retained segments and what the quarantined ones held.
+        let mut infos: VecDeque<SegInfo> = VecDeque::with_capacity(segs.len());
+        let mut drops = tail_drops;
+        let mut recorded_q = tail_quarantines;
+        for (ci, c) in closed.iter().enumerate() {
+            if c.damage.is_some() {
+                continue;
+            }
+            infos.push_back(SegInfo {
+                index: c.idx,
+                start: Some((c.records[0].seq, c.records[0].prev_hash)),
+            });
+            if Some(ci) != tail_pos {
+                drops.extend(c.drops.iter().cloned());
+                recorded_q.extend(c.quarantine_records.iter().cloned());
+            }
+        }
+        let active_start = if need_segment_start {
+            None
+        } else {
+            Some((tail[0].seq, tail[0].prev_hash))
+        };
+        infos.push_back(SegInfo {
+            index: last_idx,
+            start: active_start,
+        });
+        let head_rec = tail.last().expect("non-empty").clone();
+        let mut quarantine: Vec<QInfo> = Vec::new();
+        for (ci, c) in closed.iter().enumerate() {
+            let Some((reason, severity)) = &c.damage else {
+                continue;
+            };
+            let sha = to_hex(&sha256(&c.bytes));
+            let mut cands: Vec<Record> = scan_frames(&c.bytes)
+                .items
+                .into_iter()
+                .filter_map(|it| match it {
+                    ScanItem::Record(sr)
+                        if sr.record.chain_id == chain_id
+                            && sr.record.compute_hash() == sr.record.hash =>
+                    {
+                        Some(sr.record)
+                    }
+                    _ => None,
+                })
+                .collect();
+            cands.sort_by_key(|r| r.seq);
+            // Bounded signature work: the frames are untrusted.
+            const TRIES: usize = 32;
+            let hi = cands.iter().rev().take(TRIES).find(|r| keys.record(r));
+            let lo = cands.iter().take(TRIES).find(|r| keys.record(r));
+            let range = match (lo, hi) {
+                (Some(a), Some(b)) => Some([a.seq, b.seq]),
+                _ => None,
+            };
+            let already = recorded_q
+                .iter()
+                .any(|q| q.segment_index == c.idx && q.discarded_sha256 == sha);
+            quarantine.push(QInfo {
+                pos: ci,
+                reason: reason.clone(),
+                severity: *severity,
+                sha,
+                records: cands.len() as u64,
+                range,
+                max_auth: hi.filter(|_| c.idx > tail_idx).cloned(),
+                recorded: already,
+            });
+        }
+        let q_indices: HashSet<u64> = quarantine
+            .iter()
+            .map(|q| closed[q.pos].idx)
+            .chain(recorded_q.iter().map(|q| q.segment_index))
+            .collect();
+
+        // 8. Expected segment indices: gaps, and the oldest one's predecessor.
+        //    Quarantined segments are reported by their own record.
+        let reported = |idx: u64| {
+            q_indices.contains(&idx) || drops.iter().any(|d| d.segment_index == idx && d.missing)
+        };
         let mut missing: Vec<u64> = Vec::new();
         let oldest = infos[0];
         if oldest.index > 0 {
@@ -1423,7 +2086,11 @@ impl Recorder {
             }
         }
         for (a, b) in infos.iter().zip(infos.iter().skip(1)) {
-            let gap = b.index - a.index - 1;
+            let quarantined_between = q_indices
+                .iter()
+                .filter(|&&i| i > a.index && i < b.index)
+                .count() as u64;
+            let gap = (b.index - a.index - 1).saturating_sub(quarantined_between);
             if gap > MAX_SEGMENT_GAP {
                 return Err(Error::Corrupt {
                     segment: segment_file_name(b.index),
@@ -1434,9 +2101,7 @@ impl Recorder {
             missing.extend((a.index + 1..b.index).filter(|&i| !reported(i)));
         }
 
-        let head_rec = tail.last().expect("non-empty").clone();
-
-        // 5b. Authentic records quarantined with a mid-segment hole: their
+        // 8b. Authentic records quarantined with a mid-segment hole: their
         //     seqs must never be reused; whether a crash explains the hole.
         let lost: Vec<Record> = cut
             .as_ref()
@@ -1448,40 +2113,68 @@ impl Recorder {
                     .collect()
             })
             .unwrap_or_default();
-        let lost_max = lost
+        let lost_top = lost
             .iter()
-            .map(|r| r.seq)
-            .max()
-            .filter(|&m| m > head_rec.seq);
-        let crash_plausible = !lost.iter().any(|r| Self::was_synced(&parts.cfg, r));
+            .filter(|r| r.seq > head_rec.seq)
+            .max_by_key(|r| r.seq)
+            .cloned();
+        let lost_max = lost_top.as_ref().map(|r| r.seq);
+        // The high-water mark proves everything up to it was fsynced.
+        let mark_in = read_state(&parts.cfg.dir, HEAD_FILE)?
+            .and_then(|s| Checkpoint::from_json(&s))
+            .filter(|c| c.chain_id == chain_id && keys.sig(&signing_message(&c.hash), &c.sig));
+        let crash_plausible = !lost.iter().any(|r| {
+            Self::was_synced(&parts.cfg, r) || mark_in.as_ref().is_some_and(|m| r.seq <= m.seq)
+        });
+        // Seqs held by quarantined records beyond the head (a damaged
+        // segment newer than the tail): never reuse them.
+        let q_top = quarantine
+            .iter()
+            .filter_map(|q| q.max_auth.as_ref())
+            .filter(|r| r.seq > head_rec.seq)
+            .max_by_key(|r| r.seq)
+            .cloned();
+        // Positions up to here are accounted for by quarantined evidence,
+        // not by a truncation.
+        let explained_max = lost_max.max(q_top.as_ref().map(|r| r.seq));
 
-        // 5c. Refusal counters persisted before the restart.
+        // 8c. Refusal counters persisted before the restart.
         let mut refusals = persisted_refusals(tail.iter());
-        if refusals.is_none() && !need_segment_start && segs.len() >= 2 {
-            let (_, ppath) = &segs[segs.len() - 2];
-            if let Ok(pbytes) = fs::read(ppath) {
-                let prev: Vec<Record> = scan_frames(&pbytes)
-                    .items
-                    .into_iter()
-                    .filter_map(|it| match it {
-                        ScanItem::Record(sr)
-                            if sr.record.chain_id == chain_id && keys.record(&sr.record) =>
-                        {
-                            Some(sr.record)
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                refusals = persisted_refusals(prev.iter());
+        if refusals.is_none() && !need_segment_start {
+            if let Some(c) = closed
+                .last()
+                .filter(|c| c.damage.is_none() && c.idx + 1 == last_idx)
+            {
+                refusals = persisted_refusals(c.records.iter());
             }
         }
         let (refused_noncritical, refused_critical) = refusals.unwrap_or((0, 0));
 
-        // 6. Only now modify anything: quarantine the damaged suffix.
+        // 9. Only now modify anything: quarantine the damaged suffix of the
+        //    active segment (after pinning the highest authentic record it
+        //    held in RECOVERY_PIN_FILE, so a crash right after the cut still
+        //    leaves evidence).
         let recovery = match cut {
             Some(c) => {
-                let mut rp =
-                    Self::quarantine(&parts.cfg, last_idx, &last_path, &bytes, c.offset, c.reason)?;
+                let pin = lost_top
+                    .as_ref()
+                    .filter(|r| mark_in.as_ref().is_none_or(|m| m.seq < r.seq))
+                    .map(|r| Checkpoint {
+                        chain_id,
+                        seq: r.seq,
+                        hash: r.hash,
+                        key_id: parts.signer.key_id().to_string(),
+                        sig: r.sig.clone(),
+                    });
+                let mut rp = Self::quarantine(
+                    &parts.cfg,
+                    last_idx,
+                    &last_path,
+                    &bytes,
+                    c.offset,
+                    c.reason,
+                    pin.as_ref(),
+                )?;
                 if !c.after.is_empty() {
                     rp.discarded_records = lost.len() as u64;
                     rp.discarded_seqs = lost_max.map(|m| [head_rec.seq + 1, m]);
@@ -1511,8 +2204,9 @@ impl Recorder {
             file.set_permissions(fs::Permissions::from_mode(0o600))?;
         }
         let seg_len = file.metadata()?.len();
+        let retained = infos.len();
         let saturated = matches!(parts.cfg.mode, RetentionMode::Saturation { max_segments, .. }
-            if segs.len() as u64 > u64::from(max_segments));
+            if retained as u64 > u64::from(max_segments));
         let chain_boot_id = identity.boot_id.clone();
         let Parts {
             cfg,
@@ -1554,33 +2248,64 @@ impl Recorder {
             last_checkpoint: None,
             poisoned: false,
             seq_floor: None,
+            head_sig: head_rec.sig.clone(),
+            head_mono: head_rec.time.mono_ns,
+            mark_seq: None,
+            since_mark: 0,
+            last_mark_mono: head_rec.time.mono_ns,
+            mark_failures: 0,
+            anchor_failures: 0,
+            last_anchor_error: None,
+            quarantined_ranges: quarantine.iter().filter_map(|q| q.range).collect(),
+            quarantined_now: Vec::new(),
         };
 
-        // 7. State files: trusted only if authenticated and consistent. An
-        //    authentic one that points *beyond* the head proves truncation.
+        // 10. State: trusted only if authenticated and consistent. An
+        //     authentic position *beyond* the head proves truncation, unless
+        //     quarantined evidence accounts for it.
+        let explained = |seq: u64| explained_max.is_some_and(|m| seq <= m);
         let mut rejected = Vec::new();
-        let mut beyond: Vec<(String, Anchor, String)> = Vec::new();
+        let mut beyond: Vec<Beyond> = Vec::new();
         if let Some(s) = read_state(&r.cfg.dir, CURSOR_FILE)? {
             match r.check_cursor(&s) {
                 Ok(a) => r.export_cursor = Some(a),
-                Err((Some(a), _)) => beyond.push((CURSOR_FILE.to_string(), a, s)),
+                Err((Some(a), _)) if explained(a.seq) => {}
+                Err((Some(a), _)) => beyond.push(Beyond {
+                    file: CURSOR_FILE.to_string(),
+                    seq: a.seq,
+                    hash: Some(a.hash),
+                    text: s,
+                }),
                 Err((None, why)) => rejected.push(format!("{CURSOR_FILE}: {why}")),
             }
         }
-        if let Some(s) = read_state(&r.cfg.dir, CHECKPOINT_FILE)? {
+        for name in [CHECKPOINT_FILE, HEAD_FILE, RECOVERY_PIN_FILE] {
+            let Some(s) = read_state(&r.cfg.dir, name)? else {
+                continue;
+            };
             match Checkpoint::from_json(&s) {
                 Some(c)
                     if c.chain_id == chain_id
                         && r.keys().sig(&signing_message(&c.hash), &c.sig) =>
                 {
                     match r.check_position(&c.anchor()) {
-                        PosCheck::Ok | PosCheck::Unknown(_) => r.last_checkpoint = Some(c),
-                        PosCheck::Beyond(_) => {
-                            beyond.push((CHECKPOINT_FILE.to_string(), c.anchor(), s))
+                        PosCheck::Ok | PosCheck::Unknown(_) | PosCheck::Quarantined => {
+                            if name == CHECKPOINT_FILE {
+                                r.last_checkpoint = Some(c);
+                            } else if name == HEAD_FILE {
+                                r.mark_seq = Some(c.seq);
+                            }
                         }
+                        PosCheck::Beyond(_) if explained(c.seq) => {}
+                        PosCheck::Beyond(_) => beyond.push(Beyond {
+                            file: name.to_string(),
+                            seq: c.seq,
+                            hash: Some(c.hash),
+                            text: s,
+                        }),
                         PosCheck::Mismatch(why) => {
                             return Err(Error::Untrusted(format!(
-                                "{CHECKPOINT_FILE} is authentic but {why}: the log was \
+                                "{name} is authentic but {why}: the log was \
                                  rewritten under this chain's key; refusing to extend it \
                                  (preserve the directory for analysis)"
                             )))
@@ -1588,23 +2313,61 @@ impl Recorder {
                     }
                 }
                 _ => rejected.push(format!(
-                    "{CHECKPOINT_FILE}: unparseable, foreign or not signed by this key"
+                    "{name}: unparseable, foreign or not signed by this key"
                 )),
             }
         }
+        if let Some(anchor) = r.cfg.head_anchor.clone() {
+            match anchor.current() {
+                Ok(None) => {}
+                Ok(Some(h)) if h.chain_id.is_some_and(|c| c != chain_id) => rejected.push(format!(
+                    "{EXTERNAL_ANCHOR}: holds a position of another chain"
+                )),
+                Ok(Some(h)) if h.seq > head_rec.seq => {
+                    if !explained(h.seq) {
+                        beyond.push(Beyond {
+                            file: EXTERNAL_ANCHOR.to_string(),
+                            seq: h.seq,
+                            hash: h.hash,
+                            text: anchor_evidence_json(&h),
+                        });
+                    }
+                }
+                Ok(Some(h)) => {
+                    if let Some(hash) = h.hash {
+                        let a = Anchor {
+                            chain_id,
+                            seq: h.seq,
+                            hash,
+                        };
+                        if let PosCheck::Mismatch(why) = r.check_position(&a) {
+                            return Err(Error::Untrusted(format!(
+                                "{EXTERNAL_ANCHOR} {why}: the log was rewritten under this \
+                                 chain's key; refusing to extend it"
+                            )));
+                        }
+                    }
+                }
+                Err(e) => {
+                    r.anchor_failures += 1;
+                    rejected.push(format!("{EXTERNAL_ANCHOR}: unreadable: {e}"));
+                    r.last_anchor_error = Some(e);
+                }
+            }
+        }
 
-        for (file, a, _) in &beyond {
+        for b in &beyond {
             rejected.push(format!(
-                "{file}: authentic but seq {} is beyond the head {}: log truncated \
+                "{}: authentic but seq {} is beyond the head {}: log truncated \
                  (see the TruncationDetected record)",
-                a.seq, head_rec.seq
+                b.file, b.seq, head_rec.seq
             ));
         }
         // Never reuse a sequence number that may exist elsewhere.
         let floor = beyond
             .iter()
-            .map(|(_, a, _)| a.seq)
-            .chain(lost_max)
+            .map(|b| b.seq)
+            .chain(explained_max)
             .max()
             .and_then(|m| m.checked_add(1));
         let skipped = floor.map(|f| [head_rec.seq + 1, f - 1]);
@@ -1612,21 +2375,50 @@ impl Recorder {
 
         // Keep the evidence before anything replaces it.
         let mut evidence = Vec::new();
-        for (file, a, text) in &beyond {
-            let base = format!("state-{}-seq{}", file.trim_end_matches(".json"), a.seq);
-            let preserved_as = Some(Self::preserve(&r.cfg, &base, "json", text.as_bytes())?);
+        for b in &beyond {
+            let base = format!("state-{}-seq{}", b.file.trim_end_matches(".json"), b.seq);
+            let preserved_as = Some(Self::preserve(&r.cfg, &base, "json", b.text.as_bytes())?);
             evidence.push(StateEvidence {
-                file: file.clone(),
-                seq: a.seq,
-                hash: to_hex(&a.hash),
+                file: b.file.clone(),
+                seq: b.seq,
+                hash: b.hash.map(|h| to_hex(&h)).unwrap_or_default(),
                 preserved_as,
-                sha256: to_hex(&sha256(text.as_bytes())),
+                sha256: to_hex(&sha256(b.text.as_bytes())),
             });
         }
 
-        // 8. Record what was found. The first record written takes the seq
-        //    jump; a `Resume` that declares it is the only in-segment jump the
-        //    recorder accepts at the next open.
+        // 11. Copy damaged closed segments into quarantine (the originals
+        //     stay until their records are durable).
+        let mut q_records = Vec::new();
+        for q in quarantine.iter().filter(|q| !q.recorded) {
+            let c = &closed[q.pos];
+            let file = Self::preserve(
+                &r.cfg,
+                &format!("damaged-seg{:016}", c.idx),
+                "rbb",
+                &c.bytes,
+            )?;
+            q_records.push(RecoveryPayload {
+                segment_index: c.idx,
+                offset: 0,
+                discarded_bytes: c.bytes.len() as u64,
+                discarded_sha256: q.sha.clone(),
+                reason: format!("closed segment failed verification: {}", q.reason),
+                quarantine_file: Some(file),
+                discarded_records: q.records,
+                discarded_seqs: q.range,
+                crash_plausible: false,
+                severity: Some(q.severity),
+                quarantined_segment: true,
+            });
+        }
+        if !quarantine.is_empty() {
+            fault("quarantine.after_copy")?;
+        }
+
+        // 12. Record what was found. The first record written takes the seq
+        //     jump; a `Resume` that declares it is the only in-segment jump
+        //     the recorder accepts at the next open.
         if need_segment_start {
             r.write_segment_start()?;
         }
@@ -1634,7 +2426,7 @@ impl Recorder {
             boot_id: r.cfg.boot_id.clone(),
             chain_boot_id,
             resumed_after_seq: head_rec.seq,
-            recovered: recovery.is_some(),
+            recovered: recovery.is_some() || !q_records.is_empty(),
             missing_segments: missing.clone(),
             rejected_state: rejected,
             skipped_seqs: skipped,
@@ -1644,6 +2436,9 @@ impl Recorder {
         r.write_record(RecordKind::Resume, to_json(&resume)?, true, true)?;
         if let Some(rec) = recovery {
             r.write_record(RecordKind::Recovery, to_json(&rec)?, true, true)?;
+        }
+        for rec in &q_records {
+            r.write_record(RecordKind::Recovery, to_json(rec)?, true, true)?;
         }
         if !evidence.is_empty() {
             let p = to_json(&TruncationPayload {
@@ -1668,6 +2463,28 @@ impl Recorder {
             })?;
             r.write_record(RecordKind::SegmentDropped, p, true, true)?;
         }
+
+        // 13. The quarantine is recorded (and synced): remove the originals.
+        if !quarantine.is_empty() {
+            fault("quarantine.after_records")?;
+            for q in &quarantine {
+                match fs::remove_file(&closed[q.pos].path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+                r.quarantined_now.push(closed[q.pos].idx);
+                fault("quarantine.after_unlink")?;
+            }
+            sync_dir(&r.cfg.dir)?;
+        }
+        // The recovery (or the truncation the pin proved) is on record.
+        match fs::remove_file(r.cfg.dir.join(RECOVERY_PIN_FILE)) {
+            Ok(()) => sync_dir(&r.cfg.dir)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        r.mark_best_effort();
         Ok(r)
     }
 
@@ -1682,7 +2499,10 @@ impl Recorder {
             ));
         }
         match self.check_position(&c.anchor) {
-            PosCheck::Ok => Ok(c.anchor),
+            // Authentic (our signature) and inside a segment quarantined at
+            // open: it can only stop the recorder re-exporting records that
+            // are gone anyway.
+            PosCheck::Ok | PosCheck::Quarantined => Ok(c.anchor),
             PosCheck::Beyond(_) => Err((Some(c.anchor), String::new())),
             PosCheck::Mismatch(why) | PosCheck::Unknown(why) => Err((None, why)),
         }
@@ -1693,6 +2513,9 @@ impl Recorder {
         match self.check_position(a) {
             PosCheck::Ok => Ok(()),
             PosCheck::Beyond(w) | PosCheck::Mismatch(w) | PosCheck::Unknown(w) => Err(w),
+            PosCheck::Quarantined => {
+                Err(format!("seq {} is in a segment quarantined at open", a.seq))
+            }
         }
     }
 
@@ -1739,6 +2562,10 @@ impl Recorder {
         let Some(&(idx, _, _)) = starts.iter().rev().find(|(_, seq, _)| *seq <= a.seq) else {
             return PosCheck::Ok; // older than all retained evidence
         };
+        let in_quarantine = self
+            .quarantined_ranges
+            .iter()
+            .any(|[lo, hi]| (*lo..=*hi).contains(&a.seq));
         let bytes = match fs::read(self.cfg.dir.join(segment_file_name(idx))) {
             Ok(b) => b,
             Err(e) => return PosCheck::Unknown(format!("cannot read segment {idx}: {e}")),
@@ -1755,6 +2582,9 @@ impl Recorder {
                     };
                 }
             }
+        }
+        if in_quarantine {
+            return PosCheck::Quarantined;
         }
         PosCheck::Unknown(format!("no authentic record {} in segment {idx}", a.seq))
     }
@@ -1817,6 +2647,9 @@ impl Recorder {
         self.seg_len += frame.len() as u64;
         self.seg_records += 1;
         self.head = Some((seq, rec.hash));
+        self.head_sig.clone_from(&rec.sig);
+        self.head_mono = rec.time.mono_ns;
+        self.since_mark += 1;
         self.since_seal += 1;
         self.unsynced = self.unsynced.saturating_add(1);
         let sync = force_sync
@@ -1883,7 +2716,82 @@ impl Recorder {
         };
         atomic_write(&self.cfg.dir, CHECKPOINT_FILE, cp.to_json().as_bytes())?;
         self.last_checkpoint = Some(cp.clone());
+        self.mark_best_effort();
         Ok(cp)
+    }
+
+    /// Write the `head.json` high-water mark for the current head (and
+    /// advance the external anchor): fsync the segment first, so the mark
+    /// never names a record a crash can take away. No-op if the head is
+    /// already marked.
+    fn write_head_mark(&mut self) -> Result<(), Error> {
+        let Some((seq, hash)) = self.head else {
+            return Ok(());
+        };
+        if self.mark_seq.is_some_and(|m| m >= seq) {
+            return Ok(());
+        }
+        self.sync()?;
+        fault("mark.after_sync")?;
+        let cp = Checkpoint {
+            chain_id: self.chain_id,
+            seq,
+            hash,
+            key_id: self.signer.key_id().to_string(),
+            sig: self.head_sig.clone(),
+        };
+        atomic_write(&self.cfg.dir, HEAD_FILE, cp.to_json().as_bytes())?;
+        self.mark_seq = Some(seq);
+        self.since_mark = 0;
+        self.last_mark_mono = self.head_mono;
+        if let Some(a) = &self.cfg.head_anchor {
+            if let Err(e) = a.advance(&cp) {
+                self.anchor_failures += 1;
+                self.last_anchor_error = Some(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Recorder::write_head_mark`] where a failure must not fail the
+    /// operation that triggered it (the record is already written): it is
+    /// counted ([`Recorder::mark_failures`]) and retried at the next mark.
+    fn mark_best_effort(&mut self) {
+        if self.poisoned {
+            return;
+        }
+        if self.write_head_mark().is_err() {
+            self.mark_failures += 1;
+            // An injected crash must stop the recorder like a dead process,
+            // not be absorbed as a failed mark.
+            #[cfg(test)]
+            if fault::fired() {
+                self.poisoned = true;
+            }
+        }
+    }
+
+    /// Mark if `head_mark_every_records` records or `head_mark_interval_ns`
+    /// of record time have passed since the last mark.
+    fn maybe_mark(&mut self) {
+        let n = self.cfg.head_mark_every_records;
+        let t = self.cfg.head_mark_interval_ns;
+        let due = (n > 0 && self.since_mark >= n)
+            || (t > 0 && self.head_mono.saturating_sub(self.last_mark_mono) >= t);
+        if due {
+            self.mark_best_effort();
+        }
+    }
+
+    /// Write the high-water mark now (fsync + atomic replace of
+    /// `head.json`, then the external anchor). Call it from a timer to bound
+    /// the unmarked window in time while no records arrive. A failing
+    /// external anchor is counted, not returned.
+    pub fn mark_head(&mut self) -> Result<(), Error> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
+        self.write_head_mark()
     }
 
     /// Write a seal now and return its checkpoint. Export the checkpoint off
@@ -1991,6 +2899,7 @@ impl Recorder {
 
     fn rotate(&mut self) -> Result<(), Error> {
         self.seal_with(SealReason::Rotation)?;
+        fault("rotate.after_seal")?;
         if let Err(e) = self.file.sync_all() {
             self.poisoned = true;
             return Err(e.into());
@@ -1998,6 +2907,7 @@ impl Recorder {
         let idx = self.seg_index + 1;
         let path = self.cfg.dir.join(segment_file_name(idx));
         let file = create_new_private(&path, true)?;
+        fault("rotate.after_create")?;
         sync_dir(&self.cfg.dir)?;
         self.file = file;
         self.seg_index = idx;
@@ -2008,6 +2918,7 @@ impl Recorder {
             start: None,
         });
         self.write_segment_start()?;
+        fault("rotate.after_segment_start")?;
         if let RetentionMode::Cyclic { max_segments } = self.cfg.mode {
             while self.segments.len() > max_segments as usize {
                 self.drop_oldest(DropReason::Cyclic)?;
@@ -2078,12 +2989,14 @@ impl Recorder {
             missing,
         })?;
         self.write_record(RecordKind::SegmentDropped, p, true, true)?;
+        fault("drop.after_record")?;
         if !missing {
             match fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
             }
+            fault("drop.after_unlink")?;
             sync_dir(&self.cfg.dir)?;
         }
         self.segments.pop_front();
@@ -2162,6 +3075,7 @@ impl Recorder {
         if self.cfg.seal_every_records > 0 && self.since_seal >= self.cfg.seal_every_records {
             self.seal_with(SealReason::Periodic)?;
         }
+        self.maybe_mark();
         Ok(AppendOutcome::Recorded {
             seq: w.seq,
             hash: w.hash,
@@ -2413,6 +3327,29 @@ impl Recorder {
     pub fn dir(&self) -> &Path {
         &self.cfg.dir
     }
+    /// Seq of the last `head.json` high-water mark written (or found valid
+    /// at open).
+    pub fn head_mark(&self) -> Option<u64> {
+        self.mark_seq
+    }
+    /// High-water marks that could not be written (recording went on).
+    pub fn mark_failures(&self) -> u64 {
+        self.mark_failures
+    }
+    /// External anchor calls that failed (recording went on).
+    pub fn anchor_failures(&self) -> u64 {
+        self.anchor_failures
+    }
+    /// The last external anchor error, if any.
+    pub fn last_anchor_error(&self) -> Option<&str> {
+        self.last_anchor_error.as_deref()
+    }
+    /// Closed segments this open found damaged and moved to quarantine (a
+    /// `Recovery` record with `quarantined_segment` documents each). Worth
+    /// an alert: the storage is failing or someone edited the log.
+    pub fn quarantined_at_open(&self) -> &[u64] {
+        &self.quarantined_now
+    }
 }
 
 /// Read a small state file; `None` if absent. Symlinks are not followed.
@@ -2441,6 +3378,10 @@ fn read_state(dir: &Path, name: &str) -> Result<Option<String>, Error> {
     }
     Ok(Some(s))
 }
+
+#[cfg(test)]
+#[path = "store_crash_tests.rs"]
+mod crash_tests;
 
 #[cfg(test)]
 mod tests {

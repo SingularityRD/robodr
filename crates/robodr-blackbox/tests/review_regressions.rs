@@ -7,7 +7,9 @@ mod common;
 use common::*;
 use robodr_blackbox::export::{cursor_signing_message, Ack, SignedCursor};
 use robodr_blackbox::record::{ResumePayload, SegmentDroppedPayload};
-use robodr_blackbox::store::{segment_file_name, ACK_FILE, CHECKPOINT_FILE, CURSOR_FILE};
+use robodr_blackbox::store::{
+    segment_file_name, ACK_FILE, CHECKPOINT_FILE, CURSOR_FILE, QUARANTINE_DIR,
+};
 use robodr_blackbox::verify::verify_dir;
 use robodr_blackbox::*;
 use std::path::Path;
@@ -504,7 +506,10 @@ fn reg_d_forged_records_anywhere_we_trust_are_refused() {
         Err(Error::Corrupt { .. })
     ));
 
-    // First record of an older (closed) segment.
+    // First record of an older (closed) segment: the log's own key verifies
+    // other records, so this is damage, not a missing key. The segment is
+    // quarantined (recorded, reported as tamper) instead of bricking the
+    // recorder; nothing is chained onto it.
     let d = TestDir::new("reg-d-old");
     let mut r = open(cfg(d.path(), big()));
     let mut i = 0;
@@ -521,10 +526,25 @@ fn reg_d_forged_records_anywhere_we_trust_are_refused() {
     let enc = f.encode_frame();
     b[o..o + enc.len()].copy_from_slice(&enc);
     std::fs::write(&p, &b).unwrap();
-    assert!(matches!(
-        Recorder::open(cfg(d.path(), big()), signer(), clock()),
-        Err(Error::Corrupt { .. })
-    ));
+    let r = Recorder::open(cfg(d.path(), big()), signer(), clock()).unwrap();
+    assert_eq!(r.quarantined_at_open(), &[1]);
+    r.close().unwrap();
+    assert!(!p.exists());
+    let rep = vdir(d.path());
+    assert!(!rep.is_intact());
+    assert!(has(&rep, |k| matches!(
+        k,
+        FindingKind::SegmentQuarantined {
+            segment_index: 1,
+            ..
+        }
+    )));
+    // The forged bytes are kept as evidence, byte for byte.
+    let kept = d
+        .path()
+        .join(QUARANTINE_DIR)
+        .join("damaged-seg0000000000000001.rbb");
+    assert_eq!(std::fs::read(kept).unwrap(), b);
 }
 
 /// (d) a signer that cannot check its own signatures must come with a

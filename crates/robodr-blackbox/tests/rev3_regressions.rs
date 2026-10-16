@@ -98,8 +98,17 @@ fn b1_truncation_below_checkpoint_is_recorded_and_seqs_are_not_reused() {
     assert_eq!(td.head_seq, head);
     assert_eq!(td.skipped_seqs, [head + 1, cp.seq]);
     assert_eq!(td.severity, Severity::Critical);
-    assert_eq!(td.evidence.len(), 1);
-    let ev = &td.evidence[0];
+    // The checkpoint, and the high-water mark written with the same seal.
+    assert_eq!(td.evidence.len(), 2);
+    assert!(td
+        .evidence
+        .iter()
+        .any(|e| e.file == robodr_blackbox::store::HEAD_FILE && e.seq == cp.seq));
+    let ev = td
+        .evidence
+        .iter()
+        .find(|e| e.file == CHECKPOINT_FILE)
+        .unwrap();
     assert_eq!((ev.file.as_str(), ev.seq), (CHECKPOINT_FILE, cp.seq));
     assert_eq!(ev.hash, to_hex(&cp.hash));
     // The evidence checkpoint was preserved byte for byte before the
