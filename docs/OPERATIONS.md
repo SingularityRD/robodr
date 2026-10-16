@@ -141,8 +141,8 @@ private copy (`/run/credentials/<unit>/blackbox.key`). The reasons are in
 > before this release) are a *shared secret*: whoever can verify can also
 > **forge**. They still work (the tools print a warning; the diode needs
 > `--allow-hmac`), but migrate at the next rotation (4.3). The Ed25519 code
-> is in-crate and **not audited**; a TPM-held, non-exportable key is still
-> planned.
+> is the audited `ed25519-dalek` crate; a TPM-held, non-exportable key is
+> still planned.
 
 ### 4.2 Generate a key
 
@@ -315,9 +315,10 @@ default (section 5.4), so the trust file must carry `--operators` (or,
 for a fleet that cannot yet re-commission its profiles, the root-signed
 opt-out `--no-require-attestation`; see 5.4 for what that gives up).
 
-The Ed25519 implementation is RoboDR's own std-only one (crates.io is not
-reachable in this build), pinned to the RFC 8032 test vectors but **not
-audited**; it is to be replaced by a vetted crate.
+The Ed25519 implementation is the audited `ed25519-dalek` crate (strict
+verification), wrapped by `robodr-blackbox` and pinned to the RFC 8032 test
+vectors; key files, key ids and signatures are unchanged from the earlier
+in-crate implementation.
 
 ## 5. Commissioning: learn, sign off, lock
 

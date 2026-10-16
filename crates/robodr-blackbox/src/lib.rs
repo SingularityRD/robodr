@@ -12,14 +12,14 @@
 //!   offline), tested against NIST and RFC 4231 vectors.
 //! - [`sign`]: [`sign::Signer`] / [`sign::Verifier`] traits; the interim
 //!   [`sign::HmacSha256Key`]. **HMAC is a placeholder**: production must
-//!   use an asymmetric, non-exportable key (Ed25519 via an audited crate or
-//!   TPM-backed ECDSA) behind the same traits.
+//!   use an asymmetric key ([`Ed25519SigningKey`], or a TPM-backed
+//!   non-exportable key) behind the same traits.
 //! - [`keys`]: key files (`robodr-blackbox-key/v1`, mode 0600, permission
 //!   checked) and [`keys::Keyring`] (key id -> verifier) for verifying across
 //!   a [`Recorder::rotate_key`].
-//! - [`sign_ed25519`]: in-crate Ed25519 (RFC 8032) + SHA-512 behind those
-//!   traits ([`Ed25519SigningKey`] / [`Ed25519VerifyingKey`]). Not audited;
-//!   swap for `ed25519-dalek` when crates.io is available.
+//! - [`sign_ed25519`]: Ed25519 (RFC 8032) behind those traits
+//!   ([`Ed25519SigningKey`] / [`Ed25519VerifyingKey`]), thin wrappers over
+//!   the audited `ed25519-dalek` crate (strict verification).
 //! - [`record`]: canonical record encoding and framing.
 //! - [`time`]: timestamps with a time-source tag (no NTP on air-gapped units).
 //! - [`store`]: the [`Recorder`]: crash recovery, quarantine of damaged

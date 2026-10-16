@@ -11,6 +11,8 @@ description = "Signed, hash-chained black-box evidence recorder for RoboDR."
 robodr-events = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
 
 [[bin]]
 name = "robodr-blackbox"

@@ -208,8 +208,8 @@ keeps no state.
 consumers hold public keys only (a map `robot id → Verifier`, e.g. a
 `robodr_blackbox::Keyring`). Distribution of those public keys is the
 commissioning / fleet registry's job and outside this contract. The Ed25519
-implementation is the in-crate RFC 8032 one from `robodr-blackbox`
-(vector-tested, not independently audited).
+implementation is `robodr-blackbox`'s wrapper over the audited
+`ed25519-dalek` crate (strict verification, RFC 8032 vectors).
 
 **Producer.** `robodr_ocsf::record_signed` / `sign_record`; the agent signs
 when configured with `Agent::with_finding_signer` (Ed25519 only; if signing a
@@ -487,7 +487,7 @@ records to Kafka are outside the crate (no network code).
   `MANIFEST.sig` = `{format, algorithm, key_id, sig (hex)}`. Batch hash =
   SHA-256(`"robodr-diode/batch-hash/v1\0" || manifest`); each manifest carries
   the previous batch's hash, so batches form a per-unit hash chain. The
-  binaries sign with Ed25519 (in-crate RFC 8032 implementation, not audited)
+  binaries sign with Ed25519 (`ed25519-dalek`, via `robodr-blackbox`)
   and the SOC holds public keys only; legacy HMAC-SHA256 needs an explicit
   `--allow-hmac`. `batch_seq` ≤ 9 999 999 999 999 999 (16 digits).
 * **Size bounds**: data bytes per batch (packer default 16 MiB, range

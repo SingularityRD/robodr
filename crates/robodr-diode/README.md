@@ -274,8 +274,8 @@ between SOC receipt confirmations (out of band), and resend on demand.
 ## Honest limits
 
 * **Signatures.** Batches are signed with Ed25519 (`robodr_blackbox`'s
-  in-crate RFC 8032 implementation: tested against the RFC vectors, **not
-  audited**, not verified constant-time). The SOC verifies with public keys
+  wrapper over the audited `ed25519-dalek` crate, tested against the RFC
+  8032 vectors). The SOC verifies with public keys
   only, so a compromised SOC or keyring can no longer forge batches; whoever
   holds a unit's secret key file (root on the low side) still can, for that
   unit. HMAC remains available behind `--allow-hmac` for migration, with the

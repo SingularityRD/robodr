@@ -311,8 +311,8 @@ request.
   whole contract, and it has not been run against a real Kafka producer.
 - **The key is a file, not a TPM.** The Ed25519 seed sits in a 0600 file
   (handed over by systemd `LoadCredential=`); root on the unit can read it
-  and sign as the unit. The Ed25519 implementation is RoboDR's own std-only
-  one (RFC 8032 vectors, not audited). HMAC keys still load (warned: the
+  and sign as the unit. The Ed25519 implementation is the audited
+  `ed25519-dalek` crate (RFC 8032 vectors pinned). HMAC keys still load (warned: the
   verifier can forge). Wall time is recorded with `TimeSource::Unknown`.
 - **A dead daemon reports nothing.** If the process dies, nothing inside it
   can report that. A console must treat a missing or stale `status.json` or

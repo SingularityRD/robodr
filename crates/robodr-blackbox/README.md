@@ -19,12 +19,12 @@ and pinned to the NIST FIPS 180-4 examples and RFC 4231 test cases 1 to 7.
 Records are signed with **Ed25519** (RFC 8032, `src/sign_ed25519.rs`) by
 default: the unit holds the 32-byte seed, every verifier (fleet console, SOC,
 auditor) holds only the public key and **cannot forge** evidence. The
-implementation is in-crate std-only Rust (crates.io is unreachable here),
-pinned to the RFC 8032 vectors, but **not audited and not verified to be
-constant-time**: replace it with `ed25519-dalek` (`verify_strict`) when
-crates.io is available, keeping `Ed25519SigningKey` / `Ed25519VerifyingKey`
-as thin wrappers so the key file and signature formats do not change. The
-seed is a file on disk, not a TPM-sealed or non-exportable key: root on the
+arithmetic is the audited, constant-time `ed25519-dalek` 2.x crate
+(`verify_strict`, plus a canonical-encoding check on public keys);
+`Ed25519SigningKey` / `Ed25519VerifyingKey` are thin wrappers, so the key
+file and signature formats, key ids and verification rules are unchanged
+from the earlier in-crate implementation and remain pinned to the RFC 8032
+and OpenSSL-derived vectors. The seed is a file on disk, not a TPM-sealed or non-exportable key: root on the
 unit can still copy it (see the threat model).
 
 **HMAC-SHA256** (`sign.rs`, `HmacSha256Key`) remains as the legacy
@@ -305,9 +305,9 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
   is the one the next retained segment chains onto (`prev_hash`, seq), and
   the signatures of its first and last record and of every
   `SegmentDropped`, `Recovery` and `KeyRotation` record (all signatures with
-  `verify_closed_signatures = true`; off by default because the in-crate
-  Ed25519 needs about 1.3 ms per verification on x86-64 in release builds,
-  minutes for a full 64 MiB store). A segment that fails is **quarantined**
+  `verify_closed_signatures = true`; off by default to keep start-up time
+  bounded on large stores: `ed25519-dalek` needs about 25 µs per
+  verification on x86-64 in release builds, measured on one host only). A segment that fails is **quarantined**
   and the recorder keeps recording:
   1. its bytes are copied to `quarantine/damaged-seg<idx>.rbb` and fsynced;
   2. a signed, critical `Recovery` record with `quarantined_segment: true`
@@ -574,10 +574,9 @@ tamper finding.
 
 ## Limits and what is not verified
 
-- The Ed25519 signer is an in-crate implementation, tested against RFC 8032
-  and OpenSSL-derived vectors but **not audited** and not verified to be
-  constant-time on any target CPU; swap in an audited crate when one is
-  available offline. TPM integration (sealing the seed, NV-index
+- The Ed25519 signer wraps the audited `ed25519-dalek` crate (tested here
+  against RFC 8032 and OpenSSL-derived vectors); its constant-time
+  behaviour has not been re-measured on our target CPUs. TPM integration (sealing the seed, NV-index
   checkpoints) is not implemented; it needs real hardware.
 - fsync durability semantics were tested only for logic (torn writes are
   simulated by writing partial or zero bytes). Power-loss behaviour on the

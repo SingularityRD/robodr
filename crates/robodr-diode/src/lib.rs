@@ -62,7 +62,7 @@
 //! `robodr_blackbox::Signer` / `Verifier`.
 //!
 //! See `README.md` in this crate for the threat model and honest limits
-//! (notably: the Ed25519 implementation is in-crate and not audited).
+//! (notably: signing keys are files on the unit, not TPM-held).
 
 pub mod cli;
 pub mod fec;
