@@ -17,6 +17,9 @@
 //! - [`keys`]: key files (`robodr-blackbox-key/v1`, mode 0600, permission
 //!   checked) and [`keys::Keyring`] (key id -> verifier) for verifying across
 //!   a [`Recorder::rotate_key`].
+//! - [`sign_ed25519`]: in-crate Ed25519 (RFC 8032) + SHA-512 behind those
+//!   traits ([`Ed25519SigningKey`] / [`Ed25519VerifyingKey`]). Not audited;
+//!   swap for `ed25519-dalek` when crates.io is available.
 //! - [`record`]: canonical record encoding and framing.
 //! - [`time`]: timestamps with a time-source tag (no NTP on air-gapped units).
 //! - [`store`]: the [`Recorder`].
@@ -57,6 +60,7 @@ pub mod export;
 pub mod keys;
 pub mod record;
 pub mod sign;
+pub mod sign_ed25519;
 pub mod store;
 pub mod time;
 pub mod verify;
@@ -65,6 +69,7 @@ pub use export::{Ack, Anchor, Bundle, Checkpoint, Receiver, SignedCursor};
 pub use keys::{KeyFile, KeyFileError, Keyring};
 pub use record::{ChainIdentity, Hash, Record, RecordKind};
 pub use sign::{HmacSha256Key, Signer, Verifier};
+pub use sign_ed25519::{Ed25519SigningKey, Ed25519VerifyingKey};
 pub use store::{
     AppendOutcome, EntryKind, Error, FsyncPolicy, Recorder, RecorderConfig, Refusal, RetentionMode,
 };
