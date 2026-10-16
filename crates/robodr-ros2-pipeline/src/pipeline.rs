@@ -27,7 +27,7 @@
 //! | capture-layer counters grew ([`Pipeline::capture_findings`]) | `robot.capture.*`: [`rules::CAPTURE_IP_FRAGMENT_CONFLICT`], [`rules::CAPTURE_IP_FRAGMENT_DUPLICATE_CONFLICT`], [`rules::CAPTURE_IP_FRAGMENT_REFUSED`], [`rules::CAPTURE_IP_REASSEMBLY_EVICTED`] | Medium |
 //! | | [`rules::CAPTURE_MALFORMED_FRAMES`], [`rules::CAPTURE_IP_REASSEMBLY_DROPPED`] (geometry, timeout, distance rule), [`rules::CAPTURE_NOT_UDP`] | Low |
 //! | | [`rules::CAPTURE_BAD_CHECKSUM`] | Low; Medium when bursty |
-//! | the profile failed `Profile::validate`, or a locked profile file failed the commissioning file check (seal: edited after `lock`) (once, [`Pipeline::status_findings`]) | [`rules::PROFILE_REFUSED`] | High |
+//! | the profile failed `Profile::validate`, or a locked profile file failed the commissioning file check (seal: edited after `lock`) or the trust check (signature, trust anchors, platform/unit, anti-rollback; see [`crate::profile_trust`]) (once, [`Pipeline::status_findings`]) | [`rules::PROFILE_REFUSED`] | High |
 //! | one input produced more than `max_findings_per_datagram` new findings | [`rules::FINDINGS_CAPPED`] | most severe suppressed, >= Medium |
 //!
 //! Every finding is de-duplicated on (rule, detail). In addition, the noisy
@@ -94,7 +94,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use robodr_commission::{parse_profile_text, ProfileFileError};
+use robodr_commission::ProfileFileError;
 use robodr_events::profile::{Profile, ProfileError};
 use robodr_events::{Deviation, Mode, Severity};
 use robodr_rtps::{
@@ -368,8 +368,11 @@ pub enum ProfileStatus {
     Refused(Vec<ProfileError>),
     /// A locked profile file that fails the commissioning file check
     /// (`robodr_commission::parse_profile_text`: seal missing or not
-    /// matching, i.e. edited after `lock`; unknown / missing keys): not
-    /// enforced, findings are [`Mode::Observe`]. Carries the reason.
+    /// matching, i.e. edited after `lock`; unknown / missing keys) or the
+    /// trust check (no valid signature from a trusted key, legacy profile
+    /// without metadata, wrong platform/unit, rollback), or a draft refused
+    /// by anti-rollback: not enforced, findings are [`Mode::Observe`].
+    /// Carries the reason.
     FileRejected(String),
 }
 
@@ -432,17 +435,23 @@ impl LoadedProfile {
     }
 }
 
-/// Read and parse a profile file (JSON) and run the commissioning file check
-/// on it ([`LoadedProfile::file_check`]). Neither the check nor validation
-/// makes this fail: [`Pipeline::from_loaded`] decides, so that a profile we
-/// cannot enforce still yields an observe-only pipeline instead of a blind
-/// sensor. An unreadable or unparseable file is an error (there is nothing
-/// to observe against).
-///
-/// The parse itself stays lenient (robodr-events tolerates unknown keys and
-/// the `seal` member) so an old or hand-written draft can still be observed
-/// against; enforcement requires the strict, sealed form.
+/// [`crate::profile_trust::load_profile_with_trust`] with **no trust
+/// anchors configured**: drafts load as before, but every locked profile
+/// fails the trust check (fail closed: it cannot be authenticated) and runs
+/// observe-only. Kept for callers not yet wired to a trust configuration
+/// (e.g. the Pulsar sensor glue); production callers pass the sensor's
+/// `profile_trust` settings to `load_profile_with_trust`.
 pub fn load_profile(path: &Path) -> Result<LoadedProfile, String> {
+    crate::profile_trust::load_profile_with_trust(
+        path,
+        &crate::profile_trust::ProfileTrustConfig::default(),
+    )
+}
+
+/// Read a profile file's text (size-capped) and parse it leniently
+/// (robodr-events tolerates unknown keys and the `seal` member, so an old
+/// or hand-written draft can still be observed against).
+pub(crate) fn read_profile_lenient(path: &Path) -> Result<(String, Profile), String> {
     let file = std::fs::File::open(path)
         .map_err(|e| format!("reading profile {}: {e}", path.display()))?;
     let mut raw = String::new();
@@ -457,11 +466,7 @@ pub fn load_profile(path: &Path) -> Result<LoadedProfile, String> {
     }
     let profile: Profile = serde_json::from_str(&raw)
         .map_err(|e| format!("parsing profile {}: {e}", path.display()))?;
-    let file_check = parse_profile_text(&raw).map(|_| ());
-    Ok(LoadedProfile {
-        profile,
-        file_check,
-    })
+    Ok((raw, profile))
 }
 
 /// A new (not previously reported) finding, ready to become one threat.
@@ -613,10 +618,13 @@ impl Pipeline {
 
     /// Build from a [`load_profile`] result. Status: `Refused` if
     /// `Profile::validate` fails; otherwise, for a locked profile whose file
-    /// check failed (edited after `lock`, missing seal, strict-key errors),
-    /// `FileRejected` (observe-only: never enforce a profile that is not the
-    /// one the OEM locked, never go blind); otherwise as [`ProfileStatus::of`].
-    /// A file-check problem of an unlocked profile is only a note in
+    /// check failed (edited after `lock`, missing seal, strict-key errors,
+    /// no valid trusted signature, rollback), `FileRejected` (observe-only:
+    /// never enforce a profile that is not the one the OEM locked and
+    /// signed, never go blind); a trust refusal of an unlocked draft
+    /// (anti-rollback: a draft replacing a locked profile) is
+    /// `FileRejected` too; otherwise as [`ProfileStatus::of`]. Any other
+    /// file-check problem of an unlocked profile is only a note in
     /// [`Pipeline::status_message`].
     pub fn from_loaded(loaded: LoadedProfile, opts: PipelineOptions) -> Self {
         let LoadedProfile {
@@ -626,9 +634,11 @@ impl Pipeline {
         let mut status = ProfileStatus::of(&profile);
         let mut file_note = None;
         if let Err(e) = file_check {
+            let untrusted = matches!(e, ProfileFileError::Untrusted { .. });
             let msg = e.to_string();
             match status {
                 ProfileStatus::Enforcing => status = ProfileStatus::FileRejected(msg),
+                ProfileStatus::Observing if untrusted => status = ProfileStatus::FileRejected(msg),
                 ProfileStatus::Observing => file_note = Some(msg),
                 _ => {}
             }
@@ -704,9 +714,9 @@ impl Pipeline {
                 ),
             }),
             ProfileStatus::FileRejected(why) => Some(format!(
-                "profile '{model}' REFUSED for enforcement (locked profile file check failed: \
-                 {}); running observe-only until the sealed profile from `robodr-commission \
-                 lock` is loaded",
+                "profile '{model}' REFUSED for enforcement (profile file check failed: {}); \
+                 running observe-only until a sealed profile from `robodr-commission lock`, \
+                 signed by a trusted key, is loaded",
                 sanitize(why)
             )),
             ProfileStatus::Refused(errors) => Some(format!(
@@ -747,8 +757,8 @@ impl Pipeline {
             }
             ProfileStatus::FileRejected(why) => {
                 let detail = format!(
-                    "locked model profile '{}' failed the profile file check and is not \
-                     enforced: {why}",
+                    "model profile '{}' failed the profile file check and is not enforced: \
+                     {why}",
                     self.profile.model
                 );
                 vec![self.finding(
@@ -1727,12 +1737,14 @@ mod tests {
         prof.writer_topics.insert("/cmd_vel".into());
         let sealed = robodr_commission::sealed_text(&prof).unwrap();
 
-        // The file `robodr-commission lock` wrote: enforced.
+        // A sealed but unsigned, unversioned file through the default
+        // loader (no trust anchors): not enforced. The signed path is
+        // tested in `profile_trust`.
         let good = dir.join("sealed.json");
         std::fs::write(&good, &sealed).unwrap();
         let p = Pipeline::from_loaded(load_profile(&good).unwrap(), PipelineOptions::default());
-        assert_eq!(p.status(), &ProfileStatus::Enforcing);
-        assert!(p.status_findings().is_empty());
+        assert!(matches!(p.status(), ProfileStatus::FileRejected(_)));
+        assert_eq!(p.status_findings().len(), 1);
 
         // A participant added by hand after locking: seal mismatch.
         let edited = dir.join("edited.json");

@@ -33,7 +33,7 @@ must be absolute.
 
 | Key | Meaning |
 |---|---|
-| `robot` | `id` (also the black-box device id), `site`, optional `model`, `profile_version`, `kafka_partitions` |
+| `robot` | `id` (also the black-box device id), `site`, optional `model`, `kafka_partitions` (`profile_version` was removed: the version in findings is the signed profile's `metadata.profile_version`) |
 | `sensor` | The ROS 2 sensor's own `[module.robodr-sensor-ros2]` section in JSON form, validated by `robodr_ros2_pipeline::Config::validate`. It sets the profile path, capture (live interfaces or `pcap_replay`), the SPDP socket (`listen_spdp`, default **true**) and the binding settings. Its profile is used by the pipeline and by the agent. |
 | `policy_path` | Response policy (`robodr.response-policy/v1`) |
 | `blackbox` | `dir`, `key_file`, optional `key_id`, optional `boot_id` (default `/proc/sys/kernel/random/boot_id`) |
@@ -57,9 +57,16 @@ is larger than 4 KiB. The checks run on the opened descriptor, and that
 descriptor is matched against the path.
 
 **Profile trust.** The pipeline decides the mode, and the agent follows it.
-A sealed, locked profile enforces. An unlocked profile observes. A locked
-profile that fails the commissioning file check (`robodr-commission lock`
-seal) runs observe-only. A profile that fails validation is replaced in the
+A sealed, locked profile with metadata and a valid detached signature
+(`<profile_path>.sig`) from a key in `sensor.profile_trust.trusted_keys`
+enforces; with `sensor.profile_trust.state_file`, a `profile_version` lower
+than the last accepted one (or the same version with other bytes, or a draft
+replacing a locked profile) is refused unless `allow_rollback` names its
+exact digest. `--check-config` makes the decision but never writes the state;
+the daemon writes it atomically at start, and if it cannot, it does not
+enforce. An unlocked profile observes. A locked profile that fails the
+commissioning file check (`robodr-commission lock` seal) or the trust check
+runs observe-only. A profile that fails validation is replaced in the
 agent by an empty, unlocked profile: everything is reported, nothing is acted
 on, and the Motion Firewall is off. In that case the pipeline's
 `robot.ros2.profile_refused` finding is the first one in the spool.

@@ -112,6 +112,8 @@ commissioning (section 5).
 | Black-box key of `robodr-agentd` | `/etc/robodr/keys/agentd-blackbox.key` (`0600 root:root`) | signing the evidence chain |
 | Black-box key of `robodr-pulsard` | `/etc/robodr/keys/pulsard-blackbox.key` | reserved, used once the Pulsar module records evidence |
 | Release key | entry station only | verifying releases (section 2) |
+| Profile signing key (Ed25519, private) | commissioning station only, **never on the robot** | signing locked profiles (section 4.4, 5) |
+| Profile trust file (Ed25519, public) | `/etc/robodr/profile-trust.json` (`0644 root:root`) | the sensor / agentd accept only profiles signed by these keys |
 
 Services never read `/etc/robodr/keys` themselves. systemd hands each one a
 private copy (`/run/credentials/<unit>/blackbox.key`). The reasons are in
@@ -190,6 +192,36 @@ one**. No evidence is lost or rewritten.
 signed after the suspected time as unauthenticated. With HMAC, a holder of the
 key can forge records. Report it as described in `SECURITY.md`.
 
+### 4.4 Profile signing key
+
+**available.** Locked profiles are signed (Ed25519) so that a robot enforces
+only a profile the OEM issued. This key is asymmetric: the robot holds only
+the public half.
+
+```sh
+robodr-commission keygen --out /secure/oem-profile.key \
+    --trust-out profile-trust.json --key-id oem-ugv-x1-2026
+```
+
+`oem-profile.key` is a `robodr-blackbox-key/v1` file with
+`"algorithm": "ed25519"` (mode `0600`, never overwritten). Keep it on the
+commissioning station (offline, encrypted at rest); it never goes to a robot.
+`profile-trust.json` (`robodr-profile-trust/v1`) holds only the public key; it
+is installed on every robot of the fleet (section 5, step 6).
+
+**Rotation:** generate a new key, add its public entry to the `keys` list of
+the trust file (a trust file may list several keys), roll the new trust file
+out, re-sign the current profile with the new key
+(`robodr-commission sign --profile locked.json --sign-key new.key --force`),
+then remove the old entry. **Revocation** is removing the entry; there is no
+revocation list or expiry. If a signing key is compromised, remove it from
+every trust file at once and re-sign with a new key: until then an attacker
+holding it can make the robot enforce a profile of their choosing.
+
+The Ed25519 implementation is RoboDR's own std-only one (crates.io is not
+reachable in this build), pinned to the RFC 8032 test vectors but **not
+audited**; it is to be replaced by a vetted crate.
+
 ## 5. Commissioning: learn, sign off, lock
 
 **available.** `robodr-commission` is an operator tool, not a service. See
@@ -229,13 +261,33 @@ Work in `/var/lib/robodr/commission/<date>/` as root.
    `robodr-commission signoff --in draft.json --out signoff.json` and review
    it again.
 
-4. **Lock**, which seals the profile:
+4. **Lock**, which versions, seals and signs the profile:
 
    ```sh
-   robodr-commission lock --in draft.json --signoff draft.json.signoff.json --out locked.json
+   robodr-commission lock --in draft.json --signoff draft.json.signoff.json \
+       --out locked.json --platform ugv-x1 --profile-version 1 \
+       [--unit-id ugv-007] --sign-key /secure/oem-profile.key
    ```
 
    Lock refuses (exit 1) until every item is confirmed by a named operator.
+   It stamps `metadata` into the profile: `schema_version`,
+   `profile_version` (monotonic, never reuse a number), `platform`,
+   `unit_id` (only for a profile made for one robot; leave it out for a
+   fleet-wide profile), `locked_by` (the sign-off operator), `locked_at`
+   and `parent_digest`. It writes `locked.json` and the detached signature
+   `locked.json.sig` (Ed25519 over the exact sealed bytes) together. On a
+   signing station separate from the review station, lock without
+   `--sign-key` and sign later with `robodr-commission sign`.
+
+   **Check the signature** the way the robot will:
+
+   ```sh
+   robodr-commission verify-profile --profile locked.json \
+       --trusted-keys profile-trust.json --expect-platform ugv-x1
+   ```
+
+   It prints the profile version and the file digest (`sha256:...`). Record
+   both in the robot's commissioning file.
 
 5. **Check** the locked profile against a run that was *not* used for
    learning:
@@ -246,23 +298,102 @@ Work in `/var/lib/robodr/commission/<date>/` as root.
 
    Exit 0 means clean. Investigate every deviation before going further.
 
-6. **Install the profile and enable the services:**
+6. **Install the profile, its signature and the trust file, and enable
+   the services:**
 
    ```sh
    sudo install -m 0640 -o root -g robodr locked.json /etc/robodr/profile.json
-   sudoedit /etc/robodr/pulsar.toml      # domain_id, capture interfaces, binding
-   sudoedit /etc/robodr/agentd.json      # robot id, key id, policy, paths
+   sudo install -m 0640 -o root -g robodr locked.json.sig /etc/robodr/profile.json.sig
+   sudo install -m 0644 -o root -g root profile-trust.json /etc/robodr/profile-trust.json
+   sudo install -d -m 0750 -o robodr -g robodr /var/lib/robodr/profile-state
+   sudoedit /etc/robodr/pulsar.toml      # domain_id, capture, binding, profile_trust
+   sudoedit /etc/robodr/agentd.json      # robot id, policy, paths, sensor.profile_trust
+   sudo robodr-agentd --config /etc/robodr/agentd.json --check-config
    sudo systemctl enable --now robodr-pulsard robodr-agentd
    journalctl -u robodr-pulsard -u robodr-agentd -f
    ```
 
-   An unlocked, missing or invalid profile makes the sensor run observe-only
-   (every finding is marked `[observe-only]`) and is reported. This is how to
-   run a first field period before enforcing.
+   The signature must sit next to the profile as `<profile_path>.sig`. The
+   `profile_trust` settings (`trusted_keys`, `state_file`, optional
+   `expect_platform` / `expect_unit_id`) are in
+   `config/agentd.example.json` (`sensor.profile_trust`) and
+   `config/robodr.toml.example` (`[module.robodr-sensor-ros2.profile_trust]`).
+   `robot.profile_version` in `agentd.json` was removed: the version in
+   findings is the signed `metadata.profile_version`; delete the key.
+
+   The anti-rollback state file must be writable by the daemon. The
+   shipped systemd unit does not yet list `/var/lib/robodr/profile-state` in
+   `ReadWritePaths=` (packaging follow-up); until it does, add it with a
+   drop-in, otherwise the daemon cannot record the accepted version and,
+   failing closed, runs observe-only.
+
+   An unlocked, missing or invalid profile, or a locked profile that is not
+   trusted (no or bad signature, key not in the trust file, no metadata,
+   wrong platform/unit, older than the last accepted version) makes the
+   sensor run observe-only (every finding is marked `[observe-only]`) and
+   is reported as `robot.ros2.profile_refused` with the reason. This is how
+   to run a first field period before enforcing.
 
 **Recommission** whenever the robot's software or network changes. Use
 `robodr-commission diff old.json new.json` so the reviewer sees exactly what
-changed, then repeat the sign-off and lock steps.
+changed, then repeat the sign-off and lock steps, locking against the
+profile it replaces:
+
+```sh
+robodr-commission lock --in draft2.json --signoff draft2.json.signoff.json \
+    --out locked2.json --parent locked.json --trusted-keys profile-trust.json \
+    --sign-key /secure/oem-profile.key
+```
+
+`--parent` sets `profile_version` to the parent's + 1 (an explicit
+`--profile-version` must be higher), inherits platform and unit, and records
+the parent's file digest in `parent_digest`, so every locked profile names
+the one it superseded.
+
+### 5.1 Profile rollback
+
+The robot remembers the last accepted `profile_version` and file digest in
+its state file (`profile_trust.state_file`). It refuses, observe-only with a
+`robot.ros2.profile_refused` finding:
+
+- a **lower** `profile_version` (rollback to an older, possibly weaker profile);
+- the **same** version with different bytes (two profiles issued under one
+  number);
+- an **unlocked draft** replacing a locked profile.
+
+To roll back deliberately, name the exact file:
+
+```sh
+robodr-commission verify-profile --profile old.json --trusted-keys profile-trust.json \
+    --state /var/lib/robodr/profile-state/agentd.json      # prints its digest; read-only
+# agentd.json: "sensor": { "profile_trust": { "allow_rollback": "sha256:<digest>" } }
+```
+
+After the daemon has loaded it, the state records the older version; remove
+`allow_rollback` again. `--check-config` evaluates the rollback rule but
+never writes the state; only a starting daemon does, atomically.
+
+Limits: the state file is plain JSON. Anyone who can delete or rewrite it
+(root on the unit) resets anti-rollback; a hardware monotonic counter (TPM)
+is the planned fix. A corrupt or unreadable state file is not reset
+silently: the profile is refused until an operator repairs or removes it.
+
+### 5.2 Legacy profiles (locked before profile versioning)
+
+Profiles locked by an earlier `robodr-commission` have a seal but no
+`metadata` and no signature. Every loader now **refuses** them for
+enforcement (observe-only, reason "legacy, unversioned"). They still work
+with `check`, `diff` and `merge`. Migrate each one on the commissioning
+station, after re-reviewing it (migration vouches for it again):
+
+```sh
+robodr-commission migrate-legacy --in legacy-locked.json --out locked.json \
+    --platform ugv-x1 --profile-version 1 --operator "<your name>" \
+    --sign-key /secure/oem-profile.key
+```
+
+The content is unchanged; the legacy file's digest becomes
+`parent_digest`. Then install as in step 6.
 
 ## 6. Running
 
@@ -317,9 +448,15 @@ Before upgrading:
 - read `CHANGELOG.md` for profile-format or config changes;
 - export pending evidence (section 8);
 - run `robodr-commission check --profile /etc/robodr/profile.json --pcap <recent run>`
-  with the **new** `robodr-commission` from the extracted `.deb`
+  and `robodr-commission verify-profile --profile /etc/robodr/profile.json
+  --trusted-keys /etc/robodr/profile-trust.json` with the **new**
+  `robodr-commission` from the extracted `.deb`
   (`dpkg-deb -x robodr_*.deb /tmp/new`). This confirms the new version accepts
-  the locked profile.
+  the locked profile (a profile locked before metadata existed needs
+  section 5.2 first).
+
+Package rollback (below) and profile rollback (section 5.1) are separate:
+rolling the package back does not touch the anti-rollback state.
 
 **Rollback** (available):
 

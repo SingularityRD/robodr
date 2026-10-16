@@ -79,6 +79,22 @@
 //! envelope has no angular field: a finite yaw rate is bounded by the Motion
 //! Firewall's per-channel `max_angular_speed`, not here.
 //!
+//! # Artifact metadata ([`ProfileMetadata`])
+//!
+//! A locked profile is a versioned artifact. `robodr-commission lock`
+//! stamps it with [`ProfileMetadata`]: the file-format `schema_version`
+//! ([`PROFILE_SCHEMA_VERSION`]), a monotonic `profile_version` (u64, >= 1),
+//! the `platform` (and optionally the single `unit_id`) it is for, who
+//! locked it (`locked_by`, the sign-off operator) and when (`locked_at`,
+//! Unix seconds, UTC), and `parent_digest`, the `sha256:<hex>` of the exact
+//! locked file this version supersedes (rollback lineage; `None` for the
+//! first version). The metadata is optional here (drafts and legacy
+//! profiles have none) and [`Profile::validate`] checks it only when
+//! present ([`ProfileMetadata::validate`]); whether a locked profile *must*
+//! carry it, and the signature and anti-rollback rules built on it, are
+//! decided by the loaders in `robodr-commission` (this crate stays pure: no
+//! crypto, no I/O). `evaluate` never looks at the metadata.
+//!
 //! # Limits
 //!
 //! `evaluate` returns at most one deviation per event and is stateless:
@@ -106,6 +122,107 @@ pub struct Envelope {
     pub max_joint_speed: Option<f64>,
 }
 
+/// The profile file-format version this crate understands
+/// ([`ProfileMetadata::schema_version`]).
+pub const PROFILE_SCHEMA_VERSION: u32 = 1;
+/// Longest `platform` / `unit_id` label.
+pub const MAX_LABEL_LEN: usize = 64;
+/// Longest `locked_by` value.
+pub const MAX_LOCKED_BY_LEN: usize = 128;
+
+/// Artifact metadata of a locked profile (see the module docs). Every key
+/// is always serialised (`null` for an absent optional), so a strict loader
+/// can require all of them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileMetadata {
+    /// File-format version; must equal [`PROFILE_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// Monotonic artifact version, >= 1. A loader with anti-rollback state
+    /// refuses a version lower than the last one it accepted.
+    pub profile_version: u64,
+    /// Platform label the profile is for, `[A-Za-z0-9._-]{1,64}`.
+    pub platform: String,
+    /// The single unit (robot id) this profile is for, same charset as
+    /// `platform`; `None` = every unit of the platform.
+    #[serde(default)]
+    pub unit_id: Option<String>,
+    /// Who locked it (the sign-off operator): non-empty, at most
+    /// [`MAX_LOCKED_BY_LEN`] bytes, no control characters.
+    pub locked_by: String,
+    /// When it was locked, Unix seconds (UTC), > 0.
+    pub locked_at: u64,
+    /// `sha256:<64 lower-case hex>` of the exact locked file this version
+    /// supersedes; `None` for the first version of a lineage.
+    #[serde(default)]
+    pub parent_digest: Option<String>,
+}
+
+/// `sha256:` followed by exactly 64 lower-case hex digits.
+pub fn is_sha256_digest(s: &str) -> bool {
+    s.strip_prefix("sha256:")
+        .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+}
+
+fn is_label(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_LABEL_LEN
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+impl ProfileMetadata {
+    /// Every problem with the metadata (empty = valid). Pure: no clock, no
+    /// I/O; `locked_at` is only checked to be non-zero.
+    pub fn validate(&self) -> Vec<ProfileError> {
+        let mut errs = Vec::new();
+        let bad = |field: &'static str, detail: &str| ProfileError::InvalidMetadata {
+            field,
+            detail: detail.to_owned(),
+        };
+        if self.schema_version != PROFILE_SCHEMA_VERSION {
+            errs.push(ProfileError::UnsupportedSchemaVersion {
+                found: self.schema_version,
+                supported: PROFILE_SCHEMA_VERSION,
+            });
+        }
+        if self.profile_version == 0 {
+            errs.push(bad("profile_version", "must be >= 1"));
+        }
+        if !is_label(&self.platform) {
+            errs.push(bad("platform", "must match [A-Za-z0-9._-]{1,64}"));
+        }
+        if let Some(u) = &self.unit_id {
+            if !is_label(u) {
+                errs.push(bad(
+                    "unit_id",
+                    "must match [A-Za-z0-9._-]{1,64} (or be null)",
+                ));
+            }
+        }
+        if self.locked_by.trim().is_empty()
+            || self.locked_by.len() > MAX_LOCKED_BY_LEN
+            || self.locked_by.chars().any(char::is_control)
+        {
+            errs.push(bad(
+                "locked_by",
+                "must be a non-empty name of at most 128 bytes without control characters",
+            ));
+        }
+        if self.locked_at == 0 {
+            errs.push(bad("locked_at", "must be Unix seconds > 0"));
+        }
+        if let Some(d) = &self.parent_digest {
+            if !is_sha256_digest(d) {
+                errs.push(bad(
+                    "parent_digest",
+                    "must be sha256:<64 lower-case hex> (or null)",
+                ));
+            }
+        }
+        errs
+    }
+}
+
 /// The profile for one robot model.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Profile {
@@ -116,6 +233,11 @@ pub struct Profile {
     /// lead to an action.
     #[serde(default)]
     pub locked: bool,
+    /// Artifact metadata stamped by `lock` (see the module docs). Absent in
+    /// drafts and in profiles locked before metadata existed; not
+    /// serialised when `None`, so drafts are byte-identical to before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<ProfileMetadata>,
     /// GUID prefixes of participants that belong on this robot.
     #[serde(default)]
     pub participants: BTreeSet<String>,
@@ -200,6 +322,10 @@ pub enum ProfileError {
     /// sets, so the raw entry can never match: list the de-mangled name in
     /// the proper ROS set instead.
     RawTopicIsRosName { name: String },
+    /// [`ProfileMetadata::schema_version`] is not one this build reads.
+    UnsupportedSchemaVersion { found: u32, supported: u32 },
+    /// A [`ProfileMetadata`] field is malformed.
+    InvalidMetadata { field: &'static str, detail: String },
 }
 
 impl fmt::Display for ProfileError {
@@ -235,6 +361,13 @@ impl fmt::Display for ProfileError {
                 f,
                 "raw_dds_topics entry {name:?} is a ROS-mangled name and can never match; list the de-mangled ROS name in writer_topics/services/actions instead"
             ),
+            Self::UnsupportedSchemaVersion { found, supported } => write!(
+                f,
+                "metadata.schema_version {found} is not supported (this build reads {supported})"
+            ),
+            Self::InvalidMetadata { field, detail } => {
+                write!(f, "metadata.{field}: {detail}")
+            }
         }
     }
 }
@@ -349,6 +482,9 @@ impl Profile {
                     }
                 }
             }
+        }
+        if let Some(m) = &self.metadata {
+            errs.extend(m.validate());
         }
         if errs.is_empty() {
             Ok(())
@@ -1275,5 +1411,126 @@ mod tests {
         )
         .unwrap();
         assert!(neg.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    fn meta() -> ProfileMetadata {
+        ProfileMetadata {
+            schema_version: PROFILE_SCHEMA_VERSION,
+            profile_version: 3,
+            platform: "ugv-x1".into(),
+            unit_id: Some("ugv-007".into()),
+            locked_by: "A. Operator".into(),
+            locked_at: 1_790_000_000,
+            parent_digest: Some(format!("sha256:{}", "ab".repeat(32))),
+        }
+    }
+
+    fn profile(m: Option<ProfileMetadata>) -> Profile {
+        let mut p = Profile {
+            model: "m".into(),
+            locked: true,
+            metadata: m,
+            ..Default::default()
+        };
+        p.writer_topics.insert("/cmd_vel".into());
+        p
+    }
+
+    #[test]
+    fn valid_metadata_passes_and_roundtrips() {
+        assert!(meta().validate().is_empty());
+        let p = profile(Some(meta()));
+        assert_eq!(p.validate(), Ok(()));
+        let text = serde_json::to_string(&p).unwrap();
+        assert_eq!(serde_json::from_str::<Profile>(&text).unwrap(), p);
+        // Optional fields are written as null, never skipped.
+        let mut m = meta();
+        m.unit_id = None;
+        m.parent_digest = None;
+        let v = serde_json::to_value(&m).unwrap();
+        assert!(v["unit_id"].is_null() && v["parent_digest"].is_null());
+        assert!(m.validate().is_empty());
+    }
+
+    #[test]
+    fn absent_metadata_is_not_serialised() {
+        let p = profile(None);
+        assert!(!serde_json::to_string(&p).unwrap().contains("metadata"));
+        assert_eq!(p.validate(), Ok(()));
+        // Legacy JSON without the key still parses.
+        let p: Profile = serde_json::from_str(r#"{"model":"m","locked":true}"#).unwrap();
+        assert!(p.metadata.is_none());
+    }
+
+    #[test]
+    fn every_bad_field_is_reported() {
+        let m = ProfileMetadata {
+            schema_version: 2,
+            profile_version: 0,
+            platform: "bad platform".into(),
+            unit_id: Some(String::new()),
+            locked_by: "x\u{1b}[31m".into(),
+            locked_at: 0,
+            parent_digest: Some("sha256:ABC".into()),
+        };
+        let errs = m.validate();
+        assert_eq!(errs.len(), 7, "{errs:?}");
+        assert!(errs.contains(&ProfileError::UnsupportedSchemaVersion {
+            found: 2,
+            supported: 1
+        }));
+        let fields: Vec<&str> = errs
+            .iter()
+            .filter_map(|e| match e {
+                ProfileError::InvalidMetadata { field, .. } => Some(*field),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                "profile_version",
+                "platform",
+                "unit_id",
+                "locked_by",
+                "locked_at",
+                "parent_digest"
+            ]
+        );
+        // Profile::validate carries them.
+        let p = profile(Some(m));
+        assert_eq!(p.validate().unwrap_err().len(), 7);
+        for e in errs {
+            assert!(!e.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn label_and_digest_edges() {
+        assert!(is_sha256_digest(&format!("sha256:{}", "0".repeat(64))));
+        assert!(!is_sha256_digest(&format!("sha256:{}", "0".repeat(63))));
+        assert!(!is_sha256_digest(&format!("sha256:{}", "0".repeat(65))));
+        assert!(!is_sha256_digest(&format!("SHA256:{}", "0".repeat(64))));
+        assert!(!is_sha256_digest(&format!(
+            "sha256:{}",
+            "\u{e9}".repeat(32)
+        )));
+        assert!(is_label(&"a".repeat(MAX_LABEL_LEN)));
+        assert!(!is_label(&"a".repeat(MAX_LABEL_LEN + 1)));
+        assert!(!is_label("a/b"));
+        let mut m = meta();
+        m.locked_by = " ".into();
+        assert_eq!(m.validate().len(), 1);
+        m.locked_by = "x".repeat(MAX_LOCKED_BY_LEN + 1);
+        assert_eq!(m.validate().len(), 1);
+        m.locked_by = "x".repeat(MAX_LOCKED_BY_LEN);
+        assert!(m.validate().is_empty());
+        m.profile_version = u64::MAX;
+        assert!(m.validate().is_empty());
     }
 }

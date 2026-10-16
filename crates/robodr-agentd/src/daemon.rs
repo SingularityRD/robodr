@@ -258,7 +258,15 @@ impl<'a> Daemon<'a> {
         for w in &r.warnings {
             let _ = writeln!(log, "robodr-agentd: warning: {}", sanitize(w));
         }
-        let pipeline = Pipeline::from_loaded(r.profile.clone(), r.sensor.pipeline.clone());
+        // Persist the anti-rollback state the accepted profile implies
+        // before enforcing it; if that fails, do not enforce (fail closed).
+        let mut loaded = r.profile.clone();
+        if let (Some(c), Ok(())) = (&r.profile_state_commit, &loaded.file_check) {
+            if let Err(e) = c.commit() {
+                loaded.file_check = Err(e);
+            }
+        }
+        let pipeline = Pipeline::from_loaded(loaded, r.sensor.pipeline.clone());
         if let Some(m) = pipeline.status_message() {
             let _ = writeln!(log, "robodr-agentd: warning: {m}");
         }
@@ -292,7 +300,10 @@ impl<'a> Daemon<'a> {
             context,
             RecorderConfig::new(&cfg.blackbox.dir, &cfg.robot.id, &r.boot_id),
         );
-        acfg.profile_version = cfg.robot.profile_version.clone();
+        acfg.profile_version = robodr_commission::trust::version_label(
+            pipeline.profile(),
+            pipeline.status() == &ProfileStatus::Enforcing,
+        );
         acfg.attestation = AttestationStatus::Unknown;
         acfg.kafka_partitions = cfg.robot.kafka_partitions;
         match (&cfg.firewall, validated) {

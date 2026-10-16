@@ -21,6 +21,10 @@ robodr-commission = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[dev-dependencies]
+# Ed25519 keys to sign test profiles (profile_trust tests).
+robodr-blackbox = { workspace = true }
+
 [[bin]]
 name = "robodr-ros2-watch"
 path = "src/bin/robodr-ros2-watch.rs"

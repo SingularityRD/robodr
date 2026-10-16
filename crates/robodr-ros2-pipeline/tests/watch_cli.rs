@@ -24,16 +24,46 @@ fn lines(out: &Output) -> Vec<Value> {
         .collect()
 }
 
-/// A locked profile is written sealed, exactly as `robodr-commission lock`
-/// writes it (the sensor refuses to enforce an unsealed locked file).
+/// A locked profile is written sealed, versioned and signed, exactly as
+/// `robodr-commission lock --sign-key` writes it (the sensor refuses to
+/// enforce anything else); the matching trust file is `trust_of(path)`.
 fn write_profile(path: &Path, locked: bool) {
     let p = robot_profile(locked);
-    let text = if locked {
-        robodr_commission::sealed_text(&p).unwrap()
+    if locked {
+        write_signed(path, p);
     } else {
-        serde_json::to_string_pretty(&p).unwrap()
-    };
+        write(path, serde_json::to_string_pretty(&p).unwrap().as_bytes());
+    }
+}
+
+/// Stamp metadata on a locked profile, seal, sign, write profile + .sig +
+/// trust file.
+fn write_signed(path: &Path, mut p: robodr_events::profile::Profile) {
+    p.metadata = Some(robodr_events::profile::ProfileMetadata {
+        schema_version: robodr_events::profile::PROFILE_SCHEMA_VERSION,
+        profile_version: 1,
+        platform: "ugv-lab".into(),
+        unit_id: None,
+        locked_by: "test".into(),
+        locked_at: 1_790_000_000,
+        parent_digest: None,
+    });
+    let text = robodr_commission::sealed_text(&p).unwrap();
     write(path, text.as_bytes());
+    let key = robodr_blackbox::Ed25519SigningKey::from_seed("lab", &[1; 32]).unwrap();
+    let sig = robodr_commission::ProfileSignature::create(text.as_bytes(), &key).unwrap();
+    write(
+        &robodr_commission::sig_path_for(path),
+        sig.to_text().as_bytes(),
+    );
+    write(
+        &trust_of(path),
+        robodr_commission::trust::trust_keys_text(&[key.verifying_key()]).as_bytes(),
+    );
+}
+
+fn trust_of(path: &Path) -> std::path::PathBuf {
+    path.with_extension("trust.json")
 }
 
 #[test]
@@ -42,12 +72,15 @@ fn pcap_run_prints_expected_json_lines() {
     let (pcap_path, prof) = (dir.join("lab.pcap"), dir.join("profile.json"));
     write(&pcap_path, &pcap(&scenario_frames(4)));
     write_profile(&prof, true);
+    let trust = trust_of(&prof);
     let out = watch(&[
         "--profile",
         prof.to_str().unwrap(),
         "--pcap",
         pcap_path.to_str().unwrap(),
         "--stats",
+        "--trusted-keys",
+        trust.to_str().unwrap(),
     ]);
     assert!(out.status.success(), "{out:?}");
     let l = lines(&out);
@@ -143,7 +176,15 @@ fn errors_and_usage_exit_codes() {
     bytes.truncate(bytes.len() - 7);
     let t = dir.join("truncated.pcap");
     write(&t, &bytes);
-    let out = watch(&["--profile", p, "--pcap", t.to_str().unwrap()]);
+    let trust = trust_of(&prof);
+    let out = watch(&[
+        "--profile",
+        p,
+        "--pcap",
+        t.to_str().unwrap(),
+        "--trusted-keys",
+        trust.to_str().unwrap(),
+    ]);
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(lines(&out).len(), 2);
     assert!(String::from_utf8_lossy(&out.stderr).contains("capture ended with an error"));
@@ -171,10 +212,8 @@ fn rtps_fixture_pcap_with_empty_profile() {
         locked: true,
         ..Default::default()
     };
-    write(
-        &prof,
-        robodr_commission::sealed_text(&empty).unwrap().as_bytes(),
-    );
+    write_signed(&prof, empty);
+    let trust = trust_of(&prof);
     let out = watch(&[
         "--profile",
         prof.to_str().unwrap(),
@@ -182,6 +221,8 @@ fn rtps_fixture_pcap_with_empty_profile() {
         pcap_path.to_str().unwrap(),
         "--domain",
         "0",
+        "--trusted-keys",
+        trust.to_str().unwrap(),
     ]);
     assert!(out.status.success(), "{out:?}");
     let l = lines(&out);
@@ -199,5 +240,61 @@ fn rtps_fixture_pcap_with_empty_profile() {
     assert!(l
         .iter()
         .all(|x| x["rule"] != "robot.ros2.endpoint_source_mismatch"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn locked_profile_without_trust_or_signature_is_refused() {
+    let dir = temp_dir("cli-untrusted");
+    let (pcap_path, prof) = (dir.join("lab.pcap"), dir.join("profile.json"));
+    write(&pcap_path, &pcap(&scenario_frames(1)));
+    write_profile(&prof, true);
+    let trust = trust_of(&prof);
+    let state = dir.join("state.json");
+    // No --trusted-keys: observe-only, profile_refused first.
+    let out = watch(&[
+        "--profile",
+        prof.to_str().unwrap(),
+        "--pcap",
+        pcap_path.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{out:?}");
+    let l = lines(&out);
+    assert_eq!(l[0]["rule"], "robot.ros2.profile_refused");
+    assert!(l.iter().all(|x| x["observe_only"] == true));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("trusted_keys is not set"));
+    // Trusted, with state: enforcing, state written.
+    let args = |extra: &[&str]| {
+        let mut a = vec![
+            "--profile",
+            prof.to_str().unwrap(),
+            "--pcap",
+            pcap_path.to_str().unwrap(),
+            "--trusted-keys",
+            trust.to_str().unwrap(),
+            "--profile-state",
+            state.to_str().unwrap(),
+        ];
+        a.extend_from_slice(extra);
+        watch(&a)
+    };
+    let out = args(&[]);
+    assert!(
+        lines(&out).iter().all(|x| x["mode"] == "enforce"),
+        "{out:?}"
+    );
+    assert!(state.exists());
+    // Signature removed: refused.
+    std::fs::remove_file(robodr_commission::sig_path_for(&prof)).unwrap();
+    let out = args(&[]);
+    let l = lines(&out);
+    assert_eq!(l[0]["rule"], "robot.ros2.profile_refused");
+    assert!(
+        l[0]["detail"].as_str().unwrap().contains("signature"),
+        "{l:?}"
+    );
+    // Bad flag values are usage errors.
+    assert_eq!(args(&["--allow-rollback", "v1"]).status.code(), Some(2));
+    assert_eq!(args(&["--expect-platform", "a b"]).status.code(), Some(2));
     std::fs::remove_dir_all(&dir).ok();
 }

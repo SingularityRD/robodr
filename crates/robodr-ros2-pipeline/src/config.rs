@@ -35,7 +35,19 @@
 //!
 //! [module.robodr-sensor-ros2.binding.participant_ips]
 //! # "010f3a7c2104000001000000" = ["192.168.50.10", "10.8.0.10"]
+//!
+//! [module.robodr-sensor-ros2.profile_trust]
+//! trusted_keys = "/etc/robodr/profile-trust.json"
+//! state_file = "/var/lib/robodr/profile-state.json"
+//! # expect_platform = "ugv-x1"
+//! # expect_unit_id = "ugv-007"
+//! # allow_rollback = "sha256:<digest>"   # one deliberate rollback, then remove
 //! ```
+//!
+//! ## Profile trust (`profile_trust` sub-table)
+//!
+//! See [`crate::profile_trust`]. Without `trusted_keys` a locked profile is
+//! never enforced (observe-only + `robot.ros2.profile_refused`).
 //!
 //! ## Binding (`binding` sub-table)
 //!
@@ -78,6 +90,7 @@ use crate::pipeline::{
     PipelineOptions, DEFAULT_DEDUP_CAPACITY, DEFAULT_MAX_FINDINGS_PER_DATAGRAM,
     MAX_FINDINGS_PER_DATAGRAM,
 };
+use crate::profile_trust::ProfileTrustConfig;
 use crate::ratelimit;
 
 pub const DEFAULT_PROFILE_PATH: &str = "/etc/robodr/profile.json";
@@ -136,6 +149,10 @@ pub struct Config {
     pub capture: CaptureConfig,
     /// Participant ↔ source-IP binding check.
     pub binding: BindingConfig,
+    /// Profile authenticity and anti-rollback (`profile_trust` sub-table).
+    /// See [`crate::profile_trust`]. Default: nothing trusted, so a locked
+    /// profile runs observe-only.
+    pub profile_trust: ProfileTrustConfig,
 }
 
 impl Default for Config {
@@ -155,6 +172,7 @@ impl Default for Config {
             rate_limit_interval_ms: ratelimit::DEFAULT_INTERVAL.as_millis() as u64,
             capture: CaptureConfig::default(),
             binding: BindingConfig::default(),
+            profile_trust: ProfileTrustConfig::default(),
         }
     }
 }
@@ -407,6 +425,10 @@ pub struct Settings {
     /// `None` when `capture.enabled = false`.
     pub capture: Option<CaptureSettings>,
     pub pipeline: PipelineOptions,
+    /// Validated `profile_trust` (pass to
+    /// [`crate::profile_trust::load_profile_with_trust`]; log its
+    /// [`ProfileTrustConfig::warnings`]).
+    pub profile_trust: ProfileTrustConfig,
 }
 
 impl Settings {
@@ -571,6 +593,7 @@ impl Config {
 
         let capture = self.validate_capture(&mut warnings, default_iface)?;
         let binding = self.binding.validate(&mut warnings)?;
+        self.profile_trust.validate()?;
 
         Ok((
             Settings {
@@ -588,6 +611,7 @@ impl Config {
                     rate_limit_interval: Duration::from_millis(self.rate_limit_interval_ms),
                     max_findings_per_datagram: self.max_findings_per_datagram,
                 },
+                profile_trust: self.profile_trust.clone(),
             },
             warnings,
         ))

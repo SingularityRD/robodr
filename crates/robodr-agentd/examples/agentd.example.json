@@ -2,7 +2,6 @@
   "robot": {
     "id": "ugv-007",
     "site": "depot-north",
-    "profile_version": "2026.10-r3",
     "kafka_partitions": 12
   },
   "sensor": {
@@ -16,6 +15,11 @@
     "binding": {
       "enabled": true,
       "hold_ms": 30000
+    },
+    "profile_trust": {
+      "trusted_keys": "/etc/robodr/profile-trust.json",
+      "state_file": "/var/lib/robodr/profile-state/agentd.json",
+      "expect_platform": "ugv-x1"
     }
   },
   "policy_path": "/etc/robodr/policy.json",

@@ -73,6 +73,7 @@ eviction can only cause a re-report.
 | valid, `locked: false` | `observing` | `mode = "observe"`, description prefixed `[observe-only] ` |
 | fails `Profile::validate` (locked or not) | `refused` | errors reported, one `robot.ros2.profile_refused` finding; **observe-only** |
 | `locked: true` but the file fails the commissioning check (`robodr_commission::parse_profile_text`: lock seal missing or not matching, i.e. edited after `robodr-commission lock`; unknown / missing keys) | `refused` | reason reported, one `robot.ros2.profile_refused` finding; **observe-only** |
+| `locked: true` but not trusted (`load_profile_with_trust`: no metadata, no / bad `<profile>.sig`, key not in `profile_trust.trusted_keys`, platform/unit mismatch, anti-rollback refusal). The plain `load_profile` trusts no key, so it always lands here for a locked profile | `refused` | same, with the trust reason |
 
 The file check lives in `robodr-commission`, which owns the profile file
 format it writes (strict keys + seal). The pipeline depends on it rather than

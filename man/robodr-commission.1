@@ -49,6 +49,73 @@ robodr\-commission \- learn, review, lock and verify a RoboDR model profile
 .I signoff.json
 .B \-\-out
 .I locked.json
+.RB ( \-\-parent
+.IR previous\-locked.json " | "
+.B \-\-platform
+.I P
+.B \-\-profile\-version
+.IR N )
+.RB [ \-\-unit\-id
+.IR U ]
+.RB [ \-\-sign\-key
+.IR signing.key ]
+.RB [ \-\-trusted\-keys
+.IR trust.json ]
+.RB [ \-\-locked\-at
+.IR UNIX_SECS ]
+.RB [ \-\-hard\-cap\-linear
+.IR 10 ]
+.RB [ \-\-hard\-cap\-joint
+.IR 10 ]
+.RB [ \-\-force ]
+.PP
+.B robodr\-commission sign
+.B \-\-profile
+.I locked.json
+.B \-\-sign\-key
+.I signing.key
+.RB [ \-\-force ]
+.PP
+.B robodr\-commission verify\-profile
+.B \-\-profile
+.I locked.json
+.B \-\-trusted\-keys
+.I trust.json
+.RB [ \-\-expect\-platform
+.IR P ]
+.RB [ \-\-expect\-unit
+.IR U ]
+.RB [ \-\-state
+.IR profile\-state.json ]
+.RB [ \-\-allow\-rollback
+.IR sha256:HEX ]
+.RB [ \-\-json ]
+.PP
+.B robodr\-commission keygen
+.B \-\-out
+.I signing.key
+.B \-\-trust\-out
+.I trust.json
+.RB [ \-\-key\-id
+.IR ID ]
+.PP
+.B robodr\-commission migrate\-legacy
+.B \-\-in
+.I legacy\-locked.json
+.B \-\-out
+.I locked.json
+.B \-\-platform
+.I P
+.B \-\-profile\-version
+.I N
+.B \-\-operator
+.I NAME
+.B \-\-sign\-key
+.I signing.key
+.RB [ \-\-unit\-id
+.IR U ]
+.RB [ \-\-locked\-at
+.IR UNIX_SECS ]
 .RB [ \-\-force ]
 .PP
 .B robodr\-commission signoff
@@ -92,7 +159,9 @@ The workflow is
 (observe a clean run and write a draft profile plus a sign\-off list),
 human review of the sign\-off list,
 .B lock
-(seal the reviewed draft), then
+(seal, version and sign the reviewed draft),
+.B verify\-profile
+(the loaders' trust check, read\-only), then
 .B check
 (replay further runs against the locked profile).
 .B diff
@@ -172,6 +241,79 @@ on every item.
 .B signoff
 builds a conservative list for an edited or merged draft. A locked profile is
 sealed; the sensor refuses a locked profile whose seal does not match.
+.SH VERSIONING AND SIGNING
+.B lock
+stamps the profile with
+.B metadata :
+.B schema_version
+(1),
+.B profile_version
+(monotonic, >= 1),
+.B platform
+and optional
+.BR unit_id ,
+.B locked_by
+(the sign\-off operator),
+.B locked_at
+(Unix seconds; \fB\-\-locked\-at\fR for reproducible output) and
+.BR parent_digest .
+With
+.BI \-\-parent " previous\-locked.json"
+the version defaults to the parent's + 1 (an explicit
+.B \-\-profile\-version
+must be higher), platform and unit default to the parent's, the model must
+match, and the parent file's
+.B sha256:
+digest is recorded as
+.B parent_digest
+(rollback lineage). With
+.B \-\-trusted\-keys
+the parent's own signature is checked first. Without a parent,
+.B \-\-platform
+and
+.B \-\-profile\-version
+are required.
+.PP
+.BI \-\-sign\-key " signing.key"
+writes the detached signature
+.IB out .sig
+together with the profile: Ed25519 over the domain tag
+.B robodr\-profile\-sig/v1
+and the exact sealed bytes. The signing key is a
+.B robodr\-blackbox\-key/v1
+file with
+.B \(dqalgorithm\(dq: \(dqed25519\(dq
+(mode 0600; made by
+.BR keygen ,
+which also writes the
+.B robodr\-profile\-trust/v1
+file holding its public key). Keep the signing key on the commissioning
+station, never on the robot; install only the trust file on the robot.
+.B sign
+signs an already locked profile (offline signing station).
+.PP
+The loaders (sensor pipeline,
+.BR robodr\-agentd (8),
+.BR robodr\-replay (1),
+.BR robodr\-ros2\-watch (1))
+enforce a locked profile only if it carries metadata and a valid signature
+from a trusted key; otherwise they run observe\-only and report
+.BR robot.ros2.profile_refused .
+.B verify\-profile
+runs the same check and prints the file digest; with
+.B \-\-state
+it also evaluates anti\-rollback against a state file without writing it
+(exit 0 trusted, 1 refused).
+.PP
+.B Legacy profiles.
+A profile locked before metadata existed (sealed, no
+.BR metadata )
+is refused by every loader.
+.B migrate\-legacy
+re\-issues it with metadata and a signature, content unchanged, the
+legacy file's digest recorded as
+.BR parent_digest .
+Review the content before migrating: migration vouches for it again.
 .SH FILE HANDLING
 Outputs never overwrite an existing file or follow a symlink unless
 .B \-\-force
@@ -180,14 +322,15 @@ Outputs never overwrite an existing file or follow a symlink unless
 from each other and from its inputs. A failed
 .B learn
 writes nothing. Profiles are loaded strictly (regular file, size cap, no
-unknown keys, sealed if locked).
+unknown keys, sealed if locked, metadata only on locked profiles).
 .SH EXIT STATUS
 .TP
 .B 0
 OK / clean.
 .TP
 .B 1
-Negative result: deviations found, profiles differ, lock refused.
+Negative result: deviations found, profiles differ, lock refused, profile
+not trusted (\fBverify\-profile\fR).
 .TP
 .B 2
 Usage, input or I/O error.
@@ -196,9 +339,17 @@ Usage, input or I/O error.
 robodr\-commission learn \-\-pcap run1.pcapng \-\-pcap run2.pcapng \e
     \-\-model ugv\-x \-\-out draft.json \-\-report report.json
 $EDITOR draft.json.signoff.json      # review, confirm, set operator
+robodr\-commission keygen \-\-out oem\-profile.key \e
+    \-\-trust\-out profile\-trust.json \-\-key\-id oem\-ugv\-x\-2026
 robodr\-commission lock \-\-in draft.json \e
-    \-\-signoff draft.json.signoff.json \-\-out locked.json
+    \-\-signoff draft.json.signoff.json \-\-out locked.json \e
+    \-\-platform ugv\-x \-\-profile\-version 1 \-\-sign\-key oem\-profile.key
+robodr\-commission verify\-profile \-\-profile locked.json \e
+    \-\-trusted\-keys profile\-trust.json
 robodr\-commission check \-\-profile locked.json \-\-pcap run3.pcapng
+# next version of the same lineage
+robodr\-commission lock \-\-in draft2.json \-\-signoff draft2.json.signoff.json \e
+    \-\-out locked2.json \-\-parent locked.json \-\-sign\-key oem\-profile.key
 .fi
 .SH SEE ALSO
 .BR robodr\-ros2\-watch (1),

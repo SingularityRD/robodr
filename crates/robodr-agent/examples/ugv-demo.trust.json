@@ -1,0 +1,10 @@
+{
+  "format": "robodr-profile-trust/v1",
+  "keys": [
+    {
+      "algorithm": "ed25519",
+      "key_id": "robodr-demo",
+      "public_hex": "435f30e36533495d5128d8d2011282d973f2f6712988e1f8726a80284029ed57"
+    }
+  ]
+}

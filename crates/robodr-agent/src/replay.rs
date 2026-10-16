@@ -23,6 +23,20 @@
 //!   de-duplicated, so link resolution is bounded by the black box's own
 //!   retention. Config files are size-capped and parsed strictly (unknown
 //!   fields refused).
+//!
+//! # Profile trust
+//!
+//! The profile is loaded with the same trust check as the sensor
+//! ([`load_trusted_profile`], `robodr_commission::trust`): a **locked**
+//! profile is enforced only if it carries metadata and a valid detached
+//! signature (`<profile>.sig`) from a key in
+//! [`ReplayOptions::trusted_keys`]. Otherwise the replay runs observe-only
+//! (the profile is treated as unlocked) and the first outcome is a
+//! `robot.ros2.profile_refused` finding saying why. The version carried in
+//! findings is the signed `metadata.profile_version` (the former
+//! `--profile-version` option was removed). Anti-rollback is opt-in for
+//! replays ([`ReplayOptions::profile_state`]): forensic replays of old
+//! recordings legitimately use old profiles.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -44,6 +58,9 @@ use crate::config::{strict_from_str, AgentConfig, AgentError, FirewallSettings, 
 use crate::evidence::{finding_refs, resolve_links, verify_blackbox, LinkReport};
 use crate::executor::LoggingExecutor;
 use crate::outcome::{AgentFault, Outcome};
+
+/// Rule id of the "profile not enforced" finding (same as the sensor's).
+pub const PROFILE_REFUSED: &str = "robot.ros2.profile_refused";
 
 /// Max size of a profile / policy / monitor-config file.
 pub const MAX_CONFIG_BYTES: u64 = 16 << 20;
@@ -69,7 +86,15 @@ pub struct ReplayOptions {
     pub site: String,
     /// Robot model for the finding; `None` uses the profile's model.
     pub model: Option<String>,
-    pub profile_version: String,
+    /// Trusted profile signing keys (`robodr-profile-trust/v1`). `None`:
+    /// no locked profile is trusted (the replay runs observe-only).
+    pub trusted_keys: Option<PathBuf>,
+    /// Anti-rollback state file (read, and rewritten when a newer signed
+    /// profile is accepted). `None`: no rollback check.
+    pub profile_state: Option<PathBuf>,
+    /// Operator rollback flag: the exact digest of an older profile file to
+    /// accept despite `profile_state`.
+    pub allow_profile_rollback: Option<String>,
     pub boot_id: String,
     pub safety: SafetyState,
     pub control: ControlMode,
@@ -115,7 +140,9 @@ impl ReplayOptions {
             robot_id: robot_id.into(),
             site: "replay".into(),
             model: None,
-            profile_version: "replay".into(),
+            trusted_keys: None,
+            profile_state: None,
+            allow_profile_rollback: None,
             boot_id: "replay-boot".into(),
             safety: SafetyState::Unknown,
             control: ControlMode::Autonomous,
@@ -177,6 +204,10 @@ pub struct ReplaySummary {
     pub report: Report,
     /// Evidence-link resolution over every finding written.
     pub links: LinkReport,
+    /// Why the profile was not enforced (`None`: enforced, or a draft).
+    pub profile_refused: Option<String>,
+    /// The profile version label carried in findings.
+    pub profile_version: String,
 }
 
 impl ReplaySummary {
@@ -215,12 +246,128 @@ pub fn read_capped(path: &Path) -> Result<String, ReplayError> {
     std::fs::read_to_string(path).map_err(|e| ReplayError::Io(format!("{}: {e}", path.display())))
 }
 
-/// Load a profile file (strict: unknown fields are refused). The agent
-/// validates it on start.
+/// Load a profile file's content (strict: unknown fields are refused; the
+/// lock seal member is tolerated). **No trust check**: use
+/// [`load_trusted_profile`] for what is enforced. The agent validates it
+/// on start.
 pub fn load_profile(path: &Path) -> Result<Profile, ReplayError> {
     let text = read_capped(path)?;
-    strict_from_str(&text)
+    parse_profile_content(&text)
         .map_err(|e| ReplayError::Config(format!("{}: not a profile: {e}", path.display())))
+}
+
+fn parse_profile_content(text: &str) -> Result<Profile, String> {
+    let mut v: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    if let Some(o) = v.as_object_mut() {
+        o.remove(robodr_commission::profile_file::SEAL_KEY);
+    }
+    strict_from_str(&v.to_string())
+}
+
+/// A profile as the replay will use it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrustedProfile {
+    /// The profile; `locked` is forced to `false` when refused.
+    pub profile: Profile,
+    /// Version label for findings (`robodr_commission::trust::version_label`).
+    pub version_label: String,
+    /// Why a locked profile is not enforced.
+    pub refused: Option<String>,
+}
+
+/// Load the profile with the trust check described in the module docs.
+/// A file that is not a profile at all is an error; a profile that is not
+/// trusted comes back with `refused` set and `locked = false`.
+pub fn load_trusted_profile(opts: &ReplayOptions) -> Result<TrustedProfile, ReplayError> {
+    use robodr_commission::trust::{
+        enforce_rollback, load_trust_keys, read_optional_sig, sig_path_for, validate_rollback_flag,
+        verify_profile_text, version_label, ProfileTrustError, TrustPolicy,
+    };
+    use robodr_commission::ProfileFileError;
+    let path = &opts.profile;
+    let text = read_capped(path)?;
+    if let Some(f) = &opts.allow_profile_rollback {
+        validate_rollback_flag(f).map_err(ReplayError::Config)?;
+    }
+    let (anchors, anchor_err) = match &opts.trusted_keys {
+        None => (None, None),
+        Some(p) => match load_trust_keys(p) {
+            Ok(k) => (Some(k), None),
+            Err(e) => (None, Some(e)),
+        },
+    };
+    let policy = TrustPolicy {
+        anchors,
+        ..Default::default()
+    };
+    let sig_path = sig_path_for(path);
+    let sig_name = sig_path.display().to_string();
+    let sig = read_optional_sig(&sig_path);
+    let verified = match &sig {
+        Ok(sig) => verify_profile_text(&text, sig.as_deref(), &sig_name, &policy),
+        Err(e) => match verify_profile_text(&text, None, &sig_name, &policy) {
+            Err(ProfileFileError::Untrusted {
+                reason: ProfileTrustError::MissingSignature { .. },
+            }) => Err(ProfileTrustError::MalformedSignature {
+                detail: format!("{sig_name}: {e}"),
+            }
+            .into()),
+            other => other,
+        },
+    };
+    let verified = match (verified, anchor_err) {
+        (
+            Err(ProfileFileError::Untrusted {
+                reason: ProfileTrustError::NoTrustAnchors,
+            }),
+            Some(e),
+        ) => Err(ProfileFileError::from(e)),
+        (v, _) => v,
+    };
+    // (reason, whether it is a trust refusal rather than a format error)
+    let (refusal, trust_refusal) = match verified {
+        Ok(v) => {
+            let rollback = match &opts.profile_state {
+                None => Ok(()),
+                Some(state) => {
+                    enforce_rollback(state, &v, opts.allow_profile_rollback.as_deref()).map(|_| ())
+                }
+            };
+            match rollback {
+                Ok(()) => {
+                    let label = version_label(&v.profile, v.profile.locked);
+                    return Ok(TrustedProfile {
+                        profile: v.profile,
+                        version_label: label,
+                        refused: None,
+                    });
+                }
+                Err(e) => (ProfileFileError::from(e).to_string(), true),
+            }
+        }
+        Err(e) => {
+            let t = matches!(e, ProfileFileError::Untrusted { .. });
+            (e.to_string(), t)
+        }
+    };
+    // Not trusted (or not a strict profile file): keep what can be
+    // observed against (unknown keys are still refused). A hand-written
+    // draft that only fails the strict file format is observed as before.
+    let mut profile = parse_profile_content(&text)
+        .map_err(|e| ReplayError::Config(format!("{}: not a profile: {e}", path.display())))?;
+    if !profile.locked && !trust_refusal {
+        return Ok(TrustedProfile {
+            profile,
+            version_label: "draft".into(),
+            refused: None,
+        });
+    }
+    profile.locked = false;
+    Ok(TrustedProfile {
+        profile,
+        version_label: "untrusted".into(),
+        refused: Some(refusal),
+    })
 }
 
 /// Load a motion monitor config file (strict: unknown fields are refused).
@@ -247,11 +394,20 @@ fn hmac_key(key: &[u8], key_id: Option<&str>) -> Result<HmacSha256Key, ReplayErr
 }
 
 /// Build the agent for `opts` (exposed for tests that drive it by hand).
+/// The profile goes through [`load_trusted_profile`]; an untrusted locked
+/// profile yields an observe-only agent (see [`build_agent_checked`] for
+/// the refusal reason).
 pub fn build_agent(opts: &ReplayOptions) -> Result<Agent, ReplayError> {
+    build_agent_checked(opts).map(|(a, _)| a)
+}
+
+/// [`build_agent`] plus the profile trust outcome.
+pub fn build_agent_checked(opts: &ReplayOptions) -> Result<(Agent, TrustedProfile), ReplayError> {
     if opts.step_ns == 0 {
         return Err(ReplayError::Config("step must be > 0".into()));
     }
-    let profile = load_profile(&opts.profile)?;
+    let trusted = load_trusted_profile(opts)?;
+    let profile = trusted.profile.clone();
     let policy = load_policy(&opts.policy)?;
     let context = OperationalContext {
         platform: policy.platform,
@@ -275,7 +431,7 @@ pub fn build_agent(opts: &ReplayOptions) -> Result<Agent, ReplayError> {
         context,
         RecorderConfig::new(&opts.blackbox, &opts.robot_id, &opts.boot_id),
     );
-    cfg.profile_version = opts.profile_version.clone();
+    cfg.profile_version = trusted.version_label.clone();
     cfg.attestation = AttestationStatus::Unknown;
     cfg.kafka_partitions = opts.kafka_partitions;
     cfg.record_all_events = opts.record_all_events;
@@ -304,7 +460,7 @@ pub fn build_agent(opts: &ReplayOptions) -> Result<Agent, ReplayError> {
     let mut agent =
         Agent::new(cfg, Box::new(signer), Box::new(clock)).map_err(ReplayError::Agent)?;
     agent.mark_replay();
-    Ok(agent)
+    Ok((agent, trusted))
 }
 
 /// A replay must start a fresh chain (see the module docs).
@@ -339,7 +495,7 @@ pub fn run(
     plan_log: Option<Box<dyn Write>>,
 ) -> Result<ReplaySummary, ReplayError> {
     require_fresh_blackbox(&opts.blackbox)?;
-    let mut agent = build_agent(opts)?;
+    let (mut agent, trusted) = build_agent_checked(opts)?;
     if let Some(w) = plan_log {
         agent = agent.with_executor(Box::new(LoggingExecutor::new(w)));
     }
@@ -353,16 +509,45 @@ pub fn run(
     let mut input_error = None;
     let mut io_error = None;
     let mut events = 0u64;
-    while let Some(item) = source.next_event() {
-        let ev = match item {
-            Ok(ev) => ev,
-            Err(e) => {
-                input_error = Some(e.to_string());
-                break;
-            }
+    // An untrusted profile is itself the first finding (observe-only).
+    let mut pending: Vec<Outcome> = Vec::new();
+    if let Some(why) = &trusted.refused {
+        let detail = format!(
+            "model profile '{}' is not enforced (observe-only): {why}",
+            trusted.profile.model
+        );
+        let now = robodr_blackbox::Timestamp {
+            wall_ns: opts.start_wall_ms.saturating_mul(1_000_000),
+            mono_ns: 0,
+            source: TimeSource::Unknown,
         };
-        events += 1;
-        for o in agent.tick(&ev.event, opts.safety) {
+        pending.push(agent.handle_external(
+            now,
+            crate::Detector::Sensor,
+            "profile",
+            robodr_ocsf::Subject::default(),
+            robodr_events::Deviation::new(PROFILE_REFUSED, robodr_events::Severity::High, detail),
+            opts.safety,
+        ));
+    }
+    loop {
+        let batch = if pending.is_empty() {
+            let Some(item) = source.next_event() else {
+                break;
+            };
+            let ev = match item {
+                Ok(ev) => ev,
+                Err(e) => {
+                    input_error = Some(e.to_string());
+                    break;
+                }
+            };
+            events += 1;
+            agent.tick(&ev.event, opts.safety)
+        } else {
+            std::mem::take(&mut pending)
+        };
+        for o in batch {
             let res = (|| -> std::io::Result<()> {
                 if let Some(f) = &o.finding {
                     writeln!(findings, "{}", f.value)?;
@@ -426,6 +611,8 @@ pub fn run(
         stats: finished.stats,
         report,
         links,
+        profile_refused: trusted.refused,
+        profile_version: trusted.version_label,
     })
 }
 

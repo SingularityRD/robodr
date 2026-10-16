@@ -1,13 +1,35 @@
 {
+  "seal": "sha256:c8accbb25e88c8949690702fa298b6ac2eeb4e9822a27d344f860c6dabee819e",
   "model": "ugv-demo-x1",
   "locked": true,
+  "metadata": {
+    "schema_version": 1,
+    "profile_version": 1,
+    "platform": "ugv-demo",
+    "unit_id": null,
+    "locked_by": "RoboDR demo (synthetic)",
+    "locked_at": 1767225600,
+    "parent_digest": null
+  },
   "participants": [
     "01103f5a8c2e000000000101",
     "01103f5a8c2e000000000102",
     "01103f5a8c2e000000000103"
   ],
-  "writer_topics": ["/cmd_vel", "/odom", "/tf", "/scan"],
+  "writer_topics": [
+    "/cmd_vel",
+    "/odom",
+    "/scan",
+    "/tf"
+  ],
   "motion_envelopes": {
-    "/cmd_vel": { "max_linear_speed": 0.5, "max_joint_speed": null }
-  }
+    "/cmd_vel": {
+      "max_linear_speed": 0.5,
+      "max_joint_speed": null
+    }
+  },
+  "services": [],
+  "actions": [],
+  "reader_topics": [],
+  "raw_dds_topics": []
 }

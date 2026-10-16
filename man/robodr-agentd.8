@@ -44,6 +44,8 @@ and the crate README for the sections
 .B \-\-check\-config
 Validate the configuration and load every file it names (profile, policy,
 monitor config, key file), print warnings, then exit without starting.
+The profile trust and anti\-rollback decision is made, but the state file is
+not written (only a starting daemon records an accepted version).
 .TP
 .BR \-h ", " \-\-help
 Print the usage and exit 0.
@@ -65,6 +67,35 @@ symlink or not a regular file, if group or others have any access to it, if
 it is owned by a uid other than the daemon's or root, or if it is larger than
 4 KiB. HMAC is a placeholder authenticator: the verifying side holds the same
 secret.
+.SH PROFILE TRUST
+.B sensor.profile_trust
+decides whether a locked profile is enforced:
+.B trusted_keys
+(a
+.I robodr\-profile\-trust/v1
+file of Ed25519 public keys; without it no locked profile is enforced),
+.B state_file
+(anti\-rollback: a lower
+.BR profile_version ,
+the same version with different bytes, or a draft replacing a locked profile
+is refused),
+.B allow_rollback
+(the exact
+.B sha256:
+digest of the one older file to accept; remove it afterwards),
+.B expect_platform
+and
+.BR expect_unit_id .
+The profile must be accompanied by its detached signature
+.IB profile_path .sig
+as written by
+.BR "robodr\-commission lock \-\-sign\-key" .
+A profile that fails any check runs observe\-only and is reported as
+.BR robot.ros2.profile_refused .
+The profile version in findings is the signed
+.BR metadata.profile_version ;
+.B robot.profile_version
+was removed and is refused with a message saying so.
 .SH SIGNALS
 .B SIGTERM
 and
@@ -97,6 +128,17 @@ Black\-box segments and checkpoint (single writer).
 .TP
 .I /var/lib/robodr/spool/agentd/
 OCSF findings spool.
+.TP
+.I /etc/robodr/profile.json\fR, \fI/etc/robodr/profile.json.sig
+Locked profile and its detached signature (0640 root:robodr).
+.TP
+.I /etc/robodr/profile\-trust.json
+Trusted profile signing keys (public; 0644 root:root, never group/other
+writable).
+.TP
+.I /var/lib/robodr/profile\-state/agentd.json
+Anti\-rollback state (suggested path; the directory must be writable by the
+daemon).
 .TP
 .I /run/robodr\-agentd/
 Runtime directory for an optional unix\-socket event input (socket mode 0600).

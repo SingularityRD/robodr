@@ -1,9 +1,15 @@
 {
-  "robot": { "id": "ugv-007", "site": "site-a", "profile_version": "v1" },
+  "robot": { "id": "ugv-007", "site": "site-a" },
   "sensor": {
     "profile_path": "/etc/robodr/profile.json",
     "listen_spdp": false,
-    "capture": { "enabled": true, "interfaces": ["eth0"] }
+    "capture": { "enabled": true, "interfaces": ["eth0"] },
+    "profile_trust": {
+      "trusted_keys": "/etc/robodr/profile-trust.json",
+      "state_file": "/var/lib/robodr/profile-state/agentd.json",
+      "expect_platform": "ugv-x1",
+      "expect_unit_id": "ugv-007"
+    }
   },
   "policy_path": "/etc/robodr/response-policy.json",
   "blackbox": {

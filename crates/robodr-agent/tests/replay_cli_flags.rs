@@ -28,6 +28,8 @@ fn base(bb: &Path) -> Vec<String> {
         p(ex.join("rogue-ugv.jsonl")),
         "--profile".into(),
         p(ex.join("ugv-demo.profile.json")),
+        "--trusted-keys".into(),
+        p(ex.join("ugv-demo.trust.json")),
         "--policy".into(),
         p(ex.join("policy-oem-validated.json")),
         "--blackbox".into(),
@@ -70,8 +72,10 @@ const VALUED: &[&str] = &[
     "connectivity",
     "site",
     "model",
-    "profile-version",
     "boot-id",
+    "trusted-keys",
+    "profile-state",
+    "allow-profile-rollback",
     "start-ms",
     "step-ms",
     "firewall-allow",
@@ -278,6 +282,8 @@ fn key_sources_are_validated() {
         ex.join("rogue-ugv.jsonl").to_string_lossy().into(),
         "--profile".into(),
         ex.join("ugv-demo.profile.json").to_string_lossy().into(),
+        "--trusted-keys".into(),
+        ex.join("ugv-demo.trust.json").to_string_lossy().into(),
         "--policy".into(),
         ex.join("policy-oem-validated.json")
             .to_string_lossy()
@@ -469,6 +475,10 @@ fn accepted_forms_inline_values_explicit_run_and_valid_enums() {
         .arg(format!(
             "--profile={}",
             ex.join("ugv-demo.profile.json").display()
+        ))
+        .arg(format!(
+            "--trusted-keys={}",
+            ex.join("ugv-demo.trust.json").display()
         ))
         .arg(format!(
             "--policy={}",

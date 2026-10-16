@@ -107,7 +107,9 @@ The scenario files are synthetic and live in `examples/`:
 
 | File | What |
 |---|---|
-| `ugv-demo.profile.json` | Locked profile: 3 participants, `/cmd_vel` envelope 0.5 m/s |
+| `ugv-demo.profile.json` | Locked, versioned (metadata `profile_version` 1) and sealed profile: 3 participants, `/cmd_vel` envelope 0.5 m/s |
+| `ugv-demo.profile.json.sig` | Its detached Ed25519 signature by the **demo** profile key (public seed, see `tests/demo_profile.rs`; never trust it in the field) |
+| `ugv-demo.trust.json` | Trust file with the demo key's public half (`--trusted-keys`); without it the replay is observe-only and its first finding is `robot.ros2.profile_refused` |
 | `policy-oem-validated.json` | `config/response-policy.example.json` with `oem_validated: true` (**simulated sign-off, demo only**) |
 | `rogue-ugv.jsonl` | Clean graph, then a rogue participant, its `/cmd_vel` writer and command, then a legitimate 0.8 m/s command |
 | `motion-injection.jsonl` | `/cmd_vel` 0.4 m/s with honest `/odom`, then fabricated 1.2 m/s odometry from t=4.0 s to t=5.5 s |
@@ -122,6 +124,7 @@ E=crates/robodr-agent/examples
 # 1. Rogue participant + foreign cmd_vel writer + over-envelope command
 cargo run -p robodr-agent --bin robodr-replay -- \
   --events $E/rogue-ugv.jsonl --profile $E/ugv-demo.profile.json \
+  --trusted-keys $E/ugv-demo.trust.json \
   --policy $E/policy-oem-validated.json --blackbox /tmp/bb --key-file $KEY \
   --robot-id ugv-007 --safety-state moving_slow \
   --firewall --firewall-max-angular /cmd_vel=1.0 \
@@ -137,6 +140,7 @@ cargo run -p robodr-agent --bin robodr-replay -- verify --blackbox /tmp/bb \
 # 3. Injected telemetry caught by the motion monitor
 cargo run -p robodr-agent --bin robodr-replay -- \
   --events $E/motion-injection.jsonl --profile $E/ugv-demo.profile.json \
+  --trusted-keys $E/ugv-demo.trust.json \
   --policy $E/policy-oem-validated.json --blackbox /tmp/bb-motion --key-file $KEY \
   --robot-id ugv-007 --safety-state moving_slow --step-ms 20 \
   --monitor --feedback-source /odom=wheel_odometry \
@@ -145,6 +149,7 @@ cargo run -p robodr-agent --bin robodr-replay -- \
 # 4. Same scenario as 1 with the repository's (not OEM-validated) policy: observe only
 cargo run -p robodr-agent --bin robodr-replay -- \
   --events $E/rogue-ugv.jsonl --profile $E/ugv-demo.profile.json \
+  --trusted-keys $E/ugv-demo.trust.json \
   --policy config/response-policy.example.json --blackbox /tmp/bb-observe \
   --key-file $KEY --robot-id ugv-007 --log-plans \
   --firewall --firewall-max-angular /cmd_vel=1.0

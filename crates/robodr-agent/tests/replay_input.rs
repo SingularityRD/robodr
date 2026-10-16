@@ -40,6 +40,7 @@ fn opts_for(events: &Path, bb: &Path) -> ReplayOptions {
     o.safety = SafetyState::MovingSlow;
     o.firewall = true;
     o.firewall_max_angular = demo_angular();
+    o.trusted_keys = Some(ex.join("ugv-demo.trust.json"));
     o
 }
 

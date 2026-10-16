@@ -25,7 +25,21 @@
 //! on an unlocked file is refused too. The sensor ignores the extra key
 //! (robodr-events tolerates unknown keys). The seal is a plain hash, not a
 //! signature: it detects edits and corruption, not a deliberate forger who
-//! recomputes it. Authenticity needs a signing key (follow-up).
+//! recomputes it. Authenticity comes from the detached Ed25519 signature
+//! over the exact sealed bytes, checked by the loaders (see [`crate::trust`]).
+//!
+//! # Metadata
+//!
+//! The optional top-level `metadata` member (`ProfileMetadata`: schema and
+//! profile version, platform / unit, locked_by / locked_at, parent digest)
+//! is written by `lock`. When present it must be an object with exactly
+//! [`METADATA_KEYS`] (all present, nothing else), and it is only allowed on
+//! a locked profile ([`ProfileFileError::MetadataOnDraft`]): a draft has
+//! not been locked by anyone. A locked file *without* metadata is a legacy
+//! (pre-versioning) profile: it still parses here, so `check`, `diff` and
+//! `merge` work on it, but the loaders refuse to enforce it
+//! ([`crate::trust::ProfileTrustError::LegacyUnversioned`]); migrate it with
+//! `robodr-commission migrate-legacy`.
 //!
 //! # Safe writes ([`write_file_atomic`])
 //!
@@ -69,6 +83,18 @@ pub const PROFILE_KEYS: [&str; 9] = [
     "reader_topics",
     "raw_dds_topics",
 ];
+/// Optional top-level keys (written by `lock`).
+pub const OPTIONAL_PROFILE_KEYS: [&str; 1] = ["metadata"];
+/// Keys of the `metadata` object; all must be present.
+pub const METADATA_KEYS: [&str; 7] = [
+    "schema_version",
+    "profile_version",
+    "platform",
+    "unit_id",
+    "locked_by",
+    "locked_at",
+    "parent_digest",
+];
 /// Keys of one envelope object; both must be present.
 pub const ENVELOPE_KEYS: [&str; 2] = ["max_linear_speed", "max_joint_speed"];
 /// The seal member written by `lock`.
@@ -110,6 +136,19 @@ pub enum ProfileFileError {
     Invalid {
         errors: Vec<ProfileError>,
     },
+    /// The `metadata` member is not an object with exactly
+    /// [`METADATA_KEYS`].
+    BadMetadata {
+        detail: String,
+    },
+    /// `metadata` on an unlocked profile (only `lock` writes it).
+    MetadataOnDraft,
+    /// The file is well formed but not trusted for enforcement: signature,
+    /// trust anchors, platform/unit binding or anti-rollback (see
+    /// [`crate::trust`]). Only the trust-checking loaders produce this.
+    Untrusted {
+        reason: crate::trust::ProfileTrustError,
+    },
 }
 
 impl fmt::Display for ProfileFileError {
@@ -138,6 +177,13 @@ impl fmt::Display for ProfileFileError {
                 f,
                 "sealed file has \"locked\": false (edited after locking)"
             ),
+            Self::BadMetadata { detail } => write!(f, "metadata: {detail}"),
+            Self::MetadataOnDraft => write!(
+                f,
+                "\"metadata\" on an unlocked profile: only `lock` writes it; remove it from \
+                 the draft"
+            ),
+            Self::Untrusted { reason } => write!(f, "not trusted for enforcement: {reason}"),
             Self::Invalid { errors } => {
                 write!(f, "locked profile fails validation:")?;
                 for e in errors {
@@ -230,7 +276,10 @@ pub fn parse_profile_text(text: &str) -> Result<Profile, ProfileFileError> {
     let value: serde_json::Value = serde_json::from_str(text).map_err(json_err)?;
     let obj = value.as_object().ok_or(ProfileFileError::NotAnObject)?;
     for k in obj.keys() {
-        if !PROFILE_KEYS.contains(&k.as_str()) && k != SEAL_KEY {
+        if !PROFILE_KEYS.contains(&k.as_str())
+            && !OPTIONAL_PROFILE_KEYS.contains(&k.as_str())
+            && k != SEAL_KEY
+        {
             return Err(ProfileFileError::UnknownKey { key: k.clone() });
         }
     }
@@ -262,6 +311,22 @@ pub fn parse_profile_text(text: &str) -> Result<Profile, ProfileFileError> {
             }
         }
     }
+    if let Some(meta) = obj.get("metadata") {
+        let bad = |detail: String| ProfileFileError::BadMetadata { detail };
+        let m = meta
+            .as_object()
+            .ok_or_else(|| bad("not an object".into()))?;
+        for k in m.keys() {
+            if !METADATA_KEYS.contains(&k.as_str()) {
+                return Err(bad(format!("unknown key {k:?}")));
+            }
+        }
+        for k in METADATA_KEYS {
+            if !m.contains_key(k) {
+                return Err(bad(format!("missing key {k:?}")));
+            }
+        }
+    }
     // Typed parse straight from the text (duplicates were refused above).
     let profile: Profile = serde_json::from_str(text).map_err(json_err)?;
 
@@ -276,6 +341,9 @@ pub fn parse_profile_text(text: &str) -> Result<Profile, ProfileFileError> {
         }
     } else if profile.locked {
         return Err(ProfileFileError::LockedWithoutSeal);
+    }
+    if !profile.locked && profile.metadata.is_some() {
+        return Err(ProfileFileError::MetadataOnDraft);
     }
     if profile.locked {
         profile
@@ -638,6 +706,93 @@ mod tests {
             parse_profile_text(&sealed_text(&bad).unwrap()).unwrap_err(),
             ProfileFileError::Invalid { .. }
         ));
+    }
+
+    fn meta() -> robodr_events::profile::ProfileMetadata {
+        robodr_events::profile::ProfileMetadata {
+            schema_version: robodr_events::profile::PROFILE_SCHEMA_VERSION,
+            profile_version: 2,
+            platform: "ugv".into(),
+            unit_id: None,
+            locked_by: "op".into(),
+            locked_at: 1_790_000_000,
+            parent_digest: None,
+        }
+    }
+
+    #[test]
+    fn metadata_rules() {
+        let mut p = prof(true);
+        p.metadata = Some(meta());
+        let sealed = sealed_text(&p).unwrap();
+        assert_eq!(parse_profile_text(&sealed).unwrap(), p);
+        // Legacy locked profile (no metadata) still parses here.
+        assert!(parse_profile_text(&sealed_text(&prof(true)).unwrap()).is_ok());
+        let reseal = |p: &Profile, edit: &dyn Fn(&str) -> String| {
+            let body = edit(&to_json(p).unwrap());
+            let d = sha256_hex(body.as_bytes());
+            format!("{SEAL_PREFIX}{d}{SEAL_SUFFIX}{}", &body[2..])
+        };
+        for (edit, what) in [
+            (
+                &(|t: &str| t.replace("\"unit_id\": null,\n", "")) as &dyn Fn(&str) -> String,
+                "missing key",
+            ),
+            (
+                &|t: &str| t.replace("\"unit_id\": null", "\"unit_id\": null, \"x\": 1"),
+                "unknown key",
+            ),
+        ] {
+            let e = parse_profile_text(&reseal(&p, edit)).unwrap_err();
+            assert!(
+                matches!(&e, ProfileFileError::BadMetadata { detail } if detail.contains(what)),
+                "{e:?}"
+            );
+        }
+        // Not an object / null.
+        let mut v: serde_json::Value = serde_json::from_str(&to_json(&p).unwrap()).unwrap();
+        for bad in [
+            serde_json::Value::Null,
+            serde_json::json!(3),
+            serde_json::json!([]),
+        ] {
+            v["metadata"] = bad;
+            let body = to_json(&v).unwrap();
+            assert!(matches!(
+                parse_profile_text(&body).unwrap_err(),
+                ProfileFileError::BadMetadata { .. }
+            ));
+        }
+        // Wrong type inside: a JSON error.
+        let e = parse_profile_text(&reseal(&p, &|t: &str| {
+            t.replace("\"profile_version\": 2", "\"profile_version\": \"2\"")
+        }))
+        .unwrap_err();
+        assert!(matches!(e, ProfileFileError::Json { .. }), "{e:?}");
+        // Negative / overflowing version.
+        for bad in ["-1", "18446744073709551616", "1.5"] {
+            let e = parse_profile_text(&reseal(&p, &|t: &str| {
+                t.replace(
+                    "\"profile_version\": 2",
+                    &format!("\"profile_version\": {bad}"),
+                )
+            }));
+            assert!(e.is_err(), "{bad}");
+        }
+        // Invalid metadata on a locked profile: refused by validate.
+        let mut bad = p.clone();
+        bad.metadata.as_mut().unwrap().profile_version = 0;
+        assert!(matches!(
+            parse_profile_text(&sealed_text(&bad).unwrap()).unwrap_err(),
+            ProfileFileError::Invalid { .. }
+        ));
+        // Metadata on a draft.
+        let mut draft = prof(false);
+        draft.metadata = Some(meta());
+        assert_eq!(
+            parse_profile_text(&to_json(&draft).unwrap()).unwrap_err(),
+            ProfileFileError::MetadataOnDraft
+        );
     }
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {
