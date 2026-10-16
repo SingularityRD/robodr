@@ -337,7 +337,7 @@ fn f2b_conflicting_duplicate_fragment_is_reported() {
         ..Default::default()
     });
     let f = p.process(&datagram(ROGUE, &[f1, f1_bad]), XIP);
-    let r = with_rule(&f, rules::DISCOVERY_FRAGMENT_REJECTED);
+    let r = with_rule(&f, rules::DISCOVERY_FRAGMENT_CONFLICT);
     assert_eq!(r.len(), 1, "{f:#?}");
     assert_eq!(r[0].deviation.severity, Severity::Medium);
 }

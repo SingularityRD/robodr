@@ -69,7 +69,7 @@ pub mod socket;
 pub mod source;
 pub mod watch;
 
-pub use binding::{BindingOptions, BindingStats, BindingTable};
+pub use binding::{BindingOptions, BindingStats, BindingTable, Ingress};
 pub use config::{
     BindingConfig, CaptureConfig, CaptureInput, CaptureSettings, Config, Settings, SpdpSettings,
 };
@@ -80,7 +80,8 @@ pub use pipeline::{
 };
 pub use sanitize::{sanitize, MAX_TEXT_CHARS};
 pub use source::{
-    CaptureDatagramSource, CaptureHealth, Datagram, DatagramSource, SharedHealth, VecDatagramSource,
+    CaptureDatagramSource, CaptureHealth, Datagram, DatagramSource, MergedDatagramSource,
+    SharedHealth, VecDatagramSource,
 };
 
 // Re-exported so the Pulsar glue needs no direct dependency on these crates.
