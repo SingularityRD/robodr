@@ -74,7 +74,8 @@ crates/
                           (keygen, export-pub, verify, inspect).
   robodr-ocsf/            Deviation -> OCSF Detection Finding for the AutoSecOps
                           robot-edr.findings contract; Kafka key/partition helpers
-                          (no Kafka client).
+                          (no Kafka client); optional detached Ed25519 per-finding
+                          signatures (contract 1.2, header robodr-finding-sig).
   robodr-agent/           Offline decision chain composing the crates above
                           (event -> deviation -> plan -> evidence -> finding).
                           Binary: robodr-replay (JSONL replay). Executes nothing.

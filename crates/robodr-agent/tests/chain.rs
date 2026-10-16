@@ -989,3 +989,65 @@ fn invalid_configuration_is_refused() {
     ));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// Signed findings (contract 1.2) ----------------------------------------------
+
+#[test]
+fn findings_are_signed_when_a_finding_key_is_configured() {
+    use robodr_blackbox::{Ed25519SigningKey, Verifier};
+    use robodr_ocsf::{
+        parse_and_validate_signed, signature_header, SignaturePolicy, SignatureStatus,
+    };
+
+    let dir = tmpdir("signed-findings");
+    let key = Ed25519SigningKey::from_seed("finding-key-1", &[3; 32]).unwrap();
+    let mut keys: BTreeMap<String, Box<dyn Verifier>> = BTreeMap::new();
+    keys.insert(ROBOT.into(), Box::new(key.verifying_key()));
+    let mut agent = build(config(&dir, demo_profile(true), validated_policy()))
+        .with_finding_signer(Box::new(key))
+        .unwrap();
+    assert!(agent.signs_findings());
+    let o = agent.handle(
+        at(1_000 * MS),
+        &rogue_cmd_vel_writer(),
+        SafetyState::MovingSlow,
+    );
+    let f = o[0].finding.as_ref().expect("finding");
+    assert!(o[0].finding_errors.is_empty(), "{:?}", o[0].finding_errors);
+    let sig = signature_header(&f.headers)
+        .unwrap()
+        .expect("signature header");
+    let v = parse_and_validate_signed(&f.value, Some(sig), &keys, SignaturePolicy::Strict).unwrap();
+    assert_eq!(
+        v.signature,
+        SignatureStatus::Verified {
+            unit_id: ROBOT.into(),
+            key_id: "finding-key-1".into()
+        }
+    );
+    // The value itself is unchanged by signing (still plain-validates).
+    assert_eq!(finding(&o[0]), v.envelope);
+
+    // An HMAC key is refused as a finding key (symmetric: verifiers could forge).
+    let dir2 = tmpdir("signed-findings-hmac");
+    let err = build(config(&dir2, demo_profile(true), validated_policy()))
+        .with_finding_signer(signer())
+        .unwrap_err();
+    assert!(err.to_string().contains("finding signer"), "{err}");
+
+    // Without a finding key, no signature header (1.1-compatible output).
+    let dir3 = tmpdir("unsigned-findings");
+    let mut plain = build(config(&dir3, demo_profile(true), validated_policy()));
+    assert!(!plain.signs_findings());
+    let o = plain.handle(
+        at(1_000 * MS),
+        &rogue_cmd_vel_writer(),
+        SafetyState::MovingSlow,
+    );
+    let f = o[0].finding.as_ref().unwrap();
+    assert_eq!(signature_header(&f.headers).unwrap(), None);
+    assert_eq!(
+        parse_and_validate_signed(&f.value, None, &keys, SignaturePolicy::Strict).unwrap_err(),
+        robodr_ocsf::SignatureError::Missing
+    );
+}

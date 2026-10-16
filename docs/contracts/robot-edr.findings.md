@@ -2,12 +2,12 @@
 
 | | |
 | --- | --- |
-| Contract version | **1.1.0** (`contract_version` field, `robodr-contract-version` header); changes in §10 |
+| Contract version | **1.2.0** (`contract_version` field, `robodr-contract-version` header); changes in §10 |
 | Producer | RoboDR control plane (Kafka publisher, Sprint 4); diode importer on air-gapped sites |
 | Consumer | AutoSecOps `core/ingestion/kafka_consumer_service.py` |
 | Value schema | [`robot-edr-finding.schema.json`](robot-edr-finding.schema.json) (JSON Schema 2020-12) |
 | Golden example | [`robot-edr-finding.example.json`](robot-edr-finding.example.json) |
-| Reference implementation | `crates/robodr-ocsf` (`FindingBuilder`, `validate`, `kafka::record`) |
+| Reference implementation | `crates/robodr-ocsf` (`FindingBuilder`, `validate`, `kafka::record`, `sig`) |
 
 The example and the schema are not hand-maintained prose: the `robodr-ocsf`
 test suite fails if the builder's output differs from the example by a single
@@ -73,12 +73,13 @@ listed in `crates/robodr-ocsf/README.md` (*OCSF-UNCERTAIN*).
 | Header | Value |
 | --- | --- |
 | `content-type` | `application/json` |
-| `robodr-contract-version` | `1.1.0` |
+| `robodr-contract-version` | `1.2.0` |
 | `ocsf-version` | `1.1.0` |
 | `data-source` | `robot_edr` |
 | `robot-id` | robot id (`[A-Za-z0-9._-]{1,64}`) |
 | `severity` | `low` \| `medium` \| `high` \| `critical` |
 | `event-uid` | `ocsf.metadata.uid` (per-emission id, `re1-` + 32 hex) |
+| `robodr-finding-sig` | *optional, since 1.2, always last:* detached Ed25519 signature (§2a) |
 
 Headers are a routing convenience; the value is authoritative. A consumer must
 not trust a header that disagrees with the value.
@@ -87,7 +88,7 @@ not trust a header that disagrees with the value.
 
 ```json
 {
-  "contract_version": "1.1.0",
+  "contract_version": "1.2.0",
   "finding_id": "rf1-0d7e79aac05cfd23bcfbdd38ef617eba",
   "external_id": "ugv-007:rf1-0d7e79aac05cfd23bcfbdd38ef617eba",
   "data_source": "robot_edr",
@@ -136,6 +137,84 @@ not trust a header that disagrees with the value.
   }
 }
 ```
+
+## 2a. Finding signature (contract 1.2, optional)
+
+**Why.** The validator proves a finding is well formed, not who wrote it. On
+a connected (non-diode) path, anyone able to produce to the topic can forge a
+finding that matches the rule catalog exactly. Since 1.2 a producer may sign
+each finding with a per-unit Ed25519 *finding key*; a consumer in **strict**
+mode requires the signature.
+
+**Signed bytes = the record value, verbatim.** The message is the exact UTF-8
+bytes of the Kafka value as the producer emitted it (`robodr_ocsf::to_json`:
+compact, deterministic). There is no canonical form and no re-serialisation:
+the consumer verifies over the raw bytes it received, before trusting the
+parse. Any hop that re-formats the value (pretty-print, key reordering,
+re-escaping, re-serialising a parsed object) breaks the signature — on
+purpose; forwarders must carry values verbatim.
+
+```text
+ed25519_sign(finding_key,
+    "robodr-ocsf/finding-sig/v1" 0x00
+    || u32be(len(alg))    || alg        -- "ed25519"
+    || u32be(len(key_id)) || key_id     -- printable ASCII, 1..128 bytes
+    || u64be(len(value))  || value)     -- record value bytes
+```
+
+The domain string keeps finding signatures distinct from black-box record or
+diode manifest signatures; `alg` and `key_id` are inside the signed message,
+so a signature cannot be relabelled to another key.
+
+**Carrier: Kafka header `robodr-finding-sig`** (not a value field: a field
+inside the value would make the signed bytes depend on the signature, and the
+value stays byte-identical to an unsigned 1.2 value). Header value, compact
+JSON, exactly these fields in this order, ≤ 512 bytes
+(`$defs/FindingSignatureHeader` in the schema):
+
+```json
+{"alg":"ed25519","key_id":"finding:ugv-007:1","sig":"<128 lower-case hex digits>"}
+```
+
+**Verification** (`robodr_ocsf::parse_and_validate_signed(raw, header, keys,
+policy)` / `verify_record`):
+
+1. Exactly one `robodr-finding-sig` header (name case-insensitive), else
+   reject (`Duplicate`). Parse it strictly: unknown/duplicate fields,
+   `alg` ≠ `ed25519` (HMAC is never accepted: a symmetric key lets every
+   verifier forge), bad key id or non-lower-case hex → reject.
+2. Validate the value with the strict validator (unchanged).
+3. Look up the verifier for the unit **the finding itself names**,
+   `entity_context.robot.id` (already bound by the validator to
+   `external_id`, `ocsf.device.uid` and `finding_id`). No key for that unit
+   → reject. If the keyring binds the named key to a device, it must be that
+   unit. A key of unit B therefore never vouches for a finding naming unit A.
+4. Verify the Ed25519 signature over the raw value bytes under the key named
+   by `key_id` (a unit's keyring may hold current and previous keys).
+
+| Policy | No header | Header present |
+| --- | --- | --- |
+| `Strict` | reject (`Missing`) | must verify |
+| `Optional` (migration) | accept, status `Unsigned` | must verify |
+
+**Replay is the consumer's job.** A signature proves origin, not freshness;
+a captured signed record re-sent verbatim verifies again. Consumers already
+drop exact duplicates on `event-uid` (§2 *Identity*); `VerifiedFinding::
+replay_key()` returns `(robot id, finding_id, event uid, ocsf.time, count)`
+for that dedup, and `ocsf.time` can feed a freshness window. The library
+keeps no state.
+
+**Keys.** One finding key per unit, distinct from its black-box key;
+consumers hold public keys only (a map `robot id → Verifier`, e.g. a
+`robodr_blackbox::Keyring`). Distribution of those public keys is the
+commissioning / fleet registry's job and outside this contract. The Ed25519
+implementation is the in-crate RFC 8032 one from `robodr-blackbox`
+(vector-tested, not independently audited).
+
+**Producer.** `robodr_ocsf::record_signed` / `sign_record`; the agent signs
+when configured with `Agent::with_finding_signer` (Ed25519 only; if signing a
+finding fails at run time it is emitted unsigned with an error, which strict
+consumers drop — the black box still holds the evidence).
 
 ### Severity mapping
 
@@ -338,6 +417,9 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
 * `ocsf.metadata.version` moves independently; upgrading the OCSF version
   inside the envelope is a minor change only if it is additive for consumers.
 * The reference validator accepts any `1.y.z` and rejects other majors.
+* 1.2 added only an optional Kafka header (§2a); the value format is
+  unchanged except for `contract_version`. 1.1 consumers ignore the header;
+  strict-signature consumers reject unsigned 1.1 producers.
 
 ## 6. Size limits
 
@@ -465,6 +547,14 @@ records to Kafka are outside the crate (no network code).
   never stops the other entries or units from being imported.
 * Because `finding_id` and `event-uid` are deterministic, re-publishing an
   already-imported finding remains idempotent for the consumer.
+* **Finding signatures (§2a) across the diode — integrator TODO.** Today
+  `findings.jsonl` carries values only and the importer re-serialises the
+  parsed value (`robodr_ocsf::record`), so per-finding signatures are not
+  carried across the diode; the batch is authenticated by `MANIFEST.sig`
+  instead. To keep end-to-end per-finding signatures the packer must carry
+  each `robodr-finding-sig` header and the importer must emit the original
+  value bytes verbatim with that header (re-serialisation is byte-identical
+  for builder output today — tested — but that is not a contract guarantee).
 
 ### 8.1 Exporters (`crates/robodr-export`)
 
@@ -519,8 +609,15 @@ Consumer acceptance checks for this contract:
 - [ ] `robotics` category assigned from `mitre_predictions`; never autonomous.
 - [ ] Tainted fields rendered as delimited data; never sole support for a benign verdict.
 - [ ] `evidence_links` resolved through the control plane's black-box API (not fetched directly from robots).
+- [ ] `robodr-finding-sig` verified over the raw value bytes with the key registered for `entity_context.robot.id` (§2a); strict mode on connected paths once all producers sign; dedup on `event-uid` (signatures do not stop replay).
 
 ## 10. Changelog
+
+* **1.2.0** — optional detached per-finding Ed25519 signature (§2a) in the
+  new Kafka header `robodr-finding-sig`; signed bytes = the record value
+  verbatim. Value format unchanged apart from `contract_version`; schema
+  `$id` → `/1.2.0`, new `$defs/FindingSignatureHeader`. Consumers may run in
+  strict mode (signature required). Reference: `robodr_ocsf::sig`.
 
 * **1.1.0, rev3 tightening** (validator and contract text only; the wire
   format and `contract_version: "1.1.0"` are unchanged — every message the

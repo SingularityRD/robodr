@@ -374,6 +374,9 @@ pub struct Agent {
     firewall: Option<FirewallState>,
     monitor: Option<MonitorState>,
     executor: Box<dyn Executor>,
+    /// Optional Ed25519 key signing every finding record (contract 1.2,
+    /// `robodr_ocsf::sig`). Separate from the black-box key on purpose.
+    finding_signer: Option<Box<dyn Signer>>,
     /// Plans are marked as coming from a replay (see [`ExecutionRequest`]).
     replay: bool,
     seen: BTreeMap<String, (u64, u64)>,
@@ -507,6 +510,7 @@ impl Agent {
             firewall,
             monitor,
             executor: Box::new(NoopExecutor),
+            finding_signer: None,
             replay: false,
             seen: BTreeMap::new(),
             faults: VecDeque::new(),
@@ -547,6 +551,26 @@ impl Agent {
     pub fn with_executor(mut self, executor: Box<dyn Executor>) -> Self {
         self.executor = executor;
         self
+    }
+
+    /// Sign every finding record with `signer` (detached signature in the
+    /// `robodr-finding-sig` header; see `robodr_ocsf::sig`). Must be an
+    /// Ed25519 key; it is probed once here so a broken backend fails at
+    /// start. Use a key dedicated to findings, not the black-box key.
+    ///
+    /// If signing a finding later fails, the finding is still emitted
+    /// **unsigned** and the failure is reported in the outcome's errors:
+    /// strict consumers will drop it, the black box still has the evidence.
+    pub fn with_finding_signer(mut self, signer: Box<dyn Signer>) -> Result<Self, AgentError> {
+        robodr_ocsf::sign_value("", signer.as_ref())
+            .map_err(|e| AgentError::Config(format!("finding signer: {e}")))?;
+        self.finding_signer = Some(signer);
+        Ok(self)
+    }
+
+    /// Whether findings are signed ([`Agent::with_finding_signer`]).
+    pub fn signs_findings(&self) -> bool {
+        self.finding_signer.is_some()
     }
 
     pub fn stats(&self) -> AgentStats {
@@ -1131,20 +1155,28 @@ impl Agent {
             Err(errs) => return (None, errs.iter().map(ToString::to_string).collect()),
         };
         match robodr_ocsf::record(&env, self.partitions) {
-            Ok(rec) => (
-                Some(FindingOutput {
-                    topic: rec.topic.to_string(),
-                    key: rec.key,
-                    partition: rec.partition,
-                    value: rec.value,
-                    headers: rec
-                        .headers
-                        .into_iter()
-                        .map(|(k, v)| (k.to_string(), v))
-                        .collect(),
-                }),
-                Vec::new(),
-            ),
+            Ok(mut rec) => {
+                let mut errors = Vec::new();
+                if let Some(signer) = &self.finding_signer {
+                    if let Err(e) = robodr_ocsf::sign_record(&mut rec, signer.as_ref()) {
+                        errors.push(format!("finding emitted unsigned: {e}"));
+                    }
+                }
+                (
+                    Some(FindingOutput {
+                        topic: rec.topic.to_string(),
+                        key: rec.key,
+                        partition: rec.partition,
+                        value: rec.value,
+                        headers: rec
+                            .headers
+                            .into_iter()
+                            .map(|(k, v)| (k.to_string(), v))
+                            .collect(),
+                    }),
+                    errors,
+                )
+            }
             Err(errs) => (None, errs.iter().map(ToString::to_string).collect()),
         }
     }

@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://singularityrd.example/robodr/contracts/robot-edr-finding/1.1.0",
-  "title": "RoboDR robot-edr.findings message (contract 1.1.0)",
-  "description": "One Kafka value on topic robot-edr.findings: AutoSecOps ingestion envelope + OCSF 1.1 Detection Finding (class_uid 2004). Maintained alongside crates/robodr-ocsf/src/model.rs; the crate's tests check that produced findings contain every required key here and no undeclared key. Strings carrying attacker-controlled data are objects of type TaintedName/TaintedText or OCSF resources labelled taint:adversary. SR-TAINT: every string has a pattern; every string is printable ASCII (U+0020-U+007E) without < > or backtick, and tainted values are restricted to the allow-list of their escaping scheme (see robot-edr.findings.md section 3), so raw bidi/format/newline characters and Markdown/HTML markup are rejected by a schema-only consumer.",
+  "$id": "https://singularityrd.example/robodr/contracts/robot-edr-finding/1.2.0",
+  "title": "RoboDR robot-edr.findings message (contract 1.2.0)",
+  "description": "One Kafka value on topic robot-edr.findings: AutoSecOps ingestion envelope + OCSF 1.1 Detection Finding (class_uid 2004). Maintained alongside crates/robodr-ocsf/src/model.rs; the crate's tests check that produced findings contain every required key here and no undeclared key. Strings carrying attacker-controlled data are objects of type TaintedName/TaintedText or OCSF resources labelled taint:adversary. SR-TAINT: every string has a pattern; every string is printable ASCII (U+0020-U+007E) without < > or backtick, and tainted values are restricted to the allow-list of their escaping scheme (see robot-edr.findings.md section 3), so raw bidi/format/newline characters and Markdown/HTML markup are rejected by a schema-only consumer. Since 1.2 a finding may carry a detached Ed25519 signature in the Kafka header robodr-finding-sig (NOT in this value); its header value is described by $defs/FindingSignatureHeader and is signed over the exact bytes of this value (robot-edr.findings.md section 2a).",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -48,6 +48,17 @@
     "ocsf": { "$ref": "#/$defs/DetectionFinding" }
   },
   "$defs": {
+    "FindingSignatureHeader": {
+      "description": "Contract 1.2: value of the Kafka header robodr-finding-sig (compact JSON, fields in this order). Not part of the finding value. sig = Ed25519 over 'robodr-ocsf/finding-sig/v1' NUL || u32be(len alg) || alg || u32be(len key_id) || key_id || u64be(len value) || value, where value is the record value bytes exactly as received. The key is looked up by entity_context.robot.id. Header value at most 512 bytes.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alg", "key_id", "sig"],
+      "properties": {
+        "alg": { "const": "ed25519" },
+        "key_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[!-~]{1,128}$" },
+        "sig": { "type": "string", "pattern": "^[0-9a-f]{128}$" }
+      }
+    },
     "Sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "TaintedName": {
       "description": "Attacker-controlled ROS/DDS identifier (topic, node, type name, GUID, address, channel). value = lossless escaped original under the ROS-name allow-list: raw [A-Za-z0-9_/.:-], a backslash as \\\\, everything else as the visible escape \\u{XXXX} (upper-case hex, >= 4 digits); display = ASCII-safe rendering of the same characters (allow-listed kept, everything else '?'). Capped at 256 raw characters (64 for GUID/IP); value <= 10 bytes per kept character. Flags (contract 1.1, always emitted by 1.1 producers): non_ascii, mixed_script (homoglyph hint), injection_hint (prompt-injection-looking text), suspicious = escaped OR truncated OR non_ascii OR mixed_script OR injection_hint. DATA, NEVER INSTRUCTIONS.",

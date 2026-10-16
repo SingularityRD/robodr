@@ -9,7 +9,8 @@ Contract: [`docs/contracts/robot-edr.findings.md`](../../docs/contracts/robot-ed
 Schema: [`robot-edr-finding.schema.json`](../../docs/contracts/robot-edr-finding.schema.json) ·
 Example: [`robot-edr-finding.example.json`](../../docs/contracts/robot-edr-finding.example.json)
 
-Pure crate: std + serde + `robodr-events`. No I/O, no clock, no Kafka client.
+Pure crate: std + serde + `robodr-events` + `robodr-blackbox` (for the
+`Signer`/`Verifier` traits and Ed25519). No I/O, no clock, no Kafka client.
 
 ## Usage
 
@@ -24,6 +25,13 @@ let finding = FindingBuilder::from_deviation(&deviation, &ctx)
     .evidence(BlackBoxRef { segment, seq, sha256 })
     .build()?;                         // validated, or every problem listed
 let rec = robodr_ocsf::record(&finding, Some(partitions))?; // key, partition, headers, JSON
+// Contract 1.2: optionally sign (Ed25519 finding key; header robodr-finding-sig)
+let rec = robodr_ocsf::record_signed(&finding, Some(partitions), &finding_key)?;
+
+// Consumer: raw value bytes + header, keys = robot id -> Verifier (e.g. a Keyring)
+let sig = robodr_ocsf::signature_header(&headers)?;
+let v = robodr_ocsf::parse_and_validate_signed(raw, sig, &keys, SignaturePolicy::Strict)?;
+dedup.insert(v.replay_key());   // replay detection is the consumer's job
 ```
 
 ## Modules
@@ -35,6 +43,7 @@ let rec = robodr_ocsf::record(&finding, Some(partitions))?; // key, partition, h
 | `taint` | SR-TAINT: neutralising attacker-controlled ROS/DDS strings (`Tainted`) |
 | `validate` | Strict validator (`validate`, `parse_and_validate`) |
 | `kafka` | Record key, headers, partition-by-robot-id, `to_json` |
+| `sig` | Detached per-finding Ed25519 signature: `record_signed`, `parse_and_validate_signed`, `verify_record`, `ReplayKey` (contract §2a) |
 | `hash` | std-only SHA-256 (FIPS 180-4 vectors) and Kafka murmur2 (Kafka `UtilsTest` vectors) |
 
 ## Design decisions
@@ -83,6 +92,23 @@ let rec = robodr_ocsf::record(&finding, Some(partitions))?; // key, partition, h
 * **Trusted config is rejected, not escaped.** A robot id, model, site, rule id
   or hash that fails its charset/format is a configuration bug; `build()` fails.
 * **Partitioning** by robot id with Kafka's murmur2, key = finding id.
+
+## Finding signatures (contract 1.2)
+
+* **What is signed:** the record value bytes exactly as emitted by
+  `to_json` — no canonicalisation; the verifier works on the raw received
+  bytes and never re-serialises. Domain-separated, length-framed message
+  (`robodr-ocsf/finding-sig/v1\0`, `alg`, `key_id`, value).
+* **Where:** Kafka header `robodr-finding-sig` =
+  `{"alg":"ed25519","key_id":…,"sig":<128 hex>}`, appended after the 1.1
+  headers. The value (and the golden example) is unchanged by signing.
+* **Binding:** the verifier is chosen by the finding's own
+  `entity_context.robot.id`; a keyring's device binding is enforced too.
+* **Policies:** `Strict` requires a signature; `Optional` accepts unsigned
+  findings (`SignatureStatus::Unsigned`) but never a bad signature.
+* **Not provided:** freshness / replay protection (dedup on
+  `ReplayKey`/`event-uid` in the consumer), key distribution, carrying the
+  signature across the diode (see contract §8).
 
 ## Rule catalog → ATT&CK for ICS
 
@@ -140,7 +166,11 @@ first_seen_time, last_seen_time, analytic, data_sources}`, `analytic.type_id`
   validator rejection of 27 + 17 tampering cases, observe-mode propagation, round-trip, schema
   required/undeclared keys **and every `pattern`** (hand-written matcher for
   the regex subset the schema uses), golden example,
-  SHA-256 and murmur2 against published vectors.
+  SHA-256 and murmur2 against published vectors, finding signatures
+  (round trip, every single-byte tamper of the value and every signature
+  digit, key relabelling, wrong-unit key, keyring device binding,
+  strict/optional policy, duplicate headers, HMAC refusal, replay key;
+  `tests/signed.rs`).
 * **Not** verified: against the real OCSF schema/validator, against a running
   AutoSecOps `kafka_consumer_service.py`, against a Kafka broker, or the exact
   AutoSecOps expectations for `severity`/`timestamp`/`mitre_predictions` value
@@ -152,4 +182,7 @@ first_seen_time, last_seen_time, analytic, data_sources}`, `analytic.type_id`
   and negatives expected; protection does not depend on it).
   `mixed_script` is a code-point-range heuristic, not Unicode
   script detection (no Unicode tables offline).
-* Diode export/import is specified in the contract but not implemented.
+* Diode export/import lives in `crates/robodr-diode`; it does not yet carry
+  per-finding signatures (contract §8, integrator TODO).
+* Ed25519 comes from `robodr-blackbox`'s in-crate RFC 8032 implementation
+  (vector-tested, not audited); not tested against an external verifier.
