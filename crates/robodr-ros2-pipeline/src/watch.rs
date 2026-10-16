@@ -14,6 +14,14 @@
 //!
 //! Read-only: replay reads a file; live capture uses the same passive
 //! `AF_PACKET` reader as the sensor (needs `CAP_NET_RAW`, never transmits).
+//!
+//! Hostile input: every capture byte goes through the pipeline, which never
+//! panics and bounds both memory and output (per-datagram finding cap, rate
+//! limits); all attacker text in a JSON line is sanitised. Argument values
+//! are validated (ranges, unicast IPs, 24-hex prefixes) and echoed back
+//! sanitised. Limit: in live mode held SEDP announcements (see
+//! `crate::binding`) are reported on the next captured datagram, not on a
+//! timer, because the capture source blocks; replays report them at the end.
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -49,6 +57,16 @@ OPTIONS:
     --no-anomalies         do not report RTPS parse anomalies
     --no-fragmentation     do not report fragmented discovery (rejected
                            fragments are always reported)
+    --discovery-server <ip>
+                           trust announcements relayed from this IP
+                           (repeatable)
+    --participant-ip <prefix>=<ip>
+                           pin a GUID prefix (24 hex digits) to a source IP
+                           (repeatable; several IPs per prefix allowed)
+    --hold-ms <ms>         how long SEDP from a participant without SPDP is
+                           held before it is reported (default 30000;
+                           replays report what is still held at the end)
+    --no-binding           disable the participant/source-IP binding check
     --duration <secs>      live only: stop after this many seconds (then
                            --stats is printed); default: run until killed
     --stats                print final counters as JSON on stderr
@@ -63,7 +81,8 @@ EXIT: 0 done, 1 runtime error, 2 usage error.
 pub enum Command {
     Help,
     Version,
-    Run(WatchArgs),
+    /// Boxed: [`WatchArgs`] is much larger than the other variants.
+    Run(Box<WatchArgs>),
 }
 
 /// Parsed arguments of a run.
@@ -89,6 +108,14 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, St
     let mut options = PipelineOptions::default();
     let mut stats = false;
     let mut duration = None;
+    let bad_ip = |flag: &str, v: &str| -> String {
+        format!("{flag} {:?}: not a unicast IP address", sanitize(v))
+    };
+    let unicast = |ip: std::net::IpAddr| {
+        !ip.is_unspecified()
+            && !ip.is_multicast()
+            && ip != std::net::IpAddr::from([255, 255, 255, 255])
+    };
 
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
@@ -96,8 +123,15 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, St
             Some((f, v)) if f.starts_with("--") => (f.to_string(), Some(v.to_string())),
             _ => (arg.clone(), None),
         };
+        // A separate value must not look like a flag (`--profile --pcap x`
+        // would otherwise take "--pcap" as the profile path); use the
+        // `--flag=value` form for a value that really starts with "--".
         let mut value = |name: &str| -> Result<String, String> {
-            match inline.clone().or_else(|| it.next()) {
+            let v = match inline.clone() {
+                Some(v) => Some(v),
+                None => it.next().filter(|v| !v.starts_with("--")),
+            };
+            match v {
                 Some(v) if !v.is_empty() => Ok(v),
                 _ => Err(format!("{name} needs a value")),
             }
@@ -155,6 +189,69 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, St
                         )
                     })?;
             }
+            "--discovery-server" => {
+                let v = value("--discovery-server")?;
+                let ip = v
+                    .parse()
+                    .ok()
+                    .filter(|ip| unicast(*ip))
+                    .map(crate::binding::canonical_ip)
+                    .ok_or_else(|| bad_ip("--discovery-server", &v))?;
+                let servers = &mut options.binding.discovery_servers;
+                if !servers.contains(&ip) {
+                    if servers.len() >= crate::binding::MAX_DISCOVERY_SERVERS {
+                        return Err("too many --discovery-server".into());
+                    }
+                    servers.push(ip);
+                }
+            }
+            "--participant-ip" => {
+                let v = value("--participant-ip")?;
+                let (prefix, ip) = v
+                    .split_once('=')
+                    .ok_or_else(|| "--participant-ip needs <prefix>=<ip>".to_string())?;
+                let prefix = crate::binding::parse_prefix(prefix).ok_or_else(|| {
+                    format!(
+                        "--participant-ip {:?}: prefix must be 24 hex digits",
+                        sanitize(&v)
+                    )
+                })?;
+                let ip = ip
+                    .parse()
+                    .ok()
+                    .filter(|ip| unicast(*ip))
+                    .map(crate::binding::canonical_ip)
+                    .ok_or_else(|| bad_ip("--participant-ip", &v))?;
+                let pins = &mut options.binding.participant_ips;
+                if pins.len() >= crate::binding::MAX_PINNED_PARTICIPANTS
+                    && !pins.contains_key(&prefix)
+                {
+                    return Err("too many --participant-ip prefixes".into());
+                }
+                let list = pins.entry(prefix).or_default();
+                if !list.contains(&ip) {
+                    if list.len() >= crate::binding::MAX_PINNED_IPS {
+                        return Err("too many --participant-ip addresses for one prefix".into());
+                    }
+                    list.push(ip);
+                }
+            }
+            "--hold-ms" => {
+                let v = value("--hold-ms")?;
+                let ms: u64 = v
+                    .parse()
+                    .ok()
+                    .filter(|ms| *ms <= crate::config::MAX_HOLD_MS)
+                    .ok_or_else(|| {
+                        format!(
+                            "--hold-ms {:?}: must be 0..={}",
+                            sanitize(&v),
+                            crate::config::MAX_HOLD_MS
+                        )
+                    })?;
+                options.binding.hold = Duration::from_millis(ms);
+            }
+            "--no-binding" if inline.is_none() => options.binding.enabled = false,
             "--no-anomalies" if inline.is_none() => options.report_anomalies = false,
             "--no-fragmentation" if inline.is_none() => options.report_fragmentation = false,
             "--stats" if inline.is_none() => stats = true,
@@ -191,7 +288,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, St
     if duration.is_some() && matches!(input, CaptureInput::Replay { .. }) {
         return Err("--duration only applies to live capture".into());
     }
-    Ok(Command::Run(WatchArgs {
+    Ok(Command::Run(Box::new(WatchArgs {
         profile,
         input,
         domain_ids,
@@ -199,7 +296,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, St
         stats,
         read_timeout: Duration::from_millis(DEFAULT_READ_TIMEOUT_MS),
         duration,
-    }))
+    })))
 }
 
 /// Result of a run.
@@ -218,7 +315,10 @@ struct FinalStats<'a> {
 }
 
 /// Feed every datagram of `source` through `pipeline`, writing findings as
-/// JSON lines to `out`. Returns when the source ends.
+/// JSON lines to `out`: profile, binding and protocol findings per datagram,
+/// capture-health findings as the source's counters grow, and at the end
+/// ([`Pipeline::finish`]) the SEDP announcements still held for a
+/// never-announced participant. Returns when the source ends.
 pub fn run_source(
     pipeline: &mut Pipeline,
     source: &mut dyn DatagramSource,
@@ -232,15 +332,39 @@ pub fn run_source(
     loop {
         match source.recv() {
             Ok(Some(d)) => {
-                for f in pipeline.process_datagram(&d) {
+                let mut found = pipeline.process_datagram(&d);
+                if let Some(h) = source.capture_health() {
+                    found.extend(pipeline.capture_findings(&h));
+                }
+                for f in found {
                     write_line(out, &f)?;
                     n += 1;
                 }
             }
-            Ok(None) => return Ok((n, None)),
-            Err(e) => return Ok((n, Some(sanitize(&e.to_string())))),
+            Ok(None) => return Ok((n + end_of_input(pipeline, source, out)?, None)),
+            Err(e) => {
+                let n = n + end_of_input(pipeline, source, out)?;
+                return Ok((n, Some(sanitize(&e.to_string()))));
+            }
         }
     }
+}
+
+/// Final capture-health and held-announcement findings.
+fn end_of_input(
+    pipeline: &mut Pipeline,
+    source: &mut dyn DatagramSource,
+    out: &mut dyn Write,
+) -> io::Result<u64> {
+    let mut found = Vec::new();
+    if let Some(h) = source.capture_health() {
+        found.extend(pipeline.capture_findings(&h));
+    }
+    found.extend(pipeline.finish());
+    for f in &found {
+        write_line(out, f)?;
+    }
+    Ok(found.len() as u64)
 }
 
 fn write_line(out: &mut dyn Write, f: &crate::Finding) -> io::Result<()> {
@@ -252,7 +376,7 @@ fn write_line(out: &mut dyn Write, f: &crate::Finding) -> io::Result<()> {
 /// Run a parsed command line. `Err` = runtime error (exit code 1).
 pub fn run(args: &WatchArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<Summary, String> {
     let profile = load_profile(&args.profile)?;
-    let mut pipeline = Pipeline::new(profile, args.options);
+    let mut pipeline = Pipeline::new(profile, args.options.clone());
     if let Some(msg) = pipeline.status_message() {
         let _ = writeln!(err, "robodr-ros2-watch: warning: {msg}");
     }
@@ -327,7 +451,7 @@ mod tests {
 
     fn run_args(args: &[&str]) -> WatchArgs {
         match p(args).unwrap() {
-            Command::Run(a) => a,
+            Command::Run(a) => *a,
             other => panic!("expected run, got {other:?}"),
         }
     }
@@ -384,6 +508,29 @@ mod tests {
         assert_eq!(a.options.dedup_capacity, 10);
         assert!(!a.options.report_anomalies && !a.options.report_fragmentation);
         assert!(a.stats);
+        let a = run_args(&[
+            "--profile",
+            "/p",
+            "--pcap",
+            "x",
+            "--discovery-server",
+            "10.0.0.2",
+            "--discovery-server=::ffff:10.0.0.2",
+            "--participant-ip",
+            "AAAAAAAAAAAAAAAAAAAAAAAA=10.0.0.5",
+            "--participant-ip=aaaaaaaaaaaaaaaaaaaaaaaa=10.0.0.6",
+            "--hold-ms",
+            "0",
+            "--no-binding",
+        ]);
+        let b = &a.options.binding;
+        assert_eq!(
+            b.discovery_servers,
+            vec![std::net::IpAddr::from([10, 0, 0, 2])]
+        );
+        assert_eq!(b.participant_ips[&[0xaa; 12]].len(), 2);
+        assert_eq!(b.hold, Duration::ZERO);
+        assert!(!b.enabled);
         let a = run_args(&["--profile", "/p", "--interface", "any", "--duration", "5"]);
         assert_eq!(a.input, CaptureInput::Live { interfaces: vec![] });
         assert_eq!(a.duration, Some(Duration::from_secs(5)));
@@ -410,6 +557,88 @@ mod tests {
             &["--profile", "/p", "--pcap", "x", "--stats=yes"],
             &["--profile", "/p", "--pcap", "x", "extra"],
             &["--profile", "/p", "--pcap", "x", "--evil\n\u{1b}"],
+            &[
+                "--profile",
+                "/p",
+                "--pcap",
+                "x",
+                "--discovery-server",
+                "0.0.0.0",
+            ],
+            &[
+                "--profile",
+                "/p",
+                "--pcap",
+                "x",
+                "--discovery-server",
+                "nope\n",
+            ],
+            &[
+                "--profile",
+                "/p",
+                "--pcap",
+                "x",
+                "--participant-ip",
+                "aa=10.0.0.1",
+            ],
+            &[
+                "--profile",
+                "/p",
+                "--pcap",
+                "x",
+                "--participant-ip",
+                "10.0.0.1",
+            ],
+            &[
+                "--profile",
+                "/p",
+                "--pcap",
+                "x",
+                "--participant-ip",
+                "aaaaaaaaaaaaaaaaaaaaaaaa=239.1.1.1",
+            ],
+            &["--profile", "/p", "--pcap", "x", "--hold-ms", "600001"],
+            &["--profile", "/p", "--pcap", "x", "--no-binding=1"],
+            &["--profile", "--pcap", "x"],
+            &["--profile", "/p", "--pcap", "x", "--hold-ms", "--stats"],
+            &[
+                "--profile",
+                "/p",
+                "--pcap",
+                "x",
+                "--participant-ip",
+                "=10.0.0.1",
+            ],
+            &[
+                "--profile",
+                "/p",
+                "--pcap",
+                "x",
+                "--participant-ip",
+                "aaaaaaaaaaaaaaaaaaaaaaaa=",
+            ],
+            &["--profile", "/p", "--pcap", "x", "--hold-ms", "-1"],
+            &["--profile", "/p", "--pcap", "x", "--hold-ms", "1e3"],
+            &[
+                "--profile",
+                "/p",
+                "--pcap",
+                "x",
+                "--hold-ms",
+                "18446744073709551616",
+            ],
+            &["--profile", "/p", "--pcap", "x", "--dedup", "NaN"],
+            &["--profile", "/p", "--pcap", "x", "--dedup", "inf"],
+            &["--profile", "/p", "--pcap", "x", "--domain", "\u{202e}0"],
+            &[
+                "--profile",
+                "/p",
+                "--pcap",
+                "x",
+                "--discovery-server",
+                "255.255.255.255",
+            ],
+            &["--profile", "/p", "--pcap", "x", "--discovery-server", "::"],
         ] {
             let e = p(bad).unwrap_err();
             assert!(!e.chars().any(char::is_control), "{e:?}");

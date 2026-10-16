@@ -12,15 +12,37 @@
 //! | Source | Rule | Severity |
 //! |---|---|---|
 //! | every `RobotEvent` from the report, through `Profile::evaluate` | the profile's rules (`robot.ros2.unknown_participant`, `robot.ros2.unauthorized_motion_writer`, ...) | as the profile says |
+//! | an SEDP endpoint announced from an IP not bound to its participant, or relayed / GUID-conflicting from a non-discovery-server IP ([`crate::binding`]) | [`rules::ENDPOINT_SOURCE_MISMATCH`] | Critical (writer on a motion topic) / High |
+//! | an SEDP endpoint whose participant never sent SPDP within the hold window | [`rules::ENDPOINT_UNANNOUNCED_PARTICIPANT`] | Medium |
+//! | an SPDP for a bound participant from outside its binding, or relayed by a non-discovery-server IP | [`rules::PARTICIPANT_SOURCE_MISMATCH`] | High (profiled) / Medium |
 //! | a *profiled* participant announced as disposed / unregistered | [`rules::PARTICIPANT_REMOVED`] | Medium |
-//! | a parse [`Anomaly`](robodr_rtps::Anomaly) (if `report_anomalies`) | [`rules::MALFORMED_DISCOVERY`] | Low |
+//! | any other dispose / unregister (unprofiled participant, endpoint) | [`rules::DISCOVERY_REMOVAL`] | Low; Medium when sent from an IP outside the owner's binding |
+//! | conflicting duplicate identity parameters (topic, type, GUIDs, key hash, status) | [`rules::AMBIGUOUS_DISCOVERY`] | High (writers in it are then judged as motion writers by the binding check) |
+//! | an anomaly after which the parser dropped content (version, truncation, malformed PL, bad value, no topic, anomaly overflow) | [`rules::DISCOVERY_NOT_INSPECTED`] | Medium, always |
+//! | any other parse [`Anomaly`](robodr_rtps::Anomaly) (if `report_anomalies`) | [`rules::MALFORMED_DISCOVERY`] | Low |
 //! | discovery `DATA_FRAG` seen (if `report_fragmentation`) | [`rules::FRAGMENTED_DISCOVERY`] | Low |
 //! | discovery fragments refused by the reassembler (always) | [`rules::DISCOVERY_FRAGMENT_REJECTED`] | Medium |
+//! | partially reassembled discovery samples evicted by the reassembler (always) | [`rules::DISCOVERY_FRAGMENT_EVICTED`] | Medium |
+//! | capture-layer counters grew ([`Pipeline::capture_findings`]) | `robot.capture.*` ([`rules::CAPTURE_MALFORMED_FRAMES`], [`rules::CAPTURE_IP_FRAGMENT_CONFLICT`], [`rules::CAPTURE_IP_REASSEMBLY_DROPPED`], [`rules::CAPTURE_IP_REASSEMBLY_EVICTED`]) | Low / Medium |
 //! | the profile failed `Profile::validate` (once, [`Pipeline::status_findings`]) | [`rules::PROFILE_REFUSED`] | High |
+//! | one input produced more than `max_findings_per_datagram` new findings | [`rules::FINDINGS_CAPPED`] | most severe suppressed, >= Medium |
 //!
-//! Removals of unknown participants and endpoint removals are only counted
-//! ([`PipelineStats`]): the unknown participant was already reported when it
-//! appeared, and an endpoint removal carries no topic to judge it by.
+//! Every finding is de-duplicated on (rule, detail). In addition, the noisy
+//! `robot.rtps.*`, `robot.capture.*` and `robot.sensor.*` rules are **rate
+//! limited** per rule ([`crate::ratelimit`]); the profile and binding rules
+//! never are. Finally each input (datagram, tick, finish, capture-health
+//! update) reports at most `max_findings_per_datagram` new findings, most
+//! severe first; the overflow is summarised and not remembered, so it is
+//! reported when it recurs (see `Pipeline::emit`).
+//!
+//! # Time
+//!
+//! The binding hold window and the rate limiter need a clock.
+//! [`Pipeline::process`] uses `Instant::now()`; [`Pipeline::process_at`]
+//! takes the time explicitly (tests, replays). Call [`Pipeline::tick`]
+//! periodically on an idle bus so held announcements still expire, and
+//! [`Pipeline::finish`] at the end of a finite input (pcap replay) to report
+//! what is still held.
 //!
 //! # Observe vs enforce, and the invalid-profile decision (fail closed)
 //!
@@ -47,26 +69,40 @@
 //!
 //! # Known limits
 //!
-//! - No rate limit on *distinct* findings: an attacker announcing a new GUID
-//!   per packet produces one finding per packet (each a true positive, the
-//!   dedup set stays bounded). Downstream consumers should aggregate.
+//! - No rate limit on *distinct* profile / binding findings: an attacker
+//!   announcing new GUIDs produces up to `max_findings_per_datagram` findings
+//!   per datagram (each a true positive, the dedup set stays bounded).
+//!   Downstream consumers should aggregate. Protocol and capture findings are
+//!   rate limited.
+//! - Duplicate identity parameters: the RTPS parser keeps the first value
+//!   and records the conflict as an anomaly without the other value. The
+//!   pipeline cannot judge the other topic itself; it raises
+//!   [`rules::AMBIGUOUS_DISCOVERY`] and judges every writer of that datagram
+//!   as a motion writer (worst case) in the binding check.
 //! - Dedup is forever-until-evicted: a participant that leaves and comes back
 //!   is not re-reported unless its entry was evicted.
 //! - Text copied into findings is attacker controlled and passed through
 //!   [`sanitize`].
 
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::io::Read;
+use std::net::IpAddr;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use robodr_events::profile::{Profile, ProfileError};
 use robodr_events::{Deviation, Mode, Severity};
-use robodr_rtps::{hex12, DatagramReport, FragmentReassembler, ReassemblyLimits};
+use robodr_rtps::{
+    hex12, hex_guid, Anomaly, DatagramReport, EndpointKind, FragmentReassembler, ReassemblyLimits,
+};
 use serde::Serialize;
 
+use crate::binding::{parse_src_ip, BindingFinding, BindingOptions, BindingStats, BindingTable};
 use crate::dedup::DedupSet;
+use crate::ratelimit::{self, RateLimiter};
 use crate::sanitize::sanitize;
-use crate::source::Datagram;
+use crate::source::{CaptureHealth, Datagram};
 
 /// Prefix added to the threat description of every observe-only finding.
 pub const OBSERVE_ONLY_TAG: &str = "[observe-only] ";
@@ -79,6 +115,98 @@ pub const MAX_PROFILE_BYTES: u64 = 16 << 20;
 
 /// `src_ip` of findings that do not come from the network.
 pub const LOCAL_SOURCE: &str = "local";
+
+/// `src_ip` of capture-layer findings (no single peer).
+pub const CAPTURE_SOURCE: &str = "capture";
+
+/// Default [`PipelineOptions::max_findings_per_datagram`].
+pub const DEFAULT_MAX_FINDINGS_PER_DATAGRAM: usize = 64;
+/// Largest [`PipelineOptions::max_findings_per_datagram`].
+pub const MAX_FINDINGS_PER_DATAGRAM: usize = 4096;
+/// Distinct rule ids listed in a [`rules::FINDINGS_CAPPED`] summary.
+const MAX_CAPPED_RULES_LISTED: usize = 16;
+
+/// A raw deviation and the source IP it is attributed to, before dedup,
+/// ordering, the per-datagram cap and the rate limit ([`Pipeline::emit`]).
+type Candidate = (Deviation, String);
+
+/// DDSI-RTPS parameter ids whose value decides *what* an announcement is
+/// (topic, type, endpoint / participant identity, instance, liveliness).
+/// A conflicting duplicate of one of them makes the announcement ambiguous.
+const IDENTITY_PIDS: &[(u16, &str)] = &[
+    (0x0005, "PID_TOPIC_NAME"),
+    (0x0007, "PID_TYPE_NAME"),
+    (0x0050, "PID_PARTICIPANT_GUID"),
+    (0x005a, "PID_ENDPOINT_GUID"),
+    (0x0070, "PID_KEY_HASH"),
+    (0x0071, "PID_STATUS_INFO"),
+];
+
+fn pid_name(pid: u16) -> String {
+    IDENTITY_PIDS
+        .iter()
+        .find(|(p, _)| *p == pid)
+        .map_or_else(|| format!("PID 0x{pid:04x}"), |(_, n)| (*n).to_string())
+}
+
+fn is_identity_conflict(a: &Anomaly) -> bool {
+    matches!(a, Anomaly::ConflictingDuplicateParameter(pid)
+        if IDENTITY_PIDS.iter().any(|(p, _)| p == pid))
+}
+
+/// Anomalies after which the parser dropped (part of) the content: a
+/// submessage, a sample, an announcement or a value that a DDS stack might
+/// still accept. Those are reported as [`rules::DISCOVERY_NOT_INSPECTED`].
+fn drops_content(a: &Anomaly) -> bool {
+    matches!(
+        a,
+        Anomaly::UnsupportedProtocolVersion(..)
+            | Anomaly::TruncatedSubmessage
+            | Anomaly::MalformedInfoSource
+            | Anomaly::MalformedData
+            | Anomaly::MalformedDataFrag
+            | Anomaly::BadOctetsToInlineQos
+            | Anomaly::MalformedParameterList
+            | Anomaly::UnsupportedParameter
+            | Anomaly::UnsupportedEncapsulation(_)
+            | Anomaly::BadParameterValue(_)
+            | Anomaly::AnnouncementWithoutTopic
+    )
+}
+
+/// Is the datagram's discovery content ambiguous (see [`IDENTITY_PIDS`])?
+#[derive(Debug, Default)]
+struct Ambiguity {
+    /// Identity PIDs repeated with conflicting values (sorted, distinct).
+    conflicting_pids: Vec<u16>,
+    /// More anomalies than the parser records: an identity conflict cannot
+    /// be ruled out (an attacker could pad the list with junk first).
+    anomalies_truncated: bool,
+}
+
+impl Ambiguity {
+    fn of(report: &DatagramReport) -> Self {
+        let mut pids: Vec<u16> = report
+            .anomalies
+            .iter()
+            .filter(|a| is_identity_conflict(a))
+            .filter_map(|a| match a {
+                Anomaly::ConflictingDuplicateParameter(p) => Some(*p),
+                _ => None,
+            })
+            .collect();
+        pids.sort_unstable();
+        pids.dedup();
+        Self {
+            conflicting_pids: pids,
+            anomalies_truncated: report.stats.anomalies as usize > report.anomalies.len(),
+        }
+    }
+
+    fn any(&self) -> bool {
+        !self.conflicting_pids.is_empty() || self.anomalies_truncated
+    }
+}
 
 /// Rule ids raised by the pipeline itself (the profile's own rules live in
 /// `robodr-events`).
@@ -94,10 +222,38 @@ pub mod rules {
     /// Discovery fragments were refused (over a cap, bad geometry or a
     /// conflicting overlap): that announcement was **not** inspected.
     pub const DISCOVERY_FRAGMENT_REJECTED: &str = "robot.rtps.discovery_fragment_rejected";
+    /// Partially reassembled discovery samples were evicted to stay within
+    /// the reassembler's caps: those announcements were **not** inspected.
+    pub const DISCOVERY_FRAGMENT_EVICTED: &str = "robot.rtps.discovery_fragment_evicted";
+    /// A dispose / unregister other than a profiled participant's.
+    pub const DISCOVERY_REMOVAL: &str = "robot.rtps.discovery_removal";
+    /// Capture saw malformed or truncated frames.
+    pub const CAPTURE_MALFORMED_FRAMES: &str = "robot.capture.malformed_frames";
+    /// IP fragments overlapped with conflicting bytes (evasion pattern).
+    pub const CAPTURE_IP_FRAGMENT_CONFLICT: &str = "robot.capture.ip_fragment_conflict";
+    /// IP datagrams dropped (bad fragment geometry or reassembly timeout).
+    pub const CAPTURE_IP_REASSEMBLY_DROPPED: &str = "robot.capture.ip_reassembly_dropped";
+    /// IP datagrams evicted from reassembly to bound memory.
+    pub const CAPTURE_IP_REASSEMBLY_EVICTED: &str = "robot.capture.ip_reassembly_evicted";
+    /// A discovery announcement repeats an identity parameter (topic, type,
+    /// GUID, key hash, status) with conflicting values: DDS stacks differ on
+    /// which value wins, so what was inspected may not be what a stack acts
+    /// on. High, never rate limited.
+    pub const AMBIGUOUS_DISCOVERY: &str = "robot.ros2.ambiguous_discovery";
+    /// The parser had to drop (part of) a discovery datagram (unsupported
+    /// version, malformed parameter list, undecodable topic, ...): that
+    /// content was not inspected. Medium, rate limited (own bucket).
+    pub const DISCOVERY_NOT_INSPECTED: &str = "robot.rtps.discovery_not_inspected";
+    /// More findings from one input than `max_findings_per_datagram`; the
+    /// least severe were suppressed (and are reported if they recur).
+    pub const FINDINGS_CAPPED: &str = "robot.sensor.findings_capped";
+    pub use crate::binding::rules::{
+        ENDPOINT_SOURCE_MISMATCH, ENDPOINT_UNANNOUNCED_PARTICIPANT, PARTICIPANT_SOURCE_MISMATCH,
+    };
 }
 
 /// Knobs of the pipeline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineOptions {
     /// Max distinct findings remembered for dedup (clamped to 1..=2^20).
     pub dedup_capacity: usize,
@@ -107,6 +263,17 @@ pub struct PipelineOptions {
     pub report_anomalies: bool,
     /// Raise a Low finding per source IP that sends fragmented discovery.
     pub report_fragmentation: bool,
+    /// Participant ↔ source-IP binding check ([`crate::binding`]).
+    pub binding: BindingOptions,
+    /// Rate limit of `robot.rtps.*` / `robot.capture.*`: burst per rule.
+    pub rate_limit_burst: u32,
+    /// Rate limit: one more finding per rule per this interval.
+    pub rate_limit_interval: Duration,
+    /// Max findings reported per input (datagram, tick, finish, capture
+    /// health update), most severe first; the rest are summarised in one
+    /// [`rules::FINDINGS_CAPPED`] finding. Clamped to
+    /// 1..=[`MAX_FINDINGS_PER_DATAGRAM`].
+    pub max_findings_per_datagram: usize,
 }
 
 impl Default for PipelineOptions {
@@ -116,6 +283,10 @@ impl Default for PipelineOptions {
             reassembly: ReassemblyLimits::default(),
             report_anomalies: true,
             report_fragmentation: true,
+            binding: BindingOptions::default(),
+            rate_limit_burst: ratelimit::DEFAULT_BURST,
+            rate_limit_interval: ratelimit::DEFAULT_INTERVAL,
+            max_findings_per_datagram: DEFAULT_MAX_FINDINGS_PER_DATAGRAM,
         }
     }
 }
@@ -273,6 +444,19 @@ pub struct PipelineStats {
     pub discovery_fragments: u64,
     pub fragment_samples_completed: u64,
     pub fragments_rejected: u64,
+    /// Partial discovery samples evicted by the reassembler.
+    pub fragment_evictions: u64,
+    /// `robot.rtps.*` / `robot.capture.*` findings suppressed by the rate
+    /// limit (not counted in `duplicates`).
+    pub rate_limited: u64,
+    /// Capture-layer findings raised.
+    pub capture_findings: u64,
+    /// Findings suppressed by the per-datagram cap (not remembered).
+    pub capped: u64,
+    /// Datagrams with conflicting duplicate identity parameters.
+    pub ambiguous_announcements: u64,
+    /// The participant binding table.
+    pub binding: BindingStats,
 }
 
 /// Datagram -> findings, against one profile. See the module docs.
@@ -281,6 +465,12 @@ pub struct Pipeline {
     status: ProfileStatus,
     seen: DedupSet,
     reassembler: FragmentReassembler,
+    binding: BindingTable,
+    limiter: RateLimiter,
+    /// `reassembler.evicted()` already reported.
+    frag_evicted_seen: u64,
+    /// Last capture health snapshot already turned into findings.
+    last_health: Option<CaptureHealth>,
     opts: PipelineOptions,
     stats: PipelineStats,
 }
@@ -292,6 +482,8 @@ impl fmt::Debug for Pipeline {
             .field("status", &self.status)
             .field("remembered", &self.seen.len())
             .field("pending_fragments", &self.reassembler.pending_samples())
+            .field("bound_participants", &self.binding.len())
+            .field("held_endpoints", &self.binding.held_len())
             .field("opts", &self.opts)
             .field("stats", &self.stats)
             .finish()
@@ -303,9 +495,13 @@ impl Pipeline {
     pub fn new(profile: Profile, opts: PipelineOptions) -> Self {
         Self {
             status: ProfileStatus::of(&profile),
-            profile,
             seen: DedupSet::new(opts.dedup_capacity),
             reassembler: FragmentReassembler::new(opts.reassembly),
+            binding: BindingTable::new(opts.binding.clone(), &profile),
+            limiter: RateLimiter::new(opts.rate_limit_burst, opts.rate_limit_interval),
+            frag_evicted_seen: 0,
+            last_health: None,
+            profile,
             opts,
             stats: PipelineStats::default(),
         }
@@ -328,8 +524,14 @@ impl Pipeline {
         &self.opts
     }
 
+    /// Counters (a snapshot, including the binding table's).
     pub fn stats(&self) -> &PipelineStats {
         &self.stats
+    }
+
+    /// The participant binding table.
+    pub fn binding(&self) -> &BindingTable {
+        &self.binding
     }
 
     /// Number of distinct findings currently remembered.
@@ -400,39 +602,185 @@ impl Pipeline {
         }
     }
 
-    /// Dedup and stamp one raw deviation.
-    fn push(&mut self, out: &mut Vec<Finding>, deviation: Deviation, src_ip: &str) {
+    /// Queue one raw deviation; [`Pipeline::emit`] decides what is reported.
+    fn push(&mut self, out: &mut Vec<Candidate>, deviation: Deviation, src_ip: &str) {
         self.stats.raw_findings += 1;
-        let key = format!("{}|{}", deviation.rule, deviation.detail);
-        if !self.seen.insert(&key) {
-            self.stats.duplicates += 1;
-            return;
+        out.push((deviation, src_ip.to_string()));
+    }
+
+    fn push_binding(&mut self, out: &mut Vec<Candidate>, found: Vec<BindingFinding>) {
+        for (dev, ip) in found {
+            self.push(out, dev, &ip);
         }
-        self.stats.findings += 1;
-        out.push(self.finding(deviation, src_ip));
+        self.stats.binding = *self.binding.stats();
+    }
+
+    /// Turn the candidates of one call (one datagram, tick, finish or
+    /// capture-health update) into findings:
+    ///
+    /// 1. drop those already reported (dedup, also within the batch);
+    /// 2. order the rest by severity, most severe first (stable);
+    /// 3. report at most `max_findings_per_datagram` of them, rate limiting
+    ///    `robot.rtps.*` / `robot.capture.*` / `robot.sensor.*`;
+    /// 4. summarise the overflow in one [`rules::FINDINGS_CAPPED`] finding.
+    ///
+    /// Overflowed and rate-limited candidates are **not** remembered, so they
+    /// are reported when they recur (DDS re-sends discovery periodically).
+    /// The cap bounds the output a single hostile datagram can cause (a
+    /// 64 KiB datagram can name thousands of fake participants), while the
+    /// ordering guarantees that the most severe findings (e.g. a Critical
+    /// rogue motion writer) are never the ones crowded out.
+    fn emit(&mut self, cands: Vec<Candidate>, now: Instant) -> Vec<Finding> {
+        let mut fresh: Vec<(String, Deviation, String)> = Vec::with_capacity(cands.len());
+        let mut batch_keys = HashSet::new();
+        for (dev, ip) in cands {
+            let key = format!("{}|{}", dev.rule, dev.detail);
+            if self.seen.contains(&key) || !batch_keys.insert(key.clone()) {
+                self.stats.duplicates += 1;
+                continue;
+            }
+            fresh.push((key, dev, ip));
+        }
+        fresh.sort_by_key(|c| std::cmp::Reverse(c.1.severity));
+        let cap = self
+            .opts
+            .max_findings_per_datagram
+            .clamp(1, MAX_FINDINGS_PER_DATAGRAM);
+        let mut out = Vec::new();
+        let mut capped: BTreeMap<String, u64> = BTreeMap::new();
+        let mut capped_max = Severity::Low;
+        let mut capped_n = 0u64;
+        for (key, mut dev, ip) in fresh {
+            if out.len() >= cap {
+                capped_n += 1;
+                capped_max = capped_max.max(dev.severity);
+                // Bounded: at most MAX_CAPPED_RULES_LISTED rule ids listed.
+                if capped.len() < MAX_CAPPED_RULES_LISTED || capped.contains_key(dev.rule_str()) {
+                    *capped.entry(dev.rule_str().to_string()).or_insert(0) += 1;
+                }
+                continue;
+            }
+            if !self.rate_allow(&mut dev, now) {
+                continue;
+            }
+            self.seen.insert(&key);
+            self.stats.findings += 1;
+            out.push(self.finding(dev, &ip));
+        }
+        if capped_n > 0 {
+            self.stats.capped += capped_n;
+            let listed = capped
+                .iter()
+                .map(|(r, n)| format!("{r} x{n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let detail = format!(
+                "{capped_n} more finding(s) from one input suppressed by the per-datagram cap of \
+                 {cap} (most severe suppressed: {capped_max:?}; {listed}); they are reported if \
+                 they recur"
+            );
+            let mut dev = Deviation::new(
+                rules::FINDINGS_CAPPED,
+                capped_max.max(Severity::Medium),
+                detail,
+            );
+            if self.rate_allow(&mut dev, now) {
+                self.stats.findings += 1;
+                out.push(self.finding(dev, LOCAL_SOURCE));
+            }
+        }
+        out
+    }
+
+    /// Rate limit (`robot.rtps.*` / `robot.capture.*` / `robot.sensor.*`
+    /// only). `false` = suppressed (counted, not remembered).
+    fn rate_allow(&mut self, dev: &mut Deviation, now: Instant) -> bool {
+        if !ratelimit::is_limited(dev.rule_str()) {
+            return true;
+        }
+        match self.limiter.allow(dev.rule_str(), now) {
+            None => {
+                self.stats.rate_limited += 1;
+                false
+            }
+            Some(0) => true,
+            Some(n) => {
+                dev.detail.push_str(&format!(
+                    " [{n} more finding(s) of this rule suppressed by the rate limit]"
+                ));
+                true
+            }
+        }
     }
 
     /// Parse one datagram and return the findings not reported before.
     /// Never panics: malformed or non-RTPS input yields at most protocol
-    /// findings.
+    /// findings. Uses `Instant::now()`; see [`Pipeline::process_at`].
     pub fn process(&mut self, payload: &[u8], src_ip: &str) -> Vec<Finding> {
+        self.process_at(payload, src_ip, Instant::now())
+    }
+
+    /// [`Pipeline::process`] at an explicit time (monotonic across calls).
+    pub fn process_at(&mut self, payload: &[u8], src_ip: &str, now: Instant) -> Vec<Finding> {
         self.stats.datagrams += 1;
+        let mut out = Vec::new();
+        self.expire_into(now, &mut out);
         let Some(report) = self.reassembler.parse_datagram_detailed(payload) else {
             self.stats.not_rtps += 1;
-            return Vec::new();
+            return self.emit(out, now);
         };
-        let mut out = Vec::new();
+        let ip = parse_src_ip(src_ip);
+        let ambiguity = Ambiguity::of(&report);
         self.profile_findings(&report, src_ip, &mut out);
-        self.removal_findings(&report, src_ip, &mut out);
-        self.protocol_findings(&report, src_ip, &mut out);
-        out
+        self.binding_findings(&report, ip, ambiguity.any(), &mut out, now);
+        self.removal_findings(&report, src_ip, ip, &mut out);
+        self.protocol_findings(&report, src_ip, &ambiguity, &mut out);
+        self.emit(out, now)
+    }
+
+    fn expire_into(&mut self, now: Instant, out: &mut Vec<Candidate>) {
+        let mut found = Vec::new();
+        self.binding.expire(&self.profile, now, &mut found);
+        self.push_binding(out, found);
+    }
+
+    /// Report SEDP announcements whose hold window (waiting for their
+    /// participant's SPDP) has expired. [`Pipeline::process`] does this on
+    /// every datagram; call it periodically (e.g. every second) so an idle
+    /// bus still reports them.
+    pub fn tick(&mut self) -> Vec<Finding> {
+        self.tick_at(Instant::now())
+    }
+
+    /// [`Pipeline::tick`] at an explicit time.
+    pub fn tick_at(&mut self, now: Instant) -> Vec<Finding> {
+        let mut out = Vec::new();
+        self.expire_into(now, &mut out);
+        self.emit(out, now)
+    }
+
+    /// End of a finite input (capture replay): report every SEDP
+    /// announcement still held for a never-announced participant.
+    /// The per-call cap of [`PipelineOptions::max_findings_per_datagram`]
+    /// applies; what it suppresses is summarised in one finding.
+    pub fn finish(&mut self) -> Vec<Finding> {
+        let mut found = Vec::new();
+        self.binding.flush(&self.profile, &mut found);
+        let mut out = Vec::new();
+        self.push_binding(&mut out, found);
+        self.emit(out, Instant::now())
     }
 
     pub fn process_datagram(&mut self, datagram: &Datagram) -> Vec<Finding> {
         self.process(&datagram.payload, &datagram.src_ip)
     }
 
-    fn profile_findings(&mut self, report: &DatagramReport, src_ip: &str, out: &mut Vec<Finding>) {
+    fn profile_findings(
+        &mut self,
+        report: &DatagramReport,
+        src_ip: &str,
+        out: &mut Vec<Candidate>,
+    ) {
         for event in report.to_events(src_ip) {
             self.stats.events += 1;
             if let Some(dev) = self.profile.evaluate(&event) {
@@ -441,14 +789,39 @@ impl Pipeline {
         }
     }
 
-    fn removal_findings(&mut self, report: &DatagramReport, src_ip: &str, out: &mut Vec<Finding>) {
-        self.stats.endpoint_removals += report.removed_endpoints.len() as u64;
+    /// SPDP first (learn / refresh / reject), then judge the endpoints, so a
+    /// participant announcing itself and its endpoints in one datagram is
+    /// bound before its endpoints are judged.
+    fn binding_findings(
+        &mut self,
+        report: &DatagramReport,
+        ip: Option<IpAddr>,
+        ambiguous: bool,
+        out: &mut Vec<Candidate>,
+        now: Instant,
+    ) {
+        let mut found = Vec::new();
+        for spdp in &report.participants {
+            self.binding
+                .observe_spdp(&self.profile, spdp, ip, now, &mut found);
+        }
+        for ep in &report.endpoints {
+            self.binding
+                .observe_endpoint(&self.profile, ep, ip, ambiguous, now, &mut found);
+        }
+        self.push_binding(out, found);
+    }
+
+    fn removal_findings(
+        &mut self,
+        report: &DatagramReport,
+        src_ip: &str,
+        ip: Option<IpAddr>,
+        out: &mut Vec<Candidate>,
+    ) {
         for r in &report.removed_participants {
             self.stats.participant_removals += 1;
             let guid = hex12(&r.guid_prefix);
-            if !self.profile.participants.contains(&guid) {
-                continue;
-            }
             let what = match (r.status.disposed(), r.status.unregistered()) {
                 (true, true) => "disposed and unregistered",
                 (true, false) => "disposed",
@@ -459,26 +832,221 @@ impl Pipeline {
             } else {
                 format!(" (relayed by {})", hex12(&r.source))
             };
-            let detail =
-                format!("profiled participant {guid} announced as {what}{by} from {src_ip}");
+            // Judged before the binding may be dropped by this removal.
+            let consistent = self.binding.observe_participant_removal(r, ip);
+            self.stats.binding = *self.binding.stats();
+            let unbound = if consistent == Some(false) {
+                ", an IP outside its binding"
+            } else {
+                ""
+            };
+            if self.profile.participants.contains(&guid) {
+                let detail = format!(
+                    "profiled participant {guid} announced as {what}{by} from {src_ip}{unbound}"
+                );
+                self.push(
+                    out,
+                    Deviation::new(rules::PARTICIPANT_REMOVED, Severity::Medium, detail),
+                    src_ip,
+                );
+            } else {
+                let sev = if consistent == Some(false) {
+                    Severity::Medium
+                } else {
+                    Severity::Low
+                };
+                let detail = format!(
+                    "unprofiled participant {guid} announced as {what}{by} from {src_ip}{unbound}"
+                );
+                self.push(
+                    out,
+                    Deviation::new(rules::DISCOVERY_REMOVAL, sev, detail),
+                    src_ip,
+                );
+            }
+        }
+        for r in &report.removed_endpoints {
+            self.stats.endpoint_removals += 1;
+            let what = match (r.status.disposed(), r.status.unregistered()) {
+                (true, true) => "disposed and unregistered",
+                (true, false) => "disposed",
+                _ => "unregistered",
+            };
+            let kind = match r.kind {
+                EndpointKind::Writer => "writer",
+                EndpointKind::Reader => "reader",
+            };
+            let id = r.guid.map(|g| hex_guid(&g)).unwrap_or_else(|| "?".into());
+            let spoofed = ip
+                .and_then(|ip| self.binding.allows(&r.participant, ip))
+                .is_some_and(|ok| !ok)
+                || (r.source != r.participant
+                    && !ip.is_some_and(|ip| self.opts.binding.discovery_servers.contains(&ip))
+                    && self.opts.binding.enabled);
+            let (sev, note) = if spoofed {
+                (
+                    Severity::Medium,
+                    ", not from an IP bound to its participant (spoofed removal?)",
+                )
+            } else {
+                (Severity::Low, "")
+            };
+            let detail = format!(
+                "{kind} {id} of participant {} announced as {what} from {src_ip}{note}",
+                hex12(&r.participant)
+            );
             self.push(
                 out,
-                Deviation::new(rules::PARTICIPANT_REMOVED, Severity::Medium, detail),
+                Deviation::new(rules::DISCOVERY_REMOVAL, sev, detail),
                 src_ip,
             );
         }
     }
 
-    fn protocol_findings(&mut self, report: &DatagramReport, src_ip: &str, out: &mut Vec<Finding>) {
+    /// Increases of the capture layer's cumulative counters become
+    /// rate-limited `robot.capture.*` findings (that traffic was not
+    /// inspected, or was tampered with below RTPS). Call it with the
+    /// source's latest [`CaptureHealth`] (e.g. after each datagram, or
+    /// periodically); unchanged counters cost nothing. A counter that went
+    /// down (the source restarted) re-bases silently.
+    pub fn capture_findings(&mut self, health: &CaptureHealth) -> Vec<Finding> {
+        self.capture_findings_at(health, Instant::now())
+    }
+
+    /// [`Pipeline::capture_findings`] at an explicit time.
+    pub fn capture_findings_at(&mut self, health: &CaptureHealth, now: Instant) -> Vec<Finding> {
+        let prev = self.last_health.unwrap_or_default();
+        self.last_health = Some(*health);
+        if prev == *health {
+            return Vec::new();
+        }
+        let d = |new: u64, old: u64| new.saturating_sub(old);
+        let h = health;
+        let checks = [
+            (
+                d(h.truncated, prev.truncated).saturating_add(d(h.malformed, prev.malformed)),
+                h.truncated.saturating_add(h.malformed),
+                rules::CAPTURE_MALFORMED_FRAMES,
+                Severity::Low,
+                "malformed or truncated frame(s); their content was not inspected",
+            ),
+            (
+                d(h.ip_fragment_conflicts, prev.ip_fragment_conflicts),
+                h.ip_fragment_conflicts,
+                rules::CAPTURE_IP_FRAGMENT_CONFLICT,
+                Severity::Medium,
+                "IP datagram(s) dropped because fragments overlapped with conflicting bytes \
+                 (evasion pattern); not inspected",
+            ),
+            (
+                d(h.ip_fragment_invalid, prev.ip_fragment_invalid)
+                    .saturating_add(d(h.ip_fragment_timeouts, prev.ip_fragment_timeouts)),
+                h.ip_fragment_invalid.saturating_add(h.ip_fragment_timeouts),
+                rules::CAPTURE_IP_REASSEMBLY_DROPPED,
+                Severity::Low,
+                "IP datagram(s) dropped (bad fragment geometry or reassembly timeout); \
+                 not inspected",
+            ),
+            (
+                d(h.ip_fragment_evicted, prev.ip_fragment_evicted),
+                h.ip_fragment_evicted,
+                rules::CAPTURE_IP_REASSEMBLY_EVICTED,
+                Severity::Medium,
+                "partially reassembled IP datagram(s) evicted to bound memory; not inspected",
+            ),
+            // TODO(capture-hardening): UDP checksum failures (and capture
+            // evictions) once robodr-capture exposes them via CaptureHealth.
+        ];
+        let mut out = Vec::new();
+        for (delta, total, rule, sev, what) in checks {
+            if delta == 0 {
+                continue;
+            }
+            self.stats.capture_findings += 1;
+            let detail = format!("capture: {delta} new {what} ({total} since capture start)");
+            self.push(&mut out, Deviation::new(rule, sev, detail), CAPTURE_SOURCE);
+        }
+        self.emit(out, now)
+    }
+
+    fn protocol_findings(
+        &mut self,
+        report: &DatagramReport,
+        src_ip: &str,
+        ambiguity: &Ambiguity,
+        out: &mut Vec<Candidate>,
+    ) {
         let s = &report.stats;
         self.stats.anomalies += u64::from(s.anomalies);
         self.stats.discovery_fragments += u64::from(s.discovery_data_frag);
         self.stats.fragment_samples_completed += u64::from(s.frag_completed);
         self.stats.fragments_rejected += u64::from(s.frag_rejected);
 
+        // Conflicting duplicate identity parameters: always reported, never
+        // rate limited (robot.ros2.*): DDS stacks differ on first- vs
+        // last-wins, so the endpoint may be on a topic other than the one
+        // parsed (and judged by the profile).
+        if !ambiguity.conflicting_pids.is_empty() {
+            self.stats.ambiguous_announcements += 1;
+            let pids = ambiguity
+                .conflicting_pids
+                .iter()
+                .map(|p| pid_name(*p))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let topics = report
+                .endpoints
+                .iter()
+                .take(4)
+                .map(|e| e.topic.chars().take(64).collect::<String>())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let detail = format!(
+                "discovery from {src_ip} repeats {pids} with conflicting values; other DDS stacks \
+                 may act on a different value than the one inspected (parsed topic(s): [{topics}]); \
+                 writers in it are judged as motion writers"
+            );
+            self.push(
+                out,
+                Deviation::new(rules::AMBIGUOUS_DISCOVERY, Severity::High, detail),
+                src_ip,
+            );
+        }
+        // Content the parser had to drop: a DDS stack may still accept it.
+        // Always reported (Medium, own rate-limit bucket so a flood of Low
+        // anomalies cannot use up its budget).
+        let mut dropped: Vec<String> = Vec::new();
+        for a in report.anomalies.iter().filter(|a| drops_content(a)) {
+            let k = format!("{a:?}");
+            if !dropped.contains(&k) {
+                dropped.push(k);
+            }
+        }
+        if ambiguity.anomalies_truncated {
+            dropped.push(format!(
+                "{} anomalies, only {} recorded",
+                s.anomalies,
+                report.anomalies.len()
+            ));
+        }
+        if !dropped.is_empty() {
+            let detail = format!(
+                "discovery from {src_ip} was (partly) not inspected: {}",
+                dropped.join(", ")
+            );
+            self.push(
+                out,
+                Deviation::new(rules::DISCOVERY_NOT_INSPECTED, Severity::Medium, detail),
+                src_ip,
+            );
+        }
         if self.opts.report_anomalies {
             let mut kinds: Vec<String> = Vec::new();
-            for a in &report.anomalies {
+            for a in report
+                .anomalies
+                .iter()
+                .filter(|a| !drops_content(a) && !is_identity_conflict(a))
+            {
                 let k = format!("{a:?}");
                 if !kinds.contains(&k) {
                     kinds.push(k);
@@ -501,6 +1069,27 @@ impl Pipeline {
             self.push(
                 out,
                 Deviation::new(rules::DISCOVERY_FRAGMENT_REJECTED, Severity::Medium, detail),
+                src_ip,
+            );
+        }
+        // TODO(rtps-hardening): the parallel robodr-rtps work adds per-datagram
+        // eviction / conflict info to the detailed report. Until then the
+        // reassembler's cumulative `evicted()` counter is diffed here; the
+        // evicted sample may belong to another sender than `src_ip` (the one
+        // whose datagram caused the eviction).
+        let evicted = self.reassembler.evicted();
+        if evicted > self.frag_evicted_seen {
+            let delta = evicted - self.frag_evicted_seen;
+            self.frag_evicted_seen = evicted;
+            self.stats.fragment_evictions += delta;
+            let detail = format!(
+                "{delta} partially reassembled discovery sample(s) evicted to stay within the \
+                 reassembler's memory caps while processing discovery from {src_ip}; those \
+                 announcements were not inspected"
+            );
+            self.push(
+                out,
+                Deviation::new(rules::DISCOVERY_FRAGMENT_EVICTED, Severity::Medium, detail),
                 src_ip,
             );
         }
@@ -752,12 +1341,14 @@ mod tests {
         d.extend_from_slice(&[0x15, 0x01, 0xff, 0x00]); // DATA claims 255 bytes
         let mut p = pl(true, 16);
         let f = p.process(&d, "10.0.0.5");
+        // A truncated submessage drops content: Medium "not inspected".
         assert_eq!(f.len(), 1, "{f:?}");
-        assert_eq!(f[0].deviation.rule, rules::MALFORMED_DISCOVERY);
-        assert_eq!(f[0].deviation.severity, Severity::Low);
+        assert_eq!(f[0].deviation.rule, rules::DISCOVERY_NOT_INSPECTED);
+        assert_eq!(f[0].deviation.severity, Severity::Medium);
         assert!(p.process(&d, "10.0.0.5").is_empty());
         assert!(p.stats().anomalies >= 2);
-        // Disabled: counted only.
+        // `report_anomalies = false` silences only the Low anomalies; content
+        // that was not inspected is always reported.
         let mut q = Pipeline::new(
             profile(true),
             PipelineOptions {
@@ -765,7 +1356,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(q.process(&d, "10.0.0.5").is_empty());
+        let f = q.process(&d, "10.0.0.5");
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].deviation.rule, rules::DISCOVERY_NOT_INSPECTED);
         assert!(q.stats().anomalies >= 1);
     }
 
@@ -789,7 +1382,7 @@ mod tests {
         let dev = Deviation::new("r", Severity::Low, "evil\n\u{1b}[2Jtopic");
         let mut out = Vec::new();
         p.push(&mut out, dev, "1.2.3.4\n");
-        let f = out.remove(0);
+        let f = p.emit(out, Instant::now()).remove(0);
         assert!(!f.description().contains('\n'));
         let x = f.extra();
         assert!(!x.detail.contains('\u{1b}'));

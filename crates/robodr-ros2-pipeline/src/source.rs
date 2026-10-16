@@ -23,7 +23,7 @@ use std::fs::File;
 use std::io::{self, BufReader};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use robodr_capture::reassembly::ReassemblyStats;
 use robodr_capture::{
@@ -61,17 +61,99 @@ impl Datagram {
 /// Implementations must stay read-only on the network.
 pub trait DatagramSource {
     fn recv(&mut self) -> io::Result<Option<Datagram>>;
+
+    /// Cumulative capture-layer health counters, for sources that have them
+    /// (passive capture). Fed to
+    /// [`Pipeline::capture_findings`](crate::Pipeline::capture_findings).
+    /// Default: none.
+    fn capture_health(&self) -> Option<CaptureHealth> {
+        None
+    }
 }
 
 impl<T: DatagramSource + ?Sized> DatagramSource for Box<T> {
     fn recv(&mut self) -> io::Result<Option<Datagram>> {
         (**self).recv()
     }
+
+    fn capture_health(&self) -> Option<CaptureHealth> {
+        (**self).capture_health()
+    }
 }
 
 impl<T: DatagramSource + ?Sized> DatagramSource for &mut T {
     fn recv(&mut self) -> io::Result<Option<Datagram>> {
         (**self).recv()
+    }
+
+    fn capture_health(&self) -> Option<CaptureHealth> {
+        (**self).capture_health()
+    }
+}
+
+/// Cumulative capture-layer counters that indicate lost, malformed or
+/// tampered-with traffic below RTPS: what the sensor could **not** inspect.
+/// Built from `robodr-capture`'s [`CaptureStats`] and IP-[`ReassemblyStats`];
+/// the pipeline turns increases into rate-limited `robot.capture.*`
+/// findings ([`crate::Pipeline::capture_findings`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct CaptureHealth {
+    /// Frames cut short by the snap length or the capture file.
+    pub truncated: u64,
+    /// Frames whose IP/UDP headers do not decode.
+    pub malformed: u64,
+    /// IP datagrams dropped because fragments overlapped with conflicting
+    /// bytes (a classic IDS-evasion pattern).
+    pub ip_fragment_conflicts: u64,
+    /// IP datagrams dropped for inconsistent fragment geometry.
+    pub ip_fragment_invalid: u64,
+    /// IP datagrams that never completed within the reassembly timeout.
+    pub ip_fragment_timeouts: u64,
+    /// IP datagrams evicted to keep reassembly memory bounded.
+    pub ip_fragment_evicted: u64,
+    // TODO(capture-hardening): the parallel robodr-capture work adds UDP
+    // checksum-failure and eviction counters to CaptureStats. When they land,
+    // add them here (e.g. a `udp_checksum_failures` field) and map them in
+    // `from_stats` and in `Pipeline::capture_findings`. Not guessed now.
+}
+
+impl CaptureHealth {
+    pub fn from_stats(c: &CaptureStats, r: &ReassemblyStats) -> Self {
+        Self {
+            truncated: c.truncated,
+            malformed: c.malformed,
+            ip_fragment_conflicts: r.dropped_overlap,
+            ip_fragment_invalid: r.dropped_invalid,
+            ip_fragment_timeouts: r.dropped_timeout,
+            ip_fragment_evicted: r.dropped_capacity,
+        }
+    }
+}
+
+/// The latest [`CaptureHealth`] of a source running on another thread (the
+/// Pulsar glue runs capture on its own OS thread). Cheap to clone; the
+/// source thread [`publish`](Self::publish)es, the pipeline side reads
+/// [`latest`](Self::latest).
+#[derive(Debug, Clone, Default)]
+pub struct SharedHealth(Arc<Mutex<Option<CaptureHealth>>>);
+
+impl SharedHealth {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Store a snapshot (`None` leaves the previous one).
+    pub fn publish(&self, health: Option<CaptureHealth>) {
+        if let Some(h) = health {
+            // A poisoned lock only means a publisher panicked mid-store of a
+            // Copy value; the data is still a valid snapshot.
+            let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            *g = Some(h);
+        }
+    }
+
+    pub fn latest(&self) -> Option<CaptureHealth> {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -234,6 +316,13 @@ impl<S: PacketSource> DatagramSource for CaptureDatagramSource<S> {
             // and read again.
         }
     }
+
+    fn capture_health(&self) -> Option<CaptureHealth> {
+        Some(CaptureHealth::from_stats(
+            self.inner.stats(),
+            self.inner.reassembly_stats(),
+        ))
+    }
 }
 
 /// Map a capture error onto an `io::Error` with a meaningful kind.
@@ -298,6 +387,34 @@ mod tests {
         assert!(s.recv().unwrap().is_none());
         assert!(s.recv().unwrap().is_none());
         assert_eq!(s.stats().filtered_out, 1);
+        assert_eq!(s.capture_health(), Some(CaptureHealth::default()));
+        let boxed: Box<dyn DatagramSource> = Box::new(s);
+        assert_eq!(boxed.capture_health(), Some(CaptureHealth::default()));
+        assert_eq!(VecDatagramSource::default().capture_health(), None);
+    }
+
+    #[test]
+    fn shared_health_keeps_the_latest_snapshot() {
+        let h = SharedHealth::new();
+        assert_eq!(h.latest(), None);
+        let snap = CaptureHealth {
+            truncated: 3,
+            ..Default::default()
+        };
+        h.clone().publish(Some(snap));
+        h.publish(None);
+        assert_eq!(h.latest(), Some(snap));
+        let t = {
+            let h = h.clone();
+            std::thread::spawn(move || {
+                h.publish(Some(CaptureHealth {
+                    malformed: 1,
+                    ..Default::default()
+                }))
+            })
+        };
+        t.join().unwrap();
+        assert_eq!(h.latest().unwrap().malformed, 1);
     }
 
     #[test]

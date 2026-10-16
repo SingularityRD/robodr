@@ -21,6 +21,13 @@
 //!   stamped observe / enforce. The profile is validated at load
 //!   (`Profile::validate`); an invalid profile is **refused for enforcement**
 //!   and the pipeline runs observe-only (see [`pipeline`] for why).
+//! - [`binding`]: the participant ↔ source-IP binding table. SEDP endpoint
+//!   announcements are judged against the IPs and locators their
+//!   participant's SPDP came from (or `participant_ips` pins), so a rogue
+//!   host announcing a `cmd_vel` writer under a profiled participant's GUID
+//!   prefix is caught (`robot.ros2.endpoint_source_mismatch`, Critical).
+//! - [`ratelimit`]: per-rule token buckets for `robot.rtps.*` /
+//!   `robot.capture.*` findings.
 //! - [`config`]: the `[module.robodr-sensor-ros2]` section (incl. the
 //!   `capture` sub-table) and its validation: domain id -> SPDP port, capture
 //!   [`RtpsPortMap`](robodr_capture::RtpsPortMap), default interfaces.
@@ -47,22 +54,29 @@
 //! The RTPS parser and this pipeline have only been exercised on synthetic
 //! datagrams, not on captures from real DDS stacks yet.
 
+pub mod binding;
 pub mod config;
 pub mod dedup;
 pub mod pipeline;
+pub mod ratelimit;
 pub mod sanitize;
 pub mod socket;
 pub mod source;
 pub mod watch;
 
-pub use config::{CaptureConfig, CaptureInput, CaptureSettings, Config, Settings, SpdpSettings};
+pub use binding::{BindingOptions, BindingStats, BindingTable};
+pub use config::{
+    BindingConfig, CaptureConfig, CaptureInput, CaptureSettings, Config, Settings, SpdpSettings,
+};
 pub use dedup::DedupSet;
 pub use pipeline::{
     load_profile, rules, Finding, Pipeline, PipelineOptions, PipelineStats, ProfileStatus,
     ThreatExtra, OBSERVE_ONLY_TAG,
 };
 pub use sanitize::{sanitize, MAX_TEXT_CHARS};
-pub use source::{CaptureDatagramSource, Datagram, DatagramSource, VecDatagramSource};
+pub use source::{
+    CaptureDatagramSource, CaptureHealth, Datagram, DatagramSource, SharedHealth, VecDatagramSource,
+};
 
 // Re-exported so the Pulsar glue needs no direct dependency on these crates.
 pub use robodr_capture::RtpsPortMap;

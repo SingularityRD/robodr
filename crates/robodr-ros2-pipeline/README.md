@@ -35,9 +35,35 @@ is tested offline. The same code runs in three places:
 | `robot.rtps.fragmented_discovery` | Low | one per source IP sending discovery `DATA_FRAG` (`report_fragmentation`) |
 | `robot.rtps.discovery_fragment_rejected` | Medium | the reassembler refused fragments: over a cap, bad geometry or conflicting overlap. That announcement was **not** inspected. Always reported. |
 | `robot.ros2.profile_refused` | High | once at start, when the profile fails `Profile::validate` |
+| `robot.ros2.endpoint_source_mismatch` | Critical (writer on a motion topic, or any writer in an ambiguous announcement when the profile has motion topics) / High | an SEDP endpoint attributed to a participant was announced from an IP not bound to it (not its SPDP source, an advertised locator, or a `participant_ips` pin), or relayed / GUID-conflicting from a non-discovery-server IP. See `src/binding.rs`. |
+| `robot.ros2.endpoint_unannounced_participant` | Medium (High for a motion-capable writer) | an SEDP endpoint whose participant sent no SPDP within `binding.hold_ms` (or before the end of a replay) |
+| `robot.ros2.participant_source_mismatch` | High (profiled) / Medium | SPDP for a bound participant from outside its binding, or relayed by a non-discovery-server IP; not learned |
+| `robot.ros2.ambiguous_discovery` | High | a discovery sample repeats an identity parameter (topic, type, endpoint/participant GUID, key hash, status) with conflicting values. Stacks differ on first- vs last-wins, so what we inspected may not be what a stack acts on. Never rate limited. |
+| `robot.rtps.discovery_not_inspected` | Medium | the parser dropped content (unsupported protocol version, truncated / malformed submessage or parameter list, undecodable value, announcement without topic, anomaly list overflow). Always reported. |
+| `robot.rtps.discovery_fragment_evicted` | Medium | partial discovery samples evicted by the reassembler to stay within its caps; not inspected |
+| `robot.rtps.discovery_removal` | Low / Medium | other disposes / unregisters (Medium when sent from an IP outside the owner's binding) |
+| `robot.capture.*` | Low / Medium | the capture layer's counters (malformed frames, IP fragment conflicts / drops / evictions) grew |
+| `robot.sensor.findings_capped` | the most severe suppressed, at least Medium | one input produced more than `max_findings_per_datagram` new findings |
 
 Each distinct finding (rule + detail) is reported once. Dedup is bounded, so
 eviction can only cause a re-report.
+
+### Flood limits
+
+- **Per-datagram cap** (`max_findings_per_datagram`, default 64): new
+  findings of one datagram (or tick / end of replay / capture-health update)
+  are ordered most severe first and at most this many are reported; the rest
+  are summarised in one `robot.sensor.findings_capped` finding and are **not**
+  remembered, so they are reported when they recur. A 64 KiB datagram naming
+  thousands of fake participants therefore cannot bury a Critical finding or
+  flood the event bus.
+- **Rate limit** (`rate_limit_burst`, `rate_limit_interval_ms`): per rule, on
+  `robot.rtps.*`, `robot.capture.*` and `robot.sensor.*` only. The profile and
+  binding rules (`robot.ros2.*`) are never rate limited.
+- **Memory**: dedup set, reassembler, binding table (`binding.max_participants`,
+  O(log n) eviction, profiled participants evicted last), held-announcement
+  queue (1024), per-participant IP / locator lists and the rate limiter are
+  all bounded; nothing grows with the number of distinct GUIDs or IPs seen.
 
 ### Observe vs enforce, and invalid profiles
 
