@@ -1,0 +1,532 @@
+//! `robodr-replay` argument validation, table-driven: every valued option
+//! without a value, switches given a value, repeated options, bad enum and
+//! number values, key sources, key/value options, and the accepted forms.
+//! Every usage error must exit 2 with a message, never panic (101) and
+//! never start a replay.
+
+mod common;
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+use common::*;
+
+fn bin() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_robodr-replay"))
+}
+
+fn stderr(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+/// A complete, valid `run` invocation for the demo scenario.
+fn base(bb: &Path) -> Vec<String> {
+    let ex = examples();
+    let p = |x: PathBuf| x.to_string_lossy().into_owned();
+    vec![
+        "--events".into(),
+        p(ex.join("rogue-ugv.jsonl")),
+        "--profile".into(),
+        p(ex.join("ugv-demo.profile.json")),
+        "--policy".into(),
+        p(ex.join("policy-oem-validated.json")),
+        "--blackbox".into(),
+        p(bb.to_path_buf()),
+        "--key-hex".into(),
+        key_hex(),
+        "--robot-id".into(),
+        ROBOT.into(),
+        "--safety-state".into(),
+        "moving_slow".into(),
+    ]
+}
+
+fn run_with(bb: &Path, extra: &[&str]) -> Output {
+    bin().args(base(bb)).args(extra).output().unwrap()
+}
+
+/// Assert a usage error: exit 2, message contains `needle`, and no black
+/// box was created (nothing ran).
+fn assert_usage_error(o: &Output, bb: &Path, needle: &str, what: &str) {
+    let err = stderr(o);
+    assert_eq!(o.status.code(), Some(2), "{what}: {err}");
+    assert!(err.contains(needle), "{what}: expected {needle:?} in {err}");
+    assert!(!err.contains("panicked"), "{what}: {err}");
+    assert!(!bb.exists(), "{what}: a replay started");
+}
+
+const VALUED: &[&str] = &[
+    "events",
+    "profile",
+    "policy",
+    "blackbox",
+    "key-hex",
+    "key-file",
+    "key-id",
+    "robot-id",
+    "out",
+    "outcomes",
+    "safety-state",
+    "control",
+    "phase",
+    "connectivity",
+    "site",
+    "model",
+    "profile-version",
+    "boot-id",
+    "start-ms",
+    "step-ms",
+    "firewall-allow",
+    "firewall-max-angular",
+    "monitor-config",
+    "feedback-source",
+    "partitions",
+    "findings",
+];
+
+const SWITCHES: &[&str] = &[
+    "firewall",
+    "monitor",
+    "record-all-events",
+    "log-plans",
+    "no-operator",
+    "help",
+];
+
+#[test]
+fn every_valued_option_needs_a_value() {
+    let dir = tmpdir("flags-noval");
+    let bb = dir.join("bb");
+    for name in VALUED {
+        // Trailing, so there is nothing to take as its value.
+        let o = run_with(&bb, &[&format!("--{name}")]);
+        assert_usage_error(&o, &bb, &format!("--{name} needs a value"), name);
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn switches_take_no_value() {
+    let dir = tmpdir("flags-sw");
+    let bb = dir.join("bb");
+    for name in SWITCHES {
+        let o = run_with(&bb, &[&format!("--{name}=yes")]);
+        assert_usage_error(&o, &bb, &format!("--{name} takes no value"), name);
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn single_valued_options_cannot_repeat() {
+    let dir = tmpdir("flags-dup");
+    let bb = dir.join("bb");
+    for (name, v) in [
+        ("events", "x"),
+        ("robot-id", "other"),
+        ("safety-state", "idle"),
+        ("control", "teleop"),
+        ("phase", "task"),
+        ("connectivity", "degraded"),
+        ("site", "s"),
+        ("model", "m"),
+        ("start-ms", "1"),
+        ("step-ms", "1"),
+        ("partitions", "1"),
+        ("key-hex", "00"),
+        ("key-id", "k"),
+        ("out", "x"),
+    ] {
+        let mut extra = vec![format!("--{name}"), v.to_string()];
+        if !["events", "robot-id", "safety-state", "key-hex"].contains(&name) {
+            extra.extend([format!("--{name}"), v.to_string()]);
+        }
+        let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
+        let o = run_with(&bb, &extra);
+        assert_usage_error(&o, &bb, "given more than once", name);
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn unknown_options_and_positionals_are_refused() {
+    let dir = tmpdir("flags-unk");
+    let bb = dir.join("bb");
+    for (args, needle) in [
+        (vec!["--bogus"], "unknown option --bogus"),
+        (vec!["--"], "unknown option --"),
+        (vec!["---events", "x"], "unknown option"),
+        (vec!["--EVENTS", "x"], "unknown option --EVENTS"),
+        (vec!["-e", "x"], "unexpected argument"),
+        (vec!["stray"], "unexpected argument"),
+        (vec!["verify"], "unexpected argument"), // subcommand only first
+    ] {
+        let o = run_with(&bb, &args);
+        assert_usage_error(&o, &bb, needle, &format!("{args:?}"));
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn bad_enum_values_are_refused() {
+    let dir = tmpdir("flags-enum");
+    let bb = dir.join("bb");
+    for (flag, v, needle) in [
+        ("--safety-state", "flying", "invalid safety state"),
+        ("--safety-state", "Idle", "invalid safety state"),
+        ("--safety-state", "e_stop_active", "invalid safety state"),
+        ("--safety-state", "", "invalid safety state"),
+        ("--control", "remote", "invalid control mode"),
+        ("--control", "AUTONOMOUS", "invalid control mode"),
+        ("--phase", "cruise", "invalid mission phase"),
+        ("--connectivity", "offline", "invalid connectivity"),
+        (
+            "--feedback-source",
+            "/odom=lidar",
+            "invalid feedback source",
+        ),
+    ] {
+        // --safety-state is in the base already; replace it.
+        let mut args = base(&bb);
+        if flag == "--safety-state" {
+            args.truncate(args.len() - 2);
+        }
+        args.extend([flag.to_string(), v.to_string()]);
+        let o = bin().args(&args).output().unwrap();
+        assert_usage_error(&o, &bb, needle, &format!("{flag} {v:?}"));
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn bad_numbers_are_refused() {
+    let dir = tmpdir("flags-num");
+    let bb = dir.join("bb");
+    for (flag, v, needle) in [
+        ("--start-ms", "abc", "invalid --start-ms"),
+        ("--start-ms", "-1", "invalid --start-ms"),
+        ("--start-ms", "18446744073709551616", "invalid --start-ms"),
+        ("--start-ms", "1e12", "invalid --start-ms"),
+        ("--start-ms", " 1", "invalid --start-ms"),
+        ("--step-ms", "0", "--step-ms must be > 0"),
+        ("--step-ms", "18446744073710", "--step-ms must be > 0"),
+        ("--step-ms", "0x10", "invalid --step-ms"),
+        ("--step-ms", "1.5", "invalid --step-ms"),
+        ("--partitions", "-1", "invalid --partitions"),
+        ("--partitions", "4294967296", "--partitions too large"),
+    ] {
+        let o = run_with(&bb, &[flag, v]);
+        assert_usage_error(&o, &bb, needle, &format!("{flag} {v:?}"));
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn key_value_options_are_validated() {
+    let dir = tmpdir("flags-kv");
+    let bb = dir.join("bb");
+    for (args, needle) in [
+        (
+            vec!["--firewall-allow", "/cmd_vel"],
+            "must be CHANNEL=VALUE",
+        ),
+        (vec!["--firewall-allow", "=abc"], "must be CHANNEL=VALUE"),
+        (
+            vec!["--firewall-allow", "/cmd_vel="],
+            "must be CHANNEL=VALUE",
+        ),
+        (vec!["--feedback-source", "/odom"], "must be CHANNEL=VALUE"),
+        (
+            vec!["--firewall-max-angular", "/cmd_vel"],
+            "must be CHANNEL=VALUE",
+        ),
+        (
+            vec!["--firewall-max-angular", "/cmd_vel=NaN"],
+            "not a finite rad/s",
+        ),
+        (
+            vec!["--firewall-max-angular", "/cmd_vel=inf"],
+            "not a finite rad/s",
+        ),
+        (
+            vec!["--firewall-max-angular", "/cmd_vel=-0.1"],
+            "not a finite rad/s",
+        ),
+        (
+            vec!["--firewall-max-angular", "/cmd_vel=fast"],
+            "not a finite rad/s",
+        ),
+        (
+            vec![
+                "--firewall-max-angular",
+                "/cmd_vel=1",
+                "--firewall-max-angular",
+                "/cmd_vel=2",
+            ],
+            "given more than once",
+        ),
+    ] {
+        let o = run_with(&bb, &args);
+        assert_usage_error(&o, &bb, needle, &format!("{args:?}"));
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn key_sources_are_validated() {
+    let dir = tmpdir("flags-key");
+    let bb = dir.join("bb");
+    let ex = examples();
+    let common: Vec<String> = vec![
+        "--events".into(),
+        ex.join("rogue-ugv.jsonl").to_string_lossy().into(),
+        "--profile".into(),
+        ex.join("ugv-demo.profile.json").to_string_lossy().into(),
+        "--policy".into(),
+        ex.join("policy-oem-validated.json")
+            .to_string_lossy()
+            .into(),
+        "--blackbox".into(),
+        bb.to_string_lossy().into(),
+        "--robot-id".into(),
+        ROBOT.into(),
+    ];
+    let big = dir.join("big.key");
+    std::fs::write(&big, "4".repeat(5000)).unwrap();
+    let good_file = dir.join("good.key");
+    std::fs::write(&good_file, format!("  {}\r\n\n", key_hex())).unwrap();
+    let bad_file = dir.join("bad.key");
+    std::fs::write(&bad_file, "zz".repeat(32)).unwrap();
+    let missing = dir.join("missing.key");
+    let s = |p: &Path| p.to_string_lossy().into_owned();
+    for (args, needle) in [
+        (vec![], "--key-hex or --key-file is required".to_string()),
+        (
+            vec![
+                "--key-hex".into(),
+                key_hex(),
+                "--key-file".into(),
+                s(&good_file),
+            ],
+            "not both".to_string(),
+        ),
+        (
+            vec!["--key-hex".into(), "xyz".into()],
+            "not valid hex".into(),
+        ),
+        (
+            vec!["--key-hex".into(), "abc".into()],
+            "not valid hex".into(),
+        ),
+        (vec!["--key-hex".into(), "".into()], "key".into()),
+        (vec!["--key-hex".into(), "ab".repeat(16 - 1)], "key".into()),
+        (vec!["--key-file".into(), s(&big)], "larger than".into()),
+        (
+            vec!["--key-file".into(), s(&bad_file)],
+            "not valid hex".into(),
+        ),
+        (vec!["--key-file".into(), s(&missing)], "missing.key".into()),
+        (vec!["--key-file".into(), s(&dir)], "".into()),
+    ] {
+        let o = bin().args(&common).args(&args).output().unwrap();
+        assert_usage_error(&o, &bb, &needle, &format!("{args:?}"));
+    }
+    // A key file with surrounding whitespace and CRLF is accepted.
+    let o = bin()
+        .args(&common)
+        .args(["--key-file".into(), s(&good_file)])
+        .args(["--safety-state", "moving_slow"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn required_options_are_reported_by_name() {
+    let dir = tmpdir("flags-req");
+    let bb = dir.join("bb");
+    let full = base(&bb);
+    for name in ["events", "profile", "policy", "blackbox", "robot-id"] {
+        let mut args = Vec::new();
+        let mut it = full.iter();
+        while let Some(a) = it.next() {
+            if a == &format!("--{name}") {
+                it.next();
+                continue;
+            }
+            args.push(a.clone());
+        }
+        let o = bin().args(&args).output().unwrap();
+        assert_usage_error(&o, &bb, &format!("--{name} is required"), name);
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn config_file_errors_exit_2() {
+    let dir = tmpdir("flags-cfg");
+    let bb = dir.join("bb");
+    let junk = dir.join("junk.json");
+    std::fs::write(&junk, "{\"not\": \"a config\"}").unwrap();
+    let missing = dir.join("missing.json");
+    for (flag, path, needle) in [
+        ("--monitor-config", &missing, "missing.json"),
+        ("--monitor-config", &junk, "not a monitor config"),
+    ] {
+        let o = run_with(&bb, &[flag, path.to_str().unwrap()]);
+        assert_usage_error(&o, &bb, needle, flag);
+    }
+    // Profile / policy replaced by junk.
+    for (flag, needle) in [("--profile", "not a profile"), ("--policy", "policy JSON")] {
+        let mut args = base(&bb);
+        let i = args.iter().position(|a| a == flag).unwrap();
+        args[i + 1] = junk.to_string_lossy().into_owned();
+        let o = bin().args(&args).output().unwrap();
+        assert_eq!(o.status.code(), Some(2), "{flag}: {}", stderr(&o));
+        assert!(stderr(&o).contains(needle), "{flag}: {}", stderr(&o));
+    }
+    // --firewall without the angular bound for the Twist channel.
+    let o = run_with(&bb, &["--firewall"]);
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    // Allow-listed writer GUIDs must be well-formed.
+    for guid in ["a", "zz", "", "0f0f0f0f0f0f0f0f0f0f0f0f0f"] {
+        let allow = format!("--firewall-allow=/cmd_vel={guid},{LEGIT_WRITER}");
+        let o = run_with(&bb, &[&allow, "--firewall-max-angular", "/cmd_vel=1"]);
+        assert_eq!(o.status.code(), Some(2), "{guid:?}: {}", stderr(&o));
+        assert!(stderr(&o).contains("invalid firewall config"), "{guid:?}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn non_empty_blackbox_is_refused_and_left_untouched() {
+    let dir = tmpdir("flags-bb");
+    let bb = dir.join("bb");
+    std::fs::create_dir_all(&bb).unwrap();
+    std::fs::write(bb.join("precious"), b"keep me").unwrap();
+    let o = bin().args(base(&bb)).output().unwrap();
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    assert!(stderr(&o).contains("not empty"), "{}", stderr(&o));
+    assert_eq!(std::fs::read(bb.join("precious")).unwrap(), b"keep me");
+    assert_eq!(std::fs::read_dir(&bb).unwrap().count(), 1);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn accepted_forms_inline_values_explicit_run_and_valid_enums() {
+    let dir = tmpdir("flags-ok");
+    let ex = examples();
+    let out = dir.join("findings.jsonl");
+    // `run` subcommand, `--name=value` forms, every enum spelled validly.
+    let bb = dir.join("bb1");
+    let o = bin()
+        .arg("run")
+        .arg(format!("--events={}", ex.join("rogue-ugv.jsonl").display()))
+        .arg(format!(
+            "--profile={}",
+            ex.join("ugv-demo.profile.json").display()
+        ))
+        .arg(format!(
+            "--policy={}",
+            ex.join("policy-oem-validated.json").display()
+        ))
+        .arg(format!("--blackbox={}", bb.display()))
+        .arg(format!("--key-hex={}", key_hex()))
+        .arg(format!("--robot-id={ROBOT}"))
+        .arg("--safety-state=collaborative_human_nearby")
+        .arg("--control=teleop")
+        .arg("--phase=landing")
+        .arg("--connectivity=disconnected")
+        .arg("--no-operator")
+        .arg("--site=a=b") // only the first '=' splits
+        .arg("--partitions=4294967295")
+        .arg("--start-ms=1000000000000")
+        .arg("--step-ms=18446744073709")
+        .arg(format!(
+            "--firewall-allow=/cmd_vel={LEGIT_WRITER},01103f5a8c2e00000000010200000203"
+        ))
+        .arg("--firewall-max-angular=/cmd_vel=0")
+        .arg("--record-all-events")
+        .arg(format!("--out={}", out.display()))
+        .output()
+        .unwrap();
+    // Valid usage: the run happens (exit 0 or 1, never 2).
+    assert!(matches!(o.status.code(), Some(0 | 1)), "{}", stderr(&o));
+    assert!(bb.exists());
+    // Every safety state is accepted.
+    for (i, s) in [
+        "idle",
+        "moving_slow",
+        "moving_fast",
+        "collaborative_human_nearby",
+        "estop_active",
+        "safe_state_active",
+        "unknown",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let bb = dir.join(format!("bbs{i}"));
+        let mut args = base(&bb);
+        args.truncate(args.len() - 2);
+        args.extend(["--safety-state".to_string(), s.to_string()]);
+        let o = bin().args(&args).output().unwrap();
+        assert_eq!(o.status.code(), Some(0), "{s}: {}", stderr(&o));
+        if *s == "estop_active" || *s == "safe_state_active" {
+            // Nothing beyond record while the safety system has authority.
+            assert!(!stderr(&o).contains("awaiting_human_approval"), "{s}");
+            assert!(!stderr(&o).contains("\"eligible\""), "{s}");
+        }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn help_and_empty_invocations() {
+    let o = bin().arg("--help").output().unwrap();
+    assert_eq!(o.status.code(), Some(0));
+    assert!(stderr(&o).contains("USAGE"));
+    let o = bin().args(["run", "--help"]).output().unwrap();
+    assert_eq!(o.status.code(), Some(0));
+    let o = bin().args(["verify", "--help"]).output().unwrap();
+    assert_eq!(o.status.code(), Some(0));
+    for args in [vec![], vec!["run"], vec!["verify"]] {
+        let o = bin().args(&args).output().unwrap();
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+        assert!(stderr(&o).contains("USAGE"), "{args:?}");
+    }
+    // `verify` requires its own options.
+    let o = bin()
+        .args(["verify", "--key-hex", &key_hex()])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    assert!(stderr(&o).contains("--blackbox is required"));
+    // A missing black box for verify is an error, not "verified".
+    let o = bin()
+        .args([
+            "verify",
+            "--blackbox",
+            "/nonexistent/robodr-bb",
+            "--key-hex",
+        ])
+        .arg(key_hex())
+        .output()
+        .unwrap();
+    assert_ne!(o.status.code(), Some(0), "{}", stderr(&o));
+}
+
+/// BUG (not fixed here: `src/bin/robodr-replay.rs` is outside this task's
+/// scope). `main` collects `std::env::args()`, which panics on an argument
+/// that is not valid Unicode, so the binary aborts with exit code 101 and a
+/// panic message instead of a usage error (exit 2). Fix: use
+/// `std::env::args_os()` and report non-UTF-8 arguments as usage errors.
+#[cfg(unix)]
+#[test]
+#[ignore = "known bug: non-UTF-8 argv panics (exit 101) instead of exit 2"]
+fn non_utf8_argument_is_a_usage_error() {
+    use std::os::unix::ffi::OsStrExt;
+    let arg = std::ffi::OsStr::from_bytes(b"--events=\xff\xfe");
+    let o = bin().arg(arg).output().unwrap();
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+}

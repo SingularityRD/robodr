@@ -516,3 +516,357 @@ pub fn describe_report(report: &Report) -> String {
     }
     s
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use robodr_blackbox::{Finding, FindingKind, FindingLevel};
+
+    use crate::outcome::Disposition;
+
+    const KEY: [u8; 32] = [0x42; 32];
+
+    fn examples() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("examples")
+    }
+
+    /// A fresh, empty directory (removed by the test).
+    fn tmpdir(tag: &str) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "robodr-replay-unit-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn demo_opts(bb: &Path) -> ReplayOptions {
+        let ex = examples();
+        ReplayOptions::new(
+            ex.join("rogue-ugv.jsonl"),
+            ex.join("ugv-demo.profile.json"),
+            ex.join("policy-oem-validated.json"),
+            bb,
+            KEY.to_vec(),
+            "ugv-007",
+        )
+    }
+
+    #[test]
+    fn options_defaults_are_conservative() {
+        let o = ReplayOptions::new("e", "p", "q", "b", vec![1], "r");
+        assert_eq!(o.events, PathBuf::from("e"));
+        assert_eq!(o.blackbox, PathBuf::from("b"));
+        assert_eq!(o.robot_id, "r");
+        // Unknown safety state by default: motion steps always need a human.
+        assert_eq!(o.safety, SafetyState::Unknown);
+        assert_eq!(o.control, ControlMode::Autonomous);
+        assert!(!o.firewall && o.monitor.is_none() && !o.record_all_events);
+        assert!(o.step_ns > 0);
+        assert_eq!(o.max_retained_outcomes, DEFAULT_MAX_RETAINED_OUTCOMES);
+        assert_eq!(o.key_id, None);
+        assert_eq!(o.model, None);
+    }
+
+    #[test]
+    fn error_display_is_the_message() {
+        assert_eq!(ReplayError::Io("a".into()).to_string(), "a");
+        assert_eq!(ReplayError::Input("b".into()).to_string(), "b");
+        assert_eq!(ReplayError::Config("c".into()).to_string(), "c");
+    }
+
+    #[test]
+    fn read_capped_errors() {
+        let d = tmpdir("cap");
+        // Missing.
+        assert!(matches!(
+            read_capped(&d.join("missing")),
+            Err(ReplayError::Io(m)) if m.contains("missing")
+        ));
+        // Over the cap (sparse: nothing is actually read).
+        let big = d.join("big.json");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_CONFIG_BYTES + 1)
+            .unwrap();
+        assert!(matches!(read_capped(&big), Err(ReplayError::Config(m)) if m.contains("larger")));
+        // Not UTF-8.
+        let bin = d.join("bin.json");
+        std::fs::write(&bin, b"{\xff}").unwrap();
+        assert!(matches!(read_capped(&bin), Err(ReplayError::Io(_))));
+        // A directory.
+        assert!(read_capped(&d).is_err());
+        // Fine.
+        std::fs::write(d.join("ok"), "x").unwrap();
+        assert_eq!(read_capped(&d.join("ok")).unwrap(), "x");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn loaders_are_strict() {
+        let d = tmpdir("load");
+        let ex = examples();
+        assert!(load_profile(&ex.join("ugv-demo.profile.json")).is_ok());
+        assert!(load_policy(&ex.join("policy-oem-validated.json")).is_ok());
+
+        let w = |name: &str, text: &str| {
+            let p = d.join(name);
+            std::fs::write(&p, text).unwrap();
+            p
+        };
+        // Profile: garbage, unknown field, wrong types.
+        let prof = std::fs::read_to_string(ex.join("ugv-demo.profile.json")).unwrap();
+        let extra = prof.replacen('{', "{\"extra\": 1,", 1);
+        for text in ["", "null", "[]", "{", extra.as_str(), "{\"model\": 5}"] {
+            let p = w("p.json", text);
+            assert!(
+                matches!(load_profile(&p), Err(ReplayError::Config(m)) if m.contains("not a profile")),
+                "{text:?}"
+            );
+        }
+        // Policy: an e-stop cell above record is refused at load.
+        let pol = std::fs::read_to_string(ex.join("policy-oem-validated.json")).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&pol).unwrap();
+        v["matrix"]["estop_active"]["critical"] = "safe_pause".into();
+        let p = w("q.json", &v.to_string());
+        assert!(matches!(load_policy(&p), Err(ReplayError::Config(m)) if m.contains("record")));
+        let p = w("q2.json", "{}");
+        assert!(matches!(load_policy(&p), Err(ReplayError::Config(_))));
+        // Monitor config: unknown fields refused.
+        let p = w("m.json", "{\"bogus\": true}");
+        assert!(matches!(
+            load_monitor_config(&p),
+            Err(ReplayError::Config(m)) if m.contains("not a monitor config")
+        ));
+        assert!(matches!(
+            load_monitor_config(&d.join("none.json")),
+            Err(ReplayError::Io(_))
+        ));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn hmac_key_requires_a_long_enough_key() {
+        assert!(matches!(
+            hmac_key(&[0u8; 8], None),
+            Err(ReplayError::Config(m)) if m.starts_with("black-box key")
+        ));
+        assert!(hmac_key(&[], Some("id")).is_err());
+        assert!(hmac_key(&KEY, None).is_ok());
+        assert!(hmac_key(&KEY, Some("my-key")).is_ok());
+    }
+
+    #[test]
+    fn fresh_blackbox_rule() {
+        let d = tmpdir("fresh");
+        // Absent: fine (it will be created).
+        assert!(require_fresh_blackbox(&d.join("absent")).is_ok());
+        // Empty: fine.
+        assert!(require_fresh_blackbox(&d).is_ok());
+        // Anything inside, even an empty subdirectory or a dotfile: refused.
+        std::fs::write(d.join(".hidden"), b"").unwrap();
+        assert!(matches!(
+            require_fresh_blackbox(&d),
+            Err(ReplayError::Config(m)) if m.contains("not empty")
+        ));
+        // A regular file where the directory should be: an error.
+        let f = d.join(".hidden");
+        assert!(matches!(
+            require_fresh_blackbox(&f),
+            Err(ReplayError::Io(_))
+        ));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn enum_names_are_serde_names() {
+        for (d, want) in [
+            (Disposition::ObserveOnly, "observe_only"),
+            (Disposition::Suppressed, "suppressed"),
+            (Disposition::RecordOnly, "record_only"),
+            (
+                Disposition::AwaitingHumanApproval,
+                "awaiting_human_approval",
+            ),
+            (Disposition::Eligible, "eligible"),
+        ] {
+            assert_eq!(enum_name(&d), want);
+        }
+        // Anything that is not a plain string falls back.
+        assert_eq!(enum_name(&5u8), "unknown");
+        assert_eq!(enum_name(&serde_json::json!({"a": 1})), "unknown");
+    }
+
+    fn finding(level: FindingLevel) -> Finding {
+        Finding {
+            level,
+            kind: FindingKind::TornTail { len: 3 },
+            location: None,
+        }
+    }
+
+    #[test]
+    fn describe_report_states() {
+        let r = Report::default();
+        let s = describe_report(&r);
+        assert!(s.starts_with("black box: 0 frames, 0 records verified, seq -..-"));
+        assert!(s.contains("last seal seq -, CLEAN"));
+        assert_eq!(s.lines().count(), 1);
+
+        let r = Report {
+            findings: vec![finding(FindingLevel::Warning)],
+            frames: 3,
+            verified_records: 2,
+            first_seq: Some(0),
+            last_seq: Some(1),
+            last_seal_seq: Some(1),
+            ..Report::default()
+        };
+        let s = describe_report(&r);
+        assert!(s.contains("3 frames, 2 records verified, seq 0..1, last seal seq 1"));
+        assert!(s.contains("INTACT (warnings)"));
+        assert_eq!(s.lines().count(), 2);
+
+        let r = Report {
+            findings: vec![finding(FindingLevel::Info), finding(FindingLevel::Tamper)],
+            ..Report::default()
+        };
+        let s = describe_report(&r);
+        assert!(s.contains("TAMPERED"));
+        assert_eq!(s.lines().count(), 3);
+        assert!(s.lines().skip(1).all(|l| l.starts_with("  [")));
+    }
+
+    #[test]
+    fn verify_summary_verified_needs_everything() {
+        let ok = |links: Option<LinkReport>, invalid: Vec<(usize, String)>, tamper: bool| {
+            VerifySummary {
+                report: Report {
+                    findings: if tamper {
+                        vec![finding(FindingLevel::Tamper)]
+                    } else {
+                        vec![finding(FindingLevel::Warning)]
+                    },
+                    ..Report::default()
+                },
+                links,
+                invalid_findings: invalid,
+            }
+            .verified()
+        };
+        let good = LinkReport {
+            checked: 2,
+            resolved: 2,
+            problems: vec![],
+        };
+        let bad = LinkReport {
+            checked: 2,
+            resolved: 1,
+            problems: vec!["x".into()],
+        };
+        assert!(ok(None, vec![], false), "warnings alone still verify");
+        assert!(ok(Some(good.clone()), vec![], false));
+        assert!(!ok(Some(bad), vec![], false));
+        assert!(!ok(Some(good.clone()), vec![(3, "e".into())], false));
+        assert!(!ok(Some(good), vec![], true));
+        assert!(!ok(None, vec![], true));
+    }
+
+    #[test]
+    fn build_agent_validates_before_creating_anything() {
+        let d = tmpdir("build");
+        let bb = d.join("bb");
+        // Zero step.
+        let mut o = demo_opts(&bb);
+        o.step_ns = 0;
+        assert!(matches!(build_agent(&o), Err(ReplayError::Config(m)) if m.contains("step")));
+        // Short key.
+        let mut o = demo_opts(&bb);
+        o.key = vec![1; 4];
+        assert!(matches!(build_agent(&o), Err(ReplayError::Config(_))));
+        // Firewall without the Twist angular bound.
+        let mut o = demo_opts(&bb);
+        o.firewall = true;
+        assert!(matches!(build_agent(&o), Err(ReplayError::Agent(_))));
+        // Missing profile / policy.
+        let mut o = demo_opts(&bb);
+        o.profile = d.join("nope.json");
+        assert!(matches!(build_agent(&o), Err(ReplayError::Io(_))));
+        let mut o = demo_opts(&bb);
+        o.policy = d.join("nope.json");
+        assert!(matches!(build_agent(&o), Err(ReplayError::Io(_))));
+        assert!(!bb.exists(), "nothing created on a config error");
+        // Valid: a replay agent (its plans are marked as replayed).
+        let agent = build_agent(&demo_opts(&bb)).unwrap();
+        assert!(agent.is_replay());
+        drop(agent);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn run_refuses_a_used_blackbox_and_does_not_touch_it() {
+        let d = tmpdir("used");
+        std::fs::write(d.join("segment"), b"old evidence").unwrap();
+        let res = run(&demo_opts(&d), &mut Vec::new(), None, None);
+        assert!(matches!(res, Err(ReplayError::Config(m)) if m.contains("fresh")));
+        assert_eq!(std::fs::read(d.join("segment")).unwrap(), b"old evidence");
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn run_and_verify_round_trip_with_key_id_and_plan_log() {
+        let d = tmpdir("rt");
+        let bb = d.join("bb");
+        let mut o = demo_opts(&bb);
+        o.safety = SafetyState::MovingSlow;
+        o.key_id = Some("site-key-1".into());
+        o.firewall = true;
+        o.firewall_max_angular = BTreeMap::from([("/cmd_vel".to_string(), 1.0)]);
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Shared {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut findings = Vec::new();
+        let sum = run(&o, &mut findings, None, Some(Box::new(Shared(log.clone())))).unwrap();
+        assert!(sum.verified());
+        assert_eq!(sum.events, 16);
+        let log = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("replay"), "{log}");
+        let fpath = d.join("f.jsonl");
+        std::fs::write(&fpath, &findings).unwrap();
+        // Same key: verified. The key id is a label; authentication rests on
+        // the key bytes, so another id with the same bytes still verifies
+        // and different bytes do not.
+        let v = verify(&bb, &KEY, Some("site-key-1"), Some("ugv-007"), Some(&fpath)).unwrap();
+        assert!(v.verified(), "{:?}", v.report);
+        assert!(verify(&bb, &KEY, None, None, None).unwrap().verified());
+        assert!(!verify(&bb, &[0x43; 32], Some("site-key-1"), None, None)
+            .unwrap()
+            .verified());
+        // Oversize findings file is refused before reading.
+        let big = d.join("big.jsonl");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_FINDINGS_BYTES + 1)
+            .unwrap();
+        assert!(matches!(
+            verify(&bb, &KEY, Some("site-key-1"), None, Some(&big)),
+            Err(ReplayError::Input(m)) if m.contains("larger")
+        ));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+}
