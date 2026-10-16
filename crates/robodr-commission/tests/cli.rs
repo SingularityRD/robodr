@@ -73,6 +73,10 @@ fn lock_learned(profile: &Path, out: &Path) -> Output {
     confirm(&signoff_of(profile));
     run(&[
         "lock",
+        "--platform",
+        "ugv-test",
+        "--profile-version",
+        "1",
         "--in",
         s(profile),
         "--signoff",
@@ -93,6 +97,10 @@ fn lock_any(profile: &Path, out: &Path) -> Output {
     confirm(&so);
     run(&[
         "lock",
+        "--platform",
+        "ugv-test",
+        "--profile-version",
+        "1",
         "--in",
         s(profile),
         "--signoff",
@@ -131,6 +139,10 @@ fn demo_learn_lock_check_clean_then_rogue() {
     // Unconfirmed sign-off: refused.
     let o = run(&[
         "lock",
+        "--platform",
+        "ugv-test",
+        "--profile-version",
+        "1",
         "--in",
         s(&profile),
         "--signoff",
@@ -351,6 +363,10 @@ fn lock_refuses_bad_profiles_and_relock() {
     assert_eq!(code(&lock_learned(&good, &out)), 0);
     let o = run(&[
         "lock",
+        "--platform",
+        "ugv-test",
+        "--profile-version",
+        "1",
         "--in",
         s(&out),
         "--signoff",
@@ -446,6 +462,10 @@ fn merge_subcommand() {
     // The learned sign-off of `a` does not cover the merged draft...
     let o = run(&[
         "lock",
+        "--platform",
+        "ugv-test",
+        "--profile-version",
+        "1",
         "--in",
         s(&m),
         "--signoff",
@@ -613,6 +633,10 @@ fn malformed_events_file_is_rejected_with_line() {
     std::fs::write(&so, "{}").unwrap();
     let o = run(&[
         "lock",
+        "--platform",
+        "ugv-test",
+        "--profile-version",
+        "1",
         "--in",
         s(&p),
         "--signoff",

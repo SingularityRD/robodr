@@ -30,7 +30,8 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::config::{capture_port_map, valid_ifname, CaptureInput, DEFAULT_READ_TIMEOUT_MS};
-use crate::pipeline::{load_profile, Pipeline, PipelineOptions, PipelineStats};
+use crate::pipeline::{Pipeline, PipelineOptions, PipelineStats};
+use crate::profile_trust::{load_profile_with_trust, ProfileTrustConfig};
 use crate::sanitize::sanitize;
 use crate::source::{CaptureDatagramSource, DatagramSource};
 
@@ -50,6 +51,16 @@ INPUT (exactly one kind):
 OPTIONS:
     --profile <file>       model profile (JSON). An invalid profile is reported
                            and the run is observe-only (never enforcing)
+    --trusted-keys <file>  trusted profile signing keys (robodr-profile-trust/v1).
+                           A locked profile is enforced only with a valid
+                           <profile>.sig from one of them; without this
+                           option every locked profile runs observe-only
+    --profile-state <file> anti-rollback state (read, and rewritten when a
+                           newer signed profile is accepted)
+    --allow-rollback <sha256:HEX>
+                           accept this exact (older) profile file once
+    --expect-platform <p>  the profile's metadata.platform must be <p>
+    --expect-unit <id>     the profile's metadata.unit_id must be null or <id>
     --domain <id>          ROS_DOMAIN_ID whose well-known ports are captured
                            (repeatable, 0..=232; default 0). RTPS on other
                            ports is still caught by the 'RTPS' magic
@@ -96,6 +107,9 @@ pub struct WatchArgs {
     pub read_timeout: Duration,
     /// Live only: stop after this long.
     pub duration: Option<Duration>,
+    /// Profile trust (signature, anti-rollback); see
+    /// [`crate::profile_trust`].
+    pub trust: ProfileTrustConfig,
 }
 
 /// Parse `args` (without the program name).
@@ -108,6 +122,15 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, St
     let mut options = PipelineOptions::default();
     let mut stats = false;
     let mut duration = None;
+    let mut trust = ProfileTrustConfig::default();
+    let abs = |p: String| -> PathBuf {
+        let p = PathBuf::from(p);
+        if p.is_absolute() {
+            p
+        } else {
+            std::env::current_dir().map(|d| d.join(&p)).unwrap_or(p)
+        }
+    };
     let bad_ip = |flag: &str, v: &str| -> String {
         format!("{flag} {:?}: not a unicast IP address", sanitize(v))
     };
@@ -145,6 +168,51 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, St
                     .is_some()
                 {
                     return Err("--profile given twice".into());
+                }
+            }
+            "--trusted-keys" => {
+                if trust
+                    .trusted_keys
+                    .replace(abs(value("--trusted-keys")?))
+                    .is_some()
+                {
+                    return Err("--trusted-keys given twice".into());
+                }
+            }
+            "--profile-state" => {
+                if trust
+                    .state_file
+                    .replace(abs(value("--profile-state")?))
+                    .is_some()
+                {
+                    return Err("--profile-state given twice".into());
+                }
+            }
+            "--allow-rollback" => {
+                if trust
+                    .allow_rollback
+                    .replace(value("--allow-rollback")?)
+                    .is_some()
+                {
+                    return Err("--allow-rollback given twice".into());
+                }
+            }
+            "--expect-platform" => {
+                if trust
+                    .expect_platform
+                    .replace(value("--expect-platform")?)
+                    .is_some()
+                {
+                    return Err("--expect-platform given twice".into());
+                }
+            }
+            "--expect-unit" => {
+                if trust
+                    .expect_unit_id
+                    .replace(value("--expect-unit")?)
+                    .is_some()
+                {
+                    return Err("--expect-unit given twice".into());
                 }
             }
             "--pcap" => {
@@ -271,6 +339,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, St
     }
 
     let profile = profile.ok_or("--profile is required")?;
+    trust.validate().map_err(|e| sanitize(&e))?;
     let input = match (pcap, interfaces.is_empty() && !any_interface) {
         (Some(_), false) => return Err("--pcap and --interface are mutually exclusive".into()),
         (Some(path), true) => CaptureInput::Replay { path },
@@ -296,6 +365,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, St
         stats,
         read_timeout: Duration::from_millis(DEFAULT_READ_TIMEOUT_MS),
         duration,
+        trust,
     })))
 }
 
@@ -375,7 +445,10 @@ fn write_line(out: &mut dyn Write, f: &crate::Finding) -> io::Result<()> {
 
 /// Run a parsed command line. `Err` = runtime error (exit code 1).
 pub fn run(args: &WatchArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<Summary, String> {
-    let loaded = load_profile(&args.profile)?;
+    for w in args.trust.warnings() {
+        let _ = writeln!(err, "robodr-ros2-watch: warning: {}", sanitize(&w));
+    }
+    let loaded = load_profile_with_trust(&args.profile, &args.trust)?;
     let mut pipeline = Pipeline::from_loaded(loaded, args.options.clone());
     if let Some(msg) = pipeline.status_message() {
         let _ = writeln!(err, "robodr-ros2-watch: warning: {msg}");

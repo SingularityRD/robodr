@@ -38,7 +38,35 @@ Live capture on an interface (Linux, needs CAP_NET_RAW); repeatable;
 .TP
 .BI \-\-profile " file"
 Model profile (JSON). An invalid profile is reported and the run is
-observe\-only (never enforcing).
+observe\-only (never enforcing). A locked profile is enforced only if it
+carries metadata and a valid
+.IB file .sig
+from a key in
+.BR \-\-trusted\-keys ;
+otherwise the first line is a
+.B robot.ros2.profile_refused
+finding and the run is observe\-only.
+.TP
+.BI \-\-trusted\-keys " file"
+Trusted profile signing keys
+.RI ( robodr\-profile\-trust/v1 ).
+.TP
+.BI \-\-profile\-state " file"
+Anti\-rollback state (read; rewritten atomically when a newer signed profile
+is accepted).
+.TP
+.BI \-\-allow\-rollback " sha256:HEX"
+Accept the one older profile file with exactly this digest.
+.TP
+.BI \-\-expect\-platform " p\fR, " \-\-expect\-unit " id"
+The profile's
+.B metadata.platform
+must be
+.IR p ;
+its
+.B metadata.unit_id
+must be null or
+.IR id .
 .TP
 .BI \-\-domain " id"
 ROS_DOMAIN_ID whose well\-known ports are captured (repeatable, 0..=232;

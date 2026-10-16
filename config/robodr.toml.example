@@ -14,6 +14,10 @@ enabled = true
 #  - fails validation       -> REFUSED for enforcement: errors are logged and
 #                              raised as a warning + one robot.ros2.profile_refused
 #                              threat; the sensor runs observe-only.
+#  - locked but not trusted -> REFUSED the same way: a locked profile is
+#                              enforced only with metadata and a valid
+#                              <profile_path>.sig from a key in
+#                              profile_trust.trusted_keys (see below).
 profile_path = "/etc/robodr/profile.json"
 # ROS_DOMAIN_ID of the robot. The SPDP port is derived from it:
 #   port = 7400 + 250 * domain_id      (domain_id 0..=232)
@@ -100,6 +104,22 @@ evaluate_commands = true
 max_writers = 4096
 # Motion samples decoded per datagram (1..=4096).
 max_samples_per_datagram = 256
+# Profile authenticity and anti-rollback. Without trusted_keys NO locked
+# profile is enforced (fail closed). The .sig file is written by
+# `robodr-commission lock --sign-key` next to the profile; install both.
+[module.robodr-sensor-ros2.profile_trust]
+# robodr-profile-trust/v1 file: the OEM's Ed25519 profile PUBLIC key(s)
+# (`robodr-commission keygen --trust-out`). Not writable by group/others.
+trusted_keys = "/etc/robodr/profile-trust.json"
+# Last accepted profile_version + digest. A lower version, or the same
+# version with different bytes, is refused. Must be writable by the daemon.
+state_file = "/var/lib/robodr/profile-state/pulsard.json"
+# metadata.platform / metadata.unit_id the profile must carry (optional).
+# expect_platform = "ugv-x1"
+# expect_unit_id = "ugv-007"
+# One deliberate rollback: the exact digest of the older profile file
+# (printed by `robodr-commission verify-profile`). Remove after it loaded.
+# allow_rollback = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
 # ---------------------------------------------------------------------------
 # Motion Firewall and motion monitor (robodr-agent). NOT Pulsar module keys:

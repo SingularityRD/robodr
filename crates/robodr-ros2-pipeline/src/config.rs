@@ -42,7 +42,19 @@
 //! evaluate_commands = true             # Profile::evaluate on decoded commands
 //! max_writers = 4096                   # writer GUID -> topic table bound
 //! max_samples_per_datagram = 256
+//!
+//! [module.robodr-sensor-ros2.profile_trust]
+//! trusted_keys = "/etc/robodr/profile-trust.json"
+//! state_file = "/var/lib/robodr/profile-state/pulsard.json"
+//! # expect_platform = "ugv-x1"
+//! # expect_unit_id = "ugv-007"
+//! # allow_rollback = "sha256:<digest>"   # one deliberate rollback, then remove
 //! ```
+//!
+//! ## Profile trust (`profile_trust` sub-table)
+//!
+//! See [`crate::profile_trust`]. Without `trusted_keys` a locked profile is
+//! never enforced (observe-only + `robot.ros2.profile_refused`).
 //!
 //! ## Motion (`motion` sub-table)
 //!
@@ -92,6 +104,7 @@ use crate::pipeline::{
     PipelineOptions, DEFAULT_DEDUP_CAPACITY, DEFAULT_MAX_FINDINGS_PER_DATAGRAM,
     MAX_FINDINGS_PER_DATAGRAM,
 };
+use crate::profile_trust::ProfileTrustConfig;
 use crate::ratelimit;
 
 pub const DEFAULT_PROFILE_PATH: &str = "/etc/robodr/profile.json";
@@ -152,6 +165,10 @@ pub struct Config {
     pub binding: BindingConfig,
     /// User-DATA motion decode path.
     pub motion: MotionConfig,
+    /// Profile authenticity and anti-rollback (`profile_trust` sub-table).
+    /// See [`crate::profile_trust`]. Default: nothing trusted, so a locked
+    /// profile runs observe-only.
+    pub profile_trust: ProfileTrustConfig,
 }
 
 impl Default for Config {
@@ -172,6 +189,7 @@ impl Default for Config {
             capture: CaptureConfig::default(),
             binding: BindingConfig::default(),
             motion: MotionConfig::default(),
+            profile_trust: ProfileTrustConfig::default(),
         }
     }
 }
@@ -525,6 +543,10 @@ pub struct Settings {
     /// `None` when `capture.enabled = false`.
     pub capture: Option<CaptureSettings>,
     pub pipeline: PipelineOptions,
+    /// Validated `profile_trust` (pass to
+    /// [`crate::profile_trust::load_profile_with_trust`]; log its
+    /// [`ProfileTrustConfig::warnings`]).
+    pub profile_trust: ProfileTrustConfig,
 }
 
 impl Settings {
@@ -690,6 +712,7 @@ impl Config {
         let capture = self.validate_capture(&mut warnings, default_iface)?;
         let binding = self.binding.validate(&mut warnings)?;
         let motion = self.motion.validate(&mut warnings)?;
+        self.profile_trust.validate()?;
 
         Ok((
             Settings {
@@ -708,6 +731,7 @@ impl Config {
                     max_findings_per_datagram: self.max_findings_per_datagram,
                     motion,
                 },
+                profile_trust: self.profile_trust.clone(),
             },
             warnings,
         ))

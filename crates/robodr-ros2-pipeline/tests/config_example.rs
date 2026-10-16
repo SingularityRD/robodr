@@ -1,6 +1,7 @@
 //! `config/robodr.toml.example` stays in sync with [`Config`]: every key of
 //! the `[module.robodr-sensor-ros2]` section (and its `capture` and
-//! `binding` and `motion` sub-tables, incl. `binding.participant_ips`), including the
+//! `binding`, `motion` and `profile_trust` sub-tables, incl.
+//! `binding.participant_ips`), including the
 //! commented-out examples, is a known field and the result deserialises and
 //! validates.
 //!
@@ -34,6 +35,13 @@ const MOTION_KEYS: &[&str] = &[
     "evaluate_commands",
     "max_writers",
     "max_samples_per_datagram",
+];
+const TRUST_KEYS: &[&str] = &[
+    "trusted_keys",
+    "state_file",
+    "allow_rollback",
+    "expect_platform",
+    "expect_unit_id",
 ];
 const CAPTURE_KEYS: &[&str] = &[
     "enabled",
@@ -72,6 +80,7 @@ struct Sections {
     binding: Map<String, Value>,
     pins: Map<String, Value>,
     motion: Map<String, Value>,
+    trust: Map<String, Value>,
 }
 
 /// (sections, include commented-out `# key = value` lines) -> JSON objects.
@@ -94,6 +103,7 @@ fn sections(text: &str, uncomment: bool) -> Sections {
                 "[module.robodr-sensor-ros2.binding]" => "binding",
                 "[module.robodr-sensor-ros2.binding.participant_ips]" => "pins",
                 "[module.robodr-sensor-ros2.motion]" => "motion",
+                "[module.robodr-sensor-ros2.profile_trust]" => "trust",
                 _ => "other",
             });
             continue;
@@ -136,6 +146,9 @@ fn sections(text: &str, uncomment: bool) -> Sections {
             Some("motion") => {
                 out.motion.insert(k.into(), v);
             }
+            Some("trust") => {
+                out.trust.insert(k.into(), v);
+            }
             _ => {}
         }
     }
@@ -157,11 +170,22 @@ fn example_keys_are_known_and_parse() {
             mut binding,
             pins,
             motion,
+            trust,
         } = sections(&text, uncomment);
         for k in motion.keys() {
             assert!(MOTION_KEYS.contains(&k.as_str()), "unknown motion key {k}");
         }
         assert_eq!(motion.len(), MOTION_KEYS.len(), "{motion:?}");
+        for k in trust.keys() {
+            assert!(
+                TRUST_KEYS.contains(&k.as_str()),
+                "unknown profile_trust key {k}"
+            );
+        }
+        assert!(trust.contains_key("trusted_keys") && trust.contains_key("state_file"));
+        if uncomment {
+            assert_eq!(trust.len(), TRUST_KEYS.len(), "{trust:?}");
+        }
         assert!(top.len() >= 11, "{top:?}");
         for k in [
             "max_findings_per_datagram",
@@ -206,6 +230,7 @@ fn example_keys_are_known_and_parse() {
         obj.insert("capture".into(), Value::Object(cap));
         obj.insert("binding".into(), Value::Object(binding));
         obj.insert("motion".into(), Value::Object(motion));
+        obj.insert("profile_trust".into(), Value::Object(trust));
         let cfg: Config = serde_json::from_value(Value::Object(obj)).unwrap();
         let (settings, _warnings) = cfg.validate_with(|| Some("eth0".into())).unwrap();
         assert!(settings.pipeline.motion.feedback_topics.contains("/odom"));

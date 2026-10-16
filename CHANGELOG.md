@@ -12,6 +12,18 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Added
 
+- Signed, versioned model profiles. `robodr-commission lock` stamps
+  `metadata` (schema / monotonic profile version, platform, unit,
+  locked_by, locked_at, parent digest; `--parent` for lineage) and with
+  `--sign-key` writes `<profile>.sig` (Ed25519 over the exact sealed bytes).
+  New subcommands `keygen`, `sign`, `verify-profile`, `migrate-legacy`.
+  The sensor pipeline (`profile_trust` settings, `load_profile_with_trust`),
+  `robodr-agentd` (`sensor.profile_trust`), `robodr-replay`
+  (`--trusted-keys`, `--profile-state`, `--allow-profile-rollback`) and
+  `robodr-ros2-watch` enforce a locked profile only with a valid signature
+  from a trusted key, and refuse a rollback to a lower `profile_version`
+  (state file) unless the operator names the file's digest.
+
 - Packaging and operations: systemd units for `robodr-pulsard` (root confined
   to a bounded eBPF capability set, read-only OS) and `robodr-agentd`
   (dedicated `robodr` user, `CAP_NET_RAW` only, no IP traffic, key via
@@ -33,6 +45,14 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   evidence export).
 
 ### Changed
+
+- **Breaking:** a locked profile without metadata and a valid signature is
+  no longer enforced (observe-only + `robot.ros2.profile_refused`);
+  migrate with `robodr-commission migrate-legacy` (OPERATIONS.md 5.2).
+  `robodr-commission lock` requires `--platform` and `--profile-version`
+  (or `--parent`). `robodr-replay --profile-version` and agentd's
+  `robot.profile_version` were removed (the version comes from the signed
+  metadata). The plain `robodr_ros2_pipeline::load_profile` trusts no key.
 
 - **Breaking (`robodr-replay`)**: `--key-hex` and `--key-id` are removed (a
   key on argv is readable through `/proc`). `--key-file` now takes a

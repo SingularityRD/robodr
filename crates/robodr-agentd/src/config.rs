@@ -6,9 +6,11 @@
 //!
 //! ```json
 //! {
-//!   "robot":   { "id": "ugv-007", "site": "lab", "profile_version": "v3" },
+//!   "robot":   { "id": "ugv-007", "site": "lab" },
 //!   "sensor":  { "profile_path": "/etc/robodr/profile.json", "listen_spdp": false,
-//!                "capture": { "enabled": true, "interfaces": ["eth0"] } },
+//!                "capture": { "enabled": true, "interfaces": ["eth0"] },
+//!                "profile_trust": { "trusted_keys": "/etc/robodr/profile-trust.json",
+//!                                   "state_file": "/var/lib/robodr/profile-state.json" } },
 //!   "policy_path": "/etc/robodr/policy.json",
 //!   "blackbox": { "dir": "/var/lib/robodr/blackbox", "key_file": "/etc/robodr/blackbox.key" },
 //!   "spool":    { "dir": "/var/spool/robodr/findings", "max_bytes": 67108864 },
@@ -31,6 +33,19 @@
 //!   `feedback_topics` is decoded into `MotionCommand` / `MotionFeedback`
 //!   and fed to the agent. The keys of `motion_monitor.feedback_sources`
 //!   that are ROS topic names are added to `feedback_topics`.
+//! * `sensor.profile_trust` ([`robodr_ros2_pipeline::ProfileTrustConfig`],
+//!   keys [`SENSOR_TRUST_KEYS`]) decides whether a locked profile is
+//!   enforced: it must carry a valid detached signature (`<profile>.sig`)
+//!   from a key in `trusted_keys`, and with `state_file` its
+//!   `profile_version` must not be lower than the last accepted one unless
+//!   `allow_rollback` names its exact digest. Otherwise the daemon runs
+//!   observe-only and reports `robot.ros2.profile_refused`. The rollback
+//!   decision is made by [`resolve`] (so `--check-config` reports it) but
+//!   the state file is only written when the daemon starts
+//!   ([`Resolved::profile_state_commit`]).
+//! * `robot.profile_version` was **removed**: the version reported in
+//!   findings is the signed profile's `metadata.profile_version`. A config
+//!   that still sets it is refused with a message saying so.
 //! * The black-box key is read from `blackbox.key_file`, never from the
 //!   command line: either a `robodr-blackbox-key/v1` JSON key file (as
 //!   written by `robodr-blackbox keygen`; HMAC-SHA256 only, its `key_id` is
@@ -49,7 +64,7 @@ use std::path::{Path, PathBuf};
 use robodr_motion::{FeedbackSource, MonitorConfig};
 use robodr_responder::{Connectivity, ControlMode, MissionPhase, ResponsePolicy, SafetyState};
 use robodr_ros2_pipeline::config::Settings;
-use robodr_ros2_pipeline::{load_profile, LoadedProfile};
+use robodr_ros2_pipeline::{load_profile_deferred, LoadedProfile, StateCommit};
 use serde::Deserialize;
 
 /// Max size of the daemon config, the policy and a monitor config file.
@@ -81,6 +96,7 @@ pub const SENSOR_KEYS: &[&str] = &[
     "capture",
     "binding",
     "motion",
+    "profile_trust",
 ];
 /// Keys of `sensor.capture`.
 pub const SENSOR_CAPTURE_KEYS: &[&str] = &[
@@ -90,6 +106,14 @@ pub const SENSOR_CAPTURE_KEYS: &[&str] = &[
     "domain_ids",
     "read_timeout_ms",
     "queue_capacity",
+];
+/// Keys of `sensor.profile_trust`.
+pub const SENSOR_TRUST_KEYS: &[&str] = &[
+    "trusted_keys",
+    "state_file",
+    "allow_rollback",
+    "expect_platform",
+    "expect_unit_id",
 ];
 /// Keys of `sensor.binding` (`participant_ips` is a free-form map).
 pub const SENSOR_BINDING_KEYS: &[&str] = &[
@@ -142,15 +166,14 @@ pub struct RobotSection {
     /// Robot model for findings; default: the profile's model.
     #[serde(default)]
     pub model: Option<String>,
-    #[serde(default = "default_profile_version")]
-    pub profile_version: String,
+    /// Removed (the version comes from the signed profile's metadata).
+    /// Still parsed so that an old config gets a clear error from
+    /// [`resolve`] instead of a generic "unknown field".
+    #[serde(default)]
+    pub profile_version: Option<serde_json::Value>,
     /// Kafka partition count of `robot-edr.findings`, if known.
     #[serde(default)]
     pub kafka_partitions: Option<u32>,
-}
-
-fn default_profile_version() -> String {
-    "unversioned".into()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -324,8 +347,11 @@ pub struct Resolved {
     pub config: DaemonConfig,
     /// The validated sensor section.
     pub sensor: Settings,
-    /// The profile as loaded (with its commissioning file check).
+    /// The profile as loaded (with its commissioning file and trust check).
     pub profile: LoadedProfile,
+    /// The anti-rollback state write that accepting the profile implies
+    /// (written by the daemon at start, never by `--check-config`).
+    pub profile_state_commit: Option<StateCommit>,
     pub policy: ResponsePolicy,
     pub monitor: Option<MonitorConfig>,
     /// Black-box key bytes (never printed by `Debug`).
@@ -414,6 +440,9 @@ pub fn sensor_settings(v: &serde_json::Value) -> Result<(Settings, Vec<String>),
     if let Some(m) = v.get("motion") {
         check_keys("sensor.motion", m, SENSOR_MOTION_KEYS)?;
     }
+    if let Some(t) = v.get("profile_trust") {
+        check_keys("sensor.profile_trust", t, SENSOR_TRUST_KEYS)?;
+    }
     let cfg: robodr_ros2_pipeline::Config =
         serde_json::from_value(v.clone()).map_err(|e| format!("sensor: {e}"))?;
     if let Some(p) = &cfg.capture.pcap_replay {
@@ -449,6 +478,14 @@ pub fn validate_daemon(d: &DaemonSection) -> Result<(), String> {
 /// Validate a parsed configuration and load every file it names.
 pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
     let mut warnings = Vec::new();
+    if config.robot.profile_version.is_some() {
+        return Err(
+            "robot.profile_version was removed: the profile version is taken from the \
+                    signed profile's metadata (`robodr-commission lock --profile-version`); \
+                    delete the key"
+                .into(),
+        );
+    }
     if !robodr_ocsf::validate::is_valid_robot_id(&config.robot.id) {
         return Err(format!(
             "robot.id {:?} must match [A-Za-z0-9._-]{{1,64}}",
@@ -525,7 +562,9 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
                 .into(),
         );
     }
-    let profile = load_profile(&sensor.profile_path)?;
+    warnings.extend(sensor.profile_trust.warnings());
+    let (profile, profile_state_commit) =
+        load_profile_deferred(&sensor.profile_path, &sensor.profile_trust)?;
     let policy_text = read_capped(&config.policy_path, MAX_CONFIG_BYTES)?;
     let policy = ResponsePolicy::from_json(&policy_text)
         .map_err(|e| format!("{}: {e}", config.policy_path.display()))?;
@@ -580,6 +619,7 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         config,
         sensor,
         profile,
+        profile_state_commit,
         policy,
         monitor,
         key,
@@ -769,7 +809,9 @@ mod tests {
         )
         .unwrap();
         let c = parse(&text).unwrap();
-        sensor_settings(&c.sensor).unwrap();
+        let (s, _) = sensor_settings(&c.sensor).unwrap();
+        assert!(s.profile_trust.trusted_keys.is_some() && s.profile_trust.state_file.is_some());
+        assert!(c.robot.profile_version.is_none());
         validate_daemon(&c.daemon).unwrap();
         assert_eq!(
             c.blackbox.key_file,
@@ -918,6 +960,8 @@ mod tests {
         validate_daemon(&c.daemon).unwrap();
         let (s, _) = sensor_settings(&c.sensor).unwrap();
         assert!(s.capture.is_some() && s.spdp.is_none());
+        assert!(s.profile_trust.trusted_keys.is_some() && s.profile_trust.state_file.is_some());
+        assert!(c.robot.profile_version.is_none());
         assert_eq!(c.event_inputs.len(), 1);
         assert_eq!(c.firewall.unwrap().max_angular["/cmd_vel"], 1.0);
     }

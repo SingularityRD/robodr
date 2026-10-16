@@ -30,6 +30,11 @@
 //!   motion channels and configured feedback topics → `robodr-cdr` →
 //!   `MotionCommand` / `MotionFeedback` ([`Pipeline::process_with_motion_at`]),
 //!   envelope evaluation and motion-sample findings.
+//! - [`profile_trust`]: [`load_profile_with_trust`] adds the trust check
+//!   (detached Ed25519 signature from a trusted key, profile metadata,
+//!   platform/unit binding, anti-rollback state) configured by the
+//!   `profile_trust` sub-table; a locked profile that fails it is refused
+//!   for enforcement the same way. The plain [`load_profile`] trusts no key.
 //! - [`binding`]: the participant ↔ source-IP binding table. SEDP endpoint
 //!   announcements are judged against the IPs and locators their
 //!   participant's SPDP came from (or `participant_ips` pins), so a rogue
@@ -68,6 +73,7 @@ pub mod config;
 pub mod dedup;
 pub mod motion;
 pub mod pipeline;
+pub mod profile_trust;
 pub mod ratelimit;
 pub mod sanitize;
 pub mod socket;
@@ -83,6 +89,9 @@ pub use motion::{MotionOptions, MotionSample, MotionStats};
 pub use pipeline::{
     load_profile, rules, Finding, LoadedProfile, Pipeline, PipelineOptions, PipelineStats,
     ProcessOutput, ProfileStatus, ThreatExtra, OBSERVE_ONLY_TAG,
+};
+pub use profile_trust::{
+    load_profile_deferred, load_profile_with_trust, ProfileTrustConfig, StateCommit,
 };
 pub use sanitize::{sanitize, MAX_TEXT_CHARS};
 pub use source::{

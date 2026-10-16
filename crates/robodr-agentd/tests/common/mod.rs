@@ -50,17 +50,53 @@ pub struct Setup {
     pub spool: PathBuf,
 }
 
-/// Write the sealed (locked) lab profile, the OEM-validated demo policy and
-/// a 0600 key file.
-pub fn setup(tag: &str, profile: &Profile) -> Setup {
-    let dir = tmpdir(tag);
-    let profile_path = dir.join("profile.json");
+/// The test profile-signing key (Ed25519).
+pub fn profile_key() -> robodr_blackbox::Ed25519SigningKey {
+    robodr_blackbox::Ed25519SigningKey::from_seed("test-profile-key", &[0x24; 32]).unwrap()
+}
+
+/// Version-1 metadata for a locked test profile.
+pub fn metadata(version: u64) -> robodr_events::profile::ProfileMetadata {
+    robodr_events::profile::ProfileMetadata {
+        schema_version: robodr_events::profile::PROFILE_SCHEMA_VERSION,
+        profile_version: version,
+        platform: "ugv-lab".into(),
+        unit_id: Some(ROBOT.into()),
+        locked_by: "Test Operator".into(),
+        locked_at: 1_790_000_000,
+        parent_digest: None,
+    }
+}
+
+/// Write `profile` to `path` as `robodr-commission lock --sign-key` would:
+/// a locked profile gets metadata (if it has none), is sealed and signed
+/// (`<path>.sig`); a draft is written as plain JSON.
+pub fn write_profile(path: &Path, profile: &Profile) {
     let text = if profile.locked {
-        robodr_commission::sealed_text(profile).unwrap()
+        let mut p = profile.clone();
+        p.metadata.get_or_insert_with(|| metadata(1));
+        let text = robodr_commission::sealed_text(&p).unwrap();
+        let sig =
+            robodr_commission::ProfileSignature::create(text.as_bytes(), &profile_key()).unwrap();
+        std::fs::write(robodr_commission::sig_path_for(path), sig.to_text()).unwrap();
+        text
     } else {
         serde_json::to_string_pretty(profile).unwrap()
     };
-    std::fs::write(&profile_path, text).unwrap();
+    std::fs::write(path, text).unwrap();
+}
+
+/// Write the sealed, signed (locked) lab profile and its trust file, the
+/// OEM-validated demo policy and a 0600 key file.
+pub fn setup(tag: &str, profile: &Profile) -> Setup {
+    let dir = tmpdir(tag);
+    let profile_path = dir.join("profile.json");
+    write_profile(&profile_path, profile);
+    std::fs::write(
+        dir.join("profile-trust.json"),
+        robodr_commission::trust::trust_keys_text(&[profile_key().verifying_key()]),
+    )
+    .unwrap();
     let policy = dir.join("policy.json");
     std::fs::copy(
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -93,6 +129,10 @@ impl Setup {
         let mut sensor = serde_json::json!({
             "profile_path": self.profile,
             "listen_spdp": false,
+            "profile_trust": {
+                "trusted_keys": self.dir.join("profile-trust.json"),
+                "state_file": self.dir.join("profile-state.json"),
+            },
         });
         merge(&mut sensor, sensor_extra);
         let mut d = serde_json::json!({
@@ -104,7 +144,7 @@ impl Setup {
         });
         merge(&mut d, daemon);
         serde_json::json!({
-            "robot": {"id": ROBOT, "site": "lab", "profile_version": "test-1"},
+            "robot": {"id": ROBOT, "site": "lab"},
             "sensor": sensor,
             "policy_path": self.policy,
             "blackbox": {"dir": self.blackbox, "key_file": self.key, "key_id": KEY_ID,

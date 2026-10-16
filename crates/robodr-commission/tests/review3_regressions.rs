@@ -719,6 +719,10 @@ fn f7_cli_merge_and_lock_take_hard_cap_flags() {
     let locked = d.join("locked.json");
     let o = run(&[
         "lock",
+        "--platform",
+        "ugv-test",
+        "--profile-version",
+        "1",
         "--in",
         &s(&m),
         "--signoff",
@@ -731,6 +735,10 @@ fn f7_cli_merge_and_lock_take_hard_cap_flags() {
     assert!(!locked.exists());
     let o = run(&[
         "lock",
+        "--platform",
+        "ugv-test",
+        "--profile-version",
+        "1",
         "--in",
         &s(&m),
         "--signoff",

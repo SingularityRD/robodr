@@ -92,11 +92,36 @@ estop_active | safe_state_active | unknown (default unknown).
 .B \-\-no\-operator
 No operator present.
 .TP
-.BI \-\-site " NAME\fR, " \-\-model " NAME\fR, " \-\-profile\-version " V\fR, " \-\-boot\-id " ID"
+.BI \-\-site " NAME\fR, " \-\-model " NAME\fR, " \-\-boot\-id " ID"
 Context and identity fields recorded with the evidence and findings.
 Without
 .BR \-\-model ,
-the profile's model is used.
+the profile's model is used. The profile version in findings is the signed
+profile's
+.B metadata.profile_version
+(\fBdraft\fR for an unlocked profile, \fBuntrusted\fR for a refused one).
+.B \-\-profile\-version
+was removed; passing it is a usage error that says so.
+.TP
+.BI \-\-trusted\-keys " trust.json"
+Trusted profile signing keys
+.RI ( robodr\-profile\-trust/v1 ,
+from
+.BR "robodr\-commission keygen" ).
+A locked profile is enforced only if it carries metadata and a valid
+.IB profile .sig
+from one of these keys. Without this option, or if the check fails, the
+replay runs observe\-only and its first finding is
+.BR robot.ros2.profile_refused .
+.TP
+.BI \-\-profile\-state " FILE"
+Anti\-rollback state: refuse a profile older than the last one accepted, and
+record a newer one. Off by default (forensic replays of old recordings
+legitimately use old profiles).
+.TP
+.BI \-\-allow\-profile\-rollback " sha256:HEX"
+Accept the one older profile file with exactly this digest despite
+.BR \-\-profile\-state .
 .TP
 .BI \-\-start\-ms " EPOCH_MS\fR, " \-\-step\-ms " MS"
 Synthetic clock: start time and step per event.

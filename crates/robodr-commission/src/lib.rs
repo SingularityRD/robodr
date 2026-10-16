@@ -23,6 +23,10 @@
 //! * [`profile_file`]: strict profile parsing, the lock seal, and
 //!   symlink-safe, no-clobber, atomic file writes.
 //! * [`stats`]: nearest-rank percentiles and bounded sample buffers.
+//! * [`trust`]: profile metadata, detached Ed25519 signatures
+//!   (`<profile>.sig`), trust anchors and anti-rollback state: what every
+//!   loader (sensor pipeline, agent replay, agentd) calls before it
+//!   enforces a locked profile.
 //!
 //! Security review (learning-time poisoning, hostile input, file handling):
 //! see the `learner` module docs (anti-poisoning gate, hard caps, memory
@@ -62,6 +66,7 @@ pub mod ops;
 pub mod profile_file;
 pub mod signoff;
 pub mod stats;
+pub mod trust;
 
 pub use input::{
     CaptureDiagnostics, EventSource, InputError, InputSpec, JsonlSource, Origin, PcapSource,
@@ -82,6 +87,11 @@ pub use profile_file::{
 };
 pub use signoff::{Signoff, SignoffItem};
 pub use stats::{SampleBuffer, SpeedStats};
+pub use trust::{
+    check_rollback, enforce_rollback, file_digest, load_trust_keys, sig_path_for,
+    verify_profile_file, verify_profile_text, AcceptedState, ProfileSignature, ProfileTrustError,
+    RollbackDecision, TrustPolicy, VerifiedProfile,
+};
 
 /// Serialise a value as pretty JSON with a trailing newline. All file output
 /// goes through here so `learn` twice over the same input is byte-identical.

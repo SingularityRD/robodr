@@ -160,7 +160,18 @@ robodr-commission learn (--events run.jsonl | --pcap run.pcapng) [...] [--model 
                         --out profile.json [--signoff signoff.json]
                         [--report report.json] [--quiet] [--force]
 robodr-commission lock    --in profile.json --signoff signoff.json --out locked.json
+                          (--parent previous-locked.json | --platform P --profile-version N)
+                          [--unit-id U] [--sign-key signing.key] [--trusted-keys trust.json]
+                          [--locked-at UNIX_SECS]
                           [--hard-cap-linear 10] [--hard-cap-joint 10] [--force]
+robodr-commission sign    --profile locked.json --sign-key signing.key [--force]
+robodr-commission verify-profile --profile locked.json --trusted-keys trust.json
+                          [--expect-platform P] [--expect-unit U]
+                          [--state profile-state.json] [--allow-rollback sha256:HEX] [--json]
+robodr-commission keygen  --out signing.key --trust-out trust.json [--key-id ID]
+robodr-commission migrate-legacy --in legacy-locked.json --out locked.json
+                          --platform P --profile-version N --operator NAME
+                          --sign-key signing.key [--unit-id U] [--locked-at UNIX_SECS]
 robodr-commission signoff --in profile.json --out signoff.json [--force]
 robodr-commission diff    old.json new.json [--json]
 robodr-commission check   --profile locked.json (--events run.jsonl | --pcap run.pcap) [...] [--json]
@@ -171,7 +182,8 @@ robodr-commission merge   --out merged.json a.json b.json [...]
 Exit codes:
 
 * `0`: ok, clean, or identical
-* `1`: a negative result (deviations found, profiles differ, or lock refused)
+* `1`: a negative result (deviations found, profiles differ, lock refused,
+  or `verify-profile` refused the profile)
 * `2`: a usage, input or I/O error
 
 Every output is written to a fresh temp file in the destination directory
@@ -231,6 +243,20 @@ valid seal if locked.
     time: an empty model, a non-finite or negative bound, a GUID that is not
     24 lower-case hex characters, a ROS name that is mangled (`rt/x`) or
     relative, or an empty raw topic or channel
+* **Versioned, signed artifact** (`trust` module). `lock` stamps
+  `metadata` (`schema_version`, monotonic `profile_version`, `platform`,
+  optional `unit_id`, `locked_by` = the sign-off operator, `locked_at`,
+  `parent_digest` = `sha256:` of the locked file it supersedes, via
+  `--parent`) and, with `--sign-key`, writes `<out>.sig`: Ed25519 (the
+  robodr-blackbox implementation, through its `Signer`/`Verifier` traits)
+  over a domain tag and the exact sealed bytes. Every loader (sensor
+  pipeline, agentd, `robodr-replay`, `robodr-ros2-watch`) enforces a locked
+  profile only with metadata and a valid signature from a key in its trust
+  file, and (with a state file) refuses a lower `profile_version` unless the
+  operator names the exact file digest. A locked profile without metadata
+  (locked before versioning) is refused; `migrate-legacy` re-issues it.
+  Limits: the Ed25519 code is not audited; the anti-rollback state is a
+  plain file root can reset; no revocation list.
 
   The locked file is **sealed**: its first member is
   `"seal": "sha256:<hex>"` over the rest of the file. `check`, `diff` and
@@ -349,8 +375,13 @@ refusing to lock profile.json:
   - not confirmed by the operator: motion_writer:/cmd_vel 01103f5a8c2e000000000101 (...)
   ...
 $ $EDITOR profile.json.signoff.json   # review each item, set "confirmed": true, fill "operator"
-$ robodr-commission lock --in profile.json --signoff profile.json.signoff.json --out locked.json
-locked profile ugv-demo-synthetic -> locked.json (sealed; signed off by "...")
+$ robodr-commission keygen --out oem.key --trust-out trust.json --key-id oem-demo
+$ robodr-commission lock --in profile.json --signoff profile.json.signoff.json --out locked.json \
+    --platform ugv-demo --profile-version 1 --sign-key oem.key
+locked profile ugv-demo-synthetic -> locked.json (sealed; profile_version 1, platform ugv-demo; ...)
+signed by oem-demo -> locked.json.sig
+$ robodr-commission verify-profile --profile locked.json --trusted-keys trust.json
+TRUSTED locked.json: model "ugv-demo-synthetic", profile_version 1, ...
 
 $ robodr-commission check --profile locked.json --events examples/clean-run.jsonl
 0 deviation(s) over 186 event(s) against profile ugv-demo-synthetic

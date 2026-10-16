@@ -30,6 +30,16 @@ pub fn run(data: &[u8]) {
             .unwrap_or_else(|e| panic!("re-sealed profile refused: {e}\n{sealed}"));
         assert!(back.locked);
         assert_eq!(back.participants, p.participants);
+        assert_eq!(back.metadata, p.metadata, "metadata lost by re-sealing");
+        // The trust check never panics and never trusts a locked profile
+        // without trust anchors.
+        let r = robodr_commission::verify_profile_text(
+            text,
+            Some(text),
+            "fuzz.sig",
+            &robodr_commission::TrustPolicy::default(),
+        );
+        assert!(r.is_err(), "locked profile trusted without anchors");
     } else {
         let so = Signoff::for_profile(&p).confirm_all("fuzz-operator");
         assert_eq!(

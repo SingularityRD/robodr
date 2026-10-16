@@ -97,6 +97,10 @@ fn confirm(path: &Path) {
 fn lock_cli(draft: &Path, signoff: &Path, out: &Path) -> Output {
     run(&[
         "lock",
+        "--platform",
+        "ugv-test",
+        "--profile-version",
+        "1",
         "--in",
         s(draft),
         "--signoff",

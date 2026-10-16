@@ -35,7 +35,9 @@ USAGE:
                 [--safety-state STATE] [--control autonomous|teleop|manual]
                 [--phase parked|transit|task|takeoff|landing|unknown]
                 [--connectivity connected|degraded|disconnected] [--no-operator]
-                [--site NAME] [--model NAME] [--profile-version V] [--boot-id ID]
+                [--site NAME] [--model NAME] [--boot-id ID]
+                [--trusted-keys trust.json] [--profile-state FILE]
+                [--allow-profile-rollback sha256:HEX]
                 [--start-ms EPOCH_MS] [--step-ms MS]
                 [--firewall] [--firewall-allow CHANNEL=GUID[,GUID...]]...
                 [--firewall-max-angular CHANNEL=RAD_PER_S]...
@@ -55,6 +57,12 @@ USAGE:
   and its key id is used. Keys are never taken on the command line.
   The HMAC key (>= 32 bytes) is a placeholder authenticator (see robodr-blackbox).
   --blackbox must be absent or empty (a replay starts a fresh chain).
+  A locked profile is enforced only with a valid <profile>.sig from a key in
+  --trusted-keys (robodr-profile-trust/v1); otherwise the replay is
+  observe-only and its first finding is robot.ros2.profile_refused. The
+  profile version in findings comes from the signed profile's metadata.
+  --profile-state enables anti-rollback (off by default: replays of old
+  recordings legitimately use old profiles).
   A replay never acts: --log-plans only prints what would have been requested.
 
 EXIT: 0 ok and verified, 1 verification failed, 2 error,
@@ -76,8 +84,10 @@ const VALUED: &[&str] = &[
     "connectivity",
     "site",
     "model",
-    "profile-version",
     "boot-id",
+    "trusted-keys",
+    "profile-state",
+    "allow-profile-rollback",
     "start-ms",
     "step-ms",
     "firewall-allow",
@@ -106,6 +116,12 @@ const REMOVED: &[(&str, &str)] = &[
     (
         "key-id",
         "--key-id was removed: the key id comes from the --key-file",
+    ),
+    (
+        "profile-version",
+        "--profile-version was removed: the version is taken from the signed profile's \
+         metadata (`robodr-commission lock --profile-version N`); pass --trusted-keys so the \
+         profile is verified",
     ),
 ];
 
@@ -231,8 +247,11 @@ fn options(a: &Args) -> Result<ReplayOptions, String> {
         o.site = v.into();
     }
     o.model = a.one("model")?.map(str::to_string);
-    if let Some(v) = a.one("profile-version")? {
-        o.profile_version = v.into();
+    o.trusted_keys = a.one("trusted-keys")?.map(PathBuf::from);
+    o.profile_state = a.one("profile-state")?.map(PathBuf::from);
+    o.allow_profile_rollback = a.one("allow-profile-rollback")?.map(str::to_string);
+    if let Some(f) = &o.allow_profile_rollback {
+        robodr_commission::trust::validate_rollback_flag(f)?;
     }
     if let Some(v) = a.one("boot-id")? {
         o.boot_id = v.into();
@@ -332,6 +351,15 @@ fn run_cmd(a: &Args) -> Result<Verdict, String> {
         w.flush().map_err(|e| format!("writing outcomes: {e}"))?;
     }
 
+    match &summary.profile_refused {
+        Some(why) => eprintln!(
+            "profile: NOT enforced (observe-only): {}",
+            why.chars()
+                .map(|c| if c.is_control() { '?' } else { c })
+                .collect::<String>()
+        ),
+        None => eprintln!("profile: version {}", summary.profile_version),
+    }
     let s = summary.stats;
     eprintln!(
         "replay: {} events, {} deviations {:?}, {} findings written ({} failed), dispositions {:?}",

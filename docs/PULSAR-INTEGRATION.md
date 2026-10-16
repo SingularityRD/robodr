@@ -224,6 +224,19 @@ opens it from its own config section in `init_state`.
   | valid, `locked = false` | `observing` | `mode = "observe"`, `observe_only = true`, description starts with `[observe-only] `, module warning raised |
   | fails validation | `refused` | as observing, plus: every error logged, one module warning, one `robot.ros2.profile_refused` (High, observe-only) threat |
   | `locked = true`, file check fails (edited after lock, no seal) | `refused` | same as above, with the file-check reason |
+  | `locked = true`, not trusted (no metadata, no / bad `<profile>.sig`, key not in `profile_trust.trusted_keys`, wrong platform/unit, refused by anti-rollback) | `refused` | same as above, with the trust reason |
+
+  Profile trust is configured in `[module.robodr-sensor-ros2.profile_trust]`
+  (`robodr_ros2_pipeline::ProfileTrustConfig`, see
+  `config/robodr.toml.example`) and checked by
+  `robodr_ros2_pipeline::load_profile_with_trust`. **Integration
+  follow-up:** `robodr-sensor-ros2` still calls the trust-less
+  `load_profile` (it cannot be built in the offline environment where the
+  trust check was added), which trusts no key, so a locked profile runs
+  observe-only under Pulsar until that call becomes
+  `load_profile_with_trust(&settings.profile_path, &settings.profile_trust)`
+  and `settings.profile_trust.warnings()` are logged. `robodr-agentd`
+  is wired.
 
   **Decision (fail closed): a refused profile is never enforced, and the
   sensor keeps running observe-only.**

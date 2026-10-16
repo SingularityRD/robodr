@@ -16,14 +16,25 @@
 //! are published together by
 //! [`write_files_atomic`](robodr_commission::write_files_atomic) (all temps
 //! first; a failed publish rolls back what was already published).
+//!
+//! Signing: `lock --sign-key` (and `sign`, `migrate-legacy`) write the
+//! detached Ed25519 signature `<out>.sig` over the exact sealed bytes, as a
+//! unit with the profile. `verify-profile` runs the same trust check the
+//! loaders run (see `robodr_commission::trust`). Signing keys are read only
+//! from mode-0600 key files, never from the command line.
 
 use robodr_commission::input::{self, InputSpec};
 use robodr_commission::profile_file::{check_destination, read_regular_file, MAX_PROFILE_BYTES};
+use robodr_commission::trust::{
+    check_rollback, file_digest, load_signing_key, load_state, load_trust_keys, new_signing_key,
+    sig_path_for, trust_keys_text, validate_rollback_flag, verify_profile_file, ProfileSignature,
+    TrustPolicy,
+};
 use robodr_commission::{
     diff, lock_draft_text_with_caps, merge_profiles_with_caps, parse_profile_text, sealed_text,
     to_json, write_files_atomic, Checker, HardCaps, LearnConfig, Learner, Signoff,
 };
-use robodr_events::profile::Profile;
+use robodr_events::profile::{Profile, ProfileMetadata, PROFILE_SCHEMA_VERSION};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -44,7 +55,20 @@ USAGE:
                           --out profile.json [--signoff signoff.json]
                           [--report report.json] [--quiet] [--force]
   robodr-commission lock    --in profile.json --signoff signoff.json --out locked.json
+                          (--parent previous-locked.json | --platform P --profile-version N)
+                          [--platform P] [--unit-id U] [--profile-version N]
+                          [--sign-key signing.key] [--trusted-keys trust.json]
+                          [--locked-at UNIX_SECS]
                           [--hard-cap-linear 10] [--hard-cap-joint 10] [--force]
+  robodr-commission sign    --profile locked.json --sign-key signing.key [--force]
+  robodr-commission verify-profile --profile locked.json --trusted-keys trust.json
+                          [--expect-platform P] [--expect-unit U]
+                          [--state profile-state.json] [--allow-rollback sha256:HEX] [--json]
+  robodr-commission keygen  --out signing.key --trust-out trust.json [--key-id ID]
+  robodr-commission migrate-legacy --in legacy-locked.json --out locked.json
+                          --platform P --profile-version N --operator NAME
+                          --sign-key signing.key [--unit-id U] [--locked-at UNIX_SECS]
+                          [--force]
   robodr-commission signoff --in profile.json --out signoff.json [--force]
   robodr-commission diff    <old.json> <new.json> [--json]
   robodr-commission check   --profile locked.json (--events <f> | --pcap <f>) [...] [--json]
@@ -70,6 +94,17 @@ USAGE:
   learn writes a sign-off list (default <out>.signoff.json); lock refuses
   until a named \"operator\" has set \"confirmed\": true on every item.
   signoff builds a conservative list for an edited or merged draft.
+  lock stamps metadata (schema/profile version, platform, unit, locked_by =
+  sign-off operator, locked_at, parent digest): with --parent the version
+  defaults to the parent's + 1 and must be higher, platform/unit default to
+  the parent's, and the parent's file digest is recorded (rollback lineage).
+  --sign-key writes <out>.sig (Ed25519 over the exact sealed bytes) with
+  the profile; loaders refuse a locked profile without a valid signature
+  from a trusted key. keygen makes an Ed25519 key file (mode 0600) and a
+  trust file holding its public key. verify-profile is read-only (exit 0
+  trusted, 1 refused). migrate-legacy re-issues a locked profile from
+  before metadata existed (content unchanged, its digest recorded as
+  parent).
   Outputs never overwrite an existing file or follow a symlink unless
   --force (symlinks are refused even then).
 
@@ -225,6 +260,10 @@ fn main() -> ExitCode {
     let result = match cmd.as_str() {
         "learn" => cmd_learn(rest),
         "lock" => cmd_lock(rest),
+        "sign" => cmd_sign(rest),
+        "verify-profile" => cmd_verify_profile(rest),
+        "keygen" => cmd_keygen(rest),
+        "migrate-legacy" => cmd_migrate_legacy(rest),
         "diff" => cmd_diff(rest),
         "check" => cmd_check(rest),
         "merge" => cmd_merge(rest),
@@ -488,10 +527,146 @@ fn cmd_learn(argv: &[String]) -> Outcome {
     Ok(())
 }
 
+fn now_unix() -> Result<u64, String> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|_| "system clock is before 1970; pass --locked-at".to_string())
+}
+
+/// `--locked-at` or the current time.
+fn locked_at(a: &Args) -> Result<u64, String> {
+    match a.u64_opt("locked-at")? {
+        Some(0) => Err("--locked-at must be > 0".into()),
+        Some(t) => Ok(t),
+        None => now_unix(),
+    }
+}
+
+/// Seal `profile` and, with a signing key, sign the sealed bytes. Returns
+/// `(profile text, signature text)`.
+fn seal_and_sign(
+    profile: &Profile,
+    key: Option<&robodr_blackbox::Ed25519SigningKey>,
+) -> Result<(String, Option<String>), String> {
+    let text = sealed_text(profile).map_err(|e| format!("serialise: {e}"))?;
+    let sig = key
+        .map(|k| {
+            ProfileSignature::create(text.as_bytes(), k)
+                .map(|s| s.to_text())
+                .map_err(|e| e.to_string())
+        })
+        .transpose()?;
+    Ok((text, sig))
+}
+
+/// Write a locked profile and (if any) its signature as one unit.
+fn write_locked(out: &str, text: &str, sig: Option<&str>, force: bool) -> Result<(), String> {
+    let sig_path = sig_path_for(Path::new(out)).display().to_string();
+    let mut files = vec![(out, text)];
+    if let Some(s) = sig {
+        files.push((sig_path.as_str(), s));
+    }
+    write_files(&files, force)
+}
+
+/// The metadata `lock` stamps (see USAGE).
+fn lock_metadata(a: &Args, draft: &Profile, operator: &str) -> Result<ProfileMetadata, String> {
+    let mut platform = a.one("platform")?.map(str::to_string);
+    let mut unit_id = a.one("unit-id")?.map(str::to_string);
+    let mut version = a.u64_opt("profile-version")?;
+    let mut parent_digest = None;
+    if let Some(parent) = a.one("parent")? {
+        let text = read_text(parent, MAX_PROFILE_BYTES)?;
+        let pp = parse_profile_text(&text).map_err(|e| format!("--parent {parent}: {e}"))?;
+        let Some(pm) = pp.metadata.as_ref().filter(|_| pp.locked) else {
+            return Err(format!(
+                "--parent {parent}: not a versioned locked profile (migrate a legacy profile \
+                 with `migrate-legacy` first)"
+            ));
+        };
+        if let Some(tk) = a.one("trusted-keys")? {
+            let policy = TrustPolicy {
+                anchors: Some(load_trust_keys(Path::new(tk)).map_err(|e| e.to_string())?),
+                ..Default::default()
+            };
+            verify_profile_file(Path::new(parent), &policy)
+                .map_err(|e| format!("--parent {parent}: {e}"))?
+                .map_err(|e| format!("--parent {parent}: {e}"))?;
+        }
+        if pp.model != draft.model {
+            return Err(format!(
+                "--parent {parent} is for model {:?}, the draft is {:?}",
+                pp.model, draft.model
+            ));
+        }
+        match &platform {
+            Some(p) if p != &pm.platform => {
+                return Err(format!(
+                    "--platform {p:?} differs from the parent's {:?}",
+                    pm.platform
+                ))
+            }
+            _ => platform = Some(pm.platform.clone()),
+        }
+        if unit_id.is_none() {
+            unit_id = pm.unit_id.clone();
+        } else if pm.unit_id.is_some() && unit_id != pm.unit_id {
+            return Err(format!(
+                "--unit-id {unit_id:?} differs from the parent's {:?}",
+                pm.unit_id
+            ));
+        }
+        let next = pm
+            .profile_version
+            .checked_add(1)
+            .ok_or("parent profile_version is u64::MAX; cannot supersede it")?;
+        match version {
+            Some(v) if v <= pm.profile_version => {
+                return Err(format!(
+                    "--profile-version {v} must be higher than the parent's {}",
+                    pm.profile_version
+                ))
+            }
+            Some(_) => {}
+            None => version = Some(next),
+        }
+        parent_digest = Some(file_digest(text.as_bytes()));
+    }
+    let meta = ProfileMetadata {
+        schema_version: PROFILE_SCHEMA_VERSION,
+        profile_version: version.ok_or("--profile-version (or --parent) is required")?,
+        platform: platform.ok_or("--platform (or --parent) is required")?,
+        unit_id,
+        locked_by: operator.trim().to_string(),
+        locked_at: locked_at(a)?,
+        parent_digest,
+    };
+    let errs = meta.validate();
+    if !errs.is_empty() {
+        let list: Vec<String> = errs.iter().map(ToString::to_string).collect();
+        return Err(format!("profile metadata: {}", list.join("; ")));
+    }
+    Ok(meta)
+}
+
 fn cmd_lock(argv: &[String]) -> Outcome {
     let a = Args::parse(
         argv,
-        &["in", "out", "signoff", "hard-cap-linear", "hard-cap-joint"],
+        &[
+            "in",
+            "out",
+            "signoff",
+            "hard-cap-linear",
+            "hard-cap-joint",
+            "platform",
+            "unit-id",
+            "profile-version",
+            "parent",
+            "sign-key",
+            "trusted-keys",
+            "locked-at",
+        ],
         &["force"],
     )?;
     if let Some(p) = a.positionals.first() {
@@ -501,19 +676,52 @@ fn cmd_lock(argv: &[String]) -> Outcome {
     let input = a.required("in")?;
     let out = a.required("out")?;
     let signoff_path = a.required("signoff")?;
-    distinct_paths(&[out], &[input, signoff_path])?;
+    let sig_out = sig_path_for(Path::new(out)).display().to_string();
+    let mut inputs = vec![input, signoff_path];
+    inputs.extend(a.one("parent")?);
+    inputs.extend(a.one("sign-key")?);
+    distinct_paths(&[out, sig_out.as_str()], &inputs)?;
+    let key = a
+        .one("sign-key")?
+        .map(|k| load_signing_key(Path::new(k)))
+        .transpose()?;
     let draft = read_text(input, MAX_PROFILE_BYTES)?;
     // An unreadable draft is an input error (exit 2), not a refusal.
-    parse_profile_text(&draft).map_err(|e| format!("{input}: {e}"))?;
+    let parsed = parse_profile_text(&draft).map_err(|e| format!("{input}: {e}"))?;
     let signoff = load_signoff(signoff_path)?;
+    // Flag / parent errors are usage errors (exit 2) and are reported
+    // before the lock decision; the operator name is checked by the lock
+    // itself (a refusal, exit 1), so a placeholder stands in for it here.
+    lock_metadata(&a, &parsed, "pending-sign-off")?;
     match lock_draft_text_with_caps(&draft, &signoff, &caps) {
-        Ok(locked) => {
-            let text = sealed_text(&locked).map_err(|e| format!("serialise: {e}"))?;
-            write_file(out, &text, a.switch("force"))?;
+        Ok(mut locked) => {
+            locked.metadata = Some(lock_metadata(&a, &parsed, &signoff.operator)?);
+            if let Err(errs) = locked.validate() {
+                let list: Vec<String> = errs.iter().map(ToString::to_string).collect();
+                return Err(format!("locked profile fails validation: {}", list.join("; ")).into());
+            }
+            let (text, sig) = seal_and_sign(&locked, key.as_ref())?;
+            write_locked(out, &text, sig.as_deref(), a.switch("force"))?;
+            let m = locked.metadata.as_ref().expect("set above");
             eprintln!(
-                "locked profile {} -> {out} (sealed; signed off by {:?})",
-                locked.model, signoff.operator
+                "locked profile {} -> {out} (sealed; profile_version {}, platform {}; signed off \
+                 by {:?}; digest {})",
+                locked.model,
+                m.profile_version,
+                m.platform,
+                signoff.operator,
+                file_digest(text.as_bytes())
             );
+            match &key {
+                Some(k) => eprintln!(
+                    "signed by {} -> {sig_out}",
+                    robodr_blackbox::Signer::key_id(k)
+                ),
+                None => eprintln!(
+                    "warning: NOT signed: loaders refuse to enforce it until signed \
+                     (`robodr-commission sign --profile {out} --sign-key <key>`)"
+                ),
+            }
             Ok(())
         }
         Err(reasons) => {
@@ -524,6 +732,239 @@ fn cmd_lock(argv: &[String]) -> Outcome {
             Err(Failure::Negative)
         }
     }
+}
+
+fn cmd_sign(argv: &[String]) -> Outcome {
+    let a = Args::parse(argv, &["profile", "sign-key"], &["force"])?;
+    if let Some(p) = a.positionals.first() {
+        return Err(format!("unexpected argument {p:?}").into());
+    }
+    let profile = a.required("profile")?;
+    let key_path = a.required("sign-key")?;
+    let sig_out = sig_path_for(Path::new(profile)).display().to_string();
+    distinct_paths(&[sig_out.as_str()], &[profile, key_path])?;
+    let key = load_signing_key(Path::new(key_path))?;
+    let text = read_text(profile, MAX_PROFILE_BYTES)?;
+    let p = parse_profile_text(&text).map_err(|e| format!("{profile}: {e}"))?;
+    if !p.locked {
+        return Err(format!("{profile}: not locked (drafts are not signed)").into());
+    }
+    if p.metadata.is_none() {
+        return Err(format!(
+            "{profile}: legacy locked profile without metadata; use `migrate-legacy`"
+        )
+        .into());
+    }
+    let sig = ProfileSignature::create(text.as_bytes(), &key).map_err(|e| e.to_string())?;
+    write_file(&sig_out, &sig.to_text(), a.switch("force"))?;
+    eprintln!(
+        "signed {profile} ({}) by {} -> {sig_out}",
+        sig.profile_digest, sig.key_id
+    );
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct VerifyReport {
+    trusted: bool,
+    profile: String,
+    digest: Option<String>,
+    model: Option<String>,
+    locked: Option<bool>,
+    profile_version: Option<u64>,
+    platform: Option<String>,
+    unit_id: Option<String>,
+    signed_by: Option<String>,
+    rollback: Option<String>,
+    refused: Option<String>,
+}
+
+fn cmd_verify_profile(argv: &[String]) -> Outcome {
+    let a = Args::parse(
+        argv,
+        &[
+            "profile",
+            "trusted-keys",
+            "expect-platform",
+            "expect-unit",
+            "state",
+            "allow-rollback",
+        ],
+        &["json"],
+    )?;
+    if let Some(p) = a.positionals.first() {
+        return Err(format!("unexpected argument {p:?}").into());
+    }
+    let path = a.required("profile")?;
+    let allow = a.one("allow-rollback")?;
+    if let Some(f) = allow {
+        validate_rollback_flag(f)?;
+    }
+    let anchors =
+        load_trust_keys(Path::new(a.required("trusted-keys")?)).map_err(|e| e.to_string())?;
+    let policy = TrustPolicy {
+        anchors: Some(anchors),
+        expect_platform: a.one("expect-platform")?.map(str::to_string),
+        expect_unit_id: a.one("expect-unit")?.map(str::to_string),
+    };
+    let result =
+        verify_profile_file(Path::new(path), &policy).map_err(|e| format!("{path}: {e}"))?;
+    let mut r = VerifyReport {
+        trusted: false,
+        profile: path.to_string(),
+        digest: None,
+        model: None,
+        locked: None,
+        profile_version: None,
+        platform: None,
+        unit_id: None,
+        signed_by: None,
+        rollback: None,
+        refused: None,
+    };
+    match result {
+        Ok(v) => {
+            let m = v.profile.metadata.as_ref();
+            r.digest = Some(v.digest.clone());
+            r.model = Some(v.profile.model.clone());
+            r.locked = Some(v.profile.locked);
+            r.profile_version = m.map(|m| m.profile_version);
+            r.platform = m.map(|m| m.platform.clone());
+            r.unit_id = m.and_then(|m| m.unit_id.clone());
+            r.signed_by = v.signed_by.clone();
+            r.trusted = v.profile.locked;
+            if !v.profile.locked {
+                r.refused = Some("unlocked draft: observe-only, nothing to trust".into());
+            }
+            if let Some(sp) = a.one("state")? {
+                let st = load_state(Path::new(sp)).map_err(|e| e.to_string());
+                match st.and_then(|st| {
+                    check_rollback(st.as_ref(), &v, allow).map_err(|e| e.to_string())
+                }) {
+                    Ok(d) => r.rollback = Some(format!("{d:?}")),
+                    Err(e) => {
+                        r.trusted = false;
+                        r.refused = Some(e);
+                    }
+                }
+            }
+        }
+        Err(e) => r.refused = Some(e.to_string()),
+    }
+    if a.switch("json") {
+        print!("{}", json(&r)?);
+    } else if r.trusted {
+        println!(
+            "TRUSTED {path}: model {:?}, profile_version {}, platform {:?}, unit {:?}, signed by \
+             {:?}, digest {}{}",
+            r.model.as_deref().unwrap_or_default(),
+            r.profile_version.unwrap_or_default(),
+            r.platform.as_deref().unwrap_or_default(),
+            r.unit_id,
+            r.signed_by.as_deref().unwrap_or_default(),
+            r.digest.as_deref().unwrap_or_default(),
+            r.rollback
+                .as_ref()
+                .map(|d| format!(", anti-rollback: {d}"))
+                .unwrap_or_default()
+        );
+    } else {
+        println!(
+            "REFUSED {path}: {}",
+            r.refused.as_deref().unwrap_or("not trusted")
+        );
+        if let Some(d) = &r.digest {
+            println!("  digest {d}");
+        }
+    }
+    if r.trusted {
+        Ok(())
+    } else {
+        Err(Failure::Negative)
+    }
+}
+
+fn cmd_keygen(argv: &[String]) -> Outcome {
+    let a = Args::parse(argv, &["out", "trust-out", "key-id"], &[])?;
+    if let Some(p) = a.positionals.first() {
+        return Err(format!("unexpected argument {p:?}").into());
+    }
+    let out = a.required("out")?;
+    let trust_out = a.required("trust-out")?;
+    distinct_paths(&[out, trust_out], &[])?;
+    precheck_outputs(&[out, trust_out], false)?;
+    let (kf, vk) = new_signing_key(a.one("key-id")?)?;
+    kf.write_new(Path::new(out))
+        .map_err(|e| format!("{out}: {e}"))?;
+    if let Err(e) = write_file(trust_out, &trust_keys_text(&[vk]), false) {
+        let _ = std::fs::remove_file(out);
+        return Err(e.into());
+    }
+    eprintln!(
+        "wrote Ed25519 profile signing key {out} (mode 0600, key id {}) and trust file \
+         {trust_out}; keep the key off the robot, install the trust file on it",
+        kf.key_id
+    );
+    Ok(())
+}
+
+fn cmd_migrate_legacy(argv: &[String]) -> Outcome {
+    let a = Args::parse(
+        argv,
+        &[
+            "in",
+            "out",
+            "platform",
+            "unit-id",
+            "profile-version",
+            "operator",
+            "sign-key",
+            "locked-at",
+        ],
+        &["force"],
+    )?;
+    if let Some(p) = a.positionals.first() {
+        return Err(format!("unexpected argument {p:?}").into());
+    }
+    let input = a.required("in")?;
+    let out = a.required("out")?;
+    let key_path = a.required("sign-key")?;
+    let sig_out = sig_path_for(Path::new(out)).display().to_string();
+    distinct_paths(&[out, sig_out.as_str()], &[input, key_path])?;
+    let key = load_signing_key(Path::new(key_path))?;
+    let text = read_text(input, MAX_PROFILE_BYTES)?;
+    let mut p = parse_profile_text(&text).map_err(|e| format!("{input}: {e}"))?;
+    if !p.locked {
+        return Err(format!("{input}: not locked; use `lock` for drafts").into());
+    }
+    if p.metadata.is_some() {
+        return Err(format!("{input}: already has metadata (not a legacy profile)").into());
+    }
+    let meta = ProfileMetadata {
+        schema_version: PROFILE_SCHEMA_VERSION,
+        profile_version: a
+            .u64_opt("profile-version")?
+            .ok_or_else(|| "--profile-version is required".to_string())?,
+        platform: a.required("platform")?.to_string(),
+        unit_id: a.one("unit-id")?.map(str::to_string),
+        locked_by: a.required("operator")?.trim().to_string(),
+        locked_at: locked_at(&a)?,
+        parent_digest: Some(file_digest(text.as_bytes())),
+    };
+    p.metadata = Some(meta);
+    if let Err(errs) = p.validate() {
+        let list: Vec<String> = errs.iter().map(ToString::to_string).collect();
+        return Err(format!("migrated profile fails validation: {}", list.join("; ")).into());
+    }
+    let (out_text, sig) = seal_and_sign(&p, Some(&key))?;
+    write_locked(out, &out_text, sig.as_deref(), a.switch("force"))?;
+    eprintln!(
+        "migrated legacy profile {input} -> {out} + {sig_out} (content unchanged; parent \
+         digest {}; new digest {})",
+        file_digest(text.as_bytes()),
+        file_digest(out_text.as_bytes())
+    );
+    Ok(())
 }
 
 fn cmd_diff(argv: &[String]) -> Outcome {
