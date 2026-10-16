@@ -1276,7 +1276,7 @@
   }
  },
  {
-  "rule": "RoboDR: RoboDR profile or Pulsar configuration written",
+  "rule": "RoboDR: RoboDR or Pulsar protected file written",
   "note": "profile widened",
   "expect": true,
   "event": {
@@ -1293,7 +1293,7 @@
   }
  },
  {
-  "rule": "RoboDR: RoboDR profile or Pulsar configuration written",
+  "rule": "RoboDR: RoboDR or Pulsar protected file written",
   "note": "daemon reads config",
   "expect": false,
   "event": {
@@ -1309,7 +1309,7 @@
   }
  },
  {
-  "rule": "RoboDR: RoboDR profile or Pulsar configuration deleted",
+  "rule": "RoboDR: RoboDR or Pulsar protected file deleted",
   "note": "rule file removed",
   "expect": true,
   "event": {
@@ -1322,7 +1322,7 @@
   }
  },
  {
-  "rule": "RoboDR: RoboDR profile or Pulsar configuration deleted",
+  "rule": "RoboDR: RoboDR or Pulsar protected file deleted",
   "note": "other file",
   "expect": false,
   "event": {
@@ -1335,7 +1335,7 @@
   }
  },
  {
-  "rule": "RoboDR: RoboDR profile or Pulsar configuration renamed",
+  "rule": "RoboDR: RoboDR or Pulsar protected file or directory renamed",
   "note": "profile replaced",
   "expect": true,
   "event": {
@@ -1349,7 +1349,7 @@
   }
  },
  {
-  "rule": "RoboDR: RoboDR profile or Pulsar configuration renamed",
+  "rule": "RoboDR: RoboDR or Pulsar protected file or directory renamed",
   "note": "other",
   "expect": false,
   "event": {
@@ -3770,7 +3770,7 @@
   }
  },
  {
-  "rule": "RoboDR: File or device node created in the RoboDR or Pulsar configuration",
+  "rule": "RoboDR: File or device node created in a RoboDR or Pulsar protected path",
   "note": "mknod FIFO /etc/pulsar/rules/zz.toml",
   "expect": true,
   "event": {
@@ -3783,7 +3783,7 @@
   }
  },
  {
-  "rule": "RoboDR: File or device node created in the RoboDR or Pulsar configuration",
+  "rule": "RoboDR: File or device node created in a RoboDR or Pulsar protected path",
   "note": "new file in /etc/robodr",
   "expect": true,
   "event": {
@@ -3796,7 +3796,7 @@
   }
  },
  {
-  "rule": "RoboDR: File or device node created in the RoboDR or Pulsar configuration",
+  "rule": "RoboDR: File or device node created in a RoboDR or Pulsar protected path",
   "note": "file created elsewhere",
   "expect": false,
   "event": {
@@ -3809,7 +3809,7 @@
   }
  },
  {
-  "rule": "RoboDR: Link created in or to the RoboDR or Pulsar configuration",
+  "rule": "RoboDR: Link created in or to a RoboDR or Pulsar protected path",
   "note": "symlink /etc/pulsar/rules/zz.toml -> /dev/null",
   "expect": true,
   "event": {
@@ -3824,7 +3824,7 @@
   }
  },
  {
-  "rule": "RoboDR: Link created in or to the RoboDR or Pulsar configuration",
+  "rule": "RoboDR: Link created in or to a RoboDR or Pulsar protected path",
   "note": "hardlink a rule file in from elsewhere",
   "expect": true,
   "event": {
@@ -3839,7 +3839,7 @@
   }
  },
  {
-  "rule": "RoboDR: Link created in or to the RoboDR or Pulsar configuration",
+  "rule": "RoboDR: Link created in or to a RoboDR or Pulsar protected path",
   "note": "hard link alias of a rule file created outside",
   "expect": true,
   "event": {
@@ -3854,7 +3854,7 @@
   }
  },
  {
-  "rule": "RoboDR: Link created in or to the RoboDR or Pulsar configuration",
+  "rule": "RoboDR: Link created in or to a RoboDR or Pulsar protected path",
   "note": "symlink outside pointing INTO /etc/pulsar (writes resolve to the real path; not matched)",
   "expect": false,
   "event": {
@@ -4360,6 +4360,2207 @@
      "-w",
      "/usr/sbin/needrestart"
     ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file written",
+  "note": "rule file in the real rules_path edited",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vim.basic"
+   },
+   "payload": {
+    "filename": "/usr/share/robodr/rules/robodr/ros2_stack.toml",
+    "flags": [
+     "O_WRONLY",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file written",
+  "note": "daemon binary overwritten in place",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/usr/sbin/robodr-agentd",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file written",
+  "note": "drop-in written by 'systemctl edit' editor",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/nano"
+   },
+   "payload": {
+    "filename": "/etc/systemd/system/robodr-pulsard.service.d/override.conf",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file written",
+  "note": "packaged unit file edited",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/tee"
+   },
+   "payload": {
+    "filename": "/usr/lib/systemd/system/robodr-agentd.service",
+    "flags": [
+     "O_RDWR"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file written",
+  "note": "set-property drop-in written by PID 1",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/lib/systemd/systemd"
+   },
+   "payload": {
+    "filename": "/etc/systemd/system.control/robodr-agentd.service.d/50-CPUQuota.conf",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file written",
+  "note": "runtime drop-in (--runtime)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/tee"
+   },
+   "payload": {
+    "filename": "/run/systemd/system/robodr-pulsard.service.d/override.conf",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file written",
+  "note": "top-level service.d drop-in (applies to every service)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/tee"
+   },
+   "payload": {
+    "filename": "/etc/systemd/system/service.d/zz.conf",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file written",
+  "note": "pulsar.toml (rules_path) edited",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vim.basic"
+   },
+   "payload": {
+    "filename": "/etc/robodr/pulsar.toml",
+    "flags": [
+     "O_WRONLY",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file written",
+  "note": "binary merely named dpkg",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/root/.cache/dpkg"
+   },
+   "payload": {
+    "filename": "/usr/sbin/robodr-pulsard",
+    "flags": [
+     "O_WRONLY",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file written",
+  "note": "dpkg unpacking the signed bundle",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "filename": "/usr/sbin/robodr-agentd.dpkg-new",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_EXCL"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file written",
+  "note": "pulsard reads its rules",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/sbin/robodr-pulsard"
+   },
+   "payload": {
+    "filename": "/usr/share/robodr/rules/robodr/self_protection.toml",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file written",
+  "note": "other unit's drop-in",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/tee"
+   },
+   "payload": {
+    "filename": "/etc/systemd/system/nginx.service.d/override.conf",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file written",
+  "note": "look-alike directory /etc/robodr-old",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/etc/robodr-old/profile.json",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file written",
+  "note": "robodr state under /var/lib (not protected here)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/sbin/robodr-agentd"
+   },
+   "payload": {
+    "filename": "/var/lib/robodr/blackbox/agentd/seg-000001.log",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_APPEND"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file deleted",
+  "note": "rule file deleted from /usr/share/robodr/rules",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/rm"
+   },
+   "payload": {
+    "filename": "/usr/share/robodr/rules/robodr/self_protection.toml"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file deleted",
+  "note": "packaged unit file deleted",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/rm"
+   },
+   "payload": {
+    "filename": "/usr/lib/systemd/system/robodr-pulsard.service"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file deleted",
+  "note": "'systemctl disable' removes the enablement link (PID 1)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/lib/systemd/systemd"
+   },
+   "payload": {
+    "filename": "/etc/systemd/system/multi-user.target.wants/robodr-agentd.service"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file deleted",
+  "note": "daemon binary deleted",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/rm"
+   },
+   "payload": {
+    "filename": "/usr/sbin/robodr-pulsard"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file deleted",
+  "note": "dpkg removes a rule file dropped by the new release",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "filename": "/usr/share/robodr/rules/robodr/old_rule.toml"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file deleted",
+  "note": "other service's enablement link",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/lib/systemd/systemd"
+   },
+   "payload": {
+    "filename": "/etc/systemd/system/multi-user.target.wants/chrony.service"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file or directory renamed",
+  "note": "directory itself renamed: /etc/pulsar",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/etc/pulsar",
+    "destination": "/etc/pulsar.old"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file or directory renamed",
+  "note": "rules directory moved away",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/usr/share/robodr/rules",
+    "destination": "/var/tmp/r"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file or directory renamed",
+  "note": "whole /usr/share/robodr renamed",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/usr/share/robodr",
+    "destination": "/usr/share/.robodr"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file or directory renamed",
+  "note": "/etc/robodr renamed",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/etc/robodr",
+    "destination": "/etc/robodr.bak"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file or directory renamed",
+  "note": "empty directory renamed INTO place as the rules dir",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/var/tmp/empty",
+    "destination": "/usr/share/robodr/rules"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file or directory renamed",
+  "note": "daemon binary replaced by rename",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/tmp/x",
+    "destination": "/usr/sbin/robodr-pulsard"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file or directory renamed",
+  "note": "drop-in moved into place",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/tmp/o.conf",
+    "destination": "/etc/systemd/system/robodr-agentd.service.d/override.conf"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file or directory renamed",
+  "note": "dpkg replaces the daemon from .dpkg-new",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "source": "/usr/sbin/robodr-agentd.dpkg-new",
+    "destination": "/usr/sbin/robodr-agentd"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected file or directory renamed",
+  "note": "look-alike /etc/robodr-old",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/etc/robodr-old",
+    "destination": "/etc/robodr-older"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File or device node created in a RoboDR or Pulsar protected path",
+  "note": "new drop-in .conf",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/tee"
+   },
+   "payload": {
+    "filename": "/etc/systemd/system/robodr-agentd.service.d/10-exec.conf"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File or device node created in a RoboDR or Pulsar protected path",
+  "note": "FIFO in the real rules_path",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mkfifo"
+   },
+   "payload": {
+    "filename": "/usr/share/robodr/rules/zz.toml"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File or device node created in a RoboDR or Pulsar protected path",
+  "note": "override unit shadowing the packaged one",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/etc/systemd/system/robodr-pulsard.service"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File or device node created in a RoboDR or Pulsar protected path",
+  "note": "transient unit named robodr-*",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/lib/systemd/systemd"
+   },
+   "payload": {
+    "filename": "/run/systemd/transient/robodr-agentd-helper.service"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File or device node created in a RoboDR or Pulsar protected path",
+  "note": "dpkg .dpkg-new",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "filename": "/usr/share/robodr/rules/robodr/self_protection.toml.dpkg-new"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File or device node created in a RoboDR or Pulsar protected path",
+  "note": "PID 1 credentials for the unit (not protected path)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/lib/systemd/systemd"
+   },
+   "payload": {
+    "filename": "/run/credentials/robodr-agentd.service/blackbox.key"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in or to a RoboDR or Pulsar protected path",
+  "note": "'systemctl mask' link to /dev/null (PID 1)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/lib/systemd/systemd"
+   },
+   "payload": {
+    "source": "/etc/systemd/system/robodr-pulsard.service",
+    "destination": "/dev/null",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in or to a RoboDR or Pulsar protected path",
+  "note": "--runtime mask",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/lib/systemd/systemd"
+   },
+   "payload": {
+    "source": "/run/systemd/system/robodr-agentd.service",
+    "destination": "/dev/null",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in or to a RoboDR or Pulsar protected path",
+  "note": "enablement link created (commissioning audit trail)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/lib/systemd/systemd"
+   },
+   "payload": {
+    "source": "/etc/systemd/system/multi-user.target.wants/robodr-agentd.service",
+    "destination": "/usr/lib/systemd/system/robodr-agentd.service",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in or to a RoboDR or Pulsar protected path",
+  "note": "hard-link alias of the daemon binary",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/home/robot/a",
+    "destination": "/usr/sbin/robodr-agentd",
+    "hard_link": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in or to a RoboDR or Pulsar protected path",
+  "note": "rules_path replaced by a symlink",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/usr/share/robodr/rules",
+    "destination": "/tmp/empty",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in or to a RoboDR or Pulsar protected path",
+  "note": "PID 1 invocation-id link at every start",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/lib/systemd/systemd"
+   },
+   "payload": {
+    "source": "/run/systemd/units/invocation:robodr-agentd.service",
+    "destination": "8f1c2a9b0d3e4f5a6b7c8d9e0f1a2b3c",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in or to a RoboDR or Pulsar protected path",
+  "note": "dpkg",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "source": "/usr/share/robodr/rules/robodr/x.toml",
+    "destination": "y.toml",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Directory created in a RoboDR or Pulsar protected path",
+  "note": "drop-in directory ('systemctl edit')",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mkdir"
+   },
+   "payload": {
+    "dirname": "/etc/systemd/system/robodr-pulsard.service.d"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Directory created in a RoboDR or Pulsar protected path",
+  "note": "set-property control directory (PID 1)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/lib/systemd/systemd"
+   },
+   "payload": {
+    "dirname": "/etc/systemd/system.control/robodr-agentd.service.d"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Directory created in a RoboDR or Pulsar protected path",
+  "note": "top-level service.d",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mkdir"
+   },
+   "payload": {
+    "dirname": "/etc/systemd/system/service.d"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Directory created in a RoboDR or Pulsar protected path",
+  "note": "runtime drop-in directory",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mkdir"
+   },
+   "payload": {
+    "dirname": "/run/systemd/system/robodr-agentd.service.d"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Directory created in a RoboDR or Pulsar protected path",
+  "note": "new rules subdirectory",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mkdir"
+   },
+   "payload": {
+    "dirname": "/usr/share/robodr/rules/zz"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Directory created in a RoboDR or Pulsar protected path",
+  "note": "PID 1 propagate dir at unit start",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/lib/systemd/systemd"
+   },
+   "payload": {
+    "dirname": "/run/systemd/propagate/robodr-agentd.service"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Directory created in a RoboDR or Pulsar protected path",
+  "note": "other unit's drop-in dir",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mkdir"
+   },
+   "payload": {
+    "dirname": "/etc/systemd/system/nginx.service.d"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Directory created in a RoboDR or Pulsar protected path",
+  "note": "dpkg creates the rules dir",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "dirname": "/usr/share/robodr/rules/pulsar"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected directory deleted",
+  "note": "rules subdirectory removed",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/rm"
+   },
+   "payload": {
+    "dirname": "/usr/share/robodr/rules/robodr"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected directory deleted",
+  "note": "/etc/pulsar removed",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/rm"
+   },
+   "payload": {
+    "dirname": "/etc/pulsar"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected directory deleted",
+  "note": "/etc/robodr/keys removed",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/rm"
+   },
+   "payload": {
+    "dirname": "/etc/robodr/keys"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected directory deleted",
+  "note": "drop-in directory removed ('systemctl revert')",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/lib/systemd/systemd"
+   },
+   "payload": {
+    "dirname": "/etc/systemd/system/robodr-agentd.service.d"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected directory deleted",
+  "note": "dpkg removes an emptied rules dir",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "dirname": "/usr/share/robodr/rules/pulsar"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: RoboDR or Pulsar protected directory deleted",
+  "note": "temp dir",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/rm"
+   },
+   "payload": {
+    "dirname": "/tmp/x"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Attempt to stop the Pulsar or RoboDR service",
+  "note": "stop pulsard unit",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/systemctl",
+    "argc": 3,
+    "argv": [
+     "systemctl",
+     "stop",
+     "robodr-pulsard.service"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Attempt to stop the Pulsar or RoboDR service",
+  "note": "stop agentd (no suffix)",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/systemctl",
+    "argc": 3,
+    "argv": [
+     "systemctl",
+     "stop",
+     "robodr-agentd"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Attempt to stop the Pulsar or RoboDR service",
+  "note": "mask --now",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/systemctl",
+    "argc": 4,
+    "argv": [
+     "systemctl",
+     "mask",
+     "--now",
+     "robodr-agentd.service"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Attempt to stop the Pulsar or RoboDR service",
+  "note": "disable --now",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/systemctl",
+    "argc": 4,
+    "argv": [
+     "systemctl",
+     "disable",
+     "--now",
+     "robodr-pulsard.service"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Attempt to stop the Pulsar or RoboDR service",
+  "note": "freeze cgroup",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/systemctl",
+    "argc": 3,
+    "argv": [
+     "systemctl",
+     "freeze",
+     "robodr-pulsard.service"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Attempt to stop the Pulsar or RoboDR service",
+  "note": "starve via set-property",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/systemctl",
+    "argc": 4,
+    "argv": [
+     "systemctl",
+     "set-property",
+     "robodr-agentd.service",
+     "CPUQuota=1%"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Attempt to stop the Pulsar or RoboDR service",
+  "note": "kill -s SIGSTOP",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/systemctl",
+    "argc": 5,
+    "argv": [
+     "systemctl",
+     "kill",
+     "-s",
+     "SIGSTOP",
+     "robodr-pulsard.service"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Attempt to stop the Pulsar or RoboDR service",
+  "note": "edit (drop-in)",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/systemctl",
+    "argc": 3,
+    "argv": [
+     "systemctl",
+     "edit",
+     "robodr-agentd.service"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Attempt to stop the Pulsar or RoboDR service",
+  "note": "pkill robodr-agentd",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/pkill",
+    "argc": 2,
+    "argv": [
+     "pkill",
+     "robodr-agentd"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Attempt to stop the Pulsar or RoboDR service",
+  "note": "killall -9 robodr-pulsard",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/killall",
+    "argc": 3,
+    "argv": [
+     "killall",
+     "-9",
+     "robodr-pulsard"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Attempt to stop the Pulsar or RoboDR service",
+  "note": "service robodr-agentd stop",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/sbin/service",
+    "argc": 3,
+    "argv": [
+     "service",
+     "robodr-agentd",
+     "stop"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Attempt to stop the Pulsar or RoboDR service",
+  "note": "package prerm on removal (audit trail)",
+  "expect": true,
+  "event": {
+   "header": {
+    "parent_pid": 4321
+   },
+   "payload": {
+    "filename": "/usr/bin/systemctl",
+    "argc": 3,
+    "argv": [
+     "systemctl",
+     "stop",
+     "robodr-agentd.service"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Attempt to stop the Pulsar or RoboDR service",
+  "note": "postinst try-restart on upgrade",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/systemctl",
+    "argc": 3,
+    "argv": [
+     "systemctl",
+     "try-restart",
+     "robodr-pulsard.service"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Attempt to stop the Pulsar or RoboDR service",
+  "note": "status check",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/systemctl",
+    "argc": 3,
+    "argv": [
+     "systemctl",
+     "status",
+     "robodr-agentd.service"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Attempt to stop the Pulsar or RoboDR service",
+  "note": "service robodr-agentd status",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/sbin/service",
+    "argc": 3,
+    "argv": [
+     "service",
+     "robodr-agentd",
+     "status"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Attempt to stop the Pulsar or RoboDR service",
+  "note": "KNOWN GAP: unit glob",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/systemctl",
+    "argc": 3,
+    "argv": [
+     "systemctl",
+     "stop",
+     "robodr-*"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed with uv, pipx, poetry or conda/mamba",
+  "note": "uv pip install --system",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/root/.local/bin/uv",
+    "argc": 5,
+    "argv": [
+     "uv",
+     "pip",
+     "install",
+     "--system",
+     "rospkg"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed with uv, pipx, poetry or conda/mamba",
+  "note": "uv pip sync into system python",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/local/bin/uv",
+    "argc": 6,
+    "argv": [
+     "uv",
+     "pip",
+     "sync",
+     "--python",
+     "/usr/bin/python3",
+     "req.txt"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed with uv, pipx, poetry or conda/mamba",
+  "note": "uv tool install",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/local/bin/uv",
+    "argc": 4,
+    "argv": [
+     "uv",
+     "tool",
+     "install",
+     "ruff"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed with uv, pipx, poetry or conda/mamba",
+  "note": "uv tool run",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/local/bin/uv",
+    "argc": 4,
+    "argv": [
+     "uv",
+     "tool",
+     "run",
+     "x"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed with uv, pipx, poetry or conda/mamba",
+  "note": "uvx",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/local/bin/uvx",
+    "argc": 2,
+    "argv": [
+     "uvx",
+     "pkg"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed with uv, pipx, poetry or conda/mamba",
+  "note": "pipx install --global",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/pipx",
+    "argc": 5,
+    "argv": [
+     "/usr/bin/python3",
+     "/usr/bin/pipx",
+     "install",
+     "--global",
+     "pkg"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed with uv, pipx, poetry or conda/mamba",
+  "note": "pipx inject",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/pipx",
+    "argc": 5,
+    "argv": [
+     "/usr/bin/python3",
+     "/usr/bin/pipx",
+     "inject",
+     "pkg",
+     "dep"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed with uv, pipx, poetry or conda/mamba",
+  "note": "pipx run",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/pipx",
+    "argc": 4,
+    "argv": [
+     "/usr/bin/python3",
+     "/usr/bin/pipx",
+     "run",
+     "pkg"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed with uv, pipx, poetry or conda/mamba",
+  "note": "poetry install",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/local/bin/poetry",
+    "argc": 3,
+    "argv": [
+     "/usr/bin/python3",
+     "/usr/local/bin/poetry",
+     "install"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed with uv, pipx, poetry or conda/mamba",
+  "note": "poetry add",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/local/bin/poetry",
+    "argc": 4,
+    "argv": [
+     "/usr/bin/python3",
+     "/usr/local/bin/poetry",
+     "add",
+     "pkg"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed with uv, pipx, poetry or conda/mamba",
+  "note": "conda install",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/opt/conda/bin/conda",
+    "argc": 5,
+    "argv": [
+     "/opt/conda/bin/python",
+     "/opt/conda/bin/conda",
+     "install",
+     "-y",
+     "pkg"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed with uv, pipx, poetry or conda/mamba",
+  "note": "mamba create",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/opt/conda/bin/mamba",
+    "argc": 5,
+    "argv": [
+     "mamba",
+     "create",
+     "-n",
+     "x",
+     "pkg"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed with uv, pipx, poetry or conda/mamba",
+  "note": "micromamba install",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/local/bin/micromamba",
+    "argc": 3,
+    "argv": [
+     "micromamba",
+     "install",
+     "pkg"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed with uv, pipx, poetry or conda/mamba",
+  "note": "python3 -m uv pip install",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3",
+    "argc": 6,
+    "argv": [
+     "/usr/bin/python3",
+     "-m",
+     "uv",
+     "pip",
+     "install",
+     "pkg"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed with uv, pipx, poetry or conda/mamba",
+  "note": "python3 -m pipx install",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3",
+    "argc": 5,
+    "argv": [
+     "/usr/bin/python3",
+     "-m",
+     "pipx",
+     "install",
+     "pkg"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed with uv, pipx, poetry or conda/mamba",
+  "note": "python3 -m poetry add",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3",
+    "argc": 5,
+    "argv": [
+     "/usr/bin/python3",
+     "-m",
+     "poetry",
+     "add",
+     "pkg"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed with uv, pipx, poetry or conda/mamba",
+  "note": "uv --version",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/local/bin/uv",
+    "argc": 2,
+    "argv": [
+     "uv",
+     "--version"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed with uv, pipx, poetry or conda/mamba",
+  "note": "uv pip list",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/local/bin/uv",
+    "argc": 3,
+    "argv": [
+     "uv",
+     "pip",
+     "list"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed with uv, pipx, poetry or conda/mamba",
+  "note": "pipx list",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/pipx",
+    "argc": 3,
+    "argv": [
+     "/usr/bin/python3",
+     "/usr/bin/pipx",
+     "list"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed with uv, pipx, poetry or conda/mamba",
+  "note": "poetry show",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/local/bin/poetry",
+    "argc": 3,
+    "argv": [
+     "/usr/bin/python3",
+     "/usr/local/bin/poetry",
+     "show"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed with uv, pipx, poetry or conda/mamba",
+  "note": "conda list",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/opt/conda/bin/conda",
+    "argc": 2,
+    "argv": [
+     "conda",
+     "list"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed with uv, pipx, poetry or conda/mamba",
+  "note": "coreutils sync",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/sync",
+    "argc": 1,
+    "argv": [
+     "sync"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed with uv, pipx, poetry or conda/mamba",
+  "note": "python3 -m venv (dir named install)",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3",
+    "argc": 4,
+    "argv": [
+     "/usr/bin/python3",
+     "-m",
+     "venv",
+     "install"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed with uv, pipx, poetry or conda/mamba",
+  "note": "KNOWN GAP: verb glued to '=' is not a whole element",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/local/bin/uv",
+    "argc": 3,
+    "argv": [
+     "uv",
+     "pip",
+     "install=pkg"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Node.js package installed with npm, npx, pnpm or yarn",
+  "note": "npm install -g",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/npm",
+    "argc": 4,
+    "argv": [
+     "npm",
+     "install",
+     "-g",
+     "pkg"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Node.js package installed with npm, npx, pnpm or yarn",
+  "note": "npm i",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/npm",
+    "argc": 3,
+    "argv": [
+     "npm",
+     "i",
+     "pkg"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Node.js package installed with npm, npx, pnpm or yarn",
+  "note": "npm ci",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/npm",
+    "argc": 2,
+    "argv": [
+     "npm",
+     "ci"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Node.js package installed with npm, npx, pnpm or yarn",
+  "note": "npm exec",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/npm",
+    "argc": 3,
+    "argv": [
+     "npm",
+     "exec",
+     "pkg"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Node.js package installed with npm, npx, pnpm or yarn",
+  "note": "npx",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/npx",
+    "argc": 2,
+    "argv": [
+     "npx",
+     "pkg"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Node.js package installed with npm, npx, pnpm or yarn",
+  "note": "pnpm add",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/local/bin/pnpm",
+    "argc": 3,
+    "argv": [
+     "pnpm",
+     "add",
+     "pkg"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Node.js package installed with npm, npx, pnpm or yarn",
+  "note": "yarn dlx",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/local/bin/yarn",
+    "argc": 3,
+    "argv": [
+     "yarn",
+     "dlx",
+     "pkg"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Node.js package installed with npm, npx, pnpm or yarn",
+  "note": "npm ls",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/npm",
+    "argc": 2,
+    "argv": [
+     "npm",
+     "ls"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Node.js package installed with npm, npx, pnpm or yarn",
+  "note": "npm --version",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/npm",
+    "argc": 2,
+    "argv": [
+     "npm",
+     "--version"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Node.js package installed with npm, npx, pnpm or yarn",
+  "note": "node app",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/node",
+    "argc": 2,
+    "argv": [
+     "node",
+     "/opt/web/server.js"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Node.js package installed with npm, npx, pnpm or yarn",
+  "note": "KNOWN GAP: bare yarn installs with no verb",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/local/bin/yarn",
+    "argc": 1,
+    "argv": [
+     "yarn"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File created in the system or ROS Python environment outside the package manager",
+  "note": "pip --break-system-packages into /usr/local dist-packages",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.12"
+   },
+   "payload": {
+    "filename": "/usr/local/lib/python3.12/dist-packages/evil/__init__.py"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File created in the system or ROS Python environment outside the package manager",
+  "note": ".pth dropped into system dist-packages",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/usr/lib/python3/dist-packages/zz.pth"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File created in the system or ROS Python environment outside the package manager",
+  "note": "sitecustomize in /etc/python3.12",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/tee"
+   },
+   "payload": {
+    "filename": "/etc/python3.12/sitecustomize.py"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File created in the system or ROS Python environment outside the package manager",
+  "note": "stdlib module shadow",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/usr/lib/python3.12/json/__init__.py"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File created in the system or ROS Python environment outside the package manager",
+  "note": "uv/conda link into ROS site-packages",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/local/bin/uv"
+   },
+   "payload": {
+    "filename": "/opt/ros/jazzy/lib/python3.12/site-packages/rclpy_ext/x.py"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File created in the system or ROS Python environment outside the package manager",
+  "note": "lib64 python tree",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/pip3"
+   },
+   "payload": {
+    "filename": "/usr/lib64/python3.12/site-packages/x.py"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File created in the system or ROS Python environment outside the package manager",
+  "note": "dpkg (exact image)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "filename": "/usr/lib/python3/dist-packages/yaml/__init__.py.dpkg-new"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File created in the system or ROS Python environment outside the package manager",
+  "note": "binary named dpkg elsewhere",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/root/.cache/dpkg"
+   },
+   "payload": {
+    "filename": "/usr/lib/python3/dist-packages/x.py"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File created in the system or ROS Python environment outside the package manager",
+  "note": "user site-packages (Python-import rule's job)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.12"
+   },
+   "payload": {
+    "filename": "/home/robot/.local/lib/python3.12/site-packages/x.py"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File created in the system or ROS Python environment outside the package manager",
+  "note": "venv outside system trees",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.12"
+   },
+   "payload": {
+    "filename": "/home/robot/venv/lib/python3.12/site-packages/x.py"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File created in the system or ROS Python environment outside the package manager",
+  "note": "robot workspace (ros2_stack rules' job)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.12"
+   },
+   "payload": {
+    "filename": "/opt/robot_ws/install/my_pkg/lib/python3.12/site-packages/x.py"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File created in the system or ROS Python environment outside the package manager",
+  "note": "/usr/share python-looking name outside site-packages",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/usr/share/doc/python3/README"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File moved into the system or ROS Python environment outside the package manager",
+  "note": "pip --break-system-packages into /usr/local dist-packages",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.12"
+   },
+   "payload": {
+    "source": "/tmp/x",
+    "destination": "/usr/local/lib/python3.12/dist-packages/evil/__init__.py"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File moved into the system or ROS Python environment outside the package manager",
+  "note": ".pth dropped into system dist-packages",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "source": "/tmp/x",
+    "destination": "/usr/lib/python3/dist-packages/zz.pth"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File moved into the system or ROS Python environment outside the package manager",
+  "note": "sitecustomize in /etc/python3.12",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/tee"
+   },
+   "payload": {
+    "source": "/tmp/x",
+    "destination": "/etc/python3.12/sitecustomize.py"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File moved into the system or ROS Python environment outside the package manager",
+  "note": "stdlib module shadow",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "source": "/tmp/x",
+    "destination": "/usr/lib/python3.12/json/__init__.py"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File moved into the system or ROS Python environment outside the package manager",
+  "note": "uv/conda link into ROS site-packages",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/local/bin/uv"
+   },
+   "payload": {
+    "source": "/tmp/x",
+    "destination": "/opt/ros/jazzy/lib/python3.12/site-packages/rclpy_ext/x.py"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File moved into the system or ROS Python environment outside the package manager",
+  "note": "lib64 python tree",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/pip3"
+   },
+   "payload": {
+    "source": "/tmp/x",
+    "destination": "/usr/lib64/python3.12/site-packages/x.py"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File moved into the system or ROS Python environment outside the package manager",
+  "note": "dpkg (exact image)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "source": "/tmp/x",
+    "destination": "/usr/lib/python3/dist-packages/yaml/__init__.py.dpkg-new"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File moved into the system or ROS Python environment outside the package manager",
+  "note": "binary named dpkg elsewhere",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/root/.cache/dpkg"
+   },
+   "payload": {
+    "source": "/tmp/x",
+    "destination": "/usr/lib/python3/dist-packages/x.py"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File moved into the system or ROS Python environment outside the package manager",
+  "note": "user site-packages (Python-import rule's job)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.12"
+   },
+   "payload": {
+    "source": "/tmp/x",
+    "destination": "/home/robot/.local/lib/python3.12/site-packages/x.py"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File moved into the system or ROS Python environment outside the package manager",
+  "note": "venv outside system trees",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.12"
+   },
+   "payload": {
+    "source": "/tmp/x",
+    "destination": "/home/robot/venv/lib/python3.12/site-packages/x.py"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File moved into the system or ROS Python environment outside the package manager",
+  "note": "robot workspace (ros2_stack rules' job)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.12"
+   },
+   "payload": {
+    "source": "/tmp/x",
+    "destination": "/opt/robot_ws/install/my_pkg/lib/python3.12/site-packages/x.py"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File moved into the system or ROS Python environment outside the package manager",
+  "note": "/usr/share python-looking name outside site-packages",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "source": "/tmp/x",
+    "destination": "/usr/share/doc/python3/README"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in the system or ROS Python environment outside the package manager",
+  "note": "pip --break-system-packages into /usr/local dist-packages",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.12"
+   },
+   "payload": {
+    "source": "/usr/local/lib/python3.12/dist-packages/evil/__init__.py",
+    "destination": "/root/.cache/uv/archive-v0/abc/__init__.py",
+    "hard_link": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in the system or ROS Python environment outside the package manager",
+  "note": ".pth dropped into system dist-packages",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "source": "/usr/lib/python3/dist-packages/zz.pth",
+    "destination": "/root/.cache/uv/archive-v0/abc/zz.pth",
+    "hard_link": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in the system or ROS Python environment outside the package manager",
+  "note": "sitecustomize in /etc/python3.12",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/tee"
+   },
+   "payload": {
+    "source": "/etc/python3.12/sitecustomize.py",
+    "destination": "/root/.cache/uv/archive-v0/abc/sitecustomize.py",
+    "hard_link": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in the system or ROS Python environment outside the package manager",
+  "note": "stdlib module shadow",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "source": "/usr/lib/python3.12/json/__init__.py",
+    "destination": "/root/.cache/uv/archive-v0/abc/__init__.py",
+    "hard_link": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in the system or ROS Python environment outside the package manager",
+  "note": "uv/conda link into ROS site-packages",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/local/bin/uv"
+   },
+   "payload": {
+    "source": "/opt/ros/jazzy/lib/python3.12/site-packages/rclpy_ext/x.py",
+    "destination": "/root/.cache/uv/archive-v0/abc/x.py",
+    "hard_link": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in the system or ROS Python environment outside the package manager",
+  "note": "lib64 python tree",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/pip3"
+   },
+   "payload": {
+    "source": "/usr/lib64/python3.12/site-packages/x.py",
+    "destination": "/root/.cache/uv/archive-v0/abc/x.py",
+    "hard_link": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in the system or ROS Python environment outside the package manager",
+  "note": "dpkg (exact image)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "source": "/usr/lib/python3/dist-packages/yaml/__init__.py.dpkg-new",
+    "destination": "/root/.cache/uv/archive-v0/abc/__init__.py.dpkg-new",
+    "hard_link": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in the system or ROS Python environment outside the package manager",
+  "note": "binary named dpkg elsewhere",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/root/.cache/dpkg"
+   },
+   "payload": {
+    "source": "/usr/lib/python3/dist-packages/x.py",
+    "destination": "/root/.cache/uv/archive-v0/abc/x.py",
+    "hard_link": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in the system or ROS Python environment outside the package manager",
+  "note": "user site-packages (Python-import rule's job)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.12"
+   },
+   "payload": {
+    "source": "/home/robot/.local/lib/python3.12/site-packages/x.py",
+    "destination": "/root/.cache/uv/archive-v0/abc/x.py",
+    "hard_link": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in the system or ROS Python environment outside the package manager",
+  "note": "venv outside system trees",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.12"
+   },
+   "payload": {
+    "source": "/home/robot/venv/lib/python3.12/site-packages/x.py",
+    "destination": "/root/.cache/uv/archive-v0/abc/x.py",
+    "hard_link": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in the system or ROS Python environment outside the package manager",
+  "note": "robot workspace (ros2_stack rules' job)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.12"
+   },
+   "payload": {
+    "source": "/opt/robot_ws/install/my_pkg/lib/python3.12/site-packages/x.py",
+    "destination": "/root/.cache/uv/archive-v0/abc/x.py",
+    "hard_link": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created in the system or ROS Python environment outside the package manager",
+  "note": "/usr/share python-looking name outside site-packages",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "source": "/usr/share/doc/python3/README",
+    "destination": "/root/.cache/uv/archive-v0/abc/README",
+    "hard_link": true
    }
   }
  }
