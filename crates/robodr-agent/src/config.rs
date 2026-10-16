@@ -402,6 +402,7 @@ mod tests {
             Envelope {
                 max_linear_speed: Some(0.5),
                 max_joint_speed: None,
+                ..Default::default()
             },
         );
         p.motion_envelopes.insert(
@@ -409,6 +410,7 @@ mod tests {
             Envelope {
                 max_linear_speed: None,
                 max_joint_speed: Some(1.0),
+                ..Default::default()
             },
         );
         let mut allowed = BTreeMap::new();

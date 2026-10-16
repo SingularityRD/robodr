@@ -35,6 +35,7 @@ fn round_trip_events_deviations_notes_and_reopen() {
         linear_speed: Some(3.5),
         joint_speed: None,
         angular_speed: None,
+        ..Default::default()
     });
     recorded(r.append_event(&mc, true).unwrap());
     let dev = Deviation::new(

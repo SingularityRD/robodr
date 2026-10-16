@@ -588,6 +588,10 @@ fn twist_maps_to_signed_motion_command() {
     assert_eq!(c.linear_speed, Some(0.5));
     assert_eq!(c.angular_speed, Some(-0.25)); // sign kept
     assert_eq!(c.joint_speed, None);
+    // Every other Twist axis is present (zero in this vector).
+    for a in [c.linear_y, c.linear_z, c.angular_x, c.angular_y] {
+        assert!(a.is_some_and(|v| v.is_finite()), "{c:?}");
+    }
 }
 
 #[test]
@@ -604,6 +608,13 @@ fn odometry_maps_to_signed_feedback_with_magnitude() {
     };
     assert_eq!(f.linear_velocity, Some(-0.75));
     assert_eq!(f.angular_velocity, Some(0.3));
+    // Holonomic axes are carried signed, per axis.
+    assert_eq!(f.linear_velocity_y, Some(0.1));
+    assert_eq!(f.linear_velocity_z, Some(0.0));
+    assert_eq!(
+        (f.angular_velocity_x, f.angular_velocity_y),
+        (Some(0.0), Some(0.0))
+    );
     let mag = f.measured_linear_speed.unwrap();
     assert!((mag - (0.75f64 * 0.75 + 0.01).sqrt()).abs() < 1e-12);
     assert_eq!(f.publisher_guid.as_deref(), Some("cc"));
@@ -618,10 +629,15 @@ fn imu_and_trajectory_mapping() {
         writer_guid: None,
         timestamp_ns: 0,
     };
-    let b = imu(Representation::CdrBe, b"imu", [0.0, 0.0, -0.4]);
+    let b = imu(Representation::CdrBe, b"imu", [0.2, -0.1, -0.4]);
     let d = decode_payload(MessageKind::Imu, &b, &L).unwrap();
     let f = d.message.to_feedback(&ctx).unwrap();
     assert_eq!(f.angular_velocity, Some(-0.4));
+    assert_eq!(
+        (f.angular_velocity_x, f.angular_velocity_y),
+        (Some(0.2), Some(-0.1))
+    );
+    assert_eq!((f.linear_velocity_y, f.linear_velocity_z), (None, None));
     assert_eq!(f.linear_velocity, None);
     assert_eq!(f.measured_linear_speed, None);
 
@@ -631,6 +647,7 @@ fn imu_and_trajectory_mapping() {
     // No points: the controller holds position; a checkable zero, not None.
     assert_eq!(c.joint_speed, Some(0.0));
     assert_eq!(c.linear_speed, None);
+    assert!(!c.has_extra_axes());
     assert!(d.anomalies().is_empty());
 }
 

@@ -190,6 +190,7 @@ fn locked_profile() -> Profile {
         Envelope {
             max_linear_speed: Some(1.0),
             max_joint_speed: None,
+            ..Default::default()
         },
     );
     p

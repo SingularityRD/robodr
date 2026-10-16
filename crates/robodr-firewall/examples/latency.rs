@@ -59,6 +59,7 @@ fn firewall() -> Firewall {
         Envelope {
             max_linear_speed: Some(1.0),
             max_joint_speed: None,
+            ..Default::default()
         },
     );
     p.motion_envelopes.insert(
@@ -66,6 +67,7 @@ fn firewall() -> Firewall {
         Envelope {
             max_linear_speed: None,
             max_joint_speed: Some(1.5),
+            ..Default::default()
         },
     );
     let base = ChannelSpec {

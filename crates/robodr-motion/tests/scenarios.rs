@@ -325,6 +325,7 @@ fn unspecified_axis_is_not_judged() {
         linear_speed: Some(0.8),
         joint_speed: None,
         angular_speed: None,
+        ..Default::default()
     };
     let mut mon = ConsistencyMonitor::new(ugv()).unwrap();
     let mut f = Vec::new();

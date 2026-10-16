@@ -337,6 +337,9 @@ pub fn lockable_with_caps(profile: &Profile, caps: &HardCaps) -> Vec<LockRefusal
                         dimension: match field {
                             EnvelopeField::MaxLinearSpeed => "linear",
                             EnvelopeField::MaxJointSpeed => "joint",
+                            EnvelopeField::MaxLateralSpeed => "lateral",
+                            EnvelopeField::MaxVerticalSpeed => "vertical",
+                            EnvelopeField::MaxRollPitchRate => "roll_pitch",
                         }
                         .into(),
                     }
@@ -915,6 +918,7 @@ mod tests {
             Envelope {
                 max_linear_speed: Some(0.5),
                 max_joint_speed: None,
+                ..Default::default()
             },
         );
         p
@@ -951,6 +955,7 @@ mod tests {
             Envelope {
                 max_linear_speed: Some(f64::NAN),
                 max_joint_speed: Some(-1.0),
+                ..Default::default()
             },
         );
         let why = lk(&p).unwrap_err();
@@ -1138,6 +1143,7 @@ mod tests {
             Envelope {
                 max_linear_speed: Some(0.3),
                 max_joint_speed: Some(2.0),
+                ..Default::default()
             },
         );
         let mut c = lk(&base()).unwrap();
@@ -1147,6 +1153,7 @@ mod tests {
             Envelope {
                 max_linear_speed: None,
                 max_joint_speed: Some(1.0),
+                ..Default::default()
             },
         );
         let m = merge_profiles(&[a.clone(), b.clone(), c.clone()]).unwrap();
@@ -1157,7 +1164,8 @@ mod tests {
             m.motion_envelopes["/cmd_vel"],
             Envelope {
                 max_linear_speed: Some(0.5),
-                max_joint_speed: Some(2.0)
+                max_joint_speed: Some(2.0),
+                ..Default::default()
             }
         );
         assert_eq!(m.motion_envelopes["/arm"].max_joint_speed, Some(1.0));
@@ -1315,6 +1323,7 @@ mod tests {
                 linear_speed: Some(v),
                 joint_speed: None,
                 angular_speed: None,
+                ..Default::default()
             })
         };
         c.observe("x", 3, &mv(0.4));

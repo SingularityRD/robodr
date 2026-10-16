@@ -187,6 +187,7 @@ fn motion_command_finding_with_envelope() {
     let env = Envelope {
         max_linear_speed: Some(1.0),
         max_joint_speed: None,
+        ..Default::default()
     };
     let f = FindingBuilder::from_deviation(&dev, &ctx)
         .event(&RobotEvent::MotionCommand(cmd.clone()))

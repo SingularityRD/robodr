@@ -288,6 +288,7 @@ fn ev_mv(g: &str, ch: &str, lin: Option<f64>, joint: Option<f64>) -> RobotEvent 
         linear_speed: lin,
         joint_speed: joint,
         angular_speed: None,
+        ..Default::default()
     })
 }
 const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaa";
@@ -474,6 +475,7 @@ fn small_profile() -> Profile {
         Envelope {
             max_linear_speed: Some(0.5),
             max_joint_speed: Some(0.0),
+            ..Default::default()
         },
     );
     p

@@ -425,11 +425,13 @@ fn minimal_and_maximal_findings_match_schema() {
         linear_speed: Some(2.0),
         joint_speed: Some(0.5),
         angular_speed: None,
+        ..Default::default()
     };
     let dev = Deviation::new("robot.motion.linear_over_envelope", Severity::High, "x");
     let env = robodr_events::profile::Envelope {
         max_linear_speed: Some(1.0),
         max_joint_speed: Some(1.0),
+        ..Default::default()
     };
     let max = robodr_ocsf::FindingBuilder::from_deviation(&dev, &ctx)
         .event(&RobotEvent::MotionCommand(cmd.clone()))

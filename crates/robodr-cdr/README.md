@@ -5,11 +5,11 @@ topics: XCDR1 / XCDR2 serialized payloads of
 
 | DDS type name (SEDP `PID_TYPE_NAME`) | ROS type | maps to |
 |---|---|---|
-| `geometry_msgs::msg::dds_::Twist_` | `geometry_msgs/msg/Twist` | `MotionCommand` (`linear_speed = linear.x`, `angular_speed = angular.z`, signed) |
+| `geometry_msgs::msg::dds_::Twist_` | `geometry_msgs/msg/Twist` | `MotionCommand` (`linear_speed = linear.x`, `angular_speed = angular.z`, plus `linear_y`, `linear_z`, `angular_x`, `angular_y`; all signed, per axis) |
 | `geometry_msgs::msg::dds_::TwistStamped_` | `geometry_msgs/msg/TwistStamped` | same as Twist (header stamp is **not** trusted as time) |
 | `trajectory_msgs::msg::dds_::JointTrajectory_` | `trajectory_msgs/msg/JointTrajectory` | `MotionCommand` (`joint_speed` = max \|velocity\| over all points) |
-| `nav_msgs::msg::dds_::Odometry_` | `nav_msgs/msg/Odometry` | `MotionFeedback` (`linear_velocity = twist.linear.x`, `angular_velocity = twist.angular.z`, `measured_linear_speed = ‖twist.linear‖`) |
-| `sensor_msgs::msg::dds_::Imu_` | `sensor_msgs/msg/Imu` | `MotionFeedback` (`angular_velocity = angular_velocity.z`) |
+| `nav_msgs::msg::dds_::Odometry_` | `nav_msgs/msg/Odometry` | `MotionFeedback` (`linear_velocity = twist.linear.x`, `angular_velocity = twist.angular.z`, plus `linear_velocity_y/_z`, `angular_velocity_x/_y`; `measured_linear_speed = ‖twist.linear‖`) |
+| `sensor_msgs::msg::dds_::Imu_` | `sensor_msgs/msg/Imu` | `MotionFeedback` (`angular_velocity = angular_velocity.z`, `angular_velocity_x/_y = angular_velocity.x/.y`) |
 | `sensor_msgs::msg::dds_::JointState_` | `sensor_msgs/msg/JointState` | `MotionFeedback` (`measured_joint_speed` = max \|velocity\|) |
 
 Dependencies: `std` and `robodr-events` only. Read-only: nothing is encoded or

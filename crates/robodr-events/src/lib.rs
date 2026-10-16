@@ -24,7 +24,9 @@
 //! * Floats from the wire are hostile. A non-finite (NaN / ±inf) commanded
 //!   speed is always a `Critical` deviation (`robot.motion.non_finite_command`),
 //!   never "not greater than the limit".
-//! * Commanded speeds are magnitudes. A negative value is compared by its
+//!   This covers every axis of a command (forward, lateral, vertical, yaw,
+//!   roll, pitch, joint).
+//! * Commanded speeds are signed. A negative value is compared by its
 //!   **absolute value** (a decoder that forgot `abs()` must not create a bypass
 //!   via `-5.0 > 0.5 == false`).
 //! * A profile whose envelope limit is negative / NaN / ±inf cannot be
@@ -86,12 +88,23 @@ pub enum RobotEvent {
 /// A single motion command, normalised across robot kinds.
 ///
 /// Linear and angular values are **signed body-frame velocities** taken from
-/// the command message as is (`geometry_msgs/Twist` `linear.x` and
-/// `angular.z`, ROS REP 103: +x forward, +yaw counter-clockwise). Producers
-/// must keep the sign: the motion monitor uses it to see a robot driving or
-/// turning against its command, and a magnitude sent for a reversing command
-/// would look like a direction reversal. Envelope checks compare `|v|`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// the command message as is (`geometry_msgs/Twist`, ROS REP 103: +x forward,
+/// +y left, +z up, +yaw counter-clockwise). `linear_speed` is always
+/// `linear.x` and `angular_speed` is always `angular.z`; the other four Twist
+/// axes are carried in `linear_y`, `linear_z`, `angular_x` and `angular_y`
+/// (holonomic / mecanum / omni bases move along `y`; a hostile writer can
+/// put anything in any axis). Producers must keep the sign: the motion
+/// monitor uses it to see a robot driving or turning against its command,
+/// and a magnitude sent for a reversing command would look like a direction
+/// reversal. Envelope checks compare `|v|` per axis plus the resultant
+/// `‖(x, y, z)‖` against `max_linear_speed` (see [`profile`]).
+///
+/// The four extra axes are `#[serde(default)]`: an event serialised before
+/// they existed deserialises with `None` (= "the command says nothing about
+/// that axis"), and a producer with only a forward speed leaves them `None`.
+/// Construct with `..Default::default()` so further axes do not break call
+/// sites.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MotionCommand {
     /// Topic (ROS 2, de-mangled, e.g. `/cmd_vel`) the command arrived on.
     /// Must match a key of `Profile::motion_envelopes` exactly. Profile keys
@@ -110,10 +123,83 @@ pub struct MotionCommand {
     pub joint_speed: Option<f64>,
     /// Commanded yaw rate in rad/s, signed (`Twist.angular.z`); `None` when
     /// the command says nothing about rotation. The profile envelope has no
-    /// angular limit (the Motion Firewall's per-channel `max_angular_speed`
+    /// yaw limit (the Motion Firewall's per-channel `max_angular_speed`
     /// bounds it); a non-finite value is a Critical deviation.
     #[serde(default)]
     pub angular_speed: Option<f64>,
+    /// Commanded lateral velocity in m/s, signed (`Twist.linear.y`, +left).
+    /// Bounded by the envelope's `max_lateral_speed` and, together with
+    /// `linear_speed` / `linear_z`, by `max_linear_speed` (resultant).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linear_y: Option<f64>,
+    /// Commanded vertical velocity in m/s, signed (`Twist.linear.z`, +up).
+    /// Bounded by `max_vertical_speed` and by the resultant check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linear_z: Option<f64>,
+    /// Commanded roll rate in rad/s, signed (`Twist.angular.x`). Bounded,
+    /// with `angular_y`, by `max_roll_pitch_rate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub angular_x: Option<f64>,
+    /// Commanded pitch rate in rad/s, signed (`Twist.angular.y`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub angular_y: Option<f64>,
+}
+
+impl MotionCommand {
+    /// Every signed component with its name, for checks that must look at
+    /// all of them (non-finite detection).
+    pub fn components(&self) -> [(&'static str, Option<f64>); 7] {
+        [
+            ("linear", self.linear_speed),
+            ("joint", self.joint_speed),
+            ("angular", self.angular_speed),
+            ("linear_y", self.linear_y),
+            ("linear_z", self.linear_z),
+            ("angular_x", self.angular_x),
+            ("angular_y", self.angular_y),
+        ]
+    }
+
+    /// `true` if the command carries any axis beyond forward speed / yaw
+    /// rate / joint speed (a holonomic or 6-DoF command).
+    pub fn has_extra_axes(&self) -> bool {
+        self.linear_y.is_some()
+            || self.linear_z.is_some()
+            || self.angular_x.is_some()
+            || self.angular_y.is_some()
+    }
+
+    /// Resultant linear speed `‖(x, y, z)‖` in m/s over the axes present
+    /// (`None` axes count as 0), or `None` if no linear axis is present.
+    /// Non-finite if any present axis is; a finite vector whose norm
+    /// overflows is `+inf`.
+    pub fn linear_resultant(&self) -> Option<f64> {
+        if self.linear_speed.is_none() && self.linear_y.is_none() && self.linear_z.is_none() {
+            return None;
+        }
+        let x = self.linear_speed.unwrap_or(0.0);
+        let y = self.linear_y.unwrap_or(0.0);
+        let z = self.linear_z.unwrap_or(0.0);
+        if x.is_nan() || y.is_nan() || z.is_nan() {
+            return Some(f64::NAN);
+        }
+        Some(x.hypot(y).hypot(z))
+    }
+
+    /// Roll/pitch rate magnitude `‖(angular_x, angular_y)‖` in rad/s, or
+    /// `None` if neither is present. Same non-finite rules as
+    /// [`MotionCommand::linear_resultant`].
+    pub fn roll_pitch_rate(&self) -> Option<f64> {
+        if self.angular_x.is_none() && self.angular_y.is_none() {
+            return None;
+        }
+        let x = self.angular_x.unwrap_or(0.0);
+        let y = self.angular_y.unwrap_or(0.0);
+        if x.is_nan() || y.is_nan() {
+            return Some(f64::NAN);
+        }
+        Some(x.hypot(y))
+    }
 }
 
 /// Measured motion reported by the platform (e.g. from `/odom` or
@@ -122,11 +208,15 @@ pub struct MotionCommand {
 ///
 /// `measured_linear_speed` is a **magnitude** (kept for producers that only
 /// have a speed, e.g. GNSS speed over ground). Producers that have the
-/// velocity vector (`nav_msgs/Odometry` `twist.twist`, IMU yaw rate) should
-/// also fill the signed `linear_velocity` / `angular_velocity`: the motion
-/// monitor compares signed values by default and only uses the magnitude for
-/// sources configured as unsigned.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// velocity vector (`nav_msgs/Odometry` `twist.twist`, IMU angular rates)
+/// should also fill the signed per-axis fields: `linear_velocity` (x) /
+/// `angular_velocity` (yaw) as before, plus `linear_velocity_y` /
+/// `linear_velocity_z` / `angular_velocity_x` / `angular_velocity_y` so a
+/// holonomic base moving sideways can be compared axis by axis with its
+/// command. The motion monitor compares signed values by default and only
+/// uses the magnitude for sources configured as unsigned. All per-axis
+/// fields are `#[serde(default)]` (old events deserialise with `None`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MotionFeedback {
     /// Topic or bus id the feedback arrived on.
     pub channel: String,
@@ -142,6 +232,18 @@ pub struct MotionFeedback {
     /// Measured yaw rate in rad/s, signed (REP 103).
     #[serde(default)]
     pub angular_velocity: Option<f64>,
+    /// Measured lateral velocity in m/s, signed (body frame, +left).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linear_velocity_y: Option<f64>,
+    /// Measured vertical velocity in m/s, signed (body frame, +up).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linear_velocity_z: Option<f64>,
+    /// Measured roll rate in rad/s, signed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub angular_velocity_x: Option<f64>,
+    /// Measured pitch rate in rad/s, signed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub angular_velocity_y: Option<f64>,
     /// GUID of the DDS writer that published this sample, if known. Lets the
     /// motion monitor keep per-publisher state and see a second (injected)
     /// publisher interleaving on the same feedback topic.
@@ -300,6 +402,7 @@ mod tests {
                 linear_speed: Some(-0.25),
                 joint_speed: None,
                 angular_speed: None,
+                ..Default::default()
             }),
             RobotEvent::MotionFeedback(MotionFeedback {
                 channel: "/odom".into(),
@@ -309,12 +412,88 @@ mod tests {
                 angular_velocity: None,
                 publisher_guid: None,
                 timestamp_ns: 1_700_000_000_000_000_000,
+                ..Default::default()
             }),
         ];
         for e in events {
             let json = serde_json::to_string(&e).unwrap();
             let back: RobotEvent = serde_json::from_str(&json).unwrap();
             assert_eq!(back, e, "{json}");
+        }
+    }
+
+    #[test]
+    fn motion_events_back_compat_and_holonomic_round_trip() {
+        // Events serialised before the per-axis fields existed.
+        let old: RobotEvent = serde_json::from_str(
+            r#"{"kind":"motion_command","channel":"/cmd_vel","source_guid":null,"linear_speed":0.3,"joint_speed":null,"angular_speed":-0.1}"#,
+        )
+        .unwrap();
+        let RobotEvent::MotionCommand(c) = &old else {
+            panic!()
+        };
+        assert!(!c.has_extra_axes());
+        assert_eq!(c.linear_speed, Some(0.3));
+        // ... re-serialise byte-identically (absent axes are not written).
+        assert_eq!(
+            serde_json::to_string(&old).unwrap(),
+            r#"{"kind":"motion_command","channel":"/cmd_vel","source_guid":null,"linear_speed":0.3,"joint_speed":null,"angular_speed":-0.1}"#
+        );
+        let old_fb: RobotEvent = serde_json::from_str(
+            r#"{"kind":"motion_feedback","channel":"/odom","measured_linear_speed":0.2,"linear_velocity":-0.2,"timestamp_ns":1}"#,
+        )
+        .unwrap();
+        let RobotEvent::MotionFeedback(f) = &old_fb else {
+            panic!()
+        };
+        assert_eq!(
+            (
+                f.linear_velocity_y,
+                f.linear_velocity_z,
+                f.angular_velocity_x,
+                f.angular_velocity_y
+            ),
+            (None, None, None, None)
+        );
+        // Holonomic command / feedback round-trip with every axis.
+        let events = [
+            RobotEvent::MotionCommand(MotionCommand {
+                channel: "/cmd_vel".into(),
+                linear_speed: Some(0.1),
+                linear_y: Some(-0.4),
+                linear_z: Some(0.0),
+                angular_x: Some(0.01),
+                angular_y: Some(-0.02),
+                angular_speed: Some(0.3),
+                ..Default::default()
+            }),
+            RobotEvent::MotionFeedback(MotionFeedback {
+                channel: "/odom".into(),
+                linear_velocity: Some(0.1),
+                linear_velocity_y: Some(-0.39),
+                linear_velocity_z: Some(0.0),
+                angular_velocity_x: Some(0.0),
+                angular_velocity_y: Some(0.0),
+                angular_velocity: Some(0.29),
+                timestamp_ns: 9,
+                ..Default::default()
+            }),
+        ];
+        for e in events {
+            let json = serde_json::to_string(&e).unwrap();
+            assert_eq!(
+                serde_json::from_str::<RobotEvent>(&json).unwrap(),
+                e,
+                "{json}"
+            );
+        }
+        // Hostile per-axis values fail to parse cleanly.
+        for bad in [
+            r#"{"kind":"motion_command","channel":"/c","source_guid":null,"linear_speed":null,"joint_speed":null,"linear_y":1e999}"#,
+            r#"{"kind":"motion_command","channel":"/c","source_guid":null,"linear_speed":null,"joint_speed":null,"angular_x":"x"}"#,
+            r#"{"kind":"motion_feedback","channel":"/o","timestamp_ns":1,"linear_velocity_y":[1]}"#,
+        ] {
+            assert!(serde_json::from_str::<RobotEvent>(bad).is_err(), "{bad}");
         }
     }
 
@@ -334,6 +513,7 @@ mod tests {
                 angular_velocity: None,
                 publisher_guid: None,
                 timestamp_ns: 5,
+                ..Default::default()
             })
         );
         let e: RobotEvent = serde_json::from_str(

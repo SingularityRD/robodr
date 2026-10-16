@@ -191,6 +191,7 @@ fn clean_run(r: &mut Rng) -> Vec<RobotEvent> {
                 linear_speed: lin,
                 joint_speed: joint,
                 angular_speed: None,
+                ..Default::default()
             }));
         }
     }
@@ -203,6 +204,7 @@ fn clean_run(r: &mut Rng) -> Vec<RobotEvent> {
             angular_velocity: None,
             publisher_guid: None,
             timestamp_ns: r.next(),
+            ..Default::default()
         }));
     }
     // Shuffle (Fisher-Yates).

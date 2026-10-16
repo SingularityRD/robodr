@@ -71,13 +71,49 @@
 //! # Motion envelope
 //!
 //! See the crate docs for the NaN / negative / invalid-limit rules. Checks run
-//! in this order and the first hit is returned: non-finite command (linear,
-//! joint or angular; Critical),
-//! unprofiled channel (High), invalid envelope limit (High, profile error),
-//! linear over envelope (Critical), joint over envelope (Critical). `None` as a
-//! limit means "not constrained"; use `None`, not `+inf`, for that. The
-//! envelope has no angular field: a finite yaw rate is bounded by the Motion
-//! Firewall's per-channel `max_angular_speed`, not here.
+//! in this order and the first hit is returned:
+//!
+//! 1. non-finite value on **any** axis of the command (forward, joint, yaw,
+//!    lateral, vertical, roll, pitch) → `robot.motion.non_finite_command`
+//!    (Critical);
+//! 2. unprofiled channel → `robot.motion.unprofiled_channel` (High);
+//! 3. invalid envelope limit, or a `holonomic` envelope missing a mandatory
+//!    limit → `robot.profile.invalid_envelope` (High, profile error);
+//! 4. `|linear.x| > max_linear_speed`, then resultant
+//!    `‖(linear.x, linear.y, linear.z)‖ > max_linear_speed`,
+//!    then `|linear.y| > max_lateral_speed`, then
+//!    `|linear.z| > max_vertical_speed` → `robot.motion.linear_over_envelope`
+//!    (Critical; the detail names the axis);
+//! 5. `‖(angular.x, angular.y)‖ > max_roll_pitch_rate` →
+//!    `robot.motion.angular_over_envelope` (Critical);
+//! 6. `|joint| > max_joint_speed` → `robot.motion.joint_over_envelope`
+//!    (Critical).
+//!
+//! `None` as a limit means "not constrained"; use `None`, not `+inf`, for
+//! that. A command axis that is `None` is not checked by its per-axis limit
+//! (it counts as 0 in the resultant).
+//!
+//! **Holonomic channels.** `linear_speed` is the signed forward component
+//! (`linear.x`) on every platform; a mecanum / omni base also moves along
+//! `linear.y`. An envelope therefore declares `holonomic`:
+//!
+//! * `holonomic: false` (the default, and what every profile written before
+//!   this field existed is): per-axis limits are optional, `None` = not
+//!   constrained per axis. The resultant check still bounds a bogus
+//!   `linear.y/z` on a differential-drive base by `max_linear_speed`, so
+//!   leaving the extra axes unset cannot open a sideways bypass.
+//! * `holonomic: true`: `max_linear_speed`, `max_lateral_speed`,
+//!   `max_vertical_speed` and `max_roll_pitch_rate` are **mandatory**. A
+//!   missing one is a validation error ([`ProfileError::MissingHolonomicLimit`])
+//!   and, should such a profile be evaluated anyway, every command on the
+//!   channel is denied as `robot.profile.invalid_envelope`. The asymmetry is
+//!   deliberate: declaring a base holonomic is a statement that sideways /
+//!   vertical / tilting motion is legitimate, so it must come with an
+//!   explicit bound for each (`0.0` for an axis that must not move) instead
+//!   of an implicit "unconstrained". `max_joint_speed` stays optional.
+//!
+//! The envelope has no yaw-rate field: a finite yaw rate is bounded by the
+//! Motion Firewall's per-channel `max_angular_speed`, not here.
 //!
 //! # Artifact metadata ([`ProfileMetadata`])
 //!
@@ -111,15 +147,70 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-/// A motion envelope: the limits a command may not exceed. `None` means the
-/// dimension is not constrained for this model. A limit must be finite and
-/// `>= 0`; anything else is a profile error (see [`Profile::validate`]).
+/// A motion envelope: the limits a command may not exceed. A limit must be
+/// finite and `>= 0`; anything else is a profile error (see
+/// [`Profile::validate`]).
+///
+/// `None` means the dimension is not constrained for this channel, **except**
+/// on a channel declared `holonomic: true`: there `max_linear_speed`,
+/// `max_lateral_speed`, `max_vertical_speed` and `max_roll_pitch_rate` are
+/// all mandatory (use `0.0` for an axis the base cannot or must not move
+/// along), validation reports a missing one as
+/// [`ProfileError::MissingHolonomicLimit`] and `evaluate` reports every
+/// command on the channel as `robot.profile.invalid_envelope` (fail closed).
+/// See the module docs ("Motion envelope") for the full rule set.
+///
+/// All fields are `#[serde(default)]`: a profile written before the
+/// holonomic fields existed loads unchanged as a non-holonomic envelope.
+/// Construct with `..Default::default()`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
-    /// Max allowed linear speed, m/s.
+    /// Max allowed linear speed, m/s: bounds `|linear.x|` and the resultant
+    /// `‖(x, y, z)‖` of the commanded linear velocity.
+    #[serde(default)]
     pub max_linear_speed: Option<f64>,
     /// Max allowed joint speed, rad/s.
+    #[serde(default)]
     pub max_joint_speed: Option<f64>,
+    /// The channel drives a holonomic (mecanum / omni / 6-DoF) base: every
+    /// per-axis limit below, and `max_linear_speed`, must be set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub holonomic: bool,
+    /// Max allowed `|linear.y|` (sideways), m/s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lateral_speed: Option<f64>,
+    /// Max allowed `|linear.z|` (vertical), m/s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_vertical_speed: Option<f64>,
+    /// Max allowed roll/pitch rate `‖(angular.x, angular.y)‖`, rad/s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_roll_pitch_rate: Option<f64>,
+}
+
+impl Envelope {
+    /// Every limit with its field id (for validation and fail-closed checks).
+    pub fn limits(&self) -> [(EnvelopeField, Option<f64>); 5] {
+        [
+            (EnvelopeField::MaxLinearSpeed, self.max_linear_speed),
+            (EnvelopeField::MaxJointSpeed, self.max_joint_speed),
+            (EnvelopeField::MaxLateralSpeed, self.max_lateral_speed),
+            (EnvelopeField::MaxVerticalSpeed, self.max_vertical_speed),
+            (EnvelopeField::MaxRollPitchRate, self.max_roll_pitch_rate),
+        ]
+    }
+
+    /// The limits a `holonomic` envelope must declare but does not (empty
+    /// for a non-holonomic envelope).
+    pub fn missing_holonomic_limits(&self) -> Vec<EnvelopeField> {
+        if !self.holonomic {
+            return Vec::new();
+        }
+        self.limits()
+            .into_iter()
+            .filter(|(f, v)| *f != EnvelopeField::MaxJointSpeed && v.is_none())
+            .map(|(f, _)| f)
+            .collect()
+    }
 }
 
 /// The profile file-format version this crate understands
@@ -270,6 +361,9 @@ pub struct Profile {
 pub enum EnvelopeField {
     MaxLinearSpeed,
     MaxJointSpeed,
+    MaxLateralSpeed,
+    MaxVerticalSpeed,
+    MaxRollPitchRate,
 }
 
 impl EnvelopeField {
@@ -277,6 +371,9 @@ impl EnvelopeField {
         match self {
             Self::MaxLinearSpeed => "max_linear_speed",
             Self::MaxJointSpeed => "max_joint_speed",
+            Self::MaxLateralSpeed => "max_lateral_speed",
+            Self::MaxVerticalSpeed => "max_vertical_speed",
+            Self::MaxRollPitchRate => "max_roll_pitch_rate",
         }
     }
 }
@@ -294,6 +391,11 @@ pub enum ProfileError {
         field: EnvelopeField,
         /// The offending value (serialized as `null` when NaN/inf).
         value: f64,
+    },
+    /// A `holonomic: true` envelope leaves a mandatory limit unset (`None`).
+    MissingHolonomicLimit {
+        channel: String,
+        field: EnvelopeField,
     },
     /// A `motion_envelopes` key is empty.
     EmptyMotionChannel,
@@ -339,6 +441,11 @@ impl fmt::Display for ProfileError {
             } => write!(
                 f,
                 "envelope {} on channel {channel:?} is {value} (must be finite and >= 0; use null for unconstrained)",
+                field.as_str()
+            ),
+            Self::MissingHolonomicLimit { channel, field } => write!(
+                f,
+                "envelope on channel {channel:?} is holonomic but {} is not set (holonomic channels must bound every axis; use 0 for an axis that must not move)",
                 field.as_str()
             ),
             Self::EmptyMotionChannel => write!(f, "motion_envelopes has an empty channel name"),
@@ -468,10 +575,13 @@ impl Profile {
                     channel: channel.clone(),
                 });
             }
-            for (field, lim) in [
-                (EnvelopeField::MaxLinearSpeed, env.max_linear_speed),
-                (EnvelopeField::MaxJointSpeed, env.max_joint_speed),
-            ] {
+            for field in env.missing_holonomic_limits() {
+                errs.push(ProfileError::MissingHolonomicLimit {
+                    channel: channel.clone(),
+                    field,
+                });
+            }
+            for (field, lim) in env.limits() {
                 if let Some(v) = lim {
                     if !valid_limit(v) {
                         errs.push(ProfileError::InvalidEnvelopeLimit {
@@ -623,13 +733,9 @@ impl Profile {
     }
 
     fn check_motion(&self, c: &MotionCommand) -> Option<Deviation> {
-        // 1. Hostile floats first: NaN compares false with everything, so it
-        //    must never reach a `>` check.
-        for (dim, v) in [
-            ("linear", c.linear_speed),
-            ("joint", c.joint_speed),
-            ("angular", c.angular_speed),
-        ] {
+        // 1. Hostile floats first, on every axis: NaN compares false with
+        //    everything, so it must never reach a `>` check.
+        for (dim, v) in c.components() {
             if let Some(v) = v.filter(|v| !v.is_finite()) {
                 return Some(Deviation::new(
                     "robot.motion.non_finite_command",
@@ -647,11 +753,9 @@ impl Profile {
             ));
         };
         // 2. Fail closed on a broken profile: an envelope we cannot enforce is
-        //    reported for every command on the channel.
-        for (field, lim) in [
-            (EnvelopeField::MaxLinearSpeed, env.max_linear_speed),
-            (EnvelopeField::MaxJointSpeed, env.max_joint_speed),
-        ] {
+        //    reported for every command on the channel. A holonomic envelope
+        //    with an unset axis limit is "cannot enforce" too.
+        for (field, lim) in env.limits() {
             if let Some(max) = lim.filter(|m| !valid_limit(*m)) {
                 return Some(Deviation::new(
                     "robot.profile.invalid_envelope",
@@ -664,30 +768,87 @@ impl Profile {
                 ));
             }
         }
+        if let Some(field) = env.missing_holonomic_limits().first() {
+            return Some(Deviation::new(
+                "robot.profile.invalid_envelope",
+                Severity::High,
+                format!(
+                    "holonomic envelope on {} has no {}; command cannot be checked",
+                    c.channel,
+                    field.as_str()
+                ),
+            ));
+        }
         // 3. Magnitudes: compare |v| so a signed value cannot slip under.
-        if let (Some(max), Some(v)) = (env.max_linear_speed, c.linear_speed) {
-            if v.abs() > max {
-                return Some(Deviation::new(
+        let over = |rule: &'static str, what: &str, unit: &str, v: f64, max: f64| {
+            Deviation::new(
+                rule,
+                Severity::Critical,
+                format!(
+                    "{what} {v:.3} {unit} (|{:.3}|) over envelope {max:.3} on {}",
+                    v.abs(),
+                    c.channel
+                ),
+            )
+        };
+        if let Some(max) = env.max_linear_speed {
+            if let Some(v) = c.linear_speed.filter(|v| v.abs() > max) {
+                return Some(over(
                     "robot.motion.linear_over_envelope",
-                    Severity::Critical,
-                    format!(
-                        "linear speed {v:.3} m/s (|{:.3}|) over envelope {max:.3} on {}",
-                        v.abs(),
-                        c.channel
-                    ),
+                    "linear speed",
+                    "m/s",
+                    v,
+                    max,
+                ));
+            }
+            // Resultant: a holonomic command can stay under the limit on
+            // every axis and still exceed it diagonally; a diff-drive base
+            // given a bogus linear.y is bounded the same way (as before).
+            if let Some(r) = c.linear_resultant().filter(|r| *r > max) {
+                return Some(over(
+                    "robot.motion.linear_over_envelope",
+                    "resultant linear speed ‖(x,y,z)‖",
+                    "m/s",
+                    r,
+                    max,
+                ));
+            }
+        }
+        for (max, v, what, unit) in [
+            (env.max_lateral_speed, c.linear_y, "lateral speed", "m/s"),
+            (env.max_vertical_speed, c.linear_z, "vertical speed", "m/s"),
+        ] {
+            if let (Some(max), Some(v)) = (max, v) {
+                if v.abs() > max {
+                    return Some(over(
+                        "robot.motion.linear_over_envelope",
+                        what,
+                        unit,
+                        v,
+                        max,
+                    ));
+                }
+            }
+        }
+        if let (Some(max), Some(r)) = (env.max_roll_pitch_rate, c.roll_pitch_rate()) {
+            if r > max {
+                return Some(over(
+                    "robot.motion.angular_over_envelope",
+                    "roll/pitch rate",
+                    "rad/s",
+                    r,
+                    max,
                 ));
             }
         }
         if let (Some(max), Some(v)) = (env.max_joint_speed, c.joint_speed) {
             if v.abs() > max {
-                return Some(Deviation::new(
+                return Some(over(
                     "robot.motion.joint_over_envelope",
-                    Severity::Critical,
-                    format!(
-                        "joint speed {v:.3} rad/s (|{:.3}|) over envelope {max:.3} on {}",
-                        v.abs(),
-                        c.channel
-                    ),
+                    "joint speed",
+                    "rad/s",
+                    v,
+                    max,
                 ));
             }
         }
@@ -718,6 +879,7 @@ mod tests {
             Envelope {
                 max_linear_speed: Some(0.5),
                 max_joint_speed: Some(1.0),
+                ..Default::default()
             },
         );
         p.services.insert("/add_two_ints".into());
@@ -746,6 +908,7 @@ mod tests {
             linear_speed: lin,
             joint_speed: joint,
             angular_speed: None,
+            ..Default::default()
         })
     }
     fn with_angular(e: RobotEvent, a: f64) -> RobotEvent {
@@ -1023,6 +1186,7 @@ mod tests {
                 Envelope {
                     max_linear_speed: Some(bad),
                     max_joint_speed: None,
+                    ..Default::default()
                 },
             );
             // Every command is reported, including ones that would have
@@ -1064,6 +1228,7 @@ mod tests {
             angular_velocity: None,
             publisher_guid: None,
             timestamp_ns: 0,
+            ..Default::default()
         });
         assert!(profile().evaluate(&fb).is_none());
     }
@@ -1119,6 +1284,7 @@ mod tests {
             Envelope {
                 max_linear_speed: Some(f64::NAN),
                 max_joint_speed: Some(-1.0),
+                ..Default::default()
             },
         );
         let errs = p.validate().unwrap_err();
@@ -1244,6 +1410,7 @@ mod tests {
             Envelope {
                 max_linear_speed: None,
                 max_joint_speed: Some(1.0),
+                ..Default::default()
             },
         );
         assert_eq!(
@@ -1411,6 +1578,408 @@ mod tests {
         )
         .unwrap();
         assert!(neg.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod holonomic_tests {
+    use super::*;
+
+    const MECANUM: &str = "/mecanum/cmd_vel";
+    const DIFF: &str = "/cmd_vel";
+
+    fn mecanum_env() -> Envelope {
+        Envelope {
+            max_linear_speed: Some(1.0),
+            holonomic: true,
+            max_lateral_speed: Some(0.6),
+            max_vertical_speed: Some(0.0),
+            max_roll_pitch_rate: Some(0.0),
+            ..Default::default()
+        }
+    }
+
+    fn profile() -> Profile {
+        let mut p = Profile {
+            model: "mecanum-ugv".into(),
+            locked: true,
+            ..Default::default()
+        };
+        p.writer_topics.insert(DIFF.into());
+        p.writer_topics.insert(MECANUM.into());
+        p.motion_envelopes.insert(
+            DIFF.into(),
+            Envelope {
+                max_linear_speed: Some(0.5),
+                ..Default::default()
+            },
+        );
+        p.motion_envelopes.insert(MECANUM.into(), mecanum_env());
+        p
+    }
+
+    /// A full Twist-shaped command: [x, y, z, roll, pitch, yaw].
+    fn twist(channel: &str, v: [f64; 6]) -> RobotEvent {
+        RobotEvent::MotionCommand(MotionCommand {
+            channel: channel.into(),
+            source_guid: None,
+            linear_speed: Some(v[0]),
+            linear_y: Some(v[1]),
+            linear_z: Some(v[2]),
+            angular_x: Some(v[3]),
+            angular_y: Some(v[4]),
+            angular_speed: Some(v[5]),
+            joint_speed: None,
+        })
+    }
+
+    fn rule(p: &Profile, e: &RobotEvent) -> Option<String> {
+        p.evaluate(e).map(|d| d.rule.into_owned())
+    }
+
+    #[test]
+    fn profile_validates() {
+        assert_eq!(profile().validate(), Ok(()));
+    }
+
+    #[test]
+    fn diff_drive_behaviour_is_unchanged() {
+        let p = profile();
+        // Planar command with explicit zero extra axes == old x/yaw command.
+        for (x, yaw, want) in [
+            (0.4, 1.0, None),
+            (-0.5, -3.0, None),
+            (0.51, 0.0, Some("robot.motion.linear_over_envelope")),
+            (-2.5, 0.0, Some("robot.motion.linear_over_envelope")),
+        ] {
+            assert_eq!(
+                rule(&p, &twist(DIFF, [x, 0.0, 0.0, 0.0, 0.0, yaw])).as_deref(),
+                want,
+                "{x}"
+            );
+            let legacy = RobotEvent::MotionCommand(MotionCommand {
+                channel: DIFF.into(),
+                linear_speed: Some(x),
+                angular_speed: Some(yaw),
+                ..Default::default()
+            });
+            assert_eq!(rule(&p, &legacy).as_deref(), want, "{x}");
+        }
+        // linear_speed is the signed x, never a folded magnitude.
+        let d = p
+            .evaluate(&twist(DIFF, [-0.6, 0.0, 0.0, 0.0, 0.0, 0.0]))
+            .unwrap();
+        assert!(d.detail.starts_with("linear speed -0.600"), "{}", d.detail);
+    }
+
+    #[test]
+    fn diff_drive_bogus_lateral_is_bounded_by_the_resultant() {
+        let p = profile();
+        // Non-holonomic, no lateral limit: y alone or diagonal over max_linear
+        // is still over envelope (no sideways bypass).
+        let d = p
+            .evaluate(&twist(DIFF, [0.0, 50.0, 0.0, 0.0, 0.0, 0.0]))
+            .unwrap();
+        assert_eq!(d.rule, "robot.motion.linear_over_envelope");
+        assert_eq!(d.severity, Severity::Critical);
+        assert!(d.detail.contains("resultant"), "{}", d.detail);
+        let d = p
+            .evaluate(&twist(DIFF, [0.4, 0.4, 0.0, 0.0, 0.0, 0.0]))
+            .unwrap();
+        assert!(d.detail.contains("resultant"), "{}", d.detail);
+        assert_eq!(
+            rule(&p, &twist(DIFF, [0.0, 0.0, -0.6, 0.0, 0.0, 0.0])).as_deref(),
+            Some("robot.motion.linear_over_envelope")
+        );
+        // Within the resultant: clean (lateral not constrained per axis).
+        assert!(p
+            .evaluate(&twist(DIFF, [0.3, 0.4, 0.0, 0.0, 0.0, 0.0]))
+            .is_none());
+        // Roll/pitch with no limit on a non-holonomic channel: not judged.
+        assert!(p
+            .evaluate(&twist(DIFF, [0.0, 0.0, 0.0, 5.0, -5.0, 0.0]))
+            .is_none());
+    }
+
+    #[test]
+    fn mecanum_lateral_within_and_over_limits() {
+        let p = profile();
+        for v in [
+            [0.0, 0.6, 0.0, 0.0, 0.0, 0.0],
+            [0.0, -0.6, 0.0, 0.0, 0.0, 0.5],
+            [0.8, 0.6, 0.0, 0.0, 0.0, 0.0], // resultant exactly 1.0
+            [-0.5, 0.3, -0.0, 0.0, 0.0, -1.0],
+        ] {
+            assert!(p.evaluate(&twist(MECANUM, v)).is_none(), "{v:?}");
+        }
+        let d = p
+            .evaluate(&twist(MECANUM, [0.0, -0.61, 0.0, 0.0, 0.0, 0.0]))
+            .unwrap();
+        assert_eq!(d.rule, "robot.motion.linear_over_envelope");
+        assert_eq!(d.severity, Severity::Critical);
+        assert!(d.detail.starts_with("lateral speed -0.610"), "{}", d.detail);
+        // Each axis within its own limit, diagonal over max_linear.
+        let d = p
+            .evaluate(&twist(MECANUM, [0.9, 0.6, 0.0, 0.0, 0.0, 0.0]))
+            .unwrap();
+        assert!(d.detail.contains("resultant"), "{}", d.detail);
+        // x alone still uses max_linear_speed.
+        let d = p
+            .evaluate(&twist(MECANUM, [-1.2, 0.0, 0.0, 0.0, 0.0, 0.0]))
+            .unwrap();
+        assert!(d.detail.starts_with("linear speed"), "{}", d.detail);
+        // Vertical / roll-pitch limits of 0: any motion there is over.
+        let d = p
+            .evaluate(&twist(MECANUM, [0.0, 0.0, 0.01, 0.0, 0.0, 0.0]))
+            .unwrap();
+        assert!(d.detail.starts_with("vertical speed"), "{}", d.detail);
+        let d = p
+            .evaluate(&twist(MECANUM, [0.0, 0.0, 0.0, 0.0, -0.01, 0.0]))
+            .unwrap();
+        assert_eq!(d.rule, "robot.motion.angular_over_envelope");
+        assert_eq!(d.severity, Severity::Critical);
+        // An absent axis is not checked by its per-axis limit.
+        let c = RobotEvent::MotionCommand(MotionCommand {
+            channel: MECANUM.into(),
+            linear_speed: Some(0.2),
+            ..Default::default()
+        });
+        assert!(p.evaluate(&c).is_none());
+    }
+
+    #[test]
+    fn roll_pitch_limit_uses_the_tilt_rate_magnitude() {
+        let mut p = profile();
+        p.motion_envelopes
+            .get_mut(MECANUM)
+            .unwrap()
+            .max_roll_pitch_rate = Some(0.5);
+        assert!(p
+            .evaluate(&twist(MECANUM, [0.0, 0.0, 0.0, 0.3, -0.4, 0.0]))
+            .is_none());
+        assert_eq!(
+            rule(&p, &twist(MECANUM, [0.0, 0.0, 0.0, 0.3, 0.41, 0.0])).as_deref(),
+            Some("robot.motion.angular_over_envelope")
+        );
+    }
+
+    #[test]
+    fn non_finite_on_any_axis_is_critical() {
+        let p = profile();
+        for bad in [f64::NAN, -f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for i in 0..6 {
+                let mut v = [0.0; 6];
+                v[i] = bad;
+                for ch in [MECANUM, DIFF, "/unprofiled"] {
+                    let d = p.evaluate(&twist(ch, v)).expect("must deviate");
+                    assert_eq!(d.rule, "robot.motion.non_finite_command", "{i} {ch}");
+                    assert_eq!(d.severity, Severity::Critical);
+                }
+            }
+            // NaN in y alone, everything else absent.
+            let c = RobotEvent::MotionCommand(MotionCommand {
+                channel: MECANUM.into(),
+                linear_y: Some(bad),
+                ..Default::default()
+            });
+            let d = p.evaluate(&c).unwrap();
+            assert_eq!(d.rule, "robot.motion.non_finite_command");
+            assert!(d.detail.contains("linear_y"), "{}", d.detail);
+        }
+        // NaN in y with an infinite x: hypot(inf, NaN) is inf in IEEE, but
+        // the NaN is still reported (component check runs first).
+        let c = MotionCommand {
+            linear_speed: Some(f64::INFINITY),
+            linear_y: Some(f64::NAN),
+            ..Default::default()
+        };
+        assert!(c.linear_resultant().unwrap().is_nan());
+    }
+
+    #[test]
+    fn resultant_helpers() {
+        let c = MotionCommand::default();
+        assert_eq!(c.linear_resultant(), None);
+        assert_eq!(c.roll_pitch_rate(), None);
+        assert!(!c.has_extra_axes());
+        let c = MotionCommand {
+            linear_speed: Some(-3.0),
+            linear_y: Some(4.0),
+            angular_x: Some(f64::MAX),
+            angular_y: Some(f64::MAX),
+            ..Default::default()
+        };
+        assert_eq!(c.linear_resultant(), Some(5.0));
+        assert_eq!(c.roll_pitch_rate(), Some(f64::INFINITY));
+        assert!(c.has_extra_axes());
+        let c = MotionCommand {
+            linear_z: Some(-2.0),
+            ..Default::default()
+        };
+        assert_eq!(c.linear_resultant(), Some(2.0));
+    }
+
+    #[test]
+    fn missing_limit_on_holonomic_channel_denies() {
+        for (field, clear) in [
+            (
+                EnvelopeField::MaxLateralSpeed,
+                (|e: &mut Envelope| e.max_lateral_speed = None) as fn(&mut Envelope),
+            ),
+            (EnvelopeField::MaxVerticalSpeed, |e: &mut Envelope| {
+                e.max_vertical_speed = None
+            }),
+            (EnvelopeField::MaxRollPitchRate, |e: &mut Envelope| {
+                e.max_roll_pitch_rate = None
+            }),
+            (EnvelopeField::MaxLinearSpeed, |e: &mut Envelope| {
+                e.max_linear_speed = None
+            }),
+        ] {
+            let mut p = profile();
+            clear(p.motion_envelopes.get_mut(MECANUM).unwrap());
+            let errs = p.validate().unwrap_err();
+            assert_eq!(
+                errs,
+                vec![ProfileError::MissingHolonomicLimit {
+                    channel: MECANUM.into(),
+                    field
+                }]
+            );
+            assert!(errs[0].to_string().contains(field.as_str()));
+            // Every command on the channel is denied, even a stationary one
+            // and one that says nothing about the missing axis.
+            for e in [
+                twist(MECANUM, [0.0; 6]),
+                twist(MECANUM, [0.1, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                RobotEvent::MotionCommand(MotionCommand {
+                    channel: MECANUM.into(),
+                    linear_speed: Some(0.1),
+                    ..Default::default()
+                }),
+            ] {
+                let d = p.evaluate(&e).expect("must deny");
+                assert_eq!(d.rule, "robot.profile.invalid_envelope", "{field:?}");
+                assert_eq!(d.severity, Severity::High);
+                assert!(d.detail.contains(field.as_str()), "{}", d.detail);
+            }
+            // The non-holonomic channel is unaffected.
+            assert!(p
+                .evaluate(&twist(DIFF, [0.1, 0.0, 0.0, 0.0, 0.0, 0.0]))
+                .is_none());
+            // Non-finite still wins over the profile error.
+            assert_eq!(
+                rule(&p, &twist(MECANUM, [f64::NAN, 0.0, 0.0, 0.0, 0.0, 0.0])).as_deref(),
+                Some("robot.motion.non_finite_command")
+            );
+        }
+        // All missing: one error per field, joint speed is never required.
+        let mut p = profile();
+        p.motion_envelopes.insert(
+            MECANUM.into(),
+            Envelope {
+                holonomic: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(p.validate().unwrap_err().len(), 4);
+        // The same envelope without `holonomic` is merely unconstrained.
+        p.motion_envelopes
+            .insert(MECANUM.into(), Envelope::default());
+        assert_eq!(p.validate(), Ok(()));
+        assert!(p
+            .evaluate(&twist(MECANUM, [9.0, 9.0, 9.0, 9.0, 9.0, 9.0]))
+            .is_none());
+    }
+
+    #[test]
+    fn invalid_axis_limit_fails_closed() {
+        for bad in [f64::NAN, f64::INFINITY, -0.1] {
+            let mut p = profile();
+            p.motion_envelopes.get_mut(DIFF).unwrap().max_lateral_speed = Some(bad);
+            let errs = p.validate().unwrap_err();
+            assert!(matches!(
+                errs.as_slice(),
+                [ProfileError::InvalidEnvelopeLimit {
+                    field: EnvelopeField::MaxLateralSpeed,
+                    ..
+                }]
+            ));
+            assert_eq!(
+                rule(&p, &twist(DIFF, [0.0; 6])).as_deref(),
+                Some("robot.profile.invalid_envelope")
+            );
+        }
+    }
+
+    #[test]
+    fn holonomic_example_profile_parses_and_validates() {
+        let p: Profile = serde_json::from_str(include_str!(
+            "../../../config/profile.holonomic.example.json"
+        ))
+        .unwrap();
+        assert_eq!(p.validate(), Ok(()));
+        let env = &p.motion_envelopes["/cmd_vel"];
+        assert!(env.holonomic);
+        assert!(env.missing_holonomic_limits().is_empty());
+        // Sideways within limits is clean; over the lateral limit is not.
+        assert!(p
+            .evaluate(&twist("/cmd_vel", [0.2, -0.5, 0.0, 0.0, 0.0, 0.4]))
+            .is_none());
+        let d = p
+            .evaluate(&twist("/cmd_vel", [0.0, 0.55, 0.0, 0.0, 0.0, 0.0]))
+            .unwrap();
+        assert_eq!(d.rule, "robot.motion.linear_over_envelope");
+        assert!(d.is_observe_only()); // the example is unlocked
+                                      // The diff-drive example stays non-holonomic.
+        let old: Profile =
+            serde_json::from_str(include_str!("../../../config/profile.example.json")).unwrap();
+        assert!(old.motion_envelopes.values().all(|e| !e.holonomic));
+    }
+
+    #[test]
+    fn serde_back_compat_profiles() {
+        // A profile written before the holonomic fields existed.
+        let old = r#"{"model":"m","writer_topics":["/cmd_vel"],"motion_envelopes":{"/cmd_vel":{"max_linear_speed":0.5,"max_joint_speed":null}}}"#;
+        let p: Profile = serde_json::from_str(old).unwrap();
+        let env = &p.motion_envelopes["/cmd_vel"];
+        assert!(!env.holonomic);
+        assert_eq!(
+            (
+                env.max_lateral_speed,
+                env.max_vertical_speed,
+                env.max_roll_pitch_rate
+            ),
+            (None, None, None)
+        );
+        assert_eq!(p.validate(), Ok(()));
+        // ... and re-serialises without the new keys (sealed/signed bytes
+        // of existing profiles stay identical).
+        let j = serde_json::to_string(env).unwrap();
+        assert_eq!(j, r#"{"max_linear_speed":0.5,"max_joint_speed":null}"#);
+        // A holonomic envelope round-trips with its keys.
+        let j = serde_json::to_string(&mecanum_env()).unwrap();
+        assert!(
+            j.contains(r#""holonomic":true"#) && j.contains("max_lateral_speed"),
+            "{j}"
+        );
+        let back: Envelope = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, mecanum_env());
+        // Wrong types are parse errors, not panics.
+        for bad in [
+            r#"{"holonomic":"yes"}"#,
+            r#"{"max_lateral_speed":"fast"}"#,
+            r#"{"max_vertical_speed":1e999}"#,
+        ] {
+            assert!(serde_json::from_str::<Envelope>(bad).is_err(), "{bad}");
+        }
+        // Holonomic declared in JSON without the limits: parses, refused by
+        // validate.
+        let p: Profile = serde_json::from_str(
+            r#"{"model":"m","writer_topics":["/c"],"motion_envelopes":{"/c":{"max_linear_speed":1,"holonomic":true}}}"#,
+        )
+        .unwrap();
+        assert_eq!(p.validate().unwrap_err().len(), 3);
     }
 }
 

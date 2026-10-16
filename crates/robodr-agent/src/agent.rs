@@ -70,8 +70,10 @@
 //! `MotionCommand` carries the command's signed body-frame values
 //! (`Twist.linear.x` as `linear_speed`, `Twist.angular.z` as
 //! `angular_speed`, REP 103) and the max joint speed, but no source stamp:
-//! * Twist channel: `linear = (linear_speed, 0, 0)`, `angular = (0, 0,
-//!   angular_speed)` (an absent axis is 0 for the firewall). A command with
+//! * Twist channel: `linear = (linear_speed, linear_y, linear_z)`,
+//!   `angular = (angular_x, angular_y, angular_speed)` (an absent axis is 0
+//!   for the firewall; the firewall bounds each vector's norm, so a
+//!   holonomic or hostile sideways component is bounded too). A command with
 //!   only `joint_speed` becomes a 1-joint command (kind mismatch → reject).
 //!   Every Twist channel has an explicit `max_angular_speed` (see
 //!   [`crate::FirewallSettings::from_profile`]).
@@ -1260,10 +1262,13 @@ fn to_firewall_command(fs: &FirewallState, c: &MotionCommand, now: u64) -> Comma
         })
         .unwrap_or(SourceId::UNKNOWN);
     let channel = fs.fw.channel_id(&c.channel).unwrap_or(ChannelId(u16::MAX));
-    // Signed body-frame values, as on the wire (REP 103).
+    // Signed body-frame values, as on the wire (REP 103), on all six axes:
+    // the firewall bounds the norm of each vector, so a holonomic (or
+    // hostile) `linear.y/z` / `angular.x/y` must reach it.
     let yaw = c.angular_speed.unwrap_or(0.0);
-    let twist =
-        |v: f64| Motion::Twist(Twist::new(Vec3::new(v, 0.0, 0.0), Vec3::new(0.0, 0.0, yaw)));
+    let (ly, lz) = (c.linear_y.unwrap_or(0.0), c.linear_z.unwrap_or(0.0));
+    let (ax, ay) = (c.angular_x.unwrap_or(0.0), c.angular_y.unwrap_or(0.0));
+    let twist = |v: f64| Motion::Twist(Twist::new(Vec3::new(v, ly, lz), Vec3::new(ax, ay, yaw)));
     let joints = |n: usize, v: f64| {
         Motion::Joints(
             JointVelocities::from_slice(&vec![v; n.clamp(1, robodr_firewall::MAX_JOINTS)])
@@ -1468,6 +1473,7 @@ mod tests {
             linear_speed: Some(1.0),
             joint_speed: None,
             angular_speed: None,
+            ..Default::default()
         };
         assert_eq!(
             source_key(&RobotEvent::MotionCommand(c.clone())),
@@ -1488,6 +1494,7 @@ mod tests {
             linear_speed: None,
             joint_speed: None,
             angular_speed: None,
+            ..Default::default()
         };
         assert!(source_key(&RobotEvent::MotionCommand(weird)).starts_with("participant:"));
     }
@@ -1519,6 +1526,7 @@ mod tests {
             linear_speed: Some(-0.3),
             joint_speed: None,
             angular_speed: Some(0.2),
+            ..Default::default()
         };
         let s = command_sample(&c, 7);
         assert_eq!(s.linear, Some(-0.3));

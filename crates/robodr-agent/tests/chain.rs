@@ -356,6 +356,51 @@ fn c_over_envelope_command_is_limited_and_reported() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Holonomic axes reach the firewall and the envelope: a purely sideways
+/// command is bounded like a forward one, and a NaN in `linear_y` is
+/// rejected as non-finite (no lateral bypass after `linear_speed` became
+/// the signed x component only).
+#[test]
+fn c_lateral_command_is_bounded_by_firewall_and_envelope() {
+    let dir = tmpdir("c3");
+    let mut agent = firewall_agent(&dir);
+    let lateral = |y: f64| {
+        RobotEvent::MotionCommand(robodr_events::MotionCommand {
+            channel: "/cmd_vel".into(),
+            source_guid: Some(LEGIT_WRITER.into()),
+            linear_speed: Some(0.0),
+            linear_y: Some(y),
+            angular_speed: Some(0.0),
+            ..Default::default()
+        })
+    };
+    let outs = agent.handle(at(10_000 * MS), &lateral(1.2), SafetyState::MovingSlow);
+    let rules: Vec<&str> = outs.iter().map(|o| o.deviation.rule_str()).collect();
+    assert!(
+        rules.contains(&"robot.firewall.rejected_over_hard_limit"),
+        "{rules:?}"
+    );
+    assert!(
+        rules.contains(&"robot.motion.linear_over_envelope"),
+        "{rules:?}"
+    );
+    let outs = agent.handle(at(20_000 * MS), &lateral(f64::NAN), SafetyState::MovingSlow);
+    let rules: Vec<&str> = outs.iter().map(|o| o.deviation.rule_str()).collect();
+    assert!(
+        rules.contains(&"robot.firewall.rejected_non_finite"),
+        "{rules:?}"
+    );
+    assert!(
+        rules.contains(&"robot.motion.non_finite_command"),
+        "{rules:?}"
+    );
+    for o in &outs {
+        let _ = finding(o); // still a valid finding
+    }
+    agent.finish().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn c_non_finite_command_is_rejected_and_still_reported() {
     let dir = tmpdir("c2");
@@ -467,6 +512,7 @@ fn motion_run_with(
                 angular_velocity: None,
                 publisher_guid: (odom == Odom::Signed).then(|| ODOM_WRITER.to_string()),
                 timestamp_ns: t,
+                ..Default::default()
             })
         };
         outs.extend(agent.handle(at(t), &e, SafetyState::MovingSlow));
@@ -567,6 +613,7 @@ fn d_interleaved_second_feedback_publisher_is_reported() {
                 angular_velocity: None,
                 publisher_guid: Some(publisher.to_string()),
                 timestamp_ns: t,
+                ..Default::default()
             })
         };
         outs.extend(agent.handle(at(t), &e, SafetyState::MovingSlow));
@@ -745,6 +792,7 @@ fn hostile_names_never_panic_and_findings_stay_valid() {
             linear_speed: Some(f64::MAX),
             joint_speed: Some(-0.0),
             angular_speed: None,
+            ..Default::default()
         }),
         RobotEvent::MotionCommand(robodr_events::MotionCommand {
             channel: "/cmd_vel".into(),
@@ -752,6 +800,7 @@ fn hostile_names_never_panic_and_findings_stay_valid() {
             linear_speed: None,
             joint_speed: Some(f64::NAN),
             angular_speed: None,
+            ..Default::default()
         }),
         RobotEvent::MotionFeedback(MotionFeedback {
             channel: nasty.clone(),
@@ -761,6 +810,7 @@ fn hostile_names_never_panic_and_findings_stay_valid() {
             angular_velocity: None,
             publisher_guid: None,
             timestamp_ns: u64::MAX,
+            ..Default::default()
         }),
     ];
     let mut n = 0;

@@ -328,6 +328,7 @@ mod tests {
             linear_speed: Some(0.8),
             joint_speed: None,
             angular_speed: None,
+            ..Default::default()
         };
         let c: CommandSample = (&mc, 42).into();
         assert_eq!(c.t_ns, 42);

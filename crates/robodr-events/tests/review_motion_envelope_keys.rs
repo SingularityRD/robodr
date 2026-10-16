@@ -28,6 +28,7 @@ fn prof(env_key: &str) -> Profile {
         Envelope {
             max_linear_speed: Some(0.5),
             max_joint_speed: None,
+            ..Default::default()
         },
     );
     p

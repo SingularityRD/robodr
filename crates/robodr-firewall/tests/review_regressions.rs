@@ -25,6 +25,7 @@ fn profile(lin: Option<f64>, locked: bool) -> Profile {
         Envelope {
             max_linear_speed: lin,
             max_joint_speed: None,
+            ..Default::default()
         },
     );
     p

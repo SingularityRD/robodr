@@ -234,11 +234,16 @@ limiting. Use `--step-ms 6000` to see each one graded on its own.
 
 ## Mapping notes
 
-- `MotionCommand` has magnitudes only and no source stamp. The firewall sees
-  a twist `(|v|, 0, 0)` or a joint vector filled with the max joint speed. Its
+- `MotionCommand` has signed per-axis values and no source stamp. The
+  firewall sees a twist `(linear_speed, linear_y, linear_z)` /
+  `(angular_x, angular_y, angular_speed)` (absent axes are 0) or a joint
+  vector filled with the max joint speed. Its
   stamp is the observation time, so stale and future checks cannot fire
   through this path.
-- In the finding, commanded speeds are reported as `|v|`. A non-finite value
+- In the finding, commanded speeds are reported as `|v|` of `linear_speed`
+  (the forward component) and `joint_speed`; the lateral / vertical /
+  roll-pitch axes are not in the findings contract yet (the deviation detail
+  names the axis that was over). A non-finite value
   is omitted, because the contract accepts only finite, non-negative numbers.
   The raw value stays in the tainted detail and in the black-box event record,
   so a NaN command still yields a valid Critical finding.

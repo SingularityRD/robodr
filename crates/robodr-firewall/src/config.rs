@@ -599,6 +599,7 @@ mod tests {
             Envelope {
                 max_linear_speed: Some(1.0),
                 max_joint_speed: None,
+                ..Default::default()
             },
         );
         p
@@ -770,6 +771,7 @@ mod tests {
             Envelope {
                 max_linear_speed: None,
                 max_joint_speed: Some(1.0),
+                ..Default::default()
             },
         );
         let mut all = specs(spec());

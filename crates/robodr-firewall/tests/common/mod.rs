@@ -40,6 +40,7 @@ pub fn profile(locked: bool) -> Profile {
         Envelope {
             max_linear_speed: Some(LIN),
             max_joint_speed: None,
+            ..Default::default()
         },
     );
     p.writer_topics.insert("/arm/cmd".into());
@@ -48,6 +49,7 @@ pub fn profile(locked: bool) -> Profile {
         Envelope {
             max_linear_speed: None,
             max_joint_speed: Some(JOINT),
+            ..Default::default()
         },
     );
     p

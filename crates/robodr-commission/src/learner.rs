@@ -1261,7 +1261,20 @@ impl Learner {
                     }
                     self.reference(g, at);
                 }
-                let linear = self.speed_sample(at, &c.channel, "linear", c.linear_speed);
+                // A command carrying lateral / vertical axes (holonomic
+                // base, or any Twist decoded by robodr-cdr) is learned by
+                // its resultant ‖(x, y, z)‖: that is what `max_linear_speed`
+                // bounds at evaluation time, and learning only `linear.x`
+                // would make every sideways move of a mecanum base a
+                // deviation after lock. Legacy x-only commands are learned
+                // as before. Per-axis limits and `holonomic` are not
+                // learned; the OEM sets them in the draft.
+                let lin = if c.linear_y.is_some() || c.linear_z.is_some() {
+                    c.linear_resultant()
+                } else {
+                    c.linear_speed
+                };
+                let linear = self.speed_sample(at, &c.channel, "linear", lin);
                 let joint = self.speed_sample(at, &c.channel, "joint", c.joint_speed);
                 let Some(acc) = admit(&mut self.motion, &c.channel, lim.max_motion_channels) else {
                     self.overflowed(at, "motion_channels", &c.channel);
@@ -1965,6 +1978,7 @@ impl Learner {
             let env = Envelope {
                 max_linear_speed: bound(&l, false),
                 max_joint_speed: bound(&j, true),
+                ..Default::default()
             };
             p.motion_envelopes.insert(ch.clone(), env);
         }
@@ -3364,6 +3378,7 @@ mod tests {
             linear_speed: lin,
             joint_speed: joint,
             angular_speed: None,
+            ..Default::default()
         })
     }
 
@@ -3552,6 +3567,43 @@ mod tests {
         assert!(r.warnings.iter().any(|w| w.code == "anomalies_present"));
         // The report must still serialise (no NaN leaks into JSON).
         serde_json::to_string(&r).unwrap();
+    }
+
+    #[test]
+    fn holonomic_commands_are_learned_by_their_resultant() {
+        let mut evs = clean();
+        let lateral = |x: f64, y: f64| {
+            RobotEvent::MotionCommand(MotionCommand {
+                channel: "/cmd_vel".into(),
+                source_guid: Some(A.into()),
+                linear_speed: Some(x),
+                linear_y: Some(y),
+                linear_z: Some(0.0),
+                ..Default::default()
+            })
+        };
+        let base = learn(cfg(), &evs).profile().motion_envelopes["/cmd_vel"]
+            .max_linear_speed
+            .unwrap();
+        // Sideways and reversing-diagonal moves are magnitudes, not
+        // negative-speed anomalies; a NaN lateral axis is an anomaly.
+        for _ in 0..50 {
+            evs.push(lateral(0.0, -0.6));
+            evs.push(lateral(-0.3, 0.4));
+        }
+        evs.push(lateral(0.1, f64::NAN));
+        let l = learn(cfg(), &evs);
+        let learned = l.profile().motion_envelopes["/cmd_vel"]
+            .max_linear_speed
+            .unwrap();
+        assert!(learned >= 0.6 && learned > base, "{learned} vs {base}");
+        let kinds: Vec<_> = l
+            .report()
+            .anomalies
+            .iter()
+            .map(|a| a.kind.clone())
+            .collect();
+        assert_eq!(kinds, vec!["non_finite_linear_speed".to_string()]);
     }
 
     #[test]
@@ -4112,6 +4164,7 @@ mod tests {
                 linear_speed: Some(9.0),
                 joint_speed: None,
                 angular_speed: None,
+                ..Default::default()
             }),
             RobotEvent::MotionCommand(MotionCommand {
                 channel: "/evil_channel".into(),
@@ -4119,6 +4172,7 @@ mod tests {
                 linear_speed: Some(5.0),
                 joint_speed: None,
                 angular_speed: None,
+                ..Default::default()
             }),
         ];
         for (i, e) in evil.into_iter().enumerate() {
@@ -4269,6 +4323,7 @@ mod tests {
                 linear_speed: Some(0.5),
                 joint_speed: None,
                 angular_speed: None,
+                ..Default::default()
             })
         }));
         let ids: Vec<String> = learn(defaults(), &evs)
@@ -4500,6 +4555,7 @@ mod tests {
                 linear_speed: Some(0.2),
                 joint_speed: None,
                 angular_speed: None,
+                ..Default::default()
             }));
         }
         for _ in 0..100_000 {
@@ -4591,6 +4647,7 @@ mod tests {
             linear_speed: Some(7.0),
             joint_speed: None,
             angular_speed: None,
+            ..Default::default()
         }));
         let l = learn(defaults(), &evs);
         assert_eq!(

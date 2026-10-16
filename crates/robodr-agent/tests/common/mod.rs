@@ -186,6 +186,7 @@ pub fn cmd(source: &str, v: f64) -> RobotEvent {
         linear_speed: Some(v),
         joint_speed: None,
         angular_speed: None,
+        ..Default::default()
     })
 }
 

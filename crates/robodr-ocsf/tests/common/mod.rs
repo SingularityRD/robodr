@@ -54,6 +54,7 @@ pub fn motion(channel: &str, linear: Option<f64>) -> MotionCommand {
         linear_speed: linear,
         joint_speed: None,
         angular_speed: None,
+        ..Default::default()
     }
 }
 

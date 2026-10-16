@@ -203,7 +203,13 @@ pub fn rule_info(rule: &str) -> RuleInfo {
         },
         "robot.motion.linear_over_envelope" => RuleInfo {
             title: "Linear speed command exceeds the motion envelope",
-            desc: "A commanded linear speed exceeded the maximum allowed by the locked model profile for this channel.",
+            desc: "A commanded linear speed (forward, lateral, vertical or their resultant) exceeded the maximum allowed by the locked model profile for this channel.",
+            data_source: MOTION,
+            techniques: &[T0831],
+        },
+        "robot.motion.angular_over_envelope" => RuleInfo {
+            title: "Roll/pitch rate command exceeds the motion envelope",
+            desc: "A commanded roll/pitch rate exceeded the maximum allowed by the locked model profile for this channel.",
             data_source: MOTION,
             techniques: &[T0831],
         },

@@ -94,6 +94,7 @@ let rec = robodr_ocsf::record(&finding, Some(partitions))?; // key, partition, h
 | `robot.ros2.unknown_reader` | Unknown subscriber in the robot graph | T0801 Monitor Process State ¹ |
 | `robot.motion.unprofiled_channel` | Motion command on an unprofiled channel | T0855 |
 | `robot.motion.linear_over_envelope` | Linear speed command exceeds the motion envelope | T0831 Manipulation of Control |
+| `robot.motion.angular_over_envelope` | Roll/pitch rate command exceeds the motion envelope | T0831 |
 | `robot.motion.joint_over_envelope` | Joint speed command exceeds the motion envelope | T0831 |
 | anything else | RoboDR model-profile deviation | — |
 

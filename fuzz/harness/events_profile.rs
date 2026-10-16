@@ -98,6 +98,7 @@ pub fn probe_events(p: &Profile) -> Vec<RobotEvent> {
                 linear_speed: s,
                 joint_speed: None,
                 angular_speed: s,
+                ..Default::default()
             }));
         }
         for s in speeds(*joint) {
@@ -107,6 +108,7 @@ pub fn probe_events(p: &Profile) -> Vec<RobotEvent> {
                 linear_speed: None,
                 joint_speed: s,
                 angular_speed: None,
+                ..Default::default()
             }));
         }
         ev.push(RobotEvent::MotionFeedback(MotionFeedback {
@@ -117,6 +119,7 @@ pub fn probe_events(p: &Profile) -> Vec<RobotEvent> {
             angular_velocity: None,
             publisher_guid: Some(guids[0].clone()),
             timestamp_ns: u64::MAX,
+            ..Default::default()
         }));
     }
     ev

@@ -47,6 +47,7 @@ fn reversal_run(mirror: bool, signed_cmd: bool) -> Vec<Finding> {
         linear_speed: Some(0.5),
         joint_speed: None,
         angular_speed: None,
+        ..Default::default()
     };
     for k in 0..1000u64 {
         let t = T0 + k * 10 * MS;

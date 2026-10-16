@@ -9,7 +9,9 @@
 //! typo (`"locked ": true`), or a dropped key would load as a *different*
 //! profile without complaint. The commissioning tool therefore requires
 //! every `Profile` key to be present, rejects unknown keys (top level and in
-//! envelopes), rejects duplicate keys **at every depth** (compared after JSON
+//! envelopes; the per-axis envelope keys `max_lateral_speed`,
+//! `max_vertical_speed`, `max_roll_pitch_rate` and the boolean `holonomic`
+//! are optional, see `robodr_events::profile::Envelope`), rejects duplicate keys **at every depth** (compared after JSON
 //! unescaping, so `"/cmd_vel"` and `"/cmd\u005fvel"` are the same key: two
 //! entries for one motion channel, where a reviewer sees the first and the
 //! parser keeps the last, are refused), and runs `Profile::validate` on
@@ -97,6 +99,16 @@ pub const METADATA_KEYS: [&str; 7] = [
 ];
 /// Keys of one envelope object; both must be present.
 pub const ENVELOPE_KEYS: [&str; 2] = ["max_linear_speed", "max_joint_speed"];
+/// Optional per-axis limit keys of an envelope (number or null when
+/// present). Absent = `None`; `Envelope` does not serialise them when
+/// `None`, so files written before they existed are byte-identical.
+pub const OPTIONAL_ENVELOPE_LIMIT_KEYS: [&str; 3] = [
+    "max_lateral_speed",
+    "max_vertical_speed",
+    "max_roll_pitch_rate",
+];
+/// Optional boolean key of an envelope (absent = `false`).
+pub const ENVELOPE_HOLONOMIC_KEY: &str = "holonomic";
 /// The seal member written by `lock`.
 pub const SEAL_KEY: &str = "seal";
 const SEAL_PREFIX: &str = "{\n  \"seal\": \"sha256:";
@@ -296,8 +308,23 @@ pub fn parse_profile_text(text: &str) -> Result<Profile, ProfileFileError> {
             };
             let e = env.as_object().ok_or_else(|| bad("not an object".into()))?;
             for k in e.keys() {
-                if !ENVELOPE_KEYS.contains(&k.as_str()) {
+                if !ENVELOPE_KEYS.contains(&k.as_str())
+                    && !OPTIONAL_ENVELOPE_LIMIT_KEYS.contains(&k.as_str())
+                    && k != ENVELOPE_HOLONOMIC_KEY
+                {
                     return Err(bad(format!("unknown key {k:?}")));
+                }
+            }
+            for k in OPTIONAL_ENVELOPE_LIMIT_KEYS {
+                if let Some(v) = e.get(k) {
+                    if !(v.is_null() || v.is_number()) {
+                        return Err(bad(format!("{k} is not a number or null")));
+                    }
+                }
+            }
+            if let Some(v) = e.get(ENVELOPE_HOLONOMIC_KEY) {
+                if !v.is_boolean() {
+                    return Err(bad(format!("{ENVELOPE_HOLONOMIC_KEY} is not a boolean")));
                 }
             }
             for k in ENVELOPE_KEYS {
@@ -605,6 +632,7 @@ mod tests {
             Envelope {
                 max_linear_speed: Some(0.429),
                 max_joint_speed: None,
+                ..Default::default()
             },
         );
         p
@@ -614,6 +642,48 @@ mod tests {
     fn draft_roundtrips_strictly() {
         let text = to_json(&prof(false)).unwrap();
         assert_eq!(parse_profile_text(&text).unwrap(), prof(false));
+    }
+
+    #[test]
+    fn holonomic_envelope_keys_are_optional_but_typed() {
+        // A legacy (non-holonomic) draft is written without the new keys.
+        let text = to_json(&prof(false)).unwrap();
+        assert!(!text.contains("holonomic") && !text.contains("max_lateral_speed"));
+        // A holonomic envelope round-trips strictly.
+        let mut p = prof(false);
+        {
+            let e = p.motion_envelopes.get_mut("/cmd_vel").unwrap();
+            e.holonomic = true;
+            e.max_lateral_speed = Some(0.3);
+            e.max_vertical_speed = Some(0.0);
+            e.max_roll_pitch_rate = Some(0.0);
+        }
+        let text = to_json(&p).unwrap();
+        assert_eq!(parse_profile_text(&text).unwrap(), p);
+        // Wrong types and typos in the new keys are refused.
+        for (from, to) in [
+            ("\"holonomic\": true", "\"holonomic\": 1"),
+            ("\"holonomic\": true", "\"holonomik\": true"),
+            (
+                "\"max_lateral_speed\": 0.3",
+                "\"max_lateral_speed\": \"0.3\"",
+            ),
+            ("\"max_lateral_speed\": 0.3", "\"max_lateral_sped\": 0.3"),
+        ] {
+            assert!(text.contains(from), "{text}");
+            let bad = text.replace(from, to);
+            assert!(
+                matches!(
+                    parse_profile_text(&bad).unwrap_err(),
+                    ProfileFileError::BadEnvelope { .. }
+                ),
+                "{to}"
+            );
+        }
+        // null for an optional limit is accepted (= None).
+        let null = text.replace("\"max_lateral_speed\": 0.3", "\"max_lateral_speed\": null");
+        let q = parse_profile_text(&null).unwrap();
+        assert_eq!(q.motion_envelopes["/cmd_vel"].max_lateral_speed, None);
     }
 
     #[test]

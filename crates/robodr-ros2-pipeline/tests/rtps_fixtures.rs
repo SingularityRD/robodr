@@ -148,6 +148,7 @@ fn unprofiled_fastdds_participant_on_cmd_vel_is_critical() {
         Envelope {
             max_linear_speed: Some(0.5),
             max_joint_speed: None,
+            ..Default::default()
         },
     );
     let (f, _) = run(&fx.pcap, profile);

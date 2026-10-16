@@ -70,6 +70,7 @@ fn profile() -> Profile {
         Envelope {
             max_linear_speed: Some(1.0),
             max_joint_speed: Some(1.0),
+            ..Default::default()
         },
     );
     p
@@ -157,49 +158,64 @@ fn f1_d_cdr2_le_with_real_id_decodes() {
 
 // ---------------------------------------------------------------- F2 (Medium)
 
+// F2 was first fixed by folding every Twist axis into a signed magnitude.
+// Since `MotionCommand` carries all six axes, the same safety properties are
+// asserted on the per-axis mapping: nothing a hostile writer puts in a
+// non-x / non-z component escapes the envelope or the non-finite rule.
+
 #[test]
 fn f2_lateral_and_non_finite_components_reach_the_command() {
-    // Lateral 50 m/s on a holonomic base: magnitude 50 reaches the envelope.
+    // Lateral 50 m/s: carried as linear_y, bounded by the resultant check
+    // (the envelope is not holonomic and has no lateral limit).
     let p = twist_payload(0x0001, [0.0, 50.0, 0.0, 0.0, 0.0, 0.0]);
     let d = decode_payload(MessageKind::Twist, &p, &l()).unwrap();
     let c = d.message.to_command(&ctx()).unwrap();
-    assert_eq!(c.linear_speed, Some(50.0));
+    assert_eq!(c.linear_speed, Some(0.0));
+    assert_eq!(c.linear_y, Some(50.0));
     assert_eq!(c.angular_speed, Some(0.0));
     let dev = profile().evaluate(&RobotEvent::MotionCommand(c)).unwrap();
     assert_eq!(dev.rule_str(), "robot.motion.linear_over_envelope");
     assert_eq!(dev.severity, Severity::Critical);
 
-    // NaN / ±inf in any non-x / non-z component → non-finite → Critical.
+    // NaN / ±inf in any component → that axis is non-finite → Critical.
     for (i, bad) in [
+        (0, f64::NAN),
         (1, f64::NAN),
         (2, f64::INFINITY),
         (1, f64::NEG_INFINITY),
         (3, f64::NAN),
         (4, f64::INFINITY),
+        (5, -f64::NAN),
     ] {
         let mut v = [0.0; 6];
         v[i] = bad;
         let p = twist_payload(0x0001, v);
         let d = decode_payload(MessageKind::Twist, &p, &l()).unwrap();
         let c = d.message.to_command(&ctx()).unwrap();
-        let (lin, ang) = (c.linear_speed.unwrap(), c.angular_speed.unwrap());
-        if i < 3 {
-            assert!(!lin.is_finite(), "component {i}: {lin}");
-            assert!(ang.is_finite());
-        } else {
-            assert!(!ang.is_finite(), "component {i}: {ang}");
-            assert!(lin.is_finite());
+        let axes = [
+            c.linear_speed,
+            c.linear_y,
+            c.linear_z,
+            c.angular_x,
+            c.angular_y,
+            c.angular_speed,
+        ];
+        for (j, a) in axes.iter().enumerate() {
+            let a = a.expect("every Twist axis is carried");
+            assert_eq!(a.is_finite(), j != i, "component {j} for bad {i}: {a}");
         }
         let dev = profile().evaluate(&RobotEvent::MotionCommand(c)).unwrap();
         assert_eq!(dev.rule_str(), "robot.motion.non_finite_command");
         assert_eq!(dev.severity, Severity::Critical);
     }
 
-    // Finite components whose norm overflows → +inf → Critical.
-    let p = twist_payload(0x0001, [f64::MAX, f64::MAX, 0.0, 0.0, 0.0, 0.0]);
+    // Finite components whose resultant overflows → over envelope.
+    let p = twist_payload(0x0001, [0.5, f64::MAX, f64::MAX, 0.0, 0.0, 0.0]);
     let d = decode_payload(MessageKind::Twist, &p, &l()).unwrap();
     let c = d.message.to_command(&ctx()).unwrap();
-    assert_eq!(c.linear_speed, Some(f64::INFINITY));
+    assert_eq!(c.linear_resultant(), Some(f64::INFINITY));
+    let dev = profile().evaluate(&RobotEvent::MotionCommand(c)).unwrap();
+    assert_eq!(dev.rule_str(), "robot.motion.linear_over_envelope");
 }
 
 #[test]
@@ -209,16 +225,20 @@ fn f2_sign_of_x_and_z_is_kept_and_planar_commands_are_unchanged() {
     let d = decode_payload(MessageKind::Twist, &p, &l()).unwrap();
     let c = d.message.to_command(&ctx()).unwrap();
     assert_eq!((c.linear_speed, c.angular_speed), (Some(-0.4), Some(-1.2)));
-    // Reversing diagonally: magnitude 5 with the sign of x.
+    assert_eq!((c.linear_y, c.linear_z), (Some(0.0), Some(0.0)));
+    // Reversing diagonally: each axis signed, as sent (no folded magnitude).
     let p = twist_payload(0x0001, [-3.0, 4.0, 0.0, 0.0, 0.0, 0.0]);
     let d = decode_payload(MessageKind::Twist, &p, &l()).unwrap();
     let c = d.message.to_command(&ctx()).unwrap();
-    assert_eq!(c.linear_speed, Some(-5.0));
-    // Roll / pitch rates count towards the angular magnitude.
-    let p = twist_payload(0x0001, [0.0, 0.0, 0.0, 3.0, 0.0, -4.0]);
+    assert_eq!((c.linear_speed, c.linear_y), (Some(-3.0), Some(4.0)));
+    assert_eq!(c.linear_resultant(), Some(5.0));
+    // Roll / pitch rates go to their own axes; yaw stays angular.z.
+    let p = twist_payload(0x0001, [0.0, 0.0, 0.0, 3.0, -4.0, -1.0]);
     let d = decode_payload(MessageKind::Twist, &p, &l()).unwrap();
     let c = d.message.to_command(&ctx()).unwrap();
-    assert_eq!(c.angular_speed, Some(-5.0));
+    assert_eq!(c.angular_speed, Some(-1.0));
+    assert_eq!((c.angular_x, c.angular_y), (Some(3.0), Some(-4.0)));
+    assert_eq!(c.roll_pitch_rate(), Some(5.0));
 }
 
 #[test]
@@ -227,12 +247,15 @@ fn f2_twist_stamped_uses_the_same_mapping() {
     w.u32(1);
     w.u32(2);
     w.s("base");
-    for x in [0.0, f64::NAN, 0.0, 0.0, 0.0, 0.0] {
+    for x in [0.1, f64::NAN, 0.0, 0.0, 0.0, 0.0] {
         w.f(x);
     }
     let d = decode_payload(MessageKind::TwistStamped, &w.b, &l()).unwrap();
     let c = d.message.to_command(&ctx()).unwrap();
-    assert!(c.linear_speed.unwrap().is_nan());
+    assert_eq!(c.linear_speed, Some(0.1));
+    assert!(c.linear_y.unwrap().is_nan());
+    let dev = profile().evaluate(&RobotEvent::MotionCommand(c)).unwrap();
+    assert_eq!(dev.rule_str(), "robot.motion.non_finite_command");
 }
 
 // ---------------------------------------------------------------- F3 (Medium)

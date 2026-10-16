@@ -28,6 +28,7 @@ fn fw(platform: PlatformConfig, spec: ChannelSpec) -> (Firewall, SourceId, Chann
         Envelope {
             max_linear_speed: Some(1.0),
             max_joint_speed: None,
+            ..Default::default()
         },
     );
     let specs = BTreeMap::from([("/cmd_vel".to_string(), spec)]);

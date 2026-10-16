@@ -151,8 +151,9 @@ state_file = "/var/lib/robodr/profile-state-pulsard/pulsard.json"
 # # Unmapped channels count as "other" (not compared against commands).
 # feedback_sources = { "/odom" = "wheel_odometry" }
 # # Values are signed body-frame velocities (REP 103): MotionCommand carries
-# # Twist linear.x / angular.z, MotionFeedback should carry linear_velocity /
-# # angular_velocity. A magnitude-only feedback sample (measured_linear_speed)
+# # Twist linear.x / angular.z (plus linear_y/_z, angular_x/_y for holonomic
+# # bases), MotionFeedback should carry linear_velocity / angular_velocity
+# # (plus linear_velocity_y/_z, angular_velocity_x/_y). A magnitude-only feedback sample (measured_linear_speed)
 # # is only used for sources configured unsigned (GNSS); for signed sources
 # # its linear axis is withheld and counted (feedback_magnitude_dropped).
 # compare_magnitudes = false

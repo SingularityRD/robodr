@@ -265,6 +265,7 @@ fn injected_fast_motion_never_widens_envelope_past_cap() {
             linear_speed: Some(v),
             joint_speed: Some(v),
             angular_speed: None,
+            ..Default::default()
         })
     };
     let writer = RobotEvent::Ros2WriterDiscovered(Endpoint {

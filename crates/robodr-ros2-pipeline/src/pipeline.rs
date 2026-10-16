@@ -1711,6 +1711,7 @@ mod tests {
             Envelope {
                 max_linear_speed: Some(f64::NAN),
                 max_joint_speed: None,
+                ..Default::default()
             },
         );
         let mut p = Pipeline::new(prof, PipelineOptions::default());
