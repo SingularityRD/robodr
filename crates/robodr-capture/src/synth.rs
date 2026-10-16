@@ -4,8 +4,10 @@
 //! commissioning tool's self-test) can exercise the decoders and file readers
 //! without real traffic. Nothing here touches the network.
 //!
-//! Checksums: the IPv4 header checksum is computed; UDP checksums are left at
-//! zero (legal for IPv4, and the decoders never verify them).
+//! Checksums: the IPv4 header checksum is always computed. The UDP checksum
+//! is computed for IPv6 (where it is mandatory) and left at zero ("not
+//! computed", legal per RFC 768) by [`ipv4_udp`], so tests may patch IPv4
+//! payload bytes freely; [`ipv4_udp_checksummed`] fills it in.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -59,6 +61,20 @@ pub fn ipv4_udp(
     p
 }
 
+/// [`ipv4_udp`] with the UDP checksum filled in.
+pub fn ipv4_udp_checksummed(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut p = ipv4_udp(src, dst, src_port, dst_port, payload);
+    let c = crate::checksum::udp_checksum(src.into(), dst.into(), &p[20..]);
+    p[26..28].copy_from_slice(&c.to_be_bytes());
+    p
+}
+
 /// Split an (option-less) IPv4 packet into fragments carrying at most
 /// `chunk` payload bytes each (`chunk` is rounded down to a multiple of 8,
 /// minimum 8).
@@ -94,7 +110,9 @@ pub fn ipv6_udp(
     ext: &[(u8, usize)],
     payload: &[u8],
 ) -> Vec<u8> {
-    let u = udp(src_port, dst_port, payload);
+    let mut u = udp(src_port, dst_port, payload);
+    let c = crate::checksum::udp_checksum(src.into(), dst.into(), &u);
+    u[6..8].copy_from_slice(&c.to_be_bytes());
     let mut chain = Vec::new();
     for (i, &(_, len)) in ext.iter().enumerate() {
         let next = ext.get(i + 1).map_or(17, |e| e.0);

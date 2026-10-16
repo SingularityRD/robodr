@@ -1,29 +1,105 @@
-//! Bounded IPv4 / IPv6 fragment reassembly.
+//! Bounded IPv4 / IPv6 fragment reassembly that follows the Linux kernel.
 //!
 //! Why bother: an SEDP announcement with large QoS / type information can
 //! exceed the link MTU and be IP-fragmented, and fragmenting a discovery
 //! packet on purpose is the cheapest way to hide it from a sensor that ignores
-//! fragments. So the capture pipeline reassembles, under hard limits:
+//! fragments. Worse, any place where the sensor reassembles *differently*
+//! from the robot's own kernel is an evasion: the attacker arranges for the
+//! kernel to deliver a datagram the sensor drops (or the reverse, to frame a
+//! peer). So this reassembler mirrors the Linux `inet_frag` /
+//! `ip_frag_queue` / `ip6_frag_queue` logic (kernels >= 5.x). The rules below
+//! were derived from the kernel source; they have **not** been replayed
+//! against a live kernel in this repository's tests.
 //!
-//! - at most [`ReassemblyLimits::max_datagrams`] datagrams in flight (oldest
-//!   evicted first),
-//! - at most [`ReassemblyLimits::max_bytes`] buffered across all of them,
-//! - a datagram is abandoned [`ReassemblyLimits::timeout`] after its first
-//!   fragment, measured on *capture* timestamps (so replaying a file behaves
-//!   the same as live capture),
-//! - no datagram may exceed 65 535 bytes of payload.
+//! - **Duplicates: first wins.** A fragment that lies entirely inside a
+//!   "run" of already-queued contiguous fragments is ignored *without
+//!   comparing bytes* (`IPFRAG_DUP`). If its bytes differ, that is counted in
+//!   [`ReassemblyStats::duplicate_conflicts`] (an overlap-evasion attempt)
+//!   but the datagram keeps the first copy, exactly as the kernel does.
+//!   Forged first copies are kept out by the capture pipeline, which drops
+//!   IPv4 fragments with a bad header checksum *before* reassembly (the
+//!   kernel never queues those) and verifies the UDP checksum of the
+//!   reassembled datagram (as the receiving socket layer does).
+//! - **Partial overlaps kill the datagram** (`IPFRAG_OVERLAP`, RFC 5722 for
+//!   IPv6, "ipfrag: drop overlapping fragments" for IPv4), counted in
+//!   [`ReassemblyStats::dropped_overlap`]. As in Linux there is **no
+//!   tombstone**: the next fragment with the same key starts a new datagram.
+//! - **Geometry** (`end` = offset + length): a last fragment ending before
+//!   data already seen, or a second last fragment with a different end, kills
+//!   the datagram; so does a non-last fragment past a known end, or an empty
+//!   fragment. A non-last IPv4 fragment whose length is not a multiple of 8
+//!   is *trimmed* to one; for IPv6 that fragment alone is dropped (the kernel
+//!   sends a parameter problem) and the datagram is kept. An IPv4 datagram
+//!   longer than 65 515 bytes (65 535 minus a 20-byte header) is dropped at
+//!   completion; an IPv6 fragment ending past 65 535 is dropped alone.
+//!   An IPv6 *atomic* fragment (offset 0, M = 0, RFC 6946) is delivered at
+//!   once without touching any queue.
+//! - **`ipfrag_max_dist`** (IPv4 only, default 64): the kernel counts every
+//!   fragment it receives from a source; if more than
+//!   [`ReassemblyLimits::max_dist`] arrived between two fragments of the same
+//!   datagram, its queued fragments are discarded and it restarts
+//!   ([`ReassemblyStats::dropped_too_far`]). The receiving kernel only counts
+//!   fragments *addressed to it*, so the sensor counts per (source,
+//!   destination) pair: fragments the attacker sends to other hosts cannot
+//!   make the sensor restart a datagram the robot keeps.
+//! - **Key**: IPv4 (src, dst, id, protocol); IPv6 (src, dst, id) — the
+//!   upper-layer protocol of an IPv6 datagram is taken from its offset-0
+//!   fragment, as in the kernel.
+//! - **Timeout** after the first fragment (or after a `max_dist` restart):
+//!   [`ReassemblyLimits::timeout`] (30 s, `net.ipv4.ipfrag_time`) for IPv4,
+//!   [`ReassemblyLimits::timeout_v6`] (60 s, `net.ipv6.ip6frag_time`) for
+//!   IPv6, on *capture* timestamps, so replaying a file behaves like live
+//!   capture.
 //!
-//! Overlap policy: fragments that overlap with **different** bytes poison the
-//! whole datagram, which is then dropped (RFC 5722 mandates this for IPv6;
-//! for IPv4 it defeats the classic overlap-based IDS evasion where the
-//! receiver and the sensor resolve the overlap differently). Exact duplicates
-//! are tolerated. Non-final fragments whose length is not a multiple of 8, or
-//! fragments past a known end, also poison the datagram. Poisoned datagrams
-//! keep a small tombstone until their timeout so late fragments stay dropped.
+//! # Memory limits: never stricter than the receiving kernel
+//! The kernel caps fragment memory per network namespace **and per IP
+//! version** at `ipfrag_high_thresh` (4 MiB of skb *truesize*, plus the
+//! queue structures); while above it, every arriving fragment is dropped
+//! (there is no eviction since Linux 4.17). An earlier version of this module
+//! kept one shared 64-datagram table with oldest-first eviction: an attacker
+//! interleaving junk first-fragments with a real datagram made the sensor
+//! evict a datagram the kernel still delivered. The budgets are now:
 //!
-//! Drops are counted in [`ReassemblyStats`]; a non-zero `dropped_overlap` is
-//! itself worth surfacing as suspicious.
+//! - **Per destination address and IP version**
+//!   ([`ReassemblyLimits::max_bytes_per_dst`], 4 MiB): the stand-in for one
+//!   receiving host's `ipfrag_high_thresh`. While a destination's bucket is
+//!   above it, new fragments to that destination are *refused*
+//!   ([`ReassemblyStats::refused_capacity`]) — never evicting anything. The
+//!   sensor charges each fragment its payload plus [`FRAGMENT_OVERHEAD`] and
+//!   each datagram [`DATAGRAM_OVERHEAD`], both below what the kernel charges
+//!   (skb truesize, `sizeof(struct ipq)`), so the host kernel reaches its
+//!   threshold first: when the sensor refuses, the host has refused too.
+//!   A flood therefore cannot evict anybody's queued state, and cannot make
+//!   the sensor refuse anything the destination itself would accept.
+//!   Deliberately **no per-source cap**: the kernel has none, so a
+//!   per-source cap would let an attacker hide its own datagram by sending
+//!   junk from the same source first.
+//! - **Global per IP version** ([`ReassemblyLimits::max_bytes`], 32 MiB;
+//!   [`ReassemblyLimits::max_datagrams`], 65 536): bounds the sensor's own
+//!   memory when it sees traffic for many hosts (a SPAN port, or fragments
+//!   with spoofed destination addresses that no kernel would queue). Above
+//!   it, the oldest datagram of the **heaviest destination** is evicted
+//!   ([`ReassemblyStats::dropped_capacity`]) — unless the arriving fragment
+//!   belongs to that heaviest destination, in which case the fragment is
+//!   refused instead. Whoever consumes the most pays: a flood (aimed at one
+//!   or at many fake destinations) evicts or refuses itself, and the robot's
+//!   state is only at risk if the robot's own bucket is the largest, i.e. the
+//!   flood targets the robot, where the per-destination rule (which the
+//!   kernel shares) applies first.
+//!
+//! All bookkeeping is O(log n) per fragment (no scans of the table under a
+//! flood), apart from amortised compaction of the order queues.
+//!
+//! Known differences (all in the "sensor sees a superset" direction, which is
+//! a false positive at worst, never an evasion): non-UDP IPv4 fragments are
+//! not decoded, so they neither count towards `max_dist` nor use memory here;
+//! fragments to a host's other addresses or to multicast groups are charged
+//! to separate buckets; the byte accounting under-approximates the kernel's
+//! truesize; IPv6 first fragments with a truncated header chain (RFC 7112)
+//! are not rejected. Non-default kernel sysctls must be mirrored in
+//! [`ReassemblyLimits`] by the integrator.
 
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -32,40 +108,101 @@ use crate::decode::IpFragment;
 /// Largest reassembled payload (IPv4 total length / IPv6 payload length max).
 pub const MAX_DATAGRAM: usize = 65_535;
 
-/// Resource bounds for [`Reassembler`].
+/// Largest IPv4 reassembled payload Linux accepts (65 535 - 20-byte header).
+pub const MAX_IPV4_PAYLOAD: usize = MAX_DATAGRAM - 20;
+
+/// Bytes charged per queued fragment on top of its payload. Deliberately
+/// below the kernel's per-skb overhead (`sk_buff` + shared info, > 500
+/// bytes) so the sensor's budget lasts longer than the kernel's.
+pub const FRAGMENT_OVERHEAD: usize = 64;
+
+/// Bytes charged per datagram in flight (below the kernel's
+/// `sizeof(struct ipq)` / `frag_queue`, which it charges the same way).
+pub const DATAGRAM_OVERHEAD: usize = 128;
+
+/// Resource bounds for [`Reassembler`]. Build with `..Default::default()`.
+/// The byte and datagram limits apply separately to IPv4 and IPv6, like the
+/// kernel's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReassemblyLimits {
-    pub max_datagrams: usize,
+    /// One destination's bucket (the receiving host's `ipfrag_high_thresh`):
+    /// while above it, new fragments to that destination are refused.
+    pub max_bytes_per_dst: usize,
+    /// All destinations together (sensor memory bound); above it the
+    /// heaviest destination is evicted (or, if that is the arriving
+    /// fragment's, the fragment is refused).
     pub max_bytes: usize,
+    /// Datagrams in flight, all destinations (same eviction rule).
+    pub max_datagrams: usize,
+    /// IPv4 reassembly timeout (`net.ipv4.ipfrag_time`).
     pub timeout: Duration,
+    /// IPv6 reassembly timeout (`net.ipv6.ip6frag_time`).
+    pub timeout_v6: Duration,
+    /// Linux `net.ipv4.ipfrag_max_dist` (IPv4 only); 0 disables.
+    pub max_dist: u32,
 }
 
 impl Default for ReassemblyLimits {
-    /// 64 datagrams, 1 MiB, 30 s (the Linux `ipfrag_time` default).
+    /// 4 MiB per destination (the Linux `ipfrag_high_thresh`), 32 MiB and
+    /// 65 536 datagrams per IP version overall, 30 s / 60 s (the Linux
+    /// `ipfrag_time` / `ip6frag_time`), `max_dist` 64 (the Linux default).
     fn default() -> Self {
         Self {
-            max_datagrams: 64,
-            max_bytes: 1 << 20,
+            max_bytes_per_dst: 4 << 20,
+            max_bytes: 32 << 20,
+            max_datagrams: 65_536,
             timeout: Duration::from_secs(30),
+            timeout_v6: Duration::from_secs(60),
+            max_dist: 64,
         }
     }
 }
 
-/// Counters kept by the reassembler.
+/// Counters kept by the reassembler. Everything except `fragments` and
+/// `completed` is worth surfacing: these are the traces of fragmentation
+/// attacks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReassemblyStats {
     pub fragments: u64,
     pub completed: u64,
-    /// Datagrams dropped because fragments overlapped with conflicting bytes.
+    /// Datagrams dropped because fragments partially overlapped.
     pub dropped_overlap: u64,
-    /// Datagrams dropped for inconsistent fragment geometry.
+    /// Datagrams (or single IPv6 fragments) dropped for inconsistent geometry.
     pub dropped_invalid: u64,
     /// Datagrams that did not complete within the timeout.
     pub dropped_timeout: u64,
-    /// Datagrams evicted to stay within `max_datagrams` / `max_bytes`.
+    /// Datagrams **evicted** under global memory pressure (always from the
+    /// heaviest destination, never the arriving fragment's).
     pub dropped_capacity: u64,
-    /// Fragments ignored because their datagram was already poisoned.
+    /// Legacy (poisoned-datagram tombstones were removed to match Linux):
+    /// always 0.
     pub ignored_after_drop: u64,
+    /// Fragments ignored because they duplicate queued data (first wins).
+    pub duplicates: u64,
+    /// Of `duplicates`, those whose bytes differed from the queued copy.
+    pub duplicate_conflicts: u64,
+    /// IPv4 datagrams restarted by the `max_dist` rule.
+    pub dropped_too_far: u64,
+    /// Fragments refused because their destination's budget was full (the
+    /// kernel drops them too) or nothing was evictable.
+    pub refused_capacity: u64,
+}
+
+impl ReassemblyStats {
+    /// Datagrams evicted under memory pressure (alias of `dropped_capacity`).
+    pub fn evictions(&self) -> u64 {
+        self.dropped_capacity
+    }
+
+    /// All datagram-level drops, for a single "reassembly failures" figure.
+    pub fn dropped_total(&self) -> u64 {
+        self.dropped_overlap
+            .saturating_add(self.dropped_invalid)
+            .saturating_add(self.dropped_timeout)
+            .saturating_add(self.dropped_capacity)
+            .saturating_add(self.dropped_too_far)
+            .saturating_add(self.refused_capacity)
+    }
 }
 
 /// A reassembled IP payload (UDP header and data, possibly preceded by IPv6
@@ -78,23 +215,80 @@ pub struct Reassembled {
     pub payload: Vec<u8>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct Key {
     src: IpAddr,
     dst: IpAddr,
     id: u32,
+    /// IPv4 protocol; 0 for IPv6 (not part of the kernel's key).
     protocol: u8,
+}
+
+type Pair = (IpAddr, IpAddr);
+
+#[derive(Debug)]
+struct Run {
+    start: usize,
+    bytes: Vec<u8>,
+}
+
+impl Run {
+    fn end(&self) -> usize {
+        self.start + self.bytes.len()
+    }
 }
 
 #[derive(Debug)]
 struct Entry {
-    key: Key,
-    first_seen: Duration,
-    data: Vec<u8>,
-    /// Sorted, non-overlapping, non-adjacent covered byte ranges [start, end).
-    have: Vec<(usize, usize)>,
-    total: Option<usize>,
-    poisoned: bool,
+    generation: u64,
+    /// Sorted, non-overlapping runs of contiguous fragments (kernel
+    /// `frag_run`s: a run only grows by appending at the tail).
+    runs: Vec<Run>,
+    /// Largest end seen (`q.len`).
+    len: usize,
+    first_in: bool,
+    last_in: bool,
+    /// Payload bytes queued (`q.meat`).
+    meat: usize,
+    /// Bytes charged against the budgets (including [`DATAGRAM_OVERHEAD`]).
+    charge: usize,
+    /// Upper-layer protocol (IPv6: from the offset-0 fragment).
+    protocol: Option<u8>,
+    /// Per-pair fragment counter value at the last fragment (max_dist).
+    rid: u32,
+}
+
+/// One destination's bucket.
+#[derive(Debug, Default)]
+struct DstUse {
+    bytes: usize,
+    datagrams: usize,
+    /// Creation order of this destination's datagrams, for eviction. May hold
+    /// stale records (generation mismatch); compacted when it grows.
+    order: VecDeque<(u64, Key)>,
+}
+
+/// Per-(src, dst) state for `max_dist`.
+#[derive(Debug, Default, Clone, Copy)]
+struct PeerUse {
+    rid: u32,
+    datagrams: usize,
+}
+
+/// Accounting for one IP version.
+#[derive(Debug, Default)]
+struct Family {
+    /// Creation order, for expiry. May hold stale records.
+    order: VecDeque<(Duration, u64, Key)>,
+    bytes: usize,
+    datagrams: usize,
+    dsts: HashMap<IpAddr, DstUse>,
+    /// (bytes, destination) for every destination in `dsts`: heaviest last.
+    by_weight: BTreeSet<(usize, IpAddr)>,
+}
+
+fn family(addr: &IpAddr) -> usize {
+    usize::from(addr.is_ipv6())
 }
 
 /// Bounded fragment reassembler. Feed it every [`IpFragment`] with its capture
@@ -102,7 +296,10 @@ struct Entry {
 #[derive(Debug)]
 pub struct Reassembler {
     limits: ReassemblyLimits,
-    entries: Vec<Entry>,
+    entries: HashMap<Key, Entry>,
+    families: [Family; 2],
+    peers: HashMap<Pair, PeerUse>,
+    next_generation: u64,
     now: Duration,
     stats: ReassemblyStats,
 }
@@ -113,62 +310,229 @@ impl Default for Reassembler {
     }
 }
 
-enum Verdict {
+enum Insert {
     Ok,
+    Dup { conflict: bool },
     Overlap,
-    Invalid,
 }
 
 impl Reassembler {
     pub fn new(limits: ReassemblyLimits) -> Self {
         Self {
             limits,
-            entries: Vec::new(),
+            entries: HashMap::new(),
+            families: Default::default(),
+            peers: HashMap::new(),
+            next_generation: 0,
             now: Duration::ZERO,
             stats: ReassemblyStats::default(),
         }
+    }
+
+    pub fn limits(&self) -> &ReassemblyLimits {
+        &self.limits
     }
 
     pub fn stats(&self) -> &ReassemblyStats {
         &self.stats
     }
 
-    /// Number of datagrams currently buffered (including tombstones).
+    /// Number of datagrams currently buffered.
     pub fn in_flight(&self) -> usize {
         self.entries.len()
     }
 
-    fn buffered_bytes(&self) -> usize {
-        self.entries.iter().map(|e| e.data.len()).sum()
+    /// Bytes currently charged (both IP versions, all destinations).
+    pub fn buffered_bytes(&self) -> usize {
+        self.families.iter().map(|f| f.bytes).sum()
+    }
+
+    /// Bytes currently charged to one destination address.
+    pub fn buffered_bytes_for(&self, dst: IpAddr) -> usize {
+        self.families[family(&dst)]
+            .dsts
+            .get(&dst)
+            .map_or(0, |d| d.bytes)
+    }
+
+    /// Add `delta` (may be negative via `sub`) to a key's charge everywhere.
+    fn recharge(&mut self, key: &Key, add: usize, sub: usize) {
+        if let Some(e) = self.entries.get_mut(key) {
+            e.charge = e.charge + add - sub;
+        }
+        let f = &mut self.families[family(&key.dst)];
+        f.bytes = f.bytes + add - sub;
+        if let Some(d) = f.dsts.get_mut(&key.dst) {
+            f.by_weight.remove(&(d.bytes, key.dst));
+            d.bytes = d.bytes + add - sub;
+            f.by_weight.insert((d.bytes, key.dst));
+        }
+    }
+
+    fn remove(&mut self, key: &Key) -> Option<Entry> {
+        let charge = self.entries.get(key)?.charge;
+        self.recharge(key, 0, charge);
+        let e = self.entries.remove(key)?;
+        let f = &mut self.families[family(&key.dst)];
+        f.datagrams -= 1;
+        if let Some(d) = f.dsts.get_mut(&key.dst) {
+            d.datagrams -= 1;
+            if d.datagrams == 0 {
+                f.by_weight.remove(&(d.bytes, key.dst));
+                f.dsts.remove(&key.dst);
+            }
+        }
+        let pair = (key.src, key.dst);
+        if let Some(p) = self.peers.get_mut(&pair) {
+            p.datagrams -= 1;
+            if p.datagrams == 0 {
+                self.peers.remove(&pair);
+            }
+        }
+        Some(e)
+    }
+
+    fn is_live(entries: &HashMap<Key, Entry>, key: &Key, generation: u64) -> bool {
+        entries.get(key).is_some_and(|e| e.generation == generation)
     }
 
     fn expire(&mut self) {
-        let (now, timeout) = (self.now, self.limits.timeout);
-        let stats = &mut self.stats;
-        self.entries.retain(|e| {
-            let alive = e.first_seen.saturating_add(timeout) >= now;
-            if !alive && !e.poisoned {
-                stats.dropped_timeout += 1;
+        for fi in 0..2 {
+            let timeout = if fi == 0 {
+                self.limits.timeout
+            } else {
+                self.limits.timeout_v6
+            };
+            while let Some(&(t, generation, key)) = self.families[fi].order.front() {
+                if t.saturating_add(timeout) >= self.now {
+                    break;
+                }
+                self.families[fi].order.pop_front();
+                if Self::is_live(&self.entries, &key, generation) {
+                    self.remove(&key);
+                    self.stats.dropped_timeout += 1;
+                }
             }
-            alive
-        });
+            // Keep the order queue proportional to the live entries.
+            let f = &mut self.families[fi];
+            if f.order.len() > 2 * f.datagrams + 1024 {
+                let entries = &self.entries;
+                f.order.retain(|(_, g, k)| Self::is_live(entries, k, *g));
+            }
+        }
     }
 
-    fn evict_oldest(&mut self) -> bool {
-        let Some(idx) = self
-            .entries
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, e)| e.first_seen)
-            .map(|(i, _)| i)
-        else {
+    /// Record a (new or restarted) datagram generation in the order queues.
+    fn track(&mut self, key: Key, generation: u64) {
+        let now = self.now;
+        let f = &mut self.families[family(&key.dst)];
+        f.order.push_back((now, generation, key));
+        let d = f.dsts.entry(key.dst).or_default();
+        d.order.push_back((generation, key));
+        if d.order.len() > 2 * d.datagrams + 16 {
+            let entries = &self.entries;
+            d.order.retain(|(g, k)| Self::is_live(entries, k, *g));
+        }
+    }
+
+    /// Evict the oldest datagram of the heaviest destination (same IP
+    /// version). Returns false, evicting nothing, when that destination is
+    /// `arriving` itself (the heaviest consumer is the one refused) or when
+    /// the table is empty.
+    fn evict_heaviest(&mut self, fi: usize, arriving: IpAddr) -> bool {
+        let f = &mut self.families[fi];
+        let Some(&(_, victim)) = f.by_weight.last() else {
             return false;
         };
-        let e = self.entries.swap_remove(idx);
-        if !e.poisoned {
-            self.stats.dropped_capacity += 1;
+        if victim == arriving {
+            return false;
         }
-        true
+        let Some(d) = f.dsts.get_mut(&victim) else {
+            return false;
+        };
+        let mut found = None;
+        while let Some((g, k)) = d.order.pop_front() {
+            if Self::is_live(&self.entries, &k, g) {
+                found = Some(k);
+                break;
+            }
+        }
+        match found {
+            Some(k) => {
+                self.remove(&k);
+                self.stats.dropped_capacity += 1;
+                true
+            }
+            None => false, // unreachable while the invariants hold
+        }
+    }
+
+    /// Kernel `inet_frag_find` threshold check, see the module docs.
+    fn admit(&mut self, key: &Key, exists: bool) -> bool {
+        let fi = family(&key.dst);
+        let dst_bytes = self.families[fi].dsts.get(&key.dst).map_or(0, |d| d.bytes);
+        // Like the kernel: refuse while *above* the threshold.
+        if dst_bytes > self.limits.max_bytes_per_dst {
+            return false;
+        }
+        loop {
+            let f = &self.families[fi];
+            let full = f.bytes > self.limits.max_bytes
+                || (!exists && f.datagrams >= self.limits.max_datagrams);
+            if !full {
+                return true;
+            }
+            if !self.evict_heaviest(fi, key.dst) {
+                return false;
+            }
+        }
+    }
+
+    fn new_entry(&mut self, key: Key) {
+        let generation = self.next_generation;
+        self.next_generation += 1;
+        self.entries.insert(
+            key,
+            Entry {
+                generation,
+                runs: Vec::new(),
+                len: 0,
+                first_in: false,
+                last_in: false,
+                meat: 0,
+                charge: 0,
+                protocol: None,
+                rid: 0,
+            },
+        );
+        let f = &mut self.families[family(&key.dst)];
+        f.datagrams += 1;
+        let d = f.dsts.entry(key.dst).or_default();
+        d.datagrams += 1;
+        f.by_weight.insert((d.bytes, key.dst));
+        self.peers.entry((key.src, key.dst)).or_default().datagrams += 1;
+        self.track(key, generation);
+        self.recharge(&key, DATAGRAM_OVERHEAD, 0);
+    }
+
+    /// `ip_frag_reinit`: drop the queued fragments, restart the timer.
+    fn reinit(&mut self, key: &Key) {
+        let Some(charge) = self.entries.get(key).map(|e| e.charge) else {
+            return;
+        };
+        self.recharge(key, 0, charge - DATAGRAM_OVERHEAD);
+        let generation = self.next_generation;
+        self.next_generation += 1;
+        if let Some(e) = self.entries.get_mut(key) {
+            e.runs.clear();
+            e.len = 0;
+            e.first_in = false;
+            e.last_in = false;
+            e.meat = 0;
+            e.protocol = None;
+            e.generation = generation;
+        }
+        self.track(*key, generation);
     }
 
     /// Add one fragment. Returns the reassembled payload when this fragment
@@ -178,185 +542,225 @@ impl Reassembler {
         self.now = self.now.max(ts);
         self.expire();
 
+        let v4 = frag.src.is_ipv4();
+        if !v4 && frag.offset == 0 && !frag.more {
+            // RFC 6946 atomic fragment: processed in isolation.
+            self.stats.completed += 1;
+            return Some(Reassembled {
+                src: frag.src,
+                dst: frag.dst,
+                protocol: frag.protocol,
+                payload: frag.data.to_vec(),
+            });
+        }
         let key = Key {
             src: frag.src,
             dst: frag.dst,
             id: frag.id,
-            protocol: frag.protocol,
+            protocol: if v4 { frag.protocol } else { 0 },
         };
-        let mut idx = match self.entries.iter().position(|e| e.key == key) {
-            Some(i) => i,
-            None => {
-                if self.limits.max_datagrams == 0 {
-                    self.stats.dropped_capacity += 1;
-                    return None;
-                }
-                while self.entries.len() >= self.limits.max_datagrams {
-                    self.evict_oldest();
-                }
-                self.entries.push(Entry {
-                    key,
-                    first_seen: self.now,
-                    data: Vec::new(),
-                    have: Vec::new(),
-                    total: None,
-                    poisoned: false,
-                });
-                self.entries.len() - 1
-            }
-        };
-
-        if self.entries[idx].poisoned {
-            self.stats.ignored_after_drop += 1;
+        let exists = self.entries.contains_key(&key);
+        if !self.admit(&key, exists) {
+            self.stats.refused_capacity += 1;
             return None;
         }
+        if !exists {
+            self.new_entry(key);
+        }
 
-        match Self::insert(&mut self.entries[idx], frag) {
-            Verdict::Ok => {}
-            Verdict::Overlap => {
-                self.stats.dropped_overlap += 1;
-                Self::poison(&mut self.entries[idx]);
-                return None;
-            }
-            Verdict::Invalid => {
-                self.stats.dropped_invalid += 1;
-                Self::poison(&mut self.entries[idx]);
-                return None;
+        // ip_frag_too_far (IPv4): counts every fragment of this pair.
+        if v4 && self.limits.max_dist > 0 {
+            let peer = self.peers.entry((key.src, key.dst)).or_default();
+            peer.rid = peer.rid.wrapping_add(1);
+            let end = peer.rid;
+            let e = self.entries.get_mut(&key)?;
+            let start = std::mem::replace(&mut e.rid, end);
+            if exists && !e.runs.is_empty() && end.wrapping_sub(start) > self.limits.max_dist {
+                self.stats.dropped_too_far += 1;
+                self.reinit(&key);
             }
         }
 
-        // Byte budget: evict other datagrams (oldest first) until we fit; if
-        // this datagram alone is over budget, drop it.
-        while self.buffered_bytes() > self.limits.max_bytes {
-            if self.entries[idx].data.len() > self.limits.max_bytes {
-                self.stats.dropped_capacity += 1;
-                self.entries.swap_remove(idx);
-                return None;
-            }
-            let victim = self
-                .entries
-                .iter()
-                .enumerate()
-                .filter(|&(i, _)| i != idx)
-                .min_by_key(|(_, e)| e.first_seen)
-                .map(|(i, _)| i);
-            match victim {
-                Some(v) => {
-                    let e = self.entries.swap_remove(v);
-                    if !e.poisoned {
-                        self.stats.dropped_capacity += 1;
-                    }
-                    // swap_remove moved the last entry into `v`.
-                    if idx == self.entries.len() {
-                        idx = v;
-                    }
+        // Geometry, in the kernel's order.
+        let offset = frag.offset;
+        let mut data = frag.data;
+        let Some(mut end) = offset.checked_add(data.len()) else {
+            return self.kill_invalid(&key);
+        };
+        if !v4 && end > MAX_DATAGRAM {
+            self.stats.dropped_invalid += 1; // fragment only
+            return None;
+        }
+        {
+            let e = self.entries.get_mut(&key)?;
+            if !frag.more {
+                if end < e.len || (e.last_in && end != e.len) {
+                    return self.kill_invalid(&key);
                 }
-                None => break,
+                e.last_in = true;
+                e.len = end;
+            } else {
+                if end % 8 != 0 {
+                    if !v4 {
+                        self.stats.dropped_invalid += 1; // fragment only
+                        return None;
+                    }
+                    end &= !7;
+                    data = &data[..end.saturating_sub(offset).min(data.len())];
+                }
+                if end > e.len {
+                    if e.last_in {
+                        return self.kill_invalid(&key);
+                    }
+                    e.len = end;
+                }
             }
         }
-        self.finish_if_complete(idx)
+        if end <= offset {
+            return self.kill_invalid(&key);
+        }
+
+        let e = self.entries.get_mut(&key)?;
+        match Self::insert(e, offset, end, data) {
+            Insert::Ok => {}
+            Insert::Dup { conflict } => {
+                self.stats.duplicates += 1;
+                if conflict {
+                    self.stats.duplicate_conflicts += 1;
+                }
+                return None;
+            }
+            Insert::Overlap => {
+                self.remove(&key);
+                self.stats.dropped_overlap += 1;
+                return None;
+            }
+        }
+        if offset == 0 {
+            e.first_in = true;
+            e.protocol = Some(frag.protocol);
+        }
+        e.meat += data.len();
+        self.recharge(&key, data.len() + FRAGMENT_OVERHEAD, 0);
+        self.finish_if_complete(&key, v4)
     }
 
-    fn finish_if_complete(&mut self, idx: usize) -> Option<Reassembled> {
-        let e = &self.entries[idx];
-        let total = e.total?;
-        if e.have.as_slice() != [(0, total)] {
+    fn kill_invalid(&mut self, key: &Key) -> Option<Reassembled> {
+        self.remove(key);
+        self.stats.dropped_invalid += 1;
+        None
+    }
+
+    fn finish_if_complete(&mut self, key: &Key, v4: bool) -> Option<Reassembled> {
+        let e = self.entries.get(key)?;
+        if !(e.first_in && e.last_in && e.meat == e.len) {
             return None;
         }
-        let mut e = self.entries.swap_remove(idx);
-        e.data.truncate(total);
+        let e = self.remove(key)?;
+        if v4 && e.len > MAX_IPV4_PAYLOAD {
+            self.stats.dropped_invalid += 1; // "Oversized IP packet"
+            return None;
+        }
+        let mut payload = Vec::with_capacity(e.len);
+        for r in &e.runs {
+            debug_assert_eq!(r.start, payload.len());
+            payload.extend_from_slice(&r.bytes);
+        }
         self.stats.completed += 1;
         Some(Reassembled {
-            src: e.key.src,
-            dst: e.key.dst,
-            protocol: e.key.protocol,
-            payload: e.data,
+            src: key.src,
+            dst: key.dst,
+            protocol: e.protocol.unwrap_or(key.protocol),
+            payload,
         })
     }
 
-    fn poison(e: &mut Entry) {
-        e.poisoned = true;
-        e.data = Vec::new();
-        e.have = Vec::new();
+    /// `inet_frag_queue_insert`.
+    fn insert(e: &mut Entry, offset: usize, end: usize, data: &[u8]) -> Insert {
+        let new_run = || Run {
+            start: offset,
+            bytes: data.to_vec(),
+        };
+        let Some(tail) = e.runs.last_mut() else {
+            e.runs.push(new_run());
+            return Insert::Ok;
+        };
+        let tail_end = tail.end();
+        if tail_end < end {
+            // Common case: goes to the end.
+            if offset < tail_end {
+                return Insert::Overlap;
+            }
+            if offset == tail_end {
+                tail.bytes.extend_from_slice(data);
+            } else {
+                e.runs.push(new_run());
+            }
+            return Insert::Ok;
+        }
+        // First run ending after `offset`: the only candidate to intersect.
+        let idx = e.runs.partition_point(|r| r.end() <= offset);
+        match e.runs.get(idx) {
+            Some(r) if r.start < end => {
+                if offset >= r.start && end <= r.end() {
+                    let held = &r.bytes[offset - r.start..end - r.start];
+                    Insert::Dup {
+                        conflict: held != data,
+                    }
+                } else {
+                    Insert::Overlap
+                }
+            }
+            _ => {
+                e.runs.insert(idx, new_run());
+                Insert::Ok
+            }
+        }
     }
 
-    fn insert(e: &mut Entry, frag: &IpFragment<'_>) -> Verdict {
-        let start = frag.offset;
-        let Some(end) = start.checked_add(frag.data.len()) else {
-            return Verdict::Invalid;
-        };
-        if end > MAX_DATAGRAM || !start.is_multiple_of(8) {
-            return Verdict::Invalid;
-        }
-        if frag.more {
-            if frag.data.is_empty() || !frag.data.len().is_multiple_of(8) {
-                return Verdict::Invalid;
-            }
-            if e.total.is_some_and(|t| end > t) {
-                return Verdict::Invalid;
-            }
-        } else {
-            if e.total.is_some_and(|t| t != end) {
-                return Verdict::Invalid;
-            }
-            if e.have.last().is_some_and(|&(_, hi)| hi > end) {
-                return Verdict::Invalid;
-            }
-            e.total = Some(end);
-        }
-
-        // Overlap check against already-held bytes.
-        for &(lo, hi) in &e.have {
-            let (os, oe) = (lo.max(start), hi.min(end));
-            if os < oe && e.data[os..oe] != frag.data[os - start..oe - start] {
-                return Verdict::Overlap;
+    /// Check the internal accounting invariants (tests only).
+    #[cfg(test)]
+    fn check_invariants(&self) {
+        for (fi, f) in self.families.iter().enumerate() {
+            let live: Vec<_> = self
+                .entries
+                .iter()
+                .filter(|(k, _)| family(&k.dst) == fi)
+                .collect();
+            assert_eq!(f.datagrams, live.len());
+            assert_eq!(f.bytes, live.iter().map(|(_, e)| e.charge).sum::<usize>());
+            assert_eq!(f.by_weight.len(), f.dsts.len());
+            for (dst, d) in &f.dsts {
+                assert!(f.by_weight.contains(&(d.bytes, *dst)));
+                let mine = live.iter().filter(|(k, _)| k.dst == *dst);
+                assert_eq!(d.datagrams, mine.clone().count());
+                assert_eq!(d.bytes, mine.map(|(_, e)| e.charge).sum::<usize>());
             }
         }
-
-        if e.data.len() < end {
-            e.data.resize(end, 0);
-        }
-        e.data[start..end].copy_from_slice(frag.data);
-
-        // Merge [start, end) into the sorted interval list.
-        let mut merged = Vec::with_capacity(e.have.len() + 1);
-        let (mut ns, mut ne) = (start, end);
-        let mut placed = false;
-        for &(lo, hi) in &e.have {
-            if hi < ns {
-                merged.push((lo, hi));
-            } else if lo > ne {
-                if !placed {
-                    merged.push((ns, ne));
-                    placed = true;
-                }
-                merged.push((lo, hi));
-            } else {
-                ns = ns.min(lo);
-                ne = ne.max(hi);
-            }
-        }
-        if !placed {
-            merged.push((ns, ne));
-        }
-        e.have = merged;
-        Verdict::Ok
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     fn ip(n: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(10, 0, 0, n))
     }
 
     fn frag(id: u32, offset: usize, more: bool, data: &[u8]) -> IpFragment<'_> {
+        frag_from(ip(1), id, offset, more, data)
+    }
+
+    fn frag_from(src: IpAddr, id: u32, offset: usize, more: bool, data: &[u8]) -> IpFragment<'_> {
         IpFragment {
-            src: ip(1),
-            dst: ip(2),
+            src,
+            dst: if src.is_ipv4() {
+                ip(2)
+            } else {
+                "fd00::2".parse::<Ipv6Addr>().unwrap().into()
+            },
             id,
             protocol: 17,
             offset,
@@ -369,10 +773,14 @@ mod tests {
         Duration::from_secs(s)
     }
 
+    fn v6(n: u16) -> IpAddr {
+        IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, n))
+    }
+
     #[test]
     fn in_order_and_out_of_order() {
         let payload: Vec<u8> = (0..40u8).collect();
-        for order in [[0usize, 1, 2], [2, 0, 1], [1, 2, 0], [2, 1, 0]] {
+        for order in [[0usize, 1, 2], [2, 0, 1], [1, 2, 0], [2, 1, 0], [0, 2, 1]] {
             let mut r = Reassembler::default();
             let parts = [
                 frag(7, 0, true, &payload[0..16]),
@@ -392,35 +800,60 @@ mod tests {
             assert_eq!(out.payload, payload);
             assert_eq!(out.protocol, 17);
             assert_eq!(r.in_flight(), 0);
+            assert_eq!(r.buffered_bytes(), 0);
             assert_eq!(r.stats().completed, 1);
         }
     }
 
     #[test]
-    fn duplicates_are_tolerated() {
+    fn duplicates_first_wins_like_linux() {
         let mut r = Reassembler::default();
         let d = [1u8; 16];
         assert!(r.push(secs(0), &frag(1, 0, true, &d[..8])).is_none());
         assert!(r.push(secs(0), &frag(1, 0, true, &d[..8])).is_none());
-        assert!(r.push(secs(0), &frag(1, 8, false, &d[8..])).is_some());
+        // Contained duplicate with different bytes: ignored, first copy kept.
+        assert!(r.push(secs(0), &frag(1, 0, true, &[9; 8])).is_none());
+        assert_eq!(r.stats().duplicates, 2);
+        assert_eq!(r.stats().duplicate_conflicts, 1);
+        let out = r.push(secs(0), &frag(1, 8, false, &d[8..])).unwrap();
+        assert_eq!(out.payload, d);
+        // Contained in a run built by tail appends: still a duplicate.
+        let mut r = Reassembler::default();
+        r.push(secs(0), &frag(2, 0, true, &[1; 8]));
+        r.push(secs(0), &frag(2, 8, true, &[2; 8]));
+        r.push(secs(0), &frag(2, 0, true, &[7; 16]));
+        assert_eq!(r.stats().duplicate_conflicts, 1);
+        let out = r.push(secs(0), &frag(2, 16, false, &[3; 8])).unwrap();
+        assert_eq!(&out.payload[..16], &[[1u8; 8], [2; 8]].concat()[..]);
     }
 
     #[test]
-    fn conflicting_overlap_poisons() {
+    fn partial_overlap_kills_without_tombstone() {
         let mut r = Reassembler::default();
         assert!(r.push(secs(0), &frag(1, 0, true, &[1; 16])).is_none());
+        // Ends past the tail but starts inside it: IPFRAG_OVERLAP.
         assert!(r.push(secs(0), &frag(1, 8, false, &[2; 16])).is_none());
         assert_eq!(r.stats().dropped_overlap, 1);
-        // Later fragments of the same datagram stay dropped.
-        assert!(r.push(secs(0), &frag(1, 16, false, &[1; 8])).is_none());
-        assert_eq!(r.stats().ignored_after_drop, 1);
-        assert_eq!(r.stats().completed, 0);
+        assert_eq!(r.in_flight(), 0);
+        // Like Linux, the next fragments start a fresh datagram.
+        assert!(r.push(secs(0), &frag(1, 0, true, &[1; 16])).is_none());
+        assert!(r.push(secs(0), &frag(1, 16, false, &[1; 8])).is_some());
+        assert_eq!(r.stats().ignored_after_drop, 0);
+        // Overlap through the binary-search path (spanning two runs).
+        let mut r = Reassembler::default();
+        r.push(secs(0), &frag(3, 0, true, &[0; 8]));
+        r.push(secs(0), &frag(3, 32, false, &[0; 8]));
+        r.push(secs(0), &frag(3, 16, true, &[0; 8]));
+        r.push(secs(0), &frag(3, 8, true, &[0; 16])); // 8..24 straddles 16..24
+        assert_eq!(r.stats().dropped_overlap, 1);
+        assert_eq!(r.in_flight(), 0);
     }
 
     #[test]
     fn invalid_geometry() {
         let mut r = Reassembler::default();
-        // Non-final fragment of odd length.
+        // IPv4 non-final fragment of odd length is trimmed (Linux), 7 -> 0:
+        // empty after trimming kills it.
         r.push(secs(0), &frag(1, 0, true, &[0; 7]));
         // Final fragment shorter than data already held.
         r.push(secs(0), &frag(2, 0, true, &[0; 16]));
@@ -428,17 +861,68 @@ mod tests {
         // Two different ends.
         r.push(secs(0), &frag(3, 8, false, &[0; 8]));
         r.push(secs(0), &frag(3, 16, false, &[0; 8]));
-        // Past 64 KiB.
-        r.push(secs(0), &frag(4, 65_528, true, &[0; 16]));
-        // Non-final after a known end.
-        r.push(secs(0), &frag(5, 0, false, &[0; 8]));
+        // Empty final fragment.
+        r.push(secs(0), &frag(4, 8, false, &[]));
+        // Unfragmented-looking (offset 0, final) completes immediately.
+        assert!(r.push(secs(0), &frag(5, 0, false, &[0; 8])).is_some());
+        // Non-final past a known end.
         let mut r2 = Reassembler::default();
         r2.push(secs(0), &frag(5, 8, false, &[0; 8]));
         r2.push(secs(0), &frag(5, 8, true, &[0; 16]));
         assert_eq!(r.stats().dropped_invalid, 4);
         assert_eq!(r2.stats().dropped_invalid, 1);
-        // Unfragmented-looking (offset 0, final) completes immediately.
         assert_eq!(r.stats().completed, 1);
+        assert_eq!(r.in_flight(), 0);
+    }
+
+    #[test]
+    fn ipv4_trims_odd_non_final_fragments() {
+        let body: Vec<u8> = (0..40u8).collect();
+        let mut r = Reassembler::default();
+        // 20 bytes at 0 (trimmed to 16), then the rest from 16.
+        assert!(r.push(secs(0), &frag(1, 0, true, &body[..20])).is_none());
+        let out = r.push(secs(0), &frag(1, 16, false, &body[16..])).unwrap();
+        assert_eq!(out.payload, body);
+    }
+
+    #[test]
+    fn ipv6_odd_non_final_fragment_dropped_alone() {
+        let body: Vec<u8> = (0..40u8).collect();
+        let mut r = Reassembler::default();
+        assert!(r
+            .push(secs(0), &frag_from(v6(1), 1, 0, true, &body[..20]))
+            .is_none());
+        assert_eq!(r.stats().dropped_invalid, 1);
+        assert!(r
+            .push(secs(0), &frag_from(v6(1), 1, 0, true, &body[..16]))
+            .is_none());
+        let out = r.push(secs(0), &frag_from(v6(1), 1, 16, false, &body[16..]));
+        assert_eq!(out.unwrap().payload, body);
+        // Past 64 KiB: the fragment alone is dropped.
+        r.push(secs(0), &frag_from(v6(1), 2, 65_528, true, &[0; 16]));
+        assert_eq!(r.stats().dropped_invalid, 2);
+    }
+
+    #[test]
+    fn ipv6_protocol_comes_from_first_fragment() {
+        let mut r = Reassembler::default();
+        let mut a = frag_from(v6(1), 9, 8, false, &[0; 8]);
+        a.protocol = 60; // differs: same kernel queue, ignored
+        assert!(r.push(secs(0), &a).is_none());
+        let out = r
+            .push(secs(0), &frag_from(v6(1), 9, 0, true, &[0; 8]))
+            .unwrap();
+        assert_eq!(out.protocol, 17);
+    }
+
+    #[test]
+    fn oversized_ipv4_dropped_at_completion() {
+        let mut r = Reassembler::default();
+        let big = vec![0u8; 65_520];
+        r.push(secs(0), &frag(1, 0, true, &big));
+        assert!(r.push(secs(0), &frag(1, 65_520, false, &[0; 8])).is_none());
+        assert_eq!(r.stats().dropped_invalid, 1);
+        assert_eq!(r.buffered_bytes(), 0);
     }
 
     #[test]
@@ -452,57 +936,297 @@ mod tests {
         assert!(r.push(secs(131), &frag(1, 8, false, &[0; 8])).is_none());
         // Timestamps going backwards do not resurrect anything or panic.
         r.push(secs(5), &frag(3, 0, true, &[0; 8]));
+        // Many completed datagrams do not grow the order queue unboundedly.
+        for id in 10..5000 {
+            r.push(secs(140), &frag(id, 0, false, &[0; 8]));
+        }
+        assert!(r.families[0].order.len() <= 2 * r.in_flight() + 1025);
+        r.check_invariants();
     }
 
+    /// `ipfrag_max_dist`: 63 fragments from the same source between two of a
+    /// datagram's fragments are fine, 64 restart it (verified on Linux 6.x).
     #[test]
-    fn datagram_count_is_bounded() {
+    fn max_dist_matches_linux() {
+        for (junk, delivered) in [(63u32, true), (64, false)] {
+            let mut r = Reassembler::default();
+            r.push(secs(0), &frag(1, 0, true, &[1; 8]));
+            for j in 0..junk {
+                r.push(secs(0), &frag(100 + j, 0, true, &[0; 8]));
+            }
+            let out = r.push(secs(0), &frag(1, 8, false, &[2; 8]));
+            assert_eq!(out.is_some(), delivered, "junk {junk}");
+            assert_eq!(r.stats().dropped_too_far, u64::from(!delivered));
+        }
+        // Other sources do not count; IPv6 has no max_dist.
+        let mut r = Reassembler::default();
+        r.push(secs(0), &frag(1, 0, true, &[1; 8]));
+        for j in 0..200u32 {
+            r.push(secs(0), &frag_from(ip(50), j, 0, true, &[0; 8]));
+        }
+        assert!(r.push(secs(0), &frag(1, 8, false, &[2; 8])).is_some());
+        let mut r = Reassembler::default();
+        r.push(secs(0), &frag_from(v6(1), 1, 0, true, &[1; 8]));
+        for j in 0..200u32 {
+            r.push(secs(0), &frag_from(v6(1), 100 + j, 0, true, &[0; 8]));
+        }
+        assert!(r
+            .push(secs(0), &frag_from(v6(1), 1, 8, false, &[2; 8]))
+            .is_some());
+        // Disabled.
         let mut r = Reassembler::new(ReassemblyLimits {
-            max_datagrams: 4,
+            max_dist: 0,
             ..Default::default()
         });
-        for id in 0..100 {
-            r.push(secs(u64::from(id)), &frag(id, 0, true, &[0; 8]));
-            assert!(r.in_flight() <= 4);
+        r.push(secs(0), &frag(1, 0, true, &[1; 8]));
+        for j in 0..200u32 {
+            r.push(secs(0), &frag(100 + j, 0, true, &[0; 8]));
         }
-        assert_eq!(r.stats().dropped_capacity, 96);
-        // The most recent ones survive and can complete.
-        assert!(r.push(secs(100), &frag(99, 8, false, &[0; 8])).is_some());
+        assert!(r.push(secs(0), &frag(1, 8, false, &[2; 8])).is_some());
     }
 
+    fn to(
+        src: IpAddr,
+        dst: IpAddr,
+        id: u32,
+        offset: usize,
+        more: bool,
+        data: &[u8],
+    ) -> IpFragment<'_> {
+        IpFragment {
+            src,
+            dst,
+            id,
+            protocol: 17,
+            offset,
+            more,
+            data,
+        }
+    }
+
+    /// Review finding F7a: junk first-fragments (same source, or spoofed
+    /// sources) interleaved with a real datagram never evict it. IPv6 has no
+    /// `max_dist`, so this is purely the memory policy.
     #[test]
-    fn byte_budget_is_bounded() {
+    fn junk_flood_never_evicts_a_queued_datagram() {
+        for spoofed in [false, true] {
+            let mut r = Reassembler::default();
+            r.push(secs(0), &frag_from(v6(1), 1, 0, true, &[1; 8]));
+            for j in 0..20_000u32 {
+                let src = if spoofed {
+                    v6(100 + (j % 60_000) as u16)
+                } else {
+                    v6(1)
+                };
+                r.push(secs(0), &frag_from(src, 1000 + j, 0, true, &[0; 8]));
+            }
+            assert_eq!(r.stats().dropped_capacity, 0);
+            let out = r.push(secs(0), &frag_from(v6(1), 1, 8, false, &[2; 8]));
+            assert_eq!(out.expect("delivered").payload, [[1u8; 8], [2; 8]].concat());
+            r.check_invariants();
+        }
+    }
+
+    /// While one destination's bucket is above its budget, every fragment to
+    /// it is refused (the kernel's `ipfrag_high_thresh` rule) and nothing is
+    /// evicted; other destinations are unaffected.
+    #[test]
+    fn per_destination_budget_refuses_like_the_kernel() {
         let mut r = Reassembler::new(ReassemblyLimits {
-            max_bytes: 4096,
+            max_bytes_per_dst: 1024,
             ..Default::default()
         });
-        let big = vec![0u8; 2048];
-        for id in 0..10 {
-            r.push(secs(1), &frag(id, 0, true, &big));
-            assert!(r.buffered_bytes() <= 4096);
+        let robot = ip(2);
+        r.push(secs(0), &frag(1, 0, true, &[1; 8]));
+        let mut refused_at = None;
+        for j in 0..100u32 {
+            r.push(secs(0), &frag_from(ip(66), 100 + j, 0, true, &[0; 64]));
+            if refused_at.is_none() && r.stats().refused_capacity > 0 {
+                refused_at = Some(j);
+            }
         }
-        // A single datagram over budget is dropped outright.
-        let huge = vec![0u8; 8192];
-        r.push(secs(1), &frag(99, 0, true, &huge));
-        assert!(r.buffered_bytes() <= 4096);
-        assert!(r.stats().dropped_capacity >= 9);
+        assert!(refused_at.is_some());
+        // Bounded by the budget plus at most one admitted datagram.
+        assert!(r.buffered_bytes_for(robot) <= 1024 + 64 + FRAGMENT_OVERHEAD + DATAGRAM_OVERHEAD);
+        assert_eq!(r.stats().dropped_capacity, 0);
+        // The real datagram's next fragment is refused too while above the
+        // threshold, exactly like the kernel (it would refuse it first).
+        assert!(r.push(secs(0), &frag(1, 8, false, &[2; 8])).is_none());
+        // Another destination still reassembles.
+        let other = ip(3);
+        r.push(secs(0), &to(ip(1), other, 9, 0, true, &[5; 8]));
+        assert!(r
+            .push(secs(0), &to(ip(1), other, 9, 8, false, &[6; 8]))
+            .is_some());
+        // After the timeout the bucket drains and the robot accepts again.
+        r.push(secs(31), &frag(2, 0, true, &[1; 8]));
+        assert!(r.push(secs(31), &frag(2, 8, false, &[2; 8])).is_some());
+        r.check_invariants();
+    }
+
+    /// Global pressure evicts the heaviest destination, or refuses the
+    /// fragment when it belongs to the heaviest one: the robot's small
+    /// bucket survives floods to one or many other destinations.
+    #[test]
+    fn global_pressure_evicts_the_heaviest_destination() {
+        let mut r = Reassembler::new(ReassemblyLimits {
+            max_bytes: 8 * 1024,
+            max_dist: 0,
+            ..Default::default()
+        });
+        let robot = ip(2);
+        r.push(secs(0), &frag(1, 0, true, &[1; 8]));
+        for j in 0..2000u32 {
+            let dst = IpAddr::V4(Ipv4Addr::new(10, 1, (j % 50) as u8, 1));
+            r.push(secs(0), &to(ip(66), dst, j, 0, true, &[0; 64]));
+            assert!(r.buffered_bytes() <= 8 * 1024 + 64 + FRAGMENT_OVERHEAD + DATAGRAM_OVERHEAD);
+        }
+        assert!(r.stats().dropped_capacity > 0);
+        assert!(r.buffered_bytes_for(robot) > 0, "robot state kept");
+        // The robot's datagram completes even though the table is full: the
+        // flood is evicted to make room.
+        assert!(r.push(secs(0), &frag(1, 8, false, &[2; 8])).is_some());
+        // Datagram-count pressure works the same way.
+        let mut r = Reassembler::new(ReassemblyLimits {
+            max_datagrams: 16,
+            max_dist: 0,
+            ..Default::default()
+        });
+        r.push(secs(0), &frag(1, 0, true, &[1; 8]));
+        for j in 0..100u32 {
+            r.push(secs(0), &to(ip(66), ip(200), j, 0, true, &[0; 8]));
+            assert!(r.in_flight() <= 16);
+        }
+        // The flood's destination is the heaviest: refused, nothing evicted.
+        assert!(r.stats().refused_capacity > 0);
+        assert_eq!(r.stats().dropped_capacity, 0);
+        // A new robot datagram evicts from the flood's destination.
+        let before = r.stats().dropped_capacity;
+        r.push(secs(0), &frag(2, 0, true, &[1; 8]));
+        assert_eq!(r.stats().dropped_capacity, before + 1);
+        assert!(r.push(secs(0), &frag(1, 8, false, &[2; 8])).is_some());
+        assert!(r.push(secs(0), &frag(2, 8, false, &[2; 8])).is_some());
+        // IPv4 pressure never evicts IPv6 state.
+        r.push(secs(0), &frag_from(v6(1), 7, 0, true, &[1; 8]));
+        for j in 0..100u32 {
+            r.push(secs(0), &to(ip(66), ip(201), 1000 + j, 0, true, &[0; 8]));
+        }
+        assert!(r
+            .push(secs(0), &frag_from(v6(1), 7, 8, false, &[2; 8]))
+            .is_some());
+        r.check_invariants();
         // Zero capacity never panics.
         let mut z = Reassembler::new(ReassemblyLimits {
             max_datagrams: 0,
             ..Default::default()
         });
-        assert!(z.push(secs(0), &frag(1, 0, false, &[0; 8])).is_none());
+        assert!(z.push(secs(0), &frag(1, 0, true, &[0; 8])).is_none());
+        assert_eq!(z.stats().refused_capacity, 1);
+        let mut z = Reassembler::new(ReassemblyLimits {
+            max_bytes_per_dst: 0,
+            max_bytes: 0,
+            ..Default::default()
+        });
+        z.push(secs(0), &frag(1, 0, true, &[0; 8]));
+        assert!(z.push(secs(0), &frag(1, 8, false, &[0; 8])).is_none());
+        z.check_invariants();
+    }
+
+    /// `max_dist` counts per (source, destination): fragments the attacker
+    /// sends to other hosts do not restart the robot's datagram.
+    #[test]
+    fn max_dist_counts_per_destination() {
+        let mut r = Reassembler::default();
+        r.push(secs(0), &frag(1, 0, true, &[1; 8]));
+        for j in 0..500u32 {
+            r.push(secs(0), &to(ip(1), ip(99), j, 0, true, &[0; 8]));
+        }
+        assert!(r.push(secs(0), &frag(1, 8, false, &[2; 8])).is_some());
+        assert_eq!(r.stats().dropped_too_far, 0);
     }
 
     #[test]
-    fn eviction_keeping_current_entry_completes() {
-        // Budget evicts an older entry while the current one completes.
+    fn ipv6_timeout_is_60s_ipv4_30s() {
+        let mut r = Reassembler::default();
+        r.push(secs(0), &frag_from(v6(1), 1, 0, true, &[1; 8]));
+        r.push(secs(0), &frag(1, 0, true, &[1; 8]));
+        assert!(r.push(secs(45), &frag(1, 8, false, &[2; 8])).is_none());
+        assert_eq!(r.stats().dropped_timeout, 1);
+        assert!(r
+            .push(secs(45), &frag_from(v6(1), 1, 8, false, &[2; 8]))
+            .is_some());
+        r.push(secs(50), &frag_from(v6(1), 2, 0, true, &[1; 8]));
+        r.push(secs(111), &frag(9, 0, true, &[1; 8]));
+        assert_eq!(r.stats().dropped_timeout, 3);
+        r.check_invariants();
+    }
+
+    #[test]
+    fn ipv6_atomic_fragment_is_isolated() {
+        let mut r = Reassembler::default();
+        r.push(secs(0), &frag_from(v6(1), 5, 0, true, &[1; 8]));
+        let a = r.push(secs(0), &frag_from(v6(1), 5, 0, false, &[9; 4]));
+        assert_eq!(a.unwrap().payload, [9; 4]);
+        // The queued datagram is untouched.
+        assert!(r
+            .push(secs(0), &frag_from(v6(1), 5, 8, false, &[2; 8]))
+            .is_some());
+    }
+
+    /// Pseudo-random operations keep the accounting consistent.
+    #[test]
+    fn accounting_invariants_hold_under_churn() {
         let mut r = Reassembler::new(ReassemblyLimits {
-            max_bytes: 64,
+            max_bytes: 4096,
+            max_bytes_per_dst: 2048,
+            max_datagrams: 40,
+            max_dist: 5,
             ..Default::default()
         });
-        r.push(secs(0), &frag(1, 0, true, &[0; 32]));
-        r.push(secs(1), &frag(2, 0, true, &[1; 32]));
-        let out = r.push(secs(2), &frag(2, 32, false, &[1; 8]));
-        assert_eq!(out.map(|o| o.payload.len()), Some(40));
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let buf = [0xa5u8; 512];
+        for i in 0..20_000u64 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let src = if x & 1 == 0 {
+                ip((x >> 8) as u8 % 4)
+            } else {
+                v6((x >> 8) as u16 % 4)
+            };
+            let dst = if src.is_ipv4() {
+                ip(10 + (x >> 16) as u8 % 4)
+            } else {
+                v6(10 + (x >> 16) as u16 % 4)
+            };
+            let off = ((x >> 24) as usize % 16) * 8;
+            let len = (x >> 32) as usize % 64;
+            let f = to(
+                src,
+                dst,
+                (x >> 40) as u32 % 8,
+                off,
+                (x >> 50) & 3 != 0,
+                &buf[..len],
+            );
+            r.push(secs(i / 500), &f);
+            if i % 997 == 0 {
+                r.check_invariants();
+            }
+        }
+        r.check_invariants();
+        assert!(r.buffered_bytes() <= 2 * (4096 + 512 + FRAGMENT_OVERHEAD + DATAGRAM_OVERHEAD));
+    }
+
+    #[test]
+    fn sparse_fragments_cost_only_their_bytes() {
+        let mut r = Reassembler::default();
+        r.push(secs(0), &frag(1, 65_000, true, &[0; 8]));
+        assert_eq!(
+            r.buffered_bytes(),
+            8 + FRAGMENT_OVERHEAD + DATAGRAM_OVERHEAD
+        );
+        assert_eq!(r.buffered_bytes_for(ip(2)), r.buffered_bytes());
+        r.check_invariants();
     }
 }

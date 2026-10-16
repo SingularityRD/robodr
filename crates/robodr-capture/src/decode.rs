@@ -19,13 +19,18 @@
 //! Network layer:
 //! - **IPv4**: version, IHL (>= 5, options skipped), total length (must
 //!   be >= IHL and fit the captured bytes; link padding and Ethernet FCS past the
-//!   total length are trimmed). Header checksums are **not** verified:
-//!   loopback and checksum-offloaded NICs routinely capture packets whose
-//!   checksum is not filled in yet.
+//!   total length are trimmed). These pure decoders do **not** verify
+//!   checksums (they are also used on offloaded captures); the capture
+//!   pipeline ([`crate::RtpsDatagrams`]) does, see [`crate::checksum`].
 //! - **IPv6**: payload length checked; the extension-header chain
 //!   (hop-by-hop, routing, destination options, AH, mobility, HIP, shim6,
-//!   fragment) is walked with per-header bounds checks and a hard limit of
-//!   [`MAX_IPV6_EXT_HEADERS`]. ESP (encrypted) and "no next header" are
+//!   fragment) is walked with per-header bounds checks. Linux puts no limit
+//!   on the number of extension headers, so neither do we in practice:
+//!   [`MAX_IPV6_EXT_HEADERS`] is above what fits in a 65 535-byte payload
+//!   (each header is at least 8 bytes); chains longer than
+//!   [`SUSPICIOUS_IPV6_EXT_HEADERS`] are decoded but counted by the pipeline.
+//!   A hop-by-hop header anywhere but first is malformed (RFC 8200; Linux
+//!   drops it). ESP (encrypted) and "no next header" are
 //!   reported as [`DecodeError::NotUdp`]. Jumbograms are not supported.
 //! - **Fragments** (IPv4 MF/offset, IPv6 fragment header) are returned as
 //!   [`Decoded::Fragment`] for the bounded reassembler in
@@ -35,7 +40,7 @@
 //!
 //! Transport: only UDP. The UDP length must be >= 8 and fit the IP payload;
 //! bytes after the UDP length are trimmed. The UDP checksum is not verified
-//! (same offload reason as above).
+//! here (same reason as above).
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -44,8 +49,17 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 /// "QinQ" double tagging). A frame with more tags is [`DecodeError::Malformed`].
 pub const MAX_VLAN_TAGS: usize = 2;
 
-/// Maximum number of IPv6 extension headers walked before giving up.
-pub const MAX_IPV6_EXT_HEADERS: usize = 8;
+/// Maximum number of IPv6 extension headers walked before giving up. Every
+/// extension header is at least 8 bytes, so at most 8 191 fit in a maximal
+/// payload: this bound is never reached by a well-formed packet and only
+/// guards the loop. (It used to be 8, which let an attacker hide a datagram
+/// that Linux — which has no such limit — delivers.)
+pub const MAX_IPV6_EXT_HEADERS: usize = 8192;
+
+/// Chains with more extension headers than this are decoded but flagged
+/// ([`crate::CaptureStats::ipv6_long_ext_chains`]): real stacks emit a few at
+/// most, so a long chain is an evasion or fingerprinting attempt.
+pub const SUSPICIOUS_IPV6_EXT_HEADERS: usize = 8;
 
 /// IANA protocol number for UDP.
 pub const IPPROTO_UDP: u8 = 17;
@@ -220,6 +234,22 @@ fn le32(b: &[u8], at: usize) -> Option<u32> {
 /// Decode a captured frame of the given link type down to UDP, returning
 /// fragments as [`Decoded::Fragment`].
 pub fn decode_frame(link: LinkType, frame: &[u8]) -> Result<Decoded<'_>, DecodeError> {
+    decode_frame_detail(link, frame).map(|d| d.decoded)
+}
+
+/// [`Decoded`] plus what the pipeline needs to verify checksums.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Detail<'a> {
+    pub decoded: Decoded<'a>,
+    /// The IPv4 header (IHL * 4 bytes), for header-checksum verification.
+    pub ipv4_header: Option<&'a [u8]>,
+    /// For [`Decoded::Udp`]: UDP header + payload, exactly UDP-length bytes.
+    pub udp_segment: Option<&'a [u8]>,
+    /// IPv6 extension headers walked (0 for IPv4).
+    pub ext_headers: usize,
+}
+
+pub(crate) fn decode_frame_detail(link: LinkType, frame: &[u8]) -> Result<Detail<'_>, DecodeError> {
     let (expected, ip) = link_payload(link, frame)?;
     decode_ip_expect(expected, ip)
 }
@@ -236,7 +266,7 @@ pub fn decode_udp(link: LinkType, frame: &[u8]) -> Result<UdpDatagram<'_>, Decod
 
 /// Decode a bare IPv4 or IPv6 packet (version from the first nibble).
 pub fn decode_ip(packet: &[u8]) -> Result<Decoded<'_>, DecodeError> {
-    decode_ip_expect(None, packet)
+    decode_ip_expect(None, packet).map(|d| d.decoded)
 }
 
 /// Strip the link-layer header. Returns the IP version the link layer
@@ -299,8 +329,17 @@ fn family_to_version(family: u32) -> Result<u8, DecodeError> {
     }
 }
 
-/// Follow VLAN tags to the IP ethertype.
-fn ethertype_dispatch(
+/// Whether `ethertype` is an 802.1Q / 802.1ad (or legacy QinQ) tag protocol.
+pub(crate) fn is_vlan_tpid(ethertype: u16) -> bool {
+    matches!(
+        ethertype,
+        ETHERTYPE_VLAN | ETHERTYPE_QINQ | ETHERTYPE_QINQ_LEGACY
+    )
+}
+
+/// Follow VLAN tags to the IP ethertype. `rest` starts right after the
+/// ethertype field, i.e. at the TCI when `ethertype` is a tag protocol.
+pub(crate) fn ethertype_dispatch(
     mut ethertype: u16,
     mut rest: &[u8],
 ) -> Result<(Option<u8>, &[u8]), DecodeError> {
@@ -309,7 +348,7 @@ fn ethertype_dispatch(
         match ethertype {
             ETHERTYPE_IPV4 => return Ok((Some(4), rest)),
             ETHERTYPE_IPV6 => return Ok((Some(6), rest)),
-            ETHERTYPE_VLAN | ETHERTYPE_QINQ | ETHERTYPE_QINQ_LEGACY => {
+            t if is_vlan_tpid(t) => {
                 if tags == MAX_VLAN_TAGS {
                     return Err(DecodeError::Malformed(Layer::Link, "too many VLAN tags"));
                 }
@@ -323,7 +362,7 @@ fn ethertype_dispatch(
     }
 }
 
-fn decode_ip_expect(expected: Option<u8>, p: &[u8]) -> Result<Decoded<'_>, DecodeError> {
+fn decode_ip_expect(expected: Option<u8>, p: &[u8]) -> Result<Detail<'_>, DecodeError> {
     let layer_of = |v: Option<u8>| match v {
         Some(6) => Layer::Ipv6,
         Some(4) => Layer::Ipv4,
@@ -348,7 +387,7 @@ fn decode_ip_expect(expected: Option<u8>, p: &[u8]) -> Result<Decoded<'_>, Decod
     }
 }
 
-fn decode_ipv4(p: &[u8]) -> Result<Decoded<'_>, DecodeError> {
+fn decode_ipv4(p: &[u8]) -> Result<Detail<'_>, DecodeError> {
     const L: Layer = Layer::Ipv4;
     if p.len() < 20 {
         return Err(DecodeError::Truncated(L));
@@ -384,19 +423,31 @@ fn decode_ipv4(p: &[u8]) -> Result<Decoded<'_>, DecodeError> {
     if protocol != IPPROTO_UDP {
         return Err(DecodeError::NotUdp);
     }
+    let ipv4_header = Some(&p[..ihl]);
     if more || offset != 0 {
         let id = u32::from(be16(p, 4).ok_or(DecodeError::Truncated(L))?);
-        return Ok(Decoded::Fragment(IpFragment {
-            src,
-            dst,
-            id,
-            protocol,
-            offset,
-            more,
-            data,
-        }));
+        return Ok(Detail {
+            decoded: Decoded::Fragment(IpFragment {
+                src,
+                dst,
+                id,
+                protocol,
+                offset,
+                more,
+                data,
+            }),
+            ipv4_header,
+            udp_segment: None,
+            ext_headers: 0,
+        });
     }
-    decode_udp_segment(src, dst, data).map(Decoded::Udp)
+    let (u, seg) = udp_segment_inner(src, dst, data)?;
+    Ok(Detail {
+        decoded: Decoded::Udp(u),
+        ipv4_header,
+        udp_segment: Some(seg),
+        ext_headers: 0,
+    })
 }
 
 fn ipv6_addr(b: &[u8]) -> Ipv6Addr {
@@ -405,7 +456,7 @@ fn ipv6_addr(b: &[u8]) -> Ipv6Addr {
     Ipv6Addr::from(a)
 }
 
-fn decode_ipv6(p: &[u8]) -> Result<Decoded<'_>, DecodeError> {
+fn decode_ipv6(p: &[u8]) -> Result<Detail<'_>, DecodeError> {
     const L: Layer = Layer::Ipv6;
     if p.len() < 40 {
         return Err(DecodeError::Truncated(L));
@@ -436,9 +487,21 @@ pub fn decode_ipv6_upper(
     next_header: u8,
     payload: &[u8],
 ) -> Result<UdpDatagram<'_>, DecodeError> {
-    match walk_ipv6(src, dst, next_header, payload, false)? {
-        Decoded::Udp(u) => Ok(u),
-        Decoded::Fragment(_) => Err(DecodeError::Fragment), // unreachable by construction
+    decode_ipv6_upper_detail(src, dst, next_header, payload).map(|(u, _, _)| u)
+}
+
+/// [`decode_ipv6_upper`] plus the UDP segment and the number of extension
+/// headers walked.
+pub(crate) fn decode_ipv6_upper_detail(
+    src: IpAddr,
+    dst: IpAddr,
+    next_header: u8,
+    payload: &[u8],
+) -> Result<(UdpDatagram<'_>, &[u8], usize), DecodeError> {
+    let d = walk_ipv6(src, dst, next_header, payload, false)?;
+    match (d.decoded, d.udp_segment) {
+        (Decoded::Udp(u), Some(seg)) => Ok((u, seg, d.ext_headers)),
+        _ => Err(DecodeError::Fragment), // unreachable by construction
     }
 }
 
@@ -462,13 +525,26 @@ fn walk_ipv6(
     mut nh: u8,
     buf: &[u8],
     allow_fragment: bool,
-) -> Result<Decoded<'_>, DecodeError> {
+) -> Result<Detail<'_>, DecodeError> {
     const L: Layer = Layer::Ipv6;
     let mut off = 0usize;
-    for _ in 0..=MAX_IPV6_EXT_HEADERS {
+    for walked in 0..=MAX_IPV6_EXT_HEADERS {
         let rest = &buf[off..];
+        if nh == IP6_HOP_BY_HOP && (walked > 0 || !allow_fragment) {
+            // RFC 8200 4.1: only directly after the IPv6 header. Linux
+            // has no handler for it elsewhere and drops the packet.
+            return Err(DecodeError::Malformed(L, "hop-by-hop header not first"));
+        }
         match nh {
-            IPPROTO_UDP => return decode_udp_segment(src, dst, rest).map(Decoded::Udp),
+            IPPROTO_UDP => {
+                let (u, seg) = udp_segment_inner(src, dst, rest)?;
+                return Ok(Detail {
+                    decoded: Decoded::Udp(u),
+                    ipv4_header: None,
+                    udp_segment: Some(seg),
+                    ext_headers: walked,
+                });
+            }
             IP6_FRAGMENT => {
                 if !allow_fragment {
                     return Err(DecodeError::Malformed(L, "nested fragment header"));
@@ -490,15 +566,20 @@ fn walk_ipv6(
                 if frag_nh != IPPROTO_UDP && !is_ipv6_ext_header(frag_nh) {
                     return Err(DecodeError::NotUdp);
                 }
-                return Ok(Decoded::Fragment(IpFragment {
-                    src,
-                    dst,
-                    id,
-                    protocol: frag_nh,
-                    offset,
-                    more,
-                    data: &buf[off..],
-                }));
+                return Ok(Detail {
+                    decoded: Decoded::Fragment(IpFragment {
+                        src,
+                        dst,
+                        id,
+                        protocol: frag_nh,
+                        offset,
+                        more,
+                        data: &buf[off..],
+                    }),
+                    ipv4_header: None,
+                    udp_segment: None,
+                    ext_headers: walked + 1,
+                });
             }
             IP6_AH => {
                 if rest.len() < 2 {
@@ -534,6 +615,16 @@ pub fn decode_udp_segment(
     dst: IpAddr,
     seg: &[u8],
 ) -> Result<UdpDatagram<'_>, DecodeError> {
+    udp_segment_inner(src, dst, seg).map(|(u, _)| u)
+}
+
+/// [`decode_udp_segment`] plus the segment trimmed to the UDP length (what
+/// the UDP checksum covers).
+pub(crate) fn udp_segment_inner(
+    src: IpAddr,
+    dst: IpAddr,
+    seg: &[u8],
+) -> Result<(UdpDatagram<'_>, &[u8]), DecodeError> {
     const L: Layer = Layer::Udp;
     if seg.len() < 8 {
         return Err(DecodeError::Truncated(L));
@@ -547,13 +638,16 @@ pub fn decode_udp_segment(
     if len > seg.len() {
         return Err(DecodeError::Truncated(L));
     }
-    Ok(UdpDatagram {
-        src,
-        dst,
-        src_port,
-        dst_port,
-        payload: &seg[8..len],
-    })
+    Ok((
+        UdpDatagram {
+            src,
+            dst,
+            src_port,
+            dst_port,
+            payload: &seg[8..len],
+        },
+        &seg[..len],
+    ))
 }
 
 #[cfg(test)]
@@ -907,17 +1001,26 @@ mod tests {
             decode_udp(LinkType::RAW, &p),
             Err(DecodeError::Truncated(Layer::Ipv6))
         );
-        // Too many extension headers.
-        let many: Vec<(u8, usize)> = (0..=MAX_IPV6_EXT_HEADERS).map(|_| (60u8, 8)).collect();
-        let p = synth::ipv6_udp(src6(), dst6(), 40000, 7410, &many, b"x");
-        assert!(matches!(
+        // Long chains decode (Linux has no count limit): review finding F8
+        // used 9 destination-options headers, which used to be Malformed.
+        for n in [SUSPICIOUS_IPV6_EXT_HEADERS + 1, 32, 1000, 8000] {
+            let many: Vec<(u8, usize)> = (0..n).map(|_| (60u8, 8)).collect();
+            let p = synth::ipv6_udp(src6(), dst6(), 40000, 7410, &many, b"x");
+            let d = decode_frame_detail(LinkType::RAW, &p).unwrap();
+            assert_eq!(d.ext_headers, n);
+            check_udp(&decode_udp(LinkType::RAW, &p).unwrap(), b"x");
+        }
+        // The loop guard is above what a 65 535-byte payload can hold.
+        const { assert!(MAX_IPV6_EXT_HEADERS * 8 > 65_535) };
+        // Hop-by-hop anywhere but first is dropped by Linux: malformed.
+        let p = synth::ipv6_udp(src6(), dst6(), 40000, 7410, &[(60, 8), (0, 8)], b"x");
+        assert_eq!(
             decode_udp(LinkType::RAW, &p),
-            Err(DecodeError::Malformed(Layer::Ipv6, _))
-        ));
-        // Exactly the limit is fine.
-        let ok: Vec<(u8, usize)> = (0..MAX_IPV6_EXT_HEADERS).map(|_| (60u8, 8)).collect();
-        let p = synth::ipv6_udp(src6(), dst6(), 40000, 7410, &ok, b"x");
-        assert!(decode_udp(LinkType::RAW, &p).is_ok());
+            Err(DecodeError::Malformed(
+                Layer::Ipv6,
+                "hop-by-hop header not first"
+            ))
+        );
         // ESP and no-next-header are not UDP.
         let mut esp = synth::ipv6_udp(src6(), dst6(), 40000, 7410, &[], b"x");
         esp[6] = 50;
