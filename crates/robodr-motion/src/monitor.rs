@@ -443,6 +443,25 @@ pub struct MonitorStats {
 /// Episode-based persistence (see [`Persistence`]): an episode starts at
 /// the first bad sample and ends after `clear_samples` consecutive good
 /// ones; interleaved good samples only dilute the bad fraction.
+///
+/// With a non-zero **hold** (`MonitorConfig::episode_hold_ns`), a good
+/// sample that arrives within the hold of the latest bad sample of an open
+/// episode is *neutral*: it neither dilutes the fraction nor counts toward
+/// `clear_samples`. The episode is then judged on the stream's upper
+/// envelope (the worst sample of every hold window) rather than on the
+/// per-sample majority, so an injector cannot hide a real excursion by
+/// interleaving any number of plausible values between real samples (it
+/// would have to stop the real samples for longer than the hold). Neutral
+/// samples never count as bad, so the hold cannot turn sparse honest
+/// outliers into a finding: `min_samples` still counts genuinely bad
+/// samples only.
+///
+/// For the uncommanded rule the episode also counts its samples at or above
+/// a **critical level**: it reports `Critical` once `min_samples` of them
+/// were seen, and a latched non-critical episode is **escalated** (fires a
+/// second time, once) when that count is reached later. An injector cannot
+/// pre-open a `High` episode with mildly bad values and keep it latched to
+/// mask later critical motion.
 #[derive(Debug, Clone, Copy, Default)]
 struct Persist {
     since: Option<u64>,
@@ -450,33 +469,96 @@ struct Persist {
     total: u32,
     good_run: u32,
     fired: bool,
+    /// Observer time until which good samples are neutral.
+    hold_until: u64,
+    /// Largest magnitude among the episode's bad samples.
+    peak: f64,
+    /// Bad samples at or above the critical level.
+    crit: u32,
+    /// A critical firing was reported in this episode.
+    crit_fired: bool,
+}
+
+/// A persistence rule firing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Fire {
+    since: u64,
+    /// Bad samples in the episode.
+    bad: u32,
+    /// Largest |value| among them.
+    peak: f64,
+    /// At least `min_samples` bad samples reached the critical level.
+    critical: bool,
 }
 
 impl Persist {
-    /// Feed one observation. Returns `Some((since, bad_samples))` exactly
-    /// once per episode, when the condition first satisfies the rule.
+    /// Feed one observation without a hold or critical level. Returns
+    /// `Some((since, bad_samples))` exactly once per episode, when the
+    /// condition first satisfies the rule.
     fn observe(&mut self, bad: bool, now: u64, p: &Persistence) -> Option<(u64, u32)> {
+        self.observe_held(bad, 0.0, f64::INFINITY, now, 0, p)
+            .map(|f| (f.since, f.bad))
+    }
+
+    /// Feed one observation of magnitude `mag`, with critical level
+    /// `crit_level` (`INFINITY` = none) and hold `hold_ns` (0 = none).
+    /// Fires once per episode when the rule is first satisfied, and once
+    /// more if a non-critical firing later becomes critical.
+    fn observe_held(
+        &mut self,
+        bad: bool,
+        mag: f64,
+        crit_level: f64,
+        now: u64,
+        hold_ns: u64,
+        p: &Persistence,
+    ) -> Option<Fire> {
         if bad {
             self.good_run = 0;
+            self.hold_until = now.saturating_add(hold_ns);
             let since = match self.since {
                 Some(s) => s,
                 None => {
                     self.bad = 0;
                     self.total = 0;
+                    self.peak = 0.0;
+                    self.crit = 0;
+                    self.crit_fired = false;
                     self.since = Some(now);
                     now
                 }
             };
+            // `mag` is finite (sanitised feedback); `max` ignores NaN anyway.
+            let mag = mag.abs();
+            self.peak = self.peak.max(mag);
+            if mag >= crit_level {
+                self.crit = self.crit.saturating_add(1);
+            }
             self.bad = self.bad.saturating_add(1);
             self.total = self.total.saturating_add(1);
-            if !self.fired
-                && self.bad >= p.min_samples
-                && now.saturating_sub(since) >= p.min_duration_ns
-                && f64::from(self.bad) >= p.min_bad_fraction * f64::from(self.total)
-            {
-                self.fired = true;
-                return Some((since, self.bad));
+            let critical = self.crit >= p.min_samples;
+            let fire = |st: &mut Self| {
+                st.fired = true;
+                st.crit_fired |= critical;
+                Some(Fire {
+                    since,
+                    bad: st.bad,
+                    peak: st.peak,
+                    critical,
+                })
+            };
+            if !self.fired {
+                if self.bad >= p.min_samples
+                    && now.saturating_sub(since) >= p.min_duration_ns
+                    && f64::from(self.bad) >= p.min_bad_fraction * f64::from(self.total)
+                {
+                    return fire(self);
+                }
+            } else if critical && !self.crit_fired {
+                return fire(self);
             }
+        } else if hold_ns > 0 && self.since.is_some() && now <= self.hold_until {
+            // Neutral: within the hold of a bad sample.
         } else {
             self.good_run = self.good_run.saturating_add(1);
             if self.since.is_some() {
@@ -1370,13 +1452,20 @@ impl ConsistencyMonitor {
                 Some(_) => true,
             };
 
+        let hold = self.cfg.episode_hold_ns;
         let p_unc = self.cfg.uncommanded;
-        if let Some((since, n)) = self.unc[si][ai].observe(uncommanded, now, &p_unc) {
-            let sev = if m.abs() >= critical {
+        if let Some(fire) =
+            self.unc[si][ai].observe_held(uncommanded, m, critical, now, hold, &p_unc)
+        {
+            // Severity and evidence use the episode's critical-sample count
+            // and peak, not the sample that happened to complete the rule
+            // (which may be a plausible value interleaved by an injector).
+            let sev = if fire.critical {
                 Severity::Critical
             } else {
                 Severity::High
             };
+            let (since, n, peak) = (fire.since, fire.bad, fire.peak);
             self.emit(
                 sink,
                 rules::UNCOMMANDED_MOTION,
@@ -1385,7 +1474,7 @@ impl ConsistencyMonitor {
                 Evidence::UncommandedMotion {
                     source,
                     axis: a,
-                    measured: m,
+                    measured: if m.abs() >= peak { m } else { peak.copysign(m) },
                     expected_abs_max: lo.abs().max(hi.abs()),
                     tolerance: tol,
                     since_ns: since,
@@ -1395,7 +1484,9 @@ impl ConsistencyMonitor {
             );
         }
         let p_div = self.cfg.divergence;
-        if let Some((since, n)) = self.div[si][ai].observe(divergence, now, &p_div) {
+        if let Some(Fire { since, bad: n, .. }) =
+            self.div[si][ai].observe_held(divergence, m, f64::INFINITY, now, hold, &p_div)
+        {
             let dir = direction.unwrap_or(Direction::Over);
             let sev = match dir {
                 Direction::Under if !self.cfg.safety_stop_signal_wired => Severity::Medium,
@@ -1674,6 +1765,96 @@ mod tests {
             s.observe(false, k, &p);
         }
         assert!(s.since.is_none());
+    }
+
+    #[test]
+    fn hold_makes_interleaved_good_samples_neutral() {
+        let p = Persistence {
+            min_duration_ns: 100,
+            min_samples: 5,
+            min_bad_fraction: 0.25,
+            clear_samples: 4,
+        };
+        // 1 bad in 20 (5 %), good ones within the hold: still fires, and
+        // only genuinely bad samples are counted.
+        let mut s = Persist::default();
+        let mut fired = None;
+        for k in 0..200u64 {
+            if let Some(f) = s.observe_held(k % 20 == 0, 0.5, f64::INFINITY, k, 25, &p) {
+                fired = Some((k, f));
+                break;
+            }
+        }
+        let (k, f) = fired.expect("held episode must fire");
+        assert_eq!((k, f.since, f.bad, f.critical), (100, 0, 6, false));
+        assert_eq!(f.peak, 0.5);
+
+        // Same stream, hold shorter than the bad-sample spacing: diluted.
+        let mut s = Persist::default();
+        for k in 0..1000u64 {
+            assert!(s
+                .observe_held(k % 20 == 0, 0.5, f64::INFINITY, k, 5, &p)
+                .is_none());
+        }
+
+        // After the hold expires, good samples clear the episode as usual.
+        let mut s = Persist::default();
+        s.observe_held(true, 0.5, f64::INFINITY, 0, 10, &p);
+        for t in 1..=10u64 {
+            s.observe_held(false, 0.0, f64::INFINITY, t, 10, &p);
+        }
+        assert!(s.since.is_some(), "neutral samples must not clear");
+        for t in 11..15u64 {
+            s.observe_held(false, 0.0, f64::INFINITY, t, 10, &p);
+        }
+        assert!(s.since.is_none());
+    }
+
+    #[test]
+    fn latched_high_episode_escalates_to_critical_once() {
+        let p = Persistence {
+            min_duration_ns: 10,
+            min_samples: 3,
+            min_bad_fraction: 1.0,
+            clear_samples: 2,
+        };
+        let mut s = Persist::default();
+        let mut fires = Vec::new();
+        for (t, mag) in [
+            (0u64, 0.2),
+            (5, 0.2),
+            (10, 0.2),
+            (15, 0.4),
+            (20, 0.4),
+            (25, 0.2),
+        ]
+        .into_iter()
+        .chain((30..60).map(|t| (t, 0.4)))
+        {
+            if let Some(f) = s.observe_held(true, mag, 0.3, t, 0, &p) {
+                fires.push((t, f.critical, f.peak));
+            }
+        }
+        // High at t = 10, Critical once the third critical sample arrives.
+        assert_eq!(fires, vec![(10, false, 0.2), (30, true, 0.4)]);
+
+        // Critical from the start: fires once, no second escalation.
+        let mut s = Persist::default();
+        let n = (0..50u64)
+            .filter(|&t| s.observe_held(true, 0.5, 0.3, t * 5, 0, &p).is_some())
+            .count();
+        assert_eq!(n, 1);
+
+        // A single critical spike does not make the episode Critical.
+        let mut s = Persist::default();
+        let mut crit = false;
+        for (t, mag) in [(0u64, 0.2), (5, 0.9), (10, 0.2), (15, 0.2)] {
+            if let Some(f) = s.observe_held(true, mag, 0.3, t, 0, &p) {
+                crit |= f.critical;
+                assert_eq!(f.peak, 0.9);
+            }
+        }
+        assert!(!crit);
     }
 
     #[test]
