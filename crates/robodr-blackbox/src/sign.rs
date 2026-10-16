@@ -59,6 +59,17 @@ pub trait Signer: Send {
     fn key_id(&self) -> &str;
     /// Sign `message`. May fail (hardware-backed keys).
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, SignError>;
+    /// Check a signature made by this key, if the backend can do so without
+    /// a separate [`Verifier`] (HMAC: recompute; Ed25519/ECDSA: the public
+    /// half). `None` (the default) means "cannot self-verify"; such a signer
+    /// must be opened with [`crate::Recorder::open_with_verifier`].
+    ///
+    /// The recorder uses this to authenticate the existing log tail and its
+    /// own state files before it chains onto them.
+    fn verify_own(&self, message: &[u8], signature: &[u8]) -> Option<bool> {
+        let _ = (message, signature);
+        None
+    }
 }
 
 /// Checks signatures produced by the matching [`Signer`].
@@ -158,6 +169,9 @@ impl Signer for HmacSha256Key {
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, SignError> {
         Ok(hmac_sha256(&self.key, message).to_vec())
     }
+    fn verify_own(&self, message: &[u8], signature: &[u8]) -> Option<bool> {
+        Some(ct_eq(&hmac_sha256(&self.key, message), signature))
+    }
 }
 
 impl Verifier for HmacSha256Key {
@@ -207,6 +221,26 @@ mod tests {
         assert!(!b.verify(b"msg", &sig));
         assert!(!a.verify(b"msg", &sig[..31]));
         assert!(!a.verify(b"msg", &[]));
+        assert_eq!(a.verify_own(b"msg", &sig), Some(true));
+        assert_eq!(a.verify_own(b"msh", &sig), Some(false));
+        assert_eq!(b.verify_own(b"msg", &sig), Some(false));
+    }
+
+    #[test]
+    fn default_signer_cannot_self_verify() {
+        struct Opaque;
+        impl Signer for Opaque {
+            fn algorithm(&self) -> &str {
+                "x"
+            }
+            fn key_id(&self) -> &str {
+                "x"
+            }
+            fn sign(&self, _: &[u8]) -> Result<Vec<u8>, SignError> {
+                Ok(vec![1])
+            }
+        }
+        assert_eq!(Opaque.verify_own(b"m", &[1]), None);
     }
 
     #[test]

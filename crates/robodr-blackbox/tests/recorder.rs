@@ -168,8 +168,10 @@ fn torn_write_is_truncated_quarantined_and_recorded() {
     // The truncated file holds only whole frames again.
     let after = segs(d.path());
     assert_eq!(after.last().unwrap().name, last_name);
+    // Recovery is intact (nothing forged) but not clean: it is a warning.
     let rep = verify_path(d.path());
-    assert!(rep.is_clean(), "{}", dump(&rep));
+    assert!(rep.is_intact(), "{}", dump(&rep));
+    assert!(!rep.is_clean(), "{}", dump(&rep));
     assert!(has(&rep, |k| matches!(
         k,
         FindingKind::RecoveryRecorded { discarded_bytes, .. } if *discarded_bytes == q.len() as u64
@@ -189,12 +191,14 @@ fn zero_filled_tail_is_recovered() {
         .unwrap();
     assert_eq!(rp.discarded_bytes, 300);
     assert!(rp.reason.contains("zero"));
-    assert!(verify_path(d.path()).is_clean());
+    let rep = verify_path(d.path());
+    assert!(rep.is_intact() && !rep.is_clean(), "{}", dump(&rep));
 }
 
 #[test]
-fn corrupt_last_record_is_recovered_but_mid_log_corruption_refuses() {
-    // A complete but corrupted final frame is treated as torn.
+fn corrupt_last_record_and_mid_log_corruption_refuse() {
+    // A complete but modified final frame cannot be a crash artefact (the
+    // hash is computed before the frame is written): refuse, touch nothing.
     let d = TestDir::new("corrupt-last");
     let mut r = open(cfg(d.path(), big()));
     for i in 0..5 {
@@ -207,9 +211,11 @@ fn corrupt_last_record_is_recovered_but_mid_log_corruption_refuses() {
     let n = b.len();
     b[n - 40] ^= 0xff; // inside the last frame's hash/sig area
     std::fs::write(&path, &b).unwrap();
-    let r = open(cfg(d.path(), big()));
-    drop(r);
-    assert!(verify_path(d.path()).is_clean());
+    let e = Recorder::open(cfg(d.path(), big()), signer(), clock()).unwrap_err();
+    assert!(matches!(e, Error::Corrupt { .. }), "{e}");
+    assert_eq!(std::fs::read(&path).unwrap(), b);
+    assert!(!d.path().join(QUARANTINE_DIR).exists());
+    assert!(!verify_path(d.path()).is_intact());
 
     // Corruption followed by valid frames: refuse, do not touch the file.
     let d = TestDir::new("corrupt-mid");
@@ -260,7 +266,8 @@ fn crash_before_genesis_starts_chain_in_place() {
     let recs = all_records(d.path());
     assert_eq!(recs[0].kind, RecordKind::Genesis);
     assert_eq!(recs[1].kind, RecordKind::Recovery);
-    assert!(verify_path(d.path()).is_clean());
+    let rep = verify_path(d.path());
+    assert!(rep.is_intact() && !rep.is_clean(), "{}", dump(&rep));
 }
 
 #[test]

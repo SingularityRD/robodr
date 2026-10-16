@@ -522,6 +522,16 @@ pub struct ResumePayload {
     pub chain_boot_id: String,
     pub resumed_after_seq: u64,
     pub recovered: bool,
+    /// Segment indices the recorder expected but did not find at open (a
+    /// gap in the retained indices, or a missing predecessor of the oldest
+    /// retained segment with no recorded drop). Each is also recorded as a
+    /// `SegmentDropped { missing: true }`. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_segments: Vec<u64>,
+    /// State files (export cursor, ...) found but rejected because they did
+    /// not authenticate or did not match the chain. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected_state: Vec<String>,
 }
 
 /// Payload recording a torn-tail truncation.
@@ -545,10 +555,20 @@ pub enum DropReason {
     Cyclic,
     /// Fully exported and pruned.
     Exported,
+    /// Not deleted by the recorder: found missing when the recorder resumed
+    /// (`missing` is then always `true`).
+    Missing,
 }
 
 /// Payload recording a segment deletion. The `last_seq`/`last_hash` pair is
 /// the anchor that lets the verifier accept the retained tail.
+///
+/// The recorder derives the anchor from its own authenticated state: the
+/// signed `prev_hash` of the *next* segment's `SegmentStart` (which it wrote
+/// itself, or verified at open), never from the bytes of the segment being
+/// deleted. The verifier accepts a drop as covering the retained head only
+/// if `segment_index` is the head segment's index minus one, `missing` is
+/// false, and the anchor equals the head's `(seq - 1, prev_hash)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SegmentDroppedPayload {
     pub segment_index: u64,
