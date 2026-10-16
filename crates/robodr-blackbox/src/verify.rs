@@ -97,7 +97,7 @@ use crate::record::{
     SegmentStartPayload, TailKind, TruncationPayload, ZERO_HASH,
 };
 use crate::sign::Verifier;
-use crate::store::{list_segments, parse_segment_file_name, CHECKPOINT_FILE};
+use crate::store::{list_segments, parse_segment_file_name, CHECKPOINT_FILE, HEAD_FILE};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -289,6 +289,16 @@ pub enum FindingKind {
     /// durably synced record followed it).
     DamageQuarantined {
         seq: u64,
+        discarded_bytes: u64,
+        discarded_records: u64,
+    },
+    /// The recorder found a *closed* segment damaged at open (bit rot,
+    /// failing storage, or a malicious edit: indistinguishable) and moved
+    /// it to `quarantine/`; its records are missing from the log (their
+    /// seqs also show as `Deleted`).
+    SegmentQuarantined {
+        seq: u64,
+        segment_index: u64,
         discarded_bytes: u64,
         discarded_records: u64,
     },
@@ -490,6 +500,16 @@ impl fmt::Display for FindingKind {
                 f,
                 "record {seq}: {discarded_bytes} B with {discarded_records} records quarantined; \
                  a crash cannot explain the damage"
+            ),
+            SegmentQuarantined {
+                seq,
+                segment_index,
+                discarded_bytes,
+                discarded_records,
+            } => write!(
+                f,
+                "record {seq}: closed segment {segment_index} failed verification at open and was \
+                 quarantined ({discarded_bytes} B, {discarded_records} records)"
             ),
             KeyRotationRecorded {
                 seq,
@@ -1255,6 +1275,12 @@ pub fn verify_segments(
                 let rp = r.payload_json::<RecoveryPayload>();
                 let discarded_bytes = rp.as_ref().map_or(0, |x| x.discarded_bytes);
                 let kind = match rp {
+                    Some(x) if x.quarantined_segment => FindingKind::SegmentQuarantined {
+                        seq,
+                        segment_index: x.segment_index,
+                        discarded_bytes,
+                        discarded_records: x.discarded_records,
+                    },
                     Some(x) if !x.crash_plausible => FindingKind::DamageQuarantined {
                         seq,
                         discarded_bytes,
@@ -1450,8 +1476,11 @@ pub fn read_segments(dir: &Path) -> std::io::Result<Vec<SegmentData>> {
 }
 
 /// Verify a recorder directory. If `opts.checkpoint` is unset, the
-/// directory's own `checkpoint.json` (written at every seal) is used; it is
-/// only as trustworthy as the directory, so keep an external copy too.
+/// directory's own `checkpoint.json` (written at every seal) is used, or
+/// its `head.json` high-water mark (written every few records, see
+/// [`crate::store`]) when that one authenticates and names a later record.
+/// Both are only as trustworthy as the directory, so keep an external copy
+/// (or a [`crate::store::HeadAnchor`]) too.
 pub fn verify_dir(
     dir: &Path,
     verifier: &dyn Verifier,
@@ -1468,6 +1497,23 @@ pub fn verify_dir(
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
+        }
+        // The high-water mark replaces the checkpoint only if it is
+        // authentic and newer: a forged or stale head.json cannot hide
+        // anything the checkpoint shows.
+        let mark = match std::fs::read(dir.join(HEAD_FILE)) {
+            Ok(b) => std::str::from_utf8(&b).ok().and_then(Checkpoint::from_json),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        if let Some(m) = mark.filter(|m| m.verify(verifier)) {
+            let newer = match &o.checkpoint {
+                Some(c) if c.chain_id == m.chain_id && c.verify(verifier) => m.seq > c.seq,
+                _ => true,
+            };
+            if newer {
+                o.checkpoint = Some(m);
+            }
         }
     }
     let mut report = verify_segments(&segments, verifier, &o);
@@ -1836,6 +1882,7 @@ mod tests {
             discarded_seqs: seqs,
             crash_plausible: plausible,
             severity: Some(Severity::High),
+            quarantined_segment: false,
         })
         .unwrap()
     }

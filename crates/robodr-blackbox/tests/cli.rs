@@ -144,7 +144,11 @@ fn verify_with_external_checkpoint_and_strict() {
     let fr = frames(&b);
     std::fs::write(&seg, &b[..fr[fr.len() - 3].0]).unwrap();
     std::fs::remove_file(dir.join("checkpoint.json")).unwrap();
-    // Without the checkpoint the shortened log looks fine ...
+    // The local high-water mark (head.json) still exposes it ...
+    let o = run(&["verify", s(&dir), "--keyring", s(&k)]);
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+    // ... without any local mark the shortened log looks fine ...
+    std::fs::remove_file(dir.join("head.json")).unwrap();
     assert!(run(&["verify", s(&dir), "--keyring", s(&k)])
         .status
         .success());

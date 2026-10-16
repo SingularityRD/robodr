@@ -215,11 +215,18 @@ ends with a rotation seal.
 ```
 seg-0000000000000000.rbb ...   segments
 checkpoint.json                latest seal checkpoint
+head.json                      high-water mark: Checkpoint of the newest durable record
+recovery-pin.json              only between a recovery cut and its Recovery record
 export-cursor.json             last exported (chain_id, seq, hash) + unit signature
 export-ack.json                last receiver acknowledgement (ack mode)
 recorder.lock                  single-writer lock (flock)
-quarantine/                    bytes removed by crash recovery
+quarantine/                    bytes removed by crash recovery (torn-*.bin),
+                               damaged closed segments (damaged-seg*.rbb),
+                               superseded state files kept as evidence (state-*.json)
 ```
+
+Stale temp files of the atomic state-file replacement (`.<state>.<hex>.tmp`)
+left by a crash are removed at the next open.
 
 Everything the recorder creates is private: directories 0700, files 0600,
 created with `O_CREAT|O_EXCL|O_NOFOLLOW`. State files are replaced through a
@@ -247,10 +254,9 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
 - **Opening an existing log:** before chaining onto anything, `open`
   authenticates it with the recorder's own key (`Signer::verify_own`, or the
   verifier given to `open_with_verifier` for keys that cannot self-verify):
-  hash, linkage and signature of every record in the active segment, the
-  first record (kind, index, chain, signature) of every retained segment, and
-  the drop records anchoring the oldest one. A forged head is
-  `Error::Corrupt`. Segment indices that should exist but do not (a gap, or a
+  hash, linkage and signature of every record in the active segment, and
+  every retained closed segment as described under *Damaged closed
+  segments* below. A forged head is `Error::Corrupt`. Segment indices that should exist but do not (a gap, or a
   missing predecessor of the oldest segment with no recorded drop) are listed
   in the `Resume` record and written as `SegmentDropped { missing: true }`.
   `export-cursor.json`, `export-ack.json` and `checkpoint.json` are used only
@@ -276,12 +282,99 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
     severity critical, verifier **tamper** (`DamageQuarantined` plus
     `Deleted`). The recorder keeps recording in both cases.
 
-  Anything else is `Error::Corrupt` and nothing is touched: a complete frame
-  whose hash or signature fails without zero evidence (a crash cannot
-  produce one, because the hash is computed before the frame is written), a
-  record that does not link, non-zero bytes that are not a frame, or damage
-  in a closed segment. A write or fsync error poisons the recorder until it
-  is reopened, and the reopen recovers the log.
+  Anything else in the **active** segment is `Error::Corrupt` and nothing is
+  touched: a complete frame whose hash or signature fails without zero
+  evidence (a crash cannot produce one, because the hash is computed before
+  the frame is written), a record that does not link, non-zero bytes that are
+  not a frame. The active segment holds the head the recorder chains onto,
+  so it is never "repaired". A write or fsync error poisons the recorder
+  until it is reopened, and the reopen recovers the log.
+
+  Before cutting authentic records out of the active segment (the
+  zero-hole case), the recorder pins the highest of them in
+  `recovery-pin.json` (removed once the `Recovery` record is durable). If
+  the process dies between the cut and the record, the next open finds the
+  pin beyond the head: `TruncationDetected` (critical), numbering continues
+  after it. A plain torn tail has no authentic records to lose; a crash
+  between its cut and its record leaves only the `quarantine/torn-*.bin`
+  copy.
+- **Damaged closed segments (never brick on failing storage):** every
+  retained closed segment is verified at open: strict framing, the hash and
+  in-segment link of every record, every record's chain id, its first record
+  (genesis or its own `SegmentStart`), a final `Seal`, that its last record
+  is the one the next retained segment chains onto (`prev_hash`, seq), and
+  the signatures of its first and last record and of every
+  `SegmentDropped`, `Recovery` and `KeyRotation` record (all signatures with
+  `verify_closed_signatures = true`; off by default because the in-crate
+  Ed25519 needs about 1.3 ms per verification on x86-64 in release builds,
+  minutes for a full 64 MiB store). A segment that fails is **quarantined**
+  and the recorder keeps recording:
+  1. its bytes are copied to `quarantine/damaged-seg<idx>.rbb` and fsynced;
+  2. a signed, critical `Recovery` record with `quarantined_segment: true`
+     names the file, its SHA-256 and size, the count of frames in it with a
+     valid hash and this chain's id, the lowest/highest of them whose
+     signature verified (`discarded_seqs`), `crash_plausible: false` and a
+     severity: `high` for framing/hash damage (what failing media produces),
+     `critical` for authentic-looking records that do not belong (foreign
+     chain, bad signature, broken cross-segment link, missing seal);
+  3. only then is the original unlinked.
+
+  A crash between 1 and 2 leaves an extra copy in `quarantine/` and the step
+  is redone; a crash between 2 and 3 is finished at the next open without a
+  second record (the authentic `Recovery` with the same index and SHA-256 is
+  found). The verifier reports `SegmentQuarantined` (tamper) plus `Deleted`
+  for the lost seqs; older verifiers see `DamageQuarantined`. Seqs are never
+  reused: a quarantined segment between retained ones is bounded by its
+  successor; if it was the newest closed segment and the active one is
+  still empty, the recorder chains onto the newest intact segment before it
+  and numbers after the damaged segment's highest authentic seq. A signature
+  failure under a key that verifies *no* record in the log is not treated as
+  damage (it is a missing `previous_keys` after a rotation): open refuses.
+  Open also refuses when the active segment is empty and no closed segment
+  is intact (no trustworthy head).
+- **High-water mark (`head.json`) and external anchor:** checkpoints exist
+  only at seals, so a tail cut after the newest seal used to leave no trace.
+  `head.json` is a `Checkpoint` of the newest record (self-authenticating
+  through that record's own signature, no extra key operation), rewritten
+  atomically every `head_mark_every_records` records (default 16) or, at the
+  next append, once `head_mark_interval_ns` (default 1 s, on the records'
+  monotonic clock) has passed; also at every seal, at open and close, and on
+  demand with `Recorder::mark_head()`. The segment is fsynced first, so a
+  mark never names a record a crash can take away. At open: a mark beyond
+  the head is truncation (handled like an authentic checkpoint beyond the
+  head, below); a mark naming a seq the log holds with another hash refuses
+  open (`Error::Untrusted`); a forged or garbled mark is ignored and listed
+  in `Resume.rejected_state`. The mark also proves that records up to it
+  were synced, so a zero-filled hole before it is not crash-plausible.
+  `verify_dir` uses `head.json` in place of `checkpoint.json` when it
+  authenticates and is newer. Failed mark writes never fail an append; they
+  are counted (`mark_failures()`).
+
+  `RecorderConfig::head_anchor` takes an optional `Arc<dyn HeadAnchor>`
+  (`advance(&Checkpoint)`, `current() -> Option<AnchoredHead { chain_id?,
+  seq, hash? }>`): e.g. a TPM NV monotonic counter (seq only) or a remote
+  receiver (full mark). It receives every mark and is read at open: a seq
+  beyond the head is truncation evidence (`external-anchor`), a hash that
+  contradicts the log refuses open, a mark of another chain is noted in
+  `rejected_state`. Unlike `head.json` it survives rollback or wholesale
+  deletion of the directory: a store with **no** segments while the anchor
+  holds a mark starts a new chain whose first records declare the gap
+  (`Resume` with `skipped_seqs = [1, mark]` and a critical
+  `TruncationDetected`), and numbering continues above the mark (a counter
+  never goes down). Anchor errors never stop recording
+  (`anchor_failures()`, `last_anchor_error()`). `MemoryHeadAnchor` is an
+  in-memory reference implementation for tests; the TPM and remote
+  implementations are integration work (not done here).
+
+  **Remaining window:** records written after the newest mark and cut with
+  the tail leave no local trace and their seqs may be reused: at most
+  `head_mark_every_records` records or `head_mark_interval_ns` of recording,
+  plus whatever was written since the last append if the recorder then
+  idles (call `mark_head()` from a timer to bound that). Unsynced records
+  lost in a real crash fall in the same window, which is why it is not
+  reported as tampering. Without an external anchor, an attacker who can
+  rewrite the directory can also restore an *older* authentic `head.json`
+  (they cannot forge a newer one).
 - **Truncation evidence:** an authentic `checkpoint.json` or
   `export-cursor.json` naming a seq **beyond** the head proves the tail was
   cut at a frame boundary. The recorder does not brick and does not hide it:
@@ -293,9 +386,14 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
   next seal replace `checkpoint.json`. An authentic checkpoint naming a seq
   the log has, with a different hash, means history was rewritten under the
   chain key: `open` refuses with `Error::Untrusted` and touches nothing.
+  `head.json` and the external anchor are checked the same way, and the
+  evidence lists every file that proved the cut. A position that the
+  quarantined bytes themselves account for (records cut out by a recovery or
+  held by a quarantined closed segment) is not counted as truncation.
   Limit: someone who rewrites the newest frame's length prefix makes it look
   torn; the bytes are then quarantined (hash recorded) and the event is a
-  warning, not a tamper finding. Only an exported checkpoint turns that into
+  warning, not a tamper finding, unless a mark already covered that frame.
+  Only an exported checkpoint or the anchor turns that into
   `TruncatedTail`.
 - **Single writer:** `open` takes `flock(LOCK_EX|LOCK_NB)` on
   `recorder.lock` before reading or writing anything and returns
@@ -388,6 +486,8 @@ location (segment name and position, byte offset, global position, seq).
 | interrupted write never recovered          | `TornTail` (warning)                        |
 | tail cut below an authentic local checkpoint/cursor, found by the recorder | `TruncationRecorded` + `Deleted` |
 | hole before a synced record, quarantined by the recorder | `DamageQuarantined` + `Deleted` |
+| closed segment damaged (bit rot or edit), quarantined by the recorder | `SegmentQuarantined` + `Deleted` |
+| tail cut after the newest seal, before the newest mark | `TruncatedTail` (from `head.json`); after reopen `TruncationRecorded` |
 
 `is_intact()` means there are no tamper findings. `is_clean()` means there
 are also no warnings. Crash recovery is a warning (the discarded newest
@@ -423,12 +523,16 @@ tamper finding.
   on the unit. Frequent export plus fleet-side checkpoints bound how much
   history even a live key-holding attacker can rewrite: only what has not
   yet left the unit.
-- **Truncation of the newest records with no external checkpoint.** A
-  shortened log is still a valid chain. The local `checkpoint.json` helps only
-  against an attacker who forgets it, since it can be deleted or replaced by an
-  older valid one. Seal often and export checkpoints.
-- **Wholesale deletion** of the log directory or disk. This is detectable
-  only by the receiver (bundles stop arriving or show gaps), not on the unit.
+- **Truncation of the newest records with no external anchor.** A
+  shortened log is still a valid chain. The local `checkpoint.json` and
+  `head.json` help against a crash and an attacker who forgets them, since
+  they can be deleted or replaced by older valid ones. Records written after
+  the newest mark are never covered locally (see *Remaining window*). Use a
+  `HeadAnchor` and export checkpoints.
+- **Wholesale deletion** of the log directory or disk, without a
+  `HeadAnchor`: detectable only by the receiver (bundles stop arriving or
+  show gaps). With an anchor that survives the deletion, the next open
+  records it.
 - **Lies before recording.** The black box proves what was recorded, not that
   the sensor told the truth. A compromised process with the key can record
   false events.
@@ -451,11 +555,23 @@ tamper finding.
 - fsync durability semantics were tested only for logic (torn writes are
   simulated by writing partial or zero bytes). Power-loss behaviour on the
   target filesystem and storage hardware has not been tested.
-- Zero-filled damage in the active segment is quarantined and recording
-  continues. Non-zero corruption (a flipped bit from failing storage looks
-  the same as tampering), damage in a closed segment, and an authentic
-  checkpoint that contradicts the log still make `open` refuse. Moving the
-  directory aside and starting a fresh chain is then an operator decision.
+- Zero-filled damage in the active segment and any damage in a closed
+  segment are quarantined and recording continues. Non-zero corruption in
+  the **active** segment (a flipped bit from failing storage looks the same
+  as tampering), an empty active segment with no intact closed segment, a
+  signature failing under a key that verifies nothing, and authentic state
+  that contradicts the log still make `open` refuse. Moving the directory
+  aside and starting a fresh chain is then an operator decision.
+- By default only the first, last and control records of a closed segment
+  have their signatures checked at open; a flipped bit inside the signature
+  of another record (the hash does not cover the signature) is then not
+  quarantined, only reported by the verifier (`BadSignature`).
+- Crash safety of rotation, drops, marks, state-file replacement, torn-tail
+  recovery and quarantine is tested by fault injection (the process "dies"
+  at each step; `src/store_crash_tests.rs`). That models a killed process,
+  not lost page-cache writes on power loss, and not a filesystem that
+  reorders `rename` against data (ext4 `data=ordered` and the fsync calls
+  here are assumed).
 - Secret key files hold the Ed25519 seed (or HMAC key) in plain JSON
   (mode 0600, owner = the loading user or root, both checked). Sealing them
   to a TPM is not implemented. Secret buffers are wiped best-effort only.
