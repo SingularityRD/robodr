@@ -1,7 +1,8 @@
 # robodr-ros2-pipeline
 
 The Pulsar-independent half of the RoboDR ROS 2 / DDS sensor. Pure crate:
-`std`, `robodr-events`, `robodr-rtps`, `robodr-capture`, serde. It builds and
+`std`, `robodr-events`, `robodr-rtps`, `robodr-cdr`, `robodr-capture`,
+`robodr-commission`, serde. It builds and
 is tested offline. The same code runs in three places:
 
 - inside the Pulsar module `robodr-sensor-ros2`, which is only tokio/Pulsar glue;
@@ -20,6 +21,7 @@ is tested offline. The same code runs in three places:
 |---|---|
 | `source` | `Datagram` and `DatagramSource`: a blocking, std-only seam. `CaptureDatagramSource` wraps `robodr_capture::rtps_datagrams` for live `AF_PACKET` (`open_live`, Linux, `CAP_NET_RAW`) and for pcap/pcapng files (`open_file`). It takes an optional stop flag. `VecDatagramSource` is the in-memory source. |
 | `pipeline` | `Pipeline` runs `FragmentReassembler::parse_datagram_detailed`, using **one long-lived, bounded reassembler**. Then `Profile::evaluate` + removal, anomaly and fragmentation findings, then bounded dedup, then `Finding`s stamped `enforce` or `observe`. Also holds `load_profile`, `ProfileStatus` and `ThreatExtra`, the flat `extra` table and JSON line. |
+| `motion` | The live motion decode path. Learns writer GUID → (topic, type) and reader GUID → topic from SEDP (bounded tables), walks user DATA / DATA_FRAG with `robodr-rtps`'s `UserDataWalker`, decodes samples on the profile's motion channels and on `motion.feedback_topics` with `robodr-cdr`, and returns `MotionCommand` / `MotionFeedback` samples (`Pipeline::process_with_motion_at`, `ProcessOutput::motion`). Commands go through `Profile::evaluate` (envelope). |
 | `config` | `Config`, i.e. `[module.robodr-sensor-ros2]` plus the `[...capture]` sub-table, and its validation. Domain id gives the SPDP port. Capture domain ids give the `RtpsPortMap`. Default capture interfaces are `lo` plus the interface of the `/proc/net/route` default route. `CaptureSettings::open` opens the configured source. |
 | `socket` | Receive-only SPDP multicast socket. It sets `SO_REUSEADDR` before `bind` and binds to the group address, so it coexists with the robot's DDS participants. |
 | `sanitize`, `dedup` | Attacker-controlled text is control-escaped and capped at 512 chars. The dedup set is O(capacity) and stores keyed hashes. |
@@ -44,6 +46,10 @@ is tested offline. The same code runs in three places:
 | `robot.rtps.discovery_removal` | Low / Medium | other disposes / unregisters (Medium when sent from an IP outside the owner's binding) |
 | `robot.capture.*` | Low / Medium | the capture layer's counters (malformed frames, IP fragment conflicts / drops / evictions) grew |
 | `robot.sensor.findings_capped` | the most severe suppressed, at least Medium | one input produced more than `max_findings_per_datagram` new findings |
+| the profile's motion rules (`robot.motion.linear_over_envelope`, `joint_over_envelope`, `non_finite_command`, `unprofiled_channel`, `robot.profile.invalid_envelope`) | as `robodr-events` decides (Critical for over-envelope / non-finite) | a `MotionCommand` decoded from user DATA on a profiled motion channel (`motion.evaluate_commands`, default on) |
+| `robot.motion.undecodable_sample` | Medium, rate limited | a sample on a motion / feedback topic was not inspected: undecodable CDR, unknown type, wrong-role type, malformed DATA / inline QoS, fragments refused / evicted / conflicting, per-datagram sample cap |
+| `robot.motion.unattributed_sample` | High | DATA to a reader announced on a motion / feedback topic from a writer never announced via SEDP |
+| `robot.motion.sample_source_mismatch` | Critical (command topic) / High (feedback) | a decoded motion sample whose writer prefix is bound (SPDP / `participant_ips`) to other IPs than its source |
 
 Each distinct finding (rule + detail) is reported once. Dedup is bounded, so
 eviction can only cause a re-report.
@@ -58,7 +64,8 @@ eviction can only cause a re-report.
   thousands of fake participants therefore cannot bury a Critical finding or
   flood the event bus.
 - **Rate limit** (`rate_limit_burst`, `rate_limit_interval_ms`): per rule, on
-  `robot.rtps.*`, `robot.capture.*` and `robot.sensor.*` only. The profile and
+  `robot.rtps.*`, `robot.capture.*`, `robot.sensor.*` and
+  `robot.motion.undecodable_sample` only. The profile and
   binding rules (`robot.ros2.*`) are never rate limited.
 - **Memory**: dedup set, reassembler, binding table (`binding.max_participants`,
   O(log n) eviction, profiled participants evicted last), held-announcement
@@ -94,6 +101,34 @@ the sensor.**
 A profile file that cannot be read or parsed at all is a hard start-up error,
 because there is nothing to observe against.
 
+## Live motion decode (`motion`)
+
+```text
+datagram ─► discovery parse ─► SEDP: writer GUID → (topic, type), reader GUID → topic
+        └─► UserDataWalker (INFO_SRC / INFO_DST / INFO_TS, LE + BE, DATA + DATA_FRAG,
+            per-writer reassembly quota; only writers on motion / feedback topics)
+              ─► robodr_cdr::Registry::decode(type announced by SEDP, payload)
+              ─► to_event(EventContext { channel: "/cmd_vel", writer GUID, capture time })
+              ─► MotionCommand ─► Profile::evaluate ─► findings
+              └─► ProcessOutput::motion (for the agent chain: firewall, motion monitor)
+```
+
+Configuration (`[module.robodr-sensor-ros2.motion]` / agentd `sensor.motion`):
+`enabled` (default true), `feedback_topics` (ROS names, e.g. `["/odom"]`),
+`evaluate_commands` (default true), `max_writers` (4096),
+`max_samples_per_datagram` (256).
+
+- The event time is the **capture** time the caller passes (the plain
+  `process*` methods use nanoseconds since the pipeline was built). The
+  INFO_TS source timestamp is exposed in `MotionSample::source_timestamp`
+  as a sender claim and never used as time.
+- The type that selects the decoder is the one SEDP announced for the
+  writer. A writer announced before the sensor started is unknown until it
+  is re-announced; its samples are not decoded meanwhile (and samples to a
+  known motion reader raise `unattributed_sample`).
+- A SEDP dispose does not forget a writer (a spoofed dispose must not blind
+  the decoder); the tables are bounded and evict non-motion entries first.
+
 ## `robodr-ros2-watch`
 
 ```sh
@@ -118,7 +153,18 @@ sudo robodr-ros2-watch --profile profile.json --interface lo --interface eth0 --
 
 ## Tests
 
-There are 73 tests:
+The counts below are from before the motion path; it added 23 tests:
+16 in `tests/motion_decode.rs` (Twist on `rt/cmd_vel` from a profiled writer
+within / over the envelope, NaN, an unprofiled writer (Critical discovery
+rule, commands still decoded), DATA_FRAG-split Twist and Odometry, a
+fragmented sample over the cap, big-endian submessage + `CDR_BE` payload,
+INFO_TS exposed but not used as time, feedback topics, garbage payloads and
+rate limiting, unknown / wrong-role types, never-announced writers to a
+motion reader, a spoofed writer from an unbound IP, disabled decode, 3000
+mutated datagrams and a GUID spray against bounded tables), 5 unit tests in
+`src/motion.rs` and 2 config tests.
+
+There were 73 tests before:
 
 - **55 unit tests.**
 - **8 end-to-end tests in `tests/e2e_pcap.rs`.** A generated pcap contains a
@@ -146,6 +192,9 @@ There are 73 tests:
 
 - The traffic is synthetic, built from the spec. The pipeline has **not**
   been run against captures from real Fast DDS, Cyclone DDS or Connext.
+  That includes the motion decode path: the user-DATA framing and the CDR
+  payloads in its tests are hand-built; no real `ros2 topic pub /cmd_vel`
+  capture was decoded.
 - Some traffic is invisible or opaque to it:
   - shared-memory transports;
   - RTPS over TCP;

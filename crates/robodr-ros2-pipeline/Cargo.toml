@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Pulsar-independent ROS 2 / DDS detection pipeline for RoboDR: datagram sources (multicast socket, passive capture, pcap replay), RTPS parsing, profile deviations, bounded dedup, sanitised findings."
+description = "Pulsar-independent ROS 2 / DDS detection pipeline for RoboDR: datagram sources (multicast socket, passive capture, pcap replay), RTPS parsing, profile deviations, motion user-DATA decoding, bounded dedup, sanitised findings."
 
 # Pure crate: std + RoboDR crates + serde only, so it builds and tests offline.
 # The Pulsar glue lives in robodr-sensor-ros2.
@@ -14,6 +14,7 @@ description = "Pulsar-independent ROS 2 / DDS detection pipeline for RoboDR: dat
 robodr-events = { workspace = true }
 robodr-rtps = { workspace = true }
 robodr-capture = { workspace = true }
+robodr-cdr = { workspace = true }
 # The profile file format (strict keys + lock seal) is owned by the
 # commissioning crate that writes it; the sensor refuses an edited locked
 # profile with the same check (`parse_profile_text`).

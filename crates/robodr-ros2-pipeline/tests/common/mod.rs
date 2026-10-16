@@ -386,3 +386,134 @@ pub fn pl_raw(params: &[u8]) -> Vec<u8> {
 
 /// Writer entity id used for hand-built rogue endpoints.
 pub const ROGUE_ENTITY: [u8; 4] = [0, 0, 0x77, 0x03];
+
+// ------------------------------------------------- user DATA (motion path) --
+
+/// Builtin SEDP subscriptions writer (announces DataReaders).
+pub const ENTITY_SEDP_SUB_WRITER: [u8; 4] = [0x00, 0x00, 0x04, 0xc2];
+/// User writer / reader entity ids of the hand-built motion endpoints.
+pub const CMD_WRITER: [u8; 4] = [0, 0, 0x10, 0x03];
+pub const ODOM_WRITER: [u8; 4] = [0, 0, 0x11, 0x03];
+pub const CMD_READER: [u8; 4] = [0, 0, 0x10, 0x04];
+
+/// SEDP payload announcing endpoint `prefix`+`entity` on `topic`.
+pub fn sedp_endpoint_payload(
+    prefix: [u8; 12],
+    entity: [u8; 4],
+    topic: &str,
+    type_name: &str,
+) -> Vec<u8> {
+    pl_payload(&[
+        param(0x005a, &guid(prefix, entity)),
+        string_param(0x0005, topic),
+        string_param(0x0007, type_name),
+    ])
+}
+
+/// SEDP publication DATA submessage for writer `prefix`+`entity`.
+pub fn sedp_writer_sub(prefix: [u8; 12], entity: [u8; 4], topic: &str, type_name: &str) -> Vec<u8> {
+    data(
+        ENTITY_SEDP_PUB_WRITER,
+        1,
+        &sedp_endpoint_payload(prefix, entity, topic, type_name),
+    )
+}
+
+/// SEDP subscription DATA submessage for reader `prefix`+`entity`.
+pub fn sedp_reader_sub(prefix: [u8; 12], entity: [u8; 4], topic: &str, type_name: &str) -> Vec<u8> {
+    data(
+        ENTITY_SEDP_SUB_WRITER,
+        1,
+        &sedp_endpoint_payload(prefix, entity, topic, type_name),
+    )
+}
+
+/// A `geometry_msgs/Twist` serialized payload, CDR_LE (encapsulation
+/// 0x0001) or CDR_BE (0x0000): linear (vx, 0, 0), angular (0, 0, wz).
+pub fn twist_cdr(vx: f64, wz: f64, le: bool) -> Vec<u8> {
+    let mut p = vec![0x00, if le { 0x01 } else { 0x00 }, 0, 0];
+    for v in [vx, 0.0, 0.0, 0.0, 0.0, wz] {
+        p.extend_from_slice(&if le { v.to_le_bytes() } else { v.to_be_bytes() });
+    }
+    p
+}
+
+/// A user DATA submessage (E flag = `le`) from `writer` to `reader`.
+pub fn user_data(writer: [u8; 4], reader: [u8; 4], sn: u32, payload: &[u8], le: bool) -> Vec<u8> {
+    let u16b = |v: u16| if le { v.to_le_bytes() } else { v.to_be_bytes() };
+    let u32b = |v: u32| if le { v.to_le_bytes() } else { v.to_be_bytes() };
+    let mut body = vec![0, 0];
+    body.extend_from_slice(&u16b(16));
+    body.extend_from_slice(&reader);
+    body.extend_from_slice(&writer);
+    body.extend_from_slice(&u32b(0));
+    body.extend_from_slice(&u32b(sn));
+    body.extend_from_slice(payload);
+    let mut s = vec![0x15, if le { 0x05 } else { 0x04 }]; // DATA, (E|)D
+    s.extend_from_slice(&u16b(body.len() as u16));
+    s.extend_from_slice(&body);
+    s
+}
+
+/// A user DATA_FRAG submessage carrying fragment `start` (1-based).
+pub fn user_data_frag(
+    writer: [u8; 4],
+    sn: u32,
+    start: u32,
+    frag_size: u16,
+    sample_size: u32,
+    frag: &[u8],
+) -> Vec<u8> {
+    let mut body = vec![0, 0];
+    body.extend_from_slice(&28u16.to_le_bytes());
+    body.extend_from_slice(&CMD_READER);
+    body.extend_from_slice(&writer);
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&sn.to_le_bytes());
+    body.extend_from_slice(&start.to_le_bytes());
+    body.extend_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&frag_size.to_le_bytes());
+    body.extend_from_slice(&sample_size.to_le_bytes());
+    body.extend_from_slice(frag);
+    let mut s = vec![0x16, 0x01]; // DATA_FRAG, E
+    s.extend_from_slice(&(body.len() as u16).to_le_bytes());
+    s.extend_from_slice(&body);
+    s
+}
+
+/// An INFO_TS submessage (little-endian).
+pub fn info_ts(seconds: u32, fraction: u32) -> Vec<u8> {
+    let mut s = vec![0x09, 0x01, 8, 0];
+    s.extend_from_slice(&seconds.to_le_bytes());
+    s.extend_from_slice(&fraction.to_le_bytes());
+    s
+}
+
+/// The lab motion scenario's discovery: the legit participant's SPDP (from
+/// the robot's IP) with a `rt/cmd_vel` writer, a `rt/odom` writer and a
+/// `rt/cmd_vel` reader (the base controller).
+pub fn motion_discovery() -> Vec<u8> {
+    datagram(
+        LEGIT,
+        &[
+            spdp_sub(LEGIT, &[ROBOT_IP]),
+            sedp_writer_sub(LEGIT, CMD_WRITER, "rt/cmd_vel", TWIST),
+            sedp_writer_sub(LEGIT, ODOM_WRITER, "rt/odom", ODOM),
+            sedp_reader_sub(LEGIT, CMD_READER, "rt/cmd_vel", TWIST),
+        ],
+    )
+}
+
+/// A datagram from `prefix` carrying one Twist command from `writer`.
+pub fn cmd_vel_datagram(prefix: [u8; 12], writer: [u8; 4], sn: u32, vx: f64) -> Vec<u8> {
+    datagram(
+        prefix,
+        &[user_data(
+            writer,
+            CMD_READER,
+            sn,
+            &twist_cdr(vx, 0.1, true),
+            true,
+        )],
+    )
+}

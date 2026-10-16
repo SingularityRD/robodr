@@ -109,40 +109,20 @@ Verified (in this crate's tests):
 * Message definitions are those of ROS 2 Humble through Kilted (unchanged
   since Foxy). A distro that changes them needs a new decoder.
 
-## Wiring it into the pipeline (follow-up for the integrator)
+## Wiring into the pipeline (done, synthetic traffic only)
 
-`robodr-rtps` currently parses discovery only and skips user DATA. The
-intended flow:
+`robodr-rtps` has a user-DATA walker (`UserDataWalker`) and
+`robodr-ros2-pipeline`'s `motion` module wires this crate in: writer GUID →
+(topic, type name) from SEDP, decode by the announced type name with
+`Registry::decode`, `to_event` with an `EventContext` built from the
+transport (channel = de-mangled topic, writer GUID, capture time), findings
+`robot.motion.undecodable_sample` (Medium, rate limited),
+`robot.motion.unattributed_sample` (High) and
+`robot.motion.sample_source_mismatch` (Critical / High), and
+`Profile::evaluate` on decoded commands. `robodr-agentd` hands the decoded
+events to `Agent::handle` (firewall recording-only, motion monitor). See
+those crates' READMEs.
 
-```text
-RTPS datagram ─► walk submessages (robodr-rtps) ─► DATA / reassembled DATA_FRAG
-   from writer GUID W, payload P
-        │
-        ├─ look up W in the SEDP graph: topic T, type name N
-        │     (unknown W → no decode; discovery findings already cover it)
-        ├─ T is a profiled motion channel (profile.motion_envelopes key) or a
-        │  configured feedback topic?  otherwise drop (do not decode all traffic)
-        ├─ registry.decode(N, P, &limits)
-        │     Err(e)  → a finding (suggested rule `robot.motion.undecodable_sample`, rate-limited,
-        │               Medium; High on a motion command channel) — never silently
-        │               ignore a command that could not be inspected
-        │     Ok(d)   → d.message.to_event(&EventContext{ channel: T,
-        │               writer_guid: Some(hex(W)), timestamp_ns: capture mono time })
-        └─ RobotEvent::MotionCommand  → Agent::handle (Firewall + Profile::evaluate
-                                        + motion monitor command sample)
-           RobotEvent::MotionFeedback → Agent::handle (motion monitor feedback,
-                                        per publisher_guid)
-```
-
-Notes for that wiring:
-
-* Needs a user-DATA walker in `robodr-rtps` (DATA submessage → writer id +
-  `serializedPayload`, honouring INFO_SRC / inline QoS / key-only and
-  dispose flags; skip `D`=0 samples) and reuse of the bounded
-  `FragmentReassembler` for large JointState / trajectory samples.
-* Key the writer → (topic, type) map by full writer GUID from SEDP; the type
-  name from SEDP selects the decoder, never a guess from the bytes.
-* SROS 2 / DDS-Security payload protection (`SEC_*` submessages, encrypted
-  payload) cannot be decoded passively; report it as not inspected.
-* RoboDR stays passive: decoding is observation; any action still goes
-  through the responder's safe-state request, never by touching the bus.
+Still true: only hand-built payloads have gone through it (see "What is and
+is not verified" above), and SROS 2 / DDS-Security protected payloads cannot
+be decoded passively (they are reported as undecodable).

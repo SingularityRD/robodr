@@ -26,6 +26,10 @@
 //!   `robodr-commission lock` is refused); a profile that fails either is
 //!   **refused for enforcement** and the pipeline runs observe-only (see
 //!   [`pipeline`] for why).
+//! - [`motion`]: the live motion decode path: RTPS user DATA on profiled
+//!   motion channels and configured feedback topics → `robodr-cdr` →
+//!   `MotionCommand` / `MotionFeedback` ([`Pipeline::process_with_motion_at`]),
+//!   envelope evaluation and motion-sample findings.
 //! - [`binding`]: the participant ↔ source-IP binding table. SEDP endpoint
 //!   announcements are judged against the IPs and locators their
 //!   participant's SPDP came from (or `participant_ips` pins), so a rogue
@@ -62,6 +66,7 @@
 pub mod binding;
 pub mod config;
 pub mod dedup;
+pub mod motion;
 pub mod pipeline;
 pub mod ratelimit;
 pub mod sanitize;
@@ -74,9 +79,10 @@ pub use config::{
     BindingConfig, CaptureConfig, CaptureInput, CaptureSettings, Config, Settings, SpdpSettings,
 };
 pub use dedup::DedupSet;
+pub use motion::{MotionOptions, MotionSample, MotionStats};
 pub use pipeline::{
     load_profile, rules, Finding, LoadedProfile, Pipeline, PipelineOptions, PipelineStats,
-    ProfileStatus, ThreatExtra, OBSERVE_ONLY_TAG,
+    ProcessOutput, ProfileStatus, ThreatExtra, OBSERVE_ONLY_TAG,
 };
 pub use sanitize::{sanitize, MAX_TEXT_CHARS};
 pub use source::{
@@ -87,4 +93,4 @@ pub use source::{
 // Re-exported so the Pulsar glue needs no direct dependency on these crates.
 pub use robodr_capture::RtpsPortMap;
 pub use robodr_events::{Deviation, Mode, Severity};
-pub use robodr_rtps::ReassemblyLimits;
+pub use robodr_rtps::{ReassemblyLimits, UserDataLimits};

@@ -1,6 +1,6 @@
 //! `config/robodr.toml.example` stays in sync with [`Config`]: every key of
 //! the `[module.robodr-sensor-ros2]` section (and its `capture` and
-//! `binding` sub-tables, incl. `binding.participant_ips`), including the
+//! `binding` and `motion` sub-tables, incl. `binding.participant_ips`), including the
 //! commented-out examples, is a known field and the result deserialises and
 //! validates.
 //!
@@ -28,6 +28,13 @@ const TOP_KEYS: &[&str] = &[
     "rate_limit_interval_ms",
 ];
 const BINDING_KEYS: &[&str] = &["enabled", "hold_ms", "max_participants", "discovery_server"];
+const MOTION_KEYS: &[&str] = &[
+    "enabled",
+    "feedback_topics",
+    "evaluate_commands",
+    "max_writers",
+    "max_samples_per_datagram",
+];
 const CAPTURE_KEYS: &[&str] = &[
     "enabled",
     "interfaces",
@@ -64,6 +71,7 @@ struct Sections {
     cap: Map<String, Value>,
     binding: Map<String, Value>,
     pins: Map<String, Value>,
+    motion: Map<String, Value>,
 }
 
 /// (sections, include commented-out `# key = value` lines) -> JSON objects.
@@ -85,6 +93,7 @@ fn sections(text: &str, uncomment: bool) -> Sections {
                 "[module.robodr-sensor-ros2.capture]" => "capture",
                 "[module.robodr-sensor-ros2.binding]" => "binding",
                 "[module.robodr-sensor-ros2.binding.participant_ips]" => "pins",
+                "[module.robodr-sensor-ros2.motion]" => "motion",
                 _ => "other",
             });
             continue;
@@ -124,6 +133,9 @@ fn sections(text: &str, uncomment: bool) -> Sections {
             Some("pins") => {
                 out.pins.insert(k.into(), v);
             }
+            Some("motion") => {
+                out.motion.insert(k.into(), v);
+            }
             _ => {}
         }
     }
@@ -144,7 +156,12 @@ fn example_keys_are_known_and_parse() {
             cap,
             mut binding,
             pins,
+            motion,
         } = sections(&text, uncomment);
+        for k in motion.keys() {
+            assert!(MOTION_KEYS.contains(&k.as_str()), "unknown motion key {k}");
+        }
+        assert_eq!(motion.len(), MOTION_KEYS.len(), "{motion:?}");
         assert!(top.len() >= 11, "{top:?}");
         for k in [
             "max_findings_per_datagram",
@@ -188,8 +205,10 @@ fn example_keys_are_known_and_parse() {
         let mut obj = top.clone();
         obj.insert("capture".into(), Value::Object(cap));
         obj.insert("binding".into(), Value::Object(binding));
+        obj.insert("motion".into(), Value::Object(motion));
         let cfg: Config = serde_json::from_value(Value::Object(obj)).unwrap();
         let (settings, _warnings) = cfg.validate_with(|| Some("eth0".into())).unwrap();
+        assert!(settings.pipeline.motion.feedback_topics.contains("/odom"));
         if uncomment {
             // With the lab line uncommented, replay takes over.
             assert!(matches!(

@@ -9,6 +9,7 @@
 //!  AF_PACKET capture ┐                                  ┌─ Pipeline (robodr-ros2-pipeline)
 //!  pcap replay ──────┤ Datagram                         │   tick() 1 Hz, capture_findings(health)
 //!  SPDP socket ──────┤──────────┐   bounded queue       │   Finding ─► Agent::handle_external(Sensor)
+//!                    │          │                       │   MotionCommand / MotionFeedback (decoded user DATA) ─► Agent::handle
 //!                    │          ├─► (try_send, drops ─► main thread ┤
 //!  JSONL stdin ──────┤ RobotEvent   counted)            │   RobotEvent ─► Agent::handle
 //!  JSONL unix socket ┘                                  │        (profile + firewall + motion monitor)
@@ -22,7 +23,9 @@
 //!   dir, key **file** with a 0600 check, spool, inputs, context, thresholds);
 //!   the `sensor` section is the ROS 2 sensor's own config, validated by it.
 //! * [`input`]: the input threads, bounded queue and hostile-input handling.
-//! * [`daemon`]: the main loop, housekeeping and ordered shutdown.
+//! * [`daemon`]: the main loop, housekeeping and ordered shutdown; live
+//!   motion data decoded by the pipeline goes to `Agent::handle`, with the
+//!   firewall recording only (see [`daemon`]).
 //! * [`health`]: self-protection. The robot's state is `unknown` whenever
 //!   the agent is blind (an input silent or ended, no data yet, pipeline
 //!   lagging), never `ok`; issues become observe-only findings.

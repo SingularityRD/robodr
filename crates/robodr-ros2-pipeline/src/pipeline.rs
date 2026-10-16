@@ -29,6 +29,16 @@
 //! | | [`rules::CAPTURE_BAD_CHECKSUM`] | Low; Medium when bursty |
 //! | the profile failed `Profile::validate`, or a locked profile file failed the commissioning file check (seal: edited after `lock`) (once, [`Pipeline::status_findings`]) | [`rules::PROFILE_REFUSED`] | High |
 //! | one input produced more than `max_findings_per_datagram` new findings | [`rules::FINDINGS_CAPPED`] | most severe suppressed, >= Medium |
+//! | user DATA on a motion / feedback topic ([`crate::motion`]): undecodable, unattributed (writer never announced), from an IP outside the writer's binding; decoded commands through `Profile::evaluate` | [`rules::MOTION_UNDECODABLE_SAMPLE`], [`rules::MOTION_UNATTRIBUTED_SAMPLE`], [`rules::MOTION_SAMPLE_SOURCE_MISMATCH`], the profile's `robot.motion.*` rules | Medium (rate limited) / High / Critical (command) or High (feedback) / as the profile says |
+//!
+//! # Motion samples
+//!
+//! Besides findings, a datagram can carry motion commands and feedback
+//! (`rt/cmd_vel`, `rt/odom`). [`Pipeline::process_with_motion_at`] returns
+//! them, decoded, as [`MotionSample`]s ([`ProcessOutput::motion`]) so a
+//! caller can feed them to the agent chain (Motion Firewall, motion
+//! monitor). The plain `process*` methods run the same decode (and report
+//! its findings) but drop the samples. See [`crate::motion`].
 //!
 //! Every finding is de-duplicated on (rule, detail). In addition, the noisy
 //! `robot.rtps.*`, `robot.capture.*` and `robot.sensor.*` rules are **rate
@@ -107,6 +117,7 @@ use crate::binding::{
     parse_src_ip, BindingFinding, BindingOptions, BindingStats, BindingTable, Ingress,
 };
 use crate::dedup::DedupSet;
+use crate::motion::{DatagramCtx, MotionOptions, MotionSample, MotionStats, MotionTracker};
 use crate::ratelimit::{self, RateLimiter};
 use crate::sanitize::sanitize;
 use crate::source::{CaptureHealth, Datagram};
@@ -316,6 +327,9 @@ pub mod rules {
     pub use crate::binding::rules::{
         ENDPOINT_SOURCE_MISMATCH, ENDPOINT_UNANNOUNCED_PARTICIPANT, PARTICIPANT_SOURCE_MISMATCH,
     };
+    pub use crate::motion::rules::{
+        MOTION_SAMPLE_SOURCE_MISMATCH, MOTION_UNATTRIBUTED_SAMPLE, MOTION_UNDECODABLE_SAMPLE,
+    };
 }
 
 /// Knobs of the pipeline.
@@ -340,6 +354,8 @@ pub struct PipelineOptions {
     /// [`rules::FINDINGS_CAPPED`] finding. Clamped to
     /// 1..=[`MAX_FINDINGS_PER_DATAGRAM`].
     pub max_findings_per_datagram: usize,
+    /// The user-DATA motion decode path ([`crate::motion`]).
+    pub motion: MotionOptions,
 }
 
 impl Default for PipelineOptions {
@@ -353,6 +369,7 @@ impl Default for PipelineOptions {
             rate_limit_burst: ratelimit::DEFAULT_BURST,
             rate_limit_interval: ratelimit::DEFAULT_INTERVAL,
             max_findings_per_datagram: DEFAULT_MAX_FINDINGS_PER_DATAGRAM,
+            motion: MotionOptions::default(),
         }
     }
 }
@@ -565,6 +582,17 @@ pub struct PipelineStats {
     pub ambiguous_announcements: u64,
     /// The participant binding table.
     pub binding: BindingStats,
+    /// The motion decode path.
+    pub motion: MotionStats,
+}
+
+/// What one datagram produced: new findings and decoded motion samples.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProcessOutput {
+    pub findings: Vec<Finding>,
+    /// Decoded `MotionCommand` / `MotionFeedback` samples, in datagram
+    /// order (see [`crate::motion`]).
+    pub motion: Vec<MotionSample>,
 }
 
 /// Datagram -> findings, against one profile. See the module docs.
@@ -584,6 +612,10 @@ pub struct Pipeline {
     last_health: Option<CaptureHealth>,
     /// Checksum failures seen in the current burst window (start, count).
     checksum_window: Option<(Instant, u64)>,
+    /// User-DATA motion decode path.
+    motion: MotionTracker,
+    /// Origin of the default capture timestamps ([`Pipeline::process_at`]).
+    epoch: Instant,
     opts: PipelineOptions,
     stats: PipelineStats,
 }
@@ -643,6 +675,8 @@ impl Pipeline {
             frag_evicted_seen: 0,
             last_health: None,
             checksum_window: None,
+            motion: MotionTracker::new(opts.motion.clone()),
+            epoch: Instant::now(),
             profile,
             opts,
             stats: PipelineStats::default(),
@@ -684,6 +718,17 @@ impl Pipeline {
     /// The DATA_FRAG reassembler (for its counters).
     pub fn reassembler(&self) -> &FragmentReassembler {
         &self.reassembler
+    }
+
+    /// The motion decode path (options, counters).
+    pub fn motion(&self) -> &MotionTracker {
+        &self.motion
+    }
+
+    /// The motion decode path, e.g. to register a vendor type name with
+    /// `motion_mut().registry_mut().register(..)`.
+    pub fn motion_mut(&mut self) -> &mut MotionTracker {
+        &mut self.motion
     }
 
     /// A one-line, sanitised operator warning when the profile is not
@@ -905,12 +950,38 @@ impl Pipeline {
         ingress: Ingress,
         now: Instant,
     ) -> Vec<Finding> {
+        let capture_ns = self.default_capture_ns(now);
+        self.process_with_motion_at(payload, src_ip, ingress, now, capture_ns)
+            .findings
+    }
+
+    /// Nanoseconds since the pipeline was built: the capture timestamp of
+    /// the plain `process*` methods.
+    fn default_capture_ns(&self, now: Instant) -> u64 {
+        u64::try_from(now.saturating_duration_since(self.epoch).as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    /// [`Pipeline::process_from_at`], also returning the decoded motion
+    /// samples. `capture_ns` is the observation time stamped into every
+    /// `MotionCommand` / `MotionFeedback` (the caller's clock, e.g. the
+    /// agent's monotonic nanoseconds; never a value from the wire).
+    pub fn process_with_motion_at(
+        &mut self,
+        payload: &[u8],
+        src_ip: &str,
+        ingress: Ingress,
+        now: Instant,
+        capture_ns: u64,
+    ) -> ProcessOutput {
         self.stats.datagrams += 1;
         let mut out = Vec::new();
         self.expire_into(now, &mut out);
         let Some(report) = self.reassembler.parse_datagram_detailed(payload) else {
             self.stats.not_rtps += 1;
-            return self.emit(out, now);
+            return ProcessOutput {
+                findings: self.emit(out, now),
+                motion: Vec::new(),
+            };
         };
         let ip = parse_src_ip(src_ip);
         let ambiguity = Ambiguity::of(&report);
@@ -918,7 +989,42 @@ impl Pipeline {
         self.binding_findings(&report, ip, ingress, ambiguity.any(), &mut out, now);
         self.removal_findings(&report, src_ip, ip, ingress, &mut out);
         self.protocol_findings(&report, src_ip, &ambiguity, &mut out);
-        self.emit(out, now)
+        // Motion: learn this datagram's SEDP first, then its user DATA.
+        self.motion.learn(&self.profile, &report);
+        let ctx = DatagramCtx {
+            src_ip,
+            ip,
+            ingress,
+            capture_ns,
+        };
+        let m = self
+            .motion
+            .process(payload, &ctx, &self.profile, &self.binding);
+        self.stats.motion = self.motion.stats();
+        for dev in m.deviations {
+            self.push(&mut out, dev, src_ip);
+        }
+        ProcessOutput {
+            findings: self.emit(out, now),
+            motion: m.samples,
+        }
+    }
+
+    /// [`Pipeline::process_datagram`], also returning the decoded motion
+    /// samples, stamped with `capture_ns` (see
+    /// [`Pipeline::process_with_motion_at`]).
+    pub fn process_datagram_with_motion(
+        &mut self,
+        datagram: &Datagram,
+        capture_ns: u64,
+    ) -> ProcessOutput {
+        self.process_with_motion_at(
+            &datagram.payload,
+            &datagram.src_ip,
+            datagram.ingress,
+            Instant::now(),
+            capture_ns,
+        )
     }
 
     fn expire_into(&mut self, now: Instant, out: &mut Vec<Candidate>) {

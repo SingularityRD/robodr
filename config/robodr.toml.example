@@ -87,6 +87,20 @@ max_participants = 1024
 [module.robodr-sensor-ros2.binding.participant_ips]
 # "010f3a7c2104000001000000" = ["192.168.50.10", "10.8.0.10"]
 
+# Live motion decode: RTPS user DATA on the profile's motion channels
+# (motion_envelopes) is decoded into MotionCommand and checked against the
+# envelope; feedback_topics (fully qualified ROS names) are decoded as
+# MotionFeedback. Verified on hand-built traffic only, not on captures of a
+# real RMW (see crates/robodr-ros2-pipeline/README.md).
+[module.robodr-sensor-ros2.motion]
+enabled = true
+feedback_topics = ["/odom"]
+evaluate_commands = true
+# Writer / reader GUID -> topic table bound (1..=65536).
+max_writers = 4096
+# Motion samples decoded per datagram (1..=4096).
+max_samples_per_datagram = 256
+
 # ---------------------------------------------------------------------------
 # Motion Firewall and motion monitor (robodr-agent). NOT Pulsar module keys:
 # the agent is not a Pulsar module yet; today these are set through

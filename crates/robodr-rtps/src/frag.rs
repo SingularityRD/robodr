@@ -10,9 +10,11 @@
 //!
 //! # Memory bounds
 //!
-//! Only fragments from builtin discovery writers (SPDP / SEDP) are buffered;
-//! user-data fragments are never stored. Every buffer is capped by
-//! [`ReassemblyLimits`]:
+//! The discovery parser only buffers fragments from builtin discovery
+//! writers (SPDP / SEDP). The user-data walker ([`crate::UserDataWalker`])
+//! owns a separate instance, in which the per-source quota is a per-*writer*
+//! quota (source prefix + writer entity), and buffers only the samples its
+//! caller wants. Every buffer is capped by [`ReassemblyLimits`]:
 //!
 //! - a sample whose claimed `sampleSize` exceeds `max_sample_bytes` is refused
 //!   before anything is allocated;
@@ -295,6 +297,13 @@ pub struct FragmentReassembler {
     dropped: u64,
     evicted: u64,
     conflicts: u64,
+    /// User-data mode ([`crate::UserDataWalker`]): the per-source quota and
+    /// the "most-represented source" pressure rule count per *writer*
+    /// (source prefix + writer entity id) instead of per source prefix, so
+    /// one large writer (a camera, a point cloud) can never take more than
+    /// its quota of the table, and the motion writers of the same
+    /// participant keep theirs.
+    per_writer: bool,
 }
 
 impl FragmentReassembler {
@@ -315,6 +324,24 @@ impl FragmentReassembler {
         Self {
             limits,
             ..Self::default()
+        }
+    }
+
+    /// A reassembler for user data: like [`FragmentReassembler::new`], but
+    /// `max_pending_per_source` is a per-*writer* quota (see the field docs).
+    pub(crate) fn new_per_writer(limits: ReassemblyLimits) -> Self {
+        Self {
+            per_writer: true,
+            ..Self::new(limits)
+        }
+    }
+
+    /// The quota / pressure grouping key of a sample.
+    fn quota_key(&self, k: &SampleKey) -> ([u8; 12], [u8; 4]) {
+        if self.per_writer {
+            (k.source, k.writer)
+        } else {
+            (k.source, [0; 4])
         }
     }
 
@@ -416,26 +443,27 @@ impl FragmentReassembler {
         if let Some((i, _)) = stale {
             return Some((i, EvictionReason::Stale));
         }
-        let mut per_source: HashMap<[u8; 12], usize> = HashMap::new();
+        let mut per_source: HashMap<([u8; 12], [u8; 4]), usize> = HashMap::new();
         for p in &self.pending {
-            *per_source.entry(p.key.source).or_default() += 1;
+            *per_source.entry(self.quota_key(&p.key)).or_default() += 1;
         }
         let most = per_source.values().copied().max()?;
         self.pending
             .iter()
             .enumerate()
-            .filter(|(_, p)| per_source[&p.key.source] == most)
+            .filter(|(_, p)| per_source[&self.quota_key(&p.key)] == most)
             .min_by_key(|(_, p)| (p.got_bytes, std::cmp::Reverse(p.created)))
             .map(|(i, _)| (i, EvictionReason::Pressure))
     }
 
-    /// Make room for a new sample of `cost` bytes from `source`.
-    fn make_room(&mut self, source: [u8; 12], cost: usize, events: &mut Vec<FragmentEvent>) {
-        // 1. Per-source quota: the source pays with its own least recently
-        //    progressed sample.
+    /// Make room for a new sample of `cost` bytes keyed `key`.
+    fn make_room(&mut self, key: &SampleKey, cost: usize, events: &mut Vec<FragmentEvent>) {
+        // 1. Per-source (per-writer in user-data mode) quota: the source
+        //    pays with its own least recently progressed sample.
+        let mine = self.quota_key(key);
         loop {
             let own: Vec<usize> = (0..self.pending.len())
-                .filter(|&i| self.pending[i].key.source == source)
+                .filter(|&i| self.quota_key(&self.pending[i].key) == mine)
                 .collect();
             if own.len() < self.limits.max_pending_per_source {
                 break;
@@ -511,7 +539,7 @@ impl FragmentReassembler {
                 if cost > self.limits.max_total_bytes {
                     return self.reject(&f, RejectReason::OverMemoryCap, nfrags32, events);
                 }
-                self.make_room(f.key.source, cost, events);
+                self.make_room(&f.key, cost, events);
                 // Bounded allocation: sample_size <= max_sample_bytes.
                 self.created += 1;
                 self.pending.push(Pending {

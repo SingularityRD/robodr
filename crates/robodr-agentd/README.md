@@ -8,6 +8,7 @@ uses std threads and `std::sync::mpsc` only: no async runtime, no Pulsar.
  AF_PACKET capture ┐                                 ┌ Pipeline (robodr-ros2-pipeline)
  pcap replay ──────┤ Datagram                        │   tick() every tick_ms (1 Hz), capture_findings(health)
  SPDP socket ──────┤───────┐  one bounded queue      │   Finding ─► Agent::handle_external(Sensor)
+                   │       │                         │   decoded MotionCommand / MotionFeedback ─► Agent::handle
                    │       ├► try_send; when full ─► main thread ┤
  JSONL stdin ──────┤ Robot │  the item is dropped    │   RobotEvent ─► Agent::handle
  JSONL unix socket ┘ Event ┘  and counted            │     (profile + Motion Firewall + motion monitor)
@@ -40,8 +41,9 @@ must be absolute.
 | `spool` | `dir`, `max_bytes` (default 64 MiB), `max_files` (default 10000) |
 | `event_inputs` | `[{"kind":"stdin"}]` and/or `[{"kind":"unix_socket","path":...,"max_connections":4}]` |
 | `context` | `safety_state` (default `unknown`), `control`, `phase`, `connectivity`, `operator_present` |
-| `firewall` | Optional. `max_angular` (rad/s for every profiled Twist channel) and `allow` (writer GUIDs per channel) |
-| `motion_monitor` | Optional. `config_path` (strict `MonitorConfig`; default: the UGV defaults on the profile's motion channels) and `feedback_sources` |
+| `firewall` | Optional. `max_angular` (rad/s for every profiled Twist channel) and `allow` (writer GUIDs per channel). Runs **recording-only** (see below). |
+| `motion_monitor` | Optional. `config_path` (strict `MonitorConfig`; default: the UGV defaults on the profile's motion channels) and `feedback_sources`. Feedback sources that are ROS topic names (`/odom`) are also decoded from the bus. |
+| `sensor.motion` | Optional. The live motion decode path: `enabled` (default true), `feedback_topics` (e.g. `["/odom"]`), `max_writers`, `max_samples_per_datagram` (`evaluate_commands` is accepted but the daemon always lets the agent evaluate). Unknown keys are refused. |
 | `daemon` | `queue_capacity` 4096, `tick_ms` 1000, `heartbeat_ms` 10000, `silence_ms` 30000, `lag_ms` 2000, `health_report_ms` 10000, `exit_when_inputs_end` false |
 
 **Key.** Keys are never accepted on the command line. `blackbox.key_file`
@@ -63,6 +65,31 @@ seal) runs observe-only. A profile that fails validation is replaced in the
 agent by an empty, unlocked profile: everything is reported, nothing is acted
 on, and the Motion Firewall is off. In that case the pipeline's
 `robot.ros2.profile_refused` finding is the first one in the spool.
+
+## Live motion data
+
+Captured datagrams carry more than discovery: the pipeline decodes RTPS
+user DATA on the profile's motion channels (`motion_envelopes`) and on the
+feedback topics into `MotionCommand` / `MotionFeedback`
+(`robodr_ros2_pipeline::motion`). The daemon stamps them with its own
+monotonic clock when it handles the datagram and passes each one to
+`Agent::handle`, like a JSONL event: profile envelope, Motion Firewall,
+motion monitor (commands and per-publisher feedback), black box, spool.
+The pipeline's own envelope evaluation is off in the daemon, so an
+over-envelope command is reported once, by the agent, with the event as
+evidence. The pipeline still reports undecodable, unattributed and
+source-mismatched samples (as sensor findings).
+
+**The firewall only records.** The daemon reads a copy of the traffic; it
+is not on the command path and cannot pass, limit or drop anything. It
+therefore runs the firewall with `FailBehaviour::PassThroughObserveOnly`:
+each verdict is a recorded *would-have* (`"enforcing": false` in the
+black-box verdict note), never an output. Plans are still produced and
+recorded (never executed, as before).
+
+`status.json` and the heartbeat carry `daemon.motion_events` and
+`pipeline.motion` counters (decoded commands / feedback, undecodable,
+unattributed, known writers, ...).
 
 ## Outputs
 
@@ -140,6 +167,7 @@ request.
 | `tests/e2e.rs` | A synthetic pcap (the pipeline's own builders) yields the rogue participant and rogue `cmd_vel` writer findings in the spool, validated, with a black box that verifies against the final seal and evidence links that resolve. Resume across two runs. Unlocked and invalid profiles never enforce. A truncated pcap raises `input_ended`. The agent's rogue-UGV JSONL scenario runs over a unix socket through profile, firewall and monitor. Queue overflow is counted exactly (`received = processed + dropped`). Fuzzed datagrams and event lines do not stop the daemon. |
 | `tests/health.rs` | A silent input reads `unknown` (never `ok`) with an observe-only High finding. Live data turns the state `ok`. Silence again raises a new finding with the same id and a higher count. |
 | `tests/binary.rs` | The real binary: exit code 2 on usage and configuration errors, on a 0644 key file and on an unknown key. SIGTERM and SIGINT give exit 0, a sealed black box that verifies with the spool's `checkpoint.json`, and a stop note. |
+| `tests/motion_live.rs` | A synthetic pcap with SEDP plus CDR `Twist` on `rt/cmd_vel` (0.4 m/s, then 2.5 m/s against a 1.0 m/s envelope) and CDR `Odometry` on `rt/odom`: three motion events reach the agent, exactly one Critical `robot.motion.linear_over_envelope` finding is spooled, the black box holds the decoded command (with its writer GUID) and a firewall verdict with `enforcing: false`, and verifies. A garbage payload on `rt/cmd_vel` yields one Medium `robot.motion.undecodable_sample` and the next good command still flows. `sensor.motion` keys are strict. |
 | `tests/agent_api.rs` | `Agent::handle_external`: sensor deviations get real plans when enforcing. Self-health and observe-mode deviations never get an action plan. |
 | unit tests | Config strictness and key file checks, spool atomicity and bounds, the line reader (CRLF, overlong lines, timeouts, a full queue), the unix socket, and the health state machine. |
 
@@ -147,6 +175,12 @@ request.
 
 - **Not run on a robot.** All inputs in the tests are synthetic: generated
   pcaps, the agent's demo JSONL. Nothing was exercised with real DDS stacks.
+  The live motion path in particular has only decoded hand-built RTPS / CDR
+  (no `ros2 topic pub /cmd_vel` capture from a real RMW).
+- **Motion decode needs SEDP.** A writer announced before the daemon
+  started is unknown until it is re-announced; its commands are not decoded
+  meanwhile (samples to a known motion reader raise
+  `robot.motion.unattributed_sample`).
 - **Live capture and the SPDP socket are untested here.** Live `AF_PACKET`
   capture (needs `CAP_NET_RAW`) and the SPDP multicast socket are wired
   through the pipeline's own openers, but no test here exercises them.

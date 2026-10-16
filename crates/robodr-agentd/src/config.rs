@@ -26,6 +26,11 @@
 //!   which only warns, unknown keys are refused here ([`SENSOR_KEYS`]).
 //!   `listen_spdp` defaults to `true` there; set it to `false` when capture
 //!   is enabled (capture sees SPDP too).
+//! * `sensor.motion` (keys [`SENSOR_MOTION_KEYS`]) configures the live
+//!   motion decode path: user DATA on the profile's motion channels and on
+//!   `feedback_topics` is decoded into `MotionCommand` / `MotionFeedback`
+//!   and fed to the agent. The keys of `motion_monitor.feedback_sources`
+//!   that are ROS topic names are added to `feedback_topics`.
 //! * The black-box key is read from `blackbox.key_file`, never from the
 //!   command line: either a `robodr-blackbox-key/v1` JSON key file (as
 //!   written by `robodr-blackbox keygen`; HMAC-SHA256 only, its `key_id` is
@@ -75,6 +80,7 @@ pub const SENSOR_KEYS: &[&str] = &[
     "rate_limit_interval_ms",
     "capture",
     "binding",
+    "motion",
 ];
 /// Keys of `sensor.capture`.
 pub const SENSOR_CAPTURE_KEYS: &[&str] = &[
@@ -92,6 +98,15 @@ pub const SENSOR_BINDING_KEYS: &[&str] = &[
     "max_participants",
     "discovery_server",
     "participant_ips",
+];
+
+/// Keys of `sensor.motion` (the live motion decode path).
+pub const SENSOR_MOTION_KEYS: &[&str] = &[
+    "enabled",
+    "feedback_topics",
+    "evaluate_commands",
+    "max_writers",
+    "max_samples_per_datagram",
 ];
 
 /// The configuration file as written.
@@ -396,12 +411,21 @@ pub fn sensor_settings(v: &serde_json::Value) -> Result<(Settings, Vec<String>),
     if let Some(b) = v.get("binding") {
         check_keys("sensor.binding", b, SENSOR_BINDING_KEYS)?;
     }
+    if let Some(m) = v.get("motion") {
+        check_keys("sensor.motion", m, SENSOR_MOTION_KEYS)?;
+    }
     let cfg: robodr_ros2_pipeline::Config =
         serde_json::from_value(v.clone()).map_err(|e| format!("sensor: {e}"))?;
     if let Some(p) = &cfg.capture.pcap_replay {
         require_abs("sensor.capture.pcap_replay", p)?;
     }
     cfg.validate().map_err(|e| format!("sensor: {e}"))
+}
+
+/// A fully qualified, plain ROS topic name (`/odom`).
+fn is_ros_topic(name: &str) -> bool {
+    let rn = robodr_events::graph::demangle(&format!("rt{name}"));
+    name.starts_with('/') && rn.kind == robodr_events::graph::RosNameKind::Topic && rn.name == name
 }
 
 /// Validate the daemon section's numbers.
@@ -478,8 +502,23 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         }
     }
 
-    let (sensor, mut w) = sensor_settings(&config.sensor)?;
+    let (mut sensor, mut w) = sensor_settings(&config.sensor)?;
     warnings.append(&mut w);
+    // The motion monitor's feedback channels are decoded from the bus too
+    // (in addition to `sensor.motion.feedback_topics`).
+    if let Some(m) = &config.motion_monitor {
+        for ch in m.feedback_sources.keys() {
+            if is_ros_topic(ch) {
+                sensor.pipeline.motion.feedback_topics.insert(ch.clone());
+            } else {
+                warnings.push(format!(
+                    "motion_monitor.feedback_sources {:?} is not a ROS topic name: it is not \
+                     decoded from the bus (JSONL events only)",
+                    robodr_ros2_pipeline::sanitize(ch)
+                ));
+            }
+        }
+    }
     if !sensor.has_builtin_source() && config.event_inputs.is_empty() {
         return Err(
             "no input configured: enable sensor.capture, sensor.listen_spdp or add event_inputs"

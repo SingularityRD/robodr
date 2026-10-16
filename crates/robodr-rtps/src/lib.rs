@@ -19,6 +19,13 @@
 //!   reassembly for large discovery samples, with an eviction policy that
 //!   resists spoofed-prefix floods (see its module docs).
 //! - [`vendor`]: known DDS vendor ids.
+//! - [`UserDataWalker`] / [`walk_user_data`]: the **user DATA** walker
+//!   (application topics such as `rt/cmd_vel`): writer / reader GUID,
+//!   sequence number, serialized payload (encapsulation included), inline
+//!   QoS and INFO_TS source timestamp per sample, honouring INFO_SRC /
+//!   INFO_DST / INFO_TS, both endiannesses, DATA and (bounded, per-writer
+//!   quota) DATA_FRAG. It does not decode payloads (`robodr-cdr` does, by
+//!   the type name learned from SEDP). See the `user` module docs.
 //!
 //! # What is parsed
 //!
@@ -158,6 +165,7 @@
 
 mod frag;
 mod parse;
+mod user;
 pub mod vendor;
 mod wire;
 
@@ -182,6 +190,12 @@ pub use parse::{
     ENTITYID_SEDP_SUBSCRIPTIONS_SECURE_WRITER, ENTITYID_SEDP_SUBSCRIPTIONS_WRITER,
     ENTITYID_SPDP_SECURE_WRITER, ENTITYID_SPDP_WRITER, GUIDPREFIX_UNKNOWN, MAX_ANOMALIES,
     MAX_FRAGMENT_EVENTS, MAX_LOCATORS_PER_LIST, MAX_PARAMETER_VALUES,
+};
+pub use user::{
+    is_builtin_entity, walk_user_data, PayloadKind, RtpsTime, SampleAddress, UserAnomaly,
+    UserAnomalyKind, UserDataLimits, UserDataReport, UserDataStats, UserDataWalker,
+    UserFragmentEvent, UserInlineQos, UserSample, DEFAULT_MAX_SAMPLES_PER_DATAGRAM,
+    ENTITYID_UNKNOWN, HARD_MAX_SAMPLES_PER_DATAGRAM, MAX_USER_ANOMALIES, MAX_USER_FRAGMENT_EVENTS,
 };
 pub use wire::{Locator, LOCATOR_KIND_INVALID, LOCATOR_KIND_UDPV4, LOCATOR_KIND_UDPV6};
 

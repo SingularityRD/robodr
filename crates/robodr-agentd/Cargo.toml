@@ -13,6 +13,7 @@ description = "RoboDR live daemon: capture / pcap / JSONL events -> ROS 2 pipeli
 robodr-agent = { workspace = true }
 robodr-blackbox = { workspace = true }
 robodr-events = { workspace = true }
+robodr-firewall = { workspace = true }
 robodr-motion = { workspace = true }
 robodr-ocsf = { workspace = true }
 robodr-responder = { workspace = true }
@@ -22,6 +23,7 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 robodr-capture = { workspace = true }
+robodr-cdr = { workspace = true }
 robodr-commission = { workspace = true }
 
 [[bin]]

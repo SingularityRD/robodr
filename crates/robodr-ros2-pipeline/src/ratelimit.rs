@@ -11,7 +11,8 @@
 //! **not** remembered by dedup, so a suppressed finding that recurs later is
 //! reported then.
 //!
-//! The profile rules (`robot.ros2.*`, `robot.motion.*`, ...) and the binding
+//! So is `robot.motion.undecodable_sample` ([`LIMITED_RULES`]). The other
+//! profile rules (`robot.ros2.*`, `robot.motion.*`, ...) and the binding
 //! findings are never rate limited: each is a distinct, security-relevant
 //! fact and dedup keeps their memory bounded.
 //!
@@ -29,9 +30,14 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(6);
 /// Rule-id prefixes that are rate limited.
 pub const LIMITED_PREFIXES: &[&str] = &["robot.rtps.", "robot.capture.", "robot.sensor."];
 
+/// Individual rules outside those prefixes that are rate limited too: the
+/// motion decode path's "sample not inspected" finding (one per bad sample
+/// could otherwise reach the command rate, e.g. 50 Hz).
+pub const LIMITED_RULES: &[&str] = &[crate::motion::rules::MOTION_UNDECODABLE_SAMPLE];
+
 /// Is this rule rate limited?
 pub fn is_limited(rule: &str) -> bool {
-    LIMITED_PREFIXES.iter().any(|p| rule.starts_with(p))
+    LIMITED_PREFIXES.iter().any(|p| rule.starts_with(p)) || LIMITED_RULES.contains(&rule)
 }
 
 #[derive(Debug, Clone, Copy)]

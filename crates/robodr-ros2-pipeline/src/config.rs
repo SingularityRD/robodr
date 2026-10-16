@@ -35,7 +35,20 @@
 //!
 //! [module.robodr-sensor-ros2.binding.participant_ips]
 //! # "010f3a7c2104000001000000" = ["192.168.50.10", "10.8.0.10"]
+//!
+//! [module.robodr-sensor-ros2.motion]
+//! enabled = true                       # decode user DATA on motion topics
+//! feedback_topics = ["/odom"]          # decoded as MotionFeedback
+//! evaluate_commands = true             # Profile::evaluate on decoded commands
+//! max_writers = 4096                   # writer GUID -> topic table bound
+//! max_samples_per_datagram = 256
 //! ```
+//!
+//! ## Motion (`motion` sub-table)
+//!
+//! See [`crate::motion`]. Commands are decoded on the profile's motion
+//! channels (`motion_envelopes`); `feedback_topics` lists the ROS topics
+//! (fully qualified, e.g. `/odom`, `/joint_states`) decoded as feedback.
 //!
 //! ## Binding (`binding` sub-table)
 //!
@@ -74,6 +87,7 @@ use serde::Deserialize;
 
 use crate::binding::{self, BindingOptions};
 use crate::dedup::MAX_DEDUP_CAPACITY;
+use crate::motion::MotionOptions;
 use crate::pipeline::{
     PipelineOptions, DEFAULT_DEDUP_CAPACITY, DEFAULT_MAX_FINDINGS_PER_DATAGRAM,
     MAX_FINDINGS_PER_DATAGRAM,
@@ -136,6 +150,8 @@ pub struct Config {
     pub capture: CaptureConfig,
     /// Participant ↔ source-IP binding check.
     pub binding: BindingConfig,
+    /// User-DATA motion decode path.
+    pub motion: MotionConfig,
 }
 
 impl Default for Config {
@@ -155,7 +171,109 @@ impl Default for Config {
             rate_limit_interval_ms: ratelimit::DEFAULT_INTERVAL.as_millis() as u64,
             capture: CaptureConfig::default(),
             binding: BindingConfig::default(),
+            motion: MotionConfig::default(),
         }
+    }
+}
+
+/// `[module.robodr-sensor-ros2.motion]`. See [`crate::motion`].
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct MotionConfig {
+    /// Decode user DATA on motion / feedback topics (default on).
+    pub enabled: bool,
+    /// Fully qualified ROS topics decoded as feedback (`/odom`, ...).
+    pub feedback_topics: Vec<String>,
+    /// Evaluate decoded commands against the profile (default on).
+    pub evaluate_commands: bool,
+    /// Writer / reader GUID table bound (1..=65536).
+    pub max_writers: usize,
+    /// Samples decoded per datagram (1..=4096).
+    pub max_samples_per_datagram: usize,
+}
+
+/// Most entries of `motion.feedback_topics`.
+pub const MAX_FEEDBACK_TOPICS: usize = 64;
+
+impl Default for MotionConfig {
+    fn default() -> Self {
+        let d = MotionOptions::default();
+        Self {
+            enabled: d.enabled,
+            feedback_topics: Vec::new(),
+            evaluate_commands: d.evaluate_commands,
+            max_writers: d.max_writers,
+            max_samples_per_datagram: d.user_data.max_samples_per_datagram,
+        }
+    }
+}
+
+impl MotionConfig {
+    /// Validate into [`MotionOptions`].
+    pub fn validate(&self, warnings: &mut Vec<String>) -> Result<MotionOptions, String> {
+        if !self.enabled {
+            warnings.push(
+                "motion.enabled = false: motion commands and feedback on the bus are NOT decoded \
+                 (no envelope check of live commands)"
+                    .into(),
+            );
+        }
+        if self.max_writers == 0 || self.max_writers > crate::motion::MAX_MAX_ENDPOINTS {
+            return Err(format!(
+                "motion.max_writers {} out of range: must be 1..={}",
+                self.max_writers,
+                crate::motion::MAX_MAX_ENDPOINTS
+            ));
+        }
+        if self.max_samples_per_datagram == 0
+            || self.max_samples_per_datagram > robodr_rtps::HARD_MAX_SAMPLES_PER_DATAGRAM
+        {
+            return Err(format!(
+                "motion.max_samples_per_datagram {} out of range: must be 1..={}",
+                self.max_samples_per_datagram,
+                robodr_rtps::HARD_MAX_SAMPLES_PER_DATAGRAM
+            ));
+        }
+        if self.feedback_topics.len() > MAX_FEEDBACK_TOPICS {
+            return Err(format!(
+                "motion.feedback_topics has {} entries, at most {MAX_FEEDBACK_TOPICS}",
+                self.feedback_topics.len()
+            ));
+        }
+        let mut topics = std::collections::BTreeSet::new();
+        for t in &self.feedback_topics {
+            let shown = crate::sanitize::sanitize(t);
+            let rn = robodr_events::graph::demangle(&format!("rt{t}"));
+            if !t.starts_with('/')
+                || rn.kind != robodr_events::graph::RosNameKind::Topic
+                || rn.name != *t
+            {
+                return Err(format!(
+                    "motion.feedback_topics entry {shown:?} is not a fully qualified ROS topic \
+                     name (e.g. \"/odom\")"
+                ));
+            }
+            if !topics.insert(t.clone()) {
+                return Err(format!("motion.feedback_topics lists {shown:?} twice"));
+            }
+        }
+        if !self.evaluate_commands {
+            warnings.push(
+                "motion.evaluate_commands = false: decoded commands are not checked against the \
+                 profile envelope by the sensor (the consumer must do it)"
+                    .into(),
+            );
+        }
+        let mut opts = MotionOptions {
+            enabled: self.enabled,
+            feedback_topics: topics,
+            evaluate_commands: self.evaluate_commands,
+            max_writers: self.max_writers,
+            max_readers: self.max_writers,
+            ..MotionOptions::default()
+        };
+        opts.user_data.max_samples_per_datagram = self.max_samples_per_datagram;
+        Ok(opts)
     }
 }
 
@@ -571,6 +689,7 @@ impl Config {
 
         let capture = self.validate_capture(&mut warnings, default_iface)?;
         let binding = self.binding.validate(&mut warnings)?;
+        let motion = self.motion.validate(&mut warnings)?;
 
         Ok((
             Settings {
@@ -587,6 +706,7 @@ impl Config {
                     rate_limit_burst: self.rate_limit_burst,
                     rate_limit_interval: Duration::from_millis(self.rate_limit_interval_ms),
                     max_findings_per_datagram: self.max_findings_per_datagram,
+                    motion,
                 },
             },
             warnings,
@@ -1245,6 +1365,46 @@ mod tests {
         for bad in ["", ".", "..", "a/b", "a b", "eth0:1", "é"] {
             assert!(!valid_ifname(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn motion_section_reaches_pipeline_options() {
+        let (s, w) = validate(
+            r#"{"motion": {"feedback_topics": ["/odom", "/joint_states"], "max_writers": 10,
+                "max_samples_per_datagram": 8}}"#,
+        )
+        .unwrap();
+        let m = &s.pipeline.motion;
+        assert!(m.enabled && m.evaluate_commands);
+        assert_eq!(
+            m.feedback_topics.iter().cloned().collect::<Vec<_>>(),
+            vec!["/joint_states".to_string(), "/odom".to_string()]
+        );
+        assert_eq!((m.max_writers, m.max_readers), (10, 10));
+        assert_eq!(m.user_data.max_samples_per_datagram, 8);
+        assert!(w.is_empty(), "{w:?}");
+        // Defaults: on, no feedback topics.
+        let (s, _) = validate("{}").unwrap();
+        assert_eq!(s.pipeline.motion, MotionOptions::default());
+        let (_, w) =
+            validate(r#"{"motion": {"enabled": false, "evaluate_commands": false}}"#).unwrap();
+        assert_eq!(w.len(), 2, "{w:?}");
+        for bad in [
+            r#"{"motion": {"feedback_topics": ["odom"]}}"#,
+            r#"{"motion": {"feedback_topics": ["rt/odom"]}}"#,
+            r#"{"motion": {"feedback_topics": ["/odom/"]}}"#,
+            r#"{"motion": {"feedback_topics": [""]}}"#,
+            r#"{"motion": {"feedback_topics": ["/odom", "/odom"]}}"#,
+            r#"{"motion": {"max_writers": 0}}"#,
+            r#"{"motion": {"max_writers": 1000000}}"#,
+            r#"{"motion": {"max_samples_per_datagram": 0}}"#,
+            r#"{"motion": {"max_samples_per_datagram": 5000}}"#,
+        ] {
+            assert!(validate(bad).is_err(), "{bad}");
+        }
+        let many: Vec<String> = (0..65).map(|i| format!("/t{i}")).collect();
+        let json = serde_json::json!({"motion": {"feedback_topics": many}}).to_string();
+        assert!(validate(&json).is_err());
     }
 
     #[test]

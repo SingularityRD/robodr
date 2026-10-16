@@ -30,6 +30,27 @@
 //! the exporter to take off-unit. Input threads that block in a read with a
 //! timeout are joined; the stdin reader is not (it may block forever).
 //!
+//! # Live motion data
+//!
+//! Datagrams go through `Pipeline::process_datagram_with_motion`: besides
+//! findings, the pipeline decodes user DATA on the profile's motion channels
+//! and the configured feedback topics into `MotionCommand` /
+//! `MotionFeedback` events (see `robodr_ros2_pipeline::motion`), stamped
+//! with the daemon clock's monotonic time at the moment the datagram is
+//! handled. Each event goes through `Agent::handle`, exactly like a JSONL
+//! event: `Profile::evaluate` (envelope), the Motion Firewall, the motion
+//! monitor (commands and per-publisher feedback), the black box and the
+//! spool. So the pipeline's own envelope evaluation is switched off here
+//! (`evaluate_commands = false`), to report each over-envelope command once,
+//! with the event as evidence; the pipeline still reports undecodable,
+//! unattributed and source-mismatched samples.
+//!
+//! **The firewall only records.** The daemon reads a copy of the traffic;
+//! it is not inline and cannot pass, limit or drop anything. Its firewall
+//! therefore runs with `FailBehaviour::PassThroughObserveOnly`: every
+//! verdict is a recorded *would-have* (`enforcing: false` in the black box),
+//! never an output. Enforcement belongs in a gateway on the command path.
+//!
 //! # What the daemon does with a plan
 //!
 //! Nothing. The agent's executor is the default `NoopExecutor`: plans
@@ -50,11 +71,12 @@ use robodr_agent::{
 };
 use robodr_blackbox::{Clock, HmacSha256Key, RecorderConfig, SystemClock, TimeSource, Timestamp};
 use robodr_events::profile::Profile;
+use robodr_firewall::FailBehaviour;
 use robodr_ocsf::{AttestationStatus, PlatformFamily as OcsfPlatform, RobotInfo, Subject};
 use robodr_responder::OperationalContext;
 use robodr_ros2_pipeline::config::CaptureInput;
 use robodr_ros2_pipeline::{
-    sanitize, Finding, Pipeline, PipelineStats, ProfileStatus, SharedHealth,
+    sanitize, Finding, MotionSample, Pipeline, PipelineStats, ProfileStatus, SharedHealth,
 };
 use serde::Serialize;
 
@@ -79,6 +101,9 @@ pub const UNVALIDATED_MODEL: &str = "unvalidated-profile";
 pub struct DaemonStats {
     pub datagrams: u64,
     pub events: u64,
+    /// Motion commands / feedback decoded from datagrams and handed to the
+    /// agent.
+    pub motion_events: u64,
     pub outcomes: u64,
     pub findings_spooled: u64,
     /// Outcomes whose finding could not be built/validated.
@@ -258,7 +283,11 @@ impl<'a> Daemon<'a> {
         for w in &r.warnings {
             let _ = writeln!(log, "robodr-agentd: warning: {}", sanitize(w));
         }
-        let pipeline = Pipeline::from_loaded(r.profile.clone(), r.sensor.pipeline.clone());
+        // The agent evaluates decoded commands itself (with evidence); see
+        // the module docs.
+        let mut popts = r.sensor.pipeline.clone();
+        popts.motion.evaluate_commands = false;
+        let pipeline = Pipeline::from_loaded(r.profile.clone(), popts);
         if let Some(m) = pipeline.status_message() {
             let _ = writeln!(log, "robodr-agentd: warning: {m}");
         }
@@ -297,10 +326,12 @@ impl<'a> Daemon<'a> {
         acfg.kafka_partitions = cfg.robot.kafka_partitions;
         match (&cfg.firewall, validated) {
             (Some(fw), true) => {
-                acfg.firewall = Some(
+                let mut fs =
                     FirewallSettings::from_profile(&acfg.profile, &fw.allow, &fw.max_angular)
-                        .map_err(DaemonError::Agent)?,
-                );
+                        .map_err(DaemonError::Agent)?;
+                // Not inline: verdicts are recorded would-haves only.
+                fs.platform.fail_behaviour = FailBehaviour::PassThroughObserveOnly;
+                acfg.firewall = Some(fs);
             }
             (Some(_), false) => {
                 let _ = writeln!(
@@ -555,8 +586,12 @@ impl<'a> Daemon<'a> {
         match m.payload {
             Payload::Datagram(d) => {
                 self.stats.datagrams += 1;
-                let found = self.pipeline.process_datagram(&d);
-                self.sensor_findings(found);
+                let capture_ns = self.clock.now().mono_ns;
+                let out = self.pipeline.process_datagram_with_motion(&d, capture_ns);
+                self.sensor_findings(out.findings);
+                for s in out.motion {
+                    self.motion_sample(s);
+                }
             }
             Payload::Event(ev) => {
                 self.stats.events += 1;
@@ -567,6 +602,18 @@ impl<'a> Daemon<'a> {
                     self.emit(o);
                 }
             }
+        }
+    }
+
+    /// A decoded motion command / feedback -> agent (profile, firewall,
+    /// motion monitor) -> spool.
+    fn motion_sample(&mut self, s: MotionSample) {
+        self.stats.motion_events += 1;
+        let now = self.clock.now();
+        let safety = self.r.config.context.safety_state;
+        let outs = self.agent.handle(now, &s.event, safety);
+        for o in outs {
+            self.emit(o);
         }
     }
 
