@@ -36,6 +36,7 @@
 
 use crate::crypto::{to_hex, Sha256};
 use crate::time::{TimeSource, Timestamp};
+use robodr_events::Severity;
 use serde::{Deserialize, Serialize};
 
 /// A SHA-256 digest.
@@ -81,6 +82,13 @@ pub enum RecordKind {
     Saturation,
     /// Saturation ended; payload [`SaturationClearedPayload`].
     SaturationCleared,
+    /// At open, authenticated local state (checkpoint, export cursor) proved
+    /// that records beyond the log's head existed: the log was truncated.
+    /// Always critical; payload [`TruncationPayload`].
+    TruncationDetected,
+    /// The signing key changed; signed by the *old* key, every later record
+    /// by the new one. Payload [`KeyRotationPayload`].
+    KeyRotation,
     /// A `robodr_events::RobotEvent` (JSON).
     Event,
     /// A `robodr_events::Deviation` (JSON).
@@ -100,6 +108,8 @@ impl RecordKind {
             RecordKind::SegmentDropped => 5,
             RecordKind::Saturation => 6,
             RecordKind::SaturationCleared => 7,
+            RecordKind::TruncationDetected => 8,
+            RecordKind::KeyRotation => 9,
             RecordKind::Event => 16,
             RecordKind::Deviation => 17,
             RecordKind::Note => 18,
@@ -116,6 +126,8 @@ impl RecordKind {
             5 => RecordKind::SegmentDropped,
             6 => RecordKind::Saturation,
             7 => RecordKind::SaturationCleared,
+            8 => RecordKind::TruncationDetected,
+            9 => RecordKind::KeyRotation,
             16 => RecordKind::Event,
             17 => RecordKind::Deviation,
             18 => RecordKind::Note,
@@ -491,6 +503,19 @@ pub struct SegmentStartPayload {
     pub segment_index: u64,
     /// Boot during which this segment was opened.
     pub boot_id: String,
+    /// Key that signs this segment's records when it differs from
+    /// `identity.key_id` (after a [`RecordKind::KeyRotation`]). Lets the
+    /// recorder and verifier name the current key of a retained tail whose
+    /// rotation record was dropped. Omitted when equal to the chain key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key: Option<KeyRef>,
+}
+
+/// A signing key by id and algorithm.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyRef {
+    pub key_id: String,
+    pub algorithm: String,
 }
 
 /// Why a seal was written.
@@ -502,6 +527,8 @@ pub enum SealReason {
     Export,
     Shutdown,
     Manual,
+    /// Written right after a [`RecordKind::KeyRotation`], under the new key.
+    KeyRotation,
 }
 
 /// Payload of a seal checkpoint.
@@ -511,6 +538,17 @@ pub struct SealPayload {
     pub segment_index: u64,
     pub records_since_last_seal: u64,
     pub prev_seal_seq: Option<u64>,
+    /// Non-critical appends refused since saturation began (persisted so a
+    /// restart does not lose them). Omitted when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub refused_noncritical: u64,
+    /// Critical appends refused (reserve full) since saturation began.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub refused_critical: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 /// Payload written each time the recorder opens an existing log.
@@ -532,6 +570,19 @@ pub struct ResumePayload {
     /// not authenticate or did not match the chain. Omitted when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rejected_state: Vec<String>,
+    /// Sequence numbers `[first, last]` this resume skipped so that none is
+    /// ever reused: they belonged to records that were lost (truncated or
+    /// quarantined) but may already exist elsewhere (exported bundles, an
+    /// off-unit checkpoint). The record carrying this payload is the only
+    /// record allowed to follow its predecessor with a seq jump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped_seqs: Option<[u64; 2]>,
+    /// Refusal counters carried over from before the restart (see
+    /// [`SealPayload::refused_noncritical`]). Omitted when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub refused_noncritical: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub refused_critical: u64,
 }
 
 /// Payload recording a torn-tail truncation.
@@ -545,6 +596,65 @@ pub struct RecoveryPayload {
     pub reason: String,
     /// File (relative to the log dir) holding the discarded bytes.
     pub quarantine_file: Option<String>,
+    /// Complete, authentic records of this chain inside the discarded bytes
+    /// (non-zero only when damage in the middle of the segment forced the
+    /// recorder to quarantine valid frames after it).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub discarded_records: u64,
+    /// `[first, last]` sequence numbers lost with the discarded bytes, when
+    /// known (authentic records were found after the damage).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discarded_seqs: Option<[u64; 2]>,
+    /// Whether a crash can explain the damage. `false` when a record after
+    /// the damage was durably synced (a seal, a control record, a critical
+    /// record under `fsync_critical`, every record under `Always`): an fsync
+    /// flushes every earlier page, so the hole cannot be lost write-back.
+    #[serde(default = "yes")]
+    pub crash_plausible: bool,
+    /// `medium` for a torn tail, `high` when authentic records were
+    /// quarantined, `critical` when the damage is not crash-plausible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<Severity>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// One piece of authenticated local state that points beyond the head.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateEvidence {
+    /// State file name (`checkpoint.json`, `export-cursor.json`).
+    pub file: String,
+    pub seq: u64,
+    /// Hex hash the state file names for `seq`.
+    pub hash: String,
+    /// Copy of the file (relative to the log dir) kept as evidence before
+    /// the recorder replaces it.
+    pub preserved_as: Option<String>,
+    /// SHA-256 (hex) of the preserved bytes.
+    pub sha256: String,
+}
+
+/// Payload of [`RecordKind::TruncationDetected`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TruncationPayload {
+    /// Last authentic record found in the log at open.
+    pub head_seq: u64,
+    pub head_hash: String,
+    /// The state that proves records beyond `head_seq` existed.
+    pub evidence: Vec<StateEvidence>,
+    /// `[first, last]` sequence numbers never to be reused.
+    pub skipped_seqs: [u64; 2],
+    pub severity: Severity,
+}
+
+/// Payload of [`RecordKind::KeyRotation`] (signed by the old key).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyRotationPayload {
+    pub from: KeyRef,
+    pub to: KeyRef,
+    pub reason: String,
 }
 
 /// Why a segment was deleted.
@@ -636,7 +746,9 @@ mod tests {
                 assert_eq!(k.is_control(), c < 16);
             }
         }
-        assert!(RecordKind::from_u8(8).is_none());
+        assert_eq!(RecordKind::from_u8(8), Some(RecordKind::TruncationDetected));
+        assert_eq!(RecordKind::from_u8(9), Some(RecordKind::KeyRotation));
+        assert!(RecordKind::from_u8(10).is_none());
     }
 
     #[test]

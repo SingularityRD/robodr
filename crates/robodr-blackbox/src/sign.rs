@@ -78,6 +78,12 @@ pub trait Verifier {
     fn key_id(&self) -> &str;
     /// `true` iff `signature` is valid for `message` under this key.
     fn verify(&self, message: &[u8], signature: &[u8]) -> bool;
+    /// `true` iff `signature` is valid for `message` under the key named
+    /// `key_id`. The default accepts only this verifier's own key id; a
+    /// [`crate::keys::Keyring`] looks the key up instead.
+    fn verify_as(&self, key_id: &str, message: &[u8], signature: &[u8]) -> bool {
+        self.key_id() == key_id && self.verify(message, signature)
+    }
 }
 
 /// Why an HMAC key was rejected.

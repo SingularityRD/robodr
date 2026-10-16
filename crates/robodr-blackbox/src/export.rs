@@ -263,9 +263,11 @@ struct CheckpointJson {
 }
 
 impl Checkpoint {
-    /// Signature check under `verifier`.
+    /// Signature check under `verifier`, for the key the checkpoint names
+    /// ([`Verifier::verify_as`]: a plain verifier must have that key id, a
+    /// keyring looks it up).
     pub fn verify(&self, verifier: &dyn Verifier) -> bool {
-        verifier.verify(&signing_message(&self.hash), &self.sig)
+        verifier.verify_as(&self.key_id, &signing_message(&self.hash), &self.sig)
     }
 
     pub fn anchor(&self) -> Anchor {

@@ -45,17 +45,65 @@
 //!
 //! # Crash recovery
 //!
-//! On [`Recorder::open`] the last segment is scanned. If it ends in an
-//! **incomplete frame or zero-filled bytes, and nothing valid follows**,
-//! those bytes are copied to `quarantine/`, the file is truncated to the last
-//! good frame, and a signed `Recovery` record (offset, length, SHA-256 of the
-//! discarded bytes, quarantine file) is appended. Recovery is never silent,
-//! and the verifier rates it a warning (`is_clean()` is false). Anything else
-//! is [`Error::Corrupt`] and nothing is touched: a *complete* frame whose
-//! hash or signature fails (a crash cannot produce one: the hash is computed
-//! before the frame is written), a record that does not link, non-zero bytes
-//! that do not start a frame, or corruption followed by valid frames. An
-//! operator must then move the directory aside (a fresh chain starts).
+//! On [`Recorder::open`] the last segment is scanned. Crash artefacts are
+//! quarantined (bytes copied to `quarantine/` with their SHA-256 recorded,
+//! the file truncated to the last good frame, a signed `Recovery` record
+//! appended); recovery is never silent:
+//!
+//! - an **incomplete frame or zero-filled tail with nothing valid after
+//!   it** (torn write): `Recovery`, severity medium, verifier warning;
+//! - **zero-filled damage followed by valid frames** (a page whose
+//!   write-back was lost while a later page reached disk, possible under
+//!   `SealsOnly` / `Every(n)`): the whole suffix from the damage on is
+//!   quarantined, authentic records in it are counted and their seqs are
+//!   never reused (`discarded_seqs`, `skipped_seqs`). If no record after
+//!   the damage was durably synced, a crash explains it: severity high,
+//!   verifier warning. Otherwise (a seal, control record, critical record
+//!   under `fsync_critical`, or any record under `Always` follows; fsync
+//!   flushes every earlier page) it cannot be a crash: severity critical,
+//!   verifier tamper (`DamageQuarantined`). Either way the recorder keeps
+//!   recording instead of refusing to start.
+//!
+//! Anything else is [`Error::Corrupt`] and nothing is touched: a *complete*
+//! frame whose hash or signature fails without zero evidence (a crash
+//! cannot produce one: the hash is computed before the frame is written), a
+//! record that does not link, non-zero bytes that do not start a frame, or
+//! damage in a closed segment. An operator must then move the directory
+//! aside (a fresh chain starts).
+//!
+//! # Truncation evidence (never reuse a sequence number)
+//!
+//! An authentic `checkpoint.json` or `export-cursor.json` whose seq is
+//! *beyond* the head proves that the tail was cut (whole frames removed
+//! leave a valid but shorter chain). The recorder then keeps working but:
+//! copies the state file to `quarantine/state-*.json` before anything can
+//! replace it, continues numbering *after* the highest seq that state
+//! names (the first record written, normally the `Resume`, declares the
+//! skipped range in `skipped_seqs`), and writes a critical
+//! `TruncationDetected` record. The verifier reports it as tamper. An
+//! authentic checkpoint that names a seq the log has, with another hash, can
+//! only come from a key holder rewriting history: open refuses with
+//! [`Error::Untrusted`] and touches nothing.
+//!
+//! Limit: records written after the newest checkpoint/cursor and destroyed
+//! with the tail leave no trace the recorder can see; their seqs may be
+//! reused. Only an off-unit copy of their content could then show a `Fork`.
+//!
+//! # Saturation counters
+//!
+//! Refused-append counters are written into every `Seal` and `Resume` and
+//! restored at open, so `SaturationCleared` reports totals across restarts.
+//! Refusals after the last such record are lost in a crash (a clean
+//! [`Recorder::close`] seals them).
+//!
+//! # Key rotation
+//!
+//! [`Recorder::rotate_key`] writes a `KeyRotation` record signed by the old
+//! key, then signs everything after with the new one; the chain id (which
+//! binds the chain's *first* key) does not change, later `SegmentStart`s
+//! name the current key. At open the log's current key must be the
+//! signer's; records signed by older keys are authenticated with
+//! `previous_keys` ([`Recorder::open_with_keys`]).
 //!
 //! # Single writer
 //!
@@ -68,9 +116,10 @@
 use crate::crypto::{sha256, to_hex};
 use crate::export::{cursor_signing_message, Ack, Anchor, Bundle, Checkpoint, SignedCursor};
 use crate::record::{
-    scan_frames, signing_message, ChainIdentity, DropReason, GenesisPayload, Hash, Record,
-    RecordKind, RecoveryPayload, ResumePayload, SaturationClearedPayload, SaturationPayload,
-    ScanItem, SealPayload, SealReason, SegmentDroppedPayload, SegmentStartPayload, TailKind,
+    scan_frames, signing_message, ChainIdentity, DropReason, GenesisPayload, Hash, KeyRef,
+    KeyRotationPayload, Record, RecordKind, RecoveryPayload, ResumePayload,
+    SaturationClearedPayload, SaturationPayload, ScanItem, SealPayload, SealReason,
+    SegmentDroppedPayload, SegmentStartPayload, StateEvidence, TailKind, TruncationPayload,
     FIXED_FIELDS_LEN, FORMAT_VERSION, FRAME_HEADER_LEN, MAX_SIG_LEN, ZERO_HASH,
 };
 use crate::sign::{SignError, Signer, Verifier};
@@ -368,7 +417,7 @@ struct SegInfo {
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
-mod sys {
+pub(crate) mod sys {
     //! The two libc facts the recorder needs, declared by hand (no libc crate
     //! offline). `flock` is linked by std on every unix target.
 
@@ -433,7 +482,7 @@ fn create_dir_private(dir: &Path) -> io::Result<()> {
 
 /// Mode 0600 for new files, and never follow a symlink at the final path
 /// component.
-fn private(o: &mut OpenOptions) -> &mut OpenOptions {
+pub(crate) fn private(o: &mut OpenOptions) -> &mut OpenOptions {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -585,18 +634,27 @@ fn segment_identity(name: &str, idx: u64, first: &Record) -> Result<ChainIdentit
 }
 
 /// Authenticates records with the recorder's own key: an explicit
-/// [`Verifier`] if one was given, else [`Signer::verify_own`].
+/// [`Verifier`] if one was given, else [`Signer::verify_own`]; then any
+/// retired key (rotated away from in this run, or passed to
+/// [`Recorder::open_with_keys`] for records signed before a rotation).
 struct KeyCheck<'a> {
     signer: &'a dyn Signer,
     ext: Option<&'a dyn Verifier>,
+    retired_signers: &'a [Box<dyn Signer>],
+    retired: &'a [Box<dyn Verifier>],
 }
 
 impl KeyCheck<'_> {
     fn sig(&self, message: &[u8], sig: &[u8]) -> bool {
-        match self.ext {
+        let own = match self.ext {
             Some(v) => v.verify(message, sig),
             None => self.signer.verify_own(message, sig) == Some(true),
-        }
+        };
+        own || self
+            .retired_signers
+            .iter()
+            .any(|s| s.verify_own(message, sig) == Some(true))
+            || self.retired.iter().any(|v| v.verify(message, sig))
     }
     /// Hash and signature both valid.
     fn record(&self, r: &Record) -> bool {
@@ -606,23 +664,76 @@ impl KeyCheck<'_> {
 
 const PROBE_MESSAGE: &[u8] = b"robodr-blackbox/self-test/v1\0";
 
-/// Good records of a segment, plus `(cut offset, reason)` if it ends in a
-/// recoverable torn tail.
-type Analyzed = (Vec<Record>, Option<(u64, String)>);
+/// Shortest zero run that counts as "lost write-back" evidence. A frame
+/// never holds 16 consecutive zero bytes except in a genesis `prev_hash`
+/// (excluded below): payloads are JSON, the rest are hashes and integers.
+const ZERO_RUN_MIN: usize = 16;
+
+fn has_zero_run(b: &[u8]) -> bool {
+    if !b.is_empty() && b.len() < ZERO_RUN_MIN {
+        return b.iter().all(|&x| x == 0);
+    }
+    let mut run = 0usize;
+    for &x in b {
+        run = if x == 0 { run + 1 } else { 0 };
+        if run >= ZERO_RUN_MIN {
+            return true;
+        }
+    }
+    false
+}
+
+/// Where the active segment has to be cut.
+struct Cut {
+    offset: u64,
+    reason: String,
+    /// Records with a valid hash found *after* the damage (quarantined with
+    /// it). Their signatures are checked by the caller.
+    after: Vec<Record>,
+}
+
+/// Good records of a segment, plus where to cut it (if at all).
+struct Analysis {
+    good: Vec<Record>,
+    cut: Option<Cut>,
+}
+
+/// Is `r` (following `p` in one segment) a correct successor? Either
+/// `seq + 1` with a linking `prev_hash`, or a `Resume` that declares exactly
+/// the sequence numbers it skipped (see [`ResumePayload::skipped_seqs`]).
+fn links(p: &Record, r: &Record) -> bool {
+    if r.prev_hash != p.hash {
+        return false;
+    }
+    if p.seq.checked_add(1) == Some(r.seq) {
+        return true;
+    }
+    r.kind == RecordKind::Resume
+        && r.seq > p.seq
+        && r.payload_json::<ResumePayload>()
+            .and_then(|x| x.skipped_seqs)
+            .is_some_and(|[a, b]| a == p.seq + 1 && b.checked_add(1) == Some(r.seq))
+}
 
 /// Structural check of one segment for the recorder's own use: strict
 /// framing, record hashes and in-segment linkage (signatures are checked by
 /// the caller once the chain's key is known).
 ///
-/// Only an *incomplete* frame or a *zero-filled* tail, with nothing valid
-/// after it, is a recoverable crash artefact. Everything else is
-/// [`Error::Corrupt`]: a complete frame whose hash fails (modified record), a
-/// record that does not link, malformed bytes followed by valid frames, or
-/// non-zero bytes that do not even start a frame. A crash cannot produce a
-/// complete frame with a wrong hash, because the hash is computed before the
-/// frame is written; treating one as "torn" would turn tampering with the
-/// newest record into a routine recovery.
-fn analyze_segment(name: &str, bytes: &[u8]) -> Result<Analyzed, Error> {
+/// Recoverable crash artefacts (the segment is cut there):
+/// - an *incomplete* frame or a *zero-filled* tail with nothing valid after
+///   it (torn write);
+/// - damage that contains a run of zero bytes (a page whose write-back was
+///   lost while a later page reached disk), even with valid frames after
+///   it. Everything from the damage on is quarantined; the frames after it
+///   are returned in [`Cut::after`] so the caller can account for them.
+///
+/// Everything else is [`Error::Corrupt`]: a complete frame whose hash fails
+/// without zero evidence (modified record), a record that does not link,
+/// non-zero bytes that do not start a frame. A crash cannot produce a
+/// complete frame with a wrong hash out of non-zero bytes, because the hash
+/// is computed before the frame is written; treating one as "torn" would
+/// turn tampering with the newest record into a routine recovery.
+fn analyze_segment(name: &str, bytes: &[u8]) -> Result<Analysis, Error> {
     let corrupt = |offset: u64, reason: String| Error::Corrupt {
         segment: name.into(),
         offset,
@@ -630,20 +741,28 @@ fn analyze_segment(name: &str, bytes: &[u8]) -> Result<Analyzed, Error> {
     };
     let scan = scan_frames(bytes);
     let mut good: Vec<Record> = Vec::new();
-    for it in scan.items {
+    let mut items = scan.items.into_iter();
+    let mut damage: Option<(u64, String)> = None;
+    for it in items.by_ref() {
         match it {
             ScanItem::Record(sr) => {
                 let r = sr.record;
+                let (o, l) = (sr.offset as usize, sr.frame_len as usize);
                 if r.compute_hash() != r.hash {
-                    return Err(corrupt(
+                    let zeros = r.prev_hash != ZERO_HASH && has_zero_run(&bytes[o..o + l]);
+                    if !zeros {
+                        return Err(corrupt(
+                            sr.offset,
+                            format!("record {} hash mismatch (complete frame modified)", r.seq),
+                        ));
+                    }
+                    damage = Some((
                         sr.offset,
-                        format!("record {} hash mismatch (complete frame modified)", r.seq),
+                        format!("record {} partly zeroed (lost write-back)", r.seq),
                     ));
+                    break;
                 }
-                let linked = good
-                    .last()
-                    .is_none_or(|p| p.seq.checked_add(1) == Some(r.seq) && r.prev_hash == p.hash);
-                if !linked {
+                if !good.last().is_none_or(|p| links(p, &r)) {
                     return Err(corrupt(
                         sr.offset,
                         format!("record {} does not link to its predecessor", r.seq),
@@ -651,19 +770,57 @@ fn analyze_segment(name: &str, bytes: &[u8]) -> Result<Analyzed, Error> {
                 }
                 good.push(r);
             }
-            ScanItem::Malformed { offset, reason, .. } => {
-                return Err(corrupt(
+            ScanItem::Malformed {
+                offset,
+                len,
+                reason,
+            } => {
+                let region = &bytes[offset as usize..(offset + len) as usize];
+                if !has_zero_run(region) {
+                    return Err(corrupt(
+                        offset,
+                        format!("{reason}, followed by valid frames"),
+                    ));
+                }
+                damage = Some((
                     offset,
-                    format!("{reason}, followed by valid frames"),
+                    format!("zero-filled hole of {len} bytes (lost write-back), followed by valid frames"),
                 ));
+                break;
             }
         }
+    }
+    if let Some((offset, reason)) = damage {
+        let after = items
+            .filter_map(|it| match it {
+                ScanItem::Record(sr) if sr.record.compute_hash() == sr.record.hash => {
+                    Some(sr.record)
+                }
+                _ => None,
+            })
+            .collect();
+        return Ok(Analysis {
+            good,
+            cut: Some(Cut {
+                offset,
+                reason,
+                after,
+            }),
+        });
     }
     let cut = match scan.tail {
         None => None,
         Some(t) => match t.kind {
-            TailKind::Incomplete => Some((t.offset, "incomplete frame (torn write)".into())),
-            TailKind::Zeros => Some((t.offset, "zero-filled tail".into())),
+            TailKind::Incomplete => Some(Cut {
+                offset: t.offset,
+                reason: "incomplete frame (torn write)".into(),
+                after: Vec::new(),
+            }),
+            TailKind::Zeros => Some(Cut {
+                offset: t.offset,
+                reason: "zero-filled tail".into(),
+                after: Vec::new(),
+            }),
             TailKind::Garbage => {
                 return Err(corrupt(
                     t.offset,
@@ -675,7 +832,65 @@ fn analyze_segment(name: &str, bytes: &[u8]) -> Result<Analyzed, Error> {
             }
         },
     };
-    Ok((good, cut))
+    Ok(Analysis { good, cut })
+}
+
+/// Refusal counters persisted by the newest `Seal` / `Resume` record (reset
+/// by `SaturationCleared`) among `records`, newest first.
+fn persisted_refusals<'a>(
+    records: impl DoubleEndedIterator<Item = &'a Record>,
+) -> Option<(u64, u64)> {
+    for r in records.rev() {
+        match r.kind {
+            RecordKind::Seal => {
+                let p: SealPayload = r.payload_json()?;
+                return Some((p.refused_noncritical, p.refused_critical));
+            }
+            RecordKind::Resume => {
+                let p: ResumePayload = r.payload_json()?;
+                return Some((p.refused_noncritical, p.refused_critical));
+            }
+            RecordKind::SaturationCleared => return Some((0, 0)),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The key that signs records after `tail` (the chain key, or the one named
+/// by the segment's `SegmentStart`, updated by every `KeyRotation`).
+fn current_key(identity: &ChainIdentity, tail: &[Record]) -> KeyRef {
+    let mut k = KeyRef {
+        key_id: identity.key_id.clone(),
+        algorithm: identity.algorithm.clone(),
+    };
+    for r in tail {
+        match r.kind {
+            RecordKind::SegmentStart => {
+                if let Some(sk) = r
+                    .payload_json::<SegmentStartPayload>()
+                    .and_then(|p| p.signing_key)
+                {
+                    k = sk;
+                }
+            }
+            RecordKind::KeyRotation => {
+                if let Some(p) = r.payload_json::<KeyRotationPayload>() {
+                    k = p.to;
+                }
+            }
+            _ => {}
+        }
+    }
+    k
+}
+
+/// Result of checking a position against the authenticated log.
+enum PosCheck {
+    Ok,
+    Beyond(String),
+    Mismatch(String),
+    Unknown(String),
 }
 
 /// Largest index gap the recorder will record as missing segments; a larger
@@ -687,6 +902,12 @@ pub struct Recorder {
     cfg: RecorderConfig,
     signer: Box<dyn Signer>,
     own_verifier: Option<Box<dyn Verifier>>,
+    /// Keys rotated away from in this run (still needed to authenticate
+    /// what they signed).
+    retired_signers: Vec<Box<dyn Signer>>,
+    /// Verifiers for older keys: the one given to [`Recorder::open_with_keys`]
+    /// and the explicit verifiers of keys rotated away from.
+    retired: Vec<Box<dyn Verifier>>,
     clock: Box<dyn Clock>,
     identity: ChainIdentity,
     chain_id: Hash,
@@ -709,6 +930,9 @@ pub struct Recorder {
     acked: Option<Anchor>,
     last_checkpoint: Option<Checkpoint>,
     poisoned: bool,
+    /// Lowest seq the next record may take (set at open when records beyond
+    /// the head are known to have existed; consumed by the next write).
+    seq_floor: Option<u64>,
 }
 
 impl fmt::Debug for Recorder {
@@ -728,8 +952,20 @@ struct Parts {
     cfg: RecorderConfig,
     signer: Box<dyn Signer>,
     own_verifier: Option<Box<dyn Verifier>>,
+    previous: Option<Box<dyn Verifier>>,
     clock: Box<dyn Clock>,
     lock: File,
+}
+
+impl Parts {
+    fn keys(&self) -> KeyCheck<'_> {
+        KeyCheck {
+            signer: &*self.signer,
+            ext: self.own_verifier.as_deref(),
+            retired_signers: &[],
+            retired: self.previous.as_slice(),
+        }
+    }
 }
 
 impl Recorder {
@@ -751,7 +987,7 @@ impl Recorder {
         signer: Box<dyn Signer>,
         clock: Box<dyn Clock>,
     ) -> Result<Self, Error> {
-        Self::open_inner(cfg, signer, None, clock)
+        Self::open_inner(cfg, signer, None, None, clock)
     }
 
     /// [`Recorder::open`] with an explicit verifier for the recorder's own
@@ -764,13 +1000,32 @@ impl Recorder {
         verifier: Box<dyn Verifier>,
         clock: Box<dyn Clock>,
     ) -> Result<Self, Error> {
-        Self::open_inner(cfg, signer, Some(verifier), clock)
+        Self::open_inner(cfg, signer, Some(verifier), None, clock)
+    }
+
+    /// The general form of [`Recorder::open`]: `own_verifier` as in
+    /// [`Recorder::open_with_verifier`] (or `None` for a self-verifying
+    /// signer), and `previous_keys` (typically a
+    /// [`crate::keys::Keyring`]) to authenticate retained records signed
+    /// before a [`Recorder::rotate_key`]. The log's *current* key (the last
+    /// rotation's target) must still be `signer`'s key, otherwise
+    /// [`Error::KeyMismatch`]: rotation happens only through `rotate_key`,
+    /// which needs the old private key.
+    pub fn open_with_keys(
+        cfg: RecorderConfig,
+        signer: Box<dyn Signer>,
+        own_verifier: Option<Box<dyn Verifier>>,
+        previous_keys: Option<Box<dyn Verifier>>,
+        clock: Box<dyn Clock>,
+    ) -> Result<Self, Error> {
+        Self::open_inner(cfg, signer, own_verifier, previous_keys, clock)
     }
 
     fn open_inner(
         cfg: RecorderConfig,
         signer: Box<dyn Signer>,
         own_verifier: Option<Box<dyn Verifier>>,
+        previous: Option<Box<dyn Verifier>>,
         clock: Box<dyn Clock>,
     ) -> Result<Self, Error> {
         cfg.validate()?;
@@ -798,11 +1053,10 @@ impl Recorder {
                 "signer cannot verify its own signatures; use Recorder::open_with_verifier".into(),
             ));
         }
-        let ok = KeyCheck {
-            signer: &*signer,
-            ext: own_verifier.as_deref(),
-        }
-        .sig(PROBE_MESSAGE, &probe);
+        let ok = match own_verifier.as_deref() {
+            Some(v) => v.verify(PROBE_MESSAGE, &probe),
+            None => signer.verify_own(PROBE_MESSAGE, &probe) == Some(true),
+        };
         if !ok {
             return Err(Error::Config(
                 "self-test failed: the verifier rejects the signer's signature".into(),
@@ -815,6 +1069,7 @@ impl Recorder {
             cfg,
             signer,
             own_verifier,
+            previous,
             clock,
             lock,
         };
@@ -831,6 +1086,8 @@ impl Recorder {
         KeyCheck {
             signer: &*self.signer,
             ext: self.own_verifier.as_deref(),
+            retired_signers: &self.retired_signers,
+            retired: &self.retired,
         }
     }
 
@@ -843,6 +1100,7 @@ impl Recorder {
             cfg,
             signer,
             own_verifier,
+            previous,
             clock,
             lock,
         } = parts;
@@ -858,6 +1116,8 @@ impl Recorder {
             cfg,
             signer,
             own_verifier,
+            retired_signers: Vec::new(),
+            retired: previous.into_iter().collect(),
             clock,
             identity: identity.clone(),
             chain_id,
@@ -882,6 +1142,7 @@ impl Recorder {
             acked: None,
             last_checkpoint: None,
             poisoned: false,
+            seq_floor: None,
         };
         let genesis = to_json(&GenesisPayload {
             identity,
@@ -895,6 +1156,42 @@ impl Recorder {
         Ok(r)
     }
 
+    /// Create a new, uniquely named file `quarantine/<base>[-n].<ext>`.
+    fn quarantine_file(
+        cfg: &RecorderConfig,
+        base: &str,
+        ext: &str,
+    ) -> Result<(String, File), Error> {
+        let qdir = cfg.dir.join(QUARANTINE_DIR);
+        create_dir_private(&qdir)?;
+        let mut n = 0u32;
+        loop {
+            let name = if n == 0 {
+                format!("{base}.{ext}")
+            } else {
+                format!("{base}-{n}.{ext}")
+            };
+            match create_new_private(&qdir.join(&name), false) {
+                Ok(f) => return Ok((name, f)),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && n < 10_000 => n += 1,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// Copy `data` into a new quarantine file, durably; returns its path
+    /// relative to the log directory.
+    fn preserve(cfg: &RecorderConfig, base: &str, ext: &str, data: &[u8]) -> Result<String, Error> {
+        let (name, mut q) = Self::quarantine_file(cfg, base, ext)?;
+        q.write_all(data)?;
+        q.sync_all()?;
+        drop(q);
+        sync_dir(&cfg.dir.join(QUARANTINE_DIR))?;
+        Ok(format!("{QUARANTINE_DIR}/{name}"))
+    }
+
+    /// Move `bytes[cut..]` of segment `seg_idx` to `quarantine/` and truncate
+    /// the segment to `cut`.
     fn quarantine(
         cfg: &RecorderConfig,
         seg_idx: u64,
@@ -904,26 +1201,12 @@ impl Recorder {
         reason: String,
     ) -> Result<RecoveryPayload, Error> {
         let discarded = &bytes[cut as usize..];
-        let qdir = cfg.dir.join(QUARANTINE_DIR);
-        create_dir_private(&qdir)?;
-        let base = format!("torn-seg{seg_idx:016}-off{cut}");
-        let mut n = 0u32;
-        let (name, mut q) = loop {
-            let name = if n == 0 {
-                format!("{base}.bin")
-            } else {
-                format!("{base}-{n}.bin")
-            };
-            match create_new_private(&qdir.join(&name), false) {
-                Ok(f) => break (name, f),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && n < 10_000 => n += 1,
-                Err(e) => return Err(e.into()),
-            }
-        };
-        q.write_all(discarded)?;
-        q.sync_all()?;
-        drop(q);
-        sync_dir(&qdir)?;
+        let file = Self::preserve(
+            cfg,
+            &format!("torn-seg{seg_idx:016}-off{cut}"),
+            "bin",
+            discarded,
+        )?;
         let mut o = OpenOptions::new();
         o.write(true);
         let f = private(&mut o).open(path)?;
@@ -935,8 +1218,21 @@ impl Recorder {
             discarded_bytes: discarded.len() as u64,
             discarded_sha256: to_hex(&sha256(discarded)),
             reason,
-            quarantine_file: Some(format!("{QUARANTINE_DIR}/{name}")),
+            quarantine_file: Some(file),
+            discarded_records: 0,
+            discarded_seqs: None,
+            crash_plausible: true,
+            severity: Some(Severity::Medium),
         })
+    }
+
+    /// Could a record with these properties have been durably synced when it
+    /// was written? Control records always are; critical ones under
+    /// `fsync_critical`; every one under [`FsyncPolicy::Always`].
+    fn was_synced(cfg: &RecorderConfig, r: &Record) -> bool {
+        r.kind.is_control()
+            || (r.critical && cfg.fsync_critical)
+            || cfg.fsync == FsyncPolicy::Always
     }
 
     fn resume(parts: Parts, segs: Vec<(u64, PathBuf)>) -> Result<Self, Error> {
@@ -944,7 +1240,7 @@ impl Recorder {
         let last_name = segment_file_name(last_idx);
         let bytes = fs::read(&last_path)?;
         // 1. Structure, hashes and linkage of the active segment (no writes yet).
-        let (good, cut) = analyze_segment(&last_name, &bytes)?;
+        let Analysis { good, cut } = analyze_segment(&last_name, &bytes)?;
 
         if good.is_empty() && segs.len() == 1 {
             if last_idx != 0 {
@@ -954,11 +1250,19 @@ impl Recorder {
                     reason: "only segment is empty and is not segment 0".into(),
                 });
             }
-            // Crash before genesis reached disk: start the chain here.
+            // Crash before genesis reached disk (or genesis itself lost):
+            // start a new chain here. Whatever followed is quarantined.
             let recovery = match cut {
-                Some((off, why)) => Some(Self::quarantine(
-                    &parts.cfg, last_idx, &last_path, &bytes, off, why,
-                )?),
+                Some(c) => {
+                    let mut rp = Self::quarantine(
+                        &parts.cfg, last_idx, &last_path, &bytes, c.offset, c.reason,
+                    )?;
+                    if !c.after.is_empty() {
+                        rp.discarded_records = c.after.len() as u64;
+                        rp.severity = Some(Severity::High);
+                    }
+                    Some(rp)
+                }
                 None => None,
             };
             let file = open_append(&last_path)?;
@@ -971,31 +1275,30 @@ impl Recorder {
             let (pidx, ppath) = &segs[segs.len() - 2];
             let pname = segment_file_name(*pidx);
             let pbytes = fs::read(ppath)?;
-            let (pgood, pcut) = analyze_segment(&pname, &pbytes)?;
-            if let Some((off, why)) = pcut {
+            let pa = analyze_segment(&pname, &pbytes)?;
+            if let Some(c) = pa.cut {
                 return Err(Error::Corrupt {
                     segment: pname,
-                    offset: off,
-                    reason: why,
+                    offset: c.offset,
+                    reason: format!("closed segment damaged: {}", c.reason),
                 });
             }
-            if pgood.is_empty() {
+            if pa.good.is_empty() {
                 return Err(Error::Corrupt {
                     segment: pname,
                     offset: 0,
                     reason: "previous segment is empty".into(),
                 });
             }
-            (pgood, pname, *pidx, true)
+            (pa.good, pname, *pidx, true)
         } else {
             (good, last_name.clone(), last_idx, false)
         };
         let identity = segment_identity(&tail_name, tail_idx, &tail[0])?;
-        if identity.key_id != parts.signer.key_id()
-            || identity.algorithm != parts.signer.algorithm()
-        {
+        let key = current_key(&identity, &tail);
+        if key.key_id != parts.signer.key_id() || key.algorithm != parts.signer.algorithm() {
             return Err(Error::KeyMismatch {
-                log_key_id: format!("{}/{}", identity.algorithm, identity.key_id),
+                log_key_id: format!("{}/{}", key.algorithm, key.key_id),
                 signer_key_id: format!("{}/{}", parts.signer.algorithm(), parts.signer.key_id()),
             });
         }
@@ -1006,10 +1309,7 @@ impl Recorder {
             });
         }
         let chain_id = identity.chain_id();
-        let keys = KeyCheck {
-            signer: &*parts.signer,
-            ext: parts.own_verifier.as_deref(),
-        };
+        let keys = parts.keys();
         // 3. Authenticate every record we chain onto: never extend a forged head.
         for r in &tail {
             if r.chain_id != chain_id {
@@ -1024,7 +1324,8 @@ impl Recorder {
                     segment: tail_name,
                     offset: 0,
                     reason: format!(
-                        "record {} signature does not verify; refusing to chain onto it",
+                        "record {} signature does not verify (with this key or any \
+                         previous key given to open_with_keys); refusing to chain onto it",
                         r.seq
                     ),
                 });
@@ -1040,7 +1341,9 @@ impl Recorder {
             let name = segment_file_name(*idx);
             let owned;
             let seg_bytes: &[u8] = if is_last {
-                &bytes
+                // Only the part we keep (a cut suffix is quarantined).
+                let end = cut.as_ref().map_or(bytes.len(), |c| c.offset as usize);
+                &bytes[..end]
             } else {
                 owned = fs::read(path)?;
                 &owned
@@ -1112,15 +1415,69 @@ impl Recorder {
             missing.extend((a.index + 1..b.index).filter(|&i| !reported(i)));
         }
 
-        // 6. Only now modify anything: recover the torn tail.
+        let head_rec = tail.last().expect("non-empty").clone();
+
+        // 5b. Authentic records quarantined with a mid-segment hole: their
+        //     seqs must never be reused; whether a crash explains the hole.
+        let lost: Vec<Record> = cut
+            .as_ref()
+            .map(|c| {
+                c.after
+                    .iter()
+                    .filter(|r| r.chain_id == chain_id && keys.record(r))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let lost_max = lost
+            .iter()
+            .map(|r| r.seq)
+            .max()
+            .filter(|&m| m > head_rec.seq);
+        let crash_plausible = !lost.iter().any(|r| Self::was_synced(&parts.cfg, r));
+
+        // 5c. Refusal counters persisted before the restart.
+        let mut refusals = persisted_refusals(tail.iter());
+        if refusals.is_none() && !need_segment_start && segs.len() >= 2 {
+            let (_, ppath) = &segs[segs.len() - 2];
+            if let Ok(pbytes) = fs::read(ppath) {
+                let prev: Vec<Record> = scan_frames(&pbytes)
+                    .items
+                    .into_iter()
+                    .filter_map(|it| match it {
+                        ScanItem::Record(sr)
+                            if sr.record.chain_id == chain_id && keys.record(&sr.record) =>
+                        {
+                            Some(sr.record)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                refusals = persisted_refusals(prev.iter());
+            }
+        }
+        let (refused_noncritical, refused_critical) = refusals.unwrap_or((0, 0));
+
+        // 6. Only now modify anything: quarantine the damaged suffix.
         let recovery = match cut {
-            Some((off, why)) => Some(Self::quarantine(
-                &parts.cfg, last_idx, &last_path, &bytes, off, why,
-            )?),
+            Some(c) => {
+                let mut rp =
+                    Self::quarantine(&parts.cfg, last_idx, &last_path, &bytes, c.offset, c.reason)?;
+                if !c.after.is_empty() {
+                    rp.discarded_records = lost.len() as u64;
+                    rp.discarded_seqs = lost_max.map(|m| [head_rec.seq + 1, m]);
+                    rp.crash_plausible = crash_plausible;
+                    rp.severity = Some(if crash_plausible {
+                        Severity::High
+                    } else {
+                        Severity::Critical
+                    });
+                }
+                Some(rp)
+            }
             None => None,
         };
 
-        let head_rec = tail.last().expect("non-empty").clone();
         let (since_seal, last_seal_seq) =
             match tail.iter().rposition(|r| r.kind == RecordKind::Seal) {
                 Some(i) => ((tail.len() - 1 - i) as u64, Some(tail[i].seq)),
@@ -1142,6 +1499,7 @@ impl Recorder {
             cfg,
             signer,
             own_verifier,
+            previous,
             clock,
             lock,
         } = parts;
@@ -1149,6 +1507,8 @@ impl Recorder {
             cfg,
             signer,
             own_verifier,
+            retired_signers: Vec::new(),
+            retired: previous.into_iter().collect(),
             clock,
             identity,
             chain_id,
@@ -1167,40 +1527,87 @@ impl Recorder {
             last_seal_seq,
             unsynced: 0,
             saturated,
-            refused_noncritical: 0,
-            refused_critical: 0,
+            refused_noncritical,
+            refused_critical,
             export_cursor: None,
             ack_verifier: None,
             acked: None,
             last_checkpoint: None,
             poisoned: false,
+            seq_floor: None,
         };
 
-        // 7. State files: trusted only if authenticated and consistent.
+        // 7. State files: trusted only if authenticated and consistent. An
+        //    authentic one that points *beyond* the head proves truncation.
         let mut rejected = Vec::new();
-        match read_state(&r.cfg.dir, CURSOR_FILE)? {
-            None => {}
-            Some(s) => match r.check_cursor(&s) {
+        let mut beyond: Vec<(String, Anchor, String)> = Vec::new();
+        if let Some(s) = read_state(&r.cfg.dir, CURSOR_FILE)? {
+            match r.check_cursor(&s) {
                 Ok(a) => r.export_cursor = Some(a),
-                Err(why) => rejected.push(format!("{CURSOR_FILE}: {why}")),
-            },
+                Err((Some(a), _)) => beyond.push((CURSOR_FILE.to_string(), a, s)),
+                Err((None, why)) => rejected.push(format!("{CURSOR_FILE}: {why}")),
+            }
         }
-        match read_state(&r.cfg.dir, CHECKPOINT_FILE)? {
-            None => {}
-            Some(s) => match Checkpoint::from_json(&s) {
+        if let Some(s) = read_state(&r.cfg.dir, CHECKPOINT_FILE)? {
+            match Checkpoint::from_json(&s) {
                 Some(c)
                     if c.chain_id == chain_id
                         && r.keys().sig(&signing_message(&c.hash), &c.sig) =>
                 {
-                    r.last_checkpoint = Some(c)
+                    match r.check_position(&c.anchor()) {
+                        PosCheck::Ok | PosCheck::Unknown(_) => r.last_checkpoint = Some(c),
+                        PosCheck::Beyond(_) => {
+                            beyond.push((CHECKPOINT_FILE.to_string(), c.anchor(), s))
+                        }
+                        PosCheck::Mismatch(why) => {
+                            return Err(Error::Untrusted(format!(
+                                "{CHECKPOINT_FILE} is authentic but {why}: the log was \
+                                 rewritten under this chain's key; refusing to extend it \
+                                 (preserve the directory for analysis)"
+                            )))
+                        }
+                    }
                 }
                 _ => rejected.push(format!(
                     "{CHECKPOINT_FILE}: unparseable, foreign or not signed by this key"
                 )),
-            },
+            }
         }
 
-        // 8. Record what was found.
+        for (file, a, _) in &beyond {
+            rejected.push(format!(
+                "{file}: authentic but seq {} is beyond the head {}: log truncated \
+                 (see the TruncationDetected record)",
+                a.seq, head_rec.seq
+            ));
+        }
+        // Never reuse a sequence number that may exist elsewhere.
+        let floor = beyond
+            .iter()
+            .map(|(_, a, _)| a.seq)
+            .chain(lost_max)
+            .max()
+            .and_then(|m| m.checked_add(1));
+        let skipped = floor.map(|f| [head_rec.seq + 1, f - 1]);
+        r.seq_floor = floor;
+
+        // Keep the evidence before anything replaces it.
+        let mut evidence = Vec::new();
+        for (file, a, text) in &beyond {
+            let base = format!("state-{}-seq{}", file.trim_end_matches(".json"), a.seq);
+            let preserved_as = Some(Self::preserve(&r.cfg, &base, "json", text.as_bytes())?);
+            evidence.push(StateEvidence {
+                file: file.clone(),
+                seq: a.seq,
+                hash: to_hex(&a.hash),
+                preserved_as,
+                sha256: to_hex(&sha256(text.as_bytes())),
+            });
+        }
+
+        // 8. Record what was found. The first record written takes the seq
+        //    jump; a `Resume` that declares it is the only in-segment jump the
+        //    recorder accepts at the next open.
         if need_segment_start {
             r.write_segment_start()?;
         }
@@ -1211,10 +1618,23 @@ impl Recorder {
             recovered: recovery.is_some(),
             missing_segments: missing.clone(),
             rejected_state: rejected,
+            skipped_seqs: skipped,
+            refused_noncritical,
+            refused_critical,
         };
         r.write_record(RecordKind::Resume, to_json(&resume)?, true, true)?;
         if let Some(rec) = recovery {
             r.write_record(RecordKind::Recovery, to_json(&rec)?, true, true)?;
+        }
+        if !evidence.is_empty() {
+            let p = to_json(&TruncationPayload {
+                head_seq: head_rec.seq,
+                head_hash: to_hex(&head_rec.hash),
+                evidence,
+                skipped_seqs: skipped.expect("evidence implies a floor"),
+                severity: Severity::Critical,
+            })?;
+            r.write_record(RecordKind::TruncationDetected, p, true, true)?;
         }
         for idx in missing {
             let p = to_json(&SegmentDroppedPayload {
@@ -1232,37 +1652,52 @@ impl Recorder {
         Ok(r)
     }
 
-    /// Parse and authenticate a persisted export cursor.
-    fn check_cursor(&self, s: &str) -> Result<Anchor, String> {
-        let c = SignedCursor::from_json(s).ok_or("unparseable or unsigned")?;
+    /// Parse and authenticate a persisted export cursor. `Err((Some(a), _))`:
+    /// authentic and of this chain, but beyond the head (truncation evidence).
+    fn check_cursor(&self, s: &str) -> Result<Anchor, (Option<Anchor>, String)> {
+        let c = SignedCursor::from_json(s).ok_or((None, "unparseable or unsigned".to_string()))?;
         if !self.keys().sig(&cursor_signing_message(&c.anchor), &c.sig) {
-            return Err("signature does not verify under this recorder's key".into());
+            return Err((
+                None,
+                "signature does not verify under this recorder's key".into(),
+            ));
         }
-        self.validate_position(&c.anchor)?;
-        Ok(c.anchor)
+        match self.check_position(&c.anchor) {
+            PosCheck::Ok => Ok(c.anchor),
+            PosCheck::Beyond(_) => Err((Some(c.anchor), String::new())),
+            PosCheck::Mismatch(why) | PosCheck::Unknown(why) => Err((None, why)),
+        }
     }
 
     /// Is `a` a real position of this chain, no later than the head?
-    ///
+    fn validate_position(&self, a: &Anchor) -> Result<(), String> {
+        match self.check_position(a) {
+            PosCheck::Ok => Ok(()),
+            PosCheck::Beyond(w) | PosCheck::Mismatch(w) | PosCheck::Unknown(w) => Err(w),
+        }
+    }
+
     /// Checked against authenticated data only: the head, the retained
     /// segments' authenticated first records (whose `prev_hash` is the hash
     /// of the record before), or the record itself, re-read and verified.
     /// A position older than all retained evidence cannot be checked and is
     /// accepted: no retained record is at or before it, so it can make the
     /// recorder neither prune nor skip anything.
-    fn validate_position(&self, a: &Anchor) -> Result<(), String> {
+    fn check_position(&self, a: &Anchor) -> PosCheck {
         if a.chain_id != self.chain_id {
-            return Err("belongs to another chain".into());
+            return PosCheck::Mismatch("belongs to another chain".into());
         }
-        let (hs, hh) = self.head.ok_or("log is empty")?;
+        let Some((hs, hh)) = self.head else {
+            return PosCheck::Unknown("log is empty".into());
+        };
         if a.seq > hs {
-            return Err(format!("seq {} is beyond the head {hs}", a.seq));
+            return PosCheck::Beyond(format!("seq {} is beyond the head {hs}", a.seq));
         }
         if a.seq == hs {
             return if a.hash == hh {
-                Ok(())
+                PosCheck::Ok
             } else {
-                Err(format!("hash differs from the head record {hs}"))
+                PosCheck::Mismatch(format!("hash differs from the head record {hs}"))
             };
         }
         let starts: Vec<(u64, u64, Hash)> = self
@@ -1270,29 +1705,39 @@ impl Recorder {
             .iter()
             .filter_map(|s| s.start.map(|(seq, prev)| (s.index, seq, prev)))
             .collect();
-        let mismatch = || Err(format!("hash differs from record {}", a.seq));
+        let mismatch = || PosCheck::Mismatch(format!("hash differs from record {}", a.seq));
         // A position right before some retained segment's first record.
         if let Some(&(_, _, prev)) = starts
             .iter()
             .find(|(_, seq, _)| a.seq.checked_add(1) == Some(*seq))
         {
-            return if prev == a.hash { Ok(()) } else { mismatch() };
+            return if prev == a.hash {
+                PosCheck::Ok
+            } else {
+                mismatch()
+            };
         }
         let Some(&(idx, _, _)) = starts.iter().rev().find(|(_, seq, _)| *seq <= a.seq) else {
-            return Ok(()); // older than all retained evidence
+            return PosCheck::Ok; // older than all retained evidence
         };
-        let bytes = fs::read(self.cfg.dir.join(segment_file_name(idx)))
-            .map_err(|e| format!("cannot read segment {idx}: {e}"))?;
+        let bytes = match fs::read(self.cfg.dir.join(segment_file_name(idx))) {
+            Ok(b) => b,
+            Err(e) => return PosCheck::Unknown(format!("cannot read segment {idx}: {e}")),
+        };
         let keys = self.keys();
         for it in scan_frames(&bytes).items {
             if let ScanItem::Record(sr) = it {
                 let r = sr.record;
                 if r.seq == a.seq && r.chain_id == self.chain_id && keys.record(&r) {
-                    return if r.hash == a.hash { Ok(()) } else { mismatch() };
+                    return if r.hash == a.hash {
+                        PosCheck::Ok
+                    } else {
+                        mismatch()
+                    };
                 }
             }
         }
-        Err(format!("no authentic record {} in segment {idx}", a.seq))
+        PosCheck::Unknown(format!("no authentic record {} in segment {idx}", a.seq))
     }
 
     fn write_record(
@@ -1309,7 +1754,8 @@ impl Recorder {
             None => (0, ZERO_HASH),
             Some((s, h)) => (
                 s.checked_add(1)
-                    .ok_or_else(|| Error::Config("sequence space exhausted".into()))?,
+                    .ok_or_else(|| Error::Config("sequence space exhausted".into()))?
+                    .max(self.seq_floor.unwrap_or(0)),
                 h,
             ),
         };
@@ -1348,6 +1794,7 @@ impl Recorder {
                 }
             }
         }
+        self.seq_floor = None;
         self.seg_len += frame.len() as u64;
         self.seg_records += 1;
         self.head = Some((seq, rec.hash));
@@ -1380,10 +1827,17 @@ impl Recorder {
     }
 
     fn write_segment_start(&mut self) -> Result<(), Error> {
+        let signing_key = (self.signer.key_id() != self.identity.key_id
+            || self.signer.algorithm() != self.identity.algorithm)
+            .then(|| KeyRef {
+                key_id: self.signer.key_id().to_string(),
+                algorithm: self.signer.algorithm().to_string(),
+            });
         let p = to_json(&SegmentStartPayload {
             identity: self.identity.clone(),
             segment_index: self.seg_index,
             boot_id: self.cfg.boot_id.clone(),
+            signing_key,
         })?;
         self.write_record(RecordKind::SegmentStart, p, true, true)?;
         Ok(())
@@ -1395,6 +1849,8 @@ impl Recorder {
             segment_index: self.seg_index,
             records_since_last_seal: self.since_seal,
             prev_seal_seq: self.last_seal_seq,
+            refused_noncritical: self.refused_noncritical,
+            refused_critical: self.refused_critical,
         })?;
         let w = self.write_record(RecordKind::Seal, p, true, true)?;
         self.since_seal = 0;
@@ -1403,7 +1859,7 @@ impl Recorder {
             chain_id: self.chain_id,
             seq: w.seq,
             hash: w.hash,
-            key_id: self.identity.key_id.clone(),
+            key_id: self.signer.key_id().to_string(),
             sig: w.sig,
         };
         atomic_write(&self.cfg.dir, CHECKPOINT_FILE, cp.to_json().as_bytes())?;
@@ -1415,6 +1871,103 @@ impl Recorder {
     /// the unit (or into TPM NV) to make tail truncation detectable.
     pub fn seal(&mut self) -> Result<Checkpoint, Error> {
         self.seal_with(SealReason::Manual)
+    }
+
+    /// Rotate the signing key, keeping the chain.
+    ///
+    /// Writes a [`RecordKind::KeyRotation`] record signed by the **current**
+    /// key that names the new one, switches to `new_signer` for every later
+    /// record, and writes a seal (reason `key_rotation`) under the new key;
+    /// returns that seal's checkpoint. The chain id keeps naming the key the
+    /// chain was created with; every later `SegmentStart` names the current
+    /// key. The old key stays usable for authenticating what it signed in
+    /// this run; after a restart pass it (or a [`crate::keys::Keyring`]) as
+    /// `previous_keys` to [`Recorder::open_with_keys`] while segments it
+    /// signed are retained. Verify across the rotation with a keyring that
+    /// holds both keys.
+    ///
+    /// `new_verifier` is required when `new_signer` cannot verify its own
+    /// signatures; it must match the signer and pass a self-test.
+    pub fn rotate_key(
+        &mut self,
+        new_signer: Box<dyn Signer>,
+        new_verifier: Option<Box<dyn Verifier>>,
+        reason: &str,
+    ) -> Result<Checkpoint, Error> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
+        let ok_name = |s: &str| {
+            !s.is_empty()
+                && s.len() <= crate::sign::MAX_KEY_ID_LEN
+                && s.bytes().all(|b| b.is_ascii_graphic())
+        };
+        if !ok_name(new_signer.key_id()) || !ok_name(new_signer.algorithm()) {
+            return Err(Error::Config(
+                "new signer needs a printable key id and algorithm".into(),
+            ));
+        }
+        if new_signer.key_id() == self.signer.key_id() {
+            return Err(Error::Config(
+                "new key has the current key's id; rotation needs a new key id".into(),
+            ));
+        }
+        if self
+            .retired_signers
+            .iter()
+            .any(|s| s.key_id() == new_signer.key_id())
+            || self
+                .retired
+                .iter()
+                .any(|v| v.key_id() == new_signer.key_id())
+        {
+            return Err(Error::Config("new key id was used before".into()));
+        }
+        if let Some(v) = &new_verifier {
+            if v.key_id() != new_signer.key_id() || v.algorithm() != new_signer.algorithm() {
+                return Err(Error::Config(
+                    "verifier does not match the new signer".into(),
+                ));
+            }
+        }
+        let probe = new_signer.sign(PROBE_MESSAGE).map_err(Error::Sign)?;
+        let ok = match &new_verifier {
+            Some(v) => v.verify(PROBE_MESSAGE, &probe),
+            None => new_signer.verify_own(PROBE_MESSAGE, &probe) == Some(true),
+        };
+        if !ok {
+            return Err(Error::Config(
+                "self-test failed: the new key cannot authenticate its own signature".into(),
+            ));
+        }
+        let p = to_json(&KeyRotationPayload {
+            from: KeyRef {
+                key_id: self.signer.key_id().to_string(),
+                algorithm: self.signer.algorithm().to_string(),
+            },
+            to: KeyRef {
+                key_id: new_signer.key_id().to_string(),
+                algorithm: new_signer.algorithm().to_string(),
+            },
+            reason: reason
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(256)
+                .collect(),
+        })?;
+        self.write_record(RecordKind::KeyRotation, p, true, true)?;
+        let old = std::mem::replace(&mut self.signer, new_signer);
+        if let Some(v) = std::mem::replace(&mut self.own_verifier, new_verifier) {
+            self.retired.push(v);
+        }
+        self.retired_signers.push(old);
+        self.seal_with(SealReason::KeyRotation)
+    }
+
+    /// Current signing key id (differs from `identity().key_id` after a
+    /// [`Recorder::rotate_key`]).
+    pub fn key_id(&self) -> &str {
+        self.signer.key_id()
     }
 
     fn rotate(&mut self) -> Result<(), Error> {

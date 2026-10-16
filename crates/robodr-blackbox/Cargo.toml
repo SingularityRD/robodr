@@ -10,3 +10,9 @@ description = "Signed, hash-chained black-box evidence recorder for RoboDR."
 robodr-events = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[[bin]]
+name = "robodr-blackbox"
+path = "src/bin/robodr-blackbox.rs"
+# Same crate name as the library: keep it out of rustdoc to avoid a collision.
+doc = false
