@@ -13,7 +13,23 @@ pub const MAX_TEXT_CHARS: usize = 512;
 /// Marker appended when [`sanitize`] truncates.
 pub const TRUNCATION_MARKER: &str = "...[truncated]";
 
-/// Escape control characters and cap the length at [`MAX_TEXT_CHARS`] chars
+/// Bidirectional-text controls and invisible formatting characters
+/// ("Trojan Source", CVE-2021-42574): not `is_control()`, but they reorder
+/// or hide what an operator sees in a terminal, log viewer or SIEM, so a
+/// topic name could display as something else. Escaped like controls.
+fn is_bidi_or_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Escape control characters (and bidi / invisible format characters) and
+/// cap the length at [`MAX_TEXT_CHARS`] chars
 /// (counted in `char`s, so a multi-byte character is never split).
 pub fn sanitize(text: &str) -> String {
     let mut out = String::with_capacity(text.len().min(MAX_TEXT_CHARS + 16));
@@ -22,7 +38,7 @@ pub fn sanitize(text: &str) -> String {
             out.push_str(TRUNCATION_MARKER);
             return out;
         }
-        if c.is_control() {
+        if c.is_control() || is_bidi_or_invisible(c) {
             out.extend(c.escape_default());
         } else {
             out.push(c);
@@ -34,6 +50,13 @@ pub fn sanitize(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bidi_and_invisible_characters_are_escaped() {
+        let s = sanitize("rt/cmd\u{202e}lev_\u{200b}x\u{2066}\u{feff}");
+        assert_eq!(s, "rt/cmd\\u{202e}lev_\\u{200b}x\\u{2066}\\u{feff}");
+        assert_eq!(sanitize("ünïcødé /ok"), "ünïcødé /ok");
+    }
 
     #[test]
     fn plain_text_is_unchanged() {

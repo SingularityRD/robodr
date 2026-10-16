@@ -174,7 +174,19 @@ fn rtps_fixture_pcap_with_empty_profile() {
     ]);
     assert!(out.status.success(), "{out:?}");
     let l = lines(&out);
-    // 4 participants + 5 writers + 1 reader (see tests/rtps_fixtures.rs).
-    assert_eq!(l.len(), 10, "{l:#?}");
+    // 4 participants + 5 writers + 1 reader (see tests/rtps_fixtures.rs),
+    // plus, at the end of the replay, the two participants whose SEDP is in
+    // the fixtures but whose SPDP is not (big-endian `rt/scan` and the
+    // service-request participant): "never announced", Medium.
+    assert_eq!(l.len(), 12, "{l:#?}");
+    let unannounced: Vec<_> = l
+        .iter()
+        .filter(|x| x["rule"] == "robot.ros2.endpoint_unannounced_participant")
+        .collect();
+    assert_eq!(unannounced.len(), 2, "{l:#?}");
+    assert!(unannounced.iter().all(|x| x["severity"] == "medium"));
+    assert!(l
+        .iter()
+        .all(|x| x["rule"] != "robot.ros2.endpoint_source_mismatch"));
     std::fs::remove_dir_all(&dir).ok();
 }

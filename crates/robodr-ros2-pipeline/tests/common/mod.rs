@@ -32,7 +32,7 @@ pub fn header(prefix: [u8; 12]) -> Vec<u8> {
     d
 }
 
-fn param(pid: u16, value: &[u8]) -> Vec<u8> {
+pub fn param(pid: u16, value: &[u8]) -> Vec<u8> {
     assert!(value.len().is_multiple_of(4));
     let mut p = pid.to_le_bytes().to_vec();
     p.extend_from_slice(&(value.len() as u16).to_le_bytes());
@@ -40,7 +40,7 @@ fn param(pid: u16, value: &[u8]) -> Vec<u8> {
     p
 }
 
-fn string_param(pid: u16, s: &str) -> Vec<u8> {
+pub fn string_param(pid: u16, s: &str) -> Vec<u8> {
     let mut v = ((s.len() + 1) as u32).to_le_bytes().to_vec();
     v.extend_from_slice(s.as_bytes());
     v.push(0);
@@ -50,14 +50,14 @@ fn string_param(pid: u16, s: &str) -> Vec<u8> {
     param(pid, &v)
 }
 
-fn guid(prefix: [u8; 12], entity: [u8; 4]) -> [u8; 16] {
+pub fn guid(prefix: [u8; 12], entity: [u8; 4]) -> [u8; 16] {
     let mut g = [0u8; 16];
     g[..12].copy_from_slice(&prefix);
     g[12..].copy_from_slice(&entity);
     g
 }
 
-fn locator_v4(ip: Ipv4Addr, port: u32) -> Vec<u8> {
+pub fn locator_v4(ip: Ipv4Addr, port: u32) -> Vec<u8> {
     let mut v = 1i32.to_le_bytes().to_vec(); // LOCATOR_KIND_UDPv4
     v.extend_from_slice(&port.to_le_bytes());
     v.extend_from_slice(&[0; 12]);
@@ -66,7 +66,7 @@ fn locator_v4(ip: Ipv4Addr, port: u32) -> Vec<u8> {
 }
 
 /// PL_CDR_LE serialized payload: encapsulation header + params + sentinel.
-fn pl_payload(params: &[Vec<u8>]) -> Vec<u8> {
+pub fn pl_payload(params: &[Vec<u8>]) -> Vec<u8> {
     let mut p = vec![0x00, 0x03, 0, 0];
     for x in params {
         p.extend_from_slice(x);
@@ -288,3 +288,101 @@ pub fn write(path: &Path, bytes: &[u8]) {
 pub fn rtps_fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../robodr-rtps/tests/fixtures")
 }
+
+/// An INFO_SRC submessage (E flag): the following submessages are sent on
+/// behalf of `prefix`.
+pub fn info_src(prefix: [u8; 12]) -> Vec<u8> {
+    let mut s = vec![0x0c, 0x01];
+    s.extend_from_slice(&20u16.to_le_bytes());
+    s.extend_from_slice(&[0; 4]); // unused
+    s.extend_from_slice(&[2, 3, 0x01, 0x0f]); // version + vendor
+    s.extend_from_slice(&prefix);
+    s
+}
+
+/// SPDP payload for `prefix` advertising unicast locators on every `ips`.
+pub fn spdp_payload_multi(prefix: [u8; 12], ips: &[Ipv4Addr]) -> Vec<u8> {
+    let mut params = vec![
+        param(0x0015, &[2, 3, 0, 0]),
+        param(0x0016, &[0x01, 0x0f, 0, 0]),
+        param(0x0050, &guid(prefix, [0, 0, 1, 0xc1])),
+    ];
+    for ip in ips {
+        params.push(param(0x0032, &locator_v4(*ip, 7410)));
+        params.push(param(0x0031, &locator_v4(*ip, 7411)));
+    }
+    pl_payload(&params)
+}
+
+/// An RTPS datagram from header prefix `sender` carrying `subs`.
+pub fn datagram(sender: [u8; 12], subs: &[Vec<u8>]) -> Vec<u8> {
+    let mut d = header(sender);
+    for s in subs {
+        d.extend_from_slice(s);
+    }
+    d
+}
+
+/// SPDP DATA submessage announcing `prefix` with locators on `ips`.
+pub fn spdp_sub(prefix: [u8; 12], ips: &[Ipv4Addr]) -> Vec<u8> {
+    data(ENTITY_SPDP_WRITER, 1, &spdp_payload_multi(prefix, ips))
+}
+
+/// SEDP publication DATA submessage for an endpoint of `owner`.
+pub fn sedp_sub(owner: [u8; 12], topic: &str) -> Vec<u8> {
+    data(
+        ENTITY_SEDP_PUB_WRITER,
+        1,
+        &sedp_payload(owner, topic, TWIST, 0),
+    )
+}
+
+/// SEDP publication whose `PID_PARTICIPANT_GUID` names `claimed`, while the
+/// endpoint GUID names `owner` (a GUID conflict).
+pub fn sedp_sub_conflict(owner: [u8; 12], claimed: [u8; 12], topic: &str) -> Vec<u8> {
+    let payload = pl_payload(&[
+        param(0x005a, &guid(owner, [0, 0, 0x12, 0x03])),
+        param(0x0050, &guid(claimed, [0, 0, 1, 0xc1])),
+        string_param(0x0005, topic),
+        string_param(0x0007, TWIST),
+    ]);
+    data(ENTITY_SEDP_PUB_WRITER, 1, &payload)
+}
+
+/// SEDP publication dispose (inline KEY_HASH + STATUS_INFO, no payload) of
+/// `owner`'s writer.
+pub fn sedp_dispose_sub(owner: [u8; 12]) -> Vec<u8> {
+    let mut body = vec![0, 0];
+    body.extend_from_slice(&16u16.to_le_bytes());
+    body.extend_from_slice(&[0, 0, 0, 0]);
+    body.extend_from_slice(&ENTITY_SEDP_PUB_WRITER);
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&2u32.to_le_bytes());
+    body.extend_from_slice(&param(0x0070, &guid(owner, [0, 0, 0x12, 0x03])));
+    body.extend_from_slice(&param(0x0071, &[0, 0, 0, 1])); // disposed
+    body.extend_from_slice(&[1, 0, 0, 0]); // sentinel
+    let mut s = vec![0x15, 0x03]; // DATA, E|Q
+    s.extend_from_slice(&(body.len() as u16).to_le_bytes());
+    s.extend_from_slice(&body);
+    s
+}
+
+/// An RTPS header with an explicit protocol version.
+pub fn header_v(prefix: [u8; 12], major: u8, minor: u8) -> Vec<u8> {
+    let mut d = b"RTPS".to_vec();
+    d.extend_from_slice(&[major, minor, 0x01, 0x0f]);
+    d.extend_from_slice(&prefix);
+    d
+}
+
+/// A PL_CDR_LE payload from already-encoded parameter bytes (no alignment
+/// checks: for malformed-input tests).
+pub fn pl_raw(params: &[u8]) -> Vec<u8> {
+    let mut p = vec![0x00, 0x03, 0, 0];
+    p.extend_from_slice(params);
+    p.extend_from_slice(&[1, 0, 0, 0]);
+    p
+}
+
+/// Writer entity id used for hand-built rogue endpoints.
+pub const ROGUE_ENTITY: [u8; 4] = [0, 0, 0x77, 0x03];
