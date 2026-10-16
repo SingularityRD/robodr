@@ -4,7 +4,9 @@
 use robodr_events::{Deviation, Mode, Severity};
 
 use crate::autosecops::{action_class, Approval, ALL_CLASSES, ROBOTICS_CATEGORY};
-use crate::escalation::{MAX_REISSUE_KEYS, MAX_SOURCES, MAX_SOURCE_KEY_LEN, OVERFLOW_SOURCE};
+use crate::escalation::{
+    MAX_MOTION_GUARD_MS, MAX_REISSUE_KEYS, MAX_SOURCES, MAX_SOURCE_KEY_LEN, OVERFLOW_SOURCE,
+};
 use crate::policy::{MAX_RULE_OVERRIDES, SCHEMA};
 use crate::*;
 
@@ -1281,6 +1283,186 @@ fn hostile_source_keys_and_clock() {
     // Third hit for the long key at the same (clamped) instant -> escalates.
     r.plan(&dev(Severity::Low), &long, SafetyState::Idle, &c, 5);
     assert_eq!(r.escalation_level(&long), 1);
+}
+
+// ------------------------------------------- flood / bounded-state siblings ---
+
+fn has_limit(p: &ResponsePlan) -> bool {
+    p.actions
+        .iter()
+        .any(|a| matches!(a, ResponseAction::LimitMotion { .. }))
+}
+
+fn has_restrict(p: &ResponsePlan) -> bool {
+    p.actions
+        .iter()
+        .any(|a| matches!(a, ResponseAction::Restrict { .. }))
+}
+
+#[test]
+fn overflow_flood_cannot_turn_auto_response_into_approval() {
+    // Decoys fill the source table, then one more lands in the shared
+    // overflow bucket with a Critical deviation (MovingFast -> safe state,
+    // above the auto ceiling: approval). Its desired step is held by the
+    // bucket. A real High deviation from a new source would then inherit
+    // that hold and only get Record + approval; it must instead get the
+    // auto LimitMotion a fresh source gets.
+    let mut r = Responder::new(esc_policy()).unwrap();
+    let c = ctx(PlatformFamily::Ugv);
+    let s = SafetyState::MovingFast;
+    let crit = dev(Severity::Critical);
+    for i in 0..=MAX_SOURCES {
+        let p = r.plan(&crit, &format!("decoy-{i}"), s, &c, i as u64);
+        assert!(p.requires_human_approval);
+    }
+    assert_eq!(r.tracked_sources(), MAX_SOURCES);
+    let real = r.plan(&dev(Severity::High), "real", s, &c, 100);
+    let alone = plan_stateless(r.policy(), &dev(Severity::High), "real", s, &c);
+    assert!(!alone.requires_human_approval && has_limit(&alone));
+    assert!(!real.requires_human_approval, "{real:?}");
+    assert!(!real.suppressed);
+    assert!(has_limit(&real) && has_restrict(&real), "{real:?}");
+    assert!(real
+        .rationale
+        .contains(|x| matches!(x, Reason::OverflowStateNotApplied { .. })));
+    assert_eq!(
+        check_invariants_for_deviation(&real, &dev(Severity::High), s, &c),
+        Ok(())
+    );
+    // A real Critical in overflow still gets its (approval) plan: shared state
+    // is only bypassed when that makes the plan more automatic.
+    let real_crit = r.plan(&crit, "real-crit", s, &c, 101);
+    assert!(real_crit.requires_human_approval);
+    assert_eq!(real_crit.max_step, Step::RequestSafeState);
+    // Tracked (non-overflow) sources are unaffected by the fallback.
+    let tracked = r.plan(&dev(Severity::High), "decoy-0", s, &c, 102);
+    assert!(!tracked
+        .rationale
+        .contains(|x| matches!(x, Reason::OverflowStateNotApplied { .. })));
+}
+
+#[test]
+fn long_key_prefix_collision_cannot_suppress_legit_source() {
+    let mut p = esc_policy();
+    p.escalation.min_reissue_interval_ms = 60_000;
+    let mut r = Responder::new(p).unwrap();
+    let c = ctx(PlatformFamily::Ugv);
+    let s = SafetyState::Idle; // High -> Restrict, auto.
+    let prefix = "/opt/vendor/".to_string() + &"x".repeat(200);
+    let legit = format!("{prefix}/legit_driver");
+    let evil = format!("{prefix}/evil");
+    let a = r.plan(&dev(Severity::High), &evil, s, &c, 0);
+    assert!(has_restrict(&a) && !a.suppressed);
+    // Same first MAX_SOURCE_KEY_LEN bytes: used to share the rate-limit
+    // entry, so the legit source's Restrict was suppressed.
+    let b = r.plan(&dev(Severity::High), &legit, s, &c, 10);
+    assert!(!b.suppressed, "{b:?}");
+    assert!(has_restrict(&b));
+    // plan.source stays the deterministic plain truncation.
+    assert_eq!(b.source.len(), MAX_SOURCE_KEY_LEN);
+    assert!(legit.starts_with(&b.source));
+    // A genuine repeat of the long key is still rate limited.
+    let again = r.plan(&dev(Severity::High), &evil, s, &c, 20);
+    assert!(again.suppressed);
+    // Escalation state is per full key too.
+    r.plan(&dev(Severity::High), &evil, s, &c, 30);
+    assert_eq!(r.escalation_level(&evil), 1);
+    assert_eq!(r.escalation_level(&legit), 0);
+    assert_eq!(r.tracked_sources(), 2);
+    // Acknowledge resolves the same identity.
+    assert!(r.acknowledge(Some(&evil), 40));
+    assert_eq!(r.escalation_level(&evil), 0);
+    assert!(!r.plan(&dev(Severity::High), &evil, s, &c, 50).suppressed);
+}
+
+#[test]
+fn motion_guard_is_short_lived_and_cleared_by_estop_and_ack() {
+    let mut p = esc_policy();
+    p.escalation.min_reissue_interval_ms = 60_000;
+    let c = ctx(PlatformFamily::Ugv);
+    let fast = SafetyState::MovingFast;
+    let high = dev(Severity::High);
+
+    // Control: within the guard window the redundant motion part is dropped.
+    let mut r = Responder::new(p.clone()).unwrap();
+    assert!(has_limit(&r.plan(&high, "decoy", fast, &c, 0)));
+    let dropped = r.plan(&high, "real", fast, &c, 1_000);
+    assert!(!has_limit(&dropped) && has_restrict(&dropped));
+    // Capped at MAX_MOTION_GUARD_MS even though the interval is 60 s.
+    let later = r.plan(&high, "real2", fast, &c, MAX_MOTION_GUARD_MS);
+    assert!(has_limit(&later), "{later:?}");
+
+    // E-stop / safe state observed: earlier motion requests are superseded.
+    for engaged in [SafetyState::EStopActive, SafetyState::SafeStateActive] {
+        let mut r = Responder::new(p.clone()).unwrap();
+        r.plan(&high, "decoy", fast, &c, 0);
+        let e = r.plan(&dev(Severity::Low), "other", engaged, &c, 100);
+        assert_eq!(e.actions, vec![ResponseAction::Record]);
+        let real = r.plan(&high, "real", fast, &c, 200);
+        assert!(has_limit(&real), "{engaged:?}: {real:?}");
+        // Same (source, rule) repeat after the safe state: its motion part
+        // is re-requested, not suppressed (entry lowered to Restrict).
+        let mut r = Responder::new(p.clone()).unwrap();
+        r.plan(&high, "g", fast, &c, 0);
+        r.plan(&dev(Severity::Low), "x", engaged, &c, 100);
+        let again = r.plan(&high, "g", fast, &c, 200);
+        assert!(!again.suppressed && has_limit(&again), "{again:?}");
+        // ...while a Restrict-level repeat is still rate limited.
+        let mut r = Responder::new(p.clone()).unwrap();
+        r.plan(&high, "g", SafetyState::Idle, &c, 0);
+        r.plan(&dev(Severity::Low), "x", engaged, &c, 100);
+        assert!(r.plan(&high, "g", SafetyState::Idle, &c, 200).suppressed);
+    }
+
+    // Any operator acknowledgement forgets the guard.
+    let mut r = Responder::new(p).unwrap();
+    r.plan(&high, "decoy", fast, &c, 0);
+    assert!(r.acknowledge(Some("decoy"), 100));
+    assert!(has_limit(&r.plan(&high, "real", fast, &c, 200)));
+}
+
+#[test]
+fn flood_never_exceeds_safe_state_request_or_acts_under_estop() {
+    // Randomized flood: fresh, repeated, long and overflow source keys, all
+    // severities and states. Every stateful plan must satisfy the planner
+    // invariants, never contain more than RequestSafeState, be Record-only
+    // while the safety system is engaged, and memory stays bounded.
+    let mut p = esc_policy();
+    p.auto_max_step = Step::RequestSafeState;
+    p.escalation.ceiling = Step::RequestSafeState;
+    let mut r = Responder::new(p).unwrap();
+    let mut rng = Rng(7);
+    let long = "L".repeat(300);
+    for i in 0..30_000u64 {
+        let src = match rng.below(4) {
+            0 => format!("fresh-{i}"),
+            1 => format!("g{}", rng.below(8)),
+            2 => format!("{long}{}", rng.below(4)),
+            _ => OVERFLOW_SOURCE.to_string(),
+        };
+        let state = rng.pick(&SafetyState::ALL);
+        let mut c = ctx(PlatformFamily::Ugv);
+        c.control = rng.pick(&ControlMode::ALL);
+        c.phase = rng.pick(&MissionPhase::ALL);
+        let mut d = dev(rng.pick(&SEVS));
+        if rng.below(10) == 0 {
+            d = d.with_mode(Mode::Observe);
+        }
+        let plan = r.plan(&d, &src, state, &c, i * 7);
+        assert_eq!(
+            check_invariants_for_deviation(&plan, &d, state, &c),
+            Ok(()),
+            "{plan:?}"
+        );
+        assert!(plan.max_step <= Step::RequestSafeState);
+        if state.safety_system_engaged() {
+            assert_eq!(plan.actions, vec![ResponseAction::Record]);
+        }
+        assert!(!has_terminate(&plan));
+        assert!(plan.source.len() <= MAX_SOURCE_KEY_LEN);
+        assert!(r.tracked_sources() <= MAX_SOURCES);
+        assert!(r.rate_limit_entries() <= MAX_REISSUE_KEYS);
+    }
 }
 
 // ---------------------------------------------------------------- policy ---

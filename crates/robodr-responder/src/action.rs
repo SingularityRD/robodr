@@ -229,6 +229,11 @@ pub enum Reason {
     /// motion-affecting actions were dropped; its Record/Restrict actions,
     /// which target its own source, are kept.
     MotionAlreadyRequested { step: Step, since_ms: u64 },
+    /// The source shares the overflow bucket (source table full). Its shared
+    /// escalation `level` / hold `held` would have made the plan await
+    /// approval; the plan a fresh source gets (`result`, auto-executable) was
+    /// used instead, so a flood cannot make a response less automatic.
+    OverflowStateNotApplied { level: u8, held: Step, result: Step },
 }
 
 impl fmt::Display for Reason {
@@ -288,6 +293,14 @@ impl fmt::Display for Reason {
             Reason::MotionAlreadyRequested { step, since_ms } => write!(
                 f,
                 "{step:?} already requested robot-wide {since_ms} ms ago: motion part dropped"
+            ),
+            Reason::OverflowStateNotApplied {
+                level,
+                held,
+                result,
+            } => write!(
+                f,
+                "shared overflow state (+{level}, held {held:?}) not applied: fresh-source plan {result:?}"
             ),
         }
     }

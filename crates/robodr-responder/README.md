@@ -84,27 +84,37 @@ is at hand.
 - **Robot-wide motion guard (anti-oscillation):** an auto-executable
   motion-affecting plan whose step *and* severity are both not higher than the
   motion-affecting auto step already issued robot-wide within
-  `min_reissue_interval_ms` has only its motion-affecting actions dropped
+  `min(min_reissue_interval_ms, 5 s)` (`MAX_MOTION_GUARD_MS`) has only its
+  motion-affecting actions dropped
   (`MotionAlreadyRequested`) — that step is already requested and plans never
   relax. Its `record`/`restrict` actions (which concern its own source) are
   kept, so it is not `suppressed`. A higher-severity or higher-step plan always
-  passes and becomes the new reference.
+  passes and becomes the new reference. The guard is forgotten on any
+  `acknowledge` and whenever a plan is made while the e-stop / safe state is
+  engaged (that also lowers remembered motion-affecting rate-limit entries to
+  `restrict`): after a safe state + restart, or an operator lifting a limit,
+  an earlier request is no longer in force and must not drop a new one.
 - **Decoy floods** (arbitrary fresh source ids): cannot mute or downgrade
   another source's response (see the above), cannot stop a real source being
   restricted, and cannot downgrade a higher-severity plan. They *can* flood the
   console with approval requests (not deduplicated here; the console should
   aggregate) and push new real sources into the shared overflow escalation
-  bucket (more active, never less). Review finding 2 (wave 2) was exactly
+  bucket (more active, never less automatic: if the bucket's shared
+  escalation/hold would make a plan await approval while a fresh source's plan
+  would be auto-executable, the fresh-source plan is used,
+  `OverflowStateNotApplied`). Review finding 2 (wave 2) was exactly
   such a flood muting real responses under the old robot-wide limiter; see
   `tests/review_poc.rs`.
 - Plans never relax anything; lifting applied restrictions is an operator
   action outside this crate. `acknowledge(Some(src))` also clears that
   source's rate-limit memory; `acknowledge(None)` clears everything.
-- **Bounded memory:** ≤ 64 sources, ≤ 64 timestamps each, keys truncated to 128
-  bytes. When full, new sources share an overflow bucket (escalates like a
+- **Bounded memory:** ≤ 64 sources, ≤ 64 timestamps each, keys ≤ 128 bytes
+  (a longer key is identified by a prefix plus a SipHash of the whole key under
+  a per-responder random key, so two long keys sharing their first 128 bytes
+  never share state; `plan.source` still shows the plain 128-byte truncation). When full, new sources share an overflow bucket (escalates like a
   source), so flooding fresh ids cannot evict real offenders or grow memory.
-  Rate-limit memory: ≤ 256 (source, rule) entries keyed by the real (truncated)
-  source key, expiring after `min_reissue_interval_ms`; when full the oldest is
+  Rate-limit memory: ≤ 256 (source, rule) entries keyed by the real source
+  identity, expiring after `min_reissue_interval_ms`; when full the oldest is
   evicted, which can only cause a redundant re-issue, never a suppression.
 - Time is the caller's monotonic ms clock; a backwards step counts as no time
   elapsed.
