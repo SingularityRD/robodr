@@ -38,4 +38,4 @@ pub use builder::{
 pub use kafka::{dedup_key, headers, partition_for, record, record_key, to_json, Record};
 pub use model::*;
 pub use taint::{Charset, Provenance, Tainted, TAINT_LABEL};
-pub use validate::{parse_and_validate, validate, ValidationError};
+pub use validate::{parse_and_validate, validate, validate_for_emit, ValidationError};

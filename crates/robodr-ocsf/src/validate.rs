@@ -32,8 +32,21 @@
 //!   value and `suspicious` the OR of the other flags.
 //! * **Floats**: finite, non-negative; `anomaly_score` within `[0, 1]`.
 //! * **Size**: serialised message at most [`MAX_FINDING_BYTES`].
+//! * **Catalog constants**: `title`, the `description` prefix,
+//!   `finding_info.types` / `data_sources` and the ATT&CK techniques
+//!   (`technique_id`/`technique_name`, `attacks[]`) must be exactly what the
+//!   trusted rule catalog ([`crate::rule_info`]) gives for `rule_id`;
+//!   `resources[].labels` must be exactly `["taint:adversary"]`. Free prose in
+//!   these sensor-provenance fields is rejected. Consequence: a new catalog
+//!   entry needs the validator (this crate) updated on both sides.
+//! * **Contract 1.0** messages are accepted for replay only if they carry
+//!   none of the 1.1 tainted-value fields (`display`, `non_ascii`,
+//!   `mixed_script`, `injection_hint`, `suspicious`); they are never
+//!   emitted ([`validate_for_emit`]).
+//! * **Raw document** ([`parse_and_validate`]): duplicate object keys are
+//!   rejected at any depth (serde_json would silently keep the last one).
 
-use crate::builder::{ocsf_severity_id, ocsf_severity_name, rfc3339_ms};
+use crate::builder::{ocsf_severity_id, ocsf_severity_name, rfc3339_ms, rule_info};
 use crate::hash::{hex, sha256};
 use crate::model::*;
 use crate::taint::{
@@ -240,7 +253,20 @@ impl Checker {
             );
         }
         if !self.v1_1 {
-            return; // contract 1.0: the remaining fields did not exist
+            // Contract 1.0 had none of the 1.1 fields. A 1.0 message must not
+            // carry them: otherwise a downgraded `contract_version` would
+            // switch off the checks below while a forged `display` or cleared
+            // `suspicious` still reached consumers (rev3 O1).
+            self.fmt(
+                t.display.is_empty()
+                    && !t.non_ascii
+                    && !t.mixed_script
+                    && !t.injection_hint
+                    && !t.suspicious,
+                path,
+                "contract 1.0 value must not carry 1.1 fields (display/flags)",
+            );
+            return;
         }
         if t.truncated {
             self.fmt(
@@ -560,12 +586,30 @@ pub fn validate(env: &FindingEnvelope) -> Result<(), Vec<ValidationError>> {
     );
     c.eq(fi.analytic.type_id, 1, "analytic.type_id == 1 (Rule)");
     c.eq(fi.analytic.type_.as_str(), "Rule", "analytic.type");
-    if fi.types.is_empty() {
-        c.push(ValidationError::Missing("finding_info.types"));
-    }
-    if fi.data_sources.is_empty() {
-        c.push(ValidationError::Missing("finding_info.data_sources"));
-    }
+    // Constant-like fields are derived from the trusted rule catalog by the
+    // builder; anything else (e.g. prose aimed at an LLM triage step in a
+    // forged or replayed message) is rejected, not merely charset-checked.
+    let info = rule_info(&ec.rule_id);
+    c.eq(
+        env.title.as_str(),
+        info.title,
+        "title == catalog title of rule_id",
+    );
+    c.fmt(
+        env.description.starts_with(info.desc),
+        "/description",
+        "description must start with the catalog description of rule_id",
+    );
+    c.fmt(
+        fi.types.len() == 2 && fi.types[0] == "robot_deviation" && fi.types[1] == info.data_source,
+        "/ocsf/finding_info/types",
+        "expected [\"robot_deviation\", <catalog data source of rule_id>]",
+    );
+    c.fmt(
+        fi.data_sources.len() == 1 && fi.data_sources[0] == info.data_source,
+        "/ocsf/finding_info/data_sources",
+        "expected [<catalog data source of rule_id>]",
+    );
 
     // --- ATT&CK
     if env.mitre_predictions.len() > MAX_TECHNIQUES {
@@ -579,6 +623,17 @@ pub fn validate(env: &FindingEnvelope) -> Result<(), Vec<ValidationError>> {
         env.mitre_predictions.len(),
         fi.attacks.len(),
         "mitre_predictions <-> attacks",
+    );
+    let catalog_ok = env.mitre_predictions.len() == info.techniques.len()
+        && env
+            .mitre_predictions
+            .iter()
+            .zip(info.techniques)
+            .all(|(mp, (id, name))| mp.technique_id == *id && mp.technique_name == *name);
+    c.fmt(
+        catalog_ok,
+        "/mitre_predictions",
+        "ATT&CK techniques must be exactly the catalog entries of rule_id",
     );
     for (i, (mp, at)) in env.mitre_predictions.iter().zip(&fi.attacks).enumerate() {
         let p = format!("/mitre_predictions/{i}");
@@ -678,6 +733,11 @@ pub fn validate(env: &FindingEnvelope) -> Result<(), Vec<ValidationError>> {
                 "resources[].labels taint:adversary",
             ));
         }
+        c.fmt(
+            r.labels.len() == 1 && r.labels[0] == TAINT_LABEL,
+            &format!("{p}/labels"),
+            "labels must be exactly [\"taint:adversary\"]",
+        );
         if r.uid.is_none() && r.name.is_none() {
             c.push(ValidationError::Missing("resources[].uid or name"));
         }
@@ -794,6 +854,10 @@ pub fn parse_and_validate(json: &str) -> Result<FindingEnvelope, Vec<ValidationE
     }
     let raw: Value =
         serde_json::from_str(json).map_err(|e| vec![ValidationError::Parse(e.to_string())])?;
+    // serde_json keeps the *last* of duplicate keys, so an earlier copy would
+    // never be validated while a first-wins parser (or an LLM reading the raw
+    // record) sees it. Reject duplicates at any depth (rev3 O2).
+    check_duplicate_keys(json).map_err(|e| vec![e])?;
     // Unknown fields are tolerated structurally (forward compatibility within
     // a contract major version) but dropped on deserialisation, so the string
     // rules are applied to the *raw* document as well: hostile characters are
@@ -803,6 +867,15 @@ pub fn parse_and_validate(json: &str) -> Result<FindingEnvelope, Vec<ValidationE
         v1_1: true,
     };
     walk_strings(&raw, &mut String::new(), &mut c);
+    // A contract 1.0 message must not carry the 1.1 tainted-value fields at
+    // all (presence, not just non-default values): see `Checker::tainted`.
+    let legacy = raw
+        .get("contract_version")
+        .and_then(Value::as_str)
+        .is_some_and(|v| !minor_at_least(v, 1));
+    if legacy {
+        find_v1_1_fields(&raw, &mut String::new(), &mut c);
+    }
     if !c.errs.is_empty() {
         return Err(c.errs);
     }
@@ -810,6 +883,135 @@ pub fn parse_and_validate(json: &str) -> Result<FindingEnvelope, Vec<ValidationE
         serde_json::from_value(raw).map_err(|e| vec![ValidationError::Parse(e.to_string())])?;
     validate(&env)?;
     Ok(env)
+}
+
+/// [`validate`] plus the producer-only rule that a finding being *emitted*
+/// (Kafka value, diode export) uses the current contract minor: contract 1.0
+/// is accepted on parse for replay of old batches but never (re-)emitted,
+/// because a 1.0 value serialises without a meaningful `display`/flags.
+pub fn validate_for_emit(env: &FindingEnvelope) -> Result<(), Vec<ValidationError>> {
+    let mut errs = validate(env).err().unwrap_or_default();
+    if !minor_at_least(&env.contract_version, 1) {
+        errs.push(ValidationError::BadFormat {
+            path: "/contract_version".into(),
+            reason: "contract 1.0 findings are parse-only and never emitted",
+        });
+    }
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs)
+    }
+}
+
+/// Fields that contract 1.1 added to tainted values.
+const V1_1_TAINTED_FIELDS: [&str; 5] = [
+    "display",
+    "non_ascii",
+    "mixed_script",
+    "injection_hint",
+    "suspicious",
+];
+
+fn find_v1_1_fields(v: &Value, path: &mut String, c: &mut Checker) {
+    match v {
+        Value::Array(a) => {
+            for (i, x) in a.iter().enumerate() {
+                let len = path.len();
+                path.push('/');
+                path.push_str(&i.to_string());
+                find_v1_1_fields(x, path, c);
+                path.truncate(len);
+            }
+        }
+        Value::Object(m) => {
+            if m.contains_key("taint") {
+                for k in V1_1_TAINTED_FIELDS {
+                    if m.contains_key(k) {
+                        c.push(ValidationError::BadFormat {
+                            path: format!("{path}/{k}"),
+                            reason: "contract 1.0 message must not carry 1.1 fields",
+                        });
+                    }
+                }
+            }
+            for (k, x) in m {
+                let len = path.len();
+                path.push('/');
+                path.push_str(&escape_pointer_token(k));
+                find_v1_1_fields(x, path, c);
+                path.truncate(len);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Reject duplicate object keys at any depth. `json` must already have been
+/// accepted by `serde_json` (so it is well-formed and nesting is bounded by
+/// serde_json's recursion limit); this is a byte scanner that only tracks
+/// structure and decodes keys (so `"a"` and `"\u0061"` are the same key).
+fn check_duplicate_keys(json: &str) -> Result<(), ValidationError> {
+    use std::collections::HashSet;
+    enum Frame {
+        Object {
+            keys: HashSet<String>,
+            expect_key: bool,
+        },
+        Array,
+    }
+    let b = json.as_bytes();
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'{' => stack.push(Frame::Object {
+                keys: HashSet::new(),
+                expect_key: true,
+            }),
+            b'[' => stack.push(Frame::Array),
+            b'}' | b']' => {
+                stack.pop();
+            }
+            b',' => {
+                if let Some(Frame::Object { expect_key, .. }) = stack.last_mut() {
+                    *expect_key = true;
+                }
+            }
+            b':' => {
+                if let Some(Frame::Object { expect_key, .. }) = stack.last_mut() {
+                    *expect_key = false;
+                }
+            }
+            b'"' => {
+                let start = i;
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                let end = (i + 1).min(b.len());
+                if let Some(Frame::Object { keys, expect_key }) = stack.last_mut() {
+                    if *expect_key {
+                        *expect_key = false;
+                        let key: String = serde_json::from_str(&json[start..end])
+                            .map_err(|e| ValidationError::Parse(e.to_string()))?;
+                        if !keys.insert(key.clone()) {
+                            return Err(ValidationError::BadFormat {
+                                path: escape_pointer_token(&key),
+                                reason: "duplicate JSON object key",
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok(())
 }
 
 fn escape_pointer_token(k: &str) -> String {
@@ -950,5 +1152,39 @@ mod tests {
             parse_and_validate("[[[[[[[[[[[[").unwrap_err()[0],
             ValidationError::Parse(_)
         ));
+    }
+
+    #[test]
+    fn duplicate_key_scanner() {
+        let ok = [
+            r#"{}"#,
+            r#"{"a":1,"b":{"a":2},"c":[{"a":1},{"a":2}]}"#,
+            r#"{"a":"x\"a\":{","b":"}","c":"\\"}"#,
+            r#"[{"a":1},{"a":1}]"#,
+            r#"{"a":["a","a"],"b":{"x":{"y":{"z":1}}}}"#,
+            r#"{"é":1,"e":2}"#,
+        ];
+        for j in ok {
+            assert!(serde_json::from_str::<Value>(j).is_ok(), "{j}");
+            assert_eq!(check_duplicate_keys(j), Ok(()), "{j}");
+        }
+        let bad = [
+            r#"{"a":1,"a":1}"#,
+            r#"{"x":{"a":1,"b":2,"a":3}}"#,
+            r#"[1,{"k":[{"q":1,"q":2}]}]"#,
+            r#"{"a":1,"\u0061":2}"#,
+            r#"{ "a" : 1 , "a" : 2 }"#,
+            r#"{"a\"b":1,"a\u0022b":2}"#,
+        ];
+        for j in bad {
+            assert!(serde_json::from_str::<Value>(j).is_ok(), "{j}");
+            assert!(
+                matches!(
+                    check_duplicate_keys(j),
+                    Err(ValidationError::BadFormat { .. })
+                ),
+                "{j}"
+            );
+        }
     }
 }
