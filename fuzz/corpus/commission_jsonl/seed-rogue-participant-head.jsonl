@@ -1,0 +1,20 @@
+# SYNTHETIC: clean-run.jsonl plus a rogue participant (0f0f...) that joins and announces a
+# writer on rt/cmd_vel. Checking it against the locked clean profile must give deviations.
+{"kind":"ros2_participant_discovered","guid_prefix":"01103f5a8c2e000000000101","src_ip":"10.42.0.11","locators":["10.42.0.11:7411"]}
+{"kind":"ros2_participant_discovered","guid_prefix":"01103f5a8c2e000000000102","src_ip":"10.42.0.12","locators":["10.42.0.12:7411"]}
+{"kind":"ros2_participant_discovered","guid_prefix":"01103f5a8c2e000000000103","src_ip":"10.42.0.13","locators":["10.42.0.13:7411"]}
+{"kind":"ros2_participant_discovered","guid_prefix":"01103f5a8c2e000000000104","src_ip":"10.42.0.14","locators":["10.42.0.14:7411"]}
+{"kind":"ros2_writer_discovered","guid_prefix":"01103f5a8c2e000000000101","topic":"rt/cmd_vel","type_name":"geometry_msgs::msg::dds_::Twist_"}
+{"kind":"ros2_reader_discovered","guid_prefix":"01103f5a8c2e000000000102","topic":"rt/cmd_vel","type_name":"geometry_msgs::msg::dds_::Twist_"}
+{"kind":"ros2_writer_discovered","guid_prefix":"01103f5a8c2e000000000102","topic":"rt/odom","type_name":"nav_msgs::msg::dds_::Odometry_"}
+{"kind":"ros2_reader_discovered","guid_prefix":"01103f5a8c2e000000000101","topic":"rt/odom","type_name":"nav_msgs::msg::dds_::Odometry_"}
+{"kind":"ros2_writer_discovered","guid_prefix":"01103f5a8c2e000000000103","topic":"rt/scan","type_name":"sensor_msgs::msg::dds_::LaserScan_"}
+{"kind":"ros2_reader_discovered","guid_prefix":"01103f5a8c2e000000000101","topic":"rt/scan","type_name":"sensor_msgs::msg::dds_::LaserScan_"}
+{"kind":"ros2_writer_discovered","guid_prefix":"01103f5a8c2e000000000101","topic":"rt/mast/pan_tilt_cmd","type_name":"control_msgs::msg::dds_::JointJog_"}
+{"kind":"ros2_reader_discovered","guid_prefix":"01103f5a8c2e000000000104","topic":"rt/mast/pan_tilt_cmd","type_name":"control_msgs::msg::dds_::JointJog_"}
+{"kind":"ros2_writer_discovered","guid_prefix":"01103f5a8c2e000000000104","topic":"rt/mast/joint_states","type_name":"sensor_msgs::msg::dds_::JointState_"}
+{"kind":"ros2_reader_discovered","guid_prefix":"01103f5a8c2e000000000101","topic":"rt/mast/joint_states","type_name":"sensor_msgs::msg::dds_::JointState_"}
+# --- ROS 2 internals every node has (rosout, parameter events/services, discovery info) ---
+{"kind":"ros2_writer_discovered","guid_prefix":"01103f5a8c2e000000000101","topic":"rt/rosout","type_name":"rcl_interfaces::msg::dds_::Log_"}
+{"kind":"ros2_writer_discovered","guid_prefix":"01103f5a8c2e000000000101","topic":"rt/parameter_events","type_name":"rcl_interfaces::msg::dds_::ParameterEvent_"}
+{"kind":"ros2_reader_discovered","guid_prefix":"01103f5a8c2e000000000101","topic":"rt/parameter_events","type_name":"rcl_interfaces::msg::dds_::ParameterEvent_"}

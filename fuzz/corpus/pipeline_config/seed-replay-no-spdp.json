@@ -1,0 +1,1 @@
+{"profile_path":"/var/lib/robodr/profile.json","listen_spdp":false,"capture":{"enabled":true,"pcap_replay":"/var/lib/robodr/lab/discovery.pcapng"}}

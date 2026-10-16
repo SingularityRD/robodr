@@ -1,0 +1,20 @@
+# SYNTHETIC: legitimate /cmd_vel at 0.4 m/s and honest /odom (first-order response, small noise),
+# then /odom is replaced by fabricated telemetry (1.2 m/s) between t=4.0 s and t=5.5 s.
+# Replay with --step-ms 20: event k is observed at k*20 ms; odom timestamp_ns uses that base.
+{"kind":"motion_command","channel":"/cmd_vel","source_guid":"01103f5a8c2e00000000010100000103","linear_speed":0.4,"joint_speed":null}
+{"kind":"motion_feedback","channel":"/odom","measured_linear_speed":0.003942,"measured_joint_speed":null,"linear_velocity":0.003942,"publisher_guid":"01103f5a8c2e00000000010200000203","timestamp_ns":40000000}
+{"kind":"motion_command","channel":"/cmd_vel","source_guid":"01103f5a8c2e00000000010100000103","linear_speed":0.4,"joint_speed":null}
+{"kind":"motion_feedback","channel":"/odom","measured_linear_speed":0.00134,"measured_joint_speed":null,"linear_velocity":0.00134,"publisher_guid":"01103f5a8c2e00000000010200000203","timestamp_ns":80000000}
+{"kind":"motion_command","channel":"/cmd_vel","source_guid":"01103f5a8c2e00000000010100000103","linear_speed":0.4,"joint_speed":null}
+{"kind":"motion_feedback","channel":"/odom","measured_linear_speed":0.022311,"measured_joint_speed":null,"linear_velocity":0.022311,"publisher_guid":"01103f5a8c2e00000000010200000203","timestamp_ns":120000000}
+{"kind":"motion_command","channel":"/cmd_vel","source_guid":"01103f5a8c2e00000000010100000103","linear_speed":0.4,"joint_speed":null}
+{"kind":"motion_feedback","channel":"/odom","measured_linear_speed":0.069983,"measured_joint_speed":null,"linear_velocity":0.069983,"publisher_guid":"01103f5a8c2e00000000010200000203","timestamp_ns":160000000}
+{"kind":"motion_command","channel":"/cmd_vel","source_guid":"01103f5a8c2e00000000010100000103","linear_speed":0.4,"joint_speed":null}
+{"kind":"motion_feedback","channel":"/odom","measured_linear_speed":0.116015,"measured_joint_speed":null,"linear_velocity":0.116015,"publisher_guid":"01103f5a8c2e00000000010200000203","timestamp_ns":200000000}
+{"kind":"motion_command","channel":"/cmd_vel","source_guid":"01103f5a8c2e00000000010100000103","linear_speed":0.4,"joint_speed":null}
+{"kind":"motion_feedback","channel":"/odom","measured_linear_speed":0.152583,"measured_joint_speed":null,"linear_velocity":0.152583,"publisher_guid":"01103f5a8c2e00000000010200000203","timestamp_ns":240000000}
+{"kind":"motion_command","channel":"/cmd_vel","source_guid":"01103f5a8c2e00000000010100000103","linear_speed":0.4,"joint_speed":null}
+{"kind":"motion_feedback","channel":"/odom","measured_linear_speed":0.179009,"measured_joint_speed":null,"linear_velocity":0.179009,"publisher_guid":"01103f5a8c2e00000000010200000203","timestamp_ns":280000000}
+{"kind":"motion_command","channel":"/cmd_vel","source_guid":"01103f5a8c2e00000000010100000103","linear_speed":0.4,"joint_speed":null}
+{"kind":"motion_feedback","channel":"/odom","measured_linear_speed":0.203961,"measured_joint_speed":null,"linear_velocity":0.203961,"publisher_guid":"01103f5a8c2e00000000010200000203","timestamp_ns":320000000}
+{"kind":"motion_command","channel":"/cmd_vel","source_guid":"01103f5a8c2e00000000010100000103","linear_speed":0.4,"joint_speed":null}

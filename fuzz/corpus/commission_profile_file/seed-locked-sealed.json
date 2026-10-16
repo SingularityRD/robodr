@@ -1,0 +1,23 @@
+{
+  "seal": "sha256:7ea0839c2cc9eb771c7ddce87c18439c1d924303781760a87ec326800d85ec30",
+  "model": "ugv-fuzz-x1",
+  "locked": true,
+  "participants": [
+    "01103f5a8c2e000000000101",
+    "01103f5a8c2e000000000102"
+  ],
+  "writer_topics": [
+    "/cmd_vel",
+    "/odom"
+  ],
+  "motion_envelopes": {
+    "/cmd_vel": {
+      "max_linear_speed": 0.5,
+      "max_joint_speed": null
+    }
+  },
+  "services": [],
+  "actions": [],
+  "reader_topics": [],
+  "raw_dds_topics": []
+}
