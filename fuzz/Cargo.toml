@@ -1,9 +1,13 @@
-# cargo-fuzz (libFuzzer) harness for robodr-rtps. NOT a member of the main
-# workspace: the empty [workspace] table below makes this its own workspace
-# root, so `cargo build --workspace` at the repo root never sees it (and never
-# needs libfuzzer-sys or a nightly toolchain). See README.md.
+# cargo-fuzz (libFuzzer) harnesses for the RoboDR parsers. NOT a member of
+# the main workspace: the empty [workspace] table below makes this its own
+# workspace root, so `cargo build --workspace` at the repo root never sees it
+# (and never needs libfuzzer-sys or a nightly toolchain). See README.md.
+#
+# Every target except parse_datagram is a thin wrapper around a harness in
+# harness/ that the owning crate's tests/fuzz_smoke.rs also runs (std only,
+# deterministic mutator), so the targets are exercised in normal CI too.
 [package]
-name = "robodr-rtps-fuzz"
+name = "robodr-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
@@ -14,12 +18,90 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-robodr-rtps = { path = "../crates/robodr-rtps" }
+serde_json = "1"
+robodr-agent = { path = "../crates/robodr-agent" }
+robodr-blackbox = { path = "../crates/robodr-blackbox" }
+robodr-capture = { path = "../crates/robodr-capture" }
+robodr-commission = { path = "../crates/robodr-commission" }
 robodr-events = { path = "../crates/robodr-events" }
+robodr-firewall = { path = "../crates/robodr-firewall" }
+robodr-ocsf = { path = "../crates/robodr-ocsf" }
+robodr-ros2-pipeline = { path = "../crates/robodr-ros2-pipeline" }
+robodr-rtps = { path = "../crates/robodr-rtps" }
 
 [[bin]]
 name = "parse_datagram"
 path = "fuzz_targets/parse_datagram.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pcap_reader"
+path = "fuzz_targets/pcap_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "capture_reassembly"
+path = "fuzz_targets/capture_reassembly.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "blackbox_segments"
+path = "fuzz_targets/blackbox_segments.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ocsf_parse_and_validate"
+path = "fuzz_targets/ocsf_parse_and_validate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "events_profile"
+path = "fuzz_targets/events_profile.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "commission_profile_file"
+path = "fuzz_targets/commission_profile_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "commission_signoff"
+path = "fuzz_targets/commission_signoff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "commission_jsonl"
+path = "fuzz_targets/commission_jsonl.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "firewall_policy"
+path = "fuzz_targets/firewall_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pipeline_config"
+path = "fuzz_targets/pipeline_config.rs"
 test = false
 doc = false
 bench = false

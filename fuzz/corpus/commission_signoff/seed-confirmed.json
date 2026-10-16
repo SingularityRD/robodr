@@ -1,0 +1,29 @@
+{
+  "format": "robodr-commission-signoff/1",
+  "model": "ugv-fuzz-x1",
+  "profile_sha256": "54f88eaab6d5f8044c4509bb10aef51cdbd88fa7a37ce7b39432fbad6718141b",
+  "operator": "op-1",
+  "items": [
+    {
+      "id": "motion_channel_unreviewed:/cmd_vel",
+      "kind": "motion_channel_unreviewed",
+      "subject": "/cmd_vel",
+      "reason": "provenance unknown (edited or merged draft): confirm this motion channel, its envelope and every participant allowed to write it",
+      "confirmed": true
+    },
+    {
+      "id": "participant_unreviewed:01103f5a8c2e000000000101",
+      "kind": "participant_unreviewed",
+      "subject": "01103f5a8c2e000000000101",
+      "reason": "provenance unknown (edited or merged draft): confirm this participant belongs on the robot",
+      "confirmed": true
+    },
+    {
+      "id": "participant_unreviewed:01103f5a8c2e000000000102",
+      "kind": "participant_unreviewed",
+      "subject": "01103f5a8c2e000000000102",
+      "reason": "provenance unknown (edited or merged draft): confirm this participant belongs on the robot",
+      "confirmed": true
+    }
+  ]
+}
