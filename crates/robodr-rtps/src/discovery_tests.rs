@@ -586,18 +586,35 @@ fn spdp_dispose_of_other_participant_emits_no_discovery() {
 }
 
 #[test]
-fn malformed_inline_qos_drops_the_sample() {
-    let q = Pl::new(true).raw_len(PID_STATUS_INFO, 3, &[0, 0, 1]).end();
-    let d = dg(
-        S,
-        &[data(
-            true,
-            PUB,
-            Some(q),
-            Payload::Data(sedp_payload(true, guid_of(X, W_ENT), "rt/x", "t")),
-        )],
+fn inline_qos_misaligned_is_flagged_unterminated_drops_the_sample() {
+    let with_q = |q: Vec<u8>| {
+        dg(
+            S,
+            &[data(
+                true,
+                PUB,
+                Some(q),
+                Payload::Data(sedp_payload(true, guid_of(X, W_ENT), "rt/x", "t")),
+            )],
+        )
+    };
+    // Misaligned length: read on right after it (lenient), flagged.
+    let r = report(&with_q(
+        Pl::new(true).raw_len(PID_STATUS_INFO, 3, &[0, 0, 1]).end(),
+    ));
+    assert_eq!(r.endpoints.len(), 1);
+    assert!(r.anomalies.contains(&Anomaly::MisalignedParameterLength));
+    assert!(
+        r.anomalies
+            .contains(&Anomaly::BadParameterValue(PID_STATUS_INFO))
+            || r.removed_endpoints.is_empty()
     );
-    let r = report(&d);
+    // No sentinel: the payload offset is unknown, the sample is dropped.
+    let mut q = Pl::new(true)
+        .raw_len(PID_STATUS_INFO, 4, &[0, 0, 0, 0])
+        .no_sentinel();
+    q.extend_from_slice(&[0x77, 0x77, 0xff, 0xff]); // a length past the end
+    let r = report(&with_q(q));
     assert!(r.endpoints.is_empty());
     assert!(r.anomalies.contains(&Anomaly::MalformedParameterList));
 }
@@ -674,14 +691,15 @@ fn trailing_partial_submessage_header_is_an_anomaly() {
 }
 
 #[test]
-fn unsupported_major_version_reports_sender_only() {
+fn unsupported_major_version_is_parsed_and_flagged() {
     let mut d = header_v(S, [1, 0]);
     d.extend(sedp(true, PUB, guid_of(X, W_ENT), "rt/a"));
     let r = report(&d);
-    assert!(r.endpoints.is_empty());
+    assert_eq!(r.endpoints.len(), 1);
     assert_eq!(r.anomalies, vec![Anomaly::UnsupportedProtocolVersion(1, 0)]);
     assert_eq!(r.header.vendor_name(), Some("eProsima Fast DDS"));
-    assert_eq!(parse_datagram(&d, "x").len(), 1);
+    // Sender + the writer (owner X) + the writer attributed to its sender S.
+    assert_eq!(parse_datagram(&d, "x").len(), 3);
 }
 
 #[test]
@@ -744,7 +762,7 @@ fn inline_qos_before_payload_is_skipped_correctly() {
 // ---------------------------------------------------------------- parameter strictness
 
 #[test]
-fn misaligned_or_unterminated_parameter_list_is_rejected() {
+fn misaligned_or_unterminated_parameter_list_is_used_and_flagged() {
     let bad = Pl::new(true)
         .guid(PID_ENDPOINT_GUID, guid_of(X, W_ENT))
         .raw_len(PID_TOPIC_NAME, 10, b"\x05\0\0\0rt/a\0\0")
@@ -753,14 +771,18 @@ fn misaligned_or_unterminated_parameter_list_is_rejected() {
         .guid(PID_ENDPOINT_GUID, guid_of(X, W_ENT))
         .string(PID_TOPIC_NAME, "rt/a")
         .no_sentinel();
-    for pl in [bad, unterminated] {
+    for (pl, anomaly) in [
+        (bad, Anomaly::MisalignedParameterLength),
+        (unterminated, Anomaly::MalformedParameterList),
+    ] {
         let d = dg(
             S,
             &[data(true, PUB, None, Payload::Data(pl_payload(true, pl)))],
         );
         let r = report(&d);
-        assert!(r.endpoints.is_empty());
-        assert_eq!(r.anomalies, vec![Anomaly::MalformedParameterList]);
+        assert_eq!(r.endpoints.len(), 1);
+        assert_eq!(r.endpoints[0].topic, "rt/a");
+        assert_eq!(r.anomalies, vec![anomaly]);
     }
 }
 
@@ -775,6 +797,23 @@ fn extended_pid_is_unsupported() {
         &[data(true, PUB, None, Payload::Data(pl_payload(true, pl)))],
     ));
     assert!(r.endpoints.is_empty());
+    assert_eq!(
+        r.anomalies,
+        vec![
+            Anomaly::UnsupportedParameter,
+            Anomaly::AnnouncementWithoutTopic
+        ]
+    );
+    // Parameters before PID_EXTENDED are still used.
+    let pl = Pl::new(true)
+        .string(PID_TOPIC_NAME, "rt/a")
+        .raw(PID_EXTENDED, &[0; 8])
+        .end();
+    let r = report(&dg(
+        S,
+        &[data(true, PUB, None, Payload::Data(pl_payload(true, pl)))],
+    ));
+    assert_eq!(r.endpoints[0].topic, "rt/a");
     assert_eq!(r.anomalies, vec![Anomaly::UnsupportedParameter]);
 }
 
@@ -815,7 +854,7 @@ fn unsupported_encapsulation_is_reported() {
 fn announcement_without_valid_topic() {
     let pl = Pl::new(true)
         .guid(PID_ENDPOINT_GUID, guid_of(X, W_ENT))
-        .raw(PID_TOPIC_NAME, b"\x04\0\0\0rt/a") // no NUL
+        .raw(PID_TOPIC_NAME, b"\x03\0\0\0\xff\xfe\0\0") // not UTF-8
         .raw(PID_ENDPOINT_GUID, &[1; 8]) // too short (and duplicate)
         .end();
     let r = report(&dg(
@@ -830,6 +869,20 @@ fn announcement_without_valid_topic() {
             Anomaly::BadParameterValue(PID_ENDPOINT_GUID),
             Anomaly::AnnouncementWithoutTopic
         ]
+    );
+    // A topic without its NUL is read the way a C-string stack reads it.
+    let pl = Pl::new(true)
+        .guid(PID_ENDPOINT_GUID, guid_of(X, W_ENT))
+        .raw(PID_TOPIC_NAME, b"\x04\0\0\0rt/a") // no NUL
+        .end();
+    let r = report(&dg(
+        S,
+        &[data(true, PUB, None, Payload::Data(pl_payload(true, pl)))],
+    ));
+    assert_eq!(r.endpoints[0].topic, "rt/a");
+    assert_eq!(
+        r.anomalies,
+        vec![Anomaly::NonCanonicalString(PID_TOPIC_NAME)]
     );
 }
 
@@ -849,7 +902,8 @@ fn anomalies_are_capped() {
         )],
     ));
     assert_eq!(r.anomalies.len(), MAX_ANOMALIES);
-    assert_eq!(r.stats.anomalies, 201);
+    // 200 x NonCanonicalString (each an empty name, read leniently).
+    assert_eq!(r.stats.anomalies, 200);
 }
 
 #[test]
@@ -894,7 +948,7 @@ fn frag_pieces(le: bool, payload: &[u8], fs: u16, writer: [u8; 4], sn: u32) -> V
 }
 
 #[test]
-fn data_frag_is_counted_without_reassembler() {
+fn data_frag_without_reassembler_is_counted_and_reassembled_within_the_datagram() {
     let payload = sedp_payload(true, guid_of(X, W_ENT), "rt/big", "T");
     let frags = frag_pieces(true, &payload, 32, PUB, 1);
     let d = dg(S, &frags);
@@ -902,7 +956,13 @@ fn data_frag_is_counted_without_reassembler() {
     assert!(r.fragmented_discovery_seen());
     assert_eq!(r.stats.data_frag as usize, frags.len());
     assert_eq!(r.stats.discovery_data_frag as usize, frags.len());
+    assert_eq!(r.stats.frag_completed, 1);
+    assert_eq!(r.endpoints[0].topic, "rt/big");
+    assert!(r.endpoints[0].from_fragments);
+    // Split over two datagrams: nothing without a reassembler.
+    let r = report(&dg(S, &frags[1..]));
     assert!(r.endpoints.is_empty());
+    assert!(r.fragmented_discovery_seen());
 
     // User-data fragments are not "discovery".
     let d = dg(S, &[data_frag(true, W_ENT, 1, 1, 1, 4, 8, None, &[0; 4])]);
@@ -1009,6 +1069,7 @@ fn reassembler_memory_stays_bounded_under_flood() {
         max_sample_bytes: 8 * 1024,
         max_pending_samples: 8,
         max_total_bytes: 32 * 1024,
+        ..Default::default()
     };
     let mut ra = FragmentReassembler::new(limits);
     for sn in 0..500u32 {
@@ -1162,6 +1223,7 @@ fn mutation_fuzz_never_panics() {
         max_sample_bytes: 4096,
         max_pending_samples: 4,
         max_total_bytes: 8192,
+        ..Default::default()
     };
     let mut ra = FragmentReassembler::new(limits);
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);

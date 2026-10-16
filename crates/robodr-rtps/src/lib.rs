@@ -13,9 +13,11 @@
 //!   full SPDP data ([`SpdpInfo`]: locators, entity name, ROS 2 enclave, domain
 //!   id, vendor, lease), endpoint attribution details ([`EndpointInfo`]),
 //!   dispose/unregister signals ([`EndpointRemoval`], [`ParticipantRemoval`]),
-//!   [`Anomaly`]s and per-submessage [`ParseStats`].
+//!   [`Anomaly`]s, reassembly [`FragmentEvent`]s and per-submessage
+//!   [`ParseStats`].
 //! - [`FragmentReassembler`]: optional, stateful, memory-capped DATA_FRAG
-//!   reassembly for large discovery samples.
+//!   reassembly for large discovery samples, with an eviction policy that
+//!   resists spoofed-prefix floods (see its module docs).
 //! - [`vendor`]: known DDS vendor ids.
 //!
 //! # What is parsed
@@ -62,12 +64,24 @@
 //!
 //! [`parse_datagram`] emits exactly one `Ros2ParticipantDiscovered` per
 //! distinct participant per datagram: the header prefix (always, as before),
-//! each distinct non-zero INFO_SRC prefix, and each SPDP-announced participant;
+//! each distinct non-zero INFO_SRC prefix, and each SPDP-announced participant
+//! (plus the prefixes of any conflicting duplicate `PID_PARTICIPANT_GUID`);
 //! the same prefix seen several ways is merged into one event whose `locators`
 //! are the SPDP unicast locators (metatraffic, then default; UDPv4 as
 //! `a.b.c.d:port`, UDPv6 as `[v6]:port`; other kinds such as shared memory are
 //! not rendered but are kept with their `kind` in [`SpdpInfo`]). Then one
-//! writer/reader event per SEDP announcement. Disposed / unregistered
+//! writer/reader event per *reading* of each SEDP announcement: normally
+//! one, but a sample that repeats `PID_TOPIC_NAME` / `PID_TYPE_NAME` /
+//! `PID_ENDPOINT_GUID` with different values yields one event for the
+//! first-occurrence reading, one for the last-occurrence reading (Fast DDS
+//! overwrites, so last wins there) and one for each other distinct value
+//! (see [`EndpointInfo::alternates`]). So a profile check sees `rt/cmd_vel`
+//! whichever duplicate a stack honours. An announcement whose GUID names a
+//! participant other than its sender (header / INFO_SRC prefix) yields each
+//! reading a second time attributed to the sender (see
+//! [`EndpointInfo::to_endpoints`]): the GUID is unauthenticated, so a rogue
+//! participant cannot hide behind a profiled participant's prefix that way.
+//! Disposed / unregistered
 //! instances (`PID_STATUS_INFO`) produce **no** discovered event; they appear
 //! only in the detailed report. (The header participant of a datagram that
 //! carries its own SPDP dispose is still reported, because it did send the
@@ -78,18 +92,52 @@
 //! Every length is checked against the remaining buffer; nothing is allocated
 //! in proportion to a claimed length (strings, user data and locators are
 //! copied only after they are known to be inside the datagram; reassembly
-//! buffers are capped). Strictness: parameter lengths must be multiples of 4
-//! (§9.4.2.11), parameter lists must end with a sentinel, CDR strings must
-//! carry exactly one trailing NUL and be UTF-8, `octetsToInlineQos` must cover
-//! the fixed fields, protocol major version must be 2. Anything else yields
-//! fewer events plus an [`Anomaly`], never a panic. Duplicate parameters keep
-//! the first value; a conflicting duplicate is an anomaly.
+//! buffers are capped). Work per datagram is linear in its size: source and
+//! participant merging is hash-indexed, values per parameter are capped.
+//! Nothing that names a participant or an endpoint is dropped for being too
+//! many (a cap would let padding hide the one that matters).
+//!
+//! # Leniency: see what the most lenient stack sees
+//!
+//! A detector that is stricter than the DDS stack it protects can be blinded:
+//! the stack acts on an announcement the detector discarded. So where stacks
+//! differ, the parser takes the *superset* and flags the deviation as an
+//! [`Anomaly`] (never silently):
+//!
+//! - parameter length not a multiple of 4 (§9.4.2.11): accepted, next
+//!   parameter read right after it ([`Anomaly::MisalignedParameterLength`]);
+//! - parameter list overrun / missing sentinel / `PID_EXTENDED`: the
+//!   parameters before the fault are used ([`Anomaly::MalformedParameterList`],
+//!   [`Anomaly::UnsupportedParameter`]);
+//! - topic / type names are read as C strings, up to the first NUL, whatever
+//!   the CDR length says (`"rt/cmd_vel\0x\0"` is `rt/cmd_vel`;
+//!   [`Anomaly::NonCanonicalString`]);
+//! - duplicate identifying parameters: all distinct values are kept (see
+//!   Events); other duplicates keep the first value
+//!   ([`Anomaly::ConflictingDuplicateParameter`]);
+//! - protocol major version other than 2: parsed with the 2.x layout
+//!   ([`Anomaly::UnsupportedProtocolVersion`]);
+//! - DATA_FRAG: the stateless functions reassemble samples whose fragments
+//!   all sit in one datagram; [`FragmentReassembler`] also across datagrams.
+//!
+//! Still strict (documented limits): names must be UTF-8 (a stack would take
+//! the raw bytes; such names cannot match a ROS 2 profile entry anyway, but
+//! the endpoint is then not reported, only the anomaly);
+//! `octetsToInlineQos` must cover the fixed fields; an inline QoS list without
+//! a sentinel drops the sample (the payload offset is unknown).
 //!
 //! # Not handled / not verified
 //!
 //! - XCDR2 (`PL_CDR2`) discovery payloads and `PID_EXTENDED` are not decoded
 //!   (reported as anomalies). Vendor-specific PIDs (bit 15) are ignored.
 //! - Protected (DDS-Security encrypted) discovery is opaque; only counted.
+//! - Full impersonation is not detectable from the bytes: a datagram whose
+//!   header prefix *and* GUIDs all name a profiled participant looks exactly
+//!   like that participant. Only the source IP (carried in every
+//!   `Ros2ParticipantDiscovered`) can tell them apart, so binding prefixes to
+//!   commissioned addresses / SPDP locators is the consumer's job.
+//! - UDP checksums are the capture layer's business; a corrupted datagram
+//!   that the kernel would drop is parsed like any other.
 //! - Verified against hand-built datagrams from the spec layout, not yet
 //!   against pcaps from real Fast DDS / Cyclone / Connext stacks.
 //!
@@ -104,17 +152,22 @@ mod wire;
 #[cfg(test)]
 mod discovery_tests;
 #[cfg(test)]
+mod review_regressions;
+#[cfg(test)]
 mod testutil;
 
-pub use frag::{FragmentReassembler, ReassemblyLimits, HARD_MAX_SAMPLE_BYTES};
+pub use frag::{
+    EvictionReason, FragmentEvent, FragmentEventKind, FragmentReassembler, ReassemblyLimits,
+    RejectReason, HARD_MAX_PENDING_SAMPLES, HARD_MAX_SAMPLE_BYTES,
+};
 pub use parse::{
-    Anomaly, Attribution, DatagramReport, DiscoveryTopic, EndpointInfo, EndpointKind,
-    EndpointRemoval, EntityId, Guid, GuidPrefix, ParseStats, ParticipantRemoval, RtpsDuration,
-    RtpsHeader, SpdpInfo, StatusInfo, ENTITYID_PARTICIPANT,
+    Anomaly, Attribution, DatagramReport, DiscoveryTopic, EndpointAlternate, EndpointInfo,
+    EndpointKind, EndpointRemoval, EntityId, Guid, GuidPrefix, ParseStats, ParticipantRemoval,
+    RtpsDuration, RtpsHeader, SpdpInfo, StatusInfo, ENTITYID_PARTICIPANT,
     ENTITYID_SEDP_PUBLICATIONS_SECURE_WRITER, ENTITYID_SEDP_PUBLICATIONS_WRITER,
     ENTITYID_SEDP_SUBSCRIPTIONS_SECURE_WRITER, ENTITYID_SEDP_SUBSCRIPTIONS_WRITER,
     ENTITYID_SPDP_SECURE_WRITER, ENTITYID_SPDP_WRITER, GUIDPREFIX_UNKNOWN, MAX_ANOMALIES,
-    MAX_LOCATORS_PER_LIST,
+    MAX_FRAGMENT_EVENTS, MAX_LOCATORS_PER_LIST, MAX_PARAMETER_VALUES,
 };
 pub use wire::{Locator, LOCATOR_KIND_INVALID, LOCATOR_KIND_UDPV4, LOCATOR_KIND_UDPV6};
 
@@ -138,8 +191,10 @@ pub fn guid_prefix(datagram: &[u8]) -> Option<GuidPrefix> {
 
 /// Parse one RTPS datagram into robot events: one participant event per
 /// distinct participant, then one writer or reader event per SEDP endpoint
-/// announcement. Stateless: DATA_FRAG is counted but not reassembled (use
-/// [`FragmentReassembler::parse_datagram`] for that). Non-RTPS input -> empty.
+/// announcement. Stateless: DATA_FRAG samples are reassembled only when all
+/// their fragments are in this datagram (use
+/// [`FragmentReassembler::parse_datagram`] for samples spread over several).
+/// Non-RTPS input -> empty.
 pub fn parse_datagram(datagram: &[u8], src_ip: &str) -> Vec<RobotEvent> {
     parse_datagram_detailed(datagram)
         .map(|r| r.to_events(src_ip))
@@ -147,7 +202,7 @@ pub fn parse_datagram(datagram: &[u8], src_ip: &str) -> Vec<RobotEvent> {
 }
 
 /// Parse one RTPS datagram into a full [`DatagramReport`]. `None` if it is
-/// not RTPS. Stateless (no DATA_FRAG reassembly).
+/// not RTPS. Stateless (DATA_FRAG reassembled within this datagram only).
 pub fn parse_datagram_detailed(datagram: &[u8]) -> Option<DatagramReport> {
     parse::parse(datagram, None)
 }
@@ -300,14 +355,22 @@ mod tests {
             guid(0xcc),
         ));
         let events = parse_datagram(&d, "10.0.0.5");
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
         match &events[1] {
             RobotEvent::Ros2WriterDiscovered(e) => {
                 assert_eq!(e.topic, "rt/cmd_vel");
                 assert_eq!(e.ros_topic(), "/cmd_vel");
                 assert_eq!(e.type_name, "geometry_msgs::msg::dds_::Twist_");
-                // The endpoint GUID wins over the sender's header prefix.
+                // The endpoint GUID is the owner ...
                 assert_eq!(e.guid_prefix, "cccccccccccccccccccccccc");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        // ... and, as the GUID is unauthenticated, the sender is judged too.
+        match &events[2] {
+            RobotEvent::Ros2WriterDiscovered(e) => {
+                assert_eq!(e.topic, "rt/cmd_vel");
+                assert_eq!(e.guid_prefix, "aaaaaaaaaaaaaaaaaaaaaaaa");
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -402,7 +465,8 @@ mod tests {
         }
         let mut d = header;
         d.extend(wrap_data(&body));
-        assert_eq!(parse_datagram(&d, "10.0.0.5").len(), 2);
+        // Participant + writer (owner 0xcc) + writer attributed to the sender.
+        assert_eq!(parse_datagram(&d, "10.0.0.5").len(), 3);
     }
 
     #[test]

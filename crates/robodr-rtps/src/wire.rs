@@ -110,8 +110,7 @@ pub(crate) enum PlEnd {
     Open,
     /// Clean end: a PID_SENTINEL was read.
     Sentinel,
-    /// The buffer ended without a sentinel, a length ran past the buffer, or a
-    /// length was not a multiple of 4 (§9.4.2.11 requires 4-byte alignment).
+    /// The buffer ended without a sentinel, or a length ran past the buffer.
     Malformed,
     /// PID_EXTENDED: framing we deliberately do not follow.
     Unsupported,
@@ -121,11 +120,17 @@ pub(crate) enum PlEnd {
 /// sentinel, the end of the buffer, or a length that does not fit. PID_PAD
 /// entries are skipped. After iteration, [`ParameterList::end`] says how it
 /// ended and [`ParameterList::pos`] is the offset just past the sentinel.
+///
+/// Lenient like the stacks we must agree with: a parameter length that is not
+/// a multiple of 4 (§9.4.2.11 requires alignment) is accepted, the next
+/// parameter is read exactly `length` octets later (what Fast DDS does), and
+/// [`ParameterList::misaligned`] records it so the caller can flag it.
 pub(crate) struct ParameterList<'a> {
     buf: &'a [u8],
     pos: usize,
     le: bool,
     end: PlEnd,
+    misaligned: bool,
 }
 
 impl<'a> ParameterList<'a> {
@@ -135,11 +140,17 @@ impl<'a> ParameterList<'a> {
             pos,
             le,
             end: PlEnd::Open,
+            misaligned: false,
         }
     }
 
     pub(crate) fn end(&self) -> PlEnd {
         self.end
+    }
+
+    /// A parameter length was not a multiple of 4.
+    pub(crate) fn misaligned(&self) -> bool {
+        self.misaligned
     }
 
     pub(crate) fn pos(&self) -> usize {
@@ -174,8 +185,7 @@ impl<'a> Iterator for ParameterList<'a> {
             }
             let plen = plen as usize;
             if !plen.is_multiple_of(4) {
-                self.end = PlEnd::Malformed;
-                return None;
+                self.misaligned = true;
             }
             let end = start + plen;
             if end > self.buf.len() {
@@ -205,6 +215,25 @@ pub(crate) fn cdr_string(value: &[u8], le: bool) -> Option<String> {
         return None;
     }
     std::str::from_utf8(text).ok().map(str::to_owned)
+}
+
+/// A CDR string read the way a C-string based stack reads it: the text runs
+/// from after the u32 length up to the first NUL in the parameter value (or
+/// to the end of the value if there is none); the length field is ignored.
+/// Fast DDS reads topic and type names this way, so `"rt/cmd_vel\0x\0"` is
+/// `rt/cmd_vel` to it. Returns the text and whether the encoding was
+/// canonical (i.e. [`cdr_string`] accepts it and yields the same text).
+/// `None` only if there is no length field or the text is not UTF-8.
+pub(crate) fn cdr_string_lenient(value: &[u8], le: bool) -> Option<(String, bool)> {
+    read_u32(value, 0, le)?;
+    let rest = value.get(4..)?;
+    let text = match rest.iter().position(|&b| b == 0) {
+        Some(n) => &rest[..n],
+        None => rest,
+    };
+    let text = std::str::from_utf8(text).ok()?;
+    let canonical = cdr_string(value, le).as_deref() == Some(text);
+    Some((text.to_owned(), canonical))
 }
 
 /// A CDR `sequence<octet>`: u32 length, then the bytes. Borrowed, never copied.
@@ -355,11 +384,19 @@ mod tests {
     }
 
     #[test]
-    fn parameter_list_rejects_misaligned_length() {
-        let buf = pl(true, &[(0x0005, &[1, 2, 3])], true);
+    fn parameter_list_accepts_misaligned_length_and_flags_it() {
+        // Length 3, the next parameter follows immediately (no padding).
+        let buf = pl(true, &[(0x0005, &[1, 2, 3]), (0x0007, &[9; 4])], true);
         let mut it = ParameterList::new(&buf, 0, true);
+        assert_eq!(it.next(), Some((0x0005, &[1u8, 2, 3][..])));
+        assert_eq!(it.next(), Some((0x0007, &[9u8; 4][..])));
         assert_eq!(it.next(), None);
-        assert_eq!(it.end(), PlEnd::Malformed);
+        assert_eq!(it.end(), PlEnd::Sentinel);
+        assert!(it.misaligned());
+        let aligned = pl(true, &[(0x0005, &[1, 2, 3, 4])], true);
+        let mut it = ParameterList::new(&aligned, 0, true);
+        for _ in it.by_ref() {}
+        assert!(!it.misaligned());
     }
 
     #[test]
@@ -415,6 +452,32 @@ mod tests {
         let mut be = 4u32.to_be_bytes().to_vec();
         be.extend_from_slice(b"xyz\0");
         assert_eq!(cdr_string(&be, false).as_deref(), Some("xyz"));
+    }
+
+    #[test]
+    fn cdr_string_lenient_reads_like_a_c_string() {
+        let mk = |n: u32, b: &[u8]| {
+            let mut v = n.to_le_bytes().to_vec();
+            v.extend_from_slice(b);
+            v
+        };
+        let l = |v: &[u8]| cdr_string_lenient(v, true);
+        assert_eq!(l(&mk(4, b"abc\0")), Some(("abc".into(), true)));
+        assert_eq!(l(&mk(1, b"\0\0\0\0")), Some(("".into(), true)));
+        // Embedded NUL: the C-string view stops there.
+        assert_eq!(
+            l(&mk(13, b"rt/cmd_vel\0x\0\0\0\0")),
+            Some(("rt/cmd_vel".into(), false))
+        );
+        // Length field lies (too short, zero, too long): ignored.
+        assert_eq!(l(&mk(3, b"abc\0")), Some(("abc".into(), false)));
+        assert_eq!(l(&mk(0, b"abc\0")), Some(("abc".into(), false)));
+        assert_eq!(l(&mk(u32::MAX, b"abc\0")), Some(("abc".into(), false)));
+        // No NUL at all: the whole value.
+        assert_eq!(l(&mk(4, b"rt/a")), Some(("rt/a".into(), false)));
+        assert_eq!(l(&mk(4, b"")), Some(("".into(), false)));
+        assert_eq!(l(&[1, 2]), None, "no length field");
+        assert_eq!(l(&mk(3, &[0xff, 0xfe, 0])), None, "not utf-8");
     }
 
     #[test]
