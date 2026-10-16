@@ -161,6 +161,7 @@ impl<'a> World<'a> {
                         linear: lin,
                         angular: ang,
                         joint_speed_max: None,
+                        direction_known: true,
                     };
                     mon.on_command(&c, |f| findings.push(f));
                 }
@@ -824,7 +825,11 @@ fn motion_during_declared_estop_after_grace_is_uncommanded() {
 // ------------------------------------------------------- hostile / integrity
 
 #[test]
-fn non_finite_feedback_is_reported_once_and_ignored() {
+fn non_finite_feedback_is_reported_once_then_escalated_while_moving() {
+    // One second of NaN odometry / -inf gyro while driving: one Medium per
+    // source/axis on the first bad value, then one High once the NaN rate
+    // over the last 64 samples is high while the robot is moving (NaN
+    // blinds every motion check). Nothing else fires.
     let sensors = |t: f64, i: Truth, a: Truth, r: &mut Rng, out: &mut Vec<FeedbackSample>| {
         honest(t, i, a, r, out);
         if (5.0..6.0).contains(&t) {
@@ -857,9 +862,27 @@ fn non_finite_feedback_is_reported_once_and_ignored() {
                 },
                 Severity::Medium
             ),
+            (
+                Evidence::NonFiniteRate {
+                    source: FeedbackSource::WheelOdometry,
+                    axis: Axis::Linear,
+                    invalid: 7,
+                    window: 64
+                },
+                Severity::High
+            ),
+            (
+                Evidence::NonFiniteRate {
+                    source: FeedbackSource::Imu,
+                    axis: Axis::Angular,
+                    invalid: 7,
+                    window: 64
+                },
+                Severity::High
+            ),
         ]
     );
-    assert_eq!(f.len(), 2, "{f:#?}");
+    assert_eq!(f.len(), 4, "{f:#?}");
 }
 
 #[test]
@@ -886,6 +909,7 @@ fn non_finite_and_huge_commands_do_not_panic() {
                 linear: Some(v),
                 angular: Some(v),
                 joint_speed_max: Some(v),
+                direction_known: true,
             },
             |_| n += 1,
         );
@@ -963,6 +987,7 @@ fn hostile_random_event_stream_never_panics() {
                         linear: pick(&mut rng),
                         angular: pick(&mut rng),
                         joint_speed_max: pick(&mut rng),
+                        direction_known: true,
                     },
                     |_| count += 1,
                 ),
@@ -1041,6 +1066,7 @@ fn many_updates_do_not_grow_the_ring() {
                 linear: Some((k % 50) as f64 / 50.0),
                 angular: Some(0.0),
                 joint_speed_max: None,
+                direction_known: true,
             },
             |_| n += 1,
         );
@@ -1082,6 +1108,7 @@ fn manipulator_joint_tracking_and_uncommanded_joint_motion() {
                 linear: None,
                 angular: None,
                 joint_speed_max: Some(cmd),
+                direction_known: true,
             },
             |x| f.push(x),
         );

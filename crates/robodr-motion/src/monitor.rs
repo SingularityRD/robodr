@@ -6,10 +6,14 @@
 //! Findings are handed to a caller-supplied sink as plain `Copy` values;
 //! turning one into a [`Deviation`] (which owns a `String`) is the caller's
 //! choice and happens off the per-sample path.
+//!
+//! Feedback state is kept per **(source type, publisher)** in a fixed table
+//! of [`PUBLISHER_SLOTS`] slots per source type, so a second publisher on the
+//! same topic cannot reset or dilute the real publisher's detector state.
 
 use crate::config::{ConfigError, MonitorConfig, Persistence};
 use crate::model::{first_order_step, CmdRec, CommandRing};
-use crate::sample::{Axis, CommandSample, FeedbackSample, FeedbackSource};
+use crate::sample::{Axis, CommandSample, FeedbackSample, FeedbackSource, PUBLISHER_UNKNOWN};
 use robodr_events::{Deviation, Severity};
 use serde::{Deserialize, Serialize};
 
@@ -25,11 +29,23 @@ pub mod rules {
     pub const CROSS_SENSOR_DISAGREEMENT: &str = "robot.motion.cross_sensor_disagreement";
     /// Feedback carried NaN / infinity.
     pub const INVALID_FEEDBACK: &str = "robot.motion.invalid_feedback";
+    /// More than one publisher interleaves samples for the same feedback
+    /// source type.
+    pub const MULTIPLE_FEEDBACK_PUBLISHERS: &str = "robot.motion.multiple_feedback_publishers";
+    /// One feedback stream repeatedly jumps between values faster than the
+    /// platform can accelerate: two streams interleaved under one
+    /// (unattributed) publisher identity, or a corrupted driver.
+    pub const INCONSISTENT_FEEDBACK_STREAM: &str = "robot.motion.inconsistent_feedback_stream";
 }
+
+/// Distinct publishers tracked per feedback source type. Further publishers
+/// share the last slot (counted in [`MonitorStats::publisher_overflow`]).
+pub const PUBLISHER_SLOTS: usize = 4;
 
 const N_SRC: usize = 5;
 const N_AXIS: usize = 3;
-const N_PAIR: usize = N_SRC * (N_SRC - 1) / 2;
+const N_ENT: usize = N_SRC * PUBLISHER_SLOTS;
+const N_EPAIR: usize = N_ENT * (N_ENT - 1) / 2;
 const NS_PER_S: f64 = 1e9;
 
 /// Which way feedback left the expected band.
@@ -130,6 +146,39 @@ pub enum Evidence {
         source: FeedbackSource,
         axis: Axis,
     },
+    /// Sustained rate of non-finite values while motion is expected or
+    /// observed (NaN used to blind the detector).
+    NonFiniteRate {
+        source: FeedbackSource,
+        axis: Axis,
+        /// Non-finite samples in the window.
+        invalid: u32,
+        /// Window size (samples, at most 64).
+        window: u32,
+    },
+    /// A publisher resumed after another one published for the same source
+    /// type: two concurrent publishers.
+    MultiplePublishers {
+        source: FeedbackSource,
+        publisher: u32,
+        other: u32,
+        /// Publishers active within `publisher_expiry_ns`.
+        active: u32,
+    },
+    /// Repeated physically implausible jumps within one (source, publisher)
+    /// stream.
+    InconsistentStream {
+        source: FeedbackSource,
+        axis: Axis,
+        /// Implausible jumps in the episode so far.
+        jumps: u32,
+        /// The jump that fired: previous and current value.
+        from: f64,
+        to: f64,
+        /// |to - from| / dt, units/s^2.
+        implied_rate: f64,
+        since_ns: u64,
+    },
     CrossSensorDisagreement {
         axis: Axis,
         source_a: FeedbackSource,
@@ -153,6 +202,10 @@ pub struct Finding {
     pub severity: Severity,
     pub t_ns: u64,
     pub evidence: Evidence,
+    /// Publisher id of the feedback sample that triggered the finding, if
+    /// it came from one ([`PUBLISHER_UNKNOWN`] when the caller used
+    /// [`ConsistencyMonitor::on_feedback`]).
+    pub publisher: Option<u32>,
 }
 
 impl Finding {
@@ -162,6 +215,16 @@ impl Finding {
             ns / 1_000_000
         }
         let age = |since: u64| ms(self.t_ns.saturating_sub(since));
+        let mut s = self.detail_core(age, ms);
+        if let Some(p) = self.publisher {
+            if p != PUBLISHER_UNKNOWN {
+                s.push_str(&format!(" [publisher {p:#010x}]"));
+            }
+        }
+        s
+    }
+
+    fn detail_core(&self, age: impl Fn(u64) -> u64, ms: fn(u64) -> u64) -> String {
         match self.evidence {
             Evidence::FeedbackDivergence {
                 source,
@@ -267,6 +330,54 @@ impl Finding {
                 source.as_str(),
                 axis.as_str()
             ),
+            Evidence::NonFiniteRate {
+                source,
+                axis,
+                invalid,
+                window,
+            } => format!(
+                "{} {} feedback NaN/infinite in {} of the last {} samples while the robot \
+                 is moving or should be: invalid values blinding motion checks",
+                source.as_str(),
+                axis.as_str(),
+                invalid,
+                window
+            ),
+            Evidence::MultiplePublishers {
+                source,
+                publisher,
+                other,
+                active,
+            } => format!(
+                "{} feedback from {} interleaved publishers (publisher {:#010x} resumed after \
+                 {:#010x}): possible injected second publisher",
+                source.as_str(),
+                active,
+                publisher,
+                other
+            ),
+            Evidence::InconsistentStream {
+                source,
+                axis,
+                jumps,
+                from,
+                to,
+                implied_rate,
+                since_ns,
+            } => format!(
+                "{} {} feedback jumped implausibly {} times in {} ms (last {:.3} -> {:.3} {}, \
+                 implied {:.1} {}/s): two interleaved publishers on one stream, or corrupted \
+                 telemetry",
+                source.as_str(),
+                axis.as_str(),
+                jumps,
+                age(since_ns),
+                from,
+                to,
+                axis.unit(),
+                implied_rate,
+                axis.unit()
+            ),
             Evidence::CrossSensorDisagreement {
                 axis,
                 source_a,
@@ -322,49 +433,71 @@ pub struct MonitorStats {
     /// `command_capacity`.
     pub history_underruns: u64,
     pub findings: u64,
+    /// Non-finite feedback values (dropped).
+    pub invalid_feedback_values: u64,
+    /// Feedback from a publisher beyond [`PUBLISHER_SLOTS`] for its source
+    /// type (shares the last slot).
+    pub publisher_overflow: u64,
 }
 
+/// Episode-based persistence (see [`Persistence`]): an episode starts at
+/// the first bad sample and ends after `clear_samples` consecutive good
+/// ones; interleaved good samples only dilute the bad fraction.
 #[derive(Debug, Clone, Copy, Default)]
 struct Persist {
     since: Option<u64>,
-    count: u32,
+    bad: u32,
+    total: u32,
+    good_run: u32,
     fired: bool,
-    clear: u32,
 }
 
 impl Persist {
-    /// Feed one observation. Returns `Some((since, count))` exactly once per
-    /// episode, when the condition first satisfies the persistence rule.
+    /// Feed one observation. Returns `Some((since, bad_samples))` exactly
+    /// once per episode, when the condition first satisfies the rule.
     fn observe(&mut self, bad: bool, now: u64, p: &Persistence) -> Option<(u64, u32)> {
         if bad {
-            self.clear = 0;
-            let since = *self.since.get_or_insert(now);
-            self.count = self.count.saturating_add(1);
+            self.good_run = 0;
+            let since = match self.since {
+                Some(s) => s,
+                None => {
+                    self.bad = 0;
+                    self.total = 0;
+                    self.since = Some(now);
+                    now
+                }
+            };
+            self.bad = self.bad.saturating_add(1);
+            self.total = self.total.saturating_add(1);
             if !self.fired
-                && self.count >= p.min_samples
+                && self.bad >= p.min_samples
                 && now.saturating_sub(since) >= p.min_duration_ns
+                && f64::from(self.bad) >= p.min_bad_fraction * f64::from(self.total)
             {
                 self.fired = true;
-                return Some((since, self.count));
+                return Some((since, self.bad));
             }
         } else {
-            self.since = None;
-            self.count = 0;
-            if self.fired {
-                self.clear = self.clear.saturating_add(1);
-                if self.clear >= p.clear_samples {
-                    self.fired = false;
-                    self.clear = 0;
-                }
+            self.good_run = self.good_run.saturating_add(1);
+            if self.since.is_some() {
+                self.total = self.total.saturating_add(1);
+            }
+            if self.good_run >= p.clear_samples {
+                self.since = None;
+                self.bad = 0;
+                self.total = 0;
+                self.fired = false;
             }
         }
         None
     }
 
-    /// Break the run without counting as a good sample (no basis to judge).
+    /// End the episode without counting a good sample (no basis to judge:
+    /// warm-up, settling, stale partner). A latched finding stays latched.
     fn interrupt(&mut self) {
         self.since = None;
-        self.count = 0;
+        self.bad = 0;
+        self.total = 0;
     }
 }
 
@@ -395,22 +528,51 @@ impl Latch {
     }
 }
 
+/// Per source type, across publishers (staleness, publisher interleaving).
 #[derive(Debug, Clone, Copy, Default)]
-struct SourceState {
+struct SourceAgg {
     seen: bool,
-    last_stamp: Option<u64>,
     last_rx: u64,
     reported: [bool; N_AXIS],
-    /// Latest finite value per axis and when it was received.
+    stale_latched: bool,
+    last_pub: Option<u32>,
+    multi_latched: bool,
+    multi_clean: u32,
+}
+
+/// Per (source type, publisher) slot.
+#[derive(Debug, Clone, Copy, Default)]
+struct EntityState {
+    publisher: Option<u32>,
+    seen: bool,
+    last_rx: u64,
+    last_stamp: Option<u64>,
+    /// Latest finite value per axis (normalised) and when it was received.
     last_val: [Option<(f64, u64)>; N_AXIS],
-    /// Bit patterns of the previous sample's raw values.
+    /// Bit patterns of the previous all-finite sample's raw values.
     prev_bits: Option<[Option<u64>; N_AXIS]>,
     frozen_count: u32,
     frozen_since: u64,
     frozen_latched: bool,
-    stale_latched: bool,
     stamp_latch: [Latch; 4],
     nonfinite_latch: [Latch; N_AXIS],
+    /// Last 64 samples per axis, bit set = non-finite.
+    nan_hist: [u64; N_AXIS],
+    nan_n: [u8; N_AXIS],
+    nan_rate_latched: [bool; N_AXIS],
+    /// Previous finite value per axis (normalised), its stamp and arrival.
+    prev_fin: [Option<(f64, u64, u64)>; N_AXIS],
+    jump: [JumpEpisode; N_AXIS],
+}
+
+/// Implausible-jump episode: ends after `jump_window_ns` without a jump
+/// (time-based, so interleaved good samples cannot end it).
+#[derive(Debug, Clone, Copy, Default)]
+struct JumpEpisode {
+    since: u64,
+    last: Option<u64>,
+    count: u32,
+    fired: bool,
 }
 
 /// The model is run twice, at the two ends of the latency window; the
@@ -432,16 +594,31 @@ pub struct ConsistencyMonitor {
     suppress_until: [u64; N_AXIS],
     stop_active: bool,
     stop_changed_at: Option<u64>,
-    src: [SourceState; N_SRC],
-    div: [[Persist; N_AXIS]; N_SRC],
-    unc: [[Persist; N_AXIS]; N_SRC],
-    cross: [[Persist; N_AXIS]; N_PAIR],
+    agg: [SourceAgg; N_SRC],
+    /// Indexed by entity `source * PUBLISHER_SLOTS + slot`.
+    ent: [EntityState; N_ENT],
+    div: [[Persist; N_AXIS]; N_ENT],
+    unc: [[Persist; N_AXIS]; N_ENT],
+    /// Indexed by entity pair; boxed (allocated once in `new`) to keep the
+    /// monitor small to move.
+    cross: Box<[[Persist; N_AXIS]; N_EPAIR]>,
     stats: MonitorStats,
 }
 
 fn pair_index(i: usize, j: usize) -> usize {
     let (i, j) = if i < j { (i, j) } else { (j, i) };
-    i * (2 * N_SRC - i - 1) / 2 + (j - i - 1)
+    i * (2 * N_ENT - i - 1) / 2 + (j - i - 1)
+}
+
+/// `[lo, hi]` mapped to the band of magnitudes it implies.
+fn abs_band(lo: f64, hi: f64) -> (f64, f64) {
+    if lo >= 0.0 {
+        (lo, hi)
+    } else if hi <= 0.0 {
+        (-hi, -lo)
+    } else {
+        (0.0, (-lo).max(hi))
+    }
 }
 
 fn secs_to_ns(s: f64) -> u64 {
@@ -474,10 +651,11 @@ impl ConsistencyMonitor {
             suppress_until: [0; N_AXIS],
             stop_active: false,
             stop_changed_at: None,
-            src: [SourceState::default(); N_SRC],
-            div: [[Persist::default(); N_AXIS]; N_SRC],
-            unc: [[Persist::default(); N_AXIS]; N_SRC],
-            cross: [[Persist::default(); N_AXIS]; N_PAIR],
+            agg: [SourceAgg::default(); N_SRC],
+            ent: [EntityState::default(); N_ENT],
+            div: [[Persist::default(); N_AXIS]; N_ENT],
+            unc: [[Persist::default(); N_AXIS]; N_ENT],
+            cross: Box::new([[Persist::default(); N_AXIS]; N_EPAIR]),
             stats: MonitorStats::default(),
         })
     }
@@ -522,11 +700,12 @@ impl ConsistencyMonitor {
         }
         let t = self.clamp_time(cmd.t_ns);
         self.advance_to(t);
+        let signed = cmd.direction_known && !self.cfg.compare_magnitudes;
         let mut v = [None; N_AXIS];
         for a in Axis::ALL {
             v[a.index()] = cmd.axis(a).map(|x| {
                 if x.is_finite() {
-                    self.normalise(a, x)
+                    self.normalise(a, signed, x)
                 } else {
                     self.stats.invalid_command_values =
                         self.stats.invalid_command_values.saturating_add(1);
@@ -534,7 +713,7 @@ impl ConsistencyMonitor {
                 }
             });
         }
-        if let Some(ev) = self.ring.push(CmdRec { t, v }) {
+        if let Some(ev) = self.ring.push(CmdRec { t, v, signed }) {
             if ev.t > t.saturating_sub(self.cfg.latency_max_ns) {
                 self.stats.history_underruns = self.stats.history_underruns.saturating_add(1);
             }
@@ -563,10 +742,23 @@ impl ConsistencyMonitor {
         self.check_stale(t, &mut sink);
     }
 
-    /// Process one feedback sample received at observer time `now_ns`.
-    pub fn on_feedback<F: FnMut(Finding)>(
+    /// Process one feedback sample received at observer time `now_ns`, from
+    /// an unknown / single publisher ([`PUBLISHER_UNKNOWN`]). Prefer
+    /// [`Self::on_feedback_from`] whenever the publisher identity is known.
+    pub fn on_feedback<F: FnMut(Finding)>(&mut self, now_ns: u64, fb: &FeedbackSample, sink: F) {
+        self.on_feedback_from(now_ns, PUBLISHER_UNKNOWN, fb, sink);
+    }
+
+    /// Process one feedback sample received at observer time `now_ns` from
+    /// publisher `publisher` (an interned id or [`crate::publisher_id`] of
+    /// the DDS writer GUID). All per-sample state (stamps, frozen, NaN,
+    /// command and cross-sensor persistence) is kept per (source type,
+    /// publisher), and publishers interleaving on one source type raise
+    /// `robot.motion.multiple_feedback_publishers`.
+    pub fn on_feedback_from<F: FnMut(Finding)>(
         &mut self,
         now_ns: u64,
+        publisher: u32,
         fb: &FeedbackSample,
         mut sink: F,
     ) {
@@ -576,10 +768,15 @@ impl ConsistencyMonitor {
         let si = fb.source.index();
         let sc = *self.cfg.sources.get(fb.source);
         let rearm = self.cfg.rearm_clean_samples;
+        let e = si * PUBLISHER_SLOTS + self.slot_for(si, publisher, now);
+        let pubtag = Some(publisher);
 
-        // 1. Stamp integrity.
+        // 0. Publisher interleaving.
+        self.check_publishers(si, e, publisher, now, fb.source, &mut sink);
+
+        // 1. Stamp integrity (per publisher).
         if sc.stamp_check {
-            let prev = self.src[si].last_stamp;
+            let prev = self.ent[e].last_stamp;
             let anomaly = match prev {
                 Some(p) if fb.t_ns < p => Some(StampAnomaly::Backwards),
                 _ if fb.t_ns > now.saturating_add(self.cfg.max_future_skew_ns) => {
@@ -593,11 +790,11 @@ impl ConsistencyMonitor {
             };
             for k in 0..4 {
                 if anomaly.map(|a| a.index()) != Some(k) {
-                    self.src[si].stamp_latch[k].ok(rearm);
+                    self.ent[e].stamp_latch[k].ok(rearm);
                 }
             }
             if let Some(a) = anomaly {
-                if self.src[si].stamp_latch[a.index()].trip() {
+                if self.ent[e].stamp_latch[a.index()].trip() {
                     let sev = match a {
                         StampAnomaly::Backwards | StampAnomaly::Future => Severity::High,
                         StampAnomaly::Duplicate | StampAnomaly::Late => Severity::Medium,
@@ -614,24 +811,35 @@ impl ConsistencyMonitor {
                             prev_stamp_ns: prev,
                             now_ns: now,
                         },
+                        pubtag,
                     );
                 }
                 if a == StampAnomaly::Duplicate {
                     // A duplicate carries no new information; counting it
                     // would inflate persistence.
                     self.stats.duplicates_skipped = self.stats.duplicates_skipped.saturating_add(1);
+                    self.ent[e].last_rx = now;
                     return;
                 }
             }
         }
-        self.src[si].last_stamp = Some(fb.t_ns);
-        self.src[si].seen = true;
-        self.src[si].last_rx = now;
-        self.src[si].stale_latched = false;
+        {
+            let st = &mut self.ent[e];
+            st.last_stamp = Some(fb.t_ns);
+            st.seen = true;
+            st.last_rx = now;
+            let ag = &mut self.agg[si];
+            ag.seen = true;
+            ag.last_rx = now;
+            ag.stale_latched = false;
+        }
 
-        // 2. Sanitise values.
+        // 2. Sanitise values. A non-finite value is skipped: it is neither a
+        //    good nor a bad sample, so it cannot reset persistence, and the
+        //    last finite value stays available to the cross-check.
         let mut vals = [None; N_AXIS];
         let mut bits = [None; N_AXIS];
+        let mut any_invalid = false;
         for a in Axis::ALL {
             let ai = a.index();
             if !self.cfg.axis(a).enabled {
@@ -639,21 +847,19 @@ impl ConsistencyMonitor {
             }
             let Some(raw) = fb.axis(a) else { continue };
             if raw.is_finite() {
-                // Only finite values take part in the frozen check: a constant
-                // NaN/inf stream is already reported as invalid.
                 bits[ai] = Some(raw.to_bits());
-                self.src[si].nonfinite_latch[ai].ok(rearm);
-                let v = self.normalise(a, raw);
+                self.ent[e].nonfinite_latch[ai].ok(rearm);
+                let v = self.normalise(a, sc.signed, raw);
                 vals[ai] = Some(v);
-                self.src[si].reported[ai] = true;
-                self.src[si].last_val[ai] = Some((v, now));
+                self.agg[si].reported[ai] = true;
+                self.ent[e].last_val[ai] = Some((v, now));
+                self.check_jump(e, a, v, fb.t_ns, now, fb.source, pubtag, &mut sink);
+                self.nan_window(e, a, false, now, fb.source, pubtag, &mut sink);
             } else {
-                // Unusable value: drop it and break persistence runs so stale
-                // context is not stitched across the gap.
-                self.src[si].last_val[ai] = None;
-                self.div[si][ai].interrupt();
-                self.unc[si][ai].interrupt();
-                if self.src[si].nonfinite_latch[ai].trip() {
+                any_invalid = true;
+                self.stats.invalid_feedback_values =
+                    self.stats.invalid_feedback_values.saturating_add(1);
+                if self.ent[e].nonfinite_latch[ai].trip() {
                     self.emit(
                         &mut sink,
                         rules::INVALID_FEEDBACK,
@@ -663,27 +869,42 @@ impl ConsistencyMonitor {
                             source: fb.source,
                             axis: a,
                         },
+                        pubtag,
                     );
                 }
+                self.nan_window(e, a, true, now, fb.source, pubtag, &mut sink);
             }
         }
 
-        // 3. Frozen values (bit-identical while commanded to move).
-        if sc.frozen_check {
-            self.check_frozen(si, fb.source, now, bits, &mut sink);
+        // 3. Frozen values (bit-identical while commanded to move). A sample
+        //    with a non-finite value is skipped entirely, so sprinkling NaN
+        //    cannot break a frozen run either.
+        if !any_invalid {
+            if sc.frozen_check {
+                self.check_frozen(e, fb.source, now, bits, pubtag, &mut sink);
+            }
+            self.ent[e].prev_bits = Some(bits);
         }
-        self.src[si].prev_bits = Some(bits);
 
         // 4. Against the command model.
         if sc.command_check {
             for a in Axis::ALL {
-                self.check_command(si, fb.source, a, vals[a.index()], now, &mut sink);
+                self.check_command(
+                    e,
+                    &sc,
+                    fb.source,
+                    a,
+                    vals[a.index()],
+                    now,
+                    pubtag,
+                    &mut sink,
+                );
             }
         }
 
         // 5. Cross-sensor.
         if sc.cross_check {
-            self.check_cross(si, fb.source, vals, now, &mut sink);
+            self.check_cross(e, fb.source, sc.signed, vals, now, pubtag, &mut sink);
         }
 
         self.check_stale(now, &mut sink);
@@ -698,6 +919,7 @@ impl ConsistencyMonitor {
         severity: Severity,
         t_ns: u64,
         evidence: Evidence,
+        publisher: Option<u32>,
     ) {
         self.stats.findings = self.stats.findings.saturating_add(1);
         sink(Finding {
@@ -705,15 +927,222 @@ impl ConsistencyMonitor {
             severity,
             t_ns,
             evidence,
+            publisher,
         });
     }
 
-    fn normalise(&self, a: Axis, x: f64) -> f64 {
-        if a == Axis::Joint || self.cfg.compare_magnitudes {
+    /// Signed value, or its magnitude when the axis/input has no sign.
+    fn normalise(&self, a: Axis, signed: bool, x: f64) -> f64 {
+        if a == Axis::Joint || !signed || self.cfg.compare_magnitudes {
             x.abs()
         } else {
             x
         }
+    }
+
+    /// The state slot for `publisher` on source `si`: its own slot, else a
+    /// free or expired one (reset), else the shared overflow slot.
+    fn slot_for(&mut self, si: usize, publisher: u32, now: u64) -> usize {
+        let base = si * PUBLISHER_SLOTS;
+        if let Some(k) =
+            (0..PUBLISHER_SLOTS).find(|&k| self.ent[base + k].publisher == Some(publisher))
+        {
+            return k;
+        }
+        let expiry = self.cfg.publisher_expiry_ns;
+        for k in 0..PUBLISHER_SLOTS {
+            let st = &self.ent[base + k];
+            if st.publisher.is_none() || now.saturating_sub(st.last_rx) > expiry {
+                self.reset_entity(base + k);
+                self.ent[base + k].publisher = Some(publisher);
+                return k;
+            }
+        }
+        self.stats.publisher_overflow = self.stats.publisher_overflow.saturating_add(1);
+        PUBLISHER_SLOTS - 1
+    }
+
+    fn reset_entity(&mut self, e: usize) {
+        self.ent[e] = EntityState::default();
+        self.div[e] = [Persist::default(); N_AXIS];
+        self.unc[e] = [Persist::default(); N_AXIS];
+        for o in 0..N_ENT {
+            if o != e {
+                self.cross[pair_index(e, o)] = [Persist::default(); N_AXIS];
+            }
+        }
+    }
+
+    /// Raise `multiple_feedback_publishers` when a publisher resumes after a
+    /// different one published for the same source type while it was still
+    /// active (interleaving). A clean hand-over (old publisher stops, new one
+    /// starts, e.g. a driver restart) does not fire.
+    fn check_publishers<F: FnMut(Finding)>(
+        &mut self,
+        si: usize,
+        e: usize,
+        publisher: u32,
+        now: u64,
+        source: FeedbackSource,
+        sink: &mut F,
+    ) {
+        let expiry = self.cfg.publisher_expiry_ns;
+        let base = si * PUBLISHER_SLOTS;
+        let active_others = (base..base + PUBLISHER_SLOTS)
+            .filter(|&o| {
+                o != e && self.ent[o].seen && now.saturating_sub(self.ent[o].last_rx) <= expiry
+            })
+            .count() as u32;
+        let me = self.ent[e];
+        let ag = self.agg[si];
+        let interleaved = match ag.last_pub {
+            Some(lp) if lp != publisher => me.seen && now.saturating_sub(me.last_rx) <= expiry,
+            _ => false,
+        };
+        if interleaved && !ag.multi_latched {
+            self.agg[si].multi_latched = true;
+            self.agg[si].multi_clean = 0;
+            self.emit(
+                sink,
+                rules::MULTIPLE_FEEDBACK_PUBLISHERS,
+                Severity::High,
+                now,
+                Evidence::MultiplePublishers {
+                    source,
+                    publisher,
+                    other: ag.last_pub.unwrap_or(PUBLISHER_UNKNOWN),
+                    active: active_others.saturating_add(1).max(2),
+                },
+                Some(publisher),
+            );
+        }
+        let ag = &mut self.agg[si];
+        if active_others == 0 {
+            ag.multi_clean = ag.multi_clean.saturating_add(1);
+            if ag.multi_clean >= self.cfg.rearm_clean_samples {
+                ag.multi_latched = false;
+                ag.multi_clean = 0;
+            }
+        } else {
+            ag.multi_clean = 0;
+        }
+        ag.last_pub = Some(publisher);
+    }
+
+    /// Track non-finite values over the last 64 samples of one entity/axis
+    /// and escalate to High when their rate is high while motion matters.
+    #[allow(clippy::too_many_arguments)]
+    fn nan_window<F: FnMut(Finding)>(
+        &mut self,
+        e: usize,
+        a: Axis,
+        invalid: bool,
+        now: u64,
+        source: FeedbackSource,
+        publisher: Option<u32>,
+        sink: &mut F,
+    ) {
+        let ai = a.index();
+        let st = &mut self.ent[e];
+        st.nan_hist[ai] = (st.nan_hist[ai] << 1) | u64::from(invalid);
+        st.nan_n[ai] = st.nan_n[ai].saturating_add(1).min(64);
+        let n = u32::from(st.nan_n[ai]);
+        let bad = st.nan_hist[ai].count_ones();
+        let rate = f64::from(bad) / f64::from(n);
+        let thr = self.cfg.nan_rate_high;
+        if rate < thr / 2.0 {
+            st.nan_rate_latched[ai] = false;
+        }
+        if !invalid || st.nan_rate_latched[ai] || n < self.cfg.nan_rate_min_samples || rate < thr {
+            return;
+        }
+        let still = self.cfg.axis(a).still_threshold;
+        let observed = st.last_val[ai].is_some_and(|(v, _)| v.abs() > still);
+        // Nothing valid in the whole window: the motion state is unknown,
+        // which is never reported as "fine", even at rest.
+        let blind = bad == n;
+        let episode = self.unc[e][ai].since.is_some() || self.div[e][ai].since.is_some();
+        if blind || observed || episode || self.moving_expected(now, ai) {
+            self.ent[e].nan_rate_latched[ai] = true;
+            self.emit(
+                sink,
+                rules::INVALID_FEEDBACK,
+                Severity::High,
+                now,
+                Evidence::NonFiniteRate {
+                    source,
+                    axis: a,
+                    invalid: bad,
+                    window: n,
+                },
+                publisher,
+            );
+        }
+    }
+
+    /// Implausible-jump check between consecutive finite samples of one
+    /// entity/axis (see `MonitorConfig::jump_accel_factor`).
+    #[allow(clippy::too_many_arguments)]
+    fn check_jump<F: FnMut(Finding)>(
+        &mut self,
+        e: usize,
+        a: Axis,
+        v: f64,
+        stamp: u64,
+        now: u64,
+        source: FeedbackSource,
+        publisher: Option<u32>,
+        sink: &mut F,
+    ) {
+        let ai = a.index();
+        let prev = self.ent[e].prev_fin[ai].replace((v, stamp, now));
+        let model = self.cfg.axis(a);
+        let (Some(acc), Some((pv, ps, prx))) = (model.max_accel, prev) else {
+            return;
+        };
+        if self.cfg.jump_min_count == 0 {
+            return;
+        }
+        let window = self.cfg.jump_window_ns;
+        let ep = &mut self.ent[e].jump[ai];
+        if ep.last.is_some_and(|l| now.saturating_sub(l) > window) {
+            *ep = JumpEpisode::default();
+        }
+        // The more lenient of the two gaps (an injector controls stamps, but
+        // interleaving within one stamp-checked stream bounds both).
+        let dt_ns = stamp.saturating_sub(ps).max(now.saturating_sub(prx)).max(1);
+        let dt = dt_ns as f64 / NS_PER_S;
+        let dv = (v - pv).abs();
+        let tol = model.cross_abs_tol + model.cross_rel_tol * v.abs().max(pv.abs());
+        if !(dv > tol && dv > self.cfg.jump_accel_factor * acc * dt) {
+            return;
+        }
+        if ep.last.is_none() {
+            ep.since = now;
+        }
+        ep.last = Some(now);
+        ep.count = ep.count.saturating_add(1);
+        if ep.fired || ep.count < self.cfg.jump_min_count {
+            return;
+        }
+        ep.fired = true;
+        let (jumps, since) = (ep.count, ep.since);
+        self.emit(
+            sink,
+            rules::INCONSISTENT_FEEDBACK_STREAM,
+            Severity::High,
+            now,
+            Evidence::InconsistentStream {
+                source,
+                axis: a,
+                jumps,
+                from: pv,
+                to: v,
+                implied_rate: dv / dt,
+                since_ns: since,
+            },
+            publisher,
+        );
     }
 
     /// Observer time must not go backwards; clamp and count.
@@ -743,6 +1172,23 @@ impl ConsistencyMonitor {
                 }
                 r.v[ai]
             }
+        }
+    }
+
+    /// Whether the command in effect for a variant at `t` carries its sign.
+    /// "No command" / timed-out / safety stop mean rest, which has no
+    /// direction to get wrong.
+    fn input_signed_at(&self, t: u64, lat: u64) -> bool {
+        if self.stop_active {
+            return true;
+        }
+        let at = t.saturating_sub(lat);
+        match self.ring.at(at) {
+            None => true,
+            Some(r) => match self.cfg.command_timeout_ns {
+                Some(h) if at.saturating_sub(r.t) > h => true,
+                _ => r.signed,
+            },
         }
     }
 
@@ -846,13 +1292,16 @@ impl ConsistencyMonitor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn check_command<F: FnMut(Finding)>(
         &mut self,
         si: usize,
+        sc: &crate::config::SourceConfig,
         source: FeedbackSource,
         a: Axis,
         val: Option<f64>,
         now: u64,
+        publisher: Option<u32>,
         sink: &mut F,
     ) {
         let ai = a.index();
@@ -861,6 +1310,16 @@ impl ConsistencyMonitor {
             self.div[si][ai].interrupt();
             self.unc[si][ai].interrupt();
             return;
+        };
+        // Direction is only judged when both the command in effect and the
+        // feedback carry their sign; otherwise compare magnitudes.
+        let signed = sc.signed
+            && self.input_signed_at(now, self.variants[0].latency_ns)
+            && self.input_signed_at(now, self.variants[1].latency_ns);
+        let (m, (lo, hi)) = if signed {
+            (m, (lo, hi))
+        } else {
+            (m.abs(), abs_band(lo, hi))
         };
         let model = self.cfg.axis(a);
         let tol = model.abs_tol + model.rel_tol * lo.abs().max(hi.abs());
@@ -932,6 +1391,7 @@ impl ConsistencyMonitor {
                     since_ns: since,
                     samples: n,
                 },
+                publisher,
             );
         }
         let p_div = self.cfg.divergence;
@@ -939,6 +1399,9 @@ impl ConsistencyMonitor {
             let dir = direction.unwrap_or(Direction::Over);
             let sev = match dir {
                 Direction::Under if !self.cfg.safety_stop_signal_wired => Severity::Medium,
+                // Driving / turning against the command at speed is as
+                // hazardous as uncommanded motion.
+                Direction::Opposite if m.abs() >= critical => Severity::Critical,
                 _ => Severity::High,
             };
             self.emit(
@@ -958,6 +1421,7 @@ impl ConsistencyMonitor {
                     since_ns: since,
                     samples: n,
                 },
+                publisher,
             );
         }
     }
@@ -968,14 +1432,15 @@ impl ConsistencyMonitor {
         source: FeedbackSource,
         now: u64,
         bits: [Option<u64>; N_AXIS],
+        publisher: Option<u32>,
         sink: &mut F,
     ) {
         let any = bits.iter().any(Option::is_some);
-        let identical = any && self.src[si].prev_bits == Some(bits);
+        let identical = any && self.ent[si].prev_bits == Some(bits);
         let moving = (0..N_AXIS).any(|ai| bits[ai].is_some() && self.moving_expected(now, ai))
             && !self.stop_active;
         if identical && moving {
-            let st = &mut self.src[si];
+            let st = &mut self.ent[si];
             if st.frozen_count == 0 {
                 st.frozen_since = now;
             }
@@ -996,10 +1461,11 @@ impl ConsistencyMonitor {
                         repeats: count,
                         since_ns: since,
                     },
+                    publisher,
                 );
             }
         } else {
-            let st = &mut self.src[si];
+            let st = &mut self.ent[si];
             st.frozen_count = 0;
             if !identical {
                 st.frozen_latched = false;
@@ -1007,37 +1473,51 @@ impl ConsistencyMonitor {
         }
     }
 
+    /// Compare this entity's values with the latest of every publisher of
+    /// every other cross-checked source type. Signed when both sides are
+    /// signed sources, magnitudes otherwise.
+    #[allow(clippy::too_many_arguments)]
     fn check_cross<F: FnMut(Finding)>(
         &mut self,
-        si: usize,
+        e: usize,
         source: FeedbackSource,
+        signed: bool,
         vals: [Option<f64>; N_AXIS],
         now: u64,
+        publisher: Option<u32>,
         sink: &mut F,
     ) {
         let skew = self.cfg.cross_max_skew_ns;
         let p = self.cfg.cross_sensor;
-        for other in FeedbackSource::ALL {
-            let oi = other.index();
-            if oi == si || !self.cfg.sources.get(other).cross_check {
+        let si = source.index();
+        for oe in 0..N_ENT {
+            let other = FeedbackSource::ALL[oe / PUBLISHER_SLOTS];
+            let osc = *self.cfg.sources.get(other);
+            if other.index() == si || !osc.cross_check || !self.ent[oe].seen {
                 continue;
             }
-            let pi = pair_index(si, oi);
+            let both_signed = signed && osc.signed;
+            let pi = pair_index(e, oe);
             for a in Axis::ALL {
                 let ai = a.index();
                 let Some(mine) = vals[ai] else { continue };
-                let Some((theirs, rx)) = self.src[oi].last_val[ai] else {
+                let Some((theirs, rx)) = self.ent[oe].last_val[ai] else {
                     continue;
                 };
                 if now.saturating_sub(rx) > skew {
                     self.cross[pi][ai].interrupt();
                     continue;
                 }
+                let (mine, theirs) = if both_signed {
+                    (mine, theirs)
+                } else {
+                    (mine.abs(), theirs.abs())
+                };
                 let model = self.cfg.axis(a);
                 let tol = model.cross_abs_tol + model.cross_rel_tol * mine.abs().max(theirs.abs());
                 let bad = (mine - theirs).abs() > tol;
                 if let Some((since, n)) = self.cross[pi][ai].observe(bad, now, &p) {
-                    let (sa, va, sb, vb) = if si < oi {
+                    let (sa, va, sb, vb) = if si < other.index() {
                         (source, mine, other, theirs)
                     } else {
                         (other, theirs, source, mine)
@@ -1065,6 +1545,7 @@ impl ConsistencyMonitor {
                             since_ns: since,
                             samples: n,
                         },
+                        publisher,
                     );
                 }
             }
@@ -1080,7 +1561,7 @@ impl ConsistencyMonitor {
             let Some(limit) = self.cfg.sources.get(s).stale_after_ns else {
                 continue;
             };
-            let st = self.src[si];
+            let st = self.agg[si];
             if !st.seen || st.stale_latched {
                 continue;
             }
@@ -1090,7 +1571,7 @@ impl ConsistencyMonitor {
             }
             let moving = (0..N_AXIS).any(|ai| st.reported[ai] && self.moving_expected(now, ai));
             if moving {
-                self.src[si].stale_latched = true;
+                self.agg[si].stale_latched = true;
                 self.emit(
                     sink,
                     rules::FROZEN_FEEDBACK,
@@ -1101,6 +1582,7 @@ impl ConsistencyMonitor {
                         last_rx_ns: st.last_rx,
                         age_ns: age,
                     },
+                    None,
                 );
             }
         }
@@ -1113,15 +1595,15 @@ mod tests {
 
     #[test]
     fn pair_index_is_a_bijection() {
-        let mut seen = [false; N_PAIR];
-        for i in 0..N_SRC {
-            for j in 0..N_SRC {
+        let mut seen = [false; N_EPAIR];
+        for i in 0..N_ENT {
+            for j in 0..N_ENT {
                 if i == j {
                     continue;
                 }
                 let p = pair_index(i, j);
                 assert_eq!(p, pair_index(j, i));
-                assert!(p < N_PAIR);
+                assert!(p < N_EPAIR);
                 if i < j {
                     assert!(!seen[p]);
                     seen[p] = true;
@@ -1136,6 +1618,7 @@ mod tests {
         let p = Persistence {
             min_duration_ns: 100,
             min_samples: 3,
+            min_bad_fraction: 1.0,
             clear_samples: 2,
         };
         let mut s = Persist::default();
@@ -1145,13 +1628,52 @@ mod tests {
         assert_eq!(s.observe(true, 100, &p), Some((0, 4)));
         assert!(s.observe(true, 200, &p).is_none()); // latched
         assert!(s.observe(false, 210, &p).is_none());
-        assert!(s.observe(true, 220, &p).is_none()); // run restarted, still latched
+        assert!(s.observe(true, 220, &p).is_none()); // episode continues, latched
         assert!(s.observe(false, 230, &p).is_none());
-        assert!(s.observe(false, 240, &p).is_none()); // re-armed
+        assert!(s.observe(false, 240, &p).is_none()); // 2 consecutive good: re-armed
         for t in [300, 350] {
             assert!(s.observe(true, t, &p).is_none());
         }
         assert_eq!(s.observe(true, 400, &p), Some((300, 3)));
+    }
+
+    #[test]
+    fn interleaved_good_samples_do_not_reset_an_episode() {
+        let p = Persistence {
+            min_duration_ns: 100,
+            min_samples: 5,
+            min_bad_fraction: 0.25,
+            clear_samples: 4,
+        };
+        // bad, good, good, good, bad, ... = 25 % bad: fires.
+        let mut s = Persist::default();
+        let mut fired = None;
+        for k in 0..100u64 {
+            if let Some(x) = s.observe(k % 4 == 0, k * 10, &p) {
+                fired = Some((k, x));
+                break;
+            }
+        }
+        let (k, (since, n)) = fired.expect("diluted episode must still fire");
+        assert_eq!(since, 0);
+        assert_eq!(n, 5);
+        assert_eq!(k, 16);
+
+        // 1 bad in 5 is below the fraction: never fires.
+        let mut s = Persist::default();
+        for k in 0..1000u64 {
+            assert!(s.observe(k % 5 == 0, k * 10, &p).is_none());
+        }
+
+        // `clear_samples` consecutive good samples end the episode.
+        let mut s = Persist::default();
+        for k in 0..4u64 {
+            s.observe(true, k, &p);
+        }
+        for k in 4..8u64 {
+            s.observe(false, k, &p);
+        }
+        assert!(s.since.is_none());
     }
 
     #[test]

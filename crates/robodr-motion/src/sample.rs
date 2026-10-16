@@ -7,7 +7,25 @@
 //! shared event crate. A [`CommandSample`] can be built from a
 //! [`robodr_events::MotionCommand`] plus a timestamp.
 //!
-//! Units: linear m/s, angular rad/s, joint rad/s. Times are `u64` nanoseconds,
+//! Units: linear m/s, angular rad/s, joint rad/s. Linear and angular values
+//! are **signed body-frame velocities** (ROS REP 103: +x forward, +yaw
+//! counter-clockwise), so the monitor can see a robot driving or turning the
+//! opposite way to its command. The joint axis is a magnitude by nature.
+//! Two exceptions are declared rather than guessed:
+//!
+//! * a command whose source only carries magnitudes (such as
+//!   [`robodr_events::MotionCommand`]) sets [`CommandSample::direction_known`]
+//!   to `false`; while it is in effect the monitor compares magnitudes and
+//!   **cannot** detect a reversal on that command;
+//! * a feedback source that only measures magnitude (GNSS speed over ground)
+//!   is declared with `SourceConfig::signed = false`.
+//!
+//! The motion sensor should therefore build [`CommandSample`] directly from
+//! the `geometry_msgs/Twist` (`linear.x`, `angular.z`) and [`FeedbackSample`]
+//! from `nav_msgs/Odometry` `twist.twist` / `sensor_msgs/Imu`
+//! `angular_velocity.z`, keeping the signs.
+//!
+//! Times are `u64` nanoseconds,
 //! which makes negative time unrepresentable; use [`stamp_from_ros`] /
 //! [`stamp_from_secs_f64`] to convert untrusted wire stamps (they return
 //! `None` for negative, non-finite or out-of-range input instead of
@@ -125,6 +143,9 @@ impl Axis {
 ///
 /// "No command at all" (none observed yet, or the last one is older than the
 /// configured command timeout) is different: it means *rest* on every axis.
+///
+/// `linear` / `angular` are signed body-frame velocities when
+/// `direction_known` is `true` (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CommandSample<'a> {
     /// Observer (monotonic) time the command was seen, ns.
@@ -137,6 +158,16 @@ pub struct CommandSample<'a> {
     pub angular: Option<f64>,
     /// Commanded max |joint speed|, rad/s.
     pub joint_speed_max: Option<f64>,
+    /// `true` (the default when deserialising) if `linear` / `angular` carry
+    /// their sign. `false` for magnitude-only sources: the monitor then
+    /// compares |command| with |feedback| and skips the direction check for
+    /// as long as this command is in effect.
+    #[serde(default = "yes")]
+    pub direction_known: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl<'a> CommandSample<'a> {
@@ -150,8 +181,11 @@ impl<'a> CommandSample<'a> {
     }
 
     /// Build from the shared event type. `MotionCommand` carries magnitudes
-    /// only (no sign, no yaw rate), so `angular` is `None` and the result is
-    /// only meaningful with `compare_magnitudes = true` (the default).
+    /// only (no sign, no yaw rate), so `angular` is `None` and
+    /// `direction_known` is `false`: the monitor compares magnitudes for this
+    /// command and **cannot detect a direction reversal** from it. Feed
+    /// signed [`CommandSample`]s built from the `Twist` itself to get the
+    /// reversal check.
     pub fn from_motion_command(cmd: &'a MotionCommand, t_ns: u64) -> Self {
         CommandSample {
             t_ns,
@@ -159,6 +193,7 @@ impl<'a> CommandSample<'a> {
             linear: cmd.linear_speed,
             angular: None,
             joint_speed_max: cmd.joint_speed,
+            direction_known: false,
         }
     }
 }
@@ -170,6 +205,11 @@ impl<'a> From<(&'a MotionCommand, u64)> for CommandSample<'a> {
 }
 
 /// One feedback (telemetry) sample.
+///
+/// `linear` / `angular` are signed body-frame velocities unless the source is
+/// configured `signed = false` (see the module docs). The publisher identity
+/// is passed separately to
+/// [`crate::ConsistencyMonitor::on_feedback_from`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FeedbackSample {
     /// The sample's own stamp (e.g. ROS `header.stamp`), ns, in the **same
@@ -196,6 +236,32 @@ impl FeedbackSample {
             Axis::Angular => self.angular,
             Axis::Joint => self.joint_speed_max,
         }
+    }
+}
+
+/// Publisher id meaning "unknown / single publisher". Used by
+/// [`crate::ConsistencyMonitor::on_feedback`].
+pub const PUBLISHER_UNKNOWN: u32 = 0;
+
+/// Convenience publisher id from a publisher identity (e.g. the 16-byte DDS
+/// writer GUID, or its textual form): 32-bit FNV-1a, never
+/// [`PUBLISHER_UNKNOWN`].
+///
+/// A 32-bit hash can be collided on purpose by an attacker who controls
+/// their GUID prefix; two colliding publishers share one state slot and lose
+/// the per-publisher separation (the time-windowed persistence still
+/// applies). Prefer interning: the sensor keeps its own GUID -> dense `u32`
+/// table and passes those ids.
+pub fn publisher_id(identity: &[u8]) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for &b in identity {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    if h == PUBLISHER_UNKNOWN {
+        1
+    } else {
+        h
     }
 }
 
@@ -264,6 +330,24 @@ mod tests {
         assert_eq!(c.axis(Axis::Linear), Some(0.8));
         assert_eq!(c.axis(Axis::Angular), None);
         assert_eq!(c.axis(Axis::Joint), None);
+        assert!(!c.direction_known);
+    }
+
+    #[test]
+    fn publisher_ids() {
+        assert_ne!(publisher_id(b""), PUBLISHER_UNKNOWN);
+        assert_ne!(publisher_id(b"01.0f.aa"), publisher_id(b"01.0f.ab"));
+        assert_eq!(publisher_id(b"x"), publisher_id(b"x"));
+    }
+
+    #[test]
+    fn command_sample_direction_defaults_to_known_when_missing() {
+        let c: CommandSample = serde_json::from_str(
+            r#"{"t_ns":1,"channel":"/c","linear":-1.0,"angular":null,"joint_speed_max":null}"#,
+        )
+        .unwrap();
+        assert!(c.direction_known);
+        assert_eq!(c.linear, Some(-1.0));
     }
 
     #[test]
@@ -274,6 +358,7 @@ mod tests {
             linear: Some(1.0),
             angular: Some(-0.5),
             joint_speed_max: None,
+            direction_known: true,
         };
         let j = serde_json::to_string(&c).unwrap();
         let back: CommandSample = serde_json::from_str(&j).unwrap();
