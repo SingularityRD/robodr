@@ -95,7 +95,7 @@ fn round_trip_with_only_public_keys_on_the_high_side() {
     site.transfer_all();
 
     let mut imp = Importer::open(site.import_cfg(), public_ring(UNIT)).unwrap();
-    imp.add_bundle_verifier(Box::new(bb_pub));
+    imp.add_bundle_verifier(UNIT, Box::new(bb_pub)).unwrap();
     let r = imp.run(NOW).unwrap();
     assert!(r.is_clean(), "{r:?}");
     assert_eq!(r.accepted.len(), 1);

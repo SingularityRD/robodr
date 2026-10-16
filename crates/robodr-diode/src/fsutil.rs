@@ -84,8 +84,11 @@ pub(crate) enum ReadError {
     Io(io::Error),
 }
 
-/// Read a regular, non-symlink file of at most `max` bytes.
-pub(crate) fn read_capped(p: &Path, max: u64) -> Result<Vec<u8>, ReadError> {
+/// Open a regular, non-symlink file of at most `max` bytes for reading.
+/// Returns the file and its size at open time. Permission problems are
+/// reported as [`ReadError::Io`] (kind `PermissionDenied`), not as
+/// "not regular", so callers can tell an unreadable entry from a planted one.
+pub(crate) fn open_capped(p: &Path, max: u64) -> Result<(File, u64), ReadError> {
     let m = match fs::symlink_metadata(p) {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(ReadError::Missing),
@@ -101,19 +104,26 @@ pub(crate) fn read_capped(p: &Path, max: u64) -> Result<Vec<u8>, ReadError> {
         .read(true)
         .custom_flags(O_NOFOLLOW | O_NONBLOCK)
         .open(p)
-        .map_err(|e| {
-            if e.kind() == io::ErrorKind::NotFound {
-                ReadError::Missing
-            } else {
-                // ELOOP from O_NOFOLLOW lands here.
-                ReadError::NotRegular
-            }
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => ReadError::Missing,
+            io::ErrorKind::PermissionDenied => ReadError::Io(e),
+            // ELOOP from O_NOFOLLOW lands here.
+            _ => ReadError::NotRegular,
         })?;
     let om = f.metadata().map_err(ReadError::Io)?;
     if !om.is_file() || om.dev() != m.dev() || om.ino() != m.ino() {
         return Err(ReadError::NotRegular);
     }
-    let mut buf = Vec::with_capacity(m.len().min(max) as usize);
+    if om.len() > max {
+        return Err(ReadError::TooLarge(om.len()));
+    }
+    Ok((f, om.len()))
+}
+
+/// Read a regular, non-symlink file of at most `max` bytes.
+pub(crate) fn read_capped(p: &Path, max: u64) -> Result<Vec<u8>, ReadError> {
+    let (f, len) = open_capped(p, max)?;
+    let mut buf = Vec::with_capacity(len.min(max) as usize);
     f.take(max.saturating_add(1))
         .read_to_end(&mut buf)
         .map_err(ReadError::Io)?;
@@ -123,13 +133,19 @@ pub(crate) fn read_capped(p: &Path, max: u64) -> Result<Vec<u8>, ReadError> {
     Ok(buf)
 }
 
-/// Create a new file (never through a symlink), write `bytes`, `fsync`.
-pub(crate) fn write_new(p: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut f = OpenOptions::new()
+/// Create a new file for writing (`O_CREAT|O_EXCL|O_NOFOLLOW`: never through
+/// a symlink, never an existing file).
+pub(crate) fn create_new(p: &Path) -> io::Result<File> {
+    OpenOptions::new()
         .write(true)
         .create_new(true)
         .custom_flags(O_NOFOLLOW)
-        .open(p)?;
+        .open(p)
+}
+
+/// Create a new file (never through a symlink), write `bytes`, `fsync`.
+pub(crate) fn write_new(p: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut f = create_new(p)?;
     f.write_all(bytes)?;
     f.sync_all()
 }
@@ -176,26 +192,71 @@ pub(crate) fn atomic_write(p: &Path, bytes: &[u8]) -> io::Result<()> {
     fsync_dir(dir)
 }
 
-/// Rename `from` into `dir` under `name`, or `name.1`, `name.2`, … if taken.
-/// Returns the final path.
+static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Attempts per unique-name operation. Every attempt after the first uses a
+/// fresh name (wall-clock ns, pid, process-wide counter), so this bound is
+/// only reached if the directory changes under us on every attempt — it is
+/// not a namespace that earlier runs can fill up.
+const UNIQUE_ATTEMPTS: u32 = 64;
+
+/// `<name>.<unix ns>-<pid>-<counter>`: unique across runs and within one.
+fn unique_name(name: &str) -> String {
+    let ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{name}.{ns}-{}-{}",
+        std::process::id(),
+        UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Rename `from` into `dir` under `name`, or under a timestamp/counter
+/// suffixed variant of it ([`unique_name`]) if `name` is taken. Returns the
+/// final path. There is no small cap on earlier occupants of `name.*`: each
+/// fallback name is new.
 pub(crate) fn move_unique(from: &Path, dir: &Path, name: &str) -> io::Result<PathBuf> {
-    for i in 0u32..10_000 {
-        let candidate = if i == 0 {
-            dir.join(name)
-        } else {
-            dir.join(format!("{name}.{i}"))
-        };
-        if exists_nofollow(&candidate) {
-            continue;
+    let mut candidate = dir.join(name);
+    for _ in 0..UNIQUE_ATTEMPTS {
+        if !exists_nofollow(&candidate) {
+            fs::rename(from, &candidate)?;
+            fsync_dir(dir)?;
+            return Ok(candidate);
         }
-        fs::rename(from, &candidate)?;
-        fsync_dir(dir)?;
-        return Ok(candidate);
+        candidate = dir.join(unique_name(name));
     }
-    Err(invalid(format!(
-        "no free name for {name} in {}",
-        dir.display()
-    )))
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("no free name for {name} in {}", dir.display()),
+    ))
+}
+
+/// Create a fresh directory in `dir` named `name` or a unique variant of it
+/// (`create_dir` is exclusive, so the result is ours alone).
+pub(crate) fn create_unique_dir(dir: &Path, name: &str) -> io::Result<PathBuf> {
+    let mut candidate = dir.join(name);
+    for _ in 0..UNIQUE_ATTEMPTS {
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        candidate = dir.join(unique_name(name));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("no free name for {name} in {}", dir.display()),
+    ))
+}
+
+/// Milliseconds since the epoch of `m`'s modification time (0 if unknown).
+pub(crate) fn mtime_ms(m: &fs::Metadata) -> u64 {
+    m.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -263,7 +324,22 @@ mod tests {
         fs::create_dir(d.join("dst")).unwrap();
         fs::create_dir(d.join("dst/x")).unwrap();
         let p = move_unique(&src, &d.join("dst"), "x").unwrap();
-        assert_eq!(p, d.join("dst/x.1"));
+        assert_ne!(p, d.join("dst/x"));
+        assert!(p.is_dir());
+        let name = p.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("x.") && name.len() > 2, "{name}");
+        // Earlier occupants of any number of `x.N` names do not matter.
+        for i in 1..=100 {
+            fs::create_dir(d.join(format!("dst/x.{i}"))).unwrap();
+        }
+        let src2 = d.join("src2");
+        fs::create_dir(&src2).unwrap();
+        assert!(move_unique(&src2, &d.join("dst"), "x").unwrap().is_dir());
+        let a = create_unique_dir(&d, "q").unwrap();
+        let b = create_unique_dir(&d, "q").unwrap();
+        assert_eq!(a, d.join("q"));
+        assert_ne!(a, b);
+        assert!(b.is_dir());
         fs::remove_dir_all(&d).unwrap();
     }
 }

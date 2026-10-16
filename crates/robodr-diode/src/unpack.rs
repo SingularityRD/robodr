@@ -20,52 +20,96 @@
 //!    * `seq > last + 1` → **held** in the inbox and reported as a gap; it is
 //!      picked up automatically once the missing batches arrive (reordering),
 //!      or accepted when the operator explicitly accepts that gap
-//!      ([`ImportConfig::accept_gaps`]), which is recorded in the state.
+//!      ([`ImportConfig::accept_gaps`], at most
+//!      [`ImportConfig::max_accept_gap`] skipped batches), which is recorded
+//!      in the state. A batch held longer than
+//!      [`ImportConfig::held_max_age_ms`] is quarantined (`held_expired`).
 //! 3. **File checks**: no entry other than the manifest, its signature and the
 //!    listed files; every listed file a regular non-symlink file of exactly
 //!    the declared size and SHA-256; every findings line re-validated with
-//!    [`robodr_ocsf::parse_and_validate`]; every bundle parsed (and verified,
-//!    when a black-box verifier for its key is configured).
+//!    [`robodr_ocsf::parse_and_validate`] and its `entity_context.robot.id`
+//!    allowed for the unit ([`Keyring::robot_allowed`]: the unit itself, plus
+//!    an explicit per-unit allow-list); every bundle parsed, its
+//!    `device_id` allowed for the unit, and its signatures verified when a
+//!    black-box key **bound to this unit** is configured (a bundle signed
+//!    with a key bound to another unit is quarantined).
 //! 4. **Emit** `out/<batch>/records.jsonl` (one Kafka record per line: topic,
 //!    partition, key, headers, value — the shape of [`robodr_ocsf::Record`]),
 //!    the bundles and a copy of the signed manifest, via a temp directory and
 //!    a rename; then atomically update the state; then move the batch to
-//!    `processed/`. A crash anywhere re-runs idempotently.
+//!    `processed/`. A crash anywhere re-runs idempotently. Files are verified
+//!    and copied one at a time, and records are streamed into the staging
+//!    directory, so peak memory is about one data file (findings are read in
+//!    64 KiB chunks), not the whole batch.
 //!
-//! Anything that fails a check is moved to `quarantine/` with a
-//! `<name>.reason.json` next to it; the state does not advance, so an intact
-//! re-send of the same batch is accepted later.
+//!    If `out/<batch>/` already exists, its `MANIFEST.json` is compared with
+//!    this batch's: identical → it was emitted by an interrupted earlier run
+//!    and is reused; different (e.g. after an operator reset that unit's
+//!    state) → this batch is emitted as `out/<batch>.<first 16 hex of the
+//!    batch hash>/`. A batch is never reported as accepted without its own
+//!    records on disk.
+//!
+//! Anything that fails a check is moved to `quarantine/<unique>/entry`, with
+//! `quarantine/<unique>/reason.json` beside it (a separate directory per
+//! entry, so inbox names cannot collide with or impersonate reason files);
+//! the state does not advance, so an intact re-send of the same batch is
+//! accepted later. Dot-entries (in transit) older than
+//! [`ImportConfig::in_transit_max_age_ms`] are quarantined too.
+//!
+//! **Per-entry failures never abort a run**: an I/O error while handling one
+//! inbox entry is reported in [`ImportReport::errors`] (the entry stays in the
+//! inbox and is retried next run; a permission problem reading it is
+//! quarantined as `unreadable`), and the run continues with the next entry.
+//! Only failing to list the inbox itself is a run error.
 
 use crate::fsutil::{self, ReadError};
 use crate::manifest::{
     batch_dir_name, batch_hash, file_sha256, is_hex_digest, manifest_signing_message, trunc,
-    FileKind, Manifest, SignatureFile, FORMAT, MANIFEST_FILE, MAX_MANIFEST_BYTES,
-    MAX_SIGNATURE_FILE_BYTES, MAX_SIG_LEN, SIGNATURE_FILE,
+    FileEntry, FileKind, Manifest, SignatureFile, FORMAT, MANIFEST_FILE, MAX_BATCH_SEQ,
+    MAX_MANIFEST_BYTES, MAX_SIGNATURE_FILE_BYTES, MAX_SIG_LEN, SIGNATURE_FILE,
 };
-use robodr_blackbox::crypto::from_hex;
+use robodr_blackbox::crypto::{from_hex, to_hex, Sha256};
 use robodr_blackbox::{Bundle, FindingLevel, Verifier};
+use robodr_ocsf::validate::MAX_FINDING_BYTES;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 /// Batch hashes remembered per unit for duplicate/conflict decisions.
 pub const RECENT_WINDOW: usize = 1024;
 /// Accepted gaps remembered per unit.
 pub const MAX_RECORDED_GAPS: usize = 1024;
-/// Default cap on the data bytes of one batch on import (256 MiB).
+/// Default cap on the data bytes of one batch on import (256 MiB). The
+/// packer's largest allowed `max_batch_bytes` equals this value.
 pub const DEFAULT_MAX_IMPORT_BATCH_BYTES: u64 = 256 * 1024 * 1024;
+/// Default cap on the number of batches one operator-accepted gap may skip.
+pub const DEFAULT_MAX_ACCEPT_GAP: u64 = 100_000;
+/// Default age after which a held (gap) batch is quarantined: 30 days.
+pub const DEFAULT_HELD_MAX_AGE_MS: u64 = 30 * 24 * 3600 * 1000;
+/// Default age after which a dot-entry (in transit) is quarantined: 24 h.
+pub const DEFAULT_IN_TRANSIT_MAX_AGE_MS: u64 = 24 * 3600 * 1000;
 const STATE_FORMAT: &str = "robodr-diode-import-state/1";
 const MAX_STATE_BYTES: u64 = 64 * 1024 * 1024;
 /// File written into each emitted batch directory.
 pub const RECORDS_FILE: &str = "records.jsonl";
+/// Name of the quarantined inbox entry inside its `quarantine/<unique>/`.
+pub const QUARANTINE_ENTRY: &str = "entry";
+/// Name of the reason file inside each `quarantine/<unique>/`.
+pub const REASON_FILE: &str = "reason.json";
+const READ_CHUNK: usize = 64 * 1024;
 
-/// Verifiers for batch manifests, each bound to the unit it may sign for.
+/// Verifiers for batch manifests, each bound to the unit it may sign for;
+/// black-box bundle verifiers, each bound to a unit; and per-unit allow-lists
+/// of the robot ids a unit may report on.
 #[derive(Default)]
 pub struct Keyring {
     entries: Vec<(String, Box<dyn Verifier>)>,
+    bundle_keys: Vec<(String, Box<dyn Verifier>)>,
+    robots: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Keyring {
@@ -76,9 +120,7 @@ impl Keyring {
     /// Trust `verifier` for batches of `unit_id`. A key id may belong to one
     /// unit only (several keys per unit are fine, e.g. during rotation).
     pub fn add(&mut self, unit_id: &str, verifier: Box<dyn Verifier>) -> Result<(), String> {
-        if !robodr_ocsf::validate::is_valid_robot_id(unit_id) {
-            return Err(format!("invalid unit id {:?}", trunc(unit_id)));
-        }
+        check_unit(unit_id)?;
         if self
             .entries
             .iter()
@@ -93,6 +135,56 @@ impl Keyring {
         Ok(())
     }
 
+    /// Verify black-box bundles signed with `verifier`'s key when they arrive
+    /// in batches of `unit_id`. A bundle signed with this key inside another
+    /// unit's batch is quarantined (`bundle_key_unit_mismatch`). A key id may
+    /// belong to one unit only.
+    pub fn add_bundle_key(
+        &mut self,
+        unit_id: &str,
+        verifier: Box<dyn Verifier>,
+    ) -> Result<(), String> {
+        check_unit(unit_id)?;
+        if self
+            .bundle_keys
+            .iter()
+            .any(|(_, v)| v.key_id() == verifier.key_id())
+        {
+            return Err(format!(
+                "bundle key id {:?} is already in the keyring",
+                verifier.key_id()
+            ));
+        }
+        self.bundle_keys.push((unit_id.to_string(), verifier));
+        Ok(())
+    }
+
+    /// Allow batches of `unit_id` to carry findings whose
+    /// `entity_context.robot.id` (and bundles whose `device_id`) is
+    /// `robot_id`, e.g. a site console exporting for its robots. Without any
+    /// entry, a unit may only report on itself.
+    pub fn allow_robot(&mut self, unit_id: &str, robot_id: &str) -> Result<(), String> {
+        check_unit(unit_id)?;
+        if !robodr_ocsf::validate::is_valid_robot_id(robot_id) {
+            return Err(format!("invalid robot id {:?}", trunc(robot_id)));
+        }
+        self.robots
+            .entry(unit_id.to_string())
+            .or_default()
+            .insert(robot_id.to_string());
+        Ok(())
+    }
+
+    /// May batches of `unit_id` report on `robot_id`? (The unit itself, or
+    /// an id added with [`Keyring::allow_robot`].)
+    pub fn robot_allowed(&self, unit_id: &str, robot_id: &str) -> bool {
+        robot_id == unit_id
+            || self
+                .robots
+                .get(unit_id)
+                .is_some_and(|s| s.contains(robot_id))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -103,6 +195,21 @@ impl Keyring {
             .find(|(_, v)| v.key_id() == key_id)
             .map(|(u, v)| (u.as_str(), v.as_ref()))
     }
+
+    fn find_bundle_key(&self, key_id: &str) -> Option<(&str, &dyn Verifier)> {
+        self.bundle_keys
+            .iter()
+            .find(|(_, v)| v.key_id() == key_id)
+            .map(|(u, v)| (u.as_str(), v.as_ref()))
+    }
+}
+
+fn check_unit(unit_id: &str) -> Result<(), String> {
+    if robodr_ocsf::validate::is_valid_robot_id(unit_id) {
+        Ok(())
+    } else {
+        Err(format!("invalid unit id {:?}", trunc(unit_id)))
+    }
 }
 
 /// Importer configuration.
@@ -112,7 +219,7 @@ pub struct ImportConfig {
     pub inbox: PathBuf,
     /// Accepted batches: `out/<batch>/records.jsonl`, bundles, manifest copy.
     pub out_dir: PathBuf,
-    /// Rejected batches plus `<name>.reason.json`.
+    /// Rejected entries: `quarantine/<unique>/{entry, reason.json}`.
     pub quarantine_dir: PathBuf,
     /// Accepted and duplicate batches, moved out of the inbox.
     pub processed_dir: PathBuf,
@@ -125,11 +232,20 @@ pub struct ImportConfig {
     /// `(unit, seq)` pairs the operator explicitly accepts despite a gap
     /// before them (or on first contact with `seq > 1`).
     pub accept_gaps: Vec<(String, u64)>,
+    /// Largest number of batches one accepted gap may skip; an acceptance
+    /// beyond it is refused (`gap_too_large`), so one mistaken or forged
+    /// far-future sequence number cannot burn a unit's sequence space.
+    pub max_accept_gap: u64,
+    /// Quarantine a held (gap) batch whose directory is older than this
+    /// (by mtime, against `now_ms`). `None`: hold forever.
+    pub held_max_age_ms: Option<u64>,
+    /// Quarantine a dot-entry (in transit) older than this. `None`: never.
+    pub in_transit_max_age_ms: Option<u64>,
 }
 
 impl ImportConfig {
     /// Conventional layout under one root: `inbox/`, `out/`, `quarantine/`,
-    /// `processed/`, `state.json`.
+    /// `processed/`, `state.json`; default limits.
     pub fn under(root: &Path) -> Self {
         Self {
             inbox: root.join("inbox"),
@@ -140,6 +256,9 @@ impl ImportConfig {
             partitions: None,
             max_batch_bytes: DEFAULT_MAX_IMPORT_BATCH_BYTES,
             accept_gaps: Vec::new(),
+            max_accept_gap: DEFAULT_MAX_ACCEPT_GAP,
+            held_max_age_ms: Some(DEFAULT_HELD_MAX_AGE_MS),
+            in_transit_max_age_ms: Some(DEFAULT_IN_TRANSIT_MAX_AGE_MS),
         }
     }
 }
@@ -154,6 +273,10 @@ pub enum QuarantineReason {
     Symlink,
     /// Inbox entry is not a directory.
     NotADirectory,
+    /// The entry (or a file in it) cannot be read: permission denied.
+    Unreadable {
+        detail: String,
+    },
     MissingManifest,
     MissingSignature,
     ManifestTooLarge {
@@ -211,6 +334,13 @@ pub enum QuarantineReason {
         line: usize,
         errors: Vec<String>,
     },
+    /// A finding's `entity_context.robot.id` is neither the unit nor on the
+    /// unit's allow-list.
+    RobotNotAllowed {
+        line: usize,
+        robot_id: String,
+        unit_id: String,
+    },
     CountMismatch {
         declared: u64,
         actual: u64,
@@ -223,6 +353,19 @@ pub enum QuarantineReason {
     BundleVerifyFailed {
         name: String,
         detail: String,
+    },
+    /// A bundle's chain `device_id` is neither the unit nor on its allow-list.
+    BundleDeviceNotAllowed {
+        name: String,
+        device_id: String,
+        unit_id: String,
+    },
+    /// A bundle is signed with a black-box key bound to another unit.
+    BundleKeyUnitMismatch {
+        name: String,
+        key_id: String,
+        key_unit: String,
+        unit_id: String,
     },
     /// `seq == last + 1` but `prev_batch_hash` is not the last accepted hash.
     ChainBreak {
@@ -241,6 +384,27 @@ pub enum QuarantineReason {
     Replay {
         seq: u64,
         last_seq: u64,
+    },
+    /// The operator accepted a gap larger than [`ImportConfig::max_accept_gap`].
+    GapTooLarge {
+        seq: u64,
+        expected_seq: u64,
+        max_gap: u64,
+    },
+    /// Held for a gap longer than [`ImportConfig::held_max_age_ms`].
+    HeldExpired {
+        seq: u64,
+        expected_seq: u64,
+        age_ms: u64,
+    },
+    /// A dot-entry older than [`ImportConfig::in_transit_max_age_ms`].
+    StaleInTransit {
+        age_ms: u64,
+    },
+    /// Both `out/<batch>` and its hash-suffixed alternative hold other
+    /// content (not reachable without tampering with `out/`).
+    OutputConflict {
+        output: String,
     },
 }
 
@@ -264,6 +428,8 @@ pub struct AcceptedBatch {
     pub bundles_verified: usize,
     /// Sequence range skipped by an operator-accepted gap, if any.
     pub gap_accepted: Option<(u64, u64)>,
+    /// `out/<batch>/`, or `out/<batch>.<hash16>/` when `out/<batch>/` held
+    /// another batch's output.
     pub output: PathBuf,
 }
 
@@ -282,6 +448,8 @@ pub struct HeldBatch {
     pub unit_id: String,
     pub seq: u64,
     pub expected_seq: u64,
+    /// Age of the batch directory (mtime) at this run.
+    pub age_ms: u64,
 }
 
 /// A quarantined inbox entry.
@@ -289,7 +457,17 @@ pub struct HeldBatch {
 pub struct QuarantinedBatch {
     pub name: String,
     pub reason: QuarantineReason,
+    /// `quarantine/<unique>/entry`; the reason is in the sibling
+    /// [`REASON_FILE`].
     pub moved_to: PathBuf,
+}
+
+/// An inbox entry that could not be handled in this run (left in place and
+/// retried next run).
+#[derive(Debug, Clone, Serialize)]
+pub struct EntryError {
+    pub name: String,
+    pub detail: String,
 }
 
 /// Result of one [`Importer::run`].
@@ -301,12 +479,14 @@ pub struct ImportReport {
     pub quarantined: Vec<QuarantinedBatch>,
     /// Dot-entries (still being written by the transfer agent).
     pub in_transit: Vec<String>,
+    /// Per-entry failures (I/O); the run carried on with the other entries.
+    pub errors: Vec<EntryError>,
 }
 
 impl ImportReport {
-    /// Nothing quarantined and no gap pending.
+    /// Nothing quarantined, no gap pending, no per-entry error.
     pub fn is_clean(&self) -> bool {
-        self.quarantined.is_empty() && self.held.is_empty()
+        self.quarantined.is_empty() && self.held.is_empty() && self.errors.is_empty()
     }
 }
 
@@ -372,11 +552,12 @@ struct Candidate {
     manifest_bytes: Vec<u8>,
     sig_bytes: Vec<u8>,
     hash: String,
+    mtime_ms: u64,
 }
 
+/// What the file pass found (the data itself went to the staging dir).
 struct Verified {
-    records: Vec<u8>,
-    bundles: Vec<(String, Vec<u8>)>,
+    bundles: usize,
     bundles_verified: usize,
 }
 
@@ -406,14 +587,58 @@ struct ReasonFile<'a> {
     reason: &'a QuarantineReason,
 }
 
+/// Running totals of one findings file.
+struct FindingsScan {
+    line_no: usize,
+    count: u64,
+    first: u64,
+    last: u64,
+    err: Option<QuarantineReason>,
+    rec_buf: Vec<u8>,
+}
+
+/// What `out/<name>` holds relative to a candidate.
+enum OutSlot {
+    Free,
+    Same,
+    Other,
+}
+
 type Checked<T> = Result<Result<T, QuarantineReason>, io::Error>;
+
+fn unreadable(e: &io::Error) -> Option<QuarantineReason> {
+    (e.kind() == io::ErrorKind::PermissionDenied).then(|| QuarantineReason::Unreadable {
+        detail: trunc(&e.to_string()),
+    })
+}
+
+/// Map a data-file read error to a quarantine reason (or a real I/O error).
+fn data_read_error(f: &FileEntry, e: ReadError) -> Checked<std::convert::Infallible> {
+    use QuarantineReason as Q;
+    Ok(Err(match e {
+        ReadError::Missing => Q::MissingFile {
+            name: f.name.clone(),
+        },
+        ReadError::NotRegular => Q::NotRegularFile {
+            name: f.name.clone(),
+        },
+        ReadError::TooLarge(n) => Q::SizeMismatch {
+            name: f.name.clone(),
+            expected: f.size,
+            actual: n,
+        },
+        ReadError::Io(e) => match unreadable(&e) {
+            Some(q) => q,
+            None => return Err(e),
+        },
+    }))
+}
 
 /// The SOC-side importer. One instance per state file; concurrent runs on
 /// the same directories are not supported.
 pub struct Importer {
     cfg: ImportConfig,
     keyring: Keyring,
-    bundle_verifiers: Vec<Box<dyn Verifier>>,
     state: ImportState,
 }
 
@@ -469,7 +694,10 @@ impl Importer {
                     return Err(ImportError::State("unknown state format".into()));
                 }
                 for (u, st) in &s.units {
-                    if st.last_seq == 0 || !is_hex_digest(&st.last_hash) {
+                    if st.last_seq == 0
+                        || st.last_seq > MAX_BATCH_SEQ
+                        || !is_hex_digest(&st.last_hash)
+                    {
                         return Err(ImportError::State(format!("bad entry for unit {u:?}")));
                     }
                 }
@@ -482,66 +710,55 @@ impl Importer {
         Ok(Self {
             cfg,
             keyring,
-            bundle_verifiers: Vec::new(),
             state,
         })
     }
 
     /// Also verify black-box bundles signed by `verifier`'s key (matched on
-    /// the bundle identity's key id). Bundles of other keys are only parsed.
-    pub fn add_bundle_verifier(&mut self, verifier: Box<dyn Verifier>) {
-        self.bundle_verifiers.push(verifier);
+    /// the bundle identity's key id) when they arrive in batches of
+    /// `unit_id`; see [`Keyring::add_bundle_key`]. Bundles of unknown keys
+    /// are only parsed (and their `device_id` checked).
+    pub fn add_bundle_verifier(
+        &mut self,
+        unit_id: &str,
+        verifier: Box<dyn Verifier>,
+    ) -> Result<(), ImportError> {
+        self.keyring
+            .add_bundle_key(unit_id, verifier)
+            .map_err(ImportError::Config)
     }
 
     pub fn state(&self) -> &ImportState {
         &self.state
     }
 
-    /// Process everything currently in the inbox. `now_ms` is only used to
-    /// timestamp quarantine reason files.
+    /// Process everything currently in the inbox. `now_ms` timestamps
+    /// quarantine reason files and is the reference for entry ages.
+    ///
+    /// Returns an error only if the inbox itself cannot be listed; problems
+    /// with individual entries end up in the report.
     pub fn run(&mut self, now_ms: u64) -> Result<ImportReport, ImportError> {
         let mut report = ImportReport::default();
-        let mut entries: Vec<_> = fs::read_dir(&self.cfg.inbox)?
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(|e| (e.file_name(), e.path()))
-            .collect();
+        let mut entries = Vec::new();
+        for e in fs::read_dir(&self.cfg.inbox)? {
+            match e {
+                Ok(e) => entries.push((e.file_name(), e.path())),
+                Err(e) => report.errors.push(EntryError {
+                    name: String::new(),
+                    detail: format!("listing the inbox: {e}"),
+                }),
+            }
+        }
         entries.sort();
         let mut candidates = Vec::new();
         for (os_name, path) in entries {
-            let Some(name) = os_name.to_str().map(str::to_string) else {
-                let n = os_name.to_string_lossy().into_owned();
-                self.quarantine(
-                    &path,
-                    &n,
-                    QuarantineReason::BadEntryName,
-                    now_ms,
-                    &mut report,
-                )?;
-                continue;
-            };
-            if name.starts_with('.') {
-                report.in_transit.push(name);
-                continue;
-            }
-            let meta = fs::symlink_metadata(&path)?;
-            if meta.file_type().is_symlink() {
-                self.quarantine(&path, &name, QuarantineReason::Symlink, now_ms, &mut report)?;
-                continue;
-            }
-            if !meta.is_dir() {
-                self.quarantine(
-                    &path,
-                    &name,
-                    QuarantineReason::NotADirectory,
-                    now_ms,
-                    &mut report,
-                )?;
-                continue;
-            }
-            match self.load_header(&path, &name)? {
-                Ok(c) => candidates.push(c),
-                Err(r) => self.quarantine(&path, &name, r, now_ms, &mut report)?,
+            match self.scan(&os_name, &path, now_ms, &mut report) {
+                Ok(Some(c)) => candidates.push(c),
+                Ok(None) => {}
+                Err(e) => report.errors.push(EntryError {
+                    name: trunc(&os_name.to_string_lossy()),
+                    detail: trunc(&e.to_string()),
+                }),
             }
         }
         candidates.sort_by(|a, b| {
@@ -549,12 +766,71 @@ impl Importer {
                 .cmp(&(&b.manifest.unit_id, b.manifest.batch_seq))
         });
         for c in candidates {
-            self.process(c, now_ms, &mut report)?;
+            let name = c.name.clone();
+            if let Err(e) = self.process(c, now_ms, &mut report) {
+                report.errors.push(EntryError {
+                    name,
+                    detail: trunc(&e.to_string()),
+                });
+            }
         }
         Ok(report)
     }
 
-    fn load_header(&self, dir: &Path, name: &str) -> Checked<Candidate> {
+    /// First look at one inbox entry: quarantine what is obviously bad,
+    /// return an authenticated candidate otherwise.
+    fn scan(
+        &self,
+        os_name: &OsStr,
+        path: &Path,
+        now_ms: u64,
+        report: &mut ImportReport,
+    ) -> io::Result<Option<Candidate>> {
+        use QuarantineReason as Q;
+        let Some(name) = os_name.to_str() else {
+            let n = os_name.to_string_lossy().into_owned();
+            self.quarantine(path, &n, Q::BadEntryName, now_ms, report)?;
+            return Ok(None);
+        };
+        let meta = fs::symlink_metadata(path)?;
+        if name.starts_with('.') {
+            let age_ms = now_ms.saturating_sub(fsutil::mtime_ms(&meta));
+            if self
+                .cfg
+                .in_transit_max_age_ms
+                .is_some_and(|max| age_ms > max)
+            {
+                self.quarantine(path, name, Q::StaleInTransit { age_ms }, now_ms, report)?;
+            } else {
+                report.in_transit.push(name.to_string());
+            }
+            return Ok(None);
+        }
+        if meta.file_type().is_symlink() {
+            self.quarantine(path, name, Q::Symlink, now_ms, report)?;
+            return Ok(None);
+        }
+        if !meta.is_dir() {
+            self.quarantine(path, name, Q::NotADirectory, now_ms, report)?;
+            return Ok(None);
+        }
+        let header = match self.load_header(path, name, fsutil::mtime_ms(&meta)) {
+            Err(e) => match unreadable(&e) {
+                Some(q) => Err(q),
+                None => return Err(e),
+            },
+            Ok(h) => h,
+        };
+        match header {
+            Ok(c) => Ok(Some(c)),
+            Err(r) => {
+                self.quarantine(path, name, r, now_ms, report)?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn load_header(&self, dir: &Path, name: &str, mtime_ms: u64) -> Checked<Candidate> {
         use QuarantineReason as Q;
         let sig_bytes =
             match fsutil::read_capped(&dir.join(SIGNATURE_FILE), MAX_SIGNATURE_FILE_BYTES as u64) {
@@ -661,15 +937,12 @@ impl Importer {
             manifest_bytes,
             sig_bytes,
             hash,
+            mtime_ms,
         }))
     }
 
-    fn process(
-        &mut self,
-        c: Candidate,
-        now_ms: u64,
-        report: &mut ImportReport,
-    ) -> Result<(), ImportError> {
+    fn process(&mut self, c: Candidate, now_ms: u64, report: &mut ImportReport) -> io::Result<()> {
+        use QuarantineReason as Q;
         let unit = c.manifest.unit_id.clone();
         let seq = c.manifest.batch_seq;
         let (last_seq, last_hash, known) = match self.state.units.get(&unit) {
@@ -688,7 +961,7 @@ impl Importer {
                 Some(h) if h == c.hash => {
                     // Nothing is re-emitted, but a corrupted copy is still
                     // reported rather than silently filed away.
-                    if let Err(r) = self.verify_files(&c)? {
+                    if let Err(r) = self.verify_files(&c, None)? {
                         return self.quarantine(&c.path, &c.name, r, now_ms, report);
                     }
                     fsutil::move_unique(&c.path, &self.cfg.processed_dir, &c.name)?;
@@ -699,7 +972,7 @@ impl Importer {
                     });
                 }
                 Some(h) => {
-                    let r = QuarantineReason::Conflict {
+                    let r = Q::Conflict {
                         seq,
                         accepted_hash: h,
                         found_hash: c.hash.clone(),
@@ -707,16 +980,18 @@ impl Importer {
                     self.quarantine(&c.path, &c.name, r, now_ms, report)?;
                 }
                 None => {
-                    let r = QuarantineReason::Replay { seq, last_seq };
+                    let r = Q::Replay { seq, last_seq };
                     self.quarantine(&c.path, &c.name, r, now_ms, report)?;
                 }
             }
             return Ok(());
         }
+        // last_seq <= MAX_BATCH_SEQ (checked on load and on every manifest).
+        let expected_seq = last_seq + 1;
         let mut gap = None;
-        if seq == last_seq + 1 {
+        if seq == expected_seq {
             if c.manifest.prev_batch_hash != last_hash {
-                let r = QuarantineReason::ChainBreak {
+                let r = Q::ChainBreak {
                     seq,
                     expected_prev: last_hash,
                     found_prev: c.manifest.prev_batch_hash.clone(),
@@ -729,23 +1004,41 @@ impl Importer {
             .iter()
             .any(|(u, s)| *u == unit && *s == seq)
         {
-            gap = Some((last_seq + 1, seq - 1));
+            if seq - expected_seq > self.cfg.max_accept_gap {
+                let r = Q::GapTooLarge {
+                    seq,
+                    expected_seq,
+                    max_gap: self.cfg.max_accept_gap,
+                };
+                return self.quarantine(&c.path, &c.name, r, now_ms, report);
+            }
+            gap = Some((expected_seq, seq - 1));
         } else {
+            let age_ms = now_ms.saturating_sub(c.mtime_ms);
+            if self.cfg.held_max_age_ms.is_some_and(|max| age_ms > max) {
+                let r = Q::HeldExpired {
+                    seq,
+                    expected_seq,
+                    age_ms,
+                };
+                return self.quarantine(&c.path, &c.name, r, now_ms, report);
+            }
             report.held.push(HeldBatch {
                 name: c.name,
                 unit_id: unit,
                 seq,
-                expected_seq: last_seq + 1,
+                expected_seq,
+                age_ms,
             });
             return Ok(());
         }
 
-        let verified = match self.verify_files(&c)? {
+        let (output, verified) = match self.emit(&c)? {
             Ok(v) => v,
             Err(r) => return self.quarantine(&c.path, &c.name, r, now_ms, report),
         };
-        let output = self.emit(&c, &verified)?;
 
+        let previous = self.state.units.get(&unit).cloned();
         let st = self.state.units.entry(unit.clone()).or_insert(UnitState {
             last_seq: 0,
             last_hash: String::new(),
@@ -766,23 +1059,36 @@ impl Importer {
                 st.accepted_gaps.drain(..excess);
             }
         }
-        self.save_state()?;
-        fsutil::move_unique(&c.path, &self.cfg.processed_dir, &c.name)?;
+        if let Err(e) = self.save_state() {
+            // Keep memory equal to disk so later batches of this unit are
+            // judged against the persisted state.
+            match previous {
+                Some(p) => self.state.units.insert(unit, p),
+                None => self.state.units.remove(&unit),
+            };
+            return Err(e);
+        }
         report.accepted.push(AcceptedBatch {
-            name: c.name,
+            name: c.name.clone(),
             unit_id: unit,
             seq,
-            batch_hash: c.hash,
+            batch_hash: c.hash.clone(),
             findings: c.manifest.finding_count,
-            bundles: verified.bundles.len(),
+            bundles: verified.bundles,
             bundles_verified: verified.bundles_verified,
             gap_accepted: gap,
             output,
         });
+        // A failure here leaves an accepted batch in the inbox; the next run
+        // sees it as a duplicate and files it then.
+        fsutil::move_unique(&c.path, &self.cfg.processed_dir, &c.name)?;
         Ok(())
     }
 
-    fn verify_files(&self, c: &Candidate) -> Checked<Verified> {
+    /// Verify every data file of `c`. With `stage`, also write
+    /// `records.jsonl` and the bundles into that directory as each file
+    /// passes (streamed; nothing is buffered beyond one data file).
+    fn verify_files(&self, c: &Candidate, stage: Option<&Path>) -> Checked<Verified> {
         use QuarantineReason as Q;
         let m = &c.manifest;
         let total = m.total_size();
@@ -793,9 +1099,17 @@ impl Importer {
             }));
         }
         let listed: BTreeSet<&str> = m.files.iter().map(|f| f.name.as_str()).collect();
-        for e in fs::read_dir(&c.path)? {
-            let e = e?;
-            let n = e.file_name();
+        let rd = match fs::read_dir(&c.path) {
+            Ok(rd) => rd,
+            Err(e) => {
+                return match unreadable(&e) {
+                    Some(q) => Ok(Err(q)),
+                    None => Err(e),
+                }
+            }
+        };
+        for e in rd {
+            let n = e?.file_name();
             let ok = n
                 .to_str()
                 .is_some_and(|n| n == MANIFEST_FILE || n == SIGNATURE_FILE || listed.contains(n));
@@ -805,163 +1119,316 @@ impl Importer {
                 }));
             }
         }
-        let mut records = Vec::new();
-        let mut bundles = Vec::new();
+        let mut records = match stage {
+            Some(d) => Some(BufWriter::new(fsutil::create_new(&d.join(RECORDS_FILE))?)),
+            None => None,
+        };
+        let mut bundles = 0;
         let mut bundles_verified = 0;
         for f in &m.files {
-            let bytes = match fsutil::read_capped(&c.path.join(&f.name), f.size) {
-                Ok(b) => b,
-                Err(ReadError::Missing) => {
-                    return Ok(Err(Q::MissingFile {
-                        name: f.name.clone(),
-                    }))
-                }
-                Err(ReadError::NotRegular) => {
-                    return Ok(Err(Q::NotRegularFile {
-                        name: f.name.clone(),
-                    }))
-                }
-                Err(ReadError::TooLarge(n)) => {
-                    return Ok(Err(Q::SizeMismatch {
-                        name: f.name.clone(),
-                        expected: f.size,
-                        actual: n,
-                    }))
-                }
-                Err(ReadError::Io(e)) => return Err(e),
-            };
-            if bytes.len() as u64 != f.size {
-                return Ok(Err(Q::SizeMismatch {
-                    name: f.name.clone(),
-                    expected: f.size,
-                    actual: bytes.len() as u64,
-                }));
-            }
-            if file_sha256(&bytes) != f.sha256 {
-                return Ok(Err(Q::HashMismatch {
-                    name: f.name.clone(),
-                }));
-            }
             match f.kind {
-                FileKind::Findings => match self.findings_to_records(c, &bytes) {
-                    Ok(r) => records = r,
-                    Err(q) => return Ok(Err(q)),
-                },
-                FileKind::BlackboxBundle => {
-                    let b = match Bundle::from_bytes(&bytes) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            return Ok(Err(Q::BadBundle {
-                                name: f.name.clone(),
-                                detail: e.to_string(),
-                            }))
-                        }
+                FileKind::Findings => {
+                    let mut sink = io::sink();
+                    let w: &mut dyn Write = match records.as_mut() {
+                        Some(w) => w,
+                        None => &mut sink,
                     };
-                    if let Some(v) = self
-                        .bundle_verifiers
-                        .iter()
-                        .find(|v| v.key_id() == b.identity.key_id)
-                    {
-                        let rep = b.verify(v.as_ref(), None, None);
-                        if !rep.is_intact() {
-                            let detail = rep
-                                .first_at_least(FindingLevel::Tamper)
-                                .map(|f| format!("{:?}", f.kind))
-                                .unwrap_or_default();
-                            return Ok(Err(Q::BundleVerifyFailed {
-                                name: f.name.clone(),
-                                detail: trunc(&detail),
-                            }));
-                        }
-                        bundles_verified += 1;
+                    if let Err(q) = self.stream_findings(c, f, w)? {
+                        return Ok(Err(q));
                     }
-                    bundles.push((f.name.clone(), bytes));
+                }
+                FileKind::BlackboxBundle => {
+                    match self.check_bundle(c, f, stage)? {
+                        Ok(verified) => bundles_verified += usize::from(verified),
+                        Err(q) => return Ok(Err(q)),
+                    }
+                    bundles += 1;
                 }
             }
         }
+        if let Some(w) = records {
+            w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+        }
         Ok(Ok(Verified {
-            records,
             bundles,
             bundles_verified,
         }))
     }
 
-    fn findings_to_records(
-        &self,
-        c: &Candidate,
-        bytes: &[u8],
-    ) -> Result<Vec<u8>, QuarantineReason> {
+    /// Read, hash-check, parse and (if a key bound to this unit is known)
+    /// verify one bundle, then copy it into `stage`. `Ok(Ok(true))` when its
+    /// signatures were verified.
+    fn check_bundle(&self, c: &Candidate, f: &FileEntry, stage: Option<&Path>) -> Checked<bool> {
+        use QuarantineReason as Q;
+        let unit = &c.manifest.unit_id;
+        let bytes = match fsutil::read_capped(&c.path.join(&f.name), f.size) {
+            Ok(b) => b,
+            Err(e) => return data_read_error(f, e).map(|r| r.map(|x| match x {})),
+        };
+        if bytes.len() as u64 != f.size {
+            return Ok(Err(Q::SizeMismatch {
+                name: f.name.clone(),
+                expected: f.size,
+                actual: bytes.len() as u64,
+            }));
+        }
+        if file_sha256(&bytes) != f.sha256 {
+            return Ok(Err(Q::HashMismatch {
+                name: f.name.clone(),
+            }));
+        }
+        let b = match Bundle::from_bytes(&bytes) {
+            Ok(b) => b,
+            Err(e) => {
+                return Ok(Err(Q::BadBundle {
+                    name: f.name.clone(),
+                    detail: e.to_string(),
+                }))
+            }
+        };
+        if !self.keyring.robot_allowed(unit, &b.identity.device_id) {
+            return Ok(Err(Q::BundleDeviceNotAllowed {
+                name: f.name.clone(),
+                device_id: trunc(&b.identity.device_id),
+                unit_id: unit.clone(),
+            }));
+        }
+        let mut verified = false;
+        if let Some((key_unit, v)) = self.keyring.find_bundle_key(&b.identity.key_id) {
+            if key_unit != unit {
+                return Ok(Err(Q::BundleKeyUnitMismatch {
+                    name: f.name.clone(),
+                    key_id: trunc(&b.identity.key_id),
+                    key_unit: key_unit.to_string(),
+                    unit_id: unit.clone(),
+                }));
+            }
+            let rep = b.verify(v, None, None);
+            if !rep.is_intact() {
+                let detail = rep
+                    .first_at_least(FindingLevel::Tamper)
+                    .map(|f| format!("{:?}", f.kind))
+                    .unwrap_or_default();
+                return Ok(Err(Q::BundleVerifyFailed {
+                    name: f.name.clone(),
+                    detail: trunc(&detail),
+                }));
+            }
+            verified = true;
+        }
+        drop(b);
+        if let Some(d) = stage {
+            fsutil::write_new(&d.join(&f.name), &bytes)?;
+        }
+        Ok(Ok(verified))
+    }
+
+    /// Stream the findings file in chunks: hash it, split lines (each at
+    /// most `MAX_FINDING_BYTES`), validate each, write its record to `w`.
+    /// The file hash and size are checked before any line-level verdict is
+    /// returned, so a corrupted file is reported as such.
+    fn stream_findings(&self, c: &Candidate, f: &FileEntry, w: &mut dyn Write) -> Checked<()> {
         use QuarantineReason as Q;
         let m = &c.manifest;
-        let Some(body) = bytes.strip_suffix(b"\n") else {
-            return Err(Q::FindingsFormat {
-                detail: "not newline-terminated".into(),
-            });
+        let (file, len) = match fsutil::open_capped(&c.path.join(&f.name), f.size) {
+            Ok(x) => x,
+            Err(e) => return data_read_error(f, e).map(|r| r.map(|x| match x {})),
         };
-        let text = std::str::from_utf8(body).map_err(|_| Q::FindingsFormat {
-            detail: "not UTF-8".into(),
-        })?;
-        let mut out = Vec::with_capacity(bytes.len() * 2);
-        let mut count = 0u64;
-        let (mut first, mut last) = (u64::MAX, 0u64);
-        for (i, line) in text.split('\n').enumerate() {
-            let line_no = i + 1;
-            if line.is_empty() {
-                return Err(Q::FindingsFormat {
-                    detail: format!("empty line {line_no}"),
-                });
+        if len != f.size {
+            return Ok(Err(Q::SizeMismatch {
+                name: f.name.clone(),
+                expected: f.size,
+                actual: len,
+            }));
+        }
+        let mut reader = BufReader::with_capacity(READ_CHUNK, file.take(f.size.saturating_add(1)));
+        let mut hasher = Sha256::new();
+        let mut total = 0u64;
+        let mut line: Vec<u8> = Vec::new();
+        let mut overlong = false;
+        let mut st = FindingsScan {
+            line_no: 0,
+            count: 0,
+            first: u64::MAX,
+            last: 0,
+            err: None,
+            rec_buf: Vec::new(),
+        };
+        loop {
+            let buf = reader.fill_buf()?;
+            if buf.is_empty() {
+                break;
             }
-            let env = robodr_ocsf::parse_and_validate(line).map_err(|errs| Q::InvalidFinding {
+            let n = buf.len();
+            hasher.update(buf);
+            total += n as u64;
+            let mut rest = buf;
+            while !rest.is_empty() {
+                let (piece, ended) = match rest.iter().position(|&b| b == b'\n') {
+                    Some(i) => (&rest[..i], Some(i + 1)),
+                    None => (rest, None),
+                };
+                if !overlong {
+                    if line.len() + piece.len() > MAX_FINDING_BYTES {
+                        overlong = true;
+                        line = Vec::new();
+                    } else {
+                        line.extend_from_slice(piece);
+                    }
+                }
+                match ended {
+                    Some(skip) => {
+                        st.line_no += 1;
+                        if st.err.is_none() {
+                            if overlong {
+                                st.err = Some(Q::FindingsFormat {
+                                    detail: format!(
+                                        "line {} longer than {MAX_FINDING_BYTES} bytes",
+                                        st.line_no
+                                    ),
+                                });
+                            } else {
+                                match self.finding_line(c, &line, &mut st) {
+                                    Ok(()) => w.write_all(&st.rec_buf)?,
+                                    Err(q) => st.err = Some(q),
+                                }
+                            }
+                        }
+                        line.clear();
+                        overlong = false;
+                        rest = &rest[skip..];
+                    }
+                    None => rest = &[],
+                }
+            }
+            reader.consume(n);
+        }
+        if total != f.size {
+            return Ok(Err(Q::SizeMismatch {
+                name: f.name.clone(),
+                expected: f.size,
+                actual: total,
+            }));
+        }
+        if to_hex(&hasher.finalize()) != f.sha256 {
+            return Ok(Err(Q::HashMismatch {
+                name: f.name.clone(),
+            }));
+        }
+        if let Some(q) = st.err {
+            return Ok(Err(q));
+        }
+        if !line.is_empty() || overlong || total == 0 {
+            return Ok(Err(Q::FindingsFormat {
+                detail: "not newline-terminated".into(),
+            }));
+        }
+        if st.count != m.finding_count {
+            return Ok(Err(Q::CountMismatch {
+                declared: m.finding_count,
+                actual: st.count,
+            }));
+        }
+        if m.first_time != Some(st.first) || m.last_time != Some(st.last) {
+            return Ok(Err(Q::TimeRangeMismatch));
+        }
+        Ok(Ok(()))
+    }
+
+    /// Validate one findings line and render its record into `st.rec_buf`.
+    fn finding_line(
+        &self,
+        c: &Candidate,
+        line: &[u8],
+        st: &mut FindingsScan,
+    ) -> Result<(), QuarantineReason> {
+        use QuarantineReason as Q;
+        let m = &c.manifest;
+        let line_no = st.line_no;
+        if line.is_empty() {
+            return Err(Q::FindingsFormat {
+                detail: format!("empty line {line_no}"),
+            });
+        }
+        let text = std::str::from_utf8(line).map_err(|_| Q::FindingsFormat {
+            detail: format!("line {line_no} is not UTF-8"),
+        })?;
+        let env = robodr_ocsf::parse_and_validate(text).map_err(|errs| Q::InvalidFinding {
+            line: line_no,
+            errors: errs.iter().take(5).map(|e| trunc(&e.to_string())).collect(),
+        })?;
+        let robot = &env.entity_context.robot.id;
+        if !self.keyring.robot_allowed(&m.unit_id, robot) {
+            return Err(Q::RobotNotAllowed {
+                line: line_no,
+                robot_id: trunc(robot),
+                unit_id: m.unit_id.clone(),
+            });
+        }
+        let rec =
+            robodr_ocsf::record(&env, self.cfg.partitions).map_err(|errs| Q::InvalidFinding {
                 line: line_no,
                 errors: errs.iter().take(5).map(|e| trunc(&e.to_string())).collect(),
             })?;
-            let rec = robodr_ocsf::record(&env, self.cfg.partitions).map_err(|errs| {
-                Q::InvalidFinding {
-                    line: line_no,
-                    errors: errs.iter().take(5).map(|e| trunc(&e.to_string())).collect(),
-                }
-            })?;
-            first = first.min(env.ocsf.time);
-            last = last.max(env.ocsf.time);
-            count += 1;
-            let o = OutRecord {
-                topic: rec.topic,
-                partition: rec.partition,
-                key: &rec.key,
-                headers: &rec.headers,
-                value: &rec.value,
-                diode: Provenance {
-                    unit_id: &m.unit_id,
-                    batch_seq: m.batch_seq,
-                    batch_hash: &c.hash,
-                    line: line_no,
-                },
-            };
-            serde_json::to_writer(&mut out, &o).map_err(|e| Q::FindingsFormat {
-                detail: trunc(&e.to_string()),
-            })?;
-            out.push(b'\n');
-        }
-        if count != m.finding_count {
-            return Err(Q::CountMismatch {
-                declared: m.finding_count,
-                actual: count,
-            });
-        }
-        if m.first_time != Some(first) || m.last_time != Some(last) {
-            return Err(Q::TimeRangeMismatch);
-        }
-        Ok(out)
+        st.first = st.first.min(env.ocsf.time);
+        st.last = st.last.max(env.ocsf.time);
+        st.count += 1;
+        let o = OutRecord {
+            topic: rec.topic,
+            partition: rec.partition,
+            key: &rec.key,
+            headers: &rec.headers,
+            value: &rec.value,
+            diode: Provenance {
+                unit_id: &m.unit_id,
+                batch_seq: m.batch_seq,
+                batch_hash: &c.hash,
+                line: line_no,
+            },
+        };
+        st.rec_buf.clear();
+        serde_json::to_writer(&mut st.rec_buf, &o).map_err(|e| Q::FindingsFormat {
+            detail: trunc(&e.to_string()),
+        })?;
+        st.rec_buf.push(b'\n');
+        Ok(())
     }
 
-    fn emit(&self, c: &Candidate, v: &Verified) -> io::Result<PathBuf> {
-        let out = self.cfg.out_dir.join(&c.name);
-        if fsutil::exists_nofollow(&out) {
-            // Emitted by an interrupted earlier run (same signed content).
-            fsutil::require_real_dir(&out)?;
-            return Ok(out);
+    /// Does `out` already hold this batch's output, another's, or nothing?
+    fn out_slot(&self, out: &Path, c: &Candidate) -> OutSlot {
+        if !fsutil::exists_nofollow(out) {
+            return OutSlot::Free;
         }
-        let tmp = self.cfg.out_dir.join(format!(".tmp-{}", c.name));
+        if fsutil::require_real_dir(out).is_err() {
+            return OutSlot::Other;
+        }
+        match fsutil::read_capped(&out.join(MANIFEST_FILE), MAX_MANIFEST_BYTES as u64) {
+            Ok(b) if b == c.manifest_bytes => OutSlot::Same,
+            _ => OutSlot::Other,
+        }
+    }
+
+    /// Verify the batch's files and emit them under `out/`. Returns the
+    /// output directory, which always holds *this* batch's records.
+    fn emit(&self, c: &Candidate) -> Checked<(PathBuf, Verified)> {
+        let primary = c.name.clone();
+        let alternate = format!("{}.{}", c.name, &c.hash[..16]);
+        for out_name in [&primary, &alternate] {
+            let out = self.cfg.out_dir.join(out_name);
+            match self.out_slot(&out, c) {
+                OutSlot::Free => return Ok(self.stage_and_publish(c, out_name)?.map(|v| (out, v))),
+                // Emitted by an interrupted earlier run (same signed
+                // content): re-verify the inbox copy, reuse the output.
+                OutSlot::Same => return Ok(self.verify_files(c, None)?.map(|v| (out, v))),
+                OutSlot::Other => {}
+            }
+        }
+        Ok(Err(QuarantineReason::OutputConflict { output: alternate }))
+    }
+
+    fn stage_and_publish(&self, c: &Candidate, out_name: &str) -> Checked<Verified> {
+        let out = self.cfg.out_dir.join(out_name);
+        let tmp = self.cfg.out_dir.join(format!(".tmp-{out_name}"));
         if let Ok(meta) = fs::symlink_metadata(&tmp) {
             if !meta.is_dir() || meta.file_type().is_symlink() {
                 return Err(fsutil::invalid(format!(
@@ -972,25 +1439,31 @@ impl Importer {
             fs::remove_dir_all(&tmp)?;
         }
         fs::create_dir(&tmp)?;
-        fsutil::write_new(&tmp.join(RECORDS_FILE), &v.records)?;
-        for (n, b) in &v.bundles {
-            fsutil::write_new(&tmp.join(n), b)?;
+        let res = (|| -> Checked<Verified> {
+            let v = match self.verify_files(c, Some(&tmp))? {
+                Ok(v) => v,
+                Err(q) => return Ok(Err(q)),
+            };
+            fsutil::write_new(&tmp.join(MANIFEST_FILE), &c.manifest_bytes)?;
+            fsutil::write_new(&tmp.join(SIGNATURE_FILE), &c.sig_bytes)?;
+            fsutil::fsync_dir(&tmp)?;
+            fs::rename(&tmp, &out)?;
+            fsutil::fsync_dir(&self.cfg.out_dir)?;
+            Ok(Ok(v))
+        })();
+        if !matches!(res, Ok(Ok(_))) {
+            let _ = fs::remove_dir_all(&tmp);
         }
-        fsutil::write_new(&tmp.join(MANIFEST_FILE), &c.manifest_bytes)?;
-        fsutil::write_new(&tmp.join(SIGNATURE_FILE), &c.sig_bytes)?;
-        fsutil::fsync_dir(&tmp)?;
-        fs::rename(&tmp, &out)?;
-        fsutil::fsync_dir(&self.cfg.out_dir)?;
-        Ok(out)
+        res
     }
 
-    fn save_state(&self) -> Result<(), ImportError> {
-        let b = serde_json::to_vec_pretty(&self.state)
-            .map_err(|e| ImportError::State(format!("serialisation: {e}")))?;
-        fsutil::atomic_write(&self.cfg.state_path, &b)?;
-        Ok(())
+    fn save_state(&self) -> io::Result<()> {
+        let b = serde_json::to_vec_pretty(&self.state).map_err(io::Error::other)?;
+        fsutil::atomic_write(&self.cfg.state_path, &b)
     }
 
+    /// Move `path` to `quarantine/<unique>/entry` and write
+    /// `quarantine/<unique>/reason.json`.
     fn quarantine(
         &self,
         path: &Path,
@@ -998,34 +1471,32 @@ impl Importer {
         reason: QuarantineReason,
         now_ms: u64,
         report: &mut ImportReport,
-    ) -> Result<(), ImportError> {
+    ) -> io::Result<()> {
         let safe = safe_entry_name(name);
-        let moved = fsutil::move_unique(path, &self.cfg.quarantine_dir, &safe)?;
-        let moved_name = moved
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or(safe);
+        let qdir = fsutil::create_unique_dir(&self.cfg.quarantine_dir, &safe)?;
+        let moved = qdir.join(QUARANTINE_ENTRY);
+        if let Err(e) = fs::rename(path, &moved) {
+            let _ = fs::remove_dir(&qdir);
+            return Err(e);
+        }
         let rf = ReasonFile {
             format: FORMAT,
             entry: &trunc(name),
             quarantined_at_ms: now_ms,
             reason: &reason,
         };
-        let bytes = serde_json::to_vec_pretty(&rf)
-            .map_err(|e| ImportError::State(format!("reason serialisation: {e}")))?;
-        fsutil::atomic_write(
-            &self
-                .cfg
-                .quarantine_dir
-                .join(format!("{moved_name}.reason.json")),
-            &bytes,
-        )?;
+        let bytes = serde_json::to_vec_pretty(&rf).map_err(io::Error::other)?;
+        // Report the move even if the reason file cannot be written: the
+        // entry has left the inbox either way.
+        let written = fsutil::write_new(&qdir.join(REASON_FILE), &bytes)
+            .and_then(|()| fsutil::fsync_dir(&qdir))
+            .and_then(|()| fsutil::fsync_dir(&self.cfg.quarantine_dir));
         report.quarantined.push(QuarantinedBatch {
             name: trunc(name),
             reason,
             moved_to: moved,
         });
-        Ok(())
+        written
     }
 }
 
@@ -1073,6 +1544,32 @@ mod tests {
             .add("a/b", Box::new(HmacSha256Key::new("k2", &[2; 32]).unwrap()))
             .is_err());
         assert_eq!(k.find("k").map(|(u, _)| u), Some("u1"));
+        // Bundle keys: bound to one unit each.
+        k.add_bundle_key("u1", Box::new(HmacSha256Key::new("b", &[3; 32]).unwrap()))
+            .unwrap();
+        assert!(k
+            .add_bundle_key("u2", Box::new(HmacSha256Key::new("b", &[4; 32]).unwrap()))
+            .is_err());
+        assert!(k
+            .add_bundle_key(
+                "../u",
+                Box::new(HmacSha256Key::new("b2", &[4; 32]).unwrap())
+            )
+            .is_err());
+        assert_eq!(k.find_bundle_key("b").map(|(u, _)| u), Some("u1"));
+    }
+
+    #[test]
+    fn robot_allow_list_defaults_to_the_unit_itself() {
+        let mut k = Keyring::new();
+        assert!(k.robot_allowed("u1", "u1"));
+        assert!(!k.robot_allowed("u1", "u2"));
+        k.allow_robot("u1", "u2").unwrap();
+        assert!(k.robot_allowed("u1", "u2"));
+        assert!(!k.robot_allowed("u3", "u2"), "allow-list is per unit");
+        assert!(!k.robot_allowed("u2", "u1"), "not symmetric");
+        assert!(k.allow_robot("u1", "a b").is_err());
+        assert!(k.allow_robot("", "u2").is_err());
     }
 
     #[test]

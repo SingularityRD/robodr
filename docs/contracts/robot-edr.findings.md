@@ -385,13 +385,15 @@ records to Kafka are outside the crate (no network code).
   crate's `Signer` over `"robodr-diode/manifest/v1\0" || manifest`;
   `MANIFEST.sig` = `{format, algorithm, key_id, sig (hex)}`. Batch hash =
   SHA-256(`"robodr-diode/batch-hash/v1\0" || manifest`); each manifest carries
-  the previous batch's hash, so batches form a per-unit hash chain.
-  **Interim:** the only signer available offline is HMAC-SHA256 (symmetric:
-  the SOC holding the key could forge batches). Production needs an
-  asymmetric signer behind the same trait.
-* **Size bounds**: data bytes per batch (default 16 MiB, ≥ 64 KiB + 1) and
-  findings per batch (default 10 000); larger inputs are split into several
-  consecutive batches.
+  the previous batch's hash, so batches form a per-unit hash chain. The
+  binaries sign with Ed25519 (in-crate RFC 8032 implementation, not audited)
+  and the SOC holds public keys only; legacy HMAC-SHA256 needs an explicit
+  `--allow-hmac`. `batch_seq` ≤ 9 999 999 999 999 999 (16 digits).
+* **Size bounds**: data bytes per batch (packer default 16 MiB, range
+  64 KiB + 1 … 256 MiB) and findings per batch (default 10 000); larger
+  inputs are split into several consecutive batches. The importer rejects
+  batches above its `max_batch_bytes` (default 256 MiB = the packer's
+  ceiling); keep the packer setting ≤ the importer's.
 * **Low side (export)**: stage in `outbox/.tmp-<batch>/`, `fsync`, commit
   (`next_seq`, chain head) to the packer state file atomically, then `rename`
   into the outbox. The transfer agent must ignore dot-entries. A crash
@@ -403,25 +405,39 @@ records to Kafka are outside the crate (no network code).
   `seq = last+1` with the right `prev_batch_hash` → verify every file
   (regular file, no symlink, exact size and SHA-256, no unlisted entries),
   run `robodr_ocsf::parse_and_validate` on every line, parse (and, with a
-  black-box verifier configured, verify) every bundle, and emit
+  black-box key bound to this unit configured, verify) every bundle, and emit
   `out/<batch>/records.jsonl` — one Kafka record per line with the **same**
   key, partition rule and headers as §2/§4 (`{topic, partition, key, headers,
-  value, diode: {unit_id, batch_seq, batch_hash, line}}`).
+  value, diode: {unit_id, batch_seq, batch_hash, line}}`). If `out/<batch>/`
+  already holds a *different* batch's output (after an operator state
+  reset), the batch is emitted as `out/<batch>.<hash16>/`; an accepted batch
+  is never reported without its own records on disk.
+* **Unit binding**: every finding's `entity_context.robot.id` and every
+  bundle's `device_id` must be the batch's `unit_id` or on that unit's
+  allow-list (keyring line `robots: <unit_id> <robot_id>...`); a bundle
+  signed with a black-box key registered for another unit is quarantined.
+  A unit's key therefore cannot emit findings or evidence for robots it was
+  not authorised to report on.
 * **Ordering**: batches are processed in `batch_seq` order. A gap is
   **reported and the later batches held** in the inbox until the missing ones
   arrive (reordering heals itself) or an operator explicitly accepts that gap
-  (`--accept-gap unit:seq`, recorded in the importer state); never silently
-  skipped. An identical re-send (same batch hash) is a duplicate: verified,
+  (`--accept-gap unit:seq`, at most `--max-accept-gap` batches, default
+  100 000, recorded in the importer state); never silently skipped. Held
+  batches older than 30 days and dot-entries older than 24 h (both
+  configurable) are quarantined (`held_expired`, `stale_in_transit`). An identical re-send (same batch hash) is a duplicate: verified,
   filed under `processed/`, nothing re-emitted. A different batch for an
   already-used `seq` (conflict), an old `seq` outside the remembered window
   or inside an accepted gap (replay), or a wrong `prev_batch_hash` (chain
   break) is quarantined.
-* **Quarantine**: any failed check moves the batch to `quarantine/` with a
-  `<name>.reason.json` (`reason.code`, e.g. `bad_signature`, `hash_mismatch`,
-  `size_mismatch`, `invalid_finding`, `manifest_invalid`, `symlink`,
-  `conflict`); importer state does not advance, so an intact re-send of the
-  same batch is accepted later (whole-file / whole-batch retransmission is the
-  forward-error strategy; no application-level FEC).
+* **Quarantine**: any failed check moves the entry to its own directory
+  `quarantine/<unique>/entry` with `quarantine/<unique>/reason.json`
+  (`reason.code`, e.g. `bad_signature`, `hash_mismatch`, `size_mismatch`,
+  `invalid_finding`, `robot_not_allowed`, `manifest_invalid`, `symlink`,
+  `conflict`, `unreadable`); importer state does not advance, so an intact
+  re-send of the same batch is accepted later (whole-file / whole-batch
+  retransmission is the forward-error strategy; no application-level FEC).
+  A failure on one inbox entry (I/O, permissions) is reported per entry and
+  never stops the other entries or units from being imported.
 * Because `finding_id` and `event-uid` are deterministic, re-publishing an
   already-imported finding remains idempotent for the consumer.
 

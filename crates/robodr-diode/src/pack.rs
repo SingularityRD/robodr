@@ -26,7 +26,7 @@ use crate::fsutil::{self, ReadError};
 use crate::manifest::{
     batch_dir_name, batch_hash, bundle_file_name, file_sha256, is_hex_digest, is_valid_key_id,
     manifest_signing_message, FileEntry, FileKind, Manifest, SignatureFile, FINDINGS_FILE, FORMAT,
-    MANIFEST_FILE, MAX_FILES, MAX_MANIFEST_BYTES, MAX_SIG_LEN, SIGNATURE_FILE,
+    MANIFEST_FILE, MAX_BATCH_SEQ, MAX_FILES, MAX_MANIFEST_BYTES, MAX_SIG_LEN, SIGNATURE_FILE,
 };
 use robodr_blackbox::crypto::to_hex;
 use robodr_blackbox::{Bundle, Signer};
@@ -44,8 +44,12 @@ pub const DEFAULT_MAX_BATCH_BYTES: u64 = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_FINDINGS_PER_BATCH: usize = 10_000;
 /// Smallest allowed `max_batch_bytes`: one maximal finding must fit.
 pub const MIN_BATCH_BYTES: u64 = MAX_FINDING_BYTES as u64 + 1;
-/// Largest allowed `max_batch_bytes` (1 GiB).
-pub const MAX_BATCH_BYTES: u64 = 1024 * 1024 * 1024;
+/// Largest allowed `max_batch_bytes`: the importer's default cap
+/// ([`DEFAULT_MAX_IMPORT_BATCH_BYTES`](crate::unpack::DEFAULT_MAX_IMPORT_BATCH_BYTES),
+/// 256 MiB), so no packer setting can produce a batch a default-configured
+/// importer quarantines as `batch_too_large`. An importer configured with a
+/// smaller `max_batch_bytes` must be matched by the packer's setting.
+pub const MAX_BATCH_BYTES: u64 = crate::unpack::DEFAULT_MAX_IMPORT_BATCH_BYTES;
 const STATE_FORMAT: &str = "robodr-diode-pack-state/1";
 const MAX_STATE_BYTES: u64 = 64 * 1024;
 const TMP_PREFIX: &str = ".tmp-";
@@ -222,6 +226,7 @@ impl Packer {
                     .map_err(|e| PackError::State(format!("unparsable: {e}")))?;
                 if s.format != STATE_FORMAT
                     || s.next_seq == 0
+                    || s.next_seq > MAX_BATCH_SEQ + 1
                     || (s.next_seq == 1) != s.last_batch_hash.is_none()
                     || s.last_batch_hash
                         .as_deref()
@@ -421,6 +426,11 @@ impl Packer {
 
     fn publish(&mut self, p: Planned, now_ms: u64) -> Result<PublishedBatch, PackError> {
         let seq = self.state.next_seq;
+        if seq > MAX_BATCH_SEQ {
+            return Err(PackError::State(format!(
+                "batch sequence exhausted (> {MAX_BATCH_SEQ})"
+            )));
+        }
         let name = batch_dir_name(&self.cfg.unit_id, seq);
         let mut files: Vec<(String, FileKind, Vec<u8>)> = Vec::new();
         let finding_count = p.findings.len() as u64;
