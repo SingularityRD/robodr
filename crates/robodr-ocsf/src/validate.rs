@@ -17,16 +17,28 @@
 //!   evidences ↔ `evidence_links`, ATT&CK lists, times.
 //! * **Formats**: id charsets, lower-case SHA-256 hex, RFC 3339 timestamp.
 //! * **Every string** in the serialised message (keys and values): at most
-//!   [`MAX_STRING_BYTES`], no control / Unicode format characters, no raw
-//!   `<`, `>` or `` ` `` (SR-TAINT, see [`crate::taint`]).
-//! * **Tainted values**: `taint == adversary`, neutral form, per-field caps.
+//!   [`MAX_STRING_BYTES`], printable ASCII only (U+0020–U+007E) and no raw
+//!   `<`, `>` or `` ` `` (SR-TAINT, see [`crate::taint`]). Trusted config
+//!   (robot model, site, versions) is therefore ASCII-only too.
+//! * **Tainted values**: `taint == adversary`; the value is in canonical
+//!   encoded form for its charset ([`crate::taint::is_encoded`]: ROS-name
+//!   charset for `ros.*`, `command.channel` and tainted `resources[]`, text
+//!   charset for `detail`); per-field caps (raw characters, escaped bytes).
+//!   The value is decoded and everything derivable from it is recomputed:
+//!   `escaped`; while not truncated, `original_len`/`original_sha256` (so the
+//!   value is proven lossless) and, for contract ≥ 1.1, `non_ascii`,
+//!   `mixed_script`, `injection_hint` exactly (only "at least" when
+//!   truncated); `display` must be the ASCII-safe rendering of the decoded
+//!   value and `suspicious` the OR of the other flags.
 //! * **Floats**: finite, non-negative; `anomaly_score` within `[0, 1]`.
 //! * **Size**: serialised message at most [`MAX_FINDING_BYTES`].
 
 use crate::builder::{ocsf_severity_id, ocsf_severity_name, rfc3339_ms};
+use crate::hash::{hex, sha256};
 use crate::model::*;
 use crate::taint::{
-    caps, is_forbidden_char, is_markup_char, is_neutral, Provenance, Tainted, TAINT_LABEL,
+    caps, escaped_cap, is_encoded, is_mixed_script, is_safe_char, looks_like_injection, render,
+    unescape, Charset, Provenance, Tainted, TAINT_LABEL,
 };
 use serde_json::Value;
 use std::fmt;
@@ -106,6 +118,9 @@ impl std::error::Error for ValidationError {}
 
 struct Checker {
     errs: Vec<ValidationError>,
+    /// Contract minor >= 1: `display`, `injection_hint`, `suspicious` exist
+    /// and the flags must match the value exactly.
+    v1_1: bool,
 }
 
 impl Checker {
@@ -154,21 +169,118 @@ impl Checker {
             }
         }
     }
-    fn tainted(&mut self, path: &str, t: &Tainted, cap: usize) {
+    /// Check one [`Tainted`] value. `cap` is the field's cap in raw
+    /// characters ([`caps`]). Because `value` is lossless while not
+    /// truncated, every flag and the display are *recomputed* from it and
+    /// compared, and the hash must match; a truncated value can only be
+    /// checked for consistency with its prefix.
+    fn tainted(&mut self, path: &str, t: &Tainted, cap: usize, cs: Charset) {
         self.eq(
             t.taint,
             Provenance::Adversary,
             "tainted value must carry taint=adversary",
         );
-        self.fmt(is_neutral(&t.value), path, "tainted value not neutralised");
-        if t.value.len() > cap {
+        if t.value.len() > escaped_cap(cap) {
             self.push(ValidationError::TooLong {
                 path: path.into(),
                 len: t.value.len(),
-                max: cap,
+                max: escaped_cap(cap),
             });
         }
         self.sha(&format!("{path}/original_sha256"), &t.original_sha256);
+        let decoded = if is_encoded(&t.value, cs) {
+            unescape(&t.value)
+        } else {
+            None
+        };
+        let Some(raw) = decoded else {
+            self.fmt(
+                false,
+                path,
+                "tainted value not neutralised (not canonical for its charset)",
+            );
+            return;
+        };
+        let p = |k: &str| format!("{path}/{k}");
+        self.fmt(
+            t.escaped == t.value.contains('\\'),
+            &p("escaped"),
+            "escaped flag does not match the value",
+        );
+        let n = raw.chars().count();
+        if n > cap {
+            self.push(ValidationError::TooLong {
+                path: path.into(),
+                len: n,
+                max: cap,
+            });
+        }
+        let (non_ascii, mixed, hint) = (
+            !raw.is_ascii(),
+            is_mixed_script(&raw),
+            looks_like_injection(&raw),
+        );
+        // Flags may only be *stronger* than what the kept prefix shows.
+        self.fmt(
+            t.non_ascii || !non_ascii,
+            &p("non_ascii"),
+            "value escapes a non-ASCII character but non_ascii is false",
+        );
+        self.fmt(
+            t.non_ascii || !t.mixed_script,
+            &p("mixed_script"),
+            "mixed_script requires non_ascii",
+        );
+        if !t.truncated {
+            self.fmt(
+                t.original_len == raw.len() as u64
+                    && t.original_sha256 == hex(&sha256(raw.as_bytes())),
+                &p("original_sha256"),
+                "untruncated value does not decode to the hashed original",
+            );
+        }
+        if !self.v1_1 {
+            return; // contract 1.0: the remaining fields did not exist
+        }
+        if t.truncated {
+            self.fmt(
+                n == cap && t.original_len > raw.len() as u64,
+                &p("truncated"),
+                "truncated value must keep exactly cap characters of a longer original",
+            );
+            self.fmt(
+                (t.mixed_script || !mixed) && (t.injection_hint || !hint),
+                path,
+                "hint flags weaker than the kept prefix",
+            );
+        } else {
+            self.fmt(
+                t.non_ascii == non_ascii,
+                &p("non_ascii"),
+                "non_ascii does not match the value",
+            );
+            self.fmt(
+                t.mixed_script == mixed,
+                &p("mixed_script"),
+                "mixed_script does not match the value",
+            );
+            self.fmt(
+                t.injection_hint == hint,
+                &p("injection_hint"),
+                "injection_hint does not match the value",
+            );
+        }
+        self.fmt(
+            t.display == render(&raw, cs),
+            &p("display"),
+            "display is not the ASCII-safe rendering of the value",
+        );
+        self.fmt(
+            t.suspicious
+                == (t.escaped || t.truncated || t.non_ascii || t.mixed_script || t.injection_hint),
+            &p("suspicious"),
+            "suspicious must be the OR of escaped/truncated/non_ascii/mixed_script/injection_hint",
+        );
     }
 }
 
@@ -213,9 +325,21 @@ fn same_major(v: &str, ours: &str) -> bool {
         && major(v) == major(ours)
 }
 
+/// `true` unless `v` is a well-formed `X.Y.Z` with `Y < min` (malformed
+/// versions are rejected separately; they get the strictest checks).
+fn minor_at_least(v: &str, min: u64) -> bool {
+    v.split('.')
+        .nth(1)
+        .and_then(|m| m.parse::<u64>().ok())
+        .is_none_or(|m| m >= min)
+}
+
 /// Validate a typed finding. `Ok(())` or every problem found.
 pub fn validate(env: &FindingEnvelope) -> Result<(), Vec<ValidationError>> {
-    let mut c = Checker { errs: Vec::new() };
+    let mut c = Checker {
+        errs: Vec::new(),
+        v1_1: minor_at_least(&env.contract_version, 1),
+    };
     let o = &env.ocsf;
     let ec = &env.entity_context;
     let fi = &o.finding_info;
@@ -560,15 +684,15 @@ pub fn validate(env: &FindingEnvelope) -> Result<(), Vec<ValidationError>> {
         for (k, v) in [("uid", &r.uid), ("name", &r.name)] {
             if let Some(v) = v {
                 c.fmt(
-                    is_neutral(v),
+                    is_encoded(v, Charset::RosName),
                     &format!("{p}/{k}"),
-                    "tainted value not neutralised",
+                    "tainted value not neutralised (not canonical for its charset)",
                 );
-                if v.len() > cap {
+                if v.len() > escaped_cap(cap) {
                     c.push(ValidationError::TooLong {
                         path: format!("{p}/{k}"),
                         len: v.len(),
-                        max: cap,
+                        max: escaped_cap(cap),
                     });
                 }
             }
@@ -590,12 +714,27 @@ pub fn validate(env: &FindingEnvelope) -> Result<(), Vec<ValidationError>> {
         ("src_ip", &ros.src_ip, caps::IP),
     ] {
         if let Some(t) = v {
-            c.tainted(&format!("/entity_context/ros/{k}"), t, cap);
+            c.tainted(
+                &format!("/entity_context/ros/{k}"),
+                t,
+                cap,
+                Charset::RosName,
+            );
         }
     }
-    c.tainted("/entity_context/detail", &ec.detail, caps::DETAIL);
+    c.tainted(
+        "/entity_context/detail",
+        &ec.detail,
+        caps::DETAIL,
+        Charset::Text,
+    );
     if let Some(cmd) = &ec.command {
-        c.tainted("/entity_context/command/channel", &cmd.channel, caps::TOPIC);
+        c.tainted(
+            "/entity_context/command/channel",
+            &cmd.channel,
+            caps::TOPIC,
+            Charset::RosName,
+        );
         c.float(
             "/entity_context/command/linear_speed",
             cmd.linear_speed,
@@ -659,7 +798,10 @@ pub fn parse_and_validate(json: &str) -> Result<FindingEnvelope, Vec<ValidationE
     // a contract major version) but dropped on deserialisation, so the string
     // rules are applied to the *raw* document as well: hostile characters are
     // rejected wherever they appear, including in fields we do not know.
-    let mut c = Checker { errs: Vec::new() };
+    let mut c = Checker {
+        errs: Vec::new(),
+        v1_1: true,
+    };
     walk_strings(&raw, &mut String::new(), &mut c);
     if !c.errs.is_empty() {
         return Err(c.errs);
@@ -682,10 +824,7 @@ fn check_str(path: &str, s: &str, c: &mut Checker) {
             max: MAX_STRING_BYTES,
         });
     }
-    if let Some(ch) = s
-        .chars()
-        .find(|&ch| is_forbidden_char(ch) || is_markup_char(ch))
-    {
+    if let Some(ch) = s.chars().find(|&ch| !is_safe_char(ch)) {
         c.push(ValidationError::ForbiddenChar {
             path: path.into(),
             codepoint: ch as u32,

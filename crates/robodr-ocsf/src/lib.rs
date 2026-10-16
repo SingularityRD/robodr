@@ -32,10 +32,10 @@ pub mod taint;
 pub mod validate;
 
 pub use builder::{
-    finding_uid, ocsf_severity_id, ocsf_severity_name, rule_info, FindingBuilder, RobotContext,
-    RuleInfo, Subject,
+    effective_mode, finding_uid, ocsf_severity_id, ocsf_severity_name, rule_info, FindingBuilder,
+    RobotContext, RuleInfo, Subject,
 };
 pub use kafka::{dedup_key, headers, partition_for, record, record_key, to_json, Record};
 pub use model::*;
-pub use taint::{Provenance, Tainted, TAINT_LABEL};
+pub use taint::{Charset, Provenance, Tainted, TAINT_LABEL};
 pub use validate::{parse_and_validate, validate, ValidationError};

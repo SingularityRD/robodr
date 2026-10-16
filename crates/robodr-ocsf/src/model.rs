@@ -23,7 +23,7 @@ use robodr_events::Severity;
 use serde::{Deserialize, Serialize};
 
 /// Contract (envelope) schema version, semver. See the topic contract doc.
-pub const CONTRACT_VERSION: &str = "1.0.0";
+pub const CONTRACT_VERSION: &str = "1.1.0";
 /// OCSF schema version written to `metadata.version`. Detection Finding
 /// (2004) was introduced in OCSF 1.1.0.
 pub const OCSF_VERSION: &str = "1.1.0";

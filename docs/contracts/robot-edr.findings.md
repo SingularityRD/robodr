@@ -2,7 +2,7 @@
 
 | | |
 | --- | --- |
-| Contract version | **1.0.0** (`contract_version` field, `robodr-contract-version` header) |
+| Contract version | **1.1.0** (`contract_version` field, `robodr-contract-version` header); changes in §10 |
 | Producer | RoboDR control plane (Kafka publisher, Sprint 4); diode importer on air-gapped sites |
 | Consumer | AutoSecOps `core/ingestion/kafka_consumer_service.py` |
 | Value schema | [`robot-edr-finding.schema.json`](robot-edr-finding.schema.json) (JSON Schema 2020-12) |
@@ -73,7 +73,7 @@ listed in `crates/robodr-ocsf/README.md` (*OCSF-UNCERTAIN*).
 | Header | Value |
 | --- | --- |
 | `content-type` | `application/json` |
-| `robodr-contract-version` | `1.0.0` |
+| `robodr-contract-version` | `1.1.0` |
 | `ocsf-version` | `1.1.0` |
 | `data-source` | `robot_edr` |
 | `robot-id` | robot id (`[A-Za-z0-9._-]{1,64}`) |
@@ -87,7 +87,7 @@ not trust a header that disagrees with the value.
 
 ```json
 {
-  "contract_version": "1.0.0",
+  "contract_version": "1.1.0",
   "finding_id": "rf1-0d7e79aac05cfd23bcfbdd38ef617eba",
   "external_id": "ugv-007:rf1-0d7e79aac05cfd23bcfbdd38ef617eba",
   "data_source": "robot_edr",
@@ -104,12 +104,14 @@ not trust a header that disagrees with the value.
     "safety_state": { "motion": "moving", "human_proximity": "not_detected" },
     "attestation": "verified",
     "ros": {
-      "participant_guid": { "value": "0102030405060708090a0b0c", "taint": "adversary", "escaped": false,
-                            "truncated": false, "original_len": 24, "original_sha256": "a703…" },
-      "topic":            { "value": "rt/cmd_vel", "taint": "adversary", "…": "…" }
+      "participant_guid": { "value": "0102030405060708090a0b0c", "display": "0102030405060708090a0b0c",
+                            "taint": "adversary", "escaped": false, "truncated": false,
+                            "non_ascii": false, "mixed_script": false, "injection_hint": false,
+                            "suspicious": false, "original_len": 24, "original_sha256": "a703…" },
+      "topic":            { "value": "rt/cmd_vel", "display": "rt/cmd_vel", "taint": "adversary", "…": "…" }
     },
     "occurrence_count": 3,
-    "detail": { "value": "participant 0102… not in profile publishes to motion topic /cmd_vel", "taint": "adversary", "…": "…" }
+    "detail": { "value": "participant 0102… not in profile publishes to motion topic /cmd_vel", "taint": "adversary", "escaped": false, "…": "…" }
   },
   "mitre_predictions": [ { "technique_id": "T0855", "technique_name": "Unauthorized Command Message",
                            "framework": "attack_ics", "provenance": "sensor" } ],
@@ -193,25 +195,83 @@ close a finding by trusting them.*
    sensor-authored config only.
 2. Every `Tainted` object carries `"taint": "adversary"`; every such location is
    listed (JSON Pointer) in `adversary_controlled_fields`.
-3. Neutralisation: control characters (C0, DEL, C1), Unicode format/invisible
-   characters (bidi embeddings/overrides/isolates, zero-width, BOM, line and
-   paragraph separators, tag characters, variation selectors) and the markup
-   characters `<` `>` `` ` `` are rewritten as the visible escape `\u{XXXX}`;
-   a backslash becomes `\\` (so the mapping is injective).
-4. Length caps after neutralisation: topic/node/type name 256 B, GUID 64 B,
-   IP 64 B, detail 1024 B; on truncation `truncated: true` plus the raw
-   `original_len` and `original_sha256` are kept for black-box correlation.
-5. **No string anywhere in the message** (keys included) contains a raw control,
-   format or markup character, or exceeds 4096 B; the whole value is ≤ 64 KiB.
+3. Neutralisation is by **allow-list**, not deny-list (a deny-list of Unicode
+   "invisible" characters cannot be complete without Unicode tables: Arabic
+   number signs U+0600–0605, musical/Egyptian format controls, Mongolian
+   variation selectors, braille blank U+2800, NBSP and other exotic spaces,
+   private-use, unassigned code points, combining marks and Cyrillic
+   homoglyphs all slipped through 1.0). Two charsets:
+
+   | Charset | Fields | Copied raw | Everything else |
+   | --- | --- | --- | --- |
+   | ROS name | `entity_context.ros.*`, `entity_context.command.channel`, tainted `resources[].{uid,name}` | `A-Z a-z 0-9 _ / . : -` | escaped |
+   | Text | `entity_context.detail` | printable ASCII U+0020–U+007E except ``! " # & ' ( ) * < > [ \ ] ` { \| } ~`` | escaped |
+
+   **Escaping scheme** (unchanged syntax since 1.0): a backslash becomes `\\`;
+   any other character outside the raw set becomes `\u{H}` with `H` its code
+   point in upper-case hex, zero-padded to at least 4 digits (no further
+   padding). Since a backslash is never raw, it always starts an escape, so
+   decoding is unambiguous and exact (`robodr_ocsf::taint::unescape`); since
+   escapes of raw characters and non-canonical forms are rejected, every
+   input has exactly one encoding. Every encoded value is printable ASCII.
+   Examples: `/cmd_v\u{0435}l` (Cyrillic `е`), `/x\u{0020}\u{0021}\u{005B}s\u{005D}…`
+   (a Markdown image), `/cmd\u{0600}vel`.
+   Schema patterns: ROS name `^[A-Za-z0-9_/.:{}\\-]*$`, text
+   `^[ $%+,./0-9:;=?@A-Z^_a-z{}\\-]*$` (they admit `\ { }` only because escapes
+   use them; well-formedness/canonicality of escapes is checked by the
+   reference validator, not by the schema).
+
+   **Two renderings** (contract 1.1). `value` is the **lossless escaped
+   original** described above. `display` is an **ASCII-safe rendering** of
+   the same characters: allow-listed characters kept, every other character
+   (backslash included) replaced by `?` — e.g. `/cmd_v?l`,
+   `/x?SYSTEM:?severity?low…`. It is lossy on purpose (no escapes a model
+   could "decode"); schema patterns `^[A-Za-z0-9_/.:?-]*$` (name) and
+   `^[ $%+,./0-9:;=?@A-Z^_a-z-]*$` (text). The reference validator decodes
+   `value` and requires `display` to be exactly its rendering.
+
+   **Flags** (contract 1.1, always emitted by 1.1 producers):
+   `escaped` — at least one character was escaped; `truncated`;
+   `non_ascii` — the raw original had a non-ASCII character (legitimate ROS
+   names never do); `mixed_script` — letters from more than one script
+   (coarse code-point-range heuristic; homoglyph hint); `injection_hint` —
+   prompt-injection-looking content (ASCII case-insensitive keywords after
+   dropping non-ASCII/control characters: role labels `system:`/`assistant:`/
+   `user:`, `ignore`/`disregard`/`instruction`/`prompt`, verdict and field
+   words `benign`/`severity`/`status=`/`resolved`/`verdict`, URLs `://`,
+   Markdown `](`/`![`, HTML entities `&#`/`&lt`, `</`, `{{ }}`, JSON `":`;
+   any line break); `suspicious` — the OR of all of the above, i.e. the value
+   was altered on the way out or looks hostile. The hint flags are signals
+   only: the allow-list applies whether or not they fire.
+4. Length caps are in **characters of the raw input** (= bytes of `display`):
+   topic/node/type name/channel 256, GUID 64, IP 64, detail 400. `value` is at
+   most 10 bytes per kept character (longest escape `\u{10FFFF}`), i.e. 2560 /
+   640 / 4000 B. Within the cap `value` is lossless and the reference
+   validator checks that it decodes to `original_len` bytes hashing to
+   `original_sha256`. Beyond it, `truncated: true`, both renderings keep the
+   first *cap* characters, and the raw `original_len` and `original_sha256`
+   are kept for black-box correlation.
+5. **No string anywhere in the message** (keys included, trusted fields
+   included) contains anything but printable ASCII U+0020–U+007E, nor `<` `>`
+   `` ` ``, nor exceeds 4096 B; the whole value is ≤ 64 KiB. Every string in the
+   JSON Schema has a `pattern` expressing this (or something stricter), so a
+   schema-only consumer rejects raw bidi/format/newline characters and, in
+   tainted fields, Markdown/HTML markup.
 6. Natural-language instructions ("ignore previous instructions…") are *not*
-   filtered (that is undecidable); they survive verbatim as inert, tainted data.
+   filtered (that is undecidable); they survive as inert, tainted data
+   (verbatim in `detail`; with spaces and punctuation escaped in ROS-name
+   fields, where they cannot be legitimate).
 
 **Consumer obligations (AutoSecOps side):**
 
-* Render `Tainted.value` and tainted `resources[]` only inside clearly delimited
-  data blocks in prompts, never as instructions; never let a tainted field be
-  the sole basis for a *benign* verdict (the design doc's provenance rule:
-  a verdict with no sensor-field support degrades to *uncertain*).
+* Put tainted values into prompts only inside clearly delimited data blocks,
+  never as instructions: prefer `Tainted.display`; use `value` (or tainted
+  `resources[]`) when exact identity matters, keeping it escaped (decode only
+  for display to a human, never into a prompt). Never render tainted values
+  as Markdown/HTML. Treat `suspicious` (and the individual flags) as a
+  hostile-name signal; never let a tainted field be the sole basis for a
+  *benign* verdict (the design doc's provenance rule: a verdict with no
+  sensor-field support degrades to *uncertain*).
 * Map `robot_edr` fields per the trust map below; in particular a field the map
   does not list is treated as adversary.
 
@@ -251,7 +311,7 @@ close a finding by trusting them.*
 | Whole value | 64 KiB (well under Kafka's 1 MiB default `max.message.bytes`) |
 | Any string | 4096 B |
 | `title` / `description` | 256 B / 2048 B |
-| Tainted fields | see SR-TAINT (256 / 64 / 1024 B) |
+| Tainted fields | see SR-TAINT (256 / 64 / 400 characters; `value` ≤ 10 B per character) |
 | `evidences` / `evidence_links` | ≤ 64 |
 | `mitre_predictions` | ≤ 16 |
 | `resources` | ≤ 8 |
@@ -289,6 +349,7 @@ Quoted from *Yapılacak işler* (to-do), with what this contract needs from each
 
 - [ ] *"Robot EDR kontrol düzleminden `robot-edr.findings` topic'ine bulgu yayını ve şema"* — schema: **this document**; publisher: Sprint 4 (E3).
 - [ ] *"`core/federation/provenance.py`: `robot_edr` kaynak güveni haritası"* — the trust map. Design doc: **sensor** = robot id, attestation status, firmware hash, safety state, bus message id, command value, permitted envelope, severity, time; **adversary** = ROS node and topic names, process and file names, hostname, command line. In this contract:
+  - `entity_context.mode` is the stricter of the robot's profile mode and the deviation's own mode: `observe` if either says observe (report only; never act on it).
   - sensor: `finding_id`, `external_id`, `severity`, `timestamp`, `entity_context.{robot, profile, rule_id, mode, safety_state, attestation, bus_message_id, occurrence_count}`, `entity_context.command.{linear_speed, joint_speed, envelope_max_*}`, `mitre_predictions` (written by RoboDR's rule catalog, *not* third-party — note the generic Kafka map would wrongly treat MITRE as third-party), `evidence_links`, `anomaly_score`, all `ocsf.*` except below;
   - adversary: every pointer in `adversary_controlled_fields` (`entity_context.ros.*`, `entity_context.command.channel`, `entity_context.detail`, `ocsf.resources[*]`, and the `ocsf.unmapped.robodr` copies). We also classify **participant GUID and source IP** as adversary (the participant chooses its GUID; UDP source addresses are spoofable) — stricter than the design doc's list, deliberately.
   - Until this map ships, the generic Kafka map applies ("ham olay saldırgan yazımı sayılır" — the raw event counts as adversary-authored), which is safe but loses the sensor fields.
@@ -308,3 +369,30 @@ Consumer acceptance checks for this contract:
 - [ ] `robotics` category assigned from `mitre_predictions`; never autonomous.
 - [ ] Tainted fields rendered as delimited data; never sole support for a benign verdict.
 - [ ] `evidence_links` resolved through the control plane's black-box API (not fetched directly from robots).
+
+## 10. Changelog
+
+* **1.1.0** — SR-TAINT hardening and safety fix after independent review.
+  - Neutralisation moved from a deny-list to the allow-lists in §3; more
+    characters are escaped, with the same escape syntax (1.0 decoders still
+    decode correctly). Free text (`detail`) now also escapes Markdown/HTML/
+    template metacharacters.
+  - New optional `Tainted` fields (always emitted by 1.1 producers): the
+    ASCII-safe rendering `display`, and the flags `non_ascii`,
+    `mixed_script`, `injection_hint`, `suspicious`. `value` is now documented
+    and checked as the lossless escaped original (hash-verified while not
+    truncated).
+  - Caps are now in raw characters (256 / 64 / 400) instead of escaped
+    bytes, so an all-non-ASCII name of legal length is no longer cut to a few
+    characters; `value` may be up to 10 B per character. `_` is now raw in
+    the text charset (readability of ROS names in `detail`).
+  - Every schema string has a `pattern`; trusted strings must be printable
+    ASCII. `Tainted` split into `TaintedName` / `TaintedText` in the schema.
+  - `entity_context.mode`: an observe-only deviation is now published as
+    `observe` even when the robot profile is locked (1.0 reported `enforce`).
+  - Compatibility: the reference validator still accepts `1.y.z`; for
+    `1.0.z` messages it skips the checks of fields 1.0 did not have. A 1.0
+    message whose tainted values or trusted strings contain characters that
+    1.1 escapes/forbids is rejected on replay. Consumers that read 1.0
+    `value` strings keep working (same escape syntax, stricter raw set).
+* **1.0.0** — initial contract.

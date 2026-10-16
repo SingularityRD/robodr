@@ -50,7 +50,16 @@
 //! rule catalog in this module and from sensor-authored context (robot id,
 //! model, site, profile version, mode, safety state). `Deviation::detail` is
 //! *not* used for narrative text, because the detection core interpolates
-//! attacker-chosen names into it; it is carried as a [`Tainted`] value.
+//! attacker-chosen names into it; it is carried as a [`Tainted`] value
+//! (free-text charset); ROS/DDS identifiers use the stricter ROS-name charset
+//! (see [`crate::taint`]).
+//!
+//! ## Mode
+//!
+//! `entity_context.mode` (and the `mode` in `description`) is
+//! [`effective_mode`]: *observe* if either the robot context or the
+//! [`Deviation::mode`] says observe. A consumer must never see `enforce` for a
+//! deviation the detection core marked observe-only.
 
 use crate::hash::{framed_sha256, hex};
 use crate::model::*;
@@ -284,6 +293,16 @@ pub fn rfc3339_ms(ms: u64) -> String {
     )
 }
 
+/// The mode published for `dev` raised under `ctx_mode`: the stricter of the
+/// two, where *observe* (report only, never act) is stricter than enforce.
+pub fn effective_mode(ctx_mode: Mode, dev: &Deviation) -> Mode {
+    if ctx_mode == Mode::Observe || dev.is_observe_only() {
+        Mode::Observe
+    } else {
+        Mode::Enforce
+    }
+}
+
 fn mode_name(m: Mode) -> &'static str {
     match m {
         Mode::Observe => "observe",
@@ -456,7 +475,12 @@ impl<'a> FindingBuilder<'a> {
         let uid = self.finding_uid();
         let robot_id = ctx.robot.id.clone();
 
-        let t = |v: &Option<String>, cap| v.as_deref().map(|s| Tainted::new(s, cap));
+        // Observe wins: a deviation the detection core marked observe-only must
+        // never be published as enforce, whatever the robot context says (and
+        // an observe-mode context downgrades every deviation).
+        let mode = effective_mode(ctx.mode, dev);
+
+        let t = |v: &Option<String>, cap| v.as_deref().map(|s| Tainted::ros_name(s, cap));
         let ros = RosContext {
             participant_guid: t(&self.subject.participant_guid, caps::GUID),
             node: t(&self.subject.node, caps::NODE),
@@ -465,7 +489,7 @@ impl<'a> FindingBuilder<'a> {
             src_ip: t(&self.subject.src_ip, caps::IP),
         };
         let command = self.command.as_ref().map(|c| CommandContext {
-            channel: Tainted::new(&c.channel, caps::TOPIC),
+            channel: Tainted::ros_name(&c.channel, caps::TOPIC),
             linear_speed: c.linear_speed,
             joint_speed: c.joint_speed,
             envelope_max_linear_speed: c.envelope.as_ref().and_then(|e| e.max_linear_speed),
@@ -476,7 +500,7 @@ impl<'a> FindingBuilder<'a> {
             robot: ctx.robot.clone(),
             profile: ctx.profile.clone(),
             rule_id: dev.rule.to_string(),
-            mode: ctx.mode,
+            mode,
             safety_state: self.safety,
             attestation: self.attestation,
             ros: ros.clone(),
@@ -534,7 +558,7 @@ impl<'a> FindingBuilder<'a> {
             ctx.robot.site,
             firmware,
             ctx.profile.version,
-            mode_name(ctx.mode),
+            mode_name(mode),
             motion_name(self.safety.motion),
             proximity_name(self.safety.human_proximity),
             attestation_name(self.attestation),
