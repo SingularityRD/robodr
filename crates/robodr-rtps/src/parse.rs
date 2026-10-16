@@ -3,12 +3,15 @@
 //! See the crate docs for the GUID-attribution rules; this module implements
 //! them in [`Report::handle_sample`].
 
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use robodr_events::graph::{Endpoint, Participant};
 use robodr_events::RobotEvent;
 
-use crate::frag::{FragIn, FragOutcome, FragmentReassembler, SampleKey};
+use crate::frag::{
+    FragIn, FragOutcome, FragmentEvent, FragmentEventKind, FragmentReassembler, SampleKey,
+};
 use crate::vendor;
 use crate::wire::*;
 
@@ -46,6 +49,12 @@ pub(crate) const RTPS_HEADER_LEN: usize = 20;
 pub const MAX_LOCATORS_PER_LIST: usize = 16;
 /// Anomalies kept per datagram ([`ParseStats::anomalies`] still counts all).
 pub const MAX_ANOMALIES: usize = 32;
+/// Distinct values kept per multi-valued parameter (topic name, type name,
+/// endpoint GUID, participant GUID) per sample. The first and the last
+/// occurrence are always among them.
+pub const MAX_PARAMETER_VALUES: usize = 4;
+/// [`FragmentEvent`]s kept per datagram (the stats count all).
+pub const MAX_FRAGMENT_EVENTS: usize = 32;
 
 /// Which builtin discovery topic a DATA belongs to (from its writer id).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -187,7 +196,38 @@ pub enum EndpointKind {
     Reader,
 }
 
+/// Another reading of an SEDP announcement whose parameters were duplicated
+/// with different values (see [`EndpointInfo::alternates`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointAlternate {
+    pub guid: Option<Guid>,
+    pub participant: GuidPrefix,
+    pub topic: String,
+    pub type_name: String,
+}
+
+impl EndpointAlternate {
+    /// The `robodr-events` view.
+    pub fn to_endpoint(&self) -> Endpoint {
+        Endpoint {
+            guid_prefix: hex(&self.participant),
+            topic: self.topic.clone(),
+            type_name: self.type_name.clone(),
+        }
+    }
+}
+
 /// An SEDP endpoint announcement.
+///
+/// `guid` / `participant` / `topic` / `type_name` are the *first-occurrence*
+/// reading. When the sample repeats `PID_TOPIC_NAME`, `PID_TYPE_NAME`,
+/// `PID_ENDPOINT_GUID` (or, without an endpoint GUID, `PID_PARTICIPANT_GUID`)
+/// with different values, DDS stacks disagree on which one counts (Fast DDS
+/// overwrites per occurrence: last wins; others keep the first or reject the
+/// sample). A detector must see what *any* of them may see, so every
+/// distinct value is kept ([`EndpointInfo::topics`],
+/// [`EndpointInfo::type_names`], [`EndpointInfo::alternates`]) and
+/// [`DatagramReport::to_events`] emits one event per reading.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndpointInfo {
     pub kind: EndpointKind,
@@ -204,6 +244,17 @@ pub struct EndpointInfo {
     pub guid_conflict: bool,
     pub topic: String,
     pub type_name: String,
+    /// Every distinct topic name in the sample, first-appearance order
+    /// (`topics[0] == topic`). At most [`MAX_PARAMETER_VALUES`].
+    pub topics: Vec<String>,
+    /// Every distinct type name (empty if none was given).
+    pub type_names: Vec<String>,
+    /// Other readings than the first-occurrence one, de-duplicated: the
+    /// all-last-occurrence reading (what a last-wins stack sees) and one per
+    /// remaining distinct value, paired with the first values of the other
+    /// parameters. Empty for a well-formed announcement. Linear, not a cross
+    /// product, so it stays bounded by the number of parameters present.
+    pub alternates: Vec<EndpointAlternate>,
     /// Reassembled from DATA_FRAG.
     pub from_fragments: bool,
 }
@@ -215,13 +266,55 @@ impl EndpointInfo {
         self.participant != self.source
     }
 
-    /// The `robodr-events` view.
+    /// The `robodr-events` view of the first-occurrence reading.
     pub fn to_endpoint(&self) -> Endpoint {
         Endpoint {
             guid_prefix: hex(&self.participant),
             topic: self.topic.clone(),
             type_name: self.type_name.clone(),
         }
+    }
+
+    /// Every reading, first-occurrence one first, as `robodr-events`
+    /// endpoints (distinct by participant / topic / type).
+    ///
+    /// When the announcement was [`relayed`](Self::relayed) (the GUID it
+    /// names belongs to a participant other than the one that sent it), each
+    /// reading is emitted a second time attributed to the *sender*
+    /// ([`EndpointInfo::source`]). The GUID in the payload is
+    /// unauthenticated: a rogue participant can name a profiled
+    /// participant's prefix there, and the `robodr-events` endpoint has no
+    /// field for the sender. The extra event makes a profile check judge the
+    /// sender too; a legitimate relay (a discovery server) is itself a
+    /// profiled participant, so on learned topics it raises nothing.
+    pub fn to_endpoints(&self) -> Vec<Endpoint> {
+        let mut out = vec![self.to_endpoint()];
+        for a in &self.alternates {
+            let e = a.to_endpoint();
+            if !out.contains(&e) {
+                out.push(e);
+            }
+        }
+        if self.source != GUIDPREFIX_UNKNOWN {
+            let sender = hex(&self.source);
+            for i in 0..out.len() {
+                if out[i].guid_prefix != sender {
+                    let e = Endpoint {
+                        guid_prefix: sender.clone(),
+                        ..out[i].clone()
+                    };
+                    if !out.contains(&e) {
+                        out.push(e);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The sample carried conflicting duplicates of an identifying parameter.
+    pub fn ambiguous(&self) -> bool {
+        !self.alternates.is_empty()
     }
 }
 
@@ -266,6 +359,10 @@ pub struct SpdpInfo {
     pub metatraffic_multicast: Vec<Locator>,
     pub default_unicast: Vec<Locator>,
     pub default_multicast: Vec<Locator>,
+    /// Prefixes of further, conflicting `PID_PARTICIPANT_GUID` values in the
+    /// same sample (a last-wins stack would register the last one). Each also
+    /// gets a participant event.
+    pub alternate_guid_prefixes: Vec<GuidPrefix>,
     pub from_fragments: bool,
 }
 
@@ -309,7 +406,8 @@ impl SpdpInfo {
 /// Useful as a low-severity signal (fuzzing, spoofing attempts, buggy peers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Anomaly {
-    /// The protocol major version is not 2; submessages were not parsed.
+    /// The protocol major version is not 2. The submessages are still parsed
+    /// best-effort with the 2.x layout (some stacks only reject major < 2).
     UnsupportedProtocolVersion(u8, u8),
     /// A submessage header or length ran past the end of the datagram.
     TruncatedSubmessage,
@@ -321,16 +419,28 @@ pub enum Anomaly {
     MalformedDataFrag,
     /// octetsToInlineQos smaller than the fixed fields it must skip.
     BadOctetsToInlineQos,
-    /// Parameter list without a sentinel, misaligned length, or overrun.
+    /// Parameter list without a sentinel, or a length past the end. The
+    /// parameters before the fault are still used.
     MalformedParameterList,
+    /// A parameter length that is not a multiple of 4 (§9.4.2.11). Accepted:
+    /// the next parameter is read right after it, as Fast DDS does.
+    MisalignedParameterLength,
     /// PID_EXTENDED in a discovery parameter list.
     UnsupportedParameter,
     /// Payload encapsulation other than PL_CDR (or CDR for a key).
     UnsupportedEncapsulation(u16),
     /// A known parameter whose value does not decode.
     BadParameterValue(u16),
-    /// The same parameter twice with different values (first one wins).
+    /// The same parameter twice with different values. For topic / type
+    /// names and GUIDs all values are kept (see [`EndpointInfo::alternates`]);
+    /// for other parameters the first one wins.
     ConflictingDuplicateParameter(u16),
+    /// More than [`MAX_PARAMETER_VALUES`] distinct values of one parameter.
+    TooManyParameterValues(u16),
+    /// A topic / type name whose CDR string is not canonical (embedded NUL,
+    /// missing NUL, wrong length field). The name was read up to the first
+    /// NUL, the way a C-string based stack reads it.
+    NonCanonicalString(u16),
     /// `PID_ENDPOINT_GUID` and `PID_PARTICIPANT_GUID` name different participants.
     EndpointParticipantMismatch,
     /// Inline `PID_KEY_HASH` disagrees with the GUID in the payload.
@@ -341,6 +451,12 @@ pub enum Anomaly {
     AnnouncementWithoutTopic,
     /// More than [`MAX_LOCATORS_PER_LIST`] locators in one list.
     TooManyLocators,
+    /// The reassembler evicted a partial discovery sample (see
+    /// [`DatagramReport::fragment_events`]).
+    DiscoveryFragmentEvicted,
+    /// A discovery fragment overlapped received bytes with different
+    /// content; the first copy was kept.
+    ConflictingDiscoveryFragment,
 }
 
 /// Counters for one datagram.
@@ -360,6 +476,10 @@ pub struct ParseStats {
     pub frag_completed: u32,
     /// Discovery fragments refused by the reassembler in this datagram.
     pub frag_rejected: u32,
+    /// Partial discovery samples evicted by the reassembler in this datagram.
+    pub frag_evicted: u32,
+    /// Conflicting overlapping discovery fragments in this datagram.
+    pub frag_conflicts: u32,
     /// DDS-Security protected submessages (content unreadable to us).
     pub secure: u32,
     pub vendor_specific: u32,
@@ -384,33 +504,41 @@ pub struct DatagramReport {
     pub removed_participants: Vec<ParticipantRemoval>,
     pub removed_endpoints: Vec<EndpointRemoval>,
     pub anomalies: Vec<Anomaly>,
+    /// Discovery samples the reassembler evicted, fragments it refused and
+    /// conflicting overlaps, caused by this datagram (at most
+    /// [`MAX_FRAGMENT_EVENTS`]; without a [`FragmentReassembler`], those of
+    /// the per-datagram one). Each one is a discovery announcement the
+    /// sensor could not fully inspect.
+    pub fragment_events: Vec<FragmentEvent>,
     pub stats: ParseStats,
 }
 
 impl DatagramReport {
     /// A discovery sample was fragmented (DATA_FRAG from a builtin discovery
-    /// writer). Without a [`FragmentReassembler`] its content was not seen.
+    /// writer). Without a [`FragmentReassembler`] only samples whose
+    /// fragments all sat in this datagram were decoded
+    /// ([`ParseStats::frag_completed`]); the rest was not seen.
     pub fn fragmented_discovery_seen(&self) -> bool {
         self.stats.discovery_data_frag > 0
     }
 
     /// The `robodr-events` view: exactly one `Ros2ParticipantDiscovered` per
-    /// distinct participant (message sources first, then SPDP-announced ones,
-    /// locators merged), then one writer/reader event per announced endpoint.
-    /// Removals produce no events.
+    /// distinct participant (message sources first, then SPDP-announced ones
+    /// and their alternate GUIDs, locators merged), then one writer/reader
+    /// event per reading of each announced endpoint (normally one; see
+    /// [`EndpointInfo::alternates`]). Removals produce no events.
+    /// Linear time (hash-indexed merging).
     pub fn to_events(&self, src_ip: &str) -> Vec<RobotEvent> {
         let mut parts: Vec<(GuidPrefix, Vec<String>)> = Vec::new();
+        let mut index: HashMap<GuidPrefix, (usize, HashSet<String>)> = HashMap::new();
         let mut upsert = |prefix: GuidPrefix, locs: Vec<String>| {
-            let i = match parts.iter().position(|(p, _)| *p == prefix) {
-                Some(i) => i,
-                None => {
-                    parts.push((prefix, Vec::new()));
-                    parts.len() - 1
-                }
-            };
+            let (i, seen) = index.entry(prefix).or_insert_with(|| {
+                parts.push((prefix, Vec::new()));
+                (parts.len() - 1, HashSet::new())
+            });
             for l in locs {
-                if !parts[i].1.contains(&l) {
-                    parts[i].1.push(l);
+                if seen.insert(l.clone()) {
+                    parts[*i].1.push(l);
                 }
             }
         };
@@ -419,6 +547,9 @@ impl DatagramReport {
         }
         for p in &self.participants {
             upsert(p.guid_prefix, p.unicast_locator_strings());
+            for a in &p.alternate_guid_prefixes {
+                upsert(*a, Vec::new());
+            }
         }
         let mut events: Vec<RobotEvent> = parts
             .into_iter()
@@ -430,10 +561,12 @@ impl DatagramReport {
                 })
             })
             .collect();
-        events.extend(self.endpoints.iter().map(|e| match e.kind {
-            EndpointKind::Writer => RobotEvent::Ros2WriterDiscovered(e.to_endpoint()),
-            EndpointKind::Reader => RobotEvent::Ros2ReaderDiscovered(e.to_endpoint()),
-        }));
+        for e in &self.endpoints {
+            events.extend(e.to_endpoints().into_iter().map(|ep| match e.kind {
+                EndpointKind::Writer => RobotEvent::Ros2WriterDiscovered(ep),
+                EndpointKind::Reader => RobotEvent::Ros2ReaderDiscovered(ep),
+            }));
+        }
         events
     }
 }
@@ -448,13 +581,36 @@ struct Sample<'a> {
     from_fragments: bool,
 }
 
-/// Decoded discovery parameters (first occurrence wins).
+/// Distinct values of a repeated parameter, first-appearance order, plus the
+/// index of the value of the last occurrence.
+struct Multi<T> {
+    vals: Vec<T>,
+    last: usize,
+}
+
+impl<T> Default for Multi<T> {
+    fn default() -> Self {
+        Self {
+            vals: Vec::new(),
+            last: 0,
+        }
+    }
+}
+
+impl<T: Copy> Multi<T> {
+    fn first(&self) -> Option<T> {
+        self.vals.first().copied()
+    }
+}
+
+/// Decoded discovery parameters. Identifying parameters keep every distinct
+/// value ([`Multi`]); the others keep the first occurrence.
 #[derive(Default)]
 struct Params {
-    topic: Option<String>,
-    type_name: Option<String>,
-    endpoint_guid: Option<Guid>,
-    participant_guid: Option<Guid>,
+    topic: Multi<String>,
+    type_name: Multi<String>,
+    endpoint_guid: Multi<Guid>,
+    participant_guid: Multi<Guid>,
     key_hash: Option<Guid>,
     protocol_version: Option<(u8, u8)>,
     vendor_id: Option<[u8; 2]>,
@@ -481,6 +637,7 @@ impl Report {
             removed_participants: Vec::new(),
             removed_endpoints: Vec::new(),
             anomalies: Vec::new(),
+            fragment_events: Vec::new(),
             stats: ParseStats::default(),
         }
     }
@@ -492,9 +649,51 @@ impl Report {
         }
     }
 
-    fn add_source(&mut self, p: GuidPrefix) {
-        if p != GUIDPREFIX_UNKNOWN && !self.sources.contains(&p) {
+    /// Record a source prefix. Membership is hash-indexed (`seen`), so a
+    /// datagram of thousands of distinct INFO_SRC stays linear. Not capped:
+    /// every sender is reported (a cap would let padding hide one).
+    fn add_source(&mut self, seen: &mut HashSet<GuidPrefix>, p: GuidPrefix) {
+        if p != GUIDPREFIX_UNKNOWN && seen.insert(p) {
             self.sources.push(p);
+        }
+    }
+
+    /// Record one value of a multi-valued parameter.
+    fn push_multi<T: PartialEq>(&mut self, m: &mut Multi<T>, v: T, pid: u16) {
+        if let Some(i) = m.vals.iter().position(|x| *x == v) {
+            m.last = i;
+            return;
+        }
+        if !m.vals.is_empty() {
+            self.anomaly(Anomaly::ConflictingDuplicateParameter(pid));
+        }
+        if m.vals.len() < MAX_PARAMETER_VALUES {
+            m.vals.push(v);
+            m.last = m.vals.len() - 1;
+        } else {
+            // Keep the first values and always the latest one.
+            self.anomaly(Anomaly::TooManyParameterValues(pid));
+            m.last = MAX_PARAMETER_VALUES - 1;
+            m.vals[m.last] = v;
+        }
+    }
+
+    fn fragment_event(&mut self, e: FragmentEvent) {
+        match e.kind {
+            FragmentEventKind::Evicted(_) => {
+                self.stats.frag_evicted = self.stats.frag_evicted.saturating_add(1);
+                self.anomaly(Anomaly::DiscoveryFragmentEvicted);
+            }
+            FragmentEventKind::Rejected(_) => {
+                self.stats.frag_rejected = self.stats.frag_rejected.saturating_add(1);
+            }
+            FragmentEventKind::ConflictingOverlap => {
+                self.stats.frag_conflicts = self.stats.frag_conflicts.saturating_add(1);
+                self.anomaly(Anomaly::ConflictingDiscoveryFragment);
+            }
+        }
+        if self.fragment_events.len() < MAX_FRAGMENT_EVENTS {
+            self.fragment_events.push(e);
         }
     }
 
@@ -565,7 +764,11 @@ impl Report {
                 _ => {}
             }
         }
+        if it.misaligned() {
+            self.anomaly(Anomaly::MisalignedParameterLength);
+        }
         if it.end() != PlEnd::Sentinel {
+            // Without the sentinel the payload offset is unknown.
             self.anomaly(Anomaly::MalformedParameterList);
             return None;
         }
@@ -578,7 +781,7 @@ impl Report {
     /// [inlineQos] | fragments.
     fn handle_data_frag(
         &mut self,
-        reasm: Option<&mut FragmentReassembler>,
+        reasm: &mut FragmentReassembler,
         body: &[u8],
         flags: u8,
         source: GuidPrefix,
@@ -595,9 +798,6 @@ impl Report {
             return;
         };
         self.stats.discovery_data_frag += 1;
-        let Some(reasm) = reasm else {
-            return; // stateless mode: counted, not reassembled
-        };
         let (Some(sn_hi), Some(sn_lo), Some(start), Some(count), Some(frag_size), Some(size)) = (
             read_u32(body, 12, le),
             read_u32(body, 16, le),
@@ -616,23 +816,31 @@ impl Report {
             return;
         };
         let key_only = flags & FLAG_FRAG_K != 0;
-        let outcome = reasm.add(FragIn {
-            key: SampleKey {
-                source,
-                writer,
-                sn: (u64::from(sn_hi) << 32) | u64::from(sn_lo),
+        let mut events = Vec::new();
+        let outcome = reasm.add(
+            FragIn {
+                key: SampleKey {
+                    source,
+                    writer,
+                    sn: (u64::from(sn_hi) << 32) | u64::from(sn_lo),
+                },
+                topic,
+                start,
+                count,
+                frag_size,
+                sample_size: size,
+                data,
+                inline,
+                key_only,
             },
-            start,
-            count,
-            frag_size,
-            sample_size: size,
-            data,
-            inline,
-            key_only,
-        });
+            &mut events,
+        );
+        for e in events {
+            self.fragment_event(e);
+        }
         match outcome {
-            FragOutcome::Pending => {}
-            FragOutcome::Rejected => self.stats.frag_rejected += 1,
+            // Both already reported through the fragment events.
+            FragOutcome::Pending | FragOutcome::Rejected => {}
             FragOutcome::Complete(buf, inline, key_only) => {
                 self.stats.frag_completed += 1;
                 self.handle_sample(Sample {
@@ -673,17 +881,17 @@ impl Report {
         for (pid, v) in it.by_ref() {
             self.decode_param(&mut out, pid, v, le);
         }
-        match it.end() {
-            PlEnd::Sentinel => Some(out),
-            PlEnd::Unsupported => {
-                self.anomaly(Anomaly::UnsupportedParameter);
-                None
-            }
-            _ => {
-                self.anomaly(Anomaly::MalformedParameterList);
-                None
-            }
+        if it.misaligned() {
+            self.anomaly(Anomaly::MisalignedParameterLength);
         }
+        // Lenient: whatever was decoded before a fault is kept (a stack that
+        // processes parameters as it reads them has acted on them too).
+        match it.end() {
+            PlEnd::Sentinel => {}
+            PlEnd::Unsupported => self.anomaly(Anomaly::UnsupportedParameter),
+            PlEnd::Malformed | PlEnd::Open => self.anomaly(Anomaly::MalformedParameterList),
+        }
+        Some(out)
     }
 
     fn decode_param(&mut self, out: &mut Params, pid: u16, v: &[u8], le: bool) {
@@ -710,11 +918,28 @@ impl Report {
                 }
             }
         }
+        fn name(r: &mut Report, m: &mut Multi<String>, v: &[u8], le: bool, pid: u16) {
+            match cdr_string_lenient(v, le) {
+                None => r.anomaly(Anomaly::BadParameterValue(pid)),
+                Some((s, canonical)) => {
+                    if !canonical {
+                        r.anomaly(Anomaly::NonCanonicalString(pid));
+                    }
+                    r.push_multi(m, s, pid);
+                }
+            }
+        }
+        fn guid(r: &mut Report, m: &mut Multi<Guid>, v: &[u8], pid: u16) {
+            match read_array(v, 0) {
+                None => r.anomaly(Anomaly::BadParameterValue(pid)),
+                Some(g) => r.push_multi(m, g, pid),
+            }
+        }
         match pid {
-            PID_TOPIC_NAME => set(self, &mut out.topic, cdr_string(v, le), pid),
-            PID_TYPE_NAME => set(self, &mut out.type_name, cdr_string(v, le), pid),
-            PID_ENDPOINT_GUID => set(self, &mut out.endpoint_guid, read_array(v, 0), pid),
-            PID_PARTICIPANT_GUID => set(self, &mut out.participant_guid, read_array(v, 0), pid),
+            PID_TOPIC_NAME => name(self, &mut out.topic, v, le, pid),
+            PID_TYPE_NAME => name(self, &mut out.type_name, v, le, pid),
+            PID_ENDPOINT_GUID => guid(self, &mut out.endpoint_guid, v, pid),
+            PID_PARTICIPANT_GUID => guid(self, &mut out.participant_guid, v, pid),
             PID_KEY_HASH => set(self, &mut out.key_hash, read_array(v, 0), pid),
             PID_PROTOCOL_VERSION => {
                 let val = read_array::<2>(v, 0).map(|b| (b[0], b[1]));
@@ -757,7 +982,7 @@ impl Report {
 
         match s.topic {
             DiscoveryTopic::Participant => {
-                let pg = params.as_ref().and_then(|p| p.participant_guid);
+                let pg = params.as_ref().and_then(|p| p.participant_guid.first());
                 let (prefix, attribution) = match (pg, key) {
                     (Some(g), _) => (prefix_of(&g), Attribution::ParticipantGuid),
                     (None, Some(k)) => (prefix_of(&k), Attribution::KeyHash),
@@ -780,6 +1005,13 @@ impl Report {
                 let Some(p) = params.filter(|_| !s.key_only) else {
                     return; // key-only without status, or undecodable payload
                 };
+                let mut alternate_guid_prefixes: Vec<GuidPrefix> = Vec::new();
+                for g in p.participant_guid.vals.iter().skip(1) {
+                    let a = prefix_of(g);
+                    if a != prefix && !alternate_guid_prefixes.contains(&a) {
+                        alternate_guid_prefixes.push(a);
+                    }
+                }
                 let entity = pg.and_then(|g| read_array::<4>(&g, 12));
                 if entity.is_some_and(|e| e != ENTITYID_PARTICIPANT) {
                     self.anomaly(Anomaly::UnexpectedParticipantEntityId);
@@ -800,6 +1032,7 @@ impl Report {
                     metatraffic_multicast: p.mm,
                     default_unicast: p.du,
                     default_multicast: p.dm,
+                    alternate_guid_prefixes,
                     from_fragments: s.from_fragments,
                 });
             }
@@ -809,8 +1042,8 @@ impl Report {
                 } else {
                     EndpointKind::Reader
                 };
-                let eg = params.as_ref().and_then(|p| p.endpoint_guid);
-                let pg = params.as_ref().and_then(|p| p.participant_guid);
+                let eg = params.as_ref().and_then(|p| p.endpoint_guid.first());
+                let pg = params.as_ref().and_then(|p| p.participant_guid.first());
                 let (guid, guid_attr) = match (eg, key) {
                     (Some(g), _) => (Some(g), Attribution::EndpointGuid),
                     (None, Some(k)) => (Some(k), Attribution::KeyHash),
@@ -844,40 +1077,135 @@ impl Report {
                 let Some(p) = params.filter(|_| !s.key_only) else {
                     return; // key-only without status, or undecodable payload
                 };
-                let Some(topic) = p.topic else {
+                if p.topic.vals.is_empty() {
                     self.anomaly(Anomaly::AnnouncementWithoutTopic);
                     return;
-                };
-                self.endpoints.push(EndpointInfo {
+                }
+                self.push_endpoint(
                     kind,
-                    guid,
-                    participant,
-                    attribution,
-                    source: s.source,
-                    participant_guid_param: pg,
+                    &s,
+                    p,
+                    (guid, participant, attribution),
+                    pg,
                     guid_conflict,
-                    topic,
-                    type_name: p.type_name.unwrap_or_default(),
-                    from_fragments: s.from_fragments,
-                });
+                );
             }
         }
     }
+
+    /// Record an SEDP announcement with every reading of its (possibly
+    /// duplicated) identifying parameters. `primary` is the attribution
+    /// computed from the first occurrences.
+    fn push_endpoint(
+        &mut self,
+        kind: EndpointKind,
+        s: &Sample<'_>,
+        p: Params,
+        primary: (Option<Guid>, GuidPrefix, Attribution),
+        pg: Option<Guid>,
+        guid_conflict: bool,
+    ) {
+        let prefix_of = |g: &Guid| -> GuidPrefix { read_array(g, 0).unwrap_or_default() };
+        // Every candidate owner, in the attribution order; [0] is primary.
+        let (owners, o_last): (Vec<(Option<Guid>, GuidPrefix)>, usize) =
+            if p.endpoint_guid.vals.len() > 1 {
+                let v = p
+                    .endpoint_guid
+                    .vals
+                    .iter()
+                    .map(|g| (Some(*g), prefix_of(g)));
+                (v.collect(), p.endpoint_guid.last)
+            } else if primary.2 == Attribution::ParticipantGuid {
+                let v = p.participant_guid.vals.iter().map(|g| (None, prefix_of(g)));
+                (v.collect(), p.participant_guid.last)
+            } else {
+                (vec![(primary.0, primary.1)], 0)
+            };
+        let topics = p.topic.vals;
+        let t_last = p.topic.last;
+        let type_names = p.type_name.vals;
+        let y_last = p.type_name.last;
+        let no_type = [String::new()];
+        let types: &[String] = if type_names.is_empty() {
+            &no_type
+        } else {
+            &type_names
+        };
+        // Readings besides the first-occurrence one: all-last, then each
+        // remaining distinct value with the first values of the others.
+        let mut combos = Vec::new();
+        if (o_last, t_last, y_last) != (0, 0, 0) {
+            combos.push((o_last, t_last, y_last));
+        }
+        combos.extend(
+            (1..owners.len())
+                .filter(|&i| i != o_last)
+                .map(|i| (i, 0, 0)),
+        );
+        combos.extend(
+            (1..topics.len())
+                .filter(|&j| j != t_last)
+                .map(|j| (0, j, 0)),
+        );
+        combos.extend((1..types.len()).filter(|&k| k != y_last).map(|k| (0, 0, k)));
+        let reading = |(i, j, k): (usize, usize, usize)| EndpointAlternate {
+            guid: owners[i].0,
+            participant: owners[i].1,
+            topic: topics[j].clone(),
+            type_name: types[k].clone(),
+        };
+        let first = reading((0, 0, 0));
+        let mut alternates: Vec<EndpointAlternate> = Vec::new();
+        for c in combos {
+            let a = reading(c);
+            if a != first && !alternates.contains(&a) {
+                alternates.push(a);
+            }
+        }
+        self.endpoints.push(EndpointInfo {
+            kind,
+            guid: first.guid,
+            participant: first.participant,
+            attribution: primary.2,
+            source: s.source,
+            participant_guid_param: pg,
+            guid_conflict,
+            topic: first.topic,
+            type_name: first.type_name,
+            topics,
+            type_names,
+            alternates,
+            from_fragments: s.from_fragments,
+        });
+    }
 }
 
-/// Walk one datagram. `reasm` enables DATA_FRAG reassembly.
+/// Walk one datagram. `reasm` reassembles DATA_FRAG across datagrams;
+/// without it, a throwaway reassembler (default limits) still reassembles the
+/// samples whose fragments all sit in this one datagram, so a sample sent as
+/// a single DATA_FRAG (or several in one datagram) is never invisible.
 pub(crate) fn parse(
     datagram: &[u8],
-    mut reasm: Option<&mut FragmentReassembler>,
+    reasm: Option<&mut FragmentReassembler>,
 ) -> Option<DatagramReport> {
     let header = RtpsHeader::parse(datagram)?;
+    let mut local;
+    let reasm = match reasm {
+        Some(r) => r,
+        None => {
+            local = FragmentReassembler::new(crate::frag::ReassemblyLimits::default());
+            &mut local
+        }
+    };
     let mut r = Report::new(header);
+    let mut seen_sources: HashSet<GuidPrefix> = HashSet::from([header.guid_prefix]);
     if header.version.0 != 2 {
+        // Flag it, but parse best-effort: a stack that only rejects major < 2
+        // (or none at all) acts on these submessages, so we must see them.
         r.anomaly(Anomaly::UnsupportedProtocolVersion(
             header.version.0,
             header.version.1,
         ));
-        return Some(r);
     }
     let mut source = header.guid_prefix;
     let mut buf = &datagram[RTPS_HEADER_LEN..];
@@ -913,7 +1241,7 @@ pub(crate) fn parse(
                 match read_array::<12>(body, 8) {
                     Some(p) => {
                         source = p;
-                        r.add_source(p);
+                        r.add_source(&mut seen_sources, p);
                     }
                     None => r.anomaly(Anomaly::MalformedInfoSource),
                 }
@@ -924,7 +1252,7 @@ pub(crate) fn parse(
             }
             SUBMSG_DATA_FRAG => {
                 r.stats.data_frag += 1;
-                r.handle_data_frag(reasm.as_deref_mut(), body, flags, source);
+                r.handle_data_frag(reasm, body, flags, source);
             }
             SUBMSG_ACKNACK
             | SUBMSG_HEARTBEAT
