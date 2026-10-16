@@ -7,8 +7,15 @@
 //! position, sequence number) and a [`FindingLevel`]:
 //!
 //! - `Tamper`: evidence integrity is violated (or cannot be established).
-//! - `Warning`: anomalous but explainable by a crash or by recorded data loss.
-//! - `Info`: normal, recorded events worth showing (recovery, cyclic drops).
+//! - `Warning`: anomalous but explainable by a crash or by recorded data loss
+//!   (including a recorded crash recovery: the discarded bytes were the
+//!   newest records and their loss cannot be told apart from deliberate
+//!   truncation of an unsynced tail).
+//! - `Info`: normal, recorded events worth showing (cyclic drops, saturation).
+//!
+//! [`Report::is_intact`] = no `Tamper` finding: the retained evidence is
+//! authentic and complete as far as the log can prove. [`Report::is_clean`] =
+//! additionally no `Warning`: nothing was lost or recovered either.
 //!
 //! # Diagnosis rules
 //!
@@ -27,8 +34,12 @@
 //!    by invalid records at that spot are `Deleted`; consecutive seqs whose
 //!    `prev_hash` does not link are a `ChainBreak`.
 //! 6. The head must be genesis, or be anchored: by `trusted_anchor`, or by a
-//!    signed `SegmentDropped` record naming the head's predecessor (cyclic
-//!    retention). Otherwise `HeadMissing`.
+//!    signed `SegmentDropped` record for the head's predecessor (cyclic
+//!    retention). Such a drop only counts if the head is a `SegmentStart` for
+//!    segment `k`, the drop names segment `k - 1`, is not a `missing` report,
+//!    comes later in the chain than the head, and its anchor
+//!    `(last_seq, last_hash)` equals the head's `(seq - 1, prev_hash)`.
+//!    Otherwise `HeadMissing`.
 //! 7. Every segment except the last must end with a seal (`SegmentUnsealed`).
 //! 8. With a checkpoint, records missing after it are a `TruncatedTail`, and
 //!    a different hash at its seq is `CheckpointMismatch`.
@@ -229,12 +240,12 @@ impl FindingKind {
             | StaleBundle { .. }
             | CheckpointInvalid { .. }
             | TimeRegression { .. }
+            | RecoveryRecorded { .. }
             | Empty => FindingLevel::Warning,
             HeadDropRecorded { .. }
             | AnchorUnverified { .. }
             | CheckpointNotRetained { .. }
             | UnsealedTail { .. }
-            | RecoveryRecorded { .. }
             | SegmentDropRecorded { .. }
             | SaturationRecorded { .. } => FindingLevel::Info,
             _ => FindingLevel::Tamper,
@@ -753,11 +764,25 @@ pub fn verify_segments(
         .filter(|&&p| cx.rec(p).kind == RecordKind::SegmentDropped)
         .filter_map(|&p| cx.rec(p).payload_json().map(|d| (p, d)))
         .collect();
-    let drop_covering = |seq_before: u64, prev: &Hash| -> Option<usize> {
-        let want = to_hex(prev);
+    // A signed drop of the segment right before the head's segment, whose
+    // anchor is exactly the head's predecessor.
+    let drop_covering = |head: usize| -> Option<usize> {
+        let h = cx.rec(head);
+        if h.kind != RecordKind::SegmentStart {
+            return None;
+        }
+        let head_index = h.payload_json::<SegmentStartPayload>()?.segment_index;
+        let seq_before = h.seq.checked_sub(1)?;
+        let want = to_hex(&h.prev_hash);
         drops
             .iter()
-            .find(|(_, d)| d.last_seq == Some(seq_before) && d.last_hash.as_deref() == Some(&want))
+            .find(|(p, d)| {
+                !d.missing
+                    && d.segment_index.checked_add(1) == Some(head_index)
+                    && cx.rec(*p).seq > h.seq
+                    && d.last_seq == Some(seq_before)
+                    && d.last_hash.as_deref() == Some(&want)
+            })
             .map(|(p, _)| *p)
     };
 
@@ -792,7 +817,7 @@ pub fn verify_segments(
                     }
                 } else {
                     let (first_missing, last_missing) = (a.seq + 1, s0 - 1);
-                    if drop_covering(s0 - 1, &prev0).is_some() {
+                    if drop_covering(head).is_some() {
                         cx.add(
                             FindingKind::DroppedBeforeExport {
                                 first_missing,
@@ -813,7 +838,7 @@ pub fn verify_segments(
             }
             None => {
                 if s0 > 0 {
-                    match drop_covering(s0 - 1, &prev0) {
+                    match drop_covering(head) {
                         Some(dp) => {
                             let drop_record_seq = cx.rec(dp).seq;
                             cx.add(

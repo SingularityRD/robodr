@@ -9,6 +9,18 @@
 //! chain id, linkage to the previous bundle) and only then advances its own
 //! state, so a gap, replay or substitution between bundles is detected.
 //!
+//! # Export cursor and acknowledgements
+//!
+//! The cursor decides what the recorder may delete in
+//! [`crate::Recorder::prune_exported`], so it is authenticated: the persisted
+//! `export-cursor.json` is a [`SignedCursor`] signed by the unit's key and
+//! checked against the chain (it must name a real, authenticated record no
+//! later than the head) every time it is loaded. Where a return path exists,
+//! the stronger mode is *ack mode*: the [`Receiver`] signs an [`Ack`] with
+//! its own key, and the recorder prunes only what an ack covers. With an
+//! asymmetric receiver key the unit holds only the public half, so even root
+//! on the unit cannot fabricate a "this was received" statement.
+//!
 //! # Bundle wire format (`RBBXBND1`)
 //!
 //! `"RBBXBND1" | u32 id_len | identity JSON | u8 has_anchor |
@@ -22,7 +34,7 @@ use crate::crypto::{from_hex, hash_from_hex, to_hex};
 use crate::record::{
     scan_frames, signing_message, ChainIdentity, Hash, Record, ScanItem, MAX_SIG_LEN,
 };
-use crate::sign::Verifier;
+use crate::sign::{SignError, Signer, Verifier};
 use crate::verify::{verify_segments, Finding, FindingKind, Report, SegmentData, VerifyOptions};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -58,6 +70,168 @@ impl Anchor {
             chain_id: hash_from_hex(&j.chain_id)?,
             seq: j.seq,
             hash: hash_from_hex(&j.hash)?,
+        })
+    }
+}
+
+const CURSOR_DOMAIN: &[u8] = b"robodr-blackbox/export-cursor/v1\0";
+const ACK_DOMAIN: &[u8] = b"robodr-blackbox/ack/v1\0";
+
+fn position_message(domain: &[u8], a: &Anchor) -> Vec<u8> {
+    let mut m = Vec::with_capacity(domain.len() + 72);
+    m.extend_from_slice(domain);
+    m.extend_from_slice(&a.chain_id);
+    m.extend_from_slice(&a.seq.to_be_bytes());
+    m.extend_from_slice(&a.hash);
+    m
+}
+
+/// Message the *unit's* signer signs to authenticate `export-cursor.json`:
+/// `"robodr-blackbox/export-cursor/v1\0" || chain_id || u64_be(seq) || hash`.
+/// Domain-separated from record signatures, so a cursor signature can never
+/// be passed off as a record signature or vice versa.
+pub fn cursor_signing_message(a: &Anchor) -> Vec<u8> {
+    position_message(CURSOR_DOMAIN, a)
+}
+
+/// The persisted export cursor: an [`Anchor`] plus the unit's signature over
+/// [`cursor_signing_message`]. A cursor file that is unsigned, signed by
+/// another key, for another chain, beyond the head or not matching the
+/// chain's record at that seq is ignored by the recorder (re-export is safe;
+/// deleting unexported evidence is not).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedCursor {
+    pub anchor: Anchor,
+    pub sig: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SignedCursorJson {
+    chain_id: String,
+    seq: u64,
+    hash: String,
+    sig: String,
+}
+
+impl SignedCursor {
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(&SignedCursorJson {
+            chain_id: to_hex(&self.anchor.chain_id),
+            seq: self.anchor.seq,
+            hash: to_hex(&self.anchor.hash),
+            sig: to_hex(&self.sig),
+        })
+        .unwrap_or_default()
+    }
+
+    pub fn from_json(s: &str) -> Option<Self> {
+        let j: SignedCursorJson = serde_json::from_str(s).ok()?;
+        let sig = from_hex(&j.sig)?;
+        if sig.is_empty() || sig.len() > MAX_SIG_LEN {
+            return None;
+        }
+        Some(Self {
+            anchor: Anchor {
+                chain_id: hash_from_hex(&j.chain_id)?,
+                seq: j.seq,
+                hash: hash_from_hex(&j.hash)?,
+            },
+            sig,
+        })
+    }
+}
+
+/// A receiver's signed acknowledgement: "I hold and have verified chain
+/// `chain_id` up to record `seq` with hash `hash`".
+///
+/// Produced by [`Receiver::ack`] with the **receiver's** key (not the unit's)
+/// and checked by [`crate::Recorder::apply_ack`] with the matching
+/// [`Verifier`]. In ack mode ([`crate::Recorder::require_export_acks`]) the
+/// recorder deletes exported segments only up to the last valid ack, so
+/// nothing on the unit (a forged cursor file, a buggy exporter, a lost
+/// bundle) can make it prune evidence the far side has not confirmed.
+///
+/// Signed message: `"robodr-blackbox/ack/v1\0" || chain_id || u64_be(seq) || hash`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ack {
+    pub chain_id: Hash,
+    pub seq: u64,
+    pub hash: Hash,
+    /// Key id of the receiver key that signed this ack.
+    pub receiver_key_id: String,
+    pub sig: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AckJson {
+    chain_id: String,
+    seq: u64,
+    hash: String,
+    receiver_key_id: String,
+    sig: String,
+}
+
+impl Ack {
+    /// The signed message for position `a`.
+    pub fn signing_message(a: &Anchor) -> Vec<u8> {
+        position_message(ACK_DOMAIN, a)
+    }
+
+    /// Sign position `a` with the receiver's `signer`.
+    pub fn sign(a: &Anchor, signer: &dyn Signer) -> Result<Self, SignError> {
+        let sig = signer.sign(&Self::signing_message(a))?;
+        if sig.is_empty() || sig.len() > MAX_SIG_LEN {
+            return Err(SignError::new(format!(
+                "signature length {} out of range",
+                sig.len()
+            )));
+        }
+        Ok(Self {
+            chain_id: a.chain_id,
+            seq: a.seq,
+            hash: a.hash,
+            receiver_key_id: signer.key_id().to_string(),
+            sig,
+        })
+    }
+
+    pub fn anchor(&self) -> Anchor {
+        Anchor {
+            chain_id: self.chain_id,
+            seq: self.seq,
+            hash: self.hash,
+        }
+    }
+
+    /// Signature (and key id) check under the receiver's `verifier`.
+    pub fn verify(&self, verifier: &dyn Verifier) -> bool {
+        verifier.key_id() == self.receiver_key_id
+            && verifier.verify(&Self::signing_message(&self.anchor()), &self.sig)
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(&AckJson {
+            chain_id: to_hex(&self.chain_id),
+            seq: self.seq,
+            hash: to_hex(&self.hash),
+            receiver_key_id: self.receiver_key_id.clone(),
+            sig: to_hex(&self.sig),
+        })
+        .unwrap_or_default()
+    }
+
+    pub fn from_json(s: &str) -> Option<Self> {
+        let j: AckJson = serde_json::from_str(s).ok()?;
+        let sig = from_hex(&j.sig)?;
+        if sig.is_empty() || sig.len() > MAX_SIG_LEN {
+            return None;
+        }
+        Some(Self {
+            chain_id: hash_from_hex(&j.chain_id)?,
+            seq: j.seq,
+            hash: hash_from_hex(&j.hash)?,
+            receiver_key_id: j.receiver_key_id,
+            sig,
         })
     }
 }
@@ -329,6 +503,16 @@ impl Receiver {
         self.state.as_ref()
     }
 
+    /// Signed acknowledgement of the current state, for the unit's
+    /// [`crate::Recorder::apply_ack`]. `signer` is the receiver's own key
+    /// (never the unit's record key). `None` before the first accepted bundle.
+    pub fn ack(&self, signer: &dyn Signer) -> Result<Option<Ack>, SignError> {
+        self.state
+            .as_ref()
+            .map(|a| Ack::sign(a, signer))
+            .transpose()
+    }
+
     /// Verify `bundle` against the current state; advance only if intact.
     pub fn accept(&mut self, bundle: &Bundle, verifier: &dyn Verifier) -> Report {
         let report = bundle.verify(
@@ -438,5 +622,46 @@ mod tests {
         assert_eq!(Checkpoint::from_json(&c.to_json()).unwrap(), c);
         assert!(Checkpoint::from_json("{}").is_none());
         assert!(Anchor::from_json("not json").is_none());
+    }
+
+    #[test]
+    fn signed_cursor_and_ack_round_trip_and_reject_bad_sigs() {
+        use crate::sign::HmacSha256Key;
+        let a = Anchor {
+            chain_id: [3; 32],
+            seq: 5,
+            hash: [4; 32],
+        };
+        let c = SignedCursor {
+            anchor: a.clone(),
+            sig: vec![9; 32],
+        };
+        assert_eq!(SignedCursor::from_json(&c.to_json()).unwrap(), c);
+        // An unsigned (plain anchor) cursor file is not a signed cursor.
+        assert!(SignedCursor::from_json(&a.to_json()).is_none());
+        let empty = SignedCursor {
+            anchor: a.clone(),
+            sig: vec![],
+        };
+        assert!(SignedCursor::from_json(&empty.to_json()).is_none());
+
+        let rx_key = HmacSha256Key::new("rx", &[5; 32]).unwrap();
+        let other = HmacSha256Key::new("rx", &[6; 32]).unwrap();
+        let ack = Ack::sign(&a, &rx_key).unwrap();
+        assert_eq!(Ack::from_json(&ack.to_json()).unwrap(), ack);
+        assert!(ack.verify(&rx_key));
+        assert!(!ack.verify(&other));
+        let wrong_id = HmacSha256Key::new("rx2", &[5; 32]).unwrap();
+        assert!(!ack.verify(&wrong_id));
+        let mut moved = ack.clone();
+        moved.seq += 1;
+        assert!(!moved.verify(&rx_key));
+        // Ack and cursor messages are domain separated.
+        assert_ne!(Ack::signing_message(&a), cursor_signing_message(&a));
+        assert_ne!(
+            Ack::signing_message(&a),
+            crate::record::signing_message(&a.hash)
+        );
+        assert!(Ack::from_json("{}").is_none());
     }
 }

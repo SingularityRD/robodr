@@ -57,7 +57,7 @@ pub mod store;
 pub mod time;
 pub mod verify;
 
-pub use export::{Anchor, Bundle, Checkpoint, Receiver};
+pub use export::{Ack, Anchor, Bundle, Checkpoint, Receiver, SignedCursor};
 pub use record::{ChainIdentity, Hash, Record, RecordKind};
 pub use sign::{HmacSha256Key, Signer, Verifier};
 pub use store::{

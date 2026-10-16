@@ -136,9 +136,17 @@ ends with a rotation seal.
 ```
 seg-0000000000000000.rbb ...   segments
 checkpoint.json                latest seal checkpoint
-export-cursor.json             last exported (chain_id, seq, hash)
+export-cursor.json             last exported (chain_id, seq, hash) + unit signature
+export-ack.json                last receiver acknowledgement (ack mode)
+recorder.lock                  single-writer lock (flock)
 quarantine/                    bytes removed by crash recovery
 ```
+
+Everything the recorder creates is private: directories 0700, files 0600,
+created with `O_CREAT|O_EXCL|O_NOFOLLOW`. State files are replaced through a
+randomly named temp file and `rename`, so a symlink planted in the directory
+is never written through. An existing directory keeps its mode (tightening
+it is the integrator's call); the active segment is reset to 0600 on open.
 
 ### Bundle (`RBBXBND1`)
 
@@ -157,15 +165,39 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
   fsynced if `fsync_critical` is set (the default). Seals, rotations and
   control records are always fsynced, and the directory is fsynced after
   creating, renaming or deleting files.
-- **Crash recovery:** on open, the last segment is scanned. If it ends in an
-  incomplete, zero-filled or invalid frame **and nothing valid follows**, the
-  bytes are copied to `quarantine/` and the file is truncated to the last good
-  frame. A signed `Recovery` record is then appended with the offset, length,
-  SHA-256 of the discarded bytes and the quarantine file name. Recovery is
-  never silent. If corruption is followed by valid frames, or a record in the
-  active segment fails its hash or linkage, `open` returns `Error::Corrupt` and
-  touches nothing. A write or fsync error poisons the recorder until it is
-  reopened, and the reopen recovers the log.
+- **Opening an existing log:** before chaining onto anything, `open`
+  authenticates it with the recorder's own key (`Signer::verify_own`, or the
+  verifier given to `open_with_verifier` for keys that cannot self-verify):
+  hash, linkage and signature of every record in the active segment, the
+  first record (kind, index, chain, signature) of every retained segment, and
+  the drop records anchoring the oldest one. A forged head is
+  `Error::Corrupt`. Segment indices that should exist but do not (a gap, or a
+  missing predecessor of the oldest segment with no recorded drop) are listed
+  in the `Resume` record and written as `SegmentDropped { missing: true }`.
+  `export-cursor.json`, `export-ack.json` and `checkpoint.json` are used only
+  if they authenticate and match the chain; rejected ones are listed in the
+  `Resume` record (`rejected_state`).
+- **Crash recovery:** on open, the last segment is scanned. Only an
+  **incomplete frame or a zero-filled tail, with nothing valid after it**, is
+  treated as a crash artefact: the bytes are copied to `quarantine/`, the file
+  is truncated to the last good frame, and a signed `Recovery` record is
+  appended with the offset, length, SHA-256 of the discarded bytes and the
+  quarantine file name. Recovery is never silent and the verifier rates it a
+  **warning** (`is_clean()` is false). Anything else is `Error::Corrupt` and
+  nothing is touched: a complete frame whose hash or signature fails (a crash
+  cannot produce one, because the hash is computed before the frame is
+  written), a record that does not link, non-zero bytes that are not a frame,
+  or corruption followed by valid frames. A write or fsync error poisons the
+  recorder until it is reopened, and the reopen recovers the log.
+  Limit: someone who rewrites the newest frame's length prefix makes it look
+  torn; the bytes are then quarantined (hash recorded) and the event is a
+  warning, not a tamper finding. Only an exported checkpoint turns that into
+  `TruncatedTail`.
+- **Single writer:** `open` takes `flock(LOCK_EX|LOCK_NB)` on
+  `recorder.lock` before reading or writing anything and returns
+  `Error::Locked` if another recorder (in any process, including this one)
+  holds it. The kernel releases it when the recorder is dropped or the process
+  dies. On non-unix targets there is no lock.
 - **Rotation:** when the next record would push the segment past
   `max_segment_bytes`, the recorder writes a rotation seal, creates the next
   segment and writes `SegmentStart` into it.
@@ -174,6 +206,13 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
   segment, its seq range, the hash of its last record, and whether it had been
   exported. That hash is the carried-forward anchor: the verifier accepts the
   retained tail because a signed record vouches for the head's `prev_hash`.
+  The recorder takes the anchor from the authenticated `SegmentStart` of the
+  *next* segment (which it wrote itself or verified at open), never from the
+  bytes of the segment being deleted, so frames planted there cannot make it
+  vouch for anything else. The verifier accepts a drop as covering the head
+  only if it names the head segment's index minus one, is not a `missing`
+  report, comes later in the chain, and its anchor equals the head's
+  `(seq - 1, prev_hash)`.
   If an attacker deletes the oldest segment without that record, the verifier
   reports `HeadMissing`. If a segment vanishes before the recorder deletes it,
   the recorder writes `missing: true` into the drop record.
@@ -186,7 +225,15 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
   refusal counts.
 - **Store-and-forward:** `export_pending` first writes an export seal, then
   bundles every record after the cursor. `mark_exported` advances the cursor
-  (atomic replace) once the bundle has left the unit. `Receiver` verifies each
+  (atomic replace) once the bundle has left the unit; the bundle end must be
+  an authentic record of the chain, and the persisted cursor is signed by the
+  unit's key (domain-separated message), so a forged cursor file is ignored
+  and nothing is pruned on its account. Where a return path exists, **ack
+  mode** (`require_export_acks(receiver_verifier)`) is stronger:
+  `prune_exported` then deletes only what a receiver-signed `Ack`
+  (`Receiver::ack`, applied with `apply_ack`) covers. With an asymmetric
+  receiver key the unit holds only the public half and cannot fabricate one;
+  with HMAC it can, like everything else. `Receiver` verifies each
   bundle against its own last position and advances only when the bundle is
   intact. A skipped bundle shows up as `Deleted`, a replayed one as
   `StaleBundle`, and loss from cyclic wrap before export as
@@ -218,8 +265,11 @@ location (segment name and position, byte offset, global position, seq).
 | interrupted write never recovered          | `TornTail` (warning)                        |
 
 `is_intact()` means there are no tamper findings. `is_clean()` means there
-are also no warnings. Info findings record normal events: recovery, recorded
-drops, saturation, and an unsealed tail.
+are also no warnings. Crash recovery is a warning (the discarded newest
+records cannot be told apart from deliberate truncation). Info findings record
+normal events: recorded drops, saturation, and an unsealed tail. A
+`SegmentMissingReported` (the recorder found a segment gone at open) is a
+tamper finding.
 
 ## Threat model
 
@@ -261,8 +311,8 @@ drops, saturation, and an unsealed tail.
 - **Side channels and memory disclosure.** The in-crate SHA-256/HMAC are
   portable implementations. Key wiping and the constant-time compare use
   `std::hint::black_box`, which is best-effort.
-- **Concurrent writers.** One `Recorder` per directory. This is documented but
-  not locked.
+- **Concurrent writers that ignore the lock.** `flock` is advisory: it stops
+  a second `Recorder`, not a process that writes the files directly.
 
 ## Limits and what is not verified
 
