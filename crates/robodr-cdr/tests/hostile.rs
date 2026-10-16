@@ -97,9 +97,17 @@ fn unknown_and_unsupported_representations() {
         (0x0002u16, Some(Representation::PlCdrBe)),
         (0x0003, Some(Representation::PlCdrLe)),
         (0x0004, Some(Representation::Xml)),
-        (0x0012, Some(Representation::PlCdr2Be)),
-        (0x0013, Some(Representation::PlCdr2Le)),
+        (0x000a, Some(Representation::PlCdr2Be)),
+        (0x000b, Some(Representation::PlCdr2Le)),
         (0x0005, None),
+        // Never-assigned ids (an earlier version of this crate mapped
+        // XCDR2 here by mistake).
+        (0x0010, None),
+        (0x0011, None),
+        (0x0012, None),
+        (0x0013, None),
+        (0x0014, None),
+        (0x0015, None),
         (0x0100, None),
         (0xffff, None),
     ] {

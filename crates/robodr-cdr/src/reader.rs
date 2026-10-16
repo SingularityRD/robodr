@@ -8,7 +8,7 @@
 
 use crate::encap::{Endian, XcdrVersion};
 use crate::error::DecodeError;
-use crate::Limits;
+use crate::{DelimitedNesting, Limits};
 
 /// Bytes of a CDR string between its length prefix and its NUL terminator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -43,8 +43,11 @@ pub(crate) struct Reader<'a> {
     end: usize,
     endian: Endian,
     version: XcdrVersion,
-    /// XCDR2 only: every struct is preceded by a DHEADER (D_CDR2).
+    /// XCDR2 only: structs are preceded by a DHEADER (D_CDR2); which ones
+    /// is decided by `limits.d_cdr2_nesting`.
     delimited_structs: bool,
+    /// Current struct nesting depth (0 = the top-level message).
+    depth: u32,
     pub(crate) limits: Limits,
 }
 
@@ -63,6 +66,7 @@ impl<'a> Reader<'a> {
             endian,
             version,
             delimited_structs: delimited_structs && version == XcdrVersion::Xcdr2,
+            depth: 0,
             limits,
         }
     }
@@ -163,7 +167,9 @@ impl<'a> Reader<'a> {
     }
 
     /// A CDR string: `uint32` length including the NUL, then the bytes.
-    /// A length of 0 is accepted as the empty string (some writers emit it).
+    /// A length of 0 is rejected: the prefix counts the terminator, so the
+    /// empty string is `01 00 00 00 00` (Fast CDR and Cyclone DDS both send
+    /// that), and a 0 prefix is malformed.
     pub(crate) fn string(&mut self) -> Result<CdrStr<'a>, DecodeError> {
         self.align(4)?;
         let at = self.pos;
@@ -176,7 +182,7 @@ impl<'a> Reader<'a> {
             });
         }
         if len == 0 {
-            return Ok(CdrStr(&[]));
+            return Err(DecodeError::StringLengthZero { at });
         }
         let raw = self.bytes(len as usize)?;
         match raw.split_last() {
@@ -232,17 +238,20 @@ impl<'a> Reader<'a> {
         Ok(v)
     }
 
-    /// A (possibly appendable) struct: DHEADER-wrapped under D_CDR2,
-    /// plain otherwise.
+    /// A (possibly appendable) struct: DHEADER-wrapped under D_CDR2 (the
+    /// top-level struct always; nested ones per
+    /// [`Limits::d_cdr2_nesting`]), plain otherwise.
     pub(crate) fn structure<T>(
         &mut self,
         f: impl FnOnce(&mut Self) -> Result<T, DecodeError>,
     ) -> Result<T, DecodeError> {
-        if self.delimited_structs {
-            self.delimited(f)
-        } else {
-            f(self)
-        }
+        let depth = self.depth;
+        let wrap = self.delimited_structs
+            && (depth == 0 || self.limits.d_cdr2_nesting == DelimitedNesting::AllStructs);
+        self.depth = depth.saturating_add(1);
+        let r = if wrap { self.delimited(f) } else { f(self) };
+        self.depth = depth;
+        r
     }
 
     /// A sequence of non-primitive elements: XCDR2 puts a DHEADER before
@@ -330,7 +339,9 @@ mod tests {
     #[test]
     fn string_rules() {
         let mut a = r(&[0, 0, 0, 0], XcdrVersion::Xcdr1);
-        assert!(a.string().unwrap().is_empty());
+        assert_eq!(a.string(), Err(DecodeError::StringLengthZero { at: 0 }));
+        let mut e = r(&[1, 0, 0, 0, 0], XcdrVersion::Xcdr1);
+        assert!(e.string().unwrap().is_empty());
         let mut b = r(&[2, 0, 0, 0, b'a', b'b'], XcdrVersion::Xcdr1);
         assert!(matches!(
             b.string(),

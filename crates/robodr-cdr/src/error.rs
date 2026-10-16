@@ -25,8 +25,11 @@ pub enum DecodeError {
     Truncated { at: usize, need: usize },
     /// A string's length prefix exceeds [`crate::Limits::max_string_len`].
     StringTooLong { at: usize, len: u32, max: u32 },
-    /// A non-empty CDR string whose last byte is not NUL.
+    /// A CDR string whose last byte is not NUL.
     StringNotTerminated { at: usize },
+    /// A CDR string with length prefix 0. The prefix counts the NUL
+    /// terminator, so the shortest valid string (`""`) has length 1.
+    StringLengthZero { at: usize },
     /// A sequence's element count exceeds the configured cap.
     SequenceTooLong { at: usize, len: u32, max: u32 },
     /// An XCDR2 DHEADER announces more bytes than its container holds.
@@ -61,6 +64,12 @@ impl fmt::Display for DecodeError {
             }
             DecodeError::StringNotTerminated { at } => {
                 write!(f, "string at offset {at} is not NUL-terminated")
+            }
+            DecodeError::StringLengthZero { at } => {
+                write!(
+                    f,
+                    "string at offset {at} has length 0 (minimum is 1, the NUL)"
+                )
             }
             DecodeError::SequenceTooLong { at, len, max } => {
                 write!(f, "sequence length {len} at offset {at} exceeds cap {max}")

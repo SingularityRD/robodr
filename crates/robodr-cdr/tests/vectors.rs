@@ -22,6 +22,7 @@ const L: Limits = Limits {
     max_string_len: 256,
     max_sequence_len: 1024,
     max_trajectory_points: 1024,
+    d_cdr2_nesting: robodr_cdr::DelimitedNesting::AllStructs,
 };
 
 fn twist_of(d: &Decoded<'_>) -> Twist {
@@ -75,13 +76,13 @@ const TWIST_CDR_BE: &str = "
     BF D0 00 00 00 00 00 00     @40 angular.z = -0.25
 ";
 
-/// XCDR2 delimited (D_CDR2_LE = 0x0015): Twist and each Vector3 are
+/// XCDR2 delimited (D_CDR2_LE = 0x0009): Twist and each Vector3 are
 /// appendable, so each gets a DHEADER (uint32 byte count of what follows).
 ///   Vector3 body = 3*8 = 24 (0x18); with its DHEADER = 28.
 ///   Twist body   = 28 + 28 = 56 (0x38).
 /// Doubles are 4-aligned under XCDR2, so @8 needs no padding.
 const TWIST_DCDR2_LE: &str = "
-    00 15 00 00
+    00 09 00 00
     38 00 00 00                 @0  DHEADER(Twist)   = 56
     18 00 00 00                 @4  DHEADER(linear)  = 24
     00 00 00 00 00 00 E0 3F     @8  linear.x = 0.5
@@ -93,9 +94,9 @@ const TWIST_DCDR2_LE: &str = "
     00 00 00 00 00 00 D0 BF     @52 angular.z = -0.25   (end @60)
 ";
 
-/// D_CDR2_BE (0x0014): same layout, big-endian DHEADERs and doubles.
+/// D_CDR2_BE (0x0008): same layout, big-endian DHEADERs and doubles.
 const TWIST_DCDR2_BE: &str = "
-    00 14 00 00
+    00 08 00 00
     00 00 00 38
     00 00 00 18
     3F E0 00 00 00 00 00 00
@@ -127,7 +128,7 @@ fn twist_hand_vectors_decode() {
 fn twist_plain_cdr2_body_equals_xcdr1_body() {
     // Six doubles from offset 0: identical under 8- or 4-alignment.
     let mut v = hex(TWIST_CDR_LE);
-    v[1] = 0x11; // CDR2_LE
+    v[1] = 0x07; // CDR2_LE
     let d = decode_payload(MessageKind::Twist, &v, &L).unwrap();
     assert_eq!(twist_of(&d), expected_twist());
 }
@@ -166,10 +167,10 @@ const TS_CDR_LE: &str = "
     00 00 00 00 00 00 D0 BF     @64 angular.z = -0.25   (end @72)
 ";
 
-/// Same message, XCDR2 plain (CDR2_LE = 0x0011): doubles align to 4 only,
+/// Same message, XCDR2 plain (CDR2_LE = 0x0007): doubles align to 4 only,
 /// so 3 padding octets after @17 and the twist starts at @20.
 const TS_CDR2_LE: &str = "
-    00 11 00 00
+    00 07 00 00
     01 00 00 00
     02 00 00 00
     05 00 00 00
@@ -191,7 +192,7 @@ const TS_CDR2_LE: &str = "
 /// The padding after the Header belongs to the next DHEADER's alignment,
 /// not to the Header's size.
 const TS_DCDR2_LE: &str = "
-    00 15 00 00
+    00 09 00 00
     58 00 00 00                 @0  DHEADER(TwistStamped) = 88
     15 00 00 00                 @4  DHEADER(Header) = 21
     08 00 00 00                 @8  DHEADER(Time) = 8
@@ -250,7 +251,7 @@ fn wrong_version_label_misreads_rather_than_guessing() {
     // reads the twist from @20 (inside the XCDR1 padding) and gets garbage.
     // This documents that the encapsulation id is authoritative.
     let mut v = hex(TS_CDR_LE);
-    v[1] = 0x11;
+    v[1] = 0x07; // CDR2_LE
     let d = decode_payload(MessageKind::TwistStamped, &v, &L).unwrap();
     assert_ne!(twist_of(&d), expected_twist());
     assert_eq!(d.trailing_bytes, 4);
@@ -307,7 +308,7 @@ const JS_CDR_BE: &str = "
 /// strings: @20..@39 = 19 (0x13). `float64[]` gets none, and its doubles are
 /// 4-aligned (no pad before -1.0 this time).
 const JS_CDR2_LE: &str = "
-    00 11 00 00
+    00 07 00 00
     00 00 00 00
     00 00 00 00
     01 00 00 00
@@ -627,8 +628,10 @@ fn imu_and_trajectory_mapping() {
     let b = joint_trajectory(Representation::CdrLe, &[b"j"], &[]);
     let d = decode_payload(MessageKind::JointTrajectory, &b, &L).unwrap();
     let c = d.message.to_command(&ctx).unwrap();
-    assert_eq!(c.joint_speed, None);
+    // No points: the controller holds position; a checkable zero, not None.
+    assert_eq!(c.joint_speed, Some(0.0));
     assert_eq!(c.linear_speed, None);
+    assert!(d.anomalies().is_empty());
 }
 
 // ---------------------------------------------------------------- registry
@@ -652,10 +655,11 @@ fn registry_keys_by_dds_and_ros_names() {
         r.decode("std_msgs::msg::dds_::String_", &bytes, &L),
         Err(DecodeError::UnknownType)
     );
-    // A 48-byte Twist body is far too short for an Imu.
+    // A Twist body read as an Imu: the header's frame_id length lands on
+    // the zero half of a double (a 0 length prefix is malformed).
     assert!(matches!(
         decode_by_type_name("sensor_msgs::msg::dds_::Imu_", &bytes, &L),
-        Err(DecodeError::Truncated { .. })
+        Err(DecodeError::StringLengthZero { .. })
     ));
     for k in MessageKind::ALL {
         assert_eq!(MessageKind::from_type_name(k.dds_type_name()), Some(k));

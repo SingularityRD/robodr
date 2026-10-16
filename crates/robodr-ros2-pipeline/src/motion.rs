@@ -31,9 +31,11 @@
 //!
 //! | When | Rule | Severity |
 //! |---|---|---|
-//! | a sample on a motion / feedback topic that cannot be inspected: undecodable payload (truncated, bad encapsulation, `PL_CDR`, over a cap), unknown type name, a type of the wrong role for the topic (feedback type on a command channel or the reverse), non-standard payload, malformed DATA / inline QoS, fragments refused / evicted / conflicting, per-datagram sample cap | [`rules::MOTION_UNDECODABLE_SAMPLE`] | Medium, rate limited (`robot.motion.undecodable_sample` bucket), dedup by channel + writer + reason |
+//! | a sample on a motion / feedback topic that cannot be inspected: undecodable payload (truncated, unknown encapsulation id (anything outside XTypes 1.3 Table 60), `PL_CDR`, over a cap, malformed string), unknown type name, a type of the wrong role for the topic (feedback type on a command channel or the reverse), non-standard payload, malformed DATA / inline QoS, fragments refused / evicted / conflicting, per-datagram sample cap | [`rules::MOTION_UNDECODABLE_SAMPLE`] | Medium, rate limited (`robot.motion.undecodable_sample` bucket), dedup by channel + writer + reason |
 //! | DATA addressed to a reader entity announced on a motion / feedback topic, from a writer **never announced via SEDP** (cannot be attributed, so cannot be checked against the profile) | [`rules::MOTION_UNATTRIBUTED_SAMPLE`] | High, dedup by writer + topic |
 //! | a decoded sample whose writer prefix is bound to other source IPs than the one it came from (binding table, [`crate::binding`]): somebody speaks for a profiled writer | [`rules::MOTION_SAMPLE_SOURCE_MISMATCH`] | Critical on a command channel, High on a feedback topic |
+//! | a decoded command whose speed cannot be bounded from the message (`JointTrajectory` with no velocities and fewer than two points with positions; `robodr_cdr::DecodeAnomaly::UnverifiableCommand`): no envelope can check it | [`rules::MOTION_UNVERIFIABLE_COMMAND`] | Medium, dedup by channel + writer |
+//! | a decoded sample with more bytes after the message than XCDR end padding explains (> 3, `robodr_cdr::DecodeAnomaly::ExcessTrailingBytes`): DDS readers ignore them, nothing standard sends them | [`rules::MOTION_DECODE_ANOMALY`] | Low, dedup by channel + writer + kind (byte count not in the dedup key) |
 //! | every decoded `MotionCommand` (if `evaluate_commands`) | the profile's motion rules (`robot.motion.linear_over_envelope`, `joint_over_envelope`, `non_finite_command`, `unprofiled_channel`, `robot.profile.invalid_envelope`) | as `robodr-events` decides (Critical for over-envelope / non-finite) |
 //!
 //! A writer on a motion topic that is not in the profile is already the
@@ -64,7 +66,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 
-use robodr_cdr::{DecodeError, EventContext, Limits, MotionRole, Registry};
+use robodr_cdr::{DecodeAnomaly, DecodeError, EventContext, Limits, MotionRole, Registry};
 use robodr_events::graph::{demangle, RosNameKind};
 use robodr_events::profile::Profile;
 use robodr_events::{Deviation, RobotEvent, Severity};
@@ -87,6 +89,12 @@ pub mod rules {
     /// A decoded motion sample from a source IP not bound to its writer's
     /// participant. Critical (command) / High (feedback).
     pub const MOTION_SAMPLE_SOURCE_MISMATCH: &str = "robot.motion.sample_source_mismatch";
+    /// A decoded command whose speed cannot be bounded from the message, so
+    /// no envelope can check it. Medium.
+    pub const MOTION_UNVERIFIABLE_COMMAND: &str = "robot.motion.unverifiable_command";
+    /// A decoded sample with an oddity that does not stop decoding (e.g.
+    /// trailing bytes beyond XCDR end padding). Low.
+    pub const MOTION_DECODE_ANOMALY: &str = "robot.motion.decode_anomaly";
 }
 
 /// Default [`MotionOptions::max_writers`] / `max_readers`.
@@ -155,7 +163,8 @@ pub struct MotionSample {
     pub capture_ns: u64,
     /// Reassembled from DATA_FRAG.
     pub from_fragments: bool,
-    /// Bytes after the decoded message (XCDR padding or appended members).
+    /// Bytes after the decoded message (XCDR padding or appended members;
+    /// more than 3 is also a [`rules::MOTION_DECODE_ANOMALY`] finding).
     pub trailing_bytes: usize,
 }
 
@@ -172,6 +181,10 @@ pub struct MotionStats {
     pub unattributed: u64,
     /// Decoded samples from a source IP outside the writer's binding.
     pub source_mismatch: u64,
+    /// Decoded commands whose speed could not be bounded.
+    pub unverifiable: u64,
+    /// Decoded samples with a decode anomaly (excess trailing bytes).
+    pub anomalies: u64,
     /// Key-only / no-payload samples on motion topics (dispose etc.).
     pub not_data: u64,
     /// Writers / readers currently known.
@@ -304,6 +317,7 @@ fn decode_error_kind(e: &DecodeError) -> String {
         DecodeError::Truncated { .. } => "truncated payload".into(),
         DecodeError::StringTooLong { .. } => "string over the cap".into(),
         DecodeError::StringNotTerminated { .. } => "string not NUL-terminated".into(),
+        DecodeError::StringLengthZero { .. } => "string with length 0".into(),
         DecodeError::SequenceTooLong { .. } => "sequence over the cap".into(),
         DecodeError::DelimiterOutOfBounds { .. } | DecodeError::DelimiterOverrun { .. } => {
             "bad XCDR2 DHEADER".into()
@@ -601,6 +615,37 @@ impl MotionTracker {
                     );
                     self.undecodable(&mut out, &channel, &writer, &why);
                     continue;
+                }
+                for an in decoded.anomalies() {
+                    match an {
+                        DecodeAnomaly::UnverifiableCommand { reason } => {
+                            self.stats.unverifiable += 1;
+                            out.deviations.push(Deviation::new(
+                                rules::MOTION_UNVERIFIABLE_COMMAND,
+                                Severity::Medium,
+                                format!(
+                                    "command on {} from writer {writer} cannot be checked against \
+                                     the envelope: {reason}",
+                                    short(&channel)
+                                ),
+                            ));
+                        }
+                        DecodeAnomaly::ExcessTrailingBytes { allowed, .. } => {
+                            // Value-free detail: the dedup key is rule + detail.
+                            self.stats.anomalies += 1;
+                            out.deviations.push(Deviation::new(
+                                rules::MOTION_DECODE_ANOMALY,
+                                Severity::Low,
+                                format!(
+                                    "{role_name} sample on {} from writer {writer} carries more \
+                                     than {allowed} bytes after the message (type {}); DDS \
+                                     readers ignore them",
+                                    short(&channel),
+                                    short(&type_name)
+                                ),
+                            ));
+                        }
+                    }
                 }
                 let event = decoded.message.to_event(&EventContext {
                     channel: &channel,

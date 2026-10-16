@@ -9,7 +9,8 @@
 //! Kilted; these interfaces have been stable since Foxy). Every struct is
 //! read with `Reader::structure`, which adds the XCDR2 DHEADER under
 //! `D_CDR2_*` (ROS IDL types carry no extensibility annotation, so they are
-//! `@appendable` by XTypes default).
+//! `@appendable` by XTypes default; nested structs per
+//! [`crate::Limits::d_cdr2_nesting`]).
 
 use crate::encap::Endian;
 use crate::error::DecodeError;
@@ -31,6 +32,12 @@ impl Time {
         let sec = u64::try_from(self.sec).ok()?;
         sec.checked_mul(1_000_000_000)?
             .checked_add(u64::from(self.nanosec))
+    }
+
+    /// Seconds as `f64` (`sec + nanosec * 1e-9`; the wire may carry
+    /// `nanosec >= 1e9` or a negative `sec`, both are taken at face value).
+    pub fn as_secs_f64(&self) -> f64 {
+        f64::from(self.sec) + f64::from(self.nanosec) * 1e-9
     }
 
     fn read(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
@@ -489,6 +496,59 @@ impl<'a> JointTrajectory<'a> {
     pub fn max_abs_velocity(&self) -> Option<f64> {
         max_abs(self.points.iter().flat_map(|p| p.velocities.iter()))
     }
+
+    /// Max joint speed implied by the positions: for each pair of
+    /// consecutive points and each joint present in both,
+    /// `|Δposition| / Δtime_from_start`. A position change with
+    /// `Δt <= 0` (points not strictly increasing in time) is `+inf`: the
+    /// trajectory asks for an instantaneous jump. NaN-poisoning like
+    /// [`F64Seq::max_abs`]. `None` if no pair of points both carry
+    /// positions (a single point: the start position is the robot's
+    /// current state, which is not in the message).
+    pub fn max_position_rate(&self) -> Option<f64> {
+        let pairs = self.points.iter().zip(self.points.iter().skip(1));
+        let rates = pairs.flat_map(|(a, b)| {
+            let dt = b.time_from_start.as_secs_f64() - a.time_from_start.as_secs_f64();
+            a.positions
+                .iter()
+                .zip(b.positions.iter())
+                .map(move |(p0, p1)| position_rate(p1 - p0, dt))
+        });
+        max_abs(rates)
+    }
+
+    /// The speed bound used for a command: the larger of
+    /// [`Self::max_abs_velocity`] and [`Self::max_position_rate`] (so small
+    /// declared velocities cannot hide large position steps), NaN-poisoning.
+    /// `Some(0.0)` for an empty trajectory (no points: the controller holds
+    /// position). `None` only when the trajectory has points but neither a
+    /// velocity nor a derivable rate: the command is unverifiable, see
+    /// [`crate::MotionMessage::unverifiable_reason`].
+    pub fn max_joint_speed(&self) -> Option<f64> {
+        if self.points.is_empty() {
+            return Some(0.0);
+        }
+        max_abs(
+            [self.max_abs_velocity(), self.max_position_rate()]
+                .into_iter()
+                .flatten(),
+        )
+    }
+}
+
+/// `|dp| / dt`, with `dt <= 0` (or non-finite) and `dp != 0` → `+inf`,
+/// `dp == 0` → 0, NaN `dp` → NaN.
+fn position_rate(dp: f64, dt: f64) -> f64 {
+    let dp = dp.abs();
+    if dp.is_nan() {
+        f64::NAN
+    } else if dp == 0.0 {
+        0.0
+    } else if dt.is_finite() && dt > 0.0 {
+        dp / dt
+    } else {
+        f64::INFINITY
+    }
 }
 
 #[cfg(test)]
@@ -505,6 +565,27 @@ mod tests {
         assert_eq!(
             max_abs([1.0, f64::NEG_INFINITY].into_iter()),
             Some(f64::INFINITY)
+        );
+    }
+
+    #[test]
+    fn position_rate_rules() {
+        assert_eq!(position_rate(2.0, 0.5), 4.0);
+        assert_eq!(position_rate(-2.0, 0.5), 4.0);
+        assert_eq!(position_rate(0.0, 0.0), 0.0);
+        assert_eq!(position_rate(0.0, -1.0), 0.0);
+        assert_eq!(position_rate(1e-9, 0.0), f64::INFINITY);
+        assert_eq!(position_rate(1.0, -3.0), f64::INFINITY);
+        assert_eq!(position_rate(1.0, f64::NAN), f64::INFINITY);
+        assert_eq!(position_rate(f64::INFINITY, 1.0), f64::INFINITY);
+        assert!(position_rate(f64::NAN, 1.0).is_nan());
+        assert_eq!(
+            Time {
+                sec: -1,
+                nanosec: 500_000_000
+            }
+            .as_secs_f64(),
+            -0.5
         );
     }
 

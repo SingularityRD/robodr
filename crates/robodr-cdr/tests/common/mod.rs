@@ -53,8 +53,8 @@ impl Enc {
             rep: id,
             options: 0,
             big: id & 1 == 0,
-            xcdr2: id >= 0x10,
-            delimited: id == 0x14 || id == 0x15,
+            xcdr2: rep.version() == Some(robodr_cdr::XcdrVersion::Xcdr2),
+            delimited: rep.is_delimited(),
             body: Vec::new(),
             stack: Vec::new(),
         }
