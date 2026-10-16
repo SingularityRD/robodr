@@ -23,6 +23,11 @@
 //!   verifier can pick the right key (see [`Keyring`]). Without an explicit
 //!   id it is derived from the public key
 //!   ([`crate::sign_ed25519::derive_key_id`], `ed25519:<16 hex>`).
+//! - Optional `"device_id"` (any key file, v1 or v2) binds the key to one
+//!   unit: a [`Keyring`] then lets it verify only chains whose identity
+//!   names that device (see *Keyring* below). It is copied into the public
+//!   file by [`KeyFile::to_public`]; set it with [`KeyFile::with_device_id`]
+//!   (`robodr-blackbox keygen --device ID`).
 //! - Unknown fields are rejected, so a typo cannot silently drop data.
 //!
 //! # Legacy HMAC (`hmac-sha256`)
@@ -71,13 +76,34 @@
 //! secret). [`Keyring::load_public_file`] refuses any secret, for verifiers
 //! that must never hold signing material.
 //!
-//! **Limit:** [`Verifier::verify`] on a keyring accepts a signature made by
-//! *any* key in the ring (records do not name their key individually; only
-//! chain identities, `SegmentStart` and checkpoints do, and those use
-//! [`Verifier::verify_as`]). A keyring should therefore hold only keys of
-//! the units whose evidence it verifies.
+//! ## Which key may vouch for what
+//!
+//! A keyring never answers "does *any* key accept this?" for evidence:
+//!
+//! - [`Verifier::verify_key`] checks under exactly the key the evidence
+//!   names, and only if that key's algorithm is the named one. Record
+//!   verification ([`crate::verify::verify_segments`]) uses it with the key
+//!   the chain identity names (switched only by an authenticated
+//!   `KeyRotation`, or by a `SegmentStart` hint, see that module), so a
+//!   keyring holding unit B's key does not authenticate a log whose
+//!   identity says unit A, and an HMAC key never vouches for an `ed25519`
+//!   chain.
+//! - [`Verifier::verify_as`] (checkpoints) looks the named key up.
+//! - [`Verifier::verify`] (no key named) is accepted only when the ring
+//!   holds exactly one key, i.e. when it is unambiguous.
+//! - A key with a `device_id` is reported by [`Verifier::key_device`]; the
+//!   verifier refuses it for a chain of another device. Unbound keys are
+//!   attributed only by key id; bind fleet keys to their units.
+//! - Mixing symmetric (HMAC) and asymmetric (Ed25519) keys in one ring is
+//!   refused ([`KeyFileError::MixedAlgorithms`]) unless explicitly allowed
+//!   with [`Keyring::set_allow_mixed_algorithms`] (e.g. to verify a log
+//!   that rotated from a legacy HMAC key to Ed25519): a verifier that holds
+//!   an HMAC key can forge whatever that key is allowed to vouch for.
+//!
+//! [`Keyring::verify_any`] (the recorder's own `previous_keys`, a trusted
+//! local input) is the one place where "any key in the ring" is accepted.
 
-use crate::crypto::{from_hex, to_hex, wipe};
+use crate::crypto::{fill_random, from_hex, to_hex, wipe};
 use crate::sign::{HmacSha256Key, KeyError, Signer, Verifier, HMAC_SHA256, MIN_HMAC_KEY_LEN};
 use crate::sign_ed25519::{
     derive_key_id, public_key_from_seed, random_seed, Ed25519Error, Ed25519SigningKey,
@@ -141,6 +167,14 @@ pub enum KeyFileError {
     NoSecret,
     /// Secret material where only public keys are allowed.
     NotPublic(String),
+    /// A keyring would mix key algorithms (e.g. HMAC next to Ed25519)
+    /// without [`Keyring::set_allow_mixed_algorithms`].
+    MixedAlgorithms {
+        existing: String,
+        added: String,
+    },
+    /// `device_id` is empty, too long or not printable ASCII.
+    BadDeviceId,
 }
 
 impl fmt::Display for KeyFileError {
@@ -185,6 +219,16 @@ impl fmt::Display for KeyFileError {
                 f,
                 "key {id:?} contains secret material where only public keys are allowed \
                  (use `robodr-blackbox export-pub`)"
+            ),
+            KeyFileError::MixedAlgorithms { existing, added } => write!(
+                f,
+                "keyring holds {existing} keys; refusing to add a {added} key without an \
+                 explicit opt-in (mixed algorithms)"
+            ),
+            KeyFileError::BadDeviceId => write!(
+                f,
+                "device id must be 1..={} printable ASCII characters",
+                crate::sign::MAX_KEY_ID_LEN
             ),
         }
     }
@@ -233,6 +277,8 @@ struct KeyJson {
     public_hex: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     secret_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_id: Option<String>,
 }
 
 impl Drop for KeyJson {
@@ -250,12 +296,22 @@ struct KeyringJson {
     keys: Vec<KeyJson>,
 }
 
+/// Only the `format` field; everything else is skipped without being
+/// copied (unlike a `serde_json::Value`, which would duplicate secrets).
+#[derive(Deserialize)]
+struct FormatProbe {
+    #[serde(default)]
+    format: Option<String>,
+}
+
 /// One key: algorithm, id, and either secret material (HMAC key, Ed25519
 /// seed) or only an Ed25519 public key. The secret is wiped on drop and
 /// never printed by `Debug`.
 pub struct KeyFile {
     pub algorithm: String,
     pub key_id: String,
+    /// The unit this key belongs to, if bound (see the module docs).
+    pub device_id: Option<String>,
     secret: Vec<u8>,
     public: Option<[u8; PUBLIC_KEY_LEN]>,
 }
@@ -265,6 +321,7 @@ impl fmt::Debug for KeyFile {
         f.debug_struct("KeyFile")
             .field("algorithm", &self.algorithm)
             .field("key_id", &self.key_id)
+            .field("device_id", &self.device_id)
             .field("kind", &self.kind())
             .field("public", &self.public.as_ref().map(|p| to_hex(p)))
             .field("secret", &"<redacted>")
@@ -278,12 +335,22 @@ impl Drop for KeyFile {
     }
 }
 
+fn ok_name(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= crate::sign::MAX_KEY_ID_LEN
+        && id.bytes().all(|b| b.is_ascii_graphic())
+}
+
 fn check_key_id(id: &str) -> Result<(), KeyFileError> {
-    if id.is_empty()
-        || id.len() > crate::sign::MAX_KEY_ID_LEN
-        || !id.bytes().all(|b| b.is_ascii_graphic())
-    {
+    if !ok_name(id) {
         return Err(KeyFileError::Key(KeyError::BadKeyId));
+    }
+    Ok(())
+}
+
+fn check_device_id(id: &str) -> Result<(), KeyFileError> {
+    if !ok_name(id) {
+        return Err(KeyFileError::BadDeviceId);
     }
     Ok(())
 }
@@ -309,22 +376,20 @@ impl KeyFile {
         Ok(Self {
             algorithm: HMAC_SHA256.to_string(),
             key_id: Signer::key_id(&k).to_string(),
+            device_id: None,
             secret: secret.to_vec(),
             public: None,
         })
     }
 
-    /// A fresh 256-bit HMAC key from `/dev/urandom`. Fails rather than fall
-    /// back to weaker randomness. Legacy: prefer [`KeyFile::generate_ed25519`].
+    /// A fresh 256-bit HMAC key from the kernel CSPRNG
+    /// ([`crate::crypto::fill_random`]). Fails rather than fall back to
+    /// weaker randomness. Legacy: prefer [`KeyFile::generate_ed25519`].
     pub fn generate_hmac(key_id: Option<&str>) -> Result<Self, KeyFileError> {
         let mut secret = [0u8; GENERATED_KEY_LEN];
-        File::open("/dev/urandom")
-            .and_then(|mut f| f.read_exact(&mut secret))
-            .map_err(KeyFileError::NoRandomness)?;
-        if secret.iter().all(|&b| b == 0) {
-            return Err(KeyFileError::NoRandomness(io::Error::other(
-                "kernel returned all-zero bytes",
-            )));
+        if let Err(e) = fill_random(&mut secret) {
+            wipe(&mut secret);
+            return Err(KeyFileError::NoRandomness(e));
         }
         let k = Self::hmac_from_secret(&secret, key_id);
         wipe(&mut secret);
@@ -348,6 +413,7 @@ impl KeyFile {
         Ok(Self {
             algorithm: ED25519.to_string(),
             key_id,
+            device_id: None,
             secret: seed.to_vec(),
             public: Some(public),
         })
@@ -389,9 +455,19 @@ impl KeyFile {
         Ok(Self {
             algorithm: ED25519.to_string(),
             key_id: id,
+            device_id: None,
             secret: Vec::new(),
             public: Some(*public),
         })
+    }
+
+    /// Bind this key to one unit (see the module docs); `None` unbinds.
+    pub fn with_device_id(mut self, device_id: Option<&str>) -> Result<Self, KeyFileError> {
+        if let Some(d) = device_id {
+            check_device_id(d)?;
+        }
+        self.device_id = device_id.map(str::to_string);
+        Ok(self)
     }
 
     /// Secret (signing material present) or public (verify only).
@@ -422,7 +498,8 @@ impl KeyFile {
     /// HMAC has none: [`KeyFileError::NoPublicKey`].
     pub fn to_public(&self) -> Result<Self, KeyFileError> {
         match (&self.public, self.algorithm.as_str()) {
-            (Some(p), ED25519) => Self::ed25519_public(p, Some(&self.key_id)),
+            (Some(p), ED25519) => Self::ed25519_public(p, Some(&self.key_id))?
+                .with_device_id(self.device_id.as_deref()),
             (_, ED25519) => Err(KeyFileError::Parse("ed25519 key without public key".into())),
             (_, a) if a == HMAC_SHA256 => Err(KeyFileError::NoPublicKey(a.to_string())),
             (_, a) => Err(KeyFileError::UnsupportedAlgorithm(a.to_string())),
@@ -505,6 +582,7 @@ impl KeyFile {
                 key_id: self.key_id.clone(),
                 public_hex: self.public.as_ref().map(|p| to_hex(p)),
                 secret_hex: (!self.secret.is_empty()).then(|| to_hex(&self.secret)),
+                device_id: self.device_id.clone(),
             }
         } else {
             KeyJson {
@@ -514,10 +592,23 @@ impl KeyFile {
                 key_id: self.key_id.clone(),
                 public_hex: None,
                 secret_hex: Some(to_hex(&self.secret)),
+                device_id: self.device_id.clone(),
             }
         };
-        let s = serde_json::to_string(&j).unwrap_or_default();
-        s + "\n"
+        // One allocation of ample size, so the serialised secret is never
+        // left behind in a buffer the Vec grew out of; on the (impossible)
+        // error path the partial output is wiped.
+        let mut out = Vec::with_capacity(1024 + 2 * self.secret.len());
+        if serde_json::to_writer(&mut out, &j).is_err() {
+            wipe(&mut out);
+            return String::new();
+        }
+        out.push(b'\n');
+        String::from_utf8(out).unwrap_or_else(|e| {
+            let mut b = e.into_bytes();
+            wipe(&mut b);
+            String::new()
+        })
     }
 
     fn from_parsed(j: &KeyJson) -> Result<Self, KeyFileError> {
@@ -525,13 +616,17 @@ impl KeyFile {
         if j.algorithm.is_empty() || !j.algorithm.bytes().all(|b| b.is_ascii_graphic()) {
             return Err(KeyFileError::Parse("bad algorithm name".into()));
         }
-        match j.format.as_str() {
+        if let Some(d) = &j.device_id {
+            check_device_id(d)?;
+        }
+        let k = match j.format.as_str() {
             KEY_FILE_FORMAT => Self::from_v1(j),
             KEY_FILE_FORMAT_V2 => Self::from_v2(j),
             f => Err(KeyFileError::Parse(format!(
                 "format {f:?}, expected {KEY_FILE_FORMAT_V2:?} or {KEY_FILE_FORMAT:?}"
             ))),
-        }
+        }?;
+        k.with_device_id(j.device_id.as_deref())
     }
 
     fn from_v1(j: &KeyJson) -> Result<Self, KeyFileError> {
@@ -563,6 +658,7 @@ impl KeyFile {
         Ok(Self {
             algorithm: j.algorithm.clone(),
             key_id: j.key_id.clone(),
+            device_id: None,
             secret,
             public: None,
         })
@@ -708,7 +804,8 @@ pub fn public_key_path(secret_path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Best-effort wipe of a string that held key material.
+/// Best-effort wipe of a string that held key material (volatile writes
+/// and a compiler fence, like [`crate::crypto::wipe`]).
 fn wipe_string(s: &mut str) {
     // SAFETY: every byte is overwritten with ASCII '0', so the buffer stays
     // valid UTF-8; `write_volatile` targets a valid, exclusively borrowed byte.
@@ -717,6 +814,7 @@ fn wipe_string(s: &mut str) {
             std::ptr::write_volatile(b, b'0');
         }
     }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 
 #[cfg(unix)]
@@ -778,7 +876,9 @@ fn read_key_text(path: &Path) -> Result<(String, Metadata), KeyFileError> {
     if md.len() > MAX_KEY_FILE_BYTES {
         return Err(KeyFileError::TooLarge { len: md.len() });
     }
-    let mut s = String::new();
+    // Sized up front: a String that grows while reading would leave copies
+    // of the key text in the buffers it outgrew.
+    let mut s = String::with_capacity(md.len() as usize + 64);
     f.take(MAX_KEY_FILE_BYTES + 1)
         .read_to_string(&mut s)
         .map_err(|e| KeyFileError::Parse(e.to_string()))?;
@@ -790,14 +890,16 @@ fn read_key_text(path: &Path) -> Result<(String, Metadata), KeyFileError> {
     Ok((s, md))
 }
 
-/// Parse key file or keyring file text into key files.
+/// Parse key file or keyring file text into key files. The text is parsed
+/// straight into [`KeyJson`] (whose `Drop` wipes the secret); no
+/// intermediate `serde_json::Value` copy of the secret is made.
 fn parse_key_files(text: &str) -> Result<Vec<KeyFile>, KeyFileError> {
-    let v: serde_json::Value =
+    let probe: FormatProbe =
         serde_json::from_str(text).map_err(|e| KeyFileError::Parse(e.to_string()))?;
-    match v.get("format").and_then(|f| f.as_str()) {
+    match probe.format.as_deref() {
         Some(KEYRING_FORMAT) => {
             let j: KeyringJson =
-                serde_json::from_value(v).map_err(|e| KeyFileError::Parse(e.to_string()))?;
+                serde_json::from_str(text).map_err(|e| KeyFileError::Parse(e.to_string()))?;
             debug_assert_eq!(j.format, KEYRING_FORMAT);
             if j.keys.is_empty() {
                 return Err(KeyFileError::Parse("keyring holds no keys".into()));
@@ -806,23 +908,31 @@ fn parse_key_files(text: &str) -> Result<Vec<KeyFile>, KeyFileError> {
         }
         _ => {
             let j: KeyJson =
-                serde_json::from_value(v).map_err(|e| KeyFileError::Parse(e.to_string()))?;
+                serde_json::from_str(text).map_err(|e| KeyFileError::Parse(e.to_string()))?;
             Ok(vec![KeyFile::from_parsed(&j)?])
         }
     }
 }
 
+/// One keyring entry: the verifier and, if the key is bound, its unit.
+struct Entry {
+    verifier: Box<dyn Verifier>,
+    device_id: Option<String>,
+}
+
 /// Verifiers by key id. See the module docs.
 #[derive(Default)]
 pub struct Keyring {
-    keys: BTreeMap<String, Box<dyn Verifier>>,
+    keys: BTreeMap<String, Entry>,
     label: String,
+    allow_mixed: bool,
 }
 
 impl fmt::Debug for Keyring {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Keyring")
             .field("key_ids", &self.key_ids())
+            .field("allow_mixed_algorithms", &self.allow_mixed)
             .finish()
     }
 }
@@ -832,40 +942,103 @@ impl Keyring {
         Self::default()
     }
 
-    /// Add a verifier under its own key id. A second key with the same id is
-    /// [`KeyFileError::DuplicateKeyId`] (ambiguous, never silently replaced).
-    pub fn add(&mut self, v: Box<dyn Verifier>) -> Result<(), KeyFileError> {
-        let id = v.key_id().to_string();
-        if self.keys.contains_key(&id) {
-            return Err(KeyFileError::DuplicateKeyId(id));
+    /// Allow keys of different algorithms (HMAC next to Ed25519) in this
+    /// ring. Off by default; see the module docs for why.
+    pub fn set_allow_mixed_algorithms(&mut self, allow: bool) -> &mut Self {
+        self.allow_mixed = allow;
+        self
+    }
+
+    fn check_add(&self, id: &str, algorithm: &str) -> Result<(), KeyFileError> {
+        if self.keys.contains_key(id) {
+            return Err(KeyFileError::DuplicateKeyId(id.to_string()));
         }
-        self.keys.insert(id, v);
+        if !self.allow_mixed {
+            if let Some(e) = self
+                .keys
+                .values()
+                .find(|e| e.verifier.algorithm() != algorithm)
+            {
+                return Err(KeyFileError::MixedAlgorithms {
+                    existing: e.verifier.algorithm().to_string(),
+                    added: algorithm.to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn insert(&mut self, v: Box<dyn Verifier>, device_id: Option<String>) {
+        self.keys.insert(
+            v.key_id().to_string(),
+            Entry {
+                verifier: v,
+                device_id,
+            },
+        );
         self.label = format!(
             "keyring[{}]",
             self.keys.keys().cloned().collect::<Vec<_>>().join(",")
         );
+    }
+
+    /// Add a verifier under its own key id, not bound to a device. A second
+    /// key with the same id is [`KeyFileError::DuplicateKeyId`] (ambiguous,
+    /// never silently replaced); a key of another algorithm than the ring's
+    /// is [`KeyFileError::MixedAlgorithms`] unless allowed.
+    pub fn add(&mut self, v: Box<dyn Verifier>) -> Result<(), KeyFileError> {
+        self.add_bound(v, None)
+    }
+
+    /// [`Keyring::add`], binding the key to `device_id` (if `Some`): it then
+    /// verifies only chains of that device.
+    pub fn add_bound(
+        &mut self,
+        v: Box<dyn Verifier>,
+        device_id: Option<&str>,
+    ) -> Result<(), KeyFileError> {
+        if let Some(d) = device_id {
+            check_device_id(d)?;
+        }
+        self.check_add(v.key_id(), v.algorithm())?;
+        self.insert(v, device_id.map(str::to_string));
         Ok(())
     }
 
     /// Add the key in `k` (Ed25519 secret or public, HMAC; see
-    /// [`KeyFile::verifier`]).
+    /// [`KeyFile::verifier`]), with its `device_id` binding.
     pub fn add_key_file(&mut self, k: &KeyFile) -> Result<(), KeyFileError> {
-        self.add(k.verifier()?)
+        self.add_bound(k.verifier()?, k.device_id.as_deref())
     }
 
     fn add_all(&mut self, keys: &[KeyFile]) -> Result<(), KeyFileError> {
+        // Validate the whole batch first: nothing is added unless all are.
+        let mut alg: Option<String> = self
+            .keys
+            .values()
+            .next()
+            .map(|e| e.verifier.algorithm().to_string());
         let mut seen = std::collections::BTreeSet::new();
+        let mut verifiers = Vec::with_capacity(keys.len());
         for k in keys {
             if self.keys.contains_key(&k.key_id) || !seen.insert(k.key_id.as_str()) {
                 return Err(KeyFileError::DuplicateKeyId(k.key_id.clone()));
             }
+            let v = k.verifier()?;
+            match &alg {
+                Some(a) if !self.allow_mixed && a != v.algorithm() => {
+                    return Err(KeyFileError::MixedAlgorithms {
+                        existing: a.clone(),
+                        added: v.algorithm().to_string(),
+                    })
+                }
+                Some(_) => {}
+                None => alg = Some(v.algorithm().to_string()),
+            }
+            verifiers.push((v, k.device_id.clone()));
         }
-        let verifiers = keys
-            .iter()
-            .map(KeyFile::verifier)
-            .collect::<Result<Vec<_>, _>>()?;
-        for v in verifiers {
-            self.add(v)?;
+        for (v, d) in verifiers {
+            self.insert(v, d);
         }
         Ok(())
     }
@@ -907,7 +1080,12 @@ impl Keyring {
 
     /// The verifier for `key_id`.
     pub fn get(&self, key_id: &str) -> Option<&dyn Verifier> {
-        self.keys.get(key_id).map(|b| &**b)
+        self.keys.get(key_id).map(|e| &*e.verifier)
+    }
+
+    /// The device `key_id` is bound to, if any.
+    pub fn device_of(&self, key_id: &str) -> Option<&str> {
+        self.keys.get(key_id).and_then(|e| e.device_id.as_deref())
     }
 
     pub fn key_ids(&self) -> Vec<&str> {
@@ -918,9 +1096,17 @@ impl Keyring {
     pub fn symmetric_key_ids(&self) -> Vec<&str> {
         self.keys
             .iter()
-            .filter(|(_, v)| v.algorithm() == HMAC_SHA256)
+            .filter(|(_, e)| e.verifier.algorithm() == HMAC_SHA256)
             .map(|(k, _)| k.as_str())
             .collect()
+    }
+
+    /// Distinct algorithms of the keys in the ring.
+    pub fn algorithms(&self) -> Vec<&str> {
+        let mut a: Vec<&str> = self.keys.values().map(|e| e.verifier.algorithm()).collect();
+        a.sort_unstable();
+        a.dedup();
+        a
     }
 
     pub fn len(&self) -> usize {
@@ -939,14 +1125,33 @@ impl Verifier for Keyring {
     fn key_id(&self) -> &str {
         &self.label
     }
-    /// Valid under *any* key of the ring (see the module docs).
+    /// No key is named: accepted only if the ring holds exactly one key
+    /// (unambiguous). Evidence verification names its key
+    /// ([`Verifier::verify_key`]); see the module docs.
     fn verify(&self, message: &[u8], signature: &[u8]) -> bool {
-        self.keys.values().any(|v| v.verify(message, signature))
+        let mut it = self.keys.values();
+        match (it.next(), it.next()) {
+            (Some(e), None) => e.verifier.verify(message, signature),
+            _ => false,
+        }
     }
     fn verify_as(&self, key_id: &str, message: &[u8], signature: &[u8]) -> bool {
         self.keys
             .get(key_id)
-            .is_some_and(|v| v.verify(message, signature))
+            .is_some_and(|e| e.verifier.verify(message, signature))
+    }
+    fn verify_key(&self, key_id: &str, algorithm: &str, message: &[u8], signature: &[u8]) -> bool {
+        self.keys.get(key_id).is_some_and(|e| {
+            e.verifier.algorithm() == algorithm && e.verifier.verify(message, signature)
+        })
+    }
+    fn key_device(&self, key_id: &str) -> Option<&str> {
+        self.device_of(key_id)
+    }
+    fn verify_any(&self, message: &[u8], signature: &[u8]) -> bool {
+        self.keys
+            .values()
+            .any(|e| e.verifier.verify_any(message, signature))
     }
 }
 
@@ -1084,7 +1289,17 @@ mod tests {
         assert_eq!(ring.len(), 2);
         let sa = a.hmac().unwrap().sign(b"m").unwrap();
         let sb = b.hmac().unwrap().sign(b"m").unwrap();
-        assert!(ring.verify(b"m", &sa) && ring.verify(b"m", &sb));
+        // No key named and two keys: ambiguous, refused (K1).
+        assert!(!ring.verify(b"m", &sa) && !ring.verify(b"m", &sb));
+        assert!(!ring.verify_any(b"x", &sa));
+        assert!(ring.verify_any(b"m", &sa) && ring.verify_any(b"m", &sb));
+        assert!(ring.verify_key("a", "hmac-sha256", b"m", &sa));
+        assert!(!ring.verify_key("a", "ed25519", b"m", &sa));
+        assert!(!ring.verify_key("b", "hmac-sha256", b"m", &sa));
+        let mut one = Keyring::new();
+        one.add_key_file(&a).unwrap();
+        assert!(one.verify(b"m", &sa) && !one.verify(b"m", &sb));
+        assert!(!Keyring::new().verify(b"m", &sa));
         assert!(ring.verify_as("a", b"m", &sa));
         assert!(!ring.verify_as("a", b"m", &sb));
         assert!(!ring.verify_as("c", b"m", &sa));
@@ -1397,15 +1612,34 @@ mod tests {
             e.to_public().unwrap().to_json().trim(),
             h.to_json().trim()
         );
+        // Mixing HMAC and Ed25519 needs an explicit opt-in; nothing is
+        // added by the refused attempt.
         let mut ring = Keyring::new();
+        assert!(matches!(
+            ring.add_json(&ring_json),
+            Err(KeyFileError::MixedAlgorithms { .. })
+        ));
+        assert!(ring.is_empty());
+        ring.add_key_file(&e).unwrap();
+        assert!(matches!(
+            ring.add_key_file(&h),
+            Err(KeyFileError::MixedAlgorithms { .. })
+        ));
+        let mut ring = Keyring::new();
+        ring.set_allow_mixed_algorithms(true);
         ring.add_json(&ring_json).unwrap();
         assert_eq!(ring.key_ids(), vec!["e", "h"]);
+        assert_eq!(ring.algorithms(), vec!["ed25519", "hmac-sha256"]);
         assert_eq!(ring.symmetric_key_ids(), vec!["h"]);
         let se = e.signer().unwrap().sign(b"m").unwrap();
         let sh = h.signer().unwrap().sign(b"m").unwrap();
         assert!(ring.verify_as("e", b"m", &se));
         assert!(ring.verify_as("h", b"m", &sh));
         assert!(!ring.verify_as("e", b"m", &sh));
+        // The algorithm must match the key's: an HMAC key never answers
+        // for an ed25519 key id, even in a mixed ring.
+        assert!(ring.verify_key("h", "hmac-sha256", b"m", &sh));
+        assert!(!ring.verify_key("h", "ed25519", b"m", &sh));
         // A public-only ring has no symmetric keys.
         let mut pr = Keyring::new();
         pr.add_json(&e.to_public().unwrap().to_json()).unwrap();
@@ -1422,6 +1656,98 @@ mod tests {
             Err(KeyFileError::DuplicateKeyId(_))
         ));
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn device_binding_round_trips_and_reaches_the_keyring() {
+        let k = KeyFile::ed25519_from_seed(&[8; 32], Some("u1"))
+            .unwrap()
+            .with_device_id(Some("ugv-01"))
+            .unwrap();
+        let sec = k.to_json();
+        assert!(sec.contains("\"device_id\":\"ugv-01\""));
+        let p = k.to_public().unwrap();
+        assert_eq!(p.device_id.as_deref(), Some("ugv-01"));
+        let back = KeyFile::from_json(&p.to_json()).unwrap();
+        assert_eq!(back.device_id.as_deref(), Some("ugv-01"));
+        assert_eq!(KeyFile::from_json(&sec).unwrap().device_id, k.device_id);
+        let mut ring = Keyring::new();
+        ring.add_json(&p.to_json()).unwrap();
+        assert_eq!(ring.key_device("u1"), Some("ugv-01"));
+        assert_eq!(ring.key_device("nope"), None);
+        // HMAC v1 files may carry it too; without it they stay byte-for-byte v1.
+        let h = KeyFile::hmac_from_secret(&[3; 32], Some("h"))
+            .unwrap()
+            .with_device_id(Some("ugv-02"))
+            .unwrap();
+        let hj = h.to_json();
+        assert!(hj.starts_with("{\"format\":\"robodr-blackbox-key/v1\""));
+        assert_eq!(
+            KeyFile::from_json(&hj).unwrap().device_id.as_deref(),
+            Some("ugv-02")
+        );
+        // Bad device ids are refused, in files and in the API.
+        for bad in ["", "has space", &"x".repeat(129)] {
+            assert!(matches!(
+                KeyFile::hmac_from_secret(&[3; 32], None)
+                    .unwrap()
+                    .with_device_id(Some(bad)),
+                Err(KeyFileError::BadDeviceId)
+            ));
+            let j = hj.replace("ugv-02", bad);
+            assert!(KeyFile::from_json(&j).is_err(), "{j}");
+            assert!(Keyring::new()
+                .add_bound(Box::new(h.hmac().unwrap()), Some(bad))
+                .is_err());
+        }
+    }
+
+    /// K2 (rev4): Ed25519 key files work through the keyring, and their
+    /// lengths are exact: a 32-byte seed, a 32-byte public key.
+    #[test]
+    fn ed25519_key_files_verify_via_keyring_and_lengths_are_exact() {
+        let pk = to_hex(&public_key_from_seed(&[7; 32]));
+        let v1 = format!(
+            r#"{{"format":"robodr-blackbox-key/v1","algorithm":"ed25519","key_id":"unit-a","secret_hex":"{}"}}"#,
+            "07".repeat(32)
+        );
+        let mut ring = Keyring::new();
+        ring.add_json(&v1).unwrap();
+        let sk = KeyFile::from_json(&v1).unwrap();
+        assert_eq!(sk.secret().len(), SEED_LEN);
+        assert_eq!(sk.public_key().map(|p| to_hex(&p)), Some(pk.clone()));
+        let sig = sk.signer().unwrap().sign(b"m").unwrap();
+        assert!(ring.verify_key("unit-a", "ed25519", b"m", &sig));
+        for n in [0usize, 1, 16, 31, 33, 64] {
+            let tiny = v1.replace(&"07".repeat(32), &"07".repeat(n));
+            assert!(KeyFile::from_json(&tiny).is_err(), "seed of {n} bytes");
+            assert!(Keyring::new().add_json(&tiny).is_err());
+            let pubj = sk
+                .to_public()
+                .unwrap()
+                .to_json()
+                .replace(&pk, &pk[..(2 * n).min(pk.len())]);
+            if n < 32 {
+                assert!(KeyFile::from_json(&pubj).is_err(), "public of {n} bytes");
+            }
+        }
+        let long_pub = sk
+            .to_public()
+            .unwrap()
+            .to_json()
+            .replace(&pk, &format!("{pk}00"));
+        assert!(KeyFile::from_json(&long_pub).is_err());
+    }
+
+    #[test]
+    fn key_text_is_parsed_without_value_copies_and_rejects_non_objects() {
+        for bad in ["[]", "1", "\"x\"", "null", "{\"format\":1}"] {
+            assert!(Keyring::new().add_json(bad).is_err(), "{bad}");
+            assert!(KeyFile::from_json(bad).is_err(), "{bad}");
+        }
+        let k = KeyFile::hmac_from_secret(&[9; 32], Some("z")).unwrap();
+        assert!(k.to_json().ends_with("}\n"));
+        assert_eq!(KeyFile::from_json(&k.to_json()).unwrap().secret(), &[9; 32]);
     }
 
     #[cfg(unix)]

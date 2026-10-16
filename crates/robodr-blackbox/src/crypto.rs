@@ -11,7 +11,16 @@
 //!   table lookups; HMAC only adds XOR with the key).
 //! - [`ct_eq`] compares tags without early exit. The optimiser barrier is
 //!   `std::hint::black_box`, which is best-effort, not a guarantee.
-//! - Key material is wiped on a best-effort basis (no `unsafe` volatile writes).
+//! - Key material is wiped with volatile writes followed by a compiler fence
+//!   ([`wipe`]); the hashers wipe their chaining state, buffered input and
+//!   message schedule on drop, so an HMAC key (or an Ed25519 seed fed to
+//!   SHA-512) does not linger in a dropped hasher. This is still best
+//!   effort: copies the compiler makes in registers or spilled stack slots,
+//!   and pages swapped out before the wipe, are not covered.
+//! - [`fill_random`] reads the kernel CSPRNG with `getrandom(2)` (blocking
+//!   until the pool is initialised), falling back to `/dev/urandom` only
+//!   where the syscall does not exist, and fails rather than return
+//!   anything weaker.
 //!
 //! HMAC is a **placeholder authenticity mechanism**: anyone who holds the key
 //! can both create and verify tags, so it only proves "written by a holder of
@@ -31,6 +40,8 @@ const K: [u32; 64] = [
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
+use std::sync::atomic::{compiler_fence, Ordering};
+
 /// SHA-256 initial hash value (FIPS 180-4 §5.3.3).
 const H0: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
@@ -49,6 +60,14 @@ pub struct Sha256 {
     buf_len: usize,
     /// Total message length in bytes (mod 2^64; messages are far below 2^61 bytes).
     total_len: u64,
+}
+
+impl Drop for Sha256 {
+    fn drop(&mut self) {
+        wipe_words(&mut self.state, 0);
+        wipe(&mut self.buf);
+        wipe_words(std::slice::from_mut(&mut self.total_len), 0);
+    }
 }
 
 impl Default for Sha256 {
@@ -77,8 +96,9 @@ impl Sha256 {
             self.buf_len += take;
             data = &data[take..];
             if self.buf_len == BLOCK_LEN {
-                let block = self.buf;
+                let mut block = self.buf;
                 compress(&mut self.state, &block);
+                wipe(&mut block);
                 self.buf_len = 0;
             }
         }
@@ -87,6 +107,7 @@ impl Sha256 {
             let mut block = [0u8; BLOCK_LEN];
             block.copy_from_slice(head);
             compress(&mut self.state, &block);
+            wipe(&mut block);
             data = rest;
         }
         if !data.is_empty() {
@@ -155,6 +176,8 @@ fn compress(state: &mut [u32; 8], block: &[u8; BLOCK_LEN]) {
     for (s, v) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
         *s = s.wrapping_add(v);
     }
+    // The schedule is derived from the (possibly secret) block.
+    wipe_words(&mut w, 0);
 }
 
 /// One-shot SHA-256.
@@ -180,14 +203,17 @@ pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; DIGEST_LEN] {
         *i ^= k;
         *o ^= k;
     }
+    // Both hashers absorb a key-derived block; `Sha256`'s `Drop` wipes
+    // their state when `finalize` consumes them.
     let mut inner = Sha256::new();
     inner.update(&ipad);
     inner.update(message);
-    let inner_digest = inner.finalize();
+    let mut inner_digest = inner.finalize();
     let mut outer = Sha256::new();
     outer.update(&opad);
     outer.update(&inner_digest);
     let tag = outer.finalize();
+    wipe(&mut inner_digest);
     wipe(&mut k0);
     wipe(&mut ipad);
     wipe(&mut opad);
@@ -208,12 +234,87 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     std::hint::black_box(diff) == 0
 }
 
-/// Best-effort zeroisation of secret buffers.
-pub(crate) fn wipe(buf: &mut [u8]) {
-    for b in buf.iter_mut() {
-        *b = 0;
+/// Zeroise a secret buffer: one volatile write per byte (the compiler may
+/// not elide them as dead stores), then a compiler fence so later code is
+/// not reordered before the wipe. Best effort; see the module docs.
+pub fn wipe(buf: &mut [u8]) {
+    wipe_words(buf, 0);
+}
+
+/// [`wipe`] for buffers of any plain integer type (hash state, scalar limbs):
+/// every element is overwritten with `zero` through a volatile write.
+pub(crate) fn wipe_words<T: Copy>(buf: &mut [T], zero: T) {
+    for x in buf.iter_mut() {
+        // SAFETY: `x` is a valid, aligned, exclusively borrowed `T`, and
+        // `T: Copy` has no drop glue, so overwriting it is sound.
+        unsafe { std::ptr::write_volatile(x, zero) };
     }
-    std::hint::black_box(&buf);
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// Fill `buf` from the kernel CSPRNG.
+///
+/// Linux/Android: `getrandom(2)` with no flags (blocks only until the
+/// kernel pool has been initialised once after boot, never afterwards),
+/// retried on `EINTR` and on short reads. Only if the syscall does not exist
+/// (`ENOSYS`, pre-3.17 kernels) does it fall back to `/dev/urandom`. Other
+/// unix: `/dev/urandom`. Any failure is an error: there is no weaker
+/// fallback. A buffer of 16 bytes or more that comes back all zero is
+/// treated as a broken source.
+pub fn fill_random(buf: &mut [u8]) -> std::io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let r = match getrandom_syscall(buf) {
+        Err(e) if e.raw_os_error() == Some(ENOSYS) => urandom(buf),
+        r => r,
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let r = urandom(buf);
+    r?;
+    if buf.len() >= 16 && buf.iter().all(|&b| b == 0) {
+        return Err(std::io::Error::other(
+            "randomness source returned all-zero bytes",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const ENOSYS: i32 = 38;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const EINTR: i32 = 4;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+extern "C" {
+    // glibc >= 2.25, musl >= 1.1.20, bionic: the libc wrapper of the syscall.
+    fn getrandom(buf: *mut std::ffi::c_void, buflen: usize, flags: u32) -> isize;
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn getrandom_syscall(buf: &mut [u8]) -> std::io::Result<()> {
+    let mut done = 0usize;
+    while done < buf.len() {
+        let rest = &mut buf[done..];
+        // SAFETY: `rest` is a valid, writable buffer of `rest.len()` bytes;
+        // getrandom writes at most that many bytes into it.
+        let n = unsafe { getrandom(rest.as_mut_ptr().cast(), rest.len(), 0) };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(EINTR) {
+                continue;
+            }
+            return Err(e);
+        }
+        if n == 0 {
+            return Err(std::io::Error::other("getrandom returned 0 bytes"));
+        }
+        done += n as usize;
+    }
+    Ok(())
+}
+
+fn urandom(buf: &mut [u8]) -> std::io::Result<()> {
+    use std::io::Read;
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(buf))
 }
 
 /// Lower-case hex encoding.
@@ -241,9 +342,19 @@ pub fn from_hex(s: &str) -> Option<Vec<u8>> {
     if !b.len().is_multiple_of(2) {
         return None;
     }
-    b.chunks_exact(2)
-        .map(|p| Some((nibble(p[0])? << 4) | nibble(p[1])?))
-        .collect()
+    // Allocated once at its final size: a growing Vec would leave copies of
+    // (possibly secret) bytes in the buffers it reallocates away from.
+    let mut out = Vec::with_capacity(b.len() / 2);
+    for p in b.chunks_exact(2) {
+        match (nibble(p[0]), nibble(p[1])) {
+            (Some(h), Some(l)) => out.push((h << 4) | l),
+            _ => {
+                wipe(&mut out);
+                return None;
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Decode a 64-digit hex string into a 32-byte digest.
@@ -415,6 +526,56 @@ mod tests {
         assert!(!ct_eq(b"abc", b"abd"));
         assert!(!ct_eq(b"abc", b"ab"));
         assert!(!ct_eq(&[0u8; 32], &[1u8; 32]));
+    }
+
+    #[test]
+    fn wipe_zeroes_every_element() {
+        let mut b = [0xa5u8; 77];
+        wipe(&mut b);
+        assert!(b.iter().all(|&x| x == 0));
+        let mut w = [u64::MAX; 9];
+        wipe_words(&mut w, 0);
+        assert_eq!(w, [0; 9]);
+        let mut e: [u8; 0] = [];
+        wipe(&mut e);
+    }
+
+    #[test]
+    fn dropped_hasher_state_is_wiped() {
+        // Inspect the fields directly: what `Drop` runs must clear the
+        // chaining state and the buffered (key-derived) input.
+        let mut h = Sha256::new();
+        h.update(&[0x36; 70]);
+        assert_ne!(h.state, [0; 8]);
+        assert!(h.buf[..6].iter().all(|&b| b == 0x36));
+        // SAFETY: `h` is dropped in place exactly once and then forgotten;
+        // its fields are plain integers, so reading them afterwards only
+        // observes what `Drop` left behind.
+        unsafe { std::ptr::drop_in_place(&mut h) };
+        assert_eq!(h.state, [0; 8]);
+        assert!(h.buf.iter().all(|&b| b == 0));
+        assert_eq!(h.total_len, 0);
+        // `h` has been dropped in place: never touch it again.
+        std::mem::forget(h);
+    }
+
+    #[test]
+    fn fill_random_fills_and_differs() {
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        fill_random(&mut a).unwrap();
+        fill_random(&mut b).unwrap();
+        assert_ne!(a, b);
+        assert_ne!(a, [0; 32]);
+        // Larger than one getrandom call usually returns is still filled.
+        let mut big = vec![0u8; 1 << 20];
+        fill_random(&mut big).unwrap();
+        assert!(big.iter().filter(|&&x| x == 0).count() < big.len() / 64);
+        fill_random(&mut []).unwrap();
+        // The fallback path on its own.
+        let mut c = [0u8; 32];
+        urandom(&mut c).unwrap();
+        assert_ne!(c, [0; 32]);
     }
 
     #[test]

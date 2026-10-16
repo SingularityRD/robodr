@@ -33,8 +33,14 @@
 //!   `std::hint::black_box`), variable-latency `u128` multiplication on some
 //!   32-bit CPUs, and point *encoding* (which reads the low bit of `x` and
 //!   inverts `Z`; both are fixed-time here but not verified to be).
-//! - Secret buffers are wiped on drop on a best-effort basis (no volatile
-//!   writes, no protection against copies the compiler may have made).
+//! - Secret material is wiped with volatile writes plus a compiler fence
+//!   ([`crate::crypto::wipe`]): the seed and expanded key on drop, the
+//!   SHA-512 state that absorbed the seed or the nonce prefix (on hasher
+//!   drop), the message schedule, the nonce `r`, the 512-bit product and
+//!   the limb copies in scalar arithmetic, and the accumulator of a
+//!   secret-scalar multiplication. Copies the compiler keeps in registers
+//!   or spills are not covered.
+//! - The seed comes from [`crate::crypto::fill_random`] (`getrandom(2)`).
 //!
 //! # Verification rules
 //!
@@ -55,10 +61,9 @@
 //! that never happens, and cofactorless verification is deterministic about
 //! them. Only PureEdDSA (`Ed25519`) is provided, not `Ed25519ctx`/`Ed25519ph`.
 
-use crate::crypto::{sha256, to_hex, wipe};
+use crate::crypto::{fill_random, sha256, to_hex, wipe, wipe_words};
 use crate::sign::{SignError, Signer, Verifier, MAX_KEY_ID_LEN};
 use std::fmt;
-use std::io::Read;
 use std::sync::OnceLock;
 
 /// Algorithm name recorded in the chain identity for Ed25519 keys.
@@ -187,6 +192,14 @@ pub struct Sha512 {
     total_len: u128,
 }
 
+impl Drop for Sha512 {
+    fn drop(&mut self) {
+        wipe_words(&mut self.state, 0);
+        wipe(&mut self.buf);
+        wipe_words(std::slice::from_mut(&mut self.total_len), 0);
+    }
+}
+
 impl Default for Sha512 {
     fn default() -> Self {
         Self::new()
@@ -215,8 +228,9 @@ impl Sha512 {
             if self.buf_len < SHA512_BLOCK_LEN {
                 return;
             }
-            let block = self.buf;
+            let mut block = self.buf;
             compress512(&mut self.state, &block);
+            wipe(&mut block);
             self.buf_len = 0;
         }
         let mut chunks = data.chunks_exact(SHA512_BLOCK_LEN);
@@ -289,6 +303,8 @@ fn compress512(state: &mut [u64; 8], block: &[u8; SHA512_BLOCK_LEN]) {
     for (s, v) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
         *s = s.wrapping_add(v);
     }
+    // Derived from the block, which may be the seed or the nonce prefix.
+    wipe_words(&mut w, 0);
 }
 
 /// One-shot SHA-512.
@@ -591,13 +607,24 @@ impl Point {
     /// always adds, selects with a mask (no branch on the scalar bits).
     fn mul_scalar(&self, k: &[u8; 32]) -> Point {
         let mut q = Point::IDENTITY;
+        let mut sum = Point::IDENTITY;
         for i in (0..256).rev() {
             q = q.double();
-            let sum = q.add(self);
+            sum = q.add(self);
             let bit = ((k[i / 8] >> (i % 8)) & 1) as u64;
             q.cmov(&sum, std::hint::black_box(bit));
         }
+        // `sum` is a multiple of `self` by a prefix of the (possibly secret)
+        // scalar; the result `q` is the caller's to keep or encode.
+        sum.wipe();
         q
+    }
+
+    /// Overwrite the coordinates (volatile; see [`crate::crypto::wipe`]).
+    fn wipe(&mut self) {
+        for f in [&mut self.x, &mut self.y, &mut self.z, &mut self.t] {
+            wipe_words(&mut f.0, 0);
+        }
     }
 
     /// Projective equality: X1 Z2 = X2 Z1 and Y1 Z2 = Y2 Z1.
@@ -727,18 +754,22 @@ fn reduce_wide(bytes: &[u8; 64]) -> [u8; 32] {
         r[1] = (r[1] << 1) | (r[0] >> 63);
         r[0] = (r[0] << 1) | bit;
         // r < 2L now; subtract L unless that borrows.
-        let (d, borrow) = sub256(&r, &L_LIMBS);
+        let (mut d, borrow) = sub256(&r, &L_LIMBS);
         let keep_d = borrow.wrapping_sub(1); // all-ones iff no borrow
         for j in 0..4 {
             r[j] = (d[j] & keep_d) | (r[j] & !keep_d);
         }
+        wipe_words(&mut d, 0);
     }
-    limbs_to_bytes(&r)
+    let out = limbs_to_bytes(&r);
+    // The input may be a nonce hash or the product with the secret scalar.
+    wipe_words(&mut r, 0);
+    out
 }
 
 /// `(a * b + c) mod L` for 256-bit little-endian `a`, `b`, `c`.
 fn mul_add_mod_l(a: &[u8; 32], b: &[u8; 32], c: &[u8; 32]) -> [u8; 32] {
-    let (a, b, c) = (
+    let (mut a, mut b, mut c) = (
         limbs_from_bytes(a),
         limbs_from_bytes(b),
         limbs_from_bytes(c),
@@ -765,7 +796,13 @@ fn mul_add_mod_l(a: &[u8; 32], b: &[u8; 32], c: &[u8; 32]) -> [u8; 32] {
         ch.copy_from_slice(&v.to_le_bytes());
     }
     let out = reduce_wide(&wide);
+    // `b` is the secret scalar and `c` the secret nonce; the product and
+    // its byte form are derived from both.
     wipe(&mut wide);
+    wipe_words(&mut prod, 0);
+    wipe_words(&mut a, 0);
+    wipe_words(&mut b, 0);
+    wipe_words(&mut c, 0);
     out
 }
 
@@ -792,6 +829,7 @@ impl Drop for Expanded {
 }
 
 fn expand(seed: &[u8; SEED_LEN]) -> Expanded {
+    // `sha512` drops (and so wipes) its hasher, which absorbed the seed.
     let mut h = sha512(seed);
     let mut e = Expanded {
         scalar: [0; 32],
@@ -811,23 +849,28 @@ fn sign_expanded(
     public: &[u8; PUBLIC_KEY_LEN],
     message: &[u8],
 ) -> [u8; SIGNATURE_LEN] {
+    // The hasher absorbs the secret nonce prefix; `finalize` consumes it and
+    // its `Drop` wipes the state and buffered block.
     let mut h = Sha512::new();
     h.update(&e.prefix);
     h.update(message);
     let mut rh = h.finalize();
     let mut r = reduce_wide(&rh);
     wipe(&mut rh);
-    let big_r = consts().base.mul_scalar(&r).encode();
+    let mut rp = consts().base.mul_scalar(&r);
+    let big_r = rp.encode();
+    rp.wipe();
     let mut h = Sha512::new();
     h.update(&big_r);
     h.update(public);
     h.update(message);
     let k = reduce_wide(&h.finalize());
-    let s = mul_add_mod_l(&k, &e.scalar, &r);
+    let mut s = mul_add_mod_l(&k, &e.scalar, &r);
     wipe(&mut r);
     let mut sig = [0u8; SIGNATURE_LEN];
     sig[..32].copy_from_slice(&big_r);
     sig[32..].copy_from_slice(&s);
+    wipe(&mut s);
     sig
 }
 
@@ -929,16 +972,15 @@ pub fn derive_key_id(public: &[u8; PUBLIC_KEY_LEN]) -> String {
     format!("{ED25519}:{}", to_hex(&sha256(&m)[..8]))
 }
 
-/// Read a fresh 32-byte seed from `/dev/urandom` (Linux; the kernel CSPRNG,
-/// non-blocking once initialised at boot). An all-zero read is treated as a
-/// broken source.
+/// A fresh 32-byte seed from the kernel CSPRNG ([`fill_random`]:
+/// `getrandom(2)`, `/dev/urandom` only where the syscall is missing). Fails
+/// rather than fall back to anything weaker; an all-zero read is treated as
+/// a broken source. The caller must wipe the returned seed.
 pub fn random_seed() -> Result<[u8; SEED_LEN], Ed25519Error> {
     let mut seed = [0u8; SEED_LEN];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut seed))
-        .map_err(|e| Ed25519Error::Rng(e.to_string()))?;
-    if seed.iter().all(|&b| b == 0) {
-        return Err(Ed25519Error::Rng("all-zero output".into()));
+    if let Err(e) = fill_random(&mut seed) {
+        wipe(&mut seed);
+        return Err(Ed25519Error::Rng(e.to_string()));
     }
     Ok(seed)
 }
@@ -1108,6 +1150,28 @@ impl Verifier for Ed25519VerifyingKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropped_sha512_state_and_seeds_are_wiped() {
+        let mut h = Sha512::new();
+        h.update(&[0x77; 140]);
+        assert_ne!(h.state, [0; 8]);
+        assert!(h.buf[..12].iter().all(|&b| b == 0x77));
+        // SAFETY: `h` is dropped in place exactly once and then forgotten;
+        // its fields are plain integers, so reading them afterwards only
+        // observes what `Drop` left behind.
+        unsafe { std::ptr::drop_in_place(&mut h) };
+        assert_eq!(h.state, [0; 8]);
+        assert!(h.buf.iter().all(|&b| b == 0));
+        assert_eq!(h.total_len, 0);
+        std::mem::forget(h);
+        // The point wipe used for secret-scalar intermediates.
+        let mut p = consts().base;
+        p.wipe();
+        assert_eq!([p.x.0, p.y.0, p.z.0, p.t.0], [[0; 5]; 4]);
+        // Seeds come from getrandom and differ.
+        assert_ne!(random_seed().unwrap(), random_seed().unwrap());
+    }
     use crate::crypto::from_hex;
 
     fn h32(s: &str) -> [u8; 32] {

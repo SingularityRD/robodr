@@ -682,6 +682,11 @@ impl VerifySummary {
 
 /// Verify an existing black-box directory (with its own checkpoint.json, or
 /// none), and optionally resolve the evidence links of a findings JSONL file.
+///
+/// Records verify only under the key id (and algorithm) their chain names.
+/// Without `key_id` the HMAC key is filed under the chain's own recorded
+/// `hmac-sha256` key id (the key bytes authenticate, the id only names
+/// them); with `key_id` it must be the chain's.
 pub fn verify(
     blackbox: &Path,
     key: &[u8],
@@ -689,7 +694,17 @@ pub fn verify(
     robot_id: Option<&str>,
     findings: Option<&Path>,
 ) -> Result<VerifySummary, ReplayError> {
-    let verifier = hmac_key(key, key_id)?;
+    let mut verifier = hmac_key(key, key_id)?;
+    if key_id.is_none() {
+        if let Ok(r) = verify_blackbox(blackbox, &verifier, None, None) {
+            if let Some(id) = r.identity.filter(|i| {
+                i.algorithm == robodr_blackbox::sign::HMAC_SHA256
+                    && i.key_id != Verifier::key_id(&verifier)
+            }) {
+                verifier = hmac_key(key, Some(&id.key_id))?;
+            }
+        }
+    }
     verify_with(blackbox, &verifier, robot_id, findings)
 }
 

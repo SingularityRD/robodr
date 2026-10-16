@@ -1,7 +1,7 @@
 //! The `robodr-blackbox` binary: keygen, verify (with keyrings), inspect.
 mod common;
 use common::*;
-use robodr_blackbox::keys::{KeyFile, KEYRING_FORMAT};
+use robodr_blackbox::keys::{self, KeyFile, KEYRING_FORMAT};
 use robodr_blackbox::store::segment_file_name;
 use robodr_blackbox::*;
 use std::path::Path;
@@ -445,4 +445,80 @@ fn verify_with_only_the_public_key() {
     set_mode(&k, 0o604);
     let o = run(&["verify", s(&dir), "--keyring", s(&k)]);
     assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+}
+
+#[test]
+fn keygen_device_binding_and_verify_refuses_other_units_keys() {
+    let d = TestDir::new("cli-bind");
+    let k = d.sub("unit.key");
+    let o = run(&["keygen", "--out", s(&k), "--device", "ugv-01"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let pubk = KeyFile::load(&keys::public_key_path(&k)).unwrap();
+    assert_eq!(pubk.device_id.as_deref(), Some("ugv-01"));
+    assert_eq!(
+        KeyFile::load(&k).unwrap().device_id.as_deref(),
+        Some("ugv-01")
+    );
+    for bad in [
+        &["--device", "has space"][..],
+        &["--device", "a", "--device", "b"],
+    ] {
+        let mut args = vec!["keygen", "--out"];
+        let p = d.sub("bad.key");
+        args.push(s(&p));
+        args.extend_from_slice(bad);
+        assert_eq!(run(&args).status.code(), Some(2));
+        assert!(!p.exists());
+    }
+
+    // A log of ugv-01 signed by that key verifies with its public file...
+    let dir = d.sub("log");
+    let mut c = cfg(&dir, big());
+    c.device_id = "ugv-01".into();
+    let signer = KeyFile::load(&k).unwrap().signer().unwrap();
+    let mut r = Recorder::open(c, signer, clock()).unwrap();
+    recorded(r.append_note(&note(0), false).unwrap());
+    r.close().unwrap();
+    let pp = keys::public_key_path(&k);
+    let o = run(&["verify", s(&dir), "--keyring", s(&pp)]);
+    assert!(o.status.success(), "{}", text(&o));
+    // ... but the same key bound to another unit is refused.
+    let other_pub = d.sub("other.pub");
+    pubk.with_device_id(Some("ugv-02"))
+        .unwrap()
+        .write_new(&other_pub)
+        .unwrap();
+    let o = run(&["verify", s(&dir), "--keyring", s(&other_pub)]);
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+}
+
+#[test]
+fn verify_mixing_hmac_and_ed25519_needs_an_explicit_flag() {
+    let d = TestDir::new("cli-mixed");
+    let ka = KeyFile::generate_hmac(Some("a")).unwrap();
+    let kb = KeyFile::generate_ed25519(Some("b")).unwrap();
+    let dir = d.sub("log");
+    let mut r = Recorder::open(cfg(&dir, big()), Box::new(ka.hmac().unwrap()), clock()).unwrap();
+    recorded(r.append_note(&note(0), false).unwrap());
+    r.rotate_key(kb.signer().unwrap(), None, "move to ed25519")
+        .unwrap();
+    recorded(r.append_note(&note(1), false).unwrap());
+    r.close().unwrap();
+    let (pa, pb) = (d.sub("a.key"), d.sub("b.pub"));
+    ka.write_new(&pa).unwrap();
+    kb.to_public().unwrap().write_new(&pb).unwrap();
+    let o = run(&["verify", s(&dir), "--keyring", s(&pa), "--keyring", s(&pb)]);
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+    assert!(text(&o).contains("mixed algorithms"), "{}", text(&o));
+    let o = run(&[
+        "verify",
+        s(&dir),
+        "--keyring",
+        s(&pa),
+        "--keyring",
+        s(&pb),
+        "--allow-mixed-algorithms",
+    ]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("INTACT, CLEAN"), "{}", text(&o));
 }

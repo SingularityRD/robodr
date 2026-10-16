@@ -32,7 +32,7 @@
 
 use crate::crypto::{from_hex, hash_from_hex, to_hex};
 use crate::record::{
-    scan_frames, signing_message, ChainIdentity, Hash, Record, ScanItem, MAX_SIG_LEN,
+    scan_frames, signing_message, ChainIdentity, Hash, KeyRef, Record, ScanItem, MAX_SIG_LEN,
 };
 use crate::sign::{SignError, Signer, Verifier};
 use crate::verify::{verify_segments, Finding, FindingKind, Report, SegmentData, VerifyOptions};
@@ -425,12 +425,27 @@ impl Bundle {
 
     /// Verify independently. `trusted` is the receiver's own last position for
     /// this chain; without it the bundle's own anchor is used and flagged as
-    /// unverified (first contact).
+    /// unverified (first contact). Records are checked under the key the
+    /// chain identity names (switched by `KeyRotation`s in the bundle); use
+    /// [`Bundle::verify_with_key`] when an earlier bundle rotated the key.
     pub fn verify(
         &self,
         verifier: &dyn Verifier,
         trusted: Option<&Anchor>,
         expected_device_id: Option<&str>,
+    ) -> Report {
+        self.verify_with_key(verifier, trusted, expected_device_id, None)
+    }
+
+    /// [`Bundle::verify`] with the trusted key in effect right after
+    /// `trusted` (the previous bundle's [`Report::signing_key`]); `None`
+    /// means the chain identity's key.
+    pub fn verify_with_key(
+        &self,
+        verifier: &dyn Verifier,
+        trusted: Option<&Anchor>,
+        expected_device_id: Option<&str>,
+        signing_key: Option<&KeyRef>,
     ) -> Report {
         let chain = trusted
             .map(|a| a.chain_id)
@@ -440,6 +455,8 @@ impl Bundle {
             expected_device_id: expected_device_id.map(str::to_string),
             trusted_anchor: trusted.cloned().or_else(|| self.anchor.clone()),
             checkpoint: None,
+            identity: Some(self.identity.clone()),
+            signing_key: signing_key.cloned(),
         };
         let seg = SegmentData {
             name: "bundle".to_string(),
@@ -481,6 +498,8 @@ impl Bundle {
 pub struct Receiver {
     expected_device_id: Option<String>,
     state: Option<Anchor>,
+    /// Signing key in effect at `state` (tracks rotations across bundles).
+    signing_key: Option<KeyRef>,
 }
 
 impl Receiver {
@@ -489,20 +508,44 @@ impl Receiver {
         Self {
             expected_device_id,
             state: None,
+            signing_key: None,
         }
     }
 
-    /// Resume from a persisted position.
+    /// Resume from a persisted position (signing key: the chain identity's,
+    /// or whatever the next bundle proves; see
+    /// [`Receiver::with_state_and_key`] after a key rotation).
     pub fn with_state(expected_device_id: Option<String>, state: Anchor) -> Self {
         Self {
             expected_device_id,
             state: Some(state),
+            signing_key: None,
+        }
+    }
+
+    /// Resume from a persisted position and the signing key in effect there
+    /// ([`Receiver::signing_key`] when the state was saved).
+    pub fn with_state_and_key(
+        expected_device_id: Option<String>,
+        state: Anchor,
+        signing_key: Option<KeyRef>,
+    ) -> Self {
+        Self {
+            expected_device_id,
+            state: Some(state),
+            signing_key,
         }
     }
 
     /// Last accepted position.
     pub fn state(&self) -> Option<&Anchor> {
         self.state.as_ref()
+    }
+
+    /// Signing key in effect at [`Receiver::state`] (persist it with the
+    /// state), if known.
+    pub fn signing_key(&self) -> Option<&KeyRef> {
+        self.signing_key.as_ref()
     }
 
     /// Signed acknowledgement of the current state, for the unit's
@@ -517,15 +560,19 @@ impl Receiver {
 
     /// Verify `bundle` against the current state; advance only if intact.
     pub fn accept(&mut self, bundle: &Bundle, verifier: &dyn Verifier) -> Report {
-        let report = bundle.verify(
+        let report = bundle.verify_with_key(
             verifier,
             self.state.as_ref(),
             self.expected_device_id.as_deref(),
+            self.signing_key.as_ref(),
         );
         if report.is_intact() {
             if let Some((seq, hash)) = bundle.last() {
                 let newer = self.state.as_ref().is_none_or(|s| seq > s.seq);
                 if newer {
+                    if report.signing_key.is_some() {
+                        self.signing_key = report.signing_key.clone();
+                    }
                     self.state = Some(Anchor {
                         chain_id: self
                             .state

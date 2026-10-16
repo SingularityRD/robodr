@@ -650,6 +650,10 @@ fn segment_identity(name: &str, idx: u64, first: &Record) -> Result<ChainIdentit
 /// [`Verifier`] if one was given, else [`Signer::verify_own`]; then any
 /// retired key (rotated away from in this run, or passed to
 /// [`Recorder::open_with_keys`] for records signed before a rotation).
+/// `previous_keys` is a trusted local input (the operator vouches that
+/// every key in it belongs to this unit), so a keyring there is consulted
+/// with [`Verifier::verify_any`]. Independent verification
+/// ([`crate::verify`]) never does that: it names the key per record.
 struct KeyCheck<'a> {
     signer: &'a dyn Signer,
     ext: Option<&'a dyn Verifier>,
@@ -667,7 +671,7 @@ impl KeyCheck<'_> {
             .retired_signers
             .iter()
             .any(|s| s.verify_own(message, sig) == Some(true))
-            || self.retired.iter().any(|v| v.verify(message, sig))
+            || self.retired.iter().any(|v| v.verify_any(message, sig))
     }
     /// Hash and signature both valid.
     fn record(&self, r: &Record) -> bool {
@@ -1020,7 +1024,9 @@ impl Recorder {
     /// [`Recorder::open_with_verifier`] (or `None` for a self-verifying
     /// signer), and `previous_keys` (typically a
     /// [`crate::keys::Keyring`]) to authenticate retained records signed
-    /// before a [`Recorder::rotate_key`]. The log's *current* key (the last
+    /// before a [`Recorder::rotate_key`] (consulted with
+    /// [`Verifier::verify_any`]: put only this unit's own keys in it). The
+    /// log's *current* key (the last
     /// rotation's target) must still be `signer`'s key, otherwise
     /// [`Error::KeyMismatch`]: rotation happens only through `rotate_key`,
     /// which needs the old private key.
