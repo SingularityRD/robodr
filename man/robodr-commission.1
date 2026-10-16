@@ -89,6 +89,11 @@ robodr\-commission \- learn, review, lock and verify a RoboDR model profile
 .IR profile\-state.json ]
 .RB [ \-\-allow\-rollback
 .IR sha256:HEX ]
+.RB [ \-\-trust\-roots
+.I roots.json
+.RB [ \-\-revocations
+.I revocations.json
+.RB [ \-\-revocations\-required ]]]
 .RB [ \-\-json ]
 .PP
 .B robodr\-commission keygen
@@ -98,6 +103,7 @@ robodr\-commission \- learn, review, lock and verify a RoboDR model profile
 .I trust.json
 .RB [ \-\-key\-id
 .IR ID ]
+.RB [ \-\-roots ]
 .PP
 .B robodr\-commission trust\-keys
 .B \-\-out
@@ -105,6 +111,41 @@ robodr\-commission \- learn, review, lock and verify a RoboDR model profile
 .B \-\-pub
 .IR KEY.pub " ..."
 .RB [ \-\-force ]
+.RB [ \-\-roots " |"
+.RB [ \-\-min\-profile\-version
+.IR N ]
+.RB [ \-\-sign\-key
+.IR ROOT.key ]]
+.PP
+.B robodr\-commission revoke
+.B \-\-sign\-key
+.I ROOT.key
+.B \-\-out
+.I revocations.json
+.RB [ \-\-digest
+.IR sha256:HEX ]...
+.RB [ \-\-revoke\-profile
+.IR FILE ]...
+.RB [ \-\-key\-id
+.IR ID ]...
+.RB [ \-\-base
+.I previous.json
+.B \-\-trust\-roots
+.IR roots.json ]
+.RB [ \-\-serial
+.IR N ]
+.RB [ \-\-issued\-at
+.IR UNIX_SECS ]
+.RB [ \-\-force ]
+.PP
+.B robodr\-commission verify\-revocations
+.B \-\-list
+.I revocations.json
+.B \-\-trust\-roots
+.I roots.json
+.RB [ \-\-state
+.IR profile\-state.json ]
+.RB [ \-\-json ]
 .PP
 .B robodr\-commission migrate\-legacy
 .B \-\-in
@@ -322,6 +363,61 @@ runs the same check and prints the file digest; with
 it also evaluates anti\-rollback against a state file without writing it
 (exit 0 trusted, 1 refused).
 .PP
+.B Trust roots, floor and revocation.
+.B keygen \-\-roots
+and
+.B trust\-keys \-\-roots
+write a
+.B robodr\-trust\-roots/v1
+file: keys that sign only revocation lists and trust\-file floors, never
+profiles (a key that is both a root and a profile key is refused by every
+loader).
+.B trust\-keys \-\-min\-profile\-version
+.I N
+.B \-\-sign\-key
+.I ROOT.key
+writes a trust file with a
+.B min_profile_version
+floor plus its root signature
+.IB trust.json .sig
+(domain
+.BR robodr\-profile\-trust\-sig/v1 );
+an unsigned floor is refused, and
+.B allow_rollback
+cannot go below it.
+.B revoke
+writes a
+.B robodr\-profile\-revocations/v1
+list (revoked profile file digests and signing key ids, a monotonic
+.BR serial ,
+.BR issued_at ;
+Ed25519 by a root over the domain tag and the compact body). With
+.B \-\-base
+the previous list is verified under
+.B \-\-trust\-roots
+and its entries are carried over; the serial defaults to its serial + 1 (1
+without a base) and an explicit
+.B \-\-serial
+must be higher. With
+.B \-\-trust\-roots
+the signing key must be one of the roots.
+.B verify\-revocations
+checks a list's signature and, with
+.BR \-\-state ,
+that it is not older than (or a different list under the same serial as)
+the unit's accepted one (exit 0 valid, 1 refused). Loaders refuse a revoked
+profile or key, an invalid list, an older list, and a missing list after
+one was accepted or when
+.B revocation_policy
+is
+.BR required .
+Loaders with a black box
+.RB ( robodr\-agentd (8))
+also record each accepted profile in it and raise a Critical
+.B robot.ros2.profile_state_tampered
+finding when the anti\-rollback state file is missing or behind that
+record; the record is then the rollback baseline.
+.PP
 .B Legacy profiles.
 A profile locked before metadata existed (sealed, no
 .BR metadata )
@@ -347,7 +443,8 @@ OK / clean.
 .TP
 .B 1
 Negative result: deviations found, profiles differ, lock refused, profile
-not trusted (\fBverify\-profile\fR).
+not trusted (\fBverify\-profile\fR), revocation list refused
+(\fBverify\-revocations\fR).
 .TP
 .B 2
 Usage, input or I/O error.
@@ -364,6 +461,12 @@ robodr\-commission lock \-\-in draft.json \e
 robodr\-commission verify\-profile \-\-profile locked.json \e
     \-\-trusted\-keys profile\-trust.json
 robodr\-commission check \-\-profile locked.json \-\-pcap run3.pcapng
+# trust root (offline), then revoke a profile file
+robodr\-commission keygen \-\-out oem\-root.key \-\-trust\-out trust\-roots.json \-\-roots
+robodr\-commission revoke \-\-sign\-key oem\-root.key \-\-out revocations.json \e
+    \-\-revoke\-profile locked\-old.json
+robodr\-commission verify\-revocations \-\-list revocations.json \e
+    \-\-trust\-roots trust\-roots.json
 # next version of the same lineage
 robodr\-commission lock \-\-in draft2.json \-\-signoff draft2.json.signoff.json \e
     \-\-out locked2.json \-\-parent locked.json \-\-sign\-key oem\-profile.key

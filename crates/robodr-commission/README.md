@@ -256,8 +256,15 @@ valid seal if locked.
   file, and (with a state file) refuses a lower `profile_version` unless the
   operator names the exact file digest. A locked profile without metadata
   (locked before versioning) is refused; `migrate-legacy` re-issues it.
-  Limits: the Ed25519 code is not audited; the anti-rollback state is a
-  plain file root can reset; no revocation list.
+  Trust roots (`keygen --roots`, never profile keys) sign a revocation list
+  (`revoke`, `verify-revocations`: revoked digests / key ids, monotonic
+  serial, itself anti-rollback protected) and an optional trust-file
+  `min_profile_version` floor (`trust-keys --min-profile-version --sign-key`).
+  agentd records each accepted profile in the black box and flags a deleted
+  or rewritten state file (Critical `robot.ros2.profile_state_tampered`).
+  Limits: the Ed25519 code is not audited; root can delete both the state
+  file and the black box (only the signed floor remains on the unit); an
+  older root-signed trust file (lower floor) can be replayed; no expiry.
 
   The locked file is **sealed**: its first member is
   `"seal": "sha256:<hex>"` over the rest of the file. `check`, `diff` and

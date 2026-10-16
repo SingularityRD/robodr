@@ -34,6 +34,9 @@
 //! * [`notify`]: `sd_notify` (`READY=1`, `WATCHDOG=1` from the main loop,
 //!   `STOPPING=1`) with std only, and the `CLOCK_MONOTONIC` stamp that lets
 //!   a consumer tell a stale `status.json` from a live one.
+//! * [`profile_chain`]: the black box as the second witness of profile
+//!   anti-rollback (accepted-profile records; a deleted or rewritten state
+//!   file is detected at the next start).
 //! * [`signal`]: SIGTERM / SIGINT through `extern "C"` `signal(2)` and an
 //!   `AtomicBool`.
 //!
@@ -59,6 +62,7 @@ pub mod daemon;
 pub mod health;
 pub mod input;
 pub mod notify;
+pub mod profile_chain;
 pub mod signal;
 pub mod spool;
 

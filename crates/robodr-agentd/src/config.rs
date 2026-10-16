@@ -42,7 +42,15 @@
 //!   observe-only and reports `robot.ros2.profile_refused`. The rollback
 //!   decision is made by [`resolve`] (so `--check-config` reports it) but
 //!   the state file is only written when the daemon starts
-//!   ([`Resolved::profile_state_commit`]).
+//!   ([`Resolved::profile_state_commit`]). With `trust_roots`, a
+//!   root-signed `min_profile_version` in the trust file and a signed
+//!   revocation list (`revocation_list`, `revocation_policy`) apply too.
+//!   With `state_file`, the newest accepted-profile record of the black box
+//!   (`blackbox.dir`, verified with the black-box key; see
+//!   [`crate::profile_chain`]) is the second witness: a state file missing
+//!   or behind it is [`Resolved::profile_alarm`] (reported as a Critical,
+//!   observe-only finding at start, also by `--check-config`) and the record
+//!   is the rollback baseline.
 //! * `robot.profile_version` was **removed**: the version reported in
 //!   findings is the signed profile's `metadata.profile_version`. A config
 //!   that still sets it is refused with a message saying so.
@@ -70,10 +78,12 @@ use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use robodr_commission::trust::{AcceptedState, RollbackDecision, StateAlarm};
 use robodr_motion::{FeedbackSource, MonitorConfig};
 use robodr_responder::{Connectivity, ControlMode, MissionPhase, ResponsePolicy, SafetyState};
 use robodr_ros2_pipeline::config::Settings;
-use robodr_ros2_pipeline::{load_profile_deferred, LoadedProfile, StateCommit};
+use robodr_ros2_pipeline::profile_trust::load_profile_checked;
+use robodr_ros2_pipeline::{LoadedProfile, StateCommit};
 use serde::Deserialize;
 
 /// Max size of the daemon config, the policy and a monitor config file.
@@ -128,6 +138,9 @@ pub const SENSOR_TRUST_KEYS: &[&str] = &[
     "allow_rollback",
     "expect_platform",
     "expect_unit_id",
+    "trust_roots",
+    "revocation_list",
+    "revocation_policy",
 ];
 /// Keys of `sensor.binding` (`participant_ips` is a free-form map).
 pub const SENSOR_BINDING_KEYS: &[&str] = &[
@@ -373,6 +386,15 @@ pub struct Resolved {
     /// The anti-rollback state write that accepting the profile implies
     /// (written by the daemon at start, never by `--check-config`).
     pub profile_state_commit: Option<StateCommit>,
+    /// The state file is missing or behind the black box's record.
+    pub profile_alarm: Option<StateAlarm>,
+    /// The accepted locked profile to record in the black box at start
+    /// (and in every heartbeat) once enforcing.
+    pub profile_accepted: Option<AcceptedState>,
+    /// Key that signed the accepted profile.
+    pub profile_signed_by: Option<String>,
+    /// Anti-rollback decision for the accepted profile.
+    pub profile_decision: Option<RollbackDecision>,
     pub policy: ResponsePolicy,
     pub monitor: Option<MonitorConfig>,
     /// Black-box key bytes: the HMAC key or the Ed25519 seed (never
@@ -679,8 +701,6 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         );
     }
     warnings.extend(sensor.profile_trust.warnings());
-    let (profile, profile_state_commit) =
-        load_profile_deferred(&sensor.profile_path, &sensor.profile_trust)?;
     let policy_text = read_capped(&config.policy_path, MAX_CONFIG_BYTES)?;
     let policy = ResponsePolicy::from_json(&policy_text)
         .map_err(|e| format!("{}: {e}", config.policy_path.display()))?;
@@ -689,22 +709,6 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
             "response policy is not OEM-validated: every plan is observe-only (Record)".into(),
         );
     }
-    let monitor = match &config.motion_monitor {
-        None => None,
-        Some(m) => Some(match &m.config_path {
-            Some(p) => {
-                require_abs("motion_monitor.config_path", p)?;
-                let text = read_capped(p, MAX_CONFIG_BYTES)?;
-                robodr_agent::strict_from_str::<MonitorConfig>(&text)
-                    .map_err(|e| format!("{}: not a monitor config: {e}", p.display()))?
-            }
-            None => {
-                let mut mc = MonitorConfig::ugv(profile.profile.model.clone());
-                mc.command_channels = profile.profile.motion_envelopes.keys().cloned().collect();
-                mc
-            }
-        }),
-    };
     if let Some(fw) = &config.firewall {
         for (ch, v) in &fw.max_angular {
             if !v.is_finite() || *v < 0.0 {
@@ -742,11 +746,66 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         Some(b) => b.clone(),
         None => read_boot_id(),
     };
+    // The black box's newest accepted-profile record (only consulted with
+    // anti-rollback state).
+    let chain = if sensor.profile_trust.state_file.is_some() {
+        let signer = signer_for(&key_algorithm, &key, key_id.as_deref())
+            .map_err(|e| format!("black-box key: {e}"))?;
+        match crate::profile_chain::latest_accepted(&config.blackbox.dir, signer.as_ref()) {
+            Ok(scan) => {
+                if scan.unverified > 0 {
+                    warnings.push(format!(
+                        "black box: {} accepted-profile record(s) do not verify under the \
+                         current key (another key, or tampered); ignored",
+                        scan.unverified
+                    ));
+                }
+                for s in &scan.skipped {
+                    warnings.push(format!("black box segment skipped: {}", sanitize_path(s)));
+                }
+                scan.latest
+            }
+            Err(e) => {
+                warnings.push(format!(
+                    "black box not readable for the profile anti-rollback record: {}; only the \
+                     state file is used",
+                    sanitize_path(&e)
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let t = load_profile_checked(&sensor.profile_path, &sensor.profile_trust, chain.as_ref())?;
+    if let Some(a) = &t.alarm {
+        warnings.push(format!("CRITICAL: {a}"));
+    }
+    let monitor = match &config.motion_monitor {
+        None => None,
+        Some(m) => Some(match &m.config_path {
+            Some(p) => {
+                require_abs("motion_monitor.config_path", p)?;
+                let text = read_capped(p, MAX_CONFIG_BYTES)?;
+                robodr_agent::strict_from_str::<MonitorConfig>(&text)
+                    .map_err(|e| format!("{}: not a monitor config: {e}", p.display()))?
+            }
+            None => {
+                let mut mc = MonitorConfig::ugv(t.loaded.profile.model.clone());
+                mc.command_channels = t.loaded.profile.motion_envelopes.keys().cloned().collect();
+                mc
+            }
+        }),
+    };
     Ok(Resolved {
         config,
         sensor,
-        profile,
-        profile_state_commit,
+        profile: t.loaded,
+        profile_state_commit: t.commit,
+        profile_alarm: t.alarm,
+        profile_accepted: t.accepted,
+        profile_signed_by: t.signed_by,
+        profile_decision: t.decision,
         policy,
         monitor,
         key,
@@ -755,6 +814,10 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         boot_id,
         warnings,
     })
+}
+
+fn sanitize_path(s: &str) -> String {
+    robodr_ros2_pipeline::sanitize(s)
 }
 
 /// This boot's id, or `unknown-boot` when it cannot be read.
@@ -1258,10 +1321,12 @@ mod tests {
         assert!(resolve(base("/var/x", "/var/x/spool"))
             .unwrap_err()
             .contains("contain"));
-        // Everything valid up to the missing profile file.
+        // Everything valid up to the missing policy file (read before the
+        // key and the profile: the profile's trust check needs the
+        // black-box key to read the anti-rollback record).
         assert!(resolve(base("/var/bb", "/var/spool"))
             .unwrap_err()
-            .contains("profile"));
+            .contains("policy"));
         let mut c = base("/var/bb", "/var/spool");
         c.robot.id = "bad id\n".into();
         assert!(resolve(c).unwrap_err().contains("robot.id"));

@@ -277,10 +277,23 @@ is installed on every robot of the fleet (section 5, step 6).
 the trust file (a trust file may list several keys), roll the new trust file
 out, re-sign the current profile with the new key
 (`robodr-commission sign --profile locked.json --sign-key new.key --force`),
-then remove the old entry. **Revocation** is removing the entry; there is no
-revocation list or expiry. If a signing key is compromised, remove it from
-every trust file at once and re-sign with a new key: until then an attacker
-holding it can make the robot enforce a profile of their choosing.
+then remove the old entry. **Revocation** of a key or of a single profile
+file is done with a signed revocation list (section 5.3); removing the entry
+from the trust file still works but needs a new trust file on every robot.
+If a signing key is compromised, revoke its key id at once and re-sign with
+a new key: until the list is installed an attacker holding it can make the
+robot enforce a profile of their choosing. There is no expiry.
+
+**Trust roots** are a second, separate Ed25519 key pair (or several) that
+sign only revocation lists and the trust file's `min_profile_version`
+floor, never profiles. Keep them offline, on a different station or token
+than the profile signing key; a key that is both a root and a profile key
+is refused by every loader.
+
+```sh
+robodr-commission keygen --out /secure/oem-root.key --trust-out trust-roots.json \
+    --key-id oem-root-2026 --roots
+```
 
 The Ed25519 implementation is RoboDR's own std-only one (crates.io is not
 reachable in this build), pinned to the RFC 8032 test vectors but **not
@@ -379,7 +392,8 @@ Work in `/var/lib/robodr/commission/<date>/` as root.
 
    The signature must sit next to the profile as `<profile_path>.sig`. The
    `profile_trust` settings (`trusted_keys`, `state_file`, optional
-   `expect_platform` / `expect_unit_id`) are in
+   `expect_platform` / `expect_unit_id`, and `trust_roots`,
+   `revocation_list`, `revocation_policy` from section 5.3) are in
    `config/agentd.example.json` (`sensor.profile_trust`) and
    `config/robodr.toml.example` (`[module.robodr-sensor-ros2.profile_trust]`).
    `robot.profile_version` in `agentd.json` was removed: the version in
@@ -396,7 +410,9 @@ Work in `/var/lib/robodr/commission/<date>/` as root.
 
    An unlocked, missing or invalid profile, or a locked profile that is not
    trusted (no or bad signature, key not in the trust file, no metadata,
-   wrong platform/unit, older than the last accepted version) makes the
+   wrong platform/unit, older than the last accepted version, below the
+   signed floor, revoked, or a revocation list that is invalid, older than
+   the accepted one or missing when required) makes the
    sensor run observe-only (every finding is marked `[observe-only]`) and
    is reported as `robot.ros2.profile_refused` with the reason. This is how
    to run a first field period before enforcing.
@@ -440,10 +456,51 @@ After the daemon has loaded it, the state records the older version; remove
 `allow_rollback` again. `--check-config` evaluates the rollback rule but
 never writes the state; only a starting daemon does, atomically.
 
-Limits: the state file is plain JSON. Anyone who can delete or rewrite it
-(root on the unit) resets anti-rollback; a hardware monotonic counter (TPM)
-is the planned fix. A corrupt or unreadable state file is not reset
-silently: the profile is refused until an operator repairs or removes it.
+**The black box is the second witness.** `robodr-agentd` records every
+accepted locked profile (version, digest, revocation-list serial) in the
+signed black-box chain: a `robodr.profile_accepted` note at start and the
+same `profile_accepted` object in every heartbeat. At the next start it
+reads the newest such record (it must verify under the daemon's own
+black-box key) and compares it with the state file:
+
+- state file **missing**, or **behind** the record (lower version, other
+  digest for the same version, older revocation serial): the record is the
+  rollback baseline, so the older profile stays refused, and agentd reports
+  a **Critical** finding `robot.ros2.profile_state_tampered` (observe-only:
+  it never requests an action) and logs `CRITICAL:`; `--check-config`
+  shows it as a `CRITICAL:` warning. If the offered profile is the recorded
+  one, it is enforced and the state file is rewritten from the record.
+- state file **ahead** of the record (the daemon stopped between writing the
+  state and the note): normal, nothing reported.
+
+So deleting the state file no longer resets anti-rollback; a deliberate
+rollback always goes through `allow_rollback`. If agentd stops between an
+operator rollback and its note, the next start refuses the older profile
+again with the alarm: keep `allow_rollback` set until the daemon has run.
+
+**Signed floor.** A trust file may carry `min_profile_version`, honoured
+only when the trust file is signed by a trust root (`<trust>.sig`):
+
+```sh
+robodr-commission trust-keys --out profile-trust.json --pub oem-profile.key.pub \
+    --min-profile-version 4 --sign-key /secure/oem-root.key   # writes .json + .json.sig
+```
+
+A locked profile below the floor is refused and `allow_rollback` cannot
+override it; a floor without a valid root signature (or without
+`trust_roots` configured) makes the whole trust file invalid. The floor is
+what remains if root deletes both the state file and the black box.
+
+Limits: the state file is plain JSON; root can still delete it **and** the
+black box directory (the gap is visible off-unit in the exported chain, not
+on the unit), leaving only the signed floor. An older root-signed trust file
+with a lower floor still verifies (trust files have no serial; revocation
+lists do). Cyclic retention or export pruning can drop old segments; the
+heartbeat re-records the profile so the newest segment carries it. The
+Pulsar sensor and `robodr-ros2-watch` have no black box and use the state
+file and floor only. A hardware monotonic counter (TPM) is the planned fix.
+A corrupt or unreadable state file is not reset silently: the profile is
+refused until an operator repairs or removes it.
 
 ### 5.2 Legacy profiles (locked before profile versioning)
 
@@ -461,6 +518,48 @@ robodr-commission migrate-legacy --in legacy-locked.json --out locked.json \
 
 The content is unchanged; the legacy file's digest becomes
 `parent_digest`. Then install as in step 6.
+
+### 5.3 Revocation list
+
+A revocation list withdraws profile files (by digest) and profile signing
+keys (by key id) without touching the trust file. It is signed by a trust
+root (section 4.4) and carries a monotonic `serial` and `issued_at`
+(informational: no expiry).
+
+```sh
+# on the offline signing station
+robodr-commission revoke --sign-key /secure/oem-root.key --out revocations-1.json \
+    --revoke-profile locked-v3.json            # or --digest sha256:<hex>, --key-id oem-2025
+robodr-commission revoke --sign-key /secure/oem-root.key --out revocations-2.json \
+    --base revocations-1.json --trust-roots trust-roots.json --key-id oem-ugv-x1-2025
+robodr-commission verify-revocations --list revocations-2.json --trust-roots trust-roots.json
+```
+
+`--base` carries over the previous list's entries (after verifying it) and
+the serial defaults to its serial + 1. Install the list and the roots file
+on every robot:
+
+```json
+"profile_trust": { "trust_roots": "/etc/robodr/trust-roots.json",
+                   "revocation_list": "/etc/robodr/profile-revocations.json",
+                   "revocation_policy": "optional" }
+```
+
+A locked profile whose file digest or signing key id is listed is refused
+(observe-only, `robot.ros2.profile_refused`). The list itself is
+anti-rollback protected: its serial and digest are kept in the state file
+and the black-box record, and the loaders refuse a list with a **lower**
+serial, the **same** serial with other content, or a **missing** list after
+one was accepted (to "clear" revocations, issue a newer, shorter list).
+`revocation_policy = "required"` refuses every locked profile while no list
+file exists; `"optional"` (default) proceeds without one until the first
+list has been accepted. An invalid list (bad signature, not a root's key,
+malformed) is always refused. `verify-profile --trust-roots ...
+--revocations ...` runs the same check offline; `verify-revocations
+--state` compares a list with a unit's accepted serial.
+
+Limits: a trust root cannot be revoked by the list it signs (replace the
+roots file instead); `issued_at` is not checked against a clock.
 
 ## 6. Running
 
@@ -638,4 +737,6 @@ The package never deletes evidence or keys, not even on `apt purge`.
 | `Multiple bpf fs mounts detected` | several bpffs mounts in the namespace | report it (unverified interaction with `ProtectKernelTunables=`) |
 | agent: `log is keyed X, signer is Y` | key changed without rotation | section 4.3 |
 | every finding `[observe-only]` | profile unlocked, missing or invalid | section 5 |
+| Critical `robot.ros2.profile_state_tampered` | anti-rollback state file deleted or rewritten (or agentd stopped mid operator rollback) | section 5.1: investigate; reinstall the recorded profile or roll back with `allow_rollback` |
+| `revocation list ... rollback refused` / `now missing` | an older list, or none, replaced the accepted one | section 5.3: install the newest list |
 | capture sees only `lo` | no default route on an air-gapped robot | list the DDS interfaces in `[module.robodr-sensor-ros2.capture] interfaces` |

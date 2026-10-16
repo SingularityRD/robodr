@@ -36,7 +36,13 @@
 //! findings is the signed `metadata.profile_version` (the former
 //! `--profile-version` option was removed). Anti-rollback is opt-in for
 //! replays ([`ReplayOptions::profile_state`]): forensic replays of old
-//! recordings legitimately use old profiles.
+//! recordings legitimately use old profiles. With
+//! [`ReplayOptions::trust_roots`], a root-signed `min_profile_version` in
+//! the trust file and a signed revocation list
+//! ([`ReplayOptions::revocation_list`], [`ReplayOptions::revocation_policy`])
+//! apply exactly as on the robot (`robodr_commission::trust::evaluate_profile_trust`).
+//! A replay starts a fresh black box, so it has no black-box witness for
+//! the state file.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -100,6 +106,14 @@ pub struct ReplayOptions {
     /// Operator rollback flag: the exact digest of an older profile file to
     /// accept despite `profile_state`.
     pub allow_profile_rollback: Option<String>,
+    /// Trust roots (`robodr-trust-roots/v1`): verify the revocation list and
+    /// a trust-file `min_profile_version`.
+    pub trust_roots: Option<PathBuf>,
+    /// Signed revocation list (`robodr-profile-revocations/v1`; needs
+    /// `trust_roots`).
+    pub revocation_list: Option<PathBuf>,
+    /// What a missing `revocation_list` file means.
+    pub revocation_policy: robodr_commission::trust::RevocationPolicy,
     pub boot_id: String,
     pub safety: SafetyState,
     pub control: ControlMode,
@@ -149,6 +163,9 @@ impl ReplayOptions {
             trusted_keys: None,
             profile_state: None,
             allow_profile_rollback: None,
+            trust_roots: None,
+            revocation_list: None,
+            revocation_policy: Default::default(),
             boot_id: "replay-boot".into(),
             safety: SafetyState::Unknown,
             control: ControlMode::Autonomous,
@@ -286,8 +303,7 @@ pub struct TrustedProfile {
 /// trusted comes back with `refused` set and `locked = false`.
 pub fn load_trusted_profile(opts: &ReplayOptions) -> Result<TrustedProfile, ReplayError> {
     use robodr_commission::trust::{
-        enforce_rollback, load_trust_keys, read_optional_sig, sig_path_for, validate_rollback_flag,
-        verify_profile_text, version_label, ProfileTrustError, TrustPolicy,
+        evaluate_profile_trust, store_state, validate_rollback_flag, version_label, TrustInputs,
     };
     use robodr_commission::ProfileFileError;
     let path = &opts.profile;
@@ -295,52 +311,30 @@ pub fn load_trusted_profile(opts: &ReplayOptions) -> Result<TrustedProfile, Repl
     if let Some(f) = &opts.allow_profile_rollback {
         validate_rollback_flag(f).map_err(ReplayError::Config)?;
     }
-    let (anchors, anchor_err) = match &opts.trusted_keys {
-        None => (None, None),
-        Some(p) => match load_trust_keys(p) {
-            Ok(k) => (Some(k), None),
-            Err(e) => (None, Some(e)),
-        },
-    };
-    let policy = TrustPolicy {
-        anchors,
+    if opts.revocation_list.is_some() && opts.trust_roots.is_none() {
+        return Err(ReplayError::Config(
+            "a revocation list needs trust roots (--trust-roots)".into(),
+        ));
+    }
+    let inputs = TrustInputs {
+        trusted_keys: opts.trusted_keys.as_deref(),
+        trust_roots: opts.trust_roots.as_deref(),
+        revocation_list: opts.revocation_list.as_deref(),
+        revocation_policy: opts.revocation_policy,
+        state_file: opts.profile_state.as_deref(),
+        allow_rollback: opts.allow_profile_rollback.as_deref(),
         ..Default::default()
     };
-    let sig_path = sig_path_for(path);
-    let sig_name = sig_path.display().to_string();
-    let sig = read_optional_sig(&sig_path);
-    let verified = match &sig {
-        Ok(sig) => verify_profile_text(&text, sig.as_deref(), &sig_name, &policy),
-        Err(e) => match verify_profile_text(&text, None, &sig_name, &policy) {
-            Err(ProfileFileError::Untrusted {
-                reason: ProfileTrustError::MissingSignature { .. },
-            }) => Err(ProfileTrustError::MalformedSignature {
-                detail: format!("{sig_name}: {e}"),
-            }
-            .into()),
-            other => other,
-        },
-    };
-    let verified = match (verified, anchor_err) {
-        (
-            Err(ProfileFileError::Untrusted {
-                reason: ProfileTrustError::NoTrustAnchors,
-            }),
-            Some(e),
-        ) => Err(ProfileFileError::from(e)),
-        (v, _) => v,
-    };
     // (reason, whether it is a trust refusal rather than a format error)
-    let (refusal, trust_refusal) = match verified {
-        Ok(v) => {
-            let rollback = match &opts.profile_state {
-                None => Ok(()),
-                Some(state) => {
-                    enforce_rollback(state, &v, opts.allow_profile_rollback.as_deref()).map(|_| ())
-                }
+    let (refusal, trust_refusal) = match evaluate_profile_trust(path, &text, &inputs).result {
+        Ok(a) => {
+            let written = match (&a.state_write, &opts.profile_state) {
+                (Some(st), Some(sp)) => store_state(sp, st),
+                _ => Ok(()),
             };
-            match rollback {
+            match written {
                 Ok(()) => {
+                    let v = a.verified;
                     let label = version_label(&v.profile, v.profile.locked);
                     return Ok(TrustedProfile {
                         profile: v.profile,

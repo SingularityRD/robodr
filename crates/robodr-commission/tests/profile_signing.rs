@@ -348,6 +348,8 @@ fn lineage_parent_versions_and_rollback_state() {
         unit_id: None,
         profile_version: 2,
         digest: v2_digest.clone(),
+        revocation_serial: None,
+        revocation_digest: None,
     };
     std::fs::write(&state, to_json(&st).unwrap()).unwrap();
     let before = std::fs::read(&state).unwrap();
@@ -591,4 +593,303 @@ fn blackbox_v2_keys_sign_profiles_and_trust_keys_builds_trust_files() {
     ]);
     assert_eq!(code(&o), 2, "{}", err(&o));
     let _ = std::fs::remove_dir_all(&d);
+}
+
+/// keygen a trust root into `dir`, returning (key, roots file).
+fn root_keygen(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
+    let key = dir.join(format!("{name}.key"));
+    let roots = dir.join(format!("{name}.roots.json"));
+    let o = run(&[
+        "keygen",
+        "--out",
+        s(&key),
+        "--trust-out",
+        s(&roots),
+        "--key-id",
+        name,
+        "--roots",
+    ]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    (key, roots)
+}
+
+/// Learn, sign off and lock version `v` signed by `key` into `dir/name`.
+fn locked_profile(dir: &Path, name: &str, v: u64, key: &Path) -> PathBuf {
+    let work = dir.join(format!("{name}.draft"));
+    std::fs::create_dir_all(&work).unwrap();
+    let (p, so) = draft(&work);
+    let out = dir.join(name);
+    let o = run(&[
+        "lock",
+        "--in",
+        s(&p),
+        "--signoff",
+        s(&so),
+        "--out",
+        s(&out),
+        "--platform",
+        "ugv",
+        "--profile-version",
+        &v.to_string(),
+        "--sign-key",
+        s(key),
+        "--force",
+    ]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    out
+}
+
+#[test]
+fn revoke_and_verify_revocations_cli() {
+    let d = tmpdir("revoke");
+    let (key, trust) = keygen(&d, "oem-a");
+    let (root, roots) = root_keygen(&d, "root-a");
+    assert!(std::fs::read_to_string(&roots)
+        .unwrap()
+        .contains("robodr-trust-roots/v1"));
+    let v1 = locked_profile(&d, "v1.json", 1, &key);
+    let v1_digest = file_digest(&std::fs::read(&v1).unwrap());
+    let revs = d.join("revocations.json");
+    let rv = |extra: &[&str]| {
+        let mut a = vec![
+            "verify-profile",
+            "--profile",
+            s(&v1),
+            "--trusted-keys",
+            s(&trust),
+            "--trust-roots",
+            s(&roots),
+            "--revocations",
+            s(&revs),
+        ];
+        a.extend_from_slice(extra);
+        run(&a)
+    };
+    // No list yet: optional passes, required refuses.
+    assert_eq!(code(&rv(&[])), 0);
+    let o = rv(&["--revocations-required", "--json"]);
+    assert_eq!(code(&o), 1);
+    assert!(report(&o)["refused"].as_str().unwrap().contains("required"));
+    // Revoke v1 by profile file.
+    let o = run(&[
+        "revoke",
+        "--sign-key",
+        s(&root),
+        "--out",
+        s(&revs),
+        "--revoke-profile",
+        s(&v1),
+        "--issued-at",
+        "1790000000",
+    ]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(err(&o).contains("serial 1"), "{}", err(&o));
+    let o = rv(&["--json"]);
+    assert_eq!(code(&o), 1);
+    assert!(report(&o)["refused"]
+        .as_str()
+        .unwrap()
+        .contains("is revoked"));
+    let o = run(&[
+        "verify-revocations",
+        "--list",
+        s(&revs),
+        "--trust-roots",
+        s(&roots),
+        "--json",
+    ]);
+    assert_eq!(code(&o), 0, "{}", out(&o));
+    let r = report(&o);
+    assert_eq!(r["serial"], 1);
+    assert_eq!(r["revoked_digests"][0], v1_digest.as_str());
+    // Next list from the base: serial 2, revokes the key instead (the
+    // digest is carried over).
+    let revs2 = d.join("revocations2.json");
+    let o = run(&[
+        "revoke",
+        "--sign-key",
+        s(&root),
+        "--out",
+        s(&revs2),
+        "--base",
+        s(&revs),
+        "--trust-roots",
+        s(&roots),
+        "--key-id",
+        "oem-a",
+    ]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let o = run(&[
+        "verify-revocations",
+        "--list",
+        s(&revs2),
+        "--trust-roots",
+        s(&roots),
+        "--json",
+    ]);
+    let r = report(&o);
+    assert_eq!(r["serial"], 2);
+    assert_eq!(r["revoked_key_ids"][0], "oem-a");
+    assert_eq!(r["revoked_digests"][0], v1_digest.as_str());
+    // The base must verify and the serial must grow; a profile key cannot
+    // sign revocations for these roots.
+    let xout = d.join("x.json");
+    for bad in [
+        vec![
+            "--base",
+            s(&revs),
+            "--trust-roots",
+            s(&roots),
+            "--serial",
+            "1",
+        ],
+        vec!["--base", s(&revs)],
+        vec!["--trust-roots", s(&roots), "--digest", "sha256:xyz"],
+    ] {
+        let mut a = vec!["revoke", "--sign-key", s(&root), "--out", s(&xout)];
+        a.extend(bad.iter().copied());
+        assert_eq!(code(&run(&a)), 2, "{a:?}");
+    }
+    let o = run(&[
+        "revoke",
+        "--sign-key",
+        s(&key),
+        "--out",
+        s(&d.join("x.json")),
+        "--trust-roots",
+        s(&roots),
+    ]);
+    assert_eq!(code(&o), 2);
+    assert!(
+        err(&o).contains("not one of the trust roots"),
+        "{}",
+        err(&o)
+    );
+    assert!(!d.join("x.json").exists());
+    // Tampered list.
+    let text = std::fs::read_to_string(&revs2).unwrap();
+    let tampered = d.join("tampered.json");
+    std::fs::write(&tampered, text.replace("\"oem-a\"", "\"oem-b\"")).unwrap();
+    let o = run(&[
+        "verify-revocations",
+        "--list",
+        s(&tampered),
+        "--trust-roots",
+        s(&roots),
+    ]);
+    assert_eq!(code(&o), 1);
+    assert!(out(&o).contains("does not verify"), "{}", out(&o));
+    // Older than the state's accepted serial.
+    let state = d.join("state.json");
+    let st = AcceptedState {
+        format: robodr_commission::trust::STATE_FORMAT.into(),
+        model: "m".into(),
+        platform: "ugv".into(),
+        unit_id: None,
+        profile_version: 1,
+        digest: v1_digest.clone(),
+        revocation_serial: Some(2),
+        revocation_digest: Some(
+            robodr_commission::trust::RevocationList::parse(&text)
+                .unwrap()
+                .digest(),
+        ),
+    };
+    std::fs::write(&state, to_json(&st).unwrap()).unwrap();
+    let vr = |list: &Path| {
+        run(&[
+            "verify-revocations",
+            "--list",
+            s(list),
+            "--trust-roots",
+            s(&roots),
+            "--state",
+            s(&state),
+        ])
+    };
+    assert_eq!(code(&vr(&revs2)), 0);
+    let o = vr(&revs);
+    assert_eq!(code(&o), 1);
+    assert!(out(&o).contains("rollback"), "{}", out(&o));
+}
+
+#[test]
+fn signed_floor_in_the_trust_file_cli() {
+    let d = tmpdir("floor");
+    let (key, _) = keygen(&d, "oem-a");
+    let (root, _) = root_keygen(&d, "root-a");
+    let pubk = d.join("oem-a.key.pub");
+    let rootpub = d.join("root-a.key.pub");
+    let trust = d.join("floored.json");
+    // A floor without a root signature is refused at creation.
+    let o = run(&[
+        "trust-keys",
+        "--out",
+        s(&trust),
+        "--pub",
+        s(&pubk),
+        "--min-profile-version",
+        "2",
+    ]);
+    assert_eq!(code(&o), 2);
+    // The root cannot be one of the profile keys.
+    let o = run(&[
+        "trust-keys",
+        "--out",
+        s(&trust),
+        "--pub",
+        s(&rootpub),
+        "--min-profile-version",
+        "2",
+        "--sign-key",
+        s(&root),
+    ]);
+    assert_eq!(code(&o), 2);
+    let o = run(&[
+        "trust-keys",
+        "--out",
+        s(&trust),
+        "--pub",
+        s(&pubk),
+        "--min-profile-version",
+        "2",
+        "--sign-key",
+        s(&root),
+    ]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(sig_of(&trust).exists());
+    let roots = d.join("roots.json");
+    let o = run(&[
+        "trust-keys",
+        "--out",
+        s(&roots),
+        "--pub",
+        s(&rootpub),
+        "--roots",
+    ]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let v1 = locked_profile(&d, "v1.json", 1, &key);
+    let v2 = locked_profile(&d, "v2.json", 2, &key);
+    let vf = |p: &Path, extra: &[&str]| {
+        let mut a = vec!["--trust-roots", s(&roots)];
+        a.extend_from_slice(extra);
+        verify(p, &trust, &a)
+    };
+    let o = vf(&v1, &["--json"]);
+    assert_eq!(code(&o), 1);
+    assert!(report(&o)["refused"]
+        .as_str()
+        .unwrap()
+        .contains("min_profile_version 2"));
+    // Not overridable by the rollback flag.
+    let d1 = file_digest(&std::fs::read(&v1).unwrap());
+    assert_eq!(code(&vf(&v1, &["--allow-rollback", &d1])), 1);
+    assert_eq!(code(&vf(&v2, &[])), 0);
+    // Without roots the floored trust file is not accepted at all.
+    let o = verify(&v2, &trust, &["--json"]);
+    assert_eq!(code(&o), 1);
+    assert!(report(&o)["refused"]
+        .as_str()
+        .unwrap()
+        .contains("not signed by a trust root"));
 }

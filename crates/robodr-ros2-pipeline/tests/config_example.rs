@@ -42,6 +42,9 @@ const TRUST_KEYS: &[&str] = &[
     "allow_rollback",
     "expect_platform",
     "expect_unit_id",
+    "trust_roots",
+    "revocation_list",
+    "revocation_policy",
 ];
 const CAPTURE_KEYS: &[&str] = &[
     "enabled",

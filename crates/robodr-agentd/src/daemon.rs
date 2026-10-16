@@ -319,6 +319,9 @@ struct Daemon<'a> {
     stats: DaemonStats,
     /// Largest queue latency since the last tick.
     tick_max_age_ms: u64,
+    /// The enforced locked profile's anti-rollback record, re-recorded in
+    /// every heartbeat (see [`crate::profile_chain`]).
+    profile_accepted: Option<robodr_commission::trust::AcceptedState>,
 }
 
 fn ms(d: Duration) -> u64 {
@@ -390,6 +393,7 @@ impl<'a> Daemon<'a> {
                 loaded.file_check = Err(e);
             }
         }
+        let accepted_ok = loaded.file_check.is_ok();
         // The agent evaluates decoded commands itself (with evidence); see
         // the module docs.
         let mut popts = r.sensor.pipeline.clone();
@@ -599,6 +603,7 @@ impl<'a> Daemon<'a> {
             },
             stats: DaemonStats::default(),
             tick_max_age_ms: 0,
+            profile_accepted: None,
         };
         #[derive(Serialize)]
         struct StartNote<'b> {
@@ -624,6 +629,7 @@ impl<'a> Daemon<'a> {
             d.stats.note_errors += 1;
             let _ = writeln!(d.log, "robodr-agentd: start note not recorded: {e:?}");
         }
+        d.profile_witness(accepted_ok);
         let names: Vec<String> = d.inputs.iter().map(|i| sanitize(&i.name)).collect();
         let _ = writeln!(
             d.log,
@@ -641,6 +647,59 @@ impl<'a> Daemon<'a> {
 
     fn now_ms(&self) -> u64 {
         ms(self.epoch.elapsed())
+    }
+
+    /// At start: record the enforced profile in the black box (the second
+    /// anti-rollback witness, [`crate::profile_chain`]) and report a state
+    /// file that is missing or behind the black box as a Critical,
+    /// observe-only finding.
+    fn profile_witness(&mut self, accepted_ok: bool) {
+        let enforcing = self.pipeline.status() == &ProfileStatus::Enforcing;
+        if let (true, true, Some(acc)) = (accepted_ok, enforcing, &self.r.profile_accepted) {
+            let note = crate::profile_chain::accepted_note(
+                acc,
+                self.r.profile_signed_by.as_deref(),
+                self.r.profile_decision,
+            );
+            let now = self.clock.now();
+            match self.agent.record_note(now, "profile accepted", &note, true) {
+                Ok(_) => self.profile_accepted = Some(acc.clone()),
+                Err(e) => {
+                    self.stats.note_errors += 1;
+                    let _ = writeln!(
+                        self.log,
+                        "robodr-agentd: accepted profile not recorded in the black box: {}",
+                        sanitize(&e.join("; "))
+                    );
+                }
+            }
+        }
+        if let Some(alarm) = &self.r.profile_alarm {
+            let detail = alarm.to_string();
+            let _ = writeln!(self.log, "robodr-agentd: CRITICAL: {}", sanitize(&detail));
+            let dev = robodr_events::Deviation::new(
+                robodr_ros2_pipeline::profile_trust::PROFILE_STATE_TAMPERED,
+                robodr_events::Severity::Critical,
+                detail,
+            );
+            let subject = Subject {
+                node: Some("robodr-agentd".into()),
+                ..Subject::default()
+            };
+            let now = self.clock.now();
+            let safety = self.r.config.context.safety_state;
+            // Self-health: observe-only by construction, never a request.
+            let o = self.agent.handle_external(
+                now,
+                Detector::SelfHealth,
+                "agentd:profile_state",
+                subject,
+                dev,
+                safety,
+            );
+            self.stats.health_findings += 1;
+            self.emit(o);
+        }
     }
 
     fn main_loop(&mut self, should_stop: &dyn Fn() -> bool) -> StopReason {
@@ -1049,6 +1108,8 @@ impl<'a> Daemon<'a> {
             pipeline: &'b PipelineStats,
             agent: AgentStats,
             spool: SpoolStats,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            profile_accepted: Option<&'b robodr_commission::trust::AcceptedState>,
         }
         self.stats.heartbeats += 1;
         let stats = self.stats;
@@ -1061,6 +1122,7 @@ impl<'a> Daemon<'a> {
             pipeline: self.pipeline.stats(),
             agent: self.agent.stats(),
             spool: self.spool.stats(),
+            profile_accepted: self.profile_accepted.as_ref(),
         };
         // Serialise first: `hb` borrows self immutably.
         let value = serde_json::to_value(&hb).unwrap_or(serde_json::Value::Null);

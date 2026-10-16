@@ -186,6 +186,8 @@ fn opt_in_anti_rollback_state() {
         unit_id: None,
         profile_version: 5,
         digest: format!("sha256:{}", "0".repeat(64)),
+        revocation_serial: None,
+        revocation_digest: None,
     };
     std::fs::write(&state, robodr_commission::to_json(&st).unwrap()).unwrap();
     let mut o = opts(&dir.join("bb1"), &profile);
@@ -225,5 +227,82 @@ fn opt_in_anti_rollback_state() {
     // Garbage is still an error.
     std::fs::write(&draft, r#"{"model":"m","lockd":true}"#).unwrap();
     assert!(replay::run(&opts(&dir.join("bb5"), &draft), &mut Vec::new(), None, None).is_err());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn revocation_list_in_replays() {
+    let dir = tmpdir("rpt-revoke");
+    let (profile, trust) = demo();
+    let root = robodr_blackbox::Ed25519SigningKey::from_seed("root", &[0x55; 32]).unwrap();
+    let roots = dir.join("roots.json");
+    std::fs::write(
+        &roots,
+        robodr_commission::trust::trust_roots_text(&[root.verifying_key()]),
+    )
+    .unwrap();
+    let revs = dir.join("revocations.json");
+    let sig: robodr_commission::ProfileSignature = serde_json::from_str(
+        &std::fs::read_to_string(examples().join("ugv-demo.profile.json.sig")).unwrap(),
+    )
+    .unwrap();
+    let list = |serial: u64, keys: &[&str]| {
+        robodr_commission::trust::RevocationList::create(
+            serial,
+            1_790_000_000,
+            [],
+            keys.iter().map(|s| s.to_string()),
+            &root,
+        )
+        .unwrap()
+        .to_text()
+    };
+    // The demo's signing key revoked: observe-only with the reason.
+    std::fs::write(&revs, list(1, &[&sig.key_id])).unwrap();
+    let mut o = opts(&dir.join("bb1"), &profile);
+    o.trust_roots = Some(roots.clone());
+    o.revocation_list = Some(revs.clone());
+    let sum = replay::run(&o, &mut Vec::new(), None, None).unwrap();
+    assert!(
+        sum.profile_refused.as_deref().unwrap().contains("revoked"),
+        "{:?}",
+        sum.profile_refused
+    );
+    // A list revoking something else: enforced.
+    std::fs::write(&revs, list(2, &["someone-else"])).unwrap();
+    let mut o = opts(&dir.join("bb2"), &profile);
+    o.trust_roots = Some(roots.clone());
+    o.revocation_list = Some(revs.clone());
+    assert!(replay::run(&o, &mut Vec::new(), None, None)
+        .unwrap()
+        .profile_refused
+        .is_none());
+    // CLI: required but missing -> observe-only; flag combinations checked.
+    std::fs::remove_file(&revs).unwrap();
+    let r = |extra: &[&str], bb: &str| {
+        let mut v = vec!["--trust-roots", roots.to_str().unwrap()];
+        v.extend_from_slice(extra);
+        args(&dir.join(bb), &profile, Some(&trust), &v)
+    };
+    let o = r(
+        &[
+            "--revocations",
+            revs.to_str().unwrap(),
+            "--revocations-required",
+        ],
+        "bb3",
+    );
+    assert_eq!(o.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("required"));
+    assert!(findings(&o).iter().all(|x| mode_of(x) == "Observe"));
+    let o = r(&["--revocations-required"], "bb4");
+    assert_eq!(o.status.code(), Some(2));
+    let o = args(
+        &dir.join("bb5"),
+        &profile,
+        Some(&trust),
+        &["--revocations", revs.to_str().unwrap()],
+    );
+    assert_eq!(o.status.code(), Some(2));
     std::fs::remove_dir_all(&dir).unwrap();
 }

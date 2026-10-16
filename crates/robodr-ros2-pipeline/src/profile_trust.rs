@@ -1,10 +1,12 @@
 //! Loading a profile **with trust**: detached signature, trust anchors,
-//! platform/unit binding and anti-rollback, on top of the commissioning
-//! file check. The checks themselves live in `robodr_commission::trust`
-//! (the crate that owns the profile file format); this module wires them
-//! to the sensor configuration ([`ProfileTrustConfig`], the `profile_trust`
-//! sub-table of `[module.robodr-sensor-ros2]` / agentd's `sensor` section)
-//! and to [`LoadedProfile`].
+//! trust roots (signed floor, revocation list), platform/unit binding and
+//! anti-rollback, on top of the commissioning file check. The checks
+//! themselves live in `robodr_commission::trust` (the crate that owns the
+//! profile file format; one decision function,
+//! `evaluate_profile_trust`); this module wires them to the sensor
+//! configuration ([`ProfileTrustConfig`], the `profile_trust` sub-table of
+//! `[module.robodr-sensor-ros2]` / agentd's `sensor` section) and to
+//! [`LoadedProfile`].
 //!
 //! ```toml
 //! [module.robodr-sensor-ros2.profile_trust]
@@ -12,6 +14,9 @@
 //! state_file = "/var/lib/robodr/profile-state.json" # anti-rollback
 //! expect_platform = "ugv-x1"                        # optional
 //! expect_unit_id = "ugv-007"                        # optional
+//! trust_roots = "/etc/robodr/trust-roots.json"      # robodr-trust-roots/v1
+//! revocation_list = "/etc/robodr/revocations.json"  # robodr-profile-revocations/v1
+//! revocation_policy = "optional"                    # or "required"
 //! # allow_rollback = "sha256:<digest of the one older file to accept>"
 //! ```
 //!
@@ -21,35 +26,55 @@
 //!   authenticated, so none is enforced: the sensor runs observe-only and
 //!   reports one `robot.ros2.profile_refused` finding. The same holds for a
 //!   missing / malformed / forged signature, a key not in the trust file,
-//!   a legacy locked profile without metadata, a platform or unit mismatch
-//!   and a refused rollback. Refusal never stops the sensor (a broken
-//!   profile must not blind it, nor be escalated into a safe-state request).
+//!   a legacy locked profile without metadata, a platform or unit mismatch,
+//!   a refused rollback, a revoked profile or signing key, a profile below
+//!   the trust file's root-signed `min_profile_version`, and a revocation
+//!   list that is invalid, older than the accepted one, or (with
+//!   `revocation_policy = "required"`, or after one was accepted) missing.
+//!   Refusal never stops the sensor (a broken profile must not blind it,
+//!   nor be escalated into a safe-state request).
 //! * **Anti-rollback** needs `state_file`. On acceptance of a locked
-//!   profile with a new version (or the first one) the state is rewritten
-//!   atomically: at load time by [`load_profile_with_trust`], or when the
-//!   caller says so with [`load_profile_deferred`] + [`StateCommit::commit`]
-//!   (agentd: never on `--check-config`; a failed write means the profile is
-//!   not enforced). A refused profile never touches the state. A lower
-//!   version, the same version with different bytes, or a draft replacing
-//!   a locked profile is refused unless `allow_rollback` names that file's
-//!   exact digest (`robodr-commission verify-profile` prints it). After a
-//!   permitted rollback the state records the older version, so the flag
-//!   can (and should) be removed again.
+//!   profile with a new version (or the first one, or a newer revocation
+//!   list) the state is rewritten atomically: at load time by
+//!   [`load_profile_with_trust`], or when the caller says so with
+//!   [`load_profile_deferred`] / [`load_profile_checked`] +
+//!   [`StateCommit::commit`] (agentd: never on `--check-config`; a failed
+//!   write means the profile is not enforced). A refused profile never
+//!   touches the state. A lower version, the same version with different
+//!   bytes, or a draft replacing a locked profile is refused unless
+//!   `allow_rollback` names that file's exact digest (`robodr-commission
+//!   verify-profile` prints it). After a permitted rollback the state
+//!   records the older version, so the flag can (and should) be removed
+//!   again.
+//! * **Black-box witness.** A caller with a black box (agentd) passes the
+//!   latest accepted-profile record of its chain to
+//!   [`load_profile_checked`]: a state file that is missing or behind that
+//!   record is reported as a [`StateAlarm`] (agentd: Critical, observe-only
+//!   finding [`PROFILE_STATE_TAMPERED`]) and the record is the rollback
+//!   baseline, so deleting the state file no longer resets anti-rollback.
+//!   Callers without a black box (the Pulsar sensor, `robodr-ros2-watch`)
+//!   have only the state file and the signed floor.
 //! * Drafts (unlocked) need no signature: they are observe-only anyway.
 //!
-//! Limits: see `robodr_commission::trust` (unaudited Ed25519, state file
-//! resettable by root, no revocation list).
+//! Limits: see `robodr_commission::trust` (unaudited Ed25519, a root who
+//! deletes both state and black box leaves only the signed floor, trust
+//! files can be replayed, no expiry).
 
 use std::path::{Path, PathBuf};
 
 use robodr_commission::trust::{
-    check_rollback, load_state, load_trust_keys, read_optional_sig, sig_path_for, store_state,
-    validate_rollback_flag, verify_profile_text, AcceptedState, ProfileTrustError, TrustPolicy,
+    evaluate_profile_trust, store_state, validate_rollback_flag, AcceptedState, RevocationPolicy,
+    RollbackDecision, StateAlarm, TrustInputs,
 };
 use robodr_commission::ProfileFileError;
 use serde::Deserialize;
 
 use crate::pipeline::{read_profile_lenient, LoadedProfile};
+
+/// Rule id of the finding raised for a [`StateAlarm`]: the anti-rollback
+/// state file is missing or behind the black box's record (deleted or
+/// rewritten). Critical, always observe-only: it never requests an action.
+pub const PROFILE_STATE_TAMPERED: &str = "robot.ros2.profile_state_tampered";
 
 /// The `profile_trust` configuration. Every field is optional; the default
 /// (nothing configured) refuses every locked profile.
@@ -68,16 +93,28 @@ pub struct ProfileTrustConfig {
     pub expect_platform: Option<String>,
     /// `metadata.unit_id` must be null (fleet-wide) or equal this.
     pub expect_unit_id: Option<String>,
+    /// `robodr-trust-roots/v1` file: the keys that sign the revocation list
+    /// and a trust-file `min_profile_version` (disjoint from the profile
+    /// keys).
+    pub trust_roots: Option<PathBuf>,
+    /// `robodr-profile-revocations/v1` file (needs `trust_roots`).
+    pub revocation_list: Option<PathBuf>,
+    /// What a missing `revocation_list` file means: `"optional"` (default)
+    /// or `"required"` (every locked profile refused).
+    pub revocation_policy: RevocationPolicy,
 }
 
 impl ProfileTrustConfig {
     /// Check the configuration (paths absolute, rollback flag a digest,
-    /// expectations well-formed labels). Non-fatal problems are reported by
-    /// [`ProfileTrustConfig::warnings`].
+    /// expectations well-formed labels, a revocation list only with trust
+    /// roots, `required` only with a list). Non-fatal problems are reported
+    /// by [`ProfileTrustConfig::warnings`].
     pub fn validate(&self) -> Result<(), String> {
         for (what, p) in [
             ("profile_trust.trusted_keys", &self.trusted_keys),
             ("profile_trust.state_file", &self.state_file),
+            ("profile_trust.trust_roots", &self.trust_roots),
+            ("profile_trust.revocation_list", &self.revocation_list),
         ] {
             if let Some(p) = p {
                 if p.as_os_str().is_empty() || !p.is_absolute() {
@@ -87,6 +124,18 @@ impl ProfileTrustConfig {
                     ));
                 }
             }
+        }
+        if self.revocation_list.is_some() && self.trust_roots.is_none() {
+            return Err(
+                "profile_trust.revocation_list needs profile_trust.trust_roots (the keys that \
+                 sign it)"
+                    .into(),
+            );
+        }
+        if self.revocation_policy == RevocationPolicy::Required && self.revocation_list.is_none() {
+            return Err("profile_trust.revocation_policy = \"required\" needs \
+                 profile_trust.revocation_list"
+                .into());
         }
         if let Some(f) = &self.allow_rollback {
             validate_rollback_flag(f).map_err(|e| format!("profile_trust.{e}"))?;
@@ -113,7 +162,7 @@ impl ProfileTrustConfig {
 
     /// Operator warnings for this configuration (log them at start): no
     /// trust anchors (observe-only), no anti-rollback state, a rollback
-    /// flag left set.
+    /// flag left set, no revocation list.
     pub fn warnings(&self) -> Vec<String> {
         let mut w = Vec::new();
         if self.trusted_keys.is_none() {
@@ -141,7 +190,28 @@ impl ProfileTrustConfig {
                 );
             }
         }
+        if self.trusted_keys.is_some() && self.revocation_list.is_none() {
+            w.push(
+                "profile_trust.revocation_list is not set: a revoked profile or signing key can \
+                 only be withdrawn by editing the trust file"
+                    .into(),
+            );
+        }
         w
+    }
+
+    fn inputs<'a>(&'a self, chain: Option<&'a AcceptedState>) -> TrustInputs<'a> {
+        TrustInputs {
+            trusted_keys: self.trusted_keys.as_deref(),
+            trust_roots: self.trust_roots.as_deref(),
+            revocation_list: self.revocation_list.as_deref(),
+            revocation_policy: self.revocation_policy,
+            expect_platform: self.expect_platform.as_deref(),
+            expect_unit_id: self.expect_unit_id.as_deref(),
+            state_file: self.state_file.as_deref(),
+            allow_rollback: self.allow_rollback.as_deref(),
+            chain,
+        }
     }
 }
 
@@ -193,76 +263,67 @@ pub fn load_profile_deferred(
     path: &Path,
     trust: &ProfileTrustConfig,
 ) -> Result<(LoadedProfile, Option<StateCommit>), String> {
-    let (raw, profile) = read_profile_lenient(path)?;
-    let (file_check, commit) = match trust_check(path, &raw, trust) {
-        Ok(c) => (Ok(()), c),
-        Err(e) => (Err(e), None),
-    };
-    Ok((
-        LoadedProfile {
-            profile,
-            file_check,
-        },
-        commit,
-    ))
+    let t = load_profile_checked(path, trust, None)?;
+    Ok((t.loaded, t.commit))
 }
 
-/// The file + trust + rollback decision for `raw` (the exact bytes of
-/// `path`); `Ok` carries the state write an acceptance implies.
-fn trust_check(
+/// Everything [`load_profile_checked`] decided.
+#[derive(Debug, Clone)]
+pub struct TrustLoad {
+    /// The profile and its file + trust check.
+    pub loaded: LoadedProfile,
+    /// The state write an acceptance implies (commit before enforcing).
+    pub commit: Option<StateCommit>,
+    /// The state file disagrees with the black-box record (reported
+    /// whatever the outcome).
+    pub alarm: Option<StateAlarm>,
+    /// The accepted locked profile to record in the black box once
+    /// enforcing (`robodr_commission::trust::accepted_note`); `None` when
+    /// refused or a draft.
+    pub accepted: Option<AcceptedState>,
+    /// Key that signed the accepted profile.
+    pub signed_by: Option<String>,
+    /// The rollback decision (`None`: no state file, or refused).
+    pub decision: Option<RollbackDecision>,
+}
+
+/// [`load_profile_deferred`] with the black box's latest accepted-profile
+/// record (`chain`, see the module docs), returning the alarm and the
+/// record to append as well.
+pub fn load_profile_checked(
     path: &Path,
-    raw: &str,
     trust: &ProfileTrustConfig,
-) -> Result<Option<StateCommit>, ProfileFileError> {
-    // A broken trust file only matters for a locked profile.
-    let (anchors, anchor_err) = match &trust.trusted_keys {
-        None => (None, None),
-        Some(p) => match load_trust_keys(p) {
-            Ok(k) => (Some(k), None),
-            Err(e) => (None, Some(e)),
+    chain: Option<&AcceptedState>,
+) -> Result<TrustLoad, String> {
+    let (raw, profile) = read_profile_lenient(path)?;
+    let eval = evaluate_profile_trust(path, &raw, &trust.inputs(chain));
+    let mut t = TrustLoad {
+        loaded: LoadedProfile {
+            profile,
+            file_check: Ok(()),
         },
+        commit: None,
+        alarm: eval.alarm,
+        accepted: None,
+        signed_by: None,
+        decision: None,
     };
-    let policy = TrustPolicy {
-        anchors,
-        expect_platform: trust.expect_platform.clone(),
-        expect_unit_id: trust.expect_unit_id.clone(),
-    };
-    let sig_path = sig_path_for(path);
-    let sig_name = sig_path.display().to_string();
-    let verified = match read_optional_sig(&sig_path) {
-        Ok(sig) => verify_profile_text(raw, sig.as_deref(), &sig_name, &policy),
-        Err(e) => match verify_profile_text(raw, None, &sig_name, &policy) {
-            Err(ProfileFileError::Untrusted {
-                reason: ProfileTrustError::MissingSignature { .. },
-            }) if policy.anchors.is_some() => Err(ProfileTrustError::MalformedSignature {
-                detail: format!("{sig_name}: {e}"),
-            }
-            .into()),
-            other => other,
-        },
-    };
-    let verified = match (verified, anchor_err) {
-        (
-            Err(ProfileFileError::Untrusted {
-                reason: ProfileTrustError::NoTrustAnchors,
-            }),
-            Some(e),
-        ) => return Err(e.into()),
-        (v, _) => v?,
-    };
-    let Some(state_path) = &trust.state_file else {
-        return Ok(None);
-    };
-    let current = load_state(state_path)?;
-    let decision = check_rollback(current.as_ref(), &verified, trust.allow_rollback.as_deref())?;
-    Ok(decision
-        .writes_state(&verified)
-        .then(|| AcceptedState::of(&verified))
-        .flatten()
-        .map(|state| StateCommit {
-            path: state_path.clone(),
-            state,
-        }))
+    match eval.result {
+        Ok(a) => {
+            t.commit = match (a.state_write, &trust.state_file) {
+                (Some(state), Some(p)) => Some(StateCommit {
+                    path: p.clone(),
+                    state,
+                }),
+                _ => None,
+            };
+            t.accepted = a.record;
+            t.signed_by = a.verified.signed_by;
+            t.decision = a.decision;
+        }
+        Err(e) => t.loaded.file_check = Err(e),
+    }
+    Ok(t)
 }
 
 #[cfg(test)]
@@ -270,7 +331,9 @@ mod tests {
     use super::*;
     use crate::{Pipeline, PipelineOptions, ProfileStatus};
     use robodr_blackbox::Ed25519SigningKey;
-    use robodr_commission::trust::{file_digest, trust_keys_text, ProfileSignature};
+    use robodr_commission::trust::{
+        file_digest, load_state, sig_path_for, trust_keys_text, ProfileSignature, ProfileTrustError,
+    };
     use robodr_events::profile::{Envelope, Profile, ProfileMetadata, PROFILE_SCHEMA_VERSION};
     use robodr_events::Mode;
 
@@ -485,13 +548,139 @@ mod tests {
         ok.allow_rollback = Some(format!("sha256:{}", "a".repeat(64)));
         ok.state_file = Some("/var/lib/robodr/state.json".into());
         ok.validate().unwrap();
-        assert_eq!(ok.warnings().len(), 1);
+        assert_eq!(ok.warnings().len(), 2);
         assert!(ok.warnings()[0].contains("allow_rollback is set"));
+        assert!(ok.warnings()[1].contains("revocation_list is not set"));
         ok.state_file = None;
-        assert_eq!(ok.warnings().len(), 3);
+        assert_eq!(ok.warnings().len(), 4);
         ok.expect_platform = Some("bad platform".into());
         assert!(ok.validate().is_err());
         let c: ProfileTrustConfig = serde_json::from_str(r#"{"trusted_keys":"/t.json"}"#).unwrap();
         assert_eq!(c.trusted_keys.as_deref(), Some(Path::new("/t.json")));
+        assert_eq!(c.revocation_policy, RevocationPolicy::Optional);
+        // Revocation settings.
+        let mut r = ProfileTrustConfig {
+            trusted_keys: Some("/t.json".into()),
+            revocation_list: Some("/r.json".into()),
+            ..Default::default()
+        };
+        assert!(r.validate().unwrap_err().contains("trust_roots"));
+        r.trust_roots = Some("roots.json".into());
+        assert!(r.validate().unwrap_err().contains("absolute"));
+        r.trust_roots = Some("/roots.json".into());
+        r.validate().unwrap();
+        r.revocation_policy = RevocationPolicy::Required;
+        r.validate().unwrap();
+        r.revocation_list = None;
+        assert!(r.validate().unwrap_err().contains("required"));
+        let c: ProfileTrustConfig =
+            serde_json::from_str(r#"{"revocation_policy":"required"}"#).unwrap();
+        assert_eq!(c.revocation_policy, RevocationPolicy::Required);
+        assert!(
+            serde_json::from_str::<ProfileTrustConfig>(r#"{"revocation_policy":"maybe"}"#).is_err()
+        );
+    }
+
+    fn root() -> Ed25519SigningKey {
+        Ed25519SigningKey::from_seed("root", &[9; 32]).unwrap()
+    }
+
+    /// `trust` plus roots and a revocation list path.
+    fn with_revocations(dir: &Path, mut t: ProfileTrustConfig) -> ProfileTrustConfig {
+        let r = dir.join("roots.json");
+        std::fs::write(
+            &r,
+            robodr_commission::trust::trust_roots_text(&[root().verifying_key()]),
+        )
+        .unwrap();
+        t.trust_roots = Some(r);
+        t.revocation_list = Some(dir.join("revocations.json"));
+        t
+    }
+
+    fn write_list(t: &ProfileTrustConfig, serial: u64, digests: &[&str], keys: &[&str]) {
+        let l = robodr_commission::trust::RevocationList::create(
+            serial,
+            1,
+            digests.iter().map(|s| s.to_string()),
+            keys.iter().map(|s| s.to_string()),
+            &root(),
+        )
+        .unwrap();
+        std::fs::write(t.revocation_list.as_ref().unwrap(), l.to_text()).unwrap();
+    }
+
+    #[test]
+    fn revocations_through_the_loader() {
+        let d = tmpdir("revoke");
+        let t = with_revocations(&d, trust(&d, true));
+        let (v1, v1d) = write(&d, "v1.json", &profile(1, true), true);
+        // Optional and absent: enforced.
+        assert_eq!(status(&v1, &t), ProfileStatus::Enforcing);
+        // Required and absent: refused.
+        let mut req = t.clone();
+        req.revocation_policy = RevocationPolicy::Required;
+        refused_because(status(&v1, &req), "missing");
+        // Revoked digest / revoked key: observe-only + one finding.
+        write_list(&t, 1, &[&v1d], &[]);
+        let p = Pipeline::from_loaded(
+            load_profile_with_trust(&v1, &t).unwrap(),
+            PipelineOptions::default(),
+        );
+        assert_eq!(p.mode(), Mode::Observe);
+        assert_eq!(p.status_findings().len(), 1);
+        assert!(p.status_message().unwrap().contains("revoked"));
+        write_list(&t, 2, &[], &["oem"]);
+        refused_because(status(&v1, &t), "signing key \"oem\" is revoked");
+        // A clean newer list: enforced, serial recorded.
+        write_list(&t, 3, &[], &[]);
+        assert_eq!(status(&v1, &t), ProfileStatus::Enforcing);
+        let st = load_state(t.state_file.as_ref().unwrap()).unwrap().unwrap();
+        assert_eq!(st.revocation_serial, Some(3));
+        // An older list is refused; so is removing it.
+        write_list(&t, 2, &[], &[]);
+        refused_because(status(&v1, &t), "revocation list rollback");
+        std::fs::remove_file(t.revocation_list.as_ref().unwrap()).unwrap();
+        refused_because(status(&v1, &t), "now missing");
+        // A tampered list.
+        write_list(&t, 4, &[], &[]);
+        let lp = t.revocation_list.clone().unwrap();
+        let text = std::fs::read_to_string(&lp).unwrap();
+        std::fs::write(&lp, text.replace("\"serial\": 4", "\"serial\": 5")).unwrap();
+        refused_because(status(&v1, &t), "does not verify");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn chain_record_detects_a_deleted_state_file() {
+        let d = tmpdir("chain");
+        let t = trust(&d, true);
+        let state = t.state_file.clone().unwrap();
+        let (v2, _) = write(&d, "v2.json", &profile(2, true), true);
+        let (v1, _) = write(&d, "v1.json", &profile(1, true), true);
+        let first = load_profile_checked(&v2, &t, None).unwrap();
+        assert!(first.alarm.is_none());
+        assert_eq!(first.decision, Some(RollbackDecision::First));
+        assert_eq!(first.signed_by.as_deref(), Some("oem"));
+        first.commit.unwrap().commit().unwrap();
+        let rec = first.accepted.unwrap();
+        // State deleted, v1 offered: refused, alarm, nothing written.
+        std::fs::remove_file(&state).unwrap();
+        let l = load_profile_checked(&v1, &t, Some(&rec)).unwrap();
+        assert!(l.loaded.file_check.is_err());
+        assert!(l.commit.is_none() && l.accepted.is_none());
+        let alarm = l.alarm.unwrap();
+        assert!(alarm.to_string().contains("missing"), "{alarm}");
+        assert!(!state.exists());
+        let p = Pipeline::from_loaded(l.loaded, PipelineOptions::default());
+        assert!(p.status_message().unwrap().contains("rollback refused"));
+        // v2 again: enforced, state restored from the record.
+        let l = load_profile_checked(&v2, &t, Some(&rec)).unwrap();
+        assert!(l.loaded.file_check.is_ok() && l.alarm.is_some());
+        l.commit.unwrap().commit().unwrap();
+        assert_eq!(load_state(&state).unwrap(), Some(rec.clone()));
+        let l = load_profile_checked(&v2, &t, Some(&rec)).unwrap();
+        assert!(l.alarm.is_none() && l.commit.is_none());
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

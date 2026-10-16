@@ -120,6 +120,18 @@ state_file = "/var/lib/robodr/profile-state-pulsard/pulsard.json"
 # One deliberate rollback: the exact digest of the older profile file
 # (printed by `robodr-commission verify-profile`). Remove after it loaded.
 # allow_rollback = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+# robodr-trust-roots/v1 file: the trust-root PUBLIC key(s) that sign the
+# revocation list and a trust-file min_profile_version (`robodr-commission
+# keygen --roots`). Must differ from every profile signing key.
+# trust_roots = "/etc/robodr/trust-roots.json"
+# Signed robodr-profile-revocations/v1 list (`robodr-commission revoke`):
+# revoked profile digests / signing key ids. Needs trust_roots. A list older
+# than the last accepted one, or a missing list after one was accepted, is
+# refused.
+# revocation_list = "/etc/robodr/profile-revocations.json"
+# "optional" (default): no list file yet is fine. "required": no list file
+# means every locked profile is refused.
+# revocation_policy = "optional"
 
 # ---------------------------------------------------------------------------
 # Motion Firewall and motion monitor (robodr-agent). NOT Pulsar module keys:
