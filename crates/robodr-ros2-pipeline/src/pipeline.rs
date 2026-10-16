@@ -1020,6 +1020,7 @@ impl Pipeline {
         self.profile_findings(&report, src_ip, &mut out);
         self.binding_findings(&report, ip, ingress, ambiguity.any(), &mut out, now);
         self.removal_findings(&report, src_ip, ip, ingress, now, &mut out);
+        self.node_evidence(&report, now);
         self.protocol_findings(&report, src_ip, &ambiguity, &mut out);
         // Motion: learn this datagram's SEDP first, then its user DATA.
         self.motion.learn(&self.profile, &report);
@@ -1071,7 +1072,7 @@ impl Pipeline {
             .collect();
         for p in done {
             self.released.remove(&p);
-            if self.identities.identity_of(&p).is_none() {
+            if !self.identities.holds(&p) {
                 self.unresolve(p);
             }
         }
@@ -1081,7 +1082,36 @@ impl Pipeline {
         self.push_binding(out, found);
     }
 
-    /// The identity a run-time resolved prefix holds ([`crate::identity`]).
+    /// Node evidence for resolved prefixes: a writer of
+    /// `rr/<node>/get_parametersReply` announced by the participant itself
+    /// names one of its nodes ([`crate::identity`], "Which identity").
+    fn node_evidence(&mut self, report: &DatagramReport, now: Instant) {
+        if self.identities.is_empty() {
+            return;
+        }
+        for ep in &report.endpoints {
+            if ep.kind != EndpointKind::Writer
+                || ep.source != ep.participant
+                || ep.guid_conflict
+                || !self.identities.holds(&ep.participant)
+            {
+                continue;
+            }
+            let rn = robodr_events::graph::demangle(&ep.topic);
+            if rn.kind != robodr_events::graph::RosNameKind::ServiceReply {
+                continue;
+            }
+            if let Some(node) = rn.name.strip_suffix("/get_parameters") {
+                if !node.is_empty() {
+                    self.identities.observe_node(&ep.participant, node, now);
+                }
+            }
+        }
+        self.stats.identity = *self.identities.stats();
+    }
+
+    /// The identity a run-time resolved prefix holds ([`crate::identity`]),
+    /// once confirmed by node evidence.
     pub fn identity_of(&self, prefix: &robodr_rtps::GuidPrefix) -> Option<&str> {
         self.identities.identity_of(prefix)
     }
@@ -1278,7 +1308,7 @@ impl Pipeline {
             // A self-dispose from a consistent source frees a run-time
             // identity (the finding below still says "profiled", which it
             // was until now).
-            let resolved = self.identities.identity_of(&r.guid_prefix).is_some();
+            let resolved = self.identities.holds(&r.guid_prefix);
             if resolved && r.source == r.guid_prefix && consistent != Some(false) {
                 self.identities.release(&r.guid_prefix);
                 self.stats.identity = *self.identities.stats();

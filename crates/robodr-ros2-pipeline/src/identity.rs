@@ -37,6 +37,23 @@
 //! [`rules::IDENTITY_INSTANCES_EXCEEDED`] (High) is raised next to the
 //! profile's `robot.ros2.unknown_participant`.
 //!
+//! # Which identity: node evidence
+//!
+//! Several processes on one host with one vendor and enclave are
+//! indistinguishable at SPDP time, so the first free matching slot is taken
+//! *provisionally*. That is enough for "is this a robot participant" (the
+//! profile checks), but not for rights given **by name** (`identity:<name>`
+//! sources of the Motion Firewall, `safety_feed` writers): process B must
+//! not hold controller A's name. Every ROS 2 node serves
+//! `/<node>/get_parameters`, so when the participant announces that
+//! service's reply writer, [`IdentityResolver::observe_node`] confirms the
+//! slot if the node is one of the identity's `nodes`, or moves the
+//! participant to the identity that lists the node (swapping with an
+//! unconfirmed holder if needed). Only confirmed holdings are handed out by
+//! [`IdentityResolver::holders`] / [`IdentityResolver::identity_of`]; an
+//! identity whose `nodes` is empty is confirmed at SPDP time (nothing to
+//! check it against).
+//!
 //! # Limits (be honest)
 //!
 //! - Source IPs are not authenticated (see [`crate::binding`]); an attacker
@@ -80,6 +97,10 @@ pub struct IdentityStats {
     pub released: u64,
     /// Identities released by lease expiry.
     pub expired: u64,
+    /// Holdings confirmed by node evidence.
+    pub confirmed: u64,
+    /// Holdings moved (or swapped) to the identity their node belongs to.
+    pub moved: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +109,7 @@ struct Matcher {
     ips: Vec<IpAddr>,
     vendor: [u8; 2],
     enclave: Option<String>,
+    nodes: std::collections::BTreeSet<String>,
     max: usize,
 }
 
@@ -96,6 +118,26 @@ struct Holding {
     idx: usize,
     last: Instant,
     lease: Duration,
+    /// Source IP and vendor it was resolved from (a move keeps them).
+    ip: IpAddr,
+    vendor: [u8; 2],
+    /// Node evidence matched the identity (or it lists no nodes).
+    confirmed: bool,
+}
+
+/// What [`IdentityResolver::observe_node`] decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeEvidence {
+    /// The prefix holds no identity, or the evidence changes nothing.
+    Nothing,
+    /// The holding is confirmed for `identity`.
+    Confirmed { identity: String },
+    /// The prefix moved from `from` to `to` (confirmed).
+    Moved { from: String, to: String },
+    /// The node belongs to no identity the prefix could hold: it stays
+    /// unconfirmed (its parameter services are not in the profile either,
+    /// which the service allowlist reports).
+    Unmatched,
 }
 
 /// What [`IdentityResolver::observe_spdp`] decided.
@@ -153,6 +195,7 @@ impl IdentityResolver {
                     ips,
                     vendor: parse_vendor(&id.vendor)?,
                     enclave: id.enclave.clone(),
+                    nodes: id.nodes.clone(),
                     max: usize::try_from(id.max_instances.max(1)).unwrap_or(1),
                 })
             })
@@ -173,16 +216,91 @@ impl IdentityResolver {
         &self.stats
     }
 
-    /// The identity `prefix` currently holds.
-    pub fn identity_of(&self, prefix: &GuidPrefix) -> Option<&str> {
-        self.held.get(prefix).map(|h| self.ids[h.idx].name.as_str())
+    /// Does `prefix` hold a slot (confirmed or provisional)? It is then a
+    /// profiled participant.
+    pub fn holds(&self, prefix: &GuidPrefix) -> bool {
+        self.held.contains_key(prefix)
     }
 
-    /// Live holders, prefix -> identity name.
+    /// The identity `prefix` holds, **confirmed** (see the module docs);
+    /// `None` while provisional.
+    pub fn identity_of(&self, prefix: &GuidPrefix) -> Option<&str> {
+        self.held
+            .get(prefix)
+            .filter(|h| h.confirmed)
+            .map(|h| self.ids[h.idx].name.as_str())
+    }
+
+    /// Live confirmed holders, prefix -> identity name.
     pub fn holders(&self) -> impl Iterator<Item = (&GuidPrefix, &str)> {
         self.held
             .iter()
+            .filter(|(_, h)| h.confirmed)
             .map(|(p, h)| (p, self.ids[h.idx].name.as_str()))
+    }
+
+    fn live_holders(&self, idx: usize, now: Instant) -> Vec<GuidPrefix> {
+        self.held
+            .iter()
+            .filter(|(_, h)| h.idx == idx && now.saturating_duration_since(h.last) <= h.lease)
+            .map(|(p, _)| *p)
+            .collect()
+    }
+
+    /// Node evidence for `prefix`: it serves `/<node>/get_parameters`. See
+    /// the module docs ("Which identity").
+    pub fn observe_node(&mut self, prefix: &GuidPrefix, node: &str, now: Instant) -> NodeEvidence {
+        let Some(h) = self.held.get(prefix).copied() else {
+            return NodeEvidence::Nothing;
+        };
+        if self.ids[h.idx].nodes.contains(node) {
+            if h.confirmed {
+                return NodeEvidence::Nothing;
+            }
+            if let Some(x) = self.held.get_mut(prefix) {
+                x.confirmed = true;
+            }
+            self.stats.confirmed += 1;
+            return NodeEvidence::Confirmed {
+                identity: self.ids[h.idx].name.clone(),
+            };
+        }
+        if h.confirmed {
+            // Confirmed by another of its nodes: a second node of the same
+            // process that the identity does not list changes nothing here.
+            return NodeEvidence::Nothing;
+        }
+        let target = self
+            .ids
+            .iter()
+            .position(|m| m.nodes.contains(node) && m.ips.contains(&h.ip) && m.vendor == h.vendor);
+        let Some(to) = target else {
+            return NodeEvidence::Unmatched;
+        };
+        let holders = self.live_holders(to, now);
+        if holders.len() >= self.ids[to].max {
+            // Swap with an unconfirmed holder of the target, if any.
+            let Some(other) = holders
+                .iter()
+                .find(|p| self.held.get(*p).is_some_and(|x| !x.confirmed))
+                .copied()
+            else {
+                return NodeEvidence::Unmatched;
+            };
+            if let Some(x) = self.held.get_mut(&other) {
+                x.idx = h.idx;
+            }
+        }
+        if let Some(x) = self.held.get_mut(prefix) {
+            x.idx = to;
+            x.confirmed = true;
+        }
+        self.stats.moved += 1;
+        self.stats.confirmed += 1;
+        NodeEvidence::Moved {
+            from: self.ids[h.idx].name.clone(),
+            to: self.ids[to].name.clone(),
+        }
     }
 
     /// Judge one SPDP announcement of a prefix that is not statically
@@ -220,19 +338,18 @@ impl IdentityResolver {
             {
                 continue;
             }
-            let holders: Vec<GuidPrefix> = self
-                .held
-                .iter()
-                .filter(|(_, h)| h.idx == idx && now.saturating_duration_since(h.last) <= h.lease)
-                .map(|(p, _)| *p)
-                .collect();
+            let holders = self.live_holders(idx, now);
             if holders.len() < m.max {
+                let confirmed = m.nodes.is_empty();
                 self.held.insert(
                     p,
                     Holding {
                         idx,
                         last: now,
                         lease,
+                        ip,
+                        vendor,
+                        confirmed,
                     },
                 );
                 self.stats.resolved += 1;
@@ -435,5 +552,136 @@ mod tests {
             r.observe_spdp(&spdp(1, FAST, None, ""), ip("10.0.0.10"), Instant::now()),
             Resolution::NoMatch
         );
+    }
+}
+
+#[cfg(test)]
+mod node_evidence_tests {
+    use super::*;
+    use robodr_events::profile::ParticipantIdentity;
+
+    /// Two processes on one host, same vendor: identities `a` (node /a) and
+    /// `b` (node /b).
+    fn resolver() -> IdentityResolver {
+        let mut p = Profile {
+            model: "m".into(),
+            ..Default::default()
+        };
+        for n in ["a", "b"] {
+            p.participant_identities.insert(
+                n.into(),
+                ParticipantIdentity {
+                    ips: ["10.0.0.10".to_owned()].into(),
+                    vendor: "010f".into(),
+                    enclave: None,
+                    nodes: [format!("/{n}")].into(),
+                    max_instances: 1,
+                },
+            );
+        }
+        IdentityResolver::new(&p)
+    }
+
+    fn spdp(prefix: u8) -> SpdpInfo {
+        SpdpInfo {
+            guid_prefix: [prefix; 12],
+            attribution: robodr_rtps::Attribution::ParticipantGuid,
+            source: [prefix; 12],
+            participant_entity: None,
+            protocol_version: None,
+            vendor_id: Some([0x01, 0x0f]),
+            domain_id: None,
+            domain_tag: None,
+            entity_name: None,
+            user_data: None,
+            lease_duration: None,
+            metatraffic_unicast: Vec::new(),
+            metatraffic_multicast: Vec::new(),
+            default_unicast: Vec::new(),
+            default_multicast: Vec::new(),
+            alternate_guid_prefixes: Vec::new(),
+            from_fragments: false,
+        }
+    }
+
+    fn ip() -> IpAddr {
+        "10.0.0.10".parse().unwrap()
+    }
+
+    #[test]
+    fn provisional_until_a_node_names_the_identity() {
+        let mut r = resolver();
+        let t = Instant::now();
+        // Process "b" starts first and provisionally takes slot "a".
+        assert!(
+            matches!(r.observe_spdp(&spdp(2), ip(), t), Resolution::Resolved { ref identity } if identity == "a")
+        );
+        assert!(r.holds(&[2; 12]));
+        assert_eq!(r.identity_of(&[2; 12]), None, "not confirmed yet");
+        assert_eq!(r.holders().count(), 0);
+        // Its /b/get_parameters service moves it to "b".
+        assert_eq!(
+            r.observe_node(&[2; 12], "/b", t),
+            NodeEvidence::Moved {
+                from: "a".into(),
+                to: "b".into()
+            }
+        );
+        assert_eq!(r.identity_of(&[2; 12]), Some("b"));
+        // Process "a" then gets "a" and confirms it.
+        assert!(
+            matches!(r.observe_spdp(&spdp(1), ip(), t), Resolution::Resolved { ref identity } if identity == "a")
+        );
+        assert_eq!(
+            r.observe_node(&[1; 12], "/a", t),
+            NodeEvidence::Confirmed {
+                identity: "a".into()
+            }
+        );
+        assert_eq!(r.holders().count(), 2);
+    }
+
+    #[test]
+    fn crossed_provisional_slots_are_swapped() {
+        let mut r = resolver();
+        let t = Instant::now();
+        r.observe_spdp(&spdp(1), ip(), t); // -> a (provisional)
+        r.observe_spdp(&spdp(2), ip(), t); // -> b (provisional)
+                                           // 1 is really "b": swap with the unconfirmed holder 2.
+        assert!(matches!(
+            r.observe_node(&[1; 12], "/b", t),
+            NodeEvidence::Moved { .. }
+        ));
+        assert_eq!(r.identity_of(&[1; 12]), Some("b"));
+        assert_eq!(r.identity_of(&[2; 12]), None);
+        assert!(matches!(
+            r.observe_node(&[2; 12], "/a", t),
+            NodeEvidence::Confirmed { .. }
+        ));
+        assert_eq!(r.identity_of(&[2; 12]), Some("a"));
+        // A confirmed holding is never moved by a later node.
+        assert_eq!(r.observe_node(&[2; 12], "/b", t), NodeEvidence::Nothing);
+        assert_eq!(r.identity_of(&[2; 12]), Some("a"));
+    }
+
+    #[test]
+    fn a_node_of_no_identity_stays_unconfirmed() {
+        let mut r = resolver();
+        let t = Instant::now();
+        r.observe_spdp(&spdp(1), ip(), t);
+        assert_eq!(
+            r.observe_node(&[1; 12], "/rogue", t),
+            NodeEvidence::Unmatched
+        );
+        assert_eq!(r.identity_of(&[1; 12]), None);
+        assert!(
+            r.holds(&[1; 12]),
+            "still a profiled participant for the profile checks"
+        );
+        // An identity whose real holder is confirmed cannot be taken over.
+        r.observe_spdp(&spdp(2), ip(), t); // -> b
+        r.observe_node(&[2; 12], "/b", t);
+        assert_eq!(r.observe_node(&[1; 12], "/b", t), NodeEvidence::Unmatched);
+        assert_eq!(r.identity_of(&[2; 12]), Some("b"));
     }
 }

@@ -125,6 +125,16 @@ fn rogue_publisher_is_caught_after_the_robot_restarted() {
             "{v}: {:?}",
             p.stats().identity
         );
+        // Each holding was confirmed by its node's parameter service. The
+        // teleop disposed itself before the end of the capture, so only the
+        // robot's controller still holds its identity.
+        let names: BTreeSet<String> = p.identity_holders().into_iter().map(|(_, n)| n).collect();
+        assert_eq!(names, ["base_controller".to_string()].into(), "{v}");
+        assert!(
+            p.stats().identity.confirmed >= 2,
+            "{v}: {:?}",
+            p.stats().identity
+        );
         // The rogue: unknown participant, Critical motion writer, Critical
         // over-envelope command.
         for rule in [

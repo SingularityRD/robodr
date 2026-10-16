@@ -86,7 +86,7 @@ pub use config::{
     BindingConfig, CaptureConfig, CaptureInput, CaptureSettings, Config, Settings, SpdpSettings,
 };
 pub use dedup::DedupSet;
-pub use identity::{IdentityResolver, IdentityStats, Resolution};
+pub use identity::{IdentityResolver, IdentityStats, NodeEvidence, Resolution};
 pub use motion::{MotionOptions, MotionSample, MotionStats, SampleAttribution};
 pub use pipeline::{
     load_profile, rules, Finding, LoadedProfile, Pipeline, PipelineOptions, PipelineStats,
