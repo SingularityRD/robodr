@@ -1,22 +1,25 @@
 //! The observe-mode [`Learner`]: turns a clean run's events into a draft
-//! [`Profile`] (`locked: false`) plus a [`CommissioningReport`] the OEM reads
-//! before locking.
+//! [`Profile`] (`locked: false`), a [`CommissioningReport`] the OEM reads
+//! before locking, and a [`Signoff`] list a named operator must confirm
+//! before `lock` accepts the draft.
 //!
 //! # What is learned
 //!
-//! * `participants`: every GUID prefix seen in an SPDP participant
-//!   announcement. GUIDs seen *only* on endpoints or motion commands are not
-//!   added; they are reported as a warning instead (an endpoint whose
-//!   participant never announced itself is something a human should look at).
+//! * `participants`: every GUID prefix seen in a participant announcement
+//!   that passes the **anti-poisoning gate** below. GUIDs seen *only* on
+//!   endpoints or motion commands are never added (warning
+//!   `unannounced_participant`).
 //! * Endpoint names, routed by kind exactly as `Profile::evaluate` matches
-//!   them (see [`ProfileSlot`] and the table below), so that learn -> lock ->
-//!   check over the same clean run gives zero deviations (property-tested in
-//!   `tests/roundtrip.rs`).
+//!   them (see [`ProfileSlot`] and the table below), **only when at least one
+//!   accepted participant announced them**. learn -> lock -> check over the
+//!   same clean run gives zero deviations (property-tested in
+//!   `tests/roundtrip.rs` with a permissive gate).
 //! * `motion_envelopes`: for each motion channel, per dimension (linear m/s,
-//!   joint rad/s), `min(max_observed * margin, ceiling)` where the ceiling is
-//!   the OEM's optional hard limit. See [`envelope_bound`] for the exact math.
-//!   A channel with no valid sample in any dimension gets an empty envelope,
-//!   which [`crate::ops::lock`] refuses: the OEM must decide, not the tool.
+//!   joint rad/s), `min(max_observed * margin, effective_cap)` over samples
+//!   from accepted sources, where `effective_cap` is the OEM ceiling if set
+//!   and never more than the configured **hard cap** (see
+//!   [`envelope_bound`]). A channel with no valid sample in any dimension
+//!   gets an empty envelope, which `lock` refuses: the OEM must decide.
 //!
 //! | endpoint name ([`demangle`](robodr_events::graph::demangle))  | learned into      |
 //! |---------------------------------------------------------------|-------------------|
@@ -50,19 +53,68 @@
 //! `reader_topics` and reader-side services / actions / raw names are added
 //! to their sets as well, since reader enforcement checks those sets too.
 //!
+//! # Learning-time poisoning (threat model and mitigations)
+//!
+//! Whatever is on the bus during commissioning becomes "normal". An attacker
+//! present during the clean run (a rogue node, a laptop, a compromised
+//! component) would otherwise be baked into the locked allowlist, and a
+//! fast motion command injected during the run would widen the envelope.
+//! Mitigations, all on by default:
+//!
+//! 1. **Quarantine** (not learned, reported): a participant announced fewer
+//!    than `min_participant_announcements` times, or, when the input has
+//!    capture timestamps, observed for less than
+//!    `min_participant_duration` in every run it appears in. Its endpoints
+//!    and its motion samples are not learned either, so a quarantined
+//!    attacker leaves no trace in the profile. An operator who knows a
+//!    quarantined participant is legitimate re-runs `learn` with
+//!    `--accept-participant <guid>`; that acceptance is itself a sign-off
+//!    item.
+//! 2. **Flags for sign-off** (learned, but `lock` needs a named operator to
+//!    confirm each): participants that first appeared late in the run
+//!    (`late_fraction`), were present only briefly (`brief_fraction` of the
+//!    run), announced from several source IPs (spoofing or multi-homing),
+//!    or were missing from some runs; **every participant that writes a
+//!    motion topic or sends motion commands**; motion commands without a
+//!    source; motion channels with fewer than `min_samples` samples;
+//!    envelope-relevant samples above the hard cap; capacity overflow;
+//!    anomalies.
+//! 3. **Envelope hard cap**: no envelope is ever wider than
+//!    `hard_cap_linear` / `hard_cap_joint` (or the tighter OEM ceiling),
+//!    whatever was observed; NaN, infinite and negative speeds are never
+//!    learned; samples from quarantined, unannounced or malformed sources
+//!    never widen an envelope.
+//! 4. **Bounded memory**: every map and set has a cap (see [`Limits`]);
+//!    entries past a cap are dropped (fail-closed: they later deviate),
+//!    counted, and turned into a `capacity_exceeded` sign-off item. Motion
+//!    samples live in decimating [`SampleBuffer`]s; envelopes use exact
+//!    per-source maxima, so they do not depend on decimation.
+//!
+//! Limits of these heuristics (honest list): an attacker present for the
+//! *whole* commissioning run, from the start, announcing at the normal rate
+//! from a single IP and not touching motion topics is indistinguishable
+//! from a legitimate node by traffic alone; only the operator's review of
+//! the participant list (which the report gives with IPs and topics) can
+//! catch it. "Late" and "brief" are measured in input positions (frame
+//! ordinals, JSONL lines) because `RobotEvent` has no timestamps; durations
+//! use capture timestamps, which come from the file and are only used to
+//! make the gate *stricter*. With caps hit, which entries got in depends on
+//! arrival order.
+//!
 //! # Anomalies
 //!
 //! Non-finite or negative speeds, empty topics/channels, ROS names that
-//! `Profile::validate` would reject (whitespace or control characters) and
-//! GUID prefixes that are not 24 lower-case hex chars are counted as
-//! anomalies and never feed the profile. A clean run should have none; the report says so loudly.
+//! `Profile::validate` would reject (whitespace or control characters),
+//! GUID prefixes that are not 24 lower-case hex chars and capacity overflow
+//! are counted as anomalies and never feed the profile. A clean run should
+//! have none; the report says so loudly.
 //!
 //! # Determinism
 //!
-//! All state lives in `BTreeMap`/`BTreeSet`; samples are sorted with
-//! `f64::total_cmp`; no clocks, no hashing, no randomness. The profile depends
-//! only on sets and maxima, so it is also independent of event order and of
-//! the order in which learners are [`merge`](Learner::merge)d.
+//! All state lives in `BTreeMap`/`BTreeSet`; no clocks, no hashing, no
+//! randomness. Below the caps the profile depends only on sets, maxima and
+//! per-run presence, so it is independent of event order within a run and
+//! of the order in which learners are [`merge`](Learner::merge)d.
 //!
 //! # Positions
 //!
@@ -72,24 +124,44 @@
 //! in-memory sources.
 
 use crate::input::{CaptureDiagnostics, EventSource, InputError};
-use crate::stats::SpeedStats;
+use crate::signoff::{Signoff, SignoffItem};
+use crate::stats::{SampleBuffer, SpeedStats};
 use robodr_events::graph::{ActionRole, RosName, RosNameKind};
 use robodr_events::profile::{Envelope, Profile};
 use robodr_events::RobotEvent;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::time::Duration;
 
 /// Default safety margin applied to observed maxima.
 pub const DEFAULT_MARGIN: f64 = 1.10;
 /// Upper bound on the margin: beyond 10x the envelope stops meaning anything.
 pub const MAX_MARGIN: f64 = 10.0;
-/// Below this many valid samples per dimension, an envelope is flagged.
+/// Below this many valid samples per dimension, an envelope needs sign-off.
 pub const DEFAULT_MIN_SAMPLES: u64 = 30;
 /// Model name used when none is given (flagged in the report).
 pub const DEFAULT_MODEL: &str = "unnamed-model";
 /// At most this many anomalies are kept verbatim; all are counted.
 pub const MAX_STORED_ANOMALIES: usize = 1000;
+/// Default hard cap on any learned linear envelope, m/s. Generous for a
+/// ground UGV; set `--hard-cap-linear` to the platform's physical limit.
+pub const DEFAULT_HARD_CAP_LINEAR: f64 = 10.0;
+/// Default hard cap on any learned joint envelope, rad/s.
+pub const DEFAULT_HARD_CAP_JOINT: f64 = 10.0;
+/// A participant announced fewer times than this is quarantined.
+pub const DEFAULT_MIN_PARTICIPANT_ANNOUNCEMENTS: u64 = 2;
+/// With capture timestamps, a participant observed for less than this (in
+/// every run it appears in) is quarantined.
+pub const DEFAULT_MIN_PARTICIPANT_DURATION: Duration = Duration::from_secs(5);
+/// First seen after this fraction of the run: flagged "late".
+pub const DEFAULT_LATE_FRACTION: f64 = 0.25;
+/// Present for less than this fraction of the run: flagged "brief".
+pub const DEFAULT_BRIEF_FRACTION: f64 = 0.5;
+/// Topics always treated as motion topics (writers need sign-off), in
+/// addition to learned motion channels and the name heuristic in
+/// [`is_motion_like`].
+pub const DEFAULT_MOTION_TOPICS: [&str; 1] = ["/cmd_vel"];
 /// The parameter services every ROS 2 node serves (unless started with
 /// `start_parameter_services:=false`), as the last name segment.
 pub const PARAMETER_SERVICES: [&str; 6] = [
@@ -104,6 +176,22 @@ pub const PARAMETER_SERVICES: [&str; 6] = [
 /// learned like any raw topic but not flagged as unusual in the report.
 /// `ros_discovery_info` carries the node-to-participant map (rmw_dds_common).
 pub const ROS_INTERNAL_RAW_TOPICS: [&str; 1] = ["ros_discovery_info"];
+/// How many example names a summary warning lists.
+const EXAMPLES_SHOWN: usize = 20;
+
+/// Name heuristic for "this topic probably commands motion": the last
+/// segment contains `cmd`, `command`, `twist` or `trajectory`. Over-broad
+/// on purpose: a false hit only costs one sign-off line.
+pub fn is_motion_like(topic: &str) -> bool {
+    let last = topic
+        .rsplit('/')
+        .next()
+        .unwrap_or(topic)
+        .to_ascii_lowercase();
+    ["cmd", "command", "twist", "trajectory"]
+        .iter()
+        .any(|k| last.contains(k))
+}
 
 /// Which profile set admits an endpoint, mirroring the kind-aware matching
 /// of `Profile::evaluate` in robodr-events (writers: topic -> `writer_topics`;
@@ -171,22 +259,77 @@ fn is_client_side(kind: &RosNameKind, is_writer: bool) -> Option<bool> {
     }
 }
 
+fn is_guid_prefix(g: &str) -> bool {
+    g.len() == 24 && g.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Memory caps. Entries beyond a cap are dropped (never learned), counted
+/// and reported; see the module docs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Limits {
+    /// Distinct participants (and distinct referenced GUIDs).
+    pub max_participants: usize,
+    /// Distinct names per kind (writer topics, reader topics, services,
+    /// actions, raw topics).
+    pub max_names: usize,
+    /// Distinct motion channels.
+    pub max_motion_channels: usize,
+    /// Entries per inner set (participants per topic, IPs per participant,
+    /// type names, sources per motion channel).
+    pub max_set_entries: usize,
+    /// Retained samples per motion channel and dimension (decimated
+    /// beyond; count/min/max stay exact).
+    pub max_samples: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_participants: 4096,
+            max_names: 16384,
+            max_motion_channels: 256,
+            max_set_entries: 256,
+            max_samples: 16384,
+        }
+    }
+}
+
 /// Learner configuration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LearnConfig {
     pub model: String,
     /// Multiplier on observed max speed, in `[1.0, MAX_MARGIN]`.
     pub margin: f64,
-    /// OEM hard ceiling for linear speed (m/s); envelopes never exceed it.
+    /// OEM ceiling for linear speed (m/s); envelopes never exceed it.
     pub ceiling_linear: Option<f64>,
-    /// OEM hard ceiling for joint speed (rad/s); envelopes never exceed it.
+    /// OEM ceiling for joint speed (rad/s); envelopes never exceed it.
     pub ceiling_joint: Option<f64>,
-    /// Minimum valid samples per dimension for an envelope to be trusted.
+    /// Absolute cap on any learned linear envelope (m/s), always applied.
+    pub hard_cap_linear: f64,
+    /// Absolute cap on any learned joint envelope (rad/s), always applied.
+    pub hard_cap_joint: f64,
+    /// Minimum valid samples per dimension for an envelope to be trusted
+    /// without sign-off.
     pub min_samples: u64,
     /// Learn `reader_topics` (which turns reader-topic enforcement on) and
     /// reader-side services / actions / raw names. Off by default; see the
     /// module docs for why.
     pub learn_readers: bool,
+    /// Participants announced fewer times are quarantined (>= 1).
+    pub min_participant_announcements: u64,
+    /// With capture timestamps: participants observed for less are
+    /// quarantined. `Duration::ZERO` disables the check.
+    pub min_participant_duration: Duration,
+    /// First seen after this fraction of a run: flagged late. In `[0, 1]`.
+    pub late_fraction: f64,
+    /// Present for less than this fraction of a run: flagged brief.
+    pub brief_fraction: f64,
+    /// Operator override: learn these participants even if quarantined
+    /// (each becomes a sign-off item).
+    pub accept_participants: BTreeSet<String>,
+    /// Extra topics whose writers need sign-off (de-mangled ROS names).
+    pub motion_topics: BTreeSet<String>,
+    pub limits: Limits,
 }
 
 impl Default for LearnConfig {
@@ -196,8 +339,20 @@ impl Default for LearnConfig {
             margin: DEFAULT_MARGIN,
             ceiling_linear: None,
             ceiling_joint: None,
+            hard_cap_linear: DEFAULT_HARD_CAP_LINEAR,
+            hard_cap_joint: DEFAULT_HARD_CAP_JOINT,
             min_samples: DEFAULT_MIN_SAMPLES,
             learn_readers: false,
+            min_participant_announcements: DEFAULT_MIN_PARTICIPANT_ANNOUNCEMENTS,
+            min_participant_duration: DEFAULT_MIN_PARTICIPANT_DURATION,
+            late_fraction: DEFAULT_LATE_FRACTION,
+            brief_fraction: DEFAULT_BRIEF_FRACTION,
+            accept_participants: BTreeSet::new(),
+            motion_topics: DEFAULT_MOTION_TOPICS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            limits: Limits::default(),
         }
     }
 }
@@ -208,6 +363,12 @@ pub enum ConfigError {
     EmptyModel,
     InvalidMargin(f64),
     InvalidCeiling { dimension: &'static str, value: f64 },
+    InvalidHardCap { dimension: &'static str, value: f64 },
+    InvalidFraction { name: &'static str, value: f64 },
+    InvalidMinAnnouncements,
+    InvalidLimit { name: &'static str },
+    InvalidAcceptedParticipant(String),
+    InvalidMotionTopic(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -222,6 +383,25 @@ impl fmt::Display for ConfigError {
             ConfigError::InvalidCeiling { dimension, value } => write!(
                 f,
                 "{dimension} ceiling {value} invalid: must be finite and > 0"
+            ),
+            ConfigError::InvalidHardCap { dimension, value } => write!(
+                f,
+                "{dimension} hard cap {value} invalid: must be finite and > 0"
+            ),
+            ConfigError::InvalidFraction { name, value } => {
+                write!(f, "{name} {value} invalid: must be in [0, 1]")
+            }
+            ConfigError::InvalidMinAnnouncements => {
+                write!(f, "minimum participant announcements must be at least 1")
+            }
+            ConfigError::InvalidLimit { name } => write!(f, "limit {name} must be at least 2"),
+            ConfigError::InvalidAcceptedParticipant(g) => write!(
+                f,
+                "accepted participant {g:?} is not a 24-char lower-case hex GUID prefix"
+            ),
+            ConfigError::InvalidMotionTopic(t) => write!(
+                f,
+                "motion topic {t:?} is not a fully qualified ROS name (e.g. /cmd_vel)"
             ),
         }
     }
@@ -247,7 +427,59 @@ impl LearnConfig {
                 }
             }
         }
+        for (dimension, value) in [
+            ("linear", self.hard_cap_linear),
+            ("joint", self.hard_cap_joint),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(ConfigError::InvalidHardCap { dimension, value });
+            }
+        }
+        for (name, value) in [
+            ("late fraction", self.late_fraction),
+            ("brief fraction", self.brief_fraction),
+        ] {
+            if !(0.0..=1.0).contains(&value) {
+                return Err(ConfigError::InvalidFraction { name, value });
+            }
+        }
+        if self.min_participant_announcements == 0 {
+            return Err(ConfigError::InvalidMinAnnouncements);
+        }
+        let l = &self.limits;
+        for (name, v) in [
+            ("max_participants", l.max_participants),
+            ("max_names", l.max_names),
+            ("max_motion_channels", l.max_motion_channels),
+            ("max_set_entries", l.max_set_entries),
+            ("max_samples", l.max_samples),
+        ] {
+            if v < 2 {
+                return Err(ConfigError::InvalidLimit { name });
+            }
+        }
+        if let Some(g) = self.accept_participants.iter().find(|g| !is_guid_prefix(g)) {
+            return Err(ConfigError::InvalidAcceptedParticipant(g.clone()));
+        }
+        if let Some(t) = self
+            .motion_topics
+            .iter()
+            .find(|t| !ProfileSlot::Topic((*t).clone()).is_valid())
+        {
+            return Err(ConfigError::InvalidMotionTopic(t.clone()));
+        }
         Ok(())
+    }
+
+    /// The cap actually applied to one dimension: the OEM ceiling if it is
+    /// tighter, else the hard cap.
+    pub fn effective_cap(&self, joint: bool) -> f64 {
+        let (ceiling, hard) = if joint {
+            (self.ceiling_joint, self.hard_cap_joint)
+        } else {
+            (self.ceiling_linear, self.hard_cap_linear)
+        };
+        ceiling.map_or(hard, |c| c.min(hard))
     }
 }
 
@@ -256,7 +488,20 @@ impl LearnConfig {
 /// bound is never below the observed max), then capped at `ceiling`.
 /// Returns `(bound, capped_by_ceiling)`. If the product overflows, the
 /// observed max itself is used (still finite, still >= every sample).
+/// A non-finite or negative `observed_max` yields the ceiling (or 0 without
+/// one) so garbage can never produce a NaN/inf bound.
 pub fn envelope_bound(observed_max: f64, margin: f64, ceiling: Option<f64>) -> (f64, bool) {
+    if !observed_max.is_finite() || observed_max < 0.0 {
+        return match ceiling {
+            Some(c) if c.is_finite() && c >= 0.0 => (c, true),
+            _ => (0.0, false),
+        };
+    }
+    let margin = if margin.is_finite() && margin >= 1.0 {
+        margin
+    } else {
+        1.0
+    };
     let product = observed_max * margin;
     let scaled = if product.is_finite() {
         quantise_up(product).max(observed_max)
@@ -264,7 +509,7 @@ pub fn envelope_bound(observed_max: f64, margin: f64, ceiling: Option<f64>) -> (
         observed_max
     };
     match ceiling {
-        Some(c) if scaled > c => (c, true),
+        Some(c) if c.is_finite() && scaled > c => (c.max(0.0), true),
         _ => (scaled, false),
     }
 }
@@ -331,7 +576,7 @@ impl Span {
 
 fn shift(at: SeenAt, runs: usize) -> SeenAt {
     SeenAt {
-        run: at.run + runs,
+        run: at.run.saturating_add(runs),
         position: at.position,
     }
 }
@@ -343,10 +588,57 @@ fn touch(span: &mut Option<Span>, at: SeenAt) {
     }
 }
 
+fn merge_span(dst: &mut Option<Span>, src: &Option<Span>, off: usize) {
+    if let Some(s) = src {
+        let s = s.shifted(off);
+        match dst {
+            Some(d) => d.absorb(&s),
+            None => *dst = Some(s),
+        }
+    }
+}
+
+/// Extent of positions and timestamps within one run.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Extent {
+    min_pos: Option<u64>,
+    max_pos: Option<u64>,
+    min_ts: Option<Duration>,
+    max_ts: Option<Duration>,
+}
+
+impl Extent {
+    fn update(&mut self, pos: u64, ts: Option<Duration>) {
+        self.min_pos = Some(self.min_pos.map_or(pos, |m| m.min(pos)));
+        self.max_pos = Some(self.max_pos.map_or(pos, |m| m.max(pos)));
+        if let Some(t) = ts {
+            self.min_ts = Some(self.min_ts.map_or(t, |m| m.min(t)));
+            self.max_ts = Some(self.max_ts.map_or(t, |m| m.max(t)));
+        }
+    }
+    fn absorb(&mut self, o: &Extent) {
+        if let (Some(a), Some(b)) = (o.min_pos, o.max_pos) {
+            self.update(a, o.min_ts);
+            self.update(b, o.max_ts);
+        }
+    }
+    fn pos_span(&self) -> u64 {
+        match (self.min_pos, self.max_pos) {
+            (Some(a), Some(b)) => b.saturating_sub(a),
+            _ => 0,
+        }
+    }
+    fn duration(&self) -> Option<Duration> {
+        Some(self.max_ts?.saturating_sub(self.min_ts?))
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 struct ParticipantAcc {
     span: Option<Span>,
     src_ips: BTreeSet<String>,
+    /// Presence per run index.
+    runs: BTreeMap<usize, Extent>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -364,36 +656,75 @@ struct RoleAcc {
     side_a: BTreeSet<String>,
     /// Services/actions: server participants. Raw topics: readers.
     side_b: BTreeSet<String>,
-    /// Seen on at least one writer endpoint.
-    written: bool,
+    /// Participants seen on a writer endpoint of this name.
+    writer_guids: BTreeSet<String>,
     /// Actions: components seen (`send_goal`, ..., `status`).
     components: BTreeSet<String>,
     type_names: BTreeSet<String>,
 }
 
-impl RoleAcc {
-    fn absorb(&mut self, o: &RoleAcc, off: usize) {
-        if let Some(s) = &o.span {
-            let s = s.shifted(off);
-            match &mut self.span {
-                Some(d) => d.absorb(&s),
-                None => self.span = Some(s),
-            }
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct DimStat {
+    n: u64,
+    min: f64,
+    max: f64,
+}
+
+impl DimStat {
+    fn record(&mut self, v: f64) {
+        if self.n == 0 {
+            self.min = v;
+            self.max = v;
+        } else {
+            self.min = self.min.min(v);
+            self.max = self.max.max(v);
         }
-        self.side_a.extend(o.side_a.iter().cloned());
-        self.side_b.extend(o.side_b.iter().cloned());
-        self.written |= o.written;
-        self.components.extend(o.components.iter().cloned());
-        self.type_names.extend(o.type_names.iter().cloned());
+        self.n = self.n.saturating_add(1);
     }
+    fn absorb(&mut self, o: &DimStat) {
+        if o.n == 0 {
+            return;
+        }
+        if self.n == 0 {
+            *self = *o;
+        } else {
+            self.min = self.min.min(o.min);
+            self.max = self.max.max(o.max);
+            self.n = self.n.saturating_add(o.n);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct SourceStat {
+    commands: u64,
+    linear: DimStat,
+    joint: DimStat,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
 struct MotionAcc {
     span: Option<Span>,
-    sources: BTreeSet<String>,
-    linear: Vec<f64>,
-    joint: Vec<f64>,
+    /// Source table: `None` = command without `source_guid`.
+    sources: Vec<Option<String>>,
+    stats: Vec<SourceStat>,
+    /// `(speed, source index)`.
+    linear: SampleBuffer<(f64, u32)>,
+    joint: SampleBuffer<(f64, u32)>,
+}
+
+impl MotionAcc {
+    fn source_index(&mut self, src: &Option<String>, cap: usize) -> Option<usize> {
+        if let Some(i) = self.sources.iter().position(|s| s == src) {
+            return Some(i);
+        }
+        if self.sources.len() >= cap {
+            return None;
+        }
+        self.sources.push(src.clone());
+        self.stats.push(SourceStat::default());
+        Some(self.sources.len() - 1)
+    }
 }
 
 /// Something in the input that a clean run should not contain.
@@ -422,6 +753,7 @@ pub struct RunSummary {
 pub struct Learner {
     config: LearnConfig,
     runs: Vec<RunSummary>,
+    extents: Vec<Extent>,
     events_by_kind: BTreeMap<String, u64>,
     participants: BTreeMap<String, ParticipantAcc>,
     writers: BTreeMap<String, EndpointAcc>,
@@ -432,15 +764,100 @@ pub struct Learner {
     motion: BTreeMap<String, MotionAcc>,
     /// GUIDs referenced by endpoints/motion commands (to spot unannounced ones).
     referenced_guids: BTreeMap<String, SeenAt>,
+    /// Entries dropped per capacity category.
+    overflow: BTreeMap<String, u64>,
     anomalies_total: u64,
     anomalies: Vec<Anomaly>,
 }
 
-/// The two artefacts of commissioning.
+/// The three artefacts of commissioning.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Commissioning {
     pub profile: Profile,
     pub report: CommissioningReport,
+    /// What a named operator must confirm before `lock` accepts `profile`.
+    pub signoff: Signoff,
+}
+
+/// Verdict on one participant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParticipantStatus {
+    /// Learned.
+    Accepted,
+    /// Learned only because the operator accepted it despite quarantine.
+    OperatorAccepted,
+    /// Not learned (nor its endpoints and motion samples).
+    Quarantined,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Assessment {
+    status: ParticipantStatus,
+    quarantine: Vec<String>,
+    /// `(sign-off kind, reason)`.
+    flags: Vec<(&'static str, String)>,
+    observed: Option<Duration>,
+    runs_seen: usize,
+}
+
+impl Assessment {
+    fn accepted(&self) -> bool {
+        self.status != ParticipantStatus::Quarantined
+    }
+}
+
+/// Insert into a capped set; `false` if it was full (value not stored).
+fn insert_capped(set: &mut BTreeSet<String>, v: &str, cap: usize) -> bool {
+    if set.contains(v) {
+        return true;
+    }
+    if set.len() >= cap {
+        return false;
+    }
+    set.insert(v.to_string());
+    true
+}
+
+fn extend_capped(dst: &mut BTreeSet<String>, src: &BTreeSet<String>, cap: usize) -> u64 {
+    let mut dropped = 0;
+    for v in src {
+        if !insert_capped(dst, v, cap) {
+            dropped += 1;
+        }
+    }
+    dropped
+}
+
+/// Get or create `key` in a capped map; `None` if full.
+fn admit<'m, V: Default>(
+    map: &'m mut BTreeMap<String, V>,
+    key: &str,
+    cap: usize,
+) -> Option<&'m mut V> {
+    if !map.contains_key(key) {
+        if map.len() >= cap {
+            return None;
+        }
+        map.insert(key.to_string(), V::default());
+    }
+    map.get_mut(key)
+}
+
+fn examples<'a>(names: impl IntoIterator<Item = &'a String>) -> (usize, String) {
+    let all: Vec<&String> = names.into_iter().collect();
+    let shown: Vec<&str> = all
+        .iter()
+        .take(EXAMPLES_SHOWN)
+        .map(|s| s.as_str())
+        .collect();
+    let more = all.len().saturating_sub(EXAMPLES_SHOWN);
+    let tail = if more > 0 {
+        format!(" (+{more} more)")
+    } else {
+        String::new()
+    };
+    (all.len(), format!("{shown:?}{tail}"))
 }
 
 impl Learner {
@@ -450,6 +867,7 @@ impl Learner {
         Ok(Self {
             config,
             runs: Vec::new(),
+            extents: Vec::new(),
             events_by_kind: BTreeMap::new(),
             participants: BTreeMap::new(),
             writers: BTreeMap::new(),
@@ -459,6 +877,7 @@ impl Learner {
             raw: BTreeMap::new(),
             motion: BTreeMap::new(),
             referenced_guids: BTreeMap::new(),
+            overflow: BTreeMap::new(),
             anomalies_total: 0,
             anomalies: Vec::new(),
         })
@@ -476,6 +895,7 @@ impl Learner {
             events: 0,
             capture: None,
         });
+        self.extents.push(Extent::default());
     }
 
     fn current_run(&mut self) -> usize {
@@ -488,14 +908,21 @@ impl Learner {
     /// Observe one event at the next ordinal position of the current run.
     pub fn observe(&mut self, event: &RobotEvent) {
         let run = self.current_run();
-        let pos = self.runs[run].events + 1;
-        self.observe_at(event, pos);
+        let pos = self.runs[run].events.saturating_add(1);
+        self.observe_at_time(event, pos, None);
     }
 
     /// Observe one event at an explicit position (e.g. JSONL line number).
     pub fn observe_at(&mut self, event: &RobotEvent, position: u64) {
+        self.observe_at_time(event, position, None);
+    }
+
+    /// Observe one event at an explicit position with an optional capture
+    /// timestamp (used for minimum-duration checks).
+    pub fn observe_at_time(&mut self, event: &RobotEvent, position: u64, ts: Option<Duration>) {
         let run = self.current_run();
-        self.runs[run].events += 1;
+        self.runs[run].events = self.runs[run].events.saturating_add(1);
+        self.extents[run].update(position, ts);
         let at = SeenAt { run, position };
         let kind = match event {
             RobotEvent::Ros2ParticipantDiscovered(_) => "ros2_participant_discovered",
@@ -504,34 +931,42 @@ impl Learner {
             RobotEvent::MotionCommand(_) => "motion_command",
             RobotEvent::MotionFeedback(_) => "motion_feedback",
         };
-        *self.events_by_kind.entry(kind.into()).or_insert(0) += 1;
+        let n = self.events_by_kind.entry(kind.into()).or_insert(0);
+        *n = n.saturating_add(1);
+        let lim = self.config.limits.clone();
 
         match event {
             RobotEvent::Ros2ParticipantDiscovered(p) => {
-                self.check_guid(&p.guid_prefix, at);
-                let acc = self.participants.entry(p.guid_prefix.clone()).or_default();
+                if !self.check_guid(&p.guid_prefix, at) {
+                    return;
+                }
+                let Some(acc) = admit(&mut self.participants, &p.guid_prefix, lim.max_participants)
+                else {
+                    self.overflowed(at, "participants", &p.guid_prefix);
+                    return;
+                };
                 touch(&mut acc.span, at);
-                acc.src_ips.insert(p.src_ip.clone());
+                acc.runs.entry(run).or_default().update(position, ts);
+                if !insert_capped(&mut acc.src_ips, &p.src_ip, lim.max_set_entries) {
+                    self.overflowed(at, "participant_src_ips", &p.guid_prefix);
+                }
             }
             RobotEvent::Ros2WriterDiscovered(e) | RobotEvent::Ros2ReaderDiscovered(e) => {
                 let is_writer = matches!(event, RobotEvent::Ros2WriterDiscovered(_));
                 if e.topic.is_empty() {
-                    self.anomaly(
-                        at,
-                        "empty_topic",
-                        &e.guid_prefix,
-                        "endpoint with empty topic",
-                    );
+                    let shown: String = e.guid_prefix.chars().take(64).collect();
+                    self.anomaly(at, "empty_topic", &shown, "endpoint with empty topic");
                     return;
                 }
                 let rn = e.ros_name();
                 let slot = ProfileSlot::of(&rn);
                 if !slot.is_valid() {
                     let shown: String = e.topic.chars().take(128).collect();
+                    let g: String = e.guid_prefix.chars().take(64).collect();
                     self.anomaly(
                         at,
                         "invalid_ros_name",
-                        &e.guid_prefix,
+                        &g,
                         format!(
                             "endpoint name {shown:?} is not a valid ROS name (whitespace or \
                              control characters); not learned"
@@ -539,42 +974,89 @@ impl Learner {
                     );
                     return;
                 }
-                self.check_guid(&e.guid_prefix, at);
+                if !self.check_guid(&e.guid_prefix, at) {
+                    return;
+                }
                 self.reference(&e.guid_prefix, at);
-                let guid = e.guid_prefix.clone();
+                let guid = e.guid_prefix.as_str();
                 let client = is_client_side(&rn.kind, is_writer);
-                let (map, side_a) = match &slot {
+                let mut dropped: Vec<&'static str> = Vec::new();
+                match &slot {
                     ProfileSlot::Topic(topic) => {
-                        let map = if is_writer {
-                            &mut self.writers
+                        let (map, cat) = if is_writer {
+                            (&mut self.writers, "writer_topics")
                         } else {
-                            &mut self.readers
+                            (&mut self.readers, "reader_topics")
                         };
-                        let acc = map.entry(topic.clone()).or_default();
-                        touch(&mut acc.span, at);
-                        acc.participants.insert(guid);
-                        if !e.type_name.is_empty() {
-                            acc.type_names.insert(e.type_name.clone());
+                        match admit(map, topic, lim.max_names) {
+                            None => dropped.push(cat),
+                            Some(acc) => {
+                                touch(&mut acc.span, at);
+                                if !insert_capped(&mut acc.participants, guid, lim.max_set_entries)
+                                {
+                                    dropped.push("topic_participants");
+                                }
+                                if !e.type_name.is_empty()
+                                    && !insert_capped(
+                                        &mut acc.type_names,
+                                        &e.type_name,
+                                        lim.max_set_entries,
+                                    )
+                                {
+                                    dropped.push("type_names");
+                                }
+                            }
                         }
-                        return;
                     }
-                    ProfileSlot::Service(_) => (&mut self.services, client == Some(true)),
-                    ProfileSlot::Action(_) => (&mut self.actions, client == Some(true)),
-                    ProfileSlot::Raw(_) => (&mut self.raw, is_writer),
-                };
-                let acc = map.entry(slot.name().to_string()).or_default();
-                touch(&mut acc.span, at);
-                if side_a {
-                    acc.side_a.insert(guid);
-                } else {
-                    acc.side_b.insert(guid);
+                    _ => {
+                        let (map, cat, side_a) = match &slot {
+                            ProfileSlot::Service(_) => {
+                                (&mut self.services, "services", client == Some(true))
+                            }
+                            ProfileSlot::Action(_) => {
+                                (&mut self.actions, "actions", client == Some(true))
+                            }
+                            _ => (&mut self.raw, "raw_dds_topics", is_writer),
+                        };
+                        match admit(map, slot.name(), lim.max_names) {
+                            None => dropped.push(cat),
+                            Some(acc) => {
+                                touch(&mut acc.span, at);
+                                let side = if side_a {
+                                    &mut acc.side_a
+                                } else {
+                                    &mut acc.side_b
+                                };
+                                let mut ok = insert_capped(side, guid, lim.max_set_entries);
+                                if is_writer {
+                                    ok &= insert_capped(
+                                        &mut acc.writer_guids,
+                                        guid,
+                                        lim.max_set_entries,
+                                    );
+                                }
+                                if !ok {
+                                    dropped.push("name_participants");
+                                }
+                                if let RosNameKind::ActionPart { component, .. } = &rn.kind {
+                                    // A fixed, small set of component names.
+                                    acc.components.insert(component.as_str().to_string());
+                                }
+                                if !e.type_name.is_empty()
+                                    && !insert_capped(
+                                        &mut acc.type_names,
+                                        &e.type_name,
+                                        lim.max_set_entries,
+                                    )
+                                {
+                                    dropped.push("type_names");
+                                }
+                            }
+                        }
+                    }
                 }
-                acc.written |= is_writer;
-                if let RosNameKind::ActionPart { component, .. } = &rn.kind {
-                    acc.components.insert(component.as_str().to_string());
-                }
-                if !e.type_name.is_empty() {
-                    acc.type_names.insert(e.type_name.clone());
+                for cat in dropped {
+                    self.overflowed(at, cat, slot.name());
                 }
             }
             RobotEvent::MotionCommand(c) => {
@@ -583,18 +1065,34 @@ impl Learner {
                     return;
                 }
                 if let Some(g) = &c.source_guid {
-                    self.check_guid(g, at);
+                    if !self.check_guid(g, at) {
+                        // Not attributable to any participant: never learned.
+                        return;
+                    }
                     self.reference(g, at);
                 }
                 let linear = self.speed_sample(at, &c.channel, "linear", c.linear_speed);
                 let joint = self.speed_sample(at, &c.channel, "joint", c.joint_speed);
-                let acc = self.motion.entry(c.channel.clone()).or_default();
+                let Some(acc) = admit(&mut self.motion, &c.channel, lim.max_motion_channels) else {
+                    self.overflowed(at, "motion_channels", &c.channel);
+                    return;
+                };
                 touch(&mut acc.span, at);
-                if let Some(g) = &c.source_guid {
-                    acc.sources.insert(g.clone());
+                let Some(idx) = acc.source_index(&c.source_guid, lim.max_set_entries) else {
+                    self.overflowed(at, "motion_sources", &c.channel);
+                    return;
+                };
+                let st = &mut acc.stats[idx];
+                st.commands = st.commands.saturating_add(1);
+                let tag = idx as u32;
+                if let Some(v) = linear {
+                    st.linear.record(v);
+                    acc.linear.push((v, tag), lim.max_samples);
                 }
-                acc.linear.extend(linear);
-                acc.joint.extend(joint);
+                if let Some(v) = joint {
+                    st.joint.record(v);
+                    acc.joint.push((v, tag), lim.max_samples);
+                }
             }
             // Feedback is consumed by robodr-motion's consistency monitor; it
             // carries nothing the allowlist profile learns.
@@ -603,14 +1101,16 @@ impl Learner {
     }
 
     /// Learn everything from a source as one new run. Strict: stops at and
-    /// returns the first input error (events before it remain learned).
+    /// returns the first input error. Events before the error remain
+    /// learned in this learner; callers that need all-or-nothing (the CLI
+    /// does) must discard the learner on error.
     pub fn ingest(&mut self, src: &mut dyn EventSource) -> Result<u64, InputError> {
         self.start_run(src.label().to_string());
-        let mut n = 0;
+        let mut n: u64 = 0;
         while let Some(r) = src.next_event() {
             let se = r?;
-            self.observe_at(&se.event, se.position);
-            n += 1;
+            self.observe_at_time(&se.event, se.position, se.ts);
+            n = n.saturating_add(1);
         }
         let run = self.runs.len() - 1;
         self.runs[run].capture = src.capture_diagnostics();
@@ -619,62 +1119,115 @@ impl Learner {
 
     /// Union another learner's observations into this one (multi-mission
     /// commissioning). `other`'s runs are appended after ours; this learner's
-    /// configuration (margin, ceilings, model) is kept. Because the profile
-    /// depends only on sets and maxima, `a.merge(b)` and `b.merge(a)` yield
-    /// the same profile.
+    /// configuration (margin, caps, gate, model) is kept, and its limits
+    /// apply to the union. Below the caps, `a.merge(b)` and `b.merge(a)`
+    /// yield the same profile.
     pub fn merge(&mut self, other: &Learner) {
         let off = self.runs.len();
+        let lim = self.config.limits.clone();
+        let cap = lim.max_set_entries;
         self.runs.extend(other.runs.iter().cloned());
+        self.extents.extend(other.extents.iter().copied());
         for (k, v) in &other.events_by_kind {
-            *self.events_by_kind.entry(k.clone()).or_insert(0) += v;
+            let n = self.events_by_kind.entry(k.clone()).or_insert(0);
+            *n = n.saturating_add(*v);
         }
-        let merge_span = |dst: &mut Option<Span>, src: &Option<Span>| {
-            if let Some(s) = src {
-                let s = s.shifted(off);
-                match dst {
-                    Some(d) => d.absorb(&s),
-                    None => *dst = Some(s),
-                }
-            }
-        };
+        let mut dropped: Vec<(&'static str, String, u64)> = Vec::new();
         for (g, p) in &other.participants {
-            let acc = self.participants.entry(g.clone()).or_default();
-            merge_span(&mut acc.span, &p.span);
-            acc.src_ips.extend(p.src_ips.iter().cloned());
+            let Some(acc) = admit(&mut self.participants, g, lim.max_participants) else {
+                dropped.push(("participants", g.clone(), 1));
+                continue;
+            };
+            merge_span(&mut acc.span, &p.span, off);
+            let d = extend_capped(&mut acc.src_ips, &p.src_ips, cap);
+            if d > 0 {
+                dropped.push(("participant_src_ips", g.clone(), d));
+            }
+            for (r, e) in &p.runs {
+                acc.runs.entry(r + off).or_default().absorb(e);
+            }
         }
-        for (mine, theirs) in [
-            (&mut self.writers, &other.writers),
-            (&mut self.readers, &other.readers),
+        for (mine, theirs, cat) in [
+            (&mut self.writers, &other.writers, "writer_topics"),
+            (&mut self.readers, &other.readers, "reader_topics"),
         ] {
             for (t, e) in theirs {
-                let acc = mine.entry(t.clone()).or_default();
-                merge_span(&mut acc.span, &e.span);
-                acc.participants.extend(e.participants.iter().cloned());
-                acc.type_names.extend(e.type_names.iter().cloned());
+                let Some(acc) = admit(mine, t, lim.max_names) else {
+                    dropped.push((cat, t.clone(), 1));
+                    continue;
+                };
+                merge_span(&mut acc.span, &e.span, off);
+                let d = extend_capped(&mut acc.participants, &e.participants, cap)
+                    + extend_capped(&mut acc.type_names, &e.type_names, cap);
+                if d > 0 {
+                    dropped.push(("topic_participants", t.clone(), d));
+                }
             }
         }
-        for (mine, theirs) in [
-            (&mut self.services, &other.services),
-            (&mut self.actions, &other.actions),
-            (&mut self.raw, &other.raw),
+        for (mine, theirs, cat) in [
+            (&mut self.services, &other.services, "services"),
+            (&mut self.actions, &other.actions, "actions"),
+            (&mut self.raw, &other.raw, "raw_dds_topics"),
         ] {
             for (n, a) in theirs {
-                mine.entry(n.clone()).or_default().absorb(a, off);
+                let Some(acc) = admit(mine, n, lim.max_names) else {
+                    dropped.push((cat, n.clone(), 1));
+                    continue;
+                };
+                merge_span(&mut acc.span, &a.span, off);
+                let d = extend_capped(&mut acc.side_a, &a.side_a, cap)
+                    + extend_capped(&mut acc.side_b, &a.side_b, cap)
+                    + extend_capped(&mut acc.writer_guids, &a.writer_guids, cap)
+                    + extend_capped(&mut acc.type_names, &a.type_names, cap);
+                acc.components.extend(a.components.iter().cloned());
+                if d > 0 {
+                    dropped.push(("name_participants", n.clone(), d));
+                }
             }
         }
         for (c, m) in &other.motion {
-            let acc = self.motion.entry(c.clone()).or_default();
-            merge_span(&mut acc.span, &m.span);
-            acc.sources.extend(m.sources.iter().cloned());
-            acc.linear.extend_from_slice(&m.linear);
-            acc.joint.extend_from_slice(&m.joint);
+            let Some(acc) = admit(&mut self.motion, c, lim.max_motion_channels) else {
+                dropped.push(("motion_channels", c.clone(), 1));
+                continue;
+            };
+            merge_span(&mut acc.span, &m.span, off);
+            let mut map: Vec<Option<usize>> = Vec::with_capacity(m.sources.len());
+            for (i, src) in m.sources.iter().enumerate() {
+                let idx = acc.source_index(src, cap);
+                if let Some(j) = idx {
+                    let st = &mut acc.stats[j];
+                    st.commands = st.commands.saturating_add(m.stats[i].commands);
+                    st.linear.absorb(&m.stats[i].linear);
+                    st.joint.absorb(&m.stats[i].joint);
+                } else {
+                    dropped.push(("motion_sources", c.clone(), 1));
+                }
+                map.push(idx);
+            }
+            for &(v, tag) in m.linear.retained() {
+                if let Some(Some(j)) = map.get(tag as usize) {
+                    acc.linear.push((v, *j as u32), lim.max_samples);
+                }
+            }
+            for &(v, tag) in m.joint.retained() {
+                if let Some(Some(j)) = map.get(tag as usize) {
+                    acc.joint.push((v, *j as u32), lim.max_samples);
+                }
+            }
         }
         for (g, at) in &other.referenced_guids {
             let at = shift(*at, off);
-            self.referenced_guids
-                .entry(g.clone())
-                .and_modify(|a| *a = (*a).min(at))
-                .or_insert(at);
+            if let Some(a) = self.referenced_guids.get_mut(g) {
+                *a = (*a).min(at);
+            } else if self.referenced_guids.len() < lim.max_participants {
+                self.referenced_guids.insert(g.clone(), at);
+            } else {
+                dropped.push(("referenced_guids", g.clone(), 1));
+            }
+        }
+        for (k, v) in &other.overflow {
+            let n = self.overflow.entry(k.clone()).or_insert(0);
+            *n = n.saturating_add(*v);
         }
         self.anomalies_total = self.anomalies_total.saturating_add(other.anomalies_total);
         for a in &other.anomalies {
@@ -685,13 +1238,37 @@ impl Learner {
             a.at = shift(a.at, off);
             self.anomalies.push(a);
         }
+        let at = SeenAt {
+            run: off,
+            position: 0,
+        };
+        for (cat, subject, n) in dropped {
+            for _ in 0..n {
+                self.overflowed(at, cat, &subject);
+            }
+        }
     }
 
     fn reference(&mut self, guid: &str, at: SeenAt) {
-        self.referenced_guids
-            .entry(guid.to_string())
-            .and_modify(|a| *a = (*a).min(at))
-            .or_insert(at);
+        if let Some(a) = self.referenced_guids.get_mut(guid) {
+            *a = (*a).min(at);
+        } else if self.referenced_guids.len() < self.config.limits.max_participants {
+            self.referenced_guids.insert(guid.to_string(), at);
+        } else {
+            self.overflowed(at, "referenced_guids", guid);
+        }
+    }
+
+    fn overflowed(&mut self, at: SeenAt, category: &'static str, subject: &str) {
+        let n = self.overflow.entry(category.to_string()).or_insert(0);
+        *n = n.saturating_add(1);
+        let shown: String = subject.chars().take(128).collect();
+        self.anomaly(
+            at,
+            "capacity_exceeded",
+            &shown,
+            format!("{category} cap reached; entry not learned"),
+        );
     }
 
     fn anomaly(&mut self, at: SeenAt, kind: &str, subject: &str, detail: impl Into<String>) {
@@ -706,20 +1283,20 @@ impl Learner {
         }
     }
 
-    fn check_guid(&mut self, guid: &str, at: SeenAt) {
-        let ok = guid.len() == 24
-            && guid
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-        if !ok {
-            let shown: String = guid.chars().take(64).collect();
-            self.anomaly(
-                at,
-                "malformed_guid_prefix",
-                &shown,
-                "GUID prefix is not 24 lower-case hex chars; profile matching is exact",
-            );
+    /// `true` if `guid` is a well-formed GUID prefix; records an anomaly if
+    /// not (malformed GUIDs never feed the profile).
+    fn check_guid(&mut self, guid: &str, at: SeenAt) -> bool {
+        if is_guid_prefix(guid) {
+            return true;
         }
+        let shown: String = guid.chars().take(64).collect();
+        self.anomaly(
+            at,
+            "malformed_guid_prefix",
+            &shown,
+            "GUID prefix is not 24 lower-case hex chars; not learned",
+        );
+        false
     }
 
     /// Validate one speed; returns it if usable, records an anomaly if not.
@@ -731,11 +1308,12 @@ impl Learner {
         v: Option<f64>,
     ) -> Option<f64> {
         let v = v?;
+        let shown: String = channel.chars().take(128).collect();
         if !v.is_finite() {
             self.anomaly(
                 at,
                 &format!("non_finite_{dim}_speed"),
-                channel,
+                &shown,
                 format!("{dim} speed {v} ignored"),
             );
             return None;
@@ -744,7 +1322,7 @@ impl Learner {
             self.anomaly(
                 at,
                 &format!("negative_{dim}_speed"),
-                channel,
+                &shown,
                 format!("{dim} speed {v} ignored (speeds are absolute values)"),
             );
             return None;
@@ -753,31 +1331,202 @@ impl Learner {
         Some(if v == 0.0 { 0.0 } else { v })
     }
 
-    fn dim_bound(&self, samples: &[f64], ceiling: Option<f64>) -> Option<(f64, f64, bool)> {
-        let max = samples
-            .iter()
-            .copied()
-            .fold(None, |m: Option<f64>, v| Some(m.map_or(v, |m| m.max(v))))?;
-        let (bound, capped) = envelope_bound(max, self.config.margin, ceiling);
-        Some((max, bound, capped))
+    // ------------------------------------------------------------ gate ---
+
+    fn assess(&self) -> BTreeMap<String, Assessment> {
+        let c = &self.config;
+        // Runs that carry participant announcements at all (a motion-only
+        // JSONL run says nothing about who was present).
+        let discovery_runs: BTreeSet<usize> = self
+            .participants
+            .values()
+            .flat_map(|p| p.runs.keys().copied())
+            .collect();
+        let mut out = BTreeMap::new();
+        for (g, acc) in &self.participants {
+            let Some(span) = &acc.span else { continue };
+            let mut quarantine = Vec::new();
+            let mut flags: Vec<(&'static str, String)> = Vec::new();
+            if span.count < c.min_participant_announcements {
+                quarantine.push(format!(
+                    "announced {} time(s) (< {} required)",
+                    span.count, c.min_participant_announcements
+                ));
+            }
+            // Duration: only where the run has timestamps and is long
+            // enough for anyone to meet the minimum.
+            let mut observed: Option<Duration> = None;
+            let mut duration_applicable = false;
+            let mut max_frac_presence: f64 = 0.0;
+            let mut min_first_frac: f64 = 1.0;
+            for (r, e) in &acc.runs {
+                let run = self.extents.get(*r).copied().unwrap_or_default();
+                if let Some(d) = e.duration() {
+                    observed = Some(observed.map_or(d, |o| o.max(d)));
+                }
+                if let Some(rd) = run.duration() {
+                    if !c.min_participant_duration.is_zero() && rd >= c.min_participant_duration {
+                        duration_applicable = true;
+                    }
+                }
+                let rs = run.pos_span();
+                let (presence, first) = if rs == 0 {
+                    (1.0, 0.0)
+                } else {
+                    let rmin = run.min_pos.unwrap_or(0);
+                    let f = e.min_pos.unwrap_or(rmin).saturating_sub(rmin) as f64 / rs as f64;
+                    (e.pos_span() as f64 / rs as f64, f)
+                };
+                max_frac_presence = max_frac_presence.max(presence);
+                min_first_frac = min_first_frac.min(first);
+            }
+            if duration_applicable && observed.unwrap_or_default() < c.min_participant_duration {
+                quarantine.push(format!(
+                    "observed for {:.1}s (< {:.1}s required)",
+                    observed.unwrap_or_default().as_secs_f64(),
+                    c.min_participant_duration.as_secs_f64()
+                ));
+            }
+            if min_first_frac > c.late_fraction {
+                flags.push((
+                    "participant_late",
+                    format!(
+                        "first seen {:.0}% into the run (after {:.0}%); joined late: confirm it is \
+                         part of the robot, not a tool or intruder",
+                        100.0 * min_first_frac,
+                        100.0 * c.late_fraction
+                    ),
+                ));
+            }
+            if max_frac_presence < c.brief_fraction {
+                flags.push((
+                    "participant_brief",
+                    format!(
+                        "present for only {:.0}% of the run (< {:.0}%): transient tool, laptop or \
+                         intruder?",
+                        100.0 * max_frac_presence,
+                        100.0 * c.brief_fraction
+                    ),
+                ));
+            }
+            if acc.src_ips.len() > 1 {
+                flags.push((
+                    "participant_multiple_ips",
+                    format!(
+                        "announced from {} source IPs {:?}: GUID spoofing or a multi-homed host",
+                        acc.src_ips.len(),
+                        acc.src_ips
+                    ),
+                ));
+            }
+            if discovery_runs.len() > 1 && acc.runs.len() < discovery_runs.len() {
+                flags.push((
+                    "participant_not_in_every_run",
+                    format!(
+                        "seen in {} of {} runs with discovery",
+                        acc.runs.len(),
+                        discovery_runs.len()
+                    ),
+                ));
+            }
+            let status = if quarantine.is_empty() {
+                ParticipantStatus::Accepted
+            } else if c.accept_participants.contains(g) {
+                flags.push((
+                    "participant_operator_accepted",
+                    format!(
+                        "accepted by operator override despite quarantine: {}",
+                        quarantine.join("; ")
+                    ),
+                ));
+                ParticipantStatus::OperatorAccepted
+            } else {
+                ParticipantStatus::Quarantined
+            };
+            out.insert(
+                g.clone(),
+                Assessment {
+                    status,
+                    quarantine,
+                    flags,
+                    observed,
+                    runs_seen: acc.runs.len(),
+                },
+            );
+        }
+        out
     }
 
-    /// The draft profile (`locked: false`).
-    pub fn profile(&self) -> Profile {
+    fn accepted_set(assessed: &BTreeMap<String, Assessment>) -> BTreeSet<&str> {
+        assessed
+            .iter()
+            .filter(|(_, a)| a.accepted())
+            .map(|(g, _)| g.as_str())
+            .collect()
+    }
+
+    /// Is `src` a source whose samples may shape an envelope?
+    fn source_accepted(src: &Option<String>, accepted: &BTreeSet<&str>) -> bool {
+        match src {
+            None => true,
+            Some(g) => accepted.contains(g.as_str()),
+        }
+    }
+
+    fn role_learned(&self, a: &RoleAcc, accepted: &BTreeSet<&str>) -> bool {
+        let any = |s: &BTreeSet<String>| s.iter().any(|g| accepted.contains(g.as_str()));
+        any(&a.writer_guids) || (self.config.learn_readers && (any(&a.side_a) || any(&a.side_b)))
+    }
+
+    /// Accepted per-dimension stats of a channel: `(linear, joint, commands)`.
+    fn accepted_motion(m: &MotionAcc, accepted: &BTreeSet<&str>) -> (DimStat, DimStat, u64) {
+        let (mut l, mut j, mut n) = (DimStat::default(), DimStat::default(), 0u64);
+        for (src, st) in m.sources.iter().zip(&m.stats) {
+            if Self::source_accepted(src, accepted) {
+                l.absorb(&st.linear);
+                j.absorb(&st.joint);
+                n = n.saturating_add(st.commands);
+            }
+        }
+        (l, j, n)
+    }
+
+    fn dim_bound(&self, d: &DimStat, joint: bool) -> Option<(f64, f64, bool)> {
+        if d.n == 0 {
+            return None;
+        }
+        let cap = self.config.effective_cap(joint);
+        let (bound, capped) = envelope_bound(d.max, self.config.margin, Some(cap));
+        Some((d.max, bound, capped))
+    }
+
+    fn build_profile(&self, assessed: &BTreeMap<String, Assessment>) -> Profile {
+        let accepted = Self::accepted_set(assessed);
         let mut p = Profile {
             model: self.config.model.clone(),
             locked: false,
             ..Default::default()
         };
-        p.participants = self.participants.keys().cloned().collect();
-        p.writer_topics = self.writers.keys().cloned().collect();
-        let all = self.config.learn_readers;
-        if all {
-            p.reader_topics = self.readers.keys().cloned().collect();
+        p.participants = accepted.iter().map(|g| g.to_string()).collect();
+        let topic_learned =
+            |e: &EndpointAcc| e.participants.iter().any(|g| accepted.contains(g.as_str()));
+        p.writer_topics = self
+            .writers
+            .iter()
+            .filter(|(_, e)| topic_learned(e))
+            .map(|(t, _)| t.clone())
+            .collect();
+        if self.config.learn_readers {
+            p.reader_topics = self
+                .readers
+                .iter()
+                .filter(|(_, e)| topic_learned(e))
+                .map(|(t, _)| t.clone())
+                .collect();
         }
         let learned = |m: &BTreeMap<String, RoleAcc>| -> BTreeSet<String> {
             m.iter()
-                .filter(|(_, a)| a.written || all)
+                .filter(|(_, a)| self.role_learned(a, &accepted))
                 .map(|(n, _)| n.clone())
                 .collect()
         };
@@ -785,22 +1534,175 @@ impl Learner {
         p.actions = learned(&self.actions);
         p.raw_dds_topics = learned(&self.raw);
         for (ch, m) in &self.motion {
+            let (l, j, n) = Self::accepted_motion(m, &accepted);
+            if n == 0 {
+                continue; // only excluded sources: channel not learned
+            }
             let env = Envelope {
-                max_linear_speed: self
-                    .dim_bound(&m.linear, self.config.ceiling_linear)
-                    .map(|t| t.1),
-                max_joint_speed: self
-                    .dim_bound(&m.joint, self.config.ceiling_joint)
-                    .map(|t| t.1),
+                max_linear_speed: self.dim_bound(&l, false).map(|t| t.1),
+                max_joint_speed: self.dim_bound(&j, true).map(|t| t.1),
             };
             p.motion_envelopes.insert(ch.clone(), env);
         }
         p
     }
 
+    /// The draft profile (`locked: false`).
+    pub fn profile(&self) -> Profile {
+        self.build_profile(&self.assess())
+    }
+
+    /// Topics whose writers need sign-off: learned motion channels,
+    /// configured motion topics and the name heuristic.
+    fn motion_topic(&self, profile: &Profile, t: &str) -> bool {
+        profile.motion_envelopes.contains_key(t)
+            || self.config.motion_topics.contains(t)
+            || is_motion_like(t)
+    }
+
+    fn signoff_items(
+        &self,
+        profile: &Profile,
+        assessed: &BTreeMap<String, Assessment>,
+    ) -> Vec<SignoffItem> {
+        let accepted = Self::accepted_set(assessed);
+        let mut items = Vec::new();
+        for (g, a) in assessed {
+            if !a.accepted() {
+                continue;
+            }
+            for (kind, reason) in &a.flags {
+                items.push(SignoffItem::new(kind, g, reason.clone()));
+            }
+        }
+        // Motion writers: topic writers on motion topics...
+        for t in &profile.writer_topics {
+            if !self.motion_topic(profile, t) {
+                continue;
+            }
+            if let Some(e) = self.writers.get(t) {
+                for g in e
+                    .participants
+                    .iter()
+                    .filter(|g| accepted.contains(g.as_str()))
+                {
+                    items.push(SignoffItem::new(
+                        "motion_writer",
+                        &format!("{t} {g}"),
+                        format!(
+                            "participant {g} may publish motion topic {t} once locked: confirm \
+                             it is the robot's own controller/planner"
+                        ),
+                    ));
+                }
+            }
+        }
+        // ... and senders of motion commands that shaped an envelope.
+        for (ch, m) in &self.motion {
+            if !profile.motion_envelopes.contains_key(ch) {
+                continue;
+            }
+            for (src, st) in m.sources.iter().zip(&m.stats) {
+                match src {
+                    Some(g) if accepted.contains(g.as_str()) => items.push(SignoffItem::new(
+                        "motion_writer",
+                        &format!("{ch} {g}"),
+                        format!(
+                            "participant {g} sent {} motion command(s) on {ch} that shaped its \
+                             envelope",
+                            st.commands
+                        ),
+                    )),
+                    None => items.push(SignoffItem::new(
+                        "motion_unattributed",
+                        ch,
+                        format!(
+                            "{} motion command(s) on {ch} carried no source and still shaped the \
+                             envelope: confirm the recording came from the robot's own stack",
+                            st.commands
+                        ),
+                    )),
+                    Some(_) => {}
+                }
+            }
+            let (l, j, _) = Self::accepted_motion(m, &accepted);
+            for (dim, d, joint) in [("linear", l, false), ("joint", j, true)] {
+                if d.n > 0 && d.n < self.config.min_samples {
+                    items.push(SignoffItem::new(
+                        "few_motion_samples",
+                        &format!("{ch} {dim}"),
+                        format!(
+                            "{ch} {dim} envelope rests on {} sample(s) (< {}): confirm the \
+                             bound or record a longer run",
+                            d.n, self.config.min_samples
+                        ),
+                    ));
+                }
+                if d.n > 0 && d.max > self.config.effective_cap(joint) {
+                    items.push(SignoffItem::new(
+                        "observed_exceeds_cap",
+                        &format!("{ch} {dim}"),
+                        format!(
+                            "{ch}: observed {dim} max {} exceeds the cap {}; envelope held at \
+                             the cap, the clean run itself will deviate",
+                            d.max,
+                            self.config.effective_cap(joint)
+                        ),
+                    ));
+                }
+            }
+        }
+        for (cat, n) in &self.overflow {
+            items.push(SignoffItem::new(
+                "capacity_exceeded",
+                cat,
+                format!(
+                    "{n} {cat} entr(ies) dropped at the cap: a flood during commissioning is \
+                     not a clean run; re-commission unless explained"
+                ),
+            ));
+        }
+        if self.anomalies_total > 0 {
+            items.push(SignoffItem::new(
+                "anomalies_present",
+                "run",
+                format!(
+                    "{} anomalies in what should be a clean run",
+                    self.anomalies_total
+                ),
+            ));
+        }
+        items
+    }
+
     /// The commissioning report.
     pub fn report(&self) -> CommissioningReport {
-        let profile = self.profile();
+        let assessed = self.assess();
+        let profile = self.build_profile(&assessed);
+        let signoff = Signoff::new(&profile, self.signoff_items(&profile, &assessed));
+        self.build_report(&assessed, &profile, &signoff)
+    }
+
+    /// Profile, report and sign-off list together.
+    pub fn finish(&self) -> Commissioning {
+        let assessed = self.assess();
+        let profile = self.build_profile(&assessed);
+        let signoff = Signoff::new(&profile, self.signoff_items(&profile, &assessed));
+        let report = self.build_report(&assessed, &profile, &signoff);
+        Commissioning {
+            profile,
+            report,
+            signoff,
+        }
+    }
+
+    fn build_report(
+        &self,
+        assessed: &BTreeMap<String, Assessment>,
+        profile: &Profile,
+        signoff: &Signoff,
+    ) -> CommissioningReport {
+        let accepted = Self::accepted_set(assessed);
         let mut warnings = Vec::new();
         let mut warn = |level: WarningLevel, code: &str, subject: &str, message: String| {
             warnings.push(Warning {
@@ -840,11 +1742,31 @@ impl Learner {
                 ),
             );
         }
+        for (cat, n) in &self.overflow {
+            warn(
+                Warn,
+                "capacity_exceeded",
+                cat,
+                format!("{n} {cat} entr(ies) dropped at the configured cap (flood?)"),
+            );
+        }
+
+        // Reverse index participant -> topics, built once.
+        let mut writes: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+        let mut reads: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+        for (idx, m) in [(&mut writes, &self.writers), (&mut reads, &self.readers)] {
+            for (t, e) in m {
+                for g in &e.participants {
+                    idx.entry(g.as_str()).or_default().insert(t.clone());
+                }
+            }
+        }
 
         // Participants.
         let mut participants = BTreeMap::new();
         for (g, acc) in &self.participants {
             let Some(span) = &acc.span else { continue };
+            let Some(a) = assessed.get(g) else { continue };
             if span.count == 1 {
                 warn(
                     Warn,
@@ -856,12 +1778,24 @@ impl Learner {
                     ),
                 );
             }
-            let topics_of = |m: &BTreeMap<String, EndpointAcc>| -> BTreeSet<String> {
-                m.iter()
-                    .filter(|(_, e)| e.participants.contains(g))
-                    .map(|(t, _)| t.clone())
-                    .collect()
-            };
+            if a.status == ParticipantStatus::Quarantined {
+                warn(
+                    Warn,
+                    "quarantined_participant",
+                    g,
+                    format!(
+                        "participant {g} NOT learned ({}); nor are its endpoints and motion \
+                         samples. If it belongs on the robot, re-run learn with \
+                         --accept-participant {g}",
+                        a.quarantine.join("; ")
+                    ),
+                );
+            }
+            for (kind, reason) in &a.flags {
+                if a.accepted() {
+                    warn(Warn, kind, g, format!("participant {g}: {reason}"));
+                }
+            }
             participants.insert(
                 g.clone(),
                 ParticipantReport {
@@ -869,10 +1803,29 @@ impl Learner {
                     first_seen: span.first,
                     last_seen: span.last,
                     src_ips: acc.src_ips.clone(),
-                    writer_topics: topics_of(&self.writers),
-                    reader_topics: topics_of(&self.readers),
+                    writer_topics: writes.get(g.as_str()).cloned().unwrap_or_default(),
+                    reader_topics: reads.get(g.as_str()).cloned().unwrap_or_default(),
+                    status: a.status,
+                    quarantine_reasons: a.quarantine.clone(),
+                    flags: a.flags.iter().map(|(k, _)| k.to_string()).collect(),
+                    runs_seen: a.runs_seen,
+                    observed_ms: a
+                        .observed
+                        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
                 },
             );
+        }
+        for g in &self.config.accept_participants {
+            if !self.participants.contains_key(g) {
+                warn(
+                    Warn,
+                    "accepted_participant_not_seen",
+                    g,
+                    format!(
+                        "--accept-participant {g} given but it never announced itself; not added"
+                    ),
+                );
+            }
         }
         for (g, at) in &self.referenced_guids {
             if !self.participants.contains_key(g) {
@@ -882,14 +1835,34 @@ impl Learner {
                     g,
                     format!(
                         "GUID {g} used by an endpoint or motion command (first at {at}) but never \
-                         announced as a participant; it is NOT in the profile"
+                         announced as a participant; neither it nor what it announced or \
+                         commanded is in the profile"
                     ),
                 );
             }
         }
+        // Run-level gate diagnostics.
+        for (i, e) in self.extents.iter().enumerate() {
+            if let Some(d) = e.duration() {
+                let min = self.config.min_participant_duration;
+                if !min.is_zero() && d < min && e.min_ts.is_some() {
+                    warn(
+                        Warn,
+                        "run_shorter_than_min_duration",
+                        &format!("run{i}"),
+                        format!(
+                            "run{i} spans {:.1}s of capture time, less than the {:.1}s minimum \
+                             participant duration: the duration check could not be applied",
+                            d.as_secs_f64(),
+                            min.as_secs_f64()
+                        ),
+                    );
+                }
+            }
+        }
 
         // Endpoints.
-        let endpoint_reports = |m: &BTreeMap<String, EndpointAcc>| {
+        let endpoint_reports = |m: &BTreeMap<String, EndpointAcc>, learned: bool| {
             m.iter()
                 .filter_map(|(t, e)| {
                     let s = e.span.as_ref()?;
@@ -901,16 +1874,35 @@ impl Learner {
                             last_seen: s.last,
                             participants: e.participants.clone(),
                             type_names: e.type_names.clone(),
+                            in_profile: learned
+                                && e.participants.iter().any(|g| accepted.contains(g.as_str())),
                         },
                     ))
                 })
                 .collect::<BTreeMap<_, _>>()
         };
-        let writer_topics = endpoint_reports(&self.writers);
-        let reader_topics = endpoint_reports(&self.readers);
-        for t in writer_topics.keys() {
+        let writer_topics = endpoint_reports(&self.writers, true);
+        let reader_topics = endpoint_reports(&self.readers, self.config.learn_readers);
+        let not_learned: Vec<&String> = writer_topics
+            .iter()
+            .filter(|(_, r)| !r.in_profile)
+            .map(|(t, _)| t)
+            .collect();
+        if !not_learned.is_empty() {
+            let (n, ex) = examples(not_learned);
+            warn(
+                Warn,
+                "endpoints_not_learned",
+                "writer_topics",
+                format!(
+                    "{n} writer topic(s) announced only by quarantined or unannounced \
+                     participants, NOT learned: {ex}"
+                ),
+            );
+        }
+        for (t, rep) in &writer_topics {
             // Nothing subscribes to /rosout on a robot without a log tool.
-            if !reader_topics.contains_key(t) && t != "/rosout" {
+            if rep.in_profile && !reader_topics.contains_key(t) && t != "/rosout" {
                 warn(
                     Info,
                     "writer_without_reader",
@@ -918,14 +1910,14 @@ impl Learner {
                     format!("writer on {t} but no reader seen anywhere (dead topic? exfil path?)"),
                 );
             }
-            if self.writers[t].type_names.len() > 1 {
+            if rep.type_names.len() > 1 {
                 warn(
                     Warn,
                     "topic_type_conflict",
                     t,
                     format!(
                         "writers on {t} announce several types: {:?}",
-                        self.writers[t].type_names
+                        rep.type_names
                     ),
                 );
             }
@@ -946,7 +1938,7 @@ impl Learner {
                             clients: a.side_a.clone(),
                             servers: a.side_b.clone(),
                             components: a.components.clone(),
-                            in_profile: a.written || all,
+                            in_profile: self.role_learned(a, &accepted),
                         },
                     ))
                 })
@@ -958,6 +1950,7 @@ impl Learner {
         for (n, a) in &self.raw {
             let Some(s) = &a.span else { continue };
             let ros_internal = ROS_INTERNAL_RAW_TOPICS.contains(&n.as_str());
+            let in_profile = self.role_learned(a, &accepted);
             raw_dds_topics.insert(
                 n.clone(),
                 RawTopicReport {
@@ -968,10 +1961,10 @@ impl Learner {
                     readers: a.side_b.clone(),
                     type_names: a.type_names.clone(),
                     ros_internal,
-                    in_profile: a.written || all,
+                    in_profile,
                 },
             );
-            if !ros_internal {
+            if !ros_internal && in_profile {
                 warn(
                     Info,
                     "raw_dds_topic",
@@ -988,9 +1981,10 @@ impl Learner {
             ("action", &self.actions),
             ("raw DDS topic", &self.raw),
         ] {
+            let mut gated = Vec::new();
             for (n, a) in m {
                 // Raw topics may legitimately have only subscribers.
-                if !a.written && !all && what != "raw DDS topic" {
+                if a.writer_guids.is_empty() && !all && what != "raw DDS topic" {
                     warn(
                         Warn,
                         "reader_only_name",
@@ -1001,7 +1995,21 @@ impl Learner {
                              probably incomplete"
                         ),
                     );
+                } else if !a.writer_guids.is_empty() && !self.role_learned(a, &accepted) {
+                    gated.push(n);
                 }
+            }
+            if !gated.is_empty() {
+                let (k, ex) = examples(gated);
+                warn(
+                    Warn,
+                    "endpoints_not_learned",
+                    what,
+                    format!(
+                        "{k} {what}(s) written only by quarantined or unannounced participants, \
+                         NOT learned: {ex}"
+                    ),
+                );
             }
         }
         // Parameter services: per node (service name prefix) and per ROS
@@ -1053,7 +2061,7 @@ impl Learner {
                 }
             }
         }
-        let reader_enforcement = all && !self.readers.is_empty();
+        let reader_enforcement = !profile.reader_topics.is_empty();
         if !all && !self.readers.is_empty() {
             warn(
                 Info,
@@ -1070,6 +2078,24 @@ impl Learner {
         for (i, r) in self.runs.iter().enumerate() {
             let Some(c) = &r.capture else { continue };
             let subject = format!("run{i}");
+            if c.frames == 0 {
+                warn(
+                    Warn,
+                    "empty_capture",
+                    &subject,
+                    format!("{}: the capture contains no frames", r.label),
+                );
+            } else if c.rtps_datagrams == 0 {
+                warn(
+                    Warn,
+                    "no_rtps_in_capture",
+                    &subject,
+                    format!(
+                        "{}: {} frame(s) but no RTPS traffic: wrong interface or filter?",
+                        r.label, c.frames
+                    ),
+                );
+            }
             if c.discovery_reassembly_failed() {
                 warn(
                     Warn,
@@ -1119,6 +2145,30 @@ impl Learner {
                     ),
                 );
             }
+            if c.unsupported_linktype_frames > 0 || c.malformed_frames > 0 {
+                warn(
+                    Warn,
+                    "undecodable_frames",
+                    &subject,
+                    format!(
+                        "{}: {} frame(s) with an unsupported link type and {} malformed \
+                         frame(s) were skipped",
+                        r.label, c.unsupported_linktype_frames, c.malformed_frames
+                    ),
+                );
+            }
+            if c.rtps_anomalies > 0 || c.not_rtps > 0 {
+                warn(
+                    Warn,
+                    "malformed_rtps",
+                    &subject,
+                    format!(
+                        "{}: {} datagram(s) on RTPS ports did not parse as RTPS and {} RTPS \
+                         parser anomalies: a clean bus has none",
+                        r.label, c.not_rtps, c.rtps_anomalies
+                    ),
+                );
+            }
             if c.secure_submessages > 0 {
                 warn(
                     Warn,
@@ -1137,6 +2187,44 @@ impl Learner {
         let mut motion_channels = BTreeMap::new();
         for (ch, m) in &self.motion {
             let Some(span) = &m.span else { continue };
+            let in_profile = profile.motion_envelopes.contains_key(ch);
+            let accepted_idx: BTreeSet<u32> = m
+                .sources
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| Self::source_accepted(s, &accepted))
+                .map(|(i, _)| i as u32)
+                .collect();
+            let excluded_sources: BTreeSet<String> = m
+                .sources
+                .iter()
+                .flatten()
+                .filter(|g| !accepted.contains(g.as_str()))
+                .cloned()
+                .collect();
+            let (l, j, cmds) = Self::accepted_motion(m, &accepted);
+            let excluded_commands = span.count.saturating_sub(cmds);
+            if !excluded_sources.is_empty() {
+                warn(
+                    Warn,
+                    "motion_samples_excluded",
+                    ch,
+                    format!(
+                        "{ch}: {excluded_commands} command(s) from quarantined or unannounced \
+                         source(s) {excluded_sources:?} did not shape the envelope"
+                    ),
+                );
+            }
+            if !in_profile {
+                warn(
+                    Warn,
+                    "motion_channel_not_learned",
+                    ch,
+                    format!(
+                        "{ch}: every command came from an excluded source; channel NOT learned"
+                    ),
+                );
+            }
             if ch.starts_with("rt/") {
                 warn(
                     Warn,
@@ -1158,32 +2246,29 @@ impl Learner {
                 .get(ch)
                 .cloned()
                 .unwrap_or_default();
-            let mut dims = [
-                (
-                    "linear",
-                    &m.linear,
-                    self.config.ceiling_linear,
-                    "m/s",
-                    false,
-                ),
-                ("joint", &m.joint, self.config.ceiling_joint, "rad/s", false),
-            ];
-            for d in dims.iter_mut() {
-                let (dim, samples, ceiling, unit, _) = *d;
-                let n = samples.len() as u64;
-                if n > 0 && n < self.config.min_samples {
+            let mut capped_flags = [false, false];
+            for (k, (dim, d, joint, unit)) in
+                [("linear", l, false, "m/s"), ("joint", j, true, "rad/s")]
+                    .into_iter()
+                    .enumerate()
+            {
+                if !in_profile {
+                    continue;
+                }
+                if d.n > 0 && d.n < self.config.min_samples {
                     warn(
                         Warn,
                         "few_motion_samples",
                         ch,
                         format!(
-                            "motion channel {ch} has {n} {dim} samples (< {}): envelope not trustworthy",
-                            self.config.min_samples
+                            "motion channel {ch} has {} {dim} samples (< {}): envelope not trustworthy",
+                            d.n, self.config.min_samples
                         ),
                     );
                 }
-                if let Some((max, bound, capped)) = self.dim_bound(samples, ceiling) {
-                    d.4 = capped;
+                if let Some((max, bound, capped)) = self.dim_bound(&d, joint) {
+                    capped_flags[k] = capped;
+                    let cap = self.config.effective_cap(joint);
                     if max == 0.0 {
                         warn(
                             Warn,
@@ -1194,29 +2279,32 @@ impl Learner {
                             ),
                         );
                     }
-                    if let Some(c) = ceiling {
-                        if max > c {
-                            warn(
-                                Warn,
-                                "observed_exceeds_ceiling",
-                                ch,
-                                format!(
-                                    "{ch}: observed {dim} max {max} {unit} exceeds OEM ceiling {c}; \
-                                     the clean run itself would deviate"
-                                ),
-                            );
-                        } else if capped {
-                            warn(
-                                Info,
-                                "margin_capped_by_ceiling",
-                                ch,
-                                format!("{ch}: {dim} envelope capped at OEM ceiling {c} {unit} (margin wanted {bound})"),
-                            );
-                        }
+                    if max > cap {
+                        warn(
+                            Warn,
+                            "observed_exceeds_ceiling",
+                            ch,
+                            format!(
+                                "{ch}: observed {dim} max {max} {unit} exceeds the cap {cap} \
+                                 (OEM ceiling or hard cap); envelope held at the cap, the clean \
+                                 run itself would deviate"
+                            ),
+                        );
+                    } else if capped {
+                        warn(
+                            Info,
+                            "margin_capped_by_ceiling",
+                            ch,
+                            format!(
+                                "{ch}: {dim} envelope capped at {cap} {unit} (margin wanted {})",
+                                envelope_bound(max, self.config.margin, None).0
+                            ),
+                        );
                     }
+                    let _ = bound;
                 }
             }
-            if m.linear.is_empty() && m.joint.is_empty() {
+            if in_profile && l.n == 0 && j.n == 0 {
                 warn(
                     Warn,
                     "motion_channel_without_envelope",
@@ -1224,18 +2312,30 @@ impl Learner {
                     format!("{ch}: no valid speed sample; envelope empty, lock will refuse"),
                 );
             }
+            let stats = |buf: &SampleBuffer<(f64, u32)>, d: &DimStat| {
+                let retained: Vec<f64> = buf
+                    .retained()
+                    .iter()
+                    .filter(|(_, t)| accepted_idx.contains(t))
+                    .map(|(v, _)| *v)
+                    .collect();
+                SpeedStats::from_parts(d.n, d.min, d.max, &retained, buf.is_decimated())
+            };
             motion_channels.insert(
                 ch.clone(),
                 MotionReport {
                     commands: span.count,
                     first_seen: span.first,
                     last_seen: span.last,
-                    sources: m.sources.clone(),
-                    linear: SpeedStats::from_samples(&m.linear),
-                    joint: SpeedStats::from_samples(&m.joint),
+                    sources: m.sources.iter().flatten().cloned().collect(),
+                    linear: stats(&m.linear, &l),
+                    joint: stats(&m.joint, &j),
                     envelope: env,
-                    linear_capped_by_ceiling: dims[0].4,
-                    joint_capped_by_ceiling: dims[1].4,
+                    linear_capped_by_ceiling: capped_flags[0],
+                    joint_capped_by_ceiling: capped_flags[1],
+                    in_profile,
+                    excluded_sources,
+                    excluded_commands,
                 },
             );
         }
@@ -1246,8 +2346,20 @@ impl Learner {
                 margin: self.config.margin,
                 ceiling_linear: self.config.ceiling_linear,
                 ceiling_joint: self.config.ceiling_joint,
+                hard_cap_linear: self.config.hard_cap_linear,
+                hard_cap_joint: self.config.hard_cap_joint,
                 min_samples: self.config.min_samples,
                 learn_readers: self.config.learn_readers,
+                min_participant_announcements: self.config.min_participant_announcements,
+                min_participant_duration_ms: u64::try_from(
+                    self.config.min_participant_duration.as_millis(),
+                )
+                .unwrap_or(u64::MAX),
+                late_fraction: self.config.late_fraction,
+                brief_fraction: self.config.brief_fraction,
+                accept_participants: self.config.accept_participants.clone(),
+                motion_topics: self.config.motion_topics.clone(),
+                limits: self.config.limits.clone(),
             },
             runs: self.runs.clone(),
             events_total: total,
@@ -1260,17 +2372,11 @@ impl Learner {
             actions,
             raw_dds_topics,
             motion_channels,
+            overflow: self.overflow.clone(),
             anomalies_total: self.anomalies_total,
             anomalies: self.anomalies.clone(),
             warnings,
-        }
-    }
-
-    /// Profile and report together.
-    pub fn finish(&self) -> Commissioning {
-        Commissioning {
-            profile: self.profile(),
-            report: self.report(),
+            signoff: signoff.items.clone(),
         }
     }
 }
@@ -1298,8 +2404,17 @@ pub struct ReportConfig {
     pub margin: f64,
     pub ceiling_linear: Option<f64>,
     pub ceiling_joint: Option<f64>,
+    pub hard_cap_linear: f64,
+    pub hard_cap_joint: f64,
     pub min_samples: u64,
     pub learn_readers: bool,
+    pub min_participant_announcements: u64,
+    pub min_participant_duration_ms: u64,
+    pub late_fraction: f64,
+    pub brief_fraction: f64,
+    pub accept_participants: BTreeSet<String>,
+    pub motion_topics: BTreeSet<String>,
+    pub limits: Limits,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1310,6 +2425,16 @@ pub struct ParticipantReport {
     pub src_ips: BTreeSet<String>,
     pub writer_topics: BTreeSet<String>,
     pub reader_topics: BTreeSet<String>,
+    /// Learned, learned by operator override, or quarantined.
+    pub status: ParticipantStatus,
+    /// Why it was quarantined (empty if it passed the gate).
+    pub quarantine_reasons: Vec<String>,
+    /// Sign-off kinds raised for it (`participant_late`, ...).
+    pub flags: Vec<String>,
+    /// Runs it was seen in.
+    pub runs_seen: usize,
+    /// Longest capture-time presence in one run (pcap input only).
+    pub observed_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1319,6 +2444,9 @@ pub struct EndpointReport {
     pub last_seen: SeenAt,
     pub participants: BTreeSet<String>,
     pub type_names: BTreeSet<String>,
+    /// Learned into the profile (announced by an accepted participant; for
+    /// reader topics also only with `learn_readers`).
+    pub in_profile: bool,
 }
 
 /// A ROS 2 service or action as observed.
@@ -1364,6 +2492,13 @@ pub struct MotionReport {
     pub envelope: Envelope,
     pub linear_capped_by_ceiling: bool,
     pub joint_capped_by_ceiling: bool,
+    /// The channel is in the profile (some command came from an accepted
+    /// source).
+    pub in_profile: bool,
+    /// Sources whose commands were excluded (quarantined or unannounced).
+    pub excluded_sources: BTreeSet<String>,
+    /// Commands that did not shape the envelope because of their source.
+    pub excluded_commands: u64,
 }
 
 /// Everything the OEM needs to review a draft profile before locking it.
@@ -1384,10 +2519,14 @@ pub struct CommissioningReport {
     pub actions: BTreeMap<String, ServiceReport>,
     pub raw_dds_topics: BTreeMap<String, RawTopicReport>,
     pub motion_channels: BTreeMap<String, MotionReport>,
+    /// Entries dropped at a capacity cap, per category.
+    pub overflow: BTreeMap<String, u64>,
     pub anomalies_total: u64,
     /// First [`MAX_STORED_ANOMALIES`] anomalies, in observation order.
     pub anomalies: Vec<Anomaly>,
     pub warnings: Vec<Warning>,
+    /// The operator confirmation list (also written as the sign-off file).
+    pub signoff: Vec<SignoffItem>,
 }
 
 impl CommissioningReport {
@@ -1439,9 +2578,16 @@ impl fmt::Display for CommissioningReport {
         }
         writeln!(f, "\nParticipants ({}):", self.participants.len())?;
         for (g, p) in &self.participants {
+            let status = match p.status {
+                ParticipantStatus::Accepted => String::new(),
+                ParticipantStatus::OperatorAccepted => "  [ACCEPTED BY OPERATOR]".into(),
+                ParticipantStatus::Quarantined => {
+                    format!("  [QUARANTINED: {}]", p.quarantine_reasons.join("; "))
+                }
+            };
             writeln!(
                 f,
-                "  {g}  seen {}x [{} .. {}]  ip {:?}  writes {:?}  reads {:?}",
+                "  {g}  seen {}x [{} .. {}]  ip {:?}  writes {:?}  reads {:?}{status}",
                 p.announcements,
                 p.first_seen,
                 p.last_seen,
@@ -1509,8 +2655,15 @@ impl fmt::Display for CommissioningReport {
         for (c, m) in &self.motion_channels {
             writeln!(
                 f,
-                "  {c}  {} commands [{} .. {}]",
-                m.commands, m.first_seen, m.last_seen
+                "  {c}  {} commands [{} .. {}]{}",
+                m.commands,
+                m.first_seen,
+                m.last_seen,
+                if m.in_profile {
+                    ""
+                } else {
+                    "  [NOT in profile]"
+                }
             )?;
             for (dim, s, env, capped, unit) in [
                 (
@@ -1531,15 +2684,20 @@ impl fmt::Display for CommissioningReport {
                 if let Some(s) = s {
                     writeln!(
                         f,
-                        "    {dim}: n={} min={} p50={} p99={} max={} -> envelope {} {unit}{}",
+                        "    {dim}: n={} min={} p50={} p99={} max={}{} -> envelope {} {unit}{}",
                         s.samples,
                         s.min,
                         s.p50,
                         s.p99,
                         s.max,
+                        if s.decimated {
+                            " (percentiles approx.)"
+                        } else {
+                            ""
+                        },
                         opt(env),
                         if capped {
-                            " (capped by OEM ceiling)"
+                            " (capped by ceiling / hard cap)"
                         } else {
                             ""
                         }
@@ -1570,6 +2728,14 @@ impl fmt::Display for CommissioningReport {
                 WarningLevel::Warn => "WARN",
             };
             writeln!(f, "  [{lvl}] {}: {}", w.code, w.message)?;
+        }
+        writeln!(
+            f,
+            "\nOperator sign-off required before lock: {} item(s)",
+            self.signoff.len()
+        )?;
+        for i in &self.signoff {
+            writeln!(f, "  [ ] {}: {}", i.id, i.reason)?;
         }
         Ok(())
     }
@@ -1614,9 +2780,12 @@ mod tests {
         })
     }
 
+    /// Routing-focused tests use a gate that accepts single announcements;
+    /// the poisoning tests below use the defaults.
     fn cfg() -> LearnConfig {
         LearnConfig {
             model: "ugv-test".into(),
+            min_participant_announcements: 1,
             ..Default::default()
         }
     }
@@ -1638,6 +2807,8 @@ mod tests {
         for i in 0..40 {
             v.push(mv("/cmd_vel", Some(0.01 * f64::from(i)), None));
         }
+        // Periodic announcements: both participants present the whole run.
+        v.extend([part(A), part(B)]);
         v
     }
 
@@ -1811,16 +2982,19 @@ mod tests {
 
     #[test]
     fn warnings_for_suspicious_commissioning_runs() {
+        const D: &str = "dddddddddddddddddddddddd";
         let evs = vec![
             part(A),
             part(B),
-            part(B),
+            part(D),
             writer(A, "rt/cmd_vel"),
             writer(B, "rt/diag"),
             reader(B, "rt/cmd_vel"),
             writer("cccccccccccccccccccccccc", "rt/x"),
             mv("/cmd_vel", Some(0.2), None),
             mv("rt/mangled", Some(0.0), None),
+            part(A),
+            part(B),
         ];
         let r = learn(LearnConfig::default(), &evs).report();
         let has = |code: &str, subj: &str| {
@@ -1828,7 +3002,8 @@ mod tests {
                 .iter()
                 .any(|w| w.code == code && w.subject == subj)
         };
-        assert!(has("participant_seen_once", A), "{r}");
+        assert!(has("participant_seen_once", D), "{r}");
+        assert!(has("quarantined_participant", D), "{r}");
         assert!(!has("participant_seen_once", B));
         assert!(has("few_motion_samples", "/cmd_vel"));
         assert!(has("writer_without_reader", "/diag"));
@@ -2227,6 +3402,7 @@ mod tests {
             Some(Ok(crate::input::SourcedEvent {
                 position: 7,
                 event: self.1.remove(0),
+                ts: None,
             }))
         }
         fn capture_diagnostics(&self) -> Option<CaptureDiagnostics> {
@@ -2297,5 +3473,519 @@ mod tests {
         assert!(s.contains("p99="), "{s}");
         assert!(s.contains("/cmd_vel"));
         assert!(s.contains("envelope 0.429"));
+    }
+
+    // ---------------------------------------------------- poisoning gate --
+
+    fn defaults() -> LearnConfig {
+        LearnConfig {
+            model: "ugv-test".into(),
+            ..Default::default()
+        }
+    }
+
+    const EVIL: &str = "eeeeeeeeeeeeeeeeeeeeeeee";
+
+    /// A clean run with an intruder that announces once mid-run, publishes
+    /// /cmd_vel and /exfil, and injects a fast motion command.
+    fn poisoned() -> Vec<RobotEvent> {
+        let mut v = clean();
+        let mid = v.len() / 2;
+        let evil = [
+            part(EVIL),
+            writer(EVIL, "rt/cmd_vel"),
+            writer(EVIL, "rt/exfil"),
+            writer(EVIL, "rq/backdoorRequest"),
+            RobotEvent::MotionCommand(MotionCommand {
+                channel: "/cmd_vel".into(),
+                source_guid: Some(EVIL.into()),
+                linear_speed: Some(9.0),
+                joint_speed: None,
+            }),
+            RobotEvent::MotionCommand(MotionCommand {
+                channel: "/evil_channel".into(),
+                source_guid: Some(EVIL.into()),
+                linear_speed: Some(5.0),
+                joint_speed: None,
+            }),
+        ];
+        for (i, e) in evil.into_iter().enumerate() {
+            v.insert(mid + i, e);
+        }
+        v
+    }
+
+    #[test]
+    fn single_announcement_intruder_is_quarantined_with_everything_it_did() {
+        let l = learn(defaults(), &poisoned());
+        let c = l.finish();
+        let p = &c.profile;
+        assert!(!p.participants.contains(EVIL));
+        assert!(!p.writer_topics.contains("/exfil"));
+        assert!(!p.services.contains("/backdoor"));
+        assert!(!p.motion_envelopes.contains_key("/evil_channel"));
+        // The injected 9 m/s never widened the envelope.
+        assert_eq!(p.motion_envelopes["/cmd_vel"].max_linear_speed, Some(0.429));
+        // The legit graph is intact.
+        assert!(p.participants.contains(A) && p.participants.contains(B));
+        assert!(p.writer_topics.contains("/cmd_vel"));
+        let r = &c.report;
+        assert_eq!(r.participants[EVIL].status, ParticipantStatus::Quarantined);
+        assert!(!r.writer_topics["/exfil"].in_profile);
+        assert!(!r.motion_channels["/evil_channel"].in_profile);
+        assert!(r.motion_channels["/cmd_vel"]
+            .excluded_sources
+            .contains(EVIL));
+        assert_eq!(r.motion_channels["/cmd_vel"].excluded_commands, 1);
+        let has = |code: &str, subj: &str| {
+            r.warnings
+                .iter()
+                .any(|w| w.code == code && w.subject == subj)
+        };
+        assert!(has("quarantined_participant", EVIL), "{r}");
+        assert!(has("endpoints_not_learned", "writer_topics"), "{r}");
+        assert!(has("endpoints_not_learned", "service"), "{r}");
+        assert!(has("motion_samples_excluded", "/cmd_vel"));
+        assert!(has("motion_channel_not_learned", "/evil_channel"));
+        assert!(r.to_string().contains("[QUARANTINED"));
+        // The intruder is not on the sign-off list (nothing to confirm).
+        assert!(!c.signoff.items.iter().any(|i| i.subject.contains(EVIL)));
+        // The locked profile flags the intruder later.
+        let d = p.evaluate(&writer(EVIL, "rt/cmd_vel")).unwrap();
+        assert_eq!(d.rule, "robot.ros2.unauthorized_motion_writer");
+    }
+
+    #[test]
+    fn operator_can_accept_a_quarantined_participant_with_signoff() {
+        let mut c = defaults();
+        c.accept_participants.insert(EVIL.into());
+        let out = learn(c, &poisoned()).finish();
+        assert!(out.profile.participants.contains(EVIL));
+        assert!(out.profile.writer_topics.contains("/exfil"));
+        // Still never wider than the hard cap... and here 9.0 * 1.1 = 9.9.
+        assert_eq!(
+            out.profile.motion_envelopes["/cmd_vel"].max_linear_speed,
+            Some(9.9)
+        );
+        assert_eq!(
+            out.report.participants[EVIL].status,
+            ParticipantStatus::OperatorAccepted
+        );
+        let ids: Vec<&str> = out.signoff.items.iter().map(|i| i.id.as_str()).collect();
+        assert!(
+            ids.contains(&"participant_operator_accepted:eeeeeeeeeeeeeeeeeeeeeeee"),
+            "{ids:?}"
+        );
+        assert!(
+            ids.contains(&"motion_writer:/cmd_vel eeeeeeeeeeeeeeeeeeeeeeee"),
+            "{ids:?}"
+        );
+        // Late and brief (one announcement mid-run).
+        assert!(ids.contains(&"participant_late:eeeeeeeeeeeeeeeeeeeeeeee"));
+        assert!(ids.contains(&"participant_brief:eeeeeeeeeeeeeeeeeeeeeeee"));
+        // Accepting an unseen GUID adds nothing and warns.
+        let mut c = defaults();
+        c.accept_participants.insert("f".repeat(24));
+        let r = learn(c, &clean()).report();
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.code == "accepted_participant_not_seen"));
+        assert!(!learn(defaults(), &clean())
+            .profile()
+            .participants
+            .contains(&"f".repeat(24)));
+    }
+
+    #[test]
+    fn motion_writers_always_need_signoff() {
+        let out = learn(defaults(), &clean()).finish();
+        let ids: Vec<&str> = out.signoff.items.iter().map(|i| i.id.as_str()).collect();
+        // A writes /cmd_vel and sends its commands.
+        assert!(
+            ids.contains(&"motion_writer:/cmd_vel aaaaaaaaaaaaaaaaaaaaaaaa"),
+            "{ids:?}"
+        );
+        // B only reads it: no sign-off for B.
+        assert!(!ids.iter().any(|i| i.contains(B)), "{ids:?}");
+        assert_eq!(
+            out.signoff.profile_sha256,
+            crate::signoff::draft_digest(&out.profile)
+        );
+        assert!(out.signoff.unconfirmed().count() > 0);
+        // Heuristic and configured motion topics, even without envelopes
+        // (pcap-only learning).
+        let evs = vec![
+            part(A),
+            part(A),
+            writer(A, "rt/mast/pan_tilt_cmd"),
+            writer(A, "rt/odom"),
+            writer(A, "rt/arm/joint_trajectory"),
+            writer(A, "rt/special_motion"),
+        ];
+        let mut c = defaults();
+        c.motion_topics.insert("/special_motion".into());
+        let ids: Vec<String> = learn(c, &evs)
+            .finish()
+            .signoff
+            .items
+            .iter()
+            .map(|i| i.id.clone())
+            .collect();
+        for t in [
+            "/mast/pan_tilt_cmd",
+            "/arm/joint_trajectory",
+            "/special_motion",
+        ] {
+            assert!(
+                ids.contains(&format!("motion_writer:{t} {A}")),
+                "{t}: {ids:?}"
+            );
+        }
+        assert!(!ids.iter().any(|i| i.contains("/odom")));
+        assert!(is_motion_like("/cmd_vel") && is_motion_like("/x/JointCommand"));
+        assert!(!is_motion_like("/odom") && !is_motion_like("/scan"));
+    }
+
+    #[test]
+    fn unattributed_and_thin_motion_need_signoff() {
+        let mut evs = vec![part(A), part(A)];
+        evs.extend((0..5).map(|_| {
+            RobotEvent::MotionCommand(MotionCommand {
+                channel: "/cmd_vel".into(),
+                source_guid: None,
+                linear_speed: Some(0.5),
+                joint_speed: None,
+            })
+        }));
+        let ids: Vec<String> = learn(defaults(), &evs)
+            .finish()
+            .signoff
+            .items
+            .iter()
+            .map(|i| i.id.clone())
+            .collect();
+        assert!(
+            ids.contains(&"motion_unattributed:/cmd_vel".to_string()),
+            "{ids:?}"
+        );
+        assert!(ids.contains(&"few_motion_samples:/cmd_vel linear".to_string()));
+    }
+
+    #[test]
+    fn late_brief_and_multi_ip_participants_are_flagged() {
+        const L: &str = "1111111111111111111111aa";
+        let mut evs = vec![part(A)];
+        evs.extend((0..100).map(|_| writer(A, "rt/odom")));
+        // L joins at 80% and announces twice (passes the count gate).
+        evs.insert(80, part(L));
+        evs.insert(85, part(L));
+        evs.push(part(A));
+        // A second IP for A.
+        evs.push(RobotEvent::Ros2ParticipantDiscovered(Participant {
+            guid_prefix: A.into(),
+            src_ip: "10.0.0.66".into(),
+            locators: vec![],
+        }));
+        let out = learn(defaults(), &evs).finish();
+        assert!(out.profile.participants.contains(L));
+        let r = &out.report;
+        let flags = &r.participants[L].flags;
+        assert!(flags.contains(&"participant_late".to_string()), "{flags:?}");
+        assert!(
+            flags.contains(&"participant_brief".to_string()),
+            "{flags:?}"
+        );
+        assert!(!r.participants[A]
+            .flags
+            .contains(&"participant_late".to_string()));
+        assert!(r.participants[A]
+            .flags
+            .contains(&"participant_multiple_ips".to_string()));
+        assert!(r.warn_count() > 0);
+        let ids: Vec<&str> = out.signoff.items.iter().map(|i| i.id.as_str()).collect();
+        assert!(ids.contains(&"participant_late:1111111111111111111111aa"));
+        assert!(ids.contains(&"participant_multiple_ips:aaaaaaaaaaaaaaaaaaaaaaaa"));
+    }
+
+    #[test]
+    fn duration_gate_uses_capture_time_when_available() {
+        const S: &str = "5555555555555555555555aa";
+        let mut l = Learner::new(defaults()).unwrap();
+        l.start_run("cap");
+        let t = Duration::from_secs;
+        // A: present for 60 s. S: 10 announcements within 1 s.
+        for i in 0..=60u64 {
+            l.observe_at_time(&part(A), i * 10 + 1, Some(t(1000 + i)));
+        }
+        for i in 0..10u64 {
+            l.observe_at_time(
+                &part(S),
+                300 + i,
+                Some(Duration::from_millis(1_030_000 + i * 100)),
+            );
+        }
+        let r = l.report();
+        assert_eq!(r.participants[A].status, ParticipantStatus::Accepted);
+        assert_eq!(
+            r.participants[S].status,
+            ParticipantStatus::Quarantined,
+            "{r}"
+        );
+        assert!(r.participants[S].quarantine_reasons[0].contains("observed for"));
+        assert_eq!(r.participants[A].observed_ms, Some(60_000));
+
+        // A run shorter than the minimum: the duration check cannot apply,
+        // the count gate still does, and the report says so.
+        let mut l = Learner::new(defaults()).unwrap();
+        l.start_run("short");
+        for i in 0..3u64 {
+            l.observe_at_time(&part(A), i + 1, Some(Duration::from_millis(i * 100)));
+        }
+        let r = l.report();
+        assert_eq!(r.participants[A].status, ParticipantStatus::Accepted);
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.code == "run_shorter_than_min_duration"));
+        // Disabled duration gate.
+        let mut c = defaults();
+        c.min_participant_duration = Duration::ZERO;
+        let mut l = Learner::new(c).unwrap();
+        for i in 0..2u64 {
+            l.observe_at_time(&part(S), i, Some(t(i)));
+        }
+        assert!(l.profile().participants.contains(S));
+    }
+
+    #[test]
+    fn hard_cap_bounds_every_envelope() {
+        let mut evs = vec![part(A), part(A)];
+        evs.extend((0..40).map(|_| mv("/cmd_vel", Some(1e300), Some(f64::MAX))));
+        evs.push(part(A));
+        let out = learn(defaults(), &evs).finish();
+        let env = &out.profile.motion_envelopes["/cmd_vel"];
+        assert_eq!(env.max_linear_speed, Some(DEFAULT_HARD_CAP_LINEAR));
+        assert_eq!(env.max_joint_speed, Some(DEFAULT_HARD_CAP_JOINT));
+        assert!(out.report.motion_channels["/cmd_vel"].linear_capped_by_ceiling);
+        assert!(out
+            .signoff
+            .items
+            .iter()
+            .any(|i| i.id == "observed_exceeds_cap:/cmd_vel linear"));
+        // An OEM ceiling above the hard cap does not loosen it.
+        let mut c = defaults();
+        c.ceiling_linear = Some(1e6);
+        c.hard_cap_linear = 2.0;
+        assert_eq!(c.effective_cap(false), 2.0);
+        let p = learn(c, &evs).profile();
+        assert_eq!(p.motion_envelopes["/cmd_vel"].max_linear_speed, Some(2.0));
+        assert_eq!(p.validate(), Ok(()));
+    }
+
+    #[test]
+    fn envelope_bound_never_yields_garbage() {
+        for x in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            let (b, _) = envelope_bound(x, 1.1, Some(3.0));
+            assert_eq!(b, 3.0);
+            let (b, _) = envelope_bound(x, 1.1, None);
+            assert_eq!(b, 0.0);
+        }
+        for m in [f64::NAN, f64::INFINITY, 0.5] {
+            let (b, _) = envelope_bound(2.0, m, None);
+            assert_eq!(b, 2.0);
+        }
+        assert_eq!(envelope_bound(2.0, 1.0, Some(f64::NAN)), (2.0, false));
+    }
+
+    #[test]
+    fn new_config_fields_are_validated() {
+        let bad = |f: fn(&mut LearnConfig)| {
+            let mut c = defaults();
+            f(&mut c);
+            Learner::new(c).unwrap_err()
+        };
+        assert!(matches!(
+            bad(|c| c.hard_cap_linear = f64::INFINITY),
+            ConfigError::InvalidHardCap { .. }
+        ));
+        assert!(matches!(
+            bad(|c| c.hard_cap_joint = 0.0),
+            ConfigError::InvalidHardCap { .. }
+        ));
+        assert!(matches!(
+            bad(|c| c.hard_cap_joint = f64::NAN),
+            ConfigError::InvalidHardCap { .. }
+        ));
+        assert!(matches!(
+            bad(|c| c.late_fraction = f64::NAN),
+            ConfigError::InvalidFraction { .. }
+        ));
+        assert!(matches!(
+            bad(|c| c.brief_fraction = 1.5),
+            ConfigError::InvalidFraction { .. }
+        ));
+        assert_eq!(
+            bad(|c| c.min_participant_announcements = 0),
+            ConfigError::InvalidMinAnnouncements
+        );
+        assert!(matches!(
+            bad(|c| c.limits.max_samples = 1),
+            ConfigError::InvalidLimit {
+                name: "max_samples"
+            }
+        ));
+        assert!(matches!(
+            bad(|c| {
+                c.accept_participants.insert("XYZ".into());
+            }),
+            ConfigError::InvalidAcceptedParticipant(_)
+        ));
+        assert!(matches!(
+            bad(|c| {
+                c.motion_topics.insert("rt/cmd_vel".into());
+            }),
+            ConfigError::InvalidMotionTopic(_)
+        ));
+        for e in [
+            ConfigError::InvalidHardCap {
+                dimension: "joint",
+                value: 0.0,
+            },
+            ConfigError::InvalidMinAnnouncements,
+        ] {
+            assert!(!e.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn floods_are_bounded_and_reported() {
+        let mut c = defaults();
+        c.limits = Limits {
+            max_participants: 8,
+            max_names: 16,
+            max_motion_channels: 4,
+            max_set_entries: 4,
+            max_samples: 64,
+        };
+        let mut l = Learner::new(c).unwrap();
+        for i in 0..1000u32 {
+            let g = format!("{i:024x}");
+            l.observe(&part(&g));
+            l.observe(&writer(&g, &format!("rt/t{i}")));
+            l.observe(&writer(A, &format!("rq/s{i}Request")));
+            l.observe(&writer(&g, "rt/shared"));
+            l.observe(&RobotEvent::Ros2ParticipantDiscovered(Participant {
+                guid_prefix: A.into(),
+                src_ip: format!("10.1.{}.{}", i / 250, i % 250),
+                locators: vec![],
+            }));
+            l.observe(&mv(&format!("/ch{i}"), Some(0.1), None));
+            l.observe(&RobotEvent::MotionCommand(MotionCommand {
+                channel: "/ch0".into(),
+                source_guid: Some(g.clone()),
+                linear_speed: Some(0.2),
+                joint_speed: None,
+            }));
+        }
+        for _ in 0..100_000 {
+            l.observe(&mv("/ch0", Some(0.3), Some(0.1)));
+        }
+        let out = l.finish();
+        let r = &out.report;
+        assert!(r.participants.len() <= 8);
+        assert!(r.writer_topics.len() <= 16);
+        assert!(r.services.len() <= 16);
+        assert!(r.motion_channels.len() <= 4);
+        assert!(r.writer_topics["/shared"].participants.len() <= 4);
+        for p in r.participants.values() {
+            assert!(p.src_ips.len() <= 4);
+        }
+        assert!(r.motion_channels["/ch0"].sources.len() <= 4);
+        for (cat, n) in &r.overflow {
+            assert!(*n > 0, "{cat}");
+        }
+        for cat in [
+            "participants",
+            "writer_topics",
+            "services",
+            "motion_channels",
+            "participant_src_ips",
+            "topic_participants",
+            "motion_sources",
+        ] {
+            assert!(r.overflow.contains_key(cat), "{cat}: {:?}", r.overflow);
+        }
+        assert!(out
+            .signoff
+            .items
+            .iter()
+            .any(|i| i.kind == "capacity_exceeded"));
+        assert!(r.anomalies.len() <= MAX_STORED_ANOMALIES);
+        // Stats exact in count/max, percentiles flagged approximate.
+        let lin = r.motion_channels["/ch0"].linear.as_ref().unwrap();
+        assert!(lin.samples >= 100_000);
+        assert!(lin.decimated);
+        assert_eq!(lin.max, 0.3);
+        // The report stays bounded: one summary warning per kind, not per name.
+        assert!(
+            r.warnings
+                .iter()
+                .filter(|w| w.code == "endpoints_not_learned")
+                .count()
+                <= 4,
+            "{:?}",
+            r.warnings
+        );
+        serde_json::to_string(r).unwrap();
+        assert_eq!(out.profile.validate(), Ok(()));
+    }
+
+    #[test]
+    fn merge_respects_caps_and_keeps_profile_order_independent() {
+        let mut c = defaults();
+        c.limits.max_participants = 3;
+        let mk = |gs: &[&str]| {
+            let mut l = Learner::new(c.clone()).unwrap();
+            for g in gs {
+                l.observe(&part(g));
+                l.observe(&part(g));
+            }
+            l
+        };
+        let mut a = mk(&[A, B]);
+        a.merge(&mk(&[EVIL, "cccccccccccccccccccccccc"]));
+        assert_eq!(a.report().participants.len(), 3);
+        assert_eq!(a.report().overflow["participants"], 1);
+        // Below caps the gate gives the same verdict whichever way round.
+        let x = learn(defaults(), &poisoned());
+        let y = learn(defaults(), &clean());
+        let mut xy = x.clone();
+        xy.merge(&y);
+        let mut yx = y.clone();
+        yx.merge(&x);
+        assert_eq!(xy.profile(), yx.profile());
+        assert!(!xy.profile().participants.contains(EVIL));
+    }
+
+    #[test]
+    fn malformed_motion_source_never_shapes_envelope() {
+        let mut evs = clean();
+        evs.push(RobotEvent::MotionCommand(MotionCommand {
+            channel: "/cmd_vel".into(),
+            source_guid: Some("NOT-A-GUID".into()),
+            linear_speed: Some(7.0),
+            joint_speed: None,
+        }));
+        let l = learn(defaults(), &evs);
+        assert_eq!(
+            l.profile().motion_envelopes["/cmd_vel"].max_linear_speed,
+            Some(0.429)
+        );
+        assert!(l
+            .report()
+            .anomalies
+            .iter()
+            .any(|a| a.kind == "malformed_guid_prefix"));
     }
 }

@@ -135,12 +135,17 @@ order and merge order do not change it.
 robodr-commission learn (--events run.jsonl | --pcap run.pcapng) [...] [--model NAME]
                         [--margin 1.1] [--min-samples 30]
                         [--ceiling-linear M_PER_S] [--ceiling-joint RAD_PER_S]
+                        [--hard-cap-linear 10] [--hard-cap-joint 10]
+                        [--min-announcements 2] [--min-duration SECS]
+                        [--accept-participant GUID]... [--motion-topic /T]...
                         [--learn-readers]
-                        --out profile.json [--report report.json] [--quiet]
-robodr-commission lock  --in profile.json --out locked.json
-robodr-commission diff  old.json new.json [--json]
-robodr-commission check --profile locked.json (--events run.jsonl | --pcap run.pcap) [...] [--json]
-robodr-commission merge --out merged.json a.json b.json [...]
+                        --out profile.json [--signoff signoff.json]
+                        [--report report.json] [--quiet] [--force]
+robodr-commission lock    --in profile.json --signoff signoff.json --out locked.json [--force]
+robodr-commission signoff --in profile.json --out signoff.json [--force]
+robodr-commission diff    old.json new.json [--json]
+robodr-commission check   --profile locked.json (--events run.jsonl | --pcap run.pcap) [...] [--json]
+robodr-commission merge   --out merged.json a.json b.json [...] [--force]
 ```
 
 Exit codes:
@@ -149,8 +154,14 @@ Exit codes:
 * `1`: a negative result (deviations found, profiles differ, or lock refused)
 * `2`: a usage, input or I/O error
 
-Profiles and reports are written to a temp file and then renamed, so a failed
-run never leaves half a file.
+Every output is written to a fresh temp file in the destination directory
+(`O_EXCL`), fsynced, then published atomically (`link` when the file must not
+exist yet, `rename` with `--force`). An existing file is never overwritten
+without `--force`, a symlink at the output path is refused even with
+`--force`, and outputs must differ from each other and from the inputs. A
+failed `learn` writes nothing. Profile inputs must be regular files (no
+FIFOs or devices) of at most 64 MiB and are parsed strictly: every key
+present, no unknown or duplicate keys, a valid seal if locked.
 
 * **Input**: JSON Lines of `RobotEvent` in the serde tagged format, for example
   `{"kind":"motion_command","channel":"/cmd_vel","source_guid":"…","linear_speed":0.4,"joint_speed":null}`.
@@ -174,7 +185,11 @@ run never leaves half a file.
   one `Learner`, so percentiles and warnings cover every sample and the margin
   is applied once. `merge` unions profiles that were already learned: per
   dimension the larger bound wins, and the result is unlocked again.
-* **lock** collects every reason to refuse before failing:
+* **lock** needs the draft *and* its sign-off list, and collects every reason
+  to refuse before failing:
+  * the sign-off is malformed, is for another model, does not match the
+    SHA-256 of the draft bytes (the draft was edited after the list was
+    made), has no `operator`, or has an item with `"confirmed": false`
   * the profile is already locked
   * there are no participants
   * there are no writer topics
@@ -183,6 +198,15 @@ run never leaves half a file.
     time: an empty model, a non-finite or negative bound, a GUID that is not
     24 lower-case hex characters, a ROS name that is mangled (`rt/x`) or
     relative, or an empty raw topic or channel
+
+  The locked file is **sealed**: its first member is
+  `"seal": "sha256:<hex>"` over the rest of the file. `check`, `diff` and
+  `merge` refuse a locked profile whose seal is missing or wrong (edited,
+  partially written, `locked` flipped by hand). The sensor's own loader
+  ignores the extra member.
+* **signoff** writes a conservative sign-off list for a draft that was edited
+  by hand or produced by `merge` (every participant and motion channel must be
+  confirmed individually, because the learner's provenance is gone).
 * **check** refuses (exit 2) a profile that fails `Profile::validate`.
 * **diff** lists every change in participants, writer topics, services,
   actions, raw DDS topics, reader topics, motion channels and envelope bounds.
@@ -197,6 +221,42 @@ run never leaves half a file.
   missions never recorded.
 * **check** runs `Profile::evaluate` on every event, plus one rule of this
   crate's own, `commission.motion.anomalous_speed` (see Limits).
+
+## Learning-time poisoning and other hostile input
+
+Commissioning trusts whatever is on the bus during the clean run, so an
+intruder present then would be baked into the allowlist. Defences (details in
+the `learner` module docs):
+
+* **Quarantine** (not learned, nor its endpoints or motion samples): a
+  participant announced fewer than `--min-announcements` (2) times, or, in
+  captures, observed for less than `--min-duration` (5 s) in every run. The
+  operator can override with `--accept-participant GUID`, which itself needs
+  sign-off. Endpoints announced only by quarantined or unannounced GUIDs, and
+  motion commands from them, are never learned.
+* **Sign-off list** (`<out>.signoff.json`): every participant that writes a
+  motion topic (learned channel, `--motion-topic`, or a name containing
+  `cmd`/`command`/`twist`/`trajectory`) or sends motion commands; participants
+  that joined late, were present briefly, came from several IPs or missed
+  runs; unattributed motion commands; thin envelopes; samples above the cap;
+  capacity overflow; anomalies. `lock` refuses until a named operator has
+  confirmed every item.
+* **Hard caps**: no envelope exceeds `--hard-cap-linear` / `--hard-cap-joint`
+  (default 10 m/s, 10 rad/s) or the tighter OEM ceiling; NaN, infinite and
+  negative speeds are never learned.
+* **Bounded memory**: participants (4096), names per kind (16384), motion
+  channels (256), inner sets (256) and retained samples per channel and
+  dimension (16384, then decimated; count/min/max stay exact) are capped;
+  overflow is counted, reported and becomes a sign-off item.
+* **Hostile captures**: lengths are validated before allocation by
+  `robodr-capture`; truncated captures abort `learn`; a capture in which no
+  frame has a supported link type is refused instead of learning an empty
+  profile; partial problems become warnings.
+
+What this cannot catch: an intruder present from the very start for the whole
+run, announcing normally from one IP and not touching motion topics. Only the
+operator's review of the participant list catches that. The seal is a hash,
+not a signature: it detects edits and corruption, not a forger.
 
 ## Demo (synthetic data)
 
@@ -235,8 +295,14 @@ Warnings: 1 (0 need attention)
   [info] reader_topics_not_learned: 6 reader topics observed but not learned: reader-topic enforcement stays off (use --learn-readers to opt in)
 wrote draft profile profile.json (locked: false): 4 participants, 7 writer topics, 25 services, 1 actions, 1 raw DDS topics, 0 reader topics, 2 motion channels; 0 anomalies, 0 warnings need attention
 
-$ robodr-commission lock --in profile.json --out locked.json
-locked profile ugv-demo-synthetic -> locked.json
+$ robodr-commission lock --in profile.json --signoff profile.json.signoff.json --out locked.json
+refusing to lock profile.json:
+  - sign-off has no operator name (fill in "operator")
+  - not confirmed by the operator: motion_writer:/cmd_vel 01103f5a8c2e000000000101 (...)
+  ...
+$ $EDITOR profile.json.signoff.json   # review each item, set "confirmed": true, fill "operator"
+$ robodr-commission lock --in profile.json --signoff profile.json.signoff.json --out locked.json
+locked profile ugv-demo-synthetic -> locked.json (sealed; signed off by "...")
 
 $ robodr-commission check --profile locked.json --events examples/clean-run.jsonl
 0 deviation(s) over 186 event(s) against profile ugv-demo-synthetic
@@ -267,7 +333,10 @@ test expects `fragmented_discovery_unreassembled` for it.
   * `merge(&Learner)` to union another learner's runs into this one
   * `profile()`, `report()` and `finish()` to get the results
 * `envelope_bound(observed_max, margin, ceiling) -> (bound, capped)`
-* `lock(&Profile) -> Result<Profile, Vec<LockRefusal>>`
+* `finish() -> Commissioning { profile, report, signoff }`
+* `lock(&Profile, &Signoff)` and `lock_draft_text(&str, &Signoff)` `-> Result<Profile, Vec<LockRefusal>>`;
+  `lockable(&Profile)` for the content checks alone
+* `Signoff::for_profile`, `Signoff::confirm_all`; `profile_file::{parse_profile_text, sealed_text, write_file_atomic, read_regular_file}`
 * `diff(&old, &new) -> ProfileDiff`, with `is_empty()` and `loosens()`
 * `merge_profiles(&[Profile]) -> Result<Profile, MergeError>`
 * `Checker::new(&profile)`, then `observe` or `ingest`, then `finish() -> CheckReport`. `check_event` evaluates a single event.
@@ -297,5 +366,12 @@ test expects `fragmented_discovery_unreassembled` for it.
 * `check` adds `commission.motion.anomalous_speed` for negative speeds (the
   learner never feeds them into an envelope). Non-finite speeds are already a
   Critical deviation in `Profile::evaluate`.
-* Every motion sample is kept in memory to compute percentiles. Each sample is
-  8 bytes, about 1.4 MB per channel-hour at 50 Hz.
+* Memory is capped (see above). Past `max_samples`, p50/p99 come from a
+  deterministic decimated subset and are marked approximate; envelopes always
+  use exact maxima. When a cap is hit, which entries got in depends on
+  arrival order.
+* "Late" and "brief" use input positions (frame ordinals, JSONL lines), not
+  time; the duration gate needs capture timestamps (pcap) and is skipped,
+  with a warning, for runs shorter than the minimum.
+* The no-clobber publish uses `link(2)`; on a filesystem without hard links it
+  falls back to check-then-rename, which has a narrow race.

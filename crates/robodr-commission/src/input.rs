@@ -24,6 +24,7 @@
 //! envelopes from a JSONL recording of the sensor's events (repeat inputs to
 //! combine both into one profile).
 
+//!
 //! # Strictness
 //!
 //! A commissioning run is supposed to be clean, so the reader is strict: the
@@ -32,6 +33,31 @@
 //! `#` are skipped, so example files can carry a provenance comment; this is
 //! an extension to plain JSONL. Lines are capped at [`MAX_LINE_BYTES`] so a
 //! hostile or corrupt file cannot make us buffer unbounded memory.
+//!
+//! # Hostile captures
+//!
+//! Capture files are treated as untrusted input. `robodr-capture` validates
+//! every record/block length before allocating (classic pcap records over
+//! 256 KiB and pcapng blocks over 4 MiB are format errors), and a file that
+//! ends mid-record is an error (everything before it was delivered, but the
+//! CLI aborts the learn: a truncated capture is not a complete clean run).
+//! On top of that this source refuses a capture in which **no** frame had a
+//! supported link type (a wrong-linktype file would otherwise learn an empty
+//! profile silently) and reports partial problems (unsupported, malformed,
+//! truncated, non-RTPS frames) through [`CaptureDiagnostics`], which the
+//! learner turns into warnings. A single datagram expands into a bounded
+//! number of events (bounded by the datagram size), so the event queue is
+//! bounded too; memory across the whole capture is bounded by the
+//! learner's caps (see `learner`).
+//!
+//! # Timestamps
+//!
+//! Packet captures carry a capture time per frame, exposed as
+//! [`SourcedEvent::ts`]; the learner uses it for minimum-observation-duration
+//! checks. JSONL recordings carry none (`RobotEvent` has no timestamp), so
+//! duration checks do not apply to them. Capture timestamps come from the
+//! file and are not trusted for ordering; they only ever make the learner
+//! *more* conservative (see `learner`).
 
 use robodr_capture::{CaptureError, CaptureFile, RtpsDatagrams};
 use robodr_events::RobotEvent;
@@ -42,6 +68,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Maximum accepted length of one JSONL line, in bytes (newline excluded).
 pub const MAX_LINE_BYTES: usize = 1 << 20;
@@ -52,6 +79,9 @@ pub const MAX_LINE_BYTES: usize = 1 << 20;
 pub struct SourcedEvent {
     pub position: u64,
     pub event: RobotEvent,
+    /// Capture time of the frame that carried the event (packet captures
+    /// only; `None` for JSONL and in-memory sources).
+    pub ts: Option<Duration>,
 }
 
 /// A stream of robot events. Pull-based so sources can be files, captures or
@@ -209,6 +239,7 @@ impl<R: BufRead> EventSource for JsonlSource<R> {
                 Ok(event) => Some(Ok(SourcedEvent {
                     position: self.line,
                     event,
+                    ts: None,
                 })),
                 Err(e) => {
                     let (source, line) = (self.label.clone(), self.line);
@@ -251,6 +282,7 @@ impl EventSource for VecSource {
         Some(Ok(SourcedEvent {
             position: self.position,
             event,
+            ts: None,
         }))
     }
 }
@@ -405,10 +437,25 @@ impl<R: Read> EventSource for PcapSource<R> {
             let Some(pkt) = self.datagrams.next_packet() else {
                 // Files never time out, so `None` means EOF or a fatal error.
                 self.done = true;
-                return self
-                    .datagrams
-                    .last_error()
-                    .map(|e| Err(capture_error(&self.label, e)));
+                if let Some(e) = self.datagrams.last_error() {
+                    return Some(Err(capture_error(&self.label, e)));
+                }
+                // A capture whose every frame has a link type we cannot
+                // decode (e.g. 802.11 radiotap, USB) would learn an empty
+                // profile without complaint: refuse it instead.
+                let st = self.datagrams.stats();
+                if st.frames > 0 && st.unsupported_linktype == st.frames {
+                    return Some(Err(InputError::Capture {
+                        source: self.label.clone(),
+                        message: format!(
+                            "none of the {} frame(s) has a supported link type (supported: \
+                             Ethernet, Linux SLL/SLL2, raw IP, loopback/null); capture on \
+                             the robot's wired bus interface",
+                            st.frames
+                        ),
+                    }));
+                }
+                return None;
             };
             // The frame that completed this datagram (last fragment, if any).
             let position = self.datagrams.stats().frames;
@@ -421,11 +468,16 @@ impl<R: Read> EventSource for PcapSource<R> {
             self.secure += u64::from(st.secure);
             self.anomalies += u64::from(st.anomalies);
             let src_ip = pkt.src.to_string();
+            let ts = Some(pkt.ts);
             self.queue.extend(
                 report
                     .to_events(&src_ip)
                     .into_iter()
-                    .map(|event| SourcedEvent { position, event }),
+                    .map(|event| SourcedEvent {
+                        position,
+                        event,
+                        ts,
+                    }),
             );
         }
     }

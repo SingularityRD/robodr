@@ -2,9 +2,26 @@
 //! re-run [`Checker`].
 //!
 //! None of these act on the robot. `lock` only flips a flag after
-//! validation; `check` only evaluates and reports.
+//! validation and operator sign-off; `check` only evaluates and reports.
+//!
+//! # Lock semantics
+//!
+//! A draft becomes a locked profile only through [`lock`] (in memory) or
+//! [`lock_draft_text`] (from the draft file's bytes, what the CLI uses).
+//! Both refuse, listing every reason at once, unless:
+//! * the draft is not already locked, names a model, has participants and
+//!   writer topics, gives every motion channel at least one bound, and
+//!   passes `Profile::validate` (the sensor's own load-time check);
+//! * a [`Signoff`] is supplied for *this* draft: same model, same SHA-256
+//!   of the draft bytes, a non-empty operator and every item confirmed.
+//!
+//! The CLI then writes the result sealed (see `profile_file`), so the
+//! locked file cannot be edited or half-written without `check`, `diff`
+//! and `merge` refusing it.
 
 use crate::input::{EventSource, InputError};
+use crate::profile_file::parse_profile_text;
+use crate::signoff::{draft_digest, sha256_hex, Signoff};
 use robodr_events::profile::{Envelope, EnvelopeField, Profile, ProfileError};
 use robodr_events::{Deviation, MotionCommand, RobotEvent, Severity};
 use serde::{Deserialize, Serialize};
@@ -36,6 +53,28 @@ pub enum LockRefusal {
     InvalidProfile {
         error: ProfileError,
     },
+    /// The draft file is not a strictly well-formed profile.
+    UnreadableDraft {
+        error: String,
+    },
+    /// The sign-off file is malformed.
+    SignoffInvalid {
+        error: String,
+    },
+    SignoffModelMismatch {
+        signoff: String,
+        profile: String,
+    },
+    /// The sign-off was produced for a different draft (or the draft was
+    /// edited after the sign-off list was generated).
+    SignoffDigestMismatch,
+    /// Nobody put their name on the sign-off.
+    SignoffNoOperator,
+    /// An item the operator has not confirmed.
+    Unconfirmed {
+        id: String,
+        why: String,
+    },
 }
 
 impl fmt::Display for LockRefusal {
@@ -56,16 +95,88 @@ impl fmt::Display for LockRefusal {
                 "motion channel {channel}: {dimension} bound is not a finite, non-negative number"
             ),
             LockRefusal::InvalidProfile { error } => write!(f, "{error}"),
+            LockRefusal::UnreadableDraft { error } => write!(f, "draft: {error}"),
+            LockRefusal::SignoffInvalid { error } => write!(f, "sign-off: {error}"),
+            LockRefusal::SignoffModelMismatch { signoff, profile } => write!(
+                f,
+                "sign-off is for model {signoff:?}, profile is {profile:?}"
+            ),
+            LockRefusal::SignoffDigestMismatch => write!(
+                f,
+                "sign-off does not belong to this draft (profile_sha256 differs): the draft was \
+                 edited or the wrong sign-off file was given; re-run learn, or generate a \
+                 conservative list with `robodr-commission signoff`"
+            ),
+            LockRefusal::SignoffNoOperator => {
+                write!(f, "sign-off has no operator name (fill in \"operator\")")
+            }
+            LockRefusal::Unconfirmed { id, why } => {
+                write!(f, "not confirmed by the operator: {id} ({why})")
+            }
         }
     }
 }
 
-/// Validate a draft profile and return it with `locked = true`. All reasons
-/// to refuse are collected, so the OEM sees everything at once: the
-/// commissioning checks (already locked, empty, a motion channel without any
-/// bound) and every [`Profile::validate`] error, which the sensor would
-/// otherwise refuse at load time.
-pub fn lock(profile: &Profile) -> Result<Profile, Vec<LockRefusal>> {
+/// Validate a draft profile against its operator sign-off and return it
+/// with `locked = true`. All reasons to refuse are collected, so the OEM
+/// sees everything at once (see the module docs). The sign-off is bound to
+/// [`draft_digest`]`(profile)`, i.e. the bytes `learn` writes.
+pub fn lock(profile: &Profile, signoff: &Signoff) -> Result<Profile, Vec<LockRefusal>> {
+    lock_with_digest(profile, signoff, &draft_digest(profile))
+}
+
+/// [`lock`] for a draft read from disk: the sign-off is checked against the
+/// SHA-256 of `draft_text` itself, and the text must parse strictly
+/// (`profile_file::parse_profile_text`: all keys, no unknown keys).
+pub fn lock_draft_text(draft_text: &str, signoff: &Signoff) -> Result<Profile, Vec<LockRefusal>> {
+    let profile = parse_profile_text(draft_text).map_err(|e| {
+        vec![LockRefusal::UnreadableDraft {
+            error: e.to_string(),
+        }]
+    })?;
+    lock_with_digest(&profile, signoff, &sha256_hex(draft_text.as_bytes()))
+}
+
+fn lock_with_digest(
+    profile: &Profile,
+    signoff: &Signoff,
+    digest: &str,
+) -> Result<Profile, Vec<LockRefusal>> {
+    let mut why = lockable(profile);
+    if let Err(error) = signoff.check_shape() {
+        why.push(LockRefusal::SignoffInvalid { error });
+    }
+    if signoff.model != profile.model {
+        why.push(LockRefusal::SignoffModelMismatch {
+            signoff: signoff.model.clone(),
+            profile: profile.model.clone(),
+        });
+    }
+    if signoff.profile_sha256 != digest {
+        why.push(LockRefusal::SignoffDigestMismatch);
+    }
+    if signoff.operator.trim().is_empty() {
+        why.push(LockRefusal::SignoffNoOperator);
+    }
+    for i in signoff.unconfirmed() {
+        why.push(LockRefusal::Unconfirmed {
+            id: i.id.clone(),
+            why: i.reason.clone(),
+        });
+    }
+    if why.is_empty() {
+        let mut p = profile.clone();
+        p.locked = true;
+        Ok(p)
+    } else {
+        Err(why)
+    }
+}
+
+/// The content checks of [`lock`] alone (no sign-off): already locked,
+/// empty, a motion channel without any bound, and every
+/// [`Profile::validate`] error. Empty means the content is lockable.
+pub fn lockable(profile: &Profile) -> Vec<LockRefusal> {
     let mut why = Vec::new();
     if profile.locked {
         why.push(LockRefusal::AlreadyLocked);
@@ -101,13 +212,7 @@ pub fn lock(profile: &Profile) -> Result<Profile, Vec<LockRefusal>> {
             }
         }));
     }
-    if why.is_empty() {
-        let mut p = profile.clone();
-        p.locked = true;
-        Ok(p)
-    } else {
-        Err(why)
-    }
+    why
 }
 
 // ---------------------------------------------------------------- merge ---
@@ -120,6 +225,12 @@ pub enum MergeError {
     /// some do not: a union would silently start enforcing readers that the
     /// non-enforcing profiles never recorded.
     ReaderEnforcementMismatch,
+    /// An input fails `Profile::validate` (NaN/inf/negative bounds, bad
+    /// names): merging would carry garbage into the result.
+    InvalidInput {
+        index: usize,
+        errors: Vec<String>,
+    },
 }
 
 impl fmt::Display for MergeError {
@@ -134,6 +245,12 @@ impl fmt::Display for MergeError {
                 f,
                 "refusing to merge: some profiles enforce reader_topics and some do not \
                  (re-learn all missions with or without --learn-readers)"
+            ),
+            MergeError::InvalidInput { index, errors } => write!(
+                f,
+                "refusing to merge: profile #{} fails validation: {}",
+                index + 1,
+                errors.join("; ")
             ),
         }
     }
@@ -154,6 +271,14 @@ impl std::error::Error for MergeError {}
 /// once. Merging profiles applies whatever margins each profile already had.
 pub fn merge_profiles(profiles: &[Profile]) -> Result<Profile, MergeError> {
     let first = profiles.first().ok_or(MergeError::NoProfiles)?;
+    for (index, p) in profiles.iter().enumerate() {
+        if let Err(errs) = p.validate() {
+            return Err(MergeError::InvalidInput {
+                index,
+                errors: errs.iter().map(ToString::to_string).collect(),
+            });
+        }
+    }
     let enforcing = !first.reader_topics.is_empty();
     if profiles
         .iter()
@@ -601,6 +726,11 @@ mod tests {
     use super::*;
     use robodr_events::graph::Participant;
 
+    /// Lock with a fully confirmed conservative sign-off.
+    fn lk(p: &Profile) -> Result<Profile, Vec<LockRefusal>> {
+        lock(p, &Signoff::for_profile(p).confirm_all("test-operator"))
+    }
+
     fn base() -> Profile {
         let mut p = Profile {
             model: "ugv".into(),
@@ -620,7 +750,7 @@ mod tests {
 
     #[test]
     fn lock_sets_flag_and_preserves_content() {
-        let l = lock(&base()).unwrap();
+        let l = lk(&base()).unwrap();
         assert!(l.locked);
         let mut back = l.clone();
         back.locked = false;
@@ -631,10 +761,10 @@ mod tests {
     fn lock_refuses_and_lists_every_reason() {
         let mut p = base();
         p.locked = true;
-        assert_eq!(lock(&p).unwrap_err(), vec![LockRefusal::AlreadyLocked]);
+        assert_eq!(lk(&p).unwrap_err(), vec![LockRefusal::AlreadyLocked]);
 
         let empty = Profile::default();
-        let why = lock(&empty).unwrap_err();
+        let why = lk(&empty).unwrap_err();
         assert!(why.contains(&LockRefusal::EmptyModel));
         assert!(why.contains(&LockRefusal::NoParticipants));
         assert!(why.contains(&LockRefusal::NoWriterTopics));
@@ -649,7 +779,7 @@ mod tests {
                 max_joint_speed: Some(-1.0),
             },
         );
-        let why = lock(&p).unwrap_err();
+        let why = lk(&p).unwrap_err();
         assert_eq!(
             why,
             vec![
@@ -673,7 +803,98 @@ mod tests {
     fn lock_allows_profile_without_motion_channels() {
         let mut p = base();
         p.motion_envelopes.clear();
-        assert!(lock(&p).is_ok());
+        assert!(lk(&p).is_ok());
+    }
+
+    #[test]
+    fn lock_requires_matching_confirmed_signoff() {
+        let p = base();
+        let so = Signoff::for_profile(&p);
+        // Unconfirmed and anonymous.
+        let why = lock(&p, &so).unwrap_err();
+        assert!(why.contains(&LockRefusal::SignoffNoOperator));
+        assert_eq!(
+            why.iter()
+                .filter(|r| matches!(r, LockRefusal::Unconfirmed { .. }))
+                .count(),
+            so.items.len()
+        );
+        // Confirmed, but for another draft.
+        let mut other = base();
+        other.writer_topics.insert("/odom".into());
+        let why = lock(&other, &so.clone().confirm_all("op")).unwrap_err();
+        assert_eq!(why, vec![LockRefusal::SignoffDigestMismatch]);
+        // Wrong model.
+        let mut so2 = so.clone().confirm_all("op");
+        so2.model = "arm".into();
+        assert!(lock(&p, &so2)
+            .unwrap_err()
+            .iter()
+            .any(|r| matches!(r, LockRefusal::SignoffModelMismatch { .. })));
+        // Malformed sign-off.
+        let mut so3 = so.clone().confirm_all("op");
+        so3.format = "nope".into();
+        assert!(matches!(
+            lock(&p, &so3).unwrap_err()[0],
+            LockRefusal::SignoffInvalid { .. }
+        ));
+        // Operator of only whitespace.
+        let mut so4 = so.clone().confirm_all("op");
+        so4.operator = "  ".into();
+        assert_eq!(
+            lock(&p, &so4).unwrap_err(),
+            vec![LockRefusal::SignoffNoOperator]
+        );
+        // All good.
+        assert!(lock(&p, &so.confirm_all("op")).unwrap().locked);
+        // Refusals serialise and display.
+        let why = lock(&p, &Signoff::for_profile(&p)).unwrap_err();
+        serde_json::to_string(&why).unwrap();
+        assert!(why.iter().any(|r| r.to_string().contains("not confirmed")));
+    }
+
+    #[test]
+    fn lock_draft_text_binds_to_bytes_and_parses_strictly() {
+        let p = base();
+        let text = crate::to_json(&p).unwrap();
+        let so = Signoff::for_profile(&p).confirm_all("op");
+        assert!(lock_draft_text(&text, &so).unwrap().locked);
+        // Same content, different bytes (re-indented by an editor): the
+        // sign-off no longer matches.
+        let edited = text.replace("  ", "    ");
+        assert_eq!(
+            lock_draft_text(&edited, &so).unwrap_err(),
+            vec![LockRefusal::SignoffDigestMismatch]
+        );
+        // Partially written draft.
+        let why = lock_draft_text(&text[..text.len() / 2], &so).unwrap_err();
+        assert!(matches!(why[0], LockRefusal::UnreadableDraft { .. }));
+        // A draft with a key removed.
+        let cut = text.replace("  \"actions\": [],\n", "");
+        assert!(matches!(
+            lock_draft_text(&cut, &so).unwrap_err()[0],
+            LockRefusal::UnreadableDraft { .. }
+        ));
+    }
+
+    #[test]
+    fn merge_refuses_invalid_inputs() {
+        let mut bad = base();
+        bad.motion_envelopes
+            .get_mut("/cmd_vel")
+            .unwrap()
+            .max_linear_speed = Some(f64::INFINITY);
+        let e = merge_profiles(&[base(), bad]).unwrap_err();
+        assert!(
+            matches!(e, MergeError::InvalidInput { index: 1, .. }),
+            "{e}"
+        );
+        let mut nan = base();
+        nan.motion_envelopes
+            .get_mut("/cmd_vel")
+            .unwrap()
+            .max_joint_speed = Some(f64::NAN);
+        assert!(merge_profiles(&[nan]).is_err());
     }
 
     #[test]
@@ -687,7 +908,7 @@ mod tests {
     #[test]
     fn diff_reports_every_kind_of_change() {
         let old = base();
-        let mut new = lock(&base()).unwrap();
+        let mut new = lk(&base()).unwrap();
         new.model = "ugv2".into();
         new.participants.insert("b".repeat(24));
         new.participants.remove(&"a".repeat(24));
@@ -745,7 +966,7 @@ mod tests {
                 max_joint_speed: Some(2.0),
             },
         );
-        let mut c = lock(&base()).unwrap();
+        let mut c = lk(&base()).unwrap();
         c.motion_envelopes.insert(
             "/arm".into(),
             Envelope {
@@ -789,7 +1010,7 @@ mod tests {
         p.actions.insert("/".into());
         p.reader_topics.insert("/a b".into());
         p.raw_dds_topics.insert(String::new());
-        let why = lock(&p).unwrap_err();
+        let why = lk(&p).unwrap_err();
         assert_eq!(why.len(), 6, "{why:#?}");
         assert!(why
             .iter()
@@ -809,7 +1030,7 @@ mod tests {
         q.actions.insert("/dock".into());
         q.raw_dds_topics.insert("ros_discovery_info".into());
         q.reader_topics.insert("/odom".into());
-        let l = lock(&q).unwrap();
+        let l = lk(&q).unwrap();
         assert!(l.locked && l.services.len() == 1);
     }
 
@@ -892,7 +1113,7 @@ mod tests {
 
     #[test]
     fn checker_counts_deviations() {
-        let p = lock(&base()).unwrap();
+        let p = lk(&base()).unwrap();
         let mut c = Checker::new(&p);
         c.observe(
             "x",

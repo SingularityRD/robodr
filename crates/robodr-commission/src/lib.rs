@@ -19,7 +19,15 @@
 //!   `Profile::evaluate`, so learn -> lock -> check over the same clean run
 //!   gives zero deviations (property-tested).
 //! * [`ops`]: [`lock`], [`diff`], [`merge_profiles`], [`Checker`].
-//! * [`stats`]: nearest-rank percentiles.
+//! * [`signoff`]: the operator confirmation list [`lock`] requires.
+//! * [`profile_file`]: strict profile parsing, the lock seal, and
+//!   symlink-safe, no-clobber, atomic file writes.
+//! * [`stats`]: nearest-rank percentiles and bounded sample buffers.
+//!
+//! Security review (learning-time poisoning, hostile input, file handling):
+//! see the `learner` module docs (anti-poisoning gate, hard caps, memory
+//! caps), `input` (hostile captures), `profile_file` (seal, safe writes) and
+//! `ops` (lock semantics).
 //!
 //! Scope: protective only. Nothing here talks to the robot or changes its
 //! behaviour; the output is a file for a human to review.
@@ -35,12 +43,20 @@
 //!   discovery are invisible to a capture (see robodr-capture's limits).
 //! * Validated against synthetic captures built from the RTPS spec layout,
 //!   not yet against captures from real Fast DDS / Cyclone / Connext robots.
-//! * All motion samples are held in memory for percentiles (8 bytes each:
-//!   ~1.4 MB per channel-hour at 50 Hz).
+//! * Memory is bounded by [`Limits`]: motion samples are decimated beyond
+//!   `max_samples` per channel and dimension (percentiles become
+//!   approximate and say so; envelopes use exact maxima), and maps/sets
+//!   stop growing at their caps (dropped entries are reported).
+//! * The anti-poisoning gate is heuristic: an intruder present for the
+//!   whole run, from the start, behaving like a normal node and not
+//!   touching motion topics, can only be caught by the operator reviewing
+//!   the participant list. See the `learner` docs.
 
 pub mod input;
 pub mod learner;
 pub mod ops;
+pub mod profile_file;
+pub mod signoff;
 pub mod stats;
 
 pub use input::{
@@ -48,15 +64,17 @@ pub use input::{
     VecSource,
 };
 pub use learner::{
-    envelope_bound, Commissioning, CommissioningReport, ConfigError, LearnConfig, Learner,
-    ProfileSlot, RawTopicReport, SeenAt, ServiceReport, Warning, WarningLevel, PARAMETER_SERVICES,
-    ROS_INTERNAL_RAW_TOPICS,
+    envelope_bound, is_motion_like, Commissioning, CommissioningReport, ConfigError, LearnConfig,
+    Learner, Limits, ParticipantStatus, ProfileSlot, RawTopicReport, SeenAt, ServiceReport,
+    Warning, WarningLevel, PARAMETER_SERVICES, ROS_INTERNAL_RAW_TOPICS,
 };
 pub use ops::{
-    check_event, diff, lock, merge_profiles, CheckReport, Checker, LockRefusal, MergeError,
-    ProfileDiff,
+    check_event, diff, lock, lock_draft_text, lockable, merge_profiles, CheckReport, Checker,
+    LockRefusal, MergeError, ProfileDiff,
 };
-pub use stats::SpeedStats;
+pub use profile_file::{parse_profile_text, sealed_text, write_file_atomic, ProfileFileError};
+pub use signoff::{Signoff, SignoffItem};
+pub use stats::{SampleBuffer, SpeedStats};
 
 /// Serialise a value as pretty JSON with a trailing newline. All file output
 /// goes through here so `learn` twice over the same input is byte-identical.

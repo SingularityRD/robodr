@@ -14,7 +14,7 @@
 //! The PRNG is a std-only SplitMix64 with fixed seeds, so failures are
 //! reproducible: the failing seed is printed.
 
-use robodr_commission::{lock, Checker, LearnConfig, Learner, VecSource};
+use robodr_commission::{lock, Checker, Commissioning, LearnConfig, Learner, VecSource};
 use robodr_events::graph::{Endpoint, Participant};
 use robodr_events::profile::Profile;
 use robodr_events::{MotionCommand, MotionFeedback, RobotEvent};
@@ -227,7 +227,7 @@ fn ceiling(r: &mut Rng, max: f64) -> Option<f64> {
     Some(if c.is_finite() { c } else { f64::MAX })
 }
 
-fn learn(cfg: &LearnConfig, runs: &[Vec<RobotEvent>], merged: bool) -> Profile {
+fn learn(cfg: &LearnConfig, runs: &[Vec<RobotEvent>], merged: bool) -> Commissioning {
     if merged {
         let mut acc: Option<Learner> = None;
         for (i, run) in runs.iter().enumerate() {
@@ -239,14 +239,14 @@ fn learn(cfg: &LearnConfig, runs: &[Vec<RobotEvent>], merged: bool) -> Profile {
                 None => acc = Some(l),
             }
         }
-        acc.unwrap().profile()
+        acc.unwrap().finish()
     } else {
         let mut l = Learner::new(cfg.clone()).unwrap();
         for (i, run) in runs.iter().enumerate() {
             l.ingest(&mut VecSource::new(format!("run{i}"), run.clone()))
                 .unwrap();
         }
-        l.profile()
+        l.finish()
     }
 }
 
@@ -256,13 +256,22 @@ fn learn_lock_check_over_clean_runs_gives_zero_deviations() {
     for seed in 0..400u64 {
         let mut r = Rng(seed.wrapping_mul(0x2545_f491_4f6c_dd1d) ^ 0x5eed);
         let evs = clean_run(&mut r);
+        // The anti-poisoning gate is opened fully here (every announced
+        // participant accepted, no hard cap below f64::MAX): this property
+        // is about routing and envelope math. The default gate is covered
+        // by `default_gate_only_ever_tightens` below.
         let cfg = LearnConfig {
             model: "prop-model".into(),
             margin: 1.0 + 2.0 * r.unit(),
             ceiling_linear: ceiling(&mut r, max_speed(&evs, true)),
             ceiling_joint: ceiling(&mut r, max_speed(&evs, false)),
+            hard_cap_linear: f64::MAX,
+            hard_cap_joint: f64::MAX,
             min_samples: 30,
             learn_readers: r.chance(1, 2),
+            min_participant_announcements: 1,
+            min_participant_duration: std::time::Duration::ZERO,
+            ..Default::default()
         };
         // Split into 1..=3 runs.
         let n_runs = 1 + r.below(3);
@@ -271,10 +280,12 @@ fn learn_lock_check_over_clean_runs_gives_zero_deviations() {
             runs[r.below(n_runs)].push(e.clone());
         }
         let merged = r.chance(1, 2);
-        let profile = learn(&cfg, &runs, merged);
+        let c = learn(&cfg, &runs, merged);
+        let profile = c.profile;
 
         assert_eq!(profile.validate(), Ok(()), "seed {seed}");
-        let locked = lock(&profile).unwrap_or_else(|why| panic!("seed {seed}: {why:?}"));
+        let signoff = c.signoff.confirm_all("prop-test");
+        let locked = lock(&profile, &signoff).unwrap_or_else(|why| panic!("seed {seed}: {why:?}"));
         // Through JSON, exactly as the CLI hands it to `check`.
         let json = serde_json::to_string(&locked).unwrap();
         let locked: Profile = serde_json::from_str(&json).unwrap();
@@ -318,4 +329,57 @@ fn learn_lock_check_over_clean_runs_gives_zero_deviations() {
         cases += 1;
     }
     assert_eq!(cases, 400);
+}
+
+/// With the default anti-poisoning gate and hard caps, the learned profile
+/// is always a subset of the permissive one (the gate only ever removes
+/// entries and tightens envelopes), every bound is within the hard cap, and
+/// the result validates.
+#[test]
+fn default_gate_only_ever_tightens() {
+    for seed in 0..300u64 {
+        let mut r = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0xfeed);
+        let evs = clean_run(&mut r);
+        let permissive = LearnConfig {
+            model: "m".into(),
+            hard_cap_linear: f64::MAX,
+            hard_cap_joint: f64::MAX,
+            min_participant_announcements: 1,
+            min_participant_duration: std::time::Duration::ZERO,
+            ..Default::default()
+        };
+        let strict = LearnConfig {
+            model: "m".into(),
+            ..Default::default()
+        };
+        let runs = vec![evs];
+        let a = learn(&permissive, &runs, false).profile;
+        let b = learn(&strict, &runs, false).profile;
+        assert_eq!(b.validate(), Ok(()), "seed {seed}");
+        assert!(b.participants.is_subset(&a.participants), "seed {seed}");
+        assert!(b.writer_topics.is_subset(&a.writer_topics), "seed {seed}");
+        assert!(b.services.is_subset(&a.services), "seed {seed}");
+        assert!(b.actions.is_subset(&a.actions), "seed {seed}");
+        assert!(b.raw_dds_topics.is_subset(&a.raw_dds_topics), "seed {seed}");
+        for (ch, env) in &b.motion_envelopes {
+            let pa = &a.motion_envelopes[ch];
+            for (x, y, cap) in [
+                (
+                    env.max_linear_speed,
+                    pa.max_linear_speed,
+                    strict.hard_cap_linear,
+                ),
+                (
+                    env.max_joint_speed,
+                    pa.max_joint_speed,
+                    strict.hard_cap_joint,
+                ),
+            ] {
+                if let Some(x) = x {
+                    assert!(x <= cap, "seed {seed}: {x} > {cap}");
+                    assert!(x <= y.unwrap(), "seed {seed}");
+                }
+            }
+        }
+    }
 }
