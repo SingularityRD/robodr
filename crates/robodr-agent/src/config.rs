@@ -1,4 +1,18 @@
 //! Agent configuration and errors.
+//!
+//! [`AgentConfig::validate`] (run by [`crate::Agent::new`]) refuses a
+//! configuration that would silently weaken detection: an invalid profile,
+//! a platform mismatch, a non-finite or infinite firewall limit, a zero
+//! Kafka partition count, or trusted labels that cannot produce a valid
+//! finding (probed at start, so a bad label fails once instead of on every
+//! finding).
+//!
+//! Files are parsed with [`strict_from_str`], which rejects unknown fields
+//! at any depth. `Profile` and `MonitorConfig` default every missing field,
+//! so without it a typo such as `"lockd": true` would silently leave the
+//! profile in observe mode, or a misspelt threshold would silently fall
+//! back to its default. JSON cannot encode NaN or infinity, and
+//! `serde_json` refuses out-of-range numbers such as `1e400`.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -9,6 +23,10 @@ use robodr_firewall::{ChannelKind, ChannelSpec, PlatformConfig};
 use robodr_motion::{FeedbackSource, MonitorConfig};
 use robodr_ocsf::{AttestationStatus, RobotInfo};
 use robodr_responder::{OperationalContext, PolicyError, ResponsePolicy};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+
+use crate::clock::DEFAULT_CLOCK_JUMP_TOLERANCE_NS;
 
 /// Upper bound on distinct findings whose first-seen time and occurrence
 /// count the agent remembers. Beyond it, new findings are reported with
@@ -48,6 +66,10 @@ pub struct AgentConfig {
     /// deviation or a non-pass firewall verdict. Off by default: motion
     /// topics run at 50-1000 Hz and would flood the recorder.
     pub record_all_events: bool,
+    /// Largest tolerated disagreement between wall-time and monotonic-time
+    /// progress between two observations before a
+    /// [`crate::FaultKind::WallClockJump`] is recorded. `u64::MAX` disables.
+    pub clock_jump_tolerance_ns: u64,
 }
 
 impl AgentConfig {
@@ -70,7 +92,88 @@ impl AgentConfig {
             attestation: AttestationStatus::Unknown,
             kafka_partitions: None,
             record_all_events: false,
+            clock_jump_tolerance_ns: DEFAULT_CLOCK_JUMP_TOLERANCE_NS,
         }
+    }
+
+    /// Checks that need no I/O (the agent additionally probes a finding and
+    /// compiles the firewall and monitor). Called by [`crate::Agent::new`].
+    pub fn validate(&self) -> Result<(), AgentError> {
+        self.profile.validate().map_err(AgentError::Profile)?;
+        if !robodr_ocsf::validate::is_valid_robot_id(&self.robot.id) {
+            return Err(AgentError::Config(format!(
+                "robot id {:?} must match [A-Za-z0-9._-]{{1,64}}",
+                self.robot.id
+            )));
+        }
+        if self.context.platform != self.policy.platform {
+            return Err(AgentError::Config(format!(
+                "context platform {:?} does not match policy platform {:?}",
+                self.context.platform, self.policy.platform
+            )));
+        }
+        if self.kafka_partitions == Some(0) {
+            return Err(AgentError::Config(
+                "kafka_partitions must be >= 1 (or unset)".into(),
+            ));
+        }
+        if let Some(m) = &self.monitor {
+            if let Some(bad) = m
+                .feedback_sources
+                .keys()
+                .find(|k| k.is_empty() || k.chars().any(char::is_control))
+            {
+                return Err(AgentError::Config(format!(
+                    "monitor feedback channel {bad:?} is empty or has control characters"
+                )));
+            }
+        }
+        if let Some(fw) = &self.firewall {
+            fw.validate().map_err(AgentError::Config)?;
+        }
+        Ok(())
+    }
+}
+
+/// Parse `text` as `T`, refusing any object key (at any depth) that `T` does
+/// not keep. Works for types whose serialisation writes every field (no
+/// `skip_serializing*`), which holds for `Profile` and `MonitorConfig`.
+pub fn strict_from_str<T: DeserializeOwned + Serialize>(text: &str) -> Result<T, String> {
+    let raw: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let parsed: T = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let back = serde_json::to_value(&parsed).map_err(|e| e.to_string())?;
+    let mut unknown = Vec::new();
+    unknown_keys(&raw, &back, String::new(), &mut unknown);
+    if unknown.is_empty() {
+        Ok(parsed)
+    } else {
+        Err(format!("unknown field(s): {}", unknown.join(", ")))
+    }
+}
+
+fn unknown_keys(
+    raw: &serde_json::Value,
+    back: &serde_json::Value,
+    path: String,
+    out: &mut Vec<String>,
+) {
+    use serde_json::Value;
+    match (raw, back) {
+        (Value::Object(r), Value::Object(b)) => {
+            for (k, v) in r {
+                let p = format!("{path}/{k}");
+                match b.get(k) {
+                    None => out.push(p),
+                    Some(bv) => unknown_keys(v, bv, p, out),
+                }
+            }
+        }
+        (Value::Array(r), Value::Array(b)) => {
+            for (i, (rv, bv)) in r.iter().zip(b).enumerate() {
+                unknown_keys(rv, bv, format!("{path}/{i}"), out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -103,6 +206,12 @@ impl MonitorSettings {
             .unwrap_or(self.default_source)
     }
 }
+
+/// Angular speed bound (rad/s) that [`FirewallSettings::from_profile`] puts
+/// on Twist channels. The profile has no angular field, and a missing bound
+/// means "unlimited": a conservative explicit value for demos and replays.
+/// Production must set the OEM's value.
+pub const DEFAULT_MAX_ANGULAR_SPEED: f64 = 1.0;
 
 /// Motion Firewall settings: per-platform behaviour plus one spec per
 /// profiled motion channel (the firewall refuses a policy that misses one).
@@ -141,6 +250,8 @@ impl FirewallSettings {
                     ChannelSpec {
                         kind,
                         allowed_sources,
+                        max_angular_speed: (kind == ChannelKind::Twist)
+                            .then_some(DEFAULT_MAX_ANGULAR_SPEED),
                         ..ChannelSpec::default()
                     },
                 )
@@ -150,6 +261,45 @@ impl FirewallSettings {
             platform: PlatformConfig::default(),
             channels,
         }
+    }
+
+    /// Refuse limits the firewall would accept but that disable protection:
+    /// `+inf` (the firewall only refuses NaN and negatives, and treats a
+    /// missing limit as unlimited), a non-finite or < 1 hard-reject factor,
+    /// and a zero deviation buffer.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.platform.event_capacity == 0 {
+            return Err("firewall event_capacity must be >= 1".into());
+        }
+        for (name, c) in &self.channels {
+            let limits = [
+                ("max_linear_speed", c.max_linear_speed),
+                ("max_angular_speed", c.max_angular_speed),
+                ("max_joint_speed", c.max_joint_speed),
+                ("max_linear_accel", c.max_linear_accel),
+                ("max_angular_accel", c.max_angular_accel),
+                ("max_joint_accel", c.max_joint_accel),
+                ("max_linear_jerk", c.max_linear_jerk),
+                ("max_angular_jerk", c.max_angular_jerk),
+                ("max_joint_jerk", c.max_joint_jerk),
+            ];
+            for (field, v) in limits {
+                if let Some(v) = v {
+                    if !v.is_finite() || v < 0.0 {
+                        return Err(format!(
+                            "firewall channel {name:?}: {field} must be finite and >= 0, got {v}"
+                        ));
+                    }
+                }
+            }
+            if !c.hard_reject_factor.is_finite() || c.hard_reject_factor < 1.0 {
+                return Err(format!(
+                    "firewall channel {name:?}: hard_reject_factor must be finite and >= 1, got {}",
+                    c.hard_reject_factor
+                ));
+            }
+        }
+        Ok(())
     }
 }
 

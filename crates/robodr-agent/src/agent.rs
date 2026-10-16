@@ -29,12 +29,41 @@
 //! * **Detections survive storage failure.** If a black-box append fails or
 //!   is refused, the outcome and finding are still produced, without that
 //!   evidence link, and the error is reported in [`EvidenceLinks::errors`].
+//!   The plan is never weakened or dropped because evidence could not be
+//!   written (losing storage must not make the robot less protected).
+//!
+//! # Failure handling (fail-safe)
+//!
+//! Every internal failure is turned into an [`AgentFault`], kept in a
+//! bounded in-memory log ([`Agent::faults`], newest
+//! [`MAX_RETAINED_FAULTS`]) and, whenever the black box can take it, written
+//! as a signed `robodr.agent_fault` note. Faults never feed the responder, so
+//! an agent-internal problem cannot by itself cause a motion request.
+//!
+//! * **Black-box write failure.** An I/O failure poisons the recorder; the
+//!   agent then drops it and reopens the directory (the recorder resumes the
+//!   chain, quarantines a torn tail and signs a `Resume` record), at most once
+//!   per [`BLACKBOX_REOPEN_BACKOFF_NS`] of monotonic time, and retries the
+//!   append once. While the black box is down, detections, plans and
+//!   findings continue without evidence links. When it is back, a
+//!   `evidence_recovered` fault note records how many appends were lost.
+//! * **Responder output violating an invariant** is replaced by `Record` +
+//!   human approval (see [`guard`]); the rejected plan is kept in the
+//!   black-box plan note for review.
+//! * **Clock anomalies** (monotonic regression, wall/monotonic jump) are
+//!   handled by [`crate::clock::TimeGuard`] and recorded as faults.
+//!
+//! The release profile builds with `panic = "abort"`, so a panic in a
+//! dependency cannot be caught here; the chain is written not to panic on
+//! hostile input (tested), and the platform's safety system is never
+//! dependent on this process being alive.
 //!
 //! # Time
 //!
 //! [`Agent::handle`] takes the event's observation time; [`Agent::tick`]
-//! reads it from the injected clock. `mono_ns` is clamped so it never goes
-//! backwards (regressions are counted in [`AgentStats`]).
+//! reads it from the injected clock. Times pass through a
+//! [`crate::clock::TimeGuard`]: `mono_ns` never goes backwards and wall jumps
+//! are reported (see [`crate::clock`]).
 //!
 //! # Mapping `MotionCommand` to the firewall
 //!
@@ -58,10 +87,14 @@
 //! detail and in the black-box event record, so a NaN command still yields a
 //! valid Critical finding.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use robodr_blackbox::crypto::to_hex;
-use robodr_blackbox::{AppendOutcome, Checkpoint, Clock, Recorder, Signer, Timestamp};
+use robodr_blackbox::sign::SignError;
+use robodr_blackbox::{
+    AppendOutcome, Checkpoint, Clock, Recorder, RecorderConfig, Signer, Timestamp,
+};
 use robodr_events::profile::Profile;
 use robodr_events::{Deviation, MotionCommand, RobotEvent, Severity};
 use robodr_firewall::{
@@ -79,14 +112,22 @@ use robodr_responder::{
 };
 use serde::Serialize;
 
-use crate::clock::FollowClock;
+use crate::clock::{ClockAnomaly, FollowClock, TimeGuard};
 use crate::config::{
     profile_sha256, AgentConfig, AgentError, MonitorSettings, MAX_TRACKED_FINDINGS,
 };
 use crate::executor::{ExecutionRequest, Executor, NoopExecutor};
 use crate::outcome::{
-    Detector, Disposition, EvidenceLinks, FindingOutput, FirewallVerdictRecord, Outcome,
+    AgentFault, Detector, Disposition, EvidenceLinks, FaultKind, FindingOutput,
+    FirewallVerdictRecord, Outcome,
 };
+
+/// Newest faults kept in memory by [`Agent::faults`]; older ones are
+/// dropped (and counted in [`AgentStats::faults_dropped`]).
+pub const MAX_RETAINED_FAULTS: usize = 256;
+
+/// Minimum monotonic time between two attempts to reopen a failed black box.
+pub const BLACKBOX_REOPEN_BACKOFF_NS: u64 = 1_000_000_000;
 
 /// Counters for operators and tests. All saturating.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -99,7 +140,60 @@ pub struct AgentStats {
     pub evidence_errors: u64,
     pub guard_violations: u64,
     pub clock_regressions: u64,
+    pub wall_clock_jumps: u64,
     pub firewall_checks: u64,
+    /// Agent faults raised (all kinds).
+    pub faults: u64,
+    /// Faults evicted from the bounded in-memory log.
+    pub faults_dropped: u64,
+    /// Successful black-box reopens after a failure.
+    pub blackbox_reopens: u64,
+}
+
+/// A signer shared between the agent and every recorder it opens, so a
+/// failed recorder can be dropped and the directory reopened with the same
+/// key. Key id and algorithm are captured once.
+#[derive(Clone)]
+struct SharedSigner {
+    algorithm: String,
+    key_id: String,
+    inner: Arc<Mutex<Box<dyn Signer>>>,
+}
+
+impl SharedSigner {
+    fn new(signer: Box<dyn Signer>) -> Self {
+        Self {
+            algorithm: signer.algorithm().to_string(),
+            key_id: signer.key_id().to_string(),
+            inner: Arc::new(Mutex::new(signer)),
+        }
+    }
+}
+
+impl Signer for SharedSigner {
+    fn algorithm(&self) -> &str {
+        &self.algorithm
+    }
+    fn key_id(&self) -> &str {
+        &self.key_id
+    }
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, SignError> {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .sign(message)
+    }
+}
+
+/// Note payload for an agent fault in the black box.
+#[derive(Serialize)]
+struct FaultNote<'a> {
+    kind: &'static str,
+    fault: FaultKind,
+    mono_ns: u64,
+    wall_ns: u64,
+    detail: &'a str,
+    clock: Option<ClockAnomaly>,
 }
 
 /// Note payload for a plan in the black box.
@@ -110,6 +204,8 @@ struct PlanNote<'a> {
     disposition: Disposition,
     guard_violation: Option<&'a str>,
     plan: &'a ResponsePlan,
+    /// The responder's plan the backstop replaced, if it did.
+    rejected_plan: Option<&'a ResponsePlan>,
 }
 
 /// Note payload for a firewall verdict in the black box.
@@ -139,14 +235,25 @@ pub struct Agent {
     partitions: Option<u32>,
     record_all_events: bool,
     responder: Responder,
-    recorder: Recorder,
+    /// `None` while the black box is unavailable (see module docs).
+    recorder: Option<Recorder>,
+    blackbox_cfg: RecorderConfig,
+    signer: SharedSigner,
+    /// Monotonic time of the first failure of the current outage.
+    blackbox_down_since: Option<u64>,
+    last_reopen_attempt: Option<u64>,
+    /// Appends lost during the current outage.
+    lost_while_down: u64,
     follow: FollowClock,
     clock: Box<dyn Clock>,
+    time: TimeGuard,
     firewall: Option<FirewallState>,
     monitor: Option<MonitorState>,
     executor: Box<dyn Executor>,
+    /// Plans are marked as coming from a replay (see [`ExecutionRequest`]).
+    replay: bool,
     seen: BTreeMap<String, (u64, u64)>,
-    last_mono: Option<u64>,
+    faults: VecDeque<AgentFault>,
     stats: AgentStats,
 }
 
@@ -177,19 +284,7 @@ impl Agent {
         signer: Box<dyn Signer>,
         clock: Box<dyn Clock>,
     ) -> Result<Self, AgentError> {
-        cfg.profile.validate().map_err(AgentError::Profile)?;
-        if !robodr_ocsf::validate::is_valid_robot_id(&cfg.robot.id) {
-            return Err(AgentError::Config(format!(
-                "robot id {:?} must match [A-Za-z0-9._-]{{1,64}}",
-                cfg.robot.id
-            )));
-        }
-        if cfg.context.platform != cfg.policy.platform {
-            return Err(AgentError::Config(format!(
-                "context platform {:?} does not match policy platform {:?}",
-                cfg.context.platform, cfg.policy.platform
-            )));
-        }
+        cfg.validate()?;
         let responder = Responder::new(cfg.policy).map_err(AgentError::Policy)?;
         let firewall = match cfg.firewall {
             None => None,
@@ -229,9 +324,17 @@ impl Agent {
             mode,
         );
         let start = clock.now();
+        // Fail at start, not on every finding, if the trusted labels (model,
+        // site, profile version, ...) cannot produce a valid finding.
+        probe_finding(&ocsf, start, cfg.kafka_partitions).map_err(AgentError::Config)?;
         let follow = FollowClock::new(start);
-        let recorder = Recorder::open(cfg.blackbox, signer, Box::new(follow.clone()))
-            .map_err(AgentError::BlackBox)?;
+        let signer = SharedSigner::new(signer);
+        let recorder = Recorder::open(
+            cfg.blackbox.clone(),
+            Box::new(signer.clone()),
+            Box::new(follow.clone()),
+        )
+        .map_err(AgentError::BlackBox)?;
         let context = OperationalContext {
             profile_locked: cfg.profile.locked,
             ..cfg.context
@@ -244,16 +347,51 @@ impl Agent {
             partitions: cfg.kafka_partitions,
             record_all_events: cfg.record_all_events,
             responder,
-            recorder,
+            recorder: Some(recorder),
+            blackbox_cfg: cfg.blackbox,
+            signer,
+            blackbox_down_since: None,
+            last_reopen_attempt: None,
+            lost_while_down: 0,
             follow,
             clock,
+            time: TimeGuard::new(start, cfg.clock_jump_tolerance_ns),
             firewall,
             monitor,
             executor: Box::new(NoopExecutor),
+            replay: false,
             seen: BTreeMap::new(),
-            last_mono: Some(start.mono_ns),
+            faults: VecDeque::new(),
             stats: AgentStats::default(),
         })
+    }
+
+    /// Mark every [`ExecutionRequest`] from this agent as a replay: an
+    /// executor must act on nothing (see [`crate::executor`]).
+    pub(crate) fn mark_replay(&mut self) {
+        self.replay = true;
+    }
+
+    /// Whether this agent's plans are marked as replayed.
+    pub fn is_replay(&self) -> bool {
+        self.replay
+    }
+
+    /// The newest agent faults (at most [`MAX_RETAINED_FAULTS`]), oldest
+    /// first.
+    pub fn faults(&self) -> impl Iterator<Item = &AgentFault> {
+        self.faults.iter()
+    }
+
+    /// Remove and return the retained faults (e.g. to forward them to a
+    /// health channel).
+    pub fn take_faults(&mut self) -> Vec<AgentFault> {
+        self.faults.drain(..).collect()
+    }
+
+    /// `true` while the black box is failing (appends are being lost).
+    pub fn evidence_degraded(&self) -> bool {
+        self.blackbox_down_since.is_some()
     }
 
     /// Replace the executor (default: [`NoopExecutor`]).
@@ -273,12 +411,13 @@ impl Agent {
 
     /// The black-box directory.
     pub fn blackbox_dir(&self) -> &std::path::Path {
-        self.recorder.dir()
+        &self.blackbox_cfg.dir
     }
 
-    /// Current head `(seq, hash)` of the black box.
+    /// Current head `(seq, hash)` of the black box (`None` while it is
+    /// unavailable).
     pub fn blackbox_head(&self) -> Option<(u64, robodr_blackbox::Hash)> {
-        self.recorder.head()
+        self.recorder.as_ref().and_then(Recorder::head)
     }
 
     /// Handle `event` at the injected clock's current time.
@@ -296,8 +435,11 @@ impl Agent {
         event: &RobotEvent,
         safety: SafetyState,
     ) -> Vec<Outcome> {
-        let now = self.observe_time(now);
+        let (now, anomaly) = self.time.observe(now);
         self.follow.set(now);
+        if let Some(a) = anomaly {
+            self.clock_fault(now, a);
+        }
         self.stats.events = self.stats.events.saturating_add(1);
         let mono = now.mono_ns;
         let mode = self.profile.mode();
@@ -384,10 +526,10 @@ impl Agent {
                 profile_locked: self.profile.locked && !dev.is_observe_only(),
                 ..self.context
             };
-            let plan = self
+            let proposed = self
                 .responder
                 .plan(&dev, &source, safety, &ctx, mono / 1_000_000);
-            let (plan, guard_violation) = guard(plan, &dev, safety, &ctx);
+            let (plan, guard_violation) = guard(proposed.clone(), &dev, safety, &ctx);
             if guard_violation.is_some() {
                 self.stats.guard_violations = self.stats.guard_violations.saturating_add(1);
             }
@@ -412,6 +554,7 @@ impl Agent {
                 disposition,
                 guard_violation: guard_violation.as_deref(),
                 plan: &plan,
+                rejected_plan: guard_violation.is_some().then_some(&proposed),
             };
             let critical = plan.max_step > Step::Record || dev.severity >= Severity::High;
             let mut errs = Vec::new();
@@ -433,6 +576,7 @@ impl Agent {
                 context: &ctx,
                 evidence: &refs,
                 finding_id: finding.as_ref().map(|f| f.key.as_str()),
+                replay: self.replay,
             });
 
             outcomes.push(Outcome {
@@ -455,56 +599,218 @@ impl Agent {
         outcomes
     }
 
-    /// Seal and close the black box. Returns the final checkpoint.
-    pub fn finish(self) -> Result<Finished, AgentError> {
+    /// Seal and close the black box. Returns the final checkpoint. If the
+    /// black box is down, one last reopen is attempted (ignoring the
+    /// backoff) so what was recorded is sealed.
+    pub fn finish(mut self) -> Result<Finished, AgentError> {
+        if self.recorder.is_none() {
+            self.last_reopen_attempt = None;
+            self.try_reopen();
+        }
         let stats = self.stats;
-        let checkpoint = self.recorder.close().map_err(AgentError::BlackBox)?;
+        let recorder = self
+            .recorder
+            .take()
+            .ok_or(AgentError::BlackBox(robodr_blackbox::Error::Poisoned))?;
+        let checkpoint = recorder.close().map_err(AgentError::BlackBox)?;
         Ok(Finished { checkpoint, stats })
     }
 
-    fn observe_time(&mut self, now: Timestamp) -> Timestamp {
-        let mono = match self.last_mono {
-            Some(prev) if now.mono_ns < prev => {
+    fn clock_fault(&mut self, now: Timestamp, a: ClockAnomaly) {
+        let (kind, detail) = match a {
+            ClockAnomaly::MonoRegression {
+                observed_ns,
+                held_ns,
+            } => {
                 self.stats.clock_regressions = self.stats.clock_regressions.saturating_add(1);
-                prev
+                (
+                    FaultKind::ClockRegression,
+                    format!("monotonic time went back from {held_ns} to {observed_ns} ns; held"),
+                )
             }
-            _ => now.mono_ns,
+            ClockAnomaly::WallJump {
+                wall_delta_ns,
+                mono_delta_ns,
+            } => {
+                self.stats.wall_clock_jumps = self.stats.wall_clock_jumps.saturating_add(1);
+                (
+                    FaultKind::WallClockJump,
+                    format!(
+                        "wall time moved {wall_delta_ns} ns while monotonic moved {mono_delta_ns} ns"
+                    ),
+                )
+            }
         };
-        self.last_mono = Some(mono);
-        Timestamp {
-            mono_ns: mono,
-            ..now
+        self.fault(kind, now, detail, Some(a), true);
+    }
+
+    /// Raise a fault: keep it in memory and, if `to_blackbox`, append it as a
+    /// critical note (through [`Self::append`], whose own failures are
+    /// recorded in memory only, so this never recurses).
+    fn fault(
+        &mut self,
+        kind: FaultKind,
+        now: Timestamp,
+        detail: String,
+        clock: Option<ClockAnomaly>,
+        to_blackbox: bool,
+    ) {
+        self.stats.faults = self.stats.faults.saturating_add(1);
+        let record = if to_blackbox {
+            let note = FaultNote {
+                kind: "robodr.agent_fault",
+                fault: kind,
+                mono_ns: now.mono_ns,
+                wall_ns: now.wall_ns,
+                detail: &detail,
+                clock,
+            };
+            let mut errs = Vec::new();
+            self.append("agent fault", &mut errs, |r| r.append_note(&note, true))
+        } else {
+            None
+        };
+        if self.faults.len() >= MAX_RETAINED_FAULTS {
+            self.faults.pop_front();
+            self.stats.faults_dropped = self.stats.faults_dropped.saturating_add(1);
         }
+        self.faults.push_back(AgentFault {
+            kind,
+            mono_ns: now.mono_ns,
+            wall_ns: now.wall_ns,
+            detail,
+            clock,
+            record,
+        });
+    }
+
+    /// Drop the failed recorder and reopen the directory. Rate-limited by
+    /// [`BLACKBOX_REOPEN_BACKOFF_NS`]. Returns `true` if a recorder is open
+    /// afterwards.
+    fn try_reopen(&mut self) -> bool {
+        let now = self.time.last();
+        if let Some(t) = self.last_reopen_attempt {
+            if now.mono_ns.saturating_sub(t) < BLACKBOX_REOPEN_BACKOFF_NS {
+                return false;
+            }
+        }
+        self.last_reopen_attempt = Some(now.mono_ns);
+        // Single writer: the old recorder (and its file handle) goes first.
+        self.recorder = None;
+        match Recorder::open(
+            self.blackbox_cfg.clone(),
+            Box::new(self.signer.clone()),
+            Box::new(self.follow.clone()),
+        ) {
+            Ok(r) => {
+                self.recorder = Some(r);
+                self.stats.blackbox_reopens = self.stats.blackbox_reopens.saturating_add(1);
+                true
+            }
+            Err(e) => {
+                self.fault(
+                    FaultKind::EvidenceRecoveryFailed,
+                    now,
+                    format!("reopening the black box failed: {e}"),
+                    None,
+                    false,
+                );
+                false
+            }
+        }
+    }
+
+    /// First failed append of an outage: remember it (in memory only; the
+    /// black box is the thing that failed).
+    fn evidence_down(&mut self, what: &str, e: &robodr_blackbox::Error) {
+        if self.blackbox_down_since.is_none() {
+            let now = self.time.last();
+            self.blackbox_down_since = Some(now.mono_ns);
+            self.fault(
+                FaultKind::EvidenceWriteFailed,
+                now,
+                format!("{what}: {e}"),
+                None,
+                false,
+            );
+        }
+    }
+
+    /// A successful append after an outage: record the gap in the chain.
+    fn evidence_up(&mut self) {
+        let Some(since) = self.blackbox_down_since.take() else {
+            return;
+        };
+        let lost = std::mem::take(&mut self.lost_while_down);
+        let now = self.time.last();
+        let detail = format!(
+            "black box available again; {lost} appends lost since mono {since} ns ({} reopens so far)",
+            self.stats.blackbox_reopens
+        );
+        self.fault(FaultKind::EvidenceRecovered, now, detail, None, true);
     }
 
     fn append(
         &mut self,
         what: &str,
         errors: &mut Vec<String>,
-        f: impl FnOnce(&mut Recorder) -> Result<AppendOutcome, robodr_blackbox::Error>,
+        mut f: impl FnMut(&mut Recorder) -> Result<AppendOutcome, robodr_blackbox::Error>,
     ) -> Option<BlackBoxRef> {
-        let r = f(&mut self.recorder);
-        match r {
-            Ok(AppendOutcome::Recorded { seq, hash }) => {
-                self.stats.records_appended = self.stats.records_appended.saturating_add(1);
-                // The record went into the newest segment (rotation happens
-                // before a write, never after it).
-                let segment = self.recorder.segments().last().copied().unwrap_or(0);
-                Some(BlackBoxRef {
-                    segment,
-                    seq,
-                    sha256: to_hex(&hash),
-                })
-            }
-            Ok(AppendOutcome::Refused(why)) => {
-                self.stats.evidence_errors = self.stats.evidence_errors.saturating_add(1);
-                errors.push(format!("{what}: refused by black box ({why:?})"));
-                None
-            }
-            Err(e) => {
-                self.stats.evidence_errors = self.stats.evidence_errors.saturating_add(1);
-                errors.push(format!("{what}: {e}"));
-                None
+        use robodr_blackbox::Error as BbError;
+        let mut retried = false;
+        loop {
+            let r = match self.recorder.as_mut() {
+                Some(rec) => f(rec),
+                None => Err(BbError::Poisoned),
+            };
+            match r {
+                Ok(AppendOutcome::Recorded { seq, hash }) => {
+                    self.stats.records_appended = self.stats.records_appended.saturating_add(1);
+                    // The record went into the newest segment (rotation
+                    // happens before a write, never after it).
+                    let segment = self
+                        .recorder
+                        .as_ref()
+                        .and_then(|r| r.segments().last().copied())
+                        .unwrap_or(0);
+                    let out = BlackBoxRef {
+                        segment,
+                        seq,
+                        sha256: to_hex(&hash),
+                    };
+                    self.evidence_up();
+                    return Some(out);
+                }
+                Ok(AppendOutcome::Refused(why)) => {
+                    self.stats.evidence_errors = self.stats.evidence_errors.saturating_add(1);
+                    errors.push(format!("{what}: refused by black box ({why:?})"));
+                    return None;
+                }
+                Err(e) => {
+                    // Per-record problems (too large, encoding) say nothing
+                    // about the recorder; everything else is an outage.
+                    let outage = !matches!(e, BbError::PayloadTooLarge { .. } | BbError::Encode(_));
+                    if outage {
+                        self.evidence_down(what, &e);
+                        // A poisoned or missing recorder (or an I/O failure,
+                        // e.g. during rotation) needs a reopen; a signing
+                        // failure does not (nothing was written).
+                        let reopen = matches!(e, BbError::Poisoned | BbError::Io(_));
+                        if reopen && !retried && self.try_reopen() {
+                            retried = true;
+                            continue;
+                        }
+                        self.lost_while_down = self.lost_while_down.saturating_add(1);
+                    }
+                    self.stats.evidence_errors = self.stats.evidence_errors.saturating_add(1);
+                    let msg = if self.recorder.is_none() {
+                        format!("{what}: black box unavailable ({e})")
+                    } else {
+                        format!("{what}: {e}")
+                    };
+                    errors.push(msg);
+                    return None;
+                }
             }
         }
     }
@@ -575,6 +881,33 @@ impl Agent {
             Err(errs) => (None, errs.iter().map(ToString::to_string).collect()),
         }
     }
+}
+
+/// Build and validate one finding from the trusted configuration alone.
+fn probe_finding(
+    ctx: &RobotContext,
+    now: Timestamp,
+    partitions: Option<u32>,
+) -> Result<(), String> {
+    let dev = Deviation::new(
+        "robot.agent.config_check",
+        Severity::Low,
+        "configuration probe",
+    );
+    let ms = now.wall_ns / 1_000_000;
+    let env = FindingBuilder::from_deviation(&dev, ctx)
+        .seen(ms, ms)
+        .occurrences(1)
+        .build()
+        .map_err(|e| join_errors("trusted labels do not give a valid finding", &e))?;
+    robodr_ocsf::record(&env, partitions)
+        .map(|_| ())
+        .map_err(|e| join_errors("trusted labels do not give a valid finding", &e))
+}
+
+fn join_errors<E: std::fmt::Display>(what: &str, errs: &[E]) -> String {
+    let parts: Vec<String> = errs.iter().map(ToString::to_string).collect();
+    format!("{what}: {}", parts.join("; "))
 }
 
 /// Escalation key: deviations from one participant escalate together.

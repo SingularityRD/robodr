@@ -49,7 +49,7 @@ fn demo_run_writes_valid_findings_and_verifies() {
         "{err}"
     );
     assert!(err.contains("CLEAN"), "{err}");
-    assert!(err.contains("[executor:dry-run]"), "{err}");
+    assert!(err.contains("[executor:dry-run replay]"), "{err}");
     assert!(err.contains("awaiting human approval"), "{err}");
 
     // Same run, findings to a file; then the standalone verifier.
