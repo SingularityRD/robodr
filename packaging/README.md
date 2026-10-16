@@ -73,11 +73,13 @@ run it "with administrator privileges"). The capability set above is derived
 from Pulsar's code. **It has not been tested on a kernel.** If probes fail to
 load with `EPERM` on a target, use the drop-in example and record why.
 
-`WatchdogSec=` is not set, because neither daemon calls `sd_notify()` yet. With
-a watchdog set, systemd would kill a healthy daemon. `Restart=on-failure` with
-a start limit (5 starts in 300 s) covers crashes in the meantime. Follow-up:
-send `READY=1` and `WATCHDOG=1`, then switch to `Type=notify` and
-`WatchdogSec=30s`.
+`robodr-agentd` is `Type=notify` with `WatchdogSec=60s`: it sends `READY=1`
+after start-up and `WATCHDOG=1` from its main loop (at most once a second), so a
+stalled loop (slow fsync, hang) is killed and restarted. `robodr-pulsard` stays
+`Type=simple` without a watchdog, because Pulsar does not call `sd_notify()`;
+with `WatchdogSec=` set, systemd would kill a healthy daemon. For it,
+`Restart=on-failure` with a start limit (5 starts in 300 s) covers crashes.
+Neither watchdog has been exercised under a real systemd yet.
 
 ## Filesystem layout
 

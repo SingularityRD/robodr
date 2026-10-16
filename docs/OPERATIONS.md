@@ -476,10 +476,12 @@ Both units restart on failure, up to 5 times in 300 s, then stay failed. A
 failed unit does not affect the robot's operation; it does mean the robot is
 not being watched. Alert on it.
 
-`WatchdogSec=` is not configured yet, because the daemons do not send
-`sd_notify` keep-alives. A hung, still-alive daemon is therefore not
-restarted automatically. Monitor the findings and heartbeat flow on the fleet
-side.
+`robodr-agentd` runs as `Type=notify` with `WatchdogSec=60s`; a hung main
+loop is restarted. Its `status.json` carries `updated_mono_ms`, `boot_id` and
+`stale_after_ms`: treat a stale or other-boot status as `unknown`.
+`robodr-pulsard` has no watchdog (Pulsar does not send `sd_notify`
+keep-alives), so a hung, still-alive pulsard is not restarted automatically.
+Monitor the findings and heartbeat flow on the fleet side.
 
 ### 6.2 Pulsar API / CLI
 
