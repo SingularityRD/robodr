@@ -195,9 +195,12 @@ this was checked with stub binaries.
   capture under `IPAddressDeny=any`.
 - `robodr-agentd`'s flags, config path, key path and directories were
   checked against the merged daemon (the unit's header lists them).
-  `config/agentd.example.json` (installed under
-  `/usr/share/doc/robodr/examples/`) uses exactly the unit's paths; a unit
-  test in `robodr-agentd` keeps the two in sync. The daemon itself has not
+  `config/agentd.example.json` and `config/agentd.full.example.json`
+  (installed under `/usr/share/doc/robodr/examples/`) use exactly the
+  unit's paths; unit tests in `robodr-agentd` keep them in sync. The base
+  example passes `--check-config` as copied on a commissioned robot; the
+  full one also needs the trust-root and revocation files and the
+  finding-signing key with its drop-in (`20-finding-key.conf.example`). The daemon itself has not
   run under this unit on a real host (see the first point).
 - `install-bundle.sh install` and `rollback` have not been run against `dpkg`
   on a target. Only `verify` and the bundle round-trip were exercised.

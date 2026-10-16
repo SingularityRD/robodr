@@ -445,6 +445,13 @@ impl Packer {
         &self.state
     }
 
+    /// The configuration this packer was opened with (read-only: a caller
+    /// planning batches, e.g. `robodr-export`, checks its own limits against
+    /// it).
+    pub fn config(&self) -> &PackConfig {
+        &self.cfg
+    }
+
     pub fn outbox(&self) -> &Path {
         &self.outbox
     }

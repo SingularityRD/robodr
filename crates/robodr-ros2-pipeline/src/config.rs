@@ -71,6 +71,11 @@
 //! learning only), otherwise their own announcements are reported as
 //! mismatches. `discovery_server` lists the IPs of trusted Fast DDS
 //! discovery servers / relays whose relayed announcements are accepted.
+//! Entries are source IPs only: a GUID prefix (`PREFIX`, `PREFIX@IP`) is
+//! refused, because the RTPS sender prefix is chosen by the sender and a
+//! prefix-matched relay would let any host launder spoofed announcements
+//! (`robodr-commission` likewise requires a trusted server to be pinned by
+//! IP). Trust is per source IP, so pin the server's host.
 //! `local_addresses` / `detect_local_addresses` tell the sensor which
 //! addresses are this host's, so same-host participants talking over `lo`
 //! (Fast DDS sends unicast to local peers from `127.0.0.1`) are not reported;
@@ -1362,6 +1367,16 @@ mod tests {
         assert!(
             serde_json::from_str::<Config>(r#"{"binding": {"discovery_server": ["x"]}}"#).is_err()
         );
+        // A GUID prefix (alone or with an IP) is never a discovery server:
+        // the sender prefix is attacker-chosen, trust is by source IP only.
+        for spec in [
+            "aaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaa@10.0.0.2",
+            "@10.0.0.2",
+        ] {
+            let j = format!(r#"{{"binding": {{"discovery_server": ["{spec}"]}}}}"#);
+            assert!(serde_json::from_str::<Config>(&j).is_err(), "{spec}");
+        }
     }
 
     #[test]

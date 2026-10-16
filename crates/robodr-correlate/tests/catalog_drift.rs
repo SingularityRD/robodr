@@ -75,3 +75,54 @@ fn robot_ids_exist_in_other_crates() {
         "catalog ids no longer produced anywhere: {missing:?}"
     );
 }
+
+/// `robot.*` literals in other crates' sources that are not signals the
+/// correlation engine sees: ids the daemon never feeds back
+/// (`robot.agent.correlation_pressure`, `robot.correlate.*`), a probe that is
+/// never emitted, and unit-test fixtures.
+const NOT_SIGNALS: &[&str] = &[
+    "robot.agent.correlation_pressure",
+    "robot.agent.config_check",
+    "robot.capture.y",
+    "robot.rtps.x",
+    "robot.motion.envelope_exceeded",
+];
+
+#[test]
+fn every_robot_id_emitted_elsewhere_is_in_the_catalog() {
+    let mut files = Vec::new();
+    for e in fs::read_dir(repo().join("crates")).unwrap().flatten() {
+        let p = e.path();
+        // robodr-ocsf only holds the OCSF catalog of these ids.
+        if p.file_name()
+            .is_some_and(|n| n == "robodr-correlate" || n == "robodr-ocsf")
+        {
+            continue;
+        }
+        rs_files(&p.join("src"), &mut files);
+    }
+    let mut missing = std::collections::BTreeSet::new();
+    for text in files.iter().filter_map(|p| fs::read_to_string(p).ok()) {
+        for (i, _) in text.match_indices("\"robot.") {
+            let rest = &text[i + 1..];
+            let Some(end) = rest.find('"') else { continue };
+            let id = &rest[..end];
+            let shaped = id.split('.').count() == 3
+                && id.split('.').all(|s| !s.is_empty())
+                && id.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'.'
+                });
+            if shaped
+                && !id.starts_with("robot.correlate.")
+                && !NOT_SIGNALS.contains(&id)
+                && !NETWORK_AND_AGENT_RULES.contains(&id)
+            {
+                missing.insert(id.to_string());
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "robot.* ids emitted but missing from NETWORK_AND_AGENT_RULES: {missing:?}"
+    );
+}

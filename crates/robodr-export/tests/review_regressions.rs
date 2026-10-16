@@ -92,10 +92,17 @@ impl SplitFixture {
         Packer::open(&self.outbox, &self.pack_state, pc.clone(), signer()).unwrap()
     }
 
-    /// Run the unchecked exporter (limits 10 000 vs the packer's 2): the
-    /// split's second batch fails. Returns the published batch name.
+    /// Run the unchecked exporter (limits 10 000 vs the packer's 2; only
+    /// possible through the test-only `fault-injection` feature, since
+    /// `Exporter::open` refuses mismatched limits): the split's second batch
+    /// fails. Returns the published batch name.
     fn fail_split(&self, pc: &PackConfig) -> String {
-        let mut x = Exporter::open(
+        assert!(Exporter::open(
+            ExportConfig::new(&self.spool, &self.export_state),
+            self.packer(pc),
+        )
+        .is_err());
+        let mut x = Exporter::open_unchecked_for_fault_injection(
             ExportConfig::new(&self.spool, &self.export_state),
             self.packer(pc),
         )
@@ -113,8 +120,9 @@ impl SplitFixture {
     /// Re-open (what the binary does after an error) and return the
     /// recovery verdict.
     fn reopen(&self, pc: &PackConfig) -> Option<String> {
+        // Recovery runs under the checked open with matching limits.
         let x = Exporter::open(
-            ExportConfig::new(&self.spool, &self.export_state),
+            ExportConfig::for_packer(&self.spool, &self.export_state, pc),
             self.packer(pc),
         )
         .unwrap();

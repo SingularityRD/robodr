@@ -71,6 +71,59 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
     `argv CONTAINS` literal with spaces without a warning when the same AND
     chain pins `payload.argc == N`.
 
+- Wave 7 (review fixes, integrated on `integrate-w6`):
+  - Profile trust: with `trust_roots` configured the trust file must be
+    root-signed, and a locked profile must carry a verified
+    `metadata.attestation` (the exact signed sign-off and its operator
+    signatures, checked against the trust file's operators and
+    `motion_quorum`); a root-signed `require_attestation: false` opts out.
+    The highest accepted `min_profile_version` is remembered (state file and
+    black box), so an older trust file never lowers the floor.
+  - Revocation lists v2 (`robodr-profile-revocations/v2`): signing keys are
+    revoked by public-key fingerprint (SHA-256 of the key bytes), bound to
+    one platform; `revoke --platform --revoke-key KEY.pub /
+    --key-fingerprint`; `keygen` / `verify-profile` print fingerprints.
+  - Safety feed: `safety_feed.topics[].writers` is required; a sample is
+    used only if the binding vouches for its source (`allows_from ==
+    Some(true)`); a full writer table raises
+    `robot.safety_state.writer_overflow` (High) and reads at least unknown;
+    socket writers are tracked per connection.
+  - Binding: a profiled GUID prefix claimed by SPDP from a second host is
+    **contested** (Critical `robot.ros2.participant_source_mismatch`): no
+    source is trusted for it until `participant_ips` pins it.
+  - Motion decode applies the same rule: a decoded sample whose writer's
+    participant has no binding (or whose source IP does not parse) is
+    `robot.motion.unattributed_sample` (High), a contested prefix is
+    `robot.motion.sample_source_mismatch`; `MotionSample::attribution`
+    carries the verdict and `robodr-agentd` drops the writer GUID of a
+    refused command, so the firewall model sees an unknown source.
+  - Correlation: protection tiers and reserved slots for multi-signal
+    groups; evicting evidence raises the observe-only
+    `robot.correlate.correlation_state_evicted`.
+  - Black box: stray / cut segment files are Critical quarantines, an
+    authentic cut after the newest mark is Critical
+    `robot.agent.evidence_truncated`; `blackbox.head_anchor` (kind `file`,
+    `FileHeadAnchor`; only as strong as its storage, a TPM or remote anchor
+    is still required for deployment) and anchor status in `status.json`.
+  - Export recovery: after a split pack, only records whose exact line is
+    found in a committed batch (outbox or archive, checked against
+    `MANIFEST.json`) are acknowledged; `Exporter::open` refuses planner
+    limits that differ from the packer's (`Packer::config`, new);
+    `open_checked` also checks the unit; publisher progress is per batch.
+  - Commissioning: a trusted discovery server must be pinned by IP
+    (`PREFIX@IP` or `IP`). The sensor pipeline's `discovery_server` was
+    already IP-only (a GUID prefix is refused; regression tests added).
+  - OCSF 1.3.0 catalog (still unreleased): entries for the three wave-7 ids
+    and for every other `robot.*` id an in-repo detector emits (agent
+    health, sensor pipeline, motion decode and monitor, firewall), which
+    used to fall back to the generic entry; a test fails on an emitted id
+    without one. `robodr-correlate` knows `robot.agent.evidence_truncated`
+    and its drift test now checks both directions.
+  - `config/agentd.example.json` passes `--check-config` as copied on a
+    commissioned robot; `config/agentd.full.example.json` adds
+    `trust_roots`, `revocation_list` and `finding_signing` (needs the
+    `20-finding-key.conf.example` drop-in).
+
 - Live motion path: RTPS user DATA on the profile's motion channels and on
   `motion.feedback_topics` is decoded (`robodr-cdr`) into `MotionCommand` /
   `MotionFeedback` (`robodr_ros2_pipeline::motion`,
@@ -128,9 +181,13 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   operators. `lock` also refuses a draft without a matching output manifest
   (`--no-manifest` for older drafts). See OPERATIONS.md section 5.
 - **Breaking (findings contract 1.3.0)**: findings for the newly catalogued
-  rule ids carry their own title / description / data source instead of the
-  generic entry; consumers must run the 1.3 validator (it still accepts 1.2
-  messages).
+  rule ids (wave 6, and since wave 7 every emitted `robot.*` id) carry their
+  own title / description / data source instead of the generic entry;
+  consumers must run the 1.3 validator (it still accepts 1.2 messages).
+- **Breaking (wave 7)**: revocation lists v1 (by key id) are refused;
+  profiles loaded with `trust_roots` need an attestation; `safety_feed`
+  topics without `writers` are refused; `Exporter::open` refuses
+  mismatched planner limits.
 - One key file format: profile signing keys are robodr-blackbox `KeyFile`s
   (`robodr-commission keygen` now writes v2 secret + `.pub`; a key from
   `robodr-blackbox keygen` signs profiles too; older v1 Ed25519 signing

@@ -1869,6 +1869,29 @@ mod tests {
         assert_eq!(t.b.allows(&P2, ip(RIP)), Some(true));
     }
 
+    #[test]
+    fn relay_trust_is_by_source_ip_never_by_sender_prefix() {
+        // A real server at DS relays P1's writer under its own prefix P2.
+        let mut t = T::new(BindingOptions {
+            discovery_servers: vec![ip(DS)],
+            ..Default::default()
+        });
+        let mut relayed = writer(P1);
+        relayed.source = P2;
+        assert!(t.ep(&relayed, ip(DS)).is_empty(), "trusted relay");
+        // Another host copies the server's sender prefix: still a mismatch,
+        // the prefix it saw the server use buys it nothing.
+        let f = t.ep(&relayed, ip(XIP));
+        one(&f, rules::ENDPOINT_SOURCE_MISMATCH, Severity::Critical);
+        // Its SPDP relayed under the server's prefix teaches nothing either.
+        let p3: GuidPrefix = [0x33; 12];
+        let mut s = spdp(p3, &[XIP], None);
+        s.source = P2;
+        assert!(!t.spdp(&s, ip(XIP)).is_empty());
+        assert!(!t.b.is_bound(&p3));
+        assert_eq!(t.b.allows(&p3, ip(XIP)), None);
+    }
+
     // ---- hold queue ------------------------------------------------------
 
     #[test]

@@ -26,7 +26,8 @@
 #     the optional safety_feed socket (safety-PLC gateway).
 #   * Optional per-finding signing key (finding_signing.key_file): installed
 #     with the drop-in example 20-finding-key.conf.example (LoadCredential=
-#     finding.key), never the black-box key.
+#     finding.key), never the black-box key. Only agentd.full.example.json
+#     names it; agentd.example.json runs without the drop-in.
 #   * sd_notify (std-only, crates/robodr-agentd/src/notify.rs): READY=1 once
 #     started (Type=notify), WATCHDOG=1 from the main loop at most every 1 s,
 #     STATUS=state <ok|degraded|unknown> each tick, STOPPING=1 at shutdown.

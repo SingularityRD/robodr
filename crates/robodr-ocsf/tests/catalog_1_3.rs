@@ -166,3 +166,153 @@ fn a_1_2_message_with_the_generic_entry_stays_valid() {
         );
     }
 }
+
+/// Ids added to the 1.3 catalog during wave 7 (1.3.0 was still unreleased).
+const WAVE7_IDS: &[&str] = &[
+    "robot.safety_state.writer_overflow",
+    "robot.correlate.correlation_state_evicted",
+    "robot.agent.evidence_truncated",
+];
+
+#[test]
+fn wave7_ids_have_their_own_entry() {
+    let generic_correlation = rule_info("robot.correlate.site_specific_rule");
+    for id in WAVE7_IDS {
+        let info = rule_info(id);
+        assert_ne!(info.data_source, "robodr", "{id}");
+        assert_ne!(info.title, generic_correlation.title, "{id}");
+        let env = robodr_ocsf::parse_and_validate(&build(id)).unwrap();
+        assert_eq!(env.title, info.title);
+        // A 1.2 message keeps the generic entry.
+        assert_eq!(rule_info_for_contract(id, "1.2.0").data_source, "robodr");
+    }
+    assert_eq!(
+        rule_info("robot.correlate.correlation_state_evicted").data_source,
+        "robodr_correlation"
+    );
+    assert_eq!(
+        rule_info("robot.safety_state.writer_overflow").data_source,
+        "robot_safety_state"
+    );
+    assert_eq!(
+        rule_info("robot.agent.evidence_truncated").data_source,
+        "robodr_agent"
+    );
+}
+
+/// String literals in `crates/*/src` that look like rule ids but are test
+/// fixtures, deliberate typos, or never emitted as a finding.
+const NOT_EMITTED: &[&str] = &[
+    // robodr-agent: a configuration probe built and validated, never sent.
+    "robot.agent.config_check",
+    // robodr-correlate: typo fixtures for the unknown-id warning.
+    "robot.ros2.unknown_participan",
+    "robot.ros2.unknown_participnat",
+    "robot.correlate.t",
+    // robodr-ros2-pipeline rate-limiter unit-test keys.
+    "robot.capture.y",
+    "robot.rtps.x",
+    // robodr-responder unit-test rule.
+    "robot.motion.envelope_exceeded",
+];
+
+/// Every `"robot.<area>.<name>"` string literal in the workspace's crate
+/// sources (robodr-ocsf itself excluded).
+fn emitted_ids() -> std::collections::BTreeSet<String> {
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut out = std::collections::BTreeSet::new();
+    let mut stack = vec![];
+    for c in std::fs::read_dir(&crates).unwrap() {
+        let c = c.unwrap().path();
+        if c.file_name().is_some_and(|n| n == "robodr-ocsf") {
+            continue;
+        }
+        stack.push(c.join("src"));
+    }
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            if p.extension().is_none_or(|x| x != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&p).unwrap();
+            for (i, _) in text.match_indices("\"robot.") {
+                let rest = &text[i + 1..];
+                let Some(end) = rest.find('"') else { continue };
+                let id = &rest[..end];
+                let ok = id.split('.').count() == 3
+                    && id.split('.').all(|s| !s.is_empty())
+                    && id.bytes().all(|b| {
+                        b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'.'
+                    });
+                if ok {
+                    out.insert(id.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn every_emitted_rule_id_has_a_dedicated_catalog_entry() {
+    let ids = emitted_ids();
+    // Sanity: the scan found the detectors.
+    for must in [
+        "robot.firewall.rejected_stale",
+        "robot.motion.uncommanded_motion",
+        "robot.agent.evidence_truncated",
+        "robot.correlate.correlation_state_evicted",
+    ] {
+        assert!(ids.contains(must), "scan missed {must}");
+    }
+    let generic = rule_info("robot.nope.nothing");
+    let generic_correlation = rule_info("robot.correlate.site_specific_rule");
+    let mut missing = vec![];
+    for id in ids.iter().filter(|i| !NOT_EMITTED.contains(&i.as_str())) {
+        let info = rule_info(id);
+        if info == generic || info == generic_correlation {
+            missing.push(id.clone());
+            continue;
+        }
+        // Each entry builds a finding that validates against the contract.
+        robodr_ocsf::parse_and_validate(&build(id)).unwrap_or_else(|e| panic!("{id}: {e:?}"));
+    }
+    assert!(
+        missing.is_empty(),
+        "rule ids without a catalog entry: {missing:?}"
+    );
+    // The allowlist must not hide a real id.
+    for id in NOT_EMITTED {
+        assert_eq!(
+            rule_info(id).data_source != "robodr",
+            id.starts_with("robot.correlate."),
+            "{id}"
+        );
+    }
+}
+
+#[test]
+fn every_catalog_entry_uses_schema_constants() {
+    let schema = load_schema();
+    let types = enum_of(&schema, "types").expect("schema types enum");
+    let sources = enum_of(&schema, "data_sources").expect("schema data_sources enum");
+    let schema_text = schema.to_string();
+    for id in emitted_ids() {
+        let info = rule_info(&id);
+        assert!(types.iter().any(|t| t == info.data_source), "{id}");
+        assert!(sources.iter().any(|t| t == info.data_source), "{id}");
+        for (tid, name) in info.techniques {
+            assert!(schema_text.contains(&format!("\"{tid}\"")), "{id} {tid}");
+            assert!(schema_text.contains(&format!("\"{name}\"")), "{id} {name}");
+        }
+        assert!(info.title.len() <= 256 && info.desc.len() <= 2048, "{id}");
+    }
+}

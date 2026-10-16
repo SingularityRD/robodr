@@ -97,6 +97,7 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     "robot.agent.spool_full",
     "robot.agent.evidence_degraded",
     "robot.agent.evidence_quarantined",
+    "robot.agent.evidence_truncated",
     // robodr-agentd live safety-state feed
     "robot.safety_state.untrusted_source",
     "robot.safety_state.undecodable_sample",

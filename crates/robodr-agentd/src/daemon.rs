@@ -152,6 +152,7 @@ use robodr_agent::{
 use robodr_blackbox::{Clock, RecorderConfig, SystemClock, TimeSource, Timestamp};
 use robodr_correlate::{CorrelatedFinding, Correlator, EntityKind, Limits, Signal};
 use robodr_events::profile::Profile;
+use robodr_events::RobotEvent;
 use robodr_firewall::FailBehaviour;
 use robodr_ocsf::{AttestationStatus, PlatformFamily as OcsfPlatform, RobotInfo, Subject};
 use robodr_responder::{OperationalContext, SafetyState};
@@ -1003,8 +1004,18 @@ impl<'a> Daemon<'a> {
 
     /// A decoded motion command / feedback -> agent (profile, firewall,
     /// motion monitor) -> spool.
-    fn motion_sample(&mut self, s: MotionSample) {
+    ///
+    /// A command whose source the binding refused (unbound, contested or
+    /// source-mismatched; the pipeline already raised the finding) loses its
+    /// writer GUID first: the firewall model then sees an unknown source, so
+    /// a GUID claimed by a spoofer never authorises a command.
+    fn motion_sample(&mut self, mut s: MotionSample) {
         self.stats.motion_events += 1;
+        if s.attribution.is_refused() {
+            if let RobotEvent::MotionCommand(c) = &mut s.event {
+                c.source_guid = None;
+            }
+        }
         let safety = self.safety();
         let now = self.clock.now();
         let outs = self.agent.handle(now, &s.event, safety);

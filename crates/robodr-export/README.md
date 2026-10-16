@@ -49,7 +49,9 @@ half-finished batch).
    **one** diode batch. (`--max-batch-bytes` / `--max-findings` set both
    sides; the binary opens with `Exporter::open_checked`, which refuses an
    `ExportConfig` whose limits differ from the `PackConfig`, or a packer
-   state of another unit. Library users: `ExportConfig::for_packer`.)
+   state of another unit; `Exporter::open` itself refuses limits that
+   differ from the packer's own configuration (`Packer::config`). Library
+   users: `ExportConfig::for_packer`.)
 3. Write the intent `{batch_seq: packer.next_seq, spool_seqs}` to the state
    file (atomic replace).
 4. `Packer::pack`: stage, commit the packer state, rename, fsync.

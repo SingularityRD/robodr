@@ -377,10 +377,20 @@ fn mismatched_planner_limits_are_reported() {
     r.spool_findings(0, 5);
     let mut pc = PackConfig::new(UNIT);
     pc.max_findings_per_batch = 2; // exporter thinks 10 000
-    let mut x = Exporter::open(r.export_cfg(), r.packer(pc)).unwrap();
-    let e = x.run_once(NOW).unwrap_err();
-    assert!(matches!(e, ExportError::State(_)), "{e}");
-    // Still nothing lost or duplicated: all published, all acked.
+                                   // `Exporter::open` itself compares the planner limits with the packer's
+                                   // own configuration and refuses before touching the spool.
+    let e = Exporter::open(r.export_cfg(), r.packer(pc.clone()))
+        .err()
+        .expect("mismatched limits are refused");
+    assert!(matches!(e, ExportError::Config(_)), "{e}");
+    assert!(e.to_string().contains("max_findings_per_batch"), "{e}");
+    assert!(r.acked().is_empty());
+    assert!(r.outbox_batches().is_empty());
+    // Matching limits open and export everything.
+    let mut cfg = r.export_cfg();
+    cfg.max_findings_per_batch = 2;
+    let mut x = Exporter::open(cfg, r.packer(pc)).unwrap();
+    assert_eq!(x.run_once(NOW).unwrap().exported, 5);
     assert_eq!(r.acked().len(), 5);
     assert_eq!(r.outbox_batches().len(), 3);
 }

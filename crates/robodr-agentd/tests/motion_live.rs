@@ -175,3 +175,56 @@ fn sensor_motion_keys_are_strict() {
         r.warnings
     );
 }
+
+/// A command whose source the binding refuses (here: the legit prefix and
+/// writer GUID, sent from another host) is never authorised by its claimed
+/// GUID: the pipeline reports the mismatch and the firewall model sees an
+/// unknown source.
+#[test]
+fn a_refused_source_never_authorises_a_command_by_its_guid() {
+    let s = setup("motion-refused", &robot_profile(true));
+    let pcap = s.pcap(&[
+        frame(ROBOT_IP, SPDP_GROUP, 7400, &motion_discovery()),
+        // Bound source: authorised, no finding.
+        frame(
+            ROBOT_IP,
+            ROBOT_IP,
+            7411,
+            &cmd_vel_datagram(LEGIT, CMD_WRITER, 1, 0.2),
+        ),
+        // Spoofed: legit prefix + writer, rogue IP.
+        frame(
+            ROGUE_IP,
+            ROBOT_IP,
+            7411,
+            &cmd_vel_datagram(LEGIT, CMD_WRITER, 2, 0.2),
+        ),
+    ]);
+    let mut cfg = s.config(
+        serde_json::json!({"capture": {"enabled": true, "pcap_replay": pcap}}),
+        serde_json::json!([]),
+        serde_json::json!({"exit_when_inputs_end": true}),
+    );
+    cfg["firewall"] = serde_json::json!({"max_angular": {"/cmd_vel": 1.0}});
+    let r = s.resolve(&cfg);
+    let mut log = Vec::new();
+    let sum = robodr_agentd::run(&r, &|| false, &mut log).unwrap();
+    let log = String::from_utf8(log).unwrap();
+    assert_eq!(sum.stats.motion_events, 2, "{log}");
+    let rules = rules(&spooled(&s.spool));
+    assert!(
+        rules.contains(&"robot.motion.sample_source_mismatch".to_string()),
+        "{rules:?}\n{log}"
+    );
+    let unknown = rules
+        .iter()
+        .filter(|r| *r == "robot.firewall.rejected_unknown_source")
+        .count();
+    assert_eq!(unknown, 1, "only the spoofed command: {rules:?}\n{log}");
+    assert!(
+        !rules
+            .iter()
+            .any(|r| r == "robot.firewall.rejected_unauthorized_source"),
+        "{rules:?}"
+    );
+}

@@ -20,6 +20,13 @@ serde_json = { workspace = true }
 [dev-dependencies]
 robodr-agent = { workspace = true }
 robodr-events = { workspace = true }
+# The crate's own tests reproduce a split pack (Exporter::open refuses the
+# mismatched limits that cause one) through the test-only feature below.
+robodr-export = { path = ".", features = ["fault-injection"] }
+
+[features]
+# Test-only hooks; never enable in a deployed build.
+fault-injection = []
 
 [[bin]]
 name = "robodr-spool-export"

@@ -1,0 +1,37 @@
+{
+  "robot": { "id": "ugv-007", "site": "site-a" },
+  "sensor": {
+    "profile_path": "/etc/robodr/profile.json",
+    "listen_spdp": false,
+    "capture": { "enabled": true, "interfaces": ["eth0"] },
+    "profile_trust": {
+      "trusted_keys": "/etc/robodr/profile-trust.json",
+      "state_file": "/var/lib/robodr/profile-state/agentd.json",
+      "expect_platform": "ugv-x1",
+      "expect_unit_id": "ugv-007",
+      "trust_roots": "/etc/robodr/trust-roots.json",
+      "revocation_list": "/etc/robodr/profile-revocations.json",
+      "revocation_policy": "optional"
+    }
+  },
+  "policy_path": "/etc/robodr/response-policy.json",
+  "blackbox": {
+    "dir": "/var/lib/robodr/blackbox/agentd",
+    "key_file": "/run/credentials/robodr-agentd.service/blackbox.key"
+  },
+  "spool": { "dir": "/var/lib/robodr/spool/agentd" },
+  "event_inputs": [ { "kind": "unix_socket", "path": "/run/robodr-agentd/events.sock" } ],
+  "context": { "safety_state": "unknown", "control": "autonomous" },
+  "safety_feed": {
+    "stale_after_ms": 1000,
+    "topics": [
+      { "topic": "/estop", "type": "std_msgs/msg/Bool",
+        "values": { "true": "estop_active", "false": "none" },
+        "writers": ["0110a2b3c4d5e6f701000000"] }
+    ],
+    "socket": { "path": "/run/robodr-agentd/safety.sock", "max_connections": 2 }
+  },
+  "correlation": { "enabled": true, "include_default_rules": true },
+  "finding_signing": { "key_file": "/run/credentials/robodr-agentd.service/finding.key" },
+  "daemon": { "tick_ms": 1000, "heartbeat_ms": 10000, "silence_ms": 30000 }
+}

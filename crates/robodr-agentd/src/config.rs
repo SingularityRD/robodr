@@ -1363,13 +1363,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// `config/agentd.example.json` (shipped as an example and matching
-    /// `packaging/systemd/robodr-agentd.service`) parses strictly, its
-    /// sections validate, and it uses the unit's paths.
+    /// `config/agentd.example.json` and `config/agentd.full.example.json`
+    /// (shipped as examples and matching
+    /// `packaging/systemd/robodr-agentd.service`) parse strictly, their
+    /// sections validate, and they use the unit's paths.
     #[test]
-    fn shipped_example_config_parses() {
+    fn shipped_example_configs_parse() {
+        shipped_example_config("agentd.example.json", false);
+        shipped_example_config("agentd.full.example.json", true);
+    }
+
+    /// The base example names only files a commissioned robot has with the
+    /// shipped unit (profile, profile trust file, response policy, black-box
+    /// key credential) plus directories / sockets the unit creates, so it
+    /// passes `--check-config` when copied verbatim. Everything needing an
+    /// extra file or an extra drop-in (trust roots, revocation list, the
+    /// finding-signing key credential) is only in the full example.
+    #[test]
+    fn base_example_needs_no_optional_files() {
         let text = std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/agentd.example.json"),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let mut paths = Vec::new();
+        // Values of file / directory keys (ROS topic names also start with
+        // '/', so go by key).
+        fn walk(key: &str, v: &serde_json::Value, out: &mut Vec<String>) {
+            const PATH_KEYS: &[&str] = &[
+                "path",
+                "profile_path",
+                "policy_path",
+                "key_file",
+                "dir",
+                "trusted_keys",
+                "state_file",
+                "trust_roots",
+                "revocation_list",
+                "pcap_replay",
+                "rules_file",
+            ];
+            match v {
+                serde_json::Value::String(s) if PATH_KEYS.contains(&key) => out.push(s.clone()),
+                serde_json::Value::Array(a) => a.iter().for_each(|x| walk(key, x, out)),
+                serde_json::Value::Object(m) => m.iter().for_each(|(k, x)| walk(k, x, out)),
+                _ => {}
+            }
+        }
+        walk("", &v, &mut paths);
+        assert!(paths.len() >= 6, "{paths:?}");
+        let allowed = [
+            "/etc/robodr/profile.json",
+            "/etc/robodr/profile-trust.json",
+            "/etc/robodr/response-policy.json",
+            "/run/credentials/robodr-agentd.service/blackbox.key",
+        ];
+        let created = ["/var/lib/robodr/", "/run/robodr-agentd/"];
+        for p in &paths {
+            assert!(
+                allowed.contains(&p.as_str()) || created.iter().any(|d| p.starts_with(d)),
+                "base example names {p}, which a default install does not have"
+            );
+        }
+        let c = parse(&text).unwrap();
+        assert!(c.finding_signing.is_none());
+        let (s, _) = sensor_settings(&c.sensor).unwrap();
+        assert!(s.profile_trust.trust_roots.is_none());
+        assert!(s.profile_trust.revocation_list.is_none());
+    }
+
+    fn shipped_example_config(file: &str, full: bool) {
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../config")
+                .join(file),
         )
         .unwrap();
         let c = parse(&text).unwrap();
@@ -1447,11 +1514,12 @@ mod tests {
             "tmpfiles.d does not create {:?} for robodr",
             state.parent()
         );
-        // Wave-6 keys: revocation / trust roots, safety feed on the unit's
-        // runtime directory, correlation, and the finding key through the
-        // shipped drop-in's credential.
-        assert!(s.profile_trust.trust_roots.is_some());
-        assert!(s.profile_trust.revocation_list.is_some());
+        // Wave-6 keys: revocation / trust roots (full example only), safety
+        // feed on the unit's runtime directory, correlation, and (full
+        // example only) the finding key through the shipped drop-in's
+        // credential.
+        assert_eq!(s.profile_trust.trust_roots.is_some(), full, "{file}");
+        assert_eq!(s.profile_trust.revocation_list.is_some(), full, "{file}");
         let feed = c.safety_feed.as_ref().expect("safety_feed");
         let sock = feed.socket.as_ref().expect("safety_feed.socket");
         assert!(sock.path.starts_with("/run/robodr-agentd/"), "{sock:?}");
@@ -1464,6 +1532,10 @@ mod tests {
             robodr_correlate::RuleSet::default_rules().len()
         );
         assert!(w.is_empty(), "{w:?}");
+        if !full {
+            assert!(c.finding_signing.is_none(), "{file}");
+            return;
+        }
         let fk = &c
             .finding_signing
             .as_ref()

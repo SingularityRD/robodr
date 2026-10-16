@@ -468,7 +468,8 @@ Work in `/var/lib/robodr/commission/<date>/` as root.
    `profile_trust` settings (`trusted_keys`, `state_file`, optional
    `expect_platform` / `expect_unit_id`, and `trust_roots`,
    `revocation_list`, `revocation_policy` from section 5.3) are in
-   `config/agentd.example.json` (`sensor.profile_trust`) and
+   `config/agentd.example.json` (`sensor.profile_trust`; the section 5.3
+   keys only in `config/agentd.full.example.json`) and
    `config/robodr.toml.example` (`[module.robodr-sensor-ros2.profile_trust]`).
    `robot.profile_version` in `agentd.json` was removed: the version in
    findings is the signed `metadata.profile_version`; delete the key.
@@ -773,8 +774,16 @@ to full root.
 
 ### 6.4 agentd features (`/etc/robodr/agentd.json`)
 
-Every key below is in `config/agentd.example.json` (installed under
-`/usr/share/doc/robodr/examples/`); check every edit with
+Two examples are installed under `/usr/share/doc/robodr/examples/`.
+`agentd.example.json` names only what a commissioned robot has with the
+shipped unit (profile, `profile-trust.json`, response policy, the black-box
+key credential) and passes `--check-config` when copied verbatim.
+`agentd.full.example.json` adds every key below that needs an extra file:
+`trust_roots` and `revocation_list` (from the trust-root ceremony) and
+`finding_signing`, whose key reaches the daemon only through the drop-in
+`robodr-agentd.service.d/20-finding-key.conf.example` (install the drop-in
+and the key together, or the unit does not start). Copy the keys you need
+from it once their files exist, and check every edit with
 `robodr-agentd --config /etc/robodr/agentd.json --check-config`.
 
 **Live safety state (`safety_feed`).** Plans are graded by the robot's

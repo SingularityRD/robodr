@@ -208,6 +208,11 @@ fn catalog_1_3(rule: &str) -> Option<RuleInfo> {
     const CORRELATE: &str = "robodr_correlation";
     const SAFETY: &str = "robot_safety_state";
     const AGENT: &str = "robodr_agent";
+    // Checked first: it holds a `robot.correlate.*` id that must not fall
+    // into the generic correlation arm below.
+    if let Some(info) = catalog_1_3_wave7(rule) {
+        return Some(info);
+    }
     Some(match rule {
         "robot.correlate.coordinated_intrusion" => RuleInfo {
             title: "Correlated intrusion: unknown participant, foreign motion writer and host anomaly",
@@ -305,6 +310,440 @@ fn catalog_1_3(rule: &str) -> Option<RuleInfo> {
             data_source: AGENT,
             techniques: &[],
         },
+        _ => return None,
+    })
+}
+
+/// Entries added later in the (unreleased) 1.3 cycle: wave-7 detectors
+/// (safety-feed writer overflow, correlation eviction notice, black-box
+/// truncation) and every other `robot.*` id the in-repo detectors emit that
+/// used to fall back to the generic entry. Same contract minor as
+/// [`catalog_1_3`]: 1.3.0 had not been released when these were added.
+fn catalog_1_3_wave7(rule: &str) -> Option<RuleInfo> {
+    const GRAPH: &str = "ros2_dds_discovery";
+    const MOTION: &str = "ros2_motion_commands";
+    const CORRELATE: &str = "robodr_correlation";
+    const SAFETY: &str = "robot_safety_state";
+    const AGENT: &str = "robodr_agent";
+    // Small helper so the table below stays one entry per line group.
+    const fn e(
+        title: &'static str,
+        desc: &'static str,
+        data_source: &'static str,
+        techniques: &'static [(&'static str, &'static str)],
+    ) -> RuleInfo {
+        RuleInfo {
+            title,
+            desc,
+            data_source,
+            techniques,
+        }
+    }
+    Some(match rule {
+        // --- wave 7 -------------------------------------------------------
+        "robot.safety_state.writer_overflow" => e(
+            "Safety-state writer table overflowed",
+            "A safety-state source saw more fresh writers or socket connections than it keeps; that source reads at least unknown until the extra writers go stale.",
+            SAFETY,
+            &[],
+        ),
+        "robot.correlate.correlation_state_evicted" => e(
+            "Correlation evidence evicted under pressure",
+            "The correlation engine evicted a pending group that already held evidence to stay within its bounds; the named correlation rule may have missed a detection. Observe-only.",
+            CORRELATE,
+            &[],
+        ),
+        "robot.agent.evidence_truncated" => e(
+            "Black-box records cut after the newest mark",
+            "Opening the black box found authentic proof that records after its newest integrity mark were removed; treat the evidence store as tampered with.",
+            AGENT,
+            &[],
+        ),
+        // --- robodr-agentd self-health -------------------------------------
+        "robot.agent.input_silent" => e(
+            "Agent input silent",
+            "An agent input delivered no valid data within the silence window; the robot state reads unknown while the agent is blind.",
+            AGENT,
+            &[],
+        ),
+        "robot.agent.input_ended" => e(
+            "Agent input ended",
+            "An agent input reached end of stream or failed while the daemon was running; detections from that input stopped.",
+            AGENT,
+            &[],
+        ),
+        "robot.agent.queue_overflow" => e(
+            "Agent input queue overflowed",
+            "The agent's input queue was full and items were dropped without inspection.",
+            AGENT,
+            &[],
+        ),
+        "robot.agent.input_malformed" => e(
+            "Malformed agent input",
+            "An agent input delivered items that could not be parsed; they were skipped.",
+            AGENT,
+            &[],
+        ),
+        "robot.agent.pipeline_lag" => e(
+            "Agent pipeline lagging",
+            "Queue latency or tick delay in the agent exceeded the configured lag bound; detections are late.",
+            AGENT,
+            &[],
+        ),
+        "robot.agent.spool_full" => e(
+            "Finding spool full or failing",
+            "The agent could not write findings to its outbound spool (full or write errors); findings may be lost before export.",
+            AGENT,
+            &[],
+        ),
+        "robot.agent.evidence_degraded" => e(
+            "Black-box recording failing",
+            "The black-box recorder failed to store evidence; records from this outage are missing.",
+            AGENT,
+            &[],
+        ),
+        // --- robodr-events profile (rules without a 1.0 entry) -------------
+        "robot.ros2.unknown_service" => e(
+            "Writer on a service outside the model profile",
+            "A writer was announced on a ROS 2 service request or reply the locked model profile does not allow.",
+            GRAPH,
+            &[T0855],
+        ),
+        "robot.ros2.unknown_action" => e(
+            "Writer on an action outside the model profile",
+            "A writer was announced on a ROS 2 action topic or service the locked model profile does not allow.",
+            GRAPH,
+            &[T0855],
+        ),
+        "robot.dds.unknown_raw_writer" => e(
+            "Writer on a raw DDS topic outside the model profile",
+            "A writer was announced on a non-ROS DDS topic the locked model profile does not allow.",
+            GRAPH,
+            &[T0855],
+        ),
+        "robot.ros2.unknown_reader_topic" => e(
+            "Subscriber on a topic outside the reader allowlist",
+            "A reader was announced on a topic, service or action outside the profile's reader allowlist; it cannot command but may collect data.",
+            GRAPH,
+            &[T0801],
+        ),
+        "robot.motion.non_finite_command" => e(
+            "Motion command with a non-finite value",
+            "A motion command carried NaN or infinity on at least one axis; no envelope can bound it.",
+            MOTION,
+            &[T0831],
+        ),
+        "robot.profile.invalid_envelope" => e(
+            "Motion envelope in the profile cannot be enforced",
+            "The profile's envelope for this channel has an invalid or missing mandatory limit; every command on the channel is reported (fail closed).",
+            MOTION,
+            &[],
+        ),
+        // --- robodr-ros2-pipeline: profile, discovery, capture -------------
+        "robot.ros2.profile_refused" => e(
+            "Model profile refused",
+            "The model profile failed validation and is not enforced; the sensor reports in observe-only mode.",
+            AGENT,
+            &[],
+        ),
+        "robot.ros2.participant_removed" => e(
+            "Profiled DDS participant removed",
+            "A participant in the locked model profile was announced as disposed or unregistered.",
+            GRAPH,
+            &[],
+        ),
+        "robot.rtps.malformed_discovery" => e(
+            "Malformed RTPS discovery traffic",
+            "The RTPS parser saw discovery content a well-behaved DDS stack would not send.",
+            GRAPH,
+            &[],
+        ),
+        "robot.rtps.fragmented_discovery" => e(
+            "Fragmented RTPS discovery data",
+            "Discovery data arrived fragmented (DATA_FRAG) and was reassembled before inspection.",
+            GRAPH,
+            &[],
+        ),
+        "robot.rtps.discovery_fragment_rejected" => e(
+            "Discovery fragments refused",
+            "Discovery fragments were refused (over a cap, bad geometry or no capacity); that announcement was not inspected.",
+            GRAPH,
+            &[],
+        ),
+        "robot.rtps.discovery_fragment_conflict" => e(
+            "Conflicting discovery fragments",
+            "Discovery fragments overlapped already received bytes with different content; a DDS stack may act on a different announcement than the one inspected.",
+            GRAPH,
+            &[],
+        ),
+        "robot.rtps.discovery_fragment_evicted" => e(
+            "Partial discovery samples evicted",
+            "Partially reassembled discovery samples were evicted to stay within the reassembler's bounds; those announcements were not inspected.",
+            GRAPH,
+            &[],
+        ),
+        "robot.rtps.discovery_removal" => e(
+            "Discovery dispose or unregister",
+            "A discovery dispose or unregister arrived for an entity other than a profiled participant.",
+            GRAPH,
+            &[],
+        ),
+        "robot.rtps.discovery_not_inspected" => e(
+            "Discovery traffic not inspected",
+            "The parser had to drop all or part of a discovery datagram (unsupported version, malformed parameter list, undecodable name); that content was not inspected.",
+            GRAPH,
+            &[],
+        ),
+        "robot.ros2.ambiguous_discovery" => e(
+            "Ambiguous discovery announcement",
+            "A discovery announcement repeats an identity parameter with conflicting values; DDS stacks differ on which one wins, so what was inspected may not be what a stack acts on.",
+            GRAPH,
+            &[],
+        ),
+        "robot.capture.malformed_frames" => e(
+            "Malformed or truncated captured frames",
+            "The capture saw malformed or truncated frames; they were not inspected.",
+            GRAPH,
+            &[],
+        ),
+        "robot.capture.ip_fragment_conflict" => e(
+            "Conflicting overlapping IP fragments",
+            "IP fragments overlapped with conflicting bytes, an evasion pattern; the host may reassemble different content than the sensor inspected.",
+            GRAPH,
+            &[],
+        ),
+        "robot.capture.ip_reassembly_dropped" => e(
+            "IP datagrams dropped in reassembly",
+            "IP datagrams were dropped for bad fragment geometry or reassembly timeout; they were not inspected.",
+            GRAPH,
+            &[],
+        ),
+        "robot.capture.ip_reassembly_evicted" => e(
+            "IP datagrams evicted from reassembly",
+            "Partially reassembled IP datagrams were evicted to bound memory; they were not inspected.",
+            GRAPH,
+            &[],
+        ),
+        "robot.capture.ip_fragment_refused" => e(
+            "IP fragments refused, reassembly budget full",
+            "IP fragments were refused because the reassembly budget was full; those datagrams were not inspected (possibly a flood aimed at blinding the sensor).",
+            GRAPH,
+            &[],
+        ),
+        "robot.capture.ip_fragment_duplicate_conflict" => e(
+            "Duplicate IP fragment with different content",
+            "A duplicate IP fragment differed from the queued copy (first copy kept); what was inspected may differ from what the host accepts.",
+            GRAPH,
+            &[],
+        ),
+        "robot.capture.bad_checksum" => e(
+            "IP or UDP checksum failures",
+            "Captured packets failed the IPv4 header or UDP checksum; the robot's kernel drops these too (injection attempt aimed at the sensor, or a faulty interface).",
+            GRAPH,
+            &[],
+        ),
+        "robot.capture.not_udp" => e(
+            "Non-UDP packets reached the sensor",
+            "IP packets that were not UDP passed the kernel capture filter; they were not inspected.",
+            GRAPH,
+            &[],
+        ),
+        "robot.sensor.findings_capped" => e(
+            "Sensor findings capped for one input",
+            "One input produced more findings than the per-datagram cap; the least severe were suppressed.",
+            GRAPH,
+            &[],
+        ),
+        // --- robodr-ros2-pipeline: source binding --------------------------
+        "robot.ros2.participant_source_mismatch" => e(
+            "DDS participant announced from an unbound address",
+            "A participant announcement for a bound participant came from an address outside its binding, or was relayed by an untrusted address; it was not learned.",
+            GRAPH,
+            &[T0848],
+        ),
+        "robot.ros2.endpoint_source_mismatch" => e(
+            "DDS endpoint announced from an unbound address",
+            "An endpoint announcement for a participant came from an address not bound to it, or was relayed or GUID-conflicting from an untrusted address.",
+            GRAPH,
+            &[T0848],
+        ),
+        "robot.ros2.endpoint_unannounced_participant" => e(
+            "DDS endpoint for a participant that never announced itself",
+            "An endpoint announcement referred to a participant with no participant announcement within the hold window, or the hold queue overflowed.",
+            GRAPH,
+            &[],
+        ),
+        // --- robodr-ros2-pipeline: motion sample decode --------------------
+        "robot.motion.undecodable_sample" => e(
+            "Undecodable motion or feedback sample",
+            "A sample on a motion or feedback topic could not be decoded; it was not inspected.",
+            MOTION,
+            &[],
+        ),
+        "robot.motion.unattributed_sample" => e(
+            "Motion sample from an unattributed writer",
+            "A motion or feedback sample came from a writer that was never announced, or whose binding is unbound or contested; it was not treated as authorised.",
+            MOTION,
+            &[T0855],
+        ),
+        "robot.motion.sample_source_mismatch" => e(
+            "Motion sample from an address not bound to its writer",
+            "A decoded motion or feedback sample came from a source address not bound to its writer's participant.",
+            MOTION,
+            &[T0855],
+        ),
+        "robot.motion.unverifiable_command" => e(
+            "Motion command that cannot be bounded",
+            "A decoded command's speed cannot be bounded from the message, so no envelope can check it.",
+            MOTION,
+            &[],
+        ),
+        "robot.motion.decode_anomaly" => e(
+            "Motion sample decode anomaly",
+            "A decoded motion or feedback sample carried an oddity that did not stop decoding, such as trailing bytes.",
+            MOTION,
+            &[],
+        ),
+        // --- robodr-motion consistency monitor -----------------------------
+        "robot.motion.feedback_divergence" => e(
+            "Motion feedback diverges from commands",
+            "Measured feedback stayed apart from what the observed commands predict for longer than the configured tolerance.",
+            MOTION,
+            &[T0831],
+        ),
+        "robot.motion.uncommanded_motion" => e(
+            "Uncommanded motion",
+            "Feedback measured motion while the observed command was rest or absent.",
+            MOTION,
+            &[T0831],
+        ),
+        "robot.motion.frozen_feedback" => e(
+            "Motion feedback frozen or silent",
+            "Motion feedback was frozen, silent or carried anomalous timestamps; the platform's motion cannot be verified.",
+            MOTION,
+            &[],
+        ),
+        "robot.motion.cross_sensor_disagreement" => e(
+            "Independent motion sensors disagree",
+            "Two independent feedback sources persistently disagreed about the platform's motion.",
+            MOTION,
+            &[T0856],
+        ),
+        "robot.motion.invalid_feedback" => e(
+            "Motion feedback with a non-finite value",
+            "Motion feedback carried NaN or infinity.",
+            MOTION,
+            &[],
+        ),
+        "robot.motion.multiple_feedback_publishers" => e(
+            "Several publishers for one feedback source",
+            "More than one publisher interleaved samples for the same feedback source type.",
+            MOTION,
+            &[T0856],
+        ),
+        "robot.motion.inconsistent_feedback_stream" => e(
+            "Inconsistent motion feedback stream",
+            "One feedback stream repeatedly jumped between values faster than the platform can accelerate: interleaved publishers under one identity, or a faulty driver.",
+            MOTION,
+            &[T0856],
+        ),
+        // --- robodr-firewall ------------------------------------------------
+        "robot.firewall.rejected_clock_regression" => e(
+            "Motion command rejected: clock regression",
+            "The motion firewall rejected a command because the gateway clock went backwards (in observe mode: would have rejected).",
+            MOTION,
+            &[],
+        ),
+        "robot.firewall.rejected_unknown_channel" => e(
+            "Motion command rejected: unknown channel",
+            "The motion firewall rejected a command on a channel its policy does not know (in observe mode: would have rejected).",
+            MOTION,
+            &[T0855],
+        ),
+        "robot.firewall.rejected_unknown_source" => e(
+            "Motion command rejected: unknown source",
+            "The motion firewall rejected a command from a source its policy does not know (in observe mode: would have rejected).",
+            MOTION,
+            &[T0855],
+        ),
+        "robot.firewall.rejected_unauthorized_source" => e(
+            "Motion command rejected: unauthorised source",
+            "The motion firewall rejected a command from a source not authorised on the channel (in observe mode: would have rejected).",
+            MOTION,
+            &[T0855],
+        ),
+        "robot.firewall.rejected_rate_limited" => e(
+            "Motion command rejected: rate limit",
+            "The motion firewall rejected a command over the channel's rate limit (in observe mode: would have rejected).",
+            MOTION,
+            &[],
+        ),
+        "robot.firewall.rejected_kind_mismatch" => e(
+            "Motion command rejected: kind mismatch",
+            "The motion firewall rejected a command whose kind (twist or joints, joint count) does not match the channel (in observe mode: would have rejected).",
+            MOTION,
+            &[],
+        ),
+        "robot.firewall.rejected_non_finite" => e(
+            "Motion command rejected: non-finite value",
+            "The motion firewall rejected a command carrying NaN or infinity (in observe mode: would have rejected).",
+            MOTION,
+            &[T0831],
+        ),
+        "robot.firewall.rejected_future_timestamp" => e(
+            "Motion command rejected: future timestamp",
+            "The motion firewall rejected a command stamped in the future (in observe mode: would have rejected).",
+            MOTION,
+            &[],
+        ),
+        "robot.firewall.rejected_stale" => e(
+            "Motion command rejected: stale",
+            "The motion firewall rejected a command older than its freshness bound (in observe mode: would have rejected).",
+            MOTION,
+            &[],
+        ),
+        "robot.firewall.rejected_out_of_order" => e(
+            "Motion command rejected: out of order",
+            "The motion firewall rejected a command stamped no later than the previous one from the same source on the channel, a replay or reordering (in observe mode: would have rejected).",
+            MOTION,
+            &[],
+        ),
+        "robot.firewall.rejected_over_hard_limit" => e(
+            "Motion command rejected: over hard limit",
+            "The motion firewall rejected a command whose speed exceeded the channel's hard-reject bound (in observe mode: would have rejected).",
+            MOTION,
+            &[T0831],
+        ),
+        "robot.firewall.internal_fault" => e(
+            "Motion firewall internal fault",
+            "The motion firewall failed its own post-condition check and applied its configured fault policy to the command.",
+            MOTION,
+            &[],
+        ),
+        "robot.firewall.limited_speed" => e(
+            "Motion command speed limited",
+            "The motion firewall limited a command's speed to the channel's bound (in observe mode: would have limited).",
+            MOTION,
+            &[],
+        ),
+        "robot.firewall.limited_acceleration" => e(
+            "Motion command acceleration limited",
+            "The motion firewall limited a command's acceleration to the channel's bound (in observe mode: would have limited).",
+            MOTION,
+            &[],
+        ),
+        "robot.firewall.limited_jerk" => e(
+            "Motion command jerk limited",
+            "The motion firewall limited a command's jerk to the channel's bound (in observe mode: would have limited).",
+            MOTION,
+            &[],
+        ),
+        "robot.firewall.events_dropped" => e(
+            "Motion firewall events dropped",
+            "The motion firewall's event buffer was full and events were dropped or evicted; this finding is as severe as the worst event lost.",
+            MOTION,
+            &[],
+        ),
         _ => return None,
     })
 }

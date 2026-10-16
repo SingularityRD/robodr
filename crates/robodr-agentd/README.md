@@ -28,9 +28,13 @@ configuration error (nothing started).
 
 ## Configuration
 
-There is one JSON file. See `examples/agentd.example.json` and
-`src/config.rs`. Unknown keys are refused at every level, and every path
-must be absolute.
+There is one JSON file. See `examples/agentd.example.json` (every key, lab
+paths) and `src/config.rs`. For the installed unit, `config/agentd.example.json`
+is the runnable baseline (passes `--check-config` as copied on a
+commissioned robot) and `config/agentd.full.example.json` adds the keys that
+need extra files (`trust_roots`, `revocation_list`, `finding_signing` with
+the `20-finding-key.conf.example` drop-in). Unknown keys are refused at every
+level, and every path must be absolute.
 
 | Key | Meaning |
 |---|---|

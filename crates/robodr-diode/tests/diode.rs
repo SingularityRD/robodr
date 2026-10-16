@@ -800,3 +800,23 @@ fn hostile_inbox_never_panics() {
     assert_eq!(r.quarantined.len(), 22);
     assert!(site.inbox_entries().is_empty());
 }
+
+#[test]
+fn packer_exposes_its_configuration_read_only() {
+    let site = Site::new("config-accessor");
+    let mut cfg = PackConfig::new(UNIT);
+    cfg.max_findings_per_batch = 7;
+    let p = Packer::open(
+        &site.outbox,
+        &site.pack_state,
+        cfg.clone(),
+        Box::new(HmacSha256Key::new(KEY_ID, &KEY).unwrap()),
+    )
+    .unwrap();
+    let got = p.config();
+    assert_eq!(got.unit_id, UNIT);
+    assert_eq!(got.max_findings_per_batch, 7);
+    assert_eq!(got.max_batch_bytes, cfg.max_batch_bytes);
+    assert_eq!(got.parity_shards, cfg.parity_shards);
+    assert_eq!(got.shard_size, cfg.shard_size);
+}

@@ -63,10 +63,11 @@
 //! (`max_batch_bytes`, `max_findings_per_batch`, `parity_shards`,
 //! `shard_size`) differ from the [`PackConfig`] the packer was opened with,
 //! or a packer state of another unit; [`ExportConfig::for_packer`] derives
-//! matching limits. [`Exporter::open`] cannot check (`Packer` does not
-//! expose its configuration); a mismatch there is detected after the first
-//! split `pack` (an error is returned) and, thanks to the proof-based
-//! recovery above, never loses records.
+//! matching limits. [`Exporter::open`] performs the same limit check against
+//! the packer's own configuration (`Packer::config`), so a mismatch is
+//! refused before anything is read; should a split `pack` still happen (a
+//! packer bug), it is detected after the first batch (an error is returned)
+//! and, thanks to the proof-based recovery above, never loses records.
 //!
 //! # Limits
 //!
@@ -401,9 +402,31 @@ impl Exporter {
     /// Open the packer (which finishes a committed batch) and the exporter
     /// state, then resolve a pending intent (see the module docs).
     ///
-    /// The planner limits cannot be compared with `packer`'s here; prefer
-    /// [`Exporter::open_checked`].
+    /// Refuses a `cfg` whose planner limits differ from `packer`'s own
+    /// configuration ([`Packer::config`], [`ExportConfig::check_against`]):
+    /// a planner that thinks batches may be larger than the packer accepts
+    /// would plan batches the packer splits or refuses.
+    /// [`Exporter::open_checked`] additionally checks the unit id against a
+    /// separately loaded [`PackConfig`].
     pub fn open(cfg: ExportConfig, packer: Packer) -> Result<Self, ExportError> {
+        cfg.check_against(packer.config())?;
+        Self::open_inner(cfg, packer)
+    }
+
+    /// [`Exporter::open`] without the planner-limit check. Only with the
+    /// non-default `fault-injection` feature (enabled for this crate's own
+    /// tests): it reproduces a split `pack` so the recovery path can be
+    /// tested. Never enabled in a deployed build.
+    #[cfg(feature = "fault-injection")]
+    #[doc(hidden)]
+    pub fn open_unchecked_for_fault_injection(
+        cfg: ExportConfig,
+        packer: Packer,
+    ) -> Result<Self, ExportError> {
+        Self::open_inner(cfg, packer)
+    }
+
+    fn open_inner(cfg: ExportConfig, packer: Packer) -> Result<Self, ExportError> {
         if cfg.max_findings_per_batch == 0 {
             return Err(ExportError::Config(
                 "max_findings_per_batch must be >= 1".into(),

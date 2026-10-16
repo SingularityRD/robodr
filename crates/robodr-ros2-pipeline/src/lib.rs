@@ -85,7 +85,7 @@ pub use config::{
     BindingConfig, CaptureConfig, CaptureInput, CaptureSettings, Config, Settings, SpdpSettings,
 };
 pub use dedup::DedupSet;
-pub use motion::{MotionOptions, MotionSample, MotionStats};
+pub use motion::{MotionOptions, MotionSample, MotionStats, SampleAttribution};
 pub use pipeline::{
     load_profile, rules, Finding, LoadedProfile, Pipeline, PipelineOptions, PipelineStats,
     ProcessOutput, ProfileStatus, ThreatExtra, OBSERVE_ONLY_TAG,

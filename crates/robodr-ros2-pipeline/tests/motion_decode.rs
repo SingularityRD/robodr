@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 use common::*;
 use robodr_events::{RobotEvent, Severity};
 use robodr_ros2_pipeline::{
-    rules, Ingress, MotionOptions, Pipeline, PipelineOptions, ProcessOutput,
+    rules, BindingOptions, Ingress, MotionOptions, Pipeline, PipelineOptions, ProcessOutput,
+    SampleAttribution,
 };
 
 const LEGIT_CMD_GUID: &str = "aaaaaaaaaaaaaaaaaaaaaaaa00001003";
@@ -569,4 +570,120 @@ fn hostile_motion_traffic_never_panics_and_stays_bounded() {
     // evicted first).
     let o = r.feed(&cmd_vel_datagram(LEGIT, CMD_WRITER, 99, 0.1), &robot_ip());
     assert_eq!(o.motion.len(), 1);
+}
+
+// --- Sample attribution: only a bound source is trusted --------------------
+
+fn findings_of<'a>(o: &'a ProcessOutput, rule: &str) -> Vec<&'a robodr_ros2_pipeline::Finding> {
+    o.findings
+        .iter()
+        .filter(|f| f.deviation.rule == rule)
+        .collect()
+}
+
+#[test]
+fn a_bound_sample_is_trusted() {
+    let mut r = started();
+    let o = r.feed(&cmd_vel_datagram(LEGIT, CMD_WRITER, 1, 0.2), &robot_ip());
+    assert!(o.findings.is_empty(), "{:?}", rules_of(&o));
+    assert_eq!(o.motion[0].attribution, SampleAttribution::Bound);
+    assert!(o.motion[0].attribution.is_trusted());
+}
+
+#[test]
+fn a_mismatched_sample_is_marked_and_not_trusted() {
+    let mut r = started();
+    let o = r.feed(
+        &cmd_vel_datagram(LEGIT, CMD_WRITER, 2, 0.2),
+        &ROGUE_IP.to_string(),
+    );
+    assert_eq!(o.motion[0].attribution, SampleAttribution::SourceMismatch);
+    assert!(!o.motion[0].attribution.is_trusted());
+    assert!(o.motion[0].attribution.is_refused());
+}
+
+#[test]
+fn a_sample_from_a_writer_without_a_binding_is_unattributed() {
+    let mut r = started();
+    // SEDP for a rogue writer on /cmd_vel, never preceded by SPDP: the writer
+    // is known to the decoder, its participant has no binding.
+    let sedp = datagram(
+        ROGUE,
+        &[sedp_writer_sub(ROGUE, CMD_WRITER, "rt/cmd_vel", TWIST)],
+    );
+    r.feed(&sedp, &ROGUE_IP.to_string());
+    let o = r.feed(
+        &cmd_vel_datagram(ROGUE, CMD_WRITER, 1, 0.2),
+        &ROGUE_IP.to_string(),
+    );
+    assert_eq!(o.motion.len(), 1, "still decoded and handed on");
+    assert_eq!(o.motion[0].attribution, SampleAttribution::Unbound);
+    assert!(!o.motion[0].attribution.is_trusted());
+    let f = findings_of(&o, rules::MOTION_UNATTRIBUTED_SAMPLE);
+    assert_eq!(f.len(), 1, "{:?}", rules_of(&o));
+    assert_eq!(f[0].deviation.severity, Severity::High);
+    assert!(
+        f[0].deviation.detail.contains("no binding"),
+        "{}",
+        f[0].deviation.detail
+    );
+    assert!(findings_of(&o, rules::MOTION_SAMPLE_SOURCE_MISMATCH).is_empty());
+    assert_eq!(r.p.stats().motion.unattributed, 1);
+}
+
+#[test]
+fn a_sample_with_an_unparseable_source_ip_is_unattributed() {
+    let mut r = started();
+    let o = r.feed(&cmd_vel_datagram(LEGIT, CMD_WRITER, 3, 0.2), "not-an-ip");
+    assert_eq!(o.motion.len(), 1);
+    assert_eq!(o.motion[0].attribution, SampleAttribution::Unbound);
+    let f = findings_of(&o, rules::MOTION_UNATTRIBUTED_SAMPLE);
+    assert_eq!(f.len(), 1, "{:?}", rules_of(&o));
+    assert!(f[0].deviation.detail.contains("could not be parsed"));
+}
+
+#[test]
+fn a_sample_of_a_contested_prefix_is_never_trusted_even_from_the_first_host() {
+    let mut r = started();
+    // A second host claims the profiled prefix: it becomes contested.
+    let claim = datagram(LEGIT, &[spdp_sub(LEGIT, &[ROGUE_IP])]);
+    let o = r.feed(&claim, &ROGUE_IP.to_string());
+    assert!(rules_of(&o).contains(&rules::PARTICIPANT_SOURCE_MISMATCH.to_string()));
+    assert!(r.p.binding().is_contested(&LEGIT));
+    for (ip, sn) in [(robot_ip(), 4), (ROGUE_IP.to_string(), 5)] {
+        let o = r.feed(&cmd_vel_datagram(LEGIT, CMD_WRITER, sn, 0.2), &ip);
+        assert_eq!(o.motion.len(), 1);
+        assert_eq!(
+            o.motion[0].attribution,
+            SampleAttribution::Contested,
+            "{ip}"
+        );
+        let f = findings_of(&o, rules::MOTION_SAMPLE_SOURCE_MISMATCH);
+        assert_eq!(f.len(), 1, "{ip}: {:?}", rules_of(&o));
+        assert_eq!(f[0].deviation.severity, Severity::Critical);
+        assert!(f[0].deviation.detail.contains("contested"));
+    }
+}
+
+#[test]
+fn with_the_binding_check_off_samples_are_not_checked_and_not_trusted() {
+    let mut r = Run::new(Pipeline::new(
+        robot_profile(true),
+        PipelineOptions {
+            binding: BindingOptions {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    ));
+    r.feed(&motion_discovery(), &robot_ip());
+    let o = r.feed(
+        &cmd_vel_datagram(LEGIT, CMD_WRITER, 1, 0.2),
+        &ROGUE_IP.to_string(),
+    );
+    assert!(o.findings.is_empty(), "{:?}", rules_of(&o));
+    assert_eq!(o.motion[0].attribution, SampleAttribution::NotChecked);
+    assert!(!o.motion[0].attribution.is_trusted());
+    assert!(!o.motion[0].attribution.is_refused());
 }

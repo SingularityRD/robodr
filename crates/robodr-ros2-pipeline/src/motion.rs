@@ -34,6 +34,8 @@
 //! | a sample on a motion / feedback topic that cannot be inspected: undecodable payload (truncated, unknown encapsulation id (anything outside XTypes 1.3 Table 60), `PL_CDR`, over a cap, malformed string), unknown type name, a type of the wrong role for the topic (feedback type on a command channel or the reverse), non-standard payload, malformed DATA / inline QoS, fragments refused / evicted / conflicting, per-datagram sample cap | [`rules::MOTION_UNDECODABLE_SAMPLE`] | Medium, rate limited (`robot.motion.undecodable_sample` bucket), dedup by channel + writer + reason |
 //! | DATA addressed to a reader entity announced on a motion / feedback topic, from a writer **never announced via SEDP** (cannot be attributed, so cannot be checked against the profile) | [`rules::MOTION_UNATTRIBUTED_SAMPLE`] | High, dedup by writer + topic |
 //! | a decoded sample whose writer prefix is bound to other source IPs than the one it came from (binding table, [`crate::binding`]): somebody speaks for a profiled writer | [`rules::MOTION_SAMPLE_SOURCE_MISMATCH`] | Critical on a command channel, High on a feedback topic |
+//! | a decoded sample whose writer prefix is **contested** (claimed by SPDP from two hosts, unpinned): no source is trusted for it | [`rules::MOTION_SAMPLE_SOURCE_MISMATCH`] | Critical on a command channel, High on a feedback topic |
+//! | a decoded sample whose writer was announced via SEDP but whose participant has **no binding** (no SPDP seen, not pinned, binding expired) or whose datagram source IP does not parse, while the binding check is on | [`rules::MOTION_UNATTRIBUTED_SAMPLE`] | High |
 //! | a decoded command whose speed cannot be bounded from the message (`JointTrajectory` with no velocities and fewer than two points with positions; `robodr_cdr::DecodeAnomaly::UnverifiableCommand`): no envelope can check it | [`rules::MOTION_UNVERIFIABLE_COMMAND`] | Medium, dedup by channel + writer |
 //! | a decoded sample with more bytes after the message than XCDR end padding explains (> 3, `robodr_cdr::DecodeAnomaly::ExcessTrailingBytes`): DDS readers ignore them, nothing standard sends them | [`rules::MOTION_DECODE_ANOMALY`] | Low, dedup by channel + writer + kind (byte count not in the dedup key) |
 //! | every decoded `MotionCommand` (if `evaluate_commands`) | the profile's motion rules (`robot.motion.linear_over_envelope`, `angular_over_envelope`, `joint_over_envelope`, `non_finite_command`, `unprofiled_channel`, `robot.profile.invalid_envelope`) | as `robodr-events` decides (Critical for over-envelope / non-finite) |
@@ -48,7 +50,15 @@
 //! * Every GUID and timestamp on the wire is a claim (no DDS-Security). The
 //!   writer → topic mapping is only as good as the SEDP it came from, which
 //!   the binding check judges; DATA itself is judged against the binding
-//!   (source-IP mismatch finding above).
+//!   with the safety feed's rule: only `allows_from == Some(true)` is
+//!   trusted. Each [`MotionSample`] carries the verdict
+//!   ([`MotionSample::attribution`]); a sample that is unbound, contested or
+//!   source-mismatched is still decoded and handed on (so the firewall /
+//!   monitor see what was sent) with a finding, and consumers must not let
+//!   its writer GUID authorise anything (`robodr-agentd` drops the GUID of
+//!   such a command, so the firewall model sees an unknown source). With the
+//!   binding check disabled the verdict is
+//!   [`SampleAttribution::NotChecked`] (no finding, not trusted).
 //! * Removals (SEDP dispose) do **not** forget a writer: a spoofed dispose
 //!   must not blind the decoder. Entries are evicted only by the table bound
 //!   (least recently announced, non-motion entries first).
@@ -166,6 +176,54 @@ pub struct MotionSample {
     /// Bytes after the decoded message (XCDR padding or appended members;
     /// more than 3 is also a [`rules::MOTION_DECODE_ANOMALY`] finding).
     pub trailing_bytes: usize,
+    /// What the binding table says about the sample's source. Only
+    /// [`SampleAttribution::Bound`] means the writer GUID may be taken at
+    /// its word; see [`SampleAttribution::is_trusted`].
+    pub attribution: SampleAttribution,
+}
+
+/// How a decoded sample's source was judged against the participant
+/// binding ([`crate::binding`]). The writer GUID in the sample is a claim;
+/// only `Bound` vouches for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SampleAttribution {
+    /// The binding accepts the source IP for the writer's prefix
+    /// (`allows_from == Some(true)`).
+    Bound,
+    /// The binding check is disabled and nothing pins the prefix: the
+    /// operator chose not to attribute sources. Not a finding, but not
+    /// trusted either.
+    NotChecked,
+    /// The binding check is on but the writer's participant has no binding
+    /// (no SPDP seen, not pinned, or the binding expired), or the datagram's
+    /// source IP could not be parsed. [`rules::MOTION_UNATTRIBUTED_SAMPLE`].
+    Unbound,
+    /// The writer's prefix is contested (claimed by SPDP from two hosts):
+    /// no source is trusted for it. [`rules::MOTION_SAMPLE_SOURCE_MISMATCH`].
+    Contested,
+    /// The source IP is outside the writer's binding.
+    /// [`rules::MOTION_SAMPLE_SOURCE_MISMATCH`].
+    SourceMismatch,
+}
+
+impl SampleAttribution {
+    /// Only a bound source is trusted; every other verdict (including "no
+    /// binding yet") means the writer GUID must not authorise anything.
+    pub fn is_trusted(self) -> bool {
+        self == SampleAttribution::Bound
+    }
+
+    /// Unbound, contested or mismatched: the binding check ran and did not
+    /// vouch for the source (a finding was raised).
+    pub fn is_refused(self) -> bool {
+        matches!(
+            self,
+            SampleAttribution::Unbound
+                | SampleAttribution::Contested
+                | SampleAttribution::SourceMismatch
+        )
+    }
 }
 
 /// Counters of the motion decode path.
@@ -177,9 +235,11 @@ pub struct MotionStats {
     pub feedback: u64,
     /// Samples that were not inspected (undecodable, unknown type, ...).
     pub undecodable: u64,
-    /// DATA to a motion reader from a writer never announced via SEDP.
+    /// DATA to a motion reader from a writer never announced via SEDP, and
+    /// decoded samples whose writer's participant has no binding.
     pub unattributed: u64,
-    /// Decoded samples from a source IP outside the writer's binding.
+    /// Decoded samples from a source IP outside the writer's binding, or
+    /// from a writer whose prefix is contested.
     pub source_mismatch: u64,
     /// Decoded commands whose speed could not be bounded.
     pub unverifiable: u64,
@@ -652,26 +712,8 @@ impl MotionTracker {
                     writer_guid: Some(&writer),
                     timestamp_ns: ctx.capture_ns,
                 });
-                if let Some(ip) = ctx.ip {
-                    let prefix = s.address.writer_prefix();
-                    if binding.allows_from(&prefix, ip, ctx.ingress) == Some(false) {
-                        self.stats.source_mismatch += 1;
-                        let sev = match role {
-                            Role::Command => Severity::Critical,
-                            Role::Feedback => Severity::High,
-                        };
-                        out.deviations.push(Deviation::new(
-                            rules::MOTION_SAMPLE_SOURCE_MISMATCH,
-                            sev,
-                            format!(
-                                "{role_name} sample on {} from writer {writer} arrived from {}, \
-                                 an IP not bound to its participant (spoofed writer?)",
-                                short(&channel),
-                                ctx.src_ip
-                            ),
-                        ));
-                    }
-                }
+                let attribution =
+                    self.attribute(&mut out, binding, ctx, &s.address, role, &channel);
                 match role {
                     Role::Command => self.stats.commands += 1,
                     Role::Feedback => self.stats.feedback += 1,
@@ -692,10 +734,98 @@ impl MotionTracker {
                     capture_ns: ctx.capture_ns,
                     from_fragments: s.from_fragments,
                     trailing_bytes: decoded.trailing_bytes,
+                    attribution,
                 });
             }
         }
         out
+    }
+}
+
+impl MotionTracker {
+    /// Judge a decoded sample's source against the binding and raise the
+    /// finding for anything but a bound source (same rule as the safety
+    /// feed: only `allows_from == Some(true)` is trusted; unbound and
+    /// contested are never silently accepted).
+    fn attribute(
+        &mut self,
+        out: &mut MotionOutput,
+        binding: &BindingTable,
+        ctx: &DatagramCtx<'_>,
+        address: &SampleAddress,
+        role: Role,
+        channel: &str,
+    ) -> SampleAttribution {
+        let prefix = address.writer_prefix();
+        let writer = hex_guid(&address.writer);
+        let role_name = match role {
+            Role::Command => "command",
+            Role::Feedback => "feedback",
+        };
+        let verdict = ctx
+            .ip
+            .map(|ip| binding.allows_from(&prefix, ip, ctx.ingress));
+        let attribution = match verdict {
+            Some(Some(true)) => SampleAttribution::Bound,
+            Some(Some(false)) if binding.is_contested(&prefix) => SampleAttribution::Contested,
+            Some(Some(false)) => SampleAttribution::SourceMismatch,
+            _ if !binding.options().enabled => SampleAttribution::NotChecked,
+            _ => SampleAttribution::Unbound,
+        };
+        let mismatch_sev = match role {
+            Role::Command => Severity::Critical,
+            Role::Feedback => Severity::High,
+        };
+        match attribution {
+            SampleAttribution::Bound | SampleAttribution::NotChecked => {}
+            SampleAttribution::SourceMismatch => {
+                self.stats.source_mismatch += 1;
+                out.deviations.push(Deviation::new(
+                    rules::MOTION_SAMPLE_SOURCE_MISMATCH,
+                    mismatch_sev,
+                    format!(
+                        "{role_name} sample on {} from writer {writer} arrived from {}, an IP \
+                         not bound to its participant (spoofed writer?)",
+                        short(channel),
+                        ctx.src_ip
+                    ),
+                ));
+            }
+            SampleAttribution::Contested => {
+                self.stats.source_mismatch += 1;
+                out.deviations.push(Deviation::new(
+                    rules::MOTION_SAMPLE_SOURCE_MISMATCH,
+                    mismatch_sev,
+                    format!(
+                        "{role_name} sample on {} from writer {writer} (from {}): its \
+                         participant's GUID prefix is contested (announced from more than one \
+                         host), so no source is trusted for it; pin it in participant_ips",
+                        short(channel),
+                        ctx.src_ip
+                    ),
+                ));
+            }
+            SampleAttribution::Unbound => {
+                self.stats.unattributed += 1;
+                let why = if ctx.ip.is_none() {
+                    "its datagram's source IP could not be parsed"
+                } else {
+                    "its participant has no binding (no SPDP seen from it, not pinned, or the \
+                     binding expired)"
+                };
+                out.deviations.push(Deviation::new(
+                    rules::MOTION_UNATTRIBUTED_SAMPLE,
+                    Severity::High,
+                    format!(
+                        "{role_name} sample on {} from writer {writer} (from {}) cannot be \
+                         attributed: {why}; it is not treated as authorised",
+                        short(channel),
+                        ctx.src_ip
+                    ),
+                ));
+            }
+        }
+        attribution
     }
 }
 

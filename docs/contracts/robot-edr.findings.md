@@ -386,8 +386,13 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
   free text. Data sources: `ros2_dds_discovery`, `ros2_motion_commands`,
   `robodr` (rule not in the catalog), and since 1.3 `robodr_correlation`
   (`robot.correlate.*`), `robot_safety_state` (`robot.safety_state.*`) and
-  `robodr_agent` (`robot.ros2.profile_state_tampered`,
-  `robot.agent.evidence_quarantined`, `robot.agent.correlation_pressure`).
+  `robodr_agent` (`robot.agent.*`, `robot.ros2.profile_state_tampered`,
+  `robot.ros2.profile_refused`). Since 1.3 every `robot.*` id an in-repo
+  detector emits has its own entry (sensor discovery, capture and source
+  binding ids under `ros2_dds_discovery`; motion decode, motion monitor and
+  firewall ids under `ros2_motion_commands`); `robodr` is left for ids a
+  deployment adds. The `catalog_1_3` test of `robodr-ocsf` scans the crate
+  sources and fails on an emitted id without an entry.
   Techniques: T0848 Rogue Master, T0855 Unauthorized Command Message, T0801
   Monitor Process State, T0831 Manipulation of Control, and since 1.3 T0856
   Spoof Reporting Message (untrusted safety-state writer). Adding a catalog
@@ -647,7 +652,20 @@ Consumer acceptance checks for this contract:
   `robot.correlate.*` rules plus a generic entry for any other
   `robot.correlate.*` id, `robot.safety_state.{untrusted_source,
   undecodable_sample, unmapped_value}`, `robot.ros2.profile_state_tampered`,
-  `robot.agent.evidence_quarantined` and `robot.agent.correlation_pressure`.
+  `robot.agent.evidence_quarantined` and `robot.agent.correlation_pressure`;
+  during the same (unreleased) cycle also the wave-7 ids
+  `robot.safety_state.writer_overflow`,
+  `robot.correlate.correlation_state_evicted` (own entry, no longer the
+  generic correlation entry) and `robot.agent.evidence_truncated`, plus a
+  dedicated entry for every other emitted `robot.*` id that used to get the
+  generic `robodr` entry: agent self-health (`robot.agent.*`), profile
+  (`robot.ros2.unknown_service`, `unknown_action`, `unknown_reader_topic`,
+  `robot.dds.unknown_raw_writer`, `robot.motion.non_finite_command`,
+  `robot.profile.invalid_envelope`), sensor pipeline (`robot.ros2.*`
+  profile/binding ids, `robot.rtps.*`, `robot.capture.*`,
+  `robot.sensor.findings_capped`, motion decode `robot.motion.*`), motion
+  monitor (`robot.motion.*`) and firewall (`robot.firewall.*`). No new data
+  source or technique beyond those listed here.
   New data sources `robodr_correlation`, `robot_safety_state`,
   `robodr_agent`; new technique T0856 Spoof Reporting Message. Value format
   otherwise unchanged; the validator checks catalog constants against the
