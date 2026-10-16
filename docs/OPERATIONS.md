@@ -703,11 +703,24 @@ mode.
 
 **Black-box upkeep.** Every tick writes the black box's `head.json`
 high-water mark when records were added since the last one. If the
-recorder found damaged closed segments when it opened, they are moved to
+recorder found damaged segments when it opened, they are moved to
 `<blackbox>/quarantine/` (with a signed recovery record) and agentd raises
-`robot.agent.evidence_quarantined` (High, observe-only): the storage is
-failing or someone edited the log. Keep the quarantined files for the
-investigation.
+`robot.agent.evidence_quarantined` (observe-only) with the recorder's
+severity: High = framing/hash damage in an older segment (failing storage
+or an edit), Critical = tampering (a stray segment file above the live
+one, a closed segment cut on a frame boundary, the newest segment gone).
+If authentic state proves the newest records were cut, agentd raises
+Critical `robot.agent.evidence_truncated`. Keep the quarantined files for
+the investigation.
+
+**Head anchor.** `blackbox.head_anchor` is optional; without it agentd
+warns at start and `status.json` reports `"blackbox": {"anchored":
+false}`: `head.json` alone cannot reveal a cut of the newest records
+together with a rolled-back `head.json`, or a wiped store.
+`{"kind": "file", "path": "/abs/path"}` keeps the mark in a file outside
+`blackbox.dir` and `spool.dir`; it is only as strong as the storage it
+lives on. **A deployment must anchor to a TPM NV monotonic counter or a
+remote receiver** (integration work, not shipped yet).
 
 ## 7. Upgrade and rollback
 
@@ -874,6 +887,7 @@ The package never deletes evidence or keys, not even on `apt purge`.
 | agent: `log is keyed X, signer is Y` | key changed without rotation | section 4.3 |
 | `lock: --operators is required` / `no valid operator signature` | sign-off list not signed, or signed by a key not in the operators list | section 5, step 3 |
 | High `robot.agent.evidence_quarantined` | a closed black-box segment failed verification at open | section 6.4: keep `<blackbox>/quarantine/`, check the storage, treat as possible tampering |
+| Critical `robot.agent.evidence_quarantined` / `robot.agent.evidence_truncated` | the black-box directory was edited (stray or cut segment files, records cut after the newest mark) | section 6.4: preserve the whole `<blackbox>` directory, treat as tampering |
 | `finding_signing.key_file ... black-box key` / `must be an ed25519 key` | finding key reused or HMAC | section 6.4: generate a dedicated Ed25519 key |
 | `correlation rules: ...` at start | site rule file invalid or duplicates a shipped id | fix the file, or `--check-config` to see every problem |
 | every finding `[observe-only]` | profile unlocked, missing or invalid | section 5 |

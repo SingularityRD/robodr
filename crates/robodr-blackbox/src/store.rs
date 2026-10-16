@@ -94,15 +94,37 @@
 //! recording: its bytes are copied to `quarantine/damaged-seg<idx>.rbb`
 //! (fsynced), a signed `Recovery` record with `quarantined_segment: true`,
 //! the file's SHA-256, size, the count and authenticated seq range of the
-//! frames in it, `crash_plausible: false` and severity `high` (framing or
-//! hash damage, what failing media produces) or `critical` (authentic-
-//! looking records that do not belong: foreign chain, bad signature, broken
-//! cross-segment link, missing seal) is written, and only then is the
-//! original unlinked. The verifier reports it as `SegmentQuarantined`
-//! (tamper) and the missing seqs as `Deleted`. Sequence numbers are never
-//! reused: a quarantined segment between retained ones is bounded by its
-//! successor, and if it was the newest closed segment (active segment
-//! still empty) numbering continues after its highest authentic seq.
+//! frames in it, `crash_plausible: false` and a severity is written, and
+//! only then is the original unlinked. The severity is `high` only for
+//! framing or hash damage (what failing media produces) in a segment older
+//! than the one the recorder chains onto; it is `critical` for
+//! authentic-looking records that do not belong (foreign chain, bad
+//! signature, broken cross-segment link), for a segment that parses
+//! cleanly but holds no records or does not end with a seal (whole frames
+//! removed on a frame boundary: not media, and no crash leaves a closed
+//! segment unsealed), and for any damaged segment *newer* than the newest
+//! intact one (the newest records vanishing while older ones survive is
+//! not what failing media looks like). The verifier reports it as
+//! `SegmentQuarantined` (tamper) and the missing seqs as `Deleted`.
+//! Sequence numbers are never reused: a quarantined segment between
+//! retained ones is bounded by its successor, and if it was the newest
+//! closed segment (active segment still empty) numbering continues after
+//! its highest authentic seq.
+//!
+//! **Stray segment files.** Let H be the newest segment file that holds
+//! records. If H does not end with a seal, H is the live segment (the
+//! recorder creates a successor only after sealing H and fsyncing it), and
+//! every file above it (empty, zeros or garbage) was not written by the
+//! recorder: it is quarantined the same way, `critical`, with a reason
+//! naming it a stray file. Without this, one empty `seg-<live+1>` file
+//! would make the live segment look like a closed segment without a seal.
+//! At most 64 stray files are quarantined; more refuse open.
+//!
+//! **Bounded work.** Frames in a damaged segment and frames after a hole in
+//! the active segment are untrusted (anyone with write access can append
+//! hash-valid forgeries): their signatures are checked for at most 32
+//! frames from each end. A forged frame among those checked makes a hole
+//! in the active segment not crash-plausible.
 //!
 //! Open still refuses when the head itself cannot be trusted: the active
 //! segment is corrupt (above), it is empty and no closed segment is intact,
@@ -124,6 +146,19 @@
 //! only come from a key holder rewriting history: open refuses with
 //! [`Error::Untrusted`] and touches nothing.
 //!
+//! Quarantined evidence "explains" a position beyond the head (no
+//! truncation is claimed) only when the damage is something a crash or
+//! failing media produces: a crash-plausible hole in the active segment,
+//! or a `high` quarantine. A `critical` quarantine explains nothing: the
+//! state files beyond the head still raise `TruncationDetected`, and the
+//! authentic records beyond the head that the quarantine removed are
+//! listed as evidence in it too (`file` = the segment, `preserved_as` =
+//! its quarantine copy). The same holds for a hole in the active segment
+//! that is not crash-plausible (a mark beyond the head also makes a hole
+//! not crash-plausible: it names a synced record that is gone).
+//! [`Recorder::open_incidents`] summarises what an open found
+//! (quarantines with their severity, truncation) for the host to report.
+//!
 //! # High-water mark (`head.json`) and external anchors
 //!
 //! Checkpoints are written only at seals, so a tail cut after the newest
@@ -144,7 +179,11 @@
 //!
 //! An optional [`HeadAnchor`] ([`RecorderConfig::head_anchor`]) receives
 //! every mark too, e.g. a TPM NV monotonic counter or a remote receiver, and
-//! is consulted at open the same way. It survives an attacker who rewrites
+//! is consulted at open the same way. **A deployment that must detect an
+//! attacker with write access to the unit needs one** (TPM NV counter or
+//! remote receiver); none ships in this crate. [`FileHeadAnchor`] is a
+//! simple file-backed implementation, only as strong as the storage its
+//! file lives on (useless on the log's own filesystem). It survives an attacker who rewrites
 //! or deletes the whole directory, which `head.json` does not: a store with
 //! no segments while the anchor holds a mark starts a new chain that
 //! declares the gap (`Resume` + `TruncationDetected`), so a wiped store is
@@ -295,6 +334,121 @@ impl HeadAnchor for MemoryHeadAnchor {
     }
     fn current(&self) -> Result<Option<AnchoredHead>, String> {
         Ok(self.get())
+    }
+}
+
+/// A [`HeadAnchor`] kept in a single file (`{"chain_id","seq","hash"}`,
+/// replaced atomically, never decreasing).
+///
+/// **Limits, read before relying on it.** It is exactly as tamper-resistant
+/// as the place the file lives: on the same filesystem as the log, an
+/// attacker who can edit the log can edit or delete it too, and it adds
+/// nothing over `head.json`. It is useful only when the path is on storage
+/// the log's attacker cannot write (a separately mounted, write-restricted
+/// partition, a network share replicated off the unit, a removable medium
+/// collected after a mission). A deployment that must survive an attacker
+/// with write access to the unit needs a TPM NV monotonic counter or a
+/// remote receiver behind [`HeadAnchor`]; this type is the simple building
+/// block, not that guarantee.
+///
+/// The file is trusted input (unsigned): a writer to it can make the next
+/// open report a false truncation (never hide one that `head.json` shows).
+/// A file that exists but cannot be parsed is an anchor failure (counted,
+/// noted in the `Resume` record), not "no anchor".
+#[derive(Debug)]
+pub struct FileHeadAnchor {
+    dir: PathBuf,
+    name: String,
+    lock: Mutex<()>,
+}
+
+#[derive(Serialize, serde::Deserialize)]
+struct FileAnchorJson {
+    chain_id: String,
+    seq: u64,
+    hash: String,
+}
+
+impl FileHeadAnchor {
+    /// Anchor in `path` (absolute; its directory must exist). The file is
+    /// created at the first mark.
+    pub fn new(path: impl Into<PathBuf>) -> Result<Self, Error> {
+        let path = path.into();
+        if !path.is_absolute() {
+            return Err(Error::Config(format!(
+                "head anchor file {} must be an absolute path",
+                path.display()
+            )));
+        }
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+            return Err(Error::Config(format!(
+                "head anchor file {} has no directory or file name",
+                path.display()
+            )));
+        };
+        let name = name.to_str().ok_or_else(|| {
+            Error::Config(format!(
+                "head anchor file {} is not valid UTF-8",
+                path.display()
+            ))
+        })?;
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            name: name.to_string(),
+            lock: Mutex::new(()),
+        })
+    }
+
+    /// The anchor file's path.
+    pub fn path(&self) -> PathBuf {
+        self.dir.join(&self.name)
+    }
+
+    fn read(&self) -> Result<Option<AnchoredHead>, String> {
+        let Some(s) = read_state(&self.dir, &self.name).map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        let j: FileAnchorJson = serde_json::from_str(&s)
+            .map_err(|_| format!("{}: unparseable anchor file", self.path().display()))?;
+        let bad = || format!("{}: malformed hash in anchor file", self.path().display());
+        Ok(Some(AnchoredHead {
+            chain_id: Some(crate::crypto::hash_from_hex(&j.chain_id).ok_or_else(bad)?),
+            seq: j.seq,
+            hash: Some(crate::crypto::hash_from_hex(&j.hash).ok_or_else(bad)?),
+        }))
+    }
+}
+
+impl HeadAnchor for FileHeadAnchor {
+    fn advance(&self, mark: &Checkpoint) -> Result<(), String> {
+        let _g = self
+            .lock
+            .lock()
+            .map_err(|_| "anchor lock poisoned".to_string())?;
+        // Never go down (a read failure must not let it either).
+        if let Some(h) = self.read()? {
+            if h.seq > mark.seq {
+                return Err(format!(
+                    "anchor holds seq {} > {}: refusing to decrease it",
+                    h.seq, mark.seq
+                ));
+            }
+        }
+        let j = FileAnchorJson {
+            chain_id: to_hex(&mark.chain_id),
+            seq: mark.seq,
+            hash: to_hex(&mark.hash),
+        };
+        let data = serde_json::to_vec(&j).map_err(|e| e.to_string())?;
+        atomic_write(&self.dir, &self.name, &data)
+            .map_err(|e| format!("{}: {e}", self.path().display()))
+    }
+    fn current(&self) -> Result<Option<AnchoredHead>, String> {
+        let _g = self
+            .lock
+            .lock()
+            .map_err(|_| "anchor lock poisoned".to_string())?;
+        self.read()
     }
 }
 
@@ -1242,18 +1396,126 @@ struct Beyond {
 /// Strict structure of a closed segment: whole frames only, every hash and
 /// in-segment link valid, at least one record, ending with a seal (every
 /// rotation seals and fsyncs before the next segment is created).
-fn closed_structure(name: &str, bytes: &[u8]) -> Result<Vec<Record>, String> {
-    let a = analyze_segment(name, bytes).map_err(|e| e.to_string())?;
+///
+/// The error carries how severe the damage is: framing or hash damage
+/// (what failing media produces) is `High`; a segment that parses cleanly
+/// but holds no records or does not end with a seal is `Critical`: media
+/// does not remove whole frames on a frame boundary, and no crash leaves a
+/// closed segment unsealed (the seal is fsynced before the successor
+/// exists), so it was cut or the live segment was made to look closed.
+fn closed_structure(name: &str, bytes: &[u8]) -> Result<Vec<Record>, (String, Severity)> {
+    let a = analyze_segment(name, bytes).map_err(|e| (e.to_string(), Severity::High))?;
     if let Some(c) = a.cut {
-        return Err(format!("damaged at offset {}: {}", c.offset, c.reason));
+        return Err((
+            format!("damaged at offset {}: {}", c.offset, c.reason),
+            Severity::High,
+        ));
     }
     match a.good.last() {
-        None => Err("holds no records".into()),
-        Some(r) if r.kind != RecordKind::Seal => {
-            Err(format!("does not end with a seal (last record {})", r.seq))
-        }
+        None => Err(("holds no records".into(), Severity::Critical)),
+        Some(r) if r.kind != RecordKind::Seal => Err((
+            format!("does not end with a seal (last record {})", r.seq),
+            Severity::Critical,
+        )),
         Some(_) => Ok(a.good),
     }
+}
+
+/// Bounded signature work on untrusted frames (a damaged segment, or the
+/// records after a hole in the active segment): at most this many from the
+/// top and from the bottom are checked.
+const QUARANTINE_SIG_TRIES: usize = 32;
+
+/// Most stray segment files above the live segment the recorder will
+/// quarantine; more is refused as corruption.
+const MAX_STRAY_SEGMENTS: usize = 64;
+
+/// Segment files `(index, path)` in index order.
+type SegmentList = Vec<(u64, PathBuf)>;
+
+/// A segment file found above the live segment (see [`Recorder::resume`]).
+struct Stray {
+    idx: u64,
+    path: PathBuf,
+    bytes: Vec<u8>,
+    why: String,
+}
+
+/// Split `segs` into the segments the log really consists of and stray
+/// files above the live one.
+///
+/// Let H be the newest file that holds records. If H does not end with a
+/// seal (or has a torn / zero-damaged tail), H is the live segment: the
+/// recorder creates a successor only after sealing and fsyncing. Every
+/// file above it holds no record (empty, zeros, garbage) and was not
+/// written by the recorder; left in place it would turn the live, unsealed
+/// segment into a "closed segment without a seal" and get it quarantined.
+/// Such files are returned separately (quarantined as tamper by the
+/// caller). If H ends with a seal nothing is split off: the file after it
+/// is the active segment (a rotation that crashed before its
+/// `SegmentStart` leaves it empty or torn), and anything else is judged by
+/// the closed-segment checks.
+fn split_strays(mut segs: SegmentList) -> Result<(SegmentList, Vec<Stray>), Error> {
+    let mut above: Vec<Stray> = Vec::new();
+    for i in (0..segs.len()).rev() {
+        let (idx, path) = segs[i].clone();
+        let name = segment_file_name(idx);
+        let bytes = fs::read(&path)?;
+        let a = match analyze_segment(&name, &bytes) {
+            Ok(a) if !a.good.is_empty() => a,
+            Ok(a) => {
+                let why = if bytes.is_empty() {
+                    "empty file".to_string()
+                } else {
+                    a.cut.map_or_else(
+                        || "holds no records".to_string(),
+                        |c| format!("holds no valid record ({})", c.reason),
+                    )
+                };
+                above.push(Stray {
+                    idx,
+                    path,
+                    bytes,
+                    why,
+                });
+                continue;
+            }
+            Err(e) => {
+                above.push(Stray {
+                    idx,
+                    path,
+                    bytes,
+                    why: e.to_string(),
+                });
+                continue;
+            }
+        };
+        let live_here =
+            a.cut.is_some() || a.good.last().is_some_and(|r| r.kind != RecordKind::Seal);
+        let keep = i + 1;
+        if !live_here || keep >= segs.len() {
+            // Sealed: the files above are the (possibly empty) active
+            // segment and damaged closed ones; the closed-segment checks
+            // classify them (an empty closed segment is critical).
+            return Ok((segs, Vec::new()));
+        }
+        above.reverse(); // ascending: positions i+1 ..
+        let strays = above.split_off(keep - (i + 1));
+        if strays.len() > MAX_STRAY_SEGMENTS {
+            return Err(Error::Corrupt {
+                segment: segment_file_name(strays[0].idx),
+                offset: 0,
+                reason: format!(
+                    "{} stray segment files above the live segment {}",
+                    strays.len(),
+                    segs[keep - 1].0
+                ),
+            });
+        }
+        segs.truncate(keep);
+        return Ok((segs, strays));
+    }
+    Ok((segs, Vec::new()))
 }
 
 /// Key id expected to sign each record of a segment (its `SegmentStart`
@@ -1313,6 +1575,82 @@ fn anchor_evidence_json(h: &AnchoredHead) -> String {
     .to_string()
 }
 
+/// Evidence trouble a [`Recorder`] found while opening the log
+/// ([`Recorder::open_incidents`]), for the host to report. Each one is also
+/// a signed record in the log (`Recovery` or `TruncationDetected`); this is
+/// only the in-memory summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenIncident {
+    /// A segment file was quarantined: a closed segment that failed
+    /// verification, or a stray file above the live segment. `High` =
+    /// framing or hash damage (failing media); `Critical` = tampering.
+    SegmentQuarantined {
+        segment_index: u64,
+        severity: Severity,
+        reason: String,
+    },
+    /// Authentic records after a zero-filled hole in the active segment
+    /// were quarantined (`High` if a crash explains it, else `Critical`).
+    /// A plain torn tail (medium) is not an incident.
+    DamageQuarantined {
+        segment_index: u64,
+        severity: Severity,
+        crash_plausible: bool,
+        reason: String,
+    },
+    /// Authentic evidence (a state file, the external anchor, or authentic
+    /// records removed by a critical quarantine) names records beyond the
+    /// head: the log was cut. Always `Critical`.
+    TruncationDetected {
+        head_seq: u64,
+        skipped_seqs: [u64; 2],
+        /// What proved it, e.g. `head.json names seq 41`.
+        evidence: Vec<String>,
+    },
+}
+
+impl OpenIncident {
+    /// How severe the recorder rated it.
+    pub fn severity(&self) -> Severity {
+        match self {
+            OpenIncident::SegmentQuarantined { severity, .. }
+            | OpenIncident::DamageQuarantined { severity, .. } => *severity,
+            OpenIncident::TruncationDetected { .. } => Severity::Critical,
+        }
+    }
+}
+
+impl fmt::Display for OpenIncident {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OpenIncident::SegmentQuarantined {
+                segment_index,
+                reason,
+                ..
+            } => write!(f, "segment {segment_index} quarantined: {reason}"),
+            OpenIncident::DamageQuarantined {
+                segment_index,
+                reason,
+                crash_plausible,
+                ..
+            } => write!(
+                f,
+                "records after damage in active segment {segment_index} quarantined \
+                 ({reason}; crash plausible: {crash_plausible})"
+            ),
+            OpenIncident::TruncationDetected {
+                head_seq,
+                skipped_seqs: [a, b],
+                evidence,
+            } => write!(
+                f,
+                "log truncated after seq {head_seq}: seqs {a}..={b} are gone ({})",
+                evidence.join("; ")
+            ),
+        }
+    }
+}
+
 /// Largest index gap the recorder will record as missing segments; a larger
 /// one is refused as corruption (it cannot come from normal operation).
 const MAX_SEGMENT_GAP: u64 = 64;
@@ -1368,6 +1706,8 @@ pub struct Recorder {
     quarantined_ranges: Vec<[u64; 2]>,
     /// Indices of the closed segments quarantined by this open.
     quarantined_now: Vec<u64>,
+    /// Evidence trouble found by this open, for the host to report.
+    open_incidents: Vec<OpenIncident>,
 }
 
 impl fmt::Debug for Recorder {
@@ -1592,6 +1932,7 @@ impl Recorder {
             last_anchor_error: None,
             quarantined_ranges: Vec::new(),
             quarantined_now: Vec::new(),
+            open_incidents: Vec::new(),
         };
         let genesis = to_json(&GenesisPayload {
             identity,
@@ -1666,6 +2007,11 @@ impl Recorder {
             severity: Severity::Critical,
         })?;
         self.write_record(RecordKind::TruncationDetected, p, true, true)?;
+        self.open_incidents.push(OpenIncident::TruncationDetected {
+            head_seq: 0,
+            skipped_seqs: skipped,
+            evidence: vec![format!("{EXTERNAL_ANCHOR} names seq {}", held.seq)],
+        });
         Ok(())
     }
 
@@ -1762,6 +2108,10 @@ impl Recorder {
     }
 
     fn resume(parts: Parts, segs: Vec<(u64, PathBuf)>) -> Result<Self, Error> {
+        // 0. Files above the live segment that hold no record: not the
+        //    recorder's (quarantined as tamper below, never allowed to make
+        //    the live segment look closed).
+        let (segs, strays) = split_strays(segs)?;
         let (last_idx, last_path) = segs.last().cloned().expect("non-empty");
         let last_name = segment_file_name(last_idx);
         let bytes = fs::read(&last_path)?;
@@ -1804,7 +2154,7 @@ impl Recorder {
             let b = fs::read(path)?;
             let (records, damage) = match closed_structure(&segment_file_name(*idx), &b) {
                 Ok(r) => (r, None),
-                Err(why) => (Vec::new(), Some((why, Severity::High))),
+                Err(d) => (Vec::new(), Some(d)),
             };
             closed.push(ClosedSeg {
                 idx: *idx,
@@ -1984,6 +2334,39 @@ impl Recorder {
             }
         }
 
+        // 6b. Refusal counters persisted before the restart (before the
+        //     strays join `closed`).
+        let mut refusals = persisted_refusals(tail.iter());
+        if refusals.is_none() && !need_segment_start {
+            if let Some(c) = closed
+                .last()
+                .filter(|c| c.damage.is_none() && c.idx + 1 == last_idx)
+            {
+                refusals = persisted_refusals(c.records.iter());
+            }
+        }
+        let (refused_noncritical, refused_critical) = refusals.unwrap_or((0, 0));
+
+        // 6c. Stray files above the live segment join the quarantine as
+        //     tamper.
+        let live_idx = last_idx;
+        closed.extend(strays.into_iter().map(|s| ClosedSeg {
+            idx: s.idx,
+            path: s.path,
+            bytes: s.bytes,
+            records: Vec::new(),
+            damage: Some((
+                format!(
+                    "stray segment file above the live segment {live_idx} ({}): not written \
+                     by the recorder",
+                    s.why
+                ),
+                Severity::Critical,
+            )),
+            drops: Vec::new(),
+            quarantine_records: Vec::new(),
+        }));
+
         // 7. Retained segments and what the quarantined ones held.
         let mut infos: VecDeque<SegInfo> = VecDeque::with_capacity(segs.len());
         let mut drops = tail_drops;
@@ -2032,9 +2415,15 @@ impl Recorder {
                 .collect();
             cands.sort_by_key(|r| r.seq);
             // Bounded signature work: the frames are untrusted.
-            const TRIES: usize = 32;
-            let hi = cands.iter().rev().take(TRIES).find(|r| keys.record(r));
-            let lo = cands.iter().take(TRIES).find(|r| keys.record(r));
+            let hi = cands
+                .iter()
+                .rev()
+                .take(QUARANTINE_SIG_TRIES)
+                .find(|r| keys.record(r));
+            let lo = cands
+                .iter()
+                .take(QUARANTINE_SIG_TRIES)
+                .find(|r| keys.record(r));
             let range = match (lo, hi) {
                 (Some(a), Some(b)) => Some([a.seq, b.seq]),
                 _ => None,
@@ -2042,10 +2431,23 @@ impl Recorder {
             let already = recorded_q
                 .iter()
                 .any(|q| q.segment_index == c.idx && q.discarded_sha256 == sha);
+            // Newer than the segment we chain onto: it held the newest
+            // records. Storage that loses a whole newest segment while an
+            // older one survives intact is not what failing media looks
+            // like, and treating it as such would let its quarantine
+            // "explain" the high-water mark away.
+            let (reason, severity) = if c.idx > tail_idx && *severity < Severity::Critical {
+                (
+                    format!("{reason} (newer than the newest intact segment {tail_idx})"),
+                    Severity::Critical,
+                )
+            } else {
+                (reason.clone(), *severity)
+            };
             quarantine.push(QInfo {
                 pos: ci,
-                reason: reason.clone(),
-                severity: *severity,
+                reason,
+                severity,
                 sha,
                 records: cands.len() as u64,
                 range,
@@ -2103,52 +2505,68 @@ impl Recorder {
 
         // 8b. Authentic records quarantined with a mid-segment hole: their
         //     seqs must never be reused; whether a crash explains the hole.
-        let lost: Vec<Record> = cut
+        //     The frames after the hole are untrusted (an attacker can append
+        //     any number of hash-valid forgeries): signatures are checked for
+        //     at most QUARANTINE_SIG_TRIES from each end, as for a damaged
+        //     closed segment.
+        let mut lost_cands: Vec<Record> = cut
             .as_ref()
             .map(|c| {
                 c.after
                     .iter()
-                    .filter(|r| r.chain_id == chain_id && keys.record(r))
+                    .filter(|r| r.chain_id == chain_id)
                     .cloned()
                     .collect()
             })
             .unwrap_or_default();
-        let lost_top = lost
-            .iter()
-            .filter(|r| r.seq > head_rec.seq)
-            .max_by_key(|r| r.seq)
-            .cloned();
+        lost_cands.sort_by_key(|r| r.seq);
+        let mut forged = false;
+        let mut first_authentic = |it: &mut dyn Iterator<Item = &Record>| {
+            for r in it.take(QUARANTINE_SIG_TRIES) {
+                if keys.record(r) {
+                    return Some(r.clone());
+                }
+                forged = true;
+            }
+            None
+        };
+        let lost_hi = first_authentic(&mut lost_cands.iter().rev());
+        let lost_lo = first_authentic(&mut lost_cands.iter());
+        let lost_top = lost_hi.or(lost_lo).filter(|r| r.seq > head_rec.seq);
         let lost_max = lost_top.as_ref().map(|r| r.seq);
         // The high-water mark proves everything up to it was fsynced.
         let mark_in = read_state(&parts.cfg.dir, HEAD_FILE)?
             .and_then(|s| Checkpoint::from_json(&s))
             .filter(|c| c.chain_id == chain_id && keys.sig(&signing_message(&c.hash), &c.sig));
-        let crash_plausible = !lost.iter().any(|r| {
-            Self::was_synced(&parts.cfg, r) || mark_in.as_ref().is_some_and(|m| r.seq <= m.seq)
-        });
+        // A crash explains the hole only if nothing after it was durably
+        // synced: no record that is always synced, nothing at or below the
+        // mark (and no mark beyond the head: it names a synced record that
+        // is gone), and no forged frame (a crash writes none). The
+        // unauthenticated frames count here: they can only make the
+        // verdict stricter.
+        let crash_plausible = !forged
+            && !mark_in.as_ref().is_some_and(|m| m.seq > head_rec.seq)
+            && !lost_cands.iter().any(|r| {
+                Self::was_synced(&parts.cfg, r) || mark_in.as_ref().is_some_and(|m| r.seq <= m.seq)
+            });
         // Seqs held by quarantined records beyond the head (a damaged
-        // segment newer than the tail): never reuse them.
-        let q_top = quarantine
-            .iter()
-            .filter_map(|q| q.max_auth.as_ref())
-            .filter(|r| r.seq > head_rec.seq)
-            .max_by_key(|r| r.seq)
-            .cloned();
+        // segment newer than the tail, a stray file): never reuse them.
+        let q_top = |explaining_only: bool| {
+            quarantine
+                .iter()
+                .filter(|q| !explaining_only || q.severity < Severity::Critical)
+                .filter_map(|q| q.max_auth.as_ref())
+                .filter(|r| r.seq > head_rec.seq)
+                .map(|r| r.seq)
+                .max()
+        };
+        // Never reuse a seq that quarantined evidence holds.
+        let quarantined_max = lost_max.max(q_top(false));
         // Positions up to here are accounted for by quarantined evidence,
-        // not by a truncation.
-        let explained_max = lost_max.max(q_top.as_ref().map(|r| r.seq));
-
-        // 8c. Refusal counters persisted before the restart.
-        let mut refusals = persisted_refusals(tail.iter());
-        if refusals.is_none() && !need_segment_start {
-            if let Some(c) = closed
-                .last()
-                .filter(|c| c.damage.is_none() && c.idx + 1 == last_idx)
-            {
-                refusals = persisted_refusals(c.records.iter());
-            }
-        }
-        let (refused_noncritical, refused_critical) = refusals.unwrap_or((0, 0));
+        // not by a truncation: only when the damage is something a crash
+        // or failing media produces. A critical quarantine explains
+        // nothing: authentic state beyond the head is still truncation.
+        let explained_max = lost_max.filter(|_| crash_plausible).max(q_top(true));
 
         // 9. Only now modify anything: quarantine the damaged suffix of the
         //    active segment (after pinning the highest authentic record it
@@ -2176,7 +2594,9 @@ impl Recorder {
                     pin.as_ref(),
                 )?;
                 if !c.after.is_empty() {
-                    rp.discarded_records = lost.len() as u64;
+                    // Frames with a valid hash and this chain's id (only
+                    // the ends were signature-checked).
+                    rp.discarded_records = lost_cands.len() as u64;
                     rp.discarded_seqs = lost_max.map(|m| [head_rec.seq + 1, m]);
                     rp.crash_plausible = crash_plausible;
                     rp.severity = Some(if crash_plausible {
@@ -2258,6 +2678,7 @@ impl Recorder {
             last_anchor_error: None,
             quarantined_ranges: quarantine.iter().filter_map(|q| q.range).collect(),
             quarantined_now: Vec::new(),
+            open_incidents: Vec::new(),
         };
 
         // 10. State: trusted only if authenticated and consistent. An
@@ -2367,7 +2788,7 @@ impl Recorder {
         let floor = beyond
             .iter()
             .map(|b| b.seq)
-            .chain(explained_max)
+            .chain(quarantined_max)
             .max()
             .and_then(|m| m.checked_add(1));
         let skipped = floor.map(|f| [head_rec.seq + 1, f - 1]);
@@ -2398,12 +2819,33 @@ impl Recorder {
                 "rbb",
                 &c.bytes,
             )?;
+            let what = if c.idx > last_idx {
+                "segment file quarantined"
+            } else {
+                "closed segment failed verification"
+            };
+            // Authentic records beyond the head removed by a critical
+            // quarantine: what they held is gone from the log, and nothing
+            // explains it (see `explained_max`). Truncation evidence.
+            if let Some(m) = q
+                .max_auth
+                .as_ref()
+                .filter(|m| q.severity >= Severity::Critical && m.seq > head_rec.seq)
+            {
+                evidence.push(StateEvidence {
+                    file: segment_file_name(c.idx),
+                    seq: m.seq,
+                    hash: to_hex(&m.hash),
+                    preserved_as: Some(file.clone()),
+                    sha256: q.sha.clone(),
+                });
+            }
             q_records.push(RecoveryPayload {
                 segment_index: c.idx,
                 offset: 0,
                 discarded_bytes: c.bytes.len() as u64,
                 discarded_sha256: q.sha.clone(),
-                reason: format!("closed segment failed verification: {}", q.reason),
+                reason: format!("{what}: {}", q.reason),
                 quarantine_file: Some(file),
                 discarded_records: q.records,
                 discarded_seqs: q.range,
@@ -2414,6 +2856,46 @@ impl Recorder {
         }
         if !quarantine.is_empty() {
             fault("quarantine.after_copy")?;
+        }
+        // The same for authentic records after a hole in the active
+        // segment that no crash explains.
+        if let (Some(rp), Some(top)) = (recovery.as_ref(), lost_top.as_ref()) {
+            if !rp.crash_plausible {
+                evidence.push(StateEvidence {
+                    file: segment_file_name(last_idx),
+                    seq: top.seq,
+                    hash: to_hex(&top.hash),
+                    preserved_as: rp.quarantine_file.clone(),
+                    sha256: rp.discarded_sha256.clone(),
+                });
+            }
+        }
+
+        // What the host should hear about (each is also a record below).
+        if let Some(rp) = recovery.as_ref().filter(|rp| rp.discarded_records > 0) {
+            r.open_incidents.push(OpenIncident::DamageQuarantined {
+                segment_index: rp.segment_index,
+                severity: rp.severity.unwrap_or(Severity::High),
+                crash_plausible: rp.crash_plausible,
+                reason: rp.reason.clone(),
+            });
+        }
+        for rp in &q_records {
+            r.open_incidents.push(OpenIncident::SegmentQuarantined {
+                segment_index: rp.segment_index,
+                severity: rp.severity.unwrap_or(Severity::Critical),
+                reason: rp.reason.clone(),
+            });
+        }
+        if let (false, Some(s)) = (evidence.is_empty(), skipped) {
+            r.open_incidents.push(OpenIncident::TruncationDetected {
+                head_seq: head_rec.seq,
+                skipped_seqs: s,
+                evidence: evidence
+                    .iter()
+                    .map(|e| format!("{} names seq {}", e.file, e.seq))
+                    .collect(),
+            });
         }
 
         // 12. Record what was found. The first record written takes the seq
@@ -3344,11 +3826,20 @@ impl Recorder {
     pub fn last_anchor_error(&self) -> Option<&str> {
         self.last_anchor_error.as_deref()
     }
-    /// Closed segments this open found damaged and moved to quarantine (a
-    /// `Recovery` record with `quarantined_segment` documents each). Worth
-    /// an alert: the storage is failing or someone edited the log.
+    /// Segment files this open found damaged (closed segments, or stray
+    /// files above the live segment) and moved to quarantine (a `Recovery`
+    /// record with `quarantined_segment` documents each). Worth an alert:
+    /// the storage is failing or someone edited the log. See
+    /// [`Recorder::open_incidents`] for severities and truncation.
     pub fn quarantined_at_open(&self) -> &[u64] {
         &self.quarantined_now
+    }
+
+    /// Evidence trouble this open found (quarantines with their severity,
+    /// truncation), in the order the records were written. Empty for a
+    /// clean open.
+    pub fn open_incidents(&self) -> &[OpenIncident] {
+        &self.open_incidents
     }
 }
 

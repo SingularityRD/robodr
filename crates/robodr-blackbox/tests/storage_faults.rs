@@ -234,8 +234,19 @@ fn damaged_newest_closed_segment_with_empty_active_continues_after_it() {
     let rs: Vec<ResumePayload> = payloads(d.path(), RecordKind::Resume);
     let skipped = rs.last().unwrap().skipped_seqs.unwrap();
     assert_eq!(skipped[1], s1_max);
-    // No truncation is claimed: the quarantine accounts for the seqs.
-    assert!(payloads::<TruncationPayload>(d.path(), RecordKind::TruncationDetected).is_empty());
+    // rev5: the newest segment vanishing while an older one is intact is
+    // not media damage: critical, and its authentic records beyond the
+    // head are truncation evidence (the quarantine explains nothing).
+    assert_eq!(
+        seg_quarantines(d.path())[0].severity,
+        Some(Severity::Critical)
+    );
+    let td = payloads::<TruncationPayload>(d.path(), RecordKind::TruncationDetected);
+    assert_eq!(td.len(), 1);
+    assert!(td[0]
+        .evidence
+        .iter()
+        .any(|e| e.file == segment_file_name(1) && e.seq == s1_max));
     let rep = vdir(d.path());
     assert!(has(&rep, |k| matches!(
         k,

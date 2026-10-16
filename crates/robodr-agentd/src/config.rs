@@ -285,6 +285,35 @@ pub struct BlackboxSection {
     /// Boot id; default: `/proc/sys/kernel/random/boot_id`.
     #[serde(default)]
     pub boot_id: Option<String>,
+    /// External home for the black box's high-water mark
+    /// (`robodr_blackbox::HeadAnchor`). Without one (the default) the
+    /// daemon logs a warning at start and reports `"anchored": false` in
+    /// its status: a cut of the newest records combined with a rollback of
+    /// `head.json`, or a wiped store, is then not detectable on the unit.
+    /// A deployment against an attacker with write access needs a TPM NV
+    /// counter or a remote receiver (integration work, not offered here).
+    #[serde(default)]
+    pub head_anchor: Option<HeadAnchorConfig>,
+}
+
+/// `blackbox.head_anchor`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HeadAnchorConfig {
+    /// `robodr_blackbox::FileHeadAnchor` at `path` (absolute; outside
+    /// `blackbox.dir` and `spool.dir`). Only as strong as the storage the
+    /// file lives on: useful on a separately mounted, write-restricted or
+    /// off-unit replicated filesystem, worthless on the log's own.
+    File { path: PathBuf },
+}
+
+impl HeadAnchorConfig {
+    /// Short name for logs and status.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            HeadAnchorConfig::File { .. } => "file",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -919,6 +948,34 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
             Some(finding_key(&fs.key_file, &key, key_id.as_deref())?)
         }
     };
+    match &config.blackbox.head_anchor {
+        None => warnings.push(
+            "blackbox.head_anchor is not configured: the black box is not anchored; a cut of \
+             its newest records plus a rolled-back head.json, or a wiped store, cannot be \
+             detected on the unit (deployment needs a TPM NV counter or a remote anchor)"
+                .into(),
+        ),
+        Some(HeadAnchorConfig::File { path }) => {
+            require_abs("blackbox.head_anchor.path", path)?;
+            let p = resolve_path(path);
+            for (what, d) in [
+                ("spool.dir", &config.spool.dir),
+                ("blackbox.dir", &config.blackbox.dir),
+            ] {
+                if p.starts_with(resolve_path(d)) {
+                    return Err(format!(
+                        "blackbox.head_anchor.path must not be inside {what} (an anchor next \
+                         to the log adds nothing)"
+                    ));
+                }
+            }
+            warnings.push(format!(
+                "blackbox.head_anchor is a file ({}): only as tamper-resistant as the storage \
+                 it lives on; deployment needs a TPM NV counter or a remote anchor",
+                sanitize_path(&path.display().to_string())
+            ));
+        }
+    }
     Ok(Resolved {
         config,
         sensor,
