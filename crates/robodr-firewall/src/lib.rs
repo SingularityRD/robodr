@@ -45,17 +45,30 @@
 //! | 9 | post | output non-finite or over limit (bug) | per [`FaultPolicy`] | `internal_fault` |
 //! | — | — | none of the above | Pass (bit-exact) | — |
 //!
-//! All rule ids are prefixed `robot.firewall.` (see [`rules`]). Rate-limit
-//! credit and the per-source last-stamp are consumed/updated at their stage
-//! even if a later stage rejects (so a replay of an over-limit command is
-//! still a replay).
+//! All rule ids are prefixed `robot.firewall.` (see [`rules`]).
+//!
+//! ### State, and who can change it
+//! - **Per (channel, source)**: rate-limit credit and last stamp. Only an
+//!   **accepted** command (passed or limited) of that source updates them; a
+//!   rejected command — at any stage — changes nothing, so a source cannot
+//!   burn its own (or anyone's) credit or advance its stamp with commands
+//!   that were refused. Foreign sources have no pair state at all.
+//! - **Per channel**: the last *emitted* output and its acceleration (the
+//!   base of 8b) and the last accepted output (for `HoldLast`). This is
+//!   deliberately per channel, not per source: it describes what the
+//!   platform was told to do, and making it per source would let two
+//!   authorised sources alternate and step the platform between their
+//!   velocities with no acceleration bound. It changes only when something is
+//!   actually emitted (an accepted output, or a substitute).
+//! - Global: the gateway clock (stage 0).
 //!
 //! ### Groups and norms
 //! A twist has two groups: linear (Euclidean norm, m/s) and angular
 //! (Euclidean norm, rad/s). A joint command has one group: the max absolute
 //! joint speed. Limits: linear = min(envelope `max_linear_speed`, spec), angular
-//! = spec only (the profile envelope has no angular field), joint =
-//! min(envelope `max_joint_speed`, spec). `None` = unconstrained.
+//! = spec only (the profile envelope has no angular field; required for Twist
+//! channels), joint = min(envelope `max_joint_speed`, spec). `None` =
+//! unconstrained (except angular on a Twist channel: a compile error).
 //!
 //! ### Speed limiting (8a)
 //! The **whole** command is multiplied by one factor `s = min(limit/‖g‖)`
@@ -83,24 +96,40 @@
 //!   zero without crossing it bypasses 8b unless `limit_deceleration` is set.
 //!
 //! ### Rejection substitutes ([`FailBehaviour`], per platform)
+//! A rejected command must never cause more motion than a stop.
 //! - `ZeroVelocity`: emit an all-zero command of the channel's kind.
 //! - `HoldLast { max_hold_ns }`: re-emit the last **accepted** output while it
 //!   is younger than `max_hold_ns` (measured from its acceptance, so repeated
-//!   rejections cannot extend it), then zero.
+//!   rejections cannot extend it), then zero — and **only** if the rejected
+//!   command is readable intent (authorised source, right kind, finite) of
+//!   which the held output is a component-wise deceleration (each component
+//!   zero, or same sign and no larger). A rejected stop, slow-down or
+//!   reversal, unreadable content (NaN, wrong kind) and foreign sources all
+//!   get zero.
 //! - `PassThroughObserveOnly`: no enforcement on this platform; behaves like
 //!   observe mode.
 //!
 //! Substitutes carry `source = SourceId::FIREWALL` and `stamp = now`. A
 //! rejected command's values are **never** forwarded. With
-//! [`ForeignSourceAction::Drop`], rejections caused by an unknown/unauthorised
-//! source emit nothing, so a spoofer cannot use the firewall to stop the
-//! robot (the default, `Substitute`, prefers the safe state).
+//! [`ForeignSourceAction::Drop`] (**default**), rejections caused by an
+//! unknown/unauthorised source emit nothing and touch no state, so a spoofer
+//! cannot use the firewall to stop the robot or disturb the legitimate
+//! stream; the attempt is still a Critical deviation for the responder. The
+//! opt-in `Substitute` emits the substitute at most once per
+//! [`PlatformConfig::foreign_substitute_min_interval_ns`] per channel.
+//!
+//! ### Limits must be finite
+//! [`Policy::compile`] runs `Profile::validate` and rejects NaN, infinite or
+//! negative limits; "unconstrained" is only expressed by omitting an optional
+//! limit (`None`). A Twist channel **must** set `max_angular_speed` (the
+//! profile has no angular field, so there is nothing to fall back on).
 //!
 //! ### Observe mode
 //! When the profile is not locked (or the platform is pass-through), every
 //! verdict is `Passed { cmd: original, would_have }` where `would_have` is
 //! the limit/reject that enforcement would have produced, and every event is
-//! recorded with [`EventAction::ObservedOnly`].
+//! recorded with [`EventAction::ObservedOnly`]; the rendered deviations carry
+//! `Mode::Observe` (see [`policy_mode`]), so a responder never acts on them.
 //!
 //! ### Firewall failure ([`FaultPolicy`], per platform)
 //! Open question in the design doc, so it is configuration: `FailSafe`
@@ -129,7 +158,7 @@ pub use config::{
     PlatformConfig, Policy, RateLimit, MAX_CHANNELS, MAX_SOURCES,
 };
 pub use engine::{Firewall, Stats};
-pub use events::{reject_rule, rules, EventAction, EventBuffer, FirewallEvent};
+pub use events::{policy_mode, reject_rule, rules, EventAction, EventBuffer, FirewallEvent};
 pub use verdict::{LimitReasons, RejectReason, Substitute, SubstituteKind, Verdict, WouldHave};
 
 #[cfg(test)]

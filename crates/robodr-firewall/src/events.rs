@@ -8,6 +8,18 @@
 //! turns each event into a `Deviation` via `Deviation::new`
 //! ([`FirewallEvent::to_deviation`]); that conversion is where formatting and
 //! allocation happen.
+//!
+//! # Mode
+//! Each deviation carries the firewall's operating [`Mode`]:
+//! [`Mode::Observe`] when the policy can never enforce
+//! ([`Policy::is_observe_only`]: profile not locked, or a
+//! `PassThroughObserveOnly` platform), [`Mode::Enforce`] otherwise. This is
+//! the same rule [`robodr_events::profile::Profile::evaluate`] uses (mode
+//! follows the profile lock), so a responder never acts on a would-have
+//! verdict of an observe-only firewall. A `FailOpen` internal fault on an
+//! *enforcing* firewall is also [`EventAction::ObservedOnly`] (the command
+//! went through unchecked) but stays [`Mode::Enforce`]: the fault is real and
+//! the responder must see it.
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -19,7 +31,7 @@
 use crate::command::{ChannelId, SourceId};
 use crate::config::Policy;
 use crate::verdict::{RejectReason, SubstituteKind};
-use robodr_events::{Deviation, Severity};
+use robodr_events::{Deviation, Mode, Severity};
 
 /// Stable rule ids emitted by the firewall.
 pub mod rules {
@@ -92,6 +104,7 @@ pub struct FirewallEvent {
 
 impl FirewallEvent {
     /// Render as a [`Deviation`] (allocates; call outside the control loop).
+    /// The mode is [`policy_mode`] of `policy` (see the module docs).
     pub fn to_deviation(&self, policy: &Policy) -> Deviation {
         let ch = policy
             .channel_name(self.channel)
@@ -122,7 +135,16 @@ impl FirewallEvent {
             ));
         }
         detail.push_str(&format!(" [model {}]", policy.model()));
-        Deviation::new(self.rule, self.severity, detail)
+        Deviation::new(self.rule, self.severity, detail).with_mode(policy_mode(policy))
+    }
+}
+
+/// The [`Mode`] stamped on every deviation of a firewall running `policy`.
+pub fn policy_mode(policy: &Policy) -> Mode {
+    if policy.is_observe_only() {
+        Mode::Observe
+    } else {
+        Mode::Enforce
     }
 }
 

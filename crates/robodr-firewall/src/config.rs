@@ -5,11 +5,19 @@
 //! [`robodr_events::profile::Profile`] plus per-channel [`ChannelSpec`]s and a
 //! per-platform [`PlatformConfig`] into flat numeric tables the hot path reads.
 //!
-//! Compilation **fails closed**: any inconsistency (a profiled motion channel
-//! without a spec, a spec for a channel the profile does not know, a negative
-//! or NaN limit, a source GUID that does not belong to a profiled participant,
-//! a channel with no allowed source) is a [`ConfigError`], and the gateway must
-//! not start forwarding with a policy it could not compile.
+//! Compilation **fails closed**: any inconsistency (a profile that fails
+//! [`Profile::validate`], a profiled motion channel without a spec, a spec for
+//! a channel the profile does not know, a negative, NaN or infinite limit, a
+//! Twist channel without an angular speed limit, a source GUID that does not
+//! belong to a profiled participant, a channel with no allowed source) is a
+//! [`ConfigError`], and the gateway must not start forwarding with a policy it
+//! could not compile.
+//!
+//! "Unconstrained" is only ever expressed by **omitting** an optional limit
+//! (`None`); an explicit `Some(f64::INFINITY)` is rejected, so a limit cannot
+//! be disabled by a malformed number. The angular speed of a Twist channel is
+//! the exception: it has no envelope field to fall back on, so it must be
+//! spelled out (`max_angular_speed: Some(x)`, `x` finite and >= 0).
 
 use crate::command::{ChannelId, SourceId, MAX_JOINTS};
 use robodr_events::profile::Profile;
@@ -67,16 +75,32 @@ pub enum FaultPolicy {
 
 /// What to do on a known channel when the command comes from a source that is
 /// unknown or not allowed on that channel.
+///
+/// Either way the attempt is recorded as a `rejected_unknown_source` /
+/// `rejected_unauthorized_source` deviation (severity Critical). The
+/// *response* to a foreign writer on a motion bus — up to asking the safety
+/// controller for a safe state, with human approval where the responder's
+/// policy requires it — belongs to the responder (`robodr-responder`), not to
+/// the in-path firewall: a spoofed packet must not be able to drive the
+/// firewall's own output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ForeignSourceAction {
-    /// Treat like any other rejection: emit the [`FailBehaviour`] substitute.
-    /// Conservative (a foreign writer on a motion bus means compromise), but
-    /// it lets a spoofer stop the robot (denial of service).
+    /// **Default.** Drop the foreign command and emit nothing: the legitimate
+    /// stream keeps control and the spoofer gets no effect on the motion
+    /// output. Still recorded as a deviation.
     #[default]
-    Substitute,
-    /// Drop the foreign command and emit nothing: the legitimate stream keeps
-    /// control, the spoofer gets no effect. Still recorded as a deviation.
     Drop,
+    /// Platform opt-in: emit the [`FailBehaviour`] substitute for a foreign
+    /// command. This lets anyone who can write to the bus inject a stop
+    /// (denial of service), so it is bounded: at most one foreign-triggered
+    /// substitute per channel per
+    /// [`PlatformConfig::foreign_substitute_min_interval_ns`] (further foreign
+    /// commands in that window are dropped, still recorded). The emitted zero
+    /// *is* the channel's previous output (it was sent downstream), so the
+    /// legitimate stream then ramps up from it under the acceleration limits:
+    /// a spoofer can force at most one stop + ramp-up per interval. Choose
+    /// this only where a foreign writer must always mean "stop now".
+    Substitute,
 }
 
 /// Per-platform settings (one robot model / platform type).
@@ -85,6 +109,10 @@ pub struct PlatformConfig {
     pub fail_behaviour: FailBehaviour,
     pub fault_policy: FaultPolicy,
     pub foreign_source_action: ForeignSourceAction,
+    /// With [`ForeignSourceAction::Substitute`]: minimum gap, on the gateway
+    /// clock, between two foreign-triggered substitutes on one channel.
+    /// `0` = no bound (every foreign command triggers one). Default 1 s.
+    pub foreign_substitute_min_interval_ns: u64,
     /// Capacity of the deviation output buffer (allocated once). Events beyond
     /// it are dropped and counted until the caller drains.
     pub event_capacity: usize,
@@ -95,7 +123,8 @@ impl Default for PlatformConfig {
         Self {
             fail_behaviour: FailBehaviour::ZeroVelocity,
             fault_policy: FaultPolicy::FailSafe,
-            foreign_source_action: ForeignSourceAction::Substitute,
+            foreign_source_action: ForeignSourceAction::Drop,
+            foreign_substitute_min_interval_ns: 1_000_000_000,
             event_capacity: 256,
         }
     }
@@ -132,7 +161,9 @@ pub struct ChannelSpec {
     /// Tighter linear speed (norm, m/s) than the envelope, if any.
     pub max_linear_speed: Option<f64>,
     /// Angular speed limit (norm, rad/s). The profile envelope has no angular
-    /// field, so this is the only source of the angular limit.
+    /// field, so this is the only source of the angular limit, and it is
+    /// **required** for Twist channels ([`ConfigError::MissingLimit`] if
+    /// `None`). Ignored for joint channels.
     pub max_angular_speed: Option<f64>,
     /// Tighter per-joint speed than the envelope, if any.
     pub max_joint_speed: Option<f64>,
@@ -199,7 +230,7 @@ pub enum ConfigError {
     ChannelNotInProfile(String),
     /// The profile has an envelope for a channel that has no spec.
     ChannelWithoutSpec(String),
-    /// A limit is NaN or negative (or a factor is < 1 / non-finite).
+    /// A limit is NaN, infinite or negative (or a factor is < 1 / non-finite).
     InvalidLimit {
         channel: String,
         field: &'static str,
@@ -220,6 +251,14 @@ pub enum ConfigError {
         guid: String,
     },
     InvalidPlatform(&'static str),
+    /// A limit that has no safe default is missing (e.g. `max_angular_speed`
+    /// on a Twist channel).
+    MissingLimit {
+        channel: String,
+        field: &'static str,
+    },
+    /// The profile fails [`Profile::validate`] (the errors, joined).
+    InvalidProfile(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -236,7 +275,7 @@ impl fmt::Display for ConfigError {
             Self::InvalidLimit { channel, field } => {
                 write!(
                     f,
-                    "channel {channel}: {field} is NaN, negative or out of range"
+                    "channel {channel}: {field} is NaN, infinite, negative or out of range"
                 )
             }
             Self::InvalidTiming { channel, field } => {
@@ -259,6 +298,10 @@ impl fmt::Display for ConfigError {
                 "channel {channel}: source {guid} does not belong to a profiled participant"
             ),
             Self::InvalidPlatform(why) => write!(f, "invalid platform config: {why}"),
+            Self::MissingLimit { channel, field } => {
+                write!(f, "channel {channel}: {field} is required")
+            }
+            Self::InvalidProfile(why) => write!(f, "invalid profile: {why}"),
         }
     }
 }
@@ -318,7 +361,7 @@ pub struct Policy {
 fn limit(channel: &str, field: &'static str, v: Option<f64>) -> Result<f64, ConfigError> {
     match v {
         None => Ok(f64::INFINITY),
-        Some(x) if x.is_nan() || x < 0.0 => Err(ConfigError::InvalidLimit {
+        Some(x) if !x.is_finite() || x < 0.0 => Err(ConfigError::InvalidLimit {
             channel: channel.to_string(),
             field,
         }),
@@ -346,6 +389,14 @@ impl Policy {
         platform: PlatformConfig,
         specs: &BTreeMap<String, ChannelSpec>,
     ) -> Result<Policy, ConfigError> {
+        if let Err(errs) = profile.validate() {
+            let why = errs
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(ConfigError::InvalidProfile(why));
+        }
         if platform.event_capacity == 0 {
             return Err(ConfigError::InvalidPlatform("event_capacity must be >= 1"));
         }
@@ -389,6 +440,12 @@ impl Policy {
                 .ok_or_else(|| ConfigError::ChannelNotInProfile(name.clone()))?;
             let env_lin = limit(name, "envelope.max_linear_speed", env.max_linear_speed)?;
             let env_joint = limit(name, "envelope.max_joint_speed", env.max_joint_speed)?;
+            if spec.kind == ChannelKind::Twist && spec.max_angular_speed.is_none() {
+                return Err(ConfigError::MissingLimit {
+                    channel: name.clone(),
+                    field: "max_angular_speed",
+                });
+            }
             let limits = Limits {
                 lin: env_lin.min(limit(name, "max_linear_speed", spec.max_linear_speed)?),
                 ang: limit(name, "max_angular_speed", spec.max_angular_speed)?,
@@ -498,6 +555,13 @@ impl Policy {
         &self.model
     }
 
+    /// `true` when this policy can never enforce: the profile is not locked,
+    /// or the platform is [`FailBehaviour::PassThroughObserveOnly`]. Events
+    /// of such a policy are reported as [`robodr_events::Mode::Observe`].
+    pub fn is_observe_only(&self) -> bool {
+        !self.enforcing || self.platform.fail_behaviour == FailBehaviour::PassThroughObserveOnly
+    }
+
     /// `true` iff the profile is locked (enforcement may still be disabled by
     /// [`FailBehaviour::PassThroughObserveOnly`]).
     pub fn profile_locked(&self) -> bool {
@@ -536,6 +600,7 @@ mod tests {
     fn spec() -> ChannelSpec {
         ChannelSpec {
             allowed_sources: vec![format!("{P}00000103")],
+            max_angular_speed: Some(1.0),
             ..Default::default()
         }
     }
@@ -559,7 +624,8 @@ mod tests {
         assert!(!pol.channels[0].allows(SourceId(1)));
         assert!(!pol.channels[0].allows(SourceId::UNKNOWN));
         assert_eq!(pol.channels[0].limits.lin, 1.0);
-        assert_eq!(pol.channels[0].limits.ang, f64::INFINITY);
+        assert_eq!(pol.channels[0].limits.ang, 1.0);
+        assert_eq!(pol.channels[0].limits.lin_acc, f64::INFINITY);
     }
 
     #[test]
@@ -636,7 +702,7 @@ mod tests {
             .max_linear_speed = Some(-0.1);
         assert!(matches!(
             Policy::compile(&p, pf, &specs(spec())),
-            Err(ConfigError::InvalidLimit { .. })
+            Err(ConfigError::InvalidProfile(_))
         ));
         let bad_pf = PlatformConfig {
             event_capacity: 0,
@@ -646,6 +712,13 @@ mod tests {
             Policy::compile(&profile(), bad_pf, &specs(spec())),
             Err(ConfigError::InvalidPlatform(_))
         ));
+        // Infinite limits are rejected (None is the only way to say "none").
+        let mut s = spec();
+        s.max_linear_accel = Some(f64::INFINITY);
+        assert!(matches!(e(s), ConfigError::InvalidLimit { .. }));
+        let mut s = spec();
+        s.max_angular_speed = Some(f64::INFINITY);
+        assert!(matches!(e(s), ConfigError::InvalidLimit { .. }));
         // Display is implemented for every variant used above.
         assert!(!e(ChannelSpec::default()).to_string().is_empty());
     }
@@ -667,5 +740,80 @@ mod tests {
         p.locked = false;
         let pol = Policy::compile(&p, PlatformConfig::default(), &specs(spec())).unwrap();
         assert!(!pol.profile_locked());
+    }
+
+    #[test]
+    fn twist_channel_requires_angular_limit() {
+        let mut s = spec();
+        s.max_angular_speed = None;
+        let e = Policy::compile(&profile(), PlatformConfig::default(), &specs(s.clone()));
+        assert_eq!(
+            e,
+            Err(ConfigError::MissingLimit {
+                channel: "/cmd_vel".into(),
+                field: "max_angular_speed"
+            })
+        );
+        assert!(e.unwrap_err().to_string().contains("max_angular_speed"));
+        // Joint channels have no angular group: not required there.
+        let mut p = profile();
+        p.motion_envelopes.insert(
+            "/arm".into(),
+            Envelope {
+                max_linear_speed: None,
+                max_joint_speed: Some(1.0),
+            },
+        );
+        let mut all = specs(spec());
+        s.kind = ChannelKind::Joints { count: 6 };
+        all.insert("/arm".into(), s);
+        assert!(Policy::compile(&p, PlatformConfig::default(), &all).is_ok());
+    }
+
+    #[test]
+    fn invalid_profile_is_rejected() {
+        for bad in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN, -1.0] {
+            let mut p = profile();
+            p.motion_envelopes
+                .get_mut("/cmd_vel")
+                .unwrap()
+                .max_linear_speed = Some(bad);
+            assert!(matches!(
+                Policy::compile(&p, PlatformConfig::default(), &specs(spec())),
+                Err(ConfigError::InvalidProfile(_))
+            ));
+        }
+        let mut p = profile();
+        p.model = " ".into();
+        let e = Policy::compile(&p, PlatformConfig::default(), &specs(spec())).unwrap_err();
+        assert!(matches!(e, ConfigError::InvalidProfile(_)));
+        assert!(e.to_string().starts_with("invalid profile"));
+    }
+
+    #[test]
+    fn defaults_drop_foreign_sources() {
+        let pf = PlatformConfig::default();
+        assert_eq!(pf.foreign_source_action, ForeignSourceAction::Drop);
+        assert_eq!(pf.foreign_substitute_min_interval_ns, 1_000_000_000);
+    }
+
+    #[test]
+    fn observe_only_policy() {
+        let pol = Policy::compile(&profile(), PlatformConfig::default(), &specs(spec())).unwrap();
+        assert!(!pol.is_observe_only());
+        let pt = PlatformConfig {
+            fail_behaviour: FailBehaviour::PassThroughObserveOnly,
+            ..PlatformConfig::default()
+        };
+        assert!(Policy::compile(&profile(), pt, &specs(spec()))
+            .unwrap()
+            .is_observe_only());
+        let mut p = profile();
+        p.locked = false;
+        assert!(
+            Policy::compile(&p, PlatformConfig::default(), &specs(spec()))
+                .unwrap()
+                .is_observe_only()
+        );
     }
 }

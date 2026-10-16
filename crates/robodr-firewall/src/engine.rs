@@ -19,7 +19,7 @@ use crate::command::{
     ChannelId, Command, JointVelocities, Motion, SourceId, Twist, Vec3, MAX_JOINTS,
 };
 use crate::config::{ChannelKind, FailBehaviour, FaultPolicy, ForeignSourceAction, Limits, Policy};
-use crate::events::{reject_rule, rules, EventAction, EventBuffer, FirewallEvent};
+use crate::events::{policy_mode, reject_rule, rules, EventAction, EventBuffer, FirewallEvent};
 use crate::verdict::{LimitReasons, RejectReason, Substitute, SubstituteKind, Verdict, WouldHave};
 use robodr_events::{Deviation, Severity};
 
@@ -50,6 +50,9 @@ struct ChanState {
     a_prev: [f64; 2],
     /// Last *accepted* output and when (for `HoldLast`).
     accepted: Option<(Raw, u64)>,
+    /// When the last foreign-source-triggered substitute was emitted (to
+    /// bound them under `ForeignSourceAction::Substitute`).
+    last_foreign_sub_at: Option<u64>,
 }
 
 impl ChanState {
@@ -58,6 +61,7 @@ impl ChanState {
         last_out_at: None,
         a_prev: [0.0; 2],
         accepted: None,
+        last_foreign_sub_at: None,
     };
 }
 
@@ -102,6 +106,11 @@ struct Accepted {
     accel: (f64, f64),
     jerk: (f64, f64),
     a_new: [f64; 2],
+    /// Index and updated state of the (channel, source) pair (rate credit,
+    /// last stamp). Written back only once the command is accepted, so a
+    /// rejected command never changes it.
+    pair_idx: usize,
+    pair_new: PairState,
 }
 
 /// The Motion Firewall. See the crate docs for the decision semantics.
@@ -294,8 +303,7 @@ impl Firewall {
     pub fn new(policy: Policy) -> Self {
         let nsrc = policy.sources.len();
         let nch = policy.channels.len();
-        let observe = !policy.enforcing
-            || policy.platform.fail_behaviour == FailBehaviour::PassThroughObserveOnly;
+        let observe = policy.is_observe_only();
         let events = EventBuffer::with_capacity(policy.platform.event_capacity);
         Self {
             observe,
@@ -352,11 +360,14 @@ impl Firewall {
         let policy = &self.policy;
         let dropped = self.events.drain_with(|e| out.push(e.to_deviation(policy)));
         if dropped > 0 {
-            out.push(Deviation::new(
-                rules::EVENTS_DROPPED,
-                Severity::Medium,
-                format!("{dropped} firewall events dropped: output buffer full"),
-            ));
+            out.push(
+                Deviation::new(
+                    rules::EVENTS_DROPPED,
+                    Severity::Medium,
+                    format!("{dropped} firewall events dropped: output buffer full"),
+                )
+                .with_mode(policy_mode(policy)),
+            );
         }
         out
     }
@@ -404,13 +415,17 @@ impl Firewall {
                 if !(finite && within) {
                     return self.fault(cmd, now);
                 }
+                if let Some(p) = self.pairs.get_mut(acc.pair_idx) {
+                    *p = acc.pair_new;
+                }
                 self.accept(cmd, now, ch_idx, acc)
             }
         }
     }
 
-    /// Stages 0–8 of the decision table. Updates the clock, rate and stamp
-    /// state as a side effect (those are consumed whatever the final verdict).
+    /// Stages 0–8 of the decision table. Only the gateway clock is updated
+    /// here; the (channel, source) rate credit and last stamp are returned in
+    /// [`Accepted`] and stored by `check` for accepted commands only.
     fn evaluate(&mut self, cmd: &Command, now: u64, ch_idx: usize) -> Result<Accepted, Rejection> {
         // 0. Gateway clock must be monotonic.
         if let Some(last) = self.last_now {
@@ -440,9 +455,13 @@ impl Firewall {
         let pair_idx = ch_idx
             .checked_mul(self.nsrc)
             .and_then(|x| x.checked_add(src_idx));
-        let Some(pair) = pair_idx.and_then(|i| self.pairs.get_mut(i)) else {
+        let Some((pair_idx, pair)) = pair_idx.and_then(|i| self.pairs.get(i).map(|p| (i, *p)))
+        else {
             return Err(Rejection::new(RejectReason::UnknownSource));
         };
+        // Per-(channel, source) state is only *computed* here; `check` stores
+        // it when the command is accepted (see `Accepted::pair_new`).
+        let mut pair_new = pair;
 
         // 3. Rate limit (token bucket in ns of credit).
         if let Some((cost, cap)) = ch.rate {
@@ -453,14 +472,12 @@ impl Firewall {
             } else {
                 cap
             };
-            pair.rate_init = true;
-            pair.refill_at = now;
-            if credit >= cost {
-                pair.credit_ns = credit.saturating_sub(cost);
-            } else {
-                pair.credit_ns = credit;
+            if credit < cost {
                 return Err(Rejection::new(RejectReason::RateLimited));
             }
+            pair_new.rate_init = true;
+            pair_new.refill_at = now;
+            pair_new.credit_ns = credit.saturating_sub(cost);
         }
 
         // 4. Kind and shape.
@@ -498,7 +515,7 @@ impl Firewall {
                 ));
             }
         }
-        pair.last_stamp = Some(cmd.stamp_ns);
+        pair_new.last_stamp = Some(cmd.stamp_ns);
 
         // 7. Hard limit: far over the envelope is not a typo, it is a reject.
         let kind = ch.kind;
@@ -605,6 +622,8 @@ impl Firewall {
             accel,
             jerk,
             a_new,
+            pair_idx,
+            pair_new,
         })
     }
 
@@ -750,18 +769,39 @@ impl Firewall {
         }
     }
 
+    /// The substitute for a rejected `cmd`.
+    ///
+    /// `HoldLast` rule — a rejected command must never cause more motion
+    /// than a stop would: the last accepted output is held only if the
+    /// rejected command is **readable intent of an authorised source**
+    /// (`trust_content`, source allowed on the channel, right kind, finite)
+    /// and the held output is a component-wise deceleration of it (each
+    /// component zero, or same sign and magnitude ≤ requested). In every
+    /// other case — a stop or slow-down rejected as rate-limited, stale, out
+    /// of order or in the future; a reversal; NaN/kind-mismatch content whose
+    /// intent is unknown; a foreign source — zero is emitted instead.
     fn substitute(
         &self,
         cmd: &Command,
         now: u64,
         ch_idx: usize,
         allow_hold: bool,
+        trust_content: bool,
     ) -> Option<(Substitute, Raw)> {
         let ch = self.policy.channels.get(ch_idx)?;
         let st = self.chans.get(ch_idx)?;
+        let hold_ok = |held: &Raw| {
+            trust_content
+                && cmd.source != SourceId::UNKNOWN
+                && usize::from(cmd.source.0) < self.nsrc
+                && ch.allows(cmd.source)
+                && kind_matches(ch.kind, &cmd.motion)
+                && cmd.motion.is_finite()
+                && only_decelerates(&to_raw(&cmd.motion), held, width(ch.kind))
+        };
         let (kind, raw) = match self.policy.platform.fail_behaviour {
             FailBehaviour::HoldLast { max_hold_ns } if allow_hold => match st.accepted {
-                Some((v, at)) if now.saturating_sub(at) <= max_hold_ns => {
+                Some((v, at)) if now.saturating_sub(at) <= max_hold_ns && hold_ok(&v) => {
                     (SubstituteKind::HoldLast, v)
                 }
                 _ => (SubstituteKind::Zero, ZERO_RAW),
@@ -803,14 +843,34 @@ impl Firewall {
             };
         }
 
-        let drop_it = rej.reason.is_foreign_source()
-            && self.policy.platform.foreign_source_action == ForeignSourceAction::Drop;
-        let sub = if drop_it {
-            None
+        let foreign = rej.reason.is_foreign_source();
+        let sub = if foreign {
+            let platform = &self.policy.platform;
+            let window_open = match self.chans.get(ch_idx).and_then(|st| st.last_foreign_sub_at) {
+                Some(t) => now.saturating_sub(t) >= platform.foreign_substitute_min_interval_ns,
+                None => true,
+            };
+            match platform.foreign_source_action {
+                ForeignSourceAction::Substitute if window_open => {
+                    self.substitute(cmd, now, ch_idx, true, false)
+                }
+                _ => None,
+            }
         } else {
-            self.substitute(cmd, now, ch_idx, true)
+            self.substitute(cmd, now, ch_idx, true, true)
         };
         if let Some((s, raw)) = sub {
+            if foreign {
+                if let Some(st) = self.chans.get_mut(ch_idx) {
+                    st.last_foreign_sub_at = Some(now);
+                }
+            }
+            // What was emitted downstream is the channel's previous output,
+            // whoever triggered it: the next accepted command is acceleration
+            // limited from it, so the emitted stream never violates the
+            // limits. (This is why foreign substitutes are opt-in and
+            // interval-bounded: under `Substitute` a spoofer can force at
+            // most one stop + ramp-up per interval.)
             self.commit(ch_idx, raw, now, [0.0; 2], false);
             self.push_event(
                 rule,
@@ -866,7 +926,7 @@ impl Firewall {
             };
         }
         // Fail-safe: zero only — state may be corrupt, so never hold.
-        let sub = self.substitute(cmd, now, ch_idx, false);
+        let sub = self.substitute(cmd, now, ch_idx, false, false);
         if let Some((_, raw)) = sub {
             self.commit(ch_idx, raw, now, [0.0; 2], false);
         }
