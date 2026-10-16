@@ -1,0 +1,40 @@
+#!/bin/sh
+# robodr postinst. Creates the robodr user and directories, reloads systemd.
+# Services are NOT enabled or started on first install: an uncommissioned
+# robot must not start enforcing (OPERATIONS.md, "Commissioning"). On upgrade,
+# services that were running are restarted on the new binaries.
+set -e
+
+case "$1" in
+configure)
+    if command -v systemd-sysusers >/dev/null 2>&1; then
+        systemd-sysusers /usr/lib/sysusers.d/robodr.conf
+    elif ! getent passwd robodr >/dev/null; then
+        # Fallback for hosts without systemd-sysusers.
+        adduser --system --group --home /var/lib/robodr --no-create-home \
+            --shell /usr/sbin/nologin robodr
+    fi
+    if command -v systemd-tmpfiles >/dev/null 2>&1; then
+        systemd-tmpfiles --create /usr/lib/tmpfiles.d/robodr.conf
+    fi
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+        if [ -n "$2" ]; then
+            # Upgrade: restart only what was running.
+            for u in robodr-pulsard.service robodr-agentd.service; do
+                systemctl try-restart "$u" || true
+            done
+        else
+            echo "robodr: installed. Services are disabled until commissioning is"
+            echo "robodr: complete: see /usr/share/doc/robodr/OPERATIONS.md"
+        fi
+    fi
+    ;;
+abort-upgrade | abort-remove | abort-deconfigure) ;;
+*)
+    echo "postinst called with unknown argument '$1'" >&2
+    exit 1
+    ;;
+esac
+
+exit 0

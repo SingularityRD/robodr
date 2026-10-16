@@ -1,0 +1,276 @@
+# RoboDR release. Triggered by pushing a tag v<VERSION> (e.g. v0.1.0-alpha.2).
+# Procedure and verification on the air-gapped side: docs/OPERATIONS.md.
+#
+# Conventions copied from ci.yml (docs/BUILD.md):
+#  * Actions are pinned by full commit SHA (only the two ci.yml already
+#    uses; no new third-party actions: releases are created and filled with
+#    the preinstalled `gh` CLI). Cargo tools pinned by version + --locked.
+#  * Every build is --locked against the COMMITTED Cargo.lock
+#    (scripts/ci-setup.sh fails without one), SOURCE_DATE_EPOCH = the tagged
+#    commit's time, --remap-path-prefix for checkout and CARGO_HOME.
+#  * No build cache (rust-cache) in release jobs: a poisoned cache must not
+#    be able to reach a signed artefact.
+#
+# Outputs, per architecture (amd64, arm64):
+#   robodr_<debver>_<arch>.deb                  Debian package (packaging/)
+#   robodr-<ver>-<arch>-offline.tar.gz          air-gapped install bundle
+#   robodr-<ver>-<arch>-sbom.tar.gz             CycloneDX SBOMs (cargo-cyclonedx)
+#   SHA256SUMS-<arch>                           per-arch hashes (build job)
+# and once: SHA256SUMS (all assets) plus a minisign signature (*.minisig) for
+# every asset and for SHA256SUMS.
+#
+# Signing: minisign, because its signatures verify fully offline with one
+# pinned public key on the entry station (no transparency-log or OIDC
+# round-trip). Repository configuration:
+#   secret   MINISIGN_SECRET_KEY   contents of the minisign secret key file
+#   secret   MINISIGN_PASSWORD     its password (empty for a -W key)
+#   variable ROBODR_MINISIGN_PUBKEY the public key string (RW...), used to
+#            self-verify before publishing
+#   environment "release" holding the secrets, with required reviewers.
+# TODO(cosign): add keyless cosign signatures / SLSA provenance as a second,
+# online-verifiable layer. That needs sigstore/cosign-installer: pin it by
+# full commit SHA (resolved with `git ls-remote --tags`) before adding it;
+# do not use a tag ref.
+#
+# Reproducibility: the pure binaries are built twice from different paths
+# (scripts/ci-repro.sh) and the released bytes must equal those hashes.
+# robodr-pulsard (Pulsar-bound: clang-built eBPF objects) is built with the
+# same flags but its bit-for-bit reproducibility is NOT yet verified.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  ROBODR_CRATES_MIRROR: ${{ vars.ROBODR_CRATES_MIRROR }}
+  # Same pin as ci.yml.
+  CARGO_CYCLONEDX_VERSION: 0.5.9
+
+jobs:
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: Check tag, create draft release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tag, VERSION, CHANGELOG and Cargo.lock agree
+        id: meta
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match VERSION ($version); tag must be v$version"
+            exit 1
+          fi
+          if ! grep -q "^## \[$version\]" CHANGELOG.md; then
+            echo "::error file=CHANGELOG.md::no '## [$version]' section"
+            exit 1
+          fi
+          if ! git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
+            echo "::error file=Cargo.lock::Cargo.lock is not committed; a release cannot be --locked (docs/BUILD.md)"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Release notes from CHANGELOG
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          awk -v v="$VERSION" '
+            index($0, "## [" v "]") == 1 { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          test -s "$RUNNER_TEMP/notes.md"
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          pre=""
+          case "$VERSION" in *-*) pre="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --draft --verify-tag $pre \
+            --title "RoboDR $VERSION" --notes-file "$RUNNER_TEMP/notes.md"
+
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build and package (${{ matrix.arch }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          # Native arm64 runner (GitHub-hosted for public repositories; use a
+          # self-hosted arm64 label otherwise). Native, not cross: Pulsar's
+          # build compiles eBPF and links libsqlite3 for the host.
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install Pulsar build dependencies (as ci.yml)
+        run: |
+          sudo apt-get update
+          if sudo apt-get install -y --no-install-recommends clang-20 lld-20 llvm-20; then
+            sudo ln -sf /usr/bin/clang-20 /usr/local/bin/clang
+            sudo ln -sf /usr/bin/llvm-strip-20 /usr/local/bin/llvm-strip
+          else
+            echo "::warning::clang-20 not available from the runner's apt sources; using the distribution clang/llvm (Pulsar pins 20)"
+            sudo apt-get install -y --no-install-recommends clang lld llvm
+          fi
+          sudo apt-get install -y --no-install-recommends libssl-dev libsqlite3-dev pkg-config dpkg-dev
+          clang --version
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Setup (mirror, --locked, Pulsar-bound excludes)
+        run: scripts/ci-setup.sh
+      - name: Reproducibility proof (pure binaries, two paths)
+        env:
+          REPRO_REQUIRE_BINARIES: "1"
+        run: scripts/ci-repro.sh dist/repro
+      - name: Release build
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export RUSTFLAGS="--remap-path-prefix=$PWD=/build/robodr --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
+          # Two invocations, so feature unification for the pure binaries is
+          # exactly the one ci-repro.sh built (Pulsar's dependency graph
+          # must not change their bytes).
+          cargo build --release --workspace $PURE_EXCLUDES $CARGO_LOCKED
+          pkgs=$(printf '%s\n' $PURE_EXCLUDES | grep -v '^--exclude$' || true)
+          for p in $pkgs; do
+            cargo build --release -p "$p" $CARGO_LOCKED
+          done
+      - name: Released pure binaries == reproduced binaries
+        run: |
+          test -s dist/repro/SHA256SUMS
+          (cd target/release && sha256sum --strict -c "$GITHUB_WORKSPACE/dist/repro/SHA256SUMS")
+      - name: Cargo.lock unchanged
+        run: git diff --exit-code -- Cargo.lock
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked --version "$CARGO_CYCLONEDX_VERSION"
+      - name: SBOM (CycloneDX)
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          SBOM_TOOL=cyclonedx scripts/sbom.sh dist/sbom
+      - name: Debian package
+        env:
+          # A release must never ship without the daemon.
+          ROBODR_DEB_REQUIRE: robodr-pulsard
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          packaging/build-deb.sh --bin-dir target/release --arch "$ARCH" --out dist/release
+      - name: Offline install bundle and SBOM archive
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          deb=$(ls dist/release/robodr_*_"$ARCH".deb)
+          packaging/make-bundle.sh --deb "$deb" --sbom-dir dist/sbom --out dist/release
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+              --mtime="@$SOURCE_DATE_EPOCH" \
+              --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
+              -C dist -cf - sbom | gzip -9 -n > "dist/release/robodr-$VERSION-$ARCH-sbom.tar.gz"
+          (cd dist/release && sha256sum robodr* > "SHA256SUMS-$ARCH")
+          cat "dist/release/SHA256SUMS-$ARCH"
+      - name: Upload to the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber dist/release/*
+      - name: Keep a workflow copy
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.arch }}-${{ github.sha }}
+          path: dist/release
+          if-no-files-found: error
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Checksums, sign, publish
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    # Secrets live in this environment only; give it required reviewers.
+    environment: release
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Install minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends minisign
+          minisign -v
+      - name: Download draft assets
+        run: |
+          mkdir -p "$RUNNER_TEMP/rel"
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" -D "$RUNNER_TEMP/rel"
+          ls -l "$RUNNER_TEMP/rel"
+      - name: Check per-arch hashes, write SHA256SUMS
+        working-directory: ${{ runner.temp }}/rel
+        run: |
+          for a in amd64 arm64; do
+            test -s "SHA256SUMS-$a"
+            sha256sum --strict -c "SHA256SUMS-$a"
+          done
+          rm -f SHA256SUMS *.minisig
+          find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' -printf '%P\n' | LC_ALL=C sort |
+            xargs -r -d '\n' sha256sum > SHA256SUMS
+          cat SHA256SUMS
+      - name: Sign (minisign)
+        working-directory: ${{ runner.temp }}/rel
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          test -n "$MINISIGN_SECRET_KEY" || { echo "::error::MINISIGN_SECRET_KEY secret is not set"; exit 1; }
+          umask 077
+          key="$RUNNER_TEMP/minisign.key"
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
+          trap 'shred -u "$key" 2>/dev/null || rm -f "$key"' EXIT
+          for f in $(find . -maxdepth 1 -type f ! -name '*.minisig' -printf '%P\n' | LC_ALL=C sort); do
+            if [ -n "$MINISIGN_PASSWORD" ]; then
+              printf '%s\n' "$MINISIGN_PASSWORD" | minisign -S -s "$key" -m "$f" -t "robodr $VERSION $f"
+            else
+              minisign -S -s "$key" -m "$f" -t "robodr $VERSION $f" < /dev/null
+            fi
+          done
+      - name: Self-verify signatures with the published public key
+        working-directory: ${{ runner.temp }}/rel
+        env:
+          PUBKEY: ${{ vars.ROBODR_MINISIGN_PUBKEY }}
+        run: |
+          test -n "$PUBKEY" || { echo "::error::repository variable ROBODR_MINISIGN_PUBKEY is not set"; exit 1; }
+          for f in $(find . -maxdepth 1 -type f ! -name '*.minisig' -printf '%P\n'); do
+            minisign -V -q -P "$PUBKEY" -m "$f"
+          done
+      - name: Upload checksums and signatures, publish
+        working-directory: ${{ runner.temp }}/rel
+        run: |
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber SHA256SUMS *.minisig
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false

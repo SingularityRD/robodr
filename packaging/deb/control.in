@@ -1,0 +1,19 @@
+Package: robodr
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: @MAINTAINER@
+Installed-Size: @INSTALLED_SIZE@
+Depends: @DEPENDS@
+Section: admin
+Priority: optional
+Homepage: https://github.com/SingularityRD/robodr
+Description: RoboDR - Robot Detection & Response (protective only)
+ Runtime security for ROS 2 robots built on the Pulsar eBPF runtime: a
+ Pulsar daemon with the RoboDR ROS 2 sensor (robodr-pulsard), the decision
+ chain agent (robodr-agentd, when built), commissioning, replay and capture
+ tools, systemd units, tmpfiles/sysusers fragments and man pages.
+ .
+ RoboDR detects, records signed evidence and requests a safe state through
+ the platform's own interface. It never overrides the robot's safety system,
+ e-stop or command authority. Services are installed disabled: enable them
+ only after commissioning (see /usr/share/doc/robodr/OPERATIONS.md).

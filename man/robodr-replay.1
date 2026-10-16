@@ -1,0 +1,136 @@
+.\" robodr-replay(1). Source of truth: the USAGE text in
+.\" crates/robodr-agent/src/bin/robodr-replay.rs. Keep the two in sync.
+.TH ROBODR\-REPLAY 1 "2026-10-16" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
+.SH NAME
+robodr\-replay \- offline RoboDR decision chain (event \(-> deviation \(-> plan \(-> black box \(-> finding)
+.SH SYNOPSIS
+.B robodr\-replay
+.RB [ run ]
+.B \-\-events
+.I run.jsonl
+.B \-\-profile
+.I profile.json
+.B \-\-policy
+.I policy.json
+.B \-\-blackbox
+.I DIR
+.RB ( \-\-key\-hex
+.IR HEX " | "
+.B \-\-key\-file
+.IR FILE )
+.B \-\-robot\-id
+.I ID
+[\fIoptions\fR]
+.PP
+.B robodr\-replay verify
+.B \-\-blackbox
+.I DIR
+.RB ( \-\-key\-hex
+.IR HEX " | "
+.B \-\-key\-file
+.IR FILE )
+.RB [ \-\-key\-id
+.IR ID ]
+.RB [ \-\-robot\-id
+.IR ID ]
+.RB [ \-\-findings
+.IR findings.jsonl ]
+.SH DESCRIPTION
+.B robodr\-replay
+runs RobotEvent JSON Lines through the RoboDR decision chain offline, records
+evidence in a fresh black box, writes findings, and verifies the result.
+.B verify
+re\-checks an existing black box directory (and, optionally, the evidence links
+of a findings file) with the black\-box key.
+.PP
+A replay never acts:
+.B \-\-log\-plans
+only prints what would have been requested.
+.SH RUN OPTIONS
+.TP
+.BI \-\-events " run.jsonl\fR, " \-\-profile " profile.json\fR, " \-\-policy " policy.json"
+Input events, model profile and response policy (required).
+.TP
+.BI \-\-blackbox " DIR"
+Black\-box directory. Must be absent or empty (a replay starts a fresh chain).
+.TP
+.BI \-\-key\-hex " HEX\fR | " \-\-key\-file " FILE"
+The HMAC key (at least 32 bytes), as hex on the command line or in a file
+(hex plus whitespace, at most 4096 bytes). Exactly one is required. HMAC is a
+placeholder authenticator (see robodr\-blackbox). Prefer
+.BR \-\-key\-file :
+a command line is visible to other users in
+.IR /proc .
+.TP
+.BI \-\-robot\-id " ID"
+Robot identity bound into the chain (required).
+.TP
+.BI \-\-out " findings.jsonl"
+Findings file; default stdout. The summary goes to stderr.
+.TP
+.BI \-\-outcomes " outcomes.jsonl"
+Write decision outcomes as JSON Lines.
+.TP
+.BI \-\-safety\-state " STATE"
+idle | moving_slow | moving_fast | collaborative_human_nearby |
+estop_active | safe_state_active | unknown (default unknown).
+.TP
+.BI \-\-control " autonomous|teleop|manual"
+.TP
+.BI \-\-phase " parked|transit|task|takeoff|landing|unknown"
+.TP
+.BI \-\-connectivity " connected|degraded|disconnected"
+.TP
+.B \-\-no\-operator
+No operator present.
+.TP
+.BI \-\-site " NAME\fR, " \-\-model " NAME\fR, " \-\-profile\-version " V\fR, " \-\-boot\-id " ID\fR, " \-\-key\-id " ID"
+Context and identity fields recorded with the evidence and findings.
+Without
+.BR \-\-key\-id ,
+the key id is derived from the key; without
+.BR \-\-model ,
+the profile's model is used.
+.TP
+.BI \-\-start\-ms " EPOCH_MS\fR, " \-\-step\-ms " MS"
+Synthetic clock: start time and step per event.
+.TP
+.B \-\-firewall
+Enable the Motion Firewall.
+.TP
+.BI \-\-firewall\-allow " CHANNEL=GUID[,GUID...]"
+Writers allowed on a channel (repeatable).
+.TP
+.BI \-\-firewall\-max\-angular " CHANNEL=RAD_PER_S"
+The OEM's yaw\-rate bound for a Twist channel (repeatable).
+.B \-\-firewall
+needs it for every Twist channel of the profile (the profile has none).
+.TP
+.BR \-\-monitor " | " \-\-monitor\-config " \fIFILE\fR"
+Enable the motion monitor with UGV defaults, or with a config file.
+.TP
+.BI \-\-feedback\-source " CHANNEL=SOURCE"
+SOURCE: wheel_odometry | imu | joint_state | gnss | other (repeatable).
+.TP
+.B \-\-record\-all\-events
+Record all events in the black box.
+.TP
+.BI \-\-partitions " N"
+Kafka partition count recorded with the findings.
+.TP
+.B \-\-log\-plans
+Print the response plans that would have been requested.
+.SH EXIT STATUS
+.TP
+.B 0
+OK and verified.
+.TP
+.B 1
+Verification failed (black box or an evidence link).
+.TP
+.B 2
+Usage, input, config or I/O error.
+.SH SEE ALSO
+.BR robodr\-commission (1),
+.BR robodr\-pulsard (8),
+/usr/share/doc/robodr/OPERATIONS.md
