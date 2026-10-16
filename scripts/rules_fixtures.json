@@ -1428,5 +1428,1447 @@
     ]
    }
   }
+ },
+ {
+  "rule": "RoboDR: Kernel module file written outside the package manager",
+  "note": "REVIEW PoC: attacker binary named dpkg",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/root/.cache/dpkg"
+   },
+   "payload": {
+    "filename": "/lib/modules/6.1.0/extra/rootkit.ko"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 install tree written outside the package manager",
+  "note": "REVIEW PoC: attacker binary named dpkg",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/home/robot/dpkg"
+   },
+   "payload": {
+    "filename": "/opt/ros/humble/lib/librclcpp.so",
+    "flags": [
+     "O_WRONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process loaded a library from outside the allowlisted library paths",
+  "note": "REVIEW PoC: preload lib without .so",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/talker"
+   },
+   "payload": {
+    "filename": "/home/robot/.cache/hook",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Kernel module autoload configuration changed",
+  "note": "binary named dpkg edits modprobe.d",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/tmp/dpkg"
+   },
+   "payload": {
+    "filename": "/etc/modprobe.d/x.conf",
+    "flags": [
+     "O_WRONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Kernel module autoload configuration changed",
+  "note": "real dpkg (usrmerge path)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/bin/dpkg"
+   },
+   "payload": {
+    "filename": "/etc/modprobe.d/x.conf",
+    "flags": [
+     "O_WRONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File created or moved into the ROS 2 install tree outside the package manager",
+  "note": "binary named dpkg renames into tree",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/var/tmp/x/dpkg"
+   },
+   "payload": {
+    "source": "/tmp/a",
+    "destination": "/opt/ros/humble/lib/x"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 install tree written outside the package manager",
+  "note": "dpkg path with .. is not trusted",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/../../tmp/dpkg"
+   },
+   "payload": {
+    "filename": "/opt/ros/humble/lib/x",
+    "flags": [
+     "O_WRONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shared library written into a system library path outside the package manager",
+  "note": "binary named dpkg plants lib",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/home/u/dpkg"
+   },
+   "payload": {
+    "filename": "/usr/lib/x86_64-linux-gnu/libfoo.so.1"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shared library written into a system library path outside the package manager",
+  "note": "hook without .so planted in system lib dir",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/usr/lib/x86_64-linux-gnu/hook"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Dynamic linker search path changed",
+  "note": "binary named dpkg edits ld.so.conf.d",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/tmp/dpkg"
+   },
+   "payload": {
+    "filename": "/etc/ld.so.conf.d/zz.conf",
+    "flags": [
+     "O_WRONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Dynamic linker search path changed",
+  "note": "real dpkg",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "filename": "/etc/ld.so.conf.d/zz.conf",
+    "flags": [
+     "O_WRONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Kernel module file or autoload configuration moved into place outside the package manager",
+  "note": "write elsewhere then mv to .ko",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/tmp/x.bin",
+    "destination": "/lib/modules/6.1/extra/rk.ko"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Kernel module file or autoload configuration moved into place outside the package manager",
+  "note": "mv into modules-load.d",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/tmp/x",
+    "destination": "/etc/modules-load.d/rk.conf"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Kernel module file or autoload configuration moved into place outside the package manager",
+  "note": "dpkg unpack rename",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "source": "/lib/modules/6.1/kernel/x.ko.dpkg-new",
+    "destination": "/lib/modules/6.1/kernel/x.ko"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Kernel module file or autoload configuration moved into place outside the package manager",
+  "note": "binary named dpkg",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/tmp/dpkg"
+   },
+   "payload": {
+    "source": "/tmp/a",
+    "destination": "/lib/modules/6.1/kernel/x.ko"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Kernel module file or autoload configuration moved into place outside the package manager",
+  "note": "unrelated rename",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/tmp/a",
+    "destination": "/home/u/b"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File moved into a system library path or linker configuration outside the package manager",
+  "note": "hook moved into /usr/lib",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/tmp/h",
+    "destination": "/usr/lib/x86_64-linux-gnu/libz.so.1"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File moved into a system library path or linker configuration outside the package manager",
+  "note": "conf.d entry moved in",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/tmp/c",
+    "destination": "/etc/ld.so.conf.d/zz.conf"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File moved into a system library path or linker configuration outside the package manager",
+  "note": "dpkg rename",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "source": "/usr/lib/x/libz.so.1.dpkg-new",
+    "destination": "/usr/lib/x/libz.so.1"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: File moved into a system library path or linker configuration outside the package manager",
+  "note": "unrelated",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/tmp/a",
+    "destination": "/var/log/x"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created inside the ROS 2 install tree outside the package manager",
+  "note": "symlink to attacker binary in ws",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/opt/robot_ws/install/x/lib/x/node",
+    "destination": "/tmp/evil",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created inside the ROS 2 install tree outside the package manager",
+  "note": "dpkg symlink",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "source": "/opt/ros/humble/lib/libx.so",
+    "destination": "libx.so.1",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Link created inside the ROS 2 install tree outside the package manager",
+  "note": "link elsewhere",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/home/u/l",
+    "destination": "/opt/ros/humble/lib/libx.so",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process loaded a library from outside the allowlisted library paths",
+  "note": "hook in /tmp without .so",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.10"
+   },
+   "payload": {
+    "filename": "/tmp/.x/h",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process loaded a library from outside the allowlisted library paths",
+  "note": "node writes its own temp file",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.10"
+   },
+   "payload": {
+    "filename": "/tmp/out.csv",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process loaded a library from outside the allowlisted library paths",
+  "note": "DDS shm segment",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/x/talker"
+   },
+   "payload": {
+    "filename": "/dev/shm/fastrtps_port7411",
+    "flags": [
+     "O_RDWR"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process mapped an ELF from outside the allowlisted paths",
+  "note": "hook with arbitrary name in home",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/talker"
+   },
+   "payload": {
+    "filename": "/home/robot/.cache/hook",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process mapped an ELF from outside the allowlisted paths",
+  "note": "hook named like data in /srv",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.10"
+   },
+   "payload": {
+    "filename": "/srv/maps/map.yaml",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process mapped an ELF from outside the allowlisted paths",
+  "note": "system lib",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/talker"
+   },
+   "payload": {
+    "filename": "/usr/lib/x86_64-linux-gnu/libc.so.6",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process mapped an ELF from outside the allowlisted paths",
+  "note": "launch execs a node",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.10"
+   },
+   "payload": {
+    "filename": "/opt/ros/humble/lib/demo_nodes_cpp/talker",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process mapped an ELF from outside the allowlisted paths",
+  "note": "non-ROS process",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vim"
+   },
+   "payload": {
+    "filename": "/home/u/a.out",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ELF opened from a world-writable or user cache directory",
+  "note": "ELF in ~/.cache, any process",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/sshd"
+   },
+   "payload": {
+    "filename": "/root/.cache/x",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ELF opened from a world-writable or user cache directory",
+  "note": "ELF in /var/tmp",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/bash"
+   },
+   "payload": {
+    "filename": "/var/tmp/k",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ELF opened from a world-writable or user cache directory",
+  "note": "ELF in /usr/bin",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/bash"
+   },
+   "payload": {
+    "filename": "/usr/bin/ls",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unexpected ROS 2 middleware (RMW) library loaded",
+  "note": "rogue RMW borrowing allowlisted name",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/x/talker"
+   },
+   "payload": {
+    "filename": "/home/robot/.x/librmw_fastrtps_cpp.so",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unexpected ROS 2 middleware (RMW) library loaded",
+  "note": "helper lib from /opt/ros",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/x/talker"
+   },
+   "payload": {
+    "filename": "/opt/ros/humble/lib/librmw_dds_common.so",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: SROS 2 CA private key accessed on robot",
+  "note": "ordinary TLS key is not an SROS 2 CA key",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/sbin/nginx"
+   },
+   "payload": {
+    "filename": "/etc/ssl/private/server.key.pem",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: SROS 2 CA private key accessed on robot",
+  "note": "identity_ca key",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cat"
+   },
+   "payload": {
+    "filename": "/home/u/ks/private/identity_ca.key.pem",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: SROS 2 CA private key accessed on robot",
+  "note": "permissions_ca key",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cat"
+   },
+   "payload": {
+    "filename": "/home/u/ks/private/permissions_ca.key.pem",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: SROS 2 enclave private key read by a process outside the ROS stack",
+  "note": "image climbs out of /opt/ros with ..",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/../../../tmp/cat"
+   },
+   "payload": {
+    "filename": "/etc/sros2/keystore/enclaves/robot/talker/key.pem",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interactive shell started on robot controller",
+  "note": "bash -il",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/bin/bash",
+    "argc": 2,
+    "argv": [
+     "bash",
+     "-il"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interactive shell started on robot controller",
+  "note": "sh -ic",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/bin/sh",
+    "argc": 3,
+    "argv": [
+     "sh",
+     "-ic",
+     "id"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interactive shell started on robot controller",
+  "note": "bash -lc not interactive",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/bin/bash",
+    "argc": 3,
+    "argv": [
+     "bash",
+     "-lc",
+     "id"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interactive shell started on robot controller",
+  "note": "KNOWN GAP: rare bundle -xvi",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/bin/bash",
+    "argc": 2,
+    "argv": [
+     "bash",
+     "-xvi"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program executed from a file descriptor or /proc path",
+  "note": "memfd payload via fexecve",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/dev/fd/3",
+    "argc": 1,
+    "argv": [
+     "kworker/0:1"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program executed from a file descriptor or /proc path",
+  "note": "re-exec through /proc/self/exe",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/proc/self/exe",
+    "argc": 1,
+    "argv": [
+     "node"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program executed from a file descriptor or /proc path",
+  "note": "exec through another process's root",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/proc/1/root/tmp/x",
+    "argc": 1,
+    "argv": [
+     "x"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program executed from a file descriptor or /proc path",
+  "note": "systemd 255 executor (excluded)",
+  "expect": false,
+  "event": {
+   "header": {
+    "parent_pid": 1,
+    "uid": 0
+   },
+   "payload": {
+    "filename": "/proc/self/fd/7",
+    "argc": 3,
+    "argv": [
+     "/usr/lib/systemd/systemd-executor",
+     "--deserialize",
+     "42"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program executed from a file descriptor or /proc path",
+  "note": "executor look-alike not spawned by PID 1",
+  "expect": true,
+  "event": {
+   "header": {
+    "parent_pid": 4242,
+    "uid": 0
+   },
+   "payload": {
+    "filename": "/proc/self/fd/7",
+    "argc": 1,
+    "argv": [
+     "/usr/lib/systemd/systemd-executor"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program executed from a file descriptor or /proc path",
+  "note": "KNOWN GAP: root double-forks to ppid 1 and copies the executor argv",
+  "expect": false,
+  "event": {
+   "header": {
+    "parent_pid": 1,
+    "uid": 0
+   },
+   "payload": {
+    "filename": "/proc/self/fd/7",
+    "argc": 1,
+    "argv": [
+     "/usr/lib/systemd/systemd-executor"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program executed from a file descriptor or /proc path",
+  "note": "normal binary",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/ls",
+    "argc": 1,
+    "argv": [
+     "ls"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program executed through a non-canonical path",
+  "note": "temp dir via /usr/..",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/../tmp/implant",
+    "argc": 1,
+    "argv": [
+     "implant"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program executed through a non-canonical path",
+  "note": "ROS node via double slash (escapes /opt/ros/ scope)",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/opt//ros/humble/lib/demo/talker",
+    "argc": 1,
+    "argv": [
+     "talker"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program executed through a non-canonical path",
+  "note": "dot component",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/./tmp/x",
+    "argc": 1,
+    "argv": [
+     "x"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program executed through a non-canonical path",
+  "note": "canonical path",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/opt/ros/humble/lib/demo/talker",
+    "argc": 1,
+    "argv": [
+     "talker"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program executed from a temporary directory",
+  "note": "/run/lock is world-writable on Ubuntu",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/run/lock/x",
+    "argc": 1,
+    "argv": [
+     "x"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program executed from a temporary directory",
+  "note": "/usr/../tmp is not STARTS_WITH /tmp (caught by the non-canonical rule)",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/../tmp/implant",
+    "argc": 1,
+    "argv": [
+     "implant"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process imported Python code from outside the allowlisted paths",
+  "note": "PYTHONPATH sitecustomize in rclpy node",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/demo_nodes_py/talker"
+   },
+   "payload": {
+    "filename": "/home/robot/.x/sitecustomize.py",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process imported Python code from outside the allowlisted paths",
+  "note": "user site-packages .pth via ros2 CLI",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/bin/ros2"
+   },
+   "payload": {
+    "filename": "/root/.local/lib/python3.12/site-packages/evil.pth",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process imported Python code from outside the allowlisted paths",
+  "note": "python3 via /bin (usr-merge) is in scope",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/bin/python3"
+   },
+   "payload": {
+    "filename": "/tmp/x/rclpy/__init__.py",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process imported Python code from outside the allowlisted paths",
+  "note": "stdlib import",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/demo_nodes_py/talker"
+   },
+   "payload": {
+    "filename": "/usr/lib/python3.12/os.py",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process imported Python code from outside the allowlisted paths",
+  "note": "rclpy from /opt/ros",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/demo_nodes_py/talker"
+   },
+   "payload": {
+    "filename": "/opt/ros/humble/lib/python3.12/site-packages/rclpy/__init__.py",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process imported Python code from outside the allowlisted paths",
+  "note": "writing a pyc is not an import",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.12"
+   },
+   "payload": {
+    "filename": "/home/robot/x/__pycache__/a.cpython-312.pyc",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process imported Python code from outside the allowlisted paths",
+  "note": "KNOWN GAP: non-ROS image (renamed interpreter copy)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/home/robot/py"
+   },
+   "payload": {
+    "filename": "/home/robot/.x/sitecustomize.py",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process loaded a library from outside the allowlisted library paths",
+  "note": "python3 via /bin loading hook",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/bin/python3"
+   },
+   "payload": {
+    "filename": "/home/robot/hook.so",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process loaded a library from outside the allowlisted library paths",
+  "note": "any-name hook in /var/crash",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/x/node"
+   },
+   "payload": {
+    "filename": "/var/crash/h",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process loaded a library from outside the allowlisted library paths",
+  "note": "KNOWN GAP: ROS node exec'd as //opt/ros (non-canonical rule fires at exec)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "//opt/ros/humble/lib/x/node"
+   },
+   "payload": {
+    "filename": "/home/robot/hook.so",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interpreter one-liner executed",
+  "note": "python pty upgrade",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3",
+    "argc": 3,
+    "argv": [
+     "python3",
+     "-c",
+     "import pty;pty.spawn('/bin/bash')"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interpreter one-liner executed",
+  "note": "python -Ic bundle",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3.12",
+    "argc": 3,
+    "argv": [
+     "python3",
+     "-Ic",
+     "x"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interpreter one-liner executed",
+  "note": "perl -e",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/perl",
+    "argc": 3,
+    "argv": [
+     "perl",
+     "-e",
+     "x"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interpreter one-liner executed",
+  "note": "python script file",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3",
+    "argc": 4,
+    "argv": [
+     "python3",
+     "/opt/ros/humble/bin/ros2",
+     "topic",
+     "list"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interpreter one-liner executed",
+  "note": "KNOWN GAP: unlisted bundle -Ssc",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3",
+    "argc": 3,
+    "argv": [
+     "python3",
+     "-Ssc",
+     "x"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interpreter one-liner executed",
+  "note": "KNOWN GAP: code fed on stdin",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3",
+    "argc": 2,
+    "argv": [
+     "python3",
+     "-"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Package manager loaded a library from outside the system library paths",
+  "note": "LD_PRELOAD into real dpkg",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "filename": "/home/robot/hook.so",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Package manager loaded a library from outside the system library paths",
+  "note": "dpkg loading libc",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "filename": "/usr/lib/x86_64-linux-gnu/libc.so.6",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Package manager loaded a library from outside the system library paths",
+  "note": "dpkg writing a .so it installs",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "filename": "/opt/vendor/lib/x.so.dpkg-new",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Package manager loaded a library from outside the system library paths",
+  "note": "KNOWN GAP: hook without .so name (needs elf_check)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "filename": "/home/robot/hook",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Package manager mapped an ELF from outside the system paths",
+  "note": "ELF hook without .so name in dpkg",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "filename": "/home/robot/hook",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Package manager mapped an ELF from outside the system paths",
+  "note": "dpkg mapping libc",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "filename": "/lib/x86_64-linux-gnu/libc.so.6",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell or netcat-style tool opened a network connection",
+  "note": "bash /dev/tcp reverse shell to cell network",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/bash"
+   },
+   "payload": {
+    "destination": {
+     "ip": "10.0.0.5",
+     "port": 4444
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell or netcat-style tool opened a network connection",
+  "note": "busybox nc applet",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/bin/nc"
+   },
+   "payload": {
+    "destination": {
+     "ip": "203.0.113.9",
+     "port": 4444
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell or netcat-style tool opened a network connection",
+  "note": "ssh is not a shell",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ssh"
+   },
+   "payload": {
+    "destination": {
+     "ip": "10.0.0.5",
+     "port": 4444
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell or netcat-style tool opened a network connection",
+  "note": "KNOWN GAP: python socket reverse shell",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3"
+   },
+   "payload": {
+    "destination": {
+     "ip": "203.0.113.9",
+     "port": 4444
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: ROS 2 process connects outside the robot's networks",
+  "note": "IPv4-mapped IPv6 public address still fires",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/x/node"
+   },
+   "payload": {
+    "destination": {
+     "ip": "::ffff:8.8.8.8",
+     "port": 4444
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: SROS 2 security files loaded from outside the commissioned keystore",
+  "note": "node pointed at attacker keystore",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/demo/talker"
+   },
+   "payload": {
+    "filename": "/home/robot/ks/enclaves/talker/permissions.p7s",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: SROS 2 security files loaded from outside the commissioned keystore",
+  "note": "commissioned keystore",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/lib/demo/talker"
+   },
+   "payload": {
+    "filename": "/opt/robot_keystore/enclaves/talker/key.pem",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: SROS 2 enclave private key read by a process outside the ROS stack",
+  "note": "KNOWN GAP: PYTHONPATH-hooked ros2 CLI reads key under trusted image (Python-import rule fires instead)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/opt/ros/humble/bin/ros2"
+   },
+   "payload": {
+    "filename": "/opt/robot_keystore/enclaves/talker/key.pem",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed on robot controller",
+  "note": "python3 -mpip install",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3",
+    "argc": 4,
+    "argv": [
+     "python3",
+     "-mpip",
+     "install",
+     "x"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Python package installed on robot controller",
+  "note": "KNOWN GAP: python3 /usr/bin/pip3 install",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/python3",
+    "argc": 4,
+    "argv": [
+     "python3",
+     "/usr/bin/pip3",
+     "install",
+     "x"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interactive shell started on robot controller",
+  "note": "ksh -i",
+  "expect": true,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/usr/bin/ksh",
+    "argc": 2,
+    "argv": [
+     "ksh",
+     "-i"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Interactive shell started on robot controller",
+  "note": "KNOWN GAP: copied bash under another name",
+  "expect": false,
+  "event": {
+   "header": {},
+   "payload": {
+    "filename": "/home/robot/.x/kworker",
+    "argc": 2,
+    "argv": [
+     "kworker",
+     "-i"
+    ]
+   }
+  }
  }
 ]

@@ -39,7 +39,8 @@ env:
   # results are comparable run to run; bump deliberately.
   FUZZ_TOOLCHAIN: nightly-2026-09-01
   # Minimum supported Rust version, = [workspace.package] rust-version.
-  MSRV: "1.85.0"
+  # 1.87: u*::is_multiple_of (robodr-capture, -rtps, -blackbox, -firewall, -motion).
+  MSRV: "1.87.0"
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -62,18 +63,21 @@ jobs:
             echo "committed=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Configure mirror
+        env:
+          # This job alone may run without a lock: it produces the bootstrap one.
+          ROBODR_ALLOW_MISSING_LOCK: "1"
         run: scripts/ci-setup.sh
       - name: Check committed Cargo.lock has no local/patched sources
         if: steps.lock.outputs.committed == 'true'
         run: python3 scripts/ci-check-lockfile.py Cargo.lock --root .
-      - name: No Cargo.lock committed yet - generate one for the maintainers
+      - name: No Cargo.lock committed - generate the bootstrap lock
         id: gen
         if: steps.lock.outputs.committed != 'true'
         run: |
           echo "generated=true" >> "$GITHUB_OUTPUT"
-          echo "::warning file=Cargo.lock::Cargo.lock is not committed. Builds are not reproducible until it is. Download the 'Cargo.lock-generated' artifact of this run, review it and commit it (docs/BUILD.md)."
           cargo generate-lockfile
           python3 scripts/ci-check-lockfile.py Cargo.lock --root .
+          sha256sum Cargo.lock
       - name: Upload generated Cargo.lock
         if: steps.gen.outputs.generated == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -82,20 +86,32 @@ jobs:
           path: Cargo.lock
           if-no-files-found: error
           retention-days: 14
+      - name: Fail - Cargo.lock must be committed
+        # Required job: no build is reproducible or --locked without the lock.
+        # Bootstrap procedure (exact commands): docs/BUILD.md "Cargo.lock policy".
+        if: steps.lock.outputs.committed != 'true'
+        run: |
+          echo "::error file=Cargo.lock::Cargo.lock is not committed. Download the 'Cargo.lock-generated' artifact of this run, verify it and commit it (docs/BUILD.md, 'Cargo.lock policy')."
+          exit 1
 
   # ---------------------------------------------------------------------------
   scripts:
-    name: CI scripts (self-tests, shellcheck)
+    name: CI scripts and Pulsar rules (self-tests, shellcheck, rule validation)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # The rule validator calibrates against vendor/pulsar's source and rules.
+          submodules: recursive
           persist-credentials: false
       - name: Python self-tests
         run: |
           python3 scripts/metadata_to_cyclonedx.py --self-test
           python3 scripts/ci-check-lockfile.py --self-test
           python3 scripts/ci-pure-excludes.py --self-test
+      - name: Validate Pulsar rules (rules/) against vendor/pulsar
+        # One rule that fails to load disables Pulsar's whole rules-engine.
+        run: python3 scripts/validate_rules.py --pulsar-src vendor/pulsar --strict
       - name: shellcheck
         run: shellcheck scripts/*.sh
 
@@ -181,7 +197,7 @@ jobs:
 
   # ---------------------------------------------------------------------------
   msrv:
-    # Informational until crates opt in with `rust-version.workspace = true`
+    # Informational until every crate opts in with `rust-version.workspace = true`
     # (then flip continue-on-error off). Checks the pure crates on the MSRV.
     name: MSRV check (informational)
     runs-on: ubuntu-24.04
@@ -223,7 +239,11 @@ jobs:
             cargo install cargo-deny --locked --version "$CARGO_DENY_VERSION"
           fi
       - name: cargo deny check
-        run: cargo deny check advisories bans licenses sources
+        # --locked: cargo-deny's internal `cargo metadata` must audit the
+        # committed resolution, not silently re-resolve a stale lock.
+        run: cargo deny --locked check advisories bans licenses sources
+      - name: Cargo.lock unchanged
+        run: git diff --exit-code -- Cargo.lock
 
   # ---------------------------------------------------------------------------
   sbom:
@@ -254,6 +274,8 @@ jobs:
           SBOM_TOOL=cyclonedx scripts/sbom.sh dist/sbom/cyclonedx
           # Fallback generator, run too so the air-gapped path stays tested.
           SBOM_TOOL=metadata CARGO_METADATA_ARGS="$CARGO_LOCKED" scripts/sbom.sh dist/sbom/metadata
+      - name: Cargo.lock unchanged
+        run: git diff --exit-code -- Cargo.lock
       - name: Upload SBOMs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -280,16 +302,22 @@ jobs:
             echo "present=false" >> "$GITHUB_OUTPUT"
             echo "::notice::no fuzz/ directory; fuzz smoke skipped"
           fi
-      - name: Install toolchains + cargo-fuzz
+      - name: Install toolchains
         if: steps.detect.outputs.present == 'true'
         run: |
           rustup toolchain install
           rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
-          cargo install cargo-fuzz --locked --version "$CARGO_FUZZ_VERSION"
+      # Mirror BEFORE any `cargo install`, so tool sources also come from it.
       - name: Setup (mirror)
         if: steps.detect.outputs.present == 'true'
         run: scripts/ci-setup.sh
+      - name: Install cargo-fuzz
+        if: steps.detect.outputs.present == 'true'
+        run: cargo install cargo-fuzz --locked --version "$CARGO_FUZZ_VERSION"
       - name: Run each fuzz target for 60 s
+        # fuzz/ is its own unpublished workspace with no committed lock: its
+        # binaries are never shipped, so it resolves fresh (through the mirror)
+        # and is excluded from the --locked policy (docs/BUILD.md).
         if: steps.detect.outputs.present == 'true'
         run: |
           targets=$(cargo "+$FUZZ_TOOLCHAIN" fuzz list)
@@ -323,6 +351,9 @@ jobs:
       - name: Setup (mirror)
         run: scripts/ci-setup.sh
       - name: Build twice from different paths and compare robodr-* binaries
+        env:
+          # The workspace ships robodr-* binaries; "nothing to compare" is a failure.
+          REPRO_REQUIRE_BINARIES: "1"
         run: scripts/ci-repro.sh dist/repro
       - name: Upload binary hashes
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

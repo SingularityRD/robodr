@@ -52,11 +52,12 @@ name = "RoboDR: Python package installed on robot controller"
 type = "Exec"
 category = "initial_access"
 severity = "high"
-description = "pip install was run (pip/pip3 directly, or python3 -m pip). PyPI typosquats and trojaned wheels are the Python equivalent of a trojaned .deb, and rclpy nodes import from site-packages."
+description = "pip install was run (pip/pip3 directly, or python3 -m pip / -mpip). Not seen: 'python3 /usr/bin/pip3 install' (argv has no -m) and a renamed pip; the Python-import and package rules are the backstop. PyPI typosquats and trojaned wheels are the Python equivalent of a trojaned .deb, and rclpy nodes import from site-packages."
 condition = '''
 (
   (payload.filename ENDS_WITH "/pip" OR payload.filename ENDS_WITH "/pip3" OR payload.filename CONTAINS "/pip3.")
   AND payload.argv CONTAINS "install"
 )
 OR (payload.argv CONTAINS "-m" AND payload.argv CONTAINS "pip" AND payload.argv CONTAINS "install")
+OR (payload.argv CONTAINS "-mpip" AND payload.argv CONTAINS "install")
 '''

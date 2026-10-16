@@ -9,17 +9,26 @@
 #   defense_evasion/kernel_module_removal.toml (rmmod / modprobe -r)
 # Pulsar has no init_module/finit_module event, so a loader that calls the
 # syscall directly (no insmod) is only visible through the module FILE it
-# drops, which is what these rules watch.
+# drops, which is what these rules watch. A loader calling finit_module() on a
+# file with an arbitrary name (no .ko suffix) is NOT caught here: that needs
+# kernel.modules_disabled=1 after boot or signed-module enforcement
+# (module.sig_enforce=1 / lockdown), see rules/README.md.
+#
+# The dpkg exclusion is by EXACT image path (/usr/bin/dpkg, or /bin/dpkg on
+# usr-merged systems where both name the same file). header.image is the
+# execve path verbatim, so "ENDS_WITH /dpkg" let any binary named dpkg write
+# modules (review finding); writing /usr/bin/dpkg itself needs root and is
+# visible to Pulsar's own rules.
 
 [[rules]]
 name = "RoboDR: Kernel module file written outside the package manager"
 type = "FileCreated"
 category = "persistence"
 severity = "high"
-description = "A kernel module file (.ko, .ko.xz, .ko.zst, .ko.gz) was created by something other than dpkg. Fielded robots get kernel modules only from the signed image; a freshly written .ko anywhere is a rootkit staging step. DKMS rebuilds (e.g. GPU drivers after a kernel update) also create .ko files and must happen only in the maintenance pipeline."
+description = "A kernel module file (.ko, .ko.xz, .ko.zst, .ko.gz) was created by something other than dpkg (exact image /usr/bin/dpkg or /bin/dpkg). Fielded robots get kernel modules only from the signed image; a freshly written .ko anywhere is a rootkit staging step. DKMS rebuilds (e.g. GPU drivers after a kernel update) also create .ko files and must happen only in the maintenance pipeline."
 condition = '''
 (payload.filename ENDS_WITH ".ko" OR payload.filename ENDS_WITH ".ko.xz" OR payload.filename ENDS_WITH ".ko.zst" OR payload.filename ENDS_WITH ".ko.gz")
-AND NOT header.image ENDS_WITH "/dpkg"
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
 '''
 
 [[rules]]
@@ -31,5 +40,17 @@ description = "/etc/modules, /etc/modules-load.d or /etc/modprobe.d was opened f
 condition = '''
 (payload.filename == "/etc/modules" OR payload.filename STARTS_WITH "/etc/modules-load.d/" OR payload.filename STARTS_WITH "/etc/modprobe.d/")
 AND (payload.flags CONTAINS "O_WRONLY" OR payload.flags CONTAINS "O_RDWR")
-AND NOT header.image ENDS_WITH "/dpkg"
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
+'''
+
+[[rules]]
+name = "RoboDR: Kernel module file or autoload configuration moved into place outside the package manager"
+type = "FileRename"
+category = "persistence"
+severity = "high"
+description = "A file was renamed to a kernel module name (.ko, .ko.xz, .ko.zst, .ko.gz) or into /etc/modules, /etc/modules-load.d or /etc/modprobe.d by something other than dpkg. Writing under a harmless name and renaming produces no FileCreated event for a .ko name and no write-open on the autoload directories, so the two rules above miss it."
+condition = '''
+(payload.destination ENDS_WITH ".ko" OR payload.destination ENDS_WITH ".ko.xz" OR payload.destination ENDS_WITH ".ko.zst" OR payload.destination ENDS_WITH ".ko.gz"
+ OR payload.destination == "/etc/modules" OR payload.destination STARTS_WITH "/etc/modules-load.d/" OR payload.destination STARTS_WITH "/etc/modprobe.d/")
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
 '''
