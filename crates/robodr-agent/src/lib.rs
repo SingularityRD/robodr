@@ -43,6 +43,8 @@
 //! * `MotionCommand` has no source stamp and no angular/per-joint values, so
 //!   the firewall's stale/future checks and angular limits are not exercised
 //!   through this path (see [`agent`] for the mapping).
+//! * Black-box recovery after a real disk failure (ENOSPC, EIO) is tested
+//!   only with simulated failures (a failing signer, a removed directory).
 
 pub mod agent;
 pub mod clock;
@@ -52,14 +54,21 @@ pub mod executor;
 pub mod outcome;
 pub mod replay;
 
-pub use agent::{guard, ocsf_safety, source_key, Agent, AgentStats, Finished};
-pub use clock::{Clock, ReplayClock, TimeSource, Timestamp};
+pub use agent::{
+    guard, ocsf_safety, source_key, Agent, AgentStats, Finished, BLACKBOX_REOPEN_BACKOFF_NS,
+    MAX_RETAINED_FAULTS,
+};
+pub use clock::{
+    Clock, ClockAnomaly, ReplayClock, TimeGuard, TimeSource, Timestamp,
+    DEFAULT_CLOCK_JUMP_TOLERANCE_NS,
+};
 pub use config::{
-    profile_sha256, AgentConfig, AgentError, FirewallSettings, MonitorSettings,
-    MAX_TRACKED_FINDINGS,
+    profile_sha256, strict_from_str, AgentConfig, AgentError, FirewallSettings, MonitorSettings,
+    DEFAULT_MAX_ANGULAR_SPEED, MAX_TRACKED_FINDINGS,
 };
 pub use evidence::{finding_refs, resolve_links, verify_blackbox, LinkReport};
 pub use executor::{ExecutionRequest, Executor, LoggingExecutor, NoopExecutor};
 pub use outcome::{
-    Detector, Disposition, EvidenceLinks, FindingOutput, FirewallVerdictRecord, Outcome,
+    AgentFault, Detector, Disposition, EvidenceLinks, FaultKind, FindingOutput,
+    FirewallVerdictRecord, Outcome,
 };

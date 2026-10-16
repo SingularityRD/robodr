@@ -62,11 +62,44 @@ the validated finding (`FindingOutput { key, partition, value, headers }`).
   `src/executor.rs`.
 - **Detections survive storage failure.** If the black box refuses a record
   (saturation) or an append fails, the outcome and the finding are still
-  produced. The missing link is listed in `evidence.errors`.
+  produced and the plan is unchanged. The missing link is listed in
+  `evidence.errors`.
 - **Deterministic.** Time comes only from the injected `Clock` (`ReplayClock`
   for replays), and all state is ordered (`BTreeMap`). The same inputs with the
   same clock and key give byte-identical findings, outcomes and black-box
   segments. This is tested.
+
+## Failure handling
+
+Every agent-internal failure becomes an `AgentFault` (`Agent::faults()`,
+bounded to the newest 256) and, when the black box can take it, a signed
+critical `robodr.agent_fault` note. Faults never reach the responder: an
+internal problem cannot by itself cause a motion request.
+
+| Failure | Behaviour |
+|---|---|
+| Black-box I/O failure (recorder poisoned, rotation fails) | Drop the recorder, reopen the directory (resume + quarantine of a torn tail, signed `Resume`), retry once; at most one reopen per second of monotonic time. Detections, plans and findings continue without links meanwhile. `evidence_recovered` note with the number of lost appends when it works again. |
+| Signer failure | Nothing written; same outage accounting, no reopen. |
+| Monotonic clock goes backwards | Held at the last value (`TimeGuard`); `clock_regression` fault. |
+| Wall time disagrees with monotonic progress by > `clock_jump_tolerance_ns` (default 1 s) | Wall time kept as reported (evidence), `wall_clock_jump` fault. Rate limits and escalation windows use monotonic time only, so a wall jump cannot shorten them (tested). |
+| Responder plan violates an invariant | Replaced by `Record` + approval; the rejected plan is kept in the black-box plan note. |
+| Configuration that would weaken detection | Refused at start: unknown fields in profile / monitor files, `+inf` or NaN firewall limits, `kafka_partitions = 0`, labels that cannot form a valid finding (probed at start). |
+
+The release profile uses `panic = "abort"`; a panic cannot be caught, so the
+chain is written and tested not to panic on hostile input. The platform's
+safety system never depends on this process.
+
+## Executor contract
+
+The agent only hands plans to `Executor::submit`. Every step is a *request*
+to another component through an abstract interface; nothing in this crate
+actuates, commands motion, resets an e-stop or overrides command authority.
+`ExecutionRequest::steps_without_approval_at(current_state)` is what a real
+executor may request without a human. It is empty unless the request is not
+a replay, the disposition (given and re-derived from the plan) is
+`eligible`, the invariants hold, the current safety state equals the one the
+plan was made for, and the safety system is not engaged. Executors run
+synchronously; a real one must hand off to its own bounded queue.
 
 ## Demo (`robodr-replay`)
 
@@ -114,17 +147,20 @@ cargo run -p robodr-agent --bin robodr-replay -- \
 Output of run 1 on stderr (findings go to `--out` or stdout):
 
 ```
-[executor:dry-run] rule=robot.ros2.unknown_participant severity=High ... would request [Restrict, LimitMotion] (no approval needed); invariants ok
-[executor:dry-run] rule=robot.ros2.unauthorized_motion_writer severity=Critical ... awaiting human approval for steps [Record, Restrict, LimitMotion, SafePause, RequestSafeState]; invariants ok
-[executor:dry-run] rule=robot.firewall.rejected_unknown_source severity=Critical ... rate-limited: record only; invariants ok
-[executor:dry-run] rule=robot.motion.linear_over_envelope severity=Critical ... rate-limited: record only; invariants ok
-[executor:dry-run] rule=robot.firewall.limited_speed severity=High ... rate-limited: record only; invariants ok
-replay: 16 events, 5 deviations {"critical": 3, "high": 2}, 5 findings written (0 failed), dispositions {"AwaitingHumanApproval": 1, "Eligible": 1, "Suppressed": 3}
+[executor:dry-run replay] rule=robot.ros2.unknown_participant severity=High ... would request [Restrict, LimitMotion] (no approval needed); invariants ok
+[executor:dry-run replay] rule=robot.ros2.unauthorized_motion_writer severity=Critical ... awaiting human approval for steps [Record, Restrict, LimitMotion, SafePause, RequestSafeState]; invariants ok
+[executor:dry-run replay] rule=robot.firewall.rejected_unknown_source severity=Critical ... rate-limited: record only; invariants ok
+[executor:dry-run replay] rule=robot.motion.linear_over_envelope severity=Critical ... rate-limited: record only; invariants ok
+[executor:dry-run replay] rule=robot.firewall.limited_speed severity=High ... rate-limited: record only; invariants ok
+replay: 16 events, 5 deviations {"critical": 3, "high": 2}, 5 findings written (0 failed), dispositions {"awaiting_human_approval": 1, "eligible": 1, "suppressed": 3}
 evidence: 16 black-box records appended, 0 append errors, 0 guard violations
 black box: 18 frames, 18 records verified, seq 0..17, last seal seq 17, CLEAN
-evidence links: 17/17 resolve to intact signed records
+evidence links: 16/16 resolve to intact signed records
 VERIFIED: evidence chain intact end to end
 ```
+
+The run counts distinct links (the event record is shared by two findings);
+`verify --findings` checks every link of every line (17).
 
 After a flipped byte, `verify` prints `TAMPERED`, the hash mismatch with its
 seq and byte offset, `16/17` links resolving with the bad one named, and it
@@ -142,7 +178,9 @@ limiting. Use `--step-ms 6000` to see each one graded on its own.
   is observed at `k * --step-ms` (default 20 ms).
   `MotionFeedback.timestamp_ns` must use this monotonic base, or the
   monitor's stamp checks will fire.
-- `--firewall` builds one spec per envelope channel with default limits.
+- `--firewall` builds one spec per envelope channel with default limits and,
+  on twist channels, an explicit angular bound of 1 rad/s
+  (`DEFAULT_MAX_ANGULAR_SPEED`; the profile has no angular field).
   Without `--firewall-allow CHANNEL=GUID,...`, it allows **every profile
   participant** on the channel. This is a permissive demo default; in
   production, list the real writer GUIDs. A listed participant prefix
@@ -153,6 +191,12 @@ limiting. Use `--step-ms 6000` to see each one graded on its own.
   compared against commands.
 - By default, events are recorded only when they caused a deviation or a
   non-pass verdict. `--record-all-events` records every event.
+- `--blackbox` must be absent or empty: a replay always starts a fresh chain,
+  so its output is reproducible and it never appends to real evidence.
+- A replay cannot act. Its requests are marked `replay`, and `--log-plans`
+  only prints what a live executor would have been offered.
+- `--monitor-config` and `--profile` are parsed strictly (unknown fields are
+  errors). At most 10 000 outcomes are kept in memory; all are counted.
 - Exit codes: 0 verified, 1 verification failed, 2 usage, input or I/O error.
   A malformed JSONL line aborts the run with exit 2. The black box is still
   sealed and verifiable.
@@ -174,7 +218,7 @@ limiting. Use `--step-ms 6000` to see each one graded on its own.
 
 ## Verified vs. not verified
 
-**Verified** by `cargo test -p robodr-agent` (34 tests). All inputs are
+**Verified** by `cargo test -p robodr-agent` (53 tests). All inputs are
 synthetic.
 
 - (a) A locked profile gives a High finding for the rogue participant and a
@@ -202,6 +246,16 @@ findings. Clock regressions are clamped. E-stop gives `Record` only. Repeats
 become OCSF updates with a count. Invalid configurations are refused. The CLI
 is tested end to end.
 
+Fail-safe (`tests/failsafe.rs`): a signer outage leaves plans and
+dispositions identical to a healthy run, findings still validate, one fault
+per outage, and a signed `evidence_recovered` note when it ends; a black-box
+directory removed mid-run is recovered by reopening and the new chain
+verifies; clock regressions and wall jumps are signed faults and a wall jump
+does not reset rate limiting; the fault log is bounded; replays mark every
+request and offer nothing, refuse a used directory and bound retained
+outcomes; strict parsing refuses unknown fields and `1e400`; infinite
+firewall limits, zero partitions and unusable labels are refused.
+
 **Not verified:**
 
 - No real robot, ROS 2 graph, DDS capture or sensor feeds this agent.
@@ -215,6 +269,11 @@ is tested end to end.
   AutoSecOps. Nothing is published to Kafka.
 - No executor exists. Nothing is requested from DDS, the host, the Motion
   Firewall gateway, the mission executive or the safety controller.
+- Black-box recovery was exercised with simulated failures only (failing
+  signer, directory removed). Real ENOSPC/EIO, power loss and fsync failure
+  on target storage were not tested.
+- Agent faults are not yet turned into OCSF findings or a health channel;
+  the integrator must forward `Agent::take_faults()`.
 - Performance was not measured. The agent allocates per deviation, so it
   belongs off the control loop. The firewall's hot path stays allocation-free
   inside `robodr-firewall`, but this agent's wrapper around it is not.

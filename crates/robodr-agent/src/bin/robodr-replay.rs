@@ -12,8 +12,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use robodr_agent::replay::{self, ReplayOptions};
-use robodr_agent::{Executor, LoggingExecutor};
 use robodr_motion::{FeedbackSource, MonitorConfig};
+
+/// Max size of a key file (a hex key plus whitespace).
+const MAX_KEY_FILE_BYTES: u64 = 4096;
 
 const USAGE: &str = "\
 robodr-replay: offline RoboDR decision chain (event -> deviation -> plan -> black box -> finding)
@@ -38,6 +40,8 @@ USAGE:
   SOURCE: wheel_odometry | imu | joint_state | gnss | other
   Findings go to stdout unless --out is given; the summary goes to stderr.
   The HMAC key (>= 32 bytes) is a placeholder authenticator (see robodr-blackbox).
+  --blackbox must be absent or empty (a replay starts a fresh chain).
+  A replay never acts: --log-plans only prints what would have been requested.
 
 EXIT: 0 ok and verified, 1 verification failed, 2 error.
 ";
@@ -154,7 +158,15 @@ fn parse_u64(what: &str, v: &str) -> Result<u64, String> {
 fn key_from(a: &Args) -> Result<Vec<u8>, String> {
     let hex = match (a.one("key-hex")?, a.one("key-file")?) {
         (Some(h), None) => h.to_string(),
-        (None, Some(p)) => std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?,
+        (None, Some(p)) => {
+            let len = std::fs::metadata(p).map_err(|e| format!("{p}: {e}"))?.len();
+            if len > MAX_KEY_FILE_BYTES {
+                return Err(format!(
+                    "{p}: key file larger than {MAX_KEY_FILE_BYTES} bytes"
+                ));
+            }
+            std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?
+        }
         (Some(_), Some(_)) => return Err("give --key-hex or --key-file, not both".into()),
         (None, None) => return Err("--key-hex or --key-file is required".into()),
     };
@@ -220,13 +232,7 @@ fn options(a: &Args) -> Result<ReplayOptions, String> {
             .extend(guids.split(',').map(str::to_string));
     }
     o.monitor = match (a.has("monitor"), a.one("monitor-config")?) {
-        (_, Some(p)) => {
-            let text = replay::read_capped(p.as_ref()).map_err(|e| e.to_string())?;
-            Some(
-                serde_json::from_str::<MonitorConfig>(&text)
-                    .map_err(|e| format!("{p}: not a monitor config: {e}"))?,
-            )
-        }
+        (_, Some(p)) => Some(replay::load_monitor_config(p.as_ref()).map_err(|e| e.to_string())?),
         (true, None) => None,
         (false, None) => None,
     };
@@ -265,14 +271,14 @@ fn run_cmd(a: &Args) -> Result<bool, String> {
         ))),
         None => None,
     };
-    let executor: Option<Box<dyn Executor>> = a
+    let plan_log: Option<Box<dyn Write>> = a
         .has("log-plans")
-        .then(|| Box::new(LoggingExecutor::new(std::io::stderr())) as Box<dyn Executor>);
+        .then(|| Box::new(std::io::stderr()) as Box<dyn Write>);
     let summary = replay::run(
         &o,
         &mut out,
         outcomes.as_mut().map(|w| w as &mut dyn Write),
-        executor,
+        plan_log,
     )
     .map_err(|e| e.to_string())?;
     out.flush().map_err(|e| format!("writing findings: {e}"))?;
@@ -280,23 +286,29 @@ fn run_cmd(a: &Args) -> Result<bool, String> {
         w.flush().map_err(|e| format!("writing outcomes: {e}"))?;
     }
 
-    let mut by_sev: BTreeMap<String, u64> = BTreeMap::new();
-    let mut by_disp: BTreeMap<String, u64> = BTreeMap::new();
-    for oc in &summary.outcomes {
-        *by_sev
-            .entry(format!("{:?}", oc.deviation.severity).to_lowercase())
-            .or_default() += 1;
-        *by_disp.entry(format!("{:?}", oc.disposition)).or_default() += 1;
-    }
     let s = summary.stats;
     eprintln!(
         "replay: {} events, {} deviations {:?}, {} findings written ({} failed), dispositions {:?}",
-        summary.events, s.deviations, by_sev, s.findings, s.finding_errors, by_disp
+        summary.events,
+        s.deviations,
+        summary.by_severity,
+        s.findings,
+        s.finding_errors,
+        summary.by_disposition
     );
     eprintln!(
         "evidence: {} black-box records appended, {} append errors, {} guard violations",
         s.records_appended, s.evidence_errors, s.guard_violations
     );
+    if s.faults > 0 {
+        eprintln!(
+            "agent faults: {} ({} clock regressions, {} wall-clock jumps, {} black-box reopens)",
+            s.faults, s.clock_regressions, s.wall_clock_jumps, s.blackbox_reopens
+        );
+        for f in &summary.faults {
+            eprintln!("  {:?}: {}", f.kind, f.detail);
+        }
+    }
     eprint!("{}", replay::describe_report(&summary.report));
     eprintln!(
         "evidence links: {}/{} resolve to intact signed records",

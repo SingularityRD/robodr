@@ -7,8 +7,24 @@
 //! monotonic clock at 0, and event `k` (1-based, counting events, not lines)
 //! is observed at `k * step_ns`. `MotionFeedback.timestamp_ns` in the input
 //! must use that monotonic base for the motion monitor's stamp checks.
+//!
+//! # Guarantees
+//!
+//! * **Deterministic.** Same input files, options and key give byte-identical
+//!   findings, outcomes and black-box segments. [`run`] therefore refuses a
+//!   black-box directory that already holds anything: resuming an existing
+//!   chain would mix old evidence into the run and change every hash.
+//! * **Cannot act.** The agent is marked as a replay (every
+//!   [`crate::ExecutionRequest`] has `replay: true`, for which an executor
+//!   must do nothing), and [`run`] accepts no executor at all, only an
+//!   optional dry-run log of what would have been requested.
+//! * **Bounded.** At most [`ReplayOptions::max_retained_outcomes`] outcomes
+//!   are kept in the summary (counts cover all of them); evidence links are
+//!   de-duplicated, so link resolution is bounded by the black box's own
+//!   retention. Config files are size-capped and parsed strictly (unknown
+//!   fields refused).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -24,13 +40,19 @@ use robodr_responder::{
 
 use crate::agent::{Agent, AgentStats};
 use crate::clock::ReplayClock;
-use crate::config::{AgentConfig, AgentError, FirewallSettings, MonitorSettings};
+use crate::config::{strict_from_str, AgentConfig, AgentError, FirewallSettings, MonitorSettings};
 use crate::evidence::{finding_refs, resolve_links, verify_blackbox, LinkReport};
-use crate::executor::Executor;
-use crate::outcome::Outcome;
+use crate::executor::LoggingExecutor;
+use crate::outcome::{AgentFault, Outcome};
 
 /// Max size of a profile / policy / monitor-config file.
 pub const MAX_CONFIG_BYTES: u64 = 16 << 20;
+
+/// Max size of a findings file read by [`verify`].
+pub const MAX_FINDINGS_BYTES: u64 = 256 << 20;
+
+/// Default for [`ReplayOptions::max_retained_outcomes`].
+pub const DEFAULT_MAX_RETAINED_OUTCOMES: usize = 10_000;
 
 /// Everything a replay needs.
 #[derive(Debug, Clone)]
@@ -64,6 +86,9 @@ pub struct ReplayOptions {
     pub feedback_sources: BTreeMap<String, FeedbackSource>,
     pub record_all_events: bool,
     pub kafka_partitions: Option<u32>,
+    /// Outcomes kept in [`ReplaySummary::outcomes`]; later ones are only
+    /// counted (memory stays bounded on large inputs).
+    pub max_retained_outcomes: usize,
 }
 
 impl ReplayOptions {
@@ -102,6 +127,7 @@ impl ReplayOptions {
             feedback_sources: BTreeMap::new(),
             record_all_events: false,
             kafka_partitions: None,
+            max_retained_outcomes: DEFAULT_MAX_RETAINED_OUTCOMES,
         }
     }
 }
@@ -131,7 +157,16 @@ impl std::error::Error for ReplayError {}
 #[derive(Debug, Clone)]
 pub struct ReplaySummary {
     pub events: u64,
+    /// The first [`ReplayOptions::max_retained_outcomes`] outcomes.
     pub outcomes: Vec<Outcome>,
+    /// Outcomes produced but not retained.
+    pub outcomes_dropped: u64,
+    /// Deviations per severity (lower-case name), over all outcomes.
+    pub by_severity: BTreeMap<String, u64>,
+    /// Outcomes per disposition (snake_case name), over all outcomes.
+    pub by_disposition: BTreeMap<String, u64>,
+    /// Agent faults retained at the end of the run.
+    pub faults: Vec<AgentFault>,
     pub stats: AgentStats,
     /// Black-box verifier report (with the run's final checkpoint).
     pub report: Report,
@@ -159,11 +194,20 @@ pub fn read_capped(path: &Path) -> Result<String, ReplayError> {
     std::fs::read_to_string(path).map_err(|e| ReplayError::Io(format!("{}: {e}", path.display())))
 }
 
-/// Load and validate a profile file.
+/// Load a profile file (strict: unknown fields are refused). The agent
+/// validates it on start.
 pub fn load_profile(path: &Path) -> Result<Profile, ReplayError> {
     let text = read_capped(path)?;
-    serde_json::from_str(&text)
+    strict_from_str(&text)
         .map_err(|e| ReplayError::Config(format!("{}: not a profile: {e}", path.display())))
+}
+
+/// Load a motion monitor config file (strict: unknown fields are refused).
+/// The monitor validates its values on start.
+pub fn load_monitor_config(path: &Path) -> Result<MonitorConfig, ReplayError> {
+    let text = read_capped(path)?;
+    strict_from_str(&text)
+        .map_err(|e| ReplayError::Config(format!("{}: not a monitor config: {e}", path.display())))
 }
 
 /// Load and validate a response policy file.
@@ -232,26 +276,55 @@ pub fn build_agent(opts: &ReplayOptions) -> Result<Agent, ReplayError> {
         opts.step_ns,
         TimeSource::Unknown,
     );
-    Agent::new(cfg, Box::new(signer), Box::new(clock)).map_err(ReplayError::Agent)
+    let mut agent =
+        Agent::new(cfg, Box::new(signer), Box::new(clock)).map_err(ReplayError::Agent)?;
+    agent.mark_replay();
+    Ok(agent)
+}
+
+/// A replay must start a fresh chain (see the module docs).
+fn require_fresh_blackbox(dir: &Path) -> Result<(), ReplayError> {
+    match std::fs::read_dir(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(ReplayError::Io(format!("{}: {e}", dir.display()))),
+        Ok(mut it) => {
+            if it.next().is_some() {
+                Err(ReplayError::Config(format!(
+                    "{}: black-box directory is not empty; a replay needs a fresh one",
+                    dir.display()
+                )))
+            } else {
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Run a replay. Every validated finding is written to `findings` as one
 /// JSON line (the exact `robot-edr.findings` record value); if `outcomes` is
-/// given, every [`Outcome`] is written to it as one JSON line. At the end the
-/// black box is sealed and verified, and every evidence link is resolved.
+/// given, every [`Outcome`] is written to it as one JSON line. If `plan_log`
+/// is given, a dry-run line per plan is written to it
+/// ([`LoggingExecutor`]); no other executor can be attached to a replay. At
+/// the end the black box is sealed and verified, and every evidence link is
+/// resolved. `opts.blackbox` must be absent or empty.
 pub fn run(
     opts: &ReplayOptions,
     findings: &mut dyn Write,
     mut outcomes: Option<&mut dyn Write>,
-    executor: Option<Box<dyn Executor>>,
+    plan_log: Option<Box<dyn Write>>,
 ) -> Result<ReplaySummary, ReplayError> {
+    require_fresh_blackbox(&opts.blackbox)?;
     let mut agent = build_agent(opts)?;
-    if let Some(ex) = executor {
-        agent = agent.with_executor(ex);
+    if let Some(w) = plan_log {
+        agent = agent.with_executor(Box::new(LoggingExecutor::new(w)));
     }
     let mut source =
         JsonlSource::open(&opts.events).map_err(|e| ReplayError::Input(e.to_string()))?;
     let mut all = Vec::new();
+    let mut dropped = 0u64;
+    let mut by_severity: BTreeMap<String, u64> = BTreeMap::new();
+    let mut by_disposition: BTreeMap<String, u64> = BTreeMap::new();
+    let mut refs = BTreeSet::new();
     let mut input_error = None;
     let mut io_error = None;
     let mut events = 0u64;
@@ -278,7 +351,20 @@ pub fn run(
             if let Err(e) = res {
                 io_error.get_or_insert(e.to_string());
             }
-            all.push(o);
+            *by_severity
+                .entry(format!("{:?}", o.deviation.severity).to_lowercase())
+                .or_default() += 1;
+            *by_disposition.entry(enum_name(&o.disposition)).or_default() += 1;
+            if let Some(f) = &o.finding {
+                if let Ok(env) = robodr_ocsf::parse_and_validate(&f.value) {
+                    refs.extend(finding_refs(&env));
+                }
+            }
+            if all.len() < opts.max_retained_outcomes {
+                all.push(o);
+            } else {
+                dropped += 1;
+            }
         }
         if io_error.is_some() {
             break;
@@ -286,6 +372,7 @@ pub fn run(
     }
     // Seal the black box even if the input was bad: what was recorded stays
     // verifiable.
+    let faults = agent.take_faults();
     let finished = agent.finish().map_err(ReplayError::Agent)?;
     if let Some(e) = io_error {
         return Err(ReplayError::Io(format!("writing output: {e}")));
@@ -301,17 +388,16 @@ pub fn run(
         Some(&opts.robot_id),
     )
     .map_err(|e| ReplayError::Io(format!("{}: {e}", opts.blackbox.display())))?;
-    let refs: Vec<_> = all
-        .iter()
-        .filter_map(|o| o.finding.as_ref())
-        .filter_map(|f| robodr_ocsf::parse_and_validate(&f.value).ok())
-        .flat_map(|env| finding_refs(&env))
-        .collect();
+    let refs: Vec<_> = refs.into_iter().collect();
     let links = resolve_links(&opts.blackbox, &verifier, &refs)
         .map_err(|e| ReplayError::Io(format!("{}: {e}", opts.blackbox.display())))?;
     Ok(ReplaySummary {
         events,
         outcomes: all,
+        outcomes_dropped: dropped,
+        by_severity,
+        by_disposition,
+        faults,
         stats: finished.stats,
         report,
         links,
@@ -352,6 +438,14 @@ pub fn verify(
     let links = match findings {
         None => None,
         Some(p) => {
+            let meta = std::fs::metadata(p)
+                .map_err(|e| ReplayError::Io(format!("{}: {e}", p.display())))?;
+            if meta.len() > MAX_FINDINGS_BYTES {
+                return Err(ReplayError::Input(format!(
+                    "{}: larger than {MAX_FINDINGS_BYTES} bytes",
+                    p.display()
+                )));
+            }
             let text = std::fs::read_to_string(p)
                 .map_err(|e| ReplayError::Io(format!("{}: {e}", p.display())))?;
             let mut refs = Vec::new();
@@ -381,6 +475,14 @@ pub fn verify(
         links,
         invalid_findings: invalid,
     })
+}
+
+/// The serde (snake_case) name of a unit enum value.
+fn enum_name<T: serde::Serialize>(v: &T) -> String {
+    match serde_json::to_value(v) {
+        Ok(serde_json::Value::String(s)) => s,
+        _ => "unknown".into(),
+    }
 }
 
 /// Human-readable multi-line summary of a verifier report.

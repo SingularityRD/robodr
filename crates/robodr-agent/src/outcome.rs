@@ -6,6 +6,39 @@ use robodr_ocsf::BlackBoxRef;
 use robodr_responder::{ResponsePlan, Step};
 use serde::Serialize;
 
+use crate::clock::ClockAnomaly;
+
+/// What kind of agent-internal failure an [`AgentFault`] is. Faults are about
+/// the agent itself, not the robot, and never reach the responder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FaultKind {
+    /// Monotonic time went backwards (clamped).
+    ClockRegression,
+    /// Wall time disagreed with monotonic time beyond the tolerance.
+    WallClockJump,
+    /// A black-box append failed (first failure of an outage).
+    EvidenceWriteFailed,
+    /// Reopening a failed black box failed.
+    EvidenceRecoveryFailed,
+    /// The black box accepts records again after an outage; `detail` says
+    /// how many appends were lost.
+    EvidenceRecovered,
+}
+
+/// One agent-internal failure, see [`crate::agent`] ("Failure handling").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AgentFault {
+    pub kind: FaultKind,
+    /// Agent time (sanitised) when it was raised.
+    pub mono_ns: u64,
+    pub wall_ns: u64,
+    pub detail: String,
+    pub clock: Option<ClockAnomaly>,
+    /// The signed `robodr.agent_fault` note, if the black box took it.
+    pub record: Option<BlackBoxRef>,
+}
+
 /// Which detector raised the deviation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
