@@ -203,6 +203,35 @@ pub fn linux_sll2(protocol: u16, payload: &[u8]) -> Vec<u8> {
     f
 }
 
+/// Linux cooked capture v1 header with an explicit `pkttype` and `hatype`
+/// (e.g. `ARPHRD_LOOPBACK` = 772 for `lo`).
+pub fn linux_sll_on(pkttype: u16, hatype: u16, protocol: u16, payload: &[u8]) -> Vec<u8> {
+    let mut f = pkttype.to_be_bytes().to_vec();
+    f.extend_from_slice(&hatype.to_be_bytes());
+    f.extend_from_slice(&[0, 6, 2, 0, 0, 0, 0, 1, 0, 0]);
+    f.extend_from_slice(&protocol.to_be_bytes());
+    f.extend_from_slice(payload);
+    f
+}
+
+/// Linux cooked capture v2 header with an explicit interface index,
+/// `hatype` and `pkttype`.
+pub fn linux_sll2_on(
+    ifindex: u32,
+    hatype: u16,
+    pkttype: u8,
+    protocol: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut f = protocol.to_be_bytes().to_vec();
+    f.extend_from_slice(&[0, 0]);
+    f.extend_from_slice(&ifindex.to_be_bytes());
+    f.extend_from_slice(&hatype.to_be_bytes());
+    f.extend_from_slice(&[pkttype, 6, 2, 0, 0, 0, 0, 1, 0, 0]);
+    f.extend_from_slice(payload);
+    f
+}
+
 /// BSD NULL / OpenBSD LOOP header: 4-byte address family.
 pub fn null_loopback(family: u32, little_endian: bool, payload: &[u8]) -> Vec<u8> {
     let mut f = if little_endian {

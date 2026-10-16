@@ -9,8 +9,8 @@
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
-use robodr_capture::afpacket::{AfPacketConfig, AfPacketSource};
-use robodr_capture::{CaptureError, RtpsDatagrams, RtpsFilter};
+use robodr_capture::afpacket::{interface_index, AfPacketConfig, AfPacketSource};
+use robodr_capture::{CaptureError, IngressInfo, PacketType, RtpsDatagrams, RtpsFilter};
 
 fn open(cfg: AfPacketConfig) -> Option<AfPacketSource> {
     match AfPacketSource::open(&cfg) {
@@ -29,7 +29,7 @@ fn send_and_capture(
     src: AfPacketSource,
     sends: &[(u16, Vec<u8>)],
     marker: &[u8],
-) -> Vec<(String, u16, Vec<u8>)> {
+) -> Vec<(String, u16, Vec<u8>, IngressInfo)> {
     let mut it = RtpsDatagrams::new(src, RtpsFilter::default()).with_frame_budget(64);
     let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
     for (port, payload) in sends {
@@ -42,7 +42,7 @@ fn send_and_capture(
         // deadline is checked per packet too.
         while let Some(p) = it.next_packet() {
             if p.payload.windows(marker.len()).any(|w| w == marker) {
-                got.push((p.src.to_string(), p.dst_port, p.payload));
+                got.push((p.src.to_string(), p.dst_port, p.payload, p.ingress));
             }
             if Instant::now() >= deadline {
                 break;
@@ -103,6 +103,37 @@ fn loopback_rtps_is_captured_once_and_non_rtps_is_filtered() {
         "non-RTPS leaked through: {ports:?}"
     );
     assert!(got.iter().all(|g| g.0 == "127.0.0.1" && g.2 == rtps));
+    assert!(got.iter().all(|g| is_lo(&g.3)), "{got:?}");
+}
+
+/// The ingress the kernel reports for a datagram received on `lo`.
+fn is_lo(i: &IngressInfo) -> bool {
+    let lo = interface_index("lo").unwrap();
+    i.loopback == Some(true)
+        && i.ifindex == Some(lo)
+        && i.name.as_deref() == Some("lo")
+        && i.pkttype == Some(PacketType::Host)
+}
+
+/// Bound to every interface (the case that used to report no ingress), each
+/// datagram still says it came in on `lo`: the per-packet `sockaddr_ll`
+/// carries ifindex, hardware type and packet type.
+#[test]
+fn all_interfaces_capture_reports_loopback_ingress_per_packet() {
+    let Some(src) = open(AfPacketConfig {
+        interfaces: Vec::new(),
+        read_timeout: Some(Duration::from_millis(50)),
+        ..Default::default()
+    }) else {
+        return;
+    };
+    let m = marker();
+    let mut rtps = b"RTPS\x02\x03\x01\x0f".to_vec();
+    rtps.extend_from_slice(&[0x33; 12]);
+    rtps.extend_from_slice(&m);
+    let got = send_and_capture(src, &[(7412, rtps.clone()), (7412, rtps)], &m);
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert!(got.iter().all(|g| is_lo(&g.3)), "{got:?}");
 }
 
 #[test]

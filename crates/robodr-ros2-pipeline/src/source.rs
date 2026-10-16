@@ -15,6 +15,20 @@
 //!   traffic, which the SPDP multicast socket cannot.
 //! - [`VecDatagramSource`]: an in-memory list (tests, replays).
 //!
+//! # Ingress
+//!
+//! Every captured datagram is tagged with the [`Ingress`] the capture layer
+//! reports **for that packet** ([`robodr_capture::IngressInfo`], see
+//! [`ingress_of_packet`]): live `AF_PACKET` frames carry the kernel's
+//! interface hardware type (so a capture bound to every interface still
+//! knows `lo` from `eth0`), pcapng frames carry their Interface Description
+//! Block's `if_name`, and Linux cooked-capture frames (`tcpdump -i any`,
+//! SLL/SLL2) carry the interface type in their header. Only when the packet
+//! says nothing (classic pcap without a configured interface, `tcpdump -i
+//! lo` saved as Ethernet in a classic pcap, pcapng without `if_name`) does
+//! the source's static tag apply ([`CaptureDatagramSource::with_ingress`],
+//! [`ingress_of_interfaces`]), which defaults to [`Ingress::Unknown`].
+//!
 //! The SPDP multicast socket ([`crate::socket`]) is used directly by the
 //! async glue (tokio needs a non-blocking socket), not through this trait.
 
@@ -42,6 +56,9 @@ pub struct Datagram {
     pub src_ip: String,
     /// See [`Ingress`]; [`Ingress::Unknown`] from [`Datagram::new`].
     pub ingress: Ingress,
+    /// Name of the interface it arrived on, when the source knows it
+    /// (evidence only; trust decisions use [`Datagram::ingress`]).
+    pub interface: Option<String>,
 }
 
 impl Datagram {
@@ -50,6 +67,7 @@ impl Datagram {
             payload,
             src_ip: src_ip.into(),
             ingress: Ingress::Unknown,
+            interface: None,
         }
     }
 
@@ -71,6 +89,17 @@ pub fn is_loopback_interface(name: &str) -> bool {
     match std::fs::read_to_string(format!("/sys/class/net/{name}/type")) {
         Ok(t) => t.trim() == "772",
         Err(_) => name == "lo",
+    }
+}
+
+/// The [`Ingress`] of one captured packet: its interface's loopback flag
+/// when the capture layer knows it (`Some(true)` -> `Loopback`,
+/// `Some(false)` -> `External`), else `fallback` (the source's static tag).
+pub fn ingress_of_packet(info: &robodr_capture::IngressInfo, fallback: Ingress) -> Ingress {
+    match info.loopback {
+        Some(true) => Ingress::Loopback,
+        Some(false) => Ingress::External,
+        None => fallback,
     }
 }
 
@@ -450,15 +479,17 @@ impl<S: PacketSource> CaptureDatagramSource<S> {
         self
     }
 
-    /// Tag every datagram with `ingress` (set by
-    /// [`CaptureDatagramSource::open_live`] from the interface list).
+    /// Tag datagrams whose packet carries no interface information with
+    /// `ingress` (set by [`CaptureDatagramSource::open_live`] from the
+    /// interface list). Per-packet information always wins (see
+    /// [`ingress_of_packet`]).
     #[must_use]
     pub fn with_ingress(mut self, ingress: Ingress) -> Self {
         self.ingress = ingress;
         self
     }
 
-    /// The [`Ingress`] this source tags its datagrams with.
+    /// The fallback [`Ingress`] for packets without interface information.
     pub fn ingress(&self) -> Ingress {
         self.ingress
     }
@@ -513,10 +544,12 @@ impl CaptureDatagramSource<robodr_capture::afpacket::AfPacketSource> {
     /// `interfaces` empty = all interfaces. The kernel BPF filter is compiled
     /// from the same port map; if it cannot be built or attached, the
     /// user-space filter does all the work (the source still works).
-    /// Datagrams are tagged with [`ingress_of_interfaces`] (only loopback
-    /// interfaces -> `Loopback`, only others -> `External`, else
-    /// `Unknown`); [`crate::config::CaptureSettings::open`] splits a mixed
-    /// list into two sources so ingress is known.
+    /// Every datagram is tagged with the ingress the kernel reports for its
+    /// packet (`sll_hatype == ARPHRD_LOOPBACK`, see [`ingress_of_packet`]),
+    /// also when bound to all interfaces; [`ingress_of_interfaces`] is only
+    /// the fallback, which `AF_PACKET` never needs.
+    /// ([`crate::config::CaptureSettings::open`] still splits a mixed list
+    /// into two sources; that is no longer required for ingress.)
     pub fn open_live(
         interfaces: &[String],
         port_map: RtpsPortMap,
@@ -543,9 +576,10 @@ impl<S: PacketSource> DatagramSource for CaptureDatagramSource<S> {
                 return Ok(None);
             }
             if let Some(p) = self.inner.next_packet() {
-                return Ok(Some(
-                    Datagram::new(p.payload, p.src.to_string()).with_ingress(self.ingress),
-                ));
+                let mut d = Datagram::new(p.payload, p.src.to_string())
+                    .with_ingress(ingress_of_packet(&p.ingress, self.ingress));
+                d.interface = p.ingress.name;
+                return Ok(Some(d));
             }
             if self.inner.is_finished() {
                 self.reported_end = true;
@@ -684,6 +718,7 @@ mod tests {
                     linktype: LinkType::RAW,
                     data: &self.1,
                     orig_len: self.1.len() as u32,
+                    ingress: Default::default(),
                 })),
                 _ => Err(CaptureError::PermissionDenied("gone".into())),
             }
@@ -819,6 +854,57 @@ mod tests {
         assert!(!is_loopback_interface(""));
         assert!(!is_loopback_interface("../lo"));
         assert!(!is_loopback_interface("lo/.."));
+    }
+
+    #[test]
+    fn per_packet_ingress_overrides_the_static_tag() {
+        use robodr_capture::IngressInfo;
+        let lo_ip = Ipv4Addr::LOCALHOST;
+        let ip = synth::ipv4_udp(lo_ip, lo_ip, 1, 7410, &rtps(4));
+        let tag = |name: Option<&str>, lo: Option<bool>| IngressInfo {
+            name: name.map(str::to_owned),
+            loopback: lo,
+            ..Default::default()
+        };
+        let frames = vec![
+            (
+                Duration::ZERO,
+                LinkType::RAW,
+                ip.clone(),
+                tag(Some("lo"), Some(true)),
+            ),
+            (
+                Duration::ZERO,
+                LinkType::RAW,
+                ip.clone(),
+                tag(Some("eth0"), Some(false)),
+            ),
+            (Duration::ZERO, LinkType::RAW, ip.clone(), tag(None, None)),
+            // tcpdump -i any (SLL2): the frame header decides.
+            (
+                Duration::ZERO,
+                LinkType::LINUX_SLL2,
+                synth::linux_sll2_on(2, 1, 0, 0x0800, &ip),
+                tag(Some("any"), None),
+            ),
+        ];
+        let mut s =
+            CaptureDatagramSource::new(VecSource::with_ingress(frames), RtpsFilter::default())
+                .with_ingress(Ingress::Loopback);
+        let mut next = || {
+            let d = s.recv().unwrap().unwrap();
+            (d.ingress, d.interface)
+        };
+        assert_eq!(next(), (Ingress::Loopback, Some("lo".into())));
+        assert_eq!(next(), (Ingress::External, Some("eth0".into())));
+        assert_eq!(next(), (Ingress::Loopback, None), "fallback");
+        assert_eq!(next(), (Ingress::External, None));
+        assert!(s.recv().unwrap().is_none());
+        let unknown = IngressInfo::default();
+        assert_eq!(
+            ingress_of_packet(&unknown, Ingress::Unknown),
+            Ingress::Unknown
+        );
     }
 
     /// Reports a fixed health snapshot, then its datagrams, then ends or fails.

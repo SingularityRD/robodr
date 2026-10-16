@@ -62,8 +62,19 @@
 //!    neither missed nor hideable by a flood.
 //! 5. [`ports`]: [`RtpsFilter`] = DDSI-RTPS well-known ports and/or the
 //!    `"RTPS"` magic (see the module docs for the trade-off).
-//! 6. [`RtpsDatagrams`]: the glue iterator yielding `(src_ip, payload)`.
-//!    [`bpf`] compiles the same filter to a kernel socket filter.
+//! 6. [`RtpsDatagrams`]: the glue iterator yielding `(src_ip, payload)`
+//!    ([`RtpsPacket`] via `next_packet`). [`bpf`] compiles the same filter
+//!    to a kernel socket filter.
+//!
+//! Every [`RtpsPacket`] carries its [`ingress`]: interface index, name,
+//! loopback flag and packet type, from the live socket's `sockaddr_ll`, the
+//! pcapng Interface Description Block / `epb_flags`, or the Linux cooked
+//! (SLL/SLL2) header, merged over the fragments of a reassembled datagram.
+//! This lets the consumer tell a loopback source address on `lo` (same
+//! host) from one on a physical interface (forged), also for captures bound
+//! to every interface and `tcpdump -i any` files. Outgoing copies on a
+//! loopback interface are skipped ([`CaptureStats::loopback_outgoing`]) so
+//! each datagram is delivered once, as the live reader does.
 //!
 //! # Read-only guarantee
 //! Nothing in this crate can transmit. The live reader declares no send or
@@ -112,6 +123,7 @@ pub mod afpacket;
 pub mod bpf;
 pub mod checksum;
 pub mod decode;
+pub mod ingress;
 pub mod pcap;
 pub mod ports;
 pub mod reassembly;
@@ -123,6 +135,7 @@ use std::time::Duration;
 
 pub use checksum::{UdpChecksumMode, UdpChecksumStatus};
 pub use decode::{decode_frame, decode_udp, DecodeError, Decoded, LinkType, UdpDatagram};
+pub use ingress::{IngressInfo, PacketIngress, PacketType};
 pub use pcap::{CaptureFile, PcapNgReader, PcapReader, PcapWriter};
 pub use ports::{MatchMode, PortClass, PortKind, RtpsFilter, RtpsPortMap};
 pub use reassembly::{Reassembler, ReassemblyLimits};
@@ -141,6 +154,11 @@ pub struct RtpsPacket {
     pub port_class: Option<PortClass>,
     /// Recovered from IP fragments.
     pub reassembled: bool,
+    /// The interface the datagram arrived on, as far as the source and the
+    /// frame's link-layer header tell (see [`ingress`]); for reassembled
+    /// datagrams, merged over every fragment (any non-loopback fragment
+    /// makes the datagram non-loopback).
+    pub ingress: IngressInfo,
     pub payload: Vec<u8>,
 }
 
@@ -152,6 +170,11 @@ pub struct CaptureStats {
     pub rtps: u64,
     /// UDP datagrams the [`RtpsFilter`] rejected.
     pub filtered_out: u64,
+    /// Frames skipped because they are the *outgoing* copy of a packet on a
+    /// loopback interface (Linux cooked capture of `any`/`lo`, pcapng
+    /// `epb_flags`): the incoming copy follows, so each datagram is
+    /// delivered once, as with the live reader.
+    pub loopback_outgoing: u64,
     pub not_ip: u64,
     pub not_udp: u64,
     pub truncated: u64,
@@ -307,9 +330,7 @@ impl<S: PacketSource> RtpsDatagrams<S> {
                 self.udp_checksum,
                 &mut self.reassembler,
                 &mut self.stats,
-                pkt.ts,
-                pkt.linktype,
-                pkt.data,
+                &pkt,
             );
             if out.is_some() {
                 return out;
@@ -359,12 +380,20 @@ fn process(
     udp_mode: UdpChecksumMode,
     reassembler: &mut Reassembler,
     stats: &mut CaptureStats,
-    ts: Duration,
-    link: LinkType,
-    data: &[u8],
+    pkt: &Packet<'_>,
 ) -> Option<RtpsPacket> {
+    let (ts, link, data) = (pkt.ts, pkt.linktype, pkt.data);
     stats.frames += 1;
-    let accept = |stats: &mut CaptureStats, u: &UdpDatagram<'_>, segment: &[u8], reassembled| {
+    let ingress = ingress::resolve(&pkt.ingress, ingress::link_ingress(link, data));
+    if ingress.loopback == Some(true) && ingress.pkttype.is_some_and(PacketType::is_outgoing) {
+        stats.loopback_outgoing += 1;
+        return None;
+    }
+    let accept = |stats: &mut CaptureStats,
+                  u: &UdpDatagram<'_>,
+                  segment: &[u8],
+                  reassembled,
+                  ingress: IngressInfo| {
         if !udp_checksum_ok(udp_mode, stats, u, segment) {
             return None;
         }
@@ -382,6 +411,7 @@ fn process(
             dst_port: u.dst_port,
             port_class: filter.ports.classify(u.dst_port),
             reassembled,
+            ingress,
             payload: u.payload.to_vec(),
         })
     };
@@ -406,11 +436,11 @@ fn process(
     match d.decoded {
         Decoded::Udp(u) => {
             let segment = d.udp_segment.unwrap_or_default();
-            accept(stats, &u, segment, false)
+            accept(stats, &u, segment, false, ingress)
         }
         Decoded::Fragment(f) => {
             stats.fragments += 1;
-            let r = reassembler.push(ts, &f)?;
+            let (r, ingress) = reassembler.push_with_ingress(ts, &f, &ingress)?;
             stats.reassembled += 1;
             let udp = match r.src {
                 IpAddr::V4(_) => decode::udp_segment_inner(r.src, r.dst, &r.payload),
@@ -427,7 +457,7 @@ fn process(
                 }),
             };
             match udp {
-                Ok((u, seg)) => accept(stats, &u, seg, true),
+                Ok((u, seg)) => accept(stats, &u, seg, true, ingress),
                 Err(e) => {
                     count_error(stats, e);
                     None
@@ -567,6 +597,173 @@ mod tests {
         assert!(it.is_finished());
     }
 
+    fn info(ifindex: u32, name: &str, lo: bool) -> IngressInfo {
+        IngressInfo {
+            ifindex: Some(ifindex),
+            name: Some(name.into()),
+            loopback: Some(lo),
+            pkttype: Some(PacketType::Host),
+        }
+    }
+
+    #[test]
+    fn glue_reports_per_packet_ingress_from_source_and_cooked_headers() {
+        use ingress::ARPHRD_LOOPBACK;
+        let lo = Ipv4Addr::LOCALHOST;
+        let a = Ipv4Addr::new(10, 0, 0, 1);
+        let ip_lo = synth::ipv4_udp(lo, lo, 1, 7410, &rtps_payload(1));
+        let ip_a = synth::ipv4_udp(a, a, 1, 7410, &rtps_payload(2));
+        let t = Duration::ZERO;
+        let any = IngressInfo {
+            name: Some("any".into()),
+            ..Default::default()
+        };
+        let frames = vec![
+            // Source-provided (live AF_PACKET style).
+            (t, LinkType::RAW, ip_lo.clone(), info(1, "lo", true)),
+            (t, LinkType::RAW, ip_lo.clone(), info(2, "eth0", false)),
+            // SLL2 from an "any" capture: ifindex/hatype/pkttype from the frame.
+            (
+                t,
+                LinkType::LINUX_SLL2,
+                synth::linux_sll2_on(1, ARPHRD_LOOPBACK, 4, 0x0800, &ip_lo),
+                any.clone(),
+            ),
+            (
+                t,
+                LinkType::LINUX_SLL2,
+                synth::linux_sll2_on(1, ARPHRD_LOOPBACK, 0, 0x0800, &ip_lo),
+                any.clone(),
+            ),
+            (
+                t,
+                LinkType::LINUX_SLL2,
+                synth::linux_sll2_on(3, 1, 0, 0x0800, &ip_lo),
+                any.clone(),
+            ),
+            // SLL v1: no ifindex, hatype still tells.
+            (
+                t,
+                LinkType::LINUX_SLL,
+                synth::linux_sll_on(4, ARPHRD_LOOPBACK, 0x0800, &ip_a),
+                any.clone(),
+            ),
+            (
+                t,
+                LinkType::LINUX_SLL,
+                synth::linux_sll_on(0, ARPHRD_LOOPBACK, 0x0800, &ip_a),
+                any.clone(),
+            ),
+            (
+                t,
+                LinkType::LINUX_SLL,
+                synth::linux_sll_on(4, 1, 0x0800, &ip_a),
+                IngressInfo::default(),
+            ),
+            // Nothing known.
+            (t, LinkType::RAW, ip_a.clone(), IngressInfo::default()),
+        ];
+        let got: Vec<RtpsPacket> = std::iter::from_fn({
+            let mut it = rtps_datagrams(VecSource::with_ingress(frames));
+            move || it.next_packet()
+        })
+        .collect();
+        let ing: Vec<_> = got.iter().map(|p| p.ingress.clone()).collect();
+        assert_eq!(ing.len(), 7, "{ing:?}");
+        assert_eq!(ing[0], info(1, "lo", true));
+        assert_eq!(ing[1], info(2, "eth0", false));
+        // ing[2]: the SLL2 *outgoing* loopback copy was skipped.
+        assert_eq!(
+            ing[2],
+            IngressInfo {
+                ifindex: Some(1),
+                name: None,
+                loopback: Some(true),
+                pkttype: Some(PacketType::Host),
+            }
+        );
+        assert_eq!((ing[3].ifindex, ing[3].loopback), (Some(3), Some(false)));
+        assert_eq!((ing[4].ifindex, ing[4].loopback), (None, Some(true)));
+        assert_eq!(ing[5].loopback, Some(false));
+        assert_eq!(ing[5].pkttype, Some(PacketType::Outgoing), "kept off lo");
+        assert!(ing[6].is_unknown());
+        assert_eq!(got[3].src, IpAddr::V4(lo));
+    }
+
+    #[test]
+    fn glue_counts_skipped_loopback_outgoing_copies() {
+        let lo = Ipv4Addr::LOCALHOST;
+        let ip = synth::ipv4_udp(lo, lo, 1, 7410, &rtps_payload(1));
+        let frames = [4u16, 0].map(|pt| {
+            (
+                Duration::ZERO,
+                LinkType::LINUX_SLL,
+                synth::linux_sll_on(pt, ingress::ARPHRD_LOOPBACK, 0x0800, &ip),
+            )
+        });
+        let mut it = rtps_datagrams(VecSource::new(frames));
+        assert!(it.next_packet().is_some());
+        assert!(it.next_packet().is_none());
+        assert_eq!(it.stats().loopback_outgoing, 1);
+        assert_eq!(it.stats().rtps, 1);
+    }
+
+    #[test]
+    fn fragments_seen_off_loopback_make_the_datagram_non_loopback() {
+        let lo = Ipv4Addr::LOCALHOST;
+        let mut payload = rtps_payload(5);
+        payload.extend(std::iter::repeat_n(0xcd, 3000));
+        let ip = synth::ipv4_udp(lo, lo, 1, 7410, &payload);
+        let frags = synth::ipv4_fragment(&ip, 1480);
+        assert!(frags.len() >= 3);
+        let run = |tags: &[IngressInfo]| {
+            let frames: Vec<_> = frags
+                .iter()
+                .zip(tags.iter().cycle())
+                .map(|(f, t)| (Duration::ZERO, LinkType::RAW, f.clone(), t.clone()))
+                .collect();
+            let mut it = rtps_datagrams(VecSource::with_ingress(frames));
+            let p = it.next_packet().expect("reassembled");
+            assert!(p.reassembled);
+            assert_eq!(p.payload, payload);
+            p.ingress
+        };
+        let l = info(1, "lo", true);
+        let e = info(2, "eth0", false);
+        assert_eq!(run(std::slice::from_ref(&l)), l);
+        // A forged first fragment on eth0 completed by a fragment on lo.
+        let mixed = run(&[e.clone(), l.clone()]);
+        assert_eq!(mixed.loopback, Some(false));
+        assert_eq!((mixed.ifindex, mixed.name), (None, None));
+        let mixed = run(&[l.clone(), l.clone(), e.clone()]);
+        assert_eq!(mixed.loopback, Some(false));
+        let unknown = run(&[l.clone(), IngressInfo::default()]);
+        assert_eq!(unknown.loopback, None);
+    }
+
+    #[test]
+    fn pcapng_multi_interface_replay_reports_each_interface() {
+        let lo = Ipv4Addr::LOCALHOST;
+        let ip = synth::ipv4_udp(lo, lo, 1, 7410, &rtps_payload(9));
+        let mut b = pcap::tests::NgBuilder::new(true);
+        b.idb_named(1, b"lo");
+        b.idb_named(101, b"eth0");
+        b.epb(0, 1, &synth::ethernet(0x0800, &ip), 0);
+        b.epb(1, 1, &ip, 0);
+        let mut it = rtps_datagrams(CaptureFile::new(&b.out[..]).unwrap());
+        let a = it.next_packet().unwrap();
+        let c = it.next_packet().unwrap();
+        assert!(it.next_packet().is_none() && it.last_error().is_none());
+        assert_eq!(
+            (a.ingress.name.as_deref(), a.ingress.loopback),
+            (Some("lo"), Some(true))
+        );
+        assert_eq!(
+            (c.ingress.name.as_deref(), c.ingress.loopback),
+            (Some("eth0"), Some(false))
+        );
+    }
+
     struct Flaky(u32);
     impl PacketSource for Flaky {
         fn next_packet(&mut self) -> Result<Option<Packet<'_>>, CaptureError> {
@@ -578,6 +775,7 @@ mod tests {
                     linktype: LinkType::RAW,
                     data: &[],
                     orig_len: 0,
+                    ingress: PacketIngress::default(),
                 })),
                 _ => Err(CaptureError::Format("boom".into())),
             }
