@@ -5,6 +5,7 @@ members = [
     "crates/robodr-blackbox",
     "crates/robodr-capture",
     "crates/robodr-commission",
+    "crates/robodr-diode",
     "crates/robodr-events",
     "crates/robodr-firewall",
     "crates/robodr-motion",
@@ -43,6 +44,7 @@ robodr-rtps = { path = "crates/robodr-rtps" }
 robodr-blackbox = { path = "crates/robodr-blackbox" }
 robodr-capture = { path = "crates/robodr-capture" }
 robodr-commission = { path = "crates/robodr-commission" }
+robodr-diode = { path = "crates/robodr-diode" }
 robodr-firewall = { path = "crates/robodr-firewall" }
 robodr-motion = { path = "crates/robodr-motion" }
 robodr-ocsf = { path = "crates/robodr-ocsf" }
