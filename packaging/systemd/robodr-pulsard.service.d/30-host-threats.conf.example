@@ -1,0 +1,16 @@
+# EXAMPLE drop-in, not active as shipped. To use it:
+#   install -D -m 0644 30-host-threats.conf.example \
+#       /etc/systemd/system/robodr-pulsard.service.d/30-host-threats.conf
+#   systemctl daemon-reload && systemctl restart robodr-pulsard
+#
+# Needed when [module.robodr-threat-forward] is enabled in pulsar.toml and
+# robodr-agentd has "host_threats": {"socket_mode": "0660", ...}. The
+# forwarder connects to /run/robodr-agentd/host-threats.sock, owned by
+# robodr:robodr. robodr-pulsard runs as root but deliberately without
+# CAP_DAC_OVERRIDE, so it may connect only through the socket's group.
+# agentd still checks the peer with SO_PEERCRED (uid 0 or host_threats.
+# allowed_uids), so other members of the group cannot inject threats.
+# Directory search on /run/robodr-agentd (0750) is covered by the group
+# too (and by CAP_DAC_READ_SEARCH).
+[Service]
+SupplementaryGroups=robodr

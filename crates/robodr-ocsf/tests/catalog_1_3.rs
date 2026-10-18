@@ -172,6 +172,7 @@ const WAVE7_IDS: &[&str] = &[
     "robot.safety_state.writer_overflow",
     "robot.correlate.correlation_state_evicted",
     "robot.agent.evidence_truncated",
+    "robot.host.pulsar_threat",
 ];
 
 #[test]
@@ -197,6 +198,10 @@ fn wave7_ids_have_their_own_entry() {
     assert_eq!(
         rule_info("robot.agent.evidence_truncated").data_source,
         "robodr_agent"
+    );
+    assert_eq!(
+        rule_info("robot.host.pulsar_threat").data_source,
+        "host_runtime"
     );
 }
 

@@ -2457,6 +2457,7 @@ dependencies = [
  "clap-verbosity-flag",
  "pulsar",
  "robodr-sensor-ros2",
+ "robodr-threat-forward",
  "tokio",
 ]
 
@@ -2499,6 +2500,17 @@ dependencies = [
  "pulsar-core",
  "robodr-ros2-pipeline",
  "tokio",
+]
+
+[[package]]
+name = "robodr-threat-forward"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "log",
+ "pulsar-core",
+ "robodr-agentd",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

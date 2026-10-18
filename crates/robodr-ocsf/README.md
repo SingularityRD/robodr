@@ -134,6 +134,7 @@ dedup.insert(v.replay_key());   // replay detection is the consumer's job
 | `robot.safety_state.{undecodable_sample, unmapped_value}` | (own titles, data source `robot_safety_state`) | — |
 | `robot.ros2.profile_state_tampered` | Profile anti-rollback state missing or behind the black box | — |
 | `robot.agent.{evidence_quarantined, correlation_pressure}` | (own titles, data source `robodr_agent`) | — |
+| `robot.host.pulsar_threat` | Host runtime-security detection (Pulsar rule), data source `host_runtime`; the Pulsar rule name and process are in the detail | — |
 | anything else | RoboDR model-profile deviation | — |
 
 The validator applies the catalog of the message's own `contract_version`

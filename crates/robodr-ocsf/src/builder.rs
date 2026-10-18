@@ -325,6 +325,7 @@ fn catalog_1_3_wave7(rule: &str) -> Option<RuleInfo> {
     const CORRELATE: &str = "robodr_correlation";
     const SAFETY: &str = "robot_safety_state";
     const AGENT: &str = "robodr_agent";
+    const HOST: &str = "host_runtime";
     // Small helper so the table below stays one entry per line group.
     const fn e(
         title: &'static str,
@@ -357,6 +358,12 @@ fn catalog_1_3_wave7(rule: &str) -> Option<RuleInfo> {
             "Black-box records cut after the newest mark",
             "Opening the black box found authentic proof that records after its newest integrity mark were removed; treat the evidence store as tampered with.",
             AGENT,
+            &[],
+        ),
+        "robot.host.pulsar_threat" => e(
+            "Host runtime-security detection (Pulsar rule)",
+            "A Pulsar runtime-security rule fired on the robot controller (process, file or network activity of the host operating system); the detail names the Pulsar rule and the process.",
+            HOST,
             &[],
         ),
         // --- robodr-agentd self-health -------------------------------------

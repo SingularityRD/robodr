@@ -232,7 +232,7 @@
             "uid": { "type": "string", "pattern": "^rf1-[0-9a-f]{32}$" },
             "title": { "type": "string", "maxLength": 256, "pattern": "^[ -;=?-_a-~]*$" },
             "desc": { "type": "string", "maxLength": 2048, "pattern": "^[ -;=?-_a-~]*$" },
-            "types": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "enum": ["robot_deviation", "ros2_dds_discovery", "ros2_motion_commands", "robodr", "robodr_correlation", "robot_safety_state", "robodr_agent"] } },
+            "types": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "enum": ["robot_deviation", "ros2_dds_discovery", "ros2_motion_commands", "robodr", "robodr_correlation", "robot_safety_state", "robodr_agent", "host_runtime"] } },
             "first_seen_time": { "type": "integer" },
             "last_seen_time": { "type": "integer" },
             "analytic": {
@@ -265,7 +265,7 @@
                 }
               }
             },
-            "data_sources": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "enum": ["ros2_dds_discovery", "ros2_motion_commands", "robodr", "robodr_correlation", "robot_safety_state", "robodr_agent"] } }
+            "data_sources": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "enum": ["ros2_dds_discovery", "ros2_motion_commands", "robodr", "robodr_correlation", "robot_safety_state", "robodr_agent", "host_runtime"] } }
           }
         },
         "device": {

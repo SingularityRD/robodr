@@ -33,5 +33,6 @@
   },
   "correlation": { "enabled": true, "include_default_rules": true },
   "finding_signing": { "key_file": "/run/credentials/robodr-agentd.service/finding.key" },
+  "host_threats": { "socket_path": "/run/robodr-agentd/host-threats.sock", "socket_mode": "0660" },
   "daemon": { "tick_ms": 1000, "heartbeat_ms": 10000, "silence_ms": 30000 }
 }

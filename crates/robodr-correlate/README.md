@@ -155,10 +155,21 @@ together with them as one set; see `docs/OPERATIONS.md`):
    the deviation's black-box record URI as `evidence_ref`. Self-health issues
    (observe-only) go in without an entity. Correlated findings and the
    engine's own health finding are not fed back.
-3. **Host side.** Not yet: nothing delivers Pulsar threats to agentd, so the
-   host-dependent default rules (`coordinated_intrusion`,
+3. **Host side.** With agentd's `host_threats` section, the Pulsar module
+   `robodr-threat-forward` (registered by `robodr-pulsard`) writes every
+   Pulsar threat except the ROS 2 sensor's own to agentd's peer-checked
+   unix socket, one JSON line each. Each one goes in as
+   `Signal::host(mono_ns, <Pulsar rule name>, <rule severity>)` (the
+   rules-engine puts the rule `name` of `rules/robodr/*.toml` in the
+   threat's description, so the catalog names above match), in the mode of
+   its finding, with `EntityKind::Process` = the pid (not the image: an
+   `execve`, or Pulsar's tracker lag, changes it for one process) and the
+   finding's black-box record as `evidence_ref`. The threat itself is
+   reported as a `robot.host.pulsar_threat` finding, which is not fed again.
+   So the host-dependent default rules (`coordinated_intrusion`,
    `credential_theft`, `trojaned_package_key_access`, `defense_tampering`,
-   `host_process_persistence`) cannot fire in the daemon today.
+   `host_process_persistence`) fire in the daemon. Without `host_threats`
+   they cannot.
 4. **Emit.** Each `CorrelatedFinding` is recorded in full (every
    contributor) as a `robodr.correlated_finding` black-box note, then handed
    to `Agent::handle_external(now, Detector::Sensor, "correlate:<rule>[:<group>]",
@@ -180,8 +191,13 @@ together with them as one set; see `docs/OPERATIONS.md`):
 - Unit-scoped rules (`group_by: null`) join host and network signals that
   share no entity. RoboDR has no process↔socket attribution yet, so on a
   busy unit two unrelated events inside a window will correlate.
-- Host signals are synthetic in the engine's tests, because nothing delivers
-  Pulsar threats to agentd yet; the daemon tests exercise network-only rules
-  (discovery flood, a per-IP sequence) on synthetic captures. Throughput was not benchmarked. The cost per signal
+- Host signals are synthetic in the engine's tests. The daemon tests feed
+  host threats through the real socket and parser (a test plays the
+  forwarder) and see `coordinated_intrusion` (with a synthetic capture),
+  `host_process_persistence` and `defense_tampering` fire; the forwarder's
+  own tests cover its line format, queue and reconnects without a running
+  Pulsar. Whether real Pulsar rule hits arrive end to end depends on eBPF
+  loading on the target kernel (see `docs/PULSAR-INTEGRATION.md`).
+  Throughput was not benchmarked. The cost per signal
   is O(rules × groups-per-signal × steps), plus an O(groups) sweep whenever
   a rule's table is full.

@@ -90,6 +90,8 @@ if install_bin robodr-pulsard usr/sbin 0; then
     install -D -m 0644 "$here/systemd/robodr-pulsard.service" "$pkg/$units/robodr-pulsard.service"
     install -D -m 0644 "$here/systemd/robodr-pulsard.service.d/10-cap-sys-admin.conf.example" \
         "$pkg/usr/share/doc/robodr/examples/robodr-pulsard.service.d/10-cap-sys-admin.conf.example"
+    install -D -m 0644 "$here/systemd/robodr-pulsard.service.d/30-host-threats.conf.example" \
+        "$pkg/usr/share/doc/robodr/examples/robodr-pulsard.service.d/30-host-threats.conf.example"
     # Default config: base header + the RoboDR sensor sections (a conffile).
     install -d -m 0750 "$pkg/etc/robodr"
     cat "$here/etc/pulsar.base.toml" "$root/config/robodr.toml.example" >"$pkg/etc/robodr/pulsar.toml"
