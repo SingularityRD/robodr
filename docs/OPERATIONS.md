@@ -783,7 +783,8 @@ key credential) and passes `--check-config` when copied verbatim.
 `trust_roots` and `revocation_list` (from the trust-root ceremony) and
 `finding_signing`, whose key reaches the daemon only through the drop-in
 `robodr-agentd.service.d/20-finding-key.conf.example` (install the drop-in
-and the key together, or the unit does not start). Copy the keys you need
+and the key together, or the unit does not start), and `control_plane`,
+which needs the SOC's public key file (below). Copy the keys you need
 from it once their files exist, and check every edit with
 `robodr-agentd --config /etc/robodr/agentd.json --check-config`.
 
@@ -900,6 +901,54 @@ Give the `.pub` to the SOC's finding keyring for this unit id. Across the
 diode the per-finding signature is **not** carried (the batch is signed
 instead; contract §8), so diode-side consumers must verify in `Optional`
 mode.
+
+**Control-plane API (`control_plane`, optional, off by default).** Lets a
+SOC (AutoSecOps) *request* one of six actions on this robot
+(`restrict_motion`, `quarantine_node`, `isolate_network`, `safe_pause`,
+`request_safe_state`, `rollback_config`; contract
+`docs/contracts/robot-edr.control-plane.md`). agentd judges each request
+against the safety state at that moment and the response policy, records it
+in the black box and answers. **Nothing is executed in this release:** an
+accepted request is answered `recorded_not_executed`, a refused one
+`refused` with a reason (always while the e-stop or safe state is active,
+and for everything while the policy is not OEM-validated). Set it up:
+
+```sh
+# On the SOC side, once: the SOC signing key (keep the secret there).
+robodr-blackbox keygen --out soc-autosecops.key --key-id soc:autosecops:1
+# Carry soc-autosecops.key.pub to every robot (vetted media):
+sudo install -D -o root -g root -m 0644 soc-autosecops.key.pub /etc/robodr/soc/autosecops.pub
+# agentd.json (socket under agentd's RuntimeDirectory; TCP stays on loopback):
+#   "control_plane": { "unix_socket": "/run/robodr-agentd/control.sock",
+#                      "soc_keys": ["/etc/robodr/soc/autosecops.pub"] }
+sudo robodr-agentd --config /etc/robodr/agentd.json --check-config
+sudo systemctl restart robodr-agentd
+```
+
+- The SOC key file must be a public Ed25519 key file owned by root (or
+  `robodr`), not writable by group or others, not a symlink; a `device_id`
+  in it must be this robot. Several SOC keys (rotation) may be listed; every
+  request names its key id. Never list the robot's own black-box or finding
+  key (refused).
+- The SOC signs every request (contract §2) and needs a clock within
+  `max_clock_skew_s` (default 30 s) of the robot's: run NTP on both, or
+  requests are refused `stale_timestamp`.
+- **Transport.** agentd speaks plain HTTP. Prefer the unix socket (a local
+  TLS terminator or SSH forward in front of it) or `"listen_tcp":
+  "127.0.0.1:8787"` behind a TLS terminator; the unit's `IPAddressDeny=any`
+  then needs a drop-in `[Service]` / `IPAddressAllow=localhost`. A
+  non-loopback address needs `"allow_remote": true` and is warned about:
+  requests are authenticated, not confidential.
+- With `finding_signing`, every answer carries `X-RoboDR-Answer-Signature`
+  (the finding key): give the SOC the finding `.pub` it already uses for
+  `robodr-finding-sig`.
+- Watch `status.json` `control_plane` (`unauthenticated`,
+  `last_auth_failure`, `recorded_not_executed`, `refused`, `busy`,
+  `rate_limited`) and the findings `robot.agent.control_plane_unauthenticated`
+  (High: someone without the key is trying) and
+  `robot.agent.control_plane_invalid` (Medium: the SOC sent something the API
+  never allows). Each decision is a `robodr.control_plane_request` note in
+  the black box with the SOC's signature, which re-verifies offline.
 
 **Black-box upkeep.** Every tick writes the black box's `head.json`
 high-water mark when records were added since the last one. If the
@@ -1306,6 +1355,9 @@ The package never deletes evidence or keys, not even on `apt purge`.
 | Critical `robot.agent.evidence_quarantined` / `robot.agent.evidence_truncated` | the black-box directory was edited (stray or cut segment files, records cut after the newest mark) | section 6.4: preserve the whole `<blackbox>` directory, treat as tampering |
 | `finding_signing.key_file ... black-box key` / `must be an ed25519 key` | finding key reused or HMAC | section 6.4: generate a dedicated Ed25519 key |
 | `correlation rules: ...` at start | site rule file invalid or duplicates a shipped id | fix the file, or `--check-config` to see every problem |
+| SOC gets 401 `stale_timestamp` / `bad_signature` from the control plane | clocks apart, or the request was signed for another robot id / rewritten by a proxy | section 6.4 "Control-plane API": NTP on both sides; the proxy must forward target and body unchanged |
+| every control-plane request `refused` `observe_mode` | profile not enforced or policy not OEM-validated | section 5; the API never acts beyond what the policy allows |
+| High `robot.agent.control_plane_unauthenticated` | requests without a valid SOC signature | check `status.json` `control_plane.last_auth_failure`; treat repeated ones as an attempt to reach the robot |
 | every finding `[observe-only]` | profile unlocked, missing or invalid | section 5 |
 | Critical `robot.ros2.profile_state_tampered` | anti-rollback state file deleted or rewritten (or agentd stopped mid operator rollback) | section 5.1: investigate; reinstall the recorded profile or roll back with `allow_rollback` |
 | `revocation list ... rollback refused` / `now missing` | an older list, or none, replaced the accepted one | section 5.3: install the newest list |

@@ -53,6 +53,12 @@ pub mod rules {
     pub const EVIDENCE_TRUNCATED: &str = "robot.agent.evidence_truncated";
     /// The correlation engine evicted or refused pending state.
     pub const CORRELATION_PRESSURE: &str = "robot.agent.correlation_pressure";
+    /// Control-plane requests that failed authentication (bad or missing
+    /// signature, unknown key, stale timestamp, replayed nonce).
+    pub const CONTROL_PLANE_UNAUTHENTICATED: &str = "robot.agent.control_plane_unauthenticated";
+    /// Authenticated control-plane requests refused as invalid (unknown
+    /// action, a parameter the class does not take, an override).
+    pub const CONTROL_PLANE_INVALID: &str = "robot.agent.control_plane_invalid";
 }
 
 /// Thresholds (milliseconds).

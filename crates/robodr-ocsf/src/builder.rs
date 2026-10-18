@@ -360,6 +360,18 @@ fn catalog_1_3_wave7(rule: &str) -> Option<RuleInfo> {
             AGENT,
             &[],
         ),
+        "robot.agent.control_plane_unauthenticated" => e(
+            "Control-plane request failed authentication",
+            "The robot's control-plane API refused requests that did not carry a valid SOC signature (missing or bad signature, unknown key, stale timestamp or replayed nonce); nothing was judged or executed.",
+            AGENT,
+            &[],
+        ),
+        "robot.agent.control_plane_invalid" => e(
+            "Invalid control-plane action request refused",
+            "The robot's control-plane API refused authenticated requests for an action, parameter, time limit or authority it never allows; each was recorded in the black box and nothing was executed.",
+            AGENT,
+            &[],
+        ),
         "robot.host.pulsar_threat" => e(
             "Host runtime-security detection (Pulsar rule)",
             "A Pulsar runtime-security rule fired on the robot controller (process, file or network activity of the host operating system); the detail names the Pulsar rule and the process.",

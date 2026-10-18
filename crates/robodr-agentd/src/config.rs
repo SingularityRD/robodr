@@ -94,6 +94,11 @@
 //!   `{"socket_path": "/run/robodr-agentd/host-threats.sock"}`, the socket
 //!   the `robodr-threat-forward` Pulsar module writes Pulsar threats to (see
 //!   [`crate::host`]). Its path must differ from every other socket input.
+//! * `control_plane` (optional, [`crate::control::ControlPlaneSection`]; off
+//!   when absent): the SOC action-request API, `listen_tcp` (loopback unless
+//!   `allow_remote`) and / or `unix_socket`, `soc_keys` (Ed25519 public key
+//!   files, not group/other-writable, not this robot's own keys). Requests
+//!   are judged and recorded, never executed; see [`crate::control`].
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -220,6 +225,10 @@ pub struct DaemonConfig {
     /// `None` = no host-side signals.
     #[serde(default)]
     pub host_threats: Option<crate::host::HostThreatsSection>,
+    /// The control-plane action API (see [`crate::control`]); `None` (the
+    /// default) = no listener.
+    #[serde(default)]
+    pub control_plane: Option<crate::control::ControlPlaneSection>,
 }
 
 /// `correlation`: the `robodr-correlate` engine over every finding the
@@ -669,6 +678,8 @@ pub struct Resolved {
     pub finding_key: Option<(KeyBytes, String)>,
     /// The validated host-threat socket, if configured.
     pub host_threats: Option<crate::host::HostThreatsSpec>,
+    /// The validated control-plane API (listeners, SOC keys), if configured.
+    pub control_plane: Option<crate::control::ControlPlaneSpec>,
     /// Non-fatal warnings to log at start.
     pub warnings: Vec<String>,
 }
@@ -1155,6 +1166,60 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
             Some(finding_key(&fs.key_file, &key, key_id.as_deref())?)
         }
     };
+    let control_plane = match &config.control_plane {
+        None => None,
+        Some(c) => {
+            let mut own: Vec<&str> = Vec::new();
+            own.extend(key_id.as_deref());
+            own.extend(finding_key.as_ref().map(|(_, id)| id.as_str()));
+            let spec = c.resolve(&config.robot.id, &own)?;
+            if let Some(p) = &spec.unix {
+                let clash =
+                    config.event_inputs.iter().any(
+                        |i| matches!(i, EventInputConfig::UnixSocket { path, .. } if path == p),
+                    ) || safety_feed
+                        .as_ref()
+                        .and_then(|f| f.socket.as_ref())
+                        .is_some_and(|s| s.path == *p)
+                        || host_threats.as_ref().is_some_and(|h| h.path == *p);
+                if clash {
+                    return Err(
+                        "control_plane.unix_socket is also an event_inputs, safety_feed or \
+                         host_threats socket path"
+                            .into(),
+                    );
+                }
+            }
+            for p in spec.unix.iter().chain(c.soc_keys.iter()) {
+                for (what, d) in [
+                    ("spool.dir", &config.spool.dir),
+                    ("blackbox.dir", &config.blackbox.dir),
+                ] {
+                    if resolve_path(p).starts_with(resolve_path(d)) {
+                        return Err(format!(
+                            "control_plane: {} must not be inside {what}",
+                            sanitize_path(&p.display().to_string())
+                        ));
+                    }
+                }
+            }
+            if !policy.oem_validated {
+                warnings.push(
+                    "control_plane: the response policy is not OEM-validated, so every action \
+                     request is refused (observe_mode)"
+                        .into(),
+                );
+            }
+            if spec.tcp.is_some_and(|a| !a.ip().is_loopback()) {
+                warnings.push(
+                    "control_plane.listen_tcp is not a loopback address: requests are signed but \
+                     travel in clear text, and answers are only signed with finding_signing"
+                        .into(),
+                );
+            }
+            Some(spec)
+        }
+    };
     match &config.blackbox.head_anchor {
         None => warnings.push(
             "blackbox.head_anchor is not configured: the black box is not anchored; a cut of \
@@ -1251,6 +1316,7 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         correlation,
         finding_key,
         host_threats,
+        control_plane,
         warnings,
     })
 }

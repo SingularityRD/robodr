@@ -12,6 +12,33 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Added
 
+- Control-plane action API in `robodr-agentd` (`control_plane`, off by
+  default; `src/control/`, contract
+  `docs/contracts/robot-edr.control-plane.md`, API
+  `robodr-control-plane/v1`): the four calls of AutoSecOps' `v1-draft`
+  (`GET /api/v1/robots/{id}`, `POST .../action-requests`, `GET
+  .../action-requests/{rid}`, `POST .../{rid}/revert`) over a bounded,
+  std-only HTTP/1.1 listener on a unix socket and / or a loopback TCP
+  address. Requests are Ed25519-signed by a configured SOC key (method,
+  exact target, robot id, key id, timestamp, nonce, body hash; clock-skew
+  window, fail-closed nonce cache, per-key rate limit); six allow-listed
+  action classes with their own parameters and TTL rules, no motion command
+  or override; each request is judged with the response policy against the
+  current safety state (refused while the safety system is engaged, in
+  observe mode, for motion-affecting steps under human command or in
+  take-off / landing, `rollback_config` unless idle, above the policy's
+  ceiling, a cap above the envelope, a failed invariant check), recorded as
+  a signed `robodr.control_plane_request` note (the SOC signature
+  re-verifies offline) and answered `refused` or **`recorded_not_executed`**
+  (`"executed": false`): the only executor records, nothing reaches the
+  robot. With `finding_signing` answers are signed with the finding key.
+  New observe-only findings `robot.agent.control_plane_unauthenticated`
+  (High) and `robot.agent.control_plane_invalid` (Medium) (correlate catalog
+  and OCSF 1.3 entries); `status.json` / heartbeat `control_plane` counters;
+  `config/agentd.full.example.json` gains the section. Conformance: run
+  against AutoSecOps' own executor and client (branch `robodr-integration`)
+  with a request-signing transport: the client must learn the
+  `recorded_not_executed` status and Ed25519 request signing (contract §9).
 - Second set of real ROS 2 Jazzy lab captures
   (`fixtures/captures/ros2-jazzy/`, README "Second set"; tooling in
   `tools/lab-capture/`: `capture_gz.sh`, `capture_frag.sh`,

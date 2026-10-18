@@ -1,0 +1,2017 @@
+//! The action-request API: strict request bodies (an allow-list of action
+//! classes and parameters, the TTL rules), the Cyber-Jidoka judgment of an
+//! action against the robot's current safety state and response policy,
+//! the bounded request store and the answers.
+//!
+//! The SOC only *requests*. `authority` must be `"request"`; no override,
+//! force or motion field exists (an unknown field refuses the body); the
+//! strongest action is `request_safe_state`, a request the platform's
+//! safety controller decides on. An accepted request is offered to an
+//! [`ActionExecutor`]; the only one in this crate, [`RecordingExecutor`],
+//! executes nothing, so every accepted request is answered
+//! [`Status::RecordedNotExecuted`] with `"executed": false`.
+
+use std::collections::{HashMap, VecDeque};
+
+use robodr_events::profile::Profile;
+use robodr_events::Severity;
+use robodr_responder::{
+    check_invariants, OperationalContext, Rationale, ResponseAction, ResponsePlan, ResponsePolicy,
+    RestrictTarget, SafetyState, Step,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use super::auth::API_VERSION;
+
+/// Longest time a time-limited action may stand (24 h).
+pub const MAX_TTL_SECONDS: u64 = 86_400;
+/// Bounds of the free-text fields (characters).
+pub const MAX_REASON_CHARS: usize = 500;
+pub const MAX_REQUESTED_BY_CHARS: usize = 100;
+/// Longest request id (`[A-Za-z0-9._:-]`).
+pub const MAX_REQUEST_ID_LEN: usize = 128;
+/// Highest speed cap a `restrict_motion` may name (m/s or rad/s).
+pub const MAX_SPEED_CAP: f64 = 10.0;
+/// The rule name of the plan an accepted request is checked as (internal:
+/// never a finding, so not a `robot.*` rule id).
+pub const PLAN_RULE: &str = "control_plane:action_request";
+
+/// The six action classes (AutoSecOps `robot_<name>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionKind {
+    RestrictMotion,
+    QuarantineNode,
+    IsolateNetwork,
+    SafePause,
+    RequestSafeState,
+    RollbackConfig,
+}
+
+impl ActionKind {
+    pub const ALL: [ActionKind; 6] = [
+        ActionKind::RestrictMotion,
+        ActionKind::QuarantineNode,
+        ActionKind::IsolateNetwork,
+        ActionKind::SafePause,
+        ActionKind::RequestSafeState,
+        ActionKind::RollbackConfig,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ActionKind::RestrictMotion => "restrict_motion",
+            ActionKind::QuarantineNode => "quarantine_node",
+            ActionKind::IsolateNetwork => "isolate_network",
+            ActionKind::SafePause => "safe_pause",
+            ActionKind::RequestSafeState => "request_safe_state",
+            ActionKind::RollbackConfig => "rollback_config",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|a| a.as_str() == s)
+    }
+
+    /// Needs a `ttl_seconds` (1..=[`MAX_TTL_SECONDS`]); the others refuse one.
+    pub fn time_limited(self) -> bool {
+        matches!(
+            self,
+            ActionKind::RestrictMotion | ActionKind::IsolateNetwork
+        )
+    }
+
+    /// Can be reverted by a later request (an operator restarts after a
+    /// safe state; a rollback is not undone).
+    pub fn reversible(self) -> bool {
+        !matches!(
+            self,
+            ActionKind::RequestSafeState | ActionKind::RollbackConfig
+        )
+    }
+
+    /// The Cyber-Jidoka ladder step the action stands on.
+    pub fn step(self) -> Step {
+        match self {
+            ActionKind::QuarantineNode
+            | ActionKind::IsolateNetwork
+            | ActionKind::RollbackConfig => Step::Restrict,
+            ActionKind::RestrictMotion => Step::LimitMotion,
+            ActionKind::SafePause => Step::SafePause,
+            ActionKind::RequestSafeState => Step::RequestSafeState,
+        }
+    }
+
+    /// Parameters the action may carry.
+    pub fn allowed_params(self) -> &'static [&'static str] {
+        match self {
+            ActionKind::RestrictMotion => {
+                &["max_linear_speed", "max_joint_speed", "workspace_zone"]
+            }
+            ActionKind::QuarantineNode => &["participant_guid", "node"],
+            ActionKind::RollbackConfig => &["config", "to_version"],
+            _ => &[],
+        }
+    }
+}
+
+/// A refused call: HTTP status, stable code and a message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiError {
+    pub status: u16,
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl ApiError {
+    pub fn new(status: u16, code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            code,
+            message: message.into(),
+        }
+    }
+
+    pub fn body(&self) -> Value {
+        error_body(self.code, &self.message)
+    }
+}
+
+pub fn error_body(code: &str, message: &str) -> Value {
+    json!({"error": {"code": code, "message": message}})
+}
+
+fn bad(code: &'static str, message: impl Into<String>) -> ApiError {
+    ApiError::new(400, code, message)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSubmit {
+    request_id: String,
+    action: String,
+    #[serde(default)]
+    parameters: Option<RawParams>,
+    #[serde(default)]
+    ttl_seconds: Option<u64>,
+    #[serde(default)]
+    reason: Option<String>,
+    requested_by: String,
+    source: String,
+    authority: String,
+}
+
+/// Every parameter any action may carry; anything else refuses the body.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawParams {
+    max_linear_speed: Option<f64>,
+    max_joint_speed: Option<f64>,
+    workspace_zone: Option<String>,
+    participant_guid: Option<String>,
+    node: Option<String>,
+    config: Option<String>,
+    to_version: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRevert {
+    #[serde(default)]
+    reason: Option<String>,
+    requested_by: String,
+}
+
+/// The validated parameters of an action.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Params {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_linear_speed: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_joint_speed: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_zone: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub participant_guid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_version: Option<String>,
+}
+
+/// One validated action request.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ActionRequest {
+    pub request_id: String,
+    pub action: ActionKind,
+    pub parameters: Params,
+    pub ttl_seconds: Option<u64>,
+    pub reason: String,
+    pub requested_by: String,
+    pub source: String,
+}
+
+impl ActionRequest {
+    /// What makes two requests with one id the same request.
+    pub fn digest(&self) -> String {
+        let canon = serde_json::to_string(&(self.action, &self.parameters, self.ttl_seconds))
+            .unwrap_or_default();
+        robodr_blackbox::crypto::to_hex(&robodr_blackbox::crypto::sha256(canon.as_bytes()))
+    }
+}
+
+/// A validated revert body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RevertRequest {
+    pub reason: String,
+    pub requested_by: String,
+}
+
+fn name_ok(s: &str, max: usize) -> bool {
+    !s.is_empty()
+        && s.len() <= max
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// `[A-Za-z0-9._:-]{1,128}`.
+pub fn request_id_ok(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_REQUEST_ID_LEN
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b':'))
+}
+
+/// A plain ROS 2 node name: optional leading `/`, 1..=16 segments of
+/// `[A-Za-z][A-Za-z0-9_]{0,63}`.
+pub fn ros_name_ok(s: &str) -> bool {
+    let body = s.strip_prefix('/').unwrap_or(s);
+    let segs: Vec<&str> = body.split('/').collect();
+    !body.is_empty()
+        && segs.len() <= 16
+        && segs.iter().all(|seg| {
+            let mut b = seg.bytes();
+            seg.len() <= 64
+                && b.next().is_some_and(|c| c.is_ascii_alphabetic())
+                && b.all(|c| c.is_ascii_alphanumeric() || c == b'_')
+        })
+}
+
+fn guid_ok(s: &str) -> bool {
+    (s.len() == 24 || s.len() == 32)
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn text(what: &str, s: &str, max_chars: usize, required: bool) -> Result<String, ApiError> {
+    if required && s.trim().is_empty() {
+        return Err(bad("invalid_field", format!("{what} is empty")));
+    }
+    if s.chars().count() > max_chars {
+        return Err(bad(
+            "invalid_field",
+            format!("{what} is longer than {max_chars} characters"),
+        ));
+    }
+    if s.chars().any(char::is_control) {
+        return Err(bad(
+            "invalid_field",
+            format!("{what} contains control characters"),
+        ));
+    }
+    Ok(s.to_string())
+}
+
+fn json_error(e: &serde_json::Error) -> ApiError {
+    let m = e.to_string();
+    let code = if m.contains("unknown field") {
+        "unknown_field"
+    } else if m.contains("duplicate field") {
+        "duplicate_field"
+    } else {
+        "invalid_request"
+    };
+    bad(code, robodr_ros2_pipeline::sanitize(&m))
+}
+
+/// The body as UTF-8 text holding a JSON object whose `parameters`, if
+/// any, is an object (serde would also take a struct written as an array).
+fn object_text(body: &[u8]) -> Result<&str, ApiError> {
+    let t =
+        std::str::from_utf8(body).map_err(|_| bad("invalid_request", "the body is not UTF-8"))?;
+    let v: Value = serde_json::from_str(t).map_err(|e| json_error(&e))?;
+    let params_ok = v
+        .get("parameters")
+        .is_none_or(|p| p.is_object() || p.is_null());
+    if !v.is_object() || !params_ok {
+        return Err(bad(
+            "invalid_request",
+            "the body must be a JSON object (and parameters an object)",
+        ));
+    }
+    Ok(t)
+}
+
+fn speed(what: &str, v: Option<f64>) -> Result<Option<f64>, ApiError> {
+    match v {
+        None => Ok(None),
+        Some(x) if x.is_finite() && x > 0.0 && x <= MAX_SPEED_CAP => Ok(Some(x)),
+        Some(_) => Err(bad(
+            "invalid_parameter",
+            format!(
+                "{what} must be in (0, {MAX_SPEED_CAP}]: a cap of 0 is a stop, ask for safe_pause \
+                 instead"
+            ),
+        )),
+    }
+}
+
+/// Parse and validate a submit body.
+pub fn parse_submit(body: &[u8]) -> Result<ActionRequest, ApiError> {
+    let text_body = object_text(body)?;
+    let raw: RawSubmit = serde_json::from_str(text_body).map_err(|e| json_error(&e))?;
+    if raw.authority != "request" {
+        return Err(bad(
+            "authority_not_allowed",
+            "authority must be \"request\": the SOC requests, the robot decides; there is no \
+             override",
+        ));
+    }
+    let action = ActionKind::parse(&raw.action).ok_or_else(|| {
+        bad(
+            "unknown_action",
+            format!(
+                "action {:?} is not one of {:?}",
+                robodr_ros2_pipeline::sanitize(&raw.action),
+                ActionKind::ALL.map(ActionKind::as_str)
+            ),
+        )
+    })?;
+    if !request_id_ok(&raw.request_id) {
+        return Err(bad(
+            "invalid_request_id",
+            format!("request_id must match [A-Za-z0-9._:-]{{1,{MAX_REQUEST_ID_LEN}}}"),
+        ));
+    }
+    let p = raw.parameters.unwrap_or_default();
+    let present: Vec<&str> = [
+        ("max_linear_speed", p.max_linear_speed.is_some()),
+        ("max_joint_speed", p.max_joint_speed.is_some()),
+        ("workspace_zone", p.workspace_zone.is_some()),
+        ("participant_guid", p.participant_guid.is_some()),
+        ("node", p.node.is_some()),
+        ("config", p.config.is_some()),
+        ("to_version", p.to_version.is_some()),
+    ]
+    .into_iter()
+    .filter(|(_, set)| *set)
+    .map(|(n, _)| n)
+    .collect();
+    let stray: Vec<&str> = present
+        .iter()
+        .copied()
+        .filter(|n| !action.allowed_params().contains(n))
+        .collect();
+    if !stray.is_empty() {
+        return Err(bad(
+            "parameter_not_allowed",
+            format!("{} takes no parameter {stray:?}", action.as_str()),
+        ));
+    }
+    let mut params = Params::default();
+    match action {
+        ActionKind::RestrictMotion => {
+            params.max_linear_speed = speed("max_linear_speed", p.max_linear_speed)?;
+            params.max_joint_speed = speed("max_joint_speed", p.max_joint_speed)?;
+            if let Some(z) = p.workspace_zone {
+                if !name_ok(&z, 64) {
+                    return Err(bad(
+                        "invalid_parameter",
+                        "workspace_zone must match [A-Za-z0-9._-]{1,64}",
+                    ));
+                }
+                params.workspace_zone = Some(z);
+            }
+            if present.is_empty() {
+                return Err(bad(
+                    "invalid_parameter",
+                    "restrict_motion needs max_linear_speed, max_joint_speed or workspace_zone",
+                ));
+            }
+        }
+        ActionKind::QuarantineNode => match (p.participant_guid, p.node) {
+            (Some(g), None) if guid_ok(&g) => params.participant_guid = Some(g),
+            (None, Some(n)) if ros_name_ok(&n) => params.node = Some(n),
+            (Some(_), None) => {
+                return Err(bad(
+                    "invalid_parameter",
+                    "participant_guid must be 24 or 32 lower-case hex",
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(bad(
+                    "invalid_parameter",
+                    "node must be a plain ROS 2 node name",
+                ))
+            }
+            _ => {
+                return Err(bad(
+                    "invalid_parameter",
+                    "quarantine_node needs exactly one of participant_guid, node",
+                ))
+            }
+        },
+        ActionKind::RollbackConfig => {
+            let kind = p.config.unwrap_or_else(|| "profile".into());
+            if kind != "profile" && kind != "program" {
+                return Err(bad(
+                    "invalid_parameter",
+                    "config must be profile or program",
+                ));
+            }
+            params.config = Some(kind);
+            if let Some(v) = p.to_version {
+                if !name_ok(&v, 64) {
+                    return Err(bad(
+                        "invalid_parameter",
+                        "to_version must match [A-Za-z0-9._-]{1,64}",
+                    ));
+                }
+                params.to_version = Some(v);
+            }
+        }
+        _ => {}
+    }
+    match (action.time_limited(), raw.ttl_seconds) {
+        (true, None) => {
+            return Err(bad(
+                "ttl_required",
+                format!("{} is time-limited: give ttl_seconds", action.as_str()),
+            ))
+        }
+        (true, Some(t)) if !(1..=MAX_TTL_SECONDS).contains(&t) => {
+            return Err(bad(
+                "ttl_out_of_range",
+                format!("ttl_seconds must be 1..={MAX_TTL_SECONDS}"),
+            ))
+        }
+        (false, Some(_)) => {
+            return Err(bad(
+                "ttl_not_allowed",
+                format!(
+                    "{} does not expire: lifting it is a person's call; remove ttl_seconds",
+                    action.as_str()
+                ),
+            ))
+        }
+        _ => {}
+    }
+    let source = raw.source;
+    if source.is_empty()
+        || source.len() > 32
+        || !source
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+    {
+        return Err(bad("invalid_field", "source must match [a-z0-9_-]{1,32}"));
+    }
+    Ok(ActionRequest {
+        request_id: raw.request_id,
+        action,
+        parameters: params,
+        ttl_seconds: raw.ttl_seconds,
+        reason: text(
+            "reason",
+            raw.reason.as_deref().unwrap_or(""),
+            MAX_REASON_CHARS,
+            false,
+        )?,
+        requested_by: text(
+            "requested_by",
+            &raw.requested_by,
+            MAX_REQUESTED_BY_CHARS,
+            true,
+        )?,
+        source,
+    })
+}
+
+/// Parse and validate a revert body.
+pub fn parse_revert(body: &[u8]) -> Result<RevertRequest, ApiError> {
+    let t = object_text(body)?;
+    let raw: RawRevert = serde_json::from_str(t).map_err(|e| json_error(&e))?;
+    Ok(RevertRequest {
+        reason: text(
+            "reason",
+            raw.reason.as_deref().unwrap_or(""),
+            MAX_REASON_CHARS,
+            false,
+        )?,
+        requested_by: text(
+            "requested_by",
+            &raw.requested_by,
+            MAX_REQUESTED_BY_CHARS,
+            true,
+        )?,
+    })
+}
+
+/// The smallest speed limits of the profile's motion envelopes, to tell a
+/// restriction from a relaxation.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct EnvelopeCaps {
+    pub linear: Option<f64>,
+    pub joint: Option<f64>,
+}
+
+impl EnvelopeCaps {
+    pub fn of(profile: &Profile) -> Self {
+        let min = |f: fn(&robodr_events::profile::Envelope) -> Option<f64>| {
+            profile
+                .motion_envelopes
+                .values()
+                .filter_map(f)
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .reduce(f64::min)
+        };
+        Self {
+            linear: min(|e| e.max_linear_speed),
+            joint: min(|e| e.max_joint_speed),
+        }
+    }
+}
+
+/// What the judgment sees.
+#[derive(Debug, Clone, Copy)]
+pub struct Situation<'a> {
+    pub state: SafetyState,
+    pub context: &'a OperationalContext,
+    pub policy: &'a ResponsePolicy,
+    pub caps: EnvelopeCaps,
+}
+
+/// A refusal: a stable code, a reason and the safety state judged against.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Refusal {
+    pub code: &'static str,
+    pub reason: String,
+    pub safety_state: SafetyState,
+}
+
+/// An accepted request: its ladder step and the plan actions it stands for.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Accepted {
+    pub step: Step,
+    pub actions: Vec<ResponseAction>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Decision {
+    Accept(Accepted),
+    Refuse(Refusal),
+}
+
+/// The highest step the policy's matrix allows in `state` for any severity.
+pub fn policy_ceiling(policy: &ResponsePolicy, state: SafetyState) -> Step {
+    let r = policy.matrix.row(state);
+    [r.low, r.medium, r.high, r.critical]
+        .into_iter()
+        .max()
+        .unwrap_or(Step::Record)
+}
+
+fn step_name(s: Step) -> &'static str {
+    match s {
+        Step::Record => "record",
+        Step::Restrict => "restrict",
+        Step::LimitMotion => "limit_motion",
+        Step::SafePause => "safe_pause",
+        Step::RequestSafeState => "request_safe_state",
+    }
+}
+
+fn state_name(s: SafetyState) -> String {
+    serde_json::to_value(s)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// Judge one request against the robot's current safety state, its
+/// operational context and the response policy (Cyber-Jidoka), in order:
+///
+/// 1. the safety system is engaged (e-stop / safe state): refused, the
+///    safety system has authority and gets no competing request;
+/// 2. observe mode (profile not locked or policy not OEM-validated):
+///    refused, RoboDR only records;
+/// 3. a motion-affecting step (`limit_motion` and up) while a human holds
+///    command (teleop / manual) or in take-off / landing: refused, the
+///    person in command decides;
+/// 4. `rollback_config` while the robot is not `idle`: refused (no program
+///    or profile change in motion);
+/// 5. a step above what the policy's matrix allows in this state for any
+///    severity: refused;
+/// 6. a `restrict_motion` cap above the profile's envelope: refused (it
+///    would not restrict);
+/// 7. the plan it stands for must pass `robodr_responder::check_invariants`
+///    (as a human-approved plan: the SOC's approval).
+///
+/// An `unknown` safety state does not refuse by itself: the planner needs a
+/// human's approval there, and a SOC request is human-approved (noted).
+pub fn judge(req: &ActionRequest, key_id: &str, s: &Situation<'_>) -> Decision {
+    let refuse = |code: &'static str, reason: String| {
+        Decision::Refuse(Refusal {
+            code,
+            reason,
+            safety_state: s.state,
+        })
+    };
+    let step = req.action.step();
+    let name = state_name(s.state);
+    if s.state.safety_system_engaged() {
+        return refuse(
+            "safety_system_engaged",
+            format!(
+                "the safety system is engaged ({name}): it has authority, RoboDR sends it no \
+                 competing request"
+            ),
+        );
+    }
+    if !s.context.profile_locked {
+        return refuse(
+            "observe_mode",
+            "the model profile is not locked and enforced: RoboDR runs observe-only and only \
+             records"
+                .into(),
+        );
+    }
+    if !s.policy.oem_validated {
+        return refuse(
+            "observe_mode",
+            "the response policy is not OEM-validated: RoboDR runs observe-only and only records"
+                .into(),
+        );
+    }
+    if step.is_motion_affecting() {
+        if s.context.control.human_in_command() {
+            return refuse(
+                "human_in_command",
+                "a person is commanding motion (teleop / manual): motion-affecting requests are \
+                 theirs to make"
+                    .into(),
+            );
+        }
+        if s.context.phase.is_transient() {
+            return refuse(
+                "transient_phase",
+                "take-off / landing: interrupting motion now is itself a hazard".into(),
+            );
+        }
+    }
+    if req.action == ActionKind::RollbackConfig && s.state != SafetyState::Idle {
+        return refuse(
+            "requires_idle",
+            format!("a configuration or program rollback needs an idle robot (now {name})"),
+        );
+    }
+    let ceiling = policy_ceiling(s.policy, s.state);
+    if step > ceiling {
+        return refuse(
+            "above_policy",
+            format!(
+                "the response policy allows at most {} while {name}; {} is {}",
+                step_name(ceiling),
+                req.action.as_str(),
+                step_name(step)
+            ),
+        );
+    }
+    let mut notes = Vec::new();
+    let mut actions = vec![ResponseAction::Record];
+    match req.action {
+        ActionKind::RestrictMotion => {
+            let p = &req.parameters;
+            let mut factor: f64 = 1.0;
+            for (what, want, cap) in [
+                ("max_linear_speed", p.max_linear_speed, s.caps.linear),
+                ("max_joint_speed", p.max_joint_speed, s.caps.joint),
+            ] {
+                let Some(want) = want else { continue };
+                match cap {
+                    Some(cap) if want > cap => {
+                        return refuse(
+                            "not_a_restriction",
+                            format!(
+                                "{what} {want} is above the profile's envelope ({cap}): it would \
+                                 not restrict"
+                            ),
+                        )
+                    }
+                    Some(cap) => factor = factor.min(want / cap),
+                    None => notes.push(format!(
+                        "{what}: the profile has no envelope to compare with; the cap is \
+                         recorded as given"
+                    )),
+                }
+            }
+            if !(factor.is_finite() && factor > 0.0 && factor <= 1.0) {
+                return refuse(
+                    "invalid_parameter",
+                    "the requested caps do not give a valid envelope scale".into(),
+                );
+            }
+            if let Some(z) = &p.workspace_zone {
+                notes.push(format!(
+                    "workspace_zone {z}: recorded with the request (the plan vocabulary has no \
+                     zone; the envelope scale covers speeds only)"
+                ));
+            }
+            actions.push(ResponseAction::LimitMotion { factor });
+        }
+        ActionKind::QuarantineNode => actions.push(ResponseAction::Restrict {
+            target: RestrictTarget::Participant,
+            terminate_process: false,
+        }),
+        ActionKind::IsolateNetwork => actions.push(ResponseAction::Restrict {
+            target: RestrictTarget::Network,
+            terminate_process: false,
+        }),
+        ActionKind::SafePause => actions.push(ResponseAction::SafePause {
+            behaviour: s.policy.safe_pause,
+        }),
+        ActionKind::RequestSafeState => actions.push(ResponseAction::RequestSafeState {
+            behaviour: s.policy.safe_state,
+        }),
+        // No ladder action: the rollback itself is recorded with the request.
+        ActionKind::RollbackConfig => {}
+    }
+    if s.state == SafetyState::Unknown && step.is_motion_affecting() {
+        notes.push(
+            "safety state unknown: the planner requires a human's approval for this step; the \
+             SOC's approval of this request stands for it"
+                .into(),
+        );
+    }
+    let max_step = actions
+        .iter()
+        .map(ResponseAction::step)
+        .max()
+        .unwrap_or(Step::Record);
+    let plan = ResponsePlan {
+        rule: PLAN_RULE.into(),
+        severity: Severity::High,
+        source: format!("soc:{key_id}"),
+        safety_state: s.state,
+        max_step,
+        actions: actions.clone(),
+        requires_human_approval: true,
+        observe_only: false,
+        suppressed: false,
+        would_have: None,
+        rationale: Rationale::default(),
+    };
+    if let Err(v) = check_invariants(&plan, s.state, s.context) {
+        return refuse(
+            "invariant_violation",
+            format!("the plan this request stands for breaks the responder invariant {v}"),
+        );
+    }
+    Decision::Accept(Accepted {
+        step,
+        actions,
+        notes,
+    })
+}
+
+/// A request's state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    /// Accepted, recorded as a plan in the signed black box, **not
+    /// executed** (no executor): nothing was sent to the robot.
+    RecordedNotExecuted,
+    /// Handed to an executor that has not answered (no such executor here).
+    Pending,
+    /// An executor reports it applied (no such executor here).
+    Applied,
+    /// Judged unsafe or not allowed in the current state; never retried.
+    Refused,
+    /// An executor failed (no such executor here).
+    Failed,
+}
+
+impl Status {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Status::RecordedNotExecuted => "recorded_not_executed",
+            Status::Pending => "pending",
+            Status::Applied => "applied",
+            Status::Refused => "refused",
+            Status::Failed => "failed",
+        }
+    }
+}
+
+/// An accepted request offered to an executor.
+#[derive(Debug, Clone, Copy)]
+pub struct AcceptedAction<'a> {
+    pub request: &'a ActionRequest,
+    pub key_id: &'a str,
+    pub step: Step,
+    pub actions: &'a [ResponseAction],
+    pub safety_state: SafetyState,
+    pub context: &'a OperationalContext,
+}
+
+/// What an executor did with an accepted request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutorOutcome {
+    RecordedNotExecuted,
+    Pending,
+    Applied,
+    Failed(String),
+}
+
+/// Receives accepted requests. A real executor must follow
+/// `robodr_agent::executor`'s contract (re-check against the *current*
+/// safety state, only request, never block: hand off to its own bounded
+/// queue). None exists in this repository.
+pub trait ActionExecutor {
+    /// Shown in answers and the status (`"recording"`).
+    fn name(&self) -> &'static str;
+    /// Whether it can act on the robot at all.
+    fn executes(&self) -> bool;
+    fn submit(&mut self, a: &AcceptedAction<'_>) -> ExecutorOutcome;
+}
+
+/// Executes nothing: every accepted request stays a recorded plan.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RecordingExecutor;
+
+impl ActionExecutor for RecordingExecutor {
+    fn name(&self) -> &'static str {
+        "recording"
+    }
+    fn executes(&self) -> bool {
+        false
+    }
+    fn submit(&mut self, _: &AcceptedAction<'_>) -> ExecutorOutcome {
+        ExecutorOutcome::RecordedNotExecuted
+    }
+}
+
+/// One parsed call handed to the engine.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Call {
+    Robot,
+    Submit(ActionRequest),
+    Get(String),
+    Revert(String, RevertRequest),
+    /// Authenticated but refused before judgment (bad body): recorded.
+    Invalid(ApiError),
+}
+
+/// Who sent a call and how (recorded with it, so the black box can prove
+/// the request: `body` and the signature re-verify offline).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct Meta {
+    pub key_id: String,
+    pub nonce: String,
+    pub timestamp: u64,
+    pub signature: String,
+    pub method: String,
+    pub target: String,
+    pub body: String,
+    pub peer: String,
+}
+
+/// An answer: HTTP status and JSON body.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Answer {
+    pub status: u16,
+    pub body: Value,
+}
+
+impl Answer {
+    pub fn ok(body: Value) -> Self {
+        Self { status: 200, body }
+    }
+    pub fn error(e: &ApiError) -> Self {
+        Self {
+            status: e.status,
+            body: e.body(),
+        }
+    }
+}
+
+/// What the engine needs from the daemon.
+pub trait Host {
+    /// The safety state to judge by now (live feed or configuration).
+    fn safety_state(&mut self) -> SafetyState;
+    /// `"safety_feed"` or `"configuration"`.
+    fn safety_source(&self) -> &'static str;
+    fn context(&self) -> OperationalContext;
+    fn policy(&self) -> &ResponsePolicy;
+    fn caps(&self) -> EnvelopeCaps;
+    /// `ok`, `degraded` or `unknown`.
+    fn health(&self) -> &'static str;
+    /// Wall clock, Unix ms.
+    fn wall_ms(&self) -> u64;
+    /// Append a signed note to the black box; the evidence URI.
+    fn record(&mut self, what: &str, note: &Value) -> Result<String, String>;
+}
+
+/// A revert attempt, as recorded.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RevertRecord {
+    pub requested_by: String,
+    pub reason: String,
+    pub at_ms: u64,
+    pub result: &'static str,
+    pub evidence: String,
+}
+
+/// A stored request.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stored {
+    pub request: ActionRequest,
+    pub digest: String,
+    pub key_id: String,
+    pub status: Status,
+    pub refusal: Option<Refusal>,
+    pub safety_state: SafetyState,
+    pub accepted: Option<Accepted>,
+    pub error: Option<String>,
+    pub received_ms: u64,
+    pub evidence: String,
+    pub executor: &'static str,
+    pub revert: Option<RevertRecord>,
+}
+
+/// Engine counters (`status.json`, heartbeat).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct EngineStats {
+    pub submitted: u64,
+    pub recorded_not_executed: u64,
+    pub refused: u64,
+    pub duplicates: u64,
+    pub conflicts: u64,
+    pub reverts: u64,
+    pub invalid: u64,
+    /// Requests answered `failed` because the black box did not take them.
+    pub record_failures: u64,
+    /// Oldest requests dropped from the store when it was full.
+    pub evicted: u64,
+    pub stored: u64,
+}
+
+/// The main-thread half: judges, records, stores and answers.
+pub struct Engine {
+    robot_id: String,
+    store: HashMap<String, Stored>,
+    order: VecDeque<String>,
+    max: usize,
+    executor: Box<dyn ActionExecutor>,
+    pub stats: EngineStats,
+}
+
+impl std::fmt::Debug for Engine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Engine")
+            .field("robot_id", &self.robot_id)
+            .field("stored", &self.store.len())
+            .field("executor", &self.executor.name())
+            .finish()
+    }
+}
+
+const NOT_EXECUTED_NOTE: &str = "accepted and recorded in the signed black box as a plan; this \
+                                 agentd has no executor and sent nothing to the robot";
+
+impl Engine {
+    pub fn new(robot_id: &str, max: usize, executor: Box<dyn ActionExecutor>) -> Self {
+        Self {
+            robot_id: robot_id.to_string(),
+            store: HashMap::new(),
+            order: VecDeque::new(),
+            max: max.max(1),
+            executor,
+            stats: EngineStats::default(),
+        }
+    }
+
+    pub fn executor_name(&self) -> &'static str {
+        self.executor.name()
+    }
+
+    pub fn executes(&self) -> bool {
+        self.executor.executes()
+    }
+
+    pub fn get(&self, request_id: &str) -> Option<&Stored> {
+        self.store.get(request_id)
+    }
+
+    pub fn handle(&mut self, call: &Call, meta: &Meta, host: &mut dyn Host) -> Answer {
+        match call {
+            Call::Robot => self.robot(host),
+            Call::Submit(req) => self.submit(req, meta, host),
+            Call::Get(id) => match self.store.get(id) {
+                Some(s) => Answer::ok(self.answer(s, false, host.wall_ms())),
+                None => Answer::error(&unknown_request()),
+            },
+            Call::Revert(id, rv) => self.revert(id, rv, meta, host),
+            Call::Invalid(e) => {
+                self.stats.invalid += 1;
+                let note = json!({
+                    "kind": "robodr.control_plane_rejected",
+                    "api": API_VERSION,
+                    "error": {"code": e.code, "message": e.message, "status": e.status},
+                    "request": meta,
+                });
+                if host
+                    .record("control-plane rejected request", &note)
+                    .is_err()
+                {
+                    self.stats.record_failures += 1;
+                }
+                Answer::error(e)
+            }
+        }
+    }
+
+    fn robot(&self, host: &mut dyn Host) -> Answer {
+        let state = host.safety_state();
+        let ctx = host.context();
+        let observe = !ctx.profile_locked || !host.policy().oem_validated;
+        Answer::ok(json!({
+            "robot_id": self.robot_id,
+            "online": true,
+            "api": API_VERSION,
+            "safety_state": {
+                "state": state,
+                "source": host.safety_source(),
+                "safety_system_engaged": state.safety_system_engaged(),
+            },
+            "mode": if observe { "observe" } else { "enforce" },
+            "health": host.health(),
+            "executor": self.executor.name(),
+            "executes_actions": self.executor.executes(),
+            "actions": ActionKind::ALL.map(ActionKind::as_str),
+        }))
+    }
+
+    fn submit(&mut self, req: &ActionRequest, meta: &Meta, host: &mut dyn Host) -> Answer {
+        let digest = req.digest();
+        if let Some(s) = self.store.get(&req.request_id) {
+            if s.digest == digest {
+                self.stats.duplicates += 1;
+                return Answer::ok(self.answer(s, true, host.wall_ms()));
+            }
+            self.stats.conflicts += 1;
+            return Answer::error(&ApiError::new(
+                409,
+                "request_id_conflict",
+                "this request_id was already used for another action, parameters or ttl",
+            ));
+        }
+        self.stats.submitted += 1;
+        let state = host.safety_state();
+        let ctx = host.context();
+        let decision = judge(
+            req,
+            &meta.key_id,
+            &Situation {
+                state,
+                context: &ctx,
+                policy: host.policy(),
+                caps: host.caps(),
+            },
+        );
+        let (status, refusal, accepted, error) = match decision {
+            Decision::Refuse(r) => (Status::Refused, Some(r), None, None),
+            Decision::Accept(a) => {
+                let out = self.executor.submit(&AcceptedAction {
+                    request: req,
+                    key_id: &meta.key_id,
+                    step: a.step,
+                    actions: &a.actions,
+                    safety_state: state,
+                    context: &ctx,
+                });
+                let (st, err) = match out {
+                    ExecutorOutcome::RecordedNotExecuted => (Status::RecordedNotExecuted, None),
+                    ExecutorOutcome::Pending => (Status::Pending, None),
+                    ExecutorOutcome::Applied => (Status::Applied, None),
+                    ExecutorOutcome::Failed(e) => (Status::Failed, Some(e)),
+                };
+                (st, None, Some(a), err)
+            }
+        };
+        let received_ms = host.wall_ms();
+        let note = json!({
+            "kind": "robodr.control_plane_request",
+            "api": API_VERSION,
+            "robot_id": self.robot_id,
+            "request": req,
+            "authority": "request",
+            "auth": meta,
+            "safety_state": state,
+            "safety_source": host.safety_source(),
+            "context": ctx,
+            "policy_oem_validated": host.policy().oem_validated,
+            "decision": if refusal.is_some() { "refused" } else { "accepted" },
+            "refusal": refusal,
+            "plan": accepted,
+            "executor": self.executor.name(),
+            "executed": status == Status::Applied,
+            "status": status.as_str(),
+            "error": error,
+        });
+        let evidence = match host.record("control-plane request", &note) {
+            Ok(uri) => uri,
+            Err(e) => {
+                // Fail closed: nothing is claimed that is not in evidence.
+                self.stats.record_failures += 1;
+                return Answer::ok(json!({
+                    "request_id": req.request_id,
+                    "status": "failed",
+                    "executed": false,
+                    "state": {
+                        "error": {
+                            "code": "evidence_unavailable",
+                            "message": format!(
+                                "the black box did not take the request ({}); nothing was \
+                                 decided or stored, retry later",
+                                robodr_ros2_pipeline::sanitize(&e)
+                            ),
+                        }
+                    }
+                }));
+            }
+        };
+        match status {
+            Status::Refused => self.stats.refused += 1,
+            Status::RecordedNotExecuted => self.stats.recorded_not_executed += 1,
+            _ => {}
+        }
+        let stored = Stored {
+            request: req.clone(),
+            digest,
+            key_id: meta.key_id.clone(),
+            status,
+            refusal,
+            safety_state: state,
+            accepted,
+            error,
+            received_ms,
+            evidence,
+            executor: self.executor.name(),
+            revert: None,
+        };
+        let answer = self.answer(&stored, false, received_ms);
+        self.insert(stored);
+        Answer::ok(answer)
+    }
+
+    fn insert(&mut self, s: Stored) {
+        while self.store.len() >= self.max {
+            match self.order.pop_front() {
+                Some(old) => {
+                    if self.store.remove(&old).is_some() {
+                        self.stats.evicted += 1;
+                    }
+                }
+                None => break,
+            }
+        }
+        self.order.push_back(s.request.request_id.clone());
+        self.store.insert(s.request.request_id.clone(), s);
+        self.stats.stored = self.store.len() as u64;
+    }
+
+    fn revert(&mut self, id: &str, rv: &RevertRequest, meta: &Meta, host: &mut dyn Host) -> Answer {
+        let now = host.wall_ms();
+        let Some(s) = self.store.get(id) else {
+            return Answer::error(&unknown_request());
+        };
+        self.stats.reverts += 1;
+        let (result, refusal): (&'static str, Option<Refusal>) = if !s.request.action.reversible() {
+            (
+                "refused",
+                Some(Refusal {
+                    code: "not_reversible",
+                    reason: format!(
+                        "{} is not reversible by request: an operator restores the robot",
+                        s.request.action.as_str()
+                    ),
+                    safety_state: s.safety_state,
+                }),
+            )
+        } else {
+            match s.status {
+                Status::RecordedNotExecuted | Status::Refused | Status::Failed => {
+                    ("not_applied", None)
+                }
+                Status::Pending | Status::Applied => (
+                    "refused",
+                    Some(Refusal {
+                        code: "revert_unsupported",
+                        reason: format!(
+                            "the {} executor cannot revert requests",
+                            self.executor.name()
+                        ),
+                        safety_state: s.safety_state,
+                    }),
+                ),
+            }
+        };
+        let note = json!({
+            "kind": "robodr.control_plane_revert",
+            "api": API_VERSION,
+            "robot_id": self.robot_id,
+            "request_id": id,
+            "action": s.request.action,
+            "revert": rv,
+            "auth": meta,
+            "request_status": s.status.as_str(),
+            "result": result,
+            "refusal": refusal,
+            "executed": false,
+        });
+        let evidence = match host.record("control-plane revert", &note) {
+            Ok(uri) => uri,
+            Err(e) => {
+                self.stats.record_failures += 1;
+                return Answer::ok(json!({
+                    "request_id": id,
+                    "status": "failed",
+                    "executed": false,
+                    "state": {"error": {"code": "evidence_unavailable",
+                                        "message": robodr_ros2_pipeline::sanitize(&e)}},
+                }));
+            }
+        };
+        let robot_id = self.robot_id.clone();
+        let Some(s) = self.store.get_mut(id) else {
+            return Answer::error(&unknown_request());
+        };
+        if result == "not_applied" && s.revert.is_none() {
+            s.revert = Some(RevertRecord {
+                requested_by: rv.requested_by.clone(),
+                reason: rv.reason.clone(),
+                at_ms: now,
+                result,
+                evidence: evidence.clone(),
+            });
+        }
+        let mut body = answer_of(s, &robot_id, false, now);
+        body["status"] = json!(result);
+        body["revert_evidence"] = json!(evidence);
+        match refusal {
+            Some(r) => body["refusal"] = json!(r),
+            None => {
+                if let Some(o) = body.as_object_mut() {
+                    o.remove("refusal");
+                }
+            }
+        }
+        Answer::ok(body)
+    }
+
+    fn answer(&self, s: &Stored, duplicate: bool, now_ms: u64) -> Value {
+        answer_of(s, &self.robot_id, duplicate, now_ms)
+    }
+}
+
+fn unknown_request() -> ApiError {
+    ApiError::new(
+        404,
+        "unknown_request",
+        "no request with this id on this robot",
+    )
+}
+
+/// The request-state answer for a stored request.
+pub fn answer_of(s: &Stored, robot_id: &str, duplicate: bool, now_ms: u64) -> Value {
+    let expires = s
+        .request
+        .ttl_seconds
+        .map(|t| s.received_ms.saturating_add(t.saturating_mul(1000)));
+    let mut state = json!({
+        "robot_id": robot_id,
+        "action": s.request.action,
+        "parameters": s.request.parameters,
+        "ttl_seconds": s.request.ttl_seconds,
+        "requested_by": s.request.requested_by,
+        "received_at_ms": s.received_ms,
+        "expires_at_ms": expires,
+        "expired": expires.is_some_and(|e| now_ms >= e),
+        "decision": if s.refusal.is_some() { "refused" } else { "accepted" },
+        "safety_state": s.safety_state,
+        "executor": s.executor,
+        "executed": s.status == Status::Applied,
+        "evidence": s.evidence,
+    });
+    if let Some(a) = &s.accepted {
+        state["ladder_step"] = json!(a.step);
+        state["plan_actions"] = json!(a.actions);
+        if !a.notes.is_empty() {
+            state["notes"] = json!(a.notes);
+        }
+    }
+    if s.status == Status::RecordedNotExecuted {
+        state["note"] = json!(NOT_EXECUTED_NOTE);
+    }
+    if let Some(e) = &s.error {
+        state["error"] = json!(e);
+    }
+    if let Some(r) = &s.revert {
+        state["revert"] = json!(r);
+    }
+    let mut out = json!({
+        "request_id": s.request.request_id,
+        "status": s.status.as_str(),
+        "executed": s.status == Status::Applied,
+        "state": state,
+    });
+    if duplicate {
+        out["duplicate"] = json!(true);
+    }
+    if let Some(r) = &s.refusal {
+        out["refusal"] = json!(r);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use robodr_responder::{Connectivity, ControlMode, MissionPhase, PlatformFamily};
+
+    fn ctx() -> OperationalContext {
+        OperationalContext {
+            platform: PlatformFamily::Ugv,
+            phase: MissionPhase::Transit,
+            connectivity: Connectivity::Connected,
+            control: ControlMode::Autonomous,
+            operator_present: true,
+            profile_locked: true,
+        }
+    }
+
+    fn policy() -> ResponsePolicy {
+        let mut p = ResponsePolicy::conservative_default(PlatformFamily::Ugv);
+        p.oem_validated = true;
+        p
+    }
+
+    fn body(action: &str, params: Value, ttl: Option<u64>) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "request_id": "robot_x:ugv-007:0123456789abcdef",
+            "action": action,
+            "parameters": params,
+            "ttl_seconds": ttl,
+            "reason": "rogue writer on /cmd_vel",
+            "requested_by": "analyst@soc",
+            "source": "autosecops",
+            "authority": "request",
+        }))
+        .unwrap()
+    }
+
+    fn code(r: Result<ActionRequest, ApiError>) -> &'static str {
+        r.expect_err("refused").code
+    }
+
+    #[test]
+    fn every_class_parses_with_its_own_parameters() {
+        let ok = [
+            body(
+                "restrict_motion",
+                json!({"max_linear_speed": 0.5}),
+                Some(600),
+            ),
+            body(
+                "restrict_motion",
+                json!({"workspace_zone": "zone-a"}),
+                Some(1),
+            ),
+            body(
+                "quarantine_node",
+                json!({"participant_guid": "0110a2b3c4d5e6f701000000"}),
+                None,
+            ),
+            body(
+                "quarantine_node",
+                json!({"node": "/rogue/teleop_node"}),
+                None,
+            ),
+            body("isolate_network", json!({}), Some(86_400)),
+            body("safe_pause", json!({}), None),
+            body("request_safe_state", json!({}), None),
+            body(
+                "rollback_config",
+                json!({"config": "program", "to_version": "v1.2"}),
+                None,
+            ),
+            body("rollback_config", json!({}), None),
+        ];
+        for b in ok {
+            let r = parse_submit(&b);
+            assert!(r.is_ok(), "{}: {r:?}", String::from_utf8_lossy(&b));
+        }
+        let r = parse_submit(&body("rollback_config", json!({}), None)).unwrap();
+        assert_eq!(r.parameters.config.as_deref(), Some("profile"));
+        // Absent parameters are an empty object.
+        let mut v: Value = serde_json::from_slice(&body("safe_pause", json!({}), None)).unwrap();
+        v.as_object_mut().unwrap().remove("parameters");
+        assert!(parse_submit(&serde_json::to_vec(&v).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn allow_list_refuses_everything_else() {
+        assert_eq!(
+            code(parse_submit(&body("fly_away", json!({}), None))),
+            "unknown_action"
+        );
+        assert_eq!(
+            code(parse_submit(&body("robot_safe_pause", json!({}), None))),
+            "unknown_action"
+        );
+        // A motion command, force or override never reaches the judgment.
+        assert_eq!(
+            code(parse_submit(&body(
+                "safe_pause",
+                json!({"linear_x": 1.0}),
+                None
+            ))),
+            "unknown_field"
+        );
+        assert_eq!(
+            code(parse_submit(&body(
+                "request_safe_state",
+                json!({"force": true}),
+                None
+            ))),
+            "unknown_field"
+        );
+        assert_eq!(
+            code(parse_submit(&body(
+                "safe_pause",
+                json!({"max_linear_speed": 0.5}),
+                None
+            ))),
+            "parameter_not_allowed"
+        );
+        assert_eq!(
+            code(parse_submit(&body(
+                "restrict_motion",
+                json!({"node": "/a"}),
+                Some(10)
+            ))),
+            "parameter_not_allowed"
+        );
+        let mut v: Value = serde_json::from_slice(&body("safe_pause", json!({}), None)).unwrap();
+        v["authority"] = json!("override");
+        assert_eq!(
+            code(parse_submit(&serde_json::to_vec(&v).unwrap())),
+            "authority_not_allowed"
+        );
+        v["authority"] = json!("request");
+        v["override"] = json!(true);
+        assert_eq!(
+            code(parse_submit(&serde_json::to_vec(&v).unwrap())),
+            "unknown_field"
+        );
+        // Duplicate keys refuse the body.
+        let dup = br#"{"request_id":"a","action":"safe_pause","action":"request_safe_state","requested_by":"x","source":"s","authority":"request"}"#;
+        assert_eq!(code(parse_submit(dup)), "duplicate_field");
+        assert_eq!(code(parse_submit(b"\xff")), "invalid_request");
+        assert_eq!(code(parse_submit(b"[]")), "invalid_request");
+    }
+
+    #[test]
+    fn parameter_values_are_checked() {
+        for p in [
+            json!({"max_linear_speed": 0.0}),
+            json!({"max_linear_speed": -1.0}),
+            json!({"max_linear_speed": 11.0}),
+            json!({"workspace_zone": "a b"}),
+            json!({}),
+        ] {
+            assert_eq!(
+                code(parse_submit(&body("restrict_motion", p.clone(), Some(5)))),
+                "invalid_parameter",
+                "{p}"
+            );
+        }
+        for p in [
+            json!({"participant_guid": "0110A2B3C4D5E6F701000000"}),
+            json!({"participant_guid": "01"}),
+            json!({"node": "1bad"}),
+            json!({"node": "/a/../b"}),
+            json!({"node": "/a", "participant_guid": "0110a2b3c4d5e6f701000000"}),
+            json!({}),
+        ] {
+            assert_eq!(
+                code(parse_submit(&body("quarantine_node", p.clone(), None))),
+                "invalid_parameter",
+                "{p}"
+            );
+        }
+        assert_eq!(
+            code(parse_submit(&body(
+                "rollback_config",
+                json!({"config": "firmware"}),
+                None
+            ))),
+            "invalid_parameter"
+        );
+        let mut v: Value = serde_json::from_slice(&body("safe_pause", json!({}), None)).unwrap();
+        v["request_id"] = json!("a/b");
+        assert_eq!(
+            code(parse_submit(&serde_json::to_vec(&v).unwrap())),
+            "invalid_request_id"
+        );
+        v["request_id"] = json!("ok");
+        v["reason"] = json!("line\nbreak");
+        assert_eq!(
+            code(parse_submit(&serde_json::to_vec(&v).unwrap())),
+            "invalid_field"
+        );
+        v["reason"] = json!("x".repeat(501));
+        assert_eq!(
+            code(parse_submit(&serde_json::to_vec(&v).unwrap())),
+            "invalid_field"
+        );
+        v["reason"] = json!("");
+        v["requested_by"] = json!(" ");
+        assert_eq!(
+            code(parse_submit(&serde_json::to_vec(&v).unwrap())),
+            "invalid_field"
+        );
+        v["requested_by"] = json!("a");
+        v["source"] = json!("AutoSecOps");
+        assert_eq!(
+            code(parse_submit(&serde_json::to_vec(&v).unwrap())),
+            "invalid_field"
+        );
+    }
+
+    #[test]
+    fn ttl_rules() {
+        assert_eq!(
+            code(parse_submit(&body(
+                "restrict_motion",
+                json!({"max_linear_speed": 1.0}),
+                None
+            ))),
+            "ttl_required"
+        );
+        assert_eq!(
+            code(parse_submit(&body("isolate_network", json!({}), None))),
+            "ttl_required"
+        );
+        assert_eq!(
+            code(parse_submit(&body(
+                "isolate_network",
+                json!({}),
+                Some(86_401)
+            ))),
+            "ttl_out_of_range"
+        );
+        assert_eq!(
+            code(parse_submit(&body("isolate_network", json!({}), Some(0)))),
+            "ttl_out_of_range"
+        );
+        for a in [
+            "quarantine_node",
+            "safe_pause",
+            "request_safe_state",
+            "rollback_config",
+        ] {
+            let p = if a == "quarantine_node" {
+                json!({"node": "/x"})
+            } else {
+                json!({})
+            };
+            assert_eq!(
+                code(parse_submit(&body(a, p, Some(60)))),
+                "ttl_not_allowed",
+                "{a}"
+            );
+        }
+        let mut v: Value =
+            serde_json::from_slice(&body("isolate_network", json!({}), None)).unwrap();
+        v["ttl_seconds"] = json!(1.5);
+        assert_eq!(
+            code(parse_submit(&serde_json::to_vec(&v).unwrap())),
+            "invalid_request"
+        );
+    }
+
+    fn req(action: &str, params: Value, ttl: Option<u64>) -> ActionRequest {
+        parse_submit(&body(action, params, ttl)).unwrap()
+    }
+
+    fn judged(
+        r: &ActionRequest,
+        state: SafetyState,
+        c: &OperationalContext,
+        p: &ResponsePolicy,
+    ) -> Decision {
+        judge(
+            r,
+            "soc-1",
+            &Situation {
+                state,
+                context: c,
+                policy: p,
+                caps: EnvelopeCaps {
+                    linear: Some(1.0),
+                    joint: None,
+                },
+            },
+        )
+    }
+
+    fn refusal(d: Decision) -> &'static str {
+        match d {
+            Decision::Refuse(r) => r.code,
+            Decision::Accept(a) => panic!("accepted: {a:?}"),
+        }
+    }
+
+    #[test]
+    fn engaged_safety_system_refuses_everything() {
+        let (c, p) = (ctx(), policy());
+        for a in ActionKind::ALL {
+            let r = match a {
+                ActionKind::RestrictMotion => req(
+                    "restrict_motion",
+                    json!({"max_linear_speed": 0.5}),
+                    Some(60),
+                ),
+                ActionKind::QuarantineNode => req("quarantine_node", json!({"node": "/n"}), None),
+                ActionKind::IsolateNetwork => req("isolate_network", json!({}), Some(60)),
+                _ => req(a.as_str(), json!({}), None),
+            };
+            for s in [SafetyState::EStopActive, SafetyState::SafeStateActive] {
+                assert_eq!(
+                    refusal(judged(&r, s, &c, &p)),
+                    "safety_system_engaged",
+                    "{a:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn observe_mode_and_human_command_refuse() {
+        let r = req("safe_pause", json!({}), None);
+        let mut c = ctx();
+        c.profile_locked = false;
+        assert_eq!(
+            refusal(judged(&r, SafetyState::MovingSlow, &c, &policy())),
+            "observe_mode"
+        );
+        let mut p = policy();
+        p.oem_validated = false;
+        assert_eq!(
+            refusal(judged(&r, SafetyState::MovingSlow, &ctx(), &p)),
+            "observe_mode"
+        );
+        let mut c = ctx();
+        c.control = ControlMode::Teleop;
+        assert_eq!(
+            refusal(judged(&r, SafetyState::MovingSlow, &c, &policy())),
+            "human_in_command"
+        );
+        // A non-motion step is still fine with a human in command.
+        let q = req("isolate_network", json!({}), Some(60));
+        assert!(matches!(
+            judged(&q, SafetyState::MovingSlow, &c, &policy()),
+            Decision::Accept(_)
+        ));
+        let mut c = ctx();
+        c.phase = MissionPhase::Landing;
+        assert_eq!(
+            refusal(judged(&r, SafetyState::MovingSlow, &c, &policy())),
+            "transient_phase"
+        );
+    }
+
+    #[test]
+    fn policy_ceiling_and_restriction_checks() {
+        let (c, p) = (ctx(), policy());
+        // Idle row tops out at safe_pause: a safe-state request is above it.
+        let r = req("request_safe_state", json!({}), None);
+        assert_eq!(
+            refusal(judged(&r, SafetyState::Idle, &c, &p)),
+            "above_policy"
+        );
+        assert!(matches!(
+            judged(&r, SafetyState::MovingFast, &c, &p),
+            Decision::Accept(_)
+        ));
+        // Rollback only while idle.
+        let rb = req("rollback_config", json!({}), None);
+        assert_eq!(
+            refusal(judged(&rb, SafetyState::MovingSlow, &c, &p)),
+            "requires_idle"
+        );
+        assert!(matches!(
+            judged(&rb, SafetyState::Idle, &c, &p),
+            Decision::Accept(_)
+        ));
+        // A cap above the envelope does not restrict.
+        let up = req(
+            "restrict_motion",
+            json!({"max_linear_speed": 2.0}),
+            Some(60),
+        );
+        assert_eq!(
+            refusal(judged(&up, SafetyState::MovingSlow, &c, &p)),
+            "not_a_restriction"
+        );
+        let down = req(
+            "restrict_motion",
+            json!({"max_linear_speed": 0.25}),
+            Some(60),
+        );
+        match judged(&down, SafetyState::MovingSlow, &c, &p) {
+            Decision::Accept(a) => {
+                assert_eq!(a.step, Step::LimitMotion);
+                assert_eq!(
+                    a.actions,
+                    vec![
+                        ResponseAction::Record,
+                        ResponseAction::LimitMotion { factor: 0.25 }
+                    ]
+                );
+            }
+            d => panic!("{d:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_state_accepts_with_a_note() {
+        let r = req("request_safe_state", json!({}), None);
+        match judged(&r, SafetyState::Unknown, &ctx(), &policy()) {
+            Decision::Accept(a) => {
+                assert_eq!(a.step, Step::RequestSafeState);
+                assert!(a.notes.iter().any(|n| n.contains("unknown")), "{a:?}");
+            }
+            d => panic!("{d:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_vocabulary_tops_at_a_safe_state_request() {
+        for a in ActionKind::ALL {
+            assert!(a.step() <= Step::RequestSafeState);
+        }
+    }
+
+    // ---------------------------------------------------------- engine ----
+
+    struct FakeHost {
+        state: SafetyState,
+        ctx: OperationalContext,
+        policy: ResponsePolicy,
+        notes: Vec<Value>,
+        fail: bool,
+        now: u64,
+    }
+
+    impl FakeHost {
+        fn new(state: SafetyState) -> Self {
+            Self {
+                state,
+                ctx: ctx(),
+                policy: policy(),
+                notes: Vec::new(),
+                fail: false,
+                now: 1_000_000,
+            }
+        }
+    }
+
+    impl Host for FakeHost {
+        fn safety_state(&mut self) -> SafetyState {
+            self.state
+        }
+        fn safety_source(&self) -> &'static str {
+            "configuration"
+        }
+        fn context(&self) -> OperationalContext {
+            self.ctx
+        }
+        fn policy(&self) -> &ResponsePolicy {
+            &self.policy
+        }
+        fn caps(&self) -> EnvelopeCaps {
+            EnvelopeCaps::default()
+        }
+        fn health(&self) -> &'static str {
+            "ok"
+        }
+        fn wall_ms(&self) -> u64 {
+            self.now
+        }
+        fn record(&mut self, _: &str, note: &Value) -> Result<String, String> {
+            if self.fail {
+                return Err("black box unavailable".into());
+            }
+            self.notes.push(note.clone());
+            Ok(format!(
+                "robodr-blackbox://ugv-007/0/{}?sha256=00",
+                self.notes.len()
+            ))
+        }
+    }
+
+    fn meta() -> Meta {
+        Meta {
+            key_id: "soc-1".into(),
+            ..Meta::default()
+        }
+    }
+
+    fn engine() -> Engine {
+        Engine::new("ugv-007", 4, Box::new(RecordingExecutor))
+    }
+
+    #[test]
+    fn accepted_is_recorded_not_executed() {
+        let mut e = engine();
+        let mut h = FakeHost::new(SafetyState::MovingSlow);
+        let r = req("safe_pause", json!({}), None);
+        let a = e.handle(&Call::Submit(r.clone()), &meta(), &mut h);
+        assert_eq!(a.status, 200);
+        assert_eq!(a.body["status"], "recorded_not_executed");
+        assert_eq!(a.body["executed"], false);
+        assert_eq!(a.body["state"]["executor"], "recording");
+        assert_eq!(a.body["state"]["ladder_step"], "safe_pause");
+        assert_eq!(
+            a.body["state"]["evidence"],
+            "robodr-blackbox://ugv-007/0/1?sha256=00"
+        );
+        assert!(a.body.get("duplicate").is_none());
+        assert_eq!(h.notes.len(), 1);
+        let n = &h.notes[0];
+        assert_eq!(n["kind"], "robodr.control_plane_request");
+        assert_eq!(n["decision"], "accepted");
+        assert_eq!(n["executed"], false);
+        assert_eq!(n["status"], "recorded_not_executed");
+        assert_eq!(n["safety_state"], "moving_slow");
+        // Resubmitting returns the stored request, nothing new is recorded.
+        let d = e.handle(&Call::Submit(r.clone()), &meta(), &mut h);
+        assert_eq!(d.body["duplicate"], true);
+        assert_eq!(d.body["status"], "recorded_not_executed");
+        assert_eq!(h.notes.len(), 1);
+        // The same id for another action is a conflict.
+        let mut other = req("request_safe_state", json!({}), None);
+        other.request_id = r.request_id.clone();
+        assert_eq!(e.handle(&Call::Submit(other), &meta(), &mut h).status, 409);
+        // GET answers the same state; unknown ids are 404.
+        let g = e.handle(&Call::Get(r.request_id.clone()), &meta(), &mut h);
+        assert_eq!(g.body["status"], "recorded_not_executed");
+        assert_eq!(
+            e.handle(&Call::Get("nope".into()), &meta(), &mut h).status,
+            404
+        );
+        // Revert of a plan that never took effect: not_applied, recorded.
+        let rv = RevertRequest {
+            reason: "false positive".into(),
+            requested_by: "analyst".into(),
+        };
+        let v = e.handle(
+            &Call::Revert(r.request_id.clone(), rv.clone()),
+            &meta(),
+            &mut h,
+        );
+        assert_eq!(v.body["status"], "not_applied");
+        assert_eq!(v.body["executed"], false);
+        assert_eq!(
+            h.notes.last().unwrap()["kind"],
+            "robodr.control_plane_revert"
+        );
+        assert_eq!(e.stats.recorded_not_executed, 1);
+        assert_eq!(e.stats.duplicates, 1);
+        assert_eq!(e.stats.conflicts, 1);
+    }
+
+    #[test]
+    fn refusal_in_an_unsafe_state_is_recorded_and_answered() {
+        let mut e = engine();
+        let mut h = FakeHost::new(SafetyState::EStopActive);
+        let r = req("request_safe_state", json!({}), None);
+        let a = e.handle(&Call::Submit(r.clone()), &meta(), &mut h);
+        assert_eq!(a.body["status"], "refused");
+        assert_eq!(a.body["refusal"]["code"], "safety_system_engaged");
+        assert_eq!(a.body["refusal"]["safety_state"], "estop_active");
+        assert_eq!(h.notes[0]["decision"], "refused");
+        // An irreversible request is never reverted by request.
+        let v = e.handle(
+            &Call::Revert(
+                r.request_id,
+                RevertRequest {
+                    reason: String::new(),
+                    requested_by: "a".into(),
+                },
+            ),
+            &meta(),
+            &mut h,
+        );
+        assert_eq!(v.body["status"], "refused");
+        assert_eq!(v.body["refusal"]["code"], "not_reversible");
+    }
+
+    #[test]
+    fn no_evidence_no_claim() {
+        let mut e = engine();
+        let mut h = FakeHost::new(SafetyState::MovingSlow);
+        h.fail = true;
+        let r = req("safe_pause", json!({}), None);
+        let a = e.handle(&Call::Submit(r.clone()), &meta(), &mut h);
+        assert_eq!(a.body["status"], "failed");
+        assert_eq!(a.body["state"]["error"]["code"], "evidence_unavailable");
+        assert!(
+            e.get(&r.request_id).is_none(),
+            "not stored: a retry is judged anew"
+        );
+        assert_eq!(e.stats.record_failures, 1);
+    }
+
+    #[test]
+    fn invalid_calls_are_recorded() {
+        let mut e = engine();
+        let mut h = FakeHost::new(SafetyState::MovingSlow);
+        let err = ApiError::new(400, "unknown_action", "x");
+        let a = e.handle(&Call::Invalid(err), &meta(), &mut h);
+        assert_eq!(a.status, 400);
+        assert_eq!(a.body["error"]["code"], "unknown_action");
+        assert_eq!(h.notes[0]["kind"], "robodr.control_plane_rejected");
+        assert_eq!(e.stats.invalid, 1);
+    }
+
+    #[test]
+    fn store_is_bounded() {
+        let mut e = engine();
+        let mut h = FakeHost::new(SafetyState::MovingSlow);
+        for i in 0..6 {
+            let mut r = req("safe_pause", json!({}), None);
+            r.request_id = format!("r{i}");
+            e.handle(&Call::Submit(r), &meta(), &mut h);
+        }
+        assert_eq!(e.stats.stored, 4);
+        assert_eq!(e.stats.evicted, 2);
+        assert!(e.get("r0").is_none() && e.get("r5").is_some());
+    }
+
+    #[test]
+    fn robot_snapshot_says_it_executes_nothing() {
+        let e = engine();
+        let mut h = FakeHost::new(SafetyState::EStopActive);
+        let a = e.robot(&mut h);
+        assert_eq!(a.body["online"], true);
+        assert_eq!(a.body["safety_state"]["state"], "estop_active");
+        assert_eq!(a.body["safety_state"]["safety_system_engaged"], true);
+        assert_eq!(a.body["executes_actions"], false);
+        assert_eq!(a.body["mode"], "enforce");
+    }
+
+    /// The status mapping a future executor would get (none exists).
+    struct Applying;
+    impl ActionExecutor for Applying {
+        fn name(&self) -> &'static str {
+            "test-applying"
+        }
+        fn executes(&self) -> bool {
+            true
+        }
+        fn submit(&mut self, _: &AcceptedAction<'_>) -> ExecutorOutcome {
+            ExecutorOutcome::Applied
+        }
+    }
+
+    #[test]
+    fn executor_outcome_maps_to_the_status() {
+        let mut e = Engine::new("ugv-007", 4, Box::new(Applying));
+        let mut h = FakeHost::new(SafetyState::MovingSlow);
+        let a = e.handle(
+            &Call::Submit(req("safe_pause", json!({}), None)),
+            &meta(),
+            &mut h,
+        );
+        assert_eq!(a.body["status"], "applied");
+        assert_eq!(a.body["executed"], true);
+        assert!(a.body["state"].get("note").is_none());
+    }
+}

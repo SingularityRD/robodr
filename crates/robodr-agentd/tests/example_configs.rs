@@ -3,7 +3,8 @@
 //! its signature, profile trust file, response policy, black-box key
 //! credential): the base example passes `--check-config` (`load`) as is;
 //! the full example additionally needs its optional files (trust roots,
-//! revocation list, finding-signing key) and is refused without them.
+//! revocation list, finding-signing key, the SOC's control-plane public
+//! key) and is refused without them.
 
 mod common;
 
@@ -83,6 +84,7 @@ fn full_example_needs_its_optional_files() {
     let v: serde_json::Value = serde_json::from_str(&text).unwrap();
     let mut v = v;
     v.as_object_mut().unwrap().remove("finding_signing");
+    v.as_object_mut().unwrap().remove("control_plane");
     let t = v["sensor"]["profile_trust"].as_object_mut().unwrap();
     for k in ["trust_roots", "revocation_list", "revocation_policy"] {
         t.remove(k);
@@ -90,4 +92,34 @@ fn full_example_needs_its_optional_files() {
     std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
     let r = robodr_agentd::load(&path);
     assert!(r.is_ok(), "{:?}", r.err());
+}
+
+#[test]
+fn full_example_control_plane_loads_with_its_soc_key() {
+    let s = setup_root("example-cp");
+    let text = relocate(&example("agentd.full.example.json"), &s);
+    let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    v.as_object_mut().unwrap().remove("finding_signing");
+    let t = v["sensor"]["profile_trust"].as_object_mut().unwrap();
+    for k in ["trust_roots", "revocation_list", "revocation_policy"] {
+        t.remove(k);
+    }
+    let path = s.dir.join("agentd.json");
+    std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+    // Without the SOC's public key file: refused, naming it.
+    let e = robodr_agentd::load(&path).expect_err("SOC key missing");
+    assert!(e.contains("autosecops.pub"), "{e}");
+    let key = s.dir.join("etc/soc/autosecops.pub");
+    std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+    robodr_blackbox::KeyFile::ed25519_from_seed(&[0x33; 32], Some("soc:autosecops:1"))
+        .unwrap()
+        .to_public()
+        .unwrap()
+        .write_new(&key)
+        .unwrap();
+    let r = robodr_agentd::load(&path).unwrap_or_else(|e| panic!("{e}"));
+    let cp = r.control_plane.expect("control_plane");
+    assert!(cp.tcp.is_none());
+    assert_eq!(cp.keys.len(), 1);
+    assert!(cp.unix.unwrap().ends_with("run/control.sock"));
 }

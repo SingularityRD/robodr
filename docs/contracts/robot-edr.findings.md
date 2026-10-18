@@ -669,8 +669,11 @@ Consumer acceptance checks for this contract:
   `robot.sensor.findings_capped`, motion decode `robot.motion.*`), motion
   monitor (`robot.motion.*`) and firewall (`robot.firewall.*`). Also in the
   same cycle `robot.host.pulsar_threat` (Pulsar threats forwarded to
-  robodr-agentd) with the data source `host_runtime`. No new data source or
-  technique beyond those listed here.
+  robodr-agentd) with the data source `host_runtime`, and
+  `robot.agent.control_plane_unauthenticated` /
+  `robot.agent.control_plane_invalid` (the control-plane action API,
+  `robot-edr.control-plane.md`; data source `robodr_agent`). No new data
+  source or technique beyond those listed here.
   New data sources `robodr_correlation`, `robot_safety_state`,
   `robodr_agent`, `host_runtime`; new technique T0856 Spoof Reporting Message. Value format
   otherwise unchanged; the validator checks catalog constants against the

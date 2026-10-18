@@ -52,6 +52,7 @@ level, and every path must be absolute.
 | `motion_monitor` | Optional. `config_path` (strict `MonitorConfig`; default: the UGV defaults on the profile's motion channels) and `feedback_sources`. Feedback sources that are ROS topic names (`/odom`) are also decoded from the bus. |
 | `sensor.motion` | Optional. The live motion decode path: `enabled` (default true), `feedback_topics` (e.g. `["/odom"]`), `max_writers`, `max_samples_per_datagram` (`evaluate_commands` is accepted but the daemon always lets the agent evaluate). Unknown keys are refused. |
 | `host_threats` | Optional. `socket_path` (the socket `robodr-threat-forward` writes Pulsar threats to), `socket_mode` (`"0600"` default or `"0660"`), `allowed_uids` (peers besides uid 0), `max_connections` (default 2, max 8). See "Host threats" below. |
+| `control_plane` | Optional, off when absent. The SOC action-request API: `listen_tcp` (loopback unless `allow_remote`), `unix_socket` (`socket_mode` `"0600"`/`"0660"`), `soc_keys` (Ed25519 public key files), `max_clock_skew_s` 30, `rate_per_minute` 30, `burst` 10, `max_connections` 4, `max_requests` 1024, `answer_timeout_ms` 5000. Requests are judged and recorded, **never executed**. See "Control plane" below. |
 | `daemon` | `queue_capacity` 4096 (max 65536), `queue_bytes` 33554432 (32 MiB; 1 MiB..=256 MiB), `tick_ms` 1000, `heartbeat_ms` 10000, `silence_ms` 30000, `lag_ms` 2000, `health_report_ms` 10000, `exit_when_inputs_end` false |
 
 **Key.** Keys are never accepted on the command line. `blackbox.key_file`
@@ -219,6 +220,64 @@ one JSON object per line:
   `rejected_connections`, `connections`, `upstream_dropped`;
   `daemon.host_threats`, `host_heartbeats`, `host_threats_own_skipped`.
 
+## Control plane (SOC action requests)
+
+With `control_plane` (contract `docs/contracts/robot-edr.control-plane.md`)
+a SOC such as AutoSecOps may *request* one of six actions
+(`restrict_motion`, `quarantine_node`, `isolate_network`, `safe_pause`,
+`request_safe_state`, `rollback_config`) over a small std-only HTTP/1.1 API
+(`src/control/`). The answer is truthful about what happens: **nothing is
+executed.** The only executor is the recording one, so an accepted request
+is `recorded_not_executed` (`"executed": false`), "accepted and recorded as
+a plan".
+
+```json
+"control_plane": {
+  "unix_socket": "/run/robodr-agentd/control.sock",
+  "listen_tcp": "127.0.0.1:8787",
+  "soc_keys": ["/etc/robodr/soc/autosecops.pub"]
+}
+```
+
+- **Authentication.** Each request is signed with a configured SOC Ed25519
+  key over method, exact target, this robot's id, key id, timestamp, nonce
+  and body hash; ±`max_clock_skew_s` and a nonce cache stop replays (full
+  cache: refused, never unchecked); per-key token bucket. With
+  `finding_signing` every answer to an authenticated request is signed with
+  the finding key, bound to the request signature.
+- **Allow-list.** Six classes, each with its own parameters (speed caps in
+  (0, 10], a zone, a GUID or node name, a profile/program rollback); the
+  time-limited classes need `ttl_seconds` 1..=86400, the others refuse one;
+  no motion command, force or override field exists and `authority` must be
+  `request`. Unknown or duplicate keys refuse the body.
+- **Judgment.** Against the safety state *now* (live feed re-evaluated),
+  the operational context and the response policy: refused while the
+  e-stop / safe state is active (also `request_safe_state`: the safety
+  system has authority), in observe mode, for motion-affecting steps while a
+  person commands motion or during take-off / landing, `rollback_config`
+  unless `idle`, anything above the policy matrix's ceiling for the state, a
+  speed cap above the profile envelope, and any plan that fails
+  `check_invariants`. A refusal is final.
+- **Evidence.** Request (with its signature and exact body: it re-verifies
+  offline), state, context and decision are one fsynced
+  `robodr.control_plane_request` note; reverts and authenticated invalid
+  requests are notes too. No black box, no claim: the answer is then
+  `failed` and nothing is stored.
+- **Abuse.** Bounded parsing (8 KiB head, 16 KiB body, 5 s), at most
+  `max_connections`, a bounded queue to the main loop (full: 503). Failed
+  authentications raise `robot.agent.control_plane_unauthenticated` (High),
+  authenticated invalid requests `robot.agent.control_plane_invalid`
+  (Medium); both observe-only self-health, rate-limited by
+  `health_report_ms`. The API is not an input: a quiet SOC never makes the
+  state `unknown`.
+- **Transport.** No TLS in agentd: listen on the unix socket or loopback
+  and put a TLS terminator in front for a remote SOC (`allow_remote` exists
+  for networks you otherwise protect). The shipped unit has
+  `IPAddressDeny=any`: TCP on loopback needs a drop-in with
+  `IPAddressAllow=localhost`.
+- **Status.** `status.json` and heartbeats carry `control_plane` (listeners,
+  executor, counters, `last_auth_failure`).
+
 ## Outputs
 
 - **Black box** (`blackbox.dir`). It holds every deviation, plan note,
@@ -323,6 +382,7 @@ request.
 | `tests/motion_live.rs` | A synthetic pcap with SEDP plus CDR `Twist` on `rt/cmd_vel` (0.4 m/s, then 2.5 m/s against a 1.0 m/s envelope) and CDR `Odometry` on `rt/odom`: three motion events reach the agent, exactly one Critical `robot.motion.linear_over_envelope` finding is spooled, the black box holds the decoded command (with its writer GUID) and a firewall verdict with `enforcing: false`, and verifies. A garbage payload on `rt/cmd_vel` yields one Medium `robot.motion.undecodable_sample` and the next good command still flows. `sensor.motion` keys are strict. |
 | `tests/review_regressions.rs` | Fourth-review fixes: no busy loop once every input ended (thread CPU < 25% of wall, state `unknown`); a malformed-only stream is never `ok` (`input_silent` + `input_malformed`); `..` and a late symlink cannot alias spool and black box; a live event socket is not stolen and cleanup checks the inode; the queue's byte budget; `READY`/`WATCHDOG`/`STATUS`/`STOPPING` over a notify socket and stale or other-boot `status.json` read as `unknown`; hostile event lines do not panic. |
 | `tests/host_threats.rs` | The host-threat socket, with the test playing `robodr-threat-forward`: a synthetic capture (rogue participant and `cmd_vel` writer) plus a Pulsar shell threat fire `coordinated_intrusion` (Critical, enforce); three host rules from one process fire `host_process_persistence`; the sensor's own threat is not counted twice; junk lines and the forwarder's reported losses are health findings; a host input with no forwarder reads `unknown` and goes silent, and a Pulsar service-stop threat with that silence is the observe-only `defense_tampering`; config and socket-directory checks. |
+| `tests/control_plane.rs` | The control-plane API on the real daemon with a test SOC key, over the unix socket and TCP: the robot snapshot; `restrict_motion` accepted and answered `recorded_not_executed` (`executed: false`, ladder step, evidence link), an idempotent resubmission, a GET with a percent-encoded id; a replay, a tampered body, an unknown key, a stale timestamp, a request signed for another robot and one without credentials refused (401); an unknown action, a missing ttl and a motion field refused (400) and recorded; under e-stop (PLC socket feed) `request_safe_state` refused `safety_system_engaged`; revert `not_applied`, an irreversible revert refused; answers signed with the finding key; the observe-only findings; the black box verifies and the recorded SOC signature re-verifies offline. Off by default; strict config. |
 | `tests/agent_api.rs` | `Agent::handle_external`: sensor deviations get real plans when enforcing. Self-health and observe-mode deviations never get an action plan. |
 | `tests/safety_feed.rs` | The live safety feed: Bool / UInt8 / String / Odometry mappings (with hysteresis, non-finite speed), staleness to `unknown`, conflicts to the most conservative state, unprofiled / IP-spoofed / wrong-type / non-allowlisted writers ignored with a High finding, undecodable and unmapped values read `unknown`. End to end through the daemon: an e-stop on the bus turns the plan for a Critical over-envelope command into Record (`request_safe_state` with the e-stop released); a rogue writer's "release" is reported and ignored; the PLC socket feed grades plans, goes stale to `unknown` (approval-gated plan) and every transition is in the black box. |
 | unit tests | Config strictness and key file checks, spool atomicity and bounds, the line reader (CRLF, overlong lines, timeouts, a full queue), the unix socket, the peer-uid policy, the host-threat line parser and socket permission checks, and the health state machine. |
@@ -363,7 +423,16 @@ request.
   (`coordinated_intrusion`, `defense_tampering`) join host and network
   evidence by time window only.
 - **Plans are never executed.** The agent's executor is `NoopExecutor`.
-  Dispositions are recorded and reported only.
+  Dispositions are recorded and reported only. Control-plane requests are
+  judged and recorded the same way (`recorded_not_executed`); there is no
+  executor that reaches the robot.
+- **Control plane: no TLS, no persistence.** Requests are signed and
+  replay-protected but travel in clear text unless a TLS terminator sits in
+  front; answers are signed only with `finding_signing`. Request states live
+  in memory (bounded) and are forgotten at restart (the black box keeps
+  every decision). The replay window needs NTP on robot and SOC. Tested
+  with synthetic traffic and AutoSecOps' client in-process, not against a
+  deployed SOC.
 - **No exporter is included.** The rename-to-`acked/` acknowledgement is the
   whole contract, and it has not been run against a real Kafka producer.
 - **The key is a file, not a TPM.** The Ed25519 seed sits in a 0600 file

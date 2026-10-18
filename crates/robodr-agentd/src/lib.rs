@@ -39,6 +39,12 @@
 //!   over by the `robodr-threat-forward` Pulsar module (peer-uid checked,
 //!   strictly parsed, heartbeat liveness) become host-side correlation
 //!   signals and `robot.host.pulsar_threat` findings.
+//! * [`control`]: the optional control-plane action API (`control_plane`,
+//!   off by default): a SOC's Ed25519-signed, replay-protected action
+//!   request (six allow-listed classes, nothing beyond a safe-state
+//!   *request*) is judged with the response policy against the current
+//!   safety state, recorded in the black box and answered `refused` or
+//!   `recorded_not_executed`. Nothing is executed.
 //! * [`spool`]: atomic, bounded findings spool; acked records are pruned
 //!   oldest first, unacked ones never.
 //! * [`notify`]: `sd_notify` (`READY=1`, `WATCHDOG=1` from the main loop,
@@ -57,7 +63,9 @@
 //! executed (the agent's `NoopExecutor`); nothing is sent to the robot, the
 //! network or the safety system. Self-health findings are observe-only by
 //! construction, so neither a fault nor an attacker starving an input can
-//! cause a motion request.
+//! cause a motion request. Control-plane requests from a SOC are judged
+//! and recorded the same way and answered `recorded_not_executed`: the
+//! control plane's only executor records, it never acts.
 //!
 //! # Limits (see README)
 //!
@@ -72,6 +80,7 @@
 //! HMAC placeholder key.
 
 pub mod config;
+pub mod control;
 pub mod daemon;
 pub mod health;
 pub mod host;

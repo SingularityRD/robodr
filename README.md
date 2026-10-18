@@ -201,6 +201,13 @@ module, no robot):
   confirmed on real Fast DDS and Cyclone DDS samples; XCDR2 / `D_CDR2` and
   the other message types only on hand-built vectors. The Motion Firewall
   runs recording-only, and nothing executes a response.
+- The control-plane action API (`robodr-agentd` `control_plane`, off by
+  default; `docs/contracts/robot-edr.control-plane.md`) authenticates
+  Ed25519-signed SOC requests, judges them against the live safety state
+  and records them, but **executes nothing** (`recorded_not_executed`). It
+  has no TLS (put a terminator in front), keeps request states in memory
+  only, and was run against AutoSecOps' executor in-process over loopback,
+  not against a deployed SOC.
   The Pulsar module (`robodr-sensor-ros2`) runs the same decode for its
   envelope check but does not forward decoded samples (see its crate docs).
 - The black box's TPM 2.0 NV counter head anchor (`TpmNvCounterAnchor`,

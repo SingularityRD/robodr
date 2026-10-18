@@ -155,6 +155,23 @@
 //! (dispositions, `would_have`) are recorded in the black box and carried in
 //! the finding, never executed. Wiring an executor is future work and must
 //! follow `robodr_agent::executor`'s contract.
+//!
+//! # Control-plane requests
+//!
+//! With `control_plane` ([`crate::control`]), listener threads authenticate
+//! SOC action requests and hand them over a bounded channel; the main loop
+//! takes up to [`crate::control::CALLS_PER_POLL`] per iteration and judges
+//! each against the safety state *at that moment* (the live feed is
+//! re-evaluated first), the operational context and the response policy,
+//! records request and decision as a `robodr.control_plane_request` note
+//! (fsynced) and answers. The executor is the recording one: an accepted
+//! request is answered `recorded_not_executed`, nothing reaches the robot.
+//! Failed authentications and authenticated invalid requests become the
+//! observe-only self-health findings
+//! `robot.agent.control_plane_unauthenticated` (High) and
+//! `robot.agent.control_plane_invalid` (Medium), rate-limited by
+//! `health_report_ms`. The control plane is not an input: a quiet SOC never
+//! makes the state `unknown`.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -180,6 +197,7 @@ use robodr_ros2_pipeline::{
 use serde::Serialize;
 
 use crate::config::{check_daemon_dirs, resolve_path, EventInputConfig, Resolved};
+use crate::control::{api as cp_api, ControlPlane, ControlStatus};
 use crate::health::{
     rules as health_rules, DaemonSnapshot, HealthConfig, HealthMonitor, HealthState, InputSnapshot,
     Issue, Recovery, State,
@@ -403,6 +421,9 @@ struct Status<'a> {
     blackbox: BlackboxStatus,
     queue_bytes: usize,
     queue_bytes_max: usize,
+    /// The control-plane API's counters (absent when it is off).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    control_plane: Option<ControlStatus>,
 }
 
 /// The agent's view of the profile: what the pipeline enforces. A profile
@@ -465,6 +486,12 @@ struct Daemon<'a> {
     /// Per input: the forwarder's cumulative `dropped` at its last
     /// heartbeat (host-threat inputs only).
     host_upstream_seen: Vec<u64>,
+    /// The control-plane API (`None` = off).
+    control: Option<ControlPlane>,
+    /// Control-plane counters at their last finding, and when it was raised
+    /// (unauthenticated, invalid).
+    control_reported: [u64; 2],
+    control_reported_at_ms: [Option<u64>; 2],
 }
 
 fn ms(d: Duration) -> u64 {
@@ -656,6 +683,35 @@ impl<'a> Daemon<'a> {
         let spool = Spool::open(&cfg.spool.dir, cfg.spool.max_bytes, cfg.spool.max_files)
             .map_err(|e| DaemonError::Io(format!("spool {}: {e}", cfg.spool.dir.display())))?;
 
+        // The control plane (before the input threads: a bind failure then
+        // leaves nothing running). Answers are signed with the finding key.
+        let control = match &r.control_plane {
+            None => None,
+            Some(spec) => {
+                let signer = match &r.finding_key {
+                    Some((key, key_id)) => Some(
+                        crate::config::signer_for(
+                            robodr_blackbox::sign_ed25519::ED25519,
+                            key,
+                            Some(key_id),
+                        )
+                        .map_err(|e| DaemonError::Config(format!("finding key: {e}")))?,
+                    ),
+                    None => None,
+                };
+                let cp =
+                    ControlPlane::start(spec, &cfg.robot.id, signer).map_err(DaemonError::Io)?;
+                let _ = writeln!(
+                    log,
+                    "robodr-agentd: control plane on {} ({} SOC key(s)); requests are judged and \
+                     recorded, never executed",
+                    cp.status().listening.join(", "),
+                    spec.keys.len()
+                );
+                Some(cp)
+            }
+        };
+
         // Inputs.
         let (tx, rx) = sync_channel::<Msg>(cfg.daemon.queue_capacity);
         let budget = QueueBudget::new(cfg.daemon.queue_bytes);
@@ -846,6 +902,9 @@ impl<'a> Daemon<'a> {
             correlation_pressure_at_ms: None,
             incidents_reported: None,
             host_upstream_seen: Vec::new(),
+            control,
+            control_reported: [0; 2],
+            control_reported_at_ms: [None; 2],
         };
         #[derive(Serialize)]
         struct StartNote<'b> {
@@ -858,6 +917,8 @@ impl<'a> Daemon<'a> {
             safety_state: robodr_responder::SafetyState,
             correlation_rules: Option<usize>,
             signs_findings: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            control_plane: Option<Vec<String>>,
         }
         let initial_safety = d.safety();
         let note = StartNote {
@@ -870,6 +931,7 @@ impl<'a> Daemon<'a> {
             safety_state: initial_safety,
             correlation_rules: d.correlator.as_ref().map(|c| c.rules().len()),
             signs_findings: d.agent.signs_findings(),
+            control_plane: d.control.as_ref().map(|c| c.status().listening),
         };
         let now = d.clock.now();
         if let Err(e) = d.agent.record_note(now, "start note", &note, true) {
@@ -975,6 +1037,7 @@ impl<'a> Daemon<'a> {
             } else {
                 self.receive(wait, next_tick);
             }
+            self.control_poll();
             let now = Instant::now();
             if now >= next_tick {
                 let delay = ms(now.duration_since(next_tick));
@@ -1730,6 +1793,7 @@ impl<'a> Daemon<'a> {
             self.recovery_note(&r);
         }
         self.correlation_tick();
+        self.control_findings();
         self.evidence_incidents();
         self.mark_head();
         for f in self.agent.take_faults() {
@@ -1744,6 +1808,96 @@ impl<'a> Daemon<'a> {
             let _ = writeln!(self.log, "robodr-agentd: spool prune: {e}");
         }
         self.write_status(true);
+    }
+
+    /// Judge, record and answer the control-plane calls that are waiting
+    /// (at most [`crate::control::CALLS_PER_POLL`]).
+    fn control_poll(&mut self) {
+        let Some(mut cp) = self.control.take() else {
+            return;
+        };
+        for m in cp.take_calls() {
+            let a = cp.engine.handle(&m.call, &m.meta, self);
+            let what = match &m.call {
+                cp_api::Call::Submit(r) => Some(format!("{} {}", r.action.as_str(), r.request_id)),
+                cp_api::Call::Revert(id, _) => Some(format!("revert {id}")),
+                cp_api::Call::Invalid(e) => Some(format!("invalid request ({})", e.code)),
+                _ => None,
+            };
+            if let Some(what) = what {
+                let status = a.body["status"]
+                    .as_str()
+                    .or_else(|| a.body["error"]["code"].as_str())
+                    .unwrap_or("?");
+                let code = a.body["refusal"]["code"]
+                    .as_str()
+                    .map(|c| format!(" ({c})"))
+                    .unwrap_or_default();
+                let _ = writeln!(
+                    self.log,
+                    "robodr-agentd: control plane: {} from key {}: {status}{code}",
+                    sanitize(&what),
+                    sanitize(&m.meta.key_id)
+                );
+            }
+            // The connection may have given up (timeout): nothing to do.
+            let _ = m.reply.try_send(a);
+        }
+        self.control = Some(cp);
+    }
+
+    /// Rising control-plane failure counters become observe-only
+    /// self-health findings, at most one per counter every
+    /// `health_report_ms`.
+    fn control_findings(&mut self) {
+        let Some(cp) = &self.control else {
+            return;
+        };
+        let counts = [
+            cp.counters().unauthenticated.load(Ordering::Relaxed),
+            cp.engine.stats.invalid,
+        ];
+        let last = cp.counters().last_auth_failure();
+        let now_ms = self.now_ms();
+        let every = self.r.config.daemon.health_report_ms;
+        for (i, &count) in counts.iter().enumerate() {
+            if count <= self.control_reported[i]
+                || self.control_reported_at_ms[i].is_some_and(|t| now_ms.saturating_sub(t) < every)
+            {
+                continue;
+            }
+            let delta = count - self.control_reported[i];
+            self.control_reported[i] = count;
+            self.control_reported_at_ms[i] = Some(now_ms);
+            let dev = if i == 0 {
+                robodr_events::Deviation::new(
+                    health_rules::CONTROL_PLANE_UNAUTHENTICATED,
+                    robodr_events::Severity::High,
+                    format!(
+                        "the control-plane API refused {delta} request(s) that failed \
+                         authentication ({} in total; bad or missing signature, unknown key, \
+                         stale timestamp or replayed nonce): someone without a SOC key may be \
+                         trying to request robot actions; nothing was judged or executed; last: \
+                         {}",
+                        count,
+                        last.as_deref().unwrap_or("-")
+                    ),
+                )
+            } else {
+                robodr_events::Deviation::new(
+                    health_rules::CONTROL_PLANE_INVALID,
+                    robodr_events::Severity::Medium,
+                    format!(
+                        "the control-plane API refused {delta} authenticated request(s) as \
+                         invalid ({} in total: an action, parameter, ttl or authority the API \
+                         never allows); each is recorded as a robodr.control_plane_rejected \
+                         note; nothing was executed",
+                        count
+                    ),
+                )
+            };
+            self.self_health("agentd:control_plane", dev);
+        }
     }
 
     fn recovery_note(&mut self, r: &Recovery) {
@@ -1833,6 +1987,7 @@ impl<'a> Daemon<'a> {
             },
             queue_bytes: self.budget.used(),
             queue_bytes_max: self.budget.max(),
+            control_plane: self.control.as_ref().map(ControlPlane::status),
         };
         let res = serde_json::to_vec_pretty(&status)
             .map_err(std::io::Error::other)
@@ -1858,6 +2013,8 @@ impl<'a> Daemon<'a> {
             profile_accepted: Option<&'b robodr_commission::trust::AcceptedState>,
             #[serde(skip_serializing_if = "Option::is_none")]
             correlation: Option<robodr_correlate::Stats>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            control_plane: Option<ControlStatus>,
         }
         self.stats.heartbeats += 1;
         let stats = self.stats;
@@ -1872,6 +2029,7 @@ impl<'a> Daemon<'a> {
             spool: self.spool.stats(),
             profile_accepted: self.profile_accepted.as_ref(),
             correlation: self.correlator.as_ref().map(|c| *c.stats()),
+            control_plane: self.control.as_ref().map(ControlPlane::status),
         };
         // Serialise first: `hb` borrows self immutably.
         let value = serde_json::to_value(&hb).unwrap_or(serde_json::Value::Null);
@@ -1888,6 +2046,11 @@ impl<'a> Daemon<'a> {
 
     fn shutdown(mut self, reason: StopReason) -> Result<Summary, DaemonError> {
         let _ = writeln!(self.log, "robodr-agentd: stopping ({reason:?})");
+        // No request is judged during shutdown: queued ones are answered
+        // 503 by their connections (the channel closes).
+        if let Some(cp) = self.control.as_mut() {
+            cp.shutdown();
+        }
         self.stop_inputs.store(true, Ordering::SeqCst);
         // Join inputs that poll the stop flag (bounded by their timeouts);
         // stdin may block forever and is left behind.
@@ -1932,5 +2095,65 @@ impl<'a> Daemon<'a> {
             last_state: self.last_state,
             finished,
         })
+    }
+}
+
+/// The control-plane engine's view of the daemon.
+impl cp_api::Host for Daemon<'_> {
+    fn safety_state(&mut self) -> SafetyState {
+        self.safety()
+    }
+
+    fn safety_source(&self) -> &'static str {
+        if self.feed.is_some() {
+            "safety_feed"
+        } else {
+            "configuration"
+        }
+    }
+
+    fn context(&self) -> OperationalContext {
+        let c = &self.r.config.context;
+        OperationalContext {
+            platform: self.r.policy.platform,
+            phase: c.phase,
+            connectivity: c.connectivity,
+            control: c.control,
+            operator_present: c.operator_present,
+            // Locked in the agent *and* enforced by the pipeline.
+            profile_locked: self.agent.profile().locked
+                && self.pipeline.status() == &ProfileStatus::Enforcing,
+        }
+    }
+
+    fn policy(&self) -> &robodr_responder::ResponsePolicy {
+        &self.r.policy
+    }
+
+    fn caps(&self) -> cp_api::EnvelopeCaps {
+        cp_api::EnvelopeCaps::of(self.agent.profile())
+    }
+
+    fn health(&self) -> &'static str {
+        match self.last_state.state {
+            State::Ok => "ok",
+            State::Degraded => "degraded",
+            State::Unknown => "unknown",
+        }
+    }
+
+    fn wall_ms(&self) -> u64 {
+        self.clock.now().wall_ns / 1_000_000
+    }
+
+    fn record(&mut self, what: &str, note: &serde_json::Value) -> Result<String, String> {
+        let now = self.clock.now();
+        match self.agent.record_note(now, what, note, true) {
+            Ok(r) => Ok(r.uri(&self.r.config.robot.id)),
+            Err(e) => {
+                self.stats.note_errors += 1;
+                Err(e.join("; "))
+            }
+        }
     }
 }

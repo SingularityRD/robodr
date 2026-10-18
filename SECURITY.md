@@ -109,6 +109,52 @@ an attacker rewrote: then only the receiver's side shows it (marks stop
 arriving, or arrive lower). The receiver's own host, state directory and
 signing key are trusted. Reports that break the claims above are in scope.
 
+### Control-plane action API: what is claimed
+
+`robodr-agentd`'s optional `control_plane` API (off unless configured;
+contract `docs/contracts/robot-edr.control-plane.md`) lets a SOC request one
+of six containment actions. The claims are:
+
+- **Nothing is executed.** In this release the only executor records: an
+  accepted request is answered `recorded_not_executed` (`"executed":
+  false`) and written to the black box as a plan; nothing is sent to the
+  robot, its network, its mission executive or its safety system.
+- **No request without a SOC key.** Every request must carry an Ed25519
+  signature by a configured SOC public key over the method, the exact
+  target, this robot's id, the key id, a timestamp, a nonce and the body
+  hash. A modified, re-targeted (another robot) or replayed request is
+  refused; the nonce cache fails closed when full. Unauthenticated
+  requests are never judged or recorded one by one; they are counted and
+  reported (`robot.agent.control_plane_unauthenticated`, High,
+  observe-only).
+- **A valid key cannot ask for more.** Six action classes with their own
+  parameters and TTL rules; no motion command, force or override field
+  exists, and `authority` must be `request`. The strongest action is a
+  *request* for a safe state. Every request is judged against the current
+  safety state: while the e-stop or safe state is active everything is
+  refused, observe mode refuses everything, motion-affecting requests are
+  refused while a person commands motion or during take-off / landing, and
+  nothing above the response policy's ceiling for the state is accepted.
+  Authenticated but invalid requests are refused, recorded and reported
+  (`robot.agent.control_plane_invalid`).
+- **Every decision is evidence.** Request (with its signature and body, so it
+  re-verifies offline), safety state, context and decision are one signed,
+  fsynced black-box note; if the black box does not take it, the answer is
+  `failed` and nothing is claimed or stored.
+- **Bounded.** Parsing, connections, the per-key rate limit and the queue
+  to the main loop are bounded; a flood costs the control plane's
+  availability (429 / 503), never the detection loop's.
+
+Not claimed: confidentiality (agentd has no TLS stack; listen on loopback or
+a unix socket and terminate TLS in front for remote SOCs); authenticity of
+answers unless `finding_signing` is configured (answers are then signed with
+the finding key, bound to the request signature); availability against a
+network attacker; protection when the SOC's private key or the robot's
+configuration (`soc_keys`) is compromised; correct judgment when the safety
+state source is wrong (see the live safety feed's own limits). Reports that
+break the claims above, or any way the API reaches the robot, are in scope
+(the latter is always Critical).
+
 ## Supported versions
 
 RoboDR is pre-1.0. Only the latest release line receives security fixes.
