@@ -21,7 +21,10 @@
 #   SOURCE_DATE_EPOCH   timestamp for every file
 #   DEB_DEPENDS         Depends: field (default below; Rust binaries link
 #                       glibc + libgcc_s, robodr-pulsard also libsqlite3
-#                       unless built with Pulsar's sqlite3-vendored feature)
+#                       unless built with Pulsar's sqlite3-vendored feature;
+#                       the default libc6 floor is the newest GLIBC_x.y
+#                       version the packaged binaries need, at least 2.35,
+#                       read with readelf)
 #   DEB_MAINTAINER      Maintainer: field
 #   ROBODR_DEB_REQUIRE  extra binaries that must be present
 set -euo pipefail
@@ -53,7 +56,10 @@ if [[ -z "${SOURCE_DATE_EPOCH:-}" ]]; then
     SOURCE_DATE_EPOCH="$(git -C "$root" log -1 --format=%ct 2>/dev/null || echo 0)"
 fi
 export SOURCE_DATE_EPOCH
-depends="${DEB_DEPENDS:-libc6 (>= 2.35), libgcc-s1, libsqlite3-0, systemd (>= 247)}"
+# Default Depends; the libc6 floor is raised below to the newest GLIBC_x.y
+# symbol version any packaged binary requires.
+libc_floor=2.35
+depends_rest="libgcc-s1, libsqlite3-0, systemd (>= 247)"
 maintainer="${DEB_MAINTAINER:-RoboDR maintainers <robodr-maintainers@invalid>}"
 
 mkdir -p "$out"
@@ -167,6 +173,25 @@ fi
 # group), regular files keep the modes set above.
 find "$pkg" -type d -exec chmod 0755 {} +
 [[ -d "$pkg/etc/robodr" ]] && chmod 0750 "$pkg/etc/robodr"
+
+# libc6 floor from the binaries' version needs (readelf -V reads any ELF
+# arch). Rust std references e.g. pidfd_spawnp@GLIBC_2.39 when linked on a
+# glibc >= 2.39 host; the reference is weak, but its version need is not, so
+# ld.so refuses to start the binary on an older glibc. A hard-coded floor
+# below that would let dpkg install a package that cannot run.
+if [[ -n "${DEB_DEPENDS:-}" ]]; then
+    depends="$DEB_DEPENDS"
+else
+    command -v readelf >/dev/null || { echo "build-deb: readelf (binutils) not found; needed for the libc6 floor (or set DEB_DEPENDS)" >&2; exit 2; }
+    need="$(find "$pkg/usr" -type f \( -path "$pkg/usr/bin/*" -o -path "$pkg/usr/sbin/*" \) | LC_ALL=C sort |
+        xargs -r readelf -V --wide 2>/dev/null | sed -n 's/.*Name: GLIBC_\([0-9][0-9.]*\).*/\1/p' |
+        sort -uV | tail -n1)"
+    if [[ -n "$need" ]]; then
+        libc_floor="$(printf '%s\n%s\n' "$libc_floor" "$need" | sort -V | tail -n1)"
+    fi
+    echo "build-deb: libc6 (>= $libc_floor)" >&2
+    depends="libc6 (>= $libc_floor), $depends_rest"
+fi
 
 installed_kb="$(du -sk --exclude=DEBIAN "$pkg" | cut -f1)"
 sed -e "s|@VERSION@|$deb_version|" -e "s|@ARCH@|$arch|" \
