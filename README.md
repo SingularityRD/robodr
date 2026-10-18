@@ -177,6 +177,9 @@ module, no robot):
 - `robodr-pulsard` ran in WSL2 (kernel 6.18), not on a robot: the multicast
   join on the robot's interface and coexistence with each DDS vendor on the
   same host are open.
+- arm64 is cross-built and tested under qemu-user only (docs/BUILD.md,
+  "arm64 (cross-compiled, 2026-10-18)"). Not tested on arm64 hardware, and
+  Pulsar's eBPF probes have never been loaded on an arm64 kernel.
 - `rules/robodr/*.toml` are checked by `scripts/validate_rules.py` only, not
   loaded into a running Pulsar rules engine.
 - The firewall, motion monitor, responder, black box and OCSF mapper run

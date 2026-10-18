@@ -350,6 +350,31 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Fixed
 
+- First arm64 build (2026-10-18), cross-compiled on x86_64 with tests run
+  under qemu-user; record in `docs/BUILD.md`, "arm64 (cross-compiled,
+  2026-10-18)". The whole workspace, `robodr-pulsard` and its eBPF probes
+  included, builds for `aarch64-unknown-linux-gnu` without source changes.
+  Tests: 1946 of 1949 pass; the 3 failures come from qemu (no
+  `PACKET_STATISTICS`, posix_spawn exec errors not reported, debug timing),
+  not from arm64. The release steps produce an arm64 `.deb`, offline bundle,
+  SBOM tarball and `SHA256SUMS-arm64`. The 10 pure binaries are
+  bit-identical across paths and runs. eBPF on an arm64 kernel is still
+  untested. Fixed by that run:
+  - `packaging/build-deb.sh` declared `libc6 (>= 2.35)`, but
+    `robodr-agentd` and `robodr-blackbox` built on a glibc 2.39 host (the
+    ubuntu-24.04 runners included, both arches) need `GLIBC_2.39`
+    (non-weak version need from Rust std's `pidfd_spawnp`). On an older
+    glibc they would install but not start. The libc6 floor now comes from
+    the packaged binaries (`readelf -V`).
+  - `packaging/build-deb.sh` refuses binaries whose ELF machine does not
+    match `--arch`.
+  - `scripts/ci-repro.sh` honours `CARGO_BUILD_TARGET` for cross builds.
+    The workflow's native path is unchanged.
+  - Not fixed: `robodr-pulsard` (clang-built eBPF objects) and the
+    cargo-cyclonedx SBOMs embed the checkout path, so the `.deb`, the bundle
+    and the SBOM tarball are reproducible only from the same path (same on
+    amd64).
+
 - `robodr-export` Kafka producer (found against a real broker): a batch
   refused with `MESSAGE_TOO_LARGE` only because of its total size (topic
   `max.message.bytes` below `max_request_bytes`) degraded the partition to
