@@ -22,3 +22,8 @@ name = "robodr-blackbox"
 path = "src/bin/robodr-blackbox.rs"
 # Same crate name as the library: keep it out of rustdoc to avoid a collision.
 doc = false
+
+# Off-unit receiver of the remote head anchor (src/remote_anchor.rs).
+[[bin]]
+name = "robodr-anchor-receiver"
+path = "src/bin/robodr-anchor-receiver.rs"

@@ -920,7 +920,7 @@ together with a rolled-back `head.json`, or a wiped store.
 `{"kind": "file", "path": "/abs/path"}` keeps the mark in a file outside
 `blackbox.dir` and `spool.dir`; it is only as strong as the storage it
 lives on. **A deployment must anchor to a TPM NV monotonic counter** (kind
-`tpm_nv_counter`, below) or a remote receiver (not implemented).
+`tpm_nv_counter`, below) **or a remote receiver** (kind `remote`, below).
 
 **TPM NV counter anchor** (`tpm_nv_counter`). The TPM counter counts the
 black box's head marks and can never go back; a sidecar file signed with
@@ -993,6 +993,120 @@ prevented. The window is the newest marks: records after the last mark
 (at most 16 records or 1 s, see the black-box README) and, against an
 attacker who restores a sidecar of the same count, up to
 `min_increment_interval_ms`.
+
+**Remote anchor** (`remote`). The head marks go to
+`robodr-anchor-receiver` on a **base station or fleet host** (never the
+robot itself), which keeps per robot the highest mark and only ever raises
+it. At every start agentd asks for that mark with a fresh nonce; the answer
+is signed by the receiver's key and carries the robot's own signed mark, so
+a cut log with rolled-back state files is reported as Critical
+`robot.agent.evidence_truncated`, and a wiped store too. A receiver that is
+down or unreachable never stops recording: the open counts an anchor
+failure (`status.json` `anchor_failures`, named in the signed `Resume`
+record); marks are queued (newest only) and resent when it is back.
+
+Requirements: an **Ed25519** black-box key (the receiver verifies marks with
+its public half; HMAC is refused) and a **reverse channel** from the robot
+to the receiver (TCP, default port 7461) at least when agentd starts. A
+robot that is air-gapped during the mission needs a receiver on its local
+base station (private link), or the detect-only mode below.
+
+Receiver keys and config, on the base station (as root):
+
+```sh
+install -d -m 0700 /etc/robodr-anchor-receiver
+install -d -m 0755 /etc/robodr-anchor-receiver/units
+robodr-blackbox keygen --out /etc/robodr-anchor-receiver/receiver.key --key-id anchor-rx-site1
+# carry receiver.key.pub to every robot (vetted media), e.g.
+#   /etc/robodr/anchor-receiver.pub (0644, root)
+# carry each robot's black-box public key here (from section 4.2), e.g.
+#   /etc/robodr-anchor-receiver/units/ugv-07.pub
+```
+
+`/etc/robodr-anchor-receiver/receiver.json`:
+
+```json
+{
+  "listen": "0.0.0.0:7461",
+  "state_dir": "/var/lib/robodr-anchor-receiver",
+  "key_file": "/run/credentials/robodr-anchor-receiver.service/receiver.key",
+  "units": [
+    {"unit": "ugv-07", "public_key": "/etc/robodr-anchor-receiver/units/ugv-07.pub"}
+  ],
+  "max_connections": 64,
+  "io_timeout_ms": 5000
+}
+```
+
+`unit` is the robot's `robot.id`; a public key bound to a device
+(`keygen --device`) must name that robot. Then
+`systemctl enable --now robodr-anchor-receiver` (the unit runs as a dynamic
+user, gets the key through `LoadCredential=`, keeps its state in
+`/var/lib/robodr-anchor-receiver`). Restrict who may connect with an
+`IPAddressAllow=` drop-in; every mark and answer is authenticated anyway.
+`robodr-anchor-receiver status --config /etc/robodr-anchor-receiver/receiver.json`
+prints the held seq and alert count per robot: **watch it** (a robot whose
+held seq stops moving while it runs has lost its link, or someone is
+suppressing its marks).
+
+On the robot (`agentd.json`):
+
+```json
+"head_anchor": {
+  "kind": "remote",
+  "address": "10.20.0.1:7461",
+  "receiver_public_key": "/etc/robodr/anchor-receiver.pub",
+  "timeout_ms": 2000
+}
+```
+
+`address` is `host:port` (an IP literal avoids DNS at start);
+`receiver_public_key` must be absolute and outside `blackbox.dir` and
+`spool.dir`; `timeout_ms` (100..=30000, default 2000) bounds connect, write
+and read each, so a start waits at most about three times that for the
+receiver. Marks never wait for the network.
+
+**Alerts.** The receiver refuses and records (journal line,
+`/var/lib/robodr-anchor-receiver/alerts.jsonl`, per-robot counter): `lower`
+(a mark below the held one: the robot went back, e.g. it started without
+reaching the receiver after a rollback, or an old mark was replayed),
+`fork` (another record at the held seq: the log was rewritten with the
+robot's key), `bad_signature`, and `chain_change` (a higher mark of a new
+chain: a replaced store, stored). `state_unusable` means a state file in
+`units/` no longer verifies: that robot is refused until you investigate;
+nothing resets it silently. Treat every alert as tamper evidence until
+explained.
+
+**Key rotation** (section 4.3) is a new chain: when a robot's black-box key
+changes, replace its `.pub` on the receiver and move
+`/var/lib/robodr-anchor-receiver/units/<robot>.json` into the archive with
+the old chain (with the service stopped). Replacing the receiver key: give
+every robot the new `.pub` at the same time.
+
+**Detect-only through the diode** (no reverse channel at all). On the robot,
+with the export (section 8):
+
+```sh
+robodr-blackbox anchor-mark /var/lib/robodr/blackbox/agentd \
+  --key /etc/robodr/keys/agentd-blackbox.key --unit ugv-07 \
+  --out /var/lib/robodr/export/anchor-mark-$(date -u +%Y%m%dT%H%M%SZ).json
+```
+
+On the high side, in order of the files' times:
+
+```sh
+robodr-anchor-receiver ingest --config /etc/robodr-anchor-receiver/oneway.json FILE...
+```
+
+(exit 1 = a mark was refused and alerted). Use a separate root-owned 0700
+`state_dir` for one-way ingest (`ingest` needs the directory's lock, so it
+cannot share one with a running `serve`). The robot is never told; a
+rollback is detected on the far side, at the next mark that arrives.
+
+Limits: tested over loopback with a real receiver process, not across a
+real network. Rollback and truncation become detectable, not prevented;
+the window is the newest marks that have not reached the receiver. No TLS:
+marks (hashes, sequence numbers) are visible on the wire.
 
 ## 7. Upgrade and rollback
 

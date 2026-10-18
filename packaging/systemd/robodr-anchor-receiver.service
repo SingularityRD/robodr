@@ -1,0 +1,91 @@
+# robodr-anchor-receiver: off-unit home of black-box head marks
+# (robodr_blackbox::remote_anchor; docs/OPERATIONS.md, "Remote anchor").
+#
+# Runs on a BASE STATION or fleet host, never on the robot it anchors: an
+# anchor on the unit's own disk adds nothing against an attacker with write
+# access to the unit. It is shipped in the robodr package so a base station
+# can install the same verified release; it is not enabled by the package.
+#
+# It only stores and answers; it takes no action on any robot. If it is
+# down, robots keep recording and count anchor failures.
+#
+# Files (root-owned, created by the operator):
+#   /etc/robodr-anchor-receiver/receiver.json      config (key_file must be
+#       /run/credentials/robodr-anchor-receiver.service/receiver.key)
+#   /etc/robodr-anchor-receiver/receiver.key       receiver Ed25519 secret, 0600
+#   /etc/robodr-anchor-receiver/units/*.pub        each robot's black-box public key
+# State: /var/lib/robodr-anchor-receiver (StateDirectory; set "state_dir" to
+# it): units/<id>.json (held marks) and alerts.jsonl.
+#
+# Verify after editing: systemd-analyze verify robodr-anchor-receiver.service
+#                       systemd-analyze security robodr-anchor-receiver.service
+
+[Unit]
+Description=RoboDR remote head-anchor receiver (black-box high-water marks)
+Documentation=man:robodr-anchor-receiver(8) file:/usr/share/doc/robodr/OPERATIONS.md
+AssertPathExists=/etc/robodr-anchor-receiver/receiver.json
+After=local-fs.target network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/robodr-anchor-receiver serve --config /etc/robodr-anchor-receiver/receiver.json
+Restart=on-failure
+RestartSec=5s
+# Exit 2 = config, key or state error: restarting does not fix it.
+RestartPreventExitStatus=2
+TimeoutStopSec=10s
+MemoryMax=256M
+TasksMax=128
+
+# --- Identity --------------------------------------------------------------
+# A transient user; it needs no capability (binds an unprivileged port).
+DynamicUser=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+UMask=0077
+
+# --- Filesystem --------------------------------------------------------------
+# State survives restarts and upgrades (/var/lib/private/... with
+# DynamicUser); every write is an atomic replace + fsync, so a kill at any
+# point leaves the last committed marks.
+StateDirectory=robodr-anchor-receiver
+StateDirectoryMode=0700
+# The signing key is handed over by systemd, never read from /etc directly.
+LoadCredential=receiver.key:/etc/robodr-anchor-receiver/receiver.key
+InaccessiblePaths=-/etc/robodr-anchor-receiver/receiver.key
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# --- Network / syscalls --------------------------------------------------------
+# TCP only. Restrict who may connect with IPAddressAllow=/IPAddressDeny= in a
+# drop-in (e.g. the robots' subnet); the protocol authenticates every mark
+# and answer, the filter only cuts noise.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete @mount @swap @reboot @raw-io @cpu-emulation @clock @module @debug
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

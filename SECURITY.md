@@ -51,7 +51,8 @@ system, e-stop or command authority. Reports in scope include:
   writer, or a rule bypass.
 - **Integrity of evidence**: forging, truncating, reordering or replaying
   black-box records or export bundles without detection; export-cursor or ack
-  forgery.
+  forgery; making a head anchor (TPM NV counter, remote receiver) accept a
+  lower mark or making a unit accept one from it (see below).
 - **Profile and commissioning**: poisoning a learned profile, bypassing
   sign-off, or loading an unsealed or tampered locked profile as enforcing.
 - **Robustness**: a crash, hang, unbounded memory or CPU use, or panic driven
@@ -78,6 +79,35 @@ Out of scope:
 - the HMAC-SHA256 black-box authenticator being a shared-key MAC. This is a
   documented placeholder (`crates/robodr-blackbox/README.md`). Report attacks
   on its *use*, not on the fact that it is symmetric.
+
+### Black-box head anchors: what is claimed
+
+A cut of the newest black-box records combined with a rollback of the
+unit's state files is detectable only with a head anchor the unit's
+attacker cannot rewind (`blackbox.head_anchor`; details in
+`crates/robodr-blackbox/README.md`). For the **remote** anchor
+(`robodr-anchor-receiver` on a base station) the claims are:
+
+- the receiver never lowers the mark it holds for a unit: only an
+  authentic mark (the unit's Ed25519 signature over unit, chain id, seq,
+  hash, key id; the record's own signature covers only the hash) with a
+  higher seq replaces it; lower seqs, forks at the held seq and bad
+  signatures are refused and alerted, and a replayed old mark changes
+  nothing;
+- a unit never accepts a lower mark (or "none") from the network: the
+  answer to its query is bound to a fresh nonce and signed by the receiver
+  key it is configured with, and the mark inside must carry the unit's own
+  signature;
+- a network attacker can drop marks and answers. Dropped marks widen the
+  window (the receiver lags; watch `robodr-anchor-receiver status`), a
+  dropped answer is an anchor failure on the signed record, never a clean
+  open.
+
+Not claimed: confidentiality of marks (no TLS; hashes and seqs only);
+protection of a unit whose configuration (receiver address and public key)
+an attacker rewrote: then only the receiver's side shows it (marks stop
+arriving, or arrive lower). The receiver's own host, state directory and
+signing key are trusted. Reports that break the claims above are in scope.
 
 ## Supported versions
 

@@ -21,7 +21,7 @@ configure)
         systemctl daemon-reload || true
         if [ -n "$2" ]; then
             # Upgrade: restart only what was running.
-            for u in robodr-pulsard.service robodr-agentd.service; do
+            for u in robodr-pulsard.service robodr-agentd.service robodr-anchor-receiver.service; do
                 systemctl try-restart "$u" || true
             done
         else

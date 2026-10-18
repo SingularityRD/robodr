@@ -13,6 +13,8 @@
 #             robodr-agentd, robodr-blackbox, robodr-diode-pack,
 #             robodr-diode-unpack, robodr-spool-export,
 #             robodr-kafka-publish (pure crates; the release requires them)
+#             robodr-anchor-receiver (pure; base-station side of the remote
+#             head anchor, installed with its unit when built)
 # A unit file is only installed together with its binary. ROBODR_DEB_REQUIRE
 # (space separated) makes optional binaries mandatory; the release workflow
 # sets it so a release can never silently ship without the daemon.
@@ -130,6 +132,11 @@ if install_bin robodr-agentd usr/sbin 0; then
     install -D -m 0644 "$here/systemd/robodr-agentd.service" "$pkg/$units/robodr-agentd.service"
     install -D -m 0644 "$here/systemd/robodr-agentd.service.d/20-finding-key.conf.example" \
         "$pkg/usr/share/doc/robodr/examples/robodr-agentd.service.d/20-finding-key.conf.example"
+fi
+# Base-station side of the remote head anchor (not enabled by the package).
+if install_bin robodr-anchor-receiver usr/bin 0; then
+    install -D -m 0644 "$here/systemd/robodr-anchor-receiver.service" \
+        "$pkg/$units/robodr-anchor-receiver.service"
 fi
 
 install -D -m 0644 "$here/tmpfiles.d/robodr.conf" "$pkg/usr/lib/tmpfiles.d/robodr.conf"

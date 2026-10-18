@@ -12,6 +12,26 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Added
 
+- Remote head anchor for the black box
+  (`robodr_blackbox::remote_anchor`): `RemoteHeadAnchor` on the unit sends
+  every head mark, signed with the black-box key over (unit, chain id, seq,
+  hash, key id), to the new std-only `robodr-anchor-receiver` daemon on a
+  base station, which verifies it under the unit's public key, keeps the
+  highest mark per unit durably (atomic replace + fsync before it answers)
+  and refuses and alerts lower marks, forks and bad signatures
+  (`alerts.jsonl`, log line, per-unit counter). At open the unit queries the
+  held mark with a fresh nonce; the answer is signed by the receiver's
+  Ed25519 key and the mark inside verified under the unit's own key, so a
+  man-in-the-middle can neither feed a lower mark nor replay an old answer
+  (dropping it is an anchor failure). Marks are delivered by a background
+  thread with a coalescing one-slot queue, so `append` never waits for the
+  network. `robodr-agentd` `blackbox.head_anchor` kind `remote`
+  (`address`, `receiver_public_key`, `timeout_ms`; Ed25519 black-box key
+  required). Detect-only mode for diode-only sites:
+  `robodr-blackbox anchor-mark` + `robodr-anchor-receiver ingest`. Packaging:
+  `robodr-anchor-receiver.service` (base station, disabled) and
+  `robodr-anchor-receiver(8)`. Tested with a real receiver process over
+  loopback, not across a real network.
 - `robodr-kafka-publish` / the std-only Kafka producer run against real
   Apache Kafka brokers for the first time: `scripts/kafka-it.sh` starts a
   single-node KRaft broker in docker (`apache/kafka:3.9.1` by default,
