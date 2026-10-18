@@ -1032,6 +1032,9 @@ fn lock_dir(dir: &Path) -> Result<File, Error> {
 
 /// `flock(LOCK_EX | LOCK_NB)` on `path` (created 0600 if missing); held as
 /// long as the returned file.
+/// Attempts at `flock` before reporting [`Error::Locked`] (10 ms apart).
+const LOCK_RETRIES: u32 = 25;
+
 pub(crate) fn lock_file(path: PathBuf) -> Result<File, Error> {
     let mut o = OpenOptions::new();
     o.read(true).write(true).create(true);
@@ -1039,16 +1042,28 @@ pub(crate) fn lock_file(path: PathBuf) -> Result<File, Error> {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
-        // SAFETY: `flock` only reads its two integer arguments; the fd is
-        // owned by `f`, which is alive for the duration of the call.
-        let rc = unsafe { sys::flock(f.as_raw_fd(), sys::LOCK_EX | sys::LOCK_NB) };
-        if rc != 0 {
+        // A child process forked by this process (e.g. a `tpm2_*` tool of
+        // the TPM anchor) holds a copy of the previous recorder's lock fd
+        // until it execs (the fd is close-on-exec), so a reopen right after
+        // a close can see the lock held for a moment. Retry briefly; a lock
+        // held by another live recorder stays `Locked`.
+        let mut tries = 0u32;
+        loop {
+            // SAFETY: `flock` only reads its two integer arguments; the fd
+            // is owned by `f`, which is alive for the duration of the call.
+            let rc = unsafe { sys::flock(f.as_raw_fd(), sys::LOCK_EX | sys::LOCK_NB) };
+            if rc == 0 {
+                break;
+            }
             let e = io::Error::last_os_error();
-            return Err(if e.kind() == io::ErrorKind::WouldBlock {
-                Error::Locked { path }
-            } else {
-                Error::Io(e)
-            });
+            if e.kind() != io::ErrorKind::WouldBlock {
+                return Err(Error::Io(e));
+            }
+            tries += 1;
+            if tries >= LOCK_RETRIES {
+                return Err(Error::Locked { path });
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
     Ok(f)
