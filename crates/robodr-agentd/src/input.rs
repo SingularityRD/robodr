@@ -8,6 +8,7 @@
 //! | JSONL `RobotEvent`s on stdin | bounded line reader | EOF / error |
 //! | JSONL `RobotEvent`s on a unix socket | listener + one reader per connection | error / stop |
 //! | JSONL safety reports (`{"state":"estop_active"}`) on the `safety_feed` socket | same listener, [`parse_safety_line`] | error / stop |
+//! | JSONL Pulsar threats / heartbeats on the `host_threats` socket | same listener with a peer-uid check ([`run_unix_listener_peers`]), [`crate::host::parse_host_line`] | error / stop |
 //!
 //! # Backpressure and memory bound
 //!
@@ -137,6 +138,8 @@ pub enum Payload {
     Event(Box<RobotEvent>),
     /// A line of the safety-state socket (see [`crate::safety`]).
     Safety(crate::safety::SafetyReport),
+    /// A line of the host-threat socket (see [`crate::host`]).
+    Host(crate::host::HostLine),
 }
 
 /// Turns one trimmed, non-empty, non-comment line into a payload, or says
@@ -187,8 +190,15 @@ pub struct InputStats {
     pub budget_drops: AtomicU64,
     /// Lines that were too long, not UTF-8 or not a `RobotEvent`.
     pub malformed: AtomicU64,
-    /// Rejected connections (unix socket over `max_connections`).
+    /// Rejected connections (unix socket over `max_connections`, or a peer
+    /// the listener's peer policy refused).
     pub rejected_connections: AtomicU64,
+    /// Connections open right now (unix-socket inputs).
+    pub connections: AtomicU64,
+    /// Items the producer itself reported lost before they reached this
+    /// input (host-threat forwarder heartbeats). Health counts them like
+    /// queue drops.
+    pub upstream_dropped: AtomicU64,
     /// Milliseconds since the daemon epoch of the last **valid** item, plus
     /// one (0 = never). Malformed items do not update it.
     pub last_rx_ms1: AtomicU64,
@@ -282,7 +292,7 @@ impl Feed {
     pub fn send(&self, payload: Payload) -> bool {
         let size = match &payload {
             Payload::Datagram(d) => d.payload.capacity().saturating_add(d.src_ip.capacity()),
-            Payload::Event(_) | Payload::Safety(_) => EVENT_ESTIMATE_BYTES,
+            Payload::Event(_) | Payload::Safety(_) | Payload::Host(_) => EVENT_ESTIMATE_BYTES,
         };
         self.send_sized(payload, size)
     }
@@ -589,6 +599,22 @@ pub fn run_unix_listener_with(
     feed: Feed,
     parse: LineParser,
 ) {
+    run_unix_listener_peers(sock, max_connections, stop, feed, parse, None);
+}
+
+/// [`run_unix_listener_with`] that, with `allowed_uids`, also checks every
+/// connection's peer (`SO_PEERCRED`, [`crate::host::peer_uid`]): a peer
+/// whose uid is not listed (or whose credentials cannot be read) is closed
+/// before anything is read, counted in [`InputStats::rejected_connections`]
+/// and noted as malformed input (so health reports it, rate-limited).
+pub fn run_unix_listener_peers(
+    sock: EventSocket,
+    max_connections: usize,
+    stop: Arc<AtomicBool>,
+    feed: Feed,
+    parse: LineParser,
+    allowed_uids: Option<Vec<u32>>,
+) {
     let listener = &sock.listener;
     let active = Arc::new(AtomicUsize::new(0));
     let mut readers: Vec<JoinHandle<()>> = Vec::new();
@@ -597,6 +623,25 @@ pub fn run_unix_listener_with(
         match listener.accept() {
             Ok((conn, _)) => {
                 readers.retain(|h| !h.is_finished());
+                if let Some(allowed) = &allowed_uids {
+                    let refused = match crate::host::peer_uid(&conn) {
+                        Ok(uid) if crate::host::peer_allowed(uid, allowed) => None,
+                        Ok(uid) => Some(format!(
+                            "connection from uid {uid} refused (allowed uids: {allowed:?})"
+                        )),
+                        Err(e) => Some(format!(
+                            "connection refused: peer credentials unreadable: {e}"
+                        )),
+                    };
+                    if let Some(why) = refused {
+                        feed.stats
+                            .rejected_connections
+                            .fetch_add(1, Ordering::Relaxed);
+                        feed.malformed(&why);
+                        drop(conn);
+                        continue;
+                    }
+                }
                 if active.load(Ordering::SeqCst) >= max_connections {
                     feed.stats
                         .rejected_connections
@@ -605,6 +650,7 @@ pub fn run_unix_listener_with(
                     continue;
                 }
                 active.fetch_add(1, Ordering::SeqCst);
+                feed.stats.connections.fetch_add(1, Ordering::Relaxed);
                 next_conn = next_conn.saturating_add(1);
                 let (c_stop, c_feed, c_active) =
                     (stop.clone(), feed.for_connection(next_conn), active.clone());
@@ -613,6 +659,7 @@ pub fn run_unix_listener_with(
                     .spawn(move || {
                         serve_connection(conn, &c_stop, &c_feed, parse);
                         c_active.fetch_sub(1, Ordering::SeqCst);
+                        c_feed.stats.connections.fetch_sub(1, Ordering::Relaxed);
                     });
                 match spawned {
                     Ok(h) => readers.push(h),
@@ -620,6 +667,7 @@ pub fn run_unix_listener_with(
                         // Could not spawn: the closure (and the connection)
                         // was dropped.
                         active.fetch_sub(1, Ordering::SeqCst);
+                        feed.stats.connections.fetch_sub(1, Ordering::Relaxed);
                         feed.stats
                             .rejected_connections
                             .fetch_add(1, Ordering::Relaxed);
@@ -867,6 +915,64 @@ mod tests {
         let conns: BTreeSet<u64> = got.iter().map(|(c, _)| *c).collect();
         assert_eq!(conns.len(), 2, "{got:?}");
         assert!(conns.iter().all(|c| *c >= 1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A peer whose uid the policy does not list is closed before anything
+    /// is read; an allowed one is served; open connections are counted.
+    #[test]
+    fn peer_policy_refuses_unlisted_uids() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("robodr-agentd-peers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let euid = crate::config::effective_uid();
+        const HB: &str = r#"{"kind":"heartbeat","v":1,"sent":0,"dropped":0}"#;
+        for (allowed, accepted) in [(vec![euid.wrapping_add(1)], false), (vec![euid], true)] {
+            let path = dir.join(format!("p{accepted}.sock"));
+            let sock = bind_event_socket(&path).unwrap();
+            let (f, rx, st) = feed(16);
+            let stop = Arc::new(AtomicBool::new(false));
+            let s2 = stop.clone();
+            let h = std::thread::spawn(move || {
+                run_unix_listener_peers(
+                    sock,
+                    2,
+                    s2,
+                    f,
+                    crate::host::parse_host_line,
+                    Some(allowed),
+                );
+            });
+            let mut c = UnixStream::connect(&path).unwrap();
+            let _ = writeln!(c, "{HB}");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while st.received.load(Ordering::Relaxed) == 0
+                && st.rejected_connections.load(Ordering::Relaxed) == 0
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if accepted {
+                assert_eq!(st.connections.load(Ordering::Relaxed), 1);
+            }
+            stop.store(true, Ordering::Relaxed);
+            h.join().unwrap();
+            let got = rx
+                .try_iter()
+                .filter(|m| matches!(m.payload, Payload::Host(_)))
+                .count();
+            assert_eq!(got, usize::from(accepted));
+            assert_eq!(
+                st.rejected_connections.load(Ordering::Relaxed),
+                u64::from(!accepted)
+            );
+            if !accepted {
+                assert!(st.last_malformed().unwrap().contains("refused"));
+                assert_eq!(st.last_rx_ms(), None, "a refused peer is not activity");
+            }
+            assert_eq!(st.connections.load(Ordering::Relaxed), 0);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

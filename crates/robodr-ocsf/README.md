@@ -134,6 +134,7 @@ dedup.insert(v.replay_key());   // replay detection is the consumer's job
 | `robot.safety_state.{undecodable_sample, unmapped_value}` | (own titles, data source `robot_safety_state`) | — |
 | `robot.ros2.profile_state_tampered` | Profile anti-rollback state missing or behind the black box | — |
 | `robot.agent.{evidence_quarantined, correlation_pressure}` | (own titles, data source `robodr_agent`) | — |
+| `robot.host.pulsar_threat` | Host runtime-security detection (Pulsar rule), data source `host_runtime`; the Pulsar rule name and process are in the detail | — |
 | anything else | RoboDR model-profile deviation | — |
 
 The validator applies the catalog of the message's own `contract_version`
@@ -200,5 +201,6 @@ first_seen_time, last_seen_time, analytic, data_sources}`, `analytic.type_id`
   script detection (no Unicode tables offline).
 * Diode export/import lives in `crates/robodr-diode`; it does not yet carry
   per-finding signatures (contract §8, integrator TODO).
-* Ed25519 comes from `robodr-blackbox`'s in-crate RFC 8032 implementation
-  (vector-tested, not audited); not tested against an external verifier.
+* Ed25519 comes from `robodr-blackbox` (a wrapper over the audited
+  `ed25519-dalek` crate, vector-tested); finding signatures were not tested
+  against an external verifier.

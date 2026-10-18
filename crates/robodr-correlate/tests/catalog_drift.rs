@@ -78,10 +78,13 @@ fn robot_ids_exist_in_other_crates() {
 
 /// `robot.*` literals in other crates' sources that are not signals the
 /// correlation engine sees: ids the daemon never feeds back
-/// (`robot.agent.correlation_pressure`, `robot.correlate.*`), a probe that is
-/// never emitted, and unit-test fixtures.
+/// (`robot.agent.correlation_pressure`, `robot.correlate.*`), the finding id
+/// of a forwarded Pulsar threat (agentd feeds the threat as its Pulsar rule
+/// name, which is in `PULSAR_RULES`), a probe that is never emitted, and
+/// unit-test fixtures.
 const NOT_SIGNALS: &[&str] = &[
     "robot.agent.correlation_pressure",
+    "robot.host.pulsar_threat",
     "robot.agent.config_check",
     "robot.capture.y",
     "robot.rtps.x",

@@ -35,6 +35,10 @@
 //!   conservative state, unprofiled writers ignored and reported,
 //!   transitions in the black box. Without it the configured
 //!   `context.safety_state` is used.
+//! * [`host`]: the optional `host_threats` socket: Pulsar threats handed
+//!   over by the `robodr-threat-forward` Pulsar module (peer-uid checked,
+//!   strictly parsed, heartbeat liveness) become host-side correlation
+//!   signals and `robot.host.pulsar_threat` findings.
 //! * [`spool`]: atomic, bounded findings spool; acked records are pruned
 //!   oldest first, unacked ones never.
 //! * [`notify`]: `sd_notify` (`READY=1`, `WATCHDOG=1` from the main loop,
@@ -70,6 +74,7 @@
 pub mod config;
 pub mod daemon;
 pub mod health;
+pub mod host;
 pub mod input;
 pub mod notify;
 pub mod profile_chain;

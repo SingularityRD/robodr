@@ -226,8 +226,9 @@ impl Issue {
                 rules::QUEUE_OVERFLOW,
                 Severity::Medium,
                 format!(
-                    "{delta} item(s) from input {input} dropped because the pipeline queue was \
-                     full ({total} since start); they were not inspected"
+                    "{delta} item(s) from input {input} dropped because a queue was full (the \
+                     agent's input queue, or for a forwarded input the producer's own) \
+                     ({total} since start); they were not inspected"
                 ),
             ),
             Issue::InputMalformed {

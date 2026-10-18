@@ -161,8 +161,12 @@ pub struct RateLimit {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChannelSpec {
     pub kind: ChannelKind,
-    /// Endpoint GUIDs (24- or 32-char hex; the first 24 chars must be a
-    /// participant prefix in the profile) allowed to command this channel.
+    /// Sources allowed to command this channel: endpoint GUIDs (24- or
+    /// 32-char hex; the first 24 chars must be a participant prefix in the
+    /// profile), or `identity:<name>` for a participant identity of the
+    /// profile (`Profile::participant_identities`), which survives the
+    /// GUID change of a process restart. The gateway resolves a writer to
+    /// its identity at run time (see `robodr-ros2-pipeline`'s `identity`).
     pub allowed_sources: Vec<String>,
     /// Tighter linear speed (norm, m/s) than the envelope, if any.
     pub max_linear_speed: Option<f64>,
@@ -375,6 +379,21 @@ fn limit(channel: &str, field: &'static str, v: Option<f64>) -> Result<f64, Conf
     }
 }
 
+/// Prefix of an identity source token in [`ChannelSpec::allowed_sources`].
+pub const IDENTITY_SOURCE_PREFIX: &str = "identity:";
+
+/// A GUID (lower-cased) or an `identity:<name>` token (name kept as is).
+fn normalise_source(g: &str) -> Result<String, ConfigError> {
+    let t = g.trim();
+    match t.strip_prefix(IDENTITY_SOURCE_PREFIX) {
+        Some(name) if robodr_events::profile::is_identity_name(name) => {
+            Ok(format!("{IDENTITY_SOURCE_PREFIX}{name}"))
+        }
+        Some(_) => Err(ConfigError::InvalidGuid(g.to_string())),
+        None => normalise_guid(t),
+    }
+}
+
 fn normalise_guid(g: &str) -> Result<String, ConfigError> {
     let lower = g.trim().to_ascii_lowercase();
     let ok_len = lower.len() == 24 || lower.len() == 32;
@@ -422,9 +441,12 @@ impl Policy {
                 return Err(ConfigError::NoAllowedSources(name.clone()));
             }
             for g in &spec.allowed_sources {
-                let g = normalise_guid(g)?;
-                let prefix = g.get(..24).unwrap_or("");
-                if !profile.participants.contains(prefix) {
+                let g = normalise_source(g)?;
+                let known = match g.strip_prefix(IDENTITY_SOURCE_PREFIX) {
+                    Some(name) => profile.participant_identities.contains_key(name),
+                    None => profile.participants.contains(g.get(..24).unwrap_or("")),
+                };
+                if !known {
                     return Err(ConfigError::SourceNotInProfile {
                         channel: name.clone(),
                         guid: g,
@@ -495,7 +517,7 @@ impl Policy {
             };
             let mut allowed = [0u64; MAX_SOURCES / 64];
             for g in &spec.allowed_sources {
-                let g = normalise_guid(g)?;
+                let g = normalise_source(g)?;
                 if let Ok(idx) = sources.binary_search(&g) {
                     if let Some(w) = allowed.get_mut(idx / 64) {
                         *w |= 1u64 << (idx % 64);
@@ -539,7 +561,7 @@ impl Policy {
     /// message). Case-insensitive. `None` → the gateway passes
     /// [`SourceId::UNKNOWN`].
     pub fn source_id(&self, guid: &str) -> Option<SourceId> {
-        let g = normalise_guid(guid).ok()?;
+        let g = normalise_source(guid).ok()?;
         self.sources
             .binary_search(&g)
             .ok()
@@ -634,6 +656,41 @@ mod tests {
         assert_eq!(pol.channels[0].limits.lin, 1.0);
         assert_eq!(pol.channels[0].limits.ang, 1.0);
         assert_eq!(pol.channels[0].limits.lin_acc, f64::INFINITY);
+    }
+
+    #[test]
+    fn identity_sources_compile_and_resolve() {
+        let mut p = profile();
+        p.participant_identities.insert(
+            "base".into(),
+            robodr_events::profile::ParticipantIdentity {
+                ips: ["10.0.0.5".to_owned()].into(),
+                vendor: "010f".into(),
+                ..Default::default()
+            },
+        );
+        p.participant_identities
+            .get_mut("base")
+            .unwrap()
+            .max_instances = 1;
+        let mut s = spec();
+        s.allowed_sources.push("identity:base".into());
+        let pol = Policy::compile(&p, PlatformConfig::default(), &specs(s.clone())).unwrap();
+        let id = pol.source_id("identity:base").unwrap();
+        assert!(pol.channels[0].allows(id));
+        assert_eq!(pol.source_guid(id), Some("identity:base"));
+        // Names are exact (no case folding), unknown / malformed ones refused.
+        assert_eq!(pol.source_id("identity:BASE"), None);
+        s.allowed_sources = vec!["identity:nope".into()];
+        assert!(matches!(
+            Policy::compile(&p, PlatformConfig::default(), &specs(s.clone())),
+            Err(ConfigError::SourceNotInProfile { .. })
+        ));
+        s.allowed_sources = vec!["identity:a b".into()];
+        assert!(matches!(
+            Policy::compile(&p, PlatformConfig::default(), &specs(s)),
+            Err(ConfigError::InvalidGuid(_))
+        ));
     }
 
     #[test]

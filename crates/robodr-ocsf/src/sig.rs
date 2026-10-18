@@ -83,8 +83,8 @@
 //!
 //! * Ed25519 only. HMAC keys ([`robodr_blackbox::HmacSha256Key`]) are refused:
 //!   a symmetric key lets every verifier forge.
-//! * The in-crate Ed25519 of `robodr-blackbox` is tested against RFC 8032
-//!   vectors but not independently audited.
+//! * Ed25519 is `robodr-blackbox`'s wrapper over the audited
+//!   `ed25519-dalek` crate (strict verification, RFC 8032 vectors).
 //! * Key distribution (which public key belongs to which unit) is the
 //!   commissioning / fleet registry's job; this module only consumes it.
 

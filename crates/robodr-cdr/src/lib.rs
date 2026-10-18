@@ -89,8 +89,10 @@
 //!
 //! The byte layouts were derived by hand from DDS-XTypes 1.3 §7.4.3 and
 //! DDSI-RTPS 2.5 §10 and are checked against hand-written vectors in the
-//! tests. They have **not** been checked against captures from Fast DDS or
-//! Cyclone DDS (none are available in this environment). In particular,
+//! tests. `geometry_msgs/Twist` in XCDR1 (`CDR_LE`) is also confirmed on
+//! real samples from Fast DDS 2.14 and Cyclone DDS 0.10 under ROS 2 Jazzy
+//! (`fixtures/captures/ros2-jazzy/`); the other types and XCDR2 have
+//! **not** been checked against real captures. In particular,
 //! whether an RMW sends `CDR2` or `D_CDR2` for ROS types, and whether it
 //! wraps nested structs in DHEADERs ([`Limits::d_cdr2_nesting`]), must be
 //! confirmed on a real capture before relying on XCDR2. Default ROS 2 RMWs

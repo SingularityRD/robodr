@@ -20,6 +20,7 @@ members = [
     # Pulsar-dependent (need pulsar + tokio; cannot build without crates.io):
     "crates/robodr-pulsard",
     "crates/robodr-sensor-ros2",
+    "crates/robodr-threat-forward",
 ]
 # Pulsar is a git submodule with its own workspace; keep it out of ours.
 exclude = ["vendor"]
@@ -62,6 +63,7 @@ robodr-ocsf = { path = "crates/robodr-ocsf" }
 robodr-responder = { path = "crates/robodr-responder" }
 robodr-ros2-pipeline = { path = "crates/robodr-ros2-pipeline" }
 robodr-sensor-ros2 = { path = "crates/robodr-sensor-ros2" } # Pulsar-dependent
+robodr-threat-forward = { path = "crates/robodr-threat-forward" } # Pulsar-dependent
 
 # Pulsar is vendored as a git submodule under vendor/pulsar (see README).
 # We build on pulsar-core's module ABI (PulsarModule / SimplePulsarModule).
@@ -84,6 +86,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 thiserror = "2"
+# Ed25519 for robodr-blackbox (audited; replaces the earlier in-crate code).
+# `fast` (precomputed basepoint tables), `std` and `zeroize` (signing key
+# wiped on drop) are its defaults, spelled out. No `rand_core`: seeds come
+# from getrandom(2) via robodr_blackbox::crypto::fill_random.
+ed25519-dalek = { version = "2.1", default-features = false, features = ["fast", "std", "zeroize"] }
+# SHA-512 (the same implementation ed25519-dalek uses internally).
+sha2 = "0.10"
 
 [profile.release]
 # Runs on a robot controller: favour small, predictable binaries.

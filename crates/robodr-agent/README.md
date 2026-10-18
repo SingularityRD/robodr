@@ -304,8 +304,8 @@ firewall limits, zero partitions and unusable labels are refused.
   defaults. `policy-oem-validated.json` is a simulated sign-off for the demo.
 - The black box signs with an Ed25519 key file (`robodr-blackbox keygen`,
   default) or, legacy, HMAC (a shared key, so the verifier can forge; warned).
-  The Ed25519 seed is a file, not a TPM-held key, and the implementation is
-  std-only and unaudited. No external checkpoint store exists. The replay verifies against the checkpoint it just produced.
+  The Ed25519 seed is a file, not a TPM-held key (the arithmetic is the
+  audited `ed25519-dalek` crate). No external checkpoint store exists. The replay verifies against the checkpoint it just produced.
 - Findings were not checked against an OCSF schema server, a Kafka broker or
   AutoSecOps. Nothing is published to Kafka.
 - No executor exists. Nothing is requested from DDS, the host, the Motion

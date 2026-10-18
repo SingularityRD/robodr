@@ -1,0 +1,27 @@
+[package]
+name = "robodr-threat-forward"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# Not published (crates.io disallows path deps); also lets cargo-deny
+# accept version-less path dependencies (deny.toml, allow-wildcard-paths).
+publish = false
+repository.workspace = true
+description = "Pulsar module forwarding every Pulsar threat to robodr-agentd's host-threat socket (JSON lines)."
+
+# PULSAR-DEPENDENT CRATE: needs pulsar-core (vendor/pulsar), so it is skipped
+# by the offline build. Only robodr-pulsard depends on it. The line format,
+# bounds and the queue / reconnect writer are plain std and are tested
+# without a running Pulsar. See docs/PULSAR-INTEGRATION.md.
+
+[dependencies]
+pulsar-core = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# The consumer's parser (pure crate): every line the forwarder writes must be
+# accepted by agentd as is.
+robodr-agentd = { workspace = true }

@@ -5,7 +5,8 @@
 //!
 //! The recorder signs every record hash through [`Signer`]; the verifier checks
 //! through [`Verifier`]. Neither knows the algorithm. A production backend is a
-//! drop-in: implement both traits for Ed25519 (from an audited crate) or for a
+//! drop-in: implement both traits, as [`crate::sign_ed25519`] does for Ed25519
+//! (`ed25519-dalek`), or for a
 //! TPM-resident ECDSA key, set `algorithm()` to e.g. `"ed25519"`, and the
 //! record format, chain, storage and verification logic stay unchanged
 //! (signatures are length-prefixed, up to [`crate::record::MAX_SIG_LEN`] bytes).

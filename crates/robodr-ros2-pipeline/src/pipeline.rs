@@ -117,6 +117,7 @@ use crate::binding::{
     parse_src_ip, BindingFinding, BindingOptions, BindingStats, BindingTable, Ingress,
 };
 use crate::dedup::DedupSet;
+use crate::identity::{IdentityResolver, IdentityStats, Resolution};
 use crate::motion::{DatagramCtx, MotionOptions, MotionSample, MotionStats, MotionTracker};
 use crate::ratelimit::{self, RateLimiter};
 use crate::sanitize::sanitize;
@@ -327,6 +328,7 @@ pub mod rules {
     pub use crate::binding::rules::{
         ENDPOINT_SOURCE_MISMATCH, ENDPOINT_UNANNOUNCED_PARTICIPANT, PARTICIPANT_SOURCE_MISMATCH,
     };
+    pub use crate::identity::rules::IDENTITY_INSTANCES_EXCEEDED;
     pub use crate::motion::rules::{
         MOTION_DECODE_ANOMALY, MOTION_SAMPLE_SOURCE_MISMATCH, MOTION_UNATTRIBUTED_SAMPLE,
         MOTION_UNDECODABLE_SAMPLE, MOTION_UNVERIFIABLE_COMMAND,
@@ -590,6 +592,8 @@ pub struct PipelineStats {
     pub binding: BindingStats,
     /// The motion decode path.
     pub motion: MotionStats,
+    /// Run-time participant identity resolution ([`crate::identity`]).
+    pub identity: IdentityStats,
 }
 
 /// What one datagram produced: new findings and decoded motion samples.
@@ -620,6 +624,19 @@ pub struct Pipeline {
     checksum_window: Option<(Instant, u64)>,
     /// User-DATA motion decode path.
     motion: MotionTracker,
+    /// Fresh GUID prefixes -> the profile's stable identities. Resolved
+    /// prefixes are added to `profile.participants` (the working copy) and
+    /// removed again when they release the identity.
+    identities: IdentityResolver,
+    /// The profile's own `participants` (never removed by a release).
+    static_participants: std::collections::BTreeSet<String>,
+    /// Prefixes that disposed themselves and released their identity: they
+    /// stay in the working `participants` until this deadline, so the
+    /// stragglers of the dispose (repeated dispose samples, final
+    /// heartbeats, whose RTPS header still names the prefix) are not
+    /// reported as an unknown participant. The identity slot is free at
+    /// once (a restart may take it).
+    released: BTreeMap<robodr_rtps::GuidPrefix, Instant>,
     /// Origin of the default capture timestamps ([`Pipeline::process_at`]).
     epoch: Instant,
     opts: PipelineOptions,
@@ -688,6 +705,9 @@ impl Pipeline {
             checksum_window: None,
             motion: MotionTracker::new(opts.motion.clone()),
             epoch: Instant::now(),
+            identities: IdentityResolver::new(&profile),
+            static_participants: profile.participants.clone(),
+            released: BTreeMap::new(),
             profile,
             opts,
             stats: PipelineStats::default(),
@@ -996,9 +1016,11 @@ impl Pipeline {
         };
         let ip = parse_src_ip(src_ip);
         let ambiguity = Ambiguity::of(&report);
+        self.resolve_identities(&report, ip, ingress, src_ip, now, &mut out);
         self.profile_findings(&report, src_ip, &mut out);
         self.binding_findings(&report, ip, ingress, ambiguity.any(), &mut out, now);
-        self.removal_findings(&report, src_ip, ip, ingress, &mut out);
+        self.removal_findings(&report, src_ip, ip, ingress, now, &mut out);
+        self.node_evidence(&report, now);
         self.protocol_findings(&report, src_ip, &ambiguity, &mut out);
         // Motion: learn this datagram's SEDP first, then its user DATA.
         self.motion.learn(&self.profile, &report);
@@ -1039,9 +1061,139 @@ impl Pipeline {
     }
 
     fn expire_into(&mut self, now: Instant, out: &mut Vec<Candidate>) {
+        for (p, _) in self.identities.expire(now) {
+            self.unresolve(p);
+        }
+        let done: Vec<robodr_rtps::GuidPrefix> = self
+            .released
+            .iter()
+            .filter(|(_, at)| now >= **at)
+            .map(|(p, _)| *p)
+            .collect();
+        for p in done {
+            self.released.remove(&p);
+            if !self.identities.holds(&p) {
+                self.unresolve(p);
+            }
+        }
+        self.stats.identity = *self.identities.stats();
         let mut found = Vec::new();
         self.binding.expire(&self.profile, now, &mut found);
         self.push_binding(out, found);
+    }
+
+    /// Node evidence for resolved prefixes: a writer of
+    /// `rr/<node>/get_parametersReply` announced by the participant itself
+    /// names one of its nodes ([`crate::identity`], "Which identity").
+    fn node_evidence(&mut self, report: &DatagramReport, now: Instant) {
+        if self.identities.is_empty() {
+            return;
+        }
+        for ep in &report.endpoints {
+            if ep.kind != EndpointKind::Writer
+                || ep.source != ep.participant
+                || ep.guid_conflict
+                || !self.identities.holds(&ep.participant)
+            {
+                continue;
+            }
+            let rn = robodr_events::graph::demangle(&ep.topic);
+            if rn.kind != robodr_events::graph::RosNameKind::ServiceReply {
+                continue;
+            }
+            if let Some(node) = rn.name.strip_suffix("/get_parameters") {
+                if !node.is_empty() {
+                    self.identities.observe_node(&ep.participant, node, now);
+                }
+            }
+        }
+        self.stats.identity = *self.identities.stats();
+    }
+
+    /// The identity a run-time resolved prefix holds ([`crate::identity`]),
+    /// once confirmed by node evidence.
+    pub fn identity_of(&self, prefix: &robodr_rtps::GuidPrefix) -> Option<&str> {
+        self.identities.identity_of(prefix)
+    }
+
+    /// The live run-time resolved prefixes and their identities.
+    pub fn identity_holders(&self) -> Vec<(robodr_rtps::GuidPrefix, String)> {
+        self.identities
+            .holders()
+            .map(|(p, n)| (*p, n.to_owned()))
+            .collect()
+    }
+
+    /// A prefix released its identity: it is no longer profiled (unless the
+    /// profile lists it itself).
+    fn unresolve(&mut self, p: robodr_rtps::GuidPrefix) {
+        let g = hex12(&p);
+        if !self.static_participants.contains(&g) {
+            self.profile.participants.remove(&g);
+            self.binding.set_profiled(p, false);
+        }
+    }
+
+    /// Resolve this datagram's SPDP announcements of not statically profiled
+    /// prefixes to the profile's identities, before the profile judges them
+    /// (see [`crate::identity`]).
+    fn resolve_identities(
+        &mut self,
+        report: &DatagramReport,
+        ip: Option<IpAddr>,
+        ingress: Ingress,
+        src_ip: &str,
+        now: Instant,
+        out: &mut Vec<Candidate>,
+    ) {
+        if self.identities.is_empty() {
+            return;
+        }
+        let Some(ip) = ip else { return };
+        for spdp in &report.participants {
+            let p = spdp.guid_prefix;
+            let g = hex12(&p);
+            // A statically profiled prefix (the learned run's own process)
+            // resolves too, so it holds its identity for `identity:<name>`
+            // rights; it stays profiled whatever the resolver says.
+            let is_static = self.static_participants.contains(&g);
+            if spdp.source != p
+                || !spdp.alternate_guid_prefixes.is_empty()
+                || (ip.is_loopback() && ingress == Ingress::External)
+                || self.binding.is_contested(&p)
+                || self.binding.allows_from(&p, ip, ingress) == Some(false)
+            {
+                continue;
+            }
+            match self.identities.observe_spdp(spdp, ip, now) {
+                Resolution::Resolved { .. } => {
+                    self.released.remove(&p);
+                    self.profile.participants.insert(g);
+                    self.binding.set_profiled(p, true);
+                }
+                Resolution::PoolFull { .. } if is_static => {}
+                Resolution::PoolFull {
+                    identity,
+                    max,
+                    holders,
+                } => {
+                    let held: Vec<String> = holders.iter().map(hex12).collect();
+                    let detail = format!(
+                        "participant {g} from {src_ip} matches identity '{}' but its {max} \
+                         instance(s) are held by live participant(s) {}",
+                        sanitize(&identity),
+                        held.join(", ")
+                    );
+                    self.push(
+                        out,
+                        Deviation::new(rules::IDENTITY_INSTANCES_EXCEEDED, Severity::High, detail),
+                        src_ip,
+                    );
+                }
+                Resolution::Refreshed | Resolution::NoMatch => {}
+            }
+        }
+        self.stats.identity = *self.identities.stats();
     }
 
     /// Report SEDP announcements whose hold window (waiting for their
@@ -1133,6 +1285,7 @@ impl Pipeline {
         src_ip: &str,
         ip: Option<IpAddr>,
         ingress: Ingress,
+        now: Instant,
         out: &mut Vec<Candidate>,
     ) {
         for r in &report.removed_participants {
@@ -1156,6 +1309,16 @@ impl Pipeline {
             } else {
                 ""
             };
+            // A self-dispose from a consistent source frees a run-time
+            // identity (the finding below still says "profiled", which it
+            // was until now).
+            let resolved = self.identities.holds(&r.guid_prefix);
+            if resolved && r.source == r.guid_prefix && consistent != Some(false) {
+                self.identities.release(&r.guid_prefix);
+                self.stats.identity = *self.identities.stats();
+                self.released
+                    .insert(r.guid_prefix, now + crate::binding::MIN_LEASE);
+            }
             if self.profile.participants.contains(&guid) {
                 let detail = format!(
                     "profiled participant {guid} announced as {what}{by} from {src_ip}{unbound}"

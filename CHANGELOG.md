@@ -26,6 +26,69 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   topic, ACL denial, oversized record, quota throttling, idle-connection
   close and SASL / TLS listeners handled; partitioner identical to the Java
   client's for 205 robot ids. Single-node only (see the crate README).
+- TPM 2.0 NV counter head anchor for the black box
+  (`robodr_blackbox::tpm_anchor::TpmNvCounterAnchor`): the counter counts
+  head marks (one increment per mark, at most one per
+  `min_increment_interval`, default 60 s), a sidecar signed with the
+  recorder's key binds the count to the mark; an older restored sidecar
+  yields a lower bound of the head, so a cut log tail with rolled-back
+  state is reported as `TruncationDetected`. Driven through `tpm2-tools`
+  with a configurable TCTI, bounded tool runs and strict parsing; indexes
+  that are not counters are refused. New `robodr-blackbox tpm-anchor-init`
+  / `tpm-anchor-check`; `robodr-agentd` `blackbox.head_anchor` kind
+  `tpm_nv_counter`. Tested with a fake TPM and against swtpm
+  (`scripts/swtpm-anchor-it.sh`, `ROBODR_SWTPM=1`); not yet on a hardware
+  TPM.
+- Real ROS 2 Jazzy captures (Fast DDS 2.14, Cyclone DDS 0.10) under
+  `fixtures/captures/ros2-jazzy/` with the container lab that produced them
+  (`tools/lab-capture/`) and end-to-end tests
+  (`robodr-ros2-pipeline/tests/real_captures.rs`).
+- Participant identities (`Profile::participant_identities`: source IPs,
+  RTPS vendor, enclave, nodes, `max_instances`): DDS draws a new GUID prefix
+  per process start, so a GUID-only profile matched none of the robot's
+  participants after a restart. The pipeline resolves fresh prefixes at SPDP
+  time (`robodr-ros2-pipeline::identity`, new rule
+  `robot.ros2.identity_instances_exceeded`); `robodr-commission learn`
+  writes identities (`--no-identities` to opt out), each one a sign-off item
+  and a lock floor requirement; `check` resolves them; Motion Firewall
+  `allowed_sources` and agentd `safety_feed` writers accept
+  `identity:<name>`.
+- `robodr-commission learn --pcap` decodes `Twist` / `TwistStamped` /
+  `JointTrajectory` samples of announced writers (same decoder as the
+  sensor), so a capture alone yields motion envelopes.
+- `robodr-sensor-ros2`: first unit test (threat `extra` through the real
+  `pulsar_core::event::Value`).
+- Host-side (Pulsar) threats reach `robodr-agentd`, so the host-dependent
+  correlation rules (`coordinated_intrusion`, `credential_theft`,
+  `trojaned_package_key_access`, `defense_tampering`,
+  `host_process_persistence`) can fire in the daemon:
+  - New Pulsar module `robodr-threat-forward` (registered by
+    `robodr-pulsard`, off by default, `[module.robodr-threat-forward]
+    socket_path`): forwards every Pulsar threat except
+    `robodr-sensor-ros2`'s own as one JSON line (rule name, source module,
+    severity / category from the rule metadata, time, pid / ppid / uid /
+    gid, bounded sanitised image) to a unix socket; bounded queue with
+    counted drops, never blocks the bus, reconnects with backoff, heartbeat
+    with its counters.
+  - `robodr-agentd` `host_threats` section: binds the socket (`0600` or
+    `0660`; refuses a group/world-writable or foreign-owned directory and a
+    path that is not its own socket), accepts only peers with uid 0 or
+    `allowed_uids` (`SO_PEERCRED`), parses lines strictly (4 KiB, no unknown
+    or duplicate keys, bounded strings, no control characters; refused lines
+    are `robot.agent.input_malformed`). Each threat is a
+    `robot.host.pulsar_threat` finding and a `Signal::host(<rule name>)`
+    with the pid as its process entity. Heartbeats are the input's
+    liveness (a configured but silent host input reads `unknown`); the
+    forwarder's losses are reported as queue drops. `status.json` shows
+    connections, `upstream_dropped` and the host-threat counters.
+  - OCSF catalog (contract 1.3, unreleased): `robot.host.pulsar_threat` with
+    the new data source `host_runtime` (schema enums updated).
+  - Packaging: `config/robodr.toml.example` (hence `/etc/robodr/pulsar.toml`)
+    gains the disabled `[module.robodr-threat-forward]` section,
+    `config/agentd.full.example.json` the `host_threats` key, and the
+    drop-in example `robodr-pulsard.service.d/30-host-threats.conf.example`
+    (`SupplementaryGroups=robodr`, since pulsard has no
+    `CAP_DAC_OVERRIDE`).
 - Wave 6 (integrated on `integrate-w6`):
   - `robodr-agentd` live safety-state feed (`safety_feed`): ROS 2 topics
     decoded passively from captured user DATA (`std_msgs` Bool / UInt8 /
@@ -190,6 +253,22 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Changed
 
+- **Security (`robodr-blackbox`)**: Ed25519 now uses the audited
+  `ed25519-dalek` 2.x crate (`curve25519-dalek` 4, `zeroize`; SHA-512 from
+  RustCrypto `sha2` 0.10) instead of the hand-written, unaudited field /
+  curve / scalar / SHA-512 code, which is deleted. `sign_ed25519` keeps its
+  public API as thin wrappers, so key files (`robodr-blackbox-key/v2` and
+  `.pub`), derived key ids (`ed25519:<16 hex>`), the 64-byte `R || S`
+  signature layout and the strict verification rules (`verify_strict`:
+  canonical `S`, no small-order `A` / `R`, cofactorless; plus a
+  canonical-encoding check on public keys) are unchanged, and the RFC 8032,
+  OpenSSL cross-check and rev4 regression vectors still pass. Seeds still
+  come from `getrandom(2)` (no `rand_core`). Verification is about 50x
+  faster (about 25 µs instead of about 1.3 ms in release on x86-64).
+  `sign_ed25519::Sha512::new` is no longer a `const fn`. New dependencies
+  (BSD-3-Clause / MIT OR Apache-2.0) are allowed by `deny.toml`; all build
+  on the 1.87 MSRV.
+
 - **Breaking (`robodr-commission lock`)**: `--operators operators.json` is
   required; every sign-off must carry valid operator signatures
   (`<signoff>.sig`), and motion items need `motion_quorum` distinct
@@ -261,6 +340,19 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   an I/O error, a metadata refresh and a backoff on the first send after
   each quiet period; connections idle for `connections_max_idle` (9 min) are
   now closed before use.
+- Cyclone DDS's 1-byte shutdown wake-up datagram is no longer counted as
+  malformed RTPS by `learn --pcap`.
+
+- CI: first local run of every `ci.yml` job and of the `release.yml`
+  build/package steps (2026-10-17, Debian 13 / WSL2; record in
+  `docs/BUILD.md`, "Local CI verification"). Fixed what failed: shellcheck
+  findings in `packaging/install-bundle.sh` and `packaging/make-bundle.sh`;
+  `cargo deny` licenses (license clarifications for the remaining Pulsar
+  crates, a scoped CC0-1.0 exception for the compile-time-only
+  `tiny-keccak`), bans (every RoboDR crate is now `publish = false`; Pulsar's
+  path crates are skipped for the wildcard lint) and advisories
+  (RUSTSEC-2021-0139, unmaintained `ansi_term` via Pulsar, ignored with a
+  documented reason and review date). No source code or `Cargo.lock` change.
 - `robodr-agentd` e2e test `hostile_datagrams_and_event_lines_never_stop_the_daemon`
   could stop the daemon before housekeeping raised `robot.agent.input_malformed`;
   it now waits until both expected findings are in the spool.

@@ -18,11 +18,18 @@
 //!   into the report.
 //! * [`VecSource`]: in-memory events for tests and library callers.
 //!
-//! A pcap yields discovery events only (participants, writers, readers):
-//! motion commands are user data whose decoding is the sensor's job, so a
-//! profile learned from a capture alone has no motion envelopes. Learn
-//! envelopes from a JSONL recording of the sensor's events (repeat inputs to
-//! combine both into one profile).
+//! A pcap yields discovery events (participants, writers, readers) and the
+//! **motion commands** found in it: user DATA of writers that announced a
+//! command type `robodr-cdr` decodes (`geometry_msgs/Twist`,
+//! `TwistStamped`, `trajectory_msgs/JointTrajectory`), decoded exactly as
+//! the sensor decodes them and attributed to the writer's participant, so a
+//! profile learned from a capture alone gets motion envelopes. A sample is
+//! used only when its writer was announced (SEDP) under the sending
+//! participant and the datagram came from an IP that participant's own SPDP
+//! came from; everything else is counted in
+//! [`CaptureDiagnostics::motion_samples_unattributed`] and not learned.
+//! Undecodable samples are counted in
+//! [`CaptureDiagnostics::motion_samples_undecodable`].
 
 //!
 //! # Strictness
@@ -70,9 +77,9 @@
 
 use robodr_capture::{CaptureError, CaptureFile, RtpsDatagrams};
 use robodr_events::RobotEvent;
-use robodr_rtps::{hex12, EndpointKind, FragmentReassembler};
+use robodr_rtps::{hex12, EndpointKind, FragmentReassembler, Guid, PayloadKind, UserDataWalker};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
@@ -353,6 +360,17 @@ pub struct CaptureDiagnostics {
     pub secure_submessages: u64,
     /// RTPS parser anomalies (malformed discovery data).
     pub rtps_anomalies: u64,
+    /// Motion command samples decoded and handed to the learner.
+    #[serde(default)]
+    pub motion_samples: u64,
+    /// Samples of announced motion command writers that did not decode
+    /// (not learned).
+    #[serde(default)]
+    pub motion_samples_undecodable: u64,
+    /// Samples of announced motion command writers sent from an IP the
+    /// writer's participant never announced itself from (not learned).
+    #[serde(default)]
+    pub motion_samples_unattributed: u64,
 }
 
 impl CaptureDiagnostics {
@@ -366,7 +384,16 @@ impl CaptureDiagnostics {
 
     /// Sum of two runs' counters.
     pub fn add(&mut self, o: &CaptureDiagnostics) {
-        let pairs: [(&mut u64, u64); 16] = [
+        let pairs: [(&mut u64, u64); 19] = [
+            (&mut self.motion_samples, o.motion_samples),
+            (
+                &mut self.motion_samples_undecodable,
+                o.motion_samples_undecodable,
+            ),
+            (
+                &mut self.motion_samples_unattributed,
+                o.motion_samples_unattributed,
+            ),
             (&mut self.frames, o.frames),
             (&mut self.rtps_datagrams, o.rtps_datagrams),
             (&mut self.not_rtps, o.not_rtps),
@@ -410,7 +437,21 @@ pub struct PcapSource<R: Read> {
     secure: u64,
     anomalies: u64,
     done: bool,
+    /// User-data walker for motion samples (owns its DATA_FRAG reassembler).
+    walker: UserDataWalker,
+    /// Announced motion command writers: GUID -> (channel, DDS type name).
+    motion_writers: HashMap<Guid, (String, String)>,
+    /// Source IPs each participant's own SPDP came from.
+    spdp_ips: HashMap<[u8; 12], BTreeSet<String>>,
+    motion_samples: u64,
+    motion_undecodable: u64,
+    motion_unattributed: u64,
 }
+
+/// Most motion writers tracked per capture.
+const MAX_MOTION_WRITERS: usize = 4096;
+/// Most participants whose SPDP source IPs are tracked per capture.
+const MAX_SPDP_PARTICIPANTS: usize = 4096;
 
 impl PcapSource<BufReader<File>> {
     /// Open a capture file (format detected from its magic).
@@ -439,6 +480,12 @@ impl<R: Read> PcapSource<R> {
             secure: 0,
             anomalies: 0,
             done: false,
+            walker: UserDataWalker::default(),
+            motion_writers: HashMap::new(),
+            spdp_ips: HashMap::new(),
+            motion_samples: 0,
+            motion_undecodable: 0,
+            motion_unattributed: 0,
         })
     }
 }
@@ -489,7 +536,12 @@ impl<R: Read> EventSource for PcapSource<R> {
             // The frame that completed this datagram (last fragment, if any).
             let position = self.datagrams.stats().frames;
             let Some(report) = self.frag.parse_datagram_detailed(&pkt.payload) else {
-                self.not_rtps += 1;
+                // Cyclone DDS sends a 1-byte datagram to its own receive
+                // sockets to wake its threads on shutdown (seen on every
+                // Cyclone capture of a node stopping): not a malformed bus.
+                if pkt.payload.len() > 1 {
+                    self.not_rtps += 1;
+                }
                 continue;
             };
             let st = &report.stats;
@@ -518,7 +570,34 @@ impl<R: Read> EventSource for PcapSource<R> {
             // ... and endpoints (same readings as `to_events`, including the
             // copies attributed to a relaying sender), each tagged with the
             // prefix that actually sent its announcement.
+            for spdp in &report.participants {
+                if spdp.source == spdp.guid_prefix
+                    && (self.spdp_ips.len() < MAX_SPDP_PARTICIPANTS
+                        || self.spdp_ips.contains_key(&spdp.guid_prefix))
+                {
+                    let ips = self.spdp_ips.entry(spdp.guid_prefix).or_default();
+                    if ips.len() < 16 {
+                        ips.insert(src_ip.clone());
+                    }
+                }
+            }
             for e in &report.endpoints {
+                // A motion command writer announced by its own participant.
+                if let (EndpointKind::Writer, Some(g)) = (e.kind, e.guid) {
+                    let rn = robodr_events::graph::demangle(&e.topic);
+                    let command = robodr_cdr::MessageKind::from_type_name(&e.type_name)
+                        .is_some_and(|k| k.role() == robodr_cdr::MotionRole::Command);
+                    if command
+                        && e.source == e.participant
+                        && !e.guid_conflict
+                        && rn.kind == robodr_events::graph::RosNameKind::Topic
+                        && (self.motion_writers.len() < MAX_MOTION_WRITERS
+                            || self.motion_writers.contains_key(&g))
+                    {
+                        self.motion_writers
+                            .insert(g, (rn.name.clone(), e.type_name.clone()));
+                    }
+                }
                 let origin = Origin {
                     sender_prefix: hex12(&e.source),
                     src_ip: src_ip.clone(),
@@ -536,11 +615,17 @@ impl<R: Read> EventSource for PcapSource<R> {
                     });
                 }
             }
+            self.motion_events(&pkt.payload, &src_ip, position, ts);
         }
     }
 
     fn capture_diagnostics(&self) -> Option<CaptureDiagnostics> {
         let c = self.datagrams.stats();
+        let motion = (
+            self.motion_samples,
+            self.motion_undecodable,
+            self.motion_unattributed,
+        );
         let r = self.datagrams.reassembly_stats();
         Some(CaptureDiagnostics {
             frames: c.frames,
@@ -563,7 +648,79 @@ impl<R: Read> EventSource for PcapSource<R> {
             discovery_frag_incomplete: self.frag.pending_samples() as u64,
             secure_submessages: self.secure,
             rtps_anomalies: self.anomalies,
+            motion_samples: motion.0,
+            motion_samples_undecodable: motion.1,
+            motion_samples_unattributed: motion.2,
         })
+    }
+}
+
+impl<R: Read> PcapSource<R> {
+    /// Decode the motion command samples of one datagram (see the module
+    /// docs) and queue them as `MotionCommand` events.
+    fn motion_events(&mut self, payload: &[u8], src_ip: &str, position: u64, ts: Option<Duration>) {
+        if self.motion_writers.is_empty() {
+            return;
+        }
+        let writers = &self.motion_writers;
+        let Some(report) = self
+            .walker
+            .walk_with(payload, |a| writers.contains_key(&a.writer))
+        else {
+            return;
+        };
+        let limits = robodr_cdr::Limits::default();
+        for s in &report.samples {
+            let Some((channel, type_name)) = self.motion_writers.get(&s.address.writer) else {
+                continue;
+            };
+            if s.payload_kind != PayloadKind::Data {
+                continue;
+            }
+            let prefix = s.address.writer_prefix();
+            if !self
+                .spdp_ips
+                .get(&prefix)
+                .is_some_and(|ips| ips.contains(src_ip))
+            {
+                self.motion_unattributed += 1;
+                continue;
+            }
+            let decoded = if s.non_standard_payload {
+                None
+            } else {
+                robodr_cdr::decode_by_type_name(type_name, &s.payload, &limits).ok()
+            };
+            let Some(decoded) =
+                decoded.filter(|d| d.message.role() == robodr_cdr::MotionRole::Command)
+            else {
+                self.motion_undecodable += 1;
+                continue;
+            };
+            let source = hex12(&prefix);
+            let event = decoded.message.to_event(&robodr_cdr::EventContext {
+                channel,
+                // The learner attributes commands to participants (prefix).
+                writer_guid: Some(&source),
+                timestamp_ns: ts
+                    .map(|t| u64::try_from(t.as_nanos()).unwrap_or(u64::MAX))
+                    .unwrap_or(0),
+            });
+            if !matches!(event, RobotEvent::MotionCommand(_)) {
+                self.motion_undecodable += 1;
+                continue;
+            }
+            self.motion_samples += 1;
+            self.queue.push_back(SourcedEvent {
+                position,
+                event,
+                ts,
+                origin: Some(Origin {
+                    sender_prefix: source,
+                    src_ip: src_ip.to_string(),
+                }),
+            });
+        }
     }
 }
 

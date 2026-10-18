@@ -606,14 +606,25 @@ impl SafetyFeedSection {
             }
             if t.writers.is_empty() {
                 return Err(format!(
-                    "{what}.writers: name the commissioned writer(s) of {} (GUID prefixes or \
-                     writer GUIDs); without them any profiled participant could set the safety \
-                     state",
+                    "{what}.writers: name the commissioned writer(s) of {} (GUID prefixes, \
+                     writer GUIDs or identity:<name>); without them any profiled participant \
+                     could set the safety state",
                     t.topic
                 ));
             }
             let mut writers = BTreeSet::new();
             for w in &t.writers {
+                if let Some(name) = w.strip_prefix("identity:") {
+                    if !profile.participant_identities.contains_key(name) {
+                        return Err(format!(
+                            "{what}.writers: identity {:?} is not a participant identity of \
+                             the profile",
+                            sanitize(name)
+                        ));
+                    }
+                    writers.insert(w.clone());
+                    continue;
+                }
                 let w = w.to_ascii_lowercase();
                 if !(matches!(w.len(), 24 | 32) && is_hex_lower(&w)) {
                     return Err(format!(
@@ -998,6 +1009,9 @@ pub struct SafetyFeed {
     reported: BTreeSet<String>,
     limits_std: Limits,
     limits_odom: Limits,
+    /// Participant prefix -> profile identity it holds now
+    /// ([`SafetyFeed::set_identities`]), for `identity:<name>` writers.
+    identities: BTreeMap<[u8; 12], String>,
 }
 
 impl std::fmt::Debug for SafetyFeed {
@@ -1039,6 +1053,7 @@ impl SafetyFeed {
                 ..Limits::default()
             },
             limits_odom: Limits::default(),
+            identities: BTreeMap::new(),
         }
     }
 
@@ -1249,7 +1264,14 @@ impl SafetyFeed {
         if !profile.writer_topics.contains(&spec.topic) {
             return Some("the profile does not allow writers on this topic".into());
         }
-        if !spec.writers.contains(&prefix_hex) && !spec.writers.contains(&hex_guid(guid)) {
+        let by_identity = self
+            .identities
+            .get(&prefix)
+            .is_some_and(|n| spec.writers.contains(&format!("identity:{n}")));
+        if !spec.writers.contains(&prefix_hex)
+            && !spec.writers.contains(&hex_guid(guid))
+            && !by_identity
+        {
             return Some("it is not in the safety_feed writers allowlist".into());
         }
         let Some(ip) = parse_src_ip(&datagram.src_ip) else {
@@ -1277,6 +1299,14 @@ impl SafetyFeed {
     /// Learn this datagram's SEDP and apply its samples on safety topics.
     /// Call after the pipeline has processed the same datagram (its binding
     /// table then includes this datagram's SPDP). Returns findings.
+    /// The participant identities currently held (prefix -> identity
+    /// name), as resolved by the sensor pipeline; replaces the previous
+    /// map. A writer listed as `identity:<name>` is trusted while its
+    /// participant holds that identity.
+    pub fn set_identities(&mut self, held: BTreeMap<[u8; 12], String>) {
+        self.identities = held;
+    }
+
     pub fn observe_datagram(
         &mut self,
         datagram: &Datagram,

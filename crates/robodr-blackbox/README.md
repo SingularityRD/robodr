@@ -19,12 +19,12 @@ and pinned to the NIST FIPS 180-4 examples and RFC 4231 test cases 1 to 7.
 Records are signed with **Ed25519** (RFC 8032, `src/sign_ed25519.rs`) by
 default: the unit holds the 32-byte seed, every verifier (fleet console, SOC,
 auditor) holds only the public key and **cannot forge** evidence. The
-implementation is in-crate std-only Rust (crates.io is unreachable here),
-pinned to the RFC 8032 vectors, but **not audited and not verified to be
-constant-time**: replace it with `ed25519-dalek` (`verify_strict`) when
-crates.io is available, keeping `Ed25519SigningKey` / `Ed25519VerifyingKey`
-as thin wrappers so the key file and signature formats do not change. The
-seed is a file on disk, not a TPM-sealed or non-exportable key: root on the
+arithmetic is the audited, constant-time `ed25519-dalek` 2.x crate
+(`verify_strict`, plus a canonical-encoding check on public keys);
+`Ed25519SigningKey` / `Ed25519VerifyingKey` are thin wrappers, so the key
+file and signature formats, key ids and verification rules are unchanged
+from the earlier in-crate implementation and remain pinned to the RFC 8032
+and OpenSSL-derived vectors. The seed is a file on disk, not a TPM-sealed or non-exportable key: root on the
 unit can still copy it (see the threat model).
 
 **HMAC-SHA256** (`sign.rs`, `HmacSha256Key`) remains as the legacy
@@ -305,9 +305,9 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
   is the one the next retained segment chains onto (`prev_hash`, seq), and
   the signatures of its first and last record and of every
   `SegmentDropped`, `Recovery` and `KeyRotation` record (all signatures with
-  `verify_closed_signatures = true`; off by default because the in-crate
-  Ed25519 needs about 1.3 ms per verification on x86-64 in release builds,
-  minutes for a full 64 MiB store). A segment that fails is **quarantined**
+  `verify_closed_signatures = true`; off by default to keep start-up time
+  bounded on large stores: `ed25519-dalek` needs about 25 µs per
+  verification on x86-64 in release builds, measured on one host only). A segment that fails is **quarantined**
   and the recorder keeps recording:
   1. its bytes are copied to `quarantine/damaged-seg<idx>.rbb` and fsynced;
   2. a signed, critical `Recovery` record with `quarantined_segment: true`
@@ -383,8 +383,8 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
   the mark in one file (atomic replace, never decreasing); it is only as
   strong as the storage that file lives on and adds nothing on the log's
   own filesystem. **Deployment requires a TPM NV monotonic counter or a
-  remote receiver behind `HeadAnchor`**; those implementations are
-  integration work (not done here).
+  remote receiver behind `HeadAnchor`**: `TpmNvCounterAnchor` (below) is
+  the TPM one; a remote receiver anchor is not implemented.
 
   **Remaining window:** records written after the newest mark and cut with
   the tail leave no local trace and their seqs may be reused: at most
@@ -395,6 +395,50 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
   reported as tampering. Without an external anchor, an attacker who can
   rewrite the directory can also restore an *older* authentic `head.json`
   (they cannot forge a newer one).
+- **TPM 2.0 NV counter anchor** (`tpm_anchor::TpmNvCounterAnchor`). A TPM
+  NV index of type counter can only be incremented by one, never set or
+  lowered (a redefined index starts at the TPM's highest count ever), so
+  nothing on the unit can wind it back; it cannot hold a `seq`. Mapping:
+  the counter counts **marks**. Each `advance` increments it (at most once
+  per `min_increment_interval`, default 60 s, for NV endurance; marks in
+  between only refresh the sidecar) and then atomically writes a sidecar
+  file `{format, nv_index, counter c, chain_id, seq s, hash, key_id, sig}`,
+  signed with the recorder's key over a domain-separated message
+  (`robodr-blackbox/tpm-nv-anchor/v1`). At open, with the counter at `T`:
+  `T == c` returns the full mark (chain, seq, hash: cut detected below it,
+  rewritten history refused); `T > c` means `T - c` later marks happened,
+  each for a durable record with a larger seq, so the head reached at
+  least `s + (T - c)`, returned as a seq-only bound: an attacker who
+  restores an older authentic sidecar with a cut tail gets
+  `TruncationDetected`. The signature is required: unsigned, the sidecar
+  could be edited to `c = T` with the (seq, hash) of a record still in the
+  cut log, hiding the cut. What cannot be bounded is an error (an anchor
+  failure, named in the signed `Resume` record, not a truncation record):
+  a missing, forged or foreign sidecar while the counter is written (`T`
+  alone is no bound: the counter's starting value is unknown), an
+  unwritten index with a sidecar present (index redefined or TPM cleared),
+  `T < c` (TPM replaced), an index that is not a counter, tool failures
+  and timeouts. Increment first, sidecar second: a crash in between only
+  leaves a sound bound. Remaining window: an attacker who restores an
+  older sidecar *with the same count* (written within one increment
+  interval) is not noticed, so at most `min_increment_interval` of
+  recording, plus the `head.json` window above.
+
+  Implementation: std only, it runs `tpm2_nvreadpublic`, `tpm2_nvread`,
+  `tpm2_nvincrement` (tpm2-tools 5.x) from a configured absolute
+  directory with a cleared environment plus `TPM2TOOLS_TCTI` (default
+  `device:/dev/tpmrm0`), a bounded wait (killed on timeout, default 2 s)
+  and strict output parsing; the runner is a trait (`TpmTools`) so tests
+  use a fake TPM. Provisioning: `robodr-blackbox tpm-anchor-init --index
+  0x01500020` defines the index under the owner hierarchy with
+  `authread|authwrite|nt=counter|no_da`, size 8 (index password optional,
+  from a file); `tpm-anchor-check` shows its state. An index that is not a
+  counter is refused at runtime. Rollback and truncation become
+  **detectable, not prevented**: root on the unit can still increment the
+  counter (false alarms only) and, with the owner or lockout
+  authorization, undefine the index or clear the TPM (reported as above);
+  set those authorizations and keep them off the unit. Tested against
+  swtpm (`scripts/swtpm-anchor-it.sh`), not yet on a hardware TPM.
 - **Truncation evidence:** an authentic `checkpoint.json` or
   `export-cursor.json` naming a seq **beyond** the head proves the tail was
   cut at a frame boundary. The recorder does not brick and does not hide it:
@@ -574,10 +618,9 @@ tamper finding.
 
 ## Limits and what is not verified
 
-- The Ed25519 signer is an in-crate implementation, tested against RFC 8032
-  and OpenSSL-derived vectors but **not audited** and not verified to be
-  constant-time on any target CPU; swap in an audited crate when one is
-  available offline. TPM integration (sealing the seed, NV-index
+- The Ed25519 signer wraps the audited `ed25519-dalek` crate (tested here
+  against RFC 8032 and OpenSSL-derived vectors); its constant-time
+  behaviour has not been re-measured on our target CPUs. TPM integration (sealing the seed, NV-index
   checkpoints) is not implemented; it needs real hardware.
 - fsync durability semantics were tested only for logic (torn writes are
   simulated by writing partial or zero bytes). Power-loss behaviour on the

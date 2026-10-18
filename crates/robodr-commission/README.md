@@ -305,7 +305,7 @@ valid seal if locked.
   `--allow-unattested`). agentd records each accepted profile in the black
   box and flags a deleted or rewritten state file (Critical
   `robot.ros2.profile_state_tampered`).
-  Limits: the Ed25519 code is not audited; root can delete both the state
+  Limits: root can delete both the state
   file and the black box (only the signed floor remains on the unit); an
   older root-signed trust file can be replayed (its floor cannot lower the
   remembered one, but keys it lists come back: revoke them); no expiry.
@@ -366,7 +366,7 @@ drop learner findings only by getting an authorised operator to sign the
 list they are shown. Limits: a careless or colluding operator (or quorum)
 can still confirm anything, the signature makes it a named decision; no key
 expiry or revocation list (remove the key from the trust list); the Ed25519
-code is robodr-blackbox's, not audited. The library's `lock` /
+code is robodr-blackbox's wrapper over the audited `ed25519-dalek`. The library's `lock` /
 `lock_draft_text` check content and confirmations only, for embedders that
 authenticate the operator themselves; `lock_signed_draft` is what the CLI
 runs.

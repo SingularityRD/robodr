@@ -11,8 +11,9 @@ uses std threads and `std::sync::mpsc` only: no async runtime, no Pulsar.
                    │       │                         │   decoded MotionCommand / MotionFeedback ─► Agent::handle
                    │       ├► try_send; when full ─► main thread ┤
  JSONL stdin ──────┤ Robot │  the item is dropped    │   RobotEvent ─► Agent::handle
- JSONL unix socket ┘ Event ┘  and counted            │     (profile + Motion Firewall + motion monitor)
-                                                     │   Outcome ─► black box (signed, hash-chained)
+ JSONL unix socket ┘ Event │  and counted            │     (profile + Motion Firewall + motion monitor)
+ host_threats ──── Pulsar ─┘  (robodr-threat-forward)│   host threat ─► Agent::handle_external(Sensor) + Signal::host
+                   threats                           │   Outcome ─► black box (signed, hash-chained)
                                                      │           ─► spool/ready/<seq>.json (validated OCSF)
                                                      └ self-health ─► Agent::handle_external(SelfHealth)
                                                        status.json, heartbeat notes in the black box
@@ -33,7 +34,8 @@ paths) and `src/config.rs`. For the installed unit, `config/agentd.example.json`
 is the runnable baseline (passes `--check-config` as copied on a
 commissioned robot) and `config/agentd.full.example.json` adds the keys that
 need extra files (`trust_roots`, `revocation_list`, `finding_signing` with
-the `20-finding-key.conf.example` drop-in). Unknown keys are refused at every
+the `20-finding-key.conf.example` drop-in; `host_threats` with the
+`30-host-threats.conf.example` drop-in for `robodr-pulsard`). Unknown keys are refused at every
 level, and every path must be absolute.
 
 | Key | Meaning |
@@ -49,6 +51,7 @@ level, and every path must be absolute.
 | `firewall` | Optional. `max_angular` (rad/s for every profiled Twist channel) and `allow` (writer GUIDs per channel). Runs **recording-only** (see below). |
 | `motion_monitor` | Optional. `config_path` (strict `MonitorConfig`; default: the UGV defaults on the profile's motion channels) and `feedback_sources`. Feedback sources that are ROS topic names (`/odom`) are also decoded from the bus. |
 | `sensor.motion` | Optional. The live motion decode path: `enabled` (default true), `feedback_topics` (e.g. `["/odom"]`), `max_writers`, `max_samples_per_datagram` (`evaluate_commands` is accepted but the daemon always lets the agent evaluate). Unknown keys are refused. |
+| `host_threats` | Optional. `socket_path` (the socket `robodr-threat-forward` writes Pulsar threats to), `socket_mode` (`"0600"` default or `"0660"`), `allowed_uids` (peers besides uid 0), `max_connections` (default 2, max 8). See "Host threats" below. |
 | `daemon` | `queue_capacity` 4096 (max 65536), `queue_bytes` 33554432 (32 MiB; 1 MiB..=256 MiB), `tick_ms` 1000, `heartbeat_ms` 10000, `silence_ms` 30000, `lag_ms` 2000, `health_report_ms` 10000, `exit_when_inputs_end` false |
 
 **Key.** Keys are never accepted on the command line. `blackbox.key_file`
@@ -170,6 +173,52 @@ safety system.
   whether fresh sources disagreed, each source's claim, freshness and
   age); `status.json` carries `safety_state` and `safety_feed`.
 
+## Host threats (Pulsar)
+
+With `host_threats`, the Pulsar module `robodr-threat-forward` (registered
+by `robodr-pulsard`, `DEFAULT_ENABLED = false`, configured in
+`[module.robodr-threat-forward]`) writes every Pulsar threat except the ROS
+2 sensor's own to a unix stream socket the daemon binds (`src/host.rs`),
+one JSON object per line:
+
+```json
+{"kind":"threat","v":1,"rule":"RoboDR: Interactive shell started on robot controller","source":"rules-engine","severity":"medium","category":"execution","ts_ms":1790000000000,"pid":4242,"ppid":1,"uid":0,"gid":0,"image":"/usr/bin/bash","container":false}
+{"kind":"heartbeat","v":1,"sent":17,"dropped":0,"skipped_own":3}
+```
+
+- **What a threat becomes.** A `robot.host.pulsar_threat` finding
+  (`Detector::Sensor`, source `host:<module>`, the rule's severity, Medium
+  if none; OCSF data source `host_runtime`; the Pulsar rule name, pid,
+  image and uid in the detail) and a correlation signal
+  `Signal::host(<Pulsar rule name>)` with the process entity
+  (the pid: an `execve` or Pulsar's tracker lag can change the image of one
+  process) and the finding's black-box record as evidence. So the
+  host-dependent correlation rules (`coordinated_intrusion`,
+  `credential_theft`, `trojaned_package_key_access`, `defense_tampering`,
+  `host_process_persistence`) fire. A threat from `robodr-sensor-ros2` is
+  dropped and counted (`daemon.host_threats_own_skipped`): the daemon has
+  it from its own pipeline.
+- **Peers.** The socket's directory must be owned by root or the daemon's
+  user and not writable by group or others; an existing path must be a
+  socket owned by the daemon's user. The socket is created `0600` or `0660`.
+  Every connection's peer uid (`SO_PEERCRED`) must be 0 or in
+  `allowed_uids`; others are closed, counted (`rejected_connections`) and
+  reported as malformed input.
+- **Lines.** At most 4 KiB; unknown or duplicate keys, a wrong `v`, missing
+  `rule` / `source` / `pid`, over-long strings (rule and image 256 bytes,
+  source and category 64) or control characters refuse the line (counted
+  as malformed, `robot.agent.input_malformed`, rate-limited; never
+  activity).
+- **Liveness.** The forwarder writes a heartbeat at connect and every
+  `heartbeat_ms` (5 s) when idle. A configured host input with no forwarder
+  reads "no data yet" or silent, so the state is `unknown`, never `ok`
+  (`robot.agent.input_silent`). The heartbeat's `dropped` (threats the
+  forwarder lost, e.g. its queue filled while the daemon was down) is
+  added to the input's `upstream_dropped` and reported like queue drops.
+- **Status.** The input `host:<path>` shows `received`, `malformed`,
+  `rejected_connections`, `connections`, `upstream_dropped`;
+  `daemon.host_threats`, `host_heartbeats`, `host_threats_own_skipped`.
+
 ## Outputs
 
 - **Black box** (`blackbox.dir`). It holds every deviation, plan note,
@@ -273,9 +322,10 @@ request.
 | `tests/binary.rs` | The real binary: exit code 2 on usage and configuration errors, on a 0644 key file and on an unknown key. SIGTERM and SIGINT give exit 0, a sealed black box that verifies with the spool's `checkpoint.json`, and a stop note. |
 | `tests/motion_live.rs` | A synthetic pcap with SEDP plus CDR `Twist` on `rt/cmd_vel` (0.4 m/s, then 2.5 m/s against a 1.0 m/s envelope) and CDR `Odometry` on `rt/odom`: three motion events reach the agent, exactly one Critical `robot.motion.linear_over_envelope` finding is spooled, the black box holds the decoded command (with its writer GUID) and a firewall verdict with `enforcing: false`, and verifies. A garbage payload on `rt/cmd_vel` yields one Medium `robot.motion.undecodable_sample` and the next good command still flows. `sensor.motion` keys are strict. |
 | `tests/review_regressions.rs` | Fourth-review fixes: no busy loop once every input ended (thread CPU < 25% of wall, state `unknown`); a malformed-only stream is never `ok` (`input_silent` + `input_malformed`); `..` and a late symlink cannot alias spool and black box; a live event socket is not stolen and cleanup checks the inode; the queue's byte budget; `READY`/`WATCHDOG`/`STATUS`/`STOPPING` over a notify socket and stale or other-boot `status.json` read as `unknown`; hostile event lines do not panic. |
+| `tests/host_threats.rs` | The host-threat socket, with the test playing `robodr-threat-forward`: a synthetic capture (rogue participant and `cmd_vel` writer) plus a Pulsar shell threat fire `coordinated_intrusion` (Critical, enforce); three host rules from one process fire `host_process_persistence`; the sensor's own threat is not counted twice; junk lines and the forwarder's reported losses are health findings; a host input with no forwarder reads `unknown` and goes silent, and a Pulsar service-stop threat with that silence is the observe-only `defense_tampering`; config and socket-directory checks. |
 | `tests/agent_api.rs` | `Agent::handle_external`: sensor deviations get real plans when enforcing. Self-health and observe-mode deviations never get an action plan. |
 | `tests/safety_feed.rs` | The live safety feed: Bool / UInt8 / String / Odometry mappings (with hysteresis, non-finite speed), staleness to `unknown`, conflicts to the most conservative state, unprofiled / IP-spoofed / wrong-type / non-allowlisted writers ignored with a High finding, undecodable and unmapped values read `unknown`. End to end through the daemon: an e-stop on the bus turns the plan for a Critical over-envelope command into Record (`request_safe_state` with the e-stop released); a rogue writer's "release" is reported and ignored; the PLC socket feed grades plans, goes stale to `unknown` (approval-gated plan) and every transition is in the black box. |
-| unit tests | Config strictness and key file checks, spool atomicity and bounds, the line reader (CRLF, overlong lines, timeouts, a full queue), the unix socket, and the health state machine. |
+| unit tests | Config strictness and key file checks, spool atomicity and bounds, the line reader (CRLF, overlong lines, timeouts, a full queue), the unix socket, the peer-uid policy, the host-threat line parser and socket permission checks, and the health state machine. |
 
 ## Limits (honest)
 
@@ -305,14 +355,21 @@ request.
   `phase`, `connectivity`, `operator_present`) is still configuration.
   The new rule ids are not in `robodr-ocsf`'s rule catalog yet (generic
   title / description in findings).
+- **Host threats: end to end only with a real Pulsar.** The daemon tests
+  play the forwarder over the real socket; `robodr-threat-forward`'s own
+  tests cover its format, queue and reconnects with a local listener. A
+  real rule hit through `robodr-pulsard` needs eBPF on the target kernel.
+  There is no process-to-socket attribution, so unit-scoped rules
+  (`coordinated_intrusion`, `defense_tampering`) join host and network
+  evidence by time window only.
 - **Plans are never executed.** The agent's executor is `NoopExecutor`.
   Dispositions are recorded and reported only.
 - **No exporter is included.** The rename-to-`acked/` acknowledgement is the
   whole contract, and it has not been run against a real Kafka producer.
 - **The key is a file, not a TPM.** The Ed25519 seed sits in a 0600 file
   (handed over by systemd `LoadCredential=`); root on the unit can read it
-  and sign as the unit. The Ed25519 implementation is RoboDR's own std-only
-  one (RFC 8032 vectors, not audited). HMAC keys still load (warned: the
+  and sign as the unit. The Ed25519 implementation is the audited
+  `ed25519-dalek` crate (RFC 8032 vectors pinned). HMAC keys still load (warned: the
   verifier can forge). Wall time is recorded with `TimeSource::Unknown`.
 - **A dead daemon reports nothing.** If the process dies, nothing inside it
   can report that. A console must treat a missing or stale `status.json` or

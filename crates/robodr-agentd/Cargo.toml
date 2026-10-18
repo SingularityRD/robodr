@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+# Not published (crates.io disallows path deps); also lets cargo-deny
+# accept version-less path dependencies (deny.toml, allow-wildcard-paths).
+publish = false
 repository.workspace = true
 description = "RoboDR live daemon: capture / pcap / JSONL events -> ROS 2 pipeline -> decision chain (robodr-agent) -> signed black box -> OCSF findings spool, with self-health. Std threads only (no async runtime); plans, never executes."
 

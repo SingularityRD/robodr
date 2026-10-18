@@ -7,6 +7,10 @@
 //! robodr-blackbox verify     DIR --keyring FILE [--keyring FILE]... [--checkpoint FILE]
 //!                            [--device ID] [--allow-mixed-algorithms] [--strict] [--json]
 //! robodr-blackbox inspect    DIR|SEGMENT [--json] [--limit N]
+//! robodr-blackbox tpm-anchor-init  --index 0x01XXXXXX [--tcti TCTI] [--tools-dir DIR]
+//!                            [--owner-auth-file FILE] [--index-auth-file FILE]
+//! robodr-blackbox tpm-anchor-check --index 0x01XXXXXX [--tcti TCTI] [--tools-dir DIR]
+//!                            [--index-auth-file FILE]
 //! ```
 //!
 //! - `keygen` writes a new key. Default `--alg ed25519`: the secret seed
@@ -32,6 +36,15 @@
 //!   only for a log that rotated from a legacy HMAC key to Ed25519).
 //! - `inspect` lists frames (seq, kind, flags, time, payload) without
 //!   checking any signature: it is a viewer, not a verdict.
+//! - `tpm-anchor-init` provisions the TPM 2.0 NV counter behind
+//!   `robodr_blackbox::TpmNvCounterAnchor`: it defines `--index` under the
+//!   owner hierarchy with `authread|authwrite|nt=counter|no_da`, size 8
+//!   (`tpm2_nvdefine`), and refuses an index that already exists. The
+//!   counter stays unwritten until the recorder's first mark. Default TCTI
+//!   `device:/dev/tpmrm0`, tools from `/usr/bin`. Authorization values are
+//!   read from files (`file:` for tpm2-tools), never from argv.
+//! - `tpm-anchor-check` reads the index's public area and value and exits
+//!   1 if it is not a counter.
 //!
 //! Exit codes: 0 = verified intact (warnings allowed unless `--strict`),
 //! 1 = verification failed, 2 = usage, I/O or key error.
@@ -43,11 +56,13 @@ use robodr_blackbox::crypto::to_hex;
 use robodr_blackbox::keys::{public_key_path, KeyFile, Keyring};
 use robodr_blackbox::record::{scan_frames, ScanItem};
 use robodr_blackbox::store::CHECKPOINT_FILE;
+use robodr_blackbox::tpm_anchor::{self, parse_nv_index, NvCounter, Tpm2Tools};
 use robodr_blackbox::verify::{read_segments, verify_dir, SegmentData, VerifyOptions};
 use robodr_blackbox::Checkpoint;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 const USAGE: &str = "usage:
   robodr-blackbox keygen     --out FILE [--alg ed25519|hmac] [--key-id ID] [--pub-out FILE]
@@ -56,6 +71,10 @@ const USAGE: &str = "usage:
   robodr-blackbox verify     DIR --keyring FILE [--keyring FILE]... [--checkpoint FILE]
                              [--device ID] [--allow-mixed-algorithms] [--strict] [--json]
   robodr-blackbox inspect    DIR|SEGMENT [--json] [--limit N]
+  robodr-blackbox tpm-anchor-init  --index 0x01XXXXXX [--tcti TCTI] [--tools-dir DIR]
+                             [--owner-auth-file FILE] [--index-auth-file FILE]
+  robodr-blackbox tpm-anchor-check --index 0x01XXXXXX [--tcti TCTI] [--tools-dir DIR]
+                             [--index-auth-file FILE]
 keygen defaults to ed25519 (secret FILE, 0600; public FILE.pub, safe to share).
 --keyring accepts secret key files (0600, own user or root) and public key
 files (any mode).
@@ -153,6 +172,8 @@ fn main() -> ExitCode {
         Some("export-pub") => export_pub(&argv[1..]),
         Some("verify") => verify(&argv[1..]),
         Some("inspect") => inspect(&argv[1..]),
+        Some("tpm-anchor-init") => tpm_anchor_init(&argv[1..]),
+        Some("tpm-anchor-check") => tpm_anchor_check(&argv[1..]),
         Some("-h" | "--help" | "help") => {
             println!("{USAGE}");
             Ok(())
@@ -329,6 +350,97 @@ fn verify(raw: &[String]) -> Result<(), Fail> {
     } else {
         Err(Fail::Verify)
     }
+}
+
+/// The counter named by `--index`, reached with `--tcti` / `--tools-dir`.
+fn tpm_counter(a: &Args) -> Result<NvCounter, String> {
+    if !a.positional.is_empty() {
+        return Err("tpm-anchor commands take no positional arguments".into());
+    }
+    let index = parse_nv_index(a.one("index")?.ok_or("--index 0x01XXXXXX is required")?)?;
+    let tools = Tpm2Tools::new(
+        a.one("tools-dir")?.unwrap_or(tpm_anchor::DEFAULT_TOOLS_DIR),
+        a.one("tcti")?.unwrap_or(tpm_anchor::DEFAULT_TCTI),
+        Duration::from_secs(30),
+    )?;
+    let auth = abs_file(a.one("index-auth-file")?, "--index-auth-file")?;
+    Ok(NvCounter::new(index, auth, Box::new(tools)))
+}
+
+fn abs_file(v: Option<&str>, what: &str) -> Result<Option<PathBuf>, String> {
+    match v.map(PathBuf::from) {
+        Some(p) if !p.is_absolute() => Err(format!("{what} must be an absolute path")),
+        Some(p) if !p.is_file() => Err(format!("{what} {}: not a file", p.display())),
+        other => Ok(other),
+    }
+}
+
+fn tpm_anchor_init(raw: &[String]) -> Result<(), Fail> {
+    let a = Args::parse(
+        raw,
+        &[
+            "index",
+            "tcti",
+            "tools-dir",
+            "owner-auth-file",
+            "index-auth-file",
+        ],
+        &[],
+    )?;
+    let c = tpm_counter(&a)?;
+    let owner = abs_file(a.one("owner-auth-file")?, "--owner-auth-file")?;
+    let index_auth = abs_file(a.one("index-auth-file")?, "--index-auth-file")?;
+    let idx = tpm_anchor::format_nv_index(c.index());
+    if let Ok(p) = c.read_public() {
+        return Err(format!(
+            "NV index {idx} is already defined (attributes {:#010x}, counter: {}); refusing to \
+             touch it (undefine it first with tpm2_nvundefine if it is really unused)",
+            p.attributes,
+            p.is_counter()
+        )
+        .into());
+    }
+    c.define(owner.as_deref(), index_auth.as_deref())?;
+    let p = c.check_counter()?;
+    eprintln!(
+        "defined NV counter {idx} ({}, attributes {:#010x}); it stays unwritten until the \
+         recorder's first mark",
+        tpm_anchor::PROVISION_ATTRIBUTES,
+        p.attributes
+    );
+    println!("{idx}");
+    Ok(())
+}
+
+fn tpm_anchor_check(raw: &[String]) -> Result<(), Fail> {
+    let a = Args::parse(raw, &["index", "tcti", "tools-dir", "index-auth-file"], &[])?;
+    let c = tpm_counter(&a)?;
+    let idx = tpm_anchor::format_nv_index(c.index());
+    let p = c.read_public()?;
+    if !p.is_counter() || p.size != 8 {
+        eprintln!(
+            "NV index {idx} is not a counter (attributes {:#010x}, size {})",
+            p.attributes, p.size
+        );
+        return Err(Fail::Verify);
+    }
+    let value = if p.written() {
+        c.read()?.to_string()
+    } else {
+        "unwritten".to_string()
+    };
+    println!(
+        "{}",
+        serde_json::json!({
+            "nv_index": idx,
+            "attributes": format!("{:#010x}", p.attributes),
+            "counter": true,
+            "orderly": p.attributes & tpm_anchor::attr::ORDERLY != 0,
+            "written": p.written(),
+            "value": value,
+        })
+    );
+    Ok(())
 }
 
 fn read_bounded(p: &Path, max: u64) -> Result<String, String> {

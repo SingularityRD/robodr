@@ -325,6 +325,7 @@ fn catalog_1_3_wave7(rule: &str) -> Option<RuleInfo> {
     const CORRELATE: &str = "robodr_correlation";
     const SAFETY: &str = "robot_safety_state";
     const AGENT: &str = "robodr_agent";
+    const HOST: &str = "host_runtime";
     // Small helper so the table below stays one entry per line group.
     const fn e(
         title: &'static str,
@@ -357,6 +358,12 @@ fn catalog_1_3_wave7(rule: &str) -> Option<RuleInfo> {
             "Black-box records cut after the newest mark",
             "Opening the black box found authentic proof that records after its newest integrity mark were removed; treat the evidence store as tampered with.",
             AGENT,
+            &[],
+        ),
+        "robot.host.pulsar_threat" => e(
+            "Host runtime-security detection (Pulsar rule)",
+            "A Pulsar runtime-security rule fired on the robot controller (process, file or network activity of the host operating system); the detail names the Pulsar rule and the process.",
+            HOST,
             &[],
         ),
         // --- robodr-agentd self-health -------------------------------------
@@ -558,6 +565,12 @@ fn catalog_1_3_wave7(rule: &str) -> Option<RuleInfo> {
         "robot.ros2.participant_source_mismatch" => e(
             "DDS participant announced from an unbound address",
             "A participant announcement for a bound participant came from an address outside its binding, or was relayed by an untrusted address; it was not learned.",
+            GRAPH,
+            &[T0848],
+        ),
+        "robot.ros2.identity_instances_exceeded" => e(
+            "Extra DDS participant claims a robot identity",
+            "A participant matched a stable identity of the profile (source IP, DDS vendor, enclave) whose allowed instances are all held by live participants; it is not trusted.",
             GRAPH,
             &[T0848],
         ),

@@ -161,7 +161,7 @@ mod verdict;
 pub use command::{ChannelId, Command, JointVelocities, Motion, SourceId, Twist, Vec3, MAX_JOINTS};
 pub use config::{
     ChannelKind, ChannelSpec, ConfigError, FailBehaviour, FaultPolicy, ForeignSourceAction,
-    PlatformConfig, Policy, RateLimit, MAX_CHANNELS, MAX_SOURCES,
+    PlatformConfig, Policy, RateLimit, IDENTITY_SOURCE_PREFIX, MAX_CHANNELS, MAX_SOURCES,
 };
 pub use engine::{Firewall, Stats};
 pub use events::{policy_mode, reject_rule, rules, EventAction, EventBuffer, FirewallEvent};

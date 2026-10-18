@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+# Not published (crates.io disallows path deps); also lets cargo-deny
+# accept version-less path dependencies (deny.toml, allow-wildcard-paths).
+publish = false
 repository.workspace = true
 description = "Pure, no-panic XCDR1/XCDR2 decoder for ROS 2 motion messages (Twist, Odometry, JointState, ...) feeding the Motion Firewall and motion monitor."
 

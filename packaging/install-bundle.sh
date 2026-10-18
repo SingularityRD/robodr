@@ -81,7 +81,9 @@ done
 
 do_verify() {
     if [ -n "$pubkey" ] || [ -n "$tarball" ]; then
-        [ -n "$pubkey" ] && [ -n "$tarball" ] || die 2 "--pubkey and --tarball go together"
+        if [ -z "$pubkey" ] || [ -z "$tarball" ]; then
+            die 2 "--pubkey and --tarball go together"
+        fi
         verify_sig "$pubkey" "$tarball"
         signed=1
     else
@@ -123,7 +125,9 @@ rollback)
     (cd "$dir" && sha256sum --strict --quiet --ignore-missing -c SHA256SUMS) ||
         die 1 "kept release $version_arg fails its checksums"
     set -- "$dir"/robodr_*.deb
-    [ $# -eq 1 ] && [ -f "$1" ] || die 1 "expected exactly one .deb in $dir"
+    if [ $# -ne 1 ] || [ ! -f "$1" ]; then
+        die 1 "expected exactly one .deb in $dir"
+    fi
     echo "install-bundle: rolling back to robodr $version_arg"
     dpkg -i "$1"
     ;;

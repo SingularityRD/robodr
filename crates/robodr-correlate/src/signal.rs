@@ -22,7 +22,7 @@ pub enum EntityKind {
     Participant,
     /// A network source address (the pipeline's `src_ip`).
     Ip,
-    /// A host process (e.g. `"<pid>:<image>"`; the producer chooses a stable
+    /// A host process (robodr-agentd uses the pid; the producer chooses a stable
     /// form and documents it).
     Process,
     /// A robot / unit id (useful when one engine is fed by several units,

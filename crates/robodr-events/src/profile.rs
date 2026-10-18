@@ -68,6 +68,15 @@
 //! is internally inconsistent and is rejected
 //! ([`ProfileError::MotionChannelNotWritable`]).
 //!
+//! **Participants across restarts.** `participants` lists GUID prefixes, and
+//! DDS stacks draw a new prefix every time a process starts. A profile meant
+//! to survive a reboot therefore also carries `participant_identities`
+//! ([`ParticipantIdentity`]: source IPs, RTPS vendor, enclave, instance
+//! cap); the sensor resolves a new prefix to an identity at run time and
+//! adds it to its working copy of `participants`, so every check below
+//! treats it as profiled. `evaluate` itself only ever looks at
+//! `participants`.
+//!
 //! # Motion envelope
 //!
 //! See the crate docs for the NaN / negative / invalid-limit rules. Checks run
@@ -386,6 +395,133 @@ pub struct Profile {
     /// Exact raw DDS topic names (no ROS mangling) allowed on the bus.
     #[serde(default)]
     pub raw_dds_topics: BTreeSet<String>,
+    /// Stable identities of the robot's participants (see
+    /// [`ParticipantIdentity`]). DDS stacks draw a fresh GUID prefix every
+    /// time a process starts, so `participants` alone only matches the run
+    /// it was learned from; a sensor resolves a new prefix to one of these
+    /// identities at run time and then treats it as profiled. Empty = GUID
+    /// matching only (as before). Not serialised when empty, so profiles
+    /// written before this field existed keep their exact bytes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub participant_identities: BTreeMap<String, ParticipantIdentity>,
+}
+
+/// Most identities in one profile.
+pub const MAX_IDENTITIES: usize = 256;
+/// Most source IPs of one identity.
+pub const MAX_IDENTITY_IPS: usize = 16;
+/// Most ROS nodes recorded for one identity.
+pub const MAX_IDENTITY_NODES: usize = 256;
+/// Upper bound of [`ParticipantIdentity::max_instances`].
+pub const MAX_IDENTITY_INSTANCES: u32 = 16;
+
+fn one() -> u32 {
+    1
+}
+
+fn is_one(n: &u32) -> bool {
+    *n == 1
+}
+
+/// A participant of the robot described by what survives a process restart,
+/// not by its GUID prefix (which DDS stacks randomise per process: Fast DDS
+/// puts the PID in it, Cyclone DDS draws it at random).
+///
+/// A sensor resolves an SPDP announcement to an identity when **all** of
+/// these hold (see `robodr-ros2-pipeline`'s `identity` module):
+///
+/// * its source IP is one of `ips` (and the participant/IP binding check
+///   did not reject it),
+/// * the RTPS vendor id of the announcement is `vendor`,
+/// * its ROS 2 security enclave (SPDP user data `enclave=`) is `enclave`,
+///   when `enclave` is set,
+/// * fewer than `max_instances` live participants already hold the identity.
+///
+/// The prefix is then treated as a profiled participant until it disposes
+/// itself or its lease expires. Everything it announces is still checked
+/// against the topic / service / action allowlists, so a resolved process
+/// that grows a node not in `nodes` raises `robot.ros2.unknown_service` for
+/// that node's parameter services.
+///
+/// Limits (be honest): source IPs are not authenticated (see the binding
+/// module); a second process on the same host can hold an identity while
+/// the real one is down. `max_instances` bounds how many may hold it at
+/// once, so a rogue started next to the live controller is still an unknown
+/// participant.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParticipantIdentity {
+    /// Source IPs its SPDP may come from (IP literals, 1..=16).
+    pub ips: BTreeSet<String>,
+    /// RTPS vendor id, 4 lower-case hex digits (`010f` eProsima Fast DDS,
+    /// `0110` Eclipse Cyclone DDS, `0101` RTI Connext, ...).
+    pub vendor: String,
+    /// ROS 2 security enclave announced in SPDP user data (`/` by default),
+    /// `None` = not checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enclave: Option<String>,
+    /// Fully qualified names of the ROS nodes it hosts, as learned (from
+    /// their parameter services). Documentation for the operator sign-off;
+    /// enforcement comes from the `services` allowlist.
+    #[serde(default)]
+    pub nodes: BTreeSet<String>,
+    /// How many live participants may hold this identity at once (1..=16).
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub max_instances: u32,
+}
+
+impl ParticipantIdentity {
+    /// Every problem with this identity (empty = valid).
+    pub fn problems(&self) -> Vec<String> {
+        let mut v = Vec::new();
+        if self.ips.is_empty() {
+            v.push("ips must name at least one source IP".to_owned());
+        }
+        if self.ips.len() > MAX_IDENTITY_IPS {
+            v.push(format!("ips: at most {MAX_IDENTITY_IPS} entries"));
+        }
+        for ip in &self.ips {
+            if ip.parse::<std::net::IpAddr>().is_err() {
+                v.push(format!("ips entry {ip:?} is not an IP address"));
+            }
+        }
+        if !(self.vendor.len() == 4
+            && self
+                .vendor
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        {
+            v.push(format!(
+                "vendor {:?} must be 4 lower-case hex digits",
+                self.vendor
+            ));
+        }
+        if let Some(e) = &self.enclave {
+            if !e.starts_with('/') || e.len() > 256 || e.chars().any(char::is_control) {
+                v.push(format!("enclave {e:?} must be an absolute enclave path"));
+            }
+        }
+        if self.nodes.len() > MAX_IDENTITY_NODES {
+            v.push(format!("nodes: at most {MAX_IDENTITY_NODES} entries"));
+        }
+        for n in &self.nodes {
+            if validate_full_name(n).is_err() {
+                v.push(format!(
+                    "nodes entry {n:?} is not a fully qualified ROS name"
+                ));
+            }
+        }
+        if !(1..=MAX_IDENTITY_INSTANCES).contains(&self.max_instances) {
+            v.push(format!(
+                "max_instances must be 1..={MAX_IDENTITY_INSTANCES}"
+            ));
+        }
+        v
+    }
+}
+
+/// An identity name: `[A-Za-z0-9._-]{1,64}`.
+pub fn is_identity_name(s: &str) -> bool {
+    is_label(s)
 }
 
 /// Which envelope limit a [`ProfileError`] refers to.
@@ -461,6 +597,9 @@ pub enum ProfileError {
     UnsupportedSchemaVersion { found: u32, supported: u32 },
     /// A [`ProfileMetadata`] field is malformed.
     InvalidMetadata { field: &'static str, detail: String },
+    /// A [`ParticipantIdentity`] (or its name) is malformed, or there are
+    /// more than [`MAX_IDENTITIES`].
+    InvalidIdentity { name: String, detail: String },
 }
 
 impl fmt::Display for ProfileError {
@@ -507,6 +646,9 @@ impl fmt::Display for ProfileError {
             ),
             Self::InvalidMetadata { field, detail } => {
                 write!(f, "metadata.{field}: {detail}")
+            }
+            Self::InvalidIdentity { name, detail } => {
+                write!(f, "participant_identities.{name:?}: {detail}")
             }
         }
     }
@@ -628,6 +770,26 @@ impl Profile {
         }
         if let Some(m) = &self.metadata {
             errs.extend(m.validate());
+        }
+        if self.participant_identities.len() > MAX_IDENTITIES {
+            errs.push(ProfileError::InvalidIdentity {
+                name: String::new(),
+                detail: format!("at most {MAX_IDENTITIES} identities"),
+            });
+        }
+        for (name, id) in &self.participant_identities {
+            if !is_identity_name(name) {
+                errs.push(ProfileError::InvalidIdentity {
+                    name: name.clone(),
+                    detail: "name must match [A-Za-z0-9._-]{1,64}".into(),
+                });
+            }
+            for detail in id.problems() {
+                errs.push(ProfileError::InvalidIdentity {
+                    name: name.clone(),
+                    detail,
+                });
+            }
         }
         if errs.is_empty() {
             Ok(())
@@ -2151,5 +2313,71 @@ mod metadata_tests {
         assert!(m.validate().is_empty());
         m.profile_version = u64::MAX;
         assert!(m.validate().is_empty());
+    }
+
+    // ---- participant identities ----
+
+    fn identity() -> ParticipantIdentity {
+        ParticipantIdentity {
+            ips: ["10.0.0.5".to_owned()].into(),
+            vendor: "010f".into(),
+            enclave: Some("/".into()),
+            nodes: ["/base_controller".to_owned()].into(),
+            max_instances: 1,
+        }
+    }
+
+    #[test]
+    fn identities_validate() {
+        let mut p = profile(None);
+        p.participant_identities.insert("base".into(), identity());
+        assert!(p.validate().is_ok());
+
+        let bad = |f: fn(&mut ParticipantIdentity)| {
+            let mut q = profile(None);
+            let mut id = identity();
+            f(&mut id);
+            q.participant_identities.insert("base".into(), id);
+            q.validate().unwrap_err()
+        };
+        for errs in [
+            bad(|i| i.ips.clear()),
+            bad(|i| {
+                i.ips.insert("10.0.0.300".into());
+            }),
+            bad(|i| i.vendor = "010F".into()),
+            bad(|i| i.vendor = "10f".into()),
+            bad(|i| i.enclave = Some("relative".into())),
+            bad(|i| {
+                i.nodes.insert("base_controller".into());
+            }),
+            bad(|i| i.max_instances = 0),
+            bad(|i| i.max_instances = MAX_IDENTITY_INSTANCES + 1),
+        ] {
+            assert!(
+                matches!(errs.as_slice(), [ProfileError::InvalidIdentity { name, .. }] if name == "base"),
+                "{errs:?}"
+            );
+        }
+        let mut q = profile(None);
+        q.participant_identities.insert("a b".into(), identity());
+        assert!(q.validate().is_err());
+    }
+
+    #[test]
+    fn identities_are_optional_on_the_wire() {
+        // Old profiles load (no key) and keep their bytes (empty map omitted).
+        let p: Profile = serde_json::from_str(r#"{"model":"m"}"#).unwrap();
+        assert!(p.participant_identities.is_empty());
+        assert!(!serde_json::to_string(&p)
+            .unwrap()
+            .contains("participant_identities"));
+        // max_instances defaults to 1 and is omitted when 1.
+        let id: ParticipantIdentity =
+            serde_json::from_str(r#"{"ips":["10.0.0.5"],"vendor":"0110"}"#).unwrap();
+        assert_eq!(id.max_instances, 1);
+        assert!(!serde_json::to_string(&id)
+            .unwrap()
+            .contains("max_instances"));
     }
 }

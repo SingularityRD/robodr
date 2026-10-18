@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+# Not published (crates.io disallows path deps); also lets cargo-deny
+# accept version-less path dependencies (deny.toml, allow-wildcard-paths).
+publish = false
 repository.workspace = true
 description = "Signed, hash-chained black-box evidence recorder for RoboDR."
 
@@ -11,6 +14,8 @@ description = "Signed, hash-chained black-box evidence recorder for RoboDR."
 robodr-events = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
 
 [[bin]]
 name = "robodr-blackbox"

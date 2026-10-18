@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+# Not published (crates.io disallows path deps); also lets cargo-deny
+# accept version-less path dependencies (deny.toml, allow-wildcard-paths).
+publish = false
 repository.workspace = true
 description = "Passive packet capture for RoboDR: Ethernet/IP/UDP frame decoding, pcap replay, and a Linux AF_PACKET reader feeding the RTPS parser. Read-only."
 

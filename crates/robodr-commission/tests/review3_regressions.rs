@@ -344,10 +344,12 @@ fn f3_signoff_items_cannot_be_deleted() {
         .iter()
         .any(|w| matches!(w, LockRefusal::RequiredItemMissing { .. })));
 
-    // Deleting a single item (not the motion one) is caught by the digest.
+    // Deleting a single item (not one the floor requires: motion writers,
+    // participant identities) is caught by the digest.
     let mut one = c.signoff.clone().confirm_all("op");
     let n = one.items.len();
-    one.items.retain(|i| i.kind == "motion_writer");
+    one.items
+        .retain(|i| i.kind == "motion_writer" || i.kind == "participant_identity");
     assert!(one.items.len() < n, "{:#?}", c.signoff.items);
     assert_eq!(
         lock(&c.profile, &one).unwrap_err(),

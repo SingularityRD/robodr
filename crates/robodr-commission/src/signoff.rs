@@ -112,8 +112,8 @@
 //! * Limits: a careless or colluding operator (or, with a quorum, colluding
 //!   operators) can still confirm anything; the signature makes that a
 //!   named, non-repudiable decision, not a correct one. Ed25519 is
-//!   robodr-blackbox's std-only implementation (RFC 8032 vectors, not
-//!   audited). No key expiry or revocation list: revoke by removing the key
+//!   robodr-blackbox's wrapper over the audited `ed25519-dalek` crate. No
+//!   key expiry or revocation list: revoke by removing the key
 //!   from the trust list.
 
 use crate::to_json;
@@ -204,6 +204,34 @@ pub const MOTION_REVIEW_KINDS: [&str; 3] = [
     "motion_channel_unreviewed",
 ];
 
+/// Kind of the item that confirms one `participant_identities` entry
+/// ([`required_items`]: every identity needs one).
+pub const IDENTITY_KIND: &str = "participant_identity";
+
+/// The sign-off item for identity `name`. Its reason spells the matcher
+/// out, so the item digest binds what the operator confirmed.
+pub fn identity_item(name: &str, id: &robodr_events::profile::ParticipantIdentity) -> SignoffItem {
+    let list = |s: &BTreeSet<String>| s.iter().cloned().collect::<Vec<_>>().join(", ");
+    SignoffItem::new(
+        IDENTITY_KIND,
+        name,
+        format!(
+            "after a restart, any participant announcing from [{}] with RTPS vendor {}{} is \
+             accepted as '{name}' (nodes: [{}]), up to {} at a time, with every right its \
+             learned participants had (motion topics included): confirm these addresses and \
+             nodes belong to the robot",
+            list(&id.ips),
+            id.vendor,
+            id.enclave
+                .as_deref()
+                .map(|e| format!(" and enclave {e}"))
+                .unwrap_or_default(),
+            list(&id.nodes),
+            id.max_instances
+        ),
+    )
+}
+
 /// Kind of the item that must confirm a `null` (unlimited) motion
 /// dimension ([`required_items`]).
 pub const UNBOUNDED_DIMENSION_KIND: &str = "envelope_dimension_unbounded";
@@ -224,6 +252,7 @@ pub struct Requirement {
 
 /// What every sign-off for `profile` must contain, confirmed, whatever list
 /// was generated (the floor `lock` recomputes from the draft bytes):
+/// * per participant identity `name`: an [`IDENTITY_KIND`] item for `name`;
 /// * per motion channel `ch`: an item whose kind is in
 ///   [`MOTION_REVIEW_KINDS`] and whose subject is `ch` or starts with
 ///   `"<ch> "`;
@@ -233,6 +262,17 @@ pub struct Requirement {
 ///   `lock` outright.)
 pub fn required_items(profile: &Profile) -> Vec<Requirement> {
     let mut out = Vec::new();
+    for name in profile.participant_identities.keys() {
+        out.push(Requirement {
+            subject: name.clone(),
+            kinds: &[IDENTITY_KIND],
+            exact: true,
+            why: format!(
+                "participant identity {name} is in the draft, so a confirmed {IDENTITY_KIND} \
+                 item for it is required"
+            ),
+        });
+    }
     for (ch, env) in &profile.motion_envelopes {
         out.push(Requirement {
             subject: ch.clone(),
@@ -342,6 +382,9 @@ impl Signoff {
                 "provenance unknown (edited or merged draft): confirm this participant belongs \
                  on the robot",
             ));
+        }
+        for (name, id) in &profile.participant_identities {
+            items.push(identity_item(name, id));
         }
         for (ch, env) in &profile.motion_envelopes {
             items.push(SignoffItem::new(

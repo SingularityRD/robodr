@@ -71,6 +71,7 @@
 pub mod binding;
 pub mod config;
 pub mod dedup;
+pub mod identity;
 pub mod motion;
 pub mod pipeline;
 pub mod profile_trust;
@@ -85,6 +86,7 @@ pub use config::{
     BindingConfig, CaptureConfig, CaptureInput, CaptureSettings, Config, Settings, SpdpSettings,
 };
 pub use dedup::DedupSet;
+pub use identity::{IdentityResolver, IdentityStats, NodeEvidence, Resolution};
 pub use motion::{MotionOptions, MotionSample, MotionStats, SampleAttribution};
 pub use pipeline::{
     load_profile, rules, Finding, LoadedProfile, Pipeline, PipelineOptions, PipelineStats,

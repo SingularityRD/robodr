@@ -102,9 +102,22 @@
 //! pending state is protected from eviction by a flood of fresh entities;
 //! evicting pending evidence anyway is reported per rule as the
 //! observe-only correlated finding `robot.correlate.correlation_state_evicted`.
-//! Correlation only adds findings; nothing is suppressed. Host-side (Pulsar)
-//! signals are not delivered to agentd yet, so the host-dependent default
-//! rules cannot fire here.
+//! Correlation only adds findings; nothing is suppressed.
+//!
+//! # Host threats (Pulsar)
+//!
+//! With `host_threats` ([`crate::host`]), the `robodr-threat-forward`
+//! Pulsar module delivers every Pulsar threat (except the ROS 2 sensor's
+//! own) over a peer-checked unix socket. Each one is reported as a
+//! `robot.host.pulsar_threat` finding (`Detector::Sensor`, source
+//! `host:<module>`, the threat's severity) and fed to the correlator as
+//! `Signal::host(<Pulsar rule name>)` with the `process` entity
+//! (the pid), so the host-dependent default rules
+//! (`coordinated_intrusion`, `credential_theft`,
+//! `trojaned_package_key_access`, `defense_tampering`,
+//! `host_process_persistence`) fire here. The forwarder's heartbeats keep
+//! the input live; a forwarder that is gone makes the input silent and the
+//! state `unknown`.
 //!
 //! # Evidence store upkeep
 //!
@@ -122,8 +135,10 @@
 //! file says `"blackbox": {"anchored": false, ...}`: `head.json` alone
 //! cannot reveal a cut of the newest records combined with a rollback of
 //! `head.json`, or a wiped store. The `file` anchor is only as strong as
-//! the storage it lives on; a deployment needs a TPM NV counter or a
-//! remote receiver behind `robodr_blackbox::HeadAnchor`.
+//! the storage it lives on; a deployment needs the `tpm_nv_counter` anchor
+//! (`robodr_blackbox::TpmNvCounterAnchor`: TPM 2.0 NV counter plus a
+//! sidecar signed with the black-box key) or a remote receiver behind
+//! `robodr_blackbox::HeadAnchor` (not implemented).
 //!
 //! # Finding signatures
 //!
@@ -236,6 +251,12 @@ pub struct DaemonStats {
     pub head_marks: u64,
     /// High-water marks the timer could not write.
     pub head_mark_errors: u64,
+    /// Pulsar threats taken from the host-threat socket (finding + signal).
+    pub host_threats: u64,
+    /// Forwarder heartbeats received.
+    pub host_heartbeats: u64,
+    /// Host threats of `robodr-sensor-ros2` dropped (seen via the pipeline).
+    pub host_threats_own_skipped: u64,
 }
 
 /// Why the daemon stopped.
@@ -321,6 +342,10 @@ struct InputStatus<'a> {
     budget_drops: u64,
     malformed: u64,
     rejected_connections: u64,
+    /// Open connections (socket inputs).
+    connections: u64,
+    /// Items the producer reported lost before they reached this input.
+    upstream_dropped: u64,
     last_rx_age_ms: Option<u64>,
     ended: bool,
     end_error: Option<String>,
@@ -416,6 +441,8 @@ struct Daemon<'a> {
     notifier: Notifier,
     /// The live safety-state feed, if configured.
     feed: Option<SafetyFeed>,
+    /// Identity counters last handed to the agent / feed.
+    identity_seen: robodr_ros2_pipeline::IdentityStats,
     health: HealthMonitor,
     last_state: HealthState,
     stats: DaemonStats,
@@ -433,6 +460,9 @@ struct Daemon<'a> {
     /// Recorder generation (`AgentStats::blackbox_reopens`) whose open
     /// incidents were last reported.
     incidents_reported: Option<u64>,
+    /// Per input: the forwarder's cumulative `dropped` at its last
+    /// heartbeat (host-threat inputs only).
+    host_upstream_seen: Vec<u64>,
 }
 
 fn ms(d: Duration) -> u64 {
@@ -541,6 +571,20 @@ impl<'a> Daemon<'a> {
             Some(crate::config::HeadAnchorConfig::File { path }) => {
                 let a = robodr_blackbox::FileHeadAnchor::new(path)
                     .map_err(|e| DaemonError::Config(format!("blackbox.head_anchor: {e}")))?;
+                bcfg.head_anchor = Some(Arc::new(a));
+            }
+            Some(a @ crate::config::HeadAnchorConfig::TpmNvCounter { .. }) => {
+                let bad = |e: String| DaemonError::Config(format!("blackbox.head_anchor: {e}"));
+                let tc = a
+                    .tpm_config()
+                    .unwrap_or_else(|| Err("not a TPM anchor".into()))
+                    .map_err(bad)?;
+                // The sidecar is signed with the black-box key.
+                let signer =
+                    crate::config::signer_for(&r.key_algorithm, &r.key, r.key_id.as_deref())
+                        .map_err(bad)?;
+                let a = robodr_blackbox::TpmNvCounterAnchor::new(&tc, signer)
+                    .map_err(|e| bad(e.to_string()))?;
                 bcfg.head_anchor = Some(Arc::new(a));
             }
             // Never claim anchoring without one (status: anchored false).
@@ -709,6 +753,35 @@ impl<'a> Daemon<'a> {
                 }),
             ));
         }
+        if let Some(h) = &r.host_threats {
+            let l =
+                crate::host::bind_host_socket(h, crate::config::effective_uid()).map_err(|e| {
+                    DaemonError::Io(format!("host_threats socket {}: {e}", h.path.display()))
+                })?;
+            let input_feed = add(
+                format!("host:{}", h.path.display()),
+                InputKind::Events,
+                true,
+            );
+            let (stop, max, allowed) = (
+                stop_inputs.clone(),
+                h.max_connections,
+                h.allowed_uids.clone(),
+            );
+            spawns.push((
+                input_feed,
+                Box::new(move |f| {
+                    input::run_unix_listener_peers(
+                        l,
+                        max,
+                        stop,
+                        f,
+                        crate::host::parse_host_line,
+                        Some(allowed),
+                    )
+                }),
+            ));
+        }
         drop(tx);
         for (i, (feed, body)) in spawns.into_iter().enumerate() {
             let h = std::thread::Builder::new()
@@ -743,6 +816,7 @@ impl<'a> Daemon<'a> {
             inputs_gone: false,
             notifier,
             feed,
+            identity_seen: Default::default(),
             health,
             last_state: HealthState {
                 state: State::Unknown,
@@ -755,6 +829,7 @@ impl<'a> Daemon<'a> {
             correlation_pressure_reported: 0,
             correlation_pressure_at_ms: None,
             incidents_reported: None,
+            host_upstream_seen: Vec::new(),
         };
         #[derive(Serialize)]
         struct StartNote<'b> {
@@ -976,6 +1051,7 @@ impl<'a> Daemon<'a> {
                     None => Vec::new(),
                 };
                 self.feed_findings(fed);
+                self.sync_identities();
                 self.sensor_findings(out.findings);
                 for s in out.motion {
                     self.motion_sample(s);
@@ -990,6 +1066,10 @@ impl<'a> Daemon<'a> {
                 self.safety();
                 self.feed_findings(fed);
             }
+            Payload::Host(crate::host::HostLine::Heartbeat(hb)) => {
+                self.host_heartbeat(m.input, hb);
+            }
+            Payload::Host(crate::host::HostLine::Threat(t)) => self.host_threat(&t),
             Payload::Event(ev) => {
                 self.stats.events += 1;
                 let safety = self.safety();
@@ -999,6 +1079,26 @@ impl<'a> Daemon<'a> {
                     self.emit(o);
                 }
             }
+        }
+    }
+
+    /// Hand the participant identities the pipeline resolved (fresh GUIDs
+    /// of restarted processes) to the Motion Firewall and the safety feed,
+    /// when they changed.
+    fn sync_identities(&mut self) {
+        let st = self.pipeline.stats().identity;
+        if st == self.identity_seen {
+            return;
+        }
+        self.identity_seen = st;
+        let held = self.pipeline.identity_holders();
+        self.agent.set_source_identities(
+            held.iter()
+                .map(|(p, n)| (robodr_rtps::hex12(p), n.clone()))
+                .collect(),
+        );
+        if let Some(f) = self.feed.as_mut() {
+            f.set_identities(held.into_iter().collect());
         }
     }
 
@@ -1160,14 +1260,83 @@ impl<'a> Daemon<'a> {
         self.correlate(&o);
     }
 
+    /// A forwarder heartbeat: liveness (already counted by the input) and
+    /// the forwarder's own losses, added to the input's `upstream_dropped`
+    /// (a smaller count than last time = the forwarder restarted).
+    fn host_heartbeat(&mut self, input: usize, hb: crate::host::HostHeartbeat) {
+        self.stats.host_heartbeats += 1;
+        if self.host_upstream_seen.len() < self.inputs.len() {
+            self.host_upstream_seen.resize(self.inputs.len(), 0);
+        }
+        let Some(seen) = self.host_upstream_seen.get_mut(input) else {
+            return;
+        };
+        let delta = if hb.dropped >= *seen {
+            hb.dropped - *seen
+        } else {
+            hb.dropped
+        };
+        *seen = hb.dropped;
+        if delta > 0 {
+            if let Some(i) = self.inputs.get(input) {
+                i.stats.upstream_dropped.fetch_add(delta, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// A Pulsar threat: a `robot.host.pulsar_threat` finding (agent, black
+    /// box, spool), then a host-side correlation signal named by the Pulsar
+    /// rule, with the process entity and the finding's evidence.
+    fn host_threat(&mut self, t: &crate::host::HostThreat) {
+        if t.is_own_sensor() {
+            // Already reported through the pipeline: never twice.
+            self.stats.host_threats_own_skipped += 1;
+            return;
+        }
+        self.stats.host_threats += 1;
+        let _ = writeln!(
+            self.log,
+            "robodr-agentd: host threat: {} (module {}, pid {}, {})",
+            sanitize(&t.rule),
+            sanitize(&t.source),
+            t.pid,
+            sanitize(&t.image)
+        );
+        let safety = self.safety();
+        let now = self.clock.now();
+        let source = format!("host:{}", t.source);
+        let o = self.agent.handle_external(
+            now,
+            Detector::Sensor,
+            &source,
+            Subject::default(),
+            t.deviation(),
+            safety,
+        );
+        let mut sig = Signal::host(self.clock.now().mono_ns, t.rule.clone(), t.severity())
+            .with_mode(o.deviation.mode)
+            .with_entity(EntityKind::Process, t.process_entity());
+        if let Some(r) = &o.evidence.deviation {
+            sig = sig.with_evidence_ref(r.uri(&self.r.config.robot.id));
+        }
+        // `emit` does not correlate the `robot.host.pulsar_threat` finding
+        // itself: the signal below (named by the Pulsar rule) stands for it.
+        self.emit(o);
+        if self.correlator.is_some() {
+            self.observe_signal(&sig);
+        }
+    }
+
     /// Feed one reported outcome to the correlation engine and report what
-    /// it completes. Correlated findings and the engine's own health
-    /// finding are not fed back.
+    /// it completes. Correlated findings, the engine's own health finding
+    /// and host-threat findings (fed as their Pulsar rule by
+    /// [`Self::host_threat`]) are not fed here.
     fn correlate(&mut self, o: &Outcome) {
         let rule = o.deviation.rule_str();
         if self.correlator.is_none()
             || rule.starts_with(robodr_correlate::RULE_ID_PREFIX)
             || rule == health_rules::CORRELATION_PRESSURE
+            || rule == crate::host::HOST_THREAT_RULE
         {
             return;
         }
@@ -1180,9 +1349,14 @@ impl<'a> Daemon<'a> {
         if let Some(r) = &o.evidence.deviation {
             sig = sig.with_evidence_ref(r.uri(&self.r.config.robot.id));
         }
+        self.observe_signal(&sig);
+    }
+
+    /// One signal into the correlator; report what it completes.
+    fn observe_signal(&mut self, sig: &Signal) {
         let found = match self.correlator.as_mut() {
             Some(c) => {
-                let mut f = c.observe(&sig);
+                let mut f = c.observe(sig);
                 // Eviction notices (observe-only) are reported like findings.
                 f.extend(c.take_notices());
                 f
@@ -1440,7 +1614,12 @@ impl<'a> Daemon<'a> {
             .map(|i| InputSnapshot {
                 name: i.name.clone(),
                 last_rx_ms: i.stats.last_rx_ms(),
-                dropped: i.stats.dropped.load(Ordering::Relaxed),
+                // The producer's own losses count like queue drops.
+                dropped: i
+                    .stats
+                    .dropped
+                    .load(Ordering::Relaxed)
+                    .saturating_add(i.stats.upstream_dropped.load(Ordering::Relaxed)),
                 malformed: i.stats.malformed.load(Ordering::Relaxed),
                 last_malformed: i.stats.last_malformed(),
                 ended: i.stats.ended.load(Ordering::SeqCst),
@@ -1490,6 +1669,7 @@ impl<'a> Daemon<'a> {
         // Staleness is noticed (and recorded) even on a quiet bus.
         self.safety();
         let mut found = self.pipeline.tick();
+        self.sync_identities();
         if let Some(h) = self.capture_health.latest() {
             found.extend(self.pipeline.capture_findings(&h));
         }
@@ -1580,6 +1760,8 @@ impl<'a> Daemon<'a> {
                 budget_drops: i.stats.budget_drops.load(Ordering::Relaxed),
                 malformed: i.stats.malformed.load(Ordering::Relaxed),
                 rejected_connections: i.stats.rejected_connections.load(Ordering::Relaxed),
+                connections: i.stats.connections.load(Ordering::Relaxed),
+                upstream_dropped: i.stats.upstream_dropped.load(Ordering::Relaxed),
                 last_rx_age_ms: i.stats.last_rx_ms().map(|t| now.saturating_sub(t)),
                 ended: i.stats.ended.load(Ordering::SeqCst),
                 end_error: i.stats.end_error(),

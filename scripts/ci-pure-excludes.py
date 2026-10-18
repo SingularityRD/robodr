@@ -24,7 +24,7 @@ import subprocess
 import sys
 
 # Members that must be built against Pulsar even if their manifest changes.
-PULSAR_BOUND = {"robodr-sensor-ros2", "robodr-pulsard"}
+PULSAR_BOUND = {"robodr-sensor-ros2", "robodr-threat-forward", "robodr-pulsard"}
 # Any member depending on one of these needs the Pulsar/eBPF build toolchain.
 PULSAR_DEPS = {"pulsar-core", "bpf-common", "bpf-builder"}
 
