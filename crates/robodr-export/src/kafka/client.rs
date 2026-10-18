@@ -2,6 +2,11 @@
 //!
 //! * Plain TCP. **No TLS, no SASL.** Put it behind a local TLS proxy
 //!   (stunnel, a sidecar) or run it on an isolated SOC network segment.
+//!   Pointed at a TLS listener (answers with a TLS alert) or a SASL listener
+//!   (closes the connection after ApiVersions), the error says so.
+//! * Connections unused for `connections_max_idle` (9 min, as the Java
+//!   client) are closed before the broker's own idle timeout (10 min)
+//!   would make the next request fail.
 //! * On every new connection: ApiVersions v0, then the highest common
 //!   version of Metadata (1–8) and Produce (3–8) is used.
 //! * `acks = -1` (all in-sync replicas), idempotence **off** (producer id
@@ -17,10 +22,14 @@
 //!   for `retries` rounds, or exceeds `delivery_timeout`, fails without
 //!   reporting anything as delivered that was not acknowledged.
 //! * Record-level errors (`MESSAGE_TOO_LARGE`, `INVALID_RECORD`, ...) are
-//!   narrowed down by re-sending that partition's records one at a time;
-//!   the offending record is reported as [`Outcome::Rejected`], the others
-//!   are delivered. Records that cannot fit in `max_request_bytes` are
-//!   rejected client-side without being sent.
+//!   narrowed down by halving that partition's batch until it is accepted
+//!   or holds one record (as the Java client splits a batch on
+//!   `MESSAGE_TOO_LARGE`); the halved size is kept for the rest of the call,
+//!   so a batch that is only too large as a whole (topic
+//!   `max.message.bytes` below `max_request_bytes`) does not degrade to one
+//!   record per request. The offending record is reported as
+//!   [`Outcome::Rejected`], the others are delivered. Records that cannot
+//!   fit in `max_request_bytes` are rejected client-side without being sent.
 //! * Fatal errors (authorisation, unsupported version, invalid topic) stop
 //!   the call: [`ProduceError::Fatal`].
 //! * Bounds: requests ≤ `max_request_bytes`, response frames ≤
@@ -44,7 +53,7 @@ use super::batch::{encode_batch, ProduceRecord, BATCH_OVERHEAD};
 use super::errors::{self, classify, ErrorClass};
 use super::proto::{self, ApiRange};
 use super::wire::DecodeError;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -81,6 +90,11 @@ pub struct ProducerConfig {
     pub retry_backoff_max: Duration,
     /// Refresh metadata at least this often.
     pub metadata_max_age: Duration,
+    /// Close a connection unused for this long instead of using it (Java
+    /// `connections.max.idle.ms`, 9 min): brokers close idle connections
+    /// after their own `connections.max.idle.ms` (default 10 min), and a
+    /// request on such a connection fails and costs a retry.
+    pub connections_max_idle: Duration,
 }
 
 impl ProducerConfig {
@@ -99,6 +113,7 @@ impl ProducerConfig {
             retry_backoff: Duration::from_millis(100),
             retry_backoff_max: Duration::from_secs(10),
             metadata_max_age: Duration::from_secs(300),
+            connections_max_idle: Duration::from_secs(540),
         }
     }
 
@@ -118,6 +133,9 @@ impl ProducerConfig {
         }
         if self.produce_timeout_ms <= 0 {
             return bad("produce_timeout_ms must be > 0");
+        }
+        if self.connections_max_idle.is_zero() {
+            return bad("connections_max_idle must be > 0");
         }
         if self.request_timeout.is_zero() || self.connect_timeout.is_zero() {
             return bad("timeouts must be > 0");
@@ -229,6 +247,47 @@ struct Conn {
     stream: TcpStream,
     produce_v: i16,
     metadata_v: i16,
+    /// No request after the ApiVersions handshake has completed yet. A
+    /// SASL listener answers ApiVersions (allowed before authentication)
+    /// and then closes the connection on the first other request.
+    fresh: bool,
+    /// End of the last completed exchange (or of the handshake).
+    last_used: Instant,
+}
+
+/// Explain a response that is really a TLS record (a plaintext request to
+/// a TLS listener is answered with a TLS alert, `15 03 0x ...`).
+fn tls_hint(prefix: [u8; 4]) -> Option<String> {
+    (matches!(prefix[0], 0x15 | 0x16) && prefix[1] == 0x03).then(|| {
+        format!(
+            "the broker answered with a TLS record ({:02x} {:02x} {:02x} ...): this listener \
+             requires TLS, and this client speaks PLAINTEXT only (use a PLAINTEXT listener \
+             or a local TLS proxy)",
+            prefix[0], prefix[1], prefix[2]
+        )
+    })
+}
+
+/// A connection closed by the broker right after a successful ApiVersions
+/// handshake: name the likely cause.
+fn sasl_hint(e: io::Error) -> io::Error {
+    if matches!(
+        e.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+    ) {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "{e} on the first request after ApiVersions: if this listener requires \
+                 SASL, note that this client has no SASL/TLS (use a PLAINTEXT listener)"
+            ),
+        )
+    } else {
+        e
+    }
 }
 
 /// Write all of `buf` before `deadline` (the write timeout is re-armed with
@@ -347,15 +406,24 @@ impl Conn {
             )));
         }
         let deadline = Instant::now() + cfg.request_timeout;
-        write_all_deadline(&mut self.stream, &frame, deadline)?;
+        let hint = self.fresh && api != proto::API_VERSIONS;
+        let io = |e: io::Error| NetError::Io(if hint { sasl_hint(e) } else { e });
+        write_all_deadline(&mut self.stream, &frame, deadline).map_err(io)?;
         let mut len = [0u8; 4];
-        read_exact_deadline(&mut self.stream, &mut len, deadline)?;
+        read_exact_deadline(&mut self.stream, &mut len, deadline).map_err(io)?;
         let n = i32::from_be_bytes(len);
         if n < 4 || n as usize > cfg.max_response_bytes {
+            if let Some(m) = tls_hint(len) {
+                return Err(NetError::Protocol(m));
+            }
             return Err(NetError::Protocol(format!("response frame size {n}")));
         }
         let mut buf = vec![0u8; n as usize];
-        read_exact_deadline(&mut self.stream, &mut buf, deadline)?;
+        read_exact_deadline(&mut self.stream, &mut buf, deadline).map_err(io)?;
+        if api != proto::API_VERSIONS {
+            self.fresh = false;
+        }
+        self.last_used = Instant::now();
         let got = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
         if got != id {
             return Err(NetError::Protocol(format!(
@@ -392,6 +460,8 @@ impl Conn {
             stream,
             produce_v: 0,
             metadata_v: 0,
+            fresh: true,
+            last_used: Instant::now(),
         };
         let body = c.exchange(cfg, corr, proto::API_VERSIONS, 0, &[])?;
         let av = proto::decode_api_versions(&body)?;
@@ -488,8 +558,22 @@ impl Producer {
         }
     }
 
+    /// Drop connections idle for `connections_max_idle` or longer.
+    fn close_idle(&mut self) {
+        let max = self.cfg.connections_max_idle;
+        self.conns.retain(|_, c| c.last_used.elapsed() < max);
+        if self
+            .bootstrap_conn
+            .as_ref()
+            .is_some_and(|c| c.last_used.elapsed() >= max)
+        {
+            self.bootstrap_conn = None;
+        }
+    }
+
     /// Fetch metadata for `topic` from any reachable broker.
     fn refresh(&mut self, topic: &str) -> Result<(), Retry> {
+        self.close_idle();
         self.stats.metadata_refreshes += 1;
         let mut last = String::from("no broker reachable");
         // Known leaders first, then the bootstrap list.
@@ -687,6 +771,7 @@ impl Producer {
     const PART_OVERHEAD: usize = 4 + 4 + BATCH_OVERHEAD;
 
     fn conn_for(&mut self, node: i32) -> Result<&mut Conn, NetError> {
+        self.close_idle();
         if !self.conns.contains_key(&node) {
             let addr = self
                 .brokers
@@ -737,7 +822,9 @@ impl Producer {
                 queues.entry(*p).or_default().push_back(i);
             }
         }
-        let mut single: BTreeSet<i32> = BTreeSet::new();
+        // Per-partition cap on records per batch, set by record-level errors
+        // (see `produce_round`).
+        let mut limits: BTreeMap<i32, usize> = BTreeMap::new();
         let mut attempt: u32 = 0;
         while !queues.is_empty() {
             let mut trouble: Option<String> = None;
@@ -781,7 +868,7 @@ impl Producer {
                         &parts,
                         records,
                         &mut queues,
-                        &mut single,
+                        &mut limits,
                         &mut out,
                     )?;
                     progress |= pr.progress;
@@ -827,7 +914,7 @@ impl Producer {
         parts: &[i32],
         records: &[(i32, ProduceRecord)],
         queues: &mut BTreeMap<i32, VecDeque<usize>>,
-        single: &mut BTreeSet<i32>,
+        limits: &mut BTreeMap<i32, usize>,
         out: &mut [Option<Outcome>],
     ) -> Result<RoundResult, ProduceError> {
         let mut res = RoundResult::default();
@@ -843,7 +930,7 @@ impl Producer {
             }
             let mut room = budget - Self::PART_OVERHEAD;
             let mut take = Vec::new();
-            let limit = if single.contains(&p) { 1 } else { usize::MAX };
+            let limit = limits.get(&p).copied().unwrap_or(usize::MAX);
             for &i in queues.get(&p).into_iter().flatten() {
                 let need = records[i].1.size_bound();
                 if need > room || take.len() >= limit {
@@ -929,7 +1016,12 @@ impl Producer {
                     res.progress = true;
                 }
                 ErrorClass::Record if idx.len() > 1 => {
-                    single.insert(p);
+                    // Halve the batch: a record that is too large (or
+                    // invalid) is isolated in log2(n) requests, and a batch
+                    // that is only too large as a whole (the topic's
+                    // `max.message.bytes` below `max_request_bytes`) settles
+                    // on a size that fits instead of one record per request.
+                    limits.insert(p, idx.len() / 2);
                     res.progress = true;
                 }
                 ErrorClass::Record => {
@@ -938,7 +1030,7 @@ impl Producer {
                     if q.is_empty() {
                         queues.remove(&p);
                     }
-                    single.remove(&p);
+                    limits.remove(&p);
                     out[idx[0]] = Some(Outcome::Rejected {
                         code: pr.error_code,
                         reason: format!(

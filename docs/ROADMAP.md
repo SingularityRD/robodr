@@ -169,7 +169,9 @@ everything running with no outbound connectivity.
 - Bridge threats to AutoSecOps over the existing Kafka/adapter path (robot
   source-trust map + `robotics` category, per the main design doc).
   **[P]** for the OCSF mapping and topic contract (`robodr-ocsf`,
-  `docs/contracts/`); no Kafka client, AutoSecOps side not done.
+  `docs/contracts/`) and the std-only publisher `robodr-kafka-publish`
+  (verified against single-node Apache Kafka 3.9.1 and 4.1.0,
+  `scripts/kafka-it.sh`); AutoSecOps side not done.
 
 **Exit criteria.** On a real UGV companion computer: a foreign `cmd_vel`
 publisher is flagged Critical *from live traffic* (SEDP parser done; needs the

@@ -609,9 +609,10 @@ The two hops around the diode are implemented in `crates/robodr-export`
   offsets) replaced atomically after each acknowledged chunk, plus a done
   marker per batch; invalid or broker-rejected records go to a dead-letter
   file, deduplicated on (batch, line) across crashes.
-* **Producer settings actually used** (std-only client, not yet tested
-  against a real broker): `acks=all`, **idempotence off**, one request in
-  flight, no compression, **no TLS/SASL** (isolated network or local TLS
+* **Producer settings actually used** (std-only client; verified against
+  single-node Apache Kafka 3.9.1 and 4.1.0 with `scripts/kafka-it.sh`,
+  including the §4 partition against the Java client's partitioner):
+  `acks=all`, **idempotence off**, one request in flight, no compression, **no TLS/SASL** (isolated network or local TLS
   proxy); a per-request deadline covering writes and reads that exceeds the
   broker-side produce timeout; host names resolved with a timeout (IP
   literals recommended). This deviates from §4's `enable.idempotence=true`: delivery is

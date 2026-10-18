@@ -129,6 +129,12 @@ pub struct State {
     pub seen: Vec<(i32, i16, i16)>,
     /// Records with a value longer than this get MESSAGE_TOO_LARGE.
     pub max_value_bytes: usize,
+    /// A partition's `records` (all its batches) longer than this get
+    /// MESSAGE_TOO_LARGE, like a topic's `max.message.bytes`.
+    pub max_batch_bytes: usize,
+    /// Close a connection with no request for this long (the broker's
+    /// `connections.max.idle.ms`); read when a connection is accepted.
+    pub idle_close: Option<Duration>,
     pub produce_max_version: i16,
     pub acks_seen: Vec<i16>,
     pub batches_seen: u64,
@@ -145,6 +151,7 @@ impl Cluster {
         let state = Arc::new(Mutex::new(State {
             leaders: vec![1; partitions],
             max_value_bytes: usize::MAX,
+            max_batch_bytes: usize::MAX,
             produce_max_version: 8,
             ..Default::default()
         }));
@@ -221,6 +228,10 @@ fn write_response(s: &mut TcpStream, corr: i32, body: &[u8]) -> std::io::Result<
 }
 
 fn serve(node: i32, mut s: TcpStream, st: Arc<Mutex<State>>) {
+    let idle = st.lock().unwrap().idle_close;
+    if idle.is_some() {
+        let _ = s.set_read_timeout(idle);
+    }
     while let Some(frame) = read_frame(&mut s) {
         let Ok((h, mut r)) = proto::parse_request_header(&frame) else {
             return;
@@ -327,6 +338,9 @@ fn serve(node: i32, mut s: TcpStream, st: Arc<Mutex<State>>) {
                             .flat_map(|b| &b.records)
                             .any(|r| r.value.as_ref().map_or(0, Vec::len) > st.max_value_bytes);
                         if code == 0 && too_big {
+                            code = 10;
+                        }
+                        if code == 0 && bytes.len() > st.max_batch_bytes {
                             code = 10;
                         }
                         let mut base = -1;

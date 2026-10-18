@@ -974,7 +974,8 @@ mode comes with the bundle exporter.
 
 ### 8.3 Findings batches
 
-**available (not yet run against a real Kafka broker).** Two binaries carry
+**available** (`robodr-kafka-publish` verified against single-node Apache
+Kafka 3.9.1 and 4.1.0 brokers, see below). Two binaries carry
 agentd's findings to the SOC (contract section 8.1):
 
 ```sh
@@ -1008,6 +1009,35 @@ broker-rejected records go to a dead-letter file. **No TLS / SASL** and
 proxy. Without `--once` it loops every `--interval-ms` (default 2000).
 Neither binary ships a systemd unit; run them from the site's transfer
 procedure or a timer.
+
+Before the first deployment, and after a Kafka upgrade, run the real-broker
+test against the SOC's Kafka version (needs docker and the source tree):
+
+```sh
+scripts/kafka-it.sh                                   # apache/kafka:3.9.1
+KAFKA_IT_IMAGE=apache/kafka:4.1.0 scripts/kafka-it.sh  # any apache/kafka tag
+```
+
+It starts a single-node broker, publishes signed findings with
+`robodr-kafka-publish` and the library (spool and diode paths, crash and
+resume, broker restart, oversized record, unknown topic, ACL denial, quota,
+idle connections, SASL/TLS listeners), reads everything back, checks that
+each record arrived exactly once with key, headers and partition as in the
+contract, re-checks every stored CRC with `kafka-dump-log` and removes the
+container. Verified on 2026-10-17 with 3.9.1 and 4.1.0; what it does not
+cover (multi-broker clusters, replication) is listed in
+`crates/robodr-export/README.md`. To check a SOC cluster by hand, consume a
+few records with `kafka-console-consumer.sh --property print.headers=true
+--property print.key=true --property print.partition=true`: the headers
+must be in contract order with `robodr-finding-sig` last (connected sites
+that sign), and a robot's findings must all be in one partition.
+
+Troubleshooting the publisher: an error naming a **TLS record** or **SASL**
+means the bootstrap address (or an advertised listener) is a TLS or SASL
+listener; this client speaks PLAINTEXT only (use a PLAINTEXT listener or a
+local TLS proxy). `UNKNOWN_TOPIC_OR_PARTITION`: the topic does not exist
+(it is never auto-created). `TOPIC_AUTHORIZATION_FAILED`: grant WRITE and
+DESCRIBE on `robot-edr.findings` to the publisher's principal.
 
 ### 8.4 Journal
 

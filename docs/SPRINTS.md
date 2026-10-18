@@ -204,8 +204,11 @@ Objective: host-level robot threats and graph deviations both reach the SOC.
 - `rules/robodr/*.toml` (7 files) pass `scripts/validate_rules.py`; never
   loaded by a real Pulsar daemon.
 - Findings: OCSF envelope, record key and partitioning (`robodr-ocsf`) and
-  evidence links (`robodr-agent`) are **pure logic done**; there is no Kafka
-  client / publisher. AutoSecOps-side changes are not in this repo.
+  evidence links (`robodr-agent`) are **pure logic done**; the std-only
+  publisher `robodr-kafka-publish` delivers them to `robot-edr.findings` and
+  was verified against single-node Apache Kafka 3.9.1 and 4.1.0 brokers
+  (`scripts/kafka-it.sh`, 2026-10-17); not run against the SOC's cluster.
+  AutoSecOps-side changes are not in this repo.
 - 72-hour soak: not done.
 
 ### Sprint 5 — Phase 1 hardening + red-team gate

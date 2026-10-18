@@ -113,7 +113,8 @@ crates/
                           (SOC side: importer output or a connected spool ->
                           Kafka; std-only client, acks=all, idempotence off, no
                           TLS/SASL). Tested against an in-process fake broker
-                          only, never a real Kafka cluster.
+                          in CI and against single-node Apache Kafka 3.9.1 and
+                          4.1.0 brokers (scripts/kafka-it.sh, docker).
   robodr-sensor-ros2/     Thin Pulsar module wrapping robodr-ros2-pipeline.
                           Pulsar-dependent; not built or tested offline.
   robodr-pulsard/         Pulsar daemon with the RoboDR module registered.

@@ -12,6 +12,20 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Added
 
+- `robodr-kafka-publish` / the std-only Kafka producer run against real
+  Apache Kafka brokers for the first time: `scripts/kafka-it.sh` starts a
+  single-node KRaft broker in docker (`apache/kafka:3.9.1` by default,
+  `KAFKA_IT_IMAGE=apache/kafka:4.1.0` also verified) and runs the new
+  `#[ignore]`d `tests/kafka_real_broker.rs` (gated on
+  `ROBODR_KAFKA_BROKER`). Verified against both versions: signed findings
+  from a spool and through the diode path delivered exactly once with key,
+  value bytes, headers (signature last, verifying) and contract §4
+  partition intact; CRCs re-checked by `kafka-dump-log`; spool `acked/` and
+  `progress.json` correct; crash between acknowledgement and commit re-sends
+  exactly one chunk; a broker restart mid-stream loses nothing; unknown
+  topic, ACL denial, oversized record, quota throttling, idle-connection
+  close and SASL / TLS listeners handled; partitioner identical to the Java
+  client's for 205 robot ids. Single-node only (see the crate README).
 - Wave 6 (integrated on `integrate-w6`):
   - `robodr-agentd` live safety-state feed (`safety_feed`): ROS 2 topics
     decoded passively from captured user DATA (`std_msgs` Bool / UInt8 /
@@ -43,7 +57,8 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   - `robodr-export`: `robodr-spool-export` (agentd spool -> signed diode
     batches, crash-safe intent journal) and `robodr-kafka-publish` (importer
     output or a connected spool -> Kafka; std-only client, `acks=all`,
-    idempotence off, no TLS/SASL; tested against a fake broker only). Both
+    idempotence off, no TLS/SASL; verified against Apache Kafka 3.9.1 and
+    4.1.0, see the first entry). Both
     shipped in the `.deb` and required by the release workflow; man pages
     `robodr-spool-export(1)`, `robodr-kafka-publish(1)`.
   - Black box: damaged closed segments are quarantined instead of bricking
@@ -236,6 +251,16 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Fixed
 
+- `robodr-export` Kafka producer (found against a real broker): a batch
+  refused with `MESSAGE_TOO_LARGE` only because of its total size (topic
+  `max.message.bytes` below `max_request_bytes`) degraded the partition to
+  one record per request for the rest of the call; it is now halved until it
+  fits. A TLS listener's alert was reported as an absurd frame size and a
+  SASL listener's close as a bare disconnect; both errors now name the
+  cause. Connections closed by the broker's `connections.max.idle.ms` cost
+  an I/O error, a metadata refresh and a backoff on the first send after
+  each quiet period; connections idle for `connections_max_idle` (9 min) are
+  now closed before use.
 - `robodr-agentd` e2e test `hostile_datagrams_and_event_lines_never_stop_the_daemon`
   could stop the daemon before housekeeping raised `robot.agent.input_malformed`;
   it now waits until both expected findings are in the spool.

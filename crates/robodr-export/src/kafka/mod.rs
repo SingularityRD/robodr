@@ -8,10 +8,11 @@
 //! * [`client`]: [`Producer`]: connections, version negotiation, metadata,
 //!   leader routing, retries with backoff, timeouts and size bounds.
 //!
-//! **Not tested against a real Kafka broker** (none is reachable from the
-//! build environment): it is tested against the in-process fake broker in
-//! `tests/`, which implements these three APIs from the protocol
-//! documentation. See the crate README for the full list of limits.
+//! CI tests it against the in-process fake broker in `tests/`, which
+//! implements these three APIs from the protocol documentation;
+//! `tests/kafka_real_broker.rs` (`#[ignore]`d, run by `scripts/kafka-it.sh`)
+//! runs it against a real single-node Apache Kafka broker (verified with
+//! 3.9.1 and 4.1.0). See the crate README for the full list of limits.
 
 pub mod batch;
 pub mod client;

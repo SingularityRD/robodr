@@ -60,7 +60,9 @@ consumers drop duplicates on
 one request in flight, no compression.
 .B No TLS or SASL:
 run it on an isolated SOC network or through a local TLS proxy.
-Not yet tested against a real Kafka broker.
+Verified against single\-node Apache Kafka 3.9.1 and 4.1.0 brokers
+(\fBscripts/kafka\-it.sh\fR in the source tree). Pointed at a TLS or SASL
+listener it fails with an error that says so.
 .PP
 Without
 .B \-\-once
@@ -91,7 +93,8 @@ Kafka client id (default
 .BR robodr\-kafka\-publish ).
 .TP
 .BI \-\-request\-timeout\-ms " N\fR, " \-\-delivery\-timeout\-ms " N"
-Per\-request deadline (default 30000) and total delivery deadline per chunk
+Per\-request deadline (default 35000; it must exceed the broker\-side produce
+timeout, 30000) and total delivery deadline per chunk
 (default 120000).
 .TP
 .BI \-\-retries " N"

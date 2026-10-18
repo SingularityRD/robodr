@@ -5,6 +5,7 @@
 mod common;
 
 use common::*;
+use robodr_export::kafka::proto;
 use robodr_export::kafka::{Outcome, ProduceError, ProduceRecord, Producer, ProducerConfig};
 use std::time::Duration;
 
@@ -276,4 +277,153 @@ fn partition_beyond_topic_is_retried_then_fails() {
     let mut p = Producer::new(cf).unwrap();
     let e = p.send(TOPIC, &[(5, rec(0, 1))]).unwrap_err();
     assert!(matches!(e, ProduceError::RetriesExhausted(_)), "{e}");
+}
+
+/// Regression (found against Kafka 3.9.1): a batch that is only too large
+/// as a whole (topic `max.message.bytes` below `max_request_bytes`, every
+/// record fine on its own) used to switch the partition to one record per
+/// request for the rest of the call. The batch is now halved until it fits.
+#[test]
+fn batch_too_large_as_a_whole_is_halved() {
+    let c = Cluster::start(1, 1);
+    // About 8 records of ~1 KB per batch.
+    c.state.lock().unwrap().max_batch_bytes = 8 * 1100;
+    let mut p = Producer::new(cfg(&c)).unwrap();
+    let input: Vec<_> = (0..200).map(|i| (0, rec(i, 1000))).collect();
+    let out = p.send(TOPIC, &input).unwrap();
+    assert_eq!(delivered(&out), 200);
+    assert_eq!(order(&c, 0), (0..200).collect::<Vec<_>>());
+    let n = c.state.lock().unwrap().produce_requests;
+    // 200 -> 100 -> 50 -> 25 -> 12 -> 6 refused/accepted, then 6 a time.
+    assert!(n < 60, "{n} produce requests for 200 records");
+
+    // Mixed: one record too large on its own among records that are too
+    // large together. It is still isolated, everything else delivered in
+    // order.
+    let c = Cluster::start(1, 1);
+    {
+        let mut st = c.state.lock().unwrap();
+        st.max_batch_bytes = 8 * 1100;
+        st.max_value_bytes = 2000;
+    }
+    let mut p = Producer::new(cfg(&c)).unwrap();
+    let mut input: Vec<_> = (0..60).map(|i| (0, rec(i, 1000))).collect();
+    input[37].1 = rec(37, 5000);
+    let out = p.send(TOPIC, &input).unwrap();
+    assert!(matches!(out[37], Outcome::Rejected { code: 10, .. }));
+    assert_eq!(delivered(&out), 59);
+    let want: Vec<usize> = (0..60).filter(|i| *i != 37).collect();
+    assert_eq!(order(&c, 0), want);
+}
+
+fn one_shot_server(f: impl Fn(std::net::TcpStream) + Send + 'static) -> String {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        for s in l.incoming().flatten() {
+            f(s);
+        }
+    });
+    addr
+}
+
+fn read_request(s: &mut std::net::TcpStream) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut len = [0u8; 4];
+    s.read_exact(&mut len).ok()?;
+    let mut b = vec![0u8; i32::from_be_bytes(len) as usize];
+    s.read_exact(&mut b).ok()?;
+    Some(b)
+}
+
+/// Regression (found against Kafka 3.9.1): a plaintext request to a TLS
+/// listener is answered with a TLS alert (`15 03 03 00 02 02 50`), which
+/// was reported as "response frame size 352518912". The error now says
+/// that the listener wants TLS.
+#[test]
+fn tls_listener_is_named_in_the_error() {
+    let addr = one_shot_server(|mut s| {
+        use std::io::Write;
+        let _ = read_request(&mut s);
+        let _ = s.write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x50]);
+    });
+    let mut cf = ProducerConfig::new(vec![addr]);
+    cf.retries = 1;
+    cf.retry_backoff = Duration::from_millis(1);
+    let mut p = Producer::new(cf).unwrap();
+    let e = p.partition_count(TOPIC).unwrap_err().to_string();
+    assert!(e.contains("TLS") && e.contains("PLAINTEXT only"), "{e}");
+}
+
+/// Regression (found against Kafka 3.9.1): a SASL_PLAINTEXT listener
+/// answers ApiVersions, then closes the connection on Metadata; the error
+/// was a bare "broker closed the connection". It now names SASL.
+#[test]
+fn sasl_listener_is_named_in_the_error() {
+    let addr = one_shot_server(|mut s| {
+        use std::io::Write;
+        let Some(f) = read_request(&mut s) else {
+            return;
+        };
+        let (h, _) = proto::parse_request_header(&f).unwrap();
+        assert_eq!(h.api_key, proto::API_VERSIONS);
+        let body = proto::encode_api_versions_response(&proto::ApiVersionsResponse {
+            error_code: 0,
+            apis: vec![
+                proto::ApiRange {
+                    api_key: 0,
+                    min: 0,
+                    max: 11,
+                },
+                proto::ApiRange {
+                    api_key: 3,
+                    min: 0,
+                    max: 12,
+                },
+            ],
+        });
+        let mut out = ((body.len() + 4) as i32).to_be_bytes().to_vec();
+        out.extend_from_slice(&h.correlation_id.to_be_bytes());
+        out.extend_from_slice(&body);
+        let _ = s.write_all(&out);
+        // Next request (Metadata): closed without an answer.
+        let _ = read_request(&mut s);
+    });
+    let mut cf = ProducerConfig::new(vec![addr]);
+    cf.retries = 1;
+    cf.retry_backoff = Duration::from_millis(1);
+    let mut p = Producer::new(cf).unwrap();
+    let e = p.partition_count(TOPIC).unwrap_err().to_string();
+    assert!(e.contains("SASL"), "{e}");
+}
+
+/// Regression (found against Kafka 3.9.1 with `connections.max.idle.ms`):
+/// the broker closes idle connections; the producer used to discover that
+/// only by a failed request (an I/O error, a metadata refresh and a retry
+/// after backoff on every send after a quiet period, which is the normal
+/// case for findings). Connections idle for `connections_max_idle` are now
+/// closed before use.
+#[test]
+fn idle_connections_are_closed_before_the_broker_does() {
+    let c = Cluster::start(1, 1);
+    c.state.lock().unwrap().idle_close = Some(Duration::from_millis(150));
+    // Client idle limit above the broker's: the stale connection fails
+    // once, the record is still delivered exactly once.
+    let mut p = Producer::new(cfg(&c)).unwrap();
+    assert_eq!(delivered(&p.send(TOPIC, &recs(1, 1)).unwrap()), 1);
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(delivered(&p.send(TOPIC, &recs(1, 1)).unwrap()), 1);
+    assert!(p.stats().io_errors >= 1, "{:?}", p.stats());
+    assert_eq!(c.total(), 2);
+    // Below the broker's: reconnects up front, no error, no retry.
+    let mut cf = cfg(&c);
+    cf.connections_max_idle = Duration::from_millis(50);
+    let mut p = Producer::new(cf).unwrap();
+    assert_eq!(delivered(&p.send(TOPIC, &recs(1, 1)).unwrap()), 1);
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(delivered(&p.send(TOPIC, &recs(1, 1)).unwrap()), 1);
+    let st = p.stats();
+    assert_eq!((st.io_errors, st.retries), (0, 0), "{st:?}");
+    assert!(st.connects >= 3, "{st:?}");
+    assert_eq!(c.total(), 4);
 }
