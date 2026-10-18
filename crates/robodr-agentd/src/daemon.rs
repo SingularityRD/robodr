@@ -135,8 +135,10 @@
 //! file says `"blackbox": {"anchored": false, ...}`: `head.json` alone
 //! cannot reveal a cut of the newest records combined with a rollback of
 //! `head.json`, or a wiped store. The `file` anchor is only as strong as
-//! the storage it lives on; a deployment needs a TPM NV counter or a
-//! remote receiver behind `robodr_blackbox::HeadAnchor`.
+//! the storage it lives on; a deployment needs the `tpm_nv_counter` anchor
+//! (`robodr_blackbox::TpmNvCounterAnchor`: TPM 2.0 NV counter plus a
+//! sidecar signed with the black-box key) or a remote receiver behind
+//! `robodr_blackbox::HeadAnchor` (not implemented).
 //!
 //! # Finding signatures
 //!
@@ -569,6 +571,20 @@ impl<'a> Daemon<'a> {
             Some(crate::config::HeadAnchorConfig::File { path }) => {
                 let a = robodr_blackbox::FileHeadAnchor::new(path)
                     .map_err(|e| DaemonError::Config(format!("blackbox.head_anchor: {e}")))?;
+                bcfg.head_anchor = Some(Arc::new(a));
+            }
+            Some(a @ crate::config::HeadAnchorConfig::TpmNvCounter { .. }) => {
+                let bad = |e: String| DaemonError::Config(format!("blackbox.head_anchor: {e}"));
+                let tc = a
+                    .tpm_config()
+                    .unwrap_or_else(|| Err("not a TPM anchor".into()))
+                    .map_err(bad)?;
+                // The sidecar is signed with the black-box key.
+                let signer =
+                    crate::config::signer_for(&r.key_algorithm, &r.key, r.key_id.as_deref())
+                        .map_err(bad)?;
+                let a = robodr_blackbox::TpmNvCounterAnchor::new(&tc, signer)
+                    .map_err(|e| bad(e.to_string()))?;
                 bcfg.head_anchor = Some(Arc::new(a));
             }
             // Never claim anchoring without one (status: anchored false).

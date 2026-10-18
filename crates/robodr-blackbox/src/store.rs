@@ -180,15 +180,21 @@
 //! An optional [`HeadAnchor`] ([`RecorderConfig::head_anchor`]) receives
 //! every mark too, e.g. a TPM NV monotonic counter or a remote receiver, and
 //! is consulted at open the same way. **A deployment that must detect an
-//! attacker with write access to the unit needs one** (TPM NV counter or
-//! remote receiver); none ships in this crate. [`FileHeadAnchor`] is a
-//! simple file-backed implementation, only as strong as the storage its
-//! file lives on (useless on the log's own filesystem). It survives an attacker who rewrites
-//! or deletes the whole directory, which `head.json` does not: a store with
-//! no segments while the anchor holds a mark starts a new chain that
-//! declares the gap (`Resume` + `TruncationDetected`), so a wiped store is
-//! reported, not silently restarted. Anchor failures never stop recording;
-//! they are counted ([`Recorder::anchor_failures`]).
+//! attacker with write access to the unit needs one.**
+//! [`crate::tpm_anchor::TpmNvCounterAnchor`] is the one this crate ships
+//! for that: a TPM 2.0 NV counter that counts marks plus a sidecar file
+//! signed with the recorder's key; a restored older sidecar is exposed by
+//! the counter and yields a lower bound of the head (see
+//! [`crate::tpm_anchor`] for the argument and its limits). A remote
+//! receiver anchor is not implemented. [`FileHeadAnchor`] is a simple
+//! file-backed implementation, only as strong as the storage its file lives
+//! on (useless on the log's own filesystem). An anchor survives an attacker
+//! who rewrites or deletes the whole directory, which `head.json` does not:
+//! a store with no segments while the anchor holds a mark starts a new
+//! chain that declares the gap (`Resume` + `TruncationDetected`), so a wiped
+//! store is reported, not silently restarted. Anchor failures never stop
+//! recording; they are counted ([`Recorder::anchor_failures`]) and named in
+//! the `Resume` record.
 //!
 //! Remaining window: records written after the newest mark and destroyed
 //! with the tail (by an attacker with write access, or by losing unsynced
@@ -347,9 +353,10 @@ impl HeadAnchor for MemoryHeadAnchor {
 /// the log's attacker cannot write (a separately mounted, write-restricted
 /// partition, a network share replicated off the unit, a removable medium
 /// collected after a mission). A deployment that must survive an attacker
-/// with write access to the unit needs a TPM NV monotonic counter or a
-/// remote receiver behind [`HeadAnchor`]; this type is the simple building
-/// block, not that guarantee.
+/// with write access to the unit needs
+/// [`crate::tpm_anchor::TpmNvCounterAnchor`] (or a remote receiver behind
+/// [`HeadAnchor`]); this type is the simple building block, not that
+/// guarantee.
 ///
 /// The file is trusted input (unsigned): a writer to it can make the next
 /// open report a false truncation (never hide one that `head.json` shows).
@@ -963,7 +970,7 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
 /// Write `data` to `dir/name` atomically: exclusive create of a random temp
 /// file (mode 0600, `O_NOFOLLOW`), fsync, rename, fsync the directory. A
 /// planted symlink at any predictable path is never followed.
-fn atomic_write(dir: &Path, name: &str, data: &[u8]) -> io::Result<()> {
+pub(crate) fn atomic_write(dir: &Path, name: &str, data: &[u8]) -> io::Result<()> {
     let tmp = dir.join(tmp_name(name));
     let res = (|| {
         let mut f = create_new_private(&tmp, false)?;
@@ -3844,7 +3851,7 @@ impl Recorder {
 }
 
 /// Read a small state file; `None` if absent. Symlinks are not followed.
-fn read_state(dir: &Path, name: &str) -> Result<Option<String>, Error> {
+pub(crate) fn read_state(dir: &Path, name: &str) -> Result<Option<String>, Error> {
     use std::io::Read;
     let mut o = OpenOptions::new();
     o.read(true);

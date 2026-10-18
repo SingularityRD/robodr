@@ -25,6 +25,8 @@
 //! - [`store`]: the [`Recorder`]: crash recovery, quarantine of damaged
 //!   closed segments, the `head.json` high-water mark and optional external
 //!   [`HeadAnchor`].
+//! - [`tpm_anchor`]: [`TpmNvCounterAnchor`], a [`HeadAnchor`] on a TPM 2.0 NV
+//!   monotonic counter (through `tpm2-tools`) plus a signed sidecar file.
 //! - [`verify`]: [`verify::verify_segments`] / [`verify::verify_dir`].
 //! - [`export`]: [`export::Bundle`], [`export::Receiver`], checkpoints.
 //!
@@ -65,6 +67,7 @@ pub mod sign;
 pub mod sign_ed25519;
 pub mod store;
 pub mod time;
+pub mod tpm_anchor;
 pub mod verify;
 
 pub use export::{Ack, Anchor, Bundle, Checkpoint, Receiver, SignedCursor};
@@ -77,6 +80,7 @@ pub use store::{
     MemoryHeadAnchor, OpenIncident, Recorder, RecorderConfig, Refusal, RetentionMode,
 };
 pub use time::{Clock, SteppingClock, SystemClock, TimeSource, Timestamp};
+pub use tpm_anchor::{TpmAnchorConfig, TpmNvCounterAnchor};
 pub use verify::{
     Finding, FindingKind, FindingLevel, Location, Report, SegmentData, VerifyOptions,
 };

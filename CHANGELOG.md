@@ -12,6 +12,19 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Added
 
+- TPM 2.0 NV counter head anchor for the black box
+  (`robodr_blackbox::tpm_anchor::TpmNvCounterAnchor`): the counter counts
+  head marks (one increment per mark, at most one per
+  `min_increment_interval`, default 60 s), a sidecar signed with the
+  recorder's key binds the count to the mark; an older restored sidecar
+  yields a lower bound of the head, so a cut log tail with rolled-back
+  state is reported as `TruncationDetected`. Driven through `tpm2-tools`
+  with a configurable TCTI, bounded tool runs and strict parsing; indexes
+  that are not counters are refused. New `robodr-blackbox tpm-anchor-init`
+  / `tpm-anchor-check`; `robodr-agentd` `blackbox.head_anchor` kind
+  `tpm_nv_counter`. Tested with a fake TPM and against swtpm
+  (`scripts/swtpm-anchor-it.sh`, `ROBODR_SWTPM=1`); not yet on a hardware
+  TPM.
 - Real ROS 2 Jazzy captures (Fast DDS 2.14, Cyclone DDS 0.10) under
   `fixtures/captures/ros2-jazzy/` with the container lab that produced them
   (`tools/lab-capture/`) and end-to-end tests

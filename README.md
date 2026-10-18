@@ -186,9 +186,12 @@ module, no robot):
   runs recording-only, and nothing executes a response.
   The Pulsar module (`robodr-sensor-ros2`) runs the same decode for its
   envelope check but does not forward decoded samples (see its crate docs).
-- The black box's only head anchor is a file (`FileHeadAnchor`), as strong
-  as the storage it sits on; a TPM or remote anchor is still needed before
-  deployment. A contested GUID prefix fails closed (an attacker who can send
+- The black box's TPM 2.0 NV counter head anchor (`TpmNvCounterAnchor`,
+  `blackbox.head_anchor` kind `tpm_nv_counter`) is tested against swtpm
+  only, not a hardware TPM; it makes rollback and truncation detectable,
+  not impossible (root can still use the counter; owner/lockout
+  authorization must be kept off the unit). A remote receiver anchor is not
+  implemented. A contested GUID prefix fails closed (an attacker who can send
   one SPDP can make a profiled participant untrusted until it is pinned in
   `participant_ips`).
 - Evidence (black box, diode bundles) and profiles are signed with Ed25519
