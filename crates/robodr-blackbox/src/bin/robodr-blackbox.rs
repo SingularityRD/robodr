@@ -11,6 +11,7 @@
 //!                            [--owner-auth-file FILE] [--index-auth-file FILE]
 //! robodr-blackbox tpm-anchor-check --index 0x01XXXXXX [--tcti TCTI] [--tools-dir DIR]
 //!                            [--index-auth-file FILE]
+//! robodr-blackbox anchor-mark DIR --key FILE --unit ID [--out FILE]
 //! ```
 //!
 //! - `keygen` writes a new key. Default `--alg ed25519`: the secret seed
@@ -45,6 +46,12 @@
 //!   read from files (`file:` for tpm2-tools), never from argv.
 //! - `tpm-anchor-check` reads the index's public area and value and exits
 //!   1 if it is not a counter.
+//! - `anchor-mark` (one-way remote anchor, see
+//!   `robodr_blackbox::remote_anchor`): reads `DIR/head.json`, checks it
+//!   is signed by `--key` (the recorder's secret key file), and writes the
+//!   signed mark of unit `--unit` (the `advance` request line) to `--out`
+//!   (created new, never overwritten) or stdout, for
+//!   `robodr-anchor-receiver ingest` on the far side of a diode.
 //!
 //! Exit codes: 0 = verified intact (warnings allowed unless `--strict`),
 //! 1 = verification failed, 2 = usage, I/O or key error.
@@ -54,8 +61,9 @@
 
 use robodr_blackbox::crypto::to_hex;
 use robodr_blackbox::keys::{public_key_path, KeyFile, Keyring};
-use robodr_blackbox::record::{scan_frames, ScanItem};
-use robodr_blackbox::store::CHECKPOINT_FILE;
+use robodr_blackbox::record::{scan_frames, signing_message, ScanItem};
+use robodr_blackbox::remote_anchor::RemoteMark;
+use robodr_blackbox::store::{CHECKPOINT_FILE, HEAD_FILE};
 use robodr_blackbox::tpm_anchor::{self, parse_nv_index, NvCounter, Tpm2Tools};
 use robodr_blackbox::verify::{read_segments, verify_dir, SegmentData, VerifyOptions};
 use robodr_blackbox::Checkpoint;
@@ -75,6 +83,7 @@ const USAGE: &str = "usage:
                              [--owner-auth-file FILE] [--index-auth-file FILE]
   robodr-blackbox tpm-anchor-check --index 0x01XXXXXX [--tcti TCTI] [--tools-dir DIR]
                              [--index-auth-file FILE]
+  robodr-blackbox anchor-mark DIR --key FILE --unit ID [--out FILE]
 keygen defaults to ed25519 (secret FILE, 0600; public FILE.pub, safe to share).
 --keyring accepts secret key files (0600, own user or root) and public key
 files (any mode).
@@ -174,6 +183,7 @@ fn main() -> ExitCode {
         Some("inspect") => inspect(&argv[1..]),
         Some("tpm-anchor-init") => tpm_anchor_init(&argv[1..]),
         Some("tpm-anchor-check") => tpm_anchor_check(&argv[1..]),
+        Some("anchor-mark") => anchor_mark(&argv[1..]),
         Some("-h" | "--help" | "help") => {
             println!("{USAGE}");
             Ok(())
@@ -440,6 +450,53 @@ fn tpm_anchor_check(raw: &[String]) -> Result<(), Fail> {
             "value": value,
         })
     );
+    Ok(())
+}
+
+fn anchor_mark(raw: &[String]) -> Result<(), Fail> {
+    let a = Args::parse(raw, &["key", "unit", "out"], &[])?;
+    let dir = Path::new(a.single_positional("DIR")?);
+    let key = a
+        .one("key")?
+        .ok_or_else(|| "--key FILE is required".to_string())?;
+    let unit = a
+        .one("unit")?
+        .ok_or_else(|| "--unit ID is required".to_string())?;
+    let k = KeyFile::load_secret(Path::new(key)).map_err(|e| format!("{key}: {e}"))?;
+    let signer = k.signer().map_err(|e| format!("{key}: {e}"))?;
+    let text = read_bounded(&dir.join(HEAD_FILE), MAX_CHECKPOINT_BYTES)?;
+    let cp = Checkpoint::from_json(&text)
+        .ok_or_else(|| format!("{}: unparseable head mark", dir.join(HEAD_FILE).display()))?;
+    if signer.verify_own(&signing_message(&cp.hash), &cp.sig) != Some(true) {
+        return Err(format!(
+            "{}: not signed by {key} (another unit's directory or key?)",
+            dir.join(HEAD_FILE).display()
+        )
+        .into());
+    }
+    let m = RemoteMark::sign(unit, &cp, &*signer)?;
+    let mut line = m.to_request_line();
+    line.push('\n');
+    match a.one("out")? {
+        None => print!("{line}"),
+        Some(out) => {
+            let mut o = std::fs::OpenOptions::new();
+            o.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                o.mode(0o644);
+            }
+            let mut f = o.open(out).map_err(|e| format!("{out}: {e}"))?;
+            std::io::Write::write_all(&mut f, line.as_bytes())
+                .and_then(|()| f.sync_all())
+                .map_err(|e| format!("{out}: {e}"))?;
+            eprintln!(
+                "robodr-blackbox: mark of unit {unit} seq {} written to {out}",
+                m.seq
+            );
+        }
+    }
     Ok(())
 }
 

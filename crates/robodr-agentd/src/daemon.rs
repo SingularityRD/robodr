@@ -137,8 +137,10 @@
 //! `head.json`, or a wiped store. The `file` anchor is only as strong as
 //! the storage it lives on; a deployment needs the `tpm_nv_counter` anchor
 //! (`robodr_blackbox::TpmNvCounterAnchor`: TPM 2.0 NV counter plus a
-//! sidecar signed with the black-box key) or a remote receiver behind
-//! `robodr_blackbox::HeadAnchor` (not implemented).
+//! sidecar signed with the black-box key) or the `remote` anchor
+//! (`robodr_blackbox::RemoteHeadAnchor`: marks signed with the black-box
+//! key, held by a `robodr-anchor-receiver` off the unit, queried at open
+//! with a nonce, answers signed by the receiver).
 //!
 //! # Finding signatures
 //!
@@ -584,6 +586,20 @@ impl<'a> Daemon<'a> {
                     crate::config::signer_for(&r.key_algorithm, &r.key, r.key_id.as_deref())
                         .map_err(bad)?;
                 let a = robodr_blackbox::TpmNvCounterAnchor::new(&tc, signer)
+                    .map_err(|e| bad(e.to_string()))?;
+                bcfg.head_anchor = Some(Arc::new(a));
+            }
+            Some(a @ crate::config::HeadAnchorConfig::Remote { .. }) => {
+                let bad = |e: String| DaemonError::Config(format!("blackbox.head_anchor: {e}"));
+                let (rc, rkey) = a
+                    .remote_config(&cfg.robot.id)
+                    .unwrap_or_else(|| Err("not a remote anchor".into()))
+                    .map_err(bad)?;
+                // Marks are signed with the black-box key.
+                let signer =
+                    crate::config::signer_for(&r.key_algorithm, &r.key, r.key_id.as_deref())
+                        .map_err(bad)?;
+                let a = robodr_blackbox::RemoteHeadAnchor::new(rc, Box::new(rkey), signer)
                     .map_err(|e| bad(e.to_string()))?;
                 bcfg.head_anchor = Some(Arc::new(a));
             }

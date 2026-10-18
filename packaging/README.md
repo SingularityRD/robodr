@@ -9,6 +9,7 @@ operator installs on a robot. The procedures that use it are in
 | `systemd/robodr-pulsard.service` | `/usr/lib/systemd/system/` | eBPF + ROS 2 sensor daemon |
 | `systemd/robodr-agentd.service` | `/usr/lib/systemd/system/` | decision chain, black box, OCSF spool (only if the binary is built) |
 | `systemd/robodr-agentd.service.d/20-finding-key.conf.example` | `/usr/share/doc/robodr/examples/` | optional drop-in: `LoadCredential=` for the per-finding signing key (OPERATIONS 6.4) |
+| `systemd/robodr-anchor-receiver.service` | `/usr/lib/systemd/system/` | **base station only**: remote head-anchor receiver (only if the binary is built; OPERATIONS 6.4, "Remote anchor"). Not yet checked with `systemd-analyze` |
 | `systemd/robodr-pulsard.service.d/10-cap-sys-admin.conf.example` | `/usr/share/doc/robodr/examples/` | opt-in for kernels < 5.8 |
 | `systemd/robodr-pulsard.service.d/30-host-threats.conf.example` | `/usr/share/doc/robodr/examples/` | optional drop-in: `SupplementaryGroups=robodr` so `robodr-threat-forward` can reach agentd's `0660` host-threat socket (OPERATIONS 6.4) |
 | `tmpfiles.d/robodr.conf` | `/usr/lib/tmpfiles.d/` | directories, modes, owners |
@@ -33,6 +34,7 @@ The units, tmpfiles and sysusers fragments were checked with
 | `robodr-agentd` | systemd service, user `robodr`, `CAP_NET_RAW` only | long-running decision chain; needs nothing else |
 | `robodr-commission` | **not a service**: run by an operator, as needed | commissioning is a deliberate, human-reviewed act (learn, sign off, lock). A timer or unit that re-learns a profile automatically would let an attacker who is present during learning become "normal". |
 | `robodr-replay`, `robodr-ros2-watch` | operator tools | offline analysis and lab replay |
+| `robodr-anchor-receiver` | systemd service on a **base station**, dynamic user, no capabilities; never enabled on a robot | holds the robots' black-box head marks off the robots |
 
 Both services are installed **disabled**. A robot is commissioned first and its
 locked profile installed; then the operator enables the services

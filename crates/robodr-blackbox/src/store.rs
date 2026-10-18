@@ -185,8 +185,14 @@
 //! for that: a TPM 2.0 NV counter that counts marks plus a sidecar file
 //! signed with the recorder's key; a restored older sidecar is exposed by
 //! the counter and yields a lower bound of the head (see
-//! [`crate::tpm_anchor`] for the argument and its limits). A remote
-//! receiver anchor is not implemented. [`FileHeadAnchor`] is a simple
+//! [`crate::tpm_anchor`] for the argument and its limits).
+//! [`crate::remote_anchor::RemoteHeadAnchor`] keeps the marks off the unit
+//! instead: each mark, signed with the recorder's key, goes to a receiver
+//! daemon (`robodr-anchor-receiver`) that only ever raises what it holds;
+//! at open the recorder asks for it with a nonce, and the answer is signed
+//! by the receiver and carries the unit's own signed mark (see
+//! [`crate::remote_anchor`] for the protocol and its limits; it needs a
+//! reverse channel, or runs detect-only over a diode). [`FileHeadAnchor`] is a simple
 //! file-backed implementation, only as strong as the storage its file lives
 //! on (useless on the log's own filesystem). An anchor survives an attacker
 //! who rewrites or deletes the whole directory, which `head.json` does not:
@@ -354,9 +360,9 @@ impl HeadAnchor for MemoryHeadAnchor {
 /// partition, a network share replicated off the unit, a removable medium
 /// collected after a mission). A deployment that must survive an attacker
 /// with write access to the unit needs
-/// [`crate::tpm_anchor::TpmNvCounterAnchor`] (or a remote receiver behind
-/// [`HeadAnchor`]); this type is the simple building block, not that
-/// guarantee.
+/// [`crate::tpm_anchor::TpmNvCounterAnchor`] or
+/// [`crate::remote_anchor::RemoteHeadAnchor`]; this type is the simple
+/// building block, not that guarantee.
 ///
 /// The file is trusted input (unsigned): a writer to it can make the next
 /// open report a false truncation (never hide one that `head.json` shows).
@@ -1021,7 +1027,12 @@ fn remove_stale_tmp(dir: &Path) {
 /// [`LOCK_FILE`]). The lock lives as long as the returned file, i.e. as long
 /// as the [`Recorder`]; the kernel drops it if the process dies.
 fn lock_dir(dir: &Path) -> Result<File, Error> {
-    let path = dir.join(LOCK_FILE);
+    lock_file(dir.join(LOCK_FILE))
+}
+
+/// `flock(LOCK_EX | LOCK_NB)` on `path` (created 0600 if missing); held as
+/// long as the returned file.
+pub(crate) fn lock_file(path: PathBuf) -> Result<File, Error> {
     let mut o = OpenOptions::new();
     o.read(true).write(true).create(true);
     let f = private(&mut o).open(&path)?;

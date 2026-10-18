@@ -191,8 +191,12 @@ module, no robot):
   `blackbox.head_anchor` kind `tpm_nv_counter`) is tested against swtpm
   only, not a hardware TPM; it makes rollback and truncation detectable,
   not impossible (root can still use the counter; owner/lockout
-  authorization must be kept off the unit). A remote receiver anchor is not
-  implemented. A contested GUID prefix fails closed (an attacker who can send
+  authorization must be kept off the unit). The remote head anchor
+  (`RemoteHeadAnchor` + `robodr-anchor-receiver`, kind `remote`) is tested
+  over loopback against a real receiver process only, not across a real
+  network; it needs a reverse channel to the receiver (otherwise
+  detect-only through the diode) and makes rollback detectable, not
+  impossible. A contested GUID prefix fails closed (an attacker who can send
   one SPDP can make a profiled participant untrusted until it is pinned in
   `participant_ips`).
 - Evidence (black box, diode bundles) and profiles are signed with Ed25519

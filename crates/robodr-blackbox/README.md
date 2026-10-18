@@ -383,8 +383,8 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
   the mark in one file (atomic replace, never decreasing); it is only as
   strong as the storage that file lives on and adds nothing on the log's
   own filesystem. **Deployment requires a TPM NV monotonic counter or a
-  remote receiver behind `HeadAnchor`**: `TpmNvCounterAnchor` (below) is
-  the TPM one; a remote receiver anchor is not implemented.
+  remote receiver behind `HeadAnchor`**: `TpmNvCounterAnchor` and
+  `RemoteHeadAnchor` (both below).
 
   **Remaining window:** records written after the newest mark and cut with
   the tail leave no local trace and their seqs may be reused: at most
@@ -439,6 +439,57 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
   authorization, undefine the index or clear the TPM (reported as above);
   set those authorizations and keep them off the unit. Tested against
   swtpm (`scripts/swtpm-anchor-it.sh`), not yet on a hardware TPM.
+- **Remote head anchor** (`remote_anchor::RemoteHeadAnchor` on the unit,
+  `remote_anchor::AnchorReceiver` / the `robodr-anchor-receiver` binary on
+  a base station or fleet host). Std only, TCP, one JSON line per request
+  and answer (`robodr-anchor/v1`, at most 16 KiB), no TLS: everything that
+  matters is signed with Ed25519 at the application layer.
+  - *advance*: the mark is the recorder's `Checkpoint` plus `mark_sig`, the
+    unit's signature over `robodr-blackbox/remote-anchor/mark/v1\0 ||
+    lp(unit) || chain_id || seq || hash || lp(key_id)`. The checkpoint's
+    own signature covers only the record hash; without `mark_sig` a
+    captured checkpoint could be replayed with an inflated `seq`, which the
+    receiver would hold forever. The receiver verifies both under the
+    unit's configured public key and, per unit, stores the mark only if its
+    `seq` is higher (a no-op if equal and identical); a lower `seq`
+    (rollback or replay), the same `seq` with another hash or chain (fork)
+    and a bad signature are refused and recorded as alerts (log line,
+    bounded `alerts.jsonl`, per-unit counter). A higher `seq` on another
+    chain (replaced store) is stored and alerted (`chain_change`). The
+    state file `units/<unit>.json` is replaced atomically with fsync before
+    the answer; at start every stored mark is re-verified, and one that
+    does not verify blocks the unit (refused, alerted) instead of resetting
+    it. Bounded frames, units (4096), connections, per-connection deadline.
+  - *current*, at open: a fresh 32-byte nonce; the receiver answers with
+    the held mark (or none) signed with **its own** Ed25519 key over
+    `robodr-blackbox/remote-anchor/current/v1\0 || nonce || lp(unit) ||
+    mark`. The unit checks receiver key, nonce and unit, then the mark's
+    signatures under its own key (`verify_own`). A man-in-the-middle cannot
+    feed a lower mark or "none" (no receiver key), cannot replay an older
+    genuine answer (nonce), and cannot substitute another unit's mark; it
+    can drop the answer, which is an anchor failure (counted, in the signed
+    `Resume` record), never "no anchor".
+  - Client: `advance` signs and hands the mark to a background thread
+    through a one-slot queue that coalesces to the newest mark; it never
+    waits for the network. Transport failures are retried with backoff
+    (250 ms .. 30 s), refusals are not; a failure is reported by the next
+    `advance` (counted one mark late). `current` is bounded by about three
+    times the timeout (default 2 s), DNS included. Dropping the anchor
+    tries once more to deliver the last mark.
+  - Air gap: the query needs a reverse channel; use a local base-station
+    receiver, or the **detect-only** mode: `robodr-blackbox anchor-mark`
+    writes the current `head.json` as a signed mark file that rides the
+    diode, and `robodr-anchor-receiver ingest` applies it with the same
+    rule, so a rollback is detected on the far side (a lower mark, a fork)
+    though the unit is never told.
+  - Limits: detection, not prevention. The window is what has not reached
+    the receiver (records after the newest mark, marks queued or dropped
+    in transit); an attacker who controls the network can suppress marks
+    and block the query (anchor failure on the record), but cannot lower
+    what the receiver holds. Key rotation is a new chain: move the unit's
+    receiver state aside when its key changes. Marks are not encrypted
+    (hashes and seqs only). Tested over loopback with a real receiver
+    process (`tests/remote_anchor.rs`), not across a real network.
 - **Truncation evidence:** an authentic `checkpoint.json` or
   `export-cursor.json` naming a seq **beyond** the head proves the tail was
   cut at a frame boundary. The recorder does not brick and does not hide it:
