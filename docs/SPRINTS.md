@@ -102,6 +102,17 @@ runner.**
   They showed that DDS GUID prefixes change on every process start; the
   profile gained `participant_identities` to survive it. Not Gazebo, not a
   turtlebot: a two-node container lab (`tools/lab-capture/`).
+- **Update 2026-10-18: Gazebo, DATA_FRAG, Zenoh** (same README, second
+  set). A headless Gazebo Harmonic robot (ros_gz bridge,
+  robot_state_publisher, live `/odom` to the operator) learned from one run
+  and replayed against a restarted run with a rogue: no false positive after
+  the fix for DATA arriving before its writer's SEDP (Fast DDS). Real
+  DATA_FRAG (small `maxMessageSize` / `FragmentSize`) found two reassembly
+  bugs (per-source quota too small for Cyclone's SEDP bursts; interleaved
+  per-reader copies left never-completing partial samples), both fixed. A
+  robot on `rmw_zenoh_cpp` shows no RTPS at all: that blind spot is now
+  reported (`robot.capture.unsupported_middleware`), not decoded. Still no
+  turtlebot, no rendering sensors, no 72-hour soak.
 - `Cargo.lock` is committed; every job of `ci.yml` (and the build part of
   `release.yml`) passes when run locally on Linux (docs/BUILD.md, "Local CI
   verification"). The hosted runs do not start: GitHub Actions is blocked by

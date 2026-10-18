@@ -531,6 +531,12 @@ fn catalog_1_3_wave7(rule: &str) -> Option<RuleInfo> {
             GRAPH,
             &[],
         ),
+        "robot.capture.unsupported_middleware" => e(
+            "Robot middleware not inspected (Zenoh)",
+            "The capture sees Zenoh (rmw_zenoh) traffic, which RoboDR does not decode: participants, publishers and motion commands on it are not inspected; with no RTPS at all the sensor is blind to the robot's bus.",
+            GRAPH,
+            &[],
+        ),
         "robot.capture.ip_fragment_refused" => e(
             "IP fragments refused, reassembly budget full",
             "IP fragments were refused because the reassembly budget was full; those datagrams were not inspected (possibly a flood aimed at blinding the sensor).",

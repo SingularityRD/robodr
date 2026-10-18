@@ -124,6 +124,7 @@ pub mod bpf;
 pub mod checksum;
 pub mod decode;
 pub mod ingress;
+pub mod middleware;
 pub mod pcap;
 pub mod ports;
 pub mod reassembly;
@@ -204,6 +205,12 @@ pub struct CaptureStats {
     /// [`decode::SUSPICIOUS_IPV6_EXT_HEADERS`] extension headers (decoded,
     /// since Linux delivers them, but a typical evasion trait).
     pub ipv6_long_ext_chains: u64,
+    /// Packets of a middleware the sensor does not decode (Zenoh, see
+    /// [`middleware`]): counted, never inspected, not in `not_udp` /
+    /// `filtered_out` / `truncated`.
+    pub zenoh: u64,
+    /// Source address of the latest such packet (evidence for the finding).
+    pub zenoh_last_src: Option<IpAddr>,
 }
 
 /// Iterator glue: packet source -> decoders -> reassembly -> RTPS filter.
@@ -398,6 +405,11 @@ fn process(
             return None;
         }
         stats.udp += 1;
+        if middleware::classify_udp(u).is_some() {
+            stats.zenoh += 1;
+            stats.zenoh_last_src = Some(u.src);
+            return None;
+        }
         if !filter.matches(u) {
             stats.filtered_out += 1;
             return None;
@@ -417,6 +429,18 @@ fn process(
     };
     let d = match decode::decode_frame_detail(link, data) {
         Ok(d) => d,
+        Err(e @ (DecodeError::NotUdp | DecodeError::Truncated(_))) => {
+            // TCP to / from the Zenoh port (also when the kernel filter cut
+            // it to its headers): counted as a foreign middleware.
+            match middleware::classify_tcp_frame(link, data) {
+                Some((src, _)) => {
+                    stats.zenoh += 1;
+                    stats.zenoh_last_src = Some(src);
+                }
+                None => count_error(stats, e),
+            }
+            return None;
+        }
         Err(e) => {
             count_error(stats, e);
             return None;

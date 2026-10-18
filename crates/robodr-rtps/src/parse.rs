@@ -892,7 +892,7 @@ impl Report {
         }
         match outcome {
             // Both already reported through the fragment events.
-            FragOutcome::Pending | FragOutcome::Rejected => {}
+            FragOutcome::Pending | FragOutcome::Rejected | FragOutcome::LateCopy => {}
             FragOutcome::Complete(buf, inline, key_only) => {
                 self.stats.frag_completed += 1;
                 self.handle_sample(Sample {

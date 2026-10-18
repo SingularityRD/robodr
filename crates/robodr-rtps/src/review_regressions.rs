@@ -91,8 +91,11 @@ fn fragment_eviction_flood_in_same_datagram_does_not_hide_the_sample() {
     let rest = &payload[half..];
     let nfr = payload.len().div_ceil(half);
     let mut subs = vec![f1];
-    for i in 0..16u8 {
-        subs.push(info_src(true, [i + 1; 12]));
+    // More junk sources than the default table holds (256 pending).
+    for i in 0..300u16 {
+        let mut src = [0x11; 12];
+        src[..2].copy_from_slice(&(i + 1).to_be_bytes());
+        subs.push(info_src(true, src));
         subs.push(data_frag(true, PUB, 1, 1, 1, 4, 8, None, &[0; 4]));
     }
     subs.push(info_src(true, ATT));

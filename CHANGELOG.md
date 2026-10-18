@@ -12,6 +12,26 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Added
 
+- Second set of real ROS 2 Jazzy lab captures
+  (`fixtures/captures/ros2-jazzy/`, README "Second set"; tooling in
+  `tools/lab-capture/`: `capture_gz.sh`, `capture_frag.sh`,
+  `capture_zenoh.sh`, `Dockerfile.gz`): a headless Gazebo Harmonic robot
+  (Fast DDS, Cyclone DDS) with a rogue `/cmd_vel` publisher, fragmented
+  discovery and a fragmented JointTrajectory (both vendors), and a robot on
+  `rmw_zenoh_cpp`. Tested by `real_captures_lab.rs` in
+  `robodr-ros2-pipeline` and `robodr-agentd`.
+- `robot.capture.unsupported_middleware` (catalog + OCSF): the capture sees
+  Zenoh (TCP 7447, UDP 7446/7447 without the RTPS magic,
+  `robodr_capture::middleware`), which RoboDR does not decode. High while no
+  RTPS was seen, Medium otherwise. `CaptureStats::zenoh`,
+  `CaptureHealth::{zenoh, zenoh_last_src, rtps}`; the live BPF filter also
+  passes TCP SYN/FIN/RST of port 7447 (cut to 128 bytes); agentd health is
+  `unknown` when the capture sees Zenoh and no RTPS, `degraded` with both;
+  `robodr-commission learn` warns `unsupported_middleware` (report and
+  stderr), `CaptureDiagnostics::zenoh_packets`.
+- `MotionOptions::unattributed_grace` (default 2 s),
+  `MotionStats::announced_late`.
+
 - `robodr-kafka-publish` / the std-only Kafka producer run against real
   Apache Kafka brokers for the first time: `scripts/kafka-it.sh` starts a
   single-node KRaft broker in docker (`apache/kafka:3.9.1` by default,
@@ -329,6 +349,22 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   `RuntimeDirectory=robodr-agentd` for a unix-socket event input.
 
 ### Fixed
+
+- `robot.motion.unattributed_sample` (High) on a legitimate writer whose
+  DATA reached a remote reader before its own SEDP announcement (Fast DDS
+  Gazebo bridge `/odom`, 47 ms): an unannounced writer is now reported only
+  when still unannounced after `unattributed_grace`, or at `finish`.
+- Discovery DATA_FRAG reassembly lost real Cyclone DDS SEDP bursts (first
+  fragments of 25 samples before any second fragment; the quota of 4 per
+  source evicted them all): `ReassemblyLimits` defaults raised to 256
+  pending, 64 per source, 1 MiB.
+- Interleaved per-reader copies of one fragmented sample left a partial
+  sample that never completed (half of Fast DDS's fragmented SEDP
+  "incomplete"): the reassembler remembers recently completed samples
+  (`COMPLETED_MEMORY_SAMPLES` / `_BYTES`), treats further fragments as late
+  copies (`FragmentReassembler::late_copies`) and reports copies that
+  differ as conflicts.
+- TCP to / from port 7447 is no longer counted as `robot.capture.not_udp`.
 
 - `robodr-export` Kafka producer (found against a real broker): a batch
   refused with `MESSAGE_TOO_LARGE` only because of its total size (topic

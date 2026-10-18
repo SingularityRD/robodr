@@ -653,6 +653,15 @@ fn cmd_learn(argv: &[String]) -> Outcome {
     if !a.switch("quiet") {
         print!("{}", c.report);
     }
+    // A capture of a bus RoboDR cannot read must not pass as a quiet robot.
+    for w in c
+        .report
+        .warnings
+        .iter()
+        .filter(|w| w.code == "unsupported_middleware")
+    {
+        eprintln!("robodr-commission: WARNING: {}", w.message);
+    }
     eprintln!(
         "wrote draft profile {out} (locked: false): {} participants, {} writer topics, \
          {} services, {} actions, {} raw DDS topics, {} reader topics, \

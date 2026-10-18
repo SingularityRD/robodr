@@ -35,6 +35,7 @@
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, BufReader};
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -197,13 +198,23 @@ pub struct CaptureHealth {
     pub bad_udp_checksum: u64,
     /// IP packets that were not UDP (not inspected).
     pub not_udp: u64,
+    /// Packets of a middleware the sensor does not decode: Zenoh
+    /// (`rmw_zenoh_cpp`), recognised by port only
+    /// (`robodr_capture::middleware`). Not inspected at all.
+    pub zenoh: u64,
+    /// Source address of the latest such packet.
+    pub zenoh_last_src: Option<IpAddr>,
+    /// UDP datagrams accepted as RTPS (context for `zenoh`: zero means the
+    /// sensor saw nothing it can inspect).
+    pub rtps: u64,
 }
 
 impl CaptureHealth {
     /// Every counter of `robodr-capture` that means "not inspected" or
-    /// "tampered with below RTPS". Not mapped (benign or informational):
-    /// `duplicates` without conflict, `udp_checksum_partial` / `_none` /
-    /// `_unverified`, `filtered_out`, `not_ip`, `ipv6_long_ext_chains`.
+    /// "tampered with below RTPS", plus the accepted-RTPS count. Not mapped
+    /// (benign or informational): `duplicates` without conflict,
+    /// `udp_checksum_partial` / `_none` / `_unverified`, `filtered_out`,
+    /// `not_ip`, `ipv6_long_ext_chains`.
     pub fn from_stats(c: &CaptureStats, r: &ReassemblyStats) -> Self {
         Self {
             truncated: c.truncated,
@@ -218,6 +229,9 @@ impl CaptureHealth {
             bad_ip_checksum: c.bad_ip_checksum,
             bad_udp_checksum: c.bad_udp_checksum,
             not_udp: c.not_udp,
+            zenoh: c.zenoh,
+            zenoh_last_src: c.zenoh_last_src,
+            rtps: c.rtps,
         }
     }
 
@@ -251,6 +265,9 @@ impl CaptureHealth {
             bad_ip_checksum: self.bad_ip_checksum.saturating_add(o.bad_ip_checksum),
             bad_udp_checksum: self.bad_udp_checksum.saturating_add(o.bad_udp_checksum),
             not_udp: self.not_udp.saturating_add(o.not_udp),
+            zenoh: self.zenoh.saturating_add(o.zenoh),
+            zenoh_last_src: o.zenoh_last_src.or(self.zenoh_last_src),
+            rtps: self.rtps.saturating_add(o.rtps),
         }
     }
 }
@@ -663,9 +680,21 @@ mod tests {
         assert!(s.recv().unwrap().is_none());
         assert!(s.recv().unwrap().is_none());
         assert_eq!(s.stats().filtered_out, 1);
-        assert_eq!(s.capture_health(), Some(CaptureHealth::default()));
+        assert_eq!(
+            s.capture_health(),
+            Some(CaptureHealth {
+                rtps: 2,
+                ..Default::default()
+            })
+        );
         let boxed: Box<dyn DatagramSource> = Box::new(s);
-        assert_eq!(boxed.capture_health(), Some(CaptureHealth::default()));
+        assert_eq!(
+            boxed.capture_health(),
+            Some(CaptureHealth {
+                rtps: 2,
+                ..Default::default()
+            })
+        );
         assert_eq!(VecDatagramSource::default().capture_health(), None);
     }
 
@@ -776,6 +805,9 @@ mod tests {
             not_udp: 5,
             udp_checksum_partial: 99,
             filtered_out: 99,
+            zenoh: 13,
+            zenoh_last_src: Some(IpAddr::from([10, 0, 0, 9])),
+            rtps: 14,
             ..Default::default()
         };
         let r = ReassemblyStats {
@@ -805,10 +837,18 @@ mod tests {
                 bad_ip_checksum: 3,
                 bad_udp_checksum: 4,
                 not_udp: 5,
+                zenoh: 13,
+                zenoh_last_src: Some(IpAddr::from([10, 0, 0, 9])),
+                rtps: 14,
             }
         );
         let sum = h.saturating_add(&h);
         assert_eq!(sum.not_udp, 10);
+        assert_eq!((sum.zenoh, sum.rtps), (26, 28));
+        assert_eq!(
+            CaptureHealth::default().saturating_add(&h).zenoh_last_src,
+            h.zenoh_last_src
+        );
         assert_eq!(sum.ip_fragment_refused, 20);
         let max = CaptureHealth {
             bad_ip_checksum: u64::MAX,

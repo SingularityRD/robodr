@@ -171,9 +171,22 @@ module, no robot):
 
 **Not verified:**
 
-- No real robot, no Gazebo run, no RTI Connext or Zenoh traffic, no
-  DDS-Security, no controller hardware, no TPM. False-positive rates are
-  unmeasured beyond the lab captures; thresholds are still estimates.
+- No real robot, no RTI Connext traffic, no DDS-Security, no controller
+  hardware, no TPM. False-positive rates are unmeasured beyond the lab
+  captures; thresholds are still estimates.
+- Gazebo: a headless Gazebo Harmonic robot (gz bridge,
+  robot_state_publisher, `/clock`, `/tf`, `/joint_states`, `/odom`) was
+  captured, learned and replayed against a restarted run with a rogue
+  (`fixtures/captures/ros2-jazzy/`, second set): no false positive left
+  after one fix (DATA before the writer's own SEDP). No rendering sensors,
+  ros2_control or nav2.
+- DATA_FRAG: real fragmented SEDP (Fast DDS, Cyclone) and a fragmented
+  JointTrajectory are reassembled and learned (two reassembly bugs found and
+  fixed). Fragmented SPDP only from Cyclone.
+- Zenoh (`rmw_zenoh_cpp`) is **not decoded**: the sensor is blind to it.
+  It is detected by port and reported (`robot.capture.unsupported_middleware`,
+  High when no RTPS is seen; agentd health never `ok`; `learn` warns), not
+  inspected.
 - `robodr-pulsard` ran in WSL2 (kernel 6.18), not on a robot: the multicast
   join on the robot's interface and coexistence with each DDS vendor on the
   same host are open.

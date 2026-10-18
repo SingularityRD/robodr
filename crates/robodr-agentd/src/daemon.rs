@@ -1677,6 +1677,7 @@ impl<'a> Daemon<'a> {
         self.handle_ended();
 
         let spool = self.spool.stats();
+        let capture = self.capture_health.latest().unwrap_or_default();
         let snap = DaemonSnapshot {
             max_queue_age_ms: std::mem::take(&mut self.tick_max_age_ms),
             tick_delay_ms: delay_ms,
@@ -1685,6 +1686,8 @@ impl<'a> Daemon<'a> {
             evidence_degraded: self.agent.evidence_degraded(),
             profile_not_enforced: self.pipeline.status() != &ProfileStatus::Enforcing,
             all_inputs_gone: self.inputs_gone,
+            capture_zenoh: capture.zenoh,
+            capture_rtps: capture.rtps,
         };
         let inputs = self.snapshots();
         let (state, issues, recoveries) = self.health.evaluate(self.now_ms(), &inputs, &snap);

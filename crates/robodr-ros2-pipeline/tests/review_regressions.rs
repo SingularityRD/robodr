@@ -343,13 +343,25 @@ fn f2a_fragment_eviction_flood_is_reported() {
         subs.push(info_src([i + 1; 12]));
         subs.push(data_frag(ENTITY_SEDP_PUB_WRITER, 1, 1, 4, 8, &[0; 4]));
     }
-    let mut p = pipeline();
+    // A small table (the pre-lab defaults), so 40 junk sources overflow it.
+    let mut p = pipeline_with(PipelineOptions {
+        reassembly: robodr_ros2_pipeline::ReassemblyLimits {
+            max_pending_samples: 16,
+            max_total_bytes: 256 * 1024,
+            max_pending_per_source: 4,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
     let f = p.process(&datagram(ROGUE, &subs), XIP);
     let e = with_rule(&f, rules::DISCOVERY_FRAGMENT_EVICTED);
     assert_eq!(e.len(), 1, "{f:#?}");
     assert_eq!(e[0].deviation.severity, Severity::Medium);
     assert!(p.stats().fragment_evictions >= 1);
-    assert!(p.reassembler().pending_samples() <= 16);
+    assert!(
+        p.reassembler().pending_samples()
+            <= robodr_ros2_pipeline::ReassemblyLimits::default().max_pending_samples
+    );
 }
 
 /// F2b: a conflicting duplicate of fragment 1 makes the reassembler drop the
@@ -788,7 +800,10 @@ fn mutation_fuzz_never_panics_and_stays_bounded() {
     assert!(p.remembered() <= 256);
     assert!(p.binding().len() <= 32);
     assert_eq!(p.binding().held_len(), 0);
-    assert!(p.reassembler().pending_samples() <= 16);
+    assert!(
+        p.reassembler().pending_samples()
+            <= robodr_ros2_pipeline::ReassemblyLimits::default().max_pending_samples
+    );
 }
 
 /// The watch tool's run loop over hostile datagrams: every stdout line is

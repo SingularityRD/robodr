@@ -3233,7 +3233,27 @@ impl Learner {
                     &subject,
                     format!("{}: the capture contains no frames", r.label),
                 );
-            } else if c.rtps_datagrams == 0 {
+            }
+            if c.zenoh_packets > 0 {
+                let what = if c.rtps_datagrams == 0 {
+                    "and no RTPS at all: this robot runs rmw_zenoh, which RoboDR does not \
+                     decode; nothing was learned from it, and a RoboDR sensor on this bus \
+                     would be blind (it reports robot.capture.unsupported_middleware)"
+                } else {
+                    "besides RTPS: that part of the bus (rmw_zenoh) is not decoded and was not \
+                     learned"
+                };
+                warn(
+                    Warn,
+                    "unsupported_middleware",
+                    &subject,
+                    format!(
+                        "{}: {} Zenoh packet(s) (TCP/UDP 7447, scouting UDP 7446) {what}",
+                        r.label, c.zenoh_packets
+                    ),
+                );
+            }
+            if c.frames > 0 && c.rtps_datagrams == 0 {
                 warn(
                     Warn,
                     "no_rtps_in_capture",

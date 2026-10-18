@@ -779,3 +779,29 @@ fn lock_and_check_refuse_invalid_profiles() {
     assert_eq!(code(&o), 2);
     assert!(String::from_utf8_lossy(&o.stderr).contains("fails validation"));
 }
+
+#[test]
+fn learn_from_a_zenoh_capture_warns_loudly_on_stderr() {
+    // A real rmw_zenoh_cpp robot (fixtures/captures/ros2-jazzy): no RTPS at
+    // all. The learner must not present it as a quiet bus.
+    let d = tmpdir("zenoh");
+    let pcap = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/captures/ros2-jazzy/zenoh_baseline.pcap");
+    let o = run(&[
+        "learn",
+        "--pcap",
+        s(&pcap),
+        "--model",
+        "m",
+        "--out",
+        s(&d.join("z.json")),
+    ]);
+    assert_eq!(code(&o), 0);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("robodr-commission: WARNING:") && err.contains("Zenoh"),
+        "{err}"
+    );
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("unsupported_middleware"), "{out}");
+}

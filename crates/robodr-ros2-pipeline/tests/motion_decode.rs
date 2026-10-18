@@ -444,12 +444,20 @@ fn data_from_a_never_announced_writer_to_a_motion_reader_is_high() {
     let d = cmd_vel_datagram(ROGUE, ghost, 1, 0.2);
     let o = r.feed(&d, &ROGUE_IP.to_string());
     assert!(o.motion.is_empty(), "not attributable, not decoded");
-    let f: Vec<_> = o
-        .findings
+    // Only noted at first: real writers send DATA before their own SEDP.
+    assert!(
+        !rules_of(&o).contains(&rules::MOTION_UNATTRIBUTED_SAMPLE.to_string()),
+        "{:?}",
+        rules_of(&o)
+    );
+    // Still unannounced after the grace window: High.
+    let late = r.p.tick_at(r.t0 + Duration::from_secs(3));
+    let f: Vec<_> = late
         .iter()
         .filter(|f| f.deviation.rule == rules::MOTION_UNATTRIBUTED_SAMPLE)
         .collect();
-    assert_eq!(f.len(), 1, "{:?}", rules_of(&o));
+    assert_eq!(f.len(), 1, "{late:?}");
+    assert_eq!(f[0].src_ip, ROGUE_IP.to_string());
     assert_eq!(f[0].deviation.severity, Severity::High);
     assert!(f[0].deviation.detail.contains("rt/cmd_vel"));
     assert!(f[0]
@@ -475,7 +483,51 @@ fn data_from_a_never_announced_writer_to_a_motion_reader_is_high() {
             &[0; 100],
         )],
     );
-    let o = r.feed(&d, &ROGUE_IP.to_string());
+    r.feed(&d, &ROGUE_IP.to_string());
+    let end = r.p.finish();
+    assert!(
+        end.iter()
+            .any(|f| f.deviation.rule == rules::MOTION_UNATTRIBUTED_SAMPLE
+                && f.deviation
+                    .detail
+                    .contains("eeeeeeeeeeeeeeeeeeeeeeee00006703")),
+        "{end:?}"
+    );
+}
+
+#[test]
+fn data_before_the_writers_own_sedp_is_not_a_finding() {
+    // Fast DDS sends DATA to a matched remote reader before its SEDP
+    // publication reaches that host (real capture fastrtps_gz_baseline):
+    // the writer is announced within the grace window, no finding.
+    let mut r = started();
+    let late = [0, 0, 0x68, 0x03];
+    let o = r.feed(&cmd_vel_datagram(LEGIT, late, 1, 0.2), &robot_ip());
+    assert!(o.findings.is_empty(), "{:?}", rules_of(&o));
+    assert!(o.motion.is_empty(), "unknown writer: not decoded yet");
+    let sedp = datagram(LEGIT, &[sedp_writer_sub(LEGIT, late, "rt/cmd_vel", TWIST)]);
+    r.feed(&sedp, &robot_ip());
+    let o = r.feed(&cmd_vel_datagram(LEGIT, late, 2, 0.2), &robot_ip());
+    assert_eq!(o.motion.len(), 1, "decoded once announced");
+    let later = r.p.tick_at(r.t0 + Duration::from_secs(5));
+    let end = r.p.finish();
+    for f in later.iter().chain(&end) {
+        assert_ne!(f.deviation.rule, rules::MOTION_UNATTRIBUTED_SAMPLE, "{f:?}");
+    }
+    assert_eq!(r.p.stats().motion.announced_late, 1);
+}
+
+#[test]
+fn a_zero_grace_reports_unannounced_writers_at_once() {
+    let mut r = Run::new(pipeline_with(MotionOptions {
+        unattributed_grace: Duration::ZERO,
+        ..Default::default()
+    }));
+    r.feed(&motion_discovery(), &robot_ip());
+    let o = r.feed(
+        &cmd_vel_datagram(ROGUE, [0, 0, 0x69, 0x03], 1, 0.2),
+        &ROGUE_IP.to_string(),
+    );
     assert!(rules_of(&o).contains(&rules::MOTION_UNATTRIBUTED_SAMPLE.to_string()));
 }
 

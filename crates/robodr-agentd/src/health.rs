@@ -94,6 +94,11 @@ pub struct DaemonSnapshot {
     /// Every input thread has exited (the queue's senders are all gone):
     /// nothing can arrive any more.
     pub all_inputs_gone: bool,
+    /// Packets of a middleware the capture cannot decode (Zenoh) seen on
+    /// the bus so far (`CaptureHealth::zenoh` of the capture source).
+    pub capture_zenoh: u64,
+    /// Datagrams the capture accepted as RTPS so far.
+    pub capture_rtps: u64,
 }
 
 /// The robot's monitoring state, as a console should show it.
@@ -490,6 +495,29 @@ impl HealthMonitor {
                 &mut state,
             );
         }
+        // A bus the sensor cannot read is never "ok" (the finding itself is
+        // robot.capture.unsupported_middleware, from the pipeline).
+        if d.capture_zenoh > 0 && d.capture_rtps == 0 {
+            raise(
+                State::Unknown,
+                format!(
+                    "capture sees {} Zenoh packet(s) and no RTPS: the robot's middleware \
+                     (rmw_zenoh) is not inspected, the agent is blind to its bus",
+                    d.capture_zenoh
+                ),
+                &mut state,
+            );
+        } else if d.capture_zenoh > 0 {
+            raise(
+                State::Degraded,
+                format!(
+                    "capture sees {} Zenoh packet(s) besides RTPS: that part of the bus is not \
+                     inspected",
+                    d.capture_zenoh
+                ),
+                &mut state,
+            );
+        }
         (HealthState { state, reasons }, issues, recoveries)
     }
 }
@@ -629,6 +657,31 @@ mod tests {
         // No new drops: OK.
         let (st, _, _) = h.evaluate(2_200, &[s], &d);
         assert_eq!(st.state, State::Ok);
+    }
+
+    #[test]
+    fn a_zenoh_bus_is_never_ok() {
+        let mut h = HealthMonitor::new(CFG, 1);
+        let s = [snap("capture", Some(0))];
+        let blind = DaemonSnapshot {
+            capture_zenoh: 40,
+            ..Default::default()
+        };
+        let (st, i, _) = h.evaluate(10, &s, &blind);
+        assert_eq!(st.state, State::Unknown);
+        assert!(st.reasons.iter().any(|r| r.contains("40 Zenoh")), "{st:?}");
+        assert!(i.is_empty(), "the finding comes from the pipeline");
+        let mixed = DaemonSnapshot {
+            capture_zenoh: 40,
+            capture_rtps: 7,
+            ..Default::default()
+        };
+        assert_eq!(h.evaluate(20, &s, &mixed).0.state, State::Degraded);
+        let rtps_only = DaemonSnapshot {
+            capture_rtps: 7,
+            ..Default::default()
+        };
+        assert_eq!(h.evaluate(30, &s, &rtps_only).0.state, State::Ok);
     }
 
     #[test]

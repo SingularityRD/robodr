@@ -27,6 +27,7 @@
 //! | capture-layer counters grew ([`Pipeline::capture_findings`]) | `robot.capture.*`: [`rules::CAPTURE_IP_FRAGMENT_CONFLICT`], [`rules::CAPTURE_IP_FRAGMENT_DUPLICATE_CONFLICT`], [`rules::CAPTURE_IP_FRAGMENT_REFUSED`], [`rules::CAPTURE_IP_REASSEMBLY_EVICTED`] | Medium |
 //! | | [`rules::CAPTURE_MALFORMED_FRAMES`], [`rules::CAPTURE_IP_REASSEMBLY_DROPPED`] (geometry, timeout, distance rule), [`rules::CAPTURE_NOT_UDP`] | Low |
 //! | | [`rules::CAPTURE_BAD_CHECKSUM`] | Low; Medium when bursty |
+//! | | [`rules::CAPTURE_UNSUPPORTED_MIDDLEWARE`]: Zenoh (`rmw_zenoh_cpp`) packets on the bus, which the sensor cannot decode | **High** while the capture has accepted no RTPS at all (the sensor is blind to this robot), Medium when RTPS is seen too (part of the bus is not inspected) |
 //! | the profile failed `Profile::validate`, or a locked profile file failed the commissioning file check (seal: edited after `lock`) or the trust check (signature, trust anchors, platform/unit, anti-rollback; see [`crate::profile_trust`]) (once, [`Pipeline::status_findings`]) | [`rules::PROFILE_REFUSED`] | High |
 //! | one input produced more than `max_findings_per_datagram` new findings | [`rules::FINDINGS_CAPPED`] | most severe suppressed, >= Medium |
 //! | user DATA on a motion / feedback topic ([`crate::motion`]): undecodable, unattributed (writer never announced), from an IP outside the writer's binding; decoded commands through `Profile::evaluate` | [`rules::MOTION_UNDECODABLE_SAMPLE`], [`rules::MOTION_UNATTRIBUTED_SAMPLE`], [`rules::MOTION_SAMPLE_SOURCE_MISMATCH`], the profile's `robot.motion.*` rules | Medium (rate limited) / High / Critical (command) or High (feedback) / as the profile says |
@@ -313,6 +314,13 @@ pub mod rules {
     /// IP packets that were not UDP reached the user-space filter (the
     /// kernel filter should only pass UDP): not inspected.
     pub const CAPTURE_NOT_UDP: &str = "robot.capture.not_udp";
+    /// The capture sees a robot middleware RoboDR does not decode (Zenoh,
+    /// `rmw_zenoh_cpp`: TCP/UDP 7447, scouting UDP 7446; see
+    /// `robodr_capture::middleware`): participants, publishers and motion
+    /// commands carried by it are not inspected. High while no RTPS was seen
+    /// at all (blind), Medium otherwise. Rate limited like every
+    /// `robot.capture.*` rule.
+    pub const CAPTURE_UNSUPPORTED_MIDDLEWARE: &str = "robot.capture.unsupported_middleware";
     /// A discovery announcement repeats an identity parameter (topic, type,
     /// GUID, key hash, status) with conflicting values: DDS stacks differ on
     /// which value wins, so what was inspected may not be what a stack acts
@@ -1029,6 +1037,7 @@ impl Pipeline {
             ip,
             ingress,
             capture_ns,
+            now,
         };
         let m = self
             .motion
@@ -1080,6 +1089,9 @@ impl Pipeline {
         let mut found = Vec::new();
         self.binding.expire(&self.profile, now, &mut found);
         self.push_binding(out, found);
+        for (dev, src) in self.motion.expire_unattributed(Some(now)) {
+            self.push(out, dev, &src);
+        }
     }
 
     /// Node evidence for resolved prefixes: a writer of
@@ -1220,6 +1232,9 @@ impl Pipeline {
         self.binding.flush(&self.profile, &mut found);
         let mut out = Vec::new();
         self.push_binding(&mut out, found);
+        for (dev, src) in self.motion.expire_unattributed(None) {
+            self.push(&mut out, dev, &src);
+        }
         self.emit(out, Instant::now())
     }
 
@@ -1488,6 +1503,38 @@ impl Pipeline {
             self.stats.capture_findings += 1;
             let detail = format!("capture: {delta} new {what} ({total} since capture start)");
             self.push(&mut out, Deviation::new(rule, sev, detail), CAPTURE_SOURCE);
+        }
+        let zenoh = d(h.zenoh, prev.zenoh);
+        if zenoh > 0 {
+            self.stats.capture_findings += 1;
+            let blind = h.rtps == 0;
+            let (sev, tail) = if blind {
+                (
+                    Severity::High,
+                    "; no RTPS was seen at all: the sensor is blind to this robot's bus (its \
+                     clean state means nothing)",
+                )
+            } else {
+                (
+                    Severity::Medium,
+                    "; only the RTPS part of the bus is inspected",
+                )
+            };
+            let src = h
+                .zenoh_last_src
+                .map_or_else(|| CAPTURE_SOURCE.to_string(), |ip| ip.to_string());
+            let detail = format!(
+                "capture: {zenoh} new Zenoh packet(s) (rmw_zenoh_cpp: TCP/UDP 7447, scouting UDP \
+                 7446; latest from {src}) ({} since capture start): RoboDR does not decode Zenoh, \
+                 so participants, publishers and motion commands carried by it are not \
+                 inspected{tail}",
+                h.zenoh
+            );
+            self.push(
+                &mut out,
+                Deviation::new(rules::CAPTURE_UNSUPPORTED_MIDDLEWARE, sev, detail),
+                &src,
+            );
         }
         self.emit(out, now)
     }

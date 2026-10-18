@@ -92,6 +92,29 @@
 //! whose `sampleSize` / `fragmentSize` / key flag disagrees with the pending
 //! sample is refused on its own; the pending sample is left untouched.
 //!
+//! # Copies of a completed sample
+//!
+//! A DDS writer sends one copy of a sample **per matched remote reader
+//! locator**: the robot's SEDP announcement goes to every participant on the
+//! operator host, each copy fragmented the same way, and the copies may
+//! interleave on the wire (real Fast DDS 2.14 capture with a 640-byte
+//! `maxMessageSize`: copy 1 fragment 1, copy 2 fragment 1, copy 1 fragment 2
+//! completes the sample, copy 2 fragment 2 arrives last). Forgetting the
+//! sample at completion made that last fragment start a new partial sample
+//! that could never complete: half of all fragmented SEDP samples of that
+//! capture ended "incomplete" and later aged out as evictions. The
+//! reassembler therefore remembers the most recently completed multi-fragment
+//! samples (at most [`COMPLETED_MEMORY_SAMPLES`] samples and
+//! [`COMPLETED_MEMORY_BYTES`] bytes of payload, oldest forgotten first): a
+//! later fragment of one of them is a **late copy**, ignored like a DDS
+//! reader that already has that sequence number ignores it
+//! ([`FragmentReassembler::late_copies`]), and compared against what was
+//! completed: different bytes, geometry, key flag or a present, different
+//! inline status / key hash are reported as
+//! [`FragmentEventKind::ConflictingOverlap`] /
+//! [`FragmentEventKind::ConflictingInlineQos`] (the copy went to another
+//! reader, which may act on it).
+//!
 //! # Inline QoS of fragmented samples
 //!
 //! A DATA_FRAG may carry inline QoS (`PID_STATUS_INFO`, `PID_KEY_HASH`).
@@ -123,6 +146,11 @@ pub const HARD_MAX_SAMPLE_BYTES: usize = 1 << 20;
 /// Hard ceiling on `max_pending_samples` (each fragment costs a linear scan
 /// of the pending table).
 pub const HARD_MAX_PENDING_SAMPLES: usize = 1024;
+/// Completed multi-fragment samples remembered to recognise late copies
+/// (see the module docs, "Copies of a completed sample").
+pub const COMPLETED_MEMORY_SAMPLES: usize = 256;
+/// Payload bytes of the remembered completed samples, at most.
+pub const COMPLETED_MEMORY_BYTES: usize = 256 * 1024;
 
 /// Caps for [`FragmentReassembler`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,9 +172,9 @@ impl Default for ReassemblyLimits {
     fn default() -> Self {
         Self {
             max_sample_bytes: 64 * 1024,
-            max_pending_samples: 16,
-            max_total_bytes: 256 * 1024,
-            max_pending_per_source: 4,
+            max_pending_samples: 256,
+            max_total_bytes: 1024 * 1024,
+            max_pending_per_source: 64,
             stale_after_fragments: 1024,
         }
     }
@@ -248,6 +276,19 @@ pub(crate) enum FragOutcome {
     Complete(Vec<u8>, InlineQos, bool),
     /// Refused (see the [`FragmentEvent`] pushed alongside).
     Rejected,
+    /// A fragment of a sample completed earlier (another reader's copy):
+    /// nothing new; any difference was reported as a conflict event.
+    LateCopy,
+}
+
+/// A completed multi-fragment sample, kept to judge late copies.
+struct Done {
+    key: SampleKey,
+    sample_size: u32,
+    frag_size: u16,
+    key_only: bool,
+    inline: InlineQos,
+    payload: Vec<u8>,
 }
 
 struct Pending {
@@ -297,6 +338,10 @@ pub struct FragmentReassembler {
     dropped: u64,
     evicted: u64,
     conflicts: u64,
+    /// Recently completed multi-fragment samples, oldest first.
+    done: std::collections::VecDeque<Done>,
+    done_bytes: usize,
+    late_copies: u64,
     /// User-data mode ([`crate::UserDataWalker`]): the per-source quota and
     /// the "most-represented source" pressure rule count per *writer*
     /// (source prefix + writer entity id) instead of per source prefix, so
@@ -382,10 +427,90 @@ impl FragmentReassembler {
         self.conflicts
     }
 
-    /// Forget all partial samples (not counted as evictions).
+    /// Fragments of samples completed earlier (a copy addressed to another
+    /// reader, or a retransmission): ignored, compared, never buffered.
+    pub fn late_copies(&self) -> u64 {
+        self.late_copies
+    }
+
+    /// Forget all partial samples (not counted as evictions) and the memory
+    /// of completed ones.
     pub fn clear(&mut self) {
         self.pending.clear();
         self.total = 0;
+        self.done.clear();
+        self.done_bytes = 0;
+    }
+
+    /// Remember a completed multi-fragment sample (bounded, oldest out).
+    fn remember(&mut self, d: Done) {
+        if d.payload.len() > COMPLETED_MEMORY_BYTES {
+            return;
+        }
+        if let Some(i) = self.done.iter().position(|x| x.key == d.key) {
+            if let Some(old) = self.done.remove(i) {
+                self.done_bytes -= old.payload.len();
+            }
+        }
+        while self.done.len() >= COMPLETED_MEMORY_SAMPLES
+            || self.done_bytes + d.payload.len() > COMPLETED_MEMORY_BYTES
+        {
+            let Some(old) = self.done.pop_front() else {
+                break;
+            };
+            self.done_bytes -= old.payload.len();
+        }
+        self.done_bytes += d.payload.len();
+        self.done.push_back(d);
+    }
+
+    /// A fragment of a remembered completed sample: count it and report
+    /// what differs from the completed copy.
+    fn late_copy(
+        &mut self,
+        i: usize,
+        f: &FragIn<'_>,
+        offset: usize,
+        data: &[u8],
+        nfrags: u32,
+        events: &mut Vec<FragmentEvent>,
+    ) -> FragOutcome {
+        self.late_copies += 1;
+        let d = &self.done[i];
+        let same_shape = d.sample_size == f.sample_size
+            && d.frag_size == f.frag_size
+            && d.key_only == f.key_only;
+        let bytes_differ = !same_shape || d.payload.get(offset..offset + data.len()) != Some(data);
+        let status = matches!((f.inline.status, d.inline.status), (Some(a), Some(b)) if a != b);
+        let key_hash =
+            matches!((f.inline.key_hash, d.inline.key_hash), (Some(a), Some(b)) if a != b);
+        let mut kinds = Vec::new();
+        if bytes_differ {
+            kinds.push(FragmentEventKind::ConflictingOverlap);
+        }
+        if status {
+            kinds.push(FragmentEventKind::ConflictingInlineQos(
+                crate::wire::PID_STATUS_INFO,
+            ));
+        }
+        if key_hash {
+            kinds.push(FragmentEventKind::ConflictingInlineQos(
+                crate::wire::PID_KEY_HASH,
+            ));
+        }
+        for kind in kinds {
+            self.conflicts += 1;
+            events.push(FragmentEvent {
+                kind,
+                topic: f.topic,
+                source: f.key.source,
+                writer: f.key.writer,
+                sn: f.key.sn,
+                received_fragments: nfrags,
+                total_fragments: nfrags,
+            });
+        }
+        FragOutcome::LateCopy
     }
 
     fn remove(&mut self, i: usize) -> Pending {
@@ -513,7 +638,13 @@ impl FragmentReassembler {
             return self.reject(&f, RejectReason::ShortData, nfrags32, events);
         };
 
-        let idx = match self.pending.iter().position(|p| p.key == f.key) {
+        let pending_at = self.pending.iter().position(|p| p.key == f.key);
+        if pending_at.is_none() {
+            if let Some(i) = self.done.iter().position(|d| d.key == f.key) {
+                return self.late_copy(i, &f, offset, data, nfrags32, events);
+            }
+        }
+        let idx = match pending_at {
             Some(i) => {
                 let p = &self.pending[i];
                 if p.sample_size != f.sample_size || p.frag_size != f.frag_size {
@@ -642,6 +773,14 @@ impl FragmentReassembler {
                 Some(h) => p.inline.with_reading(&h),
                 None => p.inline,
             };
+            self.remember(Done {
+                key: p.key,
+                sample_size: p.sample_size,
+                frag_size: p.frag_size,
+                key_only: p.key_only,
+                inline: p.inline,
+                payload: p.buf.clone(),
+            });
             return FragOutcome::Complete(p.buf, inline, p.key_only);
         }
         FragOutcome::Pending
@@ -710,7 +849,7 @@ mod tests {
                         assert!(!ko);
                         done = Some(b)
                     }
-                    FragOutcome::Rejected => panic!("rejected"),
+                    FragOutcome::Rejected | FragOutcome::LateCopy => panic!("rejected"),
                 }
             }
             assert_eq!(done.as_deref(), Some(&s[..]));
@@ -879,9 +1018,139 @@ mod tests {
         assert_eq!(r.pending_bytes(), 0);
     }
 
+    /// The pre-0.x defaults (16 pending, 4 per source, 256 KiB): small
+    /// enough to exercise the eviction policy with a handful of samples.
+    fn small() -> ReassemblyLimits {
+        ReassemblyLimits {
+            max_pending_samples: 16,
+            max_total_bytes: 256 * 1024,
+            max_pending_per_source: 4,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn interleaved_copies_of_one_sample_complete_once_and_leave_nothing() {
+        // Real Fast DDS (fastrtps_frag_run1.pcap): one SEDP sample sent to
+        // two readers, the copies' fragments interleaved.
+        let s = sample(8);
+        let mut r = FragmentReassembler::new(ReassemblyLimits::default());
+        let mut ev = Vec::new();
+        assert!(matches!(
+            r.add(frag(1, 1, 1, 4, 8, &s[..4]), &mut ev),
+            FragOutcome::Pending
+        ));
+        assert!(matches!(
+            r.add(frag(1, 1, 1, 4, 8, &s[..4]), &mut ev),
+            FragOutcome::Pending
+        ));
+        assert!(matches!(
+            r.add(frag(1, 2, 1, 4, 8, &s[4..]), &mut ev),
+            FragOutcome::Complete(..)
+        ));
+        assert!(matches!(
+            r.add(frag(1, 2, 1, 4, 8, &s[4..]), &mut ev),
+            FragOutcome::LateCopy
+        ));
+        assert!(ev.is_empty(), "{ev:?}");
+        assert_eq!(r.pending_samples(), 0, "the late fragment starts nothing");
+        assert_eq!((r.completed(), r.late_copies(), r.conflicts()), (1, 1, 0));
+        // A late copy with other bytes, geometry or status is a conflict.
+        assert!(matches!(
+            r.add(frag(1, 1, 1, 4, 8, &[9; 4]), &mut ev),
+            FragOutcome::LateCopy
+        ));
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].kind, FragmentEventKind::ConflictingOverlap);
+        assert!(matches!(
+            r.add(frag(1, 1, 1, 2, 8, &s[..2]), &mut ev),
+            FragOutcome::LateCopy
+        ));
+        assert_eq!(ev.len(), 2, "different fragment size");
+        let mut alive = frag(2, 1, 1, 4, 8, &s[..4]);
+        alive.inline.status = Some(crate::parse::StatusInfo { raw: [0; 4] });
+        r.add(alive, &mut ev);
+        let mut alive2 = frag(2, 2, 1, 4, 8, &s[4..]);
+        alive2.inline.status = Some(crate::parse::StatusInfo { raw: [0; 4] });
+        assert!(matches!(r.add(alive2, &mut ev), FragOutcome::Complete(..)));
+        let mut late = frag(2, 2, 1, 4, 8, &s[4..]);
+        late.inline.status = Some(crate::parse::StatusInfo { raw: [0, 0, 0, 3] });
+        let n = ev.len();
+        r.add(late, &mut ev);
+        assert_eq!(
+            ev[n..].iter().map(|e| e.kind).collect::<Vec<_>>(),
+            [FragmentEventKind::ConflictingInlineQos(
+                crate::wire::PID_STATUS_INFO
+            )]
+        );
+        r.clear();
+        assert!(matches!(
+            r.add(frag(1, 2, 1, 4, 8, &s[4..]), &mut ev),
+            FragOutcome::Pending
+        ));
+    }
+
+    #[test]
+    fn the_completed_memory_is_bounded() {
+        let mut r = FragmentReassembler::new(ReassemblyLimits::default());
+        let s = sample(8);
+        for sn in 0..(COMPLETED_MEMORY_SAMPLES as u64 + 10) {
+            add(&mut r, frag(sn, 1, 1, 4, 8, &s[..4]));
+            add(&mut r, frag(sn, 2, 1, 4, 8, &s[4..]));
+        }
+        assert_eq!(r.done.len(), COMPLETED_MEMORY_SAMPLES);
+        // The oldest were forgotten: a fragment of sample 0 starts anew.
+        assert!(matches!(
+            add(&mut r, frag(0, 2, 1, 4, 8, &s[4..])),
+            FragOutcome::Pending
+        ));
+        assert!(matches!(
+            add(
+                &mut r,
+                frag(COMPLETED_MEMORY_SAMPLES as u64 + 9, 1, 1, 4, 8, &s[..4])
+            ),
+            FragOutcome::LateCopy
+        ));
+        // Large samples respect the byte bound.
+        let big = sample(60 * 1024);
+        for sn in 1000..1010u64 {
+            add(
+                &mut r,
+                frag(sn, 1, 1, 30 * 1024, 60 * 1024, &big[..30 * 1024]),
+            );
+            add(
+                &mut r,
+                frag(sn, 2, 1, 30 * 1024, 60 * 1024, &big[30 * 1024..]),
+            );
+        }
+        assert!(r.done_bytes <= COMPLETED_MEMORY_BYTES);
+    }
+
+    #[test]
+    fn defaults_hold_a_real_cyclone_sedp_burst() {
+        // Cyclone DDS with FragmentSize 256 B (fixtures/captures/ros2-jazzy/
+        // cyclonedds_frag_run1.pcap) sends the first fragment of every SEDP
+        // sample of a participant (13 publications, 12 subscriptions) before
+        // any second fragment; with the old quota of 4 per source every one
+        // of them was evicted before it could complete.
+        let mut r = FragmentReassembler::new(ReassemblyLimits::default());
+        let mut ev = Vec::new();
+        for sn in 1..=40 {
+            r.add(frag_from([0xc; 12], sn, 1, 1, 4, 8, &[1; 4]), &mut ev);
+        }
+        assert!(ev.is_empty(), "{ev:?}");
+        for sn in 1..=40 {
+            assert!(matches!(
+                add(&mut r, frag_from([0xc; 12], sn, 2, 1, 4, 8, &[1; 4])),
+                FragOutcome::Complete(..)
+            ));
+        }
+        assert_eq!(r.pending_samples(), 0);
+    }
+
     #[test]
     fn per_source_quota_evicts_only_that_source() {
-        let mut r = FragmentReassembler::new(ReassemblyLimits::default());
+        let mut r = FragmentReassembler::new(small());
         let mut ev = Vec::new();
         // A legitimate sample from source A.
         add(&mut r, frag_from([0xa; 12], 1, 1, 1, 4, 8, &[1; 4]));
@@ -901,7 +1170,7 @@ mod tests {
 
     #[test]
     fn many_spoofed_sources_do_not_evict_an_older_sample() {
-        let mut r = FragmentReassembler::new(ReassemblyLimits::default());
+        let mut r = FragmentReassembler::new(small());
         let mut ev = Vec::new();
         add(&mut r, frag_from([0xa; 12], 1, 1, 1, 4, 8, &[1; 4]));
         for i in 0..1000u32 {
@@ -946,7 +1215,7 @@ mod tests {
     fn stale_samples_are_evicted_first() {
         let limits = ReassemblyLimits {
             stale_after_fragments: 10,
-            ..Default::default()
+            ..small()
         };
         let mut r = FragmentReassembler::new(limits);
         let mut ev = Vec::new();

@@ -32,7 +32,7 @@
 //! | When | Rule | Severity |
 //! |---|---|---|
 //! | a sample on a motion / feedback topic that cannot be inspected: undecodable payload (truncated, unknown encapsulation id (anything outside XTypes 1.3 Table 60), `PL_CDR`, over a cap, malformed string), unknown type name, a type of the wrong role for the topic (feedback type on a command channel or the reverse), non-standard payload, malformed DATA / inline QoS, fragments refused / evicted / conflicting, per-datagram sample cap | [`rules::MOTION_UNDECODABLE_SAMPLE`] | Medium, rate limited (`robot.motion.undecodable_sample` bucket), dedup by channel + writer + reason |
-//! | DATA addressed to a reader entity announced on a motion / feedback topic, from a writer **never announced via SEDP** (cannot be attributed, so cannot be checked against the profile) | [`rules::MOTION_UNATTRIBUTED_SAMPLE`] | High, dedup by writer + topic |
+//! | DATA addressed to a reader entity announced on a motion / feedback topic, from a writer **never announced via SEDP** (cannot be attributed, so cannot be checked against the profile) and still unannounced [`MotionOptions::unattributed_grace`] after its first sample (or at [`crate::Pipeline::finish`]) | [`rules::MOTION_UNATTRIBUTED_SAMPLE`] | High, dedup by writer + topic |
 //! | a decoded sample whose writer prefix is bound to other source IPs than the one it came from (binding table, [`crate::binding`]): somebody speaks for a profiled writer | [`rules::MOTION_SAMPLE_SOURCE_MISMATCH`] | Critical on a command channel, High on a feedback topic |
 //! | a decoded sample whose writer prefix is **contested** (claimed by SPDP from two hosts, unpinned): no source is trusted for it | [`rules::MOTION_SAMPLE_SOURCE_MISMATCH`] | Critical on a command channel, High on a feedback topic |
 //! | a decoded sample whose writer was announced via SEDP but whose participant has **no binding** (no SPDP seen, not pinned, binding expired) or whose datagram source IP does not parse, while the binding check is on | [`rules::MOTION_UNATTRIBUTED_SAMPLE`] | High |
@@ -66,6 +66,20 @@
 //!   participant re-announces it (SEDP is not periodic): its samples are not
 //!   decoded meanwhile, and samples to a known motion reader raise the
 //!   unattributed finding. `MotionStats::unattributed` counts them.
+//! * **Data before discovery is normal.** A DDS writer matches a remote
+//!   reader as soon as it receives the *reader's* SEDP and may send DATA
+//!   before its own SEDP publication reaches that host: a real Fast DDS 2.14
+//!   capture (`fixtures/captures/ros2-jazzy/fastrtps_gz_baseline.pcap`)
+//!   shows the Gazebo bridge's `/odom` writer sending three samples 47 ms
+//!   before announcing itself. So an unknown writer is first only noted;
+//!   the finding is raised when it is still unannounced
+//!   [`MotionOptions::unattributed_grace`] (default
+//!   [`DEFAULT_UNATTRIBUTED_GRACE`]) after its first sample, or at
+//!   [`crate::Pipeline::finish`]. Its samples are never decoded either way;
+//!   the grace only delays (by at most that window) the finding for a
+//!   writer that never announces itself. At most
+//!   [`MAX_PENDING_UNATTRIBUTED`] writers are held; beyond that the finding
+//!   is raised at once.
 //! * Shared-memory transports, RTPS over TCP and DDS-Security payload /
 //!   submessage protection are invisible or opaque. Protected payloads on a
 //!   motion topic fail to decode and are reported as undecodable.
@@ -75,6 +89,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
+use std::time::{Duration, Instant};
 
 use robodr_cdr::{DecodeAnomaly, DecodeError, EventContext, Limits, MotionRole, Registry};
 use robodr_events::graph::{demangle, RosNameKind};
@@ -115,6 +130,11 @@ pub const MAX_MAX_ENDPOINTS: usize = 65_536;
 pub const MAX_READINGS_PER_ENDPOINT: usize = 4;
 /// Unattributed addresses examined per datagram (the rest are counted).
 const MAX_UNATTRIBUTED_PER_DATAGRAM: usize = 64;
+/// Default [`MotionOptions::unattributed_grace`].
+pub const DEFAULT_UNATTRIBUTED_GRACE: Duration = Duration::from_secs(2);
+/// Unannounced writers held in the grace window at once; beyond that the
+/// finding is raised immediately.
+pub const MAX_PENDING_UNATTRIBUTED: usize = 256;
 
 /// Knobs of the motion decode path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,6 +156,10 @@ pub struct MotionOptions {
     pub cdr_limits: Limits,
     /// Caps of the user-data walker (reassembly, samples per datagram).
     pub user_data: UserDataLimits,
+    /// How long DATA from a writer not (yet) announced via SEDP is only
+    /// noted before [`rules::MOTION_UNATTRIBUTED_SAMPLE`] is raised (see the
+    /// module docs, "Data before discovery is normal"). Zero = at once.
+    pub unattributed_grace: Duration,
 }
 
 impl Default for MotionOptions {
@@ -148,6 +172,7 @@ impl Default for MotionOptions {
             max_readers: DEFAULT_MAX_ENDPOINTS,
             cdr_limits: Limits::default(),
             user_data: UserDataLimits::default(),
+            unattributed_grace: DEFAULT_UNATTRIBUTED_GRACE,
         }
     }
 }
@@ -238,6 +263,9 @@ pub struct MotionStats {
     /// DATA to a motion reader from a writer never announced via SEDP, and
     /// decoded samples whose writer's participant has no binding.
     pub unattributed: u64,
+    /// Writers whose DATA arrived before their SEDP announcement, announced
+    /// within [`MotionOptions::unattributed_grace`] (no finding).
+    pub announced_late: u64,
     /// Decoded samples from a source IP outside the writer's binding, or
     /// from a writer whose prefix is contested.
     pub source_mismatch: u64,
@@ -355,7 +383,33 @@ pub struct MotionTracker {
     /// Reader entity ids of motion / feedback readers → number of such
     /// readers (for DATA addressed without INFO_DST).
     motion_reader_entities: HashMap<EntityId, u32>,
+    /// Unannounced writers seen sending to a motion reader, in their grace
+    /// window ([`MotionOptions::unattributed_grace`]).
+    pending_unattributed: HashMap<Guid, PendingUnattributed>,
     stats: MotionStats,
+}
+
+/// A writer whose DATA reached a motion reader before any SEDP of it.
+#[derive(Debug, Clone)]
+struct PendingUnattributed {
+    first: Instant,
+    reader: Guid,
+    topic: String,
+    src_ip: String,
+}
+
+fn unattributed_deviation(topic: &str, reader: &Guid, writer: &Guid) -> Deviation {
+    Deviation::new(
+        rules::MOTION_UNATTRIBUTED_SAMPLE,
+        Severity::High,
+        format!(
+            "DATA for the {} reader {} from writer {}, which was never announced via SEDP: the \
+             sample cannot be attributed or checked against the profile",
+            short(topic),
+            hex_guid(reader),
+            hex_guid(writer)
+        ),
+    )
 }
 
 impl std::fmt::Debug for MotionTracker {
@@ -404,6 +458,8 @@ pub(crate) struct DatagramCtx<'a> {
     pub ip: Option<IpAddr>,
     pub ingress: Ingress,
     pub capture_ns: u64,
+    /// The pipeline's clock (grace window of unannounced writers).
+    pub now: Instant,
 }
 
 impl MotionTracker {
@@ -414,6 +470,7 @@ impl MotionTracker {
             writers: Table::new(opts.max_writers),
             readers: Table::new(opts.max_readers),
             motion_reader_entities: HashMap::new(),
+            pending_unattributed: HashMap::new(),
             stats: MotionStats::default(),
             opts,
         }
@@ -421,6 +478,25 @@ impl MotionTracker {
 
     pub fn options(&self) -> &MotionOptions {
         &self.opts
+    }
+
+    /// Unannounced writers whose grace window ended by `now` (or all of them
+    /// with `now = None`, end of input): their findings, each with the
+    /// source IP of its first sample, oldest first.
+    pub(crate) fn expire_unattributed(&mut self, now: Option<Instant>) -> Vec<(Deviation, String)> {
+        let grace = self.opts.unattributed_grace;
+        let mut due: Vec<(Guid, PendingUnattributed)> = Vec::new();
+        self.pending_unattributed.retain(|w, p| {
+            let expired = now.is_none_or(|t| t.saturating_duration_since(p.first) >= grace);
+            if expired {
+                due.push((*w, p.clone()));
+            }
+            !expired
+        });
+        due.sort_by(|a, b| a.1.first.cmp(&b.1.first).then(a.0.cmp(&b.0)));
+        due.into_iter()
+            .map(|(w, p)| (unattributed_deviation(&p.topic, &p.reader, &w), p.src_ip))
+            .collect()
     }
 
     pub fn stats(&self) -> MotionStats {
@@ -483,6 +559,9 @@ impl MotionTracker {
                 };
                 match ep.kind {
                     EndpointKind::Writer => {
+                        if self.pending_unattributed.remove(&guid).is_some() {
+                            self.stats.announced_late += 1;
+                        }
                         self.writers.learn(guid, reading);
                     }
                     EndpointKind::Reader => {
@@ -575,17 +654,22 @@ impl MotionTracker {
 
         self.stats.unattributed += unattributed.len() as u64 + unattributed_more;
         for (a, topic) in unattributed {
-            out.deviations.push(Deviation::new(
-                rules::MOTION_UNATTRIBUTED_SAMPLE,
-                Severity::High,
-                format!(
-                    "DATA for the {} reader {} from writer {}, which was never announced via \
-                     SEDP: the sample cannot be attributed or checked against the profile",
-                    short(&topic),
-                    hex_guid(&a.reader),
-                    hex_guid(&a.writer)
-                ),
-            ));
+            if self.opts.unattributed_grace.is_zero()
+                || (self.pending_unattributed.len() >= MAX_PENDING_UNATTRIBUTED
+                    && !self.pending_unattributed.contains_key(&a.writer))
+            {
+                out.deviations
+                    .push(unattributed_deviation(&topic, &a.reader, &a.writer));
+                continue;
+            }
+            self.pending_unattributed
+                .entry(a.writer)
+                .or_insert_with(|| PendingUnattributed {
+                    first: ctx.now,
+                    reader: a.reader,
+                    topic,
+                    src_ip: ctx.src_ip.to_string(),
+                });
         }
         for an in &report.anomalies {
             let Some(a) = an.address else { continue };

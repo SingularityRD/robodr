@@ -14,7 +14,12 @@
 //! - IPv6 UDP directly after the fixed header, same port/magic rule;
 //! - IPv6 packets whose first next-header is an extension header (incl.
 //!   fragment): cBPF cannot loop over the chain, so user space decides. These
-//!   are rare on a robot LAN.
+//!   are rare on a robot LAN;
+//! - TCP (IPv4 first fragments / unfragmented, IPv6 directly after the fixed
+//!   header) to or from the Zenoh port 7447 with **SYN, FIN or RST** set,
+//!   cut to [`ZENOH_SNAP_LEN`] bytes: connection set-up and tear-down of a
+//!   middleware the sensor cannot decode, so user space can report the blind
+//!   spot ([`crate::middleware`]) without copying the session's data stream.
 //!
 //! Everything else is dropped. The user-space [`RtpsFilter`] is always applied
 //! afterwards as well, so the kernel filter is an optimisation, never the
@@ -72,6 +77,9 @@ pub const BPF_MAXINSNS: usize = 4096;
 /// Snap length returned on accept: keep the whole packet.
 pub const ACCEPT_LEN: u32 = 0x0004_0000;
 
+/// Snap length of an accepted Zenoh TCP control segment (headers only).
+pub const ZENOH_SNAP_LEN: u32 = 128;
+
 /// A validated-on-construction cBPF program.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BpfProgram {
@@ -118,6 +126,7 @@ const fn jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
 const LDB_ABS: u16 = BPF_LD | BPF_B | BPF_ABS; // 0x30
 const LDH_ABS: u16 = BPF_LD | BPF_H | BPF_ABS; // 0x28
 const LDH_IND: u16 = BPF_LD | BPF_H | BPF_IND; // 0x48
+const LDB_IND: u16 = BPF_LD | BPF_B | BPF_IND; // 0x50
 const LDW_IND: u16 = BPF_LD | BPF_W | BPF_IND; // 0x40
 const LDXB_MSH: u16 = BPF_LDX | BPF_B | BPF_MSH; // 0xb1
 const LDX_IMM: u16 = BPF_LDX | BPF_W | BPF_IMM; // 0x01
@@ -163,7 +172,8 @@ impl BpfProgram {
         for (at, i) in self.insns.iter().enumerate() {
             let next = at + 1;
             match i.code {
-                LDB_ABS | LDH_ABS | LDH_IND | LDW_IND | LDXB_MSH | LDX_IMM | RSH_K | RET_K => {}
+                LDB_ABS | LDH_ABS | LDH_IND | LDB_IND | LDW_IND | LDXB_MSH | LDX_IMM | RSH_K
+                | RET_K => {}
                 JEQ_K | JGT_K | JGE_K | JSET_K => {
                     if next + usize::from(i.jt.max(i.jf)) >= n {
                         return Err(BpfError::JumpOutOfRange { at });
@@ -207,6 +217,10 @@ impl BpfProgram {
                     None => return 0,
                 },
                 LDH_IND => match load(u64::from(x) + u64::from(i.k), 2) {
+                    Some(v) => a = v,
+                    None => return 0,
+                },
+                LDB_IND => match load(u64::from(x) + u64::from(i.k), 1) {
                     Some(v) => a = v,
                     None => return 0,
                 },
@@ -257,7 +271,7 @@ pub fn rtps_filter_program(filter: &RtpsFilter) -> Result<BpfProgram, BpfError> 
     let v4 = [
         stmt(LDB_ABS, 9),           // protocol
         jump(JEQ_K, 17, 1, 0),      // UDP?
-        drop,                       //
+        stmt(JA, 0),                // patched: not UDP -> the TCP/v4 block
         stmt(LDH_ABS, 6),           // flags + fragment offset
         jump(JSET_K, 0x3fff, 0, 1), // MF or offset != 0 -> fragment
         accept,                     //
@@ -266,6 +280,7 @@ pub fn rtps_filter_program(filter: &RtpsFilter) -> Result<BpfProgram, BpfError> 
     ];
     p.push(jump(JEQ_K, 4, 0, v4.len() as u8));
     let ja_at = p.len() + v4.len() - 1;
+    let tcp4_ja = p.len() + 2;
     p.extend_from_slice(&v4);
     // IPv6 block (A still holds the version).
     p.extend_from_slice(&[
@@ -278,10 +293,11 @@ pub fn rtps_filter_program(filter: &RtpsFilter) -> Result<BpfProgram, BpfError> 
         jump(JEQ_K, 43, 3, 0), // routing        -> accept
         jump(JEQ_K, 60, 2, 0), // dest options   -> accept
         jump(JEQ_K, 51, 1, 0), // AH             -> accept
-        drop,
+        stmt(JA, 0),           // patched: anything else -> the TCP/v6 block
         accept,
         stmt(LDX_IMM, 40),
     ]);
+    let tcp6_ja = p.len() - 3;
     // Shared UDP check, X = offset of the UDP header.
     let shared = p.len();
     p[ja_at].k = (shared - (ja_at + 1)) as u32;
@@ -301,6 +317,38 @@ pub fn rtps_filter_program(filter: &RtpsFilter) -> Result<BpfProgram, BpfError> 
         p.push(accept);
     }
     p.push(drop);
+    // TCP control segments of the Zenoh port (see the module docs). A holds
+    // the IPv4 protocol / IPv6 next header on entry.
+    let zenoh = u32::from(crate::middleware::ZENOH_PORT);
+    let tcp4 = p.len();
+    p.extend_from_slice(&[
+        jump(JEQ_K, 6, 0, 4), // TCP?
+        stmt(LDH_ABS, 6),
+        jump(JSET_K, 0x1fff, 2, 0), // non-first fragment: no ports
+        stmt(LDXB_MSH, 0),
+        stmt(JA, 5), // -> tcp shared (after the v6 block)
+        drop,
+    ]);
+    let tcp6 = p.len();
+    p.extend_from_slice(&[
+        jump(JEQ_K, 6, 0, 2), // TCP?
+        stmt(LDX_IMM, 40),
+        stmt(JA, 1), // -> tcp shared
+        drop,
+    ]);
+    p.extend_from_slice(&[
+        stmt(LDB_IND, 13),        // TCP flags
+        jump(JSET_K, 0x07, 0, 5), // FIN | SYN | RST
+        stmt(LDH_IND, 0),         // source port
+        jump(JEQ_K, zenoh, 4, 0), //
+        stmt(LDH_IND, 2),         // destination port
+        jump(JEQ_K, zenoh, 2, 0), //
+        drop,
+        drop,
+        stmt(RET_K, ZENOH_SNAP_LEN),
+    ]);
+    p[tcp4_ja].k = (tcp4 - (tcp4_ja + 1)) as u32;
+    p[tcp6_ja].k = (tcp6 - (tcp6_ja + 1)) as u32;
     BpfProgram::new(p)
 }
 
@@ -346,7 +394,7 @@ mod tests {
             (0x15, 0, 8, 4),      // jeq #4, else +8 to IPv6
             (0x30, 0, 0, 9),      // ldb [9]
             (0x15, 1, 0, 17),     // jeq #17
-            (0x06, 0, 0, 0),      // ret #0
+            (0x05, 0, 0, i[5].k), // ja -> TCP/v4 (checked below)
             (0x28, 0, 0, 6),      // ldh [6]
             (0x45, 0, 1, 0x3fff), // jset #0x3fff
             (0x06, 0, 0, ACCEPT_LEN),
@@ -357,8 +405,17 @@ mod tests {
         for (n, &(code, jt, jf, k)) in expect_head.iter().enumerate() {
             assert_eq!(i[n], SockFilter { code, jt, jf, k }, "instruction {n}");
         }
-        // Shared tail: ldh [x+2], 2 ranges * 3, ld [x+8], jeq RTPS, ret, ret 0.
+        assert_eq!(i[20].code, JA, "other IPv6 next headers -> TCP/v6");
+        // Shared tail: ldh [x+2], 2 ranges * 3, ld [x+8], jeq RTPS, ret, ret 0,
+        // then the 6 + 4 + 9 instructions of the Zenoh TCP blocks.
         let shared = &i[23..];
+        assert_eq!(6 + i[5].k as usize, 23 + 11, "ja lands on the TCP/v4 block");
+        assert_eq!(
+            21 + i[20].k as usize,
+            23 + 11 + 6,
+            "ja lands on the TCP/v6 block"
+        );
+        let shared = &shared[..shared.len() - 19];
         assert_eq!(
             shared[0],
             SockFilter {
@@ -429,9 +486,47 @@ mod tests {
                 code: 0x06,
                 jt: 0,
                 jf: 0,
-                k: 0
+                k: ZENOH_SNAP_LEN
             }
         );
+        assert_eq!(LDB_IND, 0x50); // ldb [x + k]
+    }
+
+    /// TCP with the given flags (no options): synth builds UDP, patched.
+    fn tcp(src: Ipv4Addr, sport: u16, dport: u16, flags: u8) -> Vec<u8> {
+        let mut p = synth::ipv4_udp(src, src, sport, dport, &[0u8; 12]);
+        p[9] = 6;
+        p[20 + 13] = flags;
+        p
+    }
+
+    #[test]
+    fn zenoh_tcp_control_segments_pass_cut_data_segments_do_not() {
+        let prog = rtps_filter_program(&RtpsFilter::default()).unwrap();
+        let a = Ipv4Addr::new(10, 0, 0, 1);
+        for flags in [0x02, 0x12, 0x11, 0x04] {
+            assert_eq!(prog.run(&tcp(a, 40000, 7447, flags)), ZENOH_SNAP_LEN);
+            assert_eq!(prog.run(&tcp(a, 7447, 40000, flags)), ZENOH_SNAP_LEN);
+        }
+        // Data / pure ACK segments, and other ports: dropped.
+        assert_eq!(prog.run(&tcp(a, 40000, 7447, 0x18)), 0);
+        assert_eq!(prog.run(&tcp(a, 40000, 7447, 0x10)), 0);
+        assert_eq!(prog.run(&tcp(a, 40000, 22, 0x02)), 0);
+        // A non-first IPv4 fragment carries no TCP header.
+        let mut frag = tcp(a, 40000, 7447, 0x02);
+        frag[7] = 1;
+        assert_eq!(prog.run(&frag), 0);
+        // IPv6 TCP directly after the fixed header.
+        let s6: Ipv6Addr = "fd00::1".parse().unwrap();
+        let mut v6 = synth::ipv6_udp(s6, s6, 40000, 7447, &[], &[0u8; 12]);
+        v6[6] = 6;
+        v6[40 + 13] = 0x02;
+        assert_eq!(prog.run(&v6), ZENOH_SNAP_LEN);
+        v6[40 + 13] = 0x18;
+        assert_eq!(prog.run(&v6), 0);
+        // What the kernel keeps is still recognised in user space.
+        let cut = &tcp(a, 40000, 7447, 0x02)[..ZENOH_SNAP_LEN.min(32) as usize];
+        assert!(crate::middleware::classify_tcp_frame(crate::decode::LinkType::RAW, cut).is_some());
     }
 
     #[test]

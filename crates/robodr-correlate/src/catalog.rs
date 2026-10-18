@@ -52,6 +52,7 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     "robot.capture.ip_fragment_duplicate_conflict",
     "robot.capture.bad_checksum",
     "robot.capture.not_udp",
+    "robot.capture.unsupported_middleware",
     "robot.ros2.ambiguous_discovery",
     "robot.rtps.discovery_not_inspected",
     "robot.sensor.findings_capped",

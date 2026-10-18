@@ -1,0 +1,5 @@
+# Gazebo / Zenoh lab image (tag robodr-gz:jazzy): the base lab image
+# (Dockerfile, tag robodr-cap:jazzy) plus headless Gazebo Harmonic via
+# ros_gz, robot_state_publisher, rmw_zenoh_cpp and trajectory_msgs.
+FROM robodr-cap:jazzy
+RUN apt-get update && apt-get install -y --no-install-recommends ros-jazzy-ros-gz-sim-demos ros-jazzy-ros-gz-bridge ros-jazzy-ros-gz-sim ros-jazzy-robot-state-publisher ros-jazzy-rmw-zenoh-cpp ros-jazzy-trajectory-msgs && rm -rf /var/lib/apt/lists/*

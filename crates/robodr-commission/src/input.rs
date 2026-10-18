@@ -371,6 +371,11 @@ pub struct CaptureDiagnostics {
     /// writer's participant never announced itself from (not learned).
     #[serde(default)]
     pub motion_samples_unattributed: u64,
+    /// Packets of a robot middleware RoboDR does not decode: Zenoh
+    /// (`rmw_zenoh_cpp`, TCP/UDP 7447, scouting UDP 7446). Nothing in them
+    /// was learned.
+    #[serde(default)]
+    pub zenoh_packets: u64,
 }
 
 impl CaptureDiagnostics {
@@ -384,7 +389,8 @@ impl CaptureDiagnostics {
 
     /// Sum of two runs' counters.
     pub fn add(&mut self, o: &CaptureDiagnostics) {
-        let pairs: [(&mut u64, u64); 19] = [
+        let pairs: [(&mut u64, u64); 20] = [
+            (&mut self.zenoh_packets, o.zenoh_packets),
             (&mut self.motion_samples, o.motion_samples),
             (
                 &mut self.motion_samples_undecodable,
@@ -651,6 +657,7 @@ impl<R: Read> EventSource for PcapSource<R> {
             motion_samples: motion.0,
             motion_samples_undecodable: motion.1,
             motion_samples_unattributed: motion.2,
+            zenoh_packets: c.zenoh,
         })
     }
 }
