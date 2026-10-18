@@ -22,6 +22,9 @@
 #   CARGO_FLAGS="..."      extra cargo flags, e.g. "--offline"
 #   REPRO_WORK=dir         scratch dir (default: mktemp -d)
 #   SOURCE_DATE_EPOCH      override the commit timestamp
+#   CARGO_BUILD_TARGET     cross build (e.g. aarch64-unknown-linux-gnu): the
+#                          binaries are then read from target/<triple>/release
+#                          (cargo's layout); unset = native target/release
 #   REPRO_ALLOW_NO_LOCK=1  local experiments only: without a committed lock,
 #                          let EACH copy resolve on its own (no --locked); the
 #                          result does not prove a release is rebuildable
@@ -75,6 +78,10 @@ excludes="$(cd "${dirs[0]}" && cargo metadata --no-deps --format-version 1 "${lo
     python3 "$here/ci-pure-excludes.py" -)"
 read -r -a exclude_args <<<"$excludes"
 
+# cargo puts --target / CARGO_BUILD_TARGET output under target/<triple>/.
+rel="release"
+[[ -n "${CARGO_BUILD_TARGET:-}" ]] && rel="$CARGO_BUILD_TARGET/release"
+
 build() {
     local d="$1"
     (
@@ -87,7 +94,7 @@ build() {
 }
 
 list_bins() {
-    find "$1/target/release" -maxdepth 1 -type f -name 'robodr-*' -perm -u+x ! -name '*.d' \
+    find "$1/target/$rel" -maxdepth 1 -type f -name 'robodr-*' -perm -u+x ! -name '*.d' \
         -printf '%f\n' 2>/dev/null | LC_ALL=C sort
 }
 
@@ -122,8 +129,8 @@ fi
 rc=0
 : >"$out/SHA256SUMS"
 for b in "${bins_a[@]}"; do
-    ha="$(sha256sum "${dirs[0]}/target/release/$b" | cut -d' ' -f1)"
-    hb="$(sha256sum "${dirs[1]}/target/release/$b" | cut -d' ' -f1)"
+    ha="$(sha256sum "${dirs[0]}/target/$rel/$b" | cut -d' ' -f1)"
+    hb="$(sha256sum "${dirs[1]}/target/$rel/$b" | cut -d' ' -f1)"
     if [[ "$ha" == "$hb" ]]; then
         echo "repro: OK   $b $ha" >&2
         printf '%s  %s\n' "$ha" "$b" >>"$out/SHA256SUMS"

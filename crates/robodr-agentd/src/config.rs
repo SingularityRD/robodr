@@ -300,7 +300,7 @@ pub struct BlackboxSection {
     /// its status: a cut of the newest records combined with a rollback of
     /// `head.json`, or a wiped store, is then not detectable on the unit.
     /// A deployment against an attacker with write access needs the
-    /// `tpm_nv_counter` kind (or a remote receiver, not offered here).
+    /// `tpm_nv_counter` or the `remote` kind.
     #[serde(default)]
     pub head_anchor: Option<HeadAnchorConfig>,
 }
@@ -341,6 +341,22 @@ pub enum HeadAnchorConfig {
         #[serde(default)]
         timeout_ms: Option<u64>,
     },
+    /// `robodr_blackbox::RemoteHeadAnchor`: marks go to a
+    /// `robodr-anchor-receiver` off the unit (unit id = `robot.id`), which
+    /// is queried at open with a nonce and answers signed. Needs an Ed25519
+    /// black-box key and a reverse channel to the receiver; see
+    /// `docs/OPERATIONS.md`.
+    Remote {
+        /// Receiver `host:port` (an IP literal avoids DNS at open).
+        address: String,
+        /// The receiver's Ed25519 public key file (absolute; outside
+        /// `blackbox.dir` and `spool.dir`).
+        receiver_public_key: PathBuf,
+        /// Bound on connect, write and read each; default 2000,
+        /// 100..=30000.
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
 }
 
 impl HeadAnchorConfig {
@@ -349,7 +365,58 @@ impl HeadAnchorConfig {
         match self {
             HeadAnchorConfig::File { .. } => "file",
             HeadAnchorConfig::TpmNvCounter { .. } => "tpm_nv_counter",
+            HeadAnchorConfig::Remote { .. } => "remote",
         }
+    }
+
+    /// The client settings and the receiver's verifying key of a `remote`
+    /// anchor for unit `unit` (validated, the key file loaded; no network).
+    /// `None` for other kinds.
+    pub fn remote_config(
+        &self,
+        unit: &str,
+    ) -> Option<
+        Result<
+            (
+                robodr_blackbox::RemoteAnchorConfig,
+                robodr_blackbox::Ed25519VerifyingKey,
+            ),
+            String,
+        >,
+    > {
+        let HeadAnchorConfig::Remote {
+            address,
+            receiver_public_key,
+            timeout_ms,
+        } = self
+        else {
+            return None;
+        };
+        Some((|| {
+            use robodr_blackbox::remote_anchor as ra;
+            ra::check_address(address).map_err(|e| format!("blackbox.head_anchor.address: {e}"))?;
+            require_abs(
+                "blackbox.head_anchor.receiver_public_key",
+                receiver_public_key,
+            )?;
+            let key = robodr_blackbox::KeyFile::load_public(receiver_public_key)
+                .and_then(|k| k.ed25519_verifying_key())
+                .map_err(|e| {
+                    format!(
+                        "blackbox.head_anchor.receiver_public_key {}: {e}",
+                        sanitize_path(&receiver_public_key.display().to_string())
+                    )
+                })?;
+            let mut c = robodr_blackbox::RemoteAnchorConfig::new(address.clone(), unit);
+            match *timeout_ms {
+                Some(ms) if !(100..=30_000).contains(&ms) => {
+                    return Err("blackbox.head_anchor.timeout_ms must be 100..=30000".into())
+                }
+                Some(ms) => c.timeout = std::time::Duration::from_millis(ms),
+                None => {}
+            }
+            Ok((c, key))
+        })())
     }
 
     /// The anchor settings of a `tpm_nv_counter` (validated; does not touch
@@ -1136,6 +1203,33 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
                     }
                 }
             }
+        }
+        Some(
+            a @ HeadAnchorConfig::Remote {
+                receiver_public_key,
+                ..
+            },
+        ) => {
+            // The receiver checks marks with the unit's *public* key.
+            if key_algorithm != robodr_blackbox::sign_ed25519::ED25519 {
+                return Err(format!(
+                    "blackbox.head_anchor kind remote needs an ed25519 black-box key (the \
+                     receiver verifies marks with its public half), got {key_algorithm}"
+                ));
+            }
+            let p = resolve_path(receiver_public_key);
+            for (what, d) in [
+                ("spool.dir", &config.spool.dir),
+                ("blackbox.dir", &config.blackbox.dir),
+            ] {
+                if p.starts_with(resolve_path(d)) {
+                    return Err(format!(
+                        "blackbox.head_anchor.receiver_public_key must not be inside {what}"
+                    ));
+                }
+            }
+            a.remote_config(&config.robot.id)
+                .unwrap_or_else(|| Err("not a remote anchor".into()))?;
         }
     }
     Ok(Resolved {

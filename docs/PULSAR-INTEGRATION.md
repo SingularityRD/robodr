@@ -595,8 +595,15 @@ Host: Debian 13.5 under WSL2, kernel `6.18.33.2-microsoft-standard-WSL2`
 | 10. stop / start / restart (`POST /modules/robodr-sensor-ros2/{stop,start,restart}`) | live capture on `lo` + SPDP socket: one `robodr-dgram-src` thread while running, none after `stop`, exactly one after each `start` / `restart`. With pcap replay, `start` after the `Failed` state replays once more (39 -> 78 threats, no duplicates) |
 | 11. robot runtime (multicast join on the robot's interface, coexistence with each DDS vendor on the same host, capture under load) | **open**: WSL2 is not a robot. The SPDP socket joined `239.255.0.1:7400` on `0.0.0.0` |
 
-Not done: arm64, a systemd unit run, `pulsar` CLI subcommands (the HTTP API
-behind them was used directly).
+arm64 (2026-10-18): `robodr-pulsard` and `robodr-sensor-ros2` cross-compile
+for `aarch64-unknown-linux-gnu` without changes, with the eBPF probes built
+against `include/aarch64/vmlinux.h`. Their tests pass under qemu-user, and
+`robodr-pulsard --version` runs there. The probes were not loaded on an arm64
+kernel: qemu-user has no BPF (docs/BUILD.md, "arm64 (cross-compiled,
+2026-10-18)").
+
+Not done: eBPF on an arm64 kernel, a systemd unit run, `pulsar` CLI
+subcommands (the HTTP API behind them was used directly).
 
 ## 8. Build prerequisites
 

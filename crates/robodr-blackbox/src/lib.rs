@@ -27,6 +27,9 @@
 //!   [`HeadAnchor`].
 //! - [`tpm_anchor`]: [`TpmNvCounterAnchor`], a [`HeadAnchor`] on a TPM 2.0 NV
 //!   monotonic counter (through `tpm2-tools`) plus a signed sidecar file.
+//! - [`remote_anchor`]: [`RemoteHeadAnchor`], a [`HeadAnchor`] kept off the
+//!   unit by an [`AnchorReceiver`] (`robodr-anchor-receiver`), with signed
+//!   marks and nonce-bound, receiver-signed answers.
 //! - [`verify`]: [`verify::verify_segments`] / [`verify::verify_dir`].
 //! - [`export`]: [`export::Bundle`], [`export::Receiver`], checkpoints.
 //!
@@ -63,6 +66,7 @@ pub mod crypto;
 pub mod export;
 pub mod keys;
 pub mod record;
+pub mod remote_anchor;
 pub mod sign;
 pub mod sign_ed25519;
 pub mod store;
@@ -73,6 +77,7 @@ pub mod verify;
 pub use export::{Ack, Anchor, Bundle, Checkpoint, Receiver, SignedCursor};
 pub use keys::{KeyFile, KeyFileError, Keyring};
 pub use record::{ChainIdentity, Hash, Record, RecordKind};
+pub use remote_anchor::{AnchorReceiver, RemoteAnchorConfig, RemoteHeadAnchor, RemoteMark};
 pub use sign::{HmacSha256Key, Signer, Verifier};
 pub use sign_ed25519::{Ed25519SigningKey, Ed25519VerifyingKey};
 pub use store::{

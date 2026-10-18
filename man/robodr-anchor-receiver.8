@@ -1,0 +1,90 @@
+.\" robodr-anchor-receiver(8). Source of truth: the module docs of
+.\" crates/robodr-blackbox/src/bin/robodr-anchor-receiver.rs and
+.\" crates/robodr-blackbox/src/remote_anchor.rs. Keep them in sync.
+.TH ROBODR\-ANCHOR\-RECEIVER 8 "2026-10-18" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
+.SH NAME
+robodr\-anchor\-receiver \- off\-unit home of black\-box head marks (remote head anchor)
+.SH SYNOPSIS
+.B robodr\-anchor\-receiver serve
+.B \-\-config
+.I FILE
+.br
+.B robodr\-anchor\-receiver ingest
+.B \-\-config
+.I FILE
+.IR MARKFILE ...
+.br
+.B robodr\-anchor\-receiver status
+.B \-\-config
+.I FILE
+.SH DESCRIPTION
+Runs on a base station or fleet host, never on the robot it anchors. Each
+robot's black box (\fBrobodr\-agentd\fR(8) with
+\fB"head_anchor": {"kind": "remote"}\fR) sends its head marks, signed with
+the black\-box Ed25519 key; the receiver verifies them under the robot's
+public key and keeps, per robot, the highest mark durably (atomic replace
+and fsync before it answers). At start the robot asks for the held mark
+with a fresh nonce; the answer is signed with the receiver's own Ed25519
+key, and the robot checks it and the mark (under its own key). A robot
+whose log was cut and whose state files were rolled back therefore reports
+the truncation at its next start.
+.PP
+A mark lower than the held one, a second mark at the held position with
+another hash (fork) and a mark whose signature does not verify are refused
+and recorded as alerts: a line on stderr (the journal), a line in
+.IB state_dir /alerts.jsonl
+(bounded at 16 MiB) and a per\-robot counter. A stored state file that does
+not verify at start blocks that robot (every request refused) until an
+operator investigates; it is never reset silently.
+.SH COMMANDS
+.TP
+.B serve
+Listen on \fBlisten\fR (one JSON request line per connection,
+protocol \fBrobodr\-anchor/v1\fR, at most 16 KiB; slow peers are cut after
+\fBio_timeout_ms\fR; at most \fBmax_connections\fR at a time). Prints
+\fBlistening on ADDR\fR on stdout once bound.
+.TP
+.B ingest
+Apply mark files written on a robot by
+.B robodr\-blackbox anchor\-mark
+and carried one way (diode, media), with the same rule. Detect\-only: the
+robot never learns of a rollback, the receiver does. Needs the state
+directory's lock (not while \fBserve\fR runs on it).
+.TP
+.B status
+Print, as JSON, the held mark and alert count per robot. Read\-only; works
+while \fBserve\fR runs.
+.SH CONFIGURATION
+JSON, unknown fields refused, paths absolute:
+.PP
+.nf
+{"listen": "0.0.0.0:7461",
+ "state_dir": "/var/lib/robodr\-anchor\-receiver",
+ "key_file": "/run/credentials/robodr\-anchor\-receiver.service/receiver.key",
+ "units": [{"unit": "ugv\-07",
+            "public_key": "/etc/robodr\-anchor\-receiver/units/ugv\-07.pub"}],
+ "max_connections": 64, "io_timeout_ms": 5000}
+.fi
+.PP
+\fBkey_file\fR is an Ed25519 secret key file (\fBrobodr\-blackbox keygen\fR,
+mode 0600); the robots get its \fB.pub\fR. \fBunit\fR is the robot id;
+\fBpublic_key\fR the robot's black\-box public key file (a key bound to a
+device must name that robot).
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+\fBingest\fR: at least one mark was refused (an alert was recorded).
+.TP
+.B 2
+Usage, configuration, key, state or I/O error.
+.SH NOTES
+No TLS: marks and answers are authenticated with Ed25519, not encrypted (they
+carry hashes and sequence numbers, no evidence content). A network attacker
+can drop marks or answers (the robot counts anchor failures) but cannot make
+the receiver go back or a robot accept a lower mark.
+.SH SEE ALSO
+.BR robodr\-agentd (8),
+.BR robodr\-blackbox (1)

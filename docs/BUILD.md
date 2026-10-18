@@ -249,7 +249,9 @@ scripts/ci-repro.sh dist/repro
 builds the pure workspace twice in release mode, from two copies of the tree at
 paths of different length, and requires every executable
 `target/release/robodr-*` to be bit-identical. It writes the hashes to
-`dist/repro/SHA256SUMS` (CI uploads it as `release-sha256-<sha>`). Controlled:
+`dist/repro/SHA256SUMS` (CI uploads it as `release-sha256-<sha>`). For a
+cross build, set `CARGO_BUILD_TARGET` (e.g. `aarch64-unknown-linux-gnu`); the
+script then compares `target/<triple>/release/robodr-*`. Controlled:
 
 | Source of drift | Control |
 |---|---|
@@ -354,11 +356,152 @@ Differences from the ubuntu-24.04 runner, not reflected in the workflow:
 - Debian 13 has no `clang-20`/`lld-20`/`llvm-20` in its default archive, so
   the run used the workflow's fallback path (distribution clang/lld/llvm 19).
   Whether the runner gets clang-20 from its apt sources is still unverified.
-- arm64 (`ubuntu-24.04-arm`) was not built. The `prepare` (tag/draft
+- arm64 was not built on 2026-10-17; it was cross-built on 2026-10-18 (next
+  section), not on the `ubuntu-24.04-arm` runner. The `prepare` (tag/draft
   release) and `publish` (minisign, upload) jobs need GitHub and secrets and
   were not run; nor were the `upload-artifact` steps.
 - The fuzz job writes newly found inputs into the tracked `fuzz/corpus/`
   directories; harmless on a runner, but clean them up after a local run.
+
+### arm64 (cross-compiled, 2026-10-18)
+
+First arm64 build of any kind. No arm64 machine was available, so the
+`release.yml` build job was replayed **cross-compiled** on the x86_64 host
+above, and the tests ran under **qemu-user**. Commit: the merge `afdc880`
+(main `fc1066e` plus the two fixes below); `SOURCE_DATE_EPOCH` = its commit
+time.
+
+Host additions: `rustup target add aarch64-unknown-linux-gnu` (1.98.1),
+`gcc-aarch64-linux-gnu` / `g++-aarch64-linux-gnu` 14.2.0,
+`libc6-dev-arm64-cross`, multiarch `libsqlite3-dev:arm64` 3.46.1 and
+`libssl-dev:arm64` 3.5.7 (`dpkg --add-architecture arm64`), `qemu-user`
+10.0.11 + `qemu-user-binfmt`; eBPF still with clang 19 (eBPF bytecode is
+arch-independent; `bpf-builder` picks `include/aarch64/vmlinux.h` and
+`-D__TARGET_ARCH_arm64` from `CARGO_CFG_TARGET_ARCH`, as in Pulsar's own
+`Cross.toml` builds). Environment:
+
+```bash
+export CARGO_BUILD_TARGET=aarch64-unknown-linux-gnu
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="qemu-aarch64 -L /usr/aarch64-linux-gnu"
+export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+export PKG_CONFIG_ALLOW_CROSS=1
+export PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+```
+
+The release steps were then run with the workflow's own commands; the only
+differences are `CARGO_BUILD_TARGET` and `--bin-dir
+target/aarch64-unknown-linux-gnu/release` for `build-deb.sh`.
+
+| Step | Result | Notes |
+|---|---|---|
+| `cargo build --workspace --all-targets --target aarch64-...` | pass | Every member, `robodr-pulsard` with its eBPF probes included; no source change was needed |
+| `cargo test --workspace --no-fail-fast` under qemu | 1946 passed, 3 failed, 14 ignored | Same 1949 tests and 14 ignored as amd64. The 3 failures come from qemu, not arm64 (below) |
+| repro (`scripts/ci-repro.sh`, `REPRO_REQUIRE_BINARIES=1`) | pass | 10 pure `robodr-*` binaries bit-identical across the two paths |
+| release build (two invocations, remap flags) | pass | |
+| released pure binaries == reproduced | pass | `sha256sum --strict -c` in `target/aarch64-unknown-linux-gnu/release` |
+| Cargo.lock unchanged | pass | |
+| SBOM (`SBOM_TOOL=cyclonedx`) | pass | 19 SBOMs, all pass `--check` |
+| `.deb` (`ROBODR_DEB_REQUIRE` as in the workflow) | pass after fix | `Architecture: arm64`; every binary ELF AArch64; `Depends: libc6 (>= 2.39), ...` (was 2.35, wrong: see fixes) |
+| offline bundle, SBOM tarball, `SHA256SUMS-arm64` | pass | `install-bundle.sh verify` on the extracted bundle: checksums OK |
+| `file` on the 11 binaries | pass | `ELF 64-bit LSB pie executable, ARM aarch64`, interpreter `/lib/ld-linux-aarch64.so.1`, stripped |
+| qemu smoke runs | pass | `robodr-pulsard --version`: `robodr-pulsard 0.1.0-alpha.1` / `pulsar: 0.11.0-alpha.1 (commit 4796504...)`; `robodr-agentd --version` and `robodr-commission --version` print `0.1.0-alpha.1` |
+| second, independent run from a fresh clone at another path | pure binaries identical | Same 10 pure-binary hashes in all four builds (two repro copies and one release build per run). `robodr-pulsard` and the three packaged artefacts differ between the two checkouts (below) |
+
+The three test failures, each checked:
+
+- `robodr-capture` `afpacket::tests::open_or_skip_without_privileges`: the
+  AF_PACKET socket opened and the filter attached (the WSL root user has
+  `CAP_NET_RAW`), but qemu-user does not translate
+  `getsockopt(SOL_PACKET, PACKET_STATISTICS)` and returns `EOPNOTSUPP`
+  (seen with `QEMU_STRACE=1`). Every live AF_PACKET test in
+  `tests/live_afpacket.rs` passed under qemu. Nothing was skipped.
+- `robodr-blackbox` `tpm_anchor::tests::real_runner_kills_a_hanging_tool_and_reads_output`:
+  asserts that running a missing tool fails. qemu-user runs glibc's
+  `posix_spawn` (`clone(CLONE_VM|CLONE_VFORK)`) in a way that cannot report
+  the child's exec error, so `Command::output()` of a missing program
+  returns `Ok` with exit status 127. A 3-line program shows it (`spawn Ok,
+  status 127` under qemu, `No such file or directory` natively).
+- `robodr-threat-forward` `tests::offer_never_blocks_on_a_stalled_peer`:
+  a 2 s bound on 20 000 offers; the debug build under qemu takes 2.1 to
+  2.2 s (amd64 debug: 0.16 s). The arm64 release build under qemu passes
+  (0.13 s).
+
+Reproducibility beyond the pure binaries (the same holds for amd64; nothing
+here is arm64-specific):
+
+- `robodr-pulsard` is **not** reproducible across checkout paths: the eBPF
+  objects that clang builds carry absolute source paths
+  (`<checkout>/vendor/pulsar/crates/bpf-builder/include/*.bpf.h`, ~100
+  strings), which `--remap-path-prefix` does not reach. A possible fix that
+  does not touch Pulsar: point `CLANG` at a wrapper that adds
+  `-ffile-prefix-map=$PWD=/build/robodr`. Not done.
+- The cargo-cyclonedx SBOMs carry `path+file://<checkout>/crates/...`
+  bom-refs. They are byte-identical when regenerated at the same path, not
+  across paths.
+- So the `.deb`, the bundle and the SBOM tarball are reproducible only from
+  the same checkout path.
+
+Run 1 (`/root/wt-arm64`), `SHA256SUMS-arm64`:
+
+```text
+4398340d8b334114441bf1c3b5cd46a06aedf45df2e4cf62161acb865f478093  robodr_0.1.0~alpha.1-1_arm64.deb
+4b31ece83e42fc7ac01eb051c7a6a3036b66efedcb1cb9aa1affab7c00eada9f  robodr-0.1.0-alpha.1-arm64-offline.tar.gz
+1c28dc181c8ccfb90b8d4dc111f39c4bc87338dcf1a3efb724b4ae9f98d16a2a  robodr-0.1.0-alpha.1-arm64-sbom.tar.gz
+```
+
+Pure binaries (`dist/repro/SHA256SUMS`, identical in both runs):
+
+```text
+a1da04575841d4b443715feb41cec67fdc3ec3498b8d26e820e8305607cac1af  robodr-agentd
+63405ad05a6e94953266128124bb77e21f68e838dc90c5a3c079cb533cf99944  robodr-anchor-receiver
+e755064661bc9e64e06948bb33efe45344d25a09707c67958a4f77835fb7586b  robodr-blackbox
+e95fce5d8289430da5ae53c3081cd0f1396e4a3225ce2f99f57fad504a76ed3a  robodr-commission
+96e54e1fbd8462abebda14cc01eb8055bb91b08d05bdb46431543b1f7352e436  robodr-diode-pack
+6d5d6261260ad8989777e9d65f85d881e3067a56a1b43bd5f9b26adf3222894f  robodr-diode-unpack
+1802add2b3e83b6f33812378a8e494e1394f64d6eff67aa4946c6f2cc6c70a6c  robodr-kafka-publish
+cef67368e2c4664206adab1ca3d5e9db987386ac7697f75b8adf957f98c6e219  robodr-replay
+f6f302bd517c7dfbb5fbdfd65723d65bd30501ef04f67f24f36584c602f4db03  robodr-ros2-watch
+68b54c28e9142e01521eafed18dfd3867882db69b20c246b9fe4ee5eee60c04c  robodr-spool-export
+```
+
+These are cross-built with Debian 13's toolchain and glibc 2.41 headers. A
+native `ubuntu-24.04-arm` build links a different C runtime (`crt*.o`,
+`libgcc`), so its hashes are not expected to match these.
+
+Fixes made by the arm64 run:
+
+- `packaging/build-deb.sh`: the hard-coded `libc6 (>= 2.35)` was wrong.
+  `robodr-agentd` and `robodr-blackbox` (both arches, built on any glibc 2.39
+  host: Debian 13, ubuntu-24.04 and its arm runner) need `GLIBC_2.39`.
+  Rust std references `pidfd_spawnp` / `pidfd_getpid` weakly, but the
+  version need is not marked weak (`readelf -V`: `Flags: none`), so ld.so
+  would refuse to start them on Ubuntu 22.04 (2.35) or Debian 12 (2.36),
+  which dpkg would have accepted. The floor is now the newest `GLIBC_x.y`
+  the packaged binaries need (at least 2.35), read with `readelf -V`.
+  Supporting glibc < 2.39 robots needs a build on an older runner
+  (ubuntu-22.04); that is a release decision, not made here.
+- `packaging/build-deb.sh`: checks every binary's ELF `e_machine` against
+  `--arch` (62 x86-64, 183 AArch64), so an amd64 `target/release` cannot be
+  packaged as arm64 by mistake.
+- `scripts/ci-repro.sh`: honours `CARGO_BUILD_TARGET` (binaries under
+  `target/<triple>/release`). Unset, as on both workflow runners, nothing
+  changes.
+
+`release.yml` is unchanged: its arm64 leg builds natively on
+`ubuntu-24.04-arm`, and the scripts above work for that leg as is.
+
+Not checked on arm64:
+
+- eBPF probes loading and running on an arm64 kernel. qemu-user has no BPF
+  and the probes were only compiled. Pulsar's own CI loads them on arm64
+  kernels; RoboDR's `robodr-pulsard` has never run on one.
+- Any run on real arm64 hardware (a robot companion computer), including
+  timing-sensitive code at native speed and AF_PACKET `PACKET_STATISTICS`.
+- The native `ubuntu-24.04-arm` runner: clang-20 from its apt sources, the
+  native build and its hashes.
+- That ld.so really refuses the binaries on glibc < 2.39. This follows from
+  the `readelf -V` output above and was not run on an old system.
 
 ## Verification status
 
@@ -393,7 +536,9 @@ cargo-cyclonedx / cargo-deny / shellcheck installed):
   the full graph's licenses, `nightly-2026-09-01` + cargo-fuzz 0.13.1,
   shellcheck, and a real 1.87 build of the pure crates. Still unverified:
   that `clang-20` / `llvm-20` install from the ubuntu-24.04 runner's apt
-  sources (the local run used the fallback, clang 19), and the arm64 runner.
+  sources (the local run used the fallback, clang 19), and the arm64 runner
+  (arm64 was only cross-built and tested under qemu-user, see
+  [arm64](#arm64-cross-compiled-2026-10-18)).
 - `Cargo.lock` is committed (2026-10-17); the bootstrap path of the
   `lockfile` job is therefore no longer exercised.
 - MSRV: passed `cargo +1.87.0 check` locally on 2026-10-17; the job is still

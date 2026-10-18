@@ -32,6 +32,26 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 - `MotionOptions::unattributed_grace` (default 2 s),
   `MotionStats::announced_late`.
 
+- Remote head anchor for the black box
+  (`robodr_blackbox::remote_anchor`): `RemoteHeadAnchor` on the unit sends
+  every head mark, signed with the black-box key over (unit, chain id, seq,
+  hash, key id), to the new std-only `robodr-anchor-receiver` daemon on a
+  base station, which verifies it under the unit's public key, keeps the
+  highest mark per unit durably (atomic replace + fsync before it answers)
+  and refuses and alerts lower marks, forks and bad signatures
+  (`alerts.jsonl`, log line, per-unit counter). At open the unit queries the
+  held mark with a fresh nonce; the answer is signed by the receiver's
+  Ed25519 key and the mark inside verified under the unit's own key, so a
+  man-in-the-middle can neither feed a lower mark nor replay an old answer
+  (dropping it is an anchor failure). Marks are delivered by a background
+  thread with a coalescing one-slot queue, so `append` never waits for the
+  network. `robodr-agentd` `blackbox.head_anchor` kind `remote`
+  (`address`, `receiver_public_key`, `timeout_ms`; Ed25519 black-box key
+  required). Detect-only mode for diode-only sites:
+  `robodr-blackbox anchor-mark` + `robodr-anchor-receiver ingest`. Packaging:
+  `robodr-anchor-receiver.service` (base station, disabled) and
+  `robodr-anchor-receiver(8)`. Tested with a real receiver process over
+  loopback, not across a real network.
 - `robodr-kafka-publish` / the std-only Kafka producer run against real
   Apache Kafka brokers for the first time: `scripts/kafka-it.sh` starts a
   single-node KRaft broker in docker (`apache/kafka:3.9.1` by default,
@@ -365,6 +385,30 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   copies (`FragmentReassembler::late_copies`) and reports copies that
   differ as conflicts.
 - TCP to / from port 7447 is no longer counted as `robot.capture.not_udp`.
+- First arm64 build (2026-10-18), cross-compiled on x86_64 with tests run
+  under qemu-user; record in `docs/BUILD.md`, "arm64 (cross-compiled,
+  2026-10-18)". The whole workspace, `robodr-pulsard` and its eBPF probes
+  included, builds for `aarch64-unknown-linux-gnu` without source changes.
+  Tests: 1946 of 1949 pass; the 3 failures come from qemu (no
+  `PACKET_STATISTICS`, posix_spawn exec errors not reported, debug timing),
+  not from arm64. The release steps produce an arm64 `.deb`, offline bundle,
+  SBOM tarball and `SHA256SUMS-arm64`. The 10 pure binaries are
+  bit-identical across paths and runs. eBPF on an arm64 kernel is still
+  untested. Fixed by that run:
+  - `packaging/build-deb.sh` declared `libc6 (>= 2.35)`, but
+    `robodr-agentd` and `robodr-blackbox` built on a glibc 2.39 host (the
+    ubuntu-24.04 runners included, both arches) need `GLIBC_2.39`
+    (non-weak version need from Rust std's `pidfd_spawnp`). On an older
+    glibc they would install but not start. The libc6 floor now comes from
+    the packaged binaries (`readelf -V`).
+  - `packaging/build-deb.sh` refuses binaries whose ELF machine does not
+    match `--arch`.
+  - `scripts/ci-repro.sh` honours `CARGO_BUILD_TARGET` for cross builds.
+    The workflow's native path is unchanged.
+  - Not fixed: `robodr-pulsard` (clang-built eBPF objects) and the
+    cargo-cyclonedx SBOMs embed the checkout path, so the `.deb`, the bundle
+    and the SBOM tarball are reproducible only from the same path (same on
+    amd64).
 
 - `robodr-export` Kafka producer (found against a real broker): a batch
   refused with `MESSAGE_TOO_LARGE` only because of its total size (topic

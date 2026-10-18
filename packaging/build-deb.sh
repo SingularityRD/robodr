@@ -13,6 +13,8 @@
 #             robodr-agentd, robodr-blackbox, robodr-diode-pack,
 #             robodr-diode-unpack, robodr-spool-export,
 #             robodr-kafka-publish (pure crates; the release requires them)
+#             robodr-anchor-receiver (pure; base-station side of the remote
+#             head anchor, installed with its unit when built)
 # A unit file is only installed together with its binary. ROBODR_DEB_REQUIRE
 # (space separated) makes optional binaries mandatory; the release workflow
 # sets it so a release can never silently ship without the daemon.
@@ -21,7 +23,10 @@
 #   SOURCE_DATE_EPOCH   timestamp for every file
 #   DEB_DEPENDS         Depends: field (default below; Rust binaries link
 #                       glibc + libgcc_s, robodr-pulsard also libsqlite3
-#                       unless built with Pulsar's sqlite3-vendored feature)
+#                       unless built with Pulsar's sqlite3-vendored feature;
+#                       the default libc6 floor is the newest GLIBC_x.y
+#                       version the packaged binaries need, at least 2.35,
+#                       read with readelf)
 #   DEB_MAINTAINER      Maintainer: field
 #   ROBODR_DEB_REQUIRE  extra binaries that must be present
 set -euo pipefail
@@ -53,7 +58,10 @@ if [[ -z "${SOURCE_DATE_EPOCH:-}" ]]; then
     SOURCE_DATE_EPOCH="$(git -C "$root" log -1 --format=%ct 2>/dev/null || echo 0)"
 fi
 export SOURCE_DATE_EPOCH
-depends="${DEB_DEPENDS:-libc6 (>= 2.35), libgcc-s1, libsqlite3-0, systemd (>= 247)}"
+# Default Depends; the libc6 floor is raised below to the newest GLIBC_x.y
+# symbol version any packaged binary requires.
+libc_floor=2.35
+depends_rest="libgcc-s1, libsqlite3-0, systemd (>= 247)"
 maintainer="${DEB_MAINTAINER:-RoboDR maintainers <robodr-maintainers@invalid>}"
 
 mkdir -p "$out"
@@ -63,9 +71,22 @@ trap 'rm -rf "$stage"' EXIT
 pkg="$stage/robodr_${deb_version}_${arch}"
 mkdir -p "$pkg/DEBIAN"
 
+# ELF e_machine (little-endian u16 at offset 18) each binary must carry, so an
+# amd64 build tree can never be packaged as arm64 (or the reverse), e.g. a
+# cross build that passes target/release instead of target/<triple>/release.
+case "$arch" in amd64) want_machine=62 ;; arm64) want_machine=183 ;; esac
+elf_machine() {
+    od -An -tu2 -j18 -N2 "$1" | tr -d '[:space:]'
+}
+
 install_bin() { # name dest-dir required(0/1)
     local name="$1" dest="$2" required="$3"
     if [[ -x "$bin_dir/$name" ]]; then
+        if [[ "$(head -c4 "$bin_dir/$name" | od -An -tx1 | tr -d '[:space:]')" != 7f454c46 ||
+            "$(elf_machine "$bin_dir/$name")" != "$want_machine" ]]; then
+            echo "build-deb: $bin_dir/$name is not an ELF binary for $arch (e_machine $(elf_machine "$bin_dir/$name"), want $want_machine)" >&2
+            exit 1
+        fi
         install -D -m 0755 "$bin_dir/$name" "$pkg/$dest/$name"
         echo "build-deb: + $dest/$name" >&2
         return 0
@@ -112,6 +133,11 @@ if install_bin robodr-agentd usr/sbin 0; then
     install -D -m 0644 "$here/systemd/robodr-agentd.service.d/20-finding-key.conf.example" \
         "$pkg/usr/share/doc/robodr/examples/robodr-agentd.service.d/20-finding-key.conf.example"
 fi
+# Base-station side of the remote head anchor (not enabled by the package).
+if install_bin robodr-anchor-receiver usr/bin 0; then
+    install -D -m 0644 "$here/systemd/robodr-anchor-receiver.service" \
+        "$pkg/$units/robodr-anchor-receiver.service"
+fi
 
 install -D -m 0644 "$here/tmpfiles.d/robodr.conf" "$pkg/usr/lib/tmpfiles.d/robodr.conf"
 install -D -m 0644 "$here/sysusers.d/robodr.conf" "$pkg/usr/lib/sysusers.d/robodr.conf"
@@ -154,6 +180,25 @@ fi
 # group), regular files keep the modes set above.
 find "$pkg" -type d -exec chmod 0755 {} +
 [[ -d "$pkg/etc/robodr" ]] && chmod 0750 "$pkg/etc/robodr"
+
+# libc6 floor from the binaries' version needs (readelf -V reads any ELF
+# arch). Rust std references e.g. pidfd_spawnp@GLIBC_2.39 when linked on a
+# glibc >= 2.39 host; the reference is weak, but its version need is not, so
+# ld.so refuses to start the binary on an older glibc. A hard-coded floor
+# below that would let dpkg install a package that cannot run.
+if [[ -n "${DEB_DEPENDS:-}" ]]; then
+    depends="$DEB_DEPENDS"
+else
+    command -v readelf >/dev/null || { echo "build-deb: readelf (binutils) not found; needed for the libc6 floor (or set DEB_DEPENDS)" >&2; exit 2; }
+    need="$(find "$pkg/usr" -type f \( -path "$pkg/usr/bin/*" -o -path "$pkg/usr/sbin/*" \) | LC_ALL=C sort |
+        xargs -r readelf -V --wide 2>/dev/null | sed -n 's/.*Name: GLIBC_\([0-9][0-9.]*\).*/\1/p' |
+        sort -uV | tail -n1)"
+    if [[ -n "$need" ]]; then
+        libc_floor="$(printf '%s\n%s\n' "$libc_floor" "$need" | sort -V | tail -n1)"
+    fi
+    echo "build-deb: libc6 (>= $libc_floor)" >&2
+    depends="libc6 (>= $libc_floor), $depends_rest"
+fi
 
 installed_kb="$(du -sk --exclude=DEBIAN "$pkg" | cut -f1)"
 sed -e "s|@VERSION@|$deb_version|" -e "s|@ARCH@|$arch|" \

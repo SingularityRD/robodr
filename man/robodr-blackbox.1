@@ -37,6 +37,15 @@ robodr\-blackbox \- create black\-box keys, verify and inspect RoboDR black\-box
 .RB [ \-\-json ]
 .RB [ \-\-limit
 .IR N ]
+.PP
+.B robodr\-blackbox anchor\-mark
+.I DIR
+.B \-\-key
+.I FILE
+.B \-\-unit
+.I ID
+.RB [ \-\-out
+.IR FILE ]
 .SH DESCRIPTION
 The RoboDR black box is an append\-only, hash\-chained, signed log of evidence
 records split into segment files. This tool manages its keys and checks logs.
@@ -108,6 +117,19 @@ kind, flags, time, payload preview), at most
 with
 .BR \-\-limit .
 No signature is checked: it is a viewer, not a verdict.
+.TP
+.B anchor\-mark
+One\-way remote head anchor: read
+.IR DIR /head.json,
+check that it is signed by the recorder's secret key file
+.BR \-\-key ,
+and write the signed mark of robot
+.B \-\-unit
+to
+.I FILE
+(created exclusively) or standard output, to be carried through the diode
+and applied by
+.BR "robodr\-anchor\-receiver ingest" (8).
 .SH EXIT STATUS
 .TP
 .B 0
@@ -132,4 +154,5 @@ key can verify and also forge evidence; migrate at the next key rotation.
 .BR robodr\-agentd (8),
 .BR robodr\-replay (1),
 .BR robodr\-diode\-unpack (1),
+.BR robodr\-anchor\-receiver (8),
 /usr/share/doc/robodr/OPERATIONS.md
