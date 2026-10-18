@@ -63,9 +63,22 @@ trap 'rm -rf "$stage"' EXIT
 pkg="$stage/robodr_${deb_version}_${arch}"
 mkdir -p "$pkg/DEBIAN"
 
+# ELF e_machine (little-endian u16 at offset 18) each binary must carry, so an
+# amd64 build tree can never be packaged as arm64 (or the reverse), e.g. a
+# cross build that passes target/release instead of target/<triple>/release.
+case "$arch" in amd64) want_machine=62 ;; arm64) want_machine=183 ;; esac
+elf_machine() {
+    od -An -tu2 -j18 -N2 "$1" | tr -d '[:space:]'
+}
+
 install_bin() { # name dest-dir required(0/1)
     local name="$1" dest="$2" required="$3"
     if [[ -x "$bin_dir/$name" ]]; then
+        if [[ "$(head -c4 "$bin_dir/$name" | od -An -tx1 | tr -d '[:space:]')" != 7f454c46 ||
+            "$(elf_machine "$bin_dir/$name")" != "$want_machine" ]]; then
+            echo "build-deb: $bin_dir/$name is not an ELF binary for $arch (e_machine $(elf_machine "$bin_dir/$name"), want $want_machine)" >&2
+            exit 1
+        fi
         install -D -m 0755 "$bin_dir/$name" "$pkg/$dest/$name"
         echo "build-deb: + $dest/$name" >&2
         return 0
