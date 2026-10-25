@@ -171,9 +171,8 @@ sprint, AC'leri karşılanmadan kapanmaz.
   ([licenses] `private = { ignore = true }`, kendi crate'lerimizi muaf tut, üçüncü taraf
   allowlist'i aynen); `LICENSES/LICENSE-GPL-2.0` yalnız eBPF probları için kalır,
   `LICENSES/LICENSE-APACHE-2.0` vendored Pulsar için kalır; README/BUILD.md lisans
-  bölümleri, `packaging/deb` copyright dosyası, `.deb` `Section`/lisans alanı; GitHub
-  repo görünürlüğü **private** (açıksa, daha önce Apache-2.0 ile yayımlanmış
-  commit'lerin lisansı geri alınamaz — hukuka not).
+  bölümleri, `packaging/deb` copyright dosyası, `.deb` `Section`/lisans alanı. GitHub
+  reposu zaten **private** (2026-10-25 teyit; Apache-2.0 ile kamuya yayımlanmış sürüm yok).
   **AC:** `cargo deny check licenses` yeşil; `rg -n "Apache-2.0" --glob '!vendor/**'
   --glob '!LICENSES/**'` yalnız üçüncü taraf/Pulsar bağlamında; paket metadata'sı
   tescilli.
