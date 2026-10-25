@@ -12,3 +12,7 @@ description = "Motion Firewall core (pure, deterministic, allocation-free hot pa
 
 [dependencies]
 robodr-events = { workspace = true }
+# JSON configuration (FirewallConfig::from_json); configuration time only,
+# never on the hot path.
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -146,8 +146,38 @@
 //! `check` within its deadline. A gateway **crash** is outside this crate: the
 //! platform's command timeout (e.g. a `cmd_vel` watchdog) then applies.
 //!
+//! ## Low-level joint frames (Unitree `LowCmd` style)
+//!
+//! A second entry point, [`Firewall::check_joint`], decides on
+//! [`JointCommand`]s: a fixed-capacity [`JointFrame`] of up to
+//! [`MAX_MOTORS`] (35) motor slots, each with a position target `q`, a
+//! velocity target `dq`, a feed-forward torque `tau`, gains `kp` / `kd` and
+//! an enable [`MotorMode`], plus the decoder's CRC verdict. Such channels
+//! are configured with a [`JointChannelSpec`] (a per-slot envelope:
+//! position range, `|dq|` / `|tau|` bounds, gain ranges, enabled flag; CRC
+//! requirement, expected rate window, staleness deadline) and compiled with
+//! [`Policy::compile_with_joints`] (or [`FirewallConfig`] from JSON). They
+//! share the firewall's sources, clock, statistics and event buffer, and get
+//! the channel ids after the twist / joint-velocity channels, so existing ids
+//! never change. The verdict ([`JointVerdict`]) has the same three shapes:
+//! pass (bit-exact), limit (each field clamped into its envelope — a
+//! magnitude is only ever lowered, `q` projected onto its range, a gain
+//! never raised), reject (with a substitute).
+//!
+//! **Humanoid rule.** For a [`Morphology::Humanoid`] platform a rejection on
+//! a joint channel never substitutes a zero-torque or damping frame (the
+//! robot would fall): it holds the last accepted frame (velocity targets
+//! zeroed), or emits nothing if there is none yet. Compilation refuses
+//! [`FailBehaviour::ZeroVelocity`] and [`FaultPolicy::FailSafe`] for such a
+//! platform ([`ConfigError::UnsafeSubstitute`]); the engine applies the rule
+//! regardless of configuration. Other morphologies keep every option (the
+//! damping frame for `ZeroVelocity`; see [`Morphology`] for the trade-off).
+//!
+//! See the crate README ("Low-level joint frames") for the decision table and
+//! the rule ids.
+//!
 //! ## Determinism
-//! `check` performs no heap allocation (proved by `tests/alloc_free.rs` with
+//! `check` and `check_joint` perform no heap allocation (proved by `tests/alloc_free.rs` with
 //! a counting global allocator), contains no `unwrap`/indexing/unchecked
 //! integer arithmetic (enforced by clippy `deny` lints on the engine module)
 //! and only bounded loops. See the crate README for measured latency.
@@ -156,16 +186,25 @@ mod command;
 mod config;
 mod engine;
 mod events;
+mod joint;
+mod joint_config;
+mod joint_engine;
 mod verdict;
 
 pub use command::{ChannelId, Command, JointVelocities, Motion, SourceId, Twist, Vec3, MAX_JOINTS};
 pub use config::{
     ChannelKind, ChannelSpec, ConfigError, FailBehaviour, FaultPolicy, ForeignSourceAction,
-    PlatformConfig, Policy, RateLimit, IDENTITY_SOURCE_PREFIX, MAX_CHANNELS, MAX_SOURCES,
+    Morphology, PlatformConfig, Policy, RateLimit, IDENTITY_SOURCE_PREFIX, MAX_CHANNELS,
+    MAX_SOURCES,
 };
 pub use engine::{Firewall, Stats};
 pub use events::{policy_mode, reject_rule, rules, EventAction, EventBuffer, FirewallEvent};
-pub use verdict::{LimitReasons, RejectReason, Substitute, SubstituteKind, Verdict, WouldHave};
+pub use joint::{JointCommand, JointFrame, MotorCmd, MotorMode, MAX_MOTORS};
+pub use joint_config::{FirewallConfig, JointChannelSpec, JointRate, MotorLimits};
+pub use verdict::{
+    JointLimitReasons, JointSubstitute, JointVerdict, JointWouldHave, LimitReasons, RejectReason,
+    Substitute, SubstituteKind, Verdict, WouldHave,
+};
 
 #[cfg(test)]
 mod tests;

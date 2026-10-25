@@ -34,7 +34,9 @@ DDS writer GUIDs and republishes verdicts is a later step (see "Integration" bel
 
 - **Own command type.** A `Command` holds either a `Twist` (linear and angular
   `Vec3`) or `JointVelocities`, a fixed `[f64; 32]` plus a length. It contains no
-  `Vec` and no `String`, and it is `Copy`.
+  `Vec` and no `String`, and it is `Copy`. Low-level joint frames have their own
+  `Copy` type, `JointCommand` / `JointFrame` (up to 35 motor slots inline), and
+  their own entry point, `check_joint` (see "Low-level joint frames" below).
 - **Interned identity.** Endpoint GUIDs and channel names are turned into
   `SourceId(u16)` and `ChannelId(u16)` when the policy is compiled. The hot path
   only compares integers and tests a 256-bit allow-set per channel. Each allowed
@@ -141,9 +143,10 @@ A substitute always carries `source = SourceId::FIREWALL` and `stamp = now`.
 
 `ForeignSourceAction` controls what happens when the source is unknown or not authorised:
 
-- **`Substitute`** (default) emits the substitute. This favours the safe state, but
+- **`Drop`** (default) emits nothing. The legitimate stream keeps control and the attempt is still recorded.
+- **`Substitute`** emits the substitute, at most once per
+  `foreign_substitute_min_interval_ns` per channel. This favours the safe state, but
   it means a spoofer can stop the robot (denial of service).
-- **`Drop`** emits nothing. The legitimate stream keeps control and the attempt is still recorded.
 
 **Observe mode.** Observe mode applies when the profile is not locked, or when the
 platform is set to pass-through. Every verdict is then
@@ -167,6 +170,134 @@ deadline. If the gateway **crashes**, the decision is outside this crate and the
 platform's own command timeout (for example a `cmd_vel` watchdog) applies. The
 gateway must be deployed so that this timeout exists.
 
+## Low-level joint frames (Unitree `LowCmd`)
+
+**Status: decision core only.** `check_joint` decides on decoded frames; there is
+no in-path gateway yet that subscribes to `rt/lowcmd`, decodes the Unitree IDL,
+calls `check_joint` and re-publishes. Nothing here has been run against a robot.
+
+Unitree's low-level interface sends one frame per control tick (500 Hz to 1 kHz)
+with, for every motor slot, a position target `q`, a velocity target `dq`, a
+feed-forward torque `tau`, the gains `kp` / `kd` and an enable `mode`; the motor
+driver computes `τ = kp·(q − q_meas) + kd·(dq − dq_meas) + tau`. Layouts covered by
+`MAX_MOTORS = 35`:
+
+| Platform | Message | Slots | Actuated |
+|---|---|---|---|
+| Go1, A1 (legacy) | `unitree_legged_sdk` `LowCmd` | 20 on the wire (or 12 if the decoder passes only the used ones) | 12 |
+| Go2, B2 | `go` `LowCmd` | 20 | 12 |
+| H1 | `go` `LowCmd` | 20 | 19 |
+| G1, H1-2 (and H2-style `hg`) | `hg` `LowCmd` | 35 | up to 29 (G1) |
+
+**API.** `JointCommand { source, channel, stamp_ns, frame: JointFrame }`, where
+`JointFrame` holds up to 35 `MotorCmd { mode, q, dq, tau, kp, kd }` inline plus
+`crc_ok: Option<bool>` (the decoder's CRC verdict: valid, invalid, not checked).
+`Firewall::check_joint(&cmd, now) -> JointVerdict` (`Passed` / `Limited` /
+`Rejected { reason, substitute }`, same meaning as `Verdict`), and
+`Firewall::joint_fault_verdict` for a deadline miss. Twist and joint-velocity
+channels and `check` are unchanged.
+
+**Configuration.** A `JointChannelSpec` per channel, compiled by
+`Policy::compile_with_joints(profile, platform, specs, joint_specs)`
+(`Policy::compile` is that with no joint channel), or a JSON `FirewallConfig`
+(`FirewallConfig::from_json`, unknown fields refused):
+
+- `motors`: one `MotorLimits` per slot (the slot count every frame must carry):
+  `enabled`, `q_min`/`q_max`, `dq_max` (tightened by the profile envelope's
+  `max_joint_speed`), `tau_max`, `kp_min`/`kp_max`, `kd_min`/`kd_max`. An enabled
+  slot has no "unconstrained": every bound is required, finite, `>= 0`, ranges
+  ordered. Unused slots stay `enabled: false`.
+- `require_crc` (default `true`), `rate { expected_hz, min_interval_ns,
+  max_interval_ns }` (optional; `min ≤ period ≤ max`), `max_age_ns` (staleness
+  deadline, default 20 ms, > 0), `max_future_ns` (2 ms), `hard_reject_factor`
+  (2.0), `damping_kd` (0).
+- `PlatformConfig::morphology`: `humanoid`, `quadruped`, `wheeled`, `arm` or
+  `other` (default; existing configs keep their behaviour).
+- `FaultPolicy::FailHold` (new): on a fault, hold the last accepted joint frame.
+
+Examples: `config/firewall.unitree-g1.example.json` (humanoid, 35 slots, 29
+enabled) and `config/firewall.unitree-go2.example.json` (quadruped, 20 slots, 12
+enabled). Their joint limits are illustrative values in the shape of the public
+URDFs, and the allowed source is a synthetic GUID: take the limits, gains and
+writer identity from the OEM data for the exact hardware revision.
+
+**Decision table** (`check_joint`; stages in order, first rejection wins; `f` =
+`hard_reject_factor`):
+
+| # | Stage | Condition | Verdict | Rule (severity) |
+|---|---|---|---|---|
+| 0 | clock | `now` < previous `now` | Reject | `rejected_clock_regression` (High) |
+| 1 | channel | unknown, or not a joint channel | Reject, **no substitute** | `rejected_unknown_channel` / `rejected_kind_mismatch` |
+| 2 | source | unknown / not allowed | Reject (per `ForeignSourceAction`) | `rejected_unknown_source` / `rejected_unauthorized_source` (Critical) |
+| 3 | rate | `now −` last accepted `< min_interval_ns` | Reject, **no substitute** | `rejected_rate_limited` (High) |
+| 4 | crc | `crc_ok == Some(false)`, or `None` with `require_crc` | Reject | `crc_invalid` (High) |
+| 5 | shape | slot count ≠ configured | Reject | `rejected_kind_mismatch` (High) |
+| 6 | values | NaN / ±inf in any slot | Reject | `rejected_non_finite` (Critical) |
+| 7 | time | future / older than `max_age_ns` / replay | Reject | `rejected_future_timestamp` / `rejected_stale` / `rejected_out_of_order` |
+| 8 | slot | unused slot energised (mode on and `kp`, `kd` or `tau` ≠ 0) | Reject | `disabled_motor_energised` (Critical) |
+| 8 | slot | gain < min (motor off = zero gains), or > `f`·max | Reject | `joint_gain_out_of_envelope` (Critical) |
+| 8 | slot | `\|tau\|` > `f`·`tau_max` | Reject | `joint_torque_out_of_envelope` (Critical) |
+| 8 | slot | `kd > 0` and `\|dq\|` > `f`·`dq_max` | Reject | `joint_velocity_out_of_envelope` (Critical) |
+| 8 | slot | `kp > 0` and `q` outside the range by > `(f−1)·(q_max−q_min)` | Reject | `joint_position_out_of_envelope` (Critical) |
+| 9 | clamp | gain > max; `\|tau\|`, `\|dq\|` > max; `q` outside range | Limit: clamp that field | same four ids, action `Limited` (High) |
+| 10 | post | output outside the envelope (a bug) | per `FaultPolicy` | `internal_fault` (Critical) |
+| — | gap | accepted `> max_interval_ns` after the previous accepted frame | (frame decided normally) | `joint_rate_violation` (Medium, recorded only) |
+
+Notes:
+
+- **A target only constrains while its gain acts.** `q` is not checked when
+  `kp == 0`, `dq` not when `kd == 0`: the Unitree SDK parks idle slots at
+  `PosStopF = 2.146e9` / `VelStopF = 16000` with zero gains, and those frames pass.
+- **Clamping never makes a command stronger.** `|dq|`, `|tau|`, `kp`, `kd` are
+  only ever lowered (sign kept), `q` is projected onto `[q_min, q_max]`, and a gain
+  below its minimum is rejected rather than raised. Limiting is idempotent (a
+  limited frame passes unchanged). Events carry the motor `slot`.
+- **Too-early frames emit nothing.** The previous frame, sent less than
+  `min_interval_ns` ago, is still in force; substituting would turn a flood into a
+  flood of substitutes. A late frame is still decided (refusing it would widen the
+  gap); the gap is recorded.
+- **The gateway must recompute the CRC** of a `Limited` frame and of every
+  substitute (they carry `crc_ok: Some(true)` as a marker, not a checksum), and
+  must carry the non-motor fields of the wire message (`mode_pr`, `mode_machine`,
+  flags, reserved words) itself.
+
+**Substitutes, and the humanoid rule.** A zero-torque or damping frame makes a
+standing humanoid fall, so on a `humanoid` platform's joint channel a rejection or
+a fault **never** substitutes one:
+
+- `humanoid`: hold the last accepted frame with every `dq` set to 0 (`HoldLast`),
+  with no hold timeout and also under a clock regression; if no frame was accepted
+  yet, emit nothing (the robot keeps its own last command / timeout behaviour).
+  `Policy::compile_with_joints` refuses `fail_behaviour: zero_velocity` and
+  `fault_policy: fail_safe` for a humanoid with a joint channel
+  (`ConfigError::UnsafeSubstitute`, "... makes the robot fall; use hold_last /
+  fail_hold"), and the engine applies the rule again regardless of the
+  configuration. Use `fault_policy: fail_hold` (or `fail_open`). Set `kp_min` /
+  `kd_min` above zero on the legs so that a limp frame (gains zero or motors
+  switched off) from a compromised source is refused and the posture held, rather
+  than forwarded. A humanoid's twist channel (a request to its own balance
+  controller) keeps the normal substitutes.
+- `quadruped` / `wheeled` / `arm` / `other`: `ZeroVelocity` emits the **damping
+  frame** (every enabled slot `kp = 0, dq = 0, tau = 0, kd = min(damping_kd,
+  kd_max)`; unused slots off); `HoldLast { max_hold_ns }` holds the last accepted
+  frame (`dq = 0`) while it is younger than `max_hold_ns` (not under a clock
+  regression, not for a foreign source), then damps. Faults: `FailSafe` damps,
+  `FailHold` holds, `FailOpen` forwards. **Trade-off on a quadruped:** damping
+  folds the robot onto its belly (low height, usually recoverable, but it abandons
+  stairs or a payload mid-step); holding keeps it standing stiffly in the last
+  posture for `max_hold_ns`. An arm sags under damping: prefer `HoldLast`.
+
+**Rule ids** (all prefixed `robot.firewall.`). New: `joint_position_out_of_envelope`,
+`joint_velocity_out_of_envelope`, `joint_torque_out_of_envelope`,
+`joint_gain_out_of_envelope`, `disabled_motor_energised`, `crc_invalid`,
+`joint_rate_violation`. Reused where the meaning is the same: `rejected_rate_limited`
+(too early), `rejected_stale` (staleness deadline), `rejected_future_timestamp`,
+`rejected_out_of_order`, `rejected_non_finite`, `rejected_kind_mismatch` (slot
+count / wrong entry point), the source and channel ids, `internal_fault`. The new
+ids still have to be added to the correlation catalog
+(`robodr-correlate::catalog::NETWORK_AND_AGENT_RULES`) and the OCSF rule catalog
+(`robodr-ocsf`); until then the workspace's catalog-drift tests flag them.
+
 ## Invariants (and where they are verified)
 
 | Invariant | Verified by |
@@ -187,8 +318,12 @@ gateway must be deployed so that this timeout exists.
 | **No heap allocation in `check`, `fault_verdict` or `drain_events`** after construction, across all paths, all fail behaviours, observe mode and a full event buffer | `tests/alloc_free.rs`: a counting `GlobalAlloc` with a thread-local counter, plus a check that the counter does see real allocations |
 | No `unwrap`/`expect`/`panic!`/slice indexing/unchecked integer arithmetic in hot-path modules | `#![deny(clippy::{unwrap_used, expect_used, panic, indexing_slicing, arithmetic_side_effects})]` on `engine`, `command`, `events`, `verdict`; confirmed to fire on a deliberate probe |
 | Policy compilation rejects every class of malformed config | `config::tests` |
+| Joint frames: every decision-table row, each clamp with its rule id and slot, hard rejections, gain minimums, unused-slot energising, CRC, rate window, staleness, observe mode, all three fault policies, the shipped G1 / Go2 configs, JSON strictness, and the unchanged legacy API | `tests/joint_frames.rs` (25 tests) |
+| Joint frames: forwarded output always inside the envelope (independent check); `Passed` bit-exact; `Limited` never raises a magnitude or gain and is idempotent; a substitute is the held last accepted frame (`dq = 0`) or the damping frame, **never damping on a humanoid** | `tests/joint_properties.rs` (24 random envelopes of 1–35 slots × 4 000 frames, plus an exhaustive edge grid) |
+| **No heap allocation in `check_joint` / `joint_fault_verdict`** (35, 20 and 12 slots; humanoid, quadruped, fail-open, observe; every path incl. holds, damping, a full buffer) | `tests/alloc_free.rs` (`check_joint_never_allocates`, hard failure) |
 
-Total: 99 tests. Every loop in `check` runs over at most `MAX_JOINTS` (32)
+Total: 132 tests (100 for twist / joint-velocity channels, 32 for low-level
+joint frames). Every loop in `check` runs over at most `MAX_JOINTS` (32)
 elements or a constant 4 rounds. There is no recursion and no search over sources.
 
 ## Latency and jitter harness
@@ -239,7 +374,75 @@ kernel, no CPU pinning and no frequency control.
   the Sprint 7 jitter harness; this example is its library-level half (the
   gateway-in-the-loop measurement is still to do).
 
+### Low-level joint frames: `examples/joint_latency.rs`
+
+    cargo run --release -p robodr-firewall --example joint_latency -- [SECONDS] [--fast] \
+        [--budget-p50-ns X] [--budget-p99-ns X] [--budget-max-ns X] [--budget-jitter-ns X]
+
+It drives four scenarios for `SECONDS` each (default 2): a 35-slot humanoid frame
+(29 actuated, G1 / H1-2 layout) and a 12-slot quadruped frame (Go1 / A1 layout),
+each at 1 kHz and at 500 Hz. By default the frames are **paced in real time** at
+the scenario's rate (±2 % period jitter), so each decision sees the caches a real
+control loop sees between ticks; `--fast` feeds the same stream back to back. The
+mix: smooth sinusoidal trajectories, about 3 % frames with a clamped position,
+about 1.5 % rejected (CRC invalid, NaN, unused slot energised, torque past the hard
+bound; each rejection holds the last valid frame). A counting global allocator
+reports heap allocations on the timed thread. **Exit code 1 if any allocation
+happens in a timed loop** (a hard check, like `tests/alloc_free.rs`) or if a
+configured budget (`ROBODR_FW_JOINT_BUDGET_{P50,P99,MAX,JITTER}_NS` or the flags) is
+exceeded; 2 on a usage error. The latency budgets follow the report-only policy
+above.
+
+`tests/joint_latency.rs` is the test-level gate: it prints p50 / p99 / max for
+20 000 frames of each size, is report-only in debug builds (what `cargo test` and CI
+run) and, under `cargo test --release`, fails only if p99 reaches 50 µs (about 30x
+the slowest p99 measured below), which only a pathological regression (an
+allocation, an unbounded loop) can trip.
+
+Measured 2026-10-25 in the development sandbox: a 4-vCPU VM on an Intel Xeon @
+2.10 GHz, release profile, 10 s per scenario, two runs each, while other builds
+ran on the same VM; times include the `Instant` pair (about 30 ns); 0 allocations
+in every run:
+
+| Scenario | Mode | p50 | p99 | p99.9 | max |
+|---|---|---|---|---|---|
+| 35 slots @ 1 kHz | paced | 1.6–1.7 µs | 4.7–4.9 µs | 32–37 µs | 0.37–2.9 ms |
+| 35 slots @ 500 Hz | paced | 2.5–2.8 µs | 5.6–7.3 µs | 54–70 µs | 0.25–0.36 ms |
+| 12 slots @ 1 kHz | paced | 1.1–1.2 µs | 3.8–3.9 µs | 26–38 µs | 0.14–0.16 ms |
+| 12 slots @ 500 Hz | paced | 1.9–2.0 µs | 4.3–4.4 µs | 26 µs | 56–144 µs |
+| 35 slots | back to back | 0.67–1.1 µs | 1.3–1.7 µs | 16–27 µs | 42–246 µs |
+| 12 slots | back to back | 0.36–0.47 µs | 0.7–0.85 µs | 1–24 µs | 24–69 µs |
+
+At 1 kHz the control period is 1 000 µs, so the decision p99 is below 1 % of it on
+this machine. The paced numbers are higher than back to back because the caches
+and branch predictors go cold between ticks (and the core may clock down while the
+loop sleeps); 500 Hz is colder than 1 kHz for the same reason.
+
+**Hardware caveat.** Same as above, and more so: not measured on a robot, a Jetson
+or any Unitree controller, not under an RT kernel, not pinned, on a shared VM. The
+µs-to-ms tail is scheduling, not the algorithm (`check_joint` is `O(slots)` with no
+allocation and no data-dependent loop). The number that matters — added latency on
+the robot's own compute, gateway in the loop, under load — is still to be measured.
+
 ## Integration (not done here)
+
+- **Low-level joint gateway (Unitree).** Nothing subscribes to `rt/lowcmd` yet. A
+  gateway (for example in `robodr-agentd`'s inline mode, which does not exist yet:
+  the daemon is a passive observer and runs the firewall pass-through) has to:
+  - decode the platform's `LowCmd` IDL (`go` / `hg`) into a `JointFrame`, check its
+    CRC and set `crc_ok`; resolve the writer to a `SourceId`;
+  - compile the policy with `Policy::compile_with_joints` (or
+    `FirewallConfig::from_json(..)?.compile(&profile)`), with the channel in the
+    profile's `motion_envelopes` and `writer_topics`;
+  - call `check_joint` per frame and publish the output, re-encoding a `Limited`
+    frame or a substitute **with a freshly computed CRC** and carrying the
+    message's non-motor fields (`mode_pr`, `mode_machine`, flags) itself;
+  - publish nothing when the verdict emits nothing (the robot keeps its last
+    command), and call `joint_fault_verdict` on a deadline miss;
+  - for `robodr-agent`'s verdict records: `JointVerdict` is a separate type, so a
+    `check_firewall`-style mapping needs a joint variant (reasons
+    `position` / `velocity` / `torque` / `gain`, substitute `hold_last` / `zero`
+    = damping).
 
 - **ROS 2 gateway.** It has to:
   - subscribe on a shadow topic and republish verdict outputs;

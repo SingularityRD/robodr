@@ -18,9 +18,17 @@
 //! be disabled by a malformed number. The angular speed of a Twist channel is
 //! the exception: it has no envelope field to fall back on, so it must be
 //! spelled out (`max_angular_speed: Some(x)`, `x` finite and >= 0).
+//!
+//! Low-level joint channels ([`JointChannelSpec`]) are compiled by
+//! [`Policy::compile_with_joints`]; their per-motor envelope has no
+//! "unconstrained" at all (see `joint_config`). Every configuration type
+//! here is also (de)serialisable as JSON ([`crate::FirewallConfig`]).
 
 use crate::command::{ChannelId, SourceId, MAX_JOINTS};
+use crate::joint::MAX_MOTORS;
+use crate::joint_config::{compile_joint_channel, CompiledJointChannel, JointChannelSpec};
 use robodr_events::profile::Profile;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -37,7 +45,15 @@ const NS_PER_S: u64 = 1_000_000_000;
 /// own are a zero command or a bounded repeat of the last command it accepted.
 /// The platform's safety PLC / e-stop remains the final authority in all
 /// cases; this is a protective layer in front of it, not a replacement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// On a **low-level joint channel** ([`JointChannelSpec`]) "zero" is the
+/// damping frame (every enabled slot `kp = 0`, `dq = 0`, `tau = 0`,
+/// `kd = damping_kd`) and "hold" is the last accepted frame with its
+/// velocity targets zeroed. A humanoid ([`Morphology::Humanoid`]) falls on a
+/// damping frame, so its joint channels refuse `ZeroVelocity` at compile
+/// time and always hold (see [`Morphology`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FailBehaviour {
     /// Emit an all-zero command of the channel's kind.
     ZeroVelocity,
@@ -66,13 +82,56 @@ pub enum FailBehaviour {
 /// does not forward it. An OEM may choose `FailOpen` where an unexpected stop
 /// is the greater hazard (e.g. a vehicle at speed among people with no other
 /// stopping logic) — that is a safety-case decision, not ours.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FaultPolicy {
     /// Reject with a zero substitute (never hold: state may be corrupt).
+    /// Refused for a humanoid platform with a low-level joint channel.
     #[default]
     FailSafe,
     /// Forward the original command unchanged and record the fault.
     FailOpen,
+    /// Reject; on a low-level joint channel re-emit the last **accepted**
+    /// frame (velocity targets zeroed), or nothing if none was accepted yet.
+    /// That frame passed every check (including the post-condition) when it
+    /// was accepted, so holding it cannot put the robot outside its
+    /// envelope. Twist / joint-velocity channels get the zero substitute,
+    /// exactly as with `FailSafe`. Required (or `FailOpen`) for a humanoid
+    /// with a low-level joint channel.
+    FailHold,
+}
+
+/// Body plan of the platform. It decides what a rejection may substitute on
+/// a low-level joint channel.
+///
+/// - **`Humanoid`**: a zero-torque or damping frame makes a standing biped
+///   fall. On its low-level joint channels a rejection (and a fault) **never**
+///   substitutes zero or damping: it re-emits the last accepted frame
+///   (velocity targets zeroed; no hold timeout), or nothing if no frame was
+///   accepted yet (the platform keeps its own last command / timeout
+///   behaviour). [`Policy::compile_with_joints`] refuses
+///   [`FailBehaviour::ZeroVelocity`] and [`FaultPolicy::FailSafe`] for a
+///   humanoid with a joint channel, and the engine enforces the rule again
+///   on its own.
+/// - **`Quadruped`**, `Wheeled`, `Arm`, `Other`: every [`FailBehaviour`]
+///   is allowed. Trade-off on a quadruped joint channel: `ZeroVelocity`
+///   (damping frame) lets the robot fold down onto its belly (low height,
+///   usually recoverable, but it abandons whatever it was doing, e.g. on
+///   stairs); `HoldLast` keeps the last posture stiff for `max_hold_ns`,
+///   then damps. An arm under damping sags under gravity: prefer
+///   `HoldLast` there too.
+///
+/// Twist and joint-velocity channels are not affected (their zero is a
+/// stop request to the platform's own controller, which keeps balance).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Morphology {
+    Humanoid,
+    Quadruped,
+    Wheeled,
+    Arm,
+    #[default]
+    Other,
 }
 
 /// What to do on a known channel when the command comes from a source that is
@@ -85,7 +144,8 @@ pub enum FaultPolicy {
 /// policy requires it — belongs to the responder (`robodr-responder`), not to
 /// the in-path firewall: a spoofed packet must not be able to drive the
 /// firewall's own output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ForeignSourceAction {
     /// **Default.** Drop the foreign command and emit nothing: the legitimate
     /// stream keeps control and the spoofer gets no effect on the motion
@@ -106,7 +166,11 @@ pub enum ForeignSourceAction {
 }
 
 /// Per-platform settings (one robot model / platform type).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// JSON: every field is optional (defaults below); unknown fields are an
+/// error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct PlatformConfig {
     pub fail_behaviour: FailBehaviour,
     pub fault_policy: FaultPolicy,
@@ -122,6 +186,9 @@ pub struct PlatformConfig {
     /// (see [`crate::EventBuffer`]). Each event push scans the buffer once,
     /// so keep this in the hundreds.
     pub event_capacity: usize,
+    /// Body plan (default [`Morphology::Other`]). Only changes behaviour on
+    /// low-level joint channels; see [`Morphology`].
+    pub morphology: Morphology,
 }
 
 impl Default for PlatformConfig {
@@ -132,12 +199,16 @@ impl Default for PlatformConfig {
             foreign_source_action: ForeignSourceAction::Drop,
             foreign_substitute_min_interval_ns: 1_000_000_000,
             event_capacity: 256,
+            morphology: Morphology::Other,
         }
     }
 }
 
-/// What a channel carries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a channel carries. (Low-level joint frames have their own spec,
+/// [`JointChannelSpec`], and their own entry point,
+/// [`crate::Firewall::check_joint`].)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ChannelKind {
     Twist,
     /// Joint velocities; every command must have exactly `count` joints.
@@ -147,7 +218,8 @@ pub enum ChannelKind {
 }
 
 /// Token-bucket rate limit per (channel, source).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RateLimit {
     /// Sustained commands per second (>= 1).
     pub per_second: u32,
@@ -158,7 +230,11 @@ pub struct RateLimit {
 /// Per-channel limits on top of the profile's envelope. `None` = no extra
 /// constraint. Speed fields here can only **tighten** the envelope (the
 /// effective limit is the minimum of the two).
-#[derive(Debug, Clone, PartialEq)]
+///
+/// JSON: every field is optional (defaults below); unknown fields are an
+/// error.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ChannelSpec {
     pub kind: ChannelKind,
     /// Sources allowed to command this channel: endpoint GUIDs (24- or
@@ -269,6 +345,35 @@ pub enum ConfigError {
     },
     /// The profile fails [`Profile::validate`] (the errors, joined).
     InvalidProfile(String),
+    /// A low-level joint channel's motor table is empty or longer than
+    /// [`MAX_MOTORS`].
+    InvalidMotorCount {
+        channel: String,
+        count: usize,
+    },
+    /// A motor limit is missing (enabled slot), NaN / infinite / negative,
+    /// or a range is inverted (`min > max`).
+    InvalidMotorLimit {
+        channel: String,
+        slot: usize,
+        field: &'static str,
+        why: &'static str,
+    },
+    /// A joint channel's expected rate / intervals are inconsistent.
+    InvalidRate {
+        channel: String,
+        why: &'static str,
+    },
+    /// The platform's fail behaviour or fault policy would substitute a
+    /// zero / damping frame on a humanoid's low-level joint channel.
+    UnsafeSubstitute {
+        channel: String,
+        why: &'static str,
+    },
+    /// A channel name has both a [`ChannelSpec`] and a [`JointChannelSpec`].
+    DuplicateChannel(String),
+    /// The JSON configuration could not be parsed.
+    InvalidJson(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -312,6 +417,30 @@ impl fmt::Display for ConfigError {
                 write!(f, "channel {channel}: {field} is required")
             }
             Self::InvalidProfile(why) => write!(f, "invalid profile: {why}"),
+            Self::InvalidMotorCount { channel, count } => write!(
+                f,
+                "joint channel {channel}: motor slot count {count} not in 1..={MAX_MOTORS}"
+            ),
+            Self::InvalidMotorLimit {
+                channel,
+                slot,
+                field,
+                why,
+            } => write!(
+                f,
+                "joint channel {channel}: motor slot {slot}: {field} {why}"
+            ),
+            Self::InvalidRate { channel, why } => {
+                write!(f, "joint channel {channel}: rate: {why}")
+            }
+            Self::UnsafeSubstitute { channel, why } => {
+                write!(f, "joint channel {channel}: unsafe substitute: {why}")
+            }
+            Self::DuplicateChannel(c) => write!(
+                f,
+                "channel {c} has both a channel spec and a joint channel spec"
+            ),
+            Self::InvalidJson(why) => write!(f, "invalid firewall JSON: {why}"),
         }
     }
 }
@@ -351,11 +480,34 @@ pub(crate) struct CompiledChannel {
 
 impl CompiledChannel {
     pub(crate) fn allows(&self, src: SourceId) -> bool {
-        let i = usize::from(src.0);
-        let word = i / 64;
-        let bit = i % 64;
-        self.allowed.get(word).is_some_and(|w| (w >> bit) & 1 == 1)
+        bit_allows(&self.allowed, src)
     }
+}
+
+/// Test `src` in a per-channel allow-set.
+pub(crate) fn bit_allows(allowed: &[u64; MAX_SOURCES / 64], src: SourceId) -> bool {
+    let i = usize::from(src.0);
+    let word = i / 64;
+    let bit = i % 64;
+    allowed.get(word).is_some_and(|w| (w >> bit) & 1 == 1)
+}
+
+/// The allow-set of a channel from its source list (already validated and
+/// interned into `sources`).
+fn allowed_bits(
+    list: &[String],
+    sources: &[String],
+) -> Result<[u64; MAX_SOURCES / 64], ConfigError> {
+    let mut allowed = [0u64; MAX_SOURCES / 64];
+    for g in list {
+        let g = normalise_source(g)?;
+        if let Ok(idx) = sources.binary_search(&g) {
+            if let Some(w) = allowed.get_mut(idx / 64) {
+                *w |= 1u64 << (idx % 64);
+            }
+        }
+    }
+    Ok(allowed)
 }
 
 /// A compiled, validated policy. Build once, hand to [`crate::Firewall::new`].
@@ -364,11 +516,19 @@ pub struct Policy {
     pub(crate) model: String,
     pub(crate) enforcing: bool,
     pub(crate) platform: PlatformConfig,
+    /// Twist / joint-velocity channels: ids `0..channels.len()`.
     pub(crate) channels: Vec<CompiledChannel>,
+    /// Low-level joint channels: ids `channels.len()..` (after the others,
+    /// so adding one never renumbers an existing channel).
+    pub(crate) joint_channels: Vec<CompiledJointChannel>,
     pub(crate) sources: Vec<String>,
 }
 
-fn limit(channel: &str, field: &'static str, v: Option<f64>) -> Result<f64, ConfigError> {
+pub(crate) fn limit(
+    channel: &str,
+    field: &'static str,
+    v: Option<f64>,
+) -> Result<f64, ConfigError> {
     match v {
         None => Ok(f64::INFINITY),
         Some(x) if !x.is_finite() || x < 0.0 => Err(ConfigError::InvalidLimit {
@@ -383,7 +543,7 @@ fn limit(channel: &str, field: &'static str, v: Option<f64>) -> Result<f64, Conf
 pub const IDENTITY_SOURCE_PREFIX: &str = "identity:";
 
 /// A GUID (lower-cased) or an `identity:<name>` token (name kept as is).
-fn normalise_source(g: &str) -> Result<String, ConfigError> {
+pub(crate) fn normalise_source(g: &str) -> Result<String, ConfigError> {
     let t = g.trim();
     match t.strip_prefix(IDENTITY_SOURCE_PREFIX) {
         Some(name) if robodr_events::profile::is_identity_name(name) => {
@@ -408,11 +568,33 @@ impl Policy {
     ///
     /// Channel ids are assigned in lexical order of channel name; source ids
     /// in lexical order of (lower-cased) GUID. Enforcement is on iff
-    /// `profile.locked`.
+    /// `profile.locked`. Equivalent to [`Self::compile_with_joints`] with no
+    /// low-level joint channel.
     pub fn compile(
         profile: &Profile,
         platform: PlatformConfig,
         specs: &BTreeMap<String, ChannelSpec>,
+    ) -> Result<Policy, ConfigError> {
+        Self::compile_with_joints(profile, platform, specs, &BTreeMap::new())
+    }
+
+    /// [`Self::compile`] plus low-level joint channels (`joint_specs`, see
+    /// [`JointChannelSpec`]). Every profiled motion channel needs exactly one
+    /// spec of either kind. Joint channel ids follow the others (lexical
+    /// order among themselves), so existing ids never change. Sources are
+    /// interned across both maps.
+    ///
+    /// Fails closed on everything [`Self::compile`] refuses, plus: an empty
+    /// or > [`MAX_MOTORS`] motor table, a missing / non-finite / negative
+    /// motor limit or an inverted range, an inconsistent rate, a zero
+    /// staleness deadline, and — for a [`Morphology::Humanoid`] platform
+    /// with any joint channel — [`FailBehaviour::ZeroVelocity`] or
+    /// [`FaultPolicy::FailSafe`] ([`ConfigError::UnsafeSubstitute`]).
+    pub fn compile_with_joints(
+        profile: &Profile,
+        platform: PlatformConfig,
+        specs: &BTreeMap<String, ChannelSpec>,
+        joint_specs: &BTreeMap<String, JointChannelSpec>,
     ) -> Result<Policy, ConfigError> {
         if let Err(errs) = profile.validate() {
             let why = errs
@@ -425,22 +607,54 @@ impl Policy {
         if platform.event_capacity == 0 {
             return Err(ConfigError::InvalidPlatform("event_capacity must be >= 1"));
         }
-        if specs.len() > MAX_CHANNELS {
-            return Err(ConfigError::TooManyChannels(specs.len()));
+        let total = specs.len().saturating_add(joint_specs.len());
+        if total > MAX_CHANNELS {
+            return Err(ConfigError::TooManyChannels(total));
+        }
+        if let Some(dup) = joint_specs.keys().find(|k| specs.contains_key(*k)) {
+            return Err(ConfigError::DuplicateChannel(dup.clone()));
         }
         for name in profile.motion_envelopes.keys() {
-            if !specs.contains_key(name) {
+            if !specs.contains_key(name) && !joint_specs.contains_key(name) {
                 return Err(ConfigError::ChannelWithoutSpec(name.clone()));
+            }
+        }
+        if let Some(first) = joint_specs.keys().next() {
+            if platform.morphology == Morphology::Humanoid {
+                if platform.fail_behaviour == FailBehaviour::ZeroVelocity {
+                    return Err(ConfigError::UnsafeSubstitute {
+                        channel: first.clone(),
+                        why: "a humanoid low-level joint channel cannot use fail_behaviour \
+                              zero_velocity: a zero-torque / damping frame makes the robot \
+                              fall; use hold_last (a rejection then holds the last valid frame)",
+                    });
+                }
+                // A pass-through platform never enforces, so its faults are
+                // always fail-open: no substitute to refuse.
+                if platform.fault_policy == FaultPolicy::FailSafe
+                    && platform.fail_behaviour != FailBehaviour::PassThroughObserveOnly
+                {
+                    return Err(ConfigError::UnsafeSubstitute {
+                        channel: first.clone(),
+                        why: "a humanoid low-level joint channel cannot use fault_policy \
+                              fail_safe: its zero-torque / damping substitute makes the robot \
+                              fall; use fail_hold (hold the last valid frame) or fail_open",
+                    });
+                }
             }
         }
 
         // Intern sources first so ids are stable and dense.
         let mut all_sources = BTreeSet::new();
-        for (name, spec) in specs {
-            if spec.allowed_sources.is_empty() {
+        let source_lists = specs
+            .iter()
+            .map(|(n, s)| (n, &s.allowed_sources))
+            .chain(joint_specs.iter().map(|(n, s)| (n, &s.allowed_sources)));
+        for (name, allowed_sources) in source_lists {
+            if allowed_sources.is_empty() {
                 return Err(ConfigError::NoAllowedSources(name.clone()));
             }
-            for g in &spec.allowed_sources {
+            for g in allowed_sources {
                 let g = normalise_source(g)?;
                 let known = match g.strip_prefix(IDENTITY_SOURCE_PREFIX) {
                     Some(name) => profile.participant_identities.contains_key(name),
@@ -515,15 +729,7 @@ impl Policy {
                     Some((cost, cost.saturating_mul(u64::from(r.burst))))
                 }
             };
-            let mut allowed = [0u64; MAX_SOURCES / 64];
-            for g in &spec.allowed_sources {
-                let g = normalise_source(g)?;
-                if let Ok(idx) = sources.binary_search(&g) {
-                    if let Some(w) = allowed.get_mut(idx / 64) {
-                        *w |= 1u64 << (idx % 64);
-                    }
-                }
-            }
+            let allowed = allowed_bits(&spec.allowed_sources, &sources)?;
             channels.push(CompiledChannel {
                 name: name.clone(),
                 kind: spec.kind,
@@ -539,22 +745,65 @@ impl Policy {
             });
         }
 
+        let mut joint_channels = Vec::with_capacity(joint_specs.len());
+        for (name, spec) in joint_specs {
+            let env = profile
+                .motion_envelopes
+                .get(name)
+                .ok_or_else(|| ConfigError::ChannelNotInProfile(name.clone()))?;
+            let allowed = allowed_bits(&spec.allowed_sources, &sources)?;
+            joint_channels.push(compile_joint_channel(name, spec, env, allowed, &platform)?);
+        }
+
         Ok(Policy {
             model: profile.model.clone(),
             enforcing: profile.locked,
             platform,
             channels,
+            joint_channels,
             sources,
         })
     }
 
-    /// Resolve a channel name (configuration time, not per message).
+    /// Resolve a channel name (configuration time, not per message). Covers
+    /// both twist / joint-velocity and low-level joint channels.
     pub fn channel_id(&self, name: &str) -> Option<ChannelId> {
         self.channels
             .iter()
-            .position(|c| c.name == name)
+            .map(|c| c.name.as_str())
+            .chain(self.joint_channels.iter().map(|c| c.name.as_str()))
+            .position(|c| c == name)
             .and_then(|i| u16::try_from(i).ok())
             .map(ChannelId)
+    }
+
+    /// `true` if `id` is a low-level joint channel (checked with
+    /// [`crate::Firewall::check_joint`], not `check`).
+    pub fn is_joint_channel(&self, id: ChannelId) -> bool {
+        self.joint_index(id).is_some()
+    }
+
+    /// Index into `joint_channels` of a low-level joint channel id.
+    pub(crate) fn joint_index(&self, id: ChannelId) -> Option<usize> {
+        let j = usize::from(id.0).checked_sub(self.channels.len())?;
+        (j < self.joint_channels.len()).then_some(j)
+    }
+
+    /// Total number of channels (both kinds).
+    pub(crate) fn channel_count(&self) -> usize {
+        self.channels
+            .len()
+            .saturating_add(self.joint_channels.len())
+    }
+
+    /// `true` if `src` is allowed on channel `id` (either kind).
+    pub(crate) fn allows(&self, id: ChannelId, src: SourceId) -> bool {
+        if let Some(c) = self.channels.get(usize::from(id.0)) {
+            return c.allows(src);
+        }
+        self.joint_index(id)
+            .and_then(|j| self.joint_channels.get(j))
+            .is_some_and(|c| bit_allows(&c.allowed, src))
     }
 
     /// Resolve an endpoint GUID (configuration / discovery time, not per
@@ -570,9 +819,13 @@ impl Policy {
     }
 
     pub fn channel_name(&self, id: ChannelId) -> Option<&str> {
-        self.channels
-            .get(usize::from(id.0))
-            .map(|c| c.name.as_str())
+        match self.channels.get(usize::from(id.0)) {
+            Some(c) => Some(c.name.as_str()),
+            None => self
+                .joint_index(id)
+                .and_then(|j| self.joint_channels.get(j))
+                .map(|c| c.name.as_str()),
+        }
     }
 
     pub fn source_guid(&self, id: SourceId) -> Option<&str> {
