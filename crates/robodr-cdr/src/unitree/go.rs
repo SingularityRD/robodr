@@ -14,15 +14,19 @@
 //!
 //! The SDK's TypeObjects mark these structs `@final` (struct flags `0x01`
 //! in the type-information blobs), so a writer is expected to send XCDR1
-//! (`CDR_LE`) or plain XCDR2 (`CDR2_LE`); both decode, and so does `D_CDR2`
-//! under the crate's [`crate::Limits::d_cdr2_nesting`] rule.
+//! (`CDR_LE`) or plain XCDR2 (`CDR2_LE`); both decode. A `D_CDR2` header
+//! is read as XCDR2 with the types still final (no struct DHEADERs), as
+//! Cyclone DDS reads it; [`crate::Limits::d_cdr2_nesting`] does not apply to
+//! the Unitree types.
 
 use crate::error::DecodeError;
 use crate::msgs::Time;
 use crate::reader::Reader;
 use crate::unitree::crc::CrcImage;
-use crate::unitree::joint::{JointCommand, JointCommandFrame, JointMeasurement, JointStateFrame};
-use crate::unitree::{arr, read_struct_array, MOTOR_SLOTS_GO};
+use crate::unitree::joint::{
+    Bounded, JointCommand, JointCommandFrame, JointMeasurement, JointStateFrame,
+};
+use crate::unitree::{arr, read_struct_array, read_struct_seq, MOTOR_SLOTS_GO};
 
 /// `unitree_go::msg::dds_::MotorCmd_`.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -73,6 +77,47 @@ impl GoMotorCmd {
             kp: self.kp,
             kd: self.kd,
         }
+    }
+}
+
+/// Most motors a `unitree_go::msg::dds_::MotorCmds_` sequence may hold
+/// (the joint frame's capacity; `rt/hand_sdk` sends 4). A longer sequence is
+/// refused as [`DecodeError::SequenceTooLong`].
+pub const MAX_MOTOR_CMDS: usize = crate::unitree::joint::MAX_FRAME_JOINTS;
+
+/// `unitree_go::msg::dds_::MotorCmds_` (`sequence<MotorCmd_> cmds`): the
+/// G1 hand-SDK channel `rt/hand_sdk`
+/// (`example/g1/high_level/g1_hand_sdk_example.cpp`), where `cmds[0].mode`
+/// carries the blend weight × 100 and the hand moves by `tau`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct GoMotorCmds {
+    pub cmds: Bounded<GoMotorCmd, MAX_MOTOR_CMDS>,
+}
+
+impl GoMotorCmds {
+    pub(crate) fn read(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        r.structure(|r| {
+            Ok(GoMotorCmds {
+                cmds: read_struct_seq(r, 1 + 4 * 5 + 4 * 3, GoMotorCmd::read)?,
+            })
+        })
+    }
+
+    /// The `rt/hand_sdk` blend weight (`cmds[0].mode / 100`, clamped to
+    /// `[0, 1]` as the example does); `None` for an empty sequence.
+    pub fn hand_sdk_weight(&self) -> Option<f32> {
+        self.cmds
+            .as_slice()
+            .first()
+            .map(|m| (f32::from(m.mode) / 100.0).clamp(0.0, 1.0))
+    }
+
+    pub fn joint_frame(&self) -> JointCommandFrame {
+        let mut f = JointCommandFrame::default();
+        for m in self.cmds.as_slice() {
+            f.joints.push(m.joint());
+        }
+        f
     }
 }
 

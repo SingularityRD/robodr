@@ -17,98 +17,162 @@ sent.
 
 ## Unitree
 
-RoboDR reads the motion content of every Unitree robot generation. The
-`unitree` module decodes the DDS (`unitree_sdk2`) message types, and
+The `unitree` module decodes the DDS (`unitree_sdk2`) message types, and
 `unitree_legacy` decodes the raw UDP frames of the Go1 generation
-(`unitree_legged_sdk`). The DDS motion types are also `MessageKind`s
+(`unitree_legged_sdk` v3.8.6). The DDS motion types are also `MessageKind`s
 (`MessageKind::Unitree*`), registered in `Registry::with_builtin` under
 their DDS and ROS names, so `decode_by_type_name` / `Registry::decode`
 resolve them and `MotionMessage::to_event` produces the pipeline
-`MotionCommand` / `MotionFeedback`.
+`MotionCommand` / `MotionFeedback`. Coverage is exactly the matrix below;
+see "Status" for what that does and does not mean.
 
-| DDS type name | role | mapped to |
-|---|---|---|
-| `unitree_go::msg::dds_::LowCmd_` (MotorCmd_[20], BmsCmd_) | command | `joint_speed` = max \|dq\| over enabled motors with `kd != 0`; full per-motor q/dq/tau/kp/kd in `JointCommandFrame`; `crc_ok` |
-| `unitree_go::msg::dds_::LowState_` (IMUState_, MotorState_[20], BmsState_) | feedback | `measured_joint_speed` = max \|dq\|; IMU gyro → angular rates; `crc_ok` |
-| `unitree_go::msg::dds_::SportModeState_` | feedback | body `velocity` / `yaw_speed` → linear / angular velocity feedback |
-| `unitree_hg::msg::dds_::LowCmd_` (MotorCmd_[35], mode_pr, mode_machine) | command | as go `LowCmd_`; `crc_ok` |
-| `unitree_hg::msg::dds_::LowState_` | feedback | as go `LowState_`; `crc_ok` |
-| `unitree_hg::msg::dds_::HandCmd_` / `HandState_` (Dex3) | command / feedback | joint speed of the (bounded) hand motor sequence |
-| `unitree_hg::msg::dds_::IMUState_`, `unitree_hg_doubleimu::msg::dds_::doubleIMUState_` | feedback | gyroscope → angular rates (`doubleIMUState_` adds a trailing `tick`) |
-| `unitree_api::msg::dds_::Request_` | command | header `api_id` + JSON `parameter` → typed `ApiCall`; `Move` / `SetVelocity` / `StopMove` → twist |
-| `unitree_api::msg::dds_::Response_`, `unitree_go::msg::dds_::WirelessController_` | (not motion) | `decode_unitree` only |
+| DDS type name | topic(s) | role | mapped to |
+|---|---|---|---|
+| `unitree_go::msg::dds_::LowCmd_` (MotorCmd_[20], BmsCmd_) | `rt/lowcmd`; `rt/arm_sdk` (H1) | command | `joint_speed` / `joint_torque` / `joint_kp` over all 20 slots (below); `crc_ok` (advisory) |
+| `unitree_go::msg::dds_::LowState_` | `rt/lowstate`, `rt/lf/lowstate` | feedback | `measured_joint_speed` = max \|dq\|; IMU gyro → angular rates; `crc_ok` |
+| `unitree_go::msg::dds_::SportModeState_` | `rt/sportmodestate`, `rt/lf/sportmodestate` | feedback | body `velocity` / `yaw_speed` |
+| `unitree_go::msg::dds_::MotorCmds_` (sequence of MotorCmd_) | `rt/hand_sdk` (G1 hand SDK; weight × 100 in `cmds[0].mode`) | command | as `LowCmd_` over the sequence (≤ 35) |
+| `unitree_hg::msg::dds_::LowCmd_` (MotorCmd_[35]) | `rt/lowcmd`, `rt/arm_sdk`, `rt/user_lowcmd` | command | as go `LowCmd_`, all 35 slots |
+| `unitree_hg::msg::dds_::LowState_` | `rt/lowstate` | feedback | as go `LowState_` |
+| `unitree_hg::msg::dds_::HandCmd_` / `HandState_` (Dex3) | `rt/dex3/{left,right}/cmd`, `.../state`, `rt/lf/dex3/.../state` | command / feedback | as `LowCmd_` over the (≤ 16) motors; mode octet = `Dex3Mode` bitfield `id \| status << 4 \| timeout << 7` (informational) |
+| `unitree_hg::msg::dds_::MotorCmd_` / `MotorState_` (standalone) | `rt/waistpitchcmd` / `rt/waistpitchstate` (G1-D waist) | command / feedback | one-joint frame |
+| `unitree_hg::msg::dds_::IMUState_`, `unitree_hg_doubleimu::msg::dds_::doubleIMUState_` | `rt/secondary_imu` | feedback | gyroscope → angular rates |
+| `unitree_api::msg::dds_::Request_` | `rt/api/<service>/request` | command | `ApiCall` (below); velocity calls → twist; every call's `ApiClass` → `command_class` |
+| `unitree_api::msg::dds_::Response_`, `unitree_go::msg::dds_::WirelessController_` | `rt/api/<service>/response`, `rt/wirelesscontroller` | (not motion) | `decode_unitree` only |
 
-`hg_doubleimu` differs from `hg`'s `IMUState_` only by the trailing
-`uint32 tick`; everything else is identical (both have an `int16`
-temperature, unlike `go`'s `int8`).
-
-**Unitree CRC.** `unitree::crc::crc32_core` is the SDK's `crc32_core`
-(CRC-32, polynomial `0x04C11DB7`, init `0xFFFFFFFF`, MSB-first, no final
-XOR) over the struct's C++ in-memory image as `uint32` words, excluding the
-`crc` field. `LowCmd_` / `LowState_` (go and hg) expose `crc_ok()` so a
-firewall can require a valid CRC; `computed_crc()` recomputes it. Tested
-against vectors from an independent re-implementation of the SDK algorithm
-(see `src/unitree/crc.rs`).
+**Joint commands: every slot, the mode never gates a check.** Unitree's
+motor controller applies `T = kp·(q − q_measured) + kd·(dq − dq_measured) +
+tau`. A command frame maps to `joint_speed` = max \|dq\| over slots with
+`kd != 0`, `joint_torque` = max \|tau\| and `joint_kp` = max \|kp\|, over
+**all** slots on the wire (not only `ModelInfo::actuated_motors`: the
+arm-SDK weight is `motor_cmd[29].q` on G1, `[9]` on H1, `[27]` on H1-2,
+`[31]` on H2, see `ModelInfo::arm_sdk_weight_slot`; R1 uses `mode_pr`).
+`rt/arm_sdk` frames always carry `mode = 0` and still move the arms, so the
+mode octet is informational only; a non-finite value in **any** field of
+**any** slot makes all three NaN (Critical in `Profile::evaluate`). The
+ROS 2 pipeline adds `joint_position_step` (max \|Δq\| of an acting position
+target against the previous frame on the channel). The profile envelope
+bounds them with `max_joint_torque`, `max_joint_kp` and
+`max_joint_position_step`; on an envelope without them a command that uses
+torque or position gain is `robot.motion.unverifiable_command` (Medium),
+never silently "speed 0".
 
 **API interpretation.** `ApiRequest::call(service, model)` maps a request to
 a typed `ApiCall` (`Move`, `SetVelocity`, `StopMove`, `Euler`, `SetFsmId`,
-`SetTargetPosition`, a classified `Other`, or `Unknown { api_id }` — unknown
-ids are never an error). The service comes from the topic
-(`rt/api/<svc>/request`), because api ids are reused across services and
-models (e.g. `1003` is sport `StopMove` but motion-switcher `ReleaseMode`;
-`7106` is loco `SetArmTask` but arm `ExecuteAction`). api ids and JSON keys
-are taken from the per-model SDK headers, each table citing its source. The
-`parameter` JSON is parsed by a bounded, allocation-free reader (16 KiB /
-depth 8 / 32 members caps, duplicate and escaped top-level keys rejected).
+`SetTargetPosition`, a classified `Other`, `Unknown { api_id }` or
+`Malformed`). The service comes from the topic (`rt/api/<svc>/request`),
+because api ids are reused across services and models. The wire `api_id` is
+`int64` but the SDK server dispatches on its **low 32 bits**
+(`robot/server/server.hpp`): lookups use `api_id as i32`, and an id outside
+the `int32` range is `DecodeAnomaly::ApiIdOutOfRange` (pipeline:
+`robot.motion.api_id_out_of_range`, High). Each call's `ApiClass` is carried
+into the event as `MotionCommand::command_class`; `Profile::evaluate`
+reports `Trick` (High), `Trajectory` (Medium), `Unknown` / `Malformed` on a
+motion service (High) as `robot.motion.unverifiable_command`, and
+`ControlHandover` as `robot.motion.control_handover` (High). The event path
+does not know the model, so a model-specific id (G1 `SwitchToUserCtrl`, Go2
+`FrontFlip`, ...) is `Unknown` there (High) and fully classified when a
+model is given. The `parameter` JSON is read by a bounded, allocation-free
+reader (16 KiB / depth 8 / 32 members, duplicate and escaped top-level keys
+rejected); top-level arrays are accepted where the SDK sends them (B2
+`TrajectoryFollow`, ≈ 3 KB). `Request_::parameter` / `Response_::data` are
+capped at that 16 KiB (`MAX_JSON_LEN`), not at `Limits::max_string_len`.
+
+Motion-relevant services, from every `*_api.hpp` under
+`unitree_sdk2/include/unitree/robot/**` and every client in
+`unitree_sdk2_python/unitree_sdk2py/**`:
+
+| service | models | interpreted |
+|---|---|---|
+| `sport` | Go2 / Go2-W / B2 / B2-W / A2 / AS2 (1001..2058), G1 / H2 / R1 loco (7001..7111; R1 `SetArmTask` 7106 and G1 / R1 FSM ids 701 / 702 / 706 from the Python SDK) | every id of the headers |
+| `loco` | H1 (8001..8204) | every id |
+| `arm` | G1 / H2 arm actions | every id |
+| `motion_switcher` | B2 / G1 (and every model using it) | every id (`SelectMode` / `ReleaseMode`: control handover) |
+| `obstacles_avoid` | Go2 | `Move` 1003 `{"x","y","yaw","mode"}`: mode 0 velocity, 1 / 2 position (trajectory); `UseRemoteCommandFromApi` handover |
+| `agv` | G1-D | `Move` 1001 `{"vx","vy","vyaw"}` velocity; `HeightAdjust` (normalised column speed, posture) |
+| `robot_state` | Go2 / B2 | `ServiceSwitch` (starts / stops services, the sport service included: handover) |
+| `uwbswitch` | Go2 (UWB tracking) | `SwitchSet` (robot follows the UWB remote: handover) |
+
+Not motion (never interpreted, `ApiService::Other`): `vui`, `voice`
+(audio), `videohub`, `front_videohub`, `back_videohub`, `config`. The SDK's
+`SportModeCmd_` IDL type is not published on any SDK topic.
+
+**Unitree CRC (advisory).** `unitree::crc::crc32_core` is the SDK's
+`crc32_core` (CRC-32, polynomial `0x04C11DB7`, init `0xFFFFFFFF`, MSB-first,
+no final XOR) over the struct's C++ image as `uint32` words, excluding the
+`crc` field, with **zeroed** padding. The SDK hashes the in-memory struct,
+whose padding bytes C++ leaves indeterminate on some builds (go `LowCmd_`
+22-23 and 803; go `LowState_` 22-23, 77-79, 1145-1147, 1154-1155; hg
+`LowCmd_` 2-3; hg `LowState_` 10-11, 70-71), so `crc_ok() == false` may be a
+padding artefact of the sender's build rather than a forged frame. It must
+be validated against captured traffic; nothing here or in the ROS 2
+pipeline changes a severity because of it (the Motion Firewall decides on
+its own). Tested against independent vectors (`tests/unitree_vectors.rs`,
+`tests/data/unitree/`: CRCs `0xe571104a`, `0x73b6f94c`, `0x533c453a`,
+`0xe09ebd5e` and every field value, in CDR_LE, CDR_BE and CDR2_LE).
+
+**XCDR2.** Every Unitree IDL type is `@final` (the generated TypeObjects
+carry `IS_FINAL`; the Python IDL is `@annotate.final`). Under XCDR2 no
+struct carries a DHEADER, only arrays / sequences of structs do; a `D_CDR2`
+encapsulation header is read the same way (Cyclone DDS takes the
+extensibility from the type), and `Limits::d_cdr2_nesting` does not apply.
+
+**Legacy UDP.** `LegacyHighCmd::to_motion_command` maps mode 2 (target
+velocity walking) to the body velocity and every mode to a class (posture,
+trajectory for position walking, trick for backflip / jumpYaw /
+straightHand, unknown); `LegacyLowCmd::to_motion_command` is the joint
+command as for DDS. The v3.8.6 library also has an unpublished `encryptCRC`
+mode: with it, plain CRC verification is expected to fail;
+`crc_check(.., LegacyCrcMode::EncryptCrc)` reports `None` (not checkable).
 
 ### Model matrix
 
 `UnitreeModel` is derived from the SDK directories, not invented; every
-entry carries its `source`. `ModelInfo` records generation, IDL family,
-morphology, motor slots, actuated motor count (where the SDK examples say),
-topics and API services.
+entry carries its `source`.
 
-| model | generation | IDL | morphology | actuated motors | source |
-|---|---|---|---|---|---|
-| Go2 | SDK2 DDS | go (20) | quadruped | 12 | `example/go2/go2_stand_example.cpp` |
-| Go2-W | SDK2 DDS | go (20) | wheeled quadruped | 16 (12 legs + 4 wheels) | `example/go2w/` |
-| B2 | SDK2 DDS | go (20) | quadruped | 12 | `example/b2/b2_stand_example.cpp` |
-| B2-W | SDK2 DDS | go (20) | wheeled quadruped | 16 | `example/b2w/` |
-| A2 | SDK2 DDS | — (no low-level example) | quadruped | ? | `example/a2/sport/`, `robot/a2/sport` |
-| AS2 | SDK2 DDS | — (no low-level example) | quadruped | ? | `example/as2/sport/`, `robot/as2/sport` |
-| H1 | SDK2 DDS | go (20) | humanoid | ? | `example/h1/low_level/humanoid.hpp` (unitree_go, loco service) |
-| H1-2 | SDK2 DDS | hg (35) | humanoid | 27 | `example/h1/low_level/h1_27dof_example.cpp` |
-| H2 | SDK2 DDS | hg (35) | humanoid | 31 | `example/h2/low_level/`, `robot/h2/{loco,arm}` |
-| G1 | SDK2 DDS | hg (35) | humanoid | 29 | `example/g1/low_level/`, Dex3, `robot/g1/{loco,arm}` |
-| R1 | SDK2 DDS | hg (35) | humanoid | 26 | `example/r1/low_level/` |
-| Go1 | legacy UDP | comm.h (20) | quadruped | 12 | `unitree_legged_sdk` v3.8.6 |
-| A1, Aliengo, B1 | legacy UDP | — | quadruped | 12 (nominal) | `quadruped.h` `LeggedType`; frame layout only in release v3.3.1 (not in these sources) |
+| model | generation | IDL | morphology | actuated motors | arm-SDK weight | topics / services covered |
+|---|---|---|---|---|---|---|
+| Go2 | SDK2 DDS | go (20) | quadruped | 12 | — | low cmd/state, `rt/lf/lowstate`, sport state; `sport`, `obstacles_avoid`, `robot_state`, `uwbswitch` |
+| Go2-W | SDK2 DDS | go (20) | wheeled quadruped | 16 | — | low cmd/state, `rt/lf/sportmodestate`; `sport` |
+| B2 | SDK2 DDS | go (20) | quadruped | 12 | — | low cmd/state; `sport`, `motion_switcher`, `robot_state` |
+| B2-W | SDK2 DDS | go (20) | wheeled quadruped | 16 | — | low cmd/state; `sport` |
+| A2 | SDK2 DDS | — (no low-level example) | quadruped | ? | — | `rt/lf/sportmodestate`; `sport` |
+| AS2 | SDK2 DDS | — (no low-level example) | quadruped | ? | — | `rt/lf/sportmodestate`; `sport` |
+| H1 | SDK2 DDS | go (20) | humanoid | ? | slot 9 | low cmd/state, `rt/arm_sdk`; `loco` |
+| H1-2 | SDK2 DDS | hg (35) | humanoid | 27 | slot 27 | low cmd/state, `rt/arm_sdk` |
+| H2 | SDK2 DDS | hg (35) | humanoid | 31 | slot 31 | low cmd/state, `rt/arm_sdk`, IMU; `sport`, `arm` |
+| G1 | SDK2 DDS | hg (35) | humanoid | 29 | slot 29 | low cmd/state, `rt/arm_sdk`, `rt/user_lowcmd`, `rt/hand_sdk`, Dex3, `rt/waistpitch*`, IMU; `sport`, `arm`, `agv`, `motion_switcher` |
+| R1 | SDK2 DDS | hg (35) | humanoid | 26 | `mode_pr` × 100 | low cmd/state, `rt/arm_sdk`, IMU; `sport` |
+| Go1 | legacy UDP | comm.h (20) | quadruped | 12 | — | `HighCmd` / `HighState` (129 / 1087 B), `LowCmd` / `LowState` declared layout only |
+| A1, Aliengo, B1 | legacy UDP | — | quadruped | 12 (nominal) | — | none: frame layout only in release v3.3.1 (not in these sources) |
+
+Topics found in `unitree_sdk2/example`, `include/unitree/dds_wrapper` and
+`unitree_sdk2_python` that carry **no command** and are not decoded:
+`rt/hispeed_state` (`geometry_msgs` `Point32_`, G1-D height),
+`rt/inspire/state` (Inspire hand state), `rt/audio_msg` (audio),
+`rt/utlidar/switch` (`std_msgs` `String_` lidar on/off).
 
 **Uncertainties (not guessed):**
 
 - A2 / AS2 ship no low-level example, so their motor count and IDL family
-  are unknown; only the sport-state (`unitree_go::SportModeState_`) and
-  sport client are confirmed.
-- H1 is listed by the SDK with a `unitree_go` low-level interface over an
-  array of 20 slots; its actuated motor count is not stated in the example.
-- A1 / Aliengo / B1 appear in `unitree_legged_sdk`'s `LeggedType` enum, but
-  v3.8.6 supports only Go1; their exact UDP frame layouts live in the older
-  v3.3.1 release, which is not in these sources. The legacy decoders target
-  the v3.8.6 `comm.h` layout.
-- v3.8.6 sends `LowCmd` / `LowState` in a "compressed" wire form
-  (`LOW_CMD_LENGTH = 614`, `LOW_STATE_LENGTH = 807`) whose layout is not in
-  the public headers; `unitree_legacy` decodes the declared `comm.h`
-  (uncompressed) layout and `LegacyKind::for_len` flags a 614/807-byte
-  frame as the undecodable compressed form. `HighCmd` / `HighState`
-  (129 / 1087 bytes) are not compressed and decode directly.
-- XCDR2: the SDK's own traffic is Cyclone DDS XCDR1 (`CDR_LE`); XCDR2
-  support (and the `D_CDR2` nesting choice, `Limits::d_cdr2_nesting`) is
-  spec-derived, as for the ROS types.
+  are unknown; only the sport-state and sport client are confirmed.
+- H1's actuated motor count is not stated in its example.
+- A1 / Aliengo / B1 frame layouts are only in release v3.3.1, not in these
+  sources; the legacy decoders target the v3.8.6 `comm.h` layout.
+- v3.8.6 sends `LowCmd` / `LowState` in a "compressed" wire form (614 / 807
+  bytes) whose layout is not published; `LegacyKind::for_len` flags it as
+  undecodable.
+- The model-specific API tables apply only when the caller passes the
+  model; the pipeline does not know it (see "API interpretation").
 
 ### Status
 
-Decoded from Unitree's published IDL / msg definitions and hand-built
-vectors; **not yet verified against traffic captured from a real robot.**
+Decoded from Unitree's published IDL / msg definitions, checked against
+hand-built vectors and against independent reviewer vectors (random field
+values, CDR_LE / CDR_BE / CDR2_LE, CRCs); **not yet verified on traffic
+captured from a real robot.** In particular the CRC padding behaviour, the
+`encryptCRC` mode and whether any robot sends XCDR2 must be confirmed on a
+capture.
 
 Separately (not motion messages, not in `MessageKind` / `Registry`):
 `std_msgs::msg::dds_::Bool_`, `UInt8_` and `String_` (`std_msgs` module,
@@ -143,8 +207,9 @@ let event = decoded.message.to_event(&EventContext {
 * `Registry::{new, with_builtin, register, kind, decoder, decode}` —
   `register` lets an integrator map a vendor-renamed type onto a built-in
   decoder (`registry::builtin_decoder(kind)`).
-* `Limits` (defaults): payload 256 KiB, string 256 bytes, sequence 1024
-  elements, trajectory 1024 points.
+* `Limits` (defaults): payload 256 KiB, string 256 bytes (the Unitree API
+  `parameter` / `data` strings use the 16 KiB JSON cap instead), sequence
+  1024 elements, trajectory 1024 points.
 
 ## Wire rules implemented
 

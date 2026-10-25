@@ -69,6 +69,8 @@ USAGE:
                           [--model NAME] [--margin 1.1] [--min-samples 30]
                           [--ceiling-linear M_PER_S] [--ceiling-joint RAD_PER_S]
                           [--hard-cap-linear 10] [--hard-cap-joint 10]
+                          [--hard-cap-torque 400] [--hard-cap-kp 1000]
+                          [--hard-cap-position-step 0.5]
                           [--min-announcements 2] [--min-duration SECS]
                           [--outlier-ratio 3]
                           [--accept-participant GUID]... [--motion-topic /T]...
@@ -84,6 +86,8 @@ USAGE:
                           [--sign-key signing.key] [--trusted-keys trust.json]
                           [--locked-at UNIX_SECS]
                           [--hard-cap-linear 10] [--hard-cap-joint 10] [--force]
+                          [--hard-cap-torque 400] [--hard-cap-kp 1000]
+                          [--hard-cap-position-step 0.5]
   robodr-commission sign    --profile locked.json --sign-key signing.key
                           [--operators operators.json] [--allow-unattested] [--force]
   robodr-commission verify-profile --profile locked.json --trusted-keys trust.json
@@ -116,6 +120,8 @@ USAGE:
   robodr-commission check   --profile locked.json (--events <f> | --pcap <f>) [...] [--json]
   robodr-commission merge   --out merged.json <a.json> <b.json> [...]
                           [--hard-cap-linear 10] [--hard-cap-joint 10] [--force]
+                          [--hard-cap-torque 400] [--hard-cap-kp 1000]
+                          [--hard-cap-position-step 0.5]
 
   --events: JSON Lines of RobotEvent. --pcap: pcap or pcapng capture of the
   robot bus (discovery, plus Twist / TwistStamped / JointTrajectory commands
@@ -132,8 +138,10 @@ USAGE:
   times (or, in captures, seen for less than --min-duration seconds) are
   quarantined: not learned, nor their endpoints or motion samples. Use
   --accept-participant to override (it becomes a sign-off item). No
-  envelope exceeds --hard-cap-linear / --hard-cap-joint, and lock and merge
-  refuse any bound above them (pass the same values used for learn). A
+  envelope exceeds --hard-cap-linear / --hard-cap-joint (and, for low-level
+  joint commands, --hard-cap-torque / --hard-cap-kp /
+  --hard-cap-position-step), and lock and merge refuse any bound above them
+  (pass the same values used for learn). A
   dimension never observed on a channel is bounded at its ceiling or 0
   (deny), never left unlimited. --outlier-ratio: max > ratio x p99 on an
   envelope needs sign-off. Endpoints announced under another participant's
@@ -433,12 +441,17 @@ fn precheck_outputs(paths: &[&str], force: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// `--hard-cap-linear` / `--hard-cap-joint` (defaults: learn's defaults).
+/// `--hard-cap-linear` / `--hard-cap-joint` / `--hard-cap-torque` /
+/// `--hard-cap-kp` / `--hard-cap-position-step` (defaults: learn's
+/// defaults).
 fn hard_caps(a: &Args) -> Result<HardCaps, String> {
     let mut caps = HardCaps::default();
     for (name, slot) in [
         ("hard-cap-linear", &mut caps.linear),
         ("hard-cap-joint", &mut caps.joint),
+        ("hard-cap-torque", &mut caps.torque),
+        ("hard-cap-kp", &mut caps.kp),
+        ("hard-cap-position-step", &mut caps.position_step),
     ] {
         if let Some(v) = a.f64_opt(name)? {
             if v <= 0.0 {
@@ -544,6 +557,9 @@ fn cmd_learn(argv: &[String]) -> Outcome {
             "signoff",
             "hard-cap-linear",
             "hard-cap-joint",
+            "hard-cap-torque",
+            "hard-cap-kp",
+            "hard-cap-position-step",
             "min-announcements",
             "min-duration",
             "accept-participant",
@@ -576,6 +592,15 @@ fn cmd_learn(argv: &[String]) -> Outcome {
     }
     if let Some(v) = a.f64_opt("hard-cap-joint")? {
         cfg.hard_cap_joint = v;
+    }
+    if let Some(v) = a.f64_opt("hard-cap-torque")? {
+        cfg.hard_cap_torque = v;
+    }
+    if let Some(v) = a.f64_opt("hard-cap-kp")? {
+        cfg.hard_cap_kp = v;
+    }
+    if let Some(v) = a.f64_opt("hard-cap-position-step")? {
+        cfg.hard_cap_position_step = v;
     }
     if let Some(v) = a.f64_opt("outlier-ratio")? {
         cfg.outlier_ratio = v;
@@ -819,6 +844,9 @@ fn cmd_lock(argv: &[String]) -> Outcome {
             "signoff",
             "hard-cap-linear",
             "hard-cap-joint",
+            "hard-cap-torque",
+            "hard-cap-kp",
+            "hard-cap-position-step",
             "platform",
             "unit-id",
             "profile-version",
@@ -1989,7 +2017,14 @@ fn cmd_operators(argv: &[String]) -> Outcome {
 fn cmd_merge(argv: &[String]) -> Outcome {
     let a = Args::parse(
         argv,
-        &["out", "hard-cap-linear", "hard-cap-joint"],
+        &[
+            "out",
+            "hard-cap-linear",
+            "hard-cap-joint",
+            "hard-cap-torque",
+            "hard-cap-kp",
+            "hard-cap-position-step",
+        ],
         &["force"],
     )?;
     let caps = hard_caps(&a)?;

@@ -107,13 +107,16 @@ pub const METADATA_KEYS: [&str; 7] = [
 pub const OPTIONAL_METADATA_KEYS: [&str; 1] = ["attestation"];
 /// Keys of one envelope object; both must be present.
 pub const ENVELOPE_KEYS: [&str; 2] = ["max_linear_speed", "max_joint_speed"];
-/// Optional per-axis limit keys of an envelope (number or null when
-/// present). Absent = `None`; `Envelope` does not serialise them when
+/// Optional per-axis and joint-term limit keys of an envelope (number or
+/// null when present). Absent = `None`; `Envelope` does not serialise them when
 /// `None`, so files written before they existed are byte-identical.
-pub const OPTIONAL_ENVELOPE_LIMIT_KEYS: [&str; 3] = [
+pub const OPTIONAL_ENVELOPE_LIMIT_KEYS: [&str; 6] = [
     "max_lateral_speed",
     "max_vertical_speed",
     "max_roll_pitch_rate",
+    "max_joint_torque",
+    "max_joint_kp",
+    "max_joint_position_step",
 ];
 /// Optional boolean key of an envelope (absent = `false`).
 pub const ENVELOPE_HOLONOMIC_KEY: &str = "holonomic";

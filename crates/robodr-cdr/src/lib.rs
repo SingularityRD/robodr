@@ -229,10 +229,16 @@ pub enum MessageKind {
     UnitreeHgDoubleImuState,
     /// `unitree_api::msg::dds_::Request_` (command).
     UnitreeApiRequest,
+    /// `unitree_go::msg::dds_::MotorCmds_` (command, `rt/hand_sdk`).
+    UnitreeGoMotorCmds,
+    /// `unitree_hg::msg::dds_::MotorCmd_` (command, `rt/waistpitchcmd`).
+    UnitreeHgMotorCmd,
+    /// `unitree_hg::msg::dds_::MotorState_` (feedback, `rt/waistpitchstate`).
+    UnitreeHgMotorState,
 }
 
 impl MessageKind {
-    pub const ALL: [MessageKind; 16] = [
+    pub const ALL: [MessageKind; 19] = [
         MessageKind::Twist,
         MessageKind::TwistStamped,
         MessageKind::Odometry,
@@ -249,6 +255,9 @@ impl MessageKind {
         MessageKind::UnitreeHgImuState,
         MessageKind::UnitreeHgDoubleImuState,
         MessageKind::UnitreeApiRequest,
+        MessageKind::UnitreeGoMotorCmds,
+        MessageKind::UnitreeHgMotorCmd,
+        MessageKind::UnitreeHgMotorState,
     ];
 
     /// The standard ROS 2 kinds (the six this crate decoded before the
@@ -281,6 +290,9 @@ impl MessageKind {
             MessageKind::UnitreeHgImuState => UnitreeKind::HgImuState,
             MessageKind::UnitreeHgDoubleImuState => UnitreeKind::HgDoubleImuState,
             MessageKind::UnitreeApiRequest => UnitreeKind::ApiRequest,
+            MessageKind::UnitreeGoMotorCmds => UnitreeKind::GoMotorCmds,
+            MessageKind::UnitreeHgMotorCmd => UnitreeKind::HgMotorCmd,
+            MessageKind::UnitreeHgMotorState => UnitreeKind::HgMotorState,
         })
     }
 
@@ -325,7 +337,9 @@ impl MessageKind {
             | MessageKind::UnitreeGoLowCmd
             | MessageKind::UnitreeHgLowCmd
             | MessageKind::UnitreeHgHandCmd
-            | MessageKind::UnitreeApiRequest => MotionRole::Command,
+            | MessageKind::UnitreeApiRequest
+            | MessageKind::UnitreeGoMotorCmds
+            | MessageKind::UnitreeHgMotorCmd => MotionRole::Command,
             MessageKind::Odometry
             | MessageKind::Imu
             | MessageKind::JointState
@@ -334,7 +348,8 @@ impl MessageKind {
             | MessageKind::UnitreeHgLowState
             | MessageKind::UnitreeHgHandState
             | MessageKind::UnitreeHgImuState
-            | MessageKind::UnitreeHgDoubleImuState => MotionRole::Feedback,
+            | MessageKind::UnitreeHgDoubleImuState
+            | MessageKind::UnitreeHgMotorState => MotionRole::Feedback,
         }
     }
 }
@@ -364,6 +379,9 @@ pub enum MotionMessage<'a> {
     UnitreeHgImuState(unitree::HgImuState),
     UnitreeHgDoubleImuState(unitree::HgDoubleImuState),
     UnitreeApiRequest(unitree::ApiRequest<'a>),
+    UnitreeGoMotorCmds(unitree::GoMotorCmds),
+    UnitreeHgMotorCmd(unitree::HgMotorCmd),
+    UnitreeHgMotorState(unitree::HgMotorState),
 }
 
 impl<'a> MotionMessage<'a> {
@@ -381,6 +399,9 @@ impl<'a> MotionMessage<'a> {
             UnitreeMessage::HgImuState(x) => MotionMessage::UnitreeHgImuState(x),
             UnitreeMessage::HgDoubleImuState(x) => MotionMessage::UnitreeHgDoubleImuState(x),
             UnitreeMessage::ApiRequest(x) => MotionMessage::UnitreeApiRequest(x),
+            UnitreeMessage::GoMotorCmds(x) => MotionMessage::UnitreeGoMotorCmds(x),
+            UnitreeMessage::HgMotorCmd(x) => MotionMessage::UnitreeHgMotorCmd(x),
+            UnitreeMessage::HgMotorState(x) => MotionMessage::UnitreeHgMotorState(x),
             UnitreeMessage::GoWirelessController(_) | UnitreeMessage::ApiResponse(_) => {
                 return None
             }
@@ -394,6 +415,8 @@ impl<'a> MotionMessage<'a> {
             MotionMessage::UnitreeGoLowCmd(m) => Some(m.joint_frame()),
             MotionMessage::UnitreeHgLowCmd(m) => Some(m.joint_frame()),
             MotionMessage::UnitreeHgHandCmd(m) => Some(m.joint_frame()),
+            MotionMessage::UnitreeGoMotorCmds(m) => Some(m.joint_frame()),
+            MotionMessage::UnitreeHgMotorCmd(m) => Some(m.joint_frame()),
             _ => None,
         }
     }
@@ -404,14 +427,23 @@ impl<'a> MotionMessage<'a> {
             MotionMessage::UnitreeGoLowState(m) => Some(m.joint_frame()),
             MotionMessage::UnitreeHgLowState(m) => Some(m.joint_frame()),
             MotionMessage::UnitreeHgHandState(m) => Some(m.joint_frame()),
+            MotionMessage::UnitreeHgMotorState(m) => Some(m.joint_frame()),
             _ => None,
         }
     }
 
     /// `Some(crc_ok)` for Unitree go / hg `LowCmd_` / `LowState_`, `None`
-    /// for types without a CRC. Not part of [`Decoded::anomalies`]: a
-    /// consumer that wants to require a valid CRC (the robot drops frames
-    /// without one) checks this.
+    /// for types without a CRC. **Advisory**, and not part of
+    /// [`Decoded::anomalies`]: the CRC is recomputed over the C++ struct
+    /// image with zeroed padding ([`crate::unitree::crc`]), but the SDK
+    /// hashes the in-memory struct, whose padding bytes C++ leaves
+    /// indeterminate on some builds (go `LowCmd_` 22-23 and 803, go
+    /// `LowState_` 22-23, 77-79, 1145-1147, 1154-1155, hg `LowCmd_` 2-3,
+    /// hg `LowState_` 10-11, 70-71). So `false` may be a padding artefact of
+    /// the sender's build, not a forged frame, and must be validated
+    /// against captured traffic before it is relied on; nothing in this
+    /// crate or the ROS 2 pipeline changes a severity because of it. (A
+    /// firewall that chooses to require it does so knowingly.)
     pub fn unitree_crc_ok(&self) -> Option<bool> {
         match self {
             MotionMessage::UnitreeGoLowCmd(m) => Some(m.crc_ok()),
@@ -432,9 +464,10 @@ impl<'a> MotionMessage<'a> {
                 "JointTrajectory has no velocities and fewer than two points with positions \
                  (the start position is not in the message)",
             ),
-            // The parameter of a Unitree API request is not readable JSON:
-            // whatever the call is, its arguments cannot be checked.
-            MotionMessage::UnitreeApiRequest(q) => q.parameter_json().err().map(|e| e.reason()),
+            // The parameter of a Unitree API request is not readable JSON
+            // (an object, or an array where the SDK sends one): whatever
+            // the call is, its arguments cannot be checked.
+            MotionMessage::UnitreeApiRequest(q) => q.parameter_document().err().map(|e| e.reason()),
             _ => None,
         }
     }
@@ -457,6 +490,9 @@ impl<'a> MotionMessage<'a> {
             MotionMessage::UnitreeHgImuState(_) => MessageKind::UnitreeHgImuState,
             MotionMessage::UnitreeHgDoubleImuState(_) => MessageKind::UnitreeHgDoubleImuState,
             MotionMessage::UnitreeApiRequest(_) => MessageKind::UnitreeApiRequest,
+            MotionMessage::UnitreeGoMotorCmds(_) => MessageKind::UnitreeGoMotorCmds,
+            MotionMessage::UnitreeHgMotorCmd(_) => MessageKind::UnitreeHgMotorCmd,
+            MotionMessage::UnitreeHgMotorState(_) => MessageKind::UnitreeHgMotorState,
         }
     }
 }
@@ -490,6 +526,12 @@ pub enum DecodeAnomaly {
     /// A command whose speed cannot be bounded from the message, so no
     /// envelope can check it (see [`MotionMessage::unverifiable_reason`]).
     UnverifiableCommand { reason: &'static str },
+    /// A Unitree API request / response whose wire `api_id` (`int64`) is
+    /// outside the `int32` range. The SDK server dispatches on the low 32
+    /// bits, so the robot executes a different id than the one sent
+    /// (`2^32 + 1008` is `Move`): an evasion attempt. The call is
+    /// interpreted as the robot reads it ([`ApiRequest::call`]).
+    ApiIdOutOfRange { api_id: i64 },
 }
 
 impl std::fmt::Display for DecodeAnomaly {
@@ -502,6 +544,11 @@ impl std::fmt::Display for DecodeAnomaly {
             DecodeAnomaly::UnverifiableCommand { reason } => {
                 write!(f, "command speed cannot be verified: {reason}")
             }
+            DecodeAnomaly::ApiIdOutOfRange { api_id } => write!(
+                f,
+                "api_id {api_id} is outside int32; the robot dispatches it as {}",
+                unitree::api::dispatched_id(*api_id)
+            ),
         }
     }
 }
@@ -518,6 +565,11 @@ impl Decoded<'_> {
         }
         if let Some(reason) = self.message.unverifiable_reason() {
             v.push(DecodeAnomaly::UnverifiableCommand { reason });
+        }
+        if let MotionMessage::UnitreeApiRequest(q) = &self.message {
+            if !q.api_id_in_range() {
+                v.push(DecodeAnomaly::ApiIdOutOfRange { api_id: q.api_id });
+            }
         }
         v
     }

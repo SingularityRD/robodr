@@ -649,6 +649,18 @@ fn catalog_1_3_wave7(rule: &str) -> Option<RuleInfo> {
             MOTION,
             &[],
         ),
+        "robot.motion.api_id_out_of_range" => e(
+            "Robot API request with an aliased call id",
+            "A robot API request carried a call id outside the 32-bit range the robot dispatches on, so the robot executes a different call than the one written.",
+            MOTION,
+            &[T0855],
+        ),
+        "robot.motion.control_handover" => e(
+            "Motor control handed to another channel",
+            "A command hands motor control to, or takes it from, another channel or controller (motion switcher release, user or arm SDK control).",
+            MOTION,
+            &[T0855],
+        ),
         // --- robodr-motion consistency monitor -----------------------------
         "robot.motion.feedback_divergence" => e(
             "Motion feedback diverges from commands",

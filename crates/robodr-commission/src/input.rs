@@ -447,6 +447,10 @@ pub struct PcapSource<R: Read> {
     walker: UserDataWalker,
     /// Announced motion command writers: GUID -> (channel, DDS type name).
     motion_writers: HashMap<Guid, (String, String)>,
+    /// Previous low-level joint frame per motion channel, for
+    /// `MotionCommand::joint_position_step` (same rule as the sensor
+    /// pipeline: the previous frame decoded on the channel, any writer).
+    last_joint_frames: HashMap<String, robodr_cdr::JointCommandFrame>,
     /// Source IPs each participant's own SPDP came from.
     spdp_ips: HashMap<[u8; 12], BTreeSet<String>>,
     motion_samples: u64,
@@ -488,6 +492,7 @@ impl<R: Read> PcapSource<R> {
             done: false,
             walker: UserDataWalker::default(),
             motion_writers: HashMap::new(),
+            last_joint_frames: HashMap::new(),
             spdp_ips: HashMap::new(),
             motion_samples: 0,
             motion_undecodable: 0,
@@ -705,7 +710,7 @@ impl<R: Read> PcapSource<R> {
                 continue;
             };
             let source = hex12(&prefix);
-            let event = decoded.message.to_event(&robodr_cdr::EventContext {
+            let mut event = decoded.message.to_event(&robodr_cdr::EventContext {
                 channel,
                 // The learner attributes commands to participants (prefix).
                 writer_guid: Some(&source),
@@ -713,6 +718,16 @@ impl<R: Read> PcapSource<R> {
                     .map(|t| u64::try_from(t.as_nanos()).unwrap_or(u64::MAX))
                     .unwrap_or(0),
             });
+            if let (RobotEvent::MotionCommand(c), Some(frame)) =
+                (&mut event, decoded.message.joint_command_frame())
+            {
+                if let Some(prev) = self.last_joint_frames.get_mut(channel) {
+                    c.joint_position_step = frame.max_position_step(prev);
+                    *prev = frame;
+                } else if self.last_joint_frames.len() < MAX_MOTION_WRITERS {
+                    self.last_joint_frames.insert(channel.clone(), frame);
+                }
+            }
             if !matches!(event, RobotEvent::MotionCommand(_)) {
                 self.motion_undecodable += 1;
                 continue;

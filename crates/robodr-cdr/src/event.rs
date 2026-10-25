@@ -7,8 +7,8 @@
 //! | `Odometry` | [`MotionFeedback`] | `linear_velocity{,_y,_z} = twist.twist.linear.{x,y,z}`, `angular_velocity_{x,y} = twist.twist.angular.{x,y}`, `angular_velocity = twist.twist.angular.z`, `measured_linear_speed = ‖twist.twist.linear‖` |
 //! | `Imu` | [`MotionFeedback`] | `angular_velocity_x/_y = angular_velocity.x/.y`, `angular_velocity = angular_velocity.z` |
 //! | `JointState` | [`MotionFeedback`] | `measured_joint_speed` = max \|velocity\| (`None` if `velocity` is empty) |
-//! | Unitree go / hg `LowCmd_`, hg `HandCmd_` | [`MotionCommand`] | `joint_speed` = [`crate::unitree::JointCommandFrame::max_commanded_joint_speed`]: max \|dq\| over enabled motors with `kd != 0`, `0.0` if none, NaN if an enabled motor has a non-finite field; the full per-motor q / dq / tau / kp / kd is in [`crate::unitree::JointCommandFrame`] |
-//! | Unitree `Request_` | [`MotionCommand`] | `Move` / `SetVelocity`: `linear_speed = vx`, `linear_y = vy`, `angular_speed = vyaw`, `linear_z = angular_x = angular_y = 0`; `StopMove`: all six 0; a known velocity call with an unreadable parameter: all six NaN; anything else: no speed fields. Service from the channel, no model |
+//! | Unitree go / hg `LowCmd_`, hg `HandCmd_`, go `MotorCmds_`, hg `MotorCmd_` | [`MotionCommand`] | over **every** slot, whatever its mode octet: `joint_speed` = max \|dq\| over slots with `kd != 0` (`0.0` if none), `joint_torque` = max \|tau\|, `joint_kp` = max \|kp\|; all three NaN if any field of any slot is non-finite ([`crate::unitree::JointCommandFrame`]). `joint_position_step` needs the previous frame and is left to a stateful consumer |
+//! | Unitree `Request_` | [`MotionCommand`] | `Move` / `SetVelocity` (sport, loco, obstacles_avoid, agv): `linear_speed = vx`, `linear_y = vy`, `angular_speed = vyaw`, `linear_z = angular_x = angular_y = 0`; `StopMove`: all six 0; a known velocity call with an unreadable parameter: all six NaN; anything else: no speed fields. `command_class` = the call's [`crate::unitree::ApiClass`] (none on a known non-motion service), `command_name` = its SDK name and wire api id. Service from the channel, no model |
 //! | Unitree go / hg `LowState_` | [`MotionFeedback`] | `measured_joint_speed` = max \|dq\| over all slots; `angular_velocity_x/_y`, `angular_velocity` = IMU gyroscope x / y / z |
 //! | Unitree hg `HandState_` | [`MotionFeedback`] | `measured_joint_speed` = max \|dq\| |
 //! | Unitree go `SportModeState_` | [`MotionFeedback`] | `linear_velocity{,_y,_z}` = `velocity[0..3]`, `measured_linear_speed` = ‖velocity‖, `angular_velocity` = `yaw_speed`, `angular_velocity_x/_y` = IMU gyroscope x / y |
@@ -40,10 +40,10 @@
 //! `TwistStamped`'s header stamp is **not** used as the event time: it is a
 //! wire claim. The caller passes the observation time (`timestamp_ns`).
 
-use robodr_events::{MotionCommand, MotionFeedback, RobotEvent};
+use robodr_events::{CommandClass, MotionCommand, MotionFeedback, RobotEvent};
 
 use crate::msgs::Twist;
-use crate::unitree::ApiRequest;
+use crate::unitree::{ApiClass, ApiRequest, ApiService};
 use crate::{MotionMessage, MotionRole};
 
 /// Who/where/when a sample was observed. All of it comes from the transport
@@ -70,6 +70,7 @@ fn twist_command(t: &Twist, ctx: &EventContext<'_>) -> MotionCommand {
         linear_z: Some(t.linear.z),
         angular_x: Some(t.angular.x),
         angular_y: Some(t.angular.y),
+        ..MotionCommand::default()
     }
 }
 
@@ -95,16 +96,50 @@ fn gyro_feedback(g: [f32; 3], ctx: &EventContext<'_>) -> MotionFeedback {
     }
 }
 
+/// [`ApiClass`] as the event model's [`CommandClass`].
+pub fn command_class(c: ApiClass) -> CommandClass {
+    match c {
+        ApiClass::Velocity => CommandClass::Velocity,
+        ApiClass::Stop => CommandClass::Stop,
+        ApiClass::Posture => CommandClass::Posture,
+        ApiClass::Config => CommandClass::Config,
+        ApiClass::Trick => CommandClass::Trick,
+        ApiClass::Trajectory => CommandClass::Trajectory,
+        ApiClass::ControlHandover => CommandClass::ControlHandover,
+        ApiClass::Query => CommandClass::Query,
+        ApiClass::Unknown => CommandClass::Unknown,
+        ApiClass::Malformed => CommandClass::Malformed,
+    }
+}
+
 /// A Unitree API request as a command. The service comes from the channel
 /// (`/api/<svc>/request`), the model is not known here, so only calls that
 /// mean the same on every model are interpreted ([`ApiRequest::call`]).
+/// Every request on a motion (or unidentified) service carries its
+/// [`ApiClass`] as `command_class`, so `Profile::evaluate` flags the calls
+/// whose motion the request does not bound (tricks, trajectories, control
+/// handovers, unknown / malformed calls); a request on a known non-motion
+/// service (`vui`, `voice`, ...) carries none.
 fn api_command(q: &ApiRequest<'_>, ctx: &EventContext<'_>) -> MotionCommand {
+    let service = ApiService::from_topic(ctx.channel);
+    let call = q.call(service, None);
+    let (command_class, command_name) = if service == ApiService::Other {
+        (None, None)
+    } else {
+        let name = match call.name() {
+            Some(n) => format!("{n} (api_id {})", q.api_id),
+            None => format!("api_id {}", q.api_id),
+        };
+        (Some(command_class(call.class())), Some(name))
+    };
     let base = MotionCommand {
         channel: ctx.channel.to_owned(),
         source_guid: ctx.writer_guid.map(str::to_owned),
+        command_class,
+        command_name,
         ..MotionCommand::default()
     };
-    match q.call_for_topic(ctx.channel, None).body_velocity() {
+    match call.body_velocity() {
         // A body-velocity request on a legged base: x / y / yaw, and the
         // axes the API cannot command are explicitly zero.
         Some((vx, vy, vyaw)) => MotionCommand {
@@ -141,6 +176,8 @@ impl MotionMessage<'_> {
             MotionMessage::UnitreeGoLowCmd(m) => Some(m.joint_frame().to_motion_command(ctx)),
             MotionMessage::UnitreeHgLowCmd(m) => Some(m.joint_frame().to_motion_command(ctx)),
             MotionMessage::UnitreeHgHandCmd(m) => Some(m.joint_frame().to_motion_command(ctx)),
+            MotionMessage::UnitreeGoMotorCmds(m) => Some(m.joint_frame().to_motion_command(ctx)),
+            MotionMessage::UnitreeHgMotorCmd(m) => Some(m.joint_frame().to_motion_command(ctx)),
             MotionMessage::UnitreeApiRequest(q) => Some(api_command(q, ctx)),
             MotionMessage::Odometry(_)
             | MotionMessage::Imu(_)
@@ -150,7 +187,8 @@ impl MotionMessage<'_> {
             | MotionMessage::UnitreeHgLowState(_)
             | MotionMessage::UnitreeHgHandState(_)
             | MotionMessage::UnitreeHgImuState(_)
-            | MotionMessage::UnitreeHgDoubleImuState(_) => None,
+            | MotionMessage::UnitreeHgDoubleImuState(_)
+            | MotionMessage::UnitreeHgMotorState(_) => None,
         }
     }
 
@@ -205,12 +243,18 @@ impl MotionMessage<'_> {
             }
             MotionMessage::UnitreeHgImuState(s) => Some(gyro_feedback(s.gyroscope, ctx)),
             MotionMessage::UnitreeHgDoubleImuState(s) => Some(gyro_feedback(s.gyroscope, ctx)),
+            MotionMessage::UnitreeHgMotorState(s) => Some(MotionFeedback {
+                measured_joint_speed: s.joint_frame().max_abs_velocity(),
+                ..feedback(ctx)
+            }),
             MotionMessage::Twist(_)
             | MotionMessage::TwistStamped(_)
             | MotionMessage::JointTrajectory(_)
             | MotionMessage::UnitreeGoLowCmd(_)
             | MotionMessage::UnitreeHgLowCmd(_)
             | MotionMessage::UnitreeHgHandCmd(_)
+            | MotionMessage::UnitreeGoMotorCmds(_)
+            | MotionMessage::UnitreeHgMotorCmd(_)
             | MotionMessage::UnitreeApiRequest(_) => None,
         }
     }

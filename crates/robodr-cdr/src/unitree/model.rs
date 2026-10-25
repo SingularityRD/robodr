@@ -78,7 +78,15 @@ pub struct ModelInfo {
     /// Motor slots in the low-level message (20 for go / legacy, 35 for hg).
     pub motor_slots: Option<usize>,
     /// Motors the SDK examples actually drive, if the examples say.
+    /// Informational: every slot on the wire is evaluated, never only
+    /// these (see [`ModelInfo::arm_sdk_weight_slot`]).
     pub actuated_motors: Option<usize>,
+    /// The `motor_cmd` slot whose `q` carries the `rt/arm_sdk` blend weight
+    /// (`kNotUsedJoint` in the arm-SDK examples): G1 29, H1 9, H1-2 27,
+    /// H2 31. `None` where the SDK uses no slot: R1 carries the weight in
+    /// `mode_pr` (× 100, `dds_wrapper/robots/r1/r1_pub.h`). A slot past
+    /// [`ModelInfo::actuated_motors`] that still matters.
+    pub arm_sdk_weight_slot: Option<usize>,
     /// Low-level command topic.
     pub lowcmd_topic: Option<&'static str>,
     /// Low-level state topic.
@@ -137,10 +145,10 @@ impl UnitreeModel {
                 Quadruped,
                 Some(12),
                 LOW,
-                &["rt/sportmodestate"],
-                &[],
-                &["sport"],
-                "unitree_sdk2 example/go2/go2_stand_example.cpp (12 joints), go2_sport_client.cpp; include/unitree/robot/go2/sport",
+                &["rt/sportmodestate", "rt/lf/sportmodestate"],
+                &["rt/lf/lowstate"],
+                &["sport", "obstacles_avoid", "robot_state", "uwbswitch"],
+                "unitree_sdk2 example/go2/go2_stand_example.cpp (12 joints), go2_sport_client.cpp; include/unitree/robot/go2/{sport,obstacles_avoid,robot_state,utrack}; unitree_sdk2_python example/wireless_controller (rt/lf/lowstate)",
             ),
             UnitreeModel::Go2W => (
                 "Go2-W",
@@ -163,8 +171,8 @@ impl UnitreeModel {
                 LOW,
                 &[],
                 &[],
-                &["sport", "motion_switcher"],
-                "unitree_sdk2 example/b2/b2_stand_example.cpp (12 joints); include/unitree/robot/b2/{sport,motion_switcher}",
+                &["sport", "motion_switcher", "robot_state"],
+                "unitree_sdk2 example/b2/b2_stand_example.cpp (12 joints); include/unitree/robot/b2/{sport,motion_switcher,robot_state}",
             ),
             UnitreeModel::B2W => (
                 "B2-W",
@@ -248,6 +256,10 @@ impl UnitreeModel {
                 &[],
                 &[
                     "rt/arm_sdk",
+                    "rt/user_lowcmd",
+                    "rt/hand_sdk",
+                    "rt/waistpitchcmd",
+                    "rt/waistpitchstate",
                     "rt/secondary_imu",
                     "rt/dex3/left/cmd",
                     "rt/dex3/right/cmd",
@@ -256,8 +268,8 @@ impl UnitreeModel {
                     "rt/lf/dex3/left/state",
                     "rt/lf/dex3/right/state",
                 ],
-                &["sport", "arm"],
-                "unitree_sdk2 example/g1/low_level/g1_ankle_swing_example.cpp (G1_NUM_MOTOR = 29), dex3/g1_dex3_example.cpp; include/unitree/robot/g1/{loco,arm}",
+                &["sport", "arm", "agv", "motion_switcher"],
+                "unitree_sdk2 example/g1/low_level/g1_ankle_swing_example.cpp (G1_NUM_MOTOR = 29), dex3/g1_dex3_example.cpp, high_level/g1_userctrl_dds_example.cpp (rt/user_lowcmd), high_level/g1_hand_sdk_example.cpp (rt/hand_sdk, go MotorCmds_), g1d/g1d_waist_example.cpp (rt/waistpitch*, hg MotorCmd_/MotorState_), g1d/g1d_arm_example.cpp (motion_switcher); include/unitree/robot/g1/{loco,arm,agv}",
             ),
             UnitreeModel::R1 => (
                 "R1",
@@ -320,6 +332,18 @@ impl UnitreeModel {
                 "unitree_legged_sdk quadruped.h LeggedType::B1, b1_const.h; frame layout only in release v3.3.1 (not available here)",
             ),
         };
+        let arm_sdk_weight_slot = match self {
+            // example/g1/high_level/g1_arm7_sdk_dds_example.cpp (kNotUsedJoint = 29),
+            // dds_wrapper/robots/g1/g1_pub.h (motor_cmd()[29].q()).
+            UnitreeModel::G1 => Some(29),
+            // example/h1/high_level/h1_arm_sdk_dds_example.cpp (kNotUsedJoint = 9).
+            UnitreeModel::H1 => Some(9),
+            // example/h1/high_level/h1_2_arm_sdk_dds_example.cpp (kNotUsedJoint = 27).
+            UnitreeModel::H1_2 => Some(27),
+            // example/h2/high_level/h2_arm_sdk_dds_example.cpp (kArmSdkWeightJoint = 31).
+            UnitreeModel::H2 => Some(31),
+            _ => None,
+        };
         let motor_slots = match idl {
             Some(Go) | Some(LegacyComm) => Some(crate::unitree::MOTOR_SLOTS_GO),
             Some(Hg) => Some(crate::unitree::MOTOR_SLOTS_HG),
@@ -333,6 +357,7 @@ impl UnitreeModel {
             morphology,
             motor_slots,
             actuated_motors: actuated,
+            arm_sdk_weight_slot,
             lowcmd_topic: low.0,
             lowstate_topic: low.1,
             sport_state_topics: sport,

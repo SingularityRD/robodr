@@ -11,6 +11,16 @@
 //! with `kp = kd = 0` (`example/go2/go2_low_level.cpp`), which must not be
 //! read as a 16000 rad/s command. [`JointCommandFrame::max_commanded_joint_speed`]
 //! follows the same rule.
+//!
+//! **The mode octet never gates a check.** Its meaning differs per channel:
+//! `rt/arm_sdk` frames always send `mode = 0` and still move the arms with
+//! kp / kd / dq (`example/g1/high_level/g1_arm7_sdk_dds_example.cpp`,
+//! `h1/high_level/h1_arm_sdk_dds_example.cpp`), the Dex3 hand packs a
+//! bitfield into it ([`crate::unitree::Dex3Mode`]) and `rt/hand_sdk` uses
+//! slot 0's mode as a blend weight. So every slot is evaluated, whatever
+//! its mode: a slot is *active* when its mode, kp, kd or tau is non-zero
+//! ([`JointCommand::active`]), and a non-finite value in **any** field of
+//! **any** slot poisons the frame.
 
 use robodr_events::MotionCommand;
 
@@ -41,9 +51,17 @@ pub struct JointCommand {
 }
 
 impl JointCommand {
-    /// The motor is enabled (mode octet non-zero).
+    /// The mode octet is non-zero. Informational only: no check depends
+    /// on it (see the module docs).
     pub fn enabled(&self) -> bool {
         self.mode != 0
+    }
+
+    /// The slot can act on its motor: a non-zero mode, or a non-zero
+    /// `kp`, `kd` or `tau` (NaN counts as non-zero). The same reading as
+    /// the Motion Firewall's joint frames.
+    pub fn active(&self) -> bool {
+        self.mode != 0 || [self.kp, self.kd, self.tau].iter().any(|x| *x != 0.0)
     }
 
     /// Every numeric field is finite.
@@ -133,46 +151,73 @@ impl JointCommandFrame {
         self.joints.as_slice()
     }
 
-    /// Restrict to the first `n` slots, e.g. the model's actuated motors
-    /// ([`crate::unitree::ModelInfo::actuated_motors`]).
+    /// Restrict to the first `n` slots, **for display only**. Never use it
+    /// before an evaluation: the robot reads every slot on the wire, and
+    /// slots past [`crate::unitree::ModelInfo::actuated_motors`] matter (the
+    /// arm-SDK weight is `motor_cmd[29].q` on G1, see
+    /// [`crate::unitree::ModelInfo::arm_sdk_weight_slot`]). Every method of
+    /// this type, and [`JointCommandFrame::to_motion_command`], looks at all
+    /// slots.
     pub fn truncated(mut self, n: usize) -> Self {
         self.joints.truncate(n);
         self
     }
 
-    /// The largest commanded joint speed |dq| (rad/s) over the motors whose
-    /// velocity target can act: enabled (`mode != 0`) and `kd != 0`.
+    /// Every field of every slot is finite.
+    pub fn is_finite(&self) -> bool {
+        self.as_slice().iter().all(JointCommand::is_finite)
+    }
+
+    /// The largest commanded joint speed |dq| (rad/s) over the slots whose
+    /// velocity target can act (`kd != 0`), whatever their mode.
     ///
-    /// * `Some(0.0)` when no enabled motor has a velocity gain (pure
-    ///   position / torque control, or everything disabled): the frame
-    ///   commands no velocity. Position steps are not visible in a single
-    ///   frame; compare consecutive frames with
-    ///   [`JointCommandFrame::max_position_step`].
-    /// * NaN when an enabled motor has **any** non-finite field (q, dq,
-    ///   tau, kp or kd): a NaN gain or torque is as dangerous as a NaN
-    ///   velocity, and `MotionCommand` only has room for the speed, so the
-    ///   whole frame is poisoned (the firewall treats non-finite commands
-    ///   as Critical).
+    /// * `Some(0.0)` when no slot has a velocity gain (pure position /
+    ///   torque control, or an idle frame): the frame commands no velocity.
+    ///   Torque and stiffness are in [`JointCommandFrame::max_abs_torque`]
+    ///   / [`JointCommandFrame::max_abs_kp`]; position steps need the
+    ///   previous frame ([`JointCommandFrame::max_position_step`]).
+    /// * NaN when **any** slot has **any** non-finite field (q, dq, tau, kp
+    ///   or kd): the whole frame is poisoned (the firewall and
+    ///   `Profile::evaluate` treat non-finite commands as Critical).
     pub fn max_commanded_joint_speed(&self) -> f64 {
-        let mut max = 0.0f64;
-        for j in self.as_slice().iter().filter(|j| j.enabled()) {
-            if !j.is_finite() {
-                return f64::NAN;
-            }
-            if j.kd != 0.0 {
-                max = max.max(f64::from(j.dq).abs());
-            }
+        self.max_over(|j| if j.kd != 0.0 { j.dq } else { 0.0 })
+    }
+
+    /// The largest feed-forward torque |tau| (N·m) over all slots; NaN if
+    /// any field of any slot is non-finite.
+    pub fn max_abs_torque(&self) -> f64 {
+        self.max_over(|j| j.tau)
+    }
+
+    /// The largest position gain |kp| over all slots; NaN if any field of
+    /// any slot is non-finite.
+    pub fn max_abs_kp(&self) -> f64 {
+        self.max_over(|j| j.kp)
+    }
+
+    /// max |f(slot)| over all slots, `0.0` for an empty frame, NaN if any
+    /// field of any slot is non-finite.
+    fn max_over(&self, f: impl Fn(&JointCommand) -> f32) -> f64 {
+        if !self.is_finite() {
+            return f64::NAN;
         }
-        max
+        self.as_slice()
+            .iter()
+            .map(|j| f64::from(f(j)).abs())
+            .fold(0.0f64, f64::max)
     }
 
     /// The largest |Δq| (rad) between this frame and `prev` over the slots
-    /// where both frames enable the motor with `kp != 0` (a position target
-    /// that acts). `None` when no slot qualifies. NaN propagates.
+    /// where both frames have `kp != 0` (a position target that acts),
+    /// whatever their mode. `None` when no slot qualifies. NaN if either
+    /// frame has a non-finite field.
     pub fn max_position_step(&self, prev: &JointCommandFrame) -> Option<f64> {
+        if !self.is_finite() || !prev.is_finite() {
+            return Some(f64::NAN);
+        }
         let mut out: Option<f64> = None;
         for (a, b) in self.as_slice().iter().zip(prev.as_slice()) {
-            if a.enabled() && b.enabled() && a.kp != 0.0 && b.kp != 0.0 {
+            if a.kp != 0.0 && b.kp != 0.0 {
                 let d = (f64::from(a.q) - f64::from(b.q)).abs();
                 out = Some(match out {
                     None => d,
@@ -184,19 +229,30 @@ impl JointCommandFrame {
         out
     }
 
-    /// Number of enabled motors.
+    /// Number of slots with a non-zero mode octet (informational).
     pub fn enabled_count(&self) -> usize {
         self.as_slice().iter().filter(|j| j.enabled()).count()
     }
 
-    /// The backward-compatible pipeline event: a joint command whose
-    /// `joint_speed` is [`JointCommandFrame::max_commanded_joint_speed`].
+    /// Number of active slots ([`JointCommand::active`]).
+    pub fn active_count(&self) -> usize {
+        self.as_slice().iter().filter(|j| j.active()).count()
+    }
+
+    /// The pipeline event: a joint command with `joint_speed` =
+    /// [`JointCommandFrame::max_commanded_joint_speed`], `joint_torque` =
+    /// [`JointCommandFrame::max_abs_torque`] and `joint_kp` =
+    /// [`JointCommandFrame::max_abs_kp`], over every slot. The position
+    /// step needs the previous frame; a stateful consumer fills
+    /// `joint_position_step` from [`JointCommandFrame::max_position_step`].
     pub fn to_motion_command(&self, ctx: &EventContext<'_>) -> MotionCommand {
         MotionCommand {
             channel: ctx.channel.to_owned(),
             source_guid: ctx.writer_guid.map(str::to_owned),
             linear_speed: None,
             joint_speed: Some(self.max_commanded_joint_speed()),
+            joint_torque: Some(self.max_abs_torque()),
+            joint_kp: Some(self.max_abs_kp()),
             ..MotionCommand::default()
         }
     }
@@ -262,12 +318,19 @@ mod tests {
         v.kd = 2.0;
         v.dq = -3.5;
         assert_eq!(frame(&[STOP, v]).max_commanded_joint_speed(), 3.5);
-        // Disabled motors are ignored entirely.
+        // The mode never gates a check: a mode-0 slot with kd acts (the
+        // arm SDK sends mode 0), and its NaN poisons the frame.
         let mut off = v;
         off.mode = 0;
+        assert_eq!(frame(&[off]).max_commanded_joint_speed(), 3.5);
+        assert!(off.active() && !off.enabled());
         off.dq = f32::NAN;
-        assert_eq!(frame(&[off]).max_commanded_joint_speed(), 0.0);
-        // Any non-finite field of an enabled motor poisons the frame.
+        assert!(frame(&[off]).max_commanded_joint_speed().is_nan());
+        let mut idle = off;
+        idle.kd = 0.0;
+        idle.dq = 0.0;
+        assert!(!idle.active());
+        // Any non-finite field of any slot poisons the frame.
         let mut bad = STOP;
         bad.kp = f32::INFINITY;
         assert!(frame(&[v, bad]).max_commanded_joint_speed().is_nan());

@@ -33,6 +33,7 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     "robot.profile.invalid_envelope",
     "robot.motion.linear_over_envelope",
     "robot.motion.joint_over_envelope",
+    "robot.motion.control_handover",
     "robot.motion.angular_over_envelope",
     // robodr-ros2-pipeline
     "robot.ros2.profile_refused",
@@ -65,6 +66,7 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     "robot.motion.sample_source_mismatch",
     "robot.motion.unverifiable_command",
     "robot.motion.decode_anomaly",
+    "robot.motion.api_id_out_of_range",
     // robodr-firewall
     "robot.firewall.rejected_clock_regression",
     "robot.firewall.rejected_unknown_channel",

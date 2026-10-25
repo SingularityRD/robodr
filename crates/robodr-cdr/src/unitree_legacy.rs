@@ -38,8 +38,42 @@
 //!
 //! Pure decode from `&[u8]`; no `unsafe`, no allocation, no panic.
 
+use robodr_events::MotionCommand;
+
+use crate::event::{command_class, EventContext};
 use crate::unitree::crc::frame_crc;
 use crate::unitree::joint::{JointCommand, JointCommandFrame, JointMeasurement, JointStateFrame};
+use crate::unitree::ApiClass;
+
+/// How the sender protects a legacy frame's trailing `crc` field.
+///
+/// The v3.8.6 library also ships an `encryptCRC` routine
+/// (`UNITREE_LEGGED_SDK::encryptCRC(char*, pthread_mutex_t*, unsigned)` in
+/// `lib/cpp/*/libunitree_legged_sdk.a`; no header declares it, the
+/// algorithm is not published). A robot / client pair using it puts an
+/// encrypted value in the field, so [`LegacyCrcMode::Plain`] verification
+/// is **expected to fail** on such traffic; with
+/// [`LegacyCrcMode::EncryptCrc`] the CRC is not checked at all (`None`).
+/// Which mode a fleet uses must be confirmed on captured traffic. The CRC
+/// is advisory either way: no finding's severity depends on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum LegacyCrcMode {
+    /// `crc32_core` over the frame, as `comm.h` documents.
+    #[default]
+    Plain,
+    /// The SDK's `encryptCRC`: not verifiable here.
+    EncryptCrc,
+}
+
+fn crc_check(buf: &[u8], mode: LegacyCrcMode) -> Option<bool> {
+    match mode {
+        LegacyCrcMode::Plain => {
+            let got = u32::from_le_bytes(buf.get(buf.len().checked_sub(4)?..)?.try_into().ok()?);
+            Some(frame_crc(buf)? == got)
+        }
+        LegacyCrcMode::EncryptCrc => None,
+    }
+}
 
 /// Motors in a legacy low-level frame (`MotorCmd motorCmd[20]`).
 pub const LEGACY_MOTORS: usize = 20;
@@ -369,9 +403,21 @@ impl LegacyLowCmd {
 
     /// `crc` matches `crc32_core` over the frame (`frame[..len-4]` as u32
     /// words). `None` if the frame covered by the CRC cannot be read.
+    /// Advisory (see [`LegacyCrcMode`]: `false` is expected in `encryptCRC`
+    /// mode).
     pub fn crc_ok(buf: &[u8]) -> Option<bool> {
-        let got = u32::from_le_bytes(buf.get(buf.len().checked_sub(4)?..)?.try_into().ok()?);
-        Some(frame_crc(buf)? == got)
+        crc_check(buf, LegacyCrcMode::Plain)
+    }
+
+    /// The CRC under `mode`; `None` when it cannot be checked.
+    pub fn crc_check(buf: &[u8], mode: LegacyCrcMode) -> Option<bool> {
+        crc_check(buf, mode)
+    }
+
+    /// The joint command over all 20 slots, as the DDS `LowCmd_`
+    /// ([`JointCommandFrame::to_motion_command`]: every slot, mode ignored).
+    pub fn to_motion_command(&self, ctx: &EventContext<'_>) -> MotionCommand {
+        self.joint_frame().to_motion_command(ctx)
     }
 
     /// All 20 motor slots as a [`JointCommandFrame`].
@@ -509,9 +555,61 @@ impl LegacyHighCmd {
         Ok(Self::read(&mut Le::new(buf)))
     }
 
+    /// Advisory, see [`LegacyLowCmd::crc_ok`].
     pub fn crc_ok(buf: &[u8]) -> Option<bool> {
-        let got = u32::from_le_bytes(buf.get(buf.len().checked_sub(4)?..)?.try_into().ok()?);
-        Some(frame_crc(buf)? == got)
+        crc_check(buf, LegacyCrcMode::Plain)
+    }
+
+    /// The CRC under `mode`; `None` when it cannot be checked.
+    pub fn crc_check(buf: &[u8], mode: LegacyCrcMode) -> Option<bool> {
+        crc_check(buf, mode)
+    }
+
+    /// What the `mode` byte makes the robot do (`comm.h`): 2 target
+    /// velocity walking → [`ApiClass::Velocity`]; 0 idle / 1 force stand /
+    /// 5 stand down / 6 stand up / 7 damping / 8 recovery stand →
+    /// [`ApiClass::Posture`]; 3 target position / 4 path walking →
+    /// [`ApiClass::Trajectory`]; 9 backflip / 10 jumpYaw / 11 straightHand
+    /// → [`ApiClass::Trick`]; anything else → [`ApiClass::Unknown`].
+    pub fn motion_class(&self) -> ApiClass {
+        match self.mode {
+            2 => ApiClass::Velocity,
+            0 | 1 | 5..=8 => ApiClass::Posture,
+            3 | 4 => ApiClass::Trajectory,
+            9..=11 => ApiClass::Trick,
+            _ => ApiClass::Unknown,
+        }
+    }
+
+    /// The command as the DDS path maps an API call: in mode 2 the body
+    /// velocity (`linear_speed = velocity[0]`, `linear_y = velocity[1]`,
+    /// `angular_speed = yawSpeed`, the other three axes 0); in every other
+    /// mode the robot ignores the velocity fields, so no speed is set. The
+    /// mode's [`LegacyHighCmd::motion_class`] is the `command_class`, so
+    /// `Profile::evaluate` flags tricks, position walking and unknown
+    /// modes.
+    pub fn to_motion_command(&self, ctx: &EventContext<'_>) -> MotionCommand {
+        let class = self.motion_class();
+        let base = MotionCommand {
+            channel: ctx.channel.to_owned(),
+            source_guid: ctx.writer_guid.map(str::to_owned),
+            command_class: Some(command_class(class)),
+            command_name: Some(format!("HighCmd mode {}", self.mode)),
+            ..MotionCommand::default()
+        };
+        if class != ApiClass::Velocity {
+            return base;
+        }
+        let (vx, vy, vyaw) = self.body_velocity();
+        MotionCommand {
+            linear_speed: Some(vx),
+            linear_y: Some(vy),
+            angular_speed: Some(vyaw),
+            linear_z: Some(0.0),
+            angular_x: Some(0.0),
+            angular_y: Some(0.0),
+            ..base
+        }
     }
 
     /// Commanded body velocity `(vx, vy, vyaw)` m/s, rad/s.
@@ -694,6 +792,7 @@ fn check_len(kind: LegacyKind, len: usize, expected: usize) -> Result<(), Legacy
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::EventContext;
 
     #[test]
     fn declared_sizes_match_packed_sizeof() {
@@ -824,6 +923,101 @@ mod tests {
         );
         assert_eq!(cmd.mode, 2);
         assert_eq!(LegacyHighCmd::crc_ok(&frame), Some(true));
+    }
+
+    fn high_cmd(mode: u8, v: [f32; 3]) -> Vec<u8> {
+        let mut b = Build::default();
+        b.zeros(2).u8(level::HIGH).u8(0);
+        b.zeros(8 + 8).u16(0);
+        b.u8(mode).u8(1).u8(0);
+        b.f32(0.08).f32(0.3);
+        b.f32(0.0).f32(0.0);
+        b.f32(0.0).f32(0.0).f32(0.0);
+        b.f32(v[0]).f32(v[1]);
+        b.f32(v[2]);
+        b.zeros(4 + 12 + 40 + 4);
+        b.with_crc()
+    }
+
+    /// Review item 11: legacy commands map to `MotionCommand` like the DDS
+    /// path.
+    #[test]
+    fn legacy_commands_map_to_motion_commands() {
+        use crate::unitree::ApiClass;
+        use robodr_events::CommandClass;
+        let ctx = EventContext {
+            channel: "/legacy/high_cmd",
+            writer_guid: None,
+            timestamp_ns: 0,
+        };
+        // Mode 2: target velocity walking.
+        let c = LegacyHighCmd::decode(&high_cmd(2, [1.0, -0.5, 0.25])).unwrap();
+        assert_eq!(c.motion_class(), ApiClass::Velocity);
+        let m = c.to_motion_command(&ctx);
+        assert_eq!(m.linear_speed, Some(1.0));
+        assert_eq!(m.linear_y, Some(-0.5));
+        assert_eq!(m.angular_speed, Some(0.25));
+        assert_eq!(m.linear_z, Some(0.0));
+        assert_eq!(m.command_class, Some(CommandClass::Velocity));
+        // Other modes ignore the velocity: no speed, but the class.
+        for (mode, class) in [
+            (0, ApiClass::Posture),
+            (1, ApiClass::Posture),
+            (3, ApiClass::Trajectory),
+            (7, ApiClass::Posture),
+            (9, ApiClass::Trick),
+            (11, ApiClass::Trick),
+            (42, ApiClass::Unknown),
+        ] {
+            let c = LegacyHighCmd::decode(&high_cmd(mode, [9.0, 9.0, 9.0])).unwrap();
+            assert_eq!(c.motion_class(), class, "mode {mode}");
+            let m = c.to_motion_command(&ctx);
+            assert_eq!(m.linear_speed, None, "mode {mode}");
+            assert!(m.command_class.is_some());
+        }
+        // LowCmd: the joint command, every slot, mode ignored.
+        let mut b = Build::default();
+        b.zeros(2).u8(level::LOW).u8(0);
+        b.zeros(8 + 8).u16(0);
+        for i in 0..LEGACY_MOTORS {
+            if i == 19 {
+                // A slot past the 12 legs, mode 0 (damping), torque only.
+                b.u8(0).f32(0.0).f32(0.0).f32(40.0).f32(0.0).f32(0.0);
+                b.zeros(12);
+            } else {
+                motor_cmd_bytes(&mut b, 16000.0, 0.0);
+            }
+        }
+        b.zeros(4 + 40 + 4);
+        let low = LegacyLowCmd::decode(&b.with_crc()).unwrap();
+        let m = low.to_motion_command(&ctx);
+        assert_eq!(m.joint_speed, Some(0.0));
+        assert_eq!(m.joint_torque, Some(40.0));
+    }
+
+    /// Review item 11: in `encryptCRC` mode the CRC field cannot be
+    /// verified (the algorithm is only in the binary SDK library).
+    #[test]
+    fn encrypted_crc_mode_is_not_checked() {
+        let frame = high_cmd(2, [0.1, 0.0, 0.0]);
+        assert_eq!(
+            LegacyHighCmd::crc_check(&frame, LegacyCrcMode::Plain),
+            Some(true)
+        );
+        assert_eq!(
+            LegacyHighCmd::crc_check(&frame, LegacyCrcMode::EncryptCrc),
+            None
+        );
+        let mut bad = frame.clone();
+        bad[30] ^= 1;
+        assert_eq!(
+            LegacyHighCmd::crc_check(&bad, LegacyCrcMode::Plain),
+            Some(false)
+        );
+        assert_eq!(
+            LegacyLowCmd::crc_check(&bad, LegacyCrcMode::EncryptCrc),
+            None
+        );
     }
 
     #[test]

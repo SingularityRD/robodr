@@ -36,8 +36,38 @@ pub struct HgMotorCmd {
     pub reserve: u32,
 }
 
+/// The Dex3 hand's `MotorCmd_::mode` octet, a bitfield
+/// `id | status << 4 | timeout << 7` (`RIS_Mode_t` in
+/// `example/g1/dex3/g1_dex3_example.cpp`). Informational: no check depends
+/// on it (a mode octet of 0 is motor 0 with status 0, still driven by its
+/// kp / kd / dq).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Dex3Mode {
+    /// Motor id (low 4 bits).
+    pub id: u8,
+    /// Status (3 bits; the example uses `0x01`).
+    pub status: u8,
+    /// Timeout flag (top bit).
+    pub timeout: bool,
+}
+
+impl Dex3Mode {
+    pub fn from_octet(mode: u8) -> Self {
+        Dex3Mode {
+            id: mode & 0x0F,
+            status: (mode >> 4) & 0x07,
+            timeout: mode & 0x80 != 0,
+        }
+    }
+}
+
 impl HgMotorCmd {
-    fn read(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    /// The mode octet read as the Dex3 bitfield (`rt/dex3/*/cmd`).
+    pub fn dex3_mode(&self) -> Dex3Mode {
+        Dex3Mode::from_octet(self.mode)
+    }
+
+    pub(crate) fn read(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
         r.structure(|r| {
             Ok(HgMotorCmd {
                 mode: r.u8()?,
@@ -214,7 +244,7 @@ pub struct HgMotorState {
 }
 
 impl HgMotorState {
-    fn read(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    pub(crate) fn read(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
         r.structure(|r| {
             Ok(HgMotorState {
                 mode: r.u8()?,
@@ -332,6 +362,8 @@ impl HgLowState {
 }
 
 /// `unitree_hg::msg::dds_::HandCmd_` (Dex3: `rt/dex3/{left,right}/cmd`).
+/// Each motor's mode octet is the [`Dex3Mode`] bitfield; it never gates a
+/// check (the joint frame evaluates every motor's q / dq / tau / kp / kd).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct HgHandCmd {
     pub motor_cmd: Bounded<HgMotorCmd, MAX_HAND_ELEMENTS>,
@@ -353,6 +385,26 @@ impl HgHandCmd {
         for m in self.motor_cmd.as_slice() {
             f.joints.push(m.joint());
         }
+        f
+    }
+}
+
+impl HgMotorCmd {
+    /// A one-joint frame (the standalone `MotorCmd_` of `rt/waistpitchcmd`,
+    /// `example/g1/g1d/g1d_waist_example.cpp`).
+    pub fn joint_frame(&self) -> JointCommandFrame {
+        let mut f = JointCommandFrame::default();
+        f.joints.push(self.joint());
+        f
+    }
+}
+
+impl HgMotorState {
+    /// A one-joint frame (the standalone `MotorState_` of
+    /// `rt/waistpitchstate`).
+    pub fn joint_frame(&self) -> JointStateFrame {
+        let mut f = JointStateFrame::default();
+        f.joints.push(self.measurement());
         f
     }
 }

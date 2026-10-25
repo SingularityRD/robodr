@@ -14,15 +14,21 @@
 //! * the legacy decoders are a pure function of the input length and bytes,
 //!   never a panic, and a decoded frame's `crc_ok` is total.
 //!
+//! The DDS decoders run twice: with `Limits::default()` (what the sensor
+//! pipeline uses, so the fuzzer explores the production caps) and with
+//! generous limits (64 KiB strings), so the JSON size cap rather than the
+//! CDR cap bounds the API parameter.
+//!
 //! Shared via `#[path]` with the std-only smoke test
 //! `crates/robodr-cdr/tests/fuzz_smoke.rs`, so the two cannot drift.
 #![allow(dead_code)]
 
 use robodr_cdr::unitree::{
-    decode_unitree, ApiService, JsonObject, UnitreeKind, UnitreeMessage, UnitreeModel,
+    decode_unitree, validate_document, ApiService, JsonObject, UnitreeKind, UnitreeMessage,
+    UnitreeModel,
 };
 use robodr_cdr::unitree_legacy::{
-    LegacyHighCmd, LegacyHighState, LegacyKind, LegacyLowCmd, LegacyLowState,
+    LegacyCrcMode, LegacyHighCmd, LegacyHighState, LegacyKind, LegacyLowCmd, LegacyLowState,
 };
 use robodr_cdr::{decode_payload, EventContext, Limits, MessageKind};
 
@@ -38,15 +44,32 @@ fn exercise_unitree(m: &UnitreeMessage<'_>) {
     match m {
         UnitreeMessage::ApiRequest(q) => {
             let _ = q.parameter_json();
+            let _ = q.parameter_document();
             let _ = q.noreply();
+            // The robot dispatches on the low 32 bits.
+            assert_eq!(
+                q.api_id_in_range(),
+                i64::from(q.dispatched_api_id()) == q.api_id
+            );
             for svc in [
                 ApiService::Sport,
                 ApiService::Loco,
                 ApiService::Arm,
                 ApiService::MotionSwitcher,
+                ApiService::ObstaclesAvoid,
+                ApiService::Agv,
+                ApiService::RobotState,
+                ApiService::UwbSwitch,
+                ApiService::Other,
                 ApiService::Unspecified,
             ] {
-                for model in [None, Some(UnitreeModel::Go2), Some(UnitreeModel::G1)] {
+                for model in [
+                    None,
+                    Some(UnitreeModel::Go2),
+                    Some(UnitreeModel::B2),
+                    Some(UnitreeModel::G1),
+                    Some(UnitreeModel::R1),
+                ] {
                     let call = q.call(svc, model);
                     let _ = call.class();
                     let _ = call.name();
@@ -64,18 +87,62 @@ fn exercise_unitree(m: &UnitreeMessage<'_>) {
 }
 
 pub fn run(data: &[u8]) {
-    let limits = Limits {
-        // Keep strings generous so the JSON size cap, not the CDR cap, is
-        // what bounds the API parameter.
-        max_string_len: 64 * 1024,
-        ..Limits::default()
-    };
     let Some((&sel, payload)) = data.split_first() else {
         return;
     };
+    // Production caps first, then generous strings.
+    let generous = Limits {
+        max_string_len: 64 * 1024,
+        ..Limits::default()
+    };
+    for limits in [Limits::default(), generous] {
+        run_dds(payload, &limits);
+    }
 
-    // 1. DDS decode by every Unitree kind (both decode_unitree and, for
-    //    the motion kinds, decode_payload: they must agree).
+    // 2. Bounded JSON reader on the payload directly.
+    if let Ok(o) = JsonObject::parse(payload) {
+        assert!(o.len() <= robodr_cdr::unitree::json::MAX_MEMBERS);
+        for (_, v) in o.members() {
+            let _ = v.as_f64();
+            let _ = v.as_i64();
+            let _ = v.as_bool();
+            let _ = v.as_f64_array::<3>();
+        }
+        let _ = o.get("x");
+        // An object document is a valid document.
+        assert!(validate_document(payload).is_ok());
+    }
+    let _ = validate_document(payload);
+
+    // 3. Legacy UDP frames: selected by the leading byte so the fuzzer can
+    //    reach each decoder, plus the length dispatch.
+    let _ = LegacyKind::for_len(payload.len());
+    match sel & 0x03 {
+        0 => drop(
+            LegacyLowCmd::decode(payload).map(|c| (c.joint_frame(), c.to_motion_command(&CTX))),
+        ),
+        1 => drop(LegacyLowState::decode(payload).map(|s| s.joint_frame())),
+        2 => drop(LegacyHighCmd::decode(payload).map(|c| {
+            (
+                c.body_velocity(),
+                c.motion_class(),
+                c.to_motion_command(&CTX),
+            )
+        })),
+        _ => drop(LegacyHighState::decode(payload).map(|s| s.body_velocity())),
+    }
+    let _ = LegacyLowCmd::crc_ok(payload);
+    let _ = LegacyHighCmd::crc_ok(payload);
+    assert_eq!(
+        LegacyHighCmd::crc_check(payload, LegacyCrcMode::EncryptCrc),
+        None
+    );
+}
+
+/// 1. DDS decode by every Unitree kind (both decode_unitree and, for the
+///    motion kinds, decode_payload: they must agree).
+fn run_dds(payload: &[u8], limits: &Limits) {
+    let limits = *limits;
     for kind in UnitreeKind::ALL {
         if let Ok(d) = decode_unitree(kind, payload, &limits) {
             assert_eq!(
@@ -99,33 +166,16 @@ pub fn run(data: &[u8]) {
             );
             let _ = d.message.to_event(&CTX);
             let _ = d.message.unitree_crc_ok();
-            let _ = d.message.joint_command_frame();
+            if let Some(f) = d.message.joint_command_frame() {
+                // Every slot counts, whatever its mode: a non-finite field
+                // anywhere poisons all three magnitudes.
+                let poisoned = !f.is_finite();
+                assert_eq!(f.max_commanded_joint_speed().is_nan(), poisoned);
+                assert_eq!(f.max_abs_torque().is_nan(), poisoned);
+                assert_eq!(f.max_abs_kp().is_nan(), poisoned);
+            }
             let _ = d.message.joint_state_frame();
             let _ = d.anomalies();
         }
     }
-
-    // 2. Bounded JSON reader on the payload directly.
-    if let Ok(o) = JsonObject::parse(payload) {
-        assert!(o.len() <= robodr_cdr::unitree::json::MAX_MEMBERS);
-        for (_, v) in o.members() {
-            let _ = v.as_f64();
-            let _ = v.as_i64();
-            let _ = v.as_bool();
-            let _ = v.as_f64_array::<3>();
-        }
-        let _ = o.get("x");
-    }
-
-    // 3. Legacy UDP frames: selected by the leading byte so the fuzzer can
-    //    reach each decoder, plus the length dispatch.
-    let _ = LegacyKind::for_len(payload.len());
-    match sel & 0x03 {
-        0 => drop(LegacyLowCmd::decode(payload).map(|c| c.joint_frame())),
-        1 => drop(LegacyLowState::decode(payload).map(|s| s.joint_frame())),
-        2 => drop(LegacyHighCmd::decode(payload).map(|c| c.body_velocity())),
-        _ => drop(LegacyHighState::decode(payload).map(|s| s.body_velocity())),
-    }
-    let _ = LegacyLowCmd::crc_ok(payload);
-    let _ = LegacyHighCmd::crc_ok(payload);
 }

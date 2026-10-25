@@ -304,6 +304,9 @@ fn learn_lock_check_over_clean_runs_gives_zero_deviations() {
         let caps = HardCaps {
             linear: cfg.hard_cap_linear,
             joint: cfg.hard_cap_joint,
+            torque: cfg.hard_cap_torque,
+            kp: cfg.hard_cap_kp,
+            position_step: cfg.hard_cap_position_step,
         };
         let locked = lock_with_caps(&profile, &signoff, &caps)
             .unwrap_or_else(|why| panic!("seed {seed}: {why:?}"));

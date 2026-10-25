@@ -5,23 +5,26 @@
 //!
 //! | DDS type name | role | event |
 //! |---|---|---|
-//! | `unitree_go::msg::dds_::LowCmd_` | command | `MotionCommand.joint_speed` = [`JointCommandFrame::max_commanded_joint_speed`] |
+//! | `unitree_go::msg::dds_::LowCmd_` | command | `MotionCommand.joint_speed` / `joint_torque` / `joint_kp` over every slot ([`JointCommandFrame::to_motion_command`]) |
 //! | `unitree_go::msg::dds_::LowState_` | feedback | `measured_joint_speed` = max \|dq\|, IMU gyro → angular rates |
 //! | `unitree_go::msg::dds_::SportModeState_` | feedback | `velocity` / `yaw_speed` → linear / angular velocity |
 //! | `unitree_hg::msg::dds_::LowCmd_` | command | as go `LowCmd_` (35 slots) |
 //! | `unitree_hg::msg::dds_::LowState_` | feedback | as go `LowState_` |
-//! | `unitree_hg::msg::dds_::HandCmd_` | command | joint speed of the hand motors |
+//! | `unitree_hg::msg::dds_::HandCmd_` | command | as `LowCmd_` over the hand motors |
 //! | `unitree_hg::msg::dds_::HandState_` | feedback | joint speed of the hand motors |
 //! | `unitree_hg::msg::dds_::IMUState_` | feedback | gyro → angular rates |
 //! | `unitree_hg_doubleimu::msg::dds_::doubleIMUState_` | feedback | gyro → angular rates |
-//! | `unitree_api::msg::dds_::Request_` | command | `Move` / `SetVelocity` / `StopMove` → twist, other calls → no speed (see [`ApiCall`]) |
+//! | `unitree_go::msg::dds_::MotorCmds_` | command (`rt/hand_sdk`) | as `LowCmd_` over the sequence |
+//! | `unitree_hg::msg::dds_::MotorCmd_` | command (`rt/waistpitchcmd`) | as `LowCmd_`, one joint |
+//! | `unitree_hg::msg::dds_::MotorState_` | feedback (`rt/waistpitchstate`) | `measured_joint_speed` = \|dq\| |
+//! | `unitree_api::msg::dds_::Request_` | command | velocity calls → twist; every call's [`ApiClass`] → `command_class` (see [`ApiCall`]) |
 //! | `unitree_go::msg::dds_::WirelessController_` | (not motion) | [`decode_unitree`] only |
 //! | `unitree_api::msg::dds_::Response_` | (not motion) | [`decode_unitree`] only |
 //!
 //! The motion types are also [`crate::MessageKind`]s (registered in
 //! [`crate::Registry::with_builtin`] under their DDS and ROS names) and
 //! decode through [`crate::decode_payload`] / [`crate::decode_by_type_name`]
-//! into [`crate::MotionMessage`]. [`decode_unitree`] decodes all twelve
+//! into [`crate::MotionMessage`]. [`decode_unitree`] decodes all fifteen
 //! types into [`UnitreeMessage`].
 //!
 //! # Status
@@ -41,17 +44,17 @@ pub mod model;
 pub use api::{ApiCall, ApiClass, ApiRequest, ApiResponse, ApiService, FsmMeaning};
 pub use crc::{crc32_core, crc32_core_le_bytes, frame_crc, UNITREE_CRC_POLY};
 pub use go::{
-    GoBmsCmd, GoBmsState, GoImuState, GoLowCmd, GoLowState, GoMotorCmd, GoMotorState, GoPathPoint,
-    GoSportModeState, GoWirelessController,
+    GoBmsCmd, GoBmsState, GoImuState, GoLowCmd, GoLowState, GoMotorCmd, GoMotorCmds, GoMotorState,
+    GoPathPoint, GoSportModeState, GoWirelessController, MAX_MOTOR_CMDS,
 };
 pub use hg::{
-    HgDoubleImuState, HgHandCmd, HgHandState, HgImuState, HgLowCmd, HgLowState, HgMotorCmd,
-    HgMotorState, HgPressSensorState, MAX_HAND_ELEMENTS,
+    Dex3Mode, HgDoubleImuState, HgHandCmd, HgHandState, HgImuState, HgLowCmd, HgLowState,
+    HgMotorCmd, HgMotorState, HgPressSensorState, MAX_HAND_ELEMENTS,
 };
 pub use joint::{
     Bounded, JointCommand, JointCommandFrame, JointMeasurement, JointStateFrame, MAX_FRAME_JOINTS,
 };
-pub use json::{JsonError, JsonObject, JsonValue};
+pub use json::{validate_document, JsonError, JsonObject, JsonTop, JsonValue};
 pub use model::{Generation, IdlFamily, ModelInfo, Morphology, UnitreeModel};
 
 use crate::encap::Encapsulation;
@@ -76,6 +79,18 @@ pub mod topics {
     pub const LF_SPORTMODESTATE: &str = "rt/lf/sportmodestate";
     /// Arm SDK blend channel (`example/{g1,h1,h2,r1}/high_level/*arm*_sdk_dds_example.cpp`).
     pub const ARM_SDK: &str = "rt/arm_sdk";
+    /// G1 user-control low-level channel, `unitree_hg` `LowCmd_`
+    /// (`example/g1/high_level/g1_userctrl_dds_example.cpp`).
+    pub const USER_LOWCMD: &str = "rt/user_lowcmd";
+    /// G1 hand-SDK blend channel, `unitree_go` `MotorCmds_`
+    /// (`example/g1/high_level/g1_hand_sdk_example.cpp`).
+    pub const HAND_SDK: &str = "rt/hand_sdk";
+    /// G1-D waist pitch motor, standalone `unitree_hg` `MotorCmd_` /
+    /// `MotorState_` (`example/g1/g1d/g1d_waist_example.cpp`).
+    pub const WAIST_PITCH_CMD: &str = "rt/waistpitchcmd";
+    pub const WAIST_PITCH_STATE: &str = "rt/waistpitchstate";
+    /// Low-frequency low state (`unitree_sdk2_python/example/wireless_controller`).
+    pub const LF_LOWSTATE: &str = "rt/lf/lowstate";
     /// `example/wireless_controller/main.cpp`.
     pub const WIRELESS_CONTROLLER: &str = "rt/wirelesscontroller";
     /// Torso IMU (`example/{g1,h2,r1}/low_level/*`).
@@ -101,10 +116,13 @@ pub enum UnitreeKind {
     HgDoubleImuState,
     ApiRequest,
     ApiResponse,
+    GoMotorCmds,
+    HgMotorCmd,
+    HgMotorState,
 }
 
 impl UnitreeKind {
-    pub const ALL: [UnitreeKind; 12] = [
+    pub const ALL: [UnitreeKind; 15] = [
         UnitreeKind::GoLowCmd,
         UnitreeKind::GoLowState,
         UnitreeKind::GoSportModeState,
@@ -117,6 +135,9 @@ impl UnitreeKind {
         UnitreeKind::HgDoubleImuState,
         UnitreeKind::ApiRequest,
         UnitreeKind::ApiResponse,
+        UnitreeKind::GoMotorCmds,
+        UnitreeKind::HgMotorCmd,
+        UnitreeKind::HgMotorState,
     ];
 
     /// DDS type name (`TopicTraits<...>::getTypeName()` in the SDK IDL
@@ -135,6 +156,9 @@ impl UnitreeKind {
             UnitreeKind::HgDoubleImuState => "unitree_hg_doubleimu::msg::dds_::doubleIMUState_",
             UnitreeKind::ApiRequest => "unitree_api::msg::dds_::Request_",
             UnitreeKind::ApiResponse => "unitree_api::msg::dds_::Response_",
+            UnitreeKind::GoMotorCmds => "unitree_go::msg::dds_::MotorCmds_",
+            UnitreeKind::HgMotorCmd => "unitree_hg::msg::dds_::MotorCmd_",
+            UnitreeKind::HgMotorState => "unitree_hg::msg::dds_::MotorState_",
         }
     }
 
@@ -153,6 +177,9 @@ impl UnitreeKind {
             UnitreeKind::HgDoubleImuState => "unitree_hg_doubleimu/msg/doubleIMUState",
             UnitreeKind::ApiRequest => "unitree_api/msg/Request",
             UnitreeKind::ApiResponse => "unitree_api/msg/Response",
+            UnitreeKind::GoMotorCmds => "unitree_go/msg/MotorCmds",
+            UnitreeKind::HgMotorCmd => "unitree_hg/msg/MotorCmd",
+            UnitreeKind::HgMotorState => "unitree_hg/msg/MotorState",
         }
     }
 
@@ -176,6 +203,9 @@ impl UnitreeKind {
             UnitreeKind::HgImuState => MessageKind::UnitreeHgImuState,
             UnitreeKind::HgDoubleImuState => MessageKind::UnitreeHgDoubleImuState,
             UnitreeKind::ApiRequest => MessageKind::UnitreeApiRequest,
+            UnitreeKind::GoMotorCmds => MessageKind::UnitreeGoMotorCmds,
+            UnitreeKind::HgMotorCmd => MessageKind::UnitreeHgMotorCmd,
+            UnitreeKind::HgMotorState => MessageKind::UnitreeHgMotorState,
             UnitreeKind::GoWirelessController | UnitreeKind::ApiResponse => return None,
         })
     }
@@ -200,6 +230,9 @@ pub enum UnitreeMessage<'a> {
     HgDoubleImuState(HgDoubleImuState),
     ApiRequest(ApiRequest<'a>),
     ApiResponse(ApiResponse<'a>),
+    GoMotorCmds(GoMotorCmds),
+    HgMotorCmd(HgMotorCmd),
+    HgMotorState(HgMotorState),
 }
 
 impl UnitreeMessage<'_> {
@@ -217,6 +250,9 @@ impl UnitreeMessage<'_> {
             UnitreeMessage::HgDoubleImuState(_) => UnitreeKind::HgDoubleImuState,
             UnitreeMessage::ApiRequest(_) => UnitreeKind::ApiRequest,
             UnitreeMessage::ApiResponse(_) => UnitreeKind::ApiResponse,
+            UnitreeMessage::GoMotorCmds(_) => UnitreeKind::GoMotorCmds,
+            UnitreeMessage::HgMotorCmd(_) => UnitreeKind::HgMotorCmd,
+            UnitreeMessage::HgMotorState(_) => UnitreeKind::HgMotorState,
         }
     }
 
@@ -246,16 +282,26 @@ pub struct UnitreeDecoded<'a> {
 
 impl UnitreeDecoded<'_> {
     /// [`DecodeAnomaly::ExcessTrailingBytes`] when more than
-    /// [`MAX_END_PADDING`] bytes follow the message.
+    /// [`MAX_END_PADDING`] bytes follow the message, and
+    /// [`DecodeAnomaly::ApiIdOutOfRange`] for an API request / response
+    /// whose `api_id` does not fit `int32`.
     pub fn anomalies(&self) -> Vec<DecodeAnomaly> {
+        let mut v = Vec::new();
         if self.trailing_bytes > MAX_END_PADDING {
-            vec![DecodeAnomaly::ExcessTrailingBytes {
+            v.push(DecodeAnomaly::ExcessTrailingBytes {
                 trailing: self.trailing_bytes,
                 allowed: MAX_END_PADDING,
-            }]
-        } else {
-            Vec::new()
+            });
         }
+        let api_id = match &self.message {
+            UnitreeMessage::ApiRequest(q) if !q.api_id_in_range() => Some(q.api_id),
+            UnitreeMessage::ApiResponse(r) if !r.api_id_in_range() => Some(r.api_id),
+            _ => None,
+        };
+        if let Some(api_id) = api_id {
+            v.push(DecodeAnomaly::ApiIdOutOfRange { api_id });
+        }
+        v
     }
 }
 
@@ -263,6 +309,9 @@ pub(crate) fn read_message<'a>(
     kind: UnitreeKind,
     r: &mut Reader<'a>,
 ) -> Result<UnitreeMessage<'a>, DecodeError> {
+    // Every Unitree IDL type is `@final` (the generated TypeObjects carry
+    // IS_FINAL; the Python IDL is `@annotate.final`).
+    r.set_final_types(true);
     Ok(match kind {
         UnitreeKind::GoLowCmd => UnitreeMessage::GoLowCmd(GoLowCmd::read(r)?),
         UnitreeKind::GoLowState => UnitreeMessage::GoLowState(GoLowState::read(r)?),
@@ -282,6 +331,9 @@ pub(crate) fn read_message<'a>(
         }
         UnitreeKind::ApiRequest => UnitreeMessage::ApiRequest(ApiRequest::read(r)?),
         UnitreeKind::ApiResponse => UnitreeMessage::ApiResponse(ApiResponse::read(r)?),
+        UnitreeKind::GoMotorCmds => UnitreeMessage::GoMotorCmds(GoMotorCmds::read(r)?),
+        UnitreeKind::HgMotorCmd => UnitreeMessage::HgMotorCmd(HgMotorCmd::read(r)?),
+        UnitreeKind::HgMotorState => UnitreeMessage::HgMotorState(HgMotorState::read(r)?),
     })
 }
 

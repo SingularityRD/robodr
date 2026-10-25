@@ -656,8 +656,8 @@ fn imu_and_trajectory_mapping() {
 #[test]
 fn registry_keys_by_dds_and_ros_names() {
     let r = Registry::with_builtin();
-    // 16 kinds (6 ROS + 10 Unitree), each under its DDS and ROS name.
-    assert_eq!(r.len(), 32);
+    // 19 kinds (6 ROS + 13 Unitree), each under its DDS and ROS name.
+    assert_eq!(r.len(), 38);
     assert_eq!(
         r.kind("geometry_msgs::msg::dds_::Twist_"),
         Some(MessageKind::Twist)

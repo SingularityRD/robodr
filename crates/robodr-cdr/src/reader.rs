@@ -48,6 +48,10 @@ pub(crate) struct Reader<'a> {
     delimited_structs: bool,
     /// Current struct nesting depth (0 = the top-level message).
     depth: u32,
+    /// The type being decoded is `@final` throughout (the Unitree IDL
+    /// types): no struct carries a DHEADER, whatever the encapsulation
+    /// says (see [`Reader::set_final_types`]).
+    final_types: bool,
     pub(crate) limits: Limits,
 }
 
@@ -67,8 +71,20 @@ impl<'a> Reader<'a> {
             version,
             delimited_structs: delimited_structs && version == XcdrVersion::Xcdr2,
             depth: 0,
+            final_types: false,
             limits,
         }
+    }
+
+    /// Declares the type being decoded `@final` (every struct in it). Under
+    /// XCDR2 a final struct has no DHEADER (DDS-XTypes 1.3 §7.4.3.5); only
+    /// sequences / arrays of non-primitive elements keep theirs. A `D_CDR2`
+    /// encapsulation does not change that: Cyclone DDS (Unitree's stack)
+    /// takes the extensibility from the type and uses the encapsulation id
+    /// only to choose XCDR1 vs XCDR2, so the robot reads such a payload as
+    /// final, and so must the decoder.
+    pub(crate) fn set_final_types(&mut self, on: bool) {
+        self.final_types = on;
     }
 
     pub(crate) fn pos(&self) -> usize {
@@ -219,15 +235,18 @@ impl<'a> Reader<'a> {
     /// empty string is `01 00 00 00 00` (Fast CDR and Cyclone DDS both send
     /// that), and a 0 prefix is malformed.
     pub(crate) fn string(&mut self) -> Result<CdrStr<'a>, DecodeError> {
+        self.string_capped(self.limits.max_string_len)
+    }
+
+    /// [`Reader::string`] with an explicit length cap (NUL included)
+    /// instead of `limits.max_string_len` (the Unitree API's JSON
+    /// parameter, which is legitimately kilobytes long).
+    pub(crate) fn string_capped(&mut self, max: u32) -> Result<CdrStr<'a>, DecodeError> {
         self.align(4)?;
         let at = self.pos;
         let len = self.u32()?;
-        if len > self.limits.max_string_len {
-            return Err(DecodeError::StringTooLong {
-                at,
-                len,
-                max: self.limits.max_string_len,
-            });
+        if len > max {
+            return Err(DecodeError::StringTooLong { at, len, max });
         }
         if len == 0 {
             return Err(DecodeError::StringLengthZero { at });
@@ -295,6 +314,7 @@ impl<'a> Reader<'a> {
     ) -> Result<T, DecodeError> {
         let depth = self.depth;
         let wrap = self.delimited_structs
+            && !self.final_types
             && (depth == 0 || self.limits.d_cdr2_nesting == DelimitedNesting::AllStructs);
         self.depth = depth.saturating_add(1);
         let r = if wrap { self.delimited(f) } else { f(self) };

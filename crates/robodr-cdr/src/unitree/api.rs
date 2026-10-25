@@ -41,15 +41,29 @@ use std::fmt;
 
 use crate::error::DecodeError;
 use crate::reader::{CdrStr, Reader};
-use crate::unitree::json::{JsonError, JsonObject, JsonValue};
+use crate::unitree::json::{
+    validate_document, JsonError, JsonObject, JsonTop, JsonValue, MAX_JSON_LEN,
+};
 use crate::unitree::model::UnitreeModel;
+
+/// Cap on `Request_::parameter` / `Response_::data` (NUL included): at
+/// least the JSON reader's [`MAX_JSON_LEN`] (a B2 `TrajectoryFollow` is
+/// about 3 KB), or `Limits::max_string_len` if that is larger.
+fn json_string_cap(r: &Reader<'_>) -> u32 {
+    let json = u32::try_from(MAX_JSON_LEN.saturating_add(1)).unwrap_or(u32::MAX);
+    r.limits.max_string_len.max(json)
+}
 
 /// `unitree_api::msg::dds_::Request_`, borrowing from the payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApiRequest<'a> {
     /// `header.identity.id`: the request id (client-chosen).
     pub id: i64,
-    /// `header.identity.api_id`: which API of the service.
+    /// `header.identity.api_id`: which API of the service, as sent. The
+    /// SDK server dispatches on its **low 32 bits** (`int32_t` api ids,
+    /// `robot/server/server.hpp`), so interpretation uses
+    /// [`ApiRequest::dispatched_api_id`]; an id outside the `i32` range is
+    /// an anomaly ([`ApiRequest::api_id_in_range`]).
     pub api_id: i64,
     /// `header.lease.id`.
     pub lease_id: i64,
@@ -100,10 +114,30 @@ impl<'a> ApiRequest<'a> {
                 lease_id,
                 priority,
                 noreply_octet,
-                parameter: r.string()?,
+                parameter: r.string_capped(json_string_cap(r))?,
                 binary: octets(r)?,
             })
         })
+    }
+
+    /// The api id the SDK server dispatches on: the low 32 bits of the wire
+    /// `int64`, as `int32` (wrapping).
+    pub fn dispatched_api_id(&self) -> i32 {
+        dispatched(self.api_id)
+    }
+
+    /// The wire api id fits `int32` (so it means what it says). An id that
+    /// does not is aliased by the robot onto its low 32 bits: a hostile
+    /// writer can hide `Move` (1008) as `2^32 + 1008`.
+    pub fn api_id_in_range(&self) -> bool {
+        i32::try_from(self.api_id).is_ok()
+    }
+
+    /// The parameter as a validated JSON document whose top level is an
+    /// object or an array ([`validate_document`]; `""` is the empty
+    /// object).
+    pub fn parameter_document(&self) -> Result<JsonTop, JsonError> {
+        validate_document(self.parameter.as_bytes())
     }
 
     /// `noreply_octet != 0`.
@@ -122,9 +156,11 @@ impl<'a> ApiRequest<'a> {
         }
     }
 
-    /// Interprets the request for a service and (optionally) a model.
+    /// Interprets the request for a service and (optionally) a model. The
+    /// tables are searched with [`ApiRequest::dispatched_api_id`], as the
+    /// robot does; the returned call keeps the wire id.
     pub fn call(&self, service: ApiService, model: Option<UnitreeModel>) -> ApiCall {
-        interpret(self.api_id, service, model, self.parameter_json())
+        interpret(self.api_id, service, model, self.parameter.as_bytes())
     }
 
     /// [`ApiRequest::call`] with the service taken from the topic the
@@ -135,7 +171,24 @@ impl<'a> ApiRequest<'a> {
     }
 }
 
+/// The low 32 bits of a wire api id, as the SDK server reads them.
+pub fn dispatched_id(api_id: i64) -> i32 {
+    dispatched(api_id)
+}
+
+fn dispatched(api_id: i64) -> i32 {
+    // Truncation is the point: it reproduces the server's int32 dispatch.
+    #[allow(clippy::cast_possible_truncation)]
+    let low = api_id as i32;
+    low
+}
+
 impl<'a> ApiResponse<'a> {
+    /// The wire api id fits `int32` (see [`ApiRequest::api_id_in_range`]).
+    pub fn api_id_in_range(&self) -> bool {
+        i32::try_from(self.api_id).is_ok()
+    }
+
     pub(crate) fn read(r: &mut Reader<'a>) -> Result<Self, DecodeError> {
         r.structure(|r| {
             let (id, api_id, status_code) = r.structure(|r| {
@@ -147,7 +200,7 @@ impl<'a> ApiResponse<'a> {
                 id,
                 api_id,
                 status_code,
-                data: r.string()?,
+                data: r.string_capped(json_string_cap(r))?,
                 binary: octets(r)?,
             })
         })
@@ -168,8 +221,19 @@ pub enum ApiService {
     /// `motion_switcher`: selects / releases the built-in motion service
     /// (releasing it hands the motors to `rt/lowcmd`).
     MotionSwitcher,
-    /// Any other service (vui, audio, video, robot_state, ...): never
-    /// interpreted as motion.
+    /// `obstacles_avoid` (Go2): `Move` with `mode` 0 = velocity, 1 / 2 =
+    /// relative / absolute position target.
+    ObstaclesAvoid,
+    /// `agv` (G1-D wheeled base): `Move` velocity, `HeightAdjust`.
+    Agv,
+    /// `robot_state` (Go2 / B2): `ServiceSwitch` starts / stops on-board
+    /// services, the sport service included.
+    RobotState,
+    /// `uwbswitch` (Go2 UWB tracking): `SwitchSet` makes the robot follow
+    /// the UWB remote.
+    UwbSwitch,
+    /// Any other service (vui, voice, videohub, config, ...): never
+    /// interpreted as motion (see the crate README for the list checked).
     Other,
     /// The service is not known (the topic was not given or is not an
     /// `api/<svc>/request` name). Only ids that mean the same thing on
@@ -193,6 +257,10 @@ impl ApiService {
             Some("loco") => ApiService::Loco,
             Some("arm") => ApiService::Arm,
             Some("motion_switcher") => ApiService::MotionSwitcher,
+            Some("obstacles_avoid") => ApiService::ObstaclesAvoid,
+            Some("agv") => ApiService::Agv,
+            Some("robot_state") => ApiService::RobotState,
+            Some("uwbswitch") => ApiService::UwbSwitch,
             Some(s) if !s.is_empty() && !s.contains('/') => ApiService::Other,
             _ => ApiService::Unspecified,
         }
@@ -238,6 +306,11 @@ pub enum FsmMeaning {
     StandUp,
     /// The "Start" (walking controller) state.
     Start,
+    /// Lie down (R1 `StandUp2Lie`, 702, `unitree_sdk2py/r1/loco`).
+    LieDown,
+    /// G1 706: `Squat2StandUp` / `StandUp2Squat` (the same id toggles,
+    /// `unitree_sdk2py/g1/loco/g1_loco_client.py`).
+    SquatStandToggle,
     /// Not one of the helpers' values for this model, or the model is not
     /// known and the value differs between models.
     Other,
@@ -246,7 +319,9 @@ pub enum FsmMeaning {
 /// An interpreted Unitree API request.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ApiCall {
-    /// Sport `Move` (1008): body velocity, `{"x": vx, "y": vy, "z": vyaw}`.
+    /// A body-velocity `Move`: sport 1008 `{"x": vx, "y": vy, "z": vyaw}`,
+    /// obstacles_avoid 1003 `{"x","y","yaw","mode": 0}`, agv 1001
+    /// `{"vx","vy","vyaw"}`.
     Move { vx: f64, vy: f64, vyaw: f64 },
     /// Loco `SetVelocity` (7105 / H1 8105):
     /// `{"velocity": [vx, vy, omega], "duration": s}`.
@@ -378,6 +453,11 @@ enum Param {
     TargetPosition,
     /// `{"action_id": n}`.
     ActionId,
+    /// obstacles_avoid `Move`: `{"x","y","yaw","mode"}`, mode 0 velocity,
+    /// 1 / 2 relative / absolute position.
+    ObstaclesMove,
+    /// agv `Move`: `{"vx","vy","vyaw"}`.
+    AgvMove,
     /// An argument this crate does not interpret (paths, names, arrays);
     /// the parameter must still be valid JSON.
     Opaque,
@@ -584,6 +664,53 @@ const ARM: &[Entry] = &[
     (7113, "StopCustomAction", Stop, Param::None),
 ];
 
+/// R1 only (`unitree_sdk2py/r1/loco/r1_loco_api.py`: `SetArmTask` 7106,
+/// `{"data": task_id}` in `r1_loco_client.py`; not in the C++ header).
+const LOCO_R1: &[Entry] = &[(7106, "SetArmTask", Trick, Param::Data)];
+
+/// Go2 `obstacles_avoid` (`unitree/robot/go2/obstacles_avoid/obstacles_avoid_api.hpp`,
+/// `unitree_sdk2py/go2/obstacles_avoid/obstacles_avoid_client.py`).
+const OBSTACLES_AVOID: &[Entry] = &[
+    (1001, "SwitchSet", Config, Param::Opaque),
+    (1002, "SwitchGet", Query, Param::None),
+    (1003, "Move", Vel, Param::ObstaclesMove),
+    (
+        1004,
+        "UseRemoteCommandFromApi",
+        ControlHandover,
+        Param::Opaque,
+    ),
+];
+
+/// G1-D `agv` (`unitree/robot/g1/agv/g1_agv_api.hpp`, `g1_agv_client.hpp`).
+/// `HeightAdjust` is a normalised column speed in `[-1, 1]` (`{"data": vz}`),
+/// not m/s: kept as a posture call with its value.
+const AGV: &[Entry] = &[
+    (1001, "Move", Vel, Param::AgvMove),
+    (1002, "HeightAdjust", Posture, Param::Data),
+];
+
+/// `robot_state` (`unitree/robot/{go2,b2}/robot_state/robot_state_api.hpp`).
+/// `ServiceSwitch` (`{"name","switch"}`) can stop or start the sport
+/// service, i.e. who drives the motors. `LowPowerSwitch` (B2) is kept as
+/// configuration (its motion effect is not documented in the SDK).
+const ROBOT_STATE: &[Entry] = &[
+    (1001, "ServiceSwitch", ControlHandover, Param::Opaque),
+    (1002, "SetReportFreq", Config, Param::Opaque),
+    (1003, "ServiceList", Query, Param::None),
+    (1004, "LowPowerSwitch", Config, Param::Opaque),
+    (1005, "LowPowerStatus", Query, Param::None),
+    (1006, "GetPkgVersion", Query, Param::None),
+];
+
+/// Go2 UWB tracking, service `uwbswitch` (`unitree/robot/go2/utrack/utrack_api.hpp`):
+/// `SwitchSet {"enable"}` makes the robot follow the UWB remote.
+const UWB_SWITCH: &[Entry] = &[
+    (1001, "SwitchSet", ControlHandover, Param::Opaque),
+    (1002, "SwitchGet", Query, Param::None),
+    (1003, "IsTracking", Query, Param::None),
+];
+
 /// `motion_switcher` (`unitree/robot/b2/motion_switcher/motion_switcher_api.hpp`).
 const MOTION_SWITCHER: &[Entry] = &[
     (1001, "CheckMode", Query, Param::None),
@@ -604,6 +731,8 @@ fn find(tables: &[&[Entry]], api_id: i64) -> Option<Entry> {
 /// The table lookup for `(service, model, api_id)`.
 fn lookup(service: ApiService, model: Option<UnitreeModel>, api_id: i64) -> Option<Entry> {
     use UnitreeModel as M;
+    // The server dispatches on the low 32 bits (see `ApiRequest::api_id`).
+    let api_id = i64::from(dispatched(api_id));
     match service {
         ApiService::Sport if (1000..7000).contains(&api_id) => {
             let specific: &[Entry] = match model {
@@ -620,7 +749,7 @@ fn lookup(service: ApiService, model: Option<UnitreeModel>, api_id: i64) -> Opti
             let specific: &[&[Entry]] = match model {
                 Some(M::G1) => &[LOCO_G1_H2, LOCO_G1],
                 Some(M::H2) => &[LOCO_G1_H2, LOCO_H2],
-                Some(M::R1) => &[],
+                Some(M::R1) => &[LOCO_R1],
                 Some(_) => return None,
                 None => &[],
             };
@@ -639,13 +768,34 @@ fn lookup(service: ApiService, model: Option<UnitreeModel>, api_id: i64) -> Opti
             Some(_) => None,
         },
         ApiService::MotionSwitcher => find(&[MOTION_SWITCHER], api_id),
+        ApiService::ObstaclesAvoid => match model {
+            Some(M::Go2 | M::Go2W) | None => find(&[OBSTACLES_AVOID], api_id),
+            Some(_) => None,
+        },
+        ApiService::Agv => match model {
+            Some(M::G1) | None => find(&[AGV], api_id),
+            Some(_) => None,
+        },
+        ApiService::RobotState => find(&[ROBOT_STATE], api_id),
+        ApiService::UwbSwitch => find(&[UWB_SWITCH], api_id),
         ApiService::Other => None,
         ApiService::Unspecified => {
             // Interpret only ids that no other known service reuses.
             let tables: [&[Entry]; 4] = [SPORT_COMMON, LOCO_COMMON, LOCO_H1, MOTION_SWITCHER];
             let hits = tables
                 .iter()
-                .chain([ARM, LOCO_G1_H2].iter())
+                .chain(
+                    [
+                        ARM,
+                        LOCO_G1_H2,
+                        LOCO_R1,
+                        OBSTACLES_AVOID,
+                        AGV,
+                        ROBOT_STATE,
+                        UWB_SWITCH,
+                    ]
+                    .iter(),
+                )
                 .filter(|t| t.iter().any(|e| e.0 == api_id))
                 .count();
             if hits == 1 {
@@ -661,7 +811,9 @@ fn lookup(service: ApiService, model: Option<UnitreeModel>, api_id: i64) -> Opti
 /// G1 `g1_loco_client.hpp` (ZeroTorque 0, Damp 1, Squat 2, Sit 3,
 /// StandUp 4, Start 500), H2 `h2_loco_client.hpp` (Start 601), R1
 /// `r1_loco_client.hpp` (0, 1, StandUp 4, Start 811; Squat / Sit commented
-/// out), H1 `h1_loco_client.hpp` (0, 1, StandUp 2, Start 204).
+/// out), H1 `h1_loco_client.hpp` (0, 1, StandUp 2, Start 204). Python-only
+/// helpers (`unitree_sdk2py`): G1 `Lie2StandUp` 702, `Squat2StandUp` /
+/// `StandUp2Squat` 706; R1 `Lie2StandUp` 701, `StandUp2Lie` 702.
 fn fsm_meaning(model: Option<UnitreeModel>, h1_ids: bool, id: i64) -> FsmMeaning {
     use FsmMeaning as F;
     use UnitreeModel as M;
@@ -676,6 +828,9 @@ fn fsm_meaning(model: Option<UnitreeModel>, h1_ids: bool, id: i64) -> FsmMeaning
         (3, Some(M::G1 | M::H2)) => F::Sit,
         (4, _) => F::StandUp,
         (500, Some(M::G1)) | (601, Some(M::H2)) | (811, Some(M::R1)) => F::Start,
+        (702, Some(M::G1)) | (701, Some(M::R1)) => F::StandUp,
+        (706, Some(M::G1)) => F::SquatStandToggle,
+        (702, Some(M::R1)) => F::LieDown,
         _ => F::Other,
     }
 }
@@ -688,7 +843,7 @@ fn interpret(
     api_id: i64,
     service: ApiService,
     model: Option<UnitreeModel>,
-    json: Result<JsonObject<'_>, JsonError>,
+    parameter: &[u8],
 ) -> ApiCall {
     let Some((_, name, class, param)) = lookup(service, model, api_id) else {
         return ApiCall::Unknown { api_id };
@@ -700,10 +855,21 @@ fn interpret(
         reason,
     };
     // Every known call must carry valid JSON (or nothing): an unparsable
-    // parameter is never silently ignored.
-    let o = match json {
-        Ok(o) => o,
-        Err(e) => return malformed(e.reason()),
+    // parameter is never silently ignored. Calls without an interpreted
+    // argument accept a top-level array too (B2 `TrajectoryFollow`); the
+    // others need an object.
+    let o = if matches!(param, Param::None | Param::Opaque) {
+        match validate_document(parameter) {
+            Ok(_) => JsonObject::empty(),
+            Err(e) => return malformed(e.reason()),
+        }
+    } else if parameter.is_empty() {
+        JsonObject::empty()
+    } else {
+        match JsonObject::parse(parameter) {
+            Ok(o) => o,
+            Err(e) => return malformed(e.reason()),
+        }
     };
     let other = |data: Option<f64>| ApiCall::Other {
         api_id,
@@ -751,7 +917,7 @@ fn interpret(
             Some(fsm_id) => ApiCall::SetFsmId {
                 fsm_id,
                 // H1's loco ids are 8xxx (service `loco`).
-                meaning: fsm_meaning(model, (8000..9000).contains(&api_id), fsm_id),
+                meaning: fsm_meaning(model, (8000..9000).contains(&dispatched(api_id)), fsm_id),
             },
             None => malformed("SetFsmId needs an integer data member"),
         },
@@ -772,6 +938,29 @@ fn interpret(
         Param::ActionId => match o.get("action_id").and_then(|v| v.as_i64()) {
             Some(id) => other(Some(id as f64)),
             None => malformed("ExecuteAction needs an integer action_id"),
+        },
+        Param::ObstaclesMove => match (
+            num(&o, "x"),
+            num(&o, "y"),
+            num(&o, "yaw"),
+            o.get("mode").and_then(|v| v.as_i64()),
+        ) {
+            (Some(vx), Some(vy), Some(vyaw), Some(0)) => ApiCall::Move { vx, vy, vyaw },
+            (Some(_), Some(_), Some(_), Some(mode @ (1 | 2))) => ApiCall::Other {
+                api_id,
+                name: if mode == 1 {
+                    "MoveToIncrementPosition"
+                } else {
+                    "MoveToAbsolutePosition"
+                },
+                class: Trajectory,
+                data: None,
+            },
+            _ => malformed("obstacles_avoid Move needs numeric x, y, yaw and mode 0, 1 or 2"),
+        },
+        Param::AgvMove => match (num(&o, "vx"), num(&o, "vy"), num(&o, "vyaw")) {
+            (Some(vx), Some(vy), Some(vyaw)) => ApiCall::Move { vx, vy, vyaw },
+            _ => malformed("agv Move needs numeric vx, vy, vyaw"),
         },
     }
 }
@@ -822,8 +1011,13 @@ mod tests {
             LOCO_G1,
             LOCO_H2,
             LOCO_H1,
+            LOCO_R1,
             ARM,
             MOTION_SWITCHER,
+            OBSTACLES_AVOID,
+            AGV,
+            ROBOT_STATE,
+            UWB_SWITCH,
         ] {
             for (i, a) in t.iter().enumerate() {
                 assert!(t[i + 1..].iter().all(|b| b.0 != a.0), "{a:?}");

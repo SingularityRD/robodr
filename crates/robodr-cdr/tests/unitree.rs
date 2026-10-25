@@ -366,40 +366,22 @@ fn zero_motors<const N: usize>() -> [Mc; N] {
 // ---------------------------------------------------------------- decode
 
 #[test]
-fn go_low_cmd_decodes_and_crc_links_to_reference() {
-    // An all-zero frame: every field 0, so the rebuilt C++ image is 808
-    // zero bytes and the CRC equals the independent Python reference
-    // (crc32_core of 202 zero words).
-    let n = go_low_cmd(Representation::CdrLe, &zero_motors(), 0).len();
-    let mut zero = vec![0u8; n];
-    zero[1] = 0x01; // CDR_LE encapsulation id
-    let msg = decode_unitree(UnitreeKind::GoLowCmd, &zero, &L)
-        .unwrap()
-        .message;
-    let UnitreeMessage::GoLowCmd(c) = msg else {
-        panic!("{msg:?}");
-    };
-    assert_eq!(c.computed_crc(), 0x4b5a_4880);
-    assert!(!c.crc_ok()); // the frame's crc field is 0
-                          // With the right CRC, crc_ok holds and the joint frame reads the dq.
+fn go_low_cmd_decodes_to_a_joint_command() {
+    // CRC correctness is tested against independent vectors in
+    // `tests/unitree_vectors.rs` (review item 13: the CRC asserted here
+    // used to be recomputed by the decoder itself, which is circular).
     let mut motors = zero_motors::<20>();
-    motors[2] = (1, 0.0, -2.5, 0.0, 0.0, 4.0); // enabled, kd != 0
+    motors[2] = (1, 0.0, -2.5, 0.0, 0.0, 4.0); // kd != 0: the dq acts
     motors[5] = (1, 0.0, 9.0, 0.0, 0.0, 0.0); // kd == 0, ignored
-    let probe = go_low_cmd(Representation::CdrLe, &motors, 0);
-    let crc = match decode_unitree(UnitreeKind::GoLowCmd, &probe, &L)
-        .unwrap()
-        .message
-    {
-        UnitreeMessage::GoLowCmd(c) => c.computed_crc(),
-        m => panic!("{m:?}"),
-    };
-    let bytes = go_low_cmd(Representation::CdrLe, &motors, crc);
+    let bytes = go_low_cmd(Representation::CdrLe, &motors, 0);
     let d = decode_payload(MessageKind::UnitreeGoLowCmd, &bytes, &L).unwrap();
     assert_eq!(d.trailing_bytes, 0);
     let MotionMessage::UnitreeGoLowCmd(c) = d.message else {
         panic!();
     };
-    assert!(c.crc_ok());
+    // The crc field (0) does not match: crc_ok is false, and nothing else
+    // changes (crc_ok is advisory, review item 8).
+    assert!(!c.crc_ok());
     let frame = c.joint_frame();
     assert_eq!(frame.as_slice().len(), 20);
     assert_eq!(frame.max_commanded_joint_speed(), 2.5);
@@ -410,7 +392,7 @@ fn go_low_cmd_decodes_and_crc_links_to_reference() {
         e => panic!("{e:?}"),
     }
     assert_eq!(d.message.role(), MotionRole::Command);
-    assert_eq!(d.message.unitree_crc_ok(), Some(true));
+    assert_eq!(d.message.unitree_crc_ok(), Some(false));
 }
 
 fn ctx() -> EventContext<'static> {
@@ -489,20 +471,11 @@ fn hg_low_cmd_and_state() {
     for rep in XCDR1 {
         let mut cmd = zero_motors::<35>();
         cmd[30] = (1, 0.0, 1.25, 0.0, 0.0, 2.0);
-        let probe = hg_low_cmd(rep, &cmd, 0);
-        let crc = match decode_unitree(UnitreeKind::HgLowCmd, &probe, &L)
-            .unwrap()
-            .message
-        {
-            UnitreeMessage::HgLowCmd(c) => c.computed_crc(),
-            m => panic!("{m:?}"),
-        };
-        let cb = hg_low_cmd(rep, &cmd, crc);
+        let cb = hg_low_cmd(rep, &cmd, 0);
         let d = decode_payload(MessageKind::UnitreeHgLowCmd, &cb, &L).unwrap();
         let MotionMessage::UnitreeHgLowCmd(c) = &d.message else {
             panic!();
         };
-        assert!(c.crc_ok());
         assert_eq!(c.joint_frame().as_slice().len(), 35);
         assert_eq!(c.joint_frame().max_commanded_joint_speed(), 1.25);
 
@@ -516,15 +489,6 @@ fn hg_low_cmd_and_state() {
             }
             m => panic!("{m:?}"),
         }
-    }
-    // All-zero hg LowCmd CRC equals the independent reference.
-    let z = hg_low_cmd(Representation::CdrLe, &zero_motors(), 0);
-    match decode_unitree(UnitreeKind::HgLowCmd, &z, &L)
-        .unwrap()
-        .message
-    {
-        UnitreeMessage::HgLowCmd(c) => assert_eq!(c.computed_crc(), 0xfe17_2f9f),
-        m => panic!("{m:?}"),
     }
 }
 
@@ -847,15 +811,30 @@ fn plain_xcdr2_go_low_cmd() {
 
 #[test]
 fn delimited_xcdr2_api_request() {
-    // D_CDR2_LE: every struct (Request, Header, Identity, Lease, Policy)
-    // carries a DHEADER; the decoder must thread them.
-    let bytes = api_request(Representation::DCdr2Le, 1008, br#"{"x":0,"y":0,"z":0}"#);
+    // The Unitree types are @final (review item 12): under a D_CDR2_LE
+    // header the body is read exactly as plain XCDR2, with no struct
+    // DHEADERs (Cyclone DDS takes the extensibility from the type).
+    let mut bytes = api_request(Representation::Cdr2Le, 1008, br#"{"x":0,"y":0,"z":0}"#);
+    bytes[1] = 0x09; // D_CDR2_LE
     let d = decode_payload(MessageKind::UnitreeApiRequest, &bytes, &L).unwrap();
+    assert_eq!(d.encapsulation.representation, Representation::DCdr2Le);
     let MotionMessage::UnitreeApiRequest(q) = &d.message else {
         panic!();
     };
     assert_eq!(q.api_id, 1008);
     assert_eq!(d.trailing_bytes, 0);
+    // A body that wraps every struct in a DHEADER (what an @appendable
+    // type would send) is not this type's layout: it is not read as one.
+    let wrapped = api_request(Representation::DCdr2Le, 1008, br#"{"x":0,"y":0,"z":0}"#);
+    match decode_payload(MessageKind::UnitreeApiRequest, &wrapped, &L) {
+        Err(_) => {}
+        Ok(d) => {
+            let MotionMessage::UnitreeApiRequest(q) = &d.message else {
+                panic!();
+            };
+            assert_ne!(q.api_id, 1008);
+        }
+    }
 }
 
 // ---------------------------------------------------------------- model table

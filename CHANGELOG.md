@@ -481,6 +481,40 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Fixed
 
+- Unitree decoders (`robodr-cdr`), review of the initial implementation:
+  joint command frames are evaluated over **every** slot whatever the mode
+  octet (`rt/arm_sdk` sends `mode = 0` and still moves the arms; a
+  non-finite field in any slot poisons the frame); torque-only and
+  position-gain commands are no longer "speed 0" — `MotionCommand` gains
+  `joint_torque`, `joint_kp`, `joint_position_step` (filled by the ROS 2
+  pipeline and the commissioning pcap reader from the previous frame on the
+  channel) and `command_class` / `command_name`, the profile envelope gains
+  optional `max_joint_torque`, `max_joint_kp`, `max_joint_position_step`
+  (checked as `robot.motion.joint_over_envelope`; absent → a command using
+  the term is `robot.motion.unverifiable_command`, Medium), and
+  `robodr-commission` learns, caps (`--hard-cap-torque`, `--hard-cap-kp`,
+  `--hard-cap-position-step`), locks, merges and diffs them; API calls are
+  dispatched on the low 32 bits of `api_id` as the SDK server does, and an
+  id outside `int32` is the new High finding
+  `robot.motion.api_id_out_of_range`; API tricks / trajectories / unknown /
+  malformed motion calls are `robot.motion.unverifiable_command` and
+  control handovers the new `robot.motion.control_handover` (High); new
+  velocity services Go2 `obstacles_avoid` `Move` and G1 `agv` `Move`, plus
+  `robot_state` / `uwbswitch` handovers, R1 `SetArmTask` and the
+  Python-only FSM ids; new decoders `unitree_go` `MotorCmds_`
+  (`rt/hand_sdk`) and standalone `unitree_hg` `MotorCmd_` / `MotorState_`
+  (`rt/waistpitch*`), `rt/user_lowcmd` in the model table, Dex3 mode
+  bitfield (`Dex3Mode`); the API `parameter` / `data` strings are capped at
+  the 16 KiB JSON cap and may be top-level JSON arrays (B2
+  `TrajectoryFollow`); the Unitree types are `@final`, so a `D_CDR2`
+  header no longer makes the decoder expect struct DHEADERs; `crc_ok` is
+  documented as advisory (C++ padding can be indeterminate); legacy
+  `HighCmd` / `LowCmd` map to `MotionCommand` and `LegacyCrcMode::EncryptCrc`
+  is supported; CRC tests use independent vectors; the fuzz harness runs
+  with the default limits too. The README states the exact coverage
+  (published IDL + independent vectors; not yet verified on robot
+  captures).
+
 - `robot.motion.unattributed_sample` (High) on a legitimate writer whose
   DATA reached a remote reader before its own SEDP announcement (Fast DDS
   Gazebo bridge `/odom`, 47 ms): an unannounced writer is now reported only

@@ -62,6 +62,9 @@ kind_decoder!(
     MessageKind::UnitreeHgDoubleImuState
 );
 kind_decoder!(dec_unitree_api_request, MessageKind::UnitreeApiRequest);
+kind_decoder!(dec_unitree_go_motor_cmds, MessageKind::UnitreeGoMotorCmds);
+kind_decoder!(dec_unitree_hg_motor_cmd, MessageKind::UnitreeHgMotorCmd);
+kind_decoder!(dec_unitree_hg_motor_state, MessageKind::UnitreeHgMotorState);
 
 /// The built-in decoder for a kind.
 pub fn builtin_decoder(kind: MessageKind) -> DecodeFn {
@@ -82,6 +85,9 @@ pub fn builtin_decoder(kind: MessageKind) -> DecodeFn {
         MessageKind::UnitreeHgImuState => dec_unitree_hg_imu,
         MessageKind::UnitreeHgDoubleImuState => dec_unitree_hg_double_imu,
         MessageKind::UnitreeApiRequest => dec_unitree_api_request,
+        MessageKind::UnitreeGoMotorCmds => dec_unitree_go_motor_cmds,
+        MessageKind::UnitreeHgMotorCmd => dec_unitree_hg_motor_cmd,
+        MessageKind::UnitreeHgMotorState => dec_unitree_hg_motor_state,
     }
 }
 

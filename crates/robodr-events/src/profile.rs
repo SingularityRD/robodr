@@ -95,8 +95,24 @@
 //!    (Critical; the detail names the axis);
 //! 5. `‖(angular.x, angular.y)‖ > max_roll_pitch_rate` →
 //!    `robot.motion.angular_over_envelope` (Critical);
-//! 6. `|joint| > max_joint_speed` → `robot.motion.joint_over_envelope`
-//!    (Critical).
+//! 6. `|joint| > max_joint_speed`, then `|joint_torque| > max_joint_torque`,
+//!    `|joint_kp| > max_joint_kp`, `|joint_position_step| >
+//!    max_joint_position_step` → `robot.motion.joint_over_envelope`
+//!    (Critical; the detail names the quantity);
+//! 7. an API call whose motion nothing in the request bounds
+//!    ([`crate::CommandClass`]): `Trick` (flip, jump, dance, arm action) →
+//!    `robot.motion.unverifiable_command` (High), `Trajectory` (position /
+//!    path target) → `robot.motion.unverifiable_command` (Medium),
+//!    `Unknown` / `Malformed` call of a motion service →
+//!    `robot.motion.unverifiable_command` (High), `ControlHandover` (motion
+//!    switcher release, user control, arm SDK enable) →
+//!    `robot.motion.control_handover` (High);
+//! 8. a joint command with a non-zero `joint_torque` on an envelope without
+//!    `max_joint_torque`, or a non-zero `joint_kp` on an envelope without
+//!    `max_joint_kp` / `max_joint_position_step` →
+//!    `robot.motion.unverifiable_command` (Medium): the command is not fully
+//!    checkable (the joint limits are optional, so profiles written before
+//!    they existed still load, but such a command is never silently passed).
 //!
 //! `None` as a limit means "not constrained"; use `None`, not `+inf`, for
 //! that. A command axis that is `None` is not checked by its per-axis limit
@@ -119,7 +135,8 @@
 //!   deliberate: declaring a base holonomic is a statement that sideways /
 //!   vertical / tilting motion is legitimate, so it must come with an
 //!   explicit bound for each (`0.0` for an axis that must not move) instead
-//!   of an implicit "unconstrained". `max_joint_speed` stays optional.
+//!   of an implicit "unconstrained". The joint limits (`max_joint_speed`, `max_joint_torque`,
+//!   `max_joint_kp`, `max_joint_position_step`) stay optional.
 //!
 //! The envelope has no yaw-rate field: a finite yaw rate is bounded by the
 //! Motion Firewall's per-channel `max_angular_speed`, not here.
@@ -196,17 +213,41 @@ pub struct Envelope {
     /// Max allowed roll/pitch rate `‖(angular.x, angular.y)‖`, rad/s.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_roll_pitch_rate: Option<f64>,
+    /// Max allowed feed-forward joint torque `|tau|`, N·m (low-level joint
+    /// commands, [`MotionCommand::joint_torque`]). `None` = not checked: a
+    /// command with a non-zero torque is then reported as
+    /// `robot.motion.unverifiable_command`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_joint_torque: Option<f64>,
+    /// Max allowed joint position gain `|kp|` ([`MotionCommand::joint_kp`]).
+    /// `None` = not checked; a command with `kp != 0` is then
+    /// `robot.motion.unverifiable_command`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_joint_kp: Option<f64>,
+    /// Max allowed position-target step between consecutive commands on the
+    /// channel, rad ([`MotionCommand::joint_position_step`]). `None` = not
+    /// checked; a command with `kp != 0` is then
+    /// `robot.motion.unverifiable_command` (a bounded gain with an unbounded
+    /// target is an unbounded torque).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_joint_position_step: Option<f64>,
 }
 
 impl Envelope {
     /// Every limit with its field id (for validation and fail-closed checks).
-    pub fn limits(&self) -> [(EnvelopeField, Option<f64>); 5] {
+    pub fn limits(&self) -> [(EnvelopeField, Option<f64>); 8] {
         [
             (EnvelopeField::MaxLinearSpeed, self.max_linear_speed),
             (EnvelopeField::MaxJointSpeed, self.max_joint_speed),
             (EnvelopeField::MaxLateralSpeed, self.max_lateral_speed),
             (EnvelopeField::MaxVerticalSpeed, self.max_vertical_speed),
             (EnvelopeField::MaxRollPitchRate, self.max_roll_pitch_rate),
+            (EnvelopeField::MaxJointTorque, self.max_joint_torque),
+            (EnvelopeField::MaxJointKp, self.max_joint_kp),
+            (
+                EnvelopeField::MaxJointPositionStep,
+                self.max_joint_position_step,
+            ),
         ]
     }
 
@@ -218,7 +259,7 @@ impl Envelope {
         }
         self.limits()
             .into_iter()
-            .filter(|(f, v)| *f != EnvelopeField::MaxJointSpeed && v.is_none())
+            .filter(|(f, v)| f.holonomic_mandatory() && v.is_none())
             .map(|(f, _)| f)
             .collect()
     }
@@ -533,9 +574,24 @@ pub enum EnvelopeField {
     MaxLateralSpeed,
     MaxVerticalSpeed,
     MaxRollPitchRate,
+    MaxJointTorque,
+    MaxJointKp,
+    MaxJointPositionStep,
 }
 
 impl EnvelopeField {
+    /// Mandatory on a `holonomic` envelope (the body-motion limits; the
+    /// joint limits stay optional).
+    pub fn holonomic_mandatory(self) -> bool {
+        matches!(
+            self,
+            Self::MaxLinearSpeed
+                | Self::MaxLateralSpeed
+                | Self::MaxVerticalSpeed
+                | Self::MaxRollPitchRate
+        )
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::MaxLinearSpeed => "max_linear_speed",
@@ -543,6 +599,9 @@ impl EnvelopeField {
             Self::MaxLateralSpeed => "max_lateral_speed",
             Self::MaxVerticalSpeed => "max_vertical_speed",
             Self::MaxRollPitchRate => "max_roll_pitch_rate",
+            Self::MaxJointTorque => "max_joint_torque",
+            Self::MaxJointKp => "max_joint_kp",
+            Self::MaxJointPositionStep => "max_joint_position_step",
         }
     }
 }
@@ -930,12 +989,15 @@ impl Profile {
     fn check_motion(&self, c: &MotionCommand) -> Option<Deviation> {
         // 1. Hostile floats first, on every axis: NaN compares false with
         //    everything, so it must never reach a `>` check.
-        for (dim, v) in c.components() {
+        for (i, (dim, v)) in c.components().into_iter().enumerate() {
             if let Some(v) = v.filter(|v| !v.is_finite()) {
+                // The first seven components are speeds; the rest are the
+                // joint torque / gain / step magnitudes.
+                let what = if i < 7 { " speed" } else { "" };
                 return Some(Deviation::new(
                     "robot.motion.non_finite_command",
                     Severity::Critical,
-                    format!("non-finite {dim} speed {v} on {}", c.channel),
+                    format!("non-finite {dim}{what} {v} on {}", c.channel),
                 ));
             }
         }
@@ -1047,7 +1109,103 @@ impl Profile {
                 ));
             }
         }
-        None
+        for (max, v, what, unit) in [
+            (env.max_joint_torque, c.joint_torque, "joint torque", "N·m"),
+            (env.max_joint_kp, c.joint_kp, "joint position gain kp", ""),
+            (
+                env.max_joint_position_step,
+                c.joint_position_step,
+                "joint position-target step",
+                "rad",
+            ),
+        ] {
+            if let (Some(max), Some(v)) = (max, v) {
+                if v.abs() > max {
+                    return Some(over("robot.motion.joint_over_envelope", what, unit, v, max));
+                }
+            }
+        }
+        // 4. What the envelope cannot bound: API calls whose motion is not
+        //    in the request, and joint gains the profile has no limit for.
+        if let Some(d) = Self::check_command_class(c) {
+            return Some(d);
+        }
+        Self::check_unbounded_joint_terms(c, env)
+    }
+
+    /// API calls whose motion the envelope cannot bound (see
+    /// [`crate::CommandClass`]).
+    fn check_command_class(c: &MotionCommand) -> Option<Deviation> {
+        use crate::CommandClass as K;
+        let name = c.command_name.as_deref().unwrap_or("call");
+        let (rule, sev, why) = match c.command_class? {
+            K::Trick => (
+                "robot.motion.unverifiable_command",
+                Severity::High,
+                "a pre-programmed whole-body motion: nothing in the request bounds it",
+            ),
+            K::Trajectory => (
+                "robot.motion.unverifiable_command",
+                Severity::Medium,
+                "a position / path target: the request carries no speed the envelope can check",
+            ),
+            K::ControlHandover => (
+                "robot.motion.control_handover",
+                Severity::High,
+                "hands motor control to (or takes it from) another channel or controller",
+            ),
+            K::Unknown => (
+                "robot.motion.unverifiable_command",
+                Severity::High,
+                "not a known call of this motion service: its effect cannot be checked",
+            ),
+            K::Malformed => (
+                "robot.motion.unverifiable_command",
+                Severity::High,
+                "a known motion call whose arguments cannot be read",
+            ),
+            K::Velocity | K::Stop | K::Posture | K::Config | K::Query => return None,
+        };
+        Some(Deviation::new(
+            rule,
+            sev,
+            format!("{name} on {}: {why}", c.channel),
+        ))
+    }
+
+    /// A low-level joint command carries a torque / position gain the
+    /// envelope has no limit for: it is not fully checkable.
+    fn check_unbounded_joint_terms(c: &MotionCommand, env: &Envelope) -> Option<Deviation> {
+        let torque = c.joint_torque.is_some_and(|t| t != 0.0);
+        let kp = c.joint_kp.is_some_and(|k| k != 0.0);
+        let mut missing: Vec<&'static str> = Vec::new();
+        if torque && env.max_joint_torque.is_none() {
+            missing.push("max_joint_torque");
+        }
+        if kp && env.max_joint_kp.is_none() {
+            missing.push("max_joint_kp");
+        }
+        if kp && env.max_joint_position_step.is_none() {
+            missing.push("max_joint_position_step");
+        }
+        if missing.is_empty() {
+            return None;
+        }
+        Some(Deviation::new(
+            "robot.motion.unverifiable_command",
+            Severity::Medium,
+            format!(
+                "joint command on {} applies {} but the envelope has no {}: the command is not \
+                 fully checkable",
+                c.channel,
+                match (torque, kp) {
+                    (true, true) => "a feed-forward torque and a position gain",
+                    (true, false) => "a feed-forward torque",
+                    _ => "a position gain",
+                },
+                missing.join(" / ")
+            ),
+        ))
     }
 }
 
@@ -1825,6 +1983,7 @@ mod holonomic_tests {
             angular_y: Some(v[4]),
             angular_speed: Some(v[5]),
             joint_speed: None,
+            ..Default::default()
         })
     }
 
@@ -2379,5 +2538,204 @@ mod metadata_tests {
         assert!(!serde_json::to_string(&id)
             .unwrap()
             .contains("max_instances"));
+    }
+}
+
+/// Review of the Unitree decoders (item 2 / 5): torque-only, gain-only and
+/// API-call commands must not pass as "speed 0".
+#[cfg(test)]
+mod joint_terms_and_calls {
+    use super::*;
+    use crate::CommandClass;
+
+    const ARM: &str = "/arm_sdk";
+
+    fn profile(env: Envelope) -> Profile {
+        let mut p = Profile {
+            model: "m".into(),
+            locked: true,
+            ..Default::default()
+        };
+        p.writer_topics.insert(ARM.into());
+        p.motion_envelopes.insert(ARM.into(), env);
+        p
+    }
+
+    fn joint(speed: f64, tau: f64, kp: f64, step: Option<f64>) -> RobotEvent {
+        RobotEvent::MotionCommand(MotionCommand {
+            channel: ARM.into(),
+            joint_speed: Some(speed),
+            joint_torque: Some(tau),
+            joint_kp: Some(kp),
+            joint_position_step: step,
+            ..Default::default()
+        })
+    }
+
+    fn bounded() -> Envelope {
+        Envelope {
+            max_joint_speed: Some(2.0),
+            max_joint_torque: Some(20.0),
+            max_joint_kp: Some(100.0),
+            max_joint_position_step: Some(0.05),
+            ..Default::default()
+        }
+    }
+
+    fn verdict(p: &Profile, e: &RobotEvent) -> Option<(String, Severity)> {
+        p.evaluate(e).map(|d| (d.rule.to_string(), d.severity))
+    }
+
+    #[test]
+    fn attacker_torque_or_gain_deviates_with_bounds() {
+        let p = profile(bounded());
+        assert_eq!(p.validate(), Ok(()));
+        // The legitimate frame passes.
+        assert_eq!(verdict(&p, &joint(1.0, 5.0, 60.0, Some(0.01))), None);
+        for e in [
+            joint(0.0, 500.0, 0.0, None),       // torque-only
+            joint(0.0, -500.0, 0.0, None),      // signed
+            joint(0.0, 0.0, 500.0, Some(0.0)),  // position gain
+            joint(0.0, 0.0, 60.0, Some(1.5)),   // position step
+            joint(0.0, 0.0, -500.0, Some(0.0)), // negative gain
+        ] {
+            assert_eq!(
+                verdict(&p, &e),
+                Some((
+                    "robot.motion.joint_over_envelope".to_string(),
+                    Severity::Critical
+                )),
+                "{e:?}"
+            );
+        }
+        // Non-finite gain terms are Critical like any non-finite command.
+        assert_eq!(
+            verdict(&p, &joint(0.0, f64::NAN, 0.0, None)).map(|v| v.0),
+            Some("robot.motion.non_finite_command".to_string())
+        );
+        assert_eq!(
+            verdict(&p, &joint(0.0, 0.0, 1.0, Some(f64::INFINITY))).map(|v| v.0),
+            Some("robot.motion.non_finite_command".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_joint_bounds_are_unverifiable_not_silent() {
+        // An envelope written before the joint-term limits existed.
+        let p = profile(Envelope {
+            max_joint_speed: Some(2.0),
+            ..Default::default()
+        });
+        let unverifiable = Some((
+            "robot.motion.unverifiable_command".to_string(),
+            Severity::Medium,
+        ));
+        assert_eq!(verdict(&p, &joint(0.0, 500.0, 0.0, None)), unverifiable);
+        assert_eq!(verdict(&p, &joint(0.0, 0.0, 500.0, None)), unverifiable);
+        // A pure velocity frame (kp = tau = 0) stays fully checkable.
+        assert_eq!(verdict(&p, &joint(1.0, 0.0, 0.0, None)), None);
+        // kp bounded but no step bound: still not fully checkable.
+        let q = profile(Envelope {
+            max_joint_kp: Some(100.0),
+            ..Default::default()
+        });
+        assert_eq!(verdict(&q, &joint(0.0, 0.0, 50.0, None)), unverifiable);
+        // Over-envelope wins over "unverifiable".
+        let r = profile(Envelope {
+            max_joint_speed: Some(1.0),
+            ..Default::default()
+        });
+        assert_eq!(
+            verdict(&r, &joint(3.0, 500.0, 0.0, None)).map(|v| v.0),
+            Some("robot.motion.joint_over_envelope".to_string())
+        );
+    }
+
+    #[test]
+    fn api_call_classes() {
+        let p = profile(bounded());
+        let call = |class| {
+            RobotEvent::MotionCommand(MotionCommand {
+                channel: ARM.into(),
+                command_class: Some(class),
+                command_name: Some("X".into()),
+                ..Default::default()
+            })
+        };
+        let rule = |r: &str, s| Some((r.to_string(), s));
+        let unv = "robot.motion.unverifiable_command";
+        assert_eq!(
+            verdict(&p, &call(CommandClass::Trick)),
+            rule(unv, Severity::High)
+        );
+        assert_eq!(
+            verdict(&p, &call(CommandClass::Trajectory)),
+            rule(unv, Severity::Medium)
+        );
+        assert_eq!(
+            verdict(&p, &call(CommandClass::Unknown)),
+            rule(unv, Severity::High)
+        );
+        assert_eq!(
+            verdict(&p, &call(CommandClass::Malformed)),
+            rule(unv, Severity::High)
+        );
+        assert_eq!(
+            verdict(&p, &call(CommandClass::ControlHandover)),
+            rule("robot.motion.control_handover", Severity::High)
+        );
+        for ok in [
+            CommandClass::Velocity,
+            CommandClass::Stop,
+            CommandClass::Posture,
+            CommandClass::Config,
+            CommandClass::Query,
+        ] {
+            assert_eq!(verdict(&p, &call(ok)), None, "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn new_fields_are_backward_compatible() {
+        // Old events / envelopes load; new fields are omitted when None.
+        let c: MotionCommand = serde_json::from_str(
+            r#"{"channel":"/c","source_guid":null,"linear_speed":0.5,"joint_speed":null}"#,
+        )
+        .unwrap();
+        assert_eq!(c.joint_torque, None);
+        assert_eq!(c.command_class, None);
+        let j = serde_json::to_string(&c).unwrap();
+        assert!(
+            !j.contains("joint_torque") && !j.contains("command_class"),
+            "{j}"
+        );
+        let e: Envelope = serde_json::from_str(r#"{"max_linear_speed":0.5}"#).unwrap();
+        assert_eq!(e.max_joint_torque, None);
+        assert_eq!(
+            serde_json::to_string(&e).unwrap(),
+            r#"{"max_linear_speed":0.5,"max_joint_speed":null}"#
+        );
+        // A negative / NaN joint-term limit is invalid like any other.
+        let p = profile(Envelope {
+            max_joint_torque: Some(-1.0),
+            ..Default::default()
+        });
+        assert!(p.validate().is_err());
+        assert_eq!(
+            verdict(&p, &joint(0.0, 0.0, 0.0, None)).map(|v| v.0),
+            Some("robot.profile.invalid_envelope".to_string())
+        );
+        // Joint limits are never mandatory on a holonomic envelope.
+        let h = Envelope {
+            holonomic: true,
+            max_linear_speed: Some(1.0),
+            max_lateral_speed: Some(1.0),
+            max_vertical_speed: Some(0.0),
+            max_roll_pitch_rate: Some(0.0),
+            ..Default::default()
+        };
+        assert!(h.missing_holonomic_limits().is_empty());
+        let s = serde_json::to_string(&CommandClass::ControlHandover).unwrap();
+        assert_eq!(s, "\"control_handover\"");
     }
 }

@@ -561,6 +561,7 @@ fn f7_merge_and_lock_enforce_hard_cap() {
     let caps = HardCaps {
         linear: 1e301,
         joint: 10.0,
+        ..HardCaps::default()
     };
     let m = merge_profiles_with_caps(&[c.profile.clone(), edited], &caps).unwrap();
     assert!(lock_with_caps(&m, &Signoff::for_profile(&m).confirm_all("op"), &caps).is_ok());
@@ -568,6 +569,7 @@ fn f7_merge_and_lock_enforce_hard_cap() {
     let nan = HardCaps {
         linear: f64::NAN,
         joint: f64::NAN,
+        ..HardCaps::default()
     };
     assert!(lock_with_caps(&m, &Signoff::for_profile(&m).confirm_all("op"), &nan).is_err());
 }

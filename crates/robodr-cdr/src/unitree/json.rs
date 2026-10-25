@@ -3,7 +3,10 @@
 //!
 //! Unitree's clients put a short JSON object there (`{"x":0.3,"y":0,"z":0}`
 //! for `Move`, `{"velocity":[..],"duration":1}` for `SetVelocity`,
-//! `{"data":1}` for most setters). This reader validates the **whole**
+//! `{"data":1}` for most setters). A few calls send a top-level **array**
+//! instead (B2 `TrajectoryFollow`: 30 path-point objects, about 3 KB,
+//! `unitree_sdk2py/b2/sport/sport_client.py`); [`validate_document`]
+//! accepts either, with the same caps. This reader validates the **whole**
 //! document against RFC 8259 and then answers lookups of top-level members.
 //! It is deliberately strict where a lenient parser would let a hostile
 //! writer hide a value:
@@ -40,7 +43,8 @@ pub enum JsonError {
     TooManyMembers,
     /// Not valid UTF-8.
     NotUtf8,
-    /// The document is not a JSON object.
+    /// The document is not a JSON object (or, for
+    /// [`validate_document`], not an object or an array).
     NotAnObject,
     /// A grammar violation at byte offset `at`.
     Syntax { at: usize },
@@ -257,6 +261,45 @@ impl<'a> JsonObject<'a> {
             .iter()
             .find(|(k, _)| *k == key.as_bytes())
             .map(|(_, v)| *v)
+    }
+}
+
+/// The top level of a validated parameter document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JsonTop {
+    Object,
+    Array,
+}
+
+/// Validates a whole parameter document whose top level is an object (with
+/// every [`JsonObject::parse`] rule: unique, unescaped keys, at most
+/// [`MAX_MEMBERS`]) or an array (any length, every element valid, nesting
+/// at most [`MAX_JSON_DEPTH`]); [`MAX_JSON_LEN`] and UTF-8 apply to both.
+/// An empty document is the empty object (the SDK sends `""` for calls
+/// without arguments).
+pub fn validate_document(src: &[u8]) -> Result<JsonTop, JsonError> {
+    if src.is_empty() {
+        return Ok(JsonTop::Object);
+    }
+    if src.len() > MAX_JSON_LEN {
+        return Err(JsonError::TooLong { len: src.len() });
+    }
+    if std::str::from_utf8(src).is_err() {
+        return Err(JsonError::NotUtf8);
+    }
+    let mut p = Parser::new(src);
+    p.ws();
+    match p.peek() {
+        Some(b'{') => JsonObject::parse(src).map(|_| JsonTop::Object),
+        Some(b'[') => {
+            p.value(1)?;
+            p.ws();
+            if p.pos < src.len() {
+                return Err(JsonError::TrailingData { at: p.pos });
+            }
+            Ok(JsonTop::Array)
+        }
+        _ => Err(JsonError::NotAnObject),
     }
 }
 
@@ -534,6 +577,51 @@ mod tests {
         let o = JsonObject::parse(br#"{"x":1e999,"y":-1e999}"#).unwrap();
         assert_eq!(o.get("x").unwrap().as_f64(), Some(f64::INFINITY));
         assert_eq!(o.get("y").unwrap().as_f64(), Some(f64::NEG_INFINITY));
+    }
+
+    #[test]
+    fn documents_may_be_arrays() {
+        assert_eq!(validate_document(b""), Ok(JsonTop::Object));
+        assert_eq!(validate_document(br#" {"a":1} "#), Ok(JsonTop::Object));
+        assert_eq!(
+            validate_document(br#"[{"x":1,"y":2},{"x":3}]"#),
+            Ok(JsonTop::Array)
+        );
+        assert_eq!(validate_document(b"[]"), Ok(JsonTop::Array));
+        // Object rules still apply to an object document.
+        assert!(matches!(
+            validate_document(br#"{"x":1,"x":2}"#),
+            Err(JsonError::DuplicateKey { .. })
+        ));
+        // Scalars, trailing data, depth and size caps.
+        assert_eq!(validate_document(b"1"), Err(JsonError::NotAnObject));
+        assert!(matches!(
+            validate_document(b"[1] x"),
+            Err(JsonError::TrailingData { .. })
+        ));
+        assert!(matches!(
+            validate_document(b"[1,]"),
+            Err(JsonError::Syntax { .. })
+        ));
+        let deep: Vec<u8> = std::iter::repeat_n(b'[', MAX_JSON_DEPTH + 1)
+            .chain(std::iter::repeat_n(b']', MAX_JSON_DEPTH + 1))
+            .collect();
+        assert!(matches!(
+            validate_document(&deep),
+            Err(JsonError::TooDeep { .. })
+        ));
+        let ok: Vec<u8> = std::iter::repeat_n(b'[', MAX_JSON_DEPTH)
+            .chain(std::iter::repeat_n(b']', MAX_JSON_DEPTH))
+            .collect();
+        assert_eq!(validate_document(&ok), Ok(JsonTop::Array));
+        let mut big = b"[".to_vec();
+        big.extend(std::iter::repeat_n(b' ', MAX_JSON_LEN));
+        big.push(b']');
+        assert!(matches!(
+            validate_document(&big),
+            Err(JsonError::TooLong { .. })
+        ));
+        assert_eq!(validate_document(b"[\"\xff\"]"), Err(JsonError::NotUtf8));
     }
 
     #[test]
