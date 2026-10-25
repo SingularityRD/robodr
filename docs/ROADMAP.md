@@ -32,8 +32,8 @@ contested comms, no cloud, and an adversary who may physically hold a unit:
 |---|---|---|
 | **C2 / datalink compromise** | Spoofed or replayed command-and-control over a contested RF link; injected waypoints or mode changes. | Command source + envelope check at the robot; signed-command verification; link-integrity sensor. Enforcement is local, never cloud-dependent. |
 | **GNSS / navigation spoofing** | Falsified position/time drives the platform off-mission. | GNSS-vs-inertial consistency check (sensor-authored vs claimed), flagged as a navigation deviation. |
-| **Captured-unit exploitation** | An adversary physically recovers a platform and extracts keys, firmware or mission data, or re-flashes it. | Measured-boot attestation + sealed keys; tamper response; a unit that fails attestation never rejoins the fleet at trust. (Zeroization/anti-tamper is the platform's job; RoboDR detects and refuses trust.) |
-| **Supply-chain / sovereignty** | Trojaned package or dependency (cf. the SROS 2 keystore case) in a platform that must run with no outside connectivity and under export control. | Entry-station Analyzer scan of every offline bundle; signed, versioned, rollback-able updates; on-prem/air-gapped by default; no component phones home. |
+| **Captured-unit exploitation** | An adversary physically recovers a platform and extracts keys, firmware or mission data, or re-flashes it. | Measured-boot attestation + sealed keys; tamper response; a unit that fails attestation never rejoins the fleet at trust. Software, models and mission config delivered by RoboDR are encrypted at rest under keys sealed to the unit's TPM and measured boot, with an optional site lease and cryptographic erase ([`SECURE-DELIVERY.md`](SECURE-DELIVERY.md) §7, design only). (Physical zeroization/anti-tamper remains the platform's job.) |
+| **Supply-chain / sovereignty** | Trojaned package or dependency (cf. the SROS 2 keystore case) in a platform that must run with no outside connectivity and under export control. | Entry-station Analyzer scan of every offline bundle; quorum-signed, versioned, rollback-able updates with anti-rollback floors and staged fleet rollout ([`SECURE-DELIVERY.md`](SECURE-DELIVERY.md), design only); on-prem/air-gapped by default; no component phones home. |
 
 Two lessons set the architecture:
 
@@ -123,6 +123,10 @@ written for that target; the component dependency order is unchanged.
                  ▼
  robodr-diode      one-way export (air-gap)                   [~]
  robodr-fleet      control plane · attestation verifier · console [ ]
+ robodr-depot      air-gapped fleet delivery (SECURE-DELIVERY) [ ]
+   ├ robodr-pkg       RPK / bundle / deployment formats         [ ]
+   ├ robodr-deliverd  on-unit install, rollback, safety gate    [ ]
+   └ robodr-seal      TPM-sealed payload keys, crypto-erase     [ ]
                  │ OCSF findings  (robodr-ocsf mapper          [P])
                  ▼
  AutoSecOps AI SOC  triage · hunt · workflows (see main design doc) [ ]
@@ -225,6 +229,9 @@ Linux.
   network; signed, versioned, rollback-able update bundles carried by data diode
   or vetted media through an entry station (every bundle scanned by Robot
   Analyzer); evidence out via diode. Local time source for the evidence chain.
+  Designed in [`SECURE-DELIVERY.md`](SECURE-DELIVERY.md): fleet distribution of
+  any software (`robodr-depot`, `robodr-deliverd`), staged updates gated on
+  safety state, and captured-unit protection (`robodr-seal`).
 - `robodr-sensor-bus` (Bus Tap) + Lite SDK (RTOS/MCU, Zephyr/FreeRTOS/NuttX,
   PX4/ArduPilot): the drone and defence-UGV family. CAN/EtherCAT/MAVLink/1553.
 - **IEC 62443-4-2** evidence package for the agent itself; CRA reporting workflow

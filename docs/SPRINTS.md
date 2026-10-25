@@ -356,9 +356,17 @@ RTOS/drones.
   disconnected robots decay to Unknown. *Catches the UniPwn rooted-firmware class.*
 - **Sprint 13 — Air-gap packaging:** offline install bundle (images, crates, model);
   signed, versioned, rollback-able update bundles; entry-station scan via Robot
-  Analyzer; local time source for the evidence chain.
+  Analyzer; local time source for the evidence chain. Split into **13a**
+  (formats + quorum release signing), **13b** (on-unit agent: install, health
+  gate, rollback, floors, safety-state gate) and **13c** (TPM sealing,
+  crypto-erase, no-TPM fallback); see
+  [`SECURE-DELIVERY.md`](SECURE-DELIVERY.md) §10.
 - **Sprint 14 — Air-gap bring-up + single-box control plane:** full isolated
   install; evidence egress via one-way export; no outbound connectivity.
+  Split into **14a** (`robodr-depot`: enrolment, deployments, rings, operator
+  quorum), **14b** (site lease, crypto-erase as the first executed response,
+  delivery findings) and **14c** (OS A/B updates, real TPM hardware); see
+  [`SECURE-DELIVERY.md`](SECURE-DELIVERY.md) §10.
 - **Sprint 15 — Lite SDK (RTOS/MCU):** C agent for Zephyr/FreeRTOS/NuttX; signed
   event summaries; heavy analysis on the companion computer or Sentinel Box.
 - **Sprint 16 — Bus Tap + drone family:** `robodr-sensor-bus` (CAN/EtherCAT/
