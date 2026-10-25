@@ -76,6 +76,30 @@ pub mod rules {
     pub const LIMITED_JERK: &str = "robot.firewall.limited_jerk";
     /// Synthesised on drain when events were dropped because the buffer was full.
     pub const EVENTS_DROPPED: &str = "robot.firewall.events_dropped";
+
+    // Low-level joint frames (`Firewall::check_joint`). The four
+    // `joint_*_out_of_envelope` ids are used both for a clamp (action
+    // `Limited`, High) and for a hard rejection (action `Rejected`,
+    // Critical); the event's action tells them apart.
+    /// A position target outside `[q_min, q_max]` (value: distance outside
+    /// the range, rad).
+    pub const JOINT_POSITION_OUT_OF_ENVELOPE: &str =
+        "robot.firewall.joint_position_out_of_envelope";
+    /// `|dq|` over `dq_max` (value: `|dq|`, rad/s).
+    pub const JOINT_VELOCITY_OUT_OF_ENVELOPE: &str =
+        "robot.firewall.joint_velocity_out_of_envelope";
+    /// `|tau|` over `tau_max` (value: `|tau|`, N·m).
+    pub const JOINT_TORQUE_OUT_OF_ENVELOPE: &str = "robot.firewall.joint_torque_out_of_envelope";
+    /// A gain over its maximum or under its minimum (value: the gain).
+    pub const JOINT_GAIN_OUT_OF_ENVELOPE: &str = "robot.firewall.joint_gain_out_of_envelope";
+    /// A slot the envelope marks unused is energised.
+    pub const DISABLED_MOTOR_ENERGISED: &str = "robot.firewall.disabled_motor_energised";
+    /// CRC reported invalid, or not verified where required (value: 0 for
+    /// "invalid", NaN for "not verified").
+    pub const CRC_INVALID: &str = "robot.firewall.crc_invalid";
+    /// The joint stream was slower than its `max_interval_ns` (value: the
+    /// gap, ns). Recorded only; the late frame itself is evaluated normally.
+    pub const JOINT_RATE_VIOLATION: &str = "robot.firewall.joint_rate_violation";
 }
 
 /// Rule id and severity for a rejection.
@@ -94,6 +118,12 @@ pub fn reject_rule(reason: RejectReason) -> (&'static str, Severity) {
         OutOfOrder => (rules::REJECTED_OUT_OF_ORDER, Severity::High),
         OverHardLimit => (rules::REJECTED_OVER_HARD_LIMIT, Severity::Critical),
         InternalFault => (rules::INTERNAL_FAULT, Severity::Critical),
+        CrcInvalid => (rules::CRC_INVALID, Severity::High),
+        DisabledMotorEnergised => (rules::DISABLED_MOTOR_ENERGISED, Severity::Critical),
+        JointPositionOutOfEnvelope => (rules::JOINT_POSITION_OUT_OF_ENVELOPE, Severity::Critical),
+        JointVelocityOutOfEnvelope => (rules::JOINT_VELOCITY_OUT_OF_ENVELOPE, Severity::Critical),
+        JointTorqueOutOfEnvelope => (rules::JOINT_TORQUE_OUT_OF_ENVELOPE, Severity::Critical),
+        JointGainOutOfEnvelope => (rules::JOINT_GAIN_OUT_OF_ENVELOPE, Severity::Critical),
     }
 }
 
@@ -132,6 +162,9 @@ pub struct FirewallEvent {
     pub count: u32,
     /// Time of the last coalesced occurrence (`== at_ns` when `count == 1`).
     pub last_at_ns: u64,
+    /// Joint frames: the motor slot the (worst) `value` belongs to; `None`
+    /// for frame-level rules and for twist / joint-velocity channels.
+    pub slot: Option<u8>,
 }
 
 impl FirewallEvent {
@@ -159,11 +192,21 @@ impl FirewallEvent {
             SourceId::UNKNOWN => "<unknown source>",
             id => policy.source_guid(id).unwrap_or("<unknown source>"),
         };
+        let joint = policy.is_joint_channel(self.channel);
         let action = match self.action {
+            // A slow stream is recorded only: the late frame itself was
+            // evaluated (and passed, limited or rejected) on its own merits.
+            _ if self.rule == rules::JOINT_RATE_VIOLATION => "recorded only".to_string(),
             EventAction::Limited => "limited".to_string(),
             EventAction::Rejected(None) => "rejected, nothing emitted".to_string(),
+            EventAction::Rejected(Some(SubstituteKind::Zero)) if joint => {
+                "rejected, damping frame emitted".to_string()
+            }
             EventAction::Rejected(Some(SubstituteKind::Zero)) => {
                 "rejected, zero velocity emitted".to_string()
+            }
+            EventAction::Rejected(Some(SubstituteKind::HoldLast)) if joint => {
+                "rejected, last valid frame held".to_string()
             }
             EventAction::Rejected(Some(SubstituteKind::HoldLast)) => {
                 "rejected, last accepted command held".to_string()
@@ -174,6 +217,9 @@ impl FirewallEvent {
             "{} on {ch} from {src} at {} ns ({action})",
             self.rule, self.at_ns
         );
+        if let Some(slot) = self.slot {
+            detail.push_str(&format!(" motor slot {slot}"));
+        }
         if self.count > 1 {
             detail.push_str(&format!(" x{} until {} ns", self.count, self.last_at_ns));
         }
@@ -253,6 +299,7 @@ impl EventBuffer {
             if ev.value > e.value || (e.value.is_nan() && !ev.value.is_nan()) {
                 e.value = ev.value;
                 e.limit = ev.limit;
+                e.slot = ev.slot;
             }
             return;
         }
@@ -339,6 +386,7 @@ mod tests {
             authorised: true,
             count: 1,
             last_at_ns: 1,
+            slot: None,
         }
     }
 
@@ -493,6 +541,12 @@ mod tests {
             OutOfOrder,
             OverHardLimit,
             InternalFault,
+            CrcInvalid,
+            DisabledMotorEnergised,
+            JointPositionOutOfEnvelope,
+            JointVelocityOutOfEnvelope,
+            JointTorqueOutOfEnvelope,
+            JointGainOutOfEnvelope,
         ] {
             assert!(reject_rule(r).0.starts_with("robot.firewall."));
         }

@@ -12,6 +12,7 @@
 )]
 
 use crate::command::Command;
+use crate::joint::JointCommand;
 
 /// Why a command was rejected. Ordered by the stage that decides it (see the
 /// decision table in the crate docs).
@@ -42,6 +43,25 @@ pub enum RejectReason {
     OverHardLimit,
     /// The firewall's own post-condition check failed (fail-safe policy).
     InternalFault,
+    /// Joint frame: the decoder reported the frame's CRC invalid, or did not
+    /// verify it on a channel with `require_crc`.
+    CrcInvalid,
+    /// Joint frame: a slot the envelope marks unused (disabled) is
+    /// energised (mode enabled with a non-zero `kp`, `kd` or `tau`).
+    DisabledMotorEnergised,
+    /// Joint frame: a position target (with `kp > 0`) beyond the hard-reject
+    /// margin of its range.
+    JointPositionOutOfEnvelope,
+    /// Joint frame: a velocity target (with `kd > 0`) beyond
+    /// `hard_reject_factor × dq_max`.
+    JointVelocityOutOfEnvelope,
+    /// Joint frame: a feed-forward torque beyond
+    /// `hard_reject_factor × tau_max`.
+    JointTorqueOutOfEnvelope,
+    /// Joint frame: a gain beyond `hard_reject_factor ×` its maximum, or
+    /// below its minimum (gains are never raised; a disabled motor counts as
+    /// zero gains).
+    JointGainOutOfEnvelope,
 }
 
 impl RejectReason {
@@ -86,6 +106,10 @@ impl std::ops::BitOr for LimitReasons {
 }
 
 /// Which safe substitute was emitted for a rejected command.
+///
+/// On a low-level joint channel `Zero` is the damping frame (`kp = 0`,
+/// `dq = 0`, `tau = 0`, `kd = damping_kd`; never on a humanoid) and
+/// `HoldLast` the last accepted frame with its velocity targets zeroed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SubstituteKind {
     Zero,
@@ -160,6 +184,129 @@ impl Verdict {
     }
 }
 
+/// Bit set of the limits applied to a [`JointVerdict::Limited`] frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub struct JointLimitReasons(u8);
+
+impl JointLimitReasons {
+    pub const NONE: JointLimitReasons = JointLimitReasons(0);
+    /// A position target clamped into `[q_min, q_max]`.
+    pub const POSITION: JointLimitReasons = JointLimitReasons(1);
+    /// A velocity target clamped to `±dq_max`.
+    pub const VELOCITY: JointLimitReasons = JointLimitReasons(2);
+    /// A feed-forward torque clamped to `±tau_max`.
+    pub const TORQUE: JointLimitReasons = JointLimitReasons(4);
+    /// A gain lowered to its maximum.
+    pub const GAIN: JointLimitReasons = JointLimitReasons(8);
+
+    pub fn contains(self, other: JointLimitReasons) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub(crate) fn insert(&mut self, other: JointLimitReasons) {
+        self.0 |= other.0;
+    }
+}
+
+impl std::ops::BitOr for JointLimitReasons {
+    type Output = JointLimitReasons;
+    fn bitor(self, rhs: Self) -> Self {
+        JointLimitReasons(self.0 | rhs.0)
+    }
+}
+
+/// The frame to emit downstream instead of a rejected joint frame. Its
+/// `source` is [`crate::SourceId::FIREWALL`], its `stamp_ns` the `now` of the
+/// check, and its `crc_ok` `Some(true)` (the gateway encodes it and must
+/// compute its CRC). Never a value taken from the rejected frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JointSubstitute {
+    pub kind: SubstituteKind,
+    pub cmd: JointCommand,
+}
+
+/// What the firewall would have done to a joint frame had it been enforcing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum JointWouldHave {
+    Limited {
+        cmd: JointCommand,
+        reasons: JointLimitReasons,
+    },
+    Rejected {
+        reason: RejectReason,
+    },
+}
+
+/// The decision for one low-level joint frame
+/// ([`crate::Firewall::check_joint`]). Same shape and meaning as
+/// [`Verdict`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum JointVerdict {
+    /// Forward `cmd` unchanged (bit-exact when enforcing).
+    Passed {
+        cmd: JointCommand,
+        would_have: Option<JointWouldHave>,
+    },
+    /// Forward `cmd`: the input with fields clamped into the envelope. The
+    /// gateway must re-encode it **and recompute its CRC**.
+    Limited {
+        cmd: JointCommand,
+        reasons: JointLimitReasons,
+    },
+    /// Do not forward the input. Emit `substitute` if `Some`; `None` means
+    /// emit nothing (unknown channel, foreign source with `Drop`, a frame
+    /// that arrived too early, or a humanoid channel with no valid frame to
+    /// hold yet).
+    Rejected {
+        reason: RejectReason,
+        substitute: Option<JointSubstitute>,
+    },
+}
+
+impl JointVerdict {
+    /// The frame the gateway should forward, if any.
+    pub fn output(&self) -> Option<&JointCommand> {
+        match self {
+            JointVerdict::Passed { cmd, .. } | JointVerdict::Limited { cmd, .. } => Some(cmd),
+            JointVerdict::Rejected { substitute, .. } => substitute.as_ref().map(|s| &s.cmd),
+        }
+    }
+
+    pub fn is_passed(&self) -> bool {
+        matches!(self, JointVerdict::Passed { .. })
+    }
+
+    pub fn is_limited(&self) -> bool {
+        matches!(self, JointVerdict::Limited { .. })
+    }
+
+    pub fn is_rejected(&self) -> bool {
+        matches!(self, JointVerdict::Rejected { .. })
+    }
+
+    pub fn reject_reason(&self) -> Option<RejectReason> {
+        match self {
+            JointVerdict::Rejected { reason, .. } => Some(*reason),
+            _ => None,
+        }
+    }
+
+    /// The substitute kind of a rejection, if one was emitted.
+    pub fn substitute_kind(&self) -> Option<SubstituteKind> {
+        match self {
+            JointVerdict::Rejected {
+                substitute: Some(s),
+                ..
+            } => Some(s.kind),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -179,5 +326,9 @@ mod tests {
         assert!(!r.is_empty());
         assert!(RejectReason::UnknownSource.is_foreign_source());
         assert!(!RejectReason::Stale.is_foreign_source());
+        let j = JointLimitReasons::POSITION | JointLimitReasons::GAIN;
+        assert!(j.contains(JointLimitReasons::GAIN));
+        assert!(!j.contains(JointLimitReasons::TORQUE));
+        assert!(JointLimitReasons::NONE.is_empty());
     }
 }

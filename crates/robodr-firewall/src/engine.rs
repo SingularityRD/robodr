@@ -22,6 +22,7 @@ use crate::command::{
 };
 use crate::config::{ChannelKind, FailBehaviour, FaultPolicy, ForeignSourceAction, Limits, Policy};
 use crate::events::{policy_mode, reject_rule, rules, EventAction, EventBuffer, FirewallEvent};
+use crate::joint_engine::JointChanState;
 use crate::verdict::{LimitReasons, RejectReason, Substitute, SubstituteKind, Verdict, WouldHave};
 use robodr_events::{Deviation, Severity};
 
@@ -68,11 +69,11 @@ impl ChanState {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct PairState {
+pub(crate) struct PairState {
     rate_init: bool,
     credit_ns: u64,
     refill_at: u64,
-    last_stamp: Option<u64>,
+    pub(crate) last_stamp: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -118,14 +119,18 @@ struct Accepted {
 /// The Motion Firewall. See the crate docs for the decision semantics.
 #[derive(Debug)]
 pub struct Firewall {
-    policy: Policy,
-    observe: bool,
+    pub(crate) policy: Policy,
+    pub(crate) observe: bool,
     chans: Vec<ChanState>,
-    pairs: Vec<PairState>,
-    nsrc: usize,
-    last_now: Option<u64>,
+    /// Per low-level joint channel (index = joint index, see
+    /// `Policy::joint_index`).
+    pub(crate) jchans: Vec<JointChanState>,
+    /// Per (channel, source) over **all** channel ids (both kinds).
+    pub(crate) pairs: Vec<PairState>,
+    pub(crate) nsrc: usize,
+    pub(crate) last_now: Option<u64>,
     events: EventBuffer,
-    stats: Stats,
+    pub(crate) stats: Stats,
     #[cfg(test)]
     pub(crate) inject_fault: bool,
 }
@@ -310,7 +315,8 @@ impl Firewall {
         Self {
             observe,
             chans: vec![ChanState::INIT; nch],
-            pairs: vec![PairState::default(); nch.saturating_mul(nsrc)],
+            jchans: vec![JointChanState::INIT; policy.joint_channels.len()],
+            pairs: vec![PairState::default(); policy.channel_count().saturating_mul(nsrc)],
             nsrc,
             last_now: None,
             events,
@@ -447,8 +453,20 @@ impl Firewall {
         }
         self.last_now = Some(now);
 
-        // 1. Channel.
+        // 1. Channel. A low-level joint channel is checked by
+        //    `check_joint`; a `Command` on it is a kind mismatch (after the
+        //    source checks, so a foreign source is still reported as such).
         let Some(ch) = self.policy.channels.get(ch_idx) else {
+            if self.policy.is_joint_channel(cmd.channel) {
+                let src_idx = usize::from(cmd.source.0);
+                if cmd.source == SourceId::UNKNOWN || src_idx >= self.nsrc {
+                    return Err(Rejection::new(RejectReason::UnknownSource));
+                }
+                if !self.policy.allows(cmd.channel, cmd.source) {
+                    return Err(Rejection::new(RejectReason::UnauthorizedSource));
+                }
+                return Err(Rejection::new(RejectReason::KindMismatch));
+            }
             return Err(Rejection::new(RejectReason::UnknownChannel));
         };
 
@@ -646,25 +664,45 @@ impl Firewall {
         value: f64,
         limit: f64,
     ) {
-        let authorised = cmd.source != SourceId::UNKNOWN
-            && usize::from(cmd.source.0) < self.nsrc
-            && self
-                .policy
-                .channels
-                .get(usize::from(cmd.channel.0))
-                .is_some_and(|ch| ch.allows(cmd.source));
+        self.record(
+            rule,
+            sev,
+            (cmd.channel, cmd.source),
+            now,
+            action,
+            (value, limit),
+            None,
+        );
+    }
+
+    /// Record one event (shared by both command kinds).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record(
+        &mut self,
+        rule: &'static str,
+        sev: Severity,
+        (channel, source): (ChannelId, SourceId),
+        now: u64,
+        action: EventAction,
+        (value, limit): (f64, f64),
+        slot: Option<u8>,
+    ) {
+        let authorised = source != SourceId::UNKNOWN
+            && usize::from(source.0) < self.nsrc
+            && self.policy.allows(channel, source);
         self.events.push(FirewallEvent {
             rule,
             severity: sev,
             at_ns: now,
-            channel: cmd.channel,
-            source: cmd.source,
+            channel,
+            source,
             action,
             value,
             limit,
             authorised,
             count: 1,
             last_at_ns: now,
+            slot,
         });
     }
 
