@@ -640,6 +640,8 @@ impl<'a> Daemon<'a> {
         );
         acfg.attestation = AttestationStatus::Unknown;
         acfg.kafka_partitions = cfg.robot.kafka_partitions;
+        acfg.findings_topic = cfg.findings.topic.clone();
+        acfg.data_source = cfg.findings.data_source.clone();
         match (&cfg.firewall, validated) {
             (Some(fw), true) => {
                 let mut fs =

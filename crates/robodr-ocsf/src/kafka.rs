@@ -1,11 +1,16 @@
-//! Kafka record helpers for `robot-edr.findings` (see the topic contract).
+//! Kafka record helpers for `robodr.findings` (see the contract,
+//! `docs/contracts/robodr.findings.md`).
 //!
 //! This module does not talk to Kafka (no client crate is available, and the
 //! robot side is air-gapped); it fixes the *record shape* so every producer —
-//! the control-plane publisher, the diode importer, test tooling — agrees.
+//! the agent spool, the diode importer, the publisher, test tooling — agrees.
+//! Everything is derived from the validated value: the record topic is the
+//! value's `ocsf.metadata.log_name` (the deployment's configured topic,
+//! default [`crate::DEFAULT_TOPIC`]) and the `data-source` header is its
+//! `data_source`.
 
 use crate::hash::kafka_murmur2;
-use crate::model::{FindingEnvelope, CONTRACT_VERSION, DATA_SOURCE, KAFKA_TOPIC, OCSF_VERSION};
+use crate::model::{FindingEnvelope, CONTRACT_VERSION, OCSF_VERSION};
 use crate::validate::{validate_for_emit, ValidationError};
 
 /// Header names, all lower-case ASCII.
@@ -25,7 +30,8 @@ pub mod header {
 /// One ready-to-send record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
-    pub topic: &'static str,
+    /// The value's `ocsf.metadata.log_name`.
+    pub topic: String,
     /// Explicit partition (by robot id), when the partition count is known.
     pub partition: Option<u32>,
     /// Record key: the finding id.
@@ -35,7 +41,7 @@ pub struct Record {
     pub headers: Vec<(&'static str, String)>,
 }
 
-/// Validate ([`validate_for_emit`]: contract 1.0 is never emitted) and
+/// Validate ([`validate_for_emit`]: contract 1.x is never emitted) and
 /// serialise to compact, deterministic JSON.
 pub fn to_json(env: &FindingEnvelope) -> Result<String, Vec<ValidationError>> {
     validate_for_emit(env)?;
@@ -47,7 +53,7 @@ pub fn record_key(env: &FindingEnvelope) -> &str {
     &env.finding_id
 }
 
-/// AutoSecOps dedup key `(data_source, external_id)`.
+/// Consumer dedup key `(data_source, external_id)`.
 pub fn dedup_key(env: &FindingEnvelope) -> (&str, &str) {
     (&env.data_source, &env.external_id)
 }
@@ -58,7 +64,7 @@ pub fn headers(env: &FindingEnvelope) -> Vec<(&'static str, String)> {
         (header::CONTENT_TYPE, "application/json".into()),
         (header::CONTRACT_VERSION, CONTRACT_VERSION.into()),
         (header::OCSF_VERSION, OCSF_VERSION.into()),
-        (header::DATA_SOURCE, DATA_SOURCE.into()),
+        (header::DATA_SOURCE, env.data_source.clone()),
         (header::ROBOT_ID, env.entity_context.robot.id.clone()),
         (
             header::SEVERITY,
@@ -86,7 +92,7 @@ pub fn record(
 ) -> Result<Record, Vec<ValidationError>> {
     let value = to_json(env)?;
     Ok(Record {
-        topic: KAFKA_TOPIC,
+        topic: env.ocsf.metadata.log_name.clone(),
         partition: partitions.and_then(|n| partition_for(&env.entity_context.robot.id, n)),
         key: record_key(env).to_string(),
         value,

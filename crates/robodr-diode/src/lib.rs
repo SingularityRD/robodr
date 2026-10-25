@@ -1,9 +1,9 @@
 //! # robodr-diode
 //!
 //! One-way export of RoboDR findings and black-box evidence from an
-//! air-gapped robot or fleet console to the SOC (AutoSecOps), across a data
+//! air-gapped robot or fleet console to the SOC, across a data
 //! diode or on controlled removable media. Implements the "Air-gapped
-//! transport" section of `docs/contracts/robot-edr.findings.md`.
+//! transport" section of `docs/contracts/robodr.findings.md`.
 //!
 //! * [`pack`] (low side): [`Packer`] turns validated
 //!   [`FindingEnvelope`](robodr_ocsf::FindingEnvelope)s and
@@ -19,7 +19,7 @@
 //!   re-validates every finding with [`robodr_ocsf::parse_and_validate`],
 //!   checks that every finding's robot (and every bundle's device) is the
 //!   unit or on the unit's allow-list, and emits Kafka-ready records (JSON
-//!   Lines) for the `robot-edr.findings` publisher. Bad batches go to
+//!   Lines) for the findings publisher. Bad batches go to
 //!   `quarantine/<unique>/` with a reason file; a problem with one inbox
 //!   entry never stops the others from being imported.
 //! * [`manifest`]: the wire format and its limits.

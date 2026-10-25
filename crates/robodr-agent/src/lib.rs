@@ -10,7 +10,7 @@
 //!   → ResponsePlan + Disposition
 //!   → robodr_blackbox::Recorder                 (event, firewall verdict, deviation, plan)
 //!   → robodr_ocsf::FindingBuilder               (evidence links = the black-box refs)
-//!   → validated robot-edr.findings record (key + JSON)
+//!   → validated robodr.findings record (key + JSON)
 //!   → Executor::submit                          (no-op / dry-run log: nothing is executed)
 //! ```
 //!
@@ -40,10 +40,12 @@
 //!   ROS 2 sensor (`robodr-sensor-ros2`) and Pulsar glue do not call it yet.
 //! * The response policy, motion monitor thresholds and firewall limits are
 //!   unvalidated engineering defaults (see each crate's README).
-//! * The black box authenticates with HMAC-SHA256 (shared key): a
-//!   placeholder for an asymmetric, TPM-held key.
+//! * The black box signs with whatever key the caller supplies: Ed25519
+//!   (agentd's default, via `ed25519-dalek`) or legacy HMAC-SHA256 (the
+//!   `robodr-replay` default, kept for compatibility). Keys are files, not
+//!   TPM-held.
 //! * Findings are validated by the in-repo OCSF validator only, not by an
-//!   OCSF schema server or a running AutoSecOps consumer.
+//!   OCSF schema server or a running SOC consumer.
 //! * `MotionCommand` has no source stamp and no angular/per-joint values, so
 //!   the firewall's stale/future checks and angular limits are not exercised
 //!   through this path (see [`agent`] for the mapping).

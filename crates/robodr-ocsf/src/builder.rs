@@ -25,7 +25,7 @@
 //!     .expect("valid finding");
 //! assert_eq!(finding.ocsf.severity_id, 4);
 //! let json = to_json(&finding).unwrap();
-//! assert!(json.contains("\"data_source\":\"robot_edr\""));
+//! assert!(json.contains("\"data_source\":\"robodr\""));
 //! ```
 //!
 //! ## Identity and deduplication
@@ -41,8 +41,16 @@
 //! * `metadata.uid` = `re1-` + hash(finding uid, last_seen, count) identifies
 //!   one emission, so a replayed message (e.g. after a diode re-send) is
 //!   recognisably the same event.
-//! * The AutoSecOps dedup key is `(data_source, external_id)` =
-//!   `("robot_edr", "<robot_id>:<finding_id>")` (design doc schema table).
+//! * The consumer's dedup key is `(data_source, external_id)` =
+//!   `("robodr", "<robot_id>:<finding_id>")` with the default data source
+//!   ([`RobotContext::data_source`]).
+//!
+//! ## Deployment labels
+//!
+//! [`RobotContext::data_source`] (default [`DEFAULT_DATA_SOURCE`]) and
+//! [`RobotContext::topic`] (default [`DEFAULT_TOPIC`], written to
+//! `ocsf.metadata.log_name` and used by [`crate::record`]) are trusted
+//! configuration; the builder refuses values the validator would.
 //!
 //! ## Trusted vs tainted text
 //!
@@ -77,6 +85,11 @@ pub struct RobotContext {
     pub mode: Mode,
     /// `metadata.product.version`; defaults to this crate's version.
     pub product_version: String,
+    /// Envelope `data_source`; defaults to [`DEFAULT_DATA_SOURCE`].
+    pub data_source: String,
+    /// Topic the finding is published on (`ocsf.metadata.log_name`, the
+    /// Kafka record topic); defaults to [`DEFAULT_TOPIC`].
+    pub topic: String,
 }
 
 impl RobotContext {
@@ -86,6 +99,8 @@ impl RobotContext {
             profile,
             mode,
             product_version: env!("CARGO_PKG_VERSION").to_string(),
+            data_source: DEFAULT_DATA_SOURCE.to_string(),
+            topic: DEFAULT_TOPIC.to_string(),
         }
     }
 }
@@ -188,13 +203,12 @@ pub fn rule_info(rule: &str) -> RuleInfo {
 /// The catalog as a validator for a message of `contract_version` must
 /// apply it: entries added in a later contract minor than the message's are
 /// not used (a 1.2 producer built such a finding with the generic entry, and
-/// it stays valid). A malformed version gets the current catalog.
+/// it stays valid). Contract 2.x has the full catalog. A malformed version
+/// gets the current catalog.
 pub fn rule_info_for_contract(rule: &str, contract_version: &str) -> RuleInfo {
-    let minor = contract_version
-        .split('.')
-        .nth(1)
-        .and_then(|m| m.parse::<u64>().ok());
-    if minor.is_some_and(|m| m < CATALOG_1_3_MINOR) {
+    let mut parts = contract_version.split('.').map(|p| p.parse::<u64>().ok());
+    let (major, minor) = (parts.next().flatten(), parts.next().flatten());
+    if major == Some(LEGACY_CONTRACT_MAJOR) && minor.is_some_and(|m| m < CATALOG_1_3_MINOR) {
         catalog_1_0(rule).unwrap_or(GENERIC)
     } else {
         rule_info(rule)
@@ -1229,7 +1243,7 @@ impl<'a> FindingBuilder<'a> {
                     version: ctx.product_version.clone(),
                 },
                 uid: event_uid(&uid, last, self.count),
-                log_name: KAFKA_TOPIC.into(),
+                log_name: ctx.topic.clone(),
             },
             finding_info: FindingInfo {
                 uid: uid.clone(),
@@ -1265,7 +1279,7 @@ impl<'a> FindingBuilder<'a> {
             contract_version: CONTRACT_VERSION.into(),
             finding_id: uid.clone(),
             external_id: format!("{robot_id}:{uid}"),
-            data_source: DATA_SOURCE.into(),
+            data_source: ctx.data_source.clone(),
             title,
             description,
             severity: dev.severity,

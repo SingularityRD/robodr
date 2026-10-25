@@ -94,6 +94,13 @@
 //!   `{"socket_path": "/run/robodr-agentd/host-threats.sock"}`, the socket
 //!   the `robodr-threat-forward` Pulsar module writes Pulsar threats to (see
 //!   [`crate::host`]). Its path must differ from every other socket input.
+//! * `findings` (optional, [`FindingsSection`]): `{"topic":
+//!   "robodr.findings", "data_source": "robodr"}` (the defaults), the
+//!   deployment labels every finding carries (`ocsf.metadata.log_name`, the
+//!   spooled record's topic, the envelope `data_source`). The response
+//!   policy (`policy_path`) carries the robot's `morphology` (a humanoid
+//!   never gets an executable safe pause / safe state; see
+//!   `robodr-responder`).
 //! * `control_plane` (optional, [`crate::control::ControlPlaneSection`]; off
 //!   when absent): the SOC action-request API, `listen_tcp` (loopback unless
 //!   `allow_remote`) and / or `unix_socket`, `soc_keys` (Ed25519 public key
@@ -229,6 +236,9 @@ pub struct DaemonConfig {
     /// default) = no listener.
     #[serde(default)]
     pub control_plane: Option<crate::control::ControlPlaneSection>,
+    /// Findings topic and `data_source` (see [`FindingsSection`]).
+    #[serde(default)]
+    pub findings: FindingsSection,
 }
 
 /// `correlation`: the `robodr-correlate` engine over every finding the
@@ -283,9 +293,45 @@ pub struct RobotSection {
     /// [`resolve`] instead of a generic "unknown field".
     #[serde(default)]
     pub profile_version: Option<serde_json::Value>,
-    /// Kafka partition count of `robot-edr.findings`, if known.
+    /// Kafka partition count of the findings topic, if known.
     #[serde(default)]
     pub kafka_partitions: Option<u32>,
+}
+
+fn default_findings_topic() -> String {
+    robodr_ocsf::DEFAULT_TOPIC.into()
+}
+fn default_data_source() -> String {
+    robodr_ocsf::DEFAULT_DATA_SOURCE.into()
+}
+
+/// `findings` (optional): the deployment labels of the findings this robot
+/// emits (`robodr.findings` contract 2.x). Both default to the contract
+/// defaults, so a config without the section is unchanged.
+///
+/// ```json
+/// "findings": { "topic": "robodr.findings", "data_source": "robodr" }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FindingsSection {
+    /// Topic named in every finding (`ocsf.metadata.log_name`) and in its
+    /// spooled record; `[A-Za-z0-9._-]{1,249}`.
+    #[serde(default = "default_findings_topic")]
+    pub topic: String,
+    /// Envelope `data_source` (with `external_id` the SOC's dedup key);
+    /// `[a-z0-9][a-z0-9._-]{0,63}`.
+    #[serde(default = "default_data_source")]
+    pub data_source: String,
+}
+
+impl Default for FindingsSection {
+    fn default() -> Self {
+        Self {
+            topic: default_findings_topic(),
+            data_source: default_data_source(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -900,6 +946,18 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         return Err(format!(
             "robot.id {:?} must match [A-Za-z0-9._-]{{1,64}}",
             robodr_ros2_pipeline::sanitize(&config.robot.id)
+        ));
+    }
+    if !robodr_ocsf::validate::is_valid_topic(&config.findings.topic) {
+        return Err(format!(
+            "findings.topic {:?} must match [A-Za-z0-9._-]{{1,249}}",
+            robodr_ros2_pipeline::sanitize(&config.findings.topic)
+        ));
+    }
+    if !robodr_ocsf::validate::is_valid_data_source(&config.findings.data_source) {
+        return Err(format!(
+            "findings.data_source {:?} must match [a-z0-9][a-z0-9._-]{{0,63}}",
+            robodr_ros2_pipeline::sanitize(&config.findings.data_source)
         ));
     }
     require_abs("policy_path", &config.policy_path)?;
@@ -1933,6 +1991,35 @@ mod tests {
             },
         ] {
             assert!(validate_daemon(&d).is_err(), "{d:?}");
+        }
+    }
+
+    #[test]
+    fn findings_section_defaults_and_validation() {
+        let base = r#"{"robot":{"id":"r1","site":"s"},"sensor":{},"policy_path":"/p",
+            "blackbox":{"dir":"/b","key_file":"/k"},"spool":{"dir":"/s"}}"#;
+        let c = parse(base).unwrap();
+        assert_eq!(c.findings, FindingsSection::default());
+        assert_eq!(c.findings.topic, "robodr.findings");
+        assert_eq!(c.findings.data_source, "robodr");
+        let with = |f: &str| {
+            base.replace(
+                r#""spool":{"dir":"/s"}"#,
+                &format!(r#""spool":{{"dir":"/s"}},"findings":{f}"#),
+            )
+        };
+        let c = parse(&with(r#"{"topic":"site-b.findings"}"#)).unwrap();
+        assert_eq!(c.findings.topic, "site-b.findings");
+        assert_eq!(c.findings.data_source, "robodr");
+        assert!(parse(&with(r#"{"topc":"x"}"#)).is_err(), "unknown key");
+        for (bad, what) in [
+            (r#"{"topic":"a b"}"#, "findings.topic"),
+            (r#"{"topic":""}"#, "findings.topic"),
+            (r#"{"data_source":"RoboDR"}"#, "findings.data_source"),
+            (r#"{"data_source":"kafka:x"}"#, "findings.data_source"),
+        ] {
+            let e = resolve(parse(&with(bad)).unwrap()).err().unwrap();
+            assert!(e.contains(what), "{bad}: {e}");
         }
     }
 

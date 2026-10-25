@@ -40,7 +40,8 @@ fn pcap_replay_findings_reach_spool_with_verified_evidence() {
         "{log}"
     );
     for (rec, env) in &found {
-        assert_eq!(rec.topic, "robot-edr.findings");
+        assert_eq!(rec.topic, robodr_ocsf::DEFAULT_TOPIC);
+        assert_eq!(env.data_source, robodr_ocsf::DEFAULT_DATA_SOURCE);
         assert_eq!(env.entity_context.robot.id, ROBOT);
         assert_eq!(
             env.entity_context.mode,

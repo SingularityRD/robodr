@@ -39,7 +39,7 @@ fn export_then_publish_spool_once() {
         let rec = robodr_ocsf::record(&finding(i), None).unwrap();
         s.write(
             &FindingOutput {
-                topic: rec.topic.into(),
+                topic: rec.topic,
                 key: rec.key,
                 partition: rec.partition,
                 value: rec.value,

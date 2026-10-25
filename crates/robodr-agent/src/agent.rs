@@ -8,7 +8,7 @@
 //!     Responder::plan(deviation, source, SafetyState, OperationalContext, mono ms) ─► ResponsePlan
 //!     backstop: check_invariants + observe-only guard ─► (plan, Disposition)
 //!     Recorder: event (once per event) + firewall verdict + deviation + plan note ─► BlackBoxRef(s)
-//!     FindingBuilder(... evidence = those refs) ─► validated robot-edr.findings record
+//!     FindingBuilder(... evidence = those refs) ─► validated robodr.findings record
 //!     Executor::submit(plan)  — dry-run / no-op; the agent executes nothing
 //! ```
 //!
@@ -478,7 +478,7 @@ impl Agent {
         } else {
             OcsfMode::Observe
         };
-        let ocsf = RobotContext::new(
+        let mut ocsf = RobotContext::new(
             cfg.robot,
             ProfileRef {
                 version: cfg.profile_version,
@@ -486,6 +486,8 @@ impl Agent {
             },
             mode,
         );
+        ocsf.data_source = cfg.data_source;
+        ocsf.topic = cfg.findings_topic;
         let start = clock.now();
         // Fail at start, not on every finding, if the trusted labels (model,
         // site, profile version, ...) cannot produce a valid finding.
@@ -1264,7 +1266,7 @@ impl Agent {
                 }
                 (
                     Some(FindingOutput {
-                        topic: rec.topic.to_string(),
+                        topic: rec.topic,
                         key: rec.key,
                         partition: rec.partition,
                         value: rec.value,

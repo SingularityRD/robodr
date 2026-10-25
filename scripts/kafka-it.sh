@@ -16,7 +16,7 @@
 # Broker settings: no topic auto-creation, StandardAuthorizer with
 # allow.everyone.if.no.acl.found=true, connections.max.idle.ms=10000.
 # Prepared state:
-#   robot-edr.findings  12 partitions
+#   robodr.findings  12 partitions
 #   robodr-it-small     1 partition, max.message.bytes=4096
 #   robodr-it-denied    1 partition, ACL DENY User:ANONYMOUS WRITE
 #   robodr-it-murmur    12 partitions, 200+ records keyed by robot id written
@@ -115,7 +115,7 @@ for i in $(seq 1 90); do
 done
 
 echo "kafka-it: creating topics, ACL, quota"
-kbin kafka-topics.sh --create --topic robot-edr.findings --partitions 12 --replication-factor 1 >/dev/null
+kbin kafka-topics.sh --create --topic robodr.findings --partitions 12 --replication-factor 1 >/dev/null
 kbin kafka-topics.sh --create --topic robodr-it-small --partitions 1 --replication-factor 1 \
   --config max.message.bytes=4096 >/dev/null
 kbin kafka-topics.sh --create --topic robodr-it-denied --partitions 1 --replication-factor 1 >/dev/null
@@ -152,7 +152,7 @@ echo "kafka-it: cross-check with the broker's own tooling"
 # kafka-dump-log re-reads every stored batch and recomputes its CRC-32C.
 bad=0
 # shellcheck disable=SC2016 # expanded by the container's shell
-dump="$(kexec sh -c 'for d in $(find / -maxdepth 4 -type d -name "robot-edr.findings-*" 2>/dev/null); do
+dump="$(kexec sh -c 'for d in $(find / -maxdepth 4 -type d -name "robodr.findings-*" 2>/dev/null); do
     for f in "$d"/*.log; do /opt/kafka/bin/kafka-dump-log.sh --deep-iteration --files "$f"; done
   done' 2>/dev/null || true)"
 valid="$(grep -c "isvalid: true" <<<"$dump" || true)"
@@ -163,7 +163,7 @@ else
   echo "kafka-it: kafka-dump-log: $valid batches, all CRCs valid"
 fi
 kexec /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:29092 \
-  --topic robot-edr.findings --from-beginning --max-messages 1 --timeout-ms 20000 \
+  --topic robodr.findings --from-beginning --max-messages 1 --timeout-ms 20000 \
   --property print.headers=true --property print.key=true --property print.partition=true \
   2>/dev/null | cut -c1-400 || true
 if [[ "$bad" != 0 ]]; then

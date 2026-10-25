@@ -260,7 +260,7 @@ pub struct ImportConfig {
     pub processed_dir: PathBuf,
     /// Persisted per-unit sequence state (JSON, replaced atomically).
     pub state_path: PathBuf,
-    /// Kafka partition count of `robot-edr.findings`, if known.
+    /// Kafka partition count of the findings topic, if known.
     pub partitions: Option<u32>,
     /// Upper bound on the declared data size of one batch.
     pub max_batch_bytes: u64,
@@ -1616,7 +1616,7 @@ impl Importer {
         st.last = st.last.max(env.ocsf.time);
         st.count += 1;
         let o = OutRecord {
-            topic: rec.topic,
+            topic: &rec.topic,
             partition: rec.partition,
             key: &rec.key,
             headers: &rec.headers,

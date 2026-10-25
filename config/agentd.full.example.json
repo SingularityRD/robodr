@@ -27,6 +27,7 @@
     }
   },
   "spool": { "dir": "/var/lib/robodr/spool/agentd" },
+  "findings": { "topic": "robodr.findings", "data_source": "robodr" },
   "event_inputs": [ { "kind": "unix_socket", "path": "/run/robodr-agentd/events.sock" } ],
   "context": { "safety_state": "unknown", "control": "autonomous" },
   "safety_feed": {
@@ -43,7 +44,7 @@
   "host_threats": { "socket_path": "/run/robodr-agentd/host-threats.sock", "socket_mode": "0660" },
   "control_plane": {
     "unix_socket": "/run/robodr-agentd/control.sock",
-    "soc_keys": ["/etc/robodr/soc/autosecops.pub"]
+    "soc_keys": ["/etc/robodr/soc/soc.pub"]
   },
   "daemon": { "tick_ms": 1000, "heartbeat_ms": 10000, "silence_ms": 30000 }
 }

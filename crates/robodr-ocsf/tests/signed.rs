@@ -357,7 +357,7 @@ fn hostile_headers_never_panic() {
 fn schema_and_contract_document_the_signature_header() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/contracts");
     let schema: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(dir.join("robot-edr-finding.schema.json")).unwrap(),
+        &std::fs::read_to_string(dir.join("robodr-finding.schema.json")).unwrap(),
     )
     .unwrap();
     let def = &schema["$defs"]["FindingSignatureHeader"];
@@ -368,8 +368,11 @@ fn schema_and_contract_document_the_signature_header() {
         def["properties"]["sig"]["pattern"],
         format!("^[0-9a-f]{{{}}}$", robodr_ocsf::sig::SIG_LEN * 2)
     );
-    assert!(schema["$id"].as_str().unwrap().ends_with(CONTRACT_VERSION));
-    let md = std::fs::read_to_string(dir.join("robot-edr.findings.md")).unwrap();
+    assert_eq!(
+        schema["$id"].as_str().unwrap(),
+        format!("https://schemas.singularityrd.com/robodr/findings/{CONTRACT_VERSION}")
+    );
+    let md = std::fs::read_to_string(dir.join("robodr.findings.md")).unwrap();
     assert!(md.contains(SIG_HEADER));
     assert!(md.contains(&format!("**{CONTRACT_VERSION}**")));
     assert!(md.contains("robodr-ocsf/finding-sig/v1"));

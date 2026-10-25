@@ -1,12 +1,18 @@
-//! Typed wire model of one message on the `robot-edr.findings` Kafka topic.
+//! Typed wire model of one `robodr.findings` message (contract 2.x).
 //!
-//! A message is a [`FindingEnvelope`]: the AutoSecOps ingestion fields from the
-//! design doc's *Bulgu şeması* table at the top level (`finding_id`,
-//! `external_id`, `data_source`, `title`, `description`, `severity`,
-//! `timestamp`, `entity_context`, `mitre_predictions`, `evidence_links`,
-//! `anomaly_score`), plus the full **OCSF Detection Finding** (class_uid 2004,
-//! category_uid 2 "Findings") under `ocsf`, so the same object can be forwarded
-//! verbatim to an external SIEM/SOAR "OCSF ve syslog" path.
+//! A message is a [`FindingEnvelope`]: a vendor-neutral envelope with the
+//! fields any SOC or SIEM needs to ingest, deduplicate and triage a finding
+//! (`finding_id`, `external_id`, `data_source`, `title`, `description`,
+//! `severity`, `timestamp`, `entity_context`, `mitre_predictions`,
+//! `evidence_links`, `anomaly_score`, `adversary_controlled_fields`), plus
+//! the full **OCSF Detection Finding** (class_uid 2004, category_uid 2
+//! "Findings") under `ocsf`, so the same object can be forwarded verbatim to
+//! any OCSF-capable SIEM/SOAR or syslog path.
+//!
+//! `data_source` (default [`DEFAULT_DATA_SOURCE`]) and the topic named in
+//! `ocsf.metadata.log_name` (default [`DEFAULT_TOPIC`]) are deployment
+//! configuration. Contract 1.x messages (fixed `data_source` and topic, see
+//! [`legacy_v1`]) are still parsed and validated, never emitted.
 //!
 //! Every struct derives `Serialize`/`Deserialize`. Field order is declaration
 //! order, there are no hash maps, and the builder sorts every list whose
@@ -22,15 +28,37 @@ use crate::taint::Tainted;
 use robodr_events::Severity;
 use serde::{Deserialize, Serialize};
 
-/// Contract (envelope) schema version, semver. See the topic contract doc.
-pub const CONTRACT_VERSION: &str = "1.3.0";
+/// Contract name: the schema `$id` is
+/// `https://schemas.singularityrd.com/robodr/findings/<version>`.
+pub const CONTRACT_NAME: &str = "robodr.findings";
+/// Contract (envelope) schema version emitted, semver. See
+/// `docs/contracts/robodr.findings.md`.
+pub const CONTRACT_VERSION: &str = "2.0.0";
+/// Contract major emitted and validated in full.
+pub const CONTRACT_MAJOR: u64 = 2;
+/// Older contract major still accepted on parse (replay, migration), never
+/// emitted.
+pub const LEGACY_CONTRACT_MAJOR: u64 = 1;
 /// OCSF schema version written to `metadata.version`. Detection Finding
 /// (2004) was introduced in OCSF 1.1.0.
 pub const OCSF_VERSION: &str = "1.1.0";
-/// Kafka topic name (design doc, *Veri akışı*).
-pub const KAFKA_TOPIC: &str = "robot-edr.findings";
-/// Fixed AutoSecOps `data_source` (design doc: "Sabit `robot_edr`").
-pub const DATA_SOURCE: &str = "robot_edr";
+/// Default topic (Kafka topic, and `ocsf.metadata.log_name`). Configurable
+/// per deployment ([`crate::RobotContext::topic`]); any name matching
+/// [`crate::validate::is_valid_topic`] is accepted.
+pub const DEFAULT_TOPIC: &str = "robodr.findings";
+/// Default `data_source` (with `external_id` the consumer's dedup key).
+/// Configurable per deployment ([`crate::RobotContext::data_source`]); any
+/// name matching [`crate::validate::is_valid_data_source`] is accepted.
+pub const DEFAULT_DATA_SOURCE: &str = "robodr";
+
+/// Constants of contract 1.x (`robot-edr.findings`), which fixed both
+/// values. Used only to validate 1.x messages on parse.
+pub mod legacy_v1 {
+    /// The 1.x topic and `ocsf.metadata.log_name`.
+    pub const TOPIC: &str = "robot-edr.findings";
+    /// The 1.x `data_source`.
+    pub const DATA_SOURCE: &str = "robot_edr";
+}
 /// `metadata.product.name`.
 pub const PRODUCT_NAME: &str = "RoboDR";
 /// `metadata.product.vendor_name`.
@@ -44,17 +72,18 @@ pub mod ocsf_ids {
     pub const CLASS_NAME: &str = "Detection Finding";
 }
 
-/// One message on `robot-edr.findings`.
+/// One findings message (contract [`CONTRACT_NAME`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FindingEnvelope {
     /// [`CONTRACT_VERSION`] of the producer.
     pub contract_version: String,
     /// Finding id; equals `ocsf.finding_info.uid` and the Kafka record key.
-    /// Required by AutoSecOps `kafka_consumer_service.py` on every message.
     pub finding_id: String,
-    /// `<robot_id>:<finding_id>`; with `data_source` the AutoSecOps dedup key.
+    /// `<robot_id>:<finding_id>`; with `data_source` the consumer's dedup
+    /// key.
     pub external_id: String,
-    /// Always [`DATA_SOURCE`].
+    /// Producer label, default [`DEFAULT_DATA_SOURCE`] (configurable;
+    /// [`legacy_v1::DATA_SOURCE`] in contract 1.x).
     pub data_source: String,
     /// Rule title from the trusted rule catalog. Never contains tainted text.
     pub title: String,
@@ -120,8 +149,8 @@ pub enum HumanProximity {
     Unknown,
 }
 
-/// Safety state at detection (design doc `safety_state` class: is the robot
-/// moving, stopped, is a human nearby). Sensor-authored.
+/// Safety state at detection: is the robot moving or stopped, is a human
+/// nearby. Sensor-authored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SafetyState {
     pub motion: MotionState,
@@ -135,8 +164,8 @@ impl SafetyState {
     };
 }
 
-/// Attestation status as the control plane reports it (Doğrulandı / Sapma /
-/// Bilinmiyor).
+/// Attestation status as the control plane reports it (verified /
+/// deviation / unknown).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttestationStatus {
@@ -145,8 +174,8 @@ pub enum AttestationStatus {
     Unknown,
 }
 
-/// Robot computing-platform family (the design doc classifies robots by
-/// platform, not form factor).
+/// Robot computing-platform family: how RoboDR is deployed on the robot
+/// (agent, SDK, appliance, bus tap), not the robot's form factor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlatformFamily {
@@ -221,7 +250,7 @@ pub struct CommandContext {
     pub envelope_max_joint_speed: Option<f64>,
 }
 
-/// AutoSecOps `entity_context`, also embedded as `ocsf.unmapped.robodr`.
+/// Robot context for triage, also embedded as `ocsf.unmapped.robodr`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EntityContext {
     pub robot: RobotInfo,
@@ -314,7 +343,8 @@ pub struct Metadata {
     pub product: Product,
     /// Per-emission event uid (finding uid + last_seen + count), deterministic.
     pub uid: String,
-    /// Always the Kafka topic name. OCSF-UNCERTAIN only in semantics.
+    /// The topic the producer published on (default [`DEFAULT_TOPIC`];
+    /// [`legacy_v1::TOPIC`] in 1.x). OCSF-UNCERTAIN only in semantics.
     pub log_name: String,
 }
 

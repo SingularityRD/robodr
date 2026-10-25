@@ -138,7 +138,7 @@ impl EvidenceLinks {
     }
 }
 
-/// A validated `robot-edr.findings` record.
+/// A validated findings record (`robodr.findings` contract).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FindingOutput {
     pub topic: String,

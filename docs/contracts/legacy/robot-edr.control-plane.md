@@ -1,4 +1,12 @@
-# Contract: `robot-edr.control-plane` (robot action requests)
+# Contract: `robot-edr.control-plane` (robot action requests, superseded)
+
+> **Superseded — historical record only.** This is the first draft of the
+> control-plane contract, including the comparison with a client draft of
+> an AutoSecOps integration that has been **cancelled** (§9). The current
+> contract is [`robodr.control-plane`](../robodr.control-plane.md) (same
+> API, vendor-neutral, seven catalog actions). Links below are not
+> maintained.
+
 
 | | |
 | --- | --- |

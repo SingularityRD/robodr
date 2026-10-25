@@ -108,10 +108,10 @@ fn full_example_control_plane_loads_with_its_soc_key() {
     std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
     // Without the SOC's public key file: refused, naming it.
     let e = robodr_agentd::load(&path).expect_err("SOC key missing");
-    assert!(e.contains("autosecops.pub"), "{e}");
-    let key = s.dir.join("etc/soc/autosecops.pub");
+    assert!(e.contains("soc.pub"), "{e}");
+    let key = s.dir.join("etc/soc/soc.pub");
     std::fs::create_dir_all(key.parent().unwrap()).unwrap();
-    robodr_blackbox::KeyFile::ed25519_from_seed(&[0x33; 32], Some("soc:autosecops:1"))
+    robodr_blackbox::KeyFile::ed25519_from_seed(&[0x33; 32], Some("soc:soc-a:1"))
         .unwrap()
         .to_public()
         .unwrap()

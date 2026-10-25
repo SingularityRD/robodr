@@ -1,5 +1,5 @@
 //! `robodr-kafka-publish`: diode importer output (or a site spool) ->
-//! Kafka `robot-edr.findings`. See `robodr_export::publish`.
+//! Kafka (`--topic`, default `robodr.findings`). See `robodr_export::publish`.
 
 use robodr_diode::cli::{argv, parse_args_with_switches, Args};
 use robodr_export::kafka::{Producer, ProducerConfig};

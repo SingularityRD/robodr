@@ -6,10 +6,17 @@
 //! (diode import, replay tooling, tests). The validator never panics and
 //! reports *all* problems it finds.
 //!
-//! Rules (see also the topic contract `docs/contracts/robot-edr.findings.md`):
+//! Rules (see also the contract `docs/contracts/robodr.findings.md`):
 //!
+//! * **Contract version**: `2.y.z` is validated in full; `1.y.z` (the
+//!   superseded `robot-edr.findings` contract) is accepted on parse with its
+//!   own fixed constants and never emitted ([`validate_for_emit`]); any
+//!   other major is rejected.
 //! * **Required fields / constants**: OCSF class 2004, category 2, `type_uid =
-//!   class_uid*100 + activity_id`, schema/product constants, `data_source`.
+//!   class_uid*100 + activity_id`, schema/product constants. `data_source`
+//!   and `ocsf.metadata.log_name` are deployment labels in 2.x
+//!   ([`is_valid_data_source`], [`is_valid_topic`]) and the fixed
+//!   [`legacy_v1`] values in 1.x.
 //! * **Enums in range** and consistent with their captions (`severity_id` ↔
 //!   `severity`, `activity_id` ↔ `activity_name`, `status_id` ↔ `status`).
 //! * **Cross-field consistency**: `finding_id == finding_info.uid`,
@@ -41,7 +48,7 @@
 //!   entry needs the validator (this crate) updated on both sides.
 //! * **Contract 1.0** messages are accepted for replay only if they carry
 //!   none of the 1.1 tainted-value fields (`display`, `non_ascii`,
-//!   `mixed_script`, `injection_hint`, `suspicious`); they are never
+//!   `mixed_script`, `injection_hint`, `suspicious`). No 1.x message is
 //!   emitted ([`validate_for_emit`]).
 //! * **Raw document** ([`parse_and_validate`]): duplicate object keys are
 //!   rejected at any depth (serde_json would silently keep the last one).
@@ -343,21 +350,68 @@ fn is_technique_id(s: &str) -> bool {
         || (b.len() == 9 && b[5] == b'.' && b[6..9].iter().all(u8::is_ascii_digit)))
 }
 
-fn same_major(v: &str, ours: &str) -> bool {
-    let major = |s: &str| s.split('.').next().map(str::to_owned);
-    v.split('.').count() == 3
-        && v.split('.')
-            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-        && major(v) == major(ours)
+/// The major of a well-formed `X.Y.Z` version (digits only, each part at
+/// most 9 digits), else `None`.
+pub fn contract_major(v: &str) -> Option<u64> {
+    let parts: Vec<&str> = v.split('.').collect();
+    let ok = parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.len() <= 9 && p.bytes().all(|b| b.is_ascii_digit()));
+    if ok {
+        parts[0].parse().ok()
+    } else {
+        None
+    }
 }
 
-/// `true` unless `v` is a well-formed `X.Y.Z` with `Y < min` (malformed
-/// versions are rejected separately; they get the strictest checks).
+/// A contract version this crate validates: `2.y.z` (current) or `1.y.z`
+/// (legacy, parse-only).
+pub fn is_supported_contract_version(v: &str) -> bool {
+    matches!(contract_major(v), Some(m) if m == CONTRACT_MAJOR || m == LEGACY_CONTRACT_MAJOR)
+}
+
+/// A contract version this crate emits: the current major.
+pub fn is_emittable_contract_version(v: &str) -> bool {
+    contract_major(v) == Some(CONTRACT_MAJOR)
+}
+
+/// `true` for a well-formed 1.x version (the legacy constants apply).
+fn is_legacy(v: &str) -> bool {
+    contract_major(v) == Some(LEGACY_CONTRACT_MAJOR)
+}
+
+/// `true` unless `v` is a well-formed `1.Y.Z` with `Y < min`: the feature
+/// level of contract 1.`min` or later (every 2.x has all 1.x features;
+/// malformed versions are rejected separately and get the strictest checks).
 fn minor_at_least(v: &str, min: u64) -> bool {
+    if !is_legacy(v) {
+        return true;
+    }
     v.split('.')
         .nth(1)
         .and_then(|m| m.parse::<u64>().ok())
         .is_none_or(|m| m >= min)
+}
+
+/// A topic name a producer may use (also `ocsf.metadata.log_name`): Kafka's
+/// rule, 1..=249 characters of `[A-Za-z0-9._-]`, not `.` or `..`.
+pub fn is_valid_topic(s: &str) -> bool {
+    (1..=249).contains(&s.len())
+        && s != "."
+        && s != ".."
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// A `data_source` label a producer may use: 1..=64 characters of
+/// `[a-z0-9._-]`, starting with a letter or digit.
+pub fn is_valid_data_source(s: &str) -> bool {
+    (1..=64).contains(&s.len())
+        && s.as_bytes()[0].is_ascii_alphanumeric()
+        && s.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        })
 }
 
 /// Validate a typed finding. `Ok(())` or every problem found.
@@ -372,15 +426,24 @@ pub fn validate(env: &FindingEnvelope) -> Result<(), Vec<ValidationError>> {
 
     // --- envelope constants & identity
     c.fmt(
-        same_major(&env.contract_version, CONTRACT_VERSION),
+        is_supported_contract_version(&env.contract_version),
         "/contract_version",
         "unsupported contract major version",
     );
-    c.eq(
-        env.data_source.as_str(),
-        DATA_SOURCE,
-        "data_source must be robot_edr",
-    );
+    let legacy = is_legacy(&env.contract_version);
+    if legacy {
+        c.eq(
+            env.data_source.as_str(),
+            legacy_v1::DATA_SOURCE,
+            "data_source must be robot_edr (contract 1.x)",
+        );
+    } else {
+        c.fmt(
+            is_valid_data_source(&env.data_source),
+            "/data_source",
+            "expected [a-z0-9][a-z0-9._-]{0,63}",
+        );
+    }
     c.fmt(
         is_prefixed_uid(&env.finding_id, "rf1-"),
         "/finding_id",
@@ -571,7 +634,19 @@ pub fn validate(env: &FindingEnvelope) -> Result<(), Vec<ValidationError>> {
         "/ocsf/metadata/uid",
         "expected re1-<32 hex>",
     );
-    c.eq(m.log_name.as_str(), KAFKA_TOPIC, "metadata.log_name");
+    if legacy {
+        c.eq(
+            m.log_name.as_str(),
+            legacy_v1::TOPIC,
+            "metadata.log_name (contract 1.x)",
+        );
+    } else {
+        c.fmt(
+            is_valid_topic(&m.log_name),
+            "/ocsf/metadata/log_name",
+            "expected a topic name [A-Za-z0-9._-]{1,249}",
+        );
+    }
 
     // --- finding_info
     c.eq(
@@ -888,15 +963,16 @@ pub fn parse_and_validate(json: &str) -> Result<FindingEnvelope, Vec<ValidationE
 }
 
 /// [`validate`] plus the producer-only rule that a finding being *emitted*
-/// (Kafka value, diode export) uses the current contract minor: contract 1.0
-/// is accepted on parse for replay of old batches but never (re-)emitted,
-/// because a 1.0 value serialises without a meaningful `display`/flags.
+/// (Kafka value, diode export) uses the current contract major: contract
+/// 1.x is accepted on parse for replay of old batches but never
+/// (re-)emitted (1.0 serialises without a meaningful `display`/flags, and
+/// every 1.x message carries the superseded fixed `data_source` / topic).
 pub fn validate_for_emit(env: &FindingEnvelope) -> Result<(), Vec<ValidationError>> {
     let mut errs = validate(env).err().unwrap_or_default();
-    if !minor_at_least(&env.contract_version, 1) {
+    if !is_emittable_contract_version(&env.contract_version) {
         errs.push(ValidationError::BadFormat {
             path: "/contract_version".into(),
-            reason: "contract 1.0 findings are parse-only and never emitted",
+            reason: "contract 1.x findings are parse-only and never emitted",
         });
     }
     if errs.is_empty() {
@@ -1131,12 +1207,43 @@ mod tests {
     }
 
     #[test]
-    fn contract_major() {
-        assert!(same_major("1.0.0", "1.0.0"));
-        assert!(same_major("1.7.3", "1.0.0"));
-        assert!(!same_major("2.0.0", "1.0.0"));
-        assert!(!same_major("1.0", "1.0.0"));
-        assert!(!same_major("1.x.0", "1.0.0"));
+    fn contract_majors() {
+        assert!(is_supported_contract_version("1.0.0"));
+        assert!(is_supported_contract_version("1.7.3"));
+        assert!(is_supported_contract_version("2.0.0"));
+        assert!(is_supported_contract_version(CONTRACT_VERSION));
+        assert!(is_emittable_contract_version(CONTRACT_VERSION));
+        assert!(!is_emittable_contract_version("1.3.0"));
+        for bad in ["3.0.0", "0.9.0", "1.0", "1.x.0", "2.0.0-rc1", "", "02.0.0x"] {
+            assert!(!is_supported_contract_version(bad), "{bad}");
+        }
+        assert_eq!(contract_major("2.1.0"), Some(2));
+        assert!(minor_at_least("2.0.0", 1) && minor_at_least("1.1.0", 1));
+        assert!(!minor_at_least("1.0.0", 1));
+    }
+
+    #[test]
+    fn deployment_labels() {
+        for ok in ["robodr", "robodr.findings", "site-a_findings.v2", "x"] {
+            assert!(is_valid_topic(ok), "{ok}");
+        }
+        for bad in ["", ".", "..", "a b", "a/b", "kafka:x", &"t".repeat(250)] {
+            assert!(!is_valid_topic(bad), "{bad}");
+        }
+        for ok in ["robodr", "robot_edr", "site-7.robodr", "0x"] {
+            assert!(is_valid_data_source(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "RoboDR",
+            "-x",
+            ".x",
+            "a b",
+            "kafka:robodr",
+            &"d".repeat(65),
+        ] {
+            assert!(!is_valid_data_source(bad), "{bad}");
+        }
     }
 
     #[test]
