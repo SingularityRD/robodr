@@ -220,6 +220,8 @@ mod tests {
             observe_only: observe,
             suppressed,
             would_have: None,
+            morphology: Default::default(),
+            advisory: Vec::new(),
             rationale: Rationale::default(),
         }
     }

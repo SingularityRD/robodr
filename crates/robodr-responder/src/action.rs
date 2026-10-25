@@ -13,7 +13,7 @@ use std::fmt;
 use robodr_events::Severity;
 use serde::{Deserialize, Serialize};
 
-use crate::state::{PlatformFamily, SafetyState};
+use crate::state::{Morphology, PlatformFamily, SafetyState};
 
 /// One rung of the Cyber-Jidoka ladder. Ordered: `Record < Restrict <
 /// LimitMotion < SafePause < RequestSafeState`. `RequestSafeState` is the top:
@@ -229,6 +229,12 @@ pub enum Reason {
     /// motion-affecting actions were dropped; its Record/Restrict actions,
     /// which target its own source, are kept.
     MotionAlreadyRequested { step: Step, since_ms: u64 },
+    /// The robot's morphology falls when its actuators are de-energised
+    /// (humanoid): the `safe_pause` / `request_safe_state` part of the plan
+    /// was moved to `advisory` (never executed) and the executable plan was
+    /// capped at `limit_motion` plus network isolation and participant
+    /// quarantine.
+    DeEnergisingAdvisoryOnly { morphology: Morphology, step: Step },
     /// The source shares the overflow bucket (source table full). Its shared
     /// escalation `level` / hold `held` would have made the plan await
     /// approval; the plan a fresh source gets (`result`, auto-executable) was
@@ -294,6 +300,11 @@ impl fmt::Display for Reason {
                 f,
                 "{step:?} already requested robot-wide {since_ms} ms ago: motion part dropped"
             ),
+            Reason::DeEnergisingAdvisoryOnly { morphology, step } => write!(
+                f,
+                "{morphology:?} falls when de-energised: {step:?} advisory only, contained with \
+                 limit_motion / isolate_network / quarantine_node"
+            ),
             Reason::OverflowStateNotApplied {
                 level,
                 held,
@@ -345,6 +356,10 @@ impl fmt::Display for Rationale {
 ///   approves; everything else waits.
 /// * Plans are cumulative and never relax anything: a later, lower plan does
 ///   not lift an earlier restriction. Lifting is an operator action.
+/// * `advisory` actions are **never executed** by anyone acting on the
+///   plan: they are recommendations for the operator and the platform's own
+///   safety function (today: `safe_pause` / `request_safe_state` on a
+///   humanoid, see [`Morphology`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResponsePlan {
     pub rule: String,
@@ -364,6 +379,12 @@ pub struct ResponsePlan {
     /// In observe mode: what enforcement mode would have done.
     pub would_have: Option<Box<ResponsePlan>>,
     pub rationale: Rationale,
+    /// The policy's morphology (omitted when `other`).
+    #[serde(default, skip_serializing_if = "Morphology::is_other")]
+    pub morphology: Morphology,
+    /// Recommended-only actions: never executed (omitted when empty).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub advisory: Vec<ResponseAction>,
 }
 
 impl ResponsePlan {

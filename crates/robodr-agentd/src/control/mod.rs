@@ -1,10 +1,11 @@
 //! The control-plane action API (`control_plane`, off by default).
 //!
-//! A SOC (AutoSecOps) asks for one of six containment actions on this
+//! A SOC asks for one of the seven catalog actions
+//! ([`robodr_responder::actions`]) on this
 //! robot; agentd validates the request, judges it with the response policy
 //! against the robot's *current* safety state (Cyber-Jidoka,
 //! [`api::judge`]), records the request and the decision in the signed
-//! black box and answers. Contract: `docs/contracts/robot-edr.control-plane.md`.
+//! black box and answers. Contract: `docs/contracts/robodr.control-plane.md`.
 //!
 //! **Nothing is executed.** The only executor is [`api::RecordingExecutor`]:
 //! an accepted request is answered `recorded_not_executed`
@@ -35,7 +36,9 @@
 //!   the body hash ([`auth::signing_message`]), so a request cannot be
 //!   altered, moved to another robot or replayed (timestamp window plus a
 //!   nonce cache that fails closed when full).
-//! * **What may be asked.** Six classes, their own parameters, TTL rules;
+//! * **What may be asked.** The seven catalog actions, their own
+//!   parameters, TTL rules (`safe_pause` / `request_safe_state` are refused
+//!   on a humanoid: it would fall);
 //!   no motion command, no override. A valid signature does not widen
 //!   this: an authenticated but invalid body is refused (400) and
 //!   recorded.
@@ -117,7 +120,7 @@ fn default_answer_ms() -> u64 {
 /// "control_plane": {
 ///   "listen_tcp": "127.0.0.1:8787",
 ///   "unix_socket": "/run/robodr-agentd/control.sock",
-///   "soc_keys": ["/etc/robodr/soc/autosecops.pub"]
+///   "soc_keys": ["/etc/robodr/soc/soc.pub"]
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

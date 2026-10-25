@@ -11,7 +11,9 @@
 //! 5. context caps: platform mismatch or engaged safety system → Record only;
 //! 6. approval gates: unknown state, human in command, take-off/landing,
 //!    above `auto_max_step`;
-//! 7. build the cumulative action list (Record .. max step);
+//! 7. build the cumulative action list (Record .. max step); on a humanoid
+//!    morphology `SafePause` / `RequestSafeState` go to `advisory` instead
+//!    and network isolation + participant quarantine are added;
 //! 8. observe mode (deviation in [`robodr_events::Mode::Observe`], profile
 //!    unlocked or policy not OEM-validated) → Record only, with the
 //!    would-have plan attached;
@@ -23,7 +25,7 @@ use std::fmt;
 
 use robodr_events::Deviation;
 
-use crate::action::{Rationale, Reason, ResponseAction, ResponsePlan, Step};
+use crate::action::{Rationale, Reason, ResponseAction, ResponsePlan, RestrictTarget, Step};
 use crate::policy::ResponsePolicy;
 use crate::state::{Connectivity, OperationalContext, SafetyState};
 
@@ -139,8 +141,24 @@ pub(crate) fn plan_with(
         approval = true;
     }
 
-    // 7. Build the cumulative action list.
+    // 7. Build the cumulative action list. On a morphology that falls when
+    //    de-energised (humanoid), the safe-pause / safe-state part is
+    //    advisory only and the threat is contained with the balance-keeping
+    //    steps instead: limit motion, isolate the network, quarantine the
+    //    participant.
+    let no_de_energise = policy.morphology.falls_when_de_energised() && step >= Step::SafePause;
+    let mut contain_targets = targets.to_vec();
+    if no_de_energise {
+        why.push(Reason::DeEnergisingAdvisoryOnly {
+            morphology: policy.morphology,
+            step,
+        });
+        contain_targets.push(RestrictTarget::Network);
+        contain_targets.push(RestrictTarget::Participant);
+    }
+    let targets = contain_targets.as_slice();
     let mut actions = vec![ResponseAction::Record];
+    let mut advisory = Vec::new();
     if step >= Step::Restrict {
         let terminate_ok = state.is_idle() && policy.allow_terminate_when_idle;
         let mut ts = targets.to_vec();
@@ -149,7 +167,7 @@ pub(crate) fn plan_with(
         for t in ts {
             actions.push(ResponseAction::Restrict {
                 target: t,
-                terminate_process: terminate_ok && t == crate::action::RestrictTarget::Process,
+                terminate_process: terminate_ok && t == RestrictTarget::Process,
             });
         }
     }
@@ -170,10 +188,15 @@ pub(crate) fn plan_with(
             break;
         }
         if b.allowed_for(ctx.platform) {
-            actions.push(match s {
+            let a = match s {
                 Step::SafePause => ResponseAction::SafePause { behaviour: b },
                 _ => ResponseAction::RequestSafeState { behaviour: b },
-            });
+            };
+            if no_de_energise {
+                advisory.push(a);
+            } else {
+                actions.push(a);
+            }
         } else {
             why.push(Reason::InvalidSafeBehaviour { behaviour: b });
             approval = true;
@@ -200,6 +223,8 @@ pub(crate) fn plan_with(
         suppressed: false,
         would_have: None,
         rationale: why,
+        morphology: policy.morphology,
+        advisory,
     };
 
     // 8. Observe mode. The deviation's own mode comes first: a detector that
@@ -223,6 +248,7 @@ pub(crate) fn plan_with(
             observe_only: true,
             would_have: Some(Box::new(plan.clone())),
             rationale,
+            advisory: Vec::new(),
             ..plan
         };
     }
@@ -270,6 +296,13 @@ pub enum Violation {
     /// The deviation was raised in observe mode but the plan is not an
     /// observe-only, Record-only plan.
     ObserveOnlyDeviationActed,
+    /// An executable action that may de-energise actuators
+    /// (`SafePause` / `RequestSafeState`) on a morphology that falls when
+    /// de-energised (humanoid).
+    DeEnergisingOnFallProneMorphology,
+    /// An `advisory` entry that is not a `SafePause` / `RequestSafeState`
+    /// valid for the platform, or advisory entries on an observe-only plan.
+    BadAdvisory,
 }
 
 impl fmt::Display for Violation {
@@ -340,7 +373,7 @@ pub fn check_invariants(
                 target,
                 terminate_process: true,
             } => {
-                if target != crate::action::RestrictTarget::Process {
+                if target != RestrictTarget::Process {
                     return Err(Violation::TerminateNonProcess);
                 }
                 if !state.is_idle() {
@@ -359,6 +392,23 @@ pub fn check_invariants(
                 return Err(Violation::SafeBehaviourInvalidForPlatform);
             }
             _ => {}
+        }
+    }
+    if plan.morphology.falls_when_de_energised()
+        && a.iter()
+            .any(|x| crate::actions::for_action(x).may_de_energise())
+    {
+        return Err(Violation::DeEnergisingOnFallProneMorphology);
+    }
+    if plan.observe_only && !plan.advisory.is_empty() {
+        return Err(Violation::BadAdvisory);
+    }
+    for x in &plan.advisory {
+        match *x {
+            ResponseAction::SafePause { behaviour }
+            | ResponseAction::RequestSafeState { behaviour }
+                if behaviour.allowed_for(ctx.platform) => {}
+            _ => return Err(Violation::BadAdvisory),
         }
     }
     if let Some(w) = &plan.would_have {

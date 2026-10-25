@@ -30,6 +30,11 @@
 //!   policy not OEM-validated) → Record only, with the would-have plan
 //!   attached.
 //! * Safe behaviours must be valid for the platform family.
+//! * On a [`Morphology`] that falls when its actuators are damped or
+//!   de-energised (a humanoid), `SafePause` / `RequestSafeState` are never
+//!   executable: they appear only in the plan's `advisory` list, and the
+//!   executable plan stops at `LimitMotion` plus network isolation and
+//!   participant quarantine.
 //!
 //! The policy is validated at load ([`ResponsePolicy::validate`]) and the
 //! plan is re-checked at the end of planning
@@ -37,11 +42,14 @@
 //! violating plan is replaced by Record + approval, so failure modes only ever
 //! make the response *less* active.
 //!
+//! [`actions`] is the vendor-neutral action catalog (names, approval tier,
+//! reversibility, GA execution) shared with the agentd control plane.
+//!
 //! See `README.md` in this crate for the policy format and what is not yet
 //! verified (OEM validation, real platform safe-state interfaces).
 
 pub mod action;
-pub mod autosecops;
+pub mod actions;
 pub mod escalation;
 pub mod planner;
 pub mod policy;
@@ -50,14 +58,15 @@ pub mod state;
 pub use action::{
     Rationale, Reason, ResponseAction, ResponsePlan, RestrictTarget, SafeBehaviour, Step,
 };
-pub use autosecops::{action_class, ActionClass, Approval, Reversibility};
+pub use actions::{ActionId, ActionSpec, Approval, GaExecution, CATALOG};
 pub use escalation::Responder;
 pub use planner::{check_invariants, check_invariants_for_deviation, plan_stateless, Violation};
 pub use policy::{
     EscalationPolicy, Matrix, PolicyError, ResponsePolicy, RuleOverride, SeverityRow,
 };
 pub use state::{
-    Connectivity, ControlMode, MissionPhase, OperationalContext, PlatformFamily, SafetyState,
+    Connectivity, ControlMode, MissionPhase, Morphology, OperationalContext, PlatformFamily,
+    SafetyState,
 };
 
 #[cfg(test)]

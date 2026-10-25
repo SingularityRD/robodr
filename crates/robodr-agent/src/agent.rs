@@ -1586,6 +1586,8 @@ mod tests {
             suppressed: false,
             would_have: None,
             rationale: Rationale::default(),
+            morphology: Default::default(),
+            advisory: Vec::new(),
         };
         let (q, v) = guard(bad, &dev, SafetyState::EStopActive, &ctx(true));
         assert!(v.unwrap().contains("ActionWhileSafetySystemEngaged"));

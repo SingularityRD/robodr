@@ -21,6 +21,7 @@ fn random_policy(rng: &mut XorShift) -> ResponsePolicy {
     let platform = *rng.pick(&PlatformFamily::ALL);
     let mut p = ResponsePolicy::conservative_default(platform);
     p.oem_validated = !rng.chance(1, 8);
+    p.morphology = *rng.pick(&Morphology::ALL);
     let row = |rng: &mut XorShift| SeverityRow {
         low: *rng.pick(&Step::ALL),
         medium: *rng.pick(&Step::ALL),

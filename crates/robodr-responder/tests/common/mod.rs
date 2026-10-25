@@ -236,6 +236,16 @@ pub fn universal_invariants(
         if c.platform != policy.platform && !is_record_only(q) {
             return Err("acted on a platform mismatch".into());
         }
+        if policy.morphology.falls_when_de_energised()
+            && q.actions.iter().any(|a| {
+                matches!(
+                    a,
+                    ResponseAction::SafePause { .. } | ResponseAction::RequestSafeState { .. }
+                )
+            })
+        {
+            return Err("de-energising action executable on a humanoid".into());
+        }
         for a in &q.actions {
             match a {
                 ResponseAction::SafePause { behaviour }

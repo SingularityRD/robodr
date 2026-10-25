@@ -37,82 +37,26 @@ pub const MAX_SPEED_CAP: f64 = 10.0;
 /// never a finding, so not a `robot.*` rule id).
 pub const PLAN_RULE: &str = "control_plane:action_request";
 
-/// The six action classes (AutoSecOps `robot_<name>`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ActionKind {
-    RestrictMotion,
-    QuarantineNode,
-    IsolateNetwork,
-    SafePause,
-    RequestSafeState,
-    RollbackConfig,
-}
+/// The action classes are the responder's vendor-neutral catalog
+/// ([`robodr_responder::actions`]): names, ladder step, reversibility and
+/// the TTL rule come from there, so the control plane and the planner can
+/// never disagree on what an action is (`catalog_matches_the_responder`
+/// test). On the wire a request names an action by its namespace-free name
+/// (`restrict_motion`); a SOC that registers actions under the catalog's
+/// `robot_<name>` wire names maps them back with
+/// [`ActionKind::parse_wire`].
+pub use robodr_responder::ActionId as ActionKind;
 
-impl ActionKind {
-    pub const ALL: [ActionKind; 6] = [
-        ActionKind::RestrictMotion,
-        ActionKind::QuarantineNode,
-        ActionKind::IsolateNetwork,
-        ActionKind::SafePause,
-        ActionKind::RequestSafeState,
-        ActionKind::RollbackConfig,
-    ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ActionKind::RestrictMotion => "restrict_motion",
-            ActionKind::QuarantineNode => "quarantine_node",
-            ActionKind::IsolateNetwork => "isolate_network",
-            ActionKind::SafePause => "safe_pause",
-            ActionKind::RequestSafeState => "request_safe_state",
-            ActionKind::RollbackConfig => "rollback_config",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|a| a.as_str() == s)
-    }
-
-    /// Needs a `ttl_seconds` (1..=[`MAX_TTL_SECONDS`]); the others refuse one.
-    pub fn time_limited(self) -> bool {
-        matches!(
-            self,
-            ActionKind::RestrictMotion | ActionKind::IsolateNetwork
-        )
-    }
-
-    /// Can be reverted by a later request (an operator restarts after a
-    /// safe state; a rollback is not undone).
-    pub fn reversible(self) -> bool {
-        !matches!(
-            self,
-            ActionKind::RequestSafeState | ActionKind::RollbackConfig
-        )
-    }
-
-    /// The Cyber-Jidoka ladder step the action stands on.
-    pub fn step(self) -> Step {
-        match self {
-            ActionKind::QuarantineNode
-            | ActionKind::IsolateNetwork
-            | ActionKind::RollbackConfig => Step::Restrict,
-            ActionKind::RestrictMotion => Step::LimitMotion,
-            ActionKind::SafePause => Step::SafePause,
-            ActionKind::RequestSafeState => Step::RequestSafeState,
-        }
-    }
-
-    /// Parameters the action may carry.
-    pub fn allowed_params(self) -> &'static [&'static str] {
-        match self {
-            ActionKind::RestrictMotion => {
-                &["max_linear_speed", "max_joint_speed", "workspace_zone"]
-            }
-            ActionKind::QuarantineNode => &["participant_guid", "node"],
-            ActionKind::RollbackConfig => &["config", "to_version"],
-            _ => &[],
-        }
+/// Parameters each action may carry (the others refuse every parameter).
+pub fn allowed_params(action: ActionKind) -> &'static [&'static str] {
+    match action {
+        ActionKind::RestrictMotion => &["max_linear_speed", "max_joint_speed", "workspace_zone"],
+        ActionKind::QuarantineNode => &["participant_guid", "node"],
+        ActionKind::RollbackConfig => &["config", "to_version"],
+        ActionKind::IsolateNetwork
+        | ActionKind::RecordEvidence
+        | ActionKind::SafePause
+        | ActionKind::RequestSafeState => &[],
     }
 }
 
@@ -373,7 +317,7 @@ pub fn parse_submit(body: &[u8]) -> Result<ActionRequest, ApiError> {
     let stray: Vec<&str> = present
         .iter()
         .copied()
-        .filter(|n| !action.allowed_params().contains(n))
+        .filter(|n| !allowed_params(action).contains(n))
         .collect();
     if !stray.is_empty() {
         return Err(bad(
@@ -612,7 +556,9 @@ fn state_name(s: SafetyState) -> String {
 ///    command (teleop / manual) or in take-off / landing: refused, the
 ///    person in command decides;
 /// 4. `rollback_config` while the robot is not `idle`: refused (no program
-///    or profile change in motion);
+///    or profile change in motion); an action that may de-energise the
+///    actuators (`safe_pause`, `request_safe_state`) on a humanoid
+///    morphology: refused (`fall_hazard`, it would fall);
 /// 5. a step above what the policy's matrix allows in this state for any
 ///    severity: refused;
 /// 6. a `restrict_motion` cap above the profile's envelope: refused (it
@@ -676,6 +622,17 @@ pub fn judge(req: &ActionRequest, key_id: &str, s: &Situation<'_>) -> Decision {
         return refuse(
             "requires_idle",
             format!("a configuration or program rollback needs an idle robot (now {name})"),
+        );
+    }
+    if req.action.may_de_energise() && s.policy.morphology.falls_when_de_energised() {
+        return refuse(
+            "fall_hazard",
+            format!(
+                "{} may damp or de-energise the actuators, and this robot is configured as a \
+                 humanoid: it would fall. Advisory only, never executed; use restrict_motion, \
+                 isolate_network or quarantine_node",
+                req.action.as_str()
+            ),
         );
     }
     let ceiling = policy_ceiling(s.policy, s.state);
@@ -746,8 +703,9 @@ pub fn judge(req: &ActionRequest, key_id: &str, s: &Situation<'_>) -> Decision {
         ActionKind::RequestSafeState => actions.push(ResponseAction::RequestSafeState {
             behaviour: s.policy.safe_state,
         }),
-        // No ladder action: the rollback itself is recorded with the request.
-        ActionKind::RollbackConfig => {}
+        // No ladder action beyond Record: evidence capture is the Record
+        // step itself; the rollback is recorded with the request.
+        ActionKind::RecordEvidence | ActionKind::RollbackConfig => {}
     }
     if s.state == SafetyState::Unknown && step.is_motion_affecting() {
         notes.push(
@@ -773,6 +731,8 @@ pub fn judge(req: &ActionRequest, key_id: &str, s: &Situation<'_>) -> Decision {
         suppressed: false,
         would_have: None,
         rationale: Rationale::default(),
+        morphology: s.policy.morphology,
+        advisory: Vec::new(),
     };
     if let Err(v) = check_invariants(&plan, s.state, s.context) {
         return refuse(
@@ -1378,7 +1338,7 @@ mod tests {
             "ttl_seconds": ttl,
             "reason": "rogue writer on /cmd_vel",
             "requested_by": "analyst@soc",
-            "source": "autosecops",
+            "source": "soc-a",
             "authority": "request",
         }))
         .unwrap()
@@ -1556,7 +1516,7 @@ mod tests {
             "invalid_field"
         );
         v["requested_by"] = json!("a");
-        v["source"] = json!("AutoSecOps");
+        v["source"] = json!("SOC A");
         assert_eq!(
             code(parse_submit(&serde_json::to_vec(&v).unwrap())),
             "invalid_field"
@@ -1644,6 +1604,105 @@ mod tests {
         match d {
             Decision::Refuse(r) => r.code,
             Decision::Accept(a) => panic!("accepted: {a:?}"),
+        }
+    }
+
+    /// A request for `a` with the parameters and TTL it needs.
+    fn valid_req(a: ActionKind) -> ActionRequest {
+        match a {
+            ActionKind::RestrictMotion => req(
+                "restrict_motion",
+                json!({"max_linear_speed": 0.5}),
+                Some(60),
+            ),
+            ActionKind::QuarantineNode => req("quarantine_node", json!({"node": "/n"}), None),
+            ActionKind::IsolateNetwork => req("isolate_network", json!({}), Some(60)),
+            _ => req(a.as_str(), json!({}), None),
+        }
+    }
+
+    #[test]
+    fn catalog_matches_the_responder() {
+        use robodr_responder::actions::{ActionId, CATALOG};
+        // One list: every catalog action is accepted by the request parser
+        // under its catalog name, and nothing else is.
+        assert_eq!(ActionKind::ALL, ActionId::ALL);
+        assert_eq!(ActionKind::ALL.len(), CATALOG.len());
+        for spec in CATALOG {
+            let a = ActionKind::parse(spec.name).expect("catalog name parses");
+            assert_eq!(a, spec.id);
+            assert_eq!(a.step(), spec.step);
+            assert_eq!(a.reversible(), spec.reversible);
+            assert_eq!(a.time_limited(), spec.time_limited);
+            assert!(!spec.autonomous);
+            let r = valid_req(a);
+            assert_eq!(r.action, a, "{}", spec.name);
+            assert_eq!(serde_json::to_value(r.action).unwrap(), json!(spec.name));
+        }
+        for wire in CATALOG.map(|c| c.wire_name) {
+            assert_eq!(
+                code(parse_submit(&body(wire, json!({}), None))),
+                "unknown_action",
+                "the request names the action, not its wire name: {wire}"
+            );
+        }
+    }
+
+    #[test]
+    fn record_evidence_is_accepted_as_a_record_only_plan() {
+        let r = req("record_evidence", json!({}), None);
+        assert_eq!(r.action, ActionKind::RecordEvidence);
+        assert_eq!(
+            code(parse_submit(&body(
+                "record_evidence",
+                json!({"node": "/n"}),
+                None
+            ))),
+            "parameter_not_allowed"
+        );
+        assert_eq!(
+            code(parse_submit(&body("record_evidence", json!({}), Some(60)))),
+            "ttl_not_allowed"
+        );
+        match judged(&r, SafetyState::MovingFast, &ctx(), &policy()) {
+            Decision::Accept(a) => {
+                assert_eq!(a.actions, vec![ResponseAction::Record]);
+            }
+            Decision::Refuse(x) => panic!("refused: {x:?}"),
+        }
+    }
+
+    #[test]
+    fn humanoid_refuses_de_energising_actions() {
+        let mut p = policy();
+        p.morphology = robodr_responder::Morphology::Humanoid;
+        let c = ctx();
+        for a in ActionKind::ALL {
+            let r = valid_req(a);
+            let d = judged(&r, SafetyState::MovingSlow, &c, &p);
+            if a.may_de_energise() {
+                assert_eq!(refusal(d), "fall_hazard", "{a:?}");
+            } else {
+                assert!(
+                    !matches!(d, Decision::Refuse(ref x) if x.code == "fall_hazard"),
+                    "{a:?}"
+                );
+            }
+        }
+        // Every other morphology is judged as before.
+        for m in robodr_responder::Morphology::ALL {
+            if m.falls_when_de_energised() {
+                continue;
+            }
+            p.morphology = m;
+            let r = req("safe_pause", json!({}), None);
+            assert!(
+                matches!(
+                    judged(&r, SafetyState::MovingSlow, &c, &p),
+                    Decision::Accept(_)
+                ),
+                "{m:?}"
+            );
         }
     }
 

@@ -3,7 +3,7 @@
 
 use robodr_events::{Deviation, Mode, Severity};
 
-use crate::autosecops::{action_class, Approval, ALL_CLASSES, ROBOTICS_CATEGORY};
+use crate::actions::{for_action, spec_for};
 use crate::escalation::{
     MAX_MOTION_GUARD_MS, MAX_REISSUE_KEYS, MAX_SOURCES, MAX_SOURCE_KEY_LEN, OVERFLOW_SOURCE,
 };
@@ -1655,53 +1655,356 @@ fn override_defaults_apply() {
     );
 }
 
-// ------------------------------------------------------------- autosecops ---
+// --------------------------------------------------------- action catalog ---
 
 #[test]
-fn autosecops_classes_never_autonomous() {
-    for c in ALL_CLASSES {
-        assert!(!c.autonomous_eligible, "{}", c.name);
-        assert_eq!(c.category, ROBOTICS_CATEGORY);
-        assert!(c.name.starts_with("robot_"));
+fn catalog_is_one_consistent_list() {
+    assert_eq!(CATALOG.len(), ActionId::ALL.len());
+    for (i, id) in ActionId::ALL.into_iter().enumerate() {
+        let c = id.spec();
+        assert_eq!(c, CATALOG[i]);
+        assert_eq!(c.id, id);
+        assert!(!c.autonomous, "{} must never be autonomous", c.name);
+        assert_eq!(c.wire_name, format!("robot_{}", c.name));
+        assert_eq!(ActionId::parse(c.name), Some(id));
+        assert_eq!(ActionId::parse_wire(c.wire_name), Some(id));
+        assert_eq!(
+            serde_json::to_value(id).unwrap(),
+            serde_json::json!(c.name),
+            "serde name = catalog name"
+        );
+        // GA executes only reversible actions.
+        assert!(!c.executable_in_ga || c.reversible, "{}", c.name);
+        assert_eq!(
+            c.executable_in_ga,
+            c.ga_execution != GaExecution::PlanOnly,
+            "{}",
+            c.name
+        );
+        // Irreversible or possibly de-energising actions need two people.
+        if !c.reversible || c.may_de_energise {
+            assert_eq!(c.approval, Approval::TwoPerson, "{}", c.name);
+        }
+        assert!(c.step <= Step::RequestSafeState);
     }
-    let name = |a: ResponseAction| action_class(&a).name;
-    assert_eq!(name(ResponseAction::Record), "robot_record_evidence");
-    assert!(!action_class(&ResponseAction::Record).in_design_doc);
+    let names: Vec<&str> = ActionId::ALL.iter().map(|a| a.as_str()).collect();
     assert_eq!(
-        name(ResponseAction::Restrict {
+        names,
+        [
+            "restrict_motion",
+            "quarantine_node",
+            "isolate_network",
+            "record_evidence",
+            "safe_pause",
+            "request_safe_state",
+            "rollback_config"
+        ]
+    );
+    let executed: Vec<&str> = CATALOG
+        .iter()
+        .filter(|c| c.ga_execution == GaExecution::Executor)
+        .map(|c| c.name)
+        .collect();
+    assert_eq!(
+        executed,
+        [
+            "restrict_motion",
+            "quarantine_node",
+            "isolate_network",
+            "record_evidence"
+        ]
+    );
+    assert_eq!(
+        ActionId::SafePause.spec().ga_execution,
+        GaExecution::PlatformAdapter
+    );
+    for a in [ActionId::RequestSafeState, ActionId::RollbackConfig] {
+        assert!(!a.executable_in_ga() && !a.reversible());
+        assert_eq!(a.approval(), Approval::TwoPerson);
+    }
+    let de: Vec<ActionId> = ActionId::ALL
+        .into_iter()
+        .filter(|a| a.may_de_energise())
+        .collect();
+    assert_eq!(de, [ActionId::SafePause, ActionId::RequestSafeState]);
+    assert_eq!(ActionId::parse("robot_safe_pause"), None);
+    assert_eq!(ActionId::parse_wire("safe_pause"), None);
+}
+
+#[test]
+fn every_ladder_action_maps_into_the_catalog() {
+    let id = |a: ResponseAction| for_action(&a);
+    assert_eq!(id(ResponseAction::Record), ActionId::RecordEvidence);
+    assert_eq!(
+        id(ResponseAction::Restrict {
             target: RestrictTarget::Network,
             terminate_process: false
         }),
-        "robot_isolate_network"
+        ActionId::IsolateNetwork
     );
     for t in [RestrictTarget::Participant, RestrictTarget::Process] {
         assert_eq!(
-            name(ResponseAction::Restrict {
+            id(ResponseAction::Restrict {
                 target: t,
                 terminate_process: false
             }),
-            "robot_quarantine_node"
+            ActionId::QuarantineNode
         );
     }
     assert_eq!(
-        name(ResponseAction::LimitMotion { factor: 0.5 }),
-        "robot_restrict_motion"
+        id(ResponseAction::LimitMotion { factor: 0.5 }),
+        ActionId::RestrictMotion
     );
-    let pause = action_class(&ResponseAction::SafePause {
+    let pause = spec_for(&ResponseAction::SafePause {
         behaviour: SafeBehaviour::Hold,
     });
     assert_eq!(
-        (pause.name, pause.approval),
+        (pause.wire_name, pause.approval),
         ("robot_safe_pause", Approval::TwoPerson)
     );
-    let safe = action_class(&ResponseAction::RequestSafeState {
+    let safe = spec_for(&ResponseAction::RequestSafeState {
         behaviour: SafeBehaviour::Hold,
     });
     assert_eq!(
-        (safe.name, safe.approval),
+        (safe.wire_name, safe.approval),
         ("robot_request_safe_state", Approval::TwoPerson)
     );
-    assert!(ALL_CLASSES.iter().filter(|c| c.in_design_doc).count() == 5);
+    // The catalog step of every planned action is its ladder step.
+    let mut all = vec![
+        ResponseAction::Record,
+        ResponseAction::LimitMotion { factor: 0.5 },
+        ResponseAction::SafePause {
+            behaviour: SafeBehaviour::Hold,
+        },
+        ResponseAction::RequestSafeState {
+            behaviour: SafeBehaviour::Hold,
+        },
+    ];
+    all.extend(RestrictTarget::ALL.map(|t| ResponseAction::Restrict {
+        target: t,
+        terminate_process: false,
+    }));
+    for a in all {
+        assert_eq!(spec_for(&a).step, a.step(), "{a:?}");
+    }
+}
+
+// ------------------------------------------------------------ morphology ---
+
+fn morph(platform: PlatformFamily, m: Morphology) -> ResponsePolicy {
+    let mut p = enforced(platform);
+    p.morphology = m;
+    p
+}
+
+fn has_de_energising(actions: &[ResponseAction]) -> bool {
+    actions.iter().any(|a| for_action(a).may_de_energise())
+}
+
+#[test]
+fn morphology_defaults_to_other_and_parses() {
+    assert_eq!(Morphology::default(), Morphology::Other);
+    let base = ResponsePolicy::conservative_default(PlatformFamily::Other);
+    assert_eq!(base.morphology, Morphology::Other);
+    // A policy without the field (every pre-morphology policy) still loads.
+    let mut v: serde_json::Value = serde_json::from_str(&base.to_json()).unwrap();
+    v.as_object_mut().unwrap().remove("morphology");
+    let p = ResponsePolicy::from_json(&v.to_string()).unwrap();
+    assert_eq!(p.morphology, Morphology::Other);
+    for m in Morphology::ALL {
+        v["morphology"] = serde_json::to_value(m).unwrap();
+        assert_eq!(
+            ResponsePolicy::from_json(&v.to_string())
+                .unwrap()
+                .morphology,
+            m
+        );
+    }
+    v["morphology"] = serde_json::json!("biped");
+    assert!(matches!(
+        ResponsePolicy::from_json(&v.to_string()),
+        Err(PolicyError::Json(_))
+    ));
+    let fall: Vec<Morphology> = Morphology::ALL
+        .into_iter()
+        .filter(|m| m.falls_when_de_energised())
+        .collect();
+    assert_eq!(fall, [Morphology::Humanoid]);
+}
+
+#[test]
+fn humanoid_never_gets_executable_safe_pause_or_safe_state() {
+    for platform in PlatformFamily::ALL {
+        let p = morph(platform, Morphology::Humanoid);
+        let c = ctx(platform);
+        for state in SafetyState::ALL {
+            for sev in SEVS {
+                let plan = plan_stateless(&p, &dev(sev), "s", state, &c);
+                assert!(
+                    !has_de_energising(&plan.actions),
+                    "{platform:?} {state:?} {sev:?}: {:?}",
+                    plan.actions
+                );
+                assert!(plan.max_step <= Step::LimitMotion);
+                assert_eq!(check_invariants(&plan, state, &c), Ok(()));
+                let wanted = p.matrix.get(sev, state);
+                if wanted >= Step::SafePause && !state.safety_system_engaged() {
+                    // Advisory carries what would have been requested.
+                    assert!(has_de_energising(&plan.advisory), "{state:?} {sev:?}");
+                    assert!(plan.rationale.contains(|r| matches!(
+                        r,
+                        Reason::DeEnergisingAdvisoryOnly {
+                            morphology: Morphology::Humanoid,
+                            ..
+                        }
+                    )));
+                    // Contained with the balance-keeping steps instead.
+                    for want in [
+                        ResponseAction::LimitMotion {
+                            factor: p.limit_motion_factor,
+                        },
+                        ResponseAction::Restrict {
+                            target: RestrictTarget::Network,
+                            terminate_process: false,
+                        },
+                        ResponseAction::Restrict {
+                            target: RestrictTarget::Participant,
+                            terminate_process: false,
+                        },
+                    ] {
+                        assert!(plan.actions.contains(&want), "{want:?} in {plan:?}");
+                    }
+                } else {
+                    assert!(plan.advisory.is_empty());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn other_morphologies_keep_the_full_ladder() {
+    let state = SafetyState::CollaborativeHumanNearby;
+    for m in Morphology::ALL {
+        for platform in PlatformFamily::ALL {
+            let p = morph(platform, m);
+            let c = ctx(platform);
+            let plan = plan_stateless(&p, &dev(Severity::Critical), "s", state, &c);
+            assert_eq!(check_invariants(&plan, state, &c), Ok(()));
+            assert_eq!(plan.morphology, m);
+            if m == Morphology::Humanoid {
+                assert_eq!(plan.max_step, Step::LimitMotion, "{platform:?}");
+                assert_eq!(plan.advisory.len(), 2, "{platform:?}");
+            } else {
+                assert_eq!(plan.max_step, Step::RequestSafeState, "{m:?} {platform:?}");
+                assert!(plan.advisory.is_empty());
+                assert!(has_de_energising(&plan.actions));
+                // Same actions as with no morphology at all.
+                let base = plan_stateless(
+                    &enforced(platform),
+                    &dev(Severity::Critical),
+                    "s",
+                    state,
+                    &c,
+                );
+                assert_eq!(plan.actions, base.actions, "{m:?} {platform:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn humanoid_observe_mode_keeps_advisory_in_would_have_only() {
+    let mut p = morph(PlatformFamily::Other, Morphology::Humanoid);
+    p.oem_validated = false;
+    let c = ctx(PlatformFamily::Other);
+    let state = SafetyState::MovingFast;
+    let plan = plan_stateless(&p, &dev(Severity::Critical), "s", state, &c);
+    assert!(plan.observe_only);
+    assert!(plan.advisory.is_empty());
+    let w = plan.would_have.as_ref().unwrap();
+    assert!(!w.advisory.is_empty() && !has_de_energising(&w.actions));
+    assert_eq!(check_invariants(&plan, state, &c), Ok(()));
+}
+
+#[test]
+fn humanoid_escalation_never_reaches_de_energising() {
+    let mut p = morph(PlatformFamily::Other, Morphology::Humanoid);
+    p.escalation.ceiling = Step::RequestSafeState;
+    p.escalation.max_escalation_steps = 2;
+    let c = ctx(PlatformFamily::Other);
+    let mut r = Responder::new(p).unwrap();
+    for i in 0..20u64 {
+        let plan = r.plan(
+            &dev(Severity::High),
+            "guid-1",
+            SafetyState::MovingSlow,
+            &c,
+            i * 1000,
+        );
+        assert!(!has_de_energising(&plan.actions), "{i}: {plan:?}");
+    }
+}
+
+#[test]
+fn invariant_rejects_de_energising_on_humanoid_plans() {
+    let p = enforced(PlatformFamily::Other);
+    let c = ctx(PlatformFamily::Other);
+    let state = SafetyState::MovingFast;
+    let mut plan = plan_stateless(&p, &dev(Severity::Critical), "s", state, &c);
+    assert!(has_de_energising(&plan.actions));
+    assert_eq!(check_invariants(&plan, state, &c), Ok(()));
+    plan.morphology = Morphology::Humanoid;
+    assert_eq!(
+        check_invariants(&plan, state, &c),
+        Err(Violation::DeEnergisingOnFallProneMorphology)
+    );
+    // Advisory may only hold safe pause / safe state valid for the platform.
+    let mut plan = plan_stateless(&p, &dev(Severity::Low), "s", state, &c);
+    plan.advisory = vec![ResponseAction::Record];
+    assert_eq!(
+        check_invariants(&plan, state, &c),
+        Err(Violation::BadAdvisory)
+    );
+    plan.advisory = vec![ResponseAction::SafePause {
+        behaviour: SafeBehaviour::Hold,
+    }];
+    assert_eq!(
+        check_invariants(&plan, state, &c),
+        Err(Violation::BadAdvisory),
+        "hold is not valid for `other`"
+    );
+    plan.advisory = vec![ResponseAction::SafePause {
+        behaviour: SafeBehaviour::PlatformDefined,
+    }];
+    assert_eq!(check_invariants(&plan, state, &c), Ok(()));
+}
+
+#[test]
+fn humanoid_plan_json_round_trips_and_default_omits_new_fields() {
+    let p = morph(PlatformFamily::Other, Morphology::Humanoid);
+    let c = ctx(PlatformFamily::Other);
+    let plan = plan_stateless(
+        &p,
+        &dev(Severity::Critical),
+        "s",
+        SafetyState::MovingFast,
+        &c,
+    );
+    let j = serde_json::to_string(&plan).unwrap();
+    assert!(j.contains("\"morphology\":\"humanoid\""));
+    assert!(j.contains("\"advisory\":["));
+    let back: ResponsePlan = serde_json::from_str(&j).unwrap();
+    assert_eq!(back, plan);
+    let plain = plan_stateless(
+        &enforced(PlatformFamily::Other),
+        &dev(Severity::Critical),
+        "s",
+        SafetyState::MovingFast,
+        &c,
+    );
+    let j = serde_json::to_string(&plain).unwrap();
+    assert!(!j.contains("morphology") && !j.contains("advisory"));
 }
 
 #[test]
