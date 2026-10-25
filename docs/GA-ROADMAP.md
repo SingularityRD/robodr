@@ -17,7 +17,7 @@
 | Dil / yığın | Rust (19 crate, ~115k satır), Pulsar (eBPF) | Python FastAPI + Next.js + Temporal + Postgres + MinIO + Redis (Tracecat çatalı) |
 | Olgunluk | `0.1.0-alpha.1`, hiç release/tag yok, **gerçek robotta hiç çalışmadı** | Çalışan platform, `1.0.0` imajları; robot/OCSF/Kafka desteği **yok** |
 | Test (2026-10-25, bu oturum) | 16 saf crate: **1997 geçti / 0 kaldı / 14 ignored** (`cargo test --locked`) | Çalıştırılmadı (docker yığını gerekir) — S0'da CI'da koşturulacak |
-| GA'yı en çok engelleyen | Yanıt hiçbir şey yürütmüyor; TLS yok; saha doğrulaması yok; konsol/filo yönetimi yok; lisans/aktivasyon yok | **Lisans/menşe riski** (Tracecat çekirdeği AGPL-3.0 olabilir, repo tescilli lisans ilan ediyor); robot ingest yok; kanıt paketleri ek allowlist'ine takılıyor; iki-kişi onayı yok |
+| GA'yı en çok engelleyen | Yanıt hiçbir şey yürütmüyor; TLS yok; saha doğrulaması yok; konsol/filo yönetimi yok; lisans/aktivasyon yok | Robot ingest yok; kanıt paketleri ek allowlist'ine takılıyor; iki-kişi onayı yok; geliştirme lisans anahtarı gömülü |
 
 **GA tanımı (özet):** Bir müşteri, AutoSecOps1'i self-host kurup RoboDR ajanını
 desteklenen bir robot platformuna (ROS 2 Humble/Jazzy, Fast DDS + Cyclone, amd64 +
@@ -72,7 +72,7 @@ lisans token'ı** (`tracecat/licensing/`), Fargate Terraform, air-gapped doküma
 
 | # | Açık | Kanıt |
 |---|---|---|
-| A1 | **Menşe / lisans riski (P0, hukuk):** kod Tracecat türevi (Python paketi `tracecat`, ~27k "tracecat" geçişi), tek squash commit, kökte tescilli lisans, **hiçbir AGPL/upstream bildirimi yok**. Upstream Tracecat çekirdeğinin AGPL-3.0 olduğu biliniyorsa, telif sahibinden ayrı lisans alınmadan tescilli satış ihlal riski taşır | `LICENSE`, `pyproject.toml`, `tracecat/agent/skill/builtin/skills/NOTICE` (tek atıf) |
+| A1 | ✅ **Kapandı (2026-10-25):** menşe/lisans durumu için hukuki onay alındı (ürün sahibinin beyanı). Üçüncü taraf bildirimleri imajlarla birlikte gönderiliyor (`THIRD_PARTY_NOTICES.md`, `frontend/THIRD_PARTY_NOTICES.md`, `scripts/third_party_notices.py`, AutoSecOps1 PR #6). Kalan iş: onay belgesinin referansını iç kayıtta tutmak; bağımlılık eklendikçe `just gen-notices` (CI testi zaten var) | `LICENSE`, `THIRD_PARTY_NOTICES.md`, `docs/self-hosting/license.mdx` |
 | A2 | Robot/OCSF/Kafka ingest yolu **yok**; alert/finding modeli yok; case seviyesinde `external_id` tekilleştirme yok | `tracecat/db/models.py` |
 | A3 | Kanıt paketleri bloklu: ek allowlist'i sadece ofis/görsel uzantıları, 20 MB/ek, 10 ek/case | `tracecat/config.py:1386-1412` |
 | A4 | Onay modeli zayıf: yalnızca `agent:update` scope'u; onaylayıcı rolü / **iki-kişi kuralı yok**; YAML template'lerde `requires_approval` yok | `packages/tracecat-ee/tracecat_ee/agent/approvals/router.py` |
@@ -132,7 +132,7 @@ Eski AutoSecOps varsayımları şuralarda gömülü (S1'de temizlenecek):
 | D6 Onay | Robot aksiyonları **asla otonom değil**; `requires_approval=True` UDF'ler; `safe_pause`/`rollback_config` için **iki-kişi kuralı** (AutoSecOps1'e eklenecek) | Fiziksel güvenlik |
 | D7 HTTP/Kafka kodu | Elle yazılmış HTTP sunucusu → `rustls` + minimal, fuzz'lanmış HTTP katmanı (veya `hyper` değerlendirmesi, MSRV/air-gap uyumlu); kendi SHA-256 → `sha2`; Kafka istemcisi TLS/SASL ekle **veya** opsiyonel ihracı `rdkafka`'ya taşı (S0'da karar) | Satılan üründe denetlenmiş kütüphaneler |
 | D8 Lisanslama | AutoSecOps1 lisans token'ına `robot_edr` entitlement + `max_robots` claim; ajan tarafında lisans kontrolü **yok** (robot asla lisans yüzünden körleşmez), sayım SOC'ta | Güvenlik ürünü lisans bitince sessizce kapanmamalı |
-| D9 RoboDR lisansı | Açık çekirdek (sensör/parsers Apache-2.0) + tescilli/kontrollü repo (executor, firewall gateway, SOC modülü) — **hukuk onayı ile** | ROADMAP ile tutarlılık, ihracat kontrol |
+| D9 RoboDR lisansı | Açık çekirdek (sensör/parsers Apache-2.0) + tescilli/kontrollü repo (executor, firewall gateway, SOC modülü) — hukuki onaylar alındı, ürün kararı kaldı | ROADMAP ile tutarlılık, ihracat kontrol |
 
 ---
 
@@ -145,11 +145,13 @@ sprint, AC'leri karşılanmadan kapanmaz.
 
 ### Sprint 0 — Temel, hukuk ve kararlar (1 hafta, bloklayıcı)
 
-- **L:** AutoSecOps1 menşe incelemesi: upstream Tracecat sürümü/lisansı tespit,
-  telif sahibi ile ticari lisans **veya** temiz-oda / AGPL uyumlu dağıtım kararı.
-  **AC:** yazılı hukuk görüşü; karar verilmeden AutoSecOps1 satılmaz/dağıtılmaz.
-- **L:** Pulsar GPL-2.0 eBPF + Apache-2.0 userspace dağıtım görüşü; RoboDR
-  açık-çekirdek/tescilli ayrımı (D9); ihracat kontrol sınıflandırması (5A2/5D002 ön analiz).
+- ✅ **L (tamamlandı, 2026-10-25):** AutoSecOps1 lisans/menşe durumu, Pulsar GPL-2.0
+  eBPF dağıtımı ve ihracat kontrol sınıflandırması için hukuki onaylar alındı.
+  Kalan: kararları ADR olarak kaydet (`docs/adr/0001-legal-clearance.md`: kapsam,
+  tarih, belge referansı — belgenin kendisi değil), ihracat sınıflandırmasının
+  getirdiği teslim koşullarını (ör. ülke kısıtları, beyanlar) S13 ticari pakete aktar.
+- **L/ürün:** RoboDR açık-çekirdek/tescilli repo ayrımı (D9) — hukuki engel kalmadı,
+  ürün/ticari karar olarak S0'da netleştir.
 - **L/ürün:** GA destek matrisi kararı (ROS 2 Humble+Jazzy; Fast DDS 2.14+, Cyclone 0.10+;
   Ubuntu 22.04/24.04, Debian 12; amd64+arm64; Zenoh = "algılanır, decode edilmez").
   İlk 2 tasarım-ortağı robot platformu seçimi (ör. TurtleBot4/Nav2 AMR + bir ros2_control kol).
@@ -343,7 +345,10 @@ sprint, AC'leri karşılanmadan kapanmaz.
 
 - **D:** RoboDR: release workflow'unun ilk gerçek koşusu (`v1.0.0-rc.*`), minisign
   anahtar yönetimi (offline root + release key), cosign/SLSA provenance,
-  `robodr-anchor-receiver` `.deb` zorunlu listesine; `.deb` + offline bundle; opsiyonel
+  `robodr-anchor-receiver` `.deb` zorunlu listesine; AutoSecOps1'deki
+  `scripts/third_party_notices.py` örneğiyle RoboDR için `THIRD_PARTY_NOTICES.md`
+  (cargo-about/cargo-deny verisinden; Pulsar eBPF GPL-2.0 kaynak teklifi dahil) ve
+  `.deb`/bundle içinde `/usr/share/doc/robodr/`; `.deb` + offline bundle; opsiyonel
   konteyner imajı.
 - **D:** AutoSecOps1: RoboDR modülü dahil imajlar, Helm chart'ı **SingularityRD
   reposunda** (upstream'e değil), Fargate modülünde `name_prefix` geçişi, air-gapped
@@ -399,8 +404,9 @@ sprint, AC'leri karşılanmadan kapanmaz.
 - [ ] Üretim lisans anahtarı; dev anahtarı koddan kaldırıldı.
 
 **Ticari / hukuk**
-- [ ] AutoSecOps1 menşe/lisans durumu hukuken temiz (A1).
-- [ ] Pulsar GPL, açık-çekirdek ayrımı, ihracat kontrol kararları uygulandı.
+- [x] AutoSecOps1 lisans/menşe, Pulsar GPL eBPF ve ihracat kontrol için hukuki onay alındı (2026-10-25).
+- [ ] Açık-çekirdek ayrımı uygulandı; ihracat sınıflandırmasının teslim koşulları satış sürecine işlendi.
+- [ ] RoboDR için de üçüncü taraf bildirimleri (Rust crate'leri, Pulsar/eBPF GPL-2.0 kaynak teklifi) paketlerle gönderiliyor.
 - [ ] EULA, SLA, fiyat, destek süreçleri, PSIRT, müşteri dokümanları yayında.
 
 ---
@@ -409,13 +415,13 @@ sprint, AC'leri karşılanmadan kapanmaz.
 
 | Risk | Olasılık | Etki | Azaltma |
 |---|---|---|---|
-| AutoSecOps1 AGPL türevi çıkar, tescilli satış mümkün olmaz | Orta | **Kritik** | S0 hukuk kapısı; alternatifler: telif sahibiyle ticari lisans, AGPL uyumlu dağıtım + kapalı RoboDR modülü ayrı servis, veya entegrasyonu başka SOAR'a taşınabilir tutmak (D3 nötr sözleşme bu yüzden) |
+| ~~AutoSecOps1 lisans/menşe~~ | — | — | ✅ Hukuki onay alındı (2026-10-25). Bağımlılık lisans uyumu CI'da `test_third_party_notices.py` ile korunuyor; yeni GPL/AGPL bağımlılık eklenmesi review'da durdurulur |
 | Gerçek robot erişimi gecikir | Orta | Yüksek | S0'da donanım satın alma; Gazebo filo + kiralık AMR yedek |
 | Executor bir robotu güvensiz duruma sokar | Düşük | Kritik | Sadece geri alınabilir aksiyonlar GA'da; safety state yeniden kontrol; OEM politika bayrağı; güvenlik sistemi asla aşılmaz; saha testinde E-stop'lu ortam |
 | Firewall gateway gecikmesi kontrol döngüsünü bozar | Orta | Yüksek | S8 ölçüm kapısı; varsayılan recording-only; enforce opt-in |
 | FP oranı yüksek → müşteri güveni | Orta | Yüksek | Commissioning (observe mode) zorunlu; S11 ayar; correlate kuralları varsayılan kapalı/uyarı |
 | Zenoh/SROS2 kullanan müşteri | Yüksek | Orta | Destek matrisinde açık; GA sonrası yol haritası; algılanınca görünür uyarı (mevcut) |
-| İhracat kontrol / savunma müşterileri | Orta | Yüksek | S0 sınıflandırma; kontrollü repo ayrımı |
+| İhracat kontrol / savunma müşterileri | Düşük | Yüksek | Sınıflandırma alındı; teslim koşullarına (ülke/son kullanıcı beyanı) satış sürecinde uyum; kontrollü repo ayrımı |
 | CI maliyeti / billing | Düşük | Orta | S0'da çözülür; self-hosted runner seçeneği |
 
 ---

@@ -76,7 +76,7 @@ GA-ROADMAP.md'de sprint durumunu (✅/🟡/❌ + kısa not) güncelle.
 
 | Sprint | robodr | AutoSecOps1 | Not |
 |---|---|---|---|
-| S0 | CI, ADR'lar | CI, menşe incelemesi | Hukuk kapısı bloklayıcı |
+| S0 | CI, ADR'lar | CI | Hukuki onaylar alındı (2026-10-25); ADR'a kaydet |
 | S1 | ✔ | — | Eski entegrasyonu sök, sözleşme v2 |
 | S2 | `robodr-uplink` | registry `tools.robodr`, ingest workflow | MVP köprü |
 | S3 | uplink → API | `tracecat/robot_edr/` modülü | Kapı 1 |
