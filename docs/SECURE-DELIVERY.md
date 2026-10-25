@@ -1,7 +1,7 @@
 # Secure delivery: air-gapped fleet distribution, updates and captured-unit protection
 
 > **Status: design only. Nothing in this document is implemented.** It
-> expands ROADMAP Phase 3 ("Air-gapped deployment") and replaces the one-line
+> expands ROADMAP Phase 3 ("Air-gapped deployment") and splits the one-line
 > Sprint 13 / Sprint 14 items in `docs/SPRINTS.md` with a buildable plan. Every
 > component named here that does not already exist is marked `[ ]`, using the
 > legend of ROADMAP §2. Where this design reuses existing code, the crate and
@@ -44,7 +44,7 @@ connectivity.
 - **Not an internet update service.** There is no vendor cloud. A site runs
   its own depot (§5) inside the air gap.
 
-**Threat table change.** ROADMAP §0 currently answers *captured-unit
+**Threat table change.** ROADMAP §0 previously answered *captured-unit
 exploitation* with "Measured-boot attestation + sealed keys; tamper response
 … (Zeroization/anti-tamper is the platform's job; RoboDR detects and refuses
 trust.)". Feature C extends that answer: payloads delivered by RoboDR are
@@ -285,7 +285,7 @@ does for profiles.
 
 - **Inventory**: unit id, platform, hardware, attested identity (TPM EK/AK
   certificates, §7.1), current attestation state (`Verified` / `Deviation` /
-  `Unknown` per ROADMAP Phase 3), installed RPK digests, last report time.
+  `Unknown`, the trust states of Sprint 12 in `docs/SPRINTS.md`), installed RPK digests, last report time.
 - **Groups and rings**: `lab` → `canary` (one unit) → `ring-1` (≈10 %) →
   `ring-2` (rest). Rings are per site and per platform.
 - **Desired state** per unit is the union of deployments targeting it,
@@ -496,8 +496,8 @@ equals E"). Incrementing that counter once makes every key sealed under epoch
 `E` permanently unusable on that TPM, in milliseconds, without touching the
 disk. The ciphertext left behind is just ciphertext.
 
-Triggers (each one a finding; each one a `robodr-responder` plan, so it is
-graded by safety state and never executed mid-motion unless the platform's
+Triggers (each one a finding; each one planned by `robodr-responder`, so it
+is graded by safety state and never executed mid-motion unless the platform's
 own safety system already holds the robot):
 
 | Trigger | Default |
@@ -513,12 +513,19 @@ Erase is final for that unit's delivered payloads; recovery is re-enrolment
 and re-delivery from the depot. This is RoboDR's own crypto-erase; it does not
 replace the platform's physical zeroization (§0).
 
-Execution needs the responder to execute something, which today it never does
-(`robodr-responder` plans only; the control-plane API records
-`recorded_not_executed`). Crypto-erase is proposed as the **first** executed
-response, because it touches no actuator and is safe in every `SafetyState`;
-it still goes through the responder so the rule "never overrides the safety
-system" is checked in one place.
+Nothing executes a response today: `robodr-responder` performs no I/O and
+executes nothing (`crates/robodr-responder/src/lib.rs`), the only exit for
+plans is the `Executor` seam in `robodr-agent`
+(`crates/robodr-agent/src/executor.rs`), whose contract ends the plan
+vocabulary at `request_safe_state`, and the control-plane API records
+`recorded_not_executed`. This design therefore needs two changes: a new
+`crypto_erase` action in the responder's action vocabulary
+(`crates/robodr-responder/src/action.rs`), planned under the same
+safety-state grading as every other action; and a real `Executor` in
+`robodr-agent` that executes that one action under the rules of
+`executor.rs`, extended to admit it. Crypto-erase is proposed as the
+**first** executed response because it touches no actuator and is safe in
+every `SafetyState`.
 
 ### 7.7 Units without a TPM (software fallback)
 
@@ -569,8 +576,12 @@ Claims for this mode are in the last column of §7.8.
 
 ## 9. New findings (OCSF catalog additions)
 
-All under the existing `robot-edr.findings` contract; each gets its own
-catalog entry as every `robot.*` rule id does today.
+All under the existing `robot-edr.findings` contract. These are emitted by
+in-repo components, so each gets its own catalog entry, like the other
+in-repo `robot.*` detectors (deployment-specific ids, such as site
+`robot.correlate.*` rules, share a generic entry instead). Adding catalog
+entries is a contract minor-version bump and needs the validator updated on
+both sides of the diode (`docs/contracts/robot-edr.findings.md`).
 
 | Rule id | Severity | Meaning |
 |---|---|---|
@@ -590,14 +601,14 @@ catalog entry as every `robot.*` rule id does today.
 
 ## 10. Sprint plan
 
-Replaces the Sprint 13 and Sprint 14 bullets in `docs/SPRINTS.md`. Sprint
+Splits the Sprint 13 and Sprint 14 bullets in `docs/SPRINTS.md`. Sprint
 numbers after 14 are unchanged; this work is split into lettered sub-sprints so
 nothing else renumbers.
 
 | Sprint | Deliverable (demo) | Exit criteria |
 |---|---|---|
 | **13a — Formats and release signing** | `robodr-pkg` (RPK, bundle, deployment, trust file parsers, pure, fuzzed); `robodr-release build/sign/verify` with 2-of-N quorum; parity via `robodr-diode` fec. | A bundle built on one host verifies on another; every manifest mutation, missing signature, wrong quorum, revoked key and chain gap is refused in tests; fuzz targets in `fuzz/`. |
-| **13b — Unit agent, local** | `robodr-deliverd` installing `files`, `config`, `deb`, `robodr-rules` from a per-unit media pack; store; health gate; auto-rollback; floors in a state file; safety-state gate from a recorded `safety_feed`. | Demo: bad release auto-rolls back; downgrade below floor refused; install deferred while the replayed safety state is `MovingSlow`. All recorded in the black box. |
+| **13b — Unit agent, local** | `robodr-deliverd` installing `files`, `config`, `deb`, `robodr-rules` from a per-unit media pack; store; health gate; auto-rollback; floors in a state file; safety-state gate, tested with recorded JSONL safety reports replayed into agentd's live `safety_feed` socket (a small replay helper is new work). | Demo: bad release auto-rolls back; downgrade below floor refused; install deferred while the replayed safety state is `MovingSlow`. All recorded in the black box. |
 | **13c — Sealing** | `robodr-seal`: XChaCha20-Poly1305 chunks; `UWK` in TPM via `tpm2-tools`; signed PCR policy; erase epoch; LUKS2 runtime volume; Clevis/Tang fallback. Tested against `swtpm`, like `TpmNvCounterAnchor`. | Disk image of an enrolled (swtpm) unit yields no plaintext; changed PCR → unseal refused; epoch increment → every sealed key dead; fallback unit cannot unlock without Tang. |
 | **14a — Depot and rollout** | `robodr-depot`: import with entry report, inventory, enrolment with credential activation, deployments with operator quorum, rings, per-unit re-wrapping, LAN serving (mTLS), media packs, halt-on-failure. | Demo on ≥ 3 units (VMs with swtpm acceptable): staged rollout lab → canary → ring-1; injected failing release halts at canary; captured-unit VM cannot decrypt a model assigned only to another unit. |
 | **14b — Lease, erase execution, evidence** | Lease tokens; crypto-erase as the first executed responder action; `robot.deliver.*` / `robot.seal.*` findings through the existing diode; floors moved to TPM NV counters. | Lease expiry blocks unseal after reboot; erase triggered by a simulated tamper input while state is `Idle`, deferred while `MovingFast`; SOC sees the full chain of findings. |
@@ -635,9 +646,11 @@ Each sub-sprint ends, as `docs/SPRINTS.md` requires, in a demo that runs.
 Consistent with the rest of the repository: claims are written as "verified"
 only after they run.
 
-- Parsers (`robodr-pkg`): unit tests with hostile inputs, `cargo-fuzz` targets,
-  std-only fuzz smoke runs in the crate tests, as `robodr-diode` and
-  `robodr-rtps` do.
+- Parsers (`robodr-pkg`): unit tests with hostile inputs, `cargo-fuzz` targets
+  in `fuzz/`, and std-only fuzz smoke runs in the crate tests, as
+  `robodr-blackbox`, `robodr-commission`, `robodr-ocsf` and `robodr-rtps` do.
+  (`robodr-diode`, whose fec code is reused, has no fuzz target yet; adding
+  one is part of 13a.)
 - Sealing: integration tests against `swtpm`; a separate run on hardware TPMs
   before anything is called field-verified.
 - Red-team scenarios before 14c exit: image the disk of an enrolled unit;
