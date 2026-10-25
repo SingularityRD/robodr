@@ -153,11 +153,11 @@ platform is set to pass-through. Every verdict is then
 `Passed { cmd: original, would_have }`, where `would_have` is the limit or reject
 that enforcement would have produced. Events are recorded with `EventAction::ObservedOnly`.
 
-**When the firewall itself fails (`FaultPolicy`).** The design document leaves this
-as an open question: *"Hareket Güvenlik Duvarı arızasında varsayılan davranış ne
-olmalı?"* ("What should the default behaviour be when the Motion Firewall fails?").
-It assigns the decision to the OEM per robot model, so it is configuration here and
-we do not decide it silently.
+**When the firewall itself fails (`FaultPolicy`).** The right default when the
+Motion Firewall fails is a safety-case decision that belongs to the OEM, per robot
+model, so it is configuration here and we do not decide it silently. For a
+humanoid joint channel the configuration refuses any policy that would zero or
+damp the motors (see the low-level joint section).
 
 - **Default: `FailSafe`.** Reject and emit **zero**. The firewall never holds in
   this case, because its state may be bad.
@@ -343,7 +343,7 @@ budget is exceeded**, 2 on a usage error, 0 otherwise.
 kernel, pinned core, frequency fixed) the numbers below are not a budget, and CI
 must not fail on them: run it without budgets (pure report), or with budgets and
 treat a non-zero exit as a warning. Once target hardware exists, set the budgets
-from the design doc's control-path allowance and make the exit code blocking.
+from the OEM's control-path latency allowance and make the exit code blocking.
 
 The command mix:
 

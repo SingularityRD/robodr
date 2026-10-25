@@ -789,6 +789,48 @@ fn catalog_1_3_wave7(rule: &str) -> Option<RuleInfo> {
             MOTION,
             &[],
         ),
+        "robot.firewall.joint_position_out_of_envelope" => e(
+            "Joint command position out of envelope",
+            "The motion firewall found a low-level joint command whose position target lies outside the joint's envelope and clamped or rejected it (in observe mode: would have).",
+            MOTION,
+            &[T0831],
+        ),
+        "robot.firewall.joint_velocity_out_of_envelope" => e(
+            "Joint command velocity out of envelope",
+            "The motion firewall found a low-level joint command whose velocity target exceeds the joint's bound and clamped or rejected it (in observe mode: would have).",
+            MOTION,
+            &[T0831],
+        ),
+        "robot.firewall.joint_torque_out_of_envelope" => e(
+            "Joint command torque out of envelope",
+            "The motion firewall found a low-level joint command whose feed-forward torque exceeds the joint's bound and clamped or rejected it (in observe mode: would have).",
+            MOTION,
+            &[T0831],
+        ),
+        "robot.firewall.joint_gain_out_of_envelope" => e(
+            "Joint command gain out of envelope",
+            "The motion firewall found a low-level joint command whose stiffness or damping gain lies outside the joint's range; gains are only ever lowered, a gain below its minimum is rejected (in observe mode: would have).",
+            MOTION,
+            &[T0831],
+        ),
+        "robot.firewall.disabled_motor_energised" => e(
+            "Disabled motor energised",
+            "A low-level joint command energises a motor slot the profile marks as unused (non-zero torque or gain); the motion firewall rejected it (in observe mode: would have).",
+            MOTION,
+            &[T0831, T0855],
+        ),
+        "robot.firewall.crc_invalid" => e(
+            "Joint command integrity check failed",
+            "A low-level joint command arrived with an invalid frame checksum, or unchecked where the channel requires one; the motion firewall rejected it (in observe mode: would have).",
+            MOTION,
+            &[T0855],
+        ),
+        "robot.firewall.joint_rate_violation" => e(
+            "Joint command stream gap",
+            "The gap between two low-level joint commands on a channel exceeded its configured maximum interval; recorded only, the late frame is still decided normally.",
+            MOTION,
+            &[],
+        ),
         _ => return None,
     })
 }

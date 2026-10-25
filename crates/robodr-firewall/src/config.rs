@@ -75,9 +75,8 @@ pub enum FailBehaviour {
 /// What happens when the firewall **itself** fails (an internal invariant
 /// check trips, or the gateway cannot run `check` in time).
 ///
-/// The design document leaves this open ("Hareket Güvenlik Duvarı arızasında
-/// varsayılan davranış ne olmalı?") and assigns the decision to the OEM per
-/// robot model. It is therefore exposed as configuration. The **default is
+/// The right behaviour is a safety-case decision that belongs to the OEM per
+/// robot model, so it is exposed as configuration. The **default is
 /// [`FaultPolicy::FailSafe`]**: a component that cannot vouch for a command
 /// does not forward it. An OEM may choose `FailOpen` where an unexpected stop
 /// is the greater hazard (e.g. a vehicle at speed among people with no other

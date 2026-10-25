@@ -82,6 +82,13 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     "robot.firewall.limited_acceleration",
     "robot.firewall.limited_jerk",
     "robot.firewall.events_dropped",
+    "robot.firewall.joint_position_out_of_envelope",
+    "robot.firewall.joint_velocity_out_of_envelope",
+    "robot.firewall.joint_torque_out_of_envelope",
+    "robot.firewall.joint_gain_out_of_envelope",
+    "robot.firewall.disabled_motor_energised",
+    "robot.firewall.crc_invalid",
+    "robot.firewall.joint_rate_violation",
     // robodr-motion consistency monitor
     "robot.motion.feedback_divergence",
     "robot.motion.uncommanded_motion",

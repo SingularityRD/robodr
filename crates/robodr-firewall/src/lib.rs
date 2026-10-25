@@ -138,9 +138,10 @@
 //! `Mode::Observe` (see [`policy_mode`]), so a responder never acts on them.
 //!
 //! ### Firewall failure ([`FaultPolicy`], per platform)
-//! Open question in the design doc, so it is configuration: `FailSafe`
+//! An OEM safety-case decision, so it is configuration: `FailSafe`
 //! (**default**) rejects with a zero substitute (never hold — state may be
-//! bad); `FailOpen` forwards the original and records the fault. Inside the
+//! bad), refused for a humanoid joint channel, where `FailHold` applies;
+//! `FailOpen` forwards the original and records the fault. Inside the
 //! library a fault is a failed post-condition check (finite, within limits);
 //! the gateway should call [`Firewall::fault_verdict`] if it cannot run
 //! `check` within its deadline. A gateway **crash** is outside this crate: the
