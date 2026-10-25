@@ -8,6 +8,7 @@ violated output invariant (documented at the top of its harness file).
 |---|---|---|---|
 | `parse_datagram` | robodr-rtps | one RTPS datagram to `parse_datagram` | `crates/robodr-rtps/tests/mutation_fuzz.rs` |
 | `pcap_reader` | robodr-capture | a pcap/pcapng file to `CaptureFile` + `rtps_datagrams` + RTPS parser | `crates/robodr-capture/tests/fuzz_smoke.rs` |
+| `cdr_unitree` | robodr-cdr | a selector byte + payload to the Unitree DDS decoders (`decode_unitree` / `decode_payload`), the `unitree_legacy` UDP decoders, and the bounded API-parameter JSON reader | `crates/robodr-cdr/tests/fuzz_smoke.rs` |
 | `capture_reassembly` | robodr-capture | a framed train of link-layer frames to `decode_frame`, `Reassembler` (small limits) and the pipeline | same |
 | `blackbox_segments` | robodr-blackbox | a flattened recorder directory to `scan_frames`, `Record::decode_body`, `verify_segments`, `verify_dir` (temp dir), `Bundle::from_bytes`, checkpoint/cursor/ack JSON | `crates/robodr-blackbox/tests/fuzz_smoke.rs` |
 | `ocsf_parse_and_validate` | robodr-ocsf | a finding to `parse_and_validate`, re-encode, Kafka record | `crates/robodr-ocsf/tests/fuzz_smoke.rs` |
@@ -105,6 +106,11 @@ All seeds are SYNTHETIC (no real robot data):
 * `pcap_reader/`: an Ethernet pcap (SPDP + SEDP), a nanosecond Linux-SLL
   pcap of a fragmented SEDP datagram, a two-interface pcapng (EPB + SPB),
   built with `robodr_capture::synth` + `PcapWriter` from the RTPS fixtures.
+* `cdr_unitree/`: a selector byte plus one synthetic payload each — a go
+  `WirelessController_`, an `unitree_api` `Request_` (sport `Move`), a bare
+  `SetVelocity` parameter JSON, and a legacy `HighCmd` UDP frame. Built from
+  the crate's test encoder by the `regenerate_seeds` test in
+  `crates/robodr-cdr/tests/fuzz_smoke.rs` (run with `--ignored` to refresh).
 * `capture_reassembly/`: the harness's framed format (see its doc) with IPv4
   fragments, reversed IPv6 fragments, a QinQ frame and an SLL2 mix with a
   reassembly timeout.

@@ -81,6 +81,55 @@ impl Enc {
         self.u32(v as u32);
     }
 
+    pub fn u16(&mut self, v: u16) {
+        self.align(2);
+        let b = if self.big {
+            v.to_be_bytes()
+        } else {
+            v.to_le_bytes()
+        };
+        self.body.extend_from_slice(&b);
+    }
+
+    pub fn i16(&mut self, v: i16) {
+        self.u16(v as u16);
+    }
+
+    pub fn f32(&mut self, v: f32) {
+        self.align(4);
+        let b = if self.big {
+            v.to_be_bytes()
+        } else {
+            v.to_le_bytes()
+        };
+        self.body.extend_from_slice(&b);
+    }
+
+    pub fn i64(&mut self, v: i64) {
+        self.align(8);
+        let b = if self.big {
+            v.to_be_bytes()
+        } else {
+            v.to_le_bytes()
+        };
+        self.body.extend_from_slice(&b);
+    }
+
+    /// A raw octet with no alignment (`uint8` / `boolean` / `int8`).
+    pub fn byte(&mut self, v: u8) {
+        self.body.push(v);
+    }
+
+    pub fn bytes(&mut self, v: &[u8]) {
+        self.body.extend_from_slice(v);
+    }
+
+    /// A `sequence<octet>` / `sequence<int8>`: length then the bytes.
+    pub fn octet_seq(&mut self, v: &[u8]) {
+        self.u32(v.len() as u32);
+        self.body.extend_from_slice(v);
+    }
+
     pub fn f64(&mut self, v: f64) {
         self.align(8);
         let b = if self.big {
