@@ -53,7 +53,7 @@ paketleme (Reed-Solomon), reproducible build + SBOM + minisign release pipeline'
 | R4 | Konsol / filo yönetimi / çok kiracılık yok (`robodr-fleet` yok); güncellemeler robot başına `install-bundle.sh`, dpkg ile hiç denenmedi | `docs/ROADMAP.md:110-132`, `packaging/README.md:205-208` |
 | R5 | Anahtarlar düz 0600 JSON dosya; dağıtım/rotasyon/iptal elle | `crates/robodr-blackbox/README.md:670-704` |
 | R6 | CI GitHub'da **hiç koşmadı** (org billing); release workflow'u hiç tetiklenmedi; `MINISIGN_SECRET_KEY` yok; `robodr-anchor-receiver` `.deb` zorunlu listesinde değil | `docs/BUILD.md:536-557`, `.github/workflows/release.yml` |
-| R7 | Ticari model yok: her şey Apache-2.0 (ROADMAP "response engine commercial" diyor → çelişki); lisans anahtarı/aktivasyon yok; ihracat kontrol (Wassenaar 5A2) sınıflandırması yok; Pulsar GPL-2.0 eBPF hukuki incelemesi yok | `Cargo.toml:34`, `docs/SECURE-DELIVERY.md` §11 |
+| R7 | Ticari model yok: her şey Apache-2.0 (karar: tescilliye geçecek, D9 / S1); lisans anahtarı/aktivasyon yok; ihracat kontrol (Wassenaar 5A2) sınıflandırması yok; Pulsar GPL-2.0 eBPF hukuki incelemesi yok | `Cargo.toml:34`, `docs/SECURE-DELIVERY.md` §11 |
 | R8 | Elle yazılmış kritik bileşenler: SHA-256/HMAC, Reed-Solomon, Kafka wire istemcisi (API v≤8), HTTP/1.1 sunucusu, JSON-Schema eşleyici | `crates/robodr-blackbox/src/crypto.rs`, `crates/robodr-export/src/kafka/`, `crates/robodr-agentd/src/control/` |
 | R9 | Tutarsızlıklar: iki aksiyon listesi çelişiyor (`responder::autosecops` → `record_evidence` var/`rollback_config` yok; kontrol düzlemi tersi); `panic = "abort"` → her panik daemon'ı öldürür; çok sayıda bayat doküman | `crates/robodr-responder/src/autosecops.rs:74-110` vs `crates/robodr-agentd/src/control/api.rs:40-63` |
 | R10 | Müşteri dokümanı yok: kurulum/quick-start, destek matrisi, EULA, SLA; `robodr-maintainers@invalid`, `singularityrd.example` yer tutucuları; `robodr-threat-forward` README/man sayfası yok | `packaging/build-deb.sh:65`, `docs/contracts/robot-edr-finding.schema.json` |
@@ -132,7 +132,7 @@ Eski AutoSecOps varsayımları şuralarda gömülü (S1'de temizlenecek):
 | D6 Onay | Robot aksiyonları **asla otonom değil**; `requires_approval=True` UDF'ler; `safe_pause`/`rollback_config` için **iki-kişi kuralı** (AutoSecOps1'e eklenecek) | Fiziksel güvenlik |
 | D7 HTTP/Kafka kodu | Elle yazılmış HTTP sunucusu → `rustls` + minimal, fuzz'lanmış HTTP katmanı (veya `hyper` değerlendirmesi, MSRV/air-gap uyumlu); kendi SHA-256 → `sha2`; Kafka istemcisi TLS/SASL ekle **veya** opsiyonel ihracı `rdkafka`'ya taşı (S0'da karar) | Satılan üründe denetlenmiş kütüphaneler |
 | D8 Lisanslama | AutoSecOps1 lisans token'ına `robot_edr` entitlement + `max_robots` claim; ajan tarafında lisans kontrolü **yok** (robot asla lisans yüzünden körleşmez), sayım SOC'ta | Güvenlik ürünü lisans bitince sessizce kapanmamalı |
-| D9 RoboDR lisansı | Açık çekirdek (sensör/parsers Apache-2.0) + tescilli/kontrollü repo (executor, firewall gateway, SOC modülü) — hukuki onaylar alındı, ürün kararı kaldı | ROADMAP ile tutarlılık, ihracat kontrol |
+| D9 RoboDR lisansı | ✅ **Karar (2026-10-25): RoboDR Apache-2.0 olmayacak; tamamen tescilli** (AutoSecOps1 ile aynı "SingularityRD Proprietary License" modeli). İstisna: Pulsar'dan gelen eBPF prob kaynakları GPL-2.0 kalır (kaynak teklifiyle dağıtılır); vendored Pulsar userspace kodu kendi Apache-2.0 lisansını ve NOTICE'ını korur | Ticari model, ihracat kontrol |
 
 ---
 
@@ -150,11 +150,12 @@ sprint, AC'leri karşılanmadan kapanmaz.
   Kalan: kararları ADR olarak kaydet (`docs/adr/0001-legal-clearance.md`: kapsam,
   tarih, belge referansı — belgenin kendisi değil), ihracat sınıflandırmasının
   getirdiği teslim koşullarını (ör. ülke kısıtları, beyanlar) S13 ticari pakete aktar.
-- **L/ürün:** RoboDR açık-çekirdek/tescilli repo ayrımı (D9) — hukuki engel kalmadı,
-  ürün/ticari karar olarak S0'da netleştir.
 - **L/ürün:** GA destek matrisi kararı (ROS 2 Humble+Jazzy; Fast DDS 2.14+, Cyclone 0.10+;
   Ubuntu 22.04/24.04, Debian 12; amd64+arm64; Zenoh = "algılanır, decode edilmez").
-  İlk 2 tasarım-ortağı robot platformu seçimi (ör. TurtleBot4/Nav2 AMR + bir ros2_control kol).
+  İlk tasarım-ortağı platformlar: **Unitree Go2 EDU** (dört ayaklı) + **Unitree G1 EDU**
+  (insansı) — bkz. §3a; ayrıca bir Nav2 AMR (genel ROS 2 referansı). Destek matrisine
+  Unitree'nin ROS 2 Foxy/Ubuntu 20.04 + Humble/22.04 eşleşmesi ve robot üstü Jetson
+  (L4T) çekirdeği eklenir; Foxy EOL olduğu için yalnız ağ-pasif (agentless) mod.
 - **D:** GitHub Actions billing'i aç; RoboDR `ci.yml`'nin ilk gerçek koşusu yeşil;
   AutoSecOps1 CI'sının (python, frontend, integration, migrations) yeşil koşusu.
   **AC:** iki repo `main`'de yeşil CI rozeti.
@@ -162,8 +163,20 @@ sprint, AC'leri karşılanmadan kapanmaz.
 - **D:** Ortak lab: AutoSecOps1 docker-compose staging + ROS 2 Gazebo robot + gerçek
   bir AMR; `just cluster` ile tekrarlanabilir kurulum.
 
-### Sprint 1 — Eski entegrasyonu sök, sözleşme v2
+### Sprint 1 — Eski entegrasyonu sök, sözleşme v2, tescilli lisansa geçiş
 
+- **L/R:** Tescilli lisansa geçiş (D9): kök `LICENSE` → SingularityRD Proprietary
+  License (hukukun onayladığı metin; AutoSecOps1'deki metin şablon), workspace
+  `license = "LicenseRef-Proprietary"` + her crate `publish = false`; `deny.toml`
+  ([licenses] `private = { ignore = true }`, kendi crate'lerimizi muaf tut, üçüncü taraf
+  allowlist'i aynen); `LICENSES/LICENSE-GPL-2.0` yalnız eBPF probları için kalır,
+  `LICENSES/LICENSE-APACHE-2.0` vendored Pulsar için kalır; README/BUILD.md lisans
+  bölümleri, `packaging/deb` copyright dosyası, `.deb` `Section`/lisans alanı; GitHub
+  repo görünürlüğü **private** (açıksa, daha önce Apache-2.0 ile yayımlanmış
+  commit'lerin lisansı geri alınamaz — hukuka not).
+  **AC:** `cargo deny check licenses` yeşil; `rg -n "Apache-2.0" --glob '!vendor/**'
+  --glob '!LICENSES/**'` yalnız üçüncü taraf/Pulsar bağlamında; paket metadata'sı
+  tescilli.
 - **R:** `robodr-responder::autosecops` → `robodr-responder::actions` (satıcıdan
   bağımsız katalog; iki listedeki çelişkiyi tek listeyle çöz: `restrict_motion,
   quarantine_node, isolate_network, record_evidence, safe_pause, request_safe_state,
@@ -383,6 +396,51 @@ sprint, AC'leri karşılanmadan kapanmaz.
 
 ---
 
+## 3a. Unitree platform paketi (Go2 / B2 / G1 / H1)
+
+**Kısa cevap: evet, desteklenebilir — ve güçlü bir satış senaryosu**, ama bugünkü kod
+yalnızca bir kısmını kutudan çıkar çıkmaz yapar. Unitree'nin SDK2'si ve `unitree_ros2`
+paketi **Cyclone DDS 0.10.x** üzerinde çalışır (Go2, B2, H1, G1); RoboDR'ın RTPS
+ayrıştırıcısı Cyclone trafiğini zaten gerçek yakalamalarla doğrulanmış şekilde okuyor.
+
+| Yetenek | Bugün | Unitree için gereken |
+|---|---|---|
+| DDS grafiği, rogue participant / bilinmeyen yayıncı tespiti (`rt/lowcmd` vb.) | ✅ Protokol düzeyinde çalışmalı (Cyclone) — **Unitree trafiğiyle doğrulanmadı** | Gerçek Go2/G1 yakalamaları, profil öğrenme |
+| Hareket içeriğini okuma (CDR) | ❌ Yalnız standart ROS tipleri (Twist, JointTrajectory, …) | Unitree IDL decoder'ları: `unitree_go::msg::dds_::LowCmd_/LowState_/SportModeState_`, `unitree_hg::msg::dds_::LowCmd_/LowState_` (G1/H1-2), `unitree_api::msg::dds_::Request_` (sport API, JSON parametreli) — tip adları lab'da doğrulanacak |
+| Motion Firewall zarfı | ❌ Twist/trajectory zarfı | Eklem başına q/dq/tau/kp/kd sınırları, LowCmd CRC kontrolü, sport API `Move` hız sınırları; 500 Hz–1 kHz düşük seviye döngü için gecikme bütçesi |
+| Host izleme (Pulsar) | Robot üstü Linux gerekir | Yalnız **EDU** modellerinde erişilebilen geliştirme bilgisayarı (Jetson, arm64); L4T çekirdeğinde BTF/eBPF doğrulanmalı. Ana hareket kontrolcüsü kapalı → kurulamaz |
+| Agentless mod | Tasarım var (Sentinel Box) | Robotun 192.168.123.0/24 Ethernet'ine port-mirror / tap ile pasif sensör — firmware'e dokunmadan; Air/Pro gibi kapalı modeller için tek yol |
+| Yanıt | ❌ | `quarantine_node`/`isolate_network` (dış kutuda nftables); `restrict_motion` sport API üzerinden; **insansıda `safe_pause` = düşme riski** → G1/H1'de GA'da yürütülmez, yalnız plan |
+
+**Unitree'ye özgü tehditler (satış argümanı):** UniPwn (Eyl 2025) — BLE Wi-Fi
+yapılandırma servisinde sabit anahtarlar ve komut enjeksiyonu (CVE-2025-35027) ile
+root, solucan gibi yayılabiliyor (Go2, B2, G1, H1); G1'in kullanıcıya bildirmeden dış
+sunuculara telemetri gönderdiği raporlandı; Go1'de daha önce uzaktan tünel arka kapısı
+bulunmuştu. RoboDR'ın karşılığı: `wpa_supplicant_restart.sh` altından beklenmeyen kabuk
+(Pulsar kuralı), robotun beklenmeyen dış bağlantıları (host + ağ sensörü), yeni DDS
+katılımcısı / `rt/lowcmd`'ye yetkisiz yazıcı, imzalı kara kutu ile adli kanıt.
+
+**Unitree işleri sprint planına:**
+- **S0:** Go2 EDU + G1 EDU tedarik; firmware sürümlerini sabitle; ağ topolojisi ve
+  onboard bilgisayar OS/çekirdek envanteri; Unitree kullanım şartları/garanti etkisi
+  değerlendirmesi (robot üstü ajan kurulumu).
+- **S2:** Gerçek Go2/G1 yakalamaları (`fixtures/captures/unitree/`, sentetik
+  kimliklerle); `robodr-cdr`'a Unitree decoder'ları + vektör testleri + fuzz.
+- **S3:** Unitree profil şablonları (`config/profile.unitree-go2.example.json`,
+  `…-g1…`), Unitree kural paketi (`rules/robodr/unitree.toml`: BLE/wpa_supplicant
+  kabuk, dış telemetri, bilinmeyen `rt/lowcmd` yazıcısı); AutoSecOps1'de "Unitree"
+  workflow şablonu ve ikon.
+- **S7:** Agentless sensör kutusu (arm64 mini PC + tap) referans imajı — Unitree için
+  varsayılan kurulum modu.
+- **S8:** LowCmd eklem zarfı + sport API hız zarfı; firewall gateway'in Unitree
+  döngü hızında gecikme ölçümü; `restrict_motion` sport API adaptörü.
+- **S11:** Go2 ve G1 üzerinde 72 saat soak, UniPwn benzeri saldırı senaryolarıyla
+  red-team (izole lab, yetkili cihazlarda).
+- **Kapsam dışı (GA):** Go1 (DDS değil, eski UDP SDK), Air/Pro üzerine ajan kurulumu,
+  insansıda otomatik güvenli duruş, Go2 uygulama kanalı (WebRTC) içeriğinin çözümü.
+
+---
+
 ## 4. GA çıkış kriterleri (Definition of Done)
 
 **Fonksiyonel**
@@ -391,6 +449,8 @@ sprint, AC'leri karşılanmadan kapanmaz.
 - [ ] `restrict_motion`, `quarantine_node`, `isolate_network`, `record_evidence` gerçek robotta uygulanır, doğrulanır, TTL/elle geri alınır; `safe_pause` OEM-onaylı politikada çalışır.
 - [ ] Hiçbir robot aksiyonu onaysız gönderilemez; iki-kişi kuralı uygulanır.
 - [ ] Robot onboarding, anahtar rotasyonu/iptali, profil kilitleme, güncelleme/geri alma UI'dan yönetilir.
+- [ ] Unitree Go2 EDU ve G1 EDU: tespit + kanıt + ağ tabanlı containment gerçek cihazda doğrulandı (agentless ve EDU ajan modları).
+- [ ] RoboDR tescilli lisansla dağıtılıyor; üçüncü taraf bildirimleri ve eBPF GPL-2.0 kaynak teklifi pakette.
 
 **Kalite**
 - [ ] İki repoda CI yeşil (lint, typecheck, unit, integration, contract test, fuzz-nightly, migrations).
