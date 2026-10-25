@@ -273,17 +273,21 @@ checked separately.
 
 ## Licensing
 
-- Rust crates: `license = "Apache-2.0"` (`[workspace.package]`), a valid SPDX
-  expression for cargo, cargo-deny and the SBOM.
-- eBPF probe C sources (`*.bpf.c`): GPL-2.0-only, declared per file with an
-  `SPDX-License-Identifier` header. They are separate kernel programs, not Rust
-  crates. See `LICENSE` and `LICENSES/`.
+- RoboDR crates: `license = "LicenseRef-Proprietary"` (`[workspace.package]`;
+  `LICENSE` is the SingularityRD proprietary license). Every crate is
+  `publish = false`, so cargo-deny ignores our own crates
+  (`[licenses.private]`) and checks only third-party ones.
+- eBPF probe C sources (`*.bpf.c`, all from Pulsar): GPL-2.0-only, declared per
+  file with an `SPDX-License-Identifier` header. They are separate kernel
+  programs, not Rust crates; the corresponding source is offered with every
+  release (`LICENSE`, `LICENSES/`).
 - Pulsar uses the free-text string "Apache-2.0 WITH BPF probes exception under
   GPL-2.0", which is not SPDX; `deny.toml` clarifies Pulsar's Rust crates as
   Apache-2.0 so cargo-deny can evaluate them, and the fallback SBOM records the
   raw string as a named license.
-- `deny.toml` allows only permissive licenses for userspace crates; any
-  GPL/LGPL/AGPL (and MPL-2.0 without a reviewed exception) fails CI.
+- `deny.toml` allows only permissive licenses for third-party userspace
+  crates; any GPL/LGPL/AGPL (and MPL-2.0 without a reviewed exception) fails
+  CI, which keeps proprietary distribution of the linked binaries possible.
 
 ## CI jobs
 

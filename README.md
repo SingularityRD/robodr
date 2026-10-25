@@ -259,5 +259,7 @@ cargo build -p robodr-sensor-ros2 -p robodr-pulsard
 
 ## License
 
-Apache-2.0 for userspace, GPL-2.0 for any eBPF probe code, matching Pulsar. See
-[`LICENSE`](LICENSE).
+RoboDR is proprietary software of SingularityRD; use requires a written license
+agreement. See [`LICENSE`](LICENSE). Third-party components (Pulsar: Apache-2.0
+userspace, GPL-2.0 eBPF probes; Rust dependencies: see the release SBOM) keep
+their own licenses.

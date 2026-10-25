@@ -28,10 +28,11 @@ exclude = ["vendor"]
 [workspace.package]
 version = "0.1.0-alpha.1"
 edition = "2021"
-# Valid SPDX for every Rust (userspace) crate in this workspace. eBPF probe
-# sources (`*.bpf.c`) are GPL-2.0 and are not Rust crates; see LICENSE and
-# docs/BUILD.md ("Licensing"). cargo-deny (deny.toml) rejects GPL in userspace.
-license = "Apache-2.0"
+# RoboDR is proprietary (see LICENSE). `LicenseRef-Proprietary` is a valid
+# SPDX expression for cargo metadata and the SBOM; every crate is
+# `publish = false`, so cargo-deny skips our own crates ([licenses.private])
+# and still checks every third-party dependency against deny.toml.
+license = "LicenseRef-Proprietary"
 # MSRV: 1.87, because `u*::is_multiple_of` (stable since 1.87) is used in
 # library code of robodr-capture, -rtps, -blackbox and -commission, and in
 # tests/examples of -firewall, -motion and -ros2-pipeline. Pulsar's own floor

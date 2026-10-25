@@ -11,7 +11,7 @@ name = "robodr-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
-license = "Apache-2.0"
+license = "LicenseRef-Proprietary"
 
 [package.metadata]
 cargo-fuzz = true

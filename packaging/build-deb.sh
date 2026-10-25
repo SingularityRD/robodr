@@ -164,6 +164,10 @@ for f in docs/OPERATIONS.md SECURITY.md CHANGELOG.md README.md packaging/README.
     esac
 done
 install -m 0644 "$root/LICENSE" "$doc/copyright"
+install -d "$doc/licenses"
+for f in "$root"/LICENSES/*; do
+    install -m 0644 "$f" "$doc/licenses/"
+done
 for f in "$root"/config/*.example*; do
     install -m 0644 "$f" "$doc/examples/"
 done
