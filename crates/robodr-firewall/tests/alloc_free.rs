@@ -208,73 +208,173 @@ fn counter_detects_allocations() {
     assert!(allocs() > before);
 }
 
-/// Drive every joint-frame path: pass, every clamp, every rejection
-/// (including too-early, CRC, energised unused slot, gains below minimum,
-/// clock regression, foreign sources), hold and damping substitutes, a slow
-/// stream, gateway faults and a full event buffer.
-fn exercise_joint(f: &mut JFx, rounds: u64) -> usize {
+/// Drive every joint-frame path: pass, every clamp (including a stepped
+/// position target), every rejection (including too-early, CRC, energised
+/// unused slot, mode-off slot carrying gains, gains below minimum, step and
+/// PD-torque bounds, a limp frame, a pinned-mode mismatch, clock
+/// regression, foreign sources), hold and damping substitutes (and their
+/// suppression inside the emission interval), a humanoid hold outliving
+/// `max_hold_ns`, a slow stream, gateway faults and a full event buffer.
+/// Spacing of the joint commands of one round (the test channel's minimum
+/// interval).
+const STEP_NS: u64 = 100_000;
+
+/// Slots of the `reached` array for limit reasons (after the reject reasons).
+const STEP_LIMITED: usize = 61;
+const PD_LIMITED: usize = 62;
+const Q_LIMITED: usize = 63;
+
+fn exercise_joint(f: &mut JFx, rounds: u64) -> (usize, [bool; 64]) {
     let mut seen = 0usize;
+    // Reject reasons reached (by discriminant); a fixed array, no heap.
+    let mut reached = [false; 64];
     let mut now = T0;
     let slots = f.slots;
+    // Every frame carries the channel's pinned `mode_pr`.
+    let pin = |mut c: JointCommand| {
+        c.frame.mode_pr = Some(0);
+        c
+    };
     for i in 0..rounds {
         now += 2 * MS;
         let s = now;
-        let mut crc_bad = f.nominal(s + 1);
+        let mut crc_bad = pin(f.nominal(s + 1));
         crc_bad.frame.crc_ok = Some(false);
-        let mut crc_none = f.nominal(s + 2);
+        let mut crc_none = pin(f.nominal(s + 2));
         crc_none.frame.crc_ok = None;
-        let mut foreign = f.nominal(s + 3);
+        let mut foreign = pin(f.nominal(s + 3));
         foreign.source = SourceId::UNKNOWN;
-        let mut unauth = f.nominal(s + 3);
+        let mut unauth = pin(f.nominal(s + 3));
         unauth.source = f.nav;
-        let mut unknown_ch = f.nominal(s + 3);
+        let mut unknown_ch = pin(f.nominal(s + 3));
         unknown_ch.channel = ChannelId(60);
-        let clamps = MotorCmd::enabled(1.5, 15.0, 30.0, 150.0, 7.0);
+        let mut wrong_mode = f.nominal(s + 3);
+        wrong_mode.frame.mode_pr = Some(1);
+        // q stays at the nominal 0.2 so that a tight step bound does not
+        // turn the clamps into a step rejection.
+        let clamps = MotorCmd::enabled(0.2, 15.0, 30.0, 150.0, 7.0);
+        let q_clamp = MotorCmd::enabled(1.5, 1.0, 2.0, 50.0, 1.0);
         let unused = MotorCmd::enabled(0.0, 0.0, 1.0, 0.0, 0.0);
+        let loaded_off = MotorCmd {
+            kp: 3.0,
+            ..MotorCmd::OFF
+        };
         let hard = MotorCmd::enabled(0.0, 0.0, 1e6, 10.0, 0.0);
+        let stepped = MotorCmd::enabled(0.27, 1.0, 2.0, 50.0, 1.0);
+        let jump = MotorCmd::enabled(0.9, 1.0, 2.0, 50.0, 1.0);
+        let free = MotorCmd::enabled(0.0, 0.0, 0.0, 0.0, 1.0);
+        // From the stepped target 0.25: within the hard step bound
+        // (2 × 0.05 rad), but at kp 100 it asks 9 N·m, beyond the hard PD
+        // bound (2 × 3 N·m).
+        let pd_far = MotorCmd::enabled(0.34, 1.0, 2.0, 100.0, 1.0);
         let nan = MotorCmd {
             q: f64::NAN,
             ..good()
         };
+        let limp = |_| MotorCmd::enabled(0.0, 0.0, 0.0, 0.0, 0.0);
         let t = now + MS;
+        // (command, keep its stamp, slot index): slot k is checked at
+        // `t + k·STEP_NS`, one emission interval apart, so each command
+        // reaches its own row (not `RateLimited`) and each rejection may
+        // emit; two commands share slot 3 so the second one's substitute is
+        // suppressed (emission interval). Unless kept, a command's stamp is
+        // made fresh and increasing.
         let cmds = [
-            (f.nominal(s), now),                        // pass
-            (f.with_slot(s + 4, 0, clamps), t),         // every clamp
-            (crc_bad, t),                               // crc invalid
-            (crc_none, t),                              // crc missing
-            (f.with_slot(s + 5, slots - 1, unused), t), // unused slot
-            (f.with_slot(s + 6, 1, MotorCmd::OFF), t),  // kp_min
-            (f.with_slot(s + 7, 2, hard), t),           // hard
-            (f.with_slot(s + 8, 2, nan), t),            // NaN
-            (f.nominal(s.saturating_sub(100 * MS)), t), // stale
-            (f.nominal(s + 100 * MS), t),               // future
-            (f.nominal(s), t),                          // replay
-            (foreign, t),                               // unknown source
-            (unauth, t),                                // unauthorised
-            (unknown_ch, t),                            // unknown channel
+            (pin(f.nominal(s)), false, 0),                      // pass
+            (pin(f.with_slot(s, 0, clamps)), false, 1),         // every clamp
+            (crc_bad, false, 2),                                // crc invalid
+            (crc_none, false, 2),                               // crc missing, suppressed
+            (pin(f.with_slot(s, slots - 1, unused)), false, 3), // unused slot
+            (pin(f.with_slot(s, 1, loaded_off)), false, 4),     // mode off, loaded
+            (pin(f.with_slot(s, 1, MotorCmd::OFF)), false, 5),  // kp_min
+            (pin(f.with_slot(s, 2, hard)), false, 6),           // hard
+            (pin(f.with_slot(s, 2, nan)), false, 7),            // NaN
             (
-                JointCommand::new(f.ctl, f.low, s + 9, jframe(3, 3, |_| good())),
-                t,
+                pin(JointCommand::new(
+                    f.ctl,
+                    f.low,
+                    s,
+                    jframe(slots, f.active, limp),
+                )),
+                false,
+                8,
+            ), // limp frame
+            (wrong_mode, false, 9),                             // pinned mode
+            (pin(f.nominal(s.saturating_sub(100 * MS))), true, 10), // stale
+            (pin(f.nominal(s + 100 * MS)), true, 11),           // future
+            (pin(f.nominal(s)), true, 12),                      // replay
+            (foreign, false, 13),                               // unknown source
+            (unauth, false, 14),                                // unauthorised
+            (unknown_ch, false, 15),                            // unknown channel
+            (
+                JointCommand::new(f.ctl, f.low, s, jframe(3, 3, |_| good())),
+                false,
+                16,
             ), // shape
             (
-                JointCommand::new(f.nav, f.base, s + 9, jframe(3, 3, |_| good())),
-                t,
+                JointCommand::new(f.nav, f.base, s, jframe(3, 3, |_| good())),
+                false,
+                17,
             ), // kind
+            // Step bounds. `free` (slot 0 holding no position) clears the
+            // slot's previous target whatever happened before (a damping
+            // substitute also clears it); the nominal frame then sets it to
+            // 0.2.
+            (pin(f.with_slot(s, 0, free)), false, 18), // reset
+            (pin(f.nominal(s)), false, 19),            // q_prev = 0.2
+            (pin(f.with_slot(s, 0, stepped)), false, 20), // step / PD clamp
+            (pin(f.with_slot(s, 0, pd_far)), false, 21), // PD reject
+            (pin(f.with_slot(s, 0, free)), false, 22), // reset
+            (pin(f.nominal(s)), false, 23),            // q_prev = 0.2
+            (pin(f.with_slot(s, 0, jump)), false, 24), // step reject
+            (pin(f.with_slot(s, 0, free)), false, 25), // reset
+            (pin(f.with_slot(s, 0, q_clamp)), false, 26), // q clamp, no step
+            (pin(f.with_slot(s, 0, free)), false, 27), // reset
+            (pin(f.nominal(s)), false, 28),            // q_prev = 0.2
         ];
-        for (c, t) in &cmds {
-            if f.fw.check_joint(c, *t).output().is_some() {
+        for (j, (c, keep, k)) in cmds.iter().enumerate() {
+            let at = t + k * STEP_NS;
+            let mut c = *c;
+            if !keep {
+                c.stamp_ns = at - 100_000 + j as u64;
+            }
+            let v = f.fw.check_joint(&c, at);
+            if let Some(r) = v.reject_reason() {
+                reached[r as usize] = true;
+            }
+            if let JointVerdict::Limited { reasons, .. } = v {
+                reached[STEP_LIMITED] |= reasons.contains(JointLimitReasons::STEP);
+                reached[PD_LIMITED] |= reasons.contains(JointLimitReasons::PD_TORQUE);
+                reached[Q_LIMITED] |= reasons.contains(JointLimitReasons::POSITION);
+            }
+            if v.output().is_some() {
                 seen += 1;
             }
         }
-        // Too early (min interval), then a clock regression, then a fault.
-        f.fw.check_joint(&f.nominal(s + 10), t + 100_000);
-        f.fw.check_joint(&f.nominal(s + 11), now);
-        f.fw.joint_fault_verdict(&f.nominal(s + 12), t + 100_000);
+        let t = t + 29 * STEP_NS;
+        // Too early (min interval), a slightly future-stamped frame, then a
+        // clock regression, then a fault.
+        f.fw.check_joint(&pin(f.nominal(t - 20)), t);
+        let v = f.fw.check_joint(&pin(f.nominal(t - 10)), t + STEP_NS / 2);
+        if let Some(r) = v.reject_reason() {
+            reached[r as usize] = true;
+        }
+        f.fw.check_joint(&pin(f.nominal(t + 2 * MS + 500_000)), t + 2 * MS);
+        // One emission interval later: a rejection that holds.
+        f.fw.check_joint(&crc_bad, t + 3 * MS);
+        let v = f.fw.check_joint(&pin(f.nominal(s + 11)), now);
+        if let Some(r) = v.reject_reason() {
+            reached[r as usize] = true;
+        }
+        f.fw.joint_fault_verdict(&pin(f.nominal(s + 12)), t + 100_000);
         // A twist on the joint channel through `check`.
         f.fw.check(&twist_cmd(f.ctl, f.low, s, vx(0.1)), t + 100_000);
-        // Every 8th round a long gap (slow stream; hold expiry).
+        now = t + 3 * MS;
+        // Every 8th round a long gap (slow stream; hold expiry / humanoid
+        // hold past max_hold_ns) with rejections across it.
         if i % 8 == 7 {
             now += 200 * MS;
+            f.fw.check_joint(&crc_bad, now);
         }
         if i % 4 == 3 {
             let mut drained = 0usize;
@@ -282,15 +382,30 @@ fn exercise_joint(f: &mut JFx, rounds: u64) -> usize {
             seen += drained;
         }
     }
-    seen
+    (seen, reached)
 }
 
 #[test]
 fn check_joint_never_allocates() {
-    let rate = |s: &mut JointChannelSpec| {
-        s.rate = Some(JointRate::around(500.0));
-        for m in s.motors.iter_mut().filter(|m| m.enabled) {
-            m.kp_min = 5.0;
+    // `tight`: step / PD bounds that bind and gain minimums of zero (so the
+    // limp-frame rule is reachable); otherwise wide steps (so position
+    // clamps happen) and kp_min = 5.
+    let config = |tight: bool| {
+        move |s: &mut JointChannelSpec| {
+            s.rate = Some(JointRate {
+                expected_hz: 500.0,
+                min_interval_ns: STEP_NS,
+                max_interval_ns: 4 * MS,
+            });
+            s.pinned_mode_pr = Some(0);
+            for m in s.motors.iter_mut().filter(|m| m.enabled) {
+                if tight {
+                    m.max_dq_step = Some(0.05);
+                    m.tau_pd_max = Some(3.0);
+                } else {
+                    m.kp_min = 5.0;
+                }
+            }
         }
     };
     let small = |pf: PlatformConfig| PlatformConfig {
@@ -300,9 +415,16 @@ fn check_joint_never_allocates() {
         ..pf
     };
     let cases = [
-        (small(humanoid()), true, 35, 29),
-        (small(humanoid()), true, 20, 12),
-        (small(quadruped(FailBehaviour::ZeroVelocity)), true, 20, 12),
+        (small(humanoid()), true, 35, 29, false),
+        (small(humanoid()), true, 35, 29, true),
+        (small(humanoid()), true, 20, 12, false),
+        (
+            small(quadruped(FailBehaviour::ZeroVelocity)),
+            true,
+            20,
+            12,
+            true,
+        ),
         (
             small(quadruped(FailBehaviour::HoldLast {
                 max_hold_ns: 50 * MS,
@@ -310,36 +432,80 @@ fn check_joint_never_allocates() {
             true,
             12,
             12,
+            false,
         ),
         (
             small(PlatformConfig {
                 fault_policy: FaultPolicy::FailOpen,
-                ..humanoid()
+                ..quadruped(FailBehaviour::ZeroVelocity)
             }),
             true,
-            35,
-            35,
+            20,
+            20,
+            true,
         ),
         // Observe mode.
-        (small(humanoid()), false, 35, 29),
+        (small(humanoid()), false, 35, 29, false),
     ];
-    for (platform, locked, slots, active) in cases {
+    for (k, (platform, locked, slots, active, tight)) in cases.into_iter().enumerate() {
         // Construction may allocate.
-        let mut f = build_joint(platform, locked, slots, active, rate);
+        let mut f = build_joint(platform, locked, slots, active, config(tight));
         let before = allocs();
-        let seen = exercise_joint(&mut f, 2_000);
+        let (seen, reached) = exercise_joint(&mut f, 2_000);
         let after = allocs();
         assert_eq!(
             after - before,
             0,
-            "check_joint() allocated {} times ({platform:?}, locked {locked}, {slots}/{active})",
+            "check_joint() allocated {} times ({platform:?}, locked {locked}, {slots}/{active}, tight {tight})",
             after - before
         );
         assert!(seen > 0);
         let s = f.fw.stats();
-        assert!(s.checked > 30_000 && s.faults > 0, "{s:?}");
+        assert!(s.checked > 50_000 && s.faults > 0, "{s:?}");
         if locked {
             assert!(s.passed > 0 && s.limited > 0 && s.rejected > 0, "{s:?}");
+            if matches!(platform.fail_behaviour, FailBehaviour::HoldLast { .. }) {
+                assert!(s.joint_hold_episodes > 0, "case {k}: {s:?}");
+            }
+            if platform.morphology == Morphology::Humanoid {
+                assert!(s.joint_holds_exceeded > 0, "case {k}: {s:?}");
+            }
+            use RejectReason::*;
+            let mut want = vec![
+                ClockRegression,
+                UnknownChannel,
+                UnknownSource,
+                UnauthorizedSource,
+                RateLimited,
+                KindMismatch,
+                NonFinite,
+                FutureTimestamp,
+                Stale,
+                OutOfOrder,
+                CrcInvalid,
+                JointTorqueOutOfEnvelope,
+                JointModeInconsistent,
+                JointModePinMismatch,
+            ];
+            if slots > active {
+                want.push(DisabledMotorEnergised);
+            }
+            if tight {
+                want.extend([JointStepOutOfEnvelope, JointPdTorqueOutOfEnvelope]);
+                if platform.morphology == Morphology::Humanoid {
+                    want.push(JointLimpFrame);
+                }
+            } else {
+                want.extend([JointGainBelowMinimum]);
+            }
+            for r in want {
+                assert!(reached[r as usize], "case {k}: {r:?} never reached");
+            }
+            assert!(reached[Q_LIMITED], "case {k}: no position clamp");
+            if tight {
+                assert!(reached[STEP_LIMITED], "case {k}: no step clamp");
+                assert!(reached[PD_LIMITED], "case {k}: no PD clamp");
+            }
         } else {
             assert!(s.would_have > 0, "{s:?}");
         }

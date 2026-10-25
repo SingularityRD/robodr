@@ -141,7 +141,8 @@
 //! An OEM safety-case decision, so it is configuration: `FailSafe`
 //! (**default**) rejects with a zero substitute (never hold — state may be
 //! bad), refused for a humanoid joint channel, where `FailHold` applies;
-//! `FailOpen` forwards the original and records the fault. Inside the
+//! `FailOpen` forwards the original and records the fault (also refused for
+//! a humanoid joint channel: it would forward an unchecked frame). Inside the
 //! library a fault is a failed post-condition check (finite, within limits);
 //! the gateway should call [`Firewall::fault_verdict`] if it cannot run
 //! `check` within its deadline. A gateway **crash** is outside this crate: the
@@ -155,8 +156,10 @@
 //! velocity target `dq`, a feed-forward torque `tau`, gains `kp` / `kd` and
 //! an enable [`MotorMode`], plus the decoder's CRC verdict. Such channels
 //! are configured with a [`JointChannelSpec`] (a per-slot envelope:
-//! position range, `|dq|` / `|tau|` bounds, gain ranges, enabled flag; CRC
-//! requirement, expected rate window, staleness deadline) and compiled with
+//! position range, `|dq|` / `|tau|` bounds, gain ranges, step bounds
+//! relative to the previous accepted target, enabled flag; CRC requirement,
+//! required rate window, staleness deadline, optional `mode_pr` /
+//! `mode_machine` pins) and compiled with
 //! [`Policy::compile_with_joints`] (or [`FirewallConfig`] from JSON). They
 //! share the firewall's sources, clock, statistics and event buffer, and get
 //! the channel ids after the twist / joint-velocity channels, so existing ids
@@ -165,14 +168,20 @@
 //! magnitude is only ever lowered, `q` projected onto its range, a gain
 //! never raised), reject (with a substitute).
 //!
-//! **Humanoid rule.** For a [`Morphology::Humanoid`] platform a rejection on
-//! a joint channel never substitutes a zero-torque or damping frame (the
-//! robot would fall): it holds the last accepted frame (velocity targets
-//! zeroed), or emits nothing if there is none yet. Compilation refuses
-//! [`FailBehaviour::ZeroVelocity`] and [`FaultPolicy::FailSafe`] for such a
-//! platform ([`ConfigError::UnsafeSubstitute`]); the engine applies the rule
-//! regardless of configuration. Other morphologies keep every option (the
-//! damping frame for `ZeroVelocity`; see [`Morphology`] for the trade-off).
+//! **Humanoid rule.** For a [`Morphology::Humanoid`] platform a joint
+//! channel never emits a zero-torque, damping or limp frame (the robot would
+//! fall): a rejection or a fault holds the last accepted frame (velocity
+//! targets zeroed), or emits nothing if there is none yet; a frame in which
+//! every enabled slot is limp is rejected. Compilation refuses
+//! [`FailBehaviour::ZeroVelocity`], [`FaultPolicy::FailSafe`] and
+//! [`FaultPolicy::FailOpen`] for such a platform
+//! ([`ConfigError::UnsafeSubstitute`]), an enabled slot that may go limp
+//! without an explicit `allow_limp`, and one without `max_dq_step`; the
+//! engine applies the substitute rule regardless of configuration. Past
+//! `max_hold_ns` the hold continues (feed-forward torque zeroed) and a
+//! Critical `joint_hold_exceeded` event is raised once per hold episode.
+//! Other morphologies keep every option (the damping frame for
+//! `ZeroVelocity`; see [`Morphology`] for the trade-off).
 //!
 //! See the crate README ("Low-level joint frames") for the decision table and
 //! the rule ids.
@@ -201,7 +210,9 @@ pub use config::{
 pub use engine::{Firewall, Stats};
 pub use events::{policy_mode, reject_rule, rules, EventAction, EventBuffer, FirewallEvent};
 pub use joint::{JointCommand, JointFrame, MotorCmd, MotorMode, MAX_MOTORS};
-pub use joint_config::{FirewallConfig, JointChannelSpec, JointRate, MotorLimits};
+pub use joint_config::{
+    FirewallConfig, JointChannelSpec, JointRate, MotorLimits, MAX_TIME_WINDOW_NS,
+};
 pub use verdict::{
     JointLimitReasons, JointSubstitute, JointVerdict, JointWouldHave, LimitReasons, RejectReason,
     Substitute, SubstituteKind, Verdict, WouldHave,

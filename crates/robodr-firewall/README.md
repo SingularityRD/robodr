@@ -157,7 +157,8 @@ that enforcement would have produced. Events are recorded with `EventAction::Obs
 Motion Firewall fails is a safety-case decision that belongs to the OEM, per robot
 model, so it is configuration here and we do not decide it silently. For a
 humanoid joint channel the configuration refuses any policy that would zero or
-damp the motors (see the low-level joint section).
+damp the motors or forward an unchecked frame, and a fault always holds (see
+the low-level joint section).
 
 - **Default: `FailSafe`.** Reject and emit **zero**. The firewall never holds in
   this case, because its state may be bad.
@@ -191,7 +192,13 @@ driver computes `τ = kp·(q − q_meas) + kd·(dq − dq_meas) + tau`. Layouts 
 
 **API.** `JointCommand { source, channel, stamp_ns, frame: JointFrame }`, where
 `JointFrame` holds up to 35 `MotorCmd { mode, q, dq, tau, kp, kd }` inline plus
-`crc_ok: Option<bool>` (the decoder's CRC verdict: valid, invalid, not checked).
+`crc_ok: Option<bool>` (the decoder's CRC verdict: valid, invalid, not checked)
+and the frame-level `mode_pr` / `mode_machine: Option<u8>` of the `hg`
+`LowCmd` (`None` for layouts without them). Decode a slot's mode octet with
+`MotorMode::from_u8` / `MotorMode::from(u8)`: `0x00` is `Disabled`, **every
+other value is `Enabled`** (Unitree uses `0x01` and also `0x0A`, e.g. B2 and
+the H1 strong motors; `robodr-cdr` treats any non-zero mode as enabled), so no
+mode octet the motor executes can skip the checks.
 `Firewall::check_joint(&cmd, now) -> JointVerdict` (`Passed` / `Limited` /
 `Rejected { reason, substitute }`, same meaning as `Verdict`), and
 `Firewall::joint_fault_verdict` for a deadline miss. Twist and joint-velocity
@@ -206,11 +213,34 @@ channels and `check` are unchanged.
   `enabled`, `q_min`/`q_max`, `dq_max` (tightened by the profile envelope's
   `max_joint_speed`), `tau_max`, `kp_min`/`kp_max`, `kd_min`/`kd_max`. An enabled
   slot has no "unconstrained": every bound is required, finite, `>= 0`, ranges
-  ordered. Unused slots stay `enabled: false`.
+  ordered. Unused slots stay `enabled: false`. Optional per slot:
+  - `max_dq_step` (rad, finite, > 0): bound on `|q − q_prev|` per accepted
+    frame, where `q_prev` is the slot's position target in the last accepted
+    output. **Required on every enabled slot of a humanoid.**
+  - `tau_pd_max` (N·m, finite, > 0): bound on `kp·|q − q_prev|`, the
+    proportional torque a new target asks for over the previous one (the
+    firewall has no measured joint state, so the previous accepted target
+    stands in for `q_meas`; the real tracking torque can be larger).
+  - `allow_limp` (default `false`): humanoid only, see below.
+
+  There is no `q_prev` on the first frame, after a damping substitute (the
+  motors were released) or after a frame in which the slot held no position
+  (`kp = 0` or mode off); then only the absolute range applies. Like `q`
+  itself, the step bounds act only while `kp > 0`.
 - `require_crc` (default `true`), `rate { expected_hz, min_interval_ns,
-  max_interval_ns }` (optional; `min ≤ period ≤ max`), `max_age_ns` (staleness
-  deadline, default 20 ms, > 0), `max_future_ns` (2 ms), `hard_reject_factor`
-  (2.0), `damping_kd` (0).
+  max_interval_ns }` (**required**; `0 < min ≤ period ≤ max`; `min_interval_ns`
+  also bounds how often substitutes are emitted), `max_age_ns` (staleness
+  deadline, default 20 ms, in `1..=10 s`), `max_future_ns` (2 ms, at most
+  10 s; `MAX_TIME_WINDOW_NS`: a window of seconds is a unit typo and would let
+  replayed or pre-dated frames through), `hard_reject_factor` (2.0),
+  `damping_kd` (0).
+- `pinned_mode_pr` / `pinned_mode_machine` (optional `u8`): every frame must
+  carry exactly this `mode_pr` / `mode_machine` (a missing one is rejected
+  too). On G1 / H1-2, `mode_pr` switches the ankles between series
+  pitch / roll (`0`, PR) and parallel A / B (`1`) control, which changes what
+  the envelope's ankle `q` bounds mean; `mode_machine` names the robot
+  variant. **The gateway must pass both through from the decoded frame**
+  (`JointFrame::mode_pr` / `mode_machine`).
 - `PlatformConfig::morphology`: `humanoid`, `quadruped`, `wheeled`, `arm` or
   `other` (default; existing configs keep their behaviour).
 - `FaultPolicy::FailHold` (new): on a fault, hold the last accepted joint frame.
@@ -219,7 +249,18 @@ Examples: `config/firewall.unitree-g1.example.json` (humanoid, 35 slots, 29
 enabled) and `config/firewall.unitree-go2.example.json` (quadruped, 20 slots, 12
 enabled). Their joint limits are illustrative values in the shape of the public
 URDFs, and the allowed source is a synthetic GUID: take the limits, gains and
-writer identity from the OEM data for the exact hardware revision.
+writer identity from the OEM data for the exact hardware revision. The G1
+example gives every enabled slot non-zero gain minimums (legs and waist
+`kp_min` 5–10, `kd_min` 0.2–0.5; arms `kp_min` 5, `kd_min` 0.2; wrists
+`kp_min` 2, `kd_min` 0.1) rather than `allow_limp`, the conservative choice:
+no single joint can be commanded limp. It pins `mode_pr` to `0` (PR, the mode
+its ankle limits are written for) and leaves `mode_machine` unpinned (it
+differs per unit; pin it to the value your robot reports). Both examples set
+`max_dq_step` (G1 0.15 rad, Go2 0.2 rad per frame) and `tau_pd_max` equal to
+`tau_max`; tune `max_dq_step` against the largest per-tick target change your
+controller really sends (a 50 Hz policy behind a 500 Hz loop jumps at policy
+ticks), or legitimate frames are stepped (within `f × max_dq_step`) or
+rejected (beyond).
 
 **Decision table** (`check_joint`; stages in order, first rejection wins; `f` =
 `hard_reject_factor`):
@@ -232,16 +273,24 @@ writer identity from the OEM data for the exact hardware revision.
 | 3 | rate | `now −` last accepted `< min_interval_ns` | Reject, **no substitute** | `rejected_rate_limited` (High) |
 | 4 | crc | `crc_ok == Some(false)`, or `None` with `require_crc` | Reject | `crc_invalid` (High) |
 | 5 | shape | slot count ≠ configured | Reject | `rejected_kind_mismatch` (High) |
+| 5 | mode | `mode_pr` / `mode_machine` ≠ its pin (if pinned) | Reject | `joint_mode_pin_mismatch` (Critical) |
 | 6 | values | NaN / ±inf in any slot | Reject | `rejected_non_finite` (Critical) |
 | 7 | time | future / older than `max_age_ns` / replay | Reject | `rejected_future_timestamp` / `rejected_stale` / `rejected_out_of_order` |
+| 8 | slot | mode off (`0x00`) but `kp`, `kd` or `tau` ≠ 0 (any slot) | Reject | `joint_mode_inconsistent` (Critical) |
 | 8 | slot | unused slot energised (mode on and `kp`, `kd` or `tau` ≠ 0) | Reject | `disabled_motor_energised` (Critical) |
-| 8 | slot | gain < min (motor off = zero gains), or > `f`·max | Reject | `joint_gain_out_of_envelope` (Critical) |
+| 8 | slot | gain < min (motor off = zero gains) | Reject | `joint_gain_below_minimum` (Critical) |
+| 8 | slot | gain > `f`·max | Reject | `joint_gain_out_of_envelope` (Critical) |
 | 8 | slot | `\|tau\|` > `f`·`tau_max` | Reject | `joint_torque_out_of_envelope` (Critical) |
 | 8 | slot | `kd > 0` and `\|dq\|` > `f`·`dq_max` | Reject | `joint_velocity_out_of_envelope` (Critical) |
 | 8 | slot | `kp > 0` and `q` outside the range by > `(f−1)·(q_max−q_min)` | Reject | `joint_position_out_of_envelope` (Critical) |
-| 9 | clamp | gain > max; `\|tau\|`, `\|dq\|` > max; `q` outside range | Limit: clamp that field | same four ids, action `Limited` (High) |
-| 10 | post | output outside the envelope (a bug) | per `FaultPolicy` | `internal_fault` (Critical) |
+| 8 | slot | `kp > 0`, `q_prev` known, `\|q − q_prev\|` > `f`·`max_dq_step` | Reject | `joint_step_out_of_envelope` (Critical) |
+| 8 | slot | `kp > 0`, `q_prev` known, `kp·\|q − q_prev\|` > `f`·`tau_pd_max` | Reject | `joint_pd_torque_out_of_envelope` (Critical) |
+| 9 | clamp | gain > max; `\|tau\|`, `\|dq\|` > max; `q` outside range | Limit: clamp that field | `joint_{gain,torque,velocity,position}_out_of_envelope`, action `Limited` (High) |
+| 9 | clamp | `\|q − q_prev\|` > `max_dq_step`, or `kp·\|q − q_prev\|` > `tau_pd_max` | Limit: move `q` from `q_prev` toward the (range-projected) target by the allowed amount | `joint_step_out_of_envelope` / `joint_pd_torque_out_of_envelope`, action `Limited` (High) |
+| 10 | limp | humanoid: every enabled slot limp (`kp = kd = 0`, or mode off) | Reject | `joint_limp_frame` (Critical) |
+| 11 | post | output outside the envelope (a bug) | per `FaultPolicy` (humanoid: always hold) | `internal_fault` (Critical) |
 | — | gap | accepted `> max_interval_ns` after the previous accepted frame | (frame decided normally) | `joint_rate_violation` (Medium, recorded only) |
+| — | hold | humanoid: hold older than `max_hold_ns` | keep holding, `tau := 0` in the held frame | `joint_hold_exceeded` (Critical, once per hold episode) |
 
 Notes:
 
@@ -249,34 +298,76 @@ Notes:
   `kp == 0`, `dq` not when `kd == 0`: the Unitree SDK parks idle slots at
   `PosStopF = 2.146e9` / `VelStopF = 16000` with zero gains, and those frames pass.
 - **Clamping never makes a command stronger.** `|dq|`, `|tau|`, `kp`, `kd` are
-  only ever lowered (sign kept), `q` is projected onto `[q_min, q_max]`, and a gain
-  below its minimum is rejected rather than raised. Limiting is idempotent (a
-  limited frame passes unchanged). Events carry the motor `slot`.
+  only ever lowered (sign kept), `q` is projected onto `[q_min, q_max]` and then,
+  if the step bounds require it, moved toward `q_prev` (it always lies between
+  the two), and a gain below its minimum is rejected rather than raised.
+  Clamps use `min` / `max`, never `f64::clamp` (which panics on inverted or NaN
+  bounds; compiled bounds are ordered anyway). Events carry the motor `slot`.
+- **Mode off must mean inert.** A slot whose mode octet is `0x00` but which
+  carries a non-zero `kp`, `kd` or `tau` is rejected (`joint_mode_inconsistent`)
+  on every slot, used or not: what a driver does with such a slot depends on
+  firmware, and its values would otherwise leave the firewall unchecked.
 - **Too-early frames emit nothing.** The previous frame, sent less than
-  `min_interval_ns` ago, is still in force; substituting would turn a flood into a
-  flood of substitutes. A late frame is still decided (refusing it would widen the
-  gap); the gap is recorded.
+  `min_interval_ns` ago, is still in force. **Substitutes obey the same
+  interval:** no substitute is emitted while the last emitted frame (accepted or
+  substitute) on the channel is younger than `min_interval_ns` (nothing is
+  emitted; the previous emission is still in force), so a flood of bad frames
+  yields at most one substitute per interval. (Under a gateway clock regression
+  that age cannot be measured, and the substitute is emitted.) A late frame is
+  still decided (refusing it would widen the gap); the gap is recorded.
+- **Future stamps cannot lock out on-time frames.** An accepted frame stamped
+  up to `max_future_ns` ahead advances the per-source out-of-order watermark
+  only to `min(stamp, now)`. Trade-off: a replay of that future-stamped frame
+  within the window is not caught as out of order (it is still subject to the
+  staleness, rate and step checks).
+- **Coalesced events keep the worst value**: the largest, except
+  `joint_gain_below_minimum`, which keeps the smallest gain.
 - **The gateway must recompute the CRC** of a `Limited` frame and of every
-  substitute (they carry `crc_ok: Some(true)` as a marker, not a checksum), and
-  must carry the non-motor fields of the wire message (`mode_pr`, `mode_machine`,
-  flags, reserved words) itself.
+  substitute (they carry `crc_ok: Some(true)` as a marker, not a checksum), must
+  pass the decoded `mode_pr` / `mode_machine` through into the `JointFrame` (and
+  re-encode the output's values; a substitute carries the held frame's values,
+  or the channel's pins for a damping frame), and must carry the remaining
+  non-motor fields (flags, reserved words) itself.
 
-**Substitutes, and the humanoid rule.** A zero-torque or damping frame makes a
-standing humanoid fall, so on a `humanoid` platform's joint channel a rejection or
-a fault **never** substitutes one:
+**Substitutes, and the humanoid rule.** A zero-torque, damping or limp frame
+makes a standing humanoid fall, so on a `humanoid` platform's joint channel
+**nothing of the kind is ever emitted, from any path**:
 
-- `humanoid`: hold the last accepted frame with every `dq` set to 0 (`HoldLast`),
-  with no hold timeout and also under a clock regression; if no frame was accepted
-  yet, emit nothing (the robot keeps its own last command / timeout behaviour).
-  `Policy::compile_with_joints` refuses `fail_behaviour: zero_velocity` and
-  `fault_policy: fail_safe` for a humanoid with a joint channel
-  (`ConfigError::UnsafeSubstitute`, "... makes the robot fall; use hold_last /
-  fail_hold"), and the engine applies the rule again regardless of the
-  configuration. Use `fault_policy: fail_hold` (or `fail_open`). Set `kp_min` /
-  `kd_min` above zero on the legs so that a limp frame (gains zero or motors
-  switched off) from a compromised source is refused and the posture held, rather
-  than forwarded. A humanoid's twist channel (a request to its own balance
-  controller) keeps the normal substitutes.
+- **Substitutes.** A rejection or a fault holds the last accepted frame with
+  every `dq` set to 0 (`HoldLast`), also under a clock regression and whatever
+  the fault policy; if no frame was accepted yet, nothing is emitted (the robot
+  keeps its own last command / timeout behaviour). `Policy::compile_with_joints`
+  refuses `fail_behaviour: zero_velocity`, `fault_policy: fail_safe` and
+  `fault_policy: fail_open` (which would forward the raw, unchecked frame on a
+  fault) for a humanoid with a joint channel (`ConfigError::UnsafeSubstitute`,
+  the message says why and to use `hold_last` / `fail_hold`), and the engine
+  applies the rule again regardless of the configuration. Observe mode
+  (unlocked profile or `pass_through_observe_only`) never enforces anything and
+  is the only path that forwards a frame unchecked.
+- **Hold time limit: escalation, not release.** On a humanoid
+  `HoldLast { max_hold_ns }` never ends the hold (releasing would mean falling).
+  Once the held frame is older than `max_hold_ns` the firewall (a) raises a
+  Critical `joint_hold_exceeded` event once per hold episode (value: hold age,
+  limit: `max_hold_ns`), and (b) zeroes the held frame's feed-forward `tau`,
+  keeping its `kp`, `kd` and `q`. Trade-off: the feed-forward torque was
+  computed for a posture and gait phase that are no longer current, and
+  replaying it indefinitely pushes the robot somewhere stale; stiffness and
+  damping around the last valid target do not depend on that phase. The robot
+  may sag slightly without the gravity feed-forward, but it does not go limp.
+  What happens next (a controlled stop by the platform's safety controller,
+  operator alert) is the responder's decision. `Stats` exposes
+  `joint_hold_episodes`, `joint_holds_exceeded` and the gauge
+  `joint_hold_age_ns` (age of the most recent hold; 0 once a frame is accepted).
+- **No limp frames.** Every enabled slot must have `kp_min > 0` or
+  `kd_min > 0`, unless it sets `allow_limp: true` (compile error otherwise,
+  naming the slot): a limp leg or waist makes the robot fall, so a compromised
+  source must not be able to command one. `allow_limp` is an explicit,
+  reviewable opt-out for joints that may genuinely go slack. Independently, a
+  frame in which **every** enabled slot is limp (`kp = kd = 0`, or mode off) is
+  rejected (`joint_limp_frame`) and the last frame held.
+- **Bounded steps.** Every enabled slot needs `max_dq_step`.
+- A humanoid's twist channel (a request to its own balance controller) keeps
+  the normal substitutes.
 - `quadruped` / `wheeled` / `arm` / `other`: `ZeroVelocity` emits the **damping
   frame** (every enabled slot `kp = 0, dq = 0, tau = 0, kd = min(damping_kd,
   kd_max)`; unused slots off); `HoldLast { max_hold_ns }` holds the last accepted
@@ -287,16 +378,19 @@ a fault **never** substitutes one:
   stairs or a payload mid-step); holding keeps it standing stiffly in the last
   posture for `max_hold_ns`. An arm sags under damping: prefer `HoldLast`.
 
-**Rule ids** (all prefixed `robot.firewall.`). New: `joint_position_out_of_envelope`,
-`joint_velocity_out_of_envelope`, `joint_torque_out_of_envelope`,
-`joint_gain_out_of_envelope`, `disabled_motor_energised`, `crc_invalid`,
-`joint_rate_violation`. Reused where the meaning is the same: `rejected_rate_limited`
-(too early), `rejected_stale` (staleness deadline), `rejected_future_timestamp`,
-`rejected_out_of_order`, `rejected_non_finite`, `rejected_kind_mismatch` (slot
-count / wrong entry point), the source and channel ids, `internal_fault`. The new
-ids still have to be added to the correlation catalog
-(`robodr-correlate::catalog::NETWORK_AND_AGENT_RULES`) and the OCSF rule catalog
-(`robodr-ocsf`); until then the workspace's catalog-drift tests flag them.
+**Rule ids** (all prefixed `robot.firewall.`). Joint-frame specific:
+`joint_position_out_of_envelope`, `joint_velocity_out_of_envelope`,
+`joint_torque_out_of_envelope`, `joint_gain_out_of_envelope` (over the
+maximum), `joint_gain_below_minimum`, `joint_step_out_of_envelope`,
+`joint_pd_torque_out_of_envelope`, `joint_mode_inconsistent`,
+`joint_mode_pin_mismatch`, `joint_limp_frame`, `joint_hold_exceeded`,
+`disabled_motor_energised`, `crc_invalid`, `joint_rate_violation`. Reused where
+the meaning is the same: `rejected_rate_limited` (too early), `rejected_stale`
+(staleness deadline), `rejected_future_timestamp`, `rejected_out_of_order`,
+`rejected_non_finite`, `rejected_kind_mismatch` (slot count / wrong entry
+point), the source and channel ids, `internal_fault`. Every id is in the
+correlation catalog (`robodr-correlate::catalog::NETWORK_AND_AGENT_RULES`) and
+the OCSF rule catalog (`robodr-ocsf`).
 
 ## Invariants (and where they are verified)
 
@@ -319,10 +413,11 @@ ids still have to be added to the correlation catalog
 | No `unwrap`/`expect`/`panic!`/slice indexing/unchecked integer arithmetic in hot-path modules | `#![deny(clippy::{unwrap_used, expect_used, panic, indexing_slicing, arithmetic_side_effects})]` on `engine`, `command`, `events`, `verdict`; confirmed to fire on a deliberate probe |
 | Policy compilation rejects every class of malformed config | `config::tests` |
 | Joint frames: every decision-table row, each clamp with its rule id and slot, hard rejections, gain minimums, unused-slot energising, CRC, rate window, staleness, observe mode, all three fault policies, the shipped G1 / Go2 configs, JSON strictness, and the unchanged legacy API | `tests/joint_frames.rs` (25 tests) |
-| Joint frames: forwarded output always inside the envelope (independent check); `Passed` bit-exact; `Limited` never raises a magnitude or gain and is idempotent; a substitute is the held last accepted frame (`dq = 0`) or the damping frame, **never damping on a humanoid** | `tests/joint_properties.rs` (24 random envelopes of 1–35 slots × 4 000 frames, plus an exhaustive edge grid) |
-| **No heap allocation in `check_joint` / `joint_fault_verdict`** (35, 20 and 12 slots; humanoid, quadruped, fail-open, observe; every path incl. holds, damping, a full buffer) | `tests/alloc_free.rs` (`check_joint_never_allocates`, hard failure) |
+| Joint frames: forwarded output always inside the envelope and the step / PD bounds against an independently modelled `q_prev` (independent check); `Passed` bit-exact; `Limited` never raises a magnitude or gain, keeps `q` between its projection and `q_prev`, and is idempotent; a mode-off slot carrying gains is never forwarded; a substitute is the held last accepted frame (`dq = 0`, and `tau = 0` on a humanoid past `max_hold_ns`) or the damping frame, **never damping and never a limp frame on a humanoid** | `tests/joint_properties.rs` (24 random envelopes of 1–35 slots × 4 000 frames, with random step / PD bounds, plus an exhaustive edge grid) |
+| Review findings F1–F10 on the joint path (mode octet decoding and mode-off slots, humanoid limp slots and frames, step / PD bounds, substitute flood, humanoid hold escalation, no fail-open on a humanoid, `mode_pr` / `mode_machine` pins, future-stamp watermark, time-window bounds, below-minimum coalescing) | `tests/joint_review_regressions.rs` (17 tests), `src/tests.rs` (humanoid fault holds whatever the fault policy) |
+| **No heap allocation in `check_joint` / `joint_fault_verdict`** (35, 20 and 12 slots; humanoid, quadruped, fail-open quadruped, observe; tight and wide step bounds; every path incl. step / PD clamps and rejections, limp and pinned-mode rejections, holds and their suppression inside the emission interval, a humanoid hold past `max_hold_ns`, damping, a full buffer). The test also asserts that each of these rows is actually reached | `tests/alloc_free.rs` (`check_joint_never_allocates`, hard failure) |
 
-Total: 132 tests (100 for twist / joint-velocity channels, 32 for low-level
+Total: 150 tests (100 for twist / joint-velocity channels, 50 for low-level
 joint frames). Every loop in `check` runs over at most `MAX_JOINTS` (32)
 elements or a constant 4 rounds. There is no recursion and no search over sources.
 
@@ -384,9 +479,11 @@ It drives four scenarios for `SECONDS` each (default 2): a 35-slot humanoid fram
 each at 1 kHz and at 500 Hz. By default the frames are **paced in real time** at
 the scenario's rate (±2 % period jitter), so each decision sees the caches a real
 control loop sees between ticks; `--fast` feeds the same stream back to back. The
-mix: smooth sinusoidal trajectories, about 3 % frames with a clamped position,
-about 1.5 % rejected (CRC invalid, NaN, unused slot energised, torque past the hard
-bound; each rejection holds the last valid frame). A counting global allocator
+mix: smooth sinusoidal trajectories, about 3 % frames with a position target
+nudged past `max_dq_step` and a torque past `tau_max` (both limited; the frame
+after a stepped one is sometimes stepped too), about 1.5 % rejected (CRC
+invalid, NaN, unused slot energised, torque past the hard bound; each rejection
+holds the last valid frame). A counting global allocator
 reports heap allocations on the timed thread. **Exit code 1 if any allocation
 happens in a timed loop** (a hard check, like `tests/alloc_free.rs`) or if a
 configured budget (`ROBODR_FW_JOINT_BUDGET_{P50,P99,MAX,JITTER}_NS` or the flags) is
@@ -400,18 +497,27 @@ the slowest p99 measured below), which only a pathological regression (an
 allocation, an unbounded loop) can trip.
 
 Measured 2026-10-25 in the development sandbox: a 4-vCPU VM on an Intel Xeon @
-2.10 GHz, release profile, 10 s per scenario, two runs each, while other builds
+2.10 GHz, release profile, 10 s per scenario, two runs each, while other work
 ran on the same VM; times include the `Instant` pair (about 30 ns); 0 allocations
-in every run:
+in every run. This is the version with the step / PD-torque bounds, the
+mode-consistency and limp checks (the mix: about 4.6 % of frames limited, 1.5 %
+rejected):
 
 | Scenario | Mode | p50 | p99 | p99.9 | max |
 |---|---|---|---|---|---|
-| 35 slots @ 1 kHz | paced | 1.6–1.7 µs | 4.7–4.9 µs | 32–37 µs | 0.37–2.9 ms |
-| 35 slots @ 500 Hz | paced | 2.5–2.8 µs | 5.6–7.3 µs | 54–70 µs | 0.25–0.36 ms |
-| 12 slots @ 1 kHz | paced | 1.1–1.2 µs | 3.8–3.9 µs | 26–38 µs | 0.14–0.16 ms |
-| 12 slots @ 500 Hz | paced | 1.9–2.0 µs | 4.3–4.4 µs | 26 µs | 56–144 µs |
-| 35 slots | back to back | 0.67–1.1 µs | 1.3–1.7 µs | 16–27 µs | 42–246 µs |
-| 12 slots | back to back | 0.36–0.47 µs | 0.7–0.85 µs | 1–24 µs | 24–69 µs |
+| 35 slots @ 1 kHz | paced | 3.2–3.4 µs | 7.2–9.1 µs | 39–74 µs | 0.85–2.2 ms |
+| 35 slots @ 500 Hz | paced | 4.1–4.2 µs | 8.8–10.3 µs | 39–43 µs | 0.26–0.27 ms |
+| 12 slots @ 1 kHz | paced | 2.4–2.5 µs | 6.0–6.1 µs | 41–42 µs | 0.18–0.40 ms |
+| 12 slots @ 500 Hz | paced | 3.1–3.2 µs | 7.6–8.3 µs | 34–44 µs | 85–434 µs |
+| 35 slots | back to back | 1.0–1.6 µs | 1.7–2.6 µs | 20–35 µs | 62–523 µs |
+| 12 slots | back to back | 0.54–0.66 µs | 0.96–1.17 µs | 7–16 µs | 29–159 µs |
+
+The previous version (without those checks), run in the same session on the
+same VM for comparison, measured 35 slots paced @ 1 kHz p50 2.8 µs / p99
+5.3–8.4 µs and back to back p50 0.75–0.92 µs: the extra per-slot checks cost
+roughly 10–30 % at the median. (An earlier, quieter session measured the
+previous version at about half these paced figures; compare numbers from one
+session only.)
 
 At 1 kHz the control period is 1 000 µs, so the decision p99 is below 1 % of it on
 this machine. The paced numbers are higher than back to back because the caches
@@ -435,14 +541,16 @@ the robot's own compute, gateway in the loop, under load — is still to be meas
     `FirewallConfig::from_json(..)?.compile(&profile)`), with the channel in the
     profile's `motion_envelopes` and `writer_topics`;
   - call `check_joint` per frame and publish the output, re-encoding a `Limited`
-    frame or a substitute **with a freshly computed CRC** and carrying the
-    message's non-motor fields (`mode_pr`, `mode_machine`, flags) itself;
+    frame or a substitute **with a freshly computed CRC**, passing the decoded
+    `mode_pr` / `mode_machine` through into the `JointFrame` (pinned channels
+    reject frames without them) and carrying the remaining non-motor fields
+    (flags, reserved words) itself;
   - publish nothing when the verdict emits nothing (the robot keeps its last
     command), and call `joint_fault_verdict` on a deadline miss;
   - for `robodr-agent`'s verdict records: `JointVerdict` is a separate type, so a
     `check_firewall`-style mapping needs a joint variant (reasons
-    `position` / `velocity` / `torque` / `gain`, substitute `hold_last` / `zero`
-    = damping).
+    `position` / `velocity` / `torque` / `gain` / `step` / `pd_torque`,
+    substitute `hold_last` / `zero` = damping).
 
 - **ROS 2 gateway.** It has to:
   - subscribe on a shadow topic and republish verdict outputs;

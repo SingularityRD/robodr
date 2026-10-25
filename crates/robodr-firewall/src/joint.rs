@@ -8,9 +8,11 @@
 //! heap-free: a [`JointFrame`] holds up to [`MAX_MOTORS`] slots inline (the
 //! largest Unitree layout, the `hg` `LowCmd` of G1 / H1-2, has 35; Go2 / B2 /
 //! H1 use 20, Go1 / A1 12). The decoder (gateway) fills it from the wire and
-//! says whether the frame's CRC was valid ([`JointFrame::crc_ok`]); fields of
-//! the wire message that are not motor targets (`mode_pr`, `mode_machine`,
-//! head / level flags, reserved words) are the gateway's business.
+//! says whether the frame's CRC was valid ([`JointFrame::crc_ok`]) and passes
+//! through the frame-level `mode_pr` / `mode_machine` octets of the `hg`
+//! `LowCmd` (G1 / H1-2), which change what an ankle `q` means and can be
+//! pinned per channel. Other non-motor fields (head / level flags, reserved
+//! words) are the gateway's business.
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -25,15 +27,43 @@ use crate::command::{ChannelId, SourceId};
 /// `LowCmd`: G1, H1-2). Frames for wider buses must be split over channels.
 pub const MAX_MOTORS: usize = 35;
 
-/// Per-motor enable flag as decoded from the frame (Unitree: `mode` 0x01 =
-/// servo / FOC enabled, 0x00 = disabled / brake).
+/// Per-motor enable flag as decoded from the frame.
+///
+/// Decode the wire octet with [`MotorMode::from_u8`] (or `From<u8>`): `0x00`
+/// is [`MotorMode::Disabled`], **any other value** is
+/// [`MotorMode::Enabled`]. Unitree drivers use `0x01` (servo / FOC) and also
+/// `0x0A` (B2, H1 "strong" motors), and `robodr-cdr` treats every non-zero
+/// mode as enabled; mapping an unknown non-zero octet to `Disabled` would let
+/// a frame the motor executes skip every check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum MotorMode {
-    /// The motor is not driven: it ignores every target and gain.
+    /// Mode octet `0x00`: the motor is not driven. A slot in this mode must
+    /// still be inert (`kp = kd = tau = 0`): the firewall rejects one that
+    /// carries gains or torque rather than trust every firmware to ignore
+    /// them.
     #[default]
     Disabled,
-    /// The motor drives `τ = kp·(q − q_meas) + kd·(dq − dq_meas) + tau`.
+    /// Any non-zero mode octet: the motor drives
+    /// `τ = kp·(q − q_meas) + kd·(dq − dq_meas) + tau`.
     Enabled,
+}
+
+impl MotorMode {
+    /// The mode of a wire octet: `0` is `Disabled`, anything else `Enabled`.
+    pub const fn from_u8(octet: u8) -> Self {
+        if octet == 0 {
+            Self::Disabled
+        } else {
+            Self::Enabled
+        }
+    }
+}
+
+impl From<u8> for MotorMode {
+    /// See [`MotorMode::from_u8`].
+    fn from(octet: u8) -> Self {
+        Self::from_u8(octet)
+    }
 }
 
 /// One motor slot of a [`JointFrame`].
@@ -93,6 +123,18 @@ impl MotorCmd {
         self.mode == MotorMode::Enabled && [self.kp, self.kd, self.tau].iter().any(|x| *x != 0.0)
     }
 
+    /// `true` if the mode is off but `kp`, `kd` or `tau` is non-zero (NaN
+    /// counts as non-zero): an ambiguous slot the firewall rejects.
+    pub(crate) fn disabled_but_loaded(&self) -> bool {
+        self.mode == MotorMode::Disabled && [self.kp, self.kd, self.tau].iter().any(|x| *x != 0.0)
+    }
+
+    /// `true` if the slot applies no stiffness and no damping (disabled, or
+    /// both effective gains zero): the joint is limp, whatever `tau` says.
+    pub(crate) fn is_limp(&self) -> bool {
+        self.effective_kp() == 0.0 && self.effective_kd() == 0.0
+    }
+
     /// The gains and torque the motor actually applies: zero when disabled.
     pub(crate) fn effective_kp(&self) -> f64 {
         match self.mode {
@@ -123,10 +165,19 @@ pub struct JointFrame {
     /// channel with `require_crc` rejects anything but `Some(true)`; every
     /// channel rejects `Some(false)`.
     pub crc_ok: Option<bool>,
+    /// The frame's `mode_pr` octet (`hg` `LowCmd`: ankle parallel / serial
+    /// mode), passed through by the gateway; `None` where the layout has
+    /// none. Checked against [`crate::JointChannelSpec::pinned_mode_pr`].
+    pub mode_pr: Option<u8>,
+    /// The frame's `mode_machine` octet (`hg` `LowCmd`: robot variant),
+    /// passed through by the gateway; `None` where the layout has none.
+    /// Checked against [`crate::JointChannelSpec::pinned_mode_machine`].
+    pub mode_machine: Option<u8>,
 }
 
 impl JointFrame {
-    /// `slots` disabled motors. `None` if `slots > MAX_MOTORS`.
+    /// `slots` disabled motors, no `mode_pr` / `mode_machine`. `None` if
+    /// `slots > MAX_MOTORS`.
     pub fn new(slots: usize, crc_ok: Option<bool>) -> Option<Self> {
         if slots > MAX_MOTORS {
             return None;
@@ -135,6 +186,8 @@ impl JointFrame {
             slots: u8::try_from(slots).ok()?,
             motors: [MotorCmd::OFF; MAX_MOTORS],
             crc_ok,
+            mode_pr: None,
+            mode_machine: None,
         })
     }
 
@@ -145,6 +198,8 @@ impl JointFrame {
             slots: u8::try_from(n).unwrap_or(0),
             motors: [MotorCmd::OFF; MAX_MOTORS],
             crc_ok,
+            mode_pr: None,
+            mode_machine: None,
         }
     }
 
@@ -254,13 +309,20 @@ mod tests {
         assert!(!MotorCmd::enabled(2.146e9, 16000.0, 0.0, 0.0, 0.0).energises());
         assert!(MotorCmd::enabled(0.0, 0.0, 0.1, 0.0, 0.0).energises());
         assert!(MotorCmd::enabled(0.0, 0.0, 0.0, 0.0, f64::NAN).energises());
-        // Disabled never energises, whatever the gains say.
+        // Disabled never energises, whatever the gains say (but it is
+        // "loaded", which the engine rejects).
         let d = MotorCmd {
             kp: 50.0,
             ..MotorCmd::OFF
         };
         assert!(!d.energises());
+        assert!(d.disabled_but_loaded());
+        assert!(d.is_limp());
         assert_eq!(d.effective_kp(), 0.0);
+        assert!(!MotorCmd::OFF.disabled_but_loaded());
+        assert!(!MotorCmd::enabled(0.0, 0.0, 1.0, 0.0, 0.0).disabled_but_loaded());
+        assert!(MotorCmd::enabled(0.0, 0.0, 1.0, 0.0, 0.0).is_limp());
+        assert!(!MotorCmd::enabled(0.0, 0.0, 0.0, 0.0, 0.1).is_limp());
         assert!(!MotorCmd {
             tau: f64::INFINITY,
             ..MotorCmd::OFF

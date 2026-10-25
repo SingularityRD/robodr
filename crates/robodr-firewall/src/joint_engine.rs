@@ -15,15 +15,22 @@
 //! | 3 | rate | `now − last accepted < min_interval` | Reject `RateLimited` | **none** (previous frame still in force) |
 //! | 4 | crc | `crc_ok == Some(false)`, or `None` with `require_crc` | Reject `CrcInvalid` | yes |
 //! | 5 | shape | slot count ≠ configured | Reject `KindMismatch` | yes |
+//! | 5 | mode | `mode_pr` / `mode_machine` ≠ its pin (if pinned) | Reject `JointModePinMismatch` | yes |
 //! | 6 | values | any NaN / ±inf in any slot | Reject `NonFinite` | yes |
 //! | 7 | time | future / stale (`max_age_ns`) / out of order | Reject `FutureTimestamp` / `Stale` / `OutOfOrder` | yes |
+//! | 8 | slots | mode off but `kp`, `kd` or `tau` ≠ 0 | Reject `JointModeInconsistent` | yes |
 //! | 8 | slots | unused slot energised | Reject `DisabledMotorEnergised` | yes |
-//! | 8 | slots | gain < min (disabled motor = zero gains), or > `f`× max | Reject `JointGainOutOfEnvelope` | yes |
+//! | 8 | slots | gain < min (mode off = zero gains) | Reject `JointGainBelowMinimum` | yes |
+//! | 8 | slots | gain > `f`× max | Reject `JointGainOutOfEnvelope` | yes |
 //! | 8 | slots | `\|tau\|` > `f·tau_max` | Reject `JointTorqueOutOfEnvelope` | yes |
 //! | 8 | slots | `kd > 0` and `\|dq\|` > `f·dq_max` | Reject `JointVelocityOutOfEnvelope` | yes |
 //! | 8 | slots | `kp > 0` and `q` beyond the range by > `(f−1)·width` | Reject `JointPositionOutOfEnvelope` | yes |
+//! | 8 | slots | `kp > 0`, `q_prev` known, `\|q − q_prev\|` > `f·max_dq_step` | Reject `JointStepOutOfEnvelope` | yes |
+//! | 8 | slots | `kp > 0`, `q_prev` known, `kp·\|q − q_prev\|` > `f·tau_pd_max` | Reject `JointPdTorqueOutOfEnvelope` | yes |
 //! | 9 | clamp | gain > max, `\|tau\|` > max, `\|dq\|` > max, `q` outside range | Limit (clamp the field) | — |
-//! | 10 | post | output not finite / outside the envelope (a bug) | per [`crate::FaultPolicy`] | — |
+//! | 9 | clamp | `\|q − q_prev\|` > `max_dq_step` or `kp·\|q − q_prev\|` > `tau_pd_max` | Limit (step `q` from `q_prev` toward it) | — |
+//! | 10 | limp | humanoid: every enabled slot limp (`kp = kd = 0` or mode off) | Reject `JointLimpFrame` | yes |
+//! | 11 | post | output not finite / outside the envelope (a bug) | per [`crate::FaultPolicy`] (humanoid: hold) | — |
 //! | — | gap | accepted `> max_interval` after the previous one | event `joint_rate_violation` only | — |
 //!
 //! Slots are scanned in order; within a slot the order is the row order
@@ -32,15 +39,27 @@
 //! at `PosStopF` / `VelStopF` with zero gains).
 //!
 //! Clamping only ever **lowers** a magnitude (`dq`, `tau`, `kp`, `kd`) or
-//! projects `q` onto its range; it never raises a gain (a gain below its
-//! minimum is a rejection), so the output is never stiffer, faster or
-//! stronger than the input.
+//! moves `q` toward its range and toward the previous target; it never
+//! raises a gain (a gain below its minimum is a rejection), so the output
+//! is never stiffer, faster or stronger than the input.
+//!
+//! `q_prev` is the slot's position target in the last **accepted** output
+//! while that slot held a position (mode on, `kp > 0`). It is unknown on the
+//! first frame, after a damping substitute and after a frame in which the
+//! slot held no position; then only the absolute range applies.
 //!
 //! ## Substitutes
+//! Every "yes" above is subject to the emission interval: no substitute is
+//! emitted while the last emitted frame (accepted or substitute) on the
+//! channel is younger than `min_interval_ns` (nothing is emitted instead;
+//! the previous emission is still in force).
 //! - **Humanoid** platform: the last accepted frame with `dq := 0` on every
 //!   slot (`HoldLast`), whatever the reason (also under a clock regression
-//!   or a fault, and with no hold timeout), or **nothing** if no frame was
-//!   accepted yet. Never a zero / damping frame.
+//!   or a fault, whatever the fault policy), or **nothing** if no frame was
+//!   accepted yet. Never a zero / damping / limp frame. The hold has no
+//!   release: once it is older than `max_hold_ns` the held frame's `tau` is
+//!   zeroed (gains and `q` kept) and a Critical `joint_hold_exceeded` event
+//!   is recorded once per hold episode.
 //! - Other platforms: `HoldLast { max_hold_ns }` holds that frame while it
 //!   is younger than `max_hold_ns` (not under a clock regression, not for a
 //!   foreign source), else the damping frame (`Zero`); `ZeroVelocity`
@@ -58,12 +77,21 @@ use crate::command::SourceId;
 use crate::config::{FailBehaviour, FaultPolicy, ForeignSourceAction};
 use crate::engine::{Firewall, PairState};
 use crate::events::{reject_rule, rules, EventAction};
-use crate::joint::{JointCommand, JointFrame, MotorCmd, MotorMode};
+use crate::joint::{JointCommand, JointFrame, MotorCmd, MotorMode, MAX_MOTORS};
 use crate::joint_config::{CompiledJointChannel, CompiledMotor};
 use crate::verdict::{
     JointLimitReasons, JointSubstitute, JointVerdict, JointWouldHave, RejectReason, SubstituteKind,
 };
 use robodr_events::Severity;
+
+/// No previous position target for a slot.
+const NO_Q: f64 = f64::NAN;
+
+/// Absolute part of the tolerance of the step post-condition (rad); scaled
+/// by `1 + max(|q|, |q_prev|)`. Rounding of `q_prev ± step` is far below it.
+const STEP_TOL: f64 = 1e-12;
+/// Relative tolerance of the PD-torque post-condition.
+const PD_TOL: f64 = 1e-9;
 
 /// Per low-level joint channel state.
 #[derive(Debug, Clone, Copy)]
@@ -73,12 +101,26 @@ pub(crate) struct JointChanState {
     accepted: Option<(JointFrame, u64)>,
     /// When the last foreign-source-triggered substitute was emitted.
     last_foreign_sub_at: Option<u64>,
+    /// When the last frame (accepted or substitute) was emitted.
+    last_emit_at: Option<u64>,
+    /// Per slot: position target of the last accepted output while the slot
+    /// held a position, else [`NO_Q`].
+    q_prev: [f64; MAX_MOTORS],
+    /// A hold episode is running (hold substitutes since the last accepted
+    /// frame).
+    holding: bool,
+    /// The running hold episode already raised `joint_hold_exceeded`.
+    hold_exceeded: bool,
 }
 
 impl JointChanState {
     pub(crate) const INIT: JointChanState = JointChanState {
         accepted: None,
         last_foreign_sub_at: None,
+        last_emit_at: None,
+        q_prev: [NO_Q; MAX_MOTORS],
+        holding: false,
+        hold_exceeded: false,
     };
 }
 
@@ -126,6 +168,8 @@ struct JAccepted {
     velocity: Worst,
     torque: Worst,
     gain: Worst,
+    step: Worst,
+    pd_torque: Worst,
     /// `(gap, max_interval)` if the stream was slower than allowed.
     gap: Option<(u64, u64)>,
     pair_idx: usize,
@@ -148,10 +192,25 @@ fn slot_id(i: usize) -> Option<u8> {
     u8::try_from(i).ok()
 }
 
-/// Is `m` inside the compiled envelope `lim` (post-condition; exact, clamps
-/// produce the bound itself)?
-fn motor_ok(m: &MotorCmd, lim: &CompiledMotor) -> bool {
-    if !m.is_finite() {
+/// `x` clamped into `[lo, hi]` without `f64::clamp` (which panics on
+/// inverted or NaN bounds). Compiled bounds are ordered; if they ever were
+/// not, the result is still one of the bounds, and the post-condition
+/// catches it.
+fn clamp_to(x: f64, lo: f64, hi: f64) -> f64 {
+    debug_assert!(lo <= hi, "inverted clamp bounds [{lo}, {hi}]");
+    x.max(lo).min(hi)
+}
+
+/// `true` if the slot's position target is in force with `kp > 0`.
+fn holds_position(m: &MotorCmd) -> bool {
+    m.mode == MotorMode::Enabled && m.kp > 0.0
+}
+
+/// Is `m` inside the compiled envelope `lim` (post-condition; clamps produce
+/// the bound itself, steps up to rounding)? `q_prev` is [`NO_Q`] when there
+/// is no previous target.
+fn motor_ok(m: &MotorCmd, lim: &CompiledMotor, q_prev: f64) -> bool {
+    if !m.is_finite() || m.disabled_but_loaded() {
         return false;
     }
     if !lim.enabled {
@@ -164,34 +223,77 @@ fn motor_ok(m: &MotorCmd, lim: &CompiledMotor) -> bool {
     if m.mode == MotorMode::Disabled {
         return true;
     }
-    kp <= lim.kp_max
+    let in_envelope = kp <= lim.kp_max
         && kd <= lim.kd_max
         && m.tau.abs() <= lim.tau_max
         && (kd == 0.0 || m.dq.abs() <= lim.dq_max)
-        && (kp == 0.0 || (lim.q_min <= m.q && m.q <= lim.q_max))
+        && (kp == 0.0 || (lim.q_min <= m.q && m.q <= lim.q_max));
+    if !in_envelope {
+        return false;
+    }
+    if kp > 0.0 && q_prev.is_finite() {
+        let d = (m.q - q_prev).abs();
+        let tol = STEP_TOL * (1.0 + m.q.abs().max(q_prev.abs()));
+        if lim.max_dq_step.is_some_and(|s| d > s + tol) {
+            return false;
+        }
+        if lim
+            .tau_pd_max
+            .is_some_and(|t| kp * d > t * (1.0 + PD_TOL) + kp * tol)
+        {
+            return false;
+        }
+    }
+    true
 }
 
-fn frame_ok(ch: &CompiledJointChannel, f: &JointFrame) -> bool {
-    f.slots() == ch.slots
+/// Humanoid: is every enabled slot of `f` limp (and is there one)?
+fn all_limp(ch: &CompiledJointChannel, f: &JointFrame) -> bool {
+    ch.any_enabled
         && f.motors()
             .iter()
             .zip(ch.motors.iter())
-            .all(|(m, l)| motor_ok(m, l))
+            .filter(|(_, l)| l.enabled)
+            .all(|(m, _)| m.is_limp())
+}
+
+fn pins_ok(ch: &CompiledJointChannel, f: &JointFrame) -> bool {
+    ch.pinned_mode_pr.is_none_or(|p| f.mode_pr == Some(p))
+        && ch
+            .pinned_mode_machine
+            .is_none_or(|p| f.mode_machine == Some(p))
+}
+
+fn frame_ok(ch: &CompiledJointChannel, f: &JointFrame, q_prev: &[f64; MAX_MOTORS]) -> bool {
+    f.slots() == ch.slots
+        && pins_ok(ch, f)
+        && !(ch.humanoid && all_limp(ch, f))
+        && f.motors()
+            .iter()
+            .zip(ch.motors.iter())
+            .zip(q_prev.iter())
+            .all(|((m, l), q)| motor_ok(m, l, *q))
 }
 
 /// The hold substitute: `f` with every velocity target zeroed (a held
-/// position target with a non-zero velocity target would keep pushing).
-fn hold_frame(f: &JointFrame) -> JointFrame {
+/// position target with a non-zero velocity target would keep pushing), and
+/// with its feed-forward torque zeroed too when `drop_tau` (a humanoid hold
+/// past `max_hold_ns`).
+fn hold_frame(f: &JointFrame, drop_tau: bool) -> JointFrame {
     let mut h = *f;
     for m in h.motors_mut() {
         m.dq = 0.0;
+        if drop_tau {
+            m.tau = 0.0;
+        }
     }
     h.crc_ok = Some(true);
     h
 }
 
 /// The damping substitute (non-humanoid platforms only): every enabled slot
-/// `kp = 0, dq = 0, tau = 0, kd = min(damping_kd, kd_max)`; unused slots off.
+/// `kp = 0, dq = 0, tau = 0, kd = min(damping_kd, kd_max)`; unused slots
+/// off; the channel's pinned `mode_pr` / `mode_machine`.
 fn damping_frame(ch: &CompiledJointChannel) -> JointFrame {
     let mut f = JointFrame::off(ch.slots, Some(true));
     for (m, lim) in f.motors_mut().iter_mut().zip(ch.motors.iter()) {
@@ -201,7 +303,18 @@ fn damping_frame(ch: &CompiledJointChannel) -> JointFrame {
             MotorCmd::OFF
         };
     }
+    f.mode_pr = ch.pinned_mode_pr;
+    f.mode_machine = ch.pinned_mode_machine;
     f
+}
+
+/// What [`Firewall::emit_substitute`] decided.
+#[derive(Debug, Clone, Copy)]
+struct Emitted {
+    sub: Option<JointSubstitute>,
+    /// A humanoid hold just passed `max_hold_ns` in this episode:
+    /// `(hold age, max_hold_ns)` for the `joint_hold_exceeded` event.
+    exceeded: Option<(u64, u64)>,
 }
 
 /// Which substitute path is asking.
@@ -239,11 +352,12 @@ impl Firewall {
         match result {
             Err(rej) => self.reject_joint(cmd, now, rej),
             Ok(acc) => {
-                let ok = self
-                    .policy
-                    .joint_index(cmd.channel)
-                    .and_then(|j| self.policy.joint_channels.get(j))
-                    .is_some_and(|ch| frame_ok(ch, &acc.out));
+                let ok = self.policy.joint_index(cmd.channel).is_some_and(|j| {
+                    match (self.policy.joint_channels.get(j), self.jchans.get(j)) {
+                        (Some(ch), Some(st)) => frame_ok(ch, &acc.out, &st.q_prev),
+                        _ => false,
+                    }
+                });
                 if !ok {
                     return self.fault_joint(cmd, now);
                 }
@@ -257,7 +371,9 @@ impl Firewall {
 
     /// The verdict when the gateway **cannot evaluate** a joint frame
     /// (deadline miss, internal fault), per the platform's
-    /// [`FaultPolicy`]; a humanoid never gets a damping frame.
+    /// [`FaultPolicy`]; on a humanoid channel it always holds (or emits
+    /// nothing), whatever the fault policy: never a damping frame, never the
+    /// unchecked input.
     pub fn joint_fault_verdict(&mut self, cmd: &JointCommand, now: u64) -> JointVerdict {
         self.stats.checked = self.stats.checked.saturating_add(1);
         self.fault_joint(cmd, now)
@@ -300,7 +416,7 @@ impl Firewall {
         let Some(ch) = self.policy.joint_channels.get(j) else {
             return Err(JRejection::new(RejectReason::UnknownChannel));
         };
-        let st = self.jchans.get(j).copied().unwrap_or(JointChanState::INIT);
+        let st = self.jchans.get(j).unwrap_or(&JointChanState::INIT);
         let pair_idx = ch_idx
             .checked_mul(self.nsrc)
             .and_then(|x| x.checked_add(src_idx));
@@ -312,7 +428,7 @@ impl Firewall {
 
         // 3. Minimum interval since the last accepted frame (per channel:
         //    it bounds what the motor bus receives, whoever sends).
-        let since = st.accepted.map(|(_, at)| now.saturating_sub(at));
+        let since = st.accepted.as_ref().map(|(_, at)| now.saturating_sub(*at));
         if let Some(gap) = since {
             if gap < ch.min_interval_ns {
                 return Err(JRejection {
@@ -348,6 +464,23 @@ impl Firewall {
                 None,
             ));
         }
+        // 5. Frame-level modes (G1 / H1-2 `mode_pr`, `mode_machine`): they
+        //    change what the envelope's ankle `q` bounds mean.
+        for (pin, got) in [
+            (ch.pinned_mode_pr, cmd.frame.mode_pr),
+            (ch.pinned_mode_machine, cmd.frame.mode_machine),
+        ] {
+            if let Some(p) = pin {
+                if got != Some(p) {
+                    return Err(JRejection::with(
+                        RejectReason::JointModePinMismatch,
+                        got.map_or(f64::NAN, f64::from),
+                        f64::from(p),
+                        None,
+                    ));
+                }
+            }
+        }
 
         // 6. Finite values (every slot, used or not).
         if !cmd.frame.is_finite() {
@@ -382,7 +515,10 @@ impl Firewall {
                 ));
             }
         }
-        pair_new.last_stamp = Some(cmd.stamp_ns);
+        // The watermark never runs ahead of `now`: an accepted frame stamped
+        // up to `max_future_ns` early must not lock out the on-time frames
+        // that follow it.
+        pair_new.last_stamp = Some(cmd.stamp_ns.min(now));
 
         // 8 + 9. Per slot: hard rejections, then clamps.
         let f = ch.hard_factor;
@@ -390,14 +526,22 @@ impl Firewall {
         let mut reasons = JointLimitReasons::NONE;
         let (mut position, mut velocity, mut torque, mut gain) =
             (NO_WORST, NO_WORST, NO_WORST, NO_WORST);
-        for (i, (m, lim)) in out
+        let (mut step, mut pd_torque) = (NO_WORST, NO_WORST);
+        for (i, ((m, lim), q_prev)) in out
             .motors_mut()
             .iter_mut()
             .zip(ch.motors.iter())
+            .zip(st.q_prev.iter())
             .enumerate()
         {
             let slot = slot_id(i);
+            let q_prev = *q_prev;
             let rej = |reason, value, limit| Err(JRejection::with(reason, value, limit, slot));
+            // Mode off must mean inert: never forward gains / torque the
+            // firewall did not check on the strength of a mode octet.
+            if m.disabled_but_loaded() {
+                return rej(RejectReason::JointModeInconsistent, 1.0, 0.0);
+            }
             if !lim.enabled {
                 if m.energises() {
                     return rej(RejectReason::DisabledMotorEnergised, 1.0, 0.0);
@@ -406,10 +550,10 @@ impl Firewall {
             }
             let (kp, kd) = (m.effective_kp(), m.effective_kd());
             if kp < lim.kp_min {
-                return rej(RejectReason::JointGainOutOfEnvelope, kp, lim.kp_min);
+                return rej(RejectReason::JointGainBelowMinimum, kp, lim.kp_min);
             }
             if kd < lim.kd_min {
-                return rej(RejectReason::JointGainOutOfEnvelope, kd, lim.kd_min);
+                return rej(RejectReason::JointGainBelowMinimum, kd, lim.kd_min);
             }
             if m.mode == MotorMode::Disabled {
                 continue;
@@ -433,8 +577,23 @@ impl Firewall {
             if kp > 0.0 && dist > margin {
                 return rej(RejectReason::JointPositionOutOfEnvelope, dist, margin);
             }
+            // Step bounds against the previous accepted target (if any).
+            let tracked = kp > 0.0 && q_prev.is_finite();
+            if tracked {
+                let d = (m.q - q_prev).abs();
+                if let Some(s) = lim.max_dq_step {
+                    if d > f * s {
+                        return rej(RejectReason::JointStepOutOfEnvelope, d, f * s);
+                    }
+                }
+                if let Some(t) = lim.tau_pd_max {
+                    if kp * d > f * t {
+                        return rej(RejectReason::JointPdTorqueOutOfEnvelope, kp * d, f * t);
+                    }
+                }
+            }
 
-            // Clamps: lower magnitudes / project q; never raise anything.
+            // Clamps: lower magnitudes / move q; never raise anything.
             if kp > lim.kp_max {
                 m.kp = lim.kp_max;
                 reasons.insert(JointLimitReasons::GAIN);
@@ -446,24 +605,56 @@ impl Firewall {
                 note(&mut gain, kd, lim.kd_max, slot);
             }
             if tau > lim.tau_max {
-                m.tau = m.tau.clamp(-lim.tau_max, lim.tau_max);
+                m.tau = clamp_to(m.tau, -lim.tau_max, lim.tau_max);
                 reasons.insert(JointLimitReasons::TORQUE);
                 note(&mut torque, tau, lim.tau_max, slot);
             }
             if kd > 0.0 && dq > lim.dq_max {
-                m.dq = m.dq.clamp(-lim.dq_max, lim.dq_max);
+                m.dq = clamp_to(m.dq, -lim.dq_max, lim.dq_max);
                 reasons.insert(JointLimitReasons::VELOCITY);
                 note(&mut velocity, dq, lim.dq_max, slot);
             }
             if kp > 0.0 && dist > 0.0 {
-                m.q = m.q.clamp(lim.q_min, lim.q_max);
+                m.q = clamp_to(m.q, lim.q_min, lim.q_max);
                 reasons.insert(JointLimitReasons::POSITION);
                 note(&mut position, dist, 0.0, slot);
             }
+            if tracked && m.kp > 0.0 {
+                // `q_prev` and the (projected) target are both inside the
+                // range, so any point between them is too.
+                let target = m.q;
+                let d = (target - q_prev).abs();
+                let step_over = lim.max_dq_step.filter(|s| d > *s);
+                let pd_over = lim.tau_pd_max.filter(|t| m.kp * d > *t);
+                if step_over.is_some() || pd_over.is_some() {
+                    let allowed = step_over
+                        .unwrap_or(f64::INFINITY)
+                        .min(pd_over.map_or(f64::INFINITY, |t| t / m.kp));
+                    let moved = if target > q_prev {
+                        q_prev + allowed
+                    } else {
+                        q_prev - allowed
+                    };
+                    m.q = clamp_to(moved, q_prev.min(target), q_prev.max(target));
+                }
+                if let Some(s) = step_over {
+                    reasons.insert(JointLimitReasons::STEP);
+                    note(&mut step, d, s, slot);
+                }
+                if let Some(t) = pd_over {
+                    reasons.insert(JointLimitReasons::PD_TORQUE);
+                    note(&mut pd_torque, m.kp * d, t, slot);
+                }
+            }
         }
 
-        let gap = match (since, ch.max_interval_ns) {
-            (Some(g), Some(mx)) if g > mx => Some((g, mx)),
+        // 10. Humanoid: a frame that makes every enabled joint limp.
+        if ch.humanoid && all_limp(ch, &out) {
+            return Err(JRejection::new(RejectReason::JointLimpFrame));
+        }
+
+        let gap = match since {
+            Some(g) if g > ch.max_interval_ns => Some((g, ch.max_interval_ns)),
             _ => None,
         };
         Ok(JAccepted {
@@ -473,6 +664,8 @@ impl Firewall {
             velocity,
             torque,
             gain,
+            step,
+            pd_torque,
             gap,
             pair_idx,
             pair_new,
@@ -507,6 +700,16 @@ impl Firewall {
                 rules::JOINT_GAIN_OUT_OF_ENVELOPE,
                 acc.gain,
             ),
+            (
+                JointLimitReasons::STEP,
+                rules::JOINT_STEP_OUT_OF_ENVELOPE,
+                acc.step,
+            ),
+            (
+                JointLimitReasons::PD_TORQUE,
+                rules::JOINT_PD_TORQUE_OUT_OF_ENVELOPE,
+                acc.pd_torque,
+            ),
         ] {
             if acc.reasons.contains(bit) {
                 self.record(rule, Severity::High, key, now, action, (value, limit), slot);
@@ -535,6 +738,15 @@ impl Firewall {
             .and_then(|j| self.jchans.get_mut(j))
         {
             st.accepted = Some((forwarded, now));
+            st.last_emit_at = Some(now);
+            // The step reference is the enforced output (also in observe
+            // mode, so the would-have verdicts stay those of enforcement).
+            for (q, m) in st.q_prev.iter_mut().zip(acc.out.motors()) {
+                *q = if holds_position(m) { m.q } else { NO_Q };
+            }
+            st.holding = false;
+            st.hold_exceeded = false;
+            self.stats.joint_hold_age_ns = 0;
         }
         if self.observe {
             self.stats.passed = self.stats.passed.saturating_add(1);
@@ -568,49 +780,143 @@ impl Firewall {
     }
 
     /// The substitute for a rejected / faulted frame on joint channel `j`
-    /// (see the module docs). A humanoid channel only ever holds (or emits
-    /// nothing): this is enforced here regardless of the configuration.
-    fn substitute_joint(
-        &self,
-        cmd: &JointCommand,
-        now: u64,
-        j: usize,
-        why: SubFor,
-    ) -> Option<JointSubstitute> {
-        let ch = self.policy.joint_channels.get(j)?;
-        let st = self.jchans.get(j)?;
-        let held = st.accepted.map(|(f, at)| (hold_frame(&f), at));
+    /// (see the module docs), and the channel state it implies. A humanoid
+    /// channel only ever holds (or emits nothing): this is enforced here
+    /// regardless of the configuration. Nothing is emitted while the last
+    /// emission on the channel is younger than its `min_interval_ns`.
+    fn emit_substitute(&mut self, cmd: &JointCommand, now: u64, j: usize, why: SubFor) -> Emitted {
+        let none = Emitted {
+            sub: None,
+            exceeded: None,
+        };
+        let (Some(ch), Some(st)) = (self.policy.joint_channels.get(j), self.jchans.get(j)) else {
+            return none;
+        };
+        // A flood of rejected frames must not become a flood of substitutes.
+        // (Under a clock regression the age cannot be measured: allowed.)
+        if st
+            .last_emit_at
+            .and_then(|at| now.checked_sub(at))
+            .is_some_and(|age| age < ch.min_interval_ns)
+        {
+            return none;
+        }
         let platform = &self.policy.platform;
-        let hold = |f: JointFrame| (SubstituteKind::HoldLast, f);
-        let damp = || (SubstituteKind::Zero, damping_frame(ch));
-        let (kind, frame) = if ch.humanoid {
-            hold(held?.0)
+        let max_hold = match platform.fail_behaviour {
+            FailBehaviour::HoldLast { max_hold_ns } => Some(max_hold_ns),
+            _ => None,
+        };
+        // `Some((frame, age))` = hold, `None` = damp.
+        let held = st.accepted.map(|(f, at)| (f, now.saturating_sub(at)));
+        let choice: Option<(JointFrame, u64)> = if ch.humanoid {
+            match held {
+                Some(h) => Some(h),
+                None => return none,
+            }
         } else {
             match why {
                 SubFor::Fault => match (platform.fault_policy, held) {
-                    (FaultPolicy::FailHold, Some((f, _))) => hold(f),
-                    _ => damp(),
+                    (FaultPolicy::FailHold, Some(h)) => Some(h),
+                    _ => None,
                 },
-                SubFor::Reject { allow_hold } => match (platform.fail_behaviour, held) {
+                SubFor::Reject { allow_hold } => match (platform.fail_behaviour, st.accepted) {
                     (FailBehaviour::HoldLast { max_hold_ns }, Some((f, at)))
                         if allow_hold
                             && now.checked_sub(at).is_some_and(|age| age <= max_hold_ns) =>
                     {
-                        hold(f)
+                        Some((f, now.saturating_sub(at)))
                     }
-                    _ => damp(),
+                    _ => None,
                 },
             }
         };
-        Some(JointSubstitute {
-            kind,
-            cmd: JointCommand {
-                source: SourceId::FIREWALL,
-                channel: cmd.channel,
-                stamp_ns: now,
-                frame,
-            },
-        })
+        let humanoid = ch.humanoid;
+        let (kind, frame, exceeded) = match choice {
+            Some((f, age)) => {
+                // Humanoid past max_hold_ns: keep holding (never limp), but
+                // drop the stale feed-forward torque.
+                let over = if humanoid {
+                    max_hold.filter(|mx| age > *mx).map(|mx| (age, mx))
+                } else {
+                    None
+                };
+                (
+                    SubstituteKind::HoldLast,
+                    hold_frame(&f, over.is_some()),
+                    over,
+                )
+            }
+            None => (SubstituteKind::Zero, damping_frame(ch), None),
+        };
+        let mut report = None;
+        if let Some(st) = self.jchans.get_mut(j) {
+            st.last_emit_at = Some(now);
+            match kind {
+                SubstituteKind::HoldLast => {
+                    if !st.holding {
+                        st.holding = true;
+                        self.stats.joint_hold_episodes =
+                            self.stats.joint_hold_episodes.saturating_add(1);
+                    }
+                    self.stats.joint_hold_age_ns = held.map_or(0, |(_, age)| age);
+                    if exceeded.is_some() && !st.hold_exceeded {
+                        st.hold_exceeded = true;
+                        self.stats.joint_holds_exceeded =
+                            self.stats.joint_holds_exceeded.saturating_add(1);
+                        report = exceeded;
+                    }
+                }
+                SubstituteKind::Zero => {
+                    // The motors were released: no target is in force any
+                    // more, and any hold episode is over.
+                    st.q_prev = [NO_Q; MAX_MOTORS];
+                    st.holding = false;
+                    st.hold_exceeded = false;
+                    self.stats.joint_hold_age_ns = 0;
+                }
+            }
+        }
+        Emitted {
+            sub: Some(JointSubstitute {
+                kind,
+                cmd: JointCommand {
+                    source: SourceId::FIREWALL,
+                    channel: cmd.channel,
+                    stamp_ns: now,
+                    frame,
+                },
+            }),
+            exceeded: report,
+        }
+    }
+
+    /// Record the rejection / fault event, then the hold escalation (if
+    /// any), for an emitted substitute.
+    #[allow(clippy::too_many_arguments)]
+    fn record_rejection(
+        &mut self,
+        cmd: &JointCommand,
+        now: u64,
+        rule: &'static str,
+        sev: Severity,
+        emitted: Emitted,
+        (value, limit): (f64, f64),
+        slot: Option<u8>,
+    ) {
+        let key = (cmd.channel, cmd.source);
+        let action = EventAction::Rejected(emitted.sub.map(|s| s.kind));
+        self.record(rule, sev, key, now, action, (value, limit), slot);
+        if let Some((age, mx)) = emitted.exceeded {
+            self.record(
+                rules::JOINT_HOLD_EXCEEDED,
+                Severity::Critical,
+                key,
+                now,
+                action,
+                (age as f64, mx as f64),
+                None,
+            );
+        }
     }
 
     fn reject_joint(&mut self, cmd: &JointCommand, now: u64, rej: JRejection) -> JointVerdict {
@@ -634,11 +940,15 @@ impl Firewall {
             };
         }
 
+        let none = Emitted {
+            sub: None,
+            exceeded: None,
+        };
         let j = self.policy.joint_index(cmd.channel);
         let foreign = rej.reason.is_foreign_source();
-        let sub = match j {
-            None => None,
-            Some(_) if !rej.substitutable => None,
+        let emitted = match j {
+            None => none,
+            Some(_) if !rej.substitutable => none,
             Some(j) if foreign => {
                 let platform = &self.policy.platform;
                 let window_open = match self.jchans.get(j).and_then(|s| s.last_foreign_sub_at) {
@@ -647,42 +957,38 @@ impl Firewall {
                 };
                 match platform.foreign_source_action {
                     ForeignSourceAction::Substitute if window_open => {
-                        let s = self.substitute_joint(
-                            cmd,
-                            now,
-                            j,
-                            SubFor::Reject { allow_hold: false },
-                        );
-                        if s.is_some() {
+                        let e =
+                            self.emit_substitute(cmd, now, j, SubFor::Reject { allow_hold: false });
+                        if e.sub.is_some() {
                             if let Some(st) = self.jchans.get_mut(j) {
                                 st.last_foreign_sub_at = Some(now);
                             }
                         }
-                        s
+                        e
                     }
-                    _ => None,
+                    _ => none,
                 }
             }
             Some(j) => {
                 // Under a clock regression the hold age cannot be measured:
                 // non-humanoid platforms damp (a humanoid still holds).
                 let allow_hold = rej.reason != RejectReason::ClockRegression;
-                self.substitute_joint(cmd, now, j, SubFor::Reject { allow_hold })
+                self.emit_substitute(cmd, now, j, SubFor::Reject { allow_hold })
             }
         };
-        self.record(
+        self.record_rejection(
+            cmd,
+            now,
             rule,
             sev,
-            key,
-            now,
-            EventAction::Rejected(sub.map(|s| s.kind)),
+            emitted,
             (rej.value, rej.limit),
             rej.slot,
         );
         self.stats.rejected = self.stats.rejected.saturating_add(1);
         JointVerdict::Rejected {
             reason: rej.reason,
-            substitute: sub,
+            substitute: emitted.sub,
         }
     }
 
@@ -690,7 +996,15 @@ impl Firewall {
         self.stats.faults = self.stats.faults.saturating_add(1);
         let (rule, sev) = reject_rule(RejectReason::InternalFault);
         let key = (cmd.channel, cmd.source);
-        let fail_open = self.observe || self.policy.platform.fault_policy == FaultPolicy::FailOpen;
+        let j = self.policy.joint_index(cmd.channel);
+        let humanoid = j
+            .and_then(|j| self.policy.joint_channels.get(j))
+            .is_some_and(|ch| ch.humanoid);
+        // A humanoid joint channel never forwards an unchecked frame on a
+        // fault (compile refuses `FailOpen` there; this holds regardless).
+        // Observe mode never enforces anything.
+        let fail_open = self.observe
+            || (!humanoid && self.policy.platform.fault_policy == FaultPolicy::FailOpen);
         if fail_open {
             self.record(
                 rule,
@@ -710,23 +1024,18 @@ impl Firewall {
                 }),
             };
         }
-        let sub = self
-            .policy
-            .joint_index(cmd.channel)
-            .and_then(|j| self.substitute_joint(cmd, now, j, SubFor::Fault));
-        self.record(
-            rule,
-            sev,
-            key,
-            now,
-            EventAction::Rejected(sub.map(|s| s.kind)),
-            (f64::NAN, f64::NAN),
-            None,
-        );
+        let emitted = match j {
+            Some(j) => self.emit_substitute(cmd, now, j, SubFor::Fault),
+            None => Emitted {
+                sub: None,
+                exceeded: None,
+            },
+        };
+        self.record_rejection(cmd, now, rule, sev, emitted, (f64::NAN, f64::NAN), None);
         self.stats.rejected = self.stats.rejected.saturating_add(1);
         JointVerdict::Rejected {
             reason: RejectReason::InternalFault,
-            substitute: sub,
+            substitute: emitted.sub,
         }
     }
 }

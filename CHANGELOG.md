@@ -12,6 +12,25 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Added
 
+- Motion Firewall low-level joint path (`check_joint`), review fixes:
+  per-slot `max_dq_step` / `tau_pd_max` bounds on the position target
+  relative to the previous accepted target (stepped within the hard
+  factor, rejected beyond; new rule ids `joint_step_out_of_envelope`,
+  `joint_pd_torque_out_of_envelope`); `MotorMode::from_u8` (any non-zero
+  mode octet is enabled, e.g. Unitree `0x0A`); a mode-off slot carrying
+  `kp` / `kd` / `tau` is rejected (`joint_mode_inconsistent`); optional
+  `JointFrame::mode_pr` / `mode_machine` with channel pins
+  (`pinned_mode_pr` / `pinned_mode_machine`, `joint_mode_pin_mismatch`);
+  humanoid limp protection (a frame with every enabled joint limp is
+  rejected, `joint_limp_frame`); humanoid hold escalation past
+  `max_hold_ns` (Critical `joint_hold_exceeded` once per episode, held
+  feed-forward torque zeroed, never released) with `Stats`
+  `joint_hold_episodes` / `joint_holds_exceeded` / `joint_hold_age_ns`;
+  substitutes rate-bounded by `min_interval_ns` since the last emission;
+  gain-below-minimum rejections get their own id
+  (`joint_gain_below_minimum`, coalescing keeps the smallest gain). All new
+  ids are in the correlation and OCSF catalogs.
+
 - Vendor-neutral action catalog `robodr_responder::actions` (replaces
   `robodr_responder::autosecops`): one list of seven robot actions —
   `restrict_motion`, `quarantine_node`, `isolate_network`,
@@ -346,6 +365,16 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   evidence export).
 
 ### Changed
+
+- Motion Firewall joint channels (breaking for joint configs): `rate`
+  (with `min_interval_ns > 0`) is required; `max_age_ns` /
+  `max_future_ns` are capped at 10 s; a humanoid joint channel refuses
+  `fault_policy: fail_open` (and a fault always holds there), needs
+  `max_dq_step` on every enabled slot and a non-zero `kp_min` or `kd_min`
+  unless the slot sets `allow_limp: true`. An accepted future-stamped frame
+  advances the out-of-order watermark only to `now`. The G1 example gives
+  the arms non-zero gain minimums and pins `mode_pr`; both Unitree examples
+  set step bounds.
 
 - **Findings contract 2.0 (`robodr.findings`)**, superseding
   `robot-edr.findings` 1.3: vendor-neutral envelope; `data_source` is a

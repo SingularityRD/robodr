@@ -17,8 +17,9 @@
 //! By default each runs **paced in real time** at its rate (sleep, then spin
 //! to the deadline), so every `check_joint` call sees the caches a real
 //! control loop sees between ticks. The frame mix: smooth trajectories, ~3 %
-//! frames with a clamped field, ~1.5 % rejected (CRC invalid, NaN, an unused
-//! slot energised, a torque beyond the hard bound).
+//! frames with a stepped position target and a clamped torque, ~1.5 %
+//! rejected (CRC invalid, NaN, an unused slot energised, a torque beyond the
+//! hard bound).
 //!
 //! Prints, per scenario, decision-time p50 / p99 / p99.9 / max / mean,
 //! jitter, the verdict mix and the number of heap allocations made on this
@@ -107,6 +108,9 @@ const DQ: f64 = 20.0;
 const TAU: f64 = 60.0;
 const KP: f64 = 200.0;
 const KD: f64 = 8.0;
+/// Per-frame position step bound (rad); the trajectories move ~2 mrad per
+/// tick, the "clamp" frames 70 mrad (stepped, within the hard factor).
+const STEP: f64 = 0.05;
 
 fn firewall(sc: &Scenario) -> Firewall {
     let mut p = Profile {
@@ -128,6 +132,8 @@ fn firewall(sc: &Scenario) -> Firewall {
             if i < sc.active {
                 MotorLimits {
                     kp_min: if sc.humanoid { 5.0 } else { 0.0 },
+                    max_dq_step: Some(STEP),
+                    tau_pd_max: Some(TAU),
                     ..MotorLimits::enabled(Q, DQ, TAU, KP, KD)
                 }
             } else {
@@ -203,7 +209,13 @@ fn work(sc: &Scenario, fw: &Firewall, n: usize, seed: u64) -> Vec<(JointCommand,
         let roll = r.next() % 1000;
         let slot = (r.next() as usize) % sc.active;
         match roll {
-            0..=29 => frame.motor_mut(slot).expect("slot").q = 1.9, // clamp
+            0..=29 => {
+                // Clamp: a position nudge past the step bound and a torque
+                // past its bound (both limited, neither rejected).
+                let m = frame.motor_mut(slot).expect("slot");
+                m.q += 0.07;
+                m.tau = 1.5 * TAU;
+            }
             30..=32 => frame.crc_ok = Some(false),
             33..=35 => frame.motor_mut(slot).expect("slot").dq = f64::NAN,
             36..=38 if sc.slots > sc.active => {

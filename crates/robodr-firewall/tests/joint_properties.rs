@@ -12,9 +12,15 @@
 //!   `kp`, `kd` (never raises a gain) and projects `q`; mode and unused
 //!   slots untouched;
 //! - limiting is idempotent: a limited frame passes unchanged;
-//! - a substitute is the held last accepted frame (velocity zeroed) or the
-//!   damping frame, never a value of the rejected frame, and **never** the
-//!   damping frame on a humanoid.
+//! - a substitute is the held last accepted frame (velocity zeroed; on a
+//!   humanoid past `max_hold_ns` also `tau` zeroed) or the damping frame,
+//!   never a value of the rejected frame, and **never** the damping frame
+//!   on a humanoid;
+//! - a mode-off slot that carries gains / torque is never forwarded;
+//! - forwarded position targets respect `max_dq_step` / `tau_pd_max`
+//!   against an independently modelled previous target;
+//! - nothing limp (every enabled slot without stiffness and damping) is
+//!   ever emitted on a humanoid.
 
 mod common;
 use common::*;
@@ -32,9 +38,16 @@ struct Lim {
     tau: f64,
     kp: (f64, f64),
     kd: (f64, f64),
+    allow_limp: bool,
+    step: Option<f64>,
+    pd: Option<f64>,
 }
 
-fn rand_lim(r: &mut Rng) -> Lim {
+const NO_Q: f64 = f64::NAN;
+/// Humanoid `max_hold_ns` (`common::humanoid()`).
+const HUMANOID_MAX_HOLD: u64 = 50 * MS;
+
+fn rand_lim(r: &mut Rng, humanoid: bool) -> Lim {
     let lo = r.range(-3.0, 0.5);
     let kp_max = if r.chance(0.1) {
         0.0
@@ -63,6 +76,11 @@ fn rand_lim(r: &mut Rng) -> Lim {
             },
             kd_max,
         ),
+        // A humanoid needs a non-zero minimum or an explicit opt-in; the
+        // opt-in is set below where both minimums are zero.
+        allow_limp: false,
+        step: (humanoid || r.chance(0.5)).then(|| r.range(0.05, 2.0)),
+        pd: r.chance(0.3).then(|| r.range(1.0, 100.0)),
     }
 }
 
@@ -73,17 +91,24 @@ fn to_spec(l: &Lim) -> MotorLimits {
     MotorLimits {
         kp_min: l.kp.0,
         kd_min: l.kd.0,
+        allow_limp: l.allow_limp,
+        max_dq_step: l.step,
+        tau_pd_max: l.pd,
         ..MotorLimits::enabled(l.q, l.dq, l.tau, l.kp.1, l.kd.1)
     }
 }
 
-/// Independent envelope check (`dq_env` = envelope max_joint_speed).
-fn ref_motor_ok(m: &MotorCmd, l: &Lim, dq_env: f64) -> bool {
+/// Independent envelope check (`dq_env` = envelope max_joint_speed;
+/// `q_prev` = modelled previous position target, NaN if none).
+fn ref_motor_ok(m: &MotorCmd, l: &Lim, dq_env: f64, q_prev: f64) -> bool {
     let finite = [m.q, m.dq, m.tau, m.kp, m.kd].iter().all(|x| x.is_finite());
     if !finite {
         return false;
     }
     let on = m.mode == MotorMode::Enabled;
+    if !on && (m.kp != 0.0 || m.kd != 0.0 || m.tau != 0.0) {
+        return false;
+    }
     if !l.enabled {
         return !(on && (m.kp != 0.0 || m.kd != 0.0 || m.tau != 0.0));
     }
@@ -94,19 +119,56 @@ fn ref_motor_ok(m: &MotorCmd, l: &Lim, dq_env: f64) -> bool {
     if !on {
         return true;
     }
-    kp <= l.kp.1
+    let base = kp <= l.kp.1
         && kd <= l.kd.1
         && m.tau.abs() <= l.tau
         && (kd == 0.0 || m.dq.abs() <= l.dq.min(dq_env))
-        && (kp == 0.0 || (l.q.0 <= m.q && m.q <= l.q.1))
+        && (kp == 0.0 || (l.q.0 <= m.q && m.q <= l.q.1));
+    if !base {
+        return false;
+    }
+    if kp > 0.0 && q_prev.is_finite() {
+        // Rounding of `q_prev ± step` only.
+        let d = (m.q - q_prev).abs();
+        let eps = 1e-9;
+        if l.step.is_some_and(|s| d > s + eps) {
+            return false;
+        }
+        if l.pd.is_some_and(|t| kp * d > t + kp * eps) {
+            return false;
+        }
+    }
+    true
 }
 
-fn ref_frame_ok(f: &JointFrame, lims: &[Lim], dq_env: f64) -> bool {
+fn ref_frame_ok(f: &JointFrame, lims: &[Lim], dq_env: f64, q_prev: &[f64]) -> bool {
     f.slots() == lims.len()
         && f.motors()
             .iter()
             .zip(lims)
-            .all(|(m, l)| ref_motor_ok(m, l, dq_env))
+            .zip(q_prev)
+            .all(|((m, l), q)| ref_motor_ok(m, l, dq_env, *q))
+}
+
+/// Every enabled slot without stiffness and damping (and at least one).
+fn ref_all_limp(f: &JointFrame, lims: &[Lim]) -> bool {
+    lims.iter().any(|l| l.enabled)
+        && f.motors()
+            .iter()
+            .zip(lims)
+            .filter(|(_, l)| l.enabled)
+            .all(|(m, _)| m.mode == MotorMode::Disabled || (m.kp == 0.0 && m.kd == 0.0))
+}
+
+/// The modelled previous position targets after `out` was accepted.
+fn next_q_prev(out: &JointFrame) -> [f64; MAX_MOTORS] {
+    let mut q = [NO_Q; MAX_MOTORS];
+    for (dst, m) in q.iter_mut().zip(out.motors()) {
+        if m.mode == MotorMode::Enabled && m.kp > 0.0 {
+            *dst = m.q;
+        }
+    }
+    q
 }
 
 fn rand_motor(r: &mut Rng, l: &Lim) -> MotorCmd {
@@ -170,6 +232,12 @@ fn rand_motor(r: &mut Rng, l: &Lim) -> MotorCmd {
             kd: f64::MAX,
             ..inside(r)
         },
+        98 => MotorCmd {
+            // Mode off but loaded.
+            kp: r.range(0.0, 50.0),
+            tau: r.range(0.0, 5.0),
+            ..MotorCmd::OFF
+        },
         _ => MotorCmd::enabled(0.0, 0.0, r.range(0.0, 1.0), 0.0, 0.0),
     }
 }
@@ -194,7 +262,7 @@ fn rand_frame(r: &mut Rng, lims: &[Lim]) -> JointFrame {
     // Keep most frames clean so the accept paths run often.
     if r.chance(0.6) {
         for (m, l) in ms.iter_mut().zip(lims) {
-            if l.enabled && !ref_motor_ok(m, l, ENV_DQ) && r.chance(0.8) {
+            if l.enabled && !ref_motor_ok(m, l, ENV_DQ, NO_Q) && r.chance(0.8) {
                 *m = MotorCmd::enabled(
                     (l.q.0 + l.q.1) / 2.0,
                     0.0,
@@ -222,17 +290,24 @@ struct Setup {
 
 fn setup(r: &mut Rng, locked: bool) -> Setup {
     let slots = 1 + r.below(MAX_MOTORS as u64) as usize;
-    let lims: Vec<Lim> = (0..slots).map(|_| rand_lim(r)).collect();
     let humanoid = r.chance(0.5);
+    let lims: Vec<Lim> = (0..slots)
+        .map(|_| {
+            let mut l = rand_lim(r, humanoid);
+            if humanoid && l.kp.0 == 0.0 && l.kd.0 == 0.0 {
+                // Either an explicit opt-in or a damping minimum.
+                if r.chance(0.5) || l.kd.1 == 0.0 {
+                    l.allow_limp = true;
+                } else {
+                    l.kd.0 = l.kd.1 * 0.1;
+                }
+            }
+            l
+        })
+        .collect();
     let platform = if humanoid {
-        PlatformConfig {
-            fault_policy: if r.chance(0.5) {
-                FaultPolicy::FailHold
-            } else {
-                FaultPolicy::FailOpen
-            },
-            ..common::humanoid()
-        }
+        // FailOpen / FailSafe are refused for a humanoid joint channel.
+        common::humanoid()
     } else {
         quadruped(if r.chance(0.5) {
             FailBehaviour::ZeroVelocity
@@ -256,7 +331,11 @@ fn setup(r: &mut Rng, locked: bool) -> Setup {
         allowed_sources: vec![guid("00000103")],
         motors: lims.iter().map(to_spec).collect(),
         require_crc: r.chance(0.7),
-        rate: r.chance(0.5).then(|| JointRate::around(1000.0)),
+        rate: Some(if r.chance(0.5) {
+            JointRate::around(1000.0)
+        } else {
+            wide_rate()
+        }),
         hard_reject_factor: r.range(1.0, 3.0),
         damping_kd,
         ..Default::default()
@@ -276,18 +355,28 @@ fn setup(r: &mut Rng, locked: bool) -> Setup {
     }
 }
 
-fn held(f: &JointFrame) -> JointFrame {
+fn held(f: &JointFrame, drop_tau: bool) -> JointFrame {
     let mut h = *f;
     for i in 0..h.slots() {
-        h.motor_mut(i).unwrap().dq = 0.0;
+        let m = h.motor_mut(i).unwrap();
+        m.dq = 0.0;
+        if drop_tau {
+            m.tau = 0.0;
+        }
     }
     h.crc_ok = Some(true);
     h
 }
 
-fn check_limited(input: &JointFrame, out: &JointFrame, lims: &[Lim]) {
+fn check_limited(input: &JointFrame, out: &JointFrame, lims: &[Lim], q_prev: &[f64]) {
     assert_eq!(input.slots(), out.slots());
-    for ((a, b), l) in input.motors().iter().zip(out.motors()).zip(lims) {
+    for (((a, b), l), qp) in input
+        .motors()
+        .iter()
+        .zip(out.motors())
+        .zip(lims)
+        .zip(q_prev)
+    {
         assert_eq!(a.mode, b.mode);
         if !l.enabled || a.mode == MotorMode::Disabled {
             assert_eq!(a, b, "untouched slot changed");
@@ -304,16 +393,26 @@ fn check_limited(input: &JointFrame, out: &JointFrame, lims: &[Lim]) {
         );
         assert!(b.kp <= a.kp && b.kp >= 0.0, "{a:?} {b:?}");
         assert!(b.kd <= a.kd && b.kd >= 0.0, "{a:?} {b:?}");
-        // q is projected onto its range (only when kp acts).
+        // q is projected onto its range (only when kp acts), then moved
+        // toward the previous target if the step bounds require it: it
+        // always lies between the two.
         if a.kp > 0.0 {
-            assert_eq!(b.q, a.q.clamp(l.q.0, l.q.1));
+            let proj = a.q.clamp(l.q.0, l.q.1);
+            if qp.is_finite() {
+                assert!(
+                    b.q >= proj.min(*qp) && b.q <= proj.max(*qp),
+                    "{a:?} {b:?} prev {qp}"
+                );
+            } else {
+                assert_eq!(b.q, proj);
+            }
         } else {
             assert_eq!(b.q, a.q);
         }
     }
 }
 
-fn run(seed: u64, locked: bool) -> [u64; 4] {
+fn run(seed: u64, locked: bool) -> [u64; 6] {
     let mut r = Rng(0x9E37_79B9_7F4A_7C15 ^ seed.wrapping_mul(0x1234_5678_9ABC_DEF1));
     let s = setup(&mut r, locked);
     let mut fw = Firewall::new(s.policy.clone());
@@ -322,8 +421,9 @@ fn run(seed: u64, locked: bool) -> [u64; 4] {
     let low = fw.channel_id("/lowcmd").unwrap();
     let mut now = T0;
     let mut last_stamp = T0;
-    let mut last_out: Option<JointFrame> = None;
-    let mut counts = [0u64; 4];
+    let mut last_out: Option<(JointFrame, u64)> = None;
+    let mut q_prev = [NO_Q; MAX_MOTORS];
+    let mut counts = [0u64; 6];
     for step in 0..STEPS {
         now += match r.below(100) {
             0..=2 => r.below(400_000),          // early
@@ -361,16 +461,19 @@ fn run(seed: u64, locked: bool) -> [u64; 4] {
             } => {
                 assert_eq!(out, cmd, "{ctx}");
                 assert!(would_have.is_none(), "{ctx}");
-                assert!(ref_frame_ok(&out.frame, &s.lims, ENV_DQ), "{ctx}");
+                assert!(ref_frame_ok(&out.frame, &s.lims, ENV_DQ, &q_prev), "{ctx}");
+                assert!(!(s.humanoid && ref_all_limp(&out.frame, &s.lims)), "{ctx}");
                 assert!(src == ctl && out.frame.crc_ok != Some(false), "{ctx}");
-                last_out = Some(out.frame);
+                last_out = Some((out.frame, at));
+                q_prev = next_q_prev(&out.frame);
                 last_stamp = stamp;
                 counts[0] += 1;
             }
             JointVerdict::Limited { cmd: out, reasons } => {
                 assert!(!reasons.is_empty(), "{ctx}");
-                assert!(ref_frame_ok(&out.frame, &s.lims, ENV_DQ), "{ctx}");
-                check_limited(&cmd.frame, &out.frame, &s.lims);
+                assert!(ref_frame_ok(&out.frame, &s.lims, ENV_DQ, &q_prev), "{ctx}");
+                assert!(!(s.humanoid && ref_all_limp(&out.frame, &s.lims)), "{ctx}");
+                check_limited(&cmd.frame, &out.frame, &s.lims, &q_prev);
                 assert_eq!((out.source, out.channel, out.stamp_ns), (ctl, low, stamp));
                 // Idempotent: the limited frame passes unchanged.
                 let mut fresh = Firewall::new(s.policy.clone());
@@ -383,24 +486,43 @@ fn run(seed: u64, locked: bool) -> [u64; 4] {
                     },
                     "{ctx}"
                 );
-                last_out = Some(out.frame);
+                last_out = Some((out.frame, at));
+                q_prev = next_q_prev(&out.frame);
                 last_stamp = stamp;
                 counts[1] += 1;
+                if reasons.contains(JointLimitReasons::STEP)
+                    || reasons.contains(JointLimitReasons::PD_TORQUE)
+                {
+                    counts[4] += 1;
+                }
             }
             JointVerdict::Rejected { reason, substitute } => {
                 counts[2] += 1;
+                if matches!(
+                    reason,
+                    RejectReason::JointStepOutOfEnvelope | RejectReason::JointPdTorqueOutOfEnvelope
+                ) {
+                    counts[5] += 1;
+                }
                 let Some(sub) = substitute else { continue };
                 assert_eq!(sub.cmd.source, SourceId::FIREWALL, "{ctx}");
                 assert_eq!(sub.cmd.stamp_ns, at, "{ctx}");
                 assert_ne!(reason, RejectReason::RateLimited, "{ctx}");
                 match sub.kind {
                     SubstituteKind::HoldLast => {
-                        let base = last_out.expect("hold without an accepted frame");
-                        assert_eq!(sub.cmd.frame, held(&base), "{ctx}");
+                        let (base, base_at) = last_out.expect("hold without an accepted frame");
+                        let drop_tau = s.humanoid && at.saturating_sub(base_at) > HUMANOID_MAX_HOLD;
+                        assert_eq!(sub.cmd.frame, held(&base, drop_tau), "{ctx}");
+                        assert!(
+                            !(s.humanoid && ref_all_limp(&sub.cmd.frame, &s.lims)),
+                            "{ctx}"
+                        );
                     }
                     SubstituteKind::Zero => {
                         assert!(!s.humanoid, "humanoid got a damping frame: {ctx}");
                         counts[3] += 1;
+                        // The motors were released: no previous target.
+                        q_prev = [NO_Q; MAX_MOTORS];
                         for (m, l) in sub.cmd.frame.motors().iter().zip(&s.lims) {
                             if l.enabled {
                                 assert_eq!(
@@ -429,7 +551,7 @@ fn run(seed: u64, locked: bool) -> [u64; 4] {
 
 #[test]
 fn randomized_joint_invariants_enforcing() {
-    let mut total = [0u64; 4];
+    let mut total = [0u64; 6];
     for seed in 0..SEEDS {
         let c = run(seed, true);
         for (t, x) in total.iter_mut().zip(c) {
@@ -437,8 +559,12 @@ fn randomized_joint_invariants_enforcing() {
         }
     }
     // Every path was taken many times overall.
-    eprintln!("joint property totals [passed, limited, rejected, damped]: {total:?}");
-    let [passed, limited, rejected, damped] = total;
+    eprintln!(
+        "joint property totals [passed, limited, rejected, damped, step-limited, step-rejected]: {total:?}"
+    );
+    let [passed, limited, rejected, damped, step_limited, step_rejected] = total;
+    assert!(step_limited > 100, "{total:?}");
+    assert!(step_rejected > 100, "{total:?}");
     assert!(passed > 1_000, "{total:?}");
     assert!(limited > 1_000, "{total:?}");
     assert!(rejected > 1_000, "{total:?}");
@@ -457,7 +583,11 @@ fn clamping_is_idempotent_and_never_increases_magnitude_exhaustive_edges() {
     // Deterministic edge cases on one slot: every field at -2x, -1x-eps,
     // -1x, 0, +1x, +1x+eps, +2x of its bound (hard factor 3 so nothing is
     // rejected for being far out).
-    let mut f = build_joint(humanoid(), true, 1, 1, |s| s.hard_reject_factor = 3.0);
+    // (Quadruped: a lone slot with zero gains would be a limp frame on a
+    // humanoid.)
+    let mut f = build_joint(quadruped(FailBehaviour::ZeroVelocity), true, 1, 1, |s| {
+        s.hard_reject_factor = 3.0
+    });
     let lim = Lim {
         enabled: true,
         q: (-Q_LIM, Q_LIM),
@@ -465,6 +595,9 @@ fn clamping_is_idempotent_and_never_increases_magnitude_exhaustive_edges() {
         tau: TAU_MAX,
         kp: (0.0, KP_MAX),
         kd: (0.0, KD_MAX),
+        allow_limp: true,
+        step: Some(STEP_MAX),
+        pd: None,
     };
     let mults = [-2.0, -1.0 - 1e-12, -1.0, 0.0, 1.0, 1.0 + 1e-12, 2.0];
     let mut t = T0;
@@ -480,9 +613,9 @@ fn clamping_is_idempotent_and_never_increases_magnitude_exhaustive_edges() {
                         f.fw.check_joint(&JointCommand::new(f.ctl, f.low, t, input), t);
                     let out = jout(&v);
                     assert!(!v.is_rejected(), "{m:?}: {v:?}");
-                    assert!(ref_frame_ok(&out, &[lim], ENV_DQ), "{m:?}");
+                    assert!(ref_frame_ok(&out, &[lim], ENV_DQ, &[NO_Q]), "{m:?}");
                     if v.is_limited() {
-                        check_limited(&input, &out, &[lim]);
+                        check_limited(&input, &out, &[lim], &[NO_Q]);
                         t += MS;
                         let again =
                             f.fw.check_joint(&JointCommand::new(f.ctl, f.low, t, out), t);

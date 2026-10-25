@@ -204,19 +204,41 @@ pub fn joint_profile(locked: bool) -> Profile {
     p
 }
 
-/// `slots` motor slots, the first `active` enabled with the test limits.
+/// Fixture `max_dq_step`: wider than any in-range move, so only the tests
+/// that set their own step bound see one.
+pub const STEP_MAX: f64 = 100.0;
+
+/// The fixture rate: 1 kHz, a 1 ns minimum interval (frames 1 ns apart are
+/// still accepted) and no practical maximum, so only the tests that set
+/// their own rate see the window.
+pub fn wide_rate() -> JointRate {
+    JointRate {
+        expected_hz: 1000.0,
+        min_interval_ns: 1,
+        max_interval_ns: 60_000 * MS,
+    }
+}
+
+/// `slots` motor slots, the first `active` enabled with the test limits
+/// (gain minimums zero with an explicit `allow_limp`, so the same spec
+/// compiles for a humanoid; `max_dq_step` = [`STEP_MAX`]).
 pub fn joint_spec(slots: usize, active: usize) -> JointChannelSpec {
     JointChannelSpec {
         allowed_sources: vec![guid("00000103")],
         motors: (0..slots)
             .map(|i| {
                 if i < active {
-                    MotorLimits::enabled((-Q_LIM, Q_LIM), DQ_MAX, TAU_MAX, KP_MAX, KD_MAX)
+                    MotorLimits {
+                        allow_limp: true,
+                        max_dq_step: Some(STEP_MAX),
+                        ..MotorLimits::enabled((-Q_LIM, Q_LIM), DQ_MAX, TAU_MAX, KP_MAX, KD_MAX)
+                    }
                 } else {
                     MotorLimits::disabled()
                 }
             })
             .collect(),
+        rate: Some(wide_rate()),
         ..Default::default()
     }
 }

@@ -24,6 +24,7 @@
       "max_age_ns": 20000000,
       "max_future_ns": 2000000,
       "hard_reject_factor": 2.0,
+      "pinned_mode_pr": 0,
       "motors": [
         {
           "name": "left_hip_pitch",
@@ -35,7 +36,9 @@
           "kp_min": 10.0,
           "kp_max": 300.0,
           "kd_min": 0.5,
-          "kd_max": 10.0
+          "kd_max": 10.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 88.0
         },
         {
           "name": "left_hip_roll",
@@ -47,7 +50,9 @@
           "kp_min": 10.0,
           "kp_max": 300.0,
           "kd_min": 0.5,
-          "kd_max": 10.0
+          "kd_max": 10.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 139.0
         },
         {
           "name": "left_hip_yaw",
@@ -59,7 +64,9 @@
           "kp_min": 10.0,
           "kp_max": 300.0,
           "kd_min": 0.5,
-          "kd_max": 10.0
+          "kd_max": 10.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 88.0
         },
         {
           "name": "left_knee",
@@ -71,7 +78,9 @@
           "kp_min": 10.0,
           "kp_max": 300.0,
           "kd_min": 0.5,
-          "kd_max": 10.0
+          "kd_max": 10.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 139.0
         },
         {
           "name": "left_ankle_pitch",
@@ -83,7 +92,9 @@
           "kp_min": 5.0,
           "kp_max": 100.0,
           "kd_min": 0.2,
-          "kd_max": 5.0
+          "kd_max": 5.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 50.0
         },
         {
           "name": "left_ankle_roll",
@@ -95,7 +106,9 @@
           "kp_min": 5.0,
           "kp_max": 100.0,
           "kd_min": 0.2,
-          "kd_max": 5.0
+          "kd_max": 5.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 50.0
         },
         {
           "name": "right_hip_pitch",
@@ -107,7 +120,9 @@
           "kp_min": 10.0,
           "kp_max": 300.0,
           "kd_min": 0.5,
-          "kd_max": 10.0
+          "kd_max": 10.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 88.0
         },
         {
           "name": "right_hip_roll",
@@ -119,7 +134,9 @@
           "kp_min": 10.0,
           "kp_max": 300.0,
           "kd_min": 0.5,
-          "kd_max": 10.0
+          "kd_max": 10.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 139.0
         },
         {
           "name": "right_hip_yaw",
@@ -131,7 +148,9 @@
           "kp_min": 10.0,
           "kp_max": 300.0,
           "kd_min": 0.5,
-          "kd_max": 10.0
+          "kd_max": 10.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 88.0
         },
         {
           "name": "right_knee",
@@ -143,7 +162,9 @@
           "kp_min": 10.0,
           "kp_max": 300.0,
           "kd_min": 0.5,
-          "kd_max": 10.0
+          "kd_max": 10.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 139.0
         },
         {
           "name": "right_ankle_pitch",
@@ -155,7 +176,9 @@
           "kp_min": 5.0,
           "kp_max": 100.0,
           "kd_min": 0.2,
-          "kd_max": 5.0
+          "kd_max": 5.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 50.0
         },
         {
           "name": "right_ankle_roll",
@@ -167,7 +190,9 @@
           "kp_min": 5.0,
           "kp_max": 100.0,
           "kd_min": 0.2,
-          "kd_max": 5.0
+          "kd_max": 5.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 50.0
         },
         {
           "name": "waist_yaw",
@@ -179,7 +204,9 @@
           "kp_min": 10.0,
           "kp_max": 300.0,
           "kd_min": 0.5,
-          "kd_max": 10.0
+          "kd_max": 10.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 88.0
         },
         {
           "name": "waist_roll",
@@ -191,7 +218,9 @@
           "kp_min": 10.0,
           "kp_max": 300.0,
           "kd_min": 0.5,
-          "kd_max": 10.0
+          "kd_max": 10.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 50.0
         },
         {
           "name": "waist_pitch",
@@ -203,7 +232,9 @@
           "kp_min": 10.0,
           "kp_max": 300.0,
           "kd_min": 0.5,
-          "kd_max": 10.0
+          "kd_max": 10.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 50.0
         },
         {
           "name": "left_shoulder_pitch",
@@ -212,10 +243,12 @@
           "q_max": 2.6704,
           "dq_max": 37.0,
           "tau_max": 25.0,
-          "kp_min": 0.0,
+          "kp_min": 5.0,
           "kp_max": 100.0,
-          "kd_min": 0.0,
-          "kd_max": 5.0
+          "kd_min": 0.2,
+          "kd_max": 5.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 25.0
         },
         {
           "name": "left_shoulder_roll",
@@ -224,10 +257,12 @@
           "q_max": 2.2515,
           "dq_max": 37.0,
           "tau_max": 25.0,
-          "kp_min": 0.0,
+          "kp_min": 5.0,
           "kp_max": 100.0,
-          "kd_min": 0.0,
-          "kd_max": 5.0
+          "kd_min": 0.2,
+          "kd_max": 5.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 25.0
         },
         {
           "name": "left_shoulder_yaw",
@@ -236,10 +271,12 @@
           "q_max": 2.618,
           "dq_max": 37.0,
           "tau_max": 25.0,
-          "kp_min": 0.0,
+          "kp_min": 5.0,
           "kp_max": 100.0,
-          "kd_min": 0.0,
-          "kd_max": 5.0
+          "kd_min": 0.2,
+          "kd_max": 5.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 25.0
         },
         {
           "name": "left_elbow",
@@ -248,10 +285,12 @@
           "q_max": 2.0944,
           "dq_max": 37.0,
           "tau_max": 25.0,
-          "kp_min": 0.0,
+          "kp_min": 5.0,
           "kp_max": 100.0,
-          "kd_min": 0.0,
-          "kd_max": 5.0
+          "kd_min": 0.2,
+          "kd_max": 5.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 25.0
         },
         {
           "name": "left_wrist_roll",
@@ -260,10 +299,12 @@
           "q_max": 1.97222,
           "dq_max": 37.0,
           "tau_max": 25.0,
-          "kp_min": 0.0,
+          "kp_min": 2.0,
           "kp_max": 40.0,
-          "kd_min": 0.0,
-          "kd_max": 2.0
+          "kd_min": 0.1,
+          "kd_max": 2.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 25.0
         },
         {
           "name": "left_wrist_pitch",
@@ -272,10 +313,12 @@
           "q_max": 1.61443,
           "dq_max": 22.0,
           "tau_max": 5.0,
-          "kp_min": 0.0,
+          "kp_min": 2.0,
           "kp_max": 40.0,
-          "kd_min": 0.0,
-          "kd_max": 2.0
+          "kd_min": 0.1,
+          "kd_max": 2.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 5.0
         },
         {
           "name": "left_wrist_yaw",
@@ -284,10 +327,12 @@
           "q_max": 1.61443,
           "dq_max": 22.0,
           "tau_max": 5.0,
-          "kp_min": 0.0,
+          "kp_min": 2.0,
           "kp_max": 40.0,
-          "kd_min": 0.0,
-          "kd_max": 2.0
+          "kd_min": 0.1,
+          "kd_max": 2.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 5.0
         },
         {
           "name": "right_shoulder_pitch",
@@ -296,10 +341,12 @@
           "q_max": 2.6704,
           "dq_max": 37.0,
           "tau_max": 25.0,
-          "kp_min": 0.0,
+          "kp_min": 5.0,
           "kp_max": 100.0,
-          "kd_min": 0.0,
-          "kd_max": 5.0
+          "kd_min": 0.2,
+          "kd_max": 5.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 25.0
         },
         {
           "name": "right_shoulder_roll",
@@ -308,10 +355,12 @@
           "q_max": 1.5882,
           "dq_max": 37.0,
           "tau_max": 25.0,
-          "kp_min": 0.0,
+          "kp_min": 5.0,
           "kp_max": 100.0,
-          "kd_min": 0.0,
-          "kd_max": 5.0
+          "kd_min": 0.2,
+          "kd_max": 5.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 25.0
         },
         {
           "name": "right_shoulder_yaw",
@@ -320,10 +369,12 @@
           "q_max": 2.618,
           "dq_max": 37.0,
           "tau_max": 25.0,
-          "kp_min": 0.0,
+          "kp_min": 5.0,
           "kp_max": 100.0,
-          "kd_min": 0.0,
-          "kd_max": 5.0
+          "kd_min": 0.2,
+          "kd_max": 5.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 25.0
         },
         {
           "name": "right_elbow",
@@ -332,10 +383,12 @@
           "q_max": 2.0944,
           "dq_max": 37.0,
           "tau_max": 25.0,
-          "kp_min": 0.0,
+          "kp_min": 5.0,
           "kp_max": 100.0,
-          "kd_min": 0.0,
-          "kd_max": 5.0
+          "kd_min": 0.2,
+          "kd_max": 5.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 25.0
         },
         {
           "name": "right_wrist_roll",
@@ -344,10 +397,12 @@
           "q_max": 1.97222,
           "dq_max": 37.0,
           "tau_max": 25.0,
-          "kp_min": 0.0,
+          "kp_min": 2.0,
           "kp_max": 40.0,
-          "kd_min": 0.0,
-          "kd_max": 2.0
+          "kd_min": 0.1,
+          "kd_max": 2.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 25.0
         },
         {
           "name": "right_wrist_pitch",
@@ -356,10 +411,12 @@
           "q_max": 1.61443,
           "dq_max": 22.0,
           "tau_max": 5.0,
-          "kp_min": 0.0,
+          "kp_min": 2.0,
           "kp_max": 40.0,
-          "kd_min": 0.0,
-          "kd_max": 2.0
+          "kd_min": 0.1,
+          "kd_max": 2.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 5.0
         },
         {
           "name": "right_wrist_yaw",
@@ -368,10 +425,12 @@
           "q_max": 1.61443,
           "dq_max": 22.0,
           "tau_max": 5.0,
-          "kp_min": 0.0,
+          "kp_min": 2.0,
           "kp_max": 40.0,
-          "kd_min": 0.0,
-          "kd_max": 2.0
+          "kd_min": 0.1,
+          "kd_max": 2.0,
+          "max_dq_step": 0.15,
+          "tau_pd_max": 5.0
         },
         {
           "name": "unused_29",

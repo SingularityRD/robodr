@@ -32,7 +32,8 @@ const ZERO_RAW: Raw = [0.0; MAX_JOINTS];
 /// Relative tolerance of the internal post-condition check.
 const POST_CHECK_TOL: f64 = 1e-9;
 
-/// Counters since construction (never reset; saturating).
+/// Counters since construction (never reset; saturating), plus one gauge
+/// (`joint_hold_age_ns`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stats {
     pub checked: u64,
@@ -42,6 +43,17 @@ pub struct Stats {
     /// Passed with a would-have verdict (observe / pass-through / fail-open).
     pub would_have: u64,
     pub faults: u64,
+    /// Low-level joint channels: hold episodes started. An episode is a run
+    /// of hold substitutes on one channel between two accepted frames (or
+    /// until a damping substitute).
+    pub joint_hold_episodes: u64,
+    /// Humanoid joint channels: hold episodes that outlived `max_hold_ns`
+    /// (each also raised one `joint_hold_exceeded` event).
+    pub joint_holds_exceeded: u64,
+    /// Gauge: age (`now` − acceptance of the held frame, ns) of the most
+    /// recent hold substitute on any joint channel; back to 0 when that
+    /// channel accepts a frame (or damps).
+    pub joint_hold_age_ns: u64,
 }
 
 #[derive(Debug, Clone, Copy)]

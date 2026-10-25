@@ -36,7 +36,9 @@
           "kp_min": 0.0,
           "kp_max": 100.0,
           "kd_min": 0.0,
-          "kd_max": 10.0
+          "kd_max": 10.0,
+          "max_dq_step": 0.2,
+          "tau_pd_max": 23.7
         },
         {
           "name": "FR_thigh",
@@ -48,7 +50,9 @@
           "kp_min": 0.0,
           "kp_max": 100.0,
           "kd_min": 0.0,
-          "kd_max": 10.0
+          "kd_max": 10.0,
+          "max_dq_step": 0.2,
+          "tau_pd_max": 23.7
         },
         {
           "name": "FR_calf",
@@ -60,7 +64,9 @@
           "kp_min": 0.0,
           "kp_max": 100.0,
           "kd_min": 0.0,
-          "kd_max": 10.0
+          "kd_max": 10.0,
+          "max_dq_step": 0.2,
+          "tau_pd_max": 45.43
         },
         {
           "name": "FL_hip",
@@ -72,7 +78,9 @@
           "kp_min": 0.0,
           "kp_max": 100.0,
           "kd_min": 0.0,
-          "kd_max": 10.0
+          "kd_max": 10.0,
+          "max_dq_step": 0.2,
+          "tau_pd_max": 23.7
         },
         {
           "name": "FL_thigh",
@@ -84,7 +92,9 @@
           "kp_min": 0.0,
           "kp_max": 100.0,
           "kd_min": 0.0,
-          "kd_max": 10.0
+          "kd_max": 10.0,
+          "max_dq_step": 0.2,
+          "tau_pd_max": 23.7
         },
         {
           "name": "FL_calf",
@@ -96,7 +106,9 @@
           "kp_min": 0.0,
           "kp_max": 100.0,
           "kd_min": 0.0,
-          "kd_max": 10.0
+          "kd_max": 10.0,
+          "max_dq_step": 0.2,
+          "tau_pd_max": 45.43
         },
         {
           "name": "RR_hip",
@@ -108,7 +120,9 @@
           "kp_min": 0.0,
           "kp_max": 100.0,
           "kd_min": 0.0,
-          "kd_max": 10.0
+          "kd_max": 10.0,
+          "max_dq_step": 0.2,
+          "tau_pd_max": 23.7
         },
         {
           "name": "RR_thigh",
@@ -120,7 +134,9 @@
           "kp_min": 0.0,
           "kp_max": 100.0,
           "kd_min": 0.0,
-          "kd_max": 10.0
+          "kd_max": 10.0,
+          "max_dq_step": 0.2,
+          "tau_pd_max": 23.7
         },
         {
           "name": "RR_calf",
@@ -132,7 +148,9 @@
           "kp_min": 0.0,
           "kp_max": 100.0,
           "kd_min": 0.0,
-          "kd_max": 10.0
+          "kd_max": 10.0,
+          "max_dq_step": 0.2,
+          "tau_pd_max": 45.43
         },
         {
           "name": "RL_hip",
@@ -144,7 +162,9 @@
           "kp_min": 0.0,
           "kp_max": 100.0,
           "kd_min": 0.0,
-          "kd_max": 10.0
+          "kd_max": 10.0,
+          "max_dq_step": 0.2,
+          "tau_pd_max": 23.7
         },
         {
           "name": "RL_thigh",
@@ -156,7 +176,9 @@
           "kp_min": 0.0,
           "kp_max": 100.0,
           "kd_min": 0.0,
-          "kd_max": 10.0
+          "kd_max": 10.0,
+          "max_dq_step": 0.2,
+          "tau_pd_max": 23.7
         },
         {
           "name": "RL_calf",
@@ -168,7 +190,9 @@
           "kp_min": 0.0,
           "kp_max": 100.0,
           "kd_min": 0.0,
-          "kd_max": 10.0
+          "kd_max": 10.0,
+          "max_dq_step": 0.2,
+          "tau_pd_max": 45.43
         },
         {
           "name": "unused_12",

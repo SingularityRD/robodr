@@ -49,12 +49,22 @@ fn nominal_frames_pass_bit_exact_for_every_unitree_layout() {
 fn idle_slots_parked_like_the_unitree_sdk_pass() {
     // Enabled, zero gains, PosStopF / VelStopF targets: inert, so neither
     // the position nor the velocity target is checked.
-    let mut f = build_joint(humanoid(), true, 20, 12, |_| {});
+    let mut f = build_joint(quadruped(FailBehaviour::ZeroVelocity), true, 20, 12, |_| {});
     let parked = MotorCmd::enabled(2.146e9, 16000.0, 0.0, 0.0, 0.0);
     let c = JointCommand::new(f.ctl, f.low, T, jframe(20, 20, |_| parked));
     // Slots 0..12 are enabled in the envelope; all-zero gains are allowed
     // (kp_min = kd_min = 0); slots 12..20 are unused but not energised.
     assert!(f.fw.check_joint(&c, T).is_passed());
+    // On a humanoid an all-parked frame is limp (refused), but parked
+    // slots next to driven ones pass.
+    let mut h = build_joint(humanoid(), true, 20, 12, |_| {});
+    let c = JointCommand::new(h.ctl, h.low, T, jframe(20, 20, |_| parked));
+    assert_eq!(
+        h.fw.check_joint(&c, T).reject_reason(),
+        Some(RejectReason::JointLimpFrame)
+    );
+    let c = h.with_slot(T + 1, 3, parked);
+    assert!(h.fw.check_joint(&c, T + 1).is_passed());
     // kp = 0 but kd > 0 on an enabled slot: q is still not checked, dq is.
     let damp = MotorCmd::enabled(2.146e9, 0.5, 0.0, 0.0, 2.0);
     let c = f.with_slot(T + 1, 0, damp);
@@ -237,13 +247,13 @@ fn gains_below_minimum_are_rejected_never_raised() {
     let c = f.with_slot(T, 2, MotorCmd::enabled(0.0, 0.0, 0.0, 5.0, 1.0));
     assert_eq!(
         reason(&f.fw.check_joint(&c, T)),
-        RejectReason::JointGainOutOfEnvelope
+        RejectReason::JointGainBelowMinimum
     );
     // A limp frame: every motor switched off (effective gains zero).
     let limp = JointCommand::new(f.ctl, f.low, T + 1, jframe(12, 12, |_| MotorCmd::OFF));
     assert_eq!(
         reason(&f.fw.check_joint(&limp, T + 1)),
-        RejectReason::JointGainOutOfEnvelope
+        RejectReason::JointGainBelowMinimum
     );
     // Zero-gain "damping" frame (kp = 0): rejected too.
     let damp = JointCommand::new(
@@ -254,7 +264,7 @@ fn gains_below_minimum_are_rejected_never_raised() {
     );
     assert_eq!(
         reason(&f.fw.check_joint(&damp, T + 2)),
-        RejectReason::JointGainOutOfEnvelope
+        RejectReason::JointGainBelowMinimum
     );
     // With minimums of zero a disabled motor on an enabled slot is allowed.
     let mut f = build_joint(humanoid(), true, 12, 12, |_| {});
@@ -285,7 +295,8 @@ fn energising_an_unused_slot_is_rejected() {
     assert_eq!(ev[0].0, rules::DISABLED_MOTOR_ENERGISED);
     assert_eq!(ev[0].1, Severity::Critical);
     assert_eq!(ev[0].3, Some(15));
-    // Not energised: gains set but the motor is off.
+    // Mode off but gains set: not energised, yet ambiguous, so refused
+    // too (never forwarded unchecked).
     let c = f.with_slot(
         T + 10,
         15,
@@ -294,7 +305,20 @@ fn energising_an_unused_slot_is_rejected() {
             ..MotorCmd::OFF
         },
     );
-    assert!(f.fw.check_joint(&c, T + 10).is_passed());
+    assert_eq!(
+        reason(&f.fw.check_joint(&c, T + 10)),
+        RejectReason::JointModeInconsistent
+    );
+    // Mode off and inert: fine.
+    let c = f.with_slot(
+        T + 11,
+        15,
+        MotorCmd {
+            q: 3.0,
+            ..MotorCmd::OFF
+        },
+    );
+    assert!(f.fw.check_joint(&c, T + 11).is_passed());
 }
 
 #[test]
@@ -505,7 +529,7 @@ fn humanoid_never_substitutes_zero_or_damping() {
     let mut f = build_joint(humanoid(), true, 35, 29, |s| {
         s.rate = Some(JointRate {
             expected_hz: 500.0,
-            min_interval_ns: 0,
+            min_interval_ns: 1,
             max_interval_ns: 4 * MS,
         });
         for m in &mut s.motors {
@@ -591,12 +615,20 @@ fn humanoid_never_substitutes_zero_or_damping() {
     let v = f.fw.check_joint(&f.nominal(T), T);
     assert_eq!(v.reject_reason(), Some(RejectReason::ClockRegression));
     assert_eq!(v.substitute_kind(), Some(SubstituteKind::HoldLast));
-    // No hold timeout: ten seconds later the frame is still held.
+    // No release: ten seconds later the frame is still held (past
+    // max_hold_ns its feed-forward torque is zeroed, gains and q kept).
     let late = t + 10_000 * MS;
     let mut c = f.nominal(late);
     c.frame.crc_ok = None;
     let v = f.fw.check_joint(&c, late);
     assert_eq!(v.substitute_kind(), Some(SubstituteKind::HoldLast));
+    let mut held_late = held;
+    for i in 0..35 {
+        if let Some(m) = held_late.motor_mut(i) {
+            m.tau = 0.0;
+        }
+    }
+    assert_eq!(jout(&v), held_late);
     // A gateway-declared fault holds too (FailHold).
     let v = f.fw.joint_fault_verdict(&f.nominal(late + 1), late + 1);
     assert_eq!(v.reject_reason(), Some(RejectReason::InternalFault));
@@ -671,12 +703,15 @@ fn humanoid_config_refuses_zero_and_fail_safe() {
         &twist_specs()
     )
     .is_ok());
-    // FailOpen and pass-through (never substitutes) are allowed.
-    assert!(compile(PlatformConfig {
+    // FailOpen (it would forward an unchecked frame on a fault) is refused;
+    // pass-through (never enforces, never substitutes) is allowed.
+    let e = compile(PlatformConfig {
         fault_policy: FaultPolicy::FailOpen,
         ..humanoid()
     })
-    .is_ok());
+    .unwrap_err();
+    assert!(matches!(e, ConfigError::UnsafeSubstitute { .. }), "{e:?}");
+    assert!(e.to_string().contains("fail_open"), "{e}");
     assert!(compile(PlatformConfig {
         fail_behaviour: FailBehaviour::PassThroughObserveOnly,
         fault_policy: FaultPolicy::FailSafe,
@@ -1125,7 +1160,11 @@ fn mid_frame(cfg: &FirewallConfig) -> JointFrame {
             }
         })
         .collect();
-    JointFrame::from_slice(&ms, Some(true)).unwrap()
+    let mut f = JointFrame::from_slice(&ms, Some(true)).unwrap();
+    // The gateway passes the decoded frame-level modes through.
+    f.mode_pr = cfg.joint_channels["/lowcmd"].pinned_mode_pr;
+    f.mode_machine = cfg.joint_channels["/lowcmd"].pinned_mode_machine;
+    f
 }
 
 #[test]
@@ -1154,11 +1193,28 @@ fn unitree_g1_example_compiles_and_holds() {
     let mut limp = JointCommand::new(src, ch, T + 4 * MS, frame);
     *limp.frame.motor_mut(3).unwrap() = MotorCmd::OFF;
     let v = fw.check_joint(&limp, T + 4 * MS);
+    assert_eq!(v.reject_reason(), Some(RejectReason::JointGainBelowMinimum));
+    assert_eq!(v.substitute_kind(), Some(SubstituteKind::HoldLast));
+    // The ankle mode is pinned: a frame switching it is refused and held.
+    let mut switched = JointCommand::new(src, ch, T + 6 * MS, frame);
+    switched.frame.mode_pr = Some(1);
+    let v = fw.check_joint(&switched, T + 6 * MS);
+    assert_eq!(v.reject_reason(), Some(RejectReason::JointModePinMismatch));
+    assert_eq!(v.substitute_kind(), Some(SubstituteKind::HoldLast));
+    // A large jump of a leg target is refused (max_dq_step 0.15 rad, hard
+    // factor 2), a moderate one is stepped.
+    let mut jump = JointCommand::new(src, ch, T + 8 * MS, frame);
+    jump.frame.motor_mut(0).unwrap().q += 0.4;
+    let v = fw.check_joint(&jump, T + 8 * MS);
     assert_eq!(
         v.reject_reason(),
-        Some(RejectReason::JointGainOutOfEnvelope)
+        Some(RejectReason::JointStepOutOfEnvelope)
     );
-    assert_eq!(v.substitute_kind(), Some(SubstituteKind::HoldLast));
+    let mut nudge = JointCommand::new(src, ch, T + 10 * MS, frame);
+    nudge.frame.motor_mut(0).unwrap().q += 0.2;
+    let v = fw.check_joint(&nudge, T + 10 * MS);
+    assert!(v.is_limited(), "{v:?}");
+    assert!((jout(&v).motor(0).unwrap().q - (frame.motor(0).unwrap().q + 0.15)).abs() < 1e-9);
     // The shipped humanoid config cannot be switched to zero_velocity.
     let mut unsafe_cfg = cfg.clone();
     unsafe_cfg.platform.fail_behaviour = FailBehaviour::ZeroVelocity;

@@ -58,10 +58,26 @@ pub enum RejectReason {
     /// Joint frame: a feed-forward torque beyond
     /// `hard_reject_factor × tau_max`.
     JointTorqueOutOfEnvelope,
-    /// Joint frame: a gain beyond `hard_reject_factor ×` its maximum, or
-    /// below its minimum (gains are never raised; a disabled motor counts as
-    /// zero gains).
+    /// Joint frame: a gain beyond `hard_reject_factor ×` its maximum.
     JointGainOutOfEnvelope,
+    /// Joint frame: a gain below its minimum (gains are never raised; a
+    /// disabled motor counts as zero gains).
+    JointGainBelowMinimum,
+    /// Joint frame: a position target (with `kp > 0`) further from the
+    /// previous accepted target than `hard_reject_factor × max_dq_step`.
+    JointStepOutOfEnvelope,
+    /// Joint frame: the proportional torque demand `kp·|q − q_prev|` beyond
+    /// `hard_reject_factor × tau_pd_max`.
+    JointPdTorqueOutOfEnvelope,
+    /// Joint frame: a slot whose mode is off (`0x00`) carries a non-zero
+    /// `kp`, `kd` or `tau`.
+    JointModeInconsistent,
+    /// Joint frame: `mode_pr` / `mode_machine` differs from the channel's
+    /// pinned value.
+    JointModePinMismatch,
+    /// Joint frame on a humanoid: every enabled slot is limp (no stiffness
+    /// and no damping); a limp humanoid falls.
+    JointLimpFrame,
 }
 
 impl RejectReason {
@@ -198,6 +214,12 @@ impl JointLimitReasons {
     pub const TORQUE: JointLimitReasons = JointLimitReasons(4);
     /// A gain lowered to its maximum.
     pub const GAIN: JointLimitReasons = JointLimitReasons(8);
+    /// A position target stepped toward the requested one by at most
+    /// `max_dq_step` from the previous accepted target.
+    pub const STEP: JointLimitReasons = JointLimitReasons(16);
+    /// A position target moved toward the previous accepted target so that
+    /// `kp·|q − q_prev| <= tau_pd_max`.
+    pub const PD_TORQUE: JointLimitReasons = JointLimitReasons(32);
 
     pub fn contains(self, other: JointLimitReasons) -> bool {
         self.0 & other.0 == other.0
@@ -329,6 +351,9 @@ mod tests {
         let j = JointLimitReasons::POSITION | JointLimitReasons::GAIN;
         assert!(j.contains(JointLimitReasons::GAIN));
         assert!(!j.contains(JointLimitReasons::TORQUE));
+        let k = JointLimitReasons::STEP | JointLimitReasons::PD_TORQUE;
+        assert!(k.contains(JointLimitReasons::STEP) && k.contains(JointLimitReasons::PD_TORQUE));
+        assert!(!k.contains(JointLimitReasons::POSITION));
         assert!(JointLimitReasons::NONE.is_empty());
     }
 }

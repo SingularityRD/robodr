@@ -90,8 +90,33 @@ pub mod rules {
         "robot.firewall.joint_velocity_out_of_envelope";
     /// `|tau|` over `tau_max` (value: `|tau|`, N·m).
     pub const JOINT_TORQUE_OUT_OF_ENVELOPE: &str = "robot.firewall.joint_torque_out_of_envelope";
-    /// A gain over its maximum or under its minimum (value: the gain).
+    /// A gain over its maximum (value: the gain).
     pub const JOINT_GAIN_OUT_OF_ENVELOPE: &str = "robot.firewall.joint_gain_out_of_envelope";
+    /// A gain under its minimum: always a rejection (value: the gain, limit:
+    /// the minimum). Coalesced events keep the **smallest** gain (see
+    /// [`lower_is_worse`]).
+    pub const JOINT_GAIN_BELOW_MINIMUM: &str = "robot.firewall.joint_gain_below_minimum";
+    /// A position target too far from the previous accepted target: stepped
+    /// (`Limited`, High) or rejected (Critical) (value: `|q − q_prev|`, rad;
+    /// limit: `max_dq_step`, or the hard bound for a rejection).
+    pub const JOINT_STEP_OUT_OF_ENVELOPE: &str = "robot.firewall.joint_step_out_of_envelope";
+    /// The proportional torque demand `kp·|q − q_prev|` over `tau_pd_max`:
+    /// limited (High) or rejected (Critical) (value: the demand, N·m).
+    pub const JOINT_PD_TORQUE_OUT_OF_ENVELOPE: &str =
+        "robot.firewall.joint_pd_torque_out_of_envelope";
+    /// A slot whose mode is off carries a non-zero `kp`, `kd` or `tau`.
+    pub const JOINT_MODE_INCONSISTENT: &str = "robot.firewall.joint_mode_inconsistent";
+    /// `mode_pr` / `mode_machine` differs from the channel's pin (value: the
+    /// frame's octet, NaN if absent; limit: the pin).
+    pub const JOINT_MODE_PIN_MISMATCH: &str = "robot.firewall.joint_mode_pin_mismatch";
+    /// Humanoid: every enabled slot of the frame is limp.
+    pub const JOINT_LIMP_FRAME: &str = "robot.firewall.joint_limp_frame";
+    /// Humanoid: the firewall has been holding the last valid frame for
+    /// longer than `max_hold_ns` (value: hold age, limit: `max_hold_ns`, ns).
+    /// Critical, once per hold episode; the hold continues (with its
+    /// feed-forward torque zeroed): on a humanoid `max_hold_ns` escalates,
+    /// it never releases.
+    pub const JOINT_HOLD_EXCEEDED: &str = "robot.firewall.joint_hold_exceeded";
     /// A slot the envelope marks unused is energised.
     pub const DISABLED_MOTOR_ENERGISED: &str = "robot.firewall.disabled_motor_energised";
     /// CRC reported invalid, or not verified where required (value: 0 for
@@ -100,6 +125,13 @@ pub mod rules {
     /// The joint stream was slower than its `max_interval_ns` (value: the
     /// gap, ns). Recorded only; the late frame itself is evaluated normally.
     pub const JOINT_RATE_VIOLATION: &str = "robot.firewall.joint_rate_violation";
+
+    /// `true` for rules whose `value` is worse the **smaller** it is (a gain
+    /// below its minimum): coalescing keeps the smallest value for them, the
+    /// largest for every other rule.
+    pub fn lower_is_worse(rule: &str) -> bool {
+        rule == JOINT_GAIN_BELOW_MINIMUM
+    }
 }
 
 /// Rule id and severity for a rejection.
@@ -124,6 +156,12 @@ pub fn reject_rule(reason: RejectReason) -> (&'static str, Severity) {
         JointVelocityOutOfEnvelope => (rules::JOINT_VELOCITY_OUT_OF_ENVELOPE, Severity::Critical),
         JointTorqueOutOfEnvelope => (rules::JOINT_TORQUE_OUT_OF_ENVELOPE, Severity::Critical),
         JointGainOutOfEnvelope => (rules::JOINT_GAIN_OUT_OF_ENVELOPE, Severity::Critical),
+        JointGainBelowMinimum => (rules::JOINT_GAIN_BELOW_MINIMUM, Severity::Critical),
+        JointStepOutOfEnvelope => (rules::JOINT_STEP_OUT_OF_ENVELOPE, Severity::Critical),
+        JointPdTorqueOutOfEnvelope => (rules::JOINT_PD_TORQUE_OUT_OF_ENVELOPE, Severity::Critical),
+        JointModeInconsistent => (rules::JOINT_MODE_INCONSISTENT, Severity::Critical),
+        JointModePinMismatch => (rules::JOINT_MODE_PIN_MISMATCH, Severity::Critical),
+        JointLimpFrame => (rules::JOINT_LIMP_FRAME, Severity::Critical),
     }
 }
 
@@ -145,7 +183,9 @@ pub enum EventAction {
 /// units for limits, ages in ns for timestamp rules, `NaN` when not
 /// applicable. When several identical events were coalesced (see the module
 /// docs) `count > 1`, `at_ns` is the first occurrence, `last_at_ns` the last,
-/// and `value`/`limit` those of the worst (largest `value`) occurrence.
+/// and `value`/`limit` those of the worst occurrence: the largest `value`,
+/// or the smallest for a rule where lower is worse
+/// ([`rules::lower_is_worse`], e.g. a gain below its minimum).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FirewallEvent {
     pub rule: &'static str,
@@ -197,6 +237,9 @@ impl FirewallEvent {
             // A slow stream is recorded only: the late frame itself was
             // evaluated (and passed, limited or rejected) on its own merits.
             _ if self.rule == rules::JOINT_RATE_VIOLATION => "recorded only".to_string(),
+            _ if self.rule == rules::JOINT_HOLD_EXCEEDED => {
+                "still holding the last valid frame, feed-forward torque zeroed".to_string()
+            }
             EventAction::Limited => "limited".to_string(),
             EventAction::Rejected(None) => "rejected, nothing emitted".to_string(),
             EventAction::Rejected(Some(SubstituteKind::Zero)) if joint => {
@@ -296,7 +339,12 @@ impl EventBuffer {
         if let Some(e) = self.buf.iter_mut().rev().find(|e| e.same_key(&ev)) {
             e.count = e.count.saturating_add(ev.count.max(1));
             e.last_at_ns = e.last_at_ns.max(ev.last_at_ns);
-            if ev.value > e.value || (e.value.is_nan() && !ev.value.is_nan()) {
+            let worse = if rules::lower_is_worse(ev.rule) {
+                ev.value < e.value
+            } else {
+                ev.value > e.value
+            };
+            if worse || (e.value.is_nan() && !ev.value.is_nan()) {
                 e.value = ev.value;
                 e.limit = ev.limit;
                 e.slot = ev.slot;
@@ -547,6 +595,12 @@ mod tests {
             JointVelocityOutOfEnvelope,
             JointTorqueOutOfEnvelope,
             JointGainOutOfEnvelope,
+            JointGainBelowMinimum,
+            JointStepOutOfEnvelope,
+            JointPdTorqueOutOfEnvelope,
+            JointModeInconsistent,
+            JointModePinMismatch,
+            JointLimpFrame,
         ] {
             assert!(reject_rule(r).0.starts_with("robot.firewall."));
         }

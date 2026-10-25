@@ -7,6 +7,13 @@
 //! the rest of the policy it is validated once, at compile time, and fails
 //! closed: there is no "unconstrained" motor — every limit of an enabled
 //! slot must be given, finite and non-negative, and every range ordered.
+//! Every joint channel must declare its `rate` (with a minimum interval > 0:
+//! it also bounds how often the firewall emits substitutes), and its
+//! staleness / future windows are capped at [`MAX_TIME_WINDOW_NS`].
+//!
+//! A [`Morphology::Humanoid`] platform adds, per enabled slot: a non-zero
+//! `kp_min` or `kd_min` unless the slot says `allow_limp: true`, and a
+//! `max_dq_step`.
 //!
 //! JSON example (one slot shown; see `config/firewall.unitree-*.example.json`):
 //!
@@ -24,7 +31,8 @@
 //!       "motors": [
 //!         { "name": "left_hip_pitch", "enabled": true,
 //!           "q_min": -2.5307, "q_max": 2.8798, "dq_max": 32.0, "tau_max": 88.0,
-//!           "kp_min": 0.0, "kp_max": 300.0, "kd_min": 0.5, "kd_max": 10.0 }
+//!           "kp_min": 10.0, "kp_max": 300.0, "kd_min": 0.5, "kd_max": 10.0,
+//!           "max_dq_step": 0.05, "tau_pd_max": 88.0 }
 //!       ]
 //!     }
 //!   }
@@ -41,6 +49,12 @@ use std::collections::BTreeMap;
 
 const NS_PER_S: f64 = 1e9;
 
+/// Upper bound on a joint channel's `max_age_ns` and `max_future_ns`
+/// (10 s). A low-level joint frame is meant for the next control tick
+/// (milliseconds); a window of seconds is a configuration error (a typo in
+/// the unit) and would let a replayed or pre-dated frame through.
+pub const MAX_TIME_WINDOW_NS: u64 = 10_000_000_000;
+
 /// Envelope of one motor slot.
 ///
 /// `enabled: false` (the default) marks an unused / locked-out slot: a frame
@@ -50,10 +64,31 @@ const NS_PER_S: f64 = 1e9;
 /// "unconstrained").
 ///
 /// Gain minimums: a commanded gain below `kp_min` / `kd_min` (a disabled
-/// motor counts as zero gains) is **rejected**, never raised. Set them above
-/// zero on a humanoid so that a limp frame (all gains zero, or motors
-/// switched off) from a compromised source is refused and the last valid
-/// frame held, instead of being forwarded.
+/// motor counts as zero gains) is **rejected**, never raised. On a humanoid
+/// an enabled slot must have `kp_min > 0` or `kd_min > 0` unless it sets
+/// `allow_limp: true` (compile error otherwise): a limp humanoid joint (no
+/// stiffness, no damping) under load folds, and a limp leg or waist makes
+/// the robot fall, so a frame that would make it limp from a compromised
+/// source must be refused (and the last valid frame held), not forwarded.
+/// `allow_limp` is an explicit, reviewable opt-out for slots that are
+/// genuinely allowed to go slack (e.g. a hand); it does not lift the
+/// humanoid run-time rule that a frame in which **every** enabled slot is
+/// limp is rejected.
+///
+/// Step bounds (relative to the previous **accepted** position target of
+/// the slot, `q_prev`; the firewall has no measured joint state):
+/// - `max_dq_step`: `|q − q_prev| <= max_dq_step` (rad per accepted frame).
+///   **Required** on a humanoid's enabled slots, optional elsewhere.
+/// - `tau_pd_max`: `kp·|q − q_prev| <= tau_pd_max` (N·m), a bound on the
+///   proportional torque the new target asks for over the old one.
+///
+/// Beyond the bound (but within `hard_reject_factor ×` it) `q` is stepped
+/// toward the requested target by the allowed amount (`Limited`); further
+/// out the frame is rejected. Only checked while `kp > 0` (like `q`
+/// itself). There is no `q_prev` on the first frame, after a damping
+/// substitute (the target was released) or after a frame in which the slot
+/// held no position (`kp = 0` or mode off): then only the absolute range
+/// `[q_min, q_max]` applies.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MotorLimits {
@@ -75,6 +110,13 @@ pub struct MotorLimits {
     /// Velocity gain range (`0 <= kd_min <= kd_max`).
     pub kd_min: f64,
     pub kd_max: Option<f64>,
+    /// Humanoid only: allow this enabled slot to have `kp_min = kd_min = 0`
+    /// (see above). Default `false`.
+    pub allow_limp: bool,
+    /// Bound on `|q − q_prev|`, rad per accepted frame (finite, > 0).
+    pub max_dq_step: Option<f64>,
+    /// Bound on `kp·|q − q_prev|`, N·m (finite, > 0).
+    pub tau_pd_max: Option<f64>,
 }
 
 impl MotorLimits {
@@ -83,7 +125,9 @@ impl MotorLimits {
         Self::default()
     }
 
-    /// An enabled slot with the given bounds and gain minimums of zero.
+    /// An enabled slot with the given bounds, gain minimums of zero and no
+    /// step bound (a humanoid additionally needs non-zero minimums or
+    /// `allow_limp`, and `max_dq_step`).
     pub fn enabled(q: (f64, f64), dq_max: f64, tau_max: f64, kp_max: f64, kd_max: f64) -> Self {
         Self {
             name: None,
@@ -96,21 +140,29 @@ impl MotorLimits {
             kp_max: Some(kp_max),
             kd_min: 0.0,
             kd_max: Some(kd_max),
+            allow_limp: false,
+            max_dq_step: None,
+            tau_pd_max: None,
         }
     }
 }
 
-/// Expected frame rate of a joint channel, on the gateway clock.
+/// Expected frame rate of a joint channel, on the gateway clock. Required
+/// on every joint channel.
 ///
 /// - A frame arriving less than `min_interval_ns` after the last **accepted**
 ///   frame on the channel is rejected (`RateLimited`) and **nothing** is
 ///   substituted (the previous frame, sent less than an interval ago, is
 ///   still in force; a flood must not turn into a flood of substitutes).
+/// - Any other rejection substitutes only if the last **emitted** frame
+///   (accepted or substitute) is at least `min_interval_ns` old; otherwise
+///   it emits nothing (the previous emission is still in force), so a flood
+///   of bad frames yields at most one substitute per interval.
 /// - A frame accepted more than `max_interval_ns` after the previous accepted
 ///   one is still evaluated normally (refusing a late frame would only make
 ///   the gap worse) and a `joint_rate_violation` event records the gap.
 ///
-/// Requires `0 <= min_interval_ns <= 1e9/expected_hz <= max_interval_ns`.
+/// Requires `0 < min_interval_ns <= 1e9/expected_hz <= max_interval_ns`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JointRate {
@@ -150,12 +202,20 @@ pub struct JointChannelSpec {
     /// (`crc_ok != Some(true)`). Default `true`. A frame reported invalid
     /// (`Some(false)`) is rejected on every channel.
     pub require_crc: bool,
-    /// Expected rate and interval window (`None` = not checked).
+    /// Expected rate and interval window. **Required** (`None` is a
+    /// [`ConfigError::InvalidRate`]): its `min_interval_ns` also bounds how
+    /// often the firewall emits substitutes.
     pub rate: Option<JointRate>,
-    /// Staleness deadline: oldest acceptable frame (now − stamp), ns. Must
-    /// be > 0. Default 20 ms.
+    /// Staleness deadline: oldest acceptable frame (now − stamp), ns. In
+    /// `1..=MAX_TIME_WINDOW_NS`. Default 20 ms.
     pub max_age_ns: u64,
-    /// Furthest-future acceptable frame (stamp − now), ns. Default 2 ms.
+    /// Furthest-future acceptable frame (stamp − now), ns. At most
+    /// [`MAX_TIME_WINDOW_NS`]. Default 2 ms. An accepted future-stamped
+    /// frame advances the out-of-order watermark only up to `now`, so it
+    /// cannot lock out the on-time frames that follow it (trade-off: within
+    /// that window, a replay of the future-stamped frame is not caught as
+    /// out of order; it is still bounded by the step, rate and staleness
+    /// checks).
     pub max_future_ns: u64,
     /// A value further outside its bound than this factor is rejected
     /// rather than clamped: `|dq| > f·dq_max`, `|tau| > f·tau_max`,
@@ -167,6 +227,17 @@ pub struct JointChannelSpec {
     /// expires), capped per slot at its `kd_max`. `0` (default) is a
     /// zero-torque frame. Ignored on a humanoid (it never damps).
     pub damping_kd: f64,
+    /// If set, every frame must carry exactly this `mode_pr`
+    /// ([`crate::JointFrame::mode_pr`]); anything else (including `None`)
+    /// is rejected (`JointModePinMismatch`). On the `hg` `LowCmd` (G1 /
+    /// H1-2) `mode_pr` switches the ankle joints between parallel and
+    /// serial (pitch / roll) control, which changes what the envelope's
+    /// ankle `q` bounds mean: pin it to the mode the envelope was written
+    /// for. The gateway must pass the decoded octet through.
+    pub pinned_mode_pr: Option<u8>,
+    /// Same for `mode_machine` ([`crate::JointFrame::mode_machine`], the
+    /// robot variant the frame is for).
+    pub pinned_mode_machine: Option<u8>,
 }
 
 impl Default for JointChannelSpec {
@@ -180,6 +251,8 @@ impl Default for JointChannelSpec {
             max_future_ns: 2_000_000,
             hard_reject_factor: 2.0,
             damping_kd: 0.0,
+            pinned_mode_pr: None,
+            pinned_mode_machine: None,
         }
     }
 }
@@ -197,6 +270,10 @@ pub(crate) struct CompiledMotor {
     pub kp_max: f64,
     pub kd_min: f64,
     pub kd_max: f64,
+    /// Bound on `|q − q_prev|` (rad), if any.
+    pub max_dq_step: Option<f64>,
+    /// Bound on `kp·|q − q_prev|` (N·m), if any.
+    pub tau_pd_max: Option<f64>,
 }
 
 /// A low-level joint channel after compilation: numbers only.
@@ -210,12 +287,16 @@ pub(crate) struct CompiledJointChannel {
     pub hard_factor: f64,
     pub max_age_ns: u64,
     pub max_future_ns: u64,
-    /// 0 = no minimum interval.
+    /// Always > 0 (a rate is required).
     pub min_interval_ns: u64,
-    pub max_interval_ns: Option<u64>,
+    pub max_interval_ns: u64,
     pub damping_kd: f64,
-    /// Platform is a humanoid: never substitute zero / damping.
+    /// Platform is a humanoid: never substitute zero / damping / limp.
     pub humanoid: bool,
+    /// At least one slot is enabled in the envelope.
+    pub any_enabled: bool,
+    pub pinned_mode_pr: Option<u8>,
+    pub pinned_mode_machine: Option<u8>,
 }
 
 fn motor_err(channel: &str, slot: usize, field: &'static str, why: &'static str) -> ConfigError {
@@ -259,11 +340,27 @@ fn finite(channel: &str, slot: usize, field: &'static str, x: f64) -> Result<f64
     }
 }
 
+/// A finite, strictly positive optional bound.
+fn positive(
+    channel: &str,
+    slot: usize,
+    field: &'static str,
+    v: Option<f64>,
+) -> Result<Option<f64>, ConfigError> {
+    match v {
+        None => Ok(None),
+        Some(x) if !x.is_finite() => Err(motor_err(channel, slot, field, "must be finite")),
+        Some(x) if x <= 0.0 => Err(motor_err(channel, slot, field, "must be > 0")),
+        Some(x) => Ok(Some(x)),
+    }
+}
+
 fn compile_motor(
     channel: &str,
     slot: usize,
     m: &MotorLimits,
     env_joint: f64,
+    humanoid: bool,
 ) -> Result<CompiledMotor, ConfigError> {
     // Whatever is given must be well-formed, even on a disabled slot (a
     // typo there is still a typo).
@@ -276,6 +373,8 @@ fn compile_motor(
         ("kd_max", m.kd_max),
         ("kp_min", Some(m.kp_min)),
         ("kd_min", Some(m.kd_min)),
+        ("max_dq_step", m.max_dq_step),
+        ("tau_pd_max", m.tau_pd_max),
     ] {
         if let Some(x) = v {
             finite(channel, slot, field, x)?;
@@ -286,6 +385,8 @@ fn compile_motor(
             return Err(motor_err(channel, slot, "q_min", "is greater than q_max"));
         }
     }
+    let max_dq_step = positive(channel, slot, "max_dq_step", m.max_dq_step)?;
+    let tau_pd_max = positive(channel, slot, "tau_pd_max", m.tau_pd_max)?;
     if !m.enabled {
         return Ok(CompiledMotor::default());
     }
@@ -315,6 +416,26 @@ fn compile_motor(
     if kd_min > kd_max {
         return Err(motor_err(channel, slot, "kd_min", "is greater than kd_max"));
     }
+    if humanoid {
+        if kp_min == 0.0 && kd_min == 0.0 && !m.allow_limp {
+            return Err(motor_err(
+                channel,
+                slot,
+                "kp_min",
+                "and kd_min are both 0 on a humanoid: a frame could make this joint limp \
+                 (no stiffness, no damping) and a limp humanoid falls; set a non-zero kp_min \
+                 or kd_min, or allow_limp: true if this joint may genuinely go slack",
+            ));
+        }
+        if max_dq_step.is_none() {
+            return Err(motor_err(
+                channel,
+                slot,
+                "max_dq_step",
+                "is required for an enabled slot on a humanoid",
+            ));
+        }
+    }
     Ok(CompiledMotor {
         enabled: true,
         q_min,
@@ -325,6 +446,8 @@ fn compile_motor(
         kp_max,
         kd_min,
         kd_max,
+        max_dq_step,
+        tau_pd_max,
     })
 }
 
@@ -343,9 +466,10 @@ pub(crate) fn compile_joint_channel(
         });
     }
     let env_joint = limit(name, "envelope.max_joint_speed", env.max_joint_speed)?;
+    let humanoid = platform.morphology == Morphology::Humanoid;
     let mut motors = [CompiledMotor::default(); MAX_MOTORS];
     for (slot, (dst, m)) in motors.iter_mut().zip(&spec.motors).enumerate() {
-        *dst = compile_motor(name, slot, m, env_joint)?;
+        *dst = compile_motor(name, slot, m, env_joint, humanoid)?;
     }
     if !(spec.hard_reject_factor.is_finite() && spec.hard_reject_factor >= 1.0) {
         return Err(ConfigError::InvalidLimit {
@@ -365,19 +489,35 @@ pub(crate) fn compile_joint_channel(
             field: "max_age_ns",
         });
     }
+    for (field, v) in [
+        ("max_age_ns", spec.max_age_ns),
+        ("max_future_ns", spec.max_future_ns),
+    ] {
+        if v > MAX_TIME_WINDOW_NS {
+            return Err(ConfigError::InvalidLimit {
+                channel: name.to_string(),
+                field,
+            });
+        }
+    }
     let rate_err = |why| ConfigError::InvalidRate {
         channel: name.to_string(),
         why,
     };
     let (min_interval_ns, max_interval_ns) = match spec.rate {
-        None => (0, None),
+        None => {
+            return Err(rate_err(
+                "is required on a joint channel (its min_interval_ns also bounds how often \
+                 the firewall emits substitutes)",
+            ))
+        }
         Some(r) => {
             if !(r.expected_hz.is_finite() && r.expected_hz > 0.0) {
                 return Err(rate_err("expected_hz must be finite and > 0"));
             }
             let period = NS_PER_S / r.expected_hz;
-            if r.max_interval_ns == 0 {
-                return Err(rate_err("max_interval_ns must be > 0"));
+            if r.min_interval_ns == 0 {
+                return Err(rate_err("min_interval_ns must be > 0"));
             }
             if r.min_interval_ns > r.max_interval_ns {
                 return Err(rate_err("min_interval_ns is greater than max_interval_ns"));
@@ -392,7 +532,7 @@ pub(crate) fn compile_joint_channel(
                     "max_interval_ns is shorter than the expected period (every on-time frame would be a violation)",
                 ));
             }
-            (r.min_interval_ns, Some(r.max_interval_ns))
+            (r.min_interval_ns, r.max_interval_ns)
         }
     };
     Ok(CompiledJointChannel {
@@ -407,7 +547,10 @@ pub(crate) fn compile_joint_channel(
         min_interval_ns,
         max_interval_ns,
         damping_kd: spec.damping_kd,
-        humanoid: platform.morphology == Morphology::Humanoid,
+        humanoid,
+        any_enabled: motors.iter().any(|m| m.enabled),
+        pinned_mode_pr: spec.pinned_mode_pr,
+        pinned_mode_machine: spec.pinned_mode_machine,
     })
 }
 

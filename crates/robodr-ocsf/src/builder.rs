@@ -831,6 +831,48 @@ fn catalog_1_3_wave7(rule: &str) -> Option<RuleInfo> {
             MOTION,
             &[],
         ),
+        "robot.firewall.joint_gain_below_minimum" => e(
+            "Joint command gain below minimum",
+            "The motion firewall rejected a low-level joint command whose stiffness or damping gain is below the joint's minimum (a disabled motor counts as zero gains); gains are never raised (in observe mode: would have rejected).",
+            MOTION,
+            &[T0831],
+        ),
+        "robot.firewall.joint_step_out_of_envelope" => e(
+            "Joint command position step out of envelope",
+            "The motion firewall found a low-level joint command whose position target moved further from the previous accepted target than the joint's per-frame step bound and stepped or rejected it (in observe mode: would have).",
+            MOTION,
+            &[T0831],
+        ),
+        "robot.firewall.joint_pd_torque_out_of_envelope" => e(
+            "Joint command proportional torque out of envelope",
+            "The motion firewall found a low-level joint command whose stiffness times position step exceeds the joint's proportional torque bound and stepped or rejected it (in observe mode: would have).",
+            MOTION,
+            &[T0831],
+        ),
+        "robot.firewall.joint_mode_inconsistent" => e(
+            "Joint command mode inconsistent",
+            "A low-level joint command switches a motor off while carrying non-zero gains or torque for it; the motion firewall rejected it rather than forward unchecked values (in observe mode: would have).",
+            MOTION,
+            &[T0831, T0855],
+        ),
+        "robot.firewall.joint_mode_pin_mismatch" => e(
+            "Joint command operating mode changed",
+            "A low-level joint command carries a frame-level mode (ankle control mode or robot variant) other than the one the channel is pinned to, which changes what the joint envelope means; the motion firewall rejected it (in observe mode: would have).",
+            MOTION,
+            &[T0831, T0855],
+        ),
+        "robot.firewall.joint_limp_frame" => e(
+            "Humanoid joint command would go limp",
+            "A low-level joint command for a humanoid leaves every enabled joint without stiffness or damping, which makes the robot fall; the motion firewall rejected it and held the last valid frame (in observe mode: would have).",
+            MOTION,
+            &[T0831, T0855],
+        ),
+        "robot.firewall.joint_hold_exceeded" => e(
+            "Humanoid joint hold exceeded its time limit",
+            "The motion firewall has been holding a humanoid's last valid joint frame for longer than the configured hold time because newer frames keep being rejected; it keeps holding with the feed-forward torque removed and needs escalation.",
+            MOTION,
+            &[],
+        ),
         _ => return None,
     })
 }

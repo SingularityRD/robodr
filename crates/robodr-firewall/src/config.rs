@@ -89,14 +89,16 @@ pub enum FaultPolicy {
     #[default]
     FailSafe,
     /// Forward the original command unchanged and record the fault.
+    /// Refused for a humanoid platform with a low-level joint channel (and
+    /// treated as `FailHold` there by the engine regardless).
     FailOpen,
     /// Reject; on a low-level joint channel re-emit the last **accepted**
     /// frame (velocity targets zeroed), or nothing if none was accepted yet.
     /// That frame passed every check (including the post-condition) when it
     /// was accepted, so holding it cannot put the robot outside its
     /// envelope. Twist / joint-velocity channels get the zero substitute,
-    /// exactly as with `FailSafe`. Required (or `FailOpen`) for a humanoid
-    /// with a low-level joint channel.
+    /// exactly as with `FailSafe`. Required for a humanoid with a low-level
+    /// joint channel.
     FailHold,
 }
 
@@ -109,9 +111,19 @@ pub enum FaultPolicy {
 ///   (velocity targets zeroed; no hold timeout), or nothing if no frame was
 ///   accepted yet (the platform keeps its own last command / timeout
 ///   behaviour). [`Policy::compile_with_joints`] refuses
-///   [`FailBehaviour::ZeroVelocity`] and [`FaultPolicy::FailSafe`] for a
-///   humanoid with a joint channel, and the engine enforces the rule again
-///   on its own.
+///   [`FailBehaviour::ZeroVelocity`], [`FaultPolicy::FailSafe`] and
+///   [`FaultPolicy::FailOpen`] for a humanoid with a joint channel, and the
+///   engine enforces the rule again on its own (a fault always holds). A
+///   frame in which every enabled slot is limp is rejected, and enabled
+///   slots need non-zero gain minimums (or an explicit `allow_limp`) and a
+///   `max_dq_step`. `HoldLast { max_hold_ns }` does not release the hold on
+///   a humanoid: past `max_hold_ns` the firewall raises a Critical
+///   `joint_hold_exceeded` event (once per hold episode) and zeroes the
+///   held frame's feed-forward torque, keeping its gains and position
+///   targets (stale feed-forward torque was computed for a posture and
+///   phase that no longer holds; stiffness around the last valid target
+///   does not depend on them). Escalation (e.g. a controlled stop by the
+///   platform's own safety controller) is the responder's job.
 /// - **`Quadruped`**, `Wheeled`, `Arm`, `Other`: every [`FailBehaviour`]
 ///   is allowed. Trade-off on a quadruped joint channel: `ZeroVelocity`
 ///   (damping frame) lets the robot fold down onto its belly (low height,
@@ -586,9 +598,13 @@ impl Policy {
     /// Fails closed on everything [`Self::compile`] refuses, plus: an empty
     /// or > [`MAX_MOTORS`] motor table, a missing / non-finite / negative
     /// motor limit or an inverted range, an inconsistent rate, a zero
-    /// staleness deadline, and — for a [`Morphology::Humanoid`] platform
-    /// with any joint channel — [`FailBehaviour::ZeroVelocity`] or
-    /// [`FaultPolicy::FailSafe`] ([`ConfigError::UnsafeSubstitute`]).
+    /// staleness deadline, a missing joint `rate`, a time window over
+    /// [`crate::MAX_TIME_WINDOW_NS`], and — for a
+    /// [`Morphology::Humanoid`] platform with any joint channel —
+    /// [`FailBehaviour::ZeroVelocity`], [`FaultPolicy::FailSafe`] or
+    /// [`FaultPolicy::FailOpen`] ([`ConfigError::UnsafeSubstitute`]), an
+    /// enabled slot that may go limp without `allow_limp`, or one without
+    /// `max_dq_step`.
     pub fn compile_with_joints(
         profile: &Profile,
         platform: PlatformConfig,
@@ -637,7 +653,18 @@ impl Policy {
                         channel: first.clone(),
                         why: "a humanoid low-level joint channel cannot use fault_policy \
                               fail_safe: its zero-torque / damping substitute makes the robot \
-                              fall; use fail_hold (hold the last valid frame) or fail_open",
+                              fall; use fail_hold (hold the last valid frame)",
+                    });
+                }
+                if platform.fault_policy == FaultPolicy::FailOpen
+                    && platform.fail_behaviour != FailBehaviour::PassThroughObserveOnly
+                {
+                    return Err(ConfigError::UnsafeSubstitute {
+                        channel: first.clone(),
+                        why: "a humanoid low-level joint channel cannot use fault_policy \
+                              fail_open: on a fault it would forward the raw, unchecked frame \
+                              (which may be limp or out of envelope) to the motors; use \
+                              fail_hold (hold the last valid frame)",
                     });
                 }
             }
