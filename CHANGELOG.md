@@ -12,10 +12,37 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Added
 
+- Vendor-neutral action catalog `robodr_responder::actions` (replaces
+  `robodr_responder::autosecops`): one list of seven robot actions —
+  `restrict_motion`, `quarantine_node`, `isolate_network`,
+  `record_evidence`, `safe_pause`, `request_safe_state`,
+  `rollback_config` — each with its wire name (`robot_<name>`, unchanged),
+  ladder step, reversibility, TTL rule, approval tier (`single` /
+  `two_person`), `autonomous: false`, `executable_in_ga` /
+  `ga_execution` (executor for the four reversible actions, platform
+  adapter only for `safe_pause`, plan-only for `request_safe_state` and
+  `rollback_config`). The agentd control plane uses it (`ActionKind` =
+  `ActionId`) and so now also accepts `record_evidence`; a test asserts
+  the two agree. This resolves the earlier contradiction between the
+  responder's list (no `rollback_config`) and the control plane's (no
+  `record_evidence`).
+- Response policy `morphology` (`humanoid`, `quadruped`,
+  `wheeled_mobile`, `arm`, `aerial`, `other`; default `other`). For a
+  humanoid, `safe_pause` / `request_safe_state` (which may damp or
+  de-energise the joints: the robot would fall) are never executable: the
+  planner lists them in the new `ResponsePlan::advisory` and contains the
+  threat with `limit_motion`, `isolate_network` and `quarantine_node`;
+  `check_invariants` rejects such plans
+  (`Violation::DeEnergisingOnFallProneMorphology`); the control plane
+  refuses them (`fall_hazard`).
+- agentd `findings` section (`topic`, `data_source`) and
+  `AgentConfig::{findings_topic, data_source}`.
+- `crates/robodr-threat-forward/README.md`.
+
 - Control-plane action API in `robodr-agentd` (`control_plane`, off by
   default; `src/control/`, contract
-  `docs/contracts/robot-edr.control-plane.md`, API
-  `robodr-control-plane/v1`): the four calls of AutoSecOps' `v1-draft`
+  `docs/contracts/robodr.control-plane.md`, API
+  `robodr-control-plane/v1`): four calls
   (`GET /api/v1/robots/{id}`, `POST .../action-requests`, `GET
   .../action-requests/{rid}`, `POST .../{rid}/revert`) over a bounded,
   std-only HTTP/1.1 listener on a unix socket and / or a loopback TCP
@@ -36,9 +63,9 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   (High) and `robot.agent.control_plane_invalid` (Medium) (correlate catalog
   and OCSF 1.3 entries); `status.json` / heartbeat `control_plane` counters;
   `config/agentd.full.example.json` gains the section. Conformance: run
-  against AutoSecOps' own executor and client (branch `robodr-integration`)
-  with a request-signing transport: the client must learn the
-  `recorded_not_executed` status and Ed25519 request signing (contract §9).
+  against an earlier SOC client draft with a request-signing transport (that
+  integration was later cancelled; the client requirements are now in the
+  contract's §9).
 - Second set of real ROS 2 Jazzy lab captures
   (`fixtures/captures/ros2-jazzy/`, README "Second set"; tooling in
   `tools/lab-capture/`: `capture_gz.sh`, `capture_frag.sh`,
@@ -319,6 +346,34 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   evidence export).
 
 ### Changed
+
+- **Findings contract 2.0 (`robodr.findings`)**, superseding
+  `robot-edr.findings` 1.3: vendor-neutral envelope; `data_source` is a
+  deployment label (default `robodr`, was the constant `robot_edr`); the
+  topic is configurable (default `robodr.findings`, was fixed
+  `robot-edr.findings`) and named in `ocsf.metadata.log_name`; schema
+  `$id` `https://schemas.singularityrd.com/robodr/findings/2.0.0`
+  (`docs/contracts/robodr-finding.schema.json`, contract
+  `docs/contracts/robodr.findings.md`). The OCSF 1.1 Detection Finding
+  body, identity, SR-TAINT and signatures are unchanged. 1.x messages are
+  parse-only (validated, never emitted, packed or published).
+  `KAFKA_TOPIC` / `DATA_SOURCE` → `DEFAULT_TOPIC` / `DEFAULT_DATA_SOURCE`
+  (+ `legacy_v1`); `Record::topic` is a `String` derived from the value.
+- `robodr-kafka-publish` no longer refuses records for other topics: the
+  record topic must match its value, 1.x is refused, and records are sent
+  to `--topic` (relabelled ones counted as `topic_overridden`). The diode
+  manifest check is a contract-version check (2.x) instead of "1.x only";
+  the spool exporter checks the topic against the value.
+- The AutoSecOps-specific integration (a cancelled SOC integration) is
+  removed from code and docs: contracts are vendor-neutral
+  (`docs/contracts/robodr.findings.md`,
+  `docs/contracts/robodr.control-plane.md`); the 1.x contract texts moved
+  to `docs/contracts/legacy/` marked superseded; examples use a generic
+  SOC (`soc:<id>`, `/etc/robodr/soc/soc.pub`); code comments no longer
+  cite an out-of-repo design document.
+- Stale documentation fixed: README Pulsar crate status, SPRINTS header,
+  release signing in BUILD.md, agentd exporter note, Sprint 9 black-box
+  key note, real-capture notes in the pipeline and commissioning READMEs.
 
 - **Security (`robodr-blackbox`)**: Ed25519 now uses the audited
   `ed25519-dalek` 2.x crate (`curve25519-dalek` 4, `zeroize`; SHA-512 from

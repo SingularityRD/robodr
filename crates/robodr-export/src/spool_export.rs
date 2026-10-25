@@ -13,8 +13,9 @@
 //! For each batch:
 //!
 //! 1. Take `ready/` files in name (= sequence) order. Each is parsed as a
-//!    [`SpoolRecord`], checked (`schema`, `seq` = file name, topic) and its
-//!    `value` re-validated with [`robodr_ocsf::parse_and_validate`]. A record
+//!    [`SpoolRecord`], checked (`schema`, `seq` = file name, topic = the
+//!    value's `ocsf.metadata.log_name`) and its `value` re-validated with
+//!    [`robodr_ocsf::parse_and_validate`]. A record
 //!    that fails is **moved** to `<spool>/rejected/` with a `.reason.json`
 //!    beside it (never deleted). The batch is cut so the packer is
 //!    guaranteed to write it as **one** diode batch (same size/count rule
@@ -85,7 +86,7 @@ use robodr_diode::manifest::{
     MAX_MANIFEST_BYTES,
 };
 use robodr_diode::{PackConfig, PackError, Packer, PublishedBatch};
-use robodr_ocsf::{FindingEnvelope, KAFKA_TOPIC};
+use robodr_ocsf::FindingEnvelope;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
@@ -643,12 +644,6 @@ impl Exporter {
         if rec.seq != seq {
             return Ok(Err(format!("seq {} does not match file name", rec.seq)));
         }
-        if rec.topic != KAFKA_TOPIC {
-            return Ok(Err(format!(
-                "topic {:?}, expected {KAFKA_TOPIC}",
-                rec.topic
-            )));
-        }
         let env = match robodr_ocsf::parse_and_validate(&rec.value) {
             Ok(e) => e,
             Err(errs) => {
@@ -658,6 +653,12 @@ impl Exporter {
         };
         if rec.key != env.finding_id {
             return Ok(Err("record key is not the finding id".into()));
+        }
+        if rec.topic != env.ocsf.metadata.log_name {
+            return Ok(Err(format!(
+                "topic {:?} is not the one the value names ({:?})",
+                rec.topic, env.ocsf.metadata.log_name
+            )));
         }
         // Exactly what the packer will write (it re-serialises with to_json).
         let line = match robodr_ocsf::to_json(&env) {

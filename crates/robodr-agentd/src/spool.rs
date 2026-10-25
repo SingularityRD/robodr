@@ -1,4 +1,5 @@
-//! The findings spool: validated `robot-edr.findings` records as files, for
+//! The findings spool: validated findings records (`robodr.findings`
+//! contract; topic = the configured `findings.topic`) as files, for
 //! an exporter (Kafka producer, sneakernet, ...) to pick up.
 //!
 //! ```text
@@ -343,7 +344,7 @@ mod tests {
 
     fn rec(n: usize) -> FindingOutput {
         FindingOutput {
-            topic: "robot-edr.findings".into(),
+            topic: robodr_ocsf::DEFAULT_TOPIC.into(),
             key: format!("rf1-{n}"),
             partition: None,
             value: format!("{{\"x\":\"{}\"}}", "v".repeat(n)),
@@ -417,7 +418,13 @@ mod tests {
             assert!(n < 100);
         }
         assert!(s.stats().ready_bytes <= 2_000);
-        assert!(s.is_full() || s.stats().ready_bytes + 300 > 2_000);
+        // Every record has the same size: the next one would not fit.
+        let ready = s.stats().ready_bytes;
+        assert!(n > 0);
+        assert!(
+            s.is_full() || ready + ready / n > 2_000,
+            "{n} records, {ready} B"
+        );
         let _ = fs::remove_dir_all(&d);
     }
 

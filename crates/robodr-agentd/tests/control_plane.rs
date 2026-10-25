@@ -23,7 +23,7 @@ use robodr_blackbox::crypto::to_hex;
 use robodr_blackbox::{Ed25519SigningKey, KeyFile};
 use serde_json::{json, Value};
 
-const SOC_ID: &str = "soc:autosecops:1";
+const SOC_ID: &str = "soc:soc-a:1";
 const SOC_SEED: [u8; 32] = [0x51; 32];
 const FINDING_ID: &str = "finding:ugv-007:1";
 const FINDING_SEED: [u8; 32] = [0x52; 32];
@@ -161,7 +161,7 @@ fn submit_body(id: &str, action: &str, params: Value, ttl: Option<u64>) -> Vec<u
         "ttl_seconds": ttl,
         "reason": "rogue /cmd_vel writer (test)",
         "requested_by": "analyst@soc",
-        "source": "autosecops",
+        "source": "soc-a",
         "authority": "request",
     }))
     .unwrap()
@@ -328,7 +328,7 @@ fn signed_requests_are_judged_recorded_and_never_executed() {
     let r = unix(&control, &again);
     assert_eq!(r.body["duplicate"], true);
     assert_eq!(r.body["status"], "recorded_not_executed");
-    // Read it back over TCP (percent-encoded id, as AutoSecOps sends it).
+    // Read it back over TCP (percent-encoded id, as a SOC client sends it).
     let get = format!("{requests}/{}", id.replace(':', "%3A"));
     let r = tcp(port, &signed("GET", &get, b""));
     assert_eq!(r.status, 200, "{}", r.body);

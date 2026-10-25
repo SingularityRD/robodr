@@ -373,7 +373,7 @@ fn check(root: &Value, schema: &Value, inst: &Value, path: &str, errs: &mut Vec<
 }
 
 fn schema_errors(inst: &Value) -> Vec<String> {
-    let schema: Value = serde_json::from_str(&load("robot-edr-finding.schema.json"))
+    let schema: Value = serde_json::from_str(&load("robodr-finding.schema.json"))
         .expect("schema file is valid JSON");
     let mut errs = vec![];
     check(&schema, &schema, inst, "", &mut errs);
@@ -401,7 +401,7 @@ fn produced_finding_contains_every_required_schema_key() {
     let inst: Value = serde_json::from_str(&robodr_ocsf::to_json(&f).unwrap()).unwrap();
     let errs = schema_errors(&inst);
     assert!(errs.is_empty(), "schema violations:\n{}", errs.join("\n"));
-    let schema: Value = serde_json::from_str(&load("robot-edr-finding.schema.json")).unwrap();
+    let schema: Value = serde_json::from_str(&load("robodr-finding.schema.json")).unwrap();
     assert!(
         count_required(&schema) > 80,
         "schema lost its required lists"
@@ -477,9 +477,9 @@ fn schema_checker_detects_missing_and_undeclared_keys() {
 fn contract_example_file_is_exactly_what_the_builder_produces() {
     let f = common::example_finding();
     let produced = serde_json::to_string_pretty(&f).unwrap() + "\n";
-    let on_disk = load("robot-edr-finding.example.json");
+    let on_disk = load("robodr-finding.example.json");
     if produced != on_disk {
-        eprintln!("---- regenerate docs/contracts/robot-edr-finding.example.json ----\n{produced}");
+        eprintln!("---- regenerate docs/contracts/robodr-finding.example.json ----\n{produced}");
     }
     assert_eq!(produced, on_disk, "contract example is stale");
     // And the example itself passes the strict validator.
@@ -489,7 +489,7 @@ fn contract_example_file_is_exactly_what_the_builder_produces() {
 // ------------------------------------------------------- SR-TAINT patterns --
 
 fn schema() -> Value {
-    serde_json::from_str(&load("robot-edr-finding.schema.json")).unwrap()
+    serde_json::from_str(&load("robodr-finding.schema.json")).unwrap()
 }
 
 fn collect_patterns(v: &Value, out: &mut Vec<String>) {

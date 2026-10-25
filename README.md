@@ -68,6 +68,10 @@ crates/
                           telemetry, uncommanded motion, GNSS vs odom vs IMU). Pure.
   robodr-responder/       Cyber-Jidoka response *planner*: graded, safety-state-aware
                           plans; executes nothing, never overrides the safety system.
+                          Owns the vendor-neutral action catalog (`actions`:
+                          seven actions, approval tier, reversibility, GA
+                          execution) and the humanoid rule (no executable
+                          safe pause / safe state: a humanoid would fall).
   robodr-blackbox/        Signed (Ed25519 by default, via the audited
                           ed25519-dalek crate; legacy HMAC-SHA256 warned),
                           hash-chained evidence recorder with append-only
@@ -75,12 +79,12 @@ crates/
                           format (robodr-blackbox-key/v2 secret + .pub) also
                           used for profile signing. Binary: robodr-blackbox
                           (keygen, export-pub, verify, inspect).
-  robodr-ocsf/            Deviation -> OCSF Detection Finding for the AutoSecOps
-                          robot-edr.findings contract; Kafka key/partition helpers
+  robodr-ocsf/            Deviation -> OCSF Detection Finding in the vendor-neutral
+                          robodr.findings contract (2.0; configurable data source
+                          and topic; 1.x parse-only); Kafka key/partition helpers
                           (no Kafka client); optional detached Ed25519 per-finding
-                          signatures (contract 1.2, header robodr-finding-sig);
-                          contract 1.3 catalog for correlation, safety-state
-                          and agent findings.
+                          signatures (header robodr-finding-sig); rule catalog
+                          for correlation, safety-state and agent findings.
   robodr-agent/           Offline decision chain composing the crates above
                           (event -> deviation -> plan -> evidence -> finding).
                           Binary: robodr-replay (JSONL replay). Executes nothing.
@@ -119,9 +123,17 @@ crates/
                           in CI and against single-node Apache Kafka 3.9.1 and
                           4.1.0 brokers (scripts/kafka-it.sh, docker).
   robodr-sensor-ros2/     Thin Pulsar module wrapping robodr-ros2-pipeline.
-                          Pulsar-dependent; not built or tested offline.
-  robodr-pulsard/         Pulsar daemon with the RoboDR module registered.
-                          Pulsar-dependent; not built or tested offline.
+                          Pulsar-dependent: built, linted and tested against
+                          vendor/pulsar in CI's `pulsar` job (needs Pulsar's
+                          eBPF toolchain).
+  robodr-threat-forward/  Pulsar module (no binary) forwarding every Pulsar
+                          threat to robodr-agentd's host_threats socket (JSON
+                          lines, bounded queue, never blocks the bus).
+                          Pulsar-dependent; built and tested like the above.
+  robodr-pulsard/         Pulsar daemon with the RoboDR modules registered.
+                          Pulsar-dependent; built and tested in the `pulsar`
+                          job; run as root with eBPF probes loaded in WSL2,
+                          never on a robot (PULSAR-INTEGRATION §7b).
 rules/robodr/           Robot detection rules in Pulsar rules-engine TOML format
                         (validate: scripts/validate_rules.py; see rules/README.md).
 config/                 Profile, response-policy and daemon config examples.
@@ -131,7 +143,8 @@ docs/SECURE-DELIVERY.md Design (not implemented): air-gapped fleet distribution,
                         staged updates, captured-unit software protection.
 docs/BUILD.md           Toolchain, MSRV, Cargo.lock policy, air-gapped builds, CI.
 docs/PULSAR-INTEGRATION.md  Every Pulsar item the Pulsar-bound crates use.
-docs/contracts/         robot-edr.findings topic contract + JSON Schema.
+docs/contracts/         robodr.findings contract (v2) + JSON Schema + example,
+                        robodr.control-plane contract; legacy/ = superseded 1.x.
 fuzz/                   cargo-fuzz targets (RTPS, capture, black box, OCSF,
                         commissioning, firewall, pipeline config; own
                         workspace) + std-only smoke runs in the crates' tests.
@@ -204,12 +217,12 @@ module, no robot):
   the other message types only on hand-built vectors. The Motion Firewall
   runs recording-only, and nothing executes a response.
 - The control-plane action API (`robodr-agentd` `control_plane`, off by
-  default; `docs/contracts/robot-edr.control-plane.md`) authenticates
-  Ed25519-signed SOC requests, judges them against the live safety state
-  and records them, but **executes nothing** (`recorded_not_executed`). It
-  has no TLS (put a terminator in front), keeps request states in memory
-  only, and was run against AutoSecOps' executor in-process over loopback,
-  not against a deployed SOC.
+  default; `docs/contracts/robodr.control-plane.md`) authenticates
+  Ed25519-signed SOC requests for the seven catalog actions, judges them
+  against the live safety state and records them, but **executes nothing**
+  (`recorded_not_executed`). It has no TLS (put a terminator in front),
+  keeps request states in memory only, and was exercised with an
+  in-process signing client over loopback, not against a deployed SOC.
   The Pulsar module (`robodr-sensor-ros2`) runs the same decode for its
   envelope check but does not forward decoded samples (see its crate docs).
 - The black box's TPM 2.0 NV counter head anchor (`TpmNvCounterAnchor`,
@@ -248,13 +261,14 @@ cd robodr
 # Pure crates: build and test with no kernel and no robot. (Cargo still
 # resolves the whole workspace, so this needs the submodule and the crates
 # pinned in Cargo.lock, from crates.io or the mirror.)
-cargo test --workspace --exclude robodr-sensor-ros2 --exclude robodr-pulsard
+cargo test --workspace --exclude robodr-sensor-ros2 --exclude robodr-pulsard \
+  --exclude robodr-threat-forward
 cargo test -p robodr-rtps          # RTPS discovery parser
 cargo test -p robodr-ros2-pipeline # sensor pipeline (what the Pulsar module runs)
 
 # Pulsar-bound crates link all of Pulsar (needs its eBPF build toolchain; see
 # vendor/pulsar/README.md for kernel 5.5+, BTF, clang requirements):
-cargo build -p robodr-sensor-ros2 -p robodr-pulsard
+cargo build -p robodr-sensor-ros2 -p robodr-threat-forward -p robodr-pulsard
 ```
 
 ## License

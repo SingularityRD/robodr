@@ -12,16 +12,38 @@ the final authority; RoboDR is not a safety-rated component.
 
 Plans are cumulative: a plan at step N contains every step up to N, in order.
 
-| # | Step | Action | Requested from | AutoSecOps class |
-|---|------|--------|----------------|------------------|
-| 1 | `record` | Evidence to black box, alert to console | black box / console | `robot_record_evidence` *(proposed, not in design doc)* |
-| 2 | `restrict` | Deny network link / DDS participant / process | host & DDS enforcement | `robot_isolate_network` (network), `robot_quarantine_node` (participant, process) |
-| 3 | `limit_motion` | Scale speed/workspace envelope by `factor` ∈ (0, 1] | Motion Firewall | `robot_restrict_motion` |
-| 4 | `safe_pause` | Pause at a safe point, platform's safe behaviour | mission executive / autopilot | `robot_safe_pause` (two-person) |
-| 5 | `request_safe_state` | Ask for the protective safe state; it decides | safety controller | `robot_request_safe_state` (two-person) |
+| # | Step | Action | Requested from | Catalog action |
+|---|------|--------|----------------|----------------|
+| 1 | `record` | Evidence to black box, alert to console | black box / console | `record_evidence` |
+| 2 | `restrict` | Deny network link / DDS participant / process | host & DDS enforcement | `isolate_network` (network), `quarantine_node` (participant, process) |
+| 3 | `limit_motion` | Scale speed/workspace envelope by `factor` ∈ (0, 1] | Motion Firewall | `restrict_motion` |
+| 4 | `safe_pause` | Pause at a safe point, platform's safe behaviour | mission executive / autopilot | `safe_pause` (two-person) |
+| 5 | `request_safe_state` | Ask for the protective safe state; it decides | safety controller | `request_safe_state` (two-person) |
 
-All classes are in the `robotics` category, `autonomous_eligible = false`; none
-may join AutoSecOps' `AUTONOMOUS_ELIGIBLE` list (`autosecops::action_class`).
+## Action catalog (`actions`)
+
+`robodr_responder::actions` is the **single, vendor-neutral list** of robot
+containment actions. The agentd control plane accepts exactly these
+(`ActionKind` is a re-export of `ActionId`; a test asserts they match), and a
+SOC integration registers them under their wire names.
+
+| Action | Wire name | Step | Reversible | Approval | GA execution |
+|---|---|---|---|---|---|
+| `restrict_motion` | `robot_restrict_motion` | `limit_motion` | yes, TTL | single | executor (firewall gateway) |
+| `quarantine_node` | `robot_quarantine_node` | `restrict` | yes | single | executor (DDS / nftables) |
+| `isolate_network` | `robot_isolate_network` | `restrict` | yes, TTL | single | executor (nftables, management channel exempt) |
+| `record_evidence` | `robot_record_evidence` | `record` | yes (no lasting effect) | single | executor (black box) |
+| `safe_pause` | `robot_safe_pause` | `safe_pause` | yes | two-person | platform adapter only, OEM-validated policy |
+| `request_safe_state` | `robot_request_safe_state` | `request_safe_state` | no | two-person | plan only |
+| `rollback_config` | `robot_rollback_config` | `restrict` | no | two-person | plan only |
+
+Every action is **never autonomous** (`autonomous = false`): a SOC must
+have a human approve it. `executable_in_ga` is `false` for the plan-only
+pair; GA executes only reversible actions. The wire names keep the
+`robot_<name>` strings used so far, so existing registrations stay valid.
+`safe_pause` and `request_safe_state` are flagged `may_de_energise`: see
+*Humanoids* below. (Nothing in this crate executes; GA execution is the
+executor's and the platform adapters' job.)
 
 ## Invariants (in code, regardless of policy; tested exhaustively)
 
@@ -49,6 +71,44 @@ may join AutoSecOps' `AUTONOMOUS_ELIGIBLE` list (`autosecops::action_class`).
    approval.
 7. **Policy mismatch** (context platform ≠ policy platform) → `record` +
    approval.
+8. **Humanoid: no executable de-energising action.** With `morphology:
+   "humanoid"`, `safe_pause` and `request_safe_state` never appear in a
+   plan's `actions`; they go to `advisory` (never executed) and the plan
+   contains the threat with `limit_motion`, `isolate_network` and
+   `quarantine_node` instead (`Reason::DeEnergisingAdvisoryOnly`,
+   `Violation::DeEnergisingOnFallProneMorphology`).
+
+## Humanoids (`morphology`)
+
+The response policy carries the robot's body plan, `morphology`:
+`humanoid`, `quadruped`, `wheeled_mobile`, `arm`, `aerial` or `other`
+(default; policies written before the field existed load unchanged and plan
+exactly as before).
+
+A humanoid stays upright only while its joint controllers actively balance
+it. The usual implementation of "pause", "safe state" or "protective stop"
+on such a platform is a damping / zero-torque mode or a motor power cut, and
+the robot then **falls** — tens of kilograms from standing height, next to
+the people and equipment it works with. That is a worse hazard than most
+cyber events it would answer, and RoboDR cannot know how a given platform
+implements those requests. So, for `humanoid` only:
+
+* the planner moves `safe_pause` / `request_safe_state` into
+  `ResponsePlan::advisory` (a recommendation for the operator and the
+  platform's own safety function, which may have a validated sit-down or
+  crouch sequence) and caps the executable plan at `limit_motion`, adding
+  network isolation and participant quarantine to the restrict targets;
+* `check_invariants` rejects any plan with `morphology: humanoid` whose
+  actions contain either step, and any advisory entry that is not one of
+  them (executors must also compare the plan's `morphology` with their own
+  policy);
+* the agentd control plane refuses SOC requests for `safe_pause` /
+  `request_safe_state` on a humanoid (`fall_hazard`).
+
+Quadrupeds, wheeled platforms, arms and aerial vehicles keep the full ladder
+(their safe behaviours are a controlled stop, protective stop category 2 or
+hold). A quadruped whose damping mode collapses the body should use an
+OEM-validated `platform_defined` behaviour, or be declared `humanoid`.
 
 Defence in depth: `ResponsePolicy::validate` rejects policies that try to break
 2/5 (and malformed ones); the planner enforces all invariants again at plan time;
@@ -127,6 +187,7 @@ is at hand.
 | Field | Meaning |
 |---|---|
 | `model`, `platform` | Robot model and family (`ugv`, `amr`, `drone`, `arm`, `other`) |
+| `morphology` | Optional, default `other`: `humanoid`, `quadruped`, `wheeled_mobile`, `arm`, `aerial`, `other`. `humanoid` makes steps 4/5 advisory only |
 | `oem_validated` | `true` only after OEM sign-off; otherwise observe-only |
 | `matrix.<state>.<severity>` | Max step. States: `idle`, `moving_slow`, `moving_fast`, `collaborative_human_nearby`, `estop_active`, `safe_state_active`, `unknown`. All states/severities required; e-stop/safe-state rows must be `record` |
 | `rule_overrides[]` | `{rule, min_step?, max_step?, restrict?}` — clamps the matrix step for one rule id; ≤ 256, unique, `[A-Za-z0-9._-]{1,128}` |
@@ -152,7 +213,8 @@ so medium deviations on a moving robot only record; restricting comms while
 moving can itself trip watchdogs, so it is not used below high there. With a
 human nearby, slowing down is cheap relative to the hazard, so it starts at
 medium. `auto_max_step = limit_motion`: pause and safe-state requests wait for a
-human (matching the design doc's two-person tier); an OEM may raise this.
+human (matching their two-person approval tier in the action catalog); an OEM
+may raise this.
 Escalation: 3 in 60 s → +1 rung, max +1, never above `limit_motion`; 5 min
 quiet resets; 5 s re-issue interval. The default is **not** `oem_validated`, so
 out of the box it is observe-only.
@@ -169,8 +231,8 @@ out of the box it is observe-only.
   PLC status, mission executive, teleop link) and how authentic they are is not
   addressed here; a spoofed `idle` could enable process termination if the
   policy allows it (hence default `false`).
-- AutoSecOps class `robot_record_evidence` is our proposal; the other names come
-  from the design doc. The AutoSecOps-side executor/registration is not built.
+- The SOC-side registration of the catalog (approval workflow, two-person
+  rule) and the on-robot executor are not built here.
 - Known limit: deviations that are observe-only only because of the *context*
   (`profile_locked = false`) or an unvalidated policy still update escalation
   and hold (shadow evaluation), and that state carries over if the profile is

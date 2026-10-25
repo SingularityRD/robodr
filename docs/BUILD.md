@@ -264,8 +264,13 @@ script then compares `target/<triple>/release/robodr-*`. Controlled:
 
 To verify a published release independently: check out the tag with
 submodules, install Rust 1.98.1, run `scripts/ci-repro.sh`, and compare its
-`SHA256SUMS` with the one published for the release. Signing the release (the
-other half of the Sprint 1 assurance item) is not implemented yet.
+`SHA256SUMS` with the one published for the release. Signing (the other
+half of the Sprint 1 assurance item) is implemented in `release.yml`'s
+`publish` job: `SHA256SUMS` plus a minisign signature (`*.minisig`) for every
+asset, verifiable offline with the public key in the repository variable
+`ROBODR_MINISIGN_PUBKEY`. It has never run: the `MINISIGN_SECRET_KEY` /
+`MINISIGN_PASSWORD` secrets are not provisioned and no release has been cut.
+cosign / SLSA provenance is a TODO in the workflow.
 
 The Pulsar-bound binary (`pulsard` with RoboDR modules, embedding eBPF objects
 built by clang) is **not** covered yet: clang/LLVM output must be pinned and
@@ -558,5 +563,7 @@ cargo-cyclonedx / cargo-deny / shellcheck installed):
   the case). The Pulsar-bound crates were not checked at all.
 - The air-gapped procedures (mirror, vendored tarball, offline toolchain,
   advisory-DB snapshot) are documented, not yet rehearsed in the lab.
-- Release signing is not implemented. Reproducibility of the Pulsar-bound
-  binary (eBPF objects from clang) is not checked.
+- Release signing (minisign in `release.yml`'s `publish` job) is written but
+  has never run: no signing key is provisioned and no release was cut.
+  Reproducibility of the Pulsar-bound binary (eBPF objects from clang) is not
+  checked.

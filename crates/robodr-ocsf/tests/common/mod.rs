@@ -246,6 +246,37 @@ pub const BYPASS_CASES: &[Bypass] = &[
     ),
 ];
 
+/// Rewrite a current (2.x) finding value into the shape contract 1.x fixed
+/// (`version`, `data_source` `robot_edr`, topic `robot-edr.findings`), as a
+/// 1.x producer emitted it. Used by the parse-only compatibility tests.
+pub fn to_v1(v: &mut serde_json::Value, version: &str) {
+    v["contract_version"] = version.into();
+    v["data_source"] = legacy_v1::DATA_SOURCE.into();
+    v["ocsf"]["metadata"]["log_name"] = legacy_v1::TOPIC.into();
+}
+
+/// [`to_v1`] on compact JSON, keeping key order and spelling.
+pub fn to_v1_json(json: &str, version: &str) -> String {
+    let out = json
+        .replacen(
+            &format!("\"contract_version\":\"{CONTRACT_VERSION}\""),
+            &format!("\"contract_version\":\"{version}\""),
+            1,
+        )
+        .replacen(
+            &format!("\"data_source\":\"{DEFAULT_DATA_SOURCE}\""),
+            &format!("\"data_source\":\"{}\"", legacy_v1::DATA_SOURCE),
+            1,
+        )
+        .replacen(
+            &format!("\"log_name\":\"{DEFAULT_TOPIC}\""),
+            &format!("\"log_name\":\"{}\"", legacy_v1::TOPIC),
+            1,
+        );
+    assert_ne!(out, json, "not a default-labelled current finding");
+    out
+}
+
 /// A writer finding whose topic (and detail line) is the attacker string.
 pub fn build_topic(topic: &str) -> FindingEnvelope {
     let dev = Deviation::new(

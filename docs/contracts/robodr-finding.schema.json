@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://singularityrd.example/robodr/contracts/robot-edr-finding/1.3.0",
-  "title": "RoboDR robot-edr.findings message (contract 1.3.0)",
-  "description": "One Kafka value on topic robot-edr.findings: AutoSecOps ingestion envelope + OCSF 1.1 Detection Finding (class_uid 2004). Maintained alongside crates/robodr-ocsf/src/model.rs; the crate's tests check that produced findings contain every required key here and no undeclared key. Strings carrying attacker-controlled data are objects of type TaintedName/TaintedText or OCSF resources labelled taint:adversary. SR-TAINT: every string has a pattern; every string is printable ASCII (U+0020-U+007E) without < > or backtick, and tainted values are restricted to the allow-list of their escaping scheme (see robot-edr.findings.md section 3), so raw bidi/format/newline characters and Markdown/HTML markup are rejected by a schema-only consumer. Since 1.2 a finding may carry a detached Ed25519 signature in the Kafka header robodr-finding-sig (NOT in this value); its header value is described by $defs/FindingSignatureHeader and is signed over the exact bytes of this value (robot-edr.findings.md section 2a).",
+  "$id": "https://schemas.singularityrd.com/robodr/findings/2.0.0",
+  "title": "RoboDR robodr.findings message (contract 2.0.0)",
+  "description": "One findings message (Kafka value on the configured topic, default robodr.findings; one NDJSON line on other transports): vendor-neutral envelope + OCSF 1.1 Detection Finding (class_uid 2004). data_source (default robodr) and ocsf.metadata.log_name (the topic, default robodr.findings) are deployment labels. Contract 1.x messages (robot-edr.findings) are described by legacy/robot-edr-finding.schema.json. Maintained alongside crates/robodr-ocsf/src/model.rs; the crate's tests check that produced findings contain every required key here and no undeclared key. Strings carrying attacker-controlled data are objects of type TaintedName/TaintedText or OCSF resources labelled taint:adversary. SR-TAINT: every string has a pattern; every string is printable ASCII (U+0020-U+007E) without < > or backtick, and tainted values are restricted to the allow-list of their escaping scheme (see robodr.findings.md section 3), so raw bidi/format/newline characters and Markdown/HTML markup are rejected by a schema-only consumer. A finding may carry a detached Ed25519 signature in the Kafka header robodr-finding-sig (NOT in this value); its header value is described by $defs/FindingSignatureHeader and is signed over the exact bytes of this value (robodr.findings.md section 2a).",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -11,10 +11,10 @@
     "evidence_links", "adversary_controlled_fields", "ocsf"
   ],
   "properties": {
-    "contract_version": { "type": "string", "pattern": "^1\\.[0-9]+\\.[0-9]+$" },
+    "contract_version": { "type": "string", "pattern": "^2\\.[0-9]+\\.[0-9]+$" },
     "finding_id": { "type": "string", "pattern": "^rf1-[0-9a-f]{32}$" },
     "external_id": { "type": "string", "maxLength": 101, "pattern": "^[A-Za-z0-9._-]{1,64}:rf1-[0-9a-f]{32}$" },
-    "data_source": { "const": "robot_edr" },
+    "data_source": { "type": "string", "maxLength": 64, "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$" },
     "title": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[ -;=?-_a-~]*$" },
     "description": { "type": "string", "minLength": 1, "maxLength": 2048, "pattern": "^[ -;=?-_a-~]*$" },
     "severity": { "enum": ["low", "medium", "high", "critical"] },
@@ -49,7 +49,7 @@
   },
   "$defs": {
     "FindingSignatureHeader": {
-      "description": "Contract 1.2: value of the Kafka header robodr-finding-sig (compact JSON, fields in this order). Not part of the finding value. sig = Ed25519 over 'robodr-ocsf/finding-sig/v1' NUL || u32be(len alg) || alg || u32be(len key_id) || key_id || u64be(len value) || value, where value is the record value bytes exactly as received. The key is looked up by entity_context.robot.id. Header value at most 512 bytes.",
+      "description": "Value of the Kafka header robodr-finding-sig (since contract 1.2) (compact JSON, fields in this order). Not part of the finding value. sig = Ed25519 over 'robodr-ocsf/finding-sig/v1' NUL || u32be(len alg) || alg || u32be(len key_id) || key_id || u64be(len value) || value, where value is the record value bytes exactly as received. The key is looked up by entity_context.robot.id. Header value at most 512 bytes.",
       "type": "object",
       "additionalProperties": false,
       "required": ["alg", "key_id", "sig"],
@@ -218,7 +218,7 @@
               }
             },
             "uid": { "type": "string", "pattern": "^re1-[0-9a-f]{32}$" },
-            "log_name": { "const": "robot-edr.findings" }
+            "log_name": { "type": "string", "maxLength": 249, "pattern": "^[A-Za-z0-9._-]{1,249}$" }
           }
         },
         "finding_info": {

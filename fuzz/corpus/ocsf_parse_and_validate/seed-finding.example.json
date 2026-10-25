@@ -1,8 +1,8 @@
 {
-  "contract_version": "1.1.0",
+  "contract_version": "2.0.0",
   "finding_id": "rf1-0d7e79aac05cfd23bcfbdd38ef617eba",
   "external_id": "ugv-007:rf1-0d7e79aac05cfd23bcfbdd38ef617eba",
-  "data_source": "robot_edr",
+  "data_source": "robodr",
   "title": "Unauthorized publisher on a motion topic",
   "description": "A participant that is not in the locked model profile announced a writer on a motion/control topic. Robot ugv-007 (model ugv-tracked-v1, site range-north, firmware 2.4.1); profile version 7; mode enforce; safety state: motion moving, human proximity not detected; attestation verified; occurrences 3.",
   "severity": "critical",
@@ -133,7 +133,7 @@
         "version": "0.1.0-alpha.1"
       },
       "uid": "re1-e10d71877f52e563b8482d1359871bb1",
-      "log_name": "robot-edr.findings"
+      "log_name": "robodr.findings"
     },
     "finding_info": {
       "uid": "rf1-0d7e79aac05cfd23bcfbdd38ef617eba",

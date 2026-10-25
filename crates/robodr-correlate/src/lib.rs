@@ -1,9 +1,10 @@
 //! RoboDR correlation engine: combines weak signals into stronger findings.
 //!
-//! The design document's detection engine has four parts: model profile,
-//! rules, anomaly models and **correlation** ("combines individually weak
-//! signals, e.g. new process + new ROS node + the source of the velocity
-//! command changed = high severity"). This crate is that last part.
+//! RoboDR's detection has four parts: model profile, rules, anomaly models
+//! and **correlation**, which combines individually weak signals into a
+//! stronger one (e.g. new process + new ROS node + the source of the
+//! velocity command changed = high severity). This crate is that last
+//! part.
 //!
 //! ```text
 //! Deviation (ROS 2 pipeline, agent)  ─┐

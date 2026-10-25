@@ -1,4 +1,5 @@
-//! SOC side: publish `robot-edr.findings` records to Kafka from
+//! SOC side: publish findings records (`robodr.findings` contract) to
+//! Kafka from
 //!
 //! * the diode importer's output, `out/<batch>/records.jsonl` (one Kafka
 //!   record per line, see `robodr_diode::unpack`), or
@@ -10,6 +11,12 @@
 //! [`robodr_ocsf::parse_and_validate`], and the key and headers must be
 //! exactly what [`robodr_ocsf::record`] derives from that value (contract
 //! §2; a record whose headers disagree with its value is not forwarded).
+//! The value must be of the current contract major (1.x findings are
+//! parse-only and dead-lettered). The record's `topic` must be the one its
+//! value names (`ocsf.metadata.log_name`); the publisher sends to its own
+//! configured topic (`--topic`, default `robodr.findings`), whatever topic
+//! the producer named, and counts records it relabelled that way
+//! (`topic_overridden`).
 //! The **value bytes sent are the ones on disk** (the validated bytes).
 //! The partition is recomputed from the robot id and the topic's *current*
 //! partition count (contract §4); a different `partition` in the input
@@ -56,7 +63,7 @@
 use crate::fsutil::{self, ReadError};
 use crate::kafka::{Outcome, ProduceError, ProduceRecord, Producer};
 use robodr_agentd::spool::SpoolRecord;
-use robodr_ocsf::KAFKA_TOPIC;
+use robodr_ocsf::DEFAULT_TOPIC;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashSet};
@@ -132,7 +139,7 @@ impl PublishConfig {
         Self {
             source,
             state_dir: state_dir.into(),
-            topic: KAFKA_TOPIC.into(),
+            topic: DEFAULT_TOPIC.into(),
             chunk_records: 500,
             max_record_bytes: 1024 * 1024,
             fail_after_send: None,
@@ -284,6 +291,9 @@ pub struct PublishReport {
     pub batches_done: Vec<String>,
     /// Records whose input partition differed from the recomputed one.
     pub partition_overridden: u64,
+    /// Records whose producer named another topic than the one published
+    /// to (the publisher's configured topic wins).
+    pub topic_overridden: u64,
     /// Lines skipped at the start of a resumed batch.
     pub resumed_after: u64,
 }
@@ -474,20 +484,29 @@ impl<S: Sink> Publisher<S> {
     ) -> Result<(i32, ProduceRecord), String> {
         let rec: InRecord =
             serde_json::from_slice(raw).map_err(|e| format!("not a record: {e}"))?;
-        if rec.topic != self.cfg.topic {
-            return Err(format!(
-                "topic {:?}, publishing to {:?}",
-                rec.topic, self.cfg.topic
-            ));
-        }
         let env = robodr_ocsf::parse_and_validate(&rec.value).map_err(|errs| {
             let v: Vec<String> = errs.iter().take(3).map(|e| e.to_string()).collect();
             format!("invalid finding: {}", v.join("; "))
         })?;
+        if !robodr_ocsf::validate::is_emittable_contract_version(&env.contract_version) {
+            return Err(format!(
+                "contract {} findings are parse-only and not published",
+                env.contract_version
+            ));
+        }
         let want = robodr_ocsf::record(&env, Some(partitions))
             .map_err(|_| "finding cannot be emitted".to_string())?;
         if rec.key != want.key {
             return Err("key is not the finding id".into());
+        }
+        if rec.topic != want.topic {
+            return Err(format!(
+                "topic {:?} is not the one the value names ({:?})",
+                rec.topic, want.topic
+            ));
+        }
+        if want.topic != self.cfg.topic {
+            report.topic_overridden += 1;
         }
         // An optional detached finding signature (contract §2a) is carried
         // verbatim as the last header; every other header is re-derived from

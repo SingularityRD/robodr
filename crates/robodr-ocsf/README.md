@@ -1,13 +1,18 @@
 # robodr-ocsf
 
-Turns a RoboDR `Deviation` into a **finding** for the AutoSecOps AI SOC: an
-OCSF 1.1 **Detection Finding** (`class_uid` 2004, `category_uid` 2 *Findings*)
-wrapped in the AutoSecOps ingestion envelope, ready for the
-`robot-edr.findings` Kafka topic.
+Turns a RoboDR `Deviation` into a **finding** for any SOC or SIEM: an OCSF
+1.1 **Detection Finding** (`class_uid` 2004, `category_uid` 2 *Findings*)
+wrapped in the vendor-neutral `robodr.findings` envelope (contract **2.0**),
+ready for a Kafka topic (default `robodr.findings`), an NDJSON ingest API or
+a diode batch. `data_source` (default `robodr`) and the topic are deployment
+configuration (`RobotContext::{data_source, topic}`). Contract 1.x
+(`robot-edr.findings`) messages are still parsed and validated with their
+fixed 1.x constants, never emitted.
 
-Contract: [`docs/contracts/robot-edr.findings.md`](../../docs/contracts/robot-edr.findings.md) ·
-Schema: [`robot-edr-finding.schema.json`](../../docs/contracts/robot-edr-finding.schema.json) ·
-Example: [`robot-edr-finding.example.json`](../../docs/contracts/robot-edr-finding.example.json)
+Contract: [`docs/contracts/robodr.findings.md`](../../docs/contracts/robodr.findings.md) ·
+Schema: [`robodr-finding.schema.json`](../../docs/contracts/robodr-finding.schema.json) ·
+Example: [`robodr-finding.example.json`](../../docs/contracts/robodr-finding.example.json) ·
+Superseded 1.x: [`legacy/`](../../docs/contracts/legacy/)
 
 Pure crate: std + serde + `robodr-events` + `robodr-blackbox` (for the
 `Signer`/`Verifier` traits and Ed25519). No I/O, no clock, no Kafka client.
@@ -25,7 +30,7 @@ let finding = FindingBuilder::from_deviation(&deviation, &ctx)
     .evidence(BlackBoxRef { segment, seq, sha256 })
     .build()?;                         // validated, or every problem listed
 let rec = robodr_ocsf::record(&finding, Some(partitions))?; // key, partition, headers, JSON
-// Contract 1.2: optionally sign (Ed25519 finding key; header robodr-finding-sig)
+// Optionally sign (Ed25519 finding key; header robodr-finding-sig)
 let rec = robodr_ocsf::record_signed(&finding, Some(partitions), &finding_key)?;
 
 // Consumer: raw value bytes + header, keys = robot id -> Verifier (e.g. a Keyring)
@@ -48,12 +53,12 @@ dedup.insert(v.replay_key());   // replay detection is the consumer's job
 
 ## Design decisions
 
-* **Envelope + embedded OCSF.** The design doc's *Bulgu şeması* names
-  AutoSecOps fields (`finding_id`, `external_id`, `data_source`, `title`,
-  `description`, `severity`, `timestamp`, `entity_context`,
-  `mitre_predictions`, `evidence_links`, `anomaly_score`); these are the top
-  level. The full OCSF object is under `ocsf` so it can be forwarded to an
-  external SIEM verbatim. Robot-specific data with no OCSF attribute lives in
+* **Envelope + embedded OCSF.** The top level is a vendor-neutral envelope
+  with what a SOC needs to ingest, deduplicate and triage (`finding_id`,
+  `external_id`, `data_source`, `title`, `description`, `severity`,
+  `timestamp`, `entity_context`, `mitre_predictions`, `evidence_links`,
+  `anomaly_score`, `adversary_controlled_fields`). The full OCSF object is
+  under `ocsf` so it can be forwarded to any SIEM verbatim. Robot-specific data with no OCSF attribute lives in
   `ocsf.unmapped.robodr` (identical to `entity_context`; validator-enforced).
 * **Deterministic identity.** `finding_id` = `rf1-` + 128-bit SHA-256 prefix of
   length-framed `(robot id, rule id, raw subject)`; `metadata.uid` = `re1-` +
@@ -64,7 +69,7 @@ dedup.insert(v.replay_key());   // replay detection is the consumer's job
   *not* used for narrative because the detection core interpolates attacker
   names into it; it is carried as `Tainted` data.
 * **SR-TAINT** (security requirement). ROS node/topic/type names, GUIDs, source
-  IPs and `detail` are attacker-controlled and reach an LLM-based SOC. They are
+  IPs and `detail` are attacker-controlled and may reach an LLM-based SOC. They are
   placed only in typed `Tainted` fields (`taint: "adversary"`) or OCSF resources
   labelled `taint:adversary`, listed in `adversary_controlled_fields`, and
   neutralised by **allow-list**: ROS/DDS identifiers keep only
@@ -93,15 +98,15 @@ dedup.insert(v.replay_key());   // replay detection is the consumer's job
   or hash that fails its charset/format is a configuration bug; `build()` fails.
 * **Partitioning** by robot id with Kafka's murmur2, key = finding id.
 
-## Finding signatures (contract 1.2)
+## Finding signatures (since contract 1.2)
 
 * **What is signed:** the record value bytes exactly as emitted by
   `to_json` — no canonicalisation; the verifier works on the raw received
   bytes and never re-serialises. Domain-separated, length-framed message
   (`robodr-ocsf/finding-sig/v1\0`, `alg`, `key_id`, value).
 * **Where:** Kafka header `robodr-finding-sig` =
-  `{"alg":"ed25519","key_id":…,"sig":<128 hex>}`, appended after the 1.1
-  headers. The value (and the golden example) is unchanged by signing.
+  `{"alg":"ed25519","key_id":…,"sig":<128 hex>}`, appended after the
+  other headers. The value (and the golden example) is unchanged by signing.
 * **Binding:** the verifier is chosen by the finding's own
   `entity_context.robot.id`; a keyring's device binding is enforced too.
 * **Policies:** `Strict` requires a signature; `Optional` accepts unsigned
@@ -139,12 +144,15 @@ dedup.insert(v.replay_key());   // replay detection is the consumer's job
 
 The validator applies the catalog of the message's own `contract_version`
 (`rule_info_for_contract`): a 1.2 finding for an id that only gained an
-entry in 1.3 keeps the generic entry and stays valid.
+entry in 1.3 keeps the generic entry and stays valid; every 2.x finding has
+the full catalog.
 
-¹ Not in the design doc's robotics technique list (T0855, T0831, T0836, T0843,
-T0889, T0856). Our mapping choice; AutoSecOps `categories.py` must add them or
-these findings land in `other` (still never autonomous). Technique names are
-from memory of ATT&CK for ICS — verify against the current matrix.
+¹ Our mapping choice, outside the commonly cited robotics technique set
+(T0855, T0831, T0836, T0843, T0889, T0856): a consumer that maps techniques
+to a robot category must include T0848 and T0801 or these findings land in
+its generic bucket (robot findings are never autonomous either way).
+Technique names are from memory of ATT&CK for ICS — verify against the
+current matrix.
 
 ## OCSF-UNCERTAIN
 
@@ -188,10 +196,9 @@ first_seen_time, last_seen_time, analytic, data_sources}`, `analytic.type_id`
   digit, key relabelling, wrong-unit key, keyring device binding,
   strict/optional policy, duplicate headers, HMAC refusal, replay key;
   `tests/signed.rs`).
-* **Not** verified: against the real OCSF schema/validator, against a running
-  AutoSecOps `kafka_consumer_service.py`, against a Kafka broker, or the exact
-  AutoSecOps expectations for `severity`/`timestamp`/`mitre_predictions` value
-  formats (assumed: lower-case string, RFC 3339 string, list of objects).
+* **Not** verified: against the real OCSF schema/validator or against a
+  running SOC consumer. (Delivery to real Kafka brokers is verified in
+  `robodr-export`, `scripts/kafka-it.sh`.)
   The schema `pattern`s are evaluated with an in-repo matcher, not a real
   ECMA-262 engine; they were written in a portable subset (anchors, classes,
   groups, simple quantifiers) but not run through a third-party JSON Schema

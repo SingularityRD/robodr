@@ -42,9 +42,10 @@ level, and every path must be absolute.
 |---|---|
 | `robot` | `id` (also the black-box device id), `site`, optional `model`, `kafka_partitions` (`profile_version` was removed: the version in findings is the signed profile's `metadata.profile_version`) |
 | `sensor` | The ROS 2 sensor's own `[module.robodr-sensor-ros2]` section in JSON form, validated by `robodr_ros2_pipeline::Config::validate`. It sets the profile path, capture (live interfaces or `pcap_replay`), the SPDP socket (`listen_spdp`, default **true**) and the binding settings. Its profile is used by the pipeline and by the agent. |
-| `policy_path` | Response policy (`robodr.response-policy/v1`) |
+| `policy_path` | Response policy (`robodr.response-policy/v1`; its optional `morphology` — e.g. `humanoid` — makes safe pause / safe state advisory only, see `robodr-responder`) |
 | `blackbox` | `dir`, `key_file`, optional `key_id`, optional `boot_id` (default `/proc/sys/kernel/random/boot_id`) |
 | `spool` | `dir`, `max_bytes` (default 64 MiB), `max_files` (default 10000) |
+| `findings` | Optional. `topic` (default `robodr.findings`) and `data_source` (default `robodr`): the deployment labels every finding carries (`robodr.findings` contract 2.x) |
 | `event_inputs` | `[{"kind":"stdin"}]` and/or `[{"kind":"unix_socket","path":...,"max_connections":4}]` |
 | `context` | `safety_state` (default `unknown`; must stay `unknown` when `safety_feed` is set), `control`, `phase`, `connectivity`, `operator_present` |
 | `safety_feed` | Optional. The live safety-state feed (see below): `stale_after_ms` (default 1000), `topics` (ROS topics decoded from the captured bus) and/or `socket` (a local safety-PLC gateway socket). |
@@ -222,10 +223,11 @@ one JSON object per line:
 
 ## Control plane (SOC action requests)
 
-With `control_plane` (contract `docs/contracts/robot-edr.control-plane.md`)
-a SOC such as AutoSecOps may *request* one of six actions
-(`restrict_motion`, `quarantine_node`, `isolate_network`, `safe_pause`,
-`request_safe_state`, `rollback_config`) over a small std-only HTTP/1.1 API
+With `control_plane` (contract `docs/contracts/robodr.control-plane.md`)
+a SOC may *request* one of the seven actions of the responder's catalog
+(`robodr_responder::actions`: `restrict_motion`, `quarantine_node`,
+`isolate_network`, `record_evidence`, `safe_pause`, `request_safe_state`,
+`rollback_config`) over a small std-only HTTP/1.1 API
 (`src/control/`). The answer is truthful about what happens: **nothing is
 executed.** The only executor is the recording one, so an accepted request
 is `recorded_not_executed` (`"executed": false`), "accepted and recorded as
@@ -235,7 +237,7 @@ a plan".
 "control_plane": {
   "unix_socket": "/run/robodr-agentd/control.sock",
   "listen_tcp": "127.0.0.1:8787",
-  "soc_keys": ["/etc/robodr/soc/autosecops.pub"]
+  "soc_keys": ["/etc/robodr/soc/soc.pub"]
 }
 ```
 
@@ -245,7 +247,7 @@ a plan".
   cache: refused, never unchecked); per-key token bucket. With
   `finding_signing` every answer to an authenticated request is signed with
   the finding key, bound to the request signature.
-- **Allow-list.** Six classes, each with its own parameters (speed caps in
+- **Allow-list.** The seven catalog actions, each with its own parameters (speed caps in
   (0, 10], a zone, a GUID or node name, a profile/program rollback); the
   time-limited classes need `ttl_seconds` 1..=86400, the others refuse one;
   no motion command, force or override field exists and `authority` must be
@@ -253,7 +255,8 @@ a plan".
 - **Judgment.** Against the safety state *now* (live feed re-evaluated),
   the operational context and the response policy: refused while the
   e-stop / safe state is active (also `request_safe_state`: the safety
-  system has authority), in observe mode, for motion-affecting steps while a
+  system has authority), `safe_pause` / `request_safe_state` on a humanoid
+  (`fall_hazard`), in observe mode, for motion-affecting steps while a
   person commands motion or during take-off / landing, `rollback_config`
   unless `idle`, anything above the policy matrix's ceiling for the state, a
   speed cap above the profile envelope, and any plan that fails
@@ -287,8 +290,9 @@ a plan".
   spool counters), `robodr.agentd_recovery` and a final `robodr.agentd_stop`
   note. A restart resumes the chain; the recorder signs a `Resume` record.
 - **Spool** (`spool.dir`):
-  - `ready/<seq:020>.json` holds one validated `robot-edr.findings` record
-    per file: `{schema, seq, topic, key, partition, headers, value}`. `value`
+  - `ready/<seq:020>.json` holds one validated findings record
+    (`robodr.findings` 2.x) per file: `{schema, seq, topic, key, partition,
+    headers, value}` (`topic` = `findings.topic`). `value`
     contains the exact validated bytes. Each file is written under `tmp/`,
     fsynced, renamed, and then its directory is fsynced.
   - **Exporter contract:** read `ready/` in name order, deliver, then
@@ -431,10 +435,14 @@ request.
   front; answers are signed only with `finding_signing`. Request states live
   in memory (bounded) and are forgotten at restart (the black box keeps
   every decision). The replay window needs NTP on robot and SOC. Tested
-  with synthetic traffic and AutoSecOps' client in-process, not against a
+  with synthetic traffic and an in-process signing client, not against a
   deployed SOC.
-- **No exporter is included.** The rename-to-`acked/` acknowledgement is the
-  whole contract, and it has not been run against a real Kafka producer.
+- **Exporters live in `robodr-export`, not here.** The spool's only
+  contract is the rename-to-`acked/` acknowledgement. `robodr-spool-export`
+  (spool → diode batches) and `robodr-kafka-publish` (spool or diode output
+  → Kafka) implement it and are tested against an in-process fake broker
+  and real single-node Apache Kafka 3.9.1 / 4.1.0 (`scripts/kafka-it.sh`);
+  not against a production cluster, and without TLS/SASL.
 - **The key is a file, not a TPM.** The Ed25519 seed sits in a 0600 file
   (handed over by systemd `LoadCredential=`); root on the unit can read it
   and sign as the unit. The Ed25519 implementation is the audited

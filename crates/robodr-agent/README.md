@@ -13,7 +13,7 @@ RobotEvent
   -> backstop: check_invariants + observe-only guard -> ResponsePlan + Disposition
   -> Recorder                     (robodr-blackbox: event, firewall verdict, deviation, plan note)
   -> FindingBuilder               (robodr-ocsf, evidence links = the black-box seq/hash)
-  -> validated robot-edr.findings record (Kafka key + JSON value)
+  -> validated robodr.findings record (Kafka key + JSON value)
   -> Executor::submit             (no-op or dry-run log: the agent executes nothing)
 ```
 
@@ -306,8 +306,9 @@ firewall limits, zero partitions and unusable labels are refused.
   default) or, legacy, HMAC (a shared key, so the verifier can forge; warned).
   The Ed25519 seed is a file, not a TPM-held key (the arithmetic is the
   audited `ed25519-dalek` crate). No external checkpoint store exists. The replay verifies against the checkpoint it just produced.
-- Findings were not checked against an OCSF schema server, a Kafka broker or
-  AutoSecOps. Nothing is published to Kafka.
+- Findings were not checked against an OCSF schema server or a running SOC
+  consumer. The agent publishes nothing itself (agentd spools records;
+  `robodr-export` delivers them).
 - No executor exists. Nothing is requested from DDS, the host, the Motion
   Firewall gateway, the mission executive or the safety controller.
 - Black-box recovery was exercised with simulated failures only (failing

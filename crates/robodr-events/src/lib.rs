@@ -254,7 +254,8 @@ pub struct MotionFeedback {
     pub timestamp_ns: u64,
 }
 
-/// Severity of a deviation, mapped 1:1 onto Pulsar/AutoSecOps severities.
+/// Severity of a deviation, mapped 1:1 onto Pulsar severities and the
+/// findings contract's `severity` (OCSF `severity_id` 2..=5).
 /// Ordered by declaration: `Low < Medium < High < Critical`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

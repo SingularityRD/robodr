@@ -1,7 +1,7 @@
 //! # robodr-export
 //!
-//! The two missing hops of the `robot-edr.findings` path
-//! (`docs/contracts/robot-edr.findings.md`):
+//! The two missing hops of the findings path (`robodr.findings` contract,
+//! `docs/contracts/robodr.findings.md`):
 //!
 //! ```text
 //!  robot (air-gapped)                                     SOC

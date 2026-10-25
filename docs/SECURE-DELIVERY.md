@@ -576,12 +576,12 @@ Claims for this mode are in the last column of §7.8.
 
 ## 9. New findings (OCSF catalog additions)
 
-All under the existing `robot-edr.findings` contract. These are emitted by
+All under the existing findings contract (now `robodr.findings` 2.x). These are emitted by
 in-repo components, so each gets its own catalog entry, like the other
 in-repo `robot.*` detectors (deployment-specific ids, such as site
 `robot.correlate.*` rules, share a generic entry instead). Adding catalog
 entries is a contract minor-version bump and needs the validator updated on
-both sides of the diode (`docs/contracts/robot-edr.findings.md`).
+both sides of the diode (`docs/contracts/robodr.findings.md`).
 
 | Rule id | Severity | Meaning |
 |---|---|---|

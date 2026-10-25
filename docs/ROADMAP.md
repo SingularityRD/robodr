@@ -129,7 +129,7 @@ written for that target; the component dependency order is unchanged.
    └ robodr-seal      TPM-sealed payload keys, crypto-erase   [ ]
                  │ OCSF findings  (robodr-ocsf mapper          [P])
                  ▼
- AutoSecOps AI SOC  triage · hunt · workflows (see main design doc) [ ]
+ SOC (any; robodr.findings v2 + control plane)  triage · hunt · workflows [ ]
 ```
 
 Legend (status as of 2026-10-16):
@@ -170,12 +170,13 @@ everything running with no outbound connectivity.
   envelopes over a clean run, emits a `profile.json`, the OEM locks it.
   **[P]** `robodr-commission` (`learn` / `diff` / `merge` / `lock` / `check`,
   from JSONL event recordings or pcap/pcapng); never run on a real robot.
-- Bridge threats to AutoSecOps over the existing Kafka/adapter path (robot
-  source-trust map + `robotics` category, per the main design doc).
-  **[P]** for the OCSF mapping and topic contract (`robodr-ocsf`,
+- Bridge threats to the SOC through the vendor-neutral findings contract
+  (`robodr.findings` 2.x: robot source-trust map, never-autonomous robot
+  actions; see the contract's consumer checklist).
+  **[P]** for the OCSF mapping and contract (`robodr-ocsf`,
   `docs/contracts/`) and the std-only publisher `robodr-kafka-publish`
   (verified against single-node Apache Kafka 3.9.1 and 4.1.0,
-  `scripts/kafka-it.sh`); AutoSecOps side not done.
+  `scripts/kafka-it.sh`); SOC side not done.
 
 **Exit criteria.** On a real UGV companion computer: a foreign `cmd_vel`
 publisher is flagged Critical *from live traffic* (SEDP parser done; needs the
@@ -255,7 +256,7 @@ research and model advantage no one else can match.
 - **RoboDR foundation model**: trained on the robot-behaviour telemetry our fleet
   produces (graph, motion, feedback, bus) — a data asset that, like Exein's, is
   hard to replicate, but robot-behaviour-native rather than firmware-generic.
-- **Agentic robot SOC**: robot-specific hunt/root-cause workflows in AutoSecOps;
+- **Agentic robot SOC**: robot-specific hunt/root-cause workflows in the SOC;
   a confirmed root cause ships a signed new rule to the whole fleet (poka-yoke).
 - White-label console and OEM edition: the OEM ships RoboDR inside the robot and
   sells the posture to their own customers.
@@ -263,7 +264,7 @@ research and model advantage no one else can match.
 **Exit criteria.** A jailbroken planner's unsafe command is blocked by the
 firewall and explained by the SOC. The foundation model beats the rule+profile
 baseline on a held-out attack corpus (our own eval set, with injection tests
-placed in ROS node and topic names, mirroring AutoSecOps' eval discipline).
+placed in ROS node and topic names, as an LLM-based SOC's eval set must be).
 
 ---
 
@@ -299,5 +300,6 @@ placed in ROS node and topic names, mirroring AutoSecOps' eval discipline).
 3. Stand up the lab (**not started**; every test so far uses synthetic
    inputs): one ROS 2 AMR (or Gazebo + a real controller) and one
    closed-controller brand, so detection is measured against real traffic.
-4. Land the AutoSecOps robot source-trust map + `robotics` category (main design
-   doc checklist) so Phase 1 findings flow into the SOC.
+4. Land the SOC-side robot source-trust map and never-autonomous robot
+   action category (consumer checklist, `docs/contracts/robodr.findings.md`
+   §9) so Phase 1 findings flow into the SOC.

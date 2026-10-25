@@ -2,6 +2,7 @@
   "schema": "robodr.response-policy/v1",
   "model": "ugv-example-x1",
   "platform": "ugv",
+  "morphology": "wheeled_mobile",
   "oem_validated": false,
   "matrix": {
     "idle":                       { "low": "record", "medium": "restrict",     "high": "restrict",     "critical": "safe_pause" },

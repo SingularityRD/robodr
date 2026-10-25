@@ -8,7 +8,7 @@ license.workspace = true
 # accept version-less path dependencies (deny.toml, allow-wildcard-paths).
 publish = false
 repository.workspace = true
-description = "Exporters for robot-edr.findings: agentd spool -> diode packer (robot side), and diode importer output / site spool -> Kafka (SOC side, std-only Kafka producer)."
+description = "Exporters for robodr.findings: agentd spool -> diode packer (robot side), and diode importer output / site spool -> Kafka (SOC side, std-only Kafka producer)."
 
 # Pure crate: std + RoboDR crates + serde only. The Kafka client is a minimal
 # in-crate implementation (no TLS/SASL; see README).

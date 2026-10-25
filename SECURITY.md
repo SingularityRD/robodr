@@ -112,8 +112,8 @@ signing key are trusted. Reports that break the claims above are in scope.
 ### Control-plane action API: what is claimed
 
 `robodr-agentd`'s optional `control_plane` API (off unless configured;
-contract `docs/contracts/robot-edr.control-plane.md`) lets a SOC request one
-of six containment actions. The claims are:
+contract `docs/contracts/robodr.control-plane.md`) lets a SOC request one
+of the seven catalog containment actions. The claims are:
 
 - **Nothing is executed.** In this release the only executor records: an
   accepted request is answered `recorded_not_executed` (`"executed":
@@ -127,7 +127,7 @@ of six containment actions. The claims are:
   requests are never judged or recorded one by one; they are counted and
   reported (`robot.agent.control_plane_unauthenticated`, High,
   observe-only).
-- **A valid key cannot ask for more.** Six action classes with their own
+- **A valid key cannot ask for more.** The seven catalog actions with their own
   parameters and TTL rules; no motion command, force or override field
   exists, and `authority` must be `request`. The strongest action is a
   *request* for a safe state. Every request is judged against the current

@@ -522,7 +522,7 @@ fn require_fresh_blackbox(dir: &Path) -> Result<(), ReplayError> {
 }
 
 /// Run a replay. Every validated finding is written to `findings` as one
-/// JSON line (the exact `robot-edr.findings` record value); if `outcomes` is
+/// JSON line (the exact findings record value); if `outcomes` is
 /// given, every [`Outcome`] is written to it as one JSON line. If `plan_log`
 /// is given, a dry-run line per plan is written to it
 /// ([`LoggingExecutor`]); no other executor can be attached to a replay. At

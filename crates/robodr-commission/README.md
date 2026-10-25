@@ -568,12 +568,17 @@ test expects `fragmented_discovery_unreassembled` for it.
 * The profile covers only what the clean run exercised. Rarely used topics and
   manoeuvres faster than anything in the run will deviate later. Merge more
   missions to widen coverage, and watch for `few_motion_samples`.
-* Only synthetic inputs have been tested: hand-written JSONL, and pcaps built
-  from the DDSI-RTPS layout with `robodr-capture`'s frame helpers. No Gazebo
-  or real-robot capture from Fast DDS, Cyclone or Connext has been run through
-  the tool yet. The names `ros_discovery_info` and `rq/…Request`/`rr/…Reply`
-  follow the rmw naming as we know it, and have not been checked against a
-  live stack.
+* Inputs tested: hand-written JSONL, pcaps built from the DDSI-RTPS layout
+  with `robodr-capture`'s frame helpers, and the real ROS 2 Jazzy lab
+  captures in `fixtures/captures/ros2-jazzy/` (Fast DDS 2.14 and Cyclone DDS
+  0.10, a container lab and a headless Gazebo Harmonic robot, fragmented
+  discovery, an `rmw_zenoh_cpp` robot): the learner is run on them by
+  `robodr-ros2-pipeline`'s `tests/real_captures*.rs` (learn one run, replay
+  a restarted run clean, catch a rogue `/cmd_vel`) and by
+  `tests/cli.rs` (`learn` on the Zenoh capture warns). No physical robot and
+  no RTI Connext capture has been run through the tool. The service names
+  `rq/…Request`/`rr/…Reply` follow the rmw naming as we know it and have not
+  been checked against a live stack with services.
 * A capture cannot see shared-memory transports or DDS-Security protected
   discovery (the report counts protected submessages). See the limits in
   `robodr-capture`. Starting a capture after the nodes have started can miss

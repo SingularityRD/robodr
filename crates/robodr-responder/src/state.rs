@@ -75,7 +75,8 @@ pub enum PlatformFamily {
     /// Industrial or collaborative manipulator arm.
     Arm,
     /// Anything else (humanoid, legged, marine...). Only the platform's own
-    /// configured safe behaviour may be requested.
+    /// configured safe behaviour may be requested. See also [`Morphology`]:
+    /// a humanoid never gets an executable safe pause / safe state.
     Other,
 }
 
@@ -87,6 +88,78 @@ impl PlatformFamily {
         PlatformFamily::Arm,
         PlatformFamily::Other,
     ];
+}
+
+/// The robot's body plan (morphology), set per model in the response policy
+/// (`"morphology"`, default `other`). [`PlatformFamily`] decides which safe
+/// behaviours make physical sense; the morphology decides whether a
+/// safe behaviour may be *executed* at all.
+///
+/// # Why a humanoid never gets `safe_pause` / `request_safe_state`
+///
+/// A biped stands only while its joint controllers actively balance it. The
+/// way most humanoid stacks implement "pause", "safe state" or "protective
+/// stop" is to switch the joints to a damping or zero-torque mode (or to cut
+/// motor power): the robot then **falls**, from standing height, with
+/// tens of kilograms of mass, onto whatever and whoever is next to it. A
+/// fall is a worse hazard than the cyber event that prompted it, and RoboDR
+/// cannot know which implementation a given platform uses. So for
+/// [`Morphology::Humanoid`] the planner never puts `SafePause` or
+/// `RequestSafeState` into a plan's executable actions; it lists them in
+/// `ResponsePlan::advisory` (a recommendation for the operator and the
+/// platform's own safety function, which may know a safe sit-down or
+/// crouch sequence) and contains the threat with the steps that keep the
+/// robot balanced: `LimitMotion`, network isolation and participant
+/// quarantine. The control plane refuses SOC requests for these actions on
+/// a humanoid for the same reason.
+///
+/// Quadrupeds, wheeled platforms, arms and aerial vehicles are statically
+/// stable when stopped or have a platform-specific safe behaviour (controlled
+/// stop, protective stop category 2, hold / return-to-launch), so the
+/// existing per-family rules apply to them unchanged. A quadruped whose
+/// "damp" mode collapses the body should be configured with a
+/// `platform_defined` safe behaviour that the OEM has validated, or as
+/// `humanoid` if no safe sequence exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Morphology {
+    /// Biped / humanoid: balance is active; de-energising means falling.
+    Humanoid,
+    /// Four-legged robot.
+    Quadruped,
+    /// Wheeled or tracked ground platform (UGV, AMR).
+    WheeledMobile,
+    /// Manipulator arm (fixed or on a stable base).
+    Arm,
+    /// Multirotor / fixed-wing aerial vehicle.
+    Aerial,
+    /// Unspecified (the default; keeps pre-morphology policies unchanged).
+    #[default]
+    Other,
+}
+
+impl Morphology {
+    pub const ALL: [Morphology; 6] = [
+        Morphology::Humanoid,
+        Morphology::Quadruped,
+        Morphology::WheeledMobile,
+        Morphology::Arm,
+        Morphology::Aerial,
+        Morphology::Other,
+    ];
+
+    /// True when damping or de-energising the actuators makes the robot
+    /// fall, so actions that may do so (`safe_pause`, `request_safe_state`)
+    /// are advisory only.
+    pub fn falls_when_de_energised(self) -> bool {
+        matches!(self, Morphology::Humanoid)
+    }
+
+    /// `serde` helper: the default is not serialised, so plans of
+    /// pre-morphology policies keep their exact JSON.
+    pub fn is_other(&self) -> bool {
+        matches!(self, Morphology::Other)
+    }
 }
 
 /// Mission phase as reported by the mission executive / autopilot.

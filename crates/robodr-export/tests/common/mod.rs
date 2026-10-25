@@ -20,7 +20,7 @@ use std::time::Duration;
 pub const T0: u64 = 1_790_000_000_000;
 pub const NOW: u64 = 1_790_000_100_000;
 pub const UNIT: &str = "ugv-007";
-pub const TOPIC: &str = "robot-edr.findings";
+pub const TOPIC: &str = robodr_ocsf::DEFAULT_TOPIC;
 
 static N: AtomicU64 = AtomicU64::new(0);
 

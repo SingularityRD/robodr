@@ -16,7 +16,7 @@ use robodr_events::Severity;
 use serde::{Deserialize, Serialize};
 
 use crate::action::{RestrictTarget, SafeBehaviour, Step};
-use crate::state::{PlatformFamily, SafetyState};
+use crate::state::{Morphology, PlatformFamily, SafetyState};
 
 /// Schema tag every policy file must carry.
 pub const SCHEMA: &str = "robodr.response-policy/v1";
@@ -149,6 +149,11 @@ pub struct ResponsePolicy {
     /// Robot model this policy is for (matches the model profile).
     pub model: String,
     pub platform: PlatformFamily,
+    /// Body plan of the model (default `other`). `humanoid` makes
+    /// `safe_pause` / `request_safe_state` advisory only (see
+    /// [`Morphology`]).
+    #[serde(default)]
+    pub morphology: Morphology,
     /// Set only after OEM sign-off. While false, every plan is observe-only.
     pub oem_validated: bool,
     pub matrix: Matrix,
@@ -267,6 +272,7 @@ impl ResponsePolicy {
             schema: SCHEMA.to_string(),
             model: "default".to_string(),
             platform,
+            morphology: Morphology::Other,
             oem_validated: false,
             matrix: Matrix {
                 idle: row(Record, Restrict, Restrict, SafePause),

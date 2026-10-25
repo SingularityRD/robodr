@@ -189,14 +189,23 @@ There were 73 tests before:
   `config/robodr.toml.example` keys are known and parse.
 - **1 test in `tests/live_capture.rs`.** It catches a rogue SEDP on `lo`
   live. It needs `CAP_NET_RAW` and is otherwise SKIPPED.
+- **`tests/real_captures.rs` and `tests/real_captures_lab.rs`.** They run
+  real ROS 2 Jazzy captures (`fixtures/captures/ros2-jazzy/`, Fast DDS 2.14
+  and Cyclone DDS 0.10, recorded in a container lab): learn a profile from
+  one run with `robodr-commission`, replay another run in which every
+  process has a new GUID prefix, and catch the rogue `/cmd_vel` publisher;
+  a headless Gazebo Harmonic robot (rogue `/cmd_vel`, DATA before SEDP);
+  fragmented discovery and a fragmented JointTrajectory (`DATA_FRAG`, both
+  vendors); a `rmw_zenoh_cpp` robot reported as a blind spot.
 
 ## Limits
 
-- The traffic is synthetic, built from the spec. The pipeline has **not**
-  been run against captures from real Fast DDS, Cyclone DDS or Connext.
-  That includes the motion decode path: the user-DATA framing and the CDR
-  payloads in its tests are hand-built; no real `ros2 topic pub /cmd_vel`
-  capture was decoded.
+- Most tests use synthetic traffic built from the spec. Real traffic is
+  limited to the container-lab captures above (Fast DDS and Cyclone DDS on
+  ROS 2 Jazzy, a Gazebo simulation, no physical robot); RTI Connext has not
+  been captured. On the motion decode path the XCDR1 `Twist` decode is
+  confirmed on real Fast DDS and Cyclone DDS samples; XCDR2 / `D_CDR2` and
+  the other message types only on hand-built vectors.
 - Some traffic is invisible or opaque to it:
   - shared-memory transports;
   - RTPS over TCP;

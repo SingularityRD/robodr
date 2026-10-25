@@ -4,6 +4,14 @@ This breaks [`ROADMAP.md`](ROADMAP.md) into executable sprints: who builds what,
 in what order, and what "done" looks like for each. It is the layer the roadmap
 left open — task breakdown, ownership, dependencies and a per-sprint demo.
 
+> **SOC side.** The SOC tasks below were first written against one specific
+> SOC codebase; that integration is cancelled. RoboDR now speaks
+> vendor-neutral contracts
+> ([`robodr.findings`](contracts/robodr.findings.md) 2.x,
+> [`robodr.control-plane`](contracts/robodr.control-plane.md), the action
+> catalog `robodr_responder::actions`) and the SOC-side work is planned
+> against those. "SOC bridge" below means whatever SOC consumes them.
+
 ## Working assumptions
 
 Change these and the plan rescales; they are stated so the plan is honest.
@@ -12,7 +20,7 @@ Change these and the plan rescales; they are stated so the plan is honest.
 - **Team of 4 engineers:**
   - **E1 — Core/eBPF:** Rust detection core, Pulsar integration, eBPF/LSM.
   - **E2 — Robotics:** ROS 2 / DDS, motion, robot lab, commissioning.
-  - **E3 — Backend:** fleet control plane, AutoSecOps bridge, console.
+  - **E3 — Backend:** fleet control plane, SOC bridge, console.
   - **E4 — Embedded/HW:** Sentinel Box, Lite SDK (RTOS), attestation, fieldbus.
   - Security research is shared across all four, 1 day/week, feeding the eval corpus.
 - **Lab start:** Gazebo simulation of a **defence ground UGV** + one real ROS 2
@@ -48,10 +56,15 @@ the [roadmap legend](ROADMAP.md#2-component-map-dependency-order): **pure
 logic done** = crate exists and is tested offline on synthetic inputs;
 **integrated** = wired into a runnable sensor/daemon and built; **field-
 verified** = shown on a real robot, real DDS traffic or real hardware.
-Nothing is field-verified yet, no CI run has happened (no `Cargo.lock` is
-committed; see `docs/BUILD.md`), and the Pulsar-bound crates have never been
-compiled. Work that happened out of order (much of Phase 2's pure logic) is
-recorded under its planned sprint.
+Nothing is field-verified yet. `Cargo.lock` is committed and the CI
+workflow is complete (pure crates, Pulsar-bound crates, scripts, fuzz
+smoke), but it has not yet run on a hosted runner (see `docs/BUILD.md`);
+every job's commands are run locally instead. The Pulsar-bound crates are
+built and tested against the vendored Pulsar and `robodr-pulsard` was run
+as root with eBPF probes loaded in WSL2 (`docs/PULSAR-INTEGRATION.md` §7b),
+not on a robot. Status blocks dated before those facts keep their wording.
+Work that happened out of order (much of Phase 2's pure logic) is recorded
+under its planned sprint.
 
 ---
 
@@ -59,7 +72,7 @@ recorded under its planned sprint.
 
 Goal of the phase: on a ROS 2 UGV companion computer, catch an unknown
 participant, an unauthorized motion/command publisher, and a host compromise,
-visible in one console and flowing into AutoSecOps — all air-gapped. Exit = the
+visible in one console and flowing into the SOC — all air-gapped. Exit = the
 Phase 1 criteria in the roadmap.
 
 Defence note: attestation (Sprint 3 spike → brought forward from Phase 3) and
@@ -85,8 +98,8 @@ Added defence tasks this sprint (on top of the general Sprint 1 work below):
 - **E1:** Wire Pulsar as a submodule into CI; get `cargo test -p robodr-events`
   and `-p robodr-sensor-ros2` green on a hosted runner; publish the first
   `pulsard` build with the RoboDR module registered (behind `DEFAULT_ENABLED = false`).
-- **E3:** Stand up a dev AutoSecOps instance (from `autosecops2`) with the Kafka
-  ingest path reachable; document the `robot-edr.findings` topic contract.
+- **E3:** Stand up a dev SOC instance with a findings ingest path reachable;
+  document the findings contract (now `robodr.findings` 2.x).
 - **E4:** Spike: pick the Sentinel Box reference hardware (fanless, ≥2 NIC) and
   the attestation stack (TPM 2.0 + Keylime) to validate in Phase 2/3; no code.
 - **Demo:** a Gazebo robot runs; CI is green; a captured SPDP packet replays
@@ -134,7 +147,8 @@ Previous status (2026-10-16), kept for the record:
 - Mirror / SBOM: scripts exist (`scripts/ci-setup.sh`, `scripts/sbom.sh`);
   the SBOM fallback is verified in the sandbox; the air-gapped procedure is
   documented, not rehearsed.
-- `robot-edr.findings` contract: documented (`docs/contracts/`).
+- Findings contract: documented (`docs/contracts/`; then `robot-edr.findings`
+  1.x, now `robodr.findings` 2.x).
 - Export-control memo, Sentinel Box / TPM hardware choice: nothing in this
   repository; status unknown from the code.
 
@@ -163,8 +177,8 @@ unit tests.
   `pcap`s, and run it in CI.
 - **E2:** Extend the ROS 2 topic de-mangling (`rt`/`rq`/`rr`) and add fixtures
   for services and actions, not just topics.
-- **E3:** Define the OCSF mapping for robot findings (the schema table from the
-  design doc) as a typed struct in the AutoSecOps bridge.
+- **E3:** Define the OCSF mapping for robot findings (envelope fields plus an
+  OCSF Detection Finding) as a typed struct shared with the SOC bridge.
 - **Demo:** on the Gazebo robot, the sensor prints the live participant/topic
   graph; a `cmd_vel` publisher shows up as a writer on `/cmd_vel`.
 - **Exit:** writer/reader events carry real topics; fuzzing runs in CI.
@@ -181,7 +195,7 @@ unit tests.
 - De-mangling of `rt`/`rq`/`rr` incl. actions: done in `robodr-events`
   (`graph.rs`); synthetic service and action fixtures exist.
 - OCSF mapping as a typed struct: **pure logic done** as `robodr-ocsf` in this
-  repo (schema-checked); the AutoSecOps-side bridge is not here.
+  repo (schema-checked); the SOC-side bridge is not here.
 - Per-vendor UDP-vs-shared-memory validation: not done.
 
 ### Sprint 3 — Learn and lock the profile
@@ -210,21 +224,20 @@ Objective: a robot's "normal" is captured automatically, not hand-written.
   `robodr-ros2-pipeline` (an unlocked or invalid profile runs observe-only).
 - Control-plane profile storage, TPM measured-boot read: not done.
 
-### Sprint 4 — Host rules + AutoSecOps bridge
+### Sprint 4 — Host rules + SOC bridge
 
 Objective: host-level robot threats and graph deviations both reach the SOC.
 
 - **E1:** Run `rules/robodr/*.toml` (offline-validated by `scripts/validate_rules.py`;
   see `rules/README.md` "Still unverified") on a real Pulsar daemon on the
   controller; tune to the robot's actual control stack to hit the false-positive bound.
-- **E3:** Ship the AutoSecOps robot source-trust map (`core/federation/provenance.py`
-  `robot_edr`) and the `robotics` category (`core/contracts/verdict.py`,
-  `core/autonomy/tiers.py`), never autonomous — the design-doc checklist items.
-- **E3:** Kafka publisher from the control plane to `robot-edr.findings`;
+- **E3:** Ship the SOC's robot source-trust map (sensor vs adversary fields,
+  contract §9) and a robot-action category that is never autonomous.
+- **E3:** Kafka publisher from the control plane to the findings topic;
   findings carry black-box evidence links.
 - **E2:** 72-hour clean-run soak on the Gazebo robot; record the false-positive rate.
 - **Demo:** a reverse shell on the controller and a rogue DDS participant both
-  appear as findings in the AutoSecOps console, correctly categorised.
+  appear as findings in the SOC console, correctly categorised.
 - **Exit:** findings flow end to end; soak FP rate under the agreed bound.
 
 **Status as of 2026-10-16 — exit NOT met.**
@@ -232,10 +245,10 @@ Objective: host-level robot threats and graph deviations both reach the SOC.
   loaded by a real Pulsar daemon.
 - Findings: OCSF envelope, record key and partitioning (`robodr-ocsf`) and
   evidence links (`robodr-agent`) are **pure logic done**; the std-only
-  publisher `robodr-kafka-publish` delivers them to `robot-edr.findings` and
+  publisher `robodr-kafka-publish` delivers them to the findings topic and
   was verified against single-node Apache Kafka 3.9.1 and 4.1.0 brokers
   (`scripts/kafka-it.sh`, 2026-10-17); not run against the SOC's cluster.
-  AutoSecOps-side changes are not in this repo.
+  SOC-side changes are not in this repo.
 - 72-hour soak: not done.
 
 ### Sprint 5 — Phase 1 hardening + red-team gate
@@ -299,14 +312,14 @@ CI gate.
 - **E1:** `robodr-responder`: the five-step ladder (record → restrict → limit
   motion → safe pause → request safe state), chosen by severity × safety state.
   Response profiles per model, OEM-validated. Never overrides the safety system.
-- **E3:** Response actions as AutoSecOps action classes (`robot_restrict_motion`,
-  `robot_safe_pause`, …), all approval-gated, none autonomous; the `robot_edr`
-  executor (`core/response/executors/`).
+- **E3:** Response actions as SOC action classes (the catalog's wire names
+  `robot_restrict_motion`, `robot_safe_pause`, …), all approval-gated, none
+  autonomous; a SOC-side executor that sends them to the control plane.
 - **Demo:** a Critical deviation on a moving robot → "request safe state", logged
   and evidenced; the safety PLC remains final authority.
 
 **Status as of 2026-10-16:** planner **pure logic done** (`robodr-responder`,
-incl. AutoSecOps action-class mapping, all non-autonomous). It executes
+incl. the vendor-neutral action catalog `actions`, all non-autonomous). It executes
 nothing: `robodr-agent` composes it into an offline chain with no-op /
 logging executors only. `robodr-agentd` (runtime daemon) is in progress.
 
@@ -321,8 +334,11 @@ logging executors only. `robodr-agentd` (runtime daemon) is in progress.
 
 **Status as of 2026-10-16:** recorder **pure logic done** (`robodr-blackbox`:
 hash chain, cyclic / saturation retention, export bundles, tamper tests).
-Signing is an HMAC-SHA256 placeholder; production needs an asymmetric,
-non-exportable key. Evidence links on findings: in `robodr-agent` /
+Signing (updated): Ed25519 by default through the audited `ed25519-dalek`
+crate (`robodr-blackbox` key format v2, public `.pub` for verifiers; legacy
+HMAC-SHA256 still loads with a warning). Keys are 0600 files, not yet
+non-exportable (TPM-held keys are later work; a TPM NV counter head anchor
+exists, tested on swtpm). Evidence links on findings: in `robodr-agent` /
 `robodr-ocsf`. Console timeline, Sentinel Box: not done.
 
 ### Sprint 10 — Sentinel Box: first closed controller

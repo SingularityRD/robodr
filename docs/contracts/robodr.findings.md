@@ -1,69 +1,67 @@
-# Topic contract: `robot-edr.findings`
+# Contract: `robodr.findings` (findings, v2)
 
 | | |
 | --- | --- |
-| Contract version | **1.3.0** (`contract_version` field, `robodr-contract-version` header); changes in §10 |
-| Producer | RoboDR control plane (Kafka publisher, Sprint 4); diode importer on air-gapped sites |
-| Consumer | AutoSecOps `core/ingestion/kafka_consumer_service.py` |
-| Value schema | [`robot-edr-finding.schema.json`](robot-edr-finding.schema.json) (JSON Schema 2020-12) |
-| Golden example | [`robot-edr-finding.example.json`](robot-edr-finding.example.json) |
+| Contract | `robodr.findings`, version **2.0.0** (`contract_version` field, `robodr-contract-version` header); changes in §10 |
+| Producer | `robodr-agentd` (findings spool), `robodr-diode` importer (air-gapped sites), `robodr-kafka-publish` |
+| Consumer | Any SOC, SIEM or SOAR: the envelope is vendor-neutral and the body is a standard OCSF Detection Finding |
+| Value schema | [`robodr-finding.schema.json`](robodr-finding.schema.json) (JSON Schema 2020-12, `$id` `https://schemas.singularityrd.com/robodr/findings/2.0.0`) |
+| Golden example | [`robodr-finding.example.json`](robodr-finding.example.json) |
 | Reference implementation | `crates/robodr-ocsf` (`FindingBuilder`, `validate`, `kafka::record`, `sig`) |
+| Superseded | Contract 1.x (`robot-edr.findings`): [`legacy/robot-edr.findings.md`](legacy/robot-edr.findings.md); parse-only (§5) |
 
 The example and the schema are not hand-maintained prose: the `robodr-ocsf`
 test suite fails if the builder's output differs from the example by a single
 byte, if a produced finding is missing any key the schema marks `required`, or
 if it has a key the schema does not declare.
 
-## 1. What the design doc specifies (quoted)
+## 1. Scope
 
-From `2-tasarim/tasarim-dokumani.md`, section *AI SOC entegrasyonu (AutoSecOps)*.
-English glosses are ours.
+What a robot sends a SOC is **correlated findings with links to black-box
+evidence**, not raw telemetry. Each message is a vendor-neutral envelope
+around a full **OCSF 1.1 Detection Finding** (`class_uid` 2004,
+`category_uid` 2 *Findings*), so the same object can be ingested by a SOC
+case system, forwarded to an OCSF-capable SIEM, or written to syslog
+unchanged. Fields we are not certain of in the OCSF spec are listed in
+`crates/robodr-ocsf/README.md` (*OCSF-UNCERTAIN*).
 
-> AI SOC'a ham telemetri değil, kontrol düzleminde korele edilmiş bulgular ve
-> kara kutu kanıtına bağlantılar gider.
+A finding never carries an action. A SOC never sends a motion command to a
+robot: actions go through the control plane
+([`robodr.control-plane.md`](robodr.control-plane.md)), are drawn from the
+action catalog (`robodr_responder::actions`), and the on-robot agent judges
+each one against the robot's current safety state and may refuse it.
 
-*Not raw telemetry: correlated findings plus links to black-box evidence.*
+**Transports.** The value is the same on every path:
 
-> AI SOC robota hiçbir zaman doğrudan hareket komutu göndermez: onaylanan
-> aksiyon kontrol düzlemine gider, son kontrolü robot üzerindeki ajan yapar.
+| Path | Unit of transfer |
+| --- | --- |
+| Kafka (optional SIEM export) | one record per finding, §2 |
+| HTTPS ingest (SOC native, planned) | NDJSON: one compact value per line, signed batch |
+| Air-gapped diode | `findings.jsonl` in a signed batch, §8 |
 
-*The SOC never sends a motion command to a robot; approved actions go to the
-control plane and the on-robot agent has the final check.*
+**Envelope fields** (top level; all required unless marked):
 
-**Veri akışı** (data flow):
-
-| Yol | AutoSecOps'ta nerede | Ne zaman |
-| --- | --- | --- |
-| Kafka topic (`robot-edr.findings`) | `core/ingestion/kafka_consumer_service.py`: her mesajda `finding_id` zorunlu; `data_source` verilmezse `kafka:<topic>` olur | İlk sürüm, en hızlı yol |
-
-*`finding_id` is mandatory on every message; if `data_source` is absent it
-defaults to `kafka:<topic>`.* We therefore always send `data_source`.
-
-**Bulgu şeması** (finding schema) and where each row lands in this contract:
-
-| Robot EDR alanı (design doc) | AutoSecOps alanı (design doc) | This contract |
-| --- | --- | --- |
-| Olay kimliği | `finding_id` | `finding_id` = `ocsf.finding_info.uid` |
-| Robot kimliği + olay kimliği | `external_id` (`data_source` ile birlikte tekilleştirme anahtarı) | `external_id` = `<robot_id>:<finding_id>`; dedup key = (`data_source`, `external_id`) |
-| Sabit `robot_edr` | `data_source` | `data_source: "robot_edr"` |
-| Kural adı, açıklama, önem, zaman | `title`, `description`, `severity`, `timestamp` | same names; `severity` ∈ `low/medium/high/critical`; `timestamp` RFC 3339 UTC ms |
-| Robot kimliği, model, firmware sürümü ve hash'i, saha, attestation durumu, güvenlik durumu, ROS node ve topic, veri yolu mesaj kimliği, komut değeri ve izinli zarf | `entity_context` | `entity_context.{robot{id,model,site,firmware{version,sha256}}, attestation, safety_state, ros{node,topic,…}, bus_message_id, command{…, envelope_max_*}}` + `profile`, `mode`, `rule_id` |
-| ATT&CK for ICS teknikleri | `mitre_predictions` | `mitre_predictions[]` (`technique_id`, `technique_name`, `framework: attack_ics`, `provenance: sensor`) |
-| Kara kutu kanıtı | `evidence_links` | `evidence_links[]` = `robodr-blackbox://<robot>/<segment>/<seq>?sha256=<hex>` |
-| Anomali modeli skoru | `anomaly_score` | `anomaly_score` ∈ [0,1], omitted when no model was involved |
-
-The design doc also says the event model is "OCSF tabanlı" (OCSF-based) and the
-SOC receives an "OCSF olay akışı". The design doc is **silent on the OCSF class**;
-we use **OCSF 1.1 Detection Finding** (`class_uid` 2004, `category_uid` 2
-*Findings*) and embed it whole under `ocsf`, so the same object can go to an
-external SIEM/SOAR unchanged. Fields we are not certain of in the OCSF spec are
-listed in `crates/robodr-ocsf/README.md` (*OCSF-UNCERTAIN*).
+| Field | Meaning |
+| --- | --- |
+| `contract_version` | `2.y.z` |
+| `finding_id` | `ocsf.finding_info.uid`; deterministic (§2 *Identity*) |
+| `external_id` | `<robot_id>:<finding_id>`; with `data_source` the consumer's dedup key |
+| `data_source` | producer label, default `robodr`, configurable per deployment: `[a-z0-9][a-z0-9._-]{0,63}` |
+| `title`, `description` | trusted catalog text + sensor-authored facts (never tainted text) |
+| `severity` | `low` \| `medium` \| `high` \| `critical` |
+| `timestamp` | RFC 3339 UTC, ms (= `ocsf.time`) |
+| `entity_context` | robot, profile, rule id, mode, safety state, attestation, ROS/DDS identifiers (tainted), command and envelope, bus message id, occurrence count, detail (tainted) |
+| `mitre_predictions` | ATT&CK for ICS techniques from RoboDR's own rule catalog (`provenance: sensor`) |
+| `evidence_links` | `robodr-blackbox://<robot>/<segment>/<seq>?sha256=<hex>` |
+| `anomaly_score` | *optional*, in [0, 1] |
+| `adversary_controlled_fields` | JSON Pointers of every attacker-controlled value (§3) |
+| `ocsf` | the OCSF Detection Finding; `ocsf.unmapped.robodr` = `entity_context` |
 
 ## 2. Record layout
 
 | Part | Value |
 | --- | --- |
-| Topic | `robot-edr.findings` |
+| Topic | configured per deployment, default `robodr.findings`; the value names it in `ocsf.metadata.log_name` |
 | Key | `finding_id` (UTF-8, `rf1-` + 32 lower-case hex) |
 | Value | compact JSON `FindingEnvelope`, UTF-8, ≤ 64 KiB |
 | Partition | chosen **explicitly** by the producer from the **robot id** (§4), not from the key |
@@ -73,13 +71,13 @@ listed in `crates/robodr-ocsf/README.md` (*OCSF-UNCERTAIN*).
 | Header | Value |
 | --- | --- |
 | `content-type` | `application/json` |
-| `robodr-contract-version` | `1.3.0` |
+| `robodr-contract-version` | `2.0.0` |
 | `ocsf-version` | `1.1.0` |
-| `data-source` | `robot_edr` |
+| `data-source` | the value's `data_source` (default `robodr`) |
 | `robot-id` | robot id (`[A-Za-z0-9._-]{1,64}`) |
 | `severity` | `low` \| `medium` \| `high` \| `critical` |
 | `event-uid` | `ocsf.metadata.uid` (per-emission id, `re1-` + 32 hex) |
-| `robodr-finding-sig` | *optional, since 1.2, always last:* detached Ed25519 signature (§2a) |
+| `robodr-finding-sig` | *optional, always last:* detached Ed25519 signature (§2a) |
 
 Headers are a routing convenience; the value is authoritative. A consumer must
 not trust a header that disagrees with the value.
@@ -88,10 +86,10 @@ not trust a header that disagrees with the value.
 
 ```json
 {
-  "contract_version": "1.3.0",
+  "contract_version": "2.0.0",
   "finding_id": "rf1-0d7e79aac05cfd23bcfbdd38ef617eba",
   "external_id": "ugv-007:rf1-0d7e79aac05cfd23bcfbdd38ef617eba",
-  "data_source": "robot_edr",
+  "data_source": "robodr",
   "title": "Unauthorized publisher on a motion topic",
   "description": "A participant that is not in the locked model profile announced a writer on a motion/control topic. Robot ugv-007 (model ugv-tracked-v1, site range-north, firmware 2.4.1); profile version 7; mode enforce; safety state: motion moving, human proximity not detected; attestation verified; occurrences 3.",
   "severity": "critical",
@@ -124,7 +122,7 @@ not trust a header that disagrees with the value.
     "severity_id": 5, "severity": "Critical", "status_id": 1, "status": "New",
     "time": 1790000004250, "count": 3,
     "metadata": { "version": "1.1.0", "product": { "name": "RoboDR", "vendor_name": "Singularity RD", "version": "0.1.0-alpha.1" },
-                  "uid": "re1-e10d71877f52e563b8482d1359871bb1", "log_name": "robot-edr.findings" },
+                  "uid": "re1-e10d71877f52e563b8482d1359871bb1", "log_name": "robodr.findings" },
     "finding_info": { "uid": "rf1-0d7e…", "title": "…", "desc": "…", "types": ["robot_deviation", "ros2_dds_discovery"],
                       "first_seen_time": 1790000000000, "last_seen_time": 1790000004250,
                       "analytic": { "uid": "robot.ros2.unauthorized_motion_writer", "type_id": 1, "type": "Rule", "…": "…" },
@@ -138,11 +136,11 @@ not trust a header that disagrees with the value.
 }
 ```
 
-## 2a. Finding signature (contract 1.2, optional)
+## 2a. Finding signature (optional; since 1.2)
 
 **Why.** The validator proves a finding is well formed, not who wrote it. On
 a connected (non-diode) path, anyone able to produce to the topic can forge a
-finding that matches the rule catalog exactly. Since 1.2 a producer may sign
+finding that matches the rule catalog exactly. A producer may sign
 each finding with a per-unit Ed25519 *finding key*; a consumer in **strict**
 mode requires the signature.
 
@@ -168,7 +166,7 @@ so a signature cannot be relabelled to another key.
 
 **Carrier: Kafka header `robodr-finding-sig`** (not a value field: a field
 inside the value would make the signed bytes depend on the signature, and the
-value stays byte-identical to an unsigned 1.2 value). Header value, compact
+value stays byte-identical to an unsigned value). Header value, compact
 JSON, exactly these fields in this order, ≤ 512 bytes
 (`$defs/FindingSignatureHeader` in the schema):
 
@@ -236,7 +234,10 @@ OCSF `severity_id` enum: 0 Unknown, 1 Informational, 2 Low, 3 Medium, 4 High,
   robot, same subject ⇒ same `finding_id`, across restarts and producers.
 * First occurrence: `ocsf.activity_id` 1 *Create*, `count` 1. Repeats: activity
   2 *Update* with the same `finding_id`, higher `count`, later `last_seen_time`.
-  A consumer upserts on (`data_source`, `external_id`).
+  A consumer upserts on (`data_source`, `external_id`). With several
+  RoboDR deployments feeding one SOC, give each its own `data_source`
+  (e.g. `site-a.robodr`) or rely on the globally unique robot id inside
+  `external_id`.
 * `ocsf.metadata.uid` (`event-uid` header) identifies one *emission*
   (hash of finding id, `last_seen_time`, `count`). Re-delivery of the same
   emission (producer retry, diode re-send) carries the same `event-uid`;
@@ -247,21 +248,14 @@ OCSF `severity_id` enum: 0 Unknown, 1 Informational, 2 Low, 3 Medium, 4 High,
 
 **Requirement.** ROS 2 node names, topic names, type names, DDS GUID prefixes,
 source addresses and the deviation's free-text `detail` (which interpolates
-them) are chosen by whoever can reach the robot's DDS bus. They flow into an
-**LLM-based SOC**. The roadmap requires our eval set to carry "injection tests
-placed in ROS node and topic names, mirroring AutoSecOps' eval discipline", and
-the design doc lists "`eval/` derlemine robot bulgu örnekleri ve enjeksiyon
-testleri (ROS node adına yazılmış talimat gibi)" — *injection tests such as an
-instruction written into a ROS node name*. The design doc's source-trust section
-classifies exactly these as adversary-authored:
-
-> **Saldırgan:** ROS node ve topic adları, süreç ve dosya adları, hostname,
-> komut satırı. Bunları robota erişen biri seçebilir; triyaj modeli bunlara
-> güvenerek bulguyu kapatamamalı.
-
-*Adversary: ROS node and topic names, process and file names, hostname, command
-line. Anyone with access to the robot can choose them; the triage model must not
-close a finding by trusting them.*
+them) are chosen by whoever can reach the robot's DDS bus. They may flow into
+an **LLM-based SOC** (triage agents, summarisers), so every one of them is a
+potential prompt-injection carrier: an instruction written into a ROS node
+name is the canonical test case (`crates/robodr-ocsf/tests/findings.rs`,
+`INJECTIONS`). The provenance rule this contract encodes: **ROS node and
+topic names, process and file names, host names and command lines are
+adversary-authored** — anyone with access to the robot can choose them, so a
+triage model must never close a finding by trusting them.
 
 **Producer obligations (enforced by `robodr-ocsf`, checked by its validator):**
 
@@ -341,7 +335,7 @@ close a finding by trusting them.*
    (verbatim in `detail`; with spaces and punctuation escaped in ROS-name
    fields, where they cannot be legitimate).
 
-**Consumer obligations (AutoSecOps side):**
+**Consumer obligations:**
 
 * Put tainted values into prompts only inside clearly delimited data blocks,
   never as instructions: prefer `Tainted.display`; use `value` (or tainted
@@ -349,10 +343,10 @@ close a finding by trusting them.*
   for display to a human, never into a prompt). Never render tainted values
   as Markdown/HTML. Treat `suspicious` (and the individual flags) as a
   hostile-name signal; never let a tainted field be the sole basis for a
-  *benign* verdict (the design doc's provenance rule: a verdict with no
-  sensor-field support degrades to *uncertain*).
-* Map `robot_edr` fields per the trust map below; in particular a field the map
-  does not list is treated as adversary.
+  *benign* verdict (a verdict with no sensor-field support degrades to
+  *uncertain*).
+* Map fields per the trust map in §9; in particular a field the map does
+  not list is treated as adversary.
 
 **Consumer parsing rules (normative).** A consumer that does
 not run `robodr_ocsf::parse_and_validate` must enforce at least these:
@@ -366,14 +360,14 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
 * **Prompts use `display`, never a re-rendering of `value`.** `display` is
   validated as the exact ASCII-safe rendering of the decoded `value`; feed
   that, delimited as data, to an LLM.
-* **Contract 1.0 messages** carry no `display` and no flags. The reference
+* **Contract 1.0 messages** (legacy, parse-only, §5) carry no `display` and no flags. The reference
   validator rejects any 1.0 message that carries one of the 1.1 tainted-value
   fields (`display`, `non_ascii`, `mixed_script`, `injection_hint`,
   `suspicious`) — present at all, even at a default value — because 1.0 has
   no checks for them and a downgraded `contract_version` would otherwise
   smuggle a forged `display` or a cleared `suspicious`. For an accepted 1.0
   message, treat every tainted value as `suspicious: true` and render it from
-  `value` (kept escaped) only. Producers never emit 1.0
+  `value` (kept escaped) only. Producers never emit 1.x
   (`robodr_ocsf::validate_for_emit` / `to_json` refuse it).
 * **Catalog constants are exact.** `title`, the leading catalog sentence of
   `description`, `finding_info.types` (`["robot_deviation", <data source>]`),
@@ -402,7 +396,8 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
   sides of the diode in step. The validator applies the catalog **of the
   message's own `contract_version`** (`robodr_ocsf::rule_info_for_contract`):
   a 1.2 finding for a rule that only gained an entry in 1.3 carries the
-  generic entry and stays valid; a 1.3 finding must carry the new entry.
+  generic entry and stays valid; a 1.3 or any 2.x finding must carry the new
+  entry.
   Any `robot.correlate.*` id without its own entry (a deployment's custom
   correlation rule) gets the generic correlation entry.
 
@@ -422,21 +417,36 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
 
 ## 5. Versioning and compatibility
 
-* `contract_version` is semver; the major version is in the schema `$id`.
-* **Minor** (1.x): add *optional* fields only; never change meaning, type or
-  enum values of an existing field; never make a field required. Consumers
-  must ignore unknown fields (the reference validator does, but still applies
-  the SR-TAINT string rules to them).
-* **Major** (2.0): anything else — removing/renaming fields, new required
-  fields, changing id derivation (`rf1-`/`re1-` prefixes encode the derivation
-  version), changing the OCSF class. A major bump goes to a **new topic**
-  `robot-edr.findings.v2`, produced in parallel until AutoSecOps migrates.
+* `contract_version` is semver; the major version is in the schema `$id`
+  (`https://schemas.singularityrd.com/robodr/findings/<version>`).
+* **Minor** (2.x): add *optional* fields or catalog entries only; never
+  change meaning, type or enum values of an existing field; never make a
+  field required. Consumers must ignore unknown fields (the reference
+  validator does, but still applies the SR-TAINT string rules to them).
+  The validator applies the rule catalog of the message's own minor (§3).
+* **Major** (3.0): anything else — removing/renaming fields, new required
+  fields, changing id derivation (`rf1-`/`re1-` prefixes encode the
+  derivation version), changing the OCSF class. Produce a new major in
+  parallel (e.g. a new topic) until consumers migrate.
 * `ocsf.metadata.version` moves independently; upgrading the OCSF version
   inside the envelope is a minor change only if it is additive for consumers.
-* The reference validator accepts any `1.y.z` and rejects other majors.
-* 1.2 added only an optional Kafka header (§2a); the value format is
-  unchanged except for `contract_version`. 1.1 consumers ignore the header;
-  strict-signature consumers reject unsigned 1.1 producers.
+* **What 2.0 changed from 1.3** (`robot-edr.findings`): `data_source` is no
+  longer the constant `robot_edr` but a deployment label (default
+  `robodr`); the topic is no longer fixed to `robot-edr.findings` but
+  configured (default `robodr.findings`) and named in
+  `ocsf.metadata.log_name`; the `data-source` header follows the value. The
+  field set, identity derivation, SR-TAINT rules, signature scheme and the
+  OCSF body are unchanged. The dedup key changes with `data_source`, hence
+  the major bump.
+* **1.x is parse-only.** The reference validator accepts `1.y.z` messages
+  with their fixed 1.x constants (`data_source` `robot_edr`, `log_name`
+  `robot-edr.findings`) and the 1.x rules of their minor, so stored 1.x
+  findings can still be read and verified; `to_json`, `record`, the diode
+  packer/importer and `robodr-kafka-publish` never emit or forward them
+  (diode batches whose manifest names a 1.x contract are quarantined;
+  1.x spool records are dead-lettered / rejected). Any other major is
+  rejected. The 1.x schema is kept at
+  [`legacy/robot-edr-finding.schema.json`](legacy/robot-edr-finding.schema.json).
 
 ## 6. Size limits
 
@@ -454,7 +464,7 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
 ## 7. Retention (proposal — integrator to confirm)
 
 * `cleanup.policy=delete`, `retention.ms=604800000` (7 days). The topic is a
-  transport, not the system of record: findings live in AutoSecOps cases and
+  transport, not the system of record: findings live in the SOC's cases and
   the control plane; evidence lives in the signed black box (months).
 * Partitions: 12 for a fleet deployment; replication 3 (1 on a single-box
   air-gapped install).
@@ -462,8 +472,7 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
 ## 8. Air-gapped transport (diode export batches)
 
 Defence sites run the console air-gapped; findings may have to cross a
-one-way data diode (or controlled removable media) to reach an AutoSecOps
-instance. **Implemented in `crates/robodr-diode`** (`Packer` / `Importer`,
+one-way data diode (or controlled removable media) to reach the SOC. **Implemented in `crates/robodr-diode`** (`Packer` / `Importer`,
 CLIs `robodr-diode-pack` / `robodr-diode-unpack`; format and limits in that
 crate's README). Moving files across the diode and producing the emitted
 records to Kafka are outside the crate (no network code).
@@ -475,7 +484,8 @@ records to Kafka are outside the crate (no network code).
   `parity-NN.rbpar`, `MANIFEST.json` and `MANIFEST.sig`.
   `unit_id` is the exporting robot or site console (`[A-Za-z0-9._-]{1,64}`).
 * **Manifest** (`deny_unknown_fields`, ≤ 128 KiB, ≤ 256 files):
-  `{format: "robodr-diode/1", contract_version, unit_id, batch_seq (1-based),
+  `{format: "robodr-diode/1", contract_version (`2.y.z`; a 1.x batch is
+  quarantined, §5), unit_id, batch_seq (1-based),
   prev_batch_hash, created_at (RFC 3339 ms), created_at_ms, key_id, algorithm,
   finding_count, first_time, last_time, files: [{name, kind, size, sha256}],
   parity?}` (`kind`: `findings` | `blackbox_bundle` | `parity`; `parity`
@@ -530,7 +540,7 @@ records to Kafka are outside the crate (no network code).
   run `robodr_ocsf::parse_and_validate` on every line, parse (and, with a
   black-box key bound to this unit configured, verify) every bundle, and emit
   `out/<batch>/records.jsonl` — one Kafka record per line with the **same**
-  key, partition rule and headers as §2/§4 (`{topic, partition, key, headers,
+  topic (the value's `log_name`), key, partition rule and headers as §2/§4 (`{topic, partition, key, headers,
   value, diode: {unit_id, batch_seq, batch_hash, line}}`). If `out/<batch>/`
   already holds a *different* batch's output (after an operator state
   reset), the batch is emitted as `out/<batch>.<hash16>/`; an accepted batch
@@ -600,8 +610,11 @@ The two hops around the diode are implemented in `crates/robodr-export`
   packer's. Records leave `ready/` only by rename (to `acked/`, or to
   `rejected/` if invalid), never by deletion.
 * **`robodr-kafka-publish`** (SOC side) publishes the importer's
-  `out/<batch>/records.jsonl` (or a connected site's spool) to this topic
-  with the §2 key and headers (re-derived from the validated value and
+  `out/<batch>/records.jsonl` (or a connected site's spool) to its
+  configured topic (`--topic`, default `robodr.findings`; a record whose
+  value names another topic is published there anyway and counted as
+  `topic_overridden`, a record whose `topic` disagrees with its own value is
+  dead-lettered) with the §2 key and headers (re-derived from the validated value and
   required to match the input; an optional `robodr-finding-sig` header is
   carried verbatim as the last header, §2a) and the §4 partition rule,
   computed with the
@@ -621,103 +634,73 @@ The two hops around the diode are implemented in `crates/robodr-export`
   at-least-once and consumers must drop duplicates on `event-uid`.
   Per-partition order is preserved.
 
-## 9. AutoSecOps-side checklist (from the design doc)
+## 9. Consumer integration checklist
 
-Quoted from *Yapılacak işler* (to-do), with what this contract needs from each:
+What a SOC (or any consumer) needs to implement to ingest this contract
+safely. Nothing here is specific to one product.
 
-- [ ] *"Robot EDR kontrol düzleminden `robot-edr.findings` topic'ine bulgu yayını ve şema"* — schema: **this document**; publisher: Sprint 4 (E3).
-- [ ] *"`core/federation/provenance.py`: `robot_edr` kaynak güveni haritası"* — the trust map. Design doc: **sensor** = robot id, attestation status, firmware hash, safety state, bus message id, command value, permitted envelope, severity, time; **adversary** = ROS node and topic names, process and file names, hostname, command line. In this contract:
-  - `entity_context.mode` is the stricter of the robot's profile mode and the deviation's own mode: `observe` if either says observe (report only; never act on it).
-  - sensor: `finding_id`, `external_id`, `severity`, `timestamp`, `entity_context.{robot, profile, rule_id, mode, safety_state, attestation, bus_message_id, occurrence_count}`, `entity_context.command.{linear_speed, joint_speed, envelope_max_*}`, `mitre_predictions` (written by RoboDR's rule catalog, *not* third-party — note the generic Kafka map would wrongly treat MITRE as third-party), `evidence_links`, `anomaly_score`, all `ocsf.*` except below;
-  - adversary: every pointer in `adversary_controlled_fields` (`entity_context.ros.*`, `entity_context.command.channel`, `entity_context.detail`, `ocsf.resources[*]`, and the `ocsf.unmapped.robodr` copies). We also classify **participant GUID and source IP** as adversary (the participant chooses its GUID; UDP source addresses are spoofable) — stricter than the design doc's list, deliberately.
-  - Until this map ships, the generic Kafka map applies ("ham olay saldırgan yazımı sayılır" — the raw event counts as adversary-authored), which is safe but loses the sensor fields.
-- [ ] *"`core/contracts/verdict.py` ve `core/autonomy/tiers.py`: `robotics` kategorisi, hiç otonom olmayanlar listesinde"* — the `robotics` category, **never autonomous** ("o da hiçbir zaman otonom olmamalı").
-- [ ] *"`core/autonomy/categories.py`: ATT&CK for ICS eşlemesi ve `robot_edr` kaynağının kategorisi"* — the design doc names T0855, T0831, T0836, T0843, T0889, T0856 as the robotics techniques. **Gap:** RoboDR's catalog also emits **T0848 Rogue Master** (unknown DDS participant) and **T0801 Monitor Process State** (unknown reader), which are not in that list; either add them to the robotics mapping or those findings fall to `other` (still never autonomous). Decision needed.
-- [ ] *"`core/response/approval_service.py` ve `core/autonomy/tiers.py`: robot aksiyon sınıfları"* — action classes, none in `AUTONOMOUS_ELIGIBLE`: `robot_restrict_motion` (approval), `robot_quarantine_node` (approval), `robot_isolate_network` (approval), `robot_safe_pause` (approval, two-person), `robot_request_safe_state` (approval, two-person; not reversible), `robot_rollback_config` (approval, two-person; not reversible). A finding never carries an action; actions go SOC → control plane → on-robot agent, which may refuse in the current safety state.
-- [ ] *"`core/response/executors/`: `robot_edr` yürütücüsü"*.
-- [ ] *"`core/integrations/robot_edr/`: vendor slice ve MCP araçları"*.
-- [ ] *"`core/workflows/definitions/robot-incident-response/WORKFLOW.md`"*.
-- [ ] *"Otonomi kademeleri tablosu için yeni veritabanı init dosyası"*.
-- [ ] *"`eval/` derlemine robot bulgu örnekleri ve enjeksiyon testleri (ROS node adına yazılmış talimat gibi)"* — `crates/robodr-ocsf/tests/findings.rs` (`INJECTIONS`) holds a starting corpus of hostile names; the produced findings are valid eval inputs.
+**Trust map** (field provenance):
 
-Consumer acceptance checks for this contract:
+- `entity_context.mode` is the stricter of the robot's profile mode and the
+  deviation's own mode: `observe` if either says observe (report only; never
+  act on it).
+- **sensor** (RoboDR's own measurements and catalog): `finding_id`,
+  `external_id`, `severity`, `timestamp`,
+  `entity_context.{robot, profile, rule_id, mode, safety_state, attestation,
+  bus_message_id, occurrence_count}`,
+  `entity_context.command.{linear_speed, joint_speed, envelope_max_*}`,
+  `mitre_predictions` (written by RoboDR's rule catalog, *not* a third
+  party), `evidence_links`, `anomaly_score`, all `ocsf.*` except below;
+- **adversary**: every pointer in `adversary_controlled_fields`
+  (`entity_context.ros.*`, `entity_context.command.channel`,
+  `entity_context.detail`, `ocsf.resources[*]`, and the
+  `ocsf.unmapped.robodr` copies). **Participant GUID and source IP** are
+  adversary too (the participant chooses its GUID; UDP source addresses are
+  spoofable).
+- A consumer that cannot apply the map treats the whole message as
+  adversary-authored: safe, but it loses the sensor fields.
 
-- [ ] `finding_id` present (consumer requires it) and used with `data_source` + `external_id` for dedup/upsert.
-- [ ] `data_source` read from the message (`robot_edr`), not defaulted to `kafka:robot-edr.findings`.
-- [ ] `robotics` category assigned from `mitre_predictions`; never autonomous.
-- [ ] Tainted fields rendered as delimited data; never sole support for a benign verdict.
-- [ ] `evidence_links` resolved through the control plane's black-box API (not fetched directly from robots).
-- [ ] `robodr-finding-sig` verified over the raw value bytes with the key registered for `entity_context.robot.id` (§2a); strict mode on connected paths once all producers sign; dedup on `event-uid` (signatures do not stop replay).
+**Checks:**
+
+- [ ] Validate every message (`robodr_ocsf::parse_and_validate`, or the
+      schema plus the §3 parsing rules); reject duplicate keys.
+- [ ] Verify `robodr-finding-sig` over the raw value bytes with the key
+      registered for `entity_context.robot.id` (§2a); strict mode on
+      connected paths once all producers sign; behind a diode rely on the
+      importer's batch verification.
+- [ ] `finding_id` present and used with `data_source` + `external_id` for
+      dedup/upsert; drop exact re-deliveries on `event-uid` (signatures do
+      not stop replay).
+- [ ] Read `data_source` from the message; never default it from the topic.
+- [ ] Tainted fields rendered as delimited data (`display`), never as
+      instructions or Markdown/HTML; never the sole support for a benign
+      verdict.
+- [ ] Robot findings are never auto-remediated: any response is a request
+      from the action catalog through the control plane, approved by a
+      person (two people for `safe_pause`, `request_safe_state`,
+      `rollback_config`), and judged again on the robot.
+- [ ] `evidence_links` resolved through the robot's evidence export (not
+      fetched directly from robots).
+- [ ] ATT&CK for ICS techniques used by the catalog: T0848 Rogue Master,
+      T0855 Unauthorized Command Message, T0801 Monitor Process State, T0831
+      Manipulation of Control, T0856 Spoof Reporting Message.
+- [ ] A hostile-name eval corpus: `crates/robodr-ocsf/tests/findings.rs`
+      (`INJECTIONS`) holds a starting set; the produced findings are valid
+      eval inputs.
 
 ## 10. Changelog
 
-* **1.3.0** — rule catalog entries for the wave-6 detectors: the nine default
-  `robot.correlate.*` rules plus a generic entry for any other
-  `robot.correlate.*` id, `robot.safety_state.{untrusted_source,
-  undecodable_sample, unmapped_value}`, `robot.ros2.profile_state_tampered`,
-  `robot.agent.evidence_quarantined` and `robot.agent.correlation_pressure`;
-  during the same (unreleased) cycle also the wave-7 ids
-  `robot.safety_state.writer_overflow`,
-  `robot.correlate.correlation_state_evicted` (own entry, no longer the
-  generic correlation entry) and `robot.agent.evidence_truncated`, plus a
-  dedicated entry for every other emitted `robot.*` id that used to get the
-  generic `robodr` entry: agent self-health (`robot.agent.*`), profile
-  (`robot.ros2.unknown_service`, `unknown_action`, `unknown_reader_topic`,
-  `robot.dds.unknown_raw_writer`, `robot.motion.non_finite_command`,
-  `robot.profile.invalid_envelope`), sensor pipeline (`robot.ros2.*`
-  profile/binding ids, `robot.rtps.*`, `robot.capture.*`,
-  `robot.sensor.findings_capped`, motion decode `robot.motion.*`), motion
-  monitor (`robot.motion.*`) and firewall (`robot.firewall.*`). Also in the
-  same cycle `robot.host.pulsar_threat` (Pulsar threats forwarded to
-  robodr-agentd) with the data source `host_runtime`, and
-  `robot.agent.control_plane_unauthenticated` /
-  `robot.agent.control_plane_invalid` (the control-plane action API,
-  `robot-edr.control-plane.md`; data source `robodr_agent`). No new data
-  source or technique beyond those listed here.
-  New data sources `robodr_correlation`, `robot_safety_state`,
-  `robodr_agent`, `host_runtime`; new technique T0856 Spoof Reporting Message. Value format
-  otherwise unchanged; the validator checks catalog constants against the
-  catalog of the message's own minor, so 1.2 messages stay valid. Schema
-  `$id` → `/1.3.0`.
-
-* **1.2.0** — optional detached per-finding Ed25519 signature (§2a) in the
-  new Kafka header `robodr-finding-sig`; signed bytes = the record value
-  verbatim. Value format unchanged apart from `contract_version`; schema
-  `$id` → `/1.2.0`, new `$defs/FindingSignatureHeader`. Consumers may run in
-  strict mode (signature required). Reference: `robodr_ocsf::sig`.
-
-* **1.1.0, rev3 tightening** (validator and contract text only; the wire
-  format and `contract_version: "1.1.0"` are unchanged — every message the
-  builder ever produced still validates):
-  - Duplicate object keys are rejected at any depth.
-  - Contract 1.0 messages carrying any 1.1 tainted-value field are rejected
-    (previously the 1.1 checks were skipped while the fields were still
-    parsed and carried); 1.0 is parse-only and never emitted.
-  - `title`, `description` prefix, `finding_info.types`/`data_sources`,
-    ATT&CK technique ids/names and `resources[].labels` must match the rule
-    catalog exactly; the JSON Schema now uses `enum`/`const` for them.
-
-* **1.1.0** — SR-TAINT hardening and safety fix after independent review.
-  - Neutralisation moved from a deny-list to the allow-lists in §3; more
-    characters are escaped, with the same escape syntax (1.0 decoders still
-    decode correctly). Free text (`detail`) now also escapes Markdown/HTML/
-    template metacharacters.
-  - New optional `Tainted` fields (always emitted by 1.1 producers): the
-    ASCII-safe rendering `display`, and the flags `non_ascii`,
-    `mixed_script`, `injection_hint`, `suspicious`. `value` is now documented
-    and checked as the lossless escaped original (hash-verified while not
-    truncated).
-  - Caps are now in raw characters (256 / 64 / 400) instead of escaped
-    bytes, so an all-non-ASCII name of legal length is no longer cut to a few
-    characters; `value` may be up to 10 B per character. `_` is now raw in
-    the text charset (readability of ROS names in `detail`).
-  - Every schema string has a `pattern`; trusted strings must be printable
-    ASCII. `Tainted` split into `TaintedName` / `TaintedText` in the schema.
-  - `entity_context.mode`: an observe-only deviation is now published as
-    `observe` even when the robot profile is locked (1.0 reported `enforce`).
-  - Compatibility: the reference validator still accepts `1.y.z`; for
-    `1.0.z` messages it skips the checks of fields 1.0 did not have. A 1.0
-    message whose tainted values or trusted strings contain characters that
-    1.1 escapes/forbids is rejected on replay. Consumers that read 1.0
-    `value` strings keep working (same escape syntax, stricter raw set).
-* **1.0.0** — initial contract.
+* **2.0.0** — vendor-neutral contract `robodr.findings` (supersedes
+  `robot-edr.findings` 1.3.0, see
+  [`legacy/robot-edr.findings.md`](legacy/robot-edr.findings.md) for the
+  1.x history):
+  - `data_source`: deployment label, default `robodr` (was the constant
+    `robot_edr`); `data-source` header = the value's `data_source`.
+  - Topic: configured, default `robodr.findings` (was fixed
+    `robot-edr.findings`); `ocsf.metadata.log_name` names it and the
+    record topic is derived from it.
+  - Schema `$id` `https://schemas.singularityrd.com/robodr/findings/2.0.0`.
+  - 1.x messages: parse-only (validated with their 1.x constants and
+    rules, never emitted or forwarded).
+  - Unchanged: field set, OCSF 1.1 Detection Finding body, identity
+    (`rf1-`/`re1-`), SR-TAINT, signatures (§2a), rule catalog (= 1.3).

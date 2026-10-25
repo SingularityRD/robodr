@@ -1,8 +1,11 @@
 //! # robodr-ocsf
 //!
 //! Maps RoboDR [`Deviation`](robodr_events::Deviation)s to **OCSF Detection
-//! Findings** wrapped in the AutoSecOps ingestion envelope, for the
-//! `robot-edr.findings` Kafka topic (design doc, *AI SOC entegrasyonu*).
+//! Findings** wrapped in the vendor-neutral `robodr.findings` envelope
+//! (contract 2.x, `docs/contracts/robodr.findings.md`): what the robot sends
+//! a SOC or SIEM is correlated findings with links to black-box evidence,
+//! not raw telemetry. Contract 1.x (`robot-edr.findings`) messages are still
+//! parsed and validated, never emitted.
 //!
 //! * [`model`] — typed, serde-derived wire structs ([`FindingEnvelope`]).
 //! * [`builder`] — [`FindingBuilder::from_deviation`], deterministic ids,
@@ -21,14 +24,13 @@
 //! `robodr-blackbox` [`Signer`](robodr_blackbox::Signer) /
 //! [`Verifier`](robodr_blackbox::Verifier) traits). Given the same inputs it
 //! produces byte-identical JSON. The JSON Schema in
-//! `docs/contracts/robot-edr-finding.schema.json` and the example in
-//! `docs/contracts/robot-edr-finding.example.json` are checked against the
+//! `docs/contracts/robodr-finding.schema.json` and the example in
+//! `docs/contracts/robodr-finding.example.json` are checked against the
 //! builder's output by the integration tests.
 //!
 //! Protective scope: a finding *describes* a deviation. Nothing here commands
-//! the robot; AutoSecOps actions go to the control plane and the on-robot agent
-//! has the final say (design doc: "AI SOC robota hiçbir zaman doğrudan hareket
-//! komutu göndermez").
+//! the robot. A SOC never sends a motion command to a robot: approved actions
+//! go to the control plane and the on-robot agent has the final say.
 
 pub mod builder;
 pub mod hash;

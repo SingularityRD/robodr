@@ -60,8 +60,14 @@ pub struct AgentConfig {
     pub firewall: Option<FirewallSettings>,
     /// Attestation status to report in findings (control-plane supplied).
     pub attestation: AttestationStatus,
-    /// Kafka partition count of `robot-edr.findings`, if known.
+    /// Kafka partition count of the findings topic, if known.
     pub kafka_partitions: Option<u32>,
+    /// Findings topic (`ocsf.metadata.log_name` and the record topic);
+    /// default [`robodr_ocsf::DEFAULT_TOPIC`].
+    pub findings_topic: String,
+    /// Findings `data_source` label; default
+    /// [`robodr_ocsf::DEFAULT_DATA_SOURCE`].
+    pub data_source: String,
     /// Record every event in the black box, not only events that produced a
     /// deviation or a non-pass firewall verdict. Off by default: motion
     /// topics run at 50-1000 Hz and would flood the recorder.
@@ -91,6 +97,8 @@ impl AgentConfig {
             firewall: None,
             attestation: AttestationStatus::Unknown,
             kafka_partitions: None,
+            findings_topic: robodr_ocsf::DEFAULT_TOPIC.into(),
+            data_source: robodr_ocsf::DEFAULT_DATA_SOURCE.into(),
             record_all_events: false,
             clock_jump_tolerance_ns: DEFAULT_CLOCK_JUMP_TOLERANCE_NS,
         }
@@ -116,6 +124,18 @@ impl AgentConfig {
             return Err(AgentError::Config(
                 "kafka_partitions must be >= 1 (or unset)".into(),
             ));
+        }
+        if !robodr_ocsf::validate::is_valid_topic(&self.findings_topic) {
+            return Err(AgentError::Config(format!(
+                "findings topic {:?} must match [A-Za-z0-9._-]{{1,249}}",
+                self.findings_topic
+            )));
+        }
+        if !robodr_ocsf::validate::is_valid_data_source(&self.data_source) {
+            return Err(AgentError::Config(format!(
+                "data_source {:?} must match [a-z0-9][a-z0-9._-]{{0,63}}",
+                self.data_source
+            )));
         }
         if let Some(m) = &self.monitor {
             if let Some(bad) = m

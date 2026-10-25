@@ -447,7 +447,26 @@ fn publisher_dead_letters_bad_records_and_continues() {
     // Garbage, an overlong line and a wrong topic.
     lines.insert(2, "not json".into());
     lines.insert(3, "x".repeat(2 * 1024 * 1024));
-    lines.push(lines[0].replace("robot-edr.findings", "other.topic"));
+    // (Only the record's topic: its value still names the default topic.)
+    let wrong = lines[0].replacen(
+        &format!("\"topic\":\"{TOPIC}\""),
+        "\"topic\":\"other.topic\"",
+        1,
+    );
+    assert_ne!(wrong, lines[0]);
+    lines.push(wrong);
+    // A finding whose producer was configured with another topic: it is
+    // published to this publisher's topic and counted, not refused.
+    let mut f = finding(99);
+    f.ocsf.metadata.log_name = "site-b.findings".into();
+    let rec = robodr_ocsf::record(&f, None).unwrap();
+    lines.push(
+        serde_json::json!({
+            "topic": rec.topic, "partition": null, "key": rec.key,
+            "headers": rec.headers, "value": rec.value,
+        })
+        .to_string(),
+    );
     fs::write(&path, lines.join("\n") + "\n").unwrap();
 
     let c = Cluster::start(1, 1);
@@ -457,12 +476,14 @@ fn publisher_dead_letters_bad_records_and_continues() {
     )
     .unwrap();
     let rep = p.run_once().unwrap();
-    assert_eq!(rep.published, 3);
+    assert_eq!(rep.published, 4);
+    assert_eq!(rep.topic_overridden, 1);
     assert_eq!(rep.dead_lettered, 4);
     let dl = fs::read_to_string(r.soc_state.join("dead-letter.jsonl")).unwrap();
     assert_eq!(dl.lines().count(), 4);
     assert!(dl.contains("headers disagree"));
     assert!(dl.contains("longer than"));
+    assert!(dl.contains("not the one the value names"));
 }
 
 #[test]
