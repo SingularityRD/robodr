@@ -162,6 +162,48 @@ impl<'a> Reader<'a> {
         Ok(f64_from(b, self.endian))
     }
 
+    /// `uint16` (2-aligned).
+    pub(crate) fn u16(&mut self) -> Result<u16, DecodeError> {
+        let b = self.array::<2>()?;
+        Ok(match self.endian {
+            Endian::Big => u16::from_be_bytes(b),
+            Endian::Little => u16::from_le_bytes(b),
+        })
+    }
+
+    /// `int16` (2-aligned).
+    pub(crate) fn i16(&mut self) -> Result<i16, DecodeError> {
+        let b = self.array::<2>()?;
+        Ok(match self.endian {
+            Endian::Big => i16::from_be_bytes(b),
+            Endian::Little => i16::from_le_bytes(b),
+        })
+    }
+
+    /// `int8`: one octet, no alignment.
+    pub(crate) fn i8(&mut self) -> Result<i8, DecodeError> {
+        let [b] = self.array::<1>()?;
+        Ok(i8::from_ne_bytes([b]))
+    }
+
+    /// `int64` (8-aligned under XCDR1, 4-aligned under XCDR2).
+    pub(crate) fn i64(&mut self) -> Result<i64, DecodeError> {
+        let b = self.array::<8>()?;
+        Ok(match self.endian {
+            Endian::Big => i64::from_be_bytes(b),
+            Endian::Little => i64::from_le_bytes(b),
+        })
+    }
+
+    /// `float` / `float32` (4-aligned).
+    pub(crate) fn f32(&mut self) -> Result<f32, DecodeError> {
+        let b = self.array::<4>()?;
+        Ok(match self.endian {
+            Endian::Big => f32::from_be_bytes(b),
+            Endian::Little => f32::from_le_bytes(b),
+        })
+    }
+
     /// A fixed-size `double[N]` array (no length prefix, no DHEADER: the
     /// element type is primitive).
     pub(crate) fn f64_array<const N: usize>(&mut self) -> Result<[f64; N], DecodeError> {

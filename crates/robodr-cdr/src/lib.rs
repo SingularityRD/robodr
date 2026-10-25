@@ -21,6 +21,14 @@
 //! | `sensor_msgs::msg::dds_::Imu_` | `sensor_msgs/msg/Imu` | feedback |
 //! | `sensor_msgs::msg::dds_::JointState_` | `sensor_msgs/msg/JointState` | feedback |
 //!
+//! Unitree robots ([`unitree`]): `unitree_go` / `unitree_hg` low-level
+//! command and state, sport-mode state, hand command / state, IMU, and
+//! `unitree_api` requests (sport / loco `Move`, `SetVelocity`, ...) are
+//! motion kinds too (`MessageKind::Unitree*`); the legacy UDP generation
+//! (Go1) is decoded by [`unitree_legacy`]. Status: decoded from Unitree's
+//! published IDL / msg definitions and hand-built vectors, not yet verified
+//! against traffic captured from a real robot.
+//!
 //! Separately from the motion types (not in [`MessageKind`] / [`Registry`]),
 //! [`std_msgs`] decodes `std_msgs/msg/Bool`, `UInt8` and `String` (bounded),
 //! the scalar types robots use to publish e-stop flags and operating modes
@@ -119,6 +127,8 @@ pub mod msgs;
 mod reader;
 pub mod registry;
 pub mod std_msgs;
+pub mod unitree;
+pub mod unitree_legacy;
 
 pub use encap::{Encapsulation, Endian, Representation, XcdrVersion};
 pub use error::DecodeError;
@@ -132,6 +142,10 @@ pub use reader::CdrStr;
 pub use registry::{DecodeFn, Registry};
 pub use std_msgs::{
     decode_std, decode_std_by_type_name, StdDecodeError, StdDecoded, StdKind, StdValue,
+};
+pub use unitree::{
+    decode_unitree, decode_unitree_by_type_name, ApiCall, ApiRequest, JointCommandFrame,
+    JointStateFrame, UnitreeKind, UnitreeMessage, UnitreeModel,
 };
 
 use reader::Reader;
@@ -195,10 +209,51 @@ pub enum MessageKind {
     Imu,
     JointState,
     JointTrajectory,
+    /// `unitree_go::msg::dds_::LowCmd_` (command).
+    UnitreeGoLowCmd,
+    /// `unitree_go::msg::dds_::LowState_` (feedback).
+    UnitreeGoLowState,
+    /// `unitree_go::msg::dds_::SportModeState_` (feedback).
+    UnitreeGoSportModeState,
+    /// `unitree_hg::msg::dds_::LowCmd_` (command).
+    UnitreeHgLowCmd,
+    /// `unitree_hg::msg::dds_::LowState_` (feedback).
+    UnitreeHgLowState,
+    /// `unitree_hg::msg::dds_::HandCmd_` (command).
+    UnitreeHgHandCmd,
+    /// `unitree_hg::msg::dds_::HandState_` (feedback).
+    UnitreeHgHandState,
+    /// `unitree_hg::msg::dds_::IMUState_` (feedback).
+    UnitreeHgImuState,
+    /// `unitree_hg_doubleimu::msg::dds_::doubleIMUState_` (feedback).
+    UnitreeHgDoubleImuState,
+    /// `unitree_api::msg::dds_::Request_` (command).
+    UnitreeApiRequest,
 }
 
 impl MessageKind {
-    pub const ALL: [MessageKind; 6] = [
+    pub const ALL: [MessageKind; 16] = [
+        MessageKind::Twist,
+        MessageKind::TwistStamped,
+        MessageKind::Odometry,
+        MessageKind::Imu,
+        MessageKind::JointState,
+        MessageKind::JointTrajectory,
+        MessageKind::UnitreeGoLowCmd,
+        MessageKind::UnitreeGoLowState,
+        MessageKind::UnitreeGoSportModeState,
+        MessageKind::UnitreeHgLowCmd,
+        MessageKind::UnitreeHgLowState,
+        MessageKind::UnitreeHgHandCmd,
+        MessageKind::UnitreeHgHandState,
+        MessageKind::UnitreeHgImuState,
+        MessageKind::UnitreeHgDoubleImuState,
+        MessageKind::UnitreeApiRequest,
+    ];
+
+    /// The standard ROS 2 kinds (the six this crate decoded before the
+    /// Unitree types were added).
+    pub const ROS: [MessageKind; 6] = [
         MessageKind::Twist,
         MessageKind::TwistStamped,
         MessageKind::Odometry,
@@ -206,6 +261,28 @@ impl MessageKind {
         MessageKind::JointState,
         MessageKind::JointTrajectory,
     ];
+
+    /// The Unitree type this kind decodes, if it is a Unitree kind.
+    pub fn unitree_kind(self) -> Option<UnitreeKind> {
+        Some(match self {
+            MessageKind::Twist
+            | MessageKind::TwistStamped
+            | MessageKind::Odometry
+            | MessageKind::Imu
+            | MessageKind::JointState
+            | MessageKind::JointTrajectory => return None,
+            MessageKind::UnitreeGoLowCmd => UnitreeKind::GoLowCmd,
+            MessageKind::UnitreeGoLowState => UnitreeKind::GoLowState,
+            MessageKind::UnitreeGoSportModeState => UnitreeKind::GoSportModeState,
+            MessageKind::UnitreeHgLowCmd => UnitreeKind::HgLowCmd,
+            MessageKind::UnitreeHgLowState => UnitreeKind::HgLowState,
+            MessageKind::UnitreeHgHandCmd => UnitreeKind::HgHandCmd,
+            MessageKind::UnitreeHgHandState => UnitreeKind::HgHandState,
+            MessageKind::UnitreeHgImuState => UnitreeKind::HgImuState,
+            MessageKind::UnitreeHgDoubleImuState => UnitreeKind::HgDoubleImuState,
+            MessageKind::UnitreeApiRequest => UnitreeKind::ApiRequest,
+        })
+    }
 
     /// DDS-mangled type name as announced in SEDP `PID_TYPE_NAME`.
     pub fn dds_type_name(self) -> &'static str {
@@ -216,6 +293,7 @@ impl MessageKind {
             MessageKind::Imu => "sensor_msgs::msg::dds_::Imu_",
             MessageKind::JointState => "sensor_msgs::msg::dds_::JointState_",
             MessageKind::JointTrajectory => "trajectory_msgs::msg::dds_::JointTrajectory_",
+            k => k.unitree_kind().map_or("", UnitreeKind::dds_type_name),
         }
     }
 
@@ -228,6 +306,7 @@ impl MessageKind {
             MessageKind::Imu => "sensor_msgs/msg/Imu",
             MessageKind::JointState => "sensor_msgs/msg/JointState",
             MessageKind::JointTrajectory => "trajectory_msgs/msg/JointTrajectory",
+            k => k.unitree_kind().map_or("", UnitreeKind::ros_type_name),
         }
     }
 
@@ -240,20 +319,32 @@ impl MessageKind {
 
     pub fn role(self) -> MotionRole {
         match self {
-            MessageKind::Twist | MessageKind::TwistStamped | MessageKind::JointTrajectory => {
-                MotionRole::Command
-            }
-            MessageKind::Odometry | MessageKind::Imu | MessageKind::JointState => {
-                MotionRole::Feedback
-            }
+            MessageKind::Twist
+            | MessageKind::TwistStamped
+            | MessageKind::JointTrajectory
+            | MessageKind::UnitreeGoLowCmd
+            | MessageKind::UnitreeHgLowCmd
+            | MessageKind::UnitreeHgHandCmd
+            | MessageKind::UnitreeApiRequest => MotionRole::Command,
+            MessageKind::Odometry
+            | MessageKind::Imu
+            | MessageKind::JointState
+            | MessageKind::UnitreeGoLowState
+            | MessageKind::UnitreeGoSportModeState
+            | MessageKind::UnitreeHgLowState
+            | MessageKind::UnitreeHgHandState
+            | MessageKind::UnitreeHgImuState
+            | MessageKind::UnitreeHgDoubleImuState => MotionRole::Feedback,
         }
     }
 }
 
 /// A decoded message, borrowing from the payload.
 ///
-/// Not boxed on purpose: `Odometry` (two 6x6 covariances) is ~720 bytes,
-/// which is cheaper on the stack than a heap allocation per sample.
+/// Not boxed on purpose: `Odometry` (two 6x6 covariances) is ~720 bytes
+/// and the largest Unitree variant (`unitree_hg` `LowState_`, 35 motors)
+/// ~2.1 KB, which is cheaper on the stack than a heap allocation per
+/// sample (Unitree low-level topics run at 500 Hz).
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum MotionMessage<'a> {
@@ -263,9 +354,74 @@ pub enum MotionMessage<'a> {
     Imu(Imu<'a>),
     JointState(JointState<'a>),
     JointTrajectory(JointTrajectory<'a>),
+    UnitreeGoLowCmd(unitree::GoLowCmd),
+    UnitreeGoLowState(unitree::GoLowState),
+    UnitreeGoSportModeState(unitree::GoSportModeState),
+    UnitreeHgLowCmd(unitree::HgLowCmd),
+    UnitreeHgLowState(unitree::HgLowState),
+    UnitreeHgHandCmd(unitree::HgHandCmd),
+    UnitreeHgHandState(unitree::HgHandState),
+    UnitreeHgImuState(unitree::HgImuState),
+    UnitreeHgDoubleImuState(unitree::HgDoubleImuState),
+    UnitreeApiRequest(unitree::ApiRequest<'a>),
 }
 
-impl MotionMessage<'_> {
+impl<'a> MotionMessage<'a> {
+    /// The motion message for a decoded Unitree message; `None` for the
+    /// two non-motion types (`WirelessController_`, `Response_`).
+    pub fn from_unitree(m: UnitreeMessage<'a>) -> Option<Self> {
+        Some(match m {
+            UnitreeMessage::GoLowCmd(x) => MotionMessage::UnitreeGoLowCmd(x),
+            UnitreeMessage::GoLowState(x) => MotionMessage::UnitreeGoLowState(x),
+            UnitreeMessage::GoSportModeState(x) => MotionMessage::UnitreeGoSportModeState(x),
+            UnitreeMessage::HgLowCmd(x) => MotionMessage::UnitreeHgLowCmd(x),
+            UnitreeMessage::HgLowState(x) => MotionMessage::UnitreeHgLowState(x),
+            UnitreeMessage::HgHandCmd(x) => MotionMessage::UnitreeHgHandCmd(x),
+            UnitreeMessage::HgHandState(x) => MotionMessage::UnitreeHgHandState(x),
+            UnitreeMessage::HgImuState(x) => MotionMessage::UnitreeHgImuState(x),
+            UnitreeMessage::HgDoubleImuState(x) => MotionMessage::UnitreeHgDoubleImuState(x),
+            UnitreeMessage::ApiRequest(x) => MotionMessage::UnitreeApiRequest(x),
+            UnitreeMessage::GoWirelessController(_) | UnitreeMessage::ApiResponse(_) => {
+                return None
+            }
+        })
+    }
+
+    /// The per-motor command frame of a Unitree low-level / hand command
+    /// (`None` for every other message).
+    pub fn joint_command_frame(&self) -> Option<JointCommandFrame> {
+        match self {
+            MotionMessage::UnitreeGoLowCmd(m) => Some(m.joint_frame()),
+            MotionMessage::UnitreeHgLowCmd(m) => Some(m.joint_frame()),
+            MotionMessage::UnitreeHgHandCmd(m) => Some(m.joint_frame()),
+            _ => None,
+        }
+    }
+
+    /// The per-motor state frame of a Unitree low-level / hand state.
+    pub fn joint_state_frame(&self) -> Option<JointStateFrame> {
+        match self {
+            MotionMessage::UnitreeGoLowState(m) => Some(m.joint_frame()),
+            MotionMessage::UnitreeHgLowState(m) => Some(m.joint_frame()),
+            MotionMessage::UnitreeHgHandState(m) => Some(m.joint_frame()),
+            _ => None,
+        }
+    }
+
+    /// `Some(crc_ok)` for Unitree go / hg `LowCmd_` / `LowState_`, `None`
+    /// for types without a CRC. Not part of [`Decoded::anomalies`]: a
+    /// consumer that wants to require a valid CRC (the robot drops frames
+    /// without one) checks this.
+    pub fn unitree_crc_ok(&self) -> Option<bool> {
+        match self {
+            MotionMessage::UnitreeGoLowCmd(m) => Some(m.crc_ok()),
+            MotionMessage::UnitreeGoLowState(m) => Some(m.crc_ok()),
+            MotionMessage::UnitreeHgLowCmd(m) => Some(m.crc_ok()),
+            MotionMessage::UnitreeHgLowState(m) => Some(m.crc_ok()),
+            _ => None,
+        }
+    }
+
     /// Why this command's speed cannot be bounded, if so: a non-empty
     /// `JointTrajectory` with no velocities and no pair of points to derive
     /// a speed from (see [`JointTrajectory::max_joint_speed`]). `None` for
@@ -276,6 +432,9 @@ impl MotionMessage<'_> {
                 "JointTrajectory has no velocities and fewer than two points with positions \
                  (the start position is not in the message)",
             ),
+            // The parameter of a Unitree API request is not readable JSON:
+            // whatever the call is, its arguments cannot be checked.
+            MotionMessage::UnitreeApiRequest(q) => q.parameter_json().err().map(|e| e.reason()),
             _ => None,
         }
     }
@@ -288,6 +447,16 @@ impl MotionMessage<'_> {
             MotionMessage::Imu(_) => MessageKind::Imu,
             MotionMessage::JointState(_) => MessageKind::JointState,
             MotionMessage::JointTrajectory(_) => MessageKind::JointTrajectory,
+            MotionMessage::UnitreeGoLowCmd(_) => MessageKind::UnitreeGoLowCmd,
+            MotionMessage::UnitreeGoLowState(_) => MessageKind::UnitreeGoLowState,
+            MotionMessage::UnitreeGoSportModeState(_) => MessageKind::UnitreeGoSportModeState,
+            MotionMessage::UnitreeHgLowCmd(_) => MessageKind::UnitreeHgLowCmd,
+            MotionMessage::UnitreeHgLowState(_) => MessageKind::UnitreeHgLowState,
+            MotionMessage::UnitreeHgHandCmd(_) => MessageKind::UnitreeHgHandCmd,
+            MotionMessage::UnitreeHgHandState(_) => MessageKind::UnitreeHgHandState,
+            MotionMessage::UnitreeHgImuState(_) => MessageKind::UnitreeHgImuState,
+            MotionMessage::UnitreeHgDoubleImuState(_) => MessageKind::UnitreeHgDoubleImuState,
+            MotionMessage::UnitreeApiRequest(_) => MessageKind::UnitreeApiRequest,
         }
     }
 }
@@ -354,12 +523,12 @@ impl Decoded<'_> {
     }
 }
 
-/// Decodes one serialized payload (encapsulation header included) as `kind`.
-pub fn decode_payload<'a>(
-    kind: MessageKind,
+/// Checks the payload cap, parses the encapsulation header and positions a
+/// reader at the CDR body.
+pub(crate) fn open_reader<'a>(
     payload: &'a [u8],
     limits: &Limits,
-) -> Result<Decoded<'a>, DecodeError> {
+) -> Result<(Encapsulation, Reader<'a>), DecodeError> {
     if payload.len() > limits.max_payload_len {
         return Err(DecodeError::PayloadTooLarge {
             len: payload.len(),
@@ -372,7 +541,17 @@ pub fn decode_payload<'a>(
         (Some(e), Some(v)) if !rep.is_parameter_list() => (e, v),
         _ => return Err(DecodeError::UnsupportedRepresentation(rep)),
     };
-    let mut r = Reader::new(body, endian, version, rep.is_delimited(), *limits);
+    let r = Reader::new(body, endian, version, rep.is_delimited(), *limits);
+    Ok((encapsulation, r))
+}
+
+/// Decodes one serialized payload (encapsulation header included) as `kind`.
+pub fn decode_payload<'a>(
+    kind: MessageKind,
+    payload: &'a [u8],
+    limits: &Limits,
+) -> Result<Decoded<'a>, DecodeError> {
+    let (encapsulation, mut r) = open_reader(payload, limits)?;
     let message = match kind {
         MessageKind::Twist => MotionMessage::Twist(Twist::read(&mut r)?),
         MessageKind::TwistStamped => MotionMessage::TwistStamped(TwistStamped::read(&mut r)?),
@@ -381,6 +560,12 @@ pub fn decode_payload<'a>(
         MessageKind::JointState => MotionMessage::JointState(JointState::read(&mut r)?),
         MessageKind::JointTrajectory => {
             MotionMessage::JointTrajectory(JointTrajectory::read(&mut r)?)
+        }
+        other => {
+            // Every remaining kind is a Unitree motion kind.
+            let k = other.unitree_kind().ok_or(DecodeError::UnknownType)?;
+            let m = unitree::read_message(k, &mut r)?;
+            MotionMessage::from_unitree(m).ok_or(DecodeError::UnknownType)?
         }
     };
     Ok(Decoded {
