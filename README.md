@@ -127,6 +127,8 @@ rules/robodr/           Robot detection rules in Pulsar rules-engine TOML format
 config/                 Profile, response-policy and daemon config examples.
 docs/ROADMAP.md         The engineering plan: phases, components, research.
 docs/SPRINTS.md         The roadmap broken into sprints, with status.
+docs/SECURE-DELIVERY.md Design (not implemented): air-gapped fleet distribution,
+                        staged updates, captured-unit software protection.
 docs/BUILD.md           Toolchain, MSRV, Cargo.lock policy, air-gapped builds, CI.
 docs/PULSAR-INTEGRATION.md  Every Pulsar item the Pulsar-bound crates use.
 docs/contracts/         robot-edr.findings topic contract + JSON Schema.
