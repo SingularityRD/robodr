@@ -116,8 +116,9 @@ All seeds are SYNTHETIC (no real robot data):
   `max_segment_bytes = 4096` (one seal frame over; see
   `crates/robodr-blackbox/README.md`, "Segment size"). It still verifies and
   is kept as a seed for exactly that shape.
-* `ocsf_parse_and_validate/`: `docs/contracts/robot-edr-finding.example.json`
-  (pretty and minified).
+* `ocsf_parse_and_validate/`: `docs/contracts/robodr-finding.example.json`
+  (pretty and minified; contract 2.0), plus the superseded contract 1.1
+  example as `seed-finding-legacy-1.1.*` (parse-only path).
 * `events_profile/`: `config/profile.example.json`,
   `crates/robodr-agent/examples/ugv-demo.profile.json`.
 * `commission_profile_file/`, `commission_signoff/`: a draft, its sealed

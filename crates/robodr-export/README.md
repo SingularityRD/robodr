@@ -1,7 +1,8 @@
 # robodr-export
 
-The two hops of the `robot-edr.findings` path that nothing else moved
-(contract: `docs/contracts/robot-edr.findings.md`, §2, §4, §8 and §8.1):
+The two hops of the findings path that nothing else moved (contract
+`robodr.findings`: `docs/contracts/robodr.findings.md`, §2, §4, §8 and
+§8.1):
 
 ```
  robot (air-gapped)                                                   SOC
@@ -43,7 +44,8 @@ half-finished batch).
 
 1. List `ready/` (only `<20 digits>.json` regular files), in name order.
    Parse each as agentd's `SpoolRecord`; check `schema`, `seq` (= file
-   name), `topic`, `key` (= finding id) and re-validate the value with
+   name), `topic` (= the value's `ocsf.metadata.log_name`), `key` (= finding
+   id) and re-validate the value with
    `robodr_ocsf::parse_and_validate`. A failing record is **moved** to
    `<spool>/rejected/` (with `<name>.reason.json`), never deleted.
 2. Cut the batch exactly as the packer's planner would (data bytes and
@@ -81,7 +83,7 @@ finding exactly once; the split-pack cases are in
 ```
 robodr-kafka-publish --bootstrap kafka-1:9092 [--bootstrap kafka-2:9092] \
   --state-dir /var/lib/robodr/publish (--diode-out /srv/diode/out | --spool /srv/site/spool) \
-  [--topic robot-edr.findings] [--chunk 500] [--client-id S] [--request-timeout-ms N] \
+  [--topic robodr.findings] [--chunk 500] [--client-id S] [--request-timeout-ms N] \
   [--produce-timeout-ms N] [--delivery-timeout-ms N] [--retries N] [--max-request-bytes N] [--interval-ms 2000] [--once]
 ```
 
@@ -92,8 +94,12 @@ robodr-kafka-publish --bootstrap kafka-1:9092 [--bootstrap kafka-2:9092] \
   a connected site's agentd.
 * **Validation.** The value is re-validated (`parse_and_validate`); key and
   headers must equal what `robodr_ocsf::record` derives from the value
-  (contract §2: the value is authoritative), the topic must be the
-  configured one. The **bytes on disk** are what is sent as the value.
+  (contract §2: the value is authoritative), and so must the record's
+  `topic` (the value's `ocsf.metadata.log_name`). Contract 1.x values are
+  refused (parse-only). Records go to the configured `--topic` (default
+  `robodr.findings`) whatever topic their producer named; those are counted
+  in `topic_overridden`. The **bytes on disk** are what is sent as the
+  value.
   A per-finding signature header `robodr-finding-sig` (contract §2a, agentd
   `finding_signing`) is the one exception: it must be the last header, is
   shape-checked (`FindingSignature::from_header_value`) and forwarded

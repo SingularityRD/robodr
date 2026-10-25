@@ -1,9 +1,9 @@
 # robodr-diode
 
-One-way export of RoboDR findings (`robot-edr.findings`, see
-`docs/contracts/robot-edr.findings.md` §8) and black-box evidence bundles from
-an air-gapped robot or site console to the SOC (AutoSecOps), across a data
-diode or on controlled removable media.
+One-way export of RoboDR findings (`robodr.findings` contract, see
+`docs/contracts/robodr.findings.md` §8) and black-box evidence bundles from
+an air-gapped robot or site console to the SOC, across a data diode or on
+controlled removable media.
 
 ```
  low side (air-gapped)                         high side (SOC)
@@ -35,7 +35,8 @@ One directory per batch, named `rdd_<unit_id>_<seq as 16 digits>`:
 | `MANIFEST.sig` | `{format, algorithm, key_id, sig}` (hex signature) |
 
 Manifest fields: `format`, `contract_version` (findings contract, must be
-`1.y.z`), `unit_id`, `batch_seq` (1-based, per unit), `prev_batch_hash`
+the major `robodr-ocsf` emits, `2.y.z`; a 1.x batch is quarantined as
+`manifest_invalid`: 1.x findings are parse-only), `unit_id`, `batch_seq` (1-based, per unit), `prev_batch_hash`
 (absent only for seq 1), `created_at` / `created_at_ms`, `key_id`,
 `algorithm`, `finding_count`, `first_time` / `last_time` (min/max
 `ocsf.time`), `files[] = {name, kind: findings|blackbox_bundle|parity, size, sha256}` (data

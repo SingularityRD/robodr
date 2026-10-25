@@ -903,24 +903,27 @@ instead; contract §8), so diode-side consumers must verify in `Optional`
 mode.
 
 **Control-plane API (`control_plane`, optional, off by default).** Lets a
-SOC (AutoSecOps) *request* one of six actions on this robot
-(`restrict_motion`, `quarantine_node`, `isolate_network`, `safe_pause`,
-`request_safe_state`, `rollback_config`; contract
-`docs/contracts/robot-edr.control-plane.md`). agentd judges each request
+SOC *request* one of the seven catalog actions on this robot
+(`restrict_motion`, `quarantine_node`, `isolate_network`,
+`record_evidence`, `safe_pause`, `request_safe_state`, `rollback_config`;
+contract `docs/contracts/robodr.control-plane.md`). agentd judges each request
 against the safety state at that moment and the response policy, records it
 in the black box and answers. **Nothing is executed in this release:** an
 accepted request is answered `recorded_not_executed`, a refused one
 `refused` with a reason (always while the e-stop or safe state is active,
-and for everything while the policy is not OEM-validated). Set it up:
+for everything while the policy is not OEM-validated, and for `safe_pause` /
+`request_safe_state` when the response policy's `morphology` is
+`humanoid`: de-energising a humanoid makes it fall). Set it up:
 
 ```sh
 # On the SOC side, once: the SOC signing key (keep the secret there).
-robodr-blackbox keygen --out soc-autosecops.key --key-id soc:autosecops:1
-# Carry soc-autosecops.key.pub to every robot (vetted media):
-sudo install -D -o root -g root -m 0644 soc-autosecops.key.pub /etc/robodr/soc/autosecops.pub
+# Name the key after the SOC instance: soc:<id>:<n>, e.g. soc:soc-a:1.
+robodr-blackbox keygen --out soc-a.key --key-id soc:soc-a:1
+# Carry soc-a.key.pub to every robot (vetted media):
+sudo install -D -o root -g root -m 0644 soc-a.key.pub /etc/robodr/soc/soc.pub
 # agentd.json (socket under agentd's RuntimeDirectory; TCP stays on loopback):
 #   "control_plane": { "unix_socket": "/run/robodr-agentd/control.sock",
-#                      "soc_keys": ["/etc/robodr/soc/autosecops.pub"] }
+#                      "soc_keys": ["/etc/robodr/soc/soc.pub"] }
 sudo robodr-agentd --config /etc/robodr/agentd.json --check-config
 sudo systemctl restart robodr-agentd
 ```
@@ -1270,7 +1273,7 @@ sudo -u robodr robodr-spool-export --spool /var/lib/robodr/spool/agentd \
 
 # SOC side (high side), after robodr-diode-unpack has imported the batches:
 robodr-kafka-publish --bootstrap kafka1:9092 --state-dir /var/lib/robodr-soc/publish \
-    --diode-out /var/lib/robodr-soc/import/out [--once]
+    --diode-out /var/lib/robodr-soc/import/out [--topic robodr.findings] [--once]
 # A connected site publishes straight from a spool copy instead: --spool DIR
 ```
 
@@ -1283,7 +1286,10 @@ Invalid records go to `<spool>/rejected/` with a reason file, never deleted.
 Without `--once` it loops every `--interval-ms` (default 5000).
 
 `robodr-kafka-publish` re-validates every record, re-derives key, headers
-and partition from the value (contract §2, §4), sends with `acks=all`, and
+and partition from the value (contract §2, §4), publishes to `--topic`
+(default `robodr.findings`; findings name the topic agentd was configured
+with, `findings.topic`, and records relabelled to `--topic` are counted),
+refuses contract 1.x records (parse-only), sends with `acks=all`, and
 persists per-batch progress after each acknowledged chunk; invalid or
 broker-rejected records go to a dead-letter file. **No TLS / SASL** and
 **idempotence off** (at-least-once: consumers drop duplicates on
@@ -1319,7 +1325,8 @@ means the bootstrap address (or an advertised listener) is a TLS or SASL
 listener; this client speaks PLAINTEXT only (use a PLAINTEXT listener or a
 local TLS proxy). `UNKNOWN_TOPIC_OR_PARTITION`: the topic does not exist
 (it is never auto-created). `TOPIC_AUTHORIZATION_FAILED`: grant WRITE and
-DESCRIBE on `robot-edr.findings` to the publisher's principal.
+DESCRIBE on the findings topic (default `robodr.findings`) to the
+publisher's principal.
 
 ### 8.4 Journal
 

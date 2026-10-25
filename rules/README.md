@@ -33,9 +33,9 @@ Everything below was checked against the vendored Pulsar at rev `4796504`
   `command_and_control`, `credential_access`, `defense_evasion`, `discovery`,
   `execution`, `exfiltration`, `generic`, `impact`, `initial_access`,
   `lateral_movement`, `persistence`, `privilege_escalation`, `reconnaissance`
-  or `resource_development`. There is **no** `robotics` category. To let the
-  AutoSecOps bridge map our threats to its `robotics` category, every rule name
-  here starts with **`RoboDR: `**. The threat event carries the rule name as its
+  or `resource_development`. There is **no** `robotics` category. So that a
+  SOC (or agentd's `host_threats` input) can recognise robot threats, every
+  rule name here starts with **`RoboDR: `**. The threat event carries the rule name as its
   description (`engine.rs:97-104`).
 * **`severity`** must be `low`, `medium`, `high` or `critical`.
 * **One bad rule disables everything.** If any rule fails to parse or compile,

@@ -1,8 +1,9 @@
 //! Self-health: turn input counters, queue latency, spool and black-box
 //! state into a robot **state** and into health deviations.
 //!
-//! Design rule (design document, "Kara kutu ve öz koruma"): when the agent
-//! is blind its robot is **Unknown**, never OK. [`HealthState`] is therefore
+//! Design rule (black box and self-protection): when the agent is blind its
+//! robot is **Unknown**, never OK: a monitor that cannot see must not
+//! report all clear. [`HealthState`] is therefore
 //! `ok` only when every input has delivered **valid** data within
 //! `silence_ms`, none has ended, the pipeline is not lagging and nothing was
 //! lost since the last evaluation. Before an input has delivered anything
