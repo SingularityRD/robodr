@@ -398,6 +398,23 @@ RTOS/drones.
 already tags timestamps with their time source (`robodr-blackbox` `time`
 module), and `robodr-diode` (one-way export, Sprint 14) is in progress.
 
+**Status as of 2026-10-26 — Sprint 13a: pure logic done** (formats and
+release signing, [`SECURE-DELIVERY.md`](SECURE-DELIVERY.md) §3, §3.5,
+§10). `robodr-pkg` (pure parsers and validators for RPK, bundle,
+deployment, trust file and quorum signature sets) and `robodr-release`
+(`build rpk`, `build bundle` with Reed-Solomon parity through
+`robodr-diode`'s code, `sign`, `verify`, `repair`). The exit criteria are
+demonstrated by tests, offline, on synthetic payloads in temporary
+directories: a bundle built and signed in one tree verifies in another
+that holds only the bundle, the trust file and the pinned root
+fingerprints (`crates/robodr-release/tests/cross_host.rs`, through the
+binary); every single-byte change of `bundle.json` and `MANIFEST.json`,
+missing signatures, a wrong quorum, revoked keys, chain gaps, replays,
+equivocations and the review's forgery attempts are refused
+(`tests/forgery.rs`); five `pkg_*` libFuzzer targets with std-only smoke
+runs (`fuzz/README.md`). Not done: 13b (unit agent), 13c (sealing), the
+entry-station scan, any run on a real site or robot.
+
 ---
 
 ## Phase 4 — AI-robot security + the frontier lab (Sprints 18–21)

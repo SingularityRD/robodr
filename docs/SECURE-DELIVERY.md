@@ -1,11 +1,18 @@
 # Secure delivery: air-gapped fleet distribution, updates and captured-unit protection
 
-> **Status: design only. Nothing in this document is implemented.** It
-> expands ROADMAP Phase 3 ("Air-gapped deployment") and splits the one-line
-> Sprint 13 / Sprint 14 items in `docs/SPRINTS.md` with a buildable plan. Every
-> component named here that does not already exist is marked `[ ]`, using the
-> legend of ROADMAP §2. Where this design reuses existing code, the crate and
-> file are named so the reuse can be checked.
+> **Status: design; Sprint 13a implemented** (2026-10-26). The formats of
+> §3 and release signing exist as `robodr-pkg` (pure parsers and
+> validators) and `robodr-release` (build, sign, verify, repair), with the
+> decisions of §3.5; the 13a exit criteria are demonstrated by tests
+> (§10). Verified offline only: on synthetic payloads in temporary
+> directories, never on an air-gapped site, an entry station or a robot.
+> **Everything else in this document (13b onward) is not implemented.**
+> It expands ROADMAP Phase 3 ("Air-gapped deployment") and splits the
+> one-line Sprint 13 / Sprint 14 items in `docs/SPRINTS.md` with a
+> buildable plan. Every component named here that does not already exist
+> is marked `[ ]`, using the legend of ROADMAP §2. Where this design
+> reuses existing code, the crate and file are named so the reuse can be
+> checked.
 
 RoboDR today can install **itself** on an air-gapped robot
 (`packaging/make-bundle.sh`, `packaging/install-bundle.sh`: minisign-signed
@@ -136,9 +143,9 @@ both directions.
 
 | Component | Kind | Role |
 |---|---|---|
-| `robodr-pkg` `[ ]` | pure library | RPK and bundle formats (§3): parse, validate, verify, hash. No I/O beyond reading bytes it is given. Fuzzed like `robodr-rtps`. |
+| `robodr-pkg` `[P]` | pure library | RPK, bundle, deployment and trust-file formats (§3): parse, validate, verify, hash. No I/O beyond reading bytes it is given. Fuzzed like `robodr-rtps`. Sprint 13a. |
 | `robodr-seal` `[ ]` | library | Key wrapping, payload encryption, TPM sealing via `tpm2-tools` (same approach as `robodr-blackbox/src/tpm_anchor.rs`), software fallback (§7). |
-| `robodr-release` `[ ]` | CLI, connected side | Build RPKs from `.deb` / OCI / files / models, encrypt, sign (quorum), assemble bundles, add Reed-Solomon parity. |
+| `robodr-release` `[P]` | CLI, connected side | Build RPKs from `.deb` / OCI / files / models, encrypt, sign (quorum), assemble bundles, add Reed-Solomon parity. Sprint 13a: builds every kind from a payload directory (kind shape and SBOM checked; a `.deb` or OCI archive is carried as a file, not inspected), quorum signing, chained bundles, parity, verify, repair; no encryption (13c). |
 | `robodr-depot` `[ ]` | service, site | Single-box control plane: import bundles, inventory, deployments and rings, per-unit key wrapping, serve units, lease server. This is the air-gapped instance of the planned `robodr-fleet` (ROADMAP §2) and the "single-box control plane" of Sprint 14. |
 | `robodr-deliverd` `[ ]` | service, unit | The on-unit agent: reconcile desired vs installed, verify, stage, gate on safety state, install, health-check, roll back, report. Runs separately from `robodr-agentd` so a delivery bug cannot stop detection. |
 
@@ -241,6 +248,152 @@ protected (the `robodr-commission` model, generalised):
 Revocation lists revoke release, depot and operator keys by public-key
 fingerprint and RPKs by digest, exactly as `robodr-profile-revocations/v2`
 does for profiles.
+
+### 3.5 Format decisions (Sprint 13a)
+
+Where §3.1–§3.4 (and §5.2 for deployments) left room, 13a took the
+stricter reading. The exact rules are in the `robodr-pkg` module docs;
+this is the list of decisions a reviewer should check against the design.
+
+**Every document**
+
+1. **One encoding per value.** A document is signed and hashed over its
+   raw bytes (as in `robodr-diode`) and is accepted only if those bytes
+   are exactly the compact serialisation of the parsed value: members in
+   the documented order, no whitespace, optional members present as
+   `null`, set-valued lists sorted without duplicates. Unknown members,
+   duplicate keys, alternative number or string encodings, a BOM or a
+   trailing newline are refused before any signature is looked at, so a
+   depot written later in another language cannot disagree with this
+   crate about what was signed.
+2. **Hard caps before parsing** (RPK manifest 8 MiB, `bundle.json`
+   32 MiB, trust file and deployment 1 MiB, signature file 8 KiB) and on
+   every list. Every integer (serials, sequence numbers, times) is at most
+   `2^53 - 1`.
+3. **Detached signature sets** (`robodr-sigset/1`, file `MANIFEST.sig`,
+   `bundle.sig` or `<file>.sig`): Ed25519 only (strict verification),
+   1–16 entries sorted by key id. **Every entry must be valid** (listed
+   key, role allowed for this document, not revoked, verifies); one bad
+   entry refuses the document. Signers are counted **by public-key
+   fingerprint**, so two entries by one key never make a quorum of two.
+4. **A signing domain per document type**: `robodr-pkg/manifest/v1\0`
+   (given in §3.1), `robodr-bundle/manifest/v1\0`,
+   `robodr-deployment/v1\0`, `robodr-delivery-trust/v1\0`, and separate
+   digest domains for each. Digests are bare lower-case hex; key
+   fingerprints are `sha256:<hex>` of the raw public key, the value
+   `robodr-commission` already prints and revokes.
+5. **Refusals have stable codes** (`robodr_pkg::Code`), the reasons the
+   §9 findings will carry.
+
+**RPK (`robodr-pkg/1`)**
+
+6. `version` is `{"serial": N, "display": "..."}`. The directory name is
+   `rpk_<name>_<serial>_<arch>` (serial, not the display string, so it
+   is unambiguous); package names exclude `_`. `arch` is `amd64`,
+   `arm64` or `all`.
+7. Chunking is per content file (4 MiB, last short, none for an empty
+   file); `chunks[]` lists each distinct chunk once, sorted by hash, and
+   content files name their chunks by index. Every chunk must be used.
+8. Content paths: relative, `/`-separated components of
+   `[A-Za-z0-9_][A-Za-z0-9._+-]*` (no `.`/`..`, no hidden file, nothing
+   that reads as an option), at most 16 deep and 255 bytes, unique **also
+   case-insensitively**, and no path both a file and a directory.
+9. Modes: permission bits only (no setuid, setgid, sticky), owner
+   readable, **no group or other write**; data-only kinds (`model`,
+   `config`, `robodr-profile`, `robodr-rules`) have no executable bit.
+   The builder refuses such payloads; it never normalises them.
+10. `security_floor` is `1..=serial` (a release cannot forbid itself).
+    `requires` / `conflicts` are name + minimum serial, never the
+    package itself, never the same name in both.
+11. `sbom` is the SHA-256 of exactly one non-empty content file named
+    `*.cdx.json` (the builder checks it is CycloneDX JSON); mandatory for
+    `deb`, `oci-image`, `os-image`.
+12. Content shape per kind (the SBOM aside): `deb` one `.deb`;
+    `oci-image` one `.tar`; `os-image` one file; `robodr-profile` one
+    `.json`; `robodr-rules` only `.toml`; other kinds at least one file.
+13. `install` is exactly `{allow_maintainer_scripts, requires_operator_present}`;
+    maintainer scripts only for `deb`. `health` is a closed set of checks
+    (`service_active`, `file_present`, `ros2_node`, `probe` with an argv
+    whose first element is absolute, a non-root user and a 1–300 s
+    timeout); unknown members inside a check are refused.
+14. `expires_at` is Unix seconds; an RPK is refused at and after it.
+15. `confidentiality: "sealed"` is refused (`unsupported`) until 13c
+    defines the key-wrap members.
+
+**Bundle (`robodr-bundle/1`)**
+
+16. `bundle.json` lists every RPK (`dir`, `name`, `serial`, `arch`,
+    `digest`) and **every file of the tree** with size and SHA-256 (a
+    signed `SHA256SUMS`). File paths follow a fixed grammar
+    (`<rpk dir>/MANIFEST.json`, `<rpk dir>/MANIFEST.sig`,
+    `<rpk dir>/chunks/<sha256>`, `parity/g<gggg>-p<jj>.rbpar`); a chunk's
+    name must be its hash. Traversal is not expressible. The verifier
+    refuses any file or directory not implied by the listing, any
+    symlink and any special file.
+17. One serial per package and arch per bundle; no RPK twice.
+18. The bundle must name a `programme` the site's trust file lists.
+19. Chain: from a head `h`, `bundle_seq == h + 1` with
+    `prev_bundle_hash == hash(h)` is next; a higher number is a **gap**;
+    a lower one a **replay**; the same number with other bytes an
+    **equivocation**; the right number with another link a **broken
+    chain**; the same bytes again is accepted as a no-op. With no head, a
+    verifier must say so explicitly (`--genesis`: only bundle 1 is
+    accepted) or name the head (`--after SEQ:HASH`); there is no default.
+    The chain state also records the version and digest of the trust file
+    the head was accepted under: the trust file crosses the gap like a
+    bundle, so an older root-signed trust file (one from before a key
+    revocation) is refused as a replay, and the same version with other
+    content as an equivocation (found in the 13a self-review). Without a
+    state (`--genesis`, `--after`) that check is the operator's.
+20. Parity (`rs-gf256-0x11d/1`, `robodr-diode`'s code and parity-length
+    rule): the data files (every non-parity entry, in path order) form
+    groups of `k`; each group carries `m` parity files (1–32,
+    `k + m <= 255`). Up to `m` missing or damaged files per group are
+    rebuilt; a rebuilt file is accepted only if its listed hash matches,
+    and only after `bundle.json` itself is authenticated.
+
+**Trust file (`robodr-delivery-trust/1`)**
+
+21. Members: `site`, `version`, `issued_at` (informational),
+    `programmes`, `quorum {root, release, operator_prod, operator_lab}`,
+    `roots`, `release_keys`, `depot_keys`, `operator_keys`,
+    `revoked_keys` (fingerprints), `revoked_rpks` (digests), `floors`.
+22. **Roles are disjoint**: one fingerprint and one key id appear at most
+    once in the whole file.
+23. Quorum floors: `root >= 2`, `release >= 2`, `operator_prod >= 2`,
+    `1 <= operator_lab <= operator_prod`; root and release quorums must be
+    reachable with non-revoked keys. The depot quorum is fixed at 1.
+24. A revoked key may stay listed (refusals then say `revoked_key`) but
+    never counts; a root cannot be revoked by the file it signs.
+25. Standalone acceptance: the file's roots must be **exactly** the
+    pinned root fingerprints and the root quorum must have signed.
+    Rotation (TUF-style): a higher version for the same site, signed by
+    the root quorum of the accepted file **and** of the new one;
+    revocations and floors only grow; an older version is a replay, the
+    same version with other bytes an equivocation.
+
+**Deployment (`robodr-deployment/1`)**
+
+26. Signed by depot and operator keys only; at least one depot
+    signature. §3.4 says "1 for `lab`", §5.3 reads as if the depot alone
+    may push to `lab` and `canary`: the stricter reading is taken, so
+    `lab` and `canary` need `operator_lab` (>= 1) operators and
+    `ring-<n>` (`n` in 1–99, the production rings) `operator_prod`
+    (>= 2). A compromised depot alone can push nowhere.
+27. `not_before < expires_at`, at most 366 days apart; valid for
+    `not_before <= now < expires_at`. Items must not be revoked or below a
+    floor. `deployment_seq` must increase (replay, equivocation); a gap is
+    normal for one unit, which only sees deployments that target it, so
+    gaps are not reported for deployments (bundles only).
+28. `wrapped_keys` is present and must be empty until 13c.
+
+**Release tool**
+
+29. `sign` checks before it signs: the document parses and, for an RPK or
+    a bundle, the files on disk are exactly what it describes (every
+    hash). `build bundle` copies the signed RPKs and verifies the
+    **copies** (release quorum, site policy, every hash) before listing
+    them. Builds are deterministic: no times or host paths in an RPK.
 
 ---
 
@@ -607,7 +760,7 @@ nothing else renumbers.
 
 | Sprint | Deliverable (demo) | Exit criteria |
 |---|---|---|
-| **13a — Formats and release signing** | `robodr-pkg` (RPK, bundle, deployment, trust file parsers, pure, fuzzed); `robodr-release build/sign/verify` with 2-of-N quorum; parity via `robodr-diode` fec. | A bundle built on one host verifies on another; every manifest mutation, missing signature, wrong quorum, revoked key and chain gap is refused in tests; fuzz targets in `fuzz/`. |
+| **13a — Formats and release signing** (implemented, see below) | `robodr-pkg` (RPK, bundle, deployment, trust file parsers, pure, fuzzed); `robodr-release build/sign/verify` with 2-of-N quorum; parity via `robodr-diode` fec. | A bundle built on one host verifies on another; every manifest mutation, missing signature, wrong quorum, revoked key and chain gap is refused in tests; fuzz targets in `fuzz/`. |
 | **13b — Unit agent, local** | `robodr-deliverd` installing `files`, `config`, `deb`, `robodr-rules` from a per-unit media pack; store; health gate; auto-rollback; floors in a state file; safety-state gate, tested with recorded JSONL safety reports replayed into agentd's live `safety_feed` socket (a small replay helper is new work). | Demo: bad release auto-rolls back; downgrade below floor refused; install deferred while the replayed safety state is `MovingSlow`. All recorded in the black box. |
 | **13c — Sealing** | `robodr-seal`: XChaCha20-Poly1305 chunks; `UWK` in TPM via `tpm2-tools`; signed PCR policy; erase epoch; LUKS2 runtime volume; Clevis/Tang fallback. Tested against `swtpm`, like `TpmNvCounterAnchor`. | Disk image of an enrolled (swtpm) unit yields no plaintext; changed PCR → unseal refused; epoch increment → every sealed key dead; fallback unit cannot unlock without Tang. |
 | **14a — Depot and rollout** | `robodr-depot`: import with entry report, inventory, enrolment with credential activation, deployments with operator quorum, rings, per-unit re-wrapping, LAN serving (mTLS), media packs, halt-on-failure. | Demo on ≥ 3 units (VMs with swtpm acceptable): staged rollout lab → canary → ring-1; injected failing release halts at canary; captured-unit VM cannot decrypt a model assigned only to another unit. |
@@ -615,6 +768,48 @@ nothing else renumbers.
 | **14c — OS A/B and hardware** | `os-image` kind with one A/B updater (decision §11); first run on real TPM hardware (not swtpm) and a real robot computer. | A/B OS update with forced boot failure falls back; sealing survives an authorised OS update (new signed policy) and fails for an unauthorised one. |
 
 Each sub-sprint ends, as `docs/SPRINTS.md` requires, in a demo that runs.
+
+**13a status (2026-10-26): implemented; exit criteria demonstrated by
+tests, offline.** `crates/robodr-pkg` (pure, `#![forbid(unsafe_code)]`, no
+panicking calls outside tests) and `crates/robodr-release` (binary
+`robodr-release`), with the decisions of §3.5. What runs:
+
+| Exit criterion | Demonstrated by |
+|---|---|
+| A bundle built on one host verifies on another | `robodr-release/tests/cross_host.rs`: through the binary, keys generated, trust file root-signed, a 9 MiB RPK (three chunks + SBOM) built and signed by two release keys, a bundle with parity built and signed by two others; only the bundle directory and the trust file are copied to a second tree, which verifies with the pinned root fingerprints and nothing else, commits its chain head, accepts bundle 2, refuses the replay of 1 and the gap to 3, and repairs a deleted chunk from parity. A third tree rebuilds the RPK and gets identical `MANIFEST.json` bytes. |
+| Every manifest mutation is refused | `tests/forgery.rs`: every single-byte change (four XOR masks per byte), every truncation and an extension of `bundle.json` and of an RPK's `MANIFEST.json`; byte flips and truncation of every file of the tree on disk. |
+| Missing signature, wrong quorum | no `bundle.sig`, an empty set, one release signature, no `MANIFEST.sig`, an unsigned or once-signed RPK, a site with release quorum 3. |
+| Revoked key | the bundle's signer revoked by fingerprint (`revoked_key`), and removed from the role (`unknown_key`); revoked RPK digest; site floor above the serial. |
+| Chain gap | gap, replay, equivocation, broken link, genesis with bundle 2, a bundle of another programme. |
+
+The self-review found one gap in the first implementation and closed it:
+an older, root-signed trust file carried in next to a bundle signed by a
+since-revoked key verified under pinned roots; the chain state now pins
+the trust file version (§3.5, item 19; `an_older_trust_file_cannot_reopen_a_revoked_key`).
+It also bounded directory listings of untrusted media before reading
+them whole, and made `keygen` refuse key ids the formats would refuse.
+Also tried in the self-review and refused in tests: duplicate signatures
+by one key (same id, or the same key under a second id: the trust file
+refuses the alias); reordered signature entries, files or RPKs (even
+re-signed by the quorum); a swapped chunk, `MANIFEST.json`,
+`MANIFEST.sig` or whole RPK directory (also another validly signed RPK of
+the same name and serial), an extra RPK; key confusion (a bundle signed
+by depot and operator keys or by roots, an RPK-domain signature or a real
+`MANIFEST.sig` used as `bundle.sig`, a trust file signed by release keys,
+a key in two roles, an HMAC key); traversal paths in a quorum-signed
+`bundle.json`, stray files and directories, symlinked chunks,
+directories and `bundle.json`, oversized signature files and manifests,
+over-long key ids, symlinks / hidden names / setuid modes in a payload;
+repair through a symlinked directory, from a forged `bundle.json`, or
+with more than `m` damaged files per group. Deployments (format,
+depot + operator quorum by ring, freshness, replay) and trust rotation
+are unit-tested in `robodr-pkg`. Fuzzing: `pkg_rpk`, `pkg_bundle`,
+`pkg_deployment`, `pkg_trust`, `pkg_parity` (results in
+`fuzz/README.md`).
+
+Not in 13a: sealed RPKs and wrapped keys (13c), the entry-station scan
+and signed entry report (§6.1), anything on a unit (13b) or a depot (14a).
+Signing keys are files on the signing station, not HSM-held.
 
 ---
 
@@ -649,8 +844,12 @@ only after they run.
 - Parsers (`robodr-pkg`): unit tests with hostile inputs, `cargo-fuzz` targets
   in `fuzz/`, and std-only fuzz smoke runs in the crate tests, as
   `robodr-blackbox`, `robodr-commission`, `robodr-ocsf` and `robodr-rtps` do.
-  (`robodr-diode`, whose fec code is reused, has no fuzz target yet; adding
-  one is part of 13a.)
+  (This sentence used to say `robodr-diode`, whose fec code is reused, had
+  no fuzz target. That was out of date when 13a started: `diode_fec`,
+  `diode_manifest` and `diode_import` exist since S10, `diode_fec`
+  checking the encoder and erasure decoder against an independent oracle.
+  13a re-ran `diode_fec` under libFuzzer and added `pkg_parity` for the
+  bundle-parity use of the code; see `fuzz/README.md`.)
 - Sealing: integration tests against `swtpm`; a separate run on hardware TPMs
   before anything is called field-verified.
 - Red-team scenarios before 14c exit: image the disk of an enrolled unit;

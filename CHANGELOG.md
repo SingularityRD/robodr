@@ -160,6 +160,30 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Added
 
+- Secure delivery, Sprint 13a (formats and release signing,
+  `docs/SECURE-DELIVERY.md` §3, §3.5, §10):
+  - `robodr-pkg` (new, pure): strict parsers and validators for RPK
+    packages (`robodr-pkg/1`), release bundles (`robodr-bundle/1`),
+    deployments (`robodr-deployment/1`), the site delivery trust file
+    (`robodr-delivery-trust/1`) and detached signature sets
+    (`robodr-sigset/1`). One canonical encoding per document, size caps
+    before parsing, release / depot / operator / root roles kept disjoint,
+    quorum counted by key fingerprint, revocation by fingerprint and RPK
+    digest, floors, TUF-style root rotation, per-programme bundle chain
+    (gap, replay, equivocation, broken link refused), Reed-Solomon bundle
+    parity with `robodr-diode`'s code.
+  - `robodr-release` (new binary): `keygen`, `fingerprint`, `build rpk`
+    (deterministic), `build bundle` (verifies the copied RPKs, lists every
+    file, adds parity), `sign` (checks the document and its files before
+    adding a signature), `verify rpk|bundle|trust|deployment` (pinned
+    roots, explicit chain mode, exact tree, every hash) and `repair`
+    (rebuilds damaged files from parity after authenticating the bundle).
+  - Fuzzing: libFuzzer targets `pkg_rpk`, `pkg_bundle`, `pkg_deployment`,
+    `pkg_trust`, `pkg_parity` with std-only smoke runs in
+    `crates/robodr-pkg/tests/fuzz_smoke.rs`.
+  - Not in 13a: sealed (encrypted) RPKs and wrapped keys (13c), the unit
+    agent (13b), the depot (14a).
+
 - `robodr-firewall-gw`: new channels. `unitree_loco_request` (humanoid
   locomotion client: G1 / H2 / R1 on `rt/api/sport/request`, H1 on
   `rt/api/loco/request`): `SetVelocity` limited by the twist firewall and
