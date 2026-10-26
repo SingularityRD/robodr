@@ -1505,11 +1505,94 @@ disables verification.
 
 Retries: network errors, `429` and `5xx` are retried with the same batch
 (same batch id, new timestamp and signature), backing off exponentially and
-never sooner than `Retry-After`; after `--max-attempts` the run fails and
-the service retries later with the same batch. Batch ids are derived from
-the input position and the body, so a restart after a crash re-sends the
-same batch under the same id and the server answers from its replay store
-(no double processing).
+never sooner than `Retry-After` (honoured in full up to 24 h, also when it
+came with the last attempt of a run); after `--max-attempts` the run fails
+and the service retries later with the same batch. Batch ids are derived
+from the input position and the body, so a restart after a crash re-sends
+the same batch under the same id and the server answers from its replay
+store (no double processing).
+
+**One process per state directory.** The service holds
+`/var/lib/robodr/export/uplink/uplink.lock` while it runs (also between
+runs). A manual `robodr-uplink --once` or `robodr-uplink reinject` on the
+same state directory exits 1 ("held by another robodr-uplink"): stop the
+service first, run as user `robodr`
+(`sudo -u robodr robodr-uplink ...`), start it again.
+
+#### Is the queue moving? (status, blocked batch)
+
+Delivery is in order: a batch the server keeps refusing blocks **every**
+later finding of this robot until the cause is fixed. It is never silent:
+
+```bash
+systemctl status robodr-uplink          # STATUS= line: ok / retrying / blocked, error, backlog
+sudo cat /var/lib/robodr/export/uplink/uplink-status.json
+journalctl -u robodr-uplink -n 50       # one line per failed run
+```
+
+`uplink-status.json` (rewritten after every run): `state` (`ok`,
+`retrying` = transient failures, `blocked` = refused, needs a fix),
+`last_success_at_ms`, `last_delivery_at_ms`, `last_error` (`kind`,
+`status`, `code`, `message`, `retry_after_s`), `stuck_since_ms` (start of
+the failure streak; kept across restarts while the same batch is pending),
+`pending_batch_id`, `pending_lines`, `pending_failed_runs`, `backlog`
+(`spool_ready` records, or `diode_batches`; `reinject_generations`),
+`next_attempt_at_ms`, `dead_letter_malformed`, delivery totals. Times are
+ms since the epoch. **Monitor it**: alert when `state` is not `ok` for
+longer than your tolerance, or when `last_success_at_ms` is old (the
+service is not running at all). `--exit-when-stuck-s N` (in
+`ROBODR_UPLINK_ARGS`) additionally makes the unit exit 3 after `N` s of
+failures, so a unit-state monitor sees it; it is off by default because a
+fixed registration then resumes delivery without a restart.
+
+Backoff: after transient failures the next run waits up to
+`--backoff-max-ms` (60 s); after refusals and other failures that need a
+fix up to `--refused-backoff-max-s` (default 900 s), so a robot with an
+unregistered key causes under 200 `401` audit-log entries a day on the
+SOC, not ~1440. After the fix, delivery resumes at `next_attempt_at_ms`;
+`systemctl restart robodr-uplink` retries at once.
+
+Procedure for a blocked queue (`state: blocked`):
+
+1. Read `last_error.status` / `last_error.code` and act on the table
+   below (registration, NTP, CA/pin). Do **not** delete
+   `uplink-state.json` or move spool files: the pending batch would be
+   re-cut and, at best, reported as duplicates.
+2. `400`, `409`, `415`, a single-line `413` or a malformed `200` mean a
+   producer/server mismatch or bug: collect `uplink-status.json`, the
+   journal lines and the robodr / AutoSecOps versions, and escalate;
+   upgrading the side at fault unblocks the queue (the batch is re-sent
+   under its id).
+3. Confirm: `state` goes back to `ok`, `backlog` drains.
+
+#### Re-injecting dead letters after a fix
+
+Lines the server rejected for registration reasons (`unknown_robot`,
+`robot_mismatch`, `site_mismatch`, `missing_finding_signature`,
+`bad_finding_signature`) are dead-lettered and acknowledged; they do not
+come back by themselves. After fixing the registration:
+
+```bash
+sudo systemctl stop robodr-uplink
+cd /var/lib/robodr/export/uplink
+sudo -u robodr robodr-uplink reinject --state-dir . --spool /var/lib/robodr/spool/agentd \
+    $(ls dead-letter.jsonl* | sed 's/^/--dead-letter /') --dry-run     # check the counts
+sudo -u robodr robodr-uplink reinject --state-dir . --spool /var/lib/robodr/spool/agentd \
+    $(ls dead-letter.jsonl* | sed 's/^/--dead-letter /')
+sudo systemctl start robodr-uplink
+```
+
+(`--codes a,b` selects other codes; SOC side: `--diode-out` instead of
+`--spool`.) The records are sent again under **new** batch ids; running the
+command twice queues nothing new. A record rejected again shows up in the
+dead letters with `source: "reinject:<generation>"` and can be re-injected
+after the next fix. `unavailable` in the report lists records whose
+original and dead-letter copy are both gone.
+
+Dead letters: `dead-letter.jsonl` rotates at 64 MiB, keeping 4 rotated
+files (`--dead-letter-max-bytes`, `--dead-letter-keep`); a line torn by a
+power loss is closed and counted (`dead_letter_malformed`), never merged
+with the next entry.
 
 Troubleshooting (journal, `journalctl -u robodr-uplink`):
 
@@ -1521,7 +1604,9 @@ Troubleshooting (journal, `journalctl -u robodr-uplink`):
 | `invalid peer certificate: ... matches no configured pin` | the server key changed: verify out of band, then update `--spki-sha256` (list old and new during a rotation) |
 | `invalid peer certificate: UnknownIssuer` / `NotValidForName` | wrong CA bundle, or the URL host is not the name in the certificate |
 | `HTTP 400` / `409` / `415` | a producer bug: report it with the journal lines; nothing was acknowledged |
-| dead letters with `robot_mismatch` | the findings name another robot than the key is bound to (a sensor box watching several robots needs a `relay` key, or one uplink per robot) |
+| `... held by another robodr-uplink` | a second process on the same state directory: stop the service before `--once` / `reinject` |
+| dead letters with `robot_mismatch` | the findings name another robot than the key is bound to (a sensor box watching several robots needs a `relay` key, or one uplink per robot); then re-inject |
+| dead letters with `site_mismatch` | a site-scoped `relay` key sent a robot not registered with its site: fix the robot's site or the key's scope, then re-inject |
 | dead letters with code `local` | the record failed RoboDR's own validation before sending (see `reason`) |
 
 ## 9. Decommissioning

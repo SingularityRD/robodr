@@ -121,7 +121,14 @@ crates/
                           Kafka; std-only client, acks=all, idempotence off, no
                           TLS/SASL). Tested against an in-process fake broker
                           in CI and against single-node Apache Kafka 3.9.1 and
-                          4.1.0 brokers (scripts/kafka-it.sh, docker).
+                          4.1.0 brokers (scripts/kafka-it.sh, docker). And
+                          robodr-uplink: the same inputs -> the AutoSecOps
+                          ingest API (docs/contracts/robodr.ingest-api.md) over
+                          TLS (rustls + ring, CA bundle, SPKI pins), signed
+                          NDJSON batches, at-least-once and crash-safe;
+                          uplink-status.json + sd_notify STATUS= show a
+                          blocked queue; `reinject` re-queues dead letters
+                          after a registration fix.
   robodr-sensor-ros2/     Thin Pulsar module wrapping robodr-ros2-pipeline.
                           Pulsar-dependent: built, linted and tested against
                           vendor/pulsar in CI's `pulsar` job (needs Pulsar's

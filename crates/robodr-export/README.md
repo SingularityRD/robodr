@@ -152,8 +152,12 @@ robodr-uplink --url https://soc.example.org/api --key-file /etc/robodr/keys/upli
   --ca-bundle /etc/robodr/uplink-ca.pem [--spki-sha256 HEX ...] --state-dir /var/lib/robodr/export/uplink \
   (--spool /var/lib/robodr/spool/agentd | --diode-out /srv/diode/out) [--max-lines N] [--max-body-bytes N] \
   [--connect-timeout-ms N] [--request-timeout-ms N] [--max-attempts N] [--backoff-base-ms N] \
-  [--backoff-max-ms N] [--max-retry-after-s N] [--upgrade-data-source L] [--upgrade-topic T] \
-  [--interval-ms 2000] [--once]
+  [--backoff-max-ms N] [--refused-backoff-max-s 900] [--exit-when-stuck-s N] \
+  [--dead-letter-max-bytes 67108864] [--dead-letter-keep 4] [--upgrade-data-source L] \
+  [--upgrade-topic T] [--interval-ms 2000] [--once]
+robodr-uplink reinject --state-dir DIR (--spool DIR | --diode-out DIR) --dead-letter FILE [...] \
+  [--codes unknown_robot,robot_mismatch,site_mismatch,missing_finding_signature,bad_finding_signature] \
+  [--dry-run]
 ```
 
 The producer of the `robodr.ingest` HTTP API, contract v1
@@ -161,8 +165,9 @@ The producer of the `robodr.ingest` HTTP API, contract v1
 `POST {url}/robot-edr/v2/ingest`, NDJSON lines
 `{"value":"<finding, verbatim>","sig":null|{...}}`, signed per batch with
 an Ed25519 key file. Code: `src/uplink/` (`wire.rs` contract pieces,
-`http.rs` transport, `mod.rs` delivery), binary
-`src/bin/robodr-uplink.rs`.
+`http.rs` transport, `mod.rs` delivery, `service.rs` the loop and status,
+`reinject.rs` re-injection), `src/deadletter.rs` (dead-letter files, shared
+with `robodr-kafka-publish`), binary `src/bin/robodr-uplink.rs`.
 
 * **Input and validation** are `robodr-kafka-publish`'s (shared code in
   `publish.rs`: `check_record`, the spool and `records.jsonl` readers): the
@@ -208,15 +213,20 @@ an Ed25519 key file. Code: `src/uplink/` (`wire.rs` contract pieces,
    signature are fresh for every attempt, body and batch id never change.
    Retry network errors, `408`, `429` and `5xx` up to `--max-attempts` per
    run, waiting a random time in `[d/2, d]`, `d = min(max, base·2^(k-1))`,
-   but never less than `Retry-After` (delay-seconds, capped by
-   `--max-retry-after-s`).
+   but never less than `Retry-After` (delay-seconds, honoured in full up to
+   24 h; a larger value, or one too long for a `u64`, counts as 24 h —
+   contract §7). When the run's last attempt carried a `Retry-After`, the
+   run fails with it (`UplinkError::GaveUp { retry_after }`) and the
+   service waits at least that long before the next run.
 3. A `200` is accepted only if it names this batch id and accounts for every
    line exactly once (`accepted = created + updated + duplicates`,
    `accepted + rejected = lines`, lines in range, valid codes); otherwise
    nothing is acknowledged (`Protocol` error).
 4. Save the rejected lines into `pending.result`; append them to
    `<state>/dead-letter.jsonl` (`{source, position, code, reason, batch_id,
-   record, at_ms}`, deduplicated on (source, position)); acknowledge
+   record, at_ms}`, deduplicated on (source, position) over the current
+   and rotated files; fsynced; a line torn by a crash is closed before the
+   next append and counted as malformed, `dead_letter_malformed`); acknowledge
    (diode: committed line count; spool: `ready/ → acked/`, rejected ones
    `→ rejected/`, directories fsynced); clear `pending`.
 
@@ -232,10 +242,66 @@ Other statuses: `413` halves the line cap for the rest of the run and re-cuts
 (nothing was processed; a single-line `413` stops with an error);
 `400`, `401`, `409`, `415` and any other `4xx` stop the run without
 acknowledging anything; the batch stays pending and the next run re-sends
-it under the same id (the binary backs off exponentially between failed
-runs, from `--interval-ms` up to `--backoff-max-ms`). Every case is a test
-in `tests/uplink.rs` (in-memory transport and the reference consumer) or
-`tests/uplink_https.rs` (real TLS).
+it under the same id. Every case is a test in `tests/uplink.rs`
+(in-memory transport and the reference consumer) or
+`tests/uplink_https.rs` (real TLS, and the binary).
+
+### Service loop, status, blocked queue (`src/uplink/service.rs`)
+
+Delivery is in order, so a batch the server keeps refusing blocks every
+later record. The loop makes that visible and keeps it cheap:
+
+* **Backoff between failed runs** (equal jitter, from `--interval-ms`):
+  transient failures (network, `408`, `429`, `5xx` with the run's attempts
+  exhausted) up to `--backoff-max-ms` (60 s); everything else (`400`,
+  `401`, `409`, `415`, a single-line `413`, a malformed `200`, local
+  errors) up to `--refused-backoff-max-s` (900 s): under 200 refused
+  requests a day instead of ~1440 (each `401` is an audit-log entry on the
+  SOC); never less than the last `Retry-After`.
+* **`<state>/uplink-status.json`** (atomic, after every run;
+  `robodr-uplink-status/1`): `state` (`ok`, `retrying`, `blocked`),
+  `last_success_at_ms`, `last_delivery_at_ms`, `last_error` {`kind`,
+  `status`, `code`, `message`, `retry_after_s`}, `consecutive_failures`,
+  `stuck_since_ms` (kept across restarts while the same batch is pending),
+  `pending_batch_id`, `pending_source`, `pending_lines`,
+  `pending_failed_runs`, `backlog` {`spool_ready` | `diode_batches`,
+  `reinject_generations`}, `next_attempt_at_ms`, `dead_letter_malformed`
+  and the delivery totals.
+* **`sd_notify` `STATUS=`** with the same summary (the units set
+  `NotifyAccess=main`; `systemctl status robodr-uplink`), and a log line
+  per failed run.
+* **`--exit-when-stuck-s N`** (off by default): exit 3 after `N` s of
+  failures in this process, so the unit is visibly failed/restarted.
+* **One process per state directory**: `<state>/uplink.lock` (`flock`),
+  held by the service for its lifetime and taken by `--once` and
+  `reinject`; a second process exits 1 with a clear message.
+* **Dead-letter rotation**: at `--dead-letter-max-bytes` (64 MiB; ≥ 64 KiB;
+  0 = never), keeping `--dead-letter-keep` files (`.1` newest, default 4).
+
+### Re-injection (`src/uplink/reinject.rs`)
+
+A rejection an operator can fix (`unknown_robot`, `robot_mismatch`,
+`site_mismatch`, `missing_finding_signature`, `bad_finding_signature`: a
+registry change on the SOC) is dead-lettered and acknowledged; it never
+comes back on its own. After the fix, with the service stopped:
+
+```
+robodr-uplink reinject --state-dir /var/lib/robodr/export/uplink --spool /var/lib/robodr/spool/agentd \
+  --dead-letter /var/lib/robodr/export/uplink/dead-letter.jsonl [--dead-letter ....1 ...] [--dry-run]
+```
+
+Each selected record is re-read from the original input (spool
+`rejected/<seq>.json`, the diode batch's `records.jsonl` line, or an
+earlier generation's line), else taken from the dead letter's `record`
+copy, and written as one **generation** `<state>/reinject/rj-<ms>-<hash>/`
+(`records.jsonl`, `origin.jsonl`; built under a temporary name, fsynced,
+renamed). The uplink sends each generation after its regular input as the
+line-numbered stream `reinject:<generation>` — so under **new batch ids**
+(the old ids would return the stored rejection) — with the usual crash
+safety, and marks it `done`. Idempotent: dead letters named by any
+generation's `origin.jsonl` are skipped. A record rejected again is
+dead-lettered as `source: "reinject:<generation>"` and can be re-injected
+again. Every record is re-validated before it is sent.
 
 ### TLS and HTTP (`src/uplink/http.rs`)
 
