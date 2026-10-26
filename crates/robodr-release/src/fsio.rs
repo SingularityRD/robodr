@@ -109,7 +109,8 @@ pub fn read_capped(path: &Path, max: usize) -> Result<Vec<u8>, Fail> {
     Ok(v)
 }
 
-/// Size and hex SHA-256 of a regular file, streaming.
+/// Size and hex SHA-256 of a regular file, streaming. Only for files this
+/// process wrote itself; untrusted files go through [`hash_file_listed`].
 pub fn hash_file(path: &Path) -> Result<(u64, String), Fail> {
     let (mut f, _) = open_regular(path)?;
     let mut h = robodr_blackbox::crypto::Sha256::new();
@@ -124,6 +125,33 @@ pub fn hash_file(path: &Path) -> Result<(u64, String), Fail> {
         n += r as u64;
     }
     Ok((n, robodr_blackbox::crypto::to_hex(&h.finalize())))
+}
+
+/// Hex SHA-256 of a regular file whose listed size is `size`, or `None`
+/// when its size differs. The size is compared (`fstat` of the opened
+/// file) **before** anything is read, and reading stops at `size + 1`
+/// bytes, so a huge or sparse file costs nothing (13a review finding 7).
+pub fn hash_file_listed(path: &Path, size: u64) -> Result<Option<String>, Fail> {
+    let (f, len) = open_regular(path)?;
+    if len != size {
+        return Ok(None);
+    }
+    let mut f = f.take(size.saturating_add(1));
+    let mut h = robodr_blackbox::crypto::Sha256::new();
+    let mut buf = vec![0u8; IO_BUF];
+    let mut n: u64 = 0;
+    loop {
+        let r = f.read(&mut buf).map_err(|e| io_err(path, e))?;
+        if r == 0 {
+            break;
+        }
+        h.update(&buf[..r]);
+        n += r as u64;
+    }
+    if n != size {
+        return Ok(None);
+    }
+    Ok(Some(robodr_blackbox::crypto::to_hex(&h.finalize())))
 }
 
 /// Every file and directory under `root` (relative, `/`-separated paths),

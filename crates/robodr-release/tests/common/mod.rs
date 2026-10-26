@@ -6,13 +6,18 @@ use robodr_blackbox::{Ed25519SigningKey, Signer};
 use robodr_pkg::common::{fingerprint, to_canonical};
 use robodr_pkg::rpk::{Arch, Install, Kind, Version};
 use robodr_pkg::sig::SignatureSet;
-use robodr_pkg::trust::{Quorum, TrustFile, TrustKey, TRUST_FORMAT, TRUST_SIG_DOMAIN};
-use robodr_release::ops::{self, BundleOptions, RpkSpec, Target, SPEC_FORMAT};
+use robodr_pkg::trust::{
+    Programme, Quorum, RingAssignment, TrustFile, TrustKey, VerifiedTrust, TRUST_FORMAT,
+    TRUST_SIG_DOMAIN,
+};
+use robodr_release::fsio::Fail;
+use robodr_release::ops::{self, BundleOptions, RpkSpec, SiteTrust, Target, SPEC_FORMAT};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const NOW: u64 = 1_790_000_000;
 pub const PROGRAMME: &str = "ugv-x1";
+pub const SITE: &str = "site-a";
 
 /// A fresh, empty temp directory, removed on drop.
 pub struct Tmp(pub PathBuf);
@@ -78,7 +83,12 @@ pub fn trust_file(k: &Keys) -> TrustFile {
         site: "site-a".into(),
         version: 1,
         issued_at: NOW,
-        programmes: vec![PROGRAMME.into()],
+        expires_at: NOW + 90 * 86400,
+        programmes: vec![Programme {
+            name: PROGRAMME.into(),
+            release_keys: k.rel.iter().map(|r| r.key_id().to_string()).collect(),
+            packages: vec!["*".into()],
+        }],
         quorum: Quorum {
             root: 2,
             release: 2,
@@ -89,8 +99,13 @@ pub fn trust_file(k: &Keys) -> TrustFile {
         release_keys: k.rel.iter().map(tk).collect(),
         depot_keys: vec![tk(&k.depot)],
         operator_keys: k.ops.iter().map(tk).collect(),
+        rings: vec![RingAssignment {
+            ring: "lab".into(),
+            units: vec!["bench-01".into()],
+        }],
         revoked_keys: vec![],
         revoked_rpks: vec![],
+        revoked_serials: vec![],
         floors: vec![],
     }
 }
@@ -113,6 +128,74 @@ pub fn write_trust(dir: &Path, name: &str, t: &TrustFile, by: &[&Ed25519SigningK
     }
     std::fs::write(ops::sig_path(&p), s.to_bytes().unwrap()).unwrap();
     p
+}
+
+/// `t` root-signed (roots 1 and 2) into `dir/name`.
+pub fn put(dir: &Path, name: &str, t: &TrustFile, k: &Keys) -> PathBuf {
+    write_trust(dir, name, t, &[&k.roots[0], &k.roots[1]])
+}
+
+/// A trust file accepted under the pins and site, no anchor.
+pub fn load(p: &Path, k: &Keys) -> Result<VerifiedTrust, Fail> {
+    ops::load_trust(p, &pins(k), SITE, NOW)
+}
+
+/// The presented trust file `p` at a site whose anchor is `anchor`.
+pub fn anchored(p: &Path, anchor: &Path, k: &Keys) -> Result<SiteTrust, Fail> {
+    SiteTrust::anchored(p, anchor, &pins(k), SITE, NOW)
+}
+
+/// The explicit no-anchor mode.
+pub fn unanchored(p: &Path, k: &Keys) -> Result<SiteTrust, Fail> {
+    SiteTrust::unanchored(p, &pins(k), SITE, NOW)
+}
+
+/// Create a site anchor at `anchor` from the trust file `p`.
+pub fn init_anchor(p: &Path, anchor: &Path, k: &Keys) {
+    ops::init_anchor(p, anchor, &pins(k), SITE, NOW).unwrap();
+}
+
+/// The default site trust (in memory), for signing in fixtures.
+pub fn default_trust() -> VerifiedTrust {
+    let k = keys();
+    let doc = to_canonical(&trust_file(&k)).unwrap();
+    let mut s = SignatureSet::empty();
+    for r in &k.roots[..2] {
+        s.add(r, TRUST_SIG_DOMAIN, &doc).unwrap();
+    }
+    robodr_pkg::trust::verify_trust_pinned(&doc, &s.to_bytes().unwrap(), &pins(&k), SITE, NOW)
+        .unwrap()
+}
+
+/// Sign an RPK's manifest with `by` directly (no checks): what an
+/// attacker holding those keys can produce without this tool.
+pub fn raw_sign_rpk(dir: &Path, by: &[&Ed25519SigningKey]) {
+    let doc = std::fs::read(dir.join(robodr_pkg::rpk::MANIFEST_FILE)).unwrap();
+    let mut s = SignatureSet::empty();
+    for k in by {
+        s.add(*k, robodr_pkg::rpk::MANIFEST_SIG_DOMAIN, &doc)
+            .unwrap();
+    }
+    std::fs::write(
+        dir.join(robodr_pkg::rpk::SIGNATURE_FILE),
+        s.to_bytes().unwrap(),
+    )
+    .unwrap();
+}
+
+/// Sign a bundle's `bundle.json` with `by` directly (no checks).
+pub fn raw_sign_bundle(dir: &Path, by: &[&Ed25519SigningKey]) {
+    let doc = std::fs::read(dir.join(robodr_pkg::bundle::BUNDLE_FILE)).unwrap();
+    let mut s = SignatureSet::empty();
+    for k in by {
+        s.add(*k, robodr_pkg::bundle::BUNDLE_SIG_DOMAIN, &doc)
+            .unwrap();
+    }
+    std::fs::write(
+        dir.join(robodr_pkg::bundle::BUNDLE_SIG_FILE),
+        s.to_bytes().unwrap(),
+    )
+    .unwrap();
 }
 
 /// The default site trust file in `dir`, signed by roots 1 and 2.
@@ -196,8 +279,9 @@ pub fn signed_rpk_spec(
     let out = work.join("rpks");
     std::fs::create_dir_all(&out).unwrap();
     let b = ops::build_rpk(s, &pl, &out).unwrap();
+    let t = default_trust();
     for k in by {
-        ops::sign(&Target::Rpk(b.dir.clone()), *k).unwrap();
+        ops::sign(&Target::Rpk(b.dir.clone()), *k, Some(&t), NOW).unwrap();
     }
     b.dir
 }
@@ -228,7 +312,7 @@ pub fn signed_bundle(
     })
     .unwrap();
     for k in by {
-        ops::sign(&Target::Bundle(out.clone()), *k).unwrap();
+        ops::sign(&Target::Bundle(out.clone()), *k, Some(trust), NOW).unwrap();
     }
     out
 }

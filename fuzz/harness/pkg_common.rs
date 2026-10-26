@@ -8,7 +8,8 @@ use robodr_blackbox::{Ed25519SigningKey, Signer};
 use robodr_pkg::common::{fingerprint, to_canonical};
 use robodr_pkg::sig::SignatureSet;
 use robodr_pkg::trust::{
-    verify_trust_pinned, Quorum, TrustFile, TrustKey, VerifiedTrust, TRUST_FORMAT, TRUST_SIG_DOMAIN,
+    verify_trust_pinned, Programme, Quorum, RingAssignment, TrustFile, TrustKey, VerifiedTrust,
+    TRUST_FORMAT, TRUST_SIG_DOMAIN,
 };
 use std::sync::OnceLock;
 
@@ -47,7 +48,12 @@ pub fn trust_file() -> TrustFile {
         site: SITE.into(),
         version: 1,
         issued_at: 1_790_000_000,
-        programmes: vec![PROGRAMME.into()],
+        expires_at: 1_790_000_000 + 90 * 86400,
+        programmes: vec![Programme {
+            name: PROGRAMME.into(),
+            release_keys: vec!["rel-a".into(), "rel-b".into()],
+            packages: vec!["mission-cfg".into(), "nav-*".into()],
+        }],
         quorum: Quorum {
             root: 2,
             release: 2,
@@ -58,8 +64,13 @@ pub fn trust_file() -> TrustFile {
         release_keys: release().iter().map(tk).collect(),
         depot_keys: vec![tk(&depot())],
         operator_keys: operators().iter().map(tk).collect(),
+        rings: vec![RingAssignment {
+            ring: "lab".into(),
+            units: vec!["ugv-07".into()],
+        }],
         revoked_keys: vec![],
         revoked_rpks: vec![],
+        revoked_serials: vec![],
         floors: vec![],
     }
 }
@@ -93,7 +104,7 @@ pub fn trust() -> &'static VerifiedTrust {
     static T: OnceLock<VerifiedTrust> = OnceLock::new();
     T.get_or_init(|| {
         let (doc, sig) = trust_bytes();
-        verify_trust_pinned(&doc, &sig, &pins()).expect("harness trust verifies")
+        verify_trust_pinned(&doc, &sig, &pins(), SITE, NOW).expect("harness trust verifies")
     })
 }
 

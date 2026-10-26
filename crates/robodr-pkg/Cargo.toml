@@ -18,3 +18,8 @@ robodr-blackbox = { workspace = true }
 robodr-diode = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# Twin-key regression test (review 13a finding 2): point and scalar
+# arithmetic to forge a signature under A + T with A's secret.
+curve25519-dalek = { workspace = true }

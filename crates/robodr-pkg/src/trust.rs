@@ -3,12 +3,15 @@
 //! quorums, revocations and floors.
 //!
 //! ```json
-//! {"format":"robodr-delivery-trust/1","site":"site-a","version":3,"issued_at":1790000000,
-//!  "programmes":["ugv-x1"],
+//! {"format":"robodr-delivery-trust/1","site":"site-a","version":3,
+//!  "issued_at":1790000000,"expires_at":1797776000,
+//!  "programmes":[{"name":"ugv-x1","release_keys":["rel-a","rel-b"],"packages":["nav-stack","ugv-*"]}],
 //!  "quorum":{"root":2,"release":2,"operator_prod":2,"operator_lab":1},
 //!  "roots":[{"key_id":"root-a","algorithm":"ed25519","public_hex":"<64 hex>"}, ...],
 //!  "release_keys":[...],"depot_keys":[...],"operator_keys":[...],
+//!  "rings":[{"ring":"canary","units":["ugv-07"]},{"ring":"lab","units":["bench-01"]}],
 //!  "revoked_keys":["sha256:<fingerprint>"],"revoked_rpks":["<rpk digest>"],
+//!  "revoked_serials":[{"name":"nav-stack","serial":9}],
 //!  "floors":[{"name":"robodr-agentd","min_serial":12}]}
 //! ```
 //!
@@ -18,32 +21,58 @@
 //! * **Roles are disjoint**: one public key (by fingerprint) and one key
 //!   id appear at most once in the whole file, so a release key can never
 //!   also sign deployments, a depot key never releases, and a root never
-//!   signs anything but trust files (key confusion).
-//! * **Quorum floors**: `root >= 2`, `release >= 2`, `operator_prod >= 2`,
-//!   `1 <= operator_lab <= operator_prod`; the root and release quorums
-//!   must be reachable with the non-revoked keys listed. The depot quorum
-//!   is fixed at 1 (one machine key) and not configurable.
+//!   signs anything but trust files (key confusion). Keys must be
+//!   torsion-free (`robodr-blackbox`), so one secret has one fingerprint.
+//! * **Programmes scope release keys and packages** (13a review finding
+//!   5): each programme names the release keys that may sign for it and
+//!   the package names it may deliver (exact names, or a prefix ending in
+//!   `*`); a package name belongs to at most one programme. An RPK is
+//!   verified against the release keys of the programme that owns its
+//!   name, a bundle against those of its programme; a signature by any
+//!   other release key refuses the document ([`Code::WrongScope`]).
+//! * **Quorum floors and caps**: `root >= 2`, `release >= 2`,
+//!   `operator_prod >= 2`, `1 <= operator_lab <= operator_prod`; no quorum
+//!   above what one signature set can hold ([`MAX_SIGNATURES`], and
+//!   `operator_prod` one less: a deployment also carries the depot's). The
+//!   root quorum must be reachable with the roots listed and the release
+//!   quorum with the non-revoked release keys **of every programme**. The
+//!   depot quorum is fixed at 1 (one machine key) and not configurable.
+//! * **Rings** (13a review finding 3): a root-signed assignment of units
+//!   to rings. A deployment may use the `lab` operator quorum only for
+//!   units this file assigns to its (`lab` or `canary`) ring; see
+//!   [`crate::deployment`].
 //! * **Revocation by fingerprint**, as `robodr-profile-revocations/v2`. A
 //!   revoked key may stay listed in its role (so a refusal can say
 //!   "revoked" rather than "unknown"), but it never counts, and any
 //!   signature by it refuses the document. Roots cannot be revoked by the
-//!   file they sign: rotate them instead.
+//!   file they sign: rotate them instead. RPKs are revoked by digest
+//!   (`revoked_rpks`) or by package name and serial (`revoked_serials`,
+//!   which also covers the same release re-signed into another manifest).
+//! * **Expiry**: `issued_at < expires_at <= issued_at +`
+//!   [`MAX_TRUST_LIFETIME_S`]; a file is refused at and after
+//!   `expires_at`. A courier who withholds a newer file (a revocation)
+//!   is thereby detected within one lifetime (T8 freeze, §6.5).
 //! * **Acceptance** of a standalone file ([`verify_trust_pinned`]): its
 //!   root set must equal the pinned root fingerprints (carried out of band,
-//!   e.g. printed at enrolment) and the root quorum must have signed it.
+//!   e.g. printed at enrolment), its `site` must equal the pinned site
+//!   (13a review finding 1: roots are shared by the sites of a programme
+//!   office, so roots alone do not tell one site's file from another's),
+//!   the root quorum must have signed it and it must not have expired.
 //! * **Rotation** ([`verify_trust_update`], TUF-style): version strictly
 //!   higher, same site, signed by the root quorum of the **accepted** file
 //!   *and* by the root quorum of the new one; revocations and floors only
-//!   ever grow (a later file cannot un-revoke a key or an RPK, or lower or
-//!   drop a floor). An older version is a replay, the same version with
-//!   other bytes an equivocation.
-//! * `issued_at` is informational: units have no trusted clock.
+//!   ever grow (a later file cannot un-revoke a key, an RPK or a serial,
+//!   or lower or drop a floor). An older version is a replay, the same
+//!   version with other bytes an equivocation. This is the only way a
+//!   verifier's accepted trust (its anchor) moves forward.
+//! * `issued_at` and `expires_at` are judged on the verifier's clock;
+//!   units have no trusted clock (13b decides how they use them).
 
 use crate::common::{
     domain_hash, fingerprint, invalid, is_fingerprint, is_hex64, is_key_id, is_label, is_pkg_name,
     parse_canonical, strictly_sorted, Code, Refusal,
 };
-use crate::sig::{KeyInfo, KeyLookup, Role, SignatureSet};
+use crate::sig::{KeyInfo, KeyLookup, Role, SignatureSet, Signers, MAX_SIGNATURES};
 use crate::MAX_SAFE_INTEGER;
 use robodr_blackbox::crypto::from_hex;
 use robodr_blackbox::sign_ed25519::ED25519;
@@ -67,6 +96,13 @@ pub const MAX_REVOKED: usize = 4096;
 pub const MAX_FLOORS: usize = 4096;
 /// Most programmes a site accepts bundles from.
 pub const MAX_PROGRAMMES: usize = 64;
+/// Most package names or prefixes per programme.
+pub const MAX_PACKAGES: usize = 1024;
+/// Most units assigned to rings.
+pub const MAX_RING_UNITS: usize = 4096;
+/// Longest lifetime of a trust file (`expires_at - issued_at`): one year
+/// and a day. Sites should issue shorter ones; this is the hard cap.
+pub const MAX_TRUST_LIFETIME_S: u64 = 366 * 24 * 3600;
 /// Smallest allowed quorums (design defaults, §3.4).
 pub const MIN_ROOT_QUORUM: u32 = 2;
 pub const MIN_RELEASE_QUORUM: u32 = 2;
@@ -104,6 +140,37 @@ pub struct Floor {
     pub min_serial: u64,
 }
 
+/// A programme whose bundles the site accepts: the release keys that may
+/// sign for it and the packages it may deliver.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Programme {
+    pub name: String,
+    /// Key ids of `release_keys` entries, sorted.
+    pub release_keys: Vec<String>,
+    /// Package names, or prefixes ending in `*` (`"*"` alone: every
+    /// name), sorted.
+    pub packages: Vec<String>,
+}
+
+/// Units assigned to one ring by the roots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RingAssignment {
+    /// `lab`, `canary` or `ring-<1..99>`.
+    pub ring: String,
+    /// Unit ids, sorted.
+    pub units: Vec<String>,
+}
+
+/// One revoked release of a package (whatever manifest carries it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevokedSerial {
+    pub name: String,
+    pub serial: u64,
+}
+
 /// A parsed trust file (members in canonical order).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -112,14 +179,20 @@ pub struct TrustFile {
     pub site: String,
     pub version: u64,
     pub issued_at: u64,
-    pub programmes: Vec<String>,
+    pub expires_at: u64,
+    /// Sorted by name.
+    pub programmes: Vec<Programme>,
     pub quorum: Quorum,
     pub roots: Vec<TrustKey>,
     pub release_keys: Vec<TrustKey>,
     pub depot_keys: Vec<TrustKey>,
     pub operator_keys: Vec<TrustKey>,
+    /// Sorted by ring; a unit appears at most once.
+    pub rings: Vec<RingAssignment>,
     pub revoked_keys: Vec<String>,
     pub revoked_rpks: Vec<String>,
+    /// Sorted by (name, serial).
+    pub revoked_serials: Vec<RevokedSerial>,
     pub floors: Vec<Floor>,
 }
 
@@ -133,6 +206,14 @@ pub struct CheckedTrust {
     pub digest: String,
     keys: BTreeMap<String, KeyInfo>,
     revoked: BTreeSet<String>,
+    /// Programme name -> fingerprints of its release keys.
+    scopes: BTreeMap<String, BTreeSet<String>>,
+    /// Exact package name -> programme.
+    packages: BTreeMap<String, String>,
+    /// Package-name prefix (from `prefix*`) -> programme.
+    prefixes: BTreeMap<String, String>,
+    /// Unit -> ring.
+    rings: BTreeMap<String, String>,
 }
 
 /// A trust file accepted under pinned roots or by rotation from an
@@ -208,18 +289,22 @@ impl TrustFile {
         if self.version == 0 || self.version > MAX_SAFE_INTEGER {
             return Err(invalid("trust file: version must be 1..=2^53-1"));
         }
-        if self.issued_at > MAX_SAFE_INTEGER {
-            return Err(invalid("trust file: issued_at out of range"));
+        if self.issued_at > MAX_SAFE_INTEGER || self.expires_at > MAX_SAFE_INTEGER {
+            return Err(invalid("trust file: issued_at / expires_at out of range"));
+        }
+        if self.expires_at <= self.issued_at
+            || self.expires_at - self.issued_at > MAX_TRUST_LIFETIME_S
+        {
+            return Err(invalid(format!(
+                "trust file: need issued_at < expires_at, at most {MAX_TRUST_LIFETIME_S} s apart"
+            )));
         }
         if self.programmes.is_empty() || self.programmes.len() > MAX_PROGRAMMES {
             return Err(invalid(format!(
                 "trust file: 1..={MAX_PROGRAMMES} programmes"
             )));
         }
-        if !self.programmes.iter().all(|p| is_label(p)) {
-            return Err(invalid("trust file: bad programme label"));
-        }
-        strictly_sorted(&self.programmes, |p| p.clone(), "programmes")?;
+        strictly_sorted(&self.programmes, |p| p.name.clone(), "programmes (by name)")?;
         let q = self.quorum;
         if q.root < MIN_ROOT_QUORUM
             || q.release < MIN_RELEASE_QUORUM
@@ -233,7 +318,21 @@ impl TrustFile {
                  1 <= operator_lab <= operator_prod)"
             )));
         }
-        if self.revoked_keys.len() + self.revoked_rpks.len() > MAX_REVOKED {
+        // One signature set holds at most MAX_SIGNATURES entries, and a
+        // deployment's also carries the depot's (13a review finding 9).
+        if q.root as usize > MAX_SIGNATURES
+            || q.release as usize > MAX_SIGNATURES
+            || q.operator_prod as usize > MAX_SIGNATURES - 1
+        {
+            return Err(invalid(format!(
+                "trust file: quorums above what one signature set can hold (root, release <= \
+                 {MAX_SIGNATURES}, operator_prod <= {})",
+                MAX_SIGNATURES - 1
+            )));
+        }
+        if self.revoked_keys.len() + self.revoked_rpks.len() + self.revoked_serials.len()
+            > MAX_REVOKED
+        {
             return Err(invalid(format!(
                 "trust file: more than {MAX_REVOKED} revocations"
             )));
@@ -248,6 +347,16 @@ impl TrustFile {
             return Err(invalid("trust file: revoked_rpks must be RPK digests"));
         }
         strictly_sorted(&self.revoked_rpks, |d| d.clone(), "revoked_rpks")?;
+        for r in &self.revoked_serials {
+            if !is_pkg_name(&r.name) || r.serial == 0 || r.serial > MAX_SAFE_INTEGER {
+                return Err(invalid("trust file: bad revoked_serials entry"));
+            }
+        }
+        strictly_sorted(
+            &self.revoked_serials,
+            |r| (r.name.clone(), r.serial),
+            "revoked_serials (by name, serial)",
+        )?;
         if self.floors.len() > MAX_FLOORS {
             return Err(invalid(format!(
                 "trust file: more than {MAX_FLOORS} floors"
@@ -312,18 +421,147 @@ impl TrustFile {
         if live(Role::Root) < q.root as usize {
             return Err(invalid("trust file: fewer roots than the root quorum"));
         }
-        if live(Role::Release) < q.release as usize {
-            return Err(invalid(
-                "trust file: fewer non-revoked release keys than the release quorum",
-            ));
+
+        // Programmes: release-key scopes and package ownership.
+        let mut scopes = BTreeMap::new();
+        let mut packages: BTreeMap<String, String> = BTreeMap::new();
+        let mut prefixes: BTreeMap<String, String> = BTreeMap::new();
+        let mut n_packages = 0usize;
+        for p in &self.programmes {
+            if !is_label(&p.name) {
+                return Err(invalid("trust file: bad programme label"));
+            }
+            if p.release_keys.is_empty() || p.release_keys.len() > MAX_KEYS_PER_ROLE {
+                return Err(invalid(format!(
+                    "trust file: programme {} needs 1..={MAX_KEYS_PER_ROLE} release keys",
+                    p.name
+                )));
+            }
+            strictly_sorted(&p.release_keys, |k| k.clone(), "programme release_keys")?;
+            let mut scope = BTreeSet::new();
+            let mut live = 0usize;
+            for id in &p.release_keys {
+                match keys.get(id) {
+                    Some(k) if k.role == Role::Release => {
+                        if !revoked.contains(&k.fingerprint) {
+                            live += 1;
+                        }
+                        scope.insert(k.fingerprint.clone());
+                    }
+                    _ => {
+                        return Err(invalid(format!(
+                            "trust file: programme {} names {id:?}, which is not a release key",
+                            p.name
+                        )))
+                    }
+                }
+            }
+            if live < q.release as usize {
+                return Err(invalid(format!(
+                    "trust file: programme {} has fewer non-revoked release keys than the \
+                     release quorum",
+                    p.name
+                )));
+            }
+            if p.packages.is_empty() || p.packages.len() > MAX_PACKAGES {
+                return Err(invalid(format!(
+                    "trust file: programme {} needs 1..={MAX_PACKAGES} packages",
+                    p.name
+                )));
+            }
+            n_packages += p.packages.len();
+            strictly_sorted(&p.packages, |x| x.clone(), "programme packages")?;
+            for pat in &p.packages {
+                match pat.strip_suffix('*') {
+                    Some(prefix) if is_pkg_prefix(prefix) => {
+                        prefixes.insert(prefix.to_string(), p.name.clone());
+                    }
+                    None if is_pkg_name(pat) => {
+                        packages.insert(pat.clone(), p.name.clone());
+                    }
+                    _ => {
+                        return Err(invalid(format!(
+                            "trust file: programme {}: {:?} is neither a package name nor a \
+                             prefix ending in *",
+                            p.name,
+                            crate::common::trunc(pat)
+                        )))
+                    }
+                }
+            }
+            scopes.insert(p.name.clone(), scope);
+        }
+        // A package name belongs to at most one programme: no pattern may
+        // cover another (an exact name under a prefix, a prefix under a
+        // shorter one, or one entry twice).
+        if packages.len() + prefixes.len() != n_packages {
+            return Err(invalid("trust file: a package entry is listed twice"));
+        }
+        let covered = |s: &str, proper: bool| -> Option<&String> {
+            let n = if proper { s.len() } else { s.len() + 1 };
+            (0..n).find_map(|i| s.get(..i).and_then(|pre| prefixes.get(pre)))
+        };
+        for name in packages.keys() {
+            if covered(name, false).is_some() {
+                return Err(invalid(format!(
+                    "trust file: package {name} is also covered by a prefix (a package belongs \
+                     to one programme)"
+                )));
+            }
+        }
+        for pre in prefixes.keys() {
+            if covered(pre, true).is_some() {
+                return Err(invalid(format!(
+                    "trust file: prefix {pre}* overlaps a shorter prefix"
+                )));
+            }
+        }
+
+        // Rings: each unit in at most one.
+        strictly_sorted(&self.rings, |r| r.ring.clone(), "rings (by ring)")?;
+        let mut rings = BTreeMap::new();
+        for r in &self.rings {
+            if !crate::deployment::is_ring(&r.ring) {
+                return Err(invalid(
+                    "trust file: ring must be lab, canary or ring-<1..99>",
+                ));
+            }
+            if r.units.is_empty() || !r.units.iter().all(|u| is_label(u)) {
+                return Err(invalid(format!(
+                    "trust file: ring {} needs unit labels",
+                    r.ring
+                )));
+            }
+            strictly_sorted(&r.units, |u| u.clone(), "ring units")?;
+            for u in &r.units {
+                if rings.insert(u.clone(), r.ring.clone()).is_some() {
+                    return Err(invalid(format!(
+                        "trust file: unit {u} is assigned to two rings"
+                    )));
+                }
+                if rings.len() > MAX_RING_UNITS {
+                    return Err(invalid(format!(
+                        "trust file: more than {MAX_RING_UNITS} units in rings"
+                    )));
+                }
+            }
         }
         Ok(CheckedTrust {
             file: self,
             digest,
             keys,
             revoked,
+            scopes,
+            packages,
+            prefixes,
+            rings,
         })
     }
+}
+
+/// A package-name prefix: empty, or the start of a valid package name.
+fn is_pkg_prefix(s: &str) -> bool {
+    s.is_empty() || is_pkg_name(&format!("{s}a"))
 }
 
 /// Parse and validate trust file bytes (no signature check).
@@ -388,19 +626,119 @@ impl VerifiedTrust {
             .map_or(0, |f| f.min_serial)
     }
 
+    /// Whether release `serial` of package `name` is revoked.
+    pub fn is_serial_revoked(&self, name: &str, serial: u64) -> bool {
+        self.0
+            .file
+            .revoked_serials
+            .binary_search_by(|r| (r.name.as_str(), r.serial).cmp(&(name, serial)))
+            .is_ok()
+    }
+
     /// Whether bundles of `programme` are accepted at this site.
     pub fn accepts_programme(&self, programme: &str) -> bool {
-        self.0.file.programmes.iter().any(|p| p == programme)
+        self.0.scopes.contains_key(programme)
+    }
+
+    /// The programme that may deliver package `name` (exact entry first,
+    /// then the prefix covering it; at most one exists).
+    pub fn programme_of_package(&self, name: &str) -> Option<&str> {
+        if let Some(p) = self.0.packages.get(name) {
+            return Some(p);
+        }
+        (0..=name.len())
+            .find_map(|i| name.get(..i).and_then(|pre| self.0.prefixes.get(pre)))
+            .map(String::as_str)
+    }
+
+    /// The ring the roots assigned `unit` to, if any.
+    pub fn ring_of_unit(&self, unit: &str) -> Option<&str> {
+        self.0.rings.get(unit).map(String::as_str)
+    }
+
+    /// Refuse unless every release signer is a release key of
+    /// `programme` and at least the release quorum of them signed (13a
+    /// review finding 5: a programme's release keys sign for it only).
+    pub fn require_release_quorum(
+        &self,
+        signers: &Signers,
+        programme: &str,
+        what: &str,
+    ) -> Result<(), Refusal> {
+        self.check_release_scope(signers, programme, what)?;
+        signers.require(Role::Release, self.0.file.quorum.release as usize, what)
+    }
+
+    /// Refuse unless every release signer is a release key of `programme`
+    /// (no quorum check: `sign` uses it on a partly signed document).
+    pub fn check_release_scope(
+        &self,
+        signers: &Signers,
+        programme: &str,
+        what: &str,
+    ) -> Result<(), Refusal> {
+        let Some(scope) = self.0.scopes.get(programme) else {
+            return Err(Refusal::new(
+                Code::WrongScope,
+                format!("{what}: programme {programme} is not accepted at this site"),
+            ));
+        };
+        if let Some(f) = signers
+            .of(Role::Release)
+            .into_iter()
+            .find(|f| !scope.contains(*f))
+        {
+            return Err(Refusal::new(
+                Code::WrongScope,
+                format!(
+                    "{what}: signed by release key {f}, which may not sign for programme \
+                     {programme}"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuse a trust file at or after its `expires_at`.
+    pub fn check_fresh(&self, now: u64) -> Result<(), Refusal> {
+        let f = &self.0.file;
+        if now >= f.expires_at {
+            return Err(Refusal::new(
+                Code::Expired,
+                format!(
+                    "trust file {} version {} expired at {} (now {now}): a newer one is due",
+                    f.site, f.version, f.expires_at
+                ),
+            ));
+        }
+        Ok(())
     }
 }
 
 /// Accept a trust file standalone: its roots must be exactly `pinned`
-/// (root fingerprints carried out of band) and the root quorum must have
-/// signed it.
+/// (root fingerprints carried out of band), its site must be `site`, the
+/// root quorum must have signed it and it must not have expired at `now`.
 pub fn verify_trust_pinned(
     doc: &[u8],
     sigset: &[u8],
     pinned: &[String],
+    site: &str,
+    now: u64,
+) -> Result<VerifiedTrust, Refusal> {
+    let v = verify_trust_anchor(doc, sigset, pinned, site)?;
+    v.check_fresh(now)?;
+    Ok(v)
+}
+
+/// As [`verify_trust_pinned`] without the expiry check: only for loading
+/// a verifier's own accepted trust file (its anchor), whose successor is
+/// then accepted with [`verify_trust_update`], which checks expiry. An
+/// expired anchor must still be able to accept the file that replaces it.
+pub fn verify_trust_anchor(
+    doc: &[u8],
+    sigset: &[u8],
+    pinned: &[String],
+    site: &str,
 ) -> Result<VerifiedTrust, Refusal> {
     let t = parse_trust(doc)?;
     let pinned: BTreeSet<String> = pinned.iter().cloned().collect();
@@ -410,10 +748,33 @@ pub fn verify_trust_pinned(
             "trust file: its roots are not exactly the pinned root fingerprints",
         ));
     }
+    if t.file.site != site {
+        return Err(Refusal::new(
+            Code::WrongScope,
+            format!("trust file: for site {}, this is site {site}", t.file.site),
+        ));
+    }
     let set = SignatureSet::parse(sigset)?;
     let signers = set.check(&t, &[Role::Root], TRUST_SIG_DOMAIN, doc)?;
     signers.require(Role::Root, t.file.quorum.root as usize, "trust file")?;
     Ok(VerifiedTrust(t))
+}
+
+/// Check every existing root signature on a trust file being signed
+/// (`robodr-release sign`): each entry must be a root of the document
+/// itself or of `prev` (the accepted file, during a rotation) and verify.
+/// Returns the distinct signers.
+pub fn check_trust_signatures(
+    doc: &[u8],
+    sigset: &[u8],
+    prev: Option<&VerifiedTrust>,
+) -> Result<Signers, Refusal> {
+    let t = parse_trust(doc)?;
+    let set = SignatureSet::parse(sigset)?;
+    match prev {
+        Some(p) => set.check(&Union(&p.0, &t), &[Role::Root], TRUST_SIG_DOMAIN, doc),
+        None => set.check(&t, &[Role::Root], TRUST_SIG_DOMAIN, doc),
+    }
 }
 
 /// Keys of two trust files (rotation): a key id must mean the same key in
@@ -436,6 +797,17 @@ impl KeyLookup for Union<'_> {
 /// Accept `doc` as the successor of the accepted `prev` (see the module
 /// docs). The same bytes as `prev` return `prev` unchanged.
 pub fn verify_trust_update(
+    prev: &VerifiedTrust,
+    doc: &[u8],
+    sigset: &[u8],
+    now: u64,
+) -> Result<VerifiedTrust, Refusal> {
+    let v = verify_trust_update_at_any_time(prev, doc, sigset)?;
+    v.check_fresh(now)?;
+    Ok(v)
+}
+
+fn verify_trust_update_at_any_time(
     prev: &VerifiedTrust,
     doc: &[u8],
     sigset: &[u8],
@@ -504,6 +876,14 @@ pub fn verify_trust_update(
             return Err(invalid(format!("trust update: un-revokes RPK {d}")));
         }
     }
+    for r in &p.revoked_serials {
+        if !n.revoked_serials.contains(r) {
+            return Err(invalid(format!(
+                "trust update: un-revokes {} serial {}",
+                r.name, r.serial
+            )));
+        }
+    }
     for f in &p.floors {
         match n.floors.iter().find(|x| x.name == f.name) {
             Some(x) if x.min_serial >= f.min_serial => {}
@@ -540,7 +920,12 @@ pub(crate) mod test_support {
             site: "site-a".into(),
             version: 1,
             issued_at: 1_790_000_000,
-            programmes: vec!["ugv-x1".into()],
+            expires_at: 1_790_000_000 + 90 * 86400,
+            programmes: vec![Programme {
+                name: "ugv-x1".into(),
+                release_keys: vec!["rel-a".into(), "rel-b".into(), "rel-c".into()],
+                packages: vec!["*".into()],
+            }],
             quorum: Quorum {
                 root: 2,
                 release: 2,
@@ -557,9 +942,33 @@ pub(crate) mod test_support {
             operator_keys: (1..=3)
                 .map(|i| tk(&key(&format!("op-{i}"), 30 + i)))
                 .collect(),
+            rings: vec![
+                RingAssignment {
+                    ring: "canary".into(),
+                    units: vec!["ugv-08".into()],
+                },
+                RingAssignment {
+                    ring: "lab".into(),
+                    units: vec!["ugv-07".into()],
+                },
+            ],
             revoked_keys: vec![],
             revoked_rpks: vec![],
+            revoked_serials: vec![],
             floors: vec![],
+        }
+    }
+
+    /// Pinned-root acceptance of `t` at its own site, at `t.issued_at`.
+    pub fn accept(doc: &[u8], sig: &[u8], t: &TrustFile) -> Result<VerifiedTrust, Refusal> {
+        verify_trust_pinned(doc, sig, &pins(t), &t.site, t.issued_at)
+    }
+
+    pub fn prog(name: &str, keys: &[&str], packages: &[&str]) -> Programme {
+        Programme {
+            name: name.into(),
+            release_keys: keys.iter().map(|k| k.to_string()).collect(),
+            packages: packages.iter().map(|k| k.to_string()).collect(),
         }
     }
 
@@ -587,7 +996,7 @@ pub(crate) mod test_support {
         let doc = to_canonical(t).unwrap();
         let r = roots();
         let sig = sign(&doc, TRUST_SIG_DOMAIN, &[&r[0], &r[1]]);
-        verify_trust_pinned(&doc, &sig, &pins(t)).unwrap()
+        accept(&doc, &sig, t).unwrap()
     }
 }
 
@@ -598,6 +1007,7 @@ mod tests {
     use crate::common::to_canonical;
 
     type Mutation = Box<dyn Fn(&mut TrustFile)>;
+    const T0: u64 = 1_790_000_000;
 
     #[test]
     fn valid_trust_file_verifies_under_pins() {
@@ -616,19 +1026,23 @@ mod tests {
         let r = roots();
         let one = sign(&doc, TRUST_SIG_DOMAIN, &[&r[0]]);
         assert_eq!(
-            verify_trust_pinned(&doc, &one, &pins(&t)).unwrap_err().code,
+            verify_trust_pinned(&doc, &one, &pins(&t), "site-a", T0)
+                .unwrap_err()
+                .code,
             Code::QuorumNotMet
         );
         let two = sign(&doc, TRUST_SIG_DOMAIN, &[&r[0], &r[2]]);
-        verify_trust_pinned(&doc, &two, &pins(&t)).unwrap();
+        verify_trust_pinned(&doc, &two, &pins(&t), "site-a", T0).unwrap();
         // Pins must equal the roots exactly.
         let mut fewer = pins(&t);
         fewer.pop();
         assert_eq!(
-            verify_trust_pinned(&doc, &two, &fewer).unwrap_err().code,
+            verify_trust_pinned(&doc, &two, &fewer, "site-a", T0)
+                .unwrap_err()
+                .code,
             Code::UnknownKey
         );
-        assert!(verify_trust_pinned(&doc, &two, &[]).is_err());
+        assert!(verify_trust_pinned(&doc, &two, &[], "site-a", T0).is_err());
         // Release keys (even two) cannot sign a trust file.
         let rel = sign(
             &doc,
@@ -636,7 +1050,9 @@ mod tests {
             &[&key("rel-a", 11), &key("rel-b", 12)],
         );
         assert_eq!(
-            verify_trust_pinned(&doc, &rel, &pins(&t)).unwrap_err().code,
+            verify_trust_pinned(&doc, &rel, &pins(&t), "site-a", T0)
+                .unwrap_err()
+                .code,
             Code::WrongRole
         );
         // An attacker's self-made file with its own roots fails the pins.
@@ -651,7 +1067,7 @@ mod tests {
             &[&key("root-40", 40), &key("root-41", 41)],
         );
         assert_eq!(
-            verify_trust_pinned(&edoc, &esig, &pins(&t))
+            verify_trust_pinned(&edoc, &esig, &pins(&t), "site-a", T0)
                 .unwrap_err()
                 .code,
             Code::UnknownKey
@@ -671,7 +1087,128 @@ mod tests {
             ("no programmes", Box::new(|t| t.programmes.clear())),
             (
                 "programmes unsorted",
-                Box::new(|t| t.programmes = vec!["b".into(), "a".into()]),
+                Box::new(|t| {
+                    t.programmes = vec![
+                        prog("b", &["rel-a", "rel-b"], &["x"]),
+                        prog("a", &["rel-a", "rel-b"], &["y"]),
+                    ]
+                }),
+            ),
+            ("expires = issued", Box::new(|t| t.expires_at = t.issued_at)),
+            (
+                "expires < issued",
+                Box::new(|t| t.expires_at = t.issued_at - 1),
+            ),
+            (
+                "lifetime too long",
+                Box::new(|t| t.expires_at = t.issued_at + MAX_TRUST_LIFETIME_S + 1),
+            ),
+            ("root quorum 17", Box::new(|t| t.quorum.root = 17)),
+            ("op prod 16", Box::new(|t| t.quorum.operator_prod = 16)),
+            (
+                "programme names a depot key",
+                Box::new(|t| {
+                    t.programmes[0].release_keys =
+                        vec!["depot-1".into(), "rel-a".into(), "rel-b".into()]
+                }),
+            ),
+            (
+                "programme names an unknown key",
+                Box::new(|t| t.programmes[0].release_keys.push("rel-z".into())),
+            ),
+            (
+                "programme below the release quorum",
+                Box::new(|t| t.programmes[0].release_keys = vec!["rel-a".into()]),
+            ),
+            (
+                "programme quorum unreachable after revocation",
+                Box::new(|t| {
+                    t.programmes[0].release_keys = vec!["rel-a".into(), "rel-b".into()];
+                    t.revoked_keys = vec![fingerprint(&key("rel-a", 11).public_key())];
+                }),
+            ),
+            (
+                "no packages",
+                Box::new(|t| t.programmes[0].packages.clear()),
+            ),
+            (
+                "bad package pattern",
+                Box::new(|t| t.programmes[0].packages = vec!["nav*x".into()]),
+            ),
+            (
+                "upper-case package",
+                Box::new(|t| t.programmes[0].packages = vec!["Nav".into()]),
+            ),
+            (
+                "package in two programmes",
+                Box::new(|t| {
+                    t.programmes = vec![
+                        prog("a", &["rel-a", "rel-b"], &["nav"]),
+                        prog("b", &["rel-b", "rel-c"], &["nav"]),
+                    ]
+                }),
+            ),
+            (
+                "package under another's prefix",
+                Box::new(|t| {
+                    t.programmes = vec![
+                        prog("a", &["rel-a", "rel-b"], &["nav-*"]),
+                        prog("b", &["rel-b", "rel-c"], &["nav-stack"]),
+                    ]
+                }),
+            ),
+            (
+                "nested prefixes",
+                Box::new(|t| {
+                    t.programmes = vec![
+                        prog("a", &["rel-a", "rel-b"], &["nav*"]),
+                        prog("b", &["rel-b", "rel-c"], &["nav-*"]),
+                    ]
+                }),
+            ),
+            (
+                "wildcard and anything",
+                Box::new(|t| {
+                    t.programmes = vec![
+                        prog("a", &["rel-a", "rel-b"], &["*"]),
+                        prog("b", &["rel-b", "rel-c"], &["x"]),
+                    ]
+                }),
+            ),
+            (
+                "exact name equals prefix",
+                Box::new(|t| t.programmes[0].packages = vec!["nav".into(), "nav*".into()]),
+            ),
+            (
+                "unit in two rings",
+                Box::new(|t| t.rings[0].units = vec!["ugv-07".into()]),
+            ),
+            ("bad ring", Box::new(|t| t.rings[0].ring = "prod".into())),
+            ("rings unsorted", Box::new(|t| t.rings.swap(0, 1))),
+            ("ring without units", Box::new(|t| t.rings[0].units.clear())),
+            (
+                "revoked serial 0",
+                Box::new(|t| {
+                    t.revoked_serials = vec![RevokedSerial {
+                        name: "a".into(),
+                        serial: 0,
+                    }]
+                }),
+            ),
+            (
+                "revoked serials unsorted",
+                Box::new(|t| {
+                    t.revoked_serials = vec![
+                        RevokedSerial {
+                            name: "a".into(),
+                            serial: 2,
+                        },
+                        RevokedSerial {
+                            name: "a".into(),
+                            serial: 1,
+                        },
+                    ]
+                }),
             ),
             ("root quorum 1", Box::new(|t| t.quorum.root = 1)),
             ("release quorum 1", Box::new(|t| t.quorum.release = 1)),
@@ -792,21 +1329,21 @@ mod tests {
             min_serial: 5,
         }];
         let (d2, s2) = signed(&t2, &[&r[0], &r[1]]);
-        let v2 = verify_trust_update(&prev, &d2, &s2).unwrap();
+        let v2 = verify_trust_update(&prev, &d2, &s2, T0).unwrap();
         assert_eq!(v2.floor("pkg"), 5);
         // Idempotent for the same bytes, equivocation for others.
-        assert_eq!(verify_trust_update(&v2, &d2, &s2).unwrap(), v2);
+        assert_eq!(verify_trust_update(&v2, &d2, &s2, T0).unwrap(), v2);
         let mut t2b = t2.clone();
         t2b.issued_at += 1;
         let (d2b, s2b) = signed(&t2b, &[&r[0], &r[1]]);
         assert_eq!(
-            verify_trust_update(&v2, &d2b, &s2b).unwrap_err().code,
+            verify_trust_update(&v2, &d2b, &s2b, T0).unwrap_err().code,
             Code::Equivocation
         );
         // Replay of version 1 after 2.
         let (d1, s1) = signed(&base(), &[&r[0], &r[1]]);
         assert_eq!(
-            verify_trust_update(&v2, &d1, &s1).unwrap_err().code,
+            verify_trust_update(&v2, &d1, &s1, T0).unwrap_err().code,
             Code::Replay
         );
 
@@ -817,11 +1354,11 @@ mod tests {
         let r4 = key("root-4", 4);
         let (d3, s3) = signed(&t3, &[&r[2], &r4]); // 1 old (r3) + r4: old quorum not met
         assert_eq!(
-            verify_trust_update(&v2, &d3, &s3).unwrap_err().code,
+            verify_trust_update(&v2, &d3, &s3, T0).unwrap_err().code,
             Code::QuorumNotMet
         );
         let (d3, s3) = signed(&t3, &[&r[0], &r[1]]); // old roots, also 2 new
-        let v3 = verify_trust_update(&v2, &d3, &s3).unwrap();
+        let v3 = verify_trust_update(&v2, &d3, &s3, T0).unwrap();
         // Takeover attempt: new file with all-new roots signed only by them.
         let mut evil = t3.clone();
         evil.version = 4;
@@ -830,7 +1367,7 @@ mod tests {
             .collect();
         let (de, se) = signed(&evil, &[&key("root-50", 50), &key("root-51", 51)]);
         assert_eq!(
-            verify_trust_update(&v3, &de, &se).unwrap_err().code,
+            verify_trust_update(&v3, &de, &se, T0).unwrap_err().code,
             Code::QuorumNotMet
         );
         // Un-revoking, lowering or dropping a floor is refused even when signed.
@@ -853,7 +1390,227 @@ mod tests {
             t.version = 9;
             m(&mut t);
             let (d, s) = signed(&t, &[&r[0], &r[1]]);
-            assert!(verify_trust_update(&v3, &d, &s).is_err(), "{name}");
+            assert!(verify_trust_update(&v3, &d, &s, T0).is_err(), "{name}");
         }
+    }
+
+    /// Review 13a finding 1: roots are shared by the sites of a programme
+    /// office, so the pinned site is checked too; finding 4: expiry.
+    #[test]
+    fn site_is_pinned_and_expired_files_are_refused() {
+        let t = base();
+        let doc = to_canonical(&t).unwrap();
+        let r = roots();
+        let sig = sign(&doc, TRUST_SIG_DOMAIN, &[&r[0], &r[1]]);
+        verify_trust_pinned(&doc, &sig, &pins(&t), "site-a", T0).unwrap();
+        assert_eq!(
+            verify_trust_pinned(&doc, &sig, &pins(&t), "site-b", T0)
+                .unwrap_err()
+                .code,
+            Code::WrongScope
+        );
+        // Expired at and after expires_at; the anchor loader ignores time.
+        assert_eq!(
+            verify_trust_pinned(&doc, &sig, &pins(&t), "site-a", t.expires_at)
+                .unwrap_err()
+                .code,
+            Code::Expired
+        );
+        verify_trust_pinned(&doc, &sig, &pins(&t), "site-a", t.expires_at - 1).unwrap();
+        let anchor = verify_trust_anchor(&doc, &sig, &pins(&t), "site-a").unwrap();
+        assert_eq!(
+            verify_trust_update(&anchor, &doc, &sig, t.expires_at)
+                .unwrap_err()
+                .code,
+            Code::Expired
+        );
+        // An expired anchor accepts its fresh successor.
+        let mut t2 = base();
+        t2.version = 2;
+        t2.issued_at = t.expires_at;
+        t2.expires_at = t.expires_at + 86400;
+        let (d2, s2) = signed(&t2, &[&r[0], &r[1]]);
+        verify_trust_update(&anchor, &d2, &s2, t.expires_at).unwrap();
+    }
+
+    #[test]
+    fn programmes_scope_release_keys_and_packages() {
+        let mut t = base();
+        t.programmes = vec![
+            prog("ugv-x1", &["rel-a", "rel-b"], &["mission-cfg", "nav-*"]),
+            prog("ugv-y2", &["rel-b", "rel-c"], &["arm-ctl"]),
+        ];
+        let v = verified(&t);
+        assert_eq!(v.programme_of_package("nav-stack"), Some("ugv-x1"));
+        assert_eq!(v.programme_of_package("nav-"), Some("ugv-x1"));
+        assert_eq!(v.programme_of_package("mission-cfg"), Some("ugv-x1"));
+        assert_eq!(v.programme_of_package("arm-ctl"), Some("ugv-y2"));
+        assert_eq!(v.programme_of_package("nav"), None);
+        assert_eq!(v.programme_of_package("other"), None);
+        assert!(v.accepts_programme("ugv-y2") && !v.accepts_programme("ugv-z3"));
+        let fp = |id: &str, seed: u8| (Role::Release, fingerprint(&key(id, seed).public_key()));
+        let both = Signers([fp("rel-a", 11), fp("rel-b", 12)].into_iter().collect());
+        v.require_release_quorum(&both, "ugv-x1", "x").unwrap();
+        // rel-a is not a key of ugv-y2: refused even though rel-b is.
+        assert_eq!(
+            v.require_release_quorum(&both, "ugv-y2", "x")
+                .unwrap_err()
+                .code,
+            Code::WrongScope
+        );
+        let one = Signers([fp("rel-b", 12)].into_iter().collect());
+        assert_eq!(
+            v.require_release_quorum(&one, "ugv-y2", "x")
+                .unwrap_err()
+                .code,
+            Code::QuorumNotMet
+        );
+        assert_eq!(
+            v.require_release_quorum(&both, "ugv-z3", "x")
+                .unwrap_err()
+                .code,
+            Code::WrongScope
+        );
+        // Rings and serial revocations.
+        assert_eq!(v.ring_of_unit("ugv-07"), Some("lab"));
+        assert_eq!(v.ring_of_unit("ugv-99"), None);
+        let mut t = base();
+        t.revoked_serials = vec![RevokedSerial {
+            name: "nav-stack".into(),
+            serial: 9,
+        }];
+        let v = verified(&t);
+        assert!(v.is_serial_revoked("nav-stack", 9));
+        assert!(!v.is_serial_revoked("nav-stack", 8));
+    }
+
+    #[test]
+    fn rotation_keeps_serial_revocations() {
+        let mut t1 = base();
+        t1.revoked_serials = vec![RevokedSerial {
+            name: "nav-stack".into(),
+            serial: 9,
+        }];
+        let prev = verified(&t1);
+        let mut t2 = base();
+        t2.version = 2;
+        let r = roots();
+        let (d, s) = signed(&t2, &[&r[0], &r[1]]);
+        assert!(verify_trust_update(&prev, &d, &s, T0).is_err());
+        t2.revoked_serials = t1.revoked_serials.clone();
+        let (d, s) = signed(&t2, &[&r[0], &r[1]]);
+        verify_trust_update(&prev, &d, &s, T0).unwrap();
+    }
+
+    /// `sign` checks existing root signatures against the document's roots
+    /// and, during a rotation, the accepted file's.
+    #[test]
+    fn existing_trust_signatures_are_checked() {
+        let t = base();
+        let doc = to_canonical(&t).unwrap();
+        let r = roots();
+        let good = sign(&doc, TRUST_SIG_DOMAIN, &[&r[0]]);
+        check_trust_signatures(&doc, &good, None).unwrap();
+        let stale = sign(b"other", TRUST_SIG_DOMAIN, &[&r[0]]);
+        assert_eq!(
+            check_trust_signatures(&doc, &stale, None).unwrap_err().code,
+            Code::BadSignature
+        );
+        // A rotation away from root-3: its signature is checked against
+        // the accepted file.
+        let prev = verified(&base());
+        let mut t2 = base();
+        t2.version = 2;
+        t2.roots = vec![tk(&r[0]), tk(&r[1]), tk(&key("root-4", 4))];
+        let d2 = to_canonical(&t2).unwrap();
+        let s3 = sign(&d2, TRUST_SIG_DOMAIN, &[&r[2]]);
+        assert_eq!(
+            check_trust_signatures(&d2, &s3, None).unwrap_err().code,
+            Code::UnknownKey
+        );
+        check_trust_signatures(&d2, &s3, Some(&prev)).unwrap();
+    }
+
+    /// A mixed-order "twin" of the key with `seed` (`A + T`, `T` of order
+    /// 2) and a signature over `msg` that verifies under the twin, made with
+    /// `A`'s secret alone (nonce ground until `k` is even, so `[k]T = 0`).
+    pub(crate) fn twin_sign(seed: &[u8; 32], msg: &[u8]) -> ([u8; 32], [u8; 64]) {
+        use curve25519_dalek::edwards::CompressedEdwardsY;
+        use curve25519_dalek::{EdwardsPoint, Scalar};
+        use robodr_blackbox::sign_ed25519::sha512;
+        let h = sha512(seed);
+        let mut a_bytes = [0u8; 32];
+        a_bytes.copy_from_slice(&h[..32]);
+        a_bytes[0] &= 248;
+        a_bytes[31] &= 127;
+        a_bytes[31] |= 64;
+        let a = Scalar::from_bytes_mod_order(a_bytes);
+        let mut t = [0xffu8; 32];
+        t[0] = 0xec;
+        t[31] = 0x7f;
+        let t = CompressedEdwardsY(t).decompress().unwrap();
+        let twin = (EdwardsPoint::mul_base(&a) + t).compress().to_bytes();
+        let mut i = 0u32;
+        loop {
+            let mut nm = h[32..].to_vec();
+            nm.extend(i.to_le_bytes());
+            nm.extend(msg);
+            let r = Scalar::from_bytes_mod_order_wide(&sha512(&nm));
+            let big_r = EdwardsPoint::mul_base(&r).compress().to_bytes();
+            let mut km = big_r.to_vec();
+            km.extend(twin);
+            km.extend(msg);
+            let k = Scalar::from_bytes_mod_order_wide(&sha512(&km));
+            if k.to_bytes()[0] & 1 == 0 {
+                let s = r + k * a;
+                let mut sig = [0u8; 64];
+                sig[..32].copy_from_slice(&big_r);
+                sig[32..].copy_from_slice(&s.to_bytes());
+                return (twin, sig);
+            }
+            i += 1;
+        }
+    }
+
+    /// Review 13a finding 2: one secret enrolled twice (as `A` and as its
+    /// mixed-order twin `A + T`, another fingerprint) would be two votes.
+    #[test]
+    fn a_mixed_order_twin_key_is_refused_in_a_trust_file() {
+        let seed = [11u8; 32]; // rel-a
+        let msg = crate::common::domain_message(crate::rpk::MANIFEST_SIG_DOMAIN, b"doc");
+        let (twin, sig) = twin_sign(&seed, &msg);
+        // The twin is another fingerprint than rel-a.
+        assert_ne!(
+            fingerprint(&twin),
+            fingerprint(&key("rel-a", 11).public_key())
+        );
+        // Its signature, made with rel-a's secret, must not verify.
+        assert!(
+            !robodr_blackbox::sign_ed25519::verify(&twin, &msg, &sig),
+            "a twin-key signature verified"
+        );
+        // And a trust file listing it next to rel-a is refused.
+        let mut t = base();
+        t.release_keys.push(TrustKey::new("rel-z", &twin));
+        assert!(
+            parse_trust(&to_canonical(&t).unwrap()).is_err(),
+            "trust file with a twin key accepted"
+        );
+    }
+
+    /// Review 13a finding 9: a quorum above the 16-signature cap of a
+    /// signature set can never be met; such a trust file is refused rather
+    /// than accepted and then refusing everything.
+    #[test]
+    fn quorums_above_the_signature_cap_are_refused() {
+        let mut t = base();
+        t.release_keys = (0..17u8)
+            .map(|i| tk(&key(&format!("rel-{i:02}"), 100 + i)))
+            .collect();
+        t.quorum.release = 17;
+        assert!(
+            parse_trust(&to_canonical(&t).unwrap()).is_err(),
+            "release quorum 17 accepted"
+        );
     }
 }

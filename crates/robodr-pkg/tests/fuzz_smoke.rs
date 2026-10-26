@@ -30,6 +30,8 @@ mod pkg_trust;
 mod smoke;
 
 const DIR: &str = env!("CARGO_MANIFEST_DIR");
+/// The harness site (`fuzz/harness/pkg_common.rs`).
+const SITE: &str = "site-f";
 
 type Seeds = fn() -> Vec<(&'static str, Vec<u8>)>;
 
@@ -104,8 +106,9 @@ fn seeds_take_the_success_paths() {
     assert!(dep.iter().any(|r| r.is_ok()) && dep.contains(&Err(Code::QuorumNotMet)));
     for d in smoke::corpus(DIR, "pkg_trust") {
         let p = parts(&d);
-        let v = robodr_pkg::trust::verify_trust_pinned(p[0], p[1], &pkg_trust_pins()).unwrap();
-        robodr_pkg::trust::verify_trust_update(&v, p[2], p[3]).unwrap();
+        let v = robodr_pkg::trust::verify_trust_pinned(p[0], p[1], &pkg_trust_pins(), SITE, now)
+            .unwrap();
+        robodr_pkg::trust::verify_trust_update(&v, p[2], p[3], now).unwrap();
     }
     for d in smoke::corpus(DIR, "pkg_parity") {
         pkg_parity::run(&d);
@@ -114,7 +117,8 @@ fn seeds_take_the_success_paths() {
 
 fn pkg_rpk_trust() -> robodr_pkg::trust::VerifiedTrust {
     let (doc, sig) = pkg_trust_bytes();
-    robodr_pkg::trust::verify_trust_pinned(&doc, &sig, &pkg_trust_pins()).unwrap()
+    robodr_pkg::trust::verify_trust_pinned(&doc, &sig, &pkg_trust_pins(), SITE, 1_790_000_100)
+        .unwrap()
 }
 
 fn pkg_trust_bytes() -> (Vec<u8>, Vec<u8>) {

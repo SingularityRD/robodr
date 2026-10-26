@@ -16,9 +16,9 @@ use robodr_pkg::bundle::{
 use robodr_pkg::common::{fingerprint, to_canonical};
 use robodr_pkg::rpk::{self, MANIFEST_FILE, MANIFEST_SIG_DOMAIN, SIGNATURE_FILE};
 use robodr_pkg::sig::SignatureSet;
-use robodr_pkg::trust::{Floor, VerifiedTrust};
+use robodr_pkg::trust::Floor;
 use robodr_pkg::Code;
-use robodr_release::ops::{self, ChainMode, Target};
+use robodr_release::ops::{self, ChainMode, SiteTrust, Target};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -27,8 +27,10 @@ struct Site {
     _tmp: Tmp,
     work: PathBuf,
     k: Keys,
-    trust: VerifiedTrust,
+    /// The site trust, anchored (anchor: a copy of `trust_path`).
+    trust: SiteTrust,
     trust_path: PathBuf,
+    anchor: PathBuf,
     bundle: PathBuf,
     rpk_nav: PathBuf,
 }
@@ -38,7 +40,9 @@ fn site() -> Site {
     let work = tmp.path().to_path_buf();
     let k = keys();
     let trust_path = site_trust(&work, &k);
-    let trust = ops::load_trust(&trust_path, &pins(&k)).unwrap();
+    let anchor = work.join("anchor.json");
+    init_anchor(&trust_path, &anchor, &k);
+    let trust = anchored(&trust_path, &anchor, &k).unwrap();
     let big = bytes(1, 300_000);
     let rpk_nav = signed_rpk(
         &work,
@@ -70,6 +74,7 @@ fn site() -> Site {
         k,
         trust,
         trust_path,
+        anchor,
         bundle,
         rpk_nav,
     }
@@ -253,7 +258,7 @@ fn missing_signatures_and_wrong_quorum_are_refused() {
         &t,
         &[&s.k.roots[0], &s.k.roots[1]],
     );
-    let t3 = ops::load_trust(&tp, &pins(&s.k)).unwrap();
+    let t3 = unanchored(&tp, &s.k).unwrap();
     assert_eq!(
         code(ops::verify_bundle_dir(
             &s.bundle,
@@ -278,7 +283,7 @@ fn revoked_keys_and_rpks_and_floors_are_refused() {
         &t,
         &[&s.k.roots[0], &s.k.roots[1]],
     );
-    let tr = ops::load_trust(&tp, &pins(&s.k)).unwrap();
+    let tr = unanchored(&tp, &s.k).unwrap();
     assert_eq!(
         code(ops::verify_bundle_dir(
             &s.bundle,
@@ -290,13 +295,14 @@ fn revoked_keys_and_rpks_and_floors_are_refused() {
     );
     // Removing the revoked key from the role does not let it back in: unknown.
     t.release_keys.remove(0);
+    t.programmes[0].release_keys.remove(0);
     let tp = write_trust(
         &s.work,
         "trust-rev2.json",
         &t,
         &[&s.k.roots[0], &s.k.roots[1]],
     );
-    let tr = ops::load_trust(&tp, &pins(&s.k)).unwrap();
+    let tr = unanchored(&tp, &s.k).unwrap();
     assert_eq!(
         code(ops::verify_bundle_dir(
             &s.bundle,
@@ -316,7 +322,7 @@ fn revoked_keys_and_rpks_and_floors_are_refused() {
         &t,
         &[&s.k.roots[0], &s.k.roots[1]],
     );
-    let tr = ops::load_trust(&tp, &pins(&s.k)).unwrap();
+    let tr = unanchored(&tp, &s.k).unwrap();
     assert!(matches!(
         ops::verify_bundle_dir(&s.bundle, &tr, &ChainMode::Genesis, NOW),
         Err(robodr_release::fsio::Fail::Refused(r)) if r.code == Code::RevokedRpk
@@ -333,7 +339,7 @@ fn revoked_keys_and_rpks_and_floors_are_refused() {
         &t,
         &[&s.k.roots[0], &s.k.roots[1]],
     );
-    let tr = ops::load_trust(&tp, &pins(&s.k)).unwrap();
+    let tr = unanchored(&tp, &s.k).unwrap();
     assert_eq!(
         code(ops::verify_bundle_dir(
             &s.bundle,
@@ -349,7 +355,7 @@ fn revoked_keys_and_rpks_and_floors_are_refused() {
     let r9 = key("root-9", 98);
     t.roots[2] = tk(&r9);
     let tp = write_trust(&s.work, "trust-evil.json", &t, &[&s.k.roots[0], &r9]);
-    assert_eq!(code(ops::load_trust(&tp, &pins(&s.k))), Code::UnknownKey);
+    assert_eq!(code(load(&tp, &s.k)), Code::UnknownKey);
 }
 
 #[test]
@@ -515,8 +521,8 @@ fn chain_gap_replay_equivocation_and_broken_links_are_refused() {
 
 /// Review finding: the trust file crosses the gap like a bundle, so an
 /// older root-signed trust file (from before a revocation) could be
-/// paired with a bundle signed by the revoked key. The chain state pins
-/// the trust version it was accepted under.
+/// paired with a bundle signed by the revoked key. The site's trust anchor
+/// and the chain state pin the trust version it was accepted under.
 #[test]
 fn an_older_trust_file_cannot_reopen_a_revoked_key() {
     let s = site();
@@ -534,7 +540,8 @@ fn an_older_trust_file_cannot_reopen_a_revoked_key() {
         &t2,
         &[&s.k.roots[0], &s.k.roots[1]],
     );
-    let v2 = ops::load_trust(&t2p, &pins(&s.k)).unwrap();
+    let v2 = anchored(&t2p, &s.anchor, &s.k).unwrap();
+    assert!(v2.is_rotation());
     let rpk2 = signed_rpk(
         &s.work,
         "nav-stack",
@@ -554,7 +561,13 @@ fn an_older_trust_file_cannot_reopen_a_revoked_key() {
     );
     let st = ChainMode::State(state.clone());
     let r2 = ops::verify_bundle_dir(&b2, &v2, &st, NOW).unwrap();
+    // Committing advances the site's anchor to v2 first.
     ops::commit_chain(&state, &r2.bundle, &v2).unwrap();
+    assert_eq!(
+        fs::read(&s.anchor).unwrap(),
+        fs::read(&t2p).unwrap(),
+        "anchor advanced"
+    );
     // The attacker's bundle 3 is signed by the revoked rel-a (plus rel-b)
     // and carried in with the old trust v1, under which rel-a is valid.
     let rpk3 = signed_rpk(
@@ -574,15 +587,14 @@ fn an_older_trust_file_cannot_reopen_a_revoked_key() {
         "bundle-3",
         &[&s.k.rel[0], &s.k.rel[1]],
     );
+    let v2 = anchored(&t2p, &s.anchor, &s.k).unwrap();
     assert_eq!(
         code(ops::verify_bundle_dir(&b3, &v2, &st, NOW)),
         Code::RevokedKey
     );
-    assert_eq!(
-        code(ops::verify_bundle_dir(&b3, &s.trust, &st, NOW)),
-        Code::Replay
-    );
-    // A re-signed v2 with other content (same version) is refused too.
+    // v1 is refused by the anchor before anything else is looked at.
+    assert_eq!(code(anchored(&s.trust_path, &s.anchor, &s.k)), Code::Replay);
+    // So is a re-signed v2 with other content (same version).
     let mut t2b = t2.clone();
     t2b.issued_at += 1;
     let t2bp = write_trust(
@@ -591,12 +603,18 @@ fn an_older_trust_file_cannot_reopen_a_revoked_key() {
         &t2b,
         &[&s.k.roots[0], &s.k.roots[1]],
     );
-    let v2b = ops::load_trust(&t2bp, &pins(&s.k)).unwrap();
+    assert_eq!(code(anchored(&t2bp, &s.anchor, &s.k)), Code::Equivocation);
+    // An anchor rolled back to v1 under a chain state of v2: refused.
+    let rolled = s.work.join("rolled-anchor.json");
+    fs::copy(&s.trust_path, &rolled).unwrap();
+    fs::copy(ops::sig_path(&s.trust_path), ops::sig_path(&rolled)).unwrap();
+    let v1r = anchored(&s.trust_path, &rolled, &s.k).unwrap();
     assert_eq!(
-        code(ops::verify_bundle_dir(&b3, &v2b, &st, NOW)),
-        Code::Equivocation
+        code(ops::verify_bundle_dir(&b3, &v1r, &st, NOW)),
+        Code::Replay
     );
-    // A newer trust file is accepted and recorded at the next commit.
+    // A newer trust file is accepted as a rotation and recorded at the
+    // next commit; it still refuses the revoked key.
     let mut t3 = t2.clone();
     t3.version = 3;
     let t3p = write_trust(
@@ -605,7 +623,7 @@ fn an_older_trust_file_cannot_reopen_a_revoked_key() {
         &t3,
         &[&s.k.roots[0], &s.k.roots[2]],
     );
-    let v3 = ops::load_trust(&t3p, &pins(&s.k)).unwrap();
+    let v3 = anchored(&t3p, &s.anchor, &s.k).unwrap();
     assert_eq!(
         code(ops::verify_bundle_dir(&b3, &v3, &st, NOW)),
         Code::RevokedKey
@@ -613,6 +631,9 @@ fn an_older_trust_file_cannot_reopen_a_revoked_key() {
     let state_now = robodr_pkg::bundle::ChainState::parse(&fs::read(&state).unwrap()).unwrap();
     assert_eq!(state_now.trust_version, 2);
     assert_eq!(state_now.trust_digest, v2.digest);
+    // Without an anchor the state path is not available at all.
+    let un = unanchored(&t2p, &s.k).unwrap();
+    assert!(ops::verify_bundle_dir(&b3, &un, &st, NOW).is_err());
 }
 
 #[test]
@@ -778,7 +799,7 @@ fn key_confusion_is_refused() {
         &t,
         &[&s.k.rel[0], &s.k.rel[1]],
     );
-    assert_eq!(code(ops::load_trust(&tp, &pins(&s.k))), Code::WrongRole);
+    assert_eq!(code(load(&tp, &s.k)), Code::WrongRole);
     // A trust file giving the depot key the release role too is invalid.
     let mut t = trust_file(&s.k);
     let mut d2 = tk(&s.k.depot);
@@ -789,7 +810,7 @@ fn key_confusion_is_refused() {
     // An HMAC key cannot sign.
     let h = robodr_blackbox::HmacSha256Key::new("h", &[7u8; 32]).unwrap();
     assert_eq!(h.algorithm(), "hmac-sha256");
-    let r = ops::sign(&Target::Bundle(s.bundle.clone()), &h);
+    let r = ops::sign(&Target::Bundle(s.bundle.clone()), &h, Some(&*s.trust), NOW);
     assert_eq!(code(r), Code::Unsupported);
 }
 
@@ -977,14 +998,14 @@ fn expiry_and_scope_are_enforced() {
     );
     // A bundle for a programme the site does not accept.
     let mut t = trust_file(&s.k);
-    t.programmes = vec!["other".into()];
+    t.programmes[0].name = "other".into();
     let tp = write_trust(
         &s.work,
         "trust-prog.json",
         &t,
         &[&s.k.roots[0], &s.k.roots[1]],
     );
-    let tr = ops::load_trust(&tp, &pins(&s.k)).unwrap();
+    let tr = unanchored(&tp, &s.k).unwrap();
     assert_eq!(
         code(ops::verify_bundle_dir(
             &s.bundle,
@@ -995,7 +1016,7 @@ fn expiry_and_scope_are_enforced() {
         Code::WrongScope
     );
     // The site's own trust file, re-read from disk, still verifies.
-    ops::load_trust(&s.trust_path, &pins(&s.k)).unwrap();
+    load(&s.trust_path, &s.k).unwrap();
 }
 
 #[test]
@@ -1011,20 +1032,35 @@ fn sign_checks_what_it_signs() {
         .path();
     fs::write(&chunk, b"abd").unwrap();
     assert_eq!(
-        code(ops::sign(&Target::Rpk(r.clone()), &s.k.rel[0])),
+        code(ops::sign(
+            &Target::Rpk(r.clone()),
+            &s.k.rel[0],
+            Some(&*s.trust),
+            NOW
+        )),
         Code::FileMismatch
     );
     // A second signature by the same key is refused.
     let r = signed_rpk(&s.work, "twice", 1, &[("a", b"a")], &[&s.k.rel[0]]);
     assert_eq!(
-        code(ops::sign(&Target::Rpk(r), &s.k.rel[0])),
+        code(ops::sign(
+            &Target::Rpk(r),
+            &s.k.rel[0],
+            Some(&*s.trust),
+            NOW
+        )),
         Code::DuplicateSigner
     );
     // A bundle with a stray file cannot be signed.
     let d = copy(&s, "sign-stray");
     fs::write(d.join("stray"), b"x").unwrap();
     assert_eq!(
-        code(ops::sign(&Target::Bundle(d), &s.k.rel[1])),
+        code(ops::sign(
+            &Target::Bundle(d),
+            &s.k.rel[1],
+            Some(&*s.trust),
+            NOW
+        )),
         Code::UnexpectedFile
     );
 }

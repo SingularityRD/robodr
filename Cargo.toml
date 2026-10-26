@@ -106,6 +106,10 @@ ed25519-dalek = { version = "2.1", default-features = false, features = ["fast",
 # internally). Replaces the earlier in-crate SHA-256 of robodr-blackbox and
 # robodr-ocsf (S10, R8).
 sha2 = "0.10"
+# Test only (robodr-pkg dev-dependency): builds mixed-order "twin" keys and
+# their signatures for the regression test of review 13a finding 2. Already
+# in the graph through ed25519-dalek.
+curve25519-dalek = { version = "4.1", default-features = false }
 # Volatile wipe of secrets and of the hasher state above (already in the graph
 # through ed25519-dalek's `zeroize` feature).
 zeroize = "1"

@@ -17,7 +17,7 @@ mod common;
 use common::{bytes, copy_tree, Tmp};
 use robodr_blackbox::KeyFile;
 use robodr_pkg::common::to_canonical;
-use robodr_pkg::trust::{Quorum, TrustFile, TrustKey, TRUST_FORMAT};
+use robodr_pkg::trust::{Programme, Quorum, RingAssignment, TrustFile, TrustKey, TRUST_FORMAT};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -50,6 +50,8 @@ struct HostA {
     keys: PathBuf,
     pins: Vec<String>,
     trust: PathBuf,
+    /// Host A's trust anchor (the signing station checks against it too).
+    anchor: PathBuf,
 }
 
 fn keygen(h: &Path, id: &str) -> (PathBuf, String) {
@@ -84,7 +86,12 @@ fn host_a(tmp: &Tmp) -> HostA {
         site: "site-a".into(),
         version: 1,
         issued_at: 1_790_000_000,
-        programmes: vec!["ugv-x1".into()],
+        expires_at: 1_790_000_000 + 90 * 86400,
+        programmes: vec![Programme {
+            name: "ugv-x1".into(),
+            release_keys: vec!["rel-a".into(), "rel-b".into(), "rel-c".into()],
+            packages: vec!["nav-stack".into()],
+        }],
         quorum: Quorum {
             root: 2,
             release: 2,
@@ -98,8 +105,13 @@ fn host_a(tmp: &Tmp) -> HostA {
         release_keys: ["rel-a", "rel-b", "rel-c"].iter().map(|i| tk(i)).collect(),
         depot_keys: vec![tk("depot-1")],
         operator_keys: vec![tk("op-1"), tk("op-2")],
+        rings: vec![RingAssignment {
+            ring: "lab".into(),
+            units: vec!["bench-01".into()],
+        }],
         revoked_keys: vec![],
         revoked_rpks: vec![],
+        revoked_serials: vec![],
         floors: vec![],
     };
     let trust = dir.join("trust.json");
@@ -112,7 +124,17 @@ fn host_a(tmp: &Tmp) -> HostA {
         "--target",
         s(&trust),
     ]);
-    let mut v = vec!["verify", "trust", "--trust", s(&trust)];
+    let mut v = vec![
+        "verify",
+        "trust",
+        "--trust",
+        s(&trust),
+        "--site",
+        "site-a",
+        "--no-trust-anchor",
+        "--now",
+        NOW,
+    ];
     for p in &pins {
         v.extend(["--root", p]);
     }
@@ -127,11 +149,34 @@ fn host_a(tmp: &Tmp) -> HostA {
         s(&trust),
     ]);
     ok(&v);
+    // Another site name, or no anchor choice at all: refused / usage.
+    let mut other = v.clone();
+    other[5] = "site-b";
+    let (c, _, e) = run(&other);
+    assert_eq!(c, 1);
+    assert!(e.contains("refused (wrong_scope)"), "{e}");
+    let without: Vec<&str> = v
+        .iter()
+        .copied()
+        .filter(|a| *a != "--no-trust-anchor")
+        .collect();
+    assert_eq!(run(&without).0, 2);
+    // Host A keeps its own anchor (the signing station checks against it).
+    let anchor = dir.join("anchor.json");
+    let mut init: Vec<&str> = v
+        .iter()
+        .copied()
+        .filter(|a| *a != "--no-trust-anchor")
+        .collect();
+    let a = anchor.to_str().unwrap().to_string();
+    init.extend(["--init-anchor", "--trust-anchor", &a]);
+    ok(&init);
     HostA {
         dir,
         keys,
         pins,
         trust,
+        anchor,
     }
 }
 
@@ -180,20 +225,38 @@ fn build_rpk(host: &Path, serial: u64, big: &[u8]) -> PathBuf {
 
 fn release_sign(a: &HostA, target: &Path, ids: &[&str]) {
     for id in ids {
-        ok(&[
-            "sign",
-            "--key",
-            s(&a.keys.join(format!("{id}.key"))),
-            "--target",
-            s(target),
-        ]);
+        let k = a.keys.join(format!("{id}.key"));
+        ok(&with_trust(
+            vec![
+                "sign",
+                "--key",
+                s(&k),
+                "--target",
+                s(target),
+                "--trust",
+                s(&a.trust),
+                "--now",
+                NOW,
+            ],
+            &a.pins,
+            &a.anchor,
+        ));
     }
 }
 
+/// `v` plus the pinned roots and site.
 fn with_pins<'a>(mut v: Vec<&'a str>, pins: &'a [String]) -> Vec<&'a str> {
     for p in pins {
         v.extend(["--root", p.as_str()]);
     }
+    v.extend(["--site", "site-a"]);
+    v
+}
+
+/// `v` plus the pinned roots, site and the trust anchor.
+fn with_trust<'a>(v: Vec<&'a str>, pins: &'a [String], anchor: &'a Path) -> Vec<&'a str> {
+    let mut v = with_pins(v, pins);
+    v.extend(["--trust-anchor", s(anchor)]);
     v
 }
 
@@ -207,7 +270,7 @@ fn a_bundle_built_on_one_host_verifies_on_another() {
     let rpk = build_rpk(&a.dir, 7, &big);
     assert_eq!(fs::read_dir(rpk.join("chunks")).unwrap().count(), 4); // 3 + SBOM
     release_sign(&a, &rpk, &["rel-a", "rel-b"]);
-    ok(&with_pins(
+    ok(&with_trust(
         vec![
             "verify",
             "rpk",
@@ -219,9 +282,10 @@ fn a_bundle_built_on_one_host_verifies_on_another() {
             NOW,
         ],
         &a.pins,
+        &a.anchor,
     ));
     let b1 = a.dir.join("bundle-0001");
-    let v = ok(&with_pins(
+    let v = ok(&with_trust(
         vec![
             "build",
             "bundle",
@@ -247,6 +311,7 @@ fn a_bundle_built_on_one_host_verifies_on_another() {
             s(&b1),
         ],
         &a.pins,
+        &a.anchor,
     ));
     assert_eq!(v["parity"], true);
     release_sign(&a, &b1, &["rel-b", "rel-c"]);
@@ -263,6 +328,21 @@ fn a_bundle_built_on_one_host_verifies_on_another() {
     .unwrap();
     let state = hb.join("chain-ugv-x1.json");
     let tb = hb.join("trust.json");
+    // Host B's site-wide trust anchor, created once from the pinned file.
+    let anchor_b = hb.join("anchor.json");
+    ok(&with_trust(
+        vec![
+            "verify",
+            "trust",
+            "--trust",
+            s(&tb),
+            "--now",
+            NOW,
+            "--init-anchor",
+        ],
+        &a.pins,
+        &anchor_b,
+    ));
     let verify_b = |bundle: &Path, extra: &[&str]| {
         let mut v = vec![
             "verify",
@@ -275,7 +355,7 @@ fn a_bundle_built_on_one_host_verifies_on_another() {
             NOW,
         ];
         v.extend_from_slice(extra);
-        run(&with_pins(v, &a.pins))
+        run(&with_trust(v, &a.pins, &anchor_b))
     };
     // No chain mode: usage error. A missing state without --genesis too.
     assert_eq!(verify_b(&hb.join("media/bundle-0001"), &[]).0, 2);
@@ -312,9 +392,29 @@ fn a_bundle_built_on_one_host_verifies_on_another() {
         &a.pins[0],
         "--root",
         &a.pins[1],
+        "--site",
+        "site-a",
+        "--trust-anchor",
+        s(&anchor_b),
     ]);
     assert_eq!(c, 1);
     assert!(e.contains("refused (unknown_key)"), "{e}");
+    // A --state without the anchor: usage error.
+    let (c, _, _) = run(&with_pins(
+        vec![
+            "verify",
+            "bundle",
+            "--dir",
+            s(&hb.join("media/bundle-0001")),
+            "--trust",
+            s(&tb),
+            "--state",
+            s(&state),
+            "--no-trust-anchor",
+        ],
+        &a.pins,
+    ));
+    assert_eq!(c, 2);
 
     // --- Host C: the same spec and payload give the same RPK bytes.
     let hc = tmp.path().join("host-c-elsewhere");
@@ -329,7 +429,7 @@ fn a_bundle_built_on_one_host_verifies_on_another() {
     let rpk8 = build_rpk(&a.dir, 8, &big[..1000]);
     release_sign(&a, &rpk8, &["rel-a", "rel-c"]);
     let b2 = a.dir.join("bundle-0002");
-    ok(&with_pins(
+    ok(&with_trust(
         vec![
             "build",
             "bundle",
@@ -351,12 +451,13 @@ fn a_bundle_built_on_one_host_verifies_on_another() {
             s(&b2),
         ],
         &a.pins,
+        &a.anchor,
     ));
     release_sign(&a, &b2, &["rel-a", "rel-b"]);
     let b3 = a.dir.join("bundle-0003");
     let h2 = {
         // Learn bundle 2's hash from a --after verification on A.
-        let (c, v, e) = run(&with_pins(
+        let (c, v, e) = run(&with_trust(
             vec![
                 "verify",
                 "bundle",
@@ -370,11 +471,12 @@ fn a_bundle_built_on_one_host_verifies_on_another() {
                 &format!("1:{h1}"),
             ],
             &a.pins,
+            &a.anchor,
         ));
         assert_eq!(c, 0, "{e}");
         v["bundle_hash"].as_str().unwrap().to_string()
     };
-    ok(&with_pins(
+    ok(&with_trust(
         vec![
             "build",
             "bundle",
@@ -394,6 +496,7 @@ fn a_bundle_built_on_one_host_verifies_on_another() {
             s(&b3),
         ],
         &a.pins,
+        &a.anchor,
     ));
     release_sign(&a, &b3, &["rel-b", "rel-c"]);
     copy_tree(&b2, &hb.join("media/bundle-0002"));
@@ -416,15 +519,18 @@ fn a_bundle_built_on_one_host_verifies_on_another() {
     let (c, _, e) = verify_b(&hb.join("media/bundle-0002"), &["--state", s(&state)]);
     assert_eq!(c, 1);
     assert!(e.contains("refused (missing_file)"), "{e}");
-    let v = ok(&with_pins(
+    let v = ok(&with_trust(
         vec![
             "repair",
             "--dir",
             s(&hb.join("media/bundle-0002")),
             "--trust",
             s(&tb),
+            "--now",
+            NOW,
         ],
         &a.pins,
+        &anchor_b,
     ));
     assert_eq!(v["rebuilt"].as_array().unwrap().len(), 1);
     let (c, v, e) = verify_b(

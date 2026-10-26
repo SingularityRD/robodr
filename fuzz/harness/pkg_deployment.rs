@@ -8,8 +8,10 @@
 //!   `not_before < expires_at`, at least one target and item, and an empty
 //!   `wrapped_keys`;
 //! * a deployment that verifies against the harness site is for its site,
-//!   carries a depot signature and the operator quorum of its ring, and is
-//!   valid at the harness time;
+//!   carries a depot signature and the production operator quorum unless
+//!   the lab quorum applies (a `lab` / `canary` ring, units only, each
+//!   assigned to that ring by the trust file, a canary of one unit), and
+//!   is valid at the harness time;
 //! * `check_seq` without history is `Newer`; against itself it is
 //!   `AlreadyAccepted`; against a higher sequence number a replay.
 //!
@@ -21,7 +23,9 @@ mod pkg_common;
 
 use pkg_common::*;
 use robodr_pkg::common::to_canonical;
-use robodr_pkg::deployment::{self, check_seq, is_prod_ring, LastDeployment, SeqStep};
+use robodr_pkg::deployment::{
+    self, check_seq, is_prod_ring, lab_quorum_applies, LastDeployment, SeqStep,
+};
 use robodr_pkg::sig::Role;
 use robodr_pkg::Code;
 
@@ -43,12 +47,15 @@ pub fn run(data: &[u8]) {
         assert_eq!(d.site, SITE);
         assert!(v.signers.count(Role::Depot) >= 1);
         let q = trust().file().quorum;
-        let need = if is_prod_ring(&d.ring) {
-            q.operator_prod
-        } else {
-            q.operator_lab
-        };
+        let lab = lab_quorum_applies(d, trust());
+        let need = if lab { q.operator_lab } else { q.operator_prod };
         assert!(v.signers.count(Role::Operator) >= need as usize);
+        if v.signers.count(Role::Operator) < q.operator_prod as usize {
+            assert!(!is_prod_ring(&d.ring) && d.targets.groups.is_empty());
+            for u in &d.targets.units {
+                assert_eq!(trust().ring_of_unit(u), Some(d.ring.as_str()));
+            }
+        }
         assert!(d.not_before <= NOW && NOW < d.expires_at);
         assert_eq!(check_seq(None, &v).expect("no history"), SeqStep::Newer);
         let me = LastDeployment {
@@ -67,11 +74,12 @@ pub fn run(data: &[u8]) {
     }
 }
 
-/// Seeds: a lab deployment signed by the depot and one operator, and a
-/// production one signed by the depot and one operator (short of quorum).
+/// Seeds: a lab deployment to a lab unit signed by the depot and one
+/// operator, and a production one (a unit and a group) signed by the depot
+/// and one operator (short of quorum).
 pub fn seeds() -> Vec<(&'static str, Vec<u8>)> {
     use robodr_pkg::deployment::*;
-    let mk = |ring: &str| Deployment {
+    let mk = |ring: &str, groups: Vec<String>| Deployment {
         format: DEPLOYMENT_FORMAT.into(),
         deployment_id: "dep-0001".into(),
         site: SITE.into(),
@@ -79,7 +87,7 @@ pub fn seeds() -> Vec<(&'static str, Vec<u8>)> {
         created_at: 1_790_000_000,
         targets: Targets {
             units: vec!["ugv-07".into()],
-            groups: vec!["lab-bench".into()],
+            groups,
         },
         ring: ring.into(),
         items: vec![Item {
@@ -102,9 +110,9 @@ pub fn seeds() -> Vec<(&'static str, Vec<u8>)> {
         wrapped_keys: vec![],
     };
     let ops = operators();
-    let lab = to_canonical(&mk("lab")).expect("ser");
+    let lab = to_canonical(&mk("lab", vec![])).expect("ser");
     let lab_sig = sign(&lab, DEPLOYMENT_SIG_DOMAIN, &[&depot(), &ops[0]]);
-    let prod = to_canonical(&mk("ring-1")).expect("ser");
+    let prod = to_canonical(&mk("ring-1", vec!["ring-1-all".into()])).expect("ser");
     let prod_sig = sign(&prod, DEPLOYMENT_SIG_DOMAIN, &[&depot(), &ops[1]]);
     vec![
         ("seed-lab.bin", join(&[&lab, &lab_sig])),

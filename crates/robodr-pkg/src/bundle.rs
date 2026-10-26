@@ -353,11 +353,21 @@ pub fn verify_bundle_manifest(
     }
     let set = SignatureSet::parse(sigset)?;
     let signers = set.check(trust, &[Role::Release], BUNDLE_SIG_DOMAIN, bytes)?;
-    signers.require(
-        Role::Release,
-        trust.file().quorum.release as usize,
-        "bundle",
-    )?;
+    trust.require_release_quorum(&signers, &manifest.programme, "bundle")?;
+    // Every RPK must be a package of this programme (13a review finding 5).
+    if let Some(r) = manifest
+        .rpks
+        .iter()
+        .find(|r| trust.programme_of_package(&r.name) != Some(manifest.programme.as_str()))
+    {
+        return Err(Refusal::new(
+            Code::WrongScope,
+            format!(
+                "bundle: package {} is not delivered by programme {}",
+                r.name, manifest.programme
+            ),
+        ));
+    }
     Ok(VerifiedBundle {
         manifest,
         hash: bundle_hash(bytes),
@@ -413,14 +423,21 @@ pub fn check_rpk_files(b: &BundleManifest, entry: &BundleRpk, m: &Manifest) -> R
 ///
 /// The trust file travels into the air gap like the bundles do, so a
 /// courier could pair a bundle signed by a since-revoked key with the
-/// older, root-signed trust file from before the revocation. Pinned roots
-/// alone cannot tell versions apart; the state can: [`check_trust`]
-/// refuses a trust file older than the one the head was accepted under,
-/// or the same version with other bytes.
+/// older, root-signed trust file from before the revocation, or with
+/// another site's file signed by the same roots. [`check_trust`] refuses
+/// a trust file of another site, one older than the one the head was
+/// accepted under, or the same version with other bytes. A *newer* file
+/// is accepted here only because the verifier already accepted it as a
+/// rotation of its site-wide trust anchor (`robodr-release`,
+/// `--trust-anchor`; [`crate::trust::verify_trust_update`]), which keeps
+/// revocations and floors monotonic; the state alone never advances the
+/// trust version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChainState {
     pub format: String,
+    /// Site of the trust file the head was accepted under.
+    pub site: String,
     pub programme: String,
     pub bundle_seq: u64,
     pub bundle_hash: String,
@@ -435,6 +452,7 @@ impl ChainState {
     pub fn after(b: &VerifiedBundle, trust: &VerifiedTrust) -> Self {
         Self {
             format: CHAIN_FORMAT.into(),
+            site: trust.file().site.clone(),
             programme: b.manifest.programme.clone(),
             bundle_seq: b.manifest.bundle_seq,
             bundle_hash: b.hash.clone(),
@@ -447,6 +465,7 @@ impl ChainState {
     pub fn parse(bytes: &[u8]) -> Result<Self, Refusal> {
         let s: Self = parse_canonical(bytes, 4096, "chain state")?;
         if s.format != CHAIN_FORMAT
+            || !is_label(&s.site)
             || !is_label(&s.programme)
             || s.bundle_seq == 0
             || s.bundle_seq > MAX_SAFE_INTEGER
@@ -465,9 +484,20 @@ impl ChainState {
     }
 }
 
-/// Refuse a trust file older than the one `state` was accepted under, or
-/// the same version with other content (see [`ChainState`]).
+/// Refuse a trust file of another site than `state`'s, older than the one
+/// `state` was accepted under, or the same version with other content
+/// (see [`ChainState`]).
 pub fn check_trust(state: &ChainState, trust: &VerifiedTrust) -> Result<(), Refusal> {
+    if trust.file().site != state.site {
+        return Err(Refusal::new(
+            Code::WrongScope,
+            format!(
+                "trust file of site {}; this chain was accepted at site {}",
+                trust.file().site,
+                state.site
+            ),
+        ));
+    }
     let v = trust.file().version;
     if v < state.trust_version {
         return Err(Refusal::new(
@@ -846,6 +876,16 @@ mod tests {
         let mut t3 = base();
         t3.version = 3;
         check_trust(&st, &verified(&t3)).unwrap();
+        // Another site's file, even newer and signed by the same roots, is
+        // refused (13a review finding 1).
+        assert_eq!(st.site, "site-a");
+        let mut other = base();
+        other.site = "site-b".into();
+        other.version = 9;
+        assert_eq!(
+            check_trust(&st, &verified(&other)).unwrap_err().code,
+            Code::WrongScope
+        );
         let bytes = st.to_bytes().unwrap();
         assert_eq!(ChainState::parse(&bytes).unwrap(), st);
         let mut bad = st.clone();

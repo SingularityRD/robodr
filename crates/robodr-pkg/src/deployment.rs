@@ -11,12 +11,21 @@
 //! * Signed over [`DEPLOYMENT_SIG_DOMAIN`] by **depot** and **operator**
 //!   keys only (a release or root key is refused: [`Code::WrongRole`]). At
 //!   least one depot signature (the depot quorum is 1), plus
-//!   `quorum.operator_prod` distinct operators for a production ring
-//!   (`ring-<n>`) and `quorum.operator_lab` for `lab` and `canary`. The
-//!   table of §3.4 says "1 for lab"; §5.3 reads as if a depot alone could
-//!   push to `lab` and `canary`. The stricter reading is taken: every ring
-//!   needs at least one operator, so a compromised depot (T4) alone can
-//!   push nowhere.
+//!   `quorum.operator_prod` distinct operators, except that
+//!   `quorum.operator_lab` suffices for a [`lab_quorum_applies`]
+//!   deployment. The table of §3.4 says "1 for lab"; §5.3 reads as if a
+//!   depot alone could push to `lab` and `canary`. The stricter reading is
+//!   taken: every ring needs at least one operator, so a compromised depot
+//!   (T4) alone can push nowhere.
+//! * **The ring label is bound to the targets** (13a review finding 3):
+//!   `ring` is written by the depot, so it cannot by itself choose the
+//!   smaller quorum. The lab quorum applies only when the ring is `lab` or
+//!   `canary`, the targets are units only (a group's membership is the
+//!   depot's to define, so a group is never authenticated as lab), every
+//!   unit is assigned to that very ring by the root-signed trust file
+//!   (`rings`), and a `canary` deployment names exactly one unit (§4.3).
+//!   Anything else needs the production quorum. The unit agent (13b) must
+//!   in addition refuse a deployment whose ring is not its own.
 //! * `not_before < expires_at`, at most [`MAX_VALIDITY_S`] apart; a
 //!   deployment is valid for `not_before <= now < expires_at`.
 //! * Replay: `deployment_seq` increases per site ([`check_seq`]). A unit
@@ -127,7 +136,8 @@ pub fn is_prod_ring(ring: &str) -> bool {
     !matches!(ring, "lab" | "canary")
 }
 
-fn is_ring(s: &str) -> bool {
+/// `lab`, `canary` or `ring-<1..99>`.
+pub fn is_ring(s: &str) -> bool {
     matches!(s, "lab" | "canary")
         || s.strip_prefix("ring-").is_some_and(|n| {
             !n.is_empty()
@@ -135,6 +145,21 @@ fn is_ring(s: &str) -> bool {
                 && n.bytes().all(|b| b.is_ascii_digit())
                 && !n.starts_with('0')
         })
+}
+
+/// Whether `d` may be approved with the lab operator quorum under
+/// `trust`: a `lab` or `canary` ring, units only (no groups), every unit
+/// assigned to exactly that ring in the trust file, and a canary of one
+/// unit. Otherwise the production quorum is required.
+pub fn lab_quorum_applies(d: &Deployment, trust: &VerifiedTrust) -> bool {
+    !is_prod_ring(&d.ring)
+        && d.targets.groups.is_empty()
+        && !d.targets.units.is_empty()
+        && (d.ring != "canary" || d.targets.units.len() == 1)
+        && d.targets
+            .units
+            .iter()
+            .all(|u| trust.ring_of_unit(u) == Some(d.ring.as_str()))
 }
 
 /// Digest of deployment bytes.
@@ -262,21 +287,37 @@ pub fn verify_deployment(
     )?;
     signers.require(Role::Depot, 1, "deployment")?;
     let q = &trust.file().quorum;
-    let ops = if is_prod_ring(&d.ring) {
-        q.operator_prod
+    let (ops, why) = if lab_quorum_applies(&d, trust) {
+        (q.operator_lab, String::new())
+    } else if is_prod_ring(&d.ring) {
+        (q.operator_prod, String::new())
     } else {
-        q.operator_lab
+        (
+            q.operator_prod,
+            " (its targets are not all units the trust file assigns to that ring, or a \
+             canary of more than one unit: production quorum)"
+                .to_string(),
+        )
     };
     signers.require(
         Role::Operator,
         ops as usize,
-        &format!("deployment to {}", d.ring),
+        &format!("deployment to {}{why}", d.ring),
     )?;
     for i in &d.items {
-        if trust.is_rpk_revoked(&i.rpk_digest) {
+        if trust.is_rpk_revoked(&i.rpk_digest) || trust.is_serial_revoked(&i.name, i.serial) {
             return Err(Refusal::new(
                 Code::RevokedRpk,
                 format!("deployment item {} {} is revoked", i.name, i.serial),
+            ));
+        }
+        if trust.programme_of_package(&i.name).is_none() {
+            return Err(Refusal::new(
+                Code::WrongScope,
+                format!(
+                    "deployment item {}: no programme of this site delivers that package",
+                    i.name
+                ),
             ));
         }
         let floor = trust.floor(&i.name);
@@ -620,5 +661,56 @@ mod tests {
         }
         assert!(is_prod_ring("ring-2"));
         assert!(!is_prod_ring("canary"));
+    }
+
+    /// Review 13a finding 3: the ring label picks the operator quorum, so it
+    /// must be bound to the targets. A depot plus one operator must not
+    /// reach production units or depot-defined groups by labelling the
+    /// deployment `lab`, nor more than one unit as `canary`.
+    #[test]
+    fn a_lab_label_does_not_reach_production_units() {
+        let t = verified(&base());
+        let (depot, o1, o2) = (key("depot-1", 21), key("op-1", 31), key("op-2", 32));
+        let mut d = deployment("lab");
+        d.targets.units = vec![
+            "prod-ugv-001".into(),
+            "prod-ugv-002".into(),
+            "prod-ugv-003".into(),
+        ];
+        d.targets.groups = vec!["ring-2-all-production".into()];
+        let (b, s) = signed(&d, &[&depot, &o1]);
+        assert_eq!(
+            verify_deployment(&b, &s, &t, NOW)
+                .map(|_| ())
+                .unwrap_err()
+                .code,
+            Code::QuorumNotMet,
+            "lab deployment to production units accepted with one operator"
+        );
+        // A group (depot-defined membership) is never authenticated as lab.
+        let mut d = deployment("lab");
+        d.targets.groups = vec!["lab-bench".into()];
+        let (b, s) = signed(&d, &[&depot, &o1]);
+        assert_eq!(
+            verify_deployment(&b, &s, &t, NOW)
+                .map(|_| ())
+                .unwrap_err()
+                .code,
+            Code::QuorumNotMet
+        );
+        // With the production quorum the same deployment is fine.
+        let (b, s) = signed(&d, &[&depot, &o1, &o2]);
+        verify_deployment(&b, &s, &t, NOW).unwrap();
+        // Canary is one unit (§4.3).
+        let mut d = deployment("canary");
+        d.targets.units = vec!["ugv-08".into(), "ugv-09".into()];
+        let (b, s) = signed(&d, &[&depot, &o1]);
+        assert_eq!(
+            verify_deployment(&b, &s, &t, NOW)
+                .map(|_| ())
+                .unwrap_err()
+                .code,
+            Code::QuorumNotMet
+        );
     }
 }

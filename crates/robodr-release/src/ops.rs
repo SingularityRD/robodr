@@ -3,8 +3,8 @@
 //! decision is `robodr-pkg`'s; this module reads and writes files.
 
 use crate::fsio::{
-    self, ensure_dirs, hash_file, io_err, open_regular, read_capped, require_exact, sibling, walk,
-    write_new, write_replace, Fail, IO_BUF,
+    self, ensure_dirs, hash_file, hash_file_listed, io_err, open_regular, read_capped,
+    require_exact, sibling, walk, write_new, write_replace, Fail, IO_BUF,
 };
 use robodr_blackbox::Signer;
 use robodr_pkg::bundle::{
@@ -22,10 +22,10 @@ use robodr_pkg::rpk::{
     Manifest, VerifiedManifest, Version, CHUNKS_DIR, CHUNK_SIZE, MANIFEST_FILE,
     MANIFEST_SIG_DOMAIN, MAX_MANIFEST_BYTES, RPK_FORMAT, SIGNATURE_FILE,
 };
-use robodr_pkg::sig::{SignatureSet, MAX_SIGSET_BYTES};
+use robodr_pkg::sig::{Role, SignatureSet, MAX_SIGSET_BYTES};
 use robodr_pkg::trust::{
-    self, verify_trust_pinned, verify_trust_update, VerifiedTrust, MAX_TRUST_BYTES,
-    TRUST_SIG_DOMAIN,
+    self, verify_trust_anchor, verify_trust_pinned, verify_trust_update, VerifiedTrust,
+    MAX_TRUST_BYTES, TRUST_SIG_DOMAIN,
 };
 use robodr_pkg::{Code, Refusal};
 use serde::{Deserialize, Serialize};
@@ -51,19 +51,160 @@ pub fn sig_path(doc: &Path) -> PathBuf {
 // Trust
 // ---------------------------------------------------------------------------
 
-/// Load a trust file (and its `.sig`) and accept it under pinned roots.
-pub fn load_trust(path: &Path, pins: &[String]) -> Result<VerifiedTrust, Fail> {
+/// Read a trust file and its `.sig`.
+pub fn read_trust_files(path: &Path) -> Result<(Vec<u8>, Vec<u8>), Fail> {
     let doc = read_capped(path, MAX_TRUST_BYTES)?;
     let sig = read_capped(&sig_path(path), MAX_SIGSET_BYTES)?;
-    Ok(verify_trust_pinned(&doc, &sig, pins)?)
+    Ok((doc, sig))
 }
 
-/// Accept `next` as the successor of the pinned `prev`.
-pub fn load_trust_update(prev: &Path, pins: &[String], next: &Path) -> Result<VerifiedTrust, Fail> {
-    let p = load_trust(prev, pins)?;
-    let doc = read_capped(next, MAX_TRUST_BYTES)?;
-    let sig = read_capped(&sig_path(next), MAX_SIGSET_BYTES)?;
-    Ok(verify_trust_update(&p, &doc, &sig)?)
+/// Load a trust file (and its `.sig`) and accept it under the pinned
+/// roots and site, unexpired at `now`. No anti-rollback: an older,
+/// root-signed file is accepted too. Use [`SiteTrust::anchored`] wherever
+/// a site has an anchor; this is the explicit `--no-trust-anchor` mode.
+pub fn load_trust(
+    path: &Path,
+    pins: &[String],
+    site: &str,
+    now: u64,
+) -> Result<VerifiedTrust, Fail> {
+    let (doc, sig) = read_trust_files(path)?;
+    Ok(verify_trust_pinned(&doc, &sig, pins, site, now)?)
+}
+
+/// The trust a verifier works under, and how it was accepted.
+///
+/// A site keeps **one** trust anchor (13a review finding 4): a copy of the
+/// last trust file it accepted (`FILE` and `FILE.sig`) on trusted
+/// storage, shared by every programme and every command. A presented
+/// trust file is accepted only as that anchor or a valid rotation of it
+/// ([`verify_trust_update`]: same site, newer version signed by the old
+/// and new root quorums, revocations and floors only grow, not expired),
+/// so an older file, another site's file or one that drops a revocation
+/// is refused everywhere (`verify rpk`, `verify bundle`, `verify
+/// deployment`, `repair`, `import`, `build bundle`, `sign`). The anchor
+/// moves forward only by [`commit_anchor`] of such a rotation.
+#[derive(Debug, Clone)]
+pub struct SiteTrust {
+    /// The accepted trust file (anchor or rotation of it).
+    pub trust: VerifiedTrust,
+    /// `None` in the explicit `--no-trust-anchor` mode.
+    pub anchor: Option<Anchor>,
+}
+
+/// A loaded trust anchor.
+#[derive(Debug, Clone)]
+pub struct Anchor {
+    pub path: PathBuf,
+    /// The anchor file as accepted (pins and site; not its expiry).
+    pub trust: VerifiedTrust,
+    /// Bytes of the presented trust file and signature (written by
+    /// [`commit_anchor`] when newer than the anchor).
+    doc: Vec<u8>,
+    sig: Vec<u8>,
+}
+
+impl std::ops::Deref for SiteTrust {
+    type Target = VerifiedTrust;
+    fn deref(&self) -> &VerifiedTrust {
+        &self.trust
+    }
+}
+
+impl SiteTrust {
+    /// Accept `presented` as the site's anchor at `anchor` or a rotation
+    /// of it. The anchor must exist (create it with [`init_anchor`]) and
+    /// satisfy the pinned roots and site.
+    pub fn anchored(
+        presented: &Path,
+        anchor: &Path,
+        pins: &[String],
+        site: &str,
+        now: u64,
+    ) -> Result<Self, Fail> {
+        if fs::symlink_metadata(anchor).is_err() {
+            return Err(Fail::Io(format!(
+                "{}: no trust anchor; create it once with `verify trust --init-anchor`",
+                anchor.display()
+            )));
+        }
+        let (adoc, asig) = read_trust_files(anchor).map_err(|e| prefix(e, "trust anchor"))?;
+        let a = verify_trust_anchor(&adoc, &asig, pins, site)
+            .map_err(|r| Fail::Refused(r.context("trust anchor")))?;
+        let (doc, sig) = read_trust_files(presented)?;
+        let trust = verify_trust_update(&a, &doc, &sig, now)?;
+        Ok(Self {
+            trust,
+            anchor: Some(Anchor {
+                path: anchor.to_path_buf(),
+                trust: a,
+                doc,
+                sig,
+            }),
+        })
+    }
+
+    /// The explicit no-anchor mode (`--no-trust-anchor`): pinned roots,
+    /// site and expiry only; an older root-signed file is not detected.
+    pub fn unanchored(
+        presented: &Path,
+        pins: &[String],
+        site: &str,
+        now: u64,
+    ) -> Result<Self, Fail> {
+        Ok(Self {
+            trust: load_trust(presented, pins, site, now)?,
+            anchor: None,
+        })
+    }
+
+    /// Whether the presented file is newer than the anchor.
+    pub fn is_rotation(&self) -> bool {
+        self.anchor
+            .as_ref()
+            .is_some_and(|a| self.trust.file().version > a.trust.file().version)
+    }
+}
+
+/// Create the site's trust anchor from a trust file accepted under the
+/// pinned roots and site (the one-time enrolment step). Refuses to
+/// overwrite an existing anchor.
+pub fn init_anchor(
+    presented: &Path,
+    anchor: &Path,
+    pins: &[String],
+    site: &str,
+    now: u64,
+) -> Result<VerifiedTrust, Fail> {
+    let (doc, sig) = read_trust_files(presented)?;
+    let t = verify_trust_pinned(&doc, &sig, pins, site, now)?;
+    for p in [anchor.to_path_buf(), sig_path(anchor)] {
+        if fs::symlink_metadata(&p).is_ok() {
+            return Err(Fail::Io(format!(
+                "{}: already exists; an anchor is advanced with --commit, never re-created",
+                p.display()
+            )));
+        }
+    }
+    write_new(&sig_path(anchor), &sig)?;
+    write_new(anchor, &doc)?;
+    Ok(t)
+}
+
+/// Advance the anchor to the presented file when it is a newer, accepted
+/// rotation (no-op otherwise). The signature is written first: a crash
+/// between the two renames leaves a pair that fails to load (refused,
+/// never trusted), not an older anchor.
+pub fn commit_anchor(st: &SiteTrust) -> Result<bool, Fail> {
+    let Some(a) = &st.anchor else {
+        return Ok(false);
+    };
+    if !st.is_rotation() {
+        return Ok(false);
+    }
+    write_replace(&sig_path(&a.path), &a.sig)?;
+    write_replace(&a.path, &a.doc)?;
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -406,44 +547,152 @@ impl Target {
     }
 }
 
-/// Add `signer`'s signature to `target` after checking the document is
-/// well formed and, for an RPK or a bundle, that the files on disk are
-/// exactly what it describes: a signer never signs what was not checked.
-/// Returns the signature file and the number of signatures in it.
-pub fn sign(target: &Target, signer: &dyn Signer) -> Result<(PathBuf, usize), Fail> {
+/// Add `signer`'s signature to `target`, but only after checking what is
+/// signed (a signer never signs what was not checked; 13a review finding
+/// 9):
+///
+/// * the document parses and validates;
+/// * an RPK: the files on disk are exactly what the manifest describes
+///   (every chunk and content hash), the site policy (revocation, floors,
+///   expiry) holds and a programme of the site delivers the package;
+/// * a bundle: the files on disk are exactly the listing (every hash), the
+///   programme is accepted, and every RPK in it verifies completely
+///   (digest, its own release quorum, scope, policy, files, content);
+/// * every signature already in the set, and the new one, is valid for
+///   this document under `trust` (listed key, allowed role, not revoked,
+///   verifies; for an RPK or a bundle a release key of the right
+///   programme; for a trust file a root of the document or, during a
+///   rotation, of `trust`). A stale or foreign entry is refused, never
+///   kept.
+///
+/// `trust` (the site's accepted trust) is required for RPKs, bundles and
+/// deployments; for a trust file it is the accepted file a rotation
+/// starts from, if any. The chain position of a bundle is not checked
+/// here (that needs the verifier's chain state). Returns the signature
+/// file and the number of signatures in it.
+pub fn sign(
+    target: &Target,
+    signer: &dyn Signer,
+    trust: Option<&VerifiedTrust>,
+    now: u64,
+) -> Result<(PathBuf, usize), Fail> {
     let (doc_path, sig_file, domain) = target.parts();
-    let doc = match target {
-        Target::Rpk(dir) => {
-            let b = read_capped(&doc_path, MAX_MANIFEST_BYTES)?;
-            let m = rpk::parse_manifest(&b)?;
-            check_rpk_tree(dir, &m, false)?;
-            rpk::verify_content(&m, &mut |c| read_chunk(dir, c))?;
-            b
-        }
-        Target::Bundle(dir) => {
-            let b = read_capped(&doc_path, MAX_BUNDLE_BYTES)?;
-            let m = bundle::parse_bundle(&b)?;
-            check_bundle_files(dir, &m, false)?;
-            b
-        }
-        Target::Trust(_) => {
-            let b = read_capped(&doc_path, MAX_TRUST_BYTES)?;
-            trust::parse_trust(&b)?;
-            b
-        }
-        Target::Deployment(_) => {
-            let b = read_capped(&doc_path, MAX_DEPLOYMENT_BYTES)?;
-            deployment::parse_deployment(&b)?;
-            b
-        }
+    let need = |what: &str| {
+        trust.ok_or_else(|| {
+            Fail::Io(format!(
+                "signing {what} needs the site trust (--trust, --root, --site and \
+                 --trust-anchor or --no-trust-anchor)"
+            ))
+        })
     };
     let mut set = match fs::symlink_metadata(&sig_file) {
         Ok(_) => SignatureSet::parse(&read_capped(&sig_file, MAX_SIGSET_BYTES)?)?,
         Err(_) => SignatureSet::empty(),
     };
-    set.add(signer, domain, &doc)?;
+    match target {
+        Target::Rpk(dir) => {
+            let t = need("an RPK")?;
+            let b = read_capped(&doc_path, MAX_MANIFEST_BYTES)?;
+            let m = rpk::parse_manifest(&b)?;
+            check_rpk_tree(dir, &m, false)?;
+            rpk::verify_content(&m, &mut |c| read_chunk(dir, c))?;
+            rpk::check_policy(&m, &rpk::rpk_digest(&b), t, now)?;
+            let programme = t.programme_of_package(&m.name).ok_or_else(|| {
+                Refusal::new(
+                    Code::WrongScope,
+                    format!(
+                        "RPK {}: no programme of this site delivers that package",
+                        m.name
+                    ),
+                )
+            })?;
+            set.add(signer, domain, &b)?;
+            let signers = set.check(t, &[Role::Release], domain, &b)?;
+            t.check_release_scope(&signers, programme, "RPK manifest")?;
+        }
+        Target::Bundle(dir) => {
+            let t = need("a bundle")?;
+            let b = read_capped(&doc_path, MAX_BUNDLE_BYTES)?;
+            let m = bundle::parse_bundle(&b)?;
+            if !t.accepts_programme(&m.programme) {
+                return Err(Refusal::new(
+                    Code::WrongScope,
+                    format!(
+                        "bundle: programme {} is not accepted at this site",
+                        m.programme
+                    ),
+                )
+                .into());
+            }
+            check_bundle_files(dir, &m, false)?;
+            for e in &m.rpks {
+                verify_listed_rpk(dir, &m, e, t, now)?;
+            }
+            set.add(signer, domain, &b)?;
+            let signers = set.check(t, &[Role::Release], domain, &b)?;
+            t.check_release_scope(&signers, &m.programme, "bundle")?;
+        }
+        Target::Trust(_) => {
+            let b = read_capped(&doc_path, MAX_TRUST_BYTES)?;
+            trust::parse_trust(&b)?;
+            set.add(signer, domain, &b)?;
+            trust::check_trust_signatures(&b, &set.to_bytes()?, trust)?;
+        }
+        Target::Deployment(_) => {
+            let t = need("a deployment")?;
+            let b = read_capped(&doc_path, MAX_DEPLOYMENT_BYTES)?;
+            let d = deployment::parse_deployment(&b)?;
+            if d.site != t.file().site {
+                return Err(Refusal::new(
+                    Code::WrongScope,
+                    format!("deployment for site {}, this is {}", d.site, t.file().site),
+                )
+                .into());
+            }
+            set.add(signer, domain, &b)?;
+            set.check(t, &[Role::Depot, Role::Operator], domain, &b)?;
+        }
+    }
     write_replace(&sig_file, &set.to_bytes()?)?;
     Ok((sig_file, set.signatures.len()))
+}
+
+/// Verify one RPK listed in a bundle completely: `MANIFEST.json` is the
+/// digest the bundle names, its release quorum (of the programme owning
+/// the package, which must be the bundle's), site policy, its file set in
+/// the listing, and every chunk and content hash.
+fn verify_listed_rpk(
+    dir: &Path,
+    m: &BundleManifest,
+    e: &BundleRpk,
+    trust: &VerifiedTrust,
+    now: u64,
+) -> Result<VerifiedManifest, Fail> {
+    let rdir = dir.join(&e.dir);
+    let mbytes = read_capped(&rdir.join(MANIFEST_FILE), MAX_MANIFEST_BYTES)?;
+    if rpk::rpk_digest(&mbytes) != e.digest {
+        return Err(Refusal::new(
+            Code::DigestMismatch,
+            format!("{}: MANIFEST.json is not the RPK bundle.json names", e.dir),
+        )
+        .into());
+    }
+    let sb = read_capped(&rdir.join(SIGNATURE_FILE), MAX_SIGSET_BYTES)?;
+    let v = rpk::verify_manifest(&mbytes, &sb, trust, now).map_err(|r| r.context(&e.dir))?;
+    if v.programme != m.programme {
+        return Err(Refusal::new(
+            Code::WrongScope,
+            format!(
+                "{}: package {} belongs to programme {}, not {}",
+                e.dir, v.manifest.name, v.programme, m.programme
+            ),
+        )
+        .into());
+    }
+    check_rpk_files(m, e, &v.manifest)?;
+    rpk::verify_content(&v.manifest, &mut |c| read_chunk(&rdir, c))
+        .map_err(|r| r.context(&e.dir))?;
+    Ok(v)
 }
 
 // ---------------------------------------------------------------------------
@@ -565,6 +814,19 @@ pub fn build_bundle(o: &BundleOptions<'_>) -> Result<BuiltBundle, Fail> {
         }
         let v = verify_rpk_dir(&dst, o.trust, o.now)
             .map_err(|e| prefix(e, &format!("RPK {}", src.display())))?;
+        if v.programme != o.programme {
+            return Err(Refusal::new(
+                Code::WrongScope,
+                format!(
+                    "RPK {}: package {} belongs to programme {}, not {}",
+                    src.display(),
+                    v.manifest.name,
+                    v.programme,
+                    o.programme
+                ),
+            )
+            .into());
+        }
         rpks.push(BundleRpk {
             dir: dir_name,
             name: v.manifest.name.clone(),
@@ -675,8 +937,11 @@ fn check_bundle_files(dir: &Path, m: &BundleManifest, with_sig: bool) -> Result<
     }
     require_exact(dir, &tree, &want)?;
     for f in &m.files {
-        let (size, sha) = hash_file(&dir.join(&f.path))?;
-        if size != f.size || sha != f.sha256 {
+        // Never read past the listed size (13a review finding 7: a sparse
+        // multi-terabyte file must be refused by its size, not hashed).
+        let ok =
+            matches!(hash_file_listed(&dir.join(&f.path), f.size)?, Some(sha) if sha == f.sha256);
+        if !ok {
             let hint = if m.parity.is_some() {
                 " (the bundle carries parity: try `robodr-release repair`)"
             } else {
@@ -716,16 +981,37 @@ pub struct BundleReport {
 /// (digest, release quorum, site policy, file set, content hashes).
 pub fn verify_bundle_dir(
     dir: &Path,
-    trust: &VerifiedTrust,
+    site: &SiteTrust,
     chain: &ChainMode,
     now: u64,
 ) -> Result<BundleReport, Fail> {
-    // The chain state first: it also pins the trust file version the head
-    // was accepted under, and an older trust file (e.g. one from before a
-    // key revocation) is a replay whatever it would let through.
+    let trust = &site.trust;
+    // The chain state first: it also pins the site and the trust file
+    // version the head was accepted under, and an older trust file (e.g.
+    // one from before a key revocation) or another site's is refused
+    // whatever it would let through. A newer one is acceptable only as a
+    // rotation of the site's trust anchor (never on the state's word), so
+    // the state path needs the anchor.
     let state = match chain {
         ChainMode::State(p) => {
+            let Some(a) = &site.anchor else {
+                return Err(Fail::Io(
+                    "a chain state needs the site's trust anchor (--trust-anchor)".into(),
+                ));
+            };
             let st = bundle::ChainState::parse(&read_capped(p, 4096)?)?;
+            if st.trust_version > a.trust.file().version {
+                return Err(Refusal::new(
+                    Code::Replay,
+                    format!(
+                        "the trust anchor (version {}) is older than the trust file this chain \
+                         was accepted under (version {}): the anchor was rolled back or replaced",
+                        a.trust.file().version,
+                        st.trust_version
+                    ),
+                )
+                .into());
+            }
             bundle::check_trust(&st, trust)?;
             Some(st)
         }
@@ -737,8 +1023,9 @@ pub fn verify_bundle_dir(
     let anchor = match (chain, state) {
         (_, Some(st)) => ChainAnchor::Head(st),
         (ChainMode::After { seq, hash }, None) => ChainAnchor::Head(bundle::ChainState {
-            // The operator names the head; the trust file is taken as given.
+            // The operator names the head; the trust file is as accepted.
             format: bundle::CHAIN_FORMAT.into(),
+            site: trust.file().site.clone(),
             programme: vb.manifest.programme.clone(),
             bundle_seq: *seq,
             bundle_hash: hash.clone(),
@@ -751,21 +1038,7 @@ pub fn verify_bundle_dir(
     check_bundle_files(dir, &vb.manifest, true)?;
     let mut rpks = Vec::new();
     for e in &vb.manifest.rpks {
-        let rdir = dir.join(&e.dir);
-        let mbytes = read_capped(&rdir.join(MANIFEST_FILE), MAX_MANIFEST_BYTES)?;
-        if rpk::rpk_digest(&mbytes) != e.digest {
-            return Err(Refusal::new(
-                Code::DigestMismatch,
-                format!("{}: MANIFEST.json is not the RPK bundle.json names", e.dir),
-            )
-            .into());
-        }
-        let sb = read_capped(&rdir.join(SIGNATURE_FILE), MAX_SIGSET_BYTES)?;
-        let v = rpk::verify_manifest(&mbytes, &sb, trust, now).map_err(|r| r.context(&e.dir))?;
-        check_rpk_files(&vb.manifest, e, &v.manifest)?;
-        rpk::verify_content(&v.manifest, &mut |c| read_chunk(&rdir, c))
-            .map_err(|r| r.context(&e.dir))?;
-        rpks.push(v);
+        rpks.push(verify_listed_rpk(dir, &vb.manifest, e, trust, now)?);
     }
     Ok(BundleReport {
         bundle: vb,
@@ -774,10 +1047,72 @@ pub fn verify_bundle_dir(
     })
 }
 
+/// Import a bundle from untrusted media (13a review finding 6): the
+/// verify-then-use gap on removable media is closed by never using the
+/// media's bytes after a check. `bundle.json` is authenticated first
+/// (release quorum, programme), the media tree must be exactly its listing
+/// (no symlink, special file, stray file or directory), every listed file
+/// is copied into a staging directory next to `to` reading at most its
+/// listed size and hashing while copying, and then the **copy** is
+/// verified completely (chain, tree, every hash, every RPK) before it is
+/// renamed to `to`. Only `to` may be used afterwards; the media may
+/// change at will (a malicious USB device serving other bytes on a second
+/// read) without effect. `to` must not exist and should be on trusted
+/// local storage.
+pub fn import_bundle(
+    from: &Path,
+    to: &Path,
+    site: &SiteTrust,
+    chain: &ChainMode,
+    now: u64,
+) -> Result<BundleReport, Fail> {
+    let bbytes = read_capped(&from.join(BUNDLE_FILE), MAX_BUNDLE_BYTES)?;
+    let sbytes = read_capped(&from.join(BUNDLE_SIG_FILE), MAX_SIGSET_BYTES)?;
+    let vb = verify_bundle_manifest(&bbytes, &sbytes, &site.trust)?;
+    let tree = walk(from)?;
+    let mut want: BTreeSet<String> = vb.manifest.files.iter().map(|f| f.path.clone()).collect();
+    want.insert(BUNDLE_FILE.into());
+    want.insert(BUNDLE_SIG_FILE.into());
+    require_exact(from, &tree, &want)?;
+    let staging = Staging::new(to)?;
+    write_new(&staging.dir.join(BUNDLE_FILE), &bbytes)?;
+    write_new(&staging.dir.join(BUNDLE_SIG_FILE), &sbytes)?;
+    for f in &vb.manifest.files {
+        // Paths follow the bundle grammar (no traversal is expressible).
+        ensure_dirs(&staging.dir, &f.path)?;
+        let (n, sha) = copy_hashed(&from.join(&f.path), &staging.dir.join(&f.path), f.size)?;
+        if n != f.size || sha != f.sha256 {
+            return Err(Refusal::new(
+                Code::FileMismatch,
+                format!("{} differs from bundle.json", f.path),
+            )
+            .into());
+        }
+    }
+    let r = verify_bundle_dir(&staging.dir, site, chain, now)
+        .map_err(|e| prefix(e, "the imported copy"))?;
+    if r.bundle.hash != vb.hash {
+        return Err(Refusal::new(Code::DigestMismatch, "the imported copy changed").into());
+    }
+    staging.publish(to)?;
+    Ok(r)
+}
+
 /// Persist the chain head after an accepted bundle, with the trust file
-/// it was accepted under (atomic replace).
-pub fn commit_chain(state: &Path, b: &VerifiedBundle, trust: &VerifiedTrust) -> Result<(), Fail> {
-    write_replace(state, &bundle::ChainState::after(b, trust).to_bytes()?)
+/// it was accepted under (atomic replace). The site's trust anchor is
+/// advanced first when the bundle was accepted under a rotation of it, so
+/// a chain state never records a trust version above the anchor's.
+pub fn commit_chain(state: &Path, b: &VerifiedBundle, site: &SiteTrust) -> Result<(), Fail> {
+    if site.anchor.is_none() {
+        return Err(Fail::Io(
+            "committing a chain state needs the site's trust anchor (--trust-anchor)".into(),
+        ));
+    }
+    commit_anchor(site)?;
+    write_replace(
+        state,
+        &bundle::ChainState::after(b, &site.trust).to_bytes()?,
+    )
 }
 
 /// Rebuild missing or damaged files of a bundle from its parity. The
@@ -802,8 +1137,7 @@ pub fn repair_bundle(dir: &Path, trust: &VerifiedTrust) -> Result<Vec<String>, F
         let mut erased = Vec::new();
         for (pos, &i) in members.iter().enumerate() {
             let f = &m.files[i];
-            let ok =
-                matches!(hash_file(&dir.join(&f.path)), Ok((s, h)) if s == f.size && h == f.sha256);
+            let ok = matches!(hash_file_listed(&dir.join(&f.path), f.size), Ok(Some(h)) if h == f.sha256);
             if !ok {
                 erased.push(pos);
             }
@@ -869,8 +1203,8 @@ pub fn repair_bundle(dir: &Path, trust: &VerifiedTrust) -> Result<Vec<String>, F
         for (pos, (tmp, f)) in &outs {
             let entry = &m.files[members[*pos]];
             f.sync_all().map_err(|e| io_err(tmp, e))?;
-            let (size, sha) = hash_file(tmp)?;
-            if size != entry.size || sha != entry.sha256 {
+            let ok = matches!(hash_file_listed(tmp, entry.size)?, Some(sha) if sha == entry.sha256);
+            if !ok {
                 cleanup(&outs);
                 return Err(Refusal::new(
                     Code::FileMismatch,

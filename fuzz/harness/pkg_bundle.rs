@@ -44,6 +44,12 @@ pub fn run(data: &[u8]) {
         if let Ok(v) = bundle::verify_bundle_manifest(doc, sig, trust()) {
             assert!(v.signers.count(Role::Release) >= 2);
             assert!(trust().accepts_programme(&v.manifest.programme));
+            for r in &v.manifest.rpks {
+                assert_eq!(
+                    trust().programme_of_package(&r.name),
+                    Some(v.manifest.programme.as_str())
+                );
+            }
             assert_eq!(v.hash, h);
             let set = SignatureSet::parse(sig).expect("parses");
             assert_eq!(set.to_bytes().expect("ser"), *sig);
@@ -96,6 +102,7 @@ fn check_bundle(b: &BundleManifest, doc: &[u8], h: &str) {
         ] {
             let head = ChainState {
                 format: bundle::CHAIN_FORMAT.into(),
+                site: SITE.into(),
                 programme: b.programme.clone(),
                 bundle_seq: head_seq,
                 bundle_hash: head_hash.clone(),

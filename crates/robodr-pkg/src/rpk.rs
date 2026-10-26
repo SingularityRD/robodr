@@ -573,6 +573,12 @@ pub fn check_policy(
             format!("RPK {} {} ({digest}) is revoked", m.name, m.version.serial),
         ));
     }
+    if trust.is_serial_revoked(&m.name, m.version.serial) {
+        return Err(Refusal::new(
+            Code::RevokedRpk,
+            format!("{} serial {} is revoked", m.name, m.version.serial),
+        ));
+    }
     let floor = trust.floor(&m.name);
     if m.version.serial < floor {
         return Err(Refusal::new(
@@ -601,10 +607,15 @@ pub struct VerifiedManifest {
     pub manifest: Manifest,
     pub digest: String,
     pub signers: Signers,
+    /// The programme that owns the package name (whose release keys
+    /// signed it).
+    pub programme: String,
 }
 
 /// Parse, validate, check the release quorum's signatures and the site
-/// policy of an RPK manifest.
+/// policy of an RPK manifest. The quorum is that of the programme the
+/// trust file gives the package name to; a release key of another
+/// programme refuses it ([`Code::WrongScope`], 13a review finding 5).
 pub fn verify_manifest(
     manifest_bytes: &[u8],
     sigset_bytes: &[u8],
@@ -613,18 +624,27 @@ pub fn verify_manifest(
 ) -> Result<VerifiedManifest, Refusal> {
     let manifest = parse_manifest(manifest_bytes)?;
     let digest = rpk_digest(manifest_bytes);
+    let programme = trust
+        .programme_of_package(&manifest.name)
+        .ok_or_else(|| {
+            Refusal::new(
+                Code::WrongScope,
+                format!(
+                    "RPK {}: no programme of this site delivers that package",
+                    manifest.name
+                ),
+            )
+        })?
+        .to_string();
     let set = SignatureSet::parse(sigset_bytes)?;
     let signers = set.check(trust, &[Role::Release], MANIFEST_SIG_DOMAIN, manifest_bytes)?;
-    signers.require(
-        Role::Release,
-        trust.file().quorum.release as usize,
-        "RPK manifest",
-    )?;
+    trust.require_release_quorum(&signers, &programme, "RPK manifest")?;
     check_policy(&manifest, &digest, trust, now)?;
     Ok(VerifiedManifest {
         manifest,
         digest,
         signers,
+        programme,
     })
 }
 

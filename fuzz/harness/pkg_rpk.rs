@@ -45,6 +45,11 @@ pub fn run(data: &[u8]) {
     if let Ok(v) = rpk::verify_manifest(doc, sig, trust(), NOW) {
         assert!(v.signers.count(Role::Release) >= trust().file().quorum.release as usize);
         assert_eq!(v.digest, d);
+        // Signed by the release keys of the programme owning the name.
+        assert_eq!(
+            trust().programme_of_package(&v.manifest.name),
+            Some(v.programme.as_str())
+        );
         // The signature really is over the domain-separated bytes.
         let set = SignatureSet::parse(sig).expect("verified set parses");
         assert!(set
