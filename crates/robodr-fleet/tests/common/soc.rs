@@ -185,6 +185,7 @@ impl Soc {
         Envelope::sign(kind, payload, &[&self.soc_key]).to_bytes()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn approval(
         &mut self,
         approval_id: &str,

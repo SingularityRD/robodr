@@ -662,7 +662,10 @@ pub fn files() -> Vec<(String, Vec<u8>)> {
 }
 
 /// Fuzz seeds: (token seeds, envelope seeds), each (file name, bytes).
-pub fn fuzz_seeds() -> (Vec<(String, Vec<u8>)>, Vec<(String, Vec<u8>)>) {
+/// Named seed files.
+pub type Seeds = Vec<(String, Vec<u8>)>;
+
+pub fn fuzz_seeds() -> (Seeds, Seeds) {
     let toks = TOKENS
         .iter()
         .map(|(id, ..)| (format!("seed-{id}.txt"), token_text(id).into_bytes()))
