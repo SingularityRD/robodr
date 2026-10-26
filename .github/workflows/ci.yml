@@ -158,7 +158,11 @@ jobs:
       - name: install-bundle.sh against a real dpkg (root; Sprint 9 update/rollback test)
         # The test binary is built as the runner user and run as root, so no
         # root-owned files land in target/ (the cache).
+        # minisign: the signed-install tests (signature, private extraction,
+        # a tampered extracted directory refused).
         run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends minisign
           bin=$(cargo test -p robodr-fleet --test packaging $CARGO_LOCKED --no-run 2>&1 |
             sed -n 's/.*Executable tests\/packaging.rs (\(.*\))$/\1/p')
           test -x "$bin"

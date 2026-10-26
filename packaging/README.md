@@ -29,7 +29,8 @@ operator installs on a robot. The procedures that use it are in
 | `deb/` | `DEBIAN/` | control template, maintainer scripts |
 | `build-deb.sh` | (build time) | reproducible `.deb` from built binaries: `robodr` (default) or `robodr-focal` (`--variant focal`, static binaries only) |
 | `make-bundle.sh` | (build time) | offline install bundle |
-| `install-bundle.sh` | inside the bundle | verify, install, list, roll back on the robot |
+| `install-bundle.sh` | inside the bundle; `/usr/lib/robodr/install-bundle.sh` | verify (signature, then a private extraction), install, list, roll back on the robot; the installed copy is the trusted verifier for the next upgrade |
+| `security-floor` | inside the bundle | `min_version=`: no install or rollback below it (recorded per unit, only rises) |
 
 The units, tmpfiles and sysusers fragments were checked with
 `systemd-analyze verify`, `systemd-analyze security --offline`,
@@ -131,7 +132,8 @@ Neither watchdog has been exercised under a real systemd yet.
 ├── archive/                     0750 root:robodr   black boxes closed by a key rotation
 ├── executor/                    0700 robodr-exec:robodr journal of robodr-executor (active actions, TTL deadlines)
 ├── fleet/                       0700 root:root     robodr-enroll state, staged profile, fleet journal (black box)
-└── releases/<version>/          0750 root:root     .deb kept for rollback (install-bundle.sh)
+├── releases/<version>/          0750 root:root     .deb kept for rollback (install-bundle.sh)
+└── releases/security-floor      0644 root:root     lowest release install/rollback may reach (only rises)
 /run/robodr-pulsard/pulsar.sock                     Pulsar API socket (RuntimeDirectory)
 /run/robodr-executor/executor.sock                  agentd -> robodr-executor (0660 robodr-exec:robodr, dir 0750)
 /run/credentials/<unit>/blackbox.key                key copy for the service (systemd)

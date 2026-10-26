@@ -228,6 +228,10 @@ fi
 # Fleet lifecycle (Sprint 9): robodr-enroll and its configuration example.
 # (config/fleet.example.json goes to the examples with the other configs.)
 install_bin robodr-enroll usr/sbin 0 || true
+# A trusted copy of the bundle installer for the next upgrade: it verifies a
+# new tarball's signature and installs from a private extraction
+# (OPERATIONS.md section 3; never run the copy inside an unverified bundle).
+install -D -m 0755 "$here/install-bundle.sh" "$pkg/usr/lib/robodr/install-bundle.sh"
 # On-disk formats this release writes and reads (install-bundle.sh's
 # black-box format gate on install and rollback).
 install -D -m 0644 "$here/formats" "$pkg/usr/share/robodr/formats"
