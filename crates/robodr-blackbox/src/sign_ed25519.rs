@@ -41,10 +41,18 @@
 //! - the check is the **cofactorless** equation `[S]B = R + [k]A` with
 //!   `k = SHA-512(R || A || M) mod L`.
 //!
-//! Points of mixed order (a large-order point plus a small-order torsion
-//! component) are not rejected; for signatures produced by an honest signer
-//! that never happens, and cofactorless verification is deterministic about
-//! them. Only PureEdDSA (`Ed25519`) is provided, not `Ed25519ctx`/`Ed25519ph`.
+//! - `A` must be **torsion-free** (in the prime-order subgroup). A
+//!   mixed-order key `A + T` (`T` a small-order torsion point) is a valid,
+//!   canonical encoding with another fingerprint than `A`, yet the holder of
+//!   `A`'s secret can sign under it (cofactorless verification accepts about
+//!   one nonce in two, eight for an order-8 `T`). Accepting it would let one
+//!   secret count as two signers in a quorum that de-duplicates by
+//!   fingerprint (review of Sprint 13a, finding 2). Honestly generated keys
+//!   (`A = [a]B`) are always torsion-free, so no real key is affected.
+//!
+//! `R` of mixed order is not rejected (it only changes which nonce verifies,
+//! not who can sign). Only PureEdDSA (`Ed25519`) is provided, not
+//! `Ed25519ctx`/`Ed25519ph`.
 
 use crate::crypto::{fill_random, sha256, to_hex, wipe};
 use crate::sign::{SignError, Signer, Verifier, MAX_KEY_ID_LEN};
@@ -103,12 +111,14 @@ pub fn sha512(data: &[u8]) -> [u8; SHA512_DIGEST_LEN] {
 // ---------------------------------------------------------------------------
 
 /// Strict public-key decoding: the bytes must decode to a curve point, be its
-/// canonical encoding (`y < p`, no `x = 0` with the sign bit set) and the
-/// point must not be of small order.
+/// canonical encoding (`y < p`, no `x = 0` with the sign bit set), and the
+/// point must not be of small order and must be torsion-free (no mixed-order
+/// "twin" of a real key; see the module docs).
 fn decode_public_strict(bytes: &[u8; PUBLIC_KEY_LEN]) -> Option<ed25519_dalek::VerifyingKey> {
     let vk = ed25519_dalek::VerifyingKey::from_bytes(bytes).ok()?;
+    let point = vk.to_edwards();
     // `from_bytes` accepts non-canonical `y`; re-encoding exposes it.
-    if vk.to_edwards().compress().to_bytes() != *bytes || vk.is_weak() {
+    if point.compress().to_bytes() != *bytes || vk.is_weak() || !point.is_torsion_free() {
         return None;
     }
     Some(vk)
@@ -160,7 +170,8 @@ pub fn verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
 pub enum Ed25519Error {
     /// Key id is empty, longer than [`MAX_KEY_ID_LEN`], or not printable ASCII.
     BadKeyId,
-    /// Public key is not a canonical encoding of a point of large order.
+    /// Public key is not a canonical encoding of a torsion-free point of
+    /// large order.
     InvalidPublicKey,
     /// The operating-system randomness source failed.
     Rng(String),
@@ -174,7 +185,10 @@ impl fmt::Display for Ed25519Error {
                 "key id must be 1..={MAX_KEY_ID_LEN} printable ASCII characters"
             ),
             Ed25519Error::InvalidPublicKey => {
-                write!(f, "not a valid (canonical, large-order) Ed25519 public key")
+                write!(
+                    f,
+                    "not a valid (canonical, large-order, torsion-free) Ed25519 public key"
+                )
             }
             Ed25519Error::Rng(e) => write!(f, "randomness source failed: {e}"),
         }
@@ -276,8 +290,8 @@ impl Ed25519SigningKey {
 
     /// The matching verifier, under the same key id.
     pub fn verifying_key(&self) -> Ed25519VerifyingKey {
-        // The public key of a clamped secret scalar is canonical and never of
-        // small order, and the key id was checked by the constructor, so the
+        // The public key of a clamped secret scalar is canonical, never of
+        // small order and torsion-free (`[a]B`), and the key id was checked by the constructor, so the
         // strict checks of `Ed25519VerifyingKey::from_bytes` are not needed
         // (unit-tested below).
         Ed25519VerifyingKey {
@@ -325,7 +339,7 @@ impl Signer for Ed25519SigningKey {
 }
 
 /// Ed25519 public key usable as a [`Verifier`]. Construction validates the
-/// key (canonical, not small order), so a verifier can never be built
+/// key (canonical, not small order, torsion-free), so a verifier can never be built
 /// around a key that would accept forged signatures.
 #[derive(Clone)]
 pub struct Ed25519VerifyingKey {
@@ -462,6 +476,31 @@ mod tests {
                     "y = p + {k}, sign {sign}"
                 );
             }
+        }
+    }
+
+    /// Review 13a finding 2: `A + T` (T a torsion point) is a canonical,
+    /// non-small-order encoding with another fingerprint than `A`, and the
+    /// holder of `A`'s secret can sign under it (cofactorless verify, about
+    /// 1 in 2 nonces). Such a "twin" would count as a second signer in a
+    /// quorum, so mixed-order keys are refused.
+    #[test]
+    fn mixed_order_twin_keys_are_refused() {
+        let order2 = ed25519_dalek::VerifyingKey::from_bytes(&h32(
+            "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        ))
+        .unwrap()
+        .to_edwards();
+        for i in 0..32u8 {
+            let k = Ed25519SigningKey::from_seed("a", &[i.wrapping_mul(7) ^ 0x31; 32]).unwrap();
+            let a = ed25519_dalek::VerifyingKey::from_bytes(&k.public_key())
+                .unwrap()
+                .to_edwards();
+            let twin = (a + order2).compress().to_bytes();
+            assert_ne!(twin, k.public_key());
+            assert!(decode_public_strict(&k.public_key()).is_some());
+            assert!(decode_public_strict(&twin).is_none(), "twin of key {i}");
+            assert!(Ed25519VerifyingKey::from_bytes("twin", &twin).is_err());
         }
     }
 }
