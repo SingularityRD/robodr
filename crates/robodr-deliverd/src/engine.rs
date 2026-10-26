@@ -598,6 +598,21 @@ impl Engine {
             self.save()?;
             return Ok(());
         }
+        // The same serial with other content (a release re-signed into
+        // another manifest) would be "already active" to the installers.
+        if let Some(i) = self.state.installed.get(&it.name) {
+            if i.ver.serial == m.version.serial && i.ver.digest != it.digest {
+                return self.refuse_item(
+                    idx,
+                    "equivocation",
+                    format!(
+                        "serial {} is installed with other content",
+                        m.version.serial
+                    ),
+                    rep,
+                );
+            }
+        }
         // 2. Policy at the moment of use: floors (unit and site),
         // revocations, the unit checks.
         if let Some(a) = &self.anchor {

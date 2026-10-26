@@ -14,9 +14,13 @@
 //!   so a probe that forks a child to keep running is killed with it.
 //! * stdout and stderr are read concurrently; at most `max_output` bytes
 //!   are kept, the rest is read and discarded (a flood never blocks the
-//!   child, never grows memory). Readers that are still blocked after the
-//!   kill (a process escaped the group with `setsid` and holds the pipe)
-//!   are abandoned and the run counts as failed.
+//!   child, never grows memory). A probe that exits but leaves processes
+//!   holding its output fails, and those left in its group are killed;
+//!   readers still blocked after that (a process escaped the group with
+//!   `setsid` and holds the pipe) are abandoned and the run fails too.
+//! * The group is signalled before the child is reaped (timeout), or only
+//!   while members of it still hold the pipes (after a normal exit), so
+//!   the group id cannot have been reused by an unrelated process.
 
 use std::io::Read;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -58,6 +62,8 @@ pub struct RunResult {
     pub output: String,
     /// The program could not be started (the reason).
     pub spawn_error: Option<String>,
+    /// The probe exited but left processes holding its output (killed).
+    pub left_processes: bool,
     /// A pipe was still held open after the kill (escaped process).
     pub pipes_held: bool,
     pub elapsed_ms: u64,
@@ -66,7 +72,11 @@ pub struct RunResult {
 impl RunResult {
     /// Exit 0, in time, nothing escaped.
     pub fn success(&self) -> bool {
-        self.code == Some(0) && !self.timed_out && self.spawn_error.is_none() && !self.pipes_held
+        self.code == Some(0)
+            && !self.timed_out
+            && self.spawn_error.is_none()
+            && !self.left_processes
+            && !self.pipes_held
     }
 
     /// One line for evidence: outcome and at most 256 printable bytes of
@@ -88,7 +98,12 @@ impl RunResult {
             .take(256)
             .collect();
         format!(
-            "{how}{}{}; output {} bytes{}: {out}",
+            "{how}{}{}{}; output {} bytes{}: {out}",
+            if self.left_processes {
+                ", left processes behind (killed)"
+            } else {
+                ""
+            },
             if self.pipes_held {
                 ", output pipe held by an escaped process"
             } else {
@@ -161,6 +176,7 @@ pub fn run(argv: &[String], user: Option<RunAs>, limits: Limits) -> RunResult {
         truncated: false,
         output: String::new(),
         spawn_error: None,
+        left_processes: false,
         pipes_held: false,
         elapsed_ms: 0,
     };
@@ -210,18 +226,33 @@ pub fn run(argv: &[String], user: Option<RunAs>, limits: Limits) -> RunResult {
         }
         std::thread::sleep(Duration::from_millis(10));
     };
-    // A child that exited normally may have left grandchildren in its group
-    // holding the pipes: they die with the group too.
-    kill_group(pgid);
     if let Some(st) = status {
         res.code = st.code();
         res.signal = st.signal();
     }
+    // The child is reaped. Readers that do not finish within the grace
+    // period mean something still holds the pipes: processes the probe
+    // left behind. Those that stayed in its group keep the group id in use
+    // (Linux does not reuse a pid while a process group of that id has
+    // members), so signalling the group now reaches only them. The run
+    // fails either way: a probe must not leave processes behind.
     let grace = Duration::from_millis(1000);
+    let rxs: Vec<_> = [out_rx, err_rx].into_iter().flatten().collect();
+    let mut got: Vec<Option<(Vec<u8>, u64)>> =
+        rxs.iter().map(|rx| rx.recv_timeout(grace).ok()).collect();
+    if got.iter().any(Option::is_none) {
+        res.left_processes = true;
+        kill_group(pgid);
+        for (g, rx) in got.iter_mut().zip(&rxs) {
+            if g.is_none() {
+                *g = rx.recv_timeout(grace).ok();
+            }
+        }
+    }
     let mut kept = Vec::new();
-    for rx in [out_rx, err_rx].into_iter().flatten() {
-        match rx.recv_timeout(grace) {
-            Ok((b, total)) => {
+    for g in got {
+        match g {
+            Some((b, total)) => {
                 res.output_bytes += total;
                 if total > b.len() as u64 {
                     res.truncated = true;
@@ -229,7 +260,7 @@ pub fn run(argv: &[String], user: Option<RunAs>, limits: Limits) -> RunResult {
                 let room = limits.max_output.saturating_sub(kept.len());
                 kept.extend_from_slice(&b[..b.len().min(room)]);
             }
-            Err(_) => res.pipes_held = true,
+            None => res.pipes_held = true,
         }
     }
     res.output = String::from_utf8_lossy(&kept).into_owned();
@@ -298,6 +329,20 @@ mod tests {
             !r.pipes_held,
             "the group kill must also free the pipe: {r:?}"
         );
+        assert!(r.elapsed_ms < 5000, "{r:?}");
+    }
+
+    #[test]
+    fn a_probe_that_exits_but_leaves_a_child_fails_and_the_child_dies() {
+        let r = run(
+            &sv(&["/bin/sh", "-c", "sleep 30 & exit 0"]),
+            None,
+            lim(5000),
+        );
+        assert_eq!(r.code, Some(0));
+        assert!(r.left_processes, "{r:?}");
+        assert!(!r.pipes_held, "{r:?}");
+        assert!(!r.success());
         assert!(r.elapsed_ms < 5000, "{r:?}");
     }
 

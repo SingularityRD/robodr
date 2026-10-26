@@ -211,9 +211,11 @@ fn check_layout(pack: &Path) -> Result<Vec<(String, PathBuf)>, Refused> {
     let rd =
         fs::read_dir(pack).map_err(|e| Refused::new(Code::MissingFile, format!("pack: {e}")))?;
     let mut seen = Vec::new();
-    for e in rd.take(64) {
+    for e in rd {
         let e = e.map_err(|e| Refused::new(Code::Invalid, format!("pack: {e}")))?;
         let name = e.file_name().to_string_lossy().into_owned();
+        // Every entry is judged: the first unexpected one refuses the pack
+        // (so a listing is never read past six entries).
         if !want.contains(&name) {
             return Err(Refused::new(
                 Code::UnexpectedFile,
@@ -697,8 +699,11 @@ fn import_into(
         check_item(cfg, state, &v.manifest, &others)?;
     }
     manifests.retain(|k, _| d.items.iter().any(|i| &i.rpk_digest == k));
+    // The floor only takes signed time: in trusted mode never beyond the
+    // clock at acceptance either, so one wrong reading of the system clock
+    // is not made permanent.
     let time_floor = match cfg.trust.clock {
-        ClockTrust::Trusted => state.time_floor.max(now1),
+        ClockTrust::Trusted => state.time_floor.max(d.created_at.min(now1)),
         ClockTrust::Untrusted => state.time_floor.max(d.created_at),
     };
     Ok(Outcome::Imported(Box::new(Imported {
