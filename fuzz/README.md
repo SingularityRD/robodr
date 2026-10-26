@@ -18,6 +18,7 @@ violated output invariant (documented at the top of its harness file).
 | `commission_jsonl` | robodr-commission | a JSONL recording to `JsonlSource`, `Learner`, strict re-read of the learned draft, `check_event` | same |
 | `firewall_policy` | robodr-agent / robodr-firewall | `profile JSON \0 command bytes` to `strict_from_str`, `FirewallSettings::from_profile`, `Policy::compile`, `Firewall::check` | `crates/robodr-agent/tests/fuzz_smoke.rs` |
 | `pipeline_config` | robodr-ros2-pipeline | sensor `Config` (JSON) to `validate_with`, a `Pipeline` over RTPS fixtures, `/proc/net/route` parsing | `crates/robodr-ros2-pipeline/tests/fuzz_smoke.rs` |
+| `firewall_gw_packet` | robodr-firewall-gw | a flags byte + framed records (each wrapped in IPv4 / UDP) to `Gateway::process` (strict RTPS walk, SEDP learning, `LowCmd_` / sport `Request_` / Go1 decode, firewall decision, in-place rewrite), and the bytes to the NFQUEUE netlink parser | `crates/robodr-firewall-gw/tests/fuzz_smoke.rs` |
 
 The firewall crate has no file format of its own (and no serde): its policy
 is compiled from the profile JSON the agent parses, so that target and its

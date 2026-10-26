@@ -1,0 +1,112 @@
+# robodr-firewall-gw: the in-path Motion Firewall gateway on the sensor box
+# ----------------------------------------------------------------------------
+# robodr-focal VARIANT for systemd 245 (Ubuntu 20.04, NVIDIA JetPack 5 / L4T
+# 35). Generated from packaging/systemd/robodr-firewall-gw.service and kept in step with it by
+# scripts/check-focal-units.py (CI). Differences, all forced by systemd 245:
+#   * ProtectProc= and ProcSubset= (systemd 247) are dropped: every process
+#     of the host stays visible in this unit's /proc. Nothing replaces them
+#     on 245 (hidepid= is not per unit).
+# On a cgroup v1 / hybrid host (Ubuntu 20.04 default) MemoryHigh= has no
+# effect and MemoryMax= is applied as the v1 memory limit; IPAddressDeny=
+# needs the kernel's cgroup BPF support (CONFIG_CGROUP_BPF).
+# ----------------------------------------------------------------------------
+# (inline bridge, NFQUEUE). See crates/robodr-firewall-gw/README.md.
+#
+# NOT A SAFETY-RATED DEVICE. This is a cyber-security control in front of
+# the robot's own safety functions (e-stop, safety controller, motor
+# drivers' protections), which remain primary. It can only pass, reduce,
+# hold or remove commands that cross the bridge.
+#
+# Checked against crates/robodr-firewall-gw:
+#   * CLI: `robodr-firewall-gw run --config <json>`; exit 0 clean stop
+#     (SIGTERM/SIGINT), 1 runtime failure, 2 usage / configuration error
+#     (a profile that fails its trust checks in enforce mode is one: the
+#     gateway does not start and on_gateway_down applies).
+#   * Needs CAP_NET_ADMIN (bind an NFQUEUE over netlink) and nothing else.
+#   * sd_notify: READY=1 once the queue is bound, WATCHDOG=1 from the main
+#     loop every housekeeping_ms (default 100 ms; an idle queue still ticks
+#     through the receive timeout), STOPPING=1.
+#   * While this unit is down, the kernel applies the ruleset's flag:
+#     fail_closed (default) drops the queued motion datagrams, bypass lets
+#     them pass unchecked (refused for humanoid joint channels).
+#
+# Verify after editing: systemd-analyze verify robodr-firewall-gw.service
+#                       systemd-analyze security robodr-firewall-gw.service
+
+[Unit]
+Description=RoboDR inline Motion Firewall gateway (NFQUEUE)
+Documentation=file:/usr/share/doc/robodr/OPERATIONS.md
+AssertPathExists=/etc/robodr/firewall-gw.json
+Requires=robodr-firewall-gw-rules.service
+After=robodr-firewall-gw-rules.service local-fs.target
+StartLimitIntervalSec=60
+StartLimitBurst=20
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/sbin/robodr-firewall-gw run --config /etc/robodr/firewall-gw.json
+# Every restart is time without commands (fail_closed) or without checks
+# (bypass): restart fast.
+Restart=on-failure
+RestartSec=200ms
+RestartPreventExitStatus=2
+TimeoutStopSec=5s
+# The loop pings every housekeeping_ms (100 ms): 2 s means stalled.
+WatchdogSec=2s
+
+# --- Scheduling ----------------------------------------------------------------
+# In the motion path: real-time FIFO priority so the decision is not
+# delayed behind other work on the box. The loop blocks in recv(2) between
+# packets, so it does not starve the box. Tune with the OEM; measure with
+# tests/netns_e2e.rs and examples/gw_latency.rs on the target.
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=40
+# The sensor box exists for this process: the OOM killer picks others first.
+OOMScoreAdjust=-500
+MemoryHigh=96M
+MemoryMax=128M
+
+# --- Identity and capabilities ---------------------------------------------
+User=robodr
+Group=robodr
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+UMask=0027
+
+# --- Filesystem --------------------------------------------------------------
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+# status_path, events_path and rtps.state_file live here.
+StateDirectory=robodr/firewall-gw
+StateDirectoryMode=0750
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# --- Network -----------------------------------------------------------------
+# Netlink only (NFQUEUE) and the journal / sd_notify; the gateway never
+# opens an IP socket: it cannot originate traffic.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+IPAddressDeny=any
+
+# --- Kernel interfaces / syscalls -------------------------------------------
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @obsolete @mount @swap @reboot @raw-io @cpu-emulation @clock @module @debug
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

@@ -351,6 +351,50 @@ sprint, AC'leri karşılanmadan kapanmaz.
   raporlanmış; `restrict_motion` gerçek robotta hız limitini uygular ve TTL sonunda
   geri alır; safe_pause yalnızca politika izinliyken çalışır.
 
+> **Durum (2026-10-26) — in-path gateway, ilk uygulama noktası:** ✅
+> `robodr-firewall-gw` (crate + binary). Tasarım seçimi: sensör kutusunda
+> **inline köprü** (iki NIC, kontrolcü tarafı / robot tarafı), Linux
+> **NFQUEUE** (br_netfilter + iptables `physdev`/`NFQUEUE`; kural seti
+> gateway yapılandırmasından `robodr-firewall-gw ruleset` ile üretiliyor;
+> `nft` `queue` deyimi kullanılmıyor — bu çekirdekte `CONFIG_NFT_QUEUE`
+> yok ve `ip` ailesi köprü portunu doğal eşleyemiyor). Her datagram için
+> ACCEPT / DROP / aynı uzunlukta yeniden yazılmış yük. Kanallar: Unitree
+> SDK2 `rt/lowcmd` (`unitree_go` / `unitree_hg` `LowCmd_`, katı RTPS +
+> kanonik CDR, sınırlanan çerçeve yerinde yeniden yazılır, CRC yeniden
+> hesaplanıp doğrulanır), sport API `Move` (parametre yeniden yazılır,
+> diğer çağrılar izin listesiyle, `2^32+id` takma adı reddedilir), Go1
+> eski UDP `HighCmd` / sıkıştırılmamış `LowCmd`. **Paket düzeyinde
+> "hold":** ikame, reddedilen örneğin **kendisine** yazılır (aynı yazıcı,
+> aynı sıra numarası, aynı uzunluk); gateway hiçbir zaman datagram veya
+> sıra numarası üretmez (eski datagramı tekrar göndermek okuyucuda
+> kopya olarak atılır; yeni SN uydurmak kontrolcünün bir sonraki gerçek
+> çerçevesini düşürtür). Yayılacak bir şey yoksa örnek PAD'e çevrilir
+> (aktarımda kaybolmuş gibi; sahte GAP yok); yeniden iletim/tekrar
+> oynatma önbellekteki kararı yeniden yayar; çözülemeyen yük bütünlük
+> hatası olarak karar görür; hareket kanalında DATA_FRAG bastırılır.
+> İnsansıda iletilen her `LowCmd_` ya kabul edilmiş ya da son kabul
+> edilenin hold'u (asla sönümleme/gevşek değil). Gateway düşerse
+> `queue.on_gateway_down`: `fail_closed` (varsayılan) veya `bypass`
+> (insansı eklem kanalında reddedilir); watchdog (systemd 2 s), geç
+> paket → firewall arıza kararı. Fizibilite: bu VM'de (çekirdek 6.18)
+> NFQUEUE + köprü + netns uçtan uca çalıştı. **Gecikme (paylaşılan,
+> yüklü VM, RT değil):** karar yolu 35 motor @1 kHz p50 10–14 µs / p99
+> ≈ 35 µs; çekirdek üzerinden uçtan uca ek gecikme medyan ≈ 20–70 µs
+> (sakin koşuda 1 kHz'te ek p99 ≈ 60 µs), 1 kHz'te 3000/3000 ve 500 Hz'te
+> 1500/1500 çerçeve iletildi; p99 bu VM'de güvenilir ölçülemiyor (taban
+> çizgisinin kendisi ms düzeyinde kuyruklu) —
+> AC'deki p99 < 1 ms hedef sensör kutusunda ölçülecek (`gw_latency
+> --budget-p99-ns`, `tests/netns_e2e.rs`). Testler: 20 doğrulama testi
+> (referans firewall ile karşılaştırmalı rastgele akış dahil), birim
+> testleri, gerçek çekirdekte netns uçtan uca testi, fuzz hedefi
+> `firewall_gw_packet`. **Kalan:** gerçek Go2/G1 ve gerçek sensör
+> kutusunda doğrulama ve gecikme ölçümü; Unitree `rt/lowcmd` QoS'u ve
+> motor kartının akış kaybındaki davranışı (OEM); ROS 2 `/cmd_vel` /
+> `JointTrajectory` gateway'i; loco `SetVelocity`, kol/el SDK
+> kanalları; gateway'e özgü bulgu kuralları (sözleşme 2.2) ve olay
+> dosyasının agentd'ye beslenmesi; `restrict_motion` kontrol düzlemi
+> adaptörü ve `safe_pause` adaptörleri.
+
 ### Sprint 9 — Filo yaşam döngüsü: kayıt, anahtar, güncelleme
 
 - **A/F:** Robot onboarding akışı: UI'da robot ekle → tek kullanımlık kayıt token'ı →
@@ -448,7 +492,7 @@ ayrıştırıcısı Cyclone trafiğini zaten gerçek yakalamalarla doğrulanmı�
 |---|---|---|
 | DDS grafiği, rogue participant / bilinmeyen yayıncı tespiti (`rt/lowcmd` vb.) | ✅ Canlı (agentd), sentetik Cyclone trafiğiyle uçtan uca test | Gerçek Go2/G1 yakalamaları |
 | Hareket içeriğini okuma (CDR) | ✅ Tüm SDK2 tipleri + eski UDP (Go1); bağımsız vektörlerle doğrulandı | Gerçek trafikle doğrulama; Go1 sıkıştırılmış düşük seviye çerçeve |
-| Motion Firewall zarfı | ✅ Eklem başına q/dq/tau/kp/kd, adım/PD tork, CRC, mod pin'leri; 1 kHz'te p99 ≈ 7–9 µs (VM) — **yalnız kayıt modu** | In-path gateway; Jetson/RT çekirdekte ölçüm |
+| Motion Firewall zarfı | ✅ Eklem başına q/dq/tau/kp/kd, adım/PD tork, CRC, mod pin'leri; 1 kHz'te p99 ≈ 7–9 µs (VM) — pasif modda kayıt; ✅ **in-path inline köprü gateway'i** (`robodr-firewall-gw`, NFQUEUE; S8) | Gerçek robot ve hedef sensör kutusunda doğrulama / gecikme ölçümü |
 | Host izleme (Pulsar) | ✅ Kural paketi (`rules/robodr/unitree.toml`); JetPack 5/6 için statik `robodr-focal` paketi (agentd-only) | `robodr-pulsard` için BTF'li çekirdek + glibc 2.35 build; kapalı ana kontrolcü kapsanamaz |
 | Agentless mod | ✅ Sensör kutusu yapılandırması, systemd drop-in, networkd/nftables örnekleri, VLAN | Referans donanım imajı (S7), sahada deneme |
 | Yanıt | ✅ İnsansıda enerji kesen aksiyon yok, ikameler onaylı, `min_motion_factor`; hepsi plan/kayıt | Yürütücü (S7), `restrict_motion` sport API adaptörü (S8) |
@@ -507,9 +551,9 @@ katılımcısı / `rt/lowcmd`'ye yetkisiz yazıcı, imzalı kara kutu ile adli k
 >   **Yalnız sentetik trafik ve IDL'den türetilmiş bağımsız vektörlerle;
 >   gerçek bir Unitree yakalaması henüz yok.**
 >
-> **Kalan (dürüst durum):** firewall'ın **in-path gateway**'i yok (kütüphane
-> karar veriyor ve agentd kayıt modunda çalıştırıyor; `rt/lowcmd`'ye abone
-> olup yeniden yayınlayan süreç yok — sonraki sprint); decoder'lar, kurallar
+> **Kalan (dürüst durum):** firewall'ın **in-path gateway**'i artık var
+> (`robodr-firewall-gw`, S8 durumuna bakın) ama yalnız sentetik trafikle ve
+> ağ ad alanlarında test edildi; decoder'lar, kurallar
 > ve canlı yol **gerçek Go2/G1 trafiğiyle doğrulanmadı** (yalnız yayımlanmış
 > IDL, el yapımı ve bağımsız vektörler, sentetik yakalamalar); **A2 / AS2**
 > düşük seviye örneği olmadığı için motor sayısı / IDL ailesi ve modele özgü

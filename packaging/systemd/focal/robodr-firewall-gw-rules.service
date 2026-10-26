@@ -1,0 +1,46 @@
+# robodr-firewall-gw-rules: installs the netfilter ruleset that hands the
+# ----------------------------------------------------------------------------
+# robodr-focal VARIANT for systemd 245 (Ubuntu 20.04, NVIDIA JetPack 5 / L4T
+# 35). Generated from packaging/systemd/robodr-firewall-gw-rules.service and kept in step with it by
+# scripts/check-focal-units.py (CI). Differences, all forced by systemd 245:
+#   * ProtectProc= and ProcSubset= (systemd 247) are dropped: every process
+#     of the host stays visible in this unit's /proc. Nothing replaces them
+#     on 245 (hidepid= is not per unit).
+# On a cgroup v1 / hybrid host (Ubuntu 20.04 default) MemoryHigh= has no
+# effect and MemoryMax= is applied as the v1 memory limit; IPAddressDeny=
+# needs the kernel's cgroup BPF support (CONFIG_CGROUP_BPF).
+# ----------------------------------------------------------------------------
+# inline bridge's motion datagrams to the gateway's NFQUEUE (see
+# crates/robodr-firewall-gw/README.md, "Deployment").
+#
+# The ruleset is rendered from the gateway's own configuration
+# (`robodr-firewall-gw ruleset`), so the queue number, the ports and the
+# on_gateway_down flag cannot disagree with what the gateway expects.
+#
+# It is deliberately NOT removed when the gateway stops (no ExecStop=): with
+# on_gateway_down = fail_closed the queued datagrams must stay queued, and
+# therefore dropped, while the gateway is down. To take the gateway out of
+# the path, stop this unit's effect explicitly (OPERATIONS.md, "Inline
+# Motion Firewall gateway": maintenance bypass), never by stopping the
+# gateway.
+#
+# Ordering: before the gateway and before the bridge carries traffic
+# (network-pre.target), so no motion datagram crosses the bridge unchecked
+# between boot and the gateway's start.
+
+[Unit]
+Description=RoboDR inline Motion Firewall gateway ruleset (bridge -> NFQUEUE)
+Documentation=file:/usr/share/doc/robodr/OPERATIONS.md
+AssertPathExists=/etc/robodr/firewall-gw.json
+DefaultDependencies=no
+Before=network-pre.target robodr-firewall-gw.service
+Wants=network-pre.target
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c '/usr/sbin/robodr-firewall-gw ruleset --config /etc/robodr/firewall-gw.json | /bin/sh -eu'
+
+[Install]
+WantedBy=multi-user.target

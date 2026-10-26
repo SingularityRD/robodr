@@ -6,8 +6,13 @@ set -e
 case "$1" in
 remove | deconfigure)
     if [ -d /run/systemd/system ]; then
+        # robodr-firewall-gw-rules is deliberately not stopped (it has no
+        # ExecStop=): the ruleset stays, so with fail_closed the bridge keeps
+        # refusing motion datagrams after the gateway is removed. Take the
+        # gateway out of the path explicitly (OPERATIONS.md 6.5).
         for u in robodr-spool-export.service robodr-kafka-publish.service robodr-uplink.service \
-            robodr-agentd.service robodr-pulsard.service robodr-anchor-receiver.service; do
+            robodr-agentd.service robodr-pulsard.service robodr-anchor-receiver.service \
+            robodr-firewall-gw.service; do
             systemctl stop "$u" 2>/dev/null || true
         done
     fi

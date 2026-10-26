@@ -2449,6 +2449,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "robodr-firewall-gw"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "robodr-capture",
+ "robodr-cdr",
+ "robodr-events",
+ "robodr-firewall",
+ "robodr-ros2-pipeline",
+ "robodr-rtps",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "robodr-motion"
 version = "0.1.0-alpha.1"
 dependencies = [

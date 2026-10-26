@@ -32,6 +32,8 @@
 #             requires them)
 #             robodr-anchor-receiver (pure; base-station side of the remote
 #             head anchor, installed with its unit when built)
+#             robodr-firewall-gw (pure; in-path inline-bridge gateway for
+#             a sensor box, installed with its two units, never enabled)
 # A unit file is only installed together with its binary. ROBODR_DEB_REQUIRE
 # (space separated) makes optional binaries mandatory; the release workflow
 # sets it so a release can never silently ship without the daemon.
@@ -207,6 +209,14 @@ if install_bin robodr-agentd usr/sbin 0; then
         "$pkg/usr/share/doc/robodr/examples/robodr-agentd.service.d/40-sensor-box.conf.example"
     for f in 10-robodr-capture.network.example nftables.conf.example; do
         install -D -m 0644 "$here/sensor-box/$f" "$pkg/usr/share/doc/robodr/examples/sensor-box/$f"
+    done
+fi
+# In-path Motion Firewall gateway (inline bridge on a sensor box,
+# crates/robodr-firewall-gw): the gateway and its ruleset unit, installed
+# disabled (enforcing must follow commissioning; OPERATIONS.md 6.5).
+if install_bin robodr-firewall-gw usr/sbin 0; then
+    for u in robodr-firewall-gw.service robodr-firewall-gw-rules.service; do
+        install -D -m 0644 "$unit_src/$u" "$pkg/$units/$u"
     done
 fi
 # Base-station side of the remote head anchor (not enabled by the package).

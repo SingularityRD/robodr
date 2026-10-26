@@ -9,8 +9,12 @@ in [`OPERATIONS.md`](OPERATIONS.md); this guide refers to them by section.
 
 > **Scope: protective only.** RoboDR detects, records signed evidence and
 > *requests* a safe state through the platform's own interface. It never
-> overrides the robot's safety system, e-stop or command authority, and on a
-> Unitree robot it is never in the path of `rt/lowcmd`.
+> overrides the robot's safety system, e-stop or command authority. On a
+> Unitree robot it is in the path of `rt/lowcmd` only in the optional
+> **inline gateway** mode (section 5.1), where it can pass, limit, hold or
+> remove commands that cross the sensor box's bridge, and never originates
+> one; it is not a safety-rated device, and the robot's own safety
+> functions remain primary.
 
 > **Status: not validated on a real robot.** The decoders, rules and
 > examples below are built from Unitree's published SDK sources and IDL, and
@@ -63,6 +67,15 @@ revision and from your own commissioning captures.
 
 Both modes can run together: an EDU agent on the development computer and a
 sensor box on the robot's uplink.
+
+**Inline gateway (in-path, optional, S8).** The sensor box can instead sit
+**in** the cable between the controller (operator / companion PC) and the
+robot as a two-port bridge, with `robodr-firewall-gw` deciding every motion
+datagram that enters from the controller side (section 5.1). This is the
+only mode in which RoboDR blocks anything. It needs the box's two NICs in
+the cable, not on a tap, and the same placement caveats apply: it acts only
+on what crosses that cable, never on the robot's internal links, Wi-Fi or
+cellular.
 
 **Where to attach the sensor box.** The box sees only what reaches its
 capture NIC:
@@ -367,7 +380,7 @@ For Unitree:
 
 Recommission whenever the firmware, the SDK programs or the network change.
 
-## 5. Joint envelopes (Motion Firewall): recording only
+## 5. Joint envelopes (Motion Firewall)
 
 `config/firewall.unitree-{g1,go2}.example.json` define per-motor limits for
 the low-level frames: position, velocity, torque, gains, per-frame step, the
@@ -376,12 +389,50 @@ pinned ankle mode; a humanoid frame that commands every joint limp is
 rejected. The decision logic and its tables are in
 [`crates/robodr-firewall/README.md`](../crates/robodr-firewall/README.md).
 
-**There is no in-path gateway yet.** Nothing subscribes to `rt/lowcmd` and
-republishes filtered frames, so a frame outside the envelope is **reported**
-(`robot.firewall.joint_*`, `crc_invalid`, `disabled_motor_energised`
-findings, contract 2.1) but still reaches the motors. Treat the envelopes as
-detection and evidence, never as protection. Take the limits from Unitree's
-data for your hardware revision; the example values are illustrative.
+**In the passive modes (tap, mirror port, EDU agent) the envelopes only
+record.** agentd evaluates every decoded frame and reports a frame outside
+the envelope (`robot.firewall.joint_*`, `crc_invalid`,
+`disabled_motor_energised` findings, contract 2.1), but the frame still
+reaches the motors. Treat them as detection and evidence. Take the limits
+from Unitree's data for your hardware revision; the example values are
+illustrative.
+
+### 5.1 Inline gateway mode (`robodr-firewall-gw`)
+
+With the sensor box bridged into the controller cable, the same envelopes
+**enforce**. Design, safety argument and measurements:
+[`crates/robodr-firewall-gw/README.md`](../crates/robodr-firewall-gw/README.md);
+installation and operation: [OPERATIONS.md section 6.5](OPERATIONS.md#65-inline-motion-firewall-gateway-robodr-firewall-gw).
+In short:
+
+| Channel | Codec | What the gateway does |
+|---|---|---|
+| `rt/lowcmd` (G1, H1-2) | `unitree_hg_lowcmd` | `check_joint` per frame: a valid frame passes byte-identical, an out-of-envelope one is limited in place (CRC recomputed), a rejected one is replaced **in the same sample** by the hold of the last accepted frame (never damping, never limp, on a humanoid) or removed if there is none yet |
+| `rt/lowcmd` (Go2, B2, H1) | `unitree_go_lowcmd` | as above; a quadruped may damp after the hold (`fail_behaviour`) |
+| `rt/api/sport/request` | `unitree_sport_request` | `Move` speed limited (parameter rewritten), a rejected `Move` replaced by the hold / zero; other calls only if `allowed_api_ids` lists them (`StopMove` always) |
+| Go1 UDP 8082 / 8007 | `go1_high_cmd` / `go1_low_cmd` | `HighCmd` velocity limited / held, other modes by `allowed_high_modes`; uncompressed `LowCmd` as `rt/lowcmd` (the compressed form cannot be decided) |
+
+**What "hold" means on the wire.** The gateway never sends a datagram of
+its own: re-sending an old `LowCmd` is discarded by the robot's DDS reader
+as a duplicate, and inventing a new sequence number would make it discard
+the controller's next real frame instead. A hold is written into the
+rejected sample (same writer, same sequence number), so it is delivered
+like the frame it replaces. A sample the firewall emits nothing for
+(foreign writer, too early) is removed from the datagram as if lost in
+transit; the robot keeps its last received frame, which in enforce mode is
+always an accepted frame or a hold.
+
+**When the gateway is down** (`queue.on_gateway_down`): `fail_closed`
+(default) drops the queued commands, so the robot's own command timeout
+applies, as when the controller fails; `bypass` forwards them unchecked and
+is refused for a humanoid's `rt/lowcmd`. Check what the robot does on a
+lost `rt/lowcmd` stream (Unitree's motor-board timeout behaviour) with the
+OEM before enabling enforce mode on a humanoid.
+
+Start in `mode: observe` (decides and records, forwards everything
+unchanged), compare the would-have verdicts with the robot's behaviour,
+then switch to `enforce`. Examples:
+`config/firewall-gw.unitree-{g1,go2}.example.json`.
 
 ## 6. Humanoid and quadruped safety rules
 
@@ -556,8 +607,13 @@ the contract's section 5.
 * **A2 / AS2**: no low-level example is published, so their motor count,
   IDL family and model-specific API ids are unknown; only the sport state
   and sport client are covered.
-* **No in-path gateway**: joint envelopes record, they do not block
-  (section 5). There is no `restrict_motion` adapter for the sport API yet.
+* **The inline gateway (section 5.1) is new and not field-tested**: run
+  on synthetic traffic through real network namespaces only; latency on the
+  target sensor box, Unitree's `rt/lowcmd` QoS and the motor board's
+  behaviour on a lost stream are still to be measured / confirmed. In the
+  passive modes the joint envelopes record, they do not block. There is no
+  `restrict_motion` control-plane adapter for the sport API yet (the
+  gateway's sport limit is configuration, not a SOC action).
 * **Bluetooth is invisible to Pulsar** (no HCI or AF_BLUETOOTH events): the
   rules see user-space tools, files and the processes around them, not BLE
   traffic. A worm that talks to bluetoothd over D-Bus from an interpreter

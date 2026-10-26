@@ -12,6 +12,38 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Added
 
+- `robodr-firewall-gw` (new crate + binary): the first **in-path**
+  enforcement point. An inline bridge on the sensor box hands every UDP
+  datagram of a configured motion channel that enters from the controller
+  side to an NFQUEUE (br_netfilter + iptables `physdev` / `NFQUEUE`,
+  ruleset rendered from the gateway configuration by `robodr-firewall-gw
+  ruleset`), decides it with `robodr-firewall` and answers ACCEPT, DROP or
+  ACCEPT with a same-length rewritten payload. Channels: Unitree SDK2
+  `rt/lowcmd` (`unitree_go` / `unitree_hg` `LowCmd_`, strict RTPS walk and
+  canonical-CDR decode, limited frames rewritten in place with the CRC
+  recomputed and verified), sport API `Move` (parameter rewritten, other
+  calls by allowlist, aliased api ids refused) and Go1 legacy UDP
+  `HighCmd` / uncompressed `LowCmd`. Substitutes (humanoid: hold, never
+  damping or limp) are written into the rejected sample itself (same
+  writer, sequence number and length; the gateway never originates a
+  datagram or a sequence number); a sample with nothing to emit becomes a
+  PAD; retransmissions / replays re-emit the cached decision; undecidable
+  payloads are integrity failures; DATA_FRAG of a motion channel is
+  suppressed. Writer → topic learned from SEDP (persisted), SPDP identities,
+  source-IP binding, kernel arrival timestamps as the firewall clock, fault
+  verdict for late packets. `queue.on_gateway_down`: `fail_closed`
+  (default) or `bypass` (refused for a humanoid joint channel). In-tree
+  NFQUEUE netlink client (std + `extern "C"`, fuzzed); units
+  `robodr-firewall-gw.service` / `robodr-firewall-gw-rules.service` (+
+  systemd 245 variants); example configurations
+  `config/firewall-gw.unitree-{g1,go2}.example.json`; fuzz target
+  `firewall_gw_packet`; latency harness `examples/gw_latency.rs`; an
+  end-to-end test through real network namespaces, bridge and NFQUEUE
+  (`tests/netns_e2e.rs`, `--ignored`, root). Docs: crate README (design,
+  "what hold means on the wire", latency), UNITREE.md 5.1, OPERATIONS.md
+  6.5. Not validated on a robot; not a safety-rated device.
+
+
 - `robodr-uplink` (crate `robodr-export`): producer of the AutoSecOps ingest
   API (`docs/contracts/robodr.ingest-api.md`, contract v1). Inputs as
   `robodr-kafka-publish` (agentd spool on a connected unit or sensor box, or
@@ -458,6 +490,13 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   safety rules, known limits) shipped in the `.deb` and the offline bundle.
 
 ### Changed
+
+- `robodr-cdr`: the Unitree CRC (`crc32_core`, `frame_crc`, every
+  `crc_ok`) is computed a byte at a time from a 256-entry table instead of
+  bit by bit; results are identical (checked against the SDK loop for every
+  byte value in every word position and the independent vectors). The
+  in-path gateway computes it on every frame it decodes or rewrites; its
+  per-frame decision went from about 28 µs to about 10 µs (p50, 35 slots).
 
 - `robodr-uplink`: `Retry-After` is honoured in full (up to a documented
   24 h bound, contract §7), also when it came with a run's last attempt;

@@ -46,6 +46,8 @@ FOCAL_UNITS = (
     "robodr-spool-export.service",
     "robodr-kafka-publish.service",
     "robodr-uplink.service",
+    "robodr-firewall-gw.service",
+    "robodr-firewall-gw-rules.service",
 )
 
 # Directives a focal unit may use: all exist in systemd 245 (version in
@@ -57,11 +59,12 @@ KNOWN_245 = {
     "RequiresMountsFor", "StartLimitIntervalSec", "StartLimitBurst",  # 229
     "DefaultDependencies",
     # [Service]
-    "Type", "NotifyAccess", "ExecStart", "ExecStartPre", "ExecStartPost",
+    "Type", "RemainAfterExit", "NotifyAccess", "ExecStart", "ExecStartPre", "ExecStartPost",
     "ExecStopPost", "Restart", "RestartSec", "RestartPreventExitStatus",
     "TimeoutStopSec", "TimeoutStartSec", "WatchdogSec", "EnvironmentFile",
     "Environment", "OOMScoreAdjust", "MemoryHigh", "MemoryMax",  # 231
     "TasksMax", "Nice", "IOSchedulingClass", "IOSchedulingPriority",
+    "CPUSchedulingPolicy", "CPUSchedulingPriority",
     "User", "Group", "SupplementaryGroups", "DynamicUser",  # 235
     "AmbientCapabilities", "CapabilityBoundingSet", "NoNewPrivileges", "UMask",
     "InaccessiblePaths", "ReadWritePaths", "ReadOnlyPaths",  # 231

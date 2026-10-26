@@ -1,0 +1,39 @@
+{
+  "mode": "enforce",
+  "profile": "/etc/robodr/profile.json",
+  "profile_trust": {
+    "trusted_keys": "/etc/robodr/profile-trust.json",
+    "state_file": "/var/lib/robodr/profile-state/agentd.json"
+  },
+  "firewall": "/etc/robodr/firewall.json",
+  "queue": {
+    "num": 0,
+    "on_gateway_down": "fail_closed",
+    "max_len": 1024,
+    "controller_port": "enp2s0",
+    "robot_port": "enp3s0"
+  },
+  "rtps": {
+    "domain_ids": [0],
+    "malformed_datagram": "drop",
+    "unknown_writers": "probe",
+    "state_file": "/var/lib/robodr/firewall-gw/writers.json"
+  },
+  "channels": [
+    {
+      "firewall_channel": "/lowcmd",
+      "codec": "unitree_go_lowcmd",
+      "allowed_src_ips": ["192.168.123.164"]
+    },
+    {
+      "firewall_channel": "/api/sport/request",
+      "codec": "unitree_sport_request",
+      "allowed_src_ips": ["192.168.123.164"],
+      "allowed_api_ids": [1001, 1002, 1003, 1004, 1005, 1006, 1008, 1015]
+    }
+  ],
+  "max_queue_delay_ns": 5000000,
+  "events_path": "/var/lib/robodr/firewall-gw/events.jsonl",
+  "status_path": "/var/lib/robodr/firewall-gw/status.json",
+  "housekeeping_ms": 100
+}

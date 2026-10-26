@@ -1,0 +1,33 @@
+[package]
+name = "robodr-firewall-gw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# Not published (crates.io disallows path deps); also lets cargo-deny
+# accept version-less path dependencies (deny.toml, allow-wildcard-paths).
+publish = false
+repository.workspace = true
+description = "In-path Motion Firewall gateway: an inline bridge that decides each motion datagram (Unitree SDK2 RTPS LowCmd / sport API, Go1 legacy UDP) via Linux NFQUEUE with robodr-firewall and accepts, drops or rewrites it in place."
+
+# Pure crate: std + RoboDR crates + serde only. The NFQUEUE netlink client is
+# implemented here (std + `extern "C"` socket calls, like robodr-capture's
+# AF_PACKET source), so no new third-party dependency enters the motion path.
+[dependencies]
+# Decision core (check_joint / check, fault verdicts).
+robodr-firewall = { workspace = true }
+# Unitree decoders and CRC (LowCmd go / hg, API Request_, legacy UDP).
+robodr-cdr = { workspace = true }
+# SEDP / SPDP parsing (writer -> topic, participant identity).
+robodr-rtps = { workspace = true }
+# IPv4 / UDP checksums.
+robodr-capture = { workspace = true }
+# Profile loading with the commissioning + trust checks, identity resolver.
+robodr-ros2-pipeline = { workspace = true }
+robodr-events = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "robodr-firewall-gw"
+path = "src/bin/robodr-firewall-gw.rs"
