@@ -104,6 +104,13 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
 /// The directory holding `path` must exist, not be a symlink and not be
 /// writable by group or others (key directories).
 pub fn check_parent_private(path: &Path) -> io::Result<()> {
+    check_parent_not_shared(path, "key directory")
+}
+
+/// The directory holding `path` (`what`: how to name it) must exist, not
+/// be a symlink and not be writable by group or others: anyone who can
+/// write there could replace the file between two checks or plant a link.
+pub fn check_parent_not_shared(path: &Path, what: &str) -> io::Result<()> {
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -118,13 +125,71 @@ pub fn check_parent_private(path: &Path) -> io::Result<()> {
     if md.permissions().mode() & 0o022 != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!(
-                "key directory {} is writable by group or others",
-                dir.display()
-            ),
+            format!("{what} {} is writable by group or others", dir.display()),
         ));
     }
     Ok(())
+}
+
+/// A temp file next to `path` (`<path>.robodr-enroll.tmp`, exclusive
+/// create, never through a symlink) holding `bytes`, with `mode` and, if
+/// given, the owner set on its **descriptor** (fchown, then fchmod) and
+/// fsynced: ready for [`commit`]. A stale temp file is removed first.
+pub fn stage_file(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    owner: Option<(u32, u32)>,
+) -> io::Result<PathBuf> {
+    let tmp = with_suffix(path, ".robodr-enroll.tmp");
+    match fs::symlink_metadata(&tmp) {
+        Ok(_) => fs::remove_file(&tmp)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let res = (|| {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(O_NOFOLLOW)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        if let Some((uid, gid)) = owner {
+            std::os::unix::fs::fchown(&f, Some(uid), Some(gid))?;
+        }
+        f.set_permissions(fs::Permissions::from_mode(mode))?;
+        f.sync_all()
+    })();
+    match res {
+        Ok(()) => Ok(tmp),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// Rename a [`stage_file`] temp file over `path` and fsync the directory
+/// (the temp file is removed on failure).
+pub fn commit(tmp: &Path, path: &Path) -> io::Result<()> {
+    let r = rename_durable(tmp, path);
+    if r.is_err() {
+        let _ = fs::remove_file(tmp);
+    }
+    r
+}
+
+/// Atomically replace `path` with `bytes`, `mode` and owner set on the
+/// descriptor before the rename ([`stage_file`] + [`commit`]).
+pub fn write_atomic_with(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    owner: Option<(u32, u32)>,
+) -> io::Result<()> {
+    let tmp = stage_file(path, bytes, mode, owner)?;
+    commit(&tmp, path)
 }
 
 /// `path` + `suffix`.

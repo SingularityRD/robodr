@@ -1,6 +1,7 @@
 //! One-time enrollment (contract §3): verify the SOC-signed token, generate
-//! the unit's keys locally, build the request signed by the new uplink key
-//! and MAC'd with the token secret, submit it (or write it to a file for
+//! the unit's keys locally, build the request signed by each new key
+//! (uplink, finding, blackbox: proof of possession) and MAC'd with the
+//! token secret, submit it (or write it to a file for
 //! the air-gapped flow), verify the SOC's signed answer.
 
 use serde::{Deserialize, Serialize};
@@ -164,7 +165,7 @@ pub fn prepare(ctx: &Ctx, token_text: &str, opt: &EnrollOptions) -> Result<Prepa
         keys: role_keys.iter().map(RoleKey::entry).collect(),
     };
     req.check().map_err(|e| format!("request: {e}"))?;
-    let envelope = build_request_envelope(&req, &role_keys[0], &token);
+    let envelope = build_request_envelope(&req, &role_keys, &token);
     let payload = wire::payload_bytes(&req);
     let pending = PendingEnroll {
         format: PENDING_FORMAT.into(),
@@ -199,10 +200,14 @@ pub fn prepare(ctx: &Ctx, token_text: &str, opt: &EnrollOptions) -> Result<Prepa
     })
 }
 
-/// The request envelope: signed by the uplink key, MAC'd with the token.
-pub fn build_request_envelope(req: &EnrollRequest, uplink: &RoleKey, token: &Token) -> Envelope {
+/// The request envelope: signed by every role key it registers, in the
+/// request's order (uplink, finding, blackbox: proof of possession of each),
+/// and MAC'd with the token.
+pub fn build_request_envelope(req: &EnrollRequest, keys: &[RoleKey], token: &Token) -> Envelope {
     let payload = wire::payload_bytes(req);
-    let mut e = Envelope::sign(wire::T_ENROLL_REQUEST, &payload, &[&uplink.signing]);
+    let signers: Vec<&robodr_blackbox::Ed25519SigningKey> =
+        keys.iter().map(|k| &k.signing).collect();
+    let mut e = Envelope::sign(wire::T_ENROLL_REQUEST, &payload, &signers);
     e.mac = Some(wire::EnvMac {
         alg: "hmac-sha256".into(),
         token_id: req.token_id.clone(),

@@ -104,9 +104,23 @@ pub struct Rotation {
     /// The exact rotate request envelope.
     pub request: String,
     pub request_digest: String,
+    /// The rotate request may have reached the SOC: it was submitted (set
+    /// **before** the first submit) or written out for the air-gapped
+    /// flow. From then on the rotation is never abandoned locally: it is
+    /// resent (the SOC answers with its stored answer) or cancelled at the
+    /// SOC (§5.5). Missing in a journal: assumed sent.
+    #[serde(default = "assume_sent")]
+    pub sent: bool,
+    /// The exact cancel request envelope, once built (§5.5).
+    #[serde(default)]
+    pub cancel_request: Option<String>,
     /// The exact retire request envelope, once built.
     pub retire_request: Option<String>,
     pub started_at_ms: u64,
+}
+
+fn assume_sent() -> bool {
+    true
 }
 
 /// Last accepted revocation list of a platform.

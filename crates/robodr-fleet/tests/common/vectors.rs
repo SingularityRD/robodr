@@ -20,10 +20,12 @@ pub const SOC_SEED: [u8; 32] = [0x50; 32];
 /// (file stem, seed, robot, role) of every test key.
 pub const KEYS: &[(&str, u8, &str, &str)] = &[
     ("soc", 0x50, "", "soc"),
+    ("soc-approval", 0x54, "", "approval"),
     ("ugv-001-uplink", 0x61, "ugv-001", "uplink"),
     ("ugv-001-finding", 0x62, "ugv-001", "finding"),
     ("ugv-001-blackbox", 0x63, "ugv-001", "blackbox"),
     ("ugv-001-uplink-next", 0x64, "ugv-001", "uplink"),
+    ("ugv-001-uplink-next2", 0x65, "ugv-001", "uplink"),
     ("ugv-002-uplink", 0x71, "ugv-002", "uplink"),
     ("ugv-002-finding", 0x72, "ugv-002", "finding"),
     ("ugv-002-blackbox", 0x73, "ugv-002", "blackbox"),
@@ -53,7 +55,7 @@ pub const TOKENS: &[(&str, &str, Option<&str>, u8)] = &[
 
 pub fn token_text(id: &str) -> String {
     let (_, robot, site, n) = TOKENS.iter().find(|t| t.0 == id).unwrap();
-    let mut s = Soc::new(key("soc"), WORKSPACE, T0);
+    let mut s = Soc::new(key("soc"), key("soc-approval"), WORKSPACE, T0);
     s.issue_token(id, robot, *site, 3_600_000, [*n; 32])
 }
 
@@ -61,7 +63,8 @@ fn token(id: &str) -> Token {
     Token::parse(&token_text(id)).unwrap()
 }
 
-/// An enrollment request body for `robot` from token `tok`.
+/// An enrollment request body for `robot` from token `tok`, signed by its
+/// three keys (or by `signer` alone).
 pub fn enroll_body(
     tok: &str,
     robot: &str,
@@ -92,7 +95,7 @@ pub fn enroll_body(
         Some(_) => token(tok),
         None => token("tok-1"),
     };
-    let mut e = robodr_fleet::enroll::build_request_envelope(&req, &keys[0], &t);
+    let mut e = robodr_fleet::enroll::build_request_envelope(&req, &keys, &t);
     if let Some(s) = signer {
         let payload = wire::payload_bytes(&req);
         let mac = e.mac.clone();
@@ -124,6 +127,33 @@ fn rotate_body(rotation: u8, old: &str, new: &str, signers: &[&str]) -> Vec<u8> 
     let ks: Vec<Ed25519SigningKey> = signers.iter().map(|s| key(s)).collect();
     let refs: Vec<&Ed25519SigningKey> = ks.iter().collect();
     Envelope::sign(wire::T_ROTATE_REQUEST, &wire::payload_bytes(&req), &refs).to_bytes()
+}
+
+/// The digest of the payload of a request envelope (what a cancel names).
+fn payload_digest(body: &[u8], kind: &str) -> String {
+    Envelope::parse(body, kind).unwrap().payload_digest()
+}
+
+/// A cancel request for the uplink rotation `rotation` (old -> new) whose
+/// rotate request is `rotate`, signed by `signer`.
+fn cancel_body(rotation: u8, old: &str, new: &str, rotate: &[u8], signer: &str) -> Vec<u8> {
+    let req = robodr_fleet::wire::CancelRequest {
+        format: wire::CANCEL_REQUEST_FORMAT.into(),
+        rotation_id: format!("rfr1-{}", format!("{rotation:02x}").repeat(16)),
+        request_digest: payload_digest(rotate, wire::T_ROTATE_REQUEST),
+        workspace: WORKSPACE.into(),
+        robot_id: "ugv-001".into(),
+        role: "uplink".into(),
+        old_key_id: key(old).key_id().into(),
+        new_key_id: key(new).key_id().into(),
+        created_at_ms: T0 + 150_000,
+    };
+    Envelope::sign(
+        wire::T_CANCEL_REQUEST,
+        &wire::payload_bytes(&req),
+        &[&key(signer)],
+    )
+    .to_bytes()
 }
 
 fn retire_body(rotation: u8, old: &str, new: &str) -> Vec<u8> {
@@ -244,7 +274,7 @@ fn draft_profile() -> Vec<u8> {
 }
 
 fn publications() -> Setup {
-    let mut s = Soc::new(key("soc"), WORKSPACE, T0);
+    let mut s = Soc::new(key("soc"), key("soc-approval"), WORKSPACE, T0);
     let (p, sig) = signed_profile();
     s.offer("ugv-001", 4, &p, &sig);
     let digest = wire::digest(&p);
@@ -257,7 +287,7 @@ fn publications() -> Setup {
         &["op-a", "op-b"],
         3_600_000,
     );
-    let ring = s.ring("ugv-001", 1, 1, Some("0.2.0"));
+    let ring = s.ring_with_min("ugv-001", 1, 1, Some("0.2.0"), Some("0.1.0"));
     let rev = robodr_commission::trust::RevocationList::create(
         2,
         1_790_000_000,
@@ -409,7 +439,7 @@ pub fn cases() -> Vec<Case> {
                     profile_digest: None,
                     keys: keys.iter().map(RoleKey::entry).collect(),
                 };
-                robodr_fleet::enroll::build_request_envelope(&req, &keys[0], &tk).to_bytes()
+                robodr_fleet::enroll::build_request_envelope(&req, &keys, &tk).to_bytes()
             }, t)],
         },
         Case {
@@ -501,6 +531,64 @@ pub fn cases() -> Vec<Case> {
             t,
         )],
     });
+    let next2 = "ugv-001-uplink-next2";
+    let fnd = "ugv-001-finding";
+    let r1 = || rotate_body(1, up, next, &[up, next]);
+    let r2 = || rotate_body(2, up, next2, &[up, next2]);
+    let r3 = || rotate_body(3, up, next2, &[up, next2]);
+    v.push(Case {
+        name: "15-enroll-possession",
+        description: "proof of possession of every key: request signed by its uplink key only -> 401 bad_signature; signed by uplink, blackbox, finding (wrong order) -> 401 bad_signature; signed by the three keys in order -> 200",
+        setup: Setup { tokens: vec!["tok-1"], ..Default::default() },
+        steps: vec![
+            json_post(wire::PATH_ENROLL, {
+                let o = Envelope::parse(&enroll1(), wire::T_ENROLL_REQUEST).unwrap();
+                let mut e = o.envelope;
+                e.sigs.truncate(1);
+                e.to_bytes()
+            }, t),
+            json_post(wire::PATH_ENROLL, {
+                let o = Envelope::parse(&enroll1(), wire::T_ENROLL_REQUEST).unwrap();
+                let mut e = o.envelope;
+                e.sigs.swap(1, 2);
+                e.to_bytes()
+            }, t),
+            json_post(wire::PATH_ENROLL, enroll1(), t),
+        ],
+    });
+    v.push(Case {
+        name: "16-rotate-cancel",
+        description: "enroll; rotate (overlap); cancel signed by the new key -> 401 bad_signature; cancel authenticated by the new uplink key -> 401 wrong_key; cancel (signed and authenticated by the old key) -> cancelled, the new key retired; the same cancel again -> stored answer; the rotate request again -> 409 rotation_cancelled; the new key no longer authenticates (401 unknown_key); a new rotation -> overlap (the cancelled one is not in progress); cancel of a rotation the SOC never received -> cancelled; that rotate request arriving later -> 409 rotation_cancelled; retire of the open rotation -> retired; cancelling it now -> 409 already_retired",
+        setup: Setup { tokens: vec!["tok-1"], rings: publications().rings, ..Default::default() },
+        steps: vec![
+            json_post(wire::PATH_ENROLL, enroll1(), t),
+            authed("POST", wire::PATH_ROTATE, r1(), up, t + 40_000, t + 40_000),
+            authed("POST", wire::PATH_CANCEL, cancel_body(1, up, next, &r1(), next), up, t + 41_000, t + 41_000),
+            authed("POST", wire::PATH_CANCEL, cancel_body(1, up, next, &r1(), up), next, t + 42_000, t + 42_000),
+            authed("POST", wire::PATH_CANCEL, cancel_body(1, up, next, &r1(), up), up, t + 43_000, t + 43_000),
+            authed("POST", wire::PATH_CANCEL, cancel_body(1, up, next, &r1(), up), up, t + 44_000, t + 44_000),
+            authed("POST", wire::PATH_ROTATE, r1(), up, t + 45_000, t + 45_000),
+            authed("GET", wire::PATH_RING, Vec::new(), next, t + 46_000, t + 46_000),
+            authed("POST", wire::PATH_ROTATE, r2(), up, t + 47_000, t + 47_000),
+            authed("POST", wire::PATH_CANCEL, cancel_body(3, up, next2, &r3(), up), up, t + 48_000, t + 48_000),
+            authed("POST", wire::PATH_ROTATE, r3(), up, t + 49_000, t + 49_000),
+            authed("POST", wire::PATH_RETIRE, retire_body(2, up, next2), next2, t + 50_000, t + 50_000),
+            authed("POST", wire::PATH_CANCEL, cancel_body(2, up, next2, &r2(), up), next2, t + 51_000, t + 51_000),
+        ],
+    });
+    v.push(Case {
+        name: "17-rotate-auth-key",
+        description: "§5.1/§5.3 authentication of an uplink rotation: rotate authenticated by the finding key -> 401 unknown_key; rotate authenticated by the old uplink key -> overlap; the same rotate request authenticated by the new uplink key -> 401 wrong_key; retire authenticated by the old uplink key -> 401 wrong_key (the old key stays active); retire authenticated by the new uplink key -> retired",
+        setup: Setup { tokens: vec!["tok-1"], ..Default::default() },
+        steps: vec![
+            json_post(wire::PATH_ENROLL, enroll1(), t),
+            authed("POST", wire::PATH_ROTATE, r1(), fnd, t + 40_000, t + 40_000),
+            authed("POST", wire::PATH_ROTATE, r1(), up, t + 41_000, t + 41_000),
+            authed("POST", wire::PATH_ROTATE, r1(), next, t + 42_000, t + 42_000),
+            authed("POST", wire::PATH_RETIRE, retire_body(1, up, next), up, t + 43_000, t + 43_000),
+            authed("POST", wire::PATH_RETIRE, retire_body(1, up, next), next, t + 44_000, t + 44_000),
+        ],
+    });
     v
 }
 
@@ -516,7 +604,7 @@ fn sha(b: &[u8]) -> String {
 
 /// A SOC for `case` (fresh, setup applied).
 pub fn soc_for(case: &Case) -> Soc {
-    let mut s = Soc::new(key("soc"), WORKSPACE, T0);
+    let mut s = Soc::new(key("soc"), key("soc-approval"), WORKSPACE, T0);
     for tok in &case.setup.tokens {
         s.register_token(&token_text(tok));
     }
@@ -546,6 +634,7 @@ pub fn response_json(status: u16, body: &[u8], body_file: &str) -> Value {
         wire::T_ENROLL_ANSWER,
         wire::T_ROTATE_ANSWER,
         wire::T_RETIRE_ANSWER,
+        wire::T_CANCEL_ANSWER,
         wire::T_APPROVAL,
         wire::T_RING,
     ] {
@@ -651,6 +740,7 @@ pub fn files() -> Vec<(String, Vec<u8>)> {
         "workspace": WORKSPACE,
         "base_path": BASE,
         "soc_key": "keys/soc.key.pub",
+        "approval_key": "keys/soc-approval.key.pub",
         "run": "each case starts from an empty workspace whose SOC fleet key is keys/soc.key; register the setup tokens (as issued: the token file), serve the setup publications verbatim (revocations by platform, offers and rings by robot, approvals by digest hex), then send the requests in order with the server clock at server_time_ms; target includes base_path",
         "compare": "status; error bodies by code; 200 envelopes by type, signer list and decoded payload (JSON value equality; the committed body bytes are the reference's, Ed25519 is deterministic so an implementation serialising payloads as compact JSON in the contract's key order reproduces them exactly); other 200 bodies byte-exact (body_sha256)",
         "keys": keys,

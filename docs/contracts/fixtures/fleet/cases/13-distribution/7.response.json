@@ -1,12 +1,13 @@
 {
   "body_file": "7.response.body",
-  "body_sha256": "90b521eaf78ec14c041cc5c0d8db2c0f47b80c1b5a961fa326781e470dc6cbaf",
+  "body_sha256": "3b1bcb93579c9d57ebfcef743f64fc8293564d535708ba7ed164a94ce320d48b",
   "envelope": {
     "payload": {
       "bundle_sha256": "abababababababababababababababababababababababababababababababab",
       "expires_at_ms": 1790086400000,
       "format": "robodr-fleet-ring/v1",
       "issued_at_ms": 1790000000000,
+      "min_version": "0.1.0",
       "ring": 1,
       "robot_id": "ugv-001",
       "serial": 1,

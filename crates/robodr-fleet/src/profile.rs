@@ -9,8 +9,9 @@
 //!
 //! * **Never auto-enforce.** `fetch` only stages: it never touches agentd's
 //!   profile. Only `approve`, run by the operator with an approval
-//!   artefact signed by a SOC fleet key, installs a profile, and agentd
-//!   enforces it only after its next start (where it verifies it again).
+//!   artefact signed by a SOC approval key (never the online fleet key),
+//!   installs a profile, and agentd enforces it only after its next start
+//!   (where it verifies it again).
 //! * The staged profile is verified with exactly agentd's trust inputs
 //!   (`sensor.profile_trust`: trusted keys, trust roots and floor,
 //!   revocation list and policy, platform / unit expectations) and against
@@ -21,10 +22,13 @@
 //!   and workspace, has an expiry, and is single-use on the unit.
 //! * Install is re-verified immediately before writing (the trust inputs
 //!   may have changed since staging); the previous profile and `.sig` are
-//!   kept under `profile/backup-<ms>/`. The `.sig` is written first, then
-//!   the profile: a crash in between leaves a pair that does not verify,
-//!   which agentd refuses (observe-only) — fail closed, and re-running
-//!   `approve` with the same artefact completes the install.
+//!   kept under `profile/backup-<ms>/`. Both new files are written
+//!   completely (owner, mode, fsync) before either is renamed into place;
+//!   the two renames follow back to back, `.sig` first, profile last. Two
+//!   files cannot be replaced in one atomic step: a crash between the two
+//!   renames leaves the new `.sig` next to the old profile, a pair that does
+//!   not verify, which agentd refuses (observe-only) — fail closed, and
+//!   re-running `approve` with the same artefact completes the install.
 
 use robodr_commission::trust::{evaluate_profile_trust, sig_path_for, TrustInputs};
 use std::path::{Path, PathBuf};
@@ -235,9 +239,11 @@ pub fn approve(ctx: &Ctx, approval: &[u8]) -> Result<Installed, String> {
         .ok_or("agentd has no sensor.profile_path: nowhere to install the profile")?;
     let meta = staged(ctx)?.ok_or("no staged profile (robodr-enroll profile fetch)")?;
     let o = Envelope::parse(approval, wire::T_APPROVAL).map_err(|e| format!("approval: {e}"))?;
-    SocKeys::load(&ctx.cfg.soc_keys)?
+    SocKeys::load_approval(&ctx.cfg.approval_keys, &ctx.cfg.soc_keys)?
         .verify(&o)
-        .map_err(|e| format!("approval: {e}"))?;
+        .map_err(|e| {
+            format!("approval: {e} (approvals are accepted from a SOC approval key only)")
+        })?;
     let a = Approval::parse(&o.payload).map_err(|e| format!("approval: {e}"))?;
     let refuse = |why: String| -> Result<Installed, String> {
         let _ = journal(
@@ -328,8 +334,7 @@ pub fn approve(ctx: &Ctx, approval: &[u8]) -> Result<Installed, String> {
     let profile = fsx::read_capped(&staged_path, MAX_PROFILE_BYTES).map_err(|e| e.to_string())?;
     let sig =
         fsx::read_capped(&sig_path_for(&staged_path), 64 * 1024).map_err(|e| e.to_string())?;
-    crate::install::install_public(&target_sig, &sig)?;
-    crate::install::install_public(&target, &profile)?;
+    crate::install::install_pair(&target_sig, &sig, &target, &profile)?;
     journal(
         ctx,
         serde_json::json!({"kind": crate::journal::K_PROFILE, "step": "installed",

@@ -98,17 +98,31 @@ pub fn write_public(kf: &KeyFile, path: &Path) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", pubp.display()))
 }
 
-/// Load a SOC fleet public key file (`kind: public`, Ed25519, not group- or
-/// other-writable, no symlink).
+/// Load a SOC public key file (`kind: public`, Ed25519): a regular file
+/// (no symlink), owned by root (or by the invoking user when not run as
+/// root: tests), not writable by group or others, in a directory not
+/// writable by group or others. Whoever can replace this file decides what
+/// the unit accepts as the SOC's signature.
 pub fn load_soc_key(path: &Path) -> Result<(String, [u8; PUBLIC_KEY_LEN]), String> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let md = std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if md.file_type().is_symlink() || md.permissions().mode() & 0o022 != 0 {
+    if md.file_type().is_symlink() || !md.is_file() || md.permissions().mode() & 0o022 != 0 {
         return Err(format!(
-            "{}: SOC key file must not be a symlink or writable by group/others",
+            "{}: SOC key file must be a regular file, not a symlink, and not writable by \
+             group/others",
             path.display()
         ));
     }
+    let euid = robodr_blackbox::keys::effective_uid();
+    if md.uid() != 0 && md.uid() != euid {
+        return Err(format!(
+            "{}: SOC key file must be owned by root (it is owned by uid {})",
+            path.display(),
+            md.uid()
+        ));
+    }
+    fsx::check_parent_not_shared(path, "SOC key directory")
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     let kf = KeyFile::load_public(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let pk = kf
         .public_key()
@@ -128,6 +142,7 @@ pub fn load_soc_key(path: &Path) -> Result<(String, [u8; PUBLIC_KEY_LEN]), Strin
 pub struct SocKeys(pub Vec<(String, [u8; PUBLIC_KEY_LEN])>);
 
 impl SocKeys {
+    /// The SOC fleet keys (`soc.keys`).
     pub fn load(paths: &[std::path::PathBuf]) -> Result<Self, String> {
         if paths.is_empty() {
             return Err(
@@ -136,6 +151,36 @@ impl SocKeys {
                     .into(),
             );
         }
+        Self::load_paths(paths)
+    }
+
+    /// The SOC approval keys (`soc.approval_keys`), which must not share a
+    /// key with the fleet keys `fleet`.
+    pub fn load_approval(
+        paths: &[std::path::PathBuf],
+        fleet: &[std::path::PathBuf],
+    ) -> Result<Self, String> {
+        if paths.is_empty() {
+            return Err(
+                "no SOC approval key configured (fleet.json soc.approval_keys or \
+                 --approval-key): a profile approval cannot be authenticated"
+                    .into(),
+            );
+        }
+        let a = Self::load_paths(paths)?;
+        if !fleet.is_empty() {
+            let f = Self::load_paths(fleet)?;
+            if let Some((id, _)) = a.0.iter().find(|(id, _)| f.get(id).is_some()) {
+                return Err(format!(
+                    "SOC key {id} is configured both as a fleet key and as an approval key; an \
+                     approval key must be a separate key (fleet.json soc.approval_keys)"
+                ));
+            }
+        }
+        Ok(a)
+    }
+
+    fn load_paths(paths: &[std::path::PathBuf]) -> Result<Self, String> {
         let mut v: Vec<(String, [u8; PUBLIC_KEY_LEN])> = Vec::new();
         for p in paths {
             let k = load_soc_key(p)?;

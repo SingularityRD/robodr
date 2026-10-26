@@ -1,0 +1,25 @@
+{
+  "body_file": "6.body",
+  "body_sha256": "b7b987ac45e3f41bc968cadcee90b519ddcc4d4466f981e3e67ac8cc1b6d1ba1",
+  "headers": [
+    [
+      "Content-Type",
+      "application/json"
+    ],
+    [
+      "X-RoboDR-Key-Id",
+      "ed25519:7bf642b114c6afa2"
+    ],
+    [
+      "X-RoboDR-Timestamp",
+      "1790000104000"
+    ],
+    [
+      "X-RoboDR-Signature",
+      "73e0d0b4b3c60dbdaf7a504fe3612fe4a356fdf1ee4e54f29099950a1ed6746ed080a46134e9fd5211adc3c12dbee81aba2853194cbf13a8578a94d4bd2e9306"
+    ]
+  ],
+  "method": "POST",
+  "server_time_ms": 1790000104000,
+  "target": "/api/robot-edr/v2/fleet/keys/cancel"
+}

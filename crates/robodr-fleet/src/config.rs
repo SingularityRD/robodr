@@ -7,7 +7,8 @@
 //!   "state_dir": "/var/lib/robodr/fleet",
 //!   "agentd_config": "/etc/robodr/agentd.json",
 //!   "soc": { "url": "https://soc.example.org/api", "ca_bundle": "/etc/robodr/uplink-ca.pem",
-//!            "spki_sha256": [], "keys": ["/etc/robodr/fleet-soc.pub"] },
+//!            "spki_sha256": [], "keys": ["/etc/robodr/fleet-soc.pub"],
+//!            "approval_keys": ["/etc/robodr/fleet-approval.pub"] },
 //!   "workspace": null,
 //!   "keys": { "uplink": "/etc/robodr/keys/uplink.key",
 //!             "finding": "/etc/robodr/keys/agentd-finding.key",
@@ -16,8 +17,14 @@
 //! ```
 //!
 //! Every key is optional except `format`; the defaults are the values
-//! above (`soc.url`, `soc.keys` and `workspace` have none). Unknown keys are
-//! refused. Paths must be absolute.
+//! above (`soc.url`, `soc.keys`, `soc.approval_keys` and `workspace` have
+//! none). Unknown keys are refused. Paths must be absolute.
+//!
+//! `soc.keys` are the SOC's online **fleet keys** (tokens, answers, ring
+//! information); `soc.approval_keys` are its **approval keys**, the only
+//! keys an observe -> enforce profile approval is accepted from. They are
+//! distinct keys (a file in both lists, or one key id in both, is refused):
+//! a compromised online fleet key must not be able to approve enforcement.
 //!
 //! From agentd's configuration (read as plain JSON, never executed or
 //! validated beyond the members used): `robot.id`, `robot.site`,
@@ -47,6 +54,8 @@ struct SocJson {
     spki_sha256: Vec<String>,
     #[serde(default)]
     keys: Vec<PathBuf>,
+    #[serde(default)]
+    approval_keys: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -86,8 +95,11 @@ pub struct Config {
     pub soc_url: Option<String>,
     pub ca_bundle: PathBuf,
     pub spki_sha256: Vec<String>,
-    /// SOC fleet public keys (sign tokens, answers, approvals, ring info).
+    /// SOC fleet public keys (sign tokens, answers, ring info).
     pub soc_keys: Vec<PathBuf>,
+    /// SOC approval public keys (sign profile approvals only; distinct
+    /// from the fleet keys).
+    pub approval_keys: Vec<PathBuf>,
     /// Expected workspace: a token for another workspace is refused.
     pub workspace: Option<String>,
     pub uplink_key: PathBuf,
@@ -104,6 +116,7 @@ impl Default for Config {
             ca_bundle: "/etc/robodr/uplink-ca.pem".into(),
             spki_sha256: Vec::new(),
             soc_keys: Vec::new(),
+            approval_keys: Vec::new(),
             workspace: None,
             uplink_key: "/etc/robodr/keys/uplink.key".into(),
             finding_key: "/etc/robodr/keys/agentd-finding.key".into(),
@@ -128,6 +141,7 @@ impl Config {
             ca_bundle: j.soc.ca_bundle.unwrap_or(d.ca_bundle),
             spki_sha256: j.soc.spki_sha256,
             soc_keys: j.soc.keys,
+            approval_keys: j.soc.approval_keys,
             workspace: j.workspace,
             uplink_key: j.keys.uplink.unwrap_or(d.uplink_key),
             finding_key: j.keys.finding.unwrap_or(d.finding_key),
@@ -166,6 +180,9 @@ impl Config {
         for k in &self.soc_keys {
             paths.push(("soc.keys[]", k));
         }
+        for k in &self.approval_keys {
+            paths.push(("soc.approval_keys[]", k));
+        }
         for (what, p) in paths {
             if !p.is_absolute() {
                 return Err(format!("{what} must be an absolute path"));
@@ -175,6 +192,13 @@ impl Config {
             if !crate::wire::is_ident(w) {
                 return Err("workspace must be [A-Za-z0-9._:-]{1,64}".into());
             }
+        }
+        if self.approval_keys.iter().any(|k| self.soc_keys.contains(k)) {
+            return Err(
+                "soc.approval_keys and soc.keys must be distinct files (an approval key is \
+                 never the online fleet key)"
+                    .into(),
+            );
         }
         let keys = [&self.uplink_key, &self.finding_key, &self.blackbox_key];
         if keys[0] == keys[1] || keys[0] == keys[2] || keys[1] == keys[2] {
@@ -287,6 +311,22 @@ mod tests {
             r#"{"format":"robodr-fleet-config/v1","keys":{"uplink":"/k","finding":"/k"}}"#
         )
         .is_err());
+        let c = Config::parse(
+            r#"{"format":"robodr-fleet-config/v1","soc":{"keys":["/f.pub"],"approval_keys":["/a.pub"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.approval_keys, [PathBuf::from("/a.pub")]);
+        assert!(Config::parse(
+            r#"{"format":"robodr-fleet-config/v1","soc":{"keys":["/f.pub"],"approval_keys":["/f.pub"]}}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn shipped_example_parses() {
+        let c = Config::parse(include_str!("../../../config/fleet.example.json")).unwrap();
+        assert_eq!(c.soc_keys.len(), 1);
+        assert_eq!(c.approval_keys.len(), 1);
     }
 
     #[test]

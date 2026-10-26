@@ -233,6 +233,7 @@ fn tampered_or_foreign_tokens_are_refused() {
     // Signed by a key that is not a configured SOC key.
     let mut rogue = common::soc::Soc::new(
         Ed25519SigningKey::from_seed_with_derived_id(&[0x77; 32]),
+        Ed25519SigningKey::from_seed_with_derived_id(&[0x78; 32]),
         WORKSPACE,
         T0,
     );
@@ -538,6 +539,7 @@ fn rotation_abort_and_refusals() {
     let rot = rotate::prepare(&ctx, "uplink", &rotate::no_crash).unwrap();
     let mut rogue = common::soc::Soc::new(
         Ed25519SigningKey::from_seed_with_derived_id(&[0x77; 32]),
+        Ed25519SigningKey::from_seed_with_derived_id(&[0x78; 32]),
         WORKSPACE,
         T0,
     );
@@ -684,6 +686,7 @@ fn profile_is_staged_never_enforced_without_approval() {
     u.now.set(T0);
     let mut rogue = common::soc::Soc::new(
         Ed25519SigningKey::from_seed_with_derived_id(&[0x77; 32]),
+        Ed25519SigningKey::from_seed_with_derived_id(&[0x78; 32]),
         WORKSPACE,
         T0,
     );
@@ -872,4 +875,329 @@ fn soc_refuses_unauthenticated_and_stale_requests() {
         400
     );
     let _ = key_id(&soc_key());
+}
+
+// ------------------------------------------- review regression tests --
+
+/// Delivers the request to the SOC, then loses the answer (connection
+/// reset after the SOC processed it).
+struct LoseAnswer<'a> {
+    soc: &'a std::cell::RefCell<common::soc::Soc>,
+}
+
+impl robodr_fleet::client::SocTransport for LoseAnswer<'_> {
+    fn send(
+        &mut self,
+        method: &str,
+        target: &str,
+        headers: Vec<(&'static str, String)>,
+        body: &[u8],
+    ) -> Result<robodr_fleet::client::HttpResponse, robodr_fleet::client::TransportError> {
+        Direct { soc: self.soc }.send(method, target, headers, body)?;
+        Err(robodr_fleet::client::TransportError(
+            "connection reset by peer".into(),
+        ))
+    }
+
+    fn base_path(&self) -> String {
+        common::soc::BASE.into()
+    }
+}
+
+#[test]
+fn rotation_whose_answer_was_lost_is_not_aborted_locally() {
+    use robodr_fleet::client::SocTransport as _;
+    let (u, soc) = enrolled("rot-lost");
+    let ctx = u.ctx();
+    rotate::prepare(&ctx, "uplink", &rotate::no_crash).unwrap();
+    let err = rotate::submit_rotate(&ctx, &mut LoseAnswer { soc: &soc }, "uplink").unwrap_err();
+    assert!(err.starts_with("SOC not reached"), "{err}");
+    // The SOC registered the new key: a local abort would leave the
+    // rotation open at the SOC forever (409 rotation_in_progress).
+    let err = rotate::abort(&ctx, "uplink").unwrap_err();
+    assert!(err.contains("may have reached the SOC"), "{err}");
+    assert!(robodr_fleet::fsx::with_suffix(&u.cfg.uplink_key, ".next").exists());
+    // Resending gets the stored answer.
+    let r = rotate::submit_rotate(&ctx, &mut Direct { soc: &soc }, "uplink").unwrap();
+    assert_eq!(r.phase, Phase::Registered);
+    let _ = Direct { soc: &soc }.base_path();
+}
+
+#[test]
+fn enrollment_request_proves_possession_of_every_key() {
+    let u = Unit::new("pop");
+    let soc = new_soc();
+    let t = token(&soc, "tok-1");
+    let ctx = u.ctx();
+    let p = enroll::prepare(&ctx, &t, &Default::default()).unwrap();
+    let o = Envelope::parse(p.pending.envelope.as_bytes(), wire::T_ENROLL_REQUEST).unwrap();
+    let keys: Vec<robodr_fleet::keys::RoleKey> = wire::ROLES
+        .iter()
+        .map(|r| robodr_fleet::keys::load(r, u.cfg.key_path(r).unwrap()).unwrap())
+        .collect();
+    let ids: Vec<String> = keys.iter().map(|k| k.key_id()).collect();
+    assert_eq!(o.signers(), ids, "signed by uplink, finding, blackbox");
+    for k in &keys {
+        o.verify_by(&k.key_id(), &k.public()).unwrap();
+    }
+    // The SOC refuses a request signed by the uplink key alone.
+    let mut e = o.envelope.clone();
+    e.sigs.truncate(1);
+    let h = vec![("Content-Type".to_string(), "application/json".to_string())];
+    let r = soc
+        .borrow_mut()
+        .handle("POST", wire::PATH_ENROLL, &h, &e.to_bytes());
+    assert_eq!(r.status, 401);
+    assert!(String::from_utf8_lossy(&r.body).contains("bad_signature"));
+}
+
+fn authed_headers(
+    method: &str,
+    target: &str,
+    body: &[u8],
+    k: &robodr_fleet::keys::RoleKey,
+    now: u64,
+) -> Vec<(String, String)> {
+    let mut h = vec![("Content-Type".to_string(), "application/json".to_string())];
+    for (a, b) in robodr_fleet::client::auth_headers(
+        method,
+        &format!("{}{target}", common::soc::BASE),
+        body,
+        &k.signing,
+        now,
+    ) {
+        h.push((a.to_string(), b));
+    }
+    h
+}
+
+#[test]
+fn soc_takes_rotate_auth_from_the_old_uplink_key_and_retire_auth_from_the_new() {
+    let (u, soc) = enrolled("rot-auth");
+    let ctx = u.ctx();
+    let rot = rotate::prepare(&ctx, "uplink", &rotate::no_crash).unwrap();
+    rotate::submit_rotate(&ctx, &mut Direct { soc: &soc }, "uplink").unwrap();
+    // Overlap: both uplink keys are active. The rotate request (a replay)
+    // authenticated by the NEW key is refused: rotate is the old key's.
+    let next = robodr_fleet::fsx::with_suffix(&u.cfg.uplink_key, ".next");
+    let new = robodr_fleet::keys::load("uplink", &next).unwrap();
+    let h = authed_headers("POST", wire::PATH_ROTATE, rot.request.as_bytes(), &new, T0);
+    let r = soc
+        .borrow_mut()
+        .handle("POST", wire::PATH_ROTATE, &h, rot.request.as_bytes());
+    assert_eq!(r.status, 401, "{}", String::from_utf8_lossy(&r.body));
+    rotate::swap(&ctx, "uplink", &rotate::no_crash).unwrap();
+    // Retire authenticated by the OLD key: refused (retire is the new key's).
+    let body = rotate::retire_request(&ctx, "uplink").unwrap();
+    let old = robodr_fleet::keys::load(
+        "uplink",
+        &rotate::retired_path(&u.cfg.uplink_key, "uplink", &rot.old_key_id),
+    )
+    .unwrap();
+    let h = authed_headers("POST", wire::PATH_RETIRE, &body, &old, T0);
+    let r = soc
+        .borrow_mut()
+        .handle("POST", wire::PATH_RETIRE, &h, &body);
+    assert_eq!(r.status, 401, "{}", String::from_utf8_lossy(&r.body));
+    assert!(soc.borrow().keys[&rot.old_key_id].retired_at.is_none());
+    rotate::submit_retire(&ctx, &mut Direct { soc: &soc }, "uplink", &rotate::no_crash).unwrap();
+}
+
+#[test]
+fn revocation_reinstall_compares_the_installed_file() {
+    let (u, soc) = enrolled("rev-reinstall");
+    let ctx = u.ctx();
+    let list = revocation_list(2, &[], &root_key());
+    soc.borrow_mut()
+        .revocations
+        .insert(PLATFORM.into(), list.clone());
+    revocation::fetch(&ctx, &mut Direct { soc: &soc }, PLATFORM).unwrap();
+    let target = u.etc("revocations.json");
+    // The installed file is damaged or replaced: the same list is
+    // installed again, not skipped as "already installed".
+    std::fs::write(&target, b"{\"damaged\": true}").unwrap();
+    let r = revocation::fetch(&ctx, &mut Direct { soc: &soc }, PLATFORM).unwrap();
+    assert!(!r.unchanged, "the installed file was not the list");
+    assert_eq!(std::fs::read(&target).unwrap(), list);
+    // Intact: nothing written.
+    assert!(
+        revocation::fetch(&ctx, &mut Direct { soc: &soc }, PLATFORM)
+            .unwrap()
+            .unchanged
+    );
+}
+
+#[test]
+fn files_for_agentd_are_not_installed_into_a_shared_directory() {
+    let (u, soc) = enrolled("shared-dir");
+    let pubdir = u.root.join("pub");
+    std::fs::create_dir_all(&pubdir).unwrap();
+    std::fs::set_permissions(&pubdir, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let mut facts = u.facts.clone();
+    facts.revocation_list = Some(pubdir.join("revocations.json"));
+    let ctx = robodr_fleet::state::Ctx::open(u.cfg.clone(), facts, Box::new(|| T0)).unwrap();
+    soc.borrow_mut()
+        .revocations
+        .insert(PLATFORM.into(), revocation_list(2, &[], &root_key()));
+    let err = revocation::fetch(&ctx, &mut Direct { soc: &soc }, PLATFORM).unwrap_err();
+    assert!(err.contains("writable by group or others"), "{err}");
+    assert!(!pubdir.join("revocations.json").exists());
+}
+
+#[test]
+fn soc_key_file_must_be_root_owned_in_a_private_directory() {
+    let (u, soc) = enrolled("soc-key-dir");
+    soc.borrow_mut().ring(ROBOT, 1, 0, None);
+    let shared = u.root.join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o775)).unwrap();
+    let k = shared.join("fleet-soc.pub");
+    write_public_key(&k, &soc_key());
+    let mut cfg = u.cfg.clone();
+    cfg.soc_keys = vec![k.clone()];
+    {
+        let ctx =
+            robodr_fleet::state::Ctx::open(cfg.clone(), u.facts.clone(), Box::new(|| T0)).unwrap();
+        let err = ring::fetch(&ctx, &mut Direct { soc: &soc }).unwrap_err();
+        assert!(err.contains("writable by group or others"), "{err}");
+    }
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if robodr_blackbox::keys::effective_uid() == 0 {
+        // Owned by another user: refused.
+        std::os::unix::fs::chown(&k, Some(4242), Some(4242)).unwrap();
+        let ctx =
+            robodr_fleet::state::Ctx::open(cfg.clone(), u.facts.clone(), Box::new(|| T0)).unwrap();
+        let err = ring::fetch(&ctx, &mut Direct { soc: &soc }).unwrap_err();
+        assert!(err.contains("owned by root"), "{err}");
+        std::os::unix::fs::chown(&k, Some(0), Some(0)).unwrap();
+    }
+    let ctx = robodr_fleet::state::Ctx::open(cfg, u.facts.clone(), Box::new(|| T0)).unwrap();
+    ring::fetch(&ctx, &mut Direct { soc: &soc }).unwrap();
+}
+
+#[test]
+fn ring_info_issued_in_the_future_is_refused() {
+    let (u, soc) = enrolled("ring-future");
+    let ctx = u.ctx();
+    soc.borrow_mut().now_ms = T0 + wire::MAX_SKEW_MS + 1;
+    let r = soc.borrow_mut().ring(ROBOT, 1, 0, None);
+    let err = ring::accept(&ctx, &r).unwrap_err();
+    assert!(err.contains("future"), "{err}");
+    soc.borrow_mut().now_ms = T0 + wire::MAX_SKEW_MS;
+    let r = soc.borrow_mut().ring(ROBOT, 1, 0, None);
+    ring::accept(&ctx, &r).unwrap();
+}
+
+#[test]
+fn a_sent_rotation_is_cancelled_at_the_soc_and_a_new_one_can_start() {
+    let (u, soc) = enrolled("rot-cancel");
+    let ctx = u.ctx();
+    let old_id = robodr_fleet::keys::load("uplink", &u.cfg.uplink_key)
+        .unwrap()
+        .key_id();
+    // (a) The SOC registered the rotation, the answer was lost.
+    let rot = rotate::prepare(&ctx, "uplink", &rotate::no_crash).unwrap();
+    assert!(rotate::submit_rotate(&ctx, &mut LoseAnswer { soc: &soc }, "uplink").is_err());
+    assert!(soc.borrow().keys.contains_key(&rot.new_key_id));
+    rotate::submit_cancel(&ctx, &mut Direct { soc: &soc }, "uplink").unwrap();
+    assert!(rotate::current(&ctx, "uplink").unwrap().is_none());
+    assert!(!robodr_fleet::fsx::with_suffix(&u.cfg.uplink_key, ".next").exists());
+    assert!(soc.borrow().keys[&rot.new_key_id].retired_at.is_some());
+    assert_eq!(
+        robodr_fleet::keys::load("uplink", &u.cfg.uplink_key)
+            .unwrap()
+            .key_id(),
+        old_id,
+        "the old key stays active"
+    );
+    assert_eq!(soc.borrow().active_key(ROBOT, "uplink"), vec![&old_id]);
+    // (b) A request that never reached the SOC (network down) is sent as
+    // far as the unit knows: cancelled at the SOC too, which records it.
+    let rot2 = rotate::prepare(&ctx, "uplink", &rotate::no_crash).unwrap();
+    assert!(rotate::submit_rotate(&ctx, &mut Down, "uplink").is_err());
+    assert!(rotate::abort(&ctx, "uplink").is_err());
+    rotate::submit_cancel(&ctx, &mut Direct { soc: &soc }, "uplink").unwrap();
+    // The late rotate request is refused by the SOC.
+    let up = robodr_fleet::keys::load("uplink", &u.cfg.uplink_key).unwrap();
+    let h = authed_headers("POST", wire::PATH_ROTATE, rot2.request.as_bytes(), &up, T0);
+    let r = soc
+        .borrow_mut()
+        .handle("POST", wire::PATH_ROTATE, &h, rot2.request.as_bytes());
+    assert_eq!(r.status, 409);
+    assert!(String::from_utf8_lossy(&r.body).contains("rotation_cancelled"));
+    // (c) The air-gapped request file counts as sent.
+    let ctx2 = &ctx;
+    rotate::prepare(ctx2, "finding", &rotate::no_crash).unwrap();
+    rotate::request_out(ctx2, "finding").unwrap();
+    assert!(rotate::abort(ctx2, "finding").is_err());
+    rotate::submit_cancel(ctx2, &mut Direct { soc: &soc }, "finding").unwrap();
+    // A new rotation runs to the end (nothing is left "in progress").
+    drop(ctx);
+    full_rotation(&u, &soc, "uplink");
+    full_rotation(&u, &soc, "finding");
+    let notes = journal_notes(&u);
+    assert_eq!(
+        notes.iter().filter(|n| n["phase"] == "cancelled").count(),
+        3
+    );
+}
+
+#[test]
+fn approvals_are_accepted_from_the_approval_key_only() {
+    let (u, soc) = enrolled("approval-key");
+    let ctx = u.ctx();
+    let (p, s) = signed_profile(4, Some(ROBOT));
+    soc.borrow_mut().offer(ROBOT, 4, &p, &s);
+    let m = profile::fetch(&ctx, &mut Direct { soc: &soc }).unwrap();
+    // Signed by the online fleet key (a valid SOC key for answers): refused.
+    let a = wire::Approval {
+        format: wire::APPROVAL_FORMAT.into(),
+        approval_id: "ap-f".into(),
+        workspace: WORKSPACE.into(),
+        robot_id: ROBOT.into(),
+        platform: PLATFORM.into(),
+        profile_digest: m.digest.clone(),
+        profile_version: 4,
+        transition: "enforce".into(),
+        approved_by: vec!["op-a".into()],
+        issued_at_ms: T0,
+        expires_at_ms: T0 + 600_000,
+    };
+    let by_fleet_key =
+        Envelope::sign(wire::T_APPROVAL, &wire::payload_bytes(&a), &[&soc_key()]).to_bytes();
+    let err = profile::approve(&ctx, &by_fleet_key).unwrap_err();
+    assert!(err.contains("approval key"), "{err}");
+    assert!(!u.etc("profile.json").exists());
+    drop(ctx);
+    // The fleet key configured as an approval key too: refused.
+    let mut cfg = u.cfg.clone();
+    let dup = u.etc("fleet-soc-copy.pub");
+    write_public_key(&dup, &soc_key());
+    cfg.approval_keys = vec![dup];
+    let ctx = robodr_fleet::state::Ctx::open(cfg, u.facts.clone(), Box::new(|| T0)).unwrap();
+    let err = profile::approve(&ctx, &by_fleet_key).unwrap_err();
+    assert!(
+        err.contains("both as a fleet key and as an approval key"),
+        "{err}"
+    );
+    drop(ctx);
+    let ctx = u.ctx();
+    let good = soc
+        .borrow_mut()
+        .approval("ap-g", ROBOT, PLATFORM, &m.digest, 4, &["op-a"], 600_000);
+    profile::approve(&ctx, &good).unwrap();
+    assert_eq!(std::fs::read(u.etc("profile.json")).unwrap(), p);
+}
+
+#[test]
+fn ring_minimum_version_reaches_ring_env() {
+    let (u, soc) = enrolled("ring-min");
+    let ctx = u.ctx();
+    soc.borrow_mut()
+        .ring_with_min(ROBOT, 1, 0, Some("0.2.0"), Some("0.1.5"));
+    let s = ring::fetch(&ctx, &mut Direct { soc: &soc }).unwrap();
+    assert_eq!(s.info.min_version.as_deref(), Some("0.1.5"));
+    let env = std::fs::read_to_string(u.cfg.state_dir.join("ring.env")).unwrap();
+    assert!(env.lines().any(|l| l == "min_version=0.1.5"), "{env}");
+    assert!(env.lines().any(|l| l == "target_version=0.2.0"), "{env}");
 }

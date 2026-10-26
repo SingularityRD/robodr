@@ -11,8 +11,8 @@ use robodr_blackbox::sign_ed25519::PUBLIC_KEY_LEN;
 use robodr_blackbox::{Ed25519SigningKey, Signer};
 use robodr_fleet::client::{HttpResponse, SocTransport, TransportError};
 use robodr_fleet::wire::{
-    self, Approval, EnrollAnswer, EnrollRequest, Envelope, KeyAnswer, KeyRef, RetireRequest,
-    RingInfo, RotateRequest, TokenPayload,
+    self, Approval, CancelRequest, EnrollAnswer, EnrollRequest, Envelope, KeyAnswer, KeyRef,
+    RetireRequest, RingInfo, RotateRequest, TokenPayload,
 };
 use std::collections::BTreeMap;
 
@@ -45,10 +45,22 @@ pub struct RotationRec {
     pub answer: Vec<u8>,
     /// (retire request digest, stored answer) once retired.
     pub retired: Option<(String, Vec<u8>)>,
+    /// (cancel request digest, stored answer) once cancelled (§5.5).
+    pub cancelled: Option<(String, Vec<u8>)>,
+}
+
+impl RotationRec {
+    /// Still open: neither retired nor cancelled.
+    pub fn open(&self) -> bool {
+        self.retired.is_none() && self.cancelled.is_none()
+    }
 }
 
 pub struct Soc {
+    /// The online fleet key (tokens, answers, ring information).
     pub soc_key: Ed25519SigningKey,
+    /// The approval key (profile approvals only; §6.3).
+    pub approval_key: Ed25519SigningKey,
     pub workspace: String,
     pub now_ms: u64,
     pub tokens: BTreeMap<String, TokenRec>,
@@ -88,9 +100,15 @@ pub fn header<'a>(h: &'a [(String, String)], name: &str) -> Vec<&'a str> {
 }
 
 impl Soc {
-    pub fn new(soc_key: Ed25519SigningKey, workspace: &str, now_ms: u64) -> Self {
+    pub fn new(
+        soc_key: Ed25519SigningKey,
+        approval_key: Ed25519SigningKey,
+        workspace: &str,
+        now_ms: u64,
+    ) -> Self {
         Self {
             soc_key,
+            approval_key,
             workspace: workspace.into(),
             now_ms,
             tokens: BTreeMap::new(),
@@ -209,13 +227,29 @@ impl Soc {
             issued_at_ms: self.now_ms,
             expires_at_ms: self.now_ms + validity_ms,
         };
-        let env = self.sign(wire::T_APPROVAL, &wire::payload_bytes(&a));
+        let env = Envelope::sign(
+            wire::T_APPROVAL,
+            &wire::payload_bytes(&a),
+            &[&self.approval_key],
+        )
+        .to_bytes();
         self.approvals
             .insert(digest.trim_start_matches("sha256:").into(), env.clone());
         env
     }
 
     pub fn ring(&mut self, robot: &str, serial: u64, ring: u8, target: Option<&str>) -> Vec<u8> {
+        self.ring_with_min(robot, serial, ring, target, None)
+    }
+
+    pub fn ring_with_min(
+        &mut self,
+        robot: &str,
+        serial: u64,
+        ring: u8,
+        target: Option<&str>,
+        min_version: Option<&str>,
+    ) -> Vec<u8> {
         let r = RingInfo {
             format: wire::RING_FORMAT.into(),
             serial,
@@ -224,6 +258,7 @@ impl Soc {
             ring,
             target_version: target.map(str::to_string),
             bundle_sha256: target.map(|_| "ab".repeat(32)),
+            min_version: min_version.map(str::to_string),
             issued_at_ms: self.now_ms,
             expires_at_ms: self.now_ms + 86_400_000,
         };
@@ -257,7 +292,11 @@ impl Soc {
         if post(wire::PATH_ENROLL) {
             return self.enroll(headers, body);
         }
-        if post(wire::PATH_ROTATE) || post(wire::PATH_RETIRE) || post(wire::PATH_PROFILE_DRAFTS) {
+        if post(wire::PATH_ROTATE)
+            || post(wire::PATH_RETIRE)
+            || post(wire::PATH_CANCEL)
+            || post(wire::PATH_PROFILE_DRAFTS)
+        {
             if let Err(r) = check_json(
                 headers,
                 body,
@@ -269,21 +308,23 @@ impl Soc {
             ) {
                 return r;
             }
-            let robot = match self.auth(method, target, headers, body) {
+            let (robot, auth_key) = match self.auth(method, target, headers, body) {
                 Ok(r) => r,
                 Err(r) => return r,
             };
             return if post(wire::PATH_ROTATE) {
-                self.rotate(&robot, body)
+                self.rotate(&robot, &auth_key, body)
             } else if post(wire::PATH_RETIRE) {
-                self.retire(&robot, body)
+                self.retire(&robot, &auth_key, body)
+            } else if post(wire::PATH_CANCEL) {
+                self.cancel(&robot, &auth_key, body)
             } else {
                 self.draft(&robot, body)
             };
         }
         if method == "GET" {
             let robot = match self.auth(method, target, headers, body) {
-                Ok(r) => r,
+                Ok((r, _)) => r,
                 Err(r) => return r,
             };
             if target == wire::PATH_PROFILE_CURRENT {
@@ -314,14 +355,15 @@ impl Soc {
         e(404, "not_found", "no such endpoint")
     }
 
-    /// §2.5 request authentication; returns the robot.
+    /// §2.5 request authentication; returns the robot and the key id that
+    /// authenticated the request.
     fn auth(
         &self,
         method: &str,
         target: &str,
         h: &[(String, String)],
         body: &[u8],
-    ) -> Result<String, Resp> {
+    ) -> Result<(String, String), Resp> {
         let one = |n: &str| -> Result<&str, Resp> {
             match header(h, n).as_slice() {
                 [v] => Ok(v),
@@ -358,7 +400,7 @@ impl Soc {
         if !wire::verify_hex(&k.public, &msg, sig) {
             return Err(e(401, "bad_signature", "request signature"));
         }
-        Ok(k.robot.clone())
+        Ok((k.robot.clone(), key_id.to_string()))
     }
 
     fn enroll(&mut self, h: &[(String, String)], body: &[u8]) -> Resp {
@@ -388,13 +430,18 @@ impl Soc {
         if o.verify_mac(&nonce).is_err() {
             return e(401, "bad_token", "token mac");
         }
-        let up = req.key("uplink").unwrap();
-        let pk: [u8; 32] = from_hex(&up.public_hex).unwrap().try_into().unwrap();
-        if o.signers() != [up.key_id.as_str()] || o.verify_by(&up.key_id, &pk).is_err() {
+        // Proof of possession of every key: signed by the request's
+        // uplink, finding and blackbox keys, in that order, nothing else.
+        let ids: Vec<&str> = req.keys.iter().map(|k| k.key_id.as_str()).collect();
+        let all_verify = req.keys.iter().all(|k| {
+            let pk: [u8; 32] = from_hex(&k.public_hex).unwrap().try_into().unwrap();
+            o.verify_by(&k.key_id, &pk).is_ok()
+        });
+        if o.signers() != ids || !all_verify {
             return e(
                 401,
                 "bad_signature",
-                "must be signed by the request's uplink key only",
+                "must be signed by the request's uplink, finding and blackbox keys, in that order",
             );
         }
         let digest = o.payload_digest();
@@ -476,7 +523,7 @@ impl Soc {
         ok(ans)
     }
 
-    fn rotate(&mut self, robot: &str, body: &[u8]) -> Resp {
+    fn rotate(&mut self, robot: &str, auth_key: &str, body: &[u8]) -> Resp {
         let o = match Envelope::parse(body, wire::T_ROTATE_REQUEST) {
             Ok(o) => o,
             Err(x) => return e(400, "bad_request", &x.0),
@@ -492,8 +539,18 @@ impl Soc {
                 "rotation for another robot or workspace",
             );
         }
+        if r.role == "uplink" && auth_key != r.old_key_id {
+            return e(
+                401,
+                "wrong_key",
+                "an uplink rotation is authenticated by its old uplink key",
+            );
+        }
         let digest = o.payload_digest();
         if let Some(rec) = self.rotations.get(&r.rotation_id) {
+            if rec.cancelled.is_some() {
+                return e(409, "rotation_cancelled", "this rotation was cancelled");
+            }
             return if rec.request_digest == digest {
                 ok(rec.answer.clone())
             } else {
@@ -530,7 +587,7 @@ impl Soc {
         if self
             .rotations
             .values()
-            .any(|x| x.robot == robot && x.role == r.role && x.retired.is_none())
+            .any(|x| x.robot == robot && x.role == r.role && x.open())
         {
             return e(
                 409,
@@ -579,12 +636,13 @@ impl Soc {
                 request_digest: digest,
                 answer: ans.clone(),
                 retired: None,
+                cancelled: None,
             },
         );
         ok(ans)
     }
 
-    fn retire(&mut self, robot: &str, body: &[u8]) -> Resp {
+    fn retire(&mut self, robot: &str, auth_key: &str, body: &[u8]) -> Resp {
         let o = match Envelope::parse(body, wire::T_RETIRE_REQUEST) {
             Ok(o) => o,
             Err(x) => return e(400, "bad_request", &x.0),
@@ -605,6 +663,16 @@ impl Soc {
                 "bad_request",
                 "retire request does not match the rotation",
             );
+        }
+        if r.role == "uplink" && auth_key != r.new_key_id {
+            return e(
+                401,
+                "wrong_key",
+                "an uplink retirement is authenticated by the new uplink key",
+            );
+        }
+        if rec.cancelled.is_some() {
+            return e(409, "rotation_cancelled", "this rotation was cancelled");
         }
         let new_pk = self.keys[&r.new_key_id].public;
         if o.signers() != [r.new_key_id.as_str()] || o.verify_by(&r.new_key_id, &new_pk).is_err() {
@@ -637,6 +705,123 @@ impl Soc {
         };
         let ans = self.sign(wire::T_RETIRE_ANSWER, &wire::payload_bytes(&a));
         self.rotations.get_mut(&r.rotation_id).unwrap().retired = Some((digest, ans.clone()));
+        ok(ans)
+    }
+
+    /// §5.5: close a rotation the robot will not complete. Signed by the
+    /// old key; for `uplink`, also authenticated by it. An unknown rotation
+    /// id is recorded as cancelled, so a rotate request with that id that
+    /// arrives later is refused.
+    fn cancel(&mut self, robot: &str, auth_key: &str, body: &[u8]) -> Resp {
+        let o = match Envelope::parse(body, wire::T_CANCEL_REQUEST) {
+            Ok(o) => o,
+            Err(x) => return e(400, "bad_request", &x.0),
+        };
+        let r = match CancelRequest::parse(&o.payload) {
+            Ok(r) => r,
+            Err(x) => return e(400, "bad_request", &x.0),
+        };
+        if r.workspace != self.workspace || r.robot_id != robot {
+            return e(403, "robot_mismatch", "rotation of another robot");
+        }
+        if r.role == "uplink" && auth_key != r.old_key_id {
+            return e(
+                401,
+                "wrong_key",
+                "an uplink cancellation is authenticated by the old uplink key",
+            );
+        }
+        let rec = self.rotations.get(&r.rotation_id).cloned();
+        if let Some(rec) = &rec {
+            if rec.robot != robot {
+                return e(403, "robot_mismatch", "rotation of another robot");
+            }
+            if r.role != rec.role
+                || r.old_key_id != rec.old_key_id
+                || r.new_key_id != rec.new_key_id
+                || r.request_digest != rec.request_digest
+            {
+                return e(
+                    400,
+                    "bad_request",
+                    "cancel request does not match the rotation",
+                );
+            }
+        }
+        let Some(old) = self
+            .keys
+            .get(&r.old_key_id)
+            .filter(|k| k.robot == robot && k.role == r.role)
+        else {
+            return e(
+                409,
+                "stale_key",
+                "old key is not a key of this robot and role",
+            );
+        };
+        if o.signers() != [r.old_key_id.as_str()]
+            || o.verify_by(&r.old_key_id, &old.public).is_err()
+        {
+            return e(401, "bad_signature", "must be signed by the old key only");
+        }
+        let digest = o.payload_digest();
+        if let Some(rec) = &rec {
+            if let Some((d, ans)) = &rec.cancelled {
+                return if *d == digest {
+                    ok(ans.clone())
+                } else {
+                    e(
+                        409,
+                        "already_cancelled",
+                        "rotation already cancelled by another request",
+                    )
+                };
+            }
+            if rec.retired.is_some() {
+                return e(409, "already_retired", "the rotation is complete");
+            }
+        }
+        if old.retired_at.is_some() {
+            return e(
+                409,
+                "stale_key",
+                "old key is not this robot's active key of that role",
+            );
+        }
+        // Effects: the new key (if registered by this rotation) is retired;
+        // the old key stays active.
+        if rec.is_some() {
+            if let Some(k) = self.keys.get_mut(&r.new_key_id) {
+                k.retired_at.get_or_insert(self.now_ms);
+            }
+        }
+        let a = KeyAnswer {
+            format: wire::CANCEL_ANSWER_FORMAT.into(),
+            rotation_id: r.rotation_id.clone(),
+            request_digest: digest.clone(),
+            workspace: r.workspace.clone(),
+            robot_id: robot.into(),
+            role: r.role.clone(),
+            old_key_id: r.old_key_id.clone(),
+            new_key_id: r.new_key_id.clone(),
+            status: "cancelled".into(),
+            at_ms: self.now_ms,
+        };
+        let ans = self.sign(wire::T_CANCEL_ANSWER, &wire::payload_bytes(&a));
+        let entry = self
+            .rotations
+            .entry(r.rotation_id.clone())
+            .or_insert_with(|| RotationRec {
+                robot: robot.into(),
+                role: r.role.clone(),
+                old_key_id: r.old_key_id.clone(),
+                new_key_id: r.new_key_id.clone(),
+                request_digest: r.request_digest.clone(),
+                answer: Vec::new(),
+                retired: None,
+                cancelled: None,
+            });
+        entry.cancelled = Some((digest, ans.clone()));
         ok(ans)
     }
 

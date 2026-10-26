@@ -6,7 +6,8 @@
     "url": "https://soc.example.org/api",
     "ca_bundle": "/etc/robodr/uplink-ca.pem",
     "spki_sha256": [],
-    "keys": ["/etc/robodr/fleet-soc.pub"]
+    "keys": ["/etc/robodr/fleet-soc.pub"],
+    "approval_keys": ["/etc/robodr/fleet-approval.pub"]
   },
   "workspace": null,
   "keys": {

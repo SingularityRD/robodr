@@ -1,0 +1,23 @@
+{
+  "body_file": "12.response.body",
+  "body_sha256": "ebe94fb56aa8c90b0718537ed4751016bd7c28dc4fbef6e3f074af6e48c52bfd",
+  "envelope": {
+    "payload": {
+      "at_ms": 1790000110000,
+      "format": "robodr-fleet-retire-answer/v1",
+      "new_key_id": "ed25519:5229cc84fa78c5b4",
+      "old_key_id": "ed25519:7bf642b114c6afa2",
+      "request_digest": "sha256:db732af7088bbec37b867a5ef9127e2307c50a32caed1d18d4a8e73b6256628e",
+      "robot_id": "ugv-001",
+      "role": "uplink",
+      "rotation_id": "rfr1-02020202020202020202020202020202",
+      "status": "retired",
+      "workspace": "ws-test-0001"
+    },
+    "signed_by": [
+      "ed25519:370ede82195fa32b"
+    ],
+    "type": "retire-answer"
+  },
+  "status": 200
+}

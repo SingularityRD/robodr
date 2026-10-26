@@ -6,19 +6,21 @@
 //!
 //! * [`enroll`]: one-time enrollment with a single-use, SOC-signed token;
 //!   the unit's keys (uplink, finding, black-box) are generated on the unit
-//!   and never leave it; the request is signed by the new uplink key and
-//!   MAC'd with the token secret; online over HTTPS or as files on vetted
-//!   media (air-gapped).
+//!   and never leave it; the request is signed by each of the three new
+//!   keys (proof of possession) and MAC'd with the token secret; online
+//!   over HTTPS or as files on vetted media (air-gapped).
 //! * [`rotate`]: key rotation of the `uplink` and `finding` roles with
 //!   overlap (the old key stays valid until the SOC confirms), an atomic
-//!   swap, a crash-safe journal and a signed key handover in the fleet
-//!   journal.
+//!   swap, a crash-safe journal, a signed key handover in the fleet
+//!   journal, and cancellation at the SOC (signed by the old key) of a
+//!   rotation that was sent but will not be completed.
 //! * [`revocation`]: the SOC-distributed, root-signed revocation list
 //!   (`robodr-profile-revocations/v2`), verified with robodr-commission's
 //!   code and anti-rollback protected.
 //! * [`profile`]: SOC-published signed profiles are fetched, verified with
 //!   agentd's own trust inputs and **staged**; they are installed only on an
-//!   explicit operator approval artefact signed by the SOC. Nothing is ever
+//!   explicit operator approval artefact signed by a SOC **approval key**
+//!   (distinct from the online fleet key). Nothing is ever
 //!   enforced automatically.
 //! * [`ring`]: update-ring information (0/1/2), information only.
 //!

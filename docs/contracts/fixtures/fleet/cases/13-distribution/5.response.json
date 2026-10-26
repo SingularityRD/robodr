@@ -1,6 +1,6 @@
 {
   "body_file": "5.response.body",
-  "body_sha256": "5f7c62d677ce4be88ddeb50e07e6349604c946f92bbb78378377dc9320ca7c2a",
+  "body_sha256": "b6c0f9340f99f72308a44049d210430428c6d850dc5f18648e5445cc26fae4f9",
   "envelope": {
     "payload": {
       "approval_id": "ap-1",
@@ -19,7 +19,7 @@
       "workspace": "ws-test-0001"
     },
     "signed_by": [
-      "ed25519:370ede82195fa32b"
+      "ed25519:9e208c2e60b4f0a2"
     ],
     "type": "profile-approval"
   },

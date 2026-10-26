@@ -12,6 +12,7 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -141,7 +142,7 @@ fn serve(soc: Soc) -> Server {
 }
 
 fn live_soc() -> Soc {
-    Soc::new(soc_key(), WORKSPACE, now_ms())
+    Soc::new(soc_key(), approval_key(), WORKSPACE, now_ms())
 }
 
 fn run(args: &[&str]) -> Output {
@@ -158,6 +159,14 @@ fn txt(o: &Output) -> String {
         String::from_utf8_lossy(&o.stdout),
         String::from_utf8_lossy(&o.stderr)
     )
+}
+
+/// The token in a root-only file (mode 0600).
+fn token_file(u: &Unit, tok: &str) -> PathBuf {
+    let f = u.root.join("token.txt");
+    std::fs::write(&f, format!("{tok}\n")).unwrap();
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+    f
 }
 
 fn unit_with_ca(tag: &str) -> Unit {
@@ -215,13 +224,13 @@ fn cli_online_enroll_rotate_and_status() {
         .lock()
         .unwrap()
         .issue_token("tok-1", ROBOT, Some(SITE), 600_000, [9; 32]);
-    let tokf = u.root.join("token.txt");
-    std::fs::write(&tokf, format!("{tok}\n")).unwrap();
+    let tokf = token_file(&u, &tok);
     let o = run(&["--config", c, "--token-file", tokf.to_str().unwrap()]);
     assert_eq!(code(&o), 0, "{}", txt(&o));
     assert!(String::from_utf8_lossy(&o.stdout).contains("enrolled: robot ugv-001"));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("shred -u"));
     // Replay of the same token through the CLI: refused locally (exit 1).
-    let o = run(&["--config", c, "--token", &tok]);
+    let o = run(&["--config", c, "--token-file", tokf.to_str().unwrap()]);
     assert_eq!(code(&o), 1, "{}", txt(&o));
     let o = run(&["rotate", "--config", c, "--role", "finding"]);
     assert_eq!(code(&o), 0, "{}", txt(&o));
@@ -252,18 +261,20 @@ fn cli_air_gapped_files_and_usage() {
     let mut soc = live_soc();
     let tok = soc.issue_token("tok-1", ROBOT, Some(SITE), 600_000, [9; 32]);
     let req = u.root.join("req.json");
+    let tokf = token_file(&u, &tok);
+    let tf = tokf.to_str().unwrap();
     let o = run(&[
         "request",
         "--config",
         c,
-        "--token",
-        &tok,
+        "--token-file",
+        tf,
         "--out",
         req.to_str().unwrap(),
     ]);
     assert_eq!(code(&o), 0, "{}", txt(&o));
     // Online enroll without a URL: usage error.
-    let o = run(&["--config", c, "--token", &tok]);
+    let o = run(&["--config", c, "--token-file", tf]);
     assert_eq!(code(&o), 2, "{}", txt(&o));
     let h = vec![("Content-Type".to_string(), "application/json".to_string())];
     soc.now_ms = now_ms();
@@ -373,6 +384,12 @@ fn cli_air_gapped_files_and_usage() {
         vec!["rotate", "--config", c, "--role", "blackbox"],
         vec!["bogus", "--config", c],
         vec!["status", "--config", c, "--role", "uplink"],
+        vec![
+            "rotate", "--config", c, "--role", "uplink", "--cancel", "--abort",
+        ],
+        vec![
+            "rotate", "--config", c, "--role", "uplink", "--cancel", "--finish",
+        ],
         vec!["--token"],
     ] {
         let o = run(&args);
@@ -383,4 +400,63 @@ fn cli_air_gapped_files_and_usage() {
     assert!(String::from_utf8_lossy(&o.stdout).starts_with("robodr-enroll "));
     let o = run(&["--help"]);
     assert_eq!(code(&o), 0);
+}
+
+#[test]
+fn cli_never_takes_the_token_from_argv() {
+    let srv = serve(live_soc());
+    let u = unit_with_ca("cli-token");
+    let cfgf = u.config_file(Some(&srv.url()));
+    let c = cfgf.to_str().unwrap();
+    let tok = srv
+        .soc
+        .lock()
+        .unwrap()
+        .issue_token("tok-1", ROBOT, Some(SITE), 600_000, [9; 32]);
+    // On argv the token would be in /proc/<pid>/cmdline, sudo logs and the
+    // shell history: refused before anything else.
+    for args in [
+        vec!["--config", c, "--token", tok.as_str()],
+        vec![
+            "request",
+            "--config",
+            c,
+            "--token",
+            tok.as_str(),
+            "--out",
+            "/dev/null",
+        ],
+    ] {
+        let o = run(&args);
+        assert_eq!(code(&o), 2, "{}", txt(&o));
+        assert!(txt(&o).contains("command line"), "{}", txt(&o));
+        assert!(!u.cfg.uplink_key.exists());
+    }
+    let o = run(&["--config", c, &format!("--token={tok}")]);
+    assert_eq!(code(&o), 2, "{}", txt(&o));
+    // A token file readable by group or others: refused.
+    let tokf = u.root.join("token.txt");
+    std::fs::write(&tokf, format!("{tok}\n")).unwrap();
+    std::fs::set_permissions(&tokf, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let o = run(&["--config", c, "--token-file", tokf.to_str().unwrap()]);
+    assert_eq!(code(&o), 1, "{}", txt(&o));
+    assert!(txt(&o).contains("group or others"), "{}", txt(&o));
+    assert!(!u.cfg.uplink_key.exists());
+    // On stdin (`--token -`): accepted.
+    let mut child = Command::new(BIN)
+        .args(["--config", c, "--token", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{tok}\n").as_bytes())
+        .unwrap();
+    let o = child.wait_with_output().unwrap();
+    assert_eq!(code(&o), 0, "{}", txt(&o));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("enrolled: robot ugv-001"));
 }

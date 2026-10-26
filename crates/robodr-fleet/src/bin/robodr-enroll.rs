@@ -12,10 +12,11 @@ use robodr_fleet::{enroll, fsx, profile, revocation, ring, rotate};
 
 const USAGE: &str = "\
 usage:
-  robodr-enroll [enroll] (--token TOKEN | --token-file FILE) [--reuse-existing-keys]
-  robodr-enroll request  (--token TOKEN | --token-file FILE) --out FILE [--reuse-existing-keys]
+  robodr-enroll [enroll] (--token-file FILE | --token -) [--reuse-existing-keys]
+  robodr-enroll request  (--token-file FILE | --token -) --out FILE [--reuse-existing-keys]
   robodr-enroll accept   --answer FILE
   robodr-enroll rotate   --role uplink|finding [--finish] [--request-out FILE | --answer FILE]
+  robodr-enroll rotate   --role uplink|finding --cancel [--request-out FILE | --answer FILE]
   robodr-enroll rotate   --role uplink|finding --abort
   robodr-enroll revocations [fetch] [--platform P]
   robodr-enroll revocations install --file FILE [--platform P]
@@ -32,7 +33,11 @@ common options:
   --ca-bundle PEM        SOC CA certificate(s) (overrides soc.ca_bundle)
   --spki-sha256 HEX      pin the SOC server key (repeatable; overrides soc.spki_sha256)
   --soc-key FILE         SOC fleet public key file (repeatable; overrides soc.keys)
+  --approval-key FILE    SOC approval public key file (repeatable; overrides soc.approval_keys)
   --agentd-config FILE   agentd configuration (overrides agentd_config)
+the token is never taken from the command line (it would show in /proc, sudo logs and
+the shell history): --token-file FILE (owned by root, mode 0600 or stricter; shred it
+afterwards) or --token - (read from standard input).
 exit: 0 ok, 1 refused or failed verification, 2 usage error, 3 SOC not reachable (retry)";
 
 struct Args {
@@ -44,6 +49,7 @@ const FLAGS: &[&str] = &[
     "--reuse-existing-keys",
     "--finish",
     "--abort",
+    "--cancel",
     "--fetch",
     "--help",
     "-h",
@@ -67,9 +73,14 @@ const VALUED: &[&str] = &[
     "--ca-bundle",
     "--spki-sha256",
     "--soc-key",
+    "--approval-key",
     "--agentd-config",
 ];
-const REPEATABLE: &[&str] = &["--spki-sha256", "--soc-key"];
+const REPEATABLE: &[&str] = &["--spki-sha256", "--soc-key", "--approval-key"];
+
+const TOKEN_ARGV: &str = "the enrollment token is not accepted on the command line (it would \
+show in /proc/<pid>/cmdline, sudo logs and the shell history): put it in a file only root can \
+read (--token-file FILE, then shred it) or pass it on standard input (--token -)";
 
 fn parse(argv: &[String]) -> Result<Args, String> {
     let mut a = Args {
@@ -99,6 +110,9 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                             .ok_or_else(|| format!("{name} needs a value"))?
                     }
                 };
+                if name == "--token" && v != "-" {
+                    return Err(TOKEN_ARGV.into());
+                }
                 if !REPEATABLE.contains(&name.as_str()) && a.opts.iter().any(|(n, _)| *n == name) {
                     return Err(format!("{name} given twice"));
                 }
@@ -139,6 +153,7 @@ impl Args {
             "--ca-bundle",
             "--spki-sha256",
             "--soc-key",
+            "--approval-key",
             "--agentd-config",
         ];
         for (k, _) in &self.opts {
@@ -172,12 +187,9 @@ fn read_file(p: &str, max: u64) -> Result<Vec<u8>, Fail> {
 
 fn write_out(p: &str, bytes: &[u8]) -> Result<(), Fail> {
     // Request files carry no secret (public keys, signatures, a MAC);
-    // written atomically, 0644, for vetted media.
-    robodr_commission::write_file_atomic(Path::new(p), bytes, true)
-        .and_then(|()| {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644))
-        })
+    // written atomically, mode 0644 set on the descriptor before the
+    // rename, for vetted media.
+    fsx::write_atomic_with(Path::new(p), bytes, 0o644, None)
         .map_err(|e| Fail::Refused(format!("{p}: {e}")))
 }
 
@@ -201,6 +213,10 @@ fn context(a: &Args) -> Result<Ctx, Fail> {
     if !keys.is_empty() {
         cfg.soc_keys = keys.into_iter().map(PathBuf::from).collect();
     }
+    let keys = a.all("--approval-key");
+    if !keys.is_empty() {
+        cfg.approval_keys = keys.into_iter().map(PathBuf::from).collect();
+    }
     if let Some(c) = a.get("--agentd-config") {
         cfg.agentd_config = Some(PathBuf::from(c));
     }
@@ -218,14 +234,43 @@ fn transport(ctx: &Ctx) -> Result<Https, Fail> {
     Https::new(url, Some(&ctx.cfg.ca_bundle), &ctx.cfg.spki_sha256).map_err(Fail::Usage)
 }
 
+/// The enrollment token: from a root-only file or standard input, never
+/// from argv (see `TOKEN_ARGV`).
 fn token(a: &Args) -> Result<String, Fail> {
-    match (a.get("--token"), a.get("--token-file")) {
-        (Some(t), None) => Ok(t.to_string()),
-        (None, Some(f)) => String::from_utf8(read_file(f, 8192)?)
-            .map_err(|_| Fail::Refused(format!("{f}: not UTF-8"))),
-        _ => Err(Fail::Usage(
-            "give exactly one of --token / --token-file".into(),
-        )),
+    let bytes = match (a.get("--token"), a.get("--token-file")) {
+        (Some("-"), None) => {
+            use std::io::Read;
+            let mut v = Vec::new();
+            std::io::stdin()
+                .take(8193)
+                .read_to_end(&mut v)
+                .map_err(|e| Fail::Refused(format!("standard input: {e}")))?;
+            if v.len() > 8192 {
+                return Err(Fail::Refused("standard input: token too long".into()));
+            }
+            v
+        }
+        (Some(_), None) => return Err(Fail::Usage(TOKEN_ARGV.into())),
+        (None, Some(f)) => {
+            fsx::check_secret_mode(Path::new(f)).map_err(|e| {
+                Fail::Refused(format!(
+                    "{e}; the token file is a secret: chown root, chmod 0600"
+                ))
+            })?;
+            read_file(f, 8192)?
+        }
+        _ => {
+            return Err(Fail::Usage(
+                "give exactly one of --token-file FILE / --token - (standard input)".into(),
+            ))
+        }
+    };
+    String::from_utf8(bytes).map_err(|_| Fail::Refused("the token is not UTF-8".into()))
+}
+
+fn shred_hint(a: &Args) {
+    if let Some(f) = a.get("--token-file") {
+        println!("the token is consumed; destroy the token file: shred -u {f}");
     }
 }
 
@@ -267,6 +312,7 @@ fn run(a: &Args) -> Result<(), Fail> {
                 e.site.as_deref().unwrap_or("-"),
                 e.soc_key_id
             );
+            shred_hint(a);
             Ok(())
         }
         ["request"] => {
@@ -289,6 +335,7 @@ fn run(a: &Args) -> Result<(), Fail> {
                  robodr-enroll accept --answer FILE",
                 p.pending.request_id
             );
+            shred_hint(a);
             Ok(())
         }
         ["accept"] => {
@@ -425,7 +472,14 @@ fn report_revocations(r: &revocation::Installed) {
 }
 
 fn cmd_rotate(a: &Args) -> Result<(), Fail> {
-    a.allow(&["--role", "--finish", "--abort", "--request-out", "--answer"])?;
+    a.allow(&[
+        "--role",
+        "--finish",
+        "--abort",
+        "--cancel",
+        "--request-out",
+        "--answer",
+    ])?;
     let role = a
         .get("--role")
         .ok_or_else(|| Fail::Usage("rotate needs --role uplink|finding".into()))?;
@@ -435,6 +489,16 @@ fn cmd_rotate(a: &Args) -> Result<(), Fail> {
     if a.get("--request-out").is_some() && a.get("--answer").is_some() {
         return Err(Fail::Usage(
             "--request-out and --answer are separate steps".into(),
+        ));
+    }
+    if [a.flag("--finish"), a.flag("--abort"), a.flag("--cancel")]
+        .iter()
+        .filter(|f| **f)
+        .count()
+        > 1
+    {
+        return Err(Fail::Usage(
+            "--finish, --cancel and --abort are separate steps".into(),
         ));
     }
     let ctx = context(a)?;
@@ -447,6 +511,25 @@ fn cmd_rotate(a: &Args) -> Result<(), Fail> {
     if a.flag("--abort") {
         rotate::abort(&ctx, role)?;
         println!("rotation of the {role} key aborted; the new key was shredded");
+        return Ok(());
+    }
+    if a.flag("--cancel") {
+        if let Some(out) = a.get("--request-out") {
+            write_out(out, &rotate::cancel_request(&ctx, role)?)?;
+            println!(
+                "cancel request written to {out}; carry it to the SOC, then run \
+                 robodr-enroll rotate --role {role} --cancel --answer FILE"
+            );
+            return Ok(());
+        }
+        match a.get("--answer") {
+            Some(f) => rotate::cancelled(&ctx, role, &read_file(f, 64 * 1024)?)?,
+            None => rotate::submit_cancel(&ctx, &mut transport(&ctx)?, role)?,
+        }
+        println!(
+            "rotation of the {role} key cancelled at the SOC; the new key was shredded, the \
+             old key stays active"
+        );
         return Ok(());
     }
     if a.flag("--finish") {
@@ -465,7 +548,7 @@ fn cmd_rotate(a: &Args) -> Result<(), Fail> {
     }
     let rot = rotate::prepare(&ctx, role, crash)?;
     if let Some(out) = a.get("--request-out") {
-        write_out(out, rot.request.as_bytes())?;
+        write_out(out, &rotate::request_out(&ctx, role)?)?;
         println!(
             "rotate request {} written to {out}; carry it to the SOC, then run \
              robodr-enroll rotate --role {role} --answer FILE",

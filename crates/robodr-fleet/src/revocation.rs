@@ -27,7 +27,7 @@ const MAX_LIST_BYTES: u64 = robodr_commission::trust::MAX_REVOCATION_BYTES;
 pub struct Installed {
     pub serial: u64,
     pub digest: String,
-    /// The same list was already installed (nothing written).
+    /// The installed file already was this list (nothing written).
     pub unchanged: bool,
     /// With this list, agentd would refuse the active profile (reason).
     pub active_profile_refused: Option<String>,
@@ -120,8 +120,9 @@ pub fn install(ctx: &Ctx, bytes: &[u8], platform: &str) -> Result<Installed, Str
             "last list installed by robodr-enroll",
         ));
     }
-    if let Some((s, d)) = installed_mark(target, &roots) {
-        floor.push((s, d, "list currently installed"));
+    let installed_now = installed_mark(target, &roots);
+    if let Some((s, d)) = &installed_now {
+        floor.push((*s, d.clone(), "list currently installed"));
     }
     if let Some(sf) = &ctx.facts.state_file {
         if let Ok(Some(st)) = load_state(sf) {
@@ -130,7 +131,6 @@ pub fn install(ctx: &Ctx, bytes: &[u8], platform: &str) -> Result<Installed, Str
             }
         }
     }
-    let mut unchanged = false;
     for (s, d, what) in &floor {
         if list.serial < *s {
             return Err(format!(
@@ -138,13 +138,10 @@ pub fn install(ctx: &Ctx, bytes: &[u8], platform: &str) -> Result<Installed, Str
                 list.serial
             ));
         }
-        if list.serial == *s {
-            if *d != digest {
-                return Err(format!(
-                    "equivocation refused: serial {s} with other content than the {what}"
-                ));
-            }
-            unchanged = true;
+        if list.serial == *s && *d != digest {
+            return Err(format!(
+                "equivocation refused: serial {s} with other content than the {what}"
+            ));
         }
     }
     // What agentd would decide for the active profile with this list.
@@ -173,7 +170,11 @@ pub fn install(ctx: &Ctx, bytes: &[u8], platform: &str) -> Result<Installed, Str
         }
         _ => None,
     };
-    if !(unchanged && target.exists()) {
+    // Nothing to write only if the installed file IS this list (it parses,
+    // verifies and has its digest): a damaged or replaced file is
+    // reinstalled even when the recorded marks say this serial is in place.
+    let unchanged = installed_now.is_some_and(|(s, d)| s == list.serial && d == digest);
+    if !unchanged {
         crate::install::install_public(target, bytes)?;
     }
     marks.retain(|m| m.platform != platform);

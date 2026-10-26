@@ -1,4 +1,5 @@
 {
+  "approval_key": "keys/soc-approval.key.pub",
   "base_path": "/api",
   "cases": [
     {
@@ -216,6 +217,64 @@
           "tokens/tok-3.txt"
         ]
       }
+    },
+    {
+      "description": "proof of possession of every key: request signed by its uplink key only -> 401 bad_signature; signed by uplink, blackbox, finding (wrong order) -> 401 bad_signature; signed by the three keys in order -> 200",
+      "name": "15-enroll-possession",
+      "requests": [
+        "cases/15-enroll-possession/1",
+        "cases/15-enroll-possession/2",
+        "cases/15-enroll-possession/3"
+      ],
+      "setup": {
+        "tokens": [
+          "tokens/tok-1.txt"
+        ]
+      }
+    },
+    {
+      "description": "enroll; rotate (overlap); cancel signed by the new key -> 401 bad_signature; cancel authenticated by the new uplink key -> 401 wrong_key; cancel (signed and authenticated by the old key) -> cancelled, the new key retired; the same cancel again -> stored answer; the rotate request again -> 409 rotation_cancelled; the new key no longer authenticates (401 unknown_key); a new rotation -> overlap (the cancelled one is not in progress); cancel of a rotation the SOC never received -> cancelled; that rotate request arriving later -> 409 rotation_cancelled; retire of the open rotation -> retired; cancelling it now -> 409 already_retired",
+      "name": "16-rotate-cancel",
+      "requests": [
+        "cases/16-rotate-cancel/1",
+        "cases/16-rotate-cancel/2",
+        "cases/16-rotate-cancel/3",
+        "cases/16-rotate-cancel/4",
+        "cases/16-rotate-cancel/5",
+        "cases/16-rotate-cancel/6",
+        "cases/16-rotate-cancel/7",
+        "cases/16-rotate-cancel/8",
+        "cases/16-rotate-cancel/9",
+        "cases/16-rotate-cancel/10",
+        "cases/16-rotate-cancel/11",
+        "cases/16-rotate-cancel/12",
+        "cases/16-rotate-cancel/13"
+      ],
+      "setup": {
+        "rings": {
+          "ugv-001": "cases/16-rotate-cancel/setup/rings-ugv-001.body"
+        },
+        "tokens": [
+          "tokens/tok-1.txt"
+        ]
+      }
+    },
+    {
+      "description": "§5.1/§5.3 authentication of an uplink rotation: rotate authenticated by the finding key -> 401 unknown_key; rotate authenticated by the old uplink key -> overlap; the same rotate request authenticated by the new uplink key -> 401 wrong_key; retire authenticated by the old uplink key -> 401 wrong_key (the old key stays active); retire authenticated by the new uplink key -> retired",
+      "name": "17-rotate-auth-key",
+      "requests": [
+        "cases/17-rotate-auth-key/1",
+        "cases/17-rotate-auth-key/2",
+        "cases/17-rotate-auth-key/3",
+        "cases/17-rotate-auth-key/4",
+        "cases/17-rotate-auth-key/5",
+        "cases/17-rotate-auth-key/6"
+      ],
+      "setup": {
+        "tokens": [
+          "tokens/tok-1.txt"
+        ]
+      }
     }
   ],
   "compare": "status; error bodies by code; 200 envelopes by type, signer list and decoded payload (JSON value equality; the committed body bytes are the reference's, Ed25519 is deterministic so an implementation serialising payloads as compact JSON in the contract's key order reproduces them exactly); other 200 bodies byte-exact (body_sha256)",
@@ -226,6 +285,12 @@
       "key_id": "ed25519:370ede82195fa32b",
       "robot": null,
       "role": "soc"
+    },
+    {
+      "file": "keys/soc-approval.key",
+      "key_id": "ed25519:9e208c2e60b4f0a2",
+      "robot": null,
+      "role": "approval"
     },
     {
       "file": "keys/ugv-001-uplink.key",
@@ -248,6 +313,12 @@
     {
       "file": "keys/ugv-001-uplink-next.key",
       "key_id": "ed25519:caf521a404f9a7bf",
+      "robot": "ugv-001",
+      "role": "uplink"
+    },
+    {
+      "file": "keys/ugv-001-uplink-next2.key",
+      "key_id": "ed25519:5229cc84fa78c5b4",
       "robot": "ugv-001",
       "role": "uplink"
     },

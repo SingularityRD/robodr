@@ -36,6 +36,8 @@ fn fleet_seeds_take_the_success_paths() {
             wire::T_ROTATE_ANSWER,
             wire::T_RETIRE_REQUEST,
             wire::T_RETIRE_ANSWER,
+            wire::T_CANCEL_REQUEST,
+            wire::T_CANCEL_ANSWER,
             wire::T_APPROVAL,
             wire::T_RING,
         ] {
@@ -49,7 +51,7 @@ fn fleet_seeds_take_the_success_paths() {
     // The malformed-request vectors (no mac, trailing bytes) are seeds too.
     assert!(parsed + 2 >= total, "only {parsed} of {total} seeds parse");
     assert!(
-        kinds.len() >= 7,
+        kinds.len() >= 9,
         "seeds cover too few envelope types: {kinds:?}"
     );
 }

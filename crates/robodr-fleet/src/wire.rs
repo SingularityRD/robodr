@@ -29,6 +29,8 @@ pub const PATH_ENROLL: &str = "/robot-edr/v2/fleet/enroll";
 pub const PATH_ROTATE: &str = "/robot-edr/v2/fleet/keys/rotate";
 /// `POST`: retire request envelope -> retire answer envelope.
 pub const PATH_RETIRE: &str = "/robot-edr/v2/fleet/keys/retire";
+/// `POST`: cancel request envelope -> cancel answer envelope.
+pub const PATH_CANCEL: &str = "/robot-edr/v2/fleet/keys/cancel";
 /// `GET` + `/<platform>`: the root-signed revocation list.
 pub const PATH_REVOCATIONS: &str = "/robot-edr/v2/fleet/revocations";
 /// `POST`: a draft profile for review.
@@ -52,6 +54,8 @@ pub const ROTATE_REQUEST_FORMAT: &str = "robodr-fleet-rotate-request/v1";
 pub const ROTATE_ANSWER_FORMAT: &str = "robodr-fleet-rotate-answer/v1";
 pub const RETIRE_REQUEST_FORMAT: &str = "robodr-fleet-retire-request/v1";
 pub const RETIRE_ANSWER_FORMAT: &str = "robodr-fleet-retire-answer/v1";
+pub const CANCEL_REQUEST_FORMAT: &str = "robodr-fleet-cancel-request/v1";
+pub const CANCEL_ANSWER_FORMAT: &str = "robodr-fleet-cancel-answer/v1";
 pub const APPROVAL_FORMAT: &str = "robodr-fleet-profile-approval/v1";
 pub const RING_FORMAT: &str = "robodr-fleet-ring/v1";
 pub const OFFER_FORMAT: &str = "robodr-fleet-profile-offer/v1";
@@ -64,9 +68,11 @@ pub const T_ROTATE_REQUEST: &str = "rotate-request";
 pub const T_ROTATE_ANSWER: &str = "rotate-answer";
 pub const T_RETIRE_REQUEST: &str = "retire-request";
 pub const T_RETIRE_ANSWER: &str = "retire-answer";
+pub const T_CANCEL_REQUEST: &str = "cancel-request";
+pub const T_CANCEL_ANSWER: &str = "cancel-answer";
 pub const T_APPROVAL: &str = "profile-approval";
 pub const T_RING: &str = "ring-info";
-const TYPES: [&str; 9] = [
+const TYPES: [&str; 11] = [
     T_TOKEN,
     T_ENROLL_REQUEST,
     T_ENROLL_ANSWER,
@@ -74,6 +80,8 @@ const TYPES: [&str; 9] = [
     T_ROTATE_ANSWER,
     T_RETIRE_REQUEST,
     T_RETIRE_ANSWER,
+    T_CANCEL_REQUEST,
+    T_CANCEL_ANSWER,
     T_APPROVAL,
     T_RING,
 ];
@@ -97,6 +105,8 @@ pub const MAX_PAYLOAD_BYTES: usize = 32 * 1024;
 pub const MAX_TOKEN_BYTES: usize = 4 * 1024;
 /// Longest validity window of a token (7 days).
 pub const MAX_TOKEN_VALIDITY_MS: u64 = 7 * 24 * 3600 * 1000;
+/// Longest validity window of a profile approval (7 days).
+pub const MAX_APPROVAL_VALIDITY_MS: u64 = 7 * 24 * 3600 * 1000;
 /// Clock skew tolerated between robot and SOC (5 minutes, inclusive).
 pub const MAX_SKEW_MS: u64 = 300_000;
 /// Most signatures in one envelope.
@@ -905,7 +915,7 @@ impl RotateRequest {
     }
 }
 
-/// Answer to a rotate or retire request (§5).
+/// Answer to a rotate, retire or cancel request (§5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyAnswer {
     pub format: String,
@@ -916,7 +926,7 @@ pub struct KeyAnswer {
     pub role: String,
     pub old_key_id: String,
     pub new_key_id: String,
-    /// `overlap` (rotate) or `retired` (retire).
+    /// `overlap` (rotate), `retired` (retire) or `cancelled` (cancel).
     pub status: String,
     pub at_ms: u64,
 }
@@ -993,6 +1003,53 @@ impl RetireRequest {
     }
 }
 
+/// Cancel request (§5.5): ends a rotation the robot will not complete,
+/// signed by the **old** key (the one that stays).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelRequest {
+    pub format: String,
+    pub rotation_id: String,
+    /// Digest of the rotate request payload being cancelled.
+    pub request_digest: String,
+    pub workspace: String,
+    pub robot_id: String,
+    pub role: String,
+    pub old_key_id: String,
+    pub new_key_id: String,
+    pub created_at_ms: u64,
+}
+
+pub const CANCEL_REQUEST_KEYS: &[&str] = &[
+    "format",
+    "rotation_id",
+    "request_digest",
+    "workspace",
+    "robot_id",
+    "role",
+    "old_key_id",
+    "new_key_id",
+    "created_at_ms",
+];
+
+impl CancelRequest {
+    pub fn parse(payload: &[u8]) -> Result<Self, WireError> {
+        let r: Self = strict_parse(payload, CANCEL_REQUEST_KEYS)?;
+        if r.format != CANCEL_REQUEST_FORMAT
+            || !is_prefixed_id(&r.rotation_id, "rfr1-")
+            || !is_sha256_digest(&r.request_digest)
+            || !is_ident(&r.workspace)
+            || !is_label(&r.robot_id)
+            || !ROTATABLE.contains(&r.role.as_str())
+            || !is_key_id(&r.old_key_id)
+            || !is_key_id(&r.new_key_id)
+            || r.old_key_id == r.new_key_id
+        {
+            return err("cancel request malformed");
+        }
+        Ok(r)
+    }
+}
+
 // -------------------------------------------------------------- profile --
 
 /// Operator approval of the observe -> enforce transition (§6.3).
@@ -1051,8 +1108,10 @@ impl Approval {
         if o.len() != a.approved_by.len() {
             return err("approved_by names an operator twice");
         }
-        if a.expires_at_ms <= a.issued_at_ms {
-            return err("approval expires before it is issued");
+        if a.expires_at_ms <= a.issued_at_ms
+            || a.expires_at_ms - a.issued_at_ms > MAX_APPROVAL_VALIDITY_MS
+        {
+            return err("approval validity must be > 0 and <= 7 days");
         }
         Ok(a)
     }
@@ -1104,6 +1163,9 @@ pub struct RingInfo {
     pub ring: u8,
     pub target_version: Option<String>,
     pub bundle_sha256: Option<String>,
+    /// The lowest release this robot may run (known-vulnerable releases
+    /// below it): raises the unit's security floor (`install-bundle.sh`).
+    pub min_version: Option<String>,
     pub issued_at_ms: u64,
     pub expires_at_ms: u64,
 }
@@ -1116,6 +1178,7 @@ pub const RING_KEYS: &[&str] = &[
     "ring",
     "target_version",
     "bundle_sha256",
+    "min_version",
     "issued_at_ms",
     "expires_at_ms",
 ];
@@ -1129,6 +1192,7 @@ impl RingInfo {
             || !is_label(&r.robot_id)
             || r.ring > 2
             || r.target_version.as_deref().is_some_and(|v| !is_version(v))
+            || r.min_version.as_deref().is_some_and(|v| !is_version(v))
             || r.bundle_sha256
                 .as_deref()
                 .is_some_and(|h| !is_lower_hex(h, 64))
@@ -1224,5 +1288,26 @@ mod tests {
         assert!(parsed.check_time(1_000_000 - MAX_SKEW_MS - 1).is_err());
         assert!(Token::parse(&t.replacen("rdet1.", "rdet2.", 1)).is_err());
         assert!(Token::parse(&format!("{t}.x")).is_err());
+    }
+
+    #[test]
+    fn approval_validity_is_capped() {
+        let a = |validity: u64| {
+            payload_bytes(&Approval {
+                format: APPROVAL_FORMAT.into(),
+                approval_id: "ap-1".into(),
+                workspace: "ws-1".into(),
+                robot_id: "ugv-001".into(),
+                platform: "ugv-x1".into(),
+                profile_digest: format!("sha256:{}", "a".repeat(64)),
+                profile_version: 1,
+                transition: "enforce".into(),
+                approved_by: vec!["op-a".into()],
+                issued_at_ms: 1_000,
+                expires_at_ms: 1_000 + validity,
+            })
+        };
+        Approval::parse(&a(7 * 24 * 3600 * 1000)).unwrap();
+        assert!(Approval::parse(&a(7 * 24 * 3600 * 1000 + 1)).is_err());
     }
 }

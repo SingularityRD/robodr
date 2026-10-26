@@ -28,6 +28,10 @@ pub const T0: u64 = 1_790_000_000_000;
 pub fn soc_key() -> Ed25519SigningKey {
     Ed25519SigningKey::from_seed_with_derived_id(&[0x50; 32])
 }
+/// The SOC's approval key (profile approvals only; not the fleet key).
+pub fn approval_key() -> Ed25519SigningKey {
+    Ed25519SigningKey::from_seed_with_derived_id(&[0x54; 32])
+}
 pub fn profile_key() -> Ed25519SigningKey {
     Ed25519SigningKey::from_seed_with_derived_id(&[0x51; 32])
 }
@@ -35,6 +39,7 @@ pub fn root_key() -> Ed25519SigningKey {
     Ed25519SigningKey::from_seed_with_derived_id(&[0x52; 32])
 }
 
+/// A fresh temporary directory (removed by its owner: [`Unit`]'s `Drop`).
 pub fn tmpdir(tag: &str) -> PathBuf {
     static N: AtomicUsize = AtomicUsize::new(0);
     let d = std::env::temp_dir().join(format!(
@@ -65,6 +70,13 @@ pub struct Unit {
     pub now: Rc<Cell<u64>>,
 }
 
+/// The unit's temporary root is removed with it (also when a test fails).
+impl Drop for Unit {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
 impl Unit {
     /// A unit with agentd configured for `ROBOT` at `SITE`, profile trust
     /// (profile key, trust roots, revocation list path, state file).
@@ -76,6 +88,7 @@ impl Unit {
         std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::set_permissions(&etc, std::fs::Permissions::from_mode(0o755)).unwrap();
         write_public_key(&etc.join("fleet-soc.pub"), &soc_key());
+        write_public_key(&etc.join("fleet-approval.pub"), &approval_key());
         // Trust roots + root-signed trust file (attestation not required).
         write_mode(
             &etc.join("trust-roots.json"),
@@ -118,6 +131,7 @@ impl Unit {
             ca_bundle: etc.join("soc-ca.pem"),
             spki_sha256: Vec::new(),
             soc_keys: vec![etc.join("fleet-soc.pub")],
+            approval_keys: vec![etc.join("fleet-approval.pub")],
             workspace: Some(WORKSPACE.into()),
             uplink_key: keys.join("uplink.key"),
             finding_key: keys.join("agentd-finding.key"),
@@ -153,7 +167,8 @@ impl Unit {
             "format": "robodr-fleet-config/v1",
             "state_dir": self.cfg.state_dir,
             "agentd_config": self.cfg.agentd_config,
-            "soc": {"url": soc_url, "ca_bundle": self.cfg.ca_bundle, "keys": self.cfg.soc_keys},
+            "soc": {"url": soc_url, "ca_bundle": self.cfg.ca_bundle, "keys": self.cfg.soc_keys,
+                    "approval_keys": self.cfg.approval_keys},
             "workspace": self.cfg.workspace,
             "keys": {"uplink": self.cfg.uplink_key, "finding": self.cfg.finding_key,
                      "blackbox": self.cfg.blackbox_key},
@@ -164,7 +179,7 @@ impl Unit {
 }
 
 pub fn new_soc() -> RefCell<soc::Soc> {
-    RefCell::new(soc::Soc::new(soc_key(), WORKSPACE, T0))
+    RefCell::new(soc::Soc::new(soc_key(), approval_key(), WORKSPACE, T0))
 }
 
 /// A locked profile of `version` for `PLATFORM`, signed by the profile key:

@@ -95,12 +95,18 @@ fn replaying_the_committed_requests_gives_the_committed_responses() {
     assert_eq!(soc_secret.public_key(), soc_pub.public_key().unwrap());
     let base = m["base_path"].as_str().unwrap();
     let cases = m["cases"].as_array().unwrap();
-    assert!(cases.len() >= 14);
+    assert!(cases.len() >= 17);
     let mut statuses = std::collections::BTreeSet::new();
     for c in cases {
         let seed = soc_secret.to_seed();
         let key = robodr_blackbox::Ed25519SigningKey::from_seed_with_derived_id(&seed);
-        let mut soc = soc::Soc::new(key, m["workspace"].as_str().unwrap(), 0);
+        let approval = robodr_blackbox::KeyFile::from_json(
+            &fs::read_to_string(root.join("keys/soc-approval.key")).unwrap(),
+        )
+        .unwrap()
+        .ed25519_signing_key()
+        .unwrap();
+        let mut soc = soc::Soc::new(key, approval, m["workspace"].as_str().unwrap(), 0);
         let setup = &c["setup"];
         for t in setup["tokens"].as_array().unwrap() {
             soc.register_token(&fs::read_to_string(root.join(t.as_str().unwrap())).unwrap());
