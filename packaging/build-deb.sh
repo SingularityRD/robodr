@@ -132,6 +132,13 @@ if install_bin robodr-agentd usr/sbin 0; then
     install -D -m 0644 "$here/systemd/robodr-agentd.service" "$pkg/$units/robodr-agentd.service"
     install -D -m 0644 "$here/systemd/robodr-agentd.service.d/20-finding-key.conf.example" \
         "$pkg/usr/share/doc/robodr/examples/robodr-agentd.service.d/20-finding-key.conf.example"
+    # Passive sensor box (tap / port mirror; docs/UNITREE.md): agentd drop-in,
+    # capture-NIC networkd file and host firewall. Examples, never active.
+    install -D -m 0644 "$here/systemd/robodr-agentd.service.d/40-sensor-box.conf.example" \
+        "$pkg/usr/share/doc/robodr/examples/robodr-agentd.service.d/40-sensor-box.conf.example"
+    for f in 10-robodr-capture.network.example nftables.conf.example; do
+        install -D -m 0644 "$here/sensor-box/$f" "$pkg/usr/share/doc/robodr/examples/sensor-box/$f"
+    done
 fi
 # Base-station side of the remote head anchor (not enabled by the package).
 if install_bin robodr-anchor-receiver usr/bin 0; then
@@ -156,7 +163,7 @@ done
 
 doc="$pkg/usr/share/doc/robodr"
 install -d "$doc/examples"
-for f in docs/OPERATIONS.md SECURITY.md CHANGELOG.md README.md packaging/README.md; do
+for f in docs/OPERATIONS.md docs/UNITREE.md SECURITY.md CHANGELOG.md README.md packaging/README.md; do
     [[ -f "$root/$f" ]] || continue
     case "$f" in
     packaging/README.md) install -m 0644 "$root/$f" "$doc/PACKAGING.md" ;;

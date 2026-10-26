@@ -1,0 +1,52 @@
+#!/usr/sbin/nft -f
+# EXAMPLE host firewall for a RoboDR sensor box (docs/UNITREE.md, "Sensor
+# box"). Not active as shipped. To use: copy to /etc/nftables.conf, set the
+# TUNE values, check with 'nft -c -f /etc/nftables.conf', then
+# 'systemctl enable --now nftables'.
+#
+# Policy: drop by default in every direction.
+#   * Capture NIC: nothing in, nothing out, ever. This does not affect
+#     capture: AF_PACKET taps see frames before netfilter.
+#   * Uplink NIC: out only to the SOC collector (findings export) and NTP;
+#     in only SSH from the admin network. No forwarding: the box is not a
+#     router between the robot network and the uplink.
+# All addresses below are documentation placeholders (RFC 5737) and must be
+# replaced. Use addresses, not host names: the box resolves no DNS.
+# If the uplink uses DHCP or IPv6, add the DHCP (udp 67/68) and ICMPv6
+# neighbour discovery rules it needs; nothing here permits them.
+
+flush ruleset
+
+# TUNE
+define CAPTURE_IF = "enp2s0"
+define UPLINK_IF = "enp1s0"
+define SOC_COLLECTOR = 192.0.2.10
+define SOC_PORT = 9093
+define NTP_SERVER = 192.0.2.123
+define ADMIN_NET = 192.0.2.64/28
+
+table inet robodr_sensor_box {
+    chain input {
+        type filter hook input priority filter; policy drop;
+        iif "lo" accept
+        iifname $CAPTURE_IF drop
+        ct state invalid drop
+        ct state established,related accept
+        iifname $UPLINK_IF ip saddr $ADMIN_NET tcp dport 22 ct state new accept
+        iifname $UPLINK_IF icmp type { echo-request, destination-unreachable, time-exceeded } accept
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority filter; policy drop;
+        oif "lo" accept
+        oifname $CAPTURE_IF drop
+        ct state invalid drop
+        ct state established,related accept
+        oifname $UPLINK_IF ip daddr $SOC_COLLECTOR tcp dport $SOC_PORT ct state new accept
+        oifname $UPLINK_IF ip daddr $NTP_SERVER udp dport 123 ct state new accept
+    }
+}

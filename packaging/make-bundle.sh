@@ -9,7 +9,7 @@
 #     robodr_<debver>_<arch>.deb
 #     install-bundle.sh            (verify + install + rollback, POSIX sh)
 #     sbom/*.cdx.json              (CycloneDX, when --sbom-dir is given)
-#     doc/OPERATIONS.md SECURITY.md CHANGELOG.md
+#     doc/OPERATIONS.md UNITREE.md SECURITY.md CHANGELOG.md
 #     SHA256SUMS                   (every file above, relative paths)
 # The release workflow signs the tarball and SHA256SUMS separately
 # (minisign); the bundle never carries the public key it is verified with:
@@ -52,7 +52,7 @@ mkdir -p "$b/doc"
 
 install -m 0644 "$deb" "$b/"
 install -m 0755 "$here/install-bundle.sh" "$b/install-bundle.sh"
-for f in docs/OPERATIONS.md SECURITY.md CHANGELOG.md; do
+for f in docs/OPERATIONS.md docs/UNITREE.md SECURITY.md CHANGELOG.md; do
     [[ -f "$root/$f" ]] && install -m 0644 "$root/$f" "$b/doc/"
 done
 if [[ -n "$sbom_dir" ]]; then

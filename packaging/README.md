@@ -9,6 +9,9 @@ operator installs on a robot. The procedures that use it are in
 | `systemd/robodr-pulsard.service` | `/usr/lib/systemd/system/` | eBPF + ROS 2 sensor daemon |
 | `systemd/robodr-agentd.service` | `/usr/lib/systemd/system/` | decision chain, black box, OCSF spool (only if the binary is built) |
 | `systemd/robodr-agentd.service.d/20-finding-key.conf.example` | `/usr/share/doc/robodr/examples/` | optional drop-in: `LoadCredential=` for the per-finding signing key (OPERATIONS 6.4) |
+| `systemd/robodr-agentd.service.d/40-sensor-box.conf.example` | `/usr/share/doc/robodr/examples/` | **sensor box only**: passive tap / port-mirror mode of `robodr-agentd` (`CAP_NET_RAW` only, all IP denied, waits for the writable data mount; [`docs/UNITREE.md`](../docs/UNITREE.md)) |
+| `sensor-box/10-robodr-capture.network.example` | `/usr/share/doc/robodr/examples/sensor-box/` | **sensor box only**: systemd-networkd file for the capture NIC (no address, no ARP, no IPv6 link-local, promiscuous) |
+| `sensor-box/nftables.conf.example` | `/usr/share/doc/robodr/examples/sensor-box/` | **sensor box only**: host firewall (capture NIC silent, uplink to the SOC collector, NTP and admin SSH only, no forwarding) |
 | `systemd/robodr-anchor-receiver.service` | `/usr/lib/systemd/system/` | **base station only**: remote head-anchor receiver (only if the binary is built; OPERATIONS 6.4, "Remote anchor"). Not yet checked with `systemd-analyze` |
 | `systemd/robodr-pulsard.service.d/10-cap-sys-admin.conf.example` | `/usr/share/doc/robodr/examples/` | opt-in for kernels < 5.8 |
 | `systemd/robodr-pulsard.service.d/30-host-threats.conf.example` | `/usr/share/doc/robodr/examples/` | optional drop-in: `SupplementaryGroups=robodr` so `robodr-threat-forward` can reach agentd's `0660` host-threat socket (OPERATIONS 6.4) |

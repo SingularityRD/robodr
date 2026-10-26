@@ -203,6 +203,14 @@ example
 the unit exposes it at
 .IR /run/credentials/robodr\-agentd.service/finding.key .
 .TP
+.I /usr/share/doc/robodr/examples/robodr\-agentd.service.d/40\-sensor\-box.conf.example
+Drop\-in example for a passive sensor box on a tap or port mirror
+(CAP_NET_RAW only, all IP denied, waits for the
+.I /var/lib/robodr
+mount); install it only on a sensor box, never on a robot.
+See the Unitree guide
+.RI ( UNITREE.md ).
+.TP
 .I /etc/robodr/trust\-roots.json\fR, \fI/etc/robodr/profile\-revocations.json
 Trust roots and the signed revocation list (public; 0644 root:root).
 .TP

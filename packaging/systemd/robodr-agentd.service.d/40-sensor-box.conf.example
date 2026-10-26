@@ -1,0 +1,71 @@
+# EXAMPLE drop-in, not active as shipped. Sensor-box mode of robodr-agentd:
+# a separate, passive box on a tap or port mirror of the robot network (for
+# Unitree: the 192.168.123.0/24 robot LAN; docs/UNITREE.md). To use it:
+#   install -D -m 0644 40-sensor-box.conf.example \
+#       /etc/systemd/system/robodr-agentd.service.d/40-sensor-box.conf
+#   systemctl daemon-reload && systemctl restart robodr-agentd
+#
+# Install it ONLY on a dedicated sensor box, never on a robot: it removes no
+# privilege the base unit grants, but it assumes the box's layout (capture
+# NIC without an IP address, separate uplink, writable data mount).
+#
+# What it relies on, set up outside this unit (docs/UNITREE.md "Sensor box
+# hardening checklist"):
+#   * The capture NIC has no IP address, no ARP and no IPv6 link-local
+#     address, and is in promiscuous mode, set by systemd-networkd from
+#     /usr/share/doc/robodr/examples/sensor-box/10-robodr-capture.network.example.
+#     agentd's AF_PACKET socket never enables promiscuous mode itself
+#     (crates/robodr-capture), and this unit gives it no CAP_NET_ADMIN.
+#   * /etc/robodr/agentd.json is the sensor-box configuration
+#     (config/agentd.unitree-sensor-box.example.json): capture on the
+#     capture NIC only, no control_plane, no event_inputs from a local
+#     Pulsar (there is no robot host here). Its key path stays
+#     /run/credentials/robodr-agentd.service/blackbox.key: this is a drop-in,
+#     so the unit name and the credential path do not change.
+#   * Findings leave the box over the uplink NIC through the export path
+#     (robodr-spool-export / robodr-kafka-publish, OPERATIONS.md), never from
+#     agentd itself. The host firewall
+#     (/usr/share/doc/robodr/examples/sensor-box/nftables.conf.example) allows
+#     the uplink only to the SOC collector, NTP and the admin network.
+#
+# Verify after installing: systemd-analyze verify robodr-agentd.service
+#                          systemd-analyze security robodr-agentd.service
+
+[Unit]
+Description=RoboDR agent, passive sensor box (tap / port mirror, no control plane)
+# Read-only root file system: the black box, the spool and the profile state
+# live on the writable, encrypted data mount. Order agentd after it and stop
+# it if the mount goes away, so evidence is never written to the root fs.
+RequiresMountsFor=/var/lib/robodr
+# TUNE: tie agentd to the capture NIC (here enp2s0), so it starts only once
+# the interface exists and stops if it disappears (systemd-escape the name
+# if it contains '-'):
+#BindsTo=sys-subsystem-net-devices-enp2s0.device
+#After=sys-subsystem-net-devices-enp2s0.device
+
+[Service]
+# --- Privilege: unchanged floor, stated again ---------------------------------
+# CAP_NET_RAW (AF_PACKET capture) is the only capability; repeated here so
+# the box's intent is readable in one place. Bounding and ambient sets merge
+# by OR across drop-ins, so restating cannot widen them.
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+NoNewPrivileges=yes
+
+# --- No IP traffic at all from agentd ----------------------------------------
+# The box is passive: agentd needs no IP socket to send anything. The empty
+# assignment RESETS any IPAddressAllow= an earlier drop-in added (e.g.
+# 'localhost' for a control_plane.listen_tcp), so no control-plane listener
+# can be reached over IP. AF_PACKET capture is not affected by
+# IPAddressDeny= (the cgroup BPF filter applies to IP sockets only).
+# The uplink is used by the exporter, a separate process: restrict that one
+# with IPAddressAllow=<SOC collector> on its own unit or timer.
+IPAddressAllow=
+IPAddressDeny=any
+
+# --- Read-only root file system ------------------------------------------------
+# ProtectSystem=strict and the ReadWritePaths= of the base unit already
+# make every path read-only except the three /var/lib/robodr directories.
+# With a read-only root, /tmp and /var/tmp must still be writable (tmpfs):
+# PrivateTmp=yes in the base unit creates this unit's private copies there.
+ProtectSystem=strict
