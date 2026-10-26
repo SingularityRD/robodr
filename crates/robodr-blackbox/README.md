@@ -667,11 +667,12 @@ tamper finding.
 - **Wall-clock truth.** Timestamps are evidence, not authenticators. The
   time-source tag says how far to trust them. The verifier only warns about
   monotonic regressions within one run.
-- **Side channels and memory disclosure.** SHA-256/HMAC come from `sha2` /
-  `hmac`, the tag compare from `subtle`, key wiping from `zeroize` (the
-  hasher state is wiped on drop). Wiping is best effort: temporaries inside
-  those crates, register / stack copies and swapped-out pages are not
-  covered.
+- **Side channels and memory disclosure.** SHA-256 comes from `sha2`;
+  HMAC-SHA256 is RFC 2104 written over a `sha2` wrapper that wipes its state
+  on drop (the `hmac` crate left keyed temporaries unwiped); the tag compare
+  from `subtle`, key wiping from `zeroize`. Wiping is best effort:
+  temporaries inside `sha2`, register / stack copies and swapped-out pages
+  are not covered.
 - **Concurrent writers that ignore the lock.** `flock` is advisory: it stops
   a second `Recorder`, not a process that writes the files directly.
 

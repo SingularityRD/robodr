@@ -27,7 +27,7 @@
 | SM | Roadmap with acceptance criteria per sprint; ADRs; written agent rules; dependency policy; pinned C toolchain for ring | No written security management plan, role list or training records; release-key custody not set up |
 | SR | Per-component threat models and "what is claimed" sections (now also the executor's trust boundary and the gateway's safety argument); contract-level security requirements (SR-TAINT) | No single product security context and requirements document |
 | SD | Defence-in-depth invariants in code (decided twice before the executor acts); design docs; ADRs | Threat models not reviewed per release |
-| SI | Lints as errors; `forbid(unsafe_code)` where possible and `deny` + SAFETY comments elsewhere; panic-family calls denied in daemon code; audited `sha2` / `hmac`; `cargo deny` | Hand-written HTTP server and Kafka client remain (fuzzed); no written coding standard |
+| SI | Lints as errors; `forbid(unsafe_code)` where possible and `deny` + SAFETY comments elsewhere; panic-family calls denied in daemon code; audited `sha2` (HMAC as RFC 2104 over it); `cargo deny` | Hand-written HTTP server and Kafka client remain (fuzzed); no written coding standard |
 | SVV | Unit, integration and network-namespace tests; 23 fuzz targets (10 run under libFuzzer for 630 s); review regression suites from 9 independent review rounds; contract vectors shared with the SOC | **CI has never run on GitHub**; no pentest; no red team; reviews were by AI agents, not independent humans; no review of control plane v2 recorded |
 | DM | `SECURITY.md` intake and timelines | No tracker records, advisory process or CVE assignment path exercised |
 | SUM | Signed offline bundle installed from a verified private extraction; downgrade refusal, security floor, format gate (tested with the real `dpkg`); SBOM generator | **No release has ever been cut or signed**; support period not CRA-ready |
@@ -93,7 +93,7 @@ per trust boundary exists only in prose
 | `cargo clippy -D warnings`, `cargo fmt --check` in CI (pure and Pulsar jobs) | [`docs/BUILD.md`](../BUILD.md) "CI jobs" |
 | `#![forbid(unsafe_code)]` on 9 library crates and every binary root; `deny(unsafe_code)` + `unsafe_op_in_unsafe_fn` + a SAFETY comment on every remaining FFI block elsewhere; executor forbids it; gateway and fleet deny it with local allows | `c2800c8`, `2b8ab65`, `a4e0b4b`, `1de502d` |
 | Panic-family calls (`unwrap`, `expect`, `panic!`, `unreachable!`, `todo!`, `unimplemented!`) denied by clippy in non-test code of the daemon crates, executor, gateway and fleet | `7637f9d`, `2b8ab65`, `a4e0b4b`, `1de502d` |
-| Audited crypto: `ed25519-dalek` (strict), rustls + ring, `sha2` / `hmac` with `subtle` and `zeroize`, proven byte-identical to the replaced code by differential tests | [ADR-0007](../adr/0007-audited-libraries.md); `86e70e7`; `crates/robodr-blackbox/tests/crypto_differential.rs` |
+| Audited crypto: `ed25519-dalek` (strict), rustls + ring, `sha2` (HMAC as RFC 2104 over it) with `subtle` and `zeroize`, proven byte-identical to the replaced code by differential tests | [ADR-0007](../adr/0007-audited-libraries.md); `86e70e7`; `crates/robodr-blackbox/tests/crypto_differential.rs` |
 | In-crate Reed-Solomon kept (its parity is part of the signed wire format) and pinned to an independent oracle | `aba80a5`; `crates/robodr-diode/tests/fec_oracle.rs` |
 | Memory and resource bounds stated per parser and queue | crate READMEs |
 

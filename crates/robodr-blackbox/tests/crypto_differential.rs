@@ -1,5 +1,7 @@
 //! S10 (R8): `robodr_blackbox::crypto` moved from a hand-rolled SHA-256 /
-//! HMAC-SHA256 to RustCrypto `sha2` / `hmac`. This proves the new code is the
+//! HMAC-SHA256 to RustCrypto `sha2` (HMAC is RFC 2104 over a wiping `sha2`
+//! wrapper, after a first version on the `hmac` crate). This proves the new
+//! code is the
 //! old code, byte for byte, so every record hash, chain head, checkpoint and
 //! legacy HMAC tag already on disk still verifies:
 //!

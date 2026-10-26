@@ -4,10 +4,11 @@
 //! copied VERBATIM except that the secret wipes are plain stores here (they
 //! never affected the output) and the module docs. It is kept only so
 //! `tests/crypto_differential.rs` can prove that the RustCrypto-backed
-//! implementation (`sha2` / `hmac`) is byte-for-byte the old one, i.e. every
-//! tag and digest already on disk still verifies. Never use it in library
-//! code. robodr-ocsf's test suite includes this file too (its own copy of
-//! the same algorithm was replaced at the same time).
+//! implementation is byte-for-byte the old one, i.e. every tag and digest
+//! already on disk still verifies. Never use it in library code.
+//! robodr-ocsf keeps its own, separate oracle
+//! (`crates/robodr-ocsf/tests/support/legacy_sha256.rs`, a verbatim copy of
+//! its pre-S10 `src/hash.rs`); this file is used by robodr-blackbox only.
 #![allow(dead_code)]
 
 fn wipe(buf: &mut [u8]) {

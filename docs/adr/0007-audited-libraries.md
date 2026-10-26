@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Proposed (partly implemented): SHA-256 / HMAC from `sha2` / `hmac` (`86e70e7`); Reed-Solomon kept in-crate, pinned to an independent oracle (`aba80a5`); the HTTP server (fuzzed) and the Kafka client remain hand-written |
+| Status | Proposed (partly implemented): SHA-256 from `sha2` (`86e70e7`), HMAC as a wiping RFC 2104 wrapper over it (the `hmac` crate left keyed temporaries unwiped); Reed-Solomon kept in-crate, pinned to an independent oracle (`aba80a5`); the HTTP server (fuzzed) and the Kafka client remain hand-written |
 | Proposed | 2026-10-25, GA-ROADMAP §2.1 D7 (commit `a5c5afd`); the main work is in Sprints 5 and 10 |
 | Implemented in part | Ed25519 through `ed25519-dalek` (before the GA plan). TLS for `robodr-uplink` through rustls + ring (`fa3f3dc`, 2026-10-26). |
 | Related | [ADR-0004](0004-control-plane-v2.md), [ADR-0001](0001-findings-transport-native-ingest.md) |

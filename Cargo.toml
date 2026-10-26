@@ -102,9 +102,6 @@ ed25519-dalek = { version = "2.1", default-features = false, features = ["fast",
 # internally). Replaces the earlier in-crate SHA-256 of robodr-blackbox and
 # robodr-ocsf (S10, R8).
 sha2 = "0.10"
-# HMAC-SHA256 for the legacy symmetric black-box keys (RustCrypto, same digest
-# 0.10 traits as sha2; replaces the earlier in-crate HMAC).
-hmac = "0.12"
 # Volatile wipe of secrets and of the hasher state above (already in the graph
 # through ed25519-dalek's `zeroize` feature).
 zeroize = "1"

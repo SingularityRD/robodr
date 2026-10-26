@@ -140,7 +140,7 @@ development VM, never a robot.
 |---|---|---|---|---|
 | 4.1 | Information confidentiality | In transit: TLS on `robodr-uplink` and `robodr-enroll`; mutual TLS on the control plane off loopback (plain HTTP only on loopback and the unix socket). Kafka and the anchor receiver are plaintext. At rest: key files root-only; evidence, spool, journals and exports are not encrypted. | 🟡 | TLS for Kafka and the anchor (GAP-03). Evidence at rest relies on host full-disk encryption (document it, GAP-01). |
 | 4.2 | Information persistence | Decommissioning procedure (OPERATIONS 9); package purge removes the executor journal. | 🟡 | Cryptographic erase is design only (SECURE-DELIVERY §7.6). |
-| 4.3 | Use of cryptography | `ed25519-dalek`; `sha2` / `hmac` with `subtle` and `zeroize`, byte-identical to the former code by differential tests (`86e70e7`); rustls + ring; minisign for releases. Reed-Solomon (not cryptography) stays in-crate, pinned to an independent oracle (`aba80a5`). | ✅ | The hand-written HTTP/1.1 server and Kafka client remain (not cryptography; fuzzed) ([ADR-0007](../adr/0007-audited-libraries.md)). |
+| 4.3 | Use of cryptography | `ed25519-dalek`; `sha2` (HMAC as an RFC 2104 wrapper over it, every keyed buffer wiped) with `subtle` and `zeroize`, byte-identical to the former code by differential tests (`86e70e7`); rustls + ring; minisign for releases. Reed-Solomon (not cryptography) stays in-crate, pinned to an independent oracle (`aba80a5`). | ✅ | The hand-written HTTP/1.1 server and Kafka client remain (not cryptography; fuzzed) ([ADR-0007](../adr/0007-audited-libraries.md)). |
 
 ### FR5: Restricted data flow
 
@@ -190,7 +190,7 @@ commit; it still needs field validation where the row says so.
 | GAP-03 | Kafka export: TLS + SASL, or `rdkafka`; TLS for the anchor receiver | Open | S10 (carry-over from S5) | ADR-0007 |
 | GAP-04 | Hardware-protected keys (TPM) where available; SOC-driven rotation | Partial: SOC-driven uplink / finding rotation on the robot side (`1de502d`, `3083030`); no TPM sealing | S9 (SOC side), S10 (TPM) | — |
 | GAP-05 | Certificate revocation: uplink server certificates (confirm and document), control-plane SOC client certificates (optional CRL file since the CP v2 review; no OCSP; restart to rotate) | Open | S10 | contract §13 |
-| GAP-06 | HMAC evidence keys off by default in GA builds | Open (the HMAC itself now comes from `hmac`, `86e70e7`) | S10 | — |
+| GAP-06 | HMAC evidence keys off by default in GA builds | Open (the HMAC itself is now RFC 2104 over `sha2`) | S10 | — |
 | GAP-07 | Per-key action scopes; decide whether the robot verifies two-person approvals | Partial: SOC-side sign-off and two-person rule in AutoSecOps (`bee7e167`, `6ae14d0e`); nothing on the robot | S10 / S11 | ADR-0006 |
 | GAP-08 | Black-box capacity alerting | Open | S12 | — |
 | GAP-09 | Time-source integrity guidance; skew findings | Open | S10 / S13 | — |
@@ -203,7 +203,7 @@ commit; it still needs field validation where the row says so.
 | GAP-16 | TPM anchor on hardware; remote anchor across a real network, with TLS | Open | S10, S11 | — |
 | GAP-17 | Update and rollback rehearsed on target hardware; staged rollout | Partial: dpkg-tested gates and floor (`3d36c65`, `ace7fba`); not on a target; rings are information only | S11 (target), post-GA (staged rollout) | SECURE-DELIVERY |
 | GAP-18 | Enrollment: bind unit keys to the SOC registry | Partial: robot side done (`1de502d`, `3083030`; contract [`robodr.fleet-api`](../contracts/robodr.fleet-api.md) draft v1); AutoSecOps side in progress, uncommitted | S9 (SOC side) | — |
-| GAP-19 | Replace the in-house SHA-256 and HMAC with `sha2`/`hmac` | **Closed in code** (`86e70e7`) | S10 | ADR-0007 |
+| GAP-19 | Replace the in-house SHA-256 and HMAC with `sha2`/`hmac` | **Closed in code** (`86e70e7`; HMAC later moved off `hmac` onto a wiping RFC 2104 wrapper over `sha2`) | S10 | ADR-0007 |
 | GAP-20 | 72 h soak, FP rate, CPU and memory budget on target hardware | Open | S11 | — |
 | GAP-21 | Backup and restore procedure for `/etc/robodr` and the persistent state directories | Open | S12 | — |
 | GAP-22 | Secure configuration baseline document | Open | S13 | — |

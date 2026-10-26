@@ -1,11 +1,14 @@
-//! SHA-256 and HMAC-SHA256 (RustCrypto `sha2` / `hmac`), tag comparison
+//! SHA-256 (RustCrypto `sha2`) and HMAC-SHA256 on top of it, tag comparison
 //! (`subtle`), secret wiping (`zeroize`), the kernel CSPRNG and hex helpers.
 //!
 //! Until S10 the two hash primitives were implemented in this file (crates.io
-//! was unreachable where the black box was first written). They now come
-//! from the audited RustCrypto crates (`sha2` is the same implementation
-//! `ed25519-dalek` already used for SHA-512); this module only keeps the
-//! small API the rest of the workspace calls. The output is byte-for-byte
+//! was unreachable where the black box was first written). SHA-256 now comes
+//! from the audited RustCrypto `sha2` (the same implementation
+//! `ed25519-dalek` already used for SHA-512), behind a wrapper that wipes its
+//! state on drop. HMAC-SHA256 is the RFC 2104 construction written here on
+//! top of that wrapper (a dozen lines), not the `hmac` crate: `hmac` 0.12
+//! leaves the padded key block, the long-key digest and the keyed state that
+//! `finalize` consumes unwiped. The output is byte-for-byte
 //! the old one, so every HMAC tag, record hash and checkpoint already on disk
 //! still verifies: `tests/crypto_differential.rs` checks it against the old
 //! code (kept as a test-only oracle in `tests/support/legacy_sha256.rs`) over
@@ -20,13 +23,13 @@
 //!   the *length* is public).
 //! - [`wipe`] is `zeroize` (volatile writes and a compiler fence). The
 //!   [`Sha256`] wrapper wipes the whole hasher state (chaining value and
-//!   buffered input) when dropped, and [`hmac_sha256`] wipes its MAC state,
-//!   so an HMAC key does not linger in a dropped hasher (Ed25519 and its
-//!   SHA-512 come from `ed25519-dalek` / `sha2`). This is still best effort:
-//!   temporaries inside `sha2` / `hmac` (e.g. the padded key block while the
-//!   MAC is keyed, the moved state while it is finalised), copies the
-//!   compiler makes in registers or spilled stack slots, and pages swapped
-//!   out before the wipe, are not covered.
+//!   buffered input) when dropped; [`sha256`] and [`hmac_sha256`] use only
+//!   that wrapper, and HMAC wipes its padded key block, `K0` and the inner
+//!   digest, so an HMAC key does not linger in a dropped hasher (Ed25519 and
+//!   its SHA-512 come from `ed25519-dalek` / `sha2`). This is still best
+//!   effort: temporaries inside `sha2` (the block it pads while finalising),
+//!   copies the compiler makes in registers or spilled stack slots, and
+//!   pages swapped out before the wipe, are not covered.
 //! - [`fill_random`] reads the kernel CSPRNG with `getrandom(2)` (blocking
 //!   until the pool is initialised), falling back to `/dev/urandom` only
 //!   where the syscall does not exist, and fails rather than return
@@ -40,7 +43,6 @@
 
 use std::mem::ManuallyDrop;
 
-use hmac::Mac as _;
 use sha2::Digest as _;
 use subtle::ConstantTimeEq as _;
 use zeroize::Zeroize as _;
@@ -50,15 +52,12 @@ pub const BLOCK_LEN: usize = 64;
 /// SHA-256 digest size in bytes.
 pub const DIGEST_LEN: usize = 32;
 
-type HmacSha256 = hmac::Hmac<sha2::Sha256>;
-
-// The states wiped below with `zeroize_flat_type` must be plain data: no
+// The state wiped below with `zeroize_flat_type` must be plain data: no
 // drop glue that the `ManuallyDrop` would skip (nothing to leak), no pointers
-// or heap buffers. Both are fixed-size arrays of integers plus a position
-// byte in sha2 0.10 / hmac 0.12; a dependency bump that adds drop glue fails
-// the build here instead of silently leaking.
+// or heap buffers. It is fixed-size arrays of integers plus a position byte
+// in sha2 0.10; a dependency bump that adds drop glue fails the build here
+// instead of silently leaking.
 const _: () = assert!(!std::mem::needs_drop::<sha2::Sha256>());
-const _: () = assert!(!std::mem::needs_drop::<HmacSha256>());
 
 /// Overwrite every byte of a plain-data RustCrypto state with zeros.
 ///
@@ -68,8 +67,8 @@ const _: () = assert!(!std::mem::needs_drop::<HmacSha256>());
 fn wipe_state<T>(state: &mut ManuallyDrop<T>) {
     let p: *mut T = &mut **state;
     // SAFETY: `p` points to a live, exclusively borrowed `T` of
-    // `size_of::<T>()` bytes. `T` is one of the two hasher states asserted
-    // above to have no drop glue, and they hold only integers and byte
+    // `size_of::<T>()` bytes. `T` is the hasher state asserted above to
+    // have no drop glue, and it holds only integers and byte
     // arrays (no pointers, references or niches), for which all-zero is a
     // valid bit pattern; in any case the value is never read again (it is in
     // a `ManuallyDrop` that is being dropped or discarded).
@@ -85,6 +84,8 @@ pub struct Sha256 {
 impl Drop for Sha256 {
     fn drop(&mut self) {
         wipe_state(&mut self.inner);
+        #[cfg(test)]
+        tests::WIPED_HASHERS.with(|n| n.set(n.get() + 1));
     }
 }
 
@@ -114,29 +115,52 @@ impl Sha256 {
     }
 }
 
-/// One-shot SHA-256.
+/// One-shot SHA-256, through the wiping [`Sha256`] wrapper (the input may
+/// be secret, e.g. a key whose id is derived from its digest).
 pub fn sha256(data: &[u8]) -> [u8; DIGEST_LEN] {
-    sha2::Sha256::digest(data).into()
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize()
 }
 
-/// HMAC-SHA256 (RFC 2104 with H = SHA-256, B = 64, L = 32), `hmac::Hmac`.
+/// HMAC-SHA256 (RFC 2104 with H = SHA-256, B = 64, L = 32), built on the
+/// wiping [`Sha256`] wrapper:
+/// `H((K0 ^ opad) || H((K0 ^ ipad) || message))`, where `K0` is the key
+/// zero-padded to B bytes, or `H(key)` zero-padded if the key is longer than
+/// B (as the RFC requires).
 ///
-/// Keys longer than the block size are hashed first, as the RFC requires.
+/// Every keyed state (the key hash, the inner and the outer hash) lives in a
+/// wrapper that is wiped when dropped, and `K0`, the padded key block and the
+/// inner digest are wiped before returning. Nothing keyed is cloned.
 pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; DIGEST_LEN] {
-    // `Hmac<D>` accepts keys of every length (RFC 2104): its
-    // `new_from_slice` hashes a long key and zero-pads a short one, and is
-    // documented never to return `InvalidLength`. The `expect` is therefore
-    // unreachable; the differential test covers key lengths 0..=200.
-    #[allow(clippy::expect_used)]
-    let mac = <HmacSha256 as hmac::Mac>::new_from_slice(key)
-        .expect("HMAC-SHA256 accepts keys of any length");
-    let mut mac = ManuallyDrop::new(mac);
-    mac.update(message);
-    // `finalize` consumes its state, so it gets a copy (inside `hmac`, not
-    // wiped; see the module docs) and the original is wiped here.
-    let tag: [u8; DIGEST_LEN] = (*mac).clone().finalize().into_bytes().into();
-    wipe_state(&mut mac);
-    tag
+    let mut k0 = [0u8; BLOCK_LEN];
+    if key.len() > BLOCK_LEN {
+        let mut kh = Sha256::new();
+        kh.update(key);
+        let mut d = kh.finalize();
+        k0[..DIGEST_LEN].copy_from_slice(&d);
+        wipe(&mut d);
+    } else {
+        k0[..key.len()].copy_from_slice(key);
+    }
+    let mut pad = [0u8; BLOCK_LEN];
+    for (p, k) in pad.iter_mut().zip(&k0) {
+        *p = k ^ 0x36;
+    }
+    let mut inner = Sha256::new();
+    inner.update(&pad);
+    inner.update(message);
+    let mut inner_digest = inner.finalize();
+    for (p, k) in pad.iter_mut().zip(&k0) {
+        *p = k ^ 0x5c;
+    }
+    wipe(&mut k0);
+    let mut outer = Sha256::new();
+    outer.update(&pad);
+    wipe(&mut pad);
+    outer.update(&inner_digest);
+    wipe(&mut inner_digest);
+    outer.finalize()
 }
 
 /// Compare two byte strings without an early exit on the first difference
@@ -269,6 +293,42 @@ pub fn hash_from_hex(s: &str) -> Option<[u8; DIGEST_LEN]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Number of wiping [`Sha256`] wrappers dropped on this thread.
+        pub(super) static WIPED_HASHERS: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+    }
+
+    fn wiped_hashers_during(f: impl FnOnce() -> [u8; DIGEST_LEN]) -> usize {
+        let before = WIPED_HASHERS.with(|n| n.get());
+        std::hint::black_box(f());
+        WIPED_HASHERS.with(|n| n.get()) - before
+    }
+
+    // Review L2: the one-shot hash is used on secret input
+    // (`HmacSha256Key::with_derived_id`), so it must go through the wiping
+    // wrapper rather than a bare `sha2::Sha256` that is dropped unwiped.
+    #[test]
+    fn one_shot_sha256_goes_through_the_wiping_wrapper() {
+        assert_eq!(wiped_hashers_during(|| sha256(b"secret")), 1);
+    }
+
+    // Review L1: HMAC is built on the wiping wrapper (inner and outer hash,
+    // plus the key hash for a key longer than the block), so no keyed hash
+    // state is left unwiped.
+    #[test]
+    fn hmac_keyed_state_lives_only_in_wiping_wrappers() {
+        assert_eq!(wiped_hashers_during(|| hmac_sha256(&[7; 32], b"m")), 2);
+        assert_eq!(
+            wiped_hashers_during(|| hmac_sha256(&[7; BLOCK_LEN], b"m")),
+            2
+        );
+        assert_eq!(
+            wiped_hashers_during(|| hmac_sha256(&[7; BLOCK_LEN + 1], b"m")),
+            3
+        );
+    }
 
     fn h(s: &str) -> Vec<u8> {
         from_hex(s).unwrap()

@@ -208,7 +208,8 @@ qemu. No release has been cut or signed, and GitHub CI has never run
   single-use SOC token, uplink / finding key rotation, revocation lists,
   staged SOC profiles, ring information
   ([contract](docs/contracts/robodr.fleet-api.md), draft v1).
-- **Hardening (S10)**: `sha2` / `hmac` instead of hand-written crypto,
+- **Hardening (S10)**: `sha2` (HMAC as a wiping RFC 2104 wrapper over it)
+  instead of hand-written crypto,
   `forbid(unsafe_code)` where possible, panic-family calls denied in daemon
   code, 23 fuzz targets (10 run under libFuzzer for 630 s each, no crash).
 

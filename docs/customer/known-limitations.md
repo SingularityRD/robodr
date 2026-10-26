@@ -149,8 +149,9 @@
   certificate only ([ADR-0006](../adr/0006-approval-never-autonomous.md)).
 - **Hand-written components remain:** the agentd HTTP server (fuzzed), the
   Kafka client, Reed-Solomon (pinned to an independent oracle)
-  ([ADR-0007](../adr/0007-audited-libraries.md)). SHA-256 and HMAC now
-  come from the audited `sha2` / `hmac` crates.
+  ([ADR-0007](../adr/0007-audited-libraries.md)). SHA-256 now comes from
+  the audited `sha2` crate; HMAC is the RFC 2104 construction over it (a
+  few lines, so every keyed buffer can be wiped).
 - **`panic = "abort"`:** a panic stops the daemon until systemd restarts
   it. Panic-family calls are denied in daemon code, but indexing can
   still panic.
