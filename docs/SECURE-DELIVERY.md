@@ -249,6 +249,16 @@ Revocation lists revoke release, depot and operator keys by public-key
 fingerprint and RPKs by digest, exactly as `robodr-profile-revocations/v2`
 does for profiles.
 
+The trust file also scopes release keys and packages to **programmes**
+(a site may take bundles from several programme offices or vendors; one
+programme's release quorum signs only its own packages and bundles),
+assigns units to the `lab` and `canary` **rings** (so the depot's ring
+label cannot choose the smaller operator quorum), and **expires** (so a
+withheld newer trust file, carrying a revocation, is detected). A
+verifying station keeps one site-wide **trust anchor**: the last trust
+file it accepted, which only moves forward by rotation. The exact rules
+are §3.5, items 19 and 21–25, and the review section after item 29.
+
 ### 3.5 Format decisions (Sprint 13a)
 
 Where §3.1–§3.4 (and §5.2 for deployments) left room, 13a took the
@@ -339,12 +349,15 @@ this is the list of decisions a reviewer should check against the design.
     chain**; the same bytes again is accepted as a no-op. With no head, a
     verifier must say so explicitly (`--genesis`: only bundle 1 is
     accepted) or name the head (`--after SEQ:HASH`); there is no default.
-    The chain state also records the version and digest of the trust file
-    the head was accepted under: the trust file crosses the gap like a
-    bundle, so an older root-signed trust file (one from before a key
-    revocation) is refused as a replay, and the same version with other
-    content as an equivocation (found in the 13a self-review). Without a
-    state (`--genesis`, `--after`) that check is the operator's.
+    The chain state also records the site and the version and digest of
+    the trust file the head was accepted under: the trust file crosses the
+    gap like a bundle, so an older root-signed trust file (one from before
+    a key revocation) is refused as a replay, the same version with other
+    content as an equivocation (found in the 13a self-review), and another
+    site's file as `wrong_scope` (13a review, finding 1). A *newer* trust
+    version is never accepted on the state's word: it must be a rotation
+    of the site's trust anchor (item 25), so `--state` needs
+    `--trust-anchor`, and a commit advances the anchor before the state.
 20. Parity (`rs-gf256-0x11d/1`, `robodr-diode`'s code and parity-length
     rule): the data files (every non-parity entry, in path order) form
     groups of `k`; each group carries `m` parity files (1–32,
@@ -354,32 +367,82 @@ this is the list of decisions a reviewer should check against the design.
 
 **Trust file (`robodr-delivery-trust/1`)**
 
-21. Members: `site`, `version`, `issued_at` (informational),
-    `programmes`, `quorum {root, release, operator_prod, operator_lab}`,
-    `roots`, `release_keys`, `depot_keys`, `operator_keys`,
-    `revoked_keys` (fingerprints), `revoked_rpks` (digests), `floors`.
+21. Members: `site`, `version`, `issued_at`, `expires_at`,
+    `programmes` (`{name, release_keys, packages}`),
+    `quorum {root, release, operator_prod, operator_lab}`, `roots`,
+    `release_keys`, `depot_keys`, `operator_keys`, `rings`
+    (`{ring, units}`), `revoked_keys` (fingerprints), `revoked_rpks`
+    (digests), `revoked_serials` (`{name, serial}`), `floors`.
+    `issued_at < expires_at <= issued_at + 366 days`; a file is refused at
+    and after `expires_at` (`expired`), judged on the verifier's clock.
 22. **Roles are disjoint**: one fingerprint and one key id appear at most
-    once in the whole file.
+    once in the whole file. Keys must be canonical, of large order and
+    **torsion-free** (`robodr-blackbox`): a mixed-order "twin" `A + T` of
+    a key `A` has another fingerprint but can be signed for with `A`'s
+    secret, so it would count as a second signer (13a review, finding 2).
 23. Quorum floors: `root >= 2`, `release >= 2`, `operator_prod >= 2`,
-    `1 <= operator_lab <= operator_prod`; root and release quorums must be
-    reachable with non-revoked keys. The depot quorum is fixed at 1.
+    `1 <= operator_lab <= operator_prod`; caps: `root` and `release` at
+    most 16 (the signature-set limit), `operator_prod` at most 15 (a
+    deployment also carries the depot's signature). The root quorum must
+    be reachable with the roots, the release quorum with the non-revoked
+    release keys **of every programme**. The depot quorum is fixed at 1.
+    A full root rotation needs the old and the new root quorum in one
+    16-entry set (shared roots count for both).
 24. A revoked key may stay listed (refusals then say `revoked_key`) but
-    never counts; a root cannot be revoked by the file it signs.
+    never counts; a root cannot be revoked by the file it signs. RPKs are
+    revoked by digest (`revoked_rpks`) or by package and serial
+    (`revoked_serials`, which also catches the same release re-signed
+    into another manifest, i.e. another digest). Floors remain the
+    control for "everything below N".
 25. Standalone acceptance: the file's roots must be **exactly** the
-    pinned root fingerprints and the root quorum must have signed.
-    Rotation (TUF-style): a higher version for the same site, signed by
-    the root quorum of the accepted file **and** of the new one;
-    revocations and floors only grow; an older version is a replay, the
-    same version with other bytes an equivocation.
+    pinned root fingerprints, its `site` must be the **pinned site**
+    (`--site`; the roots belong to the programme office and are normally
+    shared by several sites, so roots alone do not tell one site's file
+    from another's: 13a review, finding 1), the root quorum must have
+    signed, and it must not have expired. Rotation (TUF-style): a higher
+    version for the same site, signed by the root quorum of the accepted
+    file **and** of the new one; revocations (keys, RPKs, serials) and
+    floors only grow; an older version is a replay, the same version with
+    other bytes an equivocation. **Trust anchor** (13a review, finding
+    4): every verifying station keeps one site-wide anchor (the last
+    accepted trust file, for all programmes) and accepts a presented file
+    only as that anchor or a rotation of it, for every command (`verify
+    rpk|bundle|deployment|trust`, `repair`, `import`, `build bundle`,
+    `sign`). The anchor is created once (`verify trust --init-anchor`)
+    and moves forward only by an accepted rotation (`verify trust
+    --commit`, or `--commit` of a bundle accepted under the rotation).
+    Working without it needs the explicit `--no-trust-anchor`, which then
+    checks pins, site, quorum and expiry only and cannot be combined with
+    a chain state. An expired anchor can still accept its fresh successor.
+
+    *25a.* **Programmes** (13a review, finding 5): each programme names the
+    release keys that may sign for it and the packages it may deliver
+    (exact names, or a prefix ending in `*`; `*` alone is every name). A
+    package name belongs to at most one programme (overlapping patterns
+    are refused). An RPK is verified against the release quorum of the
+    programme owning its name; a bundle against its own programme's, and
+    every RPK in it must be a package of that programme. A signature by
+    a release key of another programme refuses the document
+    (`wrong_scope`), so one programme's release station can neither sign
+    another's packages nor fork or freeze another's chain.
 
 **Deployment (`robodr-deployment/1`)**
 
 26. Signed by depot and operator keys only; at least one depot
     signature. §3.4 says "1 for `lab`", §5.3 reads as if the depot alone
     may push to `lab` and `canary`: the stricter reading is taken, so
-    `lab` and `canary` need `operator_lab` (>= 1) operators and
-    `ring-<n>` (`n` in 1–99, the production rings) `operator_prod`
-    (>= 2). A compromised depot alone can push nowhere.
+    every deployment needs at least `operator_lab` (>= 1) operators and a
+    compromised depot alone can push nowhere. **The ring label is bound
+    to the targets** (13a review, finding 3): the `ring` string is the
+    depot's, so it cannot by itself select the smaller quorum. The
+    `operator_lab` quorum applies only when the ring is `lab` or
+    `canary`, the targets are **units only** (a group's membership is
+    defined on the depot, so a group is never authenticated as lab), every
+    unit is assigned to **that** ring by the root-signed trust file
+    (`rings`), and a `canary` names exactly one unit (§4.3). Anything
+    else, including every `ring-<n>` (`n` in 1–99, the production rings),
+    needs `operator_prod` (>= 2). The unit agent must also refuse a
+    deployment whose ring is not the unit's own (§10, 13b requirements).
 27. `not_before < expires_at`, at most 366 days apart; valid for
     `not_before <= now < expires_at`. Items must not be revoked or below a
     floor. `deployment_seq` must increase (replay, equivocation); a gap is
@@ -389,11 +452,61 @@ this is the list of decisions a reviewer should check against the design.
 
 **Release tool**
 
-29. `sign` checks before it signs: the document parses and, for an RPK or
-    a bundle, the files on disk are exactly what it describes (every
-    hash). `build bundle` copies the signed RPKs and verifies the
-    **copies** (release quorum, site policy, every hash) before listing
-    them. Builds are deterministic: no times or host paths in an RPK.
+29. `sign` checks before it signs: the document parses; for an RPK the
+    files on disk are exactly what it describes (every hash), the site
+    policy holds and a programme of the site delivers the package; for a
+    bundle the files are exactly the listing (every hash) and **every
+    RPK in it verifies completely** (digest, its own release quorum and
+    programme, policy, content); and every signature already in the set,
+    and the new one, is valid for the document under the site's trust
+    (a stale or foreign entry is refused, not kept). It does not check a
+    bundle's chain position (that is the verifier's state). `build
+    bundle` copies the signed RPKs and verifies the **copies** (release
+    quorum, programme, site policy, every hash) before listing them.
+    Builds are deterministic: no times or host paths in an RPK.
+30. **Verify, then use only the verified copy** (13a review, finding 6).
+    Verifying files in place on removable media proves nothing about the
+    next read: a malicious USB device can serve the verified bytes to
+    `verify` and other bytes to the `cp` or import that follows. `import
+    --from MEDIA --to DIR` is the only supported way in: it
+    authenticates `bundle.json`, requires the media tree to be exactly
+    its listing (no symlink, device, FIFO or stray file), copies each
+    listed file reading at most its listed size and hashing as it copies,
+    then verifies the **copy** completely (chain, tree, every hash, every
+    RPK) and only then renames it to `DIR`. Only `DIR` may be used
+    afterwards; the depot (14a) imports from it or from a
+    content-addressed store filled from it, never from the media.
+31. Listed files are compared by size (`fstat` of the opened file)
+    before anything is read and never read past their listed size, so a
+    sparse multi-terabyte file costs nothing (13a review, finding 7).
+32. CLI: `--help` / `-h` exits 0 only as the whole command line; next to
+    other arguments it is a usage error (a stray `-h` spliced into a
+    verify command never turns a refusal into success). A system clock
+    before 1970 is an error, never read as 0.
+
+**Review of 13a (independent adversarial review, 2026-10-26).** After
+the self-review an independent review attacked the implementation with
+working PoCs and found one high, five medium and three low issues. All
+are fixed, each with a regression test that replays the attack and
+failed before the fix (`crates/robodr-release/tests/review_13a.rs`;
+unit tests in `robodr-pkg` and `robodr-blackbox`):
+
+| # | Finding | Decision |
+|---|---|---|
+| 1 | High: another site's trust file (same roots) accepted, bypassing revocations and floors and locking the real file out | site pinned with the roots (item 25); chain state records and compares the site (item 19) |
+| 2 | Mixed-order twin keys: one secret, two signers | torsion-free keys only, in `robodr-blackbox` (every key load) (item 22) |
+| 3 | `lab` label not bound to targets: depot + one operator reach production | root-signed unit→ring assignment; lab quorum only for assigned units; canary of one unit (item 26) |
+| 4 | No trust anti-rollback outside `verify bundle --state`; per-programme only; no expiry (freeze undetectable) | one site-wide trust anchor for every command, advanced only by rotation; mandatory `expires_at` (items 21, 25) |
+| 5 | Release keys site-wide: one programme's release quorum signs another's RPKs and bundles | programmes scope release keys and package names (item 25a) |
+| 6 | Verify-then-use on removable media | `import`: copy, verify the copy, use only the copy (item 30) |
+| 7 | Hash before size (sparse-file DoS) | size first, bounded read (item 31) |
+| 8 | `-h` anywhere exits 0 | help only alone (item 32) |
+| 9 | Quorums above 16; clock before 1970 read as 0; `sign` trusted a bundle's RPKs and existing entries; revocation by digest only | caps (item 23); clock error (item 32); `sign` checks (item 29); `revoked_serials` (item 24) |
+
+The formats were changed before any release: `robodr-delivery-trust/1`
+gained `expires_at`, structured `programmes`, `rings` and
+`revoked_serials`; `robodr-bundle-chain/1` gained `site`. Notes for
+fields that 13b will act on are in §10 ("13b requirements").
 
 ---
 
@@ -470,7 +583,13 @@ keys for sealed items (§7.3).
 
 Assigning to `prod` rings needs two distinct site operators (the
 `motion_quorum` idea from commissioning, applied to delivery). A compromised
-depot (T4) can therefore push to `lab` and `canary` only.
+depot (T4) can therefore push to `lab` and `canary` only, and (13a: §3.5,
+item 26) never alone: every deployment needs at least one operator. Which
+units are `lab` and `canary` is not the depot's to say: the root-signed
+trust file assigns units to those rings, and the smaller quorum applies
+only to units assigned to the deployment's ring (a canary is one unit);
+a deployment naming any group or any other unit needs the production
+quorum.
 
 ---
 
@@ -543,7 +662,10 @@ and is documented as such.
 ### 6.5 Freshness and freeze attacks
 
 An air-gapped unit cannot ask "is there a newer release?". Instead, every
-deployment carries `expires_at`. A unit whose newest valid deployment has
+deployment carries `expires_at`, and so does the site trust file (13a:
+§3.5, item 21), so a courier who withholds a newer trust file (one that
+revokes a key or an RPK) is detected when the old one expires: every
+verifying station then refuses until a fresh trust file arrives. A unit whose newest valid deployment has
 expired raises `robot.deliver.stale` (High after a configurable grace). That
 makes withholding (T8) visible in the SOC, through the outbound diode, within
 one freshness window. It does not make it impossible.
@@ -807,9 +929,58 @@ are unit-tested in `robodr-pkg`. Fuzzing: `pkg_rpk`, `pkg_bundle`,
 `pkg_deployment`, `pkg_trust`, `pkg_parity` (results in
 `fuzz/README.md`).
 
+**Independent adversarial review (2026-10-26).** A review after the
+self-review found nine issues with working PoCs (one high: another
+site's trust file signed by the same roots was accepted). All are fixed
+and each has a regression test that replays the attack and failed before
+the fix; the decisions are in §3.5 ("Review of 13a"). The review's PoCs
+were re-run against the fixed binary and each is refused. Fuzz harnesses
+and seeds follow the format changes.
+
 Not in 13a: sealed RPKs and wrapped keys (13c), the entry-station scan
 and signed entry report (§6.1), anything on a unit (13b) or a depot (14a).
 Signing keys are files on the signing station, not HSM-held.
+
+### 13b requirements (from the 13a review)
+
+The formats carry fields that only an installer acts on. The 13a parsers
+bound their shape; these rules are requirements on `robodr-deliverd`
+(13b) and the depot (14a), not yet implemented anywhere:
+
+1. **Probe argv is not a shell command.** `health[].probe.argv` may hold
+   shell metacharacters (`;`, `|`, `$()`, backticks, globs). The agent
+   must `execve` the argv directly (absolute `argv[0]`, no shell, no
+   `PATH` lookup, a fixed minimal environment) and never join it into a
+   string.
+2. **Probe user by UID.** `probe.user` is a name; the agent must resolve
+   it once to a UID/GID, refuse UID 0 and any UID below the system range
+   it is configured for, refuse a name that resolves differently than at
+   install time, and drop privileges (setgroups, setgid, setuid) before
+   `execve`.
+3. **Rollout limits.** `rollout.batch_size` and `rollout.max_failures`
+   are unbounded in the format: the depot must cap them against the size
+   of the targeted ring (a batch never larger than the ring, a failure
+   threshold below it) and the unit must ignore a deployment whose
+   rollout would apply to more units than its ring holds.
+4. **The unit's own ring.** A unit learns its ring from the trust file
+   (`rings`) and enrolment, and refuses a deployment whose `ring` is not
+   its own and, for `lab` / `canary`, one that does not name it as a
+   unit (no group expansion on the depot's word).
+5. **Maintainer scripts.** `install.allow_maintainer_scripts` lets a
+   `deb` run root shell; the agent records it in the black box and runs
+   such packages only after the safety gate and, if set,
+   `requires_operator_present`.
+6. **One architecture per package.** A bundle may hold `name` for `all`
+   and for `arm64`; the agent installs at most one, preferring the
+   unit's architecture, and refuses two different serials.
+7. **Install only from verified bytes.** Like `import` (§3.5, item 30),
+   the agent installs from its own content-addressed store, filled by
+   verifying chunks as they are written, never from media or a
+   depot-served path re-read after the check.
+8. **Trust anchor and expiry on the unit.** The unit keeps its own trust
+   anchor (§3.5, item 25) and refuses an expired trust file; with no
+   trusted clock it treats "trust file expired by the depot's clock" and
+   "newest deployment expired" as staleness findings (§6.5).
 
 ---
 

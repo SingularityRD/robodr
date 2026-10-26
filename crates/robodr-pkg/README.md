@@ -8,10 +8,10 @@ agent are its callers.
 
 | Module | Format | What it checks |
 | --- | --- | --- |
-| `rpk` | `robodr-pkg/1` | RPK manifest: name, serial, kind (closed set), platform / arch, dependencies, security floor, content paths and modes, 4 MiB per-file chunking, SBOM, install options, health checks; release quorum; site policy (revoked digest, floor, expiry); content hashes from chunks |
-| `bundle` | `robodr-bundle/1` | Bundle manifest: RPKs by digest, every file with size and SHA-256 under a fixed path grammar, parity section; release quorum; per-programme chain (gap, replay, equivocation, broken link) |
-| `deployment` | `robodr-deployment/1` | Deployment: targets, ring, items, validity window, rollout, maintenance window; depot signature plus operator quorum by ring; revoked items and floors; replay by sequence number |
-| `trust` | `robodr-delivery-trust/1` | Site trust file: disjoint roles (roots, release, depot, operators), quorum floors, revocations by key fingerprint and RPK digest, floors; acceptance under pinned roots; root rotation |
+| `rpk` | `robodr-pkg/1` | RPK manifest: name, serial, kind (closed set), platform / arch, dependencies, security floor, content paths and modes, 4 MiB per-file chunking, SBOM, install options, health checks; release quorum of the programme owning the package; site policy (revoked digest or serial, floor, expiry); content hashes from chunks |
+| `bundle` | `robodr-bundle/1` | Bundle manifest: RPKs by digest, every file with size and SHA-256 under a fixed path grammar, parity section; release quorum of its programme, whose packages it must carry; per-programme chain (gap, replay, equivocation, broken link); chain state pinned to the site and trust version |
+| `deployment` | `robodr-deployment/1` | Deployment: targets, ring, items, validity window, rollout, maintenance window; depot signature plus operator quorum, the lab quorum only for units the trust file assigns to that lab / canary ring; revoked items and floors; replay by sequence number |
+| `trust` | `robodr-delivery-trust/1` | Site trust file: disjoint, torsion-free keys (roots, release, depot, operators), programmes scoping release keys and package names, ring assignment of units, capped quorum floors, revocations by key fingerprint, RPK digest and package serial, floors, expiry; acceptance under pinned roots **and site**; root rotation (the only way an accepted trust moves forward) |
 | `sig` | `robodr-sigset/1` | Detached Ed25519 signature sets over domain-separated messages; quorum by distinct key |
 | `parity` | `rs-gf256-0x11d/1` | Reed-Solomon parity over bundle files, in groups, with `robodr-diode`'s code |
 
@@ -44,7 +44,15 @@ agent are its callers.
 * **Roles are disjoint**: one key (by fingerprint) has at most one role
   in a trust file. Release keys sign RPKs and bundles; the depot and site
   operators sign deployments; roots sign trust files. Anything else is
-  `wrong_role`.
+  `wrong_role`. Keys must be torsion-free (`robodr-blackbox`), so one
+  secret has exactly one fingerprint.
+* **Release keys belong to programmes**: a release key of another
+  programme than the package's (RPK) or the bundle's refuses the document
+  (`wrong_scope`).
+* **Trust is pinned by roots and site, and expires.** Anti-rollback of
+  trust files is the caller's: keep the last accepted file as an anchor
+  and accept newer ones only through `verify_trust_update` (what
+  `robodr-release --trust-anchor` does).
 
 ## Refusal codes
 
@@ -58,6 +66,9 @@ planned `robot.deliver.refused` / `robot.deliver.chain_gap` findings
 (§9 of the design) will carry.
 
 ## Not here yet
+
+* Revocation by digest covers one manifest; the same release re-signed
+  into another manifest needs `revoked_serials` or a floor.
 
 * `confidentiality: "sealed"` and deployment `wrapped_keys` are reserved
   for Sprint 13c (sealing) and refused (`unsupported`) until then.

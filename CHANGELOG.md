@@ -12,6 +12,45 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Security
 
+- Secure delivery, independent adversarial review of Sprint 13a
+  (`docs/SECURE-DELIVERY.md` §3.5 "Review of 13a"); every finding has a
+  regression test replaying its attack
+  (`crates/robodr-release/tests/review_13a.rs`). The formats changed
+  before any release:
+  - **Another site's trust file (high):** trust files are pinned by site
+    as well as by root fingerprints (`--site`, required wherever trust is
+    pinned); the bundle chain state records the site. Roots shared by
+    several sites no longer let one site's file stand in for another's.
+  - **Trust rollback and freeze (medium):** one site-wide trust anchor
+    (`--trust-anchor`, created by `verify trust --init-anchor`, advanced
+    only by an accepted rotation) for every command (`verify rpk`,
+    `verify bundle`, `verify deployment`, `repair`, `import`, `build
+    bundle`, `sign`); working without it needs `--no-trust-anchor` and is
+    refused with `--state`. Trust files carry a mandatory `expires_at`
+    (at most 366 days); revocations and floors can no longer be dropped
+    on the state path.
+  - **Release keys scoped to programmes (medium):** `programmes` name
+    their release keys and packages; one programme's release quorum
+    cannot sign another's RPKs or bundles.
+  - **Ring bound to targets (medium):** the trust file assigns units to
+    rings; the `lab` operator quorum applies only to units assigned to
+    the deployment's ring (a canary is one unit, groups need the
+    production quorum).
+  - **Mixed-order twin keys (medium):** `robodr-blackbox` refuses Ed25519
+    public keys that are not torsion-free everywhere keys are loaded, so
+    one secret cannot count as two signers (also hardens
+    `robodr-commission` quorums).
+  - **Verify-then-use on media (medium):** new `robodr-release import
+    --from MEDIA --to DIR` copies, verifies the copy and publishes only
+    the copy.
+  - Low: listed files are size-checked before hashing and never read past
+    their size; `-h` / `--help` exits 0 only as the whole command line
+    (also in `robodr-diode-pack` / `-unpack` and the `robodr-export`
+    binaries); quorums are capped at the 16-entry signature set; a clock
+    before 1970 is an error; `sign` verifies a bundle's RPKs and every
+    existing signature before adding one; RPKs can be revoked by package
+    and serial (`revoked_serials`).
+
 - Control plane v2 review (agentd, `robodr-control-plane/v2`):
   - **TLS read deadline (high):** the handshake and request deadlines now
     bound every socket read (rustls' `complete_io` loops reused one socket

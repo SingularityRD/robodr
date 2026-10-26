@@ -27,10 +27,10 @@ violated output invariant (documented at the top of its harness file).
 | `safety_feed` | robodr-agentd | `safety_feed JSON \0 records`: safety-socket lines, RTPS datagrams (through the sensor pipeline, then `SafetyFeed::observe_datagram`), clock steps; "never less conservative than a fresh socket report" | `crates/robodr-agentd/tests/fuzz_smoke.rs` |
 | `kafka_wire` | robodr-export | a selector + body to the Kafka decoders: ApiVersions / Metadata v1-8 / Produce v3-8 responses (decode-encode-decode identity), RecordBatch v2 (CRC fixed up or not), request header + Metadata / Produce requests, wire primitives | `crates/robodr-export/tests/fuzz_smoke.rs` |
 | `firewall_gw_packet` | robodr-firewall-gw | a flags byte + framed records (each wrapped in IPv4 / UDP) to `Gateway::process` (strict RTPS walk, SEDP learning, `LowCmd_` / sport `Request_` / Go1 decode, firewall decision, in-place rewrite), and the bytes to the NFQUEUE netlink parser | `crates/robodr-firewall-gw/tests/fuzz_smoke.rs` |
-| `pkg_rpk` | robodr-pkg | `MANIFEST.json \0 MANIFEST.sig` to `parse_manifest` (canonical, every value rule), `rpk_digest`, `SignatureSet::parse`, `verify_manifest` against a fixed harness site (release quorum, policy), `verify_content` | `crates/robodr-pkg/tests/fuzz_smoke.rs` |
-| `pkg_bundle` | robodr-pkg | `bundle.json \0 bundle.sig` to `parse_bundle` (path grammar, parity plan), `verify_bundle_manifest`, and `check_chain` against genesis and several heads (gap / replay / equivocation / broken-link rules as invariants) | same |
-| `pkg_deployment` | robodr-pkg | `deployment \0 sig` to `parse_deployment`, `verify_deployment` (depot + operator quorum by ring, freshness), `check_seq` | same |
-| `pkg_trust` | robodr-pkg | `trust \0 sig \0 next \0 next sig` to `parse_trust` (disjoint roles), `verify_trust_pinned` and `verify_trust_update` from the harness site (monotonic revocations and floors) | same |
+| `pkg_rpk` | robodr-pkg | `MANIFEST.json \0 MANIFEST.sig` to `parse_manifest` (canonical, every value rule), `rpk_digest`, `SignatureSet::parse`, `verify_manifest` against a fixed harness site (release quorum of the programme owning the package, policy), `verify_content` | `crates/robodr-pkg/tests/fuzz_smoke.rs` |
+| `pkg_bundle` | robodr-pkg | `bundle.json \0 bundle.sig` to `parse_bundle` (path grammar, parity plan), `verify_bundle_manifest` (programme scope of signers and packages), and `check_chain` against genesis and several heads (gap / replay / equivocation / broken-link rules as invariants) | same |
+| `pkg_deployment` | robodr-pkg | `deployment \0 sig` to `parse_deployment`, `verify_deployment` (depot + operator quorum; lab quorum only for units the trust file assigns to that ring), `check_seq` | same |
+| `pkg_trust` | robodr-pkg | `trust \0 sig \0 next \0 next sig` to `parse_trust` (disjoint roles, expiry bounds, quorum caps, programme scopes and package ownership), `verify_trust_pinned` (pins, site, expiry) and `verify_trust_update` from the harness site (monotonic revocations, serials and floors; unexpired) | same |
 | `pkg_parity` | robodr-pkg | `k`, `m`, an erasure mask and data files to `parity::layout`, `encode_group`, `rebuild_group` (`robodr-diode`'s RS code): erased members come back byte for byte | same |
 
 `kafka_wire` got its std-only smoke test after the fact (it was added while
@@ -137,6 +137,26 @@ or invariant violation:**
 nine Ed25519 keys and checks signatures twice). Five minutes per target
 is a first run, not an acceptance run: the 1 h nightly and 24 h
 campaigns of the roadmap still apply.
+
+### libFuzzer runs (13a review fixes, 2026-10-26)
+
+After the fixes for the independent review of Sprint 13a changed the
+trust file (site pin, `expires_at`, programme scopes, rings,
+`revoked_serials`), the deployment quorum rule and the chain state, the
+five `pkg_*` harnesses and seeds were updated (`seeds_are_current`
+passes) and each target re-run: `nightly-2026-09-01`, `cargo-fuzz`
+0.13.1, AddressSanitizer + debug assertions, `-max_total_time=150
+-rss_limit_mb=2048`, seeded from `fuzz/corpus/<target>/` (copied), two
+targets at a time on a 4-core sandbox. **No crash, leak, timeout or
+invariant violation:**
+
+| target | runs | exec/s | coverage (edges) | corpus at end |
+|---|---:|---:|---:|---:|
+| `pkg_bundle` | 1 582 320 | 10 478 | 5 695 | 2 233 |
+| `pkg_deployment` | 2 203 276 | 14 591 | 5 417 | 2 460 |
+| `pkg_rpk` | 1 162 425 | 7 698 | 6 619 | 2 910 |
+| `pkg_parity` | 355 437 | 2 353 | 600 | 203 |
+| `pkg_trust` | 176 570 | 1 169 | 4 371 | 1 198 |
 
 ### Smoke runs
 
