@@ -232,11 +232,22 @@ pub(crate) fn lock_path(p: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// Attempts at `flock` before [`try_lock`] reports the lock as held (10 ms
+/// apart, so a held lock is reported after about a quarter of a second).
+const LOCK_RETRIES: u32 = 25;
+
 /// Take an exclusive, non-blocking `flock` on `p` (created mode 0600 if
 /// missing, never through a symlink, never truncated or removed). `Ok(None)`
 /// if another process (or another open file description in this one) holds
 /// it. The lock lives as long as the returned file; the kernel drops it when
 /// the process dies, so a crash never leaves a stale lock behind.
+///
+/// A held lock is retried briefly (like `robodr-blackbox`'s recorder lock):
+/// a child forked by *any* thread of this process holds a copy of every
+/// open descriptor, the lock file's included, until it execs (std opens
+/// files close-on-exec), so a lock dropped just before such a fork can look
+/// held for a moment. A lock held by another live packer / importer stays
+/// held and is reported as `Ok(None)`.
 // FFI: `File::try_lock` (std 1.89) is newer than the MSRV (1.87).
 #[allow(unsafe_code)]
 pub(crate) fn try_lock(p: &Path) -> io::Result<Option<File>> {
@@ -252,17 +263,23 @@ pub(crate) fn try_lock(p: &Path) -> io::Result<Option<File>> {
     if !f.metadata()?.is_file() {
         return Err(invalid(format!("{} is not a regular file", p.display())));
     }
-    // SAFETY: `flock` only reads its two integer arguments; the descriptor
-    // is owned by `f`, which outlives the call.
-    let rc = unsafe { sys::flock(f.as_raw_fd(), sys::LOCK_EX | sys::LOCK_NB) };
-    if rc == 0 {
-        return Ok(Some(f));
-    }
-    let e = io::Error::last_os_error();
-    if e.kind() == io::ErrorKind::WouldBlock {
-        Ok(None)
-    } else {
-        Err(e)
+    let mut tries = 0u32;
+    loop {
+        // SAFETY: `flock` only reads its two integer arguments; the
+        // descriptor is owned by `f`, which outlives the call.
+        let rc = unsafe { sys::flock(f.as_raw_fd(), sys::LOCK_EX | sys::LOCK_NB) };
+        if rc == 0 {
+            return Ok(Some(f));
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::WouldBlock {
+            return Err(e);
+        }
+        tries += 1;
+        if tries >= LOCK_RETRIES {
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 

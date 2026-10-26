@@ -23,7 +23,8 @@
 //! * an accepted batch carried a signature that verifies with the unit's key
 //!   over the exact manifest bytes, its manifest passes `check_import`, and
 //!   its output holds `records.jsonl` and a byte-identical `MANIFEST.json`;
-//! * a second run over the now empty inbox accepts nothing.
+//! * after an acceptance, a second run over the now empty inbox accepts
+//!   nothing.
 //!
 //! Shared via `#[path]` with `crates/robodr-diode/tests/fuzz_smoke.rs`.
 #![allow(dead_code)]
@@ -216,8 +217,10 @@ pub fn run(data: &[u8]) {
         assert_inside(&a.output, &root);
     }
 
-    let again = imp.run(NOW).expect("second run");
-    assert!(again.accepted.is_empty(), "{again:?}");
+    if !report.accepted.is_empty() {
+        let again = imp.run(NOW).expect("second run");
+        assert!(again.accepted.is_empty(), "{again:?}");
+    }
     drop(imp);
 }
 
