@@ -750,6 +750,17 @@ fn cli_lock_status_and_reinject() {
         .unwrap();
     assert_eq!(o.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&o.stderr).contains("removed"));
+    // Values the library refuses are usage errors at start, not a run that
+    // fails forever.
+    for bad in [
+        &["--dead-letter-max-bytes", "100"][..],
+        &["--dead-letter-keep", "0"],
+        &["--max-lines", "1001"],
+        &["--refused-backoff-max-s", "0"],
+    ] {
+        let o = base(bad).output().unwrap();
+        assert_eq!(o.status.code(), Some(2), "{bad:?}");
+    }
 
     // The service holds the lock while it runs (also between runs).
     let mut svc = base(&["--interval-ms", "200"])
