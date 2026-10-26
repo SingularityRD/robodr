@@ -53,6 +53,11 @@
 //! write failed is counted as dropped, never retried (a partial line may
 //! have reached the peer).
 
+// S10 (review I3): no `unsafe` code here (checked with grep; the only
+// macros used, `tokio::main` / `tokio::select!` and derives, compile under
+// `forbid(unsafe_code)`), and it must stay that way.
+#![forbid(unsafe_code)]
+
 use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;

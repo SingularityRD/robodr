@@ -137,7 +137,7 @@
         target_arch = "riscv64"
     )
 ))]
-#[allow(unsafe_code)]
+// The FFI calls carry `#[allow(unsafe_code)]` per function (review I3).
 pub mod afpacket;
 pub mod bpf;
 pub mod checksum;

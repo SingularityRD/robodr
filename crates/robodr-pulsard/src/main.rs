@@ -36,6 +36,11 @@
 //! The daemon must hold `CAP_NET_RAW` for live capture (it already runs as
 //! root for eBPF).
 
+// S10 (review I3): no `unsafe` code here (checked with grep; the only
+// macros used, `tokio::main` / `tokio::select!` and derives, compile under
+// `forbid(unsafe_code)`), and it must stay that way.
+#![forbid(unsafe_code)]
+
 use std::sync::OnceLock;
 
 use clap::Parser;

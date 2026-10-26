@@ -215,6 +215,7 @@ fn cvt(ret: c_int) -> io::Result<c_int> {
 
 /// `setsockopt` with a `#[repr(C)]` value. Private: only called with the
 /// option structs above.
+#[allow(unsafe_code)] // setsockopt(2) FFI
 fn setsockopt<T>(fd: &OwnedFd, level: c_int, name: c_int, val: &T) -> io::Result<()> {
     // SAFETY: `val` is a valid, initialised `T` borrowed for the duration of
     // the call, and we pass its exact size; the kernel only reads that many
@@ -233,6 +234,7 @@ fn setsockopt<T>(fd: &OwnedFd, level: c_int, name: c_int, val: &T) -> io::Result
 }
 
 /// Resolve an interface name to its index.
+#[allow(unsafe_code)] // if_nametoindex(3) FFI
 pub fn interface_index(name: &str) -> Result<u32, CaptureError> {
     let c = CString::new(name)
         .map_err(|_| CaptureError::Unsupported(format!("interface name {name:?} contains NUL")))?;
@@ -249,6 +251,7 @@ pub fn interface_index(name: &str) -> Result<u32, CaptureError> {
 
 /// Resolve an interface index to its name (`None` if there is no such
 /// interface, e.g. it was removed).
+#[allow(unsafe_code)] // if_indextoname(3) FFI
 pub fn interface_name(index: u32) -> Option<String> {
     if index == 0 {
         return None;
@@ -323,6 +326,7 @@ pub struct AfPacketSource {
 
 impl AfPacketSource {
     /// Open the socket. Needs `CAP_NET_RAW`.
+    #[allow(unsafe_code)] // socket(2) FFI, fd ownership, bind(2)
     pub fn open(cfg: &AfPacketConfig) -> Result<Self, CaptureError> {
         let ifindexes = cfg
             .interfaces
@@ -423,6 +427,7 @@ impl AfPacketSource {
 
     /// Kernel counters `(packets, drops)` since the previous call (reading
     /// resets them). Drops mean the sensor fell behind.
+    #[allow(unsafe_code)] // getsockopt(2) FFI
     pub fn kernel_stats(&self) -> Result<(u32, u32), CaptureError> {
         let mut st = TpacketStats::default();
         let mut len = size_of::<TpacketStats>() as u32;
@@ -442,6 +447,7 @@ impl AfPacketSource {
 }
 
 impl PacketSource for AfPacketSource {
+    #[allow(unsafe_code)] // recvfrom(2) FFI
     fn next_packet(&mut self) -> Result<Option<Packet<'_>>, CaptureError> {
         let (len, addr) = loop {
             let mut addr = SockaddrLl::default();
