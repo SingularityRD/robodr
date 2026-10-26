@@ -21,7 +21,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use common::pcap::robot_profile;
+use common::pcap::{
+    frame, robot_profile, sedp_datagram, spdp_datagram, ROGUE, ROGUE_HEX, SPDP_GROUP, TWIST,
+};
 use common::*;
 use robodr_agentd::control::auth::{answer_message, signing_message};
 use robodr_agentd::control::evidence::parse_signature_header;
@@ -787,4 +789,68 @@ fn executor_section_is_strict_and_off_by_default() {
     assert!(s.resolve(&cfg).executor.is_some());
     cfg["executor"]["unknown"] = json!(1);
     assert!(robodr_agentd::load(&s.write_config(&cfg)).is_err());
+}
+
+/// Red team F3 (row R6e): the SOC quarantines the rogue participant after
+/// a GUID spray (R2) pushed it out of the binding table. agentd used to
+/// hand the executor no locators then (`locators_required`); it now hands
+/// it the rogue's own last announced ones, and the quarantine is verified.
+#[test]
+fn a_rogue_pushed_out_by_a_guid_spray_is_still_quarantined_by_its_own_locators() {
+    let s = setup("exec-rt-f3", &robot_profile(true));
+    let safety = s.dir.join("safety.sock");
+    let control = s.dir.join("control.sock");
+    let exec_sock = s.dir.join("executor.sock");
+    let model = Model::default();
+    let _exec = start_executor(&s.dir, &exec_sock, &s.policy, &model);
+    let rogue_ip = std::net::Ipv4Addr::new(10, 0, 0, 66);
+    let spray_ip = std::net::Ipv4Addr::new(10, 0, 0, 77);
+    let mut frames = vec![
+        frame(rogue_ip, SPDP_GROUP, 7400, &spdp_datagram(ROGUE, rogue_ip)),
+        frame(
+            rogue_ip,
+            rogue_ip,
+            7410,
+            &sedp_datagram(ROGUE, "rt/cmd_vel", TWIST),
+        ),
+    ];
+    const SPRAY: u32 = 1500;
+    for i in 0..SPRAY {
+        let mut g = [0xd1; 12];
+        g[8..12].copy_from_slice(&i.to_be_bytes());
+        frames.push(frame(
+            spray_ip,
+            SPDP_GROUP,
+            7400,
+            &spdp_datagram(g, spray_ip),
+        ));
+    }
+    let mut cfg = exec_config(&s, &control, None, &safety, &exec_sock);
+    cfg["sensor"]["capture"] = json!({"enabled": true, "pcap_replay": s.pcap(&frames)});
+    let (stop, h) = spawn(s.resolve(&cfg));
+    let _plc = plc_idle(&s, &safety, &control);
+    wait_for(60, "capture replayed", || {
+        let st = status(&s.spool)?;
+        (st["daemon"]["datagrams"].as_u64()? >= u64::from(SPRAY) + 2).then_some(())
+    });
+    let st = status(&s.spool).unwrap();
+    assert!(
+        st["pipeline"]["binding"]["evicted"].as_u64().unwrap() > 0,
+        "the spray evicted bindings: {}",
+        st["pipeline"]["binding"]
+    );
+    let ux = Via::Unix(&control);
+    submit(
+        ux,
+        "q-rogue",
+        "quarantine_node",
+        json!({"participant_guid": ROGUE_HEX}),
+        None,
+    );
+    let v = wait_status(ux, "q-rogue", "verified");
+    assert_eq!(v["executed"], true, "{v}");
+    let table = serde_json::to_string(&*model.0.lock().unwrap()).unwrap();
+    assert!(table.contains("10.0.0.66"), "rogue locator rule: {table}");
+    assert!(!table.contains("10.0.0.77"), "never the sprayer's: {table}");
+    finish(stop, h);
 }

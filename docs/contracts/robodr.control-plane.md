@@ -400,8 +400,11 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
   * `isolate_network` and `quarantine_node` (by `participant_guid`) can
     reach `verified`. agentd hands a `quarantine_node` order the
     participant's SPDP unicast locators it has seen (from the pipeline's
-    binding table, else from `ros2_participant_discovered` events); without
-    them the executor refuses it (`locators_required`).
+    binding table: the prefix's own last trusted announcement, also after
+    the participant left or was evicted, for 24 h, minus any locator
+    another participant claims, none for a contested or pinned prefix;
+    else from `ros2_participant_discovered` events); without them the
+    executor refuses it (`locators_required`).
   * `record_evidence` becomes `verified` once a signed
     `robodr.evidence_mark` note naming the request's evidence is in the
     black box. It is never reverted.

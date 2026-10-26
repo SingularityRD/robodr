@@ -2506,10 +2506,13 @@ impl Daemon<'_> {
                     };
                     if recorded {
                         // A quarantine carries the participant's SPDP
-                        // unicast locators (the executor refuses it without).
+                        // unicast locators (the executor refuses it
+                        // without): its own last trusted ones, also after
+                        // it left (red team F3; never another
+                        // participant's, none for a contested prefix).
                         let now = self.pipeline_now();
                         let binding = self.pipeline.binding();
-                        let o = link.with_locators(o, |g| binding.spdp_unicast(g, now));
+                        let o = link.with_locators(o, |g| binding.quarantine_locators(g, now));
                         link.dispatch(Staged::Submit(o));
                     } else {
                         link.count_dropped();

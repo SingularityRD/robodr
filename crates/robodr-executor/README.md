@@ -426,10 +426,14 @@ and `src/config.rs` for every field and its limits. agentd's side is the
   isolation. `"multicast_groups": []` keeps none.
 * **Locators from agentd.** For a `quarantine_node` order agentd attaches
   the participant's SPDP unicast locators (metatraffic and default, IP and
-  port): from the pipeline's binding table (what the participant
-  announced through a path the binding trusts; none for a contested or
-  expired prefix), else from `ros2_participant_discovered` events of a
-  JSONL input. Without them the executor refuses (`locators_required`).
+  port): from the pipeline's binding table (what the participant itself
+  last announced through a path the binding trusts, also after it left,
+  its lease expired or a prefix flood evicted it, kept 24 h; never a
+  locator another live or profiled participant claims; none for a
+  contested or pinned prefix, see `robodr_ros2_pipeline::binding`,
+  "Quarantine locators"), else from `ros2_participant_discovered` events
+  of a JSONL input. Without them the executor refuses
+  (`locators_required`).
 
 ## Tests
 

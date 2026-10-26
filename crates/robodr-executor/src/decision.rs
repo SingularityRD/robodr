@@ -551,10 +551,12 @@ pub fn precheck(
                 return Err(Refusal::new(
                     codes::LOCATORS_REQUIRED,
                     format!(
-                        "the order names participant {} without its SPDP unicast locators: the \
-                         executor quarantines only a participant it can prove is outside the \
-                         motion control path (GUID prefixes change on restart and can be \
-                         forged)",
+                        "the order names participant {} without its SPDP unicast locators (agentd \
+                         had none it could vouch for: the prefix was never seen with locators, or \
+                         not within the retention, is contested or pinned, or announced only \
+                         locators another participant claims): the executor quarantines only a \
+                         participant it can prove is outside the motion control path (GUID \
+                         prefixes change on restart and can be forged)",
                         q.guid_prefix
                     ),
                 ));
