@@ -1,0 +1,21 @@
+{
+  "body_file": "2.body",
+  "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "headers": [
+    [
+      "X-RoboDR-Key-Id",
+      "ed25519:7bf642b114c6afa2"
+    ],
+    [
+      "X-RoboDR-Timestamp",
+      "1790000060000"
+    ],
+    [
+      "X-RoboDR-Signature",
+      "344b15afb29f9e8fd11430f356ae7876dd8ee8f47cbea9bf0a38e19832e37ff58c8886d4e6a912b93965a93acbafbe4b9a80e7aa8a7b7076a4599fcd34652105"
+    ]
+  ],
+  "method": "GET",
+  "server_time_ms": 1790000060000,
+  "target": "/api/robot-edr/v2/fleet/revocations/ugv-x1"
+}

@@ -13,6 +13,7 @@ members = [
     "crates/robodr-executor",
     "crates/robodr-export",
     "crates/robodr-firewall",
+    "crates/robodr-fleet",
     "crates/robodr-motion",
     "crates/robodr-ocsf",
     "crates/robodr-responder",
@@ -61,6 +62,7 @@ robodr-commission = { path = "crates/robodr-commission" }
 robodr-correlate = { path = "crates/robodr-correlate" }
 robodr-diode = { path = "crates/robodr-diode" }
 robodr-firewall = { path = "crates/robodr-firewall" }
+robodr-fleet = { path = "crates/robodr-fleet" }
 robodr-motion = { path = "crates/robodr-motion" }
 robodr-ocsf = { path = "crates/robodr-ocsf" }
 robodr-responder = { path = "crates/robodr-responder" }

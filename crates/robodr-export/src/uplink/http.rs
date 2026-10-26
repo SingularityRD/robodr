@@ -75,6 +75,14 @@ impl Endpoint {
     /// IP literal). No user info, query, fragment, percent-escapes or
     /// white space.
     pub fn parse(url: &str) -> Result<Self, String> {
+        Self::parse_with_path(url, wire::INGEST_PATH)
+    }
+
+    /// [`Endpoint::parse`] with `suffix` appended to the base path instead
+    /// of the ingest path (`""`: the base itself). Shared with the fleet
+    /// client (`robodr-fleet`), which sends to several paths under the same
+    /// API root ([`HttpsTransport::request`]).
+    pub fn parse_with_path(url: &str, suffix: &str) -> Result<Self, String> {
         let lower = url
             .get(..8)
             .map(str::to_ascii_lowercase)
@@ -168,7 +176,7 @@ impl Endpoint {
             tls,
             host,
             port,
-            path: format!("{base}{}", wire::INGEST_PATH),
+            path: format!("{base}{suffix}"),
         })
     }
 
@@ -453,6 +461,44 @@ impl HttpsTransport {
         &self.endpoint
     }
 
+    /// Replace the `User-Agent` (default `robodr-uplink/<version>`).
+    pub fn set_user_agent(&mut self, user_agent: &str) -> Result<(), String> {
+        if user_agent.is_empty() || !user_agent.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+            return Err("User-Agent must be printable ASCII".into());
+        }
+        self.user_agent = user_agent.to_string();
+        Ok(())
+    }
+
+    /// Send `method` to `target` (an origin-form request target such as
+    /// `/api/robot-edr/v2/fleet/ring`) on this transport's host, with the
+    /// same TLS, timeouts and response limits as [`Transport::post`] (which
+    /// is `request("POST", endpoint().path, ..)`). `method` is upper-case
+    /// ASCII letters; `target` starts with `/` and holds only
+    /// `[A-Za-z0-9-._~/]`.
+    pub fn request(
+        &mut self,
+        method: &str,
+        target: &str,
+        req: &HttpRequest<'_>,
+    ) -> Result<HttpResponse, TransportError> {
+        if method.is_empty() || method.len() > 16 || !method.bytes().all(|b| b.is_ascii_uppercase())
+        {
+            return Err(TransportError(format!("refusing method {method:?}")));
+        }
+        if !target.starts_with('/')
+            || !target
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-._~/".contains(&b))
+        {
+            return Err(TransportError(format!(
+                "refusing request target {:?}",
+                wire::trunc(target)
+            )));
+        }
+        self.exchange(method, target, req)
+    }
+
     fn connect(&self) -> Result<TcpStream, TransportError> {
         let addr = self.endpoint.addr();
         let addrs = crate::kafka::client::resolve(&addr, self.timeouts.connect)
@@ -474,11 +520,10 @@ impl HttpsTransport {
         Err(TransportError(format!("connect {a}: {e}")))
     }
 
-    fn head(&self, req: &HttpRequest<'_>) -> Vec<u8> {
+    fn head(&self, method: &str, target: &str, req: &HttpRequest<'_>) -> Vec<u8> {
         let mut h = format!(
-            "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: application/json\r\n\
+            "{method} {target} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: application/json\r\n\
              Connection: close\r\nContent-Length: {}\r\n",
-            self.endpoint.path,
             self.endpoint.host_header(),
             self.user_agent,
             req.body.len()
@@ -496,6 +541,18 @@ impl HttpsTransport {
 
 impl Transport for HttpsTransport {
     fn post(&mut self, req: &HttpRequest<'_>) -> Result<HttpResponse, TransportError> {
+        let target = self.endpoint.path.clone();
+        self.exchange("POST", &target, req)
+    }
+}
+
+impl HttpsTransport {
+    fn exchange(
+        &mut self,
+        method: &str,
+        target: &str,
+        req: &HttpRequest<'_>,
+    ) -> Result<HttpResponse, TransportError> {
         for (k, v) in &req.headers {
             // Header injection is impossible with the values built by the
             // uplink; refuse it anyway.
@@ -509,7 +566,7 @@ impl Transport for HttpsTransport {
         let tcp = self.connect()?;
         let deadline = Instant::now() + self.timeouts.request;
         let stream = DeadlineStream { tcp, deadline };
-        let head = self.head(req);
+        let head = self.head(method, target, req);
         let io_err = |e: io::Error| TransportError(describe_io(&e));
         match &self.tls {
             None => {

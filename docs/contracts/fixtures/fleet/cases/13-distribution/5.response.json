@@ -1,0 +1,27 @@
+{
+  "body_file": "5.response.body",
+  "body_sha256": "5f7c62d677ce4be88ddeb50e07e6349604c946f92bbb78378377dc9320ca7c2a",
+  "envelope": {
+    "payload": {
+      "approval_id": "ap-1",
+      "approved_by": [
+        "op-a",
+        "op-b"
+      ],
+      "expires_at_ms": 1790003600000,
+      "format": "robodr-fleet-profile-approval/v1",
+      "issued_at_ms": 1790000000000,
+      "platform": "ugv-x1",
+      "profile_digest": "sha256:74f11807fc52af6b7b274348ebce77307bd2af34800e3bcdf4b62e2957c3f1c7",
+      "profile_version": 4,
+      "robot_id": "ugv-001",
+      "transition": "enforce",
+      "workspace": "ws-test-0001"
+    },
+    "signed_by": [
+      "ed25519:370ede82195fa32b"
+    ],
+    "type": "profile-approval"
+  },
+  "status": 200
+}

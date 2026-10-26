@@ -26,6 +26,7 @@ robodr-cdr = { path = "../crates/robodr-cdr" }
 robodr-commission = { path = "../crates/robodr-commission" }
 robodr-events = { path = "../crates/robodr-events" }
 robodr-firewall = { path = "../crates/robodr-firewall" }
+robodr-fleet = { path = "../crates/robodr-fleet" }
 robodr-ocsf = { path = "../crates/robodr-ocsf" }
 robodr-ros2-pipeline = { path = "../crates/robodr-ros2-pipeline" }
 robodr-rtps = { path = "../crates/robodr-rtps" }
@@ -110,6 +111,20 @@ bench = false
 [[bin]]
 name = "pipeline_config"
 path = "fuzz_targets/pipeline_config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fleet_token"
+path = "fuzz_targets/fleet_token.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fleet_envelope"
+path = "fuzz_targets/fleet_envelope.rs"
 test = false
 doc = false
 bench = false

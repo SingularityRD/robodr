@@ -1,0 +1,48 @@
+//! # robodr-fleet
+//!
+//! The robot side of the fleet lifecycle (GA-ROADMAP Sprint 9; contract
+//! `docs/contracts/robodr.fleet-api.md`), behind one binary,
+//! `robodr-enroll`:
+//!
+//! * [`enroll`]: one-time enrollment with a single-use, SOC-signed token;
+//!   the unit's keys (uplink, finding, black-box) are generated on the unit
+//!   and never leave it; the request is signed by the new uplink key and
+//!   MAC'd with the token secret; online over HTTPS or as files on vetted
+//!   media (air-gapped).
+//! * [`rotate`]: key rotation of the `uplink` and `finding` roles with
+//!   overlap (the old key stays valid until the SOC confirms), an atomic
+//!   swap, a crash-safe journal and a signed key handover in the fleet
+//!   journal.
+//! * [`revocation`]: the SOC-distributed, root-signed revocation list
+//!   (`robodr-profile-revocations/v2`), verified with robodr-commission's
+//!   code and anti-rollback protected.
+//! * [`profile`]: SOC-published signed profiles are fetched, verified with
+//!   agentd's own trust inputs and **staged**; they are installed only on an
+//!   explicit operator approval artefact signed by the SOC. Nothing is ever
+//!   enforced automatically.
+//! * [`ring`]: update-ring information (0/1/2), information only.
+//!
+//! Supporting modules: [`wire`] (formats, pure), [`b64`], [`client`] (the
+//! HTTPS client is robodr-uplink's), [`keys`], [`state`], [`journal`] (the
+//! fleet journal, a robodr-blackbox recorder), [`config`], [`fsx`],
+//! [`install`].
+//!
+//! Scope: protective only. Nothing here talks to the motion stack, and
+//! nothing the SOC sends is executed: tokens, answers, approvals and ring
+//! information are verified data; profiles take effect only through
+//! agentd's own verification at its next start.
+
+pub mod b64;
+pub mod client;
+pub mod config;
+pub mod enroll;
+pub mod fsx;
+pub mod install;
+pub mod journal;
+pub mod keys;
+pub mod profile;
+pub mod revocation;
+pub mod ring;
+pub mod rotate;
+pub mod state;
+pub mod wire;

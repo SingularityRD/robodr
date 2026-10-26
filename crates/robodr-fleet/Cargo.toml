@@ -1,0 +1,31 @@
+[package]
+name = "robodr-fleet"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# Not published (crates.io disallows path deps); also lets cargo-deny
+# accept version-less path dependencies (deny.toml, allow-wildcard-paths).
+publish = false
+repository.workspace = true
+description = "Fleet lifecycle on the robot (robodr-enroll): one-time enrollment with a SOC-signed token, key rotation with overlap, revocation-list and signed-profile distribution from the SOC, update-ring information (contract robodr.fleet-api)."
+
+# The HTTPS client is robodr-uplink's (robodr-export::uplink::http: rustls +
+# ring, operator CA bundle, optional SPKI pins); profile trust, revocation
+# lists and anti-rollback are robodr-commission's; keys, signatures and the
+# fleet journal are robodr-blackbox's.
+[dependencies]
+robodr-blackbox = { workspace = true }
+robodr-commission = { workspace = true }
+robodr-events = { workspace = true }
+robodr-export = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# The in-process HTTPS SOC stub of the integration tests.
+rustls = { workspace = true }
+
+[[bin]]
+name = "robodr-enroll"
+path = "src/bin/robodr-enroll.rs"
