@@ -111,6 +111,8 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     "robot.motion.invalid_feedback",
     "robot.motion.multiple_feedback_publishers",
     "robot.motion.inconsistent_feedback_stream",
+    // robodr-agentd discovery-flood aggregation (red team F1)
+    "robot.ros2.discovery_flood",
     // robodr-agentd self-health (always observe-only downstream)
     "robot.agent.input_silent",
     "robot.agent.input_ended",

@@ -114,7 +114,7 @@ impl Site {
         fs::create_dir_all(&s.outbox).unwrap();
         let mut sp = Spool::open(&s.spool, 1 << 30, 1_000_000).unwrap();
         for o in outputs {
-            sp.write(o, false).unwrap();
+            sp.write(o, robodr_agentd::SpoolClass::Normal).unwrap();
         }
         s
     }

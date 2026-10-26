@@ -49,7 +49,7 @@ fn export_then_publish_spool_once() {
                     .map(|(k, v)| (k.into(), v))
                     .collect(),
             },
-            false,
+            robodr_agentd::SpoolClass::Normal,
         )
         .unwrap();
     }

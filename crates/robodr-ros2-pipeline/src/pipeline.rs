@@ -88,7 +88,8 @@
 //! - No rate limit on *distinct* profile / binding findings: an attacker
 //!   announcing new GUIDs produces up to `max_findings_per_datagram` findings
 //!   per datagram (each a true positive, the dedup set stays bounded).
-//!   Downstream consumers should aggregate. Protocol and capture findings are
+//!   Downstream consumers should aggregate (robodr-agentd does: its
+//!   discovery-flood guard, red team F1). Protocol and capture findings are
 //!   rate limited.
 //! - Duplicate identity parameters: the RTPS parser keeps the first value
 //!   and records the conflict as an anomaly without the other value. The

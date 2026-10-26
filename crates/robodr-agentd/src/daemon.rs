@@ -223,7 +223,7 @@ use crate::health::{
 use crate::input::{self, Feed, InputStats, Msg, Payload, QueueBudget};
 use crate::notify::{monotonic_ms, Notifier};
 use crate::safety::{FeedFinding, FeedStatus, SafetyFeed, Transition};
-use crate::spool::{Spool, SpoolError, SpoolStats};
+use crate::spool::{Spool, SpoolClass, SpoolError, SpoolStats};
 
 /// Most queued items handled between two clock checks.
 pub const BATCH: usize = 256;
@@ -432,6 +432,8 @@ struct Status<'a> {
     pipeline: &'a PipelineStats,
     agent: AgentStats,
     spool: SpoolStats,
+    /// Discovery-flood aggregation (red team F1, [`crate::flood`]).
+    discovery_flood: crate::flood::FloodStats,
     /// Correlation engine counters (absent when correlation is disabled).
     #[serde(skip_serializing_if = "Option::is_none")]
     correlation: Option<robodr_correlate::Stats>,
@@ -500,6 +502,8 @@ struct Daemon<'a> {
     profile_accepted: Option<robodr_commission::trust::AcceptedState>,
     /// The correlation engine (`None` = disabled).
     correlator: Option<Correlator>,
+    /// Discovery-flood aggregation of pipeline findings ([`crate::flood`]).
+    flood: crate::flood::FloodGuard,
     /// `groups_evicted + groups_refused` at the last pressure report.
     correlation_pressure_reported: u64,
     /// When the last pressure finding was raised (daemon ms).
@@ -1087,6 +1091,7 @@ impl<'a> Daemon<'a> {
             tick_max_age_ms: 0,
             profile_accepted: None,
             correlator,
+            flood: crate::flood::FloodGuard::default(),
             correlation_pressure_reported: 0,
             correlation_pressure_at_ms: None,
             incidents_reported: None,
@@ -1487,9 +1492,24 @@ impl<'a> Daemon<'a> {
             .unwrap_or_else(Instant::now)
     }
 
-    /// Pipeline findings -> agent -> spool.
+    /// Pipeline findings -> agent -> spool; per-participant discovery
+    /// findings of a flooding source are folded into one aggregate
+    /// ([`crate::flood`]): recorded in the black box and correlated, not
+    /// reported one by one.
     fn sensor_findings(&mut self, found: Vec<Finding>) {
         for f in found {
+            let ns = self.signal_ns();
+            let wall_ms = self.clock.now().wall_ns / 1_000_000;
+            match self.flood.admit(&f.deviation, &f.src_ip, ns, wall_ms) {
+                crate::flood::Admit::Pass => {}
+                crate::flood::Admit::Fold(report) => {
+                    self.fold(&f);
+                    if let Some(r) = report {
+                        self.flood_report(r);
+                    }
+                    continue;
+                }
+            }
             let safety = self.safety();
             let now = self.clock.now();
             let subject = Subject {
@@ -1506,6 +1526,60 @@ impl<'a> Daemon<'a> {
                 safety,
             );
             self.emit(o);
+        }
+    }
+
+    /// A folded finding: its deviation record in the black box (as the
+    /// agent writes it for a reported one) and its correlation signal.
+    fn fold(&mut self, f: &Finding) {
+        let now = self.clock.now();
+        let r = match self
+            .agent
+            .record_deviation(now, Detector::Sensor, &f.deviation)
+        {
+            Ok(r) => Some(r),
+            Err(_) => {
+                self.stats.note_errors += 1;
+                None
+            }
+        };
+        let source = format!("src:{}", f.src_ip);
+        self.correlate_deviation(&f.deviation, &source, r.as_ref());
+    }
+
+    /// A discovery-flood aggregate: reported like a pipeline finding.
+    fn flood_report(&mut self, r: crate::flood::FloodReport) {
+        let safety = self.safety();
+        let now = self.clock.now();
+        let source = match &r.src_ip {
+            Some(ip) => format!("src:{ip}"),
+            None => "flood:many_sources".to_string(),
+        };
+        let subject = Subject {
+            src_ip: r.src_ip.clone(),
+            ..Subject::default()
+        };
+        let o = self.agent.handle_external(
+            now,
+            Detector::Sensor,
+            &source,
+            subject,
+            r.deviation,
+            safety,
+        );
+        self.emit(o);
+    }
+
+    /// Close quiet floods (tick) or every flood (`all`, at stop).
+    fn flood_close(&mut self, all: bool) {
+        let reports = if all {
+            self.flood.flush()
+        } else {
+            let ns = self.signal_ns();
+            self.flood.tick(ns)
+        };
+        for r in reports {
+            self.flood_report(r);
         }
     }
 
@@ -1593,9 +1667,18 @@ impl<'a> Daemon<'a> {
 
     fn emit(&mut self, o: Outcome) {
         self.stats.outcomes += 1;
-        let reserve = o.detector == Detector::SelfHealth;
+        // Critical findings have a share of the spool lesser ones cannot
+        // fill (red team F1, `spool` module docs); health findings their
+        // own reserve.
+        let class = if o.detector == Detector::SelfHealth {
+            SpoolClass::Health
+        } else if o.deviation.severity >= robodr_events::Severity::Critical {
+            SpoolClass::Critical
+        } else {
+            SpoolClass::Normal
+        };
         match &o.finding {
-            Some(f) => match self.spool.write(f, reserve) {
+            Some(f) => match self.spool.write(f, class) {
                 Ok(_) => self.stats.findings_spooled += 1,
                 Err(SpoolError::Full) => {}
                 Err(e) => {
@@ -1695,7 +1778,17 @@ impl<'a> Daemon<'a> {
     /// and host-threat findings (fed as their Pulsar rule by
     /// [`Self::host_threat`]) are not fed here.
     fn correlate(&mut self, o: &Outcome) {
-        let rule = o.deviation.rule_str();
+        self.correlate_deviation(&o.deviation, &o.source, o.evidence.deviation.as_ref());
+    }
+
+    /// One deviation (reported or folded) into the correlator.
+    fn correlate_deviation(
+        &mut self,
+        dev: &robodr_events::Deviation,
+        source: &str,
+        evidence: Option<&robodr_ocsf::BlackBoxRef>,
+    ) {
+        let rule = dev.rule_str();
         if self.correlator.is_none()
             || rule.starts_with(robodr_correlate::RULE_ID_PREFIX)
             || rule == health_rules::CORRELATION_PRESSURE
@@ -1703,13 +1796,13 @@ impl<'a> Daemon<'a> {
         {
             return;
         }
-        let mut sig = Signal::from_deviation(self.signal_ns(), &o.deviation);
-        if let Some(ip) = o.source.strip_prefix("src:") {
+        let mut sig = Signal::from_deviation(self.signal_ns(), dev);
+        if let Some(ip) = source.strip_prefix("src:") {
             sig = sig.with_entity(EntityKind::Ip, ip);
-        } else if let Some(p) = o.source.strip_prefix("participant:") {
+        } else if let Some(p) = source.strip_prefix("participant:") {
             sig = sig.with_entity(EntityKind::Participant, p);
         }
-        if let Some(r) = &o.evidence.deviation {
+        if let Some(r) = evidence {
             sig = sig.with_evidence_ref(r.uri(&self.r.config.robot.id));
         }
         self.observe_signal(&sig);
@@ -2036,6 +2129,7 @@ impl<'a> Daemon<'a> {
             found.extend(self.pipeline.capture_findings(&h));
         }
         self.sensor_findings(found);
+        self.flood_close(false);
         self.handle_ended();
 
         let spool = self.spool.stats();
@@ -2253,6 +2347,7 @@ impl<'a> Daemon<'a> {
             pipeline: self.pipeline.stats(),
             agent: self.agent.stats(),
             spool: self.spool.stats(),
+            discovery_flood: self.flood.stats(),
             correlation: self.correlator.as_ref().map(|c| *c.stats()),
             signs_findings: self.agent.signs_findings(),
             evidence_degraded: self.agent.evidence_degraded(),
@@ -2355,6 +2450,7 @@ impl<'a> Daemon<'a> {
         }
         found.extend(self.pipeline.finish());
         self.sensor_findings(found);
+        self.flood_close(true);
         self.heartbeat("robodr.agentd_stop");
         self.write_status(false);
         let pipeline = *self.pipeline.stats();

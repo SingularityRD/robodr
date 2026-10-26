@@ -284,7 +284,7 @@ impl Site {
                         .map(|(k, v)| (k.to_string(), v))
                         .collect(),
                 },
-                false,
+                robodr_agentd::SpoolClass::Normal,
             )
             .unwrap();
         }

@@ -771,6 +771,13 @@ safely. Nothing here is specific to one product.
     (an RTPS-looking datagram on a configured legacy port) and
     `robot.motion.command_type_mismatch` (a changed, unknown or feedback type
     announced on a profiled command channel).
+  - Also added while 2.1.0 was unreleased (same caveat):
+    `robot.ros2.discovery_flood` (agentd's aggregate of the per-participant
+    discovery findings of a flooding source: count per rule, first and last
+    seen and sample GUID prefixes in the tainted `detail`; subject the
+    source IP, none for the "many sources" aggregate; no new field).
+    Consumers that mirror the catalog (e.g. AutoSecOps' validator) need the
+    entry, or they reject these findings for a title mismatch.
   - Schema `$id` `https://schemas.singularityrd.com/robodr/findings/2.1.0`;
     `contract_version` parts at most 9 digits and `ocsf.metadata.log_name`
     not `.` / `..` (as the validator always required).

@@ -813,7 +813,8 @@ fn catalog_1_3_wave7(rule: &str) -> Option<RuleInfo> {
 
 /// Entries added in contract **2.1**: the low-level joint-frame firewall ids
 /// (Unitree `LowCmd` envelope, humanoid no-zero rule), the robot-API /
-/// control-handover motion ids and the Unitree legacy UDP sender id. Not in 1.3 or 2.0: a 2.0 producer built
+/// control-handover motion ids, the Unitree legacy UDP sender ids and the
+/// discovery-flood aggregate. Not in 1.3 or 2.0: a 2.0 producer built
 /// such a finding with the generic entry, and the validator keeps applying
 /// that to a 2.0 message ([`rule_info_for_contract`]).
 fn catalog_2_1(rule: &str) -> Option<RuleInfo> {
@@ -861,6 +862,12 @@ fn catalog_2_1(rule: &str) -> Option<RuleInfo> {
             "A datagram on a configured Unitree legacy UDP port also parses as RTPS; it was inspected on both paths. DDS traffic on the legacy command ports is not normal and can be an attempt to evade the legacy sender check.",
             MOTION,
             &[T0855],
+        ),
+        "robot.ros2.discovery_flood" => e(
+            "Discovery flood: unknown participants aggregated",
+            "One source address (or many) announced more new DDS participants than are reported one by one; their per-participant findings are folded into this one, with the count per rule, first and last seen and sample GUID prefixes, and each is still recorded in the black box. A GUID spray or a discovery scan, possibly aimed at flooding the findings path.",
+            "ros2_dds_discovery",
+            &[T0848],
         ),
         "robot.motion.command_type_mismatch" => e(
             "Motion command writer with an unexpected type",

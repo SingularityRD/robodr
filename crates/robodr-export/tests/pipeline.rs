@@ -80,7 +80,7 @@ impl Robot {
                     .map(|(k, v)| (k.to_string(), v))
                     .collect(),
             };
-            s.write(&out, false).unwrap();
+            s.write(&out, robodr_agentd::SpoolClass::Normal).unwrap();
         }
     }
 
@@ -554,7 +554,8 @@ fn publisher_carries_finding_signatures_from_a_spool() {
     for i in 0..3 {
         let mut rec = robodr_ocsf::record(&finding(i), Some(12)).unwrap();
         robodr_ocsf::sign_record(&mut rec, &fsigner).unwrap();
-        s.write(&out(rec), false).unwrap();
+        s.write(&out(rec), robodr_agentd::SpoolClass::Normal)
+            .unwrap();
     }
     // Signature header moved first: refused.
     let mut rec = robodr_ocsf::record(&finding(3), Some(12)).unwrap();
@@ -562,13 +563,13 @@ fn publisher_carries_finding_signatures_from_a_spool() {
     let mut o = out(rec);
     let sig = o.headers.pop().unwrap();
     o.headers.insert(0, sig);
-    s.write(&o, false).unwrap();
+    s.write(&o, robodr_agentd::SpoolClass::Normal).unwrap();
     // Malformed signature header: refused.
     let rec = robodr_ocsf::record(&finding(4), Some(12)).unwrap();
     let mut o = out(rec);
     o.headers
         .push((robodr_ocsf::SIG_HEADER.into(), "{\"alg\":\"hmac\"}".into()));
-    s.write(&o, false).unwrap();
+    s.write(&o, robodr_agentd::SpoolClass::Normal).unwrap();
     drop(s);
 
     let c = Cluster::start(1, 3);

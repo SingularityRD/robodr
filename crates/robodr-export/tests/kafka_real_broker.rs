@@ -368,7 +368,8 @@ fn spool(
         expect.partition = robodr_ocsf::record(&env, Some(PARTITIONS))
             .unwrap()
             .partition;
-        s.write(&output(rec), false).unwrap();
+        s.write(&output(rec), robodr_agentd::SpoolClass::Normal)
+            .unwrap();
         want.insert(expect.key.clone(), expect);
     }
     want

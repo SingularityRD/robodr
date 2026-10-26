@@ -494,6 +494,30 @@ goes over an HMAC-authenticated unix socket (`socket`, `key_file`):
     is not spooled: it is counted, it stays in the black box, and the daemon
     raises a `robot.agent.spool_full` finding. Health findings can use a
     small reserve.
+  - **Critical findings first.** Findings below Critical may fill only
+    7/8 of `max_bytes` and of `max_files`; the last eighth is kept for
+    Critical findings, so a flood of lesser findings never makes a Critical
+    one black-box-only (red team F1). Within that share it is first come,
+    first served.
+- **Discovery-flood aggregation** (`src/flood.rs`, red team F1). The
+  per-participant discovery findings (`robot.ros2.unknown_participant`,
+  `identity_instances_exceeded`, `participant_source_mismatch`,
+  `endpoint_unannounced_participant`, `participant_removed`) below
+  Critical are reported one by one only for the first 8 per source IP and
+  32 in total per 60 s window. Past that, a source is flooding: its
+  findings are folded into one `robot.ros2.discovery_flood` finding (High
+  when the folded ones are; subject: the source IP, so one SOC case) with
+  the count per rule, first and last seen and up to 8 sample GUID
+  prefixes, reported at 1, 2, 4, 8, ... folded findings and once more when
+  the source has been quiet for 60 s or agentd stops. Sources folded only
+  by the 32-per-window cap (a spoofed-source spray) share one "many
+  sources" aggregate. Every folded finding is still recorded in the black
+  box (the same deviation record) and fed to the correlation engine; only
+  its plan, finding and spool record are replaced by the aggregate.
+  Critical findings are never folded. `status.json` counts it under
+  `discovery_flood` (`folded`, `reports`, `floods`). The red team's 3000
+  random-prefix SPDP spray now gives 8 per-GUID records plus 13
+  aggregate reports instead of one record per prefix.
   - `status.json` is rewritten every tick. It carries `updated_mono_ms`
     (`CLOCK_MONOTONIC`, ms), `boot_id` and `stale_after_ms` (2 x `tick_ms`
     + `lag_ms`). **A consumer must show `unknown`** when `running` is false,
@@ -572,6 +596,7 @@ request.
 | Test | What it shows |
 |---|---|
 | `tests/e2e.rs` | A synthetic pcap (the pipeline's own builders) yields the rogue participant and rogue `cmd_vel` writer findings in the spool, validated, with a black box that verifies against the final seal and evidence links that resolve. Resume across two runs. Unlocked and invalid profiles never enforce. A truncated pcap raises `input_ended`. The agent's rogue-UGV JSONL scenario runs over a unix socket through profile, firewall and monitor. Queue overflow is counted exactly (`received = processed + dropped`). Fuzzed datagrams and event lines do not stop the daemon. |
+| `tests/redteam_regressions.rs` | Red team F1: a 3000-prefix GUID spray from one address replayed through the daemon gives at most a handful of per-GUID findings and one aggregated `robot.ros2.discovery_flood` case (counts, first / last seen, samples), every sprayed announcement stays in the black box, and the genuine rogue's Critical `unauthorized_motion_writer` after the spray is spooled, also when the spool is already full of lesser findings. |
 | `tests/health.rs` | A silent input reads `unknown` (never `ok`) with an observe-only High finding. Live data turns the state `ok`. Silence again raises a new finding with the same id and a higher count. |
 | `tests/binary.rs` | The real binary: exit code 2 on usage and configuration errors, on a 0644 key file and on an unknown key. SIGTERM and SIGINT give exit 0, a sealed black box that verifies with the spool's `checkpoint.json`, and a stop note. |
 | `tests/motion_live.rs` | A synthetic pcap with SEDP plus CDR `Twist` on `rt/cmd_vel` (0.4 m/s, then 2.5 m/s against a 1.0 m/s envelope) and CDR `Odometry` on `rt/odom`: three motion events reach the agent, exactly one Critical `robot.motion.linear_over_envelope` finding is spooled, the black box holds the decoded command (with its writer GUID) and a firewall verdict with `enforcing: false`, and verifies. A garbage payload on `rt/cmd_vel` yields one Medium `robot.motion.undecodable_sample` and the next good command still flows. `sensor.motion` keys are strict. |
@@ -593,6 +618,14 @@ request.
   pcaps, the agent's demo JSONL. Nothing was exercised with real DDS stacks.
   The live motion path in particular has only decoded hand-built RTPS / CDR
   (no `ros2 topic pub /cmd_vel` capture from a real RMW).
+- **A flood hides lesser discovery findings.** During a discovery flood
+  a genuine unknown participant from the flooding address (or, past 32
+  per window, from any address) is folded too: it is in the black box and
+  the correlator, named in the aggregate only if it is among the samples,
+  and gets no response plan of its own. Its Critical findings (e.g. a
+  motion writer) are never folded. Source addresses are not
+  authenticated, so a forged flood from a legitimate host's address folds
+  that host's own non-Critical discovery findings.
 - **Motion decode needs SEDP.** A writer announced before the daemon
   started is unknown until it is re-announced; its commands are not decoded
   meanwhile (samples to a known motion reader raise
