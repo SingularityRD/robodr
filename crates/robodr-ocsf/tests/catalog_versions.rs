@@ -7,7 +7,9 @@
 //!   did not change the catalog);
 //! * 2.1: + the low-level joint-frame firewall ids, the robot API /
 //!   control-handover motion ids, the Unitree legacy UDP sender ids and
-//!   the motion command type id.
+//!   the motion command type id;
+//! * 2.2: + the secure-delivery ids of `robodr-deliverd` (`robot.deliver.*`,
+//!   data source `robodr_delivery`, `docs/SECURE-DELIVERY.md` §9).
 
 mod common;
 
@@ -37,6 +39,17 @@ const IDS_2_1: &[&str] = &[
     "robot.firewall.joint_mode_pin_mismatch",
     "robot.firewall.joint_limp_frame",
     "robot.firewall.joint_hold_exceeded",
+];
+
+/// Ids whose catalog entry was added after contract 2.1.0 (2.2).
+const IDS_2_2: &[&str] = &[
+    "robot.deliver.installed",
+    "robot.deliver.deferred_safety",
+    "robot.deliver.health_failed",
+    "robot.deliver.rollback_blocked_floor",
+    "robot.deliver.refused",
+    "robot.deliver.stale",
+    "robot.deliver.chain_gap",
 ];
 
 /// A sample of 1.3 entries (wave 6 and wave 7) that must stay as they were.
@@ -90,15 +103,15 @@ fn as_2_0(json: &str, id: &str) -> String {
 }
 
 #[test]
-fn current_contract_is_2_1() {
-    assert_eq!(CONTRACT_VERSION, "2.1.0");
+fn current_contract_is_2_2() {
+    assert_eq!(CONTRACT_VERSION, "2.2.0");
     let schema: serde_json::Value = serde_json::from_str(include_str!(
         "../../../docs/contracts/robodr-finding.schema.json"
     ))
     .unwrap();
     assert_eq!(
         schema["$id"],
-        "https://schemas.singularityrd.com/robodr/findings/2.1.0"
+        "https://schemas.singularityrd.com/robodr/findings/2.2.0"
     );
 }
 
@@ -111,7 +124,7 @@ fn entries_added_after_2_0_are_not_in_1_3_or_2_0() {
         for v in ["1.0.0", "1.2.0", "1.3.0", "1.9.0", "2.0.0", "2.0.7"] {
             assert_eq!(rule_info_for_contract(id, v), g, "{id} @ {v}");
         }
-        for v in ["2.1.0", "2.1.3", "2.4.0"] {
+        for v in ["2.1.0", "2.1.3", "2.2.0", "2.4.0"] {
             assert_eq!(rule_info_for_contract(id, v), full, "{id} @ {v}");
         }
         // Malformed versions get the current (strictest) catalog.
@@ -120,11 +133,73 @@ fn entries_added_after_2_0_are_not_in_1_3_or_2_0() {
 }
 
 #[test]
+fn entries_added_after_2_1_are_not_in_2_1_or_earlier() {
+    let g = generic();
+    for id in IDS_2_2 {
+        let full = rule_info(id);
+        assert_ne!(full, g, "{id} has its own entry in the current catalog");
+        assert_eq!(full.data_source, "robodr_delivery", "{id}");
+        for v in ["1.0.0", "1.3.0", "2.0.0", "2.1.0", "2.1.9"] {
+            assert_eq!(rule_info_for_contract(id, v), g, "{id} @ {v}");
+        }
+        for v in ["2.2.0", "2.2.5", "2.9.0"] {
+            assert_eq!(rule_info_for_contract(id, v), full, "{id} @ {v}");
+        }
+        assert_eq!(rule_info_for_contract(id, "x"), full);
+    }
+    // The 2.1 entries are unchanged in 2.2.
+    for id in IDS_2_1 {
+        assert_eq!(
+            rule_info_for_contract(id, "2.2.0"),
+            rule_info_for_contract(id, "2.1.0")
+        );
+    }
+}
+
+/// What a 2.1.0 producer emitted for `id`: the generic entry.
+fn as_2_1(json: &str, id: &str) -> String {
+    let new = rule_info(id);
+    let old = rule_info_for_contract(id, "2.1.0");
+    assert!(old.techniques.is_empty() && new.techniques.is_empty());
+    json.replace(new.title, old.title)
+        .replace(new.desc, old.desc)
+        .replace(
+            &format!("\"{}\"", new.data_source),
+            &format!("\"{}\"", old.data_source),
+        )
+        .replace(
+            &format!("\"contract_version\":\"{CONTRACT_VERSION}\""),
+            "\"contract_version\":\"2.1.0\"",
+        )
+}
+
+#[test]
+fn a_2_1_message_validates_with_its_own_catalog() {
+    for id in IDS_2_2 {
+        let v22 = build(id);
+        robodr_ocsf::parse_and_validate(&v22).unwrap_or_else(|e| panic!("{id}: {e:?}"));
+        let v21 = as_2_1(&v22, id);
+        assert_ne!(v21, v22);
+        robodr_ocsf::parse_and_validate(&v21).unwrap_or_else(|e| panic!("{id} 2.1: {e:?}"));
+        let up = v21.replace(
+            "\"contract_version\":\"2.1.0\"",
+            &format!("\"contract_version\":\"{CONTRACT_VERSION}\""),
+        );
+        assert!(robodr_ocsf::parse_and_validate(&up).is_err(), "{id}");
+        let down = v22.replace(
+            &format!("\"contract_version\":\"{CONTRACT_VERSION}\""),
+            "\"contract_version\":\"2.1.0\"",
+        );
+        assert!(robodr_ocsf::parse_and_validate(&down).is_err(), "{id}");
+    }
+}
+
+#[test]
 fn the_1_3_entries_are_the_same_in_1_3_2_0_and_2_1() {
     for id in IDS_1_3 {
         let full = rule_info(id);
         assert_ne!(full, generic(), "{id}");
-        for v in ["1.3.0", "2.0.0", "2.1.0"] {
+        for v in ["1.3.0", "2.0.0", "2.1.0", "2.2.0"] {
             assert_eq!(rule_info_for_contract(id, v), full, "{id} @ {v}");
         }
     }

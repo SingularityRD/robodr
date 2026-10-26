@@ -2,10 +2,10 @@
 
 | | |
 | --- | --- |
-| Contract | `robodr.findings`, version **2.1.0** (`contract_version` field, `robodr-contract-version` header); changes in §10 |
-| Producer | `robodr-agentd` (findings spool), `robodr-diode` importer (air-gapped sites), `robodr-kafka-publish` |
+| Contract | `robodr.findings`, version **2.2.0** (`contract_version` field, `robodr-contract-version` header); changes in §10 |
+| Producer | `robodr-agentd` (findings spool; since 2.2 also `robodr-deliverd`, the on-unit delivery agent, which writes its `robot.deliver.*` findings into the same spool), `robodr-diode` importer (air-gapped sites), `robodr-kafka-publish` |
 | Consumer | Any SOC, SIEM or SOAR: the envelope is vendor-neutral and the body is a standard OCSF Detection Finding |
-| Value schema | [`robodr-finding.schema.json`](robodr-finding.schema.json) (JSON Schema 2020-12, `$id` `https://schemas.singularityrd.com/robodr/findings/2.1.0`; it also describes 2.0.x messages, whose only difference is the rule catalog the validator applies, §3) |
+| Value schema | [`robodr-finding.schema.json`](robodr-finding.schema.json) (JSON Schema 2020-12, `$id` `https://schemas.singularityrd.com/robodr/findings/2.2.0`; it also describes 2.0.x and 2.1.x messages, whose only difference is the rule catalog the validator applies, §3) |
 | Golden example | [`robodr-finding.example.json`](robodr-finding.example.json) |
 | Reference implementation | `crates/robodr-ocsf` (`FindingBuilder`, `validate`, `kafka::record`, `sig`) |
 | Superseded | Contract 1.x (`robot-edr.findings`): [`legacy/robot-edr.findings.md`](legacy/robot-edr.findings.md); parse-only (§5) |
@@ -71,7 +71,7 @@ each one against the robot's current safety state and may refuse it.
 | Header | Value |
 | --- | --- |
 | `content-type` | `application/json` |
-| `robodr-contract-version` | the value's own `contract_version` (`2.1.0` from this producer; a forwarded or replayed 2.0 message keeps `2.0.0`) |
+| `robodr-contract-version` | the value's own `contract_version` (`2.2.0` from this producer; a forwarded or replayed 2.0 or 2.1 message keeps its version) |
 | `ocsf-version` | `1.1.0` |
 | `data-source` | the value's `data_source` (default `robodr`) |
 | `robot-id` | robot id (`[A-Za-z0-9._-]{1,64}`) |
@@ -86,7 +86,7 @@ not trust a header that disagrees with the value.
 
 ```json
 {
-  "contract_version": "2.1.0",
+  "contract_version": "2.2.0",
   "finding_id": "rf1-0d7e79aac05cfd23bcfbdd38ef617eba",
   "external_id": "ugv-007:rf1-0d7e79aac05cfd23bcfbdd38ef617eba",
   "data_source": "robodr",
@@ -398,7 +398,13 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
   `robodr_agent` (`robot.agent.*`, `robot.ros2.profile_state_tampered`,
   `robot.ros2.profile_refused`) and `host_runtime`
   (`robot.host.pulsar_threat`: a Pulsar host rule forwarded to agentd; the
-  Pulsar rule name is in the description, since it is not a rule id). Since 1.3 every `robot.*` id an in-repo
+  Pulsar rule name is in the description, since it is not a rule id), and
+  since 2.2 `robodr_delivery` (`robot.deliver.*`, the on-unit delivery agent
+  `robodr-deliverd`, `docs/SECURE-DELIVERY.md` §9; for these findings
+  `entity_context.profile` names the delivery trust file they were judged
+  under, version `delivery-trust-<n>` and its digest, not a model profile,
+  and the subject is empty: the package and reason are in the tainted
+  detail). Since 1.3 every `robot.*` id an in-repo
   detector emits has its own entry (sensor discovery, capture and source
   binding ids under `ros2_dds_discovery`; motion decode, motion monitor and
   firewall ids under `ros2_motion_commands`); `robodr` is left for ids a
@@ -415,7 +421,8 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
   | --- | --- |
   | 1.0 – 1.2 | base catalog |
   | 1.3 – 1.x, 2.0 | base + the 1.3 entries, exactly as 1.3.0 shipped (2.0 did not change the catalog) |
-  | 2.1 and later | + the 2.1 entries: the low-level joint-frame firewall ids (`robot.firewall.joint_*`, `disabled_motor_energised`, `crc_invalid`), `robot.motion.api_id_out_of_range`, `robot.motion.control_handover`, `robot.motion.command_type_mismatch` and the Unitree legacy-UDP ids `robot.unitree.legacy_unknown_sender`, `legacy_sender_flood`, `legacy_sender_mac_mismatch`, `legacy_port_rtps` |
+  | 2.1 | + the 2.1 entries: the low-level joint-frame firewall ids (`robot.firewall.joint_*`, `disabled_motor_energised`, `crc_invalid`), `robot.motion.api_id_out_of_range`, `robot.motion.control_handover`, `robot.motion.command_type_mismatch` and the Unitree legacy-UDP ids `robot.unitree.legacy_unknown_sender`, `legacy_sender_flood`, `legacy_sender_mac_mismatch`, `legacy_port_rtps` |
+  | 2.2 and later | + the 2.2 entries: the secure-delivery ids `robot.deliver.installed` (Low: the contract has no informational severity), `deferred_safety` (Low, Medium when repeated), `health_failed` (High), `rollback_blocked_floor` (Critical), `refused` (High), `stale` (Medium, High after the grace period), `chain_gap` (High), data source `robodr_delivery` |
 
   A finding of an older minor for a rule that only gained an entry in a
   later minor carries the generic entry and stays valid; a finding of that
@@ -453,11 +460,14 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
   parallel (e.g. a new topic) until consumers migrate.
 * `ocsf.metadata.version` moves independently; upgrading the OCSF version
   inside the envelope is a minor change only if it is additive for consumers.
-* **2.0 vs 2.1.** 2.1 only added rule-catalog entries (§3). A 2.1
-  validator accepts 2.0 messages with the 2.0 catalog; a 2.0 validator
-  accepts a 2.1 message for every rule both catalogs share and rejects one
-  for a rule that only 2.1 catalogues (title / data source differ): upgrade
-  consumers (and both sides of a diode) before producers.
+* **2.0 vs 2.1 vs 2.2.** 2.1 and 2.2 only added rule-catalog entries
+  (§3; 2.2 also the data source `robodr_delivery` they use). A 2.2
+  validator accepts 2.0 and 2.1 messages with their own catalogs; an older
+  validator accepts a newer message for every rule both catalogs share and
+  rejects one for a rule only the newer minor catalogues (title / data
+  source differ): upgrade consumers (and both sides of a diode) before
+  producers. Sites that run `robodr-deliverd` need 2.2 validators on the
+  SOC side before its findings are exported.
 * **What 2.0 changed from 1.3** (`robot-edr.findings`): `data_source` is no
   longer the constant `robot_edr` but a deployment label (default
   `robodr`); the topic is no longer fixed to `robot-edr.findings` but
@@ -747,6 +757,19 @@ safely. Nothing here is specific to one product.
 
 ## 10. Changelog
 
+* **2.2.0** — rule-catalog entries only (minor), Sprint 13b:
+  - New entries (data source `robodr_delivery`, added to the schema's
+    `types` / `data_sources` enums): `robot.deliver.installed`,
+    `robot.deliver.deferred_safety`, `robot.deliver.health_failed`,
+    `robot.deliver.rollback_blocked_floor`, `robot.deliver.refused`,
+    `robot.deliver.stale`, `robot.deliver.chain_gap`
+    (`docs/SECURE-DELIVERY.md` §9), emitted by `robodr-deliverd`.
+  - A second producer on the agentd spool: `robodr-deliverd` claims record
+    names with no-replace links, as agentd does since this release
+    (`robodr.spool/v1` unchanged; names and `seq` stay equal).
+  - Schema `$id` `https://schemas.singularityrd.com/robodr/findings/2.2.0`.
+  - The `robot.seal.*` ids of §9 have no entry yet (nothing emits them
+    before Sprint 13c / 14b).
 * **2.1.0** — rule-catalog entries only (minor):
   - New entries: the low-level joint-frame firewall ids
     (`robot.firewall.joint_position_out_of_envelope`,

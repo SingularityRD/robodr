@@ -192,6 +192,8 @@ const GENERIC: RuleInfo = RuleInfo {
 pub const CATALOG_1_3_MINOR: u64 = 3;
 /// Contract 2.x minor that added [`catalog_2_1`]'s entries.
 pub const CATALOG_2_1_MINOR: u64 = 1;
+/// Contract 2.x minor that added [`catalog_2_2`]'s entries.
+pub const CATALOG_2_2_MINOR: u64 = 2;
 
 /// The trusted rule catalog of the current contract
 /// ([`crate::CONTRACT_VERSION`]). Unknown rule ids get a generic entry (the
@@ -201,6 +203,7 @@ pub fn rule_info(rule: &str) -> RuleInfo {
     catalog_1_0(rule)
         .or_else(|| catalog_1_3(rule))
         .or_else(|| catalog_2_1(rule))
+        .or_else(|| catalog_2_2(rule))
         .unwrap_or(GENERIC)
 }
 
@@ -213,7 +216,8 @@ pub fn rule_info(rule: &str) -> RuleInfo {
 /// |---|---|
 /// | 1.0 - 1.2 | base ([`catalog_1_0`]) |
 /// | 1.3+ (1.x), 2.0 | base + 1.3 ([`catalog_1_3`], exactly as released in 1.3) |
-/// | 2.1+ | base + 1.3 + 2.1 ([`catalog_2_1`]) |
+/// | 2.1 | base + 1.3 + 2.1 ([`catalog_2_1`]) |
+/// | 2.2+ | base + 1.3 + 2.1 + 2.2 ([`catalog_2_2`]) |
 ///
 /// A malformed version gets the current catalog (and is rejected anyway).
 pub fn rule_info_for_contract(rule: &str, contract_version: &str) -> RuleInfo {
@@ -225,9 +229,12 @@ pub fn rule_info_for_contract(rule: &str, contract_version: &str) -> RuleInfo {
     let with_1_3 = major > LEGACY_CONTRACT_MAJOR || minor >= CATALOG_1_3_MINOR;
     let with_2_1 =
         major > CONTRACT_MAJOR || (major == CONTRACT_MAJOR && minor >= CATALOG_2_1_MINOR);
+    let with_2_2 =
+        major > CONTRACT_MAJOR || (major == CONTRACT_MAJOR && minor >= CATALOG_2_2_MINOR);
     catalog_1_0(rule)
         .or_else(|| with_1_3.then(|| catalog_1_3(rule)).flatten())
         .or_else(|| with_2_1.then(|| catalog_2_1(rule)).flatten())
+        .or_else(|| with_2_2.then(|| catalog_2_2(rule)).flatten())
         .unwrap_or(GENERIC)
 }
 
@@ -956,6 +963,73 @@ fn catalog_2_1(rule: &str) -> Option<RuleInfo> {
             "Humanoid joint hold exceeded its time limit",
             "The motion firewall has been holding a humanoid's last valid joint frame for longer than the configured hold time because newer frames keep being rejected; it keeps holding with the feed-forward torque removed and needs escalation.",
             MOTION,
+            &[],
+        ),
+        _ => return None,
+    })
+}
+
+/// Entries added in contract **2.2**: the secure-delivery findings of the
+/// on-unit agent `robodr-deliverd` (`docs/SECURE-DELIVERY.md` §9, Sprint
+/// 13b), data source `robodr_delivery`. Not in 2.1 or earlier: a 2.1
+/// validator applies the generic entry to these ids, and so does a 2.2
+/// validator to a 2.1 message ([`rule_info_for_contract`]).
+fn catalog_2_2(rule: &str) -> Option<RuleInfo> {
+    const DELIVERY: &str = "robodr_delivery";
+    const fn e(
+        title: &'static str,
+        desc: &'static str,
+        data_source: &'static str,
+        techniques: &'static [(&'static str, &'static str)],
+    ) -> RuleInfo {
+        RuleInfo {
+            title,
+            desc,
+            data_source,
+            techniques,
+        }
+    }
+    Some(match rule {
+        "robot.deliver.installed" => e(
+            "Delivered package installed",
+            "The unit's delivery agent installed a release-signed package that a depot and operator quorum assigned to it, and the package passed its health gate. Informational: the evidence trail of what runs on the unit.",
+            DELIVERY,
+            &[],
+        ),
+        "robot.deliver.deferred_safety" => e(
+            "Delivery deferred by the robot's safety state",
+            "The unit's delivery agent deferred an install or rollback because the robot's live safety state was not idle or safe-state (moving, human nearby, e-stop or unknown); downloading and staging continue and the install waits for a safe window. Repeated deferrals mean the unit never reaches one.",
+            DELIVERY,
+            &[],
+        ),
+        "robot.deliver.health_failed" => e(
+            "Delivered package failed its health gate; rolled back",
+            "A package installed by the unit's delivery agent failed its health checks; the agent rolled back automatically to the previous version at or above the anti-rollback floor.",
+            DELIVERY,
+            &[],
+        ),
+        "robot.deliver.rollback_blocked_floor" => e(
+            "Failed package cannot be rolled back",
+            "A package installed by the unit's delivery agent failed its health checks and there is no earlier version at or above the anti-rollback floor (or the rollback itself failed); the unit stays on the failing version until an operator acts.",
+            DELIVERY,
+            &[],
+        ),
+        "robot.deliver.refused" => e(
+            "Delivery refused",
+            "The unit's delivery agent refused a media pack, deployment or package: a signature, quorum, revocation, floor, scope (unit, ring, site), platform or hash check failed, or its state had to be restored. Nothing was installed from it.",
+            DELIVERY,
+            &[],
+        ),
+        "robot.deliver.stale" => e(
+            "No fresh deployment or trust file",
+            "The unit's newest deployment or its site trust file expired without a fresh one arriving: updates or revocations may be withheld from the unit.",
+            DELIVERY,
+            &[],
+        ),
+        "robot.deliver.chain_gap" => e(
+            "Release bundle chain gap or equivocation",
+            "The unit's delivery agent saw a release bundle that skips bundles it never received, or two different bundles with the same sequence number, or one that does not follow the accepted bundle.",
+            DELIVERY,
             &[],
         ),
         _ => return None,
