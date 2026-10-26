@@ -1,0 +1,313 @@
+# RoboDR host rules: Unitree robots (Go2 / B2 / G1 / H1 and relatives).
+#
+# Where these run: on a Linux host where robodr-pulsard can load eBPF, i.e.
+# the EDU development computer (Jetson, arm64). The closed main motion
+# controller and the Air/Pro models cannot run pulsard; for them the passive
+# sensor box (docs/UNITREE.md) watches the robot network instead, and these
+# host rules do not apply.
+#
+# Threats (public research, docs/UNITREE.md "What the Unitree rules detect"):
+#   * UniPwn (Makris & Finisterre, Sept 2025; CVE-2025-35027): the BLE Wi-Fi
+#     provisioning service used hardcoded keys and passed attacker-supplied
+#     SSID/password text into a shell command around wpa_supplicant_restart.sh,
+#     giving root; an infected robot can infect others over BLE (wormable;
+#     Go2, B2, G1, H1). radio_provisioning.toml already watches the BlueZ /
+#     Wi-Fi tools and the wireless configuration files; this file adds the
+#     provisioning script itself and what its process does.
+#   * Reports of G1 units sending telemetry to external servers: outbound
+#     connections from Unitree processes to non-allowlisted destinations.
+#   * The earlier Go1 remote-tunnel backdoor (a CloudSail-like vendor tunnel
+#     service): reverse tunnels, tunnel clients, overlay VPNs, and new
+#     persistent services.
+#   * Tampering with the DDS (Cyclone) configuration or the Unitree SDK /
+#     Cyclone DDS libraries that every SDK2 program loads.
+#
+# Pulsar limits that shape these rules (rules/README.md "DSL facts"):
+#   * Exec carries no parent image, so "a shell spawned by the BLE daemon" or
+#     "an interpreter spawned by wpa_supplicant_restart.sh" cannot be written
+#     as a rule. They are written on behaviour instead: the provisioning
+#     script being run at all (audit trail, correlate header.parent_pid in the
+#     SOC), and the script's OWN process opening a socket. When a shebang
+#     script is exec'd directly, Pulsar reports the script path as the image
+#     of that process (sched_process_exec reads bprm->filename), so the
+#     script's own builtins (bash /dev/tcp) are attributed to it.
+#   * Firmware-specific paths are NOT assumed where they could not be
+#     verified. The names used are: wpa_supplicant_restart.sh (named in the
+#     UniPwn disclosure; matched by file name, not directory), the SDK install
+#     prefix /opt/unitree_robotics/ (unitree_sdk2 README), library and config
+#     file names from unitree_sdk2 / unitree_legged_sdk / unitree_ros2, and
+#     /unitree/ (the reported onboard layout; unverified, used only to widen
+#     a trigger, never to exclude). Every such value is marked TUNE.
+#
+# Commissioning (TUNE): set the destination allowlist of the outbound rule to
+# the robot's real networks, add the commissioned CYCLONEDDS_URI file if it
+# is not named *cyclonedds.xml, and confirm the bluetoothd image path.
+
+[[rules]]
+name = "RoboDR: Unitree Wi-Fi provisioning script executed"
+type = "Exec"
+category = "initial_access"
+severity = "medium"
+description = "wpa_supplicant_restart.sh, the Wi-Fi provisioning script behind the Unitree BLE configuration service, was executed (directly, or as 'sh wpa_supplicant_restart.sh' / './wpa_supplicant_restart.sh'). UniPwn (CVE-2025-35027) injected root commands through the SSID/password text handed to this script; the injected commands run as siblings or children of the script, which Pulsar cannot link to it (no parent image). A fielded robot keeps its commissioned network, so every run is either an owner re-provisioning over BLE (the audit trail) or the exploit path: correlate header.parent_pid and the commands executed in the same second in the SOC. Invocations as 'sh /full/path/wpa_supplicant_restart.sh' are a KNOWN GAP (argv elements match whole, and the directory is firmware-specific)."
+# TUNE: if this firmware's script has another name, add it here and to the
+# Connect rule below.
+condition = '''
+payload.filename ENDS_WITH "/wpa_supplicant_restart.sh"
+OR payload.argv CONTAINS "wpa_supplicant_restart.sh"
+OR payload.argv CONTAINS "./wpa_supplicant_restart.sh"
+'''
+
+[[rules]]
+name = "RoboDR: Bluetooth daemon or Wi-Fi provisioning script opened an IP connection"
+type = "Connect"
+category = "command_and_control"
+severity = "critical"
+description = "bluetoothd, or the Unitree Wi-Fi provisioning script's own process (image ending in /wpa_supplicant_restart.sh), opened an IP connection. Neither has any reason to: bluetoothd speaks HCI and D-Bus, and the script's network work (wpa_supplicant, DHCP client, ping) runs in child processes with their own images. A connection from the script's process is a shell builtin such as 'bash >& /dev/tcp/host/port' injected through the provisioning text (UniPwn), which the shell rule in ros2_stack.toml does not see because the image is the script path, not /bin/bash. Destinations inside the robot's networks are deliberately not excluded: a worming robot attacks its neighbours."
+condition = '''
+header.image ENDS_WITH "/bluetoothd" OR header.image ENDS_WITH "/wpa_supplicant_restart.sh"
+'''
+
+[[rules]]
+name = "RoboDR: Bluetooth pairing keys or configuration modified outside bluetoothd"
+type = "FileOpened"
+category = "persistence"
+severity = "high"
+description = "A file under /var/lib/bluetooth (bonding keys: link keys, LTKs, IRKs per paired device) or /etc/bluetooth (adapter and pairing policy, e.g. JustWorks / discoverable settings) was opened for writing by something other than bluetoothd or dpkg (exact images). Planting a bond gives an attacker's device a trusted BLE link to the robot's provisioning service with no pairing on the robot; relaxing main.conf makes the robot pairable or discoverable. bluetoothd saves its own state (excluded by exact image: /usr/lib/bluetooth/bluetoothd, /usr/libexec/bluetooth/bluetoothd, /usr/sbin/bluetoothd)."
+# TUNE: confirm the bluetoothd image on the target (systemctl cat
+# bluetooth.service, ExecStart=). A non-canonical spelling of the real path
+# is not excluded and fires (fails safe).
+condition = '''
+(payload.filename STARTS_WITH "/var/lib/bluetooth/" OR payload.filename STARTS_WITH "/etc/bluetooth/")
+AND (payload.flags CONTAINS "O_WRONLY" OR payload.flags CONTAINS "O_RDWR")
+AND NOT (header.image == "/usr/lib/bluetooth/bluetoothd" OR header.image == "/usr/libexec/bluetooth/bluetoothd"
+         OR header.image == "/usr/sbin/bluetoothd")
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
+'''
+
+[[rules]]
+name = "RoboDR: Bluetooth pairing keys or configuration moved into place outside bluetoothd"
+type = "FileRename"
+category = "persistence"
+severity = "high"
+description = "A file was renamed into /var/lib/bluetooth or /etc/bluetooth by something other than bluetoothd or dpkg (exact images): the 'write elsewhere, then mv' form of planting a bonding key or a relaxed pairing policy, which the write rule never sees on the target path. bluetoothd's own atomic saves (temp file + rename) are excluded by image."
+condition = '''
+(payload.destination STARTS_WITH "/var/lib/bluetooth/" OR payload.destination STARTS_WITH "/etc/bluetooth/")
+AND NOT (header.image == "/usr/lib/bluetooth/bluetoothd" OR header.image == "/usr/libexec/bluetooth/bluetoothd"
+         OR header.image == "/usr/sbin/bluetoothd")
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
+'''
+
+[[rules]]
+name = "RoboDR: Service or autostart entry written outside the package manager"
+type = "FileOpened"
+category = "persistence"
+severity = "high"
+description = "A systemd unit or drop-in (system: /etc/systemd/system, /usr/lib/systemd/system, /lib/systemd/system; user: /etc/systemd/user, /usr/lib/systemd/user, ~/.config/systemd/user), a SysV init script, /etc/rc.local, or an XDG autostart entry (/etc/xdg/autostart, ~/.config/autostart) was opened for writing by something other than dpkg (exact image). A new persistent service is how a remote tunnel (the Go1 CloudSail-style backdoor) or a UniPwn implant survives reboot. 'systemctl edit' and commissioning-time unit installs also fire (the audit trail). Cron is covered by Pulsar's own 'Schedule a Cron job' rule."
+condition = '''
+(payload.filename STARTS_WITH "/etc/systemd/system/" OR payload.filename STARTS_WITH "/usr/lib/systemd/system/"
+ OR payload.filename STARTS_WITH "/lib/systemd/system/" OR payload.filename STARTS_WITH "/etc/systemd/user/"
+ OR payload.filename STARTS_WITH "/usr/lib/systemd/user/" OR payload.filename CONTAINS "/.config/systemd/user/"
+ OR payload.filename STARTS_WITH "/etc/init.d/" OR payload.filename == "/etc/rc.local"
+ OR payload.filename STARTS_WITH "/etc/xdg/autostart/" OR payload.filename CONTAINS "/.config/autostart/")
+AND (payload.flags CONTAINS "O_WRONLY" OR payload.flags CONTAINS "O_RDWR")
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
+'''
+
+[[rules]]
+name = "RoboDR: Service or autostart entry moved into place outside the package manager"
+type = "FileRename"
+category = "persistence"
+severity = "high"
+description = "A file was renamed into a systemd unit directory (system or user), /etc/init.d, /etc/rc.local or an XDG autostart directory by something other than dpkg (exact image): atomic installation of a new or replaced persistent service. 'systemctl edit' saves its override this way and also fires (the audit trail)."
+condition = '''
+(payload.destination STARTS_WITH "/etc/systemd/system/" OR payload.destination STARTS_WITH "/usr/lib/systemd/system/"
+ OR payload.destination STARTS_WITH "/lib/systemd/system/" OR payload.destination STARTS_WITH "/etc/systemd/user/"
+ OR payload.destination STARTS_WITH "/usr/lib/systemd/user/" OR payload.destination CONTAINS "/.config/systemd/user/"
+ OR payload.destination STARTS_WITH "/etc/init.d/" OR payload.destination == "/etc/rc.local"
+ OR payload.destination STARTS_WITH "/etc/xdg/autostart/" OR payload.destination CONTAINS "/.config/autostart/")
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
+'''
+
+[[rules]]
+name = "RoboDR: Service enabled, masked or linked outside the package manager"
+type = "FileLink"
+category = "persistence"
+severity = "medium"
+description = "A hard or symbolic link was created in a systemd unit directory (system or user), /etc/init.d, as /etc/rc.local or in an XDG autostart directory by something other than dpkg or deb-systemd-helper (exact images). This is 'systemctl enable' / 'mask' (PID 1 makes the .wants/.requires links), and also the way to start a vendor service that ships disabled (a remote-tunnel service) or to mask a security service. Enabling at commissioning fires (the audit trail); package installs that enable their units through deb-systemd-helper do not. Pulsar FileLink: 'source' is the new link."
+condition = '''
+(payload.source STARTS_WITH "/etc/systemd/system/" OR payload.source STARTS_WITH "/usr/lib/systemd/system/"
+ OR payload.source STARTS_WITH "/lib/systemd/system/" OR payload.source STARTS_WITH "/etc/systemd/user/"
+ OR payload.source STARTS_WITH "/usr/lib/systemd/user/" OR payload.source CONTAINS "/.config/systemd/user/"
+ OR payload.source STARTS_WITH "/etc/init.d/" OR payload.source == "/etc/rc.local"
+ OR payload.source STARTS_WITH "/etc/xdg/autostart/" OR payload.source CONTAINS "/.config/autostart/")
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
+AND NOT header.image == "/usr/bin/deb-systemd-helper"
+'''
+
+[[rules]]
+name = "RoboDR: Unitree robot process connects outside the allowlisted destinations"
+type = "Connect"
+category = "exfiltration"
+severity = "high"
+description = "A Unitree process (image under /unitree/ or /opt/unitree_robotics/, or inside a unitree_sdk2, unitree_sdk2_python, unitree_ros2 or unitree_legged_sdk tree) opened a connection to an address outside the destination allowlist (default: loopback, RFC 1918 including the robot's 192.168.123.0/24, link-local, multicast, limited broadcast, IPv6 ULA/link-local/multicast, and the IPv4-mapped forms of the private ranges). Robot software has no reason to reach the Internet; this is the host-side view of the reported G1 telemetry to external servers and of a vendor or implanted tunnel. The network sensor sees the same flows on the wire for models without an EDU computer. Processes outside these trees (an attacker's own binary) are left to the shell, tunnel and tooling rules. UDP DDS traffic is mostly sendto(), not connect(), so this rule mostly sees TCP and connected UDP."
+# TUNE (destination allowlist): narrow the private ranges to the robot's real
+# networks (192.168.123.0/24 robot LAN, the operator/fleet subnet) and add the
+# fleet gateway or SOC collector if it sits outside private space, as one more
+#   OR (payload.destination.ip >= "<first>" AND payload.destination.ip <= "<last>")
+# line inside the NOT (...) group. IpAddr has no STARTS_WITH: CIDRs are
+# inclusive ranges, and every IPv4 address sorts before every IPv6 address.
+# TOML comments cannot go inside the condition string (the DSL has no
+# comments), so document each added range here.
+# TUNE (image scope): /unitree/ is the reported onboard layout (unverified);
+# add the commissioned path of any other robot program.
+condition = '''
+(header.image STARTS_WITH "/unitree/" OR header.image STARTS_WITH "/opt/unitree_robotics/"
+ OR header.image CONTAINS "/unitree_sdk2/" OR header.image CONTAINS "/unitree_sdk2_python/"
+ OR header.image CONTAINS "/unitree_ros2/" OR header.image CONTAINS "/unitree_legged_sdk/")
+AND NOT (
+  (payload.destination.ip >= "127.0.0.0" AND payload.destination.ip <= "127.255.255.255")
+  OR (payload.destination.ip >= "10.0.0.0" AND payload.destination.ip <= "10.255.255.255")
+  OR (payload.destination.ip >= "172.16.0.0" AND payload.destination.ip <= "172.31.255.255")
+  OR (payload.destination.ip >= "192.168.0.0" AND payload.destination.ip <= "192.168.255.255")
+  OR (payload.destination.ip >= "169.254.0.0" AND payload.destination.ip <= "169.254.255.255")
+  OR (payload.destination.ip >= "224.0.0.0" AND payload.destination.ip <= "239.255.255.255")
+  OR payload.destination.ip == "255.255.255.255"
+  OR payload.destination.ip == "0.0.0.0"
+  OR payload.destination.ip == "::1"
+  OR payload.destination.ip == "::"
+  OR (payload.destination.ip >= "::ffff:127.0.0.0" AND payload.destination.ip <= "::ffff:127.255.255.255")
+  OR (payload.destination.ip >= "::ffff:10.0.0.0" AND payload.destination.ip <= "::ffff:10.255.255.255")
+  OR (payload.destination.ip >= "::ffff:172.16.0.0" AND payload.destination.ip <= "::ffff:172.31.255.255")
+  OR (payload.destination.ip >= "::ffff:192.168.0.0" AND payload.destination.ip <= "::ffff:192.168.255.255")
+  OR (payload.destination.ip >= "fc00::" AND payload.destination.ip <= "fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")
+  OR (payload.destination.ip >= "fe80::" AND payload.destination.ip <= "febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff")
+  OR (payload.destination.ip >= "ff00::" AND payload.destination.ip <= "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")
+)
+'''
+
+[[rules]]
+name = "RoboDR: Reverse tunnel client executed on robot"
+type = "Exec"
+category = "command_and_control"
+severity = "high"
+description = "A reverse-tunnel or exposure client was executed: frpc/frps, cloudflared, bore, rathole, inlets, npc (nps client), zrok or autossh. These publish a port of the robot (SSH, the DDS bridge, a web UI) on an outside relay, which is what the Go1 remote-tunnel backdoor did and what an attacker installs after UniPwn. Pulsar's own rules already cover ngrok, chisel, gost, iodine, dnscat and similar; they are not repeated here."
+condition = '''
+payload.filename ENDS_WITH "/frpc" OR payload.filename ENDS_WITH "/frps" OR payload.filename ENDS_WITH "/cloudflared"
+OR payload.filename ENDS_WITH "/bore" OR payload.filename ENDS_WITH "/rathole" OR payload.filename ENDS_WITH "/inlets"
+OR payload.filename ENDS_WITH "/npc" OR payload.filename ENDS_WITH "/zrok" OR payload.filename ENDS_WITH "/autossh"
+'''
+
+[[rules]]
+name = "RoboDR: SSH reverse or dynamic tunnel with bundled options"
+type = "Exec"
+category = "command_and_control"
+severity = "high"
+description = "ssh was started with -R (remote forward) or -D (SOCKS) bundled with other short options ('-NR', '-fNR', '-NfD', ...), or Dropbear's client dbclient was started with -R or -D in any of these forms. Pulsar's 'SSH with suspicious arguments' rule only matches the separate '-R'/'-D' element and only for ssh; bundling is the usual form in persistence scripts ('ssh -fNR 2222:localhost:22 relay'). The attached form '-R2222:localhost:22' is a KNOWN GAP (argv elements match whole)."
+condition = '''
+(
+  payload.filename ENDS_WITH "/ssh"
+  AND (
+    payload.argv CONTAINS "-NR" OR payload.argv CONTAINS "-RN" OR payload.argv CONTAINS "-fR" OR payload.argv CONTAINS "-Rf"
+    OR payload.argv CONTAINS "-fNR" OR payload.argv CONTAINS "-NfR" OR payload.argv CONTAINS "-nNR" OR payload.argv CONTAINS "-NTR"
+    OR payload.argv CONTAINS "-TNR" OR payload.argv CONTAINS "-fNTR" OR payload.argv CONTAINS "-fTNR"
+    OR payload.argv CONTAINS "-ND" OR payload.argv CONTAINS "-DN" OR payload.argv CONTAINS "-fD" OR payload.argv CONTAINS "-Df"
+    OR payload.argv CONTAINS "-fND" OR payload.argv CONTAINS "-NfD" OR payload.argv CONTAINS "-nND" OR payload.argv CONTAINS "-NTD"
+    OR payload.argv CONTAINS "-TND" OR payload.argv CONTAINS "-fNTD"
+  )
+)
+OR (
+  payload.filename ENDS_WITH "/dbclient"
+  AND (
+    payload.argv CONTAINS "-R" OR payload.argv CONTAINS "-D"
+    OR payload.argv CONTAINS "-NR" OR payload.argv CONTAINS "-fR" OR payload.argv CONTAINS "-fNR" OR payload.argv CONTAINS "-NfR"
+    OR payload.argv CONTAINS "-ND" OR payload.argv CONTAINS "-fD" OR payload.argv CONTAINS "-fND" OR payload.argv CONTAINS "-NfD"
+  )
+)
+'''
+
+[[rules]]
+name = "RoboDR: Remote-access overlay VPN started on robot"
+type = "Exec"
+category = "command_and_control"
+severity = "medium"
+description = "An overlay-VPN client or daemon was started (tailscale/tailscaled, zerotier-one/zerotier-cli, openvpn, wg-quick). Each gives the robot an outbound-established path that bypasses the cell boundary and any in-path gateway, and they are a convenient persistent backdoor after UniPwn. A fleet that manages robots through one of them should remove that tool from this rule at commissioning (TUNE) and allowlist its relay addresses in the outbound rule instead."
+condition = '''
+payload.filename ENDS_WITH "/tailscale" OR payload.filename ENDS_WITH "/tailscaled"
+OR payload.filename ENDS_WITH "/zerotier-one" OR payload.filename ENDS_WITH "/zerotier-cli"
+OR payload.filename ENDS_WITH "/openvpn" OR payload.filename ENDS_WITH "/wg-quick"
+'''
+
+[[rules]]
+name = "RoboDR: Unitree DDS configuration modified"
+type = "FileOpened"
+category = "defense_evasion"
+severity = "high"
+description = "A Cyclone DDS configuration file (any name ending in cyclonedds.xml, the convention used by unitree_ros2 and by CYCLONEDDS_URI=file://...) or a unitree_ros2 environment script that sets CYCLONEDDS_URI (setup.sh, setup_local.sh, setup_default.sh) was opened for writing by something other than dpkg (exact image). The DDS configuration chooses the network interface, peers, discovery and DDS Security settings of every SDK2 / ROS 2 program on the robot: changing it moves control traffic to an attacker's interface or peer, or switches security off. Commissioning edits fire (the audit trail). A CYCLONEDDS_URI file with another name is a KNOWN GAP until added here (TUNE); inline XML in the variable itself is not visible (Pulsar does not capture the environment)."
+condition = '''
+(payload.filename ENDS_WITH "cyclonedds.xml"
+ OR payload.filename ENDS_WITH "/unitree_ros2/setup.sh" OR payload.filename ENDS_WITH "/unitree_ros2/setup_local.sh"
+ OR payload.filename ENDS_WITH "/unitree_ros2/setup_default.sh")
+AND (payload.flags CONTAINS "O_WRONLY" OR payload.flags CONTAINS "O_RDWR")
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
+'''
+
+[[rules]]
+name = "RoboDR: Unitree DDS configuration moved into place"
+type = "FileRename"
+category = "defense_evasion"
+severity = "high"
+description = "A Cyclone DDS configuration file (*cyclonedds.xml) or a unitree_ros2 environment script (setup.sh, setup_local.sh, setup_default.sh) was replaced by rename, by something other than dpkg (exact image): the atomic form of the DDS configuration change, as editors and 'sed -i' do it."
+condition = '''
+(payload.destination ENDS_WITH "cyclonedds.xml"
+ OR payload.destination ENDS_WITH "/unitree_ros2/setup.sh" OR payload.destination ENDS_WITH "/unitree_ros2/setup_local.sh"
+ OR payload.destination ENDS_WITH "/unitree_ros2/setup_default.sh")
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
+'''
+
+[[rules]]
+name = "RoboDR: Unitree SDK or Cyclone DDS library modified outside the package manager"
+type = "FileOpened"
+category = "persistence"
+severity = "high"
+description = "A Unitree SDK library (libunitree_sdk2*, libunitree_legged_sdk*, a native .so inside unitree_sdk2py), a Cyclone DDS runtime library (libddsc.so*, libddscxx.so*) or anything under the SDK install prefix /opt/unitree_robotics/ was opened for writing by something other than dpkg (exact image). Every SDK2 program loads libddsc/libddscxx and links libunitree_sdk2; a trojaned copy sees and can forge every rt/lowcmd frame. Rebuilding or 'make install' of the SDK or Cyclone DDS on the unit, a 'git pull' of the SDK tree, and 'pip install cyclonedds' fire (dev and commissioning activity: the audit trail). Debian-packaged copies (ros-<distro>-cyclonedds under /opt/ros) are written by dpkg and excluded."
+condition = '''
+(payload.filename CONTAINS "/libunitree_sdk2" OR payload.filename CONTAINS "/libunitree_legged_sdk"
+ OR payload.filename CONTAINS "/libddsc.so" OR payload.filename CONTAINS "/libddscxx.so"
+ OR payload.filename STARTS_WITH "/opt/unitree_robotics/"
+ OR (payload.filename CONTAINS "/unitree_sdk2py/" AND payload.filename ENDS_WITH ".so"))
+AND (payload.flags CONTAINS "O_WRONLY" OR payload.flags CONTAINS "O_RDWR")
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
+'''
+
+[[rules]]
+name = "RoboDR: Unitree SDK or Cyclone DDS library moved into place outside the package manager"
+type = "FileRename"
+category = "persistence"
+severity = "high"
+description = "A file was renamed onto a Unitree SDK library name, a Cyclone DDS runtime library name, a native .so inside unitree_sdk2py, or into /opt/unitree_robotics/, by something other than dpkg (exact image): the atomic replacement of a library that every SDK2 program loads."
+condition = '''
+(payload.destination CONTAINS "/libunitree_sdk2" OR payload.destination CONTAINS "/libunitree_legged_sdk"
+ OR payload.destination CONTAINS "/libddsc.so" OR payload.destination CONTAINS "/libddscxx.so"
+ OR payload.destination STARTS_WITH "/opt/unitree_robotics/"
+ OR (payload.destination CONTAINS "/unitree_sdk2py/" AND payload.destination ENDS_WITH ".so"))
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
+'''
+
+[[rules]]
+name = "RoboDR: Unitree SDK or Cyclone DDS library linked outside the package manager"
+type = "FileLink"
+category = "persistence"
+severity = "high"
+description = "A hard or symbolic link was created with a Unitree SDK or Cyclone DDS library name, or inside /opt/unitree_robotics/, by something other than dpkg (exact image). 'libddsc.so.0 -> /home/x/hook.so' makes every SDK2 program load the hook with no write to the real library. ldconfig (exact images) creating its soname symlinks is excluded only for symlinks to a bare file name in the same directory, as in runtime_hooking.toml. 'make install' of the SDK or Cyclone DDS creates its version links and fires (commissioning audit trail). Pulsar FileLink: 'source' is the new link, 'destination' the target."
+condition = '''
+(payload.source CONTAINS "/libunitree_sdk2" OR payload.source CONTAINS "/libunitree_legged_sdk"
+ OR payload.source CONTAINS "/libddsc.so" OR payload.source CONTAINS "/libddscxx.so"
+ OR payload.source STARTS_WITH "/opt/unitree_robotics/")
+AND NOT (header.image == "/usr/bin/dpkg" OR header.image == "/bin/dpkg")
+AND NOT (
+  payload.hard_link == "false"
+  AND NOT payload.destination CONTAINS "/"
+  AND (header.image == "/sbin/ldconfig.real" OR header.image == "/usr/sbin/ldconfig.real"
+       OR header.image == "/sbin/ldconfig" OR header.image == "/usr/sbin/ldconfig")
+)
+'''

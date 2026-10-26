@@ -3073,6 +3073,271 @@
      }
     }
    ]
+  },
+  {
+   "scenario": "Unitree EDU computer (SDK2 program, DDS config read, bluetoothd pairing, bluez upgrade, NTP, owner Wi-Fi re-provisioning)",
+   "events": [
+    {
+     "note": "SDK2 C++ example started on the EDU computer (synthetic home dir)",
+     "type": "Exec",
+     "header": {
+      "image": "/home/unitree/unitree_sdk2/build/bin/go2_sport_client",
+      "uid": 1000,
+      "parent_pid": 2001
+     },
+     "payload": {
+      "filename": "/home/unitree/unitree_sdk2/build/bin/go2_sport_client",
+      "argc": 2,
+      "argv": [
+       "/home/unitree/unitree_sdk2/build/bin/go2_sport_client",
+       "eth0"
+      ]
+     }
+    },
+    {
+     "note": "SDK2 program loads the bundled Cyclone DDS runtime",
+     "type": "FileOpened",
+     "header": {
+      "image": "/home/unitree/unitree_sdk2/build/bin/go2_sport_client",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/home/unitree/unitree_sdk2/thirdparty/lib/aarch64/libddsc.so.0",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "SDK2 program reads the DDS configuration (CYCLONEDDS_URI=file://...)",
+     "type": "FileOpened",
+     "header": {
+      "image": "/home/unitree/unitree_sdk2/build/bin/go2_sport_client",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/home/unitree/unitree_ros2/cyclonedds_ws/src/cyclonedds.xml",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "SPDP multicast on the robot LAN",
+     "type": "Connect",
+     "header": {
+      "image": "/home/unitree/unitree_sdk2/build/bin/go2_sport_client",
+      "uid": 1000
+     },
+     "payload": {
+      "destination": {
+       "ip": "239.255.0.1",
+       "port": 7400
+      },
+      "is_tcp": false
+     }
+    },
+    {
+     "note": "unicast DDS to the motion controller on 192.168.123.0/24",
+     "type": "Connect",
+     "header": {
+      "image": "/home/unitree/unitree_sdk2/build/bin/go2_sport_client",
+      "uid": 1000
+     },
+     "payload": {
+      "destination": {
+       "ip": "192.168.123.161",
+       "port": 7410
+      },
+      "is_tcp": false
+     }
+    },
+    {
+     "note": "unicast DDS on loopback",
+     "type": "Connect",
+     "header": {
+      "image": "/home/unitree/unitree_sdk2/build/bin/go2_sport_client",
+      "uid": 1000
+     },
+     "payload": {
+      "destination": {
+       "ip": "127.0.0.1",
+       "port": 7412
+      },
+      "is_tcp": false
+     }
+    },
+    {
+     "note": "colcon build of unitree_go messages (linker output)",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/aarch64-linux-gnu-ld.bfd",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/home/unitree/unitree_ros2/cyclonedds_ws/build/unitree_go/libunitree_go__rosidl_typesupport_c.so",
+      "flags": [
+       "O_RDWR",
+       "O_CREAT",
+       "O_TRUNC"
+      ]
+     }
+    },
+    {
+     "note": "bluetoothd starts (systemd bluetooth.service)",
+     "type": "Exec",
+     "header": {
+      "image": "/usr/lib/bluetooth/bluetoothd",
+      "parent_pid": 1
+     },
+     "payload": {
+      "filename": "/usr/lib/bluetooth/bluetoothd",
+      "argc": 1,
+      "argv": [
+       "/usr/lib/bluetooth/bluetoothd"
+      ]
+     }
+    },
+    {
+     "note": "bluetoothd reads its configuration",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/lib/bluetooth/bluetoothd"
+     },
+     "payload": {
+      "filename": "/etc/bluetooth/main.conf",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "bluetoothd saves a bond after owner pairing (temp file)",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/lib/bluetooth/bluetoothd"
+     },
+     "payload": {
+      "filename": "/var/lib/bluetooth/00:00:5E:00:53:01/00:00:5E:00:53:02/info.QW12ER",
+      "flags": [
+       "O_RDWR",
+       "O_CREAT",
+       "O_EXCL"
+      ]
+     }
+    },
+    {
+     "note": "bluetoothd atomic rename of the bond file",
+     "type": "FileRename",
+     "header": {
+      "image": "/usr/lib/bluetooth/bluetoothd"
+     },
+     "payload": {
+      "source": "/var/lib/bluetooth/00:00:5E:00:53:01/00:00:5E:00:53:02/info.QW12ER",
+      "destination": "/var/lib/bluetooth/00:00:5E:00:53:01/00:00:5E:00:53:02/info"
+     }
+    },
+    {
+     "note": "chronyd queries a public NTP server (not a Unitree process)",
+     "type": "Connect",
+     "header": {
+      "image": "/usr/sbin/chronyd",
+      "uid": 110
+     },
+     "payload": {
+      "destination": {
+       "ip": "203.0.113.10",
+       "port": 123
+      },
+      "is_tcp": false
+     }
+    },
+    {
+     "note": "PID 1 reads an installed unit",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/lib/systemd/systemd"
+     },
+     "payload": {
+      "filename": "/usr/lib/systemd/system/bluetooth.service",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "apt upgrade of bluez: dpkg writes the unit",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "filename": "/usr/lib/systemd/system/bluetooth.service.dpkg-new",
+      "flags": [
+       "O_WRONLY",
+       "O_CREAT",
+       "O_EXCL"
+      ]
+     }
+    },
+    {
+     "note": "apt upgrade of bluez: dpkg renames the unit",
+     "type": "FileRename",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "source": "/usr/lib/systemd/system/bluetooth.service.dpkg-new",
+      "destination": "/usr/lib/systemd/system/bluetooth.service"
+     }
+    },
+    {
+     "note": "apt upgrade of bluez: postinst enables the unit through deb-systemd-helper",
+     "type": "FileLink",
+     "header": {
+      "image": "/usr/bin/deb-systemd-helper"
+     },
+     "payload": {
+      "source": "/etc/systemd/system/bluetooth.target.wants/bluetooth.service",
+      "destination": "/lib/systemd/system/bluetooth.service",
+      "hard_link": false
+     }
+    },
+    {
+     "note": "ldconfig soname link for a Cyclone DDS installed in /usr/local/lib at commissioning",
+     "type": "FileLink",
+     "header": {
+      "image": "/sbin/ldconfig.real"
+     },
+     "payload": {
+      "source": "/usr/local/lib/libddsc.so.0",
+      "destination": "libddsc.so.0.10.5",
+      "hard_link": false
+     }
+    },
+    {
+     "note": "owner re-provisions Wi-Fi from the app over BLE: the provisioning script runs (synthetic directory)",
+     "type": "Exec",
+     "header": {
+      "image": "/opt/vendor/wifi/wpa_supplicant_restart.sh",
+      "parent_pid": 2100
+     },
+     "payload": {
+      "filename": "/opt/vendor/wifi/wpa_supplicant_restart.sh",
+      "argc": 4,
+      "argv": [
+       "/bin/sh",
+       "/opt/vendor/wifi/wpa_supplicant_restart.sh",
+       "lab-ssid",
+       "lab-psk"
+      ]
+     },
+     "allow": [
+      "RoboDR: Unitree Wi-Fi provisioning script executed"
+     ],
+     "reason": "Audit trail by design: every run of the provisioning script is recorded, because the UniPwn injection rides on exactly this call and Pulsar cannot tell the two apart (no parent image, argv matched per whole element)."
+    }
+   ]
   }
  ]
 }
