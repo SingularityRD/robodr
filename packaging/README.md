@@ -45,6 +45,7 @@ The units, tmpfiles and sysusers fragments were checked with
 | `robodr-agentd` | systemd service, user `robodr`, `CAP_NET_RAW` only | long-running decision chain; needs nothing else |
 | `robodr-commission` | **not a service**: run by an operator, as needed | commissioning is a deliberate, human-reviewed act (learn, sign off, lock). A timer or unit that re-learns a profile automatically would let an attacker who is present during learning become "normal". |
 | `robodr-replay`, `robodr-ros2-watch` | operator tools | offline analysis and lab replay |
+| `robodr-enroll` | **not a service**: root-only operator tool (`/usr/sbin`) | enrollment, key rotation, revocation lists, SOC profiles and ring information (OPERATIONS 8.6); every step is a deliberate operator act, nothing is applied by the SOC on its own |
 | `robodr-anchor-receiver` | systemd service on a **base station**, dynamic user, no capabilities; never enabled on a robot | holds the robots' black-box head marks off the robots |
 | `robodr-spool-export` | systemd service (`User=robodr`, no network, no capabilities) on the **unit or sensor box** of a diode site | loops on agentd's spool and writes signed diode batches; the transfer to the diode is the site's procedure |
 | `robodr-kafka-publish` | systemd service (`User=robodr`, brokers only) on the **unit or sensor box** of a connected site; on a diode site it runs on the **SOC (high) side** after `robodr-diode-unpack`, from the SOC's own unit or procedure (`--diode-out`) | publishes findings to Kafka; one consumer per spool, so it conflicts with `robodr-spool-export` and `robodr-uplink` |
@@ -107,10 +108,13 @@ Neither watchdog has been exercised under a real systemd yet.
 ├── agentd.json                  0640 root:robodr   robodr-agentd config (operator-created)
 ├── profile.json                 0640 root:robodr   LOCKED model profile (from robodr-commission)
 ├── response-policy.json         0640 root:robodr   response policy (operator-created)
+├── fleet.json                   0644 root:root     robodr-enroll config (operator-created)
+├── fleet-soc.pub                0644 root:root     SOC fleet public key (vetted media)
 └── keys/                        0700 root:root     key material, root only
     ├── agentd-blackbox.key      0600 root:root     black-box key of robodr-agentd
     ├── agentd-finding.key       0600 root:root     optional per-finding signing key (drop-in 20-finding-key)
     ├── executor.key             0600 root:root     agentd <-> robodr-executor protocol key (unit + drop-in 30-executor)
+    ├── uplink.key               0600 root:root     uplink key (robodr-uplink, fleet API requests; robodr-enroll)
     ├── pulsard-blackbox.key     0600 root:root     (when the Pulsar module records)
     └── retired/                 0700 root:root     rotated keys kept for verification
 /var/lib/robodr/                 0750 root:robodr
@@ -126,11 +130,13 @@ Neither watchdog has been exercised under a real systemd yet.
 ├── export/                      0750 root:robodr   bundles staged for the diode / media
 ├── archive/                     0750 root:robodr   black boxes closed by a key rotation
 ├── executor/                    0700 robodr-exec:robodr journal of robodr-executor (active actions, TTL deadlines)
+├── fleet/                       0700 root:root     robodr-enroll state, staged profile, fleet journal (black box)
 └── releases/<version>/          0750 root:root     .deb kept for rollback (install-bundle.sh)
 /run/robodr-pulsard/pulsar.sock                     Pulsar API socket (RuntimeDirectory)
 /run/robodr-executor/executor.sock                  agentd -> robodr-executor (0660 robodr-exec:robodr, dir 0750)
 /run/credentials/<unit>/blackbox.key                key copy for the service (systemd)
 /usr/share/robodr/rules/{robodr,pulsar}/            Pulsar rules, read-only
+/usr/share/robodr/formats                           black-box formats the release writes / reads (install-bundle.sh gate)
 ```
 
 `tmpfiles.d/robodr.conf` creates every directory and **resets** mode and owner

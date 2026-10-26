@@ -158,6 +158,10 @@ Registry fields (explicit; the vectors' `manifest.json` lists them):
 * **Rotation.** A robot may have more than one active key per role at a
   time (overlap during rotation); each authenticates independently until
   revoked.
+* **Fleet registration.** Keys are registered and rotated through the fleet
+  API ([`robodr.fleet-api.md`](robodr.fleet-api.md)), which also registers a
+  `blackbox` key per robot; a `blackbox` key (like a `finding` key)
+  authenticates no batch here (`401 unknown_key`).
 
 ## 4. Processing (consumer)
 
@@ -367,6 +371,9 @@ every request through a reference consumer of this text
 
 ## 10. Changelog
 
+* **v1 draft, 2026-10-26, fleet** (Sprint 9): §3 names the fleet API as
+  the registration path and its `blackbox` role (wrong role here, like
+  `finding`). No change to processing or vectors.
 * **v1 draft, 2026-10-26, review** (independent review of the producer and
   of the decisions entry below). Clarifications and one new line code; no
   change to the wire format of a valid request.

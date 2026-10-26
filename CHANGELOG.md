@@ -12,6 +12,48 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Added
 
+- Fleet lifecycle on the robot (Sprint 9): new crate `robodr-fleet`, binary
+  `robodr-enroll` (`/usr/sbin`, root-only, man page `robodr-enroll(8)`,
+  `config/fleet.example.json`, OPERATIONS 8.6). The SOC side is not built
+  yet; the new contract `docs/contracts/robodr.fleet-api.md` (draft v1) and
+  its deterministic vectors `docs/contracts/fixtures/fleet/` (generator,
+  byte-identical test, replay through a reference SOC) specify it.
+  - Enrollment with a single-use token signed by the SOC fleet key (robot
+    id, site, workspace, validity <= 7 days, 256-bit secret): the unit's
+    uplink, finding and black-box keys are generated on the unit (0600) and
+    registered by a request signed with the new uplink key and MAC'd with
+    the token secret (the token never leaves the unit); online over HTTPS
+    (robodr-uplink's client) or as files on vetted media (air-gapped).
+    Local checks: SOC signature, validity, workspace / robot / site binding,
+    local replay guard; the answer must match the request exactly.
+  - `rotate --role uplink|finding`: overlap (the old key stays valid until
+    the SOC confirms), atomic swap, old key kept in `retired/` until the
+    SOC retires it, then shredded; crash-safe journal (resumes at every
+    step; the crash points are tested); a key handover signed by both keys
+    over the fleet journal's head.
+  - Fleet journal: a robodr-blackbox chain signed with the black-box key
+    (`/var/lib/robodr/fleet/journal`) recording every lifecycle step.
+  - `revocations`: the root-signed revocation list from the SOC, verified
+    with robodr-commission against agentd's trust roots, rollback /
+    equivocation refused, installed atomically; warns when the active
+    profile would be refused.
+  - `profile publish | fetch | stage | approve`: SOC-published signed
+    profiles are verified with agentd's own trust inputs and staged, never
+    enforced; only an operator running `approve` with a SOC-signed approval
+    for this robot and digest (unexpired, single use) installs them.
+  - `ring`: update-ring information (0/1/2), information only.
+  - Fuzz targets `fleet_token` and `fleet_envelope` with std-only smoke
+    tests.
+- `install-bundle.sh`: black-box format gate on install and rollback (each
+  package ships `/usr/share/robodr/formats`; a release that cannot read a
+  segment on the unit is refused, naming it), `list` shows the formats each
+  kept release reads, `ring` prints the SOC ring information; tested against
+  the real `dpkg` (install -> upgrade -> rollback, refused rollback across a
+  format change) in `crates/robodr-fleet/tests/packaging.rs`.
+- `robodr-uplink`'s HTTPS transport takes a method and request target
+  (`HttpsTransport::request`, `Endpoint::parse_with_path`), shared with
+  `robodr-enroll`; ingest behaviour unchanged.
+
 - Executor v1 (`robodr-executor`, Sprint 7), **off by default**:
   reversible actions only.
   - `isolate_network` and `quarantine_node` are nftables rules in a

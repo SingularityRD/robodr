@@ -314,6 +314,59 @@ fn cli_air_gapped_files_and_usage() {
         rans.to_str().unwrap(),
     ]);
     assert_eq!(code(&o), 0, "{}", txt(&o));
+    // Profile with files: stage, a wrong approval, the genuine one.
+    let (prof, sig) = signed_profile(4, Some(ROBOT));
+    let pf = u.root.join("offer-profile.json");
+    std::fs::write(&pf, &prof).unwrap();
+    std::fs::write(u.root.join("offer-profile.json.sig"), &sig).unwrap();
+    let o = run(&[
+        "profile",
+        "stage",
+        "--config",
+        c,
+        "--profile",
+        pf.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 0, "{}", txt(&o));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("STAGED"));
+    assert!(!u.etc("profile.json").exists(), "staging never installs");
+    let digest = robodr_fleet::wire::digest(&prof);
+    let wrong = soc.approval("ap-x", ROBOT, PLATFORM, &digest, 5, &["op-a"], 600_000);
+    let wf = u.root.join("approval-wrong.json");
+    std::fs::write(&wf, wrong).unwrap();
+    let o = run(&[
+        "profile",
+        "approve",
+        "--config",
+        c,
+        "--approval",
+        wf.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 1, "{}", txt(&o));
+    assert!(!u.etc("profile.json").exists());
+    let good = soc.approval(
+        "ap-y",
+        ROBOT,
+        PLATFORM,
+        &digest,
+        4,
+        &["op-a", "op-b"],
+        600_000,
+    );
+    let gf = u.root.join("approval.json");
+    std::fs::write(&gf, good).unwrap();
+    let o = run(&[
+        "profile",
+        "approve",
+        "--config",
+        c,
+        "--approval",
+        gf.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 0, "{}", txt(&o));
+    assert_eq!(std::fs::read(u.etc("profile.json")).unwrap(), prof);
+    let o = run(&["profile", "status", "--config", c]);
+    assert!(String::from_utf8_lossy(&o.stdout).contains("no staged profile"));
     // Usage errors.
     for args in [
         vec!["rotate", "--config", c],
