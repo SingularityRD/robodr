@@ -270,7 +270,7 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
 | `pending` | accepted, recorded, handed to the executor; read the state again with GET | no |
 | `verified` | the executor applied it and the read-back of its nftables rules matched; it stays in force until revert or TTL (`state.expires_at_ms`) | no |
 | `reverted` | removed again: revert request, TTL expiry, restart reconciliation, or an operator's emergency disable (`nft delete table inet robodr`) | yes |
-| `refused` | the executor's own check refused it; nothing was applied. `refusal.code` is one of `not_executor_action` (`safe_pause`, `request_safe_state`, `rollback_config`: never executed), `fall_hazard`, `needs_approval`, `motion_path`, `no_management_channel`, `unsupported_target` (a `node` target, or a process), `safety_state_changed`, `safety_state_stale`, `safety_state_unavailable`, `safety_system_engaged`, `morphology_mismatch`, `observe_mode`, `already_active`, `ttl_out_of_range`, `replay`, `invalid_order`, `id_conflict`, or `executor_refused` for a code this agentd does not know | yes |
+| `refused` | the executor's own check refused it; nothing was applied. `refusal.code` is one of `not_executor_action` (`safe_pause`, `request_safe_state`, `rollback_config`: never executed), `fall_hazard`, `needs_approval`, `motion_path`, `locators_required` (agentd has not seen the participant's SPDP locators), `no_management_channel`, `unsupported_target` (a `node` target, or a process), `safety_state_changed`, `safety_state_stale`, `safety_state_unavailable` (also: judged or current state `unknown`), `safety_system_engaged`, `morphology_mismatch`, `observe_mode`, `operator_disabled` (an operator removed the executor's table: nothing is executed until it is re-armed on the robot), `config_unavailable`, `already_active`, `ttl_out_of_range`, `replay`, `invalid_order`, `id_conflict`, or `executor_refused` for a code this agentd does not know | yes |
 | `failed` | the executor was unreachable, its queue was full, or the apply did not verify and was rolled back (`state.error`); nothing is in force | yes |
 | `recorded_not_executed` | `restrict_motion` (advisory in v1: no motion gateway yet) | yes |
 
@@ -293,9 +293,14 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
   `pending` request.
 * **Evidence.** Each executor event (`applied`, `verified`, `refused`,
   `failed`, `reverted`, `expired`, `revert_failed`, `drift`,
-  `removed_externally`, `reconciled`) is a `robodr.executor_event` note.
-  `revert_failed`, `drift` and `removed_externally` are critical
+  `removed_externally`, `reconciled`, `journal_reset`, `held`, `rearmed`,
+  `journal_error`) is a `robodr.executor_event` note. `revert_failed`,
+  `drift`, `removed_externally` and `journal_reset` are critical
   (fsynced). `status.json` carries `executor` counters.
+* **Reboot.** After a reboot of the robot an action in force is held
+  (not installed) until the executor re-validated it and agentd supplied
+  a fresh safety state; the request keeps its status meanwhile (`verified`)
+  and turns `reverted` if it is not re-armed before its TTL.
 
 ## 7. HTTP errors
 

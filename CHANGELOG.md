@@ -47,8 +47,34 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
     - real nftables in network namespaces with UDP traffic between veth
       peers;
     - agentd end to end.
-  - Not yet: a High finding for a failed revert (needs a findings-contract
-    catalog bump) and SPDP locators from agentd.
+  - Not yet: a High finding for a failed revert or a journal reset
+    (needs a findings-contract catalog bump), and executor-side
+    verification of the SOC signature (after the control-plane v2 merge).
+- Executor v1 review fixes (each with a regression test that failed
+  first):
+  - A motion-path entry needs `cidr` and/or `interface`; `guid_prefix`
+    only narrows it (H1). Entries a quarantine may not cut are accepted
+    before any drop in every chain; `quarantine_node` needs the
+    participant's SPDP unicast locators (`locators_required`), each
+    outside those entries; agentd attaches them from the pipeline's
+    binding table or participant events (H2).
+  - Isolation keeps the robot's DDS discovery (`network.discovery`,
+    default 239.255.0.1, domain 0), IGMP / MLD, the DHCP / DHCPv6 client,
+    path MTU discovery and IPv6 router / neighbour discovery (H3, L5);
+    port rules match by direction (L2); fragments of protected flows pass
+    (M6).
+  - Server: housekeeping on its own thread, an absolute 5 s deadline per
+    message, at most 8 connections, nonces on the monotonic clock (M2,
+    L3). TTLs on CLOCK_BOOTTIME within a boot (L1).
+  - An operator's `nft delete table inet robodr` is honoured by every
+    path and refuses orders until `robodr-executor rearm` (M3); any
+    failed start and `ExecStopPost=robodr-executor stop-cleanup` delete
+    the table (M4); a revert is `reverted` only once journalled (M5).
+  - After a reboot actions are re-validated and held until a fresh
+    safety state (L4); `unknown` safety states refuse (L6); the policy
+    and configuration are re-read per order (L7); purge removes the
+    executor journal; a corrupt journal is a High notice (critical
+    `journal_reset` event, `executor.journal_resets`, status flag).
 - `robodr-uplink` (crate `robodr-export`): producer of the AutoSecOps ingest
   API (`docs/contracts/robodr.ingest-api.md`, contract v1). Inputs as
   `robodr-kafka-publish` (agentd spool on a connected unit or sensor box, or

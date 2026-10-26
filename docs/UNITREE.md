@@ -438,12 +438,20 @@ Rules for Unitree, all enforced in code:
 * **Never cut `rt/lowcmd` on a humanoid.** The balance loop of G1, H1, H2
   and R1 is a DDS writer of `rt/lowcmd` on the robot network
   (192.168.123.0/24). In `/etc/robodr/executor.json`, list that network
-  and the `rt/lowcmd` writer's GUID prefix in
-  `network.motion_control_path` with `"low_level": true`, as
-  `config/executor.unitree-g1.example.json` does:
+  (and, narrowed by its GUID prefix, the `rt/lowcmd` writer: a GUID
+  prefix always comes with the `cidr`) in `network.motion_control_path`
+  with `"low_level": true`, as `config/executor.unitree-g1.example.json`
+  does:
   * A `low_level` entry is never cut, whatever the response policy says.
-    Isolation keeps it open.
-  * A quarantine of a participant on it is refused (`motion_path`).
+    Isolation keeps it open, and it is accepted before any quarantine
+    drop, so no quarantine acts inside the robot network, even on
+    traffic that carries the quarantined GUID prefix.
+  * A quarantine of a participant whose SPDP locators lie on it (or that
+    agentd has no locators for) is refused (`motion_path`,
+    `locators_required`).
+  * During an isolation the robot's DDS discovery (SPDP to
+    239.255.0.1:7400/7401, IGMP) keeps working, so the motion stack does
+    not lose its peers.
 * **G1 example policy: nothing is executed.** `fall_safe_restrict` is
   empty, so on a humanoid both `isolate_network` and `quarantine_node` are
   refused (`fall_hazard`) before any rule is written. Even an OEM that

@@ -1215,8 +1215,8 @@ its own table `inet robodr`, plus an evidence mark:
 
 | Action | Effect | Lifted |
 |---|---|---|
-| `isolate_network` | everything dropped except loopback, the management and uplink allow-lists, the control buses (configurable) and the motion control path | on revert or TTL |
-| `quarantine_node` | one DDS participant dropped (by RTPS GUID prefix, and by its locators when known) | on revert or TTL |
+| `isolate_network` | everything dropped except loopback, the management and uplink allow-lists, the control buses (configurable), the motion control path, the robot's DDS discovery (SPDP multicast, IGMP), the DHCP client, path MTU discovery and IPv6 neighbour / router discovery | on revert or TTL |
+| `quarantine_node` | one DDS participant dropped (by RTPS GUID prefix and by its SPDP locators, which agentd must have seen and which must lie outside the motion control path; that path is never cut, even by traffic carrying the quarantined prefix) | on revert or TTL |
 | `record_evidence` | a signed black-box mark | never: evidence is not reverted |
 
 `restrict_motion` is recorded as advisory: there is no gateway yet. The
@@ -1257,14 +1257,25 @@ table.
    * `network.uplink`: the findings uplink (`robodr-uplink`'s ingest API).
    * `network.control_buses`: the robot's internal controller networks,
      kept open while `exempt` is `true` (the default).
-   * `network.motion_control_path`: every address, interface, UDP port
-     range or DDS participant (`guid_prefix`) that carries motion
-     commands. These entries are never cut. Mark the low-level / balance
-     loop `low_level: true`: it is never cut, whatever the policy says.
+   * `network.motion_control_path`: every address or interface (with an
+     optional UDP port range, the ports **as destination**, and an optional
+     DDS participant `guid_prefix` that narrows it) that carries motion
+     commands. Every entry needs `cidr` and/or `interface`: a GUID prefix
+     alone is refused (anyone can write it into an RTPS header). These
+     entries are never cut. Mark the low-level / balance loop
+     `low_level: true`: it is never cut, whatever the policy says, and no
+     quarantine is possible inside it. An entry with an interface and no
+     `cidr` blocks every quarantine (no locator can be proven outside it).
+   * `network.discovery`: the SPDP multicast groups and DDS domains kept
+     open during isolation (default `239.255.0.1`, domain 0: ports 7400
+     and 7401). List your `ROS_DOMAIN_ID`s.
    * `ttl.default_s` / `ttl.max_s`: every executed action is lifted at its
      TTL.
 4. Check the configuration:
    `robodr-executor --config /etc/robodr/executor.json --check-config`.
+   The running executor re-reads the configuration and the response
+   policy before every order (no reload needed); an unreadable or invalid
+   file refuses orders (`config_unavailable`) until it is fixed.
 5. Give agentd the key with the drop-in example
    `robodr-agentd.service.d/30-executor.conf.example` (section 6.4
    explains how drop-ins are installed). Then add to `agentd.json`:
@@ -1300,10 +1311,17 @@ in reach):
 nft delete table inet robodr
 ```
 
-The running executor detects the missing table within
-`verify_interval_s`. It drops every action as `removed_externally` and
-re-installs nothing, also not after a restart within the same boot. To
-keep it from acting again:
+The executor detects the missing table before its next transaction (a
+new order, a revert, a TTL expiry) or within `verify_interval_s`. It drops
+every action as `removed_externally`, re-installs nothing, also not after a
+restart within the same boot, and **refuses every order**
+(`operator_disabled`) until you re-arm it:
+
+```sh
+robodr-executor rearm --config /etc/robodr/executor.json --reason "<why>"
+```
+
+To keep it from acting at all:
 
 ```sh
 systemctl disable --now robodr-executor
@@ -1320,15 +1338,33 @@ robodr-executor revert-all --config /etc/robodr/executor.json --reason "<why>"
 ```
 
 After a reboot the kernel ruleset is empty. At the next start the
-executor re-applies the actions whose TTL has not expired, and reverts
-the expired ones.
+executor reverts the expired actions and **holds** the others: each is
+re-validated against the current configuration and policy (refused ones
+are reverted) and re-applied only once agentd's next event poll supplies
+a fresh, known safety state that is not engaged. A held action still
+expires at its deadline. TTLs run on CLOCK_BOOTTIME within a boot, so a
+wall-clock step (NTP at boot) neither extends nor shortens them.
+
+Any failed start (configuration, key, a journal write on a full disk, the
+socket) deletes the table before the process exits, and the unit's
+`ExecStopPost=robodr-executor stop-cleanup` does the same after every run
+that did not end in success, so a unit that gives up
+(`StartLimitBurst=`) leaves no rule without TTL enforcement. A revert on a
+full disk is reported `reverting` (never `reverted`) until the journal
+records it. Bridged traffic is isolated only with `br_netfilter` loaded
+(`net.bridge.bridge-nf-call-iptables=1`).
 
 **Watch.**
 
 * `status.json` `executor`: `verified`, `refused`, `failed`, `reverted`,
-  `revert_failures`, `unreachable`, `queue_full`, `dropped_unrecorded`.
-* The black-box notes `robodr.executor_event`. `revert_failed`, `drift`
-  and `removed_externally` are critical.
+  `revert_failures`, `unreachable`, `queue_full`, `dropped_unrecorded`,
+  `journal_resets`.
+* The black-box notes `robodr.executor_event`. `revert_failed`, `drift`,
+  `removed_externally` and `journal_reset` are critical. A
+  `journal_reset` (detail `HIGH: ...`) means the executor found its
+  journal unreadable, deleted its table and lost the history: treat it
+  as High, find the cause, and acknowledge it with `rearm` (the flag
+  `journal_reset_ms` stays in `robodr-executor status` until then).
 * `robodr-executor status --config /etc/robodr/executor.json`: the journal
   of active actions, their deadlines, history and events.
 * `journalctl -u robodr-executor`.

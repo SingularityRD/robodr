@@ -366,7 +366,8 @@ sprint, AC'leri karşılanmadan kapanmaz.
 >   (`planner_orders`) yürütücüye gider. Durumlar: `pending` → `verified` /
 >   `refused` / `failed` → `reverted` (sözleşme §6a).
 > - ✅ Testler:
->   - karar matrisi (7×7×7×2×4×2);
+>   - karar matrisi (v1: 7×7×7×2×4×2 = 5 488 durum; inceleme sonrası
+>     ×4 hedef ×4 hareket yolu ×2 profil kilidi ×3 TTL = 526 848);
 >   - gerçek nftables ve network namespace'lerde veth eşleri arasında UDP
 >     trafiği: izolasyon, GUID / locator karantinası, tam revert, TTL,
 >     restart / reboot, apply ile journal arasında çökme, yabancı tablolara
@@ -377,8 +378,37 @@ sprint, AC'leri karşılanmadan kapanmaz.
 >   ve SOC ile birlikte yapılmalı). Şimdilik sinyal yolları: istek durumu,
 >   kritik `robodr.executor_event` notu ve `status.json`
 >   `executor.revert_failures`.
-> - ❌ agentd henüz SPDP locator'larını iletmiyor; v1 GUID ile karantinaya
->   alıyor. `node` hedefi reddediliyor.
+> - ✅ Bağımsız inceleme (executor v1, 0499a47..356224f) bulguları
+>   kapatıldı, her biri önce başarısız olan bir regresyon testiyle:
+>   - H1: GUID-only korumalı girdi yasak (cidr ve/veya interface şart; GUID
+>     yalnızca daraltır), renderer eski journal'daki GUID-only girdiyi
+>     yok sayar;
+>   - H2: kesilemeyen hareket yolu girdileri her zincirde tüm drop'lardan
+>     önce kabul edilir; karantina SPDP locator'ları ister ve her biri
+>     kesilemeyen her girdinin dışında olmalı; agentd locator'ları
+>     pipeline'ın binding tablosundan (ya da participant olaylarından)
+>     iletir;
+>   - H3: izolasyonda robotun DDS keşfi (SPDP multicast, IGMP) açık kalır;
+>   - M2: mesaj başına mutlak süre, bağlantı sınırı, I/O'dan bağımsız TTL
+>     iş parçacığı; M3: operatörün tablo silmesi bir sonraki emir/revert
+>     ile geri alınmaz, `rearm`'a kadar emir reddedilir; M4: başarısız
+>     başlangıç ve başarısız koşu (`ExecStopPost=` `stop-cleanup`) tabloyu
+>     siler; M5: journal'a yazılamayan revert `reverted` bildirilmez; M6:
+>     korumalı akışların IP parçaları geçer;
+>   - L1 CLOCK_BOOTTIME TTL, L2 yöne duyarlı port kuralları, L3 monotonik
+>     nonce önbelleği, L4 reboot sonrası yeniden doğrulama + taze safety,
+>     purge journal'ı siler, L5 DHCP / PMTU / ND / MLD açık (belgelendi:
+>     br_netfilter, INFO_SRC), L6 `unknown` safety reddedilir, L7 politika
+>     her emirde yeniden okunur;
+>   - bozuk journal: High bildirim (kritik `journal_reset` olayı,
+>     `status.json` `executor.journal_resets`, `journal_reset_ms` bayrağı;
+>     uygun bir mevcut bulgu kimliği yok);
+>   - karar matrisi hedef, hareket yolu, profil kilidi ve TTL ile
+>     genişletildi: 526 848 durum (v1: 5 488).
+> - ⏳ M1 (güven sınırı): ele geçirilmiş bir agentd `human_approved`
+>   iddia edebilir; sınırları README "Trust boundary" bölümünde. SOC
+>   imzalı isteğin yürütücüye iletilip orada doğrulanması kontrol düzlemi
+>   v2 birleşmesinden sonra yapılacak.
 > - ⏳ Q / Kapı 2: tasarım ortağı robotunda kurulum, gerçek robotta
 >   uygula / geri al, 24 saat koşu. Unit henüz gerçek systemd altında
 >   çalıştırılmadı.
