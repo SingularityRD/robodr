@@ -111,6 +111,16 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     "robot.motion.invalid_feedback",
     "robot.motion.multiple_feedback_publishers",
     "robot.motion.inconsistent_feedback_stream",
+    // robodr-deliverd (secure delivery, Sprint 13b): spooled directly by the
+    // delivery agent, not through agentd's correlator; listed so rule files
+    // may name them and the drift test sees them.
+    "robot.deliver.installed",
+    "robot.deliver.deferred_safety",
+    "robot.deliver.health_failed",
+    "robot.deliver.rollback_blocked_floor",
+    "robot.deliver.refused",
+    "robot.deliver.stale",
+    "robot.deliver.chain_gap",
     // robodr-agentd self-health (always observe-only downstream)
     "robot.agent.input_silent",
     "robot.agent.input_ended",
