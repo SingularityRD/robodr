@@ -289,6 +289,10 @@ for j in $jobs; do
             --env "PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig"
             --subst "target/release=>target/$cross_triple/release"
             --subst "rustc -vV | sed -n 's/^host: //p'=>echo $cross_triple"
+            # A host tool, not a release binary: CARGO_BUILD_TARGET would
+            # make `cargo install` put an aarch64 cargo-cyclonedx into
+            # ~/.cargo/bin (the first dry run did exactly that).
+            --subst "cargo install =>env -u CARGO_BUILD_TARGET cargo install "
         )
     fi
     secrets=()
@@ -410,10 +414,12 @@ if [[ $rc_all == 0 && " $jobs " == *" publish "* ]]; then
     result PASS "tampered bundles and a foreign key are refused (any acceptance is listed as FAIL above)"
     # Install smoke test of every package.
     if "$here/deb-install-smoke.sh" "$assets"/*.deb >"$out/logs/deb-install-smoke.log" 2>&1; then
-        result PASS "deb-install-smoke: every .deb unpacks in a throwaway dpkg root, binaries run (--version/--help), units verify"
+        result PASS "deb-install-smoke: every .deb unpacks in a throwaway dpkg root, every binary starts, sysusers/tmpfiles apply, units verify"
     else
         result FAIL "deb-install-smoke (logs/deb-install-smoke.log)"
     fi
+    grep -E '^(== |   )' "$out/logs/deb-install-smoke.log" | sed 's/^/INFO  /' | tee -a "$report" >&2 || true
+    grep 'FINDING' "$out/logs/deb-install-smoke.log" | sed 's/^deb-install-smoke: /INFO  /' | tee -a "$report" >&2 || true
     cp -a "$assets" "$out/assets"
     cp "$rel/notes.md" "$out/assets/RELEASE-NOTES.md"
 fi
