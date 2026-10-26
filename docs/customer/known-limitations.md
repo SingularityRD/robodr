@@ -102,8 +102,13 @@
   robot.** Whether an older recorder can append to a chain written by a
   newer one is not verified ([`docs/OPERATIONS.md`](../OPERATIONS.md)
   section 7).
-- **No fleet management or console.** Updates and keys are handled per
-  robot. The secure-delivery design is not implemented
+- **No fleet management or console.** The robot side of the fleet
+  lifecycle exists (`robodr-enroll`: enrollment, uplink / finding key
+  rotation, revocation lists and SOC profiles,
+  [`docs/OPERATIONS.md`](../OPERATIONS.md) section 8.6), but the AutoSecOps
+  side of the fleet API does not exist yet, so updates and keys are still
+  handled per robot. Update rings are information only; the
+  secure-delivery design is not implemented
   ([`docs/SECURE-DELIVERY.md`](../SECURE-DELIVERY.md)).
 - **Debian 12 and Ubuntu 22.04 hosts** get the agentd-only package
   ([`support-matrix.md`](support-matrix.md)).

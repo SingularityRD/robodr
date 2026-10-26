@@ -2498,6 +2498,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "robodr-fleet"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "robodr-blackbox",
+ "robodr-commission",
+ "robodr-events",
+ "robodr-export",
+ "rustls",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "robodr-motion"
 version = "0.1.0-alpha.1"
 dependencies = [

@@ -1,0 +1,13 @@
+{
+  "format": "robodr-profile-revocations/v2",
+  "serial": 2,
+  "issued_at": 1790000000,
+  "platform": "ugv-x1",
+  "revoked_digests": [],
+  "revoked_keys": [],
+  "signature": {
+    "algorithm": "ed25519",
+    "key_id": "ed25519:acdd03f52b337b5e",
+    "signature_hex": "ded6c702c6b2694983ca8618a2791d8aee9dd127d1277e1012cf902445dd3dddca5a9fdc55f926ec4586c5a7069a38ccb0ed73e0b05e8e784ea6cf87f5bb6200"
+  }
+}

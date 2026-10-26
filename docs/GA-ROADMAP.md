@@ -483,6 +483,56 @@ sprint, AC'leri karşılanmadan kapanmaz.
 - **AC:** 50 sanal robot (Gazebo/konteyner) onboard + anahtar rotasyonu + güncelleme
   ve geri alma, veri kaybı yok.
 
+> **Durum (2026-10-26): robot tarafı (R, R/D) kodda tamam; SOC tarafı (A/F) ve
+> 50 robotluk AC açık.**
+>
+> - ✅ Yeni crate `robodr-fleet`, ikili `robodr-enroll` (`/usr/sbin`, yalnız
+>   root, man `robodr-enroll(8)`, OPERATIONS 8.6). Yeni sözleşme
+>   `docs/contracts/robodr.fleet-api.md` (taslak v1): enroll, anahtar
+>   rotate / retire, iptal listesi, profil draft / offer / onay, halka
+>   bilgisi. Deterministik test vektörleri `docs/contracts/fixtures/fleet/`
+>   (üreteç + bayt-özdeş test + referans SOC ile bağımsız tekrar);
+>   AutoSecOps tarafı bunlarla test edecek.
+> - ✅ Kayıt: SOC'un fleet anahtarıyla imzalı, tek kullanımlık token
+>   (robot, site, workspace, ≤ 7 gün, 256 bit gizli değer). Anahtarlar
+>   (uplink, finding, black-box) robotta üretilir, robottan çıkmaz; istek
+>   yeni uplink anahtarıyla imzalı ve token gizli değeriyle MAC'li (token
+>   ağa çıkmaz). Online (robodr-uplink'in TLS istemcisi, CA paketi + SPKI
+>   pin) veya air-gap için dosya.
+> - ✅ Rotasyon (`uplink`, `finding`): örtüşme (eski anahtar SOC onaylayana
+>   kadar geçerli), atomik takas, `retired/` ve onaydan sonra shred,
+>   çökmeye dayanıklı günlük (6 çökme noktası testli), fleet günlüğünde iki
+>   anahtarla imzalı devir kaydı (black-box zincirine bağlı). Black-box
+>   anahtarı bu araçla döndürülmez (OPERATIONS 4.3).
+> - ✅ İptal listesi (revocation v2) SOC'tan: kök imzası, platform,
+>   anti-rollback (seri / eşit seride farklı içerik reddi), atomik kurulum.
+> - ✅ Profil: SOC'un imzalı profili agentd'nin kendi güven girdileriyle
+>   doğrulanıp **sahnelenir**, asla kendiliğinden uygulanmaz; observe →
+>   enforce yalnız SOC imzalı, bu robota ve bu özete bağlı, süreli, tek
+>   kullanımlık onay belgesiyle ve robottaki operatörün komutuyla.
+> - ✅ Güncelleme: `install-bundle.sh` gerçek `dpkg` ile install → upgrade
+>   → rollback testi (ayrı dpkg kökü, stub paketler; ayrıca gerçek
+>   `build-deb.sh` / `make-bundle.sh` çıktısı). Kara kutu format kapısı:
+>   her paket `/usr/share/robodr/formats` taşır; okuyamadığı segment varsa
+>   kurulum / geri alma segment adıyla reddedilir. Halka 0/1/2 yalnız bilgi
+>   (`ring.env`); kurulum yereldir.
+> - ✅ Testler: birim + entegrasyon (süreç içi HTTPS SOC stub'ı), token
+>   tekrar / süre / workspace / robot / site, kurcalanmış token / cevap /
+>   profil, sahte SOC imzası, rollback denemeleri (profil, iptal listesi,
+>   halka, paket), air-gap dosya akışı, CLI çıkış kodları; `fleet_token` ve
+>   `fleet_envelope` fuzz hedefleri + smoke testleri.
+> - ✅ S10 politikası (birleştirmede): `robodr-fleet` `unsafe` deny (tek FFI
+>   `flock(2)`, yerel `allow` + `SAFETY`; fork penceresi için kısa yeniden
+>   deneme), ikili `forbid(unsafe_code)`; test dışı kodda `unwrap` /
+>   `expect` / `panic!` ailesi clippy ile yasak (serileştirme hataları
+>   artık `Result` olarak döner).
+> - ❌ A/F: AutoSecOps tarafı (UI'da robot ekle, token, `/robot-edr/v2/fleet/*`).
+>   Henüz gerçek SOC'a karşı çalıştırılmadı.
+> - ❌ Kara kutu anahtarı rotasyonu agentd'nin önceki anahtarları
+>   (`open_with_keys`) yüklemesini gerektirir; bugün OPERATIONS 4.3'teki
+>   zincir kapatma yolu.
+> - ⏳ AC: 50 sanal robot onboard + rotasyon + güncelleme / geri alma (Q).
+
 ### Sprint 10 — Sertleştirme
 
 - **R:** Elle yazılmış kriptoyu `sha2`/denetlenmiş crate'lere taşı; Reed-Solomon için

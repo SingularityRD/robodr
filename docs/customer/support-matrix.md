@@ -73,6 +73,7 @@ matrix". Deployment modes are in [`docs/UNITREE.md`](../UNITREE.md).
 | Item | Level | Notes |
 |---|---|---|
 | AutoSecOps ingest API (`robodr-uplink`) | V1 | Tested against an in-repository reference consumer and the shared vectors, and by hand against a Python TLS server. **The AutoSecOps side does not exist yet** (S3). |
+| Fleet API, robot side (`robodr-enroll`) | V1 | Enrollment, key rotation, revocation lists, SOC profiles, ring information; tested against an in-repository reference SOC over HTTPS and the shared vectors. **The AutoSecOps side does not exist yet** (S9). |
 | Kafka export (`robodr-kafka-publish`) | V2 | Single-node Apache Kafka 3.9.1 and 4.1.0. No TLS or SASL. Multi-broker behaviour tested only against a fake broker. |
 | Diode export and import | V1 | In-process and integration tests. No physical diode tested. |
 | Control-plane action API | V1 | In-process signing client over loopback. Executes nothing. No TLS. |

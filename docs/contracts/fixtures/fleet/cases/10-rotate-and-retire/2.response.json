@@ -1,0 +1,23 @@
+{
+  "body_file": "2.response.body",
+  "body_sha256": "bc143ec8b59d8c83488a977d1b5b5defaecfe737808dd2fd57d46c84cf1f4f7b",
+  "envelope": {
+    "payload": {
+      "at_ms": 1790000100000,
+      "format": "robodr-fleet-rotate-answer/v1",
+      "new_key_id": "ed25519:caf521a404f9a7bf",
+      "old_key_id": "ed25519:7bf642b114c6afa2",
+      "request_digest": "sha256:906b5280c25736c93f979b48b069b9dc4e4877eb2fa97643403b9ef3698dfb79",
+      "robot_id": "ugv-001",
+      "role": "uplink",
+      "rotation_id": "rfr1-01010101010101010101010101010101",
+      "status": "overlap",
+      "workspace": "ws-test-0001"
+    },
+    "signed_by": [
+      "ed25519:370ede82195fa32b"
+    ],
+    "type": "rotate-answer"
+  },
+  "status": 200
+}

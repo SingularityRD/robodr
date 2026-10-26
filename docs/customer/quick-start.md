@@ -42,11 +42,18 @@ site ([OPERATIONS section 2](../OPERATIONS.md)).
 
 ## 2. Robot or sensor box: install
 
+Verify the tarball **before** extracting it, then run the installer from
+the verified extraction (upgrades: from `/usr/lib/robodr/install-bundle.sh`,
+installed by the previous release). It installs from its own private copy
+of the signed tarball and refuses an extracted directory that was modified
+([OPERATIONS section 3](../OPERATIONS.md)).
+
 ```sh
-tar -xzf robodr-$V-$A-offline.tar.gz && cd robodr-$V-$A
-sudo ./install-bundle.sh install \
+minisign -V -p /etc/robodr-trust/robodr-release.pub -m robodr-$V-$A-offline.tar.gz
+sudo mkdir -m 0700 /root/robodr-$V && sudo tar -xzf robodr-$V-$A-offline.tar.gz -C /root/robodr-$V
+sudo sh /root/robodr-$V/robodr-$V-$A/install-bundle.sh install \
     --pubkey /etc/robodr-trust/robodr-release.pub \
-    --tarball ../robodr-$V-$A-offline.tar.gz
+    --tarball robodr-$V-$A-offline.tar.gz
 ```
 
 Units are installed **disabled**. Before installing, check the

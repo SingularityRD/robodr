@@ -1,0 +1,38 @@
+{
+  "body_file": "1.response.body",
+  "body_sha256": "5eedca232c7c8c1542a61a4468e5d86d8903263a178e10c8699f3594399aeae0",
+  "envelope": {
+    "payload": {
+      "enrolled_at_ms": 1790000060000,
+      "format": "robodr-fleet-enroll-answer/v1",
+      "keys": [
+        {
+          "fingerprint": "sha256:a3c761e56d55f45e06a31c3c7e32f79cfba417d3e2e2397767ef5a453f35ffe7",
+          "key_id": "ed25519:7bf642b114c6afa2",
+          "role": "uplink"
+        },
+        {
+          "fingerprint": "sha256:2d3bb9ef976d407955e4188df05c25f511cd1fe3c85fe70fc221c4d8f8e66261",
+          "key_id": "ed25519:bd1a186a203ad9e3",
+          "role": "finding"
+        },
+        {
+          "fingerprint": "sha256:2b61f0ec7a2b23523274ba3f5b0a4a9e66f75a1165e11ced25862d8a1692761d",
+          "key_id": "ed25519:3d2af05f349c1712",
+          "role": "blackbox"
+        }
+      ],
+      "request_digest": "sha256:de818b47a501b145bc68344e5584f850427f3eaabc437db5f6dcf8cb36cae073",
+      "request_id": "rfe1-04040404040404040404040404040404",
+      "robot_id": "ugv-001",
+      "site": null,
+      "token_id": "tok-3",
+      "workspace": "ws-test-0001"
+    },
+    "signed_by": [
+      "ed25519:370ede82195fa32b"
+    ],
+    "type": "enroll-answer"
+  },
+  "status": 200
+}

@@ -34,6 +34,8 @@
 #             head anchor, installed with its unit when built)
 #             robodr-firewall-gw (pure; in-path inline-bridge gateway for
 #             a sensor box, installed with its two units, never enabled)
+#             robodr-enroll (pure; fleet enrollment, key rotation, SOC
+#             profiles; usr/sbin, root-only tool, no unit)
 # A unit file is only installed together with its binary. ROBODR_DEB_REQUIRE
 # (space separated) makes optional binaries mandatory; the release workflow
 # sets it so a release can never silently ship without the daemon.
@@ -236,6 +238,17 @@ if [[ "$variant" == standard ]] && install_bin robodr-anchor-receiver usr/bin 0;
         "$pkg/$units/robodr-anchor-receiver.service"
 fi
 
+# Fleet lifecycle (Sprint 9): robodr-enroll and its configuration example.
+# (config/fleet.example.json goes to the examples with the other configs.)
+install_bin robodr-enroll usr/sbin 0 || true
+# A trusted copy of the bundle installer for the next upgrade: it verifies a
+# new tarball's signature and installs from a private extraction
+# (OPERATIONS.md section 3; never run the copy inside an unverified bundle).
+install -D -m 0755 "$here/install-bundle.sh" "$pkg/usr/lib/robodr/install-bundle.sh"
+# On-disk formats this release writes and reads (install-bundle.sh's
+# black-box format gate on install and rollback).
+install -D -m 0644 "$here/formats" "$pkg/usr/share/robodr/formats"
+
 install -D -m 0644 "$here/tmpfiles.d/robodr.conf" "$pkg/usr/lib/tmpfiles.d/robodr.conf"
 install -D -m 0644 "$here/sysusers.d/robodr.conf" "$pkg/usr/lib/sysusers.d/robodr.conf"
 
@@ -263,6 +276,11 @@ done
 # The control-plane contract (man robodr-agentd(8) points here).
 install -D -m 0644 "$root/docs/contracts/robodr.control-plane.md" \
     "$doc/contracts/robodr.control-plane.md"
+# The fleet contract (man robodr-enroll(8) points here), when the tool is in.
+if [[ -e "$pkg/usr/sbin/robodr-enroll" ]]; then
+    install -D -m 0644 "$root/docs/contracts/robodr.fleet-api.md" \
+        "$doc/contracts/robodr.fleet-api.md"
+fi
 install -m 0644 "$root/LICENSE" "$doc/copyright"
 install -d "$doc/licenses"
 for f in "$root"/LICENSES/*; do

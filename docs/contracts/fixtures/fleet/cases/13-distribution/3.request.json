@@ -1,0 +1,21 @@
+{
+  "body_file": "3.body",
+  "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "headers": [
+    [
+      "X-RoboDR-Key-Id",
+      "ed25519:7bf642b114c6afa2"
+    ],
+    [
+      "X-RoboDR-Timestamp",
+      "1790000060000"
+    ],
+    [
+      "X-RoboDR-Signature",
+      "826b78b9e0e3456569f317795b4f98f5734e6f82a28a6dc252d774c02cf1565350c9485d528f7ed82a59e63f64808992cfc2c082ff35ac201136d85e01196a0c"
+    ]
+  ],
+  "method": "GET",
+  "server_time_ms": 1790000060000,
+  "target": "/api/robot-edr/v2/fleet/revocations/other-x"
+}

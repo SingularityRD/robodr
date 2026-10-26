@@ -92,7 +92,11 @@ Limits:
   ([`docs/OPERATIONS.md`](../OPERATIONS.md) section 4);
 - legacy HMAC keys still load, with a warning.
 
-Planned: TPM sealing (S10) and enrolment and rotation from the SOC (S9).
+Robot side available, SOC side planned: enrolment with a single-use,
+SOC-signed token and rotation of the uplink and finding keys with the SOC
+(`robodr-enroll`, S9; keys are generated on the unit and never leave it;
+[`docs/OPERATIONS.md`](../OPERATIONS.md) section 8.6). Planned: TPM sealing
+(S10) and the AutoSecOps side of the fleet API.
 
 ## 5. Integrity and evidence
 

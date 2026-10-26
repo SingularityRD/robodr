@@ -1,0 +1,382 @@
+{
+  "approval_key": "keys/soc-approval.key.pub",
+  "base_path": "/api",
+  "cases": [
+    {
+      "description": "valid enrollment request (uplink-signed, token MAC) -> SOC-signed answer naming the request digest and the three keys",
+      "name": "01-enroll-ok",
+      "requests": [
+        "cases/01-enroll-ok/1"
+      ],
+      "setup": {
+        "tokens": [
+          "tokens/tok-1.txt"
+        ]
+      }
+    },
+    {
+      "description": "the same request again (lost answer): the stored answer, byte-identical",
+      "name": "02-enroll-retry",
+      "requests": [
+        "cases/02-enroll-retry/1",
+        "cases/02-enroll-retry/2"
+      ],
+      "setup": {
+        "tokens": [
+          "tokens/tok-1.txt"
+        ]
+      }
+    },
+    {
+      "description": "a second, different request (other request id) with a consumed token -> 409 token_used",
+      "name": "03-enroll-token-used",
+      "requests": [
+        "cases/03-enroll-token-used/1",
+        "cases/03-enroll-token-used/2"
+      ],
+      "setup": {
+        "tokens": [
+          "tokens/tok-1.txt"
+        ]
+      }
+    },
+    {
+      "description": "MAC under another nonce -> 401 bad_token; unknown token id -> 401 bad_token",
+      "name": "04-enroll-bad-token",
+      "requests": [
+        "cases/04-enroll-bad-token/1",
+        "cases/04-enroll-bad-token/2"
+      ],
+      "setup": {
+        "tokens": [
+          "tokens/tok-1.txt"
+        ]
+      }
+    },
+    {
+      "description": "valid request processed after the token expired (air-gapped import too late) -> 410 token_expired",
+      "name": "05-enroll-expired",
+      "requests": [
+        "cases/05-enroll-expired/1"
+      ],
+      "setup": {
+        "tokens": [
+          "tokens/tok-1.txt"
+        ]
+      }
+    },
+    {
+      "description": "request names another workspace than its token -> 403 workspace_mismatch; another robot -> 403 robot_mismatch; another site -> 403 robot_mismatch",
+      "name": "06-enroll-binding",
+      "requests": [
+        "cases/06-enroll-binding/1",
+        "cases/06-enroll-binding/2",
+        "cases/06-enroll-binding/3"
+      ],
+      "setup": {
+        "tokens": [
+          "tokens/tok-1.txt"
+        ]
+      }
+    },
+    {
+      "description": "request signed by its finding key instead of its uplink key -> 401 bad_signature",
+      "name": "07-enroll-bad-signature",
+      "requests": [
+        "cases/07-enroll-bad-signature/1"
+      ],
+      "setup": {
+        "tokens": [
+          "tokens/tok-1.txt"
+        ]
+      }
+    },
+    {
+      "description": "envelope without mac -> 400 bad_request; Content-Type text/plain -> 415; trailing garbage -> 400",
+      "name": "08-enroll-malformed",
+      "requests": [
+        "cases/08-enroll-malformed/1",
+        "cases/08-enroll-malformed/2",
+        "cases/08-enroll-malformed/3"
+      ],
+      "setup": {
+        "tokens": [
+          "tokens/tok-1.txt"
+        ]
+      }
+    },
+    {
+      "description": "ugv-002 enrolls with keys already registered to ugv-001 -> 409 key_conflict",
+      "name": "09-enroll-key-conflict",
+      "requests": [
+        "cases/09-enroll-key-conflict/1",
+        "cases/09-enroll-key-conflict/2"
+      ],
+      "setup": {
+        "tokens": [
+          "tokens/tok-1.txt",
+          "tokens/tok-2.txt"
+        ]
+      }
+    },
+    {
+      "description": "enroll; rotate the uplink key (request authenticated by the old key, signed by old then new) -> overlap; the new key authenticates; retire (authenticated and signed by the new key) -> retired; the old key no longer authenticates (401 unknown_key)",
+      "name": "10-rotate-and-retire",
+      "requests": [
+        "cases/10-rotate-and-retire/1",
+        "cases/10-rotate-and-retire/2",
+        "cases/10-rotate-and-retire/3",
+        "cases/10-rotate-and-retire/4",
+        "cases/10-rotate-and-retire/5",
+        "cases/10-rotate-and-retire/6"
+      ],
+      "setup": {
+        "tokens": [
+          "tokens/tok-1.txt"
+        ]
+      }
+    },
+    {
+      "description": "rotate signed by the old key only -> 401 bad_signature; valid rotate; the same again -> stored answer; another rotation of the role while one is open -> 409 rotation_in_progress; old key that is not the active one -> 409 stale_key",
+      "name": "11-rotate-refusals",
+      "requests": [
+        "cases/11-rotate-refusals/1",
+        "cases/11-rotate-refusals/2",
+        "cases/11-rotate-refusals/3",
+        "cases/11-rotate-refusals/4",
+        "cases/11-rotate-refusals/5",
+        "cases/11-rotate-refusals/6"
+      ],
+      "setup": {
+        "tokens": [
+          "tokens/tok-1.txt"
+        ]
+      }
+    },
+    {
+      "description": "GET ring: valid; timestamp 300001 ms off -> 401 stale_timestamp; signature for another path -> 401 bad_signature; finding key -> 401 unknown_key; X-RoboDR-Timestamp twice -> 400 bad_header; no auth headers -> 400 bad_header",
+      "name": "12-request-auth",
+      "requests": [
+        "cases/12-request-auth/1",
+        "cases/12-request-auth/2",
+        "cases/12-request-auth/3",
+        "cases/12-request-auth/4",
+        "cases/12-request-auth/5",
+        "cases/12-request-auth/6",
+        "cases/12-request-auth/7"
+      ],
+      "setup": {
+        "rings": {
+          "ugv-001": "cases/12-request-auth/setup/rings-ugv-001.body"
+        },
+        "tokens": [
+          "tokens/tok-1.txt"
+        ]
+      }
+    },
+    {
+      "description": "authenticated GETs: revocation list (verbatim, root-signed), unknown platform -> 404 no_list, profile offer, approval for the offered digest, unknown digest -> 404 no_approval, ring info; draft publish -> received; a locked profile as draft -> 400 invalid_profile",
+      "name": "13-distribution",
+      "requests": [
+        "cases/13-distribution/1",
+        "cases/13-distribution/2",
+        "cases/13-distribution/3",
+        "cases/13-distribution/4",
+        "cases/13-distribution/5",
+        "cases/13-distribution/6",
+        "cases/13-distribution/7",
+        "cases/13-distribution/8",
+        "cases/13-distribution/9"
+      ],
+      "setup": {
+        "approvals": {
+          "74f11807fc52af6b7b274348ebce77307bd2af34800e3bcdf4b62e2957c3f1c7": "cases/13-distribution/setup/approvals-74f11807fc52af6b7b274348ebce77307bd2af34800e3bcdf4b62e2957c3f1c7.body"
+        },
+        "offers": {
+          "ugv-001": "cases/13-distribution/setup/offers-ugv-001.body"
+        },
+        "revocations": {
+          "ugv-x1": "cases/13-distribution/setup/revocations-ugv-x1.body"
+        },
+        "rings": {
+          "ugv-001": "cases/13-distribution/setup/rings-ugv-001.body"
+        },
+        "tokens": [
+          "tokens/tok-1.txt"
+        ]
+      }
+    },
+    {
+      "description": "token without a site; the request carries site null -> answer with site null",
+      "name": "14-enroll-no-site",
+      "requests": [
+        "cases/14-enroll-no-site/1"
+      ],
+      "setup": {
+        "tokens": [
+          "tokens/tok-3.txt"
+        ]
+      }
+    },
+    {
+      "description": "proof of possession of every key: request signed by its uplink key only -> 401 bad_signature; signed by uplink, blackbox, finding (wrong order) -> 401 bad_signature; signed by the three keys in order -> 200",
+      "name": "15-enroll-possession",
+      "requests": [
+        "cases/15-enroll-possession/1",
+        "cases/15-enroll-possession/2",
+        "cases/15-enroll-possession/3"
+      ],
+      "setup": {
+        "tokens": [
+          "tokens/tok-1.txt"
+        ]
+      }
+    },
+    {
+      "description": "enroll; rotate (overlap); cancel signed by the new key -> 401 bad_signature; cancel authenticated by the new uplink key -> 401 wrong_key; cancel (signed and authenticated by the old key) -> cancelled, the new key retired; the same cancel again -> stored answer; the rotate request again -> 409 rotation_cancelled; the new key no longer authenticates (401 unknown_key); a new rotation -> overlap (the cancelled one is not in progress); cancel of a rotation the SOC never received -> cancelled; that rotate request arriving later -> 409 rotation_cancelled; retire of the open rotation -> retired; cancelling it now -> 409 already_retired",
+      "name": "16-rotate-cancel",
+      "requests": [
+        "cases/16-rotate-cancel/1",
+        "cases/16-rotate-cancel/2",
+        "cases/16-rotate-cancel/3",
+        "cases/16-rotate-cancel/4",
+        "cases/16-rotate-cancel/5",
+        "cases/16-rotate-cancel/6",
+        "cases/16-rotate-cancel/7",
+        "cases/16-rotate-cancel/8",
+        "cases/16-rotate-cancel/9",
+        "cases/16-rotate-cancel/10",
+        "cases/16-rotate-cancel/11",
+        "cases/16-rotate-cancel/12",
+        "cases/16-rotate-cancel/13"
+      ],
+      "setup": {
+        "rings": {
+          "ugv-001": "cases/16-rotate-cancel/setup/rings-ugv-001.body"
+        },
+        "tokens": [
+          "tokens/tok-1.txt"
+        ]
+      }
+    },
+    {
+      "description": "§5.1/§5.3 authentication of an uplink rotation: rotate authenticated by the finding key -> 401 unknown_key; rotate authenticated by the old uplink key -> overlap; the same rotate request authenticated by the new uplink key -> 401 wrong_key; retire authenticated by the old uplink key -> 401 wrong_key (the old key stays active); retire authenticated by the new uplink key -> retired",
+      "name": "17-rotate-auth-key",
+      "requests": [
+        "cases/17-rotate-auth-key/1",
+        "cases/17-rotate-auth-key/2",
+        "cases/17-rotate-auth-key/3",
+        "cases/17-rotate-auth-key/4",
+        "cases/17-rotate-auth-key/5",
+        "cases/17-rotate-auth-key/6"
+      ],
+      "setup": {
+        "tokens": [
+          "tokens/tok-1.txt"
+        ]
+      }
+    }
+  ],
+  "compare": "status; error bodies by code; 200 envelopes by type, signer list and decoded payload (JSON value equality; the committed body bytes are the reference's, Ed25519 is deterministic so an implementation serialising payloads as compact JSON in the contract's key order reproduces them exactly); other 200 bodies byte-exact (body_sha256)",
+  "contract": "robodr.fleet-api v1 (docs/contracts/robodr.fleet-api.md)",
+  "keys": [
+    {
+      "file": "keys/soc.key",
+      "key_id": "ed25519:370ede82195fa32b",
+      "robot": null,
+      "role": "soc"
+    },
+    {
+      "file": "keys/soc-approval.key",
+      "key_id": "ed25519:9e208c2e60b4f0a2",
+      "robot": null,
+      "role": "approval"
+    },
+    {
+      "file": "keys/ugv-001-uplink.key",
+      "key_id": "ed25519:7bf642b114c6afa2",
+      "robot": "ugv-001",
+      "role": "uplink"
+    },
+    {
+      "file": "keys/ugv-001-finding.key",
+      "key_id": "ed25519:bd1a186a203ad9e3",
+      "robot": "ugv-001",
+      "role": "finding"
+    },
+    {
+      "file": "keys/ugv-001-blackbox.key",
+      "key_id": "ed25519:3d2af05f349c1712",
+      "robot": "ugv-001",
+      "role": "blackbox"
+    },
+    {
+      "file": "keys/ugv-001-uplink-next.key",
+      "key_id": "ed25519:caf521a404f9a7bf",
+      "robot": "ugv-001",
+      "role": "uplink"
+    },
+    {
+      "file": "keys/ugv-001-uplink-next2.key",
+      "key_id": "ed25519:5229cc84fa78c5b4",
+      "robot": "ugv-001",
+      "role": "uplink"
+    },
+    {
+      "file": "keys/ugv-002-uplink.key",
+      "key_id": "ed25519:e316bb4369867f14",
+      "robot": "ugv-002",
+      "role": "uplink"
+    },
+    {
+      "file": "keys/ugv-002-finding.key",
+      "key_id": "ed25519:1b3ef3f0e5c90998",
+      "robot": "ugv-002",
+      "role": "finding"
+    },
+    {
+      "file": "keys/ugv-002-blackbox.key",
+      "key_id": "ed25519:9df9d6d8f83b54ba",
+      "robot": "ugv-002",
+      "role": "blackbox"
+    },
+    {
+      "file": "keys/profile-signer.key",
+      "key_id": "ed25519:a16e3ca100fe526c",
+      "robot": null,
+      "role": "profile"
+    },
+    {
+      "file": "keys/trust-root.key",
+      "key_id": "ed25519:acdd03f52b337b5e",
+      "robot": null,
+      "role": "root"
+    }
+  ],
+  "run": "each case starts from an empty workspace whose SOC fleet key is keys/soc.key and approval key keys/soc-approval.key (approvals are served verbatim); register the setup tokens (as issued: the token file), serve the setup publications verbatim (revocations by platform, offers and rings by robot, approvals by digest hex), then send the requests in order with the server clock at server_time_ms; target includes base_path",
+  "soc_key": "keys/soc.key.pub",
+  "tokens": [
+    {
+      "file": "tokens/tok-1.txt",
+      "nonce_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+      "robot": "ugv-001",
+      "site": "lab-1",
+      "token_id": "tok-1"
+    },
+    {
+      "file": "tokens/tok-2.txt",
+      "nonce_hex": "3434343434343434343434343434343434343434343434343434343434343434",
+      "robot": "ugv-002",
+      "site": "lab-1",
+      "token_id": "tok-2"
+    },
+    {
+      "file": "tokens/tok-3.txt",
+      "nonce_hex": "3535353535353535353535353535353535353535353535353535353535353535",
+      "robot": "ugv-001",
+      "site": null,
+      "token_id": "tok-3"
+    }
+  ],
+  "workspace": "ws-test-0001"
+}
