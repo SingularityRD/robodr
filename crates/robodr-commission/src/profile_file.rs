@@ -460,9 +460,13 @@ pub fn parse_profile_text(text: &str) -> Result<Profile, ProfileFileError> {
 pub fn sealed_text(profile: &Profile) -> Result<String, serde_json::Error> {
     let body = to_json(profile)?;
     let digest = sha256_hex(body.as_bytes());
-    let rest = body
-        .strip_prefix("{\n")
-        .expect("serde_json pretty output of a struct starts with \"{\\n\"");
+    // serde_json's pretty output of a struct always starts with "{\n";
+    // refuse rather than abort if that ever changes.
+    let rest = body.strip_prefix("{\n").ok_or_else(|| {
+        <serde_json::Error as serde::ser::Error>::custom(
+            "canonical profile JSON does not start with \"{\\n\"",
+        )
+    })?;
     Ok(format!("{SEAL_PREFIX}{digest}{SEAL_SUFFIX}{rest}"))
 }
 

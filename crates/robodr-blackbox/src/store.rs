@@ -1456,6 +1456,20 @@ fn closed_structure(name: &str, bytes: &[u8]) -> Result<Vec<Record>, (String, Se
     }
 }
 
+/// Open refuses a log in which an authentic record (or state file) already
+/// holds seq `u64::MAX`: continuing would reuse a sequence number.
+fn seq_space_exhausted(segment: &str, what: &str) -> Error {
+    Error::Corrupt {
+        segment: segment.to_string(),
+        offset: 0,
+        reason: format!(
+            "{what} holds sequence number {}: no sequence number is left to \
+             continue the chain without reusing one",
+            u64::MAX
+        ),
+    }
+}
+
 /// Bounded signature work on untrusted frames (a damaged segment, or the
 /// records after a hole in the active segment): at most this many from the
 /// top and from the bottom are checked.
@@ -2147,7 +2161,15 @@ impl Recorder {
         //    recorder's (quarantined as tamper below, never allowed to make
         //    the live segment look closed).
         let (segs, strays) = split_strays(segs)?;
-        let (last_idx, last_path) = segs.last().cloned().expect("non-empty");
+        // `open` only resumes a non-empty list and `split_strays` keeps at
+        // least one file; refuse rather than abort if that ever changes.
+        let Some((last_idx, last_path)) = segs.last().cloned() else {
+            return Err(Error::Corrupt {
+                segment: segment_file_name(0),
+                offset: 0,
+                reason: "no segment file to resume".into(),
+            });
+        };
         let last_name = segment_file_name(last_idx);
         let bytes = fs::read(&last_path)?;
         // 1. Structure, hashes and linkage of the active segment (no writes
@@ -2355,12 +2377,17 @@ impl Recorder {
                 None => None,
             };
             if let Some((s, prev)) = next {
-                let l = closed[ci].records.last().expect("non-empty");
-                if prev != l.hash || s <= l.seq {
+                // `closed_structure` accepts no empty closed segment; treat
+                // one as damage rather than abort if that ever changes.
+                let Some((l_seq, l_hash)) = closed[ci].records.last().map(|l| (l.seq, l.hash))
+                else {
+                    closed[ci].damage = Some(("holds no records".into(), Severity::Critical));
+                    continue;
+                };
+                if prev != l_hash || s <= l_seq {
                     closed[ci].damage = Some((
                         format!(
-                            "its last record {} is not the record segment {} chains onto",
-                            l.seq,
+                            "its last record {l_seq} is not the record segment {} chains onto",
                             idx + 1
                         ),
                         Severity::Critical,
@@ -2428,7 +2455,13 @@ impl Recorder {
             index: last_idx,
             start: active_start,
         });
-        let head_rec = tail.last().expect("non-empty").clone();
+        let Some(head_rec) = tail.last().cloned() else {
+            return Err(Error::Corrupt {
+                segment: tail_name,
+                offset: 0,
+                reason: "no record to chain onto".into(),
+            });
+        };
         let mut quarantine: Vec<QInfo> = Vec::new();
         for (ci, c) in closed.iter().enumerate() {
             let Some((reason, severity)) = &c.damage else {
@@ -2597,6 +2630,14 @@ impl Recorder {
         };
         // Never reuse a seq that quarantined evidence holds.
         let quarantined_max = lost_max.max(q_top(false));
+        // An authentic record already holds the last seq: the chain cannot
+        // continue without reusing one. Refuse before anything is modified.
+        if quarantined_max == Some(u64::MAX) {
+            return Err(seq_space_exhausted(
+                &last_name,
+                "a quarantined authentic record",
+            ));
+        }
         // Positions up to here are accounted for by quarantined evidence,
         // not by a truncation: only when the damage is something a crash
         // or failing media produces. A critical quarantine explains
@@ -2820,12 +2861,13 @@ impl Recorder {
             ));
         }
         // Never reuse a sequence number that may exist elsewhere.
-        let floor = beyond
-            .iter()
-            .map(|b| b.seq)
-            .chain(quarantined_max)
-            .max()
-            .and_then(|m| m.checked_add(1));
+        let floor = match beyond.iter().map(|b| b.seq).chain(quarantined_max).max() {
+            Some(m) => Some(
+                m.checked_add(1)
+                    .ok_or_else(|| seq_space_exhausted(&last_name, "authentic state"))?,
+            ),
+            None => None,
+        };
         let skipped = floor.map(|f| [head_rec.seq + 1, f - 1]);
         r.seq_floor = floor;
 
@@ -2962,7 +3004,13 @@ impl Recorder {
                 head_seq: head_rec.seq,
                 head_hash: to_hex(&head_rec.hash),
                 evidence,
-                skipped_seqs: skipped.expect("evidence implies a floor"),
+                // Every evidence item names a seq above the head that also
+                // sets the floor; refuse rather than abort if it did not.
+                skipped_seqs: skipped.ok_or_else(|| Error::Corrupt {
+                    segment: last_name.clone(),
+                    offset: 0,
+                    reason: "truncation evidence without a sequence floor".into(),
+                })?,
                 severity: Severity::Critical,
             })?;
             r.write_record(RecordKind::TruncationDetected, p, true, true)?;

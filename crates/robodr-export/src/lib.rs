@@ -39,6 +39,22 @@
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(clippy::undocumented_unsafe_blocks)]
+// Review L3 (S10, R9): the robodr-uplink daemon and robodr-enroll (through
+// robodr-fleet) link this library and release builds use
+// `panic = "abort"`, so a panic here kills the process. Non-test code has
+// no unwrap / expect / panic!-family call; slice indexing and arithmetic
+// are left to review and fuzzing.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 
 pub mod crc32c;
 pub mod deadletter;

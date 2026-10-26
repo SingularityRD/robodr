@@ -243,8 +243,14 @@ impl Ed25519SigningKey {
     /// Key from an existing seed, key id derived from the public key
     /// ([`derive_key_id`]).
     pub fn from_seed_with_derived_id(seed: &[u8; SEED_LEN]) -> Self {
-        let public = public_key_from_seed(seed);
-        Self::from_seed(derive_key_id(&public), seed).expect("derived key id is valid")
+        let key = ed25519_dalek::SigningKey::from_bytes(seed);
+        let public = key.verifying_key().to_bytes();
+        // `derive_key_id` always yields a valid key id (unit-tested below).
+        Self {
+            key_id: derive_key_id(&public),
+            key,
+            public,
+        }
     }
 
     /// Fresh key from [`random_seed`] under an explicit key id.
@@ -270,8 +276,15 @@ impl Ed25519SigningKey {
 
     /// The matching verifier, under the same key id.
     pub fn verifying_key(&self) -> Ed25519VerifyingKey {
-        Ed25519VerifyingKey::from_bytes(self.key_id.clone(), &self.public)
-            .expect("public key of a clamped scalar is valid")
+        // The public key of a clamped secret scalar is canonical and never of
+        // small order, and the key id was checked by the constructor, so the
+        // strict checks of `Ed25519VerifyingKey::from_bytes` are not needed
+        // (unit-tested below).
+        Ed25519VerifyingKey {
+            key_id: self.key_id.clone(),
+            public: self.public,
+            key: self.key.verifying_key(),
+        }
     }
 
     /// **Secret.** The seed, for sealing the key at rest (e.g. to a TPM).
@@ -376,6 +389,28 @@ mod tests {
 
     fn h32(s: &str) -> [u8; 32] {
         from_hex(s).unwrap().try_into().unwrap()
+    }
+
+    // The invariants `from_seed_with_derived_id` and `verifying_key` rely on
+    // instead of re-checking (review L3: no `expect` in library code).
+    #[test]
+    fn derived_ids_and_own_verifying_keys_pass_the_strict_checks() {
+        for i in 0..64u8 {
+            let seed = [i.wrapping_mul(37); SEED_LEN];
+            let k = Ed25519SigningKey::from_seed_with_derived_id(&seed);
+            check_key_id(&k.key_id).unwrap();
+            let checked = Ed25519SigningKey::from_seed(k.key_id.clone(), &seed).unwrap();
+            assert_eq!(checked.public, k.public);
+            let strict = Ed25519VerifyingKey::from_bytes(k.key_id.clone(), &k.public).unwrap();
+            let v = k.verifying_key();
+            assert_eq!(v.key, strict.key);
+            assert_eq!(
+                (v.key_id.as_str(), v.public),
+                (strict.key_id.as_str(), strict.public)
+            );
+            let sig = k.sign_message(b"m");
+            assert!(v.verify(b"m", &sig));
+        }
     }
 
     #[test]

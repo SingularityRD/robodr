@@ -42,7 +42,7 @@ use rustls::{
 };
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::net::{IpAddr, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -516,8 +516,10 @@ impl HttpsTransport {
                 Err(e) => last = Some((a, e)),
             }
         }
-        let (a, e): (&SocketAddr, io::Error) = last.expect("at least one address tried");
-        Err(TransportError(format!("connect {a}: {e}")))
+        Err(TransportError(match last {
+            Some((a, e)) => format!("connect {a}: {e}"),
+            None => format!("{addr}: no address tried"),
+        }))
     }
 
     fn head(&self, method: &str, target: &str, req: &HttpRequest<'_>) -> Vec<u8> {

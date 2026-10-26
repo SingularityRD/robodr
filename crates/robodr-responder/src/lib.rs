@@ -56,6 +56,21 @@
 
 // S10: this crate has no `unsafe` code and must stay that way.
 #![forbid(unsafe_code)]
+// Review L3 (S10, R9): agentd links this library and release builds use
+// `panic = "abort"`, so a panic here kills the daemon. Non-test code has no
+// unwrap / expect / panic!-family call; slice indexing and arithmetic are
+// left to review and fuzzing.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 
 pub mod action;
 pub mod actions;
