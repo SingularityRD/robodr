@@ -3075,7 +3075,7 @@
    ]
   },
   {
-   "scenario": "Unitree EDU computer (SDK2 program, DDS config read, bluetoothd pairing, bluez upgrade, NTP, owner Wi-Fi re-provisioning)",
+   "scenario": "Unitree EDU computer (SDK2 program, DDS config read, bluetoothd pairing, bluez upgrade, NTP, owner Wi-Fi re-provisioning, login shells, network and udev hooks read, pip-vendored Cyclone DDS)",
    "events": [
     {
      "note": "SDK2 C++ example started on the EDU computer (synthetic home dir)",
@@ -3336,6 +3336,216 @@
       "RoboDR: Unitree Wi-Fi provisioning script executed"
      ],
      "reason": "Audit trail by design: every run of the provisioning script is recorded, because the UniPwn injection rides on exactly this call and Pulsar cannot tell the two apart (no parent image, argv matched per whole element)."
+    },
+    {
+     "note": "owner re-provisioning, system() form: the shell opens the provisioning script by path (synthetic directory)",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/dash",
+      "parent_pid": 2100
+     },
+     "payload": {
+      "filename": "/opt/vendor/wifi/wpa_supplicant_restart.sh",
+      "flags": [
+       "O_RDONLY"
+      ]
+     },
+     "allow": [
+      "RoboDR: Unitree Wi-Fi provisioning script opened"
+     ],
+     "reason": "Audit trail by design, as for the Exec rule: the interpreter's open of the provisioning script is the only trace of 'sh /full/path/wpa_supplicant_restart.sh' and system() invocations, and an owner re-provisioning cannot be told apart from the UniPwn path."
+    },
+    {
+     "note": "operator login: bash reads ~/.bashrc (sources unitree_ros2 setup.sh, exports CYCLONEDDS_URI)",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/bash",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/home/unitree/.bashrc",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "login shell reads /etc/profile.d",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/bash",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/etc/profile.d/01-locale-fix.sh",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "bash appends to its history",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/bash",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/home/unitree/.bash_history",
+      "flags": [
+       "O_WRONLY",
+       "O_APPEND",
+       "O_CREAT"
+      ]
+     }
+    },
+    {
+     "note": "udevd reads its rules at boot",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/lib/systemd/systemd-udevd"
+     },
+     "payload": {
+      "filename": "/etc/udev/rules.d/99-tegra-devices.rules",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "NetworkManager dispatcher runs its scripts on link-up",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/lib/NetworkManager/nm-dispatcher"
+     },
+     "payload": {
+      "filename": "/etc/NetworkManager/dispatcher.d/01-ifupdown",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "dhclient-script reads its exit hooks",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/dash"
+     },
+     "payload": {
+      "filename": "/etc/dhcp/dhclient-exit-hooks.d/timesyncd",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "PID 1 runs a system generator at daemon-reload",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/lib/systemd/systemd"
+     },
+     "payload": {
+      "filename": "/usr/lib/systemd/system-generators/systemd-fstab-generator",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "generator writes its output under /run/systemd/generator (every boot)",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/lib/systemd/system-generators/systemd-fstab-generator"
+     },
+     "payload": {
+      "filename": "/run/systemd/generator/local-fs.target.requires/-.mount",
+      "flags": [
+       "O_WRONLY",
+       "O_CREAT",
+       "O_TRUNC"
+      ]
+     }
+    },
+    {
+     "note": "L4T upgrade: dpkg writes a udev rule",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "filename": "/etc/udev/rules.d/99-tegra-devices.rules.dpkg-new",
+      "flags": [
+       "O_WRONLY",
+       "O_CREAT",
+       "O_EXCL"
+      ]
+     }
+    },
+    {
+     "note": "L4T upgrade: dpkg renames the udev rule",
+     "type": "FileRename",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "source": "/etc/udev/rules.d/99-tegra-devices.rules.dpkg-new",
+      "destination": "/etc/udev/rules.d/99-tegra-devices.rules"
+     }
+    },
+    {
+     "note": "bash upgrade: dpkg renames /etc/bash.bashrc",
+     "type": "FileRename",
+     "header": {
+      "image": "/usr/bin/dpkg"
+     },
+     "payload": {
+      "source": "/etc/bash.bashrc.dpkg-new",
+      "destination": "/etc/bash.bashrc"
+     }
+    },
+    {
+     "note": "unitree_sdk2_python program loads the pip-vendored libddsc read-only",
+     "type": "FileOpened",
+     "header": {
+      "image": "/usr/bin/python3.8",
+      "uid": 1000
+     },
+     "payload": {
+      "filename": "/usr/local/lib/python3.8/dist-packages/cyclonedds.libs/libddsc-a1b2c3d4.so.0.10.2",
+      "flags": [
+       "O_RDONLY"
+      ]
+     }
+    },
+    {
+     "note": "workspace binary in the home directory to the motion controller",
+     "type": "Connect",
+     "header": {
+      "image": "/home/unitree/ws/install/ctl/lib/ctl/ctl_node",
+      "uid": 1000
+     },
+     "payload": {
+      "destination": {
+       "ip": "192.168.123.161",
+       "port": 7410
+      },
+      "is_tcp": false
+     }
+    },
+    {
+     "note": "SDK binary in the home directory to the operator laptop on the site LAN",
+     "type": "Connect",
+     "header": {
+      "image": "/home/unitree/unitree_sdk2/build/bin/go2_sport_client",
+      "uid": 1000
+     },
+     "payload": {
+      "destination": {
+       "ip": "10.40.0.12",
+       "port": 8080
+      },
+      "is_tcp": true
+     }
     }
    ]
   }

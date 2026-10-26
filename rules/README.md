@@ -103,7 +103,7 @@ The harness uses only the Python standard library (3.11+ for `tomllib`). It:
    and a check that the benign-corpus runner reports a false positive, a
    stale allowance and an incomplete event.
 7. Runs the **benign corpus** `scripts/rules_benign_corpus.json` (mandatory;
-   a missing file is an error): 219 events in nine scenarios (`ros2 launch`
+   a missing file is an error): 234 events in nine scenarios (`ros2 launch`
    with dict parameters and SROS 2, `ros2 bag` record/play from `/tmp`, an
    rclpy node loading torch weights, `colcon build` in a dev workspace,
    `apt-get upgrade` with a kernel (dpkg, depmod, update-initramfs, ldconfig
@@ -116,26 +116,32 @@ The harness uses only the Python standard library (3.11+ for `tomllib`). It:
    EDU computer: an SDK2 program loading Cyclone DDS, reading
    `cyclonedds.xml` and talking DDS on 192.168.123.0/24, bluetoothd saving a
    bond, a bluez upgrade enabling its unit via `deb-systemd-helper`, an
-   ldconfig soname link for Cyclone DDS, NTP, and an owner re-provisioning
-   Wi-Fi over BLE). **Every**
+   ldconfig soname link for Cyclone DDS, NTP, an owner re-provisioning
+   Wi-Fi over BLE (the script run and opened by the shell), login shells
+   reading `~/.bashrc` and `/etc/profile.d`, udevd, the NetworkManager
+   dispatcher and dhclient-script reading their hooks, PID 1 running a
+   generator and the generator writing `/run/systemd/generator`, an L4T and
+   a bash upgrade writing a udev rule and `/etc/bash.bashrc` through dpkg,
+   `unitree_sdk2_python` loading the pip-vendored `libddsc`, and home
+   directory binaries talking to the robot LAN and the site LAN). **Every**
    rule of the event's type is evaluated against every event, not just the
    rule a fixture names. Any hit fails, unless the event lists that rule in
    `allow` with a `reason`; an `allow` entry that no longer fires also fails,
-   so allowances cannot pile up. The 15 allowed hits are the apt and
+   so allowances cannot pile up. The 16 allowed hits are the apt and
    RoboDR-bundle audit trail (package install, maintainer script, package
    database: 7), py3compile's `.pyc` writes in `/usr/lib/python3` (4: the
    library rules and the Python-environment rules, deliberate, see below),
    the two CMake FindPython probes that cannot be excluded, one
    `python3 setup.py` from the dev source tree, and the Unitree Wi-Fi
-   provisioning script run by an owner (audit trail by design, see
-   `unitree.toml`).
+   provisioning script run (Exec) and opened by the shell (FileOpened) for
+   an owner re-provisioning (audit trail by design, see `unitree.toml`).
    The events are modelled on the named tools' behaviour (sources and
    local traces listed in the file header), **not** captured from pulsard.
 
 The last run gave: self-test 88/88; drift mutation test 12/12; 89/89
-upstream rules accepted; no schema or grammar drift; 78 RoboDR rules in 8
-files; 546/546 fixtures pass; benign corpus 219 events, 0 false positives,
-15 allow-listed hits; 0 errors and 0 warnings (`--strict`; the FindPython
+upstream rules accepted; no schema or grammar drift; 86 RoboDR rules in 8
+files; 659/659 fixtures pass; benign corpus 234 events, 0 false positives,
+16 allow-listed hits; 0 errors and 0 warnings (`--strict`; the FindPython
 exclusion's literals with spaces are accepted because the same AND chain pins
 `payload.argc == 3`, see the CMake note below). Mutation checks showed the harness catches problems: flipping every
 negative fixture gave 44 errors, and changing `argv: Argv` in a copy of
@@ -487,26 +493,39 @@ tools and the configuration files instead.
 
 ### `unitree.toml`: Unitree hosts (UniPwn 2025, G1 telemetry, Go1 tunnel)
 
-For the EDU development computer, where pulsard can run. Closed controllers
-and Air/Pro models are covered by the passive sensor box instead
+For the EDU development computer, where pulsard can run (a BTF kernel and
+the regular package; on current Unitree JetPack 5 images it cannot, and
+agentd runs alone: `docs/UNITREE.md` section 3.2). Closed controllers and
+Air/Pro models are covered by the passive sensor box instead
 (`docs/UNITREE.md`). Firmware-specific directories are not assumed: the
 provisioning script is matched by file name, and the SDK paths come from the
 `unitree_sdk2`, `unitree_sdk2_python`, `unitree_ros2` and
 `unitree_legged_sdk` sources.
 
+**Scope of the UniPwn rules.** The BLE provisioning service very likely
+runs on the closed main controller, not on the EDU computer. The five
+provisioning-script and bluetoothd rules (the first five rows) fire only if
+that service, or a copy of it, runs on the host where pulsard runs; on an
+EDU computer without it they are silent and say nothing about the
+controller, which only the network detections (agentd, sensor box) cover.
+
 | Rule | Sev. | Threat | False positives / notes |
 |---|---|---|---|
-| Unitree Wi-Fi provisioning script executed | medium | UniPwn command injection rides on the call to `wpa_supplicant_restart.sh` | Every owner re-provisioning over BLE (the audit trail; allow-listed in the benign corpus). `sh /full/path/wpa_supplicant_restart.sh` is a known gap. Injected commands cannot be linked to the script (no parent image): correlate `parent_pid` in the SOC. |
+| Unitree Wi-Fi provisioning script executed | medium | UniPwn command injection rides on the call to `wpa_supplicant_restart.sh` | Every owner re-provisioning over BLE (the audit trail; allow-listed in the benign corpus). `sh /full/path/...` and `system()` forms have no matching argv element: the next rule covers them. Injected commands cannot be linked to the script (no parent image): correlate `parent_pid` in the SOC. |
+| Unitree Wi-Fi provisioning script opened | medium | Same, for every invocation form: the interpreter opens the script by path (`sh /full/path/wpa_supplicant_restart.sh`, `bash -c`, `system()`/`popen()` strings); a write-open is tampering with the script | Every re-provisioning (audit trail, allow-listed in the benign corpus); a direct exec fires this and the Exec rule. Any reader (`cat`, a backup) also fires. dpkg excluded by exact image. |
 | Bluetooth daemon or Wi-Fi provisioning script opened an IP connection | critical | Injected `bash >& /dev/tcp/...` inside the script's own process (its image is the script path, so the ros2_stack shell rule misses it); compromised bluetoothd | None expected. Robot-LAN destinations are deliberately not excluded (worming). |
 | Bluetooth pairing keys or configuration modified / moved into place outside bluetoothd (2 rules) | high | Planted bond (LTK/IRK) giving an attacker's device a trusted BLE link; relaxed pairing policy in `/etc/bluetooth` | Manual `main.conf` edits at commissioning. Confirm the bluetoothd image (three spellings excluded by exact path). |
-| Service or autostart entry written / moved into place outside the package manager (2 rules) | high | New persistent service (Go1-style tunnel, implant), `rc.local`, init script, XDG autostart, user units | `systemctl edit`, commissioning-time unit installs. Cron is Pulsar's own rule. |
-| Service enabled, masked or linked outside the package manager | medium | `systemctl enable` of a shipped-but-disabled tunnel service, `mask` of a security service | Enabling at commissioning. `deb-systemd-helper` (package installs) is excluded by exact image. |
+| Service or autostart entry written / moved into place outside the package manager (2 rules) | high | New persistent service (Go1-style tunnel, implant), `rc.local`, init script, XDG autostart, user units, units under `/usr/local/lib/systemd/{system,user}`, system and user **generators** (`/etc`, `/usr/lib`, `/lib`, `/usr/local/lib` `systemd/*-generators`: run as root at every boot and daemon-reload) | `systemctl edit`, commissioning-time unit installs. Generator output under `/run/systemd/generator*` is not watched (written at every boot). Cron is Pulsar's own rule. |
+| Service enabled, masked or linked outside the package manager | medium | `systemctl enable` of a shipped-but-disabled tunnel service, `mask` of a security service, a generator linked into place | Enabling at commissioning. `deb-systemd-helper` (package installs) is excluded by exact image. |
+| Boot, network or udev hook written / moved into place / linked outside the package manager (3 rules) | high | Root hooks that need no unit: udev rules with `RUN+=` (`/etc`, `/usr/lib`, `/lib`, `/usr/local/lib` `udev/rules.d`), ifupdown `/etc/network/if-*.d`, NetworkManager `dispatcher.d` (and `pre-up.d`, ...), dhclient enter/exit hooks, ppp `ip-up.d` and relatives (cellular modems) | Commissioning edits (audit trail). dpkg excluded by exact image (L4T and distribution packages install udev rules and hooks through dpkg). Readers (udevd, nm-dispatcher, dhclient-script) do not fire. `/etc/wpa_supplicant/*` hooks are in `radio_provisioning.toml`. |
+| Shell startup or login environment file modified / moved into place / linked (3 rules) | medium | `/etc/profile`, `/etc/profile.d/*`, `/etc/bash.bashrc`, `/etc/environment`, zsh system files, and `~/.bashrc`, `~/.profile`, `~/.bash_profile`, `~/.bash_login`, `~/.zshrc`, `~/.zshenv`, `~/.zprofile`, `~/.pam_environment` under `/home` and `/root`: code in every shell, `LD_PRELOAD`/`PATH`, and `CYCLONEDDS_URI` (the `unitree_ros2` setup puts it in `~/.bashrc`) | SDK setup and `conda init` at commissioning, any edit on a development unit, `useradd` copying `/etc/skel`, dotfile managers (links). Shell history and editor backups (`~/.bashrc~`) do not match. dpkg excluded by exact image. |
 | Unitree robot process connects outside the allowlisted destinations | high | Telemetry to external servers (reported for G1), vendor or implanted tunnel | TUNE the allowlist. Only processes in the Unitree trees; DDS UDP mostly uses `sendto` (not seen). |
+| Program in a user-writable directory connects to a public address | high | Any tool **whatever its name** (renamed frpc, chisel, an implant, a cross-compiled agent) run from `/tmp`, `/var/tmp`, `/dev/shm`, `/run/user`, `/run/lock`, `/var/crash`, `/home` or `/root` calling out; the tunnel/VPN rules match names only | Development units: IDE servers (`~/.vscode-server`), conda/venv interpreters and downloaded tools in a home directory. Interpreted code runs as `/usr/bin/python3` and is not seen here. Same destination allowlist as the Unitree outbound rule (keep them equal); a Unitree SDK binary in a home directory that calls out fires both rules. |
 | Reverse tunnel client executed on robot | high | frpc/frps, cloudflared, bore, rathole, inlets, npc, zrok, autossh | Not duplicated: Pulsar already covers ngrok, chisel, gost, iodine and others. |
 | SSH reverse or dynamic tunnel with bundled options | high | `ssh -fNR`, `-NfD`, Dropbear `dbclient -R/-D` | Plain `ssh -R` is Pulsar's own rule. Attached `-R2222:...` is a known gap. |
 | Remote-access overlay VPN started on robot | medium | tailscale(d), zerotier, openvpn, wg-quick as a persistent path out | Fleets that use one on purpose remove it here (TUNE). |
 | Unitree DDS configuration modified / moved into place (2 rules) | high | `*cyclonedds.xml` and the `unitree_ros2` setup scripts that set `CYCLONEDDS_URI`: interface, peers, DDS Security | Commissioning edits. Other `CYCLONEDDS_URI` file names (TUNE) and inline XML in the variable are not seen. |
-| Unitree SDK or Cyclone DDS library modified / moved / linked outside the package manager (3 rules) | high | Trojaned `libddsc`/`libddscxx`/`libunitree_sdk2`/`unitree_sdk2py` native code, which sees and can forge every `rt/lowcmd` frame | SDK or Cyclone rebuilds, `make install`, `git pull` of the SDK tree, `pip install cyclonedds` (dev and commissioning). Names match anywhere, so a backup renamed to `libddsc.so.0.bak` also fires (`KNOWN NOISE` fixture). ldconfig soname links excluded as in `runtime_hooking.toml`. |
+| Unitree SDK or Cyclone DDS library modified / moved / linked outside the package manager (3 rules) | high | Trojaned `libddsc`/`libddscxx`/`libunitree_sdk2`/`unitree_sdk2py` native code, or a library in a pip wheel's vendored `cyclonedds.libs/` (`libddsc-<hash>.so.*`, what `unitree_sdk2_python` loads through the `cyclonedds` package), which sees and can forge every `rt/lowcmd` frame | SDK or Cyclone rebuilds, `make install`, `git pull` of the SDK tree, `pip install cyclonedds` (dev and commissioning). Names match anywhere, so a backup renamed to `libddsc.so.0.bak` also fires (`KNOWN NOISE` fixture). ldconfig soname links excluded as in `runtime_hooking.toml`. |
 
 Running the Unitree SDKs from a home directory also trips the existing
 library-load and Python-import rules (`unitree_sdk2_python` is outside the
