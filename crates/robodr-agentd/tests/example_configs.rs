@@ -99,13 +99,17 @@ fn full_example_control_plane_loads_with_its_soc_key() {
     let s = setup_root("example-cp");
     let text = relocate(&example("agentd.full.example.json"), &s);
     let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
-    v.as_object_mut().unwrap().remove("finding_signing");
     let t = v["sensor"]["profile_trust"].as_object_mut().unwrap();
     for k in ["trust_roots", "revocation_list", "revocation_policy"] {
         t.remove(k);
     }
     let path = s.dir.join("agentd.json");
     std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+    // The finding key (answers are signed: required with control_plane).
+    robodr_blackbox::KeyFile::ed25519_from_seed(&[0x34; 32], Some("finding:ugv-007:1"))
+        .unwrap()
+        .write_new(&s.dir.join("credentials/finding.key"))
+        .unwrap();
     // Without the SOC's public key file: refused, naming it.
     let e = robodr_agentd::load(&path).expect_err("SOC key missing");
     assert!(e.contains("soc.pub"), "{e}");
@@ -117,11 +121,28 @@ fn full_example_control_plane_loads_with_its_soc_key() {
         .unwrap()
         .write_new(&key)
         .unwrap();
+    // Without the TLS files: refused, naming them.
+    let e = robodr_agentd::load(&path).expect_err("TLS files missing");
+    assert!(e.contains("control_plane.tls"), "{e}");
+    let tls = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/control-tls");
+    let cp = s.dir.join("etc/control-plane");
+    std::fs::create_dir_all(&cp).unwrap();
+    std::fs::copy(tls.join("robot.pem"), cp.join("robot.pem")).unwrap();
+    std::fs::copy(tls.join("soc-ca.pem"), cp.join("soc-ca.pem")).unwrap();
+    let k = s.dir.join("credentials/cp-tls.key");
+    std::fs::copy(tls.join("robot.key"), &k).unwrap();
+    for f in [cp.join("robot.pem"), cp.join("soc-ca.pem")] {
+        std::fs::set_permissions(f, std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+    }
+    std::fs::set_permissions(&k, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
     let r = robodr_agentd::load(&path).unwrap_or_else(|e| panic!("{e}"));
     let cp = r.control_plane.expect("control_plane");
-    assert!(cp.tcp.is_none());
+    assert!(cp.tcp.is_some_and(|a| !a.ip().is_loopback()));
+    assert!(cp.tls.is_some(), "off loopback only with mutual TLS");
+    assert!(cp.evidence.is_some());
     assert_eq!(cp.keys.len(), 1);
     assert!(cp.unix.unwrap().ends_with("run/control.sock"));
+    assert!(cp.state_dir.ends_with("var/control-plane/agentd"));
 }
 
 /// Review M6: every rule id a shipped response policy overrides

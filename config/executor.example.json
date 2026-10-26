@@ -10,7 +10,7 @@
   "network": {
     "management": [
       {"cidr": "10.20.0.0/24", "proto": "tcp", "port": 22, "note": "operator SSH (illustrative)"},
-      {"cidr": "10.20.0.5", "proto": "tcp", "port": 443, "note": "SOC / TLS terminator in front of the control plane (illustrative)"}
+      {"cidr": "10.20.0.5", "proto": "tcp", "port": 443, "note": "SOC: client of the mutual-TLS control plane (illustrative)"}
     ],
     "uplink": [
       {"cidr": "10.20.0.10", "proto": "tcp", "port": 443, "note": "AutoSecOps ingest API (robodr-uplink, illustrative)"}

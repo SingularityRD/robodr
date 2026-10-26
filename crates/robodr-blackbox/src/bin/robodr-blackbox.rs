@@ -6,6 +6,8 @@
 //! robodr-blackbox export-pub KEYFILE [--out FILE]
 //! robodr-blackbox verify     DIR --keyring FILE [--keyring FILE]... [--checkpoint FILE]
 //!                            [--device ID] [--allow-mixed-algorithms] [--strict] [--json]
+//! robodr-blackbox verify     BUNDLE --keyring FILE [--keyring FILE]... [--device ID]
+//!                            [--signing-key ID] [--allow-mixed-algorithms] [--strict] [--json]
 //! robodr-blackbox inspect    DIR|SEGMENT [--json] [--limit N]
 //! robodr-blackbox tpm-anchor-init  --index 0x01XXXXXX [--tcti TCTI] [--tools-dir DIR]
 //!                            [--owner-auth-file FILE] [--index-auth-file FILE]
@@ -35,6 +37,14 @@
 //!   `robodr_blackbox::verify`), never under "any key given". Mixing HMAC
 //!   and Ed25519 keys is refused unless `--allow-mixed-algorithms` (needed
 //!   only for a log that rotated from a legacy HMAC key to Ed25519).
+//!   Given a **file** instead of a directory, `verify` checks an `RBBXBND1`
+//!   export bundle (e.g. one downloaded through the control-plane evidence
+//!   API, reassembled from its chunks): hashes, signatures, chain linkage
+//!   from its anchor, chain id and `--device`; `--signing-key ID` names
+//!   the key that signs its first record (the manifest's
+//!   `chain.signing_key.key_id`; needed only for a bundle that starts after
+//!   a key rotation; its algorithm is the keyring entry's). The anchor is
+//!   reported as unverified (info): compare it with what you already hold.
 //! - `inspect` lists frames (seq, kind, flags, time, payload) without
 //!   checking any signature: it is a viewer, not a verdict.
 //! - `tpm-anchor-init` provisions the TPM 2.0 NV counter behind
@@ -61,12 +71,13 @@
 
 use robodr_blackbox::crypto::to_hex;
 use robodr_blackbox::keys::{public_key_path, KeyFile, Keyring};
+use robodr_blackbox::record::KeyRef;
 use robodr_blackbox::record::{scan_frames, signing_message, ScanItem};
 use robodr_blackbox::remote_anchor::RemoteMark;
 use robodr_blackbox::store::{CHECKPOINT_FILE, HEAD_FILE};
 use robodr_blackbox::tpm_anchor::{self, parse_nv_index, NvCounter, Tpm2Tools};
 use robodr_blackbox::verify::{read_segments, verify_dir, SegmentData, VerifyOptions};
-use robodr_blackbox::Checkpoint;
+use robodr_blackbox::{Bundle, Checkpoint};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -78,6 +89,8 @@ const USAGE: &str = "usage:
   robodr-blackbox export-pub KEYFILE [--out FILE]
   robodr-blackbox verify     DIR --keyring FILE [--keyring FILE]... [--checkpoint FILE]
                              [--device ID] [--allow-mixed-algorithms] [--strict] [--json]
+  robodr-blackbox verify     BUNDLE --keyring FILE [--keyring FILE]... [--device ID]
+                             [--signing-key ID] [--allow-mixed-algorithms] [--strict] [--json]
   robodr-blackbox inspect    DIR|SEGMENT [--json] [--limit N]
   robodr-blackbox tpm-anchor-init  --index 0x01XXXXXX [--tcti TCTI] [--tools-dir DIR]
                              [--owner-auth-file FILE] [--index-auth-file FILE]
@@ -93,6 +106,8 @@ const HMAC_WARNING: &str = "warning: hmac-sha256 is the legacy symmetric placeho
 holder of this key can also forge evidence. Use ed25519 for production.";
 
 const MAX_CHECKPOINT_BYTES: u64 = 64 * 1024;
+/// Largest bundle file `verify` reads.
+const MAX_BUNDLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const PAYLOAD_PREVIEW: usize = 160;
 
 struct Args {
@@ -282,10 +297,10 @@ fn export_pub(raw: &[String]) -> Result<(), Fail> {
 fn verify(raw: &[String]) -> Result<(), Fail> {
     let a = Args::parse(
         raw,
-        &["keyring", "checkpoint", "device"],
+        &["keyring", "checkpoint", "device", "signing-key"],
         &["strict", "json", "allow-mixed-algorithms"],
     )?;
-    let dir = PathBuf::from(a.single_positional("log directory")?);
+    let dir = PathBuf::from(a.single_positional("log directory or bundle file")?);
     let files = a.all("keyring");
     if files.is_empty() {
         return Err("--keyring FILE is required".to_string().into());
@@ -312,10 +327,41 @@ fn verify(raw: &[String]) -> Result<(), Fail> {
         opts.checkpoint =
             Some(Checkpoint::from_json(&text).ok_or(format!("{p}: not a checkpoint"))?);
     }
-    if !dir.is_dir() {
-        return Err(format!("{}: not a directory", dir.display()).into());
-    }
-    let report = verify_dir(&dir, &ring, &opts).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let report = if dir.is_file() {
+        if opts.checkpoint.is_some() {
+            return Err("--checkpoint applies to a log directory, not a bundle"
+                .to_string()
+                .into());
+        }
+        let bytes = read_bytes_bounded(&dir, MAX_BUNDLE_BYTES)?;
+        let bundle = Bundle::from_bytes(&bytes).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let signing_key = match a.one("signing-key")? {
+            None => None,
+            Some(id) => {
+                let v = ring
+                    .get(id)
+                    .ok_or(format!("--signing-key {id}: not in the keyring"))?;
+                Some(KeyRef {
+                    key_id: id.to_string(),
+                    algorithm: v.algorithm().to_string(),
+                })
+            }
+        };
+        bundle.verify_with_key(
+            &ring,
+            None,
+            opts.expected_device_id.as_deref(),
+            signing_key.as_ref(),
+        )
+    } else {
+        if a.one("signing-key")?.is_some() {
+            return Err("--signing-key applies to a bundle file".to_string().into());
+        }
+        if !dir.is_dir() {
+            return Err(format!("{}: not a directory", dir.display()).into());
+        }
+        verify_dir(&dir, &ring, &opts).map_err(|e| format!("{}: {e}", dir.display()))?
+    };
     let ok = report.is_intact() && (!a.flag("strict") || report.is_clean());
     if a.flag("json") {
         println!(
@@ -498,6 +544,18 @@ fn anchor_mark(raw: &[String]) -> Result<(), Fail> {
         }
     }
     Ok(())
+}
+
+fn read_bytes_bounded(p: &Path, max: u64) -> Result<Vec<u8>, String> {
+    let f = std::fs::File::open(p).map_err(|e| format!("{}: {e}", p.display()))?;
+    let mut b = Vec::new();
+    f.take(max + 1)
+        .read_to_end(&mut b)
+        .map_err(|e| format!("{}: {e}", p.display()))?;
+    if b.len() as u64 > max {
+        return Err(format!("{}: larger than {max} bytes", p.display()));
+    }
+    Ok(b)
 }
 
 fn read_bounded(p: &Path, max: u64) -> Result<String, String> {

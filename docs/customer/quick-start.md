@@ -133,9 +133,9 @@ Enable **exactly one** spool consumer. The units conflict.
   ([OPERATIONS section 8.2](../OPERATIONS.md)) and verify them with
   `robodr-blackbox verify` against the robot's `.pub`.
 - **Control plane** (optional, off by default): it lets the SOC request
-  the seven catalog actions. In this release it **executes nothing** and
-  has no TLS. Keep it on loopback or a unix socket, behind a TLS
-  terminator ([`docs/contracts/robodr.control-plane.md`](../contracts/robodr.control-plane.md)).
+  the seven catalog actions over mutual TLS. It **executes nothing**
+  unless executor v1 is enabled (off by default; OPERATIONS section 6.5)
+  ([`docs/contracts/robodr.control-plane.md`](../contracts/robodr.control-plane.md)).
 
 ## 8. Before you rely on it
 

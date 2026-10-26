@@ -8,10 +8,12 @@ license.workspace = true
 # accept version-less path dependencies (deny.toml, allow-wildcard-paths).
 publish = false
 repository.workspace = true
-description = "RoboDR live daemon: capture / pcap / JSONL events -> ROS 2 pipeline -> decision chain (robodr-agent) -> signed black box -> OCSF findings spool, with self-health. Std threads only (no async runtime); plans, never executes."
+description = "RoboDR live daemon: capture / pcap / JSONL events -> ROS 2 pipeline -> decision chain (robodr-agent) -> signed black box -> OCSF findings spool, with self-health and the mTLS control-plane / evidence API. Std threads only (no async runtime); plans, and executes only through the separate robodr-executor when executor.enabled."
 
-# Pure crate: std + RoboDR crates + serde only (no async runtime, no Pulsar), so it
-# builds and is tested offline.
+# std + RoboDR crates + serde (no async runtime, no Pulsar), so it builds and
+# is tested offline; rustls (+ ring) and rustls-webpki are the control plane's
+# TLS stack (mutual TLS, `src/control/tls.rs`), the same crates and versions
+# robodr-uplink uses (workspace Cargo.toml).
 [dependencies]
 robodr-agent = { workspace = true }
 robodr-blackbox = { workspace = true }
@@ -33,8 +35,10 @@ robodr-motion = { workspace = true }
 robodr-ocsf = { workspace = true }
 robodr-responder = { workspace = true }
 robodr-ros2-pipeline = { workspace = true }
+rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+webpki = { workspace = true }
 
 [dev-dependencies]
 robodr-capture = { workspace = true }

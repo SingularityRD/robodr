@@ -1,15 +1,17 @@
 //! Request authentication: Ed25519 signatures by a configured SOC key over
-//! the request, bound to this robot, with a timestamp window and a nonce
-//! cache against replay, and a per-key rate limit.
+//! the request, bound to this robot, with a timestamp window and a
+//! persisted nonce store against replay, and a per-key rate limit. On a TLS
+//! listener this comes **in addition to** the SOC's client certificate
+//! (mutual TLS, [`super::tls`]): both are required.
 //!
 //! # What is signed
 //!
 //! [`signing_message`]: the lines (joined by `\n`, no trailing newline)
 //!
 //! ```text
-//! robodr-control-plane/v1
+//! robodr-control-plane/v2
 //! <METHOD>
-//! <request target exactly as sent, e.g. /api/v1/robots/ugv-007/action-requests>
+//! <request target exactly as sent, e.g. /api/v2/robots/ugv-007/action-requests>
 //! <robot id this agentd is configured for>
 //! <key id>
 //! <timestamp: Unix seconds, decimal>
@@ -33,21 +35,36 @@
 //! (`replay_cache_full`) rather than accepted unchecked. Only requests whose
 //! signature verified enter the cache, so unauthenticated traffic cannot
 //! fill it.
+//!
+//! The cache is persisted ([`ReplayGuard::persistent`]: `nonces.journal` in
+//! the state directory): a pair is appended and fsynced **before** the
+//! request goes any further, so a request accepted before a restart is
+//! still a replay after it, for as long as its timestamp is in the window.
+//! If the store cannot be trusted at start (damaged lines, or missing while
+//! the request journal exists: the state was removed), a **fence** refuses
+//! every request whose timestamp is not later than the start (it may have
+//! been seen before); a failed append refuses the request
+//! (`replay_store_unavailable`, 503), never accepts it unrecorded.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::Instant;
 
 use robodr_blackbox::crypto::{from_hex, sha256, to_hex};
+use serde::{Deserialize, Serialize};
 
 use super::http::Request;
+use super::journal::{Journal, Loaded};
 
 /// API and signature domain.
-pub const API_VERSION: &str = "robodr-control-plane/v1";
+pub const API_VERSION: &str = "robodr-control-plane/v2";
+/// The replay store's journal file (in the state directory).
+pub const NONCE_JOURNAL: &str = "nonces.journal";
 pub const H_KEY_ID: &str = "x-robodr-key-id";
 pub const H_TIMESTAMP: &str = "x-robodr-timestamp";
 pub const H_NONCE: &str = "x-robodr-nonce";
 pub const H_SIGNATURE: &str = "x-robodr-signature";
-/// The answer signature header (with `finding_signing`).
+/// The answer signature header (every answer to an authenticated request).
 pub const H_ANSWER_SIGNATURE: &str = "X-RoboDR-Answer-Signature";
 /// Most live (key, nonce) pairs remembered.
 pub const MAX_NONCES: usize = 8192;
@@ -84,6 +101,13 @@ pub enum AuthFailure {
     Replayed,
     ReplayCacheFull,
     ClockUnavailable,
+    /// Signed before a restart that found the replay store untrustworthy.
+    Fenced,
+    /// The nonce could not be made durable.
+    ReplayStoreUnavailable,
+    /// The TLS handshake failed (no / untrusted / expired / unpinned client
+    /// certificate): counted, never answered (there is no channel).
+    Tls(String),
 }
 
 impl AuthFailure {
@@ -97,13 +121,18 @@ impl AuthFailure {
             AuthFailure::Replayed => "replayed_nonce",
             AuthFailure::ReplayCacheFull => "replay_cache_full",
             AuthFailure::ClockUnavailable => "clock_unavailable",
+            AuthFailure::Fenced => "stale_timestamp",
+            AuthFailure::ReplayStoreUnavailable => "replay_store_unavailable",
+            AuthFailure::Tls(_) => "tls_handshake_failed",
         }
     }
 
     /// The HTTP status: 401, except 503 when this host cannot check.
     pub fn status(&self) -> u16 {
         match self {
-            AuthFailure::ReplayCacheFull | AuthFailure::ClockUnavailable => 503,
+            AuthFailure::ReplayCacheFull
+            | AuthFailure::ClockUnavailable
+            | AuthFailure::ReplayStoreUnavailable => 503,
             _ => 401,
         }
     }
@@ -124,6 +153,15 @@ impl AuthFailure {
                 "too many recent requests to check for replay; retry later".into()
             }
             AuthFailure::ClockUnavailable => "the robot's wall clock is unavailable".into(),
+            AuthFailure::Fenced => {
+                "signed before agentd restarted with an untrusted replay store; sign the request \
+                 again"
+                    .into()
+            }
+            AuthFailure::ReplayStoreUnavailable => {
+                "the replay store could not record the nonce; retry later".into()
+            }
+            AuthFailure::Tls(why) => format!("TLS handshake failed: {why}"),
         }
     }
 }
@@ -226,22 +264,103 @@ pub fn verify(
     }
 }
 
-/// Timestamp window and nonce cache.
+/// One persisted (key, nonce) pair.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NonceEntry {
+    pub t: String,
+    pub key_id: String,
+    pub nonce: String,
+    /// Unix second after which the pair is dead (its timestamp left the
+    /// window).
+    pub dead_after: u64,
+}
+
+/// What [`ReplayGuard::persistent`] found.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct ReplayLoad {
+    /// Live pairs restored.
+    pub restored: usize,
+    /// Dead pairs dropped.
+    pub expired: usize,
+    pub torn_bytes: u64,
+    pub damaged: usize,
+    pub created: bool,
+    /// The fence set (Unix seconds), if any.
+    pub fence: Option<u64>,
+}
+
+/// Timestamp window and nonce cache (optionally persisted).
 #[derive(Debug)]
 pub struct ReplayGuard {
     /// (key id, nonce) -> Unix second after which the entry is dead.
     seen: HashMap<(String, String), u64>,
     skew_s: u64,
     max: usize,
+    journal: Option<Journal>,
+    /// Timestamps `<=` this are refused ([`AuthFailure::Fenced`]).
+    fence: Option<u64>,
+    /// Journal append failures.
+    pub store_errors: u64,
+    /// Compact (dropping dead pairs) when the journal reaches this many
+    /// lines: twice the live set after the last compaction, plus 1024.
+    compact_at: usize,
 }
 
 impl ReplayGuard {
+    /// An in-memory guard (tests, and the shape of the persisted one).
     pub fn new(skew_s: u64, max: usize) -> Self {
         Self {
             seen: HashMap::new(),
             skew_s,
             max,
+            journal: None,
+            fence: None,
+            store_errors: 0,
+            compact_at: 1024,
         }
+    }
+
+    /// A guard persisted in `dir/nonces.journal`. `fence_if_created`: the
+    /// caller knows state existed before (the request journal is there), so
+    /// a missing nonce journal means it was removed: fence. Damage fences
+    /// too. `now_s` drops dead pairs and is the fence value.
+    pub fn persistent(
+        dir: &Path,
+        skew_s: u64,
+        max: usize,
+        now_s: u64,
+        fence_if_created: bool,
+    ) -> std::io::Result<(Self, ReplayLoad)> {
+        let (journal, loaded): (Journal, Loaded<NonceEntry>) =
+            Journal::open(dir, NONCE_JOURNAL, "nonces")?;
+        let mut g = Self::new(skew_s, max);
+        let mut load = ReplayLoad {
+            torn_bytes: loaded.torn_bytes,
+            damaged: loaded.damaged,
+            created: loaded.created,
+            ..ReplayLoad::default()
+        };
+        for e in loaded.entries {
+            if e.t != "nonce" {
+                load.damaged += 1;
+                continue;
+            }
+            if e.dead_after < now_s {
+                load.expired += 1;
+                continue;
+            }
+            g.seen.insert((e.key_id, e.nonce), e.dead_after);
+        }
+        load.restored = g.seen.len();
+        if load.damaged > 0 || (loaded.created && fence_if_created) {
+            g.fence = Some(now_s);
+            load.fence = Some(now_s);
+        }
+        g.journal = Some(journal);
+        // Start from a compact file.
+        g.compact(now_s);
+        Ok((g, load))
     }
 
     pub fn len(&self) -> usize {
@@ -252,9 +371,42 @@ impl ReplayGuard {
         self.seen.is_empty()
     }
 
+    pub fn fence(&self) -> Option<u64> {
+        self.fence
+    }
+
+    pub fn is_persistent(&self) -> bool {
+        self.journal.is_some()
+    }
+
+    fn compact(&mut self, now_s: u64) {
+        let Some(j) = self.journal.as_mut() else {
+            return;
+        };
+        self.seen.retain(|_, dead_after| *dead_after >= now_s);
+        let mut live: Vec<NonceEntry> = self
+            .seen
+            .iter()
+            .map(|((k, n), d)| NonceEntry {
+                t: "nonce".into(),
+                key_id: k.clone(),
+                nonce: n.clone(),
+                dead_after: *d,
+            })
+            .collect();
+        live.sort_by(|a, b| {
+            (a.dead_after, &a.key_id, &a.nonce).cmp(&(b.dead_after, &b.key_id, &b.nonce))
+        });
+        if j.compact(&live).is_err() {
+            self.store_errors += 1;
+        }
+        self.compact_at = 2 * self.seen.len() + 1024;
+    }
+
     /// Check the window and record the nonce (`now_s`: this host's Unix
     /// seconds). An entry lives until its timestamp leaves the window, after
-    /// which the window check alone refuses a replay.
+    /// which the window check alone refuses a replay. With a journal, the
+    /// pair is durable before `Ok` is returned.
     pub fn check(
         &mut self,
         key_id: &str,
@@ -264,6 +416,9 @@ impl ReplayGuard {
     ) -> Result<(), AuthFailure> {
         if timestamp.abs_diff(now_s) > self.skew_s {
             return Err(AuthFailure::StaleTimestamp);
+        }
+        if self.fence.is_some_and(|f| timestamp <= f) {
+            return Err(AuthFailure::Fenced);
         }
         let k = (key_id.to_string(), nonce.to_string());
         if self.seen.contains_key(&k) {
@@ -275,8 +430,29 @@ impl ReplayGuard {
                 return Err(AuthFailure::ReplayCacheFull);
             }
         }
-        self.seen
-            .insert(k, timestamp.saturating_add(self.skew_s).saturating_add(1));
+        let dead_after = timestamp.saturating_add(self.skew_s).saturating_add(1);
+        if self
+            .journal
+            .as_ref()
+            .is_some_and(|j| j.lines() >= self.compact_at)
+        {
+            self.compact(now_s);
+        }
+        if let Some(j) = self.journal.as_mut() {
+            let e = NonceEntry {
+                t: "nonce".into(),
+                key_id: k.0.clone(),
+                nonce: k.1.clone(),
+                dead_after,
+            };
+            if j.append(&e).is_err() {
+                self.store_errors += 1;
+                // Remembered in memory all the same (refused either way).
+                self.seen.insert(k, dead_after);
+                return Err(AuthFailure::ReplayStoreUnavailable);
+            }
+        }
+        self.seen.insert(k, dead_after);
         Ok(())
     }
 }
@@ -362,7 +538,7 @@ mod tests {
     fn a_signed_request_verifies_and_is_bound() {
         let r = signed(
             "POST",
-            "/api/v1/robots/ugv-007/action-requests",
+            "/api/v2/robots/ugv-007/action-requests",
             "ugv-007",
             b"{}",
             100,
@@ -375,7 +551,7 @@ mod tests {
             Err(AuthFailure::BadSignature)
         );
         let edits: [fn(&mut Request); 3] = [
-            |r| r.target = "/api/v1/robots/ugv-007/action-requests/x".into(),
+            |r| r.target = "/api/v2/robots/ugv-007/action-requests/x".into(),
             |r| r.method = "GET".into(),
             |r| r.body = b"{ }".to_vec(),
         ];
@@ -411,7 +587,7 @@ mod tests {
 
     #[test]
     fn credential_headers_are_strict() {
-        let base = signed("GET", "/api/v1/robots/r", "r", b"", 5);
+        let base = signed("GET", "/api/v2/robots/r", "r", b"", 5);
         assert!(credentials(&base).is_ok());
         let edit = |name: &str, v: Option<&str>, dup: bool| {
             let mut r = base.clone();
@@ -499,5 +675,121 @@ mod tests {
         assert_ne!(a, answer_message("ab", 200, b"{}"));
         assert_ne!(a, answer_message("aa", 401, b"{}"));
         assert_ne!(a, answer_message("aa", 200, b"{ }"));
+    }
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("robodr-cp-n-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A nonce accepted before a restart is still a replay after it, for as
+    /// long as its timestamp is in the window; dead pairs are dropped.
+    #[test]
+    fn replay_after_restart_is_refused() {
+        let d = tmp("restart");
+        let (mut g, l) = ReplayGuard::persistent(&d, 30, 100, 1000, false).unwrap();
+        assert!(l.created && l.fence.is_none());
+        assert_eq!(g.check("k", "nonce-aaaaaaaaaaaaaaaa", 1000, 1000), Ok(()));
+        assert_eq!(g.check("k", "nonce-bbbbbbbbbbbbbbbb", 995, 1000), Ok(()));
+        drop(g);
+        // Restart 10 s later: both still live, both refused.
+        let (mut g, l) = ReplayGuard::persistent(&d, 30, 100, 1010, true).unwrap();
+        assert_eq!((l.restored, l.expired, l.fence), (2, 0, None));
+        assert_eq!(
+            g.check("k", "nonce-aaaaaaaaaaaaaaaa", 1000, 1010),
+            Err(AuthFailure::Replayed)
+        );
+        assert_eq!(g.check("k", "nonce-cccccccccccccccc", 1010, 1010), Ok(()));
+        drop(g);
+        // Restart after the window: the old pairs are dead (dropped), and
+        // the window alone refuses their timestamps.
+        let (mut g, l) = ReplayGuard::persistent(&d, 30, 100, 1035, true).unwrap();
+        assert_eq!((l.restored, l.expired), (1, 2));
+        assert_eq!(
+            g.check("k", "nonce-aaaaaaaaaaaaaaaa", 1000, 1035),
+            Err(AuthFailure::StaleTimestamp)
+        );
+        assert_eq!(
+            g.check("k", "nonce-cccccccccccccccc", 1010, 1035),
+            Err(AuthFailure::Replayed)
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// An untrusted store (damaged, or missing while other state exists)
+    /// fences: nothing signed at or before the start is accepted.
+    #[test]
+    fn an_untrusted_store_fences() {
+        let d = tmp("fence");
+        let (mut g, _) = ReplayGuard::persistent(&d, 30, 100, 1000, false).unwrap();
+        g.check("k", "nonce-aaaaaaaaaaaaaaaa", 1000, 1000).unwrap();
+        g.check("k", "nonce-bbbbbbbbbbbbbbbb", 1000, 1000).unwrap();
+        drop(g);
+        // Damage the first nonce line (a good line follows it).
+        let p = d.join(NONCE_JOURNAL);
+        let mut b = std::fs::read(&p).unwrap();
+        let second = b.iter().position(|&c| c == b'\n').unwrap() + 1;
+        b[second + 80] ^= 1;
+        std::fs::write(&p, &b).unwrap();
+        let (mut g, l) = ReplayGuard::persistent(&d, 30, 100, 1005, true).unwrap();
+        assert_eq!(l.damaged, 1);
+        assert_eq!(l.fence, Some(1005));
+        // The lost nonce is refused by the fence, a fresh request accepted.
+        assert_eq!(
+            g.check("k", "nonce-aaaaaaaaaaaaaaaa", 1000, 1005),
+            Err(AuthFailure::Fenced)
+        );
+        assert_eq!(
+            g.check("k", "nonce-dddddddddddddddd", 1005, 1005),
+            Err(AuthFailure::Fenced)
+        );
+        assert_eq!(g.check("k", "nonce-dddddddddddddddd", 1006, 1006), Ok(()));
+        drop(g);
+        // Removed while the request journal exists: fenced too; a first
+        // start (nothing else there) is not.
+        std::fs::remove_file(&p).unwrap();
+        let (_, l) = ReplayGuard::persistent(&d, 30, 100, 1010, true).unwrap();
+        assert_eq!(l.fence, Some(1010));
+        std::fs::remove_file(&p).unwrap();
+        let (_, l) = ReplayGuard::persistent(&d, 30, 100, 1010, false).unwrap();
+        assert_eq!(l.fence, None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A nonce that cannot be made durable refuses the request (503), and
+    /// the pair is still remembered.
+    #[test]
+    fn a_failing_store_refuses() {
+        let d = tmp("fail");
+        let (mut g, _) = ReplayGuard::persistent(&d, 30, 100, 1000, false).unwrap();
+        crate::control::fsutil::fault::arm("survive.journal.append.short_write", 1);
+        let r = g.check("k", "nonce-aaaaaaaaaaaaaaaa", 1000, 1000);
+        assert_eq!(r, Err(AuthFailure::ReplayStoreUnavailable));
+        assert_eq!(AuthFailure::ReplayStoreUnavailable.status(), 503);
+        assert_eq!(
+            g.check("k", "nonce-aaaaaaaaaaaaaaaa", 1000, 1000),
+            Err(AuthFailure::Replayed)
+        );
+        assert_eq!(g.store_errors, 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_store_is_compacted() {
+        let d = tmp("compact");
+        let (mut g, _) = ReplayGuard::persistent(&d, 30, 100_000, 1000, false).unwrap();
+        for i in 0..3000u64 {
+            let now = 1000 + i / 10;
+            g.check("k", &format!("nonce-{i:016}"), now, now).unwrap();
+        }
+        drop(g);
+        let lines = std::fs::read_to_string(d.join(NONCE_JOURNAL))
+            .unwrap()
+            .lines()
+            .count();
+        assert!(lines < 2 * 320 + 1024 + 10, "{lines}");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

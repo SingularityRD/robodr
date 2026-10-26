@@ -526,3 +526,93 @@ fn verify_mixing_hmac_and_ed25519_needs_an_explicit_flag() {
     assert!(o.status.success(), "{}", text(&o));
     assert!(text(&o).contains("INTACT, CLEAN"), "{}", text(&o));
 }
+
+/// `verify BUNDLE`: an `RBBXBND1` export bundle (as the control-plane
+/// evidence API ships one) verifies with the unit's public key file; a
+/// flipped byte, another device or a wrong key fail; directory-only
+/// options are usage errors.
+#[test]
+fn verify_an_export_bundle_file() {
+    let d = TestDir::new("cli-verify-bundle");
+    let k = d.sub("unit.key");
+    assert!(run(&["keygen", "--out", s(&k)]).status.success());
+    let key = KeyFile::load(&k).unwrap().signer().unwrap();
+    let dir = d.sub("log");
+    let mut c = cfg(&dir, big());
+    c.device_id = "ugv-01".into();
+    let mut r = Recorder::open(c, key, clock()).unwrap();
+    for i in 0..20 {
+        recorded(r.append_note(&note(i), false).unwrap());
+    }
+    let b = r.export_pending(None).unwrap().unwrap();
+    r.mark_exported(&b).unwrap();
+    for i in 20..30 {
+        recorded(r.append_note(&note(i), false).unwrap());
+    }
+    // A bundle that starts mid-chain (with an anchor).
+    let b2 = r.export_pending(None).unwrap().unwrap();
+    assert!(b2.anchor.is_some());
+    r.close().unwrap();
+    let pubk = d.sub("unit.key.pub");
+    for (name, bundle) in [("b1.rbbx", &b), ("b2.rbbx", &b2)] {
+        let f = d.sub(name);
+        std::fs::write(&f, bundle.to_bytes()).unwrap();
+        let o = run(&["verify", s(&f), "--keyring", s(&pubk), "--device", "ugv-01"]);
+        assert!(o.status.success(), "{name}: {}", text(&o));
+        assert!(text(&o).contains("RESULT: INTACT"), "{}", text(&o));
+        let o = run(&["verify", s(&f), "--keyring", s(&pubk), "--json"]);
+        let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+        assert!(v["verified_records"].as_u64().unwrap() > 0);
+        let o = run(&["verify", s(&f), "--keyring", s(&pubk), "--device", "other"]);
+        assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+    }
+    let f = d.sub("b2.rbbx");
+    // The signing key named explicitly (as the manifest does).
+    let id = KeyFile::load(&pubk).unwrap().key_id.clone();
+    let o = run(&["verify", s(&f), "--keyring", s(&pubk), "--signing-key", &id]);
+    assert!(o.status.success(), "{}", text(&o));
+    let o = run(&[
+        "verify",
+        s(&f),
+        "--keyring",
+        s(&pubk),
+        "--signing-key",
+        "nope",
+    ]);
+    assert_eq!(o.status.code(), Some(2));
+    // A flipped byte in a frame.
+    let mut bytes = std::fs::read(&f).unwrap();
+    let n = bytes.len();
+    bytes[n - 100] ^= 1;
+    let t = d.sub("t.rbbx");
+    std::fs::write(&t, &bytes).unwrap();
+    let o = run(&["verify", s(&t), "--keyring", s(&pubk)]);
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+    // Not a bundle; a checkpoint option on a bundle.
+    let junk = d.sub("junk.rbbx");
+    std::fs::write(&junk, b"RBBXBND1 not really").unwrap();
+    assert_eq!(
+        run(&["verify", s(&junk), "--keyring", s(&pubk)])
+            .status
+            .code(),
+        Some(2)
+    );
+    assert_eq!(
+        run(&[
+            "verify",
+            s(&f),
+            "--keyring",
+            s(&pubk),
+            "--checkpoint",
+            s(&junk)
+        ])
+        .status
+        .code(),
+        Some(2)
+    );
+    // Another key: tamper.
+    let other = d.sub("other.key");
+    assert!(run(&["keygen", "--out", s(&other)]).status.success());
+    let o = run(&["verify", s(&f), "--keyring", s(&d.sub("other.key.pub"))]);
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+}

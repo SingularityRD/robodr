@@ -7,6 +7,15 @@
 > IEC 62443-4-2 (and IEC 62443-3-3 for system-level terms). Every "Today"
 > entry cites a file you can check. Nothing here was verified on a real
 > robot. See the repository [Status](../../README.md#status).
+>
+> **Superseded rows (control plane v2).** The rows on the control plane
+> (1.2, 1.8, 3.1, 3.8, 4.1) describe the v1 baseline this analysis was made
+> against. `robodr-control-plane/v2` has since implemented GAP-02: mutual
+> TLS off loopback, a persisted nonce store and request journal, and
+> answers that are always signed
+> ([`docs/contracts/robodr.control-plane.md`](../contracts/robodr.control-plane.md)).
+> It is tested on a local test PKI only; re-assess those rows before any
+> external use.
 
 ## 1. Scope and assumptions
 

@@ -22,10 +22,12 @@
 
 ## Response and enforcement
 
-- **Nothing is executed.** The responder plans, agentd's executor
-  records, and the control plane answers `recorded_not_executed`
+- **Nothing is executed by default.** The responder plans, agentd's
+  executor records, and the control plane answers `recorded_not_executed`
   ([`docs/contracts/robodr.control-plane.md`](../contracts/robodr.control-plane.md)).
-  Executing actions are S7 and S8.
+  Executor v1 (`robodr-executor`, off by default) executes only the
+  reversible `isolate_network` / `quarantine_node` (nftables) and
+  `record_evidence`; motion and safe-state actions remain S8.
 - **The Motion Firewall records only.** There is no in-path gateway: a
   command outside the envelope is reported but still reaches the motors
   ([`docs/UNITREE.md`](../UNITREE.md) section 5). Gateway: S8.
@@ -72,9 +74,9 @@
 
 ## Security of RoboDR itself
 
-- **No TLS** on the control plane, the Kafka exporter or the anchor
-  receiver. Only `robodr-uplink` uses TLS. Use loopback or a unix socket,
-  a TLS terminator, or an isolated segment (S5).
+- **No TLS** on the Kafka exporter or the anchor receiver. The control
+  plane (v2) uses mutual TLS off loopback, but it has only been tested
+  against a local test PKI, not a deployed SOC.
 - **Keys are files**, not TPM-held. Distribution and rotation are manual.
   Anti-rollback state is a plain file (S9, S10).
 - **The TPM head anchor is tested on swtpm only.** Head anchors make

@@ -1,0 +1,18 @@
+{
+  "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "description": "signed for robot ugv-008: 401 bad_signature",
+  "expect": {
+    "authenticated": false,
+    "code": "bad_signature",
+    "status": 401
+  },
+  "key_id": "soc:soc-a:1",
+  "method": "GET",
+  "name": "12-other-robot",
+  "nonce": "contract-nonce-0012",
+  "robot_id": "ugv-007",
+  "signature": "5211e4b3e0b619c4bbb394defcfbb913422e04ea1b613f9bed32e77782e3153877619cd0b43194925af014b4c6560bcbcc436152fafbf6ba53bc32f7c1c8240b",
+  "signing_message": "robodr-control-plane/v2\nGET\n/api/v2/robots/ugv-007\nugv-008\nsoc:soc-a:1\n1800000000\ncontract-nonce-0012\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "target": "/api/v2/robots/ugv-007",
+  "timestamp": 1800000000
+}

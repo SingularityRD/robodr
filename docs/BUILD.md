@@ -78,7 +78,8 @@ Binaries built from the pure set (all shipped in the `.deb`, all checked by
 `robodr-uplink`, `robodr-anchor-receiver`. Pulsar-bound: `robodr-pulsard`.
 
 C in the pure set: only `ring` (the crypto provider of rustls, linked into
-`robodr-uplink` for TLS) compiles C and assembly through the `cc` crate,
+`robodr-uplink` and `robodr-agentd` for TLS — the agent's mutual-TLS
+control plane) compiles C and assembly through the `cc` crate,
 so a C compiler is needed. A developer build uses whatever `cc` is
 installed; **release and reproducibility builds use the pinned clang**
 for every target ([C toolchain](#c-toolchain)). Everything else is pure
@@ -86,7 +87,8 @@ Rust.
 
 ## C toolchain
 
-ring's C and assembly objects end up in the shipped `robodr-uplink`, so
+ring's C and assembly objects end up in the shipped `robodr-uplink` and
+`robodr-agentd`, so
 the release bytes depend on the C compiler, not only on the Rust
 toolchain. The C toolchain is therefore pinned like Rust is
 (`scripts/c-toolchain.sh` is the single source; this table repeats it):
@@ -383,7 +385,8 @@ pure workspace) for the musl target with the release flags (`--locked`,
 `SOURCE_DATE_EPOCH`, `--remap-path-prefix`), links with **rust-lld** from
 the Rust toolchain for both targets (self-contained musl CRT and libc from
 the target's rust-std; no `musl-gcc`), compiles the one piece of C,
-`ring`'s C and assembly (rustls' crypto provider, `robodr-uplink`), with
+`ring`'s C and assembly (rustls' crypto provider, `robodr-uplink` and
+`robodr-agentd`), with
 the **pinned clang** for both triples (`CC_<triple>` = `clang-18` 18.1.3,
 [C toolchain](#c-toolchain): missing or another version fails the build;
 ring needs no libc headers beyond what clang finds, verified 2026-10-26

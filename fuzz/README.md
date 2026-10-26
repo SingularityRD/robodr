@@ -18,6 +18,7 @@ violated output invariant (documented at the top of its harness file).
 | `commission_jsonl` | robodr-commission | a JSONL recording to `JsonlSource`, `Learner`, strict re-read of the learned draft, `check_event` | same |
 | `firewall_policy` | robodr-agent / robodr-firewall | `profile JSON \0 command bytes` to `strict_from_str`, `FirewallSettings::from_profile`, `Policy::compile`, `Firewall::check` | `crates/robodr-agent/tests/fuzz_smoke.rs` |
 | `pipeline_config` | robodr-ros2-pipeline | sensor `Config` (JSON) to `validate_with`, a `Pipeline` over RTPS fixtures, `/proc/net/route` parsing | `crates/robodr-ros2-pipeline/tests/fuzz_smoke.rs` |
+| `control_plane_request` | robodr-agentd | raw bytes from a control-plane peer (read-step byte + request) to the bounded HTTP parser (`control::http::read_request`, re-encode round trip, read sizes do not matter), `auth::credentials` + signature check, `control::route`, `api::parse_submit` / `parse_revert`, `evidence::parse_export` / `parse_link` | `crates/robodr-agentd/tests/fuzz_smoke.rs` |
 
 The firewall crate has no file format of its own (and no serde): its policy
 is compiled from the profile JSON the agent parses, so that target and its
@@ -56,6 +57,12 @@ This crate is **not** part of the main workspace: `Cargo.toml` has its own
 at the repo root never touch it and never need nightly or `libfuzzer-sys`.
 
 ## Status: libFuzzer not run in the development sandbox
+
+`control_plane_request` (added 2026-10-26) has likewise only run under the
+std-only smoke driver: about 90 000 inputs in a 240 s debug run (PRNG seed
+`7`), no panic, no invariant violation. Writing its read-size invariant exposed that
+the HTTP head bound depended on how the peer's bytes were split into reads
+(fixed before the target landed).
 
 `libfuzzer-sys` (crates.io) and the nightly toolchain with `cargo-fuzz` were
 unreachable where this was written, so **no target has been run under
@@ -137,6 +144,12 @@ All seeds are SYNTHETIC (no real robot data):
   sources / clock steps / a fault verdict.
 * `pipeline_config/`: `config/robodr.toml.example` as JSON, a capture-enabled
   and a replay config, a `/proc/net/route` table.
+* `control_plane_request/`: signed `robodr-control-plane/v2` requests of
+  every route (fixed test SOC key, timestamp and nonces; action request,
+  revert, evidence inventory / exports / chunk / delete), each prefixed with
+  the harness's read-step byte. Written by the `regenerate_seeds` test in
+  `crates/robodr-agentd/tests/fuzz_smoke.rs` (`--ignored`); the smoke test
+  fails when the committed seeds differ from it.
 
 Each smoke test also checks its seeds take the success path (pcaps reach the
 RTPS parser, fragments reassemble, chains verify, findings validate, the

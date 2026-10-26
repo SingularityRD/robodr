@@ -151,11 +151,13 @@ docs/SECURE-DELIVERY.md Design (not implemented): air-gapped fleet distribution,
 docs/BUILD.md           Toolchain, MSRV, Cargo.lock policy, air-gapped builds, CI.
 docs/PULSAR-INTEGRATION.md  Every Pulsar item the Pulsar-bound crates use.
 docs/contracts/         robodr.findings contract (v2) + JSON Schema + example,
-                        robodr.control-plane contract; legacy/ = superseded 1.x.
+                        robodr.control-plane contract (v2) + fixtures/
+                        test vectors; legacy/ = superseded 1.x.
 docs/{adr,compliance,customer}/  ADRs (D1-D9 etc.), IEC 62443/CRA/safety notes, customer drafts.
 fuzz/                   cargo-fuzz targets (RTPS, capture, black box, OCSF,
-                        commissioning, firewall, pipeline config; own
-                        workspace) + std-only smoke runs in the crates' tests.
+                        commissioning, firewall, pipeline config, control-plane
+                        requests; own workspace) + std-only smoke runs in the
+                        crates' tests.
 man/                    Man pages for every shipped binary.
 packaging/              .deb, offline bundle, systemd units, tmpfiles, sysusers.
 vendor/pulsar/          Pulsar, as a git submodule (the base we build on).
@@ -224,13 +226,18 @@ module, no robot):
   confirmed on real Fast DDS and Cyclone DDS samples; XCDR2 / `D_CDR2` and
   the other message types only on hand-built vectors. The Motion Firewall
   runs recording-only, and nothing executes a response.
-- The control-plane action API (`robodr-agentd` `control_plane`, off by
-  default; `docs/contracts/robodr.control-plane.md`) authenticates
-  Ed25519-signed SOC requests for the seven catalog actions, judges them
-  against the live safety state and records them, but **executes nothing**
-  (`recorded_not_executed`). It has no TLS (put a terminator in front),
-  keeps request states in memory only, and was exercised with an
-  in-process signing client over loopback, not against a deployed SOC.
+- The control-plane API `robodr-control-plane/v2` (`robodr-agentd`
+  `control_plane`, off by default; `docs/contracts/robodr.control-plane.md`)
+  serves mutual TLS (rustls) off loopback and authenticates Ed25519-signed
+  SOC requests for the seven catalog actions, judges them against the live
+  safety state, records them and keeps their state across restarts
+  (journal, persisted replay store). It **executes nothing**
+  (`recorded_not_executed`) unless executor v1 (`robodr-executor`, off by
+  default) is enabled; then executor states (`verified`, `reverted`, ...)
+  are signed and journalled like every other state. Its evidence API exports black-box records as
+  signed, chunked bundles that `robodr-blackbox verify` checks. Exercised
+  with an in-process signing client and a test PKI over loopback, not
+  against a deployed SOC or across a real network.
   The Pulsar module (`robodr-sensor-ros2`) runs the same decode for its
   envelope check but does not forward decoded samples (see its crate docs).
 - The black box's TPM 2.0 NV counter head anchor (`TpmNvCounterAnchor`,

@@ -819,7 +819,8 @@ key credential) and passes `--check-config` when copied verbatim.
 `finding_signing`, whose key reaches the daemon only through the drop-in
 `robodr-agentd.service.d/20-finding-key.conf.example` (install the drop-in
 and the key together, or the unit does not start), and `control_plane`,
-which needs the SOC's public key file (below). Copy the keys you need
+which needs the SOC's public key file, the TLS files and the finding key
+(below; drop-in `30-control-plane.conf.example`). Copy the keys you need
 from it once their files exist, and check every edit with
 `robodr-agentd --config /etc/robodr/agentd.json --check-config`.
 
@@ -937,62 +938,148 @@ diode the per-finding signature is **not** carried (the batch is signed
 instead; contract §8), so diode-side consumers must verify in `Optional`
 mode.
 
-**Control-plane API (`control_plane`, optional, off by default).** Lets a
-SOC *request* one of the seven catalog actions on this robot
-(`restrict_motion`, `quarantine_node`, `isolate_network`,
-`record_evidence`, `safe_pause`, `request_safe_state`, `rollback_config`;
-contract `docs/contracts/robodr.control-plane.md`). agentd judges each request
-against the safety state at that moment and the response policy, records it
-in the black box and answers. **Nothing is executed in this release:** an
-accepted request is answered `recorded_not_executed`, a refused one
-`refused` with a reason (always while the e-stop or safe state is active,
-for everything but `record_evidence` while the policy is not OEM-validated,
-for `safe_pause` / `request_safe_state` when the response policy's
-`morphology` is `humanoid` — de-energising a humanoid makes it fall — and for
-`rollback_config` on a humanoid or quadruped, or a `restrict_motion` cap
-below the policy's `min_motion_factor` there: a legged robot balances
-actively, also while idle). The response policy must declare `morphology`
-once it is OEM-validated or its platform is `other`; see
+**Control-plane API (`control_plane`, optional, off by default).** The
+SOC API `robodr-control-plane/v2` (contract
+`docs/contracts/robodr.control-plane.md`, installed under
+`/usr/share/doc/robodr/contracts/`). A SOC may *request* one of the seven
+catalog actions on this robot (`restrict_motion`, `quarantine_node`,
+`isolate_network`, `record_evidence`, `safe_pause`, `request_safe_state`,
+`rollback_config`) and export black-box evidence. agentd judges each
+request against the safety state at that moment and the response policy,
+records it in the black box and in its request journal, and answers.
+**Nothing is executed unless executor v1 is enabled** (section 6.5, off by
+default): an accepted request is answered `recorded_not_executed`, a
+refused one `refused` with a reason (always while
+the e-stop or safe state is active, for everything but `record_evidence`
+while the policy is not OEM-validated, for `safe_pause` /
+`request_safe_state` when the response policy's `morphology` is `humanoid`
+— de-energising a humanoid makes it fall — and for `rollback_config` on a
+humanoid or quadruped, or a `restrict_motion` cap below the policy's
+`min_motion_factor` there: a legged robot balances actively, also while
+idle). The response policy must declare `morphology` once it is
+OEM-validated or its platform is `other`; see
 `config/response-policy.unitree-g1.example.json` /
-`…unitree-go2.example.json`. Set it up:
+`…unitree-go2.example.json`.
+
+Two locks protect it and both are required: **mutual TLS** on the network
+listener (the SOC's client certificate, issued by a CA the robot trusts)
+and an **Ed25519 signature** on every request (the SOC's signing key).
+Every answer is signed with the robot's finding key. Plain HTTP exists only
+on loopback and on the unix socket.
 
 ```sh
-# On the SOC side, once: the SOC signing key (keep the secret there).
-# Name the key after the SOC instance: soc:<id>:<n>, e.g. soc:soc-a:1.
+# --- On the SOC side, once ----------------------------------------------
+# 1. The SOC signing key (keep the secret there). Name it after the SOC
+#    instance: soc:<id>:<n>.
 robodr-blackbox keygen --out soc-a.key --key-id soc:soc-a:1
-# Carry soc-a.key.pub to every robot (vetted media):
+# 2. The SOC's client-certificate CA and the SOC client certificate
+#    (EC P-256 shown; keep the CA key offline). The client certificate
+#    needs extendedKeyUsage=clientAuth.
+openssl ecparam -name prime256v1 -genkey -noout -out soc-ca.key
+openssl req -new -x509 -key soc-ca.key -subj "/O=<org>/CN=<org> SOC CA" \
+    -days 3650 -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" -out soc-ca.pem
+openssl ecparam -name prime256v1 -genkey -noout -out soc-client.key
+openssl req -new -key soc-client.key -subj "/O=<org>/CN=soc-a" -out soc-client.csr
+printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n' >client.ext
+openssl x509 -req -in soc-client.csr -CA soc-ca.pem -CAkey soc-ca.key \
+    -CAcreateserial -days 825 -extfile client.ext -out soc-client.pem
+# (optional) the pin of that certificate's public key:
+openssl x509 -in soc-client.pem -pubkey -noout | openssl pkey -pubin -outform DER \
+    | sha256sum | cut -d' ' -f1
+
+# --- Per robot -------------------------------------------------------------
+# 3. The robot's TLS server key and certificate, issued by the CA the SOC
+#    uses for robots; SAN = the address / name the SOC connects to,
+#    extendedKeyUsage=serverAuth. The key never leaves the robot:
+sudo openssl ecparam -name prime256v1 -genkey -noout | \
+    sudo openssl pkcs8 -topk8 -nocrypt -out /etc/robodr/keys/agentd-cp-tls.key
+sudo chmod 0600 /etc/robodr/keys/agentd-cp-tls.key
+sudo openssl req -new -key /etc/robodr/keys/agentd-cp-tls.key -subj "/O=<org>/CN=ugv-007" \
+    -addext "subjectAltName=IP:10.0.7.7" -out ugv-007.csr     # sign it at the robot CA
+sudo install -D -o root -g root -m 0644 ugv-007.pem   /etc/robodr/control-plane/robot.pem
+sudo install -D -o root -g root -m 0644 soc-ca.pem    /etc/robodr/control-plane/soc-ca.pem
 sudo install -D -o root -g root -m 0644 soc-a.key.pub /etc/robodr/soc/soc.pub
-# agentd.json (socket under agentd's RuntimeDirectory; TCP stays on loopback):
-#   "control_plane": { "unix_socket": "/run/robodr-agentd/control.sock",
-#                      "soc_keys": ["/etc/robodr/soc/soc.pub"] }
+# 4. The finding key (answers are signed; section 6.4 finding_signing) and
+#    the drop-ins: credentials, state directory, the SOC network.
+sudo install -D -m 0644 /usr/share/doc/robodr/examples/robodr-agentd.service.d/30-control-plane.conf.example \
+    /etc/systemd/system/robodr-agentd.service.d/30-control-plane.conf
+sudoedit /etc/systemd/system/robodr-agentd.service.d/30-control-plane.conf   # IPAddressAllow=
+# 5. agentd.json:
+#   "control_plane": {
+#     "listen_tcp": "10.0.7.7:8787",
+#     "tls": { "cert_chain": "/etc/robodr/control-plane/robot.pem",
+#              "key_file": "/run/credentials/robodr-agentd.service/cp-tls.key",
+#              "client_ca": "/etc/robodr/control-plane/soc-ca.pem",
+#              "client_spki_sha256": ["<pin from step 2>"] },
+#     "unix_socket": "/run/robodr-agentd/control.sock",
+#     "state_dir": "/var/lib/robodr/control-plane/agentd",
+#     "soc_keys": ["/etc/robodr/soc/soc.pub"],
+#     "evidence": {} }
+sudo systemctl daemon-reload
 sudo robodr-agentd --config /etc/robodr/agentd.json --check-config
 sudo systemctl restart robodr-agentd
+# 6. Give the SOC: the robot's address, its CA (or the robot.pem SPKI pin,
+#    status.json control_plane.tls.server_spki_sha256), the finding .pub
+#    (answers, manifests) and the black-box .pub (evidence bundles).
 ```
 
+- `state_dir` holds the request journal, the replay store and evidence
+  exports. It must be a directory of its own, mode 0700, owned by the
+  daemon's user (tmpfiles creates `/var/lib/robodr/control-plane/agentd`);
+  agentd refuses to start otherwise. Do not edit or copy files into it.
 - The SOC key file must be a public Ed25519 key file owned by root (or
   `robodr`), not writable by group or others, not a symlink; a `device_id`
-  in it must be this robot. Several SOC keys (rotation) may be listed; every
-  request names its key id. Never list the robot's own black-box or finding
-  key (refused).
+  in it must be this robot. Never list the robot's own black-box or finding
+  key (refused). The TLS key file must have no group/other bits (the
+  systemd credential copy has none); certificate files must not be
+  group/other-writable.
 - The SOC signs every request (contract §2) and needs a clock within
   `max_clock_skew_s` (default 30 s) of the robot's: run NTP on both, or
   requests are refused `stale_timestamp`.
-- **Transport.** agentd speaks plain HTTP. Prefer the unix socket (a local
-  TLS terminator or SSH forward in front of it) or `"listen_tcp":
-  "127.0.0.1:8787"` behind a TLS terminator; the unit's `IPAddressDeny=any`
-  then needs a drop-in `[Service]` / `IPAddressAllow=localhost`. A
-  non-loopback address needs `"allow_remote": true` and is warned about:
-  requests are authenticated, not confidential.
-- With `finding_signing`, every answer carries `X-RoboDR-Answer-Signature`
-  (the finding key): give the SOC the finding `.pub` it already uses for
-  `robodr-finding-sig`.
-- Watch `status.json` `control_plane` (`unauthenticated`,
+- **Restart.** Request states and used nonces survive a restart: the SOC
+  can query a request after it and a replay stays refused. If the replay
+  store was damaged or removed, agentd fences: requests signed before the
+  start are refused `stale_timestamp` (the SOC signs again); the journal is
+  copied to `state_dir/quarantine/` and the start note says so.
+- Watch `status.json` `control_plane` (`unauthenticated`, `tls_failures`,
   `last_auth_failure`, `recorded_not_executed`, `refused`, `busy`,
-  `rate_limited`) and the findings `robot.agent.control_plane_unauthenticated`
-  (High: someone without the key is trying) and
-  `robot.agent.control_plane_invalid` (Medium: the SOC sent something the API
-  never allows). Each decision is a `robodr.control_plane_request` note in
-  the black box with the SOC's signature, which re-verifies offline.
+  `rate_limited`, `journal_errors`, `replay_fence`, `evidence`) and the
+  findings `robot.agent.control_plane_unauthenticated` (High: someone
+  without the certificate or the key is trying) and
+  `robot.agent.control_plane_invalid` (Medium: the SOC sent something the
+  API never allows). Each decision is a `robodr.control_plane_request` note
+  in the black box with the SOC's signature, which re-verifies offline.
+
+**Rotation (no downtime for the SOC).**
+
+| What | How |
+| --- | --- |
+| SOC signing key | add the new `.pub` to `soc_keys` (both listed), restart agentd; switch the SOC; remove the old one, restart |
+| SOC client certificate, same CA | issue the new certificate; with pins, add the new pin to `client_spki_sha256` first (both listed), restart; switch the SOC; remove the old pin |
+| SOC client CA | append the new CA certificate to `client_ca` (PEM bundle with both), restart; reissue the SOC certificate; remove the old CA, restart |
+| Robot TLS certificate / key | install the new `robot.pem` and key (same paths), restart agentd; if the SOC pins the robot's SPKI, give it the new pin first (`openssl x509 -pubkey ...` as above) |
+| Finding key (answers, manifests) | section 4.3; give the SOC the new `.pub` before the restart |
+
+TLS material and keys are read at start only: every change takes a
+restart, which keeps the request state. There is no CRL / OCSP: to cut off
+a client certificate, remove its pin or its CA and restart.
+
+**Evidence export (`control_plane.evidence`).** The SOC lists the retained
+evidence (`GET .../evidence`), asks for an export of a finding's evidence
+links (or a seq / time range), downloads it in chunks (resumable, they
+survive a restart) and verifies it with the robot's public keys (contract
+§11.6). An analyst can check a downloaded bundle offline:
+
+```sh
+robodr-blackbox verify bundle.rbbx --keyring agentd-blackbox.key.pub --device ugv-007 \
+    [--signing-key <manifest chain.signing_key.key_id>]   # exit 0 = intact
+```
+
+Exports are kept in `state_dir/exports/` until they expire
+(`export_ttl_s`, default 24 h) or the SOC deletes them; `max_exports`,
+`max_export_bytes` and `max_storage_bytes` bound the space they take. Each
+export is a `robodr.control_plane_evidence_export` note in the black box.
 
 **Black-box upkeep.** Every tick writes the black box's `head.json`
 high-water mark when records were added since the last one. If the
@@ -1205,8 +1292,16 @@ marks (hashes, sequence numbers) are visible on the wire.
 
 Off by default. With `executor.enabled` absent or `false`, every accepted
 control-plane request stays `recorded_not_executed` and nothing reaches
-the robot. Enable the executor only after commissioning (section 5), with
-an OEM-validated response policy, and after the acceptance check below.
+the robot. With it, an accepted request of an executor action is
+answered `pending` and then reads `verified`, `refused` (the executor's own
+checks), `failed` or, after a revert or its TTL, `reverted` (contract
+§6a). Every answer is signed like any v2 answer, and every state the
+executor reports is written to the control plane's request journal
+(`state_dir`) before it is answered, so a request reads the same after an
+agentd restart (agentd also asks the executor once, at start, about the
+requests still open). Enable the executor only after commissioning
+(section 5), with an OEM-validated response policy, and after the
+acceptance check below.
 Design, safety argument and limits are in
 [`crates/robodr-executor/README.md`](../crates/robodr-executor/README.md).
 
@@ -1251,8 +1346,9 @@ table.
      executor takes the robot's morphology and `fall_safe_restrict` from
      it.
    * `network.management`: required. Isolation is refused without it, so
-     it can never cut the SOC off. List the operator and SOC addresses,
-     the TLS terminator in front of the control plane, and, if the robot
+     it can never cut the SOC off. List the operator and SOC addresses
+     (every address the mutual-TLS control plane accepts: the
+     `IPAddressAllow=` of `30-control-plane.conf`), and, if the robot
      depends on them, its DNS, NTP and DHCP servers.
    * `network.uplink`: the findings uplink (`robodr-uplink`'s ingest API).
    * `network.control_buses`: the robot's internal controller networks,
@@ -1469,6 +1565,15 @@ through the diode.
 
 ### 8.2 Black-box bundles
 
+**Connected sites: available on demand.** With `control_plane.evidence`
+(section 6.4) the SOC exports a finding's records, or a sequence / time
+range, as an `RBBXBND1` bundle over the mutual-TLS control plane, in signed
+chunks, and verifies it with the robot's public keys;
+`robodr-blackbox verify bundle.rbbx --keyring <black-box .pub> --device <id>`
+checks a bundle file offline. This does not move the export cursor or prune
+anything: the black box keeps its records (cyclic retention only).
+
+**Diode sites:**
 **planned (CLI); available as a library API.** `robodr-blackbox`'s
 `Recorder::export_pending` produces an `RBBXBND1` bundle of every record after
 the authenticated export cursor. The far side's `Receiver::accept` verifies
@@ -1809,7 +1914,9 @@ The package never deletes evidence or keys, not even on `apt purge`.
 | Critical `robot.agent.evidence_quarantined` / `robot.agent.evidence_truncated` | the black-box directory was edited (stray or cut segment files, records cut after the newest mark) | section 6.4: preserve the whole `<blackbox>` directory, treat as tampering |
 | `finding_signing.key_file ... black-box key` / `must be an ed25519 key` | finding key reused or HMAC | section 6.4: generate a dedicated Ed25519 key |
 | `correlation rules: ...` at start | site rule file invalid or duplicates a shipped id | fix the file, or `--check-config` to see every problem |
-| SOC gets 401 `stale_timestamp` / `bad_signature` from the control plane | clocks apart, or the request was signed for another robot id / rewritten by a proxy | section 6.4 "Control-plane API": NTP on both sides; the proxy must forward target and body unchanged |
+| SOC gets no answer at all from the control plane (connection closed during the handshake) | no / wrong client certificate, expired, or its key is not pinned; plain HTTP to the TLS port | `status.json` `control_plane.last_auth_failure` names the TLS reason; section 6.4 "Control-plane API", rotation table |
+| SOC gets 401 `stale_timestamp` right after a robot restart | the replay store was damaged or removed: requests signed before the start are fenced | sign again; check the start note / `state_dir/quarantine/` |
+| SOC gets 401 `stale_timestamp` / `bad_signature` from the control plane | clocks apart, or the request was signed for another robot id / rewritten by a proxy | section 6.4 "Control-plane API": NTP on both sides; the SOC must sign the exact target and body it sends (mutual TLS ends at agentd: no proxy may rewrite them) |
 | every control-plane request `refused` `observe_mode` | profile not enforced or policy not OEM-validated | section 5; the API never acts beyond what the policy allows |
 | High `robot.agent.control_plane_unauthenticated` | requests without a valid SOC signature | check `status.json` `control_plane.last_auth_failure`; treat repeated ones as an attempt to reach the robot |
 | every finding `[observe-only]` | profile unlocked, missing or invalid | section 5 |

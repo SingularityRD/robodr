@@ -151,21 +151,29 @@
 //!
 //! # What the daemon does with a plan
 //!
-//! Nothing. The agent's executor is the default `NoopExecutor`: plans
-//! (dispositions, `would_have`) are recorded in the black box and carried in
-//! the finding, never executed. Wiring an executor is future work and must
-//! follow `robodr_agent::executor`'s contract.
+//! By default nothing. The agent's executor is the default `NoopExecutor`:
+//! plans (dispositions, `would_have`) are recorded in the black box and
+//! carried in the finding, never executed. With `executor.enabled` and
+//! `planner_orders` (executor v1, [`crate::executor_link`]) the eligible
+//! network steps of a recorded plan are handed to `robodr-executor`.
 //!
 //! # Control-plane requests
 //!
-//! With `control_plane` ([`crate::control`]), listener threads authenticate
-//! SOC action requests and hand them over a bounded channel; the main loop
+//! With `control_plane` ([`crate::control`], `robodr-control-plane/v2`),
+//! listener threads terminate mutual TLS, authenticate SOC action requests
+//! and hand them over a bounded channel (evidence exports are built on the
+//! listener threads; only their black-box note comes here); the main loop
 //! takes up to [`crate::control::CALLS_PER_POLL`] per iteration and judges
 //! each against the safety state *at that moment* (the live feed is
 //! re-evaluated first), the operational context and the response policy,
 //! records request and decision as a `robodr.control_plane_request` note
-//! (fsynced) and answers. The executor is the recording one: an accepted
-//! request is answered `recorded_not_executed`, nothing reaches the robot.
+//! (fsynced), journaled around it in `control_plane.state_dir` (so the
+//! state survives a restart), and answers. Without executor v1 the executor
+//! is the recording one: an accepted request is answered
+//! `recorded_not_executed`, nothing reaches the robot. With it, accepted
+//! requests are staged and dispatched to `robodr-executor` once stored, and
+//! every outcome the link reports is journalled at once
+//! ([`crate::control::api::Engine::sync`]).
 //! Failed authentications and authenticated invalid requests become the
 //! observe-only self-health findings
 //! `robot.agent.control_plane_unauthenticated` (High) and
@@ -739,39 +747,84 @@ impl<'a> Daemon<'a> {
             .map_err(|e| DaemonError::Io(format!("spool {}: {e}", cfg.spool.dir.display())))?;
 
         // The control plane (before the input threads: a bind failure then
-        // leaves nothing running). Answers are signed with the finding key.
+        // leaves nothing running). Answers and evidence manifests are signed
+        // with the finding key (required with control_plane, config.rs).
         let control = match &r.control_plane {
             None => None,
             Some(spec) => {
-                let signer = match &r.finding_key {
-                    Some((key, key_id)) => Some(
-                        crate::config::signer_for(
-                            robodr_blackbox::sign_ed25519::ED25519,
-                            key,
-                            Some(key_id),
-                        )
-                        .map_err(|e| DaemonError::Config(format!("finding key: {e}")))?,
-                    ),
-                    None => None,
+                let Some((key, key_id)) = &r.finding_key else {
+                    return Err(DaemonError::Config(
+                        "control_plane needs finding_signing: every answer is signed with the \
+                         finding key"
+                            .into(),
+                    ));
                 };
-                let mut cp =
-                    ControlPlane::start(spec, &cfg.robot.id, signer).map_err(DaemonError::Io)?;
+                let signer = crate::config::signer_for(
+                    robodr_blackbox::sign_ed25519::ED25519,
+                    key,
+                    Some(key_id),
+                )
+                .map_err(|e| DaemonError::Config(format!("finding key: {e}")))?;
+                let bb_dir = agent.blackbox_dir().to_path_buf();
+                let robot = cfg.robot.id.clone();
+                let reconcile = |ids: &[String]| {
+                    crate::control::evidence::find_decision_notes(
+                        &crate::control::evidence::DirSource(bb_dir.clone()),
+                        &robot,
+                        ids,
+                    )
+                };
+                let mut cp = ControlPlane::start(spec, &cfg.robot.id, signer, &bb_dir, &reconcile)
+                    .map_err(DaemonError::Io)?;
+                // executor v1: accepted requests go to robodr-executor; the
+                // requests restored from the journal keep the executor's
+                // last journalled word.
                 if let Some(link) = &executor {
                     cp.engine
                         .set_executor(Box::new(link.control_executor(r.policy.morphology)));
+                    // What happened while agentd was down (a TTL lifted, a
+                    // pending order verified): asked once, journalled as
+                    // the answers come in.
+                    link.resync(cp.engine.open_executor_requests());
                 }
-                let _ = writeln!(
+                let st = cp.state_status().clone();
+                let _ =
+                    writeln!(
                     log,
-                    "robodr-agentd: control plane on {} ({} SOC key(s)); requests are judged and \
-                     recorded, {}",
+                    "robodr-agentd: control plane ({}) on {} ({} SOC key(s){}{}); requests are \
+                     judged and recorded, {}; state: {} request(s) restored, \
+                     {} dangling decision(s) settled from the black box",
+                    crate::control::auth::API_VERSION,
                     cp.status().listening.join(", "),
                     spec.keys.len(),
+                    if spec.tls.is_some() { ", mutual TLS" } else { "" },
+                    if spec.evidence.is_some() { ", evidence API" } else { "" },
                     if executor.is_some() {
                         "accepted ones are handed to robodr-executor (executor v1)"
                     } else {
                         "never executed"
-                    }
+                    },
+                    st.restored,
+                    st.resolved_committed + st.resolved_aborted,
                 );
+                if st.journal_damaged > 0 || st.replay.damaged > 0 {
+                    let _ = writeln!(
+                        log,
+                        "robodr-agentd: control plane: the state journals were damaged \
+                         ({} request entr(ies), {} nonce entr(ies) skipped; copy in {}); \
+                         requests signed before this start are refused",
+                        st.journal_damaged,
+                        st.replay.damaged,
+                        st.journal_quarantined.as_deref().unwrap_or("quarantine/")
+                    );
+                }
+                if let Some(f) = st.replay.fence {
+                    let _ = writeln!(
+                        log,
+                        "robodr-agentd: control plane: replay store fenced at {f}: requests \
+                         signed at or before it are refused"
+                    );
+                }
                 Some(cp)
             }
         };
@@ -1002,6 +1055,30 @@ impl<'a> Daemon<'a> {
         if let Err(e) = d.agent.record_note(now, "start note", &note, true) {
             d.stats.note_errors += 1;
             let _ = writeln!(d.log, "robodr-agentd: start note not recorded: {e:?}");
+        }
+        // The control plane's state at start (restored requests, settled
+        // decisions, journal damage, replay fence) is evidence too.
+        if let Some(cp) = d.control.as_ref() {
+            let st = cp.status();
+            let note = serde_json::json!({
+                "kind": "robodr.control_plane_start",
+                "api": st.api,
+                "listening": st.listening,
+                "tls": st.tls,
+                "evidence_api": st.evidence.is_some(),
+                "state": st.state,
+            });
+            let now = d.clock.now();
+            if let Err(e) = d
+                .agent
+                .record_note(now, "control-plane start note", &note, true)
+            {
+                d.stats.note_errors += 1;
+                let _ = writeln!(
+                    d.log,
+                    "robodr-agentd: control-plane start note not recorded: {e:?}"
+                );
+            }
         }
         d.profile_witness(accepted_ok);
         d.evidence_incidents();
@@ -2350,6 +2427,15 @@ impl Daemon<'_> {
                     let out = robodr_executor::evidence::record(&o, &refs, &mut sink, now_ms);
                     link.put(out);
                 }
+            }
+        }
+        // Journal every changed outcome at once (control plane v2): a
+        // request that reached `verified` reads `verified` after a restart
+        // even if nobody asked for it before.
+        let changed = link.take_changed();
+        if let Some(cp) = self.control.as_mut() {
+            for id in changed {
+                cp.engine.sync(&id);
             }
         }
         for ev in link.take_events() {

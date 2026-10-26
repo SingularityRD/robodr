@@ -109,24 +109,41 @@ an attacker rewrote: then only the receiver's side shows it (marks stop
 arriving, or arrive lower). The receiver's own host, state directory and
 signing key are trusted. Reports that break the claims above are in scope.
 
-### Control-plane action API: what is claimed
+### Control-plane API (`robodr-control-plane/v2`): what is claimed
 
 `robodr-agentd`'s optional `control_plane` API (off unless configured;
 contract `docs/contracts/robodr.control-plane.md`) lets a SOC request one
-of the seven catalog containment actions. The claims are:
+of the seven catalog containment actions and export black-box evidence. The
+claims are:
 
-- **Nothing is executed.** In this release the only executor records: an
+- **Nothing is executed unless executor v1 is enabled.** By default (no
+  `executor` section, or `"enabled": false`) the only executor records: an
   accepted request is answered `recorded_not_executed` (`"executed":
   false`) and written to the black box as a plan; nothing is sent to the
-  robot, its network, its mission executive or its safety system.
-- **No request without a SOC key.** Every request must carry an Ed25519
-  signature by a configured SOC public key over the method, the exact
-  target, this robot's id, the key id, a timestamp, a nonce and the body
-  hash. A modified, re-targeted (another robot) or replayed request is
-  refused; the nonce cache fails closed when full. Unauthenticated
-  requests are never judged or recorded one by one; they are counted and
-  reported (`robot.agent.control_plane_unauthenticated`, High,
-  observe-only).
+  robot, its network, its mission executive or its safety system. With
+  `executor.enabled`, agentd hands `isolate_network` / `quarantine_node`
+  (reversible nftables rules with a TTL) and `record_evidence` to the
+  separate `robodr-executor` (the only `CAP_NET_ADMIN` unit), only after
+  the request's black-box note exists; the executor re-checks the live
+  safety state before it applies. Its states (`verified`, `refused`,
+  `failed`, `reverted`) are signed answers and journalled like every other
+  state. Motion, safe-pause, safe-state and rollback actions are never
+  executed.
+- **No channel without the SOC's certificate.** Off loopback the API is
+  served only over mutual TLS (rustls): the peer must present a client
+  certificate that chains to the configured SOC CA, is valid now and, if
+  pins are configured, has a pinned public key. No session resumption.
+  Failed handshakes are counted and reported like failed signatures.
+- **No request without a SOC key.** On every listener, every request must
+  also carry an Ed25519 signature by a configured SOC public key over the
+  method, the exact target, this robot's id, the key id, a timestamp, a
+  nonce and the body hash. A modified, re-targeted (another robot) or
+  replayed request is refused, **also across a restart**: the nonce store
+  is persisted before a request proceeds, fails closed when full or not
+  writable, and fences (refuses everything signed before the start) when it
+  cannot be trusted. Unauthenticated requests are never judged or recorded
+  one by one; they are counted and reported
+  (`robot.agent.control_plane_unauthenticated`, High, observe-only).
 - **A valid key cannot ask for more.** The seven catalog actions with their own
   parameters and TTL rules; no motion command, force or override field
   exists, and `authority` must be `request`. The strongest action is a
@@ -137,23 +154,39 @@ of the seven catalog containment actions. The claims are:
   nothing above the response policy's ceiling for the state is accepted.
   Authenticated but invalid requests are refused, recorded and reported
   (`robot.agent.control_plane_invalid`).
-- **Every decision is evidence.** Request (with its signature and body, so it
-  re-verifies offline), safety state, context and decision are one signed,
-  fsynced black-box note; if the black box does not take it, the answer is
-  `failed` and nothing is claimed or stored.
-- **Bounded.** Parsing, connections, the per-key rate limit and the queue
-  to the main loop are bounded; a flood costs the control plane's
-  availability (429 / 503), never the detection loop's.
+- **Every decision is evidence, and is not forgotten.** Request (with its
+  signature and body, so it re-verifies offline), safety state, context and
+  decision are one signed, fsynced black-box note; if the black box does
+  not take it, the answer is `failed` and nothing is claimed or stored. The
+  request state is journaled around that note (begin / commit), so a
+  restart neither forgets an answered decision nor invents one: a decision
+  a crash left half-journaled is settled from the black box.
+- **Every answer is authentic.** Every answer to an authenticated request is
+  signed with the finding key, bound to the request's signature (a replayed
+  answer does not verify); the robot never sends an unsigned success.
+- **Evidence leaves only as recorded.** Exports carry the black box's frames
+  byte for byte (hashed, chained, signed by the black-box key) with a
+  manifest signed by the finding key; no key material and nothing outside
+  the black box's segment files is read into one. The SOC verifies them
+  with the robot's public keys only.
+- **Bounded.** Parsing, TLS handshakes, connections, the per-key rate limits,
+  the answer write time, evidence exports (size, count, storage, one at a
+  time) and the queue to the main loop are bounded; a flood costs the
+  control plane's availability (429 / 503), never the detection loop's.
+  The request parser has a libFuzzer target (`control_plane_request`).
 
-Not claimed: confidentiality (agentd has no TLS stack; listen on loopback or
-a unix socket and terminate TLS in front for remote SOCs); authenticity of
-answers unless `finding_signing` is configured (answers are then signed with
-the finding key, bound to the request signature); availability against a
-network attacker; protection when the SOC's private key or the robot's
-configuration (`soc_keys`) is compromised; correct judgment when the safety
-state source is wrong (see the live safety feed's own limits). Reports that
-break the claims above, or any way the API reaches the robot, are in scope
-(the latter is always Critical).
+Not claimed: confidentiality or authentication on the loopback listener and
+the unix socket (local only, file permissions); availability against a
+network attacker; protection when the SOC's private key **and** client
+certificate, or the robot's configuration (`soc_keys`, `tls`), are
+compromised; revocation of a SOC client certificate other than by removing
+its CA or pin and restarting; integrity of the request journal against a
+person with write access to the state directory (it is checksummed, not
+signed: it can be made to forget or to fence, the black box keeps every
+decision); correct judgment when the safety state source is wrong (see the
+live safety feed's own limits). Reports that break the claims above, or any
+way the API reaches the robot, are in scope (the latter is always
+Critical).
 
 ## Supported versions
 

@@ -1,0 +1,78 @@
+{
+  "api": "robodr-control-plane/v2",
+  "cases": [
+    {
+      "description": "robot snapshot",
+      "name": "01-robot"
+    },
+    {
+      "description": "action request (safe_pause)",
+      "name": "02-submit"
+    },
+    {
+      "description": "request state, percent-encoded request id",
+      "name": "03-get-request"
+    },
+    {
+      "description": "revert of a recorded request",
+      "name": "04-revert"
+    },
+    {
+      "description": "evidence inventory",
+      "name": "05-evidence-inventory"
+    },
+    {
+      "description": "export of a finding's evidence (seqs 10 and 12, 3 context records each side); answer 201 = the manifest bytes",
+      "name": "06-evidence-export"
+    },
+    {
+      "description": "the manifest again (resume after a disconnect)",
+      "name": "07-evidence-manifest"
+    },
+    {
+      "description": "one chunk (application/octet-stream)",
+      "name": "08-evidence-chunk-0"
+    },
+    {
+      "description": "one chunk (application/octet-stream)",
+      "name": "09-evidence-chunk-1"
+    },
+    {
+      "description": "delete an export",
+      "name": "10-evidence-delete"
+    },
+    {
+      "description": "signature over another body: 401 bad_signature, unsigned answer",
+      "name": "11-bad-signature"
+    },
+    {
+      "description": "signed for robot ugv-008: 401 bad_signature",
+      "name": "12-other-robot"
+    },
+    {
+      "description": "signed in the removed robodr-control-plane/v1 domain: 401 bad_signature",
+      "name": "13-v1-domain"
+    }
+  ],
+  "chunk_bytes": 1024,
+  "contract": "docs/contracts/robodr.control-plane.md",
+  "generator": "cargo run -p robodr-agentd --example control_plane_vectors",
+  "keys": {
+    "blackbox": {
+      "file": "keys/blackbox.key.pub",
+      "key_id": "bb:ugv-007:1",
+      "verifies": "the records of evidence/bundle.rbbx"
+    },
+    "finding": {
+      "file": "keys/finding.key.pub",
+      "key_id": "finding:ugv-007:1",
+      "verifies": "X-RoboDR-Answer-Signature, X-RoboDR-Manifest-Signature"
+    },
+    "note": "TEST KEYS ONLY: the secret key files are published on purpose",
+    "soc": {
+      "file": "keys/soc.key.pub",
+      "key_id": "soc:soc-a:1"
+    }
+  },
+  "robot_id": "ugv-007"
+}

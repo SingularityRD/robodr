@@ -102,10 +102,13 @@
 //!   never gets an executable safe pause / safe state; see
 //!   `robodr-responder`).
 //! * `control_plane` (optional, [`crate::control::ControlPlaneSection`]; off
-//!   when absent): the SOC action-request API, `listen_tcp` (loopback unless
-//!   `allow_remote`) and / or `unix_socket`, `soc_keys` (Ed25519 public key
-//!   files, not group/other-writable, not this robot's own keys). Requests
-//!   are judged and recorded, never executed; see [`crate::control`].
+//!   when absent): the SOC action-request and evidence API
+//!   (`robodr-control-plane/v2`), `listen_tcp` (loopback, or any address
+//!   with `tls`: mutual TLS) and / or `unix_socket`, `state_dir` (private
+//!   persistent state), `soc_keys` (Ed25519 public key files, not
+//!   group/other-writable, not this robot's own keys), optional `evidence`.
+//!   Needs `finding_signing` (answers are signed). Requests are judged and
+//!   recorded, never executed; see [`crate::control`].
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -1344,18 +1347,28 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
                     );
                 }
             }
-            for p in spec.unix.iter().chain(c.soc_keys.iter()) {
+            for p in c.paths() {
                 for (what, d) in [
                     ("spool.dir", &config.spool.dir),
                     ("blackbox.dir", &config.blackbox.dir),
                 ] {
-                    if resolve_path(p).starts_with(resolve_path(d)) {
+                    if resolve_path(p).starts_with(resolve_path(d))
+                        || (p == c.state_dir && resolve_path(d).starts_with(resolve_path(p)))
+                    {
                         return Err(format!(
-                            "control_plane: {} must not be inside {what}",
+                            "control_plane: {} must not be inside (or contain) {what}",
                             sanitize_path(&p.display().to_string())
                         ));
                     }
                 }
+            }
+            if finding_key.is_none() {
+                return Err(
+                    "control_plane needs finding_signing: in robodr-control-plane/v2 every \
+                     answer to an authenticated request (and every evidence manifest) is signed \
+                     with the finding key"
+                        .into(),
+                );
             }
             if !policy.oem_validated {
                 warnings.push(
@@ -1364,12 +1377,13 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
                         .into(),
                 );
             }
-            if spec.tcp.is_some_and(|a| !a.ip().is_loopback()) {
-                warnings.push(
-                    "control_plane.listen_tcp is not a loopback address: requests are signed but \
-                     travel in clear text, and answers are only signed with finding_signing"
-                        .into(),
-                );
+            if spec.tcp.is_some_and(|a| !a.ip().is_loopback()) && spec.tls.is_some() {
+                warnings.push(format!(
+                    "control_plane.listen_tcp {} is reachable off the robot (mutual TLS): the \
+                     unit's IPAddressDeny=any needs an IPAddressAllow= drop-in for the SOC \
+                     network (packaging/systemd/robodr-agentd.service.d/30-control-plane.conf.example)",
+                    spec.tcp.map(|a| a.to_string()).unwrap_or_default()
+                ));
             }
             Some(spec)
         }
@@ -2355,6 +2369,45 @@ mod tests {
         assert!(dropin
             .lines()
             .any(|l| l.starts_with("LoadCredential=finding.key:/etc/robodr/keys/")));
+        // The control plane (full example): its state directory is writable
+        // through the shipped drop-in and created private by tmpfiles.d, and
+        // its TLS key arrives as that drop-in's credential.
+        let cp = c.control_plane.as_ref().expect("control_plane");
+        let cpdrop =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                "../../packaging/systemd/robodr-agentd.service.d/30-control-plane.conf.example",
+            ))
+            .unwrap();
+        let rw: Vec<&str> = cpdrop
+            .lines()
+            .filter_map(|l| l.strip_prefix("ReadWritePaths="))
+            .flat_map(str::split_whitespace)
+            .collect();
+        assert!(rw.iter().any(|p| Path::new(p) == cp.state_dir), "{rw:?}");
+        assert!(
+            tmpfiles.lines().any(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                f.len() >= 5
+                    && f[0] == "d"
+                    && Path::new(f[1]) == cp.state_dir
+                    && f[2] == "0700"
+                    && f[3] == "robodr"
+            }),
+            "tmpfiles.d does not create {:?} 0700 for robodr",
+            cp.state_dir
+        );
+        let tls = cp.tls.as_ref().expect("tls");
+        let cred = tls
+            .key_file
+            .strip_prefix("/run/credentials/robodr-agentd.service/")
+            .expect("the TLS key is a credential")
+            .to_str()
+            .unwrap();
+        assert!(cpdrop
+            .lines()
+            .any(|l| l.starts_with(&format!("LoadCredential={cred}:/etc/robodr/keys/"))));
+        assert!(cpdrop.lines().any(|l| l.starts_with("IPAddressAllow=")));
+        assert!(cp.evidence.is_some());
     }
 
     #[test]

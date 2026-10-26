@@ -23,8 +23,8 @@
 | No known exploitable vulnerabilities at release | 🟡 | `cargo deny` advisories (passed locally on 2026-10-26). No release yet. No pentest (S11). |
 | Secure by default configuration | 🟡 | Units are installed disabled. No listener unless configured. Least privilege ([`packaging/systemd/`](../../packaging/systemd/)). Gaps: legacy HMAC keys still load (with a warning); `ROBODR_ALLOW_UNSIGNED=1` exists for labs. Document both as non-default. |
 | Security updates (automatic where appropriate, with opt-out) | 🟡 | Offline bundle and rollback ([`docs/OPERATIONS.md`](../OPERATIONS.md) section 7). No fleet update mechanism yet (S9; [`docs/SECURE-DELIVERY.md`](../SECURE-DELIVERY.md) is a design only). Air-gapped customers cannot receive automatic updates, which should be documented as the justified exception. |
-| Protection from unauthorised access | 🟡 | Signed requests and batches. No mTLS on the control plane yet (ADR-0004). |
-| Confidentiality of data (state of the art encryption) | ❌ | TLS only on `robodr-uplink`. Control plane, Kafka and the anchor receiver are plaintext. No encryption at rest beyond the host's (4-2 GAP-02, GAP-03). |
+| Protection from unauthorised access | 🟡 | Signed requests and batches. Control plane v2: mutual TLS plus signed requests and answers (ADR-0004), tested on a local test PKI only. |
+| Confidentiality of data (state of the art encryption) | ❌ | TLS on `robodr-uplink` and (mutual TLS) on the control plane off loopback. Kafka and the anchor receiver are plaintext. No encryption at rest beyond the host's (4-2 GAP-02, GAP-03). |
 | Integrity of data, commands, programs and configuration | ✅ / 🟡 | Signed black box, profiles, batches and requests. Release signing designed but never exercised. |
 | Data minimisation | ✅ | Findings carry correlated detections and evidence links, not raw telemetry ([`docs/contracts/robodr.findings.md`](../contracts/robodr.findings.md) §1). |
 | Availability of essential functions, resilience against DoS | 🟡 | Bounded queues and cgroup caps. Unmeasured on targets (S11). |

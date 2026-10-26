@@ -1,0 +1,10 @@
+POST /api/v2/robots/ugv-007/evidence/exports HTTP/1.1
+Host: ugv-007.robots.example
+Content-Type: application/json
+Content-Length: 380
+X-RoboDR-Key-Id: soc:soc-a:1
+X-RoboDR-Timestamp: 1800000000
+X-RoboDR-Nonce: contract-nonce-0006
+X-RoboDR-Signature: 49932dc59e5e407d0d5ee892c5e407a6ec8edec898ad4ece2063839e6613f0ecc902d3b26419a27f76e717d851b2f24e7669c00d84a2e7fb7a77a9268a784808
+
+{"export_id":"case-42:ev-1","reason":"case 42","requested_by":"analyst@soc","selector":{"finding":{"context_records":3,"evidence":["robodr-blackbox://ugv-007/0/10?sha256=5222417f54f88cdc49b40a84ffbc362064dba2e3629cbced22c22a4d7c16f50f","robodr-blackbox://ugv-007/0/12?sha256=46944103be298123d79c82c943bbf9d08515e9e98d51f5f560c4b068acc6a492"],"finding_id":"rf1-0011223344556677"}}}

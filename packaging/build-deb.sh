@@ -201,6 +201,8 @@ if install_bin robodr-agentd usr/sbin 0; then
     install -D -m 0644 "$unit_src/robodr-agentd.service" "$pkg/$units/robodr-agentd.service"
     install -D -m 0644 "$unit_src/robodr-agentd.service.d/20-finding-key.conf.example" \
         "$pkg/usr/share/doc/robodr/examples/robodr-agentd.service.d/20-finding-key.conf.example"
+    install -D -m 0644 "$unit_src/robodr-agentd.service.d/30-control-plane.conf.example" \
+        "$pkg/usr/share/doc/robodr/examples/robodr-agentd.service.d/30-control-plane.conf.example"
     # Passive sensor box (tap / port mirror; docs/UNITREE.md): agentd drop-in,
     # capture-NIC networkd file and host firewall. Examples, never active.
     install -D -m 0644 "$here/systemd/robodr-agentd.service.d/40-sensor-box.conf.example" \
@@ -247,6 +249,9 @@ for f in docs/OPERATIONS.md docs/UNITREE.md SECURITY.md CHANGELOG.md README.md p
     *) install -m 0644 "$root/$f" "$doc/$(basename "$f")" ;;
     esac
 done
+# The control-plane contract (man robodr-agentd(8) points here).
+install -D -m 0644 "$root/docs/contracts/robodr.control-plane.md" \
+    "$doc/contracts/robodr.control-plane.md"
 install -m 0644 "$root/LICENSE" "$doc/copyright"
 install -d "$doc/licenses"
 for f in "$root"/LICENSES/*; do

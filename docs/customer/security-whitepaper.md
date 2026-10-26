@@ -37,7 +37,7 @@ are recorded, not carried out.
  │   ─► responder (plans) ─► black box (sig.) │ ────────► │   registry, dedup, case) │
  │   ─► OCSF findings spool                   │ uplink    │                          │
  │ robodr-uplink | robodr-spool-export ───────┼─diode────►│ diode-unpack ─► uplink   │
- │ control plane v1 (off by default, no TLS)  │ ◄──────── │ approved action requests │
+ │ control plane v2 (off by default, mTLS)    │ ◄──────── │ approved action requests │
  └────────────────────────────────────────────┘ signed    └──────────────────────────┘
 ```
 
@@ -61,7 +61,7 @@ Unit files and the reasons behind them:
 | TB2 | The host OS of the robot or box | Trusted for privilege separation; not trusted to be unmodified | systemd confinement; signed and anti-rollback profile state; signed black box with optional head anchors that make rollback detectable |
 | TB3 | Robot → SOC network | Untrusted | TLS (rustls) with the operator's CA and optional SPKI pin; Ed25519 batch signatures; optional per-finding signatures; server-side replay table |
 | TB4 | Data diode or media | One-way, untrusted carrier | Ed25519-signed, hash-chained batches; Reed-Solomon parity; the SOC holds only public keys |
-| TB5 | SOC → robot (control plane) | Untrusted network; the SOC is trusted only to sign approved requests | Ed25519 request signatures bound to robot id, nonce and time; judgment against the safety state; signed evidence. **No TLS in v1.** |
+| TB5 | SOC → robot (control plane) | Untrusted network; the SOC is trusted only to sign approved requests | Ed25519 request signatures bound to robot id, nonce and time; judgment against the safety state; signed evidence; mutual TLS (rustls) off loopback and signed answers (control plane v2). |
 | TB6 | SOC analysts and LLM agents | May be misled by finding contents | Taint delimiting; actions need human approval (two people for the strongest) |
 | TB7 | Commissioning station and offline keys | Trusted, offline | Profile and trust-root keys never on the robot; operator sign-off with a quorum, verified on the robot |
 | TB8 | Release supply chain | Verified at the site's entry station | Minisign signatures, `SHA256SUMS`, reproducible pure binaries, SBOM. *Designed; the release workflow has never run.* |
@@ -145,8 +145,8 @@ enforcement and evaluation are AutoSecOps work (S3, S6).
 
 | Item | Today |
 |---|---|
-| Response plans (on-robot responder) | **Recorded, not executed.** The executor is a no-op or logging executor. |
-| SOC action requests (control plane v1) | Authenticated, judged, recorded; answered `recorded_not_executed`. **Nothing reaches the robot.** |
+| Response plans (on-robot responder) | **Recorded, not executed** by default. With executor v1 enabled (off by default), an Eligible plan's network isolation / participant quarantine may be handed to `robodr-executor`. |
+| SOC action requests (control plane v2) | Authenticated, judged, recorded; answered `recorded_not_executed`: **nothing reaches the robot** unless executor v1 is enabled. Then only `isolate_network` and `quarantine_node` (nftables, reversible, TTL) and `record_evidence` are executed, by the separate `robodr-executor` (the only `CAP_NET_ADMIN` unit). |
 | Motion Firewall | Decides per command and per joint frame; **recording only**. No in-path gateway. |
 | Processes RoboDR starts | None on the robot's behalf. |
 | Code loaded into the kernel | Pulsar's eBPF probes (GPL-2.0), only by `robodr-pulsard`, only where enabled. |

@@ -1,0 +1,31 @@
+{
+  "anchor": {
+    "seq": 6,
+    "sha256": "83289bf6018949841c5fec7ae72a3fdca14ad31c36cc225df4dba50d4d086bcb"
+  },
+  "bundle_sha256": "2b882fd3f1f17896817815862c99da7e3dbdd76e81d759c9ea85bee7b3922bcb",
+  "chain_id": "12f083fd76fc55129ac6f85cb34d98df10dc90c9028325c8d6b4ef6ee5de31f0",
+  "device_id": "ugv-007",
+  "first_seq": 7,
+  "last_seq": 15,
+  "last_sha256": "890a99826bcf651c14036e3c90de058f3c52130ed8e4b7ed0999cdde60dffe29",
+  "records": 9,
+  "referenced": [
+    {
+      "segment": 0,
+      "seq": 10,
+      "sha256": "5222417f54f88cdc49b40a84ffbc362064dba2e3629cbced22c22a4d7c16f50f"
+    },
+    {
+      "segment": 0,
+      "seq": 12,
+      "sha256": "46944103be298123d79c82c943bbf9d08515e9e98d51f5f560c4b068acc6a492"
+    }
+  ],
+  "signing_key": {
+    "algorithm": "ed25519",
+    "key_id": "bb:ugv-007:1"
+  },
+  "tampered/bundle-flipped-byte.rbbx": "tamper (HashMismatch at seq 10)",
+  "verdict": "intact"
+}

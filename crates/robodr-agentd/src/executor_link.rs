@@ -176,12 +176,18 @@ pub struct LinkStats {
 enum Job {
     Submit(Order),
     Revert(String, String),
+    /// Ask the executor for the state of requests restored from agentd's
+    /// journal (after a restart the link's outcomes are empty).
+    Resync(Vec<String>),
 }
 
 #[derive(Default)]
 struct Shared {
     outcomes: HashMap<String, Outcome>,
     order: VecDeque<String>,
+    /// Requests whose outcome changed since the main loop last looked
+    /// (it journals the new state at once, control plane v2).
+    changed: VecDeque<String>,
     events: VecDeque<Event>,
     last_seq: u64,
     stats: LinkStats,
@@ -198,6 +204,9 @@ impl Shared {
         }
         if !self.outcomes.contains_key(&o.id) {
             self.order.push_back(o.id.clone());
+        }
+        if self.changed.len() < MAX_OUTCOMES && !self.changed.contains(&o.id) {
+            self.changed.push_back(o.id.clone());
         }
         self.outcomes.insert(o.id.clone(), o);
         while self.outcomes.len() > MAX_OUTCOMES {
@@ -299,6 +308,26 @@ impl ExecutorLink {
                                 }
                             }
                         },
+                        Ok(Job::Resync(ids)) => {
+                            for id in ids {
+                                if st.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                match client.status(&id) {
+                                    Ok(o) if o.status == ExStatus::Unknown => {}
+                                    Ok(o) => {
+                                        if o.status == ExStatus::Verified && !watch.contains(&id) {
+                                            watch.push(id.clone());
+                                        }
+                                        lock(&sh).put(o);
+                                    }
+                                    Err(_) => {
+                                        lock(&sh).stats.unreachable += 1;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                         Err(RecvTimeoutError::Timeout) => {}
                         Err(RecvTimeoutError::Disconnected) => break,
                     }
@@ -411,6 +440,25 @@ impl ExecutorLink {
             g.stats.evidence_marks += 1;
         }
         g.put(o);
+    }
+
+    /// Ask the executor, once, for the state of the requests agentd
+    /// restored (never blocks; a full queue skips it: the requests keep
+    /// their journalled state until the executor's next word).
+    pub fn resync(&self, ids: Vec<String>) {
+        if ids.is_empty() {
+            return;
+        }
+        if let Some(tx) = &self.tx {
+            if tx.try_send(Job::Resync(ids)).is_err() {
+                lock(&self.shared).stats.queue_full += 1;
+            }
+        }
+    }
+
+    /// Requests whose outcome changed since the last call.
+    pub fn take_changed(&self) -> Vec<String> {
+        lock(&self.shared).changed.drain(..).collect()
     }
 
     pub fn count_dropped(&self) {

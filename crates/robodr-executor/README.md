@@ -395,7 +395,10 @@ and `src/config.rs` for every field and its limits. agentd's side is the
   turns a skip into a failure.
 * **Shipped examples** (`tests/examples.rs`).
 * **agentd end to end** (`crates/robodr-agentd/tests/executor_link.rs`):
-  the real daemon with signed SOC requests and an in-process executor.
+  the real daemon with signed `robodr-control-plane/v2` requests (unix
+  socket and mutual TLS, every answer's signature verified) and an
+  in-process executor; the executor states survive agentd restarts (v2
+  request journal).
 
 ## Limits (v1)
 

@@ -1,0 +1,17 @@
+{
+  "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "description": "evidence inventory",
+  "expect": {
+    "authenticated": true,
+    "route": "evidence_inventory"
+  },
+  "key_id": "soc:soc-a:1",
+  "method": "GET",
+  "name": "05-evidence-inventory",
+  "nonce": "contract-nonce-0005",
+  "robot_id": "ugv-007",
+  "signature": "29ced1c645013c375ca21591f9e0f0c2cb4f598c94e1af98616901cf1449f5995efb25fc193a40eb51117ca8f86a327614ae40908c125992b7120c0b98e57001",
+  "signing_message": "robodr-control-plane/v2\nGET\n/api/v2/robots/ugv-007/evidence\nugv-007\nsoc:soc-a:1\n1800000000\ncontract-nonce-0005\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "target": "/api/v2/robots/ugv-007/evidence",
+  "timestamp": 1800000000
+}

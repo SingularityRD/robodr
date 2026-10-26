@@ -1,0 +1,18 @@
+{
+  "body_sha256": "5c7e00c65f59a53b6edcc32276e69bade7fa9e8dbeb22158259a0047c4872f78",
+  "description": "revert of a recorded request",
+  "expect": {
+    "authenticated": true,
+    "id": "robot_safe_pause:ugv-007:0001",
+    "route": "revert"
+  },
+  "key_id": "soc:soc-a:1",
+  "method": "POST",
+  "name": "04-revert",
+  "nonce": "contract-nonce-0004",
+  "robot_id": "ugv-007",
+  "signature": "5f7f683294944f9b8ee3a0f3411b2e6e894e3fa33338a027554fc051126fd4a42ffea97459072f43220b5eb7eea6b30ec91c2448fc5720ddf009cc09cda29b0b",
+  "signing_message": "robodr-control-plane/v2\nPOST\n/api/v2/robots/ugv-007/action-requests/robot_safe_pause%3Augv-007%3A0001/revert\nugv-007\nsoc:soc-a:1\n1800000000\ncontract-nonce-0004\n5c7e00c65f59a53b6edcc32276e69bade7fa9e8dbeb22158259a0047c4872f78",
+  "target": "/api/v2/robots/ugv-007/action-requests/robot_safe_pause%3Augv-007%3A0001/revert",
+  "timestamp": 1800000000
+}

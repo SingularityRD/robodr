@@ -9,6 +9,7 @@ operator installs on a robot. The procedures that use it are in
 | `systemd/robodr-pulsard.service` | `/usr/lib/systemd/system/` | eBPF + ROS 2 sensor daemon |
 | `systemd/robodr-agentd.service` | `/usr/lib/systemd/system/` | decision chain, black box, OCSF spool (only if the binary is built) |
 | `systemd/robodr-agentd.service.d/20-finding-key.conf.example` | `/usr/share/doc/robodr/examples/` | optional drop-in: `LoadCredential=` for the per-finding signing key (OPERATIONS 6.4) |
+| `systemd/robodr-agentd.service.d/30-control-plane.conf.example` | `/usr/share/doc/robodr/examples/` | optional drop-in for the control plane v2: `ReadWritePaths=` for its state directory, `LoadCredential=` for its TLS server key, `IPAddressAllow=` for the SOC network (OPERATIONS 6.4) |
 | `systemd/robodr-agentd.service.d/40-sensor-box.conf.example` | `/usr/share/doc/robodr/examples/` | **sensor box only**: passive tap / port-mirror mode of `robodr-agentd` (`CAP_NET_RAW` only, all IP denied, waits for the writable data mount; [`docs/UNITREE.md`](../docs/UNITREE.md)) |
 | `sensor-box/10-robodr-capture.network.example` | `/usr/share/doc/robodr/examples/sensor-box/` | **sensor box only**: systemd-networkd file for the capture NIC (no address, no ARP, no IPv6 link-local, promiscuous) |
 | `sensor-box/nftables.conf.example` | `/usr/share/doc/robodr/examples/sensor-box/` | **sensor box only**: host firewall (capture NIC silent, uplink to the Kafka broker set, NTP and admin SSH only, no forwarding) |
@@ -18,7 +19,7 @@ operator installs on a robot. The procedures that use it are in
 | `systemd/robodr-uplink.service` | `/usr/lib/systemd/system/` | findings uplink to the SOC's AutoSecOps ingest API for **connected sites**, running on the unit or sensor box: agentd spool -> HTTPS (signed batches, CA bundle `/etc/robodr/uplink-ca.pem`, optional SPKI pin); `User=robodr`, key via `LoadCredential=` (`/etc/robodr/keys/uplink.key`), `IPAddressDeny=any` plus the SOC drop-in, settings in `/etc/robodr/uplink.env`. Conflicts with both units above (only if the binary is built) |
 | `systemd/robodr-uplink.service.d/50-soc.conf.example` | `/usr/share/doc/robodr/examples/` | `IPAddressAllow=` for the SOC ingest address(es) (map the URL's host name in `/etc/hosts`: DNS is not reachable) |
 | `etc/spool-export.env.example`, `etc/kafka-publish.env.example`, `etc/uplink.env.example` | `/usr/share/doc/robodr/examples/` | the three exporter units' site settings (unit id; bootstrap brokers; ingest URL and pin) |
-| `systemd/focal/*.service`, `systemd/focal/robodr-agentd.service.d/20-finding-key.conf.example` | `/usr/lib/systemd/system/` (and examples) of **`robodr-focal`** | systemd 245 variants (Ubuntu 20.04 / JetPack 5): `LoadCredential=` replaced by `robodr-load-credential`, no `ProtectProc=` / `ProcSubset=`; otherwise identical, enforced by `scripts/check-focal-units.py` |
+| `systemd/focal/*.service`, `systemd/focal/robodr-agentd.service.d/{20-finding-key,30-control-plane}.conf.example` | `/usr/lib/systemd/system/` (and examples) of **`robodr-focal`** | systemd 245 variants (Ubuntu 20.04 / JetPack 5): `LoadCredential=` replaced by `robodr-load-credential`, no `ProtectProc=` / `ProcSubset=`; otherwise identical, enforced by `scripts/check-focal-units.py` |
 | `focal/robodr-load-credential` | `/usr/lib/robodr/` of **`robodr-focal`** | POSIX sh helper run as root (`ExecStartPre=+`): copies a root-only key to `/run/credentials/<unit>/<name>`, `0400` owned by the service user, in a root-owned `0711` directory; `clear` on stop |
 | `systemd/robodr-anchor-receiver.service` | `/usr/lib/systemd/system/` | **base station only**: remote head-anchor receiver (only if the binary is built; OPERATIONS 6.4, "Remote anchor"). Not yet checked with `systemd-analyze` |
 | `systemd/robodr-pulsard.service.d/10-cap-sys-admin.conf.example` | `/usr/share/doc/robodr/examples/` | opt-in for kernels < 5.8 |
@@ -110,6 +111,7 @@ Neither watchdog has been exercised under a real systemd yet.
 └── keys/                        0700 root:root     key material, root only
     ├── agentd-blackbox.key      0600 root:root     black-box key of robodr-agentd
     ├── agentd-finding.key       0600 root:root     optional per-finding signing key (drop-in 20-finding-key)
+    ├── agentd-cp-tls.key        0600 root:root     optional control-plane TLS server key (drop-in 30-control-plane)
     ├── executor.key             0600 root:root     agentd <-> robodr-executor protocol key (unit + drop-in 30-executor)
     ├── pulsard-blackbox.key     0600 root:root     (when the Pulsar module records)
     └── retired/                 0700 root:root     rotated keys kept for verification
@@ -120,6 +122,8 @@ Neither watchdog has been exercised under a real systemd yet.
 ├── spool/                       0750 root:robodr   OCSF findings awaiting export
 │   ├── agentd/                  0750 robodr:robodr
 │   └── pulsard/                 0750 root:robodr
+├── control-plane/               0750 root:robodr
+│   └── agentd/                  0700 robodr:robodr control_plane.state_dir: request journal, replay store, evidence exports
 ├── profile-state/               0750 robodr:robodr profile anti-rollback state of robodr-agentd
 ├── profile-state-pulsard/       0750 root:robodr   profile anti-rollback state of the Pulsar sensor
 ├── commission/                  0750 root:robodr   operator workspace: runs, drafts, sign-offs

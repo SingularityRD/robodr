@@ -1,0 +1,9 @@
+GET /api/v2/robots/ugv-007/action-requests/robot_safe_pause%3Augv-007%3A0001 HTTP/1.1
+Host: ugv-007.robots.example
+Content-Type: application/json
+Content-Length: 0
+X-RoboDR-Key-Id: soc:soc-a:1
+X-RoboDR-Timestamp: 1800000000
+X-RoboDR-Nonce: contract-nonce-0003
+X-RoboDR-Signature: 0317035e620ccc95e0e6f1df55d572edff5614191a8b7a91e6faff0b6d978438a37c980de6d8a0827a95c1530dfab829b053271504a069863c7c8ad768950a0f
+
