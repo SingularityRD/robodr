@@ -241,12 +241,25 @@ valid seal if locked.
   through one `robodr_rtps::FragmentReassembler` per file. SEDP announcements
   that were split into DATA_FRAG submessages are therefore learned too. Large
   XTypes type information makes this common with Fast DDS and Connext. A
-  capture contains **discovery only**: participants, writers and readers.
-  Motion envelopes need the sensor's motion events, so mix `--pcap` and
-  `--events` in one `learn` to get both. A capture that is not a pcap file,
+  capture yields discovery (participants, writers, readers) and the motion
+  commands of announced command writers, decoded from user DATA as the
+  sensor decodes them (standard ROS types and the Unitree SDK2 types), so a
+  capture alone gets motion envelopes. A capture that is not a pcap file,
   or that ends in the middle of a record, is an input error (exit 2). Capture
   with full snap length (`tcpdump -s 0 -w run.pcap udp`) and stop it with
   SIGINT so that the last record is flushed.
+* **`--unitree-legacy`** (with `--pcap`, `learn` and `check`): also decode
+  Unitree legacy UDP (Go1 generation, `unitree_legged_sdk`) on the SDK's
+  ports 8007 / 8080 / 8082 / 8090 (`--unitree-legacy-port N`, repeatable:
+  exactly these ports). `HighCmd` and decodable `LowCmd` frames become
+  commands on `/unitree_legacy/high_cmd` / `/unitree_legacy/low_cmd`
+  (envelopes learned as usual, those channels made writable: the legacy
+  protocol has no discovery); state frames are not learned. The legacy
+  protocol has no identity, so the commands carry no source; the report's
+  capture diagnostics list the command senders' IPs
+  (`unitree_legacy_command_senders`) for the sensor's
+  `unitree_legacy.command_senders`, to be confirmed by the operator.
+  Compressed v3.8.6 low-level frames are counted, not learned.
 * **Multi-mission**: repeat `--events` in `learn`. The runs are unioned inside
   one `Learner`, so percentiles and warnings cover every sample and the margin
   is applied once. `merge` unions profiles that were already learned: per

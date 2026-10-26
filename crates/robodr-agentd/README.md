@@ -40,7 +40,7 @@ level, and every path must be absolute.
 
 | Key | Meaning |
 |---|---|
-| `robot` | `id` (also the black-box device id), `site`, optional `model`, `kafka_partitions` (`profile_version` was removed: the version in findings is the signed profile's `metadata.profile_version`) |
+| `robot` | `id` (also the black-box device id), `site`, optional `model`, `kafka_partitions` (`profile_version` was removed: the version in findings is the signed profile's `metadata.profile_version`), optional `robot_model` (a Unitree model, see "Unitree" below) |
 | `sensor` | The ROS 2 sensor's own `[module.robodr-sensor-ros2]` section in JSON form, validated by `robodr_ros2_pipeline::Config::validate`. It sets the profile path, capture (live interfaces or `pcap_replay`), the SPDP socket (`listen_spdp`, default **true**) and the binding settings. Its profile is used by the pipeline and by the agent. |
 | `policy_path` | Response policy (`robodr.response-policy/v1`; its `morphology` — required once OEM-validated or for platform `other`, e.g. `humanoid` — makes safe pause / safe state advisory only and sets the balancing-robot rules, see `robodr-responder`) |
 | `blackbox` | `dir`, `key_file`, optional `key_id`, optional `boot_id` (default `/proc/sys/kernel/random/boot_id`) |
@@ -49,9 +49,10 @@ level, and every path must be absolute.
 | `event_inputs` | `[{"kind":"stdin"}]` and/or `[{"kind":"unix_socket","path":...,"max_connections":4}]` |
 | `context` | `safety_state` (default `unknown`; must stay `unknown` when `safety_feed` is set), `control`, `phase`, `connectivity`, `operator_present` |
 | `safety_feed` | Optional. The live safety-state feed (see below): `stale_after_ms` (default 1000), `topics` (ROS topics decoded from the captured bus) and/or `socket` (a local safety-PLC gateway socket). |
-| `firewall` | Optional. `max_angular` (rad/s for every profiled Twist channel) and `allow` (writer GUIDs per channel). Runs **recording-only** (see below). |
+| `firewall` | Optional. `max_angular` (rad/s for every profiled Twist channel), `allow` (writer GUIDs per channel) and `joint_config` (a Motion Firewall JSON file whose `joint_channels` / `platform` check Unitree low-level joint frames, e.g. `config/firewall.unitree-g1.example.json`). Runs **recording-only** (see below). |
 | `motion_monitor` | Optional. `config_path` (strict `MonitorConfig`; default: the UGV defaults on the profile's motion channels) and `feedback_sources`. Feedback sources that are ROS topic names (`/odom`) are also decoded from the bus. |
 | `sensor.motion` | Optional. The live motion decode path: `enabled` (default true), `feedback_topics` (e.g. `["/odom"]`), `max_writers`, `max_samples_per_datagram` (`evaluate_commands` is accepted but the daemon always lets the agent evaluate). Unknown keys are refused. |
+| `sensor.unitree_legacy` | Optional, off by default. Unitree legacy UDP (Go1 generation): `enabled`, `ports` (default `[8007, 8080, 8082, 8090]`), `command_senders` (IPs allowed to send `HighCmd` / `LowCmd`), `robot_addresses` (default `192.168.123.10`, `192.168.123.161`). Needs `sensor.capture`. Unknown keys are refused. |
 | `host_threats` | Optional. `socket_path` (the socket `robodr-threat-forward` writes Pulsar threats to), `socket_mode` (`"0600"` default or `"0660"`), `allowed_uids` (peers besides uid 0), `max_connections` (default 2, max 8). See "Host threats" below. |
 | `control_plane` | Optional, off when absent. The SOC action-request API: `listen_tcp` (loopback unless `allow_remote`), `unix_socket` (`socket_mode` `"0600"`/`"0660"`), `soc_keys` (Ed25519 public key files), `max_clock_skew_s` 30, `rate_per_minute` 30, `burst` 10, `max_connections` 4, `max_requests` 1024, `answer_timeout_ms` 5000. Requests are judged and recorded, **never executed**. See "Control plane" below. |
 | `daemon` | `queue_capacity` 4096 (max 65536), `queue_bytes` 33554432 (32 MiB; 1 MiB..=256 MiB), `tick_ms` 1000, `heartbeat_ms` 10000, `silence_ms` 30000, `lag_ms` 2000, `health_report_ms` 10000, `exit_when_inputs_end` false |
@@ -112,6 +113,66 @@ recorded (never executed, as before).
 `status.json` and the heartbeat carry `daemon.motion_events` and
 `pipeline.motion` counters (decoded commands / feedback, undecodable,
 unattributed, known writers, ...).
+
+## Unitree
+
+Unitree SDK2 robots (Go2, Go2-W, B2, B2-W, A2, AS2, H1, H1-2, H2, G1, R1)
+speak plain DDS on topics `rt/lowcmd`, `rt/arm_sdk`, `rt/api/<svc>/request`,
+...; the pipeline learns their writers from SEDP (type names
+`unitree_go::msg::dds_::LowCmd_`, `unitree_hg::...`, `unitree_api::...`),
+de-mangles the topics like ROS topics (`/lowcmd`, `/api/sport/request`,
+`/dex3/left/cmd`) and decodes them with `robodr-cdr`. On top of the generic
+path:
+
+- **Joint firewall.** With `firewall.joint_config`, every decoded low-level
+  frame on one of the file's `joint_channels` goes to the agent with its
+  command (`Agent::handle_with_joint`): `Firewall::check_joint` on every
+  slot (CRC verdict, `mode_pr` / `mode_machine`, any non-zero mode octet is
+  enabled), stamped with the **capture time** of its datagram so the rate
+  and gap checks see the real inter-arrival times. The verdict is recorded
+  as `robodr.firewall_joint_verdict` (`"enforcing": false`) and its events
+  become findings like every firewall deviation. Recording-only: there is
+  no in-path gateway yet (a later sprint). The file is compiled **as
+  written** at `--check-config` (a humanoid with a damping / fail-open
+  substitute is refused, so the same file is safe for the gateway), its
+  `channels` must be empty (twist channels come from the profile and
+  `max_angular` / `allow`), each joint channel must be a profiled motion
+  channel, and its platform morphology must match the response policy.
+  `status.json` carries `daemon.joint_frames` and the agent's
+  `joint_firewall_checks`, `joint_frames_missing`, `joint_clock_clamped`.
+- **Model awareness.** `robot.robot_model` (`Go2`, `G1`, `H1-2`, ...; case
+  and `-` / `_` ignored) makes the pipeline interpret Unitree API requests
+  with the model's tables (a model-specific id such as G1
+  `SetStandHeight` is classified instead of `Unknown`, High) and is
+  checked against the configuration: a humanoid model (G1, H1, H1-2, H2,
+  R1) with a response policy or joint-firewall morphology other than
+  `humanoid` is a configuration error (a de-energising response makes it
+  fall); a legged quadruped with anything but `quadruped` (or the more
+  conservative `humanoid`, warned) too; a joint channel `/lowcmd`,
+  `/arm_sdk` or `/user_lowcmd` whose slot count differs from the model's
+  IDL (go 20, hg 35) is an error; legacy UDP on a DDS model (or the
+  reverse) is a warning.
+- **Legacy UDP (Go1).** With `sensor.unitree_legacy.enabled`, the capture
+  (kernel BPF included) also accepts UDP on the legacy ports; the pipeline
+  decodes `HighCmd` / `LowCmd` / `HighState` / `LowState` by length and maps
+  them onto `/unitree_legacy/high_cmd`, `low_cmd`, `high_state`,
+  `low_state` (commands to the agent, feedback when listed in
+  `feedback_topics`). A command from an IP not in `command_senders` is
+  `robot.unitree.legacy_unknown_sender` (Critical; Medium for state from an
+  address not in `robot_addresses`), a compressed v3.8.6 low-level frame is
+  `robot.motion.undecodable_sample`. A profile is learned from a legacy
+  capture with `robodr-commission learn --pcap ... --unitree-legacy`.
+- **Examples.** `config/profile.unitree-<model>.example.json` (one per
+  model the decoders support; illustrative envelopes, the model label says
+  `EXAMPLE-replace-with-OEM-data`; A1 / Aliengo / B1 have no decodable
+  frame layout and no example), `config/agentd.unitree-sensor-box.example.json`
+  (passive capture on a mirror / tap port, no control plane, legacy UDP
+  for a Go1) and `config/agentd.unitree-edu.example.json` (on the EDU dev
+  computer of a G1, with the joint firewall).
+
+Not verified on a real Unitree robot: everything above has only seen
+synthetic traffic built from the published IDL / `comm.h` layouts and the
+independent reviewer vectors of `robodr-cdr`.
 
 ## Live safety state
 
@@ -396,6 +457,8 @@ request.
 | `tests/review_regressions.rs` | Fourth-review fixes: no busy loop once every input ended (thread CPU < 25% of wall, state `unknown`); a malformed-only stream is never `ok` (`input_silent` + `input_malformed`); `..` and a late symlink cannot alias spool and black box; a live event socket is not stolen and cleanup checks the inode; the queue's byte budget; `READY`/`WATCHDOG`/`STATUS`/`STOPPING` over a notify socket and stale or other-boot `status.json` read as `unknown`; hostile event lines do not panic. |
 | `tests/host_threats.rs` | The host-threat socket, with the test playing `robodr-threat-forward`: a synthetic capture (rogue participant and `cmd_vel` writer) plus a Pulsar shell threat fire `coordinated_intrusion` (Critical, enforce); three host rules from one process fire `host_process_persistence`; the sensor's own threat is not counted twice; junk lines and the forwarder's reported losses are health findings; a host input with no forwarder reads `unknown` and goes silent, and a Pulsar service-stop threat with that silence is the observe-only `defense_tampering`; config and socket-directory checks. |
 | `tests/control_plane.rs` | The control-plane API on the real daemon with a test SOC key, over the unix socket and TCP: the robot snapshot; `restrict_motion` accepted and answered `recorded_not_executed` (`executed: false`, ladder step, evidence link), an idempotent resubmission, a GET with a percent-encoded id; a replay, a tampered body, an unknown key, a stale timestamp, a request signed for another robot and one without credentials refused (401); an unknown action, a missing ttl and a motion field refused (400) and recorded; under e-stop (PLC socket feed) `request_safe_state` refused `safety_system_engaged`; revert `not_applied`, an irreversible revert refused; answers signed with the finding key; the observe-only findings; the black box verifies and the recorded SOC signature re-verifies offline. Off by default; strict config. |
+| `tests/unitree_live.rs` | Unitree end to end on synthetic captures, the profile **learned** with `robodr-commission` from a clean capture and locked: Go2 (`unitree_go`, 12 of 20 slots), G1 (`unitree_hg`, 29 of 35, arm SDK), H1 (`unitree_go`, 20 slots, arm SDK) and Go1 (legacy UDP). Clean replay: no finding, every joint frame checked by the joint firewall. Rogue `rt/lowcmd` writer (unknown participant, unauthorized motion writer, `rejected_unknown_source`); torque / kp / step over the envelope (profile + joint firewall would-haves); `rt/arm_sdk` frames with mode 0 counted as motion; `2^32 + id` api aliasing (High); velocity over the envelope (Critical); a model-specific api id `Unknown` without `robot_model`, classified with it; humanoids never record a zero / damping substitute and a limp frame is a would-have rejection; the independent `robodr-cdr` vectors decode with `crc_ok` true; Go1: unknown sender (Critical / Medium), trick mode, joint torque, compressed frame, legacy off = nothing captured. |
+| `tests/unitree_examples.rs` | Every Unitree example: a strict, valid profile per supported model with its topics and joint bounds; the firewall examples fit their profiles; the EDU and sensor-box daemon examples pass `--check-config`; morphology / slot-count / unknown-model / unsafe-substitute / `max_angular`-on-a-joint-channel refusals; every model's profile loads in the daemon with its `robot_model`. |
 | `tests/agent_api.rs` | `Agent::handle_external`: sensor deviations get real plans when enforcing. Self-health and observe-mode deviations never get an action plan. |
 | `tests/safety_feed.rs` | The live safety feed: Bool / UInt8 / String / Odometry mappings (with hysteresis, non-finite speed), staleness to `unknown`, conflicts to the most conservative state, unprofiled / IP-spoofed / wrong-type / non-allowlisted writers ignored with a High finding, undecodable and unmapped values read `unknown`. End to end through the daemon: an e-stop on the bus turns the plan for a Critical over-envelope command into Record (`request_safe_state` with the e-stop released); a rogue writer's "release" is reported and ignored; the PLC socket feed grades plans, goes stale to `unknown` (approval-gated plan) and every transition is in the black box. |
 | unit tests | Config strictness and key file checks, spool atomicity and bounds, the line reader (CRLF, overlong lines, timeouts, a full queue), the unix socket, the peer-uid policy, the host-threat line parser and socket permission checks, and the health state machine. |

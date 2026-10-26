@@ -69,10 +69,13 @@ the `int32` range is `DecodeAnomaly::ApiIdOutOfRange` (pipeline:
 into the event as `MotionCommand::command_class`; `Profile::evaluate`
 reports `Trick` (High), `Trajectory` (Medium), `Unknown` / `Malformed` on a
 motion service (High) as `robot.motion.unverifiable_command`, and
-`ControlHandover` as `robot.motion.control_handover` (High). The event path
-does not know the model, so a model-specific id (G1 `SwitchToUserCtrl`, Go2
-`FrontFlip`, ...) is `Unknown` there (High) and fully classified when a
-model is given. The `parameter` JSON is read by a bounded, allocation-free
+`ControlHandover` as `robot.motion.control_handover` (High). Without a
+model only ids that mean the same on every model are interpreted, so a
+model-specific id (G1 `SwitchToUserCtrl`, Go2 `FrontFlip`, ...) is
+`Unknown` (High); `MotionMessage::to_event_for_model(ctx, Some(model))`
+classifies it with the model's tables. The live pipeline does that when the
+robot's model is configured (`robodr-agentd` `robot.robot_model`,
+`MotionOptions::robot_model`). The `parameter` JSON is read by a bounded, allocation-free
 reader (16 KiB / depth 8 / 32 members, duplicate and escaped top-level keys
 rejected); top-level arrays are accepted where the SDK sends them (B2
 `TrajectoryFollow`, ≈ 3 KB). `Request_::parameter` / `Response_::data` are
@@ -117,7 +120,12 @@ struct carries a DHEADER, only arrays / sequences of structs do; a `D_CDR2`
 encapsulation header is read the same way (Cyclone DDS takes the
 extensibility from the type), and `Limits::d_cdr2_nesting` does not apply.
 
-**Legacy UDP.** `LegacyHighCmd::to_motion_command` maps mode 2 (target
+**Legacy UDP.** `LegacyFrame::decode` classifies a UDP payload by its
+length (the protocol has no type tag) and `LegacyFrame::to_event` maps it
+onto the fixed channels of `unitree_legacy::channels`
+(`/unitree_legacy/high_cmd`, `low_cmd`, `high_state`, `low_state`: the
+legacy protocol has no topic names; the profile's envelopes are keyed by
+these). `LegacyHighCmd::to_motion_command` maps mode 2 (target
 velocity walking) to the body velocity and every mode to a class (posture,
 trajectory for position walking, trick for backflip / jumpYaw /
 straightHand, unknown); `LegacyLowCmd::to_motion_command` is the joint
@@ -163,7 +171,8 @@ Topics found in `unitree_sdk2/example`, `include/unitree/dds_wrapper` and
   bytes) whose layout is not published; `LegacyKind::for_len` flags it as
   undecodable.
 - The model-specific API tables apply only when the caller passes the
-  model; the pipeline does not know it (see "API interpretation").
+  model (`robodr-agentd` `robot.robot_model`); without it the pipeline
+  reports a model-specific id as `Unknown` (see "API interpretation").
 
 ### Status
 
@@ -290,6 +299,21 @@ transport (channel = de-mangled topic, writer GUID, capture time), findings
 events to `Agent::handle` (firewall recording-only, motion monitor). See
 those crates' READMEs.
 
-Still true: only hand-built payloads have gone through it (see "What is and
-is not verified" above), and SROS 2 / DDS-Security protected payloads cannot
-be decoded passively (they are reported as undecodable).
+Unitree is wired the same way: SEDP announces `rt/lowcmd` etc. with the
+DDS type names of the table above, the topics de-mangle like ROS topics
+(`rt/api/sport/request` -> `/api/sport/request`, `rt/dex3/left/cmd` ->
+`/dex3/left/cmd`), and a decoded low-level command also carries its
+per-slot frame (`JointCommandFrame`, `unitree_crc_ok`,
+`unitree_frame_modes` = hg `mode_pr` / `mode_machine`), which
+`robodr-agentd` hands to the Motion Firewall's `check_joint` (recording
+only). Legacy UDP frames reach the pipeline through `robodr-capture`'s
+legacy-port classifier. Every SDK2 topic of the model matrix, the four
+legacy frames and the independent vectors of `tests/data/unitree/` have
+been through the live daemon end to end
+(`robodr-agentd/tests/unitree_live.rs`,
+`robodr-ros2-pipeline/tests/unitree_topics.rs`).
+
+Still true: only hand-built payloads and the IDL-derived reviewer vectors
+have gone through it (see "What is and is not verified" above), never a
+capture of a real Unitree robot, and SROS 2 / DDS-Security protected
+payloads cannot be decoded passively (they are reported as undecodable).

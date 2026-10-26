@@ -173,9 +173,19 @@ gateway must be deployed so that this timeout exists.
 
 ## Low-level joint frames (Unitree `LowCmd`)
 
-**Status: decision core only.** `check_joint` decides on decoded frames; there is
-no in-path gateway yet that subscribes to `rt/lowcmd`, decodes the Unitree IDL,
-calls `check_joint` and re-publishes. Nothing here has been run against a robot.
+**Status: decision core, run live in recording mode.** `check_joint` decides on
+decoded frames. `robodr-agentd` feeds it every decoded Unitree low-level command
+of a configured joint channel (`firewall.joint_config`, e.g.
+`config/firewall.unitree-g1.example.json`): the frame from `robodr-cdr`
+(`JointCommandFrame` -> `JointFrame`, every slot, `MotorMode::from_u8`, the
+decoder's `crc_ok`, the hg `mode_pr` / `mode_machine`), stamped with the
+capture time, through `robodr-agent`'s joint verdict record
+(`robodr.firewall_joint_verdict`). The daemon is a passive observer, so the
+firewall runs `PassThroughObserveOnly`: verdicts are recorded would-haves,
+nothing is forwarded or substituted. There is **no in-path gateway** yet that
+subscribes to `rt/lowcmd`, calls `check_joint` and re-publishes (a later
+sprint). Nothing here has been run against a robot; the live path has only seen
+synthetic traffic.
 
 Unitree's low-level interface sends one frame per control tick (500 Hz to 1 kHz)
 with, for every motor slot, a position target `q`, a velocity target `dq`, a
@@ -532,9 +542,11 @@ the robot's own compute, gateway in the loop, under load — is still to be meas
 
 ## Integration (not done here)
 
-- **Low-level joint gateway (Unitree).** Nothing subscribes to `rt/lowcmd` yet. A
-  gateway (for example in `robodr-agentd`'s inline mode, which does not exist yet:
-  the daemon is a passive observer and runs the firewall pass-through) has to:
+- **Low-level joint gateway (Unitree).** Nothing subscribes to `rt/lowcmd` and
+  re-publishes yet. `robodr-agentd` already does the decode half in recording mode
+  (decode, `crc_ok`, source resolution, `mode_pr` / `mode_machine` pass-through,
+  `check_joint`, the joint verdict record in `robodr-agent`); an in-path gateway
+  (an inline mode of the daemon, which does not exist yet) still has to:
   - decode the platform's `LowCmd` IDL (`go` / `hg`) into a `JointFrame`, check its
     CRC and set `crc_ok`; resolve the writer to a `SourceId`;
   - compile the policy with `Policy::compile_with_joints` (or
@@ -547,10 +559,10 @@ the robot's own compute, gateway in the loop, under load — is still to be meas
     (flags, reserved words) itself;
   - publish nothing when the verdict emits nothing (the robot keeps its last
     command), and call `joint_fault_verdict` on a deadline miss;
-  - for `robodr-agent`'s verdict records: `JointVerdict` is a separate type, so a
-    `check_firewall`-style mapping needs a joint variant (reasons
-    `position` / `velocity` / `torque` / `gain` / `step` / `pd_torque`,
-    substitute `hold_last` / `zero` = damping).
+  - (done) `robodr-agent`'s verdict records have the joint variant
+    (`robodr.firewall_joint_verdict`: reasons `position` / `velocity` / `torque`
+    / `gain` / `step` / `pd_torque`, substitute `hold_last` / `zero` = damping,
+    slot count, `crc_ok`, `mode_pr` / `mode_machine`).
 
 - **ROS 2 gateway.** It has to:
   - subscribe on a shadow topic and republish verdict outputs;

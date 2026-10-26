@@ -474,14 +474,43 @@ katılımcısı / `rt/lowcmd`'ye yetkisiz yazıcı, imzalı kara kutu ile adli k
 >   `rollback_config` reddedilir, `min_motion_factor` tabanı; örnek politikalar
 >   `config/response-policy.unitree-{g1,go2}.example.json`.
 >
+> - ✅ **agentd canlı bağlantısı (kayıt modu):** SEDP tip adlarıyla
+>   (`unitree_go::msg::dds_::LowCmd_` …) keşfedilen `rt/...` konuları ROS
+>   konusu gibi çözülüyor (`/lowcmd`, `/api/sport/request`, `/dex3/left/cmd`);
+>   DATA CDR'den `MotionCommand` / `MotionFeedback`'e, profil zarfına
+>   (`max_joint_torque` / `kp` / `position_step` dahil) ve bulgulara gidiyor.
+>   Çözülmüş `LowCmd` çerçeveleri (CRC, `mode_pr` / `mode_machine`,
+>   `MotorMode::from_u8`) `firewall.joint_config` ile `check_joint`'e
+>   **yalnız kayıt** (would-have) olarak veriliyor; saat = yakalama zamanı;
+>   karar `robodr.firewall_joint_verdict` olarak kara kutuda, olaylar spool'da.
+>   `robot.robot_model` modele özgü API kimliklerini sınıflandırıyor ve
+>   morfoloji tutarlılığını zorluyor (insansı model + insansı olmayan
+>   politika/firewall = yapılandırma hatası). Eski UDP nesli (Go1):
+>   `sensor.unitree_legacy` ile yakalama sınıflandırıcısı (BPF dahil),
+>   decode → zarf → bulgu, bilinmeyen gönderici IP'si
+>   `robot.unitree.legacy_unknown_sender`; `robodr-commission learn
+>   --unitree-legacy` ile profil öğrenilebiliyor. Her model için örnek profil
+>   (`config/profile.unitree-<model>.example.json`, değerler temsili) ve
+>   `config/agentd.unitree-{sensor-box,edu}.example.json`.
+>   Uçtan uca testler (`robodr-agentd/tests/unitree_live.rs`): Go2 / G1 / H1 /
+>   Go1 için temiz trafikten öğrenilen profil → bulgu yok; sahte `rt/lowcmd`
+>   yazıcısı, tork/kp/adım aşımı, `rt/arm_sdk` mode=0, `2^32+id` takma adı,
+>   hız aşımı; insansıda sıfır/sönümleme ikamesi hiç kaydedilmiyor.
+>   **Yalnız sentetik trafik ve IDL'den türetilmiş bağımsız vektörlerle;
+>   gerçek bir Unitree yakalaması henüz yok.**
+>
 > **Kalan (dürüst durum):** firewall'ın **in-path gateway**'i yok (kütüphane
-> karar veriyor, `rt/lowcmd`'ye abone olup yeniden yayınlayan süreç yok);
-> decoder'lar ve kurallar **gerçek Go2/G1 trafiğiyle doğrulanmadı** (yalnız
-> yayımlanmış IDL ve el yapımı vektörler); **A2 / AS2** düşük seviye örneği
-> olmadığı için motor sayısı / IDL ailesi ve modele özgü kimlikler belirsiz;
-> **ajansız sensör kutusu** (S7) yok; decoder → firewall → responder → agentd
-> **canlı bağlantısı** (Unitree kanallarının agentd boru hattına bağlanması,
-> gecikme bütçesi ölçümü) yapılmadı; `restrict_motion` sport API adaptörü yok.
+> karar veriyor ve agentd kayıt modunda çalıştırıyor; `rt/lowcmd`'ye abone
+> olup yeniden yayınlayan süreç yok — sonraki sprint); decoder'lar, kurallar
+> ve canlı yol **gerçek Go2/G1 trafiğiyle doğrulanmadı** (yalnız yayımlanmış
+> IDL, el yapımı ve bağımsız vektörler, sentetik yakalamalar); **A2 / AS2**
+> düşük seviye örneği olmadığı için motor sayısı / IDL ailesi ve modele özgü
+> kimlikler belirsiz; A1 / Aliengo / B1 çerçeve düzeni kaynaklarda yok;
+> Go1'in v3.8.6 sıkıştırılmış düşük seviye çerçevesi çözülemiyor (bulgu
+> olarak raporlanıyor); eski UDP'de gönderici kimliği yalnız IP (sahtelenebilir);
+> **ajansız sensör kutusu** referans imajı (S7) yok (örnek yapılandırma var);
+> Unitree döngü hızında **gecikme bütçesi ölçümü** yapılmadı;
+> Pulsar sensörü `robot_model` almıyor; `restrict_motion` sport API adaptörü yok.
 
 **Unitree işleri sprint planına:**
 - **S0:** Go2 EDU + G1 EDU tedarik; firmware sürümlerini sabitle; ağ topolojisi ve

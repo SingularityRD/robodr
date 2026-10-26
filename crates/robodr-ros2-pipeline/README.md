@@ -22,6 +22,7 @@ is tested offline. The same code runs in three places:
 | `source` | `Datagram` and `DatagramSource`: a blocking, std-only seam. `CaptureDatagramSource` wraps `robodr_capture::rtps_datagrams` for live `AF_PACKET` (`open_live`, Linux, `CAP_NET_RAW`) and for pcap/pcapng files (`open_file`). It takes an optional stop flag. `VecDatagramSource` is the in-memory source. |
 | `pipeline` | `Pipeline` runs `FragmentReassembler::parse_datagram_detailed`, using **one long-lived, bounded reassembler**. Then `Profile::evaluate` + removal, anomaly and fragmentation findings, then bounded dedup, then `Finding`s stamped `enforce` or `observe`. Also holds `load_profile`, `ProfileStatus` and `ThreatExtra`, the flat `extra` table and JSON line. |
 | `motion` | The live motion decode path. Learns writer GUID → (topic, type) and reader GUID → topic from SEDP (bounded tables), walks user DATA / DATA_FRAG with `robodr-rtps`'s `UserDataWalker`, decodes samples on the profile's motion channels and on `motion.feedback_topics` with `robodr-cdr`, and returns `MotionCommand` / `MotionFeedback` samples (`Pipeline::process_with_motion_at`, `ProcessOutput::motion`). Commands go through `Profile::evaluate` (envelope). |
+| `legacy` | Unitree legacy UDP (Go1 generation, `unitree_legged_sdk`), off by default (`unitree_legacy` sub-table). The capture filter (and its kernel BPF) also accepts UDP on the configured legacy ports; `Pipeline::process_datagram_with_motion` hands those datagrams (`Datagram::legacy`) to `Pipeline::process_legacy_at`: decode by length (`robodr_cdr::unitree_legacy::LegacyFrame`), sender check, commands on `/unitree_legacy/high_cmd` / `low_cmd` as `MotionSample`s (feedback when its channel is a feedback topic). |
 | `config` | `Config`, i.e. `[module.robodr-sensor-ros2]` plus the `[...capture]` sub-table, and its validation. Domain id gives the SPDP port. Capture domain ids give the `RtpsPortMap`. Default capture interfaces are `lo` plus the interface of the `/proc/net/route` default route. `CaptureSettings::open` opens the configured source. |
 | `socket` | Receive-only SPDP multicast socket. It sets `SO_REUSEADDR` before `bind` and binds to the group address, so it coexists with the robot's DDS participants. |
 | `sanitize`, `dedup` | Attacker-controlled text is control-escaped and capped at 512 chars. The dedup set is O(capacity) and stores keyed hashes. |
@@ -51,6 +52,7 @@ is tested offline. The same code runs in three places:
 | `robot.motion.undecodable_sample` | Medium, rate limited | a sample on a motion / feedback topic was not inspected: undecodable CDR, unknown type, wrong-role type, malformed DATA / inline QoS, fragments refused / evicted / conflicting, per-datagram sample cap |
 | `robot.motion.unattributed_sample` | High | DATA to a reader announced on a motion / feedback topic from a writer never announced via SEDP |
 | `robot.motion.sample_source_mismatch` | Critical (command topic) / High (feedback) | a decoded motion sample whose writer prefix is bound (SPDP / `participant_ips`) to other IPs than its source |
+| `robot.unitree.legacy_unknown_sender` | Critical (command) / Medium (state) | a Unitree legacy UDP frame from an IP not in `unitree_legacy.command_senders` (commands) / `robot_addresses` (state); the legacy protocol is unauthenticated |
 
 Each distinct finding (rule + detail) is reported once. Dedup is bounded, so
 eviction can only cause a re-report.
@@ -118,8 +120,29 @@ datagram ─► discovery parse ─► SEDP: writer GUID → (topic, type), read
 Configuration (`[module.robodr-sensor-ros2.motion]` / agentd `sensor.motion`):
 `enabled` (default true), `feedback_topics` (ROS names, e.g. `["/odom"]`),
 `evaluate_commands` (default true), `max_writers` (4096),
-`max_samples_per_datagram` (256).
+`max_samples_per_datagram` (256). `MotionOptions::robot_model` has no key
+here: `robodr-agentd` sets it from `robot.robot_model` (the Pulsar sensor
+runs without it, so model-specific Unitree API ids are `Unknown` there).
 
+Unitree legacy UDP (`[module.robodr-sensor-ros2.unitree_legacy]` / agentd
+`sensor.unitree_legacy`): `enabled` (default false), `ports` (default
+`[8007, 8080, 8082, 8090]`), `command_senders` (IPs), `robot_addresses`
+(default `192.168.123.10`, `192.168.123.161`). Needs `capture`; `Datagram`
+carries `legacy` (UDP ports) and `captured_at` (the capture timestamp, which
+`robodr-agentd` uses as the joint firewall's clock).
+
+- **Unitree.** Unitree SDK2 topics are plain DDS topics named `rt/...`
+  and de-mangle like ROS topics (`rt/lowcmd` -> `/lowcmd`,
+  `rt/api/sport/request` -> `/api/sport/request`, `rt/dex3/left/cmd` ->
+  `/dex3/left/cmd`); their types decode by the SEDP type name
+  (`unitree_go::msg::dds_::LowCmd_`, ...). A decoded low-level joint
+  command also carries its per-slot frame in `MotionSample::joint`
+  (`JointCommandSample`: every slot, the decoder's CRC verdict, the hg
+  `mode_pr` / `mode_machine`) for a joint firewall, and
+  `MotionOptions::robot_model` interprets Unitree API requests with the
+  model's API tables (model-specific ids are otherwise `Unknown`). Every
+  SDK2 topic of the decoder's model matrix is exercised by
+  `tests/unitree_topics.rs`.
 - The event time is the **capture** time the caller passes (the plain
   `process*` methods use nanoseconds since the pipeline was built). The
   INFO_TS source timestamp is exposed in `MotionSample::source_timestamp`
@@ -154,6 +177,13 @@ sudo robodr-ros2-watch --profile profile.json --interface lo --interface eth0 --
   - `--no-fragmentation`
 
 ## Tests
+
+`tests/unitree_topics.rs` (4): every Unitree SDK2 topic of the model matrix
+(low-level, arm SDK, user control, hand SDK, Dex3, waist, IMU, sport state,
+API) de-mangles, decodes by its SEDP type and maps to a command / feedback
+(joint frames carry their slots, CRC verdict, `mode_pr` / `mode_machine`);
+model-specific API ids with and without `robot_model`; the legacy UDP path
+(off, unknown sender, over envelope, compressed frame, dedup).
 
 The counts below are from before the motion path; it added 23 tests:
 16 in `tests/motion_decode.rs` (Twist on `rt/cmd_vel` from a profiled writer

@@ -7,6 +7,7 @@ hardware. It is the Phase 1/2 demo in software.
 RobotEvent
   -> Profile::evaluate            (robodr-events)  ┐
   -> Firewall::check              (robodr-firewall, MotionCommand only, optional)
+     or Firewall::check_joint     (low-level joint channel + decoded frame, handle_with_joint)
   -> ConsistencyMonitor           (robodr-motion, commands + feedback, optional)
   -> Deviation, stamped with the profile's observe/enforce mode
   -> Responder::plan              (robodr-responder: SafetyState, OperationalContext, ResponsePolicy)
@@ -240,6 +241,19 @@ limiting. Use `--step-ms 6000` to see each one graded on its own.
   vector filled with the max joint speed. Its
   stamp is the observation time, so stale and future checks cannot fire
   through this path.
+- Low-level joint channels (`FirewallSettings::joint_channels`, Unitree
+  `LowCmd`) are checked by a separate joint-frame firewall instance:
+  `Agent::handle_with_joint(now, event, Some(&JointInput { frame,
+  stamp_ns }), safety)` runs `Firewall::check_joint` on the decoded frame
+  (every slot, CRC verdict, `mode_pr` / `mode_machine`) with the frame's
+  observation time as its clock (non-decreasing; an older stamp is
+  clamped and counted, never a clock regression), and records
+  `robodr.firewall_joint_verdict` (limit reasons `position` / `velocity`
+  / `torque` / `gain` / `step` / `pd_torque`, substitute `hold_last` /
+  `zero`, the frame's slot count, `crc_ok` and modes). A command on a
+  joint channel without its frame is not checked by the firewall
+  (`AgentStats::joint_frames_missing`); the profile still evaluates it.
+  `FirewallSettings::from_profile_and_joints` builds both kinds.
 - In the finding, commanded speeds are reported as `|v|` of `linear_speed`
   (the forward component) and `joint_speed`; the lateral / vertical /
   roll-pitch axes are not in the findings contract yet (the deviation detail

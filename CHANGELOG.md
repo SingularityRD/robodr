@@ -12,6 +12,22 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Added
 
+- Unitree live in `robodr-agentd` (recording only; synthetic traffic and
+  IDL-derived vectors, no real Unitree capture yet): the SDK2 topics
+  (`rt/lowcmd`, `rt/arm_sdk`, `rt/user_lowcmd`, `rt/hand_sdk`, `rt/dex3/*`,
+  `rt/waistpitch*`, `rt/api/<svc>/request`, state topics) decode end to
+  end; decoded low-level frames reach a **joint firewall**
+  (`firewall.joint_config`, `Agent::handle_with_joint`,
+  `robodr.firewall_joint_verdict`, clock = capture time, no in-path
+  gateway yet); `robot.robot_model` classifies model-specific API ids and
+  refuses a humanoid model with a non-humanoid policy / firewall
+  morphology (and a joint channel with the wrong slot count); Unitree
+  legacy UDP (Go1) through `sensor.unitree_legacy` (capture classifier
+  incl. kernel BPF, `robot.unitree.legacy_unknown_sender`, contract 2.1
+  catalog entry) and `robodr-commission learn --unitree-legacy`; example
+  profiles for every supported model and
+  `config/agentd.unitree-{sensor-box,edu}.example.json`.
+
 - Motion Firewall low-level joint path (`check_joint`), review fixes:
   per-slot `max_dq_step` / `tau_pd_max` bounds on the position target
   relative to the previous accepted target (stepped within the hard
@@ -378,6 +394,12 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   safety rules, known limits) shipped in the `.deb` and the offline bundle.
 
 ### Changed
+
+- `robodr_agent::FirewallSettings::from_profile`: an envelope that bounds
+  joint speed and allows no linear speed (`max_linear_speed` absent **or
+  0**, as the learner writes for a never-exercised dimension) is a
+  joint-velocity channel, no longer a Twist channel needing
+  `max_angular`.
 
 - **Response policy morphology is fail-safe (breaking for policies).**
   `morphology` is required when a policy is `oem_validated` or its
