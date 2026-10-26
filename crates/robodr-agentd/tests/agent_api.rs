@@ -29,6 +29,7 @@ fn agent(dir: &std::path::Path, locked: bool) -> Agent {
     .unwrap();
     let ctx = OperationalContext {
         platform: policy.platform,
+        morphology: policy.morphology,
         phase: MissionPhase::Transit,
         connectivity: Connectivity::Connected,
         control: ControlMode::Autonomous,

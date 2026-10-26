@@ -3,15 +3,15 @@
 //! them), the agentd control plane (which accepts requests for them) and any
 //! SOC integration (which registers them as approval-gated actions).
 //!
-//! | Action | Wire name | Step | Reversible | Approval | GA |
-//! |---|---|---|---|---|---|
-//! | `restrict_motion` | `robot_restrict_motion` | `limit_motion` | yes (time-limited) | single | executed |
-//! | `quarantine_node` | `robot_quarantine_node` | `restrict` | yes | single | executed |
-//! | `isolate_network` | `robot_isolate_network` | `restrict` | yes (time-limited) | single | executed |
-//! | `record_evidence` | `robot_record_evidence` | `record` | yes (no lasting effect) | single | executed |
-//! | `safe_pause` | `robot_safe_pause` | `safe_pause` | yes | two-person | platform adapter only |
-//! | `request_safe_state` | `robot_request_safe_state` | `request_safe_state` | no | two-person | plan only |
-//! | `rollback_config` | `robot_rollback_config` | `restrict` | no | two-person | plan only |
+//! | Action | Wire name | Step | Reversible | Approval | GA | May de-energise |
+//! |---|---|---|---|---|---|---|
+//! | `restrict_motion` | `robot_restrict_motion` | `limit_motion` | yes (time-limited) | single | executed | no |
+//! | `quarantine_node` | `robot_quarantine_node` | `restrict` | yes | single | executed | process target only |
+//! | `isolate_network` | `robot_isolate_network` | `restrict` | yes (time-limited) | single | executed | no |
+//! | `record_evidence` | `robot_record_evidence` | `record` | not applicable (no effect on the robot; evidence is never "reverted") | single | executed | no |
+//! | `safe_pause` | `robot_safe_pause` | `safe_pause` | yes | two-person | platform adapter only | yes |
+//! | `request_safe_state` | `robot_request_safe_state` | `request_safe_state` | no | two-person | plan only | yes |
+//! | `rollback_config` | `robot_rollback_config` | `restrict` | no | two-person | plan only | yes (controller restart) |
 //!
 //! Rules that hold for every entry (tested):
 //!
@@ -24,15 +24,34 @@
 //! * **Wire names** are `robot_<name>`. They are unchanged from the earlier
 //!   integration so stored approvals and registrations keep working; a
 //!   consumer that wants a namespace-free name uses [`ActionSpec::name`].
-//! * **GA execution** ([`GaExecution`]): only the reversible actions run in
-//!   GA; `safe_pause` runs only through a platform adapter (Nav2,
-//!   ros2_control, autopilot hold) under an OEM-validated policy; the
-//!   irreversible `request_safe_state` and `rollback_config` are plan-only.
+//! * **GA execution** ([`GaExecution`]): only the reversible actions (and
+//!   `record_evidence`, which has no effect on the robot) run in GA;
+//!   `safe_pause` runs only through a platform adapter (Nav2, ros2_control,
+//!   autopilot hold) under an OEM-validated policy; the irreversible
+//!   `request_safe_state` and `rollback_config` are plan-only.
+//! * **Evidence** (`record_evidence`): capture only. It is accepted in
+//!   observe mode and while the safety system is engaged (it sends nothing
+//!   to the platform), and it is never reverted: `reversible` is `false`
+//!   and `has_effect` is `false` (nothing to undo).
 //! * **May de-energise** ([`ActionSpec::may_de_energise`]): `safe_pause` and
 //!   `request_safe_state` may be implemented by the platform by damping or
-//!   de-energising actuators. On a platform that falls when it loses
-//!   actuation (a humanoid) they are never executable, only advisory (see
-//!   [`crate::Morphology`]).
+//!   de-energising actuators; `rollback_config` restarts the controller
+//!   whose configuration it rolls back. On a platform that falls when it
+//!   loses actuation (a humanoid) the first two are never executable, only
+//!   advisory, and on any robot that needs active balance (humanoid,
+//!   quadruped) a rollback is refused (see [`crate::Morphology`]).
+//!   `quarantine_node` on a **process** target may stop the balance
+//!   controller ([`ActionSpec::process_target_may_de_energise`],
+//!   [`action_may_de_energise`]): on a robot that needs active balance it
+//!   always waits for a human and never terminates.
+//! * **Balance-safe only off the balance loop.** `isolate_network` and
+//!   `quarantine_node` (participant) keep a humanoid standing only when its
+//!   balance loop is not networked. Where the low-level loop is a DDS
+//!   writer (Unitree `rt/lowcmd`), cutting that writer trips the motor
+//!   watchdog, the joints damp and the robot falls. The planner therefore
+//!   adds them to a humanoid's substitute containment only when the OEM
+//!   listed them in the policy's `fall_safe_restrict`, and always for a
+//!   human to approve.
 
 use serde::{Deserialize, Serialize};
 
@@ -56,7 +75,10 @@ pub enum ActionId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Approval {
-    /// One authorised person approves.
+    /// One authorised person approves. Serialised `single`; the earlier
+    /// integration's name `analyst` is still read (no consumer of the old
+    /// name is known; the alias keeps stored registrations readable).
+    #[serde(alias = "analyst")]
     Single,
     /// Two different people approve (four-eyes); the requester is not one
     /// of them.
@@ -88,8 +110,11 @@ pub struct ActionSpec {
     /// The Cyber-Jidoka ladder step the action stands on.
     pub step: Step,
     /// Can be undone by a later request (a safe state needs an operator
-    /// restart; a rollback is not undone).
+    /// restart; a rollback is not undone; evidence capture is never
+    /// "reverted").
     pub reversible: bool,
+    /// Changes anything on the robot. `false` only for `record_evidence`.
+    pub has_effect: bool,
     /// Needs a TTL and lapses on its own.
     pub time_limited: bool,
     pub approval: Approval,
@@ -99,8 +124,12 @@ pub struct ActionSpec {
     pub executable_in_ga: bool,
     /// How it is executed in GA.
     pub ga_execution: GaExecution,
-    /// The platform may implement it by damping / de-energising actuators.
+    /// The platform may implement it by damping / de-energising actuators
+    /// (or, for `rollback_config`, by restarting the controller).
     pub may_de_energise: bool,
+    /// On a `process` target it may stop the process that keeps the
+    /// actuators energised (the balance controller). `quarantine_node` only.
+    pub process_target_may_de_energise: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -121,12 +150,14 @@ const fn spec(
         wire_name,
         step,
         reversible,
+        has_effect: !matches!(id, ActionId::RecordEvidence),
         time_limited,
         approval,
         autonomous: false,
         executable_in_ga: !matches!(ga_execution, GaExecution::PlanOnly),
         ga_execution,
         may_de_energise,
+        process_target_may_de_energise: matches!(id, ActionId::QuarantineNode),
     }
 }
 
@@ -170,7 +201,7 @@ pub const CATALOG: [ActionSpec; 7] = [
         "record_evidence",
         "robot_record_evidence",
         Step::Record,
-        true,
+        false,
         false,
         Approval::Single,
         GaExecution::Executor,
@@ -207,7 +238,7 @@ pub const CATALOG: [ActionSpec; 7] = [
         false,
         Approval::TwoPerson,
         GaExecution::PlanOnly,
-        false,
+        true,
     ),
 ];
 
@@ -270,6 +301,16 @@ impl ActionId {
     pub const fn may_de_energise(self) -> bool {
         self.spec().may_de_energise
     }
+
+    /// Refused outright on a robot of this morphology (the control plane
+    /// answers `fall_hazard`; the robot snapshot does not advertise it):
+    /// a possibly de-energising action on a robot that falls when
+    /// de-energised, or a controller restart (`rollback_config`) on any
+    /// robot that needs active balance.
+    pub fn refused_for(self, morphology: crate::Morphology) -> bool {
+        (self.may_de_energise() && morphology.falls_when_de_energised())
+            || (self == ActionId::RollbackConfig && morphology.needs_active_balance())
+    }
 }
 
 /// The catalog action a planned ladder action corresponds to.
@@ -288,6 +329,22 @@ pub fn for_action(action: &ResponseAction) -> ActionId {
         ResponseAction::SafePause { .. } => ActionId::SafePause,
         ResponseAction::RequestSafeState { .. } => ActionId::RequestSafeState,
     }
+}
+
+/// True when this planned action may stop the robot's actuation: a
+/// possibly de-energising catalog action, or a `Restrict` of a **process**
+/// (which may be the balance controller).
+pub fn action_may_de_energise(action: &ResponseAction) -> bool {
+    let spec = spec_for(action);
+    spec.may_de_energise
+        || (spec.process_target_may_de_energise
+            && matches!(
+                action,
+                ResponseAction::Restrict {
+                    target: RestrictTarget::Process,
+                    ..
+                }
+            ))
 }
 
 /// The catalog entry for a planned ladder action.

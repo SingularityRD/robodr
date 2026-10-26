@@ -47,6 +47,7 @@ fn every_platform_state_severity_mode_and_context_matches_the_oracle() {
         for oem_validated in [false, true] {
             let mut policy = ResponsePolicy::conservative_default(platform);
             policy.oem_validated = oem_validated;
+            policy.morphology = stable(platform);
             for c in all_contexts(platform) {
                 for state in SafetyState::ALL {
                     for sev in SEVERITIES {

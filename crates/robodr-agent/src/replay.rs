@@ -452,6 +452,7 @@ pub fn build_agent_checked(opts: &ReplayOptions) -> Result<(Agent, TrustedProfil
     let policy = load_policy(&opts.policy)?;
     let context = OperationalContext {
         platform: policy.platform,
+        morphology: policy.morphology,
         phase: opts.phase,
         connectivity: opts.connectivity,
         control: opts.control,

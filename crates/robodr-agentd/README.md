@@ -42,7 +42,7 @@ level, and every path must be absolute.
 |---|---|
 | `robot` | `id` (also the black-box device id), `site`, optional `model`, `kafka_partitions` (`profile_version` was removed: the version in findings is the signed profile's `metadata.profile_version`) |
 | `sensor` | The ROS 2 sensor's own `[module.robodr-sensor-ros2]` section in JSON form, validated by `robodr_ros2_pipeline::Config::validate`. It sets the profile path, capture (live interfaces or `pcap_replay`), the SPDP socket (`listen_spdp`, default **true**) and the binding settings. Its profile is used by the pipeline and by the agent. |
-| `policy_path` | Response policy (`robodr.response-policy/v1`; its optional `morphology` — e.g. `humanoid` — makes safe pause / safe state advisory only, see `robodr-responder`) |
+| `policy_path` | Response policy (`robodr.response-policy/v1`; its `morphology` — required once OEM-validated or for platform `other`, e.g. `humanoid` — makes safe pause / safe state advisory only and sets the balancing-robot rules, see `robodr-responder`) |
 | `blackbox` | `dir`, `key_file`, optional `key_id`, optional `boot_id` (default `/proc/sys/kernel/random/boot_id`) |
 | `spool` | `dir`, `max_bytes` (default 64 MiB), `max_files` (default 10000) |
 | `findings` | Optional. `topic` (default `robodr.findings`) and `data_source` (default `robodr`): the deployment labels every finding carries (`robodr.findings` contract 2.x) |
@@ -253,14 +253,23 @@ a plan".
   no motion command, force or override field exists and `authority` must be
   `request`. Unknown or duplicate keys refuse the body.
 - **Judgment.** Against the safety state *now* (live feed re-evaluated),
-  the operational context and the response policy: refused while the
-  e-stop / safe state is active (also `request_safe_state`: the safety
-  system has authority), `safe_pause` / `request_safe_state` on a humanoid
-  (`fall_hazard`), in observe mode, for motion-affecting steps while a
-  person commands motion or during take-off / landing, `rollback_config`
-  unless `idle`, anything above the policy matrix's ceiling for the state, a
-  speed cap above the profile envelope, and any plan that fails
-  `check_invariants`. A refusal is final.
+  the operational context and the response policy. `record_evidence`
+  (capture only, nothing sent to the platform) is accepted in every state,
+  observe mode included. Everything else is refused while the e-stop /
+  safe state is active (also `request_safe_state`: the safety system has
+  authority), in observe mode, when the context's morphology differs from
+  the policy's (`morphology_mismatch`), for motion-affecting steps while a
+  person commands motion or during take-off / landing; `fall_hazard` for
+  `safe_pause` / `request_safe_state` on a humanoid and for
+  `rollback_config` (a controller restart) on a humanoid or quadruped —
+  also while `idle`, since a legged robot balances while idle — and for a
+  `restrict_motion` cap below the policy's `min_motion_factor` of the
+  envelope (or with no envelope to judge it) on a humanoid / quadruped;
+  `rollback_config` unless `idle`; anything above the policy matrix's
+  ceiling for the state; a speed cap above the profile envelope; and any
+  plan that fails `check_invariants`. A refusal is final. The robot
+  snapshot lists the robot's `morphology` and only the actions not refused
+  for it.
 - **Evidence.** Request (with its signature and exact body: it re-verifies
   offline), state, context and decision are one fsynced
   `robodr.control_plane_request` note; reverts and authenticated invalid

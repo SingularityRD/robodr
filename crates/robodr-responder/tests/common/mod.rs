@@ -48,10 +48,22 @@ impl XorShift {
     }
 }
 
+/// The statically stable morphology the tests declare for a family (the
+/// conservative default leaves it unspecified, which is fall-prone).
+pub fn stable(platform: PlatformFamily) -> Morphology {
+    match platform {
+        PlatformFamily::Ugv | PlatformFamily::Amr => Morphology::WheeledMobile,
+        PlatformFamily::Drone => Morphology::Aerial,
+        PlatformFamily::Arm => Morphology::Arm,
+        PlatformFamily::Other => Morphology::Other,
+    }
+}
+
 /// A nominal, autonomous, connected, profile-locked context.
 pub fn ctx(platform: PlatformFamily) -> OperationalContext {
     OperationalContext {
         platform,
+        morphology: stable(platform),
         phase: MissionPhase::Transit,
         connectivity: Connectivity::Connected,
         control: ControlMode::Autonomous,
@@ -70,6 +82,7 @@ pub fn all_contexts(platform: PlatformFamily) -> Vec<OperationalContext> {
                     for profile_locked in [false, true] {
                         v.push(OperationalContext {
                             platform,
+                            morphology: stable(platform),
                             phase,
                             connectivity,
                             control,
@@ -88,6 +101,7 @@ pub fn all_contexts(platform: PlatformFamily) -> Vec<OperationalContext> {
 pub fn validated(platform: PlatformFamily) -> ResponsePolicy {
     let mut p = ResponsePolicy::conservative_default(platform);
     p.oem_validated = true;
+    p.morphology = stable(platform);
     p
 }
 
@@ -219,8 +233,36 @@ pub fn universal_invariants(
     // No process kill while in motion (or ever, unless idle + allowed);
     // also checked on the would-have plan.
     for q in std::iter::once(p).chain(p.would_have.as_deref()) {
-        if has_terminate(q) && !(state == SafetyState::Idle && policy.allow_terminate_when_idle) {
+        if has_terminate(q)
+            && !(state == SafetyState::Idle
+                && policy.allow_terminate_when_idle
+                && !policy.morphology.needs_active_balance()
+                && !c.morphology.needs_active_balance())
+        {
             return Err("terminate outside idle/allowed".into());
+        }
+        if (policy.morphology.needs_active_balance() || c.morphology.needs_active_balance())
+            && !q.requires_human_approval
+            && q.actions.iter().any(|a| {
+                matches!(
+                    a,
+                    ResponseAction::Restrict {
+                        target: RestrictTarget::Process,
+                        ..
+                    }
+                )
+            })
+        {
+            return Err("process quarantine on a balancing robot without approval".into());
+        }
+        if policy.morphology.falls_when_de_energised()
+            && !q.advisory.is_empty()
+            && !q.requires_human_approval
+        {
+            return Err("humanoid substitute containment without approval".into());
+        }
+        if c.morphology != policy.morphology && !is_record_only(q) {
+            return Err("acted on a morphology mismatch".into());
         }
         if has_motion(q)
             && !q.requires_human_approval

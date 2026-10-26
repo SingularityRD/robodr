@@ -27,31 +27,36 @@ containment actions. The agentd control plane accepts exactly these
 (`ActionKind` is a re-export of `ActionId`; a test asserts they match), and a
 SOC integration registers them under their wire names.
 
-| Action | Wire name | Step | Reversible | Approval | GA execution |
-|---|---|---|---|---|---|
-| `restrict_motion` | `robot_restrict_motion` | `limit_motion` | yes, TTL | single | executor (firewall gateway) |
-| `quarantine_node` | `robot_quarantine_node` | `restrict` | yes | single | executor (DDS / nftables) |
-| `isolate_network` | `robot_isolate_network` | `restrict` | yes, TTL | single | executor (nftables, management channel exempt) |
-| `record_evidence` | `robot_record_evidence` | `record` | yes (no lasting effect) | single | executor (black box) |
-| `safe_pause` | `robot_safe_pause` | `safe_pause` | yes | two-person | platform adapter only, OEM-validated policy |
-| `request_safe_state` | `robot_request_safe_state` | `request_safe_state` | no | two-person | plan only |
-| `rollback_config` | `robot_rollback_config` | `restrict` | no | two-person | plan only |
+| Action | Wire name | Step | Reversible | Approval | GA execution | May de-energise |
+|---|---|---|---|---|---|---|
+| `restrict_motion` | `robot_restrict_motion` | `limit_motion` | yes, TTL | single | executor (firewall gateway) | no |
+| `quarantine_node` | `robot_quarantine_node` | `restrict` | yes | single | executor (DDS / nftables) | process target only |
+| `isolate_network` | `robot_isolate_network` | `restrict` | yes, TTL | single | executor (nftables, management channel exempt) | no |
+| `record_evidence` | `robot_record_evidence` | `record` | not applicable (`reversible: false`, `has_effect: false`: evidence is never "reverted") | single | executor (black box) | no |
+| `safe_pause` | `robot_safe_pause` | `safe_pause` | yes | two-person | platform adapter only, OEM-validated policy | yes |
+| `request_safe_state` | `robot_request_safe_state` | `request_safe_state` | no | two-person | plan only | yes |
+| `rollback_config` | `robot_rollback_config` | `restrict` | no | two-person | plan only | yes (controller restart) |
 
 Every action is **never autonomous** (`autonomous = false`): a SOC must
 have a human approve it. `executable_in_ga` is `false` for the plan-only
-pair; GA executes only reversible actions. The wire names keep the
+pair; GA executes only reversible actions and `record_evidence` (which has
+no effect on the robot, and is accepted by the control plane in observe
+mode and while the safety system is engaged). The wire names keep the
 `robot_<name>` strings used so far, so existing registrations stay valid.
-`safe_pause` and `request_safe_state` are flagged `may_de_energise`: see
-*Humanoids* below. (Nothing in this crate executes; GA execution is the
-executor's and the platform adapters' job.)
+`Approval::Single` is written `single`; the earlier name `analyst` is still
+read (serde alias). `safe_pause`, `request_safe_state` and
+`rollback_config` are flagged `may_de_energise`, and `quarantine_node` on
+a process target `process_target_may_de_energise`: see *Morphology* below.
+(Nothing in this crate executes; GA execution is the executor's and the
+platform adapters' job.)
 
 ## Invariants (in code, regardless of policy; tested exhaustively)
 
 1. **Nothing beyond `request_safe_state` exists.** The action vocabulary has no
    actuation, motor/power cut, IEC 60204-1 stop category 0, e-stop reset or
    "kill process mid-motion". A process may be *terminated* only while
-   `Idle` and only if the policy sets `allow_terminate_when_idle`; otherwise it is
-   quarantined.
+   `Idle`, only if the policy sets `allow_terminate_when_idle`, and never on a
+   morphology that needs active balance; otherwise it is quarantined.
 2. **`estop_active` / `safe_state_active` → `record` only.** The safety system
    already has authority; RoboDR sends it no competing requests.
 3. **`unknown` safety state → motion-affecting steps (3–5) require human
@@ -69,21 +74,39 @@ executor's and the platform adapters' job.)
 6. **Approval contract:** if `requires_human_approval`, only `record` may run
    before a human approves. Steps above the policy's `auto_max_step` always need
    approval.
-7. **Policy mismatch** (context platform ≠ policy platform) → `record` +
-   approval.
-8. **Humanoid: no executable de-energising action.** With `morphology:
-   "humanoid"`, `safe_pause` and `request_safe_state` never appear in a
-   plan's `actions`; they go to `advisory` (never executed) and the plan
-   contains the threat with `limit_motion`, `isolate_network` and
-   `quarantine_node` instead (`Reason::DeEnergisingAdvisoryOnly`,
-   `Violation::DeEnergisingOnFallProneMorphology`).
+7. **Policy mismatch** (context platform or morphology ≠ the policy's) →
+   `record` + approval. The context's morphology is the caller's own
+   configuration, and `check_invariants` refuses an acting plan whose
+   `morphology` differs from the context's (`Violation::MorphologyMismatch`),
+   so a plan's own label is never trusted alone.
+8. **Fall-prone (humanoid, unspecified): no executable de-energising
+   action.** `safe_pause` and `request_safe_state` never appear in a plan's
+   `actions`; they go to `advisory` (never executed). The substitute
+   containment — `limit_motion` plus only the restrict targets in the
+   policy's `fall_safe_restrict` — **always requires human approval**
+   (`Reason::DeEnergisingAdvisoryOnly`,
+   `Violation::DeEnergisingOnFallProneMorphology`,
+   `Violation::SubstituteWithoutApproval`).
+9. **Needs active balance (humanoid, quadruped, unspecified).** No process
+   termination (`allow_terminate_when_idle` is rejected; `idle` is not a
+   gate — the robot balances while idle), a process quarantine always needs
+   approval (it may be the balance controller), `limit_motion` never below
+   `min_motion_factor` (and never below the hard floor 0.05 in
+   `check_invariants`), and the control plane refuses `rollback_config`
+   (a controller restart) with `fall_hazard`.
 
-## Humanoids (`morphology`)
+## Morphology (`morphology`)
 
 The response policy carries the robot's body plan, `morphology`:
 `humanoid`, `quadruped`, `wheeled_mobile`, `arm`, `aerial` or `other`
-(default; policies written before the field existed load unchanged and plan
-exactly as before).
+(declared statically stable). It is **required** when `oem_validated` is
+true or `platform` is `other` (the family that covers humanoids and legged
+robots): `validate` rejects such a policy without it
+(`PolicyError::MorphologyRequired`). Where it may still be omitted (a
+not-yet-validated policy of another family, which runs observe-only) it
+reads as `unspecified`, which gets the humanoid treatment. RoboDR never
+assumes a robot stands on its own; `conservative_default` leaves it
+unspecified for every family.
 
 A humanoid stays upright only while its joint controllers actively balance
 it. The usual implementation of "pause", "safe state" or "protective stop"
@@ -91,24 +114,43 @@ on such a platform is a damping / zero-torque mode or a motor power cut, and
 the robot then **falls** — tens of kilograms from standing height, next to
 the people and equipment it works with. That is a worse hazard than most
 cyber events it would answer, and RoboDR cannot know how a given platform
-implements those requests. So, for `humanoid` only:
+implements those requests. So, for `humanoid` (and `unspecified`):
 
 * the planner moves `safe_pause` / `request_safe_state` into
   `ResponsePlan::advisory` (a recommendation for the operator and the
   platform's own safety function, which may have a validated sit-down or
-  crouch sequence) and caps the executable plan at `limit_motion`, adding
-  network isolation and participant quarantine to the restrict targets;
-* `check_invariants` rejects any plan with `morphology: humanoid` whose
-  actions contain either step, and any advisory entry that is not one of
-  them (executors must also compare the plan's `morphology` with their own
-  policy);
+  crouch sequence) and caps the executable plan at `limit_motion`;
+* the substitute containment always waits for a human. It adds only the
+  restrict targets the OEM listed in `fall_safe_restrict` (default empty:
+  `limit_motion` alone). **`isolate_network` and `quarantine_node` are
+  balance-safe only when the balance loop is not networked.** On Unitree
+  G1/H1 the low-level loop is a DDS writer of `rt/lowcmd`; cutting that
+  writer (network isolation, participant quarantine) trips the motor
+  watchdog, the joints damp and the robot falls. `process` is never
+  accepted in `fall_safe_restrict`;
+* `check_invariants` rejects any plan (by the plan's *or* the checker's
+  morphology) whose actions contain either step, any advisory entry that is
+  not one of them, and any substitute plan without approval;
 * the agentd control plane refuses SOC requests for `safe_pause` /
-  `request_safe_state` on a humanoid (`fall_hazard`).
+  `request_safe_state` / `rollback_config` on a humanoid (`fall_hazard`) and
+  does not advertise them in the robot snapshot.
 
-Quadrupeds, wheeled platforms, arms and aerial vehicles keep the full ladder
-(their safe behaviours are a controlled stop, protective stop category 2 or
-hold). A quadruped whose damping mode collapses the body should use an
-OEM-validated `platform_defined` behaviour, or be declared `humanoid`.
+A **quadruped** also balances actively while standing: if its controller
+process dies or restarts it drops onto its belly (~15-50 kg from
+~0.3-0.5 m — less dangerous than a biped falling, but a real hazard next to
+people). So the *active balance* rules (invariant 9) apply to quadrupeds
+too: no process termination, process quarantine only with approval, no
+`rollback_config`, a `min_motion_factor` floor. A quadruped keeps an
+executable `safe_pause` / `request_safe_state` under an OEM-validated
+`platform_defined` behaviour (e.g. a controlled stand-down); one whose
+damping mode collapses the body without a safe sequence should be declared
+`humanoid`. Wheeled platforms, arms and aerial vehicles keep the full
+ladder unchanged.
+
+Examples: [`config/response-policy.unitree-g1.example.json`](../../config/response-policy.unitree-g1.example.json)
+(humanoid) and [`config/response-policy.unitree-go2.example.json`](../../config/response-policy.unitree-go2.example.json)
+(quadruped); both are not OEM-validated and validated by
+`tests/fall_prone_review.rs`.
 
 Defence in depth: `ResponsePolicy::validate` rejects policies that try to break
 2/5 (and malformed ones); the planner enforces all invariants again at plan time;
@@ -187,15 +229,17 @@ is at hand.
 | Field | Meaning |
 |---|---|
 | `model`, `platform` | Robot model and family (`ugv`, `amr`, `drone`, `arm`, `other`) |
-| `morphology` | Optional, default `other`: `humanoid`, `quadruped`, `wheeled_mobile`, `arm`, `aerial`, `other`. `humanoid` makes steps 4/5 advisory only |
+| `morphology` | `humanoid`, `quadruped`, `wheeled_mobile`, `arm`, `aerial`, `other`. Required when `oem_validated` or `platform: other`; otherwise absent = `unspecified` (treated as humanoid). See *Morphology* |
 | `oem_validated` | `true` only after OEM sign-off; otherwise observe-only |
 | `matrix.<state>.<severity>` | Max step. States: `idle`, `moving_slow`, `moving_fast`, `collaborative_human_nearby`, `estop_active`, `safe_state_active`, `unknown`. All states/severities required; e-stop/safe-state rows must be `record` |
 | `rule_overrides[]` | `{rule, min_step?, max_step?, restrict?}` — clamps the matrix step for one rule id; ≤ 256, unique, `[A-Za-z0-9._-]{1,128}` |
 | `auto_max_step` | Highest step executable without approval |
-| `limit_motion_factor` | Envelope scale for step 3, finite, in (0, 1] |
+| `limit_motion_factor` | Envelope scale for step 3, finite, in (0, 1]; ≥ `min_motion_factor` on humanoid / quadruped |
+| `min_motion_factor` | Default `0.2`, in [0.05, 1]: lowest envelope scale (planner and control-plane `restrict_motion` caps) on a robot that needs active balance |
+| `fall_safe_restrict` | Default `[]`: restrict targets (`network`, `participant`; never `process`) the OEM validated as balance-safe on a humanoid; humanoid only |
 | `safe_pause`, `safe_state` | Safe behaviour for steps 4/5, must suit `platform` |
 | `default_restrict` | Restrict targets (`network`, `participant`, `process`), non-empty |
-| `allow_terminate_when_idle` | Default `false` |
+| `allow_terminate_when_idle` | Default `false`; rejected on humanoid / quadruped / unspecified |
 | `escalation` | `window_ms`, `threshold` (2–64), `max_escalation_steps` (≤ 2), `ceiling`, `quiet_period_ms` (≥ window), `min_reissue_interval_ms` (≤ quiet) |
 
 ### Default policy (`ResponsePolicy::conservative_default`)

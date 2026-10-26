@@ -10,7 +10,7 @@
 //! `data_source`.
 
 use crate::hash::kafka_murmur2;
-use crate::model::{FindingEnvelope, CONTRACT_VERSION, OCSF_VERSION};
+use crate::model::FindingEnvelope;
 use crate::validate::{validate_for_emit, ValidationError};
 
 /// Header names, all lower-case ASCII.
@@ -58,12 +58,15 @@ pub fn dedup_key(env: &FindingEnvelope) -> (&str, &str) {
     (&env.data_source, &env.external_id)
 }
 
-/// Record headers, in a fixed order.
+/// Record headers, in a fixed order. Every value comes from the message
+/// itself: `robodr-contract-version` is the value's own `contract_version`
+/// and `ocsf-version` its `ocsf.metadata.version` (a forwarded or replayed
+/// message of an older 2.x minor keeps its own version in the header).
 pub fn headers(env: &FindingEnvelope) -> Vec<(&'static str, String)> {
     vec![
         (header::CONTENT_TYPE, "application/json".into()),
-        (header::CONTRACT_VERSION, CONTRACT_VERSION.into()),
-        (header::OCSF_VERSION, OCSF_VERSION.into()),
+        (header::CONTRACT_VERSION, env.contract_version.clone()),
+        (header::OCSF_VERSION, env.ocsf.metadata.version.clone()),
         (header::DATA_SOURCE, env.data_source.clone()),
         (header::ROBOT_ID, env.entity_context.robot.id.clone()),
         (

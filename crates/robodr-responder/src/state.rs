@@ -55,7 +55,9 @@ impl SafetyState {
     }
 
     /// True when the robot is known to be stationary and not under a safety
-    /// stop. Only here may a process restriction escalate to termination.
+    /// stop. Only here may a process restriction escalate to termination —
+    /// and never on a morphology that balances while idle
+    /// ([`Morphology::needs_active_balance`]).
     pub fn is_idle(self) -> bool {
         matches!(self, SafetyState::Idle)
     }
@@ -75,8 +77,9 @@ pub enum PlatformFamily {
     /// Industrial or collaborative manipulator arm.
     Arm,
     /// Anything else (humanoid, legged, marine...). Only the platform's own
-    /// configured safe behaviour may be requested. See also [`Morphology`]:
-    /// a humanoid never gets an executable safe pause / safe state.
+    /// configured safe behaviour may be requested. A policy for this family
+    /// must declare its [`Morphology`]: a humanoid never gets an executable
+    /// safe pause / safe state.
     Other,
 }
 
@@ -91,41 +94,71 @@ impl PlatformFamily {
 }
 
 /// The robot's body plan (morphology), set per model in the response policy
-/// (`"morphology"`, default `other`). [`PlatformFamily`] decides which safe
-/// behaviours make physical sense; the morphology decides whether a
-/// safe behaviour may be *executed* at all.
+/// (`"morphology"`). [`PlatformFamily`] decides which safe behaviours make
+/// physical sense; the morphology decides whether an action that may stop
+/// the robot's balance may be *executed* at all.
 ///
-/// # Why a humanoid never gets `safe_pause` / `request_safe_state`
+/// # Required, and fail-safe when absent
 ///
-/// A biped stands only while its joint controllers actively balance it. The
-/// way most humanoid stacks implement "pause", "safe state" or "protective
-/// stop" is to switch the joints to a damping or zero-torque mode (or to cut
-/// motor power): the robot then **falls**, from standing height, with
-/// tens of kilograms of mass, onto whatever and whoever is next to it. A
-/// fall is a worse hazard than the cyber event that prompted it, and RoboDR
-/// cannot know which implementation a given platform uses. So for
-/// [`Morphology::Humanoid`] the planner never puts `SafePause` or
-/// `RequestSafeState` into a plan's executable actions; it lists them in
-/// `ResponsePlan::advisory` (a recommendation for the operator and the
-/// platform's own safety function, which may know a safe sit-down or
-/// crouch sequence) and contains the threat with the steps that keep the
-/// robot balanced: `LimitMotion`, network isolation and participant
-/// quarantine. The control plane refuses SOC requests for these actions on
-/// a humanoid for the same reason.
+/// A policy must declare its morphology when it is OEM-validated or its
+/// platform is [`PlatformFamily::Other`] (the family that covers humanoids
+/// and legged robots); [`crate::ResponsePolicy::validate`] rejects it
+/// otherwise. Where it may still be omitted (a not-yet-validated policy of
+/// another family, which runs observe-only), it reads as
+/// [`Morphology::Unspecified`], which gets the **most conservative**
+/// treatment: that of a humanoid. RoboDR never assumes a robot stands on its
+/// own.
 ///
-/// Quadrupeds, wheeled platforms, arms and aerial vehicles are statically
-/// stable when stopped or have a platform-specific safe behaviour (controlled
-/// stop, protective stop category 2, hold / return-to-launch), so the
-/// existing per-family rules apply to them unchanged. A quadruped whose
-/// "damp" mode collapses the body should be configured with a
-/// `platform_defined` safe behaviour that the OEM has validated, or as
-/// `humanoid` if no safe sequence exists.
+/// # Two hazards
+///
+/// * **Falls when de-energised** ([`Morphology::falls_when_de_energised`]:
+///   humanoid, unspecified). A biped stands only while its joint
+///   controllers actively balance it. The way most humanoid stacks
+///   implement "pause", "safe state" or "protective stop" is to switch the
+///   joints to a damping or zero-torque mode (or to cut motor power): the
+///   robot then **falls**, from standing height, with tens of kilograms of
+///   mass, onto whatever and whoever is next to it. A fall is a worse
+///   hazard than the cyber event that prompted it, and RoboDR cannot know
+///   which implementation a given platform uses. So the planner never puts
+///   `SafePause` or `RequestSafeState` into a plan's executable actions; it
+///   lists them in `ResponsePlan::advisory` (a recommendation for the
+///   operator and the platform's own safety function, which may know a
+///   safe sit-down or crouch sequence). The substitute containment it plans
+///   instead **always needs a human's approval**: `LimitMotion` (never
+///   below the policy's `min_motion_factor`) plus only the restrict targets
+///   the OEM listed in the policy's `fall_safe_restrict`. Cutting the
+///   network or quarantining a DDS participant is balance-safe only when
+///   the balance loop itself is not networked: on Unitree G1/H1 the
+///   low-level loop is a DDS writer of `rt/lowcmd`, and silencing that
+///   writer trips the motor watchdog, which damps the joints — the robot
+///   falls. The control plane refuses SOC requests for these actions with
+///   `fall_hazard` for the same reason.
+/// * **Needs active balance** ([`Morphology::needs_active_balance`]:
+///   humanoid, quadruped, unspecified). The standing posture is held by a
+///   running controller process. A legged robot reports `idle` while it
+///   stands and actively balances, so `idle` does not mean "safe to stop a
+///   process": if the controller process dies, freezes or restarts, a
+///   humanoid falls from standing height and a quadruped drops onto its
+///   belly (a smaller but real hazard: ~15-50 kg from ~0.3-0.5 m, legs
+///   folding under it). For these morphologies a process is never
+///   terminated (`allow_terminate_when_idle` is rejected), a process
+///   quarantine always needs a human's approval (RoboDR cannot tell the
+///   balance controller from a payload process), `rollback_config` (a
+///   controller restart) is refused, and the motion envelope is never
+///   scaled below the policy's `min_motion_factor` (a near-zero joint speed
+///   cap also prevents the balance corrections the robot needs).
+///
+/// Quadrupeds keep an executable `safe_pause` / `request_safe_state` when
+/// the OEM validated a `platform_defined` behaviour (e.g. a controlled
+/// stand-down); a quadruped whose "damp" mode collapses the body should be
+/// configured as `humanoid` if no safe sequence exists. Wheeled platforms,
+/// arms and aerial vehicles keep the per-family rules unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Morphology {
     /// Biped / humanoid: balance is active; de-energising means falling.
     Humanoid,
-    /// Four-legged robot.
+    /// Four-legged robot: balance is active while standing.
     Quadruped,
     /// Wheeled or tracked ground platform (UGV, AMR).
     WheeledMobile,
@@ -133,32 +166,63 @@ pub enum Morphology {
     Arm,
     /// Multirotor / fixed-wing aerial vehicle.
     Aerial,
-    /// Unspecified (the default; keeps pre-morphology policies unchanged).
-    #[default]
+    /// Declared by the OEM: none of the above, statically stable when its
+    /// actuators stop (it neither falls nor needs a balance controller).
     Other,
+    /// Not declared (the default). Treated like a humanoid: every
+    /// fall-prone rule applies. Rejected in an OEM-validated policy and on
+    /// platform `other`.
+    #[default]
+    Unspecified,
 }
 
 impl Morphology {
-    pub const ALL: [Morphology; 6] = [
+    pub const ALL: [Morphology; 7] = [
         Morphology::Humanoid,
         Morphology::Quadruped,
         Morphology::WheeledMobile,
         Morphology::Arm,
         Morphology::Aerial,
         Morphology::Other,
+        Morphology::Unspecified,
     ];
 
     /// True when damping or de-energising the actuators makes the robot
     /// fall, so actions that may do so (`safe_pause`, `request_safe_state`)
-    /// are advisory only.
+    /// are advisory only and their substitutes need approval. Humanoid and
+    /// unspecified.
     pub fn falls_when_de_energised(self) -> bool {
-        matches!(self, Morphology::Humanoid)
+        matches!(self, Morphology::Humanoid | Morphology::Unspecified)
     }
 
-    /// `serde` helper: the default is not serialised, so plans of
-    /// pre-morphology policies keep their exact JSON.
-    pub fn is_other(&self) -> bool {
-        matches!(self, Morphology::Other)
+    /// True when the robot's posture is held by a running balance
+    /// controller (it collapses if that process stops, even while `idle`):
+    /// no process termination, process quarantine only with approval, no
+    /// `rollback_config`, a floor on motion scaling. Humanoid, quadruped
+    /// and unspecified.
+    pub fn needs_active_balance(self) -> bool {
+        matches!(
+            self,
+            Morphology::Humanoid | Morphology::Quadruped | Morphology::Unspecified
+        )
+    }
+
+    /// `serde` helper: the default is not serialised.
+    pub fn is_unspecified(&self) -> bool {
+        matches!(self, Morphology::Unspecified)
+    }
+
+    /// The JSON name (`humanoid`, ...).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Morphology::Humanoid => "humanoid",
+            Morphology::Quadruped => "quadruped",
+            Morphology::WheeledMobile => "wheeled_mobile",
+            Morphology::Arm => "arm",
+            Morphology::Aerial => "aerial",
+            Morphology::Other => "other",
+            Morphology::Unspecified => "unspecified",
+        }
     }
 }
 
@@ -245,6 +309,14 @@ impl ControlMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct OperationalContext {
     pub platform: PlatformFamily,
+    /// The robot's morphology as the component building the context knows
+    /// it (its own configuration). The planner refuses to act when it
+    /// differs from the policy's, and [`crate::check_invariants`] refuses a
+    /// plan made for another morphology, so an executor never trusts a
+    /// plan's own `morphology` field. Default (when absent from JSON):
+    /// [`Morphology::Unspecified`], the most conservative.
+    #[serde(default)]
+    pub morphology: Morphology,
     pub phase: MissionPhase,
     pub connectivity: Connectivity,
     pub control: ControlMode,

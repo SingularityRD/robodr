@@ -230,11 +230,24 @@ pub enum Reason {
     /// which target its own source, are kept.
     MotionAlreadyRequested { step: Step, since_ms: u64 },
     /// The robot's morphology falls when its actuators are de-energised
-    /// (humanoid): the `safe_pause` / `request_safe_state` part of the plan
-    /// was moved to `advisory` (never executed) and the executable plan was
-    /// capped at `limit_motion` plus network isolation and participant
-    /// quarantine.
+    /// (humanoid, unspecified): the `safe_pause` / `request_safe_state` part
+    /// of the plan was moved to `advisory` (never executed); the executable
+    /// plan was capped at `limit_motion` plus the policy's
+    /// `fall_safe_restrict` targets and awaits human approval.
     DeEnergisingAdvisoryOnly { morphology: Morphology, step: Step },
+    /// The context's morphology (the caller's own configuration) does not
+    /// match the policy's; only Record.
+    MorphologyMismatch {
+        policy: Morphology,
+        context: Morphology,
+    },
+    /// A process quarantine on a robot that needs active balance (the
+    /// process may be its balance controller; it balances while idle):
+    /// approval required, never terminated.
+    ProcessQuarantineNeedsApproval { morphology: Morphology },
+    /// The policy's `limit_motion_factor` is below its `min_motion_factor`
+    /// on a robot that needs active balance: dropped, approval required.
+    MotionFactorBelowFloor { morphology: Morphology },
     /// The source shares the overflow bucket (source table full). Its shared
     /// escalation `level` / hold `held` would have made the plan await
     /// approval; the plan a fresh source gets (`result`, auto-executable) was
@@ -303,7 +316,21 @@ impl fmt::Display for Reason {
             Reason::DeEnergisingAdvisoryOnly { morphology, step } => write!(
                 f,
                 "{morphology:?} falls when de-energised: {step:?} advisory only, contained with \
-                 limit_motion / isolate_network / quarantine_node"
+                 limit_motion and the policy's fall_safe_restrict targets: approval required"
+            ),
+            Reason::MorphologyMismatch { policy, context } => write!(
+                f,
+                "morphology mismatch (policy {policy:?}, robot {context:?}): record only"
+            ),
+            Reason::ProcessQuarantineNeedsApproval { morphology } => write!(
+                f,
+                "{morphology:?} balances while idle: a process quarantine may stop its balance \
+                 controller: approval required, never terminated"
+            ),
+            Reason::MotionFactorBelowFloor { morphology } => write!(
+                f,
+                "limit-motion factor below min_motion_factor on {morphology:?}: dropped, approval \
+                 required"
             ),
             Reason::OverflowStateNotApplied {
                 level,
@@ -359,7 +386,8 @@ impl fmt::Display for Rationale {
 /// * `advisory` actions are **never executed** by anyone acting on the
 ///   plan: they are recommendations for the operator and the platform's own
 ///   safety function (today: `safe_pause` / `request_safe_state` on a
-///   humanoid, see [`Morphology`]).
+///   humanoid, see [`Morphology`]). A plan with advisory entries always
+///   requires human approval.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResponsePlan {
     pub rule: String,
@@ -379,8 +407,11 @@ pub struct ResponsePlan {
     /// In observe mode: what enforcement mode would have done.
     pub would_have: Option<Box<ResponsePlan>>,
     pub rationale: Rationale,
-    /// The policy's morphology (omitted when `other`).
-    #[serde(default, skip_serializing_if = "Morphology::is_other")]
+    /// The policy's morphology (omitted when `unspecified`; a plan record
+    /// without it reads as `unspecified`, the most conservative). An
+    /// executor never trusts it alone: [`crate::check_invariants`] compares
+    /// it with the context's.
+    #[serde(default, skip_serializing_if = "Morphology::is_unspecified")]
     pub morphology: Morphology,
     /// Recommended-only actions: never executed (omitted when empty).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -120,6 +120,13 @@ impl AgentConfig {
                 self.context.platform, self.policy.platform
             )));
         }
+        if self.context.morphology != self.policy.morphology {
+            return Err(AgentError::Config(format!(
+                "context morphology {} does not match policy morphology {}",
+                self.context.morphology.as_str(),
+                self.policy.morphology.as_str()
+            )));
+        }
         if self.kafka_partitions == Some(0) {
             return Err(AgentError::Config(
                 "kafka_partitions must be >= 1 (or unset)".into(),

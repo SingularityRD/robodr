@@ -109,9 +109,16 @@ Paths under `/api/v1`. `{robot_id}` must be this robot (else 404
 {"robot_id": "ugv-007", "online": true, "api": "robodr-control-plane/v1",
  "safety_state": {"state": "moving_slow", "source": "safety_feed", "safety_system_engaged": false},
  "mode": "enforce", "health": "ok", "executor": "recording", "executes_actions": false,
+ "morphology": "wheeled_mobile",
  "actions": ["restrict_motion", "quarantine_node", "isolate_network", "record_evidence",
              "safe_pause", "request_safe_state", "rollback_config"]}
 ```
+
+`morphology` is the response policy's (`unspecified` when it declares
+none). `actions` lists only what this robot may be asked for: an action
+refused for its morphology (`fall_hazard`, §4.1) is not advertised — a
+humanoid lists neither `safe_pause`, `request_safe_state` nor
+`rollback_config`; a quadruped not `rollback_config`.
 
 `safety_state.state` is the state requests are judged by right now (live feed
 or configuration, `source`). `mode` is `observe` when the profile is not
@@ -145,10 +152,10 @@ their wire names (`robot_<name>`); it sends the plain name here.
 | `restrict_motion` | `robot_restrict_motion` | at least one of `max_linear_speed`, `max_joint_speed` (in (0, 10]; 0 is a stop: use `safe_pause`), `workspace_zone` (`[A-Za-z0-9._-]{1,64}`) | required, 1..=86400 | yes | `limit_motion` | single | executed |
 | `quarantine_node` | `robot_quarantine_node` | exactly one of `participant_guid` (24 or 32 lower-case hex), `node` (plain ROS 2 name) | not allowed | yes | `restrict` (participant) | single | executed |
 | `isolate_network` | `robot_isolate_network` | none | required, 1..=86400 | yes | `restrict` (network) | single | executed |
-| `record_evidence` | `robot_record_evidence` | none | not allowed | yes (no lasting effect) | `record` | single | executed |
+| `record_evidence` | `robot_record_evidence` | none | not allowed | not applicable: evidence is never reverted (a revert answers `not_reversible`) | `record` | single | executed; accepted in every safety state and in observe mode |
 | `safe_pause` | `robot_safe_pause` | none | not allowed | yes | `safe_pause` | two-person | platform adapter only (OEM-validated policy); never on a humanoid |
 | `request_safe_state` | `robot_request_safe_state` | none | not allowed | no (an operator restarts) | `request_safe_state` | two-person | plan only; never on a humanoid |
-| `rollback_config` | `robot_rollback_config` | `config` (`profile` default, or `program`), `to_version` (`[A-Za-z0-9._-]{1,64}`) | not allowed | no | `restrict` (needs `idle`) | two-person | plan only |
+| `rollback_config` | `robot_rollback_config` | `config` (`profile` default, or `program`), `to_version` (`[A-Za-z0-9._-]{1,64}`) | not allowed | no | `restrict` (needs `idle`) | two-person | plan only; never on a humanoid or quadruped (a controller restart) |
 
 No action is ever autonomous: the SOC sends one only after the approval
 above. The "GA" column is the catalog's plan for the first executing
@@ -168,19 +175,30 @@ Body errors are answered with an HTTP error (§7) and recorded
 
 ### 4.1 Judgment (Cyber-Jidoka)
 
-In order; the first rule that applies refuses (`refusal.code`):
+`record_evidence` is judged first and always accepted: it is evidence
+capture only and sends nothing to the platform, so it is allowed in observe
+mode and while the safety system is engaged. Every other action: in order,
+the first rule that applies refuses (`refusal.code`):
 
 | Code | When |
 | --- | --- |
 | `safety_system_engaged` | the safety state is `estop_active` or `safe_state_active` (every action, including `request_safe_state`): the safety system has authority and gets no competing request |
 | `observe_mode` | the profile is not locked and enforced, or the response policy is not OEM-validated |
+| `morphology_mismatch` | the robot context's `morphology` differs from the response policy's |
 | `human_in_command` | a motion-affecting step (`limit_motion` and up) while `context.control` is `teleop` or `manual` |
 | `transient_phase` | a motion-affecting step during take-off / landing |
+| `fall_hazard` | `safe_pause` or `request_safe_state` while the response policy's `morphology` is `humanoid` (or unspecified): those may damp or de-energise the joints and a humanoid would fall (advisory only); `rollback_config` while it is `humanoid` or `quadruped` (or unspecified): a controller restart collapses a robot that balances actively — also when `idle`, since a legged robot balances while idle; a `restrict_motion` cap that scales the profile envelope below the policy's `min_motion_factor` (default 0.2), or a cap with no profile envelope to judge it against, on a humanoid or quadruped (a near-stop envelope also stops the balance corrections) |
 | `requires_idle` | `rollback_config` while the safety state is not `idle` |
-| `fall_hazard` | `safe_pause` or `request_safe_state` while the response policy's `morphology` is `humanoid`: those may damp or de-energise the joints and a humanoid would fall (advisory only; use `restrict_motion`, `isolate_network`, `quarantine_node`) |
 | `above_policy` | the action's ladder step is above the highest step the policy's matrix allows in the current state for any severity |
 | `not_a_restriction` | a `restrict_motion` cap above the profile's smallest envelope for that quantity |
 | `invariant_violation` | the plan the request stands for fails `robodr_responder::check_invariants` (as a human-approved plan) |
+
+`isolate_network` and `quarantine_node` are accepted on a humanoid, but a
+SOC should send them only when the robot's balance loop is not networked:
+where the low-level loop is a DDS writer (Unitree `rt/lowcmd`), cutting that
+writer trips the motor watchdog and the robot falls (the on-robot planner
+only plans them for a humanoid when the OEM listed them as balance-safe in
+the policy's `fall_safe_restrict`).
 
 An `unknown` safety state does not refuse by itself: the planner needs a
 human's approval there, and the SOC's (approved) request stands for it; the

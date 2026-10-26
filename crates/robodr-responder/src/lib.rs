@@ -31,10 +31,16 @@
 //!   attached.
 //! * Safe behaviours must be valid for the platform family.
 //! * On a [`Morphology`] that falls when its actuators are damped or
-//!   de-energised (a humanoid), `SafePause` / `RequestSafeState` are never
-//!   executable: they appear only in the plan's `advisory` list, and the
-//!   executable plan stops at `LimitMotion` plus network isolation and
-//!   participant quarantine.
+//!   de-energised (a humanoid, or a morphology left unspecified),
+//!   `SafePause` / `RequestSafeState` are never executable: they appear only
+//!   in the plan's `advisory` list, and the substitute containment
+//!   (`LimitMotion` plus the policy's `fall_safe_restrict` targets) always
+//!   needs human approval.
+//! * On a morphology that needs active balance (humanoid, quadruped,
+//!   unspecified) no process is terminated, a process quarantine needs
+//!   approval and `LimitMotion` never goes below `min_motion_factor`.
+//! * A plan made for another morphology than the checker's own
+//!   (`OperationalContext::morphology`) never acts.
 //!
 //! The policy is validated at load ([`ResponsePolicy::validate`]) and the
 //! plan is re-checked at the end of planning

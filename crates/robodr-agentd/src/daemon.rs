@@ -578,6 +578,7 @@ impl<'a> Daemon<'a> {
         let validated = !matches!(pipeline.status(), ProfileStatus::Refused(_));
         let context = OperationalContext {
             platform: r.policy.platform,
+            morphology: r.policy.morphology,
             phase: cfg.context.phase,
             connectivity: cfg.context.connectivity,
             control: cfg.context.control,
@@ -2118,6 +2119,7 @@ impl cp_api::Host for Daemon<'_> {
         let c = &self.r.config.context;
         OperationalContext {
             platform: self.r.policy.platform,
+            morphology: self.r.policy.morphology,
             phase: c.phase,
             connectivity: c.connectivity,
             control: c.control,

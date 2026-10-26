@@ -9,6 +9,7 @@ use robodr_responder::*;
 fn ctx() -> OperationalContext {
     OperationalContext {
         platform: PlatformFamily::Ugv,
+        morphology: Morphology::WheeledMobile,
         phase: MissionPhase::Transit,
         connectivity: Connectivity::Connected,
         control: ControlMode::Autonomous,
@@ -20,6 +21,7 @@ fn ctx() -> OperationalContext {
 fn pol() -> ResponsePolicy {
     let mut p = ResponsePolicy::conservative_default(PlatformFamily::Ugv);
     p.oem_validated = true;
+    p.morphology = Morphology::WheeledMobile;
     p
 }
 

@@ -1550,6 +1550,7 @@ mod tests {
     fn ctx(locked: bool) -> OperationalContext {
         OperationalContext {
             platform: PlatformFamily::Ugv,
+            morphology: robodr_responder::Morphology::WheeledMobile,
             phase: MissionPhase::Transit,
             connectivity: Connectivity::Connected,
             control: ControlMode::Autonomous,
@@ -1562,6 +1563,7 @@ mod tests {
     fn guard_passes_valid_plans_unchanged() {
         let mut pol = ResponsePolicy::conservative_default(PlatformFamily::Ugv);
         pol.oem_validated = true;
+        pol.morphology = robodr_responder::Morphology::WheeledMobile;
         let dev = Deviation::new("robot.x", Severity::Critical, "d");
         let p = plan_stateless(&pol, &dev, "s", SafetyState::MovingFast, &ctx(true));
         let (q, v) = guard(p.clone(), &dev, SafetyState::MovingFast, &ctx(true));
@@ -1604,6 +1606,7 @@ mod tests {
         // (what would happen if the agent forgot to downgrade the context).
         let mut pol = ResponsePolicy::conservative_default(PlatformFamily::Ugv);
         pol.oem_validated = true;
+        pol.morphology = robodr_responder::Morphology::WheeledMobile;
         let dev = Deviation::new("robot.x", Severity::High, "d").with_mode(Mode::Observe);
         // The responder itself now refuses to act on an observe-mode
         // deviation, so build the acting plan from its enforce-mode twin.

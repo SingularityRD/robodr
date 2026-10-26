@@ -8,6 +8,12 @@
 //! platform, a motion factor outside `(0, 1]`, unbounded tables). The planner
 //! *also* enforces every invariant at plan time, so a policy that slipped past
 //! validation still cannot cause an unsafe plan.
+//!
+//! The policy must declare the robot's [`Morphology`] when it is
+//! OEM-validated or for platform `other`; for a robot that needs active
+//! balance (humanoid, quadruped) it may not allow process termination and
+//! may not scale motion below `min_motion_factor`, and only a humanoid may
+//! list `fall_safe_restrict` targets (see [`Morphology`]).
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -31,6 +37,15 @@ pub const MAX_ESCALATION_THRESHOLD: u32 = 64;
 pub const MAX_ESCALATION_STEPS: u8 = 2;
 /// One day: upper bound for any time window, to reject nonsense values.
 pub const MAX_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
+/// Default `min_motion_factor`: on a robot that needs active balance the
+/// motion envelope is never scaled below 20 % of the profile's (a
+/// near-stop joint speed cap would also stop the balance corrections).
+pub const DEFAULT_MIN_MOTION_FACTOR: f64 = 0.2;
+/// Hard floor for `min_motion_factor` (and the invariant
+/// [`crate::check_invariants`] enforces on every `LimitMotion` of a plan for
+/// a robot that needs active balance): an OEM may lower the 20 % default
+/// for its platform, never below 5 %.
+pub const MIN_MOTION_FACTOR_FLOOR: f64 = 0.05;
 
 /// Max ladder step for each severity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +128,10 @@ pub struct RuleOverride {
     pub restrict: Option<Vec<RestrictTarget>>,
 }
 
+fn default_min_motion_factor() -> f64 {
+    DEFAULT_MIN_MOTION_FACTOR
+}
+
 fn step_record() -> Step {
     Step::Record
 }
@@ -149,10 +168,10 @@ pub struct ResponsePolicy {
     /// Robot model this policy is for (matches the model profile).
     pub model: String,
     pub platform: PlatformFamily,
-    /// Body plan of the model (default `other`). `humanoid` makes
-    /// `safe_pause` / `request_safe_state` advisory only (see
-    /// [`Morphology`]).
-    #[serde(default)]
+    /// Body plan of the model. Required when `oem_validated` is true or
+    /// `platform` is `other`; when absent otherwise it reads as
+    /// `unspecified`, treated like a humanoid (see [`Morphology`]).
+    #[serde(default, skip_serializing_if = "Morphology::is_unspecified")]
     pub morphology: Morphology,
     /// Set only after OEM sign-off. While false, every plan is observe-only.
     pub oem_validated: bool,
@@ -170,9 +189,27 @@ pub struct ResponsePolicy {
     /// Restrict targets used when no rule override names any.
     pub default_restrict: Vec<RestrictTarget>,
     /// Allow a `Process` restriction to terminate the process, only ever
-    /// while the robot is `Idle`. Default false (quarantine only).
+    /// while the robot is `Idle`. Default false (quarantine only). Rejected
+    /// for a morphology that needs active balance (it balances while
+    /// "idle"; see [`Morphology::needs_active_balance`]).
     #[serde(default)]
     pub allow_terminate_when_idle: bool,
+    /// Restrict targets the OEM validated as balance-safe on a robot that
+    /// falls when de-energised (humanoid): the planner adds them to the
+    /// substitute containment it plans instead of a safe pause / safe state
+    /// (always awaiting approval). Default empty: the substitute is only
+    /// `LimitMotion`. List `network` / `participant` only when the balance
+    /// loop is not networked (e.g. not a DDS `rt/lowcmd` writer whose
+    /// silence trips the motor watchdog). `process` is never accepted.
+    /// Must be empty for any other morphology.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fall_safe_restrict: Vec<RestrictTarget>,
+    /// Lowest `LimitMotion` factor (and control-plane `restrict_motion`
+    /// cap, as a fraction of the profile envelope) on a robot that needs
+    /// active balance. Default [`DEFAULT_MIN_MOTION_FACTOR`]; must be in
+    /// `[MIN_MOTION_FACTOR_FLOOR, 1]`.
+    #[serde(default = "default_min_motion_factor")]
+    pub min_motion_factor: f64,
     pub escalation: EscalationPolicy,
 }
 
@@ -204,6 +241,26 @@ pub enum PolicyError {
         max: Step,
     },
     Escalation(&'static str),
+    /// `morphology` is missing (or `unspecified`) in a policy that is
+    /// OEM-validated or for platform `other`.
+    MorphologyRequired {
+        platform: PlatformFamily,
+        oem_validated: bool,
+    },
+    /// `allow_terminate_when_idle` on a morphology that balances while idle.
+    TerminateOnBalancingRobot(Morphology),
+    /// `min_motion_factor` outside `[MIN_MOTION_FACTOR_FLOOR, 1]`.
+    MinMotionFactor(String),
+    /// `limit_motion_factor` below `min_motion_factor` on a morphology that
+    /// needs active balance.
+    MotionFactorBelowFloor {
+        morphology: Morphology,
+        factor: String,
+        min: String,
+    },
+    /// `fall_safe_restrict` is malformed or used on a morphology it does
+    /// not apply to.
+    FallSafeRestrict(&'static str),
 }
 
 impl fmt::Display for PolicyError {
@@ -235,6 +292,36 @@ impl fmt::Display for PolicyError {
                 write!(f, "override {rule}: min_step {min:?} > max_step {max:?}")
             }
             PolicyError::Escalation(e) => write!(f, "escalation: {e}"),
+            PolicyError::MorphologyRequired {
+                platform,
+                oem_validated,
+            } => write!(
+                f,
+                "morphology is required (platform {platform:?}, oem_validated {oem_validated}): \
+                 declare humanoid, quadruped, wheeled_mobile, arm, aerial or other; RoboDR never \
+                 assumes a robot stands on its own"
+            ),
+            PolicyError::TerminateOnBalancingRobot(m) => write!(
+                f,
+                "allow_terminate_when_idle is refused for morphology {}: the robot balances \
+                 while idle, and terminating its controller makes it fall",
+                m.as_str()
+            ),
+            PolicyError::MinMotionFactor(v) => write!(
+                f,
+                "min_motion_factor {v} must be finite and in [{MIN_MOTION_FACTOR_FLOOR}, 1]"
+            ),
+            PolicyError::MotionFactorBelowFloor {
+                morphology,
+                factor,
+                min,
+            } => write!(
+                f,
+                "limit_motion_factor {factor} is below min_motion_factor {min} for morphology {}: \
+                 a near-stop envelope is a fall hazard on a balancing robot",
+                morphology.as_str()
+            ),
+            PolicyError::FallSafeRestrict(e) => write!(f, "fall_safe_restrict: {e}"),
         }
     }
 }
@@ -272,7 +359,10 @@ impl ResponsePolicy {
             schema: SCHEMA.to_string(),
             model: "default".to_string(),
             platform,
-            morphology: Morphology::Other,
+            // RoboDR cannot know the body plan from the family: undeclared,
+            // treated like a humanoid until the OEM declares it (required
+            // before `oem_validated` may be set).
+            morphology: Morphology::Unspecified,
             oem_validated: false,
             matrix: Matrix {
                 idle: row(Record, Restrict, Restrict, SafePause),
@@ -290,6 +380,8 @@ impl ResponsePolicy {
             safe_state,
             default_restrict: vec![RestrictTarget::Participant],
             allow_terminate_when_idle: false,
+            fall_safe_restrict: Vec::new(),
+            min_motion_factor: DEFAULT_MIN_MOTION_FACTOR,
             escalation: EscalationPolicy {
                 window_ms: 60_000,
                 threshold: 3,
@@ -332,6 +424,14 @@ impl ResponsePolicy {
         {
             return Err(PolicyError::Model(self.model.clone()));
         }
+        if self.morphology.is_unspecified()
+            && (self.oem_validated || self.platform == PlatformFamily::Other)
+        {
+            return Err(PolicyError::MorphologyRequired {
+                platform: self.platform,
+                oem_validated: self.oem_validated,
+            });
+        }
         for state in [SafetyState::EStopActive, SafetyState::SafeStateActive] {
             for step in self.matrix.row(state).cells() {
                 if step != Step::Record {
@@ -354,6 +454,35 @@ impl ResponsePolicy {
         let f = self.limit_motion_factor;
         if !(f.is_finite() && f > 0.0 && f <= 1.0) {
             return Err(PolicyError::LimitMotionFactor(f.to_string()));
+        }
+        let m = self.min_motion_factor;
+        if !(m.is_finite() && (MIN_MOTION_FACTOR_FLOOR..=1.0).contains(&m)) {
+            return Err(PolicyError::MinMotionFactor(m.to_string()));
+        }
+        if self.morphology.needs_active_balance() {
+            if f < m {
+                return Err(PolicyError::MotionFactorBelowFloor {
+                    morphology: self.morphology,
+                    factor: f.to_string(),
+                    min: m.to_string(),
+                });
+            }
+            if self.allow_terminate_when_idle {
+                return Err(PolicyError::TerminateOnBalancingRobot(self.morphology));
+            }
+        }
+        if !self.fall_safe_restrict.is_empty() {
+            if !self.morphology.falls_when_de_energised() {
+                return Err(PolicyError::FallSafeRestrict(
+                    "only applies to a morphology that falls when de-energised (humanoid)",
+                ));
+            }
+            if self.fall_safe_restrict.contains(&RestrictTarget::Process) {
+                return Err(PolicyError::FallSafeRestrict(
+                    "process is never balance-safe (it may be the balance controller)",
+                ));
+            }
+            validate_targets(&self.fall_safe_restrict)?;
         }
         validate_targets(&self.default_restrict)?;
         if self.rule_overrides.len() > MAX_RULE_OVERRIDES {

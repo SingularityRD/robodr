@@ -1,0 +1,44 @@
+{
+  "schema": "robodr.response-policy/v1",
+  "model": "unitree-go2-edu",
+  "platform": "other",
+  "morphology": "quadruped",
+  "oem_validated": false,
+  "matrix": {
+    "idle":                       { "low": "record", "medium": "restrict",     "high": "restrict",     "critical": "safe_pause" },
+    "moving_slow":                { "low": "record", "medium": "record",       "high": "limit_motion", "critical": "request_safe_state" },
+    "moving_fast":                { "low": "record", "medium": "record",       "high": "limit_motion", "critical": "request_safe_state" },
+    "collaborative_human_nearby": { "low": "record", "medium": "limit_motion", "high": "safe_pause",   "critical": "request_safe_state" },
+    "estop_active":               { "low": "record", "medium": "record",       "high": "record",       "critical": "record" },
+    "safe_state_active":          { "low": "record", "medium": "record",       "high": "record",       "critical": "record" },
+    "unknown":                    { "low": "record", "medium": "record",       "high": "restrict",     "critical": "request_safe_state" }
+  },
+  "rule_overrides": [
+    {
+      "rule": "robot.ros2.unknown_participant",
+      "min_step": "restrict",
+      "max_step": "limit_motion",
+      "restrict": ["participant"]
+    },
+    {
+      "rule": "robot.host.unexpected_egress",
+      "max_step": "restrict",
+      "restrict": ["network"]
+    }
+  ],
+  "auto_max_step": "limit_motion",
+  "limit_motion_factor": 0.5,
+  "min_motion_factor": 0.2,
+  "safe_pause": "platform_defined",
+  "safe_state": "platform_defined",
+  "default_restrict": ["participant"],
+  "allow_terminate_when_idle": false,
+  "escalation": {
+    "window_ms": 60000,
+    "threshold": 3,
+    "max_escalation_steps": 1,
+    "ceiling": "limit_motion",
+    "quiet_period_ms": 300000,
+    "min_reissue_interval_ms": 5000
+  }
+}

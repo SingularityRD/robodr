@@ -161,9 +161,20 @@ fn partition_by_robot_id_not_by_key() {
     let rec = record(&f, Some(12)).unwrap();
     assert_eq!(rec.topic, "robodr.findings");
     assert!(rec.headers.contains(&("data-source", "robodr".into())));
-    assert!(rec
-        .headers
-        .contains(&("robodr-contract-version", "2.0.0".into())));
+    assert!(rec.headers.contains(&(
+        "robodr-contract-version",
+        robodr_ocsf::CONTRACT_VERSION.into()
+    )));
+    // L4: the header is the value's own version, not the producer's.
+    let mut older = f.clone();
+    older.contract_version = "2.0.0".into();
+    assert!(
+        robodr_ocsf::kafka::headers(&older).contains(&("robodr-contract-version", "2.0.0".into()))
+    );
+    older.contract_version = "2.7.1".into();
+    assert!(
+        robodr_ocsf::kafka::headers(&older).contains(&("robodr-contract-version", "2.7.1".into()))
+    );
     assert_eq!(rec.key, f.finding_id);
     assert_eq!(rec.partition, partition_for("ugv-007", 12));
     assert_eq!(rec.headers[0], ("content-type", "application/json".into()));

@@ -15,6 +15,7 @@ use std::collections::{HashMap, VecDeque};
 
 use robodr_events::profile::Profile;
 use robodr_events::Severity;
+use robodr_responder::policy::MIN_MOTION_FACTOR_FLOOR;
 use robodr_responder::{
     check_invariants, OperationalContext, Rationale, ResponseAction, ResponsePlan, ResponsePolicy,
     RestrictTarget, SafetyState, Step,
@@ -548,21 +549,32 @@ fn state_name(s: SafetyState) -> String {
 /// Judge one request against the robot's current safety state, its
 /// operational context and the response policy (Cyber-Jidoka), in order:
 ///
+/// 0. `record_evidence` is evidence capture only (a Record-only plan, it
+///    sends nothing to the platform): accepted in every state, including
+///    observe mode and while the safety system is engaged;
 /// 1. the safety system is engaged (e-stop / safe state): refused, the
 ///    safety system has authority and gets no competing request;
 /// 2. observe mode (profile not locked or policy not OEM-validated):
-///    refused, RoboDR only records;
+///    refused, RoboDR only records; a context whose morphology differs from
+///    the policy's: refused (`morphology_mismatch`);
 /// 3. a motion-affecting step (`limit_motion` and up) while a human holds
 ///    command (teleop / manual) or in take-off / landing: refused, the
 ///    person in command decides;
-/// 4. `rollback_config` while the robot is not `idle`: refused (no program
-///    or profile change in motion); an action that may de-energise the
-///    actuators (`safe_pause`, `request_safe_state`) on a humanoid
-///    morphology: refused (`fall_hazard`, it would fall);
+/// 4. an action refused for the robot's morphology
+///    ([`ActionKind::refused_for`]): `safe_pause` / `request_safe_state` on
+///    a robot that falls when de-energised (humanoid) and `rollback_config`
+///    (a controller restart) on any robot that needs active balance
+///    (humanoid, quadruped) — refused (`fall_hazard`) whatever the safety
+///    state, `idle` included (a legged robot balances while idle);
+///    `rollback_config` while the robot is not `idle`: refused (no program
+///    or profile change in motion);
 /// 5. a step above what the policy's matrix allows in this state for any
 ///    severity: refused;
 /// 6. a `restrict_motion` cap above the profile's envelope: refused (it
-///    would not restrict);
+///    would not restrict); on a robot that needs active balance, a cap
+///    below the policy's `min_motion_factor` of the envelope, or a cap with
+///    no envelope to judge it against: refused (`fall_hazard`, a near-stop
+///    envelope also stops the balance corrections);
 /// 7. the plan it stands for must pass `robodr_responder::check_invariants`
 ///    (as a human-approved plan: the SOC's approval).
 ///
@@ -578,6 +590,18 @@ pub fn judge(req: &ActionRequest, key_id: &str, s: &Situation<'_>) -> Decision {
     };
     let step = req.action.step();
     let name = state_name(s.state);
+    let morphology = s.policy.morphology;
+    if req.action == ActionKind::RecordEvidence {
+        return Decision::Accept(Accepted {
+            step: Step::Record,
+            actions: vec![ResponseAction::Record],
+            notes: vec![
+                "evidence capture only: nothing is sent to the platform (accepted in every \
+                 safety state and in observe mode)"
+                    .into(),
+            ],
+        });
+    }
     if s.state.safety_system_engaged() {
         return refuse(
             "safety_system_engaged",
@@ -602,6 +626,17 @@ pub fn judge(req: &ActionRequest, key_id: &str, s: &Situation<'_>) -> Decision {
                 .into(),
         );
     }
+    if s.context.morphology != morphology {
+        return refuse(
+            "morphology_mismatch",
+            format!(
+                "the robot's context says {} but the response policy says {}: RoboDR does not \
+                 act on a plan made for another body",
+                s.context.morphology.as_str(),
+                morphology.as_str()
+            ),
+        );
+    }
     if step.is_motion_affecting() {
         if s.context.control.human_in_command() {
             return refuse(
@@ -618,21 +653,27 @@ pub fn judge(req: &ActionRequest, key_id: &str, s: &Situation<'_>) -> Decision {
             );
         }
     }
+    if req.action.refused_for(morphology) {
+        let why = if req.action == ActionKind::RollbackConfig {
+            "restarts the controller whose configuration it rolls back"
+        } else {
+            "may damp or de-energise the actuators"
+        };
+        return refuse(
+            "fall_hazard",
+            format!(
+                "{} {why}, and this robot is configured as {} (it balances actively, also while \
+                 idle): it would fall. Never executed here; ask the operator / the platform's \
+                 own safety function, or use restrict_motion within min_motion_factor",
+                req.action.as_str(),
+                morphology.as_str()
+            ),
+        );
+    }
     if req.action == ActionKind::RollbackConfig && s.state != SafetyState::Idle {
         return refuse(
             "requires_idle",
             format!("a configuration or program rollback needs an idle robot (now {name})"),
-        );
-    }
-    if req.action.may_de_energise() && s.policy.morphology.falls_when_de_energised() {
-        return refuse(
-            "fall_hazard",
-            format!(
-                "{} may damp or de-energise the actuators, and this robot is configured as a \
-                 humanoid: it would fall. Advisory only, never executed; use restrict_motion, \
-                 isolate_network or quarantine_node",
-                req.action.as_str()
-            ),
         );
     }
     let ceiling = policy_ceiling(s.policy, s.state);
@@ -669,6 +710,17 @@ pub fn judge(req: &ActionRequest, key_id: &str, s: &Situation<'_>) -> Decision {
                         )
                     }
                     Some(cap) => factor = factor.min(want / cap),
+                    None if morphology.needs_active_balance() => {
+                        return refuse(
+                            "fall_hazard",
+                            format!(
+                                "{what}: the profile has no envelope to judge the cap against, \
+                                 and this robot ({}) balances actively: a cap that may be a \
+                                 near-stop is not accepted",
+                                morphology.as_str()
+                            ),
+                        )
+                    }
                     None => notes.push(format!(
                         "{what}: the profile has no envelope to compare with; the cap is \
                          recorded as given"
@@ -679,6 +731,18 @@ pub fn judge(req: &ActionRequest, key_id: &str, s: &Situation<'_>) -> Decision {
                 return refuse(
                     "invalid_parameter",
                     "the requested caps do not give a valid envelope scale".into(),
+                );
+            }
+            let floor = s.policy.min_motion_factor.max(MIN_MOTION_FACTOR_FLOOR);
+            if morphology.needs_active_balance() && factor < floor {
+                return refuse(
+                    "fall_hazard",
+                    format!(
+                        "the requested caps scale the envelope to {factor} of the profile's, below \
+                         this {} robot's min_motion_factor {floor}: a near-stop envelope also \
+                         stops the balance corrections it needs",
+                        morphology.as_str()
+                    ),
                 );
             }
             if let Some(z) = &p.workspace_zone {
@@ -704,7 +768,8 @@ pub fn judge(req: &ActionRequest, key_id: &str, s: &Situation<'_>) -> Decision {
             behaviour: s.policy.safe_state,
         }),
         // No ladder action beyond Record: evidence capture is the Record
-        // step itself; the rollback is recorded with the request.
+        // step itself (handled above); the rollback is recorded with the
+        // request.
         ActionKind::RecordEvidence | ActionKind::RollbackConfig => {}
     }
     if s.state == SafetyState::Unknown && step.is_motion_affecting() {
@@ -1021,7 +1086,14 @@ impl Engine {
             "health": host.health(),
             "executor": self.executor.name(),
             "executes_actions": self.executor.executes(),
-            "actions": ActionKind::ALL.map(ActionKind::as_str),
+            "morphology": host.policy().morphology.as_str(),
+            // Only what this robot may be asked for: an action refused for
+            // its morphology (`fall_hazard`) is not advertised.
+            "actions": ActionKind::ALL
+                .into_iter()
+                .filter(|a| !a.refused_for(host.policy().morphology))
+                .map(ActionKind::as_str)
+                .collect::<Vec<_>>(),
         }))
     }
 
@@ -1161,14 +1233,19 @@ impl Engine {
         };
         self.stats.reverts += 1;
         let (result, refusal): (&'static str, Option<Refusal>) = if !s.request.action.reversible() {
+            let reason = if s.request.action == ActionKind::RecordEvidence {
+                "record_evidence is evidence capture: evidence is never reverted".to_string()
+            } else {
+                format!(
+                    "{} is not reversible by request: an operator restores the robot",
+                    s.request.action.as_str()
+                )
+            };
             (
                 "refused",
                 Some(Refusal {
                     code: "not_reversible",
-                    reason: format!(
-                        "{} is not reversible by request: an operator restores the robot",
-                        s.request.action.as_str()
-                    ),
+                    reason,
                     safety_state: s.safety_state,
                 }),
             )
@@ -1311,11 +1388,12 @@ pub fn answer_of(s: &Stored, robot_id: &str, duplicate: bool, now_ms: u64) -> Va
 #[cfg(test)]
 mod tests {
     use super::*;
-    use robodr_responder::{Connectivity, ControlMode, MissionPhase, PlatformFamily};
+    use robodr_responder::{Connectivity, ControlMode, MissionPhase, Morphology, PlatformFamily};
 
     fn ctx() -> OperationalContext {
         OperationalContext {
             platform: PlatformFamily::Ugv,
+            morphology: Morphology::WheeledMobile,
             phase: MissionPhase::Transit,
             connectivity: Connectivity::Connected,
             control: ControlMode::Autonomous,
@@ -1327,7 +1405,21 @@ mod tests {
     fn policy() -> ResponsePolicy {
         let mut p = ResponsePolicy::conservative_default(PlatformFamily::Ugv);
         p.oem_validated = true;
+        p.morphology = Morphology::WheeledMobile;
         p
+    }
+
+    /// A policy and matching context for morphology `m`.
+    fn body_plan(m: Morphology) -> (OperationalContext, ResponsePolicy) {
+        let mut p = policy();
+        p.morphology = m;
+        (
+            OperationalContext {
+                morphology: m,
+                ..ctx()
+            },
+            p,
+        )
     }
 
     fn body(action: &str, params: Value, ttl: Option<u64>) -> Vec<u8> {
@@ -1585,6 +1677,25 @@ mod tests {
         c: &OperationalContext,
         p: &ResponsePolicy,
     ) -> Decision {
+        judged_caps(
+            r,
+            state,
+            c,
+            p,
+            EnvelopeCaps {
+                linear: Some(1.0),
+                joint: None,
+            },
+        )
+    }
+
+    fn judged_caps(
+        r: &ActionRequest,
+        state: SafetyState,
+        c: &OperationalContext,
+        p: &ResponsePolicy,
+        caps: EnvelopeCaps,
+    ) -> Decision {
         judge(
             r,
             "soc-1",
@@ -1592,10 +1703,7 @@ mod tests {
                 state,
                 context: c,
                 policy: p,
-                caps: EnvelopeCaps {
-                    linear: Some(1.0),
-                    joint: None,
-                },
+                caps,
             },
         )
     }
@@ -1674,9 +1782,7 @@ mod tests {
 
     #[test]
     fn humanoid_refuses_de_energising_actions() {
-        let mut p = policy();
-        p.morphology = robodr_responder::Morphology::Humanoid;
-        let c = ctx();
+        let (c, p) = body_plan(Morphology::Humanoid);
         for a in ActionKind::ALL {
             let r = valid_req(a);
             let d = judged(&r, SafetyState::MovingSlow, &c, &p);
@@ -1689,12 +1795,12 @@ mod tests {
                 );
             }
         }
-        // Every other morphology is judged as before.
-        for m in robodr_responder::Morphology::ALL {
+        // Every other morphology keeps its safe pause.
+        for m in Morphology::ALL {
             if m.falls_when_de_energised() {
                 continue;
             }
-            p.morphology = m;
+            let (c, p) = body_plan(m);
             let r = req("safe_pause", json!({}), None);
             assert!(
                 matches!(
@@ -1707,9 +1813,126 @@ mod tests {
     }
 
     #[test]
-    fn engaged_safety_system_refuses_everything() {
+    fn balancing_robots_refuse_rollback_even_when_idle() {
+        // M3 / H2: a rollback restarts the controller; a legged robot
+        // reports idle while it balances.
+        let rb = req("rollback_config", json!({}), None);
+        for m in [Morphology::Humanoid, Morphology::Quadruped] {
+            let (c, p) = body_plan(m);
+            let d = judged(&rb, SafetyState::Idle, &c, &p);
+            assert_eq!(refusal(d), "fall_hazard", "{m:?}");
+        }
+        let (c, p) = body_plan(Morphology::WheeledMobile);
+        assert!(matches!(
+            judged(&rb, SafetyState::Idle, &c, &p),
+            Decision::Accept(_)
+        ));
+    }
+
+    #[test]
+    fn balancing_robots_refuse_near_stop_motion_caps() {
+        // M2: a near-zero joint speed cap makes a balancing robot fall.
+        let caps = EnvelopeCaps {
+            linear: Some(1.0),
+            joint: Some(2.0),
+        };
+        let tiny = req(
+            "restrict_motion",
+            json!({"max_joint_speed": 1e-9}),
+            Some(60),
+        );
+        let ok = req("restrict_motion", json!({"max_joint_speed": 1.0}), Some(60));
+        for m in [Morphology::Humanoid, Morphology::Quadruped] {
+            let (c, p) = body_plan(m);
+            let d = judged_caps(&tiny, SafetyState::MovingSlow, &c, &p, caps);
+            assert_eq!(refusal(d), "fall_hazard", "{m:?}");
+            // 0.39 of the envelope: below the 0.4 the OEM configured.
+            let mut q = p.clone();
+            q.min_motion_factor = 0.4;
+            q.limit_motion_factor = 0.5;
+            let low = req(
+                "restrict_motion",
+                json!({"max_joint_speed": 0.78}),
+                Some(60),
+            );
+            assert_eq!(
+                refusal(judged_caps(&low, SafetyState::MovingSlow, &c, &q, caps)),
+                "fall_hazard"
+            );
+            match judged_caps(&ok, SafetyState::MovingSlow, &c, &p, caps) {
+                Decision::Accept(a) => assert_eq!(
+                    a.actions,
+                    vec![
+                        ResponseAction::Record,
+                        ResponseAction::LimitMotion { factor: 0.5 }
+                    ]
+                ),
+                d => panic!("{m:?}: {d:?}"),
+            }
+            // No envelope to judge a joint cap against: refused, not
+            // recorded as given.
+            let none = EnvelopeCaps {
+                linear: Some(1.0),
+                joint: None,
+            };
+            assert_eq!(
+                refusal(judged_caps(&ok, SafetyState::MovingSlow, &c, &p, none)),
+                "fall_hazard"
+            );
+        }
+        // A wheeled robot may be slowed to a crawl.
+        let (c, p) = body_plan(Morphology::WheeledMobile);
+        assert!(matches!(
+            judged_caps(&tiny, SafetyState::MovingSlow, &c, &p, caps),
+            Decision::Accept(_)
+        ));
+    }
+
+    #[test]
+    fn record_evidence_is_accepted_in_observe_mode_and_while_engaged() {
+        // L3: evidence capture sends nothing to the platform.
+        let r = req("record_evidence", json!({}), None);
+        let mut observe = ctx();
+        observe.profile_locked = false;
+        let mut unvalidated = policy();
+        unvalidated.oem_validated = false;
+        for (state, c, p) in [
+            (SafetyState::EStopActive, ctx(), policy()),
+            (SafetyState::SafeStateActive, ctx(), policy()),
+            (SafetyState::MovingSlow, observe, policy()),
+            (SafetyState::MovingSlow, ctx(), unvalidated),
+        ] {
+            match judged(&r, state, &c, &p) {
+                Decision::Accept(a) => assert_eq!(a.actions, vec![ResponseAction::Record]),
+                Decision::Refuse(x) => panic!("{state:?}: refused {x:?}"),
+            }
+        }
+        // Everything else is still refused there.
+        let q = req("isolate_network", json!({}), Some(60));
+        assert_eq!(
+            refusal(judged(&q, SafetyState::EStopActive, &ctx(), &policy())),
+            "safety_system_engaged"
+        );
+    }
+
+    #[test]
+    fn morphology_mismatch_is_refused() {
+        let mut p = policy();
+        p.morphology = Morphology::Humanoid;
+        let q = req("isolate_network", json!({}), Some(60));
+        assert_eq!(
+            refusal(judged(&q, SafetyState::MovingSlow, &ctx(), &p)),
+            "morphology_mismatch"
+        );
+    }
+
+    #[test]
+    fn engaged_safety_system_refuses_everything_but_evidence() {
         let (c, p) = (ctx(), policy());
         for a in ActionKind::ALL {
+            if a == ActionKind::RecordEvidence {
+                continue;
+            }
             let r = match a {
                 ActionKind::RestrictMotion => req(
                     "restrict_motion",
@@ -2044,6 +2267,37 @@ mod tests {
         assert_eq!(a.body["safety_state"]["safety_system_engaged"], true);
         assert_eq!(a.body["executes_actions"], false);
         assert_eq!(a.body["mode"], "enforce");
+        assert_eq!(a.body["actions"].as_array().unwrap().len(), 7);
+    }
+
+    #[test]
+    fn robot_snapshot_does_not_advertise_refused_actions() {
+        // L4: a humanoid never advertises safe_pause / request_safe_state /
+        // rollback_config; a quadruped never rollback_config.
+        let e = engine();
+        for (m, gone) in [
+            (
+                Morphology::Humanoid,
+                &["safe_pause", "request_safe_state", "rollback_config"][..],
+            ),
+            (Morphology::Quadruped, &["rollback_config"][..]),
+            (Morphology::WheeledMobile, &[][..]),
+        ] {
+            let mut h = FakeHost::new(SafetyState::Idle);
+            (h.ctx, h.policy) = body_plan(m);
+            let a = e.robot(&mut h);
+            let listed: Vec<&str> = a.body["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            for g in gone {
+                assert!(!listed.contains(g), "{m:?} advertises {g}");
+            }
+            assert_eq!(listed.len(), 7 - gone.len(), "{m:?}: {listed:?}");
+            assert_eq!(a.body["morphology"], m.as_str());
+        }
     }
 
     /// The status mapping a future executor would get (none exists).

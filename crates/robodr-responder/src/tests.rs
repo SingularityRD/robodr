@@ -41,16 +41,29 @@ impl Rng {
     }
 }
 
+/// The statically stable morphology most tests declare for a family (the
+/// conservative default leaves it unspecified, which is fall-prone).
+fn stable(platform: PlatformFamily) -> Morphology {
+    match platform {
+        PlatformFamily::Ugv | PlatformFamily::Amr => Morphology::WheeledMobile,
+        PlatformFamily::Drone => Morphology::Aerial,
+        PlatformFamily::Arm => Morphology::Arm,
+        PlatformFamily::Other => Morphology::Other,
+    }
+}
+
 fn enforced(platform: PlatformFamily) -> ResponsePolicy {
     let mut p = ResponsePolicy::conservative_default(platform);
     p.oem_validated = true;
     p.model = "test-model".into();
+    p.morphology = stable(platform);
     p
 }
 
 fn ctx(platform: PlatformFamily) -> OperationalContext {
     OperationalContext {
         platform,
+        morphology: stable(platform),
         phase: MissionPhase::Transit,
         connectivity: Connectivity::Connected,
         control: ControlMode::Autonomous,
@@ -198,6 +211,10 @@ fn assert_invariants(
     if has_terminate(plan) {
         assert_eq!(state, SafetyState::Idle, "{tag}");
         assert!(policy.allow_terminate_when_idle);
+        assert!(!policy.morphology.needs_active_balance(), "{tag}");
+    }
+    if policy.morphology.falls_when_de_energised() && !plan.advisory.is_empty() {
+        assert!(plan.requires_human_approval, "{tag}");
     }
     for a in plan
         .actions
@@ -235,6 +252,7 @@ fn all_contexts() -> Vec<OperationalContext> {
                         for profile_locked in [false, true] {
                             v.push(OperationalContext {
                                 platform,
+                                morphology: stable(platform),
                                 phase,
                                 connectivity,
                                 control,
@@ -302,7 +320,22 @@ fn random_policy(r: &mut Rng) -> ResponsePolicy {
         .collect();
     p.safe_pause = r.pick(&allowed);
     p.safe_state = r.pick(&allowed);
-    p.allow_terminate_when_idle = r.bool();
+    p.morphology = r.pick(&Morphology::ALL);
+    if p.morphology.is_unspecified() && (p.oem_validated || platform == PlatformFamily::Other) {
+        p.morphology = stable(platform);
+    }
+    p.allow_terminate_when_idle = r.bool() && !p.morphology.needs_active_balance();
+    p.min_motion_factor = (r.below(46) + 5) as f64 / 100.0;
+    if p.morphology.needs_active_balance() {
+        p.limit_motion_factor = p.limit_motion_factor.max(p.min_motion_factor);
+    }
+    if p.morphology.falls_when_de_energised() {
+        p.fall_safe_restrict = match r.below(4) {
+            0 => vec![RestrictTarget::Network],
+            1 => vec![RestrictTarget::Participant, RestrictTarget::Network],
+            _ => Vec::new(),
+        };
+    }
     p.default_restrict = vec![r.pick(&RestrictTarget::ALL)];
     if r.bool() {
         let a = r.pick(&Step::ALL);
@@ -343,6 +376,9 @@ fn invariants_randomized_with_escalation_state() {
             let mut c = contexts[r.below(contexts.len())];
             if r.below(3) == 0 {
                 c.platform = policy.platform; // bias towards matching platform
+            }
+            if r.below(4) != 0 {
+                c.morphology = policy.morphology; // and morphology
             }
             let rule = if r.bool() { RULE_A } else { RULE_B };
             let mut d = Deviation::new(rule, r.pick(&SEVS), "x");
@@ -1673,8 +1709,20 @@ fn catalog_is_one_consistent_list() {
             serde_json::json!(c.name),
             "serde name = catalog name"
         );
-        // GA executes only reversible actions.
-        assert!(!c.executable_in_ga || c.reversible, "{}", c.name);
+        // GA executes only reversible actions, or ones with no effect on
+        // the robot (evidence capture).
+        assert!(
+            !c.executable_in_ga || c.reversible || !c.has_effect,
+            "{}",
+            c.name
+        );
+        assert_eq!(c.has_effect, id != ActionId::RecordEvidence, "{}", c.name);
+        assert_eq!(
+            c.process_target_may_de_energise,
+            id == ActionId::QuarantineNode,
+            "{}",
+            c.name
+        );
         assert_eq!(
             c.executable_in_ga,
             c.ga_execution != GaExecution::PlanOnly,
@@ -1682,7 +1730,7 @@ fn catalog_is_one_consistent_list() {
             c.name
         );
         // Irreversible or possibly de-energising actions need two people.
-        if !c.reversible || c.may_de_energise {
+        if (!c.reversible && c.has_effect) || c.may_de_energise {
             assert_eq!(c.approval, Approval::TwoPerson, "{}", c.name);
         }
         assert!(c.step <= Step::RequestSafeState);
@@ -1726,7 +1774,31 @@ fn catalog_is_one_consistent_list() {
         .into_iter()
         .filter(|a| a.may_de_energise())
         .collect();
-    assert_eq!(de, [ActionId::SafePause, ActionId::RequestSafeState]);
+    assert_eq!(
+        de,
+        [
+            ActionId::SafePause,
+            ActionId::RequestSafeState,
+            ActionId::RollbackConfig
+        ]
+    );
+    // Evidence is never "reverted" (L3).
+    assert!(!ActionId::RecordEvidence.reversible());
+    // L4: the new name is written; the old `analyst` is still read.
+    assert_eq!(
+        serde_json::to_value(Approval::Single).unwrap(),
+        serde_json::json!("single")
+    );
+    for name in ["single", "analyst"] {
+        assert_eq!(
+            serde_json::from_value::<Approval>(serde_json::json!(name)).unwrap(),
+            Approval::Single
+        );
+    }
+    assert_eq!(
+        serde_json::from_value::<Approval>(serde_json::json!("two_person")).unwrap(),
+        Approval::TwoPerson
+    );
     assert_eq!(ActionId::parse("robot_safe_pause"), None);
     assert_eq!(ActionId::parse_wire("safe_pause"), None);
 }
@@ -1797,22 +1869,33 @@ fn morph(platform: PlatformFamily, m: Morphology) -> ResponsePolicy {
     p
 }
 
+fn ctx_m(platform: PlatformFamily, m: Morphology) -> OperationalContext {
+    OperationalContext {
+        morphology: m,
+        ..ctx(platform)
+    }
+}
+
 fn has_de_energising(actions: &[ResponseAction]) -> bool {
     actions.iter().any(|a| for_action(a).may_de_energise())
 }
 
 #[test]
-fn morphology_defaults_to_other_and_parses() {
-    assert_eq!(Morphology::default(), Morphology::Other);
-    let base = ResponsePolicy::conservative_default(PlatformFamily::Other);
-    assert_eq!(base.morphology, Morphology::Other);
-    // A policy without the field (every pre-morphology policy) still loads.
+fn morphology_defaults_to_unspecified_and_parses() {
+    assert_eq!(Morphology::default(), Morphology::Unspecified);
+    let base = ResponsePolicy::conservative_default(PlatformFamily::Ugv);
+    assert_eq!(base.morphology, Morphology::Unspecified);
+    // Unvalidated, non-`other` policy without the field: loads, unspecified.
     let mut v: serde_json::Value = serde_json::from_str(&base.to_json()).unwrap();
-    v.as_object_mut().unwrap().remove("morphology");
+    assert!(
+        v.get("morphology").is_none(),
+        "unspecified is not serialised"
+    );
     let p = ResponsePolicy::from_json(&v.to_string()).unwrap();
-    assert_eq!(p.morphology, Morphology::Other);
+    assert_eq!(p.morphology, Morphology::Unspecified);
     for m in Morphology::ALL {
         v["morphology"] = serde_json::to_value(m).unwrap();
+        assert_eq!(v["morphology"], serde_json::json!(m.as_str()));
         assert_eq!(
             ResponsePolicy::from_json(&v.to_string())
                 .unwrap()
@@ -1829,14 +1912,73 @@ fn morphology_defaults_to_other_and_parses() {
         .into_iter()
         .filter(|m| m.falls_when_de_energised())
         .collect();
-    assert_eq!(fall, [Morphology::Humanoid]);
+    assert_eq!(fall, [Morphology::Humanoid, Morphology::Unspecified]);
+    let balance: Vec<Morphology> = Morphology::ALL
+        .into_iter()
+        .filter(|m| m.needs_active_balance())
+        .collect();
+    assert_eq!(
+        balance,
+        [
+            Morphology::Humanoid,
+            Morphology::Quadruped,
+            Morphology::Unspecified
+        ]
+    );
+}
+
+#[test]
+fn morphology_is_required_when_validated_or_platform_other() {
+    // H1: validated without morphology.
+    let mut p = enforced(PlatformFamily::Ugv);
+    p.morphology = Morphology::Unspecified;
+    assert_eq!(
+        p.validate(),
+        Err(PolicyError::MorphologyRequired {
+            platform: PlatformFamily::Ugv,
+            oem_validated: true
+        })
+    );
+    // H1: platform `other`, even unvalidated.
+    let p = ResponsePolicy::conservative_default(PlatformFamily::Other);
+    assert!(matches!(
+        p.validate(),
+        Err(PolicyError::MorphologyRequired { .. })
+    ));
+    // Explicit `unspecified` is the same as absent.
+    let mut v: serde_json::Value =
+        serde_json::from_str(&enforced(PlatformFamily::Arm).to_json()).unwrap();
+    v["morphology"] = serde_json::json!("unspecified");
+    assert!(matches!(
+        ResponsePolicy::from_json(&v.to_string()),
+        Err(PolicyError::MorphologyRequired { .. })
+    ));
+    assert!(PolicyError::MorphologyRequired {
+        platform: PlatformFamily::Other,
+        oem_validated: false
+    }
+    .to_string()
+    .contains("morphology is required"));
+    // Unspecified (unvalidated, non-`other`) plans like a humanoid.
+    let mut p = enforced(PlatformFamily::Ugv);
+    p.morphology = Morphology::Unspecified;
+    let c = ctx_m(PlatformFamily::Ugv, Morphology::Unspecified);
+    let plan = plan_stateless(
+        &p,
+        &dev(Severity::Critical),
+        "s",
+        SafetyState::MovingFast,
+        &c,
+    );
+    assert!(!has_de_energising(&plan.actions) && !plan.advisory.is_empty());
+    assert!(plan.requires_human_approval);
 }
 
 #[test]
 fn humanoid_never_gets_executable_safe_pause_or_safe_state() {
     for platform in PlatformFamily::ALL {
         let p = morph(platform, Morphology::Humanoid);
-        let c = ctx(platform);
+        let c = ctx_m(platform, Morphology::Humanoid);
         for state in SafetyState::ALL {
             for sev in SEVS {
                 let plan = plan_stateless(&p, &dev(sev), "s", state, &c);
@@ -1849,8 +1991,10 @@ fn humanoid_never_gets_executable_safe_pause_or_safe_state() {
                 assert_eq!(check_invariants(&plan, state, &c), Ok(()));
                 let wanted = p.matrix.get(sev, state);
                 if wanted >= Step::SafePause && !state.safety_system_engaged() {
-                    // Advisory carries what would have been requested.
-                    assert!(has_de_energising(&plan.advisory), "{state:?} {sev:?}");
+                    if p.safe_pause.allowed_for(platform) {
+                        // Advisory carries what would have been requested.
+                        assert!(has_de_energising(&plan.advisory), "{state:?} {sev:?}");
+                    }
                     assert!(plan.rationale.contains(|r| matches!(
                         r,
                         Reason::DeEnergisingAdvisoryOnly {
@@ -1858,22 +2002,17 @@ fn humanoid_never_gets_executable_safe_pause_or_safe_state() {
                             ..
                         }
                     )));
-                    // Contained with the balance-keeping steps instead.
-                    for want in [
-                        ResponseAction::LimitMotion {
-                            factor: p.limit_motion_factor,
-                        },
-                        ResponseAction::Restrict {
-                            target: RestrictTarget::Network,
-                            terminate_process: false,
-                        },
-                        ResponseAction::Restrict {
-                            target: RestrictTarget::Participant,
-                            terminate_process: false,
-                        },
-                    ] {
-                        assert!(plan.actions.contains(&want), "{want:?} in {plan:?}");
-                    }
+                    // M1: the substitute always waits for a human, and with
+                    // an empty `fall_safe_restrict` it adds no network or
+                    // participant restriction.
+                    assert!(plan.requires_human_approval, "{plan:?}");
+                    assert!(plan.actions.contains(&ResponseAction::LimitMotion {
+                        factor: p.limit_motion_factor,
+                    }));
+                    assert!(!plan.actions.contains(&ResponseAction::Restrict {
+                        target: RestrictTarget::Network,
+                        terminate_process: false,
+                    }));
                 } else {
                     assert!(plan.advisory.is_empty());
                 }
@@ -1883,29 +2022,214 @@ fn humanoid_never_gets_executable_safe_pause_or_safe_state() {
 }
 
 #[test]
+fn humanoid_substitutes_only_the_oem_validated_restrict_targets() {
+    let mut p = morph(PlatformFamily::Other, Morphology::Humanoid);
+    p.auto_max_step = Step::RequestSafeState;
+    p.fall_safe_restrict = vec![RestrictTarget::Network];
+    p.validate().unwrap();
+    let c = ctx_m(PlatformFamily::Other, Morphology::Humanoid);
+    let state = SafetyState::CollaborativeHumanNearby;
+    let plan = plan_stateless(&p, &dev(Severity::Critical), "s", state, &c);
+    assert_eq!(
+        plan.actions,
+        vec![
+            ResponseAction::Record,
+            ResponseAction::Restrict {
+                target: RestrictTarget::Network,
+                terminate_process: false
+            },
+            ResponseAction::Restrict {
+                target: RestrictTarget::Participant,
+                terminate_process: false
+            },
+            ResponseAction::LimitMotion { factor: 0.5 },
+        ],
+        "default_restrict participant + listed network"
+    );
+    assert!(
+        plan.requires_human_approval,
+        "above auto ceiling is not enough"
+    );
+    assert_eq!(check_invariants(&plan, state, &c), Ok(()));
+    // An auto-executable substitute is an invariant violation.
+    let mut bad = plan.clone();
+    bad.requires_human_approval = false;
+    assert_eq!(
+        check_invariants(&bad, state, &c),
+        Err(Violation::SubstituteWithoutApproval)
+    );
+    // fall_safe_restrict validation.
+    p.fall_safe_restrict = vec![RestrictTarget::Process];
+    assert!(matches!(
+        p.validate(),
+        Err(PolicyError::FallSafeRestrict(_))
+    ));
+    p.fall_safe_restrict = vec![RestrictTarget::Network, RestrictTarget::Network];
+    assert_eq!(p.validate(), Err(PolicyError::DuplicateRestrictTarget));
+    let mut q = morph(PlatformFamily::Other, Morphology::Quadruped);
+    q.fall_safe_restrict = vec![RestrictTarget::Network];
+    assert!(matches!(
+        q.validate(),
+        Err(PolicyError::FallSafeRestrict(_))
+    ));
+}
+
+#[test]
+fn balancing_robots_never_terminate_and_quarantine_processes_only_with_approval() {
+    for m in [Morphology::Humanoid, Morphology::Quadruped] {
+        // H2: validation refuses terminate-when-idle.
+        let mut p = morph(PlatformFamily::Other, m);
+        p.allow_terminate_when_idle = true;
+        assert_eq!(p.validate(), Err(PolicyError::TerminateOnBalancingRobot(m)));
+        // A policy that bypassed validation still never terminates, and the
+        // process quarantine waits for a human even while idle.
+        p.default_restrict = vec![RestrictTarget::Process];
+        p.auto_max_step = Step::RequestSafeState;
+        let c = ctx_m(PlatformFamily::Other, m);
+        let plan = plan_stateless(&p, &dev(Severity::Medium), "s", SafetyState::Idle, &c);
+        assert_eq!(
+            plan.actions,
+            vec![
+                ResponseAction::Record,
+                ResponseAction::Restrict {
+                    target: RestrictTarget::Process,
+                    terminate_process: false
+                }
+            ],
+            "{m:?}"
+        );
+        assert!(plan.requires_human_approval, "{m:?}");
+        assert!(plan
+            .rationale
+            .contains(|r| matches!(r, Reason::ProcessQuarantineNeedsApproval { .. })));
+        assert_eq!(check_invariants(&plan, SafetyState::Idle, &c), Ok(()));
+        let mut bad = plan.clone();
+        bad.requires_human_approval = false;
+        assert_eq!(
+            check_invariants(&bad, SafetyState::Idle, &c),
+            Err(Violation::ProcessQuarantineWithoutApproval)
+        );
+        bad.requires_human_approval = true;
+        bad.actions[1] = ResponseAction::Restrict {
+            target: RestrictTarget::Process,
+            terminate_process: true,
+        };
+        assert_eq!(
+            check_invariants(&bad, SafetyState::Idle, &c),
+            Err(Violation::TerminateOnBalancingRobot)
+        );
+    }
+    // A wheeled robot keeps the idle termination.
+    let mut p = morph(PlatformFamily::Ugv, Morphology::WheeledMobile);
+    p.allow_terminate_when_idle = true;
+    p.default_restrict = vec![RestrictTarget::Process];
+    p.validate().unwrap();
+    let c = ctx(PlatformFamily::Ugv);
+    let plan = plan_stateless(&p, &dev(Severity::Medium), "s", SafetyState::Idle, &c);
+    assert!(has_terminate(&plan) && !plan.requires_human_approval);
+}
+
+#[test]
+fn balancing_robots_have_a_motion_factor_floor() {
+    for m in [Morphology::Humanoid, Morphology::Quadruped] {
+        let mut p = morph(PlatformFamily::Other, m);
+        p.limit_motion_factor = 1e-9;
+        assert!(matches!(
+            p.validate(),
+            Err(PolicyError::MotionFactorBelowFloor { .. })
+        ));
+        p.limit_motion_factor = 0.19;
+        assert!(p.validate().is_err(), "default floor 0.2");
+        p.min_motion_factor = 0.1;
+        p.validate().unwrap();
+        for bad in [0.0, 0.049, 1.01, f64::NAN, f64::INFINITY] {
+            p.min_motion_factor = bad;
+            assert!(
+                matches!(p.validate(), Err(PolicyError::MinMotionFactor(_))),
+                "{bad}"
+            );
+        }
+        // Bypassing validation: the factor is dropped and approval needed.
+        p.min_motion_factor = 0.2;
+        p.limit_motion_factor = 1e-9;
+        let c = ctx_m(PlatformFamily::Other, m);
+        let state = SafetyState::MovingSlow;
+        let plan = plan_stateless(&p, &dev(Severity::High), "s", state, &c);
+        assert!(!plan
+            .actions
+            .iter()
+            .any(|a| matches!(a, ResponseAction::LimitMotion { .. })));
+        assert!(plan.requires_human_approval);
+        // The invariant has a hard floor.
+        let mut bad = plan.clone();
+        bad.actions
+            .push(ResponseAction::LimitMotion { factor: 0.01 });
+        bad.max_step = Step::LimitMotion;
+        assert_eq!(
+            check_invariants(&bad, state, &c),
+            Err(Violation::MotionBelowFloor)
+        );
+    }
+    // Wheeled: no floor beyond (0, 1].
+    let mut p = enforced(PlatformFamily::Ugv);
+    p.limit_motion_factor = 0.01;
+    p.validate().unwrap();
+}
+
+#[test]
+fn morphology_mismatch_records_only_and_plans_for_another_body_are_refused() {
+    // The policy says wheeled, the context (the robot's own config) says
+    // humanoid: the planner only records.
+    let p = enforced(PlatformFamily::Other);
+    let c = ctx_m(PlatformFamily::Other, Morphology::Humanoid);
+    let state = SafetyState::MovingFast;
+    let plan = plan_stateless(&p, &dev(Severity::Critical), "s", state, &c);
+    assert_eq!(plan.actions, vec![ResponseAction::Record]);
+    assert!(plan.requires_human_approval);
+    assert!(plan
+        .rationale
+        .contains(|r| matches!(r, Reason::MorphologyMismatch { .. })));
+    assert_eq!(check_invariants(&plan, state, &c), Ok(()));
+    // M4: a plan that claims `other` but acts is refused by a humanoid
+    // executor, whatever the plan says about itself.
+    let lying = plan_stateless(
+        &p,
+        &dev(Severity::Critical),
+        "s",
+        state,
+        &ctx(PlatformFamily::Other),
+    );
+    assert!(has_de_energising(&lying.actions));
+    assert_eq!(
+        check_invariants(&lying, state, &c),
+        Err(Violation::MorphologyMismatch)
+    );
+}
+
+#[test]
 fn other_morphologies_keep_the_full_ladder() {
     let state = SafetyState::CollaborativeHumanNearby;
     for m in Morphology::ALL {
         for platform in PlatformFamily::ALL {
             let p = morph(platform, m);
-            let c = ctx(platform);
+            let c = ctx_m(platform, m);
             let plan = plan_stateless(&p, &dev(Severity::Critical), "s", state, &c);
             assert_eq!(check_invariants(&plan, state, &c), Ok(()));
             assert_eq!(plan.morphology, m);
-            if m == Morphology::Humanoid {
+            if m.falls_when_de_energised() {
                 assert_eq!(plan.max_step, Step::LimitMotion, "{platform:?}");
                 assert_eq!(plan.advisory.len(), 2, "{platform:?}");
             } else {
                 assert_eq!(plan.max_step, Step::RequestSafeState, "{m:?} {platform:?}");
                 assert!(plan.advisory.is_empty());
                 assert!(has_de_energising(&plan.actions));
-                // Same actions as with no morphology at all.
+                // Same actions as the family's statically stable body.
                 let base = plan_stateless(
                     &enforced(platform),
                     &dev(Severity::Critical),
                     "s",
                     state,
-                    &c,
+                    &ctx(platform),
                 );
                 assert_eq!(plan.actions, base.actions, "{m:?} {platform:?}");
             }
@@ -1917,13 +2241,14 @@ fn other_morphologies_keep_the_full_ladder() {
 fn humanoid_observe_mode_keeps_advisory_in_would_have_only() {
     let mut p = morph(PlatformFamily::Other, Morphology::Humanoid);
     p.oem_validated = false;
-    let c = ctx(PlatformFamily::Other);
+    let c = ctx_m(PlatformFamily::Other, Morphology::Humanoid);
     let state = SafetyState::MovingFast;
     let plan = plan_stateless(&p, &dev(Severity::Critical), "s", state, &c);
     assert!(plan.observe_only);
     assert!(plan.advisory.is_empty());
     let w = plan.would_have.as_ref().unwrap();
     assert!(!w.advisory.is_empty() && !has_de_energising(&w.actions));
+    assert!(w.requires_human_approval);
     assert_eq!(check_invariants(&plan, state, &c), Ok(()));
 }
 
@@ -1932,7 +2257,7 @@ fn humanoid_escalation_never_reaches_de_energising() {
     let mut p = morph(PlatformFamily::Other, Morphology::Humanoid);
     p.escalation.ceiling = Step::RequestSafeState;
     p.escalation.max_escalation_steps = 2;
-    let c = ctx(PlatformFamily::Other);
+    let c = ctx_m(PlatformFamily::Other, Morphology::Humanoid);
     let mut r = Responder::new(p).unwrap();
     for i in 0..20u64 {
         let plan = r.plan(
@@ -1950,13 +2275,20 @@ fn humanoid_escalation_never_reaches_de_energising() {
 fn invariant_rejects_de_energising_on_humanoid_plans() {
     let p = enforced(PlatformFamily::Other);
     let c = ctx(PlatformFamily::Other);
+    let hc = ctx_m(PlatformFamily::Other, Morphology::Humanoid);
     let state = SafetyState::MovingFast;
     let mut plan = plan_stateless(&p, &dev(Severity::Critical), "s", state, &c);
     assert!(has_de_energising(&plan.actions));
     assert_eq!(check_invariants(&plan, state, &c), Ok(()));
+    // The plan relabelled as humanoid: refused by a checker that knows the
+    // robot as `other` (mismatch) and by one that knows it as humanoid.
     plan.morphology = Morphology::Humanoid;
     assert_eq!(
         check_invariants(&plan, state, &c),
+        Err(Violation::MorphologyMismatch)
+    );
+    assert_eq!(
+        check_invariants(&plan, state, &hc),
         Err(Violation::DeEnergisingOnFallProneMorphology)
     );
     // Advisory may only hold safe pause / safe state valid for the platform.
@@ -1983,7 +2315,7 @@ fn invariant_rejects_de_energising_on_humanoid_plans() {
 #[test]
 fn humanoid_plan_json_round_trips_and_default_omits_new_fields() {
     let p = morph(PlatformFamily::Other, Morphology::Humanoid);
-    let c = ctx(PlatformFamily::Other);
+    let c = ctx_m(PlatformFamily::Other, Morphology::Humanoid);
     let plan = plan_stateless(
         &p,
         &dev(Severity::Critical),
@@ -1996,15 +2328,26 @@ fn humanoid_plan_json_round_trips_and_default_omits_new_fields() {
     assert!(j.contains("\"advisory\":["));
     let back: ResponsePlan = serde_json::from_str(&j).unwrap();
     assert_eq!(back, plan);
+    // A plan without the field (older records) reads as unspecified: the
+    // conservative reading.
+    let mut v: serde_json::Value = serde_json::from_str(&j).unwrap();
+    v.as_object_mut().unwrap().remove("morphology");
+    let old: ResponsePlan = serde_json::from_value(v).unwrap();
+    assert_eq!(old.morphology, Morphology::Unspecified);
     let plain = plan_stateless(
-        &enforced(PlatformFamily::Other),
-        &dev(Severity::Critical),
+        &enforced(PlatformFamily::Ugv),
+        &dev(Severity::Low),
         "s",
         SafetyState::MovingFast,
-        &c,
+        &ctx(PlatformFamily::Ugv),
     );
     let j = serde_json::to_string(&plain).unwrap();
-    assert!(!j.contains("morphology") && !j.contains("advisory"));
+    assert!(j.contains("\"morphology\":\"wheeled_mobile\"") && !j.contains("advisory"));
+    // OperationalContext without `morphology` reads as unspecified.
+    let mut v = serde_json::to_value(ctx(PlatformFamily::Ugv)).unwrap();
+    v.as_object_mut().unwrap().remove("morphology");
+    let c: OperationalContext = serde_json::from_value(v).unwrap();
+    assert_eq!(c.morphology, Morphology::Unspecified);
 }
 
 #[test]

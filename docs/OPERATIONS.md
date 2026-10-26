@@ -911,9 +911,15 @@ against the safety state at that moment and the response policy, records it
 in the black box and answers. **Nothing is executed in this release:** an
 accepted request is answered `recorded_not_executed`, a refused one
 `refused` with a reason (always while the e-stop or safe state is active,
-for everything while the policy is not OEM-validated, and for `safe_pause` /
-`request_safe_state` when the response policy's `morphology` is
-`humanoid`: de-energising a humanoid makes it fall). Set it up:
+for everything but `record_evidence` while the policy is not OEM-validated,
+for `safe_pause` / `request_safe_state` when the response policy's
+`morphology` is `humanoid` — de-energising a humanoid makes it fall — and for
+`rollback_config` on a humanoid or quadruped, or a `restrict_motion` cap
+below the policy's `min_motion_factor` there: a legged robot balances
+actively, also while idle). The response policy must declare `morphology`
+once it is OEM-validated or its platform is `other`; see
+`config/response-policy.unitree-g1.example.json` /
+`…unitree-go2.example.json`. Set it up:
 
 ```sh
 # On the SOC side, once: the SOC signing key (keep the secret there).
