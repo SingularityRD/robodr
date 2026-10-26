@@ -127,13 +127,18 @@
     )
 )]
 
+pub mod armsdk;
 pub mod config;
 pub mod discovery;
 pub mod gateway;
+pub mod hand;
 pub mod ip;
 pub mod legacy;
 pub mod lowcmd;
+pub mod nflog;
 pub mod nfq;
+pub mod observe;
+pub mod ros2;
 pub mod round;
 pub mod rtps;
 pub mod ruleset;
@@ -144,5 +149,5 @@ pub mod sys;
 #[doc(hidden)]
 pub mod testkit;
 
-pub use config::{Codec, GatewayConfig, GatewayMode, OnGatewayDown};
+pub use config::{Codec, GatewayConfig, GatewayMode, LocoModel, OnGatewayDown};
 pub use gateway::{Gateway, GatewayStats, PacketMeta, Verdict};

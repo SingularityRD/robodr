@@ -160,11 +160,11 @@ pub fn handle(
                 outcome: Box::new(out),
             }
         }
-        Msg::Revert { id, reason } => {
+        Msg::Revert { id, reason, soc } => {
             let reason = format!("revert requested: {}", proto_text(&reason));
             Msg::Outcome {
                 outcome: Box::new(if crate::net::id_ok(&id) {
-                    lock(engine).revert(&id, &reason, Now::system())
+                    lock(engine).revert_request(&id, &reason, soc.as_deref(), Now::system())
                 } else {
                     bad_id(&id)
                 }),

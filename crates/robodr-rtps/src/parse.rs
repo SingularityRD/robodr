@@ -285,6 +285,11 @@ pub struct EndpointInfo {
     pub alternates: Vec<EndpointAlternate>,
     /// Reassembled from DATA_FRAG.
     pub from_fragments: bool,
+    /// The endpoint's own unicast locators (`PID_UNICAST_LOCATOR`; empty =
+    /// the participant's default locators apply).
+    pub unicast_locators: Vec<Locator>,
+    /// The endpoint's own multicast locators (`PID_MULTICAST_LOCATOR`).
+    pub multicast_locators: Vec<Locator>,
 }
 
 impl EndpointInfo {
@@ -651,6 +656,9 @@ struct Params {
     mm: Vec<Locator>,
     du: Vec<Locator>,
     dm: Vec<Locator>,
+    /// Endpoint locators (SEDP `PID_UNICAST_LOCATOR` / `PID_MULTICAST_LOCATOR`).
+    eu: Vec<Locator>,
+    em: Vec<Locator>,
 }
 
 type Report = DatagramReport;
@@ -1015,6 +1023,8 @@ impl Report {
             PID_METATRAFFIC_MULTICAST_LOCATOR => push(self, &mut out.mm, v, le, pid),
             PID_DEFAULT_UNICAST_LOCATOR => push(self, &mut out.du, v, le, pid),
             PID_DEFAULT_MULTICAST_LOCATOR => push(self, &mut out.dm, v, le, pid),
+            PID_UNICAST_LOCATOR => push(self, &mut out.eu, v, le, pid),
+            PID_MULTICAST_LOCATOR => push(self, &mut out.em, v, le, pid),
             _ => {} // everything else (QoS, vendor-specific 0x8000 PIDs) is ignored
         }
     }
@@ -1188,6 +1198,8 @@ impl Report {
             } else {
                 (vec![(primary.0, primary.1)], 0)
             };
+        let unicast_locators = p.eu;
+        let multicast_locators = p.em;
         let topics = p.topic.vals;
         let t_last = p.topic.last;
         let type_names = p.type_name.vals;
@@ -1243,6 +1255,8 @@ impl Report {
             type_names,
             alternates,
             from_fragments: s.from_fragments,
+            unicast_locators,
+            multicast_locators,
         });
     }
 }
@@ -1398,6 +1412,8 @@ mod tests {
             type_names: vec!["T".into()],
             alternates: Vec::new(),
             from_fragments: false,
+            unicast_locators: Vec::new(),
+            multicast_locators: Vec::new(),
         }
     }
 

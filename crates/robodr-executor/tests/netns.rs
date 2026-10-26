@@ -494,6 +494,59 @@ fn config_with(
         .unwrap()
 }
 
+/// The lab SOC (trust boundary M1): its seed and public key file.
+const SOC_SEED: [u8; 32] = [0x33; 32];
+const SOC_KEY_ID: &str = "soc:lab:1";
+
+fn soc_key_path() -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = std::env::temp_dir().join(format!("robodr-netns-soc-{}.pub", std::process::id()));
+    if !p.exists() {
+        let n = SOC_NONCE.fetch_add(1, Ordering::SeqCst);
+        let tmp = p.with_extension(format!("tmp{n}"));
+        std::fs::write(
+            &tmp,
+            robodr_executor::soc::testing::public_key_json(&SOC_SEED, SOC_KEY_ID),
+        )
+        .unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::rename(&tmp, &p).unwrap();
+    }
+    p
+}
+
+static SOC_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A public key file standing for the robot's own (black-box) key.
+fn robot_key_path() -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = std::env::temp_dir().join(format!("robodr-netns-robot-{}.pub", std::process::id()));
+    if !p.exists() {
+        let n = SOC_NONCE.fetch_add(1, Ordering::SeqCst);
+        let tmp = p.with_extension(format!("tmp{n}"));
+        std::fs::write(
+            &tmp,
+            robodr_executor::soc::testing::public_key_json(&[0x77; 32], "robot:blackbox"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::rename(&tmp, &p).unwrap();
+    }
+    p
+}
+
+/// Attach the lab SOC's signed request (at `ts_s`, a fresh nonce).
+fn sign_at(o: Order, ts_s: u64) -> Order {
+    let n = SOC_NONCE.fetch_add(1, Ordering::SeqCst);
+    robodr_executor::soc::testing::sign_order(
+        o,
+        &SOC_SEED,
+        "lab-robot",
+        ts_s,
+        &format!("lab-nonce-{}-{n:012}", std::process::id()),
+    )
+}
+
 fn config_json(state_dir: &std::path::Path) -> Value {
     json!({
             "schema": "robodr-executor-config/v1",
@@ -508,10 +561,13 @@ fn config_json(state_dir: &std::path::Path) -> Value {
                 "control_buses": {"exempt": true, "entries": []},
                 "motion_control_path": [
                     {"cidr": MOTION, "udp_ports": [7400, 7600], "note": "robot DDS bus"}
-                ]
+                ],
+                // F4: where a quarantine may act (ROGUE / OTHER, not MGMT).
+                "quarantine": {"cidrs": ["10.99.0.0/29", "fd00:30::/64"]}
             },
             "ttl": {"default_s": 600, "max_s": 3600},
-            "max_safety_age_ms": 1000
+            "max_safety_age_ms": 1000,
+            "soc": {"keys": [soc_key_path()]}
     })
 }
 
@@ -523,7 +579,29 @@ fn policy(m: Morphology, fsr: &[RestrictTarget]) -> ResponsePolicy {
     p
 }
 
+/// A control-plane order; [`submit`] attaches the lab SOC's signed request
+/// for it as it is at submission (trust boundary M1).
 fn order(id: &str, action: ActionId, m: Morphology) -> Order {
+    unsigned(id, action, m)
+}
+
+/// Submit `o` to the engine at `now` with the lab SOC's request for it
+/// (signed at `now`) when it is a control-plane order without one.
+fn submit(
+    e: &mut Engine,
+    o: &Order,
+    s: &mut FixedSafety,
+    now: impl Into<robodr_executor::engine::Now>,
+) -> robodr_executor::engine::Outcome {
+    let now = now.into();
+    let o = match o.origin {
+        Origin::ControlPlane { .. } if o.soc.is_none() => sign_at(o.clone(), now.wall_ms / 1000),
+        _ => o.clone(),
+    };
+    e.submit(&o, s, now)
+}
+
+fn unsigned(id: &str, action: ActionId, m: Morphology) -> Order {
     Order {
         id: id.into(),
         action,
@@ -553,10 +631,11 @@ fn order(id: &str, action: ActionId, m: Morphology) -> Order {
         human_approved: true,
         replay: false,
         origin: Origin::ControlPlane {
-            key_id: "soc:lab:1".into(),
+            key_id: SOC_KEY_ID.into(),
             requested_by: "lab".into(),
         },
         issued_ms: 0,
+        soc: None,
     }
 }
 
@@ -600,7 +679,7 @@ fn isolate_network_blocks_traffic_keeps_management_and_motion_path_and_reverts_e
     let dir = lab.state_dir("iso");
     let mut e = open(&lab, &dir, "boot-1", Morphology::WheeledMobile, 1_000);
     let o = order("iso-1", ActionId::IsolateNetwork, Morphology::WheeledMobile);
-    let out = e.submit(&o, &mut idle(), 1_000);
+    let out = submit(&mut e, &o, &mut idle(), 1_000);
     assert_eq!(out.status, Status::Verified, "{out:?}");
 
     // The installed rules are exactly the rendering.
@@ -675,7 +754,8 @@ fn quarantine_node_drops_the_participant_by_guid_and_locator_only() {
     let dir = lab.state_dir("q");
     let mut e = open(&lab, &dir, "boot-1", Morphology::WheeledMobile, 1_000);
     let before = lab.ruleset();
-    let out = e.submit(
+    let out = submit(
+        &mut e,
         &order("q-1", ActionId::QuarantineNode, Morphology::WheeledMobile),
         &mut idle(),
         1_000,
@@ -728,10 +808,16 @@ fn revert_of_one_action_restores_the_exact_earlier_ruleset() {
     let dir = lab.state_dir("two");
     let mut e = open(&lab, &dir, "boot-1", Morphology::WheeledMobile, 1_000);
     let q = order("q-1", ActionId::QuarantineNode, Morphology::WheeledMobile);
-    assert_eq!(e.submit(&q, &mut idle(), 1_000).status, Status::Verified);
+    assert_eq!(
+        submit(&mut e, &q, &mut idle(), 1_000).status,
+        Status::Verified
+    );
     let with_q = lab.ruleset();
     let i = order("i-1", ActionId::IsolateNetwork, Morphology::WheeledMobile);
-    assert_eq!(e.submit(&i, &mut idle(), 1_000).status, Status::Verified);
+    assert_eq!(
+        submit(&mut e, &i, &mut idle(), 1_000).status,
+        Status::Verified
+    );
     assert_ne!(lab.ruleset(), with_q);
     assert_eq!(e.revert("i-1", "lab", 2_000).status, Status::Reverted);
     assert_eq!(lab.ruleset(), with_q);
@@ -754,7 +840,10 @@ fn ttl_expiry_reverts_with_real_nftables() {
     let mut e = open(&lab, &dir, "boot-1", Morphology::WheeledMobile, 1_000);
     let mut i = order("i-ttl", ActionId::IsolateNetwork, Morphology::WheeledMobile);
     i.ttl_s = Some(1);
-    assert_eq!(e.submit(&i, &mut idle(), 1_000).status, Status::Verified);
+    assert_eq!(
+        submit(&mut e, &i, &mut idle(), 1_000).status,
+        Status::Verified
+    );
     assert_eq!(lab.peer_to_robot(&format!("{OTHER}:0"), 9000, b"x"), 0);
     e.tick(1_500);
     assert_eq!(e.status("i-ttl").status, Status::Verified);
@@ -770,7 +859,10 @@ fn restart_reconciliation_and_reboot_with_real_nftables() {
     let dir = lab.state_dir("restart");
     let mut e = open(&lab, &dir, "boot-1", Morphology::WheeledMobile, 1_000);
     let i = order("i-1", ActionId::IsolateNetwork, Morphology::WheeledMobile);
-    assert_eq!(e.submit(&i, &mut idle(), 1_000).status, Status::Verified);
+    assert_eq!(
+        submit(&mut e, &i, &mut idle(), 1_000).status,
+        Status::Verified
+    );
     let applied = lab.ruleset();
     drop(e);
     // Restart, same boot: re-verified, unchanged.
@@ -804,7 +896,10 @@ fn restart_reconciliation_and_reboot_with_real_nftables() {
     assert!(e.rearm("lab", 4_500).unwrap());
     // ... and while it runs.
     let i2 = order("i-2", ActionId::IsolateNetwork, Morphology::WheeledMobile);
-    assert_eq!(e.submit(&i2, &mut idle(), 5_000).status, Status::Verified);
+    assert_eq!(
+        submit(&mut e, &i2, &mut idle(), 5_000).status,
+        Status::Verified
+    );
     lab.nft_cmd(&["delete", "table", "inet", "robodr"]).unwrap();
     e.periodic_verify(6_000);
     assert_eq!(e.status("i-2").status, Status::RemovedExternally);
@@ -813,7 +908,10 @@ fn restart_reconciliation_and_reboot_with_real_nftables() {
     assert!(e.rearm("lab", 60_500).unwrap());
     // Drift: a rule removed by hand is put back.
     let i3 = order("i-3", ActionId::IsolateNetwork, Morphology::WheeledMobile);
-    assert_eq!(e.submit(&i3, &mut idle(), 61_000).status, Status::Verified);
+    assert_eq!(
+        submit(&mut e, &i3, &mut idle(), 61_000).status,
+        Status::Verified
+    );
     lab.nft_cmd(&["flush", "chain", "inet", "robodr", "input"])
         .unwrap();
     assert_eq!(lab.peer_to_robot(&format!("{OTHER}:0"), 9000, b"x"), 3);
@@ -829,10 +927,14 @@ fn crash_between_apply_and_journal_write_is_recovered() {
     let dir = lab.state_dir("crash");
     let mut e = open(&lab, &dir, "boot-1", Morphology::WheeledMobile, 1_000);
     let q = order("q-1", ActionId::QuarantineNode, Morphology::WheeledMobile);
-    assert_eq!(e.submit(&q, &mut idle(), 1_000).status, Status::Verified);
+    assert_eq!(
+        submit(&mut e, &q, &mut idle(), 1_000).status,
+        Status::Verified
+    );
     let before = lab.ruleset();
     robodr_executor::fault::arm(robodr_executor::fault::Point::AfterApply);
-    let out = e.submit(
+    let out = submit(
+        &mut e,
         &order("i-1", ActionId::IsolateNetwork, Morphology::WheeledMobile),
         &mut idle(),
         2_000,
@@ -858,7 +960,8 @@ fn humanoid_refusals_install_nothing() {
     // fall_safe_restrict empty (the Unitree G1 example).
     let mut e = open(&lab, &dir, "boot-1", Morphology::Humanoid, 1_000);
     for a in ActionId::ALL {
-        let out = e.submit(
+        let out = submit(
+            &mut e,
             &order(a.as_str(), a, Morphology::Humanoid),
             &mut idle(),
             1_000,
@@ -883,10 +986,16 @@ fn humanoid_refusals_install_nothing() {
         2_000,
     )
     .unwrap();
+    // (Unapproved = the planner's: a control-plane order is approved only
+    // by the SOC's verified signature.)
     let mut o = order("h-iso", ActionId::IsolateNetwork, Morphology::Humanoid);
     o.human_approved = false;
+    o.origin = Origin::Planner {
+        rule: "lab".into(),
+        finding_id: None,
+    };
     assert_eq!(
-        e.submit(&o, &mut idle(), 2_000).refusal.unwrap().code,
+        submit(&mut e, &o, &mut idle(), 2_000).refusal.unwrap().code,
         codes::NEEDS_APPROVAL
     );
     assert_eq!(lab.ruleset(), before);
@@ -930,8 +1039,12 @@ fn protocol_end_to_end_over_the_unix_socket() {
     assert_eq!(client.ping().unwrap().0, 0);
     // The safety state is asked for immediately before apply; a changed one
     // refuses.
+    let now_s = || robodr_executor::proto::wall_ms() / 1000;
     let mut asked = 0;
-    let o = order("p-1", ActionId::IsolateNetwork, Morphology::WheeledMobile);
+    let o = sign_at(
+        unsigned("p-1", ActionId::IsolateNetwork, Morphology::WheeledMobile),
+        now_s(),
+    );
     let out = client
         .submit(&o, &mut || {
             asked += 1;
@@ -940,7 +1053,43 @@ fn protocol_end_to_end_over_the_unix_socket() {
         .unwrap();
     assert_eq!(asked, 1);
     assert_eq!(out.refusal.unwrap().code, codes::SAFETY_STATE_CHANGED);
-    let o = order("p-2", ActionId::IsolateNetwork, Morphology::WheeledMobile);
+    // Trust boundary M1, over the real socket and kernel: an order that
+    // agentd (holding the protocol key) forges without the SOC's signature,
+    // or with another key's, installs nothing.
+    let before = lab.ruleset();
+    let forged = unsigned("p-f1", ActionId::IsolateNetwork, Morphology::WheeledMobile);
+    let out = client
+        .submit(&forged, &mut || Ok((SafetyState::Idle, 3)))
+        .unwrap();
+    assert_eq!(out.refusal.unwrap().code, codes::SOC_SIGNATURE_INVALID);
+    let mut wrong = robodr_executor::soc::testing::sign_order(
+        unsigned("p-f2", ActionId::IsolateNetwork, Morphology::WheeledMobile),
+        &[0x44; 32],
+        "lab-robot",
+        now_s(),
+        "lab-forged-nonce-0001",
+    );
+    let out = client
+        .submit(&wrong, &mut || Ok((SafetyState::Idle, 3)))
+        .unwrap();
+    assert_eq!(out.refusal.unwrap().code, codes::SOC_SIGNATURE_INVALID);
+    // A genuine approval for a 60 s isolation stretched by agentd.
+    wrong = sign_at(
+        unsigned("p-f3", ActionId::IsolateNetwork, Morphology::WheeledMobile),
+        now_s(),
+    );
+    wrong.ttl_s = Some(3600);
+    let out = client
+        .submit(&wrong, &mut || Ok((SafetyState::Idle, 3)))
+        .unwrap();
+    assert_eq!(out.refusal.unwrap().code, codes::ORDER_MISMATCH);
+    assert_eq!(lab.ruleset(), before, "a forged order changed the ruleset");
+    assert_eq!(lab.peer_to_robot(&format!("{OTHER}:0"), 9000, b"x"), 3);
+    // The matching signed order is applied.
+    let o = sign_at(
+        unsigned("p-2", ActionId::IsolateNetwork, Morphology::WheeledMobile),
+        now_s(),
+    );
     let out = client
         .submit(&o, &mut || Ok((SafetyState::Idle, 3)))
         .unwrap();
@@ -957,9 +1106,29 @@ fn protocol_end_to_end_over_the_unix_socket() {
     );
     assert!(bad.revert("p-2", "x").is_err());
     assert_eq!(client.status("p-2").unwrap().status, Status::Verified);
-    // Revert through the protocol.
+    // Review F3: a revert without the SOC's signature (what agentd, or
+    // anyone holding the protocol key, could send) is refused and the
+    // isolation stays in force.
+    let out = client.revert("p-2", "lab").unwrap();
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    assert_eq!(out.refusal.unwrap().code, codes::SOC_SIGNATURE_INVALID);
+    assert_eq!(lab.peer_to_robot(&format!("{OTHER}:0"), 9000, b"x"), 0);
+    // The SOC's signed revert, through the protocol, lifts it.
+    let rv = robodr_executor::soc::SocRequest::sign(
+        &SOC_SEED,
+        "lab-robot",
+        SOC_KEY_ID,
+        "POST",
+        "/api/v2/robots/lab-robot/action-requests/p-2/revert",
+        now_s(),
+        &format!("lab-revert-{}-0001", std::process::id()),
+        r#"{"reason":"lab","requested_by":"analyst"}"#,
+    );
     assert_eq!(
-        client.revert("p-2", "lab").unwrap().status,
+        client
+            .revert_signed("p-2", "lab", Some(&rv))
+            .unwrap()
+            .status,
         Status::Reverted
     );
     assert_eq!(lab.peer_to_robot(&format!("{OTHER}:0"), 9000, b"x"), 3);
@@ -1030,7 +1199,7 @@ fn h1_guid_only_protected_entry_opens_no_hole() {
         ActionId::IsolateNetwork,
         Morphology::WheeledMobile,
     );
-    let out = e.submit(&o, &mut idle(), 1_000);
+    let out = submit(&mut e, &o, &mut idle(), 1_000);
     assert_eq!(out.status, Status::Verified, "{out:?}");
     assert_eq!(
         lab.peer_to_robot(&format!("{OTHER}:0"), 7500, &rtps(GUID)),
@@ -1069,7 +1238,7 @@ fn h2_quarantine_never_cuts_a_low_level_path() {
     )
     .unwrap();
     let q = order("q-h2", ActionId::QuarantineNode, Morphology::WheeledMobile);
-    let out = e.submit(&q, &mut idle(), 1_000);
+    let out = submit(&mut e, &q, &mut idle(), 1_000);
     assert_eq!(out.status, Status::Verified, "{out:?}");
     assert_eq!(
         lab.peer_to_robot(&format!("{MOTION}:7410"), 7410, &rtps(GUID)),
@@ -1118,7 +1287,10 @@ fn h3_isolation_keeps_dds_multicast_discovery() {
         ActionId::IsolateNetwork,
         Morphology::WheeledMobile,
     );
-    assert_eq!(e.submit(&o, &mut idle(), 1_000).status, Status::Verified);
+    assert_eq!(
+        submit(&mut e, &o, &mut idle(), 1_000).status,
+        Status::Verified
+    );
     let mc = |from: &str, src: &str, to: &str, ifaddr: &str, port: u16| {
         lab.exchange(
             to,
@@ -1213,7 +1385,10 @@ fn m6_forwarded_fragments_of_a_protected_flow_pass() {
         ActionId::IsolateNetwork,
         Morphology::WheeledMobile,
     );
-    assert_eq!(e.submit(&o, &mut idle(), 1_000).status, Status::Verified);
+    assert_eq!(
+        submit(&mut e, &o, &mut idle(), 1_000).status,
+        Status::Verified
+    );
     let routed = |from: &str, src: &str, to: &str, dst: &str, len: usize| {
         lab.exchange(
             to,
@@ -1276,7 +1451,10 @@ fn l5_isolation_keeps_dhcp_client_and_path_mtu_discovery() {
         ActionId::IsolateNetwork,
         Morphology::WheeledMobile,
     );
-    assert_eq!(e.submit(&o, &mut idle(), 1_000).status, Status::Verified);
+    assert_eq!(
+        submit(&mut e, &o, &mut idle(), 1_000).status,
+        Status::Verified
+    );
     assert_eq!(
         lab.peer_to_robot(&format!("{OTHER}:67"), 68, b"dhcp offer"),
         3,
@@ -1338,7 +1516,10 @@ fn l2_port_rules_match_the_direction() {
         ActionId::IsolateNetwork,
         Morphology::WheeledMobile,
     );
-    assert_eq!(e.submit(&o, &mut idle(), 1_000).status, Status::Verified);
+    assert_eq!(
+        submit(&mut e, &o, &mut idle(), 1_000).status,
+        Status::Verified
+    );
     assert_eq!(
         lab.peer_to_robot(&format!("{MGMT}:5000"), 9000, b"x"),
         0,
@@ -1385,10 +1566,13 @@ fn m3_operator_table_delete_is_not_undone_by_the_next_order() {
     let dir = lab.state_dir("m3");
     let mut e = open(&lab, &dir, "boot-1", Morphology::WheeledMobile, 1_000);
     let i = order("i-m3", ActionId::IsolateNetwork, Morphology::WheeledMobile);
-    assert_eq!(e.submit(&i, &mut idle(), 1_000).status, Status::Verified);
+    assert_eq!(
+        submit(&mut e, &i, &mut idle(), 1_000).status,
+        Status::Verified
+    );
     lab.nft_cmd(&["delete", "table", "inet", "robodr"]).unwrap();
     let q = order("q-m3", ActionId::QuarantineNode, Morphology::WheeledMobile);
-    let out = e.submit(&q, &mut idle(), 1_100);
+    let out = submit(&mut e, &q, &mut idle(), 1_100);
     assert_eq!(out.status, Status::Refused, "{out:?}");
     assert_eq!(out.refusal.unwrap().code, "operator_disabled");
     assert!(!nft::table_exists(&mut lab.nft()).unwrap());
@@ -1399,8 +1583,14 @@ fn m3_operator_table_delete_is_not_undone_by_the_next_order() {
     assert!(e.rearm("lab", 1_200).unwrap());
     let q2 = order("q-m3b", ActionId::QuarantineNode, Morphology::WheeledMobile);
     let i2 = order("i-m3b", ActionId::IsolateNetwork, Morphology::WheeledMobile);
-    assert_eq!(e.submit(&q2, &mut idle(), 1_300).status, Status::Verified);
-    assert_eq!(e.submit(&i2, &mut idle(), 1_300).status, Status::Verified);
+    assert_eq!(
+        submit(&mut e, &q2, &mut idle(), 1_300).status,
+        Status::Verified
+    );
+    assert_eq!(
+        submit(&mut e, &i2, &mut idle(), 1_300).status,
+        Status::Verified
+    );
     lab.nft_cmd(&["delete", "table", "inet", "robodr"]).unwrap();
     assert_eq!(
         e.revert("q-m3b", "lab", 1_400).status,
@@ -1419,7 +1609,10 @@ fn m4_failed_start_on_a_full_disk_leaves_no_rule() {
     let dir = t.0.clone();
     let mut e = open(&lab, &dir, "boot-1", Morphology::WheeledMobile, 1_000);
     let i = order("i-m4", ActionId::IsolateNetwork, Morphology::WheeledMobile);
-    assert_eq!(e.submit(&i, &mut idle(), 1_000).status, Status::Verified);
+    assert_eq!(
+        submit(&mut e, &i, &mut idle(), 1_000).status,
+        Status::Verified
+    );
     drop(e);
     t.fill();
     let r = Engine::open(
@@ -1446,7 +1639,10 @@ fn m5_revert_on_a_full_disk_is_not_reported_reverted() {
     let dir = t.0.clone();
     let mut e = open(&lab, &dir, "boot-1", Morphology::WheeledMobile, 1_000);
     let i = order("i-m5", ActionId::IsolateNetwork, Morphology::WheeledMobile);
-    assert_eq!(e.submit(&i, &mut idle(), 1_000).status, Status::Verified);
+    assert_eq!(
+        submit(&mut e, &i, &mut idle(), 1_000).status,
+        Status::Verified
+    );
     t.fill();
     let out = e.revert("i-m5", "lab", 2_000);
     assert_ne!(out.status, Status::Reverted, "{out:?}");
@@ -1510,7 +1706,12 @@ fn m4_binary_failed_start_and_stop_cleanup_leave_no_rule() {
         )
         .unwrap();
         let o = order(id, ActionId::IsolateNetwork, Morphology::WheeledMobile);
-        let out = e.submit(&o, &mut idle(), robodr_executor::engine::Now::system());
+        let out = submit(
+            &mut e,
+            &o,
+            &mut idle(),
+            robodr_executor::engine::Now::system(),
+        );
         assert_eq!(out.status, Status::Verified, "{out:?}");
         assert!(nft::table_exists(&mut lab.nft()).unwrap());
     };
@@ -1588,7 +1789,10 @@ fn l4_m3_rearm_through_the_protocol() {
     )
     .unwrap();
     let i = order("i-pr", ActionId::IsolateNetwork, Morphology::WheeledMobile);
-    assert_eq!(e.submit(&i, &mut idle(), now()).status, Status::Verified);
+    assert_eq!(
+        submit(&mut e, &i, &mut idle(), now()).status,
+        Status::Verified
+    );
     drop(e);
     // Reboot.
     lab.nft_cmd(&["delete", "table", "inet", "robodr"]).unwrap();
@@ -1644,7 +1848,10 @@ fn l4_m3_rearm_through_the_protocol() {
     assert!(client.health().unwrap().operator_disabled);
     assert!(client.rearm("lab").unwrap());
     assert!(!client.health().unwrap().operator_disabled);
-    let q2 = order("q-pr2", ActionId::QuarantineNode, Morphology::WheeledMobile);
+    let q2 = sign_at(
+        order("q-pr2", ActionId::QuarantineNode, Morphology::WheeledMobile),
+        robodr_executor::proto::wall_ms() / 1000,
+    );
     let out = client
         .submit(&q2, &mut || Ok((SafetyState::Idle, 2)))
         .unwrap();
@@ -1685,7 +1892,7 @@ fn ipv6_interface_and_example_renderings_read_back_exactly() {
     )
     .unwrap();
     let i = order("i-v6", ActionId::IsolateNetwork, Morphology::WheeledMobile);
-    let out = e.submit(&i, &mut idle(), 1_000);
+    let out = submit(&mut e, &i, &mut idle(), 1_000);
     assert_eq!(out.status, Status::Verified, "{out:?}");
     let mut q = order("q-v6", ActionId::QuarantineNode, Morphology::WheeledMobile);
     q.target = Target::Participant {
@@ -1697,7 +1904,7 @@ fn ipv6_interface_and_example_renderings_read_back_exactly() {
     };
     // Interface-only motion path entries cannot be proven: refused.
     assert_eq!(
-        e.submit(&q, &mut idle(), 1_000).refusal.unwrap().code,
+        submit(&mut e, &q, &mut idle(), 1_000).refusal.unwrap().code,
         codes::MOTION_PATH
     );
     let listed = nft::read_table(&mut lab.nft()).unwrap();
@@ -1723,6 +1930,11 @@ fn ipv6_interface_and_example_renderings_read_back_exactly() {
             serde_json::from_str(&std::fs::read_to_string(root.join(name)).unwrap()).unwrap();
         let d = lab.state_dir(name);
         v["state_dir"] = json!(d);
+        // The lab SOC's key in place of the example's path, and a robot key
+        // (another key: the example's robot key files do not exist here).
+        v["soc"]["keys"] = json!([soc_key_path()]);
+        v["soc"]["robot_keys"] = json!([robot_key_path()]);
+        v["robot_id"] = json!("lab-robot");
         let c = ExecutorConfig::parse(&v.to_string())
             .unwrap()
             .validate()
@@ -1736,7 +1948,7 @@ fn ipv6_interface_and_example_renderings_read_back_exactly() {
         )
         .unwrap();
         let i = order("i-ex", ActionId::IsolateNetwork, Morphology::WheeledMobile);
-        let out = e.submit(&i, &mut idle(), 1_000);
+        let out = submit(&mut e, &i, &mut idle(), 1_000);
         assert_eq!(out.status, Status::Verified, "{name}: {out:?}");
         assert_eq!(e.revert("i-ex", "lab", 2_000).status, Status::Reverted);
     }

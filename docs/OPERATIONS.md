@@ -1168,7 +1168,7 @@ sudo systemctl restart robodr-agentd
 
 | What | How |
 | --- | --- |
-| SOC signing key | add the new `.pub` to `soc_keys` (both listed), restart agentd; switch the SOC; remove the old one, restart |
+| SOC signing key | add the new `.pub` to `soc_keys` (both listed), restart agentd, and to `executor.json` `soc.keys` (re-read per order); switch the SOC; remove the old one from both, restart agentd |
 | SOC client certificate, same CA | issue the new certificate; with pins, add the new pin to `client_spki_sha256` first (both listed), restart; switch the SOC; remove the old pin |
 | SOC client CA | append the new CA certificate to `client_ca` (PEM bundle with both), restart; reissue the SOC certificate; remove the old CA, restart |
 | Robot TLS certificate / key | install the new `robot.pem` and key (same paths), restart agentd; if the SOC pins the robot's SPKI, give it the new pin first (`openssl x509 -pubkey ...` as above) |
@@ -1492,6 +1492,24 @@ table.
      and 7401). List your `ROS_DOMAIN_ID`s.
    * `ttl.default_s` / `ttl.max_s`: every executed action is lifted at its
      TTL.
+   * `soc.keys`: the SOC public key files, the **same** files as agentd's
+     `control_plane.soc_keys` (root-owned, `0644`). The executor verifies
+     every SOC approval itself with them (trust boundary M1): without
+     them every control-plane order is refused (`soc_signature_invalid`).
+     Rotate them together with agentd's. Keep `soc.max_clock_skew_s`
+     (default 30) at least agentd's `max_clock_skew_s`. One key file the
+     executor cannot read or refuses blocks **every** control-plane order
+     (`soc_keys_unavailable`, the start log names the file). Reverts of a
+     SOC-approved action need the SOC's signed revert request (agentd
+     forwards it; unsigned reverts are refused, the action stays).
+   * `soc.robot_keys`: the robot's own public keys (the black-box and
+     finding keys' public halves, e.g. `robodr-blackbox keygen` public
+     files): never accepted as SOC keys.
+   * `network.quarantine.cidrs`: the networks where a participant may be
+     quarantined (its SPDP locators must be there, on the robot's DDS
+     ports); empty refuses every quarantine (`locator_out_of_scope`).
+   * `require_approval_for_all_containment: true` makes every containment
+     wait for the SOC (the on-robot planner's orders are refused).
 4. Check the configuration:
    `robodr-executor --config /etc/robodr/executor.json --check-config`.
    The running executor re-reads the configuration and the response
@@ -1621,6 +1639,20 @@ primary.
 5. `systemctl enable --now robodr-firewall-gw-rules.service robodr-firewall-gw.service`.
    The rules unit runs before `network-pre.target` at boot, so no motion
    datagram crosses the bridge before the queue exists.
+6. **Check the DDS ports.** The status file's `port_bypass_risk` (and a
+   one-time WARNING in the journal) is set when discovery announces a
+   locator outside the queued port ranges: RTPS to that port crosses the
+   bridge unchecked. Add the ports to `rtps.extra_port_ranges`, re-render
+   and re-apply the ruleset (step 4), or pin the DDS ports; repeat until
+   the flag stays false while the controller and robot run. The check
+   covers the controller's discovery (queued) and the robot's own SPDP /
+   SEDP (an NFLOG copy, never queued; `observe.enabled`, default): the
+   status shows `observe_unavailable: true` if the copy could not be set
+   up (load `nfnetlink_log`). **Commissioning capture (required):** record
+   both bridge ports with `tcpdump ... udp` through a full robot and
+   controller start-up and confirm every port either side receives RTPS on
+   is in a queued range; the check only sees discovery while the gateway
+   runs.
 
 **Run observe first.** With `"mode": "observe"` every datagram is forwarded
 unchanged while the decisions are made and recorded (`events_path`,
@@ -1648,6 +1680,10 @@ lines, size-capped by `events_max_bytes`). Watch in particular:
 | `binding_conflicts` > 0 | the motion writer's GUID arrived from another source IP / MAC than the controller's stream: a spoofer on the controller segment (or a second NIC sending the controller's traffic) |
 | `sn_jumps` > 0 | a sequence-number jump past `rtps.max_sn_jump` was held back: lost frames between controller and gateway, or a spoofed far-future number |
 | `writer_restarts` | a writer restarted with its old GUID (announced by SEDP); expected only when the controller software restarts |
+| `arm_weight_step_rejected`, `arm_weight_rate_rejected`, `arm_engage_rejected` | an arm-SDK blend weight that jumped, moved too fast, or rose from 0 with targets away from where `rt/lowstate` says the arms are (the arms were held): a controller that engages faster than the channel allows, or an attack |
+| `hand_mode_rejected` | a hand frame with a mode octet the SDK never sends (another motor id, another status) or a hand-SDK weight jump |
+| `velocity_expired` | a loco `SetVelocity` ended (the robot stopped on its own): informational |
+| `observe_unavailable`, `observe_overruns` | robot-side observation is off (no `rt/lowstate`, no robot-side locator check) / copies lost under load |
 | `unknown_undecidable` > 0 | a fragmented / key-only / non-standard sample from a writer the gateway never saw announced was removed: a discovery path around the bridge, a missing `rtps.state_file`, or an attack |
 | `non_motor_rejected` > 0 | a `LowCmd_` asked to turn the battery off (`bms_cmd.off`) and was replaced by the substitute: investigate the sender |
 | firewall `joint_holds_exceeded` | a humanoid has been held past `max_hold_ns`: escalate (the gateway keeps holding) |

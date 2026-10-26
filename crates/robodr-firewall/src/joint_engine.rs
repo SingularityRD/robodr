@@ -29,7 +29,7 @@
 //! | 8 | slots | `kp > 0`, `q_prev` known, `kp·\|q − q_prev\|` > `f·tau_pd_max` | Reject `JointPdTorqueOutOfEnvelope` | yes |
 //! | 9 | clamp | gain > max, `\|tau\|` > max, `\|dq\|` > max, `q` outside range | Limit (clamp the field) | — |
 //! | 9 | clamp | `\|q − q_prev\|` > `max_dq_step` or `kp·\|q − q_prev\|` > `tau_pd_max` | Limit (step `q` from `q_prev` toward it) | — |
-//! | 10 | limp | humanoid: every enabled slot limp (`kp = kd = 0` or mode off) | Reject `JointLimpFrame` | yes |
+//! | 10 | limp | humanoid, `balance_critical` channel (default): every enabled slot limp (`kp = kd = 0` or mode off) | Reject `JointLimpFrame` | yes |
 //! | 11 | post | output not finite / outside the envelope (a bug) | per [`crate::FaultPolicy`] (humanoid: hold) | — |
 //! | — | gap | accepted `> max_interval` after the previous one | event `joint_rate_violation` only | — |
 //!
@@ -267,7 +267,7 @@ fn pins_ok(ch: &CompiledJointChannel, f: &JointFrame) -> bool {
 fn frame_ok(ch: &CompiledJointChannel, f: &JointFrame, q_prev: &[f64; MAX_MOTORS]) -> bool {
     f.slots() == ch.slots
         && pins_ok(ch, f)
-        && !(ch.humanoid && all_limp(ch, f))
+        && !(ch.humanoid && ch.balance_critical && all_limp(ch, f))
         && f.motors()
             .iter()
             .zip(ch.motors.iter())
@@ -648,8 +648,9 @@ impl Firewall {
             }
         }
 
-        // 10. Humanoid: a frame that makes every enabled joint limp.
-        if ch.humanoid && all_limp(ch, &out) {
+        // 10. Humanoid: a frame that makes every enabled joint limp (only
+        //     on a balance-critical channel: a hand may be released).
+        if ch.humanoid && ch.balance_critical && all_limp(ch, &out) {
             return Err(JRejection::new(RejectReason::JointLimpFrame));
         }
 

@@ -261,7 +261,35 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Trust boundary M1: the SOC keys the executor verifies approvals with
+    // (re-read before every order; a start never fails on them, reverts and
+    // TTL expiry must keep working).
+    let soc_keys = robodr_executor::soc::load_keys_checked(
+        &cfg.config.soc.keys,
+        &cfg.config.soc.robot_keys,
+        &cfg.config.robot_id,
+    );
+    match &soc_keys {
+        Err(e) => {
+            eprintln!(
+                "robodr-executor: soc.keys: {e}: every control-plane order is refused \
+                 (soc_keys_unavailable)"
+            );
+            if a.check {
+                return ExitCode::from(2);
+            }
+        }
+        Ok(k) if k.is_empty() => eprintln!(
+            "robodr-executor: soc.keys is empty: no SOC approval can be verified, every \
+             control-plane order is refused (soc_signature_invalid)"
+        ),
+        Ok(_) => {}
+    }
     if a.check {
+        println!(
+            "robodr-executor: {} SOC key(s) for approvals",
+            soc_keys.map(|k| k.len()).unwrap_or(0)
+        );
         println!(
             "robodr-executor: configuration ok (robot {}, morphology {}, policy {}validated, \
              {} management / {} uplink / {} control-bus entries, {} motion-path entries)",

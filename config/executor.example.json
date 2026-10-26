@@ -24,9 +24,16 @@
     "motion_control_path": [
       {"cidr": "192.168.10.0/24", "udp_ports": [7400, 7600], "note": "ROS 2 / DDS between the navigation and base controllers (illustrative)"}
     ],
-    "discovery": {"multicast_groups": ["239.255.0.1"], "domains": [0]}
+    "discovery": {"multicast_groups": ["239.255.0.1"], "domains": [0]},
+    "quarantine": {"cidrs": ["192.168.10.0/24"]}
   },
   "ttl": {"default_s": 900, "max_s": 86400},
   "max_safety_age_ms": 500,
-  "verify_interval_s": 10
+  "verify_interval_s": 10,
+  "soc": {
+    "keys": ["/etc/robodr/soc/soc.pub"],
+    "max_clock_skew_s": 30,
+    "robot_keys": ["/etc/robodr/keys/blackbox.pub", "/etc/robodr/keys/finding.pub"]
+  },
+  "require_approval_for_all_containment": false
 }

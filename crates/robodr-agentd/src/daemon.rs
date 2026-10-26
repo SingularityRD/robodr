@@ -2515,14 +2515,14 @@ impl Daemon<'_> {
                         link.count_dropped();
                     }
                 }
-                Staged::Revert { id, reason } => {
+                Staged::Revert { id, reason, soc } => {
                     let recorded = self
                         .control
                         .as_ref()
                         .and_then(|c| c.engine.get(&id))
                         .is_some_and(|s| s.revert.is_some());
                     if recorded {
-                        link.dispatch(Staged::Revert { id, reason });
+                        link.dispatch(Staged::Revert { id, reason, soc });
                     } else {
                         link.count_dropped();
                     }

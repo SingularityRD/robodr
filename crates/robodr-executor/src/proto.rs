@@ -20,7 +20,7 @@
 //! agentd → safety{state,age}  executor → outcome{...}
 //! agentd → events{since}      [executor → confirm{"rearm"} → agentd safety{..}, only while
 //!                              actions are held after a reboot]   executor → event_list
-//! agentd → revert / status / ping   executor → outcome / pong
+//! agentd → revert{id,reason,soc?} / status / ping   executor → outcome / pong
 //! operator (CLI) → rearm{reason}    executor → rearmed{was_disabled}
 //! ```
 //!
@@ -44,7 +44,8 @@ use crate::order::Order;
 
 pub const VERSION: &str = "robodr-executor/1";
 /// Longest envelope line.
-pub const MAX_LINE: usize = 64 * 1024;
+/// (128 KiB: an order carries the SOC's signed request, body up to 16 KiB.)
+pub const MAX_LINE: usize = 128 * 1024;
 /// Allowed clock difference between the two processes (same host).
 pub const MAX_SKEW_MS: u64 = 30_000;
 /// Nonces remembered.
@@ -71,6 +72,10 @@ pub enum Msg {
     Revert {
         id: String,
         reason: String,
+        /// The SOC's signed revert request (control-plane reverts; review
+        /// finding F3): required to lift an action the SOC approved.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        soc: Option<Box<crate::soc::SocRequest>>,
     },
     Status {
         id: String,

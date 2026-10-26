@@ -117,10 +117,23 @@ impl Client {
         self.recv(c, n)
     }
 
+    /// An unsigned revert (planner actions; a SOC-approved action answers
+    /// with a `soc_signature_invalid` refusal and stays in force).
     pub fn revert(&self, id: &str, reason: &str) -> Result<Outcome, String> {
+        self.revert_signed(id, reason, None)
+    }
+
+    /// A revert with the SOC's signed revert request (review finding F3).
+    pub fn revert_signed(
+        &self,
+        id: &str,
+        reason: &str,
+        soc: Option<&crate::soc::SocRequest>,
+    ) -> Result<Outcome, String> {
         match self.call(&Msg::Revert {
             id: id.into(),
             reason: reason.into(),
+            soc: soc.map(|s| Box::new(s.clone())),
         })? {
             Msg::Outcome { outcome } => Ok(*outcome),
             _ => Err("unexpected executor answer".into()),

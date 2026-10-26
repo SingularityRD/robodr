@@ -7,7 +7,7 @@
 //! | `isolate_network` | [`nft`] | drops all traffic except loopback, the management / uplink allow-list, the control buses (configurable), the motion control path, the robot's DDS discovery, DHCP, path MTU and IPv6 neighbour discovery | exact inverse (re-render without it) | always (default `ttl.default_s`) |
 //! | `quarantine_node` | [`nft`] | drops RTPS from the participant's GUID prefix (raw payload match) and UDP to / from its SPDP locators (required, provably outside the motion control path; that path is accepted before any drop) | exact inverse | always |
 //! | `record_evidence` | [`evidence`] (in agentd) | signed black-box mark naming the evidence bundle | not applicable | none |
-//! | `restrict_motion` | none in v1 | recorded as advisory to the Motion Firewall (no gateway yet) | — | — |
+//! | `restrict_motion` | none in v1 | recorded as advisory (the executor does not drive the separate `robodr-firewall-gw` unit) | — | — |
 //! | `safe_pause`, `request_safe_state`, `rollback_config` | none | refused (`not_executor_action`) | — | — |
 //!
 //! Every adapter follows precheck ([`decision::precheck`], against the
@@ -17,6 +17,11 @@
 //! a persisted deadline (CLOCK_BOOTTIME within a boot, [`journal`]) and
 //! reconciliation at restart ([`engine::Engine::open`]; after a reboot an
 //! action is re-validated and held until a fresh safety check).
+//!
+//! The executor verifies a SOC approval itself ([`soc`], trust boundary
+//! M1): agentd forwards the SOC's signed control-plane request with each
+//! order, and `human_approved` holds only when that signature verifies with
+//! the executor's own SOC keys and the order is the signed one.
 //!
 //! agentd talks to the executor over a unix socket with an authenticated
 //! protocol ([`proto`], [`client`], [`server`]); agentd itself holds no
@@ -56,6 +61,7 @@ pub mod nft;
 pub mod order;
 pub mod proto;
 pub mod server;
+pub mod soc;
 
 pub use config::{ExecutorConfig, Resolved};
 pub use decision::{precheck, recheck_safety, Current, Effect, Planned, Refusal};

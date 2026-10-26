@@ -595,3 +595,323 @@ fn spoofed_future_sequence_number_does_not_stop_the_stream() {
     let _ = std::fs::remove_file(&script_path);
     drop(topo);
 }
+
+/// The channels added after S8 through the real kernel path: a G1 with
+/// `/lowcmd`, `rt/arm_sdk`, loco on `rt/api/sport/request`, a Dex3 hand, the
+/// hand SDK and a ROS 2 `/cmd_vel`, plus an extra queued port range
+/// (non-default DDS ports). A too-fast `SetVelocity` arrives limited and
+/// with its duration capped, `Damp` arrives as a PAD (the humanoid never
+/// goes limp), `Start` byte-identical, an SDK-style arm frame (mode 0 +
+/// gains) byte-identical, an out-of-envelope hand frame as a PAD, a
+/// too-fast twist limited; a `Damp` to a port in `rtps.extra_port_ranges`
+/// is decided, one to a port outside every range is not (the bypass the
+/// warning is for), and an SEDP reader of `rt/lowcmd` announcing that port
+/// sets the status flag `port_bypass_risk`.
+#[test]
+#[ignore = "needs root, network namespaces, iptables + nft and nfnetlink_queue; run with --ignored"]
+fn new_channels_and_extra_ports_end_to_end() {
+    use robodr_cdr::unitree::{ApiService, UnitreeModel};
+    use robodr_cdr::ApiCall;
+    use robodr_firewall_gw::config::Codec;
+    use robodr_firewall_gw::{hand, ros2, sport};
+
+    let topo = Topology::new('n', false);
+    let status =
+        std::env::temp_dir().join(format!("robodr-gw-e2e-status-{}.json", std::process::id()));
+    let mut cfg = g1_channels_config(|v| {
+        v["rtps"] = serde_json::json!({"extra_port_ranges": [[30000, 30100]]});
+        // `Start` needs the allowlist (F10 e); the arm stream may engage in
+        // one frame (the SDK example) when `rt/lowstate` agrees (F1).
+        v["channels"][2]["allowed_fsm_ids"] = serde_json::json!([500]);
+        v["channels"][1]["max_weight_step"] = serde_json::json!(1.0);
+        v["channels"][1]["max_weight_rate_per_s"] = serde_json::json!(1000.0);
+    });
+    cfg.queue.num = 9;
+    cfg.queue.controller_port = topo.ctrl_port.clone();
+    cfg.queue.robot_port = topo.rob_port.clone();
+    cfg.housekeeping_ms = 50;
+    cfg.status_path = Some(status.clone());
+    cfg.observe.nflog_group = 4100 + (std::process::id() % 1000) as u16;
+    let script = ruleset::render(&cfg, "netns_e2e");
+    assert!(script.contains("--dport 30000:30100 -j NFQUEUE"));
+    assert!(script.contains("-j NFLOG --nflog-group"));
+    let script_path =
+        std::env::temp_dir().join(format!("robodr-gw-e2e-n-{}.sh", std::process::id()));
+    std::fs::write(&script_path, &script).unwrap();
+    sh(&format!(
+        "ip netns exec {} sh {}",
+        topo.gw,
+        script_path.display()
+    ));
+
+    const EXTRA: u16 = 30050;
+    const OUTSIDE: u16 = 31000;
+    let stop_rx = Arc::new(AtomicBool::new(false));
+    let (tx_rx, rx_rx) = mpsc::channel::<(u16, Vec<u8>)>();
+    let rob = topo.rob.clone();
+    let s2 = stop_rx.clone();
+    let receiver = std::thread::spawn(move || {
+        enter(&rob);
+        let socks: Vec<(u16, UdpSocket)> = [DDS_PORT, EXTRA, OUTSIDE]
+            .into_iter()
+            .map(|p| {
+                let s = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, p)).unwrap();
+                s.set_read_timeout(Some(Duration::from_millis(5))).unwrap();
+                (p, s)
+            })
+            .collect();
+        let mut buf = vec![0u8; 65_536];
+        while !s2.load(Ordering::SeqCst) {
+            for (p, s) in &socks {
+                if let Ok((n, _)) = s.recv_from(&mut buf) {
+                    let _ = tx_rx.send((*p, buf[..n].to_vec()));
+                }
+            }
+        }
+    });
+    let stop_gw = Arc::new(AtomicBool::new(false));
+    let gwns = topo.gw.clone();
+    let s3 = stop_gw.clone();
+    let gcfg = cfg.clone();
+    let gw_thread = std::thread::spawn(move || {
+        enter(&gwns);
+        let mut gw = Gateway::new(&gcfg, &g1_channels_profile(), &g1_channels_firewall()).unwrap();
+        let opts = RunOptions {
+            max_packets: None,
+            max_duration: Some(Duration::from_secs(60)),
+        };
+        let r = runtime::run(&gcfg, &mut gw, opts, &|| s3.load(Ordering::SeqCst));
+        (r, gw.stats)
+    });
+    std::thread::sleep(Duration::from_millis(500));
+
+    enter(&topo.ctrl);
+    let tx = UdpSocket::bind(SocketAddrV4::new(CONTROLLER_IP, 0)).unwrap();
+    let send = |port: u16, d: &[u8]| {
+        tx.send_to(d, SocketAddrV4::new(ROBOT_IP, port)).unwrap();
+    };
+    let one = |port: u16| -> Vec<u8> {
+        let until = Instant::now() + Duration::from_millis(300);
+        let mut got = Vec::new();
+        while Instant::now() < until {
+            if let Ok((p, d)) = rx_rx.recv_timeout(Duration::from_millis(10)) {
+                assert_eq!(p, port, "arrived on the port it was sent to");
+                got.push(d);
+            }
+        }
+        assert_eq!(got.len(), 1, "exactly one datagram on {port}");
+        got.remove(0)
+    };
+    let payload = |d: &[u8]| -> Option<Vec<u8>> {
+        let mut v = Vec::new();
+        rtps::walk(d, WalkOptions::default(), &mut v).ok()?;
+        let s = v.iter().find(|s| s.content == Content::Data)?;
+        Some(d[s.payload.clone()?].to_vec())
+    };
+    // Classify every writer (SEDP crosses the bridge, queued and learned).
+    for (w, topic, ty) in [
+        (ARM_WRITER, "rt/arm_sdk", "unitree_hg::msg::dds_::LowCmd_"),
+        (
+            LOCO_WRITER,
+            "rt/api/sport/request",
+            "unitree_api::msg::dds_::Request_",
+        ),
+        (
+            DEX3_WRITER,
+            "rt/dex3/left/cmd",
+            "unitree_hg::msg::dds_::HandCmd_",
+        ),
+        (
+            TWIST_WRITER,
+            "rt/cmd_vel",
+            "geometry_msgs::msg::dds_::Twist_",
+        ),
+    ] {
+        send(7410, &sedp_datagram(PREFIX, w, topic, ty));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let req = |id: i64, p: &str| sport::encode_request(Representation::CdrLe, 1, id, p);
+    let call = |p: &[u8]| {
+        sport::decode_strict_for(p, ApiService::Sport, Some(UnitreeModel::G1))
+            .unwrap()
+            .call
+    };
+
+    // Loco: too fast and continuous → limited, duration 1 s.
+    let d = data_datagram(
+        LOCO_WRITER,
+        1,
+        &req(7105, "{\"duration\":864000.0,\"velocity\":[2.5,0.0,0.0]}"),
+    );
+    send(DDS_PORT, &d);
+    let got = one(DDS_PORT);
+    assert_eq!(got.len(), d.len());
+    match call(&payload(&got).expect("limited, not removed")) {
+        ApiCall::SetVelocity { vx, duration, .. } => {
+            assert!(vx <= TWIST_MAX_LIN && duration <= 1.0, "{vx} {duration}");
+        }
+        c => panic!("{c:?}"),
+    }
+    std::thread::sleep(Duration::from_millis(30));
+    // Damp: removed. Start: byte-identical.
+    send(
+        DDS_PORT,
+        &data_datagram(LOCO_WRITER, 2, &req(7101, "{\"data\":1}")),
+    );
+    assert!(
+        payload(&one(DDS_PORT)).is_none(),
+        "Damp never reaches the robot"
+    );
+    std::thread::sleep(Duration::from_millis(30));
+    let start = data_datagram(LOCO_WRITER, 3, &req(7101, "{\"data\":500}"));
+    send(DDS_PORT, &start);
+    assert_eq!(one(DDS_PORT), start, "Start byte-identical");
+
+    // Arm SDK (mode 0 + gains, weight 1 at once, SDK style): without the
+    // robot's joint state the engagement cannot be verified → removed.
+    let arm = |sn| {
+        data_datagram(
+            ARM_WRITER,
+            sn,
+            &lowcmd::encode_payload(&arm_frame(1.0, 0.0), Representation::CdrLe),
+        )
+    };
+    send(DDS_PORT, &arm(1));
+    assert!(
+        payload(&one(DDS_PORT)).is_none(),
+        "arm engagement without rt/lowstate removed"
+    );
+    // The robot publishes rt/lowstate (500 Hz, fragmented like Cyclone's
+    // 2 KB `LowState_`) with its arms where the frame's targets are, and
+    // announces a reader of rt/lowcmd at a port no rule queues. The gateway
+    // sees both only as NFLOG copies.
+    let stop_ls = Arc::new(AtomicBool::new(false));
+    let s4 = stop_ls.clone();
+    let robns = topo.rob.clone();
+    let target = arm_frame(1.0, 0.0);
+    let q: Vec<f32> = (0..35)
+        .map(|i| target.motor(i).map_or(0.0, |m| m.q))
+        .collect();
+    let ls_thread = std::thread::spawn(move || {
+        enter(&robns);
+        let s = UdpSocket::bind(SocketAddrV4::new(ROBOT_IP, 0)).unwrap();
+        let to = SocketAddrV4::new(CONTROLLER_IP, 7411);
+        let reader = sedp_with_locator(
+            ROBOT_PREFIX,
+            [0, 0, 0x11, 0x04],
+            "rt/lowcmd",
+            "unitree_hg::msg::dds_::LowCmd_",
+            true,
+            ROBOT_IP,
+            45999,
+        );
+        s.send_to(&reader, SocketAddrV4::new(CONTROLLER_IP, 7410))
+            .unwrap();
+        let mut sn = 0;
+        while !s4.load(Ordering::SeqCst) {
+            sn += 1;
+            for d in lowstate_datagram(sn, &q, Some(1024)) {
+                let _ = s.send_to(&d, to);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    let a2 = arm(2);
+    send(DDS_PORT, &a2);
+    assert_eq!(
+        one(DDS_PORT),
+        a2,
+        "arm frame byte-identical (engagement verified)"
+    );
+
+    // Dex3: out of the finger envelope → removed.
+    let fingers: Vec<_> = (0..DEX3_MOTORS)
+        .map(|i| ((i as u8) | 0x10, 3.0f32, 0.0, 0.0, 2.0, 0.1))
+        .collect();
+    send(
+        DDS_PORT,
+        &data_datagram(
+            DEX3_WRITER,
+            1,
+            &hand::encode(Codec::UnitreeDex3HandCmd, &fingers),
+        ),
+    );
+    assert!(payload(&one(DDS_PORT)).is_none(), "hand frame removed");
+
+    // ROS 2 twist: limited in place.
+    send(
+        DDS_PORT,
+        &data_datagram(
+            TWIST_WRITER,
+            1,
+            &ros2::encode([2.0, 0.0, 0.0, 0.0, 0.0, 0.0], None, false),
+        ),
+    );
+    let w = ros2::decode_strict(&payload(&one(DDS_PORT)).unwrap(), false).unwrap();
+    assert!(w.values[0] <= TWIST_MAX_LIN, "{:?}", w.values);
+
+    // Extra port range: decided. Outside every range: not queued.
+    std::thread::sleep(Duration::from_millis(30));
+    send(
+        EXTRA,
+        &data_datagram(LOCO_WRITER, 4, &req(7101, "{\"data\":0}")),
+    );
+    assert!(
+        payload(&one(EXTRA)).is_none(),
+        "ZeroTorque on an extra port removed"
+    );
+    let around = data_datagram(LOCO_WRITER, 5, &req(7101, "{\"data\":0}"));
+    send(OUTSIDE, &around);
+    assert_eq!(
+        one(OUTSIDE),
+        around,
+        "a port outside every queued range bypasses the gateway"
+    );
+    // ... which the deployment check reports when discovery shows it.
+    send(
+        7410,
+        &sedp_with_locator(
+            [9; 12],
+            [0, 0, 1, 4],
+            "rt/lowcmd",
+            "unitree_hg::msg::dds_::LowCmd_",
+            true,
+            ROBOT_IP,
+            u32::from(OUTSIDE),
+        ),
+    );
+    let until = Instant::now() + Duration::from_secs(3);
+    let mut flagged = false;
+    while Instant::now() < until && !flagged {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(t) = std::fs::read_to_string(&status) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
+                flagged = v["port_bypass_risk"] == true
+                    && v["discovery"]["unqueued_locators"].as_u64() >= Some(1);
+            }
+        }
+    }
+    assert!(flagged, "status flag port_bypass_risk set");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&status).unwrap()).unwrap();
+    assert!(
+        v["discovery"]["robot_unqueued_locators"].as_u64() >= Some(1),
+        "robot-side reader flagged: {v}"
+    );
+    assert!(v["observer"]["lowstate_samples"].as_u64() >= Some(1), "{v}");
+    assert_eq!(v["observe_unavailable"], false);
+    stop_ls.store(true, Ordering::SeqCst);
+    ls_thread.join().unwrap();
+
+    stop_gw.store(true, Ordering::SeqCst);
+    let (r, stats) = gw_thread.join().unwrap();
+    r.expect("gateway run loop");
+    println!("new-channels e2e gateway stats: {stats:?}");
+    assert!(stats.loco_refused >= 2 && stats.duration_capped >= 1 && stats.hand_suppressed >= 1);
+    stop_rx.store(true, Ordering::SeqCst);
+    receiver.join().unwrap();
+    let _ = std::fs::remove_file(&script_path);
+    let _ = std::fs::remove_file(&status);
+    drop(topo);
+}

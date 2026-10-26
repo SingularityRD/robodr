@@ -406,6 +406,73 @@ impl Firewall {
         self.fault(cmd, now)
     }
 
+    /// Source, rate and timestamp check of a request that commands **no
+    /// motion** on a twist channel (a query, an allowlisted non-velocity
+    /// call): stages 0-6 of [`Self::check`] for `cmd` (its motion should be
+    /// a zero twist), with the channel's **motion state left as it was**
+    /// (last output, acceleration, hold value): such a request says nothing
+    /// about the robot's velocity, so it must neither reset the reference
+    /// the next velocity command is ramped from nor count as a stop.
+    /// Accepted: the (channel, source) rate credit and stamp are stored,
+    /// `true`. Refused: the rejection event is recorded (no substitute:
+    /// the request carries none), `false`. Observe mode: recorded as
+    /// would-have, `true`.
+    pub fn check_access(&mut self, cmd: &Command, now: u64) -> bool {
+        self.stats.checked = self.stats.checked.saturating_add(1);
+        let ch_idx = usize::from(cmd.channel.0);
+        match self.evaluate(cmd, now, ch_idx) {
+            Ok(acc) => {
+                if let Some(p) = self.pairs.get_mut(acc.pair_idx) {
+                    *p = acc.pair_new;
+                }
+                self.stats.passed = self.stats.passed.saturating_add(1);
+                true
+            }
+            Err(rej) => {
+                let (rule, sev) = reject_rule(rej.reason);
+                if self.observe {
+                    self.push_event(
+                        rule,
+                        sev,
+                        cmd,
+                        now,
+                        EventAction::ObservedOnly,
+                        rej.value,
+                        rej.limit,
+                    );
+                    self.stats.passed = self.stats.passed.saturating_add(1);
+                    self.stats.would_have = self.stats.would_have.saturating_add(1);
+                    return true;
+                }
+                self.push_event(
+                    rule,
+                    sev,
+                    cmd,
+                    now,
+                    EventAction::Rejected(None),
+                    rej.value,
+                    rej.limit,
+                );
+                self.stats.rejected = self.stats.rejected.saturating_add(1);
+                false
+            }
+        }
+    }
+
+    /// The platform is known to be at rest on twist channel `channel` as of
+    /// `now` (a velocity command whose duration ended: the robot stopped on
+    /// its own). The next command is acceleration limited from zero, and a
+    /// hold can no longer hold the earlier velocity. No-op for an unknown
+    /// channel.
+    pub fn twist_at_rest(&mut self, channel: ChannelId, now: u64) {
+        if let Some(st) = self.chans.get_mut(usize::from(channel.0)) {
+            st.last_out = ZERO_RAW;
+            st.last_out_at = Some(now);
+            st.a_prev = [0.0; 2];
+            st.accepted = None;
+        }
+    }
+
     /// Check one command. Never allocates, never panics, bounded time.
     ///
     /// `now` is the gateway's monotonic clock in nanoseconds, in the same

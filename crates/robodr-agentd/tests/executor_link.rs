@@ -319,9 +319,13 @@ fn start_executor(dir: &Path, sock: &Path, policy: &Path, model: &Model) -> Exec
                 "management": [{"cidr": "10.20.0.0/24"}],
                 "motion_control_path": [
                     {"cidr": "192.168.123.0/24", "guid_prefix": PROTECTED_GUID, "low_level": true}
-                ]
+                ],
+                // Executor review F4: where a quarantine may act.
+                "quarantine": {"cidrs": ["10.0.0.0/24"]}
             },
-            "max_safety_age_ms": 2000
+            "max_safety_age_ms": 2000,
+            // Executor M1: its own copy of the SOC's public key.
+            "soc": {"keys": [write_soc_pub(dir)]}
         })
         .to_string(),
     )
@@ -359,6 +363,9 @@ fn start_executor(dir: &Path, sock: &Path, policy: &Path, model: &Model) -> Exec
 
 fn write_soc_pub(dir: &Path) -> PathBuf {
     let p = dir.join("soc.pub");
+    if p.exists() {
+        return p;
+    }
     KeyFile::ed25519_from_seed(&SOC_SEED, Some(SOC_ID))
         .unwrap()
         .to_public()
@@ -578,7 +585,7 @@ fn accepted_requests_are_executed_verified_and_reverted_through_the_executor() {
     assert_eq!(marks.len(), 1);
     assert_eq!(marks[0]["bundle"][0], req_evidence.as_str());
 
-    // restrict_motion: advisory only (no gateway in v1).
+    // restrict_motion: advisory only (the executor does not drive the gateway).
     submit(
         ux,
         "m-1",

@@ -391,6 +391,9 @@ pub enum Undecidable {
     NonCanonical,
     /// More than 3 octets, or non-zero octets, after the message.
     Trailing,
+    /// A mode / weight octet outside what the SDK sends (hand channels:
+    /// `crate::hand`).
+    Mode,
 }
 
 impl Undecidable {
@@ -399,6 +402,7 @@ impl Undecidable {
             Undecidable::Decode => "decode",
             Undecidable::NonCanonical => "non_canonical",
             Undecidable::Trailing => "trailing_bytes",
+            Undecidable::Mode => "mode",
         }
     }
 }

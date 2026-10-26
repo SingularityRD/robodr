@@ -1095,6 +1095,64 @@ fn shipped_gateway_examples_build() {
     }
 }
 
+/// The shipped examples with the channels added after S8 (G1: arm SDK,
+/// loco, Dex3, arm actions; Go2: sport, ROS 2 twist), each against its
+/// firewall example and a locked profile listing its channels.
+#[test]
+fn shipped_channel_examples_build() {
+    for (gw_name, fw_name) in [
+        (
+            "firewall-gw.unitree-g1.channels.example.json",
+            "firewall.unitree-g1.channels.example.json",
+        ),
+        (
+            "firewall-gw.unitree-go2.channels.example.json",
+            "firewall.unitree-go2.channels.example.json",
+        ),
+    ] {
+        let text = std::fs::read_to_string(config_dir().join(gw_name)).unwrap();
+        let cfg = robodr_firewall_gw::GatewayConfig::from_json(&text)
+            .unwrap_or_else(|e| panic!("{gw_name}: {e}"));
+        let fw = example_firewall(fw_name);
+        let mut profile = robodr_events::profile::Profile {
+            model: "unitree-example".into(),
+            locked: true,
+            ..Default::default()
+        };
+        profile
+            .participants
+            .insert("0123456789abcdef01234567".into());
+        for name in fw.channels.keys() {
+            profile.writer_topics.insert(name.clone());
+            profile.motion_envelopes.insert(
+                name.clone(),
+                robodr_events::profile::Envelope {
+                    max_linear_speed: Some(1.5),
+                    ..Default::default()
+                },
+            );
+        }
+        for name in fw.joint_channels.keys() {
+            profile.writer_topics.insert(name.clone());
+            profile.motion_envelopes.insert(
+                name.clone(),
+                robodr_events::profile::Envelope {
+                    max_joint_speed: Some(40.0),
+                    ..Default::default()
+                },
+            );
+        }
+        let gw = Gateway::new(&cfg, &profile, &fw).unwrap_or_else(|e| panic!("{gw_name}: {e}"));
+        assert_eq!(gw.mode(), GatewayMode::Enforce);
+        assert!(
+            cfg.channels.iter().all(|c| c.note.is_some()),
+            "{gw_name}: every channel explained"
+        );
+        let script = robodr_firewall_gw::ruleset::render(&cfg, gw_name);
+        assert!(script.contains("-j NFLOG --nflog-group 4174"));
+    }
+}
+
 #[test]
 fn foreign_flood_does_not_evict_the_authorised_writers_state() {
     let fx = Fixture::G1;

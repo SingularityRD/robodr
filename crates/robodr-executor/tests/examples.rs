@@ -57,6 +57,57 @@ fn order(action: ActionId, p: &ResponsePolicy, target: Target) -> Order {
             requested_by: "analyst".into(),
         },
         issued_ms: 0,
+        soc: None,
+    }
+}
+
+/// Both examples name the SOC's public key (trust boundary M1): the same
+/// file as agentd's `control_plane.soc_keys`.
+#[test]
+fn examples_name_the_soc_keys() {
+    for name in ["executor.example.json", "executor.unitree-g1.example.json"] {
+        let c = example(name);
+        assert_eq!(
+            c.config.soc.keys,
+            vec![PathBuf::from("/etc/robodr/soc/soc.pub")],
+            "{name}"
+        );
+        assert_eq!(c.config.soc.max_clock_skew_s, 30, "{name}");
+        // Review F9 (a): the robot's own public keys, never a SOC key.
+        assert!(!c.config.soc.robot_keys.is_empty(), "{name}");
+    }
+    // The humanoid example requires a human for every containment.
+    assert!(
+        example("executor.unitree-g1.example.json")
+            .config
+            .require_approval_for_all_containment
+    );
+}
+
+/// Review F4: the generic example scopes quarantines to its DDS network
+/// and the robot's DDS ports.
+#[test]
+fn generic_example_scopes_quarantine_locators() {
+    let c = example("executor.example.json");
+    let mut p = policy("response-policy.example.json");
+    p.fall_safe_restrict = vec![RestrictTarget::Participant];
+    let t = |ip: &str, port: u16| Target::Participant {
+        guid_prefix: "0110a2b3c4d5e6f701000000".parse().unwrap(),
+        locators: vec![Locator {
+            ip: ip.parse().unwrap(),
+            port,
+        }],
+    };
+    for (ip, port, ok) in [
+        ("192.168.10.7", 7410, true),
+        ("192.168.10.7", 53, false),
+        ("10.20.0.10", 7410, false),
+    ] {
+        let r = precheck(&order(ActionId::QuarantineNode, &p, t(ip, port)), &p, &c);
+        assert_eq!(r.is_ok(), ok, "{ip}:{port}: {r:?}");
+        if !ok {
+            assert_eq!(r.unwrap_err().code, codes::LOCATOR_OUT_OF_SCOPE);
+        }
     }
 }
 

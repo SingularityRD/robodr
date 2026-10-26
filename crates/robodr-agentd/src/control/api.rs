@@ -862,6 +862,10 @@ impl Status {
 pub struct AcceptedAction<'a> {
     pub request: &'a ActionRequest,
     pub key_id: &'a str,
+    /// The SOC's signed request exactly as received (method, target,
+    /// credentials, body): forwarded to the executor, which verifies the
+    /// approval itself (executor M1).
+    pub meta: &'a Meta,
     pub step: Step,
     pub actions: &'a [ResponseAction],
     pub safety_state: SafetyState,
@@ -922,8 +926,15 @@ pub trait ActionExecutor {
     fn submit(&mut self, a: &AcceptedAction<'_>) -> ExecutorOutcome;
     // --- executor v1 -------------------------------------------------------
     /// Ask for a revert of an accepted request; `None` (the default): this
-    /// executor cannot revert.
-    fn revert(&mut self, _request_id: &str, _reason: &str) -> Option<ExecutorOutcome> {
+    /// executor cannot revert. `signed` is the SOC's revert request exactly
+    /// as received (the executor lifts a SOC-approved action only with it,
+    /// executor review F3).
+    fn revert(
+        &mut self,
+        _request_id: &str,
+        _reason: &str,
+        _signed: &Meta,
+    ) -> Option<ExecutorOutcome> {
         None
     }
     /// The executor's latest word on a request it was given (`None`:
@@ -1397,6 +1408,7 @@ impl Engine {
                 let out = self.executor.submit(&AcceptedAction {
                     request: req,
                     key_id: &meta.key_id,
+                    meta,
                     step: a.step,
                     actions: &a.actions,
                     safety_state: state,
@@ -1562,7 +1574,7 @@ impl Engine {
                 Status::Reverted => ("reverted", None),
                 Status::Pending | Status::Applied | Status::Verified => {
                     // executor v1: the executor reverts (or queues it).
-                    match self.executor.revert(id, &rv.reason) {
+                    match self.executor.revert(id, &rv.reason, meta) {
                         Some(ExecutorOutcome::Reverted) => ("reverted", None),
                         Some(ExecutorOutcome::Pending) => ("pending", None),
                         Some(ExecutorOutcome::Failed(_)) => ("failed", None),
@@ -2994,7 +3006,7 @@ mod tests {
         fn submit(&mut self, _: &AcceptedAction<'_>) -> ExecutorOutcome {
             ExecutorOutcome::Pending
         }
-        fn revert(&mut self, _: &str, _: &str) -> Option<ExecutorOutcome> {
+        fn revert(&mut self, _: &str, _: &str, _: &Meta) -> Option<ExecutorOutcome> {
             Some(ExecutorOutcome::Pending)
         }
         fn refresh(&mut self, id: &str) -> Option<ExecutorOutcome> {
