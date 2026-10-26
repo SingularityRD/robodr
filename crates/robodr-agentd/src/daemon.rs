@@ -151,10 +151,11 @@
 //!
 //! # What the daemon does with a plan
 //!
-//! Nothing. The agent's executor is the default `NoopExecutor`: plans
-//! (dispositions, `would_have`) are recorded in the black box and carried in
-//! the finding, never executed. Wiring an executor is future work and must
-//! follow `robodr_agent::executor`'s contract.
+//! By default nothing. The agent's executor is the default `NoopExecutor`:
+//! plans (dispositions, `would_have`) are recorded in the black box and
+//! carried in the finding, never executed. With `executor.enabled` and
+//! `planner_orders` (executor v1, [`crate::executor_link`]) the eligible
+//! network steps of a recorded plan are handed to `robodr-executor`.
 //!
 //! # Control-plane requests
 //!
@@ -167,8 +168,12 @@
 //! re-evaluated first), the operational context and the response policy,
 //! records request and decision as a `robodr.control_plane_request` note
 //! (fsynced), journaled around it in `control_plane.state_dir` (so the
-//! state survives a restart), and answers. The executor is the recording one: an accepted
-//! request is answered `recorded_not_executed`, nothing reaches the robot.
+//! state survives a restart), and answers. Without executor v1 the executor
+//! is the recording one: an accepted request is answered
+//! `recorded_not_executed`, nothing reaches the robot. With it, accepted
+//! requests are staged and dispatched to `robodr-executor` once stored, and
+//! every outcome the link reports is journalled at once
+//! ([`crate::control::api::Engine::sync`]).
 //! Failed authentications and authenticated invalid requests become the
 //! observe-only self-health findings
 //! `robot.agent.control_plane_unauthenticated` (High) and
@@ -431,6 +436,9 @@ struct Status<'a> {
     /// The control-plane API's counters (absent when it is off).
     #[serde(skip_serializing_if = "Option::is_none")]
     control_plane: Option<ControlStatus>,
+    /// executor v1 link counters (absent when the executor is off).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    executor: Option<crate::executor_link::LinkStats>,
 }
 
 /// The agent's view of the profile: what the pipeline enforces. A profile
@@ -499,6 +507,8 @@ struct Daemon<'a> {
     /// (unauthenticated, invalid).
     control_reported: [u64; 2],
     control_reported_at_ms: [Option<u64>; 2],
+    /// executor v1: the link to robodr-executor (`None` = off).
+    executor: Option<crate::executor_link::ExecutorLink>,
 }
 
 fn ms(d: Duration) -> u64 {
@@ -699,6 +709,35 @@ impl<'a> Daemon<'a> {
             .map_err(|e| DaemonError::Config(format!("finding key: {e}")))?;
             agent = agent.with_finding_signer(fs).map_err(DaemonError::Agent)?;
         }
+        // executor v1 (off unless `executor.enabled`): the link to the
+        // separate robodr-executor process; the planner's eligible steps go
+        // to it when `planner_orders` is set.
+        let executor = match &r.executor {
+            None => None,
+            Some(spec) => {
+                let link = crate::executor_link::ExecutorLink::start(
+                    spec,
+                    crate::executor_link::SafetyCell::default(),
+                )
+                .map_err(DaemonError::Io)?;
+                if link.planner_orders {
+                    agent =
+                        agent.with_executor(Box::new(link.planner_executor(r.policy.morphology)));
+                }
+                let _ = writeln!(
+                    log,
+                    "robodr-agentd: executor v1 enabled ({}): accepted requests{} are handed \
+                     to robodr-executor",
+                    spec.socket.display(),
+                    if link.planner_orders {
+                        " and eligible plan steps"
+                    } else {
+                        ""
+                    }
+                );
+                Some(link)
+            }
+        };
         let correlator = r
             .correlation
             .clone()
@@ -735,20 +774,36 @@ impl<'a> Daemon<'a> {
                         ids,
                     )
                 };
-                let cp = ControlPlane::start(spec, &cfg.robot.id, signer, &bb_dir, &reconcile)
+                let mut cp = ControlPlane::start(spec, &cfg.robot.id, signer, &bb_dir, &reconcile)
                     .map_err(DaemonError::Io)?;
+                // executor v1: accepted requests go to robodr-executor; the
+                // requests restored from the journal keep the executor's
+                // last journalled word.
+                if let Some(link) = &executor {
+                    cp.engine
+                        .set_executor(Box::new(link.control_executor(r.policy.morphology)));
+                    // What happened while agentd was down (a TTL lifted, a
+                    // pending order verified): asked once, journalled as
+                    // the answers come in.
+                    link.resync(cp.engine.open_executor_requests());
+                }
                 let st = cp.state_status().clone();
                 let _ =
                     writeln!(
                     log,
                     "robodr-agentd: control plane ({}) on {} ({} SOC key(s){}{}); requests are \
-                     judged and recorded, never executed; state: {} request(s) restored, \
+                     judged and recorded, {}; state: {} request(s) restored, \
                      {} dangling decision(s) settled from the black box",
                     crate::control::auth::API_VERSION,
                     cp.status().listening.join(", "),
                     spec.keys.len(),
                     if spec.tls.is_some() { ", mutual TLS" } else { "" },
                     if spec.evidence.is_some() { ", evidence API" } else { "" },
+                    if executor.is_some() {
+                        "accepted ones are handed to robodr-executor (executor v1)"
+                    } else {
+                        "never executed"
+                    },
                     st.restored,
                     st.resolved_committed + st.resolved_aborted,
                 );
@@ -967,6 +1022,7 @@ impl<'a> Daemon<'a> {
             control,
             control_reported: [0; 2],
             control_reported_at_ms: [None; 2],
+            executor,
         };
         #[derive(Serialize)]
         struct StartNote<'b> {
@@ -1124,6 +1180,7 @@ impl<'a> Daemon<'a> {
                 self.receive(wait, next_tick);
             }
             self.control_poll();
+            self.executor_poll();
             let now = Instant::now();
             if now >= next_tick {
                 let delay = ms(now.duration_since(next_tick));
@@ -2094,6 +2151,7 @@ impl<'a> Daemon<'a> {
             queue_bytes: self.budget.used(),
             queue_bytes_max: self.budget.max(),
             control_plane: self.control.as_ref().map(ControlPlane::status),
+            executor: self.executor.as_ref().map(|l| l.stats()),
         };
         let res = serde_json::to_vec_pretty(&status)
             .map_err(std::io::Error::other)
@@ -2293,4 +2351,140 @@ pub fn joint_frame(
     f.mode_pr = j.mode_pr;
     f.mode_machine = j.mode_machine;
     Some(f)
+}
+
+// --- executor v1 -------------------------------------------------------------
+// Kept apart from the control-plane code: the link to robodr-executor
+// (`executor.enabled`, crate::executor_link).
+impl Daemon<'_> {
+    /// Publish the safety state for the executor's apply-time re-check,
+    /// dispatch staged orders whose request / plan is in the black box, do
+    /// `record_evidence` marks, and record the executor's events.
+    fn executor_poll(&mut self) {
+        let Some(link) = self.executor.take() else {
+            return;
+        };
+        let state = self.safety();
+        link.safety().set(state);
+        for st in link.take_staged() {
+            use crate::executor_link::Staged;
+            match st {
+                Staged::Submit(o) => {
+                    // A control-plane order goes out only once its request
+                    // is stored (i.e. recorded); a planner order's plan was
+                    // recorded before the agent offered it.
+                    let recorded = match &o.origin {
+                        robodr_executor::Origin::ControlPlane { .. } => self
+                            .control
+                            .as_ref()
+                            .and_then(|c| c.engine.get(&o.id))
+                            .is_some(),
+                        robodr_executor::Origin::Planner { .. } => true,
+                    };
+                    if recorded {
+                        link.dispatch(Staged::Submit(o));
+                    } else {
+                        link.count_dropped();
+                    }
+                }
+                Staged::Revert { id, reason } => {
+                    let recorded = self
+                        .control
+                        .as_ref()
+                        .and_then(|c| c.engine.get(&id))
+                        .is_some_and(|s| s.revert.is_some());
+                    if recorded {
+                        link.dispatch(Staged::Revert { id, reason });
+                    } else {
+                        link.count_dropped();
+                    }
+                }
+                Staged::Evidence(o) => {
+                    let refs: Vec<String> = self
+                        .control
+                        .as_ref()
+                        .and_then(|c| c.engine.get(&o.id))
+                        .map(|s| vec![s.evidence.clone()])
+                        .unwrap_or_default();
+                    if refs.is_empty() {
+                        link.count_dropped();
+                        continue;
+                    }
+                    let robot = self.r.config.robot.id.clone();
+                    let now_ms = cp_api::Host::wall_ms(self);
+                    let mut sink = EvidenceSink {
+                        daemon: self,
+                        robot: &robot,
+                    };
+                    let out = robodr_executor::evidence::record(&o, &refs, &mut sink, now_ms);
+                    link.put(out);
+                }
+            }
+        }
+        // Journal every changed outcome at once (control plane v2): a
+        // request that reached `verified` reads `verified` after a restart
+        // even if nobody asked for it before.
+        let changed = link.take_changed();
+        if let Some(cp) = self.control.as_mut() {
+            for id in changed {
+                cp.engine.sync(&id);
+            }
+        }
+        for ev in link.take_events() {
+            let note = serde_json::json!({
+                "kind": "robodr.executor_event",
+                "event": ev,
+            });
+            let critical = matches!(
+                ev.kind,
+                robodr_executor::journal::EventKind::RevertFailed
+                    | robodr_executor::journal::EventKind::Drift
+                    | robodr_executor::journal::EventKind::RemovedExternally
+            );
+            let now = self.clock.now();
+            if self
+                .agent
+                .record_note(now, "executor event", &note, critical)
+                .is_err()
+            {
+                self.stats.note_errors += 1;
+            }
+            let _ = writeln!(
+                self.log,
+                "robodr-agentd: executor: {:?} {} {}",
+                ev.kind,
+                sanitize(ev.id.as_deref().unwrap_or("-")),
+                sanitize(&ev.detail)
+            );
+        }
+        self.executor = Some(link);
+    }
+}
+
+/// The black box as the `record_evidence` adapter's sink.
+struct EvidenceSink<'d, 'a> {
+    daemon: &'d mut Daemon<'a>,
+    robot: &'d str,
+}
+
+impl robodr_executor::evidence::EvidenceSink for EvidenceSink<'_, '_> {
+    fn mark(&mut self, note: &serde_json::Value) -> Result<String, String> {
+        // Critical: fsynced before the reference is returned.
+        cp_api::Host::record(self.daemon, "evidence mark", note)
+    }
+
+    fn verify(&mut self, reference: &str) -> Result<(), String> {
+        let prefix = format!("robodr-blackbox://{}/", self.robot);
+        let hash = reference.rsplit_once("?sha256=").map(|(_, h)| h);
+        if reference.starts_with(&prefix)
+            && hash.is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "unexpected evidence reference {}",
+                sanitize(reference)
+            ))
+        }
+    }
 }

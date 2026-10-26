@@ -219,6 +219,51 @@ impl UplinkConfig {
             fail_point: None,
         }
     }
+
+    /// The static checks of [`Uplink::open`] (ranges, labels, retry
+    /// policy, rotation): a caller can refuse a bad configuration at start
+    /// (usage error) instead of failing every run.
+    pub fn validate(&self) -> Result<(), UplinkError> {
+        if !(1..=wire::MAX_LINES).contains(&self.max_lines) {
+            return Err(UplinkError::Config(format!(
+                "max_lines must be in 1..={}",
+                wire::MAX_LINES
+            )));
+        }
+        if !(MIN_BODY_BYTES..=wire::MAX_BODY_BYTES).contains(&self.max_body_bytes) {
+            return Err(UplinkError::Config(format!(
+                "max_body_bytes must be in {MIN_BODY_BYTES}..={}",
+                wire::MAX_BODY_BYTES
+            )));
+        }
+        if !(1024..=16 * 1024 * 1024).contains(&self.max_record_bytes) {
+            return Err(UplinkError::Config(
+                "max_record_bytes must be in 1024..=16777216".into(),
+            ));
+        }
+        if !robodr_ocsf::validate::is_valid_data_source(&self.upgrade_data_source)
+            || !robodr_ocsf::validate::is_valid_topic(&self.upgrade_topic)
+        {
+            return Err(UplinkError::Config(
+                "upgrade topic / data source must be valid deployment labels".into(),
+            ));
+        }
+        if self
+            .dead_letter_rotation
+            .is_some_and(|r| r.keep == 0 || r.max_bytes < MIN_DEAD_LETTER_BYTES)
+        {
+            return Err(UplinkError::Config(format!(
+                "dead-letter rotation: keep >= 1 and max_bytes >= {MIN_DEAD_LETTER_BYTES} required"
+            )));
+        }
+        let r = &self.retry;
+        if r.max_attempts == 0 || r.base.is_zero() || r.max < r.base {
+            return Err(UplinkError::Config(
+                "retry: max_attempts >= 1 and 0 < base <= max required".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Simulated crash points (tests).
@@ -752,44 +797,7 @@ impl<T: Transport> Uplink<T> {
                 cfg.state_dir.display()
             )));
         }
-        if !(1..=wire::MAX_LINES).contains(&cfg.max_lines) {
-            return Err(UplinkError::Config(format!(
-                "max_lines must be in 1..={}",
-                wire::MAX_LINES
-            )));
-        }
-        if !(MIN_BODY_BYTES..=wire::MAX_BODY_BYTES).contains(&cfg.max_body_bytes) {
-            return Err(UplinkError::Config(format!(
-                "max_body_bytes must be in {MIN_BODY_BYTES}..={}",
-                wire::MAX_BODY_BYTES
-            )));
-        }
-        if !(1024..=16 * 1024 * 1024).contains(&cfg.max_record_bytes) {
-            return Err(UplinkError::Config(
-                "max_record_bytes must be in 1024..=16777216".into(),
-            ));
-        }
-        if !robodr_ocsf::validate::is_valid_data_source(&cfg.upgrade_data_source)
-            || !robodr_ocsf::validate::is_valid_topic(&cfg.upgrade_topic)
-        {
-            return Err(UplinkError::Config(
-                "upgrade topic / data source must be valid deployment labels".into(),
-            ));
-        }
-        if cfg
-            .dead_letter_rotation
-            .is_some_and(|r| r.keep == 0 || r.max_bytes < MIN_DEAD_LETTER_BYTES)
-        {
-            return Err(UplinkError::Config(format!(
-                "dead-letter rotation: keep >= 1 and max_bytes >= {MIN_DEAD_LETTER_BYTES} required"
-            )));
-        }
-        let r = &cfg.retry;
-        if r.max_attempts == 0 || r.base.is_zero() || r.max < r.base {
-            return Err(UplinkError::Config(
-                "retry: max_attempts >= 1 and 0 < base <= max required".into(),
-            ));
-        }
+        cfg.validate()?;
         check_sender_key(&key).map_err(UplinkError::Config)?;
         let key_id = key.key_id().to_string();
         fsutil::mkdir(&cfg.state_dir)?;

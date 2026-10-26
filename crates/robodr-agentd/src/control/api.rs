@@ -830,9 +830,20 @@ pub enum Status {
     Refused,
     /// An executor failed (no such executor here).
     Failed,
+    // --- executor v1 (robodr-executor, `executor.enabled`) ---------------
+    /// The executor applied it and the read-back matched.
+    Verified,
+    /// The executor removed it again (revert request, TTL, reconciliation).
+    Reverted,
 }
 
 impl Status {
+    /// The request took effect on the robot (applied, verified, or applied
+    /// and reverted since).
+    pub fn executed(self) -> bool {
+        matches!(self, Status::Applied | Status::Verified | Status::Reverted)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Status::RecordedNotExecuted => "recorded_not_executed",
@@ -840,6 +851,8 @@ impl Status {
             Status::Applied => "applied",
             Status::Refused => "refused",
             Status::Failed => "failed",
+            Status::Verified => "verified",
+            Status::Reverted => "reverted",
         }
     }
 }
@@ -862,6 +875,39 @@ pub enum ExecutorOutcome {
     Pending,
     Applied,
     Failed(String),
+    // --- executor v1 -------------------------------------------------------
+    Verified,
+    Reverted,
+    /// The executor's own checks refused it (nothing applied).
+    Refused {
+        code: &'static str,
+        reason: String,
+    },
+}
+
+/// Status, error and refusal a stored request takes for an executor
+/// outcome (executor v1).
+fn outcome_status(
+    out: ExecutorOutcome,
+    state: SafetyState,
+) -> (Status, Option<String>, Option<Refusal>) {
+    match out {
+        ExecutorOutcome::RecordedNotExecuted => (Status::RecordedNotExecuted, None, None),
+        ExecutorOutcome::Pending => (Status::Pending, None, None),
+        ExecutorOutcome::Applied => (Status::Applied, None, None),
+        ExecutorOutcome::Failed(e) => (Status::Failed, Some(e), None),
+        ExecutorOutcome::Verified => (Status::Verified, None, None),
+        ExecutorOutcome::Reverted => (Status::Reverted, None, None),
+        ExecutorOutcome::Refused { code, reason } => (
+            Status::Refused,
+            None,
+            Some(Refusal {
+                code,
+                reason,
+                safety_state: state,
+            }),
+        ),
+    }
 }
 
 /// Receives accepted requests. A real executor must follow
@@ -874,6 +920,17 @@ pub trait ActionExecutor {
     /// Whether it can act on the robot at all.
     fn executes(&self) -> bool;
     fn submit(&mut self, a: &AcceptedAction<'_>) -> ExecutorOutcome;
+    // --- executor v1 -------------------------------------------------------
+    /// Ask for a revert of an accepted request; `None` (the default): this
+    /// executor cannot revert.
+    fn revert(&mut self, _request_id: &str, _reason: &str) -> Option<ExecutorOutcome> {
+        None
+    }
+    /// The executor's latest word on a request it was given (`None`:
+    /// nothing new). Asked before a request's state is answered.
+    fn refresh(&mut self, _request_id: &str) -> Option<ExecutorOutcome> {
+        None
+    }
 }
 
 /// Executes nothing: every accepted request stays a recorded plan.
@@ -1109,6 +1166,81 @@ impl Engine {
         self.executor.name()
     }
 
+    // --- executor v1 -------------------------------------------------------
+    /// Replace the executor (agentd's `executor.enabled`).
+    pub fn set_executor(&mut self, executor: Box<dyn ActionExecutor>) {
+        self.executor = executor;
+    }
+
+    /// Take the executor's latest word on a stored request. A change is
+    /// journalled before it is taken (and answered): a request that read
+    /// `verified` still reads `verified` after a restart, when the link's
+    /// in-memory outcomes are gone. If the journal does not take it, the
+    /// stored state stays as it was (counted in `journal_errors`) and the
+    /// next query asks again: no answer claims a state the robot could
+    /// forget.
+    fn refresh(&mut self, id: &str) {
+        let Some(s) = self.store.get(id) else {
+            return;
+        };
+        if !matches!(
+            s.status,
+            Status::Pending | Status::Applied | Status::Verified
+        ) {
+            return;
+        }
+        let Some(out) = self.executor.refresh(id) else {
+            return;
+        };
+        let (status, err, refusal) = outcome_status(out, s.safety_state);
+        let error = err.or_else(|| s.error.clone());
+        let refusal = refusal.or_else(|| s.refusal.clone());
+        if status == s.status && error == s.error && refusal == s.refusal {
+            return;
+        }
+        let entry = super::state::Entry::Executor {
+            request_id: id.to_string(),
+            status: status.as_str().to_string(),
+            error: error.clone(),
+            refusal: refusal.as_ref().map(super::state::PRefusal::of),
+        };
+        if !self.journal(&entry) {
+            return;
+        }
+        if let Some(s) = self.store.get_mut(id) {
+            s.status = status;
+            s.error = error;
+            s.refusal = refusal;
+        }
+        self.maybe_compact(false);
+    }
+
+    /// Take (and journal) the executor's latest word on a request now, not
+    /// only when it is next queried (the daemon calls this for every
+    /// outcome the executor link reports).
+    pub fn sync(&mut self, id: &str) {
+        self.refresh(id);
+    }
+
+    /// Stored requests this engine's executor may still change (`pending`,
+    /// `applied`, `verified`), oldest first: after a restart the executor
+    /// is asked for their state.
+    pub fn open_executor_requests(&self) -> Vec<String> {
+        let name = self.executor.name();
+        self.order
+            .iter()
+            .filter_map(|id| self.store.get(id))
+            .filter(|s| {
+                s.executor == name
+                    && matches!(
+                        s.status,
+                        Status::Pending | Status::Applied | Status::Verified
+                    )
+            })
+            .map(|s| s.request.request_id.clone())
+            .collect()
+    }
+
     pub fn executes(&self) -> bool {
         self.executor.executes()
     }
@@ -1121,10 +1253,13 @@ impl Engine {
         match call {
             Call::Robot => self.robot(host),
             Call::Submit(req) => self.submit(req, meta, host),
-            Call::Get(id) => match self.store.get(id) {
-                Some(s) => Answer::ok(self.answer(s, false, host.wall_ms())),
-                None => Answer::error(&unknown_request()),
-            },
+            Call::Get(id) => {
+                self.refresh(id);
+                match self.store.get(id) {
+                    Some(s) => Answer::ok(self.answer(s, false, host.wall_ms())),
+                    None => Answer::error(&unknown_request()),
+                }
+            }
             Call::Revert(id, rv) => self.revert(id, rv, meta, host),
             Call::EvidenceNote(note) => match host.record("control-plane evidence export", note) {
                 Ok(uri) => {
@@ -1193,6 +1328,7 @@ impl Engine {
 
     fn submit(&mut self, req: &ActionRequest, meta: &Meta, host: &mut dyn Host) -> Answer {
         let digest = req.digest();
+        self.refresh(&req.request_id);
         if let Some(s) = self.store.get(&req.request_id) {
             if s.digest == digest {
                 self.stats.duplicates += 1;
@@ -1229,13 +1365,8 @@ impl Engine {
                     safety_state: state,
                     context: &ctx,
                 });
-                let (st, err) = match out {
-                    ExecutorOutcome::RecordedNotExecuted => (Status::RecordedNotExecuted, None),
-                    ExecutorOutcome::Pending => (Status::Pending, None),
-                    ExecutorOutcome::Applied => (Status::Applied, None),
-                    ExecutorOutcome::Failed(e) => (Status::Failed, Some(e)),
-                };
-                (st, None, Some(a), err)
+                let (st, err, refusal) = outcome_status(out, state);
+                (st, refusal, Some(a), err)
             }
         };
         let received_ms = host.wall_ms();
@@ -1300,7 +1431,7 @@ impl Engine {
             "refusal": refusal,
             "plan": accepted,
             "executor": self.executor.name(),
-            "executed": status == Status::Applied,
+            "executed": status.executed(),
             "status": status.as_str(),
             "error": error,
         });
@@ -1359,6 +1490,9 @@ impl Engine {
 
     fn revert(&mut self, id: &str, rv: &RevertRequest, meta: &Meta, host: &mut dyn Host) -> Answer {
         let now = host.wall_ms();
+        // executor v1: judge the revert by the executor's latest word (a TTL
+        // may have lifted it already).
+        self.refresh(id);
         let Some(s) = self.store.get(id) else {
             return Answer::error(&unknown_request());
         };
@@ -1385,21 +1519,36 @@ impl Engine {
                 Status::RecordedNotExecuted | Status::Refused | Status::Failed => {
                     ("not_applied", None)
                 }
-                Status::Pending | Status::Applied => (
-                    "refused",
-                    Some(Refusal {
-                        code: "revert_unsupported",
-                        reason: format!(
-                            "the {} executor cannot revert requests",
-                            self.executor.name()
+                Status::Reverted => ("reverted", None),
+                Status::Pending | Status::Applied | Status::Verified => {
+                    // executor v1: the executor reverts (or queues it).
+                    match self.executor.revert(id, &rv.reason) {
+                        Some(ExecutorOutcome::Reverted) => ("reverted", None),
+                        Some(ExecutorOutcome::Pending) => ("pending", None),
+                        Some(ExecutorOutcome::Failed(_)) => ("failed", None),
+                        _ => (
+                            "refused",
+                            Some(Refusal {
+                                code: "revert_unsupported",
+                                reason: format!(
+                                    "the {} executor cannot revert requests",
+                                    self.executor.name()
+                                ),
+                                safety_state: s.safety_state,
+                            }),
                         ),
-                        safety_state: s.safety_state,
-                    }),
-                ),
+                    }
+                }
             }
         };
-        // Only the first `not_applied` changes the stored state: journal it.
-        let changes = result == "not_applied" && s.revert.is_none();
+        // What changes the stored state is journalled first: the first
+        // revert record (`not_applied`, or an executor revert `pending` /
+        // `reverted`: the daemon dispatches a staged executor revert only
+        // once this record exists) and a status that becomes `reverted`.
+        let sets_revert =
+            matches!(result, "not_applied" | "pending" | "reverted") && s.revert.is_none();
+        let sets_status = result == "reverted" && s.status != Status::Reverted;
+        let changes = sets_revert || sets_status;
         let decision_id = if changes {
             let d = match super::fsutil::random_hex16() {
                 Ok(d) => d,
@@ -1479,7 +1628,10 @@ impl Engine {
         let Some(s) = self.store.get_mut(id) else {
             return Answer::error(&unknown_request());
         };
-        if changes && s.revert.is_none() {
+        if sets_status {
+            s.status = Status::Reverted;
+        }
+        if sets_revert && s.revert.is_none() {
             s.revert = Some(RevertRecord {
                 requested_by: rv.requested_by.clone(),
                 reason: rv.reason.clone(),
@@ -1533,7 +1685,7 @@ pub fn answer_of(s: &Stored, robot_id: &str, duplicate: bool, now_ms: u64) -> Va
         "decision": if s.refusal.is_some() { "refused" } else { "accepted" },
         "safety_state": s.safety_state,
         "executor": s.executor,
-        "executed": s.status == Status::Applied,
+        "executed": s.status.executed(),
         "evidence": s.evidence,
     });
     if let Some(a) = &s.accepted {
@@ -1555,7 +1707,7 @@ pub fn answer_of(s: &Stored, robot_id: &str, duplicate: bool, now_ms: u64) -> Va
     let mut out = json!({
         "request_id": s.request.request_id,
         "status": s.status.as_str(),
-        "executed": s.status == Status::Applied,
+        "executed": s.status.executed(),
         "state": state,
     });
     if duplicate {
@@ -2759,6 +2911,143 @@ mod tests {
         assert_eq!(get(&mut e, &mut h, "b-199").status, 200);
         assert_eq!(get(&mut e, &mut h, "b-184").status, 200);
         assert_eq!(get(&mut e, &mut h, "b-183").status, 404);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// executor v1 on the v2 journal: an executor that answers through
+    /// `refresh` (as `executor_link::ControlExecutor` does).
+    #[derive(Clone, Default)]
+    struct Scripted(std::sync::Arc<std::sync::Mutex<HashMap<String, ExecutorOutcome>>>);
+
+    impl Scripted {
+        fn set(&self, id: &str, o: ExecutorOutcome) {
+            self.0.lock().unwrap().insert(id.into(), o);
+        }
+    }
+
+    impl ActionExecutor for Scripted {
+        fn name(&self) -> &'static str {
+            "robodr-executor"
+        }
+        fn executes(&self) -> bool {
+            true
+        }
+        fn submit(&mut self, _: &AcceptedAction<'_>) -> ExecutorOutcome {
+            ExecutorOutcome::Pending
+        }
+        fn revert(&mut self, _: &str, _: &str) -> Option<ExecutorOutcome> {
+            Some(ExecutorOutcome::Pending)
+        }
+        fn refresh(&mut self, id: &str) -> Option<ExecutorOutcome> {
+            self.0.lock().unwrap().get(id).cloned()
+        }
+    }
+
+    /// A restart with the executor link's memory empty (a fresh
+    /// [`Scripted`]).
+    fn restart_exec(dir: &std::path::Path, h: &FakeHost, x: &Scripted) -> Engine {
+        let (mut e, _) = restart(dir, h, 16);
+        e.set_executor(Box::new(x.clone()));
+        e
+    }
+
+    #[test]
+    fn executor_states_are_journalled_and_survive_a_restart() {
+        let d = tmp("exec");
+        let mut h = FakeHost::new(SafetyState::Idle);
+        let x = Scripted::default();
+        let mut e = restart_exec(&d, &h, &x);
+        let a = e.handle(
+            &sub("x-1", "isolate_network", json!({}), Some(600)),
+            &meta(),
+            &mut h,
+        );
+        assert_eq!(a.body["status"], "pending", "{}", a.body);
+        e.handle(
+            &sub(
+                "x-2",
+                "quarantine_node",
+                json!({"node": "/rogue/teleop_node"}),
+                None,
+            ),
+            &meta(),
+            &mut h,
+        );
+        e.handle(
+            &sub("x-3", "isolate_network", json!({}), Some(60)),
+            &meta(),
+            &mut h,
+        );
+        // x-1 verified (queried), x-2 verified and only synced (nobody
+        // asked), x-3 refused by the executor's own check.
+        x.set("x-1", ExecutorOutcome::Verified);
+        x.set("x-2", ExecutorOutcome::Verified);
+        x.set(
+            "x-3",
+            ExecutorOutcome::Refused {
+                code: "no_management_channel",
+                reason: "no management channel".into(),
+            },
+        );
+        let v1 = get(&mut e, &mut h, "x-1").body;
+        assert_eq!(v1["status"], "verified");
+        assert_eq!(v1["executed"], true);
+        e.sync("x-2");
+        let v3 = get(&mut e, &mut h, "x-3").body;
+        assert_eq!(v3["refusal"]["code"], "no_management_channel", "{v3}");
+        assert_eq!(
+            e.open_executor_requests(),
+            vec!["x-1".to_string(), "x-2".to_string()]
+        );
+        drop(e);
+
+        // Restart: the link knows nothing; the journal does.
+        let x = Scripted::default();
+        let mut e = restart_exec(&d, &h, &x);
+        assert_eq!(get(&mut e, &mut h, "x-1").body, v1);
+        assert_eq!(get(&mut e, &mut h, "x-2").body["status"], "verified");
+        assert_eq!(get(&mut e, &mut h, "x-3").body, v3);
+        // A revert: staged (`pending`), then the executor reports it.
+        let rv = Call::Revert(
+            "x-1".into(),
+            parse_revert(br#"{"requested_by": "analyst@soc", "reason": "done"}"#).unwrap(),
+        );
+        assert_eq!(e.handle(&rv, &meta(), &mut h).body["status"], "pending");
+        x.set("x-1", ExecutorOutcome::Reverted);
+        let r1 = get(&mut e, &mut h, "x-1").body;
+        assert_eq!(r1["status"], "reverted");
+        assert_eq!(r1["state"]["revert"]["result"], "pending");
+        // Asked again: already reverted, nothing new is journalled.
+        assert_eq!(e.handle(&rv, &meta(), &mut h).body["status"], "reverted");
+        drop(e);
+        let x = Scripted::default();
+        let mut e = restart_exec(&d, &h, &x);
+        assert_eq!(get(&mut e, &mut h, "x-1").body, r1);
+        assert_eq!(e.stats.journal_damaged, 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A journal that cannot take the executor's word keeps the stored
+    /// state (never answered, so never forgotten); the next query retries.
+    #[test]
+    fn an_executor_state_the_journal_does_not_take_is_not_answered() {
+        let d = tmp("exec-fail");
+        let mut h = FakeHost::new(SafetyState::Idle);
+        let x = Scripted::default();
+        let mut e = restart_exec(&d, &h, &x);
+        e.handle(
+            &sub("y-1", "isolate_network", json!({}), Some(60)),
+            &meta(),
+            &mut h,
+        );
+        x.set("y-1", ExecutorOutcome::Verified);
+        fault::arm("survive.journal.append.short_write", 1);
+        assert_eq!(get(&mut e, &mut h, "y-1").body["status"], "pending");
+        assert_eq!(e.stats.journal_errors, 1);
+        assert_eq!(get(&mut e, &mut h, "y-1").body["status"], "verified");
+        drop(e);
+        let mut e = restart_exec(&d, &h, &Scripted::default());
+        assert_eq!(get(&mut e, &mut h, "y-1").body["status"], "verified");
         let _ = std::fs::remove_dir_all(&d);
     }
 

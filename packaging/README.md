@@ -112,6 +112,7 @@ Neither watchdog has been exercised under a real systemd yet.
     ├── agentd-blackbox.key      0600 root:root     black-box key of robodr-agentd
     ├── agentd-finding.key       0600 root:root     optional per-finding signing key (drop-in 20-finding-key)
     ├── agentd-cp-tls.key        0600 root:root     optional control-plane TLS server key (drop-in 30-control-plane)
+    ├── executor.key             0600 root:root     agentd <-> robodr-executor protocol key (unit + drop-in 30-executor)
     ├── pulsard-blackbox.key     0600 root:root     (when the Pulsar module records)
     └── retired/                 0700 root:root     rotated keys kept for verification
 /var/lib/robodr/                 0750 root:robodr
@@ -128,8 +129,10 @@ Neither watchdog has been exercised under a real systemd yet.
 ├── commission/                  0750 root:robodr   operator workspace: runs, drafts, sign-offs
 ├── export/                      0750 root:robodr   bundles staged for the diode / media
 ├── archive/                     0750 root:robodr   black boxes closed by a key rotation
+├── executor/                    0700 robodr-exec:robodr journal of robodr-executor (active actions, TTL deadlines)
 └── releases/<version>/          0750 root:root     .deb kept for rollback (install-bundle.sh)
 /run/robodr-pulsard/pulsar.sock                     Pulsar API socket (RuntimeDirectory)
+/run/robodr-executor/executor.sock                  agentd -> robodr-executor (0660 robodr-exec:robodr, dir 0750)
 /run/credentials/<unit>/blackbox.key                key copy for the service (systemd)
 /usr/share/robodr/rules/{robodr,pulsar}/            Pulsar rules, read-only
 ```
@@ -254,6 +257,12 @@ binaries (`robodr-focal`, arm64).
   on a robot. In a Ubuntu 24.04 container (not booted with systemd) they
   were: `install` of a `robodr-focal` bundle, then of a `robodr` bundle
   (dpkg removed `robodr-focal` in favour of `robodr`), then `rollback`.
+- `robodr-executor.service` (executor v1, the only `CAP_NET_ADMIN` unit) and
+  its focal variant (added 2026-10-26) pass `systemd-analyze verify` apart
+  from the missing binaries in the check environment and score 1.1 / 1.3
+  with `systemd-analyze security --offline=yes` (systemd 255); not started
+  by systemd: its syscall filter has not been exercised with `nft` under
+  systemd.
 - `robodr-uplink.service` and its focal variant (added 2026-10-26) pass
   `systemd-analyze verify` apart from the missing binary in the check
   environment, and score 1.1 / 1.2 with `systemd-analyze security

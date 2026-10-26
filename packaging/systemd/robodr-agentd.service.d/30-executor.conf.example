@@ -1,0 +1,18 @@
+# EXAMPLE drop-in, not active as shipped. To use it (executor v1, see
+# docs/OPERATIONS.md "Executor v1"):
+#   install -D -m 0644 30-executor.conf.example \
+#       /etc/systemd/system/robodr-agentd.service.d/30-executor.conf
+#   systemctl daemon-reload && systemctl restart robodr-agentd
+#
+# Hands robodr-agentd the shared key of the agentd <-> robodr-executor
+# protocol (the same file robodr-executor.service loads), as
+#   /run/credentials/robodr-agentd.service/executor.key
+# which agentd.json then names:
+#   "executor": { "enabled": true,
+#                 "key_file": "/run/credentials/robodr-agentd.service/executor.key" }
+# agentd itself gets no new capability: it only connects to
+# /run/robodr-executor/executor.sock (group robodr, 0660). If the key file is
+# missing, the unit fails to start, so install this drop-in only together
+# with the key (`robodr-executor keygen --out /etc/robodr/keys/executor.key`).
+[Service]
+LoadCredential=executor.key:/etc/robodr/keys/executor.key

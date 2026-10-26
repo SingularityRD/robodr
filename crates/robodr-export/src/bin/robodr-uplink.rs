@@ -305,7 +305,10 @@ fn main() -> ExitCode {
              24 h (contract section 7)",
         );
     }
-    let o = match parse_args_with_switches(v, SERVICE_FLAGS, &["once"]).and_then(|a| opts(&a)) {
+    let o = match parse_args_with_switches(v, SERVICE_FLAGS, &["once"])
+        .and_then(|a| opts(&a))
+        .and_then(|o| o.cfg.validate().map(|()| o).map_err(|e| e.to_string()))
+    {
         Ok(o) => o,
         Err(e) => return usage_exit(&e),
     };

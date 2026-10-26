@@ -121,7 +121,14 @@ crates/
                           Kafka; std-only client, acks=all, idempotence off, no
                           TLS/SASL). Tested against an in-process fake broker
                           in CI and against single-node Apache Kafka 3.9.1 and
-                          4.1.0 brokers (scripts/kafka-it.sh, docker).
+                          4.1.0 brokers (scripts/kafka-it.sh, docker). And
+                          robodr-uplink: the same inputs -> the AutoSecOps
+                          ingest API (docs/contracts/robodr.ingest-api.md) over
+                          TLS (rustls + ring, CA bundle, SPKI pins), signed
+                          NDJSON batches, at-least-once and crash-safe;
+                          uplink-status.json + sd_notify STATUS= show a
+                          blocked queue; `reinject` re-queues dead letters
+                          after a registration fix.
   robodr-sensor-ros2/     Thin Pulsar module wrapping robodr-ros2-pipeline.
                           Pulsar-dependent: built, linted and tested against
                           vendor/pulsar in CI's `pulsar` job (needs Pulsar's
@@ -146,6 +153,7 @@ docs/PULSAR-INTEGRATION.md  Every Pulsar item the Pulsar-bound crates use.
 docs/contracts/         robodr.findings contract (v2) + JSON Schema + example,
                         robodr.control-plane contract (v2) + fixtures/
                         test vectors; legacy/ = superseded 1.x.
+docs/{adr,compliance,customer}/  ADRs (D1-D9 etc.), IEC 62443/CRA/safety notes, customer drafts.
 fuzz/                   cargo-fuzz targets (RTPS, capture, black box, OCSF,
                         commissioning, firewall, pipeline config, control-plane
                         requests; own workspace) + std-only smoke runs in the
@@ -223,8 +231,10 @@ module, no robot):
   serves mutual TLS (rustls) off loopback and authenticates Ed25519-signed
   SOC requests for the seven catalog actions, judges them against the live
   safety state, records them and keeps their state across restarts
-  (journal, persisted replay store), but **executes nothing**
-  (`recorded_not_executed`). Its evidence API exports black-box records as
+  (journal, persisted replay store). It **executes nothing**
+  (`recorded_not_executed`) unless executor v1 (`robodr-executor`, off by
+  default) is enabled; then executor states (`verified`, `reverted`, ...)
+  are signed and journalled like every other state. Its evidence API exports black-box records as
   signed, chunked bundles that `robodr-blackbox verify` checks. Exercised
   with an in-process signing client and a test PKI over loopback, not
   against a deployed SOC or across a real network.

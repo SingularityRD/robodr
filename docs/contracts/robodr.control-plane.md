@@ -7,8 +7,8 @@
 | Consumer | any SOC integration that sends approved robot actions or collects evidence (requirements in §10) |
 | Action catalog | `robodr_responder::actions` (one list shared with the planner; §4) |
 | Superseded | v1 (this file's history); the first draft, written for a cancelled integration: [`legacy/robot-edr.control-plane.md`](legacy/robot-edr.control-plane.md) |
-| Status | **Experimental.** Off by default. **Nothing is executed** in this release |
-| Reference tests | `crates/robodr-agentd/tests/control_plane.rs` (end to end, real daemon: mTLS, restart, evidence), `tests/control_plane_vectors.rs` (§12), `tests/fuzz_smoke.rs`, unit tests in `src/control/{http,auth,api,journal,state,evidence,tls,mod}.rs` |
+| Status | **Experimental.** Off by default. **Nothing is executed** unless executor v1 is enabled (§6a, off by default) |
+| Reference tests | `crates/robodr-agentd/tests/control_plane.rs` (end to end, real daemon: mTLS, restart, evidence), `tests/executor_link.rs` (executor v1 on v2: signed `pending` / `verified` / `refused` / `reverted` answers over the unix socket and mTLS, executor states across restarts), `tests/control_plane_vectors.rs` (§12), `tests/fuzz_smoke.rs`, unit tests in `src/control/{http,auth,api,journal,state,evidence,tls,mod}.rs` |
 | Test vectors | [`fixtures/control-plane-v2/`](fixtures/control-plane-v2/) (§12) |
 
 A SOC asks the robot for one of the seven catalog actions. The on-robot agent
@@ -22,11 +22,11 @@ also exports black-box evidence (a finding's records, a sequence or time
 range) in signed, resumable chunks and verifies it with the robot's public
 keys.
 
-In this release agentd has no executor that acts on the robot. The only
-executor is the recording one: an accepted request is answered
-**`recorded_not_executed`** ("accepted and recorded as a plan, not
-executed"), with `"executed": false`. A consumer must report that as "not
-applied", never as success.
+Unless executor v1 is enabled (§6a; off by default) agentd has no executor
+that acts on the robot. The executor is then the recording one: an accepted
+request is answered **`recorded_not_executed`** ("accepted and recorded as
+a plan, not executed"), with `"executed": false`. A consumer must report
+that as "not applied", never as success.
 
 ## 1. Transport
 
@@ -305,14 +305,15 @@ and a consumer must not either.
 | `recorded_not_executed` | accepted against the current safety state and recorded as a plan in the black box; **nothing was sent to the robot** | yes |
 | `refused` | judged unsafe or not allowed now (§4.1), recorded | yes |
 | `failed` | not taken: `state.error.code` is `evidence_unavailable` (the black box did not take it) or `state_unavailable` (the request journal did not take it, §9); nothing was decided or stored, a retry is judged anew | yes |
-| `pending`, `applied` | reserved for an executor that acts; none exists in this repository | — |
+| `pending`, `verified`, `reverted` | executor v1 only (§6a); `refused` and `failed` are also what the executor answers for its own checks and faults | see §6a |
+| `applied` | reserved; no executor in this repository reports it | — |
 
 `request_id` is the idempotency key: the same id with the same action,
 parameters and ttl returns the stored state with `"duplicate": true` (not
 judged or recorded again); the same id for anything else is 409
 `request_id_conflict`. The store keeps the newest `max_requests` (default
-1024) requests and **survives a restart** (§9): a status query after a
-restart answers exactly as before it; older requests answer 404
+1024) requests and **survives a restart** (§9), executor states (§6a)
+included: a status query after a restart answers exactly as before it; older requests answer 404
 `unknown_request` (the black box keeps every decision; §11 exports it).
 
 ## 6. Revert
@@ -321,9 +322,69 @@ restart answers exactly as before it; older requests answer 404
 | --- | --- |
 | `request_safe_state`, `rollback_config`, `record_evidence` | `refused`, `refusal.code: not_reversible` (an operator restores the robot; evidence is never reverted) |
 | `recorded_not_executed`, `refused`, `failed` | `not_applied`: it never took effect; recorded (`robodr.control_plane_revert`), `state.revert` filled (the first revert is kept, also across restarts) |
+| `pending`, `verified`, `reverted` (executor v1) | `pending` or `reverted`, see §6a |
 
 The revert answer carries the request's state with `status` replaced by the
 revert's result and `revert_evidence` (the note's black-box reference).
+
+## 6a. Executor v1 (`executor.enabled`)
+
+> Additive subsection for executor v1 (`crates/robodr-executor`). It only
+> applies when agentd's `executor.enabled` is `true`. Off by default:
+> without it, everything above holds unchanged (`recorded_not_executed`).
+
+With the executor enabled, the robot snapshot reports
+`"executor": "robodr-executor"` and `"executes_actions": true`. An accepted
+request (§4.1) is recorded first, then handed to the separate
+`robodr-executor` process. That process checks it again against its own
+policy and configuration and against the safety state **at the moment of
+apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
+
+| `status` | Meaning | Terminal |
+| --- | --- | --- |
+| `pending` | accepted, recorded, handed to the executor; read the state again with GET | no |
+| `verified` | the executor applied it and the read-back of its nftables rules matched; it stays in force until revert or TTL (`state.expires_at_ms`) | no |
+| `reverted` | removed again: revert request, TTL expiry, restart reconciliation, or an operator's emergency disable (`nft delete table inet robodr`) | yes |
+| `refused` | the executor's own check refused it; nothing was applied; `state.decision` then reads `refused`. `refusal.code` is one of `not_executor_action` (`safe_pause`, `request_safe_state`, `rollback_config`: never executed), `fall_hazard`, `needs_approval`, `motion_path`, `no_management_channel`, `unsupported_target` (a `node` target, or a process), `safety_state_changed`, `safety_state_stale`, `safety_state_unavailable`, `safety_system_engaged`, `morphology_mismatch`, `observe_mode`, `already_active`, `ttl_out_of_range`, `replay`, `invalid_order`, `id_conflict`, `evidence_elsewhere`, or `executor_refused` for a code this agentd does not know | yes |
+| `failed` | the executor was unreachable, its queue was full, or the apply did not verify and was rolled back (`state.error`); nothing is in force | yes |
+| `recorded_not_executed` | `restrict_motion` (advisory in v1: no motion gateway yet) | yes |
+
+* **Statuses by action.**
+  * `isolate_network` and `quarantine_node` (by `participant_guid`) can
+    reach `verified`.
+  * `record_evidence` becomes `verified` once a signed
+    `robodr.evidence_mark` note naming the request's evidence is in the
+    black box. It is never reverted.
+  * An action the executor never carries out is `refused`.
+* **Revert.** A revert of a `pending` or `verified` request answers
+  `pending` (`state.revert.result: "pending"`), and GET then shows
+  `reverted`. A revert of a `reverted` request answers `reverted`. The
+  revert is recorded (`robodr.control_plane_revert`) and journalled
+  (`revert_begin` / `revert_commit`, §9) **before** agentd sends it to the
+  executor; one that is not recorded is never sent. The other rows of §6
+  are unchanged.
+* **Signed and persistent (v2).** Every answer carrying these statuses is
+  signed with the finding key (§2, `X-RoboDR-Answer-Signature`) like any
+  other answer. Each state the executor reports is journalled (§9,
+  `executor` entry, fsynced) before agentd answers it, and agentd journals
+  outcomes as they arrive, not only when the SOC asks: a request that read
+  `verified` reads `verified` after an agentd restart, and a `reverted` one
+  stays `reverted`. If the journal does not take a new state, the request
+  keeps answering its previous state until it does (never a state the
+  robot could forget). At start agentd asks the executor once about the
+  restored requests that are still `pending` or `verified`.
+* **TTL.** Every executed action has a TTL: the request's `ttl_seconds`,
+  or the executor's `ttl.default_s` when the request names none. The
+  executor lifts the action at `expires_at_ms` without further requests.
+* **Client requirements.** Report `verified` (not `pending`) as "in
+  force". Treat `refused` and `failed` as "not applied" and show
+  `refusal.code`, `refusal.reason` and `state.error`. Poll GET for a
+  `pending` request.
+* **Evidence.** Each executor event (`applied`, `verified`, `refused`,
+  `failed`, `reverted`, `expired`, `revert_failed`, `drift`,
+  `removed_externally`, `reconciled`) is a `robodr.executor_event` note.
+  `revert_failed`, `drift` and `removed_externally` are critical
+  (fsynced). `status.json` carries `executor` counters.
 
 ## 7. HTTP errors
 
@@ -441,8 +502,18 @@ the decision is committed with that note's reference (the SOC may have seen
 it); not found, it is aborted (nothing was recorded, nothing decided: a
 resubmission is judged anew). A journal that cannot take the `begin`
 refuses the request before anything is judged into evidence (`failed`,
-`state_unavailable`). Reverts that change a request's state follow the same
-steps. The newest `max_requests` requests are kept.
+`state_unavailable`). Reverts that change a request's state (the first
+revert record, or an executor revert that reports `reverted`) follow the
+same steps (`revert_begin` / `revert_commit` / `revert_abort`). The newest
+`max_requests` requests are kept.
+
+**Executor states** (executor v1, §6a) are one entry each,
+`{"t":"executor","request_id":...,"status":...,"error":...,"refusal":...}`,
+appended (fsync) before the new state is answered. They are the executor's
+word, not a decision of agentd (the executor and agentd's
+`robodr.executor_event` notes are their evidence), so they have no
+begin / commit pair. An entry for a request whose decision is still
+dangling is carried into it and settled with it.
 
 ## 10. Client requirements
 
@@ -694,9 +765,13 @@ another robot), 13 (signed in the removed v1 domain); all 401
 
 ## 13. Limits of this release
 
-* Nothing is executed; a future executor must follow
-  `robodr_agent::executor`'s contract (re-check against the current safety
-  state, only request, never block) and would report `pending` / `applied`.
+* Nothing is executed unless executor v1 is enabled (§6a); it carries out
+  `isolate_network`, `quarantine_node` (participant GUID) and
+  `record_evidence` only, re-checks the safety state at apply time and
+  reports `pending` / `verified` / `reverted`. A `pending` request whose
+  order was staged but not yet sent when agentd stopped stays `pending`
+  (the order is dropped, never sent late); the SOC resubmits under a new
+  `request_id`.
 * The judgment is only as right as the safety state source (live feed or
   static configuration) and the response policy; `control`, `phase` and
   `connectivity` are still configuration.
@@ -732,3 +807,5 @@ another robot), 13 (signed in the removed v1 domain); all 401
 * Request state and replay store persist across restarts (`state_dir`).
 * The evidence API (§11).
 * DELETE is a method of the API (exports).
+* Executor v1's statuses (§6a) are answered and persisted the v2 way:
+  signed answers, journalled states.

@@ -8,7 +8,7 @@ license.workspace = true
 # accept version-less path dependencies (deny.toml, allow-wildcard-paths).
 publish = false
 repository.workspace = true
-description = "RoboDR live daemon: capture / pcap / JSONL events -> ROS 2 pipeline -> decision chain (robodr-agent) -> signed black box -> OCSF findings spool, with self-health and the mTLS control-plane / evidence API. Std threads only (no async runtime); plans, never executes."
+description = "RoboDR live daemon: capture / pcap / JSONL events -> ROS 2 pipeline -> decision chain (robodr-agent) -> signed black box -> OCSF findings spool, with self-health and the mTLS control-plane / evidence API. Std threads only (no async runtime); plans, and executes only through the separate robodr-executor when executor.enabled."
 
 # std + RoboDR crates + serde (no async runtime, no Pulsar), so it builds and
 # is tested offline; rustls (+ ring) and rustls-webpki are the control plane's
@@ -27,6 +27,9 @@ robodr-commission = { workspace = true }
 # Weak-signal correlation over every finding the daemon reports.
 robodr-correlate = { workspace = true }
 robodr-events = { workspace = true }
+# executor v1: orders to the separate robodr-executor process (client side
+# of its protocol, order types); agentd itself never touches nftables.
+robodr-executor = { workspace = true }
 robodr-firewall = { workspace = true }
 robodr-motion = { workspace = true }
 robodr-ocsf = { workspace = true }

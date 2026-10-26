@@ -54,7 +54,7 @@ level, and every path must be absolute.
 | `sensor.motion` | Optional. The live motion decode path: `enabled` (default true), `feedback_topics` (e.g. `["/odom"]`), `max_writers`, `max_samples_per_datagram` (`evaluate_commands` is accepted but the daemon always lets the agent evaluate). Unknown keys are refused. |
 | `sensor.unitree_legacy` | Optional, off by default. Unitree legacy UDP (Go1 generation): `enabled`, `ports` (default `[8007, 8080, 8082, 8090]`), `command_senders` (IPs allowed to send `HighCmd` / `LowCmd`, or tables `{"ip", "mac"?, "label"?}`; `mac` binds the sender to its link-layer source), `robot_addresses` (default `192.168.123.10`, `192.168.123.161`). Needs `sensor.capture`. Unknown keys are refused. |
 | `host_threats` | Optional. `socket_path` (the socket `robodr-threat-forward` writes Pulsar threats to), `socket_mode` (`"0600"` default or `"0660"`), `allowed_uids` (peers besides uid 0), `max_connections` (default 2, max 8). See "Host threats" below. |
-| `control_plane` | Optional, off when absent. The SOC API `robodr-control-plane/v2`: `listen_tcp` (with `tls` any address, mutual TLS; without, loopback only), `tls` (`cert_chain`, `key_file`, `client_ca`, optional `client_spki_sha256` pins), `unix_socket` (`socket_mode` `"0600"`/`"0660"`), `state_dir` (required, private 0700: request journal, replay store, exports), `soc_keys` (Ed25519 public key files), `max_clock_skew_s` 30, `rate_per_minute` 30, `burst` 10, `max_connections` 4, `max_requests` 1024, `answer_timeout_ms` 5000, `evidence` (optional; evidence API, see below). Needs `finding_signing` (answers are signed). Requests are judged and recorded, **never executed**. See "Control plane" below. |
+| `control_plane` | Optional, off when absent. The SOC API `robodr-control-plane/v2`: `listen_tcp` (with `tls` any address, mutual TLS; without, loopback only), `tls` (`cert_chain`, `key_file`, `client_ca`, optional `client_spki_sha256` pins), `unix_socket` (`socket_mode` `"0600"`/`"0660"`), `state_dir` (required, private 0700: request journal, replay store, exports), `soc_keys` (Ed25519 public key files), `max_clock_skew_s` 30, `rate_per_minute` 30, `burst` 10, `max_connections` 4, `max_requests` 1024, `answer_timeout_ms` 5000, `evidence` (optional; evidence API, see below). Needs `finding_signing` (answers are signed). Requests are judged and recorded, **never executed** unless `executor` is enabled. See "Control plane" below. |
 | `daemon` | `queue_capacity` 4096 (max 65536), `queue_bytes` 33554432 (32 MiB; 1 MiB..=256 MiB), `tick_ms` 1000, `heartbeat_ms` 10000, `silence_ms` 30000, `lag_ms` 2000, `health_report_ms` 10000, `exit_when_inputs_end` false |
 
 **Key.** Keys are never accepted on the command line. `blackbox.key_file`
@@ -315,9 +315,11 @@ the responder's catalog (`robodr_responder::actions`: `restrict_motion`,
 `quarantine_node`, `isolate_network`, `record_evidence`, `safe_pause`,
 `request_safe_state`, `rollback_config`) and export black-box evidence, over
 a small, bounded, fuzzed HTTP/1.1 layer (`src/control/`). The answer is
-truthful about what happens: **nothing is executed.** The only executor is
-the recording one, so an accepted request is `recorded_not_executed`
-(`"executed": false`), "accepted and recorded as a plan".
+truthful about what happens: without executor v1 (below, off by default)
+**nothing is executed.** The executor is then the recording one, so an
+accepted request is `recorded_not_executed` (`"executed": false`),
+"accepted and recorded as a plan". With it, executor states are answered
+(signed) and journalled like every other state (see "Executor v1").
 
 ```json
 "control_plane": {
@@ -413,6 +415,40 @@ the recording one, so an accepted request is `recorded_not_executed`
 - **Status.** `status.json` and heartbeats carry `control_plane` (listeners,
   executor, counters incl. `tls_failures`, `last_auth_failure`, TLS
   identity, replay store, persistent state, evidence).
+
+## Executor v1 (`executor`, off by default)
+
+Without an `executor` section, or with `"enabled": false`, the paragraphs
+above hold: nothing is executed. With `"enabled": true`
+(`src/executor_link.rs`), agentd hands work to the separate
+`robodr-executor` process (`crates/robodr-executor`). That process is the
+only RoboDR unit with `CAP_NET_ADMIN`; agentd gains no capability. Work
+goes over an HMAC-authenticated unix socket (`socket`, `key_file`):
+
+- **Control-plane requests.** An accepted request is first recorded in the
+  black box (until then it is only staged), then sent from a worker
+  thread through a bounded queue. The detection loop never waits on the
+  executor. Request states go `pending` → `verified` / `refused` (the
+  executor's own code) / `failed`, then `reverted` after a revert request,
+  TTL expiry or reconciliation (contract §6a). Each state the executor
+  reports is an `executor` entry of the v2 request journal
+  (`control_plane.state_dir`), fsynced before it is answered and written
+  as the outcome arrives (not only when the SOC asks); a revert is
+  journalled with `revert_begin` / `revert_commit` and dispatched to the
+  executor only once its black-box note exists. After a restart the
+  journalled state is answered, and agentd asks the executor once about
+  the requests still `pending` / `verified`.
+- **Planner steps** (`planner_orders`, default `true`). Steps of an
+  Eligible plan that `steps_without_approval_for` offers for the policy's
+  own morphology, with black-box evidence, become orders. These are
+  network isolation and participant quarantine only.
+- **Safety state.** Immediately before it applies anything, the executor
+  asks for the safety state. agentd answers from a cell its main loop
+  refreshes every iteration, together with the cell's age.
+- **`record_evidence`.** A critical black-box mark (`robodr.evidence_mark`)
+  naming the request's evidence.
+- **Events.** The executor's events are recorded as `robodr.executor_event`
+  notes. `status.json` carries `executor` counters.
 
 ## Outputs
 
@@ -519,6 +555,7 @@ request.
 | `tests/motion_live.rs` | A synthetic pcap with SEDP plus CDR `Twist` on `rt/cmd_vel` (0.4 m/s, then 2.5 m/s against a 1.0 m/s envelope) and CDR `Odometry` on `rt/odom`: three motion events reach the agent, exactly one Critical `robot.motion.linear_over_envelope` finding is spooled, the black box holds the decoded command (with its writer GUID) and a firewall verdict with `enforcing: false`, and verifies. A garbage payload on `rt/cmd_vel` yields one Medium `robot.motion.undecodable_sample` and the next good command still flows. `sensor.motion` keys are strict. |
 | `tests/review_regressions.rs` | Fourth-review fixes: no busy loop once every input ended (thread CPU < 25% of wall, state `unknown`); a malformed-only stream is never `ok` (`input_silent` + `input_malformed`); `..` and a late symlink cannot alias spool and black box; a live event socket is not stolen and cleanup checks the inode; the queue's byte budget; `READY`/`WATCHDOG`/`STATUS`/`STOPPING` over a notify socket and stale or other-boot `status.json` read as `unknown`; hostile event lines do not panic. |
 | `tests/host_threats.rs` | The host-threat socket, with the test playing `robodr-threat-forward`: a synthetic capture (rogue participant and `cmd_vel` writer) plus a Pulsar shell threat fire `coordinated_intrusion` (Critical, enforce); three host rules from one process fire `host_process_persistence`; the sensor's own threat is not counted twice; junk lines and the forwarder's reported losses are health findings; a host input with no forwarder reads `unknown` and goes silent, and a Pulsar service-stop threat with that silence is the observe-only `defense_tampering`; config and socket-directory checks. |
+| `tests/executor_link.rs` | executor v1 on control plane v2: the real daemon with an in-process `robodr-executor` (in-memory nftables model), signed requests over the unix socket and mutual TLS (every answer's signature verified): `pending` → `verified` → `reverted`, an executor refusal (`motion_path`), a `record_evidence` mark, an advisory `restrict_motion`, refusal under e-stop, executor events in the black box; executor states across two restarts (a request verified while nobody asked, a revert after a restart); an unreachable executor fails the request; the strict `executor` section. |
 | `tests/control_plane.rs` | The control-plane API v2 on the real daemon with a test SOC key, over the unix socket, loopback TCP and mutual TLS (OpenSSL test PKI in `tests/data/control-tls/`, `gen.sh`): the robot snapshot; `restrict_motion` accepted and answered `recorded_not_executed` (`executed: false`, ladder step, evidence link), an idempotent resubmission, a GET with a percent-encoded id; a replay, a tampered body, an unknown key, a stale timestamp, a request signed for another robot, a v1-domain signature and one without credentials refused (401); an unknown action, a missing ttl and a motion field refused (400) and recorded; under e-stop (PLC socket feed) `request_safe_state` refused `safety_system_engaged`; revert `not_applied`, an irreversible revert refused; every answer signed with the finding key; mTLS: the SOC certificate + signature accepted, a valid certificate without or with a bad signature refused (401), no client certificate / another CA / an unpinned key / an expired certificate / plain HTTP get no channel (each with its reason in `last_auth_failure`), counted and reported; without pins any certificate of the CA (still not an expired one); restart: the same answer to a status query, the earlier request's replay refused, a resubmission a duplicate, a removed replay store fences; evidence: inventory, an export of a decision's evidence link, the manifest signature, a chunked download resumed after a "disconnect", the bundle verified with the black-box public key file only, tamper detected, no key material in it, idempotency / conflict / limit / out-of-range / invalid body, delete, the export surviving a restart and its black-box note; the observe-only findings; the black box verifies and the recorded SOC signature re-verifies offline. Off by default; strict config (TLS key permissions, wrong key for the certificate, pins, `allow_remote`, `finding_signing` required, state directory mode). |
 | `tests/control_plane_vectors.rs` | The contract vectors `docs/contracts/fixtures/control-plane-v2/` are byte-identical to the generator (`examples/control_plane_vectors.rs`) and hold against the implementation: requests authenticate (or are refused 401) and route as stated, answer and manifest signatures verify, chunks reassemble to the bundle, the bundle verifies with the black-box public key and the tampered copy does not. |
 | `tests/fuzz_smoke.rs` | The `control_plane_request` libFuzzer harness (`fuzz/harness/control_plane_request.rs`) driven by the std-only mutator over generated, signed seeds of every route (the seeds take the success path; the corpus equals the generator). |
@@ -563,10 +600,12 @@ request.
   There is no process-to-socket attribution, so unit-scoped rules
   (`coordinated_intrusion`, `defense_tampering`) join host and network
   evidence by time window only.
-- **Plans are never executed.** The agent's executor is `NoopExecutor`.
-  Dispositions are recorded and reported only. Control-plane requests are
-  judged and recorded the same way (`recorded_not_executed`); there is no
-  executor that reaches the robot.
+- **Plans are not executed by default.** Without executor v1 the agent's
+  executor is `NoopExecutor`: dispositions are recorded and reported only,
+  and control-plane requests are judged and recorded the same way
+  (`recorded_not_executed`). With `executor.enabled`, only the reversible
+  network actions and evidence marks reach the robot, through
+  `robodr-executor`.
 - **Control plane: tested locally only.** mTLS, signatures, the journal
   and the evidence API were exercised with an in-process client and an
   OpenSSL test PKI over loopback, not against a deployed SOC or across a

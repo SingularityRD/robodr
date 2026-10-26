@@ -21,7 +21,11 @@ black box and writes validated OCSF findings to a spool directory. It reports
 its own health and is never "OK" while blind.
 .PP
 It is read\-only on networks and protective only: response plans are
-recorded, never executed. It does not override the platform's safety system,
+recorded, never executed by agentd itself; only with
+.B executor.enabled
+(off by default) are the reversible network actions handed to the separate
+.BR robodr\-executor ,
+which alone holds CAP_NET_ADMIN. It does not override the platform's safety system,
 e\-stop or command authority.
 .PP
 Normally started by
@@ -159,7 +163,10 @@ the High, observe\-only finding
 (contract
 .IR /usr/share/doc/robodr/contracts/robodr.control\-plane.md ):
 action requests for the seven catalog actions, judged against the live
-safety state and recorded, never executed, and (with
+safety state and recorded, executed only through
+.B executor
+(executor v1, off by default; its states are signed and journalled like
+every other), and (with
 .BR control_plane.evidence )
 black\-box evidence exports.
 .TP

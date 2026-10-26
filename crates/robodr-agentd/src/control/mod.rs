@@ -10,10 +10,14 @@
 //! With `evidence` configured, the SOC also lists and exports black-box
 //! evidence ([`evidence`]). Contract: `docs/contracts/robodr.control-plane.md`.
 //!
-//! **Nothing is executed.** The only executor is [`api::RecordingExecutor`]:
-//! an accepted request is answered `recorded_not_executed`
-//! (`"executed": false`), "accepted and recorded as a plan", never
-//! `applied`. RoboDR never overrides the platform's safety authority: the
+//! **Nothing is executed by default.** The executor is
+//! [`api::RecordingExecutor`]: an accepted request is answered
+//! `recorded_not_executed` (`"executed": false`), "accepted and recorded as
+//! a plan", never `applied`. Only with agentd's `executor.enabled` (executor
+//! v1, [`crate::executor_link`]) is the engine's executor replaced
+//! ([`api::Engine::set_executor`]): requests then read `pending`,
+//! `verified`, `refused`, `failed`, `reverted`, each state journalled
+//! ([`state`]) before it is answered (signed like every answer). RoboDR never overrides the platform's safety authority: the
 //! strongest action is a *request* for a safe state, and while the safety
 //! system is engaged every request is refused.
 //!

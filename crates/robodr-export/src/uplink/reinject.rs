@@ -254,6 +254,11 @@ pub fn reinject(o: &ReinjectOptions) -> Result<ReinjectReport, UplinkError> {
     if o.dead_letters.is_empty() {
         return Err(UplinkError::Config("no dead-letter file given".into()));
     }
+    if !(1024..=16 * 1024 * 1024).contains(&o.max_record_bytes) {
+        return Err(UplinkError::Config(
+            "max_record_bytes must be in 1024..=16777216".into(),
+        ));
+    }
     let dir = o.state_dir.join(REINJECT_DIR);
     let queued_before = ledger(&dir)?;
     let mut rep = ReinjectReport::default();

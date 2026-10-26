@@ -14,9 +14,16 @@
 //! 5. answer
 //! ```
 //!
-//! A revert that changes a request's state (the first `not_applied`)
-//! follows the same steps with `revert_begin` / `revert_commit` /
-//! `revert_abort`.
+//! A revert that changes a request's state (the first revert record:
+//! `not_applied`, or an executor revert `pending` / `reverted`; or a status
+//! that becomes `reverted`) follows the same steps with `revert_begin` /
+//! `revert_commit` / `revert_abort`.
+//!
+//! executor v1: the executor's word on a request (`verified`, `refused`,
+//! `failed`, `reverted`, ...) is one `executor` entry, appended (fsync)
+//! before the new state is answered; it is the executor's own record, not a
+//! decision, so it has no begin/commit pair. A request that read `verified`
+//! reads `verified` after a restart.
 //!
 //! Crash points: before 2, nothing happened (a resubmission is judged
 //! anew). Between 2 and 4 the journal holds a dangling `begin`: at the next
@@ -60,16 +67,31 @@ pub const REFUSAL_CODES: [&str; 13] = [
     "revert_unsupported",
 ];
 
+/// The refusal code an executor answer carries when it names none
+/// (`crate::executor_link`).
+pub const EXECUTOR_REFUSED: &str = "executor_refused";
+
+/// A persisted refusal code: the control plane's own, or (executor v1) the
+/// executor's (`robodr_executor::decision::codes`).
 fn static_code(s: &str) -> Option<&'static str> {
-    REFUSAL_CODES.iter().copied().find(|c| *c == s)
+    REFUSAL_CODES
+        .iter()
+        .copied()
+        .find(|c| *c == s)
+        .or_else(|| robodr_executor::decision::codes::intern(s))
+        .or((s == EXECUTOR_REFUSED).then_some(EXECUTOR_REFUSED))
 }
 
 fn static_executor(s: &str) -> Option<&'static str> {
-    ["recording"].into_iter().find(|c| *c == s)
+    ["recording", "robodr-executor"]
+        .into_iter()
+        .find(|c| *c == s)
 }
 
 fn static_revert_result(s: &str) -> Option<&'static str> {
-    ["not_applied"].into_iter().find(|c| *c == s)
+    ["not_applied", "pending", "reverted"]
+        .into_iter()
+        .find(|c| *c == s)
 }
 
 fn parse_status(s: &str) -> Option<Status> {
@@ -79,6 +101,8 @@ fn parse_status(s: &str) -> Option<Status> {
         "applied" => Status::Applied,
         "refused" => Status::Refused,
         "failed" => Status::Failed,
+        "verified" => Status::Verified,
+        "reverted" => Status::Reverted,
         _ => return None,
     })
 }
@@ -119,6 +143,24 @@ pub struct PStored {
     pub revert: Option<PRevert>,
 }
 
+impl PRefusal {
+    pub fn of(r: &Refusal) -> Self {
+        Self {
+            code: r.code.to_string(),
+            reason: r.reason.clone(),
+            safety_state: r.safety_state,
+        }
+    }
+
+    pub fn to_refusal(&self) -> Option<Refusal> {
+        Some(Refusal {
+            code: static_code(&self.code)?,
+            reason: self.reason.clone(),
+            safety_state: self.safety_state,
+        })
+    }
+}
+
 impl PStored {
     pub fn of(s: &Stored) -> Self {
         Self {
@@ -126,11 +168,7 @@ impl PStored {
             digest: s.digest.clone(),
             key_id: s.key_id.clone(),
             status: s.status.as_str().to_string(),
-            refusal: s.refusal.as_ref().map(|r| PRefusal {
-                code: r.code.to_string(),
-                reason: r.reason.clone(),
-                safety_state: r.safety_state,
-            }),
+            refusal: s.refusal.as_ref().map(PRefusal::of),
             safety_state: s.safety_state,
             accepted: s.accepted.clone(),
             error: s.error.clone(),
@@ -151,11 +189,7 @@ impl PStored {
         }
         let refusal = match &self.refusal {
             None => None,
-            Some(r) => Some(Refusal {
-                code: static_code(&r.code)?,
-                reason: r.reason.clone(),
-                safety_state: r.safety_state,
-            }),
+            Some(r) => Some(r.to_refusal()?),
         };
         let revert = match &self.revert {
             None => None,
@@ -232,6 +266,42 @@ pub enum Entry {
     RevertAbort {
         decision_id: String,
     },
+    /// executor v1: the executor's word on a stored request (its status,
+    /// error and refusal after it).
+    Executor {
+        request_id: String,
+        status: String,
+        error: Option<String>,
+        refusal: Option<PRefusal>,
+    },
+}
+
+/// Apply an `executor` entry to a stored request; `false` if it does not
+/// convert back (damage). An entry for a request no longer stored (evicted)
+/// is ignored.
+fn apply_executor(
+    store: &mut HashMap<String, Stored>,
+    request_id: &str,
+    status: &str,
+    error: &Option<String>,
+    refusal: &Option<PRefusal>,
+) -> bool {
+    let Some(status) = parse_status(status) else {
+        return false;
+    };
+    let refusal = match refusal {
+        None => None,
+        Some(r) => match r.to_refusal() {
+            Some(r) => Some(r),
+            None => return false,
+        },
+    };
+    if let Some(s) = store.get_mut(request_id) {
+        s.status = status;
+        s.error = error.clone();
+        s.refusal = refusal;
+    }
+    true
 }
 
 /// The journal plus its bookkeeping.
@@ -329,9 +399,9 @@ pub fn open(dir: &Path, max: usize) -> std::io::Result<(RequestJournal, Restored
                 Some((id, mut rv)) => {
                     rv.evidence = evidence;
                     match (store.get_mut(&id), rv.to_record()) {
-                        (Some(s), Some(rec)) if s.revert.is_none() => s.revert = Some(rec),
-                        // Evicted since, or already reverted: nothing to do.
-                        (_, Some(_)) => {}
+                        (Some(s), Some(rec)) => apply_revert(s, rec),
+                        // Evicted since: nothing to do.
+                        (None, Some(_)) => {}
                         (_, None) => r.damaged += 1,
                     }
                 }
@@ -339,6 +409,27 @@ pub fn open(dir: &Path, max: usize) -> std::io::Result<(RequestJournal, Restored
             },
             Entry::RevertAbort { decision_id } => {
                 r.pending_reverts.remove(&decision_id);
+            }
+            Entry::Executor {
+                request_id,
+                status,
+                error,
+                refusal,
+            } => {
+                if !apply_executor(&mut store, &request_id, &status, &error, &refusal) {
+                    r.damaged += 1;
+                } else if !store.contains_key(&request_id) {
+                    // Its decision is still dangling (a commit that did not
+                    // reach the journal): carry the executor's word into the
+                    // begin, so the black box's verdict settles it with it.
+                    for p in r.pending.values_mut() {
+                        if p.request.request_id == request_id {
+                            p.status.clone_from(&status);
+                            p.error.clone_from(&error);
+                            p.refusal.clone_from(&refusal);
+                        }
+                    }
+                }
             }
         }
     }
@@ -354,6 +445,18 @@ pub fn open(dir: &Path, max: usize) -> std::io::Result<(RequestJournal, Restored
         },
         r,
     ))
+}
+
+/// A committed revert on its request: the first revert record is kept, and
+/// an executor revert that reported `reverted` makes the request
+/// `reverted`.
+fn apply_revert(s: &mut Stored, rec: RevertRecord) {
+    if rec.result == "reverted" {
+        s.status = Status::Reverted;
+    }
+    if s.revert.is_none() {
+        s.revert = Some(rec);
+    }
 }
 
 /// Settle the dangling decisions of `r` with the black box's verdict
@@ -407,9 +510,7 @@ pub fn resolve(
                     r.stored.iter_mut().find(|s| s.request.request_id == rid),
                     rv.to_record(),
                 ) {
-                    if s.revert.is_none() {
-                        s.revert = Some(rec);
-                    }
+                    apply_revert(s, rec);
                 }
                 committed += 1;
             }

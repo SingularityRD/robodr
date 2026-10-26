@@ -338,6 +338,51 @@ sprint, AC'leri karşılanmadan kapanmaz.
   kurulum kılavuzu taslağı) 1–2 tasarım ortağına; geri alınabilir aksiyonlar gerçek
   robotta uygulanır/geri alınır; 24 saat kesintisiz çalışma.
 
+> **Durum (2026-10-26): executor v1 kodda tamam; saha (Q, Kapı 2) açık.**
+>
+> - ✅ Yeni crate `robodr-executor`. Saf karar (`precheck`: aksiyon ×
+>   morfoloji × safety state × politika, yürütücünün **kendi** politikası
+>   ve yapılandırması), apply'dan hemen önce safety state'in yeniden
+>   kontrolü, adaptörler ve diğer bileşenler:
+>   - `isolate_network`: nftables, ayrı `inet robodr` tablosu; yönetim /
+>     uplink allow-list'i, kontrol veriyolları ve hareket kontrol yolu
+>     muaf.
+>   - `quarantine_node`: RTPS GUID prefix raw-payload eşleşmesi ve SPDP
+>     locator IP+port.
+>   - `record_evidence`: kara kutu işareti ve bundle referansları.
+>   - `restrict_motion`: yalnız tavsiye olarak kaydedilir (gateway S8'de).
+>   - Uygulama zinciri: `nft -j -f` atomik tüm-tablo transaction'ı,
+>     read-back doğrulaması, tam ve idempotent revert.
+>   - TTL: kalıcı son tarih, saat geri gitse bile uzamaz.
+>   - Write-ahead journal ve yeniden başlatma / reboot / çökme uzlaşması.
+>   - Operatörün `nft delete table inet robodr` acil kapatması her durumda
+>     onurlandırılır.
+> - ✅ Ayrı süreç ve unit `robodr-executor.service`: yalnız
+>   `CAP_NET_ADMIN`, AF_UNIX + AF_NETLINK, `IPAddressDeny=any`; focal
+>   varyantı da var. agentd'de `CAP_NET_ADMIN` **yok**. Haberleşme HMAC ile
+>   doğrulanan unix socket protokolüyle.
+> - ✅ agentd bağlantısı (`executor.enabled`, varsayılan kapalı). Onaylanmış
+>   kontrol düzlemi istekleri ve planlayıcının uygun adımları
+>   (`planner_orders`) yürütücüye gider. Durumlar: `pending` → `verified` /
+>   `refused` / `failed` → `reverted` (sözleşme §6a).
+> - ✅ Testler:
+>   - karar matrisi (7×7×7×2×4×2);
+>   - gerçek nftables ve network namespace'lerde veth eşleri arasında UDP
+>     trafiği: izolasyon, GUID / locator karantinası, tam revert, TTL,
+>     restart / reboot, apply ile journal arasında çökme, yabancı tablolara
+>     dokunulmaması, insansı redleri;
+>   - agentd uçtan uca.
+> - ❌ Başarısız revert → High bulgu henüz yok. Bulgu kataloğuna giriş,
+>   findings sözleşmesinde 2.2 minor bump gerektirir (diyot doğrulayıcısı
+>   ve SOC ile birlikte yapılmalı). Şimdilik sinyal yolları: istek durumu,
+>   kritik `robodr.executor_event` notu ve `status.json`
+>   `executor.revert_failures`.
+> - ❌ agentd henüz SPDP locator'larını iletmiyor; v1 GUID ile karantinaya
+>   alıyor. `node` hedefi reddediliyor.
+> - ⏳ Q / Kapı 2: tasarım ortağı robotunda kurulum, gerçek robotta
+>   uygula / geri al, 24 saat koşu. Unit henüz gerçek systemd altında
+>   çalıştırılmadı.
+
 ### Sprint 8 — Motion Firewall gateway + safe-pause adaptörleri
 
 - **R:** ROS 2 in-path gateway (`robodr-firewall-gw`): `/cmd_vel` ve

@@ -7,9 +7,15 @@ case "$1" in
 remove | deconfigure)
     if [ -d /run/systemd/system ]; then
         for u in robodr-spool-export.service robodr-kafka-publish.service robodr-uplink.service \
-            robodr-agentd.service robodr-pulsard.service robodr-anchor-receiver.service; do
+            robodr-agentd.service robodr-pulsard.service robodr-anchor-receiver.service \
+            robodr-executor.service; do
             systemctl stop "$u" 2>/dev/null || true
         done
+    fi
+    # executor v1: without the executor nothing would lift its actions at
+    # their TTL, so its table goes with it (only this table, never another).
+    if command -v nft >/dev/null 2>&1 && nft list table inet robodr >/dev/null 2>&1; then
+        nft delete table inet robodr || true
     fi
     ;;
 upgrade | failed-upgrade) ;;

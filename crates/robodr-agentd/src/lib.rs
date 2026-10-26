@@ -84,6 +84,8 @@
 pub mod config;
 pub mod control;
 pub mod daemon;
+/// executor v1 link (robodr-executor process; `executor.enabled`).
+pub mod executor_link;
 pub mod health;
 pub mod host;
 pub mod input;

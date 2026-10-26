@@ -116,10 +116,19 @@ contract `docs/contracts/robodr.control-plane.md`) lets a SOC request one
 of the seven catalog containment actions and export black-box evidence. The
 claims are:
 
-- **Nothing is executed.** In this release the only executor records: an
+- **Nothing is executed unless executor v1 is enabled.** By default (no
+  `executor` section, or `"enabled": false`) the only executor records: an
   accepted request is answered `recorded_not_executed` (`"executed":
   false`) and written to the black box as a plan; nothing is sent to the
-  robot, its network, its mission executive or its safety system.
+  robot, its network, its mission executive or its safety system. With
+  `executor.enabled`, agentd hands `isolate_network` / `quarantine_node`
+  (reversible nftables rules with a TTL) and `record_evidence` to the
+  separate `robodr-executor` (the only `CAP_NET_ADMIN` unit), only after
+  the request's black-box note exists; the executor re-checks the live
+  safety state before it applies. Its states (`verified`, `refused`,
+  `failed`, `reverted`) are signed answers and journalled like every other
+  state. Motion, safe-pause, safe-state and rollback actions are never
+  executed.
 - **No channel without the SOC's certificate.** Off loopback the API is
   served only over mutual TLS (rustls): the peer must present a client
   certificate that chains to the configured SOC CA, is valid now and, if

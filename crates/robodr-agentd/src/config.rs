@@ -245,6 +245,11 @@ pub struct DaemonConfig {
     /// Findings topic and `data_source` (see [`FindingsSection`]).
     #[serde(default)]
     pub findings: FindingsSection,
+    /// executor v1: the link to `robodr-executor` (see
+    /// [`crate::executor_link`]); absent or `enabled: false` (the default)
+    /// = nothing is executed.
+    #[serde(default)]
+    pub executor: Option<crate::executor_link::ExecutorSection>,
 }
 
 /// `correlation`: the `robodr-correlate` engine over every finding the
@@ -751,6 +756,8 @@ pub struct Resolved {
     pub host_threats: Option<crate::host::HostThreatsSpec>,
     /// The validated control-plane API (listeners, SOC keys), if configured.
     pub control_plane: Option<crate::control::ControlPlaneSpec>,
+    /// executor v1: the enabled executor link (`None` = off).
+    pub executor: Option<crate::executor_link::ExecutorSpec>,
     /// `firewall.joint_config`, parsed (its `platform` and
     /// `joint_channels`).
     pub firewall_joint: Option<robodr_firewall::FirewallConfig>,
@@ -1381,6 +1388,30 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
             Some(spec)
         }
     };
+    // --- executor v1 -------------------------------------------------------
+    let executor = match &config.executor {
+        None => None,
+        Some(e) => {
+            let spec = e.resolve()?;
+            if let Some(x) = &spec {
+                if !policy.oem_validated {
+                    warnings.push(
+                        "executor: the response policy is not OEM-validated, so the executor \
+                         refuses every action (observe_mode)"
+                            .into(),
+                    );
+                }
+                if control_plane.is_none() && !x.planner_orders {
+                    warnings.push(
+                        "executor: enabled, but without control_plane and with planner_orders \
+                         false nothing is ever handed to it"
+                            .into(),
+                    );
+                }
+            }
+            spec
+        }
+    };
     match &config.blackbox.head_anchor {
         None => warnings.push(
             "blackbox.head_anchor is not configured: the black box is not anchored; a cut of \
@@ -1478,6 +1509,7 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         finding_key,
         host_threats,
         control_plane,
+        executor,
         firewall_joint,
         robot_model,
         warnings,
