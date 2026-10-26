@@ -25,6 +25,13 @@
 //!   fsynced; then appends continue on the new file. A crash before the
 //!   rename leaves the old journal intact (the temp file is removed at the
 //!   next open); after it, the new one, which holds the same live state.
+//!   After the rename, appends always go to the new file; if the directory
+//!   fsync failed (the rename might not survive a power loss), the journal
+//!   refuses every append until it is reopened (fail closed).
+//! * **A survived append failure** (short write on a full disk, an fsync
+//!   error) is rolled back by cutting the file to its previous length, so
+//!   no later line follows a fragment; if that fails too, the journal
+//!   refuses every append until it is reopened.
 //!
 //! # Loading (what a crash or damage leaves behind)
 //!
@@ -288,7 +295,9 @@ impl Journal {
         }
         let file = if damaged_lines > 0 || good_end == 0 {
             // Rewrite from the good entries (their exact JSON values).
-            rewrite(dir, name, kind, &kept)?
+            let (f, synced) = rewrite(dir, name, kind, &kept)?;
+            synced?;
+            f
         } else {
             if loaded.torn_bytes > 0 {
                 let f = std::fs::OpenOptions::new()
@@ -381,17 +390,29 @@ impl Journal {
             .iter()
             .map(|e| serde_json::to_value(e).map_err(io::Error::other))
             .collect::<io::Result<_>>()?;
-        self.file = rewrite(&self.dir, &self.name, &self.kind, &values)?;
+        let (file, synced) = rewrite(&self.dir, &self.name, &self.kind, &values)?;
+        // The rename happened: from now on only the new file is the
+        // journal (appending to the old handle would write into the
+        // replaced inode). If the rename may not be durable (the directory
+        // fsync failed), refuse every append until the next open.
+        self.file = file;
         self.lines = values.len();
         self.len = self.file.metadata()?.len();
-        self.poisoned = false;
-        Ok(())
+        self.poisoned = synced.is_err();
+        synced
     }
 }
 
 /// Write `values` under a fresh header to a temp file, fsync, rename over
-/// `dir/name`, fsync the directory; the append handle of the result.
-fn rewrite(dir: &Path, name: &str, kind: &str, values: &[Value]) -> io::Result<File> {
+/// `dir/name`, fsync the directory. `Err` if the journal was not replaced;
+/// otherwise the append handle of the new file and whether the directory
+/// fsync (the rename's durability) succeeded.
+fn rewrite(
+    dir: &Path,
+    name: &str,
+    kind: &str,
+    values: &[Value],
+) -> io::Result<(File, io::Result<()>)> {
     let tmp = dir.join(format!("{name}.tmp-{}", fsutil::random_hex16()?));
     let res = (|| {
         let mut f = fsutil::create_new_private(&tmp)?;
@@ -407,9 +428,7 @@ fn rewrite(dir: &Path, name: &str, kind: &str, values: &[Value]) -> io::Result<F
         fault("journal.compact.before_sync")?;
         f.sync_all()?;
         fault("journal.compact.before_rename")?;
-        std::fs::rename(&tmp, dir.join(name))?;
-        fault("journal.compact.before_dir_sync")?;
-        fsutil::sync_dir(dir)
+        std::fs::rename(&tmp, dir.join(name))
     })();
     if let Err(e) = res {
         #[cfg(test)]
@@ -420,7 +439,11 @@ fn rewrite(dir: &Path, name: &str, kind: &str, values: &[Value]) -> io::Result<F
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    fsutil::open_append_nofollow(&dir.join(name))
+    let synced = fault("journal.compact.before_dir_sync")
+        .and_then(|()| fault("survive.journal.compact.dir_sync"))
+        .and_then(|()| fsutil::sync_dir(dir));
+    let file = fsutil::open_append_nofollow(&dir.join(name))?;
+    Ok((file, synced))
 }
 
 fn create_with_header(dir: &Path, name: &str, kind: &str) -> io::Result<File> {
@@ -668,6 +691,31 @@ mod tests {
         let (_, l) = open(&d);
         assert_eq!(ns(&l), [1, 3, 4]);
         assert_eq!((l.damaged, l.torn_bytes), (0, 0));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A compaction whose rename happened but whose directory fsync failed
+    /// (and the process lives on): appends never go to the replaced file;
+    /// the journal refuses them until it is reopened, which sees the new
+    /// file.
+    #[test]
+    fn a_failed_directory_sync_after_the_rename_fails_closed() {
+        let d = tmp("dirsync");
+        let (mut j, _) = open(&d);
+        j.append(&e(1)).unwrap();
+        fault::arm("survive.journal.compact.dir_sync", 1);
+        assert!(j.compact(&[e(2)]).is_err());
+        assert!(!fault::fired());
+        assert!(
+            j.append(&e(3)).is_err(),
+            "appends are refused once the rename may not be durable"
+        );
+        drop(j);
+        let (mut j, l) = open(&d);
+        assert_eq!(ns(&l), [2]);
+        j.append(&e(4)).unwrap();
+        drop(j);
+        assert_eq!(ns(&open(&d).1), [2, 4]);
         let _ = std::fs::remove_dir_all(&d);
     }
 

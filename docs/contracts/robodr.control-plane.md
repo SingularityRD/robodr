@@ -417,7 +417,11 @@ header `{"t":"header","format":"robodr-cp-journal/v1","kind":...}`. Each
 append is one write followed by `fdatasync`; a failed append is rolled back
 (the file is cut to its previous length) or, if even that fails, the journal
 refuses further appends until restart. Compaction writes the live state to a
-temp file, fsyncs it, renames it over the journal and fsyncs the directory.
+temp file, fsyncs it, renames it over the journal and fsyncs the directory;
+if that last fsync fails, the journal also refuses appends until restart
+(fail closed: requests are answered `failed` / `state_unavailable`, or 503
+`replay_store_unavailable`), since the rename might not survive a power
+loss.
 At open, an unterminated or bad last line is a torn append (cut); a bad line
 followed by good ones is damage (counted, the file copied to `quarantine/`,
 rewritten without it). The journal is operational state, not evidence: it is
