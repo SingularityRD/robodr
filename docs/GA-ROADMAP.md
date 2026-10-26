@@ -1,6 +1,7 @@
 # RoboDR + AutoSecOps — GA Yol Haritası
 
-> Durum: **plan** (2026-10-25). Bu belge `docs/SPRINTS.md` ve `docs/ROADMAP.md`'nin
+> Durum: **plan** (2026-10-25; durum notları 2026-10-26'da güncellendi, dal başı
+> `332d88f`). Bu belge `docs/SPRINTS.md` ve `docs/ROADMAP.md`'nin
 > ticari ürün (GA) hedefli halefidir. Eski AutoSecOps entegrasyonu (`autosecops2`,
 > `core/ingestion/kafka_consumer_service.py`, `core/integrations/robot_edr/`,
 > `AUTONOMOUS_ELIGIBLE`, `robodr-integration` dalı) **iptal edilmiştir**; yerine
@@ -14,10 +15,10 @@
 | | RoboDR (bu repo) | AutoSecOps1 |
 |---|---|---|
 | Ne | Robot EDR: ROS 2/DDS grafiği, Motion Firewall, Cyber-Jidoka yanıt planlayıcı, imzalı kara kutu, diyot ihracı | Agentic SOAR/SOC: workflow (Temporal), case yönetimi, agent preset'leri, 100+ entegrasyon, MCP |
-| Dil / yığın | Rust (19 crate, ~115k satır), Pulsar (eBPF) | Python FastAPI + Next.js + Temporal + Postgres + MinIO + Redis (Tracecat çatalı) |
-| Olgunluk | `0.1.0-alpha.1`, hiç release/tag yok, **gerçek robotta hiç çalışmadı** | Çalışan platform, `1.0.0` imajları; robot/OCSF/Kafka desteği **yok** |
-| Test (2026-10-25, bu oturum) | 16 saf crate: **1997 geçti / 0 kaldı / 14 ignored** (`cargo test --locked`) | Çalıştırılmadı (docker yığını gerekir) — S0'da CI'da koşturulacak |
-| GA'yı en çok engelleyen | Yanıt hiçbir şey yürütmüyor; TLS yok; saha doğrulaması yok; konsol/filo yönetimi yok; lisans/aktivasyon yok | Robot ingest yok; kanıt paketleri ek allowlist'ine takılıyor; iki-kişi onayı yok; geliştirme lisans anahtarı gömülü |
+| Dil / yığın | Rust (22 workspace üyesi: 19 saf + 3 Pulsar'a bağlı; `crates/**/*.rs` testler dahil ~240k satır), Pulsar (eBPF) | Python FastAPI + Next.js + Temporal + Postgres + MinIO + Redis (Tracecat çatalı) |
+| Olgunluk | `0.1.0-alpha.1`, hiç release/tag yok, **gerçek robotta hiç çalışmadı**. Kodda (2026-10-26): kontrol düzlemi v2 (mTLS, journal, kanıt API'si; v1 kaldırıldı), executor v1 (varsayılan kapalı), in-path gateway `robodr-firewall-gw`, filo yaşam döngüsünün robot tarafı (`robodr-enroll`), S10 sertleştirmesi, `robodr-uplink`, Unitree desteği | Çalışan platform, `1.0.0` imajları. `claude/robodr-ingest` dalında (henüz `main`'e birleşmedi): RoboDR ingest modülü, `tools.robodr.*`, imza/onay (sign-off, iki kişi), Robot SOC preset'i, Robots UI sayfaları, kontrol düzlemi v2 istemcisi + kanıt, Helm, güvenlik taramaları; filo API'si sürüyor (commit'lenmedi) |
+| Test | Son kayıtlı toplam: **2196+ test, 0 hata** (§3a, 2026-10-26; S7–S10 birleşmelerinden önce). Birleşmelerden sonra çalışma alanı genelinde yeniden sayılmadı; her parça kendi testleriyle birleşti (network namespace'te gerçek nftables / NFQUEUE, gerçek `dpkg`, libFuzzer 10 hedef × 630 s) | Ortak sözleşme vektörleri gerçek uç noktaya karşı geçiyor (ingest 26 vaka, kontrol düzlemi v2); ingest benchmark'ı 1000 satırlık batch'te p95 ≈ 1,27 s (`gc.freeze`, yüklü 4 vCPU VM, AutoSecOps `09133dc0`). Bu dalın CI koşu sonuçları burada kayıtlı değil |
+| GA'yı en çok engelleyen | Saha doğrulaması yok (gerçek robot, soak, FP oranı); CI GitHub'da hiç koşmadı; release imzalanmadı; Kafka/anchor TLS yok; `restrict_motion`/`safe_pause` adaptörleri yok; executor SOC imzasını kendisi doğrulamıyor | Dal birleşmedi; filo API'si bitmedi; üretim lisans anahtarı yok; robot sayısı kotası yok; uçtan uca (robot ↔ SOC) gerçek ağda hiç çalışmadı |
 
 **GA tanımı (özet):** Bir müşteri, AutoSecOps1'i self-host kurup RoboDR ajanını
 desteklenen bir robot platformuna (ROS 2 Humble/Jazzy, Fast DDS + Cyclone, amd64 +
@@ -47,16 +48,16 @@ paketleme (Reed-Solomon), reproducible build + SBOM + minisign release pipeline'
 
 | # | Açık | Kanıt |
 |---|---|---|
-| R1 | Yanıt **hiçbir şey yürütmüyor**: responder sadece planlıyor, agentd `NoopExecutor`, Motion Firewall recording-only ve ROS 2 gateway'i yok, kontrol düzlemi yalnızca `recorded_not_executed` döndürüyor | `crates/robodr-responder/README.md:160-191`, `crates/robodr-firewall/README.md:194-255`, `docs/contracts/robot-edr.control-plane.md` §10 |
-| R2 | **TLS yok**: kontrol düzlemi, Kafka istemcisi (SASL de yok), anchor receiver düz metin | `crates/robodr-export/README.md:264-303`, `SECURITY.md:118-121` |
-| R3 | Saha doğrulaması yok: gerçek robot, RTI Connext, SROS2/DDS-Security, donanım TPM, 72 saat soak, FP oranı ölçümü yok; Zenoh kör; Pulsar kuralları gerçek motora hiç yüklenmedi; pulsard sadece WSL2'de | `README.md` Status, `docs/SPRINTS.md` S1–S4 |
-| R4 | Konsol / filo yönetimi / çok kiracılık yok (`robodr-fleet` yok); güncellemeler robot başına `install-bundle.sh`, dpkg ile hiç denenmedi | `docs/ROADMAP.md:110-132`, `packaging/README.md:205-208` |
-| R5 | Anahtarlar düz 0600 JSON dosya; dağıtım/rotasyon/iptal elle | `crates/robodr-blackbox/README.md:670-704` |
-| R6 | CI GitHub'da **hiç koşmadı** (org billing); release workflow'u hiç tetiklenmedi; `MINISIGN_SECRET_KEY` yok; `robodr-anchor-receiver` `.deb` zorunlu listesinde değil | `docs/BUILD.md:536-557`, `.github/workflows/release.yml` |
-| R7 | Ticari model yok: her şey Apache-2.0 (karar: tescilliye geçecek, D9 / S1); lisans anahtarı/aktivasyon yok; ihracat kontrol (Wassenaar 5A2) sınıflandırması yok; Pulsar GPL-2.0 eBPF hukuki incelemesi yok | `Cargo.toml:34`, `docs/SECURE-DELIVERY.md` §11 |
-| R8 | Elle yazılmış kritik bileşenler: SHA-256/HMAC, Reed-Solomon, Kafka wire istemcisi (API v≤8), HTTP/1.1 sunucusu, JSON-Schema eşleyici | `crates/robodr-blackbox/src/crypto.rs`, `crates/robodr-export/src/kafka/`, `crates/robodr-agentd/src/control/` |
-| R9 | Tutarsızlıklar: ~~iki aksiyon listesi çelişiyor (`responder::autosecops` → `record_evidence` var/`rollback_config` yok; kontrol düzlemi tersi)~~ ✅ S1'de çözüldü: tek katalog `robodr-responder::actions`, kontrol düzleminin `ActionKind`'i onun yeniden ihracı (ed4f1ac); `panic = "abort"` → her panik daemon'ı öldürür (açık); bayat dokümanlar S1'de büyük ölçüde düzeltildi (c9512c1) | Eski kanıt (silinen dosya): `git show ed4f1ac^:crates/robodr-responder/src/autosecops.rs`; bugün `crates/robodr-responder/src/actions.rs` |
-| R10 | Müşteri dokümanı yok: kurulum/quick-start, destek matrisi, EULA, SLA; `robodr-maintainers@invalid`, `singularityrd.example` yer tutucuları; `robodr-threat-forward` README/man sayfası yok | `packaging/build-deb.sh:65`, `docs/contracts/robot-edr-finding.schema.json` |
+| R1 | 🟡 **Kısmen çözüldü:** executor v1 geri alınabilir ağ aksiyonlarını yürütüyor (varsayılan kapalı; 0499a47, inceleme 31d1aa4), in-path gateway Unitree hareket kanallarını uyguluyor (a4e0b4b, inceleme e85471c). Kalan: SOC'tan `restrict_motion`, `safe_pause` adaptörleri, ROS 2 `/cmd_vel` / `JointTrajectory` gateway'i, gerçek robotta doğrulama. Eski durum: yanıt **hiçbir şey yürütmüyordu** (responder yalnız plan, agentd `NoopExecutor`, Motion Firewall recording-only, kontrol düzlemi yalnızca `recorded_not_executed`) | `crates/robodr-responder/README.md:160-191`, `crates/robodr-firewall/README.md:194-255`, `docs/contracts/legacy/robot-edr.control-plane.md` §10 |
+| R2 | 🟡 **Kısmen çözüldü:** kontrol düzlemi v2 mTLS (a158536); uplink ve enroll TLS. **Açık:** Kafka istemcisi (TLS/SASL yok) ve anchor receiver düz metin | `crates/robodr-export/README.md:264-303`, `SECURITY.md:118-121` |
+| R3 | ❌ **Açık.** Saha doğrulaması yok: gerçek robot, RTI Connext, SROS2/DDS-Security, donanım TPM, 72 saat soak, FP oranı ölçümü yok; Zenoh kör; Pulsar kuralları gerçek motora hiç yüklenmedi; pulsard sadece WSL2'de | `README.md` Status, `docs/SPRINTS.md` S1–S4 |
+| R4 | 🟡 **Kısmen çözüldü:** `robodr-fleet` / `robodr-enroll` robot tarafı (1de502d, inceleme 3083030); `install-bundle.sh` gerçek `dpkg` ile test edildi, format kapısı, downgrade ve güvenlik tabanı (3d36c65, ace7fba); AutoSecOps Robots sayfaları (AutoSecOps `05a431e0`). **Açık:** filo API'sinin SOC tarafı, hedef cihazda kurulum provası, staged rollout, çok kiracılık | `docs/ROADMAP.md:110-132`, `packaging/README.md:205-208` |
+| R5 | 🟡 **Kısmen çözüldü:** uplink/finding anahtar rotasyonu ve iptal listesi dağıtımı robot tarafında (`robodr-enroll`). **Açık:** TPM, SOC tarafı, black-box anahtarı rotasyonu hâlâ elle | `crates/robodr-blackbox/README.md:670-704` |
+| R6 | ❌ **Açık.** CI GitHub'da **hiç koşmadı** (org billing); release workflow'u hiç tetiklenmedi; `MINISIGN_SECRET_KEY` yok; `robodr-anchor-receiver` `.deb` zorunlu listesinde değil | `docs/BUILD.md:536-557`, `.github/workflows/release.yml` |
+| R7 | 🟡 **Kısmen çözüldü:** tescilli lisans (24fe84c), hukuki onaylar (ADR-0010), SOC'ta `robot_edr` entitlement'ı (AutoSecOps `9de8854e`). **Açık:** üretim lisans anahtarı, `max_robots` kotası, RoboDR üçüncü taraf bildirimleri. Eski durum: her şey Apache-2.0; lisans anahtarı/aktivasyon, ihracat sınıflandırması ve Pulsar GPL-2.0 incelemesi yoktu | `Cargo.toml:34`, `docs/SECURE-DELIVERY.md` §11 |
+| R8 | 🟡 **Kısmen çözüldü:** SHA-256/HMAC → `sha2`/`hmac` (86e70e7); Reed-Solomon tel biçimi gereği kaldı, bağımsız oracle'a sabitlendi (aba80a5); HTTP/1.1 sunucusu ve Kafka wire istemcisi fuzz hedefi aldı (`control_plane_request`, `kafka_wire`). **Açık:** Kafka istemcisi ve HTTP sunucusu hâlâ elle yazılmış (ADR-0007), JSON-Schema eşleyici | `crates/robodr-blackbox/src/crypto.rs`, `crates/robodr-export/src/kafka/`, `crates/robodr-agentd/src/control/` |
+| R9 | Tutarsızlıklar: ~~iki aksiyon listesi çelişiyor (`responder::autosecops` → `record_evidence` var/`rollback_config` yok; kontrol düzlemi tersi)~~ ✅ S1'de çözüldü: tek katalog `robodr-responder::actions`, kontrol düzleminin `ActionKind`'i onun yeniden ihracı (ed4f1ac); `panic = "abort"` → panik ailesi çağrıları daemon crate'lerinde clippy ile yasak, abort/yeniden başlatma süreç testi var (7637f9d; kalan: indexing panikleri); bayat dokümanlar S1'de büyük ölçüde düzeltildi (c9512c1) | Eski kanıt (silinen dosya): `git show ed4f1ac^:crates/robodr-responder/src/autosecops.rs`; bugün `crates/robodr-responder/src/actions.rs` |
+| R10 | 🟡 **Kısmen çözüldü:** müşteri taslakları `docs/customer/` (0f61cea; bu güncellemede yenilendi), `robodr-threat-forward` README (c9512c1). **Açık:** hukuk onayı, `robodr-maintainers@invalid` yer tutucusu. Eski durum: müşteri dokümanı yoktu: kurulum/quick-start, destek matrisi, EULA, SLA; `robodr-maintainers@invalid`, `singularityrd.example` yer tutucuları; `robodr-threat-forward` README/man sayfası yok | `packaging/build-deb.sh:65`, `docs/contracts/legacy/robot-edr-finding.schema.json` |
 
 ### 1.2 AutoSecOps1
 
@@ -73,14 +74,14 @@ lisans token'ı** (`tracecat/licensing/`), Fargate Terraform, air-gapped doküma
 | # | Açık | Kanıt |
 |---|---|---|
 | A1 | ✅ **Kapandı (2026-10-25):** menşe/lisans durumu için hukuki onay alındı (ürün sahibinin beyanı). Üçüncü taraf bildirimleri imajlarla birlikte gönderiliyor (`THIRD_PARTY_NOTICES.md`, `frontend/THIRD_PARTY_NOTICES.md`, `scripts/third_party_notices.py`, AutoSecOps1 PR #6). Kalan iş: onay belgesinin referansını iç kayıtta tutmak; bağımlılık eklendikçe `just gen-notices` (CI testi zaten var) | `LICENSE`, `THIRD_PARTY_NOTICES.md`, `docs/self-hosting/license.mdx` |
-| A2 | Robot/OCSF/Kafka ingest yolu **yok**; alert/finding modeli yok; case seviyesinde `external_id` tekilleştirme yok | `tracecat/db/models.py` |
-| A3 | Kanıt paketleri bloklu: ek allowlist'i sadece ofis/görsel uzantıları, 20 MB/ek, 10 ek/case | `tracecat/config.py:1386-1412` |
-| A4 | Onay modeli zayıf: yalnızca `agent:update` scope'u; onaylayıcı rolü / **iki-kişi kuralı yok**; YAML template'lerde `requires_approval` yok | `packages/tracecat-ee/tracecat_ee/agent/approvals/router.py` |
-| A5 | Lisans altyapısında **geliştirme açık anahtarı** gömülü; değiştirilmeli | `tracecat/licensing/keys.py` |
-| A6 | Rebrand artıkları: `TracecatHQ/*` git URL'leri CI'da, `docs.tracecat.com` alembic hata mesajında, Splunk HEC default `host: tracecat.com`, `x-tracecat-*` header'ları, Fargate `name_prefix="Tracecat"`, Helm repo'su upstream'e işaret ediyor | `.github/workflows/run-integration-tests.yml:128`, `test-python.yml:60`, `alembic/versions/9680c861644a_*.py:38` |
-| A7 | Güvensiz `.env.example` varsayılanları: `postgres/postgres`, `MINIO_ROOT_PASSWORD=password`, `APP_ENV=development`, `DB_SSLMODE=disable`, `AUTH_ALLOWED_DOMAINS` boş, `temporal ui:latest` | `.env.example` |
-| A8 | Air-gap: MCP katalog ikonları Google favicon URL'lerinden çekiliyor; Kubernetes/Helm repo'da yok | `tracecat/integrations/catalog/mcp_catalog.json` |
-| A9 | Servis hesapları (doğrudan REST) `SERVICE_ACCOUNTS` entitlement'ına bağlı; case add-on'ları, agent add-on'ları, RBAC add-on'ları lisans gerektiriyor → RoboDR SKU'sunun hangi entitlement'ları içerdiği tanımlanmalı | `tracecat/tiers/` |
+| A2 | ✅ **Dalda çözüldü** (`claude/robodr-ingest`, `main`'e birleşmedi): imzalı ingest `POST /robot-edr/v2/ingest`, `robot` / `robot_key` / `robot_finding` / `robot_finding_event` / `robot_ingest_batch` tabloları (workspace RLS), `external_id` ile tekilleştirme ve bulgu başına tek case (AutoSecOps `918363d2`), toplu upsert (`1d1ec348`), son sözleşme vektörleri (`68e3d2d5`). Eski durum: robot/OCSF/Kafka ingest yolu, finding modeli ve `external_id` tekilleştirmesi yoktu | `tracecat/db/models.py` |
+| A3 | 🟡 **Dalda kısmen:** doğrulanmış kanıt export'u iç bir yolla attachments bucket'ına yazılıyor, case'e `robodr-evidence-<sha>.txt` raporu ekleniyor (AutoSecOps `a9fca839`). Genel ek allowlist'i / boyut kotası değişmedi. Eski durum: ek allowlist'i sadece ofis/görsel uzantıları, 20 MB/ek, 10 ek/case | `tracecat/config.py:1386-1412` |
+| A4 | 🟡 **Dalda RoboDR aksiyonları için çözüldü:** platform sign-off formlarıyla istek sahibi + onaylayıcı (en güçlü aksiyonlarda iki kişi, istek sahibi hariç) aynı istek özetini imzalamadan hiçbir şey imzalanmaz/gönderilmez (AutoSecOps `bee7e167`); robot aksiyon araçları her agent'ta onaya zorlanır (`6ae14d0e`). Genel onaylayıcı rolü ve YAML `requires_approval` açık. Eski durum: yalnızca `agent:update` scope'u, iki-kişi kuralı yoktu | `packages/tracecat-ee/tracecat_ee/agent/approvals/router.py` |
+| A5 | ❌ **Açık.** Lisans altyapısında **geliştirme açık anahtarı** gömülü; değiştirilmeli | `tracecat/licensing/keys.py` |
+| A6 | 🟡 **Dalda büyük ölçüde:** upstream URL/host'lar (AutoSecOps `c284c8cf`), CI'da `TracecatHQ` referansları (`dd0f96f2`), Helm chart repo içinde (`b60eda05`), Fargate `name_prefix` geçişi dokümante (`a2b3bd18`; mevcut yığınlarda varsayılan kalır). `x-tracecat-*` header'ları için kayıt yok. Eski durum: Rebrand artıkları: `TracecatHQ/*` git URL'leri CI'da, `docs.tracecat.com` alembic hata mesajında, Splunk HEC default `host: tracecat.com`, `x-tracecat-*` header'ları, Fargate `name_prefix="Tracecat"`, Helm repo'su upstream'e işaret ediyor | `.github/workflows/run-integration-tests.yml:128`, `test-python.yml:60`, `alembic/versions/9680c861644a_*.py:38` |
+| A7 | ✅ **Dalda çözüldü:** placeholder sırlar + `env.sh` üretimi ve `--check`, varsayılan production modu, Temporal UI 2.43.3'e sabitlendi (AutoSecOps `86568f3b`). Eski durum: Güvensiz `.env.example` varsayılanları: `postgres/postgres`, `MINIO_ROOT_PASSWORD=password`, `APP_ENV=development`, `DB_SSLMODE=disable`, `AUTH_ALLOWED_DOMAINS` boş, `temporal ui:latest` | `.env.example` |
+| A8 | ✅ **Dalda çözüldü:** MCP ikonları yerel (AutoSecOps `99425305`), API doküman varlıkları yerel (`8cc0300a`), Helm chart repo'da (`b60eda05`). Eski durum: MCP katalog ikonları Google favicon URL'lerinden çekiliyordu; Kubernetes/Helm repo'da yoktu | `tracecat/integrations/catalog/mcp_catalog.json` |
+| A9 | 🟡 **Kısmen:** `robot_edr` entitlement'ı ve `robot:read` / `robot:update` scope'ları (AutoSecOps `9de8854e`); SKU tanımı açık. Servis hesapları (doğrudan REST) `SERVICE_ACCOUNTS` entitlement'ına bağlı; case add-on'ları, agent add-on'ları, RBAC add-on'ları lisans gerektiriyor → RoboDR SKU'sunun hangi entitlement'ları içerdiği tanımlanmalı | `tracecat/tiers/` |
 
 ### 1.3 İptal edilen eski entegrasyon — RoboDR'daki izler
 
@@ -153,8 +154,9 @@ sprint, AC'leri karşılanmadan kapanmaz.
 
 - ✅ **L (tamamlandı, 2026-10-25):** AutoSecOps1 lisans/menşe durumu, Pulsar GPL-2.0
   eBPF dağıtımı ve ihracat kontrol sınıflandırması için hukuki onaylar alındı.
-  Kalan: kararları ADR olarak kaydet (`docs/adr/0001-legal-clearance.md`: kapsam,
-  tarih, belge referansı — belgenin kendisi değil), ihracat sınıflandırmasının
+  Kararlar ADR olarak kaydedildi ([`docs/adr/0010-legal-clearance.md`](adr/0010-legal-clearance.md):
+  kapsam, tarih, belge referansı — belgenin kendisi değil; plan bu kaydı
+  `0001` diye anıyordu). Kalan: ihracat sınıflandırmasının
   getirdiği teslim koşullarını (ör. ülke kısıtları, beyanlar) S13 ticari pakete aktar.
 - **L/ürün:** GA destek matrisi kararı (ROS 2 Humble+Jazzy; Fast DDS 2.14+, Cyclone 0.10+;
   Ubuntu 22.04/24.04, Debian 12; amd64+arm64; Zenoh = "algılanır, decode edilmez").
@@ -168,6 +170,13 @@ sprint, AC'leri karşılanmadan kapanmaz.
 - **Tümü:** §2.1 kararlarını (D1–D9) ADR olarak `docs/adr/` altında onayla.
 - **D:** Ortak lab: AutoSecOps1 docker-compose staging + ROS 2 Gazebo robot + gerçek
   bir AMR; `just cluster` ile tekrarlanabilir kurulum.
+
+> **Durum (2026-10-26):** ✅ L: hukuki onaylar (ADR-0010). 🟡 Tümü: D1–D9
+> ADR olarak yazıldı (0f61cea); D9 kabul edildi, diğerleri "uygulamada kabul,
+> onay bekliyor" veya "önerildi" (`docs/adr/README.md`). ❌ D: GitHub Actions
+> billing açılmadı, iki repoda da yeşil CI rozeti yok. ❌ Ortak lab, tasarım
+> ortağı robotları (Go2 EDU, G1 EDU) ve destek matrisinin ürün sahibi onayı
+> kayıtlı değil.
 
 ### Sprint 1 — Eski entegrasyonu sök, sözleşme v2, tescilli lisansa geçiş
 
@@ -258,6 +267,14 @@ sprint, AC'leri karşılanmadan kapanmaz.
 - **AC:** Lab'daki rogue `/cmd_vel` senaryosu → 30 sn içinde AutoSecOps1'de doğru
   severity ve alanlarla **tek** case; aynı bulgu 3 kez gönderilince yine tek case.
 
+> **Durum (2026-10-26):** ✅ R: `robodr-uplink` (fa3f3dc; inceleme F1–F8:
+> b5a9c7c, 30e8a7d, 4f4dfbf, 8f22bac, 38ac3a7) ve 26 vakalık ortak vektörler.
+> ✅ A (`claude/robodr-ingest` dalında, birleşmedi): `tools.robodr.*` bulgu
+> araçları (AutoSecOps `fe4c63f4`), örnek workflow'lar (`48c67f51`), imza
+> doğrulama ve case eşleme. D2'deki webhook köprüsü yerine doğrudan native
+> modül yapıldı (S3). ❌ AC: lab'daki rogue `/cmd_vel` senaryosu AutoSecOps'a
+> karşı koşturulmadı.
+
 ### Sprint 3 — Native ingest modülü v1  → **Kapı 1: MVP entegrasyon demosu**
 
 - **A:** `tracecat/robot_edr/` modülü: router `POST /robot-edr/v2/ingest` (NDJSON
@@ -276,6 +293,21 @@ sprint, AC'leri karşılanmadan kapanmaz.
   imza doğrulanmış case olarak görünür; 10k bulgu/saat ingest p95 < 2 sn; kayıp 0,
   çift case 0; imzasız/yanlış anahtarlı batch 401 + audit log.
 
+> **Durum (2026-10-26) — Kapı 1 açık:** ✅ A (dalda): native modül
+> `POST /robot-edr/v2/ingest` (AutoSecOps `918363d2`): Ed25519 batch imzası,
+> replay tablosu, anahtar başına token bucket, satır satır doğrulama
+> (robodr-ocsf validator'ının portu), `external_id` tekilleştirme, tablolar
+> + RLS, `robot_edr` entitlement'ı ve `robot:*` scope'ları (`9de8854e`),
+> taint'li alanlar yalnız nötrleştirilmiş kod span'ı olarak; toplu upsert ve
+> case oluşturma (AutoSecOps `1d1ec348`), son vektörler gerçek uç noktaya
+> karşı geçiyor (AutoSecOps `68e3d2d5`). Benchmark: 1000 satırlık batch'te
+> p95 ≈ 1,27 s, `gc.freeze` ile, yüklü 4 vCPU VM'de (AutoSecOps `09133dc0`,
+> `a943c67b`). ❌ R/Q: `robodr-uplink`
+> gerçek AutoSecOps'a karşı hiç çalışmadı; diyot → uplink → AutoSecOps
+> zinciri ve iki repoda CI'da uçtan uca contract testi yok. **Kapı 1 AC
+> karşılanmadı** (uçtan uca connected + air-gapped koşu, saatlik hacim
+> ölçümü, 401 audit kaydının uçtan uca kanıtı yok).
+
 ### Sprint 4 — Kanıt (evidence) ve UI v1
 
 - **R:** Evidence API: agentd kara kutu bundle export'u (kontrol düzlemi üzerinden,
@@ -291,6 +323,17 @@ sprint, AC'leri karşılanmadan kapanmaz.
 - **AC:** Analist case'ten kanıt paketini indirip `robodr-blackbox verify` ile
   doğrulayabilir; UI'daki "doğrulandı" rozeti sunucu doğrulamasıyla aynı; Playwright
   smoke testleri.
+
+> **Durum (2026-10-26):** ✅ R: kanıt API'si kontrol düzlemi v2'de
+> (a158536): envanter, bulgu / seq / zaman aralığı export'u, finding
+> anahtarıyla imzalı manifest, imzalı, boyut-sınırlı, devam ettirilebilir
+> parçalar; `robodr-blackbox verify BUNDLE` (5cf978e). ✅ A (dalda): export'u
+> indirip RBBXBND1 kayıtlarını black-box anahtarlarıyla doğrulayan Python
+> istemcisi, doğrulanmış export'un attachments bucket'ında saklanması ve
+> case'e rapor eklenmesi (AutoSecOps `a9fca839`). ✅ F (dalda): Robots
+> listesi / detay sayfaları ve case içinde RoboDR paneli (`05a431e0`).
+> ❌ AC: analistin case'ten indirip doğrulaması gerçek bir robota karşı
+> denenmedi; Playwright smoke testleri kayıtlı değil.
 
 ### Sprint 5 — Kontrol düzlemi v2 (güvenli kanal, kalıcı durum)
 
@@ -308,6 +351,18 @@ sprint, AC'leri karşılanmadan kapanmaz.
   `robot.agent.control_plane_*` bulgusu üretilir; agentd restart sonrası durum sorgusu
   tutarlı.
 
+> **Durum (2026-10-26):** ✅ R: `robodr-control-plane/v2` (a158536, 5cf978e,
+> dc22a34; v1 kaldırıldı): mTLS (rustls + ring, istemci sertifikası
+> zorunlu, SPKI pin), kalıcı istek journal'ı ve nonce deposu, bind→chmod
+> penceresi kapatıldı, `control_plane_request` fuzz hedefi, her yanıt
+> imzalı, sözleşme vektörleri. ✅ A (dalda): `tools.robodr.*` v2: mTLS,
+> imzalı istek/yanıt, executor durumları, kanıt araçları (AutoSecOps
+> `f9e334ab` → `a9fca839`). ❌ R: Kafka TLS + SASL ve anchor receiver TLS
+> yapılmadı. ❌ AC: ağ üzerinden (aynı host değil) AutoSecOps → robot döngüsü
+> koşturulmadı; yalnız yerel test PKI'si ve süreç içi istemci. Kontrol
+> düzlemi v2 için bağımsız inceleme turu commit geçmişinde yok. SSRF /
+> özel CIDR allowlist'inin robot ağları için ayarı kayıtlı değil.
+
 ### Sprint 6 — Onay iş akışı ve Robot SOC agent'ı
 
 - **A:** Onay modeline **onaylayıcı rolü + iki-kişi kuralı** (istek sahibi ≠ onaylayıcı,
@@ -323,6 +378,18 @@ sprint, AC'leri karşılanmadan kapanmaz.
 - **AC:** Agent hiçbir robot aksiyonunu onaysız gönderemez (negatif test); iki-kişi
   aksiyonu tek kişiyle tamamlanamaz; injection korpusu agent'ı aksiyona yönlendiremez
   (eval geçme oranı %100).
+
+> **Durum (2026-10-26):** ✅ A (dalda): iki-kişi kuralı ve platform
+> sign-off'u robot aksiyonları için (istek özeti üzerinde istek sahibi + bir,
+> en güçlü aksiyonlarda iki onaylayıcı; AutoSecOps `bee7e167`), robot aksiyon
+> araçları her agent'ta onaya zorlanır (`6ae14d0e`), Robot SOC preset'i
+> (opt-in kurulum, `54a7a89b`), `robodr-triage` / `-containment` /
+> `-forensics` skill'leri (`2f7d6d22`), dört workflow tanımı (triage,
+> onaylı containment, rogue DDS participant, motion envelope; `48c67f51`),
+> injection korpusunu içeren deterministik eval (`54a7a89b`). ❌ Genel
+> onaylayıcı rolü, YAML `requires_approval`, onay kutusunda robot aksiyon
+> kartı (F), "Evidence collection" şablonu; canlı model eval'i ve %100
+> geçme oranı kayıtlı değil. Hepsi birleşmemiş dalda.
 
 ### Sprint 7 — Executor v1 (geri alınabilir aksiyonlar)  → **Kapı 2: Private Beta**
 
@@ -405,10 +472,15 @@ sprint, AC'leri karşılanmadan kapanmaz.
 >     uygun bir mevcut bulgu kimliği yok);
 >   - karar matrisi hedef, hareket yolu, profil kilidi ve TTL ile
 >     genişletildi: 526 848 durum (v1: 5 488).
+> - ✅ Kontrol düzlemi v2 ile birleşti (d48e8b0, 19f7713): executor
+>   durumları v2'nin imzalı yanıtları ve journal'ı ile; S10 politikası
+>   executor crate'ine de uygulandı (2b8ab65). Ek düzeltme 12931f3: saat
+>   geri gidince aksiyon uzamaz; başarısız revert'te istek "kalktı"
+>   okunmaz.
 > - ⏳ M1 (güven sınırı): ele geçirilmiş bir agentd `human_approved`
->   iddia edebilir; sınırları README "Trust boundary" bölümünde. SOC
->   imzalı isteğin yürütücüye iletilip orada doğrulanması kontrol düzlemi
->   v2 birleşmesinden sonra yapılacak.
+>   iddia edebilir; sınırları README "Trust boundary" bölümünde. Kontrol
+>   düzlemi v2 birleşti, ama SOC imzalı isteğin yürütücüye iletilip orada
+>   doğrulanması **hâlâ yapılmadı** (4-2 GAP-23).
 > - ⏳ Q / Kapı 2: tasarım ortağı robotunda kurulum, gerçek robotta
 >   uygula / geri al, 24 saat koşu. Unit henüz gerçek systemd altında
 >   çalıştırılmadı.
@@ -469,6 +541,25 @@ sprint, AC'leri karşılanmadan kapanmaz.
 > kanalları; gateway'e özgü bulgu kuralları (sözleşme 2.2) ve olay
 > dosyasının agentd'ye beslenmesi; `restrict_motion` kontrol düzlemi
 > adaptörü ve `safe_pause` adaptörleri.
+>
+> **Güncelleme (2026-10-26) — bağımsız inceleme ve kalan:** ✅ İnceleme
+> bulguları test-önce kapatıldı (e85471c): F1 (kritik) sıra numarası
+> zehirleme — yazıcının GUID'iyle ve çok ileri SN'li tek bir sahte DATA
+> gerçek akışı "tekrar" olarak bastırıyordu (komut zaman aşımı → düşme);
+> akış durumu artık (GUID, yetkili kaynak, kaynak IP, `NFQA_HWADDR` MAC)
+> bağına bağlı, büyük sıçrama teyide kadar tutulur, yeni kanal seçeneği
+> `allowed_src_macs`; F2 (yüksek) sınıflandırılmamış yazıcının DATA_FRAG /
+> yalnız-anahtar / standart dışı örnekleri enforce'ta bastırılır; F3 (orta)
+> go `LowCmd_` `bms_cmd.off != 0` (pil kapatma) reddedilir. Unitree CRC
+> tablo tabanlı (0c906fe): G1 karar yolu p50 ≈ 28 µs → ≈ 10 µs. Birleştirme
+> 1dd1517 (S10 politikası: `deny(unsafe_code)` + yerel izinler, ikili
+> `forbid`, panik ailesi yasak). **Dağıtım kuralları (README "Known
+> limits"):** robot ile kontrolcü tarafı arasındaki tüm SPDP / SEDP köprüden
+> geçmeli; kuyruklanan aralık dışındaki DDS portları denetlenmez; kontrolcü
+> segmentinde kontrolcünün kendi IP + MAC'ini kullanan bir saldırgan ayırt
+> edilemez. ❌ AC: gerçek robotta `restrict_motion` ve TTL, hedef sensör
+> kutusunda p99 ölçümü, `safe_pause` adaptörleri (Nav2 / ros2_control /
+> PX4) yok.
 
 ### Sprint 9 — Filo yaşam döngüsü: kayıt, anahtar, güncelleme
 
@@ -526,8 +617,18 @@ sprint, AC'leri karşılanmadan kapanmaz.
 >   deneme), ikili `forbid(unsafe_code)`; test dışı kodda `unwrap` /
 >   `expect` / `panic!` ailesi clippy ile yasak (serileştirme hataları
 >   artık `Result` olarak döner).
-> - ❌ A/F: AutoSecOps tarafı (UI'da robot ekle, token, `/robot-edr/v2/fleet/*`).
->   Henüz gerçek SOC'a karşı çalıştırılmadı.
+> - ✅ Bağımsız inceleme (filo + kurulum paketi) bulguları test-önce
+>   kapatıldı: H1, M1, M2, L8 (ace7fba: imzalı tarball'dan özel çıkarma ile
+>   kurulum, downgrade reddi ve güvenlik tabanı, format kapısı
+>   düzeltmeleri); M3, M4, L1–L7 + bilgi maddeleri (3083030: gönderilmiş
+>   rotasyon kalıcı işaretlenir ve `rotate --cancel` ile SOC'ta bitirilir,
+>   token yalnız root dosyasından veya stdin'den, ayrı SOC onay anahtarları,
+>   kayıt isteği üç anahtarla imzalı); sözleşme revizyonu ve dokümanlar
+>   6c19e73. Birleştirme 332d88f.
+> - 🟡 A/F: AutoSecOps tarafında Robots sayfaları ve robot / anahtar
+>   yönetimi var (dalda, AutoSecOps `05a431e0`); filo API'si
+>   (`/robot-edr/v2/fleet/*`, token, rotasyon onayı) **sürüyor, henüz
+>   commit'lenmedi**. Gerçek SOC'a karşı hiç çalıştırılmadı.
 > - ❌ Kara kutu anahtarı rotasyonu agentd'nin önceki anahtarları
 >   (`open_with_keys`) yüklemesini gerektirir; bugün OPERATIONS 4.3'teki
 >   zincir kapatma yolu.
@@ -550,6 +651,39 @@ sprint, AC'leri karşılanmadan kapanmaz.
   taraması) CI'da zorunlu; SBOM her iki ürün için.
 - **AC:** sıfır High/Critical bulgu (SAST/SCA/imaj); fuzz 24 saat çökmesiz.
 
+> **Durum (2026-10-26) — R kalemleri büyük ölçüde kodda; uzun koşular, TPM
+> ve CI açık:**
+>
+> - ✅ SHA-256 / HMAC → RustCrypto `sha2` / `hmac` (+ `subtle`, `zeroize`),
+>   eski kodla bayt-özdeş olduğu diferansiyel testlerle gösterildi
+>   (86e70e7).
+> - ✅ Reed-Solomon değerlendirildi: denetlenmiş crate'ler aynı parity
+>   baytlarını üretmiyor (imzalı tel biçimi), kod kaldı ve bağımsız bir
+>   oracle'a sabitlendi (aba80a5).
+> - ✅ `unsafe`: 9 crate'te ve her ikilide `forbid`, kalanlarda `deny` +
+>   her FFI bloğunda SAFETY (c2800c8); executor, gateway ve fleet
+>   birleşmelerde aynı politikaya alındı.
+> - ✅ `panic = "abort"`: daemon crate'lerinde panik ailesi clippy ile yasak,
+>   SIGABRT → yeniden başlatma → kara kutunun iki koşu boyunca doğrulandığı
+>   süreç testi (7637f9d). Kalan: indexing / aritmetik lint'leri (~600 yer).
+> - 🟡 Fuzz: yeni hedefler (`cdr_payload`, `diode_manifest`, `diode_import`,
+>   `diode_fec`, `correlate_rules`, `safety_feed`, `kafka_wire`; f34754a)
+>   ve kontrol düzlemi / gateway / fleet hedefleri; toplam 23. İlk libFuzzer
+>   koşuları: 10 hedef × 630 s, çökme yok. ❌ ≥ 1 saat CI-nightly ve 24 saat
+>   çökmesiz koşu yok.
+> - ❌ TPM ile anahtar mühürleme; donanım TPM ile NV counter testi.
+> - ✅ A (dalda): `.env.example` güvenli varsayılanlar + `env.sh --check`
+>   (AutoSecOps `86568f3b`), rebrand artıkları (`c284c8cf`, `dd0f96f2`),
+>   MCP ikonları ve API doküman varlıkları yerel (`99425305`, `8cc0300a`).
+>   ❌ Lisans üretim açık anahtarı (A5).
+> - 🟡 D: AutoSecOps'ta pip-audit, pnpm audit, gitleaks ve Trivy imaj
+>   taraması workflow'ları (`dd3925a2`) ve bulunan açıkların düzeltmeleri
+>   (`7a2e14fa`, `192d26c4`, zod 4 geçişi `ef756586`). RoboDR'da `cargo deny`
+>   yalnız yerelde koştu; GitHub CI hiç koşmadı.
+> - ❌ AC: SAST/SCA/imaj taramasında sıfır High/Critical bulgu CI'da
+>   kanıtlanmadı; 24 saat fuzz yok. S10 değişiklikleri için bağımsız
+>   inceleme turu commit geçmişinde yok.
+
 ### Sprint 11 — Saha doğrulama + red-team  → **Kapı 3: Public Beta / RC**
 
 - **Q:** 72 saat soak (her iki tasarım ortağı robotu + Gazebo filo), FP oranı ölçümü
@@ -563,6 +697,9 @@ sprint, AC'leri karşılanmadan kapanmaz.
 - **Kapı 3 AC:** FP < hedef (S0'da belirlenen, ör. < 1 yanlış alarm/robot/gün),
   red-team kritik bulgu 0 açık, soak'ta veri kaybı/sızıntı yok, RC sürümü (`v1.0.0-rc.1`)
   imzalı yayınlandı.
+
+> **Durum (2026-10-26):** başlanmadı. Saha doğrulaması, soak, FP ölçümü,
+> red-team ve harici pentest yok; gerçek robot ve sensör kutusu yok.
 
 ### Sprint 12 — Paketleme, kurulum, gözlemlenebilirlik
 
@@ -581,6 +718,13 @@ sprint, AC'leri karşılanmadan kapanmaz.
 - **AC:** Temiz bir müşteri ortamında (connected + air-gapped) kılavuzla < 2 saatte
   kurulum; yükseltme `rc.1 → rc.2` veri kaybısız.
 
+> **Durum (2026-10-26):** ❌ Release workflow'u hiç koşmadı, minisign
+> anahtarları yok, provenance yok, RoboDR `THIRD_PARTY_NOTICES.md` yok.
+> 🟡 AutoSecOps: Helm chart SingularityRD reposunda (AutoSecOps `b60eda05`),
+> Fargate `name_prefix` geçişi dokümante (`a2b3bd18`); RoboDR modülü dahil
+> imajlar yayımlanmadı. ❌ Gözlemlenebilirlik (SOC'ta robot sağlık
+> metrikleri) yok.
+
 ### Sprint 13 — Dokümantasyon, uyum, ticari paket
 
 - **Docs:** Müşteri dokümanları: Quick-start, Kurulum (robot + SOC + air-gap),
@@ -596,6 +740,14 @@ sprint, AC'leri karşılanmadan kapanmaz.
 - **AC:** Doküman sitesi yayında; hukuk tüm metinleri onayladı; lisans token akışı
   uçtan uca (üret → kur → entitlement → robot kotası).
 
+> **Durum (2026-10-26):** 🟡 Docs ve uyum belgeleri taslak olarak var ve bu
+> güncellemede kodun bugünkü durumuna çekildi: `docs/customer/` (quick-start,
+> destek matrisi, bilinen kısıtlar, güvenlik beyaz kağıdı, PSIRT, EULA ve
+> SLA taslakları), `docs/compliance/` (IEC 62443-4-2 boşluk analizi,
+> 4-1 SDL kanıtları, CRA hazırlığı, güvenlik konumlandırması). ❌ Doküman
+> sitesi, hukuk onayı (EULA/SLA), fiyatlandırma, lisans token üretim
+> prosedürü, CRA sorumlusu yok.
+
 ### Sprint 14 — GA sertleştirme ve yayın  → **Kapı 4: GA**
 
 - Yalnızca hata düzeltme (feature freeze S12 sonu). Tasarım ortaklarında RC → GA
@@ -603,6 +755,8 @@ sprint, AC'leri karşılanmadan kapanmaz.
   contract test + kurulum testi). `v1.0.0` tag'leri (RoboDR + AutoSecOps1), imzalı
   artefaktlar, release notes, destek ekibi eğitimi, satış demo ortamı.
 - **GA AC:** §4'teki tüm GA kapı kriterleri yeşil.
+
+> **Durum (2026-10-26):** başlanmadı.
 
 ---
 
@@ -620,7 +774,7 @@ ayrıştırıcısı Cyclone trafiğini zaten gerçek yakalamalarla doğrulanmı�
 | Motion Firewall zarfı | ✅ Eklem başına q/dq/tau/kp/kd, adım/PD tork, CRC, mod pin'leri; 1 kHz'te p99 ≈ 7–9 µs (VM) — pasif modda kayıt; ✅ **in-path inline köprü gateway'i** (`robodr-firewall-gw`, NFQUEUE; S8) | Gerçek robot ve hedef sensör kutusunda doğrulama / gecikme ölçümü |
 | Host izleme (Pulsar) | ✅ Kural paketi (`rules/robodr/unitree.toml`); JetPack 5/6 için statik `robodr-focal` paketi (agentd-only) | `robodr-pulsard` için BTF'li çekirdek + glibc 2.35 build; kapalı ana kontrolcü kapsanamaz |
 | Agentless mod | ✅ Sensör kutusu yapılandırması, systemd drop-in, networkd/nftables örnekleri, VLAN | Referans donanım imajı (S7), sahada deneme |
-| Yanıt | ✅ İnsansıda enerji kesen aksiyon yok, ikameler onaylı, `min_motion_factor`; hepsi plan/kayıt | Yürütücü (S7), `restrict_motion` sport API adaptörü (S8) |
+| Yanıt | ✅ İnsansıda enerji kesen aksiyon yok, ikameler onaylı, `min_motion_factor`; executor v1 (varsayılan kapalı) G1 örneğinde insansıda hiçbir ağ aksiyonu yürütmez (`fall_safe_restrict` boş) | Executor'ın gerçek robotta denenmesi; `restrict_motion` sport API adaptörü (SOC aksiyonu olarak) |
 
 **Unitree'ye özgü tehditler (satış argümanı):** UniPwn (Eyl 2025) — BLE Wi-Fi
 yapılandırma servisinde sabit anahtarlar ve komut enjeksiyonu (CVE-2025-35027) ile
@@ -727,11 +881,11 @@ katılımcısı / `rt/lowcmd`'ye yetkisiz yazıcı, imzalı kara kutu ile adli k
 ## 4. GA çıkış kriterleri (Definition of Done)
 
 **Fonksiyonel**
-- [ ] Bulgular connected + air-gapped yollarda imzalı, tekil, doğru severity/alanlarla case olur.
-- [ ] Kanıt paketi case'ten indirilir ve bağımsız doğrulanır.
-- [ ] `restrict_motion`, `quarantine_node`, `isolate_network`, `record_evidence` gerçek robotta uygulanır, doğrulanır, TTL/elle geri alınır; `safe_pause` OEM-onaylı politikada çalışır.
-- [ ] Hiçbir robot aksiyonu onaysız gönderilemez; iki-kişi kuralı uygulanır.
-- [ ] Robot onboarding, anahtar rotasyonu/iptali, profil kilitleme, güncelleme/geri alma UI'dan yönetilir.
+- [ ] Bulgular connected + air-gapped yollarda imzalı, tekil, doğru severity/alanlarla case olur. *(2026-10-26: iki taraf kodda ve ortak vektörlerle test edildi; `robodr-uplink` → AutoSecOps uçtan uca hiç koşmadı.)*
+- [ ] Kanıt paketi case'ten indirilir ve bağımsız doğrulanır. *(Kodda: kanıt API'si + `verify BUNDLE`, AutoSecOps doğrulayıp saklıyor; gerçek robota karşı denenmedi.)*
+- [ ] `restrict_motion`, `quarantine_node`, `isolate_network`, `record_evidence` gerçek robotta uygulanır, doğrulanır, TTL/elle geri alınır; `safe_pause` OEM-onaylı politikada çalışır. *(Executor v1 son üçünü yalnız network namespace'te yapıyor; `restrict_motion` SOC aksiyonu ve `safe_pause` adaptörleri yok.)*
+- [ ] Hiçbir robot aksiyonu onaysız gönderilemez; iki-kişi kuralı uygulanır. *(AutoSecOps dalında uygulandı; birleşmedi, robot onayı doğrulamıyor.)*
+- [ ] Robot onboarding, anahtar rotasyonu/iptali, profil kilitleme, güncelleme/geri alma UI'dan yönetilir. *(Robot tarafı hazır; SOC filo API'si ve UI akışı sürüyor.)*
 - [ ] Unitree Go2 EDU ve G1 EDU: tespit + kanıt + ağ tabanlı containment gerçek cihazda doğrulandı (agentless ve EDU ajan modları).
 - [ ] RoboDR tescilli lisansla dağıtılıyor; üçüncü taraf bildirimleri ve eBPF GPL-2.0 kaynak teklifi pakette.
 
@@ -742,7 +896,7 @@ katılımcısı / `rt/lowcmd`'ye yetkisiz yazıcı, imzalı kara kutu ile adli k
 - [ ] Harici pentest + red-team: açık Critical/High 0.
 
 **Güvenlik / tedarik zinciri**
-- [ ] Tüm ağ yolları TLS/mTLS; anahtarlar TPM'de (destekli donanımda).
+- [ ] Tüm ağ yolları TLS/mTLS; anahtarlar TPM'de (destekli donanımda). *(Kontrol düzlemi mTLS, uplink/enroll TLS; Kafka ve anchor düz metin; TPM yok.)*
 - [ ] İmzalı, reproducible release; SBOM; cosign/SLSA provenance; SCA temiz.
 - [ ] Üretim lisans anahtarı; dev anahtarı koddan kaldırıldı.
 
@@ -760,12 +914,43 @@ katılımcısı / `rt/lowcmd`'ye yetkisiz yazıcı, imzalı kara kutu ile adli k
 |---|---|---|---|
 | ~~AutoSecOps1 lisans/menşe~~ | — | — | ✅ Hukuki onay alındı (2026-10-25). Bağımlılık lisans uyumu CI'da `test_third_party_notices.py` ile korunuyor; yeni GPL/AGPL bağımlılık eklenmesi review'da durdurulur |
 | Gerçek robot erişimi gecikir | Orta | Yüksek | S0'da donanım satın alma; Gazebo filo + kiralık AMR yedek |
-| Executor bir robotu güvensiz duruma sokar | Düşük | Kritik | Sadece geri alınabilir aksiyonlar GA'da; safety state yeniden kontrol; OEM politika bayrağı; güvenlik sistemi asla aşılmaz; saha testinde E-stop'lu ortam |
-| Firewall gateway gecikmesi kontrol döngüsünü bozar | Orta | Yüksek | S8 ölçüm kapısı; varsayılan recording-only; enforce opt-in |
+| Executor bir robotu güvensiz duruma sokar | Düşük | Kritik | Kodda: yalnız geri alınabilir, TTL'li nftables kuralları; korumalı hareket yolu ve yönetim her zincirde drop'lardan önce; apply'dan hemen önce safety state yeniden kontrol; varsayılan kapalı; insansıda `fall_safe_restrict` dışı hiçbir şey (31d1aa4). Açık: gerçek robotta deneme, saha testinde E-stop'lu ortam |
+| Ele geçirilmiş agentd executor'a sahte "insan onayı" bildirir | Düşük | Yüksek | Executor kendi kurallarını yine uygular (geri alınabilir, TTL'li, korumalı yol asla); SOC imzasının executor'da doğrulanması (GAP-23) yapılana kadar açık risk |
+| Firewall gateway gecikmesi kontrol döngüsünü bozar | Orta | Yüksek | Gateway kodda (a4e0b4b); VM'de medyan ek ≈ 20–70 µs; hedef sensör kutusunda p99 ölçüm kapısı (`gw_latency --budget-p99-ns`); önce `mode: observe`; enforce opt-in |
+| Gateway atlatılır (köprü dışı keşif yolu, kuyruk dışı DDS portu, kontrolcü segmentinde IP + MAC sahteciliği) | Orta | Yüksek | Dağıtım kuralları müşteri dokümanında (quick-start 7a, known-limitations); saha ağ incelemesi; `allowed_src_ips` / `allowed_src_macs`; SN bağlama (e85471c). Gerçek robotta doğrulanmadı |
+| Unitree `rt/lowcmd` QoS'u veya motor kartının akış kaybındaki davranışı varsayımdan farklı | Orta | Yüksek | `fail_closed` → robotun kendi komut zaman aşımı; OEM ile teyit; gerçek Go2/G1'de ölçüm (S11) |
+| Kontrol düzlemi v2 ve S10 değişiklikleri bağımsız incelenmedi | Orta | Yüksek | S11 red-team + harici pentest; inceleme turu planla (GAP-26) |
+| AutoSecOps dalı (`claude/robodr-ingest`) birleşmeden uzun yaşar, `main` ile ayrışır | Orta | Orta | Filo API'si bitince birleştirme; birleşmeden önce iki repoda CI |
 | FP oranı yüksek → müşteri güveni | Orta | Yüksek | Commissioning (observe mode) zorunlu; S11 ayar; correlate kuralları varsayılan kapalı/uyarı |
 | Zenoh/SROS2 kullanan müşteri | Yüksek | Orta | Destek matrisinde açık; GA sonrası yol haritası; algılanınca görünür uyarı (mevcut) |
 | İhracat kontrol / savunma müşterileri | Düşük | Yüksek | Sınıflandırma alındı; teslim koşullarına (ülke/son kullanıcı beyanı) satış sürecinde uyum; kontrollü repo ayrımı |
-| CI maliyeti / billing | Düşük | Orta | S0'da çözülür; self-hosted runner seçeneği |
+| CI maliyeti / billing | Orta | Yüksek | Hâlâ çözülmedi (2026-10-26): RoboDR CI'ı GitHub'da hiç koşmadı, her doğrulama yerel. S0 kalemi; self-hosted runner seçeneği |
+
+### 5a. Kalan işler (yazılım dışı)
+
+Kodla kapanmayan, karar, satın alma veya imza gerektiren işler
+(2026-10-26):
+
+- [ ] **CI billing:** GitHub Actions billing'i aç (veya self-hosted runner);
+  RoboDR CI'ın GitHub'da ilk gerçek koşusu.
+- [ ] **Test robotları:** Unitree Go2 EDU ve G1 EDU (ve bir Nav2 AMR)
+  tedariki, firmware sürümlerinin sabitlenmesi, E-stop'lu test alanı,
+  hedef sensör kutusu donanımı.
+- [ ] **Release anahtarları:** minisign offline kök + release anahtarı
+  anahtar töreni, saklama ve sorumlular; `MINISIGN_SECRET_KEY`.
+- [ ] **Üretim lisans anahtarı:** AutoSecOps lisans altyapısındaki geliştirme
+  anahtarının yerine üretim anahtarı (HSM / offline), token üretim prosedürü.
+- [ ] **Hukuk onayı:** EULA ve SLA taslaklarının (`docs/customer/`) hukukça
+  onaylanması; destek süresi kararı.
+- [ ] **CRA sorumlusu:** ürün kategorisi kararı, 24 h / 72 h raporlama
+  süreci için isimli sorumlu (`docs/compliance/cra-readiness.md`).
+- [ ] **Monitor toleransı (ürün kararı):** hareket monitörü ve FP eşikleri
+  (ör. < 1 yanlış alarm/robot/gün hedefi) ve gecikme/kalıcılık
+  pencerelerinin toleransı.
+- [ ] **Gerçek robotta doğrulama:** gateway portları ve dağıtım kuralları
+  (tüm SPDP/SEDP köprüden, kuyruklanan DDS port aralığı, kontrolcü
+  segmenti), Unitree `rt/lowcmd` QoS'u ve motor kartının akış kaybındaki
+  davranışı (OEM teyidi).
 
 ---
 

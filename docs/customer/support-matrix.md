@@ -1,6 +1,6 @@
 # Support matrix
 
-> **Pre-release draft (2026-10-26).** This lists what RoboDR targets and,
+> **Pre-release draft (refreshed 2026-10-26).** This lists what RoboDR targets and,
 > for each row, **how far it has actually been verified**. The GA targets
 > come from GA-ROADMAP Sprint 0 and are not yet confirmed by the product
 > owner. **No row is field-verified. Nothing has run on a customer or
@@ -72,11 +72,13 @@ matrix". Deployment modes are in [`docs/UNITREE.md`](../UNITREE.md).
 
 | Item | Level | Notes |
 |---|---|---|
-| AutoSecOps ingest API (`robodr-uplink`) | V1 | Tested against an in-repository reference consumer and the shared vectors, and by hand against a Python TLS server. **The AutoSecOps side does not exist yet** (S3). |
-| Fleet API, robot side (`robodr-enroll`) | V1 | Enrollment, key rotation, revocation lists, SOC profiles, ring information; tested against an in-repository reference SOC over HTTPS and the shared vectors. **The AutoSecOps side does not exist yet** (S9). |
+| AutoSecOps ingest API (`robodr-uplink`) | V1 | Tested against an in-repository reference consumer and the shared vectors, and by hand against a Python TLS server. The AutoSecOps ingest module exists on its development branch and passes the same 26 vectors against its real endpoint (AutoSecOps `918363d2`, `68e3d2d5`); its benchmark reached p95 ≈ 1.27 s per 1000-line batch on a loaded 4-vCPU VM (AutoSecOps `09133dc0`). **`robodr-uplink` has not yet been run against it**, and that branch is not released. |
+| Fleet API, robot side (`robodr-enroll`) | V1 | Enrollment, key rotation, revocation lists, SOC profiles, ring information; tested against an in-repository reference SOC over HTTPS and the shared vectors. **The AutoSecOps side is in progress** (not committed) (S9). |
 | Kafka export (`robodr-kafka-publish`) | V2 | Single-node Apache Kafka 3.9.1 and 4.1.0. No TLS or SASL. Multi-broker behaviour tested only against a fake broker. |
 | Diode export and import | V1 | In-process and integration tests. No physical diode tested. |
-| Control-plane action API | V1 | In-process signing client over loopback. Executes nothing. No TLS. |
+| Control-plane action API (`robodr-control-plane/v2`) | V1 | Mutual TLS and signed requests and answers, persistent state, evidence API; tested with an in-process signing client and a local test PKI, not across a real network. The AutoSecOps client speaks v2 and verifies the shared vectors (AutoSecOps `a9fca839`); the two have not been run against each other. Executes nothing unless executor v1 is enabled. |
+| Executor v1 (`robodr-executor`): `isolate_network`, `quarantine_node`, `record_evidence` | V2 | Real nftables in network namespaces with UDP traffic between veth peers, agentd end to end. **Off by default.** Not run on a robot or under a real systemd; no Cyclone / Fast DDS process and no IPv6 traffic in the tests. Needs nf_tables; bridged traffic only with `br_netfilter`. |
+| Inline gateway (`robodr-firewall-gw`): Unitree `rt/lowcmd` (`unitree_go`, `unitree_hg`), sport `Move`, Go1 legacy UDP | V2 | Real kernel: three network namespaces, a bridge with br_netfilter and NFQUEUE, the binary's run loop, synthetic datagrams. IPv4 only. Not run on a robot, a real Cyclone DDS stack or a real sensor box. Loco `SetVelocity`, arm and hand SDK channels and ROS 2 `/cmd_vel` / `JointTrajectory` are not decided. |
 | Black-box TPM NV anchor | V1 | swtpm only. |
 | Black-box remote anchor | V1 | Over loopback against a real receiver process. |
 
@@ -86,4 +88,10 @@ No CPU, memory or latency budget has been measured on target hardware.
 The unit's `MemoryMax=512M` is an estimate. The GA goals (< 5 % CPU and
 < 150 MB RSS on the robot) are measured in Sprint 11. The Motion Firewall
 joint check measured p99 ≈ 7–9 µs per frame at 1 kHz **in a VM**
-(GA-ROADMAP §3a). That figure is not from a robot or an RT kernel.
+(GA-ROADMAP §3a). The inline gateway's decision path measured p50
+10–14 µs / p99 ≈ 35 µs (G1, 35 motors, 1 kHz), and its added end-to-end
+median through the kernel ≈ 20–70 µs, on a shared, loaded 4-vCPU VM
+without an RT kernel; p99 tails there were dominated by the VM itself
+([`crates/robodr-firewall-gw/README.md`](../../crates/robodr-firewall-gw/README.md),
+"Latency"). None of these figures is from a robot, a sensor box or an RT
+kernel.

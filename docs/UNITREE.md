@@ -16,11 +16,13 @@ in [`OPERATIONS.md`](OPERATIONS.md); this guide refers to them by section.
 > one; it is not a safety-rated device, and the robot's own safety
 > functions remain primary.
 
-> **Status: not validated on a real robot.** The decoders, rules and
-> examples below are built from Unitree's published SDK sources and IDL, and
-> checked against hand-built and reviewer vectors. None of it has run against
-> a real Go2 or G1 yet (see [Known limits](#known-limits)). Run the first
-> field period observe-only.
+> **Status (2026-10-26): not validated on a real robot.** The decoders,
+> rules and examples below are built from Unitree's published SDK sources
+> and IDL, and checked against hand-built and reviewer vectors. The inline
+> gateway (section 5.1) and executor v1 (section 6.1) have run only in
+> network namespaces on a development VM. None of it has run against a
+> real Go2 or G1 yet (see [Known limits](#known-limits)). Run the first
+> field period observe-only: executor disabled, gateway in `mode: observe`.
 
 ---
 
@@ -676,7 +678,23 @@ the contract's section 5.
   behaviour on a lost stream are still to be measured / confirmed. In the
   passive modes the joint envelopes record, they do not block. There is no
   `restrict_motion` control-plane adapter for the sport API yet (the
-  gateway's sport limit is configuration, not a SOC action).
+  gateway's sport limit is configuration, not a SOC action). Its deployment
+  rules must be checked on site before enforce mode
+  ([`crates/robodr-firewall-gw/README.md`](../crates/robodr-firewall-gw/README.md),
+  "Known limits"):
+  * **all SPDP / SEDP between controller-side participants and the robot
+    must cross the bridge**; a writer matched on `rt/lowcmd` through an
+    announcement the gateway never saw (Wi-Fi, a second NIC, a modem)
+    passes unchecked;
+  * **DDS ports outside the queued range are not inspected**: check that
+    the robot's and the controller's Cyclone DDS configuration uses the
+    default port mapping of the configured domains;
+  * **IP and MAC spoofing on the controller segment**: the gateway binds a
+    writer's stream to its source IP and MAC (`e85471c`), but a host on the
+    controller-side segment that sends with the controller's own IP and
+    MAC cannot be told apart; keep only the controller on that port;
+  * loco `SetVelocity`, arm and hand SDK channels are not decided, and the
+    gateway's events file does not reach agentd or the SOC yet.
 * **Executor v1 is untested on a Unitree robot.** It has run against real
   nftables in network namespaces only. On a passive sensor box it has no
   effect, because the box is not in the path. On a humanoid with the

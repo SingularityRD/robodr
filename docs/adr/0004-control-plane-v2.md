@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Proposed |
+| Status | Accepted in implementation; ratification pending. Robot side `robodr-control-plane/v2` (`a158536`, `5cf978e`; v1 removed); the AutoSecOps client speaks v2 on its development branch (AutoSecOps `a9fca839`). Tested on a local test PKI only |
 | Proposed | 2026-10-25, GA-ROADMAP §2.1 D4 (commit `a5c5afd`); scheduled for Sprint 5 |
 | Implemented | Not yet. v1 exists: `6c3287d` (control-plane action API), with the shared action catalog from `ed4f1ac`. |
 | Related | [ADR-0005](0005-action-catalog.md), [ADR-0006](0006-approval-never-autonomous.md), [ADR-0007](0007-audited-libraries.md) |

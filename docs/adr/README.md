@@ -26,14 +26,14 @@ the commit.
 
 | ADR | Title | GA-ROADMAP | Status |
 |---|---|---|---|
-| [0001](0001-findings-transport-native-ingest.md) | Findings reach the SOC through a native HTTPS ingest API; Kafka is optional | D1 | Accepted in implementation; ratification pending |
+| [0001](0001-findings-transport-native-ingest.md) | Findings reach the SOC through a native HTTPS ingest API; Kafka is optional | D1 | Accepted in implementation; ratification pending (SOC side on an unreleased AutoSecOps branch) |
 | [0002](0002-mvp-bridge-webhook-workflow.md) | MVP bridge: webhook + workflow + deduplicate before the native module | D2 | Proposed |
 | [0003](0003-findings-contract-v2.md) | Findings contract `robodr.findings/2.x`: vendor-neutral envelope, OCSF 1.1 body | D3 | Accepted in implementation; ratification pending |
-| [0004](0004-control-plane-v2.md) | Control plane v2: mTLS, signed requests, persistent state, real outcomes | D4 | Proposed |
+| [0004](0004-control-plane-v2.md) | Control plane v2: mTLS, signed requests, persistent state, real outcomes | D4 | Accepted in implementation; ratification pending |
 | [0005](0005-action-catalog.md) | One vendor-neutral action catalog, with what GA executes | D5 | Accepted in implementation; ratification pending |
-| [0006](0006-approval-never-autonomous.md) | Robot actions are never autonomous; two-person rule for the strongest | D6 | Accepted in implementation (robot side); ratification pending |
+| [0006](0006-approval-never-autonomous.md) | Robot actions are never autonomous; two-person rule for the strongest | D6 | Accepted in implementation; ratification pending (SOC side on an unreleased AutoSecOps branch) |
 | [0007](0007-audited-libraries.md) | Audited libraries instead of hand-written HTTP, crypto and Kafka code | D7 | Proposed (partly implemented) |
-| [0008](0008-licensing-enforced-at-soc.md) | Licensing is enforced at the SOC; the robot agent never goes blind | D8 | Proposed |
+| [0008](0008-licensing-enforced-at-soc.md) | Licensing is enforced at the SOC; the robot agent never goes blind | D8 | Proposed (partly implemented on the SOC side) |
 | [0009](0009-robodr-proprietary-license.md) | RoboDR is proprietary; Pulsar eBPF probes stay GPL-2.0 | D9 | Accepted (2026-10-25) |
 | [0010](0010-legal-clearance.md) | Legal clearance: AutoSecOps1 provenance, Pulsar GPL-2.0 eBPF, export control | S0 (L) | Accepted (2026-10-25) |
 | [0011](0011-ingest-api-v1.md) | The `robodr.ingest` HTTP API, contract v1 | S2–S3 | Accepted in implementation; ratification pending |

@@ -1,9 +1,11 @@
 # RoboDR quick start
 
-> **Pre-release draft (2026-10-26).** RoboDR is alpha software
+> **Pre-release draft (refreshed 2026-10-26).** RoboDR is alpha software
 > (`0.1.0-alpha`). No signed release has been published yet, and nothing
 > has run on a customer robot. The SOC side of the connected path (the
-> AutoSecOps ingest module) is not available yet (GA-ROADMAP Sprint 3).
+> AutoSecOps ingest module, control-plane client and robot pages) exists
+> on an unreleased AutoSecOps development branch; its fleet API is not
+> finished.
 > This page gives the order of steps. The authoritative procedures are in
 > [`docs/OPERATIONS.md`](../OPERATIONS.md), and for Unitree robots in
 > [`docs/UNITREE.md`](../UNITREE.md). Check what your build supports in
@@ -103,6 +105,14 @@ sudo systemctl enable --now robodr-agentd
 Health: `systemctl status robodr-agentd` (STATUS line) and the daemon's
 `status.json` ([OPERATIONS section 6](../OPERATIONS.md)).
 
+**Leave `executor.enabled` at `false`** for the first field period. The
+executor ([OPERATIONS section 6.5](../OPERATIONS.md)) is off by default and
+should be enabled only after the response policy is OEM-validated and the
+robot's motion control path, management and control buses are listed in
+its configuration (examples: `config/executor.example.json`,
+`config/executor.unitree-g1.example.json`; with the G1 example it runs no
+network action on the humanoid).
+
 ## 6. Deliver findings to the SOC
 
 Enable **exactly one** spool consumer. The units conflict.
@@ -134,20 +144,64 @@ Enable **exactly one** spool consumer. The units conflict.
 
 - **AutoSecOps** receives findings at `POST /api/robot-edr/v2/ingest`
   ([`docs/contracts/robodr.ingest-api.md`](../contracts/robodr.ingest-api.md)).
-  Register each robot and its keys in the workspace. **Not available
-  yet** (Sprint 3).
+  Register each robot and its keys in the workspace. The module is on an
+  unreleased AutoSecOps branch and has not yet been run against
+  `robodr-uplink`.
+- **Enrollment** (optional): `robodr-enroll` registers the unit's keys
+  with the SOC using a single-use token
+  ([OPERATIONS section 8.6](../OPERATIONS.md)). The AutoSecOps side is not
+  finished; until then, register keys by hand.
 - **Evidence:** export black-box bundles
-  ([OPERATIONS section 8.2](../OPERATIONS.md)) and verify them with
-  `robodr-blackbox verify` against the robot's `.pub`.
+  ([OPERATIONS section 8.2](../OPERATIONS.md)), or through the control
+  plane's evidence API, and verify them with `robodr-blackbox verify`
+  (`verify BUNDLE` for an export) against the robot's `.pub`.
 - **Control plane** (optional, off by default): it lets the SOC request
-  the seven catalog actions over mutual TLS. It **executes nothing**
-  unless executor v1 is enabled (off by default; OPERATIONS section 6.5)
+  the seven catalog actions over mutual TLS, with signed requests and
+  answers. It **executes nothing** unless executor v1 is enabled (off by
+  default; OPERATIONS section 6.5)
   ([`docs/contracts/robodr.control-plane.md`](../contracts/robodr.control-plane.md)).
+
+## 7a. Optional: inline Motion Firewall gateway (Unitree)
+
+The gateway puts a bridged sensor box into the controller cable and
+enforces the joint and sport envelopes
+([OPERATIONS section 6.6](../OPERATIONS.md),
+[UNITREE.md section 5.1](../UNITREE.md),
+[`crates/robodr-firewall-gw/README.md`](../../crates/robodr-firewall-gw/README.md)).
+It is not validated on a robot. Before you install it:
+
+1. **All discovery crosses the bridge.** The robot must have no other
+   link (Wi-Fi, a second NIC, a cellular modem) that reaches
+   controller-side participants: every SPDP / SEDP must cross the bridge,
+   or a writer the gateway never classified passes unchecked.
+2. **DDS ports.** Capture the ports the robot and the controller use and
+   check they are inside the queued range of the configured
+   `rtps.domain_ids` (7400 + 250·d .. +249). A non-default Cyclone DDS
+   port or participant-index setting bypasses the queue.
+3. **Controller segment.** Only the controller on the controller-side
+   port. Set `allowed_src_ips` and `allowed_src_macs` on every channel; a
+   host on that segment that spoofs the controller's IP and MAC cannot be
+   told apart.
+4. **Loss of the command stream.** Confirm with the OEM what the robot
+   does when commands stop: with `fail_closed` (default) a stopped
+   gateway hands over to the robot's own command timeout. `bypass` is
+   refused for a humanoid joint channel.
+5. **Humanoid rules.** On a humanoid joint channel the gateway forwards
+   only accepted frames or holds of the last accepted one, never damping
+   or limp frames. List in `allowed_api_ids` only the sport calls your
+   controller uses (`Damp` makes a Go2 go limp).
+6. **Latency.** Measure on your box with the gateway's latency harness
+   (`crates/robodr-firewall-gw/examples/gw_latency.rs`, `--budget-p99-ns`);
+   the published figures are from a development VM.
+7. Run `robodr-firewall-gw check-config`, start in `mode: observe`,
+   compare the would-have verdicts with the robot's behaviour, and only
+   then switch to `enforce`.
 
 ## 8. Before you rely on it
 
-- Run observe-only for the first field period, and review false
-  positives with your RoboDR contact.
+- Run observe-only for the first field period (executor disabled,
+  gateway in `mode: observe`), and review false positives with your
+  RoboDR contact.
 - Read [`known-limitations.md`](known-limitations.md) and the
   [`security-whitepaper.md`](security-whitepaper.md).
 - Report vulnerabilities as described in [`SECURITY.md`](../../SECURITY.md)

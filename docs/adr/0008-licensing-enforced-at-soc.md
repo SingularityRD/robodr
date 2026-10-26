@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Proposed |
+| Status | Proposed (partly implemented on the SOC side: `robot_edr` entitlement, AutoSecOps `9de8854e`; no robot-count claim yet). The robot side has no licence check, as decided |
 | Proposed | 2026-10-25, GA-ROADMAP §2.1 D8 (commit `a5c5afd`) |
 | Implemented | No. The SOC side is AutoSecOps1 work. This repository holds no licence check, which matches the decision: no match for `entitlement` or `max_robots` in `crates/`. |
 | Related | [ADR-0009](0009-robodr-proprietary-license.md) |

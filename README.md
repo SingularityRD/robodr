@@ -165,98 +165,76 @@ vendor/pulsar/          Pulsar, as a git submodule (the base we build on).
 
 ## Status
 
-**Verified offline** (dev sandbox: no network, Rust stable 1.97, Pulsar-bound
-members dropped from the workspace, serde patched to local checkouts; no kernel
-module, no robot):
+**Alpha (`0.1.0-alpha.1`), unreleased, not validated on a real robot.**
+Everything below was verified offline: unit and integration tests, real
+ROS 2 lab captures, network namespaces on a development VM, containers and
+qemu. No release has been cut or signed, and GitHub CI has never run
+(every CI job passed in a local run). Plan and per-sprint status:
+[`docs/GA-ROADMAP.md`](docs/GA-ROADMAP.md); blunt list of limits:
+[`docs/customer/known-limitations.md`](docs/customer/known-limitations.md).
 
-- The 16 pure crates build, pass `clippy -D warnings` and pass their tests:
-  1883 unit + integration tests passing, 1 long fuzz run `#[ignore]`d (at the
-  wave-7 integration, two consecutive full runs).
-- Wave 7 (review fixes) is in: profile trust files must be root-signed and
-  locked profiles attested when `trust_roots` is configured; revocation
-  lists v2 revoke signing keys by fingerprint; `safety_feed` topics need
-  commissioned `writers`, and safety and motion samples are trusted only
-  when the participant binding vouches for their source (contested
-  prefixes trust no source); the black box can mark its head through a
-  file anchor (`blackbox.head_anchor`, kind `file`); spool export recovers
-  a split pack without acknowledging unpacked records. Every emitted
-  `robot.*` rule id has its own OCSF 1.3 catalog entry. The Pulsar-bound
-  crates are built against the real Pulsar (commit 4796504) and were run as
-  root with eBPF probes loaded (PULSAR-INTEGRATION §7b).
-- Inputs: most tests use **synthetic** RTPS / pcap generated from the spec;
-  four **real captures** of ROS 2 Jazzy (Fast DDS 2.14, Cyclone DDS 0.10;
-  robot + teleop + a rogue `/cmd_vel` publisher) are checked in under
-  `fixtures/captures/ros2-jazzy/` and exercised end to end by
-  `crates/robodr-ros2-pipeline/tests/real_captures.rs`: learn from one run,
-  detect the rogue in another run in which every process has a new GUID
-  (participant identities, `Profile::participant_identities`).
-- Live `AF_PACKET` capture is exercised only on the loopback interface with
-  test-generated datagrams, and only when the test has `CAP_NET_RAW` (it
-  prints `SKIPPED` and passes otherwise).
+**In the code (2026-10-26):**
+
+- **Detection** in `robodr-agentd`: DDS graph against a signed, locked
+  profile (participant identities survive GUID changes), RTPS user DATA →
+  CDR → motion envelope, Motion Firewall decisions (recording only in the
+  passive modes), motion monitor, correlation, Pulsar host threats, a
+  signed and hash-chained black box. Unitree SDK2 topics and Go1 legacy
+  UDP decode end to end on synthetic traffic and IDL-derived vectors
+  ([`docs/UNITREE.md`](docs/UNITREE.md)).
+- **Findings to a SOC**: `robodr.findings` 2.1 over `robodr-uplink`
+  (signed NDJSON batches, TLS, contract
+  [`robodr.ingest-api`](docs/contracts/robodr.ingest-api.md)), the diode,
+  or Kafka (no TLS).
+- **Control plane `robodr-control-plane/v2`** (off by default; v1 is
+  removed): mutual TLS off loopback, Ed25519-signed requests and answers,
+  a persistent request journal and replay store, and an evidence API that
+  exports black-box records as signed, chunked bundles
+  (`robodr-blackbox verify BUNDLE`)
+  ([contract](docs/contracts/robodr.control-plane.md)).
+- **Executor v1** (`robodr-executor`, **off by default**): reversible,
+  TTL-bounded `isolate_network` and `quarantine_node` (nftables) and
+  `record_evidence`, decided again on the robot against its own policy and
+  the live safety state; separate process with `CAP_NET_ADMIN` only.
+  `restrict_motion` is recorded only; `safe_pause`, `request_safe_state`
+  and `rollback_config` are never executed
+  ([crate README](crates/robodr-executor/README.md)).
+- **In-path gateway** (`robodr-firewall-gw`, optional): a bridged sensor
+  box that passes, limits, holds or removes Unitree motion samples
+  (`rt/lowcmd`, sport `Move`, Go1 UDP) and never originates one;
+  `fail_closed` by default. It protects only what crosses its bridge
+  ([crate README](crates/robodr-firewall-gw/README.md), "Known limits").
+- **Fleet lifecycle, robot side** (`robodr-enroll`): enrollment with a
+  single-use SOC token, uplink / finding key rotation, revocation lists,
+  staged SOC profiles, ring information
+  ([contract](docs/contracts/robodr.fleet-api.md), draft v1).
+- **Hardening (S10)**: `sha2` / `hmac` instead of hand-written crypto,
+  `forbid(unsafe_code)` where possible, panic-family calls denied in daemon
+  code, 23 fuzz targets (10 run under libFuzzer for 630 s each, no crash).
 
 **Not verified:**
 
-- No real robot, no RTI Connext traffic, no DDS-Security, no controller
-  hardware, no TPM. False-positive rates are unmeasured beyond the lab
-  captures; thresholds are still estimates.
-- Gazebo: a headless Gazebo Harmonic robot (gz bridge,
-  robot_state_publisher, `/clock`, `/tf`, `/joint_states`, `/odom`) was
-  captured, learned and replayed against a restarted run with a rogue
-  (`fixtures/captures/ros2-jazzy/`, second set): no false positive left
-  after one fix (DATA before the writer's own SEDP). No rendering sensors,
-  ros2_control or nav2.
-- DATA_FRAG: real fragmented SEDP (Fast DDS, Cyclone) and a fragmented
-  JointTrajectory are reassembled and learned (two reassembly bugs found and
-  fixed). Fragmented SPDP only from Cyclone.
-- Zenoh (`rmw_zenoh_cpp`) is **not decoded**: the sensor is blind to it.
-  It is detected by port and reported (`robot.capture.unsupported_middleware`,
-  High when no RTPS is seen; agentd health never `ok`; `learn` warns), not
-  inspected.
-- `robodr-pulsard` ran in WSL2 (kernel 6.18), not on a robot: the multicast
-  join on the robot's interface and coexistence with each DDS vendor on the
-  same host are open.
-- arm64 is cross-built and tested under qemu-user only (docs/BUILD.md,
-  "arm64 (cross-compiled, 2026-10-18)"). Not tested on arm64 hardware, and
-  Pulsar's eBPF probes have never been loaded on an arm64 kernel.
-- `rules/robodr/*.toml` are checked by `scripts/validate_rules.py` only, not
-  loaded into a running Pulsar rules engine.
-- The firewall, motion monitor, responder, black box and OCSF mapper run
-  live in `robodr-agentd`: capture -> RTPS user DATA -> CDR ->
-  `MotionCommand` / `MotionFeedback` -> agent. The XCDR1 `Twist` decode is
-  confirmed on real Fast DDS and Cyclone DDS samples; XCDR2 / `D_CDR2` and
-  the other message types only on hand-built vectors. The Motion Firewall
-  runs recording-only, and nothing executes a response.
-- The control-plane API `robodr-control-plane/v2` (`robodr-agentd`
-  `control_plane`, off by default; `docs/contracts/robodr.control-plane.md`)
-  serves mutual TLS (rustls) off loopback and authenticates Ed25519-signed
-  SOC requests for the seven catalog actions, judges them against the live
-  safety state, records them and keeps their state across restarts
-  (journal, persisted replay store). It **executes nothing**
-  (`recorded_not_executed`) unless executor v1 (`robodr-executor`, off by
-  default) is enabled; then executor states (`verified`, `reverted`, ...)
-  are signed and journalled like every other state. Its evidence API exports black-box records as
-  signed, chunked bundles that `robodr-blackbox verify` checks. Exercised
-  with an in-process signing client and a test PKI over loopback, not
-  against a deployed SOC or across a real network.
-  The Pulsar module (`robodr-sensor-ros2`) runs the same decode for its
-  envelope check but does not forward decoded samples (see its crate docs).
-- The black box's TPM 2.0 NV counter head anchor (`TpmNvCounterAnchor`,
-  `blackbox.head_anchor` kind `tpm_nv_counter`) is tested against swtpm
-  only, not a hardware TPM; it makes rollback and truncation detectable,
-  not impossible (root can still use the counter; owner/lockout
-  authorization must be kept off the unit). The remote head anchor
-  (`RemoteHeadAnchor` + `robodr-anchor-receiver`, kind `remote`) is tested
-  over loopback against a real receiver process only, not across a real
-  network; it needs a reverse channel to the receiver (otherwise
-  detect-only through the diode) and makes rollback detectable, not
-  impossible. A contested GUID prefix fails closed (an attacker who can send
-  one SPDP can make a profiled participant untrusted until it is pinned in
-  `participant_ips`).
-- Evidence (black box, diode bundles) and profiles are signed with Ed25519
-  key files (`robodr-blackbox-key/v2`; HMAC still loads, with a warning). The
-  Ed25519 arithmetic is the audited `ed25519-dalek` crate (strict
-  verification, pinned to the RFC 8032 vectors), but keys are files, not TPM-held;
-  anti-rollback state is a plain file.
+- No real robot, sensor box, controller hardware or hardware TPM. No 72 h
+  soak; false-positive rates and resource budgets are unmeasured. Gateway
+  latency was measured only on a shared VM.
+- The executor and the gateway have run only in network namespaces with
+  synthetic traffic, never under a real systemd on a target, never next to
+  a real Cyclone / Fast DDS stack. Unitree's `rt/lowcmd` QoS and the motor
+  board's behaviour on a lost command stream are unconfirmed.
+- The control plane, uplink and enroll have run against in-process clients,
+  reference servers and a local test PKI, not across a real network. The
+  AutoSecOps side (ingest module, control-plane v2 client, approvals, robot
+  pages) is on an unreleased AutoSecOps branch and passes the shared
+  contract vectors; the two have not been run against each other, and the
+  AutoSecOps fleet API is not finished.
+- Zenoh is detected, not decoded; DDS-Security payloads, RTI Connext and
+  arm64 hardware are untested; `robodr-pulsard` ran only under WSL2, and
+  the host rules were never loaded into a running rules engine on a robot.
+- Kafka and the anchor receiver have no TLS. Keys are files, not TPM-held.
+  The executor cannot yet verify the SOC's approval itself.
+- Reviews were done by independent AI agents, not humans; there has been no
+  penetration test. RoboDR is not a safety-rated component
+  ([`docs/compliance/safety-positioning.md`](docs/compliance/safety-positioning.md)).
 
 ## Build
 

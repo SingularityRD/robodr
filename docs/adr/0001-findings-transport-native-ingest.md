@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Accepted in implementation; ratification pending |
+| Status | Accepted in implementation; ratification pending. Producer `robodr-uplink` (`fa3f3dc`); the AutoSecOps consumer exists on its development branch (AutoSecOps `918363d2`), not released |
 | Proposed | 2026-10-25, GA-ROADMAP §2.1 D1 (commit `a5c5afd`) |
 | Implemented | 2026-10-26: producer side (`cf2f857`, `fa3f3dc`, `c7d5025`, `8f22bac`, `b5a9c7c`) |
 | Related | [ADR-0002](0002-mvp-bridge-webhook-workflow.md) (MVP bridge), [ADR-0003](0003-findings-contract-v2.md) (payload), [ADR-0011](0011-ingest-api-v1.md) (the API contract), [ADR-0007](0007-audited-libraries.md) (Kafka client) |

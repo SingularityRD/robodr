@@ -1,6 +1,6 @@
 # RoboDR security whitepaper
 
-> **Pre-release draft (2026-10-26).** This describes the architecture as
+> **Pre-release draft (refreshed 2026-10-26).** This describes the architecture as
 > implemented in the repository at this date, and marks what is planned.
 > Claims are limited to what the code and its tests show. Nothing here has
 > been validated on a customer robot, and no external audit or penetration
@@ -23,8 +23,11 @@ It is **protective only**:
 
 It is **not a safety-rated component**
 ([`docs/compliance/safety-positioning.md`](../compliance/safety-positioning.md)).
-In this release it **executes no response at all**: plans and SOC requests
-are recorded, not carried out.
+By default it **executes no response**: plans and SOC requests are
+recorded, not carried out. Two opt-in components can act, within narrow,
+reversible limits: executor v1 (network containment) and the inline
+Motion Firewall gateway (motion-command filtering on a bridged sensor
+box). Section 7 lists exactly what each does.
 
 ## 2. Architecture
 
@@ -37,8 +40,15 @@ are recorded, not carried out.
  │   ─► responder (plans) ─► black box (sig.) │ ────────► │   registry, dedup, case) │
  │   ─► OCSF findings spool                   │ uplink    │                          │
  │ robodr-uplink | robodr-spool-export ───────┼─diode────►│ diode-unpack ─► uplink   │
- │ control plane v2 (off by default, mTLS)    │ ◄──────── │ approved action requests │
- └────────────────────────────────────────────┘ signed    └──────────────────────────┘
+ │ control plane v2 (off by default, mTLS) ◄──┼───────────│ approved action requests,│
+ │   └─(HMAC unix socket)─► robodr-executor   │ signed    │ evidence exports         │
+ │      (off by default; nftables only)       │           │                          │
+ │ robodr-enroll (fleet lifecycle) ───────────┼─TLS──────►│ fleet API (in progress)  │
+ └────────────────────────────────────────────┘           └──────────────────────────┘
+
+ Optional inline mode (sensor box with two bridged NICs):
+   controller ──► [ bridge ─► NFQUEUE ─► robodr-firewall-gw ] ──► robot
+                    pass / limit / hold / remove; never originates a datagram
 ```
 
 | Process | Privilege | Network |
@@ -48,6 +58,9 @@ are recorded, not carried out.
 | `robodr-uplink` | User `robodr` | Only the SOC address in its drop-in. TLS. |
 | `robodr-spool-export` | User `robodr` | None (`PrivateNetwork=yes`) |
 | `robodr-kafka-publish` | User `robodr` | Only the brokers in its drop-in. **No TLS.** |
+| `robodr-executor` (off by default) | User `robodr-exec`, `CAP_NET_ADMIN` only, writes only its journal directory, runs `nft` with an argument vector and an empty environment | None: `RestrictAddressFamilies=AF_UNIX AF_NETLINK`, `IPAddressDeny=any` |
+| `robodr-firewall-gw` (inline mode only) | `CAP_NET_ADMIN` only (NFQUEUE), FIFO priority 40, watchdog 2 s | No IP sockets; the bridge needs no IP address |
+| `robodr-enroll` | root, run by an operator (key files) | Only the SOC, over TLS, or files on media |
 
 Unit files and the reasons behind them:
 [`packaging/systemd/`](../../packaging/systemd/),
@@ -61,7 +74,10 @@ Unit files and the reasons behind them:
 | TB2 | The host OS of the robot or box | Trusted for privilege separation; not trusted to be unmodified | systemd confinement; signed and anti-rollback profile state; signed black box with optional head anchors that make rollback detectable |
 | TB3 | Robot → SOC network | Untrusted | TLS (rustls) with the operator's CA and optional SPKI pin; Ed25519 batch signatures; optional per-finding signatures; server-side replay table |
 | TB4 | Data diode or media | One-way, untrusted carrier | Ed25519-signed, hash-chained batches; Reed-Solomon parity; the SOC holds only public keys |
-| TB5 | SOC → robot (control plane) | Untrusted network; the SOC is trusted only to sign approved requests | Ed25519 request signatures bound to robot id, nonce and time; judgment against the safety state; signed evidence; mutual TLS (rustls) off loopback and signed answers (control plane v2). |
+| TB5 | SOC → robot (control plane) | Untrusted network; the SOC is trusted only to sign approved requests | Mutual TLS (rustls) off loopback; Ed25519 request signatures bound to robot id, target, nonce and time, with a persisted replay store; judgment against the live safety state; every answer signed; evidence exports with signed manifests. No per-key action scopes yet. |
+| TB9 | agentd → executor (local) | agentd is trusted for what it judged, including the approval flag | HMAC-authenticated unix socket; the executor re-checks its own policy, configuration and the live safety state; reversible, TTL-bounded rules only. A compromised agentd can assert an approval; verification of the SOC signature in the executor is planned. |
+| TB10 | Controller segment → inline gateway | Hostile: GUIDs and sequence numbers are claims | Per-channel `allowed_src_ips` / `allowed_src_macs`; sequence state bound to (GUID, source IP, MAC); unknown writers probed and undecidable samples suppressed. **Not covered:** a sender with the controller's own IP and MAC on that segment, discovery paths that bypass the bridge, DDS ports outside the queued range. |
+| TB11 | SOC fleet documents → robot | Verified data, never orders | SOC fleet-key signatures, single-use enrollment tokens, root-signed revocation lists with anti-rollback; SOC profiles staged and installed only with an approval signed by a separate SOC approval key and a local operator command. |
 | TB6 | SOC analysts and LLM agents | May be misled by finding contents | Taint delimiting; actions need human approval (two people for the strongest) |
 | TB7 | Commissioning station and offline keys | Trusted, offline | Profile and trust-root keys never on the robot; operator sign-off with a quorum, verified on the robot |
 | TB8 | Release supply chain | Verified at the site's entry station | Minisign signatures, `SHA256SUMS`, reproducible pure binaries, SBOM. *Designed; the release workflow has never run.* |
@@ -76,10 +92,13 @@ tool accepts a key on its command line.
 | Key | Lives | Signs |
 |---|---|---|
 | Black-box key | robot | the evidence chain |
-| Finding key (optional) | robot | per-finding signatures; control-plane answers |
+| Finding key | robot (required when the control plane is enabled) | per-finding signatures; control-plane answers; evidence-export manifests |
+| Control-plane TLS key and certificate | robot | the robot's TLS server identity (the SOC's client CA and optional SPKI pins configured next to it) |
+| Executor protocol key | robot (agentd and executor) | HMAC over agentd ↔ executor messages |
 | Uplink or relay key | robot / sensor box, or the SOC-side importer | ingest batches |
 | Diode key | robot | diode batches |
 | SOC key | SOC | control-plane requests (its `.pub` on each robot) |
+| SOC fleet key, SOC approval key | SOC | enrollment tokens and fleet documents; profile approvals (two separate keys) |
 | Profile-signing key | commissioning station, never the robot | locked profiles |
 | Trust roots | offline station or token | profile trust files, revocation lists |
 | Operator keys | each operator | commissioning sign-off |
@@ -92,9 +111,11 @@ Limits:
   ([`docs/OPERATIONS.md`](../OPERATIONS.md) section 4);
 - legacy HMAC keys still load, with a warning.
 
-Robot side available, SOC side planned: enrolment with a single-use,
-SOC-signed token and rotation of the uplink and finding keys with the SOC
-(`robodr-enroll`, S9; keys are generated on the unit and never leave it;
+Robot side available, SOC side in progress: enrolment with a single-use,
+SOC-signed token (read from a root-only file or standard input, never the
+command line) and rotation of the uplink and finding keys with the SOC
+(`robodr-enroll`; keys are generated on the unit and never leave it; the
+enrollment request is signed by all three new keys;
 [`docs/OPERATIONS.md`](../OPERATIONS.md) section 8.6). Planned: TPM sealing
 (S10) and the AutoSecOps side of the fleet API.
 
@@ -116,6 +137,11 @@ SOC-signed token and rotation of the uplink and finding keys with the SOC
 - **Findings.** Optional detached per-finding signatures, carried
   unchanged through the ingest API. Ingest batches are signed over the
   exact body bytes.
+- **Evidence exports.** The control plane's evidence API exports
+  black-box frames exactly as stored, as `RBBXBND1` bundles with a
+  manifest signed by the finding key, in signed, size-bounded, resumable
+  chunks; `robodr-blackbox verify BUNDLE` checks them
+  ([`docs/contracts/robodr.control-plane.md`](../contracts/robodr.control-plane.md) §11).
 
 ## 6. Attacker-controlled data and prompt injection
 
@@ -142,24 +168,28 @@ carrier ([`docs/contracts/robodr.findings.md`](../contracts/robodr.findings.md)
 The ingest contract requires the SOC to store these fields as data, render
 them delimited, and label them untrusted in any LLM prompt. An LLM agent
 can never send a robot action without human approval
-([ADR-0006](../adr/0006-approval-never-autonomous.md)). The SOC-side
-enforcement and evaluation are AutoSecOps work (S3, S6).
+([ADR-0006](../adr/0006-approval-never-autonomous.md)). On its development
+branch AutoSecOps renders these fields only as neutralised, labelled
+untrusted data, refuses to sign a robot action without platform sign-off
+(two people for the strongest actions), and forces approval for the robot
+action tools in every agent; this is not released yet.
 
 ## 7. What is and is not executed
 
 | Item | Today |
 |---|---|
-| Response plans (on-robot responder) | **Recorded, not executed** by default. With executor v1 enabled (off by default), an Eligible plan's network isolation / participant quarantine may be handed to `robodr-executor`. |
-| SOC action requests (control plane v2) | Authenticated, judged, recorded; answered `recorded_not_executed`: **nothing reaches the robot** unless executor v1 is enabled. Then only `isolate_network` and `quarantine_node` (nftables, reversible, TTL) and `record_evidence` are executed, by the separate `robodr-executor` (the only `CAP_NET_ADMIN` unit apart from the optional inline gateway, which uses it for NFQUEUE only). |
-| Motion Firewall | Decides per command and per joint frame; **recording only**. No in-path gateway. |
+| Response plans (on-robot responder) | **Recorded, not executed** by default. With executor v1 enabled (off by default), an eligible plan's network isolation / participant quarantine may be handed to `robodr-executor` (`planner_orders`); never on a humanoid, where everything needs a human. |
+| SOC action requests (control plane v2) | Authenticated, judged, recorded; answered `recorded_not_executed`: **nothing reaches the robot** unless executor v1 is enabled. Then only `isolate_network` and `quarantine_node` (nftables, reversible, TTL) and `record_evidence` are executed, by the separate `robodr-executor`, after its own precheck and a safety-state re-check right before apply; states `verified` / `refused` / `failed` / `reverted` are signed and journalled. `restrict_motion` is recorded only; `safe_pause`, `request_safe_state` and `rollback_config` are never executed. |
+| Motion Firewall, passive modes | Decides per command and per joint frame; **recording only**. |
+| Motion Firewall, inline gateway (opt-in) | Passes, limits in place, holds (humanoid: never damping or limp) or removes motion samples that cross the bridge; never originates a datagram; `fail_closed` by default when it is down. Its limits are configuration, not SOC actions. |
 | Processes RoboDR starts | None on the robot's behalf. |
 | Code loaded into the kernel | Pulsar's eBPF probes (GPL-2.0), only by `robodr-pulsard`, only where enabled. |
 | Network transmission from agentd | None (passive capture; IP denied). |
 
-**Planned for GA (not implemented):** executing the reversible actions
-`restrict_motion`, `quarantine_node`, `isolate_network` and
-`record_evidence`, plus `safe_pause` through OEM-validated platform
-adapters. Every one needs SOC approval, a re-check against the live
+**Planned for GA (not implemented):** `restrict_motion` as a SOC action
+through the gateway, and `safe_pause` through OEM-validated platform
+adapters; verification of the SOC signature and approval inside the
+executor. Every action needs SOC approval, a re-check against the live
 safety state on the robot, and an automatic revert at TTL. On humanoids
 the de-energising actions are never executable
 ([ADR-0005](../adr/0005-action-catalog.md),
@@ -167,14 +197,28 @@ the de-energising actions are never executable
 
 ## 8. Availability and failure behaviour
 
-- Nothing in the motion stack depends on RoboDR. agentd is OOM-killed
-  before the motion stack, and its loss is visible (watchdog, stale
-  status, missing heartbeats).
+- In the passive modes nothing in the motion stack depends on RoboDR.
+  agentd is OOM-killed before the motion stack, and its loss is visible
+  (watchdog, stale status, missing heartbeats).
+- **Inline mode is the exception.** The robot's commands cross the
+  gateway. When it is down, `fail_closed` (default) drops them and the
+  robot's own command timeout applies; `bypass` forwards them unchecked
+  and is refused for a humanoid joint channel. A late packet gets the
+  firewall's fault verdict (hold on a humanoid). Integrators must include
+  this in their risk assessment
+  ([`docs/compliance/safety-positioning.md`](../compliance/safety-positioning.md)).
+- The executor fails toward "no rule set": any journal, nft, read-back,
+  safety-state or configuration error leaves the robot without the
+  action. An operator's `nft delete table inet robodr` disables it at
+  once.
 - Parsers, queues, caches and rate limits are bounded. A flood against
   the control plane costs the control plane (429/503), never detection.
 - Exporters are crash-safe and at-least-once. A batch the SOC keeps
   refusing blocks later findings visibly, and is never dropped.
 - `panic = "abort"`: a panic stops the daemon until systemd restarts it.
+  Panic-family calls are denied in the daemon crates' non-test code, and a
+  process-level test checks that the black box verifies across an abort
+  and restart.
 
 ## 9. Supply chain
 

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Accepted in implementation (robot side); ratification pending. The SOC side is not implemented. |
+| Status | Accepted in implementation; ratification pending. Robot side: no autonomous action, catalog approval tiers. SOC side on the AutoSecOps development branch, not released: platform sign-off with two people for the strongest actions (AutoSecOps `bee7e167`), approval forced for robot actions in every agent (AutoSecOps `6ae14d0e`). The robot cannot verify the approvals |
 | Proposed | 2026-10-25, GA-ROADMAP §2.1 D6 (commit `a5c5afd`) |
 | Implemented | Robot side, 2026-10-25: catalog approval tiers (`ed4f1ac`). SOC side: AutoSecOps1, Sprint 6. |
 | Related | [ADR-0005](0005-action-catalog.md), [ADR-0012](0012-balancing-robot-response-rules.md) |
