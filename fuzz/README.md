@@ -26,6 +26,7 @@ violated output invariant (documented at the top of its harness file).
 | `correlate_rules` | robodr-correlate | `rules JSON \0 signal records` to `RuleSet::from_json` and a `Correlator` driven by the result (finding invariants) | `crates/robodr-correlate/tests/fuzz_smoke.rs` |
 | `safety_feed` | robodr-agentd | `safety_feed JSON \0 records`: safety-socket lines, RTPS datagrams (through the sensor pipeline, then `SafetyFeed::observe_datagram`), clock steps; "never less conservative than a fresh socket report" | `crates/robodr-agentd/tests/fuzz_smoke.rs` |
 | `kafka_wire` | robodr-export | a selector + body to the Kafka decoders: ApiVersions / Metadata v1-8 / Produce v3-8 responses (decode-encode-decode identity), RecordBatch v2 (CRC fixed up or not), request header + Metadata / Produce requests, wire primitives | none (see below) |
+| `firewall_gw_packet` | robodr-firewall-gw | a flags byte + framed records (each wrapped in IPv4 / UDP) to `Gateway::process` (strict RTPS walk, SEDP learning, `LowCmd_` / sport `Request_` / Go1 decode, firewall decision, in-place rewrite), and the bytes to the NFQUEUE netlink parser | `crates/robodr-firewall-gw/tests/fuzz_smoke.rs` |
 
 `kafka_wire` has no std-only smoke test: it was added while
 `crates/robodr-export` was being changed by parallel work, so nothing was

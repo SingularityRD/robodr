@@ -28,8 +28,9 @@
 # what the response policy lists in fall_safe_restrict (and a human's
 # approval). Off unless agentd's `executor.enabled` is true.
 #
-# Capability model: this unit is the ONLY RoboDR process with CAP_NET_ADMIN
-# (robodr-agentd keeps CAP_NET_RAW only). It runs `nft` (absolute path from
+# Capability model: this unit is the only RoboDR process on the robot with
+# CAP_NET_ADMIN (robodr-agentd keeps CAP_NET_RAW only; the sensor box's
+# inline gateway, robodr-firewall-gw, holds it for NFQUEUE alone). It runs `nft` (absolute path from
 # the config, empty environment, argument vector, JSON on stdin), which
 # inherits the ambient CAP_NET_ADMIN. It has no IP networking at all
 # (AF_UNIX for agentd's socket, AF_NETLINK for nft).

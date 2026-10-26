@@ -28,6 +28,32 @@
 /// The CRC-32 polynomial Unitree uses (MSB-first form).
 pub const UNITREE_CRC_POLY: u32 = 0x04C1_1DB7;
 
+/// `CRC_TABLE[i]`: the register after shifting byte `i` (in the top 8
+/// bits) through eight steps of the MSB-first recurrence.
+static CRC_TABLE: [u32; 256] = crc_table();
+
+// Compile-time only: the loop bound keeps every index inside the array.
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+const fn crc_table() -> [u32; 256] {
+    let mut t = [0u32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut c = (i as u32) << 24;
+        let mut k = 0;
+        while k < 8 {
+            c = if c & 0x8000_0000 != 0 {
+                (c << 1) ^ UNITREE_CRC_POLY
+            } else {
+                c << 1
+            };
+            k += 1;
+        }
+        t[i] = c;
+        i += 1;
+    }
+    t
+}
+
 /// `crc32_core(ptr, len)` over `words` (see the module docs).
 pub fn crc32_core(words: &[u32]) -> u32 {
     let mut crc = CrcState::new();
@@ -68,19 +94,20 @@ impl CrcState {
         CrcState(0xFFFF_FFFF)
     }
 
+    /// One word, MSB first. The SDK's loop shifts one bit at a time and
+    /// XORs the polynomial when the bit leaving the register differs from
+    /// the data bit entering it: the plain MSB-first CRC-32 recurrence, so
+    /// it is computed a byte at a time with [`CRC_TABLE`] (the in-crate
+    /// reference loop and the independent vectors in the tests pin the
+    /// equivalence). The in-path gateway computes this for every frame it
+    /// decodes and every frame it rewrites, so the bit loop's ~8 000
+    /// branches per 1 KB frame mattered.
     fn word(&mut self, data: u32) {
         let mut crc = self.0;
-        let mut xbit: u32 = 1 << 31;
-        for _ in 0..32 {
-            let top = crc & 0x8000_0000 != 0;
-            crc = crc.wrapping_shl(1);
-            if top {
-                crc ^= UNITREE_CRC_POLY;
-            }
-            if data & xbit != 0 {
-                crc ^= UNITREE_CRC_POLY;
-            }
-            xbit = xbit.wrapping_shr(1);
+        for b in data.to_be_bytes() {
+            let idx = usize::from((crc.wrapping_shr(24) as u8) ^ b);
+            // `idx <= 255`, so `get` always succeeds.
+            crc = crc.wrapping_shl(8) ^ CRC_TABLE.get(idx).copied().unwrap_or(0);
         }
         self.0 = crc;
     }
@@ -228,6 +255,38 @@ mod tests {
             assert_eq!(crc32_core(&words[..n]), reference(&words[..n]));
         }
         assert_eq!(crc32_core(&[]), 0xFFFF_FFFF);
+    }
+
+    /// The table-driven register update equals the SDK's bit loop for
+    /// every byte value in every byte position of a word, from many
+    /// register states.
+    #[test]
+    fn table_matches_the_bit_loop_exhaustively_per_byte() {
+        let mut state = 0x1234_5678_u32;
+        for pos in 0..4 {
+            for byte in 0..=255u32 {
+                for _ in 0..8 {
+                    state = state.wrapping_mul(0x9E37_79B9).rotate_left(7) ^ 0xA5A5_0F0F;
+                    let w = byte << (8 * pos) | (state & !(0xff << (8 * pos)));
+                    let mut a = CrcState(state);
+                    a.word(w);
+                    let mut r: u32 = state;
+                    let mut xbit: u32 = 1 << 31;
+                    for _ in 0..32 {
+                        let top = r & 0x8000_0000 != 0;
+                        r <<= 1;
+                        if top {
+                            r ^= UNITREE_CRC_POLY;
+                        }
+                        if w & xbit != 0 {
+                            r ^= UNITREE_CRC_POLY;
+                        }
+                        xbit >>= 1;
+                    }
+                    assert_eq!(a.0, r, "state {state:#x} word {w:#x}");
+                }
+            }
+        }
     }
 
     #[test]

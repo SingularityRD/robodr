@@ -32,6 +32,8 @@
 #             requires them)
 #             robodr-anchor-receiver (pure; base-station side of the remote
 #             head anchor, installed with its unit when built)
+#             robodr-firewall-gw (pure; in-path inline-bridge gateway for
+#             a sensor box, installed with its two units, never enabled)
 # A unit file is only installed together with its binary. ROBODR_DEB_REQUIRE
 # (space separated) makes optional binaries mandatory; the release workflow
 # sets it so a release can never silently ship without the daemon.
@@ -212,12 +214,21 @@ if install_bin robodr-agentd usr/sbin 0; then
     done
 fi
 # executor v1 (off unless agentd's executor.enabled; not enabled by the
-# package): the only CAP_NET_ADMIN unit, plus agentd's key drop-in example.
+# package): with robodr-firewall-gw, the only CAP_NET_ADMIN units; plus
+# agentd's key drop-in example.
 if install_bin robodr-executor usr/sbin 0; then
     install -D -m 0644 "$unit_src/robodr-executor.service" "$pkg/$units/robodr-executor.service"
     install -D -m 0644 "$unit_src/robodr-agentd.service.d/30-executor.conf.example" \
         "$pkg/usr/share/doc/robodr/examples/robodr-agentd.service.d/30-executor.conf.example"
     install -D -m 0644 "$root/config/executor.example.json" "$pkg/$ex/executor.example.json"
+fi
+# In-path Motion Firewall gateway (inline bridge on a sensor box,
+# crates/robodr-firewall-gw): the gateway and its ruleset unit, installed
+# disabled (enforcing must follow commissioning; OPERATIONS.md 6.6).
+if install_bin robodr-firewall-gw usr/sbin 0; then
+    for u in robodr-firewall-gw.service robodr-firewall-gw-rules.service; do
+        install -D -m 0644 "$unit_src/$u" "$pkg/$units/$u"
+    done
 fi
 # Base-station side of the remote head anchor (not enabled by the package).
 if [[ "$variant" == standard ]] && install_bin robodr-anchor-receiver usr/bin 0; then

@@ -12,8 +12,9 @@ The command is checked against the locked model envelope and the set of sources
 allowed on its channel.
 
 This crate is only the **pure decision core**. It does no I/O, starts no threads and
-has no clock of its own. The ROS 2 gateway that subscribes to commands, resolves
-DDS writer GUIDs and republishes verdicts is a later step (see "Integration" below).
+has no clock of its own. The in-path gateway for Unitree low-level and sport
+channels is `robodr-firewall-gw`; a ROS 2 (`/cmd_vel`, `JointTrajectory`)
+gateway is a later step (see "Integration" below).
 
 > **Not a safety-rated component.** This is a cyber-security control. It does not
 > implement and does not replace any safety function under ISO 10218, ISO 13849 or
@@ -182,9 +183,10 @@ decoder's `crc_ok`, the hg `mode_pr` / `mode_machine`), stamped with the
 capture time, through `robodr-agent`'s joint verdict record
 (`robodr.firewall_joint_verdict`). The daemon is a passive observer, so the
 firewall runs `PassThroughObserveOnly`: verdicts are recorded would-haves,
-nothing is forwarded or substituted. There is **no in-path gateway** yet that
-subscribes to `rt/lowcmd`, calls `check_joint` and re-publishes (a later
-sprint). Nothing here has been run against a robot; the live path has only seen
+nothing is forwarded or substituted. The **in-path** use is
+`robodr-firewall-gw` (an inline bridge with NFQUEUE that calls
+`check_joint` per frame and rewrites the datagram; see "Integration").
+Nothing here has been run against a robot; both paths have only seen
 synthetic traffic.
 
 Unitree's low-level interface sends one frame per control tick (500 Hz to 1 kHz)
@@ -540,29 +542,18 @@ or any Unitree controller, not under an RT kernel, not pinned, on a shared VM. T
 allocation and no data-dependent loop). The number that matters — added latency on
 the robot's own compute, gateway in the loop, under load — is still to be measured.
 
-## Integration (not done here)
+## Integration
 
-- **Low-level joint gateway (Unitree).** Nothing subscribes to `rt/lowcmd` and
-  re-publishes yet. `robodr-agentd` already does the decode half in recording mode
-  (decode, `crc_ok`, source resolution, `mode_pr` / `mode_machine` pass-through,
-  `check_joint`, the joint verdict record in `robodr-agent`); an in-path gateway
-  (an inline mode of the daemon, which does not exist yet) still has to:
-  - decode the platform's `LowCmd` IDL (`go` / `hg`) into a `JointFrame`, check its
-    CRC and set `crc_ok`; resolve the writer to a `SourceId`;
-  - compile the policy with `Policy::compile_with_joints` (or
-    `FirewallConfig::from_json(..)?.compile(&profile)`), with the channel in the
-    profile's `motion_envelopes` and `writer_topics`;
-  - call `check_joint` per frame and publish the output, re-encoding a `Limited`
-    frame or a substitute **with a freshly computed CRC**, passing the decoded
-    `mode_pr` / `mode_machine` through into the `JointFrame` (pinned channels
-    reject frames without them) and carrying the remaining non-motor fields
-    (flags, reserved words) itself;
-  - publish nothing when the verdict emits nothing (the robot keeps its last
-    command), and call `joint_fault_verdict` on a deadline miss;
-  - (done) `robodr-agent`'s verdict records have the joint variant
-    (`robodr.firewall_joint_verdict`: reasons `position` / `velocity` / `torque`
-    / `gain` / `step` / `pd_torque`, substitute `hold_last` / `zero` = damping,
-    slot count, `crc_ok`, `mode_pr` / `mode_machine`).
+- **Low-level joint gateway (Unitree): done in `robodr-firewall-gw`.** The
+  in-path inline-bridge gateway (NFQUEUE) decodes `unitree_go` / `unitree_hg`
+  `LowCmd_` strictly, passes the decoded `crc_ok`, `mode_pr` /
+  `mode_machine` into the `JointFrame`, resolves the writer to a
+  `SourceId`, calls `check_joint` per frame (and `joint_fault_verdict` for a
+  packet read too late), re-encodes a `Limited` frame or a substitute in
+  place with a freshly computed CRC and the remaining non-motor fields, and
+  removes the sample when the verdict emits nothing. See
+  [`crates/robodr-firewall-gw/README.md`](../robodr-firewall-gw/README.md).
+  `robodr-agentd` keeps the recording-mode decode for passive deployments.
 
 - **ROS 2 gateway.** It has to:
   - subscribe on a shadow topic and republish verdict outputs;

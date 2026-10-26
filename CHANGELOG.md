@@ -10,6 +10,32 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ## [Unreleased]
 
+### Security
+
+- `robodr-firewall-gw` (review F1, critical): a spoofed DATA with the
+  motion writer's GUID and a far-future sequence number no longer poisons
+  the stream. Sequence / replay state is bound to (GUID, authorised
+  source, source IP, source MAC — the MAC from `NFQA_HWADDR`) and only
+  samples forwarded from that binding advance it; foreign samples never
+  touch it and never carry a substitute under an authorised GUID; the same
+  GUID from another (IP, MAC) is a binding conflict while the bound side is
+  live (`rtps.binding_takeover_ns`, default 1 s); a jump beyond
+  `rtps.max_sn_jump` (default 64) is held until confirmed by the next
+  sample; a writer restart (lower number after an SEDP re-announcement from
+  the bound IP) is accepted once. New channel option `allowed_src_macs`.
+- `robodr-firewall-gw` (review F2, high): DATA_FRAG, key-only and
+  non-standard samples of a writer with no SEDP / persisted classification
+  are suppressed in enforce mode (`unknown_writers: probe`): the content
+  probe cannot read them.
+- `robodr-firewall-gw` (review F3, medium): a go `LowCmd_` with
+  `bms_cmd.off != 0` (`0xA5` = battery off) is refused (decided as an
+  integrity failure, so the substitute with the last accepted frame's
+  non-motor fields applies) unless the channel sets `allow_battery_off`;
+  the other non-motor fields are documented with SDK evidence.
+- New status counters `binding_conflicts`, `sn_jumps`, `writer_restarts`,
+  `unknown_undecidable`, `non_motor_rejected`; fuzz invariants for F2 / F3;
+  netns e2e for F1 (attacker namespace, spoofed IP with its own MAC).
+
 ### Added
 
 - Control plane `robodr-control-plane/v2` in `robodr-agentd` (GA sprints 4
@@ -130,6 +156,42 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   `diode_fec` (against an oracle), `correlate_rules`, `safety_feed`,
   `kafka_wire`; each ran 10 minutes under libFuzzer without a crash
   (fuzz/README.md).
+- `robodr-firewall-gw` (new crate + binary): the first **in-path**
+  enforcement point. An inline bridge on the sensor box hands every UDP
+  datagram of a configured motion channel that enters from the controller
+  side to an NFQUEUE (br_netfilter + iptables `physdev` / `NFQUEUE`,
+  ruleset rendered from the gateway configuration by `robodr-firewall-gw
+  ruleset`), decides it with `robodr-firewall` and answers ACCEPT, DROP or
+  ACCEPT with a same-length rewritten payload. Channels: Unitree SDK2
+  `rt/lowcmd` (`unitree_go` / `unitree_hg` `LowCmd_`, strict RTPS walk and
+  canonical-CDR decode, limited frames rewritten in place with the CRC
+  recomputed and verified), sport API `Move` (parameter rewritten, other
+  calls by allowlist, aliased api ids refused) and Go1 legacy UDP
+  `HighCmd` / uncompressed `LowCmd`. Substitutes (humanoid: hold, never
+  damping or limp) are written into the rejected sample itself (same
+  writer, sequence number and length; the gateway never originates a
+  datagram or a sequence number); a sample with nothing to emit becomes a
+  PAD; retransmissions / replays re-emit the cached decision; undecidable
+  payloads are integrity failures; DATA_FRAG of a motion channel is
+  suppressed. Writer → topic learned from SEDP (persisted), SPDP identities,
+  source-IP binding, kernel arrival timestamps as the firewall clock, fault
+  verdict for late packets. `queue.on_gateway_down`: `fail_closed`
+  (default) or `bypass` (refused for a humanoid joint channel). In-tree
+  NFQUEUE netlink client (std + `extern "C"`, fuzzed); units
+  `robodr-firewall-gw.service` / `robodr-firewall-gw-rules.service` (+
+  systemd 245 variants); example configurations
+  `config/firewall-gw.unitree-{g1,go2}.example.json`; fuzz target
+  `firewall_gw_packet`; latency harness `examples/gw_latency.rs`; an
+  end-to-end test through real network namespaces, bridge and NFQUEUE
+  (`tests/netns_e2e.rs`, `--ignored`, root). Docs: crate README (design,
+  "what hold means on the wire", latency), UNITREE.md 5.1, OPERATIONS.md
+  6.6. Not validated on a robot; not a safety-rated device.
+  S10 policy as for the other daemons: `#![deny(unsafe_code)]` with local
+  allows only on the NFQUEUE netlink socket and `signal` / `clock_gettime`
+  (SAFETY comment on every block; `struct timespec` refused on 32-bit
+  targets), `#![forbid(unsafe_code)]` on the binary, panic-family clippy
+  lints denied outside tests; the test fixtures (`testkit`) are behind a
+  test-only feature and not in the shipped binary.
 - `robodr-uplink` (crate `robodr-export`): producer of the AutoSecOps ingest
   API (`docs/contracts/robodr.ingest-api.md`, contract v1). Inputs as
   `robodr-kafka-publish` (agentd spool on a connected unit or sensor box, or
@@ -586,6 +648,12 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   a non-loopback `listen_tcp` needs mutual TLS. `config/agentd.full.example.json`
   shows the mTLS listener, the state directory and the evidence API.
 - `robodr-agentd` links rustls + ring (C and assembly) like `robodr-uplink`.
+- `robodr-cdr`: the Unitree CRC (`crc32_core`, `frame_crc`, every
+  `crc_ok`) is computed a byte at a time from a 256-entry table instead of
+  bit by bit; results are identical (checked against the SDK loop for every
+  byte value in every word position and the independent vectors). The
+  in-path gateway computes it on every frame it decodes or rewrites; its
+  per-frame decision went from about 28 µs to about 10 µs (p50, 35 slots).
 - `robodr-uplink`: `Retry-After` is honoured in full (up to a documented
   24 h bound, contract §7), also when it came with a run's last attempt;
   `--max-retry-after-s` is **removed** (it could only make retries sooner

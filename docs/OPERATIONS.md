@@ -1364,7 +1364,8 @@ its own table `inet robodr`, plus an evidence mark:
 | `quarantine_node` | one DDS participant dropped (by RTPS GUID prefix and by its SPDP locators, which agentd must have seen and which must lie outside the motion control path; that path is never cut, even by traffic carrying the quarantined prefix) | on revert or TTL |
 | `record_evidence` | a signed black-box mark | never: evidence is not reverted |
 
-`restrict_motion` is recorded as advisory: there is no gateway yet. The
+`restrict_motion` is recorded as advisory: the executor does not drive the
+inline gateway (section 6.6), which enforces its own locked profile. The
 executor never sends `safe_pause`, `request_safe_state` or
 `rollback_config`.
 
@@ -1374,6 +1375,7 @@ executor never sends `safe_pause`, `request_safe_state` or
 |---|---|---|---|
 | `robodr-agentd` | `robodr` | `CAP_NET_RAW` (capture) | AF_PACKET read, no IP |
 | `robodr-executor` | `robodr-exec` (group `robodr`) | `CAP_NET_ADMIN` only | AF_UNIX + AF_NETLINK, `IPAddressDeny=any` |
+| `robodr-firewall-gw` (section 6.6, sensor box) | `robodr` | `CAP_NET_ADMIN` only (NFQUEUE) | AF_UNIX + AF_NETLINK, `IPAddressDeny=any` |
 
 agentd talks to the executor over `/run/robodr-executor/executor.sock`
 (0660, group `robodr`), using an HMAC-authenticated protocol with a key
@@ -1518,6 +1520,100 @@ records it. Bridged traffic is isolated only with `br_netfilter` loaded
 A failed revert is retried every 500 ms until it verifies. Treat
 `revert_failures > 0` as urgent. The finding for it is not in the
 findings contract yet, so watch this counter instead.
+
+### 6.6 Inline Motion Firewall gateway (`robodr-firewall-gw`)
+
+The in-path enforcement mode for a sensor box bridged into the controller
+cable (design and safety argument:
+[`crates/robodr-firewall-gw/README.md`](../crates/robodr-firewall-gw/README.md);
+Unitree specifics: [UNITREE.md section 5.1](UNITREE.md#51-inline-gateway-mode-robodr-firewall-gw)).
+**Not a safety-rated device**: the robot's own safety functions remain
+primary.
+
+**Install.**
+
+1. Bridge the two NICs without an IP address on the bridge (networkd or
+   netplan; `controller_port` faces the controller, `robot_port` the
+   robot). Nothing else should be plugged into the controller side.
+2. Put the locked, signed profile and the firewall configuration in place
+   (sections 4.4, 5) and write `/etc/robodr/firewall-gw.json` from
+   `config/firewall-gw.unitree-<model>.example.json`: port names, queue
+   number, `allowed_src_ips` for every channel, `on_gateway_down`.
+3. `robodr-firewall-gw check-config --config /etc/robodr/firewall-gw.json`
+   (exit 0 = everything compiles against the profile and the firewall
+   configuration; 2 = the error is printed). In `mode: enforce` a profile
+   that fails its trust checks is an error here and at start.
+4. `robodr-firewall-gw ruleset --config /etc/robodr/firewall-gw.json`
+   prints the netfilter setup it will install; review it once.
+5. `systemctl enable --now robodr-firewall-gw-rules.service robodr-firewall-gw.service`.
+   The rules unit runs before `network-pre.target` at boot, so no motion
+   datagram crosses the bridge before the queue exists.
+
+**Run observe first.** With `"mode": "observe"` every datagram is forwarded
+unchanged while the decisions are made and recorded (`events_path`,
+`observe_would_modify` / `observe_would_drop` in the status file). Switch to
+`enforce` only after the would-have verdicts match what the robot should
+do, and after confirming with the OEM what the robot does on a lost command
+stream (that is what `fail_closed` and every suppressed tick rely on).
+
+**Health.** `status_path` (default in the examples
+`/var/lib/robodr/firewall-gw/status.json`) is rewritten every
+`housekeeping_ms`: gateway counters (`passed`, `limited`, `substituted`,
+`suppressed`, `undecidable`, `replays`, `late`, `rewrite_failed`,
+`dropped_ip`, `rtps_malformed`, `binding_conflicts`, `sn_jumps`, ...), the firewall's statistics (hold
+episodes, holds past `max_hold_ns`), and the recv → verdict latency (p50 /
+p99 / max). Treat it as unknown when `updated_mono_ms` is older than
+`stale_after_ms`. Firewall deviations are appended to `events_path` (JSON
+lines, size-capped by `events_max_bytes`). Watch in particular:
+
+| Counter | Means |
+|---|---|
+| `suppressed` growing while the controller runs normally | frames refused with nothing to emit: wrong `allowed_src_ips` / sources, a rate window that does not match the controller's loop, or an attack |
+| `rewrite_failed` > 0 | a limited / substitute frame could not be written and verified (suppressed instead): report it |
+| `late` > 0 | packets read more than `max_queue_delay_ns` after arrival: the box is overloaded or not running the unit's real-time priority |
+| `undecidable`, `rtps_malformed`, `unsupported_sample` | malformed or fragmented motion traffic: misconfiguration or an attack |
+| `binding_conflicts` > 0 | the motion writer's GUID arrived from another source IP / MAC than the controller's stream: a spoofer on the controller segment (or a second NIC sending the controller's traffic) |
+| `sn_jumps` > 0 | a sequence-number jump past `rtps.max_sn_jump` was held back: lost frames between controller and gateway, or a spoofed far-future number |
+| `writer_restarts` | a writer restarted with its old GUID (announced by SEDP); expected only when the controller software restarts |
+| `unknown_undecidable` > 0 | a fragmented / key-only / non-standard sample from a writer the gateway never saw announced was removed: a discovery path around the bridge, a missing `rtps.state_file`, or an attack |
+| `non_motor_rejected` > 0 | a `LowCmd_` asked to turn the battery off (`bms_cmd.off`) and was replaced by the substitute: investigate the sender |
+| firewall `joint_holds_exceeded` | a humanoid has been held past `max_hold_ns`: escalate (the gateway keeps holding) |
+
+**While the gateway is down** (stopped, crashed, restarting after a
+watchdog kill, refused to start) the rules stay in place and the kernel
+applies `on_gateway_down`: `fail_closed` (default) drops the queued
+commands, `bypass` forwards them unchecked (refused for a humanoid joint
+channel). Stopping the gateway is therefore **not** a way to take it out of
+the path.
+
+**Maintenance bypass** (an explicit, logged operator action, never
+automatic): with the robot in a safe state, flush the queue chain so the
+bridge forwards everything unchecked, and restore it afterwards:
+
+```sh
+iptables -F ROBODR_GW                         # bridge now forwards unchecked
+# ... maintenance ...
+systemctl restart robodr-firewall-gw-rules    # re-installs the ruleset
+```
+
+Record both steps in the site log; the status file's counters stop moving
+while the chain is flushed.
+
+**Troubleshooting.**
+
+* `NFQUEUE <n>: ... (needs CAP_NET_ADMIN and nfnetlink_queue)`: the unit
+  lost its capability, or the kernel lacks `nfnetlink_queue`.
+* Nothing reaches the gateway (`packets` stays 0): `br_netfilter` is not
+  loaded (`sysctl net.bridge.bridge-nf-call-iptables` must be 1), the port
+  names in the configuration do not match the bridge ports, or the
+  controller uses another DDS domain than `rtps.domain_ids`.
+* Every frame suppressed after a gateway restart: the writer map was lost
+  (set `rtps.state_file`) and `unknown_writers: pass`; or the controller's
+  participant changed and its identity / GUID is not in the firewall's
+  `allowed_sources`.
+* Large IP datagrams from the controller side disappear: defragmentation
+  did not run (another ruleset flushed the `raw` table); re-run the rules
+  unit.
 
 ## 7. Upgrade and rollback
 

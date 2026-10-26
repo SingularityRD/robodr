@@ -257,7 +257,8 @@ binaries (`robodr-focal`, arm64).
   on a robot. In a Ubuntu 24.04 container (not booted with systemd) they
   were: `install` of a `robodr-focal` bundle, then of a `robodr` bundle
   (dpkg removed `robodr-focal` in favour of `robodr`), then `rollback`.
-- `robodr-executor.service` (executor v1, the only `CAP_NET_ADMIN` unit) and
+- `robodr-executor.service` (executor v1, the only `CAP_NET_ADMIN` unit on the robot
+  besides the sensor box's inline gateway) and
   its focal variant (added 2026-10-26) pass `systemd-analyze verify` apart
   from the missing binaries in the check environment and score 1.1 / 1.3
   with `systemd-analyze security --offline=yes` (systemd 255); not started

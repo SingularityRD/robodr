@@ -146,7 +146,7 @@ enforcement and evaluation are AutoSecOps work (S3, S6).
 | Item | Today |
 |---|---|
 | Response plans (on-robot responder) | **Recorded, not executed** by default. With executor v1 enabled (off by default), an Eligible plan's network isolation / participant quarantine may be handed to `robodr-executor`. |
-| SOC action requests (control plane v2) | Authenticated, judged, recorded; answered `recorded_not_executed`: **nothing reaches the robot** unless executor v1 is enabled. Then only `isolate_network` and `quarantine_node` (nftables, reversible, TTL) and `record_evidence` are executed, by the separate `robodr-executor` (the only `CAP_NET_ADMIN` unit). |
+| SOC action requests (control plane v2) | Authenticated, judged, recorded; answered `recorded_not_executed`: **nothing reaches the robot** unless executor v1 is enabled. Then only `isolate_network` and `quarantine_node` (nftables, reversible, TTL) and `record_evidence` are executed, by the separate `robodr-executor` (the only `CAP_NET_ADMIN` unit apart from the optional inline gateway, which uses it for NFQUEUE only). |
 | Motion Firewall | Decides per command and per joint frame; **recording only**. No in-path gateway. |
 | Processes RoboDR starts | None on the robot's behalf. |
 | Code loaded into the kernel | Pulsar's eBPF probes (GPL-2.0), only by `robodr-pulsard`, only where enabled. |
