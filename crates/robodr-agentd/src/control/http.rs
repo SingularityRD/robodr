@@ -491,14 +491,14 @@ pub(crate) mod tests {
     #[test]
     fn get_and_post_parse() {
         let r =
-            parse(b"GET /api/v1/robots/ugv-007 HTTP/1.1\r\nHost: x\r\nX-RoboDR-Nonce: abc\r\n\r\n")
+            parse(b"GET /api/v2/robots/ugv-007 HTTP/1.1\r\nHost: x\r\nX-RoboDR-Nonce: abc\r\n\r\n")
                 .unwrap();
         assert_eq!(r.method, "GET");
-        assert_eq!(r.target, "/api/v1/robots/ugv-007");
+        assert_eq!(r.target, "/api/v2/robots/ugv-007");
         assert_eq!(r.header("x-robodr-nonce"), Some("abc"));
         assert!(r.body.is_empty());
         let r = parse(
-            b"POST /api/v1/robots/r/action-requests HTTP/1.1\r\ncontent-length: 4\r\n\r\n{}  extra",
+            b"POST /api/v2/robots/r/action-requests HTTP/1.1\r\ncontent-length: 4\r\n\r\n{}  extra",
         )
         .unwrap();
         assert_eq!(r.body, b"{}  ");

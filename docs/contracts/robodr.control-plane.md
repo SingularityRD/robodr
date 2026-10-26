@@ -1,21 +1,26 @@
-# Contract: `robodr.control-plane` (robot action requests)
+# Contract: `robodr.control-plane` (robot action requests and evidence)
 
 | | |
 | --- | --- |
-| API version | `robodr-control-plane/v1` |
+| API version | `robodr-control-plane/v2` (v1 is removed, §14) |
 | Producer of answers | `robodr-agentd` (`crates/robodr-agentd/src/control/`), config key `control_plane` |
-| Consumer | any SOC integration that sends approved robot actions (requirements in §9) |
+| Consumer | any SOC integration that sends approved robot actions or collects evidence (requirements in §10) |
 | Action catalog | `robodr_responder::actions` (one list shared with the planner; §4) |
-| Superseded | the first draft, written for a cancelled integration: [`legacy/robot-edr.control-plane.md`](legacy/robot-edr.control-plane.md) |
+| Superseded | v1 (this file's history); the first draft, written for a cancelled integration: [`legacy/robot-edr.control-plane.md`](legacy/robot-edr.control-plane.md) |
 | Status | **Experimental.** Off by default. **Nothing is executed** in this release |
-| Reference tests | `crates/robodr-agentd/tests/control_plane.rs` (end to end, real daemon), unit tests in `src/control/{http,auth,api,mod}.rs` |
+| Reference tests | `crates/robodr-agentd/tests/control_plane.rs` (end to end, real daemon: mTLS, restart, evidence), `tests/control_plane_vectors.rs` (§12), `tests/fuzz_smoke.rs`, unit tests in `src/control/{http,auth,api,journal,state,evidence,tls,mod}.rs` |
+| Test vectors | [`fixtures/control-plane-v2/`](fixtures/control-plane-v2/) (§12) |
 
 A SOC asks the robot for one of the seven catalog actions. The on-robot agent
 checks the request against the robot's **current** safety state, operational
 context and response policy (Cyber-Jidoka), records request and decision in
-its signed black box and answers. The SOC never commands motion and never
-overrides the platform's safety authority: the strongest action is a
-*request* for a safe state, which the platform's safety controller decides on.
+its signed black box and in a persistent request journal, and answers. The
+SOC never commands motion and never overrides the platform's safety
+authority: the strongest action is a *request* for a safe state, which the
+platform's safety controller decides on. With the evidence API (§11) the SOC
+also exports black-box evidence (a finding's records, a sequence or time
+range) in signed, resumable chunks and verifies it with the robot's public
+keys.
 
 In this release agentd has no executor that acts on the robot. The only
 executor is the recording one: an accepted request is answered
@@ -25,16 +30,50 @@ applied", never as success.
 
 ## 1. Transport
 
-* HTTP/1.1, one request per connection (`Connection: close`), JSON bodies,
-  no chunked encoding, no keep-alive. Limits: head 8 KiB, 32 header lines,
-  target 1 KiB of `[A-Za-z0-9-._~%/:]` (no query string), body 16 KiB with an
-  exact `Content-Length`; the request must arrive within 5 s.
-* Listeners (at least one): `listen_tcp` (loopback unless `allow_remote:
-  true`) and / or `unix_socket` (mode `0600` or `0660`, private directory).
-* **No TLS** (agentd is std-only). Requests are authenticated (§2) but not
-  confidential. For a remote SOC terminate TLS in front of the loopback
-  listener (the signature covers the exact target and body, so the proxy
-  must forward both unchanged). `Authorization` headers are ignored.
+* HTTP/1.1, one request per connection (`Connection: close`), no chunked
+  encoding, no keep-alive, no pipelining. Limits: the request head is at
+  most 8 KiB before its blank line, 32 header lines, a target of at most
+  1 KiB of `[A-Za-z0-9-._~%/:]` (no query string), a body of at most
+  16 KiB with an exact `Content-Length` (none on `GET` / `DELETE`). The
+  request must arrive within 5 s (after the TLS handshake, which has its own
+  5 s); the answer is written within 30 s (a slower reader is cut off).
+* Answers are JSON (`Content-Type: application/json`) except evidence chunks
+  (`application/octet-stream`, §11.5). `Cache-Control: no-store`.
+* **Listeners** (at least one):
+
+  | Listener | Config | Security of the channel |
+  | --- | --- | --- |
+  | TCP, any address | `listen_tcp` + `tls` | **mutual TLS** (below) |
+  | TCP, loopback only | `listen_tcp` without `tls` | none (local tests, a local proxy) |
+  | unix socket | `unix_socket` (mode `0600` or `0660`, private directory) | file permissions |
+
+  A non-loopback `listen_tcp` without `tls` is refused at start (there is no
+  plain-HTTP remote mode any more). The socket file is created with its
+  final mode (bound in a private `0700` directory, `chmod`ed, then
+  hard-linked into place): it is never connectable with looser permissions.
+* **Mutual TLS** (rustls, ring provider; TLS 1.3 and 1.2 with rustls' safe
+  defaults: AEAD suites, ECDHE only):
+  * The robot presents `tls.cert_chain` (end entity first). The SOC verifies
+    it against the CA it uses for robots and the address or name it
+    connects to; it may also pin the robot's SPKI SHA-256
+    (`status.json` → `control_plane.tls.server_spki_sha256`).
+  * The SOC **must** present a client certificate that chains to one of the
+    CA certificates in `tls.client_ca` (nothing else is trusted), is within
+    its validity period and permits `clientAuth` (when it has an extended
+    key usage). If `tls.client_spki_sha256` lists pins, the SHA-256 of the
+    client end-entity certificate's DER `SubjectPublicKeyInfo` must be one
+    of them **in addition**. Several CA certificates and pins may be listed
+    for a rotation (§10).
+  * No session resumption (no tickets, no session cache): every connection
+    presents and checks the client certificate.
+  * A failed handshake (no certificate, unknown CA, expired, pin mismatch,
+    plain HTTP to the TLS port) gets no HTTP answer; it is counted as a
+    failed authentication (`tls_failures`, `last_auth_failure`, finding
+    `robot.agent.control_plane_unauthenticated`).
+* mTLS authenticates the channel. **Every request must still carry a valid
+  Ed25519 SOC signature (§2)** on every listener: a stolen client
+  certificate cannot sign, a stolen SOC signing key cannot connect from the
+  network. `Authorization` headers are ignored.
 
 ## 2. Authentication
 
@@ -47,66 +86,99 @@ Every request, reads included, carries:
 | `X-RoboDR-Nonce` | 16..128 characters of `[A-Za-z0-9_-]`, never reused |
 | `X-RoboDR-Signature` | Ed25519 signature, 128 hex characters |
 
-The signature is over these lines joined by `\n` (no trailing newline):
+Each header exactly once. The signature is over these lines joined by `\n`
+(no trailing newline):
 
 ```text
-robodr-control-plane/v1
+robodr-control-plane/v2
 <METHOD>
-<request target exactly as sent, e.g. /api/v1/robots/ugv-007/action-requests/robot_safe_pause%3Augv-007>
+<request target exactly as sent, e.g. /api/v2/robots/ugv-007/action-requests/robot_safe_pause%3Augv-007>
 <robot id>
 <key id>
 <timestamp>
 <nonce>
-<lower-case hex SHA-256 of the body bytes (of the empty string for a GET)>
+<lower-case hex SHA-256 of the body bytes (of the empty string for a GET / DELETE)>
 ```
 
 The robot id is the one agentd is configured with: a request signed for
 another robot never verifies. agentd then requires
 |robot clock − timestamp| ≤ `max_clock_skew_s` (default 30 s; both sides need
 NTP) and a (key, nonce) pair it has not seen while that timestamp is in the
-window (cache of 8192 live entries; refused with 503 `replay_cache_full`
-when full, never accepted unchecked). Authenticated requests are rate-limited
-per key (`rate_per_minute`, default 30, `burst` 10; 429 with `Retry-After`).
+window.
+
+**Replay store.** The (key, nonce) pairs are persisted
+(`<state_dir>/nonces.journal`): a pair is made durable (fsync) **before** the
+request goes further, so a request accepted before a restart is still a
+replay after it while its timestamp is in the window. At most 8192 live
+pairs (503 `replay_cache_full` when full of live ones, never accepted
+unchecked); a pair that cannot be made durable refuses the request (503
+`replay_store_unavailable`). If the store cannot be trusted at start
+(damaged entries, or missing while the request journal exists), agentd
+**fences**: every request whose timestamp is not later than the start is
+refused (`stale_timestamp`); sign again. (`status.json`:
+`control_plane.replay_fence`.)
+
+Authenticated requests are rate-limited per key (`rate_per_minute`, default
+30, `burst` 10; evidence chunk downloads have their own bucket, §11.7; 429
+with `Retry-After`).
 
 SOC keys are `robodr-blackbox keygen` public key files (`algorithm:
 ed25519`, `key_id`, `public_hex`, optional `device_id` which must then be
 this robot). A secret key file, a group/other-writable file, a symlink, or a
 key id equal to the robot's black-box or finding key is refused at start.
 
-**Answer signature.** With `finding_signing` configured, every answer to an
-authenticated request carries
-`X-RoboDR-Answer-Signature: ed25519;key_id=<finding key id>;sig=<128 hex>`
+**Answer signature (mandatory).** Every answer to an authenticated request
+— any status, chunks included — carries
+
+```text
+X-RoboDR-Answer-Signature: ed25519;key_id=<finding key id>;sig=<128 hex>
+```
+
 over
 
 ```text
-robodr-control-plane/v1 answer
+robodr-control-plane/v2 answer
 <the request's X-RoboDR-Signature, lower-case hex>
-<HTTP status>
+<HTTP status, decimal>
 <lower-case hex SHA-256 of the answer body bytes>
 ```
 
-verifiable with the robot's finding public key (the key the SOC already holds
-for `robodr-finding-sig`). Binding to the request signature (and so to its
-nonce) stops a replay of an old answer. Answers to unauthenticated requests
-are never signed.
+verifiable with the robot's finding public key (the key the SOC already
+holds for `robodr-finding-sig`; `finding_signing` is required with
+`control_plane`). Binding to the request signature (and so to its nonce)
+stops the replay of an old answer. Answers to requests that did not
+authenticate (400 before the credentials were read, 401, 503
+`replay_cache_full` / `replay_store_unavailable` / `clock_unavailable`) are
+never signed: there is nothing to bind them to. If the robot cannot sign, it
+answers 500 `answer_signing_failed`, unsigned. **A SOC must treat any answer
+without a valid signature as not coming from the robot** (it may still show
+an unsigned 4xx/5xx reason to a person, never act on it).
 
 ## 3. Calls
 
-Paths under `/api/v1`. `{robot_id}` must be this robot (else 404
-`unknown_robot`); `{request_id}` is percent-decoded and must match
-`[A-Za-z0-9._:-]{1,128}`.
+Paths under `/api/v2/robots/{robot_id}`. `{robot_id}` must be this robot
+(else 404 `unknown_robot`); `{request_id}` and `{export_id}` are
+percent-decoded and must match `[A-Za-z0-9._:-]{1,128}`.
 
 | Call | Body | Answer |
 | --- | --- | --- |
-| `GET /robots/{robot_id}` | — | robot snapshot (§3.1) |
-| `POST /robots/{robot_id}/action-requests` | action request (§4) | request state (§5) |
-| `GET /robots/{robot_id}/action-requests/{request_id}` | — | request state |
-| `POST /robots/{robot_id}/action-requests/{request_id}/revert` | `{"reason"?, "requested_by"}` | request state with the revert result (§6) |
+| `GET /api/v2/robots/{robot_id}` | — | robot snapshot (§3.1) |
+| `POST .../action-requests` | action request (§4) | request state (§5) |
+| `GET .../action-requests/{request_id}` | — | request state |
+| `POST .../action-requests/{request_id}/revert` | `{"reason"?, "requested_by"}` | request state with the revert result (§6) |
+| `GET .../evidence` | — | evidence inventory (§11.2) |
+| `POST .../evidence/exports` | export request (§11.3) | 201 manifest (§11.4); 200 for the same export again |
+| `GET .../evidence/exports/{export_id}` | — | manifest |
+| `GET .../evidence/exports/{export_id}/chunks/{index}` | — | chunk bytes (§11.5) |
+| `DELETE .../evidence/exports/{export_id}` | — | `{"export_id", "deleted": true}` |
+
+A method a path does not take is 405 `method_not_allowed`; an unknown path
+404 `not_found`.
 
 ### 3.1 Robot snapshot
 
 ```json
-{"robot_id": "ugv-007", "online": true, "api": "robodr-control-plane/v1",
+{"robot_id": "ugv-007", "online": true, "api": "robodr-control-plane/v2",
  "safety_state": {"state": "moving_slow", "source": "safety_feed", "safety_system_engaged": false},
  "mode": "enforce", "health": "ok", "executor": "recording", "executes_actions": false,
  "morphology": "wheeled_mobile",
@@ -232,67 +304,143 @@ and a consumer must not either.
 | --- | --- | --- |
 | `recorded_not_executed` | accepted against the current safety state and recorded as a plan in the black box; **nothing was sent to the robot** | yes |
 | `refused` | judged unsafe or not allowed now (§4.1), recorded | yes |
-| `failed` | the black box did not take the request (`state.error.code: evidence_unavailable`); nothing was decided or stored, a retry is judged anew | yes |
+| `failed` | not taken: `state.error.code` is `evidence_unavailable` (the black box did not take it) or `state_unavailable` (the request journal did not take it, §9); nothing was decided or stored, a retry is judged anew | yes |
 | `pending`, `applied` | reserved for an executor that acts; none exists in this repository | — |
 
 `request_id` is the idempotency key: the same id with the same action,
 parameters and ttl returns the stored state with `"duplicate": true` (not
 judged or recorded again); the same id for anything else is 409
 `request_id_conflict`. The store keeps the newest `max_requests` (default
-1024) requests in memory; older ones and everything before a restart answer
-404 (the black box keeps every decision).
+1024) requests and **survives a restart** (§9): a status query after a
+restart answers exactly as before it; older requests answer 404
+`unknown_request` (the black box keeps every decision; §11 exports it).
 
 ## 6. Revert
 
 | Stored request | Revert answer `status` |
 | --- | --- |
-| `request_safe_state`, `rollback_config` | `refused`, `refusal.code: not_reversible` (an operator restores the robot) |
-| `recorded_not_executed`, `refused`, `failed` | `not_applied`: it never took effect; recorded (`robodr.control_plane_revert`), `state.revert` filled |
+| `request_safe_state`, `rollback_config`, `record_evidence` | `refused`, `refusal.code: not_reversible` (an operator restores the robot; evidence is never reverted) |
+| `recorded_not_executed`, `refused`, `failed` | `not_applied`: it never took effect; recorded (`robodr.control_plane_revert`), `state.revert` filled (the first revert is kept, also across restarts) |
 
 The revert answer carries the request's state with `status` replaced by the
 revert's result and `revert_evidence` (the note's black-box reference).
 
 ## 7. HTTP errors
 
-`{"error": {"code": "...", "message": "..."}}` with 400 (body errors §4,
-malformed requests), 401 (`missing_credentials`, `malformed_credentials`,
-`unknown_key`, `bad_signature`, `stale_timestamp`, `replayed_nonce`), 404
-(`not_found`, `unknown_robot`, `unknown_request`), 405
-(`method_not_allowed`), 408 (`timeout`), 409 (`request_id_conflict`), 413
-(`body_too_large`), 429 (`rate_limited`), 431 (`head_too_large`,
-`too_many_headers`), 503 (`busy`: the main loop did not take or answer in
-`answer_timeout_ms`, or the daemon is stopping; `replay_cache_full`;
-`clock_unavailable`), 505. A 503 `busy` after the request was handed over
-may still have been recorded: read it back with GET.
+`{"error": {"code": "...", "message": "..."}}` with
 
-## 8. Evidence and findings
+* 400: body errors (§4, §11.3) and malformed requests (`bad_request_line`,
+  `bad_target`, `bad_header`, `bad_head`, `content_length`,
+  `transfer_encoding`, `body_not_allowed`, `truncated`, `io`);
+* 401: `missing_credentials`, `malformed_credentials`, `unknown_key`,
+  `bad_signature`, `stale_timestamp` (also: the replay fence, §2),
+  `replayed_nonce`;
+* 404: `not_found`, `unknown_robot`, `unknown_request`, `unknown_export`,
+  `unknown_chunk`, `evidence_disabled`, `no_records`,
+  `evidence_not_retained`;
+* 405 `method_not_allowed`; 408 `timeout`;
+* 409: `request_id_conflict`, `export_id_conflict`, `export_limit`,
+  `evidence_mismatch`, `evidence_gap`;
+* 413: `body_too_large`, `export_too_large`; 416 `out_of_range`;
+* 429 `rate_limited` (with `Retry-After`);
+* 431: `head_too_large`, `too_many_headers`;
+* 500: `export_corrupt` (the stored export no longer matches its manifest;
+  it was deleted: create it again), `answer_signing_failed` (unsigned);
+* 503: `busy` (the main loop did not take or answer in `answer_timeout_ms`,
+  or the daemon is stopping), `replay_cache_full`,
+  `replay_store_unavailable`, `clock_unavailable`, `state_unavailable`,
+  `evidence_busy` (another evidence index / export runs: retry shortly),
+  `evidence_unavailable`;
+* 505 `bad_version`; 507 `storage_full`.
+
+A 503 `busy` after the request was handed over may still have been
+recorded: read it back with GET.
+
+## 8. Evidence of the control plane and findings
 
 Black-box notes (signed, hash-chained, fsynced):
 
-* `robodr.control_plane_request`: the request, `auth` (key id, nonce,
-  timestamp, signature, method, target, the exact body, peer: the SOC
-  signature re-verifies offline from the note alone), safety state and its
-  source, operational context, policy validation, decision, refusal or plan
-  (ladder step, plan actions, notes), executor, `executed: false`, status;
-* `robodr.control_plane_revert`: the revert, its result;
+* `robodr.control_plane_request`: `decision_id` (§9), the request, `auth`
+  (key id, nonce, timestamp, signature, method, target, the exact body,
+  peer — on mTLS `mtls:<addr>;client_spki_sha256=<hex>`: the SOC signature
+  re-verifies offline from the note alone), safety state and its source,
+  operational context, policy validation, decision, refusal or plan (ladder
+  step, plan actions, notes), executor, `executed: false`, status;
+* `robodr.control_plane_revert`: the revert, its result, `decision_id`
+  (when it changed the state);
 * `robodr.control_plane_rejected`: an authenticated request refused as
-  invalid, with the error and `auth`.
+  invalid, with the error and `auth`;
+* `robodr.control_plane_evidence_export`: an export (§11): id, selector,
+  who asked (`auth`), chain id, records, anchor, bundle size / SHA-256 /
+  chunk count;
+* `robodr.control_plane_start`: at every start: listeners, TLS identity,
+  whether the evidence API is on, and the persistent state found (§9:
+  restored requests, settled decisions, journal damage, replay fence).
 
-Findings (OCSF, [`robodr.findings`](robodr.findings.md) 2.0, observe-only
+Findings (OCSF, [`robodr.findings`](robodr.findings.md) 2.x, observe-only
 self-health, rate limited by `daemon.health_report_ms`):
 
 * `robot.agent.control_plane_unauthenticated` (High): requests that failed
-  authentication since the last report (count, last reason and peer);
+  authentication since the last report, TLS handshakes included (count,
+  last reason and peer);
 * `robot.agent.control_plane_invalid` (Medium): authenticated requests
   refused as invalid.
 
-`status.json` and every heartbeat carry `control_plane`: `listening`,
-`executor`, `executes_actions`, connection, authentication, rate-limit and
-busy counters, `last_auth_failure`, and the engine's `submitted`,
+`status.json` and every heartbeat carry `control_plane`: `api`, `listening`
+(`mtls:<addr>`, `tcp:<addr>`, `unix:<path>`), `executor`,
+`executes_actions`, connection, authentication (`tls_failures` included),
+rate-limit and busy counters, `answers_signed`, `answer_sign_failures`,
+`last_auth_failure`, `tls` (`server_spki_sha256`, `client_cas`,
+`client_pins`), `replay_entries`, `replay_store_errors`, `replay_fence`,
+`state` (what §9 found at start), `evidence` (exports, bytes, created,
+deleted, expired, chunks served, corrupt) and the engine's `submitted`,
 `recorded_not_executed`, `refused`, `duplicates`, `conflicts`, `reverts`,
-`invalid`, `record_failures`, `evicted`, `stored`.
+`invalid`, `record_failures`, `evicted`, `stored`, `restored`,
+`resolved_committed`, `resolved_aborted`, `journal_damaged`,
+`journal_errors`, `journal_refusals`, `evidence_exports`.
 
-## 9. Client requirements
+## 9. Persistent state (`control_plane.state_dir`)
+
+A private directory (mode `0700`, owned by the daemon's user; agentd refuses
+to start otherwise; not inside the black box or spool):
+
+| Path | What |
+| --- | --- |
+| `requests.journal` | the request journal |
+| `nonces.journal` | the replay store (§2) |
+| `exports/<sha256(export id)[..32]>/` | evidence exports: `bundle.rbbx`, `manifest.json`, `manifest.sig` |
+| `quarantine/` | copies of damaged journals |
+
+**Journal format** (`robodr-cp-journal/v1`): one entry per line,
+`<64 hex: SHA-256 of the JSON bytes> <JSON object>\n`, the first line a
+header `{"t":"header","format":"robodr-cp-journal/v1","kind":...}`. Each
+append is one write followed by `fdatasync`; a failed append is rolled back
+(the file is cut to its previous length) or, if even that fails, the journal
+refuses further appends until restart. Compaction writes the live state to a
+temp file, fsyncs it, renames it over the journal and fsyncs the directory.
+At open, an unterminated or bad last line is a torn append (cut); a bad line
+followed by good ones is damage (counted, the file copied to `quarantine/`,
+rewritten without it). The journal is operational state, not evidence: it is
+checksummed, not signed; the black box stays the record.
+
+**Decisions** are journaled around the black-box note:
+
+```text
+judge -> journal "begin" {decision_id, state} (fsync) -> black-box note with decision_id
+      -> journal "commit" {decision_id, evidence} (fsync)  -> answer
+      (black box failed -> journal "abort" -> answer failed / evidence_unavailable)
+```
+
+A crash between `begin` and `commit` leaves a dangling decision; at the next
+start agentd looks for a black-box note carrying that `decision_id`: found,
+the decision is committed with that note's reference (the SOC may have seen
+it); not found, it is aborted (nothing was recorded, nothing decided: a
+resubmission is judged anew). A journal that cannot take the `begin`
+refuses the request before anything is judged into evidence (`failed`,
+`state_unavailable`). Reverts that change a request's state follow the same
+steps. The newest `max_requests` requests are kept.
+
+## 10. Client requirements
 
 What a SOC integration must do to use this API correctly:
 
@@ -300,11 +448,18 @@ What a SOC integration must do to use this API correctly:
   (§4): one person, or two different people (neither the requester) for
   `safe_pause`, `request_safe_state` and `rollback_config`. No robot action
   is autonomous.
+* **Channel.** Connect over mutual TLS (§1) with the SOC client certificate
+  the robot's `tls.client_ca` trusts (and, if pinned, whose SPKI is
+  pinned); verify the robot's server certificate against the robot CA and
+  the robot's address (optionally its SPKI pin). Over loopback or the unix
+  socket (a local relay on the robot) TLS does not apply.
 * **Sign every request** (§2) with a SOC Ed25519 key whose `.pub` is
   installed on the robot (`control_plane.soc_keys`, e.g.
-  `/etc/robodr/soc/soc.pub`, key id such as `soc:<id>:1`); keep `https`
-  through a TLS terminator in front of agentd, or talk to loopback / the
-  unix socket. `Authorization` headers are not used.
+  `/etc/robodr/soc/soc.pub`, key id such as `soc:<id>:1`), with a fresh
+  nonce and an NTP-synced clock. On `stale_timestamp` right after a robot
+  restart, sign again (the replay fence, §2).
+* **Verify every answer** (§2) with the robot's finding public key before
+  using it; drop answers without a valid signature.
 * **Statuses.** Know every status of §5. `recorded_not_executed` is
   **terminal** and means "accepted and recorded as a plan, not executed":
   report it as not applied, never as success, and never poll it. Report
@@ -315,12 +470,225 @@ What a SOC integration must do to use this API correctly:
 * **Parameters.** `restrict_motion` caps are in (0, 10]: 0 is a stop and is
   refused (400 `invalid_parameter`); use `safe_pause` for a stop.
 * **Idempotency.** Reuse `request_id` only to resubmit the identical
-  request (`duplicate: true`); a revert of a never-applied request answers
-  `not_applied`.
-* **Answer signature** (optional): verify `X-RoboDR-Answer-Signature` with
-  the robot's finding public key (the key used for `robodr-finding-sig`).
+  request (`duplicate: true`, also after a robot restart); a revert of a
+  never-applied request answers `not_applied`.
+* **Evidence.** Verify every export as §11.6 says before showing it as
+  verified; keep the manifest, its signature and the bundle together.
+* **Rotation.** Robot side: list the old and new SOC CA certificates in
+  `tls.client_ca` (and both pins) and both SOC keys in `soc_keys` while
+  the SOC switches, then remove the old ones; the robot's own TLS key and
+  certificate are replaced by files and a restart (state survives it).
 
-## 10. Limits
+## 11. Evidence API (`control_plane.evidence`)
+
+Off unless `control_plane.evidence` is configured (then
+`evidence_disabled` is gone). Same transport, authentication and answer
+signatures as every other call.
+
+### 11.1 What an export is
+
+An export is an `RBBXBND1` black-box bundle (`robodr_blackbox::Bundle`):
+
+```text
+"RBBXBND1" | u32_be id_len | identity JSON (ChainIdentity) | u8 has_anchor |
+[chain_id 32 | u64_be seq | hash 32]? | u64_be frames_len | frames
+```
+
+`frames` are the selected records **exactly as stored** in the black box
+(`"RBF1" | u32_be body_len | body` each: hashed fields, hash, signature;
+`crates/robodr-blackbox/src/record.rs`): a contiguous run of sequence
+numbers of the current chain. The anchor names the record just before the
+first one (absent when the first is seq 0). Records are signed by the
+robot's **black-box key**; nothing else (no key material, no file, nothing
+outside the black box's segment files) is ever exported.
+
+### 11.2 Inventory: `GET .../evidence`
+
+```json
+{"robot_id": "ugv-007", "api": "robodr-control-plane/v2",
+ "chain": {"chain_id": "<hex>", "identity": {"device_id": "ugv-007", "boot_id": "...",
+           "key_id": "bb:ugv-007:1", "algorithm": "ed25519", "created_wall_ns": 0},
+           "signing_key": {"key_id": "bb:ugv-007:1", "algorithm": "ed25519"}},
+ "retained": {"first_seq": 0, "last_seq": 4711, "first_wall_ms": 0, "last_wall_ms": 0,
+              "records": 4712, "gaps": [{"after_seq": 99, "next_seq": 250}],
+              "segments": [{"segment": 0, "first_seq": 0, "last_seq": 811,
+                            "first_wall_ms": 0, "last_wall_ms": 0, "records": 812, "bytes": 8388608}]},
+ "head": {"seq": 4711, "sha256": "<hex>"},
+ "exports": [{"export_id": "...", "created_at_ms": 0, "expires_at_ms": 0, "first_seq": 0,
+              "last_seq": 0, "bytes": 0, "chunks": 0, "manifest_sha256": "<hex>"}],
+ "limits": {"max_export_bytes": 67108864, "chunk_bytes": 1048576, "max_exports": 8,
+            "max_storage_bytes": 536870912, "export_ttl_s": 86400}}
+```
+
+`gaps` are seqs not retained between retained ones (dropped or quarantined
+segments): an export cannot span one.
+
+### 11.3 Create: `POST .../evidence/exports`
+
+```json
+{"export_id": "case-42:ev-1",
+ "selector": {"finding": {"finding_id": "rf1-0011223344556677",
+                          "evidence": ["robodr-blackbox://ugv-007/0/9?sha256=<64 hex>"],
+                          "context_records": 16}},
+ "requested_by": "analyst@soc",
+ "reason": "case 42"}
+```
+
+Strict (unknown or duplicate keys refuse it). `export_id`
+`[A-Za-z0-9._:-]{1,128}` is the idempotency key: the same id with the same
+selector answers the existing manifest (200, byte-identical); another
+selector is 409 `export_id_conflict`. `requested_by` / `reason` as in §4.
+`selector` has **exactly one** of:
+
+| Selector | Fields | The export covers |
+| --- | --- | --- |
+| `seq_range` | `from_seq` ≤ `to_seq` | exactly those seqs (all must be retained: else 416 `out_of_range`) |
+| `time_range` | `from_ms` ≤ `to_ms`, at most 7 days apart | from the first to the last retained record whose wall time (ms) is in the range (404 `no_records` if none); records in between are included whatever their time |
+| `finding` | `finding_id` (1..=256 bytes), `evidence`: 1..=64 `robodr-blackbox://` links of **this robot** (a finding's `evidence_links`), `context_records` 0..=1024 (default 16) | from `context_records` before the lowest linked seq to as many after the highest, as far as the seqs are contiguous; each link must name a retained record (404 `evidence_not_retained`) in that segment with that SHA-256 (409 `evidence_mismatch`) |
+
+Selector errors: 400 `invalid_selector`. Then: a span with a gap is 409
+`evidence_gap`; frames over `max_export_bytes` are 413 `export_too_large`;
+more than `max_exports` kept exports is 409 `export_limit`; more than
+`max_storage_bytes` in kept bundles is 507 `storage_full`; a concurrent
+index / export is 503 `evidence_busy`; a black box that cannot be read, or
+that changed under the export (retention), or that did not take the export's
+note, is 503 `evidence_unavailable` (nothing was exported). Every created
+export is a `robodr.control_plane_evidence_export` black-box note. Invalid
+bodies are recorded like any authenticated invalid request.
+
+### 11.4 Manifest
+
+The answer body of a create (201, or 200 for the same export again) and of
+`GET .../evidence/exports/{export_id}` is the manifest, **byte-identical
+every time** (store and hash these bytes; do not re-serialize):
+
+```json
+{"kind": "robodr.evidence_manifest", "version": 1, "api": "robodr-control-plane/v2",
+ "robot_id": "ugv-007", "export_id": "case-42:ev-1",
+ "created_at_ms": 1800000000000, "expires_at_ms": 1800086400000,
+ "requested_by": "analyst@soc", "reason": "case 42", "key_id": "soc:soc-a:1",
+ "selector": {"finding": {"finding_id": "...", "evidence": [{"segment": 0, "seq": 10, "sha256": "<hex>"}],
+                          "context_records": 3}},
+ "chain": {"chain_id": "<hex>", "identity": {...ChainIdentity...},
+           "signing_key": {"key_id": "bb:ugv-007:1", "algorithm": "ed25519"}},
+ "records": {"first_seq": 7, "last_seq": 15, "count": 9, "first_wall_ms": 0, "last_wall_ms": 0,
+             "last_sha256": "<hex>"},
+ "anchor": {"seq": 6, "sha256": "<hex>"},
+ "referenced": [{"segment": 0, "seq": 10, "sha256": "<hex>"}],
+ "bundle": {"format": "RBBXBND1", "bytes": 3337, "sha256": "<hex>", "chunk_bytes": 1048576,
+            "chunks": [{"index": 0, "offset": 0, "bytes": 3337, "sha256": "<hex>"}]},
+ "evidence": "robodr-blackbox://ugv-007/3/4712?sha256=<hex>"}
+```
+
+`selector` is the normalized selection (links parsed, sorted, deduplicated);
+`key_id` the SOC key that asked; `chain.signing_key` the black-box key that
+signs the **first** exported record (different from `identity.key_id` after
+a key rotation); `referenced` the linked records (finding selector);
+`evidence` the export's own black-box note.
+
+Besides the answer signature, the manifest carries a **detached signature**
+that does not depend on the request, for storage with the evidence:
+
+```text
+X-RoboDR-Manifest-Signature: ed25519;key_id=<finding key id>;sig=<128 hex>
+```
+
+over the bytes
+
+```text
+robodr-evidence-manifest/v1
+<lower-case hex SHA-256 of the manifest bytes>
+```
+
+(no trailing newline), with the robot's finding key.
+
+### 11.5 Chunks: `GET .../evidence/exports/{export_id}/chunks/{index}`
+
+`index` is decimal without leading zeros, `0 .. len(bundle.chunks)-1` (else
+404 `unknown_chunk`). The answer body is `bundle.chunks[index].bytes` bytes
+of the bundle from `offset` (`application/octet-stream`), signed like every
+answer. Chunks are immutable and independent: a download is **resumable**
+by fetching only the chunks still missing, in any order, also after a
+disconnect or a robot restart (exports survive restarts until they expire).
+The robot re-checks each chunk against its manifest before sending it; a
+stored export that no longer matches is deleted and answered 500
+`export_corrupt`.
+
+### 11.6 Verification (what the SOC must do)
+
+1. Verify `X-RoboDR-Answer-Signature` of every answer (§2).
+2. Verify `X-RoboDR-Manifest-Signature` over the manifest bytes with the
+   robot's finding public key; check `kind`, `version`, `robot_id`,
+   `export_id` and that `selector` is what was asked.
+3. For every chunk: `len == bytes` and SHA-256 == `sha256`; concatenate in
+   `index` order; the result's length and SHA-256 must equal
+   `bundle.bytes` / `bundle.sha256`.
+4. Verify the bundle with the robot's **black-box public key** (the
+   `.pub` of `blackbox.key_file`; a keyring holding every key named by
+   the chain across rotations), exactly as `robodr-blackbox` does:
+   * `robodr-blackbox verify bundle.rbbx --keyring blackbox.pub --device <robot id>
+     [--signing-key <manifest chain.signing_key.key_id>]` (exit 0 =
+     intact), or
+   * the library: `Bundle::from_bytes(b)?.verify_with_key(&keyring, None,
+     Some(robot_id), Some(&manifest.chain.signing_key))` and require
+     `is_intact()`.
+
+   This checks every record's hash, signature (under the key the chain
+   names, rotations included), chain id (identity), linkage from the anchor
+   through the last record, and the device. The anchor is reported as
+   unverified (info) unless the SOC holds that position from an earlier
+   export or checkpoint: compare it then (a match proves continuity).
+5. Check the report against the manifest: `first_seq` / `last_seq` /
+   `verified_records` / `last_hash` equal `records.*`, `chain_id` equals
+   `chain.chain_id`, and every `referenced` record is in the bundle with
+   that SHA-256 (the finding's evidence links resolve inside it).
+
+Any failure: the evidence is not verified (a tamper finding of the verifier
+is an incident). A "verified" badge must mean exactly steps 1–5 passed.
+
+### 11.7 Limits and retention
+
+| Setting (`control_plane.evidence`) | Default | Range |
+| --- | --- | --- |
+| `max_export_bytes` | 64 MiB | 64 KiB ..= 1 GiB |
+| `chunk_bytes` | 1 MiB | 16 KiB ..= 4 MiB; at most 4096 chunks per export |
+| `max_exports` (kept at once) | 8 | 1 ..= 64 |
+| `max_storage_bytes` (all kept bundles) | 512 MiB | `max_export_bytes` ..= 16 GiB |
+| `export_ttl_s` (deleted after) | 86400 | 600 ..= 604800 |
+| `chunk_rate_per_minute` / `chunk_burst` (per key, own bucket) | 600 / 60 | 1..=6000 / 1..=600 |
+
+One evidence index or export runs at a time (503 `evidence_busy`). An
+export reads one black-box segment at a time (at most 256 MiB each) plus the
+selected frames. Delete exports when downloaded (`DELETE`) to free the
+quota; expired ones are deleted at the next evidence call or start.
+
+## 12. Test vectors (`fixtures/control-plane-v2/`)
+
+Generated deterministically by
+`cargo run -p robodr-agentd --example control_plane_vectors` (generator
+`crates/robodr-agentd/tests/common/cp_vectors.rs`); the test
+`tests/control_plane_vectors.rs` fails when the committed files differ from
+it and checks every vector against the implementation. **The keys are test
+keys; their secret files are published on purpose.**
+
+| Path | Content |
+| --- | --- |
+| `manifest.json` | index: keys, cases, chunk size |
+| `keys/{soc,finding,blackbox}.key[.pub]` | `robodr-blackbox` key files (Ed25519) |
+| `requests/NN-*.http` | the exact request bytes (CRLF) |
+| `requests/NN-*.json` | method, target, timestamp, nonce, body SHA-256, the signing message, the signature, the expected outcome (`route`, or `401` + code), and for a sample answer: status, content type, body file, the answer message, `X-RoboDR-Answer-Signature` (and `X-RoboDR-Manifest-Signature`) |
+| `answers/NN-*.body.{json,bin}` | sample answer bodies |
+| `evidence/blackbox/seg-0000000000000000.rbb` | the synthetic black box (a `Genesis` and 23 notes) |
+| `evidence/bundle.rbbx`, `evidence/chunks/NNNN.bin` | the export of case 06 (finding: seqs 10 and 12, 3 context records each side; 1 KiB chunks) |
+| `evidence/manifest.json`, `manifest.sig`, `manifest.message` | its manifest bytes, signature header value, signed message |
+| `evidence/expected.json` | the verification result (intact; seqs, hashes, anchor) |
+| `evidence/tampered/bundle-flipped-byte.rbbx` | one payload byte of seq 10 flipped: tamper |
+
+Negative request vectors: 11 (signature over another body), 12 (signed for
+another robot), 13 (signed in the removed v1 domain); all 401
+`bad_signature`, unsigned.
+
+## 13. Limits of this release
 
 * Nothing is executed; a future executor must follow
   `robodr_agent::executor`'s contract (re-check against the current safety
@@ -328,11 +696,35 @@ What a SOC integration must do to use this API correctly:
 * The judgment is only as right as the safety state source (live feed or
   static configuration) and the response policy; `control`, `phase` and
   `connectivity` are still configuration.
-* Request states live in memory (bounded); a restart forgets them (the
-  black box does not).
-* Answers are unauthenticated without `finding_signing`; there is no
-  confidentiality without a TLS terminator; a network attacker can drop or
-  delay requests and answers.
-* Tested with synthetic traffic and an in-process signing client
-  (`crates/robodr-agentd/tests/control_plane.rs`), not against a deployed
-  SOC or across a network.
+* TLS material is loaded at start: a rotation of the robot's certificate or
+  of the trusted SOC CAs / pins takes a restart (the state survives it).
+  There is no revocation list (CRL / OCSP) for SOC client certificates:
+  remove the CA or use pins and restart.
+* The request journal and replay store are checksummed, not signed: a
+  person with write access to the state directory can make the robot forget
+  requests (a resubmission is then judged anew and recorded again; the black
+  box keeps both) or make it fence; not forge a decision (the black box
+  holds every decision, signed).
+* The evidence API reads the black box while it is written: a record past
+  the last complete frame is not exported yet; an export that races with
+  cyclic retention is refused (retry).
+* A network attacker without the client certificate can still make the TLS
+  listener spend handshakes (bounded by `max_connections` and the 5 s
+  deadline) and drop or delay requests and answers.
+* Tested with synthetic traffic, an in-process signing client and an
+  OpenSSL-made test PKI (`crates/robodr-agentd/tests/data/control-tls/`),
+  not against a deployed SOC or across a real network.
+
+## 14. Changes from v1
+
+* **v1 is removed**, on every listener (decision for GA sprint 5): the SOC
+  side is being built against v2 only, so there is no deployed v1 client
+  to stay compatible with, and keeping a second signing domain and
+  unsigned answers on loopback would leave a weaker path in the code that
+  every review must reason about. A v1 request (paths `/api/v1/...`, the
+  `robodr-control-plane/v1` signing domain) is refused (404 / 401).
+* Mutual TLS on TCP (any address); `allow_remote` is gone.
+* Answer signatures are mandatory (`finding_signing` is required).
+* Request state and replay store persist across restarts (`state_dir`).
+* The evidence API (§11).
+* DELETE is a method of the API (exports).

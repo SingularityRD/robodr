@@ -241,6 +241,9 @@ for f in docs/OPERATIONS.md docs/UNITREE.md SECURITY.md CHANGELOG.md README.md p
     *) install -m 0644 "$root/$f" "$doc/$(basename "$f")" ;;
     esac
 done
+# The control-plane contract (man robodr-agentd(8) points here).
+install -D -m 0644 "$root/docs/contracts/robodr.control-plane.md" \
+    "$doc/contracts/robodr.control-plane.md"
 install -m 0644 "$root/LICENSE" "$doc/copyright"
 install -d "$doc/licenses"
 for f in "$root"/LICENSES/*; do

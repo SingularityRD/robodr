@@ -54,7 +54,7 @@ level, and every path must be absolute.
 | `sensor.motion` | Optional. The live motion decode path: `enabled` (default true), `feedback_topics` (e.g. `["/odom"]`), `max_writers`, `max_samples_per_datagram` (`evaluate_commands` is accepted but the daemon always lets the agent evaluate). Unknown keys are refused. |
 | `sensor.unitree_legacy` | Optional, off by default. Unitree legacy UDP (Go1 generation): `enabled`, `ports` (default `[8007, 8080, 8082, 8090]`), `command_senders` (IPs allowed to send `HighCmd` / `LowCmd`, or tables `{"ip", "mac"?, "label"?}`; `mac` binds the sender to its link-layer source), `robot_addresses` (default `192.168.123.10`, `192.168.123.161`). Needs `sensor.capture`. Unknown keys are refused. |
 | `host_threats` | Optional. `socket_path` (the socket `robodr-threat-forward` writes Pulsar threats to), `socket_mode` (`"0600"` default or `"0660"`), `allowed_uids` (peers besides uid 0), `max_connections` (default 2, max 8). See "Host threats" below. |
-| `control_plane` | Optional, off when absent. The SOC action-request API: `listen_tcp` (loopback unless `allow_remote`), `unix_socket` (`socket_mode` `"0600"`/`"0660"`), `soc_keys` (Ed25519 public key files), `max_clock_skew_s` 30, `rate_per_minute` 30, `burst` 10, `max_connections` 4, `max_requests` 1024, `answer_timeout_ms` 5000. Requests are judged and recorded, **never executed**. See "Control plane" below. |
+| `control_plane` | Optional, off when absent. The SOC API `robodr-control-plane/v2`: `listen_tcp` (with `tls` any address, mutual TLS; without, loopback only), `tls` (`cert_chain`, `key_file`, `client_ca`, optional `client_spki_sha256` pins), `unix_socket` (`socket_mode` `"0600"`/`"0660"`), `state_dir` (required, private 0700: request journal, replay store, exports), `soc_keys` (Ed25519 public key files), `max_clock_skew_s` 30, `rate_per_minute` 30, `burst` 10, `max_connections` 4, `max_requests` 1024, `answer_timeout_ms` 5000, `evidence` (optional; evidence API, see below). Needs `finding_signing` (answers are signed). Requests are judged and recorded, **never executed**. See "Control plane" below. |
 | `daemon` | `queue_capacity` 4096 (max 65536), `queue_bytes` 33554432 (32 MiB; 1 MiB..=256 MiB), `tick_ms` 1000, `heartbeat_ms` 10000, `silence_ms` 30000, `lag_ms` 2000, `health_report_ms` 10000, `exit_when_inputs_end` false |
 
 **Key.** Keys are never accepted on the command line. `blackbox.key_file`
@@ -307,32 +307,49 @@ one JSON object per line:
   `rejected_connections`, `connections`, `upstream_dropped`;
   `daemon.host_threats`, `host_heartbeats`, `host_threats_own_skipped`.
 
-## Control plane (SOC action requests)
+## Control plane (SOC action requests and evidence)
 
-With `control_plane` (contract `docs/contracts/robodr.control-plane.md`)
-a SOC may *request* one of the seven actions of the responder's catalog
-(`robodr_responder::actions`: `restrict_motion`, `quarantine_node`,
-`isolate_network`, `record_evidence`, `safe_pause`, `request_safe_state`,
-`rollback_config`) over a small std-only HTTP/1.1 API
-(`src/control/`). The answer is truthful about what happens: **nothing is
-executed.** The only executor is the recording one, so an accepted request
-is `recorded_not_executed` (`"executed": false`), "accepted and recorded as
-a plan".
+With `control_plane` (contract `docs/contracts/robodr.control-plane.md`,
+`robodr-control-plane/v2`) a SOC may *request* one of the seven actions of
+the responder's catalog (`robodr_responder::actions`: `restrict_motion`,
+`quarantine_node`, `isolate_network`, `record_evidence`, `safe_pause`,
+`request_safe_state`, `rollback_config`) and export black-box evidence, over
+a small, bounded, fuzzed HTTP/1.1 layer (`src/control/`). The answer is
+truthful about what happens: **nothing is executed.** The only executor is
+the recording one, so an accepted request is `recorded_not_executed`
+(`"executed": false`), "accepted and recorded as a plan".
 
 ```json
 "control_plane": {
+  "listen_tcp": "10.0.7.7:8787",
+  "tls": {
+    "cert_chain": "/etc/robodr/control-plane/robot.pem",
+    "key_file": "/run/credentials/robodr-agentd.service/cp-tls.key",
+    "client_ca": "/etc/robodr/control-plane/soc-ca.pem",
+    "client_spki_sha256": ["<64 hex>"]
+  },
   "unix_socket": "/run/robodr-agentd/control.sock",
-  "listen_tcp": "127.0.0.1:8787",
-  "soc_keys": ["/etc/robodr/soc/soc.pub"]
+  "state_dir": "/var/lib/robodr/control-plane/agentd",
+  "soc_keys": ["/etc/robodr/soc/soc.pub"],
+  "evidence": {}
 }
 ```
 
-- **Authentication.** Each request is signed with a configured SOC Ed25519
-  key over method, exact target, this robot's id, key id, timestamp, nonce
-  and body hash; ±`max_clock_skew_s` and a nonce cache stop replays (full
-  cache: refused, never unchecked); per-key token bucket. With
-  `finding_signing` every answer to an authenticated request is signed with
-  the finding key, bound to the request signature.
+- **Transport (`src/control/tls.rs`).** A TCP listener with `tls` is mutual
+  TLS (rustls + ring, the uplink's crates): the SOC's client certificate
+  must chain to `client_ca`, be valid and permit `clientAuth`, and — with
+  pins — have a pinned SPKI; no session resumption. Without `tls`,
+  `listen_tcp` must be loopback (plain HTTP, tests / a local relay); the
+  unix socket is plain too. `allow_remote` (v1) is gone and refused with a
+  pointer to `tls`. A failed handshake is a failed authentication.
+- **Authentication (`auth.rs`).** On every listener, each request is also
+  signed with a configured SOC Ed25519 key over method, exact target, this
+  robot's id, key id, timestamp, nonce and body hash (domain
+  `robodr-control-plane/v2`); ±`max_clock_skew_s` and a **persisted** nonce
+  store stop replays, also across restarts (full / unwritable: refused,
+  never unchecked; untrusted at start: fenced); per-key token bucket. Every
+  answer to an authenticated request is signed with the finding key, bound
+  to the request signature (mandatory: `finding_signing` is required).
 - **Allow-list.** The seven catalog actions, each with its own parameters (speed caps in
   (0, 10], a zone, a GUID or node name, a profile/program rollback); the
   time-limited classes need `ttl_seconds` 1..=86400, the others refuse one;
@@ -358,23 +375,44 @@ a plan".
   for it.
 - **Evidence.** Request (with its signature and exact body: it re-verifies
   offline), state, context and decision are one fsynced
-  `robodr.control_plane_request` note; reverts and authenticated invalid
-  requests are notes too. No black box, no claim: the answer is then
-  `failed` and nothing is stored.
-- **Abuse.** Bounded parsing (8 KiB head, 16 KiB body, 5 s), at most
+  `robodr.control_plane_request` note; reverts, authenticated invalid
+  requests, evidence exports and every start (`robodr.control_plane_start`)
+  are notes too. No black box, no claim: the answer is then `failed` and
+  nothing is stored.
+- **Persistent state (`journal.rs`, `state.rs`).** `state_dir` (0700, the
+  daemon's) holds a checksummed append-only request journal: `begin`
+  (fsync) before the black-box note, `commit` (fsync) after it, `abort` if
+  the black box refused; a decision a crash left dangling is settled at the
+  next start from the black box (a note with its `decision_id` → commit,
+  none → abort). Compaction writes a temp file, fsyncs, renames, fsyncs the
+  directory; a torn last line is cut, damage in the middle is quarantined.
+  A status query after a restart answers as before it.
+- **Evidence API (`evidence.rs`, `control_plane.evidence`).** Inventory of
+  the retained records; exports of a finding's evidence links (plus
+  context), a seq range or a time range as an `RBBXBND1` bundle of the
+  frames exactly as stored, with a manifest (selection, chain identity and
+  signing key, record range, anchor, chunk hashes) signed with the finding
+  key; signed, resumable chunks (16 KiB..4 MiB); limits on size, count,
+  storage and age; one export at a time. The SOC verifies with the robot's
+  public keys (`robodr-blackbox verify bundle.rbbx`).
+- **Abuse.** Bounded parsing (8 KiB head, 16 KiB body, 5 s for the TLS
+  handshake and 5 s for the request, 30 s for the answer), at most
   `max_connections`, a bounded queue to the main loop (full: 503). Failed
   authentications raise `robot.agent.control_plane_unauthenticated` (High),
   authenticated invalid requests `robot.agent.control_plane_invalid`
   (Medium); both observe-only self-health, rate-limited by
   `health_report_ms`. The API is not an input: a quiet SOC never makes the
   state `unknown`.
-- **Transport.** No TLS in agentd: listen on the unix socket or loopback
-  and put a TLS terminator in front for a remote SOC (`allow_remote` exists
-  for networks you otherwise protect). The shipped unit has
-  `IPAddressDeny=any`: TCP on loopback needs a drop-in with
-  `IPAddressAllow=localhost`.
+- **Sockets.** Every unix socket of the daemon (events, safety feed, host
+  threats, control plane) is bound inside a fresh 0700 directory, given its
+  final mode there and hard-linked into place: there is no window in which
+  it is connectable with the umask's permissions.
+- **Unit.** The shipped unit has `IPAddressDeny=any`; the drop-in example
+  `30-control-plane.conf.example` allows the SOC network, makes `state_dir`
+  writable and hands over the TLS key as a credential.
 - **Status.** `status.json` and heartbeats carry `control_plane` (listeners,
-  executor, counters, `last_auth_failure`).
+  executor, counters incl. `tls_failures`, `last_auth_failure`, TLS
+  identity, replay store, persistent state, evidence).
 
 ## Outputs
 
@@ -481,12 +519,14 @@ request.
 | `tests/motion_live.rs` | A synthetic pcap with SEDP plus CDR `Twist` on `rt/cmd_vel` (0.4 m/s, then 2.5 m/s against a 1.0 m/s envelope) and CDR `Odometry` on `rt/odom`: three motion events reach the agent, exactly one Critical `robot.motion.linear_over_envelope` finding is spooled, the black box holds the decoded command (with its writer GUID) and a firewall verdict with `enforcing: false`, and verifies. A garbage payload on `rt/cmd_vel` yields one Medium `robot.motion.undecodable_sample` and the next good command still flows. `sensor.motion` keys are strict. |
 | `tests/review_regressions.rs` | Fourth-review fixes: no busy loop once every input ended (thread CPU < 25% of wall, state `unknown`); a malformed-only stream is never `ok` (`input_silent` + `input_malformed`); `..` and a late symlink cannot alias spool and black box; a live event socket is not stolen and cleanup checks the inode; the queue's byte budget; `READY`/`WATCHDOG`/`STATUS`/`STOPPING` over a notify socket and stale or other-boot `status.json` read as `unknown`; hostile event lines do not panic. |
 | `tests/host_threats.rs` | The host-threat socket, with the test playing `robodr-threat-forward`: a synthetic capture (rogue participant and `cmd_vel` writer) plus a Pulsar shell threat fire `coordinated_intrusion` (Critical, enforce); three host rules from one process fire `host_process_persistence`; the sensor's own threat is not counted twice; junk lines and the forwarder's reported losses are health findings; a host input with no forwarder reads `unknown` and goes silent, and a Pulsar service-stop threat with that silence is the observe-only `defense_tampering`; config and socket-directory checks. |
-| `tests/control_plane.rs` | The control-plane API on the real daemon with a test SOC key, over the unix socket and TCP: the robot snapshot; `restrict_motion` accepted and answered `recorded_not_executed` (`executed: false`, ladder step, evidence link), an idempotent resubmission, a GET with a percent-encoded id; a replay, a tampered body, an unknown key, a stale timestamp, a request signed for another robot and one without credentials refused (401); an unknown action, a missing ttl and a motion field refused (400) and recorded; under e-stop (PLC socket feed) `request_safe_state` refused `safety_system_engaged`; revert `not_applied`, an irreversible revert refused; answers signed with the finding key; the observe-only findings; the black box verifies and the recorded SOC signature re-verifies offline. Off by default; strict config. |
+| `tests/control_plane.rs` | The control-plane API v2 on the real daemon with a test SOC key, over the unix socket, loopback TCP and mutual TLS (OpenSSL test PKI in `tests/data/control-tls/`, `gen.sh`): the robot snapshot; `restrict_motion` accepted and answered `recorded_not_executed` (`executed: false`, ladder step, evidence link), an idempotent resubmission, a GET with a percent-encoded id; a replay, a tampered body, an unknown key, a stale timestamp, a request signed for another robot, a v1-domain signature and one without credentials refused (401); an unknown action, a missing ttl and a motion field refused (400) and recorded; under e-stop (PLC socket feed) `request_safe_state` refused `safety_system_engaged`; revert `not_applied`, an irreversible revert refused; every answer signed with the finding key; mTLS: the SOC certificate + signature accepted, a valid certificate without or with a bad signature refused (401), no client certificate / another CA / an unpinned key / an expired certificate / plain HTTP get no channel (each with its reason in `last_auth_failure`), counted and reported; without pins any certificate of the CA (still not an expired one); restart: the same answer to a status query, the earlier request's replay refused, a resubmission a duplicate, a removed replay store fences; evidence: inventory, an export of a decision's evidence link, the manifest signature, a chunked download resumed after a "disconnect", the bundle verified with the black-box public key file only, tamper detected, no key material in it, idempotency / conflict / limit / out-of-range / invalid body, delete, the export surviving a restart and its black-box note; the observe-only findings; the black box verifies and the recorded SOC signature re-verifies offline. Off by default; strict config (TLS key permissions, wrong key for the certificate, pins, `allow_remote`, `finding_signing` required, state directory mode). |
+| `tests/control_plane_vectors.rs` | The contract vectors `docs/contracts/fixtures/control-plane-v2/` are byte-identical to the generator (`examples/control_plane_vectors.rs`) and hold against the implementation: requests authenticate (or are refused 401) and route as stated, answer and manifest signatures verify, chunks reassemble to the bundle, the bundle verifies with the black-box public key and the tampered copy does not. |
+| `tests/fuzz_smoke.rs` | The `control_plane_request` libFuzzer harness (`fuzz/harness/control_plane_request.rs`) driven by the std-only mutator over generated, signed seeds of every route (the seeds take the success path; the corpus equals the generator). |
 | `tests/unitree_live.rs` | Unitree end to end on synthetic captures, the profile **learned** with `robodr-commission` from a clean capture and locked: Go2 (`unitree_go`, 12 of 20 slots), G1 (`unitree_hg`, 29 of 35, arm SDK), H1 (`unitree_go`, 20 slots, arm SDK) and Go1 (legacy UDP). Clean replay: no finding, every joint frame checked by the joint firewall. Rogue `rt/lowcmd` writer (unknown participant, unauthorized motion writer, `rejected_unknown_source`); torque / kp / step over the envelope (profile + joint firewall would-haves); `rt/arm_sdk` frames with mode 0 counted as motion; `2^32 + id` api aliasing (High); velocity over the envelope (Critical); a model-specific api id `Unknown` without `robot_model`, classified with it; humanoids never record a zero / damping substitute and a limp frame is a would-have rejection; the independent `robodr-cdr` vectors decode with `crc_ok` true; Go1: unknown sender (Critical / Medium), trick mode, joint torque, compressed frame, legacy off = nothing captured. |
 | `tests/unitree_examples.rs` | Every Unitree example: a strict, valid profile per supported model with its topics and joint bounds; the firewall examples fit their profiles; the EDU and sensor-box daemon examples pass `--check-config`; morphology / slot-count / unknown-model / unsafe-substitute / `max_angular`-on-a-joint-channel refusals; every model's profile loads in the daemon with its `robot_model`. |
 | `tests/agent_api.rs` | `Agent::handle_external`: sensor deviations get real plans when enforcing. Self-health and observe-mode deviations never get an action plan. |
 | `tests/safety_feed.rs` | The live safety feed: Bool / UInt8 / String / Odometry mappings (with hysteresis, non-finite speed), staleness to `unknown`, conflicts to the most conservative state, unprofiled / IP-spoofed / wrong-type / non-allowlisted writers ignored with a High finding, undecodable and unmapped values read `unknown`. End to end through the daemon: an e-stop on the bus turns the plan for a Critical over-envelope command into Record (`request_safe_state` with the e-stop released); a rogue writer's "release" is reported and ignored; the PLC socket feed grades plans, goes stale to `unknown` (approval-gated plan) and every transition is in the black box. |
-| unit tests | Config strictness and key file checks, spool atomicity and bounds, the line reader (CRLF, overlong lines, timeouts, a full queue), the unix socket, the peer-uid policy, the host-threat line parser and socket permission checks, and the health state machine. |
+| unit tests | Config strictness and key file checks, spool atomicity and bounds, the line reader (CRLF, overlong lines, timeouts, a full queue), the unix socket, the peer-uid policy, the host-threat line parser and socket permission checks, and the health state machine. Control plane: the journal's crash points (killed during an append, between write and fsync, before the compaction's fsync / rename / directory fsync), damage quarantine, rollback of a survived failed append; the request state across restarts and the crash points around the black-box note (commit or abort from the black box, also for reverts), a journal that refuses fails closed, compaction bounds; the persisted replay store (replay after a restart, expiry, fence on damage or removal, a failing store refuses); evidence exports from a real recorder (multi-segment, rotation, time / finding selectors, gaps, limits, chunk reassembly, tamper, stored-export corruption and expiry); the HTTP head bound independent of read sizes and the answer write deadline. |
 
 ## Limits (honest)
 
@@ -527,13 +567,14 @@ request.
   Dispositions are recorded and reported only. Control-plane requests are
   judged and recorded the same way (`recorded_not_executed`); there is no
   executor that reaches the robot.
-- **Control plane: no TLS, no persistence.** Requests are signed and
-  replay-protected but travel in clear text unless a TLS terminator sits in
-  front; answers are signed only with `finding_signing`. Request states live
-  in memory (bounded) and are forgotten at restart (the black box keeps
-  every decision). The replay window needs NTP on robot and SOC. Tested
-  with synthetic traffic and an in-process signing client, not against a
-  deployed SOC.
+- **Control plane: tested locally only.** mTLS, signatures, the journal
+  and the evidence API were exercised with an in-process client and an
+  OpenSSL test PKI over loopback, not against a deployed SOC or across a
+  real network. TLS material is read at start (rotation = restart); there
+  is no CRL / OCSP for SOC certificates. The journal is checksummed, not
+  signed (the black box is the signed record). The replay window needs NTP
+  on robot and SOC. The `control_plane_request` fuzz target has run under
+  the std-only smoke driver (about 90 000 inputs), not under libFuzzer.
 - **Exporters live in `robodr-export`, not here.** The spool's only
   contract is the rename-to-`acked/` acknowledgement. `robodr-spool-export`
   (spool → diode batches) and `robodr-kafka-publish` (spool or diode output
@@ -553,9 +594,6 @@ request.
 - **Stdin can block shutdown's join.** The stdin reader blocks in `read` and
   is not joined at shutdown. Socket and capture readers poll with timeouts
   (at most about 0.5 s).
-- **Socket permissions race.** There is a short window between `bind` and
-  `chmod 0600` of the event socket, so put the socket in a private
-  directory.
 - **Pipeline findings share a subject.** The finding subject of a pipeline
   finding is its source IP (the pipeline's `Finding` carries no structured
   GUID), so the finding id groups by (rule, source IP). Occurrence counts

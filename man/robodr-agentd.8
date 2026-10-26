@@ -1,7 +1,7 @@
 .\" robodr-agentd(8). Source of truth: the USAGE text in
 .\" crates/robodr-agentd/src/bin/robodr-agentd.rs and the configuration
 .\" reference in crates/robodr-agentd/README.md. Keep them in sync.
-.TH ROBODR\-AGENTD 8 "2026-10-16" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
+.TH ROBODR\-AGENTD 8 "2026-10-26" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
 .SH NAME
 robodr\-agentd \- RoboDR live daemon: ROS 2 discovery and events \(-> decision chain \(-> signed black box \(-> OCSF findings spool
 .SH SYNOPSIS
@@ -39,7 +39,7 @@ every level, and every path must be absolute. See
 .I /usr/share/doc/robodr/examples/agentd.example.json
 and the crate README for the sections
 .RI ( robot ", " sensor ", " policy_path ", " blackbox ", " spool ", "
-.IR event_inputs ", " context ", " firewall ", " motion_monitor ", " daemon ).
+.IR event_inputs ", " context ", " firewall ", " motion_monitor ", " control_plane ", " daemon ).
 .TP
 .B \-\-check\-config
 Validate the configuration and load every file it names (profile, policy,
@@ -152,6 +152,54 @@ Each tick writes the black box's high\-water mark
 when records were added; damaged closed segments quarantined at open raise
 the High, observe\-only finding
 .BR robot.agent.evidence_quarantined .
+.SH CONTROL PLANE
+.B control_plane
+(off when absent) is the SOC API
+.BR robodr\-control\-plane/v2
+(contract
+.IR /usr/share/doc/robodr/contracts/robodr.control\-plane.md ):
+action requests for the seven catalog actions, judged against the live
+safety state and recorded, never executed, and (with
+.BR control_plane.evidence )
+black\-box evidence exports.
+.TP
+.B listen_tcp\fR, \fBtls
+A TCP listener. With
+.B tls
+.RB ( cert_chain ,
+.BR key_file ,
+.BR client_ca ,
+optional
+.BR client_spki_sha256 )
+every connection is mutual TLS: the SOC's client certificate must chain to
+.BR client_ca ,
+be valid and, if pins are set, have a pinned public key. Without
+.B tls
+the address must be loopback (plain HTTP). The key file must have no
+group/other permission bits.
+.TP
+.B unix_socket
+A local socket (mode
+.B socket_mode
+0600 or 0660), bound with its final mode from the start.
+.TP
+.B state_dir
+Required: a private directory (0700, owned by the daemon) holding the
+request journal, the replay store and evidence exports; request states and
+used nonces survive a restart.
+.TP
+.B soc_keys
+SOC Ed25519 public key files; every request must carry a signature by one,
+also over mutual TLS.
+.PP
+.B finding_signing
+is required with
+.BR control_plane :
+every answer to an authenticated request, and every evidence manifest, is
+signed with the finding key. Failed authentications (TLS handshakes
+included) raise the High, observe\-only finding
+.BR robot.agent.control_plane_unauthenticated ;
+each decision, revert and export is a black\-box note.
 .SH SIGNALS
 .B SIGTERM
 and
@@ -202,6 +250,22 @@ example
 .I 20\-finding\-key.conf.example
 the unit exposes it at
 .IR /run/credentials/robodr\-agentd.service/finding.key .
+.TP
+.I /var/lib/robodr/control\-plane/agentd/
+Control\-plane state
+.RB ( control_plane.state_dir ,
+0700 robodr): request journal, replay store, evidence exports, quarantine.
+.TP
+.I /etc/robodr/keys/agentd\-cp\-tls.key
+Optional TLS server key of the control plane (0600 root:root); with the
+drop\-in example
+.I 30\-control\-plane.conf.example
+the unit exposes it at
+.I /run/credentials/robodr\-agentd.service/cp\-tls.key
+and allows the SOC network.
+.TP
+.I /etc/robodr/control\-plane/
+The robot's certificate chain and the SOC CA bundle (public; 0644).
 .TP
 .I /usr/share/doc/robodr/examples/robodr\-agentd.service.d/40\-sensor\-box.conf.example
 Drop\-in example for a passive sensor box on a tap or port mirror

@@ -39,12 +39,14 @@
 //!   over by the `robodr-threat-forward` Pulsar module (peer-uid checked,
 //!   strictly parsed, heartbeat liveness) become host-side correlation
 //!   signals and `robot.host.pulsar_threat` findings.
-//! * [`control`]: the optional control-plane action API (`control_plane`,
-//!   off by default): a SOC's Ed25519-signed, replay-protected action
-//!   request (six allow-listed classes, nothing beyond a safe-state
-//!   *request*) is judged with the response policy against the current
-//!   safety state, recorded in the black box and answered `refused` or
-//!   `recorded_not_executed`. Nothing is executed.
+//! * [`control`]: the optional control-plane API `robodr-control-plane/v2`
+//!   (`control_plane`, off by default): over mutual TLS (or loopback / a
+//!   unix socket), a SOC's Ed25519-signed, replay-protected action request
+//!   (the seven catalog actions, nothing beyond a safe-state *request*) is
+//!   judged with the response policy against the current safety state,
+//!   recorded in the black box and a persistent journal and answered
+//!   (signed) `refused` or `recorded_not_executed`; black-box evidence is
+//!   exported as signed, chunked bundles. Nothing is executed.
 //! * [`spool`]: atomic, bounded findings spool; acked records are pruned
 //!   oldest first, unacked ones never.
 //! * [`notify`]: `sd_notify` (`READY=1`, `WATCHDOG=1` from the main loop,

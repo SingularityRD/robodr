@@ -11,7 +11,7 @@
 //! ```text
 //! robodr-control-plane/v2
 //! <METHOD>
-//! <request target exactly as sent, e.g. /api/v1/robots/ugv-007/action-requests>
+//! <request target exactly as sent, e.g. /api/v2/robots/ugv-007/action-requests>
 //! <robot id this agentd is configured for>
 //! <key id>
 //! <timestamp: Unix seconds, decimal>
@@ -538,7 +538,7 @@ mod tests {
     fn a_signed_request_verifies_and_is_bound() {
         let r = signed(
             "POST",
-            "/api/v1/robots/ugv-007/action-requests",
+            "/api/v2/robots/ugv-007/action-requests",
             "ugv-007",
             b"{}",
             100,
@@ -551,7 +551,7 @@ mod tests {
             Err(AuthFailure::BadSignature)
         );
         let edits: [fn(&mut Request); 3] = [
-            |r| r.target = "/api/v1/robots/ugv-007/action-requests/x".into(),
+            |r| r.target = "/api/v2/robots/ugv-007/action-requests/x".into(),
             |r| r.method = "GET".into(),
             |r| r.body = b"{ }".to_vec(),
         ];
@@ -587,7 +587,7 @@ mod tests {
 
     #[test]
     fn credential_headers_are_strict() {
-        let base = signed("GET", "/api/v1/robots/r", "r", b"", 5);
+        let base = signed("GET", "/api/v2/robots/r", "r", b"", 5);
         assert!(credentials(&base).is_ok());
         let edit = |name: &str, v: Option<&str>, dup: bool| {
             let mut r = base.clone();

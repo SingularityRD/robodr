@@ -158,13 +158,16 @@
 //!
 //! # Control-plane requests
 //!
-//! With `control_plane` ([`crate::control`]), listener threads authenticate
-//! SOC action requests and hand them over a bounded channel; the main loop
+//! With `control_plane` ([`crate::control`], `robodr-control-plane/v2`),
+//! listener threads terminate mutual TLS, authenticate SOC action requests
+//! and hand them over a bounded channel (evidence exports are built on the
+//! listener threads; only their black-box note comes here); the main loop
 //! takes up to [`crate::control::CALLS_PER_POLL`] per iteration and judges
 //! each against the safety state *at that moment* (the live feed is
 //! re-evaluated first), the operational context and the response policy,
 //! records request and decision as a `robodr.control_plane_request` note
-//! (fsynced) and answers. The executor is the recording one: an accepted
+//! (fsynced), journaled around it in `control_plane.state_dir` (so the
+//! state survives a restart), and answers. The executor is the recording one: an accepted
 //! request is answered `recorded_not_executed`, nothing reaches the robot.
 //! Failed authentications and authenticated invalid requests become the
 //! observe-only self-health findings
