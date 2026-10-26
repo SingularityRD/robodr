@@ -41,12 +41,17 @@ pub trait Stream: Read + Write {
 /// evidence chunk of at most 4 MiB).
 pub const ANSWER_WRITE_DEADLINE: Duration = Duration::from_secs(30);
 
-/// A TCP stream whose writes share one deadline
-/// ([`Stream::set_write_deadline`]); each write's socket timeout is the
-/// time left.
+/// A TCP stream whose reads share one deadline and whose writes share
+/// another ([`Stream::set_read_deadline`], [`Stream::set_write_deadline`]):
+/// before **every** read or write the socket timeout is set to the time
+/// left, and past the deadline the call fails with `TimedOut`. A caller
+/// that loops over many reads (rustls' `complete_io`, used by the TLS
+/// handshake and by `StreamOwned::read`) therefore cannot be held past the
+/// deadline by a peer that drips one byte per timeout.
 #[derive(Debug)]
 pub struct DeadlineTcp {
     pub tcp: TcpStream,
+    read_deadline: std::cell::Cell<Option<Instant>>,
     write_deadline: std::cell::Cell<Option<Instant>>,
 }
 
@@ -54,13 +59,29 @@ impl DeadlineTcp {
     pub fn new(tcp: TcpStream) -> Self {
         Self {
             tcp,
+            read_deadline: std::cell::Cell::new(None),
             write_deadline: std::cell::Cell::new(None),
         }
+    }
+
+    /// Every read after this fails once `at` has passed.
+    pub fn set_read_deadline_at(&self, at: Instant) {
+        self.read_deadline.set(Some(at));
     }
 }
 
 impl Read for DeadlineTcp {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(at) = self.read_deadline.get() {
+            let left = at.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "request read deadline",
+                ));
+            }
+            self.tcp.set_read_timeout(Some(left))?;
+        }
         self.tcp.read(buf)
     }
 }
@@ -86,7 +107,9 @@ impl Write for DeadlineTcp {
 
 impl Stream for DeadlineTcp {
     fn set_read_deadline(&self, d: Duration) -> io::Result<()> {
-        self.tcp.set_read_timeout(Some(d))
+        self.set_read_deadline_at(Instant::now() + d);
+        self.tcp
+            .set_read_timeout(Some(d.max(Duration::from_millis(1))))
     }
     fn set_write_deadline(&self, at: Instant) {
         self.write_deadline.set(Some(at));

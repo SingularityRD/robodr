@@ -354,8 +354,10 @@ impl Write for TlsStream {
 }
 
 impl super::http::Stream for TlsStream {
+    /// The deadline is enforced by the socket wrapper on every read
+    /// rustls makes ([`super::http::DeadlineTcp`]), not only between them.
     fn set_read_deadline(&self, d: Duration) -> io::Result<()> {
-        self.0.sock.tcp.set_read_timeout(Some(d))
+        super::http::Stream::set_read_deadline(&self.0.sock, d)
     }
     fn set_write_deadline(&self, at: Instant) {
         super::http::Stream::set_write_deadline(&self.0.sock, at);
@@ -400,15 +402,14 @@ pub fn accept(
 ) -> Result<(TlsStream, String), String> {
     let conn = ServerConnection::new(config.clone()).map_err(|e| format!("TLS: {e}"))?;
     let mut s = StreamOwned::new(conn, super::http::DeadlineTcp::new(tcp));
+    // rustls' complete_io loops over many socket reads; the wrapper bounds
+    // each one by the time left, so a peer dripping bytes cannot stretch
+    // the handshake past `deadline` (review finding 1).
+    s.sock.set_read_deadline_at(deadline);
     while s.conn.is_handshaking() {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
+        if Instant::now() >= deadline {
             return Err("timed out".into());
         }
-        s.sock
-            .tcp
-            .set_read_timeout(Some(left.max(Duration::from_millis(1))))
-            .map_err(|e| e.to_string())?;
         if let Err(e) = s.conn.complete_io(&mut s.sock) {
             // Let the client see the alert rustls queued (best effort).
             let _ = s.conn.write_tls(&mut s.sock);
@@ -423,4 +424,142 @@ pub fn accept(
         .map(|h| robodr_blackbox::crypto::to_hex(&h))
         .ok_or_else(|| "no client certificate presented".to_string())?;
     Ok((TlsStream(s), spki))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn data(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/control-tls")
+            .join(name)
+    }
+
+    fn server() -> Arc<ServerConfig> {
+        let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(data("robot.pem"))
+            .unwrap()
+            .map(|c| c.unwrap())
+            .collect();
+        let key = PrivateKeyDer::from_pem_file(data("robot.key")).unwrap();
+        let mut roots = RootCertStore::empty();
+        for c in CertificateDer::pem_file_iter(data("soc-ca.pem")).unwrap() {
+            roots.add(c.unwrap()).unwrap();
+        }
+        server_config(chain, key, roots, &[]).unwrap()
+    }
+
+    fn client() -> Arc<rustls::ClientConfig> {
+        let mut roots = RootCertStore::empty();
+        for c in CertificateDer::pem_file_iter(data("robot-ca.pem")).unwrap() {
+            roots.add(c.unwrap()).unwrap();
+        }
+        let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(data("soc.pem"))
+            .unwrap()
+            .map(|c| c.unwrap())
+            .collect();
+        let key = PrivateKeyDer::from_pem_file(data("soc.key")).unwrap();
+        Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(chain, key)
+            .unwrap(),
+        )
+    }
+
+    /// Send `bytes` one at a time, `gap` apart, until `total` has passed
+    /// or the server closed.
+    fn drip(mut tcp: TcpStream, bytes: &[u8], gap: Duration, total: Duration) {
+        let t0 = Instant::now();
+        for b in bytes.iter().cycle() {
+            if t0.elapsed() > total || tcp.write_all(&[*b]).is_err() {
+                return;
+            }
+            thread::sleep(gap);
+        }
+    }
+
+    /// Review finding 1 (handshake): a peer that drips one byte per
+    /// (socket timeout - epsilon) used to hold the slot far beyond the
+    /// deadline (rustls' complete_io loops internally on the one timeout
+    /// set before it). The deadline now bounds every read.
+    #[test]
+    fn handshake_drip_is_bounded_by_the_deadline() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let c = thread::spawn(move || {
+            let tcp = TcpStream::connect(addr).unwrap();
+            // A handshake record header announcing 16 KiB, then filler.
+            let mut rec = vec![0x16, 0x03, 0x01, 0x40, 0x00];
+            rec.extend(std::iter::repeat_n(0u8, 16384));
+            drip(
+                tcp,
+                &rec,
+                Duration::from_millis(100),
+                Duration::from_secs(5),
+            );
+        });
+        let (s, _) = l.accept().unwrap();
+        let t0 = Instant::now();
+        let r = accept(&server(), s, t0 + Duration::from_secs(1));
+        let took = t0.elapsed();
+        assert!(r.is_err(), "a dripped handshake must fail");
+        assert!(
+            took < Duration::from_millis(2500),
+            "the handshake deadline (1 s) held for {took:?}"
+        );
+        c.join().unwrap();
+    }
+
+    /// Review finding 1 (request): after the handshake, a dripped
+    /// application-data record must not outlive the request deadline
+    /// (StreamOwned::read loops complete_io the same way).
+    #[test]
+    fn request_drip_after_handshake_is_bounded_by_the_deadline() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let c = thread::spawn(move || {
+            let mut tcp = TcpStream::connect(addr).unwrap();
+            let mut conn = rustls::ClientConnection::new(
+                client(),
+                rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap(),
+            )
+            .unwrap();
+            while conn.is_handshaking() {
+                conn.complete_io(&mut tcp).unwrap();
+            }
+            conn.writer()
+                .write_all(b"GET /api/v2/robots/x HTTP/1.1\r\nHost: robot\r\n")
+                .unwrap();
+            let mut rec = Vec::new();
+            while conn.wants_write() {
+                conn.write_tls(&mut rec).unwrap();
+            }
+            drip(
+                tcp,
+                &rec,
+                Duration::from_millis(100),
+                Duration::from_secs(5),
+            );
+        });
+        let (s, _) = l.accept().unwrap();
+        let (mut stream, _) =
+            accept(&server(), s, Instant::now() + Duration::from_secs(5)).unwrap();
+        let t0 = Instant::now();
+        let r = super::super::http::read_request(&mut stream, t0 + Duration::from_secs(1));
+        let took = t0.elapsed();
+        assert_eq!(r.map_err(|e| e.status), Err(408), "after {took:?}");
+        assert!(
+            took < Duration::from_millis(2500),
+            "the request deadline (1 s) held for {took:?}"
+        );
+        drop(stream);
+        c.join().unwrap();
+    }
 }
