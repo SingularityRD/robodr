@@ -720,20 +720,32 @@ pub fn verify_bundle_dir(
     chain: &ChainMode,
     now: u64,
 ) -> Result<BundleReport, Fail> {
+    // The chain state first: it also pins the trust file version the head
+    // was accepted under, and an older trust file (e.g. one from before a
+    // key revocation) is a replay whatever it would let through.
+    let state = match chain {
+        ChainMode::State(p) => {
+            let st = bundle::ChainState::parse(&read_capped(p, 4096)?)?;
+            bundle::check_trust(&st, trust)?;
+            Some(st)
+        }
+        _ => None,
+    };
     let bbytes = read_capped(&dir.join(BUNDLE_FILE), MAX_BUNDLE_BYTES)?;
     let sbytes = read_capped(&dir.join(BUNDLE_SIG_FILE), MAX_SIGSET_BYTES)?;
     let vb = verify_bundle_manifest(&bbytes, &sbytes, trust)?;
-    let anchor = match chain {
-        ChainMode::Genesis => ChainAnchor::Genesis,
-        ChainMode::After { seq, hash } => ChainAnchor::Head(bundle::ChainState {
+    let anchor = match (chain, state) {
+        (_, Some(st)) => ChainAnchor::Head(st),
+        (ChainMode::After { seq, hash }, None) => ChainAnchor::Head(bundle::ChainState {
+            // The operator names the head; the trust file is taken as given.
             format: bundle::CHAIN_FORMAT.into(),
             programme: vb.manifest.programme.clone(),
             bundle_seq: *seq,
             bundle_hash: hash.clone(),
+            trust_version: trust.file().version,
+            trust_digest: trust.digest.clone(),
         }),
-        ChainMode::State(p) => {
-            ChainAnchor::Head(bundle::ChainState::parse(&read_capped(p, 4096)?)?)
-        }
+        _ => ChainAnchor::Genesis,
     };
     let step = check_chain(&anchor, &vb)?;
     check_bundle_files(dir, &vb.manifest, true)?;
@@ -762,9 +774,10 @@ pub fn verify_bundle_dir(
     })
 }
 
-/// Persist the chain head after an accepted bundle (atomic replace).
-pub fn commit_chain(state: &Path, b: &VerifiedBundle) -> Result<(), Fail> {
-    write_replace(state, &bundle::ChainState::after(b).to_bytes()?)
+/// Persist the chain head after an accepted bundle, with the trust file
+/// it was accepted under (atomic replace).
+pub fn commit_chain(state: &Path, b: &VerifiedBundle, trust: &VerifiedTrust) -> Result<(), Fail> {
+    write_replace(state, &bundle::ChainState::after(b, trust).to_bytes()?)
 }
 
 /// Rebuild missing or damaged files of a bundle from its parity. The

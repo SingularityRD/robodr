@@ -358,7 +358,7 @@ fn chain_gap_replay_equivocation_and_broken_links_are_refused() {
     let state = s.work.join("chain.json");
     // Accept bundle 1 (genesis) and commit.
     let r1 = verify(&s, &s.bundle).unwrap();
-    ops::commit_chain(&state, &r1.bundle).unwrap();
+    ops::commit_chain(&state, &r1.bundle, &s.trust).unwrap();
     let st = ChainMode::State(state.clone());
     assert_eq!(
         ops::verify_bundle_dir(&s.bundle, &s.trust, &st, NOW)
@@ -430,7 +430,7 @@ fn chain_gap_replay_equivocation_and_broken_links_are_refused() {
     );
     // Accept 2, then replay 1.
     let r2 = ops::verify_bundle_dir(&b2, &s.trust, &st, NOW).unwrap();
-    ops::commit_chain(&state, &r2.bundle).unwrap();
+    ops::commit_chain(&state, &r2.bundle, &s.trust).unwrap();
     assert_eq!(
         code(ops::verify_bundle_dir(&s.bundle, &s.trust, &st, NOW)),
         Code::Replay
@@ -511,6 +511,108 @@ fn chain_gap_replay_equivocation_and_broken_links_are_refused() {
             .step,
         ChainStep::Next
     );
+}
+
+/// Review finding: the trust file crosses the gap like a bundle, so an
+/// older root-signed trust file (from before a revocation) could be
+/// paired with a bundle signed by the revoked key. The chain state pins
+/// the trust version it was accepted under.
+#[test]
+fn an_older_trust_file_cannot_reopen_a_revoked_key() {
+    let s = site();
+    let state = s.work.join("chain.json");
+    // Bundle 1 (signed by rel-a and rel-c) is accepted under trust v1; v2,
+    // which revokes rel-a, arrives with bundle 2.
+    let r1 = verify(&s, &s.bundle).unwrap();
+    ops::commit_chain(&state, &r1.bundle, &s.trust).unwrap();
+    let mut t2 = trust_file(&s.k);
+    t2.version = 2;
+    t2.revoked_keys = vec![fingerprint(&s.k.rel[0].public_key())];
+    let t2p = write_trust(
+        &s.work,
+        "trust-v2.json",
+        &t2,
+        &[&s.k.roots[0], &s.k.roots[1]],
+    );
+    let v2 = ops::load_trust(&t2p, &pins(&s.k)).unwrap();
+    let rpk2 = signed_rpk(
+        &s.work,
+        "nav-stack",
+        8,
+        &[("bin/nav", b"v8")],
+        &[&s.k.rel[1], &s.k.rel[2]],
+    );
+    let b2 = signed_bundle(
+        &s.work,
+        &v2,
+        2,
+        Some(r1.bundle.hash.clone()),
+        &[rpk2],
+        None,
+        "bundle-2",
+        &[&s.k.rel[1], &s.k.rel[2]],
+    );
+    let st = ChainMode::State(state.clone());
+    let r2 = ops::verify_bundle_dir(&b2, &v2, &st, NOW).unwrap();
+    ops::commit_chain(&state, &r2.bundle, &v2).unwrap();
+    // The attacker's bundle 3 is signed by the revoked rel-a (plus rel-b)
+    // and carried in with the old trust v1, under which rel-a is valid.
+    let rpk3 = signed_rpk(
+        &s.work,
+        "nav-stack",
+        9,
+        &[("bin/nav", b"evil")],
+        &[&s.k.rel[0], &s.k.rel[1]],
+    );
+    let b3 = signed_bundle(
+        &s.work,
+        &s.trust,
+        3,
+        Some(r2.bundle.hash.clone()),
+        &[rpk3],
+        None,
+        "bundle-3",
+        &[&s.k.rel[0], &s.k.rel[1]],
+    );
+    assert_eq!(
+        code(ops::verify_bundle_dir(&b3, &v2, &st, NOW)),
+        Code::RevokedKey
+    );
+    assert_eq!(
+        code(ops::verify_bundle_dir(&b3, &s.trust, &st, NOW)),
+        Code::Replay
+    );
+    // A re-signed v2 with other content (same version) is refused too.
+    let mut t2b = t2.clone();
+    t2b.issued_at += 1;
+    let t2bp = write_trust(
+        &s.work,
+        "trust-v2b.json",
+        &t2b,
+        &[&s.k.roots[0], &s.k.roots[1]],
+    );
+    let v2b = ops::load_trust(&t2bp, &pins(&s.k)).unwrap();
+    assert_eq!(
+        code(ops::verify_bundle_dir(&b3, &v2b, &st, NOW)),
+        Code::Equivocation
+    );
+    // A newer trust file is accepted and recorded at the next commit.
+    let mut t3 = t2.clone();
+    t3.version = 3;
+    let t3p = write_trust(
+        &s.work,
+        "trust-v3.json",
+        &t3,
+        &[&s.k.roots[0], &s.k.roots[2]],
+    );
+    let v3 = ops::load_trust(&t3p, &pins(&s.k)).unwrap();
+    assert_eq!(
+        code(ops::verify_bundle_dir(&b3, &v3, &st, NOW)),
+        Code::RevokedKey
+    );
+    let state_now = robodr_pkg::bundle::ChainState::parse(&fs::read(&state).unwrap()).unwrap();
+    assert_eq!(state_now.trust_version, 2);
+    assert_eq!(state_now.trust_digest, v2.digest);
 }
 
 #[test]

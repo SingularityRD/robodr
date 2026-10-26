@@ -99,6 +99,8 @@ fn check_bundle(b: &BundleManifest, doc: &[u8], h: &str) {
                 programme: b.programme.clone(),
                 bundle_seq: head_seq,
                 bundle_hash: head_hash.clone(),
+                trust_version: 1,
+                trust_digest: "00".repeat(32),
             };
             let r = check_chain(&ChainAnchor::Head(head), &v);
             match r {

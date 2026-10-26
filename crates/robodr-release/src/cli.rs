@@ -425,7 +425,7 @@ fn verify_bundle(args: Vec<String>) -> Result<(), Cmd> {
     let r = ops::verify_bundle_dir(Path::new(req(&a, "dir")?), &t, &mode, now(&a)?)?;
     let mut committed = false;
     if let (true, Some(p), ChainStep::Next) = (commit, &state, &r.step) {
-        ops::commit_chain(p, &r.bundle)?;
+        ops::commit_chain(p, &r.bundle, &t)?;
         committed = true;
     }
     print(json!({

@@ -408,7 +408,15 @@ pub fn check_rpk_files(b: &BundleManifest, entry: &BundleRpk, m: &Manifest) -> R
     Ok(())
 }
 
-/// The accepted head of a programme's bundle chain.
+/// The accepted head of a programme's bundle chain, and the trust file it
+/// was accepted under.
+///
+/// The trust file travels into the air gap like the bundles do, so a
+/// courier could pair a bundle signed by a since-revoked key with the
+/// older, root-signed trust file from before the revocation. Pinned roots
+/// alone cannot tell versions apart; the state can: [`check_trust`]
+/// refuses a trust file older than the one the head was accepted under,
+/// or the same version with other bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChainState {
@@ -416,16 +424,22 @@ pub struct ChainState {
     pub programme: String,
     pub bundle_seq: u64,
     pub bundle_hash: String,
+    /// `version` of the trust file the head was accepted under.
+    pub trust_version: u64,
+    /// Digest of that trust file.
+    pub trust_digest: String,
 }
 
 impl ChainState {
-    /// The head after accepting `b`.
-    pub fn after(b: &VerifiedBundle) -> Self {
+    /// The head after accepting `b` under `trust`.
+    pub fn after(b: &VerifiedBundle, trust: &VerifiedTrust) -> Self {
         Self {
             format: CHAIN_FORMAT.into(),
             programme: b.manifest.programme.clone(),
             bundle_seq: b.manifest.bundle_seq,
             bundle_hash: b.hash.clone(),
+            trust_version: trust.file().version,
+            trust_digest: trust.digest.clone(),
         }
     }
 
@@ -437,6 +451,9 @@ impl ChainState {
             || s.bundle_seq == 0
             || s.bundle_seq > MAX_SAFE_INTEGER
             || !is_hex64(&s.bundle_hash)
+            || s.trust_version == 0
+            || s.trust_version > MAX_SAFE_INTEGER
+            || !is_hex64(&s.trust_digest)
         {
             return Err(invalid("chain state: bad value"));
         }
@@ -446,6 +463,28 @@ impl ChainState {
     pub fn to_bytes(&self) -> Result<Vec<u8>, Refusal> {
         to_canonical(self)
     }
+}
+
+/// Refuse a trust file older than the one `state` was accepted under, or
+/// the same version with other content (see [`ChainState`]).
+pub fn check_trust(state: &ChainState, trust: &VerifiedTrust) -> Result<(), Refusal> {
+    let v = trust.file().version;
+    if v < state.trust_version {
+        return Err(Refusal::new(
+            Code::Replay,
+            format!(
+                "trust file version {v} is older than version {} this chain was accepted under",
+                state.trust_version
+            ),
+        ));
+    }
+    if v == state.trust_version && trust.digest != state.trust_digest {
+        return Err(Refusal::new(
+            Code::Equivocation,
+            format!("trust file version {v} with other content than the one this chain used"),
+        ));
+    }
+    Ok(())
 }
 
 /// Where a verifier joins a chain.
@@ -764,6 +803,10 @@ mod tests {
         );
     }
 
+    fn tr() -> VerifiedTrust {
+        crate::trust::test_support::verified(&crate::trust::test_support::base())
+    }
+
     fn vb(seq: u64, prev: Option<String>, salt: u64) -> VerifiedBundle {
         let (_, mut b) = fixture();
         b.bundle_seq = seq;
@@ -778,13 +821,46 @@ mod tests {
     }
 
     #[test]
+    fn the_chain_state_pins_the_trust_file_it_was_accepted_under() {
+        use crate::trust::test_support::{base, verified};
+        let b1 = vb(1, None, 0);
+        let mut t2 = base();
+        t2.version = 2;
+        let (v1, v2) = (verified(&base()), verified(&t2));
+        let st = ChainState::after(&b1, &v2);
+        assert_eq!(
+            (st.trust_version, st.trust_digest.as_str()),
+            (2, v2.digest.as_str())
+        );
+        check_trust(&st, &v2).unwrap();
+        // An older trust file (e.g. from before a revocation) is a replay.
+        assert_eq!(check_trust(&st, &v1).unwrap_err().code, Code::Replay);
+        // The same version with other bytes is an equivocation.
+        let mut t2b = t2.clone();
+        t2b.issued_at += 1;
+        assert_eq!(
+            check_trust(&st, &verified(&t2b)).unwrap_err().code,
+            Code::Equivocation
+        );
+        // A newer one is fine (and is recorded at the next commit).
+        let mut t3 = base();
+        t3.version = 3;
+        check_trust(&st, &verified(&t3)).unwrap();
+        let bytes = st.to_bytes().unwrap();
+        assert_eq!(ChainState::parse(&bytes).unwrap(), st);
+        let mut bad = st.clone();
+        bad.trust_version = 0;
+        assert!(ChainState::parse(&bad.to_bytes().unwrap()).is_err());
+    }
+
+    #[test]
     fn chain_rules() {
         let b1 = vb(1, None, 0);
         assert_eq!(
             check_chain(&ChainAnchor::Genesis, &b1).unwrap(),
             ChainStep::Next
         );
-        let h1 = ChainAnchor::Head(ChainState::after(&b1));
+        let h1 = ChainAnchor::Head(ChainState::after(&b1, &tr()));
         assert_eq!(check_chain(&h1, &b1).unwrap(), ChainStep::AlreadyAccepted);
         let b2 = vb(2, Some(b1.hash.clone()), 0);
         assert_eq!(check_chain(&h1, &b2).unwrap(), ChainStep::Next);
@@ -796,7 +872,7 @@ mod tests {
             Code::ChainGap
         );
         // Replay of 1 after 2; equivocation on 2; broken link.
-        let h2 = ChainAnchor::Head(ChainState::after(&b2));
+        let h2 = ChainAnchor::Head(ChainState::after(&b2, &tr()));
         assert_eq!(check_chain(&h2, &b1).unwrap_err().code, Code::Replay);
         let b2x = vb(2, Some(b1.hash.clone()), 5);
         assert_eq!(check_chain(&h2, &b2x).unwrap_err().code, Code::Equivocation);
@@ -804,7 +880,7 @@ mod tests {
         assert_eq!(check_chain(&h2, &b3x).unwrap_err().code, Code::ChainBroken);
         assert_eq!(check_chain(&h2, &b3).unwrap(), ChainStep::Next);
         // Another programme.
-        let mut other = ChainState::after(&b2);
+        let mut other = ChainState::after(&b2, &tr());
         other.programme = "other".into();
         assert_eq!(
             check_chain(&ChainAnchor::Head(other), &b3)
@@ -813,7 +889,7 @@ mod tests {
             Code::WrongScope
         );
         // State file round trip.
-        let s = ChainState::after(&b2);
+        let s = ChainState::after(&b2, &tr());
         assert_eq!(ChainState::parse(&s.to_bytes().unwrap()).unwrap(), s);
         assert!(ChainState::parse(b"{}").is_err());
     }
