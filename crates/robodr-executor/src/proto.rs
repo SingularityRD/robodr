@@ -44,7 +44,8 @@ use crate::order::Order;
 
 pub const VERSION: &str = "robodr-executor/1";
 /// Longest envelope line.
-pub const MAX_LINE: usize = 64 * 1024;
+/// (128 KiB: an order carries the SOC's signed request, body up to 16 KiB.)
+pub const MAX_LINE: usize = 128 * 1024;
 /// Allowed clock difference between the two processes (same host).
 pub const MAX_SKEW_MS: u64 = 30_000;
 /// Nonces remembered.

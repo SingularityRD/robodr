@@ -28,5 +28,6 @@
   },
   "ttl": {"default_s": 900, "max_s": 86400},
   "max_safety_age_ms": 500,
-  "verify_interval_s": 10
+  "verify_interval_s": 10,
+  "soc": {"keys": ["/etc/robodr/soc/soc.pub"], "max_clock_skew_s": 30}
 }

@@ -57,6 +57,22 @@ fn order(action: ActionId, p: &ResponsePolicy, target: Target) -> Order {
             requested_by: "analyst".into(),
         },
         issued_ms: 0,
+        soc: None,
+    }
+}
+
+/// Both examples name the SOC's public key (trust boundary M1): the same
+/// file as agentd's `control_plane.soc_keys`.
+#[test]
+fn examples_name_the_soc_keys() {
+    for name in ["executor.example.json", "executor.unitree-g1.example.json"] {
+        let c = example(name);
+        assert_eq!(
+            c.config.soc.keys,
+            vec![PathBuf::from("/etc/robodr/soc/soc.pub")],
+            "{name}"
+        );
+        assert_eq!(c.config.soc.max_clock_skew_s, 30, "{name}");
     }
 }
 

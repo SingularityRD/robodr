@@ -345,9 +345,9 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
 | `pending` | accepted, recorded, handed to the executor; read the state again with GET | no |
 | `verified` | the executor applied it and the read-back of its nftables rules matched; it stays in force until revert or TTL (`state.expires_at_ms`) | no |
 | `reverted` | removed again: revert request, TTL expiry, restart reconciliation, or an operator's emergency disable (`nft delete table inet robodr`) | yes |
-| `refused` | the executor's own check refused it; nothing was applied; `state.decision` then reads `refused`. `refusal.code` is one of `not_executor_action` (`safe_pause`, `request_safe_state`, `rollback_config`: never executed), `fall_hazard`, `needs_approval`, `motion_path`, `locators_required` (agentd has not seen the participant's SPDP locators), `no_management_channel`, `unsupported_target` (a `node` target, or a process), `safety_state_changed`, `safety_state_stale`, `safety_state_unavailable` (also: judged or current state `unknown`), `safety_system_engaged`, `morphology_mismatch`, `observe_mode`, `operator_disabled` (an operator removed the executor's table: nothing is executed until it is re-armed on the robot), `config_unavailable`, `already_active`, `ttl_out_of_range`, `replay`, `invalid_order`, `id_conflict`, `evidence_elsewhere`, or `executor_refused` for a code this agentd does not know | yes |
+| `refused` | the executor's own check refused it; nothing was applied; `state.decision` then reads `refused`. `refusal.code` is one of `not_executor_action` (`safe_pause`, `request_safe_state`, `rollback_config`: never executed), `fall_hazard`, `needs_approval`, `motion_path`, `locators_required` (agentd has not seen the participant's SPDP locators), `no_management_channel`, `unsupported_target` (a `node` target, or a process), `safety_state_changed`, `safety_state_stale`, `safety_state_unavailable` (also: judged or current state `unknown`), `safety_system_engaged`, `morphology_mismatch`, `observe_mode`, `operator_disabled` (an operator removed the executor's table: nothing is executed until it is re-armed on the robot), `config_unavailable`, `already_active`, `ttl_out_of_range`, `replay`, `invalid_order`, `id_conflict`, `evidence_elsewhere`, the trust-boundary codes `soc_signature_invalid`, `soc_request_stale`, `soc_nonce_replayed`, `soc_replay_store_unavailable`, `order_mismatch`, `approval_missing` (below), or `executor_refused` for a code this agentd does not know | yes |
 | `failed` | the executor was unreachable, its queue was full, or the apply did not verify and was rolled back (`state.error`); nothing is in force | yes |
-| `recorded_not_executed` | `restrict_motion` (advisory in v1: no motion gateway yet) | yes |
+| `recorded_not_executed` | `restrict_motion` (advisory in v1: the executor does not drive the separate motion firewall gateway, `robodr-firewall-gw`) | yes |
 
 * **Statuses by action.**
   * `isolate_network` and `quarantine_node` (by `participant_guid`) can
@@ -359,6 +359,24 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
     `robodr.evidence_mark` note naming the request's evidence is in the
     black box. It is never reverted.
   * An action the executor never carries out is `refused`.
+* **Trust boundary (executor M1).** agentd forwards the SOC's request
+  with the order exactly as it was signed (method, target, the four
+  credentials of §2, body). The executor verifies it itself, with its own
+  copy of the SOC public keys (`soc.keys` in `executor.json`), before it
+  accepts the approval, and refuses:
+
+  | `refusal.code` | When |
+  | --- | --- |
+  | `soc_signature_invalid` | no signed request with the order, a key id the executor does not hold (or none configured), a malformed request, or an Ed25519 signature that does not verify over the §2 signing message with the executor's own robot id |
+  | `soc_request_stale` | the timestamp is outside the executor's window (`soc.max_clock_skew_s`, default 30 s), or signed before an executor start that found its replay store missing or damaged (sign again) |
+  | `soc_nonce_replayed` | the (key, nonce) pair was already presented to the executor while its timestamp is in the window (persisted across restarts) |
+  | `soc_replay_store_unavailable` | the executor's replay store is full of live pairs or could not record the pair |
+  | `order_mismatch` | the signed request is not `POST /api/v2/robots/{robot_id}/action-requests` for this robot, or the order's `request_id`, `action`, `ttl_seconds`, target (`participant_guid` / `node`), key id or `requested_by` differ from the signed body |
+  | `approval_missing` | the signed body lacks the approval evidence §4 requires (`authority: "request"`, `requested_by`, `source`, `reason` within its limits), or an order of the on-robot planner claims a human approval |
+
+  Nothing changes for a SOC that follows §2 and §10: the executor checks
+  the same signature agentd checks. A SOC request is executed at most
+  once, also when agentd is compromised.
 * **Revert.** A revert of a `pending` or `verified` request answers
   `pending` (`state.revert.result: "pending"`), and GET then shows
   `reverted`. A revert of a `reverted` request answers `reverted`. The

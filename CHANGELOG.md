@@ -12,6 +12,20 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Security
 
+- `robodr-executor` (M1, trust boundary): the executor no longer takes
+  agentd's word for a SOC approval. agentd forwards the SOC's signed
+  `robodr-control-plane/v2` request with every control-plane order; the
+  executor verifies the Ed25519 signature with its own copy of the SOC
+  public keys (new `soc.keys`, `soc.max_clock_skew_s` in `executor.json`),
+  its own robot id, the timestamp window and its own persisted replay
+  store (`<state_dir>/soc_nonces.json`), and that the order's id, action,
+  target and TTL are the signed ones. New refusal codes
+  `soc_signature_invalid`, `soc_request_stale`, `soc_nonce_replayed`,
+  `soc_replay_store_unavailable`, `order_mismatch`, `approval_missing`
+  (control-plane contract §6a). **Upgrade:** add the SOC public key files
+  to `executor.json` (`soc.keys`); without them every control-plane order
+  is refused. Planner orders can no longer claim an approval.
+
 - `robodr-firewall-gw` (review F1, critical): a spoofed DATA with the
   motion writer's GUID and a far-future sequence number no longer poisons
   the stream. Sequence / replay state is bound to (GUID, authorised

@@ -1146,7 +1146,7 @@ sudo systemctl restart robodr-agentd
 
 | What | How |
 | --- | --- |
-| SOC signing key | add the new `.pub` to `soc_keys` (both listed), restart agentd; switch the SOC; remove the old one, restart |
+| SOC signing key | add the new `.pub` to `soc_keys` (both listed), restart agentd, and to `executor.json` `soc.keys` (re-read per order); switch the SOC; remove the old one from both, restart agentd |
 | SOC client certificate, same CA | issue the new certificate; with pins, add the new pin to `client_spki_sha256` first (both listed), restart; switch the SOC; remove the old pin |
 | SOC client CA | append the new CA certificate to `client_ca` (PEM bundle with both), restart; reissue the SOC certificate; remove the old CA, restart |
 | Robot TLS certificate / key | install the new `robot.pem` and key (same paths), restart agentd; if the SOC pins the robot's SPKI, give it the new pin first (`openssl x509 -pubkey ...` as above) |
@@ -1460,6 +1460,12 @@ table.
      and 7401). List your `ROS_DOMAIN_ID`s.
    * `ttl.default_s` / `ttl.max_s`: every executed action is lifted at its
      TTL.
+   * `soc.keys`: the SOC public key files, the **same** files as agentd's
+     `control_plane.soc_keys` (root-owned, `0644`). The executor verifies
+     every SOC approval itself with them (trust boundary M1): without
+     them every control-plane order is refused (`soc_signature_invalid`).
+     Rotate them together with agentd's. Keep `soc.max_clock_skew_s`
+     (default 30) at least agentd's `max_clock_skew_s`.
 4. Check the configuration:
    `robodr-executor --config /etc/robodr/executor.json --check-config`.
    The running executor re-reads the configuration and the response

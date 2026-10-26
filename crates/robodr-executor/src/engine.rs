@@ -212,6 +212,8 @@ pub struct Engine {
     last_hold_reason: Option<String>,
     /// Journal writes that failed (reported in status).
     pub journal_errors: u64,
+    /// The executor's own SOC replay store (trust boundary M1).
+    soc_replay: crate::soc::ReplayStore,
 }
 
 impl std::fmt::Debug for Engine {
@@ -260,6 +262,11 @@ impl Engine {
     ) -> Result<Self, String> {
         let now = now.into();
         let journal = Journal::new(&cfg.config.state_dir);
+        let soc_replay = crate::soc::ReplayStore::open(
+            &cfg.config.state_dir,
+            now.wall_ms / 1000,
+            journal.path().exists(),
+        );
         let mut e = Engine {
             state: State::empty(boot_id),
             cfg,
@@ -272,7 +279,20 @@ impl Engine {
             unjournalled: BTreeSet::new(),
             last_hold_reason: None,
             journal_errors: 0,
+            soc_replay,
         };
+        if let Some(why) = e.soc_replay.fenced_because.clone() {
+            e.state.event(
+                now.wall_ms,
+                EventKind::Reconciled,
+                None,
+                None,
+                format!(
+                    "SOC replay store untrusted ({why}): requests signed before this start are \
+                     refused (soc_request_stale)"
+                ),
+            );
+        }
         match e.open_inner(now) {
             Ok(()) => Ok(e),
             Err(err) => {
@@ -736,6 +756,12 @@ impl Engine {
         if let Err(r) = self.reload_config() {
             return self.refuse(order, &digest, r, now_ms);
         }
+        // Trust boundary (M1): the approval is the SOC's, verified here.
+        let order = match self.authenticate(order, now_ms) {
+            Ok(o) => o,
+            Err(r) => return self.refuse(order, &digest, r, now_ms),
+        };
+        let order = &order;
         let planned = match decision::precheck(order, &self.policy, &self.cfg) {
             Ok(p) => p,
             Err(r) => return self.refuse(order, &digest, r, now_ms),
@@ -884,6 +910,46 @@ impl Engine {
         );
         let _ = self.save();
         self.status(&order.id)
+    }
+
+    /// The order as the executor accepts it: `human_approved` is true only
+    /// when the SOC's signed request verifies with the executor's own keys
+    /// and matches the order ([`crate::soc::verify`]); a planner order can
+    /// never claim an approval. The returned order carries no SOC request
+    /// (the journal keeps the verified flag, not the request).
+    fn authenticate(&mut self, order: &Order, now_ms: u64) -> Result<Order, Refusal> {
+        let mut o = order.clone();
+        match &order.origin {
+            crate::order::Origin::Planner { .. } => {
+                if order.human_approved || order.soc.is_some() {
+                    return Err(Refusal::new(
+                        codes::APPROVAL_MISSING,
+                        "a planner order claims a human approval: only a SOC-signed request \
+                         carries one",
+                    ));
+                }
+            }
+            crate::order::Origin::ControlPlane { .. } => {
+                let keys =
+                    crate::soc::load_keys(&self.cfg.config.soc.keys, &self.cfg.config.robot_id)
+                        .map_err(|e| {
+                            Refusal::new(
+                                codes::CONFIG_UNAVAILABLE,
+                                format!("the SOC keys could not be read: {e}"),
+                            )
+                        })?;
+                let cx = crate::soc::Context {
+                    keys: &keys,
+                    robot_id: &self.cfg.config.robot_id,
+                    max_skew_s: self.cfg.config.soc.max_clock_skew_s,
+                    now_ms,
+                };
+                crate::soc::verify(order, &cx, &mut self.soc_replay)?;
+                o.human_approved = true;
+            }
+        }
+        o.soc = None;
+        Ok(o)
     }
 
     /// Re-arm the actions held after a reboot, with the platform's safety

@@ -4,6 +4,12 @@
 //! obtained immediately before `nft -f` (executor rule 3 / 4 of
 //! `robodr_agent::executor`).
 //!
+//! Before [`precheck`] the engine establishes `human_approved` itself
+//! ([`crate::soc::verify`], trust boundary M1): a control-plane order is
+//! approved only when the SOC's signed request verifies with the
+//! executor's own keys and matches the order; a planner order never is.
+//! Here `human_approved` is that verified flag.
+//!
 //! Rules, in order (the first that fails refuses; refusal codes in
 //! [`codes`]):
 //!
@@ -22,7 +28,8 @@
 //! 7. the safety system was not engaged when judged
 //!    (`safety_system_engaged`), and the state was known
 //!    (`safety_state_unavailable` for `unknown`);
-//! 8. `restrict_motion` is advisory in v1 (no motion gateway yet): recorded,
+//! 8. `restrict_motion` is advisory in v1 (the executor does not drive the
+//!    motion firewall gateway, a separate unit): recorded,
 //!    nothing applied (outcome `advisory`);
 //! 9. the target is one executor v1 can act on: a participant by GUID
 //!    prefix for `quarantine_node` (`unsupported_target` for a node name or
@@ -91,9 +98,28 @@ pub mod codes {
     pub const OPERATOR_DISABLED: &str = "operator_disabled";
     /// The configuration or response policy could not be re-read.
     pub const CONFIG_UNAVAILABLE: &str = "config_unavailable";
+    // --- Trust boundary (M1, `crate::soc`) ---------------------------------
+    /// A control-plane order without a SOC request, or one whose Ed25519
+    /// signature does not verify with the executor's own SOC keys for its
+    /// own robot id (unknown key, no key configured, malformed request).
+    pub const SOC_SIGNATURE_INVALID: &str = "soc_signature_invalid";
+    /// The SOC request's timestamp is outside the executor's window, or
+    /// fenced (its replay store could not be trusted at start).
+    pub const SOC_REQUEST_STALE: &str = "soc_request_stale";
+    /// The SOC request's (key, nonce) was already presented (persisted
+    /// across restarts).
+    pub const SOC_NONCE_REPLAYED: &str = "soc_nonce_replayed";
+    /// The replay store is full of live pairs or could not record the pair.
+    pub const SOC_REPLAY_STORE_UNAVAILABLE: &str = "soc_replay_store_unavailable";
+    /// The order's id, action, target, TTL or origin differ from the signed
+    /// request (or the request is not an action request to this robot).
+    pub const ORDER_MISMATCH: &str = "order_mismatch";
+    /// The approval evidence the contract requires is missing from the
+    /// signed body, or a planner order claims a human approval.
+    pub const APPROVAL_MISSING: &str = "approval_missing";
 
     /// Every code, for mapping a wire string back to a static one.
-    pub const ALL: [&str; 21] = [
+    pub const ALL: [&str; 27] = [
         INVALID_ORDER,
         REPLAY,
         NOT_EXECUTOR_ACTION,
@@ -115,6 +141,12 @@ pub mod codes {
         LOCATORS_REQUIRED,
         OPERATOR_DISABLED,
         CONFIG_UNAVAILABLE,
+        SOC_SIGNATURE_INVALID,
+        SOC_REQUEST_STALE,
+        SOC_NONCE_REPLAYED,
+        SOC_REPLAY_STORE_UNAVAILABLE,
+        ORDER_MISMATCH,
+        APPROVAL_MISSING,
     ];
 
     /// The static code for a wire string.
@@ -186,7 +218,8 @@ pub enum Effect {
     Quarantine(QuarantineSpec),
     /// Black-box mark and bundle (done by agentd, which owns the black box).
     Evidence,
-    /// Recorded only (v1 `restrict_motion`: no motion gateway yet).
+    /// Recorded only (v1 `restrict_motion`: the executor does not drive the
+    /// motion firewall gateway).
     Advisory {
         note: String,
     },
@@ -302,9 +335,10 @@ pub fn precheck(
     if order.action == ActionId::RestrictMotion {
         return Ok(Planned {
             effect: Effect::Advisory {
-                note: "restrict_motion is advisory in executor v1: no motion firewall gateway \
-                       is installed, so the request is recorded and nothing is changed on the \
-                       robot"
+                note: "restrict_motion is advisory in executor v1: the executor does not drive \
+                       the motion firewall gateway (robodr-firewall-gw, a separate unit with its \
+                       own static envelope), so the request is recorded and nothing is changed \
+                       on the robot"
                     .into(),
             },
             ttl_s: None,

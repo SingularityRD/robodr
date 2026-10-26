@@ -13,7 +13,7 @@ default**: agentd hands it nothing unless `executor.enabled` is `true` in
 | `isolate_network` | nftables | drops all traffic in, out and forwarded, except loopback, the management and uplink allow-list, the robot's control buses (configurable), the motion control path, the robot's DDS discovery (SPDP multicast, IGMP), and what any host needs: DHCP / DHCPv6 client, path MTU discovery (ICMP "fragmentation needed", ICMPv6 "packet too big"), IPv6 neighbour / router discovery and MLD | exact inverse | always (`ttl.default_s` if the request names none) |
 | `quarantine_node` | nftables | drops RTPS whose header carries the participant's GUID prefix (raw payload match), and UDP from and to its SPDP unicast locators (IP and port); never inside the motion control path it may not cut (accepted before any drop). Needs the locators, each provably outside that path | exact inverse | always |
 | `record_evidence` | black box (runs inside agentd) | a signed, fsynced `robodr.evidence_mark` note naming the evidence bundle (the request's black-box reference) | not applicable: evidence is never reverted | none |
-| `restrict_motion` | none in v1 | recorded as advisory for the Motion Firewall; no gateway exists yet, so nothing changes on the robot (request state `recorded_not_executed`) | — | — |
+| `restrict_motion` | none in v1 | recorded as advisory: the in-path Motion Firewall gateway (`robodr-firewall-gw`) is a separate unit with its own static configuration, and the executor does not drive it, so nothing changes on the robot (request state `recorded_not_executed`) | — | — |
 | `safe_pause`, `request_safe_state`, `rollback_config` | none | refused (`not_executor_action`): these may de-energise the robot or are plan-only | — | — |
 
 ## Life of an action
@@ -184,11 +184,11 @@ crash at any point, is recovered at the next start.
   survives restarts, a clock step back cannot extend it, and
   `Restart=always` keeps TTL enforcement running.
 * **Decided twice, with the robot's state now.** agentd judges the
-  request. The executor then re-checks against its own policy and
-  configuration, and against the safety state milliseconds before the
-  transaction. A compromised agentd can at most request what the
-  executor's own checks allow: a reversible, TTL-bounded network
-  restriction that keeps management and the motion path open (see
+  request. The executor then verifies the SOC's signed approval itself
+  and re-checks against its own policy and configuration, and against
+  the safety state milliseconds before the transaction. A compromised
+  agentd cannot assert an approval no SOC key holder signed; it can at
+  most request what the executor's own checks allow without one (see
   "Trust boundary").
 * **Fails towards doing nothing.** Each of the following leaves the robot
   without the rule set, never with a partial one:
@@ -212,25 +212,65 @@ crash at any point, is recovered at the next start.
 
 ## Trust boundary
 
-The executor trusts agentd for **what was judged**: the order's
-`human_approved` flag, the origin (`control_plane` with the SOC key id,
-or `planner`), the judged safety state and operational context, and the
-participant's locators. It re-checks everything it can know itself (its
-own policy and configuration, the safety state at apply time, the motion
-control path), but it cannot tell whether a human really approved an
-order: **a compromised agentd (with the protocol key) can assert
-`human_approved`** and so obtain what the executor's own rules allow with
-a human's approval. That is still bounded by those rules: reversible,
-TTL-bounded network restrictions only; nothing on a humanoid outside
-`fall_safe_restrict`; never a `low_level` entry or a motion-path entry
-the policy does not list; never an action that may de-energise; never
-while the safety system is engaged.
+**Executor M1: the executor verifies the SOC's approval itself**
+(`src/soc.rs`). agentd forwards, with every order that comes from the
+control plane, the SOC's original `robodr-control-plane/v2` request
+exactly as it was signed (method, target, key id, timestamp, nonce,
+signature, body; `Order.soc`). The order's `human_approved` is only
+agentd's claim: before the executor accepts it, it checks, with its **own**
+copy of the SOC public keys (`soc.keys` in `executor.json`: the same
+`robodr-blackbox keygen` public key files as agentd's
+`control_plane.soc_keys`, absolute paths, regular files owned by root or
+the executor's user, not group/other-writable, public Ed25519 only,
+`device_id` if set = this robot; re-read before every order):
 
-Planned with the control plane v2: agentd forwards the SOC-signed request
-itself, and the executor verifies the SOC signature and the approval with
-its own copy of the SOC keys before it accepts `human_approved`, so a
-compromised agentd can no longer assert an approval. This is not in
-executor v1.
+| Check | Refusal |
+|---|---|
+| the order carries a SOC request at all; it is well formed; its key id is configured (no key configured refuses every control-plane order) | `soc_signature_invalid` |
+| the Ed25519 signature verifies over the contract's signing message (§2) with the **executor's own** robot id | `soc_signature_invalid` |
+| the timestamp is within `soc.max_clock_skew_s` (default 30 s) of the executor's clock, and not fenced | `soc_request_stale` |
+| the (key, nonce) pair was never presented to the executor while its timestamp is in the window: the executor's **own** replay store, `<state_dir>/soc_nonces.json`, written atomically (fsync) before the order goes further, so a replay is refused **across restarts** and even after the journal is lost | `soc_nonce_replayed` |
+| the store can record the pair (at most 8192 live pairs; a write that fails refuses) | `soc_replay_store_unavailable` |
+| the request is `POST /api/v2/robots/<own robot id>/action-requests`; the order's id, action, TTL and target equal the signed `request_id`, `action`, `ttl_seconds` and `participant_guid` / `node`; the origin's key id and `requested_by` equal the signed ones; the signed body parses strictly (unknown / duplicate fields refuse) | `order_mismatch` |
+| the approval evidence the contract requires is in the signed body: `authority: "request"`, `requested_by` (1..=100 characters), `source` (`[a-z0-9_-]{1,32}`), `reason` (≤ 500 characters) | `approval_missing` |
+
+A replay store that is missing while the executor's journal exists, or
+unreadable, **fences**: every request signed at or before that start is
+refused (`soc_request_stale`); the SOC signs again. The event log records
+it (`reconciled`, detail "SOC replay store untrusted").
+
+**Planner orders** (no SOC request) can never claim an approval
+(`approval_missing` when one does), so they stay limited to what the
+policy allows without a human: nothing on a humanoid or an unspecified
+body (`needs_approval`), no quarantine on any robot that balances
+actively (humanoid, quadruped, unspecified; `needs_approval`). A
+quadruped's network isolation without a human stays possible, as the
+response policy plans it (the motion control path is kept open by every
+isolation).
+
+The verified order is journalled without the request, with
+`human_approved` as the executor established it; a held order is
+re-validated after a reboot from that verified copy (its SOC timestamp
+would be stale by then).
+
+**What a compromised agentd (with the protocol key) can still do:** refuse
+or delay to forward an order (denial of service), and lie about what only
+agentd knows: the safety state and the operational context the request
+was judged in (the executor has no safety feed; it re-checks agentd's live
+state immediately before apply), and the participant's locators (re-checked
+against the motion control path; a wrong locator can only make a
+quarantine miss or refuse). It **cannot** obtain an action no SOC key
+holder approved, change what was approved (action, target, TTL), use an
+approval twice, use one signed for another robot, or turn a planner order
+into an approved one. Everything stays bounded by the executor's own rules
+(reversible, TTL-bounded network restrictions; never a `low_level` entry;
+never an action that may de-energise; never while the safety system is
+engaged).
+
+Deployment: give the executor the SOC public key files (root-owned, 0644)
+alongside agentd's, and keep `soc.max_clock_skew_s` at least agentd's
+`max_clock_skew_s` (agentd hands an order over within milliseconds of
+accepting it).
 
 ## Protocol (agentd ↔ executor)
 
@@ -314,6 +354,9 @@ drops entries early. Only members of group `robodr` can connect.
 and `src/config.rs` for every field and its limits. agentd's side is the
 `executor` section of `agentd.json` (`crates/robodr-agentd/src/executor_link.rs`).
 
+* `soc.keys[]` (SOC public key files) and `soc.max_clock_skew_s`
+  (default 30, 1..=300): see "Trust boundary". Without keys every
+  control-plane order is refused.
 * `network.motion_control_path[]` entries need `cidr` and/or `interface`;
   `guid_prefix` and `udp_ports` only narrow them.
 * `network.discovery` (default `{"multicast_groups": ["239.255.0.1"],
@@ -353,7 +396,16 @@ and `src/config.rs` for every field and its limits. agentd's side is the
     three clients trickle one byte per 900 ms, and another client is
     served meanwhile);
   * the protocol (MAC, tamper, replay, reply binding, the nonce cache on
-    the monotonic clock).
+    the monotonic clock);
+  * trust boundary M1 (`m1_*`): forged orders refused (no SOC request,
+    another key, signed for another robot, body changed after signing,
+    truncated signature, stale timestamp, another path, a quarantine's
+    approval used for an isolation, a stretched TTL, approval evidence
+    missing, an unknown body field); a planner order claiming an
+    approval; planner orders never on a balancing robot; a matching order
+    applied; a SOC request replayed under another id, and after a restart
+    with the journal lost; a removed or corrupt replay store fences; no
+    SOC key, a group-writable or secret key file.
 * **Real nftables in network namespaces** (`tests/netns.rs`, needs root,
   `ip` and `nft`). These send real UDP between veth peers:
   * Isolation blocks another host in both directions and keeps
@@ -369,7 +421,9 @@ and `src/config.rs` for every field and its limits. agentd's side is the
   * Foreign tables stay byte-identical.
   * Humanoid refusals install nothing.
   * The protocol works end to end over the unix socket, including a
-    wrong key and a changed safety state; held actions are re-armed only
+    wrong key and a changed safety state; orders a key holder forges
+    (no SOC request, another SOC key, a stretched TTL) change nothing in
+    the kernel's ruleset and the matching signed order is applied; held actions are re-armed only
     through an event poll with a fresh safety state; `rearm` ends an
     emergency disable.
   * Review regressions (`h1_*` … `m6_*`, `l2_*`, `l5_*`): a GUID-only
@@ -430,8 +484,10 @@ and `src/config.rs` for every field and its limits. agentd's side is the
   prefix. A GUID-narrowed protected entry keeps only RTPS **sent by**
   that participant (in either direction); traffic to it is kept by
   address / port entries.
-* **`restrict_motion`** is advisory: there is no Motion Firewall gateway
-  yet (Sprint 8).
+* **`restrict_motion`** is advisory: the in-path Motion Firewall gateway
+  (`robodr-firewall-gw`) exists as a separate unit, but it enforces its own
+  static envelope and the executor does not drive it (no interface to
+  tighten its limits at run time).
 * **No High finding for a failed revert yet.** A failed revert is reported
   through:
   * the request state;

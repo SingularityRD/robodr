@@ -23,6 +23,51 @@ use crate::order::{Locator, Order, Origin, Target};
 pub const GUID: &str = "0110a2b3c4d5e6f701000000";
 pub const LOWCMD_GUID: &str = "0110aaaabbbbccccdddd0000";
 
+/// The test SOC's Ed25519 seed (its public key file: [`soc_key_path`]).
+pub const SOC_SEED: [u8; 32] = [7; 32];
+pub const SOC_KEY_ID: &str = "soc:test:1";
+
+/// The test SOC's public key file (written once per process, root-owned,
+/// mode 0644: what `soc.keys` accepts).
+pub fn soc_key_path() -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = std::env::temp_dir().join(format!("robodr-exec-test-soc-{}.pub", std::process::id()));
+    if !p.exists() {
+        let tmp = p.with_extension(
+            format!("{:?}", std::thread::current().id())
+                .replace(|c: char| !c.is_ascii_alphanumeric(), ""),
+        );
+        std::fs::write(
+            &tmp,
+            crate::soc::testing::public_key_json(&SOC_SEED, SOC_KEY_ID),
+        )
+        .unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::rename(&tmp, &p).unwrap();
+    }
+    p
+}
+
+static NONCES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Attach a fresh SOC request (signed at `ts_s`, a new nonce) to a
+/// control-plane order, matching the order as it now is.
+pub fn sign_at(o: Order, ts_s: u64) -> Order {
+    let n = NONCES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    crate::soc::testing::sign_order(
+        o,
+        &SOC_SEED,
+        "ugv-007",
+        ts_s,
+        &format!("test-nonce-{n:020}"),
+    )
+}
+
+/// [`sign_at`] at 1 s (the engine tests run at a wall clock of 1..30 s).
+pub fn signed(o: Order) -> Order {
+    sign_at(o, 1)
+}
+
 pub fn config_json(state_dir: &str) -> String {
     json!({
         "schema": "robodr-executor-config/v1",
@@ -41,7 +86,8 @@ pub fn config_json(state_dir: &str) -> String {
                  "note": "rt/lowcmd writer"}
             ]
         },
-        "ttl": {"default_s": 600, "max_s": 3600}
+        "ttl": {"default_s": 600, "max_s": 3600},
+        "soc": {"keys": [soc_key_path()]}
     })
     .to_string()
 }
@@ -73,7 +119,13 @@ pub fn ctx(m: Morphology) -> OperationalContext {
     }
 }
 
+/// A control-plane order with a matching SOC request (see [`signed`]).
 pub fn order(id: &str, action: ActionId, m: Morphology, state: SafetyState) -> Order {
+    signed(unsigned(id, action, m, state))
+}
+
+/// The same order without its SOC request.
+pub fn unsigned(id: &str, action: ActionId, m: Morphology, state: SafetyState) -> Order {
     Order {
         id: id.into(),
         action,
@@ -94,10 +146,11 @@ pub fn order(id: &str, action: ActionId, m: Morphology, state: SafetyState) -> O
         human_approved: true,
         replay: false,
         origin: Origin::ControlPlane {
-            key_id: "soc:test:1".into(),
+            key_id: SOC_KEY_ID.into(),
             requested_by: "analyst".into(),
         },
         issued_ms: 0,
+        soc: None,
     }
 }
 
@@ -340,7 +393,9 @@ fn decision_matrix_action_morphology_state_policy_approval() {
 }
 
 fn check_cell(cell: &Cell<'_>, p: &ResponsePolicy, c: &Resolved) {
-    let mut o = order("r1", cell.a, cell.m, cell.s);
+    // precheck is pure: the approval flag here is what `soc::verify`
+    // established (the engine tests cover the signature).
+    let mut o = unsigned("r1", cell.a, cell.m, cell.s);
     o.human_approved = cell.approved;
     o.context.profile_locked = cell.locked;
     o.ttl_s = cell.ttl;
@@ -900,6 +955,7 @@ fn ttl_expiry_reverts_and_survives_restart() {
     );
     let mut q = q;
     q.ttl_s = Some(10);
+    let q = signed(q);
     assert_eq!(e.submit(&q, &mut idle(), 1_000).status, Status::Verified);
     assert_eq!(e.submit(&i, &mut idle(), 1_000).status, Status::Verified);
     e.tick(5_000);
@@ -931,11 +987,14 @@ fn l1_ttl_runs_on_boottime_within_a_boot() {
     let d = tmpdir("clock");
     let nft = FakeNft::default();
     let mut e = engine(&d, &nft, "b1", at(100_000, 5_000));
-    let i = order(
-        "i1",
-        ActionId::IsolateNetwork,
-        Morphology::WheeledMobile,
-        SafetyState::Idle,
+    let i = sign_at(
+        unsigned(
+            "i1",
+            ActionId::IsolateNetwork,
+            Morphology::WheeledMobile,
+            SafetyState::Idle,
+        ),
+        100,
     );
     assert_eq!(
         e.submit(&i, &mut idle(), at(100_000, 5_000)).status,
@@ -952,11 +1011,14 @@ fn l1_ttl_runs_on_boottime_within_a_boot() {
     assert!(nft.0.lock().unwrap().table.is_none());
     // A restart in the same boot keeps the boottime deadline, whatever the
     // wall clock says.
-    let i2 = order(
-        "i2",
-        ActionId::IsolateNetwork,
-        Morphology::WheeledMobile,
-        SafetyState::Idle,
+    let i2 = sign_at(
+        unsigned(
+            "i2",
+            ActionId::IsolateNetwork,
+            Morphology::WheeledMobile,
+            SafetyState::Idle,
+        ),
+        100,
     );
     assert_eq!(
         e.submit(&i2, &mut idle(), at(100_000, 70_000)).status,
@@ -970,11 +1032,14 @@ fn l1_ttl_runs_on_boottime_within_a_boot() {
     assert_eq!(e.status("i2").status, Status::Reverted);
     // Without a boot clock the wall clock decides, and a step back never
     // extends.
-    let i3 = order(
-        "i3",
-        ActionId::IsolateNetwork,
-        Morphology::WheeledMobile,
-        SafetyState::Idle,
+    let i3 = sign_at(
+        unsigned(
+            "i3",
+            ActionId::IsolateNetwork,
+            Morphology::WheeledMobile,
+            SafetyState::Idle,
+        ),
+        100,
     );
     let mut e = e;
     let wall = |w| Now {
@@ -1492,6 +1557,7 @@ fn m2_slow_client_never_delays_ttl_enforcement() {
         SafetyState::Idle,
     );
     i.ttl_s = Some(3);
+    let i = sign_at(i, crate::proto::wall_ms() / 1000);
     let start = std::time::Instant::now();
     assert_eq!(
         e.submit(&i, &mut idle(), crate::engine::Now::system())
@@ -1558,4 +1624,354 @@ fn m2_slow_client_never_delays_ttl_enforcement() {
         l.join().unwrap();
     }
     server.join().unwrap();
+}
+
+// --- Trust boundary M1: the executor verifies the SOC's approval itself ------
+
+fn refusal_code(o: &crate::engine::Outcome) -> String {
+    o.refusal
+        .as_ref()
+        .map(|r| r.code.clone())
+        .unwrap_or_default()
+}
+
+fn wheeled(id: &str, a: ActionId) -> Order {
+    unsigned(id, a, Morphology::WheeledMobile, SafetyState::Idle)
+}
+
+/// A SOC request with an explicit body and signer (forgeries, tampering).
+fn soc_with(
+    o: &Order,
+    seed: &[u8; 32],
+    robot: &str,
+    target_robot: &str,
+    ts: u64,
+    nonce: &str,
+    body: &str,
+) -> Order {
+    let mut o = o.clone();
+    o.soc = Some(Box::new(crate::soc::SocRequest::sign(
+        seed,
+        robot,
+        SOC_KEY_ID,
+        "POST",
+        &format!("/api/v2/robots/{target_robot}/action-requests"),
+        ts,
+        nonce,
+        body,
+    )));
+    o
+}
+
+#[test]
+fn m1_forged_orders_from_agentd_are_refused() {
+    let d = tmpdir("m1forged");
+    let nft = FakeNft::default();
+    let mut e = engine(&d, &nft, "b1", 1_000);
+    let base = wheeled("f1", ActionId::IsolateNetwork);
+    let body = crate::soc::testing::body_for(&base);
+    let n = |i: u32| format!("forged-nonce-{i:08}");
+    let cases: Vec<(Order, &str)> = vec![
+        // No SOC request at all, approval asserted by agentd.
+        (base.clone(), codes::SOC_SIGNATURE_INVALID),
+        // Signed by a key the executor does not hold.
+        (
+            soc_with(&base, &[9; 32], "ugv-007", "ugv-007", 1, &n(1), &body),
+            codes::SOC_SIGNATURE_INVALID,
+        ),
+        // Signed for another robot (robot id in the signing message).
+        (
+            soc_with(&base, &SOC_SEED, "ugv-008", "ugv-007", 1, &n(2), &body),
+            codes::SOC_SIGNATURE_INVALID,
+        ),
+        // Body changed after signing.
+        (
+            {
+                let mut o = soc_with(&base, &SOC_SEED, "ugv-007", "ugv-007", 1, &n(3), &body);
+                o.soc.as_mut().unwrap().body = body.replace("\"test\"", "\"tset\"");
+                o
+            },
+            codes::SOC_SIGNATURE_INVALID,
+        ),
+        // Truncated signature.
+        (
+            {
+                let mut o = soc_with(&base, &SOC_SEED, "ugv-007", "ugv-007", 1, &n(4), &body);
+                o.soc.as_mut().unwrap().signature.truncate(100);
+                o
+            },
+            codes::SOC_SIGNATURE_INVALID,
+        ),
+        // Outside the timestamp window (now = 1 s, signed at 40 s / 0 s
+        // works, 40 does not).
+        (
+            soc_with(&base, &SOC_SEED, "ugv-007", "ugv-007", 40, &n(5), &body),
+            codes::SOC_REQUEST_STALE,
+        ),
+        // A valid request to another path (a GET of the robot).
+        (
+            {
+                let mut o = base.clone();
+                o.soc = Some(Box::new(crate::soc::SocRequest::sign(
+                    &SOC_SEED,
+                    "ugv-007",
+                    SOC_KEY_ID,
+                    "GET",
+                    "/api/v2/robots/ugv-007",
+                    1,
+                    &n(6),
+                    "",
+                )));
+                o
+            },
+            codes::ORDER_MISMATCH,
+        ),
+        // Signed for another robot's path (but ours in the message).
+        (
+            soc_with(&base, &SOC_SEED, "ugv-007", "ugv-008", 1, &n(7), &body),
+            codes::ORDER_MISMATCH,
+        ),
+        // The SOC approved quarantine of one participant; agentd orders an
+        // isolation with that approval.
+        (
+            {
+                let q = wheeled("f1", ActionId::QuarantineNode);
+                let qb = crate::soc::testing::body_for(&q);
+                soc_with(&base, &SOC_SEED, "ugv-007", "ugv-007", 1, &n(8), &qb)
+            },
+            codes::ORDER_MISMATCH,
+        ),
+        // A longer TTL than approved.
+        (
+            {
+                let mut o = soc_with(&base, &SOC_SEED, "ugv-007", "ugv-007", 1, &n(9), &body);
+                o.ttl_s = Some(3600);
+                o
+            },
+            codes::ORDER_MISMATCH,
+        ),
+        // Approval evidence missing (authority, source).
+        (
+            soc_with(
+                &base,
+                &SOC_SEED,
+                "ugv-007",
+                "ugv-007",
+                1,
+                &n(10),
+                &body.replace("\"request\"", "\"override\""),
+            ),
+            codes::APPROVAL_MISSING,
+        ),
+        (
+            soc_with(
+                &base,
+                &SOC_SEED,
+                "ugv-007",
+                "ugv-007",
+                1,
+                &n(11),
+                &body.replace("\"soc-test\"", "\"\""),
+            ),
+            codes::APPROVAL_MISSING,
+        ),
+        // Unknown field in the signed body.
+        (
+            soc_with(
+                &base,
+                &SOC_SEED,
+                "ugv-007",
+                "ugv-007",
+                1,
+                &n(12),
+                &body.replace("{\"action\"", "{\"override\":1,\"action\""),
+            ),
+            codes::ORDER_MISMATCH,
+        ),
+    ];
+    for (i, (o, want)) in cases.into_iter().enumerate() {
+        // A refused id is final: every case on a fresh executor.
+        let mut e = engine(&tmpdir(&format!("m1forged{i}")), &nft, "b1", 1_000);
+        let out = e.submit(&o, &mut idle(), 1_000);
+        assert_eq!(out.status, Status::Refused, "case {i}: {out:?}");
+        assert_eq!(refusal_code(&out), want, "case {i}: {out:?}");
+        assert!(nft.0.lock().unwrap().table.is_none(), "case {i} installed");
+    }
+    // The genuine request is applied.
+    let ok = signed(base);
+    assert_eq!(e.submit(&ok, &mut idle(), 1_000).status, Status::Verified);
+}
+
+#[test]
+fn m1_planner_orders_cannot_claim_an_approval() {
+    let d = tmpdir("m1planner");
+    let nft = FakeNft::default();
+    let mut e = engine(&d, &nft, "b1", 1_000);
+    let mut p = wheeled("plan:1", ActionId::IsolateNetwork);
+    p.origin = Origin::Planner {
+        rule: "r".into(),
+        finding_id: None,
+    };
+    // Claims a human approval: refused.
+    let out = e.submit(&p, &mut idle(), 1_000);
+    assert_eq!(refusal_code(&out), codes::APPROVAL_MISSING, "{out:?}");
+    // Unchanged planner path: unapproved on a wheeled robot is executed.
+    p.id = "plan:2".into();
+    p.human_approved = false;
+    assert_eq!(e.submit(&p, &mut idle(), 1_000).status, Status::Verified);
+    // And never on a robot that balances: no quarantine without a human on
+    // any balancing morphology, nothing at all on a humanoid / unspecified
+    // (also when the OEM listed the target class as fall-safe).
+    let all = [RestrictTarget::Network, RestrictTarget::Participant];
+    for m in [
+        Morphology::Humanoid,
+        Morphology::Quadruped,
+        Morphology::Unspecified,
+    ] {
+        for a in [ActionId::IsolateNetwork, ActionId::QuarantineNode] {
+            let mut o = unsigned("plan:x", a, m, SafetyState::Idle);
+            o.human_approved = false;
+            o.origin = Origin::Planner {
+                rule: "r".into(),
+                finding_id: None,
+            };
+            let r = precheck(&o, &policy(m, true, &all), &cfg("/tmp/x"));
+            let refused = r.is_err();
+            let want = m != Morphology::Quadruped || a == ActionId::QuarantineNode;
+            assert_eq!(refused, want, "{m:?} {a:?}: {r:?}");
+            if refused {
+                assert_eq!(r.unwrap_err().code, codes::NEEDS_APPROVAL, "{m:?} {a:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn m1_matching_signed_order_is_applied_and_replay_refused_across_restarts() {
+    let d = tmpdir("m1replay");
+    let nft = FakeNft::default();
+    let mut e = engine(&d, &nft, "b1", 1_000);
+    let o = order(
+        "r-ok",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    assert_eq!(e.submit(&o, &mut idle(), 1_000).status, Status::Verified);
+    assert_eq!(e.revert("r-ok", "test", 1_100).status, Status::Reverted);
+    // The same request under another order id: the nonce was used.
+    let mut again = o.clone();
+    again.id = "r-other".into();
+    assert_eq!(
+        refusal_code(&e.submit(&again, &mut idle(), 1_200)),
+        codes::SOC_NONCE_REPLAYED
+    );
+    drop(e);
+    // Restart after the executor's history was lost (journal removed): the
+    // replay store still knows the request.
+    std::fs::remove_file(d.join(crate::journal::FILE)).unwrap();
+    let mut e = engine(&d, &nft, "b1", 2_000);
+    let out = e.submit(&o, &mut idle(), 2_000);
+    assert_eq!(refusal_code(&out), codes::SOC_NONCE_REPLAYED, "{out:?}");
+    assert!(nft.0.lock().unwrap().table.is_none());
+    drop(e);
+    // The replay store removed while the journal exists: fenced, an old
+    // request is refused, a request signed after the start is accepted.
+    std::fs::remove_file(d.join(crate::soc::NONCE_FILE)).unwrap();
+    let mut e = engine(&d, &nft, "b1", 3_000);
+    let mut o2 = o.clone();
+    o2.id = "r-two".into();
+    let o2 = sign_at(o2, 3);
+    assert_eq!(
+        refusal_code(&e.submit(&o2, &mut idle(), 3_000)),
+        codes::SOC_REQUEST_STALE
+    );
+    let mut o3 = o.clone();
+    o3.id = "r-three".into();
+    let o3 = sign_at(o3, 4);
+    assert_eq!(e.submit(&o3, &mut idle(), 4_000).status, Status::Verified);
+    drop(e);
+    // A corrupt store fences too.
+    std::fs::write(d.join(crate::soc::NONCE_FILE), b"{not json").unwrap();
+    let mut e = engine(&d, &nft, "b1", 5_000);
+    let mut o4 = o.clone();
+    o4.id = "r-four".into();
+    let o4 = sign_at(o4, 5);
+    assert_eq!(
+        refusal_code(&e.submit(&o4, &mut idle(), 5_000)),
+        codes::SOC_REQUEST_STALE
+    );
+}
+
+#[test]
+fn m1_soc_keys_are_the_executors_own() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tmpdir("m1keys");
+    let nft = FakeNft::default();
+    // No key configured: nothing approved.
+    let mut v: Value = serde_json::from_str(&config_json(d.to_str().unwrap())).unwrap();
+    v["soc"] = json!({"keys": []});
+    let c = ExecutorConfig::parse(&v.to_string())
+        .unwrap()
+        .validate()
+        .unwrap();
+    let mut e = Engine::open(
+        c,
+        policy(Morphology::WheeledMobile, true, &[]),
+        Box::new(nft.clone()),
+        "b1",
+        1_000,
+    )
+    .unwrap();
+    let o = order(
+        "k1",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    assert_eq!(
+        refusal_code(&e.submit(&o, &mut idle(), 1_000)),
+        codes::SOC_SIGNATURE_INVALID
+    );
+    drop(e);
+    // A group-writable key file is not trusted (config_unavailable).
+    let kp = d.join("soc-gw.pub");
+    std::fs::write(
+        &kp,
+        crate::soc::testing::public_key_json(&SOC_SEED, SOC_KEY_ID),
+    )
+    .unwrap();
+    std::fs::set_permissions(&kp, std::fs::Permissions::from_mode(0o664)).unwrap();
+    v["soc"] = json!({"keys": [kp]});
+    let c = ExecutorConfig::parse(&v.to_string())
+        .unwrap()
+        .validate()
+        .unwrap();
+    let d2 = tmpdir("m1keys2");
+    let mut c = c;
+    c.config.state_dir = d2.clone();
+    let mut e = Engine::open(
+        c,
+        policy(Morphology::WheeledMobile, true, &[]),
+        Box::new(nft.clone()),
+        "b1",
+        1_000,
+    )
+    .unwrap();
+    let o = signed(wheeled("k2", ActionId::IsolateNetwork));
+    assert_eq!(
+        refusal_code(&e.submit(&o, &mut idle(), 1_000)),
+        codes::CONFIG_UNAVAILABLE
+    );
+    // A secret key file is refused too.
+    let sk = robodr_blackbox::KeyFile::ed25519_from_seed(&SOC_SEED, Some(SOC_KEY_ID))
+        .unwrap()
+        .to_json();
+    std::fs::write(&kp, sk).unwrap();
+    std::fs::set_permissions(&kp, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let o = signed(wheeled("k3", ActionId::IsolateNetwork));
+    assert_eq!(
+        refusal_code(&e.submit(&o, &mut idle(), 1_000)),
+        codes::CONFIG_UNAVAILABLE
+    );
 }

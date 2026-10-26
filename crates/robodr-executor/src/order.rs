@@ -92,6 +92,11 @@ pub struct Order {
     pub origin: Origin,
     /// Wall clock (Unix ms) when agentd issued it.
     pub issued_ms: u64,
+    /// The SOC's signed request this order stands for (control-plane
+    /// orders only; executor M1). The executor accepts `human_approved`
+    /// only when it verifies this request itself ([`crate::soc::verify`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soc: Option<Box<crate::soc::SocRequest>>,
 }
 
 fn text_ok(s: &str) -> bool {
@@ -145,6 +150,9 @@ impl Order {
             Origin::Planner { rule, finding_id } => {
                 if !text_ok(rule) || finding_id.as_deref().is_some_and(|f| !text_ok(f)) {
                     return Err("origin text too long or with control characters".into());
+                }
+                if self.soc.is_some() {
+                    return Err("a planner order carries no SOC request".into());
                 }
             }
         }

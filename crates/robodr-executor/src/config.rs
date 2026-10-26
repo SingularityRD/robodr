@@ -26,7 +26,8 @@
 //!     ],
 //!     "discovery": {"multicast_groups": ["239.255.0.1"], "domains": [0]}
 //!   },
-//!   "ttl": {"default_s": 900, "max_s": 86400}
+//!   "ttl": {"default_s": 900, "max_s": 86400},
+//!   "soc": {"keys": ["/etc/robodr/soc/soc.pub"], "max_clock_skew_s": 30}
 //! }
 //! ```
 
@@ -108,6 +109,39 @@ pub struct ExecutorConfig {
     /// How often the installed rules are read back and compared (s).
     #[serde(default = "default_verify_s")]
     pub verify_interval_s: u64,
+    /// The SOC public keys the executor verifies approvals with itself
+    /// (trust boundary M1, [`crate::soc`]). Without keys every control-plane
+    /// order is refused (`soc_signature_invalid`).
+    #[serde(default)]
+    pub soc: SocSection,
+}
+
+fn default_soc_skew_s() -> u64 {
+    30
+}
+
+/// `soc` in executor.json.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SocSection {
+    /// `robodr-blackbox keygen` **public** Ed25519 key files of the SOC
+    /// (absolute paths; root-owned, not group/other-writable: the same files
+    /// as agentd's `control_plane.soc_keys`). Re-read before every order.
+    #[serde(default)]
+    pub keys: Vec<PathBuf>,
+    /// Allowed difference between the SOC's signature timestamp and this
+    /// host's clock (s, 1..=300; default 30, as agentd's).
+    #[serde(default = "default_soc_skew_s")]
+    pub max_clock_skew_s: u64,
+}
+
+impl Default for SocSection {
+    fn default() -> Self {
+        Self {
+            keys: Vec::new(),
+            max_clock_skew_s: default_soc_skew_s(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -400,6 +434,18 @@ impl ExecutorConfig {
         if !(1..=3_600).contains(&self.verify_interval_s) {
             return Err("verify_interval_s must be 1..=3600".into());
         }
+        if self.soc.keys.len() > crate::soc::MAX_SOC_KEYS {
+            return Err(format!(
+                "soc.keys: at most {} keys",
+                crate::soc::MAX_SOC_KEYS
+            ));
+        }
+        for k in &self.soc.keys {
+            absolute("soc.keys[]", k)?;
+        }
+        if !(1..=300).contains(&self.soc.max_clock_skew_s) {
+            return Err("soc.max_clock_skew_s must be 1..=300".into());
+        }
         Ok(Resolved {
             config: self,
             socket_mode,
@@ -482,6 +528,10 @@ mod tests {
             ("ttl", serde_json::json!({"default_s": 100, "max_s": 50})),
             ("max_safety_age_ms", serde_json::json!(10)),
             ("verify_interval_s", serde_json::json!(0)),
+            ("soc", serde_json::json!({"keys": ["relative.pub"]})),
+            ("soc", serde_json::json!({"max_clock_skew_s": 0})),
+            ("soc", serde_json::json!({"max_clock_skew_s": 301})),
+            ("soc", serde_json::json!({"unknown": 1})),
             (
                 "network",
                 serde_json::json!({"management": [{"cidr": "0.0.0.0/0"}]}),

@@ -862,6 +862,10 @@ impl Status {
 pub struct AcceptedAction<'a> {
     pub request: &'a ActionRequest,
     pub key_id: &'a str,
+    /// The SOC's signed request exactly as received (method, target,
+    /// credentials, body): forwarded to the executor, which verifies the
+    /// approval itself (executor M1).
+    pub meta: &'a Meta,
     pub step: Step,
     pub actions: &'a [ResponseAction],
     pub safety_state: SafetyState,
@@ -1360,6 +1364,7 @@ impl Engine {
                 let out = self.executor.submit(&AcceptedAction {
                     request: req,
                     key_id: &meta.key_id,
+                    meta,
                     step: a.step,
                     actions: &a.actions,
                     safety_state: state,

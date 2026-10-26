@@ -43,6 +43,7 @@ use robodr_executor::engine::{Outcome, Status as ExStatus};
 use robodr_executor::journal::{Event, EventKind};
 use robodr_executor::order::{Locator, Order, Origin, Target};
 use robodr_executor::proto::Key;
+use robodr_executor::soc::SocRequest;
 use robodr_responder::{ActionId, Morphology, ResponseAction, RestrictTarget, SafetyState, Step};
 use serde::{Deserialize, Serialize};
 
@@ -562,6 +563,19 @@ pub fn order_for(a: &AcceptedAction<'_>, own: Morphology, now_ms: u64) -> Order 
             requested_by: a.request.requested_by.clone(),
         },
         issued_ms: now_ms,
+        // Executor M1: the SOC's request as it was signed. `human_approved`
+        // above is only a claim; the executor accepts it only when this
+        // request verifies with its own copy of the SOC keys and matches
+        // the order.
+        soc: Some(Box::new(SocRequest {
+            method: a.meta.method.clone(),
+            target: a.meta.target.clone(),
+            key_id: a.meta.key_id.clone(),
+            timestamp: a.meta.timestamp,
+            nonce: a.meta.nonce.clone(),
+            signature: a.meta.signature.clone(),
+            body: a.meta.body.clone(),
+        })),
     }
 }
 
@@ -671,6 +685,7 @@ pub fn orders_for_plan(req: &ExecutionRequest<'_>, own: Morphology, now_ms: u64)
                 finding_id: req.finding_id.map(|f| f.chars().take(200).collect()),
             },
             issued_ms: now_ms,
+            soc: None,
         });
     }
     out
@@ -909,6 +924,38 @@ mod tests {
         assert_eq!(map(&o), None, "a failing revert never reads as lifted");
     }
 
+    /// The executor verifies the SOC signature over the same bytes the
+    /// control plane does (executor M1): one signing message, two copies.
+    #[test]
+    fn executor_and_control_plane_sign_the_same_message() {
+        for body in [&b""[..], b"{\"a\":1}"] {
+            assert_eq!(
+                robodr_executor::soc::signing_message(
+                    "POST",
+                    "/api/v2/robots/r%3A1/action-requests",
+                    "r:1",
+                    "soc:k:1",
+                    1_792_000_000,
+                    "nonce-nonce-nonce-1",
+                    body
+                ),
+                crate::control::auth::signing_message(
+                    "POST",
+                    "/api/v2/robots/r%3A1/action-requests",
+                    "r:1",
+                    "soc:k:1",
+                    1_792_000_000,
+                    "nonce-nonce-nonce-1",
+                    body
+                )
+            );
+        }
+        assert_eq!(
+            robodr_executor::soc::API_VERSION,
+            crate::control::auth::API_VERSION
+        );
+    }
+
     #[test]
     fn quarantine_orders_get_the_participants_spdp_locators() {
         let g = "0110a2b3c4d5e6f701000000";
@@ -930,6 +977,7 @@ mod tests {
                 finding_id: None,
             },
             issued_ms: 0,
+            soc: None,
         };
         let locs = |o: &Order| match &o.target {
             Target::Participant { locators, .. } => locators.clone(),
