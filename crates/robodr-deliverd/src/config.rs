@@ -721,3 +721,25 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod example_tests {
+    use super::*;
+
+    /// The shipped example (config/deliverd.example.json) parses and is the
+    /// documented defaults plus its unit section.
+    #[test]
+    fn the_example_configuration_is_valid_and_spells_out_the_defaults() {
+        let c = Config::parse(include_bytes!("../../../config/deliverd.example.json")).unwrap();
+        // Everything but the unit, the roots and the rules reload command
+        // is the default.
+        let minimal = serde_json::json!({
+            "format": CONFIG_FORMAT, "unit": c.unit, "trust": c.trust,
+            "install": {"rules_reload": c.install.rules_reload}
+        });
+        assert_eq!(
+            Config::parse(&serde_json::to_vec(&minimal).unwrap()).unwrap(),
+            c
+        );
+    }
+}

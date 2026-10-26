@@ -1,0 +1,259 @@
+.\" robodr-deliverd(8). Source of truth: the USAGE text in
+.\" crates/robodr-deliverd/src/cli.rs, the crate docs and
+.\" docs/SECURE-DELIVERY.md (sections 4.2, 6 and 10). Keep them in sync.
+.TH ROBODR\-DELIVERD 8 "2026-10-26" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
+.SH NAME
+robodr\-deliverd \- install verified RoboDR delivery packages on a unit, behind the robot's safety-state gate
+.SH SYNOPSIS
+.B robodr\-deliverd run \-\-config
+.I FILE
+.br
+.B robodr\-deliverd once \-\-config
+.I FILE
+.br
+.B robodr\-deliverd check\-config \-\-config
+.I FILE
+.br
+.B robodr\-deliverd init\-anchor \-\-config
+.I FILE
+.B \-\-trust
+.I TRUST.json
+.br
+.B robodr\-deliverd status \-\-config
+.I FILE
+.br
+.B robodr\-deliverd confirm \-\-config
+.I FILE
+.B \-\-deployment
+.I DIGEST
+.B \-\-package
+.I NAME
+.br
+.B robodr\-deliverd \-\-version
+.SH DESCRIPTION
+The on-unit delivery agent of RoboDR's secure delivery (Sprint 13b). It
+installs packages (RPKs, format
+.BR robodr\-pkg/1 )
+of the kinds
+.BR files ,
+.BR config ,
+.B deb
+and
+.B robodr\-rules
+from
+.B per-unit media packs
+that an operator puts (copies or mounts) under the configured
+.IR media_dir .
+A media pack is a directory holding exactly
+.I trust.json
+and
+.I trust.json.sig
+(the site's delivery trust file),
+.I deployment.json
+and
+.I deployment.json.sig
+(one deployment naming this unit) and
+.IB bundles/ label /
+(1 to 16 release bundles,
+.BR robodr\-bundle/1 ).
+Anything else in it, a symlink or a special file anywhere refuses the
+pack.
+.PP
+The media is never trusted and never used after the check: the documents
+are read once, the trust file is accepted only as the unit's
+.B trust anchor
+or a root-signed rotation of it (pinned root fingerprints, the unit's own
+site, unexpired), the deployment must carry the depot's signature and the
+operator quorum of its ring, name this unit (a
+.B lab
+or
+.B canary
+deployment by unit id; a production ring by unit id or an enrolled group),
+be for the unit's own ring (from the trust file's
+.IR rings ,
+else
+.IR unit.ring ),
+fit the ring's size and be newer than the accepted one, and every bundle
+is copied bounded by its listed sizes while hashing and verified as the
+copy (the verified-copy import of
+.BR robodr\-release ).
+.PP
+Then, item by item, one switch per pass: the RPK must fit the unit
+(architecture, platform, hardware, kind, floors, revocations, dependencies);
+it is put into the content-addressed store and prepared next to the running
+version; the install waits for the deployment's maintenance window, a local
+operator's confirmation when the RPK requires one, and
+.BR robodr\-agentd (8)'s
+.B live
+safety state, which must be
+.B idle
+or
+.B safe_state_active
+(read again immediately before the switch). The write-ahead intent and the
+raised anti-rollback floor are written before the switch (a
+.I current
+symlink swap, or
+.BR "dpkg \-\-install" ).
+The RPK's health checks then decide: pass, installed; fail, automatic
+rollback to the previous version at or above the floor, or, when there is
+none, the unit stays on the failing version and a Critical finding asks an
+operator to act.
+.PP
+Every step is recorded in the agent's black box
+.RI ( /var/lib/robodr/blackbox/deliverd ,
+signed with the unit's black-box key) and reported as a
+.B robot.deliver.*
+finding in agentd's findings spool (contract
+.B robodr.findings
+2.2).
+.SH COMMANDS
+.TP
+.B run
+Loop every
+.I interval_ms
+until
+.B SIGTERM
+or
+.B SIGINT
+(handled between passes). An evidence or state write that fails stops the
+daemon with status 1; the next start resumes the intent.
+.TP
+.B once
+One pass; prints a JSON report
+.RI ( imported ", " refused ", " installed ", " deferred ", "
+.IR rolled_back ", " blocked ", " recovered ", " stale ).
+.TP
+.B check\-config
+Validate the configuration and exit.
+.TP
+.B init\-anchor
+Create the unit's trust anchor
+.RI ( state_dir /trust\-anchor.json
+and
+.IR .sig )
+from a trust file accepted under the pinned roots and the unit's site.
+Once, at enrolment; refuses to overwrite an existing anchor (it moves
+forward only by accepted rotations carried in media packs).
+.TP
+.B status
+Print the state: installed versions, kept rollback targets, floors, the
+deployment being worked on, the intent in progress, staleness.
+.TP
+.B confirm
+Record a local operator's confirmation for package
+.I NAME
+of the deployment with digest
+.I DIGEST
+(see
+.BR status )
+when its RPK sets
+.BR install.requires_operator_present .
+Consumed by the install.
+.SH CONFIGURATION
+.I /etc/robodr/deliverd.json
+.RB ( robodr\-deliverd\-config/1 ,
+unknown members refused). Required:
+.BR unit.id ,
+.BR unit.site ,
+.BR unit.model ,
+.BR unit.platform ,
+.B unit.arch
+.RB ( amd64 " or " arm64 ),
+.B trust.roots
+(the delivery roots' fingerprints, pinned out of band) and
+.B trust.clock
+.RB ( trusted :
+expiry on the system clock;
+.BR untrusted :
+expiry on the newest depot-signed time accepted, so a trust file or
+deployment expired "by the depot's clock" is a staleness finding). The
+rest has the defaults of
+.IR /usr/share/doc/robodr/examples/deliverd.example.json :
+install roots
+.IR /opt/robodr\-delivered ,
+.I /etc/robodr\-delivered
+(the only place a
+.B config
+package writes) and
+.I /etc/robodr\-delivered\-rules
+(one symlink per rules package to its active version: point Pulsar's
+.I rules_path
+or a link below it there), probe UID range 100..59999, agentd's
+.I status.json
+and spool. Paths must be absolute and normalised; the state, media and
+install trees must be disjoint.
+.SH HEALTH CHECKS
+.B probe
+argv are executed directly
+.RB ( execve ,
+no shell, no
+.B PATH
+lookup, environment
+.BR PATH=/usr/sbin:/usr/bin:/sbin:/bin " and " LC_ALL=C ,
+working directory /) as the probe user's UID and GID with supplementary
+groups dropped, in their own process group, which is killed when the
+timeout expires; output beyond
+.I max_output_bytes
+is read and discarded. The probe user is resolved from the passwd file at
+staging (never UID or GID 0, never
+.BR root ", " robodr ", " robodr\-exec ,
+inside the configured range) and must resolve the same way at probe time.
+.B service_active
+runs
+.BR "systemctl is\-active \-\-quiet" ;
+.B file_present
+needs a regular file;
+.B ros2_node
+cannot be evaluated on a unit and refuses the RPK. With
+.B health.require_agentd_ok
+(default) agentd's own health must be
+.BR ok .
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Refused or error (stderr says why).
+.TP
+.B 2
+Usage or configuration error.
+.SH FILES
+.TP
+.I /var/lib/robodr/deliverd/
+State
+.RI ( state.json ),
+trust anchor, content-addressed store, imported packs, operator
+confirmations (0700 root).
+.TP
+.I /var/lib/robodr/deliverd\-media/
+Where media packs are put (untrusted).
+.TP
+.I /var/lib/robodr/blackbox/deliverd/
+The delivery black box (verify with
+.BR "robodr\-blackbox verify" ).
+.SH SYSTEMD UNIT
+.B robodr\-deliverd.service
+(installed disabled) runs as root with a bounded capability set, no
+network, no access to
+.IR /etc/robodr/keys ;
+the black-box key arrives as
+.IR /run/credentials/robodr\-deliverd.service/blackbox.key .
+Enable after commissioning and
+.BR init\-anchor .
+.SH LIMITS
+Kinds
+.BR oci\-image ", " model ", " robodr\-profile ", " os\-image
+and sealed RPKs are refused. Floors live in the state file and the black
+box, not in a TPM. The safety state is agentd's status file: whoever
+controls the
+.B robodr
+user can claim
+.B idle
+to agentd and to this agent alike.
+.SH SEE ALSO
+.BR robodr\-agentd (8),
+.BR robodr\-blackbox (1),
+.BR robodr\-spool\-export (1),
+/usr/share/doc/robodr/OPERATIONS.md,
+/usr/share/doc/robodr/SECURE-DELIVERY.md

@@ -49,6 +49,7 @@ FOCAL_UNITS = (
     "robodr-executor.service",
     "robodr-firewall-gw.service",
     "robodr-firewall-gw-rules.service",
+    "robodr-deliverd.service",
 )
 
 # Directives a focal unit may use: all exist in systemd 245 (version in

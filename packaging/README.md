@@ -48,6 +48,7 @@ The units, tmpfiles and sysusers fragments were checked with
 | `robodr-commission` | **not a service**: run by an operator, as needed | commissioning is a deliberate, human-reviewed act (learn, sign off, lock). A timer or unit that re-learns a profile automatically would let an attacker who is present during learning become "normal". |
 | `robodr-replay`, `robodr-ros2-watch` | operator tools | offline analysis and lab replay |
 | `robodr-enroll` | **not a service**: root-only operator tool (`/usr/sbin`) | enrollment, key rotation, revocation lists, SOC profiles and ring information (OPERATIONS 8.6); every step is a deliberate operator act, nothing is applied by the SOC on its own |
+| `robodr-deliverd` | systemd service on the **unit**, root with a bounded capability set, no network | installs delivered RPKs (dpkg, `/opt` / `/etc` install roots, dropping to probe users); runs only after commissioning and `init-anchor` (OPERATIONS 11) |
 | `robodr-anchor-receiver` | systemd service on a **base station**, dynamic user, no capabilities; never enabled on a robot | holds the robots' black-box head marks off the robots |
 | `robodr-spool-export` | systemd service (`User=robodr`, no network, no capabilities) on the **unit or sensor box** of a diode site | loops on agentd's spool and writes signed diode batches; the transfer to the diode is the site's procedure |
 | `robodr-kafka-publish` | systemd service (`User=robodr`, brokers only) on the **unit or sensor box** of a connected site; on a diode site it runs on the **SOC (high) side** after `robodr-diode-unpack`, from the SOC's own unit or procedure (`--diode-out`) | publishes findings to Kafka; one consumer per spool, so it conflicts with `robodr-spool-export` and `robodr-uplink` |
@@ -123,6 +124,7 @@ Neither watchdog has been exercised under a real systemd yet.
 /var/lib/robodr/                 0750 root:robodr
 ├── blackbox/                    0750 root:robodr
 │   ├── agentd/                  0750 robodr:robodr single writer: robodr-agentd
+│   ├── deliverd/                0750 root:robodr   single writer: robodr-deliverd (delivery evidence)
 │   └── pulsard/                 0750 root:robodr   single writer: robodr-pulsard
 ├── spool/                       0750 root:robodr   OCSF findings awaiting export
 │   ├── agentd/                  0750 robodr:robodr
@@ -136,6 +138,8 @@ Neither watchdog has been exercised under a real systemd yet.
 ├── archive/                     0750 root:robodr   black boxes closed by a key rotation
 ├── executor/                    0700 robodr-exec:robodr journal of robodr-executor (active actions, TTL deadlines)
 ├── fleet/                       0700 root:root     robodr-enroll state, staged profile, fleet journal (black box)
+├── deliverd/                    0700 root:root     robodr-deliverd: state, trust anchor, content-addressed store, imported packs
+├── deliverd-media/              0700 root:root     media packs put here for robodr-deliverd (untrusted)
 ├── releases/<version>/          0750 root:root     .deb kept for rollback (install-bundle.sh)
 └── releases/security-floor      0644 root:root     lowest release install/rollback may reach (only rises)
 /run/robodr-pulsard/pulsar.sock                     Pulsar API socket (RuntimeDirectory)
@@ -143,6 +147,9 @@ Neither watchdog has been exercised under a real systemd yet.
 /run/credentials/<unit>/blackbox.key                key copy for the service (systemd)
 /usr/share/robodr/rules/{robodr,pulsar}/            Pulsar rules, read-only
 /usr/share/robodr/formats                           black-box formats the release writes / reads (install-bundle.sh gate)
+/opt/robodr-delivered/<name>/{<serial>,current}     delivered files (robodr-deliverd only)
+/etc/robodr-delivered/<name>/{<serial>,current}     delivered configuration (robodr-deliverd only)
+/etc/robodr-delivered-rules/<name>                  link to the active delivered Pulsar rules
 ```
 
 `tmpfiles.d/robodr.conf` creates every directory and **resets** mode and owner
@@ -247,6 +254,12 @@ this was checked with stub binaries (`robodr`) and with the real static
 binaries (`robodr-focal`, arm64).
 
 ## Not verified
+
+- `robodr-deliverd.service` and its focal variant (added 2026-10-26, Sprint
+  13b) pass `scripts/check-focal-units.py` and `systemd-analyze verify`
+  apart from the missing binary; not started by systemd. Its tests run the
+  agent itself on temporary directories, `deb` with the host's dpkg
+  against a separate dpkg root.
 
 - No unit has been started on a real kernel. In particular these are
   unverified: the capability set, `SystemCallFilter=`, the read-only `/sys`

@@ -27,7 +27,7 @@ configure)
             # Upgrade: restart only what was running.
             for u in robodr-pulsard.service robodr-agentd.service robodr-anchor-receiver.service \
                 robodr-spool-export.service robodr-kafka-publish.service robodr-uplink.service \
-                robodr-executor.service robodr-firewall-gw.service; do
+                robodr-executor.service robodr-firewall-gw.service robodr-deliverd.service; do
                 systemctl try-restart "$u" || true
             done
         else

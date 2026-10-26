@@ -407,6 +407,9 @@ fn build_deb_and_make_bundle_carry_robodr_enroll() {
         "robodr-uplink",
         "robodr-executor",
         "robodr-firewall-gw",
+        "robodr-deliverd",
+        // The replay helper is a test tool: built, never packaged.
+        "robodr-safety-replay",
     ] {
         std::fs::copy(&elf, bins.join(b)).unwrap();
         std::fs::set_permissions(bins.join(b), std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -420,7 +423,7 @@ fn build_deb_and_make_bundle_carry_robodr_enroll() {
         .arg(&out)
         .env(
             "ROBODR_DEB_REQUIRE",
-            "robodr-enroll robodr-uplink robodr-executor robodr-firewall-gw",
+            "robodr-enroll robodr-uplink robodr-executor robodr-firewall-gw robodr-deliverd",
         )
         .env("SOURCE_DATE_EPOCH", "1790000000")
         .output()
@@ -444,14 +447,27 @@ fn build_deb_and_make_bundle_carry_robodr_enroll() {
         "./usr/lib/systemd/system/robodr-firewall-gw-rules.service",
         "./usr/share/doc/robodr/contracts/robodr.control-plane.md",
         "./usr/share/doc/robodr/contracts/robodr.fleet-api.md",
+        // The delivery agent (Sprint 13b), its unit, man page, example
+        // configuration and design document.
+        "./usr/sbin/robodr-deliverd",
+        "./usr/lib/systemd/system/robodr-deliverd.service",
+        "./usr/share/man/man8/robodr-deliverd.8.gz",
+        "./usr/share/doc/robodr/examples/deliverd.example.json",
+        "./usr/share/doc/robodr/SECURE-DELIVERY.md",
     ] {
         assert!(list.contains(want), "{want} missing from the .deb:\n{list}");
     }
+    assert!(
+        !list.contains("robodr-safety-replay"),
+        "the replay helper must not ship:\n{list}"
+    );
     let tmpf = ok(&sh(Command::new("sh").arg("-c").arg(format!(
         "dpkg-deb --fsys-tarfile {} | tar -xOf - ./usr/lib/tmpfiles.d/robodr.conf",
         deb.display()
     ))));
     assert!(tmpf.contains("/var/lib/robodr/fleet             0700 root   root"));
+    assert!(tmpf.contains("/var/lib/robodr/deliverd          0700 root   root"));
+    assert!(tmpf.contains("/var/lib/robodr/blackbox/deliverd 0750 root   robodr"));
     // The offline bundle around it verifies.
     let o = Command::new("bash")
         .arg(repo().join("packaging/make-bundle.sh"))
