@@ -353,8 +353,11 @@ To verify a published release independently: follow
 half of the Sprint 1 assurance item) is implemented in `release.yml`'s
 `publish` job: `SHA256SUMS` plus a minisign signature (`*.minisig`) for every
 asset, verifiable offline with the public key in the repository variable
-`ROBODR_MINISIGN_PUBKEY`. It has never run: the `MINISIGN_SECRET_KEY` /
-`MINISIGN_PASSWORD` secrets are not provisioned and no release has been cut.
+`ROBODR_MINISIGN_PUBKEY`. It has never run on GitHub: the
+`MINISIGN_SECRET_KEY` / `MINISIGN_PASSWORD` secrets are not provisioned and
+no release has been cut. It passed a local dry run with a throwaway key
+([Release dry run](#release-dry-run-2026-10-26)); the procedure and key
+ceremony are in [docs/RELEASE.md](RELEASE.md).
 cosign / SLSA provenance is a TODO in the workflow.
 
 The Pulsar-bound binary (`pulsard` with RoboDR modules, embedding eBPF objects
@@ -683,6 +686,81 @@ Not checked on arm64:
 - That ld.so really refuses the binaries on glibc < 2.39. This follows from
   the `readelf -V` output above and was not run on an old system.
 
+### Release dry run (2026-10-26)
+
+`release.yml` replayed end to end with `scripts/release-dry-run.sh`
+(procedure and scope: [docs/RELEASE.md](RELEASE.md), section 4) on Ubuntu
+24.04 amd64 (4 cores), source `04663a0` plus the dry run's release commit
+for the simulated tag `v0.1.0-rc.0-dryrun` (no git tag created), signed
+with a throwaway, test-only minisign key. Result: **PASS**.
+
+| Job / check | Result | Notes |
+|---|---|---|
+| guard: wrong tag, `Cargo.toml` version != `VERSION` | refused | the second guard failed before `6e69f91` (fix below) |
+| `prepare` | pass | draft prerelease, notes from the CHANGELOG section |
+| `build` amd64 | pass (22 min) | clang-20 installed from noble-updates for eBPF (not the fallback); 14 pure binaries reproducible; `robodr-pulsard` built `--locked`; 22 SBOMs (cargo-cyclonedx 0.5.9); `libc6 (>= 2.39)` |
+| `build` arm64 | pass (21 min) | **cross-compiled** (adaptations below); 14 reproducible; `robodr-pulsard` cross-built against multiarch `libssl-dev:arm64`/`libsqlite3-dev:arm64` |
+| `build-static` amd64 / arm64 | pass (12 / 15 min) | 14 static binaries each, reproducible, built == reproduced, smoke run (arm64 under qemu-aarch64-static 8.2) |
+| `publish` | pass | per-arch hashes, `SHA256SUMS`, 15 signatures with a password-protected key through the secret path, self-verify with the `RW...` string |
+| acceptance | pass | 15 assets + 15 `.minisig`; `minisign -V -p` on each; `install-bundle.sh verify --pubkey --tarball` on the 4 bundles (2 signatures each); a tampered bundle and a foreign key refused |
+| `scripts/deb-install-smoke.sh` | pass, 38 findings | all 4 `.deb`s unpack into a throwaway dpkg root, `dpkg --verify` clean, sysusers/tmpfiles apply, every binary starts (amd64 native, arm64 under qemu), `systemd-analyze verify` (systemd 255) clean on 9 regular / 7 focal units. Findings: see below |
+
+Adaptations of the arm64 `build` job (GitHub runs it natively on
+`ubuntu-24.04-arm`): `CARGO_BUILD_TARGET=aarch64-unknown-linux-gnu`,
+linker `aarch64-linux-gnu-gcc` 13.3.0 (`libc6-dev-arm64-cross`), pkg-config
+for the arm64 multiarch libraries, `target/release` read as
+`target/aarch64-unknown-linux-gnu/release` and the host triple as the
+target triple in its step scripts, and `cargo install` without
+`CARGO_BUILD_TARGET`. ring is still compiled with the pinned clang-18.
+In every job, `ln -sf ... /usr/local/bin/` writes into the dry run's own
+`bin/`.
+
+Defects found and fixed:
+
+- `release.yml` `prepare` accepted a release commit whose `Cargo.toml`
+  `[workspace.package] version` was not `VERSION`: every binary's
+  `--version`, agentd's `product_version` and the SBOMs would have named the
+  previous release inside packages labelled with the new one. Now refused
+  (`6e69f91`).
+- `release.yml` `ROBODR_DEB_REQUIRE` omitted `robodr-executor`,
+  `robodr-firewall-gw` and `robodr-anchor-receiver` (focal: the first two),
+  so a build that stopped producing them would have shipped without them
+  (`ccbcecc`).
+- `scripts/ci-repro.sh` never deleted its default scratch directory (two
+  source copies with their `target/`, ~0.6 GB per run) (`803f177`).
+- Dry-run tooling itself: `cargo install` inherited the cross target and
+  replaced the host's `cargo-cyclonedx` with an aarch64 binary
+  (`04663a0`); the smoke test's root needed systemd's units, `/bin/sh`,
+  `--path-include` and conffile handling (`f351533`).
+
+Findings not fixed (crate code): `--version` exits 2 on
+`robodr-anchor-receiver`, `robodr-blackbox`, `robodr-diode-pack`,
+`robodr-diode-unpack`, `robodr-kafka-publish`, `robodr-replay`,
+`robodr-spool-export`, `robodr-firewall-gw`; `--help` exits 2 on
+`robodr-kafka-publish` and `robodr-spool-export`. All of them start and
+print their usage.
+
+Published set (test-only signatures; these hashes are of a dry run, never
+of a release):
+
+```text
+8498348  94377543dd85fa24bfc14b4fb04a4a4db01a973829cc3748916dac372c3c2c17  robodr_0.1.0~rc.0-dryrun-1_amd64.deb
+6442828  d298c6cf1e72b1ca85f703eb7a7fc47dd48a42539012521b94cd242a23b4458b  robodr_0.1.0~rc.0-dryrun-1_arm64.deb
+6338068  bafce6961973010c0977ebd2a85066dd4c29f717a66e4f1533836521d109f01d  robodr-focal_0.1.0~rc.0-dryrun-1_amd64.deb
+4359708  cef244f22cfbd38246b0902af69c15498d72017cdb68cb7c61f4cec91d26e1c8  robodr-focal_0.1.0~rc.0-dryrun-1_arm64.deb
+8797258  e7d9a3a2fa7b37c1bbdf7ead1261dbbb76ec9a3894e125a555f94b5a22fcf894  robodr-0.1.0-rc.0-dryrun-amd64-offline.tar.gz
+6738175  4c505c3156db1ae170e03a08c27a2dfebb259837536fe79d04179e4469cd9d00  robodr-0.1.0-rc.0-dryrun-arm64-offline.tar.gz
+6637206  bca429a243aa4ac478e29d2c81ba708637a7d681b13bd9a95d1b5949638700ba  robodr-focal-0.1.0-rc.0-dryrun-amd64-offline.tar.gz
+4658985  6b709ec98404abffeac49ad5132bc9032fa7b3b1d1110922eb5a8ce352e55ea8  robodr-focal-0.1.0-rc.0-dryrun-arm64-offline.tar.gz
+ 186469  4a989bdbdb77a3d512d86862ce0bbfa9378f44eb3be1263015be9dc510155e4b  robodr-0.1.0-rc.0-dryrun-amd64-sbom.tar.gz
+ 182493  8e81507ce1dee065ad6e22310d64275a964bbf4c77509bd55f3d7cd1e1c46d2d  robodr-0.1.0-rc.0-dryrun-arm64-sbom.tar.gz
+```
+
+Not covered by the dry run: see [docs/RELEASE.md](RELEASE.md), "What only
+a real CI run can prove". Commits after `04663a0` (the executor/firewall-gw
+merge `6dc3613` and later) were not re-run; they change no packaging
+script, unit or workflow.
+
 ## Verification status
 
 Be precise about what has and has not been exercised. Last updated with the CI
@@ -734,7 +812,9 @@ cargo-cyclonedx / cargo-deny / shellcheck installed):
   the case). The Pulsar-bound crates were not checked at all.
 - The air-gapped procedures (mirror, vendored tarball, offline toolchain,
   advisory-DB snapshot) are documented, not yet rehearsed in the lab.
-- Release signing (minisign in `release.yml`'s `publish` job) is written but
-  has never run: no signing key is provisioned and no release was cut.
+- Release signing (minisign in `release.yml`'s `publish` job) has never run
+  on GitHub: no signing key is provisioned and no release was cut. The whole
+  workflow passed a local dry run with a throwaway key on 2026-10-26
+  ([Release dry run](#release-dry-run-2026-10-26)).
   Reproducibility of the Pulsar-bound binary (eBPF objects from clang) is not
   checked.
