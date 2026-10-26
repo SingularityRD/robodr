@@ -187,3 +187,245 @@ fn s_dropped(s: &Setup) -> u64 {
         .as_u64()
         .unwrap_or(0)
 }
+
+// --- Review of the F1 fix (wt/redfix, H3, H4, L9, L10) ----------------------
+// The reviewer's proofs of concept through the real daemon.
+
+use std::time::Duration;
+
+use common::pcap::{datagram, spdp_sub, LEGIT, LEGIT_HEX, ROGUE_HEX};
+
+fn run_frames(
+    tag: &str,
+    frames: &[Vec<u8>],
+    max_files: u64,
+    sensor_extra: serde_json::Value,
+) -> (Setup, String) {
+    let s = setup(tag, &robot_profile(true));
+    let pcap = s.pcap_spaced(frames, Duration::from_millis(2));
+    let mut sensor = serde_json::json!({"capture": {"enabled": true, "pcap_replay": pcap}});
+    if let (Some(a), serde_json::Value::Object(b)) = (sensor.as_object_mut(), sensor_extra) {
+        a.extend(b);
+    }
+    let mut cfg = s.config(
+        sensor,
+        serde_json::json!([]),
+        serde_json::json!({"exit_when_inputs_end": true}),
+    );
+    cfg["spool"]["max_files"] = serde_json::json!(max_files);
+    let mut log = Vec::new();
+    robodr_agentd::run(&s.resolve(&cfg), &|| false, &mut log).unwrap();
+    (s, String::from_utf8(log).unwrap())
+}
+
+fn json_of(e: &robodr_ocsf::FindingEnvelope) -> String {
+    serde_json::to_string(e).unwrap()
+}
+
+fn spdp_at(src: Ipv4Addr, prefix: [u8; 12]) -> Vec<u8> {
+    frame(
+        src,
+        SPDP_GROUP,
+        7400,
+        &datagram(prefix, &[spdp_sub(prefix, &[src])]),
+    )
+}
+
+/// H3: the GUID spray with one `rt/cmd_vel` writer per sprayed prefix made
+/// one Critical `unauthorized_motion_writer` per GUID, never folded: the
+/// Critical spool share filled and the genuine rogue's Critical finding
+/// (from another address) was dropped. (PoC: 600 prefixes, max_files 400.)
+#[test]
+fn review_h3_a_critical_spray_is_aggregated_and_a_later_rogue_is_spooled() {
+    let mut frames = Vec::new();
+    for i in 0..600 {
+        let g = spray_prefix(i);
+        frames.push(spdp_at(SPRAY_IP, g));
+        frames.push(frame(
+            SPRAY_IP,
+            ROBOT_IP,
+            7410,
+            &sedp_datagram(g, "rt/cmd_vel", TWIST),
+        ));
+    }
+    frames.push(spdp_at(ROGUE_IP, ROGUE));
+    frames.push(frame(
+        ROGUE_IP,
+        ROBOT_IP,
+        7410,
+        &sedp_datagram(ROGUE, "rt/cmd_vel", TWIST),
+    ));
+    let (s, log) = run_frames("rv-h3", &frames, 400, serde_json::json!({}));
+    let found = spooled(&s.spool);
+    let r = rules(&found);
+    let rogue_crit = found.iter().any(|(_, e)| {
+        e.entity_context.rule_id == "robot.ros2.unauthorized_motion_writer"
+            && json_of(e).contains(&ROGUE_IP.to_string())
+    });
+    assert!(
+        rogue_crit,
+        "the genuine rogue's Critical finding: {r:?}\n{log}"
+    );
+    let crit_individual = found
+        .iter()
+        .filter(|(_, e)| e.entity_context.rule_id == "robot.ros2.unauthorized_motion_writer")
+        .count();
+    assert!(
+        crit_individual <= 9,
+        "{crit_individual} motion-writer findings one by one: {r:?}"
+    );
+    assert!(found.len() <= 60, "{} spool records: {r:?}", found.len());
+    let crit_agg = found.iter().any(|(_, e)| {
+        e.entity_context.rule_id == "robot.ros2.discovery_flood" && e.severity == Severity::Critical
+    });
+    assert!(crit_agg, "a Critical aggregate: {r:?}");
+    assert_eq!(s_dropped(&s), 0, "{r:?}");
+    // Each sprayed motion writer is still in the black box.
+    assert!(recorded(&s, "robot.ros2.unauthorized_motion_writer") >= 600);
+}
+
+/// H4: about 40 packets a minute from a dozen addresses used up the global
+/// per-window budget; every later discovery finding robot-wide was folded
+/// into a sourceless "many sources" aggregate that named neither a later
+/// genuine rogue's address nor its GUID. A pinned participant's
+/// impersonation from a flooding source was folded too, and the aggregate
+/// said "from more than 32 source addresses" for 12.
+#[test]
+fn review_h4_a_low_rate_spray_does_not_hide_a_genuine_rogue_or_an_impersonation() {
+    let mut frames = Vec::new();
+    let mut n = 0usize;
+    for src in 0..4u8 {
+        for _ in 0..8 {
+            frames.push(spdp_at(Ipv4Addr::new(10, 1, 0, src), spray_prefix(n)));
+            n += 1;
+        }
+    }
+    for src in 0..8u8 {
+        frames.push(spdp_at(Ipv4Addr::new(10, 2, 0, src), spray_prefix(n)));
+        n += 1;
+    }
+    for _ in 0..4 {
+        frames.push(spdp_at(Ipv4Addr::new(10, 1, 0, 0), spray_prefix(n)));
+        n += 1;
+    }
+    frames.push(spdp_at(ROGUE_IP, ROGUE));
+    // The pinned robot participant's prefix announced from a source that
+    // passed its own threshold.
+    frames.push(spdp_at(Ipv4Addr::new(10, 1, 0, 0), LEGIT));
+    let pins =
+        serde_json::json!({"binding": {"participant_ips": {LEGIT_HEX: [ROBOT_IP.to_string()]}}});
+    let (s, log) = run_frames("rv-h4", &frames, 1000, pins);
+    let found = spooled(&s.spool);
+    let r = rules(&found);
+    let names_rogue = found.iter().any(|(_, e)| {
+        let j = json_of(e);
+        j.contains(&ROGUE_IP.to_string()) || j.contains(ROGUE_HEX)
+    });
+    assert!(
+        names_rogue,
+        "no spooled finding names the rogue: {r:?}\n{log}"
+    );
+    let impersonation = found.iter().any(|(_, e)| {
+        e.entity_context.rule_id == "robot.ros2.participant_source_mismatch"
+            && json_of(e).contains(LEGIT_HEX)
+    });
+    assert!(impersonation, "the pinned prefix's impersonation: {r:?}");
+    for (_, e) in &found {
+        let d = &e.entity_context.detail.value;
+        assert!(!d.contains("more than 32 source addresses"), "{d}");
+    }
+}
+
+/// L9: the aggregate's sample GUID prefixes were parsed from the detail
+/// text, where an attacker-chosen topic name comes first: a topic of 24 hex
+/// digits (here the robot participant's own prefix) became a sample the
+/// SOC might copy into a quarantine. Nine SEDP-only announcements from one
+/// address: eight pass, the rest (and every "never announced" finding at
+/// the end of the replay) are folded.
+#[test]
+fn review_l9_a_topic_name_never_becomes_a_sample_guid() {
+    let mut frames = Vec::new();
+    let forged = format!("rt/{LEGIT_HEX}");
+    for i in 0..9 {
+        frames.push(frame(
+            SPRAY_IP,
+            ROBOT_IP,
+            7410,
+            &sedp_datagram(spray_prefix(i), &forged, TWIST),
+        ));
+    }
+    let (s, log) = run_frames("rv-l9", &frames, 1000, serde_json::json!({}));
+    let found = spooled(&s.spool);
+    let agg: Vec<_> = found
+        .iter()
+        .filter(|(_, e)| e.entity_context.rule_id == "robot.ros2.discovery_flood")
+        .collect();
+    assert!(!agg.is_empty(), "{:?}\n{log}", rules(&found));
+    for (_, e) in &agg {
+        let d = &e.entity_context.detail.value;
+        let samples = d.split("sample GUID prefixes:").nth(1).unwrap_or("");
+        assert!(!samples.contains(LEGIT_HEX), "forged sample: {d}");
+        assert!(d.contains("black box"), "detail not truncated: {d}");
+    }
+    // The samples are the sprayed prefixes themselves.
+    let last = &agg.last().unwrap().1.entity_context.detail.value;
+    let samples = last.split("sample GUID prefixes:").nth(1).unwrap_or("");
+    assert!(
+        last.contains("endpoint_unannounced_participant") && samples.contains("d1d1d1d1d1d1d1d1"),
+        "the real prefixes are named: {last}"
+    );
+}
+
+/// L10: every flood from one address had the same finding id forever, so a
+/// later flood updated a SOC case that may have been closed long ago.
+#[test]
+fn review_l10_each_flood_episode_is_its_own_finding() {
+    let s = setup("rv-l10", &robot_profile(true));
+    let mut frames = Vec::new();
+    for i in 0..20 {
+        frames.push((
+            Duration::from_millis(10 * i as u64),
+            spdp_at(SPRAY_IP, spray_prefix(i)),
+        ));
+    }
+    for i in 20..40 {
+        frames.push((
+            Duration::from_secs(600) + Duration::from_millis(10 * i as u64),
+            spdp_at(SPRAY_IP, spray_prefix(i)),
+        ));
+    }
+    let pcap = s.pcap_timed(&frames);
+    let cfg = s.config(
+        serde_json::json!({"capture": {"enabled": true, "pcap_replay": pcap}}),
+        serde_json::json!([]),
+        serde_json::json!({"exit_when_inputs_end": true}),
+    );
+    let mut log = Vec::new();
+    robodr_agentd::run(&s.resolve(&cfg), &|| false, &mut log).unwrap();
+    let found = spooled(&s.spool);
+    let ids: std::collections::BTreeSet<String> = found
+        .iter()
+        .filter(|(_, e)| e.entity_context.rule_id == "robot.ros2.discovery_flood")
+        .map(|(_, e)| e.finding_id.clone())
+        .collect();
+    assert_eq!(ids.len(), 2, "one finding per flood episode: {ids:?}");
+}
+
+/// L10: a spool too small for a Critical reserve (`max_files / 8 == 0`) is
+/// refused rather than run without one.
+#[test]
+fn review_l10_a_spool_without_a_critical_reserve_is_refused() {
+    let s = setup("rv-l10-spool", &robot_profile(true));
+    let pcap = s.pcap(&[spdp_at(SPRAY_IP, spray_prefix(0))]);
+    let mut cfg = s.config(
+        serde_json::json!({"capture": {"enabled": true, "pcap_replay": pcap}}),
+        serde_json::json!([]),
+        serde_json::json!({}),
+    );
+    cfg["spool"]["max_files"] = serde_json::json!(4);
+    let err = match robodr_agentd::load(&s.write_config(&cfg)) {
+        Ok(_) => panic!("a spool of 4 files was accepted"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("spool.max_files"), "{err}");
+}

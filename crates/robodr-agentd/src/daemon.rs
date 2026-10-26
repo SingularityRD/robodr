@@ -1500,11 +1500,20 @@ impl<'a> Daemon<'a> {
         for f in found {
             let ns = self.signal_ns();
             let wall_ms = self.clock.now().wall_ns / 1_000_000;
-            match self.flood.admit(&f.deviation, &f.src_ip, ns, wall_ms) {
+            let protected = f
+                .participant
+                .is_some_and(|p| self.pipeline.binding().is_protected(&p));
+            let item = crate::flood::Item {
+                deviation: &f.deviation,
+                src_ip: &f.src_ip,
+                participant: f.participant.as_ref(),
+                protected,
+            };
+            match self.flood.admit(item, ns, wall_ms) {
                 crate::flood::Admit::Pass => {}
-                crate::flood::Admit::Fold(report) => {
+                crate::flood::Admit::Fold(reports) => {
                     self.fold(&f);
-                    if let Some(r) = report {
+                    for r in reports {
                         self.flood_report(r);
                     }
                     continue;
@@ -1555,8 +1564,11 @@ impl<'a> Daemon<'a> {
             Some(ip) => format!("src:{ip}"),
             None => "flood:many_sources".to_string(),
         };
+        // One finding id per flood episode (review L10): the subject is
+        // the source plus the episode's synthetic node name.
         let subject = Subject {
             src_ip: r.src_ip.clone(),
+            node: Some(r.episode.clone()),
             ..Subject::default()
         };
         let o = self.agent.handle_external(
@@ -1678,7 +1690,7 @@ impl<'a> Daemon<'a> {
             SpoolClass::Normal
         };
         match &o.finding {
-            Some(f) => match self.spool.write(f, class) {
+            Some(f) => match self.spool.write(f, class, &o.source) {
                 Ok(_) => self.stats.findings_spooled += 1,
                 Err(SpoolError::Full) => {}
                 Err(e) => {

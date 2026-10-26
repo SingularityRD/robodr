@@ -37,10 +37,15 @@
 //! [`CRITICAL_RESERVE_DIVISOR`] (7/8 of each bound: 56 MiB / 8750 files by
 //! default); the last eighth is kept for Critical findings, which may use
 //! the whole bound; health findings keep their own reserve beyond it.
-//! Within the Critical share it is still first come, first served: a
-//! flood of Critical findings can fill it, and what does not fit is in the
-//! black box only (as always). The discovery-flood aggregation in agentd
-//! (`crate::flood`) keeps a GUID spray from filling even the lesser share.
+//! Within the Critical share, one source (the finding's `src:<ip>`, or its
+//! other source key) may hold at most 1/[`RESERVE_SOURCES`] of it (at least
+//! one record) until the spool drains below the lesser share again (review
+//! H3): a flood of Critical findings from one address cannot take the
+//! share a later genuine rogue's Critical finding needs; what does not fit
+//! is in the black box only (as always). The reserve is at least one
+//! record (agentd refuses `max_files` below 8). The discovery-flood
+//! aggregation in agentd (`crate::flood`) keeps a GUID spray, Critical
+//! findings included, from filling either share.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -58,6 +63,9 @@ pub const RESERVE_BYTES: u64 = 256 * 1024;
 /// `1 / CRITICAL_RESERVE_DIVISOR` of each bound is kept for Critical
 /// findings (module docs).
 pub const CRITICAL_RESERVE_DIVISOR: u64 = 8;
+/// One source may hold at most `1 / RESERVE_SOURCES` of the Critical
+/// share (at least one record).
+pub const RESERVE_SOURCES: u64 = 4;
 
 /// Which share of the spool a record may use (module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +112,9 @@ pub struct SpoolStats {
     pub ready_bytes: u64,
     pub acked_files: u64,
     pub acked_bytes: u64,
+    /// Critical records not written because their source already holds its
+    /// part of the Critical share (also counted in `dropped_full`).
+    pub dropped_reserve_cap: u64,
 }
 
 /// Why a record was not spooled.
@@ -134,6 +145,9 @@ pub struct Spool {
     next_seq: u64,
     last_scan: Option<Instant>,
     stats: SpoolStats,
+    /// Critical records per source written into the Critical share since
+    /// the spool was last below the lesser share (module docs).
+    reserve_use: std::collections::HashMap<String, u64>,
 }
 
 fn is_record_name(name: &str) -> Option<u64> {
@@ -210,6 +224,7 @@ impl Spool {
             next_seq: 1,
             last_scan: None,
             stats: SpoolStats::default(),
+            reserve_use: std::collections::HashMap::new(),
         };
         let r = list(&s.ready)?;
         let a = list(&s.acked)?;
@@ -300,8 +315,8 @@ impl Spool {
     fn limits(&self, class: SpoolClass) -> (u64, u64) {
         match class {
             SpoolClass::Normal => (
-                self.max_files - self.max_files / CRITICAL_RESERVE_DIVISOR,
-                self.max_bytes - self.max_bytes / CRITICAL_RESERVE_DIVISOR,
+                self.max_files - self.reserve_files(),
+                self.max_bytes - (self.max_bytes / CRITICAL_RESERVE_DIVISOR).max(1),
             ),
             SpoolClass::Critical => (self.max_files, self.max_bytes),
             SpoolClass::Health => (
@@ -311,9 +326,23 @@ impl Spool {
         }
     }
 
+    /// Files kept for Critical findings: an eighth, at least one (when the
+    /// spool holds two or more).
+    fn reserve_files(&self) -> u64 {
+        (self.max_files / CRITICAL_RESERVE_DIVISOR)
+            .max(1)
+            .min(self.max_files.saturating_sub(1))
+    }
+
     /// Spool one finding within the share of its `class` (see the module
-    /// docs).
-    pub fn write(&mut self, f: &FindingOutput, class: SpoolClass) -> Result<PathBuf, SpoolError> {
+    /// docs). `source`: who it is about (agentd's source key, e.g.
+    /// `src:<ip>`), for the per-source part of the Critical share.
+    pub fn write(
+        &mut self,
+        f: &FindingOutput,
+        class: SpoolClass,
+        source: &str,
+    ) -> Result<PathBuf, SpoolError> {
         let seq = self.next_seq;
         let rec = SpoolRecord {
             schema: SPOOL_SCHEMA.into(),
@@ -348,6 +377,19 @@ impl Spool {
                 return Err(SpoolError::Full);
             }
         }
+        // Review H3: within the Critical share, a per-source cap.
+        let (n_files, n_bytes) = self.limits(SpoolClass::Normal);
+        let in_reserve = self.used_files() + 1 > n_files || self.used_bytes() + len > n_bytes;
+        if !in_reserve {
+            self.reserve_use.clear();
+        } else if class == SpoolClass::Critical {
+            let cap = (self.reserve_files() / RESERVE_SOURCES).max(1);
+            if self.reserve_use.get(source).copied().unwrap_or(0) >= cap {
+                self.stats.dropped_full += 1;
+                self.stats.dropped_reserve_cap += 1;
+                return Err(SpoolError::Full);
+            }
+        }
         let name = format!("{seq:020}.json");
         match atomic_write(&self.tmp, &self.ready, &name, &bytes) {
             Ok(()) => {
@@ -355,6 +397,9 @@ impl Spool {
                 self.stats.written += 1;
                 self.stats.ready_files += 1;
                 self.stats.ready_bytes += len;
+                if in_reserve && class == SpoolClass::Critical {
+                    *self.reserve_use.entry(source.to_owned()).or_insert(0) += 1;
+                }
                 Ok(self.ready.join(name))
             }
             Err(e) => {
@@ -401,13 +446,13 @@ mod tests {
     fn writes_atomically_and_numbers_across_reopen() {
         let d = tmp("reopen");
         let mut s = Spool::open(&d, 1 << 20, 100).unwrap();
-        let p = s.write(&rec(3), SpoolClass::Normal).unwrap();
+        let p = s.write(&rec(3), SpoolClass::Normal, "t").unwrap();
         assert!(p.ends_with("ready/00000000000000000001.json"));
         let r: SpoolRecord = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
         assert_eq!(r.seq, 1);
         assert_eq!(r.value, rec(3).value);
         assert_eq!(r.schema, SPOOL_SCHEMA);
-        s.write(&rec(3), SpoolClass::Normal).unwrap();
+        s.write(&rec(3), SpoolClass::Normal, "t").unwrap();
         ack_all(&s);
         // Junk in the dirs is ignored; a leftover tmp file is removed.
         fs::write(d.join("ready/notes.txt"), b"x").unwrap();
@@ -415,7 +460,7 @@ mod tests {
         drop(s);
         let mut s = Spool::open(&d, 1 << 20, 100).unwrap();
         assert_eq!(fs::read_dir(d.join("tmp")).unwrap().count(), 0);
-        let p = s.write(&rec(1), SpoolClass::Normal).unwrap();
+        let p = s.write(&rec(1), SpoolClass::Normal, "t").unwrap();
         assert!(p.ends_with("ready/00000000000000000003.json"));
         assert_eq!(s.stats().acked_files, 2);
         assert_eq!(s.stats().ready_files, 1);
@@ -426,23 +471,26 @@ mod tests {
     fn full_spool_prunes_acked_oldest_first_never_ready() {
         let d = tmp("full");
         let mut s = Spool::open(&d, 1 << 20, 3).unwrap();
+        // Critical records may use the whole bound (one source each: the
+        // per-source part of the Critical share is one file here).
         for i in 0..3 {
-            s.write(&rec(i), SpoolClass::Normal).unwrap();
+            s.write(&rec(i), SpoolClass::Critical, &format!("s{i}"))
+                .unwrap();
         }
         // Nothing acked: the 4th is dropped, ready/ untouched.
         assert!(matches!(
-            s.write(&rec(9), SpoolClass::Normal),
+            s.write(&rec(9), SpoolClass::Critical, "s9"),
             Err(SpoolError::Full)
         ));
         assert_eq!(s.stats().dropped_full, 1);
         assert_eq!(list(s.ready_dir()).unwrap().len(), 3);
         // A health finding may use the reserve.
-        s.write(&rec(9), SpoolClass::Health).unwrap();
+        s.write(&rec(9), SpoolClass::Health, "t").unwrap();
         assert_eq!(list(s.ready_dir()).unwrap().len(), 4);
         // Ack everything: the oldest acked files make room.
         ack_all(&s);
         std::thread::sleep(RESCAN_INTERVAL);
-        s.write(&rec(1), SpoolClass::Normal).unwrap();
+        s.write(&rec(1), SpoolClass::Critical, "u").unwrap();
         let acked: Vec<u64> = list(s.acked_dir()).unwrap().iter().map(|x| x.0).collect();
         assert_eq!(acked, vec![3, 4], "oldest acked pruned first");
         assert_eq!(s.stats().pruned, 2);
@@ -456,29 +504,66 @@ mod tests {
         let mut s = Spool::open(&d, 1 << 20, 16).unwrap();
         // A flood of non-Critical records stops at 7/8 of the files...
         let mut n = 0;
-        while s.write(&rec(1), SpoolClass::Normal).is_ok() {
+        while s.write(&rec(1), SpoolClass::Normal, "t").is_ok() {
             n += 1;
             assert!(n <= 16);
         }
         assert_eq!(n, 14, "16 - 16 / 8");
         assert_eq!(s.stats().dropped_full, 1);
-        // ...so Critical findings still fit, up to the full bound.
-        s.write(&rec(2), SpoolClass::Critical).unwrap();
-        s.write(&rec(2), SpoolClass::Critical).unwrap();
+        // ...so Critical findings still fit, up to the full bound (one per
+        // source here: the share is 2 files, a source may hold a quarter,
+        // at least one).
+        s.write(&rec(2), SpoolClass::Critical, "src:a").unwrap();
         assert!(matches!(
-            s.write(&rec(2), SpoolClass::Critical),
+            s.write(&rec(2), SpoolClass::Critical, "src:a"),
+            Err(SpoolError::Full)
+        ));
+        assert_eq!(s.stats().dropped_reserve_cap, 1);
+        s.write(&rec(2), SpoolClass::Critical, "src:b").unwrap();
+        assert!(matches!(
+            s.write(&rec(2), SpoolClass::Critical, "src:c"),
             Err(SpoolError::Full)
         ));
         // A health finding still has its own reserve beyond that.
-        s.write(&rec(3), SpoolClass::Health).unwrap();
+        s.write(&rec(3), SpoolClass::Health, "t").unwrap();
         assert_eq!(list(s.ready_dir()).unwrap().len(), 17);
         // Once the exporter acks, a lesser record prunes acked ones until
         // it fits its own share (the Critical share stays free).
         ack_all(&s);
         std::thread::sleep(RESCAN_INTERVAL);
-        s.write(&rec(1), SpoolClass::Normal).unwrap();
+        s.write(&rec(1), SpoolClass::Normal, "t").unwrap();
         assert!(s.stats().acked_files + s.stats().ready_files <= 14);
         let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Review H3: one source flooding Critical findings cannot take the
+    /// whole Critical share; a later source's Critical finding still fits.
+    #[test]
+    fn one_source_cannot_starve_the_critical_share() {
+        let d = tmp("crit-per-source");
+        let mut s = Spool::open(&d, 1 << 22, 400).unwrap();
+        let mut n = 0;
+        while s.write(&rec(1), SpoolClass::Normal, "src:x").is_ok() {
+            n += 1;
+        }
+        assert_eq!(n, 350, "400 - 400 / 8");
+        let mut crit = 0;
+        while s
+            .write(&rec(2), SpoolClass::Critical, "src:sprayer")
+            .is_ok()
+        {
+            crit += 1;
+        }
+        assert_eq!(crit, 12, "a quarter of the 50-file share");
+        s.write(&rec(2), SpoolClass::Critical, "src:rogue").unwrap();
+        // A spool too small for an eighth still keeps one file.
+        let d2 = tmp("crit-tiny");
+        let mut t = Spool::open(&d2, 1 << 20, 2).unwrap();
+        t.write(&rec(1), SpoolClass::Normal, "a").unwrap();
+        assert!(t.write(&rec(1), SpoolClass::Normal, "a").is_err());
+        t.write(&rec(2), SpoolClass::Critical, "a").unwrap();
+        let _ = fs::remove_dir_all(&d);
+        let _ = fs::remove_dir_all(&d2);
     }
 
     #[test]
@@ -486,7 +571,7 @@ mod tests {
         let d = tmp("bytes");
         let mut s = Spool::open(&d, 2_000, 1000).unwrap();
         let mut n = 0;
-        while s.write(&rec(200), SpoolClass::Critical).is_ok() {
+        while s.write(&rec(200), SpoolClass::Critical, "t").is_ok() {
             n += 1;
             assert!(n < 100);
         }

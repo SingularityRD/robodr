@@ -1007,8 +1007,14 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
     if config.spool.max_bytes < 64 * 1024 {
         return Err("spool.max_bytes must be >= 65536".into());
     }
-    if config.spool.max_files == 0 {
-        return Err("spool.max_files must be >= 1".into());
+    // Review L10: a spool below 8 files would have no share kept for
+    // Critical findings (max_files / 8 == 0).
+    if config.spool.max_files < crate::spool::CRITICAL_RESERVE_DIVISOR {
+        return Err(format!(
+            "spool.max_files must be >= {} (1/{} of it is kept for Critical findings)",
+            crate::spool::CRITICAL_RESERVE_DIVISOR,
+            crate::spool::CRITICAL_RESERVE_DIVISOR
+        ));
     }
     check_daemon_dirs(&config, None, |p| Ok(resolve_path(p)))?;
     validate_daemon(&config.daemon)?;
