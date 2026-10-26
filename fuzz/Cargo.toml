@@ -20,15 +20,21 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 serde_json = "1"
 robodr-agent = { path = "../crates/robodr-agent" }
+robodr-agentd = { path = "../crates/robodr-agentd" }
 robodr-blackbox = { path = "../crates/robodr-blackbox" }
 robodr-capture = { path = "../crates/robodr-capture" }
 robodr-cdr = { path = "../crates/robodr-cdr" }
 robodr-commission = { path = "../crates/robodr-commission" }
+robodr-correlate = { path = "../crates/robodr-correlate" }
+robodr-diode = { path = "../crates/robodr-diode" }
 robodr-events = { path = "../crates/robodr-events" }
+robodr-export = { path = "../crates/robodr-export" }
 robodr-firewall = { path = "../crates/robodr-firewall" }
 robodr-ocsf = { path = "../crates/robodr-ocsf" }
 robodr-ros2-pipeline = { path = "../crates/robodr-ros2-pipeline" }
 robodr-rtps = { path = "../crates/robodr-rtps" }
+# Test oracle of the diode_fec target (never shipped; see crates/robodr-diode/src/fec.rs).
+reed-solomon = "0.2.1"
 
 [[bin]]
 name = "parse_datagram"
@@ -110,6 +116,55 @@ bench = false
 [[bin]]
 name = "pipeline_config"
 path = "fuzz_targets/pipeline_config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "diode_manifest"
+path = "fuzz_targets/diode_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "diode_import"
+path = "fuzz_targets/diode_import.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "diode_fec"
+path = "fuzz_targets/diode_fec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "correlate_rules"
+path = "fuzz_targets/correlate_rules.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "safety_feed"
+path = "fuzz_targets/safety_feed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kafka_wire"
+path = "fuzz_targets/kafka_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cdr_payload"
+path = "fuzz_targets/cdr_payload.rs"
 test = false
 doc = false
 bench = false

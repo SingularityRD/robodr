@@ -12,6 +12,8 @@
 #[path = "common/mod.rs"]
 mod common;
 
+#[path = "../../../fuzz/harness/cdr_payload.rs"]
+mod cdr_payload;
 #[path = "../../../fuzz/harness/cdr_unitree.rs"]
 mod cdr_unitree;
 #[path = "../../../fuzz/harness/smoke.rs"]
@@ -20,7 +22,7 @@ mod smoke;
 use std::path::PathBuf;
 
 use common::Enc;
-use robodr_cdr::Representation;
+use robodr_cdr::{decode_payload, decode_std, Limits, MessageKind, Representation, StdKind};
 
 /// One valid payload of each kind, with its harness selector byte and a
 /// file name. The selector only steers the legacy branch; the DDS / JSON
@@ -105,6 +107,140 @@ fn regenerate_seeds() {
     let dir = corpus_dir();
     std::fs::create_dir_all(&dir).unwrap();
     for (name, data) in seeds() {
+        std::fs::write(dir.join(name), &data).unwrap();
+    }
+}
+
+/// `cdr_payload` seeds: one valid payload of each standard ROS 2 kind and
+/// of the three `std_msgs` kinds, in several representations, with the
+/// harness's limits selector byte; `(name, input, expected kind)`.
+#[allow(clippy::type_complexity)]
+fn payload_seeds() -> Vec<(String, Vec<u8>, Result<MessageKind, StdKind>)> {
+    let mut out = Vec::new();
+    for (tag, rep, sel) in [
+        // Selector: 3 = TopLevelOnly nesting (irrelevant for plain CDR),
+        // 2 = generous caps, 0 = sensor defaults (the encoder writes a
+        // DHEADER on every struct, i.e. AllStructs).
+        ("le", Representation::CdrLe, 3u8),
+        ("be", Representation::CdrBe, 2),
+        ("dcdr2", Representation::DCdr2Le, 0),
+    ] {
+        let mut tw = Enc::new(rep);
+        tw.twist([0.4, 0.0, 0.0], [0.0, 0.0, -0.3]);
+        let mut ts = Enc::new(rep);
+        ts.twist_stamped(1, 2, b"base_link", [0.1, 0.2, 0.0], [0.0, 0.0, 0.5]);
+        let odom = common::odometry(
+            rep,
+            &common::OdomSpec {
+                frame: b"odom",
+                child: b"base_link",
+                position: [1.0, 2.0, 0.0],
+                orientation: [0.0, 0.0, 0.0, 1.0],
+                pose_cov: [0.0; 36],
+                lin: [0.5, 0.0, 0.0],
+                ang: [0.0, 0.0, 0.1],
+                twist_cov: [0.0; 36],
+            },
+        );
+        let imu = common::imu(rep, b"imu", [0.0, 0.0, 0.2]);
+        let js = common::joint_state(rep, &[b"j1", b"j2"], &[0.1, 0.2], &[1.0, -1.0], &[]);
+        let jt = common::joint_trajectory(
+            rep,
+            &[b"j1"],
+            &[common::PointSpec {
+                positions: &[0.5],
+                velocities: &[0.1],
+                accelerations: &[],
+                effort: &[],
+                sec: 1,
+                nanosec: 0,
+            }],
+        );
+        for (name, payload, kind) in [
+            ("twist", tw.finish(), MessageKind::Twist),
+            ("twist-stamped", ts.finish(), MessageKind::TwistStamped),
+            ("odometry", odom, MessageKind::Odometry),
+            ("imu", imu, MessageKind::Imu),
+            ("joint-state", js, MessageKind::JointState),
+            ("joint-trajectory", jt, MessageKind::JointTrajectory),
+        ] {
+            out.push((
+                format!("seed-{name}-{tag}.bin"),
+                with_sel(sel, payload),
+                Ok(kind),
+            ));
+        }
+    }
+    let std_seeds: [(&str, Vec<u8>, StdKind); 3] = [
+        ("bool", vec![0, 1, 0, 0, 1, 0, 0, 0], StdKind::Bool),
+        ("uint8", vec![0, 1, 0, 0, 7, 0, 0, 0], StdKind::UInt8),
+        (
+            "string",
+            vec![0, 1, 0, 0, 5, 0, 0, 0, b'A', b'U', b'T', b'O', 0, 0, 0, 0],
+            StdKind::String,
+        ),
+    ];
+    for (name, payload, kind) in std_seeds {
+        out.push((
+            format!("seed-std-{name}.bin"),
+            with_sel(0, payload),
+            Err(kind),
+        ));
+    }
+    out
+}
+
+fn limits_for(sel: u8) -> Limits {
+    // Mirrors the harness's selector for the seeds used here (0, 2, 3).
+    match sel % 4 {
+        3 => Limits {
+            d_cdr2_nesting: robodr_cdr::DelimitedNesting::TopLevelOnly,
+            ..Limits::default()
+        },
+        _ => Limits::default(),
+    }
+}
+
+#[test]
+fn payload_seeds_decode_as_their_kind() {
+    let committed = smoke::corpus(env!("CARGO_MANIFEST_DIR"), "cdr_payload");
+    let generated = payload_seeds();
+    assert_eq!(
+        committed.len(),
+        generated.len(),
+        "run regenerate_payload_seeds"
+    );
+    for (name, data, kind) in generated {
+        assert!(committed.contains(&data), "{name} differs from fuzz/corpus");
+        let limits = limits_for(data[0]);
+        match kind {
+            Ok(k) => {
+                let d = decode_payload(k, &data[1..], &limits)
+                    .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+                assert!(d.anomalies().is_empty(), "{name}");
+            }
+            Err(k) => {
+                decode_std(k, &data[1..], &limits).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            }
+        }
+        cdr_payload::run(&data);
+    }
+}
+
+#[test]
+fn cdr_payload_smoke() {
+    let seeds = smoke::corpus(env!("CARGO_MANIFEST_DIR"), "cdr_payload");
+    smoke::run("cdr_payload", &seeds, 0xc0de_0002, &cdr_payload::run);
+}
+
+/// Regenerates the `cdr_payload` seed corpus. Run with
+/// `cargo test -p robodr-cdr --test fuzz_smoke -- --ignored regenerate_payload_seeds`.
+#[test]
+#[ignore = "writes into fuzz/corpus; run manually to refresh seeds"]
+fn regenerate_payload_seeds() {
+    let dir = smoke::corpus_dir(env!("CARGO_MANIFEST_DIR"), "cdr_payload");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, data, _) in payload_seeds() {
         std::fs::write(dir.join(name), &data).unwrap();
     }
 }
