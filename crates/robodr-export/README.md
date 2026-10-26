@@ -95,8 +95,14 @@ robodr-kafka-publish --bootstrap kafka-1:9092 [--bootstrap kafka-2:9092] \
 * **Validation.** The value is re-validated (`parse_and_validate`); key and
   headers must equal what `robodr_ocsf::record` derives from the value
   (contract §2: the value is authoritative), and so must the record's
-  `topic` (the value's `ocsf.metadata.log_name`). Contract 1.x values are
-  refused (parse-only). Records go to the configured `--topic` (default
+  `topic` (the value's `ocsf.metadata.log_name`). An unsigned contract 1.x
+  value (written before an upgrade) is upgraded to contract 2.0
+  (`robodr_ocsf::upgrade_legacy`: same identity, `data_source`
+  `--upgrade-data-source`, the publisher's topic) and sent as the upgraded
+  value with headers derived from it (`legacy_upgraded`); a signed 1.x value
+  is dead-lettered with the reason `legacy 1.x signed record: re-sign
+  required`. The spool exporter does the same on the robot side (signed 1.x
+  records go to `rejected/` with that reason). Records go to the configured `--topic` (default
   `robodr.findings`) whatever topic their producer named; those are counted
   in `topic_overridden`. The **bytes on disk** are what is sent as the
   value.

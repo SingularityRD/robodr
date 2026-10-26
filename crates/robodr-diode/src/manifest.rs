@@ -232,14 +232,34 @@ pub fn is_supported_contract_version(v: &str) -> bool {
     robodr_ocsf::validate::is_emittable_contract_version(v)
 }
 
+/// A contract 1.x version: batches a 1.x packer published before the
+/// upgrade. The importer still takes them (it authenticates and chains
+/// them like any batch and upgrades their findings to contract 2.0, see
+/// `crate::unpack`); the packer never writes one.
+pub fn is_legacy_contract_version(v: &str) -> bool {
+    robodr_ocsf::upgrade::is_legacy_version(v)
+}
+
 impl Manifest {
-    /// Structural checks that need nothing but the manifest itself.
-    /// Returns a human-readable reason on failure.
+    /// Structural checks that need nothing but the manifest itself, for a
+    /// manifest this crate writes (contract 2.x only). Returns a
+    /// human-readable reason on failure.
     pub fn check(&self) -> Result<(), String> {
+        self.check_with(false)
+    }
+
+    /// [`check`](Self::check) for a manifest the importer reads: also
+    /// accepts a contract 1.x batch published before an upgrade.
+    pub fn check_import(&self) -> Result<(), String> {
+        self.check_with(true)
+    }
+
+    fn check_with(&self, allow_legacy: bool) -> Result<(), String> {
         if self.format != FORMAT {
             return Err(format!("unsupported format {:?}", trunc(&self.format)));
         }
-        if !is_supported_contract_version(&self.contract_version) {
+        let legacy_ok = allow_legacy && is_legacy_contract_version(&self.contract_version);
+        if !is_supported_contract_version(&self.contract_version) && !legacy_ok {
             return Err(format!(
                 "unsupported contract_version {:?}",
                 trunc(&self.contract_version)
@@ -651,6 +671,20 @@ mod tests {
         );
         assert_ne!(batch_hash(b"x"), file_sha256(b"x"));
         assert_eq!(batch_dir_name("u", 7), "rdd_u_0000000000000007");
+    }
+
+    #[test]
+    fn importer_also_takes_legacy_batches() {
+        let mut x = m();
+        x.contract_version = "1.3.0".into();
+        assert!(x.check().is_err(), "the packer never writes 1.x");
+        x.check_import().unwrap();
+        for bad in ["3.0.0", "0.9.0", "1.3", "1.3.0-rc1"] {
+            x.contract_version = bad.into();
+            assert!(x.check_import().is_err(), "{bad}");
+        }
+        assert!(is_legacy_contract_version("1.0.0"));
+        assert!(!is_legacy_contract_version("2.0.0"));
     }
 
     #[test]

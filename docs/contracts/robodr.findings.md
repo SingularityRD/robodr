@@ -466,14 +466,25 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
   field set, identity derivation, SR-TAINT rules, signature scheme and the
   OCSF body are unchanged. The dedup key changes with `data_source`, hence
   the major bump.
-* **1.x is parse-only.** The reference validator accepts `1.y.z` messages
-  with their fixed 1.x constants (`data_source` `robot_edr`, `log_name`
-  `robot-edr.findings`) and the 1.x rules of their minor, so stored 1.x
-  findings can still be read and verified; `to_json`, `record`, the diode
-  packer/importer and `robodr-kafka-publish` never emit or forward them
-  (diode batches whose manifest names a 1.x contract are quarantined;
-  1.x spool records are dead-lettered / rejected). Any other major is
-  rejected. The 1.x schema is kept at
+* **1.x is parse-only, and upgraded where that is safe.** The reference
+  validator accepts `1.y.z` messages with their fixed 1.x constants
+  (`data_source` `robot_edr`, `log_name` `robot-edr.findings`) and the 1.x
+  rules of their minor, so stored 1.x findings can still be read and
+  verified; `to_json` and `record` never emit them. Findings in flight
+  during an upgrade are **upgraded** to contract **2.0.0**
+  (`robodr_ocsf::upgrade_legacy`): `contract_version`, `data_source` and
+  `ocsf.metadata.log_name` are relabelled and nothing else changes — none
+  of the three is an input of `finding_id` (`rf1-`: robot id, rule id,
+  subject) or `ocsf.metadata.uid` (`re1-`: finding id, `last_seen_time`,
+  `count`), so identity and dedup are preserved — and the result must
+  validate in full as 2.0 (the 2.0 catalog is exactly the 1.3 one), else
+  it is refused. A **signed** 1.x record is never upgraded (the signature
+  covers the exact 1.x bytes): the spool exporter and the publisher keep it
+  with the reason "legacy 1.x signed record: re-sign required". The diode
+  importer upgrades the findings of a 1.x batch (batch-signed, no
+  per-finding signature); an intact 1.x batch that cannot be upgraded is
+  quarantined and the unit's chain advances past it (§8). Upgrade
+  procedure: `docs/OPERATIONS.md` §7. Any other major is rejected. The 1.x schema is kept at
   [`legacy/robot-edr-finding.schema.json`](legacy/robot-edr-finding.schema.json).
 
 ## 6. Size limits
@@ -512,8 +523,9 @@ records to Kafka are outside the crate (no network code).
   `parity-NN.rbpar`, `MANIFEST.json` and `MANIFEST.sig`.
   `unit_id` is the exporting robot or site console (`[A-Za-z0-9._-]{1,64}`).
 * **Manifest** (`deny_unknown_fields`, ≤ 128 KiB, ≤ 256 files):
-  `{format: "robodr-diode/1", contract_version (`2.y.z`; a 1.x batch is
-  quarantined, §5), unit_id, batch_seq (1-based),
+  `{format: "robodr-diode/1", contract_version (`2.y.z`; the importer also
+  takes a `1.y.z` batch published before an upgrade and upgrades its
+  findings, §5), unit_id, batch_seq (1-based),
   prev_batch_hash, created_at (RFC 3339 ms), created_at_ms, key_id, algorithm,
   finding_count, first_time, last_time, files: [{name, kind, size, sha256}],
   parity?}` (`kind`: `findings` | `blackbox_bundle` | `parity`; `parity`
@@ -597,7 +609,14 @@ records to Kafka are outside the crate (no network code).
   `conflict`, `unreadable`, `fec_unrecoverable`, `fec_failed`); importer state does not advance, so an intact
   re-send of the same batch is accepted later (parity repair within a
   batch, then whole-batch retransmission via `resend`, is the forward-error
-  strategy).
+  strategy). The one exception is `legacy_not_convertible`: an authentic,
+  chain-linked (in sequence with the right `prev_batch_hash`, or an
+  operator-accepted gap) and intact contract 1.x batch whose findings have
+  no valid 2.0 form. A re-send cannot change its content, so the importer
+  records its hash as the unit's chain head before quarantining it; the
+  next batch must still link to that hash, so the chain's integrity
+  (nothing inserted, removed or reordered without the unit's key) is
+  unchanged — only that batch's findings are not emitted.
   A failure on one inbox entry (I/O, permissions) is reported per entry and
   never stops the other entries or units from being imported.
 * Because `finding_id` and `event-uid` are deterministic, re-publishing an
@@ -737,6 +756,10 @@ safely. Nothing here is specific to one product.
   - `robodr-contract-version` / `ocsf-version` headers: the value's own
     versions.
   - `data_source` documented as an unauthenticated label (§2, *Identity*).
+  - Upgrade path for 1.x findings in flight (§5): unsigned 1.x findings are
+    upgraded to 2.0.0 by the spool exporter, the diode importer and the
+    publisher; signed ones are kept with "legacy 1.x signed record: re-sign
+    required"; a 1.x diode batch no longer stalls its unit's chain.
 * **2.0.0** — vendor-neutral contract `robodr.findings` (supersedes
   `robot-edr.findings` 1.3.0, see
   [`legacy/robot-edr.findings.md`](legacy/robot-edr.findings.md) for the

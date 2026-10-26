@@ -27,6 +27,10 @@ robodr\-diode\-unpack \- verify and import RoboDR export batches on the receivin
 .IR UNIT : SEQ ]...
 .RB [ \-\-max\-batch\-bytes
 .IR N ]
+.RB [ \-\-upgrade\-data\-source
+.IR LABEL ]
+.RB [ \-\-upgrade\-topic
+.IR TOPIC ]
 .SH DESCRIPTION
 High\-side importer of the RoboDR one\-way export
 .RI ( robodr\-diode/1 ).
@@ -98,6 +102,17 @@ batches are refused afterwards). An operator decision.
 .TP
 .BI \-\-max\-batch\-bytes " N"
 Largest declared data per batch (default 256 MiB).
+.TP
+.BI \-\-upgrade\-data\-source " LABEL\fR, " \-\-upgrade\-topic " TOPIC"
+Labels given to the findings of a contract 1.x batch (published before an
+upgrade) when they are upgraded to contract 2.0 on import (defaults
+.B robodr
+and
+.BR robodr.findings ).
+A 1.x batch is authenticated and chained like any batch. When it is intact
+but a finding in it has no valid 2.0 form, it is quarantined
+.RB ( legacy_not_convertible )
+and the unit's chain moves past it, so the next batch is not held as a gap.
 .SH EXIT STATUS
 .TP
 .B 0

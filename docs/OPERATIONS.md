@@ -1187,6 +1187,47 @@ Before upgrading:
   the locked profile (a profile locked before metadata existed needs
   section 5.2 first).
 
+**Upgrading from findings contract 1.x (`robot-edr.findings`, releases
+before contract 2.0) to 2.x.** Records written by the old release are still
+contract 1.x. Preferred: **drain before upgrading** — let the robot side
+empty `<spool>/ready/` (`robodr-spool-export --once` until it exports
+nothing, or `robodr-kafka-publish --spool … --once` on a connected site),
+transfer every batch in the packer outbox, import them with the old
+`robodr-diode-unpack`, and publish the importer's `out/` with the old
+`robodr-kafka-publish`, then upgrade the robots first and the SOC side
+last. What happens to anything still in flight after the upgrade:
+
+| Where | Unsigned 1.x record | Signed 1.x record (`robodr-finding-sig`) |
+|---|---|---|
+| agentd spool → `robodr-spool-export` | upgraded to contract 2.0 (same `finding_id` / `event-uid`; labels `--upgrade-data-source` / `--upgrade-topic`, defaults `robodr` / `robodr.findings`) and packed | moved to `<spool>/rejected/` with the reason `legacy 1.x signed record: re-sign required` (kept, never deleted) |
+| spool or importer `out/` → `robodr-kafka-publish` | upgraded to contract 2.0 (`data_source` `--upgrade-data-source`, topic `--topic`), sent, counted in `legacy_upgraded` | dead-lettered with the same reason (the record is kept in `dead-letter.jsonl`) |
+| 1.x diode batch → `robodr-diode-unpack` | authenticated and chained like any batch; every finding upgraded to 2.0 (`--upgrade-data-source` / `--upgrade-topic`) and the batch accepted | — (findings in a batch carry no per-finding signature; the batch signature is verified) |
+
+A 1.x finding is only upgraded when its 2.0 form validates in full (the 2.0
+rule catalog is exactly the 1.3 one); `data_source`, the topic and
+`contract_version` are not inputs of the finding identity, so an upgraded
+finding deduplicates with any earlier copy. Set the upgrade labels to the
+`findings.data_source` / `findings.topic` the upgraded agentds use, or the
+SOC sees the upgraded findings under the default labels.
+
+A signed 1.x record cannot be upgraded off the robot: its signature covers
+the exact 1.x bytes and only the robot holds the finding key. Either drain
+before upgrading, or accept that these records are kept (spool `rejected/`,
+publisher `dead-letter.jsonl`) for forensic use and not delivered to the SOC.
+
+**Gap acceptance for a 1.x diode batch.** An intact, authentic 1.x batch
+whose findings have no valid 2.0 form (in practice a 1.0–1.2 batch with a
+rule that gained its catalog entry in 1.3) is quarantined as
+`legacy_not_convertible`, and the importer **moves the unit's chain past
+it**: its hash becomes the chain head, so the next batch is accepted
+without `--accept-gap` and still has to link to it (nothing can be
+inserted or reordered). A *damaged* 1.x batch (hash or size mismatch,
+missing file) does not advance the chain: re-send it from the packer
+archive (`robodr-diode-pack resend --seq N …`), or, if it is lost for good, accept
+the gap with `--accept-gap UNIT:SEQ` for the next batch (section 8.3). The
+records of a quarantined batch stay in `quarantine/<unique>/entry` with
+`reason.json`.
+
 Package rollback (below) and profile rollback (section 5.1) are separate:
 rolling the package back does not touch the anti-rollback state.
 
@@ -1295,7 +1336,8 @@ Without `--once` it loops every `--interval-ms` (default 5000).
 and partition from the value (contract §2, §4), publishes to `--topic`
 (default `robodr.findings`; findings name the topic agentd was configured
 with, `findings.topic`, and records relabelled to `--topic` are counted),
-refuses contract 1.x records (parse-only), sends with `acks=all`, and
+upgrades unsigned contract 1.x records to 2.0 and dead-letters signed
+ones (section 7), sends with `acks=all`, and
 persists per-batch progress after each acknowledged chunk; invalid or
 broker-rejected records go to a dead-letter file. **No TLS / SASL** and
 **idempotence off** (at-least-once: consumers drop duplicates on

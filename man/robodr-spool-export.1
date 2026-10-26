@@ -30,6 +30,10 @@ robodr\-spool\-export \- move robodr\-agentd findings from its spool into signed
 .RB [ \-\-interval\-ms
 .IR N ]
 .RB [ \-\-once ]
+.RB [ \-\-upgrade\-data\-source
+.IR LABEL ]
+.RB [ \-\-upgrade\-topic
+.IR TOPIC ]
 .SH DESCRIPTION
 Robot\-side (low side) exporter. It takes the records in
 .IB DIR /ready/
@@ -107,6 +111,15 @@ Loop interval, > 0 (default 5000).
 .TP
 .B \-\-once
 One step, then exit.
+.TP
+.BI \-\-upgrade\-data\-source " LABEL\fR, " \-\-upgrade\-topic " TOPIC"
+An unsigned contract 1.x record (spooled before an upgrade) is upgraded to
+contract 2.0 with these labels (defaults
+.B robodr
+and
+.BR robodr.findings ),
+keeping its identity. A signed 1.x record is moved to the rejected directory
+with the reason "legacy 1.x signed record: re\-sign required".
 .SH EXIT STATUS
 .TP
 .B 0

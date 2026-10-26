@@ -11,8 +11,15 @@
 //! [`robodr_ocsf::parse_and_validate`], and the key and headers must be
 //! exactly what [`robodr_ocsf::record`] derives from that value (contract
 //! §2; a record whose headers disagree with its value is not forwarded).
-//! The value must be of the current contract major (1.x findings are
-//! parse-only and dead-lettered). The record's `topic` must be the one its
+//! The value must be of the current contract major. A contract 1.x record
+//! (spooled or imported before an upgrade) is upgraded to contract 2.0 when
+//! it is unsigned and consistent with its own value
+//! ([`robodr_ocsf::upgrade_legacy`]: `data_source`
+//! [`PublishConfig::upgrade_data_source`], topic the publisher's own; same
+//! identity) and is then sent as the upgraded value with headers derived
+//! from it (counted in `legacy_upgraded`); a signed 1.x record cannot be
+//! upgraded (the signature covers the 1.x bytes) and is dead-lettered with
+//! the reason "legacy 1.x signed record: re-sign required". The record's `topic` must be the one its
 //! value names (`ocsf.metadata.log_name`); the publisher sends to its own
 //! configured topic (`--topic`, default `robodr.findings`), whatever topic
 //! the producer named, and counts records it relabelled that way
@@ -63,7 +70,7 @@
 use crate::fsutil::{self, ReadError};
 use crate::kafka::{Outcome, ProduceError, ProduceRecord, Producer};
 use robodr_agentd::spool::SpoolRecord;
-use robodr_ocsf::DEFAULT_TOPIC;
+use robodr_ocsf::{DEFAULT_DATA_SOURCE, DEFAULT_TOPIC};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashSet};
@@ -127,6 +134,10 @@ pub struct PublishConfig {
     pub chunk_records: usize,
     /// Longest input line / spool file accepted.
     pub max_record_bytes: usize,
+    /// `data_source` an unsigned contract 1.x record gets when it is
+    /// upgraded to contract 2.0 (default [`DEFAULT_DATA_SOURCE`]); its topic
+    /// becomes [`topic`](Self::topic).
+    pub upgrade_data_source: String,
     /// Test hook: fail with [`PublishError::Injected`] after the n-th
     /// chunk (1-based) was acknowledged by Kafka but before progress was
     /// saved — a simulated crash.
@@ -142,6 +153,7 @@ impl PublishConfig {
             topic: DEFAULT_TOPIC.into(),
             chunk_records: 500,
             max_record_bytes: 1024 * 1024,
+            upgrade_data_source: DEFAULT_DATA_SOURCE.into(),
             fail_after_send: None,
         }
     }
@@ -296,6 +308,8 @@ pub struct PublishReport {
     pub topic_overridden: u64,
     /// Lines skipped at the start of a resumed batch.
     pub resumed_after: u64,
+    /// Unsigned contract 1.x records upgraded to contract 2.0 and sent.
+    pub legacy_upgraded: u64,
 }
 
 /// One input record, as the importer writes it (and as agentd spools it).
@@ -366,6 +380,13 @@ impl<S: Sink> Publisher<S> {
         if cfg.max_record_bytes < 1024 {
             return Err(PublishError::Config(
                 "max_record_bytes must be >= 1024".into(),
+            ));
+        }
+        if !robodr_ocsf::validate::is_valid_data_source(&cfg.upgrade_data_source)
+            || !robodr_ocsf::validate::is_valid_topic(&cfg.topic)
+        {
+            return Err(PublishError::Config(
+                "topic / upgrade data source must be valid deployment labels".into(),
             ));
         }
         fsutil::mkdir(&cfg.state_dir)?;
@@ -488,6 +509,9 @@ impl<S: Sink> Publisher<S> {
             let v: Vec<String> = errs.iter().take(3).map(|e| e.to_string()).collect();
             format!("invalid finding: {}", v.join("; "))
         })?;
+        if robodr_ocsf::upgrade::is_legacy_version(&env.contract_version) {
+            return self.prepare_legacy(rec, env, partitions, report);
+        }
         if !robodr_ocsf::validate::is_emittable_contract_version(&env.contract_version) {
             return Err(format!(
                 "contract {} findings are parse-only and not published",
@@ -555,6 +579,73 @@ impl<S: Sink> Publisher<S> {
                     .headers
                     .into_iter()
                     .map(|(k, v)| (k, v.into_bytes()))
+                    .collect(),
+                timestamp_ms: fsutil::now_ms() as i64,
+            },
+        ))
+    }
+
+    /// A contract 1.x record: checked against its own value like any record,
+    /// then (unsigned only) upgraded to contract 2.0 and re-derived.
+    fn prepare_legacy(
+        &self,
+        rec: InRecord,
+        env: robodr_ocsf::FindingEnvelope,
+        partitions: u32,
+        report: &mut PublishReport,
+    ) -> Result<(i32, ProduceRecord), String> {
+        if !matches!(robodr_ocsf::signature_header(&rec.headers), Ok(None)) {
+            return Err(format!(
+                "{} (contract {}; the finding signature covers the 1.x value, so it cannot be \
+                 upgraded here: re-sign it on the robot, or drain before upgrading)",
+                robodr_ocsf::LEGACY_SIGNED_REASON,
+                env.contract_version
+            ));
+        }
+        if rec.key != env.finding_id {
+            return Err("key is not the finding id".into());
+        }
+        if rec.topic != env.ocsf.metadata.log_name {
+            return Err(format!(
+                "topic {:?} is not the one the value names ({:?})",
+                rec.topic, env.ocsf.metadata.log_name
+            ));
+        }
+        let own = robodr_ocsf::headers(&env);
+        let same_headers = rec.headers.len() == own.len()
+            && rec
+                .headers
+                .iter()
+                .zip(&own)
+                .all(|((k, v), (wk, wv))| k == wk && v == wv);
+        if !same_headers {
+            return Err("headers disagree with the value".into());
+        }
+        let up = robodr_ocsf::upgrade_legacy(&env, &self.cfg.upgrade_data_source, &self.cfg.topic)
+            .map_err(|e| {
+                format!(
+                    "legacy contract {} record not upgraded: {e}",
+                    env.contract_version
+                )
+            })?;
+        let want = robodr_ocsf::record(&up, Some(partitions))
+            .map_err(|_| "upgraded finding cannot be emitted".to_string())?;
+        let p = want
+            .partition
+            .ok_or_else(|| "no partition (zero partitions?)".to_string())?;
+        if rec.partition.is_some_and(|x| x != p) {
+            report.partition_overridden += 1;
+        }
+        report.legacy_upgraded += 1;
+        Ok((
+            p as i32,
+            ProduceRecord {
+                key: Some(want.key.into_bytes()),
+                value: Some(want.value.into_bytes()),
+                headers: want
+                    .headers
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.into_bytes()))
                     .collect(),
                 timestamp_ms: fsutil::now_ms() as i64,
             },

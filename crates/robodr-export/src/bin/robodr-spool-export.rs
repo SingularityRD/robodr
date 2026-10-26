@@ -10,7 +10,11 @@ use std::time::Duration;
 
 const USAGE: &str = "usage: robodr-spool-export --spool DIR --outbox DIR --state FILE \
 --pack-state FILE --unit ID --key-file FILE [--key-id ID] [--allow-hmac] \
-[--max-batch-bytes N] [--max-findings N] [--rejected-dir DIR] [--interval-ms N] [--once]";
+[--max-batch-bytes N] [--max-findings N] [--rejected-dir DIR] [--interval-ms N] [--once] \
+[--upgrade-data-source LABEL] [--upgrade-topic TOPIC]\n\
+Unsigned contract 1.x records (spooled before an upgrade) are upgraded to contract 2.0 with \
+--upgrade-data-source (default robodr) and --upgrade-topic (default robodr.findings); signed \
+ones are moved to the rejected directory (\"legacy 1.x signed record: re-sign required\").";
 
 struct Opts {
     cfg: ExportConfig,
@@ -35,6 +39,12 @@ fn opts(a: &Args) -> Result<Opts, String> {
     let mut cfg = ExportConfig::for_packer(a.req("spool")?, a.req("state")?, &pack);
     if let Some(d) = a.one("rejected-dir")? {
         cfg.rejected_dir = d.into();
+    }
+    if let Some(l) = a.one("upgrade-data-source")? {
+        cfg.upgrade_data_source = l.into();
+    }
+    if let Some(t) = a.one("upgrade-topic")? {
+        cfg.upgrade_topic = t.into();
     }
     let interval: u64 = a.num("interval-ms")?.unwrap_or(5_000);
     if interval == 0 {
@@ -90,6 +100,8 @@ fn main() -> ExitCode {
                 "max-findings",
                 "rejected-dir",
                 "interval-ms",
+                "upgrade-data-source",
+                "upgrade-topic",
             ],
             &["allow-hmac", "once"],
         )

@@ -34,6 +34,8 @@ robodr\-kafka\-publish \- publish RoboDR findings to the robot\-edr.findings Kaf
 .RB [ \-\-interval\-ms
 .IR N ]
 .RB [ \-\-once ]
+.RB [ \-\-upgrade\-data\-source
+.IR LABEL ]
 .SH DESCRIPTION
 SOC\-side (high side) publisher. It reads either the
 .BR robodr\-diode\-unpack (1)
@@ -83,7 +85,7 @@ The input (exactly one).
 .TP
 .BI \-\-topic " T"
 Topic (default
-.BR robot\-edr.findings ).
+.BR robodr.findings ).
 .TP
 .BI \-\-chunk " N"
 Records per produce request (default 500).
@@ -108,6 +110,17 @@ Loop interval, > 0 (default 2000).
 .TP
 .B \-\-once
 One pass, then exit.
+.TP
+.BI \-\-upgrade\-data\-source " LABEL"
+An unsigned contract 1.x record (written before an upgrade) is upgraded to
+contract 2.0 with this
+.B data_source
+(default
+.BR robodr )
+and the publisher's topic, keeping its identity, and sent with headers derived
+from the upgraded value. A signed 1.x record cannot be upgraded (its signature
+covers the 1.x bytes) and is dead\-lettered with the reason
+"legacy 1.x signed record: re\-sign required".
 .SH EXIT STATUS
 .TP
 .B 0

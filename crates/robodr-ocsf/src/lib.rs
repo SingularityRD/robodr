@@ -38,6 +38,7 @@ pub mod kafka;
 pub mod model;
 pub mod sig;
 pub mod taint;
+pub mod upgrade;
 pub mod validate;
 
 pub use builder::{
@@ -52,4 +53,7 @@ pub use sig::{
     VerifiedFinding, VerifierByUnit, SIG_HEADER,
 };
 pub use taint::{Charset, Provenance, Tainted, TAINT_LABEL};
+pub use upgrade::{
+    upgrade_legacy, upgrade_legacy_json, UpgradeError, LEGACY_SIGNED_REASON, UPGRADE_TARGET_VERSION,
+};
 pub use validate::{parse_and_validate, validate, validate_for_emit, ValidationError};

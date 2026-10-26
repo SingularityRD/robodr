@@ -80,9 +80,10 @@
 use crate::fec::ReedSolomon;
 use crate::fsutil::{self, ReadError};
 use crate::manifest::{
-    batch_dir_name, batch_hash, file_sha256, is_hex_digest, manifest_signing_message, trunc,
-    FileEntry, FileKind, Manifest, SignatureFile, FORMAT, MANIFEST_FILE, MAX_BATCH_SEQ,
-    MAX_MANIFEST_BYTES, MAX_SIGNATURE_FILE_BYTES, MAX_SIG_LEN, SIGNATURE_FILE,
+    batch_dir_name, batch_hash, file_sha256, is_hex_digest, is_legacy_contract_version,
+    manifest_signing_message, trunc, FileEntry, FileKind, Manifest, SignatureFile, FORMAT,
+    MANIFEST_FILE, MAX_BATCH_SEQ, MAX_MANIFEST_BYTES, MAX_SIGNATURE_FILE_BYTES, MAX_SIG_LEN,
+    SIGNATURE_FILE,
 };
 use robodr_blackbox::crypto::{from_hex, to_hex, Sha256};
 use robodr_blackbox::{Bundle, FindingLevel, Verifier};
@@ -276,6 +277,14 @@ pub struct ImportConfig {
     pub held_max_age_ms: Option<u64>,
     /// Quarantine a dot-entry (in transit) older than this. `None`: never.
     pub in_transit_max_age_ms: Option<u64>,
+    /// `data_source` given to the findings of a contract 1.x batch when
+    /// they are upgraded to contract 2.0 (default
+    /// [`robodr_ocsf::DEFAULT_DATA_SOURCE`]); set it to the label the
+    /// upgraded producers use.
+    pub upgrade_data_source: String,
+    /// Topic (`ocsf.metadata.log_name`) given to the upgraded findings of a
+    /// contract 1.x batch (default [`robodr_ocsf::DEFAULT_TOPIC`]).
+    pub upgrade_topic: String,
 }
 
 impl ImportConfig {
@@ -294,6 +303,8 @@ impl ImportConfig {
             max_accept_gap: DEFAULT_MAX_ACCEPT_GAP,
             held_max_age_ms: Some(DEFAULT_HELD_MAX_AGE_MS),
             in_transit_max_age_ms: Some(DEFAULT_IN_TRANSIT_MAX_AGE_MS),
+            upgrade_data_source: robodr_ocsf::DEFAULT_DATA_SOURCE.into(),
+            upgrade_topic: robodr_ocsf::DEFAULT_TOPIC.into(),
         }
     }
 }
@@ -368,6 +379,14 @@ pub enum QuarantineReason {
     InvalidFinding {
         line: usize,
         errors: Vec<String>,
+    },
+    /// A finding of an authentic, chain-linked, intact contract 1.x batch
+    /// is a valid 1.x finding but cannot be upgraded to contract 2.0. The
+    /// batch is quarantined **and the unit's chain advances over it**
+    /// (re-sending it cannot help; the next batch is not held as a gap).
+    LegacyNotConvertible {
+        line: usize,
+        detail: String,
     },
     /// A finding's `entity_context.robot.id` is neither the unit nor on the
     /// unit's allow-list.
@@ -478,6 +497,10 @@ pub struct AcceptedBatch {
     /// `out/<batch>/`, or `out/<batch>.<hash16>/` when `out/<batch>/` held
     /// another batch's output.
     pub output: PathBuf,
+    /// The batch's contract version when it was a contract 1.x batch whose
+    /// findings were upgraded to contract 2.0 on import.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_contract: Option<String>,
     /// Files rebuilt from parity before verification (empty if none).
     pub repaired: Vec<String>,
 }
@@ -709,6 +732,13 @@ impl Importer {
         }
         if cfg.partitions == Some(0) {
             return Err(ImportError::Config("partitions must be >= 1".into()));
+        }
+        if !robodr_ocsf::validate::is_valid_data_source(&cfg.upgrade_data_source)
+            || !robodr_ocsf::validate::is_valid_topic(&cfg.upgrade_topic)
+        {
+            return Err(ImportError::Config(
+                "upgrade data source / topic must be valid deployment labels".into(),
+            ));
         }
         fsutil::require_real_dir(&cfg.inbox)?;
         let dirs = [&cfg.out_dir, &cfg.quarantine_dir, &cfg.processed_dir];
@@ -972,7 +1002,7 @@ impl Importer {
                 }))
             }
         };
-        if let Err(detail) = manifest.check() {
+        if let Err(detail) = manifest.check_import() {
             return Ok(Err(Q::ManifestInvalid { detail }));
         }
         if manifest.key_id != sigfile.key_id || manifest.algorithm != sigfile.algorithm {
@@ -1027,7 +1057,13 @@ impl Importer {
                         return self.quarantine(&c.path, &c.name, r, now_ms, report);
                     }
                     if let Err(r) = self.verify_files(&c, None)? {
-                        return self.quarantine(&c.path, &c.name, r, now_ms, report);
+                        // A copy of a legacy batch the chain already
+                        // advanced over is a duplicate like any other.
+                        let skipped =
+                            matches!(r, Q::LegacyNotConvertible { .. }) && self.files_intact(&c)?;
+                        if !skipped {
+                            return self.quarantine(&c.path, &c.name, r, now_ms, report);
+                        }
                     }
                     fsutil::move_unique(&c.path, &self.cfg.processed_dir, &c.name)?;
                     report.duplicates.push(BatchRef {
@@ -1104,19 +1140,68 @@ impl Importer {
         };
         let (output, verified) = match self.emit(&c)? {
             Ok(v) => v,
+            Err(r @ Q::LegacyNotConvertible { .. }) if self.files_intact(&c)? => {
+                // Authentic (unit key), chain-linked (checked above: in
+                // sequence with the right predecessor, or an operator-
+                // accepted gap) and intact: the batch is exactly what the
+                // unit published, and its findings are legitimately 1.x
+                // findings that 2.x cannot carry. Re-sending it cannot
+                // change that, so holding the chain for it would stall the
+                // unit for good. Record its hash as the chain head (the
+                // next batch must still link to it, so nothing can be
+                // inserted or reordered) and quarantine its content for
+                // the operator. A damaged batch never gets here.
+                self.advance(&unit, seq, &c.hash, gap)?;
+                return self.quarantine(&c.path, &c.name, r, now_ms, report);
+            }
             Err(r) => return self.quarantine(&c.path, &c.name, r, now_ms, report),
         };
 
-        let previous = self.state.units.get(&unit).cloned();
-        let st = self.state.units.entry(unit.clone()).or_insert(UnitState {
-            last_seq: 0,
-            last_hash: String::new(),
-            recent: Vec::new(),
-            accepted_gaps: Vec::new(),
+        self.advance(&unit, seq, &c.hash, gap)?;
+        report.accepted.push(AcceptedBatch {
+            name: c.name.clone(),
+            unit_id: unit,
+            seq,
+            batch_hash: c.hash.clone(),
+            findings: c.manifest.finding_count,
+            bundles: verified.bundles,
+            bundles_verified: verified.bundles_verified,
+            gap_accepted: gap,
+            output,
+            repaired,
+            legacy_contract: is_legacy_contract_version(&c.manifest.contract_version)
+                .then(|| c.manifest.contract_version.clone()),
         });
+        // A failure here leaves an accepted batch in the inbox; the next run
+        // sees it as a duplicate and files it then.
+        fsutil::move_unique(&c.path, &self.cfg.processed_dir, &c.name)?;
+        Ok(())
+    }
+
+    /// Move unit `unit`'s chain head to `(seq, hash)` (and record an
+    /// accepted gap), persisted before returning. On a save failure memory
+    /// is rolled back to the persisted state.
+    fn advance(
+        &mut self,
+        unit: &str,
+        seq: u64,
+        hash: &str,
+        gap: Option<(u64, u64)>,
+    ) -> io::Result<()> {
+        let previous = self.state.units.get(unit).cloned();
+        let st = self
+            .state
+            .units
+            .entry(unit.to_string())
+            .or_insert(UnitState {
+                last_seq: 0,
+                last_hash: String::new(),
+                recent: Vec::new(),
+                accepted_gaps: Vec::new(),
+            });
         st.last_seq = seq;
-        st.last_hash = c.hash.clone();
-        st.recent.push((seq, c.hash.clone()));
+        st.last_hash = hash.to_string();
+        st.recent.push((seq, hash.to_string()));
         if st.recent.len() > RECENT_WINDOW {
             let excess = st.recent.len() - RECENT_WINDOW;
             st.recent.drain(..excess);
@@ -1132,27 +1217,24 @@ impl Importer {
             // Keep memory equal to disk so later batches of this unit are
             // judged against the persisted state.
             match previous {
-                Some(p) => self.state.units.insert(unit, p),
-                None => self.state.units.remove(&unit),
+                Some(p) => self.state.units.insert(unit.to_string(), p),
+                None => self.state.units.remove(unit),
             };
             return Err(e);
         }
-        report.accepted.push(AcceptedBatch {
-            name: c.name.clone(),
-            unit_id: unit,
-            seq,
-            batch_hash: c.hash.clone(),
-            findings: c.manifest.finding_count,
-            bundles: verified.bundles,
-            bundles_verified: verified.bundles_verified,
-            gap_accepted: gap,
-            output,
-            repaired,
-        });
-        // A failure here leaves an accepted batch in the inbox; the next run
-        // sees it as a duplicate and files it then.
-        fsutil::move_unique(&c.path, &self.cfg.processed_dir, &c.name)?;
         Ok(())
+    }
+
+    /// Every file the manifest lists is present with its signed size and
+    /// SHA-256 (no repair, no content checks).
+    fn files_intact(&self, c: &Candidate) -> io::Result<bool> {
+        for f in &c.manifest.files {
+            match fsutil::hash_file(&c.path.join(&f.name), f.size) {
+                Ok((len, sha)) if len == f.size && sha == f.sha256 => {}
+                Ok(_) | Err(_) => return Ok(false),
+            }
+        }
+        Ok(true)
     }
 
     /// Verify every data file of `c`. With `stage`, also write
@@ -1599,6 +1681,40 @@ impl Importer {
             line: line_no,
             errors: errs.iter().take(5).map(|e| trunc(&e.to_string())).collect(),
         })?;
+        // A contract 1.x batch (published before an upgrade): its findings
+        // must be 1.x and are upgraded to contract 2.0. The batch carries
+        // no per-finding signature (it is signed as a whole, verified
+        // above), so nothing signed is changed.
+        let legacy_batch = is_legacy_contract_version(&m.contract_version);
+        let env = match (
+            legacy_batch,
+            is_legacy_contract_version(&env.contract_version),
+        ) {
+            (false, _) => env,
+            (true, false) => {
+                return Err(Q::InvalidFinding {
+                    line: line_no,
+                    errors: vec!["a contract 1.x batch holds a finding of another major".into()],
+                })
+            }
+            (true, true) => robodr_ocsf::upgrade_legacy(
+                &env,
+                &self.cfg.upgrade_data_source,
+                &self.cfg.upgrade_topic,
+            )
+            .map_err(|e| match e {
+                // Only a valid 1.x finding with no valid 2.0 form may let the
+                // chain advance (see `process`).
+                robodr_ocsf::UpgradeError::NotConvertible(_) => Q::LegacyNotConvertible {
+                    line: line_no,
+                    detail: trunc(&e.to_string()),
+                },
+                other => Q::InvalidFinding {
+                    line: line_no,
+                    errors: vec![trunc(&other.to_string())],
+                },
+            })?,
+        };
         let robot = &env.entity_context.robot.id;
         if !self.keyring.robot_allowed(&m.unit_id, robot) {
             return Err(Q::RobotNotAllowed {

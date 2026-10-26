@@ -10,7 +10,10 @@ use std::time::Duration;
 const USAGE: &str = "usage: robodr-kafka-publish --bootstrap HOST:PORT [--bootstrap ...] \
 --state-dir DIR (--diode-out DIR | --spool DIR) [--topic T] [--chunk N] [--client-id S] \
 [--request-timeout-ms N] [--produce-timeout-ms N] [--delivery-timeout-ms N] [--retries N] [--max-request-bytes N] \
-[--interval-ms N] [--once]\n\
+[--interval-ms N] [--once] [--upgrade-data-source LABEL]\n\
+Unsigned contract 1.x records are upgraded to contract 2.0 (data_source --upgrade-data-source, \
+default robodr; topic --topic); signed ones are dead-lettered \
+(\"legacy 1.x signed record: re-sign required\").\n\
 No TLS/SASL: run on an isolated SOC network or through a local TLS proxy (stunnel).";
 
 struct Opts {
@@ -55,6 +58,9 @@ fn opts(a: &Args) -> Result<Opts, String> {
     }
     if let Some(n) = a.num("chunk")? {
         c.chunk_records = n;
+    }
+    if let Some(l) = a.one("upgrade-data-source")? {
+        c.upgrade_data_source = l.into();
     }
     let interval: u64 = a.num("interval-ms")?.unwrap_or(2_000);
     if interval == 0 {
@@ -101,6 +107,7 @@ fn main() -> ExitCode {
                 "retries",
                 "max-request-bytes",
                 "interval-ms",
+                "upgrade-data-source",
             ],
             &["once"],
         )

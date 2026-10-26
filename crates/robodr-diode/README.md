@@ -35,8 +35,14 @@ One directory per batch, named `rdd_<unit_id>_<seq as 16 digits>`:
 | `MANIFEST.sig` | `{format, algorithm, key_id, sig}` (hex signature) |
 
 Manifest fields: `format`, `contract_version` (findings contract, must be
-the major `robodr-ocsf` emits, `2.y.z`; a 1.x batch is quarantined as
-`manifest_invalid`: 1.x findings are parse-only), `unit_id`, `batch_seq` (1-based, per unit), `prev_batch_hash`
+the major `robodr-ocsf` emits, `2.y.z`; the packer never writes anything
+else. The importer also takes a `1.y.z` batch published before an upgrade:
+it is authenticated and chained like any batch and its findings are
+upgraded to contract 2.0 (`--upgrade-data-source` / `--upgrade-topic`); an
+intact 1.x batch whose findings have no valid 2.0 form is quarantined as
+`legacy_not_convertible` **and the unit's chain advances past it** (its
+hash becomes the chain head, so the next batch still has to link to it),
+while a damaged one is quarantined without advancing, like any batch), `unit_id`, `batch_seq` (1-based, per unit), `prev_batch_hash`
 (absent only for seq 1), `created_at` / `created_at_ms`, `key_id`,
 `algorithm`, `finding_count`, `first_time` / `last_time` (min/max
 `ocsf.time`), `files[] = {name, kind: findings|blackbox_bundle|parity, size, sha256}` (data
