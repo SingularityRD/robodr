@@ -1742,7 +1742,7 @@ fn evidence_call(
             };
             let deadline = Instant::now() + evidence::BUILD_DEADLINE;
             let cancel = || sh.stop.load(Ordering::Relaxed) || Instant::now() > deadline;
-            let built = tmp.bundle_file().map_err(|e| unstorable(e)).and_then(|f| {
+            let built = tmp.bundle_file().map_err(&unstorable).and_then(|f| {
                 let mut w = std::io::BufWriter::new(f);
                 let r = evidence::build_into(
                     &src,
