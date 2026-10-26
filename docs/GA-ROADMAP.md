@@ -221,7 +221,8 @@ sprint, AC'leri karşılanmadan kapanmaz.
 > - ✅ Dokümanlar: v2 sözleşmeleri, eski sözleşmeler `docs/contracts/legacy/`
 >   altında, repo dışı tasarım doküman atıfları kaldırıldı, bayat dokümanlar
 >   düzeltildi, `robodr-threat-forward` README (c9512c1).
-> - ⬜ Açık: `robodr-threat-forward` **man sayfası** yok (`man/` altında yok).
+> - ➖ `robodr-threat-forward` bir Pulsar modülü, ayrı bir program değil: man sayfası
+>   gerekmiyor (README yeterli).
 >
 > **AC sonuçları:** `rg -i autosecops crates/ fuzz/ scripts/ config/` → boş ✅;
 > `rg -n "Apache-2.0"` (vendor/LICENSES hariç) yalnız üçüncü taraf / Pulsar /
@@ -229,8 +230,8 @@ sprint, AC'leri karşılanmadan kapanmaz.
 > üye hariç), `cargo clippy -D warnings`, `cargo fmt --check`, ocsf fuzz smoke
 > testi ve `scripts/validate_rules.py --strict` yerelde yeşil ✅;
 > schema/örnek/validator 2.1'de tutarlı (contract testleri) ✅;
-> `cargo deny check` bu ortamda **koşturulamadı** (cargo-deny kurulu değil) ⬜ —
-> CI'da doğrulanmalı; GitHub CI'ın gerçek koşusu hâlâ S0 (billing) bekliyor.
+> `cargo deny check advisories bans licenses sources` (cargo-deny 0.20.2,
+> 2026-10-26) → hepsi ok ✅; GitHub CI'ın gerçek koşusu hâlâ S0 (billing) bekliyor.
 
 ### Sprint 2 — AutoSecOps1 MVP köprüsü (webhook yolu) + robot kaydı tasarımı
 
