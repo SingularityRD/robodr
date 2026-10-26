@@ -2397,3 +2397,94 @@ The package never deletes evidence or keys, not even on `apt purge`.
 | `robodr-enroll rotate`: `holds key … but the SOC has …` | the key file was replaced by hand | restore the registered key, or re-enroll |
 | `install-bundle: REFUSED: release … reads black-box formats` | rollback/downgrade across a black-box format change | section 7: export and archive the chain first, or `--accept-unreadable <segment>` |
 | capture sees only `lo` | no default route on an air-gapped robot | list the DDS interfaces in `[module.robodr-sensor-ros2.capture] interfaces` |
+
+## 11. Secure delivery on a unit (`robodr-deliverd`, Sprint 13b)
+
+`robodr-deliverd` installs release-signed, depot- and operator-approved
+packages (RPKs) of the kinds `files`, `config`, `deb` and `robodr-rules`
+from **per-unit media packs**, only while the robot's live safety state is
+`idle` or `safe_state_active`, with a health gate, automatic rollback and
+anti-rollback floors (`docs/SECURE-DELIVERY.md` §4.2, §6;
+`man robodr-deliverd(8)`). Verified offline in tests only: not yet on a
+robot, an air-gapped site or a depot (14a).
+
+### 11.1 Before enabling it
+
+1. agentd runs with a **live safety feed** (`safety_feed` in
+   `/etc/robodr/agentd.json`: the safety socket a PLC gateway writes, or
+   commissioned ROS 2 safety topics). Without a feed every install waits
+   (`unknown`): a configured `context.safety_state` is not a reading.
+2. Write `/etc/robodr/deliverd.json` from
+   `/usr/share/doc/robodr/examples/deliverd.example.json`: the unit id
+   (as in the trust file's `rings` and the deployments), the site, model,
+   platform and architecture, and the delivery **root fingerprints**
+   (carried to the site out of band, as for `robodr-release --root`).
+   `trust.clock`: `trusted` only if the clock is disciplined (GPS / PTP,
+   or set at commissioning and checked); otherwise `untrusted`.
+   `robodr-deliverd check-config --config /etc/robodr/deliverd.json`.
+3. Enrol the trust anchor once, from the site's trust file on vetted
+   media:
+   `sudo robodr-deliverd init-anchor --config /etc/robodr/deliverd.json --trust /media/usb/trust.json`.
+   It prints the trust version and the unit's ring from the trust file.
+   The anchor only moves forward by root-signed rotations that arrive in
+   media packs.
+4. For `robodr-rules`, point Pulsar at the delivered rules (a symlink
+   `/usr/share/robodr/rules/delivered -> /etc/robodr-delivered-rules` or
+   `rules_path`) and set `install.rules_reload` (default in the example:
+   `systemctl try-restart robodr-pulsard.service`).
+5. SOC side: findings contract **2.2** validators before the unit's
+   `robot.deliver.*` findings are exported (they share agentd's spool and
+   exporters).
+6. `sudo systemctl enable --now robodr-deliverd`.
+
+### 11.2 Delivering a media pack
+
+Copy (or mount) the pack the depot wrote for this unit under
+`/var/lib/robodr/deliverd-media/<name>/` (`trust.json` + `.sig`,
+`deployment.json` + `.sig`, `bundles/<label>/`). The agent copies and
+verifies it into its own state directory and never reads the media again
+for it; remove the media afterwards. `sudo robodr-deliverd status --config
+/etc/robodr/deliverd.json` shows the deployment, each item's status and
+deferrals, installed versions, floors and any switch in progress.
+
+* **Deferred** items wait for `idle` / `safe_state_active` (and the
+  deployment's maintenance window, UTC). Staging continues. A unit that
+  never reaches a safe window shows `robot.deliver.deferred_safety`
+  (Medium after `findings.deferral_medium_after` deferrals).
+* RPKs with `install.requires_operator_present` wait for a local
+  operator: `sudo robodr-deliverd confirm --config /etc/robodr/deliverd.json
+  --deployment <digest from status> --package <name>`.
+* A failed health gate rolls back automatically (also only in a safe
+  state) and raises `robot.deliver.health_failed`. If the failing release
+  raised the floor above the previous version, there is no rollback
+  target: the unit stays on it with `robot.deliver.rollback_blocked_floor`
+  (Critical) until an operator delivers a fixed release.
+* `robot.deliver.stale` means no fresh deployment (or trust file) arrived
+  before the last one expired: the depot or courier may be withholding
+  updates or revocations.
+
+### 11.3 Evidence and recovery
+
+Every step is a note in `/var/lib/robodr/blackbox/deliverd` (verify with
+`robodr-blackbox verify /var/lib/robodr/blackbox/deliverd --keyring
+<agentd-blackbox.key.pub>`). A crash or power loss during a switch is
+resumed at the next start from the intent in `state.json`
+(`robodr.deliver.recovered`). If `state.json` is deleted or replaced by an
+older copy, the agent takes the floors recorded in the black box and
+reports it (`robot.deliver.refused`, `state_restored`); downgrades below
+them stay refused. Do not delete `/var/lib/robodr/deliverd`.
+
+### 11.4 Trust and limits
+
+* The safety state is agentd's `status.json`: whoever controls the
+  `robodr` user can claim `idle` to agentd and to the delivery agent.
+* `deb` maintainer scripts run only when the release quorum allowed them
+  (recorded in the black box), as root under the unit's capability set,
+  without network; `.deb`s with setuid / setgid files fail to install
+  under `RestrictSUIDSGID=` and roll back.
+* Floors are in the state file and the black box, not a TPM counter
+  (14b). Sealed RPKs, models, OCI images and OS images are refused until
+  13c / 14a / 14c.
+* `robodr-safety-replay` (tests and demos) writes safety states into
+  agentd's socket; it is not in the package and must never run on a
+  fielded robot.

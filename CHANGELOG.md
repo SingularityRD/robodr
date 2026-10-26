@@ -199,6 +199,44 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Added
 
+- Secure delivery, Sprint 13b (unit agent, local; `docs/SECURE-DELIVERY.md`
+  §4.2, §6, §10 "13b status"):
+  - `robodr-deliverd` (new crate and daemon, `/usr/sbin`, unit
+    `robodr-deliverd.service` installed disabled, focal variant): imports
+    per-unit media packs (`robodr-media-pack/1`) only through the 13a
+    verified-copy path under the unit's own trust anchor (`init-anchor`),
+    checks the deployment against the unit (depot + operator quorum, unit
+    id, its own ring, groups for production rings only, rollout within the
+    ring, sequence), and installs `files`, `config`, `deb` and
+    `robodr-rules` RPKs from a content-addressed store: safety-state gate
+    on agentd's live safety feed (`idle` / `safe_state_active` only,
+    re-read right before the switch), maintenance window, operator
+    confirmation (`confirm`), write-ahead intent and anti-rollback floor
+    before the switch, health gate (probes as an argv without a shell, as
+    an unprivileged UID, bounded in time and output), automatic rollback
+    at or above the floor, crash recovery, staleness with a trusted or
+    untrusted clock; every step in its own black-box chain.
+  - `robodr-safety-replay` (test tool, not packaged): replays recorded
+    JSONL safety reports into agentd's `safety_feed` socket.
+  - Findings contract `robodr.findings` **2.2.0**: catalog entries
+    `robot.deliver.installed`, `deferred_safety`, `health_failed`,
+    `rollback_blocked_floor`, `refused`, `stale`, `chain_gap` (data source
+    `robodr_delivery`); 2.0 / 2.1 messages keep their own catalogs.
+    Upgrade SOC-side validators (and both sides of a diode) first.
+  - tmpfiles: `/var/lib/robodr/deliverd`, `/var/lib/robodr/deliverd-media`,
+    `/var/lib/robodr/blackbox/deliverd`, `/opt/robodr-delivered`,
+    `/etc/robodr-delivered`, `/etc/robodr-delivered-rules`; example
+    `deliverd.example.json`; man page `robodr-deliverd(8)`;
+    `docs/OPERATIONS.md` section 11. Releases require `robodr-deliverd` in
+    both packages.
+  - Fuzz targets `deliverd_state`, `deliverd_inputs` with std-only smoke
+    runs.
+  - `robodr-agentd` (changed): spool records are published with
+    no-replace hard links (a taken name moves on to the next number), so
+    a second producer (`robodr-deliverd`) can share the findings spool
+    without either overwriting the other's records. `robodr.spool/v1` is
+    unchanged.
+
 - Secure delivery, Sprint 13a (formats and release signing,
   `docs/SECURE-DELIVERY.md` §3, §3.5, §10):
   - `robodr-pkg` (new, pure): strict parsers and validators for RPK

@@ -32,6 +32,8 @@ violated output invariant (documented at the top of its harness file).
 | `pkg_deployment` | robodr-pkg | `deployment \0 sig` to `parse_deployment`, `verify_deployment` (depot + operator quorum; lab quorum only for units the trust file assigns to that ring), `check_seq` | same |
 | `pkg_trust` | robodr-pkg | `trust \0 sig \0 next \0 next sig` to `parse_trust` (disjoint roles, expiry bounds, quorum caps, programme scopes and package ownership), `verify_trust_pinned` (pins, site, expiry) and `verify_trust_update` from the harness site (monotonic revocations, serials and floors; unexpired) | same |
 | `pkg_parity` | robodr-pkg | `k`, `m`, an erasure mask and data files to `parity::layout`, `encode_group`, `rebuild_group` (`robodr-diode`'s RS code): erased members come back byte for byte | same |
+| `deliverd_state` | robodr-deliverd | a selector byte + JSON to the agent's configuration (`Config::parse`: strict members, normalised and disjoint paths) and state file (`State::parse`): accepted documents re-serialise to an equal value, `raise_floor` never lowers a floor | `crates/robodr-deliverd/tests/fuzz_smoke.rs` |
+| `deliverd_inputs` | robodr-deliverd | a selector byte + bytes to agentd's `status.json` as the safety-state gate reads it (`safety::judge`: installs allowed only for a fresh, this-boot, live-feed `idle` / `safe_state_active`), the passwd lookup of probe users, recorded safety reports and their replay schedule, and the structural check of delivered Pulsar rule files | same |
 
 `kafka_wire` got its std-only smoke test after the fact (it was added while
 `crates/robodr-export` was being changed by parallel work); it also checks
@@ -176,6 +178,10 @@ invariant violation:**
 * `pkg_*` (Sprint 13a): the default debug smoke run, 20 000 inputs each
   (`pkg_trust` about 1 000: each input costs about 10 ms in debug), no
   panic, no invariant violation.
+* `deliverd_*` (Sprint 13b): the default debug smoke run found one
+  harness bug at once (its passwd invariant assumed an `x` password
+  field; fixed in the harness, the parser was right); see "libFuzzer runs
+  (Sprint 13b)" for the coverage-guided runs.
 
 The deterministic mutator is not coverage-guided: it finds shallow bugs
 cheaply but is no substitute for libFuzzer runs (CI's `fuzz` job runs every
@@ -278,6 +284,11 @@ All seeds are SYNTHETIC (no real robot data):
   `regenerate_seeds` in `crates/robodr-pkg/tests/fuzz_smoke.rs`
   (`--ignored`); `seeds_are_current` fails when the committed seeds
   differ.
+* `deliverd_state/`, `deliverd_inputs/`: a full configuration and a state
+  with an installed, a kept and a staged version and a switch in progress;
+  an agentd status claiming `idle` and one claiming `moving_slow`, a passwd
+  file, a safety recording, a Pulsar rule file. Written by
+  `regenerate_seeds` in `crates/robodr-deliverd/tests/fuzz_smoke.rs`.
 
 Each smoke test also checks its seeds take the success path (pcaps reach the
 RTPS parser, fragments reassemble, chains verify, findings validate, the

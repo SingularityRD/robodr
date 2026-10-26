@@ -1,12 +1,18 @@
 # Secure delivery: air-gapped fleet distribution, updates and captured-unit protection
 
-> **Status: design; Sprint 13a implemented** (2026-10-26). The formats of
-> §3 and release signing exist as `robodr-pkg` (pure parsers and
-> validators) and `robodr-release` (build, sign, verify, repair), with the
-> decisions of §3.5; the 13a exit criteria are demonstrated by tests
-> (§10). Verified offline only: on synthetic payloads in temporary
-> directories, never on an air-gapped site, an entry station or a robot.
-> **Everything else in this document (13b onward) is not implemented.**
+> **Status: design; Sprints 13a and 13b implemented** (2026-10-26). The
+> formats of §3 and release signing exist as `robodr-pkg` (pure parsers
+> and validators) and `robodr-release` (build, sign, verify, repair), with
+> the decisions of §3.5. The on-unit agent `robodr-deliverd` (13b, §10)
+> installs `files`, `config`, `deb` and `robodr-rules` RPKs from per-unit
+> media packs behind agentd's live safety-state gate, with a health gate,
+> automatic rollback, anti-rollback floors and black-box evidence; the
+> `robot.deliver.*` findings of §9 are catalogued (contract 2.2). The exit
+> criteria of both are demonstrated by tests (§10). Verified offline only:
+> on synthetic payloads in temporary directories (13b: the host's dpkg
+> against a separate dpkg root, a real agentd fed by the replay helper),
+> never on an air-gapped site, an entry station or a robot.
+> **Everything else in this document (13c onward) is not implemented.**
 > It expands ROADMAP Phase 3 ("Air-gapped deployment") and splits the
 > one-line Sprint 13 / Sprint 14 items in `docs/SPRINTS.md` with a
 > buildable plan. Every component named here that does not already exist
@@ -124,7 +130,7 @@ The claims table for feature C is in §7.8. For A and B:
                                                               └ lease / Tang server (§7.5)
                                                                    │  site LAN (mTLS)  │  or per-unit media
                                                                    ▼                   ▼
-                                                              robodr-deliverd on each unit   [ ]
+                                                              robodr-deliverd on each unit   [P]
                                                               ├ verify → stage → gate → install
                                                               ├ encrypted store, TPM-sealed keys
                                                               ├ health gate / auto-rollback
@@ -147,7 +153,7 @@ both directions.
 | `robodr-seal` `[ ]` | library | Key wrapping, payload encryption, TPM sealing via `tpm2-tools` (same approach as `robodr-blackbox/src/tpm_anchor.rs`), software fallback (§7). |
 | `robodr-release` `[P]` | CLI, connected side | Build RPKs from `.deb` / OCI / files / models, encrypt, sign (quorum), assemble bundles, add Reed-Solomon parity. Sprint 13a: builds every kind from a payload directory (kind shape and SBOM checked; a `.deb` or OCI archive is carried as a file, not inspected), quorum signing, chained bundles, parity, verify, repair; no encryption (13c). |
 | `robodr-depot` `[ ]` | service, site | Single-box control plane: import bundles, inventory, deployments and rings, per-unit key wrapping, serve units, lease server. This is the air-gapped instance of the planned `robodr-fleet` (ROADMAP §2) and the "single-box control plane" of Sprint 14. |
-| `robodr-deliverd` `[ ]` | service, unit | The on-unit agent: reconcile desired vs installed, verify, stage, gate on safety state, install, health-check, roll back, report. Runs separately from `robodr-agentd` so a delivery bug cannot stop detection. |
+| `robodr-deliverd` `[P]` | service, unit | The on-unit agent: reconcile desired vs installed, verify, stage, gate on safety state, install, health-check, roll back, report. Runs separately from `robodr-agentd` so a delivery bug cannot stop detection. Sprint 13b: from per-unit media packs, kinds `files`, `config`, `deb`, `robodr-rules`; no LAN, no sealing, no OS A/B. |
 
 ### 2.2 Reused, unchanged or extended
 
@@ -872,6 +878,17 @@ both sides of the diode (`docs/contracts/robodr.findings.md`).
 | `robot.seal.erased` | Critical | crypto-erase executed, with trigger |
 | `robot.seal.tamper` | Critical | enclosure tamper or erase trigger fired |
 
+13b: the seven `robot.deliver.*` ids are catalogued in contract
+`robodr.findings` **2.2** (data source `robodr_delivery`) and emitted by
+`robodr-deliverd` into agentd's findings spool (both producers claim
+record names with no-replace links). `installed` is reported as Low (the
+contract has no informational severity); `deferred_safety` is Low and
+Medium after a configurable number of deferrals of one item; `stale` is
+Medium and High after a grace period; `refused` also reports a state file
+restored from the black box. `chain_gap` covers bundles only: deployment
+sequence replays and equivocations are `refused` (gaps are normal for a
+unit, §3.5 item 27). The `robot.seal.*` ids have no entry until 13c / 14b.
+
 ---
 
 ## 10. Sprint plan
@@ -883,7 +900,7 @@ nothing else renumbers.
 | Sprint | Deliverable (demo) | Exit criteria |
 |---|---|---|
 | **13a — Formats and release signing** (implemented, see below) | `robodr-pkg` (RPK, bundle, deployment, trust file parsers, pure, fuzzed); `robodr-release build/sign/verify` with 2-of-N quorum; parity via `robodr-diode` fec. | A bundle built on one host verifies on another; every manifest mutation, missing signature, wrong quorum, revoked key and chain gap is refused in tests; fuzz targets in `fuzz/`. |
-| **13b — Unit agent, local** | `robodr-deliverd` installing `files`, `config`, `deb`, `robodr-rules` from a per-unit media pack; store; health gate; auto-rollback; floors in a state file; safety-state gate, tested with recorded JSONL safety reports replayed into agentd's live `safety_feed` socket (a small replay helper is new work). | Demo: bad release auto-rolls back; downgrade below floor refused; install deferred while the replayed safety state is `MovingSlow`. All recorded in the black box. |
+| **13b — Unit agent, local** (implemented, see below) | `robodr-deliverd` installing `files`, `config`, `deb`, `robodr-rules` from a per-unit media pack; store; health gate; auto-rollback; floors in a state file; safety-state gate, tested with recorded JSONL safety reports replayed into agentd's live `safety_feed` socket (a small replay helper is new work). | Demo: bad release auto-rolls back; downgrade below floor refused; install deferred while the replayed safety state is `MovingSlow`. All recorded in the black box. |
 | **13c — Sealing** | `robodr-seal`: XChaCha20-Poly1305 chunks; `UWK` in TPM via `tpm2-tools`; signed PCR policy; erase epoch; LUKS2 runtime volume; Clevis/Tang fallback. Tested against `swtpm`, like `TpmNvCounterAnchor`. | Disk image of an enrolled (swtpm) unit yields no plaintext; changed PCR → unseal refused; epoch increment → every sealed key dead; fallback unit cannot unlock without Tang. |
 | **14a — Depot and rollout** | `robodr-depot`: import with entry report, inventory, enrolment with credential activation, deployments with operator quorum, rings, per-unit re-wrapping, LAN serving (mTLS), media packs, halt-on-failure. | Demo on ≥ 3 units (VMs with swtpm acceptable): staged rollout lab → canary → ring-1; injected failing release halts at canary; captured-unit VM cannot decrypt a model assigned only to another unit. |
 | **14b — Lease, erase execution, evidence** | Lease tokens; crypto-erase as the first executed responder action; `robot.deliver.*` / `robot.seal.*` findings through the existing diode; floors moved to TPM NV counters. | Lease expiry blocks unseal after reboot; erase triggered by a simulated tamper input while state is `Idle`, deferred while `MovingFast`; SOC sees the full chain of findings. |
@@ -981,6 +998,97 @@ bound their shape; these rules are requirements on `robodr-deliverd`
    anchor (§3.5, item 25) and refuses an expired trust file; with no
    trusted clock it treats "trust file expired by the depot's clock" and
    "newest deployment expired" as staleness findings (§6.5).
+
+**13b status (2026-10-26): implemented; exit criteria demonstrated by
+tests, offline.** `crates/robodr-deliverd` (binaries `robodr-deliverd` and
+the test tool `robodr-safety-replay`), `robodr-deliverd.service`
+(installed disabled, focal variant), contract `robodr.findings` 2.2. What
+runs:
+
+| Exit criterion | Demonstrated by |
+|---|---|
+| A bad release auto-rolls back | `tests/exit_criteria.rs` `a_bad_release_rolls_back_automatically` (files: health check fails, `current` back to serial 1, failed version removed, `health_failed` High); `tests/kinds.rs` the same with `deb` and the host's dpkg in a separate root (dpkg downgrades back), and with `robodr-rules` whose reload fails |
+| Downgrade below the floor refused | `a_downgrade_below_the_floor_is_refused` (floor raised by the installed release, a validly signed and approved lower serial refused `below_floor`); `a_failing_release_that_raised_the_floor_is_not_rolled_back_below_it` (`rollback_blocked_floor` Critical); `adversarial.rs` `a_deleted_state_file_does_not_reopen_a_downgrade` |
+| Install deferred while `MovingSlow`, proceeds when `Idle` | `tests/agentd_replay.rs`: a real `robodr-agentd` with a `safety_feed` socket, `robodr-safety-replay` replaying `moving_slow` for 3 s then `idle`; deferred, then installed after the transition, findings in agentd's own spool; `exit_criteria.rs` also every other unsafe state, a stale or absent status, `safe_state_active` |
+| All recorded in the black box | every test above reads the delivery journal (`robodr.deliver.*` notes in order: pack imported, staged, deferred, activating, floor raised, switched, health, installed / rollback / rollback blocked, recovered) and verifies its chain with the unit key |
+
+The 13b requirements above, as implemented:
+
+1. Probes: `execve` of the argv (absolute program, no `PATH` lookup), fixed
+   environment, `/` as working directory, stdin `/dev/null`; tested with
+   `$(...)`, backticks, `;`, `|`, `&&`, globs (`probe_argv_with_shell_metacharacters_is_not_interpreted`).
+2. Probe user resolved at staging from the passwd file (files only),
+   refused for UID / GID 0, outside the configured range, `root`,
+   `robodr`, `robodr-exec`, configured names, duplicates; resolved again
+   before each run; `setgid`, `setgroups(0)`, `setuid` (tested with `id`).
+   Own process group killed on timeout, output bounded
+   (`a_probe_that_hangs_…`, `a_probe_that_floods_output_is_bounded`).
+3. Rollout: a deployment whose targets, batch size or failure threshold
+   exceed the unit's ring (when the trust file assigns it) is refused.
+4. Ring: from the trust file's `rings`, else enrolment (`unit.ring`, a
+   production ring only); lab / canary deployments must name the unit;
+   groups only for production rings (`a_pack_for_another_unit_ring_or_site_is_refused`).
+5. Maintainer scripts: refused unless the release allowed them; the flag
+   is recorded; they run only after the gate and the operator
+   confirmation.
+6. One architecture: items are chosen by digest; the RPK must be the
+   unit's architecture or `all`, a `.deb` too; one item per package.
+7. Install only from the store, filled from the verified copy with every
+   chunk hashed, materialised with every chunk and file hashed again.
+8. The unit keeps its own trust anchor (`init-anchor`, rotations only);
+   an expired trust file is refused; `trust.clock: untrusted` judges
+   expiry on the newest depot-signed time accepted (never beyond the
+   trust file's expiry) and reports staleness
+   (`with_an_untrusted_clock_expiry_follows_the_depots_signed_time`).
+
+Decisions taken where the design left room:
+
+* **Media pack** (`robodr-media-pack/1`): `trust.json`, `deployment.json`
+  (each with `.sig`) and `bundles/<label>/`, nothing else. It has no
+  signature of its own; it is per-unit because its deployment names the
+  unit (and, from 14a, because of its key wraps).
+* **The deployment is the install authority** (exact digests,
+  sequence-protected). Bundles chain per programme on the unit for
+  detection: a gap is reported (`chain_gap`) and accepted (a unit sees
+  only the bundles carrying its packages), an equivocation or a broken
+  link refuses the pack, an older bundle is a content source only.
+* **The floor is raised before the switch** (in the intent's write), so
+  a failing release that raised it has no rollback target below it
+  (§6.4: Critical, operator decides). Rollbacks pass the safety gate too.
+* **Safety state source**: agentd's `status.json` (fresh by
+  `CLOCK_MONOTONIC`, this boot, a live `safety_feed`); without a live feed
+  the state is `unknown`.
+* **Findings share agentd's spool**: agentd and the agent claim record
+  names with no-replace hard links (agentd changed from `rename`).
+* **Evidence**: a black-box chain of the agent's own (single-writer
+  recorder), signed with the unit's black-box key; a missing or older
+  state file takes the floors recorded there.
+* **Kinds** `files` / `config` (versioned directory, `current` symlink
+  swap; `config` only under `config_root`), `robodr-rules` (versions in
+  the state directory, one symlink per package in `rules_active`, Pulsar
+  rule-file structure checked, optional external validator, reload
+  command in the health gate), `deb` (`dpkg-deb` inspection, `dpkg
+  --install`, active version by `dpkg-query`).
+
+Also tested: crash at every step of a good and a bad release
+(`tests/crash.rs`: the state after the crash and after recovery is one of
+the two versions, intent resolved, floor not lowered, outcome as without
+the crash); packs for another unit, ring, site or group, rollout over the
+ring, platform or architecture; deployments signed by the depot alone,
+depot + one operator, operators alone, with release keys; traversal paths
+and symlinks in a quorum-signed payload, symlinks in the media, symlinks
+in place of install directories, a directory in place of `current`, a
+`config` RPK aimed outside its root; replayed and equivocating
+deployments and bundles; trust rollback after a rotation; site
+revocations; expiry and staleness (Medium, then High); operator
+confirmation; maintenance window; a second agent on the same state.
+Fuzzing: `deliverd_state`, `deliverd_inputs` (`fuzz/README.md`).
+
+Not in 13b: sealed RPKs and key wraps (13c), the depot and LAN delivery
+(14a), the soak window and attestation in the health gate (14a / Sprint
+12), TPM NV floors (14b), OS A/B (14c), the kinds `oci-image`, `model`,
+`robodr-profile`, `os-image` (refused), `ros2_node` health checks
+(refused: not evaluable on the unit). Nothing has run on a robot.
 
 ---
 

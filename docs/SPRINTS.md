@@ -412,8 +412,25 @@ binary); every single-byte change of `bundle.json` and `MANIFEST.json`,
 missing signatures, a wrong quorum, revoked keys, chain gaps, replays,
 equivocations and the review's forgery attempts are refused
 (`tests/forgery.rs`); five `pkg_*` libFuzzer targets with std-only smoke
-runs (`fuzz/README.md`). Not done: 13b (unit agent), 13c (sealing), the
-entry-station scan, any run on a real site or robot.
+runs (`fuzz/README.md`). Not done: 13c (sealing), the entry-station
+scan, any run on a real site or robot.
+
+**Status as of 2026-10-26 — Sprint 13b: unit agent done, offline**
+([`SECURE-DELIVERY.md`](SECURE-DELIVERY.md) §10, "13b status").
+`robodr-deliverd` installs `files`, `config`, `deb` and `robodr-rules` RPKs
+from per-unit media packs (verified-copy import, the unit's own trust
+anchor, ring and unit checks), from a content-addressed store, behind
+agentd's live safety-state gate, with a health gate (probes without a
+shell, as an unprivileged UID, bounded), automatic rollback,
+anti-rollback floors in a crash-safe state file, black-box evidence and
+the `robot.deliver.*` findings (contract 2.2) in agentd's spool;
+`robodr-safety-replay` replays recorded safety reports into agentd's
+socket. Exit criteria shown by tests: a bad release rolls back, a
+downgrade below the floor is refused, the install waits while a real
+agentd's replayed state is `moving_slow` and proceeds at `idle`, all in
+the black box; plus a crash at every step and the adversarial cases.
+Shipped in both packages (`robodr-deliverd.service`, installed disabled).
+Not done: 13c, 14a–c, any run on a robot.
 
 ---
 
