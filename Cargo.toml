@@ -8,6 +8,7 @@ members = [
     "crates/robodr-cdr",
     "crates/robodr-commission",
     "crates/robodr-correlate",
+    "crates/robodr-deliverd",
     "crates/robodr-diode",
     "crates/robodr-events",
     "crates/robodr-executor",
@@ -63,6 +64,7 @@ robodr-capture = { path = "crates/robodr-capture" }
 robodr-cdr = { path = "crates/robodr-cdr" }
 robodr-commission = { path = "crates/robodr-commission" }
 robodr-correlate = { path = "crates/robodr-correlate" }
+robodr-deliverd = { path = "crates/robodr-deliverd" }
 robodr-diode = { path = "crates/robodr-diode" }
 robodr-firewall = { path = "crates/robodr-firewall" }
 robodr-firewall-gw = { path = "crates/robodr-firewall-gw" }
@@ -110,6 +112,10 @@ sha2 = "0.10"
 # their signatures for the regression test of review 13a finding 2. Already
 # in the graph through ed25519-dalek.
 curve25519-dalek = { version = "4.1", default-features = false }
+# Structural check of delivered Pulsar rule files (robodr-deliverd,
+# kind robodr-rules). Already in the lock through Pulsar (toml 1.1); only
+# parse + serde, no writer.
+toml = { version = "1.1", default-features = false, features = ["std", "parse", "serde"] }
 # Volatile wipe of secrets and of the hasher state above (already in the graph
 # through ed25519-dalek's `zeroize` feature).
 zeroize = "1"

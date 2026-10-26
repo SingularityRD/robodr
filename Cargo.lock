@@ -2415,6 +2415,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "robodr-deliverd"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "robodr-agent",
+ "robodr-agentd",
+ "robodr-blackbox",
+ "robodr-capture",
+ "robodr-commission",
+ "robodr-diode",
+ "robodr-events",
+ "robodr-ocsf",
+ "robodr-pkg",
+ "robodr-release",
+ "robodr-responder",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "robodr-diode"
 version = "0.1.0-alpha.1"
 dependencies = [
