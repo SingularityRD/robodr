@@ -1102,6 +1102,7 @@ sudoedit /etc/systemd/system/robodr-agentd.service.d/30-control-plane.conf   # I
 #     "tls": { "cert_chain": "/etc/robodr/control-plane/robot.pem",
 #              "key_file": "/run/credentials/robodr-agentd.service/cp-tls.key",
 #              "client_ca": "/etc/robodr/control-plane/soc-ca.pem",
+#              "client_crl": "/etc/robodr/control-plane/soc-ca.crl.pem",   # optional
 #              "client_spki_sha256": ["<pin from step 2>"] },
 #     "unix_socket": "/run/robodr-agentd/control.sock",
 #     "state_dir": "/var/lib/robodr/control-plane/agentd",
@@ -1128,14 +1129,35 @@ sudo systemctl restart robodr-agentd
 - The SOC signs every request (contract §2) and needs a clock within
   `max_clock_skew_s` (default 30 s) of the robot's: run NTP on both, or
   requests are refused `stale_timestamp`.
+- **First start.** The replay store is created at the first start (and
+  whenever `state_dir` was emptied): agentd cannot tell that from a wiped
+  store, so it fences and refuses every request for `max_clock_skew_s`
+  (default 30 s) after the start (`stale_timestamp`; the SOC signs again).
+  Expect that once after commissioning.
 - **Restart.** Request states and used nonces survive a restart: the SOC
   can query a request after it and a replay stays refused. If the replay
-  store was damaged or removed, agentd fences: requests signed before the
-  start are refused `stale_timestamp` (the SOC signs again); the journal is
-  copied to `state_dir/quarantine/` and the start note says so.
+  store was damaged or removed, or the robot's clock went back below the
+  store's high-water mark, agentd fences: requests signed up to
+  `max_clock_skew_s` after the start are refused `stale_timestamp` (the
+  SOC signs again; `status.json` `control_plane.replay_fence`). A damaged
+  journal is copied to `state_dir/quarantine/` and the start note says so.
+  Only one torn last line counts as a crash; anything more is damage. A
+  damaged request journal is rebuilt from the black box's request and
+  revert notes (`state.rebuilt_from_blackbox`); if the black box cannot be
+  read, agentd refuses every new request id (503 `state_unavailable`,
+  `state.refusing_new_request_ids`) until a restart with a readable black
+  box: fix the black box (section 6.4, black-box upkeep) and restart.
+- **Connections.** TCP connections in the TLS handshake (or not yet
+  authenticated) and authenticated ones have separate slots of
+  `max_connections` (default 4) each; one source address holds at most
+  `max_connections_per_source` (default 2): raise it if several SOC
+  workers share one NAT address. The unix socket has its own 2 slots, so
+  an operator on the robot is never locked out by network peers. Rejected
+  connections count in `connections_rejected`.
 - Watch `status.json` `control_plane` (`unauthenticated`, `tls_failures`,
-  `last_auth_failure`, `recorded_not_executed`, `refused`, `busy`,
-  `rate_limited`, `journal_errors`, `replay_fence`, `evidence`) and the
+  `last_auth_failure`, `connections_rejected`, `recorded_not_executed`,
+  `refused`, `busy`, `rate_limited`, `journal_errors`, `replay_fence`,
+  `state.refusing_new_request_ids`, `evidence`) and the
   findings `robot.agent.control_plane_unauthenticated` (High: someone
   without the certificate or the key is trying) and
   `robot.agent.control_plane_invalid` (Medium: the SOC sent something the
@@ -1150,11 +1172,16 @@ sudo systemctl restart robodr-agentd
 | SOC client certificate, same CA | issue the new certificate; with pins, add the new pin to `client_spki_sha256` first (both listed), restart; switch the SOC; remove the old pin |
 | SOC client CA | append the new CA certificate to `client_ca` (PEM bundle with both), restart; reissue the SOC certificate; remove the old CA, restart |
 | Robot TLS certificate / key | install the new `robot.pem` and key (same paths), restart agentd; if the SOC pins the robot's SPKI, give it the new pin first (`openssl x509 -pubkey ...` as above) |
+| SOC client CRL | install the new CRL file (same path, `client_crl`), restart agentd |
 | Finding key (answers, manifests) | section 4.3; give the SOC the new `.pub` before the restart |
 
 TLS material and keys are read at start only: every change takes a
-restart, which keeps the request state. There is no CRL / OCSP: to cut off
-a client certificate, remove its pin or its CA and restart.
+restart, which keeps the request state. To cut off a client certificate,
+revoke it in the client CA's CRL and install that as `tls.client_crl`
+(PEM, X.509 v2; `openssl ca -gencrl`), or remove its pin or its CA, and
+restart. With `client_crl` every client CA needs a CRL in the file (a
+certificate whose issuer has none is refused); its `nextUpdate` is not
+enforced, so refresh it on your own schedule. There is no OCSP.
 
 **Evidence export (`control_plane.evidence`).** The SOC lists the retained
 evidence (`GET .../evidence`), asks for an export of a finding's evidence
@@ -1169,8 +1196,13 @@ robodr-blackbox verify bundle.rbbx --keyring agentd-blackbox.key.pub --device ug
 
 Exports are kept in `state_dir/exports/` until they expire
 (`export_ttl_s`, default 24 h) or the SOC deletes them; `max_exports`,
-`max_export_bytes` and `max_storage_bytes` bound the space they take. Each
-export is a `robodr.control_plane_evidence_export` note in the black box.
+`max_export_bytes` (at most 256 MiB) and `max_storage_bytes` bound the
+space they take, and an export is refused (507 `storage_full`) unless
+64 MiB stay free on the filesystem of `state_dir` (the request and nonce
+journals live there). A bundle is streamed to disk while it is built, and
+a build that takes over 60 s, or meets a shutdown, is abandoned (503
+`evidence_timeout`). Each export is a `robodr.control_plane_evidence_export`
+note in the black box.
 
 **Black-box upkeep.** Every tick writes the black box's `head.json`
 high-water mark when records were added since the last one. If the

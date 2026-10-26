@@ -8,7 +8,7 @@
 | Action catalog | `robodr_responder::actions` (one list shared with the planner; §4) |
 | Superseded | v1 (this file's history); the first draft, written for a cancelled integration: [`legacy/robot-edr.control-plane.md`](legacy/robot-edr.control-plane.md) |
 | Status | **Experimental.** Off by default. **Nothing is executed** unless executor v1 is enabled (§6a, off by default) |
-| Reference tests | `crates/robodr-agentd/tests/control_plane.rs` (end to end, real daemon: mTLS, restart, evidence), `tests/executor_link.rs` (executor v1 on v2: signed `pending` / `verified` / `refused` / `reverted` answers over the unix socket and mTLS, executor states across restarts), `tests/control_plane_vectors.rs` (§12), `tests/fuzz_smoke.rs`, unit tests in `src/control/{http,auth,api,journal,state,evidence,tls,mod}.rs` |
+| Reference tests | `crates/robodr-agentd/tests/control_plane.rs` (end to end, real daemon: mTLS, restart, evidence), `tests/executor_link.rs` (executor v1 on v2: signed `pending` / `verified` / `refused` / `reverted` answers over the unix socket and mTLS, executor states across restarts), `tests/control_plane_vectors.rs` (§12), `tests/fuzz_smoke.rs`, `tests/cp_review.rs` (review regressions), unit tests in `src/control/{http,auth,api,journal,state,evidence,tls,mod}.rs` |
 | Test vectors | [`fixtures/control-plane-v2/`](fixtures/control-plane-v2/) (§12) |
 
 A SOC asks the robot for one of the seven catalog actions. The on-robot agent
@@ -37,6 +37,17 @@ that as "not applied", never as success.
   16 KiB with an exact `Content-Length` (none on `GET` / `DELETE`). The
   request must arrive within 5 s (after the TLS handshake, which has its own
   5 s); the answer is written within 30 s (a slower reader is cut off).
+  These are deadlines on the whole exchange, not idle timeouts: the time
+  left bounds every socket read, inside the TLS handshake and record layer
+  too, so a peer that sends one byte at a time cannot stretch them.
+* **Connections.** The unix socket has its own slots (2), never shared with
+  TCP. On TCP, up to `max_connections` (default 4, 1..=16) connections may
+  be in the TLS handshake or before their request authenticated, and
+  another `max_connections` authenticated ones; one source address holds at
+  most `max_connections_per_source` (default 2, 1..=16) of all of them.
+  Over a cap the connection is closed at accept (no answer;
+  `connections_rejected`); an authenticated request that finds no
+  authenticated slot is answered 503 `busy` (signed).
 * Answers are JSON (`Content-Type: application/json`) except evidence chunks
   (`application/octet-stream`, §11.5). `Cache-Control: no-store`.
 * **Listeners** (at least one):
@@ -64,6 +75,12 @@ that as "not applied", never as success.
     client end-entity certificate's DER `SubjectPublicKeyInfo` must be one
     of them **in addition**. Several CA certificates and pins may be listed
     for a rotation (§10).
+  * Optional `tls.client_crl` (PEM, X.509 v2 CRLs): the client certificate
+    chain is also checked for revocation. A certificate whose issuer has no
+    CRL in the file is refused (unknown status fails closed), so give a
+    current CRL of every CA in `tls.client_ca` that issues SOC client
+    certificates. Loaded at start (a new CRL takes a restart); its
+    `nextUpdate` is not enforced.
   * No session resumption (no tickets, no session cache): every connection
     presents and checks the client certificate.
   * A failed handshake (no certificate, unknown CA, expired, pin mismatch,
@@ -112,11 +129,22 @@ request goes further, so a request accepted before a restart is still a
 replay after it while its timestamp is in the window. At most 8192 live
 pairs (503 `replay_cache_full` when full of live ones, never accepted
 unchecked); a pair that cannot be made durable refuses the request (503
-`replay_store_unavailable`). If the store cannot be trusted at start
-(damaged entries, or missing while the request journal exists), agentd
-**fences**: every request whose timestamp is not later than the start is
-refused (`stale_timestamp`); sign again. (`status.json`:
-`control_plane.replay_fence`.)
+`replay_store_unavailable`). If the store may be missing pairs, agentd
+**fences**: every request whose timestamp is not later than the fence is
+refused (`stale_timestamp`); sign again. It fences when, at start,
+
+* the store had to be created: a first install and a removed or wiped state
+  directory look the same, so **the first start refuses requests for
+  `max_clock_skew_s` seconds**;
+* the store is damaged (§9);
+* the wall clock reads below the store's persisted high-water mark (the
+  latest second at which it dropped expired pairs, a `clock` entry); and,
+  while running, when the clock steps back below that mark.
+
+The fence is `max(now, high-water mark) + max_clock_skew_s`: a request
+accepted before may carry a timestamp up to the skew ahead of the clock
+that accepted it. (`status.json`: `control_plane.replay_fence`;
+`state.replay.high_water`, `state.replay.clock_went_back`.)
 
 Authenticated requests are rate-limited per key (`rate_per_minute`, default
 30, `burst` 10; evidence chunk downloads have their own bucket, §11.7; 429
@@ -146,7 +174,15 @@ robodr-control-plane/v2 answer
 verifiable with the robot's finding public key (the key the SOC already
 holds for `robodr-finding-sig`; `finding_signing` is required with
 `control_plane`). Binding to the request signature (and so to its nonce)
-stops the replay of an old answer. Answers to requests that did not
+stops the replay of an old answer.
+
+**What the answer signature covers:** the HTTP status, the SHA-256 of the
+body bytes and the request's signature, nothing else. Headers are **not**
+covered: not `Content-Type`, not `Retry-After` (429), not
+`X-RoboDR-Manifest-Signature` (that one is its own signature, §11.4).
+A SOC takes every decision from the signed status and body; it may use
+`Retry-After` only as a scheduling hint (a forged one can only delay a
+retry, which the 429 body's own `retry after N s` text, signed, bounds). Answers to requests that did not
 authenticate (400 before the credentials were read, 401, 503
 `replay_cache_full` / `replay_store_unavailable` / `clock_unavailable`) are
 never signed: there is nothing to bind them to. If the robot cannot sign, it
@@ -283,6 +319,7 @@ and a consumer must not either.
 {"request_id": "robot_restrict_motion:ugv-007:3f2a9c0d11e45b6a",
  "status": "recorded_not_executed",
  "executed": false,
+ "in_force": false,
  "duplicate": true,
  "refusal": {"code": "safety_system_engaged", "reason": "...", "safety_state": "estop_active"},
  "state": {"robot_id": "ugv-007", "action": "restrict_motion", "parameters": {...},
@@ -300,11 +337,18 @@ and a consumer must not either.
 
 `duplicate` only on a resubmission, `refusal` only when refused.
 
+`in_force` (every request-state answer, revert answers included) says
+whether the action is **being enforced on the robot now**: `true` only for
+`verified` (or `applied`) when the executor does not hold it (§6a, reboot);
+`false` for every other status. `executed` stays "it took effect at some
+point" (`true` for `reverted` too). `state.executor_state: "held"` appears
+only on a `verified` request whose action the executor holds (§6a).
+
 | `status` | Meaning | Terminal |
 | --- | --- | --- |
 | `recorded_not_executed` | accepted against the current safety state and recorded as a plan in the black box; **nothing was sent to the robot** | yes |
 | `refused` | judged unsafe or not allowed now (§4.1), recorded | yes |
-| `failed` | not taken: `state.error.code` is `evidence_unavailable` (the black box did not take it) or `state_unavailable` (the request journal did not take it, §9); nothing was decided or stored, a retry is judged anew | yes |
+| `failed` | not taken: `state.error.code` is `evidence_unavailable` (the black box did not take it) or `state_unavailable` (the request journal did not take it, §9); nothing was decided or stored, **nothing was handed to an executor**, a retry is judged anew | yes |
 | `pending`, `verified`, `reverted` | executor v1 only (§6a); `refused` and `failed` are also what the executor answers for its own checks and faults | see §6a |
 | `applied` | reserved; no executor in this repository reports it | — |
 
@@ -315,6 +359,9 @@ judged or recorded again); the same id for anything else is 409
 1024) requests and **survives a restart** (§9), executor states (§6a)
 included: a status query after a restart answers exactly as before it; older requests answer 404
 `unknown_request` (the black box keeps every decision; §11 exports it).
+After journal damage the requests are rebuilt from the black box (§9); a
+request id the robot cannot reconcile is answered 503 `state_unavailable`
+(signed) instead of being judged again.
 
 ## 6. Revert
 
@@ -379,10 +426,12 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
 * **TTL.** Every executed action has a TTL: the request's `ttl_seconds`,
   or the executor's `ttl.default_s` when the request names none. The
   executor lifts the action at `expires_at_ms` without further requests.
-* **Client requirements.** Report `verified` (not `pending`) as "in
-  force". Treat `refused` and `failed` as "not applied" and show
-  `refusal.code`, `refusal.reason` and `state.error`. Poll GET for a
-  `pending` request.
+* **Client requirements.** Report "in force" exactly when `in_force` is
+  `true` (a `verified` request the executor does not hold); a `verified`
+  request with `in_force: false` and `state.executor_state: "held"` is
+  "held after a reboot, not enforced" (keep polling GET). Treat `refused`
+  and `failed` as "not applied" and show `refusal.code`, `refusal.reason`
+  and `state.error`. Poll GET for a `pending` request.
 * **Evidence.** Each executor event (`applied`, `verified`, `refused`,
   `failed`, `reverted`, `expired`, `revert_failed`, `drift`,
   `removed_externally`, `reconciled`, `journal_reset`, `held`, `rearmed`,
@@ -391,10 +440,20 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
   (fsynced). `status.json` carries `executor` counters.
 * **Reboot.** After a reboot of the robot an action in force is held
   (not installed) until the executor re-validated it and agentd supplied
-  a fresh safety state; the request keeps its status meanwhile (`verified`)
-  and turns `reverted` if it is not re-armed before its TTL. A held
-  action is not a new state: nothing is journalled for it and the request
-  answers its journalled status, also across an agentd restart.
+  a fresh safety state; it turns `reverted` if it is not re-armed before
+  its TTL. A held action is not a new state: nothing is journalled for it
+  and the request keeps its journalled `status` (`verified`), but while
+  held every answer says so: `"in_force": false` and
+  `"state": {"executor_state": "held", ...}`. Once re-armed, `in_force` is
+  `true` again and `executor_state` is gone. (agentd learns of the hold
+  from the executor's word on the request; after an agentd restart, from
+  its resync.)
+* **Orders follow the record.** An order is handed to the executor only
+  after the request's black-box note and journal commit (or, for a revert,
+  its note) exist, and only if the stored request is still `pending` and is
+  the one the order was made for (action, TTL, SOC key). A request answered
+  `failed` (or 503) leaves nothing behind for the executor: a retry with
+  the same `request_id` can never release an order of the failed attempt.
 
 ## 7. HTTP errors
 
@@ -417,15 +476,22 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
 * 431: `head_too_large`, `too_many_headers`;
 * 500: `export_corrupt` (the stored export no longer matches its manifest;
   it was deleted: create it again), `answer_signing_failed` (unsigned);
-* 503: `busy` (the main loop did not take or answer in `answer_timeout_ms`,
-  or the daemon is stopping), `replay_cache_full`,
-  `replay_store_unavailable`, `clock_unavailable`, `state_unavailable`,
+* 503: `busy` (below), `replay_cache_full`,
+  `replay_store_unavailable`, `clock_unavailable`, `state_unavailable`
+  (also: a request id the damaged journal could not reconcile, §9),
   `evidence_busy` (another evidence index / export runs: retry shortly),
-  `evidence_unavailable`;
+  `evidence_timeout` (an export took longer than 60 s, or the daemon is
+  stopping: select fewer records), `evidence_unavailable`;
 * 505 `bad_version`; 507 `storage_full`.
 
-A 503 `busy` after the request was handed over may still have been
-recorded: read it back with GET.
+**503 `busy`** (signed: the request authenticated) means one of: every
+authenticated TCP connection slot is taken (§1; nothing was done), the
+queue to the main loop is full or the daemon is stopping (nothing was
+done), or the main loop did not answer within `answer_timeout_ms` (the
+request **may still have been recorded**). A SOC retries a `busy`
+submission with the **same** `request_id` and body (a fresh nonce): it is
+then either judged for the first time or answered as a duplicate, never
+judged twice. GET is always safe to retry.
 
 ## 8. Evidence of the control plane and findings
 
@@ -462,8 +528,12 @@ self-health, rate limited by `daemon.health_report_ms`):
 `executes_actions`, connection, authentication (`tls_failures` included),
 rate-limit and busy counters, `answers_signed`, `answer_sign_failures`,
 `last_auth_failure`, `tls` (`server_spki_sha256`, `client_cas`,
-`client_pins`), `replay_entries`, `replay_store_errors`, `replay_fence`,
-`state` (what §9 found at start), `evidence` (exports, bytes, created,
+`client_pins`, `client_crls`), `replay_entries`, `replay_store_errors`,
+`replay_fence`,
+`state` (what §9 found at start, including `rebuilt_from_blackbox`,
+`rebuilt_reverts`, `lost_request_ids`, `refusing_new_request_ids` and the
+replay store's `replay.high_water` / `replay.clock_went_back` / `fence`),
+`evidence` (exports, bytes, created,
 deleted, expired, chunks served, corrupt) and the engine's `submitted`,
 `recorded_not_executed`, `refused`, `duplicates`, `conflicts`, `reverts`,
 `invalid`, `record_failures`, `evicted`, `stored`, `restored`,
@@ -493,10 +563,28 @@ if that last fsync fails, the journal also refuses appends until restart
 (fail closed: requests are answered `failed` / `state_unavailable`, or 503
 `replay_store_unavailable`), since the rename might not survive a power
 loss.
-At open, an unterminated or bad last line is a torn append (cut); a bad line
-followed by good ones is damage (counted, the file copied to `quarantine/`,
-rewritten without it). The journal is operational state, not evidence: it is
-checksummed, not signed; the black box stays the record.
+At open, **one** bad line after the last good one (unterminated or not) is a
+torn append (cut): every append is a single synced write, so a crash leaves
+at most that one line. Anything more is **damage**: a bad line followed by
+good ones, or two or more bad lines at the end. Damaged lines are counted,
+the file is copied to `quarantine/` and rewritten from the good entries.
+The journal is operational state, not evidence: it is checksummed, not
+signed; the black box stays the record.
+
+**After damage** agentd falls back to the record:
+
+* replay store: it fences (§2);
+* request journal: it is **rebuilt from the black box**: every
+  `robodr.control_plane_request` note of this robot whose request the
+  journal lost is restored (its decision-time state; `received_at_ms` is
+  the note's record time; an executor request then takes the executor's
+  word on resync), and every `robodr.control_plane_revert` note restores
+  the revert record it proves. A note that does not convert back makes its
+  `request_id` refused (503 `state_unavailable`) rather than judged again.
+  If the black box cannot be read, **every new `request_id` is refused**
+  (503 `state_unavailable`; stored requests still answer) until a restart
+  reconciles the journal. Requests older than the black box's retention
+  are gone either way (as after eviction).
 
 **Decisions** are journaled around the black-box note:
 
@@ -516,6 +604,12 @@ refuses the request before anything is judged into evidence (`failed`,
 revert record, or an executor revert that reports `reverted`) follow the
 same steps (`revert_begin` / `revert_commit` / `revert_abort`). The newest
 `max_requests` requests are kept.
+
+**Replay store entries** are `{"t":"nonce","key_id":...,"nonce":...,
+"dead_after":<unix s>}`, plus one `{"t":"clock","key_id":"","nonce":"",
+"dead_after":<unix s>}` written with every compaction: the high-water mark
+of §2 (the latest second at which expired pairs were dropped). An agentd
+older than this revision reads a `clock` entry as damage and fences once.
 
 **Executor states** (executor v1, §6a) are one entry each,
 `{"t":"executor","request_id":...,"status":...,"error":...,"refusal":...}`,
@@ -547,9 +641,13 @@ What a SOC integration must do to use this API correctly:
   using it; drop answers without a valid signature.
 * **Statuses.** Know every status of §5. `recorded_not_executed` is
   **terminal** and means "accepted and recorded as a plan, not executed":
-  report it as not applied, never as success, and never poll it. Report
-  `verified` only for `applied` with `executed: true` (no such answer
-  exists in this release).
+  report it as not applied, never as success, and never poll it. Report an
+  action as in force only when the answer says `"in_force": true`
+  (`verified` and not held, §6a); `verified` with `in_force: false` and
+  `state.executor_state: "held"` is "held, not enforced".
+* **Retries.** On 503 `busy` or a lost answer, resubmit with the same
+  `request_id` and body and a fresh nonce (§7); never a new `request_id`
+  for the same intent unless the first answer was a final `failed`.
 * **Refusals are final** (§4.1): show `refusal.code`, `refusal.reason` and
   `refusal.safety_state` (a state name) to the person; do not retry.
 * **Parameters.** `restrict_motion` caps are in (0, 10]: 0 is a stop and is
@@ -563,6 +661,8 @@ What a SOC integration must do to use this API correctly:
   `tls.client_ca` (and both pins) and both SOC keys in `soc_keys` while
   the SOC switches, then remove the old ones; the robot's own TLS key and
   certificate are replaced by files and a restart (state survives it).
+  With `tls.client_crl`, ship a current CRL of every client CA and restart
+  agentd when it changes.
 
 ## 11. Evidence API (`control_plane.evidence`)
 
@@ -634,7 +734,10 @@ selector is 409 `export_id_conflict`. `requested_by` / `reason` as in §4.
 Selector errors: 400 `invalid_selector`. Then: a span with a gap is 409
 `evidence_gap`; frames over `max_export_bytes` are 413 `export_too_large`;
 more than `max_exports` kept exports is 409 `export_limit`; more than
-`max_storage_bytes` in kept bundles is 507 `storage_full`; a concurrent
+`max_storage_bytes` in kept bundles, or an export that would leave less
+than 64 MiB free on the state directory's filesystem, is 507
+`storage_full`; a build that takes longer than 60 s (or meets a daemon
+shutdown) is abandoned with 503 `evidence_timeout`; a concurrent
 index / export is 503 `evidence_busy`; a black box that cannot be read, or
 that changed under the export (retention), or that did not take the export's
 note, is 503 `evidence_unavailable` (nothing was exported). Every created
@@ -735,7 +838,7 @@ is an incident). A "verified" badge must mean exactly steps 1–5 passed.
 
 | Setting (`control_plane.evidence`) | Default | Range |
 | --- | --- | --- |
-| `max_export_bytes` | 64 MiB | 64 KiB ..= 1 GiB |
+| `max_export_bytes` | 64 MiB | 64 KiB ..= 256 MiB |
 | `chunk_bytes` | 1 MiB | 16 KiB ..= 4 MiB; at most 4096 chunks per export |
 | `max_exports` (kept at once) | 8 | 1 ..= 64 |
 | `max_storage_bytes` (all kept bundles) | 512 MiB | `max_export_bytes` ..= 16 GiB |
@@ -743,9 +846,17 @@ is an incident). A "verified" badge must mean exactly steps 1–5 passed.
 | `chunk_rate_per_minute` / `chunk_burst` (per key, own bucket) | 600 / 60 | 1..=6000 / 1..=600 |
 
 One evidence index or export runs at a time (503 `evidence_busy`). An
-export reads one black-box segment at a time (at most 256 MiB each) plus the
-selected frames. Delete exports when downloaded (`DELETE`) to free the
-quota; expired ones are deleted at the next evidence call or start.
+export reads one black-box segment at a time (at most 256 MiB each) and
+streams the bundle into its temp file as it goes (per-chunk and whole
+SHA-256 computed on the way): the bundle is never held in memory. Before
+building, the export must fit `max_storage_bytes` and leave 64 MiB free on
+the state directory's filesystem (the request and nonce journals live
+there; 507 `storage_full`); the build is abandoned after 60 s or at
+shutdown (503 `evidence_timeout`, nothing kept). Delete exports when
+downloaded (`DELETE`) to free the quota; expired ones are deleted at the
+next evidence call or start. A chunk download that finds its export
+corrupt deletes it only if it is still the export it read (a delete and
+re-create of the same `export_id` in between keeps the new one).
 
 ## 12. Test vectors (`fixtures/control-plane-v2/`)
 
@@ -788,20 +899,27 @@ another robot), 13 (signed in the removed v1 domain); all 401
   static configuration) and the response policy; `control`, `phase` and
   `connectivity` are still configuration.
 * TLS material is loaded at start: a rotation of the robot's certificate or
-  of the trusted SOC CAs / pins takes a restart (the state survives it).
-  There is no revocation list (CRL / OCSP) for SOC client certificates:
-  remove the CA or use pins and restart.
+  of the trusted SOC CAs / pins / CRLs takes a restart (the state survives
+  it). Revocation is by CRL file only (`tls.client_crl`, its `nextUpdate`
+  not enforced); there is no OCSP.
 * The request journal and replay store are checksummed, not signed: a
-  person with write access to the state directory can make the robot forget
-  requests (a resubmission is then judged anew and recorded again; the black
-  box keeps both) or make it fence; not forge a decision (the black box
-  holds every decision, signed).
+  person with write access to the state directory can make the robot fence,
+  or remove whole valid lines, which no checksum detects: those requests
+  are forgotten (a resubmission is judged anew and recorded again; the
+  black box keeps both). Such a person cannot forge a decision (the black
+  box holds every decision, signed). Damage the checksums do detect is
+  rebuilt from the black box (§9).
+* The first start on an empty state directory (and any start after the
+  replay store was removed) refuses requests for `max_clock_skew_s`
+  seconds (the fence, §2).
 * The evidence API reads the black box while it is written: a record past
   the last complete frame is not exported yet; an export that races with
   cyclic retention is refused (retry).
 * A network attacker without the client certificate can still make the TLS
-  listener spend handshakes (bounded by `max_connections` and the 5 s
-  deadline) and drop or delay requests and answers.
+  listener spend handshakes (bounded by `max_connections`, the per-source
+  cap and the 5 s deadline, which a byte-at-a-time peer cannot stretch) and
+  drop or delay requests and answers; from several source addresses it can
+  keep every TCP pre-authentication slot busy (never the unix socket's).
 * Tested with synthetic traffic, an in-process signing client and an
   OpenSSL-made test PKI (`crates/robodr-agentd/tests/data/control-tls/`),
   not against a deployed SOC or across a real network.
@@ -822,3 +940,35 @@ another robot), 13 (signed in the removed v1 domain); all 401
 * Executor v1's statuses (§6a) are answered and persisted the v2 way:
   signed answers, journalled states (every executor refusal code of §6a
   survives a restart; a held action journals nothing new).
+
+### Revision: control plane v2 review (2026-10)
+
+Wire changes a SOC client must follow (the API version stays
+`robodr-control-plane/v2`):
+
+* **New answer field `in_force`** (boolean, top level) in every
+  request-state answer (submit, GET, revert); `state.executor_state:
+  "held"` while the executor holds a `verified` action after a reboot
+  (§5, §6a). Vectors `02-submit` and `03-get-request` changed accordingly
+  (body, body SHA-256, answer message and answer signature).
+* **Replay fence** (§2): `now + max_clock_skew_s` (was `now`); always when
+  the replay store is created (a first start refuses requests for the
+  skew); also when the wall clock goes back below the store's high-water
+  mark. Wire code unchanged (`stale_timestamp`).
+* **New error codes**: 503 `evidence_timeout` (§11.3); 503
+  `state_unavailable` also for a request id a damaged journal could not
+  reconcile (§9); 507 `storage_full` also for the free-space headroom.
+* **503 `busy`** semantics and retry rule documented (§7); it is also
+  answered when every authenticated TCP slot is taken (§1).
+* **Answer-signature coverage** documented (§2): status, body hash, request
+  signature; not `Content-Type` / `Retry-After`.
+
+Robot-side changes (no wire format change): per-listener connection slots,
+handshakes counted apart from authenticated connections, a per-source cap
+(`max_connections_per_source`, §1); deadlines bound every socket read (§1);
+optional `tls.client_crl` (§1); journal tail damage beyond one line is
+damage, the request journal is rebuilt from the black box (§9); orders reach
+the executor only for recorded, matching requests (§6a); evidence exports
+streamed, `max_export_bytes` at most 256 MiB, free-space headroom, build
+deadline (§11.7); a corrupt-chunk delete never removes a re-created export;
+`%XX` in a path takes two hex digits only (a sign is refused).

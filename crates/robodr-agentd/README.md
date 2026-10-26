@@ -54,7 +54,7 @@ level, and every path must be absolute.
 | `sensor.motion` | Optional. The live motion decode path: `enabled` (default true), `feedback_topics` (e.g. `["/odom"]`), `max_writers`, `max_samples_per_datagram` (`evaluate_commands` is accepted but the daemon always lets the agent evaluate). Unknown keys are refused. |
 | `sensor.unitree_legacy` | Optional, off by default. Unitree legacy UDP (Go1 generation): `enabled`, `ports` (default `[8007, 8080, 8082, 8090]`), `command_senders` (IPs allowed to send `HighCmd` / `LowCmd`, or tables `{"ip", "mac"?, "label"?}`; `mac` binds the sender to its link-layer source), `robot_addresses` (default `192.168.123.10`, `192.168.123.161`). Needs `sensor.capture`. Unknown keys are refused. |
 | `host_threats` | Optional. `socket_path` (the socket `robodr-threat-forward` writes Pulsar threats to), `socket_mode` (`"0600"` default or `"0660"`), `allowed_uids` (peers besides uid 0), `max_connections` (default 2, max 8). See "Host threats" below. |
-| `control_plane` | Optional, off when absent. The SOC API `robodr-control-plane/v2`: `listen_tcp` (with `tls` any address, mutual TLS; without, loopback only), `tls` (`cert_chain`, `key_file`, `client_ca`, optional `client_spki_sha256` pins), `unix_socket` (`socket_mode` `"0600"`/`"0660"`), `state_dir` (required, private 0700: request journal, replay store, exports), `soc_keys` (Ed25519 public key files), `max_clock_skew_s` 30, `rate_per_minute` 30, `burst` 10, `max_connections` 4, `max_requests` 1024, `answer_timeout_ms` 5000, `evidence` (optional; evidence API, see below). Needs `finding_signing` (answers are signed). Requests are judged and recorded, **never executed** unless `executor` is enabled. See "Control plane" below. |
+| `control_plane` | Optional, off when absent. The SOC API `robodr-control-plane/v2`: `listen_tcp` (with `tls` any address, mutual TLS; without, loopback only), `tls` (`cert_chain`, `key_file`, `client_ca`, optional `client_crl` (PEM CRLs of the client CAs), optional `client_spki_sha256` pins), `unix_socket` (`socket_mode` `"0600"`/`"0660"`), `state_dir` (required, private 0700: request journal, replay store, exports), `soc_keys` (Ed25519 public key files), `max_clock_skew_s` 30, `rate_per_minute` 30, `burst` 10, `max_connections` 4 (TCP, counted apart for handshakes and authenticated connections; the unix socket has its own 2), `max_connections_per_source` 2, `max_requests` 1024, `answer_timeout_ms` 5000, `evidence` (optional; evidence API, see below). Needs `finding_signing` (answers are signed). Requests are judged and recorded, **never executed** unless `executor` is enabled. See "Control plane" below. |
 | `daemon` | `queue_capacity` 4096 (max 65536), `queue_bytes` 33554432 (32 MiB; 1 MiB..=256 MiB), `tick_ms` 1000, `heartbeat_ms` 10000, `silence_ms` 30000, `lag_ms` 2000, `health_report_ms` 10000, `exit_when_inputs_end` false |
 
 **Key.** Keys are never accepted on the command line. `blackbox.key_file`
@@ -328,6 +328,7 @@ accepted request is `recorded_not_executed` (`"executed": false`),
     "cert_chain": "/etc/robodr/control-plane/robot.pem",
     "key_file": "/run/credentials/robodr-agentd.service/cp-tls.key",
     "client_ca": "/etc/robodr/control-plane/soc-ca.pem",
+    "client_crl": "/etc/robodr/control-plane/soc-ca.crl.pem",
     "client_spki_sha256": ["<64 hex>"]
   },
   "unix_socket": "/run/robodr-agentd/control.sock",
@@ -340,7 +341,8 @@ accepted request is `recorded_not_executed` (`"executed": false`),
 - **Transport (`src/control/tls.rs`).** A TCP listener with `tls` is mutual
   TLS (rustls + ring, the uplink's crates): the SOC's client certificate
   must chain to `client_ca`, be valid and permit `clientAuth`, and — with
-  pins — have a pinned SPKI; no session resumption. Without `tls`,
+  pins — have a pinned SPKI; with `client_crl`, not be revoked (an issuer
+  without a CRL in the file fails closed); no session resumption. Without `tls`,
   `listen_tcp` must be loopback (plain HTTP, tests / a local relay); the
   unix socket is plain too. `allow_remote` (v1) is gone and refused with a
   pointer to `tls`. A failed handshake is a failed authentication.
@@ -349,9 +351,16 @@ accepted request is `recorded_not_executed` (`"executed": false`),
   robot's id, key id, timestamp, nonce and body hash (domain
   `robodr-control-plane/v2`); ±`max_clock_skew_s` and a **persisted** nonce
   store stop replays, also across restarts (full / unwritable: refused,
-  never unchecked; untrusted at start: fenced); per-key token bucket. Every
-  answer to an authenticated request is signed with the finding key, bound
-  to the request signature (mandatory: `finding_signing` is required).
+  never unchecked). The store fences (refuses timestamps up to
+  now + `max_clock_skew_s`) when it was created (so a first start refuses
+  requests for the skew), damaged, or when the clock reads below its
+  persisted high-water mark; per-key token bucket. Every answer to an
+  authenticated request is signed with the finding key over status, body
+  hash and the request signature (headers such as `Retry-After` are not
+  covered), bound to the request (mandatory: `finding_signing` is
+  required). Answers carry `in_force` (enforced on the robot now; `false`
+  while the executor holds a `verified` action after a reboot,
+  `state.executor_state: "held"`).
 - **Allow-list.** The seven catalog actions, each with its own parameters (speed caps in
   (0, 10], a zone, a GUID or node name, a profile/program rollback); the
   time-limited classes need `ttl_seconds` 1..=86400, the others refuse one;
@@ -387,19 +396,32 @@ accepted request is `recorded_not_executed` (`"executed": false`),
   the black box refused; a decision a crash left dangling is settled at the
   next start from the black box (a note with its `decision_id` → commit,
   none → abort). Compaction writes a temp file, fsyncs, renames, fsyncs the
-  directory; a torn last line is cut, damage in the middle is quarantined.
-  A status query after a restart answers as before it.
+  directory; one torn last line is cut, anything more (in the middle or
+  two or more lines at the end) is damage: quarantined, the replay store
+  fences and the request journal is rebuilt from the black box's request /
+  revert notes (if the black box cannot be read, new request ids are
+  refused until a restart reconciles). A status query after a restart
+  answers as before it. An order reaches the executor only once its
+  request is recorded and only if the stored request still matches it; a
+  `failed` request leaves nothing staged.
 - **Evidence API (`evidence.rs`, `control_plane.evidence`).** Inventory of
   the retained records; exports of a finding's evidence links (plus
   context), a seq range or a time range as an `RBBXBND1` bundle of the
   frames exactly as stored, with a manifest (selection, chain identity and
   signing key, record range, anchor, chunk hashes) signed with the finding
   key; signed, resumable chunks (16 KiB..4 MiB); limits on size, count,
-  storage and age; one export at a time. The SOC verifies with the robot's
+  storage and age (`max_export_bytes` at most 256 MiB); one export at a
+  time, streamed into its temp file (never held in memory), refused (507)
+  unless 64 MiB stay free for the journals, abandoned after 60 s or at
+  shutdown (503 `evidence_timeout`). The SOC verifies with the robot's
   public keys (`robodr-blackbox verify bundle.rbbx`).
 - **Abuse.** Bounded parsing (8 KiB head, 16 KiB body, 5 s for the TLS
-  handshake and 5 s for the request, 30 s for the answer), at most
-  `max_connections`, a bounded queue to the main loop (full: 503). Failed
+  handshake and 5 s for the request, 30 s for the answer: deadlines that
+  bound every socket read, so a byte-at-a-time peer cannot stretch them),
+  separate connection slots per listener (the root-only unix socket can
+  never be locked out by TCP peers), TCP handshakes counted apart from
+  authenticated connections, at most `max_connections_per_source` per
+  source address, a bounded queue to the main loop (full: 503 `busy`). Failed
   authentications raise `robot.agent.control_plane_unauthenticated` (High),
   authenticated invalid requests `robot.agent.control_plane_invalid`
   (Medium); both observe-only self-health, rate-limited by

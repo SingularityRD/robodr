@@ -12,6 +12,44 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Security
 
+- Control plane v2 review (agentd, `robodr-control-plane/v2`):
+  - **TLS read deadline (high):** the handshake and request deadlines now
+    bound every socket read (rustls' `complete_io` loops reused one socket
+    timeout, so a peer dripping one byte per timeout held a slot for
+    hours).
+  - **Connection slots (medium):** the unix socket has its own slots; TCP
+    counts handshakes / unauthenticated connections apart from
+    authenticated ones, and one source address holds at most
+    `max_connections_per_source` (new, default 2). Idle TCP peers can no
+    longer lock out the root-only unix socket.
+  - **No order without a record (medium):** a request answered `failed`
+    leaves nothing staged for the executor (submit and revert); the daemon
+    releases a control-plane order only if the stored request is still
+    `pending` and matches it (a retry with the same `request_id` and
+    another action used to dispatch both).
+  - **Journal damage (medium):** only one trailing line of a request or
+    nonce journal can be a torn append; more is damage (quarantined). The
+    replay store then fences; the request journal is rebuilt from the
+    black box's request / revert notes, and refuses new request ids if
+    the black box cannot be read (committed requests were forgotten and
+    judged again after a restart).
+  - **Replay fence (low-medium):** the fence covers now + skew, is set
+    whenever the nonce store is created (a first start refuses requests
+    for `max_clock_skew_s`), and when the clock goes back below the
+    store's persisted high-water mark.
+  - **Held is not in force (medium):** answers carry `in_force` and, for
+    an action the executor holds after a reboot,
+    `state.executor_state: "held"` (contract §5 / §6a; vectors 02 and 03
+    regenerated).
+  - **Evidence limits (low):** exports are streamed to disk (never held in
+    memory), `max_export_bytes` is capped at 256 MiB, an export must leave
+    64 MiB free for the journals (507 `storage_full`), a build is
+    abandoned after 60 s or at shutdown (503 `evidence_timeout`); a
+    corrupt-chunk read never deletes a re-created export.
+  - Optional `control_plane.tls.client_crl` (SOC client certificate
+    revocation); `%XX` path decoding refuses a sign; answer-signature
+    coverage and 503 `busy` semantics documented.
+
 - `robodr-firewall-gw` (review F1, critical): a spoofed DATA with the
   motion writer's GUID and a far-future sequence number no longer poisons
   the stream. Sequence / replay state is bound to (GUID, authorised
