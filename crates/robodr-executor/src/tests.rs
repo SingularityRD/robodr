@@ -885,20 +885,36 @@ fn evidence_adapter_marks_and_verifies() {
             }
         }
     }
-    let c = cfg("/tmp/unused");
     // Accepted even while the e-stop is engaged and in observe mode.
-    let p = policy(Morphology::Humanoid, false, &[]);
-    let o = order(
+    let mut o = order(
         "ev1",
         ActionId::RecordEvidence,
         Morphology::Humanoid,
         SafetyState::EStopActive,
     );
+    o.context.profile_locked = false;
     let mut s = Sink(Vec::new());
-    let out = crate::evidence::record(&o, &p, &c, &["robodr-blackbox://x/0/1".into()], &mut s, 5);
+    let out = crate::evidence::record(&o, &["robodr-blackbox://x/0/1".into()], &mut s, 5);
     assert_eq!(out.status, Status::Verified, "{out:?}");
     assert_eq!(s.0[0]["kind"], "robodr.evidence_mark");
     assert_eq!(s.0[0]["bundle"][0], "robodr-blackbox://x/0/1");
+    // A replay or another action is refused and marks nothing.
+    o.replay = true;
+    assert_eq!(
+        crate::evidence::record(&o, &[], &mut s, 6).status,
+        Status::Refused
+    );
+    let o = order(
+        "x",
+        ActionId::IsolateNetwork,
+        Morphology::Humanoid,
+        SafetyState::Idle,
+    );
+    assert_eq!(
+        crate::evidence::record(&o, &[], &mut s, 6).status,
+        Status::Refused
+    );
+    assert_eq!(s.0.len(), 1);
 }
 
 #[test]

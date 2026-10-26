@@ -25,6 +25,9 @@ robodr-commission = { workspace = true }
 # Weak-signal correlation over every finding the daemon reports.
 robodr-correlate = { workspace = true }
 robodr-events = { workspace = true }
+# executor v1: orders to the separate robodr-executor process (client side
+# of its protocol, order types); agentd itself never touches nftables.
+robodr-executor = { workspace = true }
 robodr-firewall = { workspace = true }
 robodr-motion = { workspace = true }
 robodr-ocsf = { workspace = true }

@@ -827,9 +827,20 @@ pub enum Status {
     Refused,
     /// An executor failed (no such executor here).
     Failed,
+    // --- executor v1 (robodr-executor, `executor.enabled`) ---------------
+    /// The executor applied it and the read-back matched.
+    Verified,
+    /// The executor removed it again (revert request, TTL, reconciliation).
+    Reverted,
 }
 
 impl Status {
+    /// The request took effect on the robot (applied, verified, or applied
+    /// and reverted since).
+    pub fn executed(self) -> bool {
+        matches!(self, Status::Applied | Status::Verified | Status::Reverted)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Status::RecordedNotExecuted => "recorded_not_executed",
@@ -837,6 +848,8 @@ impl Status {
             Status::Applied => "applied",
             Status::Refused => "refused",
             Status::Failed => "failed",
+            Status::Verified => "verified",
+            Status::Reverted => "reverted",
         }
     }
 }
@@ -859,6 +872,39 @@ pub enum ExecutorOutcome {
     Pending,
     Applied,
     Failed(String),
+    // --- executor v1 -------------------------------------------------------
+    Verified,
+    Reverted,
+    /// The executor's own checks refused it (nothing applied).
+    Refused {
+        code: &'static str,
+        reason: String,
+    },
+}
+
+/// Status, error and refusal a stored request takes for an executor
+/// outcome (executor v1).
+fn outcome_status(
+    out: ExecutorOutcome,
+    state: SafetyState,
+) -> (Status, Option<String>, Option<Refusal>) {
+    match out {
+        ExecutorOutcome::RecordedNotExecuted => (Status::RecordedNotExecuted, None, None),
+        ExecutorOutcome::Pending => (Status::Pending, None, None),
+        ExecutorOutcome::Applied => (Status::Applied, None, None),
+        ExecutorOutcome::Failed(e) => (Status::Failed, Some(e), None),
+        ExecutorOutcome::Verified => (Status::Verified, None, None),
+        ExecutorOutcome::Reverted => (Status::Reverted, None, None),
+        ExecutorOutcome::Refused { code, reason } => (
+            Status::Refused,
+            None,
+            Some(Refusal {
+                code,
+                reason,
+                safety_state: state,
+            }),
+        ),
+    }
 }
 
 /// Receives accepted requests. A real executor must follow
@@ -871,6 +917,17 @@ pub trait ActionExecutor {
     /// Whether it can act on the robot at all.
     fn executes(&self) -> bool;
     fn submit(&mut self, a: &AcceptedAction<'_>) -> ExecutorOutcome;
+    // --- executor v1 -------------------------------------------------------
+    /// Ask for a revert of an accepted request; `None` (the default): this
+    /// executor cannot revert.
+    fn revert(&mut self, _request_id: &str, _reason: &str) -> Option<ExecutorOutcome> {
+        None
+    }
+    /// The executor's latest word on a request it was given (`None`:
+    /// nothing new). Asked before a request's state is answered.
+    fn refresh(&mut self, _request_id: &str) -> Option<ExecutorOutcome> {
+        None
+    }
 }
 
 /// Executes nothing: every accepted request stays a recorded plan.
@@ -1033,6 +1090,35 @@ impl Engine {
         self.executor.name()
     }
 
+    // --- executor v1 -------------------------------------------------------
+    /// Replace the executor (agentd's `executor.enabled`).
+    pub fn set_executor(&mut self, executor: Box<dyn ActionExecutor>) {
+        self.executor = executor;
+    }
+
+    /// Take the executor's latest word on a stored request.
+    fn refresh(&mut self, id: &str) {
+        let Some(s) = self.store.get_mut(id) else {
+            return;
+        };
+        if !matches!(
+            s.status,
+            Status::Pending | Status::Applied | Status::Verified
+        ) {
+            return;
+        }
+        if let Some(out) = self.executor.refresh(id) {
+            let (st, err, refusal) = outcome_status(out, s.safety_state);
+            s.status = st;
+            if err.is_some() {
+                s.error = err;
+            }
+            if refusal.is_some() {
+                s.refusal = refusal;
+            }
+        }
+    }
+
     pub fn executes(&self) -> bool {
         self.executor.executes()
     }
@@ -1045,10 +1131,13 @@ impl Engine {
         match call {
             Call::Robot => self.robot(host),
             Call::Submit(req) => self.submit(req, meta, host),
-            Call::Get(id) => match self.store.get(id) {
-                Some(s) => Answer::ok(self.answer(s, false, host.wall_ms())),
-                None => Answer::error(&unknown_request()),
-            },
+            Call::Get(id) => {
+                self.refresh(id);
+                match self.store.get(id) {
+                    Some(s) => Answer::ok(self.answer(s, false, host.wall_ms())),
+                    None => Answer::error(&unknown_request()),
+                }
+            }
             Call::Revert(id, rv) => self.revert(id, rv, meta, host),
             Call::Invalid(e) => {
                 self.stats.invalid += 1;
@@ -1099,6 +1188,7 @@ impl Engine {
 
     fn submit(&mut self, req: &ActionRequest, meta: &Meta, host: &mut dyn Host) -> Answer {
         let digest = req.digest();
+        self.refresh(&req.request_id);
         if let Some(s) = self.store.get(&req.request_id) {
             if s.digest == digest {
                 self.stats.duplicates += 1;
@@ -1135,13 +1225,8 @@ impl Engine {
                     safety_state: state,
                     context: &ctx,
                 });
-                let (st, err) = match out {
-                    ExecutorOutcome::RecordedNotExecuted => (Status::RecordedNotExecuted, None),
-                    ExecutorOutcome::Pending => (Status::Pending, None),
-                    ExecutorOutcome::Applied => (Status::Applied, None),
-                    ExecutorOutcome::Failed(e) => (Status::Failed, Some(e)),
-                };
-                (st, None, Some(a), err)
+                let (st, err, refusal) = outcome_status(out, state);
+                (st, refusal, Some(a), err)
             }
         };
         let received_ms = host.wall_ms();
@@ -1160,7 +1245,7 @@ impl Engine {
             "refusal": refusal,
             "plan": accepted,
             "executor": self.executor.name(),
-            "executed": status == Status::Applied,
+            "executed": status.executed(),
             "status": status.as_str(),
             "error": error,
         });
@@ -1254,17 +1339,26 @@ impl Engine {
                 Status::RecordedNotExecuted | Status::Refused | Status::Failed => {
                     ("not_applied", None)
                 }
-                Status::Pending | Status::Applied => (
-                    "refused",
-                    Some(Refusal {
-                        code: "revert_unsupported",
-                        reason: format!(
-                            "the {} executor cannot revert requests",
-                            self.executor.name()
+                Status::Reverted => ("reverted", None),
+                Status::Pending | Status::Applied | Status::Verified => {
+                    // executor v1: the executor reverts (or queues it).
+                    match self.executor.revert(id, &rv.reason) {
+                        Some(ExecutorOutcome::Reverted) => ("reverted", None),
+                        Some(ExecutorOutcome::Pending) => ("pending", None),
+                        Some(ExecutorOutcome::Failed(_)) => ("failed", None),
+                        _ => (
+                            "refused",
+                            Some(Refusal {
+                                code: "revert_unsupported",
+                                reason: format!(
+                                    "the {} executor cannot revert requests",
+                                    self.executor.name()
+                                ),
+                                safety_state: s.safety_state,
+                            }),
                         ),
-                        safety_state: s.safety_state,
-                    }),
-                ),
+                    }
+                }
             }
         };
         let note = json!({
@@ -1297,7 +1391,10 @@ impl Engine {
         let Some(s) = self.store.get_mut(id) else {
             return Answer::error(&unknown_request());
         };
-        if result == "not_applied" && s.revert.is_none() {
+        if result == "reverted" {
+            s.status = Status::Reverted;
+        }
+        if matches!(result, "not_applied" | "pending" | "reverted") && s.revert.is_none() {
             s.revert = Some(RevertRecord {
                 requested_by: rv.requested_by.clone(),
                 reason: rv.reason.clone(),
@@ -1351,7 +1448,7 @@ pub fn answer_of(s: &Stored, robot_id: &str, duplicate: bool, now_ms: u64) -> Va
         "decision": if s.refusal.is_some() { "refused" } else { "accepted" },
         "safety_state": s.safety_state,
         "executor": s.executor,
-        "executed": s.status == Status::Applied,
+        "executed": s.status.executed(),
         "evidence": s.evidence,
     });
     if let Some(a) = &s.accepted {
@@ -1373,7 +1470,7 @@ pub fn answer_of(s: &Stored, robot_id: &str, duplicate: bool, now_ms: u64) -> Va
     let mut out = json!({
         "request_id": s.request.request_id,
         "status": s.status.as_str(),
-        "executed": s.status == Status::Applied,
+        "executed": s.status.executed(),
         "state": state,
     });
     if duplicate {

@@ -2345,6 +2345,7 @@ dependencies = [
  "robodr-commission",
  "robodr-correlate",
  "robodr-events",
+ "robodr-executor",
  "robodr-firewall",
  "robodr-motion",
  "robodr-ocsf",

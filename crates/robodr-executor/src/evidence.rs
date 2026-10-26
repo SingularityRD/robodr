@@ -4,15 +4,18 @@
 //! inside agentd, which owns the black box; the executor process has no
 //! access to it.
 //!
-//! precheck: [`crate::decision::precheck`] (accepted in every safety state,
-//! observe mode included: it sends nothing to the platform) · apply: append
-//! the mark · verify: the sink confirms the mark is in the store (its
-//! reference re-reads) · revert: not applicable (evidence is never
-//! reverted) · TTL: none.
+//! precheck: well formed, not a replay (accepted in every safety state and
+//! morphology, observe mode included: it sends nothing to the platform) ·
+//! apply: append the mark (critical: fsynced before the reference is
+//! returned) · verify: the sink confirms the reference names a durable
+//! record of this robot's store · revert: not applicable (evidence is
+//! never reverted) · TTL: none.
 
 use serde_json::{json, Value};
 
-use crate::decision::{self, Effect};
+use robodr_responder::ActionId;
+
+use crate::decision::{codes, Refusal};
 use crate::engine::{Outcome, Status};
 use crate::order::Order;
 
@@ -28,15 +31,11 @@ pub trait EvidenceSink {
 pub const MAX_BUNDLE_REFS: usize = 64;
 
 /// Run `record_evidence` for `order`, bundling `refs` (black-box
-/// references, e.g. the control-plane request note).
-pub fn record(
-    order: &Order,
-    policy: &robodr_responder::ResponsePolicy,
-    cfg: &crate::config::Resolved,
-    refs: &[String],
-    sink: &mut dyn EvidenceSink,
-    now_ms: u64,
-) -> Outcome {
+/// references, e.g. the control-plane request note). The checks are
+/// [`crate::decision::precheck`]'s rules 1, 2 and 4 (well formed, not a
+/// replay, the action is `record_evidence`); evidence capture is accepted in
+/// every safety state and morphology, observe mode included.
+pub fn record(order: &Order, refs: &[String], sink: &mut dyn EvidenceSink, now_ms: u64) -> Outcome {
     let mut out = Outcome {
         id: order.id.clone(),
         status: Status::Failed,
@@ -48,17 +47,26 @@ pub fn record(
         duplicate: false,
         note: None,
     };
-    match decision::precheck(order, policy, cfg) {
-        Ok(p) if p.effect == Effect::Evidence => {}
-        Ok(_) => {
-            out.error = Some("not a record_evidence order".into());
-            return out;
-        }
-        Err(r) => {
-            out.status = Status::Refused;
-            out.refusal = Some(r);
-            return out;
-        }
+    let refuse = |code: &'static str, why: String| Refusal::new(code, why);
+    let check = if let Err(e) = order.validate() {
+        Err(refuse(codes::INVALID_ORDER, e))
+    } else if order.replay {
+        Err(refuse(
+            codes::REPLAY,
+            "a replay never reaches the black box as a live mark".into(),
+        ))
+    } else if order.action != ActionId::RecordEvidence {
+        Err(refuse(
+            codes::INVALID_ORDER,
+            "not a record_evidence order".into(),
+        ))
+    } else {
+        Ok(())
+    };
+    if let Err(r) = check {
+        out.status = Status::Refused;
+        out.refusal = Some(r);
+        return out;
     }
     let bundle: Vec<&String> = refs.iter().take(MAX_BUNDLE_REFS).collect();
     let note = json!({
