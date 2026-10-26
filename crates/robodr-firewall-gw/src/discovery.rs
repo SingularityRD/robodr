@@ -14,6 +14,17 @@
 //!   [`IdentityResolver`] (participant identity from source IP, vendor and
 //!   enclave), for `identity:<name>` sources. Only an SPDP sent by the
 //!   participant itself (header prefix == announced prefix) is used.
+//! - **Ports the queue does not see** (the "non-standard DDS ports"
+//!   risk): every SPDP participant's locators (metatraffic and default,
+//!   unicast and multicast) and every SEDP endpoint (writer or reader) of an enforced
+//!   topic with its own locators (unicast and multicast) are compared with
+//!   the queued UDP port ranges (`rtps.domain_ids` and
+//!   `rtps.extra_port_ranges`). A UDPv4 locator outside all of them means a
+//!   DDS stack that will send (or receive) RTPS the gateway never sees:
+//!   counted (`unqueued_locators`), and the gateway's status flag
+//!   `port_bypass_risk` is set with the first such locator
+//!   ([`Discovery::port_bypass`]). It is the deployment check for that risk:
+//!   it can only see the discovery that crosses the queue.
 //! - The map is bounded ([`Discovery::new`]'s `max_writers`; the oldest
 //!   entry is evicted first) and can be persisted
 //!   ([`Discovery::save`] / [`Discovery::load`]) so a restarted gateway,
@@ -59,6 +70,10 @@ pub struct Discovery {
     /// Writers announced or removed by the last [`Discovery::learn`]
     /// (restart evidence, see [`Discovery::take_announced`]).
     announced: Vec<Announced>,
+    /// The queued UDP port ranges (locator check).
+    queued: Vec<(u16, u16)>,
+    /// The first locator seen outside every queued range (module docs).
+    port_bypass: Option<String>,
 }
 
 /// A writer (or, for a participant removal, every writer of a participant)
@@ -82,6 +97,9 @@ pub struct DiscoveryStats {
     pub writers_evicted: u64,
     pub participants_removed: u64,
     pub identities_resolved: u64,
+    /// UDPv4 locators announced outside every queued port range (module
+    /// docs).
+    pub unqueued_locators: u64,
 }
 
 /// Persisted form.
@@ -143,6 +161,49 @@ impl Discovery {
             dirty: false,
             stats: DiscoveryStats::default(),
             announced: Vec::new(),
+            queued: Vec::new(),
+            port_bypass: None,
+        }
+    }
+
+    /// The queued UDP port ranges the locator check compares with (none:
+    /// no check).
+    pub fn with_queued_ranges(mut self, ranges: Vec<(u16, u16)>) -> Self {
+        self.queued = ranges;
+        self
+    }
+
+    /// The first announced locator outside every queued port range, if
+    /// any (status flag `port_bypass_risk`).
+    pub fn port_bypass(&self) -> Option<&str> {
+        self.port_bypass.as_deref()
+    }
+
+    fn check_locators<'a>(
+        &mut self,
+        what: &str,
+        locators: impl Iterator<Item = &'a robodr_rtps::Locator>,
+    ) {
+        if self.queued.is_empty() {
+            return;
+        }
+        for l in locators {
+            // UDPv4 only (kind 1): what the IPv4-only ruleset could queue.
+            if l.kind != robodr_rtps::LOCATOR_KIND_UDPV4 {
+                continue;
+            }
+            let inside = u16::try_from(l.port)
+                .is_ok_and(|p| self.queued.iter().any(|(lo, hi)| (*lo..=*hi).contains(&p)));
+            if !inside {
+                self.stats.unqueued_locators += 1;
+                if self.port_bypass.is_none() {
+                    let a = &l.address[12..16];
+                    self.port_bypass = Some(format!(
+                        "{what} announces {}.{}.{}.{}:{}, outside every queued port range",
+                        a[0], a[1], a[2], a[3], l.port
+                    ));
+                }
+            }
         }
     }
 
@@ -207,6 +268,40 @@ impl Discovery {
             return;
         };
         let sender = report.header.guid_prefix;
+        for p in &report.participants {
+            let what = format!("participant {}", hex(&p.guid_prefix));
+            self.check_locators(
+                &what,
+                p.metatraffic_unicast
+                    .iter()
+                    .chain(&p.default_unicast)
+                    .chain(&p.metatraffic_multicast)
+                    .chain(&p.default_multicast),
+            );
+        }
+        for e in &report.endpoints {
+            let topics: Vec<String> = e
+                .topics
+                .iter()
+                .cloned()
+                .chain(e.alternates.iter().map(|a| a.topic.clone()))
+                .collect();
+            if let Some(ch) = self.channel_of(&topics) {
+                let what = format!(
+                    "{} of enforced topic {}",
+                    if e.kind == EndpointKind::Writer {
+                        "writer"
+                    } else {
+                        "reader"
+                    },
+                    self.topics.get(ch).cloned().flatten().unwrap_or_default()
+                );
+                self.check_locators(
+                    &what,
+                    e.unicast_locators.iter().chain(&e.multicast_locators),
+                );
+            }
+        }
         for p in &report.participants {
             if p.guid_prefix != sender || self.identities.is_empty() {
                 continue;

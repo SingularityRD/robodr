@@ -31,6 +31,9 @@
 //!    `NFQUEUE --queue-num N`, with `--queue-bypass` only for
 //!    `on_gateway_down: bypass`.
 //!
+//! `rtps.extra_port_ranges` are queued like the domain ranges (DDS stacks
+//! configured for other ports).
+//!
 //! The queued DDS range of a domain (`7400 + 250 d ..= +249`) contains the
 //! discovery ports too (SPDP multicast `7400 + 250 d`, SPDP / SEDP unicast
 //! `7410 + 250 d + 2 i`), so every SPDP / SEDP datagram entering from the
@@ -179,6 +182,10 @@ mod tests {
             }
         }
         assert!(s.contains("-m physdev --physdev-in \"$CTRL\" -j ROBODR_GW"));
+        // Extra port ranges (non-default DDS ports) are queued too.
+        let mut e = c.clone();
+        e.rtps.extra_port_ranges = vec![[30000, 30100]];
+        assert!(render(&e, "test.json").contains("--dport 30000:30100 -j NFQUEUE --queue-num 7\n"));
         c.queue.on_gateway_down = OnGatewayDown::Bypass;
         let s = render(&c, "test.json");
         assert!(s.contains("--queue-num 7 --queue-bypass\n"));

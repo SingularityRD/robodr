@@ -1508,6 +1508,8 @@ mod tests {
             type_names: vec!["t".into()],
             alternates: Vec::new(),
             from_fragments: false,
+            unicast_locators: Vec::new(),
+            multicast_locators: Vec::new(),
         }
     }
 

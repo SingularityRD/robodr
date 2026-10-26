@@ -168,6 +168,11 @@ pub fn run(
             Err(e) => eprintln!("robodr-firewall-gw: ignoring writer state: {e}"),
         }
     }
+    eprintln!(
+        "robodr-firewall-gw: queued RTPS port ranges {:?}; discovery announcing a locator \
+         outside them raises port_bypass_risk",
+        cfg.rtps_port_ranges()
+    );
     let notifier = sys::Notifier::from_env();
     notifier.notify("READY=1\nSTATUS=deciding");
     let mut events = Events::open(cfg);
@@ -269,6 +274,8 @@ struct Events {
     written: u64,
     max: u64,
     dropped: u64,
+    /// The port-bypass warning was printed.
+    port_warned: bool,
 }
 
 impl Events {
@@ -292,6 +299,7 @@ impl Events {
             written,
             max: cfg.events_max_bytes,
             dropped: 0,
+            port_warned: false,
         }
     }
 }
@@ -317,6 +325,16 @@ fn housekeeping(cfg: &GatewayConfig, gw: &mut Gateway, events: &mut Events, hist
         let _ = f.flush();
     }
     gw.discovery_mut().expire(Instant::now());
+    if let Some(w) = gw.discovery().port_bypass() {
+        if !events.port_warned {
+            events.port_warned = true;
+            eprintln!(
+                "robodr-firewall-gw: WARNING: {w}: RTPS to that port bypasses the gateway; \
+                 add it to rtps.extra_port_ranges (and regenerate the ruleset) or fix the DDS \
+                 port configuration (status flag port_bypass_risk)"
+            );
+        }
+    }
     if let Some(p) = &cfg.rtps.state_file {
         if gw.discovery().dirty {
             if let Err(e) = gw.discovery_mut().save(p) {
@@ -334,6 +352,9 @@ fn housekeeping(cfg: &GatewayConfig, gw: &mut Gateway, events: &mut Events, hist
             "gateway": gw.stats,
             "discovery": gw.discovery().stats,
             "writers_known": gw.discovery().len(),
+            "port_bypass_risk": gw.discovery().port_bypass().is_some(),
+            "port_bypass": gw.discovery().port_bypass(),
+            "queued_rtps_port_ranges": cfg.rtps_port_ranges(),
             "firewall": {
                 "checked": fs.checked, "passed": fs.passed, "limited": fs.limited,
                 "rejected": fs.rejected, "would_have": fs.would_have, "faults": fs.faults,

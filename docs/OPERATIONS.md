@@ -1595,6 +1595,12 @@ primary.
 5. `systemctl enable --now robodr-firewall-gw-rules.service robodr-firewall-gw.service`.
    The rules unit runs before `network-pre.target` at boot, so no motion
    datagram crosses the bridge before the queue exists.
+6. **Check the DDS ports.** The status file's `port_bypass_risk` (and a
+   one-time WARNING in the journal) is set when discovery announces a
+   locator outside the queued port ranges: RTPS to that port crosses the
+   bridge unchecked. Add the ports to `rtps.extra_port_ranges`, re-render
+   and re-apply the ruleset (step 4), or pin the DDS ports; repeat until
+   the flag stays false while the controller and robot run.
 
 **Run observe first.** With `"mode": "observe"` every datagram is forwarded
 unchanged while the decisions are made and recorded (`events_path`,

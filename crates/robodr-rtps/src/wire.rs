@@ -56,6 +56,9 @@ pub(crate) const PID_DOMAIN_ID: u16 = 0x000f;
 pub(crate) const PID_PROTOCOL_VERSION: u16 = 0x0015;
 pub(crate) const PID_VENDORID: u16 = 0x0016;
 pub(crate) const PID_USER_DATA: u16 = 0x002c;
+/// Endpoint (SEDP) unicast / multicast locators.
+pub(crate) const PID_UNICAST_LOCATOR: u16 = 0x002f;
+pub(crate) const PID_MULTICAST_LOCATOR: u16 = 0x0030;
 pub(crate) const PID_DEFAULT_UNICAST_LOCATOR: u16 = 0x0031;
 pub(crate) const PID_METATRAFFIC_UNICAST_LOCATOR: u16 = 0x0032;
 pub(crate) const PID_METATRAFFIC_MULTICAST_LOCATOR: u16 = 0x0033;

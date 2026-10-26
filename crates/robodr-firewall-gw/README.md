@@ -231,10 +231,112 @@ segment, `allowed_src_macs`) on every channel.
 | `unitree_sport_request` | RTPS DATA `unitree_api::msg::dds_::Request_` on `rt/api/sport/request` | twist | `Move` (1008) decided as `(vx, vy, 0)/(0, 0, vyaw)`; a malformed `Move` as non-finite; `StopMove` always allowed; other calls: `allowed_api_ids`, then a zero-velocity check (source, rate); an api id outside `i32` (aliasing) is suppressed |
 | `go1_high_cmd` | UDP `HighCmd` (129 octets), default port 8082 | twist | mode 2 decided on `velocity` / `yawSpeed`; other modes: `allowed_high_modes`, then a zero-velocity check |
 | `go1_low_cmd` | UDP uncompressed `LowCmd` (734 octets), default port 8007 | joint, 20 slots | the 614-octet compressed form of v3.8.6 is undecidable (dropped): do not configure this channel for compressed traffic |
+| `unitree_loco_request` | RTPS DATA `Request_` of a humanoid's locomotion client: `robot_model` `g1` / `h2` / `r1` on `rt/api/sport/request` (ids 7xxx), `h1` on `rt/api/loco/request` (ids 8xxx) | twist | `SetVelocity` limited, duration capped; `SetFsmId` other than `Start` refused unless allowlisted (below, "Loco requests") |
+| `unitree_hg_arm_sdk`, `unitree_go_arm_sdk` | RTPS DATA `LowCmd_` on `rt/arm_sdk` (G1 / H1-2 / H2 / R1 `hg`, H1 `go`) | joint, 35 / 20 slots | every slot with gains or torque decided whatever its mode octet; `weight_slot` bounded (below, "Arm SDK") |
+| `unitree_dex3_hand_cmd` | RTPS DATA `unitree_hg::msg::dds_::HandCmd_` on `rt/dex3/{left,right}/cmd` (topic required) | joint, one slot per finger motor | decided; passed byte-identical or suppressed (below, "Hands") |
+| `unitree_hand_sdk` | RTPS DATA `unitree_go::msg::dds_::MotorCmds_` on `rt/hand_sdk` | joint, one slot per element | as Dex3 |
+| `ros2_twist`, `ros2_twist_stamped` | RTPS DATA ROS 2 `geometry_msgs/msg/Twist` / `TwistStamped` on `rt/cmd_vel` (XCDR1) | twist (6 DoF) | limited / substitute values written in place (`float64`, no rounding) |
 
 Every representation the decoder reads is rewritten in kind (CDR / CDR2 /
 D_CDR2, either endianness). Only the plain Unitree CRC is supported for Go1
 (a fleet using the SDK's unpublished `encryptCRC` cannot be enforced).
+
+## Loco requests (`unitree_loco_request`)
+
+A humanoid's high-level locomotion client sends `unitree_api` requests to
+its service: **`sport`** on G1, H2 and R1 (`LOCO_SERVICE_NAME = "sport"`,
+`unitree_sdk2` `include/unitree/robot/g1/loco/g1_loco_api.hpp:11`,
+`h2/loco/h2_loco_api.hpp:11`, `r1/loco/r1_loco_api.hpp:10`), so the DDS
+topic is `rt/api/sport/request` with ids 7xxx, and **`loco`** on H1
+(`h1/loco/h1_loco_api.hpp:11`, topic `rt/api/loco/request`, ids 8xxx).
+H1-2 has no locomotion client in the SDK (its examples are low-level and
+arm SDK only). A humanoid configured with `unitree_sport_request` is
+refused at start: that codec would pass a `SetVelocity` or a `Damp` it
+does not interpret. Requests are decoded strictly (as sport requests) and
+interpreted with `robodr-cdr`'s api tables for the configured model.
+
+| SDK call (G1 file:line; H1 / H2 / R1 equivalents) | Request | Gateway |
+|---|---|---|
+| `SetVelocity(vx, vy, omega, duration = 1.f)` (`g1/loco/g1_loco_client.hpp:164`; H1 `h1_loco_client.hpp:178`, H2 `h2_loco_client.hpp:209`, R1 `r1_loco_client.hpp:69`) | 7105 / 8105 `{"velocity":[vx,vy,ω],"duration":d}` | firewall twist check `(vx, vy, 0) / (0, 0, ω)`; limited or substitute velocity written in place (numbers truncated toward zero, read back); **duration capped** at `max_velocity_duration_s` (default 1 s) |
+| `Move(vx, vy, vyaw, continous_move)` (`g1_loco_client.hpp:232-233`; H1 `:239`, H2 `:261`, R1 `:97`) | `SetVelocity` with duration **864000 s** when continuous | as `SetVelocity`: the duration is rewritten to the cap, so a controller that stops sending stops the robot within it |
+| `StopMove()` (`g1_loco_client.hpp:226`; H1 `:232`, H2 `:254`, R1 `:94`) | `SetVelocity(0, 0, 0)` | passes (zero velocity) |
+| `Start()` = `SetFsmId(500)` (`g1_loco_client.hpp:216`; H1 204 `:226`, H2 601 `:244`, R1 811 `:84`) | 7101 / 8101 `{"data":id}` | passes (source / rate check): the walking controller keeps the robot balanced |
+| `ZeroTorque()` = `SetFsmId(0)` (`g1_loco_client.hpp:224`; H1 `:230`, H2 `:252`, R1 `:92`) | 7101 / 8101 `{"data":0}` | **refused** unless `allowed_fsm_ids` lists 0: motors limp, the humanoid falls |
+| `Damp()` = `SetFsmId(1)` (`g1_loco_client.hpp:214`; H1 `:224`, H2 `:242`, R1 `:82`) | `{"data":1}` | **refused** unless allowlisted: damping only, the humanoid collapses |
+| `Squat()` = 2, `Sit()` = 3 (`g1_loco_client.hpp:218,220`; H2 `:246,248`; R1 commented out `:86,88`), `StandUp()` = 4 (`g1_loco_client.hpp:222`; H1 2 `:228`, H2 `:250`, R1 `:90`); Python-only 702 / 706 | `{"data":id}` | **refused** unless allowlisted: whole-body posture transitions |
+| any other `SetFsmId` value | | refused unless allowlisted |
+| `SwitchToUserCtrl` 7110 / `SwitchToInternalCtrl` 7111 (`g1_loco_api.hpp:32-33`), `SetArmSdkStatus` 7109 (`h2_loco_api.hpp:34`) | | refused unless `allowed_api_ids` lists them: they hand the motors to another channel |
+| `SetArmTask` 7106 / 8107, `FsmApi` 7100, `SetPunchApi` 7108, `SetStandHeight` 7104 / 8104, `SetBalanceMode`, `SetSwingHeight`, `SetSpeedMode`, `SetTargetPosition` 8204, ... | | refused unless in `allowed_api_ids` |
+| `Get*` queries (7001..7008, 8001..8006, `GetOdom`) | | pass (source / rate check) |
+| unknown id for the model, a malformed parameter, an id outside `i32` | | refused (suppressed) |
+
+Refusals are suppressions (PAD) and counted (`loco_refused`); a capped
+duration counts `duration_capped`. The content probe classifies an
+unknown writer's request with a loco id (7001..7199, 8001..8299) as the
+loco channel.
+
+## Arm SDK (`unitree_hg_arm_sdk`, `unitree_go_arm_sdk`)
+
+`rt/arm_sdk` carries a `LowCmd_` the robot's locomotion service blends into
+its own arm (and waist) commands. The SDK examples set `q`, `dq`, `kp`,
+`kd`, `tau` of the arm joints and **never their mode**
+(`example/g1/high_level/g1_arm7_sdk_dds_example.cpp:156-160`), so those
+slots arrive with mode 0, and they put the blend weight in one slot's `q`:
+`msg.motor_cmd().at(JointIndex::kNotUsedJoint).q(weight)`
+(`g1_arm7_sdk_dds_example.cpp:150`, `kNotUsedJoint = 29` on G1
+`g1_arm5_sdk_dds_example.cpp:51`; 27 on H1-2
+`h1/high_level/h1_2_arm_sdk_dds_example.cpp:51`; 9 on H1
+`h1_arm_sdk_dds_example.cpp:32`; `kArmSdkWeightJoint = 31` on H2
+`h2/high_level/h2_arm_sdk_dds_example.cpp:32`). Hence:
+
+- **Every slot that carries gains or torque (or a non-finite value) is
+  decided as enabled**, whatever its mode octet: the channel's joint
+  envelope (position, speed, gains, torque, step) applies to it. A slot
+  the firewall channel has disabled (legs on the G1 fixture) must stay
+  inert. The mode octets are forwarded as sent.
+- **`weight_slot` (required) is not a motor**: it must be a disabled motor
+  of the firewall channel, is left out of the joint check, and must be
+  finite in `[0, max_weight]` (default 1) with every other field zero and
+  mode 0. Anything else is an integrity failure (`arm_weight_rejected`):
+  the firewall's substitute applies, which on a humanoid is a hold.
+- **Rewrites**: a limited frame keeps the input's weight slot bit-exact; a
+  hold copies the last accepted frame (motors, mode octets and weight); with
+  no accepted frame yet a humanoid emits nothing (suppressed). A hold never
+  damps.
+- The content probe prefers `rt/lowcmd` for an unknown writer's valid
+  `LowCmd_` (the stricter channel: an arm-SDK frame decided there is
+  refused, since a mode-0 slot with gains is not inert).
+
+## Hands (`unitree_dex3_hand_cmd`, `unitree_hand_sdk`)
+
+The Dex3 hand (`HandCmd_` on `rt/dex3/{left,right}/cmd`,
+`example/g1/dex3/g1_dex3_example.cpp:34,269`) and the G1 hand SDK
+(`MotorCmds_` on `rt/hand_sdk`, `example/g1/high_level/g1_hand_sdk_example.cpp:27`,
+the blend weight × 100 in `cmds[0].mode`) are **decided and then passed
+byte-identical or suppressed**: the finger joints are checked against the
+firewall joint channel (one motor per element; every element decided as
+enabled, since the Dex3 mode octet is a bitfield and `rt/hand_sdk` reuses
+it for the weight), a frame the firewall passes is forwarded unchanged,
+anything else (limited, rejected, a substitute, an undecodable or
+non-canonical frame, a wrong element count) is suppressed: the hand keeps
+its last command. There is no hand rewrite (no encoder for these types);
+a hand is not part of the balance loop. Counters `hand_passed`,
+`hand_suppressed`. Strictness: the elements are fixed-size and 4-aligned,
+so the 3 padding octets after each mode octet must be zero, the message
+must end where the decoder stops (at most 3 zero octets after it).
+
+## ROS 2 `/cmd_vel` (`ros2_twist`, `ros2_twist_stamped`)
+
+`geometry_msgs/msg/Twist` and `TwistStamped` on `rt/cmd_vel` (XCDR1, either
+endianness; XCDR2 is undecidable), decided with the same firewall twist
+path as the sport `Move`, all six components. The layout is fixed, so the
+strict decode checks the exact length, a `frame_id` with one terminating
+NUL and zero padding to the `float64` alignment. A limited or substitute
+twist overwrites the six `float64` in place (exact `f64`, no rounding; the
+stamp and frame id untouched) and is read back. Content probe: an unknown
+writer's sample that decodes exactly as the configured layout is decided
+as `/cmd_vel` (and is then a foreign source unless its GUID is allowed);
+`rtps.unknown_writers: pass` opts out.
 
 ## Non-motor `LowCmd_` fields
 
@@ -337,7 +439,8 @@ oneshot unit), or `fail_closed` would mean nothing.
 | `rtps.state_file` | none | persisted writer → channel map |
 | `rtps.max_sn_jump` | 64 | largest sequence-number step decided at once (larger: held until confirmed) |
 | `rtps.binding_takeover_ns` | 1 s | silence after which another (IP, MAC) may continue an authorised GUID's stream |
-| `channels[]` | — | `firewall_channel`, `codec`, `topic`, `udp_ports`, `allowed_src_ips`, `allowed_src_macs` (RTPS), `legacy_sources` (IP → firewall source), `allowed_api_ids`, `allowed_high_modes`, `allow_battery_off` (go `LowCmd_`, default `false`) |
+| `rtps.extra_port_ranges` | none | further `[lo, hi]` UDP port ranges queued and decided as RTPS (non-default DDS ports; at most 16) |
+| `channels[]` | — | `firewall_channel`, `codec`, `topic`, `udp_ports`, `allowed_src_ips`, `allowed_src_macs` (RTPS), `legacy_sources` (IP → firewall source), `allowed_api_ids` (sport, loco), `allowed_high_modes`, `allow_battery_off` (go `LowCmd_`, default `false`), `robot_model` / `allowed_fsm_ids` / `max_velocity_duration_s` (loco), `weight_slot` / `max_weight` (arm SDK) |
 | `max_queue_delay_ns` | 5 ms | late packets get the fault verdict |
 | `events_path`, `events_max_bytes` | none, 64 MiB | firewall deviations as JSON lines |
 | `status_path` | none | counters, firewall stats, recv→verdict latency |
@@ -400,6 +503,8 @@ Operations (status, maintenance bypass, troubleshooting):
 | Review findings F1–F3 (each test written first and seen failing): far-future sequence number with the writer's GUID from another IP / the controller IP with another MAC / a pinned MAC, jump held until confirmed, binding takeover only after silence, no foreign substitute under an authorised GUID, writer restart after SEDP without a replay hole; unknown-writer DATA_FRAG (single, several, out of order, oversized, foreign), key-only, non-standard suppressed, SEDP-classified / `pass` / observe unaffected; `bms_cmd.off` refused, substitute carries the last accepted non-motor fields, `allow_battery_off` | `tests/hardening.rs` |
 | Every verdict path on synthetic packets: byte-identical pass; limited rewrite equals a reference firewall's output (≤ 1 ulp, bound kept), CRC valid, length unchanged, other submessages untouched; humanoid hold for six kinds of violation and never damping / limp, suppression when nothing was accepted, hold past `max_hold_ns`; quadruped damping after the hold; foreign writer; source-IP binding; too-early; two samples in one datagram; retransmission / replay; undecidable payloads; DATA_FRAG; malformed / bad checksum / IP fragment; SEDP classification; late packet → fault verdict; sport limit / substitute / allowlist / alias; Go1 high and low; observe mode; configuration refusals; 3000-frame random stream against a reference firewall; shipped examples | `tests/gateway.rs` (21 tests) |
 | Real kernel: 3 network namespaces, bridge, rendered ruleset, NFQUEUE, the binary's run loop; pass byte-identical, hold on violation, foreign suppressed, `fail_closed` while down; latency. F1: an attacker namespace on the controller segment (macvlan, own MAC) injects the writer's GUID with SN 2^40 from its IP and then from the controller's IP; every genuine frame before and after arrives byte-identical, the kernel's `NFQA_HWADDR` tells the spoofed-IP frame apart; SEDP is queued, learned and forwarded unchanged | `tests/netns_e2e.rs` (`#[ignore]`: root; `cargo test -p robodr-firewall-gw --release --test netns_e2e -- --ignored --nocapture --test-threads 1`) |
+| Loco, arm SDK, hands, ROS 2 twist, extra port ranges and the unqueued-locator warning: `SetVelocity` limited and duration-capped (`Move(..., true)` = 864000 s), every G1 / H1 FSM helper but `Start` refused (`Damp`, `ZeroTorque`, posture), allowlists, hand-over / trick / unknown ids refused, H1's own service, the sport codec refused on a humanoid; arm frames with mode-0 gains passed, limited with modes and weight kept, weight out of range / leg gains → hold of the last accepted frame, nothing accepted → suppressed; hands passed or suppressed; ROS 2 `Twist` / `TwistStamped` limited in place; 6000 mutated packets with invariants (no forwarded `SetFsmId` but `Start`, no forwarded velocity / duration above the limits, no forwarded weight outside `[0, 1]` or leg gains, hands only unchanged and inside the envelope) | `tests/channels.rs`, unit tests in `src/{sport,armsdk,hand,ros2,config,ruleset}.rs` |
+| Real kernel, new channels (`new_channels_and_extra_ports_end_to_end`): loco `SetVelocity` limited and capped, `Damp` removed, `Start` byte-identical, arm frame byte-identical, Dex3 out of envelope removed, twist limited; `ZeroTorque` on an extra port range removed, on a port outside every range delivered unchecked; an SEDP reader announcing that port sets `port_bypass_risk` in the status file | `tests/netns_e2e.rs` |
 | Fuzz: packet path + NFQUEUE parser, invariants (no panic; accept = unchanged; rewrite = same length, valid checksums; no forwarded enforced sample that does not decode strictly / with a valid CRC; no forwarded unprobeable sample of an unknown writer; no forwarded go `LowCmd_` with `bms_cmd.off != 0`) | `fuzz/fuzz_targets/firewall_gw_packet.rs`, smoke run `tests/fuzz_smoke.rs` |
 
 ## Latency
@@ -480,14 +585,24 @@ these two harnesses; `gw_latency` takes `--budget-p99-ns` /
   needs a second path into the robot namespace that bypasses the bridge;
   the gateway cannot see it by construction, so the check belongs to the
   site's network review, not to the gateway's tests.
-- **DDS ports outside the queued range are not inspected.** The ruleset
+- **DDS ports outside the queued ranges are not inspected.** The ruleset
   queues the RTPS well-known port range of each `rtps.domain_ids` entry
-  (7400 + 250·d .. +249: participant indexes 0..119). A DDS stack
-  configured for other ports (Cyclone DDS `Discovery/Ports`, or a
-  `ParticipantIndex` setting that makes it use kernel-chosen unicast
-  ports) would send its unicast SEDP and `rt/lowcmd` around the queue.
-  Verify the robot's and the controller's Cyclone DDS configuration (and
-  capture the ports in use) before relying on the gateway.
+  (7400 + 250·d .. +249: participant indexes 0..119) and every
+  `rtps.extra_port_ranges` entry. A DDS stack configured for other ports
+  (Cyclone DDS `Discovery/Ports`, a `ParticipantIndex` of `none` that
+  makes it use kernel-chosen unicast ports, Fast DDS) sends its unicast
+  SEDP and motion samples around the queue. **Deployment check:** the
+  gateway compares every locator announced in the discovery it sees (SPDP
+  participants: metatraffic / default, unicast / multicast; SEDP writers
+  and readers of an enforced topic: their own locators) with the queued
+  ranges. A UDPv4 locator outside all of them is counted
+  (`discovery.unqueued_locators`), sets the status flag
+  `port_bypass_risk` with the first such locator (`port_bypass`), and is
+  logged once as a WARNING. Fix it by adding the ports to
+  `rtps.extra_port_ranges` (regenerate and re-apply the ruleset) or by
+  pinning the DDS ports. The check sees only discovery that crosses the
+  queue (controller-side); the robot's own announcements are bridged
+  unqueued, so capture the robot side's ports at commissioning too.
 - **No new finding types**: gateway-only conditions (malformed datagrams,
   replays, fragmented motion samples, rewrite failures) are counters in the
   status file, not findings; the firewall's own rules (`crc_invalid`,
@@ -501,8 +616,13 @@ these two harnesses; `gw_latency` takes `--budget-p99-ns` /
 - **Spoofed IP and MAC**: see "Sequence numbers and writer binding" — the
   gateway bounds, but cannot prevent, the effect of an attacker that sends
   with the controller's own IP and MAC on the controller-side segment.
-- **Loco `SetVelocity` (humanoid high-level), arm SDK, hand SDK channels**
-  are not decided yet.
+- **Hand frames are not rewritten**: a hand frame the firewall would limit
+  is suppressed instead (the hand keeps its last command). The hand
+  decoders are strict on padding and length, not by a full re-encode.
+- **Loco / arm SDK / hand / ROS 2 channels** were tested on synthetic
+  frames built from the SDK headers and examples, not against a robot.
+- **H1-2** has no locomotion client in the SDK; only its `rt/lowcmd` and
+  `rt/arm_sdk` (`hg`, weight slot 27) are enforceable.
 - **Go1 compressed low-level frames** cannot be decided (dropped if the
   channel is configured).
 - **IPv4 only**: the ruleset drops IPv6 (and VLAN-tagged, PPPoE, other

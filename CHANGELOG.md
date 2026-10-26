@@ -52,6 +52,26 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Added
 
+- `robodr-firewall-gw`: new channels. `unitree_loco_request` (humanoid
+  locomotion client: G1 / H2 / R1 on `rt/api/sport/request`, H1 on
+  `rt/api/loco/request`): `SetVelocity` limited by the twist firewall and
+  its duration capped (`max_velocity_duration_s`, default 1 s; `Move(...,
+  continuous)` sends 864000 s); every `SetFsmId` but the model's `Start`
+  (`ZeroTorque`, `Damp`, posture changes) and every hand-over / trick call
+  refused unless allowlisted (`allowed_fsm_ids`, `allowed_api_ids`).
+  `unitree_hg_arm_sdk` / `unitree_go_arm_sdk` (`rt/arm_sdk`): mode-0 slots
+  with gains decided against the joint envelope, the blend-weight slot
+  bounded. `unitree_dex3_hand_cmd` / `unitree_hand_sdk`: decided, passed or
+  suppressed. `ros2_twist` / `ros2_twist_stamped` (`rt/cmd_vel`).
+  `rtps.extra_port_ranges` queues non-default DDS ports, and discovery
+  announcing a locator outside every queued range raises
+  `discovery.unqueued_locators` and the status flag `port_bypass_risk`.
+  A humanoid configured with `unitree_sport_request` is refused (its loco
+  calls need `unitree_loco_request`); a `SetVelocity` on a sport channel is
+  now decided as a velocity.
+- `robodr-rtps`: SEDP endpoint locators (`PID_UNICAST_LOCATOR`,
+  `PID_MULTICAST_LOCATOR`) in `EndpointInfo`.
+
 - Control plane `robodr-control-plane/v2` in `robodr-agentd` (GA sprints 4
   and 5, robot side; contract `docs/contracts/robodr.control-plane.md`):
   - **Mutual TLS** on the TCP listener (`control_plane.tls`: rustls + ring,

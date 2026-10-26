@@ -129,9 +129,20 @@ fn rep_of(slot: &[u8]) -> Option<(bool, bool)> {
 /// `TrajectoryFollow` is about 3 KB.
 pub const MAX_REQUEST_BODY: usize = 8192;
 
-/// Decode `slot` strictly (module docs).
+/// Decode `slot` strictly (module docs), interpreted for the `sport`
+/// service.
 pub fn decode_strict(
     slot: &[u8],
+    model: Option<UnitreeModel>,
+) -> Result<SportRequest, Undecidable> {
+    decode_strict_for(slot, ApiService::Sport, model)
+}
+
+/// [`decode_strict`] for any service (the humanoid locomotion clients:
+/// `sport` on G1 / H2 / R1, `loco` on H1).
+pub fn decode_strict_for(
+    slot: &[u8],
+    service: ApiService,
     model: Option<UnitreeModel>,
 ) -> Result<SportRequest, Undecidable> {
     let (big, xcdr2) = rep_of(slot).ok_or(Undecidable::Decode)?;
@@ -173,7 +184,7 @@ pub fn decode_strict(
     }
     Ok(SportRequest {
         api_id: r.api_id,
-        call: r.call(ApiService::Sport, model),
+        call: r.call(service, model),
         param: 4 + prange.start..4 + prange.end,
     })
 }
@@ -295,6 +306,98 @@ pub fn write_move(
                 if !(got.abs() <= want.abs() && (got == 0.0 || got.signum() == want.signum())) {
                     return Err(RewriteError::Verify);
                 }
+            }
+            Ok(())
+        }
+        _ => Err(RewriteError::Verify),
+    }
+}
+
+fn put(out: &mut [u8], pos: &mut usize, t: &str) -> Option<()> {
+    let b = t.as_bytes();
+    out.get_mut(*pos..pos.checked_add(b.len())?)?
+        .copy_from_slice(b);
+    *pos += b.len();
+    Some(())
+}
+
+fn put_number(out: &mut [u8], pos: &mut usize, v: f64, decimals: u32) -> Option<()> {
+    let n = write_number(out.get_mut(*pos..)?, v, decimals)?;
+    *pos += n;
+    Some(())
+}
+
+/// Render `{"velocity":[vx,vy,vyaw],"duration":d}` into `out` in at most
+/// `max` octets (as [`render_move`]: numbers truncated toward zero).
+fn render_set_velocity(out: &mut [u8], max: usize, v: [f64; 3], duration: f64) -> Option<usize> {
+    for decimals in [6u32, 5, 4, 3, 2, 1, 0] {
+        let mut pos = 0usize;
+        let ok = (|| {
+            put(out, &mut pos, "{\"velocity\":[")?;
+            for (i, val) in v.into_iter().enumerate() {
+                if i > 0 {
+                    put(out, &mut pos, ",")?;
+                }
+                put_number(out, &mut pos, val, decimals)?;
+            }
+            put(out, &mut pos, "],\"duration\":")?;
+            put_number(out, &mut pos, duration, decimals)?;
+            put(out, &mut pos, "}")
+        })();
+        if ok.is_some() && pos <= max {
+            return Some(pos);
+        }
+    }
+    None
+}
+
+/// Rewrite the request in `slot` to `SetVelocity(v, duration)` of the same
+/// length (module docs: numbers truncated toward zero, padded with spaces
+/// before the closing brace, verified by decoding again for `service` /
+/// `model`: the velocity read back never exceeds `v` in magnitude and the
+/// duration never exceeds `duration`).
+pub fn write_set_velocity(
+    slot: &mut [u8],
+    req: &SportRequest,
+    v: [f64; 3],
+    duration: f64,
+    service: ApiService,
+    model: Option<UnitreeModel>,
+) -> Result<(), RewriteError> {
+    if !(duration.is_finite() && duration >= 0.0) {
+        return Err(RewriteError::Value);
+    }
+    let len = req
+        .param
+        .end
+        .checked_sub(req.param.start)
+        .ok_or(RewriteError::Length)?;
+    let mut text = [0u8; 256];
+    let cap = len.min(text.len());
+    let n = render_set_velocity(&mut text, cap, v, duration).ok_or(RewriteError::Length)?;
+    let dst = slot
+        .get_mut(req.param.clone())
+        .ok_or(RewriteError::Length)?;
+    let (body, tail) = dst.split_at_mut(n - 1);
+    body.copy_from_slice(&text[..n - 1]);
+    let (spaces, last) = tail.split_at_mut(tail.len() - 1);
+    spaces.fill(b' ');
+    last[0] = b'}';
+    let back = decode_strict_for(slot, service, model).map_err(|_| RewriteError::Verify)?;
+    match back.call {
+        ApiCall::SetVelocity {
+            vx,
+            vy,
+            vyaw,
+            duration: d,
+        } => {
+            for (got, want) in [vx, vy, vyaw].into_iter().zip(v) {
+                if !(got.abs() <= want.abs() && (got == 0.0 || got.signum() == want.signum())) {
+                    return Err(RewriteError::Verify);
+                }
+            }
+            if !(d.is_finite() && d >= 0.0 && d <= duration) {
+                return Err(RewriteError::Verify);
             }
             Ok(())
         }
@@ -431,6 +534,74 @@ mod tests {
         let r2 = decode_strict(&p2, None).unwrap();
         let mut s2 = p2.clone();
         assert!(write_move(&mut s2, &r2, [0.0, 0.0, 0.0], None).is_err());
+    }
+
+    #[test]
+    fn set_velocity_rewrite_never_exceeds() {
+        use robodr_cdr::unitree::UnitreeModel as M;
+        for (svc, model, id) in [
+            (ApiService::Sport, M::G1, 7105),
+            (ApiService::Sport, M::H2, 7105),
+            (ApiService::Sport, M::R1, 7105),
+            (ApiService::Loco, M::H1, 8105),
+        ] {
+            // What nlohmann::json writes for SetVelocity(0.3, 0, 0.1,
+            // 864000) (`Move(..., continous_move = true)`).
+            let p = encode_request(
+                Representation::CdrLe,
+                9,
+                id,
+                r#"{"duration":864000.0,"velocity":[0.30000001192092896,0.0,0.10000000149011612]}"#,
+            );
+            let r = decode_strict_for(&p, svc, Some(model)).unwrap();
+            assert!(
+                matches!(r.call, ApiCall::SetVelocity { .. }),
+                "{:?}",
+                r.call
+            );
+            let mut s = p.clone();
+            write_set_velocity(&mut s, &r, [0.2, -0.05, 0.1], 1.0, svc, Some(model)).unwrap();
+            assert_eq!(s.len(), p.len());
+            match decode_strict_for(&s, svc, Some(model)).unwrap().call {
+                ApiCall::SetVelocity {
+                    vx,
+                    vy,
+                    vyaw,
+                    duration,
+                } => {
+                    assert_eq!((vx, vy, vyaw, duration), (0.2, -0.05, 0.1, 1.0));
+                }
+                c => panic!("{c:?}"),
+            }
+            // Too short: refused.
+            let p2 = encode_request(
+                Representation::CdrLe,
+                9,
+                id,
+                r#"{"velocity":[1,0,0],"duration":1}"#,
+            );
+            let r2 = decode_strict_for(&p2, svc, Some(model)).unwrap();
+            let mut s2 = p2.clone();
+            assert!(
+                write_set_velocity(&mut s2, &r2, [0.5, 0.0, 0.0], 1.0, svc, Some(model)).is_ok()
+            );
+            let mut s3 = p2.clone();
+            assert!(write_set_velocity(
+                &mut s3,
+                &r2,
+                [0.123456, 0.654321, -0.111111],
+                1.0,
+                svc,
+                Some(model)
+            )
+            .is_ok());
+            match decode_strict_for(&s3, svc, Some(model)).unwrap().call {
+                ApiCall::SetVelocity { vx, vy, vyaw, .. } => {
+                    assert!(vx.abs() <= 0.123456 && vy.abs() <= 0.654321 && vyaw.abs() <= 0.111111);
+                }
+                c => panic!("{c:?}"),
+            }
+        }
     }
 
     #[test]

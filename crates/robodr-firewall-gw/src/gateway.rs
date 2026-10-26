@@ -17,13 +17,14 @@ use robodr_ros2_pipeline::IdentityResolver;
 use serde::Serialize;
 
 use crate::config::{
-    Codec, GatewayConfig, GatewayMode, MalformedPolicy, OnGatewayDown, UnknownWriters,
+    Codec, GatewayConfig, GatewayMode, LocoModel, MalformedPolicy, OnGatewayDown, UnknownWriters,
 };
 use crate::discovery::{Discovery, WriterInfo};
 use crate::ip::{parse_ipv4_udp, refresh_udp_checksum};
 use crate::lowcmd::{self, Forwarded, LowCmdCodec, WireLowCmd};
 use crate::rtps::{self, Content, Guid, Sample, SampleKind, WalkOptions};
-use crate::{legacy, sport};
+use crate::{armsdk, hand, legacy, ros2, sport};
+use robodr_cdr::unitree::{ApiClass, ApiService, FsmMeaning};
 
 /// What to tell the kernel about one queued packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -118,6 +119,20 @@ pub struct GatewayStats {
     pub unknown_undecidable: u64,
     /// `LowCmd_` frames refused for a non-motor field (`bms_cmd.off`).
     pub non_motor_rejected: u64,
+    /// Loco requests refused before the firewall: a `SetFsmId` that is not
+    /// the model's `Start` and not in `allowed_fsm_ids` (damp, zero torque,
+    /// posture changes), a call not in `allowed_api_ids`, an unknown or
+    /// malformed non-velocity call.
+    pub loco_refused: u64,
+    /// `SetVelocity` durations rewritten down to `max_velocity_duration_s`.
+    pub duration_capped: u64,
+    /// Arm-SDK frames whose blend-weight slot was refused (decided as an
+    /// integrity failure).
+    pub arm_weight_rejected: u64,
+    /// Hand frames forwarded unchanged (the firewall passed them).
+    pub hand_passed: u64,
+    /// Hand frames suppressed (anything the firewall did not pass as is).
+    pub hand_suppressed: u64,
 }
 
 /// One cached decision for a writer's sequence number.
@@ -223,6 +238,15 @@ struct Channel {
     allowed_modes: Option<Vec<u8>>,
     allowed_macs: Vec<[u8; 6]>,
     allow_battery_off: bool,
+    /// `unitree_loco_request`.
+    robot_model: Option<LocoModel>,
+    allowed_fsm_ids: Option<Vec<i64>>,
+    max_duration_s: f64,
+    /// Arm-SDK codecs: the blend-weight slot and its bound.
+    weight_slot: Option<usize>,
+    max_weight: f64,
+    /// Hand codecs: the element count (the firewall channel's motors).
+    hand_slots: usize,
     writers: HashMap<Guid, WriterState>,
     max_writers: usize,
     tick: u64,
@@ -233,9 +257,18 @@ struct Channel {
 impl Channel {
     fn lowcmd_codec(&self) -> Option<LowCmdCodec> {
         match self.codec {
-            Codec::UnitreeGoLowcmd => Some(LowCmdCodec::Go),
-            Codec::UnitreeHgLowcmd => Some(LowCmdCodec::Hg),
+            Codec::UnitreeGoLowcmd | Codec::UnitreeGoArmSdk => Some(LowCmdCodec::Go),
+            Codec::UnitreeHgLowcmd | Codec::UnitreeHgArmSdk => Some(LowCmdCodec::Hg),
             _ => None,
+        }
+    }
+
+    /// The api service and model a request channel decodes for.
+    fn api(&self) -> (ApiService, Option<robodr_cdr::unitree::UnitreeModel>) {
+        match self.robot_model {
+            Some(LocoModel::H1) => (ApiService::Loco, Some(LocoModel::H1.unitree())),
+            Some(m) => (ApiService::Sport, Some(m.unitree())),
+            None => (ApiService::Sport, None),
         }
     }
 
@@ -376,13 +409,21 @@ impl Gateway {
                             c.codec.as_str()
                         )
                     })?;
-                let want = c.codec.slots().unwrap_or(0);
-                if spec.motors.len() != want {
+                let want = c.codec.slots().unwrap_or(spec.motors.len());
+                if spec.motors.len() != want || want == 0 {
                     return Err(format!(
                         "{at}: the firewall channel has {} motor slots, codec {} carries {want}",
                         spec.motors.len(),
                         c.codec.as_str()
                     ));
+                }
+                if let Some(w) = c.weight_slot {
+                    if spec.motors.get(w).is_none_or(|m| m.enabled) {
+                        return Err(format!(
+                            "{at}: weight_slot {w} must be a disabled motor of the firewall \
+                             channel (it is the arm-SDK blend weight, not a motor)"
+                        ));
+                    }
                 }
                 if humanoid && cfg.queue.on_gateway_down == OnGatewayDown::Bypass {
                     return Err(format!(
@@ -401,20 +442,20 @@ impl Gateway {
                 if spec.kind != ChannelKind::Twist {
                     return Err(format!("{at}: codec {} needs kind twist", c.codec.as_str()));
                 }
+                if humanoid && c.codec == Codec::UnitreeSportRequest {
+                    return Err(format!(
+                        "{at}: a humanoid's locomotion requests (SetVelocity, SetFsmId ...) are \
+                         decided by codec unitree_loco_request with robot_model, not \
+                         unitree_sport_request"
+                    ));
+                }
             }
             if let Some(t) = profile.motion_types.get(&c.firewall_channel) {
-                let expect = match c.codec {
-                    Codec::UnitreeGoLowcmd => Some(LowCmdCodec::Go.dds_type_name()),
-                    Codec::UnitreeHgLowcmd => Some(LowCmdCodec::Hg.dds_type_name()),
-                    Codec::UnitreeSportRequest => Some(UnitreeKind::ApiRequest.dds_type_name()),
-                    Codec::Go1HighCmd => Some("unitree_legged_sdk::HighCmd"),
-                    Codec::Go1LowCmd => Some("unitree_legged_sdk::LowCmd"),
-                };
-                if expect.is_some_and(|e| e != t) {
+                let expect = c.codec.dds_type_name();
+                if expect != t {
                     return Err(format!(
-                        "{at}: the profile says its type is {t}, codec {} decodes {}",
+                        "{at}: the profile says its type is {t}, codec {} decodes {expect}",
                         c.codec.as_str(),
-                        expect.unwrap_or("")
                     ));
                 }
             }
@@ -474,6 +515,15 @@ impl Gateway {
                     .map(|m| parse_mac(m).ok_or_else(|| format!("{at}: bad MAC {m}")))
                     .collect::<Result<_, _>>()?,
                 allow_battery_off: c.allow_battery_off,
+                robot_model: c.robot_model,
+                allowed_fsm_ids: c.allowed_fsm_ids.clone(),
+                max_duration_s: c.max_duration_s(),
+                weight_slot: c.weight_slot,
+                max_weight: c.max_weight.unwrap_or(1.0),
+                hand_slots: fwcfg
+                    .joint_channels
+                    .get(&c.firewall_channel)
+                    .map_or(0, |s| s.motors.len()),
                 writers: HashMap::new(),
                 max_writers: cfg.rtps.max_writers_per_channel,
                 tick: 0,
@@ -499,7 +549,8 @@ impl Gateway {
             unknown_writers: cfg.rtps.unknown_writers,
             max_sn_jump: i64::try_from(cfg.rtps.max_sn_jump).unwrap_or(i64::MAX),
             binding_takeover_ns: cfg.rtps.binding_takeover_ns,
-            discovery: Discovery::new(topics, cfg.rtps.max_writers, IdentityResolver::new(profile)),
+            discovery: Discovery::new(topics, cfg.rtps.max_writers, IdentityResolver::new(profile))
+                .with_queued_ranges(cfg.rtps_port_ranges()),
             samples: Vec::with_capacity(rtps::MAX_SAMPLES),
             scratch: Vec::with_capacity(65_536),
             max_queue_delay_ns: cfg.max_queue_delay_ns,
@@ -683,33 +734,68 @@ impl Gateway {
 
     fn probe(&mut self, d: &[u8], s: &Sample) -> Option<usize> {
         let slot = d.get(s.payload.clone()?)?;
-        let found = self.channels.iter().position(|c| match c.codec {
-            Codec::UnitreeGoLowcmd | Codec::UnitreeHgLowcmd => {
-                let kind = if c.codec == Codec::UnitreeGoLowcmd {
-                    UnitreeKind::GoLowCmd
-                } else {
-                    UnitreeKind::HgLowCmd
-                };
-                decode_unitree(kind, slot, &Limits::default())
-                    .is_ok_and(|m| m.message.crc_ok() == Some(true))
-            }
-            // Any request in the sport services' id range (1001..=1199 on
-            // every model; model-specific tricks included), or one whose id
-            // does not fit i32 (aliasing): decided (and then refused) as
-            // sport rather than passed unchecked.
-            Codec::UnitreeSportRequest => {
-                match decode_unitree(UnitreeKind::ApiRequest, slot, &Limits::default()) {
-                    Ok(m) => match m.message {
-                        UnitreeMessage::ApiRequest(r) => {
-                            !r.api_id_in_range() || (1001..=1199).contains(&r.dispatched_api_id())
-                        }
-                        _ => false,
-                    },
-                    Err(_) => false,
+        // Each channel's content match and its priority (lower first): a
+        // payload two channels could read goes to the stricter one
+        // (`rt/lowcmd` before `rt/arm_sdk`; the motor board ignores a
+        // `LowCmd_` with a bad CRC, so only a valid one is a command).
+        let matches = |c: &Channel| -> Option<u8> {
+            match c.codec {
+                Codec::UnitreeGoLowcmd
+                | Codec::UnitreeHgLowcmd
+                | Codec::UnitreeGoArmSdk
+                | Codec::UnitreeHgArmSdk => {
+                    let kind = match c.lowcmd_codec()? {
+                        LowCmdCodec::Go => UnitreeKind::GoLowCmd,
+                        LowCmdCodec::Hg => UnitreeKind::HgLowCmd,
+                    };
+                    decode_unitree(kind, slot, &Limits::default())
+                        .is_ok_and(|m| m.message.crc_ok() == Some(true))
+                        .then_some(if c.codec.is_arm_sdk() { 1 } else { 0 })
                 }
+                // Any request in the sport services' id range (1001..=1199 on
+                // every model; model-specific tricks included), or one whose
+                // id does not fit i32 (aliasing): decided (and then refused)
+                // as sport rather than passed unchecked. Loco: the humanoid
+                // locomotion ids (7001..=7199 on service `sport`, 8001..=8299
+                // on H1's `loco`).
+                Codec::UnitreeSportRequest | Codec::UnitreeLocoRequest => {
+                    match decode_unitree(UnitreeKind::ApiRequest, slot, &Limits::default()) {
+                        Ok(m) => match m.message {
+                            UnitreeMessage::ApiRequest(r) => {
+                                let id = r.dispatched_api_id();
+                                let hit = !r.api_id_in_range()
+                                    || if c.codec == Codec::UnitreeSportRequest {
+                                        (1001..=1199).contains(&id)
+                                    } else {
+                                        (7001..=7199).contains(&id) || (8001..=8299).contains(&id)
+                                    };
+                                hit.then_some(0)
+                            }
+                            _ => None,
+                        },
+                        Err(_) => None,
+                    }
+                }
+                Codec::UnitreeDex3HandCmd | Codec::UnitreeHandSdk => {
+                    hand::decode_strict(slot, c.codec, c.hand_slots)
+                        .is_ok()
+                        .then_some(2)
+                }
+                Codec::Ros2Twist | Codec::Ros2TwistStamped => {
+                    ros2::decode_strict(slot, c.codec == Codec::Ros2TwistStamped)
+                        .is_ok()
+                        .then_some(2)
+                }
+                Codec::Go1HighCmd | Codec::Go1LowCmd => None,
             }
-            _ => false,
-        })?;
+        };
+        let found = self
+            .channels
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| matches(c).map(|p| (p, i)))
+            .min()
+            .map(|(_, i)| i)?;
         self.stats.probed += 1;
         self.discovery.insert(
             s.writer,
@@ -946,13 +1032,23 @@ impl Gateway {
         emit: bool,
     ) -> Outcome {
         match self.channels.get(ci).map(|c| c.codec) {
-            Some(Codec::UnitreeGoLowcmd | Codec::UnitreeHgLowcmd) => {
-                self.lowcmd_sample(ci, slot, source, now, late, emit)
-            }
+            Some(
+                Codec::UnitreeGoLowcmd
+                | Codec::UnitreeHgLowcmd
+                | Codec::UnitreeGoArmSdk
+                | Codec::UnitreeHgArmSdk,
+            ) => self.lowcmd_sample(ci, slot, source, now, late, emit),
             Some(Codec::UnitreeSportRequest) => {
                 self.sport_sample(ci, slot, source, now, late, emit)
             }
-            _ => Outcome::Pass,
+            Some(Codec::UnitreeLocoRequest) => self.loco_sample(ci, slot, source, now, late, emit),
+            Some(Codec::Ros2Twist | Codec::Ros2TwistStamped) => {
+                self.ros2_sample(ci, slot, source, now, late, emit)
+            }
+            Some(Codec::UnitreeDex3HandCmd | Codec::UnitreeHandSdk) => {
+                self.hand_sample(ci, slot, source, now, late)
+            }
+            Some(Codec::Go1HighCmd | Codec::Go1LowCmd) | None => Outcome::Suppress,
         }
     }
 
@@ -983,6 +1079,8 @@ impl Gateway {
         };
         let id = ch.id;
         let allow_battery_off = ch.allow_battery_off;
+        let weight = ch.weight_slot;
+        let max_weight = ch.max_weight;
         let mut decoded = lowcmd::decode_strict(slot, codec).ok();
         if decoded
             .as_ref()
@@ -994,7 +1092,18 @@ impl Gateway {
             self.stats.non_motor_rejected += 1;
             decoded = None;
         }
-        let frame = match decoded.as_ref().and_then(|d| d.msg.joint_frame()) {
+        if let (Some(w), Some(d)) = (weight, decoded.as_ref()) {
+            if !armsdk::weight_ok(&d.msg, w, max_weight) {
+                // The arm-SDK blend weight out of bounds: an integrity
+                // failure (crate::armsdk).
+                self.stats.arm_weight_rejected += 1;
+                decoded = None;
+            }
+        }
+        let frame = match decoded.as_ref().and_then(|d| match weight {
+            Some(w) => armsdk::decision_frame(&d.msg, w),
+            None => d.msg.joint_frame(),
+        }) {
             Some(f) => f,
             None => {
                 // Undecidable: decided as an integrity failure (the frame's
@@ -1032,9 +1141,11 @@ impl Gateway {
                     self.stats.rewrite_failed += 1;
                     return Outcome::Suppress;
                 };
-                match lowcmd::limited(&d.msg, &cmd.frame)
-                    .and_then(|w| lowcmd::write_slot(slot, d.header, &w).map(|()| w))
-                {
+                let wire = match weight {
+                    Some(w) => armsdk::limited(&d.msg, &cmd.frame, w),
+                    None => lowcmd::limited(&d.msg, &cmd.frame),
+                };
+                match wire.and_then(|w| lowcmd::write_slot(slot, d.header, &w).map(|()| w)) {
                     Ok(wire) => {
                         ch.last_low = Some(Forwarded {
                             frame: cmd.frame,
@@ -1059,7 +1170,11 @@ impl Gateway {
                 ..
             } => {
                 let last = ch.last_low;
-                let wire = match lowcmd::substitute(codec, &sub.cmd.frame, last.as_ref()) {
+                let wire = match weight {
+                    Some(w) => armsdk::substitute(codec, &sub.cmd.frame, last.as_ref(), w),
+                    None => lowcmd::substitute(codec, &sub.cmd.frame, last.as_ref()),
+                };
+                let wire = match wire {
                     Ok(w) => w,
                     Err(_) => {
                         self.stats.rewrite_failed += 1;
@@ -1142,6 +1257,12 @@ impl Gateway {
             self.stats.api_alias += 1;
             return Outcome::Suppress;
         }
+        if let ApiCall::SetVelocity { .. } = req.call {
+            // A loco SetVelocity (7105) on a sport channel (model not
+            // known): decided as a velocity like on a loco channel, with
+            // the default duration cap.
+            return self.set_velocity(ci, slot, &req, source, now, late, emit);
+        }
         let velocity = match req.call {
             ApiCall::Move { vx, vy, vyaw } => Some(twist(vx, vy, vyaw)),
             ApiCall::Malformed {
@@ -1197,6 +1318,271 @@ impl Gateway {
             FwVerdict::Rejected {
                 substitute: None, ..
             } => Outcome::Suppress,
+        }
+    }
+
+    // ------------------------------------------------------------ loco
+
+    /// A humanoid locomotion request (`unitree_loco_request`; see the
+    /// README, "Loco requests", for every SDK id and why).
+    fn loco_sample(
+        &mut self,
+        ci: usize,
+        slot: &mut [u8],
+        source: SourceId,
+        now: u64,
+        late: bool,
+        emit: bool,
+    ) -> Outcome {
+        let Some(ch) = self.channels.get(ci) else {
+            return Outcome::Suppress;
+        };
+        let id = ch.id;
+        let (service, model) = ch.api();
+        let allow_api = ch.allowed_api_ids.clone();
+        let allow_fsm = ch.allowed_fsm_ids.clone();
+        let req = match sport::decode_strict_for(slot, service, model) {
+            Ok(r) => r,
+            Err(_) => {
+                self.stats.undecidable += 1;
+                let _ =
+                    self.twist_check(id, source, now, twist(f64::NAN, f64::NAN, f64::NAN), false);
+                return Outcome::Suppress;
+            }
+        };
+        if i32::try_from(req.api_id).is_err() {
+            self.stats.api_alias += 1;
+            return Outcome::Suppress;
+        }
+        let allowed = match req.call {
+            ApiCall::SetVelocity { .. }
+            | ApiCall::Malformed {
+                intended: ApiClass::Velocity,
+                ..
+            } => return self.set_velocity(ci, slot, &req, source, now, late, emit),
+            // The walking controller (`Start`) keeps the robot balanced;
+            // every other FSM state (ZeroTorque, Damp: limp, the robot
+            // falls; Squat / Sit / StandUp / lie down: whole-body motion)
+            // only when the site listed it.
+            ApiCall::SetFsmId { fsm_id, meaning } => {
+                meaning == FsmMeaning::Start
+                    || allow_fsm.as_ref().is_some_and(|a| a.contains(&fsm_id))
+            }
+            ApiCall::Other {
+                class: ApiClass::Query,
+                ..
+            } => true,
+            ApiCall::Other { api_id, .. } => {
+                allow_api.as_ref().is_some_and(|a| a.contains(&api_id))
+            }
+            // Unknown ids, malformed parameters, anything else: refused.
+            _ => false,
+        };
+        if !allowed {
+            self.stats.loco_refused += 1;
+            return Outcome::Suppress;
+        }
+        match self.twist_check(id, source, now, twist(0.0, 0.0, 0.0), late) {
+            FwVerdict::Passed { .. } | FwVerdict::Limited { .. } => Outcome::Pass,
+            FwVerdict::Rejected { .. } => Outcome::Suppress,
+        }
+    }
+
+    /// A `SetVelocity` (or a malformed one): the body velocity is decided
+    /// as a twist `(vx, vy, 0) / (0, 0, vyaw)`, the duration is capped at
+    /// the channel's `max_velocity_duration_s` (default 1 s); a limited or
+    /// substitute velocity and a capped duration are written in place.
+    #[allow(clippy::too_many_arguments)]
+    fn set_velocity(
+        &mut self,
+        ci: usize,
+        slot: &mut [u8],
+        req: &sport::SportRequest,
+        source: SourceId,
+        now: u64,
+        late: bool,
+        emit: bool,
+    ) -> Outcome {
+        let Some(ch) = self.channels.get(ci) else {
+            return Outcome::Suppress;
+        };
+        let id = ch.id;
+        let cap = ch.max_duration_s;
+        let (service, model) = ch.api();
+        let (motion, duration) = match req.call {
+            ApiCall::SetVelocity {
+                vx,
+                vy,
+                vyaw,
+                duration,
+            } if duration.is_finite() && duration >= 0.0 => (twist(vx, vy, vyaw), duration),
+            // A negative / non-finite duration, or an unreadable velocity:
+            // decided as a non-finite command (refused).
+            _ => (twist(f64::NAN, f64::NAN, f64::NAN), cap),
+        };
+        let d = duration.min(cap);
+        let mut write = |gw: &mut Self, v: [f64; 3]| -> bool {
+            sport::write_set_velocity(slot, req, v, d, service, model).is_ok() || {
+                gw.stats.rewrite_failed += 1;
+                false
+            }
+        };
+        match self.twist_check(id, source, now, motion, late) {
+            FwVerdict::Passed { cmd, .. } if duration > cap => match twist_values(&cmd) {
+                Some(v) if write(self, v) => {
+                    self.stats.duration_capped += 1;
+                    Outcome::Rewritten
+                }
+                _ => Outcome::Suppress,
+            },
+            FwVerdict::Passed { .. } => Outcome::Pass,
+            FwVerdict::Limited { cmd, .. } => match twist_values(&cmd) {
+                Some(v) if write(self, v) => {
+                    self.stats.limited += 1;
+                    if duration > cap {
+                        self.stats.duration_capped += 1;
+                    }
+                    Outcome::Rewritten
+                }
+                _ => Outcome::Suppress,
+            },
+            FwVerdict::Rejected {
+                substitute: Some(_),
+                ..
+            } if !emit => Outcome::Suppress,
+            FwVerdict::Rejected {
+                substitute: Some(sub),
+                ..
+            } => match twist_values(&sub.cmd) {
+                Some(v) if write(self, v) => {
+                    self.stats.substituted += 1;
+                    if duration > cap {
+                        self.stats.duration_capped += 1;
+                    }
+                    Outcome::Rewritten
+                }
+                _ => Outcome::Suppress,
+            },
+            FwVerdict::Rejected {
+                substitute: None, ..
+            } => Outcome::Suppress,
+        }
+    }
+
+    // ------------------------------------------------------------ ROS 2
+
+    /// A ROS 2 `Twist` / `TwistStamped` (`crate::ros2`): the firewall's
+    /// twist check; limited / substitute values written in place.
+    fn ros2_sample(
+        &mut self,
+        ci: usize,
+        slot: &mut [u8],
+        source: SourceId,
+        now: u64,
+        late: bool,
+        emit: bool,
+    ) -> Outcome {
+        let Some(ch) = self.channels.get(ci) else {
+            return Outcome::Suppress;
+        };
+        let id = ch.id;
+        let stamped = ch.codec == Codec::Ros2TwistStamped;
+        let w = match ros2::decode_strict(slot, stamped) {
+            Ok(w) => w,
+            Err(_) => {
+                self.stats.undecidable += 1;
+                let nan = Motion::Twist(Twist::new(
+                    Vec3::new(f64::NAN, f64::NAN, f64::NAN),
+                    Vec3::new(f64::NAN, f64::NAN, f64::NAN),
+                ));
+                let _ = self.twist_check(id, source, now, nan, false);
+                return Outcome::Suppress;
+            }
+        };
+        let v = w.values;
+        let motion = Motion::Twist(Twist::new(
+            Vec3::new(v[0], v[1], v[2]),
+            Vec3::new(v[3], v[4], v[5]),
+        ));
+        let six = |c: &Command| match &c.motion {
+            Motion::Twist(t) => Some([
+                t.linear.x,
+                t.linear.y,
+                t.linear.z,
+                t.angular.x,
+                t.angular.y,
+                t.angular.z,
+            ]),
+            Motion::Joints(_) => None,
+        };
+        let out = match self.twist_check(id, source, now, motion, late) {
+            FwVerdict::Passed { .. } => return Outcome::Pass,
+            FwVerdict::Limited { cmd, .. } => six(&cmd).map(|x| (x, true)),
+            FwVerdict::Rejected {
+                substitute: Some(sub),
+                ..
+            } if emit => six(&sub.cmd).map(|x| (x, false)),
+            FwVerdict::Rejected { .. } => return Outcome::Suppress,
+        };
+        match out {
+            Some((x, limited)) if ros2::write_twist(slot, &w, x, stamped).is_ok() => {
+                if limited {
+                    self.stats.limited += 1;
+                } else {
+                    self.stats.substituted += 1;
+                }
+                Outcome::Rewritten
+            }
+            _ => {
+                self.stats.rewrite_failed += 1;
+                Outcome::Suppress
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ hands
+
+    /// A hand command (`crate::hand`): decided on the finger joints,
+    /// forwarded unchanged when the firewall passes it, else suppressed.
+    fn hand_sample(
+        &mut self,
+        ci: usize,
+        slot: &mut [u8],
+        source: SourceId,
+        now: u64,
+        late: bool,
+    ) -> Outcome {
+        let Some(ch) = self.channels.get(ci) else {
+            return Outcome::Suppress;
+        };
+        let id = ch.id;
+        let n = ch.hand_slots;
+        let decoded = hand::decode_strict(slot, ch.codec, n).ok();
+        let frame = match decoded {
+            Some(f) => f,
+            None => {
+                self.stats.undecidable += 1;
+                match JointFrame::new(n, Some(false)) {
+                    Some(f) => f,
+                    None => return Outcome::Suppress,
+                }
+            }
+        };
+        let cmd = JointCommand::new(source, id, now, frame);
+        let v = if late && decoded.is_some() {
+            self.fw.joint_fault_verdict(&cmd, now)
+        } else {
+            self.fw.check_joint(&cmd, now)
+        };
+        match v {
+            JointVerdict::Passed { .. } if decoded.is_some() => {
+                self.stats.hand_passed += 1;
+                Outcome::Pass
+            }
+            _ => {
+                self.stats.hand_suppressed += 1;
+                Outcome::Suppress
+            }
         }
     }
 
