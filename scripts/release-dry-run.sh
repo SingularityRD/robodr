@@ -47,8 +47,9 @@
 #     asset), every offline bundle passes `install-bundle.sh verify --pubkey
 #     --tarball` (trusted copy from the release commit) and is refused when
 #     tampered with or checked with another key, and every .deb passes
-#     scripts/deb-install-smoke.sh (throwaway dpkg root, --version/--help of
-#     every binary, systemd-analyze verify of every unit).
+#     scripts/deb-install-smoke.sh --strict (throwaway dpkg root, --version
+#     and --help of every binary must exit 0, systemd-analyze verify of
+#     every unit).
 #  7. Report: OUT/REPORT.txt (steps, adaptations, artefacts with sizes and
 #     SHA-256), OUT/logs/, and the published assets in OUT/assets/ together
 #     with the TEST-ONLY public key (OUT/TEST-ONLY-dry-run-minisign.pub).
@@ -413,7 +414,9 @@ if [[ $rc_all == 0 && " $jobs " == *" publish "* ]]; then
     done
     result PASS "tampered bundles and a foreign key are refused (any acceptance is listed as FAIL above)"
     # Install smoke test of every package.
-    if "$here/deb-install-smoke.sh" "$assets"/*.deb >"$out/logs/deb-install-smoke.log" 2>&1; then
+    # --strict: a binary whose --version / --help does not exit 0 (naming
+    # the release version) fails the run instead of being a finding.
+    if "$here/deb-install-smoke.sh" --strict "$assets"/*.deb >"$out/logs/deb-install-smoke.log" 2>&1; then
         result PASS "deb-install-smoke: every .deb unpacks in a throwaway dpkg root, every binary starts, sysusers/tmpfiles apply, units verify"
     else
         result FAIL "deb-install-smoke (logs/deb-install-smoke.log)"

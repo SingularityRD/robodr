@@ -733,12 +733,15 @@ Defects found and fixed:
   (`04663a0`); the smoke test's root needed systemd's units, `/bin/sh`,
   `--path-include` and conffile handling (`f351533`).
 
-Findings not fixed (crate code): `--version` exits 2 on
+Findings (crate code), fixed after this run: `--version` exited 2 on
 `robodr-anchor-receiver`, `robodr-blackbox`, `robodr-diode-pack`,
 `robodr-diode-unpack`, `robodr-kafka-publish`, `robodr-replay`,
-`robodr-spool-export`, `robodr-firewall-gw`; `--help` exits 2 on
-`robodr-kafka-publish` and `robodr-spool-export`. All of them start and
-print their usage.
+`robodr-spool-export`, `robodr-firewall-gw`; `--help` exited 2 on
+`robodr-kafka-publish` and `robodr-spool-export`. All of them started and
+printed their usage. Every shipped binary now prints `<name> <version>` for
+`--version` and its usage on stdout for `--help`, both with exit 0, so
+`scripts/release-dry-run.sh` runs the smoke test with `--strict` (any such
+finding fails the dry run).
 
 Published set (test-only signatures; these hashes are of a dry run, never
 of a release):

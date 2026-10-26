@@ -51,6 +51,13 @@ pub fn argv() -> Result<Vec<String>, String> {
         .collect()
 }
 
+/// True when the arguments are exactly `--version` (or `-V`): the
+/// binaries then print `<name> <version>` on stdout and exit 0. Anywhere
+/// else (or next to other flags) it stays a usage error.
+pub fn is_version_request(args: &[String]) -> bool {
+    matches!(args, [a] if a == "--version" || a == "-V")
+}
+
 pub fn parse_args(args: impl IntoIterator<Item = String>, known: &[&str]) -> Result<Args, String> {
     parse_args_with_switches(args, known, &[])
 }
@@ -338,6 +345,11 @@ mod tests {
         assert!(parse_args(s(&["--a"]), &["a"]).is_err());
         assert!(parse_args(s(&["pos"]), &["a"]).is_err());
         assert_eq!(parse_args(s(&["-h"]), &["a"]).unwrap_err(), "help");
+        assert!(is_version_request(&s(&["--version"])));
+        assert!(is_version_request(&s(&["-V"])));
+        assert!(!is_version_request(&s(&[])));
+        assert!(!is_version_request(&s(&["--version", "--a", "1"])));
+        assert!(parse_args(s(&["--version", "--a", "1"]), &["a"]).is_err());
         // Switches take no value and appear at most once.
         let a = parse_args_with_switches(s(&["--x", "--a", "1"]), &["a"], &["x"]).unwrap();
         assert!(a.flag("x") && !a.flag("a"));

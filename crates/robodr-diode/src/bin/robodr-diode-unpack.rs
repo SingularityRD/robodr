@@ -19,6 +19,7 @@ usage: robodr-diode-unpack --inbox DIR --out DIR --quarantine DIR \\
          [--accept-gap UNIT:SEQ]... [--max-accept-gap N] [--max-batch-bytes N] \\
          [--held-max-age-s N] [--in-transit-max-age-s N] \\
          [--upgrade-data-source LABEL] [--upgrade-topic TOPIC]
+       robodr-diode-unpack --version
 
 Keyring file: one `<unit_id> <public-key-file>` per line (# comments; the
 older `<unit_id> <key_id> <key-file>` also works, the id must match the
@@ -68,7 +69,18 @@ const FLAGS: &[&str] = &[
 const SWITCHES: &[&str] = &["allow-hmac"];
 
 fn main() -> ExitCode {
-    let args = match cli::argv().and_then(|v| cli::parse_args_with_switches(v, FLAGS, SWITCHES)) {
+    let argv = match cli::argv() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    if cli::is_version_request(&argv) {
+        println!("robodr-diode-unpack {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+    let args = match cli::parse_args_with_switches(argv, FLAGS, SWITCHES) {
         Ok(a) => a,
         Err(e) if e == "help" => {
             println!("{USAGE}");

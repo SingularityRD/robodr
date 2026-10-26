@@ -1102,6 +1102,13 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Fixed
 
+- `--version` (prints `<name> <version>`) and `--help` (usage on stdout)
+  exit 0 on `robodr-anchor-receiver`, `robodr-blackbox`,
+  `robodr-diode-pack`, `robodr-diode-unpack`, `robodr-kafka-publish`,
+  `robodr-replay`, `robodr-spool-export` and `robodr-firewall-gw` (they
+  exited 2; `robodr-replay --help` printed to stderr). Usage errors still
+  exit 2. `scripts/release-dry-run.sh` now runs `deb-install-smoke.sh
+  --strict`, so a shipped binary without them fails the dry run.
 - `robodr-agentd` with `capture.pcap_replay`: replayed packets are judged on
   the capture's own timeline (each record's timestamp, offset onto the
   daemon clock at the first packet, never going back) instead of the time

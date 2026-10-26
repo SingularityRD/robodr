@@ -4,7 +4,7 @@
 // S10: this crate has no `unsafe` code and must stay that way.
 #![forbid(unsafe_code)]
 
-use robodr_diode::cli::{argv, load_signer, parse_args_with_switches, Args};
+use robodr_diode::cli::{argv, is_version_request, load_signer, parse_args_with_switches, Args};
 use robodr_diode::{PackConfig, Packer};
 use robodr_export::{now_ms, ExportConfig, Exporter};
 use std::path::PathBuf;
@@ -88,33 +88,45 @@ fn run_one(o: &Opts) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
-    let parsed = argv().and_then(|v| {
-        parse_args_with_switches(
-            v,
-            &[
-                "spool",
-                "outbox",
-                "state",
-                "pack-state",
-                "unit",
-                "key-file",
-                "key-id",
-                "max-batch-bytes",
-                "max-findings",
-                "rejected-dir",
-                "interval-ms",
-                "upgrade-data-source",
-                "upgrade-topic",
-            ],
-            &["allow-hmac", "once"],
-        )
-    });
+    let v = match argv() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("robodr-spool-export: {e}");
+            eprintln!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    if is_version_request(&v) {
+        println!("robodr-spool-export {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+    let parsed = parse_args_with_switches(
+        v,
+        &[
+            "spool",
+            "outbox",
+            "state",
+            "pack-state",
+            "unit",
+            "key-file",
+            "key-id",
+            "max-batch-bytes",
+            "max-findings",
+            "rejected-dir",
+            "interval-ms",
+            "upgrade-data-source",
+            "upgrade-topic",
+        ],
+        &["allow-hmac", "once"],
+    );
     let o = match parsed.and_then(|a| opts(&a)) {
         Ok(o) => o,
+        Err(e) if e == "help" => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
         Err(e) => {
-            if e != "help" {
-                eprintln!("robodr-spool-export: {e}");
-            }
+            eprintln!("robodr-spool-export: {e}");
             eprintln!("{USAGE}");
             return ExitCode::from(2);
         }

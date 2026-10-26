@@ -61,6 +61,7 @@ const USAGE: &str = "usage:
   robodr-anchor-receiver serve  --config FILE
   robodr-anchor-receiver ingest --config FILE MARKFILE...
   robodr-anchor-receiver status --config FILE
+  robodr-anchor-receiver --version
 exit: 0 ok, 1 refused marks (ingest), 2 usage/config/key/IO error";
 
 const MAX_CONFIG_BYTES: u64 = 1 << 20;
@@ -115,6 +116,10 @@ fn main() -> ExitCode {
         Some("status") => status(&argv[1..]),
         Some("-h" | "--help" | "help") => {
             println!("{USAGE}");
+            Ok(())
+        }
+        Some("-V" | "--version") if argv.len() == 1 => {
+            println!("robodr-anchor-receiver {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         _ => Err(Fail::Usage("missing or unknown subcommand".into())),

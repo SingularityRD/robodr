@@ -100,6 +100,7 @@ const USAGE: &str = "usage:
   robodr-blackbox tpm-anchor-check --index 0x01XXXXXX [--tcti TCTI] [--tools-dir DIR]
                              [--index-auth-file FILE]
   robodr-blackbox anchor-mark DIR --key FILE --unit ID [--out FILE]
+  robodr-blackbox --version
 keygen defaults to ed25519 (secret FILE, 0600; public FILE.pub, safe to share).
 --keyring accepts secret key files (0600, own user or root) and public key
 files (any mode).
@@ -204,6 +205,10 @@ fn main() -> ExitCode {
         Some("anchor-mark") => anchor_mark(&argv[1..]),
         Some("-h" | "--help" | "help") => {
             println!("{USAGE}");
+            Ok(())
+        }
+        Some("-V" | "--version") if argv.len() == 1 => {
+            println!("robodr-blackbox {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         _ => Err(Fail::Usage("missing or unknown subcommand".into())),

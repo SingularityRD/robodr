@@ -35,7 +35,8 @@ use robodr_firewall_gw::config::GatewayConfig;
 use robodr_firewall_gw::runtime::{self, RunOptions};
 use robodr_firewall_gw::{ruleset, sys, Gateway};
 
-const USAGE: &str = "usage: robodr-firewall-gw <run|check-config|ruleset> --config <path>";
+const USAGE: &str = "usage: robodr-firewall-gw <run|check-config|ruleset> --config <path>
+       robodr-firewall-gw --version";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -48,6 +49,10 @@ fn main() -> ExitCode {
     };
     if matches!(cmd, "-h" | "--help" | "help") {
         println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
+    if matches!(cmd, "-V" | "--version") && rest.is_empty() {
+        println!("robodr-firewall-gw {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
     let config = match rest {

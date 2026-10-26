@@ -4,7 +4,7 @@
 // S10: this crate has no `unsafe` code and must stay that way.
 #![forbid(unsafe_code)]
 
-use robodr_diode::cli::{argv, parse_args_with_switches, Args};
+use robodr_diode::cli::{argv, is_version_request, parse_args_with_switches, Args};
 use robodr_export::kafka::{Producer, ProducerConfig};
 use robodr_export::{PublishConfig, Publisher, Source};
 use std::process::ExitCode;
@@ -93,34 +93,46 @@ fn run(o: &Opts) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
-    let parsed = argv().and_then(|v| {
-        parse_args_with_switches(
-            v,
-            &[
-                "bootstrap",
-                "state-dir",
-                "diode-out",
-                "spool",
-                "topic",
-                "chunk",
-                "client-id",
-                "request-timeout-ms",
-                "produce-timeout-ms",
-                "delivery-timeout-ms",
-                "retries",
-                "max-request-bytes",
-                "interval-ms",
-                "upgrade-data-source",
-            ],
-            &["once"],
-        )
-    });
+    let v = match argv() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("robodr-kafka-publish: {e}");
+            eprintln!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    if is_version_request(&v) {
+        println!("robodr-kafka-publish {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+    let parsed = parse_args_with_switches(
+        v,
+        &[
+            "bootstrap",
+            "state-dir",
+            "diode-out",
+            "spool",
+            "topic",
+            "chunk",
+            "client-id",
+            "request-timeout-ms",
+            "produce-timeout-ms",
+            "delivery-timeout-ms",
+            "retries",
+            "max-request-bytes",
+            "interval-ms",
+            "upgrade-data-source",
+        ],
+        &["once"],
+    );
     let o = match parsed.and_then(|a| opts(&a)) {
         Ok(o) => o,
+        Err(e) if e == "help" => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
         Err(e) => {
-            if e != "help" {
-                eprintln!("robodr-kafka-publish: {e}");
-            }
+            eprintln!("robodr-kafka-publish: {e}");
             eprintln!("{USAGE}");
             return ExitCode::from(2);
         }
