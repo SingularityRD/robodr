@@ -98,3 +98,29 @@ At the end:
     `crates/robodr-ros2-pipeline/tests/redteam_regressions.rs`, and
     through agentd and the executor in
     `crates/robodr-agentd/tests/executor_link.rs`.
+
+## Review of the F1 / F3 fixes
+
+An independent adversarial review of the fixes above (branch `wt/redfix`)
+found ten issues; each now has a regression test that replays the
+reviewer's proof of concept and failed before the fix.
+
+| # | Sev | Attack | Fix | Regression |
+|---|-----|--------|-----|------------|
+| H1 | High | One SPDP for the profiled prefix after its lease ran out, from the attacker's host, overwrote its remembered locators silently; the SOC's quarantine of a decoy announcing the robot's address then cut the robot participant (executor `verified`). | A profiled prefix with no live binding, announced from an address its remembered evidence never saw, becomes contested (Critical `participant_source_mismatch`); its locators are never written by a foreign host. Locators are handed out only on addresses the participant was seen sending from. | `crates/robodr-ros2-pipeline/tests/review_redfix.rs` `h1_*`; `crates/robodr-agentd/tests/executor_link.rs` `review_h1_*` |
+| H2a | High | A live decoy prefix announcing the rogue's locators made them "claimed by another participant": `locators_required`. | Another prefix takes an ip:port away only if it was seen at that address (live, or remembered later). A decoy spoofing the rogue's own address contests the locator, and agentd vouches for a GUID-prefix-only quarantine (`guid_only`). | `review_redfix.rs` `h2a_*`; `executor_link.rs` `review_h2a_*` (both variants) |
+| H2b | High | One locator outside the quarantine scope, on the motion path or loopback in the rogue's SPDP: the executor refused the whole order. | Unobserved and loopback locators never leave the binding table; the executor leaves any out-of-scope, other-family or motion-path locator out (listed with the reason) and quarantines the rest; it still refuses when every locator is on the motion path. | `review_redfix.rs` `h2b_*`; `executor_link.rs` `review_h2b_*`; executor `review_guid_only_quarantine_keeps_every_refusal` |
+| H3 | High | 600 sprayed prefixes with a `cmd_vel` writer each: 600 Critical findings, the Critical spool share full, a later genuine rogue's Critical finding dropped. | Critical per-participant findings are aggregated per source after the first 8 (a Critical `discovery_flood`); one source may hold at most a quarter of the Critical spool share. | `crates/robodr-agentd/tests/redteam_regressions.rs` `review_h3_*` |
+| H4 | High | ~40 packets a minute from 12 addresses used up the global budget: a later rogue's `unknown_participant` and a pinned prefix's impersonation were folded into a sourceless aggregate. | Only a source past its own share is folded; a late source still reports its first finding; findings about profiled / pinned participants are never folded. | `redteam_regressions.rs` `review_h4_*` |
+| M5 | Medium | An absent unprofiled legitimate host's address announced by the rogue was in the rogue's quarantine set. | Observed-source evidence (the rogue never sent from it). | `review_redfix.rs` `m5_*` |
+| M6 | Medium | 1100 active prefixes (SPDP + SEDP) evicted the rogue's remembered locators. | Ranked eviction (SPDP-only < active < High < Critical < SOC-named < profiled) and at most 128 remembered prefixes per source address. | `review_redfix.rs` `m6_*` |
+| M7 | Medium | A JSONL participant event filled the locators the binding table deliberately withheld (contested prefix). | Events are used only for prefixes the table does not know, through the same filters. | `executor_link.rs` `review_m7_*` |
+| M8 | Medium | The AutoSecOps catalog mirror lacked `robot.ros2.discovery_flood`. | Mirrored on the AutoSecOps side; the contract (`docs/contracts/robodr.findings.md` §10) states the rule's final semantics. | (AutoSecOps) |
+| L9 | Low | A 24-hex-digit topic name became an aggregate "sample GUID"; the detail was cut; "more than 32 source addresses" was printed for 12. | Samples from the structured prefix only; the detail is built to fit 400 characters; the text names the sources. | `redteam_regressions.rs` `review_l9_*` |
+| L10 | Low | One finding id per source forever; no Critical reserve below 8 files. | One finding per flood episode (subject node); `spool.max_files` below 8 refused. | `redteam_regressions.rs` `review_l10_*` |
+
+Still open (documented limits): the evidence is source addresses, which
+can be forged (a rogue spoofing an absent unprofiled participant's
+address and announcing its exact ip:port gets it); the binding memory and
+flood state are not persisted across an agentd restart.
+

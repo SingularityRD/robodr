@@ -565,9 +565,10 @@ Rules for Unitree, all enforced in code:
     Isolation keeps it open, and it is accepted before any quarantine
     drop, so no quarantine acts inside the robot network, even on
     traffic that carries the quarantined GUID prefix.
-  * A quarantine of a participant whose SPDP locators lie on it (or that
-    agentd has no locators for) is refused (`motion_path`,
-    `locators_required`).
+  * A quarantine of a participant whose SPDP locators all lie on it (or
+    that agentd has no locators for and does not vouch for) is refused
+    (`motion_path`, `locators_required`); a locator on it next to others
+    outside is left out, never acted on.
   * During an isolation the robot's DDS discovery (SPDP to
     239.255.0.1:7400/7401, IGMP) keeps working, so the motion stack does
     not lose its peers.

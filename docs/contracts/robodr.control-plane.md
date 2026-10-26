@@ -401,10 +401,18 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
     reach `verified`. agentd hands a `quarantine_node` order the
     participant's SPDP unicast locators it has seen (from the pipeline's
     binding table: the prefix's own last trusted announcement, also after
-    the participant left or was evicted, for 24 h, minus any locator
-    another participant claims, none for a contested or pinned prefix;
-    else from `ros2_participant_discovered` events); without them the
-    executor refuses it (`locators_required`).
+    the participant left or was evicted, for 24 h, only on addresses it
+    was seen sending from, minus any locator a profiled participant, a pin
+    or another participant seen at that address claims, none for a
+    contested or pinned prefix; from `ros2_participant_discovered` events
+    only for a prefix the binding table does not know, through the same
+    filters). With no locator left, agentd vouches for a GUID-prefix-only
+    quarantine of a participant it saw that is not one of the robot's own
+    (profiled, pinned, contested); otherwise the executor refuses it
+    (`locators_required`). The executor leaves out (never refuses for) a
+    locator outside its quarantine scope or on the motion control path,
+    and refuses an order whose every locator is on the motion control path
+    (`motion_path`).
   * `record_evidence` becomes `verified` once a signed
     `robodr.evidence_mark` note naming the request's evidence is in the
     black box. It is never reverted.
@@ -937,8 +945,9 @@ another robot), 13 (signed in the removed v1 domain); all 401
   `isolate_network`, `quarantine_node` (participant GUID) and
   `record_evidence` only, re-checks the safety state at apply time and
   reports `pending` / `verified` / `reverted`. A participant is
-  quarantined only once agentd has seen its SPDP unicast locators
-  (`locators_required` before that). A `pending` request whose
+  quarantined only once agentd has seen it: by its SPDP unicast locators,
+  or by its GUID prefix alone when none can be vouched for and it is not
+  one of the robot's own (`locators_required` otherwise). A `pending` request whose
   order was staged but not yet sent when agentd stopped stays `pending`
   (the order is dropped, never sent late); the SOC resubmits under a new
   `request_id`.

@@ -63,6 +63,12 @@ eviction can only cause a re-report.
 
 ### Flood limits
 
+- Every per-participant / per-endpoint finding names its GUID prefix as
+  structured data (`Finding::participant`), never to be parsed back from
+  the detail text: robodr-agentd aggregates a flooding source's findings
+  by it (discovery-flood guard), and a participant that raised a High or
+  Critical finding keeps its remembered quarantine locators longer
+  (`src/binding.rs`, "Quarantine locators").
 - **Per-datagram cap** (`max_findings_per_datagram`, default 64): new
   findings of one datagram (or tick / end of replay / capture-health update)
   are ordered most severe first and at most this many are reported; the rest

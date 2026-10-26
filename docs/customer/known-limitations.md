@@ -38,10 +38,14 @@
   - It has run against real nftables in network namespaces only, not on a
     robot and not under a real systemd (load the nf_tables modules at boot
     on a minimal kernel).
-  - A participant can be quarantined only after agentd has seen its SPDP
-    locators; RTPS over TCP or shared memory, a sender that changes its
-    GUID prefix, and a rogue on the same host over loopback are not
-    covered.
+  - A participant can be quarantined only after agentd has seen it: by
+    the SPDP locators on addresses it was seen sending from, or by its GUID
+    prefix alone when none can be vouched for. RTPS over TCP or shared
+    memory, a sender that changes its GUID prefix, and a rogue on the same
+    host over loopback are not covered. Source addresses are not
+    authenticated: a rogue that forges an *absent* unprofiled host's
+    address and announces its exact ip:port can get that ip:port into its
+    own quarantine (never a profiled or pinned participant's).
   - Bridged traffic is isolated only with `br_netfilter` loaded.
   - It verifies the SOC's signed request itself (its own copy of the SOC
     keys, its own replay store) before it executes a control-plane order,

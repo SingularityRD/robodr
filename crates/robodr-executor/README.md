@@ -49,23 +49,31 @@ revert / TTL expiry ── journal (reverting) ── re-render without it ─�
    * The motion control path is never cut, unless `fall_safe_restrict`
      names that target class and the entry is not `low_level`. A
      `low_level` entry is never cut.
-   * A quarantine needs the participant's SPDP unicast locators
-     (`locators_required`; agentd attaches them, see below), and each must
-     lie outside the `cidr` of every motion-path entry the quarantine may
-     not cut (`motion_path`). Such an entry with an `interface` and no
-     `cidr` refuses every quarantine: no locator can be proven outside
-     it. A matching GUID prefix refuses too. **A quarantine cannot act
-     inside a low-level network**: the entries it may not cut are rendered
-     as accepts before its drops, so traffic there passes even when it
-     carries the quarantined GUID prefix. **Every locator must also be in
-     scope** (review F4; `locator_out_of_scope`): inside a
-     `network.quarantine.cidrs` entry (none configured: no quarantine at
-     all), on one of the robot's DDS ports (`network.quarantine.udp_ports`,
-     default the RTPS port ranges of `network.discovery.domains`), all of
-     one address family. The locators are SPDP claims nobody signed; this
-     bounds what a forged one can name to a DDS endpoint of a network the
-     site declared quarantinable (GUIDs change on restart and can
-     be forged).
+   * A quarantine acts on the participant's SPDP unicast locators (agentd
+     attaches them, see below) and on RTPS sent by its GUID prefix. It acts
+     only on a locator that lies outside the `cidr` of every motion-path
+     entry the quarantine may not cut **and** is in scope (review F4):
+     inside a `network.quarantine.cidrs` entry, on one of the robot's DDS
+     ports (`network.quarantine.udp_ports`, default the RTPS port ranges of
+     `network.discovery.domains`), not loopback, one address family. Any
+     other locator is **left out** (review of the F3 fix, H2b: listed with
+     its reason in the plan, the `applied` event and the answer's `note`;
+     nothing is rendered for it) instead of refusing the whole order, so
+     one bad locator in a rogue's own SPDP cannot make it unquarantinable.
+     **Still refused**: a GUID prefix of a motion-path entry it may not cut,
+     or such an entry with an `interface` and no `cidr` (nothing can be
+     proven outside it) (`motion_path`); an order whose every locator lies
+     on the motion path (`motion_path`: the participant may be on it); no
+     `network.quarantine.cidrs` (`locator_out_of_scope`); and an order with
+     no locator left that agentd did not vouch for (`guid_only`, see
+     below): `locator_out_of_scope` when it had some, `locators_required`
+     when it had none. **A quarantine cannot act inside a low-level
+     network**: the entries it may not cut are rendered as accepts before
+     its drops (the GUID-prefix drop included), so traffic there passes
+     even when it carries the quarantined GUID prefix. The locators are
+     SPDP claims nobody signed; this bounds what a forged one can name to
+     a DDS endpoint of a network the site declared quarantinable (GUIDs
+     change on restart and can be forged).
    * Isolation needs a configured management channel.
    * The TTL must be within `1..=ttl.max_s`.
 2. **Safety re-check immediately before apply.** This is executor rule 4 of
@@ -426,13 +434,22 @@ and `src/config.rs` for every field and its limits. agentd's side is the
   isolation. `"multicast_groups": []` keeps none.
 * **Locators from agentd.** For a `quarantine_node` order agentd attaches
   the participant's SPDP unicast locators (metatraffic and default, IP and
-  port): from the pipeline's binding table (what the participant itself
-  last announced through a path the binding trusts, also after it left,
-  its lease expired or a prefix flood evicted it, kept 24 h; never a
-  locator another live or profiled participant claims; none for a
-  contested or pinned prefix, see `robodr_ros2_pipeline::binding`,
-  "Quarantine locators"), else from `ros2_participant_discovered` events
-  of a JSONL input. Without them the executor refuses
+  port) from the pipeline's binding table (`robodr_ros2_pipeline::binding`,
+  "Quarantine locators"): what the participant itself last announced
+  through a path the binding trusts, also after it left, its lease expired
+  or a prefix flood evicted it (kept 24 h), **only on addresses it was seen
+  sending from**; never a locator a profiled participant announces or an
+  address pinned to another prefix, never one another participant seen at
+  that address also announces; none for a contested or pinned prefix. It
+  also sets `guid_only` when the binding table saw the prefix and it is not
+  one of the robot's own (profiled, pinned, contested): with no locator
+  left the executor then quarantines by the GUID-prefix drop alone (it
+  matches RTPS sent by that prefix only). The locators agentd left out are
+  listed in the order (`excluded`, with the reason). A
+  `ros2_participant_discovered` event of a JSONL input is used only for a
+  prefix the binding table does not know at all, through the same filters
+  with the event's `src_ip` as the only evidence (review M7). Without any
+  locator and without `guid_only` the executor refuses
   (`locators_required`).
 
 ## Tests
@@ -551,9 +568,11 @@ and `src/config.rs` for every field and its limits. agentd's side is the
   port (Cyclone DDS does; Fast DDS uses ephemeral send ports, so only the
   GUID rule and the to-locator rule apply to it).
 * **Quarantine needs locators** agentd has seen (binding table or
-  participant events). A participant whose SPDP agentd never saw cannot
-  be quarantined (`locators_required`). A `node`-named quarantine is
-  refused (`unsupported_target`).
+  participant events), or agentd's `guid_only` vouch (a participant it saw
+  and that is not one of the robot's own; then by GUID prefix only). A
+  participant whose SPDP agentd never saw cannot be quarantined
+  (`locators_required`). A `node`-named quarantine is refused
+  (`unsupported_target`).
 * **A quarantine cannot act inside a low-level network** (or inside any
   motion-path entry it may not cut), and none is possible while such an
   entry names only an interface.

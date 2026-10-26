@@ -12,6 +12,46 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Security
 
+- Independent adversarial review of the F1 / F3 fixes below
+  (`tools/e2e/REDTEAM.md`, "Review of the F1 / F3 fixes"); every finding
+  has a regression test replaying the reviewer's proof of concept:
+  - H1 (high): one SPDP for a profiled prefix after its lease ran out, from
+    a foreign host, silently overwrote its remembered locators, and a
+    decoy's quarantine then cut the robot participant. The prefix is now
+    contested with a Critical `participant_source_mismatch`, its locators
+    kept.
+  - H2 (high): a decoy copying the rogue's locators, or one bad locator in
+    the rogue's own SPDP, made every quarantine of it refused. Quarantine
+    locators are now only those on addresses the participant was seen
+    sending from (ties between prefixes broken by that evidence); the
+    executor leaves out-of-scope, loopback, other-family and motion-path
+    locators out (listed with the reason) instead of refusing the order;
+    agentd vouches for a GUID-prefix-only quarantine of a participant it
+    saw that is not one of the robot's own (`guid_only` in the order). The
+    executor still refuses a motion-path GUID, an interface-only motion
+    path, an order whose every locator is on the motion path, and an order
+    with nothing it may act on.
+  - H3 (high): the GUID spray with a `cmd_vel` writer per prefix gave one
+    Critical finding per GUID and filled the Critical spool share. Critical
+    per-participant findings are now aggregated per source too (the first
+    8 one by one, then a Critical `discovery_flood`), and one source may
+    hold at most a quarter of the Critical share.
+  - H4 (high): ~40 packets a minute from a dozen addresses folded every
+    later discovery finding robot-wide into a sourceless aggregate. Only a
+    source past its own share is folded now; a source first seen late
+    still reports its first finding; findings about profiled or pinned
+    participants are never folded.
+  - M5 / M6 / M7: an absent legitimate host's address is no longer in a
+    rogue's quarantine set; a rogue that raised a Critical finding (or that
+    a SOC request named) is not evicted by an active-prefix spray (ranked
+    eviction, 128 prefixes per source address); JSONL participant events
+    are used only for prefixes the binding table does not know, through the
+    same filters.
+  - L9 / L10: aggregate sample GUIDs come from the structured prefix (a
+    topic name can no longer forge one) and the detail fits its cap; each
+    flood episode is its own finding (subject node
+    `discovery_flood/<class>/<start>`); `spool.max_files` below 8 is
+    refused.
 - Red team S11-lite (`tools/e2e/REDTEAM.md`), F1 (medium): a GUID spray
   no longer amplifies into one finding, spool record and SOC case per
   random prefix. agentd folds the per-participant discovery findings of a

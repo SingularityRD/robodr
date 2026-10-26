@@ -773,11 +773,30 @@ safely. Nothing here is specific to one product.
     announced on a profiled command channel).
   - Also added while 2.1.0 was unreleased (same caveat):
     `robot.ros2.discovery_flood` (agentd's aggregate of the per-participant
-    discovery findings of a flooding source: count per rule, first and last
-    seen and sample GUID prefixes in the tainted `detail`; subject the
-    source IP, none for the "many sources" aggregate; no new field).
-    Consumers that mirror the catalog (e.g. AutoSecOps' validator) need the
-    entry, or they reject these findings for a title mismatch.
+    and per-endpoint discovery findings of one flooding source and class).
+    Catalog entry (title, description, technique T0848, data source
+    `ros2_dds_discovery`) as first published; consumers that mirror the
+    catalog (e.g. AutoSecOps' validator) need the entry, or they reject
+    these findings for a title mismatch. Rule semantics (final for 2.1.0,
+    after the review of the F1 fix):
+    - **Severity**: `critical` for the aggregate of a source's Critical
+      findings (e.g. sprayed `unauthorized_motion_writer`), else the most
+      severe folded severity, at least `medium`. A source's Critical and
+      lesser findings are two separate aggregates.
+    - **Subject**: `src_ip` = the flooding source (absent for the "many
+      sources" aggregate) and `node` = a synthetic, sensor-authored name
+      `discovery_flood/<critical|other>/<episode start, RFC 3339 UTC ms>`
+      (it is not a ROS node). Every report of one flood episode therefore
+      has one `finding_id` (one case, updated with `count` /
+      `last_seen_time`), and a flood after the previous one ended (a full
+      60 s quiet) has a new `finding_id`.
+    - **Detail** (tainted, at most 400 characters, never cut mid-text):
+      the folded count per rule, first and last seen, up to 4 sample GUID
+      prefixes taken from the parsed announcements (never from text), and
+      for the "many sources" aggregate up to 4 sample source addresses.
+    - Never folded into it: findings that are not about one participant,
+      and findings about a profiled or pinned participant.
+    - No new field.
   - Schema `$id` `https://schemas.singularityrd.com/robodr/findings/2.1.0`;
     `contract_version` parts at most 9 digits and `ocsf.metadata.log_name`
     not `.` / `..` (as the validator always required).
