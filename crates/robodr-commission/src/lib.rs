@@ -60,6 +60,9 @@
 //!   touching motion topics, can only be caught by the operator reviewing
 //!   the participant list. See the `learner` docs.
 
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+
 pub mod input;
 pub mod learner;
 pub mod ops;

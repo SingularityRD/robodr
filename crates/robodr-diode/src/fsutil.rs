@@ -237,6 +237,8 @@ pub(crate) fn lock_path(p: &Path) -> PathBuf {
 /// if another process (or another open file description in this one) holds
 /// it. The lock lives as long as the returned file; the kernel drops it when
 /// the process dies, so a crash never leaves a stale lock behind.
+// FFI: `File::try_lock` (std 1.89) is newer than the MSRV (1.87).
+#[allow(unsafe_code)]
 pub(crate) fn try_lock(p: &Path) -> io::Result<Option<File>> {
     use std::os::unix::io::AsRawFd;
     let f = OpenOptions::new()

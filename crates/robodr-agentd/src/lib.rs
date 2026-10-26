@@ -79,6 +79,13 @@
 //! connectivity) is still static configuration. The black box uses the
 //! HMAC placeholder key.
 
+// S10: `unsafe` is denied crate-wide; each item that needs it (FFI to libc
+// symbols std already links) carries a local `#[allow(unsafe_code)]` and a
+// `// SAFETY:` comment on every block.
+#![deny(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 pub mod config;
 pub mod control;
 pub mod daemon;

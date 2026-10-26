@@ -33,6 +33,9 @@
 //! loaders run (see `robodr_commission::trust`). Signing keys are read only
 //! from mode-0600 key files, never from the command line.
 
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+
 use robodr_blackbox::keys::public_key_path;
 use robodr_commission::input::{self, InputSpec};
 use robodr_commission::learner::DiscoveryServer;

@@ -27,11 +27,19 @@
 use std::os::unix::net::{SocketAddr, UnixDatagram};
 use std::time::Duration;
 
+/// `struct timespec` on the 64-bit Linux targets RoboDR ships for (x86_64,
+/// aarch64; glibc and musl): `time_t` and `long` are both 64-bit. On a 32-bit
+/// target `time_t` may be 32- or 64-bit depending on the libc, so the layout
+/// is refused at compile time there instead of being guessed (a wrong guess
+/// would let `clock_gettime` write past the struct).
 #[repr(C)]
 struct Timespec {
     tv_sec: i64,
     tv_nsec: i64,
 }
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("robodr-agentd notify::Timespec assumes a 64-bit Linux target (x86_64 / aarch64)");
+const _: () = assert!(std::mem::size_of::<Timespec>() == 16);
 
 extern "C" {
     fn clock_gettime(clk: i32, ts: *mut Timespec) -> i32;
@@ -40,13 +48,17 @@ extern "C" {
 const CLOCK_MONOTONIC: i32 = 1;
 
 /// `CLOCK_MONOTONIC` in milliseconds (system-wide, not process-relative).
+// FFI: std exposes no raw `CLOCK_MONOTONIC` value (`Instant` is opaque).
+#[allow(unsafe_code)]
 pub fn monotonic_ms() -> u64 {
     let mut ts = Timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    // SAFETY: `ts` is a valid, writable timespec; CLOCK_MONOTONIC exists on
-    // every Linux. On the (impossible) failure, 0 makes the status stale.
+    // SAFETY: `ts` is a live, writable `struct timespec` (layout checked
+    // above) that outlives the call; the kernel/vDSO writes exactly one
+    // timespec into it. CLOCK_MONOTONIC exists on every Linux; on the
+    // (impossible) failure, 0 makes the status stale.
     let rc = unsafe { clock_gettime(CLOCK_MONOTONIC, &mut ts) };
     if rc != 0 || ts.tv_sec < 0 || ts.tv_nsec < 0 {
         return 0;

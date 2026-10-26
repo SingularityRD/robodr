@@ -52,6 +52,9 @@
 //! * Black-box recovery after a real disk failure (ENOSPC, EIO) is tested
 //!   only with simulated failures (a failing signer, a removed directory).
 
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+
 pub mod agent;
 pub mod clock;
 pub mod config;

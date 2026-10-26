@@ -163,6 +163,9 @@
 //! Reference: OMG DDSI-RTPS 2.2 / 2.5, §8.3 (messages), §8.5 (discovery),
 //! §9.4 (submessage encoding), §9.6 (parameter ids, builtin topic data).
 
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+
 mod frag;
 mod parse;
 mod user;

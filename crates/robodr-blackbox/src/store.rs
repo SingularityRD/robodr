@@ -1035,6 +1035,8 @@ fn lock_dir(dir: &Path) -> Result<File, Error> {
 /// Attempts at `flock` before reporting [`Error::Locked`] (10 ms apart).
 const LOCK_RETRIES: u32 = 25;
 
+// FFI: `File::try_lock` (std 1.89) is newer than the MSRV (1.87).
+#[allow(unsafe_code)]
 pub(crate) fn lock_file(path: PathBuf) -> Result<File, Error> {
     let mut o = OpenOptions::new();
     o.read(true).write(true).create(true);

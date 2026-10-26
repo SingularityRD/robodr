@@ -18,6 +18,9 @@
 //! Keys are never accepted on the command line: argv is readable by every
 //! process through /proc.
 
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};

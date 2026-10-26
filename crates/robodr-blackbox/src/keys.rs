@@ -804,17 +804,11 @@ pub fn public_key_path(secret_path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Best-effort wipe of a string that held key material (volatile writes
-/// and a compiler fence, like [`crate::crypto::wipe`]).
+/// Best-effort wipe of a string that held key material (`zeroize`: volatile
+/// writes of NUL, which keep it valid UTF-8, and a compiler fence, like
+/// [`crate::crypto::wipe`]).
 fn wipe_string(s: &mut str) {
-    // SAFETY: every byte is overwritten with ASCII '0', so the buffer stays
-    // valid UTF-8; `write_volatile` targets a valid, exclusively borrowed byte.
-    unsafe {
-        for b in s.as_bytes_mut() {
-            std::ptr::write_volatile(b, b'0');
-        }
-    }
-    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    zeroize::Zeroize::zeroize(s);
 }
 
 #[cfg(unix)]
@@ -824,6 +818,7 @@ extern "C" {
 
 /// The effective uid of this process.
 #[cfg(unix)]
+#[allow(unsafe_code)] // FFI: no std API for the effective uid.
 pub fn effective_uid() -> u32 {
     // SAFETY: geteuid takes no arguments, cannot fail and touches no memory.
     unsafe { geteuid() }
@@ -1159,6 +1154,17 @@ impl Verifier for Keyring {
 mod tests {
     use super::*;
     use crate::sign::Signer;
+
+    #[test]
+    fn wipe_string_zeroes_every_byte_and_keeps_the_length() {
+        let mut s = String::from("{\"secret_hex\":\"00ff\"}é");
+        let len = s.len();
+        wipe_string(&mut s);
+        assert_eq!(s.len(), len);
+        assert!(s.bytes().all(|b| b == 0));
+        let mut empty = String::new();
+        wipe_string(&mut empty);
+    }
 
     fn tmp(tag: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -1576,12 +1582,7 @@ mod tests {
         // Changing ownership needs root; when we have it, check a foreign
         // owner is refused (and root ownership is accepted).
         if effective_uid() == 0 {
-            extern "C" {
-                fn chown(path: *const std::os::raw::c_char, uid: u32, gid: u32) -> i32;
-            }
-            let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
-            // SAFETY: valid NUL-terminated path; plain syscall wrapper.
-            assert_eq!(unsafe { chown(c.as_ptr(), 4242, 4242) }, 0);
+            std::os::unix::fs::chown(&p, Some(4242), Some(4242)).unwrap();
             assert!(matches!(
                 KeyFile::load(&p),
                 Err(KeyFileError::Owner { uid: 4242 })
@@ -1595,9 +1596,7 @@ mod tests {
                 .unwrap()
                 .write_new(&pp)
                 .unwrap();
-            let c = std::ffi::CString::new(pp.to_str().unwrap()).unwrap();
-            // SAFETY: as above.
-            assert_eq!(unsafe { chown(c.as_ptr(), 4242, 4242) }, 0);
+            std::os::unix::fs::chown(&pp, Some(4242), Some(4242)).unwrap();
             assert!(KeyFile::load(&pp).is_ok());
         }
         std::fs::remove_dir_all(&d).unwrap();

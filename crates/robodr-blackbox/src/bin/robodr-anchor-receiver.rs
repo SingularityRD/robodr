@@ -41,6 +41,9 @@
 //! Exit codes: 0 ok, 1 refused marks (`ingest`), 2 usage, config, key or
 //! I/O error.
 
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+
 use robodr_blackbox::keys::KeyFile;
 use robodr_blackbox::remote_anchor::{
     self, read_unit_state, AnchorReceiver, RemoteMark, ServeOptions, UnitKey, MAX_FRAME,

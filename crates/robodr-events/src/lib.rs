@@ -58,6 +58,9 @@
 //!   [`RobotEvent::MotionFeedback`] was added before any downstream crate
 //!   matched exhaustively.
 
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+
 pub mod graph;
 pub mod profile;
 

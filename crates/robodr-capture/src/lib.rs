@@ -107,6 +107,10 @@
 //!   SPAN/TAP captures.
 
 #![deny(unsafe_code)]
+// S10: no implicit unsafe scope in an `unsafe fn`, and every block needs a
+// `// SAFETY:` comment.
+#![deny(unsafe_op_in_unsafe_fn)]
+#![warn(clippy::undocumented_unsafe_blocks)]
 
 #[cfg(all(
     target_os = "linux",

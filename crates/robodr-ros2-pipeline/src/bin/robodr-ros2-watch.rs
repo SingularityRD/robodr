@@ -1,5 +1,8 @@
 //! `robodr-ros2-watch`: see `robodr_ros2_pipeline::watch` for the contract.
 
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+
 use std::process::ExitCode;
 
 use robodr_ros2_pipeline::watch::{parse_args, run, Command, USAGE};

@@ -261,6 +261,9 @@
 //! * Stamps must share the observer's time base; the sensor must map ROS
 //!   time / sim time to it, or disable `stamp_check`.
 
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+
 mod config;
 mod model;
 mod monitor;

@@ -37,6 +37,8 @@ extern "C" fn on_signal(sig: c_int) {
 }
 
 /// Install the shutdown handler for `SIGTERM` and `SIGINT`.
+// FFI: std has no signal-handler API.
+#[allow(unsafe_code)]
 pub fn install() -> std::io::Result<()> {
     for sig in [SIGINT, SIGTERM] {
         let handler: extern "C" fn(c_int) = on_signal;

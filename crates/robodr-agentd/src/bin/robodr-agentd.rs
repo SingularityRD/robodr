@@ -5,6 +5,9 @@
 //! sealed, ...); 2 usage or configuration error (nothing was started).
 //! Keys are never taken from the command line: see `blackbox.key_file`.
 
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 

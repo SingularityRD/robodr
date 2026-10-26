@@ -56,6 +56,9 @@
 //! * Nothing feeds Pulsar threats into `robodr-agentd` yet; host signals
 //!   here are exercised with synthetic input only.
 
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+
 pub mod catalog;
 pub mod engine;
 pub mod rules;

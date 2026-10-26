@@ -32,6 +32,9 @@
 //! the robot. A SOC never sends a motion command to a robot: approved actions
 //! go to the control plane and the on-robot agent has the final say.
 
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+
 pub mod builder;
 pub mod hash;
 pub mod kafka;
