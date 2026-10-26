@@ -795,7 +795,9 @@ impl KeyLookup for Union<'_> {
 }
 
 /// Accept `doc` as the successor of the accepted `prev` (see the module
-/// docs). The same bytes as `prev` return `prev` unchanged.
+/// docs), unexpired at `now`. The same bytes as `prev` return `prev`
+/// unchanged (if it has not expired). `prev` itself may have expired: an
+/// expired anchor still accepts the file that replaces it.
 pub fn verify_trust_update(
     prev: &VerifiedTrust,
     doc: &[u8],

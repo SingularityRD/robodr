@@ -592,6 +592,11 @@ fn verify_trust(args: Vec<String>) -> Result<(), Cmd> {
     if init && commit {
         return Err(Cmd::Usage("--init-anchor or --commit, not both".into()));
     }
+    if init && a.flag("no-trust-anchor") {
+        return Err(Cmd::Usage(
+            "--init-anchor creates the --trust-anchor; not with --no-trust-anchor".into(),
+        ));
+    }
     let (v, anchored, written) = if init {
         let anchor = opt(&a, "trust-anchor")?
             .ok_or_else(|| Cmd::Usage("--init-anchor needs --trust-anchor ANCHOR.json".into()))?;
