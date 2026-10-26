@@ -874,6 +874,22 @@ impl<'a> Daemon<'a> {
                         st.journal_quarantined.as_deref().unwrap_or("quarantine/")
                     );
                 }
+                if st.rebuilt_from_blackbox + st.rebuilt_reverts + st.lost_request_ids > 0 {
+                    let _ = writeln!(
+                        log,
+                        "robodr-agentd: control plane: request journal rebuilt from the black \
+                         box: {} request(s), {} revert record(s) restored, {} request id(s) \
+                         unreadable (refused)",
+                        st.rebuilt_from_blackbox, st.rebuilt_reverts, st.lost_request_ids
+                    );
+                }
+                if let Some(why) = &st.refusing_new_request_ids {
+                    let _ = writeln!(
+                        log,
+                        "robodr-agentd: control plane: {why}: every new request id is refused \
+                         until a restart reconciles the journal"
+                    );
+                }
                 if let Some(f) = st.replay.fence {
                     let _ = writeln!(
                         log,

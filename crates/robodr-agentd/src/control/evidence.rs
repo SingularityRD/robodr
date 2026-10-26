@@ -1392,6 +1392,65 @@ pub fn find_decision_notes(
     Ok(out)
 }
 
+/// A request or revert note of the control plane, as the black box holds
+/// it (control plane v2 review, finding 4: rebuilding a damaged request
+/// journal).
+#[derive(Debug, Clone)]
+pub struct RequestNote {
+    pub note: Value,
+    /// Its evidence reference.
+    pub evidence: String,
+    /// The record's wall time (Unix ms).
+    pub wall_ms: u64,
+}
+
+/// Every `robodr.control_plane_request` and `robodr.control_plane_revert`
+/// note of `robot_id` in the black box, oldest first.
+pub fn find_request_notes(src: &dyn SegmentSource, robot_id: &str) -> io::Result<Vec<RequestNote>> {
+    let mut out = Vec::new();
+    for idx in src.list()? {
+        let Some(bytes) = src.read(idx)? else {
+            continue;
+        };
+        for item in scan_frames(&bytes).items {
+            let ScanItem::Record(r) = item else {
+                continue;
+            };
+            let rec = r.record;
+            if rec.kind != RecordKind::Note
+                || !rec
+                    .payload
+                    .windows(23)
+                    .any(|w| w == b"robodr.control_plane_re")
+            {
+                continue;
+            }
+            let Ok(v) = serde_json::from_slice::<Value>(&rec.payload) else {
+                continue;
+            };
+            let kind = v.get("kind").and_then(Value::as_str);
+            if !matches!(
+                kind,
+                Some("robodr.control_plane_request" | "robodr.control_plane_revert")
+            ) || v.get("robot_id").and_then(Value::as_str) != Some(robot_id)
+            {
+                continue;
+            }
+            out.push(RequestNote {
+                note: v,
+                evidence: RecordRef {
+                    segment: idx,
+                    seq: rec.seq,
+                    sha256: to_hex(&rec.hash),
+                }
+                .uri(robot_id),
+                wall_ms: rec.time.wall_ns / 1_000_000,
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// A file handle helper for tests: the whole bundle file of an export.
 pub fn read_bundle(s: &Stored) -> io::Result<Vec<u8>> {
     let mut f = File::open(s.dir.join(BUNDLE_FILE))?;

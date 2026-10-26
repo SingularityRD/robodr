@@ -35,10 +35,11 @@
 //!
 //! # Loading (what a crash or damage leaves behind)
 //!
-//! * A last line without its newline, or bad lines **after the last good
-//!   line**, are a torn tail (a crash during an append, whose caller never
+//! * **One** bad line after the last good line (with or without its
+//!   newline) is a torn tail (a crash during an append, whose caller never
 //!   acted on it): the file is truncated to the last good line, counted in
-//!   [`Loaded::torn_bytes`].
+//!   [`Loaded::torn_bytes`]. A crash can leave no more than that one line:
+//!   two or more bad lines at the end are damage (next point).
 //! * A bad line (checksum, JSON, over [`MAX_LINE`]) **followed by** a good
 //!   one cannot come from a crash (every append is synced before the next):
 //!   storage damage or an edit. The damaged lines are skipped and counted
@@ -198,6 +199,8 @@ impl Journal {
         let mut pending_bad: usize = 0;
         let mut offset: u64 = 0;
         let mut good_end: u64 = 0;
+        // An unterminated last line (a fragment).
+        let mut fragment = false;
         let mut buf = Vec::new();
         loop {
             buf.clear();
@@ -220,7 +223,8 @@ impl Journal {
                         continue;
                     }
                 }
-                // No newline before EOF: torn.
+                // No newline before EOF.
+                fragment = true;
                 break;
             }
             match parse_line(&buf[..buf.len() - 1]) {
@@ -233,9 +237,17 @@ impl Journal {
                 None => pending_bad += 1,
             }
         }
-        // Bad lines after the last good one, and an unterminated last line,
-        // are the torn tail of a crash during an append.
-        loaded.torn_bytes = len.saturating_sub(good_end);
+        // What follows the last good line. A crash during an append leaves
+        // at most that one line, whole or not (every append is a single
+        // write, synced before the next): one bad line is a torn tail. Two
+        // or more cannot come from a crash: damage (review finding 4), so
+        // synced entries are never forgotten silently.
+        let tail_lines = pending_bad + usize::from(fragment);
+        if tail_lines > 1 {
+            damaged_lines += tail_lines;
+        } else {
+            loaded.torn_bytes = len.saturating_sub(good_end);
+        }
         let mut values = good.into_iter().peekable();
         // The header must be the first good line.
         let mut header_missing = false;
@@ -716,6 +728,77 @@ mod tests {
         j.append(&e(4)).unwrap();
         drop(j);
         assert_eq!(ns(&open(&d).1), [2, 4]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Review finding 4: only a single trailing line can be torn (every
+    /// append is one synced write). Two or more bad lines at the end are
+    /// damage: counted, quarantined, rewritten, so the caller falls back to
+    /// its fail-safe state instead of silently forgetting synced entries.
+    #[test]
+    fn tail_damage_beyond_one_line_is_damage_not_a_torn_tail() {
+        let corrupt_last = |p: &Path, k: usize| {
+            let mut text = std::fs::read(p).unwrap();
+            let starts: Vec<usize> = std::iter::once(0)
+                .chain(
+                    text.iter()
+                        .enumerate()
+                        .filter(|(_, b)| **b == b'\n')
+                        .map(|(i, _)| i + 1),
+                )
+                .collect();
+            // starts has one entry per line plus the end of the file.
+            let lines = starts.len() - 1;
+            for l in lines - k..lines {
+                text[starts[l] + 70] ^= 0x01;
+            }
+            std::fs::write(p, &text).unwrap();
+            text
+        };
+        // One bad last line: a torn tail, as before.
+        let d = tmp("tail1");
+        let (mut j, _) = open(&d);
+        for n in 0..4 {
+            j.append(&e(n)).unwrap();
+        }
+        drop(j);
+        corrupt_last(&d.join("t.journal"), 1);
+        let (_, l) = open(&d);
+        assert_eq!(ns(&l), [0, 1, 2]);
+        assert!(l.torn_bytes > 0);
+        assert_eq!(l.damaged, 0);
+        let _ = std::fs::remove_dir_all(&d);
+        // Two bad last lines: damage.
+        let d = tmp("tail2");
+        let (mut j, _) = open(&d);
+        for n in 0..4 {
+            j.append(&e(n)).unwrap();
+        }
+        drop(j);
+        let text = corrupt_last(&d.join("t.journal"), 2);
+        let (_, l) = open(&d);
+        assert_eq!(ns(&l), [0, 1]);
+        assert_eq!(l.damaged, 2, "two bad trailing lines cannot be one crash");
+        assert_eq!(l.torn_bytes, 0);
+        let q = l.quarantined.clone().expect("quarantined copy");
+        assert_eq!(std::fs::read(&q).unwrap(), text);
+        let (_, l) = open(&d);
+        assert_eq!((l.damaged, l.torn_bytes), (0, 0), "rewritten clean");
+        let _ = std::fs::remove_dir_all(&d);
+        // A bad whole line followed by an unterminated fragment: damage.
+        let d = tmp("tail3");
+        let (mut j, _) = open(&d);
+        for n in 0..3 {
+            j.append(&e(n)).unwrap();
+        }
+        drop(j);
+        corrupt_last(&d.join("t.journal"), 1);
+        let mut f = fsutil::open_append_nofollow(&d.join("t.journal")).unwrap();
+        f.write_all(b"0123 {\"t\":").unwrap();
+        drop(f);
+        let (_, l) = open(&d);
+        assert_eq!(ns(&l), [0, 1]);
+        assert_eq!(l.damaged, 2);
         let _ = std::fs::remove_dir_all(&d);
     }
 

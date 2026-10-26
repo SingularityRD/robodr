@@ -1085,6 +1085,11 @@ pub struct Engine {
     executor: Box<dyn ActionExecutor>,
     /// The persistent request state (`None`: in memory only, unit tests).
     journal: Option<super::state::RequestJournal>,
+    /// Review finding 4: request ids whose state the damaged journal lost
+    /// and the black box could not restore, and (`refuse_new`) the reason
+    /// every unknown id is refused when the black box could not be read.
+    lost_ids: std::collections::HashSet<String>,
+    refuse_new: Option<String>,
     pub stats: EngineStats,
 }
 
@@ -1110,6 +1115,8 @@ impl Engine {
             max: max.max(1),
             executor,
             journal: None,
+            lost_ids: std::collections::HashSet::new(),
+            refuse_new: None,
             stats: EngineStats::default(),
         }
     }
@@ -1165,6 +1172,14 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Refuse submissions of `lost` request ids, and with `refuse_new`, of
+    /// every id not stored (the journal was damaged and could not be
+    /// reconciled with the black box).
+    pub fn refuse_ids(&mut self, lost: Vec<String>, refuse_new: Option<String>) {
+        self.lost_ids = lost.into_iter().collect();
+        self.refuse_new = refuse_new;
     }
 
     pub fn executor_name(&self) -> &'static str {
@@ -1344,6 +1359,16 @@ impl Engine {
                 409,
                 "request_id_conflict",
                 "this request_id was already used for another action, parameters or ttl",
+            ));
+        }
+        if self.refuse_new.is_some() || self.lost_ids.contains(&req.request_id) {
+            self.stats.journal_refusals += 1;
+            return Answer::error(&ApiError::new(
+                503,
+                "state_unavailable",
+                "the request journal was damaged and this request id cannot be reconciled with \
+                 the black box; it is not judged again (an operator restarts agentd once the \
+                 black box is readable)",
             ));
         }
         self.stats.submitted += 1;

@@ -447,6 +447,121 @@ pub fn open(dir: &Path, max: usize) -> std::io::Result<(RequestJournal, Restored
     ))
 }
 
+/// What [`rebuild`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Rebuilt {
+    /// Requests restored from their black-box notes.
+    pub requests: usize,
+    /// Revert records restored from their notes.
+    pub reverts: usize,
+    /// Request ids whose note did not convert back (their resubmission is
+    /// refused: their state is unknown).
+    pub unreadable: Vec<String>,
+}
+
+/// A request note back to a [`Stored`] (its decision-time state; the
+/// executor's later word, if any, comes from the executor's resync).
+fn stored_from_note(n: &super::evidence::RequestNote) -> Option<Stored> {
+    let v = &n.note;
+    let from = |k: &str| v.get(k).cloned().unwrap_or(serde_json::Value::Null);
+    let request: ActionRequest = serde_json::from_value(from("request")).ok()?;
+    let p = PStored {
+        digest: request.digest(),
+        request,
+        key_id: v.get("auth")?.get("key_id")?.as_str()?.to_string(),
+        status: v.get("status")?.as_str()?.to_string(),
+        refusal: serde_json::from_value(from("refusal")).ok()?,
+        safety_state: serde_json::from_value(from("safety_state")).ok()?,
+        accepted: serde_json::from_value(from("plan")).ok()?,
+        error: serde_json::from_value(from("error")).ok()?,
+        received_ms: n.wall_ms,
+        evidence: n.evidence.clone(),
+        executor: v.get("executor")?.as_str()?.to_string(),
+        revert: None,
+    };
+    p.to_stored()
+}
+
+/// Control plane v2 review, finding 4: after the request journal was
+/// damaged, restore from the black box (the record) every request whose
+/// signed `robodr.control_plane_request` note exists but that the journal
+/// lost, and every revert record its `robodr.control_plane_revert` note
+/// proves. `notes` oldest first; the newest `max` requests are kept.
+pub fn rebuild(r: &mut Restored, notes: &[super::evidence::RequestNote], max: usize) -> Rebuilt {
+    let mut out = Rebuilt::default();
+    let journalled: std::collections::HashSet<String> = r
+        .stored
+        .iter()
+        .map(|s| s.request.request_id.clone())
+        .collect();
+    for n in notes {
+        let v = &n.note;
+        match v.get("kind").and_then(serde_json::Value::as_str) {
+            Some("robodr.control_plane_request") => {
+                let Some(id) = v
+                    .get("request")
+                    .and_then(|q| q.get("request_id"))
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                if journalled.contains(id) || r.stored.iter().any(|s| s.request.request_id == id) {
+                    continue;
+                }
+                match stored_from_note(n) {
+                    Some(s) => {
+                        out.requests += 1;
+                        r.stored.push(s);
+                    }
+                    None => out.unreadable.push(id.to_string()),
+                }
+            }
+            Some("robodr.control_plane_revert") => {
+                let id = v.get("request_id").and_then(serde_json::Value::as_str);
+                let result = v
+                    .get("result")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(static_revert_result);
+                let rv = v.get("revert");
+                let text = |k: &str| {
+                    rv.and_then(|r| r.get(k))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                };
+                let (Some(id), Some(result), Some(requested_by), Some(reason)) =
+                    (id, result, text("requested_by"), text("reason"))
+                else {
+                    continue;
+                };
+                if let Some(s) = r.stored.iter_mut().find(|s| s.request.request_id == id) {
+                    let changes = s.revert.is_none()
+                        || (result == "reverted" && s.status != Status::Reverted);
+                    if changes {
+                        apply_revert(
+                            s,
+                            RevertRecord {
+                                requested_by,
+                                reason,
+                                at_ms: n.wall_ms,
+                                result,
+                                evidence: n.evidence.clone(),
+                            },
+                        );
+                        out.reverts += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    r.stored.sort_by_key(|s| s.received_ms);
+    if r.stored.len() > max {
+        let cut = r.stored.len() - max;
+        r.stored.drain(..cut);
+    }
+    out
+}
+
 /// A committed revert on its request: the first revert record is kept, and
 /// an executor revert that reported `reverted` makes the request
 /// `reverted`.

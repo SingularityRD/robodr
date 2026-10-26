@@ -508,6 +508,16 @@ pub struct StateStatus {
     /// Dangling decisions settled from the black box.
     pub resolved_committed: usize,
     pub resolved_aborted: usize,
+    /// After journal damage: requests and revert records restored from
+    /// their black-box notes (review finding 4).
+    pub rebuilt_from_blackbox: usize,
+    pub rebuilt_reverts: usize,
+    /// Request ids whose note did not convert back (resubmissions refused).
+    pub lost_request_ids: usize,
+    /// Set when the journal was damaged and the black box could not be read
+    /// to reconcile it: every new request id is refused until a restart
+    /// reconciles (fail closed).
+    pub refusing_new_request_ids: Option<String>,
     pub replay: auth::ReplayLoad,
     /// Evidence exports kept / discarded at start.
     pub exports_restored: usize,
@@ -644,6 +654,31 @@ impl ControlPlane {
             st.resolved_committed = c;
             st.resolved_aborted = a;
         }
+        // Damage (not a torn tail) may have taken committed requests with
+        // it: the black box is the record, rebuild from it (review finding
+        // 4). If it cannot be read, refuse every new request id rather than
+        // judge (and maybe execute) a known one again.
+        let mut lost: Vec<String> = Vec::new();
+        if restored.damaged > 0 {
+            match evidence::find_request_notes(
+                &evidence::DirSource(blackbox_dir.to_path_buf()),
+                robot_id,
+            ) {
+                Ok(notes) => {
+                    let rb = state::rebuild(&mut restored, &notes, spec.max_requests);
+                    st.rebuilt_from_blackbox = rb.requests;
+                    st.rebuilt_reverts = rb.reverts;
+                    st.lost_request_ids = rb.unreadable.len();
+                    lost = rb.unreadable;
+                }
+                Err(e) => {
+                    st.refusing_new_request_ids = Some(format!(
+                        "the request journal was damaged and the black box could not be read \
+                         to reconcile it ({e})"
+                    ));
+                }
+            }
+        }
         st.journal_damaged = restored.damaged;
         st.restored = restored.stored.len();
         let mut engine = api::Engine::with_journal(
@@ -656,6 +691,7 @@ impl ControlPlane {
         engine.stats.resolved_committed = st.resolved_committed as u64;
         engine.stats.resolved_aborted = st.resolved_aborted as u64;
         engine.stats.journal_damaged = st.journal_damaged as u64;
+        engine.refuse_ids(lost, st.refusing_new_request_ids.clone());
         // The replay store: fenced if it cannot be trusted.
         let (replay, rload) = ReplayGuard::persistent(
             dir,

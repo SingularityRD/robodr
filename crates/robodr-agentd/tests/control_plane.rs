@@ -1393,3 +1393,88 @@ fn idle_tcp_peers_cannot_lock_out_the_unix_socket() {
     );
     finish(stop, h);
 }
+
+/// Flip a byte in each of the last `k` lines of a journal.
+fn corrupt_last_lines(p: &Path, k: usize) {
+    let mut text = std::fs::read(p).unwrap();
+    let starts: Vec<usize> = std::iter::once(0)
+        .chain(
+            text.iter()
+                .enumerate()
+                .filter(|(_, b)| **b == b'\n')
+                .map(|(i, _)| i + 1),
+        )
+        .collect();
+    let lines = starts.len() - 1;
+    for l in lines - k..lines {
+        text[starts[l] + 70] ^= 0x01;
+    }
+    std::fs::write(p, &text).unwrap();
+}
+
+/// Review finding 4 (request journal): damage at the end of the journal
+/// beyond one line used to be cut as a torn tail, so a committed request
+/// was forgotten and judged (and recorded) again after a restart. Now it is
+/// damage: the journal is quarantined and the requests are rebuilt from
+/// their signed black-box notes, so the resubmission is a duplicate.
+#[test]
+fn request_journal_tail_damage_is_rebuilt_from_the_black_box() {
+    let s = setup("cp-jdamage", &robot_profile(true));
+    let events = s.dir.join("ev.sock");
+    let control = s.dir.join("control.sock");
+    let soc_pub = write_soc_pub(&s.dir);
+    let mut cfg = base_config(&s, &events);
+    cfg["control_plane"] = json!({
+        "unix_socket": control,
+        "state_dir": state_dir(&s),
+        "soc_keys": [soc_pub],
+        "rate_per_minute": 600,
+        "burst": 100,
+    });
+    let requests = format!("/api/v2/robots/{ROBOT}/action-requests");
+    let bodies: Vec<(String, Vec<u8>)> = (0..3)
+        .map(|n| {
+            let id = format!("robot_restrict_motion:ugv-007:jd{n}");
+            let b = submit_body(
+                &id,
+                "restrict_motion",
+                json!({"max_linear_speed": 0.5}),
+                Some(600),
+            );
+            (id, b)
+        })
+        .collect();
+    let (stop, h) = spawn(s.resolve(&cfg));
+    wait_for(5, "control socket", || UnixStream::connect(&control).ok());
+    let mut first = Vec::new();
+    for (_, b) in &bodies {
+        let r = unix(&control, &signed("POST", &requests, b));
+        assert_eq!(r.body["status"], "recorded_not_executed", "{}", r.body);
+        first.push(r.body);
+    }
+    finish(stop, h);
+    // The last request's begin + commit lines damaged.
+    corrupt_last_lines(&s.dir.join("cp-state/requests.journal"), 2);
+    let (stop, h) = spawn(s.resolve(&cfg));
+    wait_for(5, "control socket", || UnixStream::connect(&control).ok());
+    for ((id, b), before) in bodies.iter().zip(&first) {
+        let r = unix(&control, &signed("POST", &requests, b));
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(r.body["duplicate"], true, "{id} judged again: {}", r.body);
+        assert_eq!(r.body["state"]["evidence"], before["state"]["evidence"]);
+    }
+    let st = status(&s.spool).unwrap();
+    let cp = &st["control_plane"];
+    assert!(
+        cp["state"]["journal_damaged"].as_u64().unwrap() >= 2,
+        "{cp}"
+    );
+    assert!(cp["state"]["journal_quarantined"].is_string(), "{cp}");
+    assert_eq!(cp["state"]["rebuilt_from_blackbox"], 1, "{cp}");
+    finish(stop, h);
+    assert_eq!(
+        notes(&s.blackbox, "robodr.control_plane_request").len(),
+        3,
+        "no request was judged twice"
+    );
+}
