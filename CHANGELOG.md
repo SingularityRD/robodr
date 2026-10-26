@@ -889,6 +889,19 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Fixed
 
+- `robodr-agentd` with `capture.pcap_replay`: replayed packets are judged on
+  the capture's own timeline (each record's timestamp, offset onto the
+  daemon clock at the first packet, never going back) instead of the time
+  the daemon handled them. The file is read as fast as possible, so the
+  motion monitor's latency / persistence windows, the firewall's rate
+  checks, correlation windows and the pipeline's discovery expiry judged a
+  replay by host load (`real_captures_lab` raised an extra
+  `robot.motion.feedback_divergence` on the Cyclone DDS Gazebo rogue run
+  under load). On the true timeline the Fast DDS rogue run reports one
+  Medium under-motion divergence and the Cyclone DDS run none, on every
+  run. Live capture is unchanged (handling time). New
+  `robodr_agent::Agent::handle_with_joint_at` (explicit detection time) and
+  `robodr_ros2_pipeline::Pipeline::process_datagram_with_motion_at`.
 - `robodr-diode` state lock and `robodr-uplink` state lock: a lock
   that looks held only because a child forked by another thread still has
   the descriptor (until it execs) is retried for up to 25 x 10 ms before it

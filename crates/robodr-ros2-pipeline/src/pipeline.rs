@@ -1080,13 +1080,25 @@ impl Pipeline {
         datagram: &Datagram,
         capture_ns: u64,
     ) -> ProcessOutput {
+        self.process_datagram_with_motion_at(datagram, Instant::now(), capture_ns)
+    }
+
+    /// [`Pipeline::process_datagram_with_motion`] at an explicit pipeline
+    /// time `now` (a capture replay's own timeline, so discovery expiry and
+    /// grace windows do not depend on how fast the file is read).
+    pub fn process_datagram_with_motion_at(
+        &mut self,
+        datagram: &Datagram,
+        now: Instant,
+        capture_ns: u64,
+    ) -> ProcessOutput {
         if let Some(udp) = &datagram.legacy {
             return self.process_legacy_from_at(
                 &datagram.payload,
                 &datagram.src_ip,
                 datagram.ingress,
                 udp,
-                Instant::now(),
+                now,
                 capture_ns,
             );
         }
@@ -1094,7 +1106,7 @@ impl Pipeline {
             &datagram.payload,
             &datagram.src_ip,
             datagram.ingress,
-            Instant::now(),
+            now,
             capture_ns,
         )
     }

@@ -239,11 +239,19 @@ eaf6b2621d88fe3e51db074697bfb810801793605eeeef205e74f10f0f7d0e76  cyclonedds_fra
    Medium otherwise), agentd health is never `ok` (unknown without RTPS,
    degraded with both), and `robodr-commission learn` warns
    (`unsupported_middleware`, also on stderr).
-8. Not a false positive, but worth knowing: under the rogue the simulated
-   robot really moved faster (OdometryPublisher reported about 0.57 m/s
-   against the authorised 0.3) without a `robot.motion.feedback_divergence`;
-   the monitor's tolerances (not tuned here) absorb it. The rogue is still
-   caught by the discovery and envelope rules.
+8. Worth knowing: under the rogue the simulated robot really moved faster
+   (OdometryPublisher reported about 0.57 m/s against the authorised 0.3),
+   but slower than the interleaved 3.0 m/s commands imply. On the
+   captures' own timelines the motion monitor (both writers' commands,
+   untuned tolerances) reports that once in the Fast DDS run (Medium
+   `robot.motion.feedback_divergence`, "robot moving less than commanded":
+   0.41 m/s against a band starting at 0.43) and not in the Cyclone DDS
+   run. An earlier version of this note said "no divergence": `robodr-agentd`
+   then stamped replayed packets with the time it handled them, so the
+   whole replay was squeezed into however long the host took to read it
+   and the result depended on host load (the Cyclone run raised it under
+   load). Replays are now judged on their packet timestamps. The rogue is
+   also caught by the discovery and envelope rules.
 
 ## Not covered (second set)
 

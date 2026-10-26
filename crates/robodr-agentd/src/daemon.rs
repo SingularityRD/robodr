@@ -55,8 +55,17 @@
 //! and the configured feedback topics into `MotionCommand` /
 //! `MotionFeedback` events (see `robodr_ros2_pipeline::motion`), stamped
 //! with the daemon clock's monotonic time at the moment the datagram is
-//! handled. Each event goes through `Agent::handle`, exactly like a JSONL
-//! event: `Profile::evaluate` (envelope), the Motion Firewall, the motion
+//! handled (live capture). A **pcap replay** is stamped on its own
+//! timeline instead: each packet's record timestamp, offset onto the
+//! daemon's monotonic clock at the first replayed packet and held
+//! non-decreasing ([`ReplayTimeline`]). The file is read as fast as the
+//! daemon can, so its handling time says nothing about when the robot sent
+//! what: with handling time, the motion monitor's latency and persistence
+//! windows (and the firewall's rate checks) judged the replay by host load.
+//! The same timeline is the detection time of every event handled while
+//! the replay runs ([`robodr_agent::Agent::handle_with_joint_at`]);
+//! evidence keeps the daemon clock. Each event goes through
+//! `Agent::handle`, exactly like a JSONL event: `Profile::evaluate` (envelope), the Motion Firewall, the motion
 //! monitor (commands and per-publisher feedback), the black box and the
 //! spool. So the pipeline's own envelope evaluation is switched off here
 //! (`evaluate_commands = false`), to report each over-envelope command once,
@@ -509,6 +518,53 @@ struct Daemon<'a> {
     control_reported_at_ms: [Option<u64>; 2],
     /// executor v1: the link to robodr-executor (`None` = off).
     executor: Option<crate::executor_link::ExecutorLink>,
+    /// The packet timeline of a pcap replay (`None` for a live capture:
+    /// handling time is the observation time there).
+    replay: Option<ReplayTimeline>,
+}
+
+/// A replayed capture's packet timeline on the daemon's clocks.
+///
+/// The first replayed packet with a timestamp anchors the capture's clock
+/// to the daemon's (monotonic ns and `Instant` at that moment); every
+/// later packet is placed at `anchor + (its timestamp - the first's)`,
+/// independent of when the daemon gets to handle it. Out-of-order or
+/// earlier records (merged interfaces, a stepped capture clock) are held at
+/// the latest position: the timeline never goes back.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ReplayTimeline {
+    /// (capture ns, daemon mono ns, `Instant`) of the first timestamped
+    /// packet.
+    origin: Option<(u64, u64, Instant)>,
+    /// Offset of the latest position from the anchor (ns).
+    offset: u64,
+}
+
+impl ReplayTimeline {
+    /// Place a packet captured at `captured_ns` (record time); `mono_now`
+    /// and `instant_now` anchor the timeline on the first call. Returns
+    /// the packet's position (daemon mono ns).
+    fn place(&mut self, captured_ns: u64, mono_now: u64, instant_now: Instant) -> u64 {
+        let (c0, m0, _) = *self
+            .origin
+            .get_or_insert((captured_ns, mono_now, instant_now));
+        self.offset = self.offset.max(captured_ns.saturating_sub(c0));
+        m0.saturating_add(self.offset)
+    }
+
+    /// The current position (daemon mono ns), once anchored.
+    fn position(&self) -> Option<u64> {
+        self.origin.map(|(_, m0, _)| m0.saturating_add(self.offset))
+    }
+
+    /// The current position as an `Instant` (the pipeline's clock), once
+    /// anchored.
+    fn instant(&self) -> Option<Instant> {
+        self.origin.map(|(_, _, i0)| {
+            i0.checked_add(Duration::from_nanos(self.offset))
+                .unwrap_or(i0)
+        })
+    }
 }
 
 fn ms(d: Duration) -> u64 {
@@ -1023,6 +1079,12 @@ impl<'a> Daemon<'a> {
             control_reported: [0; 2],
             control_reported_at_ms: [None; 2],
             executor,
+            replay: r
+                .sensor
+                .capture
+                .as_ref()
+                .filter(|c| matches!(c.input, CaptureInput::Replay { .. }))
+                .map(|_| ReplayTimeline::default()),
         };
         #[derive(Serialize)]
         struct StartNote<'b> {
@@ -1259,8 +1321,24 @@ impl<'a> Daemon<'a> {
         match m.payload {
             Payload::Datagram(d) => {
                 self.stats.datagrams += 1;
-                let capture_ns = self.clock.now().mono_ns;
-                let out = self.pipeline.process_datagram_with_motion(&d, capture_ns);
+                let captured_ns = d
+                    .captured_at
+                    .map(|t| u64::try_from(t.as_nanos()).unwrap_or(u64::MAX));
+                let handled_ns = self.clock.now().mono_ns;
+                // A replayed packet is observed at its own record time (see
+                // "Live motion data"); a live one when it is handled.
+                let replayed = self
+                    .inputs
+                    .get(m.input)
+                    .is_some_and(|i| i.kind == InputKind::Capture);
+                let capture_ns = match (self.replay.as_mut(), captured_ns) {
+                    (Some(tl), Some(c)) if replayed => tl.place(c, handled_ns, Instant::now()),
+                    _ => handled_ns,
+                };
+                let pipeline_now = self.pipeline_now();
+                let out =
+                    self.pipeline
+                        .process_datagram_with_motion_at(&d, pipeline_now, capture_ns);
                 // The feed's tap after the pipeline (binding updated from
                 // this datagram), before anything of it is planned.
                 let fed = match self.feed.as_mut() {
@@ -1275,9 +1353,6 @@ impl<'a> Daemon<'a> {
                 self.feed_findings(fed);
                 self.sync_identities();
                 self.sensor_findings(out.findings);
-                let captured_ns = d
-                    .captured_at
-                    .map(|t| u64::try_from(t.as_nanos()).unwrap_or(u64::MAX));
                 for s in out.motion {
                     self.motion_sample(s, captured_ns.unwrap_or(capture_ns));
                 }
@@ -1302,7 +1377,10 @@ impl<'a> Daemon<'a> {
                 }
                 let safety = self.safety();
                 let now = self.clock.now();
-                let outs = self.agent.handle(now, &ev, safety);
+                let detect_ns = self.detect_ns();
+                let outs = self
+                    .agent
+                    .handle_with_joint_at(now, detect_ns, &ev, None, safety);
                 for o in outs {
                     self.emit(o);
                 }
@@ -1361,12 +1439,36 @@ impl<'a> Daemon<'a> {
         }
         let safety = self.safety();
         let now = self.clock.now();
-        let outs = self
-            .agent
-            .handle_with_joint(now, &s.event, joint.as_ref(), safety);
+        let detect_ns = self.detect_ns();
+        let outs =
+            self.agent
+                .handle_with_joint_at(now, detect_ns, &s.event, joint.as_ref(), safety);
         for o in outs {
             self.emit(o);
         }
+    }
+
+    /// The detection time for the agent's time-dependent detectors: the
+    /// replay's packet timeline while one runs (so events handled between
+    /// packets do not move the motion monitor along the daemon's clock),
+    /// else `None` (the event's own time).
+    fn detect_ns(&self) -> Option<u64> {
+        self.replay.as_ref().and_then(ReplayTimeline::position)
+    }
+
+    /// [`Self::detect_ns`], or the daemon clock: the time of a correlation
+    /// signal.
+    fn signal_ns(&self) -> u64 {
+        self.detect_ns().unwrap_or_else(|| self.clock.now().mono_ns)
+    }
+
+    /// The pipeline's clock: the replay's packet timeline while one runs
+    /// (discovery expiry and grace windows), else now.
+    fn pipeline_now(&self) -> Instant {
+        self.replay
+            .as_ref()
+            .and_then(ReplayTimeline::instant)
+            .unwrap_or_else(Instant::now)
     }
 
     /// Pipeline findings -> agent -> spool.
@@ -1558,7 +1660,7 @@ impl<'a> Daemon<'a> {
             t.deviation(),
             safety,
         );
-        let mut sig = Signal::host(self.clock.now().mono_ns, t.rule.clone(), t.severity())
+        let mut sig = Signal::host(self.signal_ns(), t.rule.clone(), t.severity())
             .with_mode(o.deviation.mode)
             .with_entity(EntityKind::Process, t.process_entity());
         if let Some(r) = &o.evidence.deviation {
@@ -1585,7 +1687,7 @@ impl<'a> Daemon<'a> {
         {
             return;
         }
-        let mut sig = Signal::from_deviation(self.clock.now().mono_ns, &o.deviation);
+        let mut sig = Signal::from_deviation(self.signal_ns(), &o.deviation);
         if let Some(ip) = o.source.strip_prefix("src:") {
             sig = sig.with_entity(EntityKind::Ip, ip);
         } else if let Some(p) = o.source.strip_prefix("participant:") {
@@ -1617,15 +1719,13 @@ impl<'a> Daemon<'a> {
     /// participants, IPs bound or pinned to them): their pending state is
     /// best protected from eviction.
     fn correlation_known(&mut self) {
+        let now = self.pipeline_now();
         let Some(c) = self.correlator.as_mut() else {
             return;
         };
         let participants = self.pipeline.profile().participants.clone();
         c.set_known_entities(EntityKind::Participant, participants);
-        let ips = self
-            .pipeline
-            .binding()
-            .profiled_ips(std::time::Instant::now());
+        let ips = self.pipeline.binding().profiled_ips(now);
         c.set_known_entities(EntityKind::Ip, ips.iter().map(|ip| ip.to_string()));
     }
 
@@ -1770,7 +1870,7 @@ impl<'a> Daemon<'a> {
     /// rising eviction / refusal count (rate-limited like other health
     /// counters).
     fn correlation_tick(&mut self) {
-        let now_ns = self.clock.now().mono_ns;
+        let now_ns = self.signal_ns();
         self.correlation_known();
         let Some(c) = self.correlator.as_mut() else {
             return;
@@ -1913,7 +2013,8 @@ impl<'a> Daemon<'a> {
         self.stats.ticks += 1;
         // Staleness is noticed (and recorded) even on a quiet bus.
         self.safety();
-        let mut found = self.pipeline.tick();
+        let now = self.pipeline_now();
+        let mut found = self.pipeline.tick_at(now);
         self.sync_identities();
         if let Some(h) = self.capture_health.latest() {
             found.extend(self.pipeline.capture_findings(&h));
@@ -2387,7 +2488,7 @@ impl Daemon<'_> {
                     if recorded {
                         // A quarantine carries the participant's SPDP
                         // unicast locators (the executor refuses it without).
-                        let now = std::time::Instant::now();
+                        let now = self.pipeline_now();
                         let binding = self.pipeline.binding();
                         let o = link.with_locators(o, |g| binding.spdp_unicast(g, now));
                         link.dispatch(Staged::Submit(o));
@@ -2495,5 +2596,33 @@ impl robodr_executor::evidence::EvidenceSink for EvidenceSink<'_, '_> {
                 sanitize(reference)
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod replay_timeline_tests {
+    use super::ReplayTimeline;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn packets_are_placed_by_record_time_not_by_handling_time() {
+        let i0 = Instant::now();
+        let mut tl = ReplayTimeline::default();
+        assert_eq!(tl.position(), None);
+        assert_eq!(tl.instant(), None);
+        // Anchored at the first packet: capture 5 s -> daemon 100 ms.
+        assert_eq!(tl.place(5_000_000_000, 100_000_000, i0), 100_000_000);
+        // Handled "much later" or "at once": only the record time counts.
+        assert_eq!(
+            tl.place(5_250_000_000, 9_000_000_000, i0 + Duration::from_secs(9)),
+            350_000_000
+        );
+        assert_eq!(tl.place(6_000_000_000, 0, i0), 1_100_000_000);
+        assert_eq!(tl.position(), Some(1_100_000_000));
+        assert_eq!(tl.instant(), Some(i0 + Duration::from_secs(1)));
+        // An earlier record (merged interfaces) never moves it back.
+        assert_eq!(tl.place(5_500_000_000, 0, i0), 1_100_000_000);
+        assert_eq!(tl.place(1, 0, i0), 1_100_000_000);
+        assert_eq!(tl.position(), Some(1_100_000_000));
     }
 }

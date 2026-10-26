@@ -195,10 +195,16 @@ pub fn frame(src: Ipv4Addr, dst: Ipv4Addr, dport: u16, payload: &[u8]) -> Vec<u8
 
 /// A classic pcap (Ethernet) of `frames`, one second apart.
 pub fn pcap(frames: &[Vec<u8>]) -> Vec<u8> {
+    pcap_spaced(frames, Duration::from_secs(1))
+}
+
+/// [`pcap`] with the records `step` apart (a replay is judged on these
+/// timestamps: a flood needs them close together).
+pub fn pcap_spaced(frames: &[Vec<u8>], step: Duration) -> Vec<u8> {
     let mut w = PcapWriter::new(Vec::new(), LinkType::ETHERNET, 65535, false).unwrap();
     for (i, f) in frames.iter().enumerate() {
         w.write_packet(
-            Duration::new(1_760_000_000 + i as u64, 0),
+            Duration::new(1_760_000_000, 0) + step * i as u32,
             f,
             f.len() as u32,
         )

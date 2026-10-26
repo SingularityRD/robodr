@@ -65,6 +65,14 @@
 //! [`crate::clock::TimeGuard`]: `mono_ns` never goes backwards and wall jumps
 //! are reported (see [`crate::clock`]).
 //!
+//! The detectors that measure time between events (the Motion Firewall's
+//! rate checks and the motion monitor's latency / persistence windows) use
+//! the event's `mono_ns` by default. [`Agent::handle_with_joint_at`] gives
+//! them an explicit detection time instead, on the timeline the events
+//! were *observed* on: a capture replayed faster or slower than it was
+//! recorded must be judged by its own packet timestamps, not by how fast
+//! this process happened to read it. Evidence keeps the guarded `now`.
+//!
 //! # Mapping `MotionCommand` to the firewall and the motion monitor
 //!
 //! `MotionCommand` carries the command's signed body-frame values
@@ -796,9 +804,28 @@ impl Agent {
         joint: Option<&JointInput>,
         safety: SafetyState,
     ) -> Vec<Outcome> {
+        self.handle_with_joint_at(now, None, event, joint, safety)
+    }
+
+    /// [`Agent::handle_with_joint`] with an explicit detection time
+    /// `detect_ns` (monotonic ns on the event's observation timeline) for
+    /// the time-dependent detectors: the twist firewall's rate checks and
+    /// the motion monitor (commands, feedback, safety-stop grace, expiry).
+    /// `None` uses the guarded `now.mono_ns`, as [`Agent::handle_with_joint`]
+    /// does. Every caller must keep `detect_ns` on one non-decreasing
+    /// timeline (the monitor holds a regression; it never rewinds).
+    /// Evidence (black box, findings) is stamped with `now` either way.
+    pub fn handle_with_joint_at(
+        &mut self,
+        now: Timestamp,
+        detect_ns: Option<u64>,
+        event: &RobotEvent,
+        joint: Option<&JointInput>,
+        safety: SafetyState,
+    ) -> Vec<Outcome> {
         let now = self.observe_time(now);
         self.stats.events = self.stats.events.saturating_add(1);
-        let mono = now.mono_ns;
+        let mono = detect_ns.unwrap_or(now.mono_ns);
         let mode = self.profile.mode();
 
         // 1. Detection.

@@ -6,6 +6,7 @@ mod common;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use common::pcap::{frame, robot_profile, scenario_frames, spdp_datagram, SPDP_GROUP};
 use common::*;
@@ -363,7 +364,15 @@ fn correlation_state_pressure_is_an_observe_only_health_finding() {
             frame(ip, SPDP_GROUP, 7400, &spdp_datagram(prefix, ip))
         })
         .collect();
-    let mut cfg = replay_cfg(&s, &frames);
+    // A flood: 300 fresh addresses within 0.3 s of capture time (the
+    // replay is judged on its packet timestamps; at the default 1 s apart
+    // the 60 s window would expire groups before the cap is reached).
+    let pcap = s.pcap_spaced(&frames, Duration::from_millis(1));
+    let mut cfg = s.config(
+        serde_json::json!({"capture": {"enabled": true, "pcap_replay": pcap}}),
+        serde_json::json!([]),
+        serde_json::json!({"exit_when_inputs_end": true}),
+    );
     cfg["correlation"] = serde_json::json!({"rules_path": p, "include_default_rules": false});
     cfg["sensor"]["rate_limit_burst"] = 10_000.into();
     let mut log = Vec::new();
