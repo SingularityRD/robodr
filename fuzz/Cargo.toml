@@ -20,6 +20,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 serde_json = "1"
 robodr-agent = { path = "../crates/robodr-agent" }
+robodr-agentd = { path = "../crates/robodr-agentd" }
 robodr-blackbox = { path = "../crates/robodr-blackbox" }
 robodr-capture = { path = "../crates/robodr-capture" }
 robodr-cdr = { path = "../crates/robodr-cdr" }
@@ -110,6 +111,13 @@ bench = false
 [[bin]]
 name = "pipeline_config"
 path = "fuzz_targets/pipeline_config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control_plane_request"
+path = "fuzz_targets/control_plane_request.rs"
 test = false
 doc = false
 bench = false

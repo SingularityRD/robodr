@@ -1,0 +1,18 @@
+{
+  "body_sha256": "1db5440187beaab24b7f43189d10cfbc81a81f8a2282f7d3c1eaffc4b6fb13f6",
+  "description": "signature over another body: 401 bad_signature, unsigned answer",
+  "expect": {
+    "authenticated": false,
+    "code": "bad_signature",
+    "status": 401
+  },
+  "key_id": "soc:soc-a:1",
+  "method": "POST",
+  "name": "11-bad-signature",
+  "nonce": "contract-nonce-0011",
+  "robot_id": "ugv-007",
+  "signature": "81e02e9d59787a34100cde815f12a6e56d48e2adeb67e6f6f433a7c3814deedd2f8f1d4f7a4947bf75f8bffaaf0b0e95a83b3fd5e07c0400fca9c308187d510e",
+  "signing_message": "robodr-control-plane/v2\nPOST\n/api/v2/robots/ugv-007/action-requests\nugv-007\nsoc:soc-a:1\n1800000000\ncontract-nonce-0011\n44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+  "target": "/api/v2/robots/ugv-007/action-requests",
+  "timestamp": 1800000000
+}

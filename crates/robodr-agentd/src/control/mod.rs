@@ -78,7 +78,7 @@ pub mod tls;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -893,7 +893,7 @@ fn run_tcp(l: TcpListener, tls: Option<Arc<rustls::ServerConfig>>, sh: Arc<Share
                 }
                 match &tls {
                     None => spawn_conn(&sh, &mut conns, format!("tcp:{addr}"), move |sh, peer| {
-                        serve::<TcpStream>(s, peer, sh)
+                        serve::<http::DeadlineTcp>(http::DeadlineTcp::new(s), peer, sh)
                     }),
                     Some(cfg) => {
                         let cfg = cfg.clone();
@@ -1116,6 +1116,7 @@ fn to_body(v: &Value) -> Vec<u8> {
 }
 
 fn send<S: http::Stream>(s: &mut S, status: u16, body: &Value, extra: &[(&str, String)]) {
+    s.set_write_deadline(Instant::now() + http::ANSWER_WRITE_DEADLINE);
     let _ = http::write_response(s, status, &to_body(body), extra);
     s.finish();
 }
@@ -1207,6 +1208,7 @@ fn serve<S: http::Stream>(mut s: S, peer: String, sh: &Shared) {
     c.authenticated.fetch_add(1, Ordering::Relaxed);
     // From here on the peer proved the key: every answer is signed.
     let answer = |s: &mut S, mut r: Reply| {
+        s.set_write_deadline(Instant::now() + http::ANSWER_WRITE_DEADLINE);
         let signed = {
             let signer = sh
                 .answer_signer
@@ -1321,6 +1323,16 @@ fn serve<S: http::Stream>(mut s: S, peer: String, sh: &Shared) {
     answer(&mut s, r)
 }
 
+/// The build lock, or `None` when another build holds it (a poisoned lock
+/// is taken over: it guards no data).
+fn try_building(svc: &evidence::Service) -> Option<std::sync::MutexGuard<'_, ()>> {
+    match svc.building.try_lock() {
+        Ok(g) => Some(g),
+        Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
 /// The evidence API calls (listener thread; only the export note goes to
 /// the main loop).
 fn evidence_call(
@@ -1355,7 +1367,7 @@ fn evidence_call(
     };
     match route {
         Route::EvidenceInventory => {
-            let Ok(_g) = svc.building.try_lock() else {
+            let Some(_g) = try_building(svc) else {
                 return Reply::error(&ApiError::new(
                     503,
                     "evidence_busy",
@@ -1448,7 +1460,7 @@ fn evidence_call(
                     ));
                 }
             }
-            let Ok(_g) = svc.building.try_lock() else {
+            let Some(_g) = try_building(svc) else {
                 return Reply::error(&ApiError::new(
                     503,
                     "evidence_busy",

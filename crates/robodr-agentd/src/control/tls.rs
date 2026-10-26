@@ -335,8 +335,8 @@ impl ClientCertVerifier for PinningClientVerifier {
     }
 }
 
-/// A server-side TLS stream over TCP.
-pub struct TlsStream(pub StreamOwned<ServerConnection, TcpStream>);
+/// A server-side TLS stream over TCP (with the answer's write deadline).
+pub struct TlsStream(pub StreamOwned<ServerConnection, super::http::DeadlineTcp>);
 
 impl Read for TlsStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -355,7 +355,10 @@ impl Write for TlsStream {
 
 impl super::http::Stream for TlsStream {
     fn set_read_deadline(&self, d: Duration) -> io::Result<()> {
-        self.0.sock.set_read_timeout(Some(d))
+        self.0.sock.tcp.set_read_timeout(Some(d))
+    }
+    fn set_write_deadline(&self, at: Instant) {
+        super::http::Stream::set_write_deadline(&self.0.sock, at);
     }
     fn finish(&mut self) {
         self.close();
@@ -396,13 +399,14 @@ pub fn accept(
     deadline: Instant,
 ) -> Result<(TlsStream, String), String> {
     let conn = ServerConnection::new(config.clone()).map_err(|e| format!("TLS: {e}"))?;
-    let mut s = StreamOwned::new(conn, tcp);
+    let mut s = StreamOwned::new(conn, super::http::DeadlineTcp::new(tcp));
     while s.conn.is_handshaking() {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Err("timed out".into());
         }
         s.sock
+            .tcp
             .set_read_timeout(Some(left.max(Duration::from_millis(1))))
             .map_err(|e| e.to_string())?;
         if let Err(e) = s.conn.complete_io(&mut s.sock) {

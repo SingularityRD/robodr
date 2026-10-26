@@ -1,0 +1,10 @@
+POST /api/v2/robots/ugv-007/action-requests HTTP/1.1
+Host: robot
+Content-Type: application/json
+Content-Length: 273
+X-RoboDR-Key-Id: soc:soc-a:1
+X-RoboDR-Timestamp: 1800000000
+X-RoboDR-Nonce: seed-nonce-000000002
+X-RoboDR-Signature: 94c66d760c54b8aa706daafcfb3ee3c5fe0e0086846fe06a5e2e5a73bca0469150c1313c4b54db1bf17fcc7913e0c129d0e5b036fe1385cd57b7ebb0ac18d901
+
+{"action":"restrict_motion","authority":"request","parameters":{"max_linear_speed":0.5,"workspace_zone":"zone-a"},"reason":"rogue /cmd_vel writer","request_id":"robot_restrict_motion:ugv-007:00112233aabbccdd","requested_by":"analyst@soc","source":"soc-a","ttl_seconds":600}

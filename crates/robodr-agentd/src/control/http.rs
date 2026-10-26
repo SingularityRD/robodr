@@ -29,8 +29,68 @@ pub const MAX_HEADER_NAME_BYTES: usize = 64;
 /// A stream with a settable read timeout (TCP, unix, TLS, test doubles).
 pub trait Stream: Read + Write {
     fn set_read_deadline(&self, d: Duration) -> io::Result<()>;
+    /// Bound the whole answer: every write after this fails once `at`
+    /// has passed (a peer that reads slowly cannot hold the connection
+    /// slot longer). Default: per-write timeouts only (unix socket).
+    fn set_write_deadline(&self, _at: Instant) {}
     /// End the exchange after the answer (TLS: `close_notify`).
     fn finish(&mut self) {}
+}
+
+/// How long the whole answer may take to write (the largest is an
+/// evidence chunk of at most 4 MiB).
+pub const ANSWER_WRITE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// A TCP stream whose writes share one deadline
+/// ([`Stream::set_write_deadline`]); each write's socket timeout is the
+/// time left.
+#[derive(Debug)]
+pub struct DeadlineTcp {
+    pub tcp: TcpStream,
+    write_deadline: std::cell::Cell<Option<Instant>>,
+}
+
+impl DeadlineTcp {
+    pub fn new(tcp: TcpStream) -> Self {
+        Self {
+            tcp,
+            write_deadline: std::cell::Cell::new(None),
+        }
+    }
+}
+
+impl Read for DeadlineTcp {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.tcp.read(buf)
+    }
+}
+
+impl Write for DeadlineTcp {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(at) = self.write_deadline.get() {
+            let left = at.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "answer write deadline",
+                ));
+            }
+            self.tcp.set_write_timeout(Some(left))?;
+        }
+        self.tcp.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.tcp.flush()
+    }
+}
+
+impl Stream for DeadlineTcp {
+    fn set_read_deadline(&self, d: Duration) -> io::Result<()> {
+        self.tcp.set_read_timeout(Some(d))
+    }
+    fn set_write_deadline(&self, at: Instant) {
+        self.write_deadline.set(Some(at));
+    }
 }
 
 impl Stream for TcpStream {
@@ -129,11 +189,17 @@ fn find_crlfcrlf(buf: &[u8]) -> Option<usize> {
 pub fn read_request<S: Stream>(s: &mut S, deadline: Instant) -> Result<Request, HttpError> {
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
+    // A head of at most MAX_HEAD_BYTES ends within the first
+    // MAX_HEAD_BYTES + 4 bytes (its blank line), so reading up to that many
+    // decides the same whatever sizes the peer's segments have. The
+    // delimiter search resumes where the last one stopped (linear time).
+    let mut searched = 0usize;
     let head_end = loop {
-        if let Some(i) = find_crlfcrlf(&buf) {
-            break i;
+        if let Some(i) = find_crlfcrlf(&buf[searched..]) {
+            break searched + i;
         }
-        if buf.len() >= MAX_HEAD_BYTES {
+        searched = buf.len().saturating_sub(3);
+        if buf.len() >= MAX_HEAD_BYTES + 4 {
             return Err(err(
                 431,
                 "head_too_large",
@@ -488,6 +554,33 @@ pub(crate) mod tests {
         assert_eq!(parse(target.as_bytes()).unwrap_err().status, 400);
     }
 
+    /// Where the head ends relative to the size bound decides, not how the
+    /// peer's bytes were cut into reads.
+    #[test]
+    fn the_head_bound_does_not_depend_on_read_sizes() {
+        for end in [MAX_HEAD_BYTES - 3, MAX_HEAD_BYTES, MAX_HEAD_BYTES + 1] {
+            // A head of exactly `end` bytes before its blank line.
+            let mut raw = b"GET /a HTTP/1.1\r\nX: ".to_vec();
+            raw.resize(end, b'a');
+            raw.extend_from_slice(b"\r\n\r\n");
+            let mut verdicts = Vec::new();
+            for step in [1, 7, 1000, usize::MAX] {
+                let mut f = Fake::new(&raw);
+                f.step = step;
+                verdicts.push(
+                    read_request(&mut f, Instant::now() + Duration::from_secs(5))
+                        .map(|_| ())
+                        .map_err(|e| e.status),
+                );
+            }
+            assert!(
+                verdicts.windows(2).all(|w| w[0] == w[1]),
+                "{end}: {verdicts:?}"
+            );
+            assert_eq!(verdicts[0].is_ok(), end <= MAX_HEAD_BYTES, "{end}");
+        }
+    }
+
     #[test]
     fn slow_client_times_out() {
         let mut f = Fake::new(b"GET /a HTTP/1.1\r\n");
@@ -496,6 +589,28 @@ pub(crate) mod tests {
         let e = read_request(&mut f, Instant::now() + Duration::from_millis(100)).unwrap_err();
         assert_eq!(e.status, 408);
         assert!(t.elapsed() < Duration::from_secs(2));
+    }
+
+    /// A slow reader cannot stretch an answer past its deadline: once it
+    /// passed, every write fails at once.
+    #[test]
+    fn answer_writes_share_one_deadline() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (srv, _) = l.accept().unwrap();
+        let mut s = DeadlineTcp::new(srv);
+        s.write_all(b"ok").unwrap();
+        s.set_write_deadline(Instant::now());
+        std::thread::sleep(Duration::from_millis(2));
+        let e = s.write_all(&[0u8; 4096]).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        // A peer that never reads: a large answer ends at the deadline.
+        s.set_write_deadline(Instant::now() + Duration::from_millis(300));
+        let t = Instant::now();
+        let big = vec![0u8; 64 * 1024 * 1024];
+        assert!(s.write_all(&big).is_err());
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        drop(c);
     }
 
     #[test]

@@ -1,0 +1,27 @@
+{
+  "answer": {
+    "answer_message": "robodr-control-plane/v2 answer\n3475ebcff5a0e2baba67a02de2f8751d186f9c4505bd7396ea656b4c662c97ae0c625f62d52d2c3bbdd8ce38643cc7db6c9292f734d46b7dc09029f838245f01\n200\n853e6afcf337463fd7694eb5a11c0ee0654f26f572a5eb1caf32c3447369f2d0",
+    "body_file": "answers/09-evidence-chunk-1.body.bin",
+    "body_sha256": "853e6afcf337463fd7694eb5a11c0ee0654f26f572a5eb1caf32c3447369f2d0",
+    "content_type": "application/octet-stream",
+    "status": 200,
+    "x_robodr_answer_signature": "ed25519;key_id=finding:ugv-007:1;sig=62eb91ffd16d6463c73afdbdb25337ac41b2b997b641a8fdf5ecf2cf1d8bce5b5d13f3bd48c9f7ed201fe9fb6f50de2d2b1d00d79cb3dbb890503171a24c4308"
+  },
+  "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "description": "one chunk (application/octet-stream)",
+  "expect": {
+    "authenticated": true,
+    "chunk": 1,
+    "id": "case-42:ev-1",
+    "route": "evidence_chunk"
+  },
+  "key_id": "soc:soc-a:1",
+  "method": "GET",
+  "name": "09-evidence-chunk-1",
+  "nonce": "contract-nonce-0009",
+  "robot_id": "ugv-007",
+  "signature": "3475ebcff5a0e2baba67a02de2f8751d186f9c4505bd7396ea656b4c662c97ae0c625f62d52d2c3bbdd8ce38643cc7db6c9292f734d46b7dc09029f838245f01",
+  "signing_message": "robodr-control-plane/v2\nGET\n/api/v2/robots/ugv-007/evidence/exports/case-42%3Aev-1/chunks/1\nugv-007\nsoc:soc-a:1\n1800000000\ncontract-nonce-0009\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "target": "/api/v2/robots/ugv-007/evidence/exports/case-42%3Aev-1/chunks/1",
+  "timestamp": 1800000000
+}

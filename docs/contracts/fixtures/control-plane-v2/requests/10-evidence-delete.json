@@ -1,0 +1,26 @@
+{
+  "answer": {
+    "answer_message": "robodr-control-plane/v2 answer\n5d6cbd981993915ea679ef11520b75f82f623cce8acce4aac4f45ba3658b9b64964aa3faa9321834dff5e6477ccfecfc9589bb4ad55047b81798c8027a93590e\n200\ned36bfb87e54e4d7b72b972a6a6a13925468e1ec7efb19a84ff67275d48ad373",
+    "body_file": "answers/10-evidence-delete.body.json",
+    "body_sha256": "ed36bfb87e54e4d7b72b972a6a6a13925468e1ec7efb19a84ff67275d48ad373",
+    "content_type": "application/json",
+    "status": 200,
+    "x_robodr_answer_signature": "ed25519;key_id=finding:ugv-007:1;sig=8e5b935283837c1a718994a59d1c158246689cac1038ddae5bdb49f64c5de3b3a35a6597be8c026447a7689b6540cb0837393a4346d61ccad4ec31e8b215b403"
+  },
+  "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "description": "delete an export",
+  "expect": {
+    "authenticated": true,
+    "id": "case-42:ev-1",
+    "route": "evidence_delete"
+  },
+  "key_id": "soc:soc-a:1",
+  "method": "DELETE",
+  "name": "10-evidence-delete",
+  "nonce": "contract-nonce-0010",
+  "robot_id": "ugv-007",
+  "signature": "5d6cbd981993915ea679ef11520b75f82f623cce8acce4aac4f45ba3658b9b64964aa3faa9321834dff5e6477ccfecfc9589bb4ad55047b81798c8027a93590e",
+  "signing_message": "robodr-control-plane/v2\nDELETE\n/api/v2/robots/ugv-007/evidence/exports/case-42%3Aev-1\nugv-007\nsoc:soc-a:1\n1800000000\ncontract-nonce-0010\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "target": "/api/v2/robots/ugv-007/evidence/exports/case-42%3Aev-1",
+  "timestamp": 1800000000
+}

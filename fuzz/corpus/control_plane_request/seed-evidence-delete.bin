@@ -1,0 +1,9 @@
+DELETE /api/v2/robots/ugv-007/evidence/exports/case-42%3Aev-1 HTTP/1.1
+Host: robot
+Content-Type: application/json
+Content-Length: 0
+X-RoboDR-Key-Id: soc:soc-a:1
+X-RoboDR-Timestamp: 1800000000
+X-RoboDR-Nonce: seed-nonce-000000009
+X-RoboDR-Signature: edb2911a1462f793d6e823b98810dd5875b694549cf9e5e3dc45b199e3decda2dcf59260d16a1e3b88d6c9062410009d8fa2c1ec79450fe2938d2aa3cb842a0f
+
