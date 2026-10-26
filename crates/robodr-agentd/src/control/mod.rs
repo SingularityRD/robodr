@@ -1637,7 +1637,7 @@ fn evidence_call(
                     if e.code == "export_corrupt" {
                         let mut g = lock();
                         g.corrupt += 1;
-                        g.delete(id);
+                        g.drop_corrupt(&st);
                     }
                     Reply::error(&e)
                 }

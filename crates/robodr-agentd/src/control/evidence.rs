@@ -1430,6 +1430,21 @@ impl Store {
         }
     }
 
+    /// Drop the export a chunk read found corrupt, but only if it is still
+    /// the very export that was read (same manifest bytes): a delete and a
+    /// re-create of the same id between the read and this call must not
+    /// cost the new export (review finding 8). `true` if it was dropped.
+    pub fn drop_corrupt(&mut self, seen: &Stored) -> bool {
+        let id = &seen.manifest.export_id;
+        let same = self.exports.get(id).is_some_and(|cur| {
+            robodr_blackbox::crypto::ct_eq(
+                &sha256(&cur.manifest_bytes),
+                &sha256(&seen.manifest_bytes),
+            ) && cur.dir == seen.dir
+        });
+        same && self.delete(id)
+    }
+
     /// Insert an export written by [`write_export`] (replacing one with
     /// the same id).
     pub fn insert(&mut self, s: Stored) {
@@ -2375,5 +2390,80 @@ mod tests {
         assert_eq!((e.status, e.code), (507, "storage_full"));
         #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
         assert!(free_bytes(&std::env::temp_dir()).is_some_and(|f| f > 0));
+    }
+
+    /// Review finding 8: a chunk read that finds its export corrupt while
+    /// the export was deleted and re-created under the same id must not
+    /// delete the new one.
+    #[test]
+    fn a_corrupt_chunk_never_deletes_a_recreated_export() {
+        let d = tmp("race");
+        let exports = d.join("exports");
+        std::fs::create_dir_all(&exports).unwrap();
+        let bb = d.join("bb");
+        std::fs::create_dir_all(&bb).unwrap();
+        let mut r = recorder(&bb, 4);
+        notes(&mut r, 0, 1);
+        drop(r);
+        let ident = index(&DirSource(bb)).unwrap().identity;
+        let mut st = Store {
+            dir: exports.clone(),
+            ..Store::default()
+        };
+        let m = |n: u64| Manifest {
+            kind: MANIFEST_KIND.into(),
+            version: MANIFEST_VERSION,
+            api: API_VERSION.into(),
+            robot_id: ROBOT.into(),
+            export_id: "case-1".into(),
+            created_at_ms: n,
+            expires_at_ms: u64::MAX,
+            requested_by: "a".into(),
+            reason: String::new(),
+            key_id: "soc".into(),
+            selector: Selector::SeqRange {
+                from_seq: 0,
+                to_seq: n,
+            },
+            chain: ChainInfo {
+                chain_id: String::new(),
+                identity: ident.clone(),
+                signing_key: KeyRef {
+                    key_id: "bb-1".into(),
+                    algorithm: "ed25519".into(),
+                },
+            },
+            records: RecordsInfo {
+                first_seq: 0,
+                last_seq: n,
+                count: n + 1,
+                first_wall_ms: 0,
+                last_wall_ms: 0,
+                last_sha256: String::new(),
+            },
+            anchor: None,
+            referenced: Vec::new(),
+            bundle: bundle_info(b"bundle", 16 * 1024),
+            evidence: String::new(),
+        };
+        let put = |st: &mut Store, n: u64| {
+            let mm = m(n);
+            let mb = serde_json::to_vec(&mm).unwrap();
+            st.insert(write_export(&exports, mm, mb, "sig".into(), b"bundle").unwrap());
+        };
+        put(&mut st, 1);
+        let seen = st.exports["case-1"].clone();
+        // Deleted and re-created (another selection) before the reader
+        // reports the corruption it saw.
+        assert!(st.delete("case-1"));
+        put(&mut st, 2);
+        assert!(!st.drop_corrupt(&seen), "the new export stays");
+        assert_eq!(st.exports["case-1"].manifest.records.last_seq, 2);
+        assert!(st.exports["case-1"].dir.join(BUNDLE_FILE).exists());
+        // The export that was read is dropped.
+        let cur = st.exports["case-1"].clone();
+        assert!(st.drop_corrupt(&cur));
+        assert!(st.exports.is_empty());
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
