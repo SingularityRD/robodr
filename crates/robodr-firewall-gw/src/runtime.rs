@@ -11,6 +11,16 @@
 //! the housekeeping period, so an idle queue still runs it (the systemd
 //! watchdog therefore sees a stalled loop, not an idle one).
 //!
+//! **Robot-side copies** (`observe.enabled`): an NFLOG group receives a
+//! copy of every UDP datagram entering from the robot port
+//! (`crate::observe`). The group is drained without blocking before each
+//! NFQUEUE receive and again right before a received batch is decided, so
+//! the robot's latest `rt/lowstate` is known when an arm-SDK frame is. The
+//! copies are never verdicted; a full socket buffer loses copies only
+//! (`observe_overruns`). If the group cannot be bound the gateway runs
+//! without observation (a WARNING, status `observe_unavailable`): the
+//! arm-SDK engagement then uses its conservative first-step rule.
+//!
 //! The loop measures, per packet, the time from the moment its batch was
 //! received to the moment its verdict was sent (`recv -> verdict`), and
 //! reports p50 / p99 / max in the status file.
@@ -26,7 +36,7 @@ use serde_json::json;
 use crate::config::{GatewayConfig, GatewayMode, OnGatewayDown};
 use crate::gateway::{Gateway, PacketMeta, Verdict};
 use crate::nfq::{self, Item};
-use crate::sys;
+use crate::{nflog, sys};
 
 /// Read a small text file (size-capped).
 fn read_capped(path: &Path, max: u64) -> Result<String, String> {
@@ -173,6 +183,23 @@ pub fn run(
          outside them raises port_bypass_risk",
         cfg.rtps_port_ranges()
     );
+    let mut log = if cfg.observe.enabled {
+        match nflog::Log::open(cfg.observe.nflog_group) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!(
+                    "robodr-firewall-gw: WARNING: NFLOG group {} ({e}; needs nfnetlink_log): \
+                     running without robot-side observation (no rt/lowstate for the arm-SDK \
+                     engagement check, no robot-side locator check); status observe_unavailable",
+                    cfg.observe.nflog_group
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let observe_unavailable = cfg.observe.enabled && log.is_none();
     let notifier = sys::Notifier::from_env();
     notifier.notify("READY=1\nSTATUS=deciding");
     let mut events = Events::open(cfg);
@@ -191,8 +218,10 @@ pub fn run(
         {
             break;
         }
+        drain_observed(&mut log, gw);
         let n = q.recv().map_err(|e| format!("NFQUEUE recv: {e}"))?;
         if n > 0 {
+            drain_observed(&mut log, gw);
             let t_batch = sys::monotonic_ns();
             let buf = std::mem::take(&mut q.buf);
             nfq::parse_packets(&buf[..n], |item| {
@@ -255,10 +284,14 @@ pub fn run(
         }
         if Instant::now() >= next_hk {
             next_hk = Instant::now() + hk;
+            events.observe_unavailable = observe_unavailable;
+            events.observe_overruns = log.as_ref().map_or(0, |l| l.overruns);
             housekeeping(cfg, gw, &mut events, &hist);
             notifier.notify("WATCHDOG=1");
         }
     }
+    events.observe_unavailable = observe_unavailable;
+    events.observe_overruns = log.as_ref().map_or(0, |l| l.overruns);
     housekeeping(cfg, gw, &mut events, &hist);
     notifier.notify("STOPPING=1");
     Ok(RunReport {
@@ -266,6 +299,47 @@ pub fn run(
         stamped,
         latency: hist,
     })
+}
+
+/// Most NFLOG receives per drain (bounds the time taken from the queue).
+const MAX_OBSERVE_RECVS: usize = 64;
+
+/// Hand the pending robot-side copies to the gateway (never blocks).
+fn drain_observed(log: &mut Option<nflog::Log>, gw: &mut Gateway) {
+    let Some(l) = log.as_mut() else {
+        return;
+    };
+    for _ in 0..MAX_OBSERVE_RECVS {
+        let n = match l.try_recv() {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        let buf = std::mem::take(&mut l.buf);
+        let mono = sys::monotonic_ns();
+        let real = sys::realtime_ns();
+        nflog::parse_packets(&buf[..n], |item| {
+            let nflog::Item::Packet(p) = item else { return };
+            if p.hw_protocol != 0x0800 {
+                return;
+            }
+            // Its arrival on the box, on the decision clock (as for queued
+            // packets).
+            let delay = p.timestamp.and_then(|(s, us)| {
+                let t = s
+                    .checked_mul(1_000_000_000)?
+                    .checked_add(us.checked_mul(1_000)?)?;
+                real.checked_sub(t)
+            });
+            let meta = PacketMeta {
+                now_ns: delay.map_or(mono, |d| mono.saturating_sub(d)),
+                queue_delay_ns: None,
+                instant: Instant::now(),
+                src_mac: None,
+            };
+            gw.observe(p.payload, meta);
+        });
+        l.buf = buf;
+    }
 }
 
 /// The events file (JSON lines of firewall deviations), size-capped.
@@ -276,6 +350,9 @@ struct Events {
     dropped: u64,
     /// The port-bypass warning was printed.
     port_warned: bool,
+    /// Status: the NFLOG group could not be bound / copies lost.
+    observe_unavailable: bool,
+    observe_overruns: u64,
 }
 
 impl Events {
@@ -300,6 +377,8 @@ impl Events {
             max: cfg.events_max_bytes,
             dropped: 0,
             port_warned: false,
+            observe_unavailable: false,
+            observe_overruns: 0,
         }
     }
 }
@@ -355,6 +434,10 @@ fn housekeeping(cfg: &GatewayConfig, gw: &mut Gateway, events: &mut Events, hist
             "port_bypass_risk": gw.discovery().port_bypass().is_some(),
             "port_bypass": gw.discovery().port_bypass(),
             "queued_rtps_port_ranges": cfg.rtps_port_ranges(),
+            "observe_enabled": cfg.observe.enabled,
+            "observe_unavailable": events.observe_unavailable,
+            "observe_overruns": events.observe_overruns,
+            "observer": gw.observer().stats,
             "firewall": {
                 "checked": fs.checked, "passed": fs.passed, "limited": fs.limited,
                 "rejected": fs.rejected, "would_have": fs.would_have, "faults": fs.faults,

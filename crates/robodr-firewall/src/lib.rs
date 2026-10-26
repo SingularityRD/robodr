@@ -172,7 +172,9 @@
 //! channel never emits a zero-torque, damping or limp frame (the robot would
 //! fall): a rejection or a fault holds the last accepted frame (velocity
 //! targets zeroed), or emits nothing if there is none yet; a frame in which
-//! every enabled slot is limp is rejected. Compilation refuses
+//! every enabled slot is limp is rejected (on a channel that is
+//! `balance_critical`, the default; a hand channel may set it `false`).
+//! Compilation refuses
 //! [`FailBehaviour::ZeroVelocity`], [`FaultPolicy::FailSafe`] and
 //! [`FaultPolicy::FailOpen`] for such a platform
 //! ([`ConfigError::UnsafeSubstitute`]), an enabled slot that may go limp

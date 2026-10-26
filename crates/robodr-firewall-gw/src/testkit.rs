@@ -362,6 +362,8 @@ fn hand_spec(writer: [u8; 4], n: usize) -> JointChannelSpec {
     let v = serde_json::json!({
         "allowed_sources": [guid_hex(&PREFIX, writer)],
         "require_crc": false,
+        // A hand is not in the balance loop: it may be released (F6).
+        "balance_critical": false,
         "rate": {"expected_hz": 50.0, "min_interval_ns": 1_000_000, "max_interval_ns": 100_000_000},
         "motors": vec![motor; n],
     });
@@ -530,4 +532,139 @@ pub fn sedp_with_locator(
         [0, 0, 3, 0xc2]
     };
     Datagram::new(prefix).data(w, 1, &[], &p).finish()
+}
+
+// --- The robot's side (observed copies: `rt/lowstate`, robot discovery) ---
+
+/// The robot's participant prefix in the fixtures.
+pub const ROBOT_PREFIX: GuidPrefix = [
+    0x02, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb,
+];
+/// The robot's `rt/lowstate` writer entity.
+pub const LOWSTATE_WRITER: [u8; 4] = [0, 0, 0x10, 0x02];
+
+/// An `hg` `LowState_` payload (CDR LE, valid CRC) whose motor `i` reports
+/// position `q[i]` (35 slots; missing entries 0).
+pub fn hg_lowstate_payload(q: &[f32]) -> Vec<u8> {
+    use robodr_cdr::unitree::{decode_unitree, UnitreeKind, UnitreeMessage};
+    // Plain CDR: every primitive aligned to its size (structs are not).
+    struct W(Vec<u8>);
+    impl W {
+        fn align(&mut self, n: usize) {
+            while !self.0.len().is_multiple_of(n) {
+                self.0.push(0);
+            }
+        }
+        fn u8(&mut self, v: u8) {
+            self.0.push(v);
+        }
+        fn u16(&mut self, v: u16) {
+            self.align(2);
+            self.0.extend_from_slice(&v.to_le_bytes());
+        }
+        fn u32(&mut self, v: u32) {
+            self.align(4);
+            self.0.extend_from_slice(&v.to_le_bytes());
+        }
+        fn f32(&mut self, v: f32) {
+            self.u32(v.to_bits());
+        }
+    }
+    let mut w = W(Vec::with_capacity(2100));
+    w.u32(0); // version[2]
+    w.u32(0);
+    w.u8(0); // mode_pr
+    w.u8(0); // mode_machine
+    w.u32(1); // tick
+    for v in [1.0f32, 0.0, 0.0, 0.0] {
+        w.f32(v); // quaternion
+    }
+    for _ in 0..9 {
+        w.f32(0.0); // gyroscope, accelerometer, rpy
+    }
+    w.u16(25); // temperature
+    for i in 0..35 {
+        w.u8(1); // mode
+        w.f32(q.get(i).copied().unwrap_or(0.0));
+        for _ in 0..3 {
+            w.f32(0.0); // dq, ddq, tau_est
+        }
+        w.u16(0); // temperature[2]
+        w.u16(0);
+        w.f32(0.0); // vol
+        w.u32(0); // sensor[2]
+        w.u32(0);
+        w.u32(0); // motorstate
+        for _ in 0..4 {
+            w.u32(0); // reserve[4]
+        }
+    }
+    for _ in 0..40 {
+        w.u8(0); // wireless_remote
+    }
+    for _ in 0..4 {
+        w.u32(0); // reserve[4]
+    }
+    w.align(4);
+    let crc_at = 4 + w.0.len();
+    w.u32(0); // crc (patched below)
+    let mut p = vec![0x00, 0x01, 0x00, 0x00];
+    p.extend_from_slice(&w.0);
+    let crc = match decode_unitree(UnitreeKind::HgLowState, &p, &robodr_cdr::Limits::default()) {
+        Ok(d) => match d.message {
+            UnitreeMessage::HgLowState(m) => m.computed_crc(),
+            m => panic!("fixture lowstate decodes as {m:?}"),
+        },
+        Err(e) => panic!("fixture lowstate does not decode: {e:?}"),
+    };
+    p[crc_at..crc_at + 4].copy_from_slice(&crc.to_le_bytes());
+    p
+}
+
+/// A robot → controller IPv4 / UDP packet (what the observe rule copies).
+pub fn robot_packet(dst_port: u16, udp_payload: &[u8]) -> Vec<u8> {
+    build_ipv4_udp(ROBOT_IP, CONTROLLER_IP, 50_001, dst_port, udp_payload)
+}
+
+/// The robot's `rt/lowstate` sample `sn` (one DATA, or DATA_FRAG of
+/// `frag` octets when given).
+pub fn lowstate_datagram(sn: i64, q: &[f32], frag: Option<u16>) -> Vec<Vec<u8>> {
+    let p = hg_lowstate_payload(q);
+    match frag {
+        None => vec![Datagram::new(ROBOT_PREFIX)
+            .data(LOWSTATE_WRITER, sn, &[], &p)
+            .finish()],
+        Some(size) => p
+            .chunks(usize::from(size))
+            .enumerate()
+            .map(|(i, c)| {
+                Datagram::new(ROBOT_PREFIX)
+                    .data_frag(LOWSTATE_WRITER, sn, i as u32 + 1, size, p.len() as u32, c)
+                    .finish()
+            })
+            .collect(),
+    }
+}
+
+/// An SPDP participant announcement of `prefix` with one metatraffic
+/// unicast locator `ip:port` (`PID_METATRAFFIC_UNICAST_LOCATOR`).
+pub fn spdp_with_locator(prefix: GuidPrefix, ip: Ipv4Addr, port: u32) -> Vec<u8> {
+    fn param(out: &mut Vec<u8>, pid: u16, value: &[u8]) {
+        out.extend_from_slice(&pid.to_le_bytes());
+        out.extend_from_slice(&(value.len() as u16).to_le_bytes());
+        out.extend_from_slice(value);
+    }
+    let mut p = vec![0x00, 0x03, 0x00, 0x00];
+    let mut guid = prefix.to_vec();
+    guid.extend_from_slice(&[0, 0, 1, 0xc1]);
+    param(&mut p, 0x0050, &guid); // PID_PARTICIPANT_GUID
+    let mut loc = 1i32.to_le_bytes().to_vec();
+    loc.extend_from_slice(&port.to_le_bytes());
+    loc.extend_from_slice(&[0u8; 12]);
+    loc.extend_from_slice(&ip.octets());
+    param(&mut p, 0x0032, &loc); // PID_METATRAFFIC_UNICAST_LOCATOR
+    p.extend_from_slice(&[1, 0, 0, 0]);
+    Datagram::new(prefix)
+        .data([0, 1, 0, 0xc2], 1, &[], &p)
+        .finish()
 }

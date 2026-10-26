@@ -34,6 +34,15 @@
 //! `rtps.extra_port_ranges` are queued like the domain ranges (DDS stacks
 //! configured for other ports).
 //!
+//! 5. **Observe** (`observe.enabled`, default; chain `ROBODR_GW_OBS`,
+//!    jumped to from `FORWARD` for packets entering on the robot port):
+//!    every UDP datagram is **copied** to NFLOG group `observe.nflog_group`
+//!    (`--nflog-threshold 1`, whole packets) and continues: `NFLOG` is not
+//!    a terminating target, nothing is queued or dropped, and a stopped
+//!    gateway changes nothing on this path. The gateway reads the robot's
+//!    `rt/lowstate` (arm-SDK engagement check) and the robot's own SPDP /
+//!    SEDP (unqueued-locator check) from the copies.
+//!
 //! The queued DDS range of a domain (`7400 + 250 d ..= +249`) contains the
 //! discovery ports too (SPDP multicast `7400 + 250 d`, SPDP / SEDP unicast
 //! `7410 + 250 d + 2 i`), so every SPDP / SEDP datagram entering from the
@@ -136,6 +145,27 @@ pub fn render(cfg: &GatewayConfig, source: &str) -> String {
         "$IPT -C FORWARD -m physdev --physdev-in \"$CTRL\" -j ROBODR_GW 2>/dev/null ||\n\
          \x20 $IPT -I FORWARD 1 -m physdev --physdev-in \"$CTRL\" -j ROBODR_GW\n",
     );
+    s.push_str(
+        "\n# 5. Observe: copy what enters from the robot side to NFLOG (never\n\
+         #    queued, never dropped).\n\
+         $IPT -N ROBODR_GW_OBS 2>/dev/null || true\n$IPT -F ROBODR_GW_OBS\n",
+    );
+    if cfg.observe.enabled {
+        s.push_str(&format!(
+            "$IPT -A ROBODR_GW_OBS -p udp -j NFLOG --nflog-group {} --nflog-size 65535 \
+             --nflog-threshold 1\n",
+            cfg.observe.nflog_group
+        ));
+        s.push_str(
+            "$IPT -C FORWARD -m physdev --physdev-in \"$ROBOT\" -j ROBODR_GW_OBS 2>/dev/null ||\n\
+             \x20 $IPT -I FORWARD 1 -m physdev --physdev-in \"$ROBOT\" -j ROBODR_GW_OBS\n",
+        );
+    } else {
+        s.push_str(
+            "# observe.enabled = false: no copy (the chain stays empty).\n\
+             $IPT -D FORWARD -m physdev --physdev-in \"$ROBOT\" -j ROBODR_GW_OBS 2>/dev/null || true\n",
+        );
+    }
     s
 }
 
@@ -186,6 +216,20 @@ mod tests {
         let mut e = c.clone();
         e.rtps.extra_port_ranges = vec![[30000, 30100]];
         assert!(render(&e, "test.json").contains("--dport 30000:30100 -j NFQUEUE --queue-num 7\n"));
+        // Observe (default): robot-side UDP copied to NFLOG, never queued.
+        assert!(s.contains(
+            "-A ROBODR_GW_OBS -p udp -j NFLOG --nflog-group 4174 --nflog-size 65535 --nflog-threshold 1\n"
+        ));
+        assert!(s.contains("-m physdev --physdev-in \"$ROBOT\" -j ROBODR_GW_OBS"));
+        let obs: Vec<&str> = s.lines().filter(|l| l.contains("ROBODR_GW_OBS")).collect();
+        assert!(
+            obs.iter()
+                .all(|l| !l.contains("DROP") && !l.contains("NFQUEUE")),
+            "{obs:?}"
+        );
+        let mut off = c.clone();
+        off.observe.enabled = false;
+        assert!(!render(&off, "t").contains("-j NFLOG"));
         c.queue.on_gateway_down = OnGatewayDown::Bypass;
         let s = render(&c, "test.json");
         assert!(s.contains("--queue-num 7 --queue-bypass\n"));

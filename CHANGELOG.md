@@ -12,6 +12,49 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Security
 
+- `robodr-firewall-gw` (review of the gateway channels, F1 high): the
+  arm-SDK blend weight is rate limited, not only bounded: `0 → 1 → 0 → 1`
+  snapped the arms between the locomotion pose and the SDK's targets. New
+  per channel `max_weight_step` (default 0.02 per accepted frame) and
+  `max_weight_rate_per_s` (default 0.5 /s); a weight rising from 0 is
+  accepted only when every weighted target is within `engage_max_q_error`
+  (0.1 rad) of the robot's `rt/lowstate` (observed, `lowstate_max_age_ms`
+  50), else only by `engage_first_step` until `engage_stable_frames` frames
+  of stable targets. Beyond: integrity failure, the humanoid holds. New
+  counters `arm_weight_step_rejected`, `arm_weight_rate_rejected`,
+  `arm_engage_rejected`. **Behaviour change:** a controller that engages
+  in one frame (the SDK example) needs `rt/lowstate` and an opened-up
+  step / rate.
+- `robodr-firewall-gw` (F2, medium-high): the unknown-writer probe
+  classifies leniently (any representation, padding and trailing octets
+  ignored, element counts from the length) and the sample is then decided
+  strictly, so a non-canonical twist (XCDR2, trailing zeros) or Dex3 frame
+  from a foreign GUID is suppressed instead of passed. Writers SEDP
+  announced on another topic are now persisted in `rtps.state_file`.
+- `robodr-firewall-gw` (F5): the Dex3 mode octet must be the SDK's
+  (motor id = index, status 1, timeout 0 / 1); the hand-SDK weight
+  (`cmds[0].mode`) is bounded to 100 and step / rate limited; other mode
+  octets must be 0 (`hand_mode_rejected`).
+- `robodr-firewall` / `robodr-firewall-gw` (F6): new joint channel flag
+  `balance_critical` (default `true`); `false` lifts the humanoid all-limp
+  rule, so a hand can be released (`stopMotors`, `kp = kd = 0`). The
+  gateway accepts it on hand codecs only.
+- `robodr-firewall-gw` (F7): the robot's own SPDP / SEDP is observed (an
+  NFLOG copy of every UDP datagram entering from the robot port, never
+  queued or dropped; new `observe.enabled` / `observe.nflog_group`, a
+  `ROBODR_GW_OBS` chain in the rendered ruleset) and runs through the
+  unqueued-locator check (`discovery.robot_unqueued_locators`). The
+  commissioning capture of both bridge ports is a documented required step.
+- `robodr-firewall-gw` (F10): a loco `SetVelocity` ends after its duration
+  (`Firewall::twist_at_rest`, `velocity_expired`); queries and allowlisted
+  calls are checked for source / rate only (`Firewall::check_access`)
+  instead of feeding a zero twist; a malformed `SetVelocity` / `Move` is
+  suppressed, never turned into a substitute; rewritten numbers never read
+  back above the limit as a `float`; **`Start` (G1 500, H1 204, H2 601, R1
+  811) now needs `allowed_fsm_ids`**; new codec `unitree_arm_request` (G1 /
+  H2 arm actions on `rt/api/arm/request`: every call but `GetActionList`
+  refused unless in `allowed_api_ids`).
+
 - `robodr-executor` (M1, trust boundary): the executor no longer takes
   agentd's word for a SOC approval. agentd forwards the SOC's signed
   `robodr-control-plane/v2` request with every control-plane order; the
@@ -71,6 +114,13 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   now decided as a velocity.
 - `robodr-rtps`: SEDP endpoint locators (`PID_UNICAST_LOCATOR`,
   `PID_MULTICAST_LOCATOR`) in `EndpointInfo`.
+- `config/firewall-gw.unitree-{g1,go2}.channels.example.json` and
+  `config/firewall.unitree-{g1,go2}.channels.example.json`: the new
+  channels enabled (G1: arm SDK, loco, both Dex3 hands, arm actions; Go2:
+  sport, ROS 2 `/cmd_vel`), each channel explained in its new `note` field.
+- `robodr-firewall-gw` fuzz target: the new channels (fixture flag 4) and
+  the robot-side observation path, NFLOG parser, invariants for the arm
+  weight step, loco calls, hand mode octets and canonical twists.
 
 - Control plane `robodr-control-plane/v2` in `robodr-agentd` (GA sprints 4
   and 5, robot side; contract `docs/contracts/robodr.control-plane.md`):

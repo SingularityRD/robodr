@@ -178,10 +178,11 @@ fn loco_set_velocity_is_limited_and_its_duration_capped() {
 }
 
 /// Every `SetFsmId` of the G1 client helpers (`unitree_sdk2`
-/// `include/unitree/robot/g1/loco/g1_loco_client.hpp`): only `Start` (500,
-/// `:216`) passes by default; `ZeroTorque` (0, `:224`), `Damp` (1, `:214`),
-/// `Squat` (2, `:218`), `Sit` (3, `:220`), `StandUp` (4, `:222`) and any
-/// other value are suppressed unless `allowed_fsm_ids` lists them.
+/// `include/unitree/robot/g1/loco/g1_loco_client.hpp`): `ZeroTorque` (0,
+/// `:224`), `Damp` (1, `:214`), `Squat` (2, `:218`), `Sit` (3, `:220`),
+/// `StandUp` (4, `:222`), any other value and, since review finding F10
+/// (e), `Start` (500, `:216`) too are suppressed unless `allowed_fsm_ids`
+/// lists them.
 #[test]
 fn humanoid_never_goes_limp_through_loco() {
     let refused = [0i64, 1, 2, 3, 4, 702, 706, 999];
@@ -201,7 +202,10 @@ fn humanoid_never_goes_limp_through_loco() {
     assert_eq!(gw.stats.loco_refused, refused.len() as u64);
     now += 20 * MS;
     let p = pkt(LOCO_WRITER, 100, &loco(7101, "{\"data\":500}"));
-    assert_eq!(run(&mut gw, &p, now).0, Verdict::Accept, "Start passes");
+    assert!(
+        out_payload(&run(&mut gw, &p, now).1).is_none(),
+        "Start needs the allowlist"
+    );
     // Hand-over / tricks / unknown ids / sport ids: refused; queries pass.
     for (j, (id, param, pass)) in [
         (7110, "{}", false),           // SwitchToUserCtrl: hands the motors to rt/lowcmd
@@ -240,6 +244,7 @@ fn humanoid_never_goes_limp_through_loco() {
 fn h1_loco_on_its_own_topic() {
     let mut gw = g1_channels_gateway(|v| {
         v["channels"][2]["robot_model"] = serde_json::json!("h1");
+        v["channels"][2]["allowed_fsm_ids"] = serde_json::json!([204]);
     });
     let h1 = |p: &[u8]| {
         sport::decode_strict_for(p, ApiService::Loco, Some(UnitreeModel::H1))
@@ -315,9 +320,18 @@ fn out_arm(pkt: &[u8]) -> Option<WireLowCmd> {
     Some(d.msg)
 }
 
+/// The arm channel with the blend weight's dynamics opened up (a full
+/// weight on the first frame), so the joint checks are what is tested
+/// here; the dynamics are in `tests/exec_gw_review.rs`.
+fn open_weight(v: &mut serde_json::Value) {
+    v["channels"][1]["max_weight_step"] = serde_json::json!(1.0);
+    v["channels"][1]["max_weight_rate_per_s"] = serde_json::json!(1000.0);
+    v["channels"][1]["engage_first_step"] = serde_json::json!(1.0);
+}
+
 #[test]
 fn arm_sdk_mode_zero_slots_are_enforced_and_the_weight_bounded() {
-    let mut gw = gw_announced(|_| {});
+    let mut gw = gw_announced(open_weight);
     let good = arm_frame(1.0, 0.0);
     let (v, _) = run(&mut gw, &arm_pkt(1, &good), T0);
     assert_eq!(
@@ -387,8 +401,20 @@ fn arm_sdk_with_nothing_accepted_is_suppressed() {
 
 // ------------------------------------------------------------------ hands
 
-fn fingers(n: usize, q: f32) -> Vec<(u8, f32, f32, f32, f32, f32)> {
-    (0..n).map(|_| (0x01, q, 0.0, 0.0, 2.0, 0.1)).collect()
+/// Hand elements with the SDK's mode octets: Dex3 `id | status 1 << 4`
+/// (`g1_dex3_example.cpp:112-121`), hand SDK 0 (a weight of 0 in
+/// `cmds[0]`).
+fn fingers_for(codec: Codec, n: usize, q: f32) -> Vec<(u8, f32, f32, f32, f32, f32)> {
+    (0..n)
+        .map(|i| {
+            let mode = if codec == Codec::UnitreeDex3HandCmd {
+                (i as u8 & 0x0f) | 0x10
+            } else {
+                0
+            };
+            (mode, q, 0.0, 0.0, 2.0, 0.1)
+        })
+        .collect()
 }
 
 #[test]
@@ -400,11 +426,11 @@ fn hands_pass_or_are_suppressed() {
         (HAND_SDK_WRITER, Codec::UnitreeHandSdk, HAND_SDK_MOTORS),
     ] {
         for (sn, (payload, pass)) in [
-            (hand::encode(codec, &fingers(n, 0.5)), true),
-            (hand::encode(codec, &fingers(n, 3.0)), false), // q out of range
-            (hand::encode(codec, &fingers(n + 1, 0.5)), false), // wrong count
-            (hand::encode(codec, &fingers(n, f32::NAN)), false),
-            (hand::encode(codec, &fingers(n, 0.4)), true),
+            (hand::encode(codec, &fingers_for(codec, n, 0.5)), true),
+            (hand::encode(codec, &fingers_for(codec, n, 3.0)), false), // q out of range
+            (hand::encode(codec, &fingers_for(codec, n + 1, 0.5)), false), // wrong count
+            (hand::encode(codec, &fingers_for(codec, n, f32::NAN)), false),
+            (hand::encode(codec, &fingers_for(codec, n, 0.4)), true),
         ]
         .into_iter()
         .enumerate()
@@ -549,9 +575,11 @@ impl Rng {
 /// Mutated packets of every new channel: no panic, accept = unchanged,
 /// rewrite = same length + valid checksums (`run`), and what is forwarded
 /// on an enforced channel stays inside the invariants: no loco `SetFsmId`
-/// but `Start`, no `SetVelocity` above the limits or the 1 s duration, no
-/// arm frame with a weight outside `[0, 1]` or gains on a disabled slot,
-/// no hand frame or ROS 2 twist outside its envelope.
+/// (none is allowlisted), no `SetVelocity` above the limits or the 1 s
+/// duration, no arm frame with a weight outside `[0, 1]`, a weight step
+/// above `max_weight_step` from the last forwarded one or gains on a
+/// disabled slot, no hand frame or ROS 2 twist outside its envelope, no
+/// Dex3 element addressing another motor.
 #[test]
 fn fuzz_invariants_of_the_new_channels() {
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
@@ -560,15 +588,25 @@ fn fuzz_invariants_of_the_new_channels() {
         (LOCO_WRITER, loco(7101, "{\"data\":500}")),
         (
             ARM_WRITER,
-            lowcmd::encode_payload(&arm_frame(0.8, 0.0), Representation::CdrLe),
+            lowcmd::encode_payload(&arm_frame(0.0, 0.0), Representation::CdrLe),
+        ),
+        (
+            ARM_WRITER,
+            lowcmd::encode_payload(&arm_frame(0.01, 0.0), Representation::CdrLe),
         ),
         (
             DEX3_WRITER,
-            hand::encode(Codec::UnitreeDex3HandCmd, &fingers(DEX3_MOTORS, 0.3)),
+            hand::encode(
+                Codec::UnitreeDex3HandCmd,
+                &fingers_for(Codec::UnitreeDex3HandCmd, DEX3_MOTORS, 0.3),
+            ),
         ),
         (
             HAND_SDK_WRITER,
-            hand::encode(Codec::UnitreeHandSdk, &fingers(HAND_SDK_MOTORS, 0.3)),
+            hand::encode(
+                Codec::UnitreeHandSdk,
+                &fingers_for(Codec::UnitreeHandSdk, HAND_SDK_MOTORS, 0.3),
+            ),
         ),
         (
             TWIST_WRITER,
@@ -577,6 +615,7 @@ fn fuzz_invariants_of_the_new_channels() {
     ];
     let mut gw = gw_announced(|_| {});
     let mut now = T0;
+    let mut last_weight: Option<f32> = None;
     for round in 0..6000u64 {
         let (entity, seed) = &seeds[rng.below(seeds.len())];
         let mut payload = seed.clone();
@@ -612,7 +651,9 @@ fn fuzz_invariants_of_the_new_channels() {
                         "round {round}: {vx} {vy} {vyaw} {duration}"
                     );
                 }
-                ApiCall::SetFsmId { fsm_id, .. } => assert_eq!(fsm_id, 500, "round {round}"),
+                ApiCall::SetFsmId { fsm_id, .. } => {
+                    panic!("round {round}: SetFsmId {fsm_id} forwarded (none allowlisted)")
+                }
                 ApiCall::Other { class, .. } => {
                     assert_eq!(class, robodr_cdr::unitree::ApiClass::Query, "round {round}")
                 }
@@ -623,6 +664,14 @@ fn fuzz_invariants_of_the_new_channels() {
                 assert!(d.msg.crc_ok());
                 let w = d.msg.motor(29).unwrap();
                 assert!((0.0..=1.0).contains(&w.q) && w.kp == 0.0 && w.kd == 0.0 && w.tau == 0.0);
+                if let Some(l) = last_weight {
+                    assert!(
+                        (w.q - l).abs() <= 0.02 + 1e-6,
+                        "round {round}: weight {l} -> {}",
+                        w.q
+                    );
+                }
+                last_weight = Some(w.q);
                 for i in 0..15 {
                     let m = d.msg.motor(i).unwrap();
                     assert!(
@@ -643,7 +692,7 @@ fn fuzz_invariants_of_the_new_channels() {
                 } else {
                     HAND_SDK_MOTORS
                 };
-                let f = hand::decode_strict(&fwd, codec, n).expect("strict");
+                let f = hand::decode_hand(&fwd, codec, n).expect("strict").frame;
                 assert!(f
                     .motors()
                     .iter()

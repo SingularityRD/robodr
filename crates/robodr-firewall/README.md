@@ -172,6 +172,16 @@ deadline. If the gateway **crashes**, the decision is outside this crate and the
 platform's own command timeout (for example a `cmd_vel` watchdog) applies. The
 gateway must be deployed so that this timeout exists.
 
+Two calls keep the twist state honest when a request is not a velocity:
+`Firewall::check_access` checks a request that commands no motion (a
+query, an allowlisted non-velocity call) for its source, rate and
+timestamps only, leaving the channel's motion state (last output,
+acceleration, hold value) as it was; `Firewall::twist_at_rest` records that
+the platform stopped on its own (a velocity command whose duration ended),
+so the next command is ramped from zero and a hold cannot hold the earlier
+velocity. Both were added for the gateway's loco channel (review finding
+F10 a / b).
+
 ## Low-level joint frames (Unitree `LowCmd`)
 
 **Status: decision core, run live in recording mode.** `check_joint` decides on
@@ -299,7 +309,7 @@ rejected (beyond).
 | 8 | slot | `kp > 0`, `q_prev` known, `kp·\|q − q_prev\|` > `f`·`tau_pd_max` | Reject | `joint_pd_torque_out_of_envelope` (Critical) |
 | 9 | clamp | gain > max; `\|tau\|`, `\|dq\|` > max; `q` outside range | Limit: clamp that field | `joint_{gain,torque,velocity,position}_out_of_envelope`, action `Limited` (High) |
 | 9 | clamp | `\|q − q_prev\|` > `max_dq_step`, or `kp·\|q − q_prev\|` > `tau_pd_max` | Limit: move `q` from `q_prev` toward the (range-projected) target by the allowed amount | `joint_step_out_of_envelope` / `joint_pd_torque_out_of_envelope`, action `Limited` (High) |
-| 10 | limp | humanoid: every enabled slot limp (`kp = kd = 0`, or mode off) | Reject | `joint_limp_frame` (Critical) |
+| 10 | limp | humanoid, `balance_critical` channel (default): every enabled slot limp (`kp = kd = 0`, or mode off) | Reject | `joint_limp_frame` (Critical) |
 | 11 | post | output outside the envelope (a bug) | per `FaultPolicy` (humanoid: always hold) | `internal_fault` (Critical) |
 | — | gap | accepted `> max_interval_ns` after the previous accepted frame | (frame decided normally) | `joint_rate_violation` (Medium, recorded only) |
 | — | hold | humanoid: hold older than `max_hold_ns` | keep holding, `tau := 0` in the held frame | `joint_hold_exceeded` (Critical, once per hold episode) |
@@ -376,7 +386,11 @@ makes a standing humanoid fall, so on a `humanoid` platform's joint channel
   source must not be able to command one. `allow_limp` is an explicit,
   reviewable opt-out for joints that may genuinely go slack. Independently, a
   frame in which **every** enabled slot is limp (`kp = kd = 0`, or mode off) is
-  rejected (`joint_limp_frame`) and the last frame held.
+  rejected (`joint_limp_frame`) and the last frame held, on every joint
+  channel whose `balance_critical` is `true` (the default). A channel whose
+  joints are not in the balance loop (a hand: the SDK releases it with
+  `kp = kd = 0`) sets `balance_critical: false`, which lifts only this rule;
+  the gateway accepts that flag on its hand codecs only.
 - **Bounded steps.** Every enabled slot needs `max_dq_step`.
 - A humanoid's twist channel (a request to its own balance controller) keeps
   the normal substitutes.

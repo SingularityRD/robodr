@@ -123,6 +123,32 @@ pub enum UnknownWriters {
     Pass,
 }
 
+/// Robot-side observation (`crate::observe`): an NFLOG **copy** of every
+/// UDP datagram entering the bridge from the robot port. Never queued,
+/// never dropped (the kernel forwards the original at once): it feeds the
+/// arm-SDK engagement check (`rt/lowstate`) and the unqueued-locator check
+/// of the robot's own discovery.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ObserveConfig {
+    /// Default `true`. `false`: no observe rule, no `rt/lowstate` (the
+    /// arm-SDK engagement uses the conservative first-step rule), no
+    /// robot-side locator check.
+    pub enabled: bool,
+    /// NFLOG group (`0..=65535`, default 4174; must not be shared with
+    /// another NFLOG consumer such as ulogd).
+    pub nflog_group: u16,
+}
+
+impl Default for ObserveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            nflog_group: 4174,
+        }
+    }
+}
+
 /// RTPS settings.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -210,6 +236,12 @@ pub enum Codec {
     Ros2Twist,
     /// RTPS DATA, ROS 2 `geometry_msgs/msg/TwistStamped` (`rt/cmd_vel`).
     Ros2TwistStamped,
+    /// RTPS DATA, `unitree_api::msg::dds_::Request_` of the G1 / H2 arm
+    /// action service (`rt/api/arm/request`, `g1_arm_action_api.hpp`:
+    /// `ExecuteAction` 7106, `ExecuteCustomAction` 7108,
+    /// `StopCustomAction` 7113, `GetActionList` 7107): every call but a
+    /// query refused unless in `allowed_api_ids`.
+    UnitreeArmRequest,
 }
 
 /// The humanoid whose locomotion client a `unitree_loco_request` channel
@@ -297,6 +329,7 @@ impl Codec {
             Codec::UnitreeHgArmSdk | Codec::UnitreeGoArmSdk => Some("rt/arm_sdk"),
             Codec::UnitreeHandSdk => Some("rt/hand_sdk"),
             Codec::Ros2Twist | Codec::Ros2TwistStamped => Some("rt/cmd_vel"),
+            Codec::UnitreeArmRequest => Some("rt/api/arm/request"),
             // Loco: by `robot_model`; Dex3: left or right, must be named.
             _ => None,
         }
@@ -324,6 +357,7 @@ impl Codec {
             Codec::UnitreeHandSdk => "unitree_hand_sdk",
             Codec::Ros2Twist => "ros2_twist",
             Codec::Ros2TwistStamped => "ros2_twist_stamped",
+            Codec::UnitreeArmRequest => "unitree_arm_request",
         }
     }
 
@@ -332,7 +366,7 @@ impl Codec {
         match self {
             Codec::UnitreeGoLowcmd | Codec::UnitreeGoArmSdk => "unitree_go::msg::dds_::LowCmd_",
             Codec::UnitreeHgLowcmd | Codec::UnitreeHgArmSdk => "unitree_hg::msg::dds_::LowCmd_",
-            Codec::UnitreeSportRequest | Codec::UnitreeLocoRequest => {
+            Codec::UnitreeSportRequest | Codec::UnitreeLocoRequest | Codec::UnitreeArmRequest => {
                 "unitree_api::msg::dds_::Request_"
             }
             Codec::UnitreeDex3HandCmd => "unitree_hg::msg::dds_::HandCmd_",
@@ -413,6 +447,65 @@ pub struct ChannelConfig {
     /// Arm-SDK codecs: the largest weight forwarded (`[0, 1]`, default 1).
     #[serde(default)]
     pub max_weight: Option<f64>,
+    /// Arm-SDK and hand-SDK codecs: the largest change of the blend weight
+    /// from the last accepted frame (`(0, 1]`, default
+    /// [`DEFAULT_MAX_WEIGHT_STEP`]). Beyond it the frame is refused (an
+    /// integrity failure: a humanoid holds the last accepted frame).
+    #[serde(default)]
+    pub max_weight_step: Option<f64>,
+    /// Arm-SDK and hand-SDK codecs: the largest rate of change of the blend
+    /// weight, per second of gateway clock since the last accepted frame
+    /// (`(0, 1000]`, default [`DEFAULT_MAX_WEIGHT_RATE`]).
+    #[serde(default)]
+    pub max_weight_rate_per_s: Option<f64>,
+    /// Arm-SDK codecs: a weight rising from 0 (the arms handed to the SDK)
+    /// is accepted only when every weighted slot's `q` (gains on) is within
+    /// this distance (rad, `(0, 1]`, default 0.1) of the joint position the
+    /// robot last reported in `rt/lowstate` (observed, never queued; see
+    /// the README, "Arm SDK").
+    #[serde(default)]
+    pub engage_max_q_error: Option<f64>,
+    /// Arm-SDK codecs: the oldest `rt/lowstate` sample the engagement check
+    /// uses (ms, `1..=1000`, default 50).
+    #[serde(default)]
+    pub lowstate_max_age_ms: Option<u64>,
+    /// Arm-SDK codecs: the robot's joint-state topic (default `rt/lowstate`).
+    #[serde(default)]
+    pub lowstate_topic: Option<String>,
+    /// Arm-SDK codecs, no fresh `rt/lowstate`: the weight may leave 0 only
+    /// up to this value (`(0, 1]`, default [`DEFAULT_MAX_WEIGHT_STEP`]) ...
+    #[serde(default)]
+    pub engage_first_step: Option<f64>,
+    /// ... and rise above it only after this many accepted frames
+    /// (`1..=100000`, default 50) whose weighted targets moved by at most
+    /// `engage_stable_q` (rad, `(0, 1]`, default 0.01) from frame to frame.
+    #[serde(default)]
+    pub engage_stable_frames: Option<u32>,
+    #[serde(default)]
+    pub engage_stable_q: Option<f64>,
+    /// Free text for the operator (ignored; at most 500 characters, no
+    /// control characters). The shipped examples explain each channel here.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// Default `max_weight_step` (per accepted frame).
+pub const DEFAULT_MAX_WEIGHT_STEP: f64 = 0.02;
+/// Default `max_weight_rate_per_s` (the SDK examples ramp at 0.2 /s,
+/// `g1_arm7_sdk_dds_example.cpp:106`).
+pub const DEFAULT_MAX_WEIGHT_RATE: f64 = 0.5;
+
+/// The blend-weight dynamics of an arm-SDK / hand-SDK channel (defaults
+/// applied).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WeightDynamics {
+    pub max_step: f64,
+    pub max_rate_per_s: f64,
+    pub engage_max_q_error: f64,
+    pub lowstate_max_age_ns: u64,
+    pub engage_first_step: f64,
+    pub engage_stable_frames: u32,
+    pub engage_stable_q: f64,
 }
 
 impl ChannelConfig {
@@ -428,6 +521,26 @@ impl ChannelConfig {
     /// The loco channel's duration cap (s).
     pub fn max_duration_s(&self) -> f64 {
         self.max_velocity_duration_s.unwrap_or(1.0)
+    }
+
+    /// The blend-weight dynamics (defaults applied).
+    pub fn weight_dynamics(&self) -> WeightDynamics {
+        WeightDynamics {
+            max_step: self.max_weight_step.unwrap_or(DEFAULT_MAX_WEIGHT_STEP),
+            max_rate_per_s: self
+                .max_weight_rate_per_s
+                .unwrap_or(DEFAULT_MAX_WEIGHT_RATE),
+            engage_max_q_error: self.engage_max_q_error.unwrap_or(0.1),
+            lowstate_max_age_ns: self.lowstate_max_age_ms.unwrap_or(50) * 1_000_000,
+            engage_first_step: self.engage_first_step.unwrap_or(DEFAULT_MAX_WEIGHT_STEP),
+            engage_stable_frames: self.engage_stable_frames.unwrap_or(50),
+            engage_stable_q: self.engage_stable_q.unwrap_or(0.01),
+        }
+    }
+
+    /// The arm-SDK channel's joint-state topic.
+    pub fn lowstate_topic(&self) -> &str {
+        self.lowstate_topic.as_deref().unwrap_or("rt/lowstate")
     }
 
     pub fn ports(&self) -> Vec<u16> {
@@ -455,6 +568,9 @@ pub struct GatewayConfig {
     pub queue: QueueConfig,
     #[serde(default)]
     pub rtps: RtpsConfig,
+    /// Robot-side observation (NFLOG copies; see [`ObserveConfig`]).
+    #[serde(default)]
+    pub observe: ObserveConfig,
     pub channels: Vec<ChannelConfig>,
     /// A datagram older than this when the gateway reads it (kernel queue
     /// timestamp) is not checked: the firewall's fault verdict applies
@@ -655,17 +771,29 @@ impl GatewayConfig {
             if c.allowed_api_ids.is_some()
                 && !matches!(
                     c.codec,
-                    Codec::UnitreeSportRequest | Codec::UnitreeLocoRequest
+                    Codec::UnitreeSportRequest
+                        | Codec::UnitreeLocoRequest
+                        | Codec::UnitreeArmRequest
                 )
             {
                 return Err(format!(
-                    "{at}: allowed_api_ids is for unitree_sport_request / unitree_loco_request only"
+                    "{at}: allowed_api_ids is for unitree_sport_request / unitree_loco_request / \
+                     unitree_arm_request only"
                 ));
             }
             let loco = c.codec == Codec::UnitreeLocoRequest;
-            if loco != c.robot_model.is_some() {
+            let needs_model = loco || c.codec == Codec::UnitreeArmRequest;
+            if needs_model != c.robot_model.is_some() {
                 return Err(format!(
-                    "{at}: robot_model is required for unitree_loco_request, and only for it"
+                    "{at}: robot_model is required for unitree_loco_request and \
+                     unitree_arm_request, and only for them"
+                ));
+            }
+            if c.codec == Codec::UnitreeArmRequest
+                && !matches!(c.robot_model, Some(LocoModel::G1 | LocoModel::H2))
+            {
+                return Err(format!(
+                    "{at}: the arm action service exists on robot_model g1 and h2 only"
                 ));
             }
             if !loco && (c.allowed_fsm_ids.is_some() || c.max_velocity_duration_s.is_some()) {
@@ -696,6 +824,62 @@ impl GatewayConfig {
                 if !(w.is_finite() && (0.0..=1.0).contains(&w)) {
                     return Err(format!("{at}: max_weight must be in [0, 1]"));
                 }
+            }
+            let weighted = arm || c.codec == Codec::UnitreeHandSdk;
+            if !weighted && (c.max_weight_step.is_some() || c.max_weight_rate_per_s.is_some()) {
+                return Err(format!(
+                    "{at}: max_weight_step / max_weight_rate_per_s are for the arm-SDK and \
+                     hand-SDK codecs only"
+                ));
+            }
+            if !arm
+                && (c.engage_max_q_error.is_some()
+                    || c.lowstate_max_age_ms.is_some()
+                    || c.lowstate_topic.is_some()
+                    || c.engage_first_step.is_some()
+                    || c.engage_stable_frames.is_some()
+                    || c.engage_stable_q.is_some())
+            {
+                return Err(format!(
+                    "{at}: engage_* / lowstate_* are for the arm-SDK codecs only"
+                ));
+            }
+            let unit = |v: Option<f64>| v.is_none_or(|x| x.is_finite() && x > 0.0 && x <= 1.0);
+            for (k, v) in [
+                ("max_weight_step", c.max_weight_step),
+                ("engage_max_q_error", c.engage_max_q_error),
+                ("engage_first_step", c.engage_first_step),
+                ("engage_stable_q", c.engage_stable_q),
+            ] {
+                if !unit(v) {
+                    return Err(format!("{at}: {k} must be in (0, 1]"));
+                }
+            }
+            if c.max_weight_rate_per_s
+                .is_some_and(|r| !(r.is_finite() && r > 0.0 && r <= 1000.0))
+            {
+                return Err(format!("{at}: max_weight_rate_per_s must be in (0, 1000]"));
+            }
+            if c.lowstate_max_age_ms
+                .is_some_and(|m| !(1..=1000).contains(&m))
+            {
+                return Err(format!("{at}: lowstate_max_age_ms must be in 1..=1000"));
+            }
+            if c.engage_stable_frames
+                .is_some_and(|n| !(1..=100_000).contains(&n))
+            {
+                return Err(format!("{at}: engage_stable_frames must be in 1..=100000"));
+            }
+            if c.lowstate_topic.as_deref().is_some_and(str::is_empty) {
+                return Err(format!("{at}: lowstate_topic is empty"));
+            }
+            if c.note
+                .as_deref()
+                .is_some_and(|n| n.chars().count() > 500 || n.chars().any(char::is_control))
+            {
+                return Err(format!(
+                    "{at}: note: at most 500 characters, no control characters"
+                ));
             }
             for m in &c.allowed_src_macs {
                 if crate::gateway::parse_mac(m).is_none() {

@@ -238,6 +238,16 @@ pub struct JointChannelSpec {
     /// Same for `mode_machine` ([`crate::JointFrame::mode_machine`], the
     /// robot variant the frame is for).
     pub pinned_mode_machine: Option<u8>,
+    /// Humanoid platforms: does this channel drive joints of the balance
+    /// loop? Default `true` (`rt/lowcmd`, `rt/arm_sdk`). `false` lifts only
+    /// the run-time rule that a frame in which **every** enabled slot is
+    /// limp is rejected (stage 10, `joint_limp_frame`), for channels whose
+    /// joints are not in the balance loop: a hand released with
+    /// `kp = kd = 0` (the SDK's `stopMotors`) does not make the robot fall.
+    /// Every other humanoid rule (non-zero gain minimums unless
+    /// `allow_limp`, `max_dq_step`, hold-only substitutes) still applies.
+    /// The gateway accepts `false` only on its hand codecs.
+    pub balance_critical: bool,
 }
 
 impl Default for JointChannelSpec {
@@ -253,6 +263,7 @@ impl Default for JointChannelSpec {
             damping_kd: 0.0,
             pinned_mode_pr: None,
             pinned_mode_machine: None,
+            balance_critical: true,
         }
     }
 }
@@ -293,6 +304,9 @@ pub(crate) struct CompiledJointChannel {
     pub damping_kd: f64,
     /// Platform is a humanoid: never substitute zero / damping / limp.
     pub humanoid: bool,
+    /// Humanoid only: the all-limp frame rule applies (see
+    /// [`JointChannelSpec::balance_critical`]).
+    pub balance_critical: bool,
     /// At least one slot is enabled in the envelope.
     pub any_enabled: bool,
     pub pinned_mode_pr: Option<u8>,
@@ -548,6 +562,7 @@ pub(crate) fn compile_joint_channel(
         max_interval_ns,
         damping_kd: spec.damping_kd,
         humanoid,
+        balance_critical: spec.balance_critical,
         any_enabled: motors.iter().any(|m| m.enabled),
         pinned_mode_pr: spec.pinned_mode_pr,
         pinned_mode_machine: spec.pinned_mode_machine,

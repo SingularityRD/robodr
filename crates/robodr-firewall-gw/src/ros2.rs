@@ -122,6 +122,43 @@ pub fn decode_strict(slot: &[u8], stamped: bool) -> Result<WireTwist, Undecidabl
     })
 }
 
+/// Lenient classification for the unknown-writer probe (review finding
+/// F2): could `slot` be this channel's message in **any** encoding a DDS
+/// reader might accept (XCDR1 or XCDR2, either endianness, `DHEADER`s,
+/// non-zero padding, trailing octets)? Only decides channel membership:
+/// the sample is then decided with [`decode_strict`] and fails closed.
+/// `Twist`: a body of 48..=80 octets (six `float64`, plus up to three
+/// `DHEADER`s and slack). `TwistStamped`: a stamp, a `frame_id` length of
+/// 1..=256 and its text, then six `float64` with at most 48 octets of
+/// headers / padding / trailing data, with or without a leading
+/// `DHEADER`.
+pub fn plausible(slot: &[u8], stamped: bool) -> bool {
+    let Some(r) = slot
+        .get(..2)
+        .and_then(|h| Representation::from_id(u16::from_be_bytes([h[0], h[1]])))
+    else {
+        return false;
+    };
+    if r.is_parameter_list() {
+        return false;
+    }
+    let big = r.endian() == Some(Endian::Big);
+    let body = slot.get(4..).unwrap_or_default();
+    if !stamped {
+        return (48..=80).contains(&body.len());
+    }
+    [0usize, 4].iter().any(|&start| {
+        let Some(len) = u32_at(body, start + 8, big).map(|l| l as usize) else {
+            return false;
+        };
+        if len == 0 || len > MAX_FRAME_ID {
+            return false;
+        }
+        let end = start + 12 + len;
+        body.len() >= end + 48 && body.len() <= end + 48 + 48
+    })
+}
+
 /// Overwrite the twist in `slot` (decoded as `w`) with `v` and verify.
 pub fn write_twist(
     slot: &mut [u8],

@@ -24,7 +24,7 @@ use crate::ip::{parse_ipv4_udp, refresh_udp_checksum};
 use crate::lowcmd::{self, Forwarded, LowCmdCodec, WireLowCmd};
 use crate::rtps::{self, Content, Guid, Sample, SampleKind, WalkOptions};
 use crate::{armsdk, hand, legacy, ros2, sport};
-use robodr_cdr::unitree::{ApiClass, ApiService, FsmMeaning};
+use robodr_cdr::unitree::{ApiClass, ApiService};
 
 /// What to tell the kernel about one queued packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -133,6 +133,25 @@ pub struct GatewayStats {
     pub hand_passed: u64,
     /// Hand frames suppressed (anything the firewall did not pass as is).
     pub hand_suppressed: u64,
+    /// Arm-SDK frames refused for the weight's step per frame (counted in
+    /// `arm_weight_rejected` too).
+    pub arm_weight_step_rejected: u64,
+    /// ... for the weight's rate per second.
+    pub arm_weight_rate_rejected: u64,
+    /// ... for an engagement that could not be verified (targets away from
+    /// `rt/lowstate`, or above the first step without stable targets).
+    pub arm_engage_rejected: u64,
+    /// Hand frames refused for a mode octet / hand-SDK weight (F5; counted
+    /// in `hand_suppressed` too).
+    pub hand_mode_rejected: u64,
+    /// Arm action requests refused (`unitree_arm_request`).
+    pub arm_request_refused: u64,
+    /// Loco twist state reset because a `SetVelocity` duration ended.
+    pub velocity_expired: u64,
+    /// Robot-side packets observed (NFLOG copies; never verdicted).
+    pub observed_packets: u64,
+    /// `rt/lowstate` samples taken from them.
+    pub lowstate_samples: u64,
 }
 
 /// One cached decision for a writer's sequence number.
@@ -247,6 +266,14 @@ struct Channel {
     max_weight: f64,
     /// Hand codecs: the element count (the firewall channel's motors).
     hand_slots: usize,
+    /// Arm-SDK / hand-SDK: the blend weight's dynamics and state.
+    weight_dyn: crate::config::WeightDynamics,
+    arm_weight: armsdk::WeightState,
+    /// Hand SDK: the last forwarded weight × 100 and when.
+    hand_weight: Option<(u8, u64)>,
+    /// Loco: when the robot stops on its own (the last forwarded
+    /// `SetVelocity`'s duration ends), gateway clock.
+    velocity_until: Option<u64>,
     writers: HashMap<Guid, WriterState>,
     max_writers: usize,
     tick: u64,
@@ -265,6 +292,9 @@ impl Channel {
 
     /// The api service and model a request channel decodes for.
     fn api(&self) -> (ApiService, Option<robodr_cdr::unitree::UnitreeModel>) {
+        if self.codec == Codec::UnitreeArmRequest {
+            return (ApiService::Arm, self.robot_model.map(LocoModel::unitree));
+        }
         match self.robot_model {
             Some(LocoModel::H1) => (ApiService::Loco, Some(LocoModel::H1.unitree())),
             Some(m) => (ApiService::Sport, Some(m.unitree())),
@@ -335,6 +365,9 @@ pub struct Gateway {
     samples: Vec<Sample>,
     scratch: Vec<u8>,
     max_queue_delay_ns: u64,
+    /// Robot-side observation (NFLOG copies): `rt/lowstate` and the
+    /// robot's discovery (see [`Gateway::observe`]).
+    observer: crate::observe::Observer,
     pub stats: GatewayStats,
 }
 
@@ -415,6 +448,13 @@ impl Gateway {
                         "{at}: the firewall channel has {} motor slots, codec {} carries {want}",
                         spec.motors.len(),
                         c.codec.as_str()
+                    ));
+                }
+                if !spec.balance_critical && !c.codec.is_hand() {
+                    return Err(format!(
+                        "{at}: balance_critical: false is for hand channels only (a hand is not \
+                         in the balance loop; a body channel that may go all-limp lets a humanoid \
+                         fall)"
                     ));
                 }
                 if let Some(w) = c.weight_slot {
@@ -524,6 +564,10 @@ impl Gateway {
                     .joint_channels
                     .get(&c.firewall_channel)
                     .map_or(0, |s| s.motors.len()),
+                weight_dyn: c.weight_dynamics(),
+                arm_weight: armsdk::WeightState::default(),
+                hand_weight: None,
+                velocity_until: None,
                 writers: HashMap::new(),
                 max_writers: cfg.rtps.max_writers_per_channel,
                 tick: 0,
@@ -554,6 +598,7 @@ impl Gateway {
             samples: Vec::with_capacity(rtps::MAX_SAMPLES),
             scratch: Vec::with_capacity(65_536),
             max_queue_delay_ns: cfg.max_queue_delay_ns,
+            observer: crate::observe::Observer::new(cfg),
             stats: GatewayStats::default(),
         })
     }
@@ -648,6 +693,31 @@ impl Gateway {
         }
     }
 
+    /// Observe one robot-side packet (an NFLOG copy of what entered the
+    /// bridge from the robot port; `crate::observe`). Never changes or
+    /// drops anything: the packet is already on its way. Learns the
+    /// robot's discovery (the unqueued-locator check, F7) and its
+    /// `rt/lowstate` (the arm-SDK engagement check, F1).
+    pub fn observe(&mut self, pkt: &[u8], meta: PacketMeta) {
+        self.stats.observed_packets += 1;
+        let Some(d) = crate::observe::udp_payload(pkt) else {
+            return;
+        };
+        if d.get(..4) != Some(b"RTPS") {
+            return;
+        }
+        if let Some(report) = self.discovery.observe_robot(d) {
+            self.observer.learn(&report);
+        }
+        let n = self.observer.lowstate(d, meta.now_ns);
+        self.stats.lowstate_samples += n;
+    }
+
+    /// The robot-side observer (status, tests).
+    pub fn observer(&self) -> &crate::observe::Observer {
+        &self.observer
+    }
+
     // ------------------------------------------------------------- RTPS
 
     /// `Ok(modified)`, or `Err` if the datagram is undecidable as a whole.
@@ -732,6 +802,12 @@ impl Gateway {
         Ok(self.probe(d, s))
     }
 
+    /// Classify an unknown writer's sample by content. **Lenient** (review
+    /// finding F2): a match decides channel membership only (any
+    /// representation, padding and trailing octets ignored, element counts
+    /// from the length too); the sample is then decided **strictly** on
+    /// that channel, so a non-canonical encoding fails closed instead of
+    /// being classified as nothing and passed.
     fn probe(&mut self, d: &[u8], s: &Sample) -> Option<usize> {
         let slot = d.get(s.payload.clone()?)?;
         // Each channel's content match and its priority (lower first): a
@@ -758,18 +834,27 @@ impl Gateway {
                 // as sport rather than passed unchecked. Loco: the humanoid
                 // locomotion ids (7001..=7199 on service `sport`, 8001..=8299
                 // on H1's `loco`).
-                Codec::UnitreeSportRequest | Codec::UnitreeLocoRequest => {
+                Codec::UnitreeSportRequest
+                | Codec::UnitreeLocoRequest
+                | Codec::UnitreeArmRequest => {
                     match decode_unitree(UnitreeKind::ApiRequest, slot, &Limits::default()) {
                         Ok(m) => match m.message {
                             UnitreeMessage::ApiRequest(r) => {
                                 let id = r.dispatched_api_id();
                                 let hit = !r.api_id_in_range()
-                                    || if c.codec == Codec::UnitreeSportRequest {
-                                        (1001..=1199).contains(&id)
-                                    } else {
-                                        (7001..=7199).contains(&id) || (8001..=8299).contains(&id)
+                                    || match c.codec {
+                                        Codec::UnitreeSportRequest => (1001..=1199).contains(&id),
+                                        Codec::UnitreeArmRequest => (7106..=7113).contains(&id),
+                                        _ => {
+                                            (7001..=7199).contains(&id)
+                                                || (8001..=8299).contains(&id)
+                                        }
                                     };
-                                hit.then_some(0)
+                                hit.then_some(if c.codec == Codec::UnitreeArmRequest {
+                                    1
+                                } else {
+                                    0
+                                })
                             }
                             _ => None,
                         },
@@ -777,14 +862,10 @@ impl Gateway {
                     }
                 }
                 Codec::UnitreeDex3HandCmd | Codec::UnitreeHandSdk => {
-                    hand::decode_strict(slot, c.codec, c.hand_slots)
-                        .is_ok()
-                        .then_some(2)
+                    hand::plausible(slot, c.codec, c.hand_slots).then_some(2)
                 }
                 Codec::Ros2Twist | Codec::Ros2TwistStamped => {
-                    ros2::decode_strict(slot, c.codec == Codec::Ros2TwistStamped)
-                        .is_ok()
-                        .then_some(2)
+                    ros2::plausible(slot, c.codec == Codec::Ros2TwistStamped).then_some(3)
                 }
                 Codec::Go1HighCmd | Codec::Go1LowCmd => None,
             }
@@ -1042,6 +1123,7 @@ impl Gateway {
                 self.sport_sample(ci, slot, source, now, late, emit)
             }
             Some(Codec::UnitreeLocoRequest) => self.loco_sample(ci, slot, source, now, late, emit),
+            Some(Codec::UnitreeArmRequest) => self.arm_request_sample(ci, slot, source, now),
             Some(Codec::Ros2Twist | Codec::Ros2TwistStamped) => {
                 self.ros2_sample(ci, slot, source, now, late, emit)
             }
@@ -1092,12 +1174,29 @@ impl Gateway {
             self.stats.non_motor_rejected += 1;
             decoded = None;
         }
+        let mut engage_verified = false;
         if let (Some(w), Some(d)) = (weight, decoded.as_ref()) {
             if !armsdk::weight_ok(&d.msg, w, max_weight) {
                 // The arm-SDK blend weight out of bounds: an integrity
                 // failure (crate::armsdk).
                 self.stats.arm_weight_rejected += 1;
                 decoded = None;
+            } else {
+                // Its dynamics (review finding F1): step, rate, engagement.
+                let lowstate = self.observer.joint_state(codec);
+                match armsdk::weight_gate(&d.msg, w, &ch.arm_weight, &ch.weight_dyn, now, lowstate)
+                {
+                    Ok(v) => engage_verified = v,
+                    Err(r) => {
+                        self.stats.arm_weight_rejected += 1;
+                        match r {
+                            armsdk::WeightRefusal::Step => self.stats.arm_weight_step_rejected += 1,
+                            armsdk::WeightRefusal::Rate => self.stats.arm_weight_rate_rejected += 1,
+                            armsdk::WeightRefusal::Engage => self.stats.arm_engage_rejected += 1,
+                        }
+                        decoded = None;
+                    }
+                }
             }
         }
         let frame = match decoded.as_ref().and_then(|d| match weight {
@@ -1134,6 +1233,16 @@ impl Gateway {
                         header: d.header,
                     });
                 }
+                if let (Some(w), Some(d)) = (weight, decoded.as_ref()) {
+                    ch.arm_weight = armsdk::accepted(
+                        &d.msg,
+                        w,
+                        &ch.arm_weight,
+                        &ch.weight_dyn,
+                        now,
+                        engage_verified,
+                    );
+                }
                 Outcome::Pass
             }
             JointVerdict::Limited { cmd, .. } => {
@@ -1152,6 +1261,16 @@ impl Gateway {
                             wire,
                             header: d.header,
                         });
+                        if let Some(w) = weight {
+                            ch.arm_weight = armsdk::accepted(
+                                &wire,
+                                w,
+                                &ch.arm_weight,
+                                &ch.weight_dyn,
+                                now,
+                                engage_verified,
+                            );
+                        }
                         self.stats.limited += 1;
                         Outcome::Rewritten
                     }
@@ -1228,6 +1347,19 @@ impl Gateway {
         }
     }
 
+    /// Source / rate check of a request that commands no motion (a query,
+    /// an allowlisted call, an unreadable request recorded as non-finite):
+    /// the twist state is left as it was (review finding F10 b).
+    fn access_check(&mut self, id: ChannelId, source: SourceId, now: u64, motion: Motion) -> bool {
+        let cmd = Command {
+            source,
+            channel: id,
+            stamp_ns: now,
+            motion,
+        };
+        self.fw.check_access(&cmd, now)
+    }
+
     fn sport_sample(
         &mut self,
         ci: usize,
@@ -1248,8 +1380,7 @@ impl Gateway {
                 self.stats.undecidable += 1;
                 // Recorded as an unreadable velocity (non-finite); the
                 // request cannot carry a substitute.
-                let _ =
-                    self.twist_check(id, source, now, twist(f64::NAN, f64::NAN, f64::NAN), false);
+                self.access_check(id, source, now, twist(f64::NAN, f64::NAN, f64::NAN));
                 return Outcome::Suppress;
             }
         };
@@ -1263,26 +1394,39 @@ impl Gateway {
             // the default duration cap.
             return self.set_velocity(ci, slot, &req, source, now, late, emit);
         }
-        let velocity = match req.call {
-            ApiCall::Move { vx, vy, vyaw } => Some(twist(vx, vy, vyaw)),
+        let motion = match req.call {
+            ApiCall::Move { vx, vy, vyaw } => twist(vx, vy, vyaw),
             ApiCall::Malformed {
                 intended: robodr_cdr::unitree::ApiClass::Velocity,
                 ..
-            } => Some(twist(f64::NAN, f64::NAN, f64::NAN)),
-            _ => None,
-        };
-        let Some(motion) = velocity else {
-            // Not a velocity call: allowlist (a stop is always allowed),
-            // then the source / rate check as a zero-velocity command.
-            let is_stop = req.call == ApiCall::StopMove;
-            if !is_stop && allow.as_ref().is_some_and(|a| !a.contains(&req.api_id)) {
-                self.stats.not_allowlisted += 1;
+            } => {
+                // A malformed `Move` is recorded (non-finite) and
+                // suppressed, never turned into a substitute (F10 c).
+                self.stats.undecidable += 1;
+                self.access_check(id, source, now, twist(f64::NAN, f64::NAN, f64::NAN));
                 return Outcome::Suppress;
             }
-            return match self.twist_check(id, source, now, twist(0.0, 0.0, 0.0), late) {
-                FwVerdict::Passed { .. } | FwVerdict::Limited { .. } => Outcome::Pass,
-                FwVerdict::Rejected { .. } => Outcome::Suppress,
-            };
+            ApiCall::StopMove => {
+                // A stop: checked as the zero velocity it commands (the
+                // robot stops, the twist state follows).
+                return match self.twist_check(id, source, now, twist(0.0, 0.0, 0.0), late) {
+                    FwVerdict::Passed { .. } | FwVerdict::Limited { .. } => Outcome::Pass,
+                    FwVerdict::Rejected { .. } => Outcome::Suppress,
+                };
+            }
+            _ => {
+                // Not a velocity call: allowlist, then the source / rate
+                // check only (the twist state is not touched, F10 b).
+                if allow.as_ref().is_some_and(|a| !a.contains(&req.api_id)) {
+                    self.stats.not_allowlisted += 1;
+                    return Outcome::Suppress;
+                }
+                return if self.access_check(id, source, now, twist(0.0, 0.0, 0.0)) {
+                    Outcome::Pass
+                } else {
+                    Outcome::Suppress
+                };
+            }
         };
         match self.twist_check(id, source, now, motion, late) {
             FwVerdict::Passed { .. } => Outcome::Pass,
@@ -1323,6 +1467,22 @@ impl Gateway {
 
     // ------------------------------------------------------------ loco
 
+    /// A `SetVelocity` lasts its duration: once the last forwarded one has
+    /// ended, the robot stands, and the twist state says so (F10 a).
+    fn expire_velocity(&mut self, ci: usize, now: u64) {
+        let Some(ch) = self.channels.get_mut(ci) else {
+            return;
+        };
+        if let Some(until) = ch.velocity_until {
+            if now > until {
+                ch.velocity_until = None;
+                let id = ch.id;
+                self.fw.twist_at_rest(id, until);
+                self.stats.velocity_expired += 1;
+            }
+        }
+    }
+
     /// A humanoid locomotion request (`unitree_loco_request`; see the
     /// README, "Loco requests", for every SDK id and why).
     fn loco_sample(
@@ -1334,6 +1494,7 @@ impl Gateway {
         late: bool,
         emit: bool,
     ) -> Outcome {
+        self.expire_velocity(ci, now);
         let Some(ch) = self.channels.get(ci) else {
             return Outcome::Suppress;
         };
@@ -1345,8 +1506,7 @@ impl Gateway {
             Ok(r) => r,
             Err(_) => {
                 self.stats.undecidable += 1;
-                let _ =
-                    self.twist_check(id, source, now, twist(f64::NAN, f64::NAN, f64::NAN), false);
+                self.access_check(id, source, now, twist(f64::NAN, f64::NAN, f64::NAN));
                 return Outcome::Suppress;
             }
         };
@@ -1360,13 +1520,12 @@ impl Gateway {
                 intended: ApiClass::Velocity,
                 ..
             } => return self.set_velocity(ci, slot, &req, source, now, late, emit),
-            // The walking controller (`Start`) keeps the robot balanced;
-            // every other FSM state (ZeroTorque, Damp: limp, the robot
-            // falls; Squat / Sit / StandUp / lie down: whole-body motion)
-            // only when the site listed it.
-            ApiCall::SetFsmId { fsm_id, meaning } => {
-                meaning == FsmMeaning::Start
-                    || allow_fsm.as_ref().is_some_and(|a| a.contains(&fsm_id))
+            // Every FSM state only when the site listed it: `ZeroTorque`,
+            // `Damp` (limp, the robot falls), the posture transitions
+            // (whole-body motion), and `Start` too (F10 e: it hands the
+            // robot to the walking controller from any state).
+            ApiCall::SetFsmId { fsm_id, .. } => {
+                allow_fsm.as_ref().is_some_and(|a| a.contains(&fsm_id))
             }
             ApiCall::Other {
                 class: ApiClass::Query,
@@ -1382,16 +1541,72 @@ impl Gateway {
             self.stats.loco_refused += 1;
             return Outcome::Suppress;
         }
-        match self.twist_check(id, source, now, twist(0.0, 0.0, 0.0), late) {
-            FwVerdict::Passed { .. } | FwVerdict::Limited { .. } => Outcome::Pass,
-            FwVerdict::Rejected { .. } => Outcome::Suppress,
+        // No motion of its own: source / rate only (F10 b).
+        if self.access_check(id, source, now, twist(0.0, 0.0, 0.0)) {
+            Outcome::Pass
+        } else {
+            Outcome::Suppress
         }
     }
 
-    /// A `SetVelocity` (or a malformed one): the body velocity is decided
-    /// as a twist `(vx, vy, 0) / (0, 0, vyaw)`, the duration is capped at
-    /// the channel's `max_velocity_duration_s` (default 1 s); a limited or
-    /// substitute velocity and a capped duration are written in place.
+    /// The G1 / H2 arm action service (`unitree_arm_request`, F10 f): a
+    /// query passes the source / rate check; every other call (an action,
+    /// a custom action, its stop, an unknown id, a malformed parameter) only
+    /// when `allowed_api_ids` lists it.
+    fn arm_request_sample(
+        &mut self,
+        ci: usize,
+        slot: &mut [u8],
+        source: SourceId,
+        now: u64,
+    ) -> Outcome {
+        let Some(ch) = self.channels.get(ci) else {
+            return Outcome::Suppress;
+        };
+        let id = ch.id;
+        let (service, model) = ch.api();
+        let allow_api = ch.allowed_api_ids.clone();
+        let req = match sport::decode_strict_for(slot, service, model) {
+            Ok(r) => r,
+            Err(_) => {
+                self.stats.undecidable += 1;
+                self.access_check(id, source, now, twist(f64::NAN, f64::NAN, f64::NAN));
+                return Outcome::Suppress;
+            }
+        };
+        if i32::try_from(req.api_id).is_err() {
+            self.stats.api_alias += 1;
+            return Outcome::Suppress;
+        }
+        let allowed = match req.call {
+            ApiCall::Other {
+                class: ApiClass::Query,
+                ..
+            } => true,
+            ApiCall::Other { api_id, .. } => {
+                allow_api.as_ref().is_some_and(|a| a.contains(&api_id))
+            }
+            _ => false,
+        };
+        if !allowed {
+            self.stats.arm_request_refused += 1;
+            return Outcome::Suppress;
+        }
+        if self.access_check(id, source, now, twist(0.0, 0.0, 0.0)) {
+            Outcome::Pass
+        } else {
+            Outcome::Suppress
+        }
+    }
+
+    /// A `SetVelocity`: the body velocity is decided as a twist
+    /// `(vx, vy, 0) / (0, 0, vyaw)`, the duration is capped at the
+    /// channel's `max_velocity_duration_s` (default 1 s); a limited or
+    /// substitute velocity and a capped duration are written in place. A
+    /// malformed one (unreadable velocity, negative / non-finite duration)
+    /// is recorded as non-finite and suppressed, never turned into a
+    /// substitute (F10 c). What is forwarded sets when the robot stops on
+    /// its own (F10 a).
     #[allow(clippy::too_many_arguments)]
     fn set_velocity(
         &mut self,
@@ -1403,6 +1618,7 @@ impl Gateway {
         late: bool,
         emit: bool,
     ) -> Outcome {
+        self.expire_velocity(ci, now);
         let Some(ch) = self.channels.get(ci) else {
             return Outcome::Suppress;
         };
@@ -1416,9 +1632,11 @@ impl Gateway {
                 vyaw,
                 duration,
             } if duration.is_finite() && duration >= 0.0 => (twist(vx, vy, vyaw), duration),
-            // A negative / non-finite duration, or an unreadable velocity:
-            // decided as a non-finite command (refused).
-            _ => (twist(f64::NAN, f64::NAN, f64::NAN), cap),
+            _ => {
+                self.stats.undecidable += 1;
+                self.access_check(id, source, now, twist(f64::NAN, f64::NAN, f64::NAN));
+                return Outcome::Suppress;
+            }
         };
         let d = duration.min(cap);
         let mut write = |gw: &mut Self, v: [f64; 3]| -> bool {
@@ -1427,7 +1645,7 @@ impl Gateway {
                 false
             }
         };
-        match self.twist_check(id, source, now, motion, late) {
+        let out = match self.twist_check(id, source, now, motion, late) {
             FwVerdict::Passed { cmd, .. } if duration > cap => match twist_values(&cmd) {
                 Some(v) if write(self, v) => {
                     self.stats.duration_capped += 1;
@@ -1466,7 +1684,14 @@ impl Gateway {
             FwVerdict::Rejected {
                 substitute: None, ..
             } => Outcome::Suppress,
+        };
+        if out != Outcome::Suppress {
+            if let Some(ch) = self.channels.get_mut(ci) {
+                let ns = (d * 1e9).min(u64::MAX as f64) as u64;
+                ch.velocity_until = Some(now.saturating_add(ns));
+            }
         }
+        out
     }
 
     // ------------------------------------------------------------ ROS 2
@@ -1542,8 +1767,9 @@ impl Gateway {
 
     // ------------------------------------------------------------ hands
 
-    /// A hand command (`crate::hand`): decided on the finger joints,
-    /// forwarded unchanged when the firewall passes it, else suppressed.
+    /// A hand command (`crate::hand`): the mode octets and the hand-SDK
+    /// weight checked (F5), then decided on the finger joints, forwarded
+    /// unchanged when the firewall passes it, else suppressed.
     fn hand_sample(
         &mut self,
         ci: usize,
@@ -1557,9 +1783,33 @@ impl Gateway {
         };
         let id = ch.id;
         let n = ch.hand_slots;
-        let decoded = hand::decode_strict(slot, ch.codec, n).ok();
+        let dynamics = ch.weight_dyn;
+        let last_weight = ch.hand_weight;
+        let mut decoded = match hand::decode_hand(slot, ch.codec, n) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                if e == crate::lowcmd::Undecidable::Mode {
+                    self.stats.hand_mode_rejected += 1;
+                }
+                None
+            }
+        };
+        // Hand SDK: the blend weight's step and rate from the last
+        // forwarded frame (none yet: from 0).
+        if let Some(w) = decoded.and_then(|h| h.weight) {
+            let (w0, t0) = last_weight.map_or((0, None), |(w, t)| (w, Some(t)));
+            let dw = f64::from(w.abs_diff(w0)) / f64::from(hand::HAND_SDK_WEIGHT_SCALE);
+            let step_ok = dw <= dynamics.max_step + 1e-9;
+            let rate_ok = t0.is_none_or(|t| {
+                dw <= dynamics.max_rate_per_s * (now.saturating_sub(t) as f64 * 1e-9) + 1e-9
+            });
+            if !(step_ok && rate_ok) {
+                self.stats.hand_mode_rejected += 1;
+                decoded = None;
+            }
+        }
         let frame = match decoded {
-            Some(f) => f,
+            Some(h) => h.frame,
             None => {
                 self.stats.undecidable += 1;
                 match JointFrame::new(n, Some(false)) {
@@ -1574,8 +1824,13 @@ impl Gateway {
         } else {
             self.fw.check_joint(&cmd, now)
         };
-        match v {
-            JointVerdict::Passed { .. } if decoded.is_some() => {
+        match (v, decoded) {
+            (JointVerdict::Passed { would_have, .. }, Some(h)) => {
+                if would_have.is_none() {
+                    if let (Some(w), Some(ch)) = (h.weight, self.channels.get_mut(ci)) {
+                        ch.hand_weight = Some((w, now));
+                    }
+                }
                 self.stats.hand_passed += 1;
                 Outcome::Pass
             }

@@ -26,15 +26,208 @@
 //!   rate and substitute rules apply: a humanoid holds the last accepted
 //!   frame).
 //!
+//! **The weight's dynamics** ([`weight_gate`], review finding F1). A
+//! bounded weight is not enough: `0 → 1 → 0 → 1` on consecutive frames
+//! snaps the arms between the locomotion pose and the SDK's targets at full
+//! gains. Relative to the last **accepted** frame's weight `w0` (0 when
+//! none):
+//!
+//! - `|w − w0| <= max_weight_step` (per accepted frame, default 0.02) and
+//!   `|w − w0| <= max_weight_rate_per_s · Δt` (Δt since that frame, default
+//!   0.5 /s; the SDK examples ramp at 0.2 /s);
+//! - **engagement** (the weight rising from 0, or a first frame after a
+//!   gateway start): when the robot's own joint positions are known (a
+//!   `rt/lowstate` sample the gateway observed on the robot side within
+//!   `lowstate_max_age_ms`), every weighted slot (a slot with `kp > 0`)
+//!   must target a `q` within `engage_max_q_error` of the measured one: the
+//!   hand-over then starts where the arm is (the SDK example
+//!   `g1_arm7_sdk_dds_example.cpp:132-160` reads `rt/lowstate` and starts
+//!   from it). A first frame after a gateway start that passes this check
+//!   may carry any weight (the stream was already engaged). Without a
+//!   fresh `rt/lowstate` the weight may leave 0 only up to
+//!   `engage_first_step` and rise beyond it only after
+//!   `engage_stable_frames` accepted frames whose weighted targets moved by
+//!   at most `engage_stable_q`, i.e. once the arms had time to settle at
+//!   the small blend.
+//!
+//! A frame outside these rules is an integrity failure like a weight out
+//! of range: the humanoid holds the last accepted frame (its weight
+//! included), nothing is forwarded before a first accepted frame.
+//!
 //! Rewrites keep the weight slot bit-exact from the input (a limited
 //! frame) or from the last accepted frame (a hold; with none, the weight
 //! is 0: the arms go back to the locomotion controller, which keeps the
 //! robot balanced).
 
-use robodr_firewall::{JointFrame, MotorCmd, MotorMode};
+use robodr_firewall::{JointFrame, MotorCmd, MotorMode, MAX_MOTORS};
 
+use crate::config::WeightDynamics;
 use crate::lowcmd::{self, Forwarded, LowCmdCodec, RewriteError, WireLowCmd, WireMotor};
 use crate::round;
+
+/// Slack on weight comparisons (the weight is an `f32` on the wire).
+const EPS: f64 = 1e-6;
+
+/// The robot's measured joint positions (`rt/lowstate`, observed on the
+/// robot side) and when the gateway saw them (its clock).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JointState {
+    pub q: [f32; MAX_MOTORS],
+    pub slots: usize,
+    pub at_ns: u64,
+}
+
+/// The blend-weight state of an arm-SDK channel (accepted frames only).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct WeightState {
+    /// Weight of the last accepted frame and its gateway time.
+    pub last: Option<(f64, u64)>,
+    /// The current engagement was verified (against `rt/lowstate`, or by
+    /// the stable-targets rule).
+    pub verified: bool,
+    /// Accepted frames in a row with stable weighted targets while engaged
+    /// at most `engage_first_step` without verification.
+    pub stable: u32,
+    /// Weighted targets of the last accepted frame (`NaN`: not weighted).
+    pub last_q: Option<[f32; MAX_MOTORS]>,
+}
+
+/// Why [`weight_gate`] refused a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightRefusal {
+    /// More than `max_weight_step` from the last accepted weight.
+    Step,
+    /// Faster than `max_weight_rate_per_s`.
+    Rate,
+    /// Engagement not verified (targets away from `rt/lowstate`, or above
+    /// the first step without stable targets).
+    Engage,
+}
+
+/// The weighted slots' targets (slots with `kp > 0`, the weight slot
+/// excluded; `NaN` elsewhere).
+pub fn weighted_q(msg: &WireLowCmd, weight_slot: usize) -> [f32; MAX_MOTORS] {
+    let mut q = [f32::NAN; MAX_MOTORS];
+    for (i, dst) in q.iter_mut().enumerate().take(msg.slots()) {
+        if i == weight_slot {
+            continue;
+        }
+        if let Some(m) = msg.motor(i) {
+            if m.kp != 0.0 {
+                *dst = m.q;
+            }
+        }
+    }
+    q
+}
+
+/// Is every weighted target of `q` within `tol` of `state` (a weighted slot
+/// the state does not cover fails)?
+fn close_to(q: &[f32; MAX_MOTORS], state: &JointState, tol: f64) -> bool {
+    q.iter().enumerate().all(|(i, t)| {
+        if t.is_nan() {
+            return true;
+        }
+        i < state.slots
+            && state
+                .q
+                .get(i)
+                .is_some_and(|m| (f64::from(*t) - f64::from(*m)).abs() <= tol)
+    })
+}
+
+/// Decide the blend weight's dynamics of `msg` (module docs). `Ok(verified)`
+/// tells whether the engagement is verified after this frame.
+pub fn weight_gate(
+    msg: &WireLowCmd,
+    weight_slot: usize,
+    st: &WeightState,
+    d: &WeightDynamics,
+    now: u64,
+    lowstate: Option<&JointState>,
+) -> Result<bool, WeightRefusal> {
+    let w = msg.motor(weight_slot).map_or(f64::NAN, |m| f64::from(m.q));
+    if !w.is_finite() {
+        return Err(WeightRefusal::Step);
+    }
+    let q = weighted_q(msg, weight_slot);
+    // A state measured just after the frame arrived (it is not applied
+    // yet) is as good as one just before it.
+    let fresh = lowstate.filter(|l| l.at_ns.abs_diff(now) <= d.lowstate_max_age_ns);
+    let matches_robot = fresh.is_some_and(|l| close_to(&q, l, d.engage_max_q_error));
+    let Some((w0, t0)) = st.last else {
+        // A first frame (gateway start): from rest, or a stream already
+        // engaged whose targets are where the arms are.
+        return if w == 0.0 {
+            Ok(false)
+        } else if matches_robot {
+            Ok(true)
+        } else if fresh.is_none() && w <= d.max_step.min(d.engage_first_step) + EPS {
+            Ok(false)
+        } else {
+            Err(WeightRefusal::Engage)
+        };
+    };
+    let dw = (w - w0).abs();
+    if dw > d.max_step + EPS {
+        return Err(WeightRefusal::Step);
+    }
+    let dt = now.saturating_sub(t0) as f64 * 1e-9;
+    if dw > d.max_rate_per_s * dt + EPS {
+        return Err(WeightRefusal::Rate);
+    }
+    if w <= w0 + EPS {
+        return Ok(st.verified && w > 0.0);
+    }
+    if w0 == 0.0 {
+        // Engaging from 0.
+        return match fresh {
+            Some(_) if matches_robot => Ok(true),
+            Some(_) => Err(WeightRefusal::Engage),
+            None if w <= d.engage_first_step + EPS => Ok(false),
+            None => Err(WeightRefusal::Engage),
+        };
+    }
+    if st.verified || w <= d.engage_first_step + EPS {
+        return Ok(st.verified);
+    }
+    if st.stable >= d.engage_stable_frames {
+        Ok(true)
+    } else {
+        Err(WeightRefusal::Engage)
+    }
+}
+
+/// The state after an accepted frame (`msg` as forwarded).
+pub fn accepted(
+    msg: &WireLowCmd,
+    weight_slot: usize,
+    st: &WeightState,
+    d: &WeightDynamics,
+    now: u64,
+    verified: bool,
+) -> WeightState {
+    let w = msg.motor(weight_slot).map_or(0.0, |m| f64::from(m.q));
+    let q = weighted_q(msg, weight_slot);
+    let stable_q = st.last_q.is_some_and(|p| {
+        q.iter().zip(p.iter()).all(|(a, b)| {
+            (a.is_nan() && b.is_nan()) || (f64::from(*a) - f64::from(*b)).abs() <= d.engage_stable_q
+        })
+    });
+    let stable = if w == 0.0 || verified {
+        0
+    } else if stable_q {
+        st.stable.saturating_add(1)
+    } else {
+        0
+    };
+    WeightState {
+        last: Some((w, now)),
+        verified: verified && w > 0.0,
+        stable,
+        last_q: Some(q),
+    }
+}
 
 /// Is the weight slot a valid blend weight (module docs)?
 pub fn weight_ok(msg: &WireLowCmd, slot: usize, max_weight: f64) -> bool {

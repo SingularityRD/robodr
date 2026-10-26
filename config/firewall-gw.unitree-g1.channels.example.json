@@ -1,0 +1,100 @@
+{
+  "mode": "enforce",
+  "profile": "/etc/robodr/profile.json",
+  "profile_trust": {
+    "trusted_keys": "/etc/robodr/profile-trust.json",
+    "state_file": "/var/lib/robodr/profile-state/agentd.json"
+  },
+  "firewall": "/etc/robodr/firewall.json",
+  "queue": {
+    "num": 0,
+    "on_gateway_down": "fail_closed",
+    "max_len": 1024,
+    "controller_port": "enp2s0",
+    "robot_port": "enp3s0"
+  },
+  "rtps": {
+    "domain_ids": [
+      0
+    ],
+    "malformed_datagram": "drop",
+    "unknown_writers": "probe",
+    "state_file": "/var/lib/robodr/firewall-gw/writers.json"
+  },
+  "channels": [
+    {
+      "firewall_channel": "/lowcmd",
+      "codec": "unitree_hg_lowcmd",
+      "allowed_src_ips": [
+        "192.168.123.164"
+      ],
+      "note": "rt/lowcmd: every motor of the balance loop (35 slots, hg LowCmd_). Usually not written by a user controller while the robot walks: keep it enforced anyway."
+    },
+    {
+      "firewall_channel": "/arm_sdk",
+      "codec": "unitree_hg_arm_sdk",
+      "weight_slot": 29,
+      "allowed_src_ips": [
+        "192.168.123.164"
+      ],
+      "max_weight": 1.0,
+      "max_weight_step": 0.02,
+      "max_weight_rate_per_s": 0.5,
+      "engage_max_q_error": 0.1,
+      "lowstate_max_age_ms": 50,
+      "lowstate_topic": "rt/lowstate",
+      "engage_first_step": 0.02,
+      "engage_stable_frames": 50,
+      "engage_stable_q": 0.01,
+      "note": "rt/arm_sdk (G1 weight slot 29 = kNotUsedJoint). The blend weight moves at most 0.02 per frame and 0.5 /s; it leaves 0 only where rt/lowstate (observed) says the arms are, or by 0.02 until the targets were stable for 50 frames. The SDK example g1_arm7_sdk_dds_example sets the weight to 1 at once from the measured pose: for it set max_weight_step 1.0 and max_weight_rate_per_s 1000 (the rt/lowstate check then gates the hand-over)."
+    },
+    {
+      "firewall_channel": "/loco",
+      "codec": "unitree_loco_request",
+      "robot_model": "g1",
+      "allowed_src_ips": [
+        "192.168.123.164"
+      ],
+      "allowed_fsm_ids": [],
+      "allowed_api_ids": [],
+      "max_velocity_duration_s": 1.0,
+      "note": "rt/api/sport/request (G1 locomotion client, ids 7xxx). SetVelocity limited and its duration capped at 1 s; every SetFsmId refused unless listed (500 = Start, 0 = ZeroTorque, 1 = Damp, 2 = Squat, 3 = Sit, 4 = StandUp): list 500 if this controller starts the walking controller; queries pass."
+    },
+    {
+      "firewall_channel": "/dex3_left",
+      "codec": "unitree_dex3_hand_cmd",
+      "topic": "rt/dex3/left/cmd",
+      "allowed_src_ips": [
+        "192.168.123.164"
+      ],
+      "note": "Dex3 left hand: mode octets must be the SDK's (motor id = index, status 1, timeout 0/1); frames passed unchanged or suppressed. The firewall channel is balance_critical false (a hand may be released)."
+    },
+    {
+      "firewall_channel": "/dex3_right",
+      "codec": "unitree_dex3_hand_cmd",
+      "topic": "rt/dex3/right/cmd",
+      "allowed_src_ips": [
+        "192.168.123.164"
+      ],
+      "note": "Dex3 right hand (as left)."
+    },
+    {
+      "firewall_channel": "/arm_action",
+      "codec": "unitree_arm_request",
+      "robot_model": "g1",
+      "allowed_src_ips": [
+        "192.168.123.164"
+      ],
+      "allowed_api_ids": [],
+      "note": "rt/api/arm/request (G1 arm actions): ExecuteAction 7106, ExecuteCustomAction 7108 and StopCustomAction 7113 refused unless listed; GetActionList passes."
+    }
+  ],
+  "max_queue_delay_ns": 5000000,
+  "events_path": "/var/lib/robodr/firewall-gw/events.jsonl",
+  "status_path": "/var/lib/robodr/firewall-gw/status.json",
+  "housekeeping_ms": 100,
+  "observe": {
+    "enabled": true,
+    "nflog_group": 4174
+  }
+}

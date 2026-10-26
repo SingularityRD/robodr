@@ -1,0 +1,65 @@
+{
+  "mode": "enforce",
+  "profile": "/etc/robodr/profile.json",
+  "profile_trust": {
+    "trusted_keys": "/etc/robodr/profile-trust.json",
+    "state_file": "/var/lib/robodr/profile-state/agentd.json"
+  },
+  "firewall": "/etc/robodr/firewall.json",
+  "queue": {
+    "num": 0,
+    "on_gateway_down": "fail_closed",
+    "max_len": 1024,
+    "controller_port": "enp2s0",
+    "robot_port": "enp3s0"
+  },
+  "rtps": {
+    "domain_ids": [
+      0
+    ],
+    "malformed_datagram": "drop",
+    "unknown_writers": "probe",
+    "state_file": "/var/lib/robodr/firewall-gw/writers.json"
+  },
+  "channels": [
+    {
+      "firewall_channel": "/lowcmd",
+      "codec": "unitree_go_lowcmd",
+      "allowed_src_ips": [
+        "192.168.123.164"
+      ],
+      "note": "rt/lowcmd (go LowCmd_, 20 slots); bms_cmd.off refused."
+    },
+    {
+      "firewall_channel": "/api/sport/request",
+      "codec": "unitree_sport_request",
+      "allowed_src_ips": [
+        "192.168.123.164"
+      ],
+      "allowed_api_ids": [
+        1002,
+        1003,
+        1004,
+        1006,
+        1008
+      ],
+      "note": "rt/api/sport/request (Go2 sport mode): Move limited; StopMove always passes; only the listed calls otherwise (1002 BalanceStand, 1004 StandUp, 1006 RecoveryStand). Damp (1001) and StandDown (1005) are not listed: a site that uses them adds them explicitly."
+    },
+    {
+      "firewall_channel": "/cmd_vel",
+      "codec": "ros2_twist",
+      "allowed_src_ips": [
+        "192.168.123.164"
+      ],
+      "note": "ROS 2 geometry_msgs/Twist on rt/cmd_vel (a ROS 2 driver on the robot): decided as a twist, limited in place."
+    }
+  ],
+  "max_queue_delay_ns": 5000000,
+  "events_path": "/var/lib/robodr/firewall-gw/events.jsonl",
+  "status_path": "/var/lib/robodr/firewall-gw/status.json",
+  "housekeeping_ms": 100,
+  "observe": {
+    "enabled": true,
+    "nflog_group": 4174
+  }
+}

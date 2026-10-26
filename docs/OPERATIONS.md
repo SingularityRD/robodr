@@ -1600,7 +1600,15 @@ primary.
    locator outside the queued port ranges: RTPS to that port crosses the
    bridge unchecked. Add the ports to `rtps.extra_port_ranges`, re-render
    and re-apply the ruleset (step 4), or pin the DDS ports; repeat until
-   the flag stays false while the controller and robot run.
+   the flag stays false while the controller and robot run. The check
+   covers the controller's discovery (queued) and the robot's own SPDP /
+   SEDP (an NFLOG copy, never queued; `observe.enabled`, default): the
+   status shows `observe_unavailable: true` if the copy could not be set
+   up (load `nfnetlink_log`). **Commissioning capture (required):** record
+   both bridge ports with `tcpdump ... udp` through a full robot and
+   controller start-up and confirm every port either side receives RTPS on
+   is in a queued range; the check only sees discovery while the gateway
+   runs.
 
 **Run observe first.** With `"mode": "observe"` every datagram is forwarded
 unchanged while the decisions are made and recorded (`events_path`,
@@ -1628,6 +1636,10 @@ lines, size-capped by `events_max_bytes`). Watch in particular:
 | `binding_conflicts` > 0 | the motion writer's GUID arrived from another source IP / MAC than the controller's stream: a spoofer on the controller segment (or a second NIC sending the controller's traffic) |
 | `sn_jumps` > 0 | a sequence-number jump past `rtps.max_sn_jump` was held back: lost frames between controller and gateway, or a spoofed far-future number |
 | `writer_restarts` | a writer restarted with its old GUID (announced by SEDP); expected only when the controller software restarts |
+| `arm_weight_step_rejected`, `arm_weight_rate_rejected`, `arm_engage_rejected` | an arm-SDK blend weight that jumped, moved too fast, or rose from 0 with targets away from where `rt/lowstate` says the arms are (the arms were held): a controller that engages faster than the channel allows, or an attack |
+| `hand_mode_rejected` | a hand frame with a mode octet the SDK never sends (another motor id, another status) or a hand-SDK weight jump |
+| `velocity_expired` | a loco `SetVelocity` ended (the robot stopped on its own): informational |
+| `observe_unavailable`, `observe_overruns` | robot-side observation is off (no `rt/lowstate`, no robot-side locator check) / copies lost under load |
 | `unknown_undecidable` > 0 | a fragmented / key-only / non-standard sample from a writer the gateway never saw announced was removed: a discovery path around the bridge, a missing `rtps.state_file`, or an attack |
 | `non_motor_rejected` > 0 | a `LowCmd_` asked to turn the battery off (`bms_cmd.off`) and was replaced by the substitute: investigate the sender |
 | firewall `joint_holds_exceeded` | a humanoid has been held past `max_hold_ns`: escalate (the gateway keeps holding) |

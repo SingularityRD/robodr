@@ -14,10 +14,11 @@ mod smoke;
 
 use firewall_gw_packet::record;
 use robodr_cdr::Representation;
+use robodr_firewall_gw::config::Codec;
 use robodr_firewall_gw::lowcmd::{self, LowCmdCodec, WireMotor};
 use robodr_firewall_gw::rtps::build::Datagram;
 use robodr_firewall_gw::testkit::*;
-use robodr_firewall_gw::{legacy, sport};
+use robodr_firewall_gw::{hand, legacy, ros2, sport};
 
 const DIR: &str = env!("CARGO_MANIFEST_DIR");
 
@@ -84,6 +85,115 @@ fn seeds() -> Vec<(&'static str, Vec<u8>)> {
         v.extend(record(
             0,
             &lowcmd_datagram(PREFIX, WRITER, 7, &m, Representation::CdrBe),
+        ));
+        v
+    }));
+    // The channels added after S8 and the robot-side observation (review
+    // of f27e02d): arm SDK (weight ramp), loco, Dex3, hand SDK, ROS 2
+    // twist, a robot `rt/lowstate` and a robot reader of `rt/lowcmd`.
+    out.push(("seed-g1-channels.bin", {
+        let mut v = vec![4u8];
+        for (w, topic, ty) in [
+            (ARM_WRITER, "rt/arm_sdk", "unitree_hg::msg::dds_::LowCmd_"),
+            (
+                LOCO_WRITER,
+                "rt/api/sport/request",
+                "unitree_api::msg::dds_::Request_",
+            ),
+            (
+                DEX3_WRITER,
+                "rt/dex3/left/cmd",
+                "unitree_hg::msg::dds_::HandCmd_",
+            ),
+            (
+                HAND_SDK_WRITER,
+                "rt/hand_sdk",
+                "unitree_go::msg::dds_::MotorCmds_",
+            ),
+            (
+                TWIST_WRITER,
+                "rt/cmd_vel",
+                "geometry_msgs::msg::dds_::Twist_",
+            ),
+        ] {
+            v.extend(record(0, &sedp_datagram(PREFIX, w, topic, ty)));
+        }
+        let target = arm_frame(1.0, 0.0);
+        let q: Vec<f32> = (0..35)
+            .map(|i| target.motor(i).map_or(0.0, |m| m.q))
+            .collect();
+        v.extend(record(0x80, &lowstate_datagram(1, &q, None)[0]));
+        v.extend(record(
+            0x80,
+            &sedp_with_locator(
+                ROBOT_PREFIX,
+                [0, 0, 0x11, 0x04],
+                "rt/lowcmd",
+                "unitree_hg::msg::dds_::LowCmd_",
+                true,
+                ROBOT_IP,
+                45123,
+            ),
+        ));
+        for (sn, w) in [0.0f32, 0.01, 0.02, 1.0].into_iter().enumerate() {
+            let p = lowcmd::encode_payload(&arm_frame(w, 0.0), Representation::CdrLe);
+            v.extend(record(
+                4 << 2,
+                &data_datagram(ARM_WRITER, sn as i64 + 1, &p),
+            ));
+        }
+        let req = |id, p: &str| sport::encode_request(Representation::CdrLe, 1, id, p);
+        for (sn, (id, p)) in [
+            (7105, r#"{"duration":864000.0,"velocity":[0.3,0.0,0.1]}"#),
+            (7101, r#"{"data":500}"#),
+            (7101, r#"{"data":1}"#),
+            (7001, ""),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            v.extend(record(
+                4 << 2,
+                &data_datagram(LOCO_WRITER, sn as i64 + 1, &req(id, p)),
+            ));
+        }
+        let dex3: Vec<_> = (0..DEX3_MOTORS)
+            .map(|i| ((i as u8) | 0x10, 0.3f32, 0.0, 0.0, 1.5, 0.1))
+            .collect();
+        v.extend(record(
+            8 << 2,
+            &data_datagram(
+                DEX3_WRITER,
+                1,
+                &hand::encode(Codec::UnitreeDex3HandCmd, &dex3),
+            ),
+        ));
+        let sdk: Vec<_> = (0..HAND_SDK_MOTORS)
+            .map(|_| (0u8, 0.2f32, 0.0, 0.3, 0.0, 0.0))
+            .collect();
+        v.extend(record(
+            8 << 2,
+            &data_datagram(
+                HAND_SDK_WRITER,
+                1,
+                &hand::encode(Codec::UnitreeHandSdk, &sdk),
+            ),
+        ));
+        v.extend(record(
+            4 << 2,
+            &data_datagram(
+                TWIST_WRITER,
+                1,
+                &ros2::encode([0.2, 0.0, 0.0, 0.0, 0.0, 0.1], None, false),
+            ),
+        ));
+        let mut x2 = ros2::encode([3.0, 0.0, 0.0, 0.0, 0.0, 0.0], None, false);
+        x2[1] = 0x07;
+        v.extend(record(
+            1,
+            &Datagram::new(FOREIGN)
+                .data([0, 0, 0x77, 3], 1, &[], &x2)
+                .finish(),
         ));
         v
     }));

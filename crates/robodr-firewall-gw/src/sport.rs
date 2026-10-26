@@ -24,8 +24,9 @@
 //! decimals, **truncated toward zero**, and then parsed back: if the
 //! decimal text would parse to a value of larger magnitude than the
 //! firewall's output (decimal / binary rounding), the last digit is moved
-//! toward zero again. So the robot's JSON reader can never read more speed
-//! than the firewall allowed. If the text does not fit, fewer decimals are
+//! toward zero again, and the same if the value rounded to the nearest
+//! `f32` (the SDK clients keep a `float`) would be larger. So the robot's
+//! JSON reader can never read more speed than the firewall allowed. If the text does not fit, fewer decimals are
 //! used; if even integers do not fit, the rewrite fails (the caller then
 //! suppresses the sample). Every other field of the request (request id,
 //! `api_id`, lease, priority, `noreply`, `binary`) is kept. The written
@@ -218,7 +219,13 @@ fn write_number(out: &mut [u8], v: f64, decimals: u32) -> Option<usize> {
         }
         let text = std::str::from_utf8(out.get(..n)?).ok()?;
         let back: f64 = text.parse().ok()?;
-        if back.abs() <= v.abs() && (back == 0.0 || back.signum() == v.signum()) {
+        // The robot's SDK reads a double and keeps a `float`: neither may
+        // exceed the firewall's value (review finding F10 d).
+        let as_f32 = f64::from(back as f32);
+        if back.abs() <= v.abs()
+            && as_f32.abs() <= v.abs()
+            && (back == 0.0 || back.signum() == v.signum())
+        {
             return Some(n);
         }
         // Move one unit toward zero and retry.
@@ -433,6 +440,27 @@ pub fn encode_request(rep: Representation, id: i64, api_id: i64, param: &str) ->
 
 #[cfg(test)]
 mod tests {
+
+    /// F10 (d): the robot reads these numbers into `float` (nlohmann::json
+    /// reads a double, the SDK client casts it): the written text must
+    /// never read back above the firewall's value as an `f32` either.
+    #[test]
+    fn written_numbers_never_round_up_as_f32() {
+        let mut buf = [0u8; 64];
+        for v in [0.8, 0.3, 0.1, 1.1, -0.3, -0.7, 0.123_456_7, 2.5, 1e-7, 0.6] {
+            for decimals in [6u32, 3, 1] {
+                let n = write_number(&mut buf, v, decimals).unwrap();
+                let text = std::str::from_utf8(&buf[..n]).unwrap();
+                let back = text.parse::<f64>().unwrap();
+                let f = back as f32;
+                assert!(
+                    f64::from(f).abs() <= f64::abs(v),
+                    "{v} written as {text}: f32 {f} is larger"
+                );
+            }
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -458,9 +486,11 @@ mod tests {
             let b = decode_strict(&s, None).unwrap();
             match b.call {
                 ApiCall::Move { vx, vy, vyaw } => {
-                    // 27 characters: one decimal fits, truncated toward zero.
+                    // 27 characters: two decimals fit, truncated toward zero;
+                    // 0.31 as an f32 (0.3100000024) is above 0.31, so the
+                    // last digit moves toward zero (0.30, trimmed to 0.3).
                     assert_eq!(vx, 0.5);
-                    assert_eq!(vy, -0.1);
+                    assert_eq!(vy, -0.16);
                     assert_eq!(vyaw, 0.3);
                 }
                 c => panic!("{c:?}"),
@@ -569,7 +599,16 @@ mod tests {
                     vyaw,
                     duration,
                 } => {
-                    assert_eq!((vx, vy, vyaw, duration), (0.2, -0.05, 0.1, 1.0));
+                    // Never above the value, also as an f32 (0.2 as f32 is
+                    // 0.2000000030: written 0.199999).
+                    for (got, want) in [(vx, 0.2f64), (vy, -0.05), (vyaw, 0.1)] {
+                        assert!(
+                            got.abs() <= want.abs() && (got - want).abs() < 2e-6,
+                            "{got}"
+                        );
+                        assert!(f64::from(got as f32).abs() <= want.abs(), "{got}");
+                    }
+                    assert_eq!(duration, 1.0);
                 }
                 c => panic!("{c:?}"),
             }
