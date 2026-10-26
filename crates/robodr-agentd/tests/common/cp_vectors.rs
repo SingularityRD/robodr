@@ -274,6 +274,7 @@ pub fn vectors() -> Vec<Vector> {
         "request_id": "robot_safe_pause:ugv-007:0001",
         "status": "recorded_not_executed",
         "executed": false,
+        "in_force": false,
         "state": {"robot_id": ROBOT, "action": "safe_pause", "decision": "accepted",
                   "executor": "recording", "executed": false, "evidence": link(10)},
     });

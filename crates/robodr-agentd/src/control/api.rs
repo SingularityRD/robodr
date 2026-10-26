@@ -936,6 +936,13 @@ pub trait ActionExecutor {
     /// every path that answers `failed` / 503 after asking, so an order for
     /// a request that was never recorded can never be released.
     fn discard(&mut self, _request_id: &str, _revert: bool) {}
+    /// Whether the executor holds an applied action without enforcing it
+    /// (after its own restart, until re-armed with a fresh safety state).
+    /// Answered (`in_force: false`, `state.executor_state: "held"`), never
+    /// journalled: the stored status stays what the executor last reported.
+    fn held(&self, _request_id: &str) -> bool {
+        false
+    }
 }
 
 /// Executes nothing: every accepted request stays a recorded plan.
@@ -1661,6 +1668,7 @@ impl Engine {
             });
         }
         let robot_id = self.robot_id.clone();
+        let held = self.store.get(id).is_some_and(|s| self.held(s));
         let Some(s) = self.store.get_mut(id) else {
             return Answer::error(&unknown_request());
         };
@@ -1676,7 +1684,7 @@ impl Engine {
                 evidence: evidence.clone(),
             });
         }
-        let mut body = answer_of(s, &robot_id, false, now);
+        let mut body = answer_of(s, &robot_id, false, now, held);
         body["status"] = json!(result);
         body["revert_evidence"] = json!(evidence);
         match refusal {
@@ -1691,7 +1699,12 @@ impl Engine {
     }
 
     fn answer(&self, s: &Stored, duplicate: bool, now_ms: u64) -> Value {
-        answer_of(s, &self.robot_id, duplicate, now_ms)
+        answer_of(s, &self.robot_id, duplicate, now_ms, self.held(s))
+    }
+
+    /// The executor holds this request's action (review finding 6).
+    fn held(&self, s: &Stored) -> bool {
+        s.executor == self.executor.name() && self.executor.held(&s.request.request_id)
     }
 }
 
@@ -1703,8 +1716,13 @@ fn unknown_request() -> ApiError {
     )
 }
 
-/// The request-state answer for a stored request.
-pub fn answer_of(s: &Stored, robot_id: &str, duplicate: bool, now_ms: u64) -> Value {
+/// The request-state answer for a stored request. `held`: the executor
+/// holds the action without enforcing it (review finding 6).
+///
+/// `in_force` (top level, every answer) says whether the action is being
+/// enforced on the robot now: only a `verified` (or `applied`) request the
+/// executor does not hold. `executed` stays "it took effect at some point".
+pub fn answer_of(s: &Stored, robot_id: &str, duplicate: bool, now_ms: u64, held: bool) -> Value {
     let expires = s
         .request
         .ttl_seconds
@@ -1740,10 +1758,15 @@ pub fn answer_of(s: &Stored, robot_id: &str, duplicate: bool, now_ms: u64) -> Va
     if let Some(r) = &s.revert {
         state["revert"] = json!(r);
     }
+    let enforcing = matches!(s.status, Status::Verified | Status::Applied);
+    if held && enforcing {
+        state["executor_state"] = json!("held");
+    }
     let mut out = json!({
         "request_id": s.request.request_id,
         "status": s.status.as_str(),
         "executed": s.status.executed(),
+        "in_force": enforcing && !held,
         "state": state,
     });
     if duplicate {

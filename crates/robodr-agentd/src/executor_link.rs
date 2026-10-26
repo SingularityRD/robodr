@@ -597,6 +597,14 @@ impl ActionExecutor for ControlExecutor {
         lock(&self.shared).outcomes.get(request_id).and_then(map)
     }
 
+    // control plane v2 review, finding 6: held after the executor's reboot.
+    fn held(&self, request_id: &str) -> bool {
+        lock(&self.shared)
+            .outcomes
+            .get(request_id)
+            .is_some_and(|o| o.status == ExStatus::Held)
+    }
+
     // control plane v2 review, finding 3.
     fn discard(&mut self, request_id: &str, revert: bool) {
         lock(&self.staged).retain(|s| match s {

@@ -1,11 +1,11 @@
 {
   "answer": {
-    "answer_message": "robodr-control-plane/v2 answer\nc321412b6762746ad684ba04025820fbfd5b405cc43a5f37f417e60636fe1719fbbf26efc687fd11c02d0b695980de6f750cb76083b43ed2c634d8b0fd64380b\n200\nb008031f0dd879bb82978d8af703e7c58ff84a0b50748b720ab5c3531c70141e",
+    "answer_message": "robodr-control-plane/v2 answer\nc321412b6762746ad684ba04025820fbfd5b405cc43a5f37f417e60636fe1719fbbf26efc687fd11c02d0b695980de6f750cb76083b43ed2c634d8b0fd64380b\n200\n3e895f67dd8da2fcefbbd74daab98a26a41f08c8d9ecf3870904429e078e9ffd",
     "body_file": "answers/02-submit.body.json",
-    "body_sha256": "b008031f0dd879bb82978d8af703e7c58ff84a0b50748b720ab5c3531c70141e",
+    "body_sha256": "3e895f67dd8da2fcefbbd74daab98a26a41f08c8d9ecf3870904429e078e9ffd",
     "content_type": "application/json",
     "status": 200,
-    "x_robodr_answer_signature": "ed25519;key_id=finding:ugv-007:1;sig=b9c3c27aa68bbf9e6854dc6e4c1a1153ee2ff6788f60c73bdfc99c4d334dca4892fae82a4110ad3014700b2d6d4f0d367449d70161b192bd96ce5c059fe93c0d"
+    "x_robodr_answer_signature": "ed25519;key_id=finding:ugv-007:1;sig=8286ba39116b9d6fd5170606a384e1516badbe6e20845a054c42b5de94f2f70cc613dbf73355cb2d36967c285e6642564ab5ab921468179330ade3bd1eaa9403"
   },
   "body_sha256": "1db5440187beaab24b7f43189d10cfbc81a81f8a2282f7d3c1eaffc4b6fb13f6",
   "description": "action request (safe_pause)",

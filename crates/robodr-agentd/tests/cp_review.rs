@@ -358,3 +358,57 @@ fn the_replay_fence_covers_the_window_creation_and_clock_steps() {
     let _ = std::fs::remove_dir_all(&dir2);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Review finding 6: after an executor reboot the executor holds a
+/// verified action (not re-armed until a fresh safety state); the request
+/// used to read plain `verified`. Answers now say it: `in_force: false`
+/// and `state.executor_state: "held"`, without journalling it (the
+/// executor's re-arm brings it back).
+#[test]
+fn a_held_action_is_not_reported_in_force() {
+    use robodr_executor::engine::{Outcome, Status as ExStatus};
+    let dir = tmp("held");
+    let link = link(&dir);
+    let mut e = Engine::new(
+        "ugv-007",
+        16,
+        Box::new(link.control_executor(Morphology::WheeledMobile)),
+    );
+    let mut h = FakeHost::new();
+    let id = "q-1";
+    let a = e.handle(
+        &submit(id, "quarantine_node", json!({"node": "/rogue"}), None),
+        &meta(),
+        &mut h,
+    );
+    assert_eq!(a.body["status"], "pending", "{}", a.body);
+    assert_eq!(a.body["in_force"], false, "{}", a.body);
+    let outcome = |status| Outcome {
+        id: id.into(),
+        status,
+        action: Some(robodr_responder::ActionId::QuarantineNode),
+        refusal: None,
+        error: None,
+        applied_ms: Some(1),
+        deadline_ms: None,
+        duplicate: false,
+        note: None,
+    };
+    link.put(outcome(ExStatus::Verified));
+    let get = |e: &mut Engine, h: &mut FakeHost| e.handle(&Call::Get(id.into()), &meta(), h).body;
+    let v = get(&mut e, &mut h);
+    assert_eq!(v["status"], "verified", "{v}");
+    assert_eq!(v["in_force"], true, "{v}");
+    assert!(v["state"].get("executor_state").is_none(), "{v}");
+    // The executor rebooted and holds it.
+    link.put(outcome(ExStatus::Held));
+    let v = get(&mut e, &mut h);
+    assert_eq!(v["status"], "verified", "the journalled state stays: {v}");
+    assert_eq!(v["in_force"], false, "{v}");
+    assert_eq!(v["state"]["executor_state"], "held", "{v}");
+    // Re-armed: in force again.
+    link.put(outcome(ExStatus::Verified));
+    let v = get(&mut e, &mut h);
+    assert_eq!(v["in_force"], true, "{v}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
