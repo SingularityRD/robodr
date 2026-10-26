@@ -30,6 +30,11 @@ pub const SERVER_LAG_MS: u64 = 1_000;
 pub const ROBOT_1: &str = "ugv-001";
 pub const ROBOT_2: &str = "ugv-002";
 pub const ROBOT_UNKNOWN: &str = "ugv-099";
+/// Registered with another site than `ugv-001` / `ugv-002`.
+pub const ROBOT_3: &str = "ugv-003";
+/// Sites the robots are registered with (§3, site-scoped relays).
+pub const SITE_A: &str = "test-range";
+pub const SITE_B: &str = "range-b";
 
 /// A fixed-seed Ed25519 key of the vectors.
 pub struct VKey {
@@ -37,6 +42,10 @@ pub struct VKey {
     /// `uplink`, `relay`, `finding`, or `unregistered`.
     pub role: &'static str,
     pub robot: Option<&'static str>,
+    /// Relay only: the site scope (§3).
+    pub site: Option<&'static str>,
+    /// Relay only: origin-vouching (§3).
+    pub vouches_origin: bool,
     pub seed: [u8; 32],
 }
 
@@ -48,8 +57,18 @@ impl VKey {
             name,
             role,
             robot,
+            site: None,
+            vouches_origin: false,
             seed: sha256(&m),
         }
+    }
+    fn site(mut self, site: &'static str) -> Self {
+        self.site = Some(site);
+        self
+    }
+    fn vouching(mut self) -> Self {
+        self.vouches_origin = true;
+        self
     }
     pub fn signing(&self) -> Ed25519SigningKey {
         Ed25519SigningKey::from_seed_with_derived_id(&self.seed)
@@ -83,6 +102,9 @@ pub fn keys() -> Vec<VKey> {
         VKey::new("finding-ugv-001", "finding", Some(ROBOT_1)),
         VKey::new("finding-ugv-002", "finding", Some(ROBOT_2)),
         VKey::new("unregistered", "unregistered", None),
+        // Added with the site / origin-vouching relay decisions (§3).
+        VKey::new("relay-diode", "relay", None).vouching(),
+        VKey::new("relay-site-test-range", "relay", None).site(SITE_A),
     ]
 }
 
@@ -90,8 +112,32 @@ fn key(name: &str) -> VKey {
     keys().into_iter().find(|k| k.name == name).unwrap()
 }
 
-/// `(robot id, require_finding_signature)` of the workspace.
-pub const ROBOTS: [(&str, bool); 2] = [(ROBOT_1, false), (ROBOT_2, true)];
+/// A robot of the workspace (§3).
+pub struct VRobot {
+    pub id: &'static str,
+    pub require_finding_signature: bool,
+    /// The site it is registered with.
+    pub site: &'static str,
+}
+
+/// The workspace's robots.
+pub const ROBOTS: [VRobot; 3] = [
+    VRobot {
+        id: ROBOT_1,
+        require_finding_signature: false,
+        site: SITE_A,
+    },
+    VRobot {
+        id: ROBOT_2,
+        require_finding_signature: true,
+        site: SITE_A,
+    },
+    VRobot {
+        id: ROBOT_3,
+        require_finding_signature: false,
+        site: SITE_B,
+    },
+];
 
 fn ctx(robot: &str) -> RobotContext {
     let mut c = RobotContext::new(
@@ -99,7 +145,7 @@ fn ctx(robot: &str) -> RobotContext {
             id: robot.into(),
             model: "ugv-tracked-v1".into(),
             platform_family: PlatformFamily::LinuxRos2,
-            site: "test-range".into(),
+            site: if robot == ROBOT_3 { SITE_B } else { SITE_A }.into(),
             firmware: Some(FirmwareRef {
                 version: "2.4.1".into(),
                 sha256: "1f".repeat(32),
@@ -753,6 +799,279 @@ pub fn cases() -> Vec<Case> {
         });
     }
 
+    cases.extend(cases_2026_10_26_review(&f1));
+    cases
+}
+
+/// Cases added after the first producer's review (contract §10, 2026-10-26
+/// review): site-scoped and origin-vouching relays, `site_mismatch`, the
+/// `contract_version` major rule, lone surrogates, duplicate keys inside
+/// `sig`, a `sig.key_id` with a space, repeated headers, the timestamp
+/// bound, a missing `Content-Type`, a body of 4 MiB + 1.
+fn cases_2026_10_26_review(f1: &VKey) -> Vec<Case> {
+    let mut cases = Vec::new();
+
+    // 20: origin-vouching relay (the SOC-side diode importer) vs a plain
+    // relay, for ugv-002 (require_finding_signature).
+    {
+        let name = "20-vouching-relay";
+        let t1 = ts(20, 1);
+        let v1 = value(ROBOT_2, 40, 1);
+        let v2 = value(ROBOT_2, 41, 1);
+        let body = [
+            line(&v1, None),
+            line(&v2, Some(&signed(&v2, f1))),
+            line(&value(ROBOT_UNKNOWN, 42, 1), None),
+        ]
+        .concat();
+        let (h1, b1) = signed_req(name, &key("relay-diode"), t1, body);
+        let id1 = hdr(&h1, wire::H_BATCH_ID).to_string();
+        let t2 = ts(20, 2);
+        let body = [
+            line(&value(ROBOT_2, 43, 1), None),
+            line(&value(ROBOT_1, 43, 1), None),
+        ]
+        .concat();
+        let (h2, b2) = signed_req(name, &key("relay-soc"), t2, body);
+        let id2 = hdr(&h2, wire::H_BATCH_ID).to_string();
+        cases.push(Case {
+            name,
+            description: "request 1, origin-vouching relay (relay-diode): ugv-002 requires                           per-finding signatures, sig null is accepted (vouches_origin); a                           present sig is still verified (signed with ugv-001's finding key:                           bad_finding_signature); vouching does not register robots (ugv-099:                           unknown_robot). Request 2, plain relay (relay-soc): ugv-002 with sig                           null is missing_finding_signature; ugv-001 is accepted",
+            requests: vec![
+                Req {
+                    headers: h1,
+                    body: b1,
+                    server_time_ms: t1 + SERVER_LAG_MS,
+                    expect_status: 200,
+                    expect_body: ok(
+                        &id1,
+                        1,
+                        0,
+                        0,
+                        &[(2, "bad_finding_signature"), (3, "unknown_robot")],
+                    ),
+                },
+                Req {
+                    headers: h2,
+                    body: b2,
+                    server_time_ms: t2 + SERVER_LAG_MS,
+                    expect_status: 200,
+                    expect_body: ok(&id2, 1, 0, 0, &[(1, "missing_finding_signature")]),
+                },
+            ],
+        });
+    }
+
+    // 21: site-scoped relay (site test-range).
+    let body = [
+        line(&value(ROBOT_1, 44, 1), None),
+        line(&value(ROBOT_3, 44, 1), None),
+        line(&value(ROBOT_UNKNOWN, 44, 1), None),
+        line(&value(ROBOT_2, 44, 1), None),
+    ]
+    .concat();
+    cases.push(simple(
+        21,
+        "21-site-scoped-relay",
+        "relay key scoped to site test-range: ugv-001 (test-range) accepted; ugv-003 \
+         (registered with range-b) site_mismatch; ugv-099 (not registered) unknown_robot, \
+         checked before the site; ugv-002 (test-range, requires signatures) with sig null: \
+         missing_finding_signature (a site-scoped relay does not vouch)",
+        "relay-site-test-range",
+        body,
+        |id| {
+            ok(
+                id,
+                1,
+                0,
+                0,
+                &[
+                    (2, "site_mismatch"),
+                    (3, "unknown_robot"),
+                    (4, "missing_finding_signature"),
+                ],
+            )
+        },
+    ));
+
+    // 22: contract_version syntax (§4 step 5.2).
+    let good = value(ROBOT_1, 45, 1);
+    let cv = format!("\"contract_version\":\"{}\"", robodr_ocsf::CONTRACT_VERSION);
+    assert!(good.contains(&cv));
+    let with = |v: &str| good.replacen(&cv, &format!("\"contract_version\":\"{v}\""), 1);
+    let body = [
+        line(&with("1.03.0"), None),
+        line(&with("2.1"), None),
+        line(&with("0000000002.1.0"), None),
+        line(&with("+2.1.0"), None),
+        line(&with("3.0.0-rc1"), None),
+        line(&with("02.1.0"), None),
+    ]
+    .concat();
+    cases.push(simple(
+        22,
+        "22-contract-version-syntax",
+        "MAJOR.MINOR.PATCH, each part 1-9 ASCII digits, leading zeros allowed, MAJOR read as \
+         a number: 1.03.0 is major 1 (unsupported_contract); 2.1, a 10-digit part, a sign and \
+         a suffix are not well formed, so the value is validated and fails \
+         (invalid_finding); 02.1.0 is major 2 and validates like 2.1.0 (accepted)",
+        "uplink-ugv-001",
+        body,
+        |id| {
+            ok(
+                id,
+                1,
+                0,
+                0,
+                &[
+                    (1, "unsupported_contract"),
+                    (2, "invalid_finding"),
+                    (3, "invalid_finding"),
+                    (4, "invalid_finding"),
+                    (5, "invalid_finding"),
+                ],
+            )
+        },
+    ));
+
+    // 23: line syntax.
+    let v = value(ROBOT_1, 46, 1);
+    let vs = serde_json::to_string(&v).unwrap();
+    let s = signed(&v, f1);
+    let mut body = Vec::new();
+    for l in [
+        "{\"value\":\"\\ud800\",\"sig\":null}".to_string(),
+        "{\"value\":\"a\\udc00b\",\"sig\":null}".to_string(),
+        format!(
+            "{{\"value\":{vs},\"sig\":{{\"alg\":\"ed25519\",\"alg\":\"ed25519\",\"key_id\":\"{}\",\"sig\":\"{}\"}}}}",
+            s.key_id, s.sig
+        ),
+        format!(
+            "{{\"value\":{vs},\"sig\":{{\"alg\":\"ed25519\",\"key_id\":\"finding key\",\"sig\":\"{}\"}}}}",
+            s.sig
+        ),
+    ] {
+        body.extend_from_slice(l.as_bytes());
+        body.push(b'\n');
+    }
+    body.extend_from_slice(&line(&v, Some(&s)));
+    cases.push(simple(
+        23,
+        "23-line-syntax",
+        "a lone high surrogate escape and a lone low surrogate escape in value (the decoded \
+         value must be valid UTF-8): invalid_line; a key twice inside sig: invalid_line; \
+         sig.key_id with a space (key ids are ASCII 0x21-0x7E): invalid_line; valid",
+        "uplink-ugv-001",
+        body,
+        |id| {
+            ok(
+                id,
+                1,
+                0,
+                0,
+                &[
+                    (1, "invalid_line"),
+                    (2, "invalid_line"),
+                    (3, "invalid_line"),
+                    (4, "invalid_line"),
+                ],
+            )
+        },
+    ));
+
+    // 24: header syntax (more).
+    {
+        let name = "24-header-syntax";
+        let body = line(&value(ROBOT_1, 47, 1), None);
+        let mut requests = Vec::new();
+        let t = ts(24, 1);
+        let (mut h, b) = signed_req(name, &key("uplink-ugv-001"), t, body.clone());
+        let dup = h[2].clone();
+        h.insert(3, dup);
+        requests.push(Req {
+            headers: h,
+            body: b,
+            server_time_ms: t + SERVER_LAG_MS,
+            expect_status: 400,
+            expect_body: code("bad_header"),
+        });
+        let t = ts(24, 2);
+        let (mut h, b) = signed_req(name, &key("uplink-ugv-001"), t, body.clone());
+        h[3].1 = "18446744073709551616".into();
+        requests.push(Req {
+            headers: h,
+            body: b,
+            server_time_ms: t + SERVER_LAG_MS,
+            expect_status: 400,
+            expect_body: code("bad_header"),
+        });
+        let t = ts(24, 3);
+        let max = u64::MAX;
+        let (h, b) = signed_req(name, &key("uplink-ugv-001"), max, body);
+        requests.push(Req {
+            headers: h,
+            body: b,
+            server_time_ms: t + SERVER_LAG_MS,
+            expect_status: 401,
+            expect_body: code("stale_timestamp"),
+        });
+        cases.push(Case {
+            name,
+            description: "X-RoboDR-Batch-Id twice (same value): 400 bad_header; timestamp \
+                          2^64 (20 digits, over 2^64-1): 400 bad_header; timestamp exactly \
+                          2^64-1, correctly signed: well formed, 401 stale_timestamp",
+            requests,
+        });
+    }
+
+    // 25: no Content-Type.
+    {
+        let t = ts(25, 1);
+        let (mut h, b) = signed_req(
+            "25-no-content-type",
+            &key("uplink-ugv-001"),
+            t,
+            line(&value(ROBOT_1, 48, 1), None),
+        );
+        h.remove(0);
+        cases.push(Case {
+            name: "25-no-content-type",
+            description: "no Content-Type header: 415 unsupported_media_type (step 1.1, \
+                          before the X-RoboDR-* headers)",
+            requests: vec![Req {
+                headers: h,
+                body: b,
+                server_time_ms: t + SERVER_LAG_MS,
+                expect_status: 415,
+                expect_body: code("unsupported_media_type"),
+            }],
+        });
+    }
+
+    // 26: body of 4 MiB + 1 bytes (one line, well under the line limit).
+    {
+        let t = ts(26, 1);
+        let head = b"{\"value\":\"";
+        let tail = b"\",\"sig\":null}\n";
+        let mut body = head.to_vec();
+        body.resize(wire::MAX_BODY_BYTES + 1 - tail.len(), b'x');
+        body.extend_from_slice(tail);
+        assert_eq!(body.len(), wire::MAX_BODY_BYTES + 1);
+        let (h, b) = signed_req("26-body-too-large", &key("uplink-ugv-001"), t, body);
+        cases.push(Case {
+            name: "26-body-too-large",
+            description: "a body of 4 MiB + 1 bytes (4 194 305, one line): 413 body_too_large, \
+                          nothing processed",
+            requests: vec![Req {
+                headers: h,
+                body: b,
+                server_time_ms: t + SERVER_LAG_MS,
+                expect_status: 413,
+                expect_body: code("body_too_large"),
+            }],
+        });
+    }
+
     cases
 }
 
@@ -776,6 +1095,8 @@ pub fn files() -> Vec<(String, Vec<u8>)> {
             "name": k.name,
             "role": k.role,
             "robot": k.robot,
+            "site": k.site,
+            "vouches_origin": k.vouches_origin,
             "key_id": k.key_id(),
             "public_key_hex": to_hex(&k.public()),
             "public_key_file": publ,
@@ -823,8 +1144,8 @@ pub fn files() -> Vec<(String, Vec<u8>)> {
             "Compare the HTTP status, then the JSON body: 200 bodies field by field except that each `rejected` entry's free-text `detail` is not compared (and absent here); error bodies by `code` only (`detail` is free text). Unknown extra response fields are allowed (contract §8)."
         ],
         "workspace": {
-            "robots": ROBOTS.iter().map(|(id, req)| json!({"id": id, "require_finding_signature": req})).collect::<Vec<_>>(),
-            "keys": "every entry of `keys` whose role is uplink, relay or finding (role `unregistered` is NOT registered)",
+            "robots": ROBOTS.iter().map(|r| json!({"id": r.id, "require_finding_signature": r.require_finding_signature, "site": r.site})).collect::<Vec<_>>(),
+            "keys": "every entry of `keys` whose role is uplink, relay or finding (role `unregistered` is NOT registered), with its `robot` (uplink, finding), and for relay keys its `site` scope (null: the whole workspace) and `vouches_origin` flag (contract section 3)",
         },
         "keys": key_list,
         "cases": case_list,

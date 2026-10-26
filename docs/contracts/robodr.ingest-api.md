@@ -38,10 +38,14 @@ carries no workspace id.
 | `X-RoboDR-Signature` | the batch signature, 128 lower-case hex (64-byte Ed25519 signature) |
 
 Header names are case-insensitive (HTTP); values are exact. Each of the four
-`X-RoboDR-*` headers must appear exactly once. A missing, repeated or
-malformed `X-RoboDR-*` header is `400` (`bad_header`, §6.2) — a syntax
-error, before any key lookup; a well-formed key id that is not registered is
-`401` (`unknown_key`).
+`X-RoboDR-*` headers must appear exactly once: a header field repeated (even
+with the same value) is repeated. A missing, repeated or malformed
+`X-RoboDR-*` header is `400` (`bad_header`, §6.2) — a syntax error, before
+any key lookup; a well-formed key id that is not registered is `401`
+(`unknown_key`). A timestamp above 2^64−1 (18446744073709551615) is
+malformed (`400`); one within the bound but far from the server clock is
+`401` (`stale_timestamp`). A missing `Content-Type` is `415` like a wrong
+one (§4 step 1.1).
 
 ### 2.2 Batch signature
 
@@ -79,18 +83,25 @@ order:
   string and works on those bytes; it never re-serialises them.
 * `sig` — `null`, or the per-finding signature object exactly as the
   `robodr-finding-sig` Kafka header defines it ([`robodr.findings`]
-  §2a, `robodr_ocsf::sig`): exactly `alg` (`ed25519`), `key_id` (printable
-  ASCII, 1–128 bytes) and `sig` (128 lower-case hex); signed bytes = the
-  decoded `value` bytes. The producer sends `null` for findings that crossed
-  a diode (the diode does not carry per-finding signatures,
+  §2a, `robodr_ocsf::sig`): exactly `alg` (`ed25519`), `key_id` (1–128
+  bytes of ASCII 0x21–0x7E: printable, **no space**; `robodr_ocsf::sig`
+  `check_key_id`) and `sig` (128 lower-case hex), each once. The signature
+  is over **the framed message of `robodr.findings` §2a** (domain
+  `"robodr-ocsf/finding-sig/v1"` 0x00, then length-prefixed `alg`,
+  `key_id` and value) built over the decoded `value` bytes — not over the
+  raw value bytes alone. The producer sends `null` for findings that
+  crossed a diode (the diode does not carry per-finding signatures,
   `robodr.findings` §8; such findings come from a `relay` key).
 
 A line is refused as `invalid_line` (§4 step 5.1) when it is empty,
 contains a CR (`0x0D`) anywhere, is not valid UTF-8, is not a JSON object
 (an array is not accepted even if a parser could map it onto the two
 fields), lacks `value` or `sig`, has any other key, has a key twice, has a
-`value` that is not a string, or has a `sig` that is neither `null` nor a
-well-formed signature object. Such a line is reported, the other lines are
+`value` that is not a string, has a `value` whose decoded string is not
+valid Unicode (a `\uD800`–`\uDFFF` escape that is not part of a
+high-low surrogate pair: the decoded value must be valid UTF-8), or has a
+`sig` that is neither `null` nor a well-formed signature object (a key
+twice inside `sig` included). Such a line is reported, the other lines are
 processed; the batch is never refused because of a line.
 
 ### 2.4 Limits
@@ -122,15 +133,28 @@ A revoked or expired key authenticates nothing from its revocation time on.
 Key ids are unique per workspace. A robot may be marked
 `require_finding_signature` (§4 step 5.4).
 
+Registry fields (explicit; the vectors' `manifest.json` lists them):
+
+| Entry | Field | Meaning |
+| --- | --- | --- |
+| robot | `require_finding_signature` | §4 step 5.4 |
+| robot | `site` | the site it is registered with (optional) |
+| key | `role`, `robot` | as above (`robot` for `uplink` and `finding`) |
+| key (`relay`) | `site` | optional site scope, `null` = whole workspace |
+| key (`relay`) | `vouches_origin` | `true` / `false` (default `false`) |
+
 * **Site scope (relay).** A `relay` key may carry an optional `site`: it then
   may send findings only for robots registered with that site (a sensor box
   watching several robots of one site gets a site-scoped relay key, not an
-  `uplink` key). Without `site` it covers the whole workspace.
+  `uplink` key); another robot of the workspace is `site_mismatch` (§4 step
+  5.3). Without `site` it covers the whole workspace.
 * **Origin-vouching relay.** A `relay` key may be marked `vouches_origin`.
   Only the SOC-side diode importer gets this flag: it has already verified
   the robot's Ed25519-signed diode batch, so findings it relays satisfy
   `require_finding_signature` without a per-finding `sig` (the diode format
-  carries none). Any other relay is held to the per-finding rule.
+  carries none). Any other relay is held to the per-finding rule (§4 step
+  5.4). The flag never registers a robot and never excuses a `sig` that is
+  present but does not verify.
 * **Rotation.** A robot may have more than one active key per role at a
   time (overlap during rotation); each authenticates independently until
   revoked.
@@ -165,20 +189,35 @@ In this order; the first step that fails decides the response:
    `duplicate`):
    1. the line object (§2.3) → `invalid_line`;
    2. the decoded `value`: longer than 256 KiB → `too_large`; a JSON object
-      whose `contract_version` is a string `MAJOR.MINOR.PATCH` (decimal
-      parts) with `MAJOR` ≠ `2` → `unsupported_contract` (the producer
-      upgrades unsigned 1.x findings to 2.0 before sending and never sends
-      signed 1.x ones, `robodr.findings` §5); otherwise validate against
-      `robodr.findings` 2.x → `invalid_finding`;
+      whose `contract_version` is a **well-formed** version with
+      `MAJOR` ≠ 2 → `unsupported_contract` (the producer upgrades unsigned
+      1.x findings to 2.0 before sending and never sends signed 1.x ones,
+      `robodr.findings` §5); otherwise validate against `robodr.findings`
+      2.x → `invalid_finding`.
+      *Well-formed* (the Rust validator's rule,
+      `robodr_ocsf::validate::contract_major`): exactly three parts
+      separated by `.`, each 1–9 ASCII decimal digits; leading zeros are
+      allowed and `MAJOR` is compared **as a number** (`02.1.0` is major 2,
+      `1.03.0` major 1). Anything else (`2.1`, a 10-digit part, a sign, a
+      suffix such as `-rc1`, a non-string) is not a version at all: the
+      value is validated and fails (`invalid_finding`).
+      Only `MAJOR` 2 reaches validation, and validation is the 2.x *emit*
+      rule (`robodr_ocsf::validate_for_emit`): a consumer whose validator
+      also parses 1.x findings (replay of old diode batches) must still
+      refuse anything that is not 2.x here, as `unsupported_contract`;
    3. robot binding: `uplink` key → the finding's robot must be the key's
       robot (`robot_mismatch`); `relay` key → the robot must be registered
-      in the workspace (`unknown_robot`);
+      in the workspace (`unknown_robot`), and, for a **site-scoped** relay
+      (§3), registered with the key's site (`site_mismatch`; checked after
+      `unknown_robot`);
    4. per-finding signature: a present `sig` must verify with a `finding`
       key registered for **that** robot, named by `sig.key_id`
       (`bad_finding_signature`; also when the key id is unknown, revoked or
-      bound to another robot); if the robot is marked
-      `require_finding_signature`, a missing `sig` is refused
-      (`missing_finding_signature`);
+      bound to another robot) — for every sender, origin-vouching relays
+      included; if the robot is marked `require_finding_signature`, a
+      missing (`null`) `sig` is refused (`missing_finding_signature`)
+      **unless the sender is a `relay` key marked `vouches_origin`** (§3),
+      which satisfies the requirement for the findings it relays;
    5. dedup and upsert (§5).
 6. Lines that fail are reported, never retried by the server; the batch
    still succeeds for the other lines.
@@ -225,6 +264,7 @@ every line is named at most once. `detail` is free text for humans
 | `invalid_finding` | 5.2 |
 | `robot_mismatch` | 5.3 |
 | `unknown_robot` | 5.3 |
+| `site_mismatch` | 5.3 |
 | `bad_finding_signature` | 5.4 |
 | `missing_finding_signature` | 5.4 |
 
@@ -254,7 +294,20 @@ its status.
 * Retries (network error, `408`, `5xx`, `429`) resend the **same** batch
   with the same batch id, timestamp re-signed (new timestamp, same body).
 * Exponential backoff with jitter; honours `Retry-After` (never retries
-  sooner).
+  sooner), also when it came with the last attempt of a run (the next run
+  waits for it). **Producer bound:** a `Retry-After` is honoured in full up
+  to 24 hours; a larger value (or one too large to parse as a 64-bit
+  number) is treated as 24 hours, so an absurd value cannot park a robot's
+  uplink indefinitely. No other cap shortens it.
+* Refusals that need a fix (`400`, `401`, `409`, `415`, a single-line `413`,
+  a `200` that does not account for the batch) are retried on a long
+  backoff (default cap 15 minutes), not every minute: each `401` is an
+  audit-log entry on the server (§4 step 2). The batch stays queued and
+  blocks the later ones (delivery is in order); the producer makes that
+  visible (status file, service status) instead of retrying silently.
+* Dead-lettered lines can be re-injected by the operator after a fix
+  (`robodr-uplink reinject`): they are sent again **under new batch ids**,
+  never under the id whose stored response rejected them.
 * Batch ids are derived from the input position and the body
   (`rdu1-` + 128 bits of SHA-256 over the input stream name, the input
   positions of the lines and SHA-256(body); `robodr_export::uplink::wire::batch_id`),
@@ -296,7 +349,15 @@ text requires, for both implementations to test against:
   signatures, malformed line objects, invalid finding, contract 3.0 and
   1.x, oversize values (256 KiB + 1 and exactly 256 KiB), empty line, CRLF,
   no final LF, replay, batch-id reuse, every `401`, `415`, `413`, every
-  `400`.
+  `400`; and (cases 20–26) origin-vouching vs plain relay, site-scoped
+  relay (own site, other site, unregistered robot), the `contract_version`
+  syntax rule, lone surrogates, a key twice inside `sig`, a `sig.key_id`
+  with a space, a repeated `X-RoboDR-*` header, timestamps 2^64 and
+  2^64−1, no `Content-Type`, a body of 4 MiB + 1.
+
+Cases are only ever **added** (new directories, new `manifest.json`
+entries and fields); an existing case changes only with a contract change
+recorded in §10.
 
 They are generated deterministically by
 `cargo run -p robodr-export --example ingest_vectors`; the RoboDR test
@@ -305,6 +366,34 @@ every request through a reference consumer of this text
 (`crates/robodr-export/tests/common/ingest.rs`).
 
 ## 10. Changelog
+
+* **v1 draft, 2026-10-26, review** (independent review of the producer and
+  of the decisions entry below). Clarifications and one new line code; no
+  change to the wire format of a valid request.
+  - §3: the registry fields are explicit (robot `site`; relay `site` and
+    `vouches_origin`).
+  - §4 step 5.3: new line code **`site_mismatch`** (minor change, §8): a
+    site-scoped relay sending a robot of another site (or of no site);
+    checked after `unknown_robot`.
+  - §4 step 5.4: the `vouches_origin` exception to
+    `require_finding_signature` is now in the processing rule (it was only
+    in §3); a present `sig` is verified for every sender.
+  - §4 step 5.2: the `contract_version` rule is the Rust validator's
+    (three parts of 1–9 digits, leading zeros allowed, `MAJOR` compared as
+    a number; malformed → validated → `invalid_finding`) and the 2.x-only
+    validation is stated.
+  - §2.3: lone surrogate escapes in `value` → `invalid_line`; a key twice
+    inside `sig` → `invalid_line`; `sig.key_id` is ASCII 0x21–0x7E (no
+    space); the per-finding signature is over the §2a framed message of the
+    decoded value, not the value alone.
+  - §2.1: repeated header fields, the timestamp bound and a missing
+    `Content-Type` spelled out.
+  - §7: `Retry-After` honoured in full up to a documented 24 h producer
+    bound, also after a run's last attempt; long backoff for refusals;
+    re-injection under new batch ids.
+  - §9: vectors 20–26 added (existing vectors unchanged; `manifest.json`
+    gains the robot `site`, the key `site` / `vouches_origin` fields, the
+    keys `relay-diode` and `relay-site-test-range` and robot `ugv-003`).
 
 * **v1 draft, 2026-10-26, decisions** (coordinator, after the first
   producer's open questions): site-scoped and origin-vouching `relay` keys,

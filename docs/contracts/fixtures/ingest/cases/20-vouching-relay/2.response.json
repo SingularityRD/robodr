@@ -1,0 +1,17 @@
+{
+  "body": {
+    "accepted": 1,
+    "batch_id": "rdu1-2539f37ed9dac7e96c8430a71635b2ba",
+    "created": 1,
+    "duplicates": 0,
+    "rejected": [
+      {
+        "code": "missing_finding_signature",
+        "line": 1
+      }
+    ],
+    "replayed": false,
+    "updated": 0
+  },
+  "status": 200
+}

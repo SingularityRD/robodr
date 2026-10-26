@@ -1,0 +1,29 @@
+{
+  "body": {
+    "accepted": 1,
+    "batch_id": "rdu1-0553da74c7df7fa1b74aa9a0dd116d57",
+    "created": 1,
+    "duplicates": 0,
+    "rejected": [
+      {
+        "code": "invalid_line",
+        "line": 1
+      },
+      {
+        "code": "invalid_line",
+        "line": 2
+      },
+      {
+        "code": "invalid_line",
+        "line": 3
+      },
+      {
+        "code": "invalid_line",
+        "line": 4
+      }
+    ],
+    "replayed": false,
+    "updated": 0
+  },
+  "status": 200
+}

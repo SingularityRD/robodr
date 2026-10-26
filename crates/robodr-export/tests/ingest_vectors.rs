@@ -64,17 +64,16 @@ fn generator_is_deterministic() {
 
 fn registry() -> Registry {
     let mut r = Registry::default();
-    for (id, req) in vectors::ROBOTS {
-        r = r.robot(id, req);
+    for rb in vectors::ROBOTS {
+        r = r.robot_at(rb.id, rb.require_finding_signature, Some(rb.site));
     }
     for k in vectors::keys() {
-        let role = match k.role {
-            "uplink" => Role::Uplink,
-            "relay" => Role::Relay,
-            "finding" => Role::Finding,
+        r = match k.role {
+            "uplink" => r.key(&k.key_id(), Role::Uplink, k.robot, k.public()),
+            "relay" => r.relay(&k.key_id(), k.public(), k.site, k.vouches_origin),
+            "finding" => r.key(&k.key_id(), Role::Finding, k.robot, k.public()),
             _ => continue,
         };
-        r = r.key(&k.key_id(), role, k.robot, k.public());
     }
     r
 }
@@ -94,7 +93,7 @@ fn strip_detail(mut v: serde_json::Value) -> serde_json::Value {
 #[test]
 fn reference_consumer_gives_every_expected_response() {
     let cases = vectors::cases();
-    assert!(cases.len() >= 18);
+    assert!(cases.len() >= 26);
     let mut statuses = std::collections::BTreeSet::new();
     let mut codes = std::collections::BTreeSet::new();
     for c in cases {
@@ -135,6 +134,7 @@ fn reference_consumer_gives_every_expected_response() {
         "too_large",
         "robot_mismatch",
         "unknown_robot",
+        "site_mismatch",
         "bad_finding_signature",
         "missing_finding_signature",
         "unknown_key",

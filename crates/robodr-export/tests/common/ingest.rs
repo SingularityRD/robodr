@@ -26,6 +26,10 @@ pub struct RegKey {
     pub robot: Option<String>,
     pub public: [u8; 32],
     pub revoked: bool,
+    /// Relay only: site scope (§3); `None` = the whole workspace.
+    pub site: Option<String>,
+    /// Relay only: origin-vouching (§3, §4 step 5.4).
+    pub vouches_origin: bool,
 }
 
 /// A workspace's registry (§3).
@@ -33,6 +37,9 @@ pub struct RegKey {
 pub struct Registry {
     /// robot id -> require_finding_signature
     pub robots: BTreeMap<String, bool>,
+    /// robot id -> site it is registered with (robots without one have no
+    /// site: a site-scoped relay covers none of them)
+    pub robot_sites: BTreeMap<String, String>,
     /// key id -> key
     pub keys: BTreeMap<String, RegKey>,
 }
@@ -40,6 +47,13 @@ pub struct Registry {
 impl Registry {
     pub fn robot(mut self, id: &str, require_sig: bool) -> Self {
         self.robots.insert(id.into(), require_sig);
+        self
+    }
+    pub fn robot_at(mut self, id: &str, require_sig: bool, site: Option<&str>) -> Self {
+        self.robots.insert(id.into(), require_sig);
+        if let Some(s) = site {
+            self.robot_sites.insert(id.into(), s.into());
+        }
         self
     }
     pub fn key(mut self, key_id: &str, role: Role, robot: Option<&str>, public: [u8; 32]) -> Self {
@@ -50,6 +64,29 @@ impl Registry {
                 robot: robot.map(str::to_string),
                 public,
                 revoked: false,
+                site: None,
+                vouches_origin: false,
+            },
+        );
+        self
+    }
+    /// A `relay` key with its §3 attributes.
+    pub fn relay(
+        mut self,
+        key_id: &str,
+        public: [u8; 32],
+        site: Option<&str>,
+        vouches_origin: bool,
+    ) -> Self {
+        self.keys.insert(
+            key_id.into(),
+            RegKey {
+                role: Role::Relay,
+                robot: None,
+                public,
+                revoked: false,
+                site: site.map(str::to_string),
+                vouches_origin,
             },
         );
         self
@@ -146,20 +183,15 @@ fn valid_timestamp(s: &str) -> Option<u64> {
     s.parse().ok()
 }
 
-/// `MAJOR` of a `contract_version` string, if the value is a JSON object
-/// carrying a well-formed one.
-fn contract_major(value: &str) -> Option<String> {
+/// `MAJOR` of a `contract_version` string (§4 step 5.2), if the value is a
+/// JSON object carrying a well-formed one: exactly three dot-separated
+/// parts of 1–9 ASCII decimal digits each (leading zeros allowed), MAJOR
+/// read as a decimal number — the Rust validator's rule
+/// (`robodr_ocsf::validate::contract_major`), used here directly.
+fn contract_major(value: &str) -> Option<u64> {
     let v: serde_json::Value = serde_json::from_str(value).ok()?;
     let cv = v.get("contract_version")?.as_str()?;
-    let parts: Vec<&str> = cv.split('.').collect();
-    if parts.len() != 3
-        || parts
-            .iter()
-            .any(|p| p.is_empty() || p.len() > 9 || !p.bytes().all(|b| b.is_ascii_digit()))
-    {
-        return None;
-    }
-    Some(parts[0].to_string())
+    robodr_ocsf::validate::contract_major(cv)
 }
 
 impl Consumer {
@@ -340,12 +372,14 @@ impl Consumer {
             return Err(("too_large", "value over 256 KiB".into()));
         }
         if let Some(m) = contract_major(&l.value) {
-            if m != "2" {
+            if m != 2 {
                 return Err(("unsupported_contract", format!("contract major {m}")));
             }
         }
         let env = robodr_ocsf::parse_and_validate(&l.value)
             .map_err(|e| ("invalid_finding", format!("{}", e[0])))?;
+        // Only MAJOR 2 reaches validation (above); a validator that also
+        // parses 1.x for replay must still accept nothing but 2.x here.
         if !robodr_ocsf::validate::is_emittable_contract_version(&env.contract_version) {
             return Err(("unsupported_contract", env.contract_version.clone()));
         }
@@ -360,6 +394,14 @@ impl Consumer {
             Role::Relay => {
                 if !self.reg.robots.contains_key(&robot) {
                     return Err(("unknown_robot", format!("robot {robot} not registered")));
+                }
+                if let Some(site) = &k.site {
+                    if self.reg.robot_sites.get(&robot) != Some(site) {
+                        return Err((
+                            "site_mismatch",
+                            format!("robot {robot} is not registered with site {site}"),
+                        ));
+                    }
                 }
             }
             Role::Finding => unreachable!("refused at authentication"),
@@ -383,7 +425,9 @@ impl Consumer {
                 }
             }
             None => {
-                if self.reg.robots.get(&robot).copied().unwrap_or(false) {
+                let required = self.reg.robots.get(&robot).copied().unwrap_or(false);
+                let vouched = k.role == Role::Relay && k.vouches_origin;
+                if required && !vouched {
                     return Err(("missing_finding_signature", "robot requires it".into()));
                 }
             }
