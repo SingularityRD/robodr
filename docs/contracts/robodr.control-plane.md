@@ -415,7 +415,7 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
   | `refusal.code` | When |
   | --- | --- |
   | `soc_signature_invalid` | no signed request with the order, a key id the executor does not hold (or none configured), a malformed request, or an Ed25519 signature that does not verify over the §2 signing message with the executor's own robot id |
-  | `soc_request_stale` | the timestamp is outside the executor's window (`soc.max_clock_skew_s`, default 30 s), or signed before an executor start that found its replay store missing or damaged (sign again) |
+  | `soc_request_stale` | the timestamp is outside the executor's window (`soc.max_clock_skew_s`, default 30 s), or inside the executor's replay fence: signed before an executor start that found its replay store missing or damaged, or while the executor's clock reads below its store's high-water mark (sign again) |
   | `soc_nonce_replayed` | the (key, nonce) pair was already presented to the executor while its timestamp is in the window (persisted across restarts) |
   | `soc_replay_store_unavailable` | the executor's replay store is full of live pairs or could not record the pair |
   | `order_mismatch` | the signed request is not `POST /api/v2/robots/{robot_id}/action-requests` for this robot, or the order's `request_id`, `action`, `ttl_seconds`, target (`participant_guid` / `node`), key id or `requested_by` differ from the signed body |
@@ -426,7 +426,9 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
   The replay fence of a store found missing or damaged at start is the
   start time **plus** `soc.max_clock_skew_s`: a request signed up to the
   skew ahead of the clock may have been presented before; the SOC signs
-  again after the fence. A site may set
+  again after the fence. Like agentd's (§2), the executor's store also
+  fences when the clock goes back below the latest time it dropped dead
+  pairs (up to that time plus the skew). A site may set
   `require_approval_for_all_containment` in `executor.json`: then the
   on-robot planner's containment orders are refused (`needs_approval`) on
   every morphology.
@@ -1014,3 +1016,37 @@ the executor only for recorded, matching requests (§6a); evidence exports
 streamed, `max_export_bytes` at most 256 MiB, free-space headroom, build
 deadline (§11.7); a corrupt-chunk delete never removes a re-created export;
 `%XX` in a path takes two hex digits only (a sign is refused).
+
+### Revision: executor trust boundary (executor M1, 2026-10)
+
+No wire format change (the API version stays `robodr-control-plane/v2`);
+it applies only with `executor.enabled` (§6a). What a SOC client sees:
+
+* **New `refusal.code` values** on `refused` answers (§6a): the
+  trust-boundary codes `soc_signature_invalid`, `soc_request_stale`,
+  `soc_nonce_replayed`, `soc_replay_store_unavailable`, `order_mismatch`,
+  `approval_missing`, `soc_keys_unavailable`, `approval_key_removed`, and
+  `locator_out_of_scope` (quarantine). A client that does not know a code
+  shows it as "not applied" (§6a, client requirements); agentd still
+  answers `executor_refused` for a code it does not know.
+* **Every control-plane order is refused** until the robot's
+  `executor.json` lists the SOC public keys (`soc.keys`,
+  `soc_signature_invalid`); one unreadable or refused key file refuses
+  every order (`soc_keys_unavailable`, was `config_unavailable`).
+* **Every quarantine is refused** until `executor.json` names
+  `network.quarantine.cidrs` (`locator_out_of_scope`).
+* **Reverts of SOC-approved actions need the SOC's signed revert** (§6a,
+  "Signed reverts"): a SOC that signs every revert (§2) sees no change;
+  a revert the executor refuses leaves the action `verified` with
+  `state.revert.result: "pending"` until TTL.
+* **After a robot reboot**, a held action whose approving SOC key was
+  removed from `soc.keys` is not re-armed and turns `reverted`
+  (`approval_key_removed`); rotate keys with both listed until the held
+  actions expired.
+* A SOC request that agentd accepted can still be refused by the executor
+  as `soc_request_stale` (the executor's own window and fence) or
+  `soc_nonce_replayed`: sign again with a fresh timestamp and nonce. A
+  resubmission with the same `request_id` answers the stored state
+  (§5): use a new `request_id`.
+* `require_approval_for_all_containment` (site option): planner orders are
+  refused, SOC requests unaffected.

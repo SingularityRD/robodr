@@ -418,6 +418,11 @@ In short:
 | `rt/lowcmd` (Go2, B2, H1) | `unitree_go_lowcmd` | as above; a quadruped may damp after the hold (`fail_behaviour`) |
 | `rt/api/sport/request` | `unitree_sport_request` | `Move` speed limited (parameter rewritten), a rejected `Move` replaced by the hold / zero; other calls only if `allowed_api_ids` lists them (`StopMove` always) |
 | Go1 UDP 8082 / 8007 | `go1_high_cmd` / `go1_low_cmd` | `HighCmd` velocity limited / held, other modes by `allowed_high_modes`; uncompressed `LowCmd` as `rt/lowcmd` (the compressed form cannot be decided) |
+| `rt/api/sport/request` (G1, H2, R1: ids 7xxx), `rt/api/loco/request` (H1: ids 8xxx) | `unitree_loco_request` (`robot_model` required) | `SetVelocity` / `Move` limited and their duration capped (`max_velocity_duration_s`); every `SetFsmId` (`Damp`, `ZeroTorque`, posture changes, **and `Start`**) and the hand-over calls refused unless `allowed_fsm_ids` / `allowed_api_ids` list them; queries pass. A humanoid configured with `unitree_sport_request` is refused at start |
+| `rt/arm_sdk` (G1, H1-2, H2, R1 `hg`; H1 `go`) | `unitree_hg_arm_sdk` / `unitree_go_arm_sdk` | every slot with gains or torque decided whatever its mode octet; the blend weight (`weight_slot`) bounded, step and rate limited, and its rise from 0 checked against the robot's `rt/lowstate` (below) |
+| `rt/dex3/{left,right}/cmd`, `rt/hand_sdk` | `unitree_dex3_hand_cmd` / `unitree_hand_sdk` | mode octets must be the SDK's, the hand-SDK weight bounded and step / rate limited; a frame the firewall passes is forwarded byte-identical, anything else is suppressed (no hand rewrite). The hand's firewall channel sets `balance_critical: false`, so `stopMotors` (`kp = kd = 0`) is allowed |
+| `rt/api/arm/request` (G1, H2 arm actions) | `unitree_arm_request` | `ExecuteAction`, `ExecuteCustomAction`, `StopCustomAction` refused unless `allowed_api_ids` lists them; `GetActionList` passes |
+| `rt/cmd_vel` (ROS 2) | `ros2_twist` / `ros2_twist_stamped` | `geometry_msgs` `Twist` / `TwistStamped` (XCDR1) limited in place, all six components |
 
 **What "hold" means on the wire.** The gateway never sends a datagram of
 its own: re-sending an old `LowCmd` is discarded by the robot's DDS reader
@@ -436,10 +441,62 @@ is refused for a humanoid's `rt/lowcmd`. Check what the robot does on a
 lost `rt/lowcmd` stream (Unitree's motor-board timeout behaviour) with the
 OEM before enabling enforce mode on a humanoid.
 
+Channel details, SDK sources and counters:
+[`crates/robodr-firewall-gw/README.md`](../crates/robodr-firewall-gw/README.md)
+("Loco requests", "Arm actions", "Arm SDK", "Hands", "ROS 2 `/cmd_vel`").
+
+**Robot-side observation.** The rendered ruleset copies every UDP datagram
+entering the bridge from the robot port to NFLOG group 4174
+(`observe.enabled`, default `true`; `observe.nflog_group`; chain
+`ROBODR_GW_OBS`). The copy is never queued or dropped: a stopped gateway
+changes nothing on the robot's path. The gateway reads two things from it:
+
+* the robot's `rt/lowstate` (`lowstate_topic` of the arm-SDK channel),
+  which the arm-SDK engagement check compares the targets with;
+* the robot's own SPDP / SEDP, which runs through the DDS port check
+  below.
+
+It needs `nfnetlink_log` and the xtables `NFLOG` target. Without them the
+gateway starts, prints a WARNING and reports `observe_unavailable` in its
+status; the arm SDK then engages only by the conservative first-step rule.
+
+**DDS ports.** The gateway queues the RTPS port range of each
+`rtps.domain_ids` entry and every `rtps.extra_port_ranges` entry (at most
+16 `[lo, hi]` ranges, for a DDS stack on non-default ports). A locator in
+the discovery it sees that lies outside every queued range sets
+`port_bypass_risk` in the status file and is logged once as a WARNING:
+RTPS to that port crosses the bridge unchecked. Add the ports and re-apply
+the ruleset. **Commissioning capture (required):** record both bridge
+ports (`tcpdump -i <port> -w ... udp`) through a full robot and controller
+start-up and confirm every port either side receives RTPS on is queued.
+
+**Upgrading an existing gateway configuration:**
+
+* **G1 / H1 / H2 / R1 `Start` is refused** (`SetFsmId` 500 / 204 / 601 /
+  811) unless the loco channel's `allowed_fsm_ids` lists it. List it only
+  if your controller starts the walking controller: it makes the whole
+  body move from any state.
+* **One-frame arm engagement is refused by default.** The arm-SDK weight
+  moves at most `max_weight_step` (0.02 per frame) and
+  `max_weight_rate_per_s` (0.5 /s). The SDK example
+  (`g1_arm7_sdk_dds_example`) sets the weight to 1 at once from the
+  measured pose: it works only with robot-side observation running (a
+  fresh `rt/lowstate`, `lowstate_max_age_ms` 50) and the step and rate
+  opened up (`max_weight_step: 1.0`, `max_weight_rate_per_s: 1000`, as the
+  G1 channels example explains). A weight beyond these rules makes the
+  humanoid hold its last accepted arm frame (`arm_weight_step_rejected`,
+  `arm_weight_rate_rejected`, `arm_engage_rejected`).
+* Re-render and re-apply the ruleset (new `ROBODR_GW_OBS` chain) and load
+  `nfnetlink_log`.
+
 Start in `mode: observe` (decides and records, forwards everything
 unchanged), compare the would-have verdicts with the robot's behaviour,
 then switch to `enforce`. Examples:
-`config/firewall-gw.unitree-{g1,go2}.example.json`.
+`config/firewall-gw.unitree-{g1,go2}.example.json`; with the newer
+channels `config/firewall-gw.unitree-{g1,go2}.channels.example.json` and
+`config/firewall.unitree-{g1,go2}.channels.example.json` (G1: arm SDK,
+loco, both Dex3 hands, arm actions; Go2: sport, ROS 2 `/cmd_vel`; each
+channel carries a `note` explaining its values).
 
 ## 6. Humanoid and quadruped safety rules
 
@@ -518,7 +575,26 @@ Rules for Unitree, all enforced in code:
   empty, so on a humanoid both `isolate_network` and `quarantine_node` are
   refused (`fall_hazard`) before any rule is written. Even an OEM that
   lists them gets no execution without a human's approval: planner
-  orders are refused with `needs_approval`.
+  orders are refused with `needs_approval`. The G1 executor example also
+  sets `require_approval_for_all_containment: true`, which refuses the
+  planner's containment orders on every morphology.
+* **The approval is verified by the executor itself.** A human approval
+  counts only when the SOC's signed request, forwarded by agentd,
+  verifies with the executor's **own** copy of the SOC public keys
+  (`soc.keys` in `executor.json`, the same files as agentd's
+  `control_plane.soc_keys`) for this robot's id, inside the timestamp
+  window and never seen before (the executor's own replay store). A
+  compromised agentd cannot approve containment on its own. List the
+  robot's own public keys in `soc.robot_keys` (they are never accepted as
+  SOC keys). An action the SOC approved is lifted on request only by the
+  SOC's signed revert; TTL expiry and `robodr-executor revert-all` on the
+  robot still lift it.
+* **Quarantine scope.** A quarantine acts only on participants whose
+  SPDP locators lie in `network.quarantine.cidrs` and on the robot's DDS
+  ports; with none configured every quarantine is refused
+  (`locator_out_of_scope`). The scope may not be `/0` or overlap the
+  management or uplink networks. On a humanoid the robot network stays a
+  `low_level` motion path, so a quarantine never acts there anyway.
 * **Quadrupeds (Go2, B2).**
   * A `quarantine_node` always needs a human's approval, because it may
     cut a balance-relevant participant.
@@ -535,6 +611,22 @@ Rules for Unitree, all enforced in code:
 
 Take every address, port range and GUID prefix from your own
 commissioning captures (section 4). The example values are synthetic.
+
+**New executor refusal codes** (contract §6a): `soc_signature_invalid`,
+`soc_request_stale`, `soc_nonce_replayed`, `soc_replay_store_unavailable`,
+`order_mismatch`, `approval_missing` (the signed approval does not
+verify or does not match the order), `soc_keys_unavailable` (a key file
+in `soc.keys` cannot be read or is one of the robot's own keys: every
+control-plane order is refused until it is fixed), `approval_key_removed`
+(after a reboot, a held action whose approving key is no longer listed is
+not re-armed) and `locator_out_of_scope`.
+
+**Upgrading an existing executor configuration:** add `soc.keys` (without
+it every control-plane order is refused, `soc_signature_invalid`) and
+`network.quarantine.cidrs` (without it every quarantine is refused). When
+you rotate the SOC key, change agentd's `soc_keys` and the executor's
+`soc.keys` together, and keep the old key listed until the actions it
+approved have expired, or they are not re-armed after a reboot.
 
 ## 7. What the Unitree rules detect
 
@@ -693,8 +785,13 @@ the contract's section 5.
     writer's stream to its source IP and MAC (`e85471c`), but a host on the
     controller-side segment that sends with the controller's own IP and
     MAC cannot be told apart; keep only the controller on that port;
-  * loco `SetVelocity`, arm and hand SDK channels are not decided, and the
-    gateway's events file does not reach agentd or the SOC yet.
+  * the loco, arm SDK, arm action, hand and ROS 2 channels have been
+    tested on synthetic frames built from the SDK headers and examples
+    only; hand frames are never rewritten (a frame the firewall would
+    limit is suppressed); the arm-SDK engagement trusts the robot's
+    `rt/lowstate`; `/cmd_vel` has no duration (the firewall's
+    `state_reset_after_ns` applies, not a known stop time);
+  * the gateway's events file does not reach agentd or the SOC yet.
 * **Executor v1 is untested on a Unitree robot.** It has run against real
   nftables in network namespaces only. On a passive sensor box it has no
   effect, because the box is not in the path. On a humanoid with the

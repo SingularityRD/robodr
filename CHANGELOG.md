@@ -64,7 +64,11 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   refused.
 - `robodr-executor` (F8): the replay-store fence is the start time plus
   `soc.max_clock_skew_s` (agentd's `ReplayGuard` got the same fence in
-  the control plane v2 review, finding 5 above).
+  the control plane v2 review, finding 5 above). Like agentd's, the
+  executor's store now persists a wall-clock high-water mark
+  (`high_water_s` in `soc_nonces.json`, the latest second it dropped dead
+  pairs) and fences up to it plus the skew when the clock reads below it,
+  at start or while running (`soc_request_stale`).
 - `robodr-executor` (F9): `soc.robot_keys` (the robot's own public keys)
   are never accepted as SOC keys; a held action is re-armed only while its
   approving key is configured (`approval_key_removed`); a bad key file
