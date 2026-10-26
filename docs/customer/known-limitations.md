@@ -43,10 +43,13 @@
     GUID prefix, and a rogue on the same host over loopback are not
     covered.
   - Bridged traffic is isolated only with `br_netfilter` loaded.
-  - It trusts agentd's statement that a human approved an order; a
-    compromised agentd can obtain what the executor's own rules allow with
-    approval (still reversible, TTL-bounded, never the protected motion
-    path). Verification of the SOC signature in the executor is planned.
+  - It verifies the SOC's signed request itself (its own copy of the SOC
+    keys, its own replay store) before it executes a control-plane order,
+    so a compromised agentd cannot claim a human approval it does not
+    hold. It cannot check the SOC's internal approval process (who
+    approved, a two-person rule): that is the SOC's
+    ([`crates/robodr-executor/README.md`](../../crates/robodr-executor/README.md),
+    "Trust boundary").
   - A failed revert or a corrupt executor journal is reported in the
     request state, the black box and `status.json`, not yet as a finding.
 - **The Motion Firewall records only in the passive modes** (tap, mirror
@@ -54,7 +57,9 @@
   still reaches the motors ([`docs/UNITREE.md`](../UNITREE.md) section 5).
 - **The inline gateway** (`robodr-firewall-gw`, opt-in, sensor box bridged
   into the controller cable) enforces the envelopes on Unitree
-  `rt/lowcmd`, sport `Move` and Go1 legacy UDP
+  `rt/lowcmd`, sport `Move`, loco requests, the arm SDK, Dex3 / hand SDK,
+  arm action requests, ROS 2 `Twist` / `TwistStamped` on `rt/cmd_vel` and
+  Go1 legacy UDP
   ([`crates/robodr-firewall-gw/README.md`](../../crates/robodr-firewall-gw/README.md),
   "Known limits"). Before relying on it, check on site:
   - **all SPDP / SEDP between controller-side participants and the robot
@@ -76,8 +81,9 @@
   - **latency on your sensor box**: measured only on a shared development
     VM; the p99 gate must be measured on the target with the latency
     harness (`crates/robodr-firewall-gw/examples/gw_latency.rs`).
-  The gateway is IPv4 only, does not decide loco `SetVelocity`, arm or
-  hand SDK channels or ROS 2 `/cmd_vel` / `JointTrajectory`, forwards
+  The gateway is IPv4 only, does not decide ROS 2 `JointTrajectory`
+  (the loco, arm, hand and ROS 2 twist channels were tested on synthetic
+  frames only), forwards
   `led` / `fan` / `gpio` fields as sent, and writes its verdicts to a
   local events file that does not reach agentd or the SOC yet. It has not
   run on a robot, a real Cyclone DDS stack or a real sensor box. Start in
@@ -135,8 +141,9 @@
   against a local test PKI, not a deployed SOC; SOC client certificates
   cannot be revoked other than by removing the CA or pins and restarting.
 - **Keys are files**, not TPM-held. The robot side of SOC-driven uplink
-  and finding key rotation exists (`robodr-enroll`), but the SOC side is
-  not finished; the black-box key is rotated by hand. Anti-rollback state
+  and finding key rotation exists (`robodr-enroll`), and the SOC side is
+  on an unreleased AutoSecOps branch; the black-box key is rotated by
+  hand. Anti-rollback state
   is a plain file (S9, S10).
 - **The TPM head anchor is tested on swtpm only.** Head anchors make
   rollback and truncation *detectable*, not impossible
@@ -144,9 +151,12 @@
 - **The control-plane journal and replay store are checksummed, not
   signed.** Someone with write access to the state directory can make the
   robot forget requests or fence; the black box keeps every decision.
-- **The robot cannot verify SOC-side approvals**, and SOC keys have no
-  per-key action scopes. It verifies the SOC key and the client
-  certificate only ([ADR-0006](../adr/0006-approval-never-autonomous.md)).
+- **The robot cannot verify the SOC's internal approval process** (who
+  approved, a two-person rule), and SOC keys have no per-key action
+  scopes. agentd and the executor each verify the SOC's signature on the
+  request (and agentd the client certificate); the executor refuses a
+  control-plane order without a valid SOC-signed request
+  ([ADR-0006](../adr/0006-approval-never-autonomous.md)).
 - **Hand-written components remain:** the agentd HTTP server (fuzzed), the
   Kafka client, Reed-Solomon (pinned to an independent oracle)
   ([ADR-0007](../adr/0007-audited-libraries.md)). SHA-256 now comes from
@@ -170,9 +180,10 @@
   lifecycle exists (`robodr-enroll`: enrollment, uplink / finding key
   rotation, revocation lists and SOC profiles,
   [`docs/OPERATIONS.md`](../OPERATIONS.md) section 8.6), and AutoSecOps has
-  robot list and detail pages on its development branch, but its fleet API
-  is not finished, so enrollment, keys and updates are still handled per
-  robot. Update rings are information only; the secure-delivery design is
+  robot list and detail pages and the SOC side of the fleet API on its
+  unreleased development branch (enrollment ran end to end against it in
+  one container, `tools/e2e/RESULTS.md`), but there is no released fleet
+  console yet, so keys and updates are still handled per robot. Update rings are information only; the secure-delivery design is
   not implemented ([`docs/SECURE-DELIVERY.md`](../SECURE-DELIVERY.md)).
 - **More state to back up.** The control-plane state directory, the
   executor journal, the gateway's `rtps.state_file` and the fleet state
@@ -184,9 +195,10 @@
   multi-broker behaviour has only been tested against a fake broker.
 - **The `done/` markers and dead-letter files** of the exporters must be
   pruned by the operator.
-- **`robodr-uplink` has not been run against the AutoSecOps ingest
-  module.** Both pass the shared contract vectors; the module is on an
-  unreleased AutoSecOps branch.
+- **`robodr-uplink` has run against the AutoSecOps ingest module only in
+  one container** (TLS and loopback HTTP, `tools/e2e/RESULTS.md`), not
+  across a real network; the module is on an unreleased AutoSecOps
+  branch.
 
 ## Commercial
 

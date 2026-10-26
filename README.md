@@ -209,8 +209,9 @@ qemu. No release has been cut or signed, and GitHub CI has never run
   and `rollback_config` are never executed
   ([crate README](crates/robodr-executor/README.md)).
 - **In-path gateway** (`robodr-firewall-gw`, optional): a bridged sensor
-  box that passes, limits, holds or removes Unitree motion samples
-  (`rt/lowcmd`, sport `Move`, Go1 UDP) and never originates one;
+  box that passes, limits, holds or removes Unitree and ROS 2 motion
+  samples (`rt/lowcmd`, sport `Move`, loco requests, arm SDK, hands,
+  `rt/cmd_vel` twists, Go1 UDP) and never originates one;
   `fail_closed` by default. It protects only what crosses its bridge
   ([crate README](crates/robodr-firewall-gw/README.md), "Known limits").
 - **Fleet lifecycle, robot side** (`robodr-enroll`): enrollment with a
@@ -235,13 +236,15 @@ qemu. No release has been cut or signed, and GitHub CI has never run
   reference servers and a local test PKI, not across a real network. The
   AutoSecOps side (ingest module, control-plane v2 client, approvals, robot
   pages) is on an unreleased AutoSecOps branch and passes the shared
-  contract vectors; the two have not been run against each other, and the
-  AutoSecOps fleet API is not finished.
+  contract vectors. In one container the uplink-to-case path and fleet
+  enrollment ran end to end against it (`tools/e2e/RESULTS.md`), not
+  across a real network.
 - Zenoh is detected, not decoded; DDS-Security payloads, RTI Connext and
   arm64 hardware are untested; `robodr-pulsard` ran only under WSL2, and
   the host rules were never loaded into a running rules engine on a robot.
 - Kafka and the anchor receiver have no TLS. Keys are files, not TPM-held.
-  The executor cannot yet verify the SOC's approval itself.
+  The executor verifies the SOC's signed request itself, but not the
+  SOC's internal approval process.
 - Reviews were done by independent AI agents, not humans; there has been no
   penetration test. RoboDR is not a safety-rated component
   ([`docs/compliance/safety-positioning.md`](docs/compliance/safety-positioning.md)).

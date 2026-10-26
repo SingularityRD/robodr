@@ -2184,9 +2184,13 @@ Troubleshooting (journal, `journalctl -u robodr-uplink`):
 
 ### 8.6 Fleet lifecycle: enrollment, key rotation, SOC profiles (`robodr-enroll`)
 
-**available (robot side)**; the AutoSecOps side of the fleet API
-(`/robot-edr/v2/fleet/*`, contract `docs/contracts/robodr.fleet-api.md`,
-shared vectors `docs/contracts/fixtures/fleet/`) is not built yet.
+**available**, robot side and AutoSecOps side: the AutoSecOps side of the
+fleet API (`/robot-edr/v2/fleet/*`, contract
+`docs/contracts/robodr.fleet-api.md`, shared vectors
+`docs/contracts/fixtures/fleet/`) is built on AutoSecOps' unreleased
+`claude/robodr-ingest` branch, and fleet enrollment (SOC token,
+`robodr-enroll`, three keys registered, signed answer) ran end to end
+against it on loopback (`tools/e2e/RESULTS.md`).
 `robodr-enroll` is a root-only tool (`/usr/sbin`, no service). It keeps its
 state in `/var/lib/robodr/fleet` (0700 root, created by the package's
 tmpfiles) and records every step in its own signed journal
