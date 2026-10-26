@@ -376,7 +376,26 @@ pub struct CaptureDiagnostics {
     /// was learned.
     #[serde(default)]
     pub zenoh_packets: u64,
+    /// Unitree legacy UDP datagrams (Go1 generation) seen on the configured
+    /// legacy ports (`learn --unitree-legacy`).
+    #[serde(default)]
+    pub unitree_legacy_frames: u64,
+    /// Legacy commands (`HighCmd` / decodable `LowCmd`) learned.
+    #[serde(default)]
+    pub unitree_legacy_commands: u64,
+    /// Legacy datagrams that are no decodable frame (compressed low-level
+    /// form, unknown length): not learned.
+    #[serde(default)]
+    pub unitree_legacy_undecodable: u64,
+    /// Source IPs that sent legacy commands (at most
+    /// [`MAX_LEGACY_SENDERS`]): the candidates for the sensor's
+    /// `unitree_legacy.command_senders`, to be confirmed by the operator.
+    #[serde(default)]
+    pub unitree_legacy_command_senders: BTreeSet<String>,
 }
+
+/// Most legacy command senders listed in [`CaptureDiagnostics`].
+pub const MAX_LEGACY_SENDERS: usize = 64;
 
 impl CaptureDiagnostics {
     /// Fragmented discovery was seen but at least one sample was not
@@ -389,7 +408,18 @@ impl CaptureDiagnostics {
 
     /// Sum of two runs' counters.
     pub fn add(&mut self, o: &CaptureDiagnostics) {
-        let pairs: [(&mut u64, u64); 20] = [
+        for ip in &o.unitree_legacy_command_senders {
+            if self.unitree_legacy_command_senders.len() < MAX_LEGACY_SENDERS {
+                self.unitree_legacy_command_senders.insert(ip.clone());
+            }
+        }
+        let pairs: [(&mut u64, u64); 23] = [
+            (&mut self.unitree_legacy_frames, o.unitree_legacy_frames),
+            (&mut self.unitree_legacy_commands, o.unitree_legacy_commands),
+            (
+                &mut self.unitree_legacy_undecodable,
+                o.unitree_legacy_undecodable,
+            ),
             (&mut self.zenoh_packets, o.zenoh_packets),
             (&mut self.motion_samples, o.motion_samples),
             (
@@ -456,6 +486,18 @@ pub struct PcapSource<R: Read> {
     motion_samples: u64,
     motion_undecodable: u64,
     motion_unattributed: u64,
+    legacy_commands: u64,
+    legacy_undecodable: u64,
+    legacy_senders: BTreeSet<String>,
+}
+
+/// Options of the capture inputs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InputOptions {
+    /// Also learn Unitree legacy UDP (Go1 generation) frames on these UDP
+    /// ports (source or destination); empty = off. See
+    /// [`PcapSource::new_with_options`].
+    pub unitree_legacy_ports: BTreeSet<u16>,
 }
 
 /// Most motion writers tracked per capture.
@@ -466,23 +508,51 @@ const MAX_SPDP_PARTICIPANTS: usize = 4096;
 impl PcapSource<BufReader<File>> {
     /// Open a capture file (format detected from its magic).
     pub fn open(path: &std::path::Path) -> Result<Self, InputError> {
+        Self::open_with_options(path, &InputOptions::default())
+    }
+
+    /// [`PcapSource::open`] with [`InputOptions`].
+    pub fn open_with_options(
+        path: &std::path::Path,
+        opts: &InputOptions,
+    ) -> Result<Self, InputError> {
         let label = path.display().to_string();
         let file = File::open(path).map_err(|error| InputError::Io {
             source: label.clone(),
             error,
         })?;
-        Self::new(label, BufReader::new(file))
+        Self::new_with_options(label, BufReader::new(file), opts)
     }
 }
 
 impl<R: Read> PcapSource<R> {
     /// Read a capture from any reader (pcap or pcapng, detected).
     pub fn new(label: impl Into<String>, reader: R) -> Result<Self, InputError> {
+        Self::new_with_options(label, reader, &InputOptions::default())
+    }
+
+    /// [`PcapSource::new`] with [`InputOptions`]. With
+    /// `unitree_legacy_ports`, UDP on those ports that is not RTPS is
+    /// decoded as Unitree legacy frames
+    /// (`robodr_cdr::unitree_legacy::LegacyFrame`, by length): every
+    /// `HighCmd` and decodable `LowCmd` becomes a `MotionCommand` on
+    /// `/unitree_legacy/high_cmd` / `/unitree_legacy/low_cmd` (no source
+    /// GUID: the legacy protocol has none), learned like any other
+    /// command; the learner makes those channels writable. State frames are
+    /// not learned. The command senders' IPs are listed in
+    /// [`CaptureDiagnostics::unitree_legacy_command_senders`].
+    pub fn new_with_options(
+        label: impl Into<String>,
+        reader: R,
+        opts: &InputOptions,
+    ) -> Result<Self, InputError> {
         let label = label.into();
         let file = CaptureFile::new(reader).map_err(|e| capture_error(&label, &e))?;
+        let filter = robodr_capture::RtpsFilter::default()
+            .with_legacy_udp_ports(opts.unitree_legacy_ports.iter().copied());
         Ok(Self {
             label,
-            datagrams: robodr_capture::rtps_datagrams(file),
+            datagrams: RtpsDatagrams::new(file, filter),
             frag: FragmentReassembler::default(),
             queue: VecDeque::new(),
             not_rtps: 0,
@@ -497,6 +567,9 @@ impl<R: Read> PcapSource<R> {
             motion_samples: 0,
             motion_undecodable: 0,
             motion_unattributed: 0,
+            legacy_commands: 0,
+            legacy_undecodable: 0,
+            legacy_senders: BTreeSet::new(),
         })
     }
 }
@@ -546,6 +619,10 @@ impl<R: Read> EventSource for PcapSource<R> {
             };
             // The frame that completed this datagram (last fragment, if any).
             let position = self.datagrams.stats().frames;
+            if pkt.kind == robodr_capture::PacketKind::UnitreeLegacy {
+                self.legacy_event(&pkt, position);
+                continue;
+            }
             let Some(report) = self.frag.parse_datagram_detailed(&pkt.payload) else {
                 // Cyclone DDS sends a 1-byte datagram to its own receive
                 // sockets to wake its threads on shutdown (seen on every
@@ -663,11 +740,56 @@ impl<R: Read> EventSource for PcapSource<R> {
             motion_samples_undecodable: motion.1,
             motion_samples_unattributed: motion.2,
             zenoh_packets: c.zenoh,
+            unitree_legacy_frames: c.legacy_udp,
+            unitree_legacy_commands: self.legacy_commands,
+            unitree_legacy_undecodable: self.legacy_undecodable,
+            unitree_legacy_command_senders: self.legacy_senders.clone(),
         })
     }
 }
 
 impl<R: Read> PcapSource<R> {
+    /// One Unitree legacy UDP datagram (see [`PcapSource::new_with_options`]).
+    fn legacy_event(&mut self, pkt: &robodr_capture::RtpsPacket, position: u64) {
+        use robodr_cdr::unitree_legacy::LegacyFrame;
+        let frame = match LegacyFrame::decode(&pkt.payload) {
+            Ok(f) => f,
+            Err(_) => {
+                self.legacy_undecodable += 1;
+                return;
+            }
+        };
+        if !frame.is_command() {
+            return;
+        }
+        let ts = Some(pkt.ts);
+        let channel = frame.channel();
+        let mut event = frame.to_event(&robodr_cdr::EventContext {
+            channel,
+            writer_guid: None,
+            timestamp_ns: u64::try_from(pkt.ts.as_nanos()).unwrap_or(u64::MAX),
+        });
+        if let (RobotEvent::MotionCommand(c), Some(jf)) = (&mut event, frame.joint_command_frame())
+        {
+            if let Some(prev) = self.last_joint_frames.get_mut(channel) {
+                c.joint_position_step = jf.max_position_step(prev);
+                *prev = jf;
+            } else if self.last_joint_frames.len() < MAX_MOTION_WRITERS {
+                self.last_joint_frames.insert(channel.to_string(), jf);
+            }
+        }
+        self.legacy_commands += 1;
+        if self.legacy_senders.len() < MAX_LEGACY_SENDERS {
+            self.legacy_senders.insert(pkt.src.to_string());
+        }
+        self.queue.push_back(SourcedEvent {
+            position,
+            event,
+            ts,
+            origin: None,
+        });
+    }
+
     /// Decode the motion command samples of one datagram (see the module
     /// docs) and queue them as `MotionCommand` events.
     fn motion_events(&mut self, payload: &[u8], src_ip: &str, position: u64, ts: Option<Duration>) {
@@ -757,9 +879,17 @@ pub enum InputSpec {
 
 /// Open an input. The single place new input kinds are plugged in.
 pub fn open(spec: &InputSpec) -> Result<Box<dyn EventSource>, InputError> {
+    open_with_options(spec, &InputOptions::default())
+}
+
+/// [`open`] with [`InputOptions`] (they apply to captures only).
+pub fn open_with_options(
+    spec: &InputSpec,
+    opts: &InputOptions,
+) -> Result<Box<dyn EventSource>, InputError> {
     match spec {
         InputSpec::Jsonl(p) => Ok(Box::new(JsonlSource::open(p)?)),
-        InputSpec::Pcap(p) => Ok(Box::new(PcapSource::open(p)?)),
+        InputSpec::Pcap(p) => Ok(Box::new(PcapSource::open_with_options(p, opts)?)),
     }
 }
 

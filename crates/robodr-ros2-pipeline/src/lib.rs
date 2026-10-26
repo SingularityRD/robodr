@@ -72,6 +72,7 @@ pub mod binding;
 pub mod config;
 pub mod dedup;
 pub mod identity;
+pub mod legacy;
 pub mod motion;
 pub mod pipeline;
 pub mod profile_trust;
@@ -84,10 +85,12 @@ pub mod watch;
 pub use binding::{BindingOptions, BindingStats, BindingTable, Ingress};
 pub use config::{
     BindingConfig, CaptureConfig, CaptureInput, CaptureSettings, Config, Settings, SpdpSettings,
+    UnitreeLegacyConfig,
 };
 pub use dedup::DedupSet;
 pub use identity::{IdentityResolver, IdentityStats, NodeEvidence, Resolution};
-pub use motion::{MotionOptions, MotionSample, MotionStats, SampleAttribution};
+pub use legacy::{LegacyOptions, LegacyStats};
+pub use motion::{JointCommandSample, MotionOptions, MotionSample, MotionStats, SampleAttribution};
 pub use pipeline::{
     load_profile, rules, Finding, LoadedProfile, Pipeline, PipelineOptions, PipelineStats,
     ProcessOutput, ProfileStatus, ThreatExtra, OBSERVE_ONLY_TAG,
@@ -97,8 +100,8 @@ pub use profile_trust::{
 };
 pub use sanitize::{sanitize, MAX_TEXT_CHARS};
 pub use source::{
-    CaptureDatagramSource, CaptureHealth, Datagram, DatagramSource, MergedDatagramSource,
-    SharedHealth, VecDatagramSource,
+    CaptureDatagramSource, CaptureHealth, Datagram, DatagramSource, LegacyUdp,
+    MergedDatagramSource, SharedHealth, VecDatagramSource,
 };
 
 // Re-exported so the Pulsar glue needs no direct dependency on these crates.

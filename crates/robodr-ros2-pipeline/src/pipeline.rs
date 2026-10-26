@@ -31,6 +31,7 @@
 //! | the profile failed `Profile::validate`, or a locked profile file failed the commissioning file check (seal: edited after `lock`) or the trust check (signature, trust anchors, platform/unit, anti-rollback; see [`crate::profile_trust`]) (once, [`Pipeline::status_findings`]) | [`rules::PROFILE_REFUSED`] | High |
 //! | one input produced more than `max_findings_per_datagram` new findings | [`rules::FINDINGS_CAPPED`] | most severe suppressed, >= Medium |
 //! | user DATA on a motion / feedback topic ([`crate::motion`]): undecodable, unattributed (writer never announced), from an IP outside the writer's binding; decoded commands through `Profile::evaluate` | [`rules::MOTION_UNDECODABLE_SAMPLE`], [`rules::MOTION_UNATTRIBUTED_SAMPLE`], [`rules::MOTION_SAMPLE_SOURCE_MISMATCH`], the profile's `robot.motion.*` rules | Medium (rate limited) / High / Critical (command) or High (feedback) / as the profile says |
+//! | Unitree legacy UDP ([`crate::legacy`], off by default): a frame from an unlisted sender, an undecodable payload on a legacy port; decoded commands through `Profile::evaluate` | [`rules::LEGACY_UNKNOWN_SENDER`], [`rules::MOTION_UNDECODABLE_SAMPLE`], the profile's `robot.motion.*` rules | Critical (command) / Medium (state); Medium (rate limited); as the profile says |
 //!
 //! # Motion samples
 //!
@@ -107,7 +108,7 @@ use std::time::{Duration, Instant};
 
 use robodr_commission::ProfileFileError;
 use robodr_events::profile::{Profile, ProfileError};
-use robodr_events::{Deviation, Mode, Severity};
+use robodr_events::{Deviation, Mode, RobotEvent, Severity};
 use robodr_rtps::{
     hex12, hex_guid, Anomaly, DatagramReport, EndpointKind, FragmentEventKind, FragmentReassembler,
     ReassemblyLimits,
@@ -119,10 +120,13 @@ use crate::binding::{
 };
 use crate::dedup::DedupSet;
 use crate::identity::{IdentityResolver, IdentityStats, Resolution};
-use crate::motion::{DatagramCtx, MotionOptions, MotionSample, MotionStats, MotionTracker};
+use crate::legacy::{self, LegacyOptions, LegacyStats};
+use crate::motion::{
+    DatagramCtx, MotionOptions, MotionSample, MotionStats, MotionTracker, SampleAttribution,
+};
 use crate::ratelimit::{self, RateLimiter};
 use crate::sanitize::sanitize;
-use crate::source::{CaptureHealth, Datagram};
+use crate::source::{CaptureHealth, Datagram, LegacyUdp};
 
 /// Prefix added to the threat description of every observe-only finding.
 pub const OBSERVE_ONLY_TAG: &str = "[observe-only] ";
@@ -337,6 +341,7 @@ pub mod rules {
         ENDPOINT_SOURCE_MISMATCH, ENDPOINT_UNANNOUNCED_PARTICIPANT, PARTICIPANT_SOURCE_MISMATCH,
     };
     pub use crate::identity::rules::IDENTITY_INSTANCES_EXCEEDED;
+    pub use crate::legacy::rules::LEGACY_UNKNOWN_SENDER;
     pub use crate::motion::rules::{
         MOTION_API_ID_OUT_OF_RANGE, MOTION_DECODE_ANOMALY, MOTION_SAMPLE_SOURCE_MISMATCH,
         MOTION_UNATTRIBUTED_SAMPLE, MOTION_UNDECODABLE_SAMPLE, MOTION_UNVERIFIABLE_COMMAND,
@@ -367,6 +372,9 @@ pub struct PipelineOptions {
     pub max_findings_per_datagram: usize,
     /// The user-DATA motion decode path ([`crate::motion`]).
     pub motion: MotionOptions,
+    /// Unitree legacy UDP (Go1 generation, [`crate::legacy`]); off by
+    /// default.
+    pub legacy: LegacyOptions,
 }
 
 impl Default for PipelineOptions {
@@ -381,6 +389,7 @@ impl Default for PipelineOptions {
             rate_limit_interval: ratelimit::DEFAULT_INTERVAL,
             max_findings_per_datagram: DEFAULT_MAX_FINDINGS_PER_DATAGRAM,
             motion: MotionOptions::default(),
+            legacy: LegacyOptions::default(),
         }
     }
 }
@@ -600,6 +609,8 @@ pub struct PipelineStats {
     pub binding: BindingStats,
     /// The motion decode path.
     pub motion: MotionStats,
+    /// The Unitree legacy UDP path.
+    pub legacy: LegacyStats,
     /// Run-time participant identity resolution ([`crate::identity`]).
     pub identity: IdentityStats,
 }
@@ -1060,6 +1071,15 @@ impl Pipeline {
         datagram: &Datagram,
         capture_ns: u64,
     ) -> ProcessOutput {
+        if let Some(udp) = &datagram.legacy {
+            return self.process_legacy_at(
+                &datagram.payload,
+                &datagram.src_ip,
+                udp,
+                Instant::now(),
+                capture_ns,
+            );
+        }
         self.process_with_motion_at(
             &datagram.payload,
             &datagram.src_ip,
@@ -1067,6 +1087,85 @@ impl Pipeline {
             Instant::now(),
             capture_ns,
         )
+    }
+
+    /// One Unitree legacy UDP datagram ([`crate::legacy`]): decoded by its
+    /// length, its sender checked, the command evaluated (if
+    /// `motion.evaluate_commands`) and returned as a [`MotionSample`]
+    /// (commands always; feedback when its channel is a configured
+    /// feedback topic). Dropped (counted) while the legacy path is off.
+    pub fn process_legacy_at(
+        &mut self,
+        payload: &[u8],
+        src_ip: &str,
+        udp: &LegacyUdp,
+        now: Instant,
+        capture_ns: u64,
+    ) -> ProcessOutput {
+        self.stats.datagrams += 1;
+        self.stats.legacy.datagrams += 1;
+        let mut out = Vec::new();
+        self.expire_into(now, &mut out);
+        let mut motion = Vec::new();
+        if !self.opts.legacy.enabled {
+            self.stats.legacy.ignored += 1;
+            return ProcessOutput {
+                findings: self.emit(out, now),
+                motion,
+            };
+        }
+        let ip = parse_src_ip(src_ip);
+        let r = legacy::process(
+            &self.opts.legacy,
+            &mut self.stats.legacy,
+            payload,
+            src_ip,
+            ip,
+            udp,
+            capture_ns,
+        );
+        for dev in r.deviations {
+            self.push(&mut out, dev, src_ip);
+        }
+        if let Some((mut event, frame, allowed)) = r.event {
+            let command = frame.is_command();
+            let channel = frame.channel();
+            if let (RobotEvent::MotionCommand(c), Some(jf)) =
+                (&mut event, frame.joint_command_frame())
+            {
+                self.motion.note_joint_frame(channel, jf, c);
+            }
+            let wanted = command || self.opts.motion.feedback_topics.contains(channel);
+            if command && self.opts.motion.evaluate_commands {
+                if let Some(dev) = self.profile.evaluate(&event) {
+                    self.push(&mut out, dev, src_ip);
+                }
+            }
+            if wanted {
+                motion.push(MotionSample {
+                    event,
+                    src_ip: src_ip.to_string(),
+                    writer_guid: format!("udp:{src_ip}:{}", udp.src_port),
+                    topic: channel.to_string(),
+                    type_name: legacy::type_label(frame.kind()).to_string(),
+                    sequence_number: 0,
+                    source_timestamp: None,
+                    capture_ns,
+                    from_fragments: false,
+                    trailing_bytes: 0,
+                    attribution: if allowed {
+                        SampleAttribution::Bound
+                    } else {
+                        SampleAttribution::Unbound
+                    },
+                    joint: None,
+                });
+            }
+        }
+        ProcessOutput {
+            findings: self.emit(out, now),
+            motion,
+        }
     }
 
     fn expire_into(&mut self, now: Instant, out: &mut Vec<Candidate>) {
@@ -1239,8 +1338,21 @@ impl Pipeline {
     }
 
     /// Process a [`Datagram`] from a [`crate::DatagramSource`], including
-    /// its [`Ingress`].
+    /// its [`Ingress`]. A Unitree legacy UDP datagram ([`Datagram::legacy`])
+    /// goes to [`Pipeline::process_legacy_at`].
     pub fn process_datagram(&mut self, datagram: &Datagram) -> Vec<Finding> {
+        if let Some(udp) = &datagram.legacy {
+            let capture_ns = self.default_capture_ns(Instant::now());
+            return self
+                .process_legacy_at(
+                    &datagram.payload,
+                    &datagram.src_ip,
+                    udp,
+                    Instant::now(),
+                    capture_ns,
+                )
+                .findings;
+        }
         self.process_from_at(
             &datagram.payload,
             &datagram.src_ip,

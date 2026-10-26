@@ -98,7 +98,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use robodr_capture::ports::{MAX_DOMAIN_ID as PORTMAP_MAX_DOMAIN, MAX_PARTICIPANT_ID};
-use robodr_capture::RtpsPortMap;
+use robodr_capture::{RtpsFilter, RtpsPortMap};
 use robodr_rtps::ReassemblyLimits;
 use serde::Deserialize;
 
@@ -174,6 +174,123 @@ pub struct Config {
     /// See [`crate::profile_trust`]. Default: nothing trusted, so a locked
     /// profile runs observe-only.
     pub profile_trust: ProfileTrustConfig,
+    /// Unitree legacy UDP (Go1 generation, `unitree_legacy` sub-table).
+    /// See [`crate::legacy`]. Off by default.
+    pub unitree_legacy: UnitreeLegacyConfig,
+}
+
+/// `[module.robodr-sensor-ros2.unitree_legacy]`. See [`crate::legacy`].
+///
+/// ```toml
+/// [module.robodr-sensor-ros2.unitree_legacy]
+/// enabled = true
+/// ports = [8007, 8080, 8082, 8090]          # default: the SDK's ports
+/// command_senders = ["192.168.123.15"]      # the operator's client PC(s)
+/// robot_addresses = ["192.168.123.10", "192.168.123.161"]   # default
+/// ```
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct UnitreeLegacyConfig {
+    /// Decode legacy UDP (default off).
+    pub enabled: bool,
+    /// UDP ports (source or destination) carrying legacy frames.
+    pub ports: Vec<u16>,
+    /// Source IPs allowed to send `HighCmd` / `LowCmd`.
+    pub command_senders: Vec<String>,
+    /// The robot's addresses (state senders).
+    pub robot_addresses: Vec<String>,
+}
+
+impl Default for UnitreeLegacyConfig {
+    fn default() -> Self {
+        let d = crate::legacy::LegacyOptions::default();
+        Self {
+            enabled: d.enabled,
+            ports: d.ports.into_iter().collect(),
+            command_senders: Vec::new(),
+            robot_addresses: d.robot_addresses.iter().map(ToString::to_string).collect(),
+        }
+    }
+}
+
+impl UnitreeLegacyConfig {
+    /// Validate into [`crate::legacy::LegacyOptions`].
+    pub fn validate(
+        &self,
+        warnings: &mut Vec<String>,
+    ) -> Result<crate::legacy::LegacyOptions, String> {
+        use crate::legacy::MAX_LEGACY_ADDRESSES;
+        let mut ports = std::collections::BTreeSet::new();
+        if self.enabled && self.ports.is_empty() {
+            return Err("unitree_legacy.ports is empty: no legacy UDP would be captured".into());
+        }
+        if self.ports.len() > robodr_capture::MAX_LEGACY_UDP_PORTS {
+            return Err(format!(
+                "unitree_legacy.ports has {} entries, at most {}",
+                self.ports.len(),
+                robodr_capture::MAX_LEGACY_UDP_PORTS
+            ));
+        }
+        for p in &self.ports {
+            if *p == 0 {
+                return Err("unitree_legacy.ports must not contain 0".into());
+            }
+            if !ports.insert(*p) {
+                return Err(format!("unitree_legacy.ports lists {p} twice"));
+            }
+        }
+        let addrs =
+            |what: &str, list: &[String]| -> Result<std::collections::BTreeSet<IpAddr>, String> {
+                if list.len() > MAX_LEGACY_ADDRESSES {
+                    return Err(format!(
+                        "unitree_legacy.{what} has {} entries, at most {MAX_LEGACY_ADDRESSES}",
+                        list.len()
+                    ));
+                }
+                let mut out = std::collections::BTreeSet::new();
+                for a in list {
+                    let ip: IpAddr = a.parse().map_err(|_| {
+                        format!(
+                            "unitree_legacy.{what} entry {:?} is not an IP address",
+                            crate::sanitize::sanitize(a)
+                        )
+                    })?;
+                    if !out.insert(ip) {
+                        return Err(format!("unitree_legacy.{what} lists {ip} twice"));
+                    }
+                }
+                Ok(out)
+            };
+        let command_senders = addrs("command_senders", &self.command_senders)?;
+        let robot_addresses = addrs("robot_addresses", &self.robot_addresses)?;
+        if self.enabled {
+            if command_senders.is_empty() {
+                warnings.push(
+                    "unitree_legacy.command_senders is empty: every legacy HighCmd / LowCmd is \
+                     reported as coming from an unknown sender (Critical)"
+                        .into(),
+                );
+            }
+            if robot_addresses.is_empty() {
+                warnings.push(
+                    "unitree_legacy.robot_addresses is empty: every legacy state frame is \
+                     reported as coming from an unknown sender"
+                        .into(),
+                );
+            }
+            if let Some(both) = command_senders.intersection(&robot_addresses).next() {
+                warnings.push(format!(
+                    "unitree_legacy: {both} is both a command sender and a robot address"
+                ));
+            }
+        }
+        Ok(crate::legacy::LegacyOptions {
+            enabled: self.enabled,
+            ports,
+            command_senders,
+            robot_addresses,
+        })
+    }
 }
 
 impl Default for Config {
@@ -195,6 +312,7 @@ impl Default for Config {
             binding: BindingConfig::default(),
             motion: MotionConfig::default(),
             profile_trust: ProfileTrustConfig::default(),
+            unitree_legacy: UnitreeLegacyConfig::default(),
         }
     }
 }
@@ -536,6 +654,9 @@ pub struct CaptureSettings {
     pub port_map: RtpsPortMap,
     pub read_timeout: Duration,
     pub queue_capacity: usize,
+    /// Unitree legacy UDP ports the capture filter also accepts (empty
+    /// unless `unitree_legacy.enabled`).
+    pub legacy_udp_ports: std::collections::BTreeSet<u16>,
 }
 
 /// Validated, ready-to-use settings.
@@ -714,10 +835,21 @@ impl Config {
             None
         };
 
-        let capture = self.validate_capture(&mut warnings, default_iface)?;
+        let mut capture = self.validate_capture(&mut warnings, default_iface)?;
         let binding = self.binding.validate(&mut warnings)?;
         let motion = self.motion.validate(&mut warnings)?;
         self.profile_trust.validate()?;
+        let legacy = self.unitree_legacy.validate(&mut warnings)?;
+        if legacy.enabled {
+            match capture.as_mut() {
+                Some(c) => c.legacy_udp_ports = legacy.ports.clone(),
+                None => warnings.push(
+                    "unitree_legacy.enabled needs capture.enabled: legacy UDP is only seen by \
+                     the packet capture"
+                        .into(),
+                ),
+            }
+        }
 
         Ok((
             Settings {
@@ -735,6 +867,7 @@ impl Config {
                     rate_limit_interval: Duration::from_millis(self.rate_limit_interval_ms),
                     max_findings_per_datagram: self.max_findings_per_datagram,
                     motion,
+                    legacy,
                 },
                 profile_trust: self.profile_trust.clone(),
             },
@@ -861,6 +994,7 @@ impl Config {
             domain_ids: domains,
             read_timeout: Duration::from_millis(c.read_timeout_ms),
             queue_capacity: c.queue_capacity,
+            legacy_udp_ports: std::collections::BTreeSet::new(),
         }))
     }
 }
@@ -877,12 +1011,20 @@ impl CaptureSettings {
         use crate::source::CaptureDatagramSource;
         match &self.input {
             CaptureInput::Replay { path } => Ok(Box::new(
-                CaptureDatagramSource::open_file(path, self.port_map.clone())?.with_stop_flag(stop),
+                CaptureDatagramSource::open_file_with_filter(path, self.filter())?
+                    .with_stop_flag(stop),
             )),
             CaptureInput::Live { interfaces } => {
-                open_live(interfaces, self.port_map.clone(), self.read_timeout, stop)
+                open_live(interfaces, self.filter(), self.read_timeout, stop)
             }
         }
+    }
+
+    /// The capture filter: the port map's RTPS ports or the `RTPS` magic,
+    /// plus the Unitree legacy UDP ports when configured.
+    pub fn filter(&self) -> RtpsFilter {
+        crate::source::rtps_filter(self.port_map.clone())
+            .with_legacy_udp_ports(self.legacy_udp_ports.iter().copied())
     }
 }
 
@@ -910,7 +1052,7 @@ pub fn split_by_ingress(
 ))]
 fn open_live(
     interfaces: &[String],
-    port_map: RtpsPortMap,
+    filter: RtpsFilter,
     timeout: Duration,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<Box<dyn crate::DatagramSource + Send>> {
@@ -919,9 +1061,9 @@ fn open_live(
     // captures, so a loopback source address can be told apart from a forged
     // one on the wire (crate::binding, "Same-host traffic over loopback").
     if let Some((lo, other)) = split_by_ingress(interfaces, is_loopback_interface) {
-        let a = CaptureDatagramSource::open_live(&lo, port_map.clone(), timeout)?
+        let a = CaptureDatagramSource::open_live_with_filter(&lo, filter.clone(), timeout)?
             .with_stop_flag(stop.clone());
-        let b = CaptureDatagramSource::open_live(&other, port_map, timeout)?
+        let b = CaptureDatagramSource::open_live_with_filter(&other, filter, timeout)?
             .with_stop_flag(stop.clone());
         return Ok(Box::new(MergedDatagramSource::new(
             vec![Box::new(a), Box::new(b)],
@@ -929,7 +1071,8 @@ fn open_live(
         )?));
     }
     Ok(Box::new(
-        CaptureDatagramSource::open_live(interfaces, port_map, timeout)?.with_stop_flag(stop),
+        CaptureDatagramSource::open_live_with_filter(interfaces, filter, timeout)?
+            .with_stop_flag(stop),
     ))
 }
 
@@ -945,7 +1088,7 @@ fn open_live(
 )))]
 fn open_live(
     _interfaces: &[String],
-    _port_map: RtpsPortMap,
+    _filter: RtpsFilter,
     _timeout: Duration,
     _stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<Box<dyn crate::DatagramSource + Send>> {

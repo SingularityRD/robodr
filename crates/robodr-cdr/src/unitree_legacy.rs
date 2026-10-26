@@ -38,7 +38,7 @@
 //!
 //! Pure decode from `&[u8]`; no `unsafe`, no allocation, no panic.
 
-use robodr_events::MotionCommand;
+use robodr_events::{MotionCommand, MotionFeedback, RobotEvent};
 
 use crate::event::{command_class, EventContext};
 use crate::unitree::crc::frame_crc;
@@ -777,6 +777,167 @@ impl LegacyKind {
     }
 }
 
+/// The motion channels the legacy UDP frames are mapped onto. The legacy
+/// protocol has no topic names; these fixed names key the profile's motion
+/// envelopes (and the motion monitor's feedback sources) for a Go1-generation
+/// robot. They live under one reserved prefix so a DDS topic can never be
+/// mistaken for one.
+pub mod channels {
+    /// Every legacy channel starts with this.
+    pub const PREFIX: &str = "/unitree_legacy/";
+    /// `HighCmd` (sport mode: body velocity, posture, tricks).
+    pub const HIGH_CMD: &str = "/unitree_legacy/high_cmd";
+    /// `LowCmd` (per-motor joint command).
+    pub const LOW_CMD: &str = "/unitree_legacy/low_cmd";
+    /// `HighState` (body velocity, IMU, joint state).
+    pub const HIGH_STATE: &str = "/unitree_legacy/high_state";
+    /// `LowState` (IMU, joint state).
+    pub const LOW_STATE: &str = "/unitree_legacy/low_state";
+    /// The four channels.
+    pub const ALL: [&str; 4] = [HIGH_CMD, LOW_CMD, HIGH_STATE, LOW_STATE];
+}
+
+/// One decoded legacy UDP frame, classified by its length
+/// ([`LegacyKind::for_len`]: the protocol has no type tag).
+#[allow(clippy::large_enum_variant)] // decoded once per datagram, not stored
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LegacyFrame {
+    HighCmd(LegacyHighCmd),
+    HighState(LegacyHighState),
+    LowCmd(LegacyLowCmd),
+    LowState(LegacyLowState),
+}
+
+/// Why a UDP payload on a legacy port is not a decodable legacy frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyFrameError {
+    /// A v3.8.6 "compressed" low-level frame (614 / 807 bytes): its layout
+    /// is not published, so it cannot be inspected.
+    Compressed { kind: LegacyKind, len: usize },
+    /// No legacy frame has this length.
+    UnknownLength { len: usize },
+}
+
+impl std::fmt::Display for LegacyFrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LegacyFrameError::Compressed { kind, len } => write!(
+                f,
+                "legacy {kind:?} in the compressed {len}-byte wire form, whose layout is not \
+                 published (not inspected)"
+            ),
+            LegacyFrameError::UnknownLength { len } => {
+                write!(f, "{len}-byte UDP payload is no legacy Unitree frame")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LegacyFrameError {}
+
+impl LegacyFrame {
+    /// Decode a UDP payload by its length. Never panics.
+    pub fn decode(buf: &[u8]) -> Result<Self, LegacyFrameError> {
+        let len = buf.len();
+        let unknown = LegacyFrameError::UnknownLength { len };
+        match LegacyKind::for_len(len) {
+            None => Err(unknown),
+            Some((kind, false)) => Err(LegacyFrameError::Compressed { kind, len }),
+            Some((LegacyKind::HighCmd, true)) => LegacyHighCmd::decode(buf)
+                .map(LegacyFrame::HighCmd)
+                .map_err(|_| unknown),
+            Some((LegacyKind::HighState, true)) => LegacyHighState::decode(buf)
+                .map(LegacyFrame::HighState)
+                .map_err(|_| unknown),
+            Some((LegacyKind::LowCmd, true)) => LegacyLowCmd::decode(buf)
+                .map(LegacyFrame::LowCmd)
+                .map_err(|_| unknown),
+            Some((LegacyKind::LowState, true)) => LegacyLowState::decode(buf)
+                .map(LegacyFrame::LowState)
+                .map_err(|_| unknown),
+        }
+    }
+
+    pub fn kind(&self) -> LegacyKind {
+        match self {
+            LegacyFrame::HighCmd(_) => LegacyKind::HighCmd,
+            LegacyFrame::HighState(_) => LegacyKind::HighState,
+            LegacyFrame::LowCmd(_) => LegacyKind::LowCmd,
+            LegacyFrame::LowState(_) => LegacyKind::LowState,
+        }
+    }
+
+    /// `HighCmd` / `LowCmd` (sent by the client to the robot).
+    pub fn is_command(&self) -> bool {
+        matches!(self, LegacyFrame::HighCmd(_) | LegacyFrame::LowCmd(_))
+    }
+
+    /// The channel the frame is mapped onto ([`channels`]).
+    pub fn channel(&self) -> &'static str {
+        match self {
+            LegacyFrame::HighCmd(_) => channels::HIGH_CMD,
+            LegacyFrame::HighState(_) => channels::HIGH_STATE,
+            LegacyFrame::LowCmd(_) => channels::LOW_CMD,
+            LegacyFrame::LowState(_) => channels::LOW_STATE,
+        }
+    }
+
+    /// The frame's CRC under `mode` (advisory, see [`LegacyCrcMode`]),
+    /// computed over the buffer the frame was decoded from.
+    pub fn crc_check(buf: &[u8], mode: LegacyCrcMode) -> Option<bool> {
+        crc_check(buf, mode)
+    }
+
+    /// The per-motor command of a `LowCmd` (`None` otherwise).
+    pub fn joint_command_frame(&self) -> Option<JointCommandFrame> {
+        match self {
+            LegacyFrame::LowCmd(c) => Some(c.joint_frame()),
+            _ => None,
+        }
+    }
+
+    /// The event: `HighCmd` / `LowCmd` as [`LegacyHighCmd::to_motion_command`]
+    /// / [`LegacyLowCmd::to_motion_command`]; `HighState` as feedback with the
+    /// measured body velocity (`velocity[0..2]`, `yawSpeed`), the IMU gyro and
+    /// the max measured joint speed; `LowState` as feedback with the IMU gyro
+    /// and the max measured joint speed. `ctx.channel` is used as given
+    /// (normally [`LegacyFrame::channel`]).
+    pub fn to_event(&self, ctx: &EventContext<'_>) -> RobotEvent {
+        let gyro = |g: [f32; 3]| g.map(f64::from);
+        let base = |g: [f32; 3], joint: Option<f64>| {
+            let [x, y, z] = gyro(g);
+            MotionFeedback {
+                channel: ctx.channel.to_owned(),
+                measured_joint_speed: joint,
+                angular_velocity_x: Some(x),
+                angular_velocity_y: Some(y),
+                angular_velocity: Some(z),
+                publisher_guid: ctx.writer_guid.map(str::to_owned),
+                timestamp_ns: ctx.timestamp_ns,
+                ..MotionFeedback::default()
+            }
+        };
+        match self {
+            LegacyFrame::HighCmd(c) => RobotEvent::MotionCommand(c.to_motion_command(ctx)),
+            LegacyFrame::LowCmd(c) => RobotEvent::MotionCommand(c.to_motion_command(ctx)),
+            LegacyFrame::HighState(s) => {
+                let (vx, vy, vyaw) = s.body_velocity();
+                RobotEvent::MotionFeedback(MotionFeedback {
+                    measured_linear_speed: Some(vx.hypot(vy)),
+                    linear_velocity: Some(vx),
+                    linear_velocity_y: Some(vy),
+                    angular_velocity: Some(vyaw),
+                    ..base(s.imu.gyroscope, s.joint_frame().max_abs_velocity())
+                })
+            }
+            LegacyFrame::LowState(s) => RobotEvent::MotionFeedback(base(
+                s.imu.gyroscope,
+                s.joint_frame().max_abs_velocity(),
+            )),
+        }
+    }
+}
+
 fn check_len(kind: LegacyKind, len: usize, expected: usize) -> Result<(), LegacyError> {
     if len == expected {
         Ok(())
@@ -1062,5 +1223,81 @@ mod tests {
         assert_eq!(st.level_flag, level::HIGH);
         assert_eq!(st.motor_state.len(), LEGACY_MOTORS);
         assert_eq!(st.joint_frame().max_abs_velocity(), Some(0.0));
+    }
+
+    #[test]
+    fn legacy_frame_classifies_by_length_and_maps_to_channels() {
+        let ctx = |ch| EventContext {
+            channel: ch,
+            writer_guid: None,
+            timestamp_ns: 7,
+        };
+        for (len, kind, command) in [
+            (LEGACY_HIGH_CMD_LEN, LegacyKind::HighCmd, true),
+            (LEGACY_HIGH_STATE_LEN, LegacyKind::HighState, false),
+            (LEGACY_LOW_CMD_LEN, LegacyKind::LowCmd, true),
+            (LEGACY_LOW_STATE_LEN, LegacyKind::LowState, false),
+        ] {
+            let f = LegacyFrame::decode(&vec![0u8; len]).unwrap();
+            assert_eq!(f.kind(), kind);
+            assert_eq!(f.is_command(), command);
+            assert!(channels::ALL.contains(&f.channel()));
+            assert!(f.channel().starts_with(channels::PREFIX));
+            assert_eq!(
+                f.joint_command_frame().is_some(),
+                kind == LegacyKind::LowCmd
+            );
+            match (f.to_event(&ctx(f.channel())), command) {
+                (RobotEvent::MotionCommand(c), true) => assert_eq!(c.channel, f.channel()),
+                (RobotEvent::MotionFeedback(fb), false) => {
+                    assert_eq!(fb.channel, f.channel());
+                    assert_eq!(fb.timestamp_ns, 7);
+                    assert_eq!(fb.measured_joint_speed, Some(0.0));
+                }
+                (e, _) => panic!("{kind:?}: {e:?}"),
+            }
+        }
+        // HighState feedback carries the measured body velocity.
+        let mut hs = vec![0u8; LEGACY_HIGH_STATE_LEN];
+        let st = LegacyHighState::decode(&hs).unwrap();
+        assert_eq!(st.body_velocity(), (0.0, 0.0, 0.0));
+        // velocity[0] follows the fixed part; find it by decoding a marker.
+        let off = (0..hs.len() - 4)
+            .find(|&o| {
+                let mut b = hs.clone();
+                b[o..o + 4].copy_from_slice(&1.5f32.to_le_bytes());
+                LegacyHighState::decode(&b).unwrap().velocity[0] == 1.5
+            })
+            .unwrap();
+        hs[off..off + 4].copy_from_slice(&1.5f32.to_le_bytes());
+        match LegacyFrame::decode(&hs)
+            .unwrap()
+            .to_event(&ctx(channels::HIGH_STATE))
+        {
+            RobotEvent::MotionFeedback(fb) => {
+                assert_eq!(fb.linear_velocity, Some(1.5));
+                assert_eq!(fb.measured_linear_speed, Some(1.5));
+            }
+            e => panic!("{e:?}"),
+        }
+        assert_eq!(
+            LegacyFrame::decode(&[0; 614]),
+            Err(LegacyFrameError::Compressed {
+                kind: LegacyKind::LowCmd,
+                len: 614
+            })
+        );
+        assert_eq!(
+            LegacyFrame::decode(&[0; 807]),
+            Err(LegacyFrameError::Compressed {
+                kind: LegacyKind::LowState,
+                len: 807
+            })
+        );
+        assert_eq!(
+            LegacyFrame::decode(&[0; 100]),
+            Err(LegacyFrameError::UnknownLength { len: 100 })
+        );
+        assert!(LegacyFrame::decode(&[]).is_err());
     }
 }

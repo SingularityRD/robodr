@@ -812,8 +812,8 @@ fn catalog_1_3_wave7(rule: &str) -> Option<RuleInfo> {
 }
 
 /// Entries added in contract **2.1**: the low-level joint-frame firewall ids
-/// (Unitree `LowCmd` envelope, humanoid no-zero rule) and the robot-API /
-/// control-handover motion ids. Not in 1.3 or 2.0: a 2.0 producer built
+/// (Unitree `LowCmd` envelope, humanoid no-zero rule), the robot-API /
+/// control-handover motion ids and the Unitree legacy UDP sender id. Not in 1.3 or 2.0: a 2.0 producer built
 /// such a finding with the generic entry, and the validator keeps applying
 /// that to a 2.0 message ([`rule_info_for_contract`]).
 fn catalog_2_1(rule: &str) -> Option<RuleInfo> {
@@ -835,6 +835,12 @@ fn catalog_2_1(rule: &str) -> Option<RuleInfo> {
         "robot.motion.api_id_out_of_range" => e(
             "Robot API request with an aliased call id",
             "A robot API request carried a call id outside the 32-bit range the robot dispatches on, so the robot executes a different call than the one written.",
+            MOTION,
+            &[T0855],
+        ),
+        "robot.unitree.legacy_unknown_sender" => e(
+            "Unitree legacy UDP frame from an unknown host",
+            "A Unitree legacy (unitree_legged_sdk, Go1 generation) UDP command or state frame came from a source address the sensor configuration does not list; the protocol is unauthenticated, so an unlisted command sender can drive the robot.",
             MOTION,
             &[T0855],
         ),

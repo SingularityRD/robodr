@@ -415,7 +415,7 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
   | --- | --- |
   | 1.0 – 1.2 | base catalog |
   | 1.3 – 1.x, 2.0 | base + the 1.3 entries, exactly as 1.3.0 shipped (2.0 did not change the catalog) |
-  | 2.1 and later | + the 2.1 entries: the low-level joint-frame firewall ids (`robot.firewall.joint_*`, `disabled_motor_energised`, `crc_invalid`) and `robot.motion.api_id_out_of_range`, `robot.motion.control_handover` |
+  | 2.1 and later | + the 2.1 entries: the low-level joint-frame firewall ids (`robot.firewall.joint_*`, `disabled_motor_energised`, `crc_invalid`), `robot.motion.api_id_out_of_range`, `robot.motion.control_handover` and `robot.unitree.legacy_unknown_sender` |
 
   A finding of an older minor for a rule that only gained an entry in a
   later minor carries the generic entry and stays valid; a finding of that
@@ -750,6 +750,10 @@ safely. Nothing here is specific to one product.
     They had been added to the 1.3 catalog by mistake after 1.3.0 and 2.0.0
     were cut; the 1.3 / 2.0 catalogs are restored to exactly what 1.3.0
     shipped and these entries apply from 2.1 on.
+  - `robot.unitree.legacy_unknown_sender` (Unitree legacy UDP, Go1
+    generation: a command or state frame from a host the sensor
+    configuration does not list). Added while 2.1.0 was still unreleased;
+    a producer of an earlier 2.1 build reported it with the generic entry.
   - Schema `$id` `https://schemas.singularityrd.com/robodr/findings/2.1.0`;
     `contract_version` parts at most 9 digits and `ocsf.metadata.log_name`
     not `.` / `..` (as the validator always required).

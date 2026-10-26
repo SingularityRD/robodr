@@ -138,13 +138,28 @@ pub use checksum::{UdpChecksumMode, UdpChecksumStatus};
 pub use decode::{decode_frame, decode_udp, DecodeError, Decoded, LinkType, UdpDatagram};
 pub use ingress::{IngressInfo, PacketIngress, PacketType};
 pub use pcap::{CaptureFile, PcapNgReader, PcapReader, PcapWriter};
-pub use ports::{MatchMode, PortClass, PortKind, RtpsFilter, RtpsPortMap};
+pub use ports::{MatchMode, PortClass, PortKind, RtpsFilter, RtpsPortMap, MAX_LEGACY_UDP_PORTS};
 pub use reassembly::{Reassembler, ReassemblyLimits};
 pub use source::{CaptureError, Packet, PacketSource, VecSource};
+
+/// What kind of datagram an [`RtpsPacket`] carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PacketKind {
+    /// RTPS (well-known port or `RTPS` magic).
+    #[default]
+    Rtps,
+    /// Raw UDP of the Unitree legacy protocol (`unitree_legged_sdk`, Go1
+    /// generation) on a configured legacy port
+    /// ([`RtpsFilter::legacy_udp_ports`]); not RTPS.
+    UnitreeLegacy,
+}
 
 /// One RTPS datagram with its context.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RtpsPacket {
+    /// RTPS, or a Unitree legacy UDP datagram (only when the filter has
+    /// legacy ports).
+    pub kind: PacketKind,
     pub ts: Duration,
     pub src: IpAddr,
     pub dst: IpAddr,
@@ -211,6 +226,9 @@ pub struct CaptureStats {
     pub zenoh: u64,
     /// Source address of the latest such packet (evidence for the finding).
     pub zenoh_last_src: Option<IpAddr>,
+    /// UDP datagrams accepted as Unitree legacy frames
+    /// ([`RtpsFilter::legacy_udp_ports`]); not in `rtps`.
+    pub legacy_udp: u64,
 }
 
 /// Iterator glue: packet source -> decoders -> reassembly -> RTPS filter.
@@ -410,12 +428,18 @@ fn process(
             stats.zenoh_last_src = Some(u.src);
             return None;
         }
-        if !filter.matches(u) {
+        let kind = if filter.matches(u) {
+            stats.rtps += 1;
+            PacketKind::Rtps
+        } else if filter.is_legacy(u) {
+            stats.legacy_udp += 1;
+            PacketKind::UnitreeLegacy
+        } else {
             stats.filtered_out += 1;
             return None;
-        }
-        stats.rtps += 1;
+        };
         Some(RtpsPacket {
+            kind,
             ts,
             src: u.src,
             dst: u.dst,
@@ -568,6 +592,53 @@ mod tests {
         let s = *it.stats();
         assert_eq!((s.frames, s.udp, s.rtps, s.filtered_out), (6, 3, 2, 1));
         assert_eq!((s.not_ip, s.unsupported_linktype, s.truncated), (1, 1, 1));
+    }
+
+    /// Unitree legacy UDP: off by default; with legacy ports, delivered as
+    /// `PacketKind::UnitreeLegacy` in both directions, RTPS on such a port
+    /// stays RTPS, and other UDP is still filtered.
+    #[test]
+    fn glue_classifies_unitree_legacy_udp() {
+        let pc = Ipv4Addr::new(192, 168, 123, 15);
+        let robot = Ipv4Addr::new(192, 168, 123, 161);
+        let ts = Duration::from_secs(1);
+        let udp = |s, d, sp, dp, p: &[u8]| {
+            (
+                ts,
+                LinkType::ETHERNET,
+                synth::ethernet(0x0800, &synth::ipv4_udp(s, d, sp, dp, p)),
+            )
+        };
+        let frames = || {
+            vec![
+                udp(pc, robot, 8090, 8082, &[0xfe; 129]),     // HighCmd
+                udp(robot, pc, 8082, 8090, &[0xfe; 1087]),    // HighState
+                udp(pc, robot, 8090, 8082, &rtps_payload(3)), // RTPS on a legacy port
+                udp(pc, robot, 5353, 5353, b"mdns"),
+            ]
+        };
+        let mut off = rtps_datagrams(VecSource::new(frames()));
+        assert_eq!(off.next_packet().unwrap().kind, PacketKind::Rtps);
+        assert!(off.next_packet().is_none());
+        assert_eq!((off.stats().legacy_udp, off.stats().filtered_out), (0, 3));
+
+        let filter = RtpsFilter::default().with_legacy_udp_ports([8082, 8090, 8007]);
+        let mut on = RtpsDatagrams::new(VecSource::new(frames()), filter);
+        let a = on.next_packet().unwrap();
+        assert_eq!(
+            (a.kind, a.src_port, a.dst_port),
+            (PacketKind::UnitreeLegacy, 8090, 8082)
+        );
+        assert_eq!(a.payload.len(), 129);
+        let b = on.next_packet().unwrap();
+        assert_eq!(
+            (b.kind, b.src, b.payload.len()),
+            (PacketKind::UnitreeLegacy, IpAddr::V4(robot), 1087)
+        );
+        assert_eq!(on.next_packet().unwrap().kind, PacketKind::Rtps);
+        assert!(on.next_packet().is_none());
+        let s = *on.stats();
+        assert_eq!((s.legacy_udp, s.rtps, s.filtered_out), (2, 1, 1));
     }
 
     #[test]

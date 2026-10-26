@@ -2614,6 +2614,18 @@ impl Learner {
             };
             p.motion_envelopes.insert(ch.clone(), env);
         }
+        // Unitree legacy UDP channels (Go1 generation) have no DDS writer to
+        // learn: the protocol has no discovery. A learned legacy channel is
+        // writable by construction (only the legacy UDP path of the sensor
+        // ever produces commands on it); the sender IPs are configured in
+        // the sensor's `unitree_legacy.command_senders`.
+        let legacy: Vec<String> = p
+            .motion_envelopes
+            .keys()
+            .filter(|ch| robodr_cdr::unitree_legacy::channels::ALL.contains(&ch.as_str()))
+            .cloned()
+            .collect();
+        p.writer_topics.extend(legacy);
         // A motion channel whose writers were not learned (no accepted
         // participant announced a writer on it) cannot be enveloped: every
         // legitimate publisher would be an unknown writer, and

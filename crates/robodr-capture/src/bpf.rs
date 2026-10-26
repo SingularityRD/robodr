@@ -8,7 +8,9 @@
 //!
 //! The program accepts:
 //! - IPv4 UDP with a destination port inside the port map's ranges, or (if the
-//!   mode includes the magic) whose payload starts with `"RTPS"`;
+//!   mode includes the magic) whose payload starts with `"RTPS"`, or whose
+//!   source or destination port is one of the filter's Unitree legacy UDP
+//!   ports ([`RtpsFilter::legacy_udp_ports`], empty by default);
 //! - IPv4 UDP *fragments* (MF set or offset != 0) — the UDP header or magic
 //!   may not be in this fragment, so user space reassembles and decides;
 //! - IPv6 UDP directly after the fixed header, same port/magic rule;
@@ -308,6 +310,18 @@ pub fn rtps_filter_program(filter: &RtpsFilter) -> Result<BpfProgram, BpfError> 
             p.push(jump(JGT_K, u32::from(hi), 1, 0));
             p.push(accept);
         }
+    }
+    // Unitree legacy UDP (source or destination port), when configured.
+    for port in &filter.legacy_udp_ports {
+        let port = u32::from(*port);
+        p.extend_from_slice(&[
+            stmt(LDH_IND, 2), // destination port
+            jump(JEQ_K, port, 0, 1),
+            accept,
+            stmt(LDH_IND, 0), // source port
+            jump(JEQ_K, port, 0, 1),
+            accept,
+        ]);
     }
     if use_magic {
         // Last: an out-of-bounds load drops, which is right for a payload
@@ -619,6 +633,53 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// With Unitree legacy ports the kernel filter accepts exactly what the
+    /// user-space filter accepts as RTPS **or** legacy, in both directions
+    /// (source or destination port), and nothing more.
+    #[test]
+    fn interpreter_agrees_with_userspace_filter_with_legacy_ports() {
+        let s4 = Ipv4Addr::new(192, 168, 123, 161);
+        let d4 = Ipv4Addr::new(192, 168, 123, 15);
+        let s6: Ipv6Addr = "fd00::1".parse().unwrap();
+        let d6: Ipv6Addr = "fd00::2".parse().unwrap();
+        let payloads: [&[u8]; 3] = [b"RTPS\x02\x03\x01\x0f", &[0xfe; 129], b""];
+        let ports = [8007u16, 8080, 8082, 8090, 7400, 7411, 5353, 0, 65535];
+        for mode in [
+            MatchMode::PortsOnly,
+            MatchMode::MagicOnly,
+            MatchMode::PortsOrMagic,
+        ] {
+            let filter = RtpsFilter::new(RtpsPortMap::new([0], 4), mode)
+                .with_legacy_udp_ports([8007, 8080, 8082, 8090]);
+            let prog = rtps_filter_program(&filter).unwrap();
+            prog.validate().unwrap();
+            for &sport in &ports {
+                for &dport in &ports {
+                    for payload in payloads {
+                        for pkt in [
+                            synth::ipv4_udp(s4, d4, sport, dport, payload),
+                            synth::ipv6_udp(s6, d6, sport, dport, &[], payload),
+                        ] {
+                            let user = match decode_ip(&pkt) {
+                                Ok(Decoded::Udp(u)) => filter.matches(&u) || filter.is_legacy(&u),
+                                other => panic!("{other:?}"),
+                            };
+                            let kernel = prog.run(&pkt) != 0;
+                            assert_eq!(
+                                kernel, user,
+                                "mode {mode:?} {sport}->{dport} payload {payload:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Without legacy ports nothing changes.
+        let plain = RtpsFilter::new(RtpsPortMap::new([0], 4), MatchMode::PortsOrMagic);
+        let legacy = synth::ipv4_udp(s4, d4, 8082, 8090, &[0xfe; 129]);
+        assert_eq!(rtps_filter_program(&plain).unwrap().run(&legacy), 0);
     }
 
     #[test]

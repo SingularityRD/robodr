@@ -5,8 +5,8 @@
 //! * 1.3 and 2.0: base + the 1.3 entries, exactly as released in 1.3
 //!   (reference: `git show c64744d:crates/robodr-ocsf/src/builder.rs`; 2.0
 //!   did not change the catalog);
-//! * 2.1: + the low-level joint-frame firewall ids and the robot API /
-//!   control-handover motion ids.
+//! * 2.1: + the low-level joint-frame firewall ids, the robot API /
+//!   control-handover motion ids and the Unitree legacy UDP sender id.
 
 mod common;
 
@@ -17,6 +17,7 @@ use robodr_ocsf::{rule_info, rule_info_for_contract, FindingBuilder, CONTRACT_VE
 const IDS_2_1: &[&str] = &[
     "robot.motion.api_id_out_of_range",
     "robot.motion.control_handover",
+    "robot.unitree.legacy_unknown_sender",
     "robot.firewall.joint_position_out_of_envelope",
     "robot.firewall.joint_velocity_out_of_envelope",
     "robot.firewall.joint_torque_out_of_envelope",

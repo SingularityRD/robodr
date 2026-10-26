@@ -421,6 +421,17 @@ impl<'a> MotionMessage<'a> {
         }
     }
 
+    /// The frame-level `(mode_pr, mode_machine)` octets of a Unitree `hg`
+    /// `LowCmd_` (G1 / H1-2 / H2 / R1: ankle control mode and robot
+    /// variant), `None` for every other message. A joint firewall pins them
+    /// per channel.
+    pub fn unitree_frame_modes(&self) -> Option<(u8, u8)> {
+        match self {
+            MotionMessage::UnitreeHgLowCmd(m) => Some((m.mode_pr, m.mode_machine)),
+            _ => None,
+        }
+    }
+
     /// The per-motor state frame of a Unitree low-level / hand state.
     pub fn joint_state_frame(&self) -> Option<JointStateFrame> {
         match self {

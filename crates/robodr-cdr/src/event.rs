@@ -43,7 +43,7 @@
 use robodr_events::{CommandClass, MotionCommand, MotionFeedback, RobotEvent};
 
 use crate::msgs::Twist;
-use crate::unitree::{ApiClass, ApiRequest, ApiService};
+use crate::unitree::{ApiClass, ApiRequest, ApiService, UnitreeModel};
 use crate::{MotionMessage, MotionRole};
 
 /// Who/where/when a sample was observed. All of it comes from the transport
@@ -113,16 +113,22 @@ pub fn command_class(c: ApiClass) -> CommandClass {
 }
 
 /// A Unitree API request as a command. The service comes from the channel
-/// (`/api/<svc>/request`), the model is not known here, so only calls that
-/// mean the same on every model are interpreted ([`ApiRequest::call`]).
+/// (`/api/<svc>/request`). Without `model` only calls that mean the same on
+/// every model are interpreted ([`ApiRequest::call`]); a model-specific id
+/// (G1 `SwitchToUserCtrl`, Go2 `FrontFlip`, ...) is then `Unknown`. With the
+/// robot's model (`robodr-agentd` `robot.robot_model`) it is classified.
 /// Every request on a motion (or unidentified) service carries its
 /// [`ApiClass`] as `command_class`, so `Profile::evaluate` flags the calls
 /// whose motion the request does not bound (tricks, trajectories, control
 /// handovers, unknown / malformed calls); a request on a known non-motion
 /// service (`vui`, `voice`, ...) carries none.
-fn api_command(q: &ApiRequest<'_>, ctx: &EventContext<'_>) -> MotionCommand {
+fn api_command(
+    q: &ApiRequest<'_>,
+    ctx: &EventContext<'_>,
+    model: Option<UnitreeModel>,
+) -> MotionCommand {
     let service = ApiService::from_topic(ctx.channel);
-    let call = q.call(service, None);
+    let call = q.call(service, model);
     let (command_class, command_name) = if service == ApiService::Other {
         (None, None)
     } else {
@@ -163,6 +169,18 @@ impl MotionMessage<'_> {
 
     /// The command this message carries, if it is a command type.
     pub fn to_command(&self, ctx: &EventContext<'_>) -> Option<MotionCommand> {
+        self.to_command_for_model(ctx, None)
+    }
+
+    /// [`MotionMessage::to_command`] for a known Unitree model: a Unitree
+    /// API request is interpreted with the model's API tables
+    /// ([`ApiRequest::call`]), so model-specific ids are classified instead
+    /// of `Unknown`. Every other message ignores `model`.
+    pub fn to_command_for_model(
+        &self,
+        ctx: &EventContext<'_>,
+        model: Option<UnitreeModel>,
+    ) -> Option<MotionCommand> {
         match self {
             MotionMessage::Twist(t) => Some(twist_command(t, ctx)),
             MotionMessage::TwistStamped(t) => Some(twist_command(&t.twist, ctx)),
@@ -178,7 +196,7 @@ impl MotionMessage<'_> {
             MotionMessage::UnitreeHgHandCmd(m) => Some(m.joint_frame().to_motion_command(ctx)),
             MotionMessage::UnitreeGoMotorCmds(m) => Some(m.joint_frame().to_motion_command(ctx)),
             MotionMessage::UnitreeHgMotorCmd(m) => Some(m.joint_frame().to_motion_command(ctx)),
-            MotionMessage::UnitreeApiRequest(q) => Some(api_command(q, ctx)),
+            MotionMessage::UnitreeApiRequest(q) => Some(api_command(q, ctx, model)),
             MotionMessage::Odometry(_)
             | MotionMessage::Imu(_)
             | MotionMessage::JointState(_)
@@ -261,7 +279,17 @@ impl MotionMessage<'_> {
 
     /// The event for this message, by its type's [`MotionRole`].
     pub fn to_event(&self, ctx: &EventContext<'_>) -> RobotEvent {
-        match (self.to_command(ctx), self.to_feedback(ctx)) {
+        self.to_event_for_model(ctx, None)
+    }
+
+    /// [`MotionMessage::to_event`] for a known Unitree model (see
+    /// [`MotionMessage::to_command_for_model`]).
+    pub fn to_event_for_model(
+        &self,
+        ctx: &EventContext<'_>,
+        model: Option<UnitreeModel>,
+    ) -> RobotEvent {
+        match (self.to_command_for_model(ctx, model), self.to_feedback(ctx)) {
             (Some(c), _) => RobotEvent::MotionCommand(c),
             (None, Some(f)) => RobotEvent::MotionFeedback(f),
             // Unreachable by construction (every kind is one or the other);

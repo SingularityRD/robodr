@@ -106,6 +106,7 @@ use std::time::{Duration, Instant};
 
 use robodr_cdr::{
     DecodeAnomaly, DecodeError, EventContext, JointCommandFrame, Limits, MotionRole, Registry,
+    UnitreeModel,
 };
 use robodr_events::graph::{demangle, RosNameKind};
 use robodr_events::profile::Profile;
@@ -184,6 +185,13 @@ pub struct MotionOptions {
     /// noted before [`rules::MOTION_UNATTRIBUTED_SAMPLE`] is raised (see the
     /// module docs, "Data before discovery is normal"). Zero = at once.
     pub unattributed_grace: Duration,
+    /// The robot's Unitree model, when known (`robodr-agentd`
+    /// `robot.robot_model`): Unitree API requests are then interpreted with
+    /// the model's API tables, so model-specific ids (G1
+    /// `SwitchToUserCtrl`, Go2 `FrontFlip`, ...) are classified instead of
+    /// `Unknown` (High). `None` (default): only ids that mean the same on
+    /// every model are interpreted.
+    pub robot_model: Option<UnitreeModel>,
 }
 
 impl Default for MotionOptions {
@@ -197,6 +205,7 @@ impl Default for MotionOptions {
             cdr_limits: Limits::default(),
             user_data: UserDataLimits::default(),
             unattributed_grace: DEFAULT_UNATTRIBUTED_GRACE,
+            robot_model: None,
         }
     }
 }
@@ -229,6 +238,26 @@ pub struct MotionSample {
     /// [`SampleAttribution::Bound`] means the writer GUID may be taken at
     /// its word; see [`SampleAttribution::is_trusted`].
     pub attribution: SampleAttribution,
+    /// The per-motor frame of a Unitree low-level joint command (`LowCmd_`,
+    /// `HandCmd_`, `MotorCmds_`, `MotorCmd_`), for a joint firewall
+    /// (`robodr-agentd` feeds it to `Firewall::check_joint`). `None` for
+    /// every other sample.
+    pub joint: Option<JointCommandSample>,
+}
+
+/// A decoded low-level joint command frame with the frame-level fields a
+/// joint firewall checks.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JointCommandSample {
+    /// Every slot on the wire, in slot order.
+    pub frame: JointCommandFrame,
+    /// The decoder's CRC verdict (`Some` for go / hg `LowCmd_`, `None` for
+    /// types without a CRC). Advisory: see `robodr_cdr::unitree::crc`.
+    pub crc_ok: Option<bool>,
+    /// `mode_pr` of an hg `LowCmd_` (ankle control mode), else `None`.
+    pub mode_pr: Option<u8>,
+    /// `mode_machine` of an hg `LowCmd_` (robot variant), else `None`.
+    pub mode_machine: Option<u8>,
 }
 
 /// How a decoded sample's source was judged against the participant
@@ -832,16 +861,27 @@ impl MotionTracker {
                         }
                     }
                 }
-                let mut event = decoded.message.to_event(&EventContext {
-                    channel: &channel,
-                    writer_guid: Some(&writer),
-                    timestamp_ns: ctx.capture_ns,
-                });
+                let mut event = decoded.message.to_event_for_model(
+                    &EventContext {
+                        channel: &channel,
+                        writer_guid: Some(&writer),
+                        timestamp_ns: ctx.capture_ns,
+                    },
+                    self.opts.robot_model,
+                );
+                let mut joint = None;
                 if role == Role::Command {
                     if let (RobotEvent::MotionCommand(c), Some(frame)) =
                         (&mut event, decoded.message.joint_command_frame())
                     {
                         self.note_joint_frame(&channel, frame, c);
+                        let modes = decoded.message.unitree_frame_modes();
+                        joint = Some(JointCommandSample {
+                            frame,
+                            crc_ok: decoded.message.unitree_crc_ok(),
+                            mode_pr: modes.map(|m| m.0),
+                            mode_machine: modes.map(|m| m.1),
+                        });
                     }
                 }
                 let attribution =
@@ -867,6 +907,7 @@ impl MotionTracker {
                     from_fragments: s.from_fragments,
                     trailing_bytes: decoded.trailing_bytes,
                     attribution,
+                    joint,
                 });
             }
         }
@@ -877,7 +918,7 @@ impl MotionTracker {
 impl MotionTracker {
     /// Fill `c.joint_position_step` from the previous frame on `channel`
     /// and remember `frame` as the new previous one.
-    fn note_joint_frame(
+    pub(crate) fn note_joint_frame(
         &mut self,
         channel: &str,
         frame: JointCommandFrame,

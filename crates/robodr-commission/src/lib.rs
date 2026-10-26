@@ -69,8 +69,8 @@ pub mod stats;
 pub mod trust;
 
 pub use input::{
-    CaptureDiagnostics, EventSource, InputError, InputSpec, JsonlSource, Origin, PcapSource,
-    SourcedEvent, VecSource,
+    CaptureDiagnostics, EventSource, InputError, InputOptions, InputSpec, JsonlSource, Origin,
+    PcapSource, SourcedEvent, VecSource,
 };
 pub use learner::{
     envelope_bound, is_motion_like, Commissioning, CommissioningReport, ConfigError, LearnConfig,
