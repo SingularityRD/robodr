@@ -1,11 +1,14 @@
-//! The control-plane action API (`control_plane`, off by default).
+//! The control-plane API `robodr-control-plane/v2` (`control_plane`, off by
+//! default).
 //!
 //! A SOC asks for one of the seven catalog actions
 //! ([`robodr_responder::actions`]) on this
 //! robot; agentd validates the request, judges it with the response policy
 //! against the robot's *current* safety state (Cyber-Jidoka,
 //! [`api::judge`]), records the request and the decision in the signed
-//! black box and answers. Contract: `docs/contracts/robodr.control-plane.md`.
+//! black box and in its persistent request journal ([`state`]) and answers.
+//! With `evidence` configured, the SOC also lists and exports black-box
+//! evidence ([`evidence`]). Contract: `docs/contracts/robodr.control-plane.md`.
 //!
 //! **Nothing is executed.** The only executor is [`api::RecordingExecutor`]:
 //! an accepted request is answered `recorded_not_executed`
@@ -15,60 +18,70 @@
 //! system is engaged every request is refused.
 //!
 //! ```text
-//!  SOC ── HTTP/1.1 (TCP and/or unix socket) ──► listener thread
-//!          one request per connection           │ bounded parse (http), Ed25519 signature,
-//!                                               │ timestamp window + nonce cache, rate limit (auth)
-//!                                               │ strict body (api::parse_submit)
+//!  SOC ── mTLS (rustls) TCP / loopback TCP / unix socket ──► listener thread
+//!          one request per connection           │ TLS: client cert chain + pin (tls)
+//!                                               │ bounded parse (http), Ed25519 signature,
+//!                                               │ timestamp window + persisted nonce store,
+//!                                               │ rate limit (auth); strict body
+//!                                               │ evidence: index / export / chunks (evidence)
 //!                                               ▼ bounded channel (try_send; full = 503)
 //!                                         main loop (Daemon::control_poll)
 //!                                               │ api::Engine: judge against the live safety
-//!                                               │ state, policy, context; black-box note;
-//!                                               │ RecordingExecutor (nothing executed); store
+//!                                               │ state, policy, context; journal begin;
+//!                                               │ black-box note; journal commit; store
 //!                                               ▼
-//!                                         answer (optionally signed with the finding key)
+//!                                         answer, always signed with the finding key
 //! ```
 //!
 //! # Threat model (summary; full text in the contract and `SECURITY.md`)
 //!
-//! * **Who may ask.** Only holders of a configured SOC Ed25519 key
-//!   (`soc_keys`, public key files). The signature covers the method, the
-//!   exact target, this robot's id, the key id, a timestamp, a nonce and
-//!   the body hash ([`auth::signing_message`]), so a request cannot be
-//!   altered, moved to another robot or replayed (timestamp window plus a
-//!   nonce cache that fails closed when full).
+//! * **Who may ask.** On a TCP listener that is not loopback, only a peer
+//!   with a client certificate from the configured SOC CA (and pin, if
+//!   set) gets a channel (mutual TLS, [`tls`]); then, on every listener,
+//!   only holders of a configured SOC Ed25519 key (`soc_keys`) get an
+//!   answer other than 401. Both are required: a stolen client certificate
+//!   cannot sign, a stolen SOC key cannot connect from the network. The
+//!   signature covers the method, the exact target, this robot's id, the
+//!   key id, a timestamp, a nonce and the body hash
+//!   ([`auth::signing_message`]), so a request cannot be altered, moved to
+//!   another robot or replayed (timestamp window plus a nonce store that is
+//!   persisted across restarts and fails closed when full).
 //! * **What may be asked.** The seven catalog actions, their own
 //!   parameters, TTL rules (`safe_pause` / `request_safe_state` are refused
-//!   on a humanoid: it would fall);
-//!   no motion command, no override. A valid signature does not widen
-//!   this: an authenticated but invalid body is refused (400) and
-//!   recorded.
+//!   on a humanoid: it would fall); no motion command, no override. A
+//!   valid signature does not widen this: an authenticated but invalid
+//!   body is refused (400) and recorded. Evidence: read-only exports of
+//!   black-box frames, never key material.
 //! * **What happens.** Nothing reaches the robot: the request is judged and
 //!   recorded. A refusal is final (never retried here).
-//! * **Transport.** agentd has no TLS stack: requests are authenticated,
-//!   not confidential. Answers are unauthenticated unless
-//!   `finding_signing` is configured, in which case every answer to an
-//!   authenticated request carries [`auth::H_ANSWER_SIGNATURE`]
-//!   (domain-separated, bound to the request signature). Listen on
-//!   loopback or a unix socket and put TLS in front for anything remote;
-//!   a non-loopback TCP address needs `allow_remote: true`.
-//! * **Abuse.** Bounded parsing, a read deadline, a connection cap, a
-//!   per-key rate limit and a bounded queue to the main loop: a flood
-//!   costs the control plane's availability (503 / 429), never the
-//!   detection loop's. Failed authentications are counted and reported as
-//!   the observe-only finding `robot.agent.control_plane_unauthenticated`
-//!   (High, rate-limited), authenticated invalid requests as
-//!   `robot.agent.control_plane_invalid` (Medium).
+//! * **Answers.** Every answer to an authenticated request carries
+//!   [`auth::H_ANSWER_SIGNATURE`] (the finding key, domain-separated, bound
+//!   to the request signature); `finding_signing` is required.
+//! * **Abuse.** Bounded parsing, a read deadline, a connection cap, per-key
+//!   rate limits (one for chunk downloads) and a bounded queue to the main
+//!   loop: a flood costs the control plane's availability (503 / 429),
+//!   never the detection loop's. Failed authentications (TLS handshakes
+//!   included) are counted and reported as the observe-only finding
+//!   `robot.agent.control_plane_unauthenticated` (High, rate-limited),
+//!   authenticated invalid requests as `robot.agent.control_plane_invalid`
+//!   (Medium).
 
 pub mod api;
 pub mod auth;
+pub mod evidence;
+pub mod fsutil;
 pub mod http;
+pub mod journal;
+pub mod state;
+pub mod tls;
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -76,14 +89,15 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use api::{Answer, ApiError, Call, Meta};
 use auth::{AuthFailure, RateLimiter, ReplayGuard, SocKey};
 
 /// Most SOC keys.
 pub const MAX_SOC_KEYS: usize = 16;
-/// Longest a connection may take to send its request.
+/// Longest a connection may take to complete its TLS handshake, and then
+/// (again) to send its request.
 pub const READ_DEADLINE: Duration = Duration::from_secs(5);
 /// Calls waiting for the main loop.
 pub const CALL_QUEUE: usize = 16;
@@ -118,26 +132,37 @@ fn default_answer_ms() -> u64 {
 ///
 /// ```json
 /// "control_plane": {
-///   "listen_tcp": "127.0.0.1:8787",
+///   "listen_tcp": "0.0.0.0:8787",
+///   "tls": { "cert_chain": "...", "key_file": "...", "client_ca": "..." },
 ///   "unix_socket": "/run/robodr-agentd/control.sock",
-///   "soc_keys": ["/etc/robodr/soc/soc.pub"]
+///   "state_dir": "/var/lib/robodr/control-plane/agentd",
+///   "soc_keys": ["/etc/robodr/soc/soc.pub"],
+///   "evidence": {}
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ControlPlaneSection {
-    /// TCP address (`ip:port`, port not 0). Loopback unless `allow_remote`.
+    /// TCP address (`ip:port`, port not 0). Without `tls` it must be
+    /// loopback (plain HTTP); with `tls` every connection is mutual TLS.
     #[serde(default)]
     pub listen_tcp: Option<String>,
-    /// Permit a non-loopback `listen_tcp` (plain HTTP: put TLS in front).
+    /// Removed in v2 (plain HTTP off loopback): refused with a pointer to
+    /// `tls`.
     #[serde(default)]
-    pub allow_remote: bool,
+    pub allow_remote: Option<bool>,
+    /// Mutual TLS for `listen_tcp` ([`tls::TlsSection`]).
+    #[serde(default)]
+    pub tls: Option<tls::TlsSection>,
     /// Absolute path of a unix stream socket (private directory).
     #[serde(default)]
     pub unix_socket: Option<PathBuf>,
     /// `"0600"` (default) or `"0660"` for `unix_socket`.
     #[serde(default = "default_mode")]
     pub socket_mode: String,
+    /// Private directory of the persistent state: request journal, replay
+    /// store, evidence exports (absolute; mode 0700, owned by the daemon).
+    pub state_dir: PathBuf,
     /// SOC public key files (`robodr-blackbox keygen` `.pub`, Ed25519).
     pub soc_keys: Vec<PathBuf>,
     /// Allowed |robot clock - request timestamp|, 1..=300 s.
@@ -158,14 +183,19 @@ pub struct ControlPlaneSection {
     /// How long a connection waits for the main loop, 100..=30000 ms.
     #[serde(default = "default_answer_ms")]
     pub answer_timeout_ms: u64,
+    /// The evidence API ([`evidence::EvidenceSection`]); absent = off.
+    #[serde(default)]
+    pub evidence: Option<evidence::EvidenceSection>,
 }
 
-/// A validated [`ControlPlaneSection`] with its keys loaded.
+/// A validated [`ControlPlaneSection`] with its keys and TLS loaded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlPlaneSpec {
     pub tcp: Option<SocketAddr>,
+    pub tls: Option<tls::TlsSpec>,
     pub unix: Option<PathBuf>,
     pub unix_mode: u32,
+    pub state_dir: PathBuf,
     pub keys: Vec<SocKey>,
     pub skew_s: u64,
     pub rate_per_minute: u32,
@@ -173,6 +203,7 @@ pub struct ControlPlaneSpec {
     pub max_connections: usize,
     pub max_requests: usize,
     pub answer_timeout: Duration,
+    pub evidence: Option<evidence::EvidenceSection>,
 }
 
 fn range(what: &str, v: u64, lo: u64, hi: u64) -> Result<(), String> {
@@ -184,14 +215,23 @@ fn range(what: &str, v: u64, lo: u64, hi: u64) -> Result<(), String> {
 }
 
 impl ControlPlaneSection {
-    /// Validate and load the SOC keys. `robot_id` binds keys that name a
-    /// device; `own_key_ids` are the black-box and finding key ids (a SOC
-    /// key must be neither).
+    /// Validate and load the SOC keys and the TLS material. `robot_id`
+    /// binds keys that name a device; `own_key_ids` are the black-box and
+    /// finding key ids (a SOC key must be neither). The state directory is
+    /// checked when the control plane starts.
     pub fn resolve(
         &self,
         robot_id: &str,
         own_key_ids: &[&str],
     ) -> Result<ControlPlaneSpec, String> {
+        if self.allow_remote.is_some() {
+            return Err(
+                "control_plane.allow_remote was removed in robodr-control-plane/v2: plain HTTP is \
+                 served on loopback and the unix socket only; a non-loopback listen_tcp needs \
+                 control_plane.tls (mutual TLS)"
+                    .into(),
+            );
+        }
         let tcp = match &self.listen_tcp {
             None => None,
             Some(s) => {
@@ -204,16 +244,19 @@ impl ControlPlaneSection {
                 if a.port() == 0 {
                     return Err("control_plane.listen_tcp: port 0 is not allowed".into());
                 }
-                if !a.ip().is_loopback() && !self.allow_remote {
+                if !a.ip().is_loopback() && self.tls.is_none() {
                     return Err(format!(
-                        "control_plane.listen_tcp {a} is not a loopback address: the API is plain \
-                         HTTP (authenticated, not encrypted); listen on loopback and put TLS in \
-                         front, or set allow_remote = true"
+                        "control_plane.listen_tcp {a} is not a loopback address: off loopback \
+                         the API is served only over mutual TLS; configure control_plane.tls \
+                         (cert_chain, key_file, client_ca)"
                     ));
                 }
                 Some(a)
             }
         };
+        if self.tls.is_some() && tcp.is_none() {
+            return Err("control_plane.tls applies to listen_tcp, which is not set".into());
+        }
         if let Some(p) = &self.unix_socket {
             if p.as_os_str().is_empty() || !p.is_absolute() {
                 return Err("control_plane.unix_socket must be an absolute path".into());
@@ -228,6 +271,9 @@ impl ControlPlaneSection {
                  the API off)"
                     .into(),
             );
+        }
+        if self.state_dir.as_os_str().is_empty() || !self.state_dir.is_absolute() {
+            return Err("control_plane.state_dir must be an absolute path".into());
         }
         let unix_mode = match self.socket_mode.as_str() {
             "0600" => 0o600,
@@ -245,6 +291,9 @@ impl ControlPlaneSection {
         range("max_connections", self.max_connections as u64, 1, 16)?;
         range("max_requests", self.max_requests as u64, 16, 65_536)?;
         range("answer_timeout_ms", self.answer_timeout_ms, 100, 30_000)?;
+        if let Some(e) = &self.evidence {
+            e.validate()?;
+        }
         if self.soc_keys.is_empty() {
             return Err("control_plane.soc_keys: at least one SOC public key file".into());
         }
@@ -272,10 +321,16 @@ impl ControlPlaneSection {
             }
             keys.push(k);
         }
+        let tls = match &self.tls {
+            None => None,
+            Some(t) => Some(t.resolve(crate::config::effective_uid())?),
+        };
         Ok(ControlPlaneSpec {
             tcp,
+            tls,
             unix: self.unix_socket.clone(),
             unix_mode,
+            state_dir: self.state_dir.clone(),
             keys,
             skew_s: self.max_clock_skew_s,
             rate_per_minute: self.rate_per_minute,
@@ -283,7 +338,24 @@ impl ControlPlaneSection {
             max_connections: self.max_connections,
             max_requests: self.max_requests,
             answer_timeout: Duration::from_millis(self.answer_timeout_ms),
+            evidence: self.evidence.clone(),
         })
+    }
+
+    /// Every file and directory path the section names (for the daemon's
+    /// "not inside the black box or spool" checks).
+    pub fn paths(&self) -> Vec<&Path> {
+        let mut v: Vec<&Path> = vec![self.state_dir.as_path()];
+        v.extend(self.unix_socket.as_deref());
+        v.extend(self.soc_keys.iter().map(PathBuf::as_path));
+        if let Some(t) = &self.tls {
+            v.extend([
+                t.cert_chain.as_path(),
+                t.key_file.as_path(),
+                t.client_ca.as_path(),
+            ]);
+        }
+        v
     }
 }
 
@@ -366,13 +438,18 @@ pub struct Counters {
     pub connections_rejected: AtomicU64,
     /// Requests that could not be read (malformed, too large, timeout).
     pub malformed: AtomicU64,
+    /// Failed authentications, TLS handshakes included.
     pub unauthenticated: AtomicU64,
+    /// TLS handshakes that failed (also in `unauthenticated`).
+    pub tls_failures: AtomicU64,
     pub authenticated: AtomicU64,
     pub rate_limited: AtomicU64,
     /// Answered 503 because the main loop did not take or answer in time.
     pub busy: AtomicU64,
     pub not_found: AtomicU64,
     pub answers_signed: AtomicU64,
+    /// Answers that could not be signed (sent as 500, unsigned).
+    pub answer_sign_failures: AtomicU64,
     last_auth_failure: Mutex<Option<String>>,
 }
 
@@ -393,6 +470,25 @@ impl Counters {
     }
 }
 
+/// What the persistent state looked like at start (status, start note).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct StateStatus {
+    pub state_dir: String,
+    /// Requests restored from the journal.
+    pub restored: usize,
+    pub journal_created: bool,
+    pub journal_torn_bytes: u64,
+    pub journal_damaged: usize,
+    pub journal_quarantined: Option<String>,
+    /// Dangling decisions settled from the black box.
+    pub resolved_committed: usize,
+    pub resolved_aborted: usize,
+    pub replay: auth::ReplayLoad,
+    /// Evidence exports kept / discarded at start.
+    pub exports_restored: usize,
+    pub exports_discarded: u64,
+}
+
 /// `status.json` / heartbeat view.
 #[derive(Debug, Clone, Serialize)]
 pub struct ControlStatus {
@@ -404,12 +500,22 @@ pub struct ControlStatus {
     pub connections_rejected: u64,
     pub malformed: u64,
     pub unauthenticated: u64,
+    pub tls_failures: u64,
     pub authenticated: u64,
     pub rate_limited: u64,
     pub busy: u64,
     pub not_found: u64,
     pub answers_signed: u64,
+    pub answer_sign_failures: u64,
     pub last_auth_failure: Option<String>,
+    /// The robot's TLS identity and the client trust (with `tls`).
+    pub tls: Option<Value>,
+    pub replay_entries: usize,
+    pub replay_store_errors: u64,
+    pub replay_fence: Option<u64>,
+    pub state: StateStatus,
+    /// Evidence API counters (with `evidence`).
+    pub evidence: Option<Value>,
     #[serde(flatten)]
     pub engine: api::EngineStats,
 }
@@ -425,15 +531,17 @@ pub struct CallMsg {
 struct Shared {
     robot_id: String,
     keys: Vec<SocKey>,
-    replay: Mutex<ReplayGuard>,
+    replay: Arc<Mutex<ReplayGuard>>,
     rate: Mutex<RateLimiter>,
+    chunk_rate: Mutex<RateLimiter>,
     counters: Arc<Counters>,
     calls: SyncSender<CallMsg>,
-    answer_signer: Option<Mutex<Box<dyn robodr_blackbox::Signer>>>,
+    answer_signer: Mutex<Box<dyn robodr_blackbox::Signer>>,
     answer_timeout: Duration,
     active: AtomicUsize,
     max_connections: usize,
     stop: Arc<AtomicBool>,
+    evidence: Option<Arc<evidence::Service>>,
 }
 
 /// The running control plane: listener threads and the main-loop side.
@@ -441,8 +549,12 @@ pub struct ControlPlane {
     pub engine: api::Engine,
     rx: Option<Receiver<CallMsg>>,
     counters: Arc<Counters>,
+    replay: Arc<Mutex<ReplayGuard>>,
     threads: Vec<JoinHandle<()>>,
     listening: Vec<String>,
+    tls: Option<Value>,
+    state: StateStatus,
+    evidence: Option<Arc<evidence::Service>>,
     stop: Arc<AtomicBool>,
 }
 
@@ -455,29 +567,124 @@ impl std::fmt::Debug for ControlPlane {
     }
 }
 
+/// Settles dangling journal decisions: given decision ids, the black-box
+/// references of the notes that carry them.
+pub type Reconcile<'a> = &'a dyn Fn(&[String]) -> std::io::Result<BTreeMap<String, String>>;
+
 impl ControlPlane {
-    /// Bind the listeners and start their threads. `answer_signer` (the
-    /// finding key) signs answers to authenticated requests.
+    /// Open the persistent state, bind the listeners and start their
+    /// threads. `answer_signer` (the finding key) signs every answer to an
+    /// authenticated request and every evidence manifest. `blackbox_dir`
+    /// is read (only) by the evidence API; `reconcile` settles decisions a
+    /// crash left half-journaled.
     pub fn start(
         spec: &ControlPlaneSpec,
         robot_id: &str,
-        answer_signer: Option<Box<dyn robodr_blackbox::Signer>>,
+        answer_signer: Box<dyn robodr_blackbox::Signer>,
+        blackbox_dir: &Path,
+        reconcile: Reconcile<'_>,
     ) -> Result<Self, String> {
+        let now_s = wall_s().ok_or("control plane: the wall clock is unavailable")?;
+        let euid = crate::config::effective_uid();
+        let dir = &spec.state_dir;
+        fsutil::check_private_dir(dir, euid)
+            .map_err(|e| format!("control_plane.state_dir: {e}"))?;
+        // The request journal (and the decisions a crash left dangling).
+        let (mut journal, mut restored) = state::open(dir, spec.max_requests).map_err(|e| {
+            format!(
+                "control_plane.state_dir: {}: {e}",
+                dir.join(state::REQUEST_JOURNAL).display()
+            )
+        })?;
+        let mut st = StateStatus {
+            state_dir: dir.display().to_string(),
+            journal_created: restored.created,
+            journal_torn_bytes: restored.torn_bytes,
+            journal_damaged: restored.damaged,
+            journal_quarantined: restored.quarantined.clone(),
+            ..StateStatus::default()
+        };
+        if !restored.pending.is_empty() || !restored.pending_reverts.is_empty() {
+            let ids: Vec<String> = restored
+                .pending
+                .keys()
+                .chain(restored.pending_reverts.keys())
+                .cloned()
+                .collect();
+            let found = reconcile(&ids).map_err(|e| {
+                format!("control plane: reading the black box to settle the request journal: {e}")
+            })?;
+            let (c, a) = state::resolve(&mut journal, &mut restored, &found, spec.max_requests)
+                .map_err(|e| format!("control plane: request journal: {e}"))?;
+            st.resolved_committed = c;
+            st.resolved_aborted = a;
+        }
+        st.journal_damaged = restored.damaged;
+        st.restored = restored.stored.len();
+        let mut engine = api::Engine::with_journal(
+            robot_id,
+            spec.max_requests,
+            Box::new(api::RecordingExecutor),
+            journal,
+            restored.stored,
+        );
+        engine.stats.resolved_committed = st.resolved_committed as u64;
+        engine.stats.resolved_aborted = st.resolved_aborted as u64;
+        engine.stats.journal_damaged = st.journal_damaged as u64;
+        // The replay store: fenced if it cannot be trusted.
+        let (replay, rload) = ReplayGuard::persistent(
+            dir,
+            spec.skew_s,
+            auth::MAX_NONCES,
+            now_s,
+            !st.journal_created,
+        )
+        .map_err(|e| {
+            format!(
+                "control_plane.state_dir: {}: {e}",
+                dir.join(auth::NONCE_JOURNAL).display()
+            )
+        })?;
+        st.replay = rload;
+        // Evidence exports.
+        let evidence = match &spec.evidence {
+            None => None,
+            Some(e) => {
+                let store = evidence::Store::open(dir, now_s.saturating_mul(1000))
+                    .map_err(|err| format!("control_plane.state_dir: exports: {err}"))?;
+                st.exports_restored = store.exports.len();
+                st.exports_discarded = store.discarded_at_open;
+                Some(Arc::new(evidence::Service {
+                    spec: e.clone(),
+                    blackbox: blackbox_dir.to_path_buf(),
+                    store: Mutex::new(store),
+                    building: Mutex::new(()),
+                }))
+            }
+        };
+        let replay = Arc::new(Mutex::new(replay));
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = sync_channel::<CallMsg>(CALL_QUEUE);
         let counters = Arc::new(Counters::default());
+        let (chunk_rate, chunk_burst) = spec
+            .evidence
+            .as_ref()
+            .map(|e| (e.chunk_rate_per_minute, e.chunk_burst))
+            .unwrap_or((1, 1));
         let shared = Arc::new(Shared {
             robot_id: robot_id.to_string(),
             keys: spec.keys.clone(),
-            replay: Mutex::new(ReplayGuard::new(spec.skew_s, auth::MAX_NONCES)),
+            replay: replay.clone(),
             rate: Mutex::new(RateLimiter::new(spec.rate_per_minute, spec.burst)),
+            chunk_rate: Mutex::new(RateLimiter::new(chunk_rate, chunk_burst)),
             counters: counters.clone(),
             calls: tx,
-            answer_signer: answer_signer.map(Mutex::new),
+            answer_signer: Mutex::new(answer_signer),
             answer_timeout: spec.answer_timeout,
             active: AtomicUsize::new(0),
             max_connections: spec.max_connections,
             stop: stop.clone(),
+            evidence: evidence.clone(),
         });
         // Bind everything first: a failure then leaves no thread behind.
         let mut listening = Vec::new();
@@ -487,11 +694,14 @@ impl ControlPlane {
                 let l = TcpListener::bind(addr)
                     .and_then(|l| l.set_nonblocking(true).map(|()| l))
                     .map_err(|e| format!("control_plane.listen_tcp {addr}: {e}"))?;
-                listening.push(
-                    l.local_addr()
-                        .map(|a| format!("tcp:{a}"))
-                        .unwrap_or_else(|_| format!("tcp:{addr}")),
-                );
+                let shown = l
+                    .local_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|_| addr.to_string());
+                listening.push(match spec.tls {
+                    Some(_) => format!("mtls:{shown}"),
+                    None => format!("tcp:{shown}"),
+                });
                 Some(l)
             }
         };
@@ -504,19 +714,20 @@ impl ControlPlane {
                     mode: spec.unix_mode,
                     max_connections: 1,
                 };
-                let sock = crate::host::bind_host_socket(&hs, crate::config::effective_uid())
+                let sock = crate::host::bind_host_socket(&hs, euid)
                     .map_err(|e| format!("control_plane.unix_socket {}: {e}", path.display()))?;
                 listening.push(format!("unix:{}", path.display()));
                 Some(sock)
             }
         };
+        let tls_cfg = spec.tls.as_ref().map(|t| t.config.clone());
         let mut threads = Vec::new();
         let mut spawned = Ok(());
         if let Some(l) = tcp {
             let sh = shared.clone();
             match std::thread::Builder::new()
                 .name("agentd-cp-tcp".into())
-                .spawn(move || run_tcp(l, sh))
+                .spawn(move || run_tcp(l, tls_cfg, sh))
             {
                 Ok(h) => threads.push(h),
                 Err(e) => spawned = Err(format!("control plane thread: {e}")),
@@ -548,15 +759,21 @@ impl ControlPlane {
             return Err(e);
         }
         Ok(Self {
-            engine: api::Engine::new(
-                robot_id,
-                spec.max_requests,
-                Box::new(api::RecordingExecutor),
-            ),
+            engine,
             rx: Some(rx),
             counters,
+            replay,
             threads,
             listening,
+            tls: spec.tls.as_ref().map(|t| {
+                json!({
+                    "server_spki_sha256": t.server_spki_sha256,
+                    "client_cas": t.client_cas,
+                    "client_pins": t.client_pins,
+                })
+            }),
+            state: st,
+            evidence,
             stop,
         })
     }
@@ -580,9 +797,30 @@ impl ControlPlane {
         &self.counters
     }
 
+    /// What the persistent state looked like at start.
+    pub fn state_status(&self) -> &StateStatus {
+        &self.state
+    }
+
     pub fn status(&self) -> ControlStatus {
         let c = &self.counters;
         let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        let (replay_entries, replay_store_errors, replay_fence) = {
+            let r = self.replay.lock().unwrap_or_else(PoisonError::into_inner);
+            (r.len(), r.store_errors, r.fence())
+        };
+        let evidence = self.evidence.as_ref().map(|e| {
+            let st = e.store.lock().unwrap_or_else(PoisonError::into_inner);
+            json!({
+                "exports": st.exports.len(),
+                "bytes": st.bytes(),
+                "created": st.created,
+                "deleted": st.deleted,
+                "expired": st.expired,
+                "chunks_served": st.chunks_served,
+                "corrupt": st.corrupt,
+            })
+        });
         ControlStatus {
             api: auth::API_VERSION,
             listening: self.listening.clone(),
@@ -592,12 +830,20 @@ impl ControlPlane {
             connections_rejected: g(&c.connections_rejected),
             malformed: g(&c.malformed),
             unauthenticated: g(&c.unauthenticated),
+            tls_failures: g(&c.tls_failures),
             authenticated: g(&c.authenticated),
             rate_limited: g(&c.rate_limited),
             busy: g(&c.busy),
             not_found: g(&c.not_found),
             answers_signed: g(&c.answers_signed),
+            answer_sign_failures: g(&c.answer_sign_failures),
             last_auth_failure: c.last_auth_failure(),
+            tls: self.tls.clone(),
+            replay_entries,
+            replay_store_errors,
+            replay_fence,
+            state: self.state.clone(),
+            evidence,
             engine: self.engine.stats,
         }
     }
@@ -627,7 +873,14 @@ fn wall_s() -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
-fn run_tcp(l: TcpListener, sh: Arc<Shared>) {
+fn wall_ms() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as u64)
+}
+
+fn run_tcp(l: TcpListener, tls: Option<Arc<rustls::ServerConfig>>, sh: Arc<Shared>) {
     let mut conns: Vec<JoinHandle<()>> = Vec::new();
     while !sh.stop.load(Ordering::Relaxed) {
         match l.accept() {
@@ -638,9 +891,30 @@ fn run_tcp(l: TcpListener, sh: Arc<Shared>) {
                 {
                     continue;
                 }
-                spawn_conn(&sh, &mut conns, format!("tcp:{addr}"), move |sh, peer| {
-                    serve::<TcpStream>(s, peer, sh)
-                });
+                match &tls {
+                    None => spawn_conn(&sh, &mut conns, format!("tcp:{addr}"), move |sh, peer| {
+                        serve::<TcpStream>(s, peer, sh)
+                    }),
+                    Some(cfg) => {
+                        let cfg = cfg.clone();
+                        spawn_conn(&sh, &mut conns, format!("mtls:{addr}"), move |sh, peer| {
+                            match tls::accept(&cfg, s, Instant::now() + READ_DEADLINE) {
+                                Ok((stream, spki)) => serve::<tls::TlsStream>(
+                                    stream,
+                                    format!("{peer};client_spki_sha256={spki}"),
+                                    sh,
+                                ),
+                                Err(why) => {
+                                    sh.counters.tls_failures.fetch_add(1, Ordering::Relaxed);
+                                    sh.counters.note_auth_failure(format!(
+                                        "tls_handshake_failed ({}) from {peer}",
+                                        robodr_ros2_pipeline::sanitize(&why)
+                                    ));
+                                }
+                            }
+                        })
+                    }
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(20));
@@ -714,7 +988,7 @@ where
 }
 
 /// Percent-decode one path segment (`%XX` only; the result must be ASCII).
-fn pct_decode(seg: &str) -> Option<String> {
+pub fn pct_decode(seg: &str) -> Option<String> {
     let b = seg.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -732,6 +1006,9 @@ fn pct_decode(seg: &str) -> Option<String> {
     s.is_ascii().then_some(s)
 }
 
+/// The API's path prefix.
+pub const PREFIX: &str = "/api/v2/robots/";
+
 /// The API routes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
@@ -739,14 +1016,47 @@ pub enum Route {
     Submit,
     Get(String),
     Revert(String),
+    /// `GET .../evidence`
+    EvidenceInventory,
+    /// `POST .../evidence/exports`
+    EvidenceCreate,
+    /// `GET .../evidence/exports/{export_id}`
+    EvidenceManifest(String),
+    /// `DELETE .../evidence/exports/{export_id}`
+    EvidenceDelete(String),
+    /// `GET .../evidence/exports/{export_id}/chunks/{index}`
+    EvidenceChunk(String, u64),
+}
+
+impl Route {
+    pub fn is_evidence(&self) -> bool {
+        matches!(
+            self,
+            Route::EvidenceInventory
+                | Route::EvidenceCreate
+                | Route::EvidenceManifest(_)
+                | Route::EvidenceDelete(_)
+                | Route::EvidenceChunk(..)
+        )
+    }
+}
+
+/// A chunk index: decimal, no sign, no leading zero (but `0`), at most
+/// 10 digits.
+fn chunk_index(s: &str) -> Option<u64> {
+    if s.is_empty() || s.len() > 10 || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if s.len() > 1 && s.starts_with('0') {
+        return None;
+    }
+    s.parse().ok()
 }
 
 /// Map method and target to a route (after authentication).
 pub fn route(method: &str, target: &str, robot_id: &str) -> Result<Route, ApiError> {
     let not_found = || ApiError::new(404, "not_found", "no such resource");
-    let rest = target
-        .strip_prefix("/api/v1/robots/")
-        .ok_or_else(not_found)?;
+    let rest = target.strip_prefix(PREFIX).ok_or_else(not_found)?;
     let segs: Vec<&str> = rest.split('/').collect();
     let robot = segs
         .first()
@@ -760,12 +1070,12 @@ pub fn route(method: &str, target: &str, robot_id: &str) -> Result<Route, ApiErr
         ));
     }
     let method_err = || ApiError::new(405, "method_not_allowed", "method not allowed here");
-    let decode_id = |s: &str| {
+    let decode_id = |s: &str, code: &'static str| {
         let id = pct_decode(s).ok_or_else(not_found)?;
         if api::request_id_ok(&id) {
             Ok(id)
         } else {
-            Err(ApiError::new(404, "unknown_request", "not a request id"))
+            Err(ApiError::new(404, code, "not a valid id"))
         }
     };
     match (method, segs.as_slice()) {
@@ -773,10 +1083,30 @@ pub fn route(method: &str, target: &str, robot_id: &str) -> Result<Route, ApiErr
         (_, [_]) => Err(method_err()),
         ("POST", [_, "action-requests"]) => Ok(Route::Submit),
         (_, [_, "action-requests"]) => Err(method_err()),
-        ("GET", [_, "action-requests", id]) => Ok(Route::Get(decode_id(id)?)),
+        ("GET", [_, "action-requests", id]) => Ok(Route::Get(decode_id(id, "unknown_request")?)),
         (_, [_, "action-requests", _]) => Err(method_err()),
-        ("POST", [_, "action-requests", id, "revert"]) => Ok(Route::Revert(decode_id(id)?)),
+        ("POST", [_, "action-requests", id, "revert"]) => {
+            Ok(Route::Revert(decode_id(id, "unknown_request")?))
+        }
         (_, [_, "action-requests", _, "revert"]) => Err(method_err()),
+        ("GET", [_, "evidence"]) => Ok(Route::EvidenceInventory),
+        (_, [_, "evidence"]) => Err(method_err()),
+        ("POST", [_, "evidence", "exports"]) => Ok(Route::EvidenceCreate),
+        (_, [_, "evidence", "exports"]) => Err(method_err()),
+        ("GET", [_, "evidence", "exports", id]) => {
+            Ok(Route::EvidenceManifest(decode_id(id, "unknown_export")?))
+        }
+        ("DELETE", [_, "evidence", "exports", id]) => {
+            Ok(Route::EvidenceDelete(decode_id(id, "unknown_export")?))
+        }
+        (_, [_, "evidence", "exports", _]) => Err(method_err()),
+        ("GET", [_, "evidence", "exports", id, "chunks", n]) => {
+            let id = decode_id(id, "unknown_export")?;
+            let n = chunk_index(n)
+                .ok_or_else(|| ApiError::new(404, "unknown_chunk", "not a chunk index"))?;
+            Ok(Route::EvidenceChunk(id, n))
+        }
+        (_, [_, "evidence", "exports", _, "chunks", _]) => Err(method_err()),
         _ => Err(not_found()),
     }
 }
@@ -787,10 +1117,56 @@ fn to_body(v: &Value) -> Vec<u8> {
 
 fn send<S: http::Stream>(s: &mut S, status: u16, body: &Value, extra: &[(&str, String)]) {
     let _ = http::write_response(s, status, &to_body(body), extra);
+    s.finish();
 }
 
-/// Serve one connection: read, authenticate, route, hand to the main loop,
-/// answer. Never panics; every exit writes an answer if the peer is there.
+/// One answer to an authenticated request, before it is signed.
+struct Reply {
+    status: u16,
+    content_type: &'static str,
+    body: Vec<u8>,
+    extra: Vec<(&'static str, String)>,
+}
+
+impl Reply {
+    fn json(status: u16, v: &Value) -> Self {
+        Self {
+            status,
+            content_type: http::JSON,
+            body: to_body(v),
+            extra: Vec::new(),
+        }
+    }
+
+    fn error(e: &ApiError) -> Self {
+        Self::json(e.status, &e.body())
+    }
+}
+
+/// Hand a call to the main loop and wait for its answer.
+fn dispatch(sh: &Shared, call: Call, meta: Meta) -> Result<Answer, &'static str> {
+    if sh.stop.load(Ordering::Relaxed) {
+        return Err("the daemon is stopping");
+    }
+    let (tx, rx) = sync_channel::<Answer>(1);
+    match sh.calls.try_send(CallMsg {
+        call,
+        meta,
+        reply: tx,
+    }) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => return Err("too many requests in flight"),
+        Err(TrySendError::Disconnected(_)) => return Err("the daemon is stopping"),
+    }
+    rx.recv_timeout(sh.answer_timeout).map_err(|_| {
+        "the daemon did not answer in time; the request may still be recorded, read it back with \
+         GET"
+    })
+}
+
+/// Serve one connection: read, authenticate, route, hand to the main loop
+/// (or the evidence API), answer. Never panics; every exit writes an
+/// answer if the peer is there.
 fn serve<S: http::Stream>(mut s: S, peer: String, sh: &Shared) {
     let c = &sh.counters;
     let req = match http::read_request(&mut s, Instant::now() + READ_DEADLINE) {
@@ -829,65 +1205,64 @@ fn serve<S: http::Stream>(mut s: S, peer: String, sh: &Shared) {
         return fail(&mut s, f);
     }
     c.authenticated.fetch_add(1, Ordering::Relaxed);
-    // From here on the peer proved the key: answers are signed.
-    let sign = |status: u16, body: &[u8]| -> Vec<(&'static str, String)> {
-        let Some(signer) = &sh.answer_signer else {
-            return Vec::new();
-        };
-        let signer = signer.lock().unwrap_or_else(PoisonError::into_inner);
-        match signer.sign(&auth::answer_message(&creds.signature_hex, status, body)) {
-            Ok(sig) => {
-                c.answers_signed.fetch_add(1, Ordering::Relaxed);
-                vec![(
-                    auth::H_ANSWER_SIGNATURE,
+    // From here on the peer proved the key: every answer is signed.
+    let answer = |s: &mut S, mut r: Reply| {
+        let signed = {
+            let signer = sh
+                .answer_signer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            signer
+                .sign(&auth::answer_message(
+                    &creds.signature_hex,
+                    r.status,
+                    &r.body,
+                ))
+                .map(|sig| {
                     format!(
                         "ed25519;key_id={};sig={}",
                         signer.key_id(),
                         robodr_blackbox::crypto::to_hex(&sig)
-                    ),
-                )]
+                    )
+                })
+        };
+        match signed {
+            Ok(h) => {
+                c.answers_signed.fetch_add(1, Ordering::Relaxed);
+                r.extra.push((auth::H_ANSWER_SIGNATURE, h));
+                let _ = http::write_typed(s, r.status, r.content_type, &r.body, &r.extra);
             }
-            Err(_) => Vec::new(),
+            Err(_) => {
+                // Never an unsigned success: the SOC treats it as a failure.
+                c.answer_sign_failures.fetch_add(1, Ordering::Relaxed);
+                let body = api::error_body(
+                    "answer_signing_failed",
+                    "the robot could not sign its answer; nothing should be trusted from it",
+                );
+                let _ = http::write_response(s, 500, &to_body(&body), &[]);
+            }
         }
+        s.finish();
     };
-    let answer = |s: &mut S, status: u16, body: &Value| {
-        let bytes = to_body(body);
-        let extra = sign(status, &bytes);
-        let _ = http::write_response(s, status, &bytes, &extra);
-    };
-    let limited = sh
-        .rate
+    let route = route(&req.method, &req.target, &sh.robot_id);
+    let is_chunk = matches!(route, Ok(Route::EvidenceChunk(..)));
+    let limiter = if is_chunk { &sh.chunk_rate } else { &sh.rate };
+    let limited = limiter
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .allow(&creds.key_id, Instant::now());
     if let Err(retry) = limited {
         c.rate_limited.fetch_add(1, Ordering::Relaxed);
-        let body = api::error_body(
-            "rate_limited",
-            &format!("too many requests for this key; retry after {retry} s"),
+        let mut r = Reply::json(
+            429,
+            &api::error_body(
+                "rate_limited",
+                &format!("too many requests for this key; retry after {retry} s"),
+            ),
         );
-        let bytes = to_body(&body);
-        let mut extra = sign(429, &bytes);
-        extra.push(("Retry-After", retry.to_string()));
-        let _ = http::write_response(&mut s, 429, &bytes, &extra);
-        return;
+        r.extra.push(("Retry-After", retry.to_string()));
+        return answer(&mut s, r);
     }
-    let call = match route(&req.method, &req.target, &sh.robot_id) {
-        Err(e) => {
-            c.not_found.fetch_add(1, Ordering::Relaxed);
-            return answer(&mut s, e.status, &e.body());
-        }
-        Ok(Route::Robot) => Call::Robot,
-        Ok(Route::Get(id)) => Call::Get(id),
-        Ok(Route::Submit) => match api::parse_submit(&req.body) {
-            Ok(r) => Call::Submit(r),
-            Err(e) => Call::Invalid(e),
-        },
-        Ok(Route::Revert(id)) => match api::parse_revert(&req.body) {
-            Ok(r) => Call::Revert(id, r),
-            Err(e) => Call::Invalid(e),
-        },
-    };
     let meta = Meta {
         key_id: creds.key_id.clone(),
         nonce: creds.nonce.clone(),
@@ -899,30 +1274,304 @@ fn serve<S: http::Stream>(mut s: S, peer: String, sh: &Shared) {
         body: String::from_utf8_lossy(&req.body).into_owned(),
         peer: peer.clone(),
     };
-    let busy = |s: &mut S, why: &str| {
+    let busy = |why: &str| {
         c.busy.fetch_add(1, Ordering::Relaxed);
-        answer(s, 503, &api::error_body("busy", why));
+        Reply::json(503, &api::error_body("busy", why))
     };
-    if sh.stop.load(Ordering::Relaxed) {
-        return busy(&mut s, "the daemon is stopping");
+    let route = match route {
+        Err(e) => {
+            c.not_found.fetch_add(1, Ordering::Relaxed);
+            return answer(&mut s, Reply::error(&e));
+        }
+        Ok(r) => r,
+    };
+    if route.is_evidence() {
+        let Some(svc) = sh.evidence.as_ref() else {
+            c.not_found.fetch_add(1, Ordering::Relaxed);
+            return answer(
+                &mut s,
+                Reply::error(&ApiError::new(
+                    404,
+                    "evidence_disabled",
+                    "the evidence API is not configured on this robot",
+                )),
+            );
+        };
+        let r = evidence_call(sh, svc, &route, &req.body, meta, &busy);
+        return answer(&mut s, r);
     }
-    let (tx, rx) = sync_channel::<Answer>(1);
-    match sh.calls.try_send(CallMsg {
-        call,
-        meta,
-        reply: tx,
-    }) {
-        Ok(()) => {}
-        Err(TrySendError::Full(_)) => return busy(&mut s, "too many requests in flight"),
-        Err(TrySendError::Disconnected(_)) => return busy(&mut s, "the daemon is stopping"),
-    }
-    match rx.recv_timeout(sh.answer_timeout) {
-        Ok(a) => answer(&mut s, a.status, &a.body),
-        Err(_) => busy(
-            &mut s,
-            "the daemon did not answer in time; the request may still be recorded, read it back \
-             with GET",
-        ),
+    let call = match route {
+        Route::Robot => Call::Robot,
+        Route::Get(id) => Call::Get(id),
+        Route::Submit => match api::parse_submit(&req.body) {
+            Ok(r) => Call::Submit(r),
+            Err(e) => Call::Invalid(e),
+        },
+        Route::Revert(id) => match api::parse_revert(&req.body) {
+            Ok(r) => Call::Revert(id, r),
+            Err(e) => Call::Invalid(e),
+        },
+        // Handled above.
+        _ => return answer(&mut s, busy("unroutable")),
+    };
+    let r = match dispatch(sh, call, meta) {
+        Ok(a) => Reply::json(a.status, &a.body),
+        Err(why) => busy(why),
+    };
+    answer(&mut s, r)
+}
+
+/// The evidence API calls (listener thread; only the export note goes to
+/// the main loop).
+fn evidence_call(
+    sh: &Shared,
+    svc: &evidence::Service,
+    route: &Route,
+    body: &[u8],
+    meta: Meta,
+    busy: &dyn Fn(&str) -> Reply,
+) -> Reply {
+    let Some(now_ms) = wall_ms() else {
+        return Reply::error(&ApiError::new(
+            503,
+            "clock_unavailable",
+            "the robot's wall clock is unavailable",
+        ));
+    };
+    let lock = || svc.store.lock().unwrap_or_else(PoisonError::into_inner);
+    lock().purge(now_ms);
+    let manifest_reply = |status: u16, st: &evidence::Stored| Reply {
+        status,
+        content_type: http::JSON,
+        body: st.manifest_bytes.clone(),
+        extra: vec![(evidence::H_MANIFEST_SIGNATURE, st.signature.clone())],
+    };
+    let unknown = || {
+        Reply::error(&ApiError::new(
+            404,
+            "unknown_export",
+            "no export with this id on this robot (it may have expired)",
+        ))
+    };
+    match route {
+        Route::EvidenceInventory => {
+            let Ok(_g) = svc.building.try_lock() else {
+                return Reply::error(&ApiError::new(
+                    503,
+                    "evidence_busy",
+                    "another evidence index or export is running; retry shortly",
+                ));
+            };
+            let src = evidence::DirSource(svc.blackbox.clone());
+            let mut inv = match evidence::index(&src) {
+                Ok(ix) => evidence::inventory(&ix, &sh.robot_id),
+                Err(e) => return Reply::error(&e),
+            };
+            inv["exports"] = json!(lock().list());
+            inv["limits"] = json!({
+                "max_export_bytes": svc.spec.max_export_bytes,
+                "chunk_bytes": svc.spec.chunk_bytes,
+                "max_exports": svc.spec.max_exports,
+                "max_storage_bytes": svc.spec.max_storage_bytes,
+                "export_ttl_s": svc.spec.export_ttl_s,
+            });
+            Reply::json(200, &inv)
+        }
+        Route::EvidenceManifest(id) => match lock().exports.get(id) {
+            Some(st) => manifest_reply(200, st),
+            None => unknown(),
+        },
+        Route::EvidenceDelete(id) => {
+            if lock().delete(id) {
+                Reply::json(200, &json!({"export_id": id, "deleted": true}))
+            } else {
+                unknown()
+            }
+        }
+        Route::EvidenceChunk(id, n) => {
+            let Some(st) = lock().exports.get(id).cloned() else {
+                return unknown();
+            };
+            match evidence::read_chunk(&st, *n) {
+                Ok(bytes) => {
+                    lock().chunks_served += 1;
+                    Reply {
+                        status: 200,
+                        content_type: http::OCTETS,
+                        body: bytes,
+                        extra: Vec::new(),
+                    }
+                }
+                Err(e) => {
+                    if e.code == "export_corrupt" {
+                        let mut g = lock();
+                        g.corrupt += 1;
+                        g.delete(id);
+                    }
+                    Reply::error(&e)
+                }
+            }
+        }
+        Route::EvidenceCreate => {
+            let req = match evidence::parse_export(body, &sh.robot_id) {
+                Ok(r) => r,
+                Err(e) => {
+                    // Authenticated but invalid: recorded like any other.
+                    return match dispatch(sh, Call::Invalid(e), meta) {
+                        Ok(a) => Reply::json(a.status, &a.body),
+                        Err(why) => busy(why),
+                    };
+                }
+            };
+            {
+                let g = lock();
+                if let Some(st) = g.exports.get(&req.export_id) {
+                    return if st.digest == req.digest() {
+                        manifest_reply(200, st)
+                    } else {
+                        Reply::error(&ApiError::new(
+                            409,
+                            "export_id_conflict",
+                            "this export_id was already used for another selection",
+                        ))
+                    };
+                }
+                if g.exports.len() >= svc.spec.max_exports {
+                    return Reply::error(&ApiError::new(
+                        409,
+                        "export_limit",
+                        format!(
+                            "{} exports are kept (max_exports); delete one or wait for one to \
+                             expire",
+                            g.exports.len()
+                        ),
+                    ));
+                }
+            }
+            let Ok(_g) = svc.building.try_lock() else {
+                return Reply::error(&ApiError::new(
+                    503,
+                    "evidence_busy",
+                    "another evidence index or export is running; retry shortly",
+                ));
+            };
+            let src = evidence::DirSource(svc.blackbox.clone());
+            let built = match evidence::index(&src).and_then(|ix| {
+                let (lo, hi, refs) = evidence::select(&ix, &req.selector)?;
+                evidence::build(&src, &ix, lo, hi, refs, svc.spec.max_export_bytes)
+            }) {
+                Ok(b) => b,
+                Err(e) => return Reply::error(&e),
+            };
+            let used = lock().bytes();
+            if used.saturating_add(built.bundle.len() as u64) > svc.spec.max_storage_bytes {
+                return Reply::error(&ApiError::new(
+                    507,
+                    "storage_full",
+                    format!(
+                        "the kept exports use {used} bytes; this one ({} bytes) would exceed \
+                         max_storage_bytes; delete exports first",
+                        built.bundle.len()
+                    ),
+                ));
+            }
+            let binfo = evidence::bundle_info(&built.bundle, svc.spec.chunk_bytes);
+            let note = json!({
+                "kind": "robodr.control_plane_evidence_export",
+                "api": auth::API_VERSION,
+                "robot_id": sh.robot_id,
+                "export_id": req.export_id,
+                "selector": req.selector,
+                "requested_by": req.requested_by,
+                "reason": req.reason,
+                "auth": meta,
+                "chain_id": built.chain.chain_id,
+                "records": built.records,
+                "anchor": built.anchor,
+                "bundle": {
+                    "format": binfo.format,
+                    "bytes": binfo.bytes,
+                    "sha256": binfo.sha256,
+                    "chunk_bytes": binfo.chunk_bytes,
+                    "chunks": binfo.chunks.len(),
+                },
+            });
+            let key_id = meta.key_id.clone();
+            let evidence_ref = match dispatch(sh, Call::EvidenceNote(Box::new(note)), meta) {
+                Ok(a) if a.status == 200 => match a.body["evidence"].as_str() {
+                    Some(e) => e.to_string(),
+                    None => return Reply::json(503, &api::error_body("evidence_unavailable", "")),
+                },
+                Ok(a) => return Reply::json(a.status, &a.body),
+                Err(why) => return busy(why),
+            };
+            let manifest = evidence::Manifest {
+                kind: evidence::MANIFEST_KIND.into(),
+                version: evidence::MANIFEST_VERSION,
+                api: auth::API_VERSION.into(),
+                robot_id: sh.robot_id.clone(),
+                export_id: req.export_id.clone(),
+                created_at_ms: now_ms,
+                expires_at_ms: now_ms.saturating_add(svc.spec.export_ttl_s.saturating_mul(1000)),
+                requested_by: req.requested_by.clone(),
+                reason: req.reason.clone(),
+                key_id,
+                selector: req.selector.clone(),
+                chain: built.chain.clone(),
+                records: built.records.clone(),
+                anchor: built.anchor.clone(),
+                referenced: built.referenced.clone(),
+                bundle: binfo,
+                evidence: evidence_ref,
+            };
+            let manifest_bytes = match serde_json::to_vec(&manifest) {
+                Ok(b) => b,
+                Err(e) => {
+                    return Reply::error(&ApiError::new(
+                        503,
+                        "evidence_unavailable",
+                        format!("manifest: {e}"),
+                    ))
+                }
+            };
+            let signature = {
+                let signer = sh
+                    .answer_signer
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                evidence::sign_manifest(signer.as_ref(), &manifest_bytes)
+            };
+            let Ok(signature) = signature else {
+                sh.counters
+                    .answer_sign_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                return Reply::error(&ApiError::new(
+                    503,
+                    "evidence_unavailable",
+                    "the manifest could not be signed; nothing was exported",
+                ));
+            };
+            let exports_dir = lock().dir.clone();
+            match evidence::write_export(
+                &exports_dir,
+                manifest,
+                manifest_bytes,
+                signature,
+                &built.bundle,
+            ) {
+                Ok(st) => {
+                    let r = manifest_reply(201, &st);
+                    lock().insert(st);
+                    r
+                }
+                Err(e) => Reply::error(&ApiError::new(
+                    503,
+                    "evidence_unavailable",
+                    format!("the export could not be stored ({e}); retry later"),
+                )),
+            }
+        }
+        _ => busy("unroutable"),
     }
 }
 
@@ -933,57 +1582,112 @@ mod tests {
     #[test]
     fn routes() {
         let r = |m: &str, t: &str| route(m, t, "ugv-007");
-        assert_eq!(r("GET", "/api/v1/robots/ugv-007"), Ok(Route::Robot));
+        assert_eq!(r("GET", "/api/v2/robots/ugv-007"), Ok(Route::Robot));
         assert_eq!(
-            r("POST", "/api/v1/robots/ugv-007/action-requests"),
+            r("POST", "/api/v2/robots/ugv-007/action-requests"),
             Ok(Route::Submit)
         );
         assert_eq!(
             r(
                 "GET",
-                "/api/v1/robots/ugv-007/action-requests/robot_safe_pause%3Augv-007"
+                "/api/v2/robots/ugv-007/action-requests/robot_safe_pause%3Augv-007"
             ),
             Ok(Route::Get("robot_safe_pause:ugv-007".into()))
         );
         assert_eq!(
-            r("POST", "/api/v1/robots/ugv%2D007/action-requests/a/revert"),
+            r("POST", "/api/v2/robots/ugv%2D007/action-requests/a/revert"),
             Ok(Route::Revert("a".into()))
         );
         assert_eq!(
-            r("GET", "/api/v1/robots/ugv-008").unwrap_err().code,
+            r("GET", "/api/v2/robots/ugv-008").unwrap_err().code,
             "unknown_robot"
         );
-        assert_eq!(r("POST", "/api/v1/robots/ugv-007").unwrap_err().status, 405);
+        assert_eq!(r("POST", "/api/v2/robots/ugv-007").unwrap_err().status, 405);
         assert_eq!(
-            r("GET", "/api/v1/robots/ugv-007/action-requests")
+            r("GET", "/api/v2/robots/ugv-007/action-requests")
                 .unwrap_err()
                 .status,
             405
         );
         assert_eq!(
-            r("GET", "/api/v1/robots/ugv-007/other").unwrap_err().status,
+            r("GET", "/api/v2/robots/ugv-007/other").unwrap_err().status,
             404
         );
-        assert_eq!(r("GET", "/api/v2/robots/ugv-007").unwrap_err().status, 404);
+        // v1 is gone.
+        assert_eq!(r("GET", "/api/v1/robots/ugv-007").unwrap_err().status, 404);
         assert_eq!(
-            r("GET", "/api/v1/robots/ugv-007/action-requests/a%2Fb")
+            r("GET", "/api/v2/robots/ugv-007/action-requests/a%2Fb")
                 .unwrap_err()
                 .code,
             "unknown_request"
         );
         assert_eq!(
-            r("GET", "/api/v1/robots/ugv-007/action-requests/%zz")
+            r("GET", "/api/v2/robots/ugv-007/action-requests/%zz")
                 .unwrap_err()
                 .status,
             404
         );
         assert_eq!(
-            r("GET", "/api/v1/robots/ugv-007/action-requests/%c3%a9")
+            r("GET", "/api/v2/robots/ugv-007/action-requests/%c3%a9")
                 .unwrap_err()
                 .status,
             404
         );
-        assert_eq!(r("GET", "/api/v1/robots/ugv-007/").unwrap_err().status, 404);
+        assert_eq!(r("GET", "/api/v2/robots/ugv-007/").unwrap_err().status, 404);
+        // Evidence.
+        assert_eq!(
+            r("GET", "/api/v2/robots/ugv-007/evidence"),
+            Ok(Route::EvidenceInventory)
+        );
+        assert_eq!(
+            r("POST", "/api/v2/robots/ugv-007/evidence/exports"),
+            Ok(Route::EvidenceCreate)
+        );
+        assert_eq!(
+            r("GET", "/api/v2/robots/ugv-007/evidence/exports/exp%3A1"),
+            Ok(Route::EvidenceManifest("exp:1".into()))
+        );
+        assert_eq!(
+            r("DELETE", "/api/v2/robots/ugv-007/evidence/exports/exp-1"),
+            Ok(Route::EvidenceDelete("exp-1".into()))
+        );
+        assert_eq!(
+            r(
+                "GET",
+                "/api/v2/robots/ugv-007/evidence/exports/exp-1/chunks/12"
+            ),
+            Ok(Route::EvidenceChunk("exp-1".into(), 12))
+        );
+        for bad in ["012", "-1", "", "99999999999", "1a"] {
+            assert_eq!(
+                r(
+                    "GET",
+                    &format!("/api/v2/robots/ugv-007/evidence/exports/e/chunks/{bad}")
+                )
+                .unwrap_err()
+                .status,
+                404,
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            r("POST", "/api/v2/robots/ugv-007/evidence/exports/e/chunks/0")
+                .unwrap_err()
+                .status,
+            405
+        );
+        assert_eq!(
+            r("PUT", "/api/v2/robots/ugv-007/evidence/exports/e")
+                .unwrap_err()
+                .status,
+            405
+        );
+        assert_eq!(
+            r("GET", "/api/v2/robots/ugv-007/evidence/exports/a%2Fb")
+                .unwrap_err()
+                .code,
+            "unknown_export"
+        );
     }
 
     fn section(v: serde_json::Value) -> Result<ControlPlaneSection, serde_json::Error> {
@@ -992,31 +1696,69 @@ mod tests {
 
     #[test]
     fn section_is_strict() {
-        assert!(
-            section(serde_json::json!({"soc_keys": [], "listen_tcp": "127.0.0.1:1", "x": 1}))
-                .is_err()
-        );
-        let s = section(serde_json::json!({"soc_keys": [], "listen_tcp": "127.0.0.1:1"})).unwrap();
+        let base = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({"soc_keys": [], "state_dir": "/var/lib/x"});
+            for (k, x) in extra.as_object().unwrap() {
+                v[k] = x.clone();
+            }
+            section(v)
+        };
+        assert!(base(serde_json::json!({"listen_tcp": "127.0.0.1:1", "x": 1})).is_err());
+        // state_dir is required.
+        assert!(section(serde_json::json!({"soc_keys": [], "listen_tcp": "127.0.0.1:1"})).is_err());
+        let s = base(serde_json::json!({"listen_tcp": "127.0.0.1:1"})).unwrap();
         assert!(s.resolve("r", &[]).unwrap_err().contains("at least one"));
-        let s = section(serde_json::json!({"soc_keys": [], "listen_tcp": "0.0.0.0:8787"})).unwrap();
-        assert!(s.resolve("r", &[]).unwrap_err().contains("loopback"));
-        let s = section(serde_json::json!({"soc_keys": [], "listen_tcp": "127.0.0.1:0"})).unwrap();
+        let s = base(serde_json::json!({"listen_tcp": "0.0.0.0:8787"})).unwrap();
+        assert!(s.resolve("r", &[]).unwrap_err().contains("mutual TLS"));
+        let s =
+            base(serde_json::json!({"listen_tcp": "0.0.0.0:8787", "allow_remote": true})).unwrap();
+        assert!(s.resolve("r", &[]).unwrap_err().contains("removed"));
+        let s =
+            base(serde_json::json!({"listen_tcp": "127.0.0.1:1", "allow_remote": false})).unwrap();
+        assert!(s.resolve("r", &[]).unwrap_err().contains("removed"));
+        let s = base(serde_json::json!({"listen_tcp": "127.0.0.1:0"})).unwrap();
         assert!(s.resolve("r", &[]).unwrap_err().contains("port 0"));
-        let s = section(serde_json::json!({"soc_keys": []})).unwrap();
+        let s = base(serde_json::json!({})).unwrap();
         assert!(s
             .resolve("r", &[])
             .unwrap_err()
             .contains("listen_tcp and/or"));
-        let s = section(serde_json::json!({"soc_keys": [], "unix_socket": "rel.sock"})).unwrap();
+        let s = base(serde_json::json!({"unix_socket": "rel.sock"})).unwrap();
         assert!(s.resolve("r", &[]).unwrap_err().contains("absolute"));
-        let s = section(
-            serde_json::json!({"soc_keys": [], "listen_tcp": "127.0.0.1:1", "max_clock_skew_s": 0}),
-        )
-        .unwrap();
+        let s =
+            base(serde_json::json!({"unix_socket": "/run/x/c.sock", "state_dir": "rel"})).unwrap();
+        assert!(s.resolve("r", &[]).unwrap_err().contains("state_dir"));
+        let s =
+            base(serde_json::json!({"listen_tcp": "127.0.0.1:1", "max_clock_skew_s": 0})).unwrap();
         assert!(s
             .resolve("r", &[])
             .unwrap_err()
             .contains("max_clock_skew_s"));
+        let s = base(serde_json::json!({
+            "unix_socket": "/run/x/c.sock",
+            "tls": {"cert_chain": "/a", "key_file": "/b", "client_ca": "/c"}
+        }))
+        .unwrap();
+        assert!(s
+            .resolve("r", &[])
+            .unwrap_err()
+            .contains("applies to listen_tcp"));
+        let s = base(serde_json::json!({
+            "listen_tcp": "127.0.0.1:1",
+            "evidence": {"chunk_bytes": 1024}
+        }))
+        .unwrap();
+        assert!(s.resolve("r", &[]).unwrap_err().contains("chunk_bytes"));
+        assert!(base(serde_json::json!({
+            "listen_tcp": "127.0.0.1:1",
+            "evidence": {"nope": 1}
+        }))
+        .is_err());
+        assert!(base(serde_json::json!({
+            "listen_tcp": "127.0.0.1:1",
+            "tls": {"cert_chain": "/a", "key_file": "/b", "client_ca": "/c", "verify": false}
+        }))
+        .is_err());
     }
 
     fn tmp(tag: &str) -> PathBuf {
@@ -1061,11 +1803,14 @@ mod tests {
         assert!(load_soc_key(&bp, "ugv-008").is_ok());
         // Through the section: duplicates and own key ids refused.
         let s = section(serde_json::json!({
-            "listen_tcp": "127.0.0.1:1", "soc_keys": [p, p]
+            "listen_tcp": "127.0.0.1:1", "state_dir": "/var/lib/x", "soc_keys": [p, p]
         }))
         .unwrap();
         assert!(s.resolve("ugv-007", &[]).unwrap_err().contains("twice"));
-        let s = section(serde_json::json!({"listen_tcp": "127.0.0.1:1", "soc_keys": [p]})).unwrap();
+        let s = section(
+            serde_json::json!({"listen_tcp": "127.0.0.1:1", "state_dir": "/var/lib/x", "soc_keys": [p]}),
+        )
+        .unwrap();
         assert!(s
             .resolve("ugv-007", &["soc-a"])
             .unwrap_err()

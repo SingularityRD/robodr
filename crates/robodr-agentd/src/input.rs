@@ -523,7 +523,15 @@ impl EventSocket {
     }
 }
 
-/// Bind the event socket at `path`, mode 0600.
+/// Bind the event socket at `path`, mode 0600 ([`bind_event_socket_mode`]).
+pub fn bind_event_socket(path: &Path) -> io::Result<EventSocket> {
+    bind_event_socket_mode(path, 0o600)
+}
+
+/// Prefix of the private bind directories ([`bind_event_socket_mode`]).
+const BIND_DIR_PREFIX: &str = ".rbind-";
+
+/// Bind a unix stream socket at `path` with permission bits `mode`.
 ///
 /// * Nothing there: bind.
 /// * A socket nobody listens on (`connect` is refused): stale, replaced.
@@ -531,9 +539,21 @@ impl EventSocket {
 ///   refused with `AddrInUse` (it is never unlinked from under it).
 /// * Anything else (a file, a directory, a symlink): refused.
 ///
-/// The parent directory should be private too: there is a short window
-/// between bind and chmod.
-pub fn bind_event_socket(path: &Path) -> io::Result<EventSocket> {
+/// **No bind → chmod window.** `bind(2)` creates the socket file with the
+/// process umask, so a socket bound in place and `chmod`ed afterwards is
+/// briefly connectable with looser permissions. Instead the socket is bound
+/// as `s` inside a fresh directory `<dir>/.rbind-<random>` created with
+/// mode 0700 (nobody else can reach anything in it), `chmod`ed to `mode`
+/// there, and only then hard-linked to `path` (`link(2)`: atomic, and it
+/// fails rather than replace anything that appeared at `path`); the
+/// temporary name and directory are removed. A connection can therefore
+/// only ever reach the socket through `path` with its final mode. (The
+/// socket stays bound across the link: a unix socket is found by its
+/// inode.) The temporary path is at most 15 bytes longer than `<dir>`, so
+/// the socket path's 107-byte limit applies to it too. Leftover bind
+/// directories of a process killed in between are removed at the next
+/// bind in the same directory.
+pub fn bind_event_socket_mode(path: &Path, mode: u32) -> io::Result<EventSocket> {
     match std::fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_socket() => match UnixStream::connect(path) {
             Ok(_) => {
@@ -562,7 +582,45 @@ pub fn bind_event_socket(path: &Path) -> io::Result<EventSocket> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    let listener = UnixListener::bind(path)?;
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    remove_stale_bind_dirs(dir);
+    let mut rnd = [0u8; 4];
+    robodr_blackbox::crypto::fill_random(&mut rnd)?;
+    let tmpdir = dir.join(format!(
+        "{BIND_DIR_PREFIX}{}",
+        robodr_blackbox::crypto::to_hex(&rnd)
+    ));
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(&tmpdir)?;
+    }
+    // The umask may have narrowed it further; never wider than 0700.
+    let tmp = tmpdir.join("s");
+    let res = (|| -> io::Result<UnixListener> {
+        let listener = UnixListener::bind(&tmp).map_err(|e| {
+            if e.kind() == io::ErrorKind::InvalidInput {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "{}: socket path too long for the private bind directory ({e}); use a \
+                         shorter path",
+                        path.display()
+                    ),
+                )
+            } else {
+                e
+            }
+        })?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+        std::fs::hard_link(&tmp, path)?;
+        Ok(listener)
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_dir(&tmpdir);
+    let listener = res?;
     let meta = std::fs::symlink_metadata(path)?;
     let sock = EventSocket {
         listener,
@@ -570,13 +628,51 @@ pub fn bind_event_socket(path: &Path) -> io::Result<EventSocket> {
         dev: meta.dev(),
         ino: meta.ino(),
     };
-    let res = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .and_then(|()| sock.listener.set_nonblocking(true));
-    if let Err(e) = res {
+    if meta.permissions().mode() & 0o777 != mode & 0o777 || !meta.file_type().is_socket() {
+        sock.remove_if_ours();
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{}: the socket did not get mode {mode:03o}", path.display()),
+        ));
+    }
+    if let Err(e) = sock.listener.set_nonblocking(true) {
         sock.remove_if_ours();
         return Err(e);
     }
     Ok(sock)
+}
+
+/// Remove bind directories (`.rbind-<8 hex>`, holding at most the socket
+/// `s`) that a killed process left in `dir`. Only exact matches owned by
+/// this process's user are touched.
+fn remove_stale_bind_dirs(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let euid = crate::config::effective_uid();
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(hex) = name.strip_prefix(BIND_DIR_PREFIX) else {
+            continue;
+        };
+        if hex.len() != 8 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let p = e.path();
+        match std::fs::symlink_metadata(&p) {
+            Ok(m) if m.is_dir() && m.uid() == euid => {
+                let s = p.join("s");
+                if std::fs::symlink_metadata(&s).is_ok_and(|m| m.file_type().is_socket()) {
+                    let _ = std::fs::remove_file(&s);
+                }
+                let _ = std::fs::remove_dir(&p);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Accept connections on `sock` (at most `max_connections` at once; more

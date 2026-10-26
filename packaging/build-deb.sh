@@ -201,6 +201,8 @@ if install_bin robodr-agentd usr/sbin 0; then
     install -D -m 0644 "$unit_src/robodr-agentd.service" "$pkg/$units/robodr-agentd.service"
     install -D -m 0644 "$unit_src/robodr-agentd.service.d/20-finding-key.conf.example" \
         "$pkg/usr/share/doc/robodr/examples/robodr-agentd.service.d/20-finding-key.conf.example"
+    install -D -m 0644 "$unit_src/robodr-agentd.service.d/30-control-plane.conf.example" \
+        "$pkg/usr/share/doc/robodr/examples/robodr-agentd.service.d/30-control-plane.conf.example"
     # Passive sensor box (tap / port mirror; docs/UNITREE.md): agentd drop-in,
     # capture-NIC networkd file and host firewall. Examples, never active.
     install -D -m 0644 "$here/systemd/robodr-agentd.service.d/40-sensor-box.conf.example" \

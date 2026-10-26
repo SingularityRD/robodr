@@ -43,8 +43,16 @@
   "finding_signing": { "key_file": "/run/credentials/robodr-agentd.service/finding.key" },
   "host_threats": { "socket_path": "/run/robodr-agentd/host-threats.sock", "socket_mode": "0660" },
   "control_plane": {
+    "listen_tcp": "0.0.0.0:8787",
+    "tls": {
+      "cert_chain": "/etc/robodr/control-plane/robot.pem",
+      "key_file": "/run/credentials/robodr-agentd.service/cp-tls.key",
+      "client_ca": "/etc/robodr/control-plane/soc-ca.pem"
+    },
     "unix_socket": "/run/robodr-agentd/control.sock",
-    "soc_keys": ["/etc/robodr/soc/soc.pub"]
+    "state_dir": "/var/lib/robodr/control-plane/agentd",
+    "soc_keys": ["/etc/robodr/soc/soc.pub"],
+    "evidence": {}
   },
   "daemon": { "tick_ms": 1000, "heartbeat_ms": 10000, "silence_ms": 30000 }
 }

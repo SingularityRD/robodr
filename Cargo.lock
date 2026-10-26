@@ -2351,6 +2351,8 @@ dependencies = [
  "robodr-responder",
  "robodr-ros2-pipeline",
  "robodr-rtps",
+ "rustls",
+ "rustls-webpki",
  "serde",
  "serde_json",
 ]

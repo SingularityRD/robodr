@@ -60,7 +60,7 @@
 
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
@@ -416,7 +416,8 @@ pub fn check_socket_dir(dir: &Path, euid: u32) -> io::Result<()> {
 
 /// Bind the host-threat socket: directory check ([`check_socket_dir`]), an
 /// existing path must be a socket owned by `euid` (then the usual stale /
-/// live handling of [`crate::input::bind_event_socket`]), then `spec.mode`.
+/// live handling of [`crate::input::bind_event_socket_mode`]), bound with
+/// `spec.mode` from the start.
 pub fn bind_host_socket(spec: &HostThreatsSpec, euid: u32) -> io::Result<EventSocket> {
     let dir = spec.path.parent().unwrap_or(Path::new("/"));
     check_socket_dir(dir, euid)?;
@@ -439,13 +440,8 @@ pub fn bind_host_socket(spec: &HostThreatsSpec, euid: u32) -> io::Result<EventSo
         }
         _ => {}
     }
-    let sock = crate::input::bind_event_socket(&spec.path)?;
-    if let Err(e) = std::fs::set_permissions(&spec.path, std::fs::Permissions::from_mode(spec.mode))
-    {
-        sock.remove_if_ours();
-        return Err(e);
-    }
-    Ok(sock)
+    // Bound with its final mode: no bind -> chmod window.
+    crate::input::bind_event_socket_mode(&spec.path, spec.mode)
 }
 
 #[repr(C)]
@@ -522,6 +518,7 @@ pub fn peer_allowed(uid: u32, allowed: &[u32]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
 
     const THREAT: &str = r#"{"kind":"threat","v":1,"rule":"RoboDR: Interactive shell started on robot controller","source":"rules-engine","severity":"medium","category":"execution","ts_ms":1790000000000,"pid":4242,"ppid":1,"uid":0,"gid":0,"image":"/usr/bin/bash","container":false}"#;

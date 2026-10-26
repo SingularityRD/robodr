@@ -129,7 +129,8 @@ struct RawRevert {
 }
 
 /// The validated parameters of an action.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Params {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_linear_speed: Option<f64>,
@@ -148,7 +149,8 @@ pub struct Params {
 }
 
 /// One validated action request.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActionRequest {
     pub request_id: String,
     pub action: ActionKind,
@@ -507,7 +509,8 @@ pub struct Refusal {
 }
 
 /// An accepted request: its ladder step and the plan actions it stands for.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Accepted {
     pub step: Step,
     pub actions: Vec<ResponseAction>,
@@ -898,6 +901,9 @@ pub enum Call {
     Revert(String, RevertRequest),
     /// Authenticated but refused before judgment (bad body): recorded.
     Invalid(ApiError),
+    /// Record an evidence export's note (`robodr.control_plane_evidence_export`);
+    /// answered `{"evidence": "<reference>"}` or 503 `evidence_unavailable`.
+    EvidenceNote(Box<Value>),
 }
 
 /// Who sent a call and how (recorded with it, so the black box can prove
@@ -992,6 +998,20 @@ pub struct EngineStats {
     /// Oldest requests dropped from the store when it was full.
     pub evicted: u64,
     pub stored: u64,
+    /// Requests restored from the journal at start.
+    pub restored: u64,
+    /// Dangling decisions settled at start from the black box: recorded
+    /// (committed) or not (aborted).
+    pub resolved_committed: u64,
+    pub resolved_aborted: u64,
+    /// Damaged journal entries skipped at start.
+    pub journal_damaged: u64,
+    /// Journal appends / compactions that failed.
+    pub journal_errors: u64,
+    /// Requests answered `failed` because the journal could not take them.
+    pub journal_refusals: u64,
+    /// Evidence exports recorded.
+    pub evidence_exports: u64,
 }
 
 /// The main-thread half: judges, records, stores and answers.
@@ -1001,6 +1021,8 @@ pub struct Engine {
     order: VecDeque<String>,
     max: usize,
     executor: Box<dyn ActionExecutor>,
+    /// The persistent request state (`None`: in memory only, unit tests).
+    journal: Option<super::state::RequestJournal>,
     pub stats: EngineStats,
 }
 
@@ -1025,7 +1047,61 @@ impl Engine {
             order: VecDeque::new(),
             max: max.max(1),
             executor,
+            journal: None,
             stats: EngineStats::default(),
+        }
+    }
+
+    /// An engine on a persistent journal, with the requests it restored
+    /// (oldest first; dangling decisions already resolved).
+    pub fn with_journal(
+        robot_id: &str,
+        max: usize,
+        executor: Box<dyn ActionExecutor>,
+        journal: super::state::RequestJournal,
+        restored: Vec<Stored>,
+    ) -> Self {
+        let mut e = Self::new(robot_id, max, executor);
+        for s in restored {
+            e.insert(s);
+        }
+        e.stats.evicted = 0;
+        e.stats.restored = e.store.len() as u64;
+        e.journal = Some(journal);
+        e.maybe_compact(true);
+        e
+    }
+
+    /// Compact the journal when it holds more than twice the store (or
+    /// `force`).
+    fn maybe_compact(&mut self, force: bool) {
+        let live = self.store.len();
+        let Some(j) = self.journal.as_mut() else {
+            return;
+        };
+        if force || j.lines() > 2 * live + 64 {
+            let order = &self.order;
+            let store = &self.store;
+            if j.compact(order.iter().filter_map(|id| store.get(id)))
+                .is_err()
+            {
+                self.stats.journal_errors += 1;
+            }
+        }
+    }
+
+    /// Append to the journal (if any); `false` on failure (counted).
+    fn journal(&mut self, e: &super::state::Entry) -> bool {
+        match self.journal.as_mut() {
+            None => true,
+            Some(j) => {
+                if j.append(e).is_ok() {
+                    true
+                } else {
+                    self.stats.journal_errors += 1;
+                    false
+                }
+            }
         }
     }
 
@@ -1050,6 +1126,24 @@ impl Engine {
                 None => Answer::error(&unknown_request()),
             },
             Call::Revert(id, rv) => self.revert(id, rv, meta, host),
+            Call::EvidenceNote(note) => match host.record("control-plane evidence export", note) {
+                Ok(uri) => {
+                    self.stats.evidence_exports += 1;
+                    Answer::ok(json!({"evidence": uri}))
+                }
+                Err(e) => {
+                    self.stats.record_failures += 1;
+                    Answer::error(&ApiError::new(
+                        503,
+                        "evidence_unavailable",
+                        format!(
+                            "the black box did not take the export note ({}); nothing was \
+                                 exported, retry later",
+                            robodr_ros2_pipeline::sanitize(&e)
+                        ),
+                    ))
+                }
+            },
             Call::Invalid(e) => {
                 self.stats.invalid += 1;
                 let note = json!({
@@ -1145,10 +1239,56 @@ impl Engine {
             }
         };
         let received_ms = host.wall_ms();
+        let mut stored = Stored {
+            request: req.clone(),
+            digest,
+            key_id: meta.key_id.clone(),
+            status,
+            refusal: refusal.clone(),
+            safety_state: state,
+            accepted: accepted.clone(),
+            error: error.clone(),
+            received_ms,
+            evidence: String::new(),
+            executor: self.executor.name(),
+            revert: None,
+        };
+        let failed = |code: &str, message: String| {
+            Answer::ok(json!({
+                "request_id": req.request_id,
+                "status": "failed",
+                "executed": false,
+                "state": {"error": {"code": code, "message": message}}
+            }))
+        };
+        // 1. The journal learns of the decision before anything records it.
+        let decision_id = match super::fsutil::random_hex16() {
+            Ok(d) => d,
+            Err(e) => {
+                self.stats.journal_refusals += 1;
+                return failed(
+                    "state_unavailable",
+                    format!("no randomness for a decision id ({e}); nothing was decided"),
+                );
+            }
+        };
+        if !self.journal(&super::state::Entry::Begin {
+            decision_id: decision_id.clone(),
+            stored: super::state::PStored::of(&stored),
+        }) {
+            self.stats.journal_refusals += 1;
+            return failed(
+                "state_unavailable",
+                "the request journal did not take the request; nothing was decided or stored, \
+                 retry later"
+                    .into(),
+            );
+        }
         let note = json!({
             "kind": "robodr.control_plane_request",
             "api": API_VERSION,
             "robot_id": self.robot_id,
+            "decision_id": decision_id,
             "request": req,
             "authority": "request",
             "auth": meta,
@@ -1164,49 +1304,40 @@ impl Engine {
             "status": status.as_str(),
             "error": error,
         });
+        // 2. The black box.
         let evidence = match host.record("control-plane request", &note) {
             Ok(uri) => uri,
             Err(e) => {
                 // Fail closed: nothing is claimed that is not in evidence.
                 self.stats.record_failures += 1;
-                return Answer::ok(json!({
-                    "request_id": req.request_id,
-                    "status": "failed",
-                    "executed": false,
-                    "state": {
-                        "error": {
-                            "code": "evidence_unavailable",
-                            "message": format!(
-                                "the black box did not take the request ({}); nothing was \
-                                 decided or stored, retry later",
-                                robodr_ros2_pipeline::sanitize(&e)
-                            ),
-                        }
-                    }
-                }));
+                // A failed abort is settled at the next start: the black
+                // box holds no note with this decision id.
+                let _ = self.journal(&super::state::Entry::Abort { decision_id });
+                return failed(
+                    "evidence_unavailable",
+                    format!(
+                        "the black box did not take the request ({}); nothing was decided or \
+                         stored, retry later",
+                        robodr_ros2_pipeline::sanitize(&e)
+                    ),
+                );
             }
         };
+        // 3. Commit. A failed commit is settled at the next start from the
+        // black box (the note exists), so the state is still answered.
+        let _ = self.journal(&super::state::Entry::Commit {
+            decision_id,
+            evidence: evidence.clone(),
+        });
         match status {
             Status::Refused => self.stats.refused += 1,
             Status::RecordedNotExecuted => self.stats.recorded_not_executed += 1,
             _ => {}
         }
-        let stored = Stored {
-            request: req.clone(),
-            digest,
-            key_id: meta.key_id.clone(),
-            status,
-            refusal,
-            safety_state: state,
-            accepted,
-            error,
-            received_ms,
-            evidence,
-            executor: self.executor.name(),
-            revert: None,
-        };
+        stored.evidence = evidence;
         let answer = self.answer(&stored, false, received_ms);
         self.insert(stored);
+        self.maybe_compact(false);
         Answer::ok(answer)
     }
 
@@ -1267,10 +1398,52 @@ impl Engine {
                 ),
             }
         };
+        // Only the first `not_applied` changes the stored state: journal it.
+        let changes = result == "not_applied" && s.revert.is_none();
+        let decision_id = if changes {
+            let d = match super::fsutil::random_hex16() {
+                Ok(d) => d,
+                Err(_) => {
+                    self.stats.journal_refusals += 1;
+                    return Answer::error(&ApiError::new(
+                        503,
+                        "state_unavailable",
+                        "no randomness for a decision id; nothing was recorded, retry later",
+                    ));
+                }
+            };
+            let begin = super::state::Entry::RevertBegin {
+                decision_id: d.clone(),
+                request_id: id.to_string(),
+                revert: super::state::PRevert::of(&RevertRecord {
+                    requested_by: rv.requested_by.clone(),
+                    reason: rv.reason.clone(),
+                    at_ms: now,
+                    result,
+                    evidence: String::new(),
+                }),
+            };
+            if !self.journal(&begin) {
+                self.stats.journal_refusals += 1;
+                return Answer::error(&ApiError::new(
+                    503,
+                    "state_unavailable",
+                    "the request journal did not take the revert; nothing was recorded, retry \
+                     later",
+                ));
+            }
+            Some(d)
+        } else {
+            None
+        };
+        let Some(s) = self.store.get(id) else {
+            return Answer::error(&unknown_request());
+        };
         let note = json!({
             "kind": "robodr.control_plane_revert",
             "api": API_VERSION,
             "robot_id": self.robot_id,
+            "decision_id": decision_id,
             "request_id": id,
             "action": s.request.action,
             "revert": rv,
@@ -1284,6 +1457,9 @@ impl Engine {
             Ok(uri) => uri,
             Err(e) => {
                 self.stats.record_failures += 1;
+                if let Some(d) = decision_id {
+                    let _ = self.journal(&super::state::Entry::RevertAbort { decision_id: d });
+                }
                 return Answer::ok(json!({
                     "request_id": id,
                     "status": "failed",
@@ -1293,11 +1469,17 @@ impl Engine {
                 }));
             }
         };
+        if let Some(d) = decision_id {
+            let _ = self.journal(&super::state::Entry::RevertCommit {
+                decision_id: d,
+                evidence: evidence.clone(),
+            });
+        }
         let robot_id = self.robot_id.clone();
         let Some(s) = self.store.get_mut(id) else {
             return Answer::error(&unknown_request());
         };
-        if result == "not_applied" && s.revert.is_none() {
+        if changes && s.revert.is_none() {
             s.revert = Some(RevertRecord {
                 requested_by: rv.requested_by.clone(),
                 reason: rv.reason.clone(),
@@ -2326,5 +2508,281 @@ mod tests {
         assert_eq!(a.body["status"], "applied");
         assert_eq!(a.body["executed"], true);
         assert!(a.body["state"].get("note").is_none());
+    }
+
+    // --- Persistence: the request journal (state.rs) ---------------------
+
+    use crate::control::fsutil::fault;
+    use crate::control::state;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("robodr-cp-st-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The black-box references of `h`'s notes that carry `ids` (what the
+    /// daemon's reconciliation finds in the real black box).
+    fn found_in(h: &FakeHost, ids: &[String]) -> std::collections::BTreeMap<String, String> {
+        let mut out = std::collections::BTreeMap::new();
+        for (i, n) in h.notes.iter().enumerate() {
+            if let Some(d) = n["decision_id"].as_str() {
+                if ids.iter().any(|x| x == d) {
+                    out.insert(
+                        d.to_string(),
+                        format!("robodr-blackbox://ugv-007/0/{}?sha256=00", i + 1),
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    /// Restart: open the journal, settle dangling decisions against `h`.
+    fn restart(dir: &std::path::Path, h: &FakeHost, max: usize) -> (Engine, (usize, usize)) {
+        let (mut j, mut r) = state::open(dir, max).unwrap();
+        let ids: Vec<String> = r
+            .pending
+            .keys()
+            .chain(r.pending_reverts.keys())
+            .cloned()
+            .collect();
+        let settled = state::resolve(&mut j, &mut r, &found_in(h, &ids), max).unwrap();
+        (
+            Engine::with_journal("ugv-007", max, Box::new(RecordingExecutor), j, r.stored),
+            settled,
+        )
+    }
+
+    fn sub(id: &str, action: &str, params: Value, ttl: Option<u64>) -> Call {
+        let mut b: Value = serde_json::from_slice(&body(action, params, ttl)).unwrap();
+        b["request_id"] = json!(id);
+        Call::Submit(parse_submit(&serde_json::to_vec(&b).unwrap()).unwrap())
+    }
+
+    fn get(e: &mut Engine, h: &mut FakeHost, id: &str) -> Answer {
+        e.handle(&Call::Get(id.into()), &meta(), h)
+    }
+
+    #[test]
+    fn request_state_survives_a_restart() {
+        let d = tmp("restart");
+        let mut h = FakeHost::new(SafetyState::MovingSlow);
+        let (mut e, _) = restart(&d, &h, 16);
+        let a1 = e.handle(
+            &sub(
+                "r-1",
+                "restrict_motion",
+                json!({"max_linear_speed": 0.5}),
+                Some(600),
+            ),
+            &meta(),
+            &mut h,
+        );
+        assert_eq!(a1.body["status"], "recorded_not_executed", "{}", a1.body);
+        h.state = SafetyState::EStopActive;
+        let a2 = e.handle(&sub("r-2", "safe_pause", json!({}), None), &meta(), &mut h);
+        assert_eq!(a2.body["status"], "refused");
+        let rv = Call::Revert(
+            "r-1".into(),
+            parse_revert(br#"{"requested_by": "analyst@soc", "reason": "fp"}"#).unwrap(),
+        );
+        let a3 = e.handle(&rv, &meta(), &mut h);
+        assert_eq!(a3.body["status"], "not_applied");
+        let before: Vec<Value> = ["r-1", "r-2"]
+            .iter()
+            .map(|id| get(&mut e, &mut h, id).body)
+            .collect();
+        let notes = h.notes.len();
+        drop(e);
+        // A restart: the same answers, a resubmission is a duplicate (not
+        // judged or recorded again), another body under the id a conflict.
+        let (mut e, settled) = restart(&d, &h, 16);
+        assert_eq!(settled, (0, 0));
+        assert_eq!(e.stats.restored, 2);
+        for (id, b) in ["r-1", "r-2"].iter().zip(&before) {
+            assert_eq!(&get(&mut e, &mut h, id).body, b, "{id}");
+        }
+        assert!(before[0]["state"]["revert"]["evidence"].is_string());
+        let dup = e.handle(
+            &sub(
+                "r-1",
+                "restrict_motion",
+                json!({"max_linear_speed": 0.5}),
+                Some(600),
+            ),
+            &meta(),
+            &mut h,
+        );
+        assert_eq!(dup.body["duplicate"], true);
+        assert_eq!(h.notes.len(), notes);
+        let c = e.handle(
+            &sub(
+                "r-1",
+                "restrict_motion",
+                json!({"max_linear_speed": 0.4}),
+                Some(600),
+            ),
+            &meta(),
+            &mut h,
+        );
+        assert_eq!(
+            (c.status, c.body["error"]["code"].as_str()),
+            (409, Some("request_id_conflict"))
+        );
+        // The second revert after the restart: the first one is kept.
+        let again = e.handle(&rv, &meta(), &mut h);
+        assert_eq!(again.body["state"]["revert"], before[0]["state"]["revert"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Crash between the black-box note and the journal commit: the
+    /// decision is in the black box, so the restart commits it with that
+    /// note's reference; the answer the SOC got stays true.
+    #[test]
+    fn crash_after_the_note_before_the_commit_is_committed_from_the_black_box() {
+        let d = tmp("commit");
+        let mut h = FakeHost::new(SafetyState::MovingSlow);
+        let (mut e, _) = restart(&d, &h, 16);
+        // Appends: 1 = begin, 2 = commit (torn: the process dies there).
+        fault::arm("journal.append.torn", 2);
+        let a = e.handle(&sub("c-1", "safe_pause", json!({}), None), &meta(), &mut h);
+        assert!(fault::fired());
+        assert_eq!(a.body["status"], "recorded_not_executed");
+        drop(e);
+        let (mut e, settled) = restart(&d, &h, 16);
+        assert_eq!(settled, (1, 0));
+        let g = get(&mut e, &mut h, "c-1");
+        assert_eq!(g.body["status"], "recorded_not_executed");
+        assert_eq!(g.body["state"]["evidence"], a.body["state"]["evidence"]);
+        // Settled durably: the next restart has nothing dangling.
+        drop(e);
+        let (_, settled) = restart(&d, &h, 16);
+        assert_eq!(settled, (0, 0));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Crash between the journal begin and the black-box note: nothing was
+    /// recorded, so the restart aborts it; a resubmission is judged anew.
+    #[test]
+    fn crash_after_the_begin_before_the_note_is_aborted() {
+        let d = tmp("abort");
+        let mut h = FakeHost::new(SafetyState::MovingSlow);
+        let (mut e, _) = restart(&d, &h, 16);
+        // The black box refuses (no note) and the abort append is torn (the
+        // process dies): only the begin is durable.
+        h.fail = true;
+        fault::arm("journal.append.torn", 2);
+        let a = e.handle(&sub("a-1", "safe_pause", json!({}), None), &meta(), &mut h);
+        assert_eq!(a.body["status"], "failed");
+        assert_eq!(a.body["state"]["error"]["code"], "evidence_unavailable");
+        drop(e);
+        h.fail = false;
+        let (mut e, settled) = restart(&d, &h, 16);
+        assert_eq!(settled, (0, 1));
+        assert_eq!(get(&mut e, &mut h, "a-1").status, 404);
+        let a = e.handle(&sub("a-1", "safe_pause", json!({}), None), &meta(), &mut h);
+        assert_eq!(a.body["status"], "recorded_not_executed");
+        assert!(a.body.get("duplicate").is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A journal that cannot take the begin refuses the request before
+    /// anything is decided or recorded (fail closed).
+    #[test]
+    fn a_failing_journal_refuses_before_recording() {
+        let d = tmp("refuse");
+        let mut h = FakeHost::new(SafetyState::MovingSlow);
+        let (mut e, _) = restart(&d, &h, 16);
+        fault::arm("journal.append.torn", 1);
+        let a = e.handle(&sub("f-1", "safe_pause", json!({}), None), &meta(), &mut h);
+        assert_eq!(a.body["status"], "failed");
+        assert_eq!(a.body["state"]["error"]["code"], "state_unavailable");
+        assert!(h.notes.is_empty(), "nothing recorded");
+        assert_eq!(e.stats.journal_refusals, 1);
+        assert_eq!(get(&mut e, &mut h, "f-1").status, 404);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Crash between a revert's note and its commit: settled from the
+    /// black box like a request.
+    #[test]
+    fn crash_during_a_revert_is_settled_from_the_black_box() {
+        let d = tmp("revert");
+        let mut h = FakeHost::new(SafetyState::MovingSlow);
+        let (mut e, _) = restart(&d, &h, 16);
+        e.handle(&sub("v-1", "safe_pause", json!({}), None), &meta(), &mut h);
+        // Appends from here: 1 = revert_begin, 2 = revert_commit (torn).
+        fault::arm("journal.append.torn", 2);
+        let rv = Call::Revert(
+            "v-1".into(),
+            parse_revert(br#"{"requested_by": "analyst@soc"}"#).unwrap(),
+        );
+        let a = e.handle(&rv, &meta(), &mut h);
+        assert!(fault::fired());
+        assert_eq!(a.body["status"], "not_applied");
+        drop(e);
+        let (mut e, settled) = restart(&d, &h, 16);
+        assert_eq!(settled, (1, 0));
+        let g = get(&mut e, &mut h, "v-1");
+        assert_eq!(
+            g.body["state"]["revert"]["evidence"],
+            a.body["revert_evidence"]
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The journal is compacted to the live store and keeps the newest
+    /// `max_requests` across restarts.
+    #[test]
+    fn journal_is_bounded_by_compaction() {
+        let d = tmp("bounded");
+        let mut h = FakeHost::new(SafetyState::MovingSlow);
+        let (mut e, _) = restart(&d, &h, 16);
+        for i in 0..200 {
+            e.handle(
+                &sub(&format!("b-{i}"), "safe_pause", json!({}), None),
+                &meta(),
+                &mut h,
+            );
+        }
+        assert!(e.stats.journal_errors == 0);
+        drop(e);
+        let lines = std::fs::read_to_string(d.join(state::REQUEST_JOURNAL))
+            .unwrap()
+            .lines()
+            .count();
+        assert!(lines <= 2 * 16 + 64 + 3, "{lines}");
+        let (mut e, _) = restart(&d, &h, 16);
+        assert_eq!(e.stats.restored, 16);
+        assert_eq!(get(&mut e, &mut h, "b-199").status, 200);
+        assert_eq!(get(&mut e, &mut h, "b-184").status, 200);
+        assert_eq!(get(&mut e, &mut h, "b-183").status, 404);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn persisted_entries_that_do_not_convert_back_are_damage() {
+        let d = tmp("convert");
+        let mut h = FakeHost::new(SafetyState::MovingSlow);
+        let (mut e, _) = restart(&d, &h, 16);
+        e.handle(&sub("k-1", "safe_pause", json!({}), None), &meta(), &mut h);
+        drop(e);
+        // A snapshot with a refusal code this code never writes.
+        let (mut j, r) = state::open(&d, 16).unwrap();
+        let mut p = state::PStored::of(&r.stored[0]);
+        p.request.request_id = "k-2".into();
+        p.refusal = Some(state::PRefusal {
+            code: "override_granted".into(),
+            reason: String::new(),
+            safety_state: SafetyState::MovingSlow,
+        });
+        j.append(&state::Entry::Stored { stored: p }).unwrap();
+        drop(j);
+        let (_, r) = state::open(&d, 16).unwrap();
+        assert_eq!(r.stored.len(), 1);
+        assert_eq!(r.damaged, 1);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

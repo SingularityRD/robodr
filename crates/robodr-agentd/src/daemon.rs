@@ -705,30 +705,68 @@ impl<'a> Daemon<'a> {
             .map_err(|e| DaemonError::Io(format!("spool {}: {e}", cfg.spool.dir.display())))?;
 
         // The control plane (before the input threads: a bind failure then
-        // leaves nothing running). Answers are signed with the finding key.
+        // leaves nothing running). Answers and evidence manifests are signed
+        // with the finding key (required with control_plane, config.rs).
         let control = match &r.control_plane {
             None => None,
             Some(spec) => {
-                let signer = match &r.finding_key {
-                    Some((key, key_id)) => Some(
-                        crate::config::signer_for(
-                            robodr_blackbox::sign_ed25519::ED25519,
-                            key,
-                            Some(key_id),
-                        )
-                        .map_err(|e| DaemonError::Config(format!("finding key: {e}")))?,
-                    ),
-                    None => None,
+                let Some((key, key_id)) = &r.finding_key else {
+                    return Err(DaemonError::Config(
+                        "control_plane needs finding_signing: every answer is signed with the \
+                         finding key"
+                            .into(),
+                    ));
                 };
-                let cp =
-                    ControlPlane::start(spec, &cfg.robot.id, signer).map_err(DaemonError::Io)?;
-                let _ = writeln!(
+                let signer = crate::config::signer_for(
+                    robodr_blackbox::sign_ed25519::ED25519,
+                    key,
+                    Some(key_id),
+                )
+                .map_err(|e| DaemonError::Config(format!("finding key: {e}")))?;
+                let bb_dir = agent.blackbox_dir().to_path_buf();
+                let robot = cfg.robot.id.clone();
+                let reconcile = |ids: &[String]| {
+                    crate::control::evidence::find_decision_notes(
+                        &crate::control::evidence::DirSource(bb_dir.clone()),
+                        &robot,
+                        ids,
+                    )
+                };
+                let cp = ControlPlane::start(spec, &cfg.robot.id, signer, &bb_dir, &reconcile)
+                    .map_err(DaemonError::Io)?;
+                let st = cp.state_status().clone();
+                let _ =
+                    writeln!(
                     log,
-                    "robodr-agentd: control plane on {} ({} SOC key(s)); requests are judged and \
-                     recorded, never executed",
+                    "robodr-agentd: control plane ({}) on {} ({} SOC key(s){}{}); requests are \
+                     judged and recorded, never executed; state: {} request(s) restored, \
+                     {} dangling decision(s) settled from the black box",
+                    crate::control::auth::API_VERSION,
                     cp.status().listening.join(", "),
-                    spec.keys.len()
+                    spec.keys.len(),
+                    if spec.tls.is_some() { ", mutual TLS" } else { "" },
+                    if spec.evidence.is_some() { ", evidence API" } else { "" },
+                    st.restored,
+                    st.resolved_committed + st.resolved_aborted,
                 );
+                if st.journal_damaged > 0 || st.replay.damaged > 0 {
+                    let _ = writeln!(
+                        log,
+                        "robodr-agentd: control plane: the state journals were damaged \
+                         ({} request entr(ies), {} nonce entr(ies) skipped; copy in {}); \
+                         requests signed before this start are refused",
+                        st.journal_damaged,
+                        st.replay.damaged,
+                        st.journal_quarantined.as_deref().unwrap_or("quarantine/")
+                    );
+                }
+                if let Some(f) = st.replay.fence {
+                    let _ = writeln!(
+                        log,
+                        "robodr-agentd: control plane: replay store fenced at {f}: requests \
+                         signed at or before it are refused"
+                    );
+                }
                 Some(cp)
             }
         };
@@ -958,6 +996,30 @@ impl<'a> Daemon<'a> {
         if let Err(e) = d.agent.record_note(now, "start note", &note, true) {
             d.stats.note_errors += 1;
             let _ = writeln!(d.log, "robodr-agentd: start note not recorded: {e:?}");
+        }
+        // The control plane's state at start (restored requests, settled
+        // decisions, journal damage, replay fence) is evidence too.
+        if let Some(cp) = d.control.as_ref() {
+            let st = cp.status();
+            let note = serde_json::json!({
+                "kind": "robodr.control_plane_start",
+                "api": st.api,
+                "listening": st.listening,
+                "tls": st.tls,
+                "evidence_api": st.evidence.is_some(),
+                "state": st.state,
+            });
+            let now = d.clock.now();
+            if let Err(e) = d
+                .agent
+                .record_note(now, "control-plane start note", &note, true)
+            {
+                d.stats.note_errors += 1;
+                let _ = writeln!(
+                    d.log,
+                    "robodr-agentd: control-plane start note not recorded: {e:?}"
+                );
+            }
         }
         d.profile_witness(accepted_ok);
         d.evidence_incidents();

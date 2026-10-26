@@ -26,9 +26,11 @@ pub const MAX_TARGET_BYTES: usize = 1024;
 /// Longest header name.
 pub const MAX_HEADER_NAME_BYTES: usize = 64;
 
-/// A stream with a settable read timeout (TCP, unix, test doubles).
+/// A stream with a settable read timeout (TCP, unix, TLS, test doubles).
 pub trait Stream: Read + Write {
     fn set_read_deadline(&self, d: Duration) -> io::Result<()>;
+    /// End the exchange after the answer (TLS: `close_notify`).
+    fn finish(&mut self) {}
 }
 
 impl Stream for TcpStream {
@@ -195,11 +197,11 @@ pub fn read_request<S: Stream>(s: &mut S, deadline: Instant) -> Result<Request, 
             format!("the body is longer than {MAX_BODY_BYTES} bytes"),
         ));
     }
-    if method == "GET" && len > 0 {
+    if (method == "GET" || method == "DELETE") && len > 0 {
         return Err(err(
             400,
             "body_not_allowed",
-            "a GET request carries no body",
+            "a GET or DELETE request carries no body",
         ));
     }
     // Bytes beyond the body (a pipelined request) are dropped: one request
@@ -296,21 +298,30 @@ fn parse_head(head: &[u8]) -> Result<Head, HttpError> {
 pub fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        201 => "Created",
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
         408 => "Request Timeout",
         409 => "Conflict",
+        410 => "Gone",
         413 => "Content Too Large",
+        416 => "Range Not Satisfiable",
         429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         505 => "HTTP Version Not Supported",
+        507 => "Insufficient Storage",
         _ => "Unknown",
     }
 }
+
+/// The JSON content type of every answer but evidence chunks.
+pub const JSON: &str = "application/json";
+/// The content type of an evidence chunk.
+pub const OCTETS: &str = "application/octet-stream";
 
 /// Write one JSON answer and close the exchange (`Connection: close`).
 /// `extra` header values must be printable ASCII (checked; a bad one is
@@ -321,8 +332,20 @@ pub fn write_response<W: Write>(
     body: &[u8],
     extra: &[(&str, String)],
 ) -> io::Result<()> {
+    write_typed(w, status, JSON, body, extra)
+}
+
+/// [`write_response`] with another content type ([`JSON`] or [`OCTETS`]).
+pub fn write_typed<W: Write>(
+    w: &mut W,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    extra: &[(&str, String)],
+) -> io::Result<()> {
+    let content_type = if content_type == OCTETS { OCTETS } else { JSON };
     let mut head = format!(
-        "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+        "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
          Cache-Control: no-store\r\nConnection: close\r\n",
         reason(status),
         body.len()
