@@ -160,6 +160,19 @@ invariant violation:**
 | `pkg_parity` | 355 437 | 2 353 | 600 | 203 |
 | `pkg_trust` | 176 570 | 1 169 | 4 371 | 1 198 |
 
+### libFuzzer runs (Sprint 13b, 2026-10-26)
+
+The two `deliverd_*` targets: `nightly-2026-09-01`, `cargo-fuzz` 0.13.1,
+`-O` (release) with AddressSanitizer, **without** debug assertions (disk
+space on the sandbox), `-max_total_time=150 -rss_limit_mb=2560`, one at
+a time, seeded from `fuzz/corpus/<target>/` (copied). **No crash, leak,
+timeout or invariant violation:**
+
+| target | runs | corpus at end |
+|---|---:|---:|
+| `deliverd_state` | 3 126 173 | 3 146 |
+| `deliverd_inputs` | 2 316 321 | 5 333 |
+
 ### Smoke runs
 
 * all targets are compiled and run in `cargo test` by their crate's
