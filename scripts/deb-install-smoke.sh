@@ -137,9 +137,9 @@ smoke_one() {
                 # library), > 128 killed by a signal; or no output at all.
                 bad "$pkg: $b $flag does not start: exit $rc: $(printf '%s' "$o" | head -n3)"
             elif [[ $rc -ne 0 ]]; then
-                finding "$pkg: $b $flag exits $rc (runs, but the flag is not supported): $(printf '%s' "$o" | head -n1 | cut -c1-100)"
+                finding "$pkg/$arch: $b $flag exits $rc (runs, but the flag is not supported): $(printf '%s' "$o" | head -n1 | cut -c1-100)"
             elif [[ "$flag" == --version && "$o" != *"$upstream"* ]]; then
-                finding "$pkg: $b --version does not name $upstream: $(printf '%s' "$o" | head -n1)"
+                finding "$pkg/$arch: $b --version does not name $upstream: $(printf '%s' "$o" | head -n1)"
             elif [[ "$flag" == --version ]]; then
                 echo "   $b: $(printf '%s' "$o" | head -n1 | cut -c1-100)"
             fi
