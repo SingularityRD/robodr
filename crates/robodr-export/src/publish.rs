@@ -284,7 +284,7 @@ impl Progress {
 }
 
 /// 128-bit key of a dead-letter entry: `(source, position)`.
-fn dead_key(source: &str, pos: u64) -> u128 {
+pub(crate) fn dead_key(source: &str, pos: u64) -> u128 {
     let h = |salt: u8| {
         let mut st = DefaultHasher::new();
         salt.hash(&mut st);
@@ -343,6 +343,312 @@ struct Item {
     raw: Result<Vec<u8>, String>,
 }
 
+/// Batch directories of the importer's `out/` (complete by construction;
+/// dot-entries are its staging directories), in name order.
+pub(crate) fn list_diode_batches(out: &Path) -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for e in fs::read_dir(out)? {
+        let e = e?;
+        let Some(name) = e.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !valid_batch_name(&name) || !e.file_type()?.is_dir() {
+            continue;
+        }
+        names.push(name);
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// `(seq, file name)` of the spool's `ready/` records, in seq order.
+pub(crate) fn list_ready(ready: &Path) -> io::Result<Vec<(u64, String)>> {
+    let mut files = Vec::new();
+    for e in fs::read_dir(ready)? {
+        let e = e?;
+        let Some(name) = e.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if let Some(seq) = spool_seq(&name) {
+            if e.file_type()?.is_file() {
+                files.push((seq, name));
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// One spool file as an input record (`{topic, partition, key, headers,
+/// value}` JSON). Outer `Err`: I/O error (stop); inner `Err`: the record is
+/// unusable (reason; dead-letter it).
+pub(crate) fn read_spool_item(
+    path: &Path,
+    seq: u64,
+    max: usize,
+) -> io::Result<Result<Vec<u8>, String>> {
+    Ok(match fsutil::read_capped(path, max as u64) {
+        Ok(b) => serde_json::from_slice::<SpoolRecord>(&b)
+            .map_err(|e| format!("not a spool record: {e}"))
+            .and_then(|r| {
+                if r.seq == seq {
+                    serde_json::to_vec(&serde_json::json!({
+                        "topic": r.topic, "partition": r.partition, "key": r.key,
+                        "headers": r.headers, "value": r.value,
+                    }))
+                    .map_err(|e| e.to_string())
+                } else {
+                    Err(format!("seq {} does not match file name", r.seq))
+                }
+            }),
+        Err(ReadError::Io(e)) => return Err(e),
+        Err(e) => Err(format!("unreadable: {e}")),
+    })
+}
+
+/// One input line: `(1-based line number, raw bytes or the reason the line
+/// is unusable)`.
+pub(crate) type NumberedLine = (u64, Result<Vec<u8>, String>);
+
+/// Why [`LineReader::open`] failed.
+pub(crate) enum OpenRecordsError {
+    /// `records.jsonl` exists but is not a regular file.
+    NotRegular(String),
+    Io(io::Error),
+}
+
+/// Reads a diode batch's `records.jsonl` line by line (1-based line
+/// numbers), each line capped: an overlong line, or a last line without a
+/// newline (the importer always ends lines: truncation), is returned as
+/// `Err(reason)`.
+pub(crate) struct LineReader {
+    reader: BufReader<fs::File>,
+    cap: u64,
+    line_no: u64,
+}
+
+impl LineReader {
+    /// `Ok(None)`: the batch has no records file (bundles only).
+    pub(crate) fn open(
+        out: &Path,
+        batch: &str,
+        max_record_bytes: usize,
+    ) -> Result<Option<Self>, OpenRecordsError> {
+        let path = out.join(batch).join(RECORDS_FILE);
+        let file = match fs::symlink_metadata(&path) {
+            Ok(m) if m.is_file() => fs::File::open(&path).map_err(OpenRecordsError::Io)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Ok(_) => {
+                return Err(OpenRecordsError::NotRegular(format!(
+                    "{} is not a regular file",
+                    path.display()
+                )))
+            }
+            Err(e) => return Err(OpenRecordsError::Io(e)),
+        };
+        Ok(Some(Self {
+            reader: BufReader::new(file),
+            cap: max_record_bytes as u64,
+            line_no: 0,
+        }))
+    }
+
+    /// The next line, or `None` at the end of the file.
+    pub(crate) fn next_line(&mut self) -> io::Result<Option<NumberedLine>> {
+        let cap = self.cap;
+        let mut buf = Vec::new();
+        let n = (&mut self.reader)
+            .take(cap + 1)
+            .read_until(b'\n', &mut buf)?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let raw = if buf.last() == Some(&b'\n') {
+            buf.pop();
+            Ok(buf)
+        } else if buf.len() as u64 > cap {
+            // Overlong line: skip to its end.
+            let mut sink = Vec::new();
+            loop {
+                sink.clear();
+                let m = (&mut self.reader).take(cap).read_until(b'\n', &mut sink)?;
+                if m == 0 || sink.last() == Some(&b'\n') {
+                    break;
+                }
+            }
+            Err(format!("line longer than {cap} bytes"))
+        } else {
+            Err("truncated last line (no newline)".into())
+        };
+        self.line_no += 1;
+        Ok(Some((self.line_no, raw)))
+    }
+}
+
+/// An input record that passed [`check_record`]: what a forwarder sends.
+#[derive(Debug, Clone)]
+pub(crate) struct CheckedRecord {
+    /// The value to send: the input bytes verbatim, or (legacy 1.x,
+    /// unsigned) the upgraded 2.0 value.
+    pub value: String,
+    /// Kafka key (= finding id).
+    pub key: String,
+    /// Headers to send: derived from the value, plus the input's
+    /// [`robodr_ocsf::SIG_HEADER`] (shape-checked, verbatim) as the last one.
+    pub headers: Vec<(String, String)>,
+    /// The per-finding signature (contract §2a), if the input carried one.
+    pub sig: Option<robodr_ocsf::FindingSignature>,
+    /// `entity_context.robot.id` (partition key).
+    pub robot_id: String,
+    /// The partition the input named, if any.
+    pub input_partition: Option<u32>,
+    /// An unsigned contract 1.x record upgraded to contract 2.0.
+    pub legacy_upgraded: bool,
+    /// The value names another topic than `topic`.
+    pub topic_overridden: bool,
+}
+
+/// Validate one input record (`{topic, partition, key, headers, value}`,
+/// as agentd spools it and the diode importer writes it); `Err` = reason.
+/// See the module docs: the value is re-validated, key, topic and headers
+/// must be what [`robodr_ocsf::record`] derives from it, an optional finding
+/// signature header must be well formed and last, and a contract 1.x record
+/// is upgraded (unsigned) or refused (signed). `topic` is the forwarder's
+/// own topic (upgraded values name it); `upgrade_data_source` the
+/// `data_source` an upgraded value gets.
+pub(crate) fn check_record(
+    raw: &[u8],
+    topic: &str,
+    upgrade_data_source: &str,
+) -> Result<CheckedRecord, String> {
+    let rec: InRecord = serde_json::from_slice(raw).map_err(|e| format!("not a record: {e}"))?;
+    let env = robodr_ocsf::parse_and_validate(&rec.value).map_err(|errs| {
+        let v: Vec<String> = errs.iter().take(3).map(|e| e.to_string()).collect();
+        format!("invalid finding: {}", v.join("; "))
+    })?;
+    if robodr_ocsf::upgrade::is_legacy_version(&env.contract_version) {
+        return check_legacy(rec, env, topic, upgrade_data_source);
+    }
+    if !robodr_ocsf::validate::is_emittable_contract_version(&env.contract_version) {
+        return Err(format!(
+            "contract {} findings are parse-only and not published",
+            env.contract_version
+        ));
+    }
+    let want =
+        robodr_ocsf::record(&env, None).map_err(|_| "finding cannot be emitted".to_string())?;
+    if rec.key != want.key {
+        return Err("key is not the finding id".into());
+    }
+    if rec.topic != want.topic {
+        return Err(format!(
+            "topic {:?} is not the one the value names ({:?})",
+            rec.topic, want.topic
+        ));
+    }
+    // An optional detached finding signature (contract §2a) is carried
+    // verbatim as the last header; every other header is re-derived from
+    // the value and must match. The signature is checked for shape here
+    // and verified by the consumer (it needs the unit's finding key).
+    let sig = robodr_ocsf::signature_header(&rec.headers)
+        .map_err(|e| format!("finding signature header: {e}"))?;
+    let (base, sig) = match sig {
+        Some(v) => {
+            let parsed = robodr_ocsf::FindingSignature::from_header_value(v)
+                .map_err(|e| format!("finding signature header: {e}"))?;
+            let last_is_sig = rec
+                .headers
+                .last()
+                .is_some_and(|(k, _)| k == robodr_ocsf::SIG_HEADER);
+            if !last_is_sig {
+                return Err(format!(
+                    "{} must be the last header",
+                    robodr_ocsf::SIG_HEADER
+                ));
+            }
+            (&rec.headers[..rec.headers.len() - 1], Some(parsed))
+        }
+        None => (&rec.headers[..], None),
+    };
+    let same_headers = base.len() == want.headers.len()
+        && base
+            .iter()
+            .zip(&want.headers)
+            .all(|((k, v), (wk, wv))| k == wk && v == wv);
+    if !same_headers {
+        return Err("headers disagree with the value".into());
+    }
+    Ok(CheckedRecord {
+        topic_overridden: want.topic != topic,
+        value: rec.value,
+        key: rec.key,
+        headers: rec.headers,
+        sig,
+        robot_id: env.entity_context.robot.id,
+        input_partition: rec.partition,
+        legacy_upgraded: false,
+    })
+}
+
+/// A contract 1.x record: checked against its own value like any record,
+/// then (unsigned only) upgraded to contract 2.0 and re-derived.
+fn check_legacy(
+    rec: InRecord,
+    env: robodr_ocsf::FindingEnvelope,
+    topic: &str,
+    upgrade_data_source: &str,
+) -> Result<CheckedRecord, String> {
+    if !matches!(robodr_ocsf::signature_header(&rec.headers), Ok(None)) {
+        return Err(format!(
+            "{} (contract {}; the finding signature covers the 1.x value, so it cannot be \
+             upgraded here: re-sign it on the robot, or drain before upgrading)",
+            robodr_ocsf::LEGACY_SIGNED_REASON,
+            env.contract_version
+        ));
+    }
+    if rec.key != env.finding_id {
+        return Err("key is not the finding id".into());
+    }
+    if rec.topic != env.ocsf.metadata.log_name {
+        return Err(format!(
+            "topic {:?} is not the one the value names ({:?})",
+            rec.topic, env.ocsf.metadata.log_name
+        ));
+    }
+    let own = robodr_ocsf::headers(&env);
+    let same_headers = rec.headers.len() == own.len()
+        && rec
+            .headers
+            .iter()
+            .zip(&own)
+            .all(|((k, v), (wk, wv))| k == wk && v == wv);
+    if !same_headers {
+        return Err("headers disagree with the value".into());
+    }
+    let up = robodr_ocsf::upgrade_legacy(&env, upgrade_data_source, topic).map_err(|e| {
+        format!(
+            "legacy contract {} record not upgraded: {e}",
+            env.contract_version
+        )
+    })?;
+    let want = robodr_ocsf::record(&up, None)
+        .map_err(|_| "upgraded finding cannot be emitted".to_string())?;
+    Ok(CheckedRecord {
+        value: want.value,
+        key: want.key,
+        headers: want
+            .headers
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+        sig: None,
+        robot_id: up.entity_context.robot.id,
+        input_partition: rec.partition,
+        legacy_upgraded: true,
+        topic_overridden: false,
+    })
+}
+
 /// See the module docs.
 pub struct Publisher<S: Sink> {
     cfg: PublishConfig,
@@ -354,7 +660,7 @@ pub struct Publisher<S: Sink> {
     dead_seen: Option<HashSet<u128>>,
 }
 
-fn valid_batch_name(n: &str) -> bool {
+pub(crate) fn valid_batch_name(n: &str) -> bool {
     !n.is_empty()
         && n.len() <= 128
         && !n.starts_with('.')
@@ -362,7 +668,7 @@ fn valid_batch_name(n: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
-fn spool_seq(name: &str) -> Option<u64> {
+pub(crate) fn spool_seq(name: &str) -> Option<u64> {
     let stem = name.strip_suffix(".json")?;
     if stem.len() != 20 || !stem.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -503,149 +809,27 @@ impl<S: Sink> Publisher<S> {
         partitions: u32,
         report: &mut PublishReport,
     ) -> Result<(i32, ProduceRecord), String> {
-        let rec: InRecord =
-            serde_json::from_slice(raw).map_err(|e| format!("not a record: {e}"))?;
-        let env = robodr_ocsf::parse_and_validate(&rec.value).map_err(|errs| {
-            let v: Vec<String> = errs.iter().take(3).map(|e| e.to_string()).collect();
-            format!("invalid finding: {}", v.join("; "))
-        })?;
-        if robodr_ocsf::upgrade::is_legacy_version(&env.contract_version) {
-            return self.prepare_legacy(rec, env, partitions, report);
+        let c = check_record(raw, &self.cfg.topic, &self.cfg.upgrade_data_source)?;
+        let p = robodr_ocsf::partition_for(&c.robot_id, partitions)
+            .ok_or_else(|| "no partition (zero partitions?)".to_string())?;
+        if c.input_partition.is_some_and(|x| x != p) {
+            report.partition_overridden += 1;
         }
-        if !robodr_ocsf::validate::is_emittable_contract_version(&env.contract_version) {
-            return Err(format!(
-                "contract {} findings are parse-only and not published",
-                env.contract_version
-            ));
-        }
-        let want = robodr_ocsf::record(&env, Some(partitions))
-            .map_err(|_| "finding cannot be emitted".to_string())?;
-        if rec.key != want.key {
-            return Err("key is not the finding id".into());
-        }
-        if rec.topic != want.topic {
-            return Err(format!(
-                "topic {:?} is not the one the value names ({:?})",
-                rec.topic, want.topic
-            ));
-        }
-        if want.topic != self.cfg.topic {
+        if c.topic_overridden {
             report.topic_overridden += 1;
         }
-        // An optional detached finding signature (contract §2a) is carried
-        // verbatim as the last header; every other header is re-derived from
-        // the value and must match. The signature is checked for shape here
-        // and verified by the consumer (it needs the unit's finding key).
-        let sig = robodr_ocsf::signature_header(&rec.headers)
-            .map_err(|e| format!("finding signature header: {e}"))?;
-        let base = match sig {
-            Some(v) => {
-                robodr_ocsf::FindingSignature::from_header_value(v)
-                    .map_err(|e| format!("finding signature header: {e}"))?;
-                let last_is_sig = rec
-                    .headers
-                    .last()
-                    .is_some_and(|(k, _)| k == robodr_ocsf::SIG_HEADER);
-                if !last_is_sig {
-                    return Err(format!(
-                        "{} must be the last header",
-                        robodr_ocsf::SIG_HEADER
-                    ));
-                }
-                &rec.headers[..rec.headers.len() - 1]
-            }
-            None => &rec.headers[..],
-        };
-        let same_headers = base.len() == want.headers.len()
-            && base
-                .iter()
-                .zip(&want.headers)
-                .all(|((k, v), (wk, wv))| k == wk && v == wv);
-        if !same_headers {
-            return Err("headers disagree with the value".into());
-        }
-        let p = want
-            .partition
-            .ok_or_else(|| "no partition (zero partitions?)".to_string())?;
-        if rec.partition.is_some_and(|x| x != p) {
-            report.partition_overridden += 1;
+        if c.legacy_upgraded {
+            report.legacy_upgraded += 1;
         }
         Ok((
             p as i32,
             ProduceRecord {
-                key: Some(rec.key.into_bytes()),
-                value: Some(rec.value.into_bytes()),
-                headers: rec
+                key: Some(c.key.into_bytes()),
+                value: Some(c.value.into_bytes()),
+                headers: c
                     .headers
                     .into_iter()
                     .map(|(k, v)| (k, v.into_bytes()))
-                    .collect(),
-                timestamp_ms: fsutil::now_ms() as i64,
-            },
-        ))
-    }
-
-    /// A contract 1.x record: checked against its own value like any record,
-    /// then (unsigned only) upgraded to contract 2.0 and re-derived.
-    fn prepare_legacy(
-        &self,
-        rec: InRecord,
-        env: robodr_ocsf::FindingEnvelope,
-        partitions: u32,
-        report: &mut PublishReport,
-    ) -> Result<(i32, ProduceRecord), String> {
-        if !matches!(robodr_ocsf::signature_header(&rec.headers), Ok(None)) {
-            return Err(format!(
-                "{} (contract {}; the finding signature covers the 1.x value, so it cannot be \
-                 upgraded here: re-sign it on the robot, or drain before upgrading)",
-                robodr_ocsf::LEGACY_SIGNED_REASON,
-                env.contract_version
-            ));
-        }
-        if rec.key != env.finding_id {
-            return Err("key is not the finding id".into());
-        }
-        if rec.topic != env.ocsf.metadata.log_name {
-            return Err(format!(
-                "topic {:?} is not the one the value names ({:?})",
-                rec.topic, env.ocsf.metadata.log_name
-            ));
-        }
-        let own = robodr_ocsf::headers(&env);
-        let same_headers = rec.headers.len() == own.len()
-            && rec
-                .headers
-                .iter()
-                .zip(&own)
-                .all(|((k, v), (wk, wv))| k == wk && v == wv);
-        if !same_headers {
-            return Err("headers disagree with the value".into());
-        }
-        let up = robodr_ocsf::upgrade_legacy(&env, &self.cfg.upgrade_data_source, &self.cfg.topic)
-            .map_err(|e| {
-                format!(
-                    "legacy contract {} record not upgraded: {e}",
-                    env.contract_version
-                )
-            })?;
-        let want = robodr_ocsf::record(&up, Some(partitions))
-            .map_err(|_| "upgraded finding cannot be emitted".to_string())?;
-        let p = want
-            .partition
-            .ok_or_else(|| "no partition (zero partitions?)".to_string())?;
-        if rec.partition.is_some_and(|x| x != p) {
-            report.partition_overridden += 1;
-        }
-        report.legacy_upgraded += 1;
-        Ok((
-            p as i32,
-            ProduceRecord {
-                key: Some(want.key.into_bytes()),
-                value: Some(want.value.into_bytes()),
-                headers: want
-                    .headers
-                    .into_iter()
-                    .map(|(k, v)| (k.to_string(), v.into_bytes()))
                     .collect(),
                 timestamp_ms: fsutil::now_ms() as i64,
             },
@@ -727,19 +911,7 @@ impl<S: Sink> Publisher<S> {
     }
 
     fn run_diode(&mut self, out: &Path, report: &mut PublishReport) -> Result<(), PublishError> {
-        let mut names = Vec::new();
-        for e in fs::read_dir(out)? {
-            let e = e?;
-            let Some(name) = e.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
-            // Dot-entries are the importer's staging directories.
-            if !valid_batch_name(&name) || !e.file_type()?.is_dir() {
-                continue;
-            }
-            names.push(name);
-        }
-        names.sort();
+        let names = list_diode_batches(out)?;
         let done_dir = self.cfg.state_dir.join(DONE_DIR);
         // Prune offsets of batches that are done or gone from out/.
         let before = self.progress.in_flight.len();
@@ -769,51 +941,19 @@ impl<S: Sink> Publisher<S> {
         name: &str,
         report: &mut PublishReport,
     ) -> Result<(), PublishError> {
-        let path = out.join(name).join(RECORDS_FILE);
-        let file = match fs::symlink_metadata(&path) {
-            Ok(m) if m.is_file() => fs::File::open(&path)?,
+        let Some(mut reader) =
+            LineReader::open(out, name, self.cfg.max_record_bytes).map_err(|e| match e {
+                OpenRecordsError::NotRegular(m) => PublishError::State(m),
+                OpenRecordsError::Io(e) => PublishError::Io(e),
+            })?
+        else {
             // A batch with bundles only has no records.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Ok(_) => {
-                return Err(PublishError::State(format!(
-                    "{} is not a regular file",
-                    path.display()
-                )))
-            }
-            Err(e) => return Err(e.into()),
+            return Ok(());
         };
         let skip = self.progress.lines_committed(name);
         report.resumed_after += skip;
-        let cap = self.cfg.max_record_bytes as u64;
-        let mut reader = BufReader::new(file);
-        let mut line_no = 0u64;
         let mut chunk: Vec<Item> = Vec::new();
-        loop {
-            let mut buf = Vec::new();
-            let n = (&mut reader).take(cap + 1).read_until(b'\n', &mut buf)?;
-            if n == 0 {
-                break;
-            }
-            let raw = if buf.last() == Some(&b'\n') {
-                buf.pop();
-                Ok(buf)
-            } else if buf.len() as u64 > cap {
-                // Overlong line: skip to its end.
-                let mut sink = Vec::new();
-                loop {
-                    sink.clear();
-                    let m = (&mut reader).take(cap).read_until(b'\n', &mut sink)?;
-                    if m == 0 || sink.last() == Some(&b'\n') {
-                        break;
-                    }
-                }
-                Err(format!("line longer than {cap} bytes"))
-            } else {
-                // Last line without a newline: the importer always ends
-                // lines, so this is truncation.
-                Err("truncated last line (no newline)".into())
-            };
-            line_no += 1;
+        while let Some((line_no, raw)) = reader.next_line()? {
             if line_no <= skip {
                 continue;
             }
@@ -850,44 +990,14 @@ impl<S: Sink> Publisher<S> {
         let acked = root.join("acked");
         let rejected = root.join("rejected");
         loop {
-            let mut files = Vec::new();
-            for e in fs::read_dir(&ready)? {
-                let e = e?;
-                let Some(name) = e.file_name().to_str().map(str::to_string) else {
-                    continue;
-                };
-                if let Some(seq) = spool_seq(&name) {
-                    if e.file_type()?.is_file() {
-                        files.push((seq, name));
-                    }
-                }
-            }
+            let mut files = list_ready(&ready)?;
             if files.is_empty() {
                 return Ok(());
             }
-            files.sort();
             files.truncate(self.cfg.chunk_records);
             let mut items = Vec::with_capacity(files.len());
             for (seq, name) in files {
-                let raw =
-                    match fsutil::read_capped(&ready.join(&name), self.cfg.max_record_bytes as u64)
-                    {
-                        Ok(b) => serde_json::from_slice::<SpoolRecord>(&b)
-                            .map_err(|e| format!("not a spool record: {e}"))
-                            .and_then(|r| {
-                                if r.seq == seq {
-                                    serde_json::to_vec(&serde_json::json!({
-                                        "topic": r.topic, "partition": r.partition, "key": r.key,
-                                        "headers": r.headers, "value": r.value,
-                                    }))
-                                    .map_err(|e| e.to_string())
-                                } else {
-                                    Err(format!("seq {} does not match file name", r.seq))
-                                }
-                            }),
-                        Err(ReadError::Io(e)) => return Err(e.into()),
-                        Err(e) => Err(format!("unreadable: {e}")),
-                    };
+                let raw = read_spool_item(&ready.join(&name), seq, self.cfg.max_record_bytes)?;
                 items.push(Item {
                     pos: seq,
                     file: Some(name),

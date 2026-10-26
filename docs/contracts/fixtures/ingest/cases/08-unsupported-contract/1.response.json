@@ -1,0 +1,21 @@
+{
+  "body": {
+    "accepted": 1,
+    "batch_id": "rdu1-f27f7f11730232d37d14439b88188876",
+    "created": 1,
+    "duplicates": 0,
+    "rejected": [
+      {
+        "code": "unsupported_contract",
+        "line": 1
+      },
+      {
+        "code": "unsupported_contract",
+        "line": 2
+      }
+    ],
+    "replayed": false,
+    "updated": 0
+  },
+  "status": 200
+}

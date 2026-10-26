@@ -24,7 +24,9 @@
 #   SOURCE_DATE_EPOCH      override the commit timestamp
 #   CARGO_BUILD_TARGET     cross build (e.g. aarch64-unknown-linux-gnu): the
 #                          binaries are then read from target/<triple>/release
-#                          (cargo's layout); unset = native target/release
+#                          (cargo's layout); unset = native target/release. For a
+#                          *-linux-musl triple, CC_<triple> defaults to clang
+#                          (ring's C/assembly; as scripts/build-static.sh)
 #   REPRO_ALLOW_NO_LOCK=1  local experiments only: without a committed lock,
 #                          let EACH copy resolve on its own (no --locked); the
 #                          result does not prove a release is rebuildable
@@ -77,6 +79,15 @@ fi
 excludes="$(cd "${dirs[0]}" && cargo metadata --no-deps --format-version 1 "${locked[@]}" "${cargo_flags[@]}" |
     python3 "$here/ci-pure-excludes.py" -)"
 read -r -a exclude_args <<<"$excludes"
+
+# musl cross builds: ring (rustls' crypto provider, robodr-uplink) has C and
+# assembly; compile it with clang, as scripts/build-static.sh does.
+if [[ "${CARGO_BUILD_TARGET:-}" == *-linux-musl ]]; then
+    cc_var="CC_$(printf '%s' "$CARGO_BUILD_TARGET" | tr '-' '_')"
+    if [[ -z "${!cc_var:-}" ]] && command -v clang >/dev/null; then
+        export "$cc_var=clang"
+    fi
+fi
 
 # cargo puts --target / CARGO_BUILD_TARGET output under target/<triple>/.
 rel="release"

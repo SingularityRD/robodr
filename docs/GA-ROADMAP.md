@@ -244,6 +244,13 @@ sprint, AC'leri karşılanmadan kapanmaz.
 - **R:** `robodr-uplink` (yeni bin, robodr-export içinde): spool/diode çıktısını HTTPS
   ile webhook'a/ingest API'sine iten, crash-safe, at-least-once, backoff'lu istemci
   (rustls, CA pinleme).
+  ✅ **Üretici tarafı hazır (2026-10-26):** `robodr-uplink` ingest API sözleşmesi v1'e
+  göre (`docs/contracts/robodr.ingest-api.md`; uygularken netleşen boşluklar
+  sözleşmeye işlendi, §10), rustls + ring, CA paketi + SPKI pin, girdi
+  konumundan ve gövdeden türetilen batch id, kalıcı uçuştaki batch, systemd
+  birimleri (+ focal), man sayfası, OPERATIONS 8.5. Ortak sözleşme test
+  vektörleri `docs/contracts/fixtures/ingest/` (AutoSecOps tarafı bunlarla
+  test eder). Henüz gerçek AutoSecOps'a karşı çalıştırılmadı (Sprint 3).
 - **A (tasarım):** native `robot_edr` modülü ADR'ı: tablolar `Robot`, `RobotSite`,
   `RobotKey` (finding/evidence/control anahtarları, rotasyon/iptal), `RobotFinding`
   (unique `(workspace_id, external_id)`), `RobotActionRequest`; RLS; alembic

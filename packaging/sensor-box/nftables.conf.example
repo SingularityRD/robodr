@@ -7,7 +7,8 @@
 # Policy: drop by default in every direction.
 #   * Capture NIC: nothing in, nothing out, ever. This does not affect
 #     capture: AF_PACKET taps see frames before netfilter.
-#   * Uplink NIC: out only to the Kafka brokers (findings export,
+#   * Uplink NIC: out only to the findings receiver (the SOC ingest API,
+#     robodr-uplink.service, HTTPS; or the Kafka brokers,
 #     robodr-kafka-publish.service) and NTP; in only SSH from the admin
 #     network. No forwarding: the box is not a router between the robot
 #     network and the uplink.
@@ -18,6 +19,10 @@
 # change. Keep it equal to the IPAddressAllow= of the publisher's
 # 50-brokers.conf drop-in. A diode site exports with robodr-spool-export
 # (files, no network) and needs no Kafka rule at all: delete it.
+# Ingest API (robodr-uplink): SOC_INGEST = the address(es) the URL's host
+# resolves to (put that name in /etc/hosts), equal to the IPAddressAllow= of
+# the uplink's 50-soc.conf drop-in. Keep the rule of the export you enable
+# and delete the other one.
 # All addresses below are documentation placeholders (RFC 5737) and must be
 # replaced. Use addresses, not host names: the box resolves no DNS, so the
 # brokers must advertise IP-literal listeners (advertised.listeners) or be
@@ -34,6 +39,8 @@ define CAPTURE_IF = "eth1"
 define UPLINK_IF = "eth0"
 define KAFKA_BROKERS = { 192.0.2.21, 192.0.2.22, 192.0.2.23 }
 define KAFKA_PORT = 9092
+define SOC_INGEST = { 192.0.2.40 }
+define SOC_INGEST_PORT = 443
 define NTP_SERVER = 192.0.2.123
 define ADMIN_NET = 192.0.2.64/28
 
@@ -59,6 +66,7 @@ table inet robodr_sensor_box {
         ct state invalid drop
         ct state established,related accept
         oifname $UPLINK_IF ip daddr $KAFKA_BROKERS tcp dport $KAFKA_PORT ct state new accept
+        oifname $UPLINK_IF ip daddr $SOC_INGEST tcp dport $SOC_INGEST_PORT ct state new accept
         oifname $UPLINK_IF ip daddr $NTP_SERVER udp dport 123 ct state new accept
     }
 }

@@ -94,6 +94,16 @@ thiserror = "2"
 ed25519-dalek = { version = "2.1", default-features = false, features = ["fast", "std", "zeroize"] }
 # SHA-512 (the same implementation ed25519-dalek uses internally).
 sha2 = "0.10"
+# TLS for robodr-uplink (crates/robodr-export, ingest API client). rustls with
+# the `ring` provider only: no aws-lc-rs (CMake + a large C library), no
+# `logging` (no `log` output of handshake details), TLS 1.3 and 1.2 (rustls
+# offers only AEAD/ECDHE suites in 1.2). The trust anchors are always the
+# operator's CA bundle (no webpki-roots / native roots). ring compiles a small
+# amount of C and assembly (docs/BUILD.md, "Static (musl) build").
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# rustls' certificate verifier (already in the graph through rustls); used
+# directly only to read the end-entity SubjectPublicKeyInfo for SPKI pinning.
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc"] }
 
 [profile.release]
 # Runs on a robot controller: favour small, predictable binaries.

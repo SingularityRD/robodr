@@ -22,7 +22,7 @@ configure)
         if [ -n "$2" ]; then
             # Upgrade: restart only what was running.
             for u in robodr-pulsard.service robodr-agentd.service robodr-anchor-receiver.service \
-                robodr-spool-export.service robodr-kafka-publish.service; do
+                robodr-spool-export.service robodr-kafka-publish.service robodr-uplink.service; do
                 systemctl try-restart "$u" || true
             done
         else

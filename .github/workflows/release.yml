@@ -185,7 +185,7 @@ jobs:
       - name: Debian package
         env:
           # A release must never ship without the daemons and their tools.
-          ROBODR_DEB_REQUIRE: robodr-pulsard robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish
+          ROBODR_DEB_REQUIRE: robodr-pulsard robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish robodr-uplink
         run: |
           export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           packaging/build-deb.sh --bin-dir target/release --arch "$ARCH" --out dist/release
@@ -218,7 +218,8 @@ jobs:
     # dependency) with systemd 245 units, for Ubuntu 20.04 / NVIDIA JetPack 5
     # hosts such as Unitree EDU computers (docs/UNITREE.md 3.2, docs/BUILD.md
     # "Static (musl) build"). Both targets are cross-linked with rust-lld on
-    # the x86-64 runner; no robodr-pulsard (needs a BTF kernel).
+    # the x86-64 runner (ring's C/assembly built with clang); no
+    # robodr-pulsard (needs a BTF kernel).
     name: Build and package robodr-focal (${{ matrix.arch }})
     needs: prepare
     runs-on: ubuntu-24.04
@@ -249,6 +250,11 @@ jobs:
         run: scripts/ci-setup.sh
       - name: Linker (rust-lld, self-contained musl)
         run: echo "CARGO_TARGET_$(printf '%s' "$TARGET" | tr 'a-z-' 'A-Z_')_LINKER=rust-lld" >> "$GITHUB_ENV"
+      - name: C compiler (clang, for ring's C/assembly; both triples)
+        run: |
+          command -v clang >/dev/null || { sudo apt-get update && sudo apt-get install -y --no-install-recommends clang; }
+          echo "CC_$(printf '%s' "$TARGET" | tr '-' '_')=clang" >> "$GITHUB_ENV"
+          clang --version
       - name: Reproducibility proof (pure binaries, two paths, musl)
         env:
           REPRO_REQUIRE_BINARIES: "1"
@@ -268,7 +274,7 @@ jobs:
             sudo apt-get install -y --no-install-recommends qemu-user-static
             run=qemu-aarch64-static
           fi
-          for b in robodr-agentd robodr-commission robodr-ros2-watch; do
+          for b in robodr-agentd robodr-commission robodr-ros2-watch robodr-uplink; do
             $run "dist/static/$TARGET/$b" --version
           done
       - name: Cargo.lock unchanged
@@ -281,7 +287,7 @@ jobs:
           SBOM_TOOL=cyclonedx scripts/sbom.sh dist/sbom
       - name: robodr-focal package and offline bundle
         env:
-          ROBODR_DEB_REQUIRE: robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish
+          ROBODR_DEB_REQUIRE: robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish robodr-uplink
         run: |
           export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           deb=$(packaging/build-deb.sh --variant focal --bin-dir "dist/static/$TARGET" --arch "$ARCH" --out dist/release)

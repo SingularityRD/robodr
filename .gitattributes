@@ -1,1 +1,6 @@
 Cargo.lock merge=binary
+# Contract test vectors are compared byte for byte (crates/robodr-export/
+# tests/ingest_vectors.rs) and include CRLF, an invalid UTF-8 byte and
+# no-final-LF bodies on purpose: never convert line endings.
+docs/contracts/fixtures/ingest/** -text
+docs/contracts/fixtures/ingest/**/*.body binary

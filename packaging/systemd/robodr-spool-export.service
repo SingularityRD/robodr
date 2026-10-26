@@ -36,8 +36,8 @@ Description=RoboDR findings exporter (agentd spool to signed diode batches)
 Documentation=man:robodr-spool-export(1) file:/usr/share/doc/robodr/OPERATIONS.md
 AssertPathExists=/etc/robodr/spool-export.env
 After=local-fs.target robodr-agentd.service
-# One consumer per spool: the connected-site publisher reads the same one.
-Conflicts=robodr-kafka-publish.service
+# One consumer per spool: the connected-site publisher and uplink read the same one.
+Conflicts=robodr-kafka-publish.service robodr-uplink.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
 

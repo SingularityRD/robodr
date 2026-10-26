@@ -64,8 +64,8 @@ Documentation=man:robodr-kafka-publish(1) file:/usr/share/doc/robodr/OPERATIONS.
 AssertPathExists=/etc/robodr/kafka-publish.env
 After=local-fs.target network-online.target robodr-agentd.service
 Wants=network-online.target
-# One consumer per spool: the diode exporter reads the same one.
-Conflicts=robodr-spool-export.service
+# One consumer per spool: the diode exporter and the uplink read the same one.
+Conflicts=robodr-spool-export.service robodr-uplink.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
 

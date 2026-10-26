@@ -1,0 +1,305 @@
+.\" robodr-uplink(1). Source of truth: the USAGE text in
+.\" crates/robodr-export/src/bin/robodr-uplink.rs, the crate README and
+.\" docs/contracts/robodr.ingest-api.md. Keep them in sync.
+.TH ROBODR\-UPLINK 1 "2026-10-26" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
+.SH NAME
+robodr\-uplink \- send RoboDR findings to the SOC ingest API over TLS
+.SH SYNOPSIS
+.B robodr\-uplink
+.B \-\-url
+.I URL
+.B \-\-key\-file
+.I FILE
+.B \-\-ca\-bundle
+.I PEM
+.RB [ \-\-spki\-sha256
+.IR HEX ]...
+.B \-\-state\-dir
+.I DIR
+.RB ( \-\-spool
+.I DIR
+|
+.B \-\-diode\-out
+.IR DIR )
+.RB [ \-\-max\-lines
+.IR N ]
+.RB [ \-\-max\-body\-bytes
+.IR N ]
+.RB [ \-\-connect\-timeout\-ms
+.IR N ]
+.RB [ \-\-request\-timeout\-ms
+.IR N ]
+.RB [ \-\-max\-attempts
+.IR N ]
+.RB [ \-\-backoff\-base\-ms
+.IR N ]
+.RB [ \-\-backoff\-max\-ms
+.IR N ]
+.RB [ \-\-max\-retry\-after\-s
+.IR N ]
+.RB [ \-\-upgrade\-data\-source
+.IR LABEL ]
+.RB [ \-\-upgrade\-topic
+.IR TOPIC ]
+.RB [ \-\-interval\-ms
+.IR N ]
+.RB [ \-\-once ]
+.br
+.B robodr\-uplink \-\-version
+.SH DESCRIPTION
+Producer of the
+.B robodr.ingest
+HTTP API, contract v1 (the AutoSecOps
+.I /robot\-edr/v2/ingest
+endpoint; docs/contracts/robodr.ingest\-api.md in the source tree). It reads
+either a connected site's
+.BR robodr\-agentd (8)
+spool
+.RB ( \-\-spool ,
+on the robot or sensor box) or the
+.BR robodr\-diode\-unpack (1)
+importer's
+.IB DIR /<batch>/records.jsonl
+.RB ( \-\-diode\-out ,
+on the SOC side of an air\-gapped site), re\-validates every finding exactly
+as
+.BR robodr\-kafka\-publish (1)
+does, and POSTs NDJSON batches
+.RB ( {"value":"<finding>","sig":...}
+per line, the value byte for byte) to
+.IB URL /robot\-edr/v2/ingest\fR.
+A per\-finding signature
+.RB ( robodr\-finding\-sig ,
+contract robodr.findings \(sc2a) found in the spool record is carried as the
+line's
+.BR sig ;
+findings that crossed a diode have none
+.RB ( "sig":null ).
+.PP
+Each batch is signed with the Ed25519 key file (header
+.BR X\-RoboDR\-Signature ,
+contract \(sc2.2) and carries a batch id derived from the input positions
+of its lines and from its body: re\-sending the same records after a crash
+reuses the same id, so the server answers with its stored response
+.RB ( "replayed":true )
+instead of processing them again. The batch in flight is saved in the state
+directory before it is sent.
+.PP
+Delivery is at\-least\-once: a record leaves the input
+.RB ( ready/
+\(->
+.BR acked/ ,
+or the diode batch's committed line count) only after a
+.B 200
+response names it accepted or rejected; rejected lines go to
+.IB DIR /dead\-letter.jsonl
+with the server's code (and, with
+.BR \-\-spool ,
+to the spool's
+.BR rejected/ ).
+A record that fails the local validation is dead\-lettered with code
+.B local
+and never sent. Network errors,
+.BR 408 ,
+.B 429
+and
+.B 5xx
+are retried with the same body and batch id and a fresh timestamp and
+signature, with exponential backoff and jitter, never sooner than
+.BR Retry\-After .
+A
+.B 413
+halves the batch;
+.BR 400 ,
+.BR 401 ,
+.B 409
+and
+.B 415
+stop the run without acknowledging anything (the batch stays pending and
+is re\-sent, under the same id, by the next run). A
+.B 200
+that does not account for every line of the batch acknowledges nothing.
+.PP
+TLS is mandatory: rustls (ring provider; TLS 1.3 and 1.2), the server
+certificate verified against
+.B \-\-ca\-bundle
+only (no system or built\-in roots), the URL host as the server name, and
+optionally SHA\-256 SPKI pins checked in addition. There is no option that
+disables verification. Plain
+.B http://
+is accepted only to a loopback IP literal (127.0.0.0/8,
+.BR [::1] ;
+not the name
+.BR localhost ),
+e.g. a local TLS\-terminating proxy, and then without
+.BR \-\-ca\-bundle .
+No HTTP proxy, no redirects, one request per connection.
+.PP
+Without
+.B \-\-once
+it sends every
+.B \-\-interval\-ms
+and, after a failed run, waits with exponential backoff (from
+.B \-\-interval\-ms
+up to
+.BR \-\-backoff\-max\-ms )
+before the next one; each run that did something prints a JSON report on
+stdout. Progress and retries are logged on stderr.
+.SH OPTIONS
+.TP
+.BI \-\-url " URL"
+The AutoSecOps API root
+.RB ( https://HOST[:PORT][/PATH] ,
+e.g.
+.BR https://soc.example.org/api );
+.B /robot\-edr/v2/ingest
+is appended. No user info, query or fragment.
+.TP
+.BI \-\-key\-file " FILE"
+The sender key: an Ed25519 secret key file made by
+.B robodr\-blackbox keygen
+(no
+.BR \-\-key\-id :
+the ingest API identifies keys by the derived
+.B ed25519:<16 hex>
+id). Mode 0600, owned by the caller or root. Register its public half
+.RI ( FILE .pub)
+in AutoSecOps as the robot's
+.B uplink
+key (connected site) or as a
+.B relay
+key (SOC side of a diode); the role is decided by the server.
+.TP
+.BI \-\-ca\-bundle " PEM"
+The CA certificate(s) the server certificate must chain to (required for
+.BR https:// ).
+.TP
+.BI \-\-spki\-sha256 " HEX"
+SHA\-256 (64 hex digits) of the server certificate's DER
+SubjectPublicKeyInfo; repeatable (a key rotation lists the current and the
+next key). When given, the server key must match one of them, in addition to
+the CA verification. Compute it with
+.br
+.B "openssl x509 \-in server.pem \-pubkey \-noout | openssl pkey \-pubin \-outform der | sha256sum"
+.TP
+.BI \-\-state\-dir " DIR"
+State file
+.RB ( uplink\-state.json ),
+done markers
+.RB ( \-\-diode\-out )
+and dead letters. One state directory per input.
+.TP
+.BI \-\-spool " DIR\fR | " \-\-diode\-out " DIR"
+The input (exactly one).
+.TP
+.BI \-\-max\-lines " N"
+Lines per batch, 1..1000 (default 1000, the contract maximum).
+.TP
+.BI \-\-max\-body\-bytes " N"
+Body bytes per batch, 1048576..4194304 (default 4194304, the contract
+maximum).
+.TP
+.BI \-\-connect\-timeout\-ms " N\fR, " \-\-request\-timeout\-ms " N"
+Name resolution and TCP connect (per address; default 10000), and the
+whole exchange after it: TLS handshake, request, response (default 60000).
+.TP
+.BI \-\-max\-attempts " N"
+Requests per batch per run (default 6); then the run fails and the batch
+stays pending.
+.TP
+.BI \-\-backoff\-base\-ms " N\fR, " \-\-backoff\-max\-ms " N"
+Backoff before retry
+.IR k :
+a random time in [d/2, d], d = min(max, base \(mu 2^(k\-1)) (defaults 500
+and 60000).
+.TP
+.BI \-\-max\-retry\-after\-s " N"
+Cap on an honoured
+.B Retry\-After
+(default 600).
+.TP
+.BI \-\-upgrade\-data\-source " LABEL\fR, " \-\-upgrade\-topic " TOPIC"
+An unsigned contract 1.x record is upgraded to contract 2.0 with this
+.B data_source
+(default
+.BR robodr )
+and topic (default
+.BR robodr.findings )
+before it is sent; a signed one is dead\-lettered ("legacy 1.x signed
+record: re\-sign required").
+.TP
+.BI \-\-interval\-ms " N"
+Loop interval, > 0 (default 2000).
+.TP
+.B \-\-once
+One pass, then exit.
+.TP
+.B \-\-version
+Print the version and exit.
+.SH FILES
+.TP
+.IB DIR /uplink\-state.json
+Committed line count per diode batch and the pending batch (batch id,
+input positions, body SHA\-256, the server's result once received).
+.TP
+.IB DIR /dead\-letter.jsonl
+.RB { source ,
+.BR position ,
+.BR code ,
+.BR reason ,
+.BR batch_id ,
+.BR record ,
+.BR at_ms }
+per line, deduplicated on
+.RB ( source ,
+.BR position ).
+.SH EXIT STATUS
+.TP
+.B 0
+Success
+.RB ( \-\-once ).
+.TP
+.B 1
+Runtime error with
+.BR \-\-once ,
+or the key file or CA bundle could not be loaded.
+.TP
+.B 2
+Usage error (including a refused
+.B http://
+URL).
+.SH SYSTEMD UNIT
+The package ships
+.B robodr\-uplink.service
+(installed disabled) for a connected site: it runs on the unit or sensor box
+as user
+.B robodr
+with
+.BR "\-\-spool /var/lib/robodr/spool/agentd" ,
+state in
+.IR /var/lib/robodr/export/uplink ,
+the key
+.I /etc/robodr/keys/uplink.key
+handed over as a systemd credential and the CA bundle
+.IR /etc/robodr/uplink\-ca.pem ;
+the URL and extra flags come from
+.I /etc/robodr/uplink.env
+.RB ( ROBODR_UPLINK_URL ,
+.BR ROBODR_UPLINK_ARGS ).
+The unit denies every IP address; the drop\-in example
+.I 50\-soc.conf.example
+allows the SOC address. DNS servers are not reachable from the unit unless
+allowed there: map the URL's host name in
+.IR /etc/hosts .
+It conflicts with
+.B robodr\-spool\-export.service
+and
+.B robodr\-kafka\-publish.service
+(one consumer per spool).
+.SH SEE ALSO
+.BR robodr\-kafka\-publish (1),
+.BR robodr\-spool\-export (1),
+.BR robodr\-diode\-unpack (1),
+.BR robodr\-blackbox (1),
+.BR robodr\-agentd (8),
+/usr/share/doc/robodr/OPERATIONS.md

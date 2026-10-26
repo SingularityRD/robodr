@@ -73,7 +73,14 @@ workspace-wide (no list to maintain).
 Binaries built from the pure set (all shipped in the `.deb`, all checked by
 `scripts/ci-repro.sh`): `robodr-replay`, `robodr-agentd`, `robodr-blackbox`,
 `robodr-commission`, `robodr-diode-pack`, `robodr-diode-unpack`,
-`robodr-ros2-watch`. Pulsar-bound: `robodr-pulsard`.
+`robodr-ros2-watch`, `robodr-spool-export`, `robodr-kafka-publish`,
+`robodr-uplink`, `robodr-anchor-receiver`. Pulsar-bound: `robodr-pulsard`.
+
+C in the pure set: only `ring` (the crypto provider of rustls, linked into
+`robodr-uplink` for TLS) compiles C and assembly through the `cc` crate,
+so a C compiler is needed (`cc`/gcc for the native glibc build, clang for
+the musl cross builds, see [Static (musl) build](#static-musl-build)).
+Everything else is pure Rust.
 
 The submodule must be checked out even for the pure crates: cargo loads the
 whole workspace manifest, and `pulsar-core` is a path dependency.
@@ -301,8 +308,11 @@ packaging/build-deb.sh --variant focal --bin-dir dist/static/aarch64-unknown-lin
 pure workspace) for the musl target with the release flags (`--locked`,
 `SOURCE_DATE_EPOCH`, `--remap-path-prefix`), links with **rust-lld** from
 the Rust toolchain for both targets (self-contained musl CRT and libc from
-the target's rust-std; the pure crates have no C code, so no C cross
-compiler or `musl-gcc` is needed), then **refuses** any `robodr-*` binary
+the target's rust-std; no `musl-gcc`), compiles the one piece of C,
+`ring`'s C and assembly (rustls' crypto provider, `robodr-uplink`), with
+**clang** for both triples (`CC_<triple>`, default `clang`; ring needs no
+libc headers beyond what clang finds, verified 2026-10-26 with clang 18 for
+both triples), then **refuses** any `robodr-*` binary
 that is not an ELF for the target machine, has a `PT_INTERP` program
 header or a `DT_NEEDED` entry, and writes the binaries and `SHA256SUMS`
 to `dist/static/<triple>/`. `build-deb.sh --variant focal` repeats the
@@ -313,11 +323,13 @@ only dependency is `systemd (>= 245)`.
 |---|---|---|
 | Linker | rust-lld | rust-lld (cross) |
 | Layout | static-pie (ASLR of the image) | static, **not PIE**: the Rust target has no static-pie support, so the executable image is at a fixed address (stack, heap and mappings are still randomised) |
-| Reproducible | yes (`CARGO_BUILD_TARGET=<triple>` + `CARGO_TARGET_<TRIPLE>_LINKER=rust-lld` with `scripts/ci-repro.sh`) | same |
+| C compiler (ring) | clang | clang (cross, `--target` added by the `cc` crate) |
+| Reproducible | yes (`CARGO_BUILD_TARGET=<triple>` + `CARGO_TARGET_<TRIPLE>_LINKER=rust-lld` with `scripts/ci-repro.sh`, which defaults `CC_<triple>` to clang like `build-static.sh`) | same |
 
 Runtime differences from the glibc build to keep in mind: the musl resolver
 reads `/etc/hosts` and `/etc/resolv.conf` but not `nsswitch.conf` (give
-`robodr-kafka-publish` IP literals); musl's allocator is slower than glibc's
+`robodr-kafka-publish` IP literals, and map `robodr-uplink`'s host name in
+`/etc/hosts`); musl's allocator is slower than glibc's
 under contention (agentd's hot path is single-threaded; not measured on a
 robot).
 
@@ -343,6 +355,18 @@ robot).
   without systemd (packaging/README.md, "Not verified").
 - Not done: the musl test suite (`cargo test --target ...-musl`; no disk
   space in the sandbox), any run on a Jetson or under systemd 245.
+
+**Re-verified on 2026-10-26 with `robodr-uplink`** (rustls + ring, the first
+C in the pure set; Ubuntu 24.04 container, Rust 1.98.1, clang 18.1.3):
+`scripts/build-static.sh x86_64-unknown-linux-musl`: 11 binaries, all
+static-pie, no `INTERP`, no `NEEDED`; `scripts/ci-repro.sh` with
+`CARGO_BUILD_TARGET=x86_64-unknown-linux-musl`: 11 binaries bit-identical
+across the two paths (ring's C objects included); the aarch64 musl build of
+`robodr-uplink` links (clang cross-compiling ring), not run (no qemu in the
+container). The static `robodr-uplink --once` delivered a spool to an
+OpenSSL-based (Python `ssl`) HTTPS server through the test CA, a host name
+and an SPKI pin. `cargo +1.87.0 check -p robodr-export --all-targets`
+passes (MSRV).
 
 ## Licensing
 

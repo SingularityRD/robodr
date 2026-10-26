@@ -1,0 +1,29 @@
+{
+  "body_file": "2.body",
+  "body_sha256": "677631708a90ed0b0b9168e5eb55577917089ceeeb96a2244e0d1371abb32a87",
+  "headers": [
+    [
+      "Content-Type",
+      "application/json"
+    ],
+    [
+      "X-RoboDR-Key-Id",
+      "ed25519:b3f6da01b39959ac"
+    ],
+    [
+      "X-RoboDR-Batch-Id",
+      "rdu1-27a8145926ed364575766c9b30fbdfb9"
+    ],
+    [
+      "X-RoboDR-Timestamp",
+      "1790000262000"
+    ],
+    [
+      "X-RoboDR-Signature",
+      "6559a6c0768d9940573209ccb654aa97e32e9b73e2e0566bc1a36d9e83899c020b4b3236c7d59b6bf26a1254c0fec2c65105c0a5ecb502cf37deb4698c0f8f04"
+    ]
+  ],
+  "method": "POST",
+  "path": "/robot-edr/v2/ingest",
+  "server_time_ms": 1790000263000
+}

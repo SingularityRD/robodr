@@ -14,9 +14,12 @@ The two hops of the findings path that nothing else moved (contract
                                                                                    ▼
                                                    out/<batch>/records.jsonl ─► robodr-kafka-publish ─► Kafka
  connected site: agentd spool/ready/ ─────────────────────────────────────────► robodr-kafka-publish ─┘
+                                                   out/<batch>/records.jsonl ─► robodr-uplink ═ HTTPS ═► AutoSecOps
+ connected site: agentd spool/ready/ ─────────────────────────────────────────► robodr-uplink ─┘    /robot-edr/v2/ingest
 ```
 
-Everything is std + RoboDR crates + serde. The Kafka producer is a small
+Everything is std + RoboDR crates + serde, plus rustls (with the `ring`
+provider) for `robodr-uplink`'s TLS. The Kafka producer is a small
 in-crate implementation (`src/kafka/`), because no client crate is
 available offline. CI tests it against an in-process fake broker; it has
 also been run against real Apache Kafka brokers (3.9.1 and 4.1.0,
@@ -142,6 +145,141 @@ robodr-kafka-publish --bootstrap kafka-1:9092 [--bootstrap kafka-2:9092] \
   file on the first dead letter of a run; 16 bytes per entry). Any other
   Kafka error stops the run without committing; the next run retries.
 
+## `robodr-uplink` (ingest API, connected site or SOC side)
+
+```
+robodr-uplink --url https://soc.example.org/api --key-file /etc/robodr/keys/uplink.key \
+  --ca-bundle /etc/robodr/uplink-ca.pem [--spki-sha256 HEX ...] --state-dir /var/lib/robodr/export/uplink \
+  (--spool /var/lib/robodr/spool/agentd | --diode-out /srv/diode/out) [--max-lines N] [--max-body-bytes N] \
+  [--connect-timeout-ms N] [--request-timeout-ms N] [--max-attempts N] [--backoff-base-ms N] \
+  [--backoff-max-ms N] [--max-retry-after-s N] [--upgrade-data-source L] [--upgrade-topic T] \
+  [--interval-ms 2000] [--once]
+```
+
+The producer of the `robodr.ingest` HTTP API, contract v1
+([`docs/contracts/robodr.ingest-api.md`](../../docs/contracts/robodr.ingest-api.md)):
+`POST {url}/robot-edr/v2/ingest`, NDJSON lines
+`{"value":"<finding, verbatim>","sig":null|{...}}`, signed per batch with
+an Ed25519 key file. Code: `src/uplink/` (`wire.rs` contract pieces,
+`http.rs` transport, `mod.rs` delivery), binary
+`src/bin/robodr-uplink.rs`.
+
+* **Input and validation** are `robodr-kafka-publish`'s (shared code in
+  `publish.rs`: `check_record`, the spool and `records.jsonl` readers): the
+  value is re-validated, key / topic / headers must be what the value
+  derives, unsigned contract 1.x is upgraded, signed 1.x is refused. A
+  record that fails is dead-lettered with code `local` and never sent.
+* **Per-finding signatures.** A spool record's `robodr-finding-sig` header
+  (agentd `finding_signing`, contract `robodr.findings` §2a) becomes the
+  line's `sig` (shape-checked, re-serialised in the header's own compact
+  form). The diode path has none: `findings.jsonl` carries values only and
+  the importer's `records.jsonl` has derived headers only (contract §8,
+  open item), so `--diode-out` lines are `"sig":null`; the SOC registers
+  that sender as a `relay` key and relies on the diode batch signature the
+  importer verified.
+* **Key.** An Ed25519 secret key file (`robodr-blackbox keygen`, without
+  `--key-id`: the contract identifies keys by the derived
+  `ed25519:<16 hex>`; another id, a public key file or an HMAC key is
+  refused). The role (`uplink` for one robot, `relay` for the workspace) is
+  the server's registry entry; the client only signs.
+* **Batches.** Records in input order, at most `--max-lines` (≤ 1000) lines
+  and `--max-body-bytes` (1–4 MiB) per batch; a diode batch is never mixed
+  with another.
+* **Batch id** (`wire::batch_id`):
+  `"rdu1-" + hex(SHA-256("robodr-uplink/batch-id/v1" 0x00 ‖ u32be(len(source)) ‖ source ‖ u32be(n) ‖ u64be(pos_1) … u64be(pos_n) ‖ SHA-256(body)))[0..32]`,
+  `source` = `spool` or `diode:<batch dir>`, `pos_i` = spool seq / line
+  number of body line `i`. Deterministic in the input positions and the
+  body: the same records re-cut after a crash give the same id, so the
+  server answers from its replay store (`replayed: true`, nothing processed
+  twice); a different body can never reuse an id (the server's stored
+  response numbers *that* body's lines, and the producer acknowledges by
+  line number). To make the re-cut identical even when new records arrived
+  meanwhile, the batch is persisted before it is sent (below).
+* **State** `<state>/uplink-state.json` (atomic replace,
+  `robodr-uplink-state/1`): committed line count per diode batch (bounded
+  map, as the Kafka publisher) and at most one **pending** batch
+  `{batch_id, source, last, positions, body_sha256, result}`.
+
+### Delivery protocol
+
+1. Cut a batch (dead-lettering locally invalid records on the way; spool:
+   moved to `rejected/`). Save `pending` (no result).
+2. `POST` with the five contract headers; `X-RoboDR-Timestamp` and the
+   signature are fresh for every attempt, body and batch id never change.
+   Retry network errors, `408`, `429` and `5xx` up to `--max-attempts` per
+   run, waiting a random time in `[d/2, d]`, `d = min(max, base·2^(k-1))`,
+   but never less than `Retry-After` (delay-seconds, capped by
+   `--max-retry-after-s`).
+3. A `200` is accepted only if it names this batch id and accounts for every
+   line exactly once (`accepted = created + updated + duplicates`,
+   `accepted + rejected = lines`, lines in range, valid codes); otherwise
+   nothing is acknowledged (`Protocol` error).
+4. Save the rejected lines into `pending.result`; append them to
+   `<state>/dead-letter.jsonl` (`{source, position, code, reason, batch_id,
+   record, at_ms}`, deduplicated on (source, position)); acknowledge
+   (diode: committed line count; spool: `ready/ → acked/`, rejected ones
+   `→ rejected/`, directories fsynced); clear `pending`.
+
+| Crash point | On restart |
+| --- | --- |
+| before 1 | nothing pending; records still in the input |
+| after 1, before the server processed it | the pending batch is rebuilt from its positions; same body SHA-256 → re-sent under the **same** id (processed now) |
+| after the server processed it, before 4 | rebuilt, re-sent under the same id → the server's stored response (`replayed: true`), applied; nothing processed twice |
+| after `result` was saved, during the acks | finished from the saved result, **no request**; renames tolerate files already moved, dead letters are not repeated |
+| input changed under a pending batch (a spool file gone, a diode batch removed, `--upgrade-*` changed) | the pending batch is dropped (reported as `pending_dropped`) and the records are cut afresh under a new id; repeats are `duplicate`s on the server: never a loss, no second case |
+
+Other statuses: `413` halves the line cap for the rest of the run and re-cuts
+(nothing was processed; a single-line `413` stops with an error);
+`400`, `401`, `409`, `415` and any other `4xx` stop the run without
+acknowledging anything; the batch stays pending and the next run re-sends
+it under the same id (the binary backs off exponentially between failed
+runs, from `--interval-ms` up to `--backoff-max-ms`). Every case is a test
+in `tests/uplink.rs` (in-memory transport and the reference consumer) or
+`tests/uplink_https.rs` (real TLS).
+
+### TLS and HTTP (`src/uplink/http.rs`)
+
+* rustls 0.23 with the **ring** provider (TLS 1.3 and 1.2, rustls' safe
+  defaults; no aws-lc-rs, no logging feature). The **only** trust anchors
+  are the `--ca-bundle` certificates (no system or built-in roots);
+  WebPKI verification of chain, validity, server name (the URL host) and
+  serverAuth. `--spki-sha256` (repeatable) adds a pin on the end-entity
+  certificate's DER `SubjectPublicKeyInfo`, checked **after** the full
+  verification (a pin never replaces it). There is no option that disables
+  verification. Pin value:
+  `openssl x509 -in server.pem -pubkey -noout | openssl pkey -pubin -outform der | sha256sum`.
+* Plain `http://` only to a loopback **IP literal** (`127.0.0.0/8`, `::1`;
+  not `localhost`, which a resolver could map elsewhere), checked when the
+  URL is parsed and again by the transport.
+* A small HTTP/1.1 client, one request per connection (`Connection:
+  close`): no redirects, proxies, cookies, compression or keep-alive.
+  Response head ≤ 32 KiB, body ≤ 1 MiB; `Content-Length`, `chunked` or
+  read-to-close (TLS close_notify required); interim `1xx` skipped (at most
+  8). Name resolution on a bounded helper thread (shared with the Kafka
+  client) within `--connect-timeout-ms`; every read and write is bounded by
+  the per-request deadline (`--request-timeout-ms`, socket timeouts
+  re-armed with the time left), so a trickling server cannot hold the
+  exchange open.
+* **Why not a client crate.** `ureq` 2.x (rustls) would add `url` →
+  `idna` → the ICU4X crates and `webpki-roots` (a built-in trust store this
+  tool must never use), and has redirect and proxy logic to switch off;
+  `ureq` 3.x takes no custom certificate verifier, which SPKI pinning
+  needs. One `POST` with fixed headers does not justify that tree; the HTTP
+  part here is a few hundred lines with its own tests (status line, header and
+  chunked parsing, truncations, limits). rustls, rustls-webpki and ring do
+  the security-critical work.
+
+### Contract test vectors
+
+`docs/contracts/fixtures/ingest/` (contract §9): fixed-seed test keys,
+requests (headers, body, server time) and the expected responses, made by
+`cargo run -p robodr-export --example ingest_vectors` with this crate's
+`wire` code. `tests/ingest_vectors.rs` fails if the committed files differ
+from the generator by a byte, and runs every request through a reference
+consumer of the contract (`tests/common/ingest.rs`). The batch and
+per-finding signatures of the vectors were also verified independently with
+Python `cryptography` (Ed25519).
+
 ## The Kafka client (`src/kafka/`)
 
 | Piece | What |
@@ -207,6 +345,33 @@ client-side; the broker's channel muting paces the producer (checked with a
   that commits nothing.
 * `tests/cli.rs`: both binaries as processes (usage exit 2, `--once` runs,
   unreachable broker exit 1 with nothing acknowledged).
+* Uplink unit tests (`src/uplink/`): batch signature message bytes (framing
+  pinned byte by byte), sign/verify, key id and batch id syntax, batch id
+  determinism and content binding (value pinned, computed independently),
+  NDJSON line encoding, `200` consistency checks, backoff bounds and caps,
+  `Retry-After` parsing, state file parsing, URL parsing (http refused
+  except loopback IP literals), SPKI pin parsing, HTTP response parsing
+  (chunked, interim, every truncation and limit).
+* `tests/uplink.rs` (in-memory transport, reference consumer): partial
+  acceptance with dead letters and acks, contract headers and signature,
+  per-finding signatures carried, line and byte limits, configuration
+  limits, transport-error retries with backoff, `5xx`/`429` retries with the
+  same batch id re-signed and `Retry-After` honoured, attempts exhausted
+  then resumed under the same id, refusals (`400`/`401`/`409`/`415`)
+  acknowledging nothing, malformed `200`s acknowledging nothing, `413`
+  halving and single-line `413`, crash at every step (pending saved,
+  response received, result saved, first ack) for spool and diode inputs,
+  input changed under a pending batch, state bound to its source kind,
+  sender key file rules.
+* `tests/uplink_https.rs` (in-process rustls HTTPS server, test PKI in
+  `tests/data/uplink-tls/`): partial acceptance, host name + pin + chunked
+  response, `401`, `413`, `429` + `Retry-After`, `5xx` with the same batch
+  id, `replayed: true` after a crash, SPKI pin mismatch refused before any
+  request, unknown CA / pin without chain / name mismatch / plain server
+  refused, `http://` to non-loopback refused, loopback `http://` works, a
+  server that never answers times out, the binary end to end (`--once`,
+  usage errors exit 2, unreachable server exit 1, `--version`).
+* `tests/ingest_vectors.rs`: the contract vectors (above).
 
 ## Real-broker test
 
@@ -308,6 +473,16 @@ partitioner all agreed with the real brokers.
   the diode README). Black-box bundles and `checkpoint.json` are not
   exported by this tool. `rejected/` is not counted in agentd's spool
   bounds.
+* **`robodr-uplink` limits.** Tested against the in-crate reference
+  consumer (CI) and, by hand on 2026-10-26, the static musl binary against
+  an OpenSSL-based Python TLS server (pin, host name); not yet against
+  AutoSecOps itself (Sprint 3 contract tests). One instance per state
+  directory (no lock file). Retries within a run are bounded
+  (`--max-attempts`); the binary then backs off between runs, so a `401`
+  (key not registered, clock off by more than 300 s) is retried slowly
+  forever with the batch kept, never dropped. No HTTP proxy support (the
+  sites are air-gapped or direct). `done/` markers and `dead-letter.jsonl`
+  grow like the publisher's.
 * The publisher's `done/` markers (one empty file per batch) and
   `dead-letter.jsonl` grow without bound; prune them together with the
   importer's `out/`. No signal handling: both tools are crash-safe by

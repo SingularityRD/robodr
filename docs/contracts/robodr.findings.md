@@ -632,7 +632,9 @@ records to Kafka are outside the crate (no network code).
   (`robodr_ocsf::record`). There the batch is authenticated by
   `MANIFEST.sig` (unit-bound diode key) instead, so SOC consumers behind a
   diode must run the §2a check in `Optional` mode or rely on the importer's
-  batch verification. Carrying it would need a signed per-finding sidecar
+  batch verification. `robodr-uplink --diode-out` (ingest API,
+  [`robodr.ingest-api.md`](robodr.ingest-api.md)) therefore sends these
+  findings with `"sig":null` under a `relay` key. Carrying it would need a signed per-finding sidecar
   (e.g. `finding-sigs.jsonl` listed and hashed in the manifest) and an
   importer that emits the original value bytes verbatim with the header
   (re-serialisation is byte-identical for builder output today — tested —
@@ -671,6 +673,14 @@ The two hops around the diode are implemented in `crates/robodr-export`
   offsets) replaced atomically after each acknowledged chunk, plus a done
   marker per batch; invalid or broker-rejected records go to a dead-letter
   file, deduplicated on (batch, line) across crashes.
+* **`robodr-uplink`** (connected robot / sensor box with `--spool`, or SOC
+  side behind the importer with `--diode-out`) sends the same records,
+  re-validated the same way, to the AutoSecOps ingest API
+  ([`robodr.ingest-api.md`](robodr.ingest-api.md)): signed NDJSON batches
+  over TLS, the value verbatim and the `robodr-finding-sig` header as the
+  line's `sig`, acknowledged only after a `200` names every line; batch ids
+  are derived from the input position and the body, so a crash-restart
+  re-sends the same batch under the same id.
 * **Producer settings actually used** (std-only client; verified against
   single-node Apache Kafka 3.9.1 and 4.1.0 with `scripts/kafka-it.sh`,
   including the §4 partition against the Java client's partitioner):

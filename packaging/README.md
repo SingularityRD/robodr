@@ -15,7 +15,9 @@ operator installs on a robot. The procedures that use it are in
 | `systemd/robodr-spool-export.service` | `/usr/lib/systemd/system/` | robot-side findings exporter for **diode sites**: agentd spool -> signed batches in `/var/lib/robodr/export/diode`; `User=robodr`, `PrivateNetwork=yes`, key via `LoadCredential=` (`/etc/robodr/keys/diode.key`), settings in `/etc/robodr/spool-export.env` (only if the binary is built) |
 | `systemd/robodr-kafka-publish.service` | `/usr/lib/systemd/system/` | findings publisher for **connected sites**, running on the unit or sensor box: agentd spool -> Kafka; `User=robodr`, `IPAddressDeny=any` plus the broker drop-in, settings in `/etc/robodr/kafka-publish.env`. Conflicts with the exporter above (only if the binary is built) |
 | `systemd/robodr-kafka-publish.service.d/50-brokers.conf.example` | `/usr/share/doc/robodr/examples/` | `IPAddressAllow=` for **every** Kafka broker (the publisher connects to each partition leader, not only to the bootstrap broker) |
-| `etc/spool-export.env.example`, `etc/kafka-publish.env.example` | `/usr/share/doc/robodr/examples/` | the two exporter units' site settings (unit id; bootstrap brokers) |
+| `systemd/robodr-uplink.service` | `/usr/lib/systemd/system/` | findings uplink to the SOC's AutoSecOps ingest API for **connected sites**, running on the unit or sensor box: agentd spool -> HTTPS (signed batches, CA bundle `/etc/robodr/uplink-ca.pem`, optional SPKI pin); `User=robodr`, key via `LoadCredential=` (`/etc/robodr/keys/uplink.key`), `IPAddressDeny=any` plus the SOC drop-in, settings in `/etc/robodr/uplink.env`. Conflicts with both units above (only if the binary is built) |
+| `systemd/robodr-uplink.service.d/50-soc.conf.example` | `/usr/share/doc/robodr/examples/` | `IPAddressAllow=` for the SOC ingest address(es) (map the URL's host name in `/etc/hosts`: DNS is not reachable) |
+| `etc/spool-export.env.example`, `etc/kafka-publish.env.example`, `etc/uplink.env.example` | `/usr/share/doc/robodr/examples/` | the three exporter units' site settings (unit id; bootstrap brokers; ingest URL and pin) |
 | `systemd/focal/*.service`, `systemd/focal/robodr-agentd.service.d/20-finding-key.conf.example` | `/usr/lib/systemd/system/` (and examples) of **`robodr-focal`** | systemd 245 variants (Ubuntu 20.04 / JetPack 5): `LoadCredential=` replaced by `robodr-load-credential`, no `ProtectProc=` / `ProcSubset=`; otherwise identical, enforced by `scripts/check-focal-units.py` |
 | `focal/robodr-load-credential` | `/usr/lib/robodr/` of **`robodr-focal`** | POSIX sh helper run as root (`ExecStartPre=+`): copies a root-only key to `/run/credentials/<unit>/<name>`, `0400` owned by the service user, in a root-owned `0711` directory; `clear` on stop |
 | `systemd/robodr-anchor-receiver.service` | `/usr/lib/systemd/system/` | **base station only**: remote head-anchor receiver (only if the binary is built; OPERATIONS 6.4, "Remote anchor"). Not yet checked with `systemd-analyze` |
@@ -45,7 +47,8 @@ The units, tmpfiles and sysusers fragments were checked with
 | `robodr-replay`, `robodr-ros2-watch` | operator tools | offline analysis and lab replay |
 | `robodr-anchor-receiver` | systemd service on a **base station**, dynamic user, no capabilities; never enabled on a robot | holds the robots' black-box head marks off the robots |
 | `robodr-spool-export` | systemd service (`User=robodr`, no network, no capabilities) on the **unit or sensor box** of a diode site | loops on agentd's spool and writes signed diode batches; the transfer to the diode is the site's procedure |
-| `robodr-kafka-publish` | systemd service (`User=robodr`, brokers only) on the **unit or sensor box** of a connected site; on a diode site it runs on the **SOC (high) side** after `robodr-diode-unpack`, from the SOC's own unit or procedure (`--diode-out`) | publishes findings to Kafka; one consumer per spool, so it conflicts with `robodr-spool-export` |
+| `robodr-kafka-publish` | systemd service (`User=robodr`, brokers only) on the **unit or sensor box** of a connected site; on a diode site it runs on the **SOC (high) side** after `robodr-diode-unpack`, from the SOC's own unit or procedure (`--diode-out`) | publishes findings to Kafka; one consumer per spool, so it conflicts with `robodr-spool-export` and `robodr-uplink` |
+| `robodr-uplink` | systemd service (`User=robodr`, SOC address only) on the **unit or sensor box** of a connected site; on a diode site it runs on the **SOC (high) side** after `robodr-diode-unpack` (`--diode-out`, a `relay` key), from the SOC's own unit or procedure | sends findings to the AutoSecOps ingest API over TLS; one consumer per spool, so it conflicts with the two units above |
 
 All services are installed **disabled**. A robot is commissioned first and its
 locked profile installed; then the operator enables the services
@@ -247,6 +250,11 @@ binaries (`robodr-focal`, arm64).
   on a robot. In a Ubuntu 24.04 container (not booted with systemd) they
   were: `install` of a `robodr-focal` bundle, then of a `robodr` bundle
   (dpkg removed `robodr-focal` in favour of `robodr`), then `rollback`.
+- `robodr-uplink.service` and its focal variant (added 2026-10-26) pass
+  `systemd-analyze verify` apart from the missing binary in the check
+  environment, and score 1.1 / 1.2 with `systemd-analyze security
+  --offline=yes` (systemd 255); not started by systemd, not checked from an
+  installed package.
 - The exporter units (`robodr-spool-export`, `robodr-kafka-publish`) and the
   `robodr-focal` units pass `systemd-analyze verify` (systemd 255, installed
   package, no warnings). `systemd-analyze security --offline=yes`

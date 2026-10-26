@@ -18,6 +18,11 @@
 //!   a connected site's spool) to Kafka, with the contract's key, partition
 //!   rule and headers; per-batch committed offsets persisted atomically;
 //!   at-least-once with at most one chunk re-sent after a crash.
+//! * [`uplink`] (robot / sensor box, or SOC side): the same inputs to the
+//!   AutoSecOps ingest API (`docs/contracts/robodr.ingest-api.md`): signed
+//!   NDJSON batches over TLS (rustls, ring), batch ids derived from the
+//!   input position and the body, the batch in flight persisted, records
+//!   acknowledged only after a `200` names them.
 //! * [`kafka`]: a minimal std-only Kafka producer (ApiVersions, Metadata,
 //!   Produce v3+ with RecordBatch v2 and CRC-32C ([`crc32c`]), `acks=all`,
 //!   no compression, no idempotence, **no TLS/SASL**).
@@ -33,7 +38,9 @@ mod fsutil;
 pub mod kafka;
 pub mod publish;
 pub mod spool_export;
+pub mod uplink;
 
 pub use fsutil::now_ms;
 pub use publish::{PublishConfig, PublishError, PublishReport, Publisher, Sink, Source};
 pub use spool_export::{ExportConfig, ExportError, ExportReport, Exporter};
+pub use uplink::{Uplink, UplinkConfig, UplinkError, UplinkReport};

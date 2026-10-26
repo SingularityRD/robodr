@@ -321,7 +321,7 @@ fn write_all_deadline(s: &mut TcpStream, mut buf: &[u8], deadline: Instant) -> i
 /// Resolve `addr` (`host:port`). IP literals never touch the resolver;
 /// host names are resolved on a helper thread waited for at most `timeout`
 /// (see the module docs).
-fn resolve(addr: &str, timeout: Duration) -> io::Result<Vec<SocketAddr>> {
+pub(crate) fn resolve(addr: &str, timeout: Duration) -> io::Result<Vec<SocketAddr>> {
     if let Ok(a) = addr.parse::<SocketAddr>() {
         return Ok(vec![a]);
     }

@@ -6,7 +6,7 @@ set -e
 case "$1" in
 remove | deconfigure)
     if [ -d /run/systemd/system ]; then
-        for u in robodr-spool-export.service robodr-kafka-publish.service \
+        for u in robodr-spool-export.service robodr-kafka-publish.service robodr-uplink.service \
             robodr-agentd.service robodr-pulsard.service robodr-anchor-receiver.service; do
             systemctl stop "$u" 2>/dev/null || true
         done

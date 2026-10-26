@@ -19,10 +19,15 @@
 # dist/static/<triple>), ready for packaging/build-deb.sh --variant focal.
 #
 # Linker: rust-lld, shipped with the Rust toolchain, for both triples (no C
-# cross compiler, no musl-gcc; the musl CRT objects and libc come from the
-# target's rust-std, "self-contained" linking). The pure crates have no C
-# code (all dependencies are pure Rust), so nothing else is needed. Set
+# cross linker, no musl-gcc; the musl CRT objects and libc come from the
+# target's rust-std, "self-contained" linking). Set
 # CARGO_TARGET_<TRIPLE>_LINKER yourself to override.
+#
+# C compiler: one dependency has C and assembly, `ring` (the crypto provider
+# of rustls, used by robodr-uplink's TLS); everything else is pure Rust.
+# `ring` is compiled with clang (CC_<triple>, default `clang`, which
+# cross-compiles for both triples; ring needs no libc headers beyond what
+# clang finds). Set CC_<triple> yourself to override.
 #
 # Executable layout: x86_64-unknown-linux-musl links static-pie (ASLR of the
 # image); the Rust aarch64-unknown-linux-musl target does not support
@@ -81,7 +86,15 @@ linker_var="CARGO_TARGET_$(printf '%s' "$triple" | tr 'a-z-' 'A-Z_')_LINKER"
 if [[ -z "${!linker_var:-}" ]]; then
     export "$linker_var=rust-lld"
 fi
-echo "build-static: $triple, linker ${!linker_var}, SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" >&2
+cc_var="CC_$(printf '%s' "$triple" | tr '-' '_')"
+if [[ -z "${!cc_var:-}" ]]; then
+    if ! command -v clang >/dev/null; then
+        echo "build-static: clang not found: it compiles ring's C/assembly for $triple (or set $cc_var)" >&2
+        exit 2
+    fi
+    export "$cc_var=clang"
+fi
+echo "build-static: $triple, linker ${!linker_var}, C compiler ${!cc_var}, SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" >&2
 
 if ! rustup target list --installed 2>/dev/null | grep -qx "$triple"; then
     echo "build-static: target $triple not installed: rustup target add $triple" >&2

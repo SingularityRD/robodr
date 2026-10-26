@@ -1343,7 +1343,9 @@ mode comes with the bundle exporter.
 
 **available** (`robodr-kafka-publish` verified against single-node Apache
 Kafka 3.9.1 and 4.1.0 brokers, see below). Two binaries carry
-agentd's findings to the SOC (contract section 8.1):
+agentd's findings to the SOC over a diode or Kafka (contract section 8.1);
+the ingest API path to AutoSecOps, `robodr-uplink`, is in section 8.5 (its
+unit conflicts with both units below):
 
 Both ship as systemd units (installed disabled, in `robodr` and
 `robodr-focal`); they consume the same spool, so they conflict: enable
@@ -1448,6 +1450,79 @@ publisher's principal.
 ```sh
 sudo journalctl -u 'robodr-*' --since "<last export>" -o export | gzip -9 > /var/lib/robodr/export/journal-$ts.export.gz
 ```
+
+### 8.5 Findings to the SOC ingest API (`robodr-uplink`)
+
+**available (producer)**; the AutoSecOps side (`/robot-edr/v2/ingest`) is
+built in Sprint 3 against the same contract
+(`docs/contracts/robodr.ingest-api.md`) and its shared test vectors. This
+is the primary path to the SOC (decision D1); Kafka (8.3) stays for
+third-party SIEMs. `robodr-uplink` reads the same inputs as
+`robodr-kafka-publish` and POSTs signed NDJSON batches over TLS; a record
+leaves the spool only after the server's `200` names it accepted or
+rejected (rejected ones: `/var/lib/robodr/export/uplink/dead-letter.jsonl`
+with the server's code, and `<spool>/rejected/`).
+
+```sh
+# Connected site, on the unit or sensor box.
+# 1. Sender key: register keys/uplink.key.pub in AutoSecOps as this
+#    robot's `uplink` key (no --key-id: the API names keys by the derived
+#    ed25519:<16 hex> id, printed by keygen).
+sudo robodr-blackbox keygen --out /etc/robodr/keys/uplink.key
+# 2. The SOC's CA certificate(s), and optionally the server key pin.
+sudo install -m 0644 soc-ca.pem /etc/robodr/uplink-ca.pem
+openssl x509 -in soc-server.pem -pubkey -noout | openssl pkey -pubin -outform der | sha256sum
+# 3. Settings, network allow-list, start.
+sudo install -m 0640 -o root -g robodr \
+    /usr/share/doc/robodr/examples/uplink.env.example /etc/robodr/uplink.env
+sudoedit /etc/robodr/uplink.env      # ROBODR_UPLINK_URL=, ROBODR_UPLINK_ARGS="--spki-sha256 <hex>"
+sudo install -D -m 0644 \
+    /usr/share/doc/robodr/examples/robodr-uplink.service.d/50-soc.conf.example \
+    /etc/systemd/system/robodr-uplink.service.d/50-soc.conf
+sudoedit /etc/systemd/system/robodr-uplink.service.d/50-soc.conf   # the SOC address
+echo '192.0.2.40 soc.example.org' | sudo tee -a /etc/hosts         # name of the certificate
+sudo systemctl daemon-reload && sudo systemctl enable --now robodr-uplink
+
+# Diode site, SOC side (high side), after robodr-diode-unpack (a SOC host
+# with its own layout; no unit is shipped for it). Register the key as a
+# `relay` key: diode findings carry no per-finding signature ("sig":null).
+robodr-uplink --url https://soc.example.org/api --key-file /etc/robodr-soc/relay.key \
+    --ca-bundle /etc/robodr-soc/ca.pem --state-dir /var/lib/robodr-soc/uplink \
+    --diode-out /var/lib/robodr-soc/import/out [--once]
+```
+
+`robodr-uplink.service` conflicts with `robodr-spool-export.service` and
+`robodr-kafka-publish.service` (one consumer per spool): enable exactly
+one. It denies every IP address except the drop-in's, DNS included, so the
+URL's host name must be in `/etc/hosts` (or the DNS server allowed in the
+drop-in); the name must match the server certificate.
+
+TLS is mandatory: the CA bundle is the only trust anchor, the URL host is
+the verified name, `--spki-sha256` (repeatable, for a key rotation) pins
+the server key in addition. Plain `http://` is accepted only to a loopback
+IP literal (a local TLS-terminating proxy). There is no switch that
+disables verification.
+
+Retries: network errors, `429` and `5xx` are retried with the same batch
+(same batch id, new timestamp and signature), backing off exponentially and
+never sooner than `Retry-After`; after `--max-attempts` the run fails and
+the service retries later with the same batch. Batch ids are derived from
+the input position and the body, so a restart after a crash re-sends the
+same batch under the same id and the server answers from its replay store
+(no double processing).
+
+Troubleshooting (journal, `journalctl -u robodr-uplink`):
+
+| Message | Cause, action |
+| --- | --- |
+| `HTTP 401 unknown_key` | the key is not registered in this workspace, revoked, or registered as a `finding` key: register `uplink.key.pub` (connected site: role `uplink`, bound to this robot) |
+| `HTTP 401 stale_timestamp` | the unit's clock is more than 300 s off the server's: fix NTP / the RTC |
+| `HTTP 401 bad_signature` | key file and registered public key differ (re-registered after a keygen?) |
+| `invalid peer certificate: ... matches no configured pin` | the server key changed: verify out of band, then update `--spki-sha256` (list old and new during a rotation) |
+| `invalid peer certificate: UnknownIssuer` / `NotValidForName` | wrong CA bundle, or the URL host is not the name in the certificate |
+| `HTTP 400` / `409` / `415` | a producer bug: report it with the journal lines; nothing was acknowledged |
+| dead letters with `robot_mismatch` | the findings name another robot than the key is bound to (a sensor box watching several robots needs a `relay` key, or one uplink per robot) |
+| dead letters with code `local` | the record failed RoboDR's own validation before sending (see `reason`) |
 
 ## 9. Decommissioning
 

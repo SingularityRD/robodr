@@ -28,7 +28,8 @@
 #   optional: robodr-pulsard (Pulsar-bound; needs the clang/eBPF toolchain)
 #             robodr-agentd, robodr-blackbox, robodr-diode-pack,
 #             robodr-diode-unpack, robodr-spool-export,
-#             robodr-kafka-publish (pure crates; the release requires them)
+#             robodr-kafka-publish, robodr-uplink (pure crates; the release
+#             requires them)
 #             robodr-anchor-receiver (pure; base-station side of the remote
 #             head anchor, installed with its unit when built)
 # A unit file is only installed together with its binary. ROBODR_DEB_REQUIRE
@@ -147,8 +148,9 @@ done
 
 units=usr/lib/systemd/system
 ex=usr/share/doc/robodr/examples
-# Exporters: robot side (diode) and connected-site publisher, each with its
-# unit, installed disabled. The two units conflict (one consumer per spool).
+# Exporters: robot side (diode), connected-site Kafka publisher and ingest
+# API uplink, each with its unit, installed disabled. The units conflict
+# (one consumer per spool).
 if install_bin robodr-spool-export usr/bin 0; then
     install -D -m 0644 "$unit_src/robodr-spool-export.service" "$pkg/$units/robodr-spool-export.service"
     install -D -m 0644 "$here/etc/spool-export.env.example" "$pkg/$ex/spool-export.env.example"
@@ -158,6 +160,13 @@ if install_bin robodr-kafka-publish usr/bin 0; then
     install -D -m 0644 "$here/etc/kafka-publish.env.example" "$pkg/$ex/kafka-publish.env.example"
     install -D -m 0644 "$here/systemd/robodr-kafka-publish.service.d/50-brokers.conf.example" \
         "$pkg/$ex/robodr-kafka-publish.service.d/50-brokers.conf.example"
+fi
+# Ingest API uplink (connected sites; conflicts with both units above).
+if install_bin robodr-uplink usr/bin 0; then
+    install -D -m 0644 "$unit_src/robodr-uplink.service" "$pkg/$units/robodr-uplink.service"
+    install -D -m 0644 "$here/etc/uplink.env.example" "$pkg/$ex/uplink.env.example"
+    install -D -m 0644 "$here/systemd/robodr-uplink.service.d/50-soc.conf.example" \
+        "$pkg/$ex/robodr-uplink.service.d/50-soc.conf.example"
 fi
 if [[ "$variant" == focal ]]; then
     for b in robodr-pulsard robodr-anchor-receiver; do

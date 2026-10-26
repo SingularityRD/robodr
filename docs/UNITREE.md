@@ -489,14 +489,24 @@ Findings use the `robodr.findings` contract, version **2.1.0**
   (`robot.ros2.*`, `robot.motion.*`, `robot.firewall.*`; the joint-frame
   and `robot.motion.api_id_out_of_range` entries are new in 2.1).
 * **Transport.** agentd writes signed findings to its spool and black box.
-  Two units, shipped disabled in both packages, carry them off the host
-  ([OPERATIONS.md section 8.3](OPERATIONS.md#83-findings-batches)); enable
-  exactly one (they conflict):
+  Three units, shipped disabled in both packages, carry them off the host
+  ([OPERATIONS.md sections 8.3 and 8.5](OPERATIONS.md#83-findings-batches));
+  enable exactly one (they conflict):
   * air-gapped site: `robodr-spool-export.service` packs them into signed
     diode batches in `/var/lib/robodr/export/diode` (no network at all:
-    `PrivateNetwork=yes`); `robodr-kafka-publish` then runs on the SOC
-    (high) side after `robodr-diode-unpack`;
-  * connected site (for example the sensor box's uplink):
+    `PrivateNetwork=yes`); `robodr-uplink --diode-out` (or
+    `robodr-kafka-publish`) then runs on the SOC (high) side after
+    `robodr-diode-unpack`;
+  * connected site (for example the sensor box's uplink), to the SOC's
+    AutoSecOps: `robodr-uplink.service` runs **on the unit or sensor box**
+    and sends agentd's spool to the ingest API over TLS (signed batches,
+    CA bundle plus optional key pin; its `50-soc.conf` drop-in allows
+    exactly the SOC address,
+    [OPERATIONS.md section 8.5](OPERATIONS.md#85-findings-to-the-soc-ingest-api-robodr-uplink)).
+    A sensor box that watches several robots sends findings naming each of
+    them, so register its key as a `relay` key (an `uplink` key is bound to
+    one robot and gets `robot_mismatch` for the others);
+  * connected site to a Kafka-based SIEM instead:
     `robodr-kafka-publish.service` runs **on the unit or sensor box** and
     publishes agentd's spool to the `robodr.findings` topic. Its
     `50-brokers.conf` drop-in allows exactly the Kafka broker set (every
