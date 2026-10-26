@@ -20,7 +20,8 @@
 # Environment:
 #   REPRO_SRC=dir          tree to copy (default: repo root)
 #   CARGO_FLAGS="..."      extra cargo flags, e.g. "--offline"
-#   REPRO_WORK=dir         scratch dir (default: mktemp -d)
+#   REPRO_WORK=dir         scratch dir, kept afterwards (default: a mktemp -d
+#                          dir, deleted when the script exits)
 #   SOURCE_DATE_EPOCH      override the commit timestamp
 #   CARGO_BUILD_TARGET     cross build (e.g. aarch64-unknown-linux-gnu): the
 #                          binaries are then read from target/<triple>/release
@@ -46,7 +47,14 @@ out="${1:-dist/repro}"
 mkdir -p "$out"
 out="$(cd "$out" && pwd)"
 read -r -a cargo_flags <<<"${CARGO_FLAGS:-}"
-work="${REPRO_WORK:-$(mktemp -d)}"
+if [[ -n "${REPRO_WORK:-}" ]]; then
+    work="$REPRO_WORK"
+else
+    # Our own scratch dir: two full source copies with their target/
+    # directories (hundreds of MB); removed on every exit.
+    work="$(mktemp -d)"
+    trap 'rm -rf "$work"' EXIT
+fi
 mkdir -p "$work"
 work="$(cd "$work" && pwd)"
 cargo_home="${CARGO_HOME:-$HOME/.cargo}"
