@@ -1327,3 +1327,69 @@ fn off_by_default_and_strict_config() {
     assert!(st.get("control_plane").is_none());
     assert!(!log.contains("control plane ("));
 }
+
+// ---------------------------------------------------------------------
+// Control plane v2 review regressions (each failed before its fix).
+// ---------------------------------------------------------------------
+
+fn unix_try(path: &Path, r: &Req) -> Result<Resp, String> {
+    let s = UnixStream::connect(path).map_err(|e| e.to_string())?;
+    s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    exchange_raw(s, &request_bytes(r))
+}
+
+/// Review finding 2: idle TCP peers that never authenticate used to take
+/// every slot of the one cap shared with the root-only unix socket. The
+/// unix socket has its own slots now, TCP handshakes / unauthenticated
+/// reads have theirs, and one source address cannot take them all.
+#[test]
+fn idle_tcp_peers_cannot_lock_out_the_unix_socket() {
+    let s = setup("cp-caps", &robot_profile(true));
+    let events = s.dir.join("ev.sock");
+    let control = s.dir.join("control.sock");
+    let soc_pub = write_soc_pub(&s.dir);
+    let port = free_port();
+    let mut cfg = base_config(&s, &events);
+    cfg["control_plane"] = json!({
+        "listen_tcp": format!("127.0.0.1:{port}"),
+        "unix_socket": control,
+        "state_dir": state_dir(&s),
+        "soc_keys": [soc_pub],
+        "rate_per_minute": 600,
+        "burst": 100,
+    });
+    let (stop, h) = spawn(s.resolve(&cfg));
+    wait_for(5, "control socket", || UnixStream::connect(&control).ok());
+    let base = format!("/api/v2/robots/{ROBOT}");
+    // Eight idle TCP connections (never a byte sent).
+    let idle: Vec<TcpStream> = (0..8)
+        .map(|_| TcpStream::connect(("127.0.0.1", port)).unwrap())
+        .collect();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let req = signed("GET", &base, b"");
+    let r = unix_try(&control, &req).expect("the unix socket must still answer");
+    assert_eq!(r.status, 200, "{}", r.body);
+    check_answer(&req, &r);
+    // The per-source cap: some of the eight were closed at once.
+    let mut closed_early = 0;
+    for mut c in idle {
+        c.set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .unwrap();
+        let mut b = [0u8; 1];
+        if matches!(c.read(&mut b), Ok(0)) {
+            closed_early += 1;
+        }
+    }
+    assert!(closed_early >= 6, "closed at accept: {closed_early}");
+    let st = status(&s.spool).unwrap();
+    assert!(
+        st["control_plane"]["connections_rejected"]
+            .as_u64()
+            .unwrap()
+            >= 6,
+        "{}",
+        st["control_plane"]
+    );
+    finish(stop, h);
+}

@@ -103,6 +103,9 @@ pub const MAX_SOC_KEYS: usize = 16;
 /// Longest a connection may take to complete its TLS handshake, and then
 /// (again) to send its request.
 pub const READ_DEADLINE: Duration = Duration::from_secs(5);
+/// Concurrent connections on the unix socket (root-only; its own slots,
+/// never shared with the TCP listener).
+pub const UNIX_CONNECTIONS: usize = 2;
 /// Calls waiting for the main loop.
 pub const CALL_QUEUE: usize = 16;
 /// Calls the main loop handles per iteration.
@@ -124,6 +127,9 @@ fn default_burst() -> u32 {
 }
 fn default_connections() -> usize {
     4
+}
+fn default_connections_per_source() -> usize {
+    2
 }
 fn default_requests() -> usize {
     1024
@@ -178,9 +184,16 @@ pub struct ControlPlaneSection {
     /// Burst per key, 1..=100.
     #[serde(default = "default_burst")]
     pub burst: u32,
-    /// Concurrent connections over all listeners, 1..=16.
+    /// Concurrent TCP connections, 1..=16, counted twice over: up to this
+    /// many still in the TLS handshake / unauthenticated request read, and
+    /// up to this many authenticated. The unix socket has its own slots
+    /// ([`UNIX_CONNECTIONS`]), so TCP peers cannot lock it out.
     #[serde(default = "default_connections")]
     pub max_connections: usize,
+    /// Concurrent TCP connections from one source address, 1..=16 (at
+    /// most `max_connections` take effect).
+    #[serde(default = "default_connections_per_source")]
+    pub max_connections_per_source: usize,
     /// Requests kept for GET / revert / idempotency, 16..=65536.
     #[serde(default = "default_requests")]
     pub max_requests: usize,
@@ -205,6 +218,7 @@ pub struct ControlPlaneSpec {
     pub rate_per_minute: u32,
     pub burst: u32,
     pub max_connections: usize,
+    pub max_connections_per_source: usize,
     pub max_requests: usize,
     pub answer_timeout: Duration,
     pub evidence: Option<evidence::EvidenceSection>,
@@ -293,6 +307,12 @@ impl ControlPlaneSection {
         range("rate_per_minute", u64::from(self.rate_per_minute), 1, 600)?;
         range("burst", u64::from(self.burst), 1, 100)?;
         range("max_connections", self.max_connections as u64, 1, 16)?;
+        range(
+            "max_connections_per_source",
+            self.max_connections_per_source as u64,
+            1,
+            16,
+        )?;
         range("max_requests", self.max_requests as u64, 16, 65_536)?;
         range("answer_timeout_ms", self.answer_timeout_ms, 100, 30_000)?;
         if let Some(e) = &self.evidence {
@@ -340,6 +360,7 @@ impl ControlPlaneSection {
             rate_per_minute: self.rate_per_minute,
             burst: self.burst,
             max_connections: self.max_connections,
+            max_connections_per_source: self.max_connections_per_source.min(self.max_connections),
             max_requests: self.max_requests,
             answer_timeout: Duration::from_millis(self.answer_timeout_ms),
             evidence: self.evidence.clone(),
@@ -542,8 +563,8 @@ struct Shared {
     calls: SyncSender<CallMsg>,
     answer_signer: Mutex<Box<dyn robodr_blackbox::Signer>>,
     answer_timeout: Duration,
-    active: AtomicUsize,
-    max_connections: usize,
+    tcp_slots: TcpSlots,
+    unix_active: AtomicUsize,
     stop: Arc<AtomicBool>,
     evidence: Option<Arc<evidence::Service>>,
 }
@@ -685,8 +706,8 @@ impl ControlPlane {
             calls: tx,
             answer_signer: Mutex::new(answer_signer),
             answer_timeout: spec.answer_timeout,
-            active: AtomicUsize::new(0),
-            max_connections: spec.max_connections,
+            tcp_slots: TcpSlots::new(spec.max_connections, spec.max_connections_per_source),
+            unix_active: AtomicUsize::new(0),
             stop: stop.clone(),
             evidence: evidence.clone(),
         });
@@ -895,18 +916,40 @@ fn run_tcp(l: TcpListener, tls: Option<Arc<rustls::ServerConfig>>, sh: Arc<Share
                 {
                     continue;
                 }
+                let Some(slot) = sh.tcp_slots.enter(addr.ip()) else {
+                    sh.counters
+                        .connections_rejected
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                };
+                let slot = Slot::Tcp(slot);
                 match &tls {
-                    None => spawn_conn(&sh, &mut conns, format!("tcp:{addr}"), move |sh, peer| {
-                        serve::<http::DeadlineTcp>(http::DeadlineTcp::new(s), peer, sh)
-                    }),
+                    None => spawn_conn(
+                        &sh,
+                        &mut conns,
+                        slot,
+                        format!("tcp:{addr}"),
+                        move |sh, slot, peer| {
+                            serve::<http::DeadlineTcp>(http::DeadlineTcp::new(s), peer, sh, slot)
+                        },
+                    ),
                     Some(cfg) => {
                         let cfg = cfg.clone();
-                        spawn_conn(&sh, &mut conns, format!("mtls:{addr}"), move |sh, peer| {
-                            match tls::accept(&cfg, s, Instant::now() + READ_DEADLINE) {
+                        spawn_conn(
+                            &sh,
+                            &mut conns,
+                            slot,
+                            format!("mtls:{addr}"),
+                            move |sh, slot, peer| match tls::accept(
+                                &cfg,
+                                s,
+                                Instant::now() + READ_DEADLINE,
+                            ) {
                                 Ok((stream, spki)) => serve::<tls::TlsStream>(
                                     stream,
                                     format!("{peer};client_spki_sha256={spki}"),
                                     sh,
+                                    slot,
                                 ),
                                 Err(why) => {
                                     sh.counters.tls_failures.fetch_add(1, Ordering::Relaxed);
@@ -915,8 +958,8 @@ fn run_tcp(l: TcpListener, tls: Option<Arc<rustls::ServerConfig>>, sh: Arc<Share
                                         robodr_ros2_pipeline::sanitize(&why)
                                     ));
                                 }
-                            }
-                        })
+                            },
+                        )
                     }
                 }
             }
@@ -946,8 +989,16 @@ fn run_unix(sock: crate::input::EventSocket, sh: Arc<Shared>) {
                     Ok(uid) => format!("unix:uid={uid}"),
                     Err(_) => "unix".to_string(),
                 };
-                spawn_conn(&sh, &mut conns, peer, move |sh, peer| {
-                    serve::<UnixStream>(s, peer, sh)
+                if sh.unix_active.fetch_add(1, Ordering::SeqCst) >= UNIX_CONNECTIONS {
+                    sh.unix_active.fetch_sub(1, Ordering::SeqCst);
+                    sh.counters
+                        .connections_rejected
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let slot = Slot::Unix(sh.clone());
+                spawn_conn(&sh, &mut conns, slot, peer, move |sh, slot, peer| {
+                    serve::<UnixStream>(s, peer, sh, slot)
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -962,28 +1013,148 @@ fn run_unix(sock: crate::input::EventSocket, sh: Arc<Shared>) {
     sock.remove_if_ours();
 }
 
-fn spawn_conn<F>(sh: &Arc<Shared>, conns: &mut Vec<JoinHandle<()>>, peer: String, f: F)
-where
-    F: FnOnce(&Shared, String) + Send + 'static,
-{
-    if sh.active.load(Ordering::SeqCst) >= sh.max_connections {
-        sh.counters
-            .connections_rejected
-            .fetch_add(1, Ordering::Relaxed);
-        return;
+/// The TCP listener's connection slots (review finding 2): `pre_auth`
+/// counts connections still in the TLS handshake or before their request
+/// authenticated, `authed` the authenticated ones (each up to `max`), and
+/// `per_source` bounds what one source address holds in all. The unix
+/// socket never uses these.
+#[derive(Debug)]
+pub struct TcpSlots {
+    max: usize,
+    max_per_source: usize,
+    inner: Arc<Mutex<SlotCounts>>,
+}
+
+#[derive(Debug, Default)]
+struct SlotCounts {
+    pre_auth: usize,
+    authed: usize,
+    per_source: BTreeMap<std::net::IpAddr, usize>,
+}
+
+/// A TCP connection's hold on [`TcpSlots`]; released on drop.
+#[derive(Debug)]
+pub struct TcpSlot {
+    inner: Arc<Mutex<SlotCounts>>,
+    max: usize,
+    ip: std::net::IpAddr,
+    authed: bool,
+}
+
+fn lock_counts(m: &Mutex<SlotCounts>) -> std::sync::MutexGuard<'_, SlotCounts> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl TcpSlots {
+    pub fn new(max: usize, max_per_source: usize) -> Self {
+        Self {
+            max,
+            max_per_source: max_per_source.min(max),
+            inner: Arc::new(Mutex::new(SlotCounts::default())),
+        }
     }
-    sh.active.fetch_add(1, Ordering::SeqCst);
+
+    /// A pre-authentication slot for a connection from `ip`, or `None`
+    /// (closed at once).
+    pub fn enter(&self, ip: std::net::IpAddr) -> Option<TcpSlot> {
+        let mut g = lock_counts(&self.inner);
+        let from_ip = g.per_source.get(&ip).copied().unwrap_or(0);
+        if g.pre_auth >= self.max || from_ip >= self.max_per_source {
+            return None;
+        }
+        g.pre_auth += 1;
+        g.per_source.insert(ip, from_ip + 1);
+        Some(TcpSlot {
+            inner: self.inner.clone(),
+            max: self.max,
+            ip,
+            authed: false,
+        })
+    }
+
+    /// (pre-authentication, authenticated) connections now.
+    pub fn counts(&self) -> (usize, usize) {
+        let g = lock_counts(&self.inner);
+        (g.pre_auth, g.authed)
+    }
+}
+
+impl TcpSlot {
+    /// Move to an authenticated slot; `false` when they are all taken.
+    pub fn authenticate(&mut self) -> bool {
+        if self.authed {
+            return true;
+        }
+        let mut g = lock_counts(&self.inner);
+        if g.authed >= self.max {
+            return false;
+        }
+        g.authed += 1;
+        g.pre_auth = g.pre_auth.saturating_sub(1);
+        self.authed = true;
+        true
+    }
+}
+
+impl Drop for TcpSlot {
+    fn drop(&mut self) {
+        let mut g = lock_counts(&self.inner);
+        if self.authed {
+            g.authed = g.authed.saturating_sub(1);
+        } else {
+            g.pre_auth = g.pre_auth.saturating_sub(1);
+        }
+        if let Some(n) = g.per_source.get_mut(&self.ip) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                g.per_source.remove(&self.ip);
+            }
+        }
+    }
+}
+
+/// What a connection thread holds: a unix slot or a TCP slot.
+enum Slot {
+    Unix(Arc<Shared>),
+    Tcp(TcpSlot),
+}
+
+impl Slot {
+    fn authenticate(&mut self) -> bool {
+        match self {
+            Slot::Unix(_) => true,
+            Slot::Tcp(t) => t.authenticate(),
+        }
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        if let Slot::Unix(sh) = self {
+            sh.unix_active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+fn spawn_conn<F>(
+    sh: &Arc<Shared>,
+    conns: &mut Vec<JoinHandle<()>>,
+    mut slot: Slot,
+    peer: String,
+    f: F,
+) where
+    F: FnOnce(&Shared, &mut Slot, String) + Send + 'static,
+{
     sh.counters.connections.fetch_add(1, Ordering::Relaxed);
     let s2 = sh.clone();
     match std::thread::Builder::new()
         .name("agentd-cp-conn".into())
         .spawn(move || {
-            f(&s2, peer);
-            s2.active.fetch_sub(1, Ordering::SeqCst);
+            f(&s2, &mut slot, peer);
+            drop(slot);
         }) {
         Ok(h) => conns.push(h),
         Err(_) => {
-            sh.active.fetch_sub(1, Ordering::SeqCst);
             sh.counters
                 .connections_rejected
                 .fetch_add(1, Ordering::Relaxed);
@@ -1172,7 +1343,7 @@ fn dispatch(sh: &Shared, call: Call, meta: Meta) -> Result<Answer, &'static str>
 /// Serve one connection: read, authenticate, route, hand to the main loop
 /// (or the evidence API), answer. Never panics; every exit writes an
 /// answer if the peer is there.
-fn serve<S: http::Stream>(mut s: S, peer: String, sh: &Shared) {
+fn serve<S: http::Stream>(mut s: S, peer: String, sh: &Shared, slot: &mut Slot) {
     let c = &sh.counters;
     let req = match http::read_request(&mut s, Instant::now() + READ_DEADLINE) {
         Ok(r) => r,
@@ -1210,6 +1381,7 @@ fn serve<S: http::Stream>(mut s: S, peer: String, sh: &Shared) {
         return fail(&mut s, f);
     }
     c.authenticated.fetch_add(1, Ordering::Relaxed);
+    let has_slot = slot.authenticate();
     // From here on the peer proved the key: every answer is signed.
     let answer = |s: &mut S, mut r: Reply| {
         s.set_write_deadline(Instant::now() + http::ANSWER_WRITE_DEADLINE);
@@ -1250,6 +1422,19 @@ fn serve<S: http::Stream>(mut s: S, peer: String, sh: &Shared) {
         }
         s.finish();
     };
+    if !has_slot {
+        c.busy.fetch_add(1, Ordering::Relaxed);
+        return answer(
+            &mut s,
+            Reply::json(
+                503,
+                &api::error_body(
+                    "busy",
+                    "every authenticated connection slot is taken; retry shortly",
+                ),
+            ),
+        );
+    }
     let route = route(&req.method, &req.target, &sh.robot_id);
     let is_chunk = matches!(route, Ok(Route::EvidenceChunk(..)));
     let limiter = if is_chunk { &sh.chunk_rate } else { &sh.rate };
@@ -1594,6 +1779,39 @@ fn evidence_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review finding 2: per-source and pre-/post-authentication slots.
+    #[test]
+    fn tcp_slots_are_bounded_per_source_and_per_phase() {
+        let ip = |n: u8| std::net::IpAddr::from([10, 0, 0, n]);
+        let slots = TcpSlots::new(3, 2);
+        let a1 = slots.enter(ip(1)).unwrap();
+        let mut a2 = slots.enter(ip(1)).unwrap();
+        assert!(slots.enter(ip(1)).is_none(), "per-source cap");
+        let b1 = slots.enter(ip(2)).unwrap();
+        assert!(slots.enter(ip(3)).is_none(), "pre-auth slots full");
+        // Authenticating frees a pre-auth slot (handshakes are counted
+        // apart from authenticated connections).
+        assert!(a2.authenticate());
+        assert_eq!(slots.counts(), (2, 1));
+        let mut c1 = slots.enter(ip(3)).unwrap();
+        assert!(c1.authenticate());
+        drop(a1);
+        drop(b1);
+        assert_eq!(slots.counts(), (0, 2));
+        // The source cap still counts the authenticated connection.
+        let a3 = slots.enter(ip(1)).unwrap();
+        assert!(slots.enter(ip(1)).is_none());
+        drop((a2, a3, c1));
+        assert_eq!(slots.counts(), (0, 0));
+        assert!(slots.inner.lock().unwrap().per_source.is_empty());
+        // Authenticated slots full: authenticate() says no.
+        let slots = TcpSlots::new(1, 1);
+        let mut x = slots.enter(ip(1)).unwrap();
+        assert!(x.authenticate());
+        let mut y = slots.enter(ip(2)).unwrap();
+        assert!(!y.authenticate());
+    }
 
     #[test]
     fn routes() {
