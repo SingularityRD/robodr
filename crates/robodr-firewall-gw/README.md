@@ -624,7 +624,8 @@ without touching the network.
    `bridge` table that bridges only IPv4 and ARP from the controller port;
    untracked traffic plus a no-op conntrack match so IPv4 defragmentation
    runs before the queue; the `ROBODR_GW` chain that drops fragments and
-   queues the DDS / legacy ports). `robodr-firewall-gw-rules.service`
+   queues the DDS / legacy ports; the `ROBODR_GW_OBS` chain that copies
+   the robot side's UDP to NFLOG). `robodr-firewall-gw-rules.service`
    (oneshot, before `network-pre.target`) applies it at boot.
 3. `robodr-firewall-gw.service` (`Type=notify`, `CAP_NET_ADMIN` only, no
    IP sockets, FIFO priority 40, watchdog 2 s). Focal (systemd 245)
