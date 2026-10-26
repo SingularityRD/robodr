@@ -9,6 +9,11 @@
 //!   system or built-in roots), is within its validity period and allows
 //!   `clientAuth` (rustls' WebPKI client verifier). A handshake without a
 //!   client certificate fails.
+//! * Optional `client_crl` (PEM, one or more X.509 v2 CRLs): the client
+//!   certificate chain is also checked for revocation, and a certificate
+//!   whose issuer has no CRL in the file is refused (unknown status fails
+//!   closed): give a current CRL of every CA in `client_ca`. Read at start
+//!   (restart agentd to load a new CRL); its `nextUpdate` is not enforced.
 //! * Optional `client_spki_sha256` pins: **in addition to** (never instead
 //!   of) the chain check, the SHA-256 of the client end-entity
 //!   certificate's DER `SubjectPublicKeyInfo` must be one of them. Several
@@ -29,7 +34,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
+use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::server::{NoServerSessionStorage, WebPkiClientVerifier};
 use rustls::{
@@ -50,6 +55,7 @@ pub const MAX_PINS: usize = 16;
 ///   "cert_chain": "/etc/robodr/control-plane/robot.pem",
 ///   "key_file": "/run/credentials/robodr-agentd.service/cp-tls.key",
 ///   "client_ca": "/etc/robodr/control-plane/soc-ca.pem",
+///   "client_crl": "/etc/robodr/control-plane/soc-ca.crl.pem",
 ///   "client_spki_sha256": ["<64 hex>"]
 /// }
 /// ```
@@ -59,6 +65,9 @@ pub struct TlsSection {
     pub cert_chain: PathBuf,
     pub key_file: PathBuf,
     pub client_ca: PathBuf,
+    /// Optional CRLs (PEM) of the client CAs (see the module docs).
+    #[serde(default)]
+    pub client_crl: Option<PathBuf>,
     #[serde(default)]
     pub client_spki_sha256: Vec<String>,
 }
@@ -72,6 +81,8 @@ pub struct TlsSpec {
     pub server_spki_sha256: String,
     pub client_cas: usize,
     pub client_pins: usize,
+    /// CRLs loaded from `client_crl` (0: no revocation check).
+    pub client_crls: usize,
 }
 
 impl fmt::Debug for TlsSpec {
@@ -80,6 +91,7 @@ impl fmt::Debug for TlsSpec {
             .field("server_spki_sha256", &self.server_spki_sha256)
             .field("client_cas", &self.client_cas)
             .field("client_pins", &self.client_pins)
+            .field("client_crls", &self.client_crls)
             .finish()
     }
 }
@@ -89,6 +101,7 @@ impl PartialEq for TlsSpec {
         self.server_spki_sha256 == o.server_spki_sha256
             && self.client_cas == o.client_cas
             && self.client_pins == o.client_pins
+            && self.client_crls == o.client_crls
     }
 }
 
@@ -212,12 +225,29 @@ impl TlsSection {
             )
         })?;
         let client_cas = roots.len();
-        let config = server_config(chain, key, roots, &pins)?;
+        let mut crls = Vec::new();
+        if let Some(p) = &self.client_crl {
+            let pem = read_pem("client_crl", p, euid, false)?;
+            for c in CertificateRevocationListDer::pem_slice_iter(&pem) {
+                crls.push(
+                    c.map_err(|e| format!("control_plane.tls.client_crl {}: {e}", p.display()))?,
+                );
+            }
+            if crls.is_empty() {
+                return Err(format!(
+                    "control_plane.tls.client_crl {}: no X509 CRL in it",
+                    p.display()
+                ));
+            }
+        }
+        let client_crls = crls.len();
+        let config = server_config(chain, key, roots, &pins, crls)?;
         Ok(TlsSpec {
             config,
             server_spki_sha256: robodr_blackbox::crypto::to_hex(&server_spki),
             client_cas,
             client_pins: pins.len(),
+            client_crls,
         })
     }
 }
@@ -228,12 +258,18 @@ pub fn server_config(
     key: PrivateKeyDer<'static>,
     client_roots: RootCertStore,
     pins: &[[u8; 32]],
+    crls: Vec<CertificateRevocationListDer<'static>>,
 ) -> Result<Arc<ServerConfig>, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let inner =
-        WebPkiClientVerifier::builder_with_provider(Arc::new(client_roots), provider.clone())
-            .build()
-            .map_err(|e| format!("control_plane.tls.client_ca: {e}"))?;
+    let mut b =
+        WebPkiClientVerifier::builder_with_provider(Arc::new(client_roots), provider.clone());
+    if !crls.is_empty() {
+        // The whole chain; an issuer without a CRL fails closed.
+        b = b.with_crls(crls);
+    }
+    let inner = b
+        .build()
+        .map_err(|e| format!("control_plane.tls.client_ca / client_crl: {e}"))?;
     let verifier: Arc<dyn ClientCertVerifier> = if pins.is_empty() {
         inner
     } else {
@@ -430,6 +466,7 @@ pub fn accept(
 mod tests {
     use super::*;
     use std::net::TcpListener;
+    use std::os::unix::fs::PermissionsExt;
     use std::thread;
 
     fn data(name: &str) -> PathBuf {
@@ -448,19 +485,24 @@ mod tests {
         for c in CertificateDer::pem_file_iter(data("soc-ca.pem")).unwrap() {
             roots.add(c.unwrap()).unwrap();
         }
-        server_config(chain, key, roots, &[]).unwrap()
+        server_config(chain, key, roots, &[], Vec::new()).unwrap()
     }
 
     fn client() -> Arc<rustls::ClientConfig> {
+        client_as("soc")
+    }
+
+    fn client_as(name: &str) -> Arc<rustls::ClientConfig> {
         let mut roots = RootCertStore::empty();
         for c in CertificateDer::pem_file_iter(data("robot-ca.pem")).unwrap() {
             roots.add(c.unwrap()).unwrap();
         }
-        let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(data("soc.pem"))
-            .unwrap()
-            .map(|c| c.unwrap())
-            .collect();
-        let key = PrivateKeyDer::from_pem_file(data("soc.key")).unwrap();
+        let chain: Vec<CertificateDer<'static>> =
+            CertificateDer::pem_file_iter(data(&format!("{name}.pem")))
+                .unwrap()
+                .map(|c| c.unwrap())
+                .collect();
+        let key = PrivateKeyDer::from_pem_file(data(&format!("{name}.key"))).unwrap();
         Arc::new(
             rustls::ClientConfig::builder_with_provider(Arc::new(
                 rustls::crypto::ring::default_provider(),
@@ -561,5 +603,76 @@ mod tests {
         );
         drop(stream);
         c.join().unwrap();
+    }
+
+    /// A full handshake of client `name` against `cfg`.
+    fn handshake(cfg: &Arc<ServerConfig>, name: &str) -> Result<(), String> {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let client = client_as(name);
+        let c = thread::spawn(move || {
+            let mut tcp = TcpStream::connect(addr).unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut conn = rustls::ClientConnection::new(
+                client,
+                rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap(),
+            )
+            .unwrap();
+            while conn.is_handshaking() {
+                if conn.complete_io(&mut tcp).is_err() {
+                    break;
+                }
+            }
+        });
+        let (s, _) = l.accept().unwrap();
+        let r = accept(cfg, s, Instant::now() + Duration::from_secs(5)).map(|_| ());
+        c.join().unwrap();
+        r
+    }
+
+    /// Review finding 9: an optional client CRL (`client_crl`): a revoked
+    /// SOC client certificate is refused, its unrevoked sibling accepted.
+    #[test]
+    fn a_client_crl_refuses_revoked_certificates() {
+        let d = std::env::temp_dir().join(format!("robodr-tls-crl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        for (f, mode) in [
+            ("robot.pem", 0o644),
+            ("robot.key", 0o600),
+            ("crl-ca.pem", 0o644),
+            ("crl-ca.crl.pem", 0o644),
+        ] {
+            std::fs::copy(data(f), d.join(f)).unwrap();
+            std::fs::set_permissions(d.join(f), std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let sec = |crl: bool| TlsSection {
+            cert_chain: d.join("robot.pem"),
+            key_file: d.join("robot.key"),
+            client_ca: d.join("crl-ca.pem"),
+            client_crl: crl.then(|| d.join("crl-ca.crl.pem")),
+            client_spki_sha256: Vec::new(),
+        };
+        let euid = crate::config::effective_uid();
+        // Without the CRL both connect.
+        let plain = sec(false).resolve(euid).unwrap();
+        assert_eq!(handshake(&plain.config, "soc-revoked"), Ok(()));
+        let with = sec(true).resolve(euid).unwrap();
+        assert_eq!(with.client_crls, 1);
+        assert_eq!(handshake(&with.config, "soc-crl"), Ok(()));
+        let e = handshake(&with.config, "soc-revoked").unwrap_err();
+        assert!(e.contains("Revoked"), "{e}");
+        // A file without a CRL in it is refused at load.
+        std::fs::copy(data("crl-ca.pem"), d.join("not-a-crl.pem")).unwrap();
+        std::fs::set_permissions(
+            d.join("not-a-crl.pem"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let mut bad = sec(true);
+        bad.client_crl = Some(d.join("not-a-crl.pem"));
+        let e = bad.resolve(euid).unwrap_err();
+        assert!(e.contains("client_crl"), "{e}");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

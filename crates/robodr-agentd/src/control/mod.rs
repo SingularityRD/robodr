@@ -379,6 +379,7 @@ impl ControlPlaneSection {
                 t.key_file.as_path(),
                 t.client_ca.as_path(),
             ]);
+            v.extend(t.client_crl.as_deref());
         }
         v
     }
@@ -825,6 +826,7 @@ impl ControlPlane {
                     "server_spki_sha256": t.server_spki_sha256,
                     "client_cas": t.client_cas,
                     "client_pins": t.client_pins,
+                    "client_crls": t.client_crls,
                 })
             }),
             state: st,
@@ -1192,14 +1194,20 @@ fn spawn_conn<F>(
     }
 }
 
-/// Percent-decode one path segment (`%XX` only; the result must be ASCII).
+/// Percent-decode one path segment (`%XX`, two hex digits, only; the
+/// result must be ASCII).
 pub fn pct_decode(seg: &str) -> Option<String> {
     let b = seg.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' {
-            let h = std::str::from_utf8(b.get(i + 1..i + 3)?).ok()?;
+            let hex = b.get(i + 1..i + 3)?;
+            // Two hex digits: from_str_radix alone would take a sign ("+1").
+            if !hex.iter().all(u8::is_ascii_hexdigit) {
+                return None;
+            }
+            let h = std::str::from_utf8(hex).ok()?;
             out.push(u8::from_str_radix(h, 16).ok()?);
             i += 3;
         } else {
@@ -1851,6 +1859,18 @@ fn evidence_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review finding 9: `%XX` takes two hex digits only; a sign
+    /// (`from_str_radix` accepts a leading `+`) is not one.
+    #[test]
+    fn pct_decode_takes_hex_digits_only() {
+        assert_eq!(pct_decode("a%3Ab").as_deref(), Some("a:b"));
+        assert_eq!(pct_decode("%+1"), None);
+        assert_eq!(pct_decode("x%+aY"), None);
+        assert_eq!(pct_decode("%-1"), None);
+        assert_eq!(pct_decode("%4"), None);
+        assert_eq!(pct_decode("%G0"), None);
+    }
 
     /// Review finding 2: per-source and pre-/post-authentication slots.
     #[test]
