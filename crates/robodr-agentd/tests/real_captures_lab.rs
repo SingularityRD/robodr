@@ -7,6 +7,8 @@ mod common;
 use common::*;
 use robodr_agentd::{State, StopReason, Summary};
 use robodr_commission::{LearnConfig, Learner, PcapSource};
+use robodr_events::Severity;
+use robodr_ocsf::FindingEnvelope;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -27,9 +29,9 @@ fn learned(file: &str) -> robodr_events::profile::Profile {
     l.finish().profile
 }
 
-/// Run the daemon over one capture: the summary and the spooled rule ids
-/// with their counts.
-fn run(learn_from: &str, file: &str) -> (Summary, BTreeMap<String, usize>) {
+/// Run the daemon over one capture: the summary, the spooled rule ids
+/// with their counts and the spooled findings.
+fn run(learn_from: &str, file: &str) -> (Summary, BTreeMap<String, usize>, Vec<FindingEnvelope>) {
     let s = setup(&format!("lab-{file}"), &learned(learn_from));
     let mut cfg = s.config(
         serde_json::json!({
@@ -54,14 +56,14 @@ fn run(learn_from: &str, file: &str) -> (Summary, BTreeMap<String, usize>) {
     for r in rules(&found) {
         *counts.entry(r).or_insert(0) += 1;
     }
-    (sum, counts)
+    (sum, counts, found.into_iter().map(|(_, e)| e).collect())
 }
 
 #[test]
 fn gazebo_baseline_with_live_feedback_raises_nothing_but_the_teleop_leaving() {
     for v in ["fastrtps", "cyclonedds"] {
         let f = format!("{v}_gz_baseline.pcap");
-        let (sum, counts) = run(&f, &f);
+        let (sum, counts, _) = run(&f, &f);
         assert!(sum.stats.motion_events > 500, "{v}: {:?}", sum.stats);
         let notable: Vec<&String> = counts
             .keys()
@@ -78,7 +80,7 @@ fn gazebo_baseline_with_live_feedback_raises_nothing_but_the_teleop_leaving() {
 #[test]
 fn gazebo_rogue_commands_are_rejected_and_the_monitor_stays_quiet() {
     for v in ["fastrtps", "cyclonedds"] {
-        let (_, counts) = run(
+        let (_, counts, found) = run(
             &format!("{v}_gz_baseline.pcap"),
             &format!("{v}_gz_rogue_cmd_vel.pcap"),
         );
@@ -88,12 +90,44 @@ fn gazebo_rogue_commands_are_rejected_and_the_monitor_stays_quiet() {
         let over = c("robot.motion.linear_over_envelope");
         assert!(over > 20, "{v}: {over}");
         assert_eq!(c("robot.firewall.rejected_unknown_source"), over, "{v}");
+        // The pcap is replayed unpaced and the monitor runs on the daemon's
+        // clock, so its timeline is the host's processing speed: the
+        // capture's ~16 s take a few ms here, ~16 s on a slow host. Near
+        // real time the monitor sees what the robot really did: the rogue's
+        // 3.0 m/s (rejected by the firewall in observe mode, i.e. still
+        // delivered) interleaved with the teleop's 0.3 m/s predicts more
+        // speed than the simulated odometry shows, one under-motion
+        // divergence (Medium), correlated with the rejection as a motion
+        // hijack. That is a legitimate detection (the baseline at the same
+        // pace stays quiet), allowed but not required; anything else from
+        // the monitor (opposite direction, uncommanded, frozen, ...) is not.
+        let allowed = [
+            "robot.motion.linear_over_envelope",
+            "robot.motion.feedback_divergence",
+        ];
         assert!(
             !counts
                 .keys()
-                .any(|r| r.starts_with("robot.motion.") && r != "robot.motion.linear_over_envelope"),
+                .any(|r| r.starts_with("robot.motion.") && !allowed.contains(&r.as_str())),
             "{v}: {counts:?}"
         );
+        let div = c("robot.motion.feedback_divergence");
+        assert!(div <= 1, "{v}: {counts:?}");
+        for e in found
+            .iter()
+            .filter(|e| e.entity_context.rule_id == "robot.motion.feedback_divergence")
+        {
+            assert_eq!(e.severity, Severity::Medium, "{v}");
+            assert!(
+                e.entity_context
+                    .detail
+                    .value
+                    .contains("robot moving less than commanded"),
+                "{v}: {}",
+                e.entity_context.detail.value
+            );
+        }
+        assert_eq!(c("robot.correlate.motion_hijack"), div, "{v}: {counts:?}");
     }
 }
 
@@ -104,7 +138,7 @@ fn two_odometry_publishers_merged_into_one_writer_are_noticed() {
     // bridge merges them into one ROS writer, so every second two samples
     // carry the same stamp. The monitor reports the duplicate stamp (and,
     // since the grace window, no longer an unattributed sample).
-    let (_, counts) = run("fastrtps_gz_baseline.pcap", "fastrtps_gz_dual_odom.pcap");
+    let (_, counts, _) = run("fastrtps_gz_baseline.pcap", "fastrtps_gz_dual_odom.pcap");
     assert_eq!(
         counts.get("robot.motion.frozen_feedback"),
         Some(&1),
@@ -118,7 +152,7 @@ fn two_odometry_publishers_merged_into_one_writer_are_noticed() {
 
 #[test]
 fn a_zenoh_bus_is_reported_and_never_ok() {
-    let (sum, counts) = run("fastrtps_baseline.pcap", "zenoh_rogue_cmd_vel.pcap");
+    let (sum, counts, _) = run("fastrtps_baseline.pcap", "zenoh_rogue_cmd_vel.pcap");
     assert_eq!(
         counts.get("robot.capture.unsupported_middleware"),
         Some(&1),
