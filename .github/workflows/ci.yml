@@ -109,13 +109,20 @@ jobs:
           python3 scripts/metadata_to_cyclonedx.py --self-test
           python3 scripts/ci-check-lockfile.py --self-test
           python3 scripts/ci-pure-excludes.py --self-test
+          python3 scripts/check-focal-units.py --self-test
+      - name: systemd-245 unit variants in step with the regular units
+        # packaging/systemd/focal/* (robodr-focal package, Ubuntu 20.04 /
+        # JetPack 5): same directives as the regular units except the
+        # LoadCredential= stand-in, and nothing newer than systemd 245.
+        run: python3 scripts/check-focal-units.py
       - name: Validate Pulsar rules (rules/) against vendor/pulsar
         # One rule that fails to load disables Pulsar's whole rules-engine.
         run: python3 scripts/validate_rules.py --pulsar-src vendor/pulsar --strict
       - name: shellcheck
         # CI scripts and the packaging scripts that run on the robot
-        # (install-bundle.sh) or build the release (build-deb.sh, make-bundle.sh).
-        run: shellcheck scripts/*.sh packaging/*.sh
+        # (install-bundle.sh, the maintainer scripts, the focal credential
+        # helper) or build the release (build-deb.sh, make-bundle.sh).
+        run: shellcheck scripts/*.sh packaging/*.sh packaging/deb/postinst packaging/deb/prerm packaging/deb/postrm packaging/focal/robodr-load-credential
 
   # ---------------------------------------------------------------------------
   pure:
@@ -367,5 +374,86 @@ jobs:
         with:
           name: release-sha256-${{ github.sha }}
           path: dist/repro/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  static:
+    # Static (musl) build of the pure binaries for hosts below glibc 2.39 /
+    # systemd 247, e.g. Unitree EDU computers on JetPack 5 (Ubuntu 20.04,
+    # glibc 2.31, systemd 245): docs/BUILD.md "Static (musl) build". Both
+    # targets are cross-linked with rust-lld on the x86-64 runner (the pure
+    # crates have no C code); the arm64 binaries are smoke-run under
+    # qemu-user. Then the robodr-focal .deb is assembled and checked.
+    name: Static musl build (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: amd64
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+    env:
+      TARGET: ${{ matrix.target }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # pulsar-core is a path dependency of the workspace manifest.
+          submodules: recursive
+          persist-credentials: false
+      - name: Install toolchain (rust-toolchain.toml) and the musl target
+        run: |
+          rustup toolchain install
+          rustup target add "$TARGET"
+      - name: Setup (mirror, --locked, Pulsar-bound excludes)
+        run: scripts/ci-setup.sh
+      - name: Linker (rust-lld, self-contained musl)
+        run: echo "CARGO_TARGET_$(printf '%s' "$TARGET" | tr 'a-z-' 'A-Z_')_LINKER=rust-lld" >> "$GITHUB_ENV"
+      - name: Reproducibility proof (pure binaries, two paths, musl)
+        env:
+          REPRO_REQUIRE_BINARIES: "1"
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
+        run: scripts/ci-repro.sh dist/repro-static
+      - name: Static build, checked (no interpreter, no shared library)
+        run: scripts/build-static.sh "$TARGET" --out "dist/static/$TARGET"
+      - name: Built binaries == reproduced binaries
+        run: (cd "dist/static/$TARGET" && sha256sum --strict -c "$GITHUB_WORKSPACE/dist/repro-static/SHA256SUMS")
+      - name: Smoke run (native, or qemu-user for arm64)
+        run: |
+          run=""
+          if [ "$ARCH" = arm64 ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends qemu-user-static
+            run=qemu-aarch64-static
+          fi
+          for b in robodr-agentd robodr-commission robodr-ros2-watch; do
+            $run "dist/static/$TARGET/$b" --version
+          done
+          $run "dist/static/$TARGET/robodr-blackbox" keygen --out "$RUNNER_TEMP/k"
+          test -s "$RUNNER_TEMP/k.pub"
+      - name: robodr-focal .deb (static binaries, systemd 245 units)
+        env:
+          ROBODR_DEB_REQUIRE: robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          deb=$(packaging/build-deb.sh --variant focal --bin-dir "dist/static/$TARGET" --arch "$ARCH" --out dist/focal)
+          dpkg-deb -I "$deb"
+          test "$(dpkg-deb -f "$deb" Package)" = robodr-focal
+          test "$(dpkg-deb -f "$deb" Depends)" = "systemd (>= 245)"
+          dpkg-deb -c "$deb" | grep -q ' ./usr/lib/robodr/robodr-load-credential$'
+          if dpkg-deb -c "$deb" | grep -q 'robodr-pulsard'; then
+            echo "::error::robodr-focal must not contain robodr-pulsard"
+            exit 1
+          fi
+      - name: Build did not modify tracked files
+        run: test -z "$(git status --porcelain --untracked-files=no)"
+      - name: Upload binary hashes
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: static-sha256-${{ matrix.target }}-${{ github.sha }}
+          path: dist/static/${{ matrix.target }}/SHA256SUMS
           if-no-files-found: error
           retention-days: 90

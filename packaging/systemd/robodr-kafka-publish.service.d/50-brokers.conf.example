@@ -1,0 +1,26 @@
+# EXAMPLE drop-in, not active as shipped. The Kafka broker set that
+# robodr-kafka-publish may reach (docs/OPERATIONS.md section 8.3). To use it:
+#   install -D -m 0644 50-brokers.conf.example \
+#       /etc/systemd/system/robodr-kafka-publish.service.d/50-brokers.conf
+#   (set the addresses below), then:
+#   systemctl daemon-reload && systemctl restart robodr-kafka-publish
+#
+# List EVERY broker of the cluster, not only the bootstrap one(s): the
+# publisher asks the bootstrap broker for metadata and then connects to the
+# leader of each partition at the address that broker ADVERTISES
+# (advertised.listeners). A leader that is not in this list is unreachable
+# and its partitions stall. Leadership moves (broker restart, rebalance), so
+# a partial list fails later, not at the first test.
+#
+# Use IP addresses, and have the brokers advertise IP-literal listeners: the
+# unit denies every other address, DNS servers included, so a broker that
+# advertises a host name resolves only through /etc/hosts. If the brokers
+# sit behind a local TLS proxy (stunnel), allow the proxy instead
+# (localhost) and point --bootstrap at it; the advertised listeners must
+# then resolve to the proxy too.
+#
+# All addresses below are documentation placeholders (RFC 5737): replace them.
+# A /32 per broker (or the broker subnet, if it holds nothing else).
+
+[Service]
+IPAddressAllow=192.0.2.21/32 192.0.2.22/32 192.0.2.23/32

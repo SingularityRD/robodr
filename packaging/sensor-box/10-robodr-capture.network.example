@@ -21,8 +21,9 @@
 #                    ip addr show <nic>      (no inet / inet6 lines)
 
 [Match]
-# TUNE: the capture NIC (by name, or better by MACAddress= / Path=).
-Name=enp2s0
+# TUNE: the capture NIC (by name, or better by MACAddress= / Path=);
+# eth1 as in agentd.unitree-sensor-box.example.json.
+Name=eth1
 
 [Link]
 Promiscuous=yes

@@ -1,0 +1,171 @@
+# robodr-agentd: RoboDR decision chain (event -> deviation -> plan -> black
+# ----------------------------------------------------------------------------
+# robodr-focal VARIANT for systemd 245 (Ubuntu 20.04, NVIDIA JetPack 5 / L4T
+# 35). Generated from packaging/systemd/robodr-agentd.service and kept in step with it by
+# scripts/check-focal-units.py (CI). Differences, all forced by systemd 245:
+#   * LoadCredential= (systemd 247) is replaced by
+#     /usr/lib/robodr/robodr-load-credential, run as root with the '+'
+#     prefix (outside the sandbox) in ExecStartPre=/ExecStopPost=; it puts
+#     the same file at the same /run/credentials/<unit>/ path, so the
+#     configuration is identical. The copy lives on /run (tmpfs, swappable),
+#     not on a private ramfs.
+#   * ProtectProc= and ProcSubset= (systemd 247) are dropped: every process
+#     of the host stays visible in this unit's /proc. Nothing replaces them
+#     on 245 (hidepid= is not per unit).
+# On a cgroup v1 / hybrid host (Ubuntu 20.04 default) MemoryHigh= has no
+# effect and MemoryMax= is applied as the v1 memory limit; IPAddressDeny=
+# needs the kernel's cgroup BPF support (CONFIG_CGROUP_BPF): if the journal
+# says "Proceeding WITHOUT firewalling in effect!" after the first start, it
+# is not enforced on this kernel.
+# ----------------------------------------------------------------------------
+# box -> OCSF finding) as a long-running daemon.
+#
+# PROTECTIVE ONLY. The agent detects, records evidence and *requests* a safe
+# state through the platform's own interface; it never overrides the safety
+# system, the e-stop or the platform's command authority, and nothing in the
+# robot's motion stack may depend on this unit being up.
+#
+# Checked against the merged robodr-agentd (crates/robodr-agentd):
+#   * CLI: `robodr-agentd --config <agentd.json> [--check-config]`; exit 0
+#     clean stop (SIGTERM/SIGINT seal the black box), 1 runtime failure,
+#     2 usage/configuration error (nothing started; not restarted, below).
+#   * /etc/robodr/agentd.json must set (absolute paths, strict JSON):
+#       "blackbox": { "dir": "/var/lib/robodr/blackbox/agentd",
+#                     "key_file": "/run/credentials/robodr-agentd.service/blackbox.key" },
+#       "spool":    { "dir": "/var/lib/robodr/spool/agentd" }
+#     The key file is a `robodr-blackbox keygen` secret key file (Ed25519 by
+#     default, robodr-blackbox-key/v2; key id taken from it; verifiers get
+#     only the FILE.pub). Legacy HMAC files and bare hex still load, with a
+#     start-up warning (the verifier could forge). A .pub file is refused.
+#     agentd refuses the key unless it is a regular file, mode
+#     without group/other bits and owned by root or the daemon's uid, which
+#     the credential copy (0400, owned by robodr) satisfies. An optional unix_socket event
+#     input belongs under /run/robodr-agentd/ (RuntimeDirectory= below; the
+#     socket is created 0600, so producers must run as User=robodr); so does
+#     the optional safety_feed socket (safety-PLC gateway).
+#   * Optional per-finding signing key (finding_signing.key_file): installed
+#     with the drop-in example 20-finding-key.conf.example (focal variant:
+#     one more robodr-load-credential load line), never the black-box key. Only agentd.full.example.json
+#     names it; agentd.example.json runs without the drop-in.
+#   * sd_notify (std-only, crates/robodr-agentd/src/notify.rs): READY=1 once
+#     started (Type=notify), WATCHDOG=1 from the main loop at most every 1 s,
+#     STATUS=state <ok|degraded|unknown> each tick, STOPPING=1 at shutdown.
+#     A main loop stalled for WatchdogSec= (slow fsync, hang) is killed and
+#     restarted. status.json carries updated_mono_ms / boot_id /
+#     stale_after_ms: consumers treat a stale status as `unknown`.
+#   * It reads /proc/sys/kernel/random/boot_id (chain identity) and
+#     /proc/net/{route,fib_trie,if_inet6} (default capture interfaces, local
+#     addresses for the binding check), so ProcSubset=pid must NOT be set.
+#
+# Verify after editing: systemd-analyze verify robodr-agentd.service
+#                       systemd-analyze security robodr-agentd.service
+
+[Unit]
+Description=RoboDR agent (decision chain, black box, OCSF spool)
+Documentation=file:/usr/share/doc/robodr/OPERATIONS.md
+AssertPathExists=/etc/robodr/agentd.json
+After=local-fs.target network.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/sbin/robodr-agentd --config /etc/robodr/agentd.json
+Restart=on-failure
+RestartSec=5s
+# Exit 2 = usage or configuration error: restarting cannot fix it.
+RestartPreventExitStatus=2
+TimeoutStopSec=30s
+# The main loop pings every <= 1 s; 60 s leaves room for a slow (but
+# progressing) fsync of critical evidence before the loop is declared hung.
+WatchdogSec=60s
+
+# --- Memory ------------------------------------------------------------------
+# agentd must never be the reason the motion stack is OOM-killed:
+#   * OOMScoreAdjust is POSITIVE: under system-wide memory pressure the
+#     kernel picks agentd before the platform's processes (default 0). Losing
+#     the monitor is visible (stale status.json, missing heartbeats, the
+#     watchdog/restart); losing the motion stack is a safety event.
+#   * MemoryMax= caps the whole unit, so a runaway agentd hits its own
+#     cgroup limit (and only agentd is killed, then restarted by
+#     Restart=on-failure) long before it can pressure the rest of the robot.
+#     Budget: input queue <= daemon.queue_bytes (default 32 MiB, max 256 MiB),
+#     pipeline/agent state bounded by their own caps, the black box streams
+#     to disk. MemoryHigh= throttles (reclaim) before the hard cap.
+#     These figures are estimates, not measured on the target: size them
+#     from the commissioning run (systemctl show -p MemoryPeak).
+OOMScoreAdjust=200
+MemoryHigh=384M
+MemoryMax=512M
+
+# --- Identity and capabilities ---------------------------------------------
+# Dedicated, unprivileged system user (packaging/sysusers.d/robodr.conf).
+User=robodr
+Group=robodr
+# The only privilege: read-only passive capture (AF_PACKET) of the robot's
+# DDS traffic. Ambient so the unprivileged process actually holds it;
+# bounded so it can never hold anything else.
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+NoNewPrivileges=yes
+UMask=0027
+
+# --- Key material ------------------------------------------------------------
+# robodr-load-credential (root, '+' prefix, outside the sandbox) reads the
+# root-only key file and places a copy, 0400 owned by User=, in a root-owned
+# 0711 directory that the service cannot write:
+#   /run/credentials/robodr-agentd.service/blackbox.key
+# It is removed when the unit stops. 'clear' first, so a credential that a
+# removed drop-in used to load does not linger. The robodr user itself has
+# no access to /etc/robodr/keys.
+ExecStartPre=+/usr/lib/robodr/robodr-load-credential clear robodr-agentd.service
+ExecStartPre=+/usr/lib/robodr/robodr-load-credential load robodr-agentd.service robodr blackbox.key:/etc/robodr/keys/agentd-blackbox.key
+ExecStopPost=+/usr/lib/robodr/robodr-load-credential clear robodr-agentd.service
+InaccessiblePaths=-/etc/robodr/keys
+
+# --- Filesystem --------------------------------------------------------------
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+# profile-state: the anti-rollback state (sensor.profile_trust.state_file,
+# /var/lib/robodr/profile-state/agentd.json), written atomically at start.
+# Without it the daemon cannot record the accepted profile and, failing
+# closed, runs observe-only.
+ReadWritePaths=/var/lib/robodr/blackbox/agentd /var/lib/robodr/spool/agentd /var/lib/robodr/profile-state
+# For an optional unix_socket event input (/run/robodr-agentd/events.sock).
+RuntimeDirectory=robodr-agentd
+RuntimeDirectoryMode=0750
+# No ProcSubset=pid: agentd reads /proc/sys/kernel/random/boot_id and
+# /proc/net/{route,fib_trie,if_inet6} (see the header).
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# --- Network -----------------------------------------------------------------
+# Read-only on networks: AF_PACKET for capture, AF_NETLINK/AF_UNIX for
+# interface lookup and the journal. AF_INET is kept only because interface
+# lookups (if_nametoindex/ioctl) may need a datagram socket; IPAddressDeny=
+# blocks all IP traffic from this unit (AF_PACKET capture is not affected).
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_PACKET AF_INET AF_INET6
+IPAddressDeny=any
+
+# --- Kernel interfaces / syscalls -------------------------------------------
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete @mount @swap @reboot @raw-io @cpu-emulation @clock @module @debug
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

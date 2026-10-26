@@ -54,14 +54,18 @@ verify_sums() {
     echo "install-bundle: checksums OK"
 }
 
+# The bundle holds one package: robodr, or robodr-focal (static build for
+# systemd 245 hosts). The two conflict; dpkg replaces one with the other.
 find_deb() {
     n=0
-    for d in "$here"/robodr_*.deb; do
+    for d in "$here"/robodr_*.deb "$here"/robodr-focal_*.deb; do
         [ -f "$d" ] || continue
         deb=$d
         n=$((n + 1))
     done
-    [ "$n" -eq 1 ] || die 1 "expected exactly one robodr_*.deb in $here, found $n"
+    [ "$n" -eq 1 ] || die 1 "expected exactly one robodr_*.deb or robodr-focal_*.deb in $here, found $n"
+    pkg=$(dpkg-deb -f "$deb" Package)
+    case "$pkg" in robodr | robodr-focal) ;; *) die 1 "unexpected package $pkg in $deb" ;; esac
 }
 
 pubkey=""
@@ -105,10 +109,17 @@ install)
     fi
     find_deb
     ver=$(dpkg-deb -f "$deb" Version)
-    prev=$(dpkg-query -W -f '${Version}' robodr 2>/dev/null || true)
-    echo "install-bundle: installing robodr $ver (currently installed: ${prev:-none})"
+    prev=""
+    for p in robodr robodr-focal; do
+        v=$(dpkg-query -W -f '${db:Status-Abbrev} ${Version}' "$p" 2>/dev/null || true)
+        case "$v" in ii*) prev="$prev $p ${v##* }" ;; esac
+    done
+    echo "install-bundle: installing $pkg $ver (currently installed:${prev:- none})"
     dpkg -i "$deb"
     install -d -m 0750 "$releases/$ver"
+    # One package per kept version: the variant installed last (robodr and
+    # robodr-focal share version numbers).
+    rm -f "$releases/$ver"/robodr_*.deb "$releases/$ver"/robodr-focal_*.deb
     install -m 0644 "$deb" "$releases/$ver/"
     (cd "$here" && install -m 0644 SHA256SUMS "$releases/$ver/SHA256SUMS")
     echo "install-bundle: kept $releases/$ver for rollback"
@@ -124,12 +135,15 @@ rollback)
     [ -d "$dir" ] || die 1 "release $version_arg not kept in $releases"
     (cd "$dir" && sha256sum --strict --quiet --ignore-missing -c SHA256SUMS) ||
         die 1 "kept release $version_arg fails its checksums"
-    set -- "$dir"/robodr_*.deb
-    if [ $# -ne 1 ] || [ ! -f "$1" ]; then
-        die 1 "expected exactly one .deb in $dir"
-    fi
-    echo "install-bundle: rolling back to robodr $version_arg"
-    dpkg -i "$1"
+    n=0
+    for d in "$dir"/robodr_*.deb "$dir"/robodr-focal_*.deb; do
+        [ -f "$d" ] || continue
+        deb=$d
+        n=$((n + 1))
+    done
+    [ "$n" -eq 1 ] || die 1 "expected exactly one .deb in $dir, found $n"
+    echo "install-bundle: rolling back to $(dpkg-deb -f "$deb" Package) $version_arg"
+    dpkg -i "$deb"
     ;;
 *)
     die 2 "unknown command $cmd (verify|install|list|rollback)"

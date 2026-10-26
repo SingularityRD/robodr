@@ -7,21 +7,33 @@
 # Policy: drop by default in every direction.
 #   * Capture NIC: nothing in, nothing out, ever. This does not affect
 #     capture: AF_PACKET taps see frames before netfilter.
-#   * Uplink NIC: out only to the SOC collector (findings export) and NTP;
-#     in only SSH from the admin network. No forwarding: the box is not a
-#     router between the robot network and the uplink.
+#   * Uplink NIC: out only to the Kafka brokers (findings export,
+#     robodr-kafka-publish.service) and NTP; in only SSH from the admin
+#     network. No forwarding: the box is not a router between the robot
+#     network and the uplink.
+# Kafka: the publisher connects to the bootstrap broker AND to every broker
+# the cluster advertises (the leader of each partition), so KAFKA_BROKERS
+# must hold every broker's advertised address, not one "collector" IP; a
+# leader that is missing here stalls its partitions after the next leader
+# change. Keep it equal to the IPAddressAllow= of the publisher's
+# 50-brokers.conf drop-in. A diode site exports with robodr-spool-export
+# (files, no network) and needs no Kafka rule at all: delete it.
 # All addresses below are documentation placeholders (RFC 5737) and must be
-# replaced. Use addresses, not host names: the box resolves no DNS.
+# replaced. Use addresses, not host names: the box resolves no DNS, so the
+# brokers must advertise IP-literal listeners (advertised.listeners) or be
+# listed in /etc/hosts.
+# Interface names: eth1 = capture NIC, eth0 = uplink, as in
+# agentd.unitree-sensor-box.example.json; use your box's names (ip link).
 # If the uplink uses DHCP or IPv6, add the DHCP (udp 67/68) and ICMPv6
 # neighbour discovery rules it needs; nothing here permits them.
 
 flush ruleset
 
 # TUNE
-define CAPTURE_IF = "enp2s0"
-define UPLINK_IF = "enp1s0"
-define SOC_COLLECTOR = 192.0.2.10
-define SOC_PORT = 9093
+define CAPTURE_IF = "eth1"
+define UPLINK_IF = "eth0"
+define KAFKA_BROKERS = { 192.0.2.21, 192.0.2.22, 192.0.2.23 }
+define KAFKA_PORT = 9092
 define NTP_SERVER = 192.0.2.123
 define ADMIN_NET = 192.0.2.64/28
 
@@ -46,7 +58,7 @@ table inet robodr_sensor_box {
         oifname $CAPTURE_IF drop
         ct state invalid drop
         ct state established,related accept
-        oifname $UPLINK_IF ip daddr $SOC_COLLECTOR tcp dport $SOC_PORT ct state new accept
+        oifname $UPLINK_IF ip daddr $KAFKA_BROKERS tcp dport $KAFKA_PORT ct state new accept
         oifname $UPLINK_IF ip daddr $NTP_SERVER udp dport 123 ct state new accept
     }
 }

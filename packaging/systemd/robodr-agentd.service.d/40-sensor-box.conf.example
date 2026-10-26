@@ -26,7 +26,7 @@
 #     (robodr-spool-export / robodr-kafka-publish, OPERATIONS.md), never from
 #     agentd itself. The host firewall
 #     (/usr/share/doc/robodr/examples/sensor-box/nftables.conf.example) allows
-#     the uplink only to the SOC collector, NTP and the admin network.
+#     the uplink only to the Kafka broker set, NTP and the admin network.
 #
 # Verify after installing: systemd-analyze verify robodr-agentd.service
 #                          systemd-analyze security robodr-agentd.service
@@ -37,11 +37,11 @@ Description=RoboDR agent, passive sensor box (tap / port mirror, no control plan
 # live on the writable, encrypted data mount. Order agentd after it and stop
 # it if the mount goes away, so evidence is never written to the root fs.
 RequiresMountsFor=/var/lib/robodr
-# TUNE: tie agentd to the capture NIC (here enp2s0), so it starts only once
+# TUNE: tie agentd to the capture NIC (here eth1), so it starts only once
 # the interface exists and stops if it disappears (systemd-escape the name
 # if it contains '-'):
-#BindsTo=sys-subsystem-net-devices-enp2s0.device
-#After=sys-subsystem-net-devices-enp2s0.device
+#BindsTo=sys-subsystem-net-devices-eth1.device
+#After=sys-subsystem-net-devices-eth1.device
 
 [Service]
 # --- Privilege: unchanged floor, stated again ---------------------------------
@@ -58,8 +58,10 @@ NoNewPrivileges=yes
 # 'localhost' for a control_plane.listen_tcp), so no control-plane listener
 # can be reached over IP. AF_PACKET capture is not affected by
 # IPAddressDeny= (the cgroup BPF filter applies to IP sockets only).
-# The uplink is used by the exporter, a separate process: restrict that one
-# with IPAddressAllow=<SOC collector> on its own unit or timer.
+# The uplink is used by the exporter, a separate process with its own unit:
+# robodr-kafka-publish.service (connected site; IPAddressAllow= for the
+# broker set in its 50-brokers.conf drop-in) or robodr-spool-export.service
+# (diode site; PrivateNetwork=yes, no network at all).
 IPAddressAllow=
 IPAddressDeny=any
 

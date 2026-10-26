@@ -134,6 +134,31 @@ Error with
 .TP
 .B 2
 Usage error.
+.SH SYSTEMD UNIT
+The package ships
+.B robodr\-kafka\-publish.service
+(installed disabled) for a connected site: it runs on the unit or sensor box
+as user
+.B robodr
+with
+.B \-\-spool /var/lib/robodr/spool/agentd
+and state in
+.IR /var/lib/robodr/export/kafka\-publish ;
+bootstrap brokers and extra flags come from
+.I /etc/robodr/kafka\-publish.env
+.RB ( ROBODR_KAFKA_BOOTSTRAP ,
+.BR ROBODR_KAFKA_PUBLISH_ARGS ).
+The unit denies every IP address; the drop\-in example
+.I 50\-brokers.conf.example
+allows the brokers. List every broker of the cluster: the publisher connects
+to the leader of each partition at its advertised address, not only to the
+bootstrap broker. Use IP literals (and IP\-literal advertised listeners): DNS
+servers are not reachable from the unit. It conflicts with
+.B robodr\-spool\-export.service
+(one consumer per spool). On a diode site this program runs on the SOC side
+with
+.B \-\-diode\-out
+instead, from the SOC's own unit or procedure.
 .SH SEE ALSO
 .BR robodr\-spool\-export (1),
 .BR robodr\-diode\-unpack (1),

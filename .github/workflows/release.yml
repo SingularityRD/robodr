@@ -16,6 +16,10 @@
 #   robodr-<ver>-<arch>-offline.tar.gz          air-gapped install bundle
 #   robodr-<ver>-<arch>-sbom.tar.gz             CycloneDX SBOMs (cargo-cyclonedx)
 #   SHA256SUMS-<arch>                           per-arch hashes (build job)
+#   robodr-focal_<debver>_<arch>.deb            static (musl) build for systemd
+#                                               245 / glibc 2.31 hosts (JetPack 5)
+#   robodr-focal-<ver>-<arch>-offline.tar.gz    its install bundle
+#   SHA256SUMS-focal-<arch>                     per-arch hashes (build-static job)
 # and once: SHA256SUMS (all assets) plus a minisign signature (*.minisig) for
 # every asset and for SHA256SUMS.
 #
@@ -209,9 +213,98 @@ jobs:
           retention-days: 90
 
   # ---------------------------------------------------------------------------
+  build-static:
+    # robodr-focal: the pure binaries as static musl executables (no libc6
+    # dependency) with systemd 245 units, for Ubuntu 20.04 / NVIDIA JetPack 5
+    # hosts such as Unitree EDU computers (docs/UNITREE.md 3.2, docs/BUILD.md
+    # "Static (musl) build"). Both targets are cross-linked with rust-lld on
+    # the x86-64 runner; no robodr-pulsard (needs a BTF kernel).
+    name: Build and package robodr-focal (${{ matrix.arch }})
+    needs: prepare
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            target: aarch64-unknown-linux-musl
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      ARCH: ${{ matrix.arch }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install toolchain (rust-toolchain.toml) and the musl target
+        run: |
+          rustup toolchain install
+          rustup target add "$TARGET"
+      - name: Setup (mirror, --locked, Pulsar-bound excludes)
+        run: scripts/ci-setup.sh
+      - name: Linker (rust-lld, self-contained musl)
+        run: echo "CARGO_TARGET_$(printf '%s' "$TARGET" | tr 'a-z-' 'A-Z_')_LINKER=rust-lld" >> "$GITHUB_ENV"
+      - name: Reproducibility proof (pure binaries, two paths, musl)
+        env:
+          REPRO_REQUIRE_BINARIES: "1"
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
+        run: scripts/ci-repro.sh dist/repro-static
+      - name: Static release build, checked (no interpreter, no shared library)
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          scripts/build-static.sh "$TARGET" --out "dist/static/$TARGET"
+      - name: Released static binaries == reproduced binaries
+        run: (cd "dist/static/$TARGET" && sha256sum --strict -c "$GITHUB_WORKSPACE/dist/repro-static/SHA256SUMS")
+      - name: Smoke run (native, or qemu-user for arm64)
+        run: |
+          run=""
+          if [ "$ARCH" = arm64 ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends qemu-user-static
+            run=qemu-aarch64-static
+          fi
+          for b in robodr-agentd robodr-commission robodr-ros2-watch; do
+            $run "dist/static/$TARGET/$b" --version
+          done
+      - name: Cargo.lock unchanged
+        run: git diff --exit-code -- Cargo.lock
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked --version "$CARGO_CYCLONEDX_VERSION"
+      - name: SBOM (CycloneDX)
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          SBOM_TOOL=cyclonedx scripts/sbom.sh dist/sbom
+      - name: robodr-focal package and offline bundle
+        env:
+          ROBODR_DEB_REQUIRE: robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          deb=$(packaging/build-deb.sh --variant focal --bin-dir "dist/static/$TARGET" --arch "$ARCH" --out dist/release)
+          test "$(dpkg-deb -f "$deb" Depends)" = "systemd (>= 245)"
+          packaging/make-bundle.sh --deb "$deb" --sbom-dir dist/sbom --out dist/release
+          (cd dist/release && sha256sum robodr-focal* > "SHA256SUMS-focal-$ARCH")
+          cat "dist/release/SHA256SUMS-focal-$ARCH"
+      - name: Upload to the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber dist/release/*
+      - name: Keep a workflow copy
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-focal-${{ matrix.arch }}-${{ github.sha }}
+          path: dist/release
+          if-no-files-found: error
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
   publish:
     name: Checksums, sign, publish
-    needs: [prepare, build]
+    needs: [prepare, build, build-static]
     runs-on: ubuntu-24.04
     # Secrets live in this environment only; give it required reviewers.
     environment: release
@@ -234,7 +327,7 @@ jobs:
       - name: Check per-arch hashes, write SHA256SUMS
         working-directory: ${{ runner.temp }}/rel
         run: |
-          for a in amd64 arm64; do
+          for a in amd64 arm64 focal-amd64 focal-arm64; do
             test -s "SHA256SUMS-$a"
             sha256sum --strict -c "SHA256SUMS-$a"
           done

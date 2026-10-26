@@ -11,7 +11,13 @@ operator installs on a robot. The procedures that use it are in
 | `systemd/robodr-agentd.service.d/20-finding-key.conf.example` | `/usr/share/doc/robodr/examples/` | optional drop-in: `LoadCredential=` for the per-finding signing key (OPERATIONS 6.4) |
 | `systemd/robodr-agentd.service.d/40-sensor-box.conf.example` | `/usr/share/doc/robodr/examples/` | **sensor box only**: passive tap / port-mirror mode of `robodr-agentd` (`CAP_NET_RAW` only, all IP denied, waits for the writable data mount; [`docs/UNITREE.md`](../docs/UNITREE.md)) |
 | `sensor-box/10-robodr-capture.network.example` | `/usr/share/doc/robodr/examples/sensor-box/` | **sensor box only**: systemd-networkd file for the capture NIC (no address, no ARP, no IPv6 link-local, promiscuous) |
-| `sensor-box/nftables.conf.example` | `/usr/share/doc/robodr/examples/sensor-box/` | **sensor box only**: host firewall (capture NIC silent, uplink to the SOC collector, NTP and admin SSH only, no forwarding) |
+| `sensor-box/nftables.conf.example` | `/usr/share/doc/robodr/examples/sensor-box/` | **sensor box only**: host firewall (capture NIC silent, uplink to the Kafka broker set, NTP and admin SSH only, no forwarding) |
+| `systemd/robodr-spool-export.service` | `/usr/lib/systemd/system/` | robot-side findings exporter for **diode sites**: agentd spool -> signed batches in `/var/lib/robodr/export/diode`; `User=robodr`, `PrivateNetwork=yes`, key via `LoadCredential=` (`/etc/robodr/keys/diode.key`), settings in `/etc/robodr/spool-export.env` (only if the binary is built) |
+| `systemd/robodr-kafka-publish.service` | `/usr/lib/systemd/system/` | findings publisher for **connected sites**, running on the unit or sensor box: agentd spool -> Kafka; `User=robodr`, `IPAddressDeny=any` plus the broker drop-in, settings in `/etc/robodr/kafka-publish.env`. Conflicts with the exporter above (only if the binary is built) |
+| `systemd/robodr-kafka-publish.service.d/50-brokers.conf.example` | `/usr/share/doc/robodr/examples/` | `IPAddressAllow=` for **every** Kafka broker (the publisher connects to each partition leader, not only to the bootstrap broker) |
+| `etc/spool-export.env.example`, `etc/kafka-publish.env.example` | `/usr/share/doc/robodr/examples/` | the two exporter units' site settings (unit id; bootstrap brokers) |
+| `systemd/focal/*.service`, `systemd/focal/robodr-agentd.service.d/20-finding-key.conf.example` | `/usr/lib/systemd/system/` (and examples) of **`robodr-focal`** | systemd 245 variants (Ubuntu 20.04 / JetPack 5): `LoadCredential=` replaced by `robodr-load-credential`, no `ProtectProc=` / `ProcSubset=`; otherwise identical, enforced by `scripts/check-focal-units.py` |
+| `focal/robodr-load-credential` | `/usr/lib/robodr/` of **`robodr-focal`** | POSIX sh helper run as root (`ExecStartPre=+`): copies a root-only key to `/run/credentials/<unit>/<name>`, `0400` owned by the service user, in a root-owned `0711` directory; `clear` on stop |
 | `systemd/robodr-anchor-receiver.service` | `/usr/lib/systemd/system/` | **base station only**: remote head-anchor receiver (only if the binary is built; OPERATIONS 6.4, "Remote anchor"). Not yet checked with `systemd-analyze` |
 | `systemd/robodr-pulsard.service.d/10-cap-sys-admin.conf.example` | `/usr/share/doc/robodr/examples/` | opt-in for kernels < 5.8 |
 | `systemd/robodr-pulsard.service.d/30-host-threats.conf.example` | `/usr/share/doc/robodr/examples/` | optional drop-in: `SupplementaryGroups=robodr` so `robodr-threat-forward` can reach agentd's `0660` host-threat socket (OPERATIONS 6.4) |
@@ -19,7 +25,7 @@ operator installs on a robot. The procedures that use it are in
 | `sysusers.d/robodr.conf` | `/usr/lib/sysusers.d/` | the `robodr` system user |
 | `etc/pulsar.base.toml` | header of `/etc/robodr/pulsar.toml` | daemon config (conffile) |
 | `deb/` | `DEBIAN/` | control template, maintainer scripts |
-| `build-deb.sh` | (build time) | reproducible `.deb` from built binaries |
+| `build-deb.sh` | (build time) | reproducible `.deb` from built binaries: `robodr` (default) or `robodr-focal` (`--variant focal`, static binaries only) |
 | `make-bundle.sh` | (build time) | offline install bundle |
 | `install-bundle.sh` | inside the bundle | verify, install, list, roll back on the robot |
 
@@ -38,8 +44,10 @@ The units, tmpfiles and sysusers fragments were checked with
 | `robodr-commission` | **not a service**: run by an operator, as needed | commissioning is a deliberate, human-reviewed act (learn, sign off, lock). A timer or unit that re-learns a profile automatically would let an attacker who is present during learning become "normal". |
 | `robodr-replay`, `robodr-ros2-watch` | operator tools | offline analysis and lab replay |
 | `robodr-anchor-receiver` | systemd service on a **base station**, dynamic user, no capabilities; never enabled on a robot | holds the robots' black-box head marks off the robots |
+| `robodr-spool-export` | systemd service (`User=robodr`, no network, no capabilities) on the **unit or sensor box** of a diode site | loops on agentd's spool and writes signed diode batches; the transfer to the diode is the site's procedure |
+| `robodr-kafka-publish` | systemd service (`User=robodr`, brokers only) on the **unit or sensor box** of a connected site; on a diode site it runs on the **SOC (high) side** after `robodr-diode-unpack`, from the SOC's own unit or procedure (`--diode-out`) | publishes findings to Kafka; one consumer per spool, so it conflicts with `robodr-spool-export` |
 
-Both services are installed **disabled**. A robot is commissioned first and its
+All services are installed **disabled**. A robot is commissioned first and its
 locked profile installed; then the operator enables the services
 (`docs/OPERATIONS.md`).
 
@@ -156,9 +164,16 @@ choice here is **root-only files, handed to each service by systemd**
 4. **`InaccessiblePaths=-/etc/robodr/keys`** in both units hides the directory
    even from `robodr-pulsard`, which runs as root.
 
-Fallback for systemd < 247 (no `LoadCredential=`; Ubuntu 22.04 has 249 and
-24.04 has 255, so this should not arise): `0640 root:robodr`, and accept
-point 1 above.
+**systemd < 247** (no `LoadCredential=`: Ubuntu 20.04 and NVIDIA JetPack 5
+have 245). The `robodr-focal` units keep the files root-only and use
+`/usr/lib/robodr/robodr-load-credential` from `ExecStartPre=+` instead: it
+places the same copy at the same `/run/credentials/<unit>/<name>` path
+(`0400`, owned by the service user, in a root-owned `0711` directory the
+service cannot write) and `ExecStopPost=+` removes it. Points 2 to 4 above
+hold; point 1 holds except that the copy is on `/run` (tmpfs, swappable)
+rather than a private ramfs. A group-readable `0640 root:robodr` key is
+**not** an option: agentd and the blackbox key loader refuse any key file
+with a group or other permission bit.
 
 **Ed25519 is the default** (`robodr-blackbox keygen` writes the secret
 `FILE`, `0600`, and the public `FILE.pub`). Only the secret goes into
@@ -178,20 +193,40 @@ the unit can read. A TPM-held, non-exportable key is the planned fix; the
 cargo build --release --workspace --locked   # plus Pulsar deps for robodr-pulsard
 packaging/build-deb.sh --bin-dir target/release --arch amd64 --out dist
 packaging/make-bundle.sh --deb dist/robodr_*_amd64.deb --sbom-dir dist/sbom --out dist
+
+# robodr-focal (static, systemd 245; docs/BUILD.md "Static (musl) build"):
+rustup target add aarch64-unknown-linux-musl
+scripts/build-static.sh aarch64-unknown-linux-musl          # -> dist/static/<triple>
+packaging/build-deb.sh --variant focal --bin-dir dist/static/aarch64-unknown-linux-musl --arch arm64 --out dist
+packaging/make-bundle.sh --deb dist/robodr-focal_*_arm64.deb --sbom-dir dist/sbom --out dist
 ```
 
 `build-deb.sh` requires `robodr-commission`, `robodr-replay` and
 `robodr-ros2-watch`. It adds `robodr-pulsard`, `robodr-agentd`,
 `robodr-blackbox`, `robodr-diode-pack`, `robodr-diode-unpack`,
-`robodr-spool-export` (robot side: agentd spool -> diode outbox) and
-`robodr-kafka-publish` (SOC side: importer output or a connected spool ->
-Kafka) if they were built, and installs each unit (and each man page) only
-together with its binary. The release workflow sets `ROBODR_DEB_REQUIRE` to
-all seven, so a release cannot silently ship without them. The two exporters
-ship without systemd units (run them from a timer or the transfer procedure;
-see `docs/OPERATIONS.md`).
+`robodr-spool-export` (robot side of a diode site: agentd spool -> diode
+outbox) and `robodr-kafka-publish` (on the unit or sensor box of a connected
+site from agentd's spool, or on the SOC side of a diode site from the
+importer's output) if they were built, and installs each unit (and each man
+page) only together with its binary. The release workflow sets
+`ROBODR_DEB_REQUIRE` to all seven, so a release cannot silently ship without
+them. Both exporters ship with a unit (`robodr-spool-export.service`,
+`robodr-kafka-publish.service`, conflicting with each other) for the
+robot / sensor-box side; see `docs/OPERATIONS.md` section 8.3.
+
+`--variant focal` builds `robodr-focal` instead: it takes the same binaries
+built static (`scripts/build-static.sh`) and **refuses** any binary with a
+program interpreter or a shared-library dependency, so its only dependency
+is `systemd (>= 245)` (no libc6 at all). It uses the units in
+`systemd/focal/`, adds `robodr-load-credential`, and leaves out
+`robodr-pulsard` (needs a BTF kernel; JetPack 5 has none) and
+`robodr-anchor-receiver` (base station: use `robodr` there). The two
+packages `Conflicts:`/`Replaces:` each other; switching is one `dpkg -i`
+(checked: dpkg removes the other package; configuration, keys and evidence
+stay).
 Building twice with the same `SOURCE_DATE_EPOCH` gives an identical `.deb`;
-this was checked with stub binaries.
+this was checked with stub binaries (`robodr`) and with the real static
+binaries (`robodr-focal`, arm64).
 
 ## Not verified
 
@@ -209,4 +244,20 @@ this was checked with stub binaries.
   finding-signing key with its drop-in (`20-finding-key.conf.example`). The daemon itself has not
   run under this unit on a real host (see the first point).
 - `install-bundle.sh install` and `rollback` have not been run against `dpkg`
-  on a target. Only `verify` and the bundle round-trip were exercised.
+  on a robot. In a Ubuntu 24.04 container (not booted with systemd) they
+  were: `install` of a `robodr-focal` bundle, then of a `robodr` bundle
+  (dpkg removed `robodr-focal` in favour of `robodr`), then `rollback`.
+- The exporter units (`robodr-spool-export`, `robodr-kafka-publish`) and the
+  `robodr-focal` units pass `systemd-analyze verify` (systemd 255, installed
+  package, no warnings). `systemd-analyze security --offline=yes`
+  (systemd 255; lower is better): spool-export 0.4, kafka-publish 1.1,
+  agentd 1.5; their focal variants 0.5, 1.2 and 1.6 (no `ProtectProc=` /
+  `ProcSubset=`). None has
+  been started by systemd. The `robodr-focal` start sequence was simulated
+  without systemd as root: `robodr-load-credential load`, then the static
+  `robodr-agentd` (`--check-config`, a 5 s run on `lo`, black box verified
+  intact) and `robodr-spool-export --once` as user `robodr` with the copied
+  keys, then `clear`. systemd 245 itself was not available: its handling of
+  these units (the `+` prefix, `@system-service` of 245, cgroup v1) is
+  unverified, and so is `robodr-kafka-publish` against a broker from the
+  unit (the binary is covered by `scripts/kafka-it.sh`).
