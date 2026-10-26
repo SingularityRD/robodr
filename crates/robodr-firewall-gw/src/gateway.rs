@@ -46,6 +46,10 @@ pub struct PacketMeta {
     pub queue_delay_ns: Option<u64>,
     /// Wall-clock instant (identity leases).
     pub instant: Instant,
+    /// Source MAC of the frame (`NFQA_HWADDR`), when the kernel reported
+    /// one. Part of a writer's binding (see the crate docs, "Sequence
+    /// numbers and writer binding").
+    pub src_mac: Option<[u8; 6]>,
 }
 
 /// What happened to one decided sample.
@@ -100,6 +104,20 @@ pub struct GatewayStats {
     /// Observe mode: packets that enforcement would have changed.
     pub observe_would_modify: u64,
     pub observe_would_drop: u64,
+    /// Samples of an authorised GUID from another (IP, MAC) than the one
+    /// the writer's stream is bound to (suppressed, state untouched).
+    pub binding_conflicts: u64,
+    /// Sequence-number jumps beyond `rtps.max_sn_jump` held back until
+    /// confirmed (suppressed, state untouched).
+    pub sn_jumps: u64,
+    /// Writer restarts (lower sequence number after a new SEDP
+    /// announcement) that reset a writer's sequence state.
+    pub writer_restarts: u64,
+    /// Unknown-writer DATA_FRAG / key-only / non-standard samples that
+    /// cannot be probed (suppressed in enforce mode).
+    pub unknown_undecidable: u64,
+    /// `LowCmd_` frames refused for a non-motor field (`bms_cmd.off`).
+    pub non_motor_rejected: u64,
 }
 
 /// One cached decision for a writer's sequence number.
@@ -112,16 +130,53 @@ struct CacheEntry {
 
 const RING: usize = 8;
 
+/// Where a sample came from on the wire: its source IP and, when the
+/// kernel reported it, its source MAC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Binding {
+    ip: Ipv4Addr,
+    mac: Option<[u8; 6]>,
+}
+
+/// Per writer GUID and enforced channel: the sequence / replay state of the
+/// stream the robot's reader sees under that GUID. Only samples of the
+/// authorised source **from the bound (IP, MAC)** change it (see the crate
+/// docs, "Sequence numbers and writer binding").
 #[derive(Debug, Clone, Default)]
 struct WriterState {
+    /// The (IP, MAC) of the last sample forwarded under this GUID.
+    bound: Option<Binding>,
+    /// Gateway clock of the last sample seen from the bound side (forwarded
+    /// or not): its liveness for a takeover.
+    bound_at: u64,
+    /// Highest sequence number forwarded under this GUID (passed, limited
+    /// or substitute): the replay boundary and the jump anchor.
     last_sn: Option<i64>,
+    /// An unconfirmed jump (> `max_sn_jump` past `last_sn`) and the binding
+    /// it came from.
+    pending_jump: Option<(i64, Binding)>,
+    /// An SEDP announcement / removal of this writer from the bound IP was
+    /// seen since the last forwarded sample: the next lower sequence number
+    /// may be a restart.
+    restart_armed: bool,
     used: u64,
-    source: Option<(SourceId, u64, Ipv4Addr)>,
+    /// What the GUID resolves to in the policy, whatever IP it came from
+    /// (cached per identity epoch).
+    claimed: Option<(SourceId, u64)>,
     ring: Vec<CacheEntry>,
     next: usize,
 }
 
 impl WriterState {
+    /// Forget the sequence state (writer restart); the binding stays.
+    fn reset_sequence(&mut self) {
+        self.last_sn = None;
+        self.pending_jump = None;
+        self.restart_armed = false;
+        self.ring.clear();
+        self.next = 0;
+    }
+
     fn remember(&mut self, sn: i64, bytes: Option<&[u8]>) {
         let entry = if self.ring.len() < RING {
             self.ring.push(CacheEntry { sn, bytes: None });
@@ -166,6 +221,8 @@ struct Channel {
     legacy_sources: Vec<(Ipv4Addr, SourceId)>,
     allowed_api_ids: Option<Vec<i64>>,
     allowed_modes: Option<Vec<u8>>,
+    allowed_macs: Vec<[u8; 6]>,
+    allow_battery_off: bool,
     writers: HashMap<Guid, WriterState>,
     max_writers: usize,
     tick: u64,
@@ -186,15 +243,16 @@ impl Channel {
         self.tick += 1;
         let tick = self.tick;
         if !self.writers.contains_key(g) && self.writers.len() >= self.max_writers {
-            // Evict a writer whose source resolved to a foreign one first
-            // (least recently used among those), so a flood of spoofed
-            // GUIDs cannot push out the authorised writer's sequence /
-            // replay state.
+            // Evict a writer that never forwarded anything first (least
+            // recently used among those), so a flood of spoofed GUIDs
+            // cannot push out the authorised writer's sequence / replay
+            // state.
             if let Some(old) = self
                 .writers
                 .iter()
                 .min_by_key(|(_, w)| {
-                    let authorised = w.source.is_some_and(|(s, _, _)| s != SourceId::UNKNOWN);
+                    let authorised =
+                        w.bound.is_some() || w.claimed.is_some_and(|(s, _)| s != SourceId::UNKNOWN);
                     (authorised, w.used)
                 })
                 .map(|(k, _)| *k)
@@ -210,6 +268,24 @@ impl Channel {
     fn ip_allowed(&self, ip: Ipv4Addr) -> bool {
         self.allowed_ips.is_empty() || self.allowed_ips.contains(&ip)
     }
+
+    fn mac_allowed(&self, mac: Option<[u8; 6]>) -> bool {
+        self.allowed_macs.is_empty() || mac.is_some_and(|m| self.allowed_macs.contains(&m))
+    }
+}
+
+/// Parse `aa:bb:cc:dd:ee:ff` (also `-` separated, any case).
+pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let mut out = [0u8; 6];
+    let mut parts = s.split([':', '-']);
+    for b in out.iter_mut() {
+        let p = parts.next()?;
+        if p.len() != 2 {
+            return None;
+        }
+        *b = u8::from_str_radix(p, 16).ok()?;
+    }
+    parts.next().is_none().then_some(out)
 }
 
 /// The in-path gateway (see the crate docs).
@@ -220,6 +296,8 @@ pub struct Gateway {
     rtps_ranges: Vec<(u16, u16)>,
     malformed: MalformedPolicy,
     unknown_writers: UnknownWriters,
+    max_sn_jump: i64,
+    binding_takeover_ns: u64,
     discovery: Discovery,
     samples: Vec<Sample>,
     scratch: Vec<u8>,
@@ -390,6 +468,12 @@ impl Gateway {
                 legacy_sources,
                 allowed_api_ids: c.allowed_api_ids.clone(),
                 allowed_modes: c.allowed_high_modes.clone(),
+                allowed_macs: c
+                    .allowed_src_macs
+                    .iter()
+                    .map(|m| parse_mac(m).ok_or_else(|| format!("{at}: bad MAC {m}")))
+                    .collect::<Result<_, _>>()?,
+                allow_battery_off: c.allow_battery_off,
                 writers: HashMap::new(),
                 max_writers: cfg.rtps.max_writers_per_channel,
                 tick: 0,
@@ -413,6 +497,8 @@ impl Gateway {
             rtps_ranges: cfg.rtps_port_ranges(),
             malformed: cfg.rtps.malformed_datagram,
             unknown_writers: cfg.rtps.unknown_writers,
+            max_sn_jump: i64::try_from(cfg.rtps.max_sn_jump).unwrap_or(i64::MAX),
+            binding_takeover_ns: cfg.rtps.binding_takeover_ns,
             discovery: Discovery::new(topics, cfg.rtps.max_writers, IdentityResolver::new(profile)),
             samples: Vec::with_capacity(rtps::MAX_SAMPLES),
             scratch: Vec::with_capacity(65_536),
@@ -523,6 +609,10 @@ impl Gateway {
                 if sum.has_builtin {
                     self.stats.discovery_datagrams += 1;
                     self.discovery.learn(d, src, meta.instant);
+                    self.arm_restarts(Binding {
+                        ip: src,
+                        mac: meta.src_mac,
+                    });
                 }
                 let mut modified = false;
                 for s in samples.iter().filter(|s| !s.builtin) {
@@ -543,13 +633,55 @@ impl Gateway {
         out
     }
 
-    fn classify(&mut self, d: &[u8], s: &Sample) -> Option<usize> {
+    /// An SEDP / SPDP datagram from `from` announced or removed writers:
+    /// arm a restart for each such writer whose stream is bound to the
+    /// same IP (and MAC, when both are known).
+    fn arm_restarts(&mut self, from: Binding) {
+        let hints = self.discovery.take_announced();
+        if hints.is_empty() {
+            return;
+        }
+        for ch in &mut self.channels {
+            for (g, w) in ch.writers.iter_mut() {
+                let hit = hints.iter().any(|h| {
+                    if h.whole_participant {
+                        h.guid[..12] == g[..12]
+                    } else {
+                        h.guid == *g
+                    }
+                });
+                let same = w.bound.is_some_and(|b| {
+                    b.ip == from.ip
+                        && match (b.mac, from.mac) {
+                            (Some(x), Some(y)) => x == y,
+                            _ => true,
+                        }
+                });
+                if hit && same {
+                    w.restart_armed = true;
+                }
+            }
+        }
+    }
+
+    /// The enforced channel of a user sample's writer: its SEDP / persisted
+    /// classification, else (`unknown_writers: probe`) a content probe.
+    /// `Err(())`: an unknown writer's sample that cannot be probed
+    /// (DATA_FRAG, key-only, non-standard): suppressed in enforce mode.
+    fn classify(&mut self, d: &[u8], s: &Sample) -> Result<Option<usize>, ()> {
         if let Some(w) = self.discovery.writer(&s.writer) {
-            return w.channel;
+            return Ok(w.channel);
         }
         if self.unknown_writers == UnknownWriters::Pass {
-            return None;
+            return Ok(None);
         }
+        if s.kind == SampleKind::DataFrag || s.non_standard || s.content == Content::Key {
+            return Err(());
+        }
+        Ok(self.probe(d, s))
+    }
+
+    fn probe(&mut self, d: &[u8], s: &Sample) -> Option<usize> {
         let slot = d.get(s.payload.clone()?)?;
         let found = self.channels.iter().position(|c| match c.codec {
             Codec::UnitreeGoLowcmd | Codec::UnitreeHgLowcmd => {
@@ -589,16 +721,31 @@ impl Gateway {
         Some(found)
     }
 
-    fn resolve_rtps_source(&mut self, ci: usize, writer: &Guid, ip: Ipv4Addr) -> SourceId {
+    /// `(claimed, source)`: what the writer GUID resolves to in the policy,
+    /// and the source the sample is decided as (`UNKNOWN` when the IP or
+    /// MAC is not allowed on the channel, whatever the GUID claims).
+    fn resolve_rtps_source(
+        &mut self,
+        ci: usize,
+        writer: &Guid,
+        ip: Ipv4Addr,
+        mac: Option<[u8; 6]>,
+    ) -> (SourceId, SourceId) {
+        let claimed = self.claimed_source(ci, writer);
+        let allowed = self
+            .channels
+            .get(ci)
+            .is_some_and(|ch| ch.ip_allowed(ip) && ch.mac_allowed(mac));
+        (claimed, if allowed { claimed } else { SourceId::UNKNOWN })
+    }
+
+    fn claimed_source(&mut self, ci: usize, writer: &Guid) -> SourceId {
         let epoch = self.discovery.epoch;
         let Some(ch) = self.channels.get_mut(ci) else {
             return SourceId::UNKNOWN;
         };
-        if !ch.ip_allowed(ip) {
-            return SourceId::UNKNOWN;
-        }
-        if let Some((s, e, cip)) = ch.writers.get(writer).and_then(|w| w.source) {
-            if e == epoch && cip == ip {
+        if let Some((s, e)) = ch.writers.get(writer).and_then(|w| w.claimed) {
+            if e == epoch {
                 return s;
             }
         }
@@ -617,7 +764,7 @@ impl Gateway {
             })
             .unwrap_or(SourceId::UNKNOWN);
         if let Some(ch) = self.channels.get_mut(ci) {
-            ch.writer_mut(writer).source = Some((s, epoch, ip));
+            ch.writer_mut(writer).claimed = Some((s, epoch));
         }
         s
     }
@@ -629,8 +776,17 @@ impl Gateway {
         src: Ipv4Addr,
         meta: PacketMeta,
     ) -> Outcome {
-        let Some(ci) = self.classify(d, s) else {
-            return Outcome::Pass;
+        let ci = match self.classify(d, s) {
+            Ok(Some(ci)) => ci,
+            Ok(None) => return Outcome::Pass,
+            Err(()) => {
+                // An unknown writer's fragment / key-only / non-standard
+                // sample: the probe cannot read it, so it could be a motion
+                // command nobody checked (see the crate docs).
+                self.stats.unknown_undecidable += 1;
+                self.stats.suppressed += 1;
+                return Outcome::Suppress;
+            }
         };
         self.stats.samples += 1;
         if s.kind == SampleKind::DataFrag || s.non_standard || s.content == Content::Key {
@@ -649,22 +805,73 @@ impl Gateway {
             self.stats.suppressed += 1;
             return Outcome::Suppress;
         }
-        // Retransmission / replay of an already decided sequence number:
-        // re-emit exactly what was forwarded then (or suppress again); the
-        // firewall is not consulted and its state does not move.
-        let last_sn = self
-            .channels
-            .get(ci)
-            .and_then(|c| c.writers.get(&s.writer))
-            .and_then(|w| w.last_sn);
-        if last_sn.is_some_and(|l| s.sn <= l) {
+        let binding = Binding {
+            ip: src,
+            mac: meta.src_mac,
+        };
+        let (claimed, source) = self.resolve_rtps_source(ci, &s.writer, src, meta.src_mac);
+        let late = meta
+            .queue_delay_ns
+            .is_some_and(|q| q > self.max_queue_delay_ns);
+        if source == SourceId::UNKNOWN {
+            // Foreign (unknown GUID, or a GUID from an IP / MAC the channel
+            // does not allow): decided so the firewall records it, but it
+            // never touches the writer's sequence state, and nothing is
+            // forwarded under a GUID the policy authorises or that carries
+            // an authorised stream (its sequence number would move the
+            // robot reader's for the genuine writer).
+            let guarded = claimed != SourceId::UNKNOWN
+                || self
+                    .channels
+                    .get(ci)
+                    .and_then(|c| c.writers.get(&s.writer))
+                    .is_some_and(|w| w.bound.is_some() || w.last_sn.is_some());
+            if late {
+                self.stats.late += 1;
+            }
+            let o = self.decide_sample(ci, &mut d[range], source, meta.now_ns, late, !guarded);
+            self.count(o);
+            return o;
+        }
+        let jump = self.max_sn_jump;
+        let takeover = self.binding_takeover_ns;
+        let now = meta.now_ns;
+        let Some(ch) = self.channels.get_mut(ci) else {
+            return Outcome::Suppress;
+        };
+        let w = ch.writer_mut(&s.writer);
+        // 1. Binding: while the stream is live from one (IP, MAC), the same
+        //    GUID from another one is a conflict, never forwarded.
+        if let Some(b) = w.bound {
+            if b != binding {
+                if now.saturating_sub(w.bound_at) <= takeover {
+                    self.stats.binding_conflicts += 1;
+                    self.stats.suppressed += 1;
+                    return Outcome::Suppress;
+                }
+                // The bound side has been silent past the takeover time:
+                // another binding may continue the GUID's stream (the
+                // sequence boundary stays: it is what the robot has seen).
+                w.bound = None;
+                w.pending_jump = None;
+                w.restart_armed = false;
+            }
+        }
+        let from_bound = w.bound == Some(binding);
+        if from_bound {
+            // Liveness of the bound side: any sample of it, decided or not.
+            w.bound_at = now;
+        }
+        // 2. Replay / retransmission, or a restart the writer announced.
+        let below = w.last_sn.is_some_and(|l| s.sn <= l);
+        if below && w.restart_armed && from_bound && s.sn <= jump {
+            w.reset_sequence();
+            self.stats.writer_restarts += 1;
+        } else if below || w.lookup(s.sn).is_some() {
+            // Re-emit exactly what was forwarded then (or suppress again);
+            // the firewall is not consulted and its state does not move.
             self.stats.replays += 1;
-            let cached = self
-                .channels
-                .get(ci)
-                .and_then(|c| c.writers.get(&s.writer))
-                .and_then(|w| w.lookup(s.sn))
-                .and_then(|e| e.bytes.clone());
+            let cached = w.lookup(s.sn).and_then(|e| e.bytes.clone());
             return match cached {
                 Some(b) if b.len() == range.len() => {
                     self.stats.replays_reemitted += 1;
@@ -682,34 +889,71 @@ impl Gateway {
                 }
             };
         }
-        let source = self.resolve_rtps_source(ci, &s.writer, src);
-        let late = meta
-            .queue_delay_ns
-            .is_some_and(|q| q > self.max_queue_delay_ns);
+        // 3. A jump past the window is held until the next sample of the
+        //    same binding confirms it.
+        if let Some(l) = w.last_sn {
+            if s.sn.saturating_sub(l) > jump {
+                let confirmed = w.pending_jump.is_some_and(|(p, pb)| {
+                    pb == binding && s.sn > p && s.sn.saturating_sub(p) <= jump
+                });
+                if !confirmed {
+                    w.pending_jump = Some((s.sn, binding));
+                    self.stats.sn_jumps += 1;
+                    self.stats.suppressed += 1;
+                    return Outcome::Suppress;
+                }
+            }
+        }
+        // 4. Decide.
         if late {
             self.stats.late += 1;
         }
-        let codec = self.channels.get(ci).map(|c| c.codec);
-        let outcome = match codec {
-            Some(Codec::UnitreeGoLowcmd | Codec::UnitreeHgLowcmd) => {
-                self.lowcmd_sample(ci, &mut d[range.clone()], source, meta.now_ns, late)
-            }
-            Some(Codec::UnitreeSportRequest) => {
-                self.sport_sample(ci, &mut d[range.clone()], source, meta.now_ns, late)
-            }
-            _ => Outcome::Pass,
-        };
+        let outcome = self.decide_sample(ci, &mut d[range.clone()], source, now, late, true);
         self.count(outcome);
+        // 5. Only what was forwarded advances the stream (and binds it);
+        //    a suppression is remembered (a retransmission is suppressed
+        //    again) only when it came from the bound side.
         let bytes = match outcome {
             Outcome::Suppress => None,
             _ => d.get(range),
         };
         if let Some(ch) = self.channels.get_mut(ci) {
             let w = ch.writer_mut(&s.writer);
-            w.last_sn = Some(s.sn);
-            w.remember(s.sn, bytes);
+            if bytes.is_some() {
+                w.last_sn = Some(w.last_sn.map_or(s.sn, |l| l.max(s.sn)));
+                w.bound = Some(binding);
+                w.bound_at = now;
+                w.pending_jump = None;
+                w.restart_armed = false;
+                w.remember(s.sn, bytes);
+            } else if from_bound {
+                w.remember(s.sn, None);
+            }
         }
         outcome
+    }
+
+    /// Decide one enforced payload slot with the channel's codec. `emit`:
+    /// whether a substitute may be written into it (never for a foreign
+    /// sample under a guarded GUID).
+    fn decide_sample(
+        &mut self,
+        ci: usize,
+        slot: &mut [u8],
+        source: SourceId,
+        now: u64,
+        late: bool,
+        emit: bool,
+    ) -> Outcome {
+        match self.channels.get(ci).map(|c| c.codec) {
+            Some(Codec::UnitreeGoLowcmd | Codec::UnitreeHgLowcmd) => {
+                self.lowcmd_sample(ci, slot, source, now, late, emit)
+            }
+            Some(Codec::UnitreeSportRequest) => {
+                self.sport_sample(ci, slot, source, now, late, emit)
+            }
+            _ => Outcome::Pass,
+        }
     }
 
     fn count(&mut self, o: Outcome) {
@@ -729,6 +973,7 @@ impl Gateway {
         source: SourceId,
         now: u64,
         late: bool,
+        emit: bool,
     ) -> Outcome {
         let Some(ch) = self.channels.get(ci) else {
             return Outcome::Suppress;
@@ -737,7 +982,18 @@ impl Gateway {
             return Outcome::Suppress;
         };
         let id = ch.id;
-        let decoded = lowcmd::decode_strict(slot, codec).ok();
+        let allow_battery_off = ch.allow_battery_off;
+        let mut decoded = lowcmd::decode_strict(slot, codec).ok();
+        if decoded
+            .as_ref()
+            .is_some_and(|d| !lowcmd::non_motor_ok(&d.msg, allow_battery_off))
+        {
+            // A non-motor field the robot acts on (battery off): refused
+            // like an integrity failure, so the platform's substitute (with
+            // the last accepted frame's non-motor fields) applies.
+            self.stats.non_motor_rejected += 1;
+            decoded = None;
+        }
         let frame = match decoded.as_ref().and_then(|d| d.msg.joint_frame()) {
             Some(f) => f,
             None => {
@@ -794,6 +1050,10 @@ impl Gateway {
                     }
                 }
             }
+            JointVerdict::Rejected {
+                substitute: Some(_),
+                ..
+            } if !emit => Outcome::Suppress,
             JointVerdict::Rejected {
                 substitute: Some(sub),
                 ..
@@ -860,6 +1120,7 @@ impl Gateway {
         source: SourceId,
         now: u64,
         late: bool,
+        emit: bool,
     ) -> Outcome {
         let Some(ch) = self.channels.get(ci) else {
             return Outcome::Suppress;
@@ -916,6 +1177,10 @@ impl Gateway {
                     }
                 }
             }
+            FwVerdict::Rejected {
+                substitute: Some(_),
+                ..
+            } if !emit => Outcome::Suppress,
             FwVerdict::Rejected {
                 substitute: Some(sub),
                 ..

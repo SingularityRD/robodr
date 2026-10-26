@@ -62,19 +62,23 @@ struct Topology {
     ctrl: String,
     gw: String,
     rob: String,
+    /// An attacker on the controller-side segment (macvlan on the
+    /// controller's link: its own MAC), if requested.
+    atk: Option<String>,
     ctrl_port: String,
     rob_port: String,
 }
 
 impl Topology {
-    fn new() -> Self {
+    fn new(tag: char, attacker: bool) -> Self {
         let id = std::process::id() % 100_000;
         let t = Topology {
-            ctrl: format!("rgwc{id}"),
-            gw: format!("rgwg{id}"),
-            rob: format!("rgwr{id}"),
-            ctrl_port: format!("gc{id}"),
-            rob_port: format!("gr{id}"),
+            ctrl: format!("rgwc{tag}{id}"),
+            gw: format!("rgwg{tag}{id}"),
+            rob: format!("rgwr{tag}{id}"),
+            atk: attacker.then(|| format!("rgwa{tag}{id}")),
+            ctrl_port: format!("gc{tag}{id}"),
+            rob_port: format!("gr{tag}{id}"),
         };
         for ns in [&t.ctrl, &t.gw, &t.rob] {
             sh(&format!("ip netns add {ns}"));
@@ -93,13 +97,29 @@ impl Topology {
         }
         sh(&format!("ip -n {} addr add {}/24 dev c0 && ip -n {0} link set c0 up && ip -n {0} link set lo up", t.ctrl, CONTROLLER_IP));
         sh(&format!("ip -n {} addr add {}/24 dev r0 && ip -n {0} link set r0 up && ip -n {0} link set lo up", t.rob, ROBOT_IP));
+        if let Some(a) = &t.atk {
+            sh(&format!("ip netns add {a}"));
+            sh(&format!(
+                "ip -n {c} link add link c0 name m0 type macvlan mode bridge && ip -n {c} link set m0 netns {a}",
+                c = t.ctrl
+            ));
+            sh(&format!("ip -n {a} addr add {ATTACKER_IP}/24 dev m0 && ip -n {a} link set m0 up && ip -n {a} link set lo up"));
+        }
         t
     }
 }
 
 impl Drop for Topology {
     fn drop(&mut self) {
-        for ns in [&self.ctrl, &self.gw, &self.rob] {
+        for ns in [
+            Some(&self.ctrl),
+            Some(&self.gw),
+            Some(&self.rob),
+            self.atk.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
             let _ = Command::new("ip").args(["netns", "del", ns]).status();
         }
     }
@@ -135,7 +155,7 @@ fn quantiles(mut v: Vec<u64>) -> (u64, u64, u64, usize) {
 #[test]
 #[ignore = "needs root, network namespaces, iptables + nft and nfnetlink_queue; run with --ignored"]
 fn inline_bridge_end_to_end() {
-    let topo = Topology::new();
+    let topo = Topology::new('l', false);
     let fx = Fixture::G1;
     let mut cfg: GatewayConfig = gateway_config(fx);
     cfg.queue.num = 7;
@@ -306,7 +326,9 @@ fn inline_bridge_end_to_end() {
         }
         lat
     };
-    let mut sn = 100;
+    // Continue the writer's sequence (phase A used 1 and 2): a jump past
+    // `rtps.max_sn_jump` would be held back until confirmed (one frame).
+    let mut sn = 3;
     let gw_1k = stream(sn, 3000, Duration::from_millis(1), 33);
     sn += 3000;
     let gw_500 = stream(sn, 1500, Duration::from_millis(2), 33);
@@ -375,6 +397,199 @@ fn inline_bridge_end_to_end() {
         g5.3
     );
 
+    stop_rx.store(true, Ordering::SeqCst);
+    receiver.join().unwrap();
+    let _ = std::fs::remove_file(&script_path);
+    drop(topo);
+}
+
+/// Review finding F1 through the real kernel path: an attacker on the
+/// controller-side segment injects a DATA with the motion writer's GUID and
+/// a far-future sequence number, first from its own IP, then spoofing the
+/// controller's IP (with its own MAC: the kernel reports it in
+/// `NFQA_HWADDR`). The robot never receives the spoofed sample, and every
+/// genuine frame before and after it arrives byte-identical (before the fix
+/// all later genuine frames were suppressed as "replays"). Also checks that
+/// SEDP from the controller side is queued, learned and forwarded
+/// unchanged.
+#[test]
+#[ignore = "needs root, network namespaces, iptables + nft and nfnetlink_queue; run with --ignored"]
+fn spoofed_future_sequence_number_does_not_stop_the_stream() {
+    let topo = Topology::new('s', true);
+    let atk_ns = topo.atk.clone().unwrap();
+    let fx = Fixture::G1;
+    let mut cfg: GatewayConfig = gateway_config(fx);
+    cfg.queue.num = 8;
+    cfg.queue.controller_port = topo.ctrl_port.clone();
+    cfg.queue.robot_port = topo.rob_port.clone();
+    cfg.housekeeping_ms = 50;
+    cfg.channels[0].allowed_src_ips = vec![CONTROLLER_IP.to_string()];
+    let script = ruleset::render(&cfg, "netns_e2e_f1");
+    let script_path =
+        std::env::temp_dir().join(format!("robodr-gw-e2e-f1-{}.sh", std::process::id()));
+    std::fs::write(&script_path, &script).unwrap();
+    sh(&format!(
+        "ip netns exec {} sh {}",
+        topo.gw,
+        script_path.display()
+    ));
+
+    // Receiver on the robot side: user port and SEDP unicast port.
+    let stop_rx = Arc::new(AtomicBool::new(false));
+    let (tx_rx, rx_rx) = mpsc::channel::<(u16, Vec<u8>)>();
+    let rob = topo.rob.clone();
+    let s2 = stop_rx.clone();
+    let receiver = std::thread::spawn(move || {
+        enter(&rob);
+        let socks: Vec<(u16, UdpSocket)> = [DDS_PORT, 7410]
+            .into_iter()
+            .map(|p| {
+                let s = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, p)).unwrap();
+                s.set_nonblocking(true).unwrap();
+                (p, s)
+            })
+            .collect();
+        let mut buf = vec![0u8; 65_536];
+        while !s2.load(Ordering::SeqCst) {
+            let mut got = false;
+            for (p, s) in &socks {
+                if let Ok((n, _)) = s.recv_from(&mut buf) {
+                    let _ = tx_rx.send((*p, buf[..n].to_vec()));
+                    got = true;
+                }
+            }
+            if !got {
+                std::thread::sleep(Duration::from_micros(200));
+            }
+        }
+    });
+
+    let stop_gw = Arc::new(AtomicBool::new(false));
+    let gwns = topo.gw.clone();
+    let s3 = stop_gw.clone();
+    let gcfg = cfg.clone();
+    let gw_thread = std::thread::spawn(move || {
+        enter(&gwns);
+        let mut gw = Gateway::new(&gcfg, &profile(Fixture::G1), &firewall(Fixture::G1)).unwrap();
+        let opts = RunOptions {
+            max_packets: None,
+            max_duration: Some(Duration::from_secs(60)),
+        };
+        let r = runtime::run(&gcfg, &mut gw, opts, &|| s3.load(Ordering::SeqCst));
+        (r, gw.stats)
+    });
+    std::thread::sleep(Duration::from_millis(500));
+
+    // The attacker's sender, in its own namespace (own MAC).
+    let (atk_tx, atk_rx) = mpsc::channel::<(Ipv4Addr, Vec<u8>)>();
+    let (atk_done_tx, atk_done) = mpsc::channel::<()>();
+    let atk_thread = std::thread::spawn(move || {
+        enter(&atk_ns);
+        while let Ok((ip, d)) = atk_rx.recv() {
+            if ip != ATTACKER_IP {
+                // Spoof the controller's IP on the attacker's own link.
+                sh(&format!(
+                    "ip -n {atk_ns} addr flush dev m0 && ip -n {atk_ns} addr add {ip}/24 dev m0"
+                ));
+            }
+            let s = UdpSocket::bind(SocketAddrV4::new(ip, 0)).unwrap();
+            s.send_to(&d, SocketAddrV4::new(ROBOT_IP, DDS_PORT))
+                .unwrap();
+            let _ = atk_done_tx.send(());
+        }
+    });
+
+    enter(&topo.ctrl);
+    let tx = UdpSocket::bind(SocketAddrV4::new(CONTROLLER_IP, 0)).unwrap();
+    let spec = lowcmd_spec(fx);
+    let pins = (spec.pinned_mode_pr, spec.pinned_mode_machine);
+    let frame = |sn: i64| mid_frame(LowCmdCodec::Hg, &spec.motors, sn as f64 * 0.001, pins);
+    let mut sent: Vec<Vec<u8>> = Vec::new();
+    let mut stream = |from: i64, to: i64| {
+        for sn in from..=to {
+            let d = lowcmd_datagram(PREFIX, WRITER, sn, &frame(sn), Representation::CdrLe);
+            tx.send_to(&d, SocketAddrV4::new(ROBOT_IP, DDS_PORT))
+                .unwrap();
+            sent.push(d);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    let drain = |wait: Duration| -> Vec<(u16, Vec<u8>)> {
+        let mut v = Vec::new();
+        let until = Instant::now() + wait;
+        while Instant::now() < until {
+            if let Ok(x) = rx_rx.recv_timeout(Duration::from_millis(10)) {
+                v.push(x);
+            }
+        }
+        v
+    };
+    // SEDP from the controller side: queued, learned, forwarded unchanged.
+    let sedp = sedp_datagram(
+        PREFIX,
+        WRITER,
+        "rt/lowcmd",
+        "unitree_hg::msg::dds_::LowCmd_",
+    );
+    tx.send_to(&sedp, SocketAddrV4::new(ROBOT_IP, 7410))
+        .unwrap();
+    let got = drain(Duration::from_millis(150));
+    assert_eq!(got, vec![(7410, sedp.clone())], "SEDP forwarded unchanged");
+
+    stream(1, 50);
+    let evil = lowcmd_datagram(PREFIX, WRITER, 1 << 40, &frame(0), Representation::CdrLe);
+    atk_tx.send((ATTACKER_IP, evil.clone())).unwrap();
+    atk_done.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    stream(51, 150);
+    atk_tx.send((CONTROLLER_IP, evil.clone())).unwrap();
+    atk_done.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    stream(151, 250);
+    let got = drain(Duration::from_millis(300));
+    drop(atk_tx);
+    atk_thread.join().unwrap();
+
+    let mut genuine = Vec::new();
+    let mut spoofed = 0;
+    for (port, d) in &got {
+        assert_eq!(*port, DDS_PORT);
+        let mut v = Vec::new();
+        rtps::walk(d, WalkOptions::default(), &mut v).unwrap();
+        if v.is_empty() {
+            spoofed += 1; // the spoofed datagram, its DATA turned into a PAD
+            assert_eq!(d.len(), evil.len());
+            continue;
+        }
+        assert!(
+            v.iter().all(|s| s.sn < 1 << 40),
+            "spoofed SN reached the robot"
+        );
+        genuine.push(d.clone());
+    }
+    assert_eq!(
+        spoofed, 2,
+        "both spoofed datagrams forwarded without their sample"
+    );
+    assert_eq!(
+        genuine.len(),
+        sent.len(),
+        "every genuine frame before and after the injection arrived"
+    );
+    assert_eq!(genuine, sent, "byte-identical, in order");
+
+    stop_gw.store(true, Ordering::SeqCst);
+    let (r, stats) = gw_thread.join().unwrap();
+    r.expect("gateway run loop");
+    println!("F1 e2e gateway stats: {stats:?}");
+    assert!(
+        stats.discovery_datagrams >= 1,
+        "SEDP was queued and learned"
+    );
+    assert!(
+        stats.binding_conflicts >= 1,
+        "the spoofed-IP frame was told apart by its MAC (NFQA_HWADDR reported)"
+    );
     stop_rx.store(true, Ordering::SeqCst);
     receiver.join().unwrap();
     let _ = std::fs::remove_file(&script_path);

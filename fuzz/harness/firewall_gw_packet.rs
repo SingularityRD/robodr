@@ -20,7 +20,11 @@
 //!   **strictly** (canonical CDR) and, for `LowCmd_`, carries a valid
 //!   Unitree CRC: the gateway never forwards an enforced sample it could
 //!   not read;
-//! - every forwarded Go1 frame on an enforced port has a valid CRC.
+//! - every forwarded Go1 frame on an enforced port has a valid CRC;
+//! - in enforce mode, no DATA_FRAG / key-only / non-standard sample of a
+//!   writer the gateway has no classification for is forwarded (it could
+//!   not be probed);
+//! - no forwarded enforced go `LowCmd_` carries `bms_cmd.off != 0`.
 #![allow(dead_code)]
 
 use std::time::Instant;
@@ -77,6 +81,7 @@ pub fn run(data: &[u8]) {
                 now_ns: now,
                 queue_delay_ns: None,
                 instant: Instant::now(),
+                src_mac: None,
             },
         );
         match v {
@@ -107,6 +112,16 @@ pub fn run(data: &[u8]) {
         if rtps::walk(d, WalkOptions::default(), &mut samples).is_err() {
             continue;
         }
+        for s in samples.iter().filter(|s| !s.builtin) {
+            if gw.discovery().writer(&s.writer).is_none() {
+                assert!(
+                    s.kind == rtps::SampleKind::Data
+                        && !s.non_standard
+                        && s.content != Content::Key,
+                    "an unknown writer's unprobeable sample was forwarded"
+                );
+            }
+        }
         for s in samples
             .iter()
             .filter(|s| !s.builtin && s.content == Content::Data)
@@ -126,6 +141,10 @@ pub fn run(data: &[u8]) {
                     let m = lowcmd::decode_strict(slot, c)
                         .expect("forwarded enforced LowCmd decodes strictly");
                     assert!(m.msg.crc_ok(), "forwarded enforced LowCmd has a valid CRC");
+                    assert!(
+                        lowcmd::non_motor_ok(&m.msg, false),
+                        "forwarded enforced LowCmd turns the battery off"
+                    );
                 }
                 Some(Codec::UnitreeSportRequest) => {
                     sport::decode_strict(slot, None)

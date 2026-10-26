@@ -38,6 +38,12 @@
 //! from the last frame the gateway forwarded as accepted, never from the
 //! rejected frame; with none yet, from [`template`] (SDK defaults:
 //! `head = FE EF`, `level_flag = 0xFF`, everything else zero, BMS `off = 0`).
+//!
+//! # Non-motor fields ([`non_motor_ok`])
+//!
+//! A go frame whose `bms_cmd.off` is not zero (`0xA5` turns the battery
+//! off) is refused unless the channel allows it; every other non-motor
+//! field is forwarded as sent (README, "Non-motor `LowCmd_` fields").
 
 use robodr_cdr::unitree::{
     decode_unitree, GoBmsCmd, GoLowCmd, GoMotorCmd, HgLowCmd, HgMotorCmd, UnitreeKind,
@@ -451,6 +457,22 @@ pub fn decode_strict(slot: &[u8], codec: LowCmdCodec) -> Result<Slot, Undecidabl
         version,
         body_len: n,
     })
+}
+
+/// Are the frame's non-motor fields acceptable (see the crate README,
+/// "Non-motor `LowCmd_` fields", for each field and its SDK evidence)?
+///
+/// Only `unitree_go` `bms_cmd.off` is refused: the SDK documents `0xA5` as
+/// "turn off the battery" (`unitree_legged_sdk` `comm.h:28`,
+/// `unitree_sdk2` `example/state_machine/comm.h:28`) and no SDK example
+/// sets it, so any non-zero value is refused unless the channel sets
+/// `allow_battery_off`. Every other non-motor field is forwarded as sent
+/// (a substitute takes them from the last accepted frame).
+pub fn non_motor_ok(msg: &WireLowCmd, allow_battery_off: bool) -> bool {
+    match msg {
+        WireLowCmd::Go(m) => allow_battery_off || m.bms_cmd.off == 0,
+        WireLowCmd::Hg(_) => true,
+    }
 }
 
 /// Why a rewrite was not done.

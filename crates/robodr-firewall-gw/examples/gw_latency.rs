@@ -215,6 +215,7 @@ fn scenario(fx: Fixture, hz: f64, secs: f64, fast: bool) -> Report {
             now_ns,
             queue_delay_ns: None,
             instant: start,
+            src_mac: None,
         };
         let a0 = ALLOCS.load(Ordering::Relaxed);
         let t0 = Instant::now();

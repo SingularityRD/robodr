@@ -142,6 +142,13 @@ pub fn gateway_config(fx: Fixture) -> GatewayConfig {
         "codec": if fx == Fixture::G1 { "unitree_hg_lowcmd" } else { "unitree_go_lowcmd" },
     })];
     if fx == Fixture::Go2 {
+        // The allowlist includes Damp (1001, `ROBOT_SPORT_API_ID_DAMP`,
+        // unitree_sdk2 `include/unitree/robot/go2/sport/sport_api.hpp:19`):
+        // it makes the robot go limp and settle to the ground, so it is
+        // reachable by anyone who can present an allowed source. Kept on
+        // purpose (operators use it as a soft stop and the tests exercise a
+        // non-velocity call through the allowlist); a deployment should list
+        // only the calls its controller uses (see the README).
         channels.push(serde_json::json!({
             "firewall_channel": "/api/sport/request",
             "codec": "unitree_sport_request",

@@ -56,6 +56,21 @@ pub struct Discovery {
     /// The writer map changed since the last [`Discovery::save`].
     pub dirty: bool,
     pub stats: DiscoveryStats,
+    /// Writers announced or removed by the last [`Discovery::learn`]
+    /// (restart evidence, see [`Discovery::take_announced`]).
+    announced: Vec<Announced>,
+}
+
+/// A writer (or, for a participant removal, every writer of a participant)
+/// that an SEDP / SPDP datagram announced or removed: the evidence a writer
+/// restart leaves (a restarted writer re-announces itself before its
+/// sequence numbers start again at 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Announced {
+    pub guid: Guid,
+    /// Only the participant prefix (`guid[..12]`) is meaningful: the
+    /// participant was removed.
+    pub whole_participant: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -127,7 +142,14 @@ impl Discovery {
             epoch: 0,
             dirty: false,
             stats: DiscoveryStats::default(),
+            announced: Vec::new(),
         }
+    }
+
+    /// The writers the last [`Discovery::learn`] saw announced or removed
+    /// (drained).
+    pub fn take_announced(&mut self) -> Vec<Announced> {
+        std::mem::take(&mut self.announced)
     }
 
     fn channel_of(&self, topics: &[String]) -> Option<usize> {
@@ -180,6 +202,7 @@ impl Discovery {
     /// Learn from one RTPS datagram (UDP payload) from `src`.
     pub fn learn(&mut self, datagram: &[u8], src: Ipv4Addr, now: Instant) {
         self.stats.datagrams += 1;
+        self.announced.clear();
         let Some(report) = self.reasm.parse_datagram_detailed(datagram) else {
             return;
         };
@@ -197,6 +220,12 @@ impl Discovery {
         }
         for r in &report.removed_participants {
             self.stats.participants_removed += 1;
+            let mut guid = [0u8; 16];
+            guid[..12].copy_from_slice(&r.guid_prefix);
+            self.announced.push(Announced {
+                guid,
+                whole_participant: true,
+            });
             if self.identities.release(&r.guid_prefix).is_some() {
                 self.epoch += 1;
             }
@@ -229,6 +258,10 @@ impl Discovery {
             guids.sort_unstable();
             guids.dedup();
             for guid in guids {
+                self.announced.push(Announced {
+                    guid,
+                    whole_participant: false,
+                });
                 let topics: Vec<String> = pairs
                     .iter()
                     .filter(|(g, _)| *g == guid)
@@ -254,6 +287,10 @@ impl Discovery {
         for r in &report.removed_endpoints {
             if r.kind == EndpointKind::Writer {
                 if let Some(g) = r.guid {
+                    self.announced.push(Announced {
+                        guid: g,
+                        whole_participant: false,
+                    });
                     self.remove(&g);
                 }
             }

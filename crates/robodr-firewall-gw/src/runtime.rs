@@ -230,6 +230,7 @@ pub fn run(
                         now_ns: now,
                         queue_delay_ns: delay,
                         instant: Instant::now(),
+                        src_mac: p.hwaddr,
                     };
                     match gw.process(&mut work, meta) {
                         Verdict::Accept => (nfq::NF_ACCEPT, None),

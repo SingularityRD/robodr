@@ -31,6 +31,19 @@
 //!    `NFQUEUE --queue-num N`, with `--queue-bypass` only for
 //!    `on_gateway_down: bypass`.
 //!
+//! The queued DDS range of a domain (`7400 + 250 d ..= +249`) contains the
+//! discovery ports too (SPDP multicast `7400 + 250 d`, SPDP / SEDP unicast
+//! `7410 + 250 d + 2 i`), so every SPDP / SEDP datagram entering from the
+//! controller side is queued: the gateway learns from it (writer
+//! classification, participant identities, writer-restart evidence) and
+//! forwards it unchanged (only a datagram the strict RTPS walker cannot
+//! read follows `rtps.malformed_datagram`). The robot's own discovery
+//! (entering on the robot port) is bridged unqueued. **All SEDP the robot
+//! receives from controller-side participants must cross this bridge**:
+//! a writer the robot learns from an announcement the gateway did not see
+//! is classified by the content probe only (see the README, "Discovery
+//! differential").
+//!
 //! Tested in this repository with iptables-nft (xtables `physdev`, `CT`,
 //! `conntrack` and `NFQUEUE` targets over `nf_tables` compat), which works
 //! on kernels built without `CONFIG_NFT_QUEUE`. A native-nft ruleset would
@@ -143,6 +156,29 @@ mod tests {
         assert!(s.contains("--dport 8082 -j NFQUEUE --queue-num 7\n"));
         assert!(!s.contains("queue-bypass"));
         assert!(s.contains("CTRL='enp2s0'"));
+        // Discovery is queued with the user traffic: SPDP multicast and the
+        // SPDP / SEDP unicast ports of every participant index are inside
+        // the queued range of their domain.
+        let queued: Vec<(u32, u32)> = s
+            .lines()
+            .filter(|l| l.contains("-j NFQUEUE"))
+            .filter_map(|l| {
+                let r = l.split("--dport ").nth(1)?.split(' ').next()?;
+                let (lo, hi) = r.split_once(':').unwrap_or((r, r));
+                Some((lo.parse().ok()?, hi.parse().ok()?))
+            })
+            .collect();
+        for domain in [0u32, 1] {
+            let base = 7400 + 250 * domain;
+            // SPDP multicast, SPDP / SEDP unicast of participant 0, 1, 119.
+            for port in [base, base + 10, base + 12, base + 10 + 2 * 119] {
+                assert!(
+                    queued.iter().any(|(lo, hi)| (*lo..=*hi).contains(&port)),
+                    "discovery port {port} not queued"
+                );
+            }
+        }
+        assert!(s.contains("-m physdev --physdev-in \"$CTRL\" -j ROBODR_GW"));
         c.queue.on_gateway_down = OnGatewayDown::Bypass;
         let s = render(&c, "test.json");
         assert!(s.contains("--queue-num 7 --queue-bypass\n"));

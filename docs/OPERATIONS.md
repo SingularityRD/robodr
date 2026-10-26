@@ -1240,7 +1240,7 @@ stream (that is what `fail_closed` and every suppressed tick rely on).
 `/var/lib/robodr/firewall-gw/status.json`) is rewritten every
 `housekeeping_ms`: gateway counters (`passed`, `limited`, `substituted`,
 `suppressed`, `undecidable`, `replays`, `late`, `rewrite_failed`,
-`dropped_ip`, `rtps_malformed`, ...), the firewall's statistics (hold
+`dropped_ip`, `rtps_malformed`, `binding_conflicts`, `sn_jumps`, ...), the firewall's statistics (hold
 episodes, holds past `max_hold_ns`), and the recv → verdict latency (p50 /
 p99 / max). Treat it as unknown when `updated_mono_ms` is older than
 `stale_after_ms`. Firewall deviations are appended to `events_path` (JSON
@@ -1252,6 +1252,11 @@ lines, size-capped by `events_max_bytes`). Watch in particular:
 | `rewrite_failed` > 0 | a limited / substitute frame could not be written and verified (suppressed instead): report it |
 | `late` > 0 | packets read more than `max_queue_delay_ns` after arrival: the box is overloaded or not running the unit's real-time priority |
 | `undecidable`, `rtps_malformed`, `unsupported_sample` | malformed or fragmented motion traffic: misconfiguration or an attack |
+| `binding_conflicts` > 0 | the motion writer's GUID arrived from another source IP / MAC than the controller's stream: a spoofer on the controller segment (or a second NIC sending the controller's traffic) |
+| `sn_jumps` > 0 | a sequence-number jump past `rtps.max_sn_jump` was held back: lost frames between controller and gateway, or a spoofed far-future number |
+| `writer_restarts` | a writer restarted with its old GUID (announced by SEDP); expected only when the controller software restarts |
+| `unknown_undecidable` > 0 | a fragmented / key-only / non-standard sample from a writer the gateway never saw announced was removed: a discovery path around the bridge, a missing `rtps.state_file`, or an attack |
+| `non_motor_rejected` > 0 | a `LowCmd_` asked to turn the battery off (`bms_cmd.off`) and was replaced by the substitute: investigate the sender |
 | firewall `joint_holds_exceeded` | a humanoid has been held past `max_hold_ns`: escalate (the gateway keeps holding) |
 
 **While the gateway is down** (stopped, crashed, restarting after a

@@ -43,6 +43,7 @@ pub const NLM_F_ACK: u16 = 4;
 pub const NFQA_PACKET_HDR: u16 = 1;
 pub const NFQA_VERDICT_HDR: u16 = 2;
 pub const NFQA_TIMESTAMP: u16 = 4;
+pub const NFQA_HWADDR: u16 = 9;
 pub const NFQA_IFINDEX_INDEV: u16 = 5;
 pub const NFQA_IFINDEX_PHYSINDEV: u16 = 7;
 pub const NFQA_PAYLOAD: u16 = 10;
@@ -104,6 +105,10 @@ pub struct Packet<'a> {
     pub timestamp: Option<(u64, u64)>,
     pub indev: Option<u32>,
     pub physindev: Option<u32>,
+    /// Source link-layer address (`NFQA_HWADDR`, `struct
+    /// nfqnl_msg_packet_hw`: be16 length, pad, 8 octets) when the kernel
+    /// reported a 6-octet one (the bridged Ethernet frame's source MAC).
+    pub hwaddr: Option<[u8; 6]>,
 }
 
 /// What [`parse_packets`] can report besides packets.
@@ -171,6 +176,7 @@ fn parse_one(msg: &[u8]) -> Item<'_> {
         timestamp: None,
         indev: None,
         physindev: None,
+        hwaddr: None,
     };
     let mut have_hdr = false;
     let mut at = NLMSG_HDRLEN + NFGEN_LEN;
@@ -208,6 +214,12 @@ fn parse_one(msg: &[u8]) -> Item<'_> {
             NFQA_TIMESTAMP => p.timestamp = be_u64(v, 0).zip(be_u64(v, 8)),
             NFQA_IFINDEX_INDEV => p.indev = be_u32(v, 0),
             NFQA_IFINDEX_PHYSINDEV => p.physindev = be_u32(v, 0),
+            NFQA_HWADDR => {
+                p.hwaddr = match (v.get(..2), v.get(4..10)) {
+                    (Some([0, 6]), Some(a)) => <[u8; 6]>::try_from(a).ok(),
+                    _ => None,
+                }
+            }
             _ => {}
         }
         match align4(alen).and_then(|a| at.checked_add(a)) {
@@ -313,6 +325,7 @@ pub fn build_packet_msg(
     id: u32,
     payload: &[u8],
     ts: Option<(u64, u64)>,
+    hw: Option<[u8; 6]>,
 ) {
     header(out, MSG_PACKET, 0, 0, 2, queue);
     let mut h = id.to_be_bytes().to_vec();
@@ -323,6 +336,12 @@ pub fn build_packet_msg(
         let mut t = s.to_be_bytes().to_vec();
         t.extend_from_slice(&us.to_be_bytes());
         put_attr(out, NFQA_TIMESTAMP, &t);
+    }
+    if let Some(a) = hw {
+        let mut v = vec![0, 6, 0, 0];
+        v.extend_from_slice(&a);
+        v.extend_from_slice(&[0, 0]);
+        put_attr(out, NFQA_HWADDR, &v);
     }
     put_attr(out, NFQA_PAYLOAD, payload);
     finish(out);
@@ -580,7 +599,14 @@ mod tests {
     #[test]
     fn packet_roundtrip_and_verdict_layout() {
         let mut m = Vec::new();
-        build_packet_msg(&mut m, 7, 0x1234, b"\x45abcdef", Some((10, 20)));
+        build_packet_msg(
+            &mut m,
+            7,
+            0x1234,
+            b"\x45abcdef",
+            Some((10, 20)),
+            Some([2, 0, 0, 0, 0, 0x64]),
+        );
         let mut two = m.clone();
         two.extend_from_slice(&m);
         let mut seen = Vec::new();
@@ -592,6 +618,7 @@ mod tests {
                 assert_eq!(p.hw_protocol, 0x0800);
                 assert_eq!(p.payload, b"\x45abcdef");
                 assert_eq!(p.timestamp, Some((10, 20)));
+                assert_eq!(p.hwaddr, Some([2, 0, 0, 0, 0, 0x64]));
             }
             other => panic!("{other:?}"),
         }
@@ -616,7 +643,7 @@ mod tests {
     #[test]
     fn malformed_inputs_never_panic() {
         let mut m = Vec::new();
-        build_packet_msg(&mut m, 1, 1, &[0u8; 40], None);
+        build_packet_msg(&mut m, 1, 1, &[0u8; 40], None, None);
         for cut in 0..m.len() {
             parse_packets(&m[..cut], |_| {});
         }

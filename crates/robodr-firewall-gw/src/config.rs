@@ -139,6 +139,15 @@ pub struct RtpsConfig {
     /// restart, which does not see the earlier SEDP again, keeps
     /// classifying the robot's existing writers).
     pub state_file: Option<PathBuf>,
+    /// Largest forward step of a bound writer's sequence number that is
+    /// decided at once. A larger jump is suppressed until the next sample
+    /// of the same binding confirms it (see the crate docs). `1..=2^20`.
+    pub max_sn_jump: u64,
+    /// How long (ns) the (source IP, MAC) a writer's stream is bound to
+    /// must have sent nothing before another (IP, MAC) presenting the same
+    /// authorised GUID may continue it; until then such samples are binding
+    /// conflicts (suppressed). `1 ms ..= 60 s`, default 1 s.
+    pub binding_takeover_ns: u64,
 }
 
 impl Default for RtpsConfig {
@@ -150,6 +159,8 @@ impl Default for RtpsConfig {
             max_writers: 4096,
             max_writers_per_channel: 16,
             state_file: None,
+            max_sn_jump: 64,
+            binding_takeover_ns: 1_000_000_000,
         }
     }
 }
@@ -254,6 +265,18 @@ pub struct ChannelConfig {
     pub allowed_api_ids: Option<Vec<i64>>,
     #[serde(default)]
     pub allowed_high_modes: Option<Vec<u8>>,
+    /// If non-empty, a datagram whose source MAC (as the kernel reports it
+    /// for the bridged frame) is not listed is a foreign source on this
+    /// channel; a datagram without a reported MAC then is too. Format
+    /// `aa:bb:cc:dd:ee:ff`.
+    #[serde(default)]
+    pub allowed_src_macs: Vec<String>,
+    /// `unitree_go_lowcmd` only: forward frames whose `bms_cmd.off` is not
+    /// zero (`0xA5` turns the robot's battery off). Default `false`: such a
+    /// frame is refused (decided as an integrity failure, so the platform's
+    /// substitute applies).
+    #[serde(default)]
+    pub allow_battery_off: bool,
 }
 
 impl ChannelConfig {
@@ -393,6 +416,12 @@ impl GatewayConfig {
         if self.rtps.max_writers == 0 || self.rtps.max_writers_per_channel == 0 {
             return Err("rtps.max_writers and rtps.max_writers_per_channel must be >= 1".into());
         }
+        if !(1..=1 << 20).contains(&self.rtps.max_sn_jump) {
+            return Err("rtps.max_sn_jump must be in 1..=1048576".into());
+        }
+        if !(1_000_000..=60_000_000_000).contains(&self.rtps.binding_takeover_ns) {
+            return Err("rtps.binding_takeover_ns must be in 1e6..=6e10 (1 ms ..= 60 s)".into());
+        }
         let mut domains = self.rtps.domain_ids.clone();
         domains.sort_unstable();
         domains.dedup();
@@ -465,6 +494,21 @@ impl GatewayConfig {
                     "{at}: allowed_api_ids is for unitree_sport_request only"
                 ));
             }
+            for m in &c.allowed_src_macs {
+                if crate::gateway::parse_mac(m).is_none() {
+                    return Err(format!(
+                        "{at}: allowed_src_macs entry {m:?} is not a MAC address (aa:bb:cc:dd:ee:ff)"
+                    ));
+                }
+            }
+            if !c.allowed_src_macs.is_empty() && !c.codec.is_rtps() {
+                return Err(format!("{at}: allowed_src_macs is for RTPS codecs only"));
+            }
+            if c.allow_battery_off && c.codec != Codec::UnitreeGoLowcmd {
+                return Err(format!(
+                    "{at}: allow_battery_off is for unitree_go_lowcmd only"
+                ));
+            }
             if c.allowed_high_modes.is_some() && c.codec != Codec::Go1HighCmd {
                 return Err(format!("{at}: allowed_high_modes is for go1_high_cmd only"));
             }
@@ -518,6 +562,26 @@ mod tests {
         assert_eq!(c.channels[0].topic(), Some("rt/lowcmd"));
         assert_eq!(c.rtps_port_ranges(), vec![(7400, 7649)]);
         assert_eq!(c.max_queue_delay_ns, 5_000_000);
+        assert_eq!(c.rtps.max_sn_jump, 64);
+        assert_eq!(c.rtps.binding_takeover_ns, 1_000_000_000);
+        assert!(!c.channels[0].allow_battery_off && c.channels[0].allowed_src_macs.is_empty());
+        let mut v = base();
+        v["channels"][0]["allowed_src_macs"] =
+            serde_json::json!(["02:00:00:00:00:64", "AA-BB-CC-DD-EE-FF"]);
+        assert!(GatewayConfig::from_json(&v.to_string()).is_ok());
+        assert_eq!(
+            crate::gateway::parse_mac("AA-bb-CC-dd-EE-ff"),
+            Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
+        );
+        for bad in [
+            "",
+            "aa:bb:cc:dd:ee",
+            "aa:bb:cc:dd:ee:ff:00",
+            "aaa:bb:cc:dd:ee:f",
+            "zz:bb:cc:dd:ee:ff",
+        ] {
+            assert_eq!(crate::gateway::parse_mac(bad), None, "{bad}");
+        }
     }
 
     #[test]
@@ -556,6 +620,23 @@ mod tests {
             (
                 "bad domain",
                 serde_json::json!({"rtps": {"domain_ids": [300]}}),
+            ),
+            ("sn jump 0", serde_json::json!({"rtps": {"max_sn_jump": 0}})),
+            (
+                "takeover too short",
+                serde_json::json!({"rtps": {"binding_takeover_ns": 1000}}),
+            ),
+            (
+                "bad mac",
+                serde_json::json!({"channels": [{"firewall_channel": "/lowcmd", "codec": "unitree_hg_lowcmd", "allowed_src_macs": ["02:00:00:00:00"]}]}),
+            ),
+            (
+                "mac on legacy",
+                serde_json::json!({"channels": [{"firewall_channel": "/h", "codec": "go1_high_cmd", "allowed_src_macs": ["02:00:00:00:00:01"]}]}),
+            ),
+            (
+                "battery off on hg",
+                serde_json::json!({"channels": [{"firewall_channel": "/lowcmd", "codec": "unitree_hg_lowcmd", "allow_battery_off": true}]}),
             ),
             (
                 "bad ifname",

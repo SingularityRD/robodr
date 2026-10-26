@@ -60,27 +60,47 @@
 //! samples arrive faster than the substitute interval allows) is covered by
 //! the robot's own command-timeout behaviour, as when the controller fails.
 //!
-//! ## Retransmissions and replays
+//! ## Sequence numbers and writer binding
 //!
-//! Per writer and channel the gateway keeps the highest decided sequence
-//! number and the payload it forwarded for the last 8 numbers. A sample
-//! whose sequence number is not newer (a reliable retransmission, or a
-//! replay) is not decided again (the firewall's state does not move): the
-//! cached output is re-emitted byte for byte if the slot has the same
-//! length, otherwise the sample is suppressed.
+//! Per writer GUID and channel the gateway keeps the stream's state as the
+//! robot's reader sees it: the highest sequence number forwarded under
+//! that GUID, the payload forwarded for the last 8 numbers, and the
+//! (source IP, source MAC) the stream was last forwarded from (its
+//! binding). The GUID is a claim, so only a sample of an authorised source
+//! **from the bound (IP, MAC)** changes that state:
+//!
+//! - a sample whose number is not newer (a reliable retransmission, or a
+//!   replay) is not decided again: the cached output is re-emitted byte
+//!   for byte if the slot has the same length, otherwise it is suppressed;
+//! - a foreign sample is decided (recorded) but never changes the state,
+//!   and no substitute is written into it under an authorised GUID;
+//! - the same authorised GUID from another (IP, MAC) is suppressed while
+//!   the bound side is live (`rtps.binding_takeover_ns`);
+//! - a jump of more than `rtps.max_sn_jump` is suppressed until the next
+//!   sample of the same binding confirms it, so no single forwarded sample
+//!   can push the robot reader's expected number far past the genuine
+//!   writer's;
+//! - a lower number after an SEDP announcement / removal of the writer from
+//!   the bound IP is a writer restart (fresh state), once.
+//!
+//! An attacker that sends with the controller's own IP **and** MAC cannot
+//! be told apart; see the README for what that leaves.
 //!
 //! ## Undecidable samples
 //!
 //! A payload of an enforced channel that does not decode strictly
-//! (truncated, non-canonical CDR, trailing junk) is decided as an
-//! **integrity failure**: the firewall gets a frame whose CRC is reported
-//! invalid, so its source, rate and substitute rules apply (a foreign
-//! writer's garbage is dropped; an authorised writer's is replaced by the
-//! hold / damping substitute where the slot can carry one, else
-//! suppressed). DATA_FRAG, key-only and non-standard samples of an enforced
-//! channel are suppressed (the Unitree SDK does not fragment `LowCmd_` at
-//! Cyclone DDS's default 1344-octet fragment size; a fragmented one is a
-//! misconfiguration or an attack). A datagram that is not decidable as a
+//! (truncated, non-canonical CDR, trailing junk) — or a go `LowCmd_` whose
+//! `bms_cmd.off` is not zero (battery off) on a channel without
+//! `allow_battery_off` — is decided as an **integrity failure**: the
+//! firewall gets a frame whose CRC is reported invalid, so its source, rate
+//! and substitute rules apply (a foreign writer's garbage is dropped; an
+//! authorised writer's is replaced by the hold / damping substitute where
+//! the slot can carry one, else suppressed). DATA_FRAG, key-only and
+//! non-standard samples of an enforced channel are suppressed (the Unitree
+//! SDK does not fragment `LowCmd_` at Cyclone DDS's default 1344-octet
+//! fragment size; a fragmented one is a misconfiguration or an attack), and
+//! so are those of a writer the gateway has no classification for (the
+//! content probe cannot read them). A datagram that is not decidable as a
 //! whole follows `rtps.malformed_datagram` (default drop).
 
 pub mod config;

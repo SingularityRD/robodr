@@ -53,9 +53,13 @@ the gateway learns which writer writes which topic.
 | Port: legacy Go1 port → legacy codec; DDS port range of a configured domain → RTPS | `gateway` | other ports → ACCEPT (the ruleset does not queue them) |
 | Strict RTPS walk with offsets (header, every submessage, INFO_SRC, inline QoS, DATA / DATA_FRAG) | `rtps` | truncated / malformed / DDS-Security / > 256 samples → `rtps.malformed_datagram` (default DROP) |
 | SEDP / SPDP of builtin writers → writer → channel map, participant identities | `discovery` | — |
-| Per user DATA: writer → enforced channel (SEDP, persisted map, or a content probe for unknown writers) | `gateway` | not an enforced channel → untouched |
-| Sequence number older than the writer's last decided one → re-emit the cached decision | `gateway` | not cached → suppressed |
+| Per user DATA: writer → enforced channel (SEDP, persisted map, or a content probe for unknown writers) | `gateway` | not an enforced channel → untouched; an **unknown** writer's DATA_FRAG / key-only / non-standard sample (cannot be probed) → suppressed |
+| Source: writer GUID / prefix / identity, `allowed_src_ips`, `allowed_src_macs` | `gateway` | not allowed → foreign (decided, never touches the stream's state, never emitted under an authorised GUID) |
+| Writer binding: the GUID's stream is bound to the (IP, MAC) it was last forwarded from | `gateway` | same GUID from another (IP, MAC) while the bound side is live → suppressed (`binding_conflicts`) |
+| Sequence number not newer than the last forwarded one → re-emit the cached decision (a lower one after an SEDP re-announcement from the bound side = writer restart) | `gateway` | not cached → suppressed |
+| Sequence number more than `rtps.max_sn_jump` ahead → held until the next sample of the same binding confirms it | `gateway` | → suppressed (`sn_jumps`) |
 | Strict decode: `robodr-cdr` decode **and** canonical re-encode must equal the bytes; ≤ 3 zero trailing octets | `lowcmd`, `sport`, `legacy` | → integrity failure (below) |
+| Non-motor `LowCmd_` fields: go `bms_cmd.off` must be 0 unless `allow_battery_off` | `lowcmd` | → integrity failure (substitute carries the last accepted frame's non-motor fields) |
 | `check_joint` / `check` (or the fault verdict when the packet waited > `max_queue_delay_ns`) | `robodr-firewall` | — |
 | Pass → bytes untouched; Limited / substitute → rewrite in place + verify; nothing → PAD | `lowcmd`, `sport`, `legacy`, `rtps` | a rewrite that fails verification → PAD |
 | UDP checksum recomputed if anything changed (a zero checksum stays zero) | `ip` | — |
@@ -122,16 +126,64 @@ by the robot's own command timeout, as when the controller itself fails.
 The gateway does not know what the Unitree motor board does after that
 timeout; that is the OEM's safety case.
 
-## Retransmissions and replays
+## Sequence numbers and writer binding
 
-Per writer and channel the gateway keeps the highest decided sequence
-number and the payload it forwarded for the last 8 numbers. A sample whose
-sequence number is not newer — a reliable retransmission, or a replay of a
-captured datagram — is **not decided again** (the firewall's state does not
-move): the cached output is re-emitted byte for byte if the slot has the
-same length, otherwise the sample is suppressed. A replay of an old sequence
-number with new content therefore delivers what was decided for that number
-the first time. Sequence number `<= 0` (invalid) is suppressed.
+Per writer GUID and enforced channel the gateway keeps the stream's state
+as the robot's DDS reader sees it: the highest sequence number forwarded
+under that GUID (passed, limited or a substitute), the payload forwarded
+for the last 8 numbers, and the **binding**: the source IP and source MAC
+(`NFQA_HWADDR`, reported by the kernel for bridged frames) the stream was
+last forwarded from. The writer GUID is attacker-controlled (no
+DDS-Security), so **nothing but a sample of an authorised source from the
+bound (IP, MAC) ever changes that state**, and nothing is forwarded that
+could move the robot reader's expected sequence number past the genuine
+writer's (review finding F1: one spoofed DATA with the motion writer's GUID
+and a far-future sequence number used to make every later genuine frame
+look like a replay — suppressed, command timeout, fall).
+
+- **Replays / retransmissions.** A sample of the bound stream whose number
+  is not newer than the last forwarded one (or that is still cached as
+  suppressed) is not decided again: the cached output is re-emitted byte
+  for byte if the slot has the same length, otherwise it is suppressed. A
+  replay of an old number with new content delivers what was decided for
+  that number the first time. Sequence number `<= 0` is suppressed.
+- **Foreign samples** (unknown GUID, or an authorised GUID from an IP / MAC
+  the channel does not allow) are decided (the firewall records them) but
+  never touch the stream's state, and with `foreign_source_action:
+  substitute` the substitute is only written into a foreign sample whose
+  GUID is neither authorised nor carrying an authorised stream (under such
+  a GUID it would ride on the spoofer's sequence number).
+- **Binding conflicts.** An authorised GUID from another (IP, MAC) than the
+  bound one is suppressed while the bound side is live (it sent anything
+  within `rtps.binding_takeover_ns`, default 1 s); after that silence the
+  other side may continue the stream, above the numbers already forwarded.
+- **Jumps.** A number more than `rtps.max_sn_jump` (default 64) ahead of the
+  last forwarded one is suppressed and the state does not move; if the
+  next sample of the same binding follows it within the window (real loss,
+  a cable unplugged while the controller kept writing) the jump is adopted
+  (one tick lost). A writer increments its sequence number by one per
+  sample, so a genuine stream only jumps by what was lost on the wire.
+- **Writer restart.** A DDS writer that restarts with the same GUID (rare:
+  most stacks draw a new GUID prefix per participant) re-announces itself
+  (SEDP) before its numbers start again at 1. An SEDP announcement or
+  removal of the writer from the bound IP (and MAC) arms a restart: the
+  next lower number `<= max_sn_jump` from the bound side starts a fresh
+  stream. The arm is cleared by the next forwarded newer sample, and an
+  announcement from any other source does not arm it, so a captured
+  datagram replayed later is still a replay.
+
+What the gateway **cannot** do: an attacker who can send from the
+controller's IP **and** MAC on the controller-side segment is
+indistinguishable from the controller. It can then send frames the
+firewall accepts (within the envelope), push the robot reader's sequence
+number forward by up to `max_sn_jump` per forwarded frame, race the
+controller's stream, and arm a restart with a spoofed SEDP. Against that,
+the controller-side port of the bridge must carry only the controller (a
+point-to-point cable, or a switch port with port security), which is part
+of the deployment requirements. With `allowed_src_ips` empty, the first
+(IP, MAC) to have a sample forwarded after a gateway start owns the
+stream until it falls silent: set `allowed_src_ips` (and, on a shared
+segment, `allowed_src_macs`) on every channel.
 
 ## Undecidable samples, fragments, malformed datagrams
 
@@ -149,6 +201,20 @@ the first time. Sequence number `<= 0` (invalid) is suppressed.
   are suppressed. The Unitree SDK does not fragment `LowCmd_` (≈ 1 KB) at
   Cyclone DDS's default 1344-octet fragment size; a fragmented one is a
   misconfiguration or an attack. Fragmented SEDP is reassembled (bounded).
+- **The same samples from an unknown writer** (no SEDP seen, not in the
+  state file) are suppressed too in enforce mode with `unknown_writers:
+  probe` (review finding F2): the content probe needs a whole payload, so
+  such a sample could be a motion command nobody checked (for instance one
+  the robot matched to `rt/lowcmd` through an announcement the gateway did
+  not see). Writers classified by SEDP on another topic are not affected;
+  `unknown_writers: pass` opts out (unknown writers unchecked). The gateway
+  does **not** reassemble user fragments to probe them: the fragments
+  before the last one would already have been forwarded, a fragment can
+  only be passed or suppressed (not rewritten), and a bounded reassembler
+  that evicts a sample the robot's reassembler still holds would forward
+  the completing fragment unchecked. No legitimate controller-side writer
+  of this deployment sends the robot fragmented samples without an SEDP
+  announcement.
 - **IP fragments** never reach the decision: the ruleset enables IPv4
   defragmentation in front of the queue and drops any fragment that still
   arrives; the gateway also drops one.
@@ -169,6 +235,29 @@ the first time. Sequence number `<= 0` (invalid) is suppressed.
 Every representation the decoder reads is rewritten in kind (CDR / CDR2 /
 D_CDR2, either endianness). Only the plain Unitree CRC is supported for Go1
 (a fleet using the SDK's unpublished `encryptCRC` cannot be enforced).
+
+## Non-motor `LowCmd_` fields
+
+A `LowCmd_` carries fields besides the motor slots. Review finding F3: the
+go `bms_cmd.off = 0xA5` turns the robot's battery off. Each field, what the
+SDK says about it, and what the gateway does (SDK checkouts:
+`unitree_legged_sdk` 4539a6c, `unitree_sdk2` d1abf00):
+
+| Field (`unitree_go` unless noted) | SDK evidence | Gateway |
+|---|---|---|
+| `bms_cmd.off` | "set 0xA5 to turn off the battery" (`unitree_legged_sdk` `include/unitree_legged_sdk/comm.h:28`; `unitree_sdk2` `example/state_machine/comm.h:28`); no SDK example sets it (`LowCmd_.hpp` default 0) | **refused unless 0** (any non-zero value; the firmware's exact test is not published), unless the channel sets `allow_battery_off: true`. A refused frame is decided as an integrity failure: the platform's substitute (hold / damping) is written with the last accepted frame's non-motor fields (`off = 0`), or the SDK defaults when none was accepted yet |
+| `bms_cmd.reserve[3]` | `reserve` (`comm.h:29`) | forwarded as sent |
+| `head[2]`, `level_flag`, `frame_reserve`, `sn[2]`, `version[2]` | all marked `// reserve` in the legacy `LowCmd` (`comm.h:116-121`); SDK2 examples set `head = FE EF`, `level_flag = 0xFF` (`example/go2/go2_low_level.cpp:111-113`) | forwarded as sent (reserve; no effect documented) |
+| `bandwidth` | no documented use; not set by any example | forwarded as sent |
+| `wireless_remote[40]` | `// reserve` in `LowCmd` (`comm.h:125`; it is joystick data only in `LowState`) | forwarded as sent |
+| `led[12]`, `fan[2]`, `gpio` | Go2 additions (`example/state_machine/comm.h:137-139`, copied through by `conversion.hpp:79-81`); examples set `gpio = 0` (`go2_low_level.cpp:114`); semantics not published | forwarded as sent — **residual risk**: not motion, but not shown inert either; verify on the robot in `mode: observe` and report |
+| `reserve`, motor `reserve[3]` | reserve | forwarded as sent |
+| hg `mode_pr`, `mode_machine` | parallel / serial ankle mode, machine type | firewall pins (`pinned_mode_pr` / `pinned_mode_machine`) |
+| hg `reserve[4]` | reserve | forwarded as sent |
+
+Whatever is forwarded as sent in an accepted frame is also what a later
+substitute carries (copied from the last accepted frame, never from the
+rejected one).
 
 ## Source identity
 
@@ -246,11 +335,20 @@ oneshot unit), or `fail_closed` would mean nothing.
 | `rtps.unknown_writers` | `probe` | `probe` or `pass` |
 | `rtps.max_writers`, `rtps.max_writers_per_channel` | 4096, 16 | bounds (oldest / least recently used evicted) |
 | `rtps.state_file` | none | persisted writer → channel map |
-| `channels[]` | — | `firewall_channel`, `codec`, `topic`, `udp_ports`, `allowed_src_ips`, `legacy_sources` (IP → firewall source), `allowed_api_ids`, `allowed_high_modes` |
+| `rtps.max_sn_jump` | 64 | largest sequence-number step decided at once (larger: held until confirmed) |
+| `rtps.binding_takeover_ns` | 1 s | silence after which another (IP, MAC) may continue an authorised GUID's stream |
+| `channels[]` | — | `firewall_channel`, `codec`, `topic`, `udp_ports`, `allowed_src_ips`, `allowed_src_macs` (RTPS), `legacy_sources` (IP → firewall source), `allowed_api_ids`, `allowed_high_modes`, `allow_battery_off` (go `LowCmd_`, default `false`) |
 | `max_queue_delay_ns` | 5 ms | late packets get the fault verdict |
 | `events_path`, `events_max_bytes` | none, 64 MiB | firewall deviations as JSON lines |
 | `status_path` | none | counters, firewall stats, recv→verdict latency |
 | `housekeeping_ms` | 100 | events, status, state file, watchdog |
+
+The Go2 example's `allowed_api_ids` (and the test fixture's) include
+`Damp` (1001, `ROBOT_SPORT_API_ID_DAMP`, `unitree_sdk2`
+`include/unitree/robot/go2/sport/sport_api.hpp:19`), which makes the robot
+go limp and settle to the ground: it is kept as the operator's soft stop,
+but anyone who can present an allowed source can send it. List only the
+calls the site's controller uses.
 
 The Go2 example's sport channel needs a twist channel
 `/api/sport/request` (with `max_angular_speed`) in the firewall
@@ -299,9 +397,10 @@ Operations (status, maintenance bypass, troubleshooting):
 | Sport parameter rewrite never rounds up; length fit; refusals | `src/sport.rs` |
 | Go1 offsets agree with `robodr-cdr`'s decoder | `src/legacy.rs` |
 | NFQUEUE message codec, malformed input | `src/nfq.rs` |
+| Review findings F1–F3 (each test written first and seen failing): far-future sequence number with the writer's GUID from another IP / the controller IP with another MAC / a pinned MAC, jump held until confirmed, binding takeover only after silence, no foreign substitute under an authorised GUID, writer restart after SEDP without a replay hole; unknown-writer DATA_FRAG (single, several, out of order, oversized, foreign), key-only, non-standard suppressed, SEDP-classified / `pass` / observe unaffected; `bms_cmd.off` refused, substitute carries the last accepted non-motor fields, `allow_battery_off` | `tests/hardening.rs` |
 | Every verdict path on synthetic packets: byte-identical pass; limited rewrite equals a reference firewall's output (≤ 1 ulp, bound kept), CRC valid, length unchanged, other submessages untouched; humanoid hold for six kinds of violation and never damping / limp, suppression when nothing was accepted, hold past `max_hold_ns`; quadruped damping after the hold; foreign writer; source-IP binding; too-early; two samples in one datagram; retransmission / replay; undecidable payloads; DATA_FRAG; malformed / bad checksum / IP fragment; SEDP classification; late packet → fault verdict; sport limit / substitute / allowlist / alias; Go1 high and low; observe mode; configuration refusals; 3000-frame random stream against a reference firewall; shipped examples | `tests/gateway.rs` (21 tests) |
-| Real kernel: 3 network namespaces, bridge, rendered ruleset, NFQUEUE, the binary's run loop; pass byte-identical, hold on violation, foreign suppressed, `fail_closed` while down; latency | `tests/netns_e2e.rs` (`#[ignore]`: root; `cargo test -p robodr-firewall-gw --test netns_e2e -- --ignored --nocapture`) |
-| Fuzz: packet path + NFQUEUE parser, invariants (no panic; accept = unchanged; rewrite = same length, valid checksums; no forwarded enforced sample that does not decode strictly / with a valid CRC) | `fuzz/fuzz_targets/firewall_gw_packet.rs`, smoke run `tests/fuzz_smoke.rs` |
+| Real kernel: 3 network namespaces, bridge, rendered ruleset, NFQUEUE, the binary's run loop; pass byte-identical, hold on violation, foreign suppressed, `fail_closed` while down; latency. F1: an attacker namespace on the controller segment (macvlan, own MAC) injects the writer's GUID with SN 2^40 from its IP and then from the controller's IP; every genuine frame before and after arrives byte-identical, the kernel's `NFQA_HWADDR` tells the spoofed-IP frame apart; SEDP is queued, learned and forwarded unchanged | `tests/netns_e2e.rs` (`#[ignore]`: root; `cargo test -p robodr-firewall-gw --release --test netns_e2e -- --ignored --nocapture --test-threads 1`) |
+| Fuzz: packet path + NFQUEUE parser, invariants (no panic; accept = unchanged; rewrite = same length, valid checksums; no forwarded enforced sample that does not decode strictly / with a valid CRC; no forwarded unprobeable sample of an unknown writer; no forwarded go `LowCmd_` with `bms_cmd.off != 0`) | `fuzz/fuzz_targets/firewall_gw_packet.rs`, smoke run `tests/fuzz_smoke.rs` |
 
 ## Latency
 
@@ -361,24 +460,47 @@ these two harnesses; `gw_latency` takes `--budget-p99-ns` /
 - **Unauthenticated identity**: writer GUIDs, INFO_SRC and (on one L2
   segment) source IPs can be spoofed; the gateway's position on the
   controller-side port is what keeps robot-side traffic out of its scope.
-- **Classification needs every SEDP the robot sees.** A writer the gateway
-  learned (from SEDP) as writing another topic is not decided on, which
-  is what lets same-type channels such as G1's `rt/arm_sdk` pass. If the
-  robot ever matched that writer on `rt/lowcmd` through an announcement
-  the gateway did not see (a discovery path around the bridge, a
-  fragmented SEDP the gateway's bounded reassembler dropped), its frames
-  would pass unchecked. Unknown writers are probed; set `rtps.state_file`
-  so a restart does not forget the robot's writers (an unknown writer's
-  DATA_FRAG cannot be probed and passes).
+- **Discovery differential: classification needs every SEDP the robot
+  sees.** A writer the gateway learned (from SEDP) as writing another
+  topic is not decided on, which is what lets same-type channels such as
+  G1's `rt/arm_sdk` pass. If the robot ever matched that writer on
+  `rt/lowcmd` through an announcement the gateway did not see (a discovery
+  path around the bridge, a fragmented SEDP the gateway's bounded
+  reassembler dropped), its DATA would pass unchecked. Unknown writers are
+  probed (and their unprobeable samples suppressed); set
+  `rtps.state_file` so a restart does not forget the robot's writers.
+  Deployment rule: **all SEDP / SPDP between controller-side participants
+  and the robot must cross the bridge** — the robot must have no other
+  link (Wi-Fi, a second NIC, a cellular modem) that reaches controller-side
+  participants. Unicast SEDP from the controller side to the robot is
+  covered: it enters on the controller port and lies in the queued DDS
+  port range, as does SPDP multicast (`ruleset` unit test; the F1 netns
+  e2e sends SEDP through the bridge and checks it was learned and
+  forwarded unchanged). Test harness note: an e2e for a real differential
+  needs a second path into the robot namespace that bypasses the bridge;
+  the gateway cannot see it by construction, so the check belongs to the
+  site's network review, not to the gateway's tests.
+- **DDS ports outside the queued range are not inspected.** The ruleset
+  queues the RTPS well-known port range of each `rtps.domain_ids` entry
+  (7400 + 250·d .. +249: participant indexes 0..119). A DDS stack
+  configured for other ports (Cyclone DDS `Discovery/Ports`, or a
+  `ParticipantIndex` setting that makes it use kernel-chosen unicast
+  ports) would send its unicast SEDP and `rt/lowcmd` around the queue.
+  Verify the robot's and the controller's Cyclone DDS configuration (and
+  capture the ports in use) before relying on the gateway.
 - **No new finding types**: gateway-only conditions (malformed datagrams,
   replays, fragmented motion samples, rewrite failures) are counters in the
   status file, not findings; the firewall's own rules (`crc_invalid`,
   `rejected_*`, `joint_*`, `internal_fault`, ...) are written to
   `events_path`. Feeding that file into agentd and dedicated rule ids
   (contract 2.2) are follow-ups.
-- **Non-motor fields are not checked**: e.g. `LowCmd_.bms_cmd.off = 0xA5`
-  (battery off) in an otherwise valid frame passes, as do the sport API's
-  non-velocity calls in `allowed_api_ids`.
+- **Non-motor fields**: only `bms_cmd.off` is refused (see "Non-motor
+  `LowCmd_` fields"); `led` / `fan` / `gpio` are forwarded as sent, and so
+  are the sport API's non-velocity calls in `allowed_api_ids` (`Damp`
+  included when listed).
+- **Spoofed IP and MAC**: see "Sequence numbers and writer binding" — the
+  gateway bounds, but cannot prevent, the effect of an attacker that sends
+  with the controller's own IP and MAC on the controller-side segment.
 - **Loco `SetVelocity` (humanoid high-level), arm SDK, hand SDK channels**
   are not decided yet.
 - **Go1 compressed low-level frames** cannot be decided (dropped if the

@@ -10,6 +10,32 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ## [Unreleased]
 
+### Security
+
+- `robodr-firewall-gw` (review F1, critical): a spoofed DATA with the
+  motion writer's GUID and a far-future sequence number no longer poisons
+  the stream. Sequence / replay state is bound to (GUID, authorised
+  source, source IP, source MAC — the MAC from `NFQA_HWADDR`) and only
+  samples forwarded from that binding advance it; foreign samples never
+  touch it and never carry a substitute under an authorised GUID; the same
+  GUID from another (IP, MAC) is a binding conflict while the bound side is
+  live (`rtps.binding_takeover_ns`, default 1 s); a jump beyond
+  `rtps.max_sn_jump` (default 64) is held until confirmed by the next
+  sample; a writer restart (lower number after an SEDP re-announcement from
+  the bound IP) is accepted once. New channel option `allowed_src_macs`.
+- `robodr-firewall-gw` (review F2, high): DATA_FRAG, key-only and
+  non-standard samples of a writer with no SEDP / persisted classification
+  are suppressed in enforce mode (`unknown_writers: probe`): the content
+  probe cannot read them.
+- `robodr-firewall-gw` (review F3, medium): a go `LowCmd_` with
+  `bms_cmd.off != 0` (`0xA5` = battery off) is refused (decided as an
+  integrity failure, so the substitute with the last accepted frame's
+  non-motor fields applies) unless the channel sets `allow_battery_off`;
+  the other non-motor fields are documented with SDK evidence.
+- New status counters `binding_conflicts`, `sn_jumps`, `writer_restarts`,
+  `unknown_undecidable`, `non_motor_rejected`; fuzz invariants for F2 / F3;
+  netns e2e for F1 (attacker namespace, spoofed IP with its own MAC).
+
 ### Added
 
 - `robodr-firewall-gw` (new crate + binary): the first **in-path**

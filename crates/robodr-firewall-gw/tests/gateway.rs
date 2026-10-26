@@ -22,6 +22,7 @@ fn meta(now: u64) -> PacketMeta {
         now_ns: now,
         queue_delay_ns: None,
         instant: Instant::now(),
+        src_mac: None,
     }
 }
 
@@ -747,6 +748,7 @@ fn late_packet_gets_the_fault_verdict() {
         now_ns: T0 + 2 * MS,
         queue_delay_ns: Some(50 * MS),
         instant: Instant::now(),
+        src_mac: None,
     };
     assert_eq!(gw.process(&mut p, m), Verdict::AcceptModified);
     let h = out_lowcmd(&p, LowCmdCodec::Hg).unwrap();
