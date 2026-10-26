@@ -152,6 +152,7 @@ docs/BUILD.md           Toolchain, MSRV, Cargo.lock policy, air-gapped builds, C
 docs/PULSAR-INTEGRATION.md  Every Pulsar item the Pulsar-bound crates use.
 docs/contracts/         robodr.findings contract (v2) + JSON Schema + example,
                         robodr.control-plane contract; legacy/ = superseded 1.x.
+docs/{adr,compliance,customer}/  ADRs (D1-D9 etc.), IEC 62443/CRA/safety notes, customer drafts.
 fuzz/                   cargo-fuzz targets (RTPS, capture, black box, OCSF,
                         commissioning, firewall, pipeline config; own
                         workspace) + std-only smoke runs in the crates' tests.
