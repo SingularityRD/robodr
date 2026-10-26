@@ -4,8 +4,8 @@
 //!
 //! | Action | Adapter | What it does | Revert | TTL |
 //! |---|---|---|---|---|
-//! | `isolate_network` | [`nft`] | drops all traffic except loopback, the management / uplink allow-list, the control buses (configurable) and the motion control path | exact inverse (re-render without it) | always (default `ttl.default_s`) |
-//! | `quarantine_node` | [`nft`] | drops RTPS from the participant's GUID prefix (raw payload match) and UDP to / from its SPDP locators | exact inverse | always |
+//! | `isolate_network` | [`nft`] | drops all traffic except loopback, the management / uplink allow-list, the control buses (configurable), the motion control path, the robot's DDS discovery, DHCP, path MTU and IPv6 neighbour discovery | exact inverse (re-render without it) | always (default `ttl.default_s`) |
+//! | `quarantine_node` | [`nft`] | drops RTPS from the participant's GUID prefix (raw payload match) and UDP to / from its SPDP locators (required, provably outside the motion control path; that path is accepted before any drop) | exact inverse | always |
 //! | `record_evidence` | [`evidence`] (in agentd) | signed black-box mark naming the evidence bundle | not applicable | none |
 //! | `restrict_motion` | none in v1 | recorded as advisory to the Motion Firewall (no gateway yet) | — | — |
 //! | `safe_pause`, `request_safe_state`, `rollback_config` | none | refused (`not_executor_action`) | — | — |
@@ -14,8 +14,9 @@
 //! executor's **own** response policy and configuration) → safety re-check
 //! immediately before apply ([`decision::recheck_safety`]) → apply → verify
 //! (read back) → revert (exact inverse, idempotent) → TTL auto-revert with
-//! a persisted deadline ([`journal`]) and reconciliation at restart
-//! ([`engine::Engine::open`]).
+//! a persisted deadline (CLOCK_BOOTTIME within a boot, [`journal`]) and
+//! reconciliation at restart ([`engine::Engine::open`]; after a reboot an
+//! action is re-validated and held until a fresh safety check).
 //!
 //! agentd talks to the executor over a unix socket with an authenticated
 //! protocol ([`proto`], [`client`], [`server`]); agentd itself holds no

@@ -1,19 +1,37 @@
-//! The executor process's socket loop: one connection at a time (so one
-//! nftables transaction at a time), a read deadline per message, and the
-//! engine's housekeeping ([`Engine::tick`]) between connections.
+//! The executor process's socket loop.
+//!
+//! * **Housekeeping never waits for a peer.** [`Engine::tick`] (TTL expiry,
+//!   revert retries, the periodic read-back) runs on its own thread every
+//!   [`TICK`], independent of any connection.
+//! * **Bounded peers.** At most [`MAX_CONNECTIONS`] connections are served
+//!   at once (each on its own thread; more are closed at once). A request
+//!   line must arrive whole within [`MESSAGE_DEADLINE`], an absolute
+//!   deadline (a peer trickling one byte at a time cannot extend it), and
+//!   it is read **without** the engine: only an authenticated request takes
+//!   the engine's lock. Inside a `submit`, the safety answer agentd owes
+//!   must arrive within [`CONFIRM_DEADLINE`] (the engine is locked
+//!   meanwhile, so housekeeping is delayed by at most that much, and only by
+//!   a key holder).
+//! * One engine, one lock: one nftables transaction at a time.
 
 use std::io::{BufReader, ErrorKind};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::decision::Current;
-use crate::engine::{Engine, Outcome, SafetyOracle};
+use crate::engine::{Engine, Now, Outcome, SafetyOracle};
 use crate::proto::{self, Key, Msg, NonceCache, Reject};
 
-/// Longest a peer may take to send one message.
-pub const READ_DEADLINE: Duration = Duration::from_secs(5);
+/// Longest a peer may take to send one whole message (absolute).
+pub const MESSAGE_DEADLINE: Duration = Duration::from_secs(5);
+/// Longest agentd may take to answer the safety question inside a submit.
+pub const CONFIRM_DEADLINE: Duration = Duration::from_secs(2);
+/// Connections served at once.
+pub const MAX_CONNECTIONS: usize = 8;
 /// How often the engine's housekeeping runs.
 pub const TICK: Duration = Duration::from_millis(500);
 
@@ -23,6 +41,8 @@ pub struct ServerStats {
     pub connections: u64,
     pub rejected: u64,
     pub handled: u64,
+    /// Connections closed at once because [`MAX_CONNECTIONS`] were busy.
+    pub over_limit: u64,
 }
 
 /// Bind the socket: a stale socket at `path` is replaced, anything else
@@ -49,13 +69,17 @@ pub fn bind(path: &Path, mode: u32) -> Result<UnixListener, String> {
     Ok(l)
 }
 
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 struct ConnOracle<'a> {
     reader: &'a mut BufReader<UnixStream>,
     writer: &'a mut UnixStream,
     key: &'a Key,
     request_nonce: &'a str,
     order_id: &'a str,
-    nonces: &'a mut NonceCache,
+    nonces: &'a Mutex<NonceCache>,
 }
 
 impl SafetyOracle for ConnOracle<'_> {
@@ -72,11 +96,11 @@ impl SafetyOracle for ConnOracle<'_> {
             },
         )?;
         proto::write_line(self.writer, &line)?;
-        let raw = proto::read_line(self.reader)?;
-        let now = proto::wall_ms();
-        let r = proto::open(self.key, &raw, now, Some(&n)).map_err(|e| e.to_string())?;
-        self.nonces
-            .check(&r.nonce, now)
+        let raw = proto::read_line_by(self.reader, sent + CONFIRM_DEADLINE)?;
+        let r =
+            proto::open(self.key, &raw, proto::wall_ms(), Some(&n)).map_err(|e| e.to_string())?;
+        lock(self.nonces)
+            .check(&r.nonce, proto::mono_ms())
             .map_err(|e| e.to_string())?;
         let rtt = u64::try_from(sent.elapsed().as_millis()).unwrap_or(u64::MAX);
         match r.msg {
@@ -97,32 +121,32 @@ fn proto_text(s: &str) -> String {
 /// Handle one connection. Returns `false` when the peer was rejected.
 pub fn handle(
     stream: UnixStream,
-    engine: &mut Engine,
+    engine: &Mutex<&mut Engine>,
     key: &Key,
-    nonces: &mut NonceCache,
+    nonces: &Mutex<NonceCache>,
     boot_id: &str,
 ) -> Result<bool, String> {
     stream
         .set_nonblocking(false)
-        .and_then(|()| stream.set_read_timeout(Some(READ_DEADLINE)))
-        .and_then(|()| stream.set_write_timeout(Some(READ_DEADLINE)))
+        .and_then(|()| stream.set_write_timeout(Some(MESSAGE_DEADLINE)))
         .map_err(|e| e.to_string())?;
     let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(stream);
-    let raw = proto::read_line(&mut reader)?;
-    let now = proto::wall_ms();
-    let req = match proto::open(key, &raw, now, None) {
+    // The whole request, without the engine.
+    let raw = proto::read_line_by(&mut reader, Instant::now() + MESSAGE_DEADLINE)?;
+    let req = match proto::open(key, &raw, proto::wall_ms(), None) {
         Ok(r) => r,
         Err(Reject::Malformed(_) | Reject::BadMac | Reject::Stale | Reject::WrongReply) => {
             return Ok(false)
         }
         Err(Reject::Replayed) => return Ok(false),
     };
-    if nonces.check(&req.nonce, now).is_err() {
+    if lock(nonces).check(&req.nonce, proto::mono_ms()).is_err() {
         return Ok(false);
     }
     let answer = match req.msg {
         Msg::Submit { order } => {
+            let mut g = lock(engine);
             let mut oracle = ConnOracle {
                 reader: &mut reader,
                 writer: &mut writer,
@@ -131,7 +155,7 @@ pub fn handle(
                 order_id: &order.id,
                 nonces,
             };
-            let out = engine.submit(&order, &mut oracle, proto::wall_ms());
+            let out = g.submit(&order, &mut oracle, Now::system());
             Msg::Outcome {
                 outcome: Box::new(out),
             }
@@ -140,7 +164,7 @@ pub fn handle(
             let reason = format!("revert requested: {}", proto_text(&reason));
             Msg::Outcome {
                 outcome: Box::new(if crate::net::id_ok(&id) {
-                    engine.revert(&id, &reason, proto::wall_ms())
+                    lock(engine).revert(&id, &reason, Now::system())
                 } else {
                     bad_id(&id)
                 }),
@@ -148,18 +172,57 @@ pub fn handle(
         }
         Msg::Status { id } => Msg::Outcome {
             outcome: Box::new(if crate::net::id_ok(&id) {
-                engine.status(&id)
+                lock(engine).status(&id)
             } else {
                 bad_id(&id)
             }),
         },
-        Msg::Events { since } => Msg::EventList {
-            events: engine.events_since(since, proto::MAX_EVENTS_PER_ANSWER),
-        },
-        Msg::Ping => Msg::Pong {
-            active: engine.state().entries.len(),
-            boot_id: boot_id.to_string(),
-        },
+        Msg::Events { since } => {
+            let mut g = lock(engine);
+            if g.has_held() {
+                // Actions held after a reboot: re-armed only with the
+                // safety state now.
+                let mut oracle = ConnOracle {
+                    reader: &mut reader,
+                    writer: &mut writer,
+                    key,
+                    request_nonce: &req.nonce,
+                    order_id: "rearm",
+                    nonces,
+                };
+                let current = oracle.current();
+                g.rearm_held(current, Now::system());
+            }
+            Msg::EventList {
+                events: g.events_since(since, proto::MAX_EVENTS_PER_ANSWER),
+            }
+        }
+        Msg::Ping => {
+            let g = lock(engine);
+            let st = g.state();
+            Msg::Pong {
+                active: st.entries.len(),
+                boot_id: boot_id.to_string(),
+                operator_disabled: st.operator_disabled,
+                journal_reset: st.journal_reset_ms.is_some(),
+                held: st
+                    .entries
+                    .iter()
+                    .filter(|e| e.phase == crate::journal::Phase::Held)
+                    .count(),
+            }
+        }
+        Msg::Rearm { reason } => {
+            let r =
+                lock(engine).rearm(&format!("operator: {}", proto_text(&reason)), Now::system());
+            match r {
+                Ok(was_disabled) => Msg::Rearmed { was_disabled },
+                Err(e) => Msg::Error {
+                    code: "journal".into(),
+                    message: proto_text(&e),
+                },
+            }
+        }
         _ => Msg::Error {
             code: "unexpected_message".into(),
             message: "not a request".into(),
@@ -188,37 +251,67 @@ fn bad_id(id: &str) -> Outcome {
 }
 
 /// Serve until `stop()` is true. `on_tick` runs after every housekeeping
-/// pass (watchdog ping).
+/// pass (watchdog ping), on the housekeeping thread.
 pub fn serve(
     listener: &UnixListener,
     engine: &mut Engine,
     key: &Key,
     boot_id: &str,
-    stop: &dyn Fn() -> bool,
-    on_tick: &mut dyn FnMut(&Engine, &ServerStats),
+    stop: &(dyn Fn() -> bool + Sync),
+    on_tick: &mut (dyn FnMut(&Engine, &ServerStats) + Send),
 ) -> ServerStats {
-    let mut stats = ServerStats::default();
-    let mut nonces = NonceCache::default();
-    let mut next_tick = Instant::now();
-    while !stop() {
-        match listener.accept() {
-            Ok((s, _)) => {
-                stats.connections += 1;
-                match handle(s, engine, key, &mut nonces, boot_id) {
-                    Ok(true) => stats.handled += 1,
-                    Ok(false) | Err(_) => stats.rejected += 1,
+    let engine = Mutex::new(engine);
+    let nonces = Mutex::new(NonceCache::default());
+    let stats = Mutex::new(ServerStats::default());
+    let busy = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        let (engine, nonces, stats, busy) = (&engine, &nonces, &stats, &busy);
+        // Housekeeping: independent of every connection.
+        s.spawn(move || {
+            let mut next = Instant::now();
+            while !stop() {
+                if Instant::now() >= next {
+                    let mut g = lock(engine);
+                    g.tick(Now::system());
+                    let st = *lock(stats);
+                    on_tick(&g, &st);
+                    drop(g);
+                    next = Instant::now() + TICK;
                 }
-            }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(20));
             }
-            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+        });
+        while !stop() {
+            match listener.accept() {
+                Ok((conn, _)) => {
+                    lock(stats).connections += 1;
+                    if busy.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
+                        let mut st = lock(stats);
+                        st.over_limit += 1;
+                        st.rejected += 1;
+                        drop(conn);
+                        continue;
+                    }
+                    busy.fetch_add(1, Ordering::SeqCst);
+                    s.spawn(move || {
+                        let r = handle(conn, engine, key, nonces, boot_id);
+                        {
+                            let mut st = lock(stats);
+                            match r {
+                                Ok(true) => st.handled += 1,
+                                Ok(false) | Err(_) => st.rejected += 1,
+                            }
+                        }
+                        busy.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(100)),
+            }
         }
-        if Instant::now() >= next_tick {
-            engine.tick(proto::wall_ms());
-            on_tick(engine, &stats);
-            next_tick = Instant::now() + TICK;
-        }
-    }
-    stats
+    });
+    let out = *lock(&stats);
+    out
 }

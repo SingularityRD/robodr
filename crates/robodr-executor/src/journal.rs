@@ -7,12 +7,17 @@
 //! read-back verified it; a revert is written as `reverting` before the
 //! transaction that removes it. The table is always rendered from the
 //! `active` entries plus the one `applying` entry in flight, never from
-//! `reverting` ones. After a crash at any point, [`crate::engine`]'s
-//! reconciliation therefore knows exactly which rules may be installed:
-//! `applying` and `reverting` entries are dropped (their transaction may or
-//! may not have run; re-rendering without them reverts them), active ones
-//! whose deadline passed are reverted, the rest are re-applied and
-//! verified.
+//! `reverting` or `held` ones. After a crash at any point,
+//! [`crate::engine`]'s reconciliation therefore knows exactly which rules
+//! may be installed: `applying` and `reverting` entries are dropped (their
+//! transaction may or may not have run; re-rendering without them reverts
+//! them), active ones whose deadline passed are reverted, the rest are
+//! re-applied and verified (same boot) or held for re-validation and a
+//! fresh safety check (after a reboot).
+//!
+//! A revert is reported `reverted` only once the journal says so: when the
+//! write fails (disk full), the rules are lifted all the same, the entry
+//! stays `reverting` and the write is retried every tick.
 //!
 //! Writes are atomic: a temporary file in the same directory, fsync,
 //! rename, fsync of the directory.
@@ -27,7 +32,7 @@ use robodr_responder::ActionId;
 use serde::{Deserialize, Serialize};
 
 use crate::decision::{Effect, Refusal};
-use crate::order::Origin;
+use crate::order::{Order, Origin};
 
 pub const SCHEMA: &str = "robodr-executor-journal/v1";
 pub const FILE: &str = "journal.json";
@@ -44,6 +49,10 @@ pub enum Phase {
     Applying,
     Active,
     Reverting,
+    /// After a reboot: not installed until it is re-validated against the
+    /// current configuration and policy and a fresh safety state allows it
+    /// ([`crate::engine::Engine::rearm_held`]).
+    Held,
 }
 
 /// One installed (or being installed / removed) action.
@@ -59,6 +68,16 @@ pub struct Entry {
     /// Wall clock (Unix ms).
     pub applied_ms: u64,
     pub deadline_ms: u64,
+    /// The deadline on CLOCK_BOOTTIME (ms) of the boot in
+    /// [`State::boot_id`]: within a boot it decides expiry (a wall-clock
+    /// step changes nothing); the wall-clock deadline is used across a
+    /// reboot only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_deadline_ms: Option<u64>,
+    /// The order, for the re-validation after a reboot (absent in journals
+    /// of executor v1.0: such an entry is reverted at a reboot).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<Order>,
 }
 
 /// How a finished action ended.
@@ -114,8 +133,16 @@ pub enum EventKind {
     /// Restart reconciliation finished (detail: what it did).
     Reconciled,
     /// The journal was unreadable: the table was deleted and the executor
-    /// started empty.
+    /// started empty. High severity: whatever was in force is gone and its
+    /// history lost (status flag `journal_reset_ms` until `rearm`).
     JournalReset,
+    /// After a reboot an action waits for re-validation and a fresh safety
+    /// check before it is installed again.
+    Held,
+    /// The operator re-armed the executor after an emergency disable.
+    Rearmed,
+    /// A journal write failed (disk full, I/O error); retried.
+    JournalError,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -139,6 +166,14 @@ pub struct State {
     pub entries: Vec<Entry>,
     pub history: VecDeque<Finished>,
     pub events: VecDeque<Event>,
+    /// The operator removed table `inet robodr` (emergency disable): no
+    /// order is executed until `robodr-executor rearm`.
+    #[serde(default)]
+    pub operator_disabled: bool,
+    /// The journal was found unreadable and reset at this time (Unix ms);
+    /// cleared by `rearm`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_reset_ms: Option<u64>,
 }
 
 impl State {
@@ -150,6 +185,8 @@ impl State {
             entries: Vec::new(),
             history: VecDeque::new(),
             events: VecDeque::new(),
+            operator_disabled: false,
+            journal_reset_ms: None,
         }
     }
 

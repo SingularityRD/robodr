@@ -84,23 +84,37 @@ impl Client {
                 order: Box::new(order.clone()),
             },
         )?;
-        let mut r = self.recv(&mut c, &n)?;
-        if let Msg::Confirm { id } = &r.msg {
-            if id != &order.id {
-                return Err("executor confirmed another order".into());
-            }
-            let answer = match safety() {
-                Ok((state, age_ms)) => Msg::Safety { state, age_ms },
-                Err(reason) => Msg::NoSafety { reason },
-            };
-            self.send(&mut c, &r.nonce, &answer)?;
-            r = self.recv(&mut c, &n)?;
-        }
+        let r = self.answer_confirm(&mut c, &n, &order.id, safety)?;
         match r.msg {
             Msg::Outcome { outcome } => Ok(*outcome),
             Msg::Error { code, message } => Err(format!("executor error {code}: {message}")),
             _ => Err("unexpected executor answer".into()),
         }
+    }
+
+    /// Receive the answer to request `n`; when the executor first asks for
+    /// the safety state (`confirm` naming `expect_id`), answer it with
+    /// `safety` and receive again.
+    fn answer_confirm(
+        &self,
+        c: &mut Conn,
+        n: &str,
+        expect_id: &str,
+        safety: &mut dyn FnMut() -> Result<(SafetyState, u64), String>,
+    ) -> Result<proto::Received, String> {
+        let r = self.recv(c, n)?;
+        let Msg::Confirm { id } = &r.msg else {
+            return Ok(r);
+        };
+        if id != expect_id {
+            return Err("executor confirmed another order".into());
+        }
+        let answer = match safety() {
+            Ok((state, age_ms)) => Msg::Safety { state, age_ms },
+            Err(reason) => Msg::NoSafety { reason },
+        };
+        self.send(c, &r.nonce, &answer)?;
+        self.recv(c, n)
     }
 
     pub fn revert(&self, id: &str, reason: &str) -> Result<Outcome, String> {
@@ -120,17 +134,77 @@ impl Client {
         }
     }
 
+    /// Events since `since`, telling the executor that no safety state is
+    /// available (actions held after a reboot then stay held).
     pub fn events(&self, since: u64) -> Result<Vec<Event>, String> {
-        match self.call(&Msg::Events { since })? {
+        self.events_with_safety(since, &mut || {
+            Err("this client supplies no safety state".into())
+        })
+    }
+
+    /// Events since `since`. While actions are held after a reboot, the
+    /// executor first asks for the safety state now (`safety`), and re-arms
+    /// them only with a fresh, known state that is not engaged.
+    pub fn events_with_safety(
+        &self,
+        since: u64,
+        safety: &mut dyn FnMut() -> Result<(SafetyState, u64), String>,
+    ) -> Result<Vec<Event>, String> {
+        let mut c = self.connect()?;
+        let n = self.send(&mut c, "", &Msg::Events { since })?;
+        match self.answer_confirm(&mut c, &n, "rearm", safety)?.msg {
             Msg::EventList { events } => Ok(events),
             _ => Err("unexpected executor answer".into()),
         }
     }
 
     pub fn ping(&self) -> Result<(usize, String), String> {
+        let h = self.health()?;
+        Ok((h.active, h.boot_id))
+    }
+
+    /// The executor's status flags.
+    pub fn health(&self) -> Result<Health, String> {
         match self.call(&Msg::Ping)? {
-            Msg::Pong { active, boot_id } => Ok((active, boot_id)),
+            Msg::Pong {
+                active,
+                boot_id,
+                operator_disabled,
+                journal_reset,
+                held,
+            } => Ok(Health {
+                active,
+                boot_id,
+                operator_disabled,
+                journal_reset,
+                held,
+            }),
             _ => Err("unexpected executor answer".into()),
         }
     }
+
+    /// Re-arm the executor after an operator's emergency disable (and
+    /// acknowledge a journal reset). Returns whether it was disabled.
+    pub fn rearm(&self, reason: &str) -> Result<bool, String> {
+        match self.call(&Msg::Rearm {
+            reason: reason.into(),
+        })? {
+            Msg::Rearmed { was_disabled } => Ok(was_disabled),
+            Msg::Error { code, message } => Err(format!("executor error {code}: {message}")),
+            _ => Err("unexpected executor answer".into()),
+        }
+    }
+}
+
+/// The executor's answer to `ping`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Health {
+    pub active: usize,
+    pub boot_id: String,
+    /// The operator removed the table: orders are refused until `rearm`.
+    pub operator_disabled: bool,
+    /// The journal was unreadable and reset (High; cleared by `rearm`).
+    pub journal_reset: bool,
+    /// Actions held after a reboot.
+    pub held: usize,
 }

@@ -19,10 +19,15 @@
 #
 # Emergency disable (any time, as root):
 #     nft delete table inet robodr
-# The running executor sees the table gone, drops every action and does not
-# re-install anything (also not after a restart within the same boot).
+# The executor sees the table gone (before its next transaction, or at the
+# periodic read-back), drops every action, re-installs nothing (also not
+# after a restart within the same boot) and refuses every order until
+#     robodr-executor rearm --config /etc/robodr/executor.json
 # `systemctl stop robodr-executor` alone does NOT lift active actions (they
-# stay until revert / TTL at the next start); see OPERATIONS.md.
+# stay until revert / TTL at the next start); see OPERATIONS.md. A run that
+# ends in anything but success (crash, watchdog, failed start, start limit)
+# deletes the table through ExecStopPost= below: nothing would enforce the
+# TTL of a rule left behind.
 #
 # Checked against crates/robodr-executor:
 #   * CLI: `robodr-executor --config <executor.json> [--check-config]`;
@@ -40,9 +45,13 @@
 #     example robodr-agentd.service.d/30-executor.conf.example.
 #   * sd_notify: READY=1 after the restart reconciliation, WATCHDOG=1 every
 #     housekeeping pass (<= 1 s), STATUS=<n> active.
-#   * It reads /proc/sys/kernel/random/boot_id (a reboot re-applies active
-#     actions, an operator's removal within one boot is honoured), so
-#     ProcSubset=pid must NOT be set.
+#   * It reads /proc/sys/kernel/random/boot_id (after a reboot active
+#     actions are re-validated and re-applied only with a fresh safety state
+#     from agentd; an operator's removal within one boot is honoured) and
+#     /proc/uptime (CLOCK_BOOTTIME: TTLs within a boot), so ProcSubset=pid
+#     must NOT be set.
+#   * The configuration and the response policy are re-read before every
+#     order (no reload signal).
 #
 # Verify after editing: systemd-analyze verify robodr-executor.service
 #                       systemd-analyze security robodr-executor.service
@@ -59,6 +68,9 @@ StartLimitBurst=5
 Type=notify
 NotifyAccess=main
 ExecStart=/usr/sbin/robodr-executor --config /etc/robodr/executor.json
+# After a run that did not succeed ($SERVICE_RESULT != success): delete
+# table inet robodr and mark the journal (robodr-executor stop-cleanup).
+ExecStopPost=/usr/sbin/robodr-executor stop-cleanup --config /etc/robodr/executor.json
 # Always: TTL auto-revert needs the process. A configuration error (exit 2)
 # is not retried.
 Restart=always
@@ -100,7 +112,7 @@ InaccessiblePaths=-/var/lib/robodr/blackbox -/var/lib/robodr/spool -/var/lib/rob
 RuntimeDirectory=robodr-executor
 RuntimeDirectoryMode=0750
 ProtectProc=invisible
-# No ProcSubset=pid: it reads /proc/sys/kernel/random/boot_id.
+# No ProcSubset=pid: it reads /proc/sys/kernel/random/boot_id and /proc/uptime.
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes

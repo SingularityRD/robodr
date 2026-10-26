@@ -15,7 +15,7 @@
     "control_buses": {"exempt": true, "entries": [{"cidr": "192.168.123.0/24", "note": "Unitree robot network"}]},
     "motion_control_path": [
       {"cidr": "192.168.123.0/24", "low_level": true, "note": "Unitree robot network: rt/lowcmd and rt/lowstate (the balance loop); never cut"},
-      {"guid_prefix": "0110d0d0d0d0d0d0d0d00000", "low_level": true, "note": "rt/lowcmd writer (synthetic placeholder: take the GUID prefix from your commissioning learn report)"}
+      {"cidr": "192.168.123.0/24", "guid_prefix": "0110d0d0d0d0d0d0d0d00000", "low_level": true, "note": "rt/lowcmd writer (synthetic placeholder: take the GUID prefix from your commissioning learn report); a guid_prefix only narrows an entry, it always needs cidr and/or interface"}
     ]
   },
   "ttl": {"default_s": 600, "max_s": 3600}

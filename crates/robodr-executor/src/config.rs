@@ -23,12 +23,14 @@
 //!     "control_buses": {"exempt": true, "entries": [{"interface": "eth1"}]},
 //!     "motion_control_path": [
 //!       {"cidr": "192.168.123.0/24", "udp_ports": [7400, 7600], "note": "DDS on the robot bus"}
-//!     ]
+//!     ],
+//!     "discovery": {"multicast_groups": ["239.255.0.1"], "domains": [0]}
 //!   },
 //!   "ttl": {"default_s": 900, "max_s": 86400}
 //! }
 //! ```
 
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -42,6 +44,11 @@ pub const MAX_TTL_S: u64 = 86_400;
 pub const MAX_ENTRIES: usize = 64;
 /// Largest configuration or policy file.
 pub const MAX_FILE_BYTES: u64 = 1 << 20;
+/// Most SPDP multicast groups / DDS domains kept open during isolation.
+pub const MAX_DISCOVERY: usize = 16;
+/// Highest DDS domain id whose ports fit the RTPS port map (7400 + 250 d +
+/// 1 <= 65535).
+pub const MAX_DOMAIN: u16 = 232;
 
 fn default_nft() -> PathBuf {
     PathBuf::from("/usr/sbin/nft")
@@ -63,6 +70,12 @@ fn default_verify_s() -> u64 {
 }
 fn default_true() -> bool {
     true
+}
+fn default_groups() -> Vec<IpAddr> {
+    vec![IpAddr::from([239, 255, 0, 1])]
+}
+fn default_domains() -> Vec<u16> {
+    vec![0]
 }
 
 /// The file as written.
@@ -135,6 +148,71 @@ pub struct NetworkSection {
     /// balance-safe) and the entry is not `low_level`.
     #[serde(default)]
     pub motion_control_path: Vec<ProtectedEntry>,
+    /// DDS discovery kept working during isolation (the robot's own SPDP
+    /// multicast, IGMP, and SPDP from the protected networks).
+    #[serde(default)]
+    pub discovery: Discovery,
+}
+
+/// The robot's DDS discovery: what stays open while it is isolated, so the
+/// motion stack keeps discovering its peers (SPDP stops otherwise, and with
+/// it the participants' leases).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Discovery {
+    /// SPDP multicast groups (default `239.255.0.1`, the RTPS default). An
+    /// empty list keeps no multicast open.
+    #[serde(default = "default_groups")]
+    pub multicast_groups: Vec<IpAddr>,
+    /// DDS domain ids: their discovery and user multicast ports
+    /// (`7400 + 250 d` and `7401 + 250 d`, RTPS port map) stay open.
+    /// Default `[0]`.
+    #[serde(default = "default_domains")]
+    pub domains: Vec<u16>,
+}
+
+impl Default for Discovery {
+    fn default() -> Self {
+        Self {
+            multicast_groups: default_groups(),
+            domains: default_domains(),
+        }
+    }
+}
+
+impl Discovery {
+    /// The multicast ports of the configured domains, sorted.
+    pub fn ports(&self) -> Vec<u16> {
+        let mut v: Vec<u16> = self
+            .domains
+            .iter()
+            .filter(|d| **d <= MAX_DOMAIN)
+            .flat_map(|d| [7400 + 250 * d, 7401 + 250 * d])
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.multicast_groups.len() > MAX_DISCOVERY || self.domains.len() > MAX_DISCOVERY {
+            return Err(format!(
+                "network.discovery: more than {MAX_DISCOVERY} groups or domains"
+            ));
+        }
+        if let Some(g) = self.multicast_groups.iter().find(|g| !g.is_multicast()) {
+            return Err(format!("network.discovery: {g} is not a multicast group"));
+        }
+        if let Some(d) = self.domains.iter().find(|d| **d > MAX_DOMAIN) {
+            return Err(format!(
+                "network.discovery: domain {d} is above {MAX_DOMAIN} (RTPS port map)"
+            ));
+        }
+        if !self.multicast_groups.is_empty() && self.domains.is_empty() {
+            return Err("network.discovery: multicast groups need at least one domain".into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -157,8 +235,11 @@ impl Default for ControlBuses {
 }
 
 /// An address / interface that stays reachable during isolation. All given
-/// fields must match (AND). `port` matches either the source or the
-/// destination port (the service may be on either side).
+/// fields must match (AND). With a `port`, a packet from outside matches
+/// when it is addressed to that port (a request to a local service), or
+/// when it comes from that port **and** is a reply (TCP: not a bare SYN;
+/// UDP: conntrack `established`); the robot's own packets match either
+/// port.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AllowEntry {
@@ -175,6 +256,13 @@ pub struct AllowEntry {
 }
 
 /// Part of the motion control path. All given fields must match (AND).
+///
+/// An entry needs an address (`cidr`) and/or an `interface`: a
+/// `guid_prefix` only narrows it (to RTPS **sent by** that participant), it
+/// never stands alone, since anyone can write any prefix into an RTPS
+/// header. `udp_ports` are the robot bus ports **as destination**: an
+/// inbound (or routed) packet must be addressed to a port in the range; the
+/// robot's own outbound packets may have either port in it.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProtectedEntry {
@@ -219,9 +307,10 @@ impl AllowEntry {
 
 impl ProtectedEntry {
     pub fn validate(&self, what: &str) -> Result<(), String> {
-        if self.cidr.is_none() && self.interface.is_none() && self.guid_prefix.is_none() {
+        if self.cidr.is_none() && self.interface.is_none() {
             return Err(format!(
-                "{what}: an entry needs cidr, interface and/or guid_prefix"
+                "{what}: an entry needs cidr and/or interface (a guid_prefix only narrows an \
+                 entry: anyone can write any prefix into an RTPS header)"
             ));
         }
         if !note_ok(&self.note) {
@@ -297,6 +386,7 @@ impl ExecutorConfig {
         for (i, e) in n.motion_control_path.iter().enumerate() {
             e.validate(&format!("network.motion_control_path[{i}]"))?;
         }
+        n.discovery.validate()?;
         let t = &self.ttl;
         if t.max_s == 0 || t.max_s > MAX_TTL_S {
             return Err(format!("ttl.max_s must be 1..={MAX_TTL_S}"));
@@ -409,6 +499,21 @@ mod tests {
                 "network",
                 serde_json::json!({"motion_control_path": [{"low_level": true}]}),
             ),
+            (
+                "network",
+                serde_json::json!({"motion_control_path": [
+                    {"guid_prefix": "0110a2b3c4d5e6f701000000", "low_level": true}
+                ]}),
+            ),
+            (
+                "network",
+                serde_json::json!({"discovery": {"multicast_groups": ["10.0.0.1"]}}),
+            ),
+            (
+                "network",
+                serde_json::json!({"discovery": {"domains": [233]}}),
+            ),
+            ("network", serde_json::json!({"discovery": {"domains": []}})),
             (
                 "network",
                 serde_json::json!({"motion_control_path": [{"udp_ports": [10, 5], "cidr": "10.0.0.1"}]}),

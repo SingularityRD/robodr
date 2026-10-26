@@ -5,6 +5,8 @@
 //! robodr-executor --config /etc/robodr/executor.json --check-config
 //! robodr-executor status --config /etc/robodr/executor.json     print the journal (read-only)
 //! robodr-executor revert-all --config /etc/robodr/executor.json [--reason TEXT]
+//! robodr-executor rearm --config /etc/robodr/executor.json [--reason TEXT]
+//! robodr-executor stop-cleanup --config /etc/robodr/executor.json   (systemd ExecStopPost=)
 //! robodr-executor keygen --out /etc/robodr/keys/executor.key
 //! ```
 //!
@@ -12,6 +14,18 @@
 //! The process holds no state outside its journal: a stop or crash at any
 //! point is recovered by the reconciliation at the next start, so it has no
 //! signal handler (SIGTERM ends it like a crash would, safely).
+//!
+//! A start that fails for any reason (configuration, key, journal write,
+//! socket) deletes table `inet robodr` before it exits: no rule is left
+//! without the process that enforces its TTL. `stop-cleanup` does the same
+//! after any run that did not end in success (systemd sets
+//! `$SERVICE_RESULT`), so a unit that gives up (`StartLimitBurst=`) leaves
+//! nothing behind.
+//!
+//! `rearm` ends an operator's emergency disable (`nft delete table inet
+//! robodr`, after which every order is refused) and acknowledges a journal
+//! reset, through the running executor's socket (or the journal directly
+//! when none runs).
 
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -19,7 +33,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use robodr_executor::config::{self, ExecutorConfig, Resolved};
-use robodr_executor::engine::Engine;
+use robodr_executor::engine::{self, Engine, Now};
 use robodr_executor::nft::NftCommand;
 use robodr_executor::proto::{self, Key};
 use robodr_executor::server;
@@ -27,6 +41,8 @@ use robodr_executor::server;
 const USAGE: &str = "usage: robodr-executor --config FILE [--check-config]\n       \
                      robodr-executor status --config FILE\n       \
                      robodr-executor revert-all --config FILE [--reason TEXT]\n       \
+                     robodr-executor rearm --config FILE [--reason TEXT]\n       \
+                     robodr-executor stop-cleanup --config FILE\n       \
                      robodr-executor keygen --out FILE\n       \
                      robodr-executor --version";
 
@@ -53,7 +69,10 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     };
     let mut it = argv.iter().peekable();
     if let Some(first) = it.peek() {
-        if matches!(first.as_str(), "status" | "revert-all" | "keygen") {
+        if matches!(
+            first.as_str(),
+            "status" | "revert-all" | "keygen" | "rearm" | "stop-cleanup"
+        ) {
             a.cmd = (*first).clone();
             it.next();
         }
@@ -167,17 +186,39 @@ fn main() -> ExitCode {
     let Some(cfg_path) = &a.config else {
         return usage("--config is required");
     };
+    if a.cmd == "stop-cleanup" {
+        return stop_cleanup(cfg_path);
+    }
+    let serving = a.cmd == "run" && !a.check;
     let (cfg, policy) = match load(cfg_path) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("robodr-executor: {e}");
+            if serving {
+                fatal_start(None, &e);
+            }
             return ExitCode::from(2);
         }
     };
+    if a.cmd == "rearm" {
+        return rearm(cfg, policy, a.reason.as_deref());
+    }
     if a.cmd == "status" {
         let j = robodr_executor::journal::Journal::new(&cfg.config.state_dir);
         return match j.load() {
             robodr_executor::journal::Loaded::State(s) => {
+                if s.operator_disabled {
+                    eprintln!(
+                        "robodr-executor: DISABLED by the operator (table removed): every order \
+                         is refused until `robodr-executor rearm`"
+                    );
+                }
+                if let Some(t) = s.journal_reset_ms {
+                    eprintln!(
+                        "robodr-executor: HIGH: the journal was unreadable and reset at {t} (Unix \
+                         ms): whatever was in force was removed; acknowledge with `rearm`"
+                    );
+                }
                 println!("{}", serde_json::to_string_pretty(&s).unwrap_or_default());
                 ExitCode::SUCCESS
             }
@@ -195,6 +236,9 @@ fn main() -> ExitCode {
         Ok(k) => k,
         Err(e) => {
             eprintln!("robodr-executor: {e}");
+            if serving {
+                fatal_start(Some(&cfg), &e);
+            }
             return ExitCode::from(2);
         }
     };
@@ -216,9 +260,13 @@ fn main() -> ExitCode {
     let nft = Box::new(NftCommand::new(&cfg.config.nft));
     let socket = cfg.config.socket.clone();
     let mode = cfg.socket_mode;
-    let mut engine = match Engine::open(cfg, policy, nft, &boot, proto::wall_ms()) {
+    let cleanup_cfg = cfg.clone();
+    let mut engine = match Engine::open(cfg, policy, nft, &boot, Now::system()) {
+        // Policy and configuration are re-read before every order.
+        Ok(e) if a.cmd == "run" => e.with_reload(cfg_path.clone()),
         Ok(e) => e,
         Err(e) => {
+            // Engine::open deleted the table already.
             eprintln!("robodr-executor: start: {e}");
             return ExitCode::from(1);
         }
@@ -237,7 +285,7 @@ fn main() -> ExitCode {
             "operator revert-all: {}",
             a.reason.as_deref().unwrap_or("no reason given")
         );
-        return match engine.revert_all(&reason, proto::wall_ms()) {
+        return match engine.revert_all(&reason, Now::system()) {
             Ok(n) => {
                 println!("robodr-executor: {n} action(s) reverted; table inet robodr removed");
                 ExitCode::SUCCESS
@@ -252,6 +300,11 @@ fn main() -> ExitCode {
         Ok(l) => l,
         Err(e) => {
             eprintln!("robodr-executor: {e}");
+            let why = format!("executor start failed ({e}): every action reverted");
+            if let Err(d) = engine.revert_all(&why, Now::system()) {
+                eprintln!("robodr-executor: revert-all after a failed start: {d}");
+                fatal_start(Some(&cleanup_cfg), &e);
+            }
             return ExitCode::from(1);
         }
     };
@@ -280,14 +333,146 @@ fn main() -> ExitCode {
                 );
             }
             notify.send("WATCHDOG=1");
+            let st_ = e.state();
             notify.send(&format!(
-                "STATUS={} active, {} connections, {} rejected",
-                e.state().entries.len(),
+                "STATUS={} active, {} connections, {} rejected{}{}",
+                st_.entries.len(),
                 st.connections,
-                st.rejected
+                st.rejected,
+                if st_.operator_disabled {
+                    ", DISABLED by operator (rearm)"
+                } else {
+                    ""
+                },
+                if st_.journal_reset_ms.is_some() {
+                    ", HIGH: journal reset"
+                } else {
+                    ""
+                }
             ));
         },
     );
     eprintln!("robodr-executor: stopped ({stats:?})");
     ExitCode::SUCCESS
+}
+
+/// A fatal start error: delete the table (and mark the journal when the
+/// configuration is known) so no rule outlives TTL enforcement.
+fn fatal_start(cfg: Option<&Resolved>, why: &str) {
+    let nft_path = cfg
+        .map(|c| c.config.nft.clone())
+        .unwrap_or_else(|| PathBuf::from("/usr/sbin/nft"));
+    let mut nft = NftCommand::new(&nft_path);
+    let why = format!(
+        "executor start failed ({}): table inet robodr deleted, every action reverted",
+        why.chars().take(200).collect::<String>()
+    );
+    match engine::abandon(cfg, &mut nft, &why, proto::wall_ms()) {
+        Ok(n) => eprintln!("robodr-executor: {why} ({n} journalled)"),
+        Err(e) => eprintln!("robodr-executor: deleting table inet robodr failed: {e}"),
+    }
+}
+
+/// `ExecStopPost=`: after a run that did not succeed (systemd's
+/// `$SERVICE_RESULT`), delete the table and mark the journal: the unit may
+/// not come back (start limit), and nothing would lift the rules at their
+/// TTL.
+fn stop_cleanup(cfg_path: &std::path::Path) -> ExitCode {
+    let result = std::env::var("SERVICE_RESULT").unwrap_or_default();
+    if result == "success" {
+        return ExitCode::SUCCESS;
+    }
+    let cfg = config::read_small(cfg_path)
+        .and_then(|t| ExecutorConfig::parse(&t))
+        .and_then(ExecutorConfig::validate)
+        .ok();
+    let nft_path = cfg
+        .as_ref()
+        .map(|c| c.config.nft.clone())
+        .unwrap_or_else(|| PathBuf::from("/usr/sbin/nft"));
+    let mut nft = NftCommand::new(&nft_path);
+    let why = format!(
+        "the executor stopped without success ({}): table inet robodr deleted, every action \
+         reverted (nothing would enforce its TTL)",
+        if result.is_empty() {
+            "SERVICE_RESULT unset".to_string()
+        } else {
+            result
+                .chars()
+                .filter(char::is_ascii_graphic)
+                .take(40)
+                .collect()
+        }
+    );
+    match engine::abandon(cfg.as_ref(), &mut nft, &why, proto::wall_ms()) {
+        Ok(n) => {
+            eprintln!("robodr-executor: {why} ({n} action(s))");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("robodr-executor: stop-cleanup: deleting table inet robodr failed: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `rearm`: through the running executor, or on the journal when none runs.
+fn rearm(
+    cfg: Resolved,
+    policy: robodr_responder::ResponsePolicy,
+    reason: Option<&str>,
+) -> ExitCode {
+    let reason = reason.unwrap_or("no reason given");
+    let key = match Key::load(&cfg.config.key_file) {
+        Ok(k) => Some(k),
+        Err(e) => {
+            eprintln!("robodr-executor: {e} (re-arming on the journal instead)");
+            None
+        }
+    };
+    if let Some(key) = key {
+        let client = robodr_executor::client::Client::new(
+            cfg.config.socket.clone(),
+            key,
+            std::time::Duration::from_secs(10),
+        );
+        match client.rearm(reason) {
+            Ok(was) => {
+                println!(
+                    "robodr-executor: re-armed{}",
+                    if was { "" } else { " (it was not disabled)" }
+                );
+                return ExitCode::SUCCESS;
+            }
+            Err(e) if e.contains("executor socket") => {
+                eprintln!("robodr-executor: {e}: not running, re-arming on the journal");
+            }
+            Err(e) => {
+                eprintln!("robodr-executor: rearm: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+    let boot = robodr_executor::boot_id();
+    let nft = Box::new(NftCommand::new(&cfg.config.nft));
+    let mut engine = match Engine::open(cfg, policy, nft, &boot, Now::system()) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("robodr-executor: rearm: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    match engine.rearm(reason, Now::system()) {
+        Ok(was) => {
+            println!(
+                "robodr-executor: re-armed on the journal{}",
+                if was { "" } else { " (it was not disabled)" }
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("robodr-executor: rearm: {e}");
+            ExitCode::from(1)
+        }
+    }
 }

@@ -2,19 +2,82 @@
 //! journal intent → apply → read-back verify → commit, and revert, TTL
 //! expiry, periodic verification and restart reconciliation.
 //!
-//! The engine is single-threaded and owns the table `inet robodr`: its
-//! content is always [`nft::render`] of the journal's `active` entries (plus
-//! the one `applying` entry while it is being installed). Every function
-//! takes the wall clock (`now_ms`, Unix ms) from its caller.
+//! The engine owns the table `inet robodr`: its content is always
+//! [`nft::render`] of the journal's `active` entries (plus the one
+//! `applying` entry while it is being installed). Every function takes the
+//! time ([`Now`]: wall clock and CLOCK_BOOTTIME) from its caller.
+//!
+//! * **Time.** Within a boot, expiry is decided on CLOCK_BOOTTIME: a
+//!   wall-clock step (NTP, an operator) neither extends nor shortens an
+//!   action. Across a reboot only the wall-clock deadline exists; more TTL
+//!   left than the action was ever given counts as expired.
+//! * **Operator emergency disable** (`nft delete table inet robodr`) is
+//!   detected before every transaction (order, revert, retry) and by the
+//!   periodic read-back: every action is dropped as `removed_externally`
+//!   and every order is refused (`operator_disabled`) until
+//!   `robodr-executor rearm`. Nothing the executor does re-creates the
+//!   table in between.
+//! * **Reboot.** An active action is not re-installed blindly: it is
+//!   re-validated against the current configuration and policy (the
+//!   precheck of its stored order) and held until agentd supplies a fresh,
+//!   known safety state that is not engaged ([`Engine::rearm_held`]).
+
+use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 use robodr_responder::{ActionId, ResponsePolicy};
 use serde::{Deserialize, Serialize};
 
-use crate::config::Resolved;
+use crate::config::{ExecutorConfig, Resolved};
 use crate::decision::{self, codes, Current, Effect, Refusal};
 use crate::journal::{Entry, EventKind, Final, Finished, Journal, Loaded, Phase, State};
 use crate::nft::{self, Active, Nft, Rendered};
 use crate::order::Order;
+
+/// The time, as the engine needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Now {
+    /// Wall clock, Unix ms.
+    pub wall_ms: u64,
+    /// CLOCK_BOOTTIME, ms (`None` when unreadable: the wall clock decides).
+    pub boot_ms: Option<u64>,
+}
+
+impl Now {
+    /// The system's clocks.
+    pub fn system() -> Now {
+        Now {
+            wall_ms: crate::proto::wall_ms(),
+            boot_ms: boottime_ms(),
+        }
+    }
+}
+
+impl From<u64> for Now {
+    /// One number for both clocks (tests and tools).
+    fn from(ms: u64) -> Now {
+        Now {
+            wall_ms: ms,
+            boot_ms: Some(ms),
+        }
+    }
+}
+
+/// CLOCK_BOOTTIME in ms, from `/proc/uptime` (the kernel's boot-time
+/// clock: monotonic, counts suspend, starts at boot). `None` when
+/// unreadable.
+pub fn boottime_ms() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/uptime").ok()?;
+    let first = s.split_whitespace().next()?;
+    let (sec, frac) = first.split_once('.').unwrap_or((first, "0"));
+    let sec: u64 = sec.parse().ok()?;
+    let mut cs = frac.chars().take(3).collect::<String>();
+    while cs.len() < 3 {
+        cs.push('0');
+    }
+    let ms: u64 = cs.parse().ok()?;
+    sec.checked_mul(1000)?.checked_add(ms)
+}
 
 /// Where the engine gets the platform's current safety state from,
 /// immediately before it applies anything.
@@ -52,6 +115,9 @@ pub enum Status {
     Advisory,
     /// Removed from outside (`nft delete table inet robodr`).
     RemovedExternally,
+    /// After a reboot: waiting for re-validation and a fresh safety check
+    /// (not installed).
+    Held,
     /// No action with this id.
     Unknown,
 }
@@ -67,6 +133,7 @@ impl Status {
             Status::Failed => "failed",
             Status::Advisory => "advisory",
             Status::RemovedExternally => "removed_externally",
+            Status::Held => "held",
             Status::Unknown => "unknown",
         }
     }
@@ -117,6 +184,15 @@ fn clock_moved_back(e: &Entry, now_ms: u64) -> bool {
     e.deadline_ms.saturating_sub(now_ms) > e.ttl_s.saturating_mul(1000)
 }
 
+/// Whether `e` has expired at `now`: on CLOCK_BOOTTIME within the boot its
+/// boot deadline belongs to, on the wall clock otherwise.
+fn expired(e: &Entry, now: Now) -> bool {
+    match (e.boot_deadline_ms, now.boot_ms) {
+        (Some(bd), Some(b)) => b >= bd || bd.saturating_sub(b) > e.ttl_s.saturating_mul(1000),
+        _ => e.deadline_ms <= now.wall_ms || clock_moved_back(e, now.wall_ms),
+    }
+}
+
 /// The executor core.
 pub struct Engine {
     cfg: Resolved,
@@ -125,8 +201,16 @@ pub struct Engine {
     journal: Journal,
     state: State,
     boot_id: String,
-    last_verify_ms: u64,
-    /// The last journal write failed (reported in status).
+    last_verify_boot_ms: u64,
+    /// The configuration file, re-read (with the policy it names) before
+    /// every order and re-arm ([`Engine::with_reload`]).
+    reload: Option<PathBuf>,
+    /// Ids whose `journal_error` event was emitted (no event per retry).
+    unjournalled: BTreeSet<String>,
+    /// The last reason held actions could not be re-armed (one event per
+    /// change).
+    last_hold_reason: Option<String>,
+    /// Journal writes that failed (reported in status).
     pub journal_errors: u64,
 }
 
@@ -159,16 +243,22 @@ macro_rules! crash_point {
 impl Engine {
     /// Open the journal in `cfg.state_dir` and reconcile the table with it
     /// (see [`crate::journal`]): `applying` / `reverting` entries are
-    /// dropped, expired ones reverted, the rest re-applied and verified; a
-    /// table that vanished during this boot while actions were active was
-    /// removed by an operator and is not re-installed.
+    /// dropped, expired ones reverted, the rest re-applied and verified
+    /// (same boot) or held for re-validation (after a reboot); a table that
+    /// vanished during this boot while actions were active was removed by
+    /// an operator and is not re-installed.
+    ///
+    /// Any error deletes table `inet robodr` before it is returned: a start
+    /// that fails never leaves rules without the process that enforces
+    /// their TTL.
     pub fn open(
         cfg: Resolved,
         policy: ResponsePolicy,
         nft: Box<dyn Nft + Send>,
         boot_id: &str,
-        now_ms: u64,
+        now: impl Into<Now>,
     ) -> Result<Self, String> {
+        let now = now.into();
         let journal = Journal::new(&cfg.config.state_dir);
         let mut e = Engine {
             state: State::empty(boot_id),
@@ -177,16 +267,34 @@ impl Engine {
             nft,
             journal,
             boot_id: boot_id.to_string(),
-            last_verify_ms: now_ms,
+            last_verify_boot_ms: now.boot_ms.unwrap_or(now.wall_ms),
+            reload: None,
+            unjournalled: BTreeSet::new(),
+            last_hold_reason: None,
             journal_errors: 0,
         };
-        match e.journal.load() {
+        match e.open_inner(now) {
+            Ok(()) => Ok(e),
+            Err(err) => {
+                let del = nft::delete_table(e.nft.as_mut());
+                Err(match del {
+                    Ok(()) => format!(
+                        "{err} (table inet robodr deleted: no rule outlives a failed start)"
+                    ),
+                    Err(d) => format!("{err}; deleting table inet robodr failed too: {d}"),
+                })
+            }
+        }
+    }
+
+    fn open_inner(&mut self, now: Now) -> Result<(), String> {
+        match self.journal.load() {
             Loaded::Fresh => {
-                let leftover = nft::table_exists(e.nft.as_mut())?;
+                let leftover = nft::table_exists(self.nft.as_mut())?;
                 if leftover {
-                    nft::delete_table(e.nft.as_mut())?;
-                    e.state.event(
-                        now_ms,
+                    nft::delete_table(self.nft.as_mut())?;
+                    self.state.event(
+                        now.wall_ms,
                         EventKind::Reconciled,
                         None,
                         None,
@@ -195,44 +303,79 @@ impl Engine {
                 }
             }
             Loaded::Corrupt(why) => {
-                nft::delete_table(e.nft.as_mut())?;
-                e.state.event(
-                    now_ms,
+                nft::delete_table(self.nft.as_mut())?;
+                self.state.journal_reset_ms = Some(now.wall_ms);
+                self.state.event(
+                    now.wall_ms,
                     EventKind::JournalReset,
                     None,
                     None,
                     format!(
-                        "the journal was unreadable ({why}): table inet robodr deleted, every \
-                         action reverted, starting empty"
+                        "HIGH: the journal was unreadable ({why}): table inet robodr deleted, \
+                         every action reverted, history lost, starting empty"
                     ),
                 );
             }
             Loaded::State(s) => {
-                e.state = s;
-                e.reconcile(now_ms)?;
+                self.state = s;
+                self.reconcile(now)?;
             }
         }
-        e.state.boot_id = boot_id.to_string();
-        e.journal.save(&e.state)?;
-        Ok(e)
+        self.state.boot_id = self.boot_id.clone();
+        self.journal.save(&self.state)
     }
 
-    fn reconcile(&mut self, now_ms: u64) -> Result<(), String> {
+    /// Re-read the configuration file (and the policy it names) before every
+    /// order and re-arm. The socket, key, state directory and `nft` path keep
+    /// their values (a restart changes them).
+    pub fn with_reload(mut self, config_path: PathBuf) -> Self {
+        self.reload = Some(config_path);
+        self
+    }
+
+    fn reload_config(&mut self) -> Result<(), Refusal> {
+        let Some(p) = &self.reload else {
+            return Ok(());
+        };
+        let fail = |e: String| {
+            Refusal::new(
+                codes::CONFIG_UNAVAILABLE,
+                format!("the configuration or response policy could not be re-read: {e}"),
+            )
+        };
+        let text = crate::config::read_small(p).map_err(fail)?;
+        let mut new = ExecutorConfig::parse(&text)
+            .and_then(ExecutorConfig::validate)
+            .map_err(fail)?;
+        let policy = crate::config::load_policy(&new.config.policy_path).map_err(fail)?;
+        let old = &self.cfg.config;
+        new.config.socket = old.socket.clone();
+        new.config.key_file = old.key_file.clone();
+        new.config.state_dir = old.state_dir.clone();
+        new.config.nft = old.nft.clone();
+        new.socket_mode = self.cfg.socket_mode;
+        self.cfg = new;
+        self.policy = policy;
+        Ok(())
+    }
+
+    fn reconcile(&mut self, now: Now) -> Result<(), String> {
         let same_boot = self.state.boot_id == self.boot_id;
         let mut summary = Vec::new();
         let entries = std::mem::take(&mut self.state.entries);
         let mut keep = Vec::new();
-        for en in entries {
+        let mut held = Vec::new();
+        for mut en in entries {
             match en.phase {
                 Phase::Applying => {
                     self.finish(
                         &en,
                         Final::Failed,
-                        now_ms,
+                        now.wall_ms,
                         "interrupted between apply and commit (crash or stop): reverted at restart",
                     );
                     self.state.event(
-                        now_ms,
+                        now.wall_ms,
                         EventKind::Failed,
                         Some(&en.id),
                         Some(en.action),
@@ -241,9 +384,14 @@ impl Engine {
                     summary.push(format!("{} interrupted apply reverted", en.id));
                 }
                 Phase::Reverting => {
-                    self.finish(&en, Final::Reverted, now_ms, "revert completed at restart");
+                    self.finish(
+                        &en,
+                        Final::Reverted,
+                        now.wall_ms,
+                        "revert completed at restart",
+                    );
                     self.state.event(
-                        now_ms,
+                        now.wall_ms,
                         EventKind::Reverted,
                         Some(&en.id),
                         Some(en.action),
@@ -251,17 +399,29 @@ impl Engine {
                     );
                     summary.push(format!("{} revert completed", en.id));
                 }
-                Phase::Active if en.deadline_ms <= now_ms || clock_moved_back(&en, now_ms) => {
+                _ if {
+                    // A boot deadline of another boot means nothing here.
+                    if !same_boot {
+                        en.boot_deadline_ms = None;
+                    }
+                    expired(&en, now)
+                } =>
+                {
                     self.state.event(
-                        now_ms,
+                        now.wall_ms,
                         EventKind::Expired,
                         Some(&en.id),
                         Some(en.action),
                         "TTL expired while the executor was down (or the clock moved back)",
                     );
-                    self.finish(&en, Final::Reverted, now_ms, "TTL expired (at restart)");
+                    self.finish(
+                        &en,
+                        Final::Reverted,
+                        now.wall_ms,
+                        "TTL expired (at restart)",
+                    );
                     self.state.event(
-                        now_ms,
+                        now.wall_ms,
                         EventKind::Reverted,
                         Some(&en.id),
                         Some(en.action),
@@ -269,28 +429,60 @@ impl Engine {
                     );
                     summary.push(format!("{} expired", en.id));
                 }
-                Phase::Active => keep.push(en),
+                Phase::Active if same_boot => keep.push(en),
+                Phase::Active | Phase::Held => held.push(en),
             }
         }
-        if !keep.is_empty() && same_boot && !nft::table_exists(self.nft.as_mut())? {
-            for en in &keep {
-                self.finish(
-                    en,
-                    Final::RemovedExternally,
-                    now_ms,
-                    "table inet robodr was removed while the executor was down (same boot): \
-                     operator emergency disable honoured, not re-applied",
-                );
-                self.state.event(
-                    now_ms,
-                    EventKind::RemovedExternally,
-                    Some(&en.id),
-                    Some(en.action),
-                    "table removed from outside during this boot: not re-applied",
-                );
+        // After a reboot: re-validate against the current configuration and
+        // policy, then hold until a fresh safety check (never re-installed
+        // blindly).
+        for mut en in held {
+            if en.boot_deadline_ms.is_none() {
+                let left = en
+                    .deadline_ms
+                    .saturating_sub(now.wall_ms)
+                    .min(en.ttl_s.saturating_mul(1000));
+                en.boot_deadline_ms = now.boot_ms.map(|b| b.saturating_add(left));
             }
-            summary.push(format!("{} removed externally", keep.len()));
-            keep.clear();
+            match self.revalidate(&en) {
+                Ok(effect) => {
+                    en.effect = effect;
+                    en.phase = Phase::Held;
+                    self.state.event(
+                        now.wall_ms,
+                        EventKind::Held,
+                        Some(&en.id),
+                        Some(en.action),
+                        "after a reboot: re-validated against the current configuration and \
+                         policy, held until a fresh safety check allows it",
+                    );
+                    summary.push(format!("{} held", en.id));
+                    keep.push(en);
+                }
+                Err(r) => {
+                    let why = format!("not re-applied after a reboot: {}: {}", r.code, r.reason);
+                    self.finish(&en, Final::Reverted, now.wall_ms, &why);
+                    self.state.event(
+                        now.wall_ms,
+                        EventKind::Reverted,
+                        Some(&en.id),
+                        Some(en.action),
+                        why,
+                    );
+                    summary.push(format!("{} not re-applied", en.id));
+                }
+            }
+        }
+        let installed = keep.iter().any(|e| e.phase == Phase::Active);
+        if installed && same_boot && !nft::table_exists(self.nft.as_mut())? {
+            self.state.entries = keep;
+            self.operator_removed(
+                now.wall_ms,
+                "table inet robodr was removed while the executor was down (same boot): \
+                 operator emergency disable honoured, not re-applied",
+            );
+            summary.push("removed externally: executor disabled until rearm".into());
+            keep = std::mem::take(&mut self.state.entries);
         }
         self.state.entries = keep;
         let r = self.rendered();
@@ -302,23 +494,19 @@ impl Engine {
             let del = nft::delete_table(self.nft.as_mut())
                 .and_then(|()| self.read_verify(&Rendered { chains: None }));
             for en in &entries {
-                self.finish(
-                    en,
-                    Final::Reverted,
-                    now_ms,
-                    &format!("could not be re-applied at restart ({err}): reverted"),
-                );
+                let why = format!("could not be re-applied at restart ({err}): reverted");
+                self.finish(en, Final::Reverted, now.wall_ms, &why);
                 self.state.event(
-                    now_ms,
+                    now.wall_ms,
                     EventKind::Reverted,
                     Some(&en.id),
                     Some(en.action),
-                    format!("could not be re-applied at restart ({err}): reverted"),
+                    why,
                 );
             }
             if let Err(e2) = del {
                 self.state.event(
-                    now_ms,
+                    now.wall_ms,
                     EventKind::RevertFailed,
                     None,
                     None,
@@ -326,17 +514,23 @@ impl Engine {
                         "restart: re-apply failed ({err}) and deleting the table failed ({e2})"
                     ),
                 );
+                return Err(format!(
+                    "re-apply failed ({err}), table delete failed ({e2})"
+                ));
             }
             summary.push(format!("re-apply failed: {err}"));
-        } else if !self.state.entries.is_empty() {
+        } else if installed {
             summary.push(format!(
-                "{} active action(s) re-applied and verified{}",
-                self.state.entries.len(),
-                if same_boot { "" } else { " after a reboot" }
+                "{} active action(s) re-applied and verified",
+                self.state
+                    .entries
+                    .iter()
+                    .filter(|e| e.phase == Phase::Active)
+                    .count()
             ));
         }
         self.state.event(
-            now_ms,
+            now.wall_ms,
             EventKind::Reconciled,
             None,
             None,
@@ -347,6 +541,19 @@ impl Engine {
             },
         );
         Ok(())
+    }
+
+    /// The precheck of a held entry's order against the current
+    /// configuration and policy; the effect it would have now.
+    fn revalidate(&self, en: &Entry) -> Result<Effect, Refusal> {
+        let Some(order) = &en.order else {
+            return Err(Refusal::new(
+                codes::INVALID_ORDER,
+                "the journal entry holds no order to re-validate (written by executor v1.0)",
+            ));
+        };
+        let p = decision::precheck(order, &self.policy, &self.cfg)?;
+        Ok(p.effect)
     }
 
     fn finish(&mut self, en: &Entry, result: Final, at_ms: u64, detail: &str) {
@@ -370,13 +577,13 @@ impl Engine {
     }
 
     /// The rendering of the current journal: `active` and `applying`
-    /// entries.
+    /// entries (never `reverting` or `held` ones).
     pub fn rendered(&self) -> Rendered {
         let act: Vec<Active<'_>> = self
             .state
             .entries
             .iter()
-            .filter(|e| e.phase != Phase::Reverting)
+            .filter(|e| matches!(e.phase, Phase::Active | Phase::Applying))
             .map(|e| Active {
                 id: &e.id,
                 effect: &e.effect,
@@ -404,10 +611,98 @@ impl Engine {
         &self.policy
     }
 
+    pub fn config(&self) -> &Resolved {
+        &self.cfg
+    }
+
+    /// Actions held after a reboot (waiting for [`Engine::rearm_held`]).
+    pub fn has_held(&self) -> bool {
+        self.state.entries.iter().any(|e| e.phase == Phase::Held)
+    }
+
+    /// Every action is dropped as `removed_externally` and the executor is
+    /// disabled until [`Engine::rearm`] (the operator removed the table).
+    fn operator_removed(&mut self, now_ms: u64, detail: &str) {
+        let entries = std::mem::take(&mut self.state.entries);
+        for en in &entries {
+            self.finish(en, Final::RemovedExternally, now_ms, detail);
+            self.state.event(
+                now_ms,
+                EventKind::RemovedExternally,
+                Some(&en.id),
+                Some(en.action),
+                detail.to_string(),
+            );
+        }
+        if !self.state.operator_disabled {
+            self.state.operator_disabled = true;
+            self.state.event(
+                now_ms,
+                EventKind::RemovedExternally,
+                None,
+                None,
+                "operator emergency disable (table inet robodr removed): every order is refused \
+                 until `robodr-executor rearm`",
+            );
+        }
+        let _ = self.save();
+    }
+
+    /// Before a transaction: is the table gone while the journal says rules
+    /// are in force? Then an operator removed it: honour that (nothing is
+    /// re-created) and answer `true`. An nft error answers `false` (the
+    /// transaction then reports it).
+    fn removed_by_operator(&mut self, now_ms: u64) -> bool {
+        if !self.state.entries.iter().any(|e| e.phase == Phase::Active) {
+            return false;
+        }
+        match nft::table_exists(self.nft.as_mut()) {
+            Ok(false) => {
+                self.operator_removed(
+                    now_ms,
+                    "table inet robodr was removed from outside (emergency disable): action \
+                     dropped, not re-applied",
+                );
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The operator's explicit re-arm after an emergency disable (and the
+    /// acknowledgement of a journal reset). Returns whether the executor was
+    /// disabled.
+    pub fn rearm(&mut self, reason: &str, now: impl Into<Now>) -> Result<bool, String> {
+        let now = now.into();
+        let was = self.state.operator_disabled;
+        self.state.operator_disabled = false;
+        self.state.journal_reset_ms = None;
+        self.state.event(
+            now.wall_ms,
+            EventKind::Rearmed,
+            None,
+            None,
+            format!(
+                "re-armed by the operator{}: {}",
+                if was { "" } else { " (was not disabled)" },
+                crate::net::clip(reason)
+            ),
+        );
+        self.save()?;
+        Ok(was)
+    }
+
     /// Execute one order (see the module docs). Never panics; every path
     /// ends in an outcome and, unless refused before anything happened, an
     /// event.
-    pub fn submit(&mut self, order: &Order, oracle: &mut dyn SafetyOracle, now_ms: u64) -> Outcome {
+    pub fn submit(
+        &mut self,
+        order: &Order,
+        oracle: &mut dyn SafetyOracle,
+        now: impl Into<Now>,
+    ) -> Outcome {
+        let now = now.into();
+        let now_ms = now.wall_ms;
         let digest = order.digest();
         if let Some(en) = self.state.entry(&order.id) {
             if en.digest == digest {
@@ -424,6 +719,22 @@ impl Engine {
                 return o;
             }
             return self.refused_conflict(order);
+        }
+        self.removed_by_operator(now_ms);
+        if self.state.operator_disabled {
+            return self.refuse(
+                order,
+                &digest,
+                Refusal::new(
+                    codes::OPERATOR_DISABLED,
+                    "the operator removed table inet robodr (emergency disable): nothing is \
+                     executed until `robodr-executor rearm`",
+                ),
+                now_ms,
+            );
+        }
+        if let Err(r) = self.reload_config() {
+            return self.refuse(order, &digest, r, now_ms);
         }
         let planned = match decision::precheck(order, &self.policy, &self.cfg) {
             Ok(p) => p,
@@ -468,16 +779,14 @@ impl Engine {
             }
             _ => planned.ttl_s.unwrap_or(self.cfg.config.ttl.default_s),
         };
-        // One isolation at a time; one quarantine per participant.
+        // One isolation at a time; one quarantine per participant (a held
+        // action does not count: the new order supersedes it).
         let clash = self
             .state
             .entries
             .iter()
-            .find(|e| match (&e.effect, &planned.effect) {
-                (Effect::Isolate(_), Effect::Isolate(_)) => true,
-                (Effect::Quarantine(a), Effect::Quarantine(b)) => a.guid_prefix == b.guid_prefix,
-                _ => false,
-            });
+            .filter(|e| e.phase != Phase::Held)
+            .find(|e| clashes(&e.effect, &planned.effect));
         if let Some(c) = clash {
             let r = Refusal::new(
                 codes::ALREADY_ACTIVE,
@@ -495,6 +804,25 @@ impl Engine {
         {
             return self.refuse(order, &digest, r, now_ms);
         }
+        let superseded: Vec<Entry> = self
+            .state
+            .entries
+            .iter()
+            .filter(|e| e.phase == Phase::Held && clashes(&e.effect, &planned.effect))
+            .cloned()
+            .collect();
+        for en in &superseded {
+            self.state.entries.retain(|e| e.id != en.id);
+            let why = format!("held after a reboot, superseded by request {}", order.id);
+            self.finish(en, Final::Reverted, now_ms, &why);
+            self.state.event(
+                now_ms,
+                EventKind::Reverted,
+                Some(&en.id),
+                Some(en.action),
+                why,
+            );
+        }
         let deadline = now_ms.saturating_add(ttl.saturating_mul(1000));
         self.state.entries.push(Entry {
             id: order.id.clone(),
@@ -506,6 +834,10 @@ impl Engine {
             ttl_s: ttl,
             applied_ms: now_ms,
             deadline_ms: deadline,
+            boot_deadline_ms: now
+                .boot_ms
+                .map(|b| b.saturating_add(ttl.saturating_mul(1000))),
+            order: Some(order.clone()),
         });
         if let Err(e) = self.save() {
             self.state.entries.retain(|en| en.id != order.id);
@@ -550,9 +882,122 @@ impl Engine {
             Some(order.action),
             "read-back matches the rendered rules",
         );
-        self.last_verify_ms = now_ms;
         let _ = self.save();
         self.status(&order.id)
+    }
+
+    /// Re-arm the actions held after a reboot, with the platform's safety
+    /// state now (asked from agentd): it must be known, fresh and not
+    /// engaged ([`decision::recheck_rearm`]); each held order is prechecked
+    /// again against the current configuration and policy. Without a usable
+    /// state they stay held (and expire at their deadline).
+    pub fn rearm_held(&mut self, current: Result<Current, String>, now: impl Into<Now>) {
+        let now = now.into();
+        let now_ms = now.wall_ms;
+        if !self.has_held() {
+            return;
+        }
+        if let Err(r) = decision::recheck_rearm(current, self.cfg.config.max_safety_age_ms) {
+            let why = format!("{}: {}", r.code, r.reason);
+            if self.last_hold_reason.as_deref() != Some(why.as_str()) {
+                self.state.event(
+                    now_ms,
+                    EventKind::Held,
+                    None,
+                    None,
+                    format!("held actions not re-armed: {why}"),
+                );
+                self.last_hold_reason = Some(why);
+                let _ = self.save();
+            }
+            return;
+        }
+        self.last_hold_reason = None;
+        if self.removed_by_operator(now_ms) || self.state.operator_disabled {
+            return;
+        }
+        let reload = self.reload_config().err();
+        let held: Vec<Entry> = self
+            .state
+            .entries
+            .iter()
+            .filter(|e| e.phase == Phase::Held)
+            .cloned()
+            .collect();
+        let mut armed = Vec::new();
+        for en in held {
+            let check = match &reload {
+                Some(r) => Err(r.clone()),
+                None => self.revalidate(&en),
+            };
+            let clash = self
+                .state
+                .entries
+                .iter()
+                .filter(|e| e.phase == Phase::Active)
+                .find(|e| check.as_ref().is_ok_and(|eff| clashes(&e.effect, eff)))
+                .map(|e| e.id.clone());
+            match (check, clash) {
+                (Ok(effect), None) => {
+                    if let Some(x) = self.state.entries.iter_mut().find(|x| x.id == en.id) {
+                        x.effect = effect;
+                        x.phase = Phase::Applying;
+                    }
+                    armed.push(en.id.clone());
+                }
+                (check, clash) => {
+                    let why = match (check, clash) {
+                        (Err(r), _) => format!("not re-armed: {}: {}", r.code, r.reason),
+                        (_, Some(c)) => format!("not re-armed: request {c} is in force"),
+                        _ => String::new(),
+                    };
+                    self.state.entries.retain(|x| x.id != en.id);
+                    self.finish(&en, Final::Reverted, now_ms, &why);
+                    self.state.event(
+                        now_ms,
+                        EventKind::Reverted,
+                        Some(&en.id),
+                        Some(en.action),
+                        why,
+                    );
+                }
+            }
+        }
+        if armed.is_empty() {
+            let _ = self.save();
+            return;
+        }
+        let done = self.save().and_then(|()| self.install());
+        for id in &armed {
+            let Some(pos) = self.state.entries.iter().position(|x| &x.id == id) else {
+                continue;
+            };
+            match &done {
+                Ok(()) => {
+                    self.state.entries[pos].phase = Phase::Active;
+                    let action = self.state.entries[pos].action;
+                    self.state.event(
+                        now_ms,
+                        EventKind::Verified,
+                        Some(id),
+                        Some(action),
+                        "re-armed after a reboot (re-validated, safety state fresh and not \
+                         engaged): installed and verified",
+                    );
+                }
+                Err(e) => {
+                    let en = self.state.entries.remove(pos);
+                    let why = format!("could not be re-armed after a reboot ({e}): reverted");
+                    self.finish(&en, Final::Reverted, now_ms, &why);
+                    self.state
+                        .event(now_ms, EventKind::Reverted, Some(id), Some(en.action), why);
+                }
+            }
+        }
+        if done.is_err() {
+            let _ = self.install();
+        }
+        let _ = self.save();
     }
 
     fn refused_conflict(&mut self, order: &Order) -> Outcome {
@@ -631,23 +1076,73 @@ impl Engine {
     }
 
     /// Revert one action (request, TTL, operator). Idempotent: an action
-    /// already finished answers its final status.
-    pub fn revert(&mut self, id: &str, reason: &str, now_ms: u64) -> Outcome {
+    /// already finished answers its final status. `reverted` is answered
+    /// only once the journal records it (see [`crate::journal`]).
+    pub fn revert(&mut self, id: &str, reason: &str, now: impl Into<Now>) -> Outcome {
+        let now_ms = now.into().wall_ms;
         let Some(pos) = self.state.entries.iter().position(|e| e.id == id) else {
             return self.status(id);
         };
+        if self.state.entries[pos].phase == Phase::Held {
+            // Not installed: nothing to remove.
+            let en = self.state.entries.remove(pos);
+            self.finish(&en, Final::Reverted, now_ms, reason);
+            self.state.event(
+                now_ms,
+                EventKind::Reverted,
+                Some(id),
+                Some(en.action),
+                reason.to_string(),
+            );
+            if self.save().is_err() {
+                self.state.entries.push(en);
+                self.state.history.retain(|h| h.id != id);
+                let mut o = self.status(id);
+                o.error = Some("journal write failed: retried".into());
+                return o;
+            }
+            return self.status(id);
+        }
+        if self.removed_by_operator(now_ms) {
+            return self.status(id);
+        }
         self.state.entries[pos].phase = Phase::Reverting;
-        let _ = self.save();
+        if let Err(e) = self.save() {
+            self.journal_failed(id, now_ms, &e);
+        }
         crash_point!(crate::fault::Point::AfterRevertIntent, id);
         self.finish_revert(id, reason, now_ms)
+    }
+
+    fn journal_failed(&mut self, id: &str, now_ms: u64, e: &str) {
+        if self.unjournalled.insert(id.to_string()) {
+            let action = self.state.entry(id).map(|x| x.action);
+            self.state.event(
+                now_ms,
+                EventKind::JournalError,
+                Some(id),
+                action,
+                format!(
+                    "journal write failed ({e}): the revert is reported `reverting` until it is \
+                     journalled; retried every tick"
+                ),
+            );
+        }
     }
 
     fn finish_revert(&mut self, id: &str, reason: &str, now_ms: u64) -> Outcome {
         let Some(en) = self.state.entry(id).cloned() else {
             return self.status(id);
         };
+        if self.removed_by_operator(now_ms) {
+            return self.status(id);
+        }
         match self.install() {
             Ok(()) => {
+                // The rules are lifted (a `reverting` entry is never
+                // rendered). Report `reverted` only once the journal says
+                // so: otherwise a restart would re-apply it.
+                let before = self.state.clone();
                 self.state.entries.retain(|e| e.id != id);
                 self.finish(&en, Final::Reverted, now_ms, reason);
                 self.state.event(
@@ -657,7 +1152,17 @@ impl Engine {
                     Some(en.action),
                     reason.to_string(),
                 );
-                let _ = self.save();
+                if let Err(e) = self.save() {
+                    self.state = before;
+                    self.journal_failed(id, now_ms, &e);
+                    let mut o = self.status(id);
+                    o.error = Some(format!(
+                        "the rules are lifted but the revert could not be journalled ({e}): \
+                         retried every tick"
+                    ));
+                    return o;
+                }
+                self.unjournalled.remove(id);
                 self.status(id)
             }
             Err(e) => {
@@ -676,9 +1181,12 @@ impl Engine {
         }
     }
 
-    /// Housekeeping, every second or so: retry failed reverts, revert
-    /// expired actions, and every `verify_interval_s` read the table back.
-    pub fn tick(&mut self, now_ms: u64) {
+    /// Housekeeping, every 500 ms or so: retry failed reverts, revert
+    /// expired actions (held ones included), and every `verify_interval_s`
+    /// read the table back.
+    pub fn tick(&mut self, now: impl Into<Now>) {
+        let now = now.into();
+        let now_ms = now.wall_ms;
         let reverting: Vec<String> = self
             .state
             .entries
@@ -693,9 +1201,7 @@ impl Engine {
             .state
             .entries
             .iter()
-            .filter(|e| {
-                e.phase == Phase::Active && (e.deadline_ms <= now_ms || clock_moved_back(e, now_ms))
-            })
+            .filter(|e| matches!(e.phase, Phase::Active | Phase::Held) && expired(e, now))
             .map(|e| (e.id.clone(), e.action))
             .collect();
         for (id, action) in expired {
@@ -706,19 +1212,20 @@ impl Engine {
                 Some(action),
                 "TTL expired",
             );
-            self.revert(&id, "TTL expired: automatic revert", now_ms);
+            self.revert(&id, "TTL expired: automatic revert", now);
         }
         let every = self.cfg.config.verify_interval_s.saturating_mul(1000);
-        if now_ms.saturating_sub(self.last_verify_ms) >= every {
-            self.last_verify_ms = now_ms;
+        let mono = now.boot_ms.unwrap_or(now_ms);
+        if mono.abs_diff(self.last_verify_boot_ms) >= every {
+            self.last_verify_boot_ms = mono;
             self.periodic_verify(now_ms);
         }
     }
 
     /// Read the table back and compare. A table that disappeared while
     /// actions were active is an operator's emergency disable: every action
-    /// is dropped and nothing is re-applied. Any other difference is
-    /// drift: the rendering is re-applied.
+    /// is dropped, nothing is re-applied and orders are refused until
+    /// `rearm`. Any other difference is drift: the rendering is re-applied.
     pub fn periodic_verify(&mut self, now_ms: u64) {
         let r = self.rendered();
         let listed = match nft::read_table(self.nft.as_mut()) {
@@ -736,24 +1243,11 @@ impl Engine {
             }
         };
         if listed.is_none() && r.chains.is_some() {
-            let entries = std::mem::take(&mut self.state.entries);
-            for en in &entries {
-                self.finish(
-                    en,
-                    Final::RemovedExternally,
-                    now_ms,
-                    "table inet robodr was removed from outside (emergency disable): not \
-                     re-applied",
-                );
-                self.state.event(
-                    now_ms,
-                    EventKind::RemovedExternally,
-                    Some(&en.id),
-                    Some(en.action),
-                    "table inet robodr was removed from outside: action dropped, not re-applied",
-                );
-            }
-            let _ = self.save();
+            self.operator_removed(
+                now_ms,
+                "table inet robodr was removed from outside (emergency disable): action \
+                 dropped, not re-applied",
+            );
             return;
         }
         if let Err(diff) = nft::verify(listed.as_deref(), &r) {
@@ -772,11 +1266,12 @@ impl Engine {
         }
     }
 
-    /// Remove every action (operator `revert-all`).
-    pub fn revert_all(&mut self, reason: &str, now_ms: u64) -> Result<usize, String> {
+    /// Remove every action (operator `revert-all`, a failed start).
+    pub fn revert_all(&mut self, reason: &str, now: impl Into<Now>) -> Result<usize, String> {
+        let now_ms = now.into().wall_ms;
         let entries = std::mem::take(&mut self.state.entries);
-        nft::delete_table(self.nft.as_mut())?;
-        self.read_verify(&Rendered { chains: None })?;
+        let del = nft::delete_table(self.nft.as_mut())
+            .and_then(|()| self.read_verify(&Rendered { chains: None }));
         for en in &entries {
             self.finish(en, Final::Reverted, now_ms, reason);
             self.state.event(
@@ -787,6 +1282,7 @@ impl Engine {
                 reason.to_string(),
             );
         }
+        del?;
         self.save()?;
         Ok(entries.len())
     }
@@ -800,6 +1296,7 @@ impl Engine {
                     Phase::Applying => Status::Applying,
                     Phase::Active => Status::Verified,
                     Phase::Reverting => Status::Reverting,
+                    Phase::Held => Status::Held,
                 },
             );
             o.action = Some(en.action);
@@ -836,4 +1333,59 @@ impl Engine {
             .cloned()
             .collect()
     }
+}
+
+/// Two effects on the same target: one isolation at a time, one
+/// quarantine per participant.
+fn clashes(a: &Effect, b: &Effect) -> bool {
+    match (a, b) {
+        (Effect::Isolate(_), Effect::Isolate(_)) => true,
+        (Effect::Quarantine(x), Effect::Quarantine(y)) => x.guid_prefix == y.guid_prefix,
+        _ => false,
+    }
+}
+
+/// Delete the table and mark every journalled action reverted, without
+/// reconciling (systemd `ExecStopPost=` after a failed run, and a fatal
+/// start error): no rule outlives the process that enforces its TTL. The
+/// journal write is best effort (the disk may be full): a later start in
+/// the same boot then finds the table gone and treats it as an emergency
+/// disable (re-arm needed), never re-installing anything blindly.
+pub fn abandon(
+    cfg: Option<&Resolved>,
+    nft: &mut dyn Nft,
+    why: &str,
+    now_ms: u64,
+) -> Result<usize, String> {
+    let del = nft::delete_table(nft);
+    let mut n = 0;
+    if let Some(cfg) = cfg {
+        let j = Journal::new(&cfg.config.state_dir);
+        if let Loaded::State(mut s) = j.load() {
+            let entries = std::mem::take(&mut s.entries);
+            n = entries.len();
+            for en in &entries {
+                s.finish(Finished {
+                    id: en.id.clone(),
+                    digest: en.digest.clone(),
+                    action: en.action,
+                    result: Final::Reverted,
+                    at_ms: now_ms,
+                    refusal: None,
+                    detail: Some(why.to_string()),
+                });
+                s.event(
+                    now_ms,
+                    EventKind::Reverted,
+                    Some(&en.id),
+                    Some(en.action),
+                    why.to_string(),
+                );
+            }
+            if n > 0 {
+                let _ = j.save(&s);
+            }
+        }
+    }
+    del.map(|()| n)
 }

@@ -71,6 +71,15 @@ fn generic_example_isolates_and_keeps_the_allow_lists() {
         Effect::Isolate(s) => {
             assert_eq!(s.allow.len(), 4);
             assert_eq!(s.protected.len(), 1);
+            // DDS discovery stays open on the control-bus interface... and,
+            // since the motion path names an address only, on any.
+            let d = s.discovery.expect("discovery kept open");
+            assert_eq!(
+                d.groups,
+                vec!["239.255.0.1".parse::<std::net::IpAddr>().unwrap()]
+            );
+            assert_eq!(d.ports, vec![7400, 7401]);
+            assert!(d.interfaces.is_empty());
         }
         e => panic!("{e:?}"),
     }

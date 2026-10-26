@@ -1,7 +1,8 @@
 //! Unit tests: the decision matrix (action × morphology × safety state ×
-//! policy × approval) and the engine's journal / TTL / reconciliation logic
-//! against an in-memory nftables model. The real-nftables tests (network
-//! namespaces, traffic) are in `tests/netns.rs`.
+//! policy × approval × target × motion path × profile lock × TTL) and the
+//! engine's journal / TTL / reconciliation logic against an in-memory
+//! nftables model. The real-nftables tests (network namespaces, traffic)
+//! are in `tests/netns.rs`.
 
 use std::sync::{Arc, Mutex};
 
@@ -36,7 +37,8 @@ pub fn config_json(state_dir: &str) -> String {
             "control_buses": {"exempt": true, "entries": [{"interface": "eth1"}]},
             "motion_control_path": [
                 {"cidr": "192.168.123.0/24", "udp_ports": [7400, 7600], "note": "robot DDS bus"},
-                {"guid_prefix": LOWCMD_GUID, "low_level": true, "note": "rt/lowcmd writer"}
+                {"cidr": "192.168.123.161", "guid_prefix": LOWCMD_GUID, "low_level": true,
+                 "note": "rt/lowcmd writer"}
             ]
         },
         "ttl": {"default_s": 600, "max_s": 3600}
@@ -99,15 +101,125 @@ pub fn order(id: &str, action: ActionId, m: Morphology, state: SafetyState) -> O
     }
 }
 
-/// Independent statement of the matrix the decision must implement.
-fn expected(
+/// A quarantine target of the matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tgt {
+    /// An unprotected GUID, its locator outside every motion-path address.
+    Outside,
+    /// An unprotected GUID, its locator inside the robot bus (192.168.123/24).
+    InsideBus,
+    /// The protected low-level participant's GUID.
+    ProtectedGuid,
+    /// An unprotected GUID without locators.
+    NoLocators,
+}
+
+impl Tgt {
+    const ALL: [Tgt; 4] = [
+        Tgt::Outside,
+        Tgt::InsideBus,
+        Tgt::ProtectedGuid,
+        Tgt::NoLocators,
+    ];
+
+    fn target(self) -> Target {
+        let loc = |ip: &str| Locator {
+            ip: ip.parse().unwrap(),
+            port: 7410,
+        };
+        match self {
+            Tgt::Outside => Target::Participant {
+                guid_prefix: GUID.parse().unwrap(),
+                locators: vec![loc("10.0.0.7")],
+            },
+            Tgt::InsideBus => Target::Participant {
+                guid_prefix: GUID.parse().unwrap(),
+                locators: vec![loc("192.168.123.50")],
+            },
+            Tgt::ProtectedGuid => Target::Participant {
+                guid_prefix: LOWCMD_GUID.parse().unwrap(),
+                locators: vec![loc("10.0.0.7")],
+            },
+            Tgt::NoLocators => Target::Participant {
+                guid_prefix: GUID.parse().unwrap(),
+                locators: vec![],
+            },
+        }
+    }
+}
+
+/// A motion-control-path configuration of the matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mp {
+    /// The robot bus (not low-level) and the low-level writer (cidr + GUID).
+    BusAndLowcmd,
+    /// The whole robot network is low-level (the Unitree G1 example).
+    LowLevelNetwork,
+    /// No motion control path configured.
+    None,
+    /// An interface-only entry (no address: nothing can be proven outside).
+    InterfaceOnly,
+}
+
+impl Mp {
+    const ALL: [Mp; 4] = [
+        Mp::BusAndLowcmd,
+        Mp::LowLevelNetwork,
+        Mp::None,
+        Mp::InterfaceOnly,
+    ];
+
+    fn entries(self) -> Value {
+        match self {
+            Mp::BusAndLowcmd => json!([
+                {"cidr": "192.168.123.0/24", "udp_ports": [7400, 7600]},
+                {"cidr": "192.168.123.161", "guid_prefix": LOWCMD_GUID, "low_level": true}
+            ]),
+            Mp::LowLevelNetwork => json!([{"cidr": "192.168.123.0/24", "low_level": true}]),
+            Mp::None => json!([]),
+            Mp::InterfaceOnly => json!([{"interface": "eth2"}]),
+        }
+    }
+
+    fn cfg(self) -> Resolved {
+        let mut v: Value = serde_json::from_str(&config_json("/tmp/unused")).unwrap();
+        v["network"]["motion_control_path"] = self.entries();
+        ExecutorConfig::parse(&v.to_string())
+            .unwrap()
+            .validate()
+            .unwrap()
+    }
+
+    /// (low_level, has cidr containing 192.168.123.50, guid is LOWCMD,
+    /// interface-only) per entry.
+    fn model(self) -> Vec<(bool, bool, bool, bool)> {
+        match self {
+            Mp::BusAndLowcmd => vec![(false, true, false, false), (true, false, true, false)],
+            Mp::LowLevelNetwork => vec![(true, true, false, false)],
+            Mp::None => vec![],
+            Mp::InterfaceOnly => vec![(false, false, false, true)],
+        }
+    }
+}
+
+/// One cell of the matrix.
+#[derive(Debug, Clone, Copy)]
+struct Cell<'a> {
     a: ActionId,
     m: Morphology,
     s: SafetyState,
     validated: bool,
-    fsr: &[RestrictTarget],
+    fsr: &'a [RestrictTarget],
     approved: bool,
-) -> Result<&'static str, &'static str> {
+    tgt: Tgt,
+    mp: Mp,
+    locked: bool,
+    ttl: Option<u64>,
+}
+
+/// Independent statement of the matrix the decision must implement.
+fn expected(c: &Cell<'_>) -> Result<&'static str, &'static str> {
+    let a = c.a;
     match a {
         ActionId::SafePause | ActionId::RequestSafeState | ActionId::RollbackConfig => {
             return Err(codes::NOT_EXECUTOR_ACTION)
@@ -115,11 +227,14 @@ fn expected(
         ActionId::RecordEvidence => return Ok("evidence"),
         _ => {}
     }
-    if !validated {
+    if !c.validated || !c.locked {
         return Err(codes::OBSERVE_MODE);
     }
-    if s.safety_system_engaged() {
+    if c.s.safety_system_engaged() {
         return Err(codes::SAFETY_SYSTEM_ENGAGED);
+    }
+    if c.s == SafetyState::Unknown {
+        return Err(codes::SAFETY_STATE_UNAVAILABLE);
     }
     if a == ActionId::RestrictMotion {
         return Ok("advisory");
@@ -129,90 +244,163 @@ fn expected(
     } else {
         RestrictTarget::Participant
     };
-    if matches!(m, Morphology::Humanoid | Morphology::Unspecified) {
-        if !fsr.contains(&class) {
+    if matches!(c.m, Morphology::Humanoid | Morphology::Unspecified) {
+        if !c.fsr.contains(&class) {
             return Err(codes::FALL_HAZARD);
         }
-        if !approved {
+        if !c.approved {
             return Err(codes::NEEDS_APPROVAL);
         }
     }
+    let quarantine = a == ActionId::QuarantineNode;
     if matches!(
-        m,
+        c.m,
         Morphology::Humanoid | Morphology::Quadruped | Morphology::Unspecified
-    ) && a == ActionId::QuarantineNode
-        && !approved
+    ) && quarantine
+        && !c.approved
     {
         return Err(codes::NEEDS_APPROVAL);
     }
-    Ok(if a == ActionId::IsolateNetwork {
-        "isolate"
-    } else {
-        "quarantine"
-    })
+    if quarantine {
+        // Entries this quarantine may not cut.
+        let keep: Vec<_> =
+            c.mp.model()
+                .into_iter()
+                .filter(|(low, ..)| *low || !c.fsr.contains(&RestrictTarget::Participant))
+                .collect();
+        if c.tgt == Tgt::ProtectedGuid && keep.iter().any(|(_, _, g, _)| *g) {
+            return Err(codes::MOTION_PATH);
+        }
+        if c.tgt == Tgt::NoLocators {
+            return Err(codes::LOCATORS_REQUIRED);
+        }
+        for (_, bus, _, iface_only) in &keep {
+            if *iface_only || (*bus && c.tgt == Tgt::InsideBus) {
+                return Err(codes::MOTION_PATH);
+            }
+        }
+    }
+    let ttl = c.ttl.unwrap_or(600);
+    if ttl == 0 || ttl > 3600 {
+        return Err(codes::TTL_OUT_OF_RANGE);
+    }
+    Ok(if quarantine { "quarantine" } else { "isolate" })
 }
 
 #[test]
 fn decision_matrix_action_morphology_state_policy_approval() {
-    let c = cfg("/tmp/unused");
+    let cfgs: Vec<(Mp, Resolved)> = Mp::ALL.iter().map(|m| (*m, m.cfg())).collect();
     let fsrs: [&[RestrictTarget]; 4] = [
         &[],
         &[RestrictTarget::Network],
         &[RestrictTarget::Participant],
         &[RestrictTarget::Network, RestrictTarget::Participant],
     ];
-    let mut cases = 0;
+    let mut cases = 0usize;
     for a in ActionId::ALL {
         for m in Morphology::ALL {
             for s in SafetyState::ALL {
                 for validated in [false, true] {
                     for fsr in fsrs {
+                        let p = policy(m, validated, fsr);
                         for approved in [false, true] {
-                            let p = policy(m, validated, fsr);
-                            let mut o = order("r1", a, m, s);
-                            o.human_approved = approved;
-                            let got = precheck(&o, &p, &c);
-                            let want = expected(a, m, s, validated, fsr, approved);
-                            match (&got, want) {
-                                (Ok(pl), Ok(kind)) => {
-                                    let k = match pl.effect {
-                                        Effect::Evidence => "evidence",
-                                        Effect::Advisory { .. } => "advisory",
-                                        Effect::Isolate(_) => "isolate",
-                                        Effect::Quarantine(_) => "quarantine",
-                                    };
-                                    assert_eq!(k, kind, "{a:?} {m:?} {s:?} {validated} {fsr:?}");
-                                }
-                                (Err(r), Err(code)) => {
-                                    assert_eq!(
-                                        r.code, code,
-                                        "{a:?} {m:?} {s:?} {validated} {fsr:?} {approved}"
-                                    )
-                                }
-                                _ => panic!(
-                                    "{a:?} {m:?} {s:?} validated={validated} fsr={fsr:?} \
-                                     approved={approved}: got {got:?}, want {want:?}"
-                                ),
-                            }
-                            // Invariants that hold whatever the matrix says.
-                            if let Ok(pl) = &got {
-                                assert!(!a.may_de_energise());
-                                if matches!(pl.effect, Effect::Isolate(_) | Effect::Quarantine(_)) {
-                                    assert!(!s.safety_system_engaged());
-                                    assert!(pl.ttl_s.is_some_and(|t| t > 0));
-                                    if m.falls_when_de_energised() {
-                                        assert!(approved);
+                            for tgt in Tgt::ALL {
+                                for (mp, c) in &cfgs {
+                                    for locked in [false, true] {
+                                        for ttl in [None, Some(60), Some(3601)] {
+                                            let cell = Cell {
+                                                a,
+                                                m,
+                                                s,
+                                                validated,
+                                                fsr,
+                                                approved,
+                                                tgt,
+                                                mp: *mp,
+                                                locked,
+                                                ttl,
+                                            };
+                                            check_cell(&cell, &p, c);
+                                            cases += 1;
+                                        }
                                     }
                                 }
                             }
-                            cases += 1;
                         }
                     }
                 }
             }
         }
     }
-    assert_eq!(cases, 7 * 7 * 7 * 2 * 4 * 2);
+    // 7 actions x 7 morphologies x 7 states x 2 validation x 4 fall-safe
+    // sets x 2 approval (the v1 matrix: 5 488) x 4 targets x 4 motion paths
+    // x 2 profile locks x 3 TTLs.
+    assert_eq!(cases, 7 * 7 * 7 * 2 * 4 * 2 * 4 * 4 * 2 * 3);
+    assert_eq!(cases, 526_848);
+}
+
+fn check_cell(cell: &Cell<'_>, p: &ResponsePolicy, c: &Resolved) {
+    let mut o = order("r1", cell.a, cell.m, cell.s);
+    o.human_approved = cell.approved;
+    o.context.profile_locked = cell.locked;
+    o.ttl_s = cell.ttl;
+    if cell.a == ActionId::QuarantineNode {
+        o.target = cell.tgt.target();
+    }
+    let got = precheck(&o, p, c);
+    let want = expected(cell);
+    match (&got, want) {
+        (Ok(pl), Ok(kind)) => {
+            let k = match pl.effect {
+                Effect::Evidence => "evidence",
+                Effect::Advisory { .. } => "advisory",
+                Effect::Isolate(_) => "isolate",
+                Effect::Quarantine(_) => "quarantine",
+            };
+            assert_eq!(k, kind, "{cell:?}");
+        }
+        (Err(r), Err(code)) => assert_eq!(r.code, code, "{cell:?}: {}", r.reason),
+        _ => panic!("{cell:?}: got {got:?}, want {want:?}"),
+    }
+    // Invariants that hold whatever the matrix says.
+    if let Ok(pl) = &got {
+        assert!(!cell.a.may_de_energise());
+        if matches!(pl.effect, Effect::Isolate(_) | Effect::Quarantine(_)) {
+            assert!(!cell.s.safety_system_engaged());
+            assert_ne!(cell.s, SafetyState::Unknown);
+            assert!(cell.locked && cell.validated);
+            assert!(pl.ttl_s.is_some_and(|t| (1..=3600).contains(&t)));
+            if cell.m.falls_when_de_energised() {
+                assert!(cell.approved);
+            }
+        }
+        let class = match pl.effect {
+            Effect::Isolate(_) => RestrictTarget::Network,
+            _ => RestrictTarget::Participant,
+        };
+        let keep: Vec<_> = c
+            .config
+            .network
+            .motion_control_path
+            .iter()
+            .filter(|e| e.low_level || !p.fall_safe_restrict.contains(&class))
+            .cloned()
+            .collect();
+        match &pl.effect {
+            // What may not be cut is frozen into the effect (rendered
+            // before any drop).
+            Effect::Isolate(s) => assert_eq!(s.protected, keep, "{cell:?}"),
+            Effect::Quarantine(q) => {
+                assert_eq!(q.protected, keep, "{cell:?}");
+                assert!(!q.locators.is_empty());
+                for e in &keep {
+                    assert!(e.cidr.is_some(), "{cell:?}");
+                    assert!(q.locators.iter().all(|l| !e.cidr.unwrap().contains(l.ip)));
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[test]
@@ -326,7 +514,9 @@ fn motion_control_path_is_never_cut() {
         precheck(&o, &wheeled, &c).unwrap_err().code,
         codes::MOTION_PATH
     );
-    // Same address, port outside the protected range: allowed.
+    // Same address, port outside the protected range: still refused (a
+    // locator must lie outside the protected address, the port proves
+    // nothing about the participant).
     o.target = Target::Participant {
         guid_prefix: GUID.parse().unwrap(),
         locators: vec![Locator {
@@ -334,7 +524,31 @@ fn motion_control_path_is_never_cut() {
             port: 9000,
         }],
     };
-    assert!(precheck(&o, &wheeled, &c).is_ok());
+    assert_eq!(
+        precheck(&o, &wheeled, &c).unwrap_err().code,
+        codes::MOTION_PATH
+    );
+    // Outside: allowed, and the protected entries travel with it.
+    o.target = Target::Participant {
+        guid_prefix: GUID.parse().unwrap(),
+        locators: vec![Locator {
+            ip: "10.0.0.7".parse().unwrap(),
+            port: 7410,
+        }],
+    };
+    match precheck(&o, &wheeled, &c).unwrap().effect {
+        Effect::Quarantine(q) => assert_eq!(q.protected.len(), 2),
+        e => panic!("{e:?}"),
+    }
+    // Without locators: refused.
+    o.target = Target::Participant {
+        guid_prefix: GUID.parse().unwrap(),
+        locators: vec![],
+    };
+    assert_eq!(
+        precheck(&o, &wheeled, &c).unwrap_err().code,
+        codes::LOCATORS_REQUIRED
+    );
     // The rt/lowcmd writer (low_level): refused even when the policy lists
     // participants as fall-safe on a humanoid.
     let humanoid = policy(Morphology::Humanoid, true, &[RestrictTarget::Participant]);
@@ -419,11 +633,38 @@ fn safety_recheck_immediately_before_apply() {
             let code = recheck_safety(&o, cur(s, 10), 500).unwrap_err().code;
             if s.safety_system_engaged() {
                 assert_eq!(code, codes::SAFETY_SYSTEM_ENGAGED);
+            } else if s == SafetyState::Unknown {
+                // L6: an unknown state never allows anything.
+                assert_eq!(code, codes::SAFETY_STATE_UNAVAILABLE);
             } else {
                 assert_eq!(code, codes::SAFETY_STATE_CHANGED);
             }
         }
     }
+    // L6: judged in an unknown state, current unknown too: refused.
+    let mut u = o.clone();
+    u.judged_state = SafetyState::Unknown;
+    assert_eq!(
+        recheck_safety(&u, cur(SafetyState::Unknown, 10), 500)
+            .unwrap_err()
+            .code,
+        codes::SAFETY_STATE_UNAVAILABLE
+    );
+    // The re-arm check after a reboot: known, fresh, not engaged.
+    use crate::decision::recheck_rearm;
+    assert!(recheck_rearm(cur(SafetyState::Idle, 10), 500).is_ok());
+    assert!(recheck_rearm(cur(SafetyState::MovingFast, 10), 500).is_ok());
+    for (st, age, code) in [
+        (SafetyState::Unknown, 10, codes::SAFETY_STATE_UNAVAILABLE),
+        (SafetyState::EStopActive, 10, codes::SAFETY_SYSTEM_ENGAGED),
+        (SafetyState::Idle, 501, codes::SAFETY_STATE_STALE),
+    ] {
+        assert_eq!(recheck_rearm(cur(st, age), 500).unwrap_err().code, code);
+    }
+    assert_eq!(
+        recheck_rearm(Err("x".into()), 500).unwrap_err().code,
+        codes::SAFETY_STATE_UNAVAILABLE
+    );
     assert_eq!(
         recheck_safety(&o, cur(SafetyState::MovingSlow, 501), 500)
             .unwrap_err()
@@ -514,7 +755,12 @@ fn tmpdir(tag: &str) -> std::path::PathBuf {
     d
 }
 
-fn engine(dir: &std::path::Path, nft: &FakeNft, boot: &str, now: u64) -> Engine {
+fn engine(
+    dir: &std::path::Path,
+    nft: &FakeNft,
+    boot: &str,
+    now: impl Into<crate::engine::Now>,
+) -> Engine {
     Engine::open(
         cfg(dir.to_str().unwrap()),
         policy(Morphology::WheeledMobile, true, &[]),
@@ -672,37 +918,82 @@ fn ttl_expiry_reverts_and_survives_restart() {
     assert!(nft.0.lock().unwrap().table.is_none());
 }
 
+/// L1: within a boot the TTL runs on CLOCK_BOOTTIME: a wall-clock step back
+/// does not extend an action, a step forward (NTP at boot) does not cut it
+/// short.
 #[test]
-fn a_clock_step_back_never_extends_an_action() {
+fn l1_ttl_runs_on_boottime_within_a_boot() {
+    use crate::engine::Now;
+    let at = |wall_ms, boot_ms| Now {
+        wall_ms,
+        boot_ms: Some(boot_ms),
+    };
     let d = tmpdir("clock");
     let nft = FakeNft::default();
-    let mut e = engine(&d, &nft, "b1", 100_000);
+    let mut e = engine(&d, &nft, "b1", at(100_000, 5_000));
     let i = order(
         "i1",
         ActionId::IsolateNetwork,
         Morphology::WheeledMobile,
         SafetyState::Idle,
     );
-    assert_eq!(e.submit(&i, &mut idle(), 100_000).status, Status::Verified);
-    // The wall clock jumps 50 s back: 60 s TTL would now last 110 s.
-    e.tick(50_000);
+    assert_eq!(
+        e.submit(&i, &mut idle(), at(100_000, 5_000)).status,
+        Status::Verified
+    );
+    // The wall clock jumps an hour forward (first NTP sync): still active.
+    e.tick(at(3_700_000, 6_000));
+    assert_eq!(e.status("i1").status, Status::Verified);
+    // ... and back 50 s: 60 s on boottime still decide.
+    e.tick(at(50_000, 64_000));
+    assert_eq!(e.status("i1").status, Status::Verified);
+    e.tick(at(50_100, 65_000));
     assert_eq!(e.status("i1").status, Status::Reverted);
     assert!(nft.0.lock().unwrap().table.is_none());
-    // Same at restart.
+    // A restart in the same boot keeps the boottime deadline, whatever the
+    // wall clock says.
     let i2 = order(
         "i2",
         ActionId::IsolateNetwork,
         Morphology::WheeledMobile,
         SafetyState::Idle,
     );
-    assert_eq!(e.submit(&i2, &mut idle(), 100_000).status, Status::Verified);
+    assert_eq!(
+        e.submit(&i2, &mut idle(), at(100_000, 70_000)).status,
+        Status::Verified
+    );
     drop(e);
-    let e = engine(&d, &nft, "b1", 10_000);
+    let e = engine(&d, &nft, "b1", at(10_000, 71_000));
+    assert_eq!(e.status("i2").status, Status::Verified);
+    drop(e);
+    let e = engine(&d, &nft, "b1", at(10_000, 130_000));
     assert_eq!(e.status("i2").status, Status::Reverted);
+    // Without a boot clock the wall clock decides, and a step back never
+    // extends.
+    let i3 = order(
+        "i3",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    let mut e = e;
+    let wall = |w| Now {
+        wall_ms: w,
+        boot_ms: None,
+    };
+    assert_eq!(
+        e.submit(&i3, &mut idle(), wall(100_000)).status,
+        Status::Verified
+    );
+    e.tick(wall(50_000));
+    assert_eq!(e.status("i3").status, Status::Reverted);
 }
 
+/// L4: after a reboot an action is re-validated against the current
+/// configuration and policy and installed again only with a fresh, known
+/// safety state that is not engaged.
 #[test]
-fn reboot_reapplies_but_operator_removal_is_honoured() {
+fn l4_reboot_reapply_needs_revalidation_and_a_fresh_safety_check() {
     let d = tmpdir("reboot");
     let nft = FakeNft::default();
     let mut e = engine(&d, &nft, "b1", 1_000);
@@ -712,32 +1003,148 @@ fn reboot_reapplies_but_operator_removal_is_honoured() {
         Morphology::WheeledMobile,
         SafetyState::Idle,
     );
+    let q = order(
+        "q1",
+        ActionId::QuarantineNode,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
     assert_eq!(e.submit(&i, &mut idle(), 1_000).status, Status::Verified);
+    assert_eq!(e.submit(&q, &mut idle(), 1_000).status, Status::Verified);
     drop(e);
-    // Reboot: the kernel ruleset is empty; the action is re-applied.
+    // Reboot: the kernel ruleset is empty; nothing is installed at start.
     nft.0.lock().unwrap().table = None;
     let mut e = engine(&d, &nft, "b2", 2_000);
+    assert_eq!(e.status("i1").status, Status::Held);
+    assert_eq!(e.status("q1").status, Status::Held);
+    assert!(nft.0.lock().unwrap().table.is_none());
+    assert!(kinds(&e).contains(&EventKind::Held));
+    // No safety state, an engaged one, an unknown one: still held.
+    let cur = |state| Ok(Current { state, age_ms: 5 });
+    e.rearm_held(Err("agentd has none".into()), 2_100);
+    e.rearm_held(cur(SafetyState::EStopActive), 2_200);
+    e.rearm_held(cur(SafetyState::Unknown), 2_300);
+    assert_eq!(e.status("i1").status, Status::Held);
+    assert!(nft.0.lock().unwrap().table.is_none());
+    // A fresh, known state: re-armed, installed, verified.
+    e.rearm_held(cur(SafetyState::MovingSlow), 2_400);
     assert_eq!(e.status("i1").status, Status::Verified);
-    assert!(nft.0.lock().unwrap().table.is_some());
-    // Operator emergency disable while running: honoured, not re-applied.
+    assert_eq!(e.status("q1").status, Status::Verified);
+    let listed = crate::nft::read_table(&mut nft.clone()).unwrap();
+    assert!(crate::nft::verify(listed.as_deref(), &e.rendered()).is_ok());
+    drop(e);
+    // Another reboot, and the configuration changed meanwhile: the
+    // participant's locator is now on the protected robot bus.
     nft.0.lock().unwrap().table = None;
-    e.periodic_verify(3_000);
+    let mut v: Value = serde_json::from_str(&config_json(d.to_str().unwrap())).unwrap();
+    v["network"]["motion_control_path"][0]["cidr"] = json!("10.0.0.0/24");
+    let c2 = ExecutorConfig::parse(&v.to_string())
+        .unwrap()
+        .validate()
+        .unwrap();
+    let mut e = Engine::open(
+        c2,
+        policy(Morphology::WheeledMobile, true, &[]),
+        Box::new(nft.clone()),
+        "b3",
+        3_000,
+    )
+    .unwrap();
+    assert_eq!(e.status("q1").status, Status::Reverted);
+    assert!(e.status("q1").note.unwrap().contains("motion_path"));
+    assert_eq!(e.status("i1").status, Status::Held);
+    // A held action expires at its deadline like any other.
+    e.tick(61_001);
+    assert_eq!(e.status("i1").status, Status::Reverted);
+    assert!(nft.0.lock().unwrap().table.is_none());
+}
+
+/// M3: the operator's emergency disable is honoured by every path (the
+/// periodic check, a revert, a new order, a restart) and lifted only by an
+/// explicit re-arm.
+#[test]
+fn m3_operator_removal_is_honoured_until_rearm() {
+    let d = tmpdir("operator");
+    let nft = FakeNft::default();
+    let mut e = engine(&d, &nft, "b1", 1_000);
+    let i = order(
+        "i1",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    let q = order(
+        "q1",
+        ActionId::QuarantineNode,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    assert_eq!(e.submit(&i, &mut idle(), 1_000).status, Status::Verified);
+    assert_eq!(e.submit(&q, &mut idle(), 1_000).status, Status::Verified);
+    // Removed, then a revert of one of them before the periodic check: the
+    // other is not re-installed.
+    nft.0.lock().unwrap().table = None;
+    assert_eq!(
+        e.revert("q1", "test", 1_100).status,
+        Status::RemovedExternally
+    );
+    assert!(nft.0.lock().unwrap().table.is_none());
     assert_eq!(e.status("i1").status, Status::RemovedExternally);
-    assert!(nft.0.lock().unwrap().table.is_none());
-    e.tick(60_000);
-    assert!(nft.0.lock().unwrap().table.is_none());
-    // Operator removal while the executor was down (same boot).
+    assert!(e.state().operator_disabled);
+    // Every order is refused until re-armed, also after a restart.
     let i2 = order(
         "i2",
         ActionId::IsolateNetwork,
         Morphology::WheeledMobile,
         SafetyState::Idle,
     );
-    assert_eq!(e.submit(&i2, &mut idle(), 4_000).status, Status::Verified);
+    assert_eq!(
+        e.submit(&i2, &mut idle(), 1_200).refusal.unwrap().code,
+        codes::OPERATOR_DISABLED
+    );
+    drop(e);
+    let mut e = engine(&d, &nft, "b1", 1_300);
+    let i3 = order(
+        "i3",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    assert_eq!(
+        e.submit(&i3, &mut idle(), 1_400).refusal.unwrap().code,
+        codes::OPERATOR_DISABLED
+    );
+    assert!(nft.0.lock().unwrap().table.is_none());
+    assert!(e.rearm("test", 1_500).unwrap());
+    let i4 = order(
+        "i4",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    assert_eq!(e.submit(&i4, &mut idle(), 1_600).status, Status::Verified);
+    // Removed while down (same boot): disabled again at the restart.
     drop(e);
     nft.0.lock().unwrap().table = None;
-    let e = engine(&d, &nft, "b2", 5_000);
-    assert_eq!(e.status("i2").status, Status::RemovedExternally);
+    let e = engine(&d, &nft, "b1", 1_700);
+    assert_eq!(e.status("i4").status, Status::RemovedExternally);
+    assert!(e.state().operator_disabled);
+    assert!(nft.0.lock().unwrap().table.is_none());
+    // The periodic check sets it too.
+    let mut e = e;
+    e.rearm("test", 1_800).unwrap();
+    let i5 = order(
+        "i5",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    assert_eq!(e.submit(&i5, &mut idle(), 1_900).status, Status::Verified);
+    nft.0.lock().unwrap().table = None;
+    e.periodic_verify(2_000);
+    assert_eq!(e.status("i5").status, Status::RemovedExternally);
+    assert!(e.state().operator_disabled);
+    e.tick(60_000);
     assert!(nft.0.lock().unwrap().table.is_none());
 }
 
@@ -836,6 +1243,105 @@ fn corrupt_journal_deletes_the_table_and_starts_empty() {
     assert!(e.state().entries.is_empty());
     assert!(nft.0.lock().unwrap().table.is_none());
     assert!(kinds(&e).contains(&EventKind::JournalReset));
+    // A High notice: an event marked HIGH and a status flag that persists
+    // until the operator acknowledges it.
+    let ev = e
+        .state()
+        .events
+        .iter()
+        .find(|x| x.kind == EventKind::JournalReset)
+        .unwrap();
+    assert!(ev.detail.starts_with("HIGH:"));
+    assert_eq!(e.state().journal_reset_ms, Some(2_000));
+    drop(e);
+    let mut e = engine(&d, &nft, "b1", 3_000);
+    assert_eq!(e.state().journal_reset_ms, Some(2_000));
+    e.rearm("acknowledged", 4_000).unwrap();
+    assert_eq!(e.state().journal_reset_ms, None);
+}
+
+/// L7: the policy (and configuration) are re-read before every order.
+#[test]
+fn l7_policy_is_reread_per_order() {
+    let d = tmpdir("reload");
+    let pol_path = d.join("policy.json");
+    let cfg_path = d.join("executor.json");
+    let mut v: Value = serde_json::from_str(&config_json(d.to_str().unwrap())).unwrap();
+    v["policy_path"] = json!(pol_path);
+    std::fs::write(&cfg_path, v.to_string()).unwrap();
+    let write_policy = |validated: bool| {
+        let p = policy(Morphology::WheeledMobile, validated, &[]);
+        std::fs::write(&pol_path, serde_json::to_string(&p).unwrap()).unwrap();
+    };
+    write_policy(true);
+    let nft = FakeNft::default();
+    let mut e = engine(&d, &nft, "b1", 1_000).with_reload(cfg_path.clone());
+    // The OEM withdraws the validation: the next order is judged by it.
+    write_policy(false);
+    let i = order(
+        "i1",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    assert_eq!(
+        e.submit(&i, &mut idle(), 1_100).refusal.unwrap().code,
+        codes::OBSERVE_MODE
+    );
+    write_policy(true);
+    let i2 = order(
+        "i2",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    assert_eq!(e.submit(&i2, &mut idle(), 1_200).status, Status::Verified);
+    // An unreadable policy refuses (never falls back to an old one).
+    e.revert("i2", "test", 1_300);
+    std::fs::write(&pol_path, b"{broken").unwrap();
+    let i3 = order(
+        "i3",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    assert_eq!(
+        e.submit(&i3, &mut idle(), 1_400).refusal.unwrap().code,
+        codes::CONFIG_UNAVAILABLE
+    );
+}
+
+/// M5 (model): a revert whose journal write fails is reported `reverting`
+/// (never `reverted`) until the journal records it.
+#[test]
+fn m5_unjournalled_revert_is_not_reported_reverted() {
+    let d = tmpdir("m5");
+    let nft = FakeNft::default();
+    let mut e = engine(&d, &nft, "b1", 1_000);
+    let i = order(
+        "i1",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    assert_eq!(e.submit(&i, &mut idle(), 1_000).status, Status::Verified);
+    fault::arm(Point::JournalWrite);
+    let out = e.revert("i1", "test", 2_000);
+    assert_eq!(out.status, Status::Reverting, "{out:?}");
+    assert!(
+        nft.0.lock().unwrap().table.is_none(),
+        "the rules are lifted"
+    );
+    e.tick(3_000);
+    assert_eq!(e.status("i1").status, Status::Reverting);
+    fault::disarm();
+    e.tick(4_000);
+    assert_eq!(e.status("i1").status, Status::Reverted);
+    assert!(kinds(&e).contains(&EventKind::JournalError));
+    drop(e);
+    let e = engine(&d, &nft, "b1", 5_000);
+    assert_eq!(e.status("i1").status, Status::Reverted);
+    assert!(nft.0.lock().unwrap().table.is_none());
 }
 
 #[test]
@@ -967,4 +1473,89 @@ fn journal_round_trips_every_effect() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+/// M2: a client that sends a request one byte at a time (never a full
+/// line) neither blocks TTL enforcement nor other clients.
+#[test]
+fn m2_slow_client_never_delays_ttl_enforcement() {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let d = tmpdir("slowloris");
+    let sock = d.join("executor.sock");
+    let nft = FakeNft::default();
+    let mut e = engine(&d, &nft, "b1", crate::engine::Now::system());
+    let mut i = order(
+        "i-ttl3",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    i.ttl_s = Some(3);
+    let start = std::time::Instant::now();
+    assert_eq!(
+        e.submit(&i, &mut idle(), crate::engine::Now::system())
+            .status,
+        Status::Verified
+    );
+    let listener = crate::server::bind(&sock, 0o600).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let st = stop.clone();
+    let server = std::thread::spawn(move || {
+        let key = crate::proto::Key::from_bytes([3u8; 32]);
+        crate::server::serve(
+            &listener,
+            &mut e,
+            &key,
+            "b1",
+            &|| st.load(Ordering::SeqCst),
+            &mut |_, _| {},
+        );
+    });
+    // Slow clients: one byte every 900 ms, never a newline.
+    let mut lorises = Vec::new();
+    for _ in 0..3 {
+        let p = sock.clone();
+        let st = stop.clone();
+        lorises.push(std::thread::spawn(move || {
+            let Ok(mut s) = std::os::unix::net::UnixStream::connect(&p) else {
+                return;
+            };
+            while !st.load(Ordering::SeqCst) {
+                if s.write_all(b"{").is_err() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(900));
+            }
+        }));
+    }
+    // A well-behaved client is still served meanwhile.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let client = crate::client::Client::new(
+        sock.clone(),
+        crate::proto::Key::from_bytes([3u8; 32]),
+        std::time::Duration::from_secs(10),
+    );
+    let t = std::time::Instant::now();
+    assert!(client.ping().is_ok());
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(2),
+        "ping waited {:?} behind slow clients",
+        t.elapsed()
+    );
+    // The 3 s TTL expires on time (tick every 500 ms).
+    while nft.0.lock().unwrap().table.is_some() {
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(4_500),
+            "TTL not enforced after {:?} with slow clients connected",
+            start.elapsed()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(start.elapsed() >= std::time::Duration::from_secs(3));
+    stop.store(true, Ordering::SeqCst);
+    for l in lorises {
+        l.join().unwrap();
+    }
+    server.join().unwrap();
 }

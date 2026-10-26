@@ -20,7 +20,10 @@
 //!   (`nft -j list table inet robodr`) and compared with what was rendered
 //!   ([`verify`]): chains, hooks, priorities, policies, every rule's
 //!   expressions and comment, in order, and no other object. Counter values
-//!   are ignored.
+//!   are ignored and anonymous sets compared order-free.
+//! * **Protected first.** Each chain starts with accepts for the motion
+//!   control path entries no active action may cut, then the quarantine
+//!   drops, then the isolation ([`render`]).
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -32,8 +35,8 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::config::{AllowEntry, ProtectedEntry};
-use crate::decision::{Effect, IsolationSpec, QuarantineSpec};
-use crate::net::{GuidPrefix, IpNet, Proto};
+use crate::decision::{DiscoverySpec, Effect, IsolationSpec, QuarantineSpec};
+use crate::net::{GuidPrefix, Iface, IpNet, Proto};
 use crate::order::Locator;
 
 pub const FAMILY: &str = "inet";
@@ -229,9 +232,17 @@ fn raw32(offset_bits: u32, value: u32) -> Value {
 /// payload bytes 0..4 = `"RTPS"`, 8..20 = the prefix (transport-header
 /// offsets 64 and 128.. bits; the UDP header is 8 bytes).
 pub fn guid_exprs(guid: &GuidPrefix) -> Vec<Value> {
+    let mut v = vec![m(json!({"meta": {"key": "l4proto"}}), json!("udp"))];
+    v.extend(guid_raw(guid));
+    v
+}
+
+/// The raw RTPS header matches of [`guid_exprs`] without the `meta l4proto
+/// udp` (for a rule that already matches a `udp` field before them: nft
+/// lists that explicit dependency as redundant and hides it).
+fn guid_raw(guid: &GuidPrefix) -> Vec<Value> {
     let w = guid.words();
     vec![
-        m(json!({"meta": {"key": "l4proto"}}), json!("udp")),
         raw32(64, RTPS_MAGIC),
         raw32(128, w[0]),
         raw32(160, w[1]),
@@ -254,6 +265,16 @@ fn ends(dir: Dir) -> (&'static str, &'static str) {
     }
 }
 
+/// The directions a chain matches an entry in: `input` the source end,
+/// `output` the destination end, `forward` both.
+fn dirs(chain: &str) -> &'static [Dir] {
+    match chain {
+        "input" => &[Dir::In],
+        "output" => &[Dir::Out],
+        _ => &[Dir::In, Dir::Out],
+    }
+}
+
 fn verdict(mut expr: Vec<Value>, v: &str, counter: bool) -> Vec<Value> {
     if counter {
         expr.push(json!({"counter": null}));
@@ -262,57 +283,151 @@ fn verdict(mut expr: Vec<Value>, v: &str, counter: bool) -> Vec<Value> {
     expr
 }
 
-/// Accept rules for one allow entry in one direction (one rule, or two
-/// when a port may be on either side).
-fn allow_rules(e: &AllowEntry, dir: Dir) -> Vec<Vec<Value>> {
+fn accept(expr: Vec<Value>) -> Vec<Value> {
+    verdict(expr, "accept", false)
+}
+
+/// Interface and address matches of an entry in one direction.
+fn base(cidr: Option<&IpNet>, iface: Option<&Iface>, dir: Dir) -> Vec<Value> {
     let (addr, ifkey) = ends(dir);
-    let mut base = Vec::new();
-    if let Some(i) = &e.interface {
-        base.push(m(json!({"meta": {"key": ifkey}}), json!(i.as_str())));
+    let mut b = Vec::new();
+    if let Some(i) = iface {
+        b.push(m(json!({"meta": {"key": ifkey}}), json!(i.as_str())));
     }
-    if let Some(c) = &e.cidr {
-        base.push(m(addr_field(c, addr), addr_value(c)));
+    if let Some(c) = cidr {
+        b.push(m(addr_field(c, addr), addr_value(c)));
     }
-    match (e.proto, e.port) {
-        (Some(p), Some(port)) => ["sport", "dport"]
-            .into_iter()
-            .map(|f| {
-                let mut x = base.clone();
-                x.push(port_match(p, f, port, port));
-                verdict(x, "accept", false)
-            })
-            .collect(),
-        (Some(p), None) => {
-            base.push(m(json!({"meta": {"key": "l4proto"}}), json!(p.as_str())));
-            vec![verdict(base, "accept", false)]
-        }
-        _ => vec![verdict(base, "accept", false)],
+    b
+}
+
+/// The reply check for a packet from outside that matched a service's
+/// **source** port: a TCP segment that is not a bare SYN (it can never open
+/// a connection), or a UDP datagram of a flow conntrack has seen both ways.
+fn reply_check(p: Proto) -> Value {
+    match p {
+        Proto::Tcp => json!({"match": {"op": "!=",
+            "left": {"&": [{"payload": {"protocol": "tcp", "field": "flags"}}, ["syn", "ack"]]},
+            "right": "syn"}}),
+        Proto::Udp => json!({"match": {"op": "in",
+            "left": {"ct": {"key": "state"}}, "right": "established"}}),
     }
 }
 
-fn protected_rules(e: &ProtectedEntry, dir: Dir) -> Vec<Vec<Value>> {
-    let (addr, ifkey) = ends(dir);
-    let mut base = Vec::new();
-    if let Some(i) = &e.interface {
-        base.push(m(json!({"meta": {"key": ifkey}}), json!(i.as_str())));
+/// The port rules of one entry in one direction of `chain`:
+/// * every packet addressed **to** a port of the range (a request to a
+///   service, local or remote);
+/// * from the range: in `output` (the robot's own packets: a local
+///   service's replies) always; from outside (`input`, `forward`) only with
+///   `reply` (allow entries: [`reply_check`]); never for protected entries
+///   (a spoofed source port would otherwise reach any local port).
+fn port_rules(
+    b: &[Value],
+    p: Proto,
+    (lo, hi): (u16, u16),
+    chain: &str,
+    reply: bool,
+    tail: &[Value],
+) -> Vec<Vec<Value>> {
+    let mut out = Vec::new();
+    let mut x = b.to_vec();
+    x.push(port_match(p, "dport", lo, hi));
+    x.extend_from_slice(tail);
+    out.push(accept(x));
+    let mut x = b.to_vec();
+    x.push(port_match(p, "sport", lo, hi));
+    if chain == "output" {
+        x.extend_from_slice(tail);
+        out.push(accept(x));
+    } else if reply {
+        x.push(reply_check(p));
+        x.extend_from_slice(tail);
+        out.push(accept(x));
     }
-    if let Some(c) = &e.cidr {
-        base.push(m(addr_field(c, addr), addr_value(c)));
+    out
+}
+
+/// Non-first IP fragments (no transport header: a port or payload match
+/// never sees them) of an entry's traffic, accepted by its address or
+/// interface. The first fragment carries the header and is matched as
+/// usual, so a datagram whose first fragment is dropped is never
+/// reassembled.
+fn fragment_rules(cidr: Option<&IpNet>, iface: Option<&Iface>, dir: Dir) -> Vec<Vec<Value>> {
+    let v4 = json!({"match": {"op": "!=",
+        "left": {"&": [{"payload": {"protocol": "ip", "field": "frag-off"}}, 0x1fff]},
+        "right": 0}});
+    let v6 = json!({"match": {"op": "!=",
+        "left": {"exthdr": {"name": "frag", "field": "frag-off"}}, "right": 0}});
+    let b = base(cidr, iface, dir);
+    let fams: Vec<Value> = match cidr {
+        Some(c) if c.is_v4() => vec![v4],
+        Some(_) => vec![v6],
+        None => vec![v4, v6],
+    };
+    fams.into_iter()
+        .map(|f| {
+            let mut x = b.clone();
+            x.push(f);
+            accept(x)
+        })
+        .collect()
+}
+
+/// Accept rules for one allow entry in `chain` (see [`port_rules`]), plus
+/// its non-first fragments when a port narrows it.
+fn allow_rules(e: &AllowEntry, chain: &str) -> Vec<Vec<Value>> {
+    let mut out = Vec::new();
+    for &dir in dirs(chain) {
+        let b = base(e.cidr.as_ref(), e.interface.as_ref(), dir);
+        match (e.proto, e.port) {
+            (Some(p), Some(port)) => {
+                out.extend(port_rules(&b, p, (port, port), chain, true, &[]));
+                out.extend(fragment_rules(e.cidr.as_ref(), e.interface.as_ref(), dir));
+            }
+            (Some(p), None) => {
+                let mut x = b;
+                x.push(m(json!({"meta": {"key": "l4proto"}}), json!(p.as_str())));
+                out.push(accept(x));
+            }
+            _ => out.push(accept(b)),
+        }
     }
-    if let Some(g) = &e.guid_prefix {
-        base.extend(guid_exprs(g));
+    out
+}
+
+/// Accept rules for one protected (motion control path) entry in `chain`.
+/// An entry without an address and an interface renders nothing: a GUID
+/// prefix alone never opens anything (H1; configuration validation refuses
+/// such an entry, this is the second line for an older journal).
+fn protected_rules(e: &ProtectedEntry, chain: &str) -> Vec<Vec<Value>> {
+    if e.cidr.is_none() && e.interface.is_none() {
+        return Vec::new();
     }
-    match e.udp_ports {
-        Some(r) => ["sport", "dport"]
-            .into_iter()
-            .map(|f| {
-                let mut x = base.clone();
-                x.push(port_match(Proto::Udp, f, r.lo, r.hi));
-                verdict(x, "accept", false)
-            })
-            .collect(),
-        None => vec![verdict(base, "accept", false)],
+    let mut out = Vec::new();
+    for &dir in dirs(chain) {
+        let mut b = base(e.cidr.as_ref(), e.interface.as_ref(), dir);
+        match (e.udp_ports, &e.guid_prefix) {
+            (Some(r), g) => {
+                let tail = g.as_ref().map(guid_raw).unwrap_or_default();
+                out.extend(port_rules(
+                    &b,
+                    Proto::Udp,
+                    (r.lo, r.hi),
+                    chain,
+                    false,
+                    &tail,
+                ));
+            }
+            (None, Some(g)) => {
+                b.extend(guid_exprs(g));
+                out.push(accept(b));
+            }
+            (None, None) => out.push(accept(b)),
+        }
+        if e.udp_ports.is_some() || e.guid_prefix.is_some() {
+            out.extend(fragment_rules(e.cidr.as_ref(), e.interface.as_ref(), dir));
+        }
     }
+    out
 }
 
 fn locator_rule(l: &Locator, dir: Dir) -> Vec<Value> {
@@ -335,66 +450,206 @@ fn locator_rule(l: &Locator, dir: Dir) -> Vec<Value> {
 fn quarantine_rules(q: &QuarantineSpec, chain: &str) -> Vec<Vec<Value>> {
     let mut out = vec![verdict(guid_exprs(&q.guid_prefix), "drop", true)];
     for l in &q.locators {
-        match chain {
-            "input" => out.push(locator_rule(l, Dir::In)),
-            "output" => out.push(locator_rule(l, Dir::Out)),
-            _ => {
-                out.push(locator_rule(l, Dir::In));
-                out.push(locator_rule(l, Dir::Out));
+        for &dir in dirs(chain) {
+            out.push(locator_rule(l, dir));
+        }
+    }
+    out
+}
+
+/// A value or, for more than one, an anonymous set.
+fn one_or_set(mut v: Vec<Value>) -> Value {
+    if v.len() == 1 {
+        v.remove(0)
+    } else {
+        json!({ "set": v })
+    }
+}
+
+fn icmpv6_types(types: &[&str]) -> Vec<Value> {
+    vec![m(
+        json!({"payload": {"protocol": "icmpv6", "field": "type"}}),
+        one_or_set(types.iter().map(|t| json!(t)).collect()),
+    )]
+}
+
+fn udp_ports(sport: u16, dport: u16) -> Vec<Value> {
+    vec![
+        port_match(Proto::Udp, "sport", sport, sport),
+        port_match(Proto::Udp, "dport", dport, dport),
+    ]
+}
+
+/// IPv4 "fragmentation needed" (path MTU discovery).
+fn frag_needed() -> Vec<Value> {
+    vec![
+        m(
+            json!({"payload": {"protocol": "icmp", "field": "type"}}),
+            json!("destination-unreachable"),
+        ),
+        m(
+            json!({"payload": {"protocol": "icmp", "field": "code"}}),
+            json!("frag-needed"),
+        ),
+    ]
+}
+
+/// The interface matches of the discovery interfaces (one rule each, or
+/// one rule without an interface match when any interface may carry them).
+fn per_interface(d: &DiscoverySpec, ifkey: &str, rest: &[Value]) -> Vec<Vec<Value>> {
+    if d.interfaces.is_empty() {
+        return vec![accept(rest.to_vec())];
+    }
+    d.interfaces
+        .iter()
+        .map(|i| {
+            let mut x = vec![m(json!({"meta": {"key": ifkey}}), json!(i.as_str()))];
+            x.extend_from_slice(rest);
+            accept(x)
+        })
+        .collect()
+}
+
+/// `ip[6] daddr <groups> udp dport <ports>` per address family (`true`:
+/// IPv4).
+fn discovery_matches(d: &DiscoverySpec) -> Vec<(bool, Vec<Value>)> {
+    let ports = one_or_set(d.ports.iter().map(|p| json!(p)).collect());
+    let mut out = Vec::new();
+    for v4 in [true, false] {
+        let groups: Vec<Value> = d
+            .groups
+            .iter()
+            .filter(|g| g.is_ipv4() == v4)
+            .map(|g| json!(g.to_string()))
+            .collect();
+        if groups.is_empty() || d.ports.is_empty() {
+            continue;
+        }
+        let proto = if v4 { "ip" } else { "ip6" };
+        out.push((
+            v4,
+            vec![
+                m(
+                    json!({"payload": {"protocol": proto, "field": "daddr"}}),
+                    one_or_set(groups),
+                ),
+                m(
+                    json!({"payload": {"protocol": "udp", "field": "dport"}}),
+                    ports.clone(),
+                ),
+            ],
+        ));
+    }
+    out
+}
+
+/// The robot's own discovery and IGMP (output), and discovery and IGMP
+/// queries from the protected networks (input).
+fn discovery_rules(s: &IsolationSpec, chain: &str) -> Vec<Vec<Value>> {
+    let Some(d) = &s.discovery else {
+        return Vec::new();
+    };
+    let igmp = vec![m(json!({"meta": {"key": "l4proto"}}), json!("igmp"))];
+    let mut out = Vec::new();
+    match chain {
+        "output" => {
+            out.extend(per_interface(d, "oifname", &igmp));
+            for (_, dm) in discovery_matches(d) {
+                out.extend(per_interface(d, "oifname", &dm));
             }
+        }
+        "input" => {
+            out.extend(per_interface(d, "iifname", &igmp));
+            for e in &s.protected {
+                if e.cidr.is_none() && e.interface.is_none() {
+                    continue;
+                }
+                for (v4, dm) in discovery_matches(d) {
+                    if e.cidr.is_some_and(|c| c.is_v4() != v4) {
+                        continue;
+                    }
+                    let mut x = base(e.cidr.as_ref(), e.interface.as_ref(), Dir::In);
+                    x.extend(dm);
+                    out.push(accept(x));
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// What every host needs to stay reachable at all (L5): loopback, IPv6
+/// neighbour / router discovery and MLD, path MTU discovery (ICMP
+/// "fragmentation needed", ICMPv6 "packet too big"), and the DHCP / DHCPv6
+/// client exchange.
+fn host_rules(chain: &str) -> Vec<Vec<Value>> {
+    let mut out = Vec::new();
+    match chain {
+        "input" => {
+            out.push(accept(vec![m(
+                json!({"meta": {"key": "iifname"}}),
+                json!("lo"),
+            )]));
+            out.push(accept(icmpv6_types(&[
+                "packet-too-big",
+                "mld-listener-query",
+                "nd-router-advert",
+                "nd-neighbor-solicit",
+                "nd-neighbor-advert",
+            ])));
+            out.push(accept(frag_needed()));
+            out.push(accept(udp_ports(67, 68)));
+            out.push(accept(udp_ports(547, 546)));
+        }
+        "output" => {
+            out.push(accept(vec![m(
+                json!({"meta": {"key": "oifname"}}),
+                json!("lo"),
+            )]));
+            out.push(accept(icmpv6_types(&[
+                "packet-too-big",
+                "mld-listener-report",
+                "mld-listener-done",
+                "nd-router-solicit",
+                "nd-neighbor-solicit",
+                "nd-neighbor-advert",
+                "mld2-listener-report",
+            ])));
+            out.push(accept(frag_needed()));
+            out.push(accept(udp_ports(68, 67)));
+            out.push(accept(udp_ports(546, 547)));
+        }
+        _ => {
+            out.push(accept(icmpv6_types(&["packet-too-big"])));
+            out.push(accept(frag_needed()));
         }
     }
     out
 }
 
 fn isolation_rules(s: &IsolationSpec, chain: &str) -> Vec<Vec<Value>> {
-    let mut out = Vec::new();
-    let dirs: &[Dir] = match chain {
-        "input" => &[Dir::In],
-        "output" => &[Dir::Out],
-        _ => &[Dir::In, Dir::Out],
-    };
-    match chain {
-        "input" => out.push(verdict(
-            vec![m(json!({"meta": {"key": "iifname"}}), json!("lo"))],
-            "accept",
-            false,
-        )),
-        "output" => out.push(verdict(
-            vec![m(json!({"meta": {"key": "oifname"}}), json!("lo"))],
-            "accept",
-            false,
-        )),
-        _ => {}
-    }
-    if chain != "forward" {
-        // IPv6 neighbour discovery: without it no IPv6 peer (management
-        // included) stays reachable.
-        out.push(verdict(
-            vec![m(
-                json!({"payload": {"protocol": "icmpv6", "field": "type"}}),
-                json!({"set": ["nd-neighbor-solicit", "nd-neighbor-advert"]}),
-            )],
-            "accept",
-            false,
-        ));
-    }
-    for e in &s.protected {
-        for d in dirs {
-            out.extend(protected_rules(e, *d));
-        }
-    }
+    let mut out = host_rules(chain);
+    out.extend(discovery_rules(s, chain));
+    // The protected entries are in the preamble (see [`render`]).
     for e in &s.allow {
-        for d in dirs {
-            out.extend(allow_rules(e, *d));
-        }
+        out.extend(allow_rules(e, chain));
     }
     out.push(verdict(Vec::new(), "drop", true));
     out
 }
 
-/// Render the table for the active actions: quarantines first (they also
-/// apply to exempted addresses), then the isolation, each in id order.
+/// Comment of the preamble's rules.
+pub const PROTECTED_COMMENT: &str = "robodr protected motion_control_path";
+
+/// Render the table for the active actions, per chain:
+///
+/// 1. **the protected preamble**: accepts for every motion-control-path
+///    entry any active action may not cut (the union of the entries frozen
+///    in the active isolations and quarantines), before any drop, so no
+///    quarantine drop ever reaches a low-level or otherwise protected flow;
+/// 2. the quarantines, then
+/// 3. the isolation, each in id order.
 pub fn render(active: &[Active<'_>]) -> Rendered {
     let mut acts: Vec<&Active<'_>> = active
         .iter()
@@ -404,9 +659,28 @@ pub fn render(active: &[Active<'_>]) -> Rendered {
         return Rendered { chains: None };
     }
     acts.sort_by(|a, b| a.id.cmp(b.id));
+    let mut protected: Vec<&ProtectedEntry> = Vec::new();
+    for a in &acts {
+        let list = match a.effect {
+            Effect::Isolate(s) => &s.protected,
+            Effect::Quarantine(q) => &q.protected,
+            _ => continue,
+        };
+        for e in list {
+            if !protected.contains(&e) {
+                protected.push(e);
+            }
+        }
+    }
     let mut chains = BTreeMap::new();
     for (chain, _) in CHAINS {
         let mut rules = Vec::new();
+        for e in &protected {
+            rules.extend(protected_rules(e, chain).into_iter().map(|expr| Rule {
+                expr,
+                comment: Some(PROTECTED_COMMENT.to_string()),
+            }));
+        }
         for a in &acts {
             if let Effect::Quarantine(q) = a.effect {
                 let c = format!("robodr quarantine_node {}", tag(a.id));
@@ -504,10 +778,27 @@ pub fn read_table(nft: &mut dyn Nft) -> Result<Option<Vec<Value>>, String> {
     Ok(Some(parse_list(&out)?))
 }
 
-/// Replace counter statistics by `null` (they change with traffic).
+/// Replace counter statistics by `null` (they change with traffic) and
+/// sort the elements of anonymous sets (nft lists them in its own order).
 pub fn normalise_expr(e: &Value) -> Value {
-    match e.as_object() {
-        Some(o) if o.contains_key("counter") => json!({"counter": null}),
+    match e {
+        Value::Object(o) if o.contains_key("counter") => json!({"counter": null}),
+        Value::Object(o) => Value::Object(
+            o.iter()
+                .map(|(k, v)| {
+                    let v = match (k.as_str(), v) {
+                        ("set", Value::Array(a)) => {
+                            let mut a: Vec<Value> = a.iter().map(normalise_expr).collect();
+                            a.sort_by_key(|x| x.to_string());
+                            Value::Array(a)
+                        }
+                        _ => normalise_expr(v),
+                    };
+                    (k.clone(), v)
+                })
+                .collect(),
+        ),
+        Value::Array(a) => Value::Array(a.iter().map(normalise_expr).collect()),
         _ => e.clone(),
     }
 }
@@ -674,6 +965,7 @@ mod tests {
                 ip: "10.0.0.7".parse().unwrap(),
                 port: 7410,
             }],
+            protected: vec![],
         })
     }
 
@@ -699,6 +991,7 @@ mod tests {
                 note: None,
             }],
             protected: vec![],
+            discovery: None,
         });
         let r = render(&[
             Active {

@@ -18,11 +18,21 @@
 //! ```text
 //! agentd → submit{order}      executor → confirm{id}        (asks for the safety state now)
 //! agentd → safety{state,age}  executor → outcome{...}
-//! agentd → revert / status / events / ping   executor → outcome / events / pong
+//! agentd → events{since}      [executor → confirm{"rearm"} → agentd safety{..}, only while
+//!                              actions are held after a reboot]   executor → event_list
+//! agentd → revert / status / ping   executor → outcome / pong
+//! operator (CLI) → rearm{reason}    executor → rearmed{was_disabled}
 //! ```
+//!
+//! A request line must arrive whole within [`crate::server::MESSAGE_DEADLINE`]
+//! (an absolute deadline, not one per read), and nonces are remembered on
+//! the monotonic clock ([`mono_ms`]): a wall-clock step back neither keeps
+//! them forever (filling the cache) nor drops them early.
 
 use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, Write};
+use std::os::unix::net::UnixStream;
+use std::time::Instant;
 
 use robodr_blackbox::crypto::{ct_eq, fill_random, from_hex, hmac_sha256, to_hex};
 use robodr_responder::SafetyState;
@@ -69,6 +79,10 @@ pub enum Msg {
         since: u64,
     },
     Ping,
+    /// The operator re-arms the executor after an emergency disable.
+    Rearm {
+        reason: String,
+    },
     // executor → agentd
     Confirm {
         id: String,
@@ -82,6 +96,16 @@ pub enum Msg {
     Pong {
         active: usize,
         boot_id: String,
+        /// Status flags (absent from executor v1.0).
+        #[serde(default)]
+        operator_disabled: bool,
+        #[serde(default)]
+        journal_reset: bool,
+        #[serde(default)]
+        held: usize,
+    },
+    Rearmed {
+        was_disabled: bool,
     },
     Error {
         code: String,
@@ -290,7 +314,8 @@ pub fn open(
     })
 }
 
-/// Remembers request nonces for the timestamp window.
+/// Remembers request nonces for the timestamp window, on the monotonic
+/// clock ([`mono_ms`]).
 #[derive(Debug, Default)]
 pub struct NonceCache {
     seen: HashSet<String>,
@@ -298,9 +323,11 @@ pub struct NonceCache {
 }
 
 impl NonceCache {
-    /// Record `nonce` seen at `now_ms`. `Err(Replayed)` if already seen;
-    /// fails closed (`Err(Stale)`) when full of nonces still in the window.
-    pub fn check(&mut self, nonce: &str, now_ms: u64) -> Result<(), Reject> {
+    /// Record `nonce` seen at `mono_ms` (monotonic ms, never the wall
+    /// clock). `Err(Replayed)` if already seen; fails closed
+    /// (`Err(Stale)`) when full of nonces still in the window.
+    pub fn check(&mut self, nonce: &str, mono_ms: u64) -> Result<(), Reject> {
+        let now_ms = mono_ms;
         while let Some((t, _)) = self.order.front() {
             if now_ms.saturating_sub(*t) > 2 * MAX_SKEW_MS {
                 if let Some((_, n)) = self.order.pop_front() {
@@ -320,6 +347,43 @@ impl NonceCache {
         self.order.push_back((now_ms, nonce.to_string()));
         Ok(())
     }
+}
+
+/// Read one line of at most [`MAX_LINE`] bytes that must be complete by
+/// `deadline` (absolute: a peer trickling bytes cannot extend it).
+pub fn read_line_by(
+    r: &mut std::io::BufReader<UnixStream>,
+    deadline: Instant,
+) -> Result<Vec<u8>, String> {
+    let mut line = Vec::new();
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err("message deadline passed".into());
+        }
+        r.get_ref()
+            .set_read_timeout(Some(left))
+            .map_err(|e| format!("read: {e}"))?;
+        let buf = r.fill_buf().map_err(|e| format!("read: {e}"))?;
+        if buf.is_empty() {
+            return Err("connection closed".into());
+        }
+        if let Some(i) = buf.iter().position(|b| *b == b'\n') {
+            line.extend_from_slice(&buf[..i]);
+            r.consume(i + 1);
+            break;
+        }
+        let n = buf.len();
+        line.extend_from_slice(buf);
+        r.consume(n);
+        if line.len() > MAX_LINE {
+            return Err("line too long".into());
+        }
+    }
+    if line.len() > MAX_LINE {
+        return Err("line too long".into());
+    }
+    Ok(line)
 }
 
 /// Read one line of at most [`MAX_LINE`] bytes (without the newline).
@@ -353,6 +417,13 @@ pub fn write_line(w: &mut impl Write, line: &[u8]) -> Result<(), String> {
     w.write_all(line)
         .and_then(|()| w.flush())
         .map_err(|e| format!("write: {e}"))
+}
+
+/// Monotonic ms since the first call in this process.
+pub fn mono_ms() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let s = START.get_or_init(Instant::now);
+    u64::try_from(s.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Wall clock, Unix ms.
@@ -401,6 +472,21 @@ mod tests {
             open(&k, &reply[..reply.len() - 1], 1000, Some(&other)),
             Err(Reject::WrongReply)
         );
+    }
+
+    #[test]
+    fn l3_nonce_cache_runs_on_the_monotonic_clock() {
+        // Filled at monotonic 1000; 2 * MAX_SKEW_MS later every entry has
+        // left the window whatever the wall clock did meanwhile.
+        let mut c = NonceCache::default();
+        for i in 0..NONCE_CACHE {
+            c.check(&format!("n{i}"), 1_000).unwrap();
+        }
+        assert_eq!(c.check("x", 1_000), Err(Reject::Stale), "fails closed");
+        assert!(c.check("x", 1_000 + 2 * MAX_SKEW_MS + 1).is_ok());
+        let a = mono_ms();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(mono_ms() >= a + 5);
     }
 
     #[test]

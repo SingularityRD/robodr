@@ -20,7 +20,8 @@
 //!    (`morphology_mismatch`);
 //! 6. the policy is OEM-validated and the profile locked (`observe_mode`);
 //! 7. the safety system was not engaged when judged
-//!    (`safety_system_engaged`);
+//!    (`safety_system_engaged`), and the state was known
+//!    (`safety_state_unavailable` for `unknown`);
 //! 8. `restrict_motion` is advisory in v1 (no motion gateway yet): recorded,
 //!    nothing applied (outcome `advisory`);
 //! 9. the target is one executor v1 can act on: a participant by GUID
@@ -33,13 +34,21 @@
 //!     (`needs_approval`);
 //! 11. the target is not on the motion control path (`motion_path`) unless
 //!     the policy lists the target class in `fall_safe_restrict` and the
-//!     entry is not `low_level` (a `low_level` entry is never cut);
+//!     entry is not `low_level` (a `low_level` entry is never cut). For a
+//!     quarantine the order must carry the participant's SPDP unicast
+//!     locators (`locators_required`), and each must lie provably outside
+//!     every non-cuttable entry: outside its `cidr`; an entry with an
+//!     `interface` and no `cidr` cannot be proven and refuses every
+//!     quarantine (`motion_path`). The non-cuttable entries are frozen into
+//!     the quarantine and rendered as accepts **before** its drops, so a
+//!     quarantine cannot act inside a low-level network even when traffic
+//!     there carries the quarantined GUID prefix;
 //! 12. `isolate_network` needs a configured management channel
 //!     (`no_management_channel`), so isolation can never cut the SOC off;
 //! 13. the TTL is within `1..=ttl.max_s` (`ttl_out_of_range`).
 //!
-//! [`recheck_safety`]: the current state must be known and fresh
-//! (`safety_state_unavailable`, `safety_state_stale`), the safety system
+//! [`recheck_safety`]: the current state must be known (not `unknown`) and
+//! fresh (`safety_state_unavailable`, `safety_state_stale`), the safety system
 //! not engaged (`safety_system_engaged`) and the state equal to the one the
 //! order was judged in (`safety_state_changed`: the action must be judged
 //! again, never reused).
@@ -49,8 +58,10 @@ use robodr_responder::{
 };
 use serde::{Deserialize, Serialize};
 
+use std::net::IpAddr;
+
 use crate::config::{AllowEntry, ProtectedEntry, Resolved};
-use crate::net::{GuidPrefix, IpNet};
+use crate::net::{GuidPrefix, Iface, IpNet};
 use crate::order::{Locator, Order, Target};
 
 /// Refusal codes (stable, on the wire).
@@ -73,9 +84,16 @@ pub mod codes {
     pub const ALREADY_ACTIVE: &str = "already_active";
     pub const ID_CONFLICT: &str = "id_conflict";
     pub const EVIDENCE_ELSEWHERE: &str = "evidence_elsewhere";
+    /// A quarantine without the participant's SPDP unicast locators.
+    pub const LOCATORS_REQUIRED: &str = "locators_required";
+    /// The operator removed table `inet robodr`: nothing is executed until
+    /// `robodr-executor rearm`.
+    pub const OPERATOR_DISABLED: &str = "operator_disabled";
+    /// The configuration or response policy could not be re-read.
+    pub const CONFIG_UNAVAILABLE: &str = "config_unavailable";
 
     /// Every code, for mapping a wire string back to a static one.
-    pub const ALL: [&str; 18] = [
+    pub const ALL: [&str; 21] = [
         INVALID_ORDER,
         REPLAY,
         NOT_EXECUTOR_ACTION,
@@ -94,6 +112,9 @@ pub mod codes {
         ALREADY_ACTIVE,
         ID_CONFLICT,
         EVIDENCE_ELSEWHERE,
+        LOCATORS_REQUIRED,
+        OPERATOR_DISABLED,
+        CONFIG_UNAVAILABLE,
     ];
 
     /// The static code for a wire string.
@@ -127,6 +148,22 @@ pub struct IsolationSpec {
     pub allow: Vec<AllowEntry>,
     /// Motion control path entries kept open.
     pub protected: Vec<ProtectedEntry>,
+    /// DDS discovery kept open (absent in journals of executor v1.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<DiscoverySpec>,
+}
+
+/// The robot's DDS discovery kept open during an isolation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoverySpec {
+    /// SPDP multicast groups.
+    pub groups: Vec<IpAddr>,
+    /// Their UDP destination ports (RTPS port map of the domains).
+    pub ports: Vec<u16>,
+    /// Interfaces of the protected and control-bus entries; empty = any
+    /// interface (some entry names an address only).
+    #[serde(default)]
+    pub interfaces: Vec<Iface>,
 }
 
 /// The rule inputs of a participant quarantine.
@@ -135,6 +172,10 @@ pub struct QuarantineSpec {
     pub guid_prefix: GuidPrefix,
     #[serde(default)]
     pub locators: Vec<Locator>,
+    /// The motion control path entries this quarantine may not cut,
+    /// rendered as accepts before any quarantine drop.
+    #[serde(default)]
+    pub protected: Vec<ProtectedEntry>,
 }
 
 /// What an accepted order does.
@@ -167,18 +208,20 @@ fn target_class(action: ActionId) -> Option<RestrictTarget> {
     }
 }
 
-fn locator_hits(e: &ProtectedEntry, l: &Locator) -> bool {
-    if e.cidr.is_none() && e.interface.is_none() {
-        // A GUID-only entry is checked by prefix.
-        return false;
+/// Why `l` cannot be proven to lie outside the non-cuttable entry `e`, if
+/// it cannot: inside its `cidr`, or `e` names an interface and no address
+/// (any locator may be behind it).
+fn locator_unproven(e: &ProtectedEntry, l: &Locator) -> Option<String> {
+    match (&e.cidr, &e.interface) {
+        (Some(c), _) if c.contains(l.ip) => Some(format!("locator {} is inside {c}", l.ip)),
+        (Some(_), _) => None,
+        (None, Some(i)) => Some(format!(
+            "the entry names interface {} and no address: no locator can be proven outside it",
+            i.as_str()
+        )),
+        // Not a valid entry (config validation refuses it): never proven.
+        (None, None) => Some("the entry names no address".into()),
     }
-    if e.interface.is_some() && e.cidr.is_none() {
-        // Interface-only: any locator may be behind it; conservative.
-        return true;
-    }
-    let ip_in = e.cidr.is_none_or(|c| c.contains(l.ip));
-    let port_in = e.udp_ports.is_none_or(|r| r.contains(l.port));
-    ip_in && port_in
 }
 
 /// May this protected entry be cut for `target` under `policy`?
@@ -250,6 +293,12 @@ pub fn precheck(
             "the safety system was engaged when the action was judged: it has authority",
         ));
     }
+    if order.judged_state == SafetyState::Unknown {
+        return Err(Refusal::new(
+            codes::SAFETY_STATE_UNAVAILABLE,
+            "the action was judged without a known safety state: nothing is executed",
+        ));
+    }
     if order.action == ActionId::RestrictMotion {
         return Ok(Planned {
             effect: Effect::Advisory {
@@ -290,6 +339,7 @@ pub fn precheck(
                 l.dedup();
                 l
             },
+            protected: Vec::new(),
         }),
         (ActionId::QuarantineNode, Target::Node { .. }) => {
             return Err(Refusal::new(
@@ -354,26 +404,64 @@ pub fn precheck(
     }
     let net = &cfg.config.network;
     let effect = match quarantine {
-        Some(q) => {
-            for (i, e) in net.motion_control_path.iter().enumerate() {
-                let hit = e.guid_prefix == Some(q.guid_prefix)
-                    || q.locators.iter().any(|l| locator_hits(e, l));
-                if hit && !cuttable(e, policy, class) {
+        Some(mut q) => {
+            let describe = |i: usize, e: &ProtectedEntry| {
+                format!(
+                    "network.motion_control_path[{i}]{}{}",
+                    if e.low_level { ", low_level" } else { "" },
+                    e.note
+                        .as_deref()
+                        .map(|n| format!(": {n}"))
+                        .unwrap_or_default()
+                )
+            };
+            let keep: Vec<(usize, &ProtectedEntry)> = net
+                .motion_control_path
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| !cuttable(e, policy, class))
+                .collect();
+            for (i, e) in &keep {
+                if e.guid_prefix == Some(q.guid_prefix) {
                     return Err(Refusal::new(
                         codes::MOTION_PATH,
                         format!(
-                            "participant {} is on the motion control path \
-                             (network.motion_control_path[{i}]{}{}): never quarantined here",
+                            "participant {} is on the motion control path ({}): never \
+                             quarantined here",
                             q.guid_prefix,
-                            if e.low_level { ", low_level" } else { "" },
-                            e.note
-                                .as_deref()
-                                .map(|n| format!(": {n}"))
-                                .unwrap_or_default()
+                            describe(*i, e)
                         ),
                     ));
                 }
             }
+            if q.locators.is_empty() {
+                return Err(Refusal::new(
+                    codes::LOCATORS_REQUIRED,
+                    format!(
+                        "the order names participant {} without its SPDP unicast locators: the \
+                         executor quarantines only a participant it can prove is outside the \
+                         motion control path (GUID prefixes change on restart and can be \
+                         forged)",
+                        q.guid_prefix
+                    ),
+                ));
+            }
+            for (i, e) in &keep {
+                for l in &q.locators {
+                    if let Some(why) = locator_unproven(e, l) {
+                        return Err(Refusal::new(
+                            codes::MOTION_PATH,
+                            format!(
+                                "participant {} may be on the motion control path ({}): {why}; \
+                                 never quarantined here",
+                                q.guid_prefix,
+                                describe(*i, e)
+                            ),
+                        ));
+                    }
+                }
+            }
+            q.protected = keep.into_iter().map(|(_, e)| e.clone()).collect();
             Effect::Quarantine(q)
         }
         None => {
@@ -389,13 +477,52 @@ pub fn precheck(
             if net.control_buses.exempt {
                 allow.extend(net.control_buses.entries.iter().cloned());
             }
-            let protected = net
+            let protected: Vec<ProtectedEntry> = net
                 .motion_control_path
                 .iter()
                 .filter(|e| !cuttable(e, policy, class))
                 .cloned()
                 .collect();
-            Effect::Isolate(IsolationSpec { allow, protected })
+            let d = &net.discovery;
+            let discovery = (!d.multicast_groups.is_empty()).then(|| {
+                // The interfaces that carry the protected and control-bus
+                // entries; any interface when one of them names none.
+                let mut ifs: Vec<Iface> = Vec::new();
+                let mut any = false;
+                let buses: &[AllowEntry] = if net.control_buses.exempt {
+                    &net.control_buses.entries
+                } else {
+                    &[]
+                };
+                let named = protected
+                    .iter()
+                    .map(|e| &e.interface)
+                    .chain(buses.iter().map(|e| &e.interface));
+                for i in named {
+                    match i {
+                        Some(i) => ifs.push(i.clone()),
+                        None => any = true,
+                    }
+                }
+                if any {
+                    ifs.clear();
+                }
+                ifs.sort();
+                ifs.dedup();
+                let mut groups = d.multicast_groups.clone();
+                groups.sort();
+                groups.dedup();
+                DiscoverySpec {
+                    groups,
+                    ports: d.ports(),
+                    interfaces: ifs,
+                }
+            });
+            Effect::Isolate(IsolationSpec {
+                allow,
+                protected,
+                discovery,
+            })
         }
     };
     let ttl = order.ttl_s.unwrap_or(cfg.config.ttl.default_s);
@@ -452,6 +579,12 @@ pub fn recheck_safety(
             ),
         ));
     }
+    if c.state == SafetyState::Unknown {
+        return Err(Refusal::new(
+            codes::SAFETY_STATE_UNAVAILABLE,
+            "the platform reports its safety state as unknown: nothing applied",
+        ));
+    }
     if c.state != order.judged_state {
         return Err(Refusal::new(
             codes::SAFETY_STATE_CHANGED,
@@ -460,6 +593,40 @@ pub fn recheck_safety(
                  judged again",
                 order.judged_state, c.state
             ),
+        ));
+    }
+    Ok(())
+}
+
+/// The safety check before an action held across a reboot is installed
+/// again: the current state must be known, fresh and not engaged (it need
+/// not equal the state the order was judged in before the reboot).
+pub fn recheck_rearm(current: Result<Current, String>, max_age_ms: u64) -> Result<(), Refusal> {
+    let c = current.map_err(|e| {
+        Refusal::new(
+            codes::SAFETY_STATE_UNAVAILABLE,
+            format!("the current safety state could not be read ({e})"),
+        )
+    })?;
+    if c.age_ms > max_age_ms {
+        return Err(Refusal::new(
+            codes::SAFETY_STATE_STALE,
+            format!(
+                "the current safety state is {} ms old (limit {max_age_ms} ms)",
+                c.age_ms
+            ),
+        ));
+    }
+    if c.state.safety_system_engaged() {
+        return Err(Refusal::new(
+            codes::SAFETY_SYSTEM_ENGAGED,
+            format!("the safety system is engaged now ({:?})", c.state),
+        ));
+    }
+    if c.state == SafetyState::Unknown {
+        return Err(Refusal::new(
+            codes::SAFETY_STATE_UNAVAILABLE,
+            "the platform reports its safety state as unknown",
         ));
     }
     Ok(())

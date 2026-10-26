@@ -10,6 +10,11 @@ set -e
 
 case "$1" in
 purge)
+    # The executor's journal is not evidence (its events are in the black
+    # box): a purge removes it, so a later install never re-applies
+    # (re-validates) actions of the old one.
+    rm -f /var/lib/robodr/executor/journal.json /var/lib/robodr/executor/journal.json.tmp
+    rmdir /var/lib/robodr/executor 2>/dev/null || true
     if [ -d /var/lib/robodr ] || [ -d /etc/robodr ]; then
         echo "robodr: purge keeps /var/lib/robodr (evidence) and /etc/robodr (keys, profile)."
         echo "robodr: export and archive them first; see OPERATIONS.md, 'Decommissioning'."

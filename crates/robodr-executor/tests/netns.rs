@@ -61,10 +61,12 @@ fn sh(args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// Two namespaces and a veth pair; removed on drop.
+/// Two namespaces and a veth pair (plus an optional third namespace
+/// `far`); removed on drop.
 struct Lab {
     robot: String,
     peer: String,
+    far: Option<String>,
     dir: PathBuf,
 }
 
@@ -72,7 +74,61 @@ impl Drop for Lab {
     fn drop(&mut self) {
         let _ = sh(&["ip", "netns", "del", &self.robot]);
         let _ = sh(&["ip", "netns", "del", &self.peer]);
+        if let Some(f) = &self.far {
+            let _ = sh(&["ip", "netns", "del", f]);
+        }
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// A third namespace `far` (10.98.0.5 behind the robot, which routes; or
+/// 10.97.0.10 behind the peer, which routes over a link of `mtu`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Far {
+    None,
+    BehindRobot,
+    BehindPeer { mtu: u32 },
+}
+
+const FAR_BEHIND_ROBOT: &str = "10.98.0.5";
+const FAR_BEHIND_PEER: &str = "10.97.0.10";
+
+/// A small tmpfs (for full-disk tests); unmounted on drop.
+struct Tmpfs(PathBuf);
+
+impl Tmpfs {
+    fn new(dir: PathBuf, size: &str) -> Tmpfs {
+        std::fs::create_dir_all(&dir).unwrap();
+        sh(&[
+            "mount",
+            "-t",
+            "tmpfs",
+            "-o",
+            &format!("size={size},mode=0700"),
+            "tmpfs",
+            dir.to_str().unwrap(),
+        ])
+        .unwrap();
+        Tmpfs(dir)
+    }
+
+    /// Fill the file system (a filler file up to ENOSPC).
+    fn fill(&self) {
+        use std::io::Write;
+        let mut f = std::fs::File::create(self.0.join("filler")).unwrap();
+        let block = vec![0u8; 4096];
+        while f.write_all(&block).is_ok() {}
+        let _ = f.sync_all();
+    }
+
+    fn free(&self) {
+        let _ = std::fs::remove_file(self.0.join("filler"));
+    }
+}
+
+impl Drop for Tmpfs {
+    fn drop(&mut self) {
+        let _ = sh(&["umount", "-l", self.0.to_str().unwrap()]);
     }
 }
 
@@ -89,7 +145,11 @@ fn is_root() -> bool {
 
 impl Lab {
     fn new() -> Option<Lab> {
-        match Self::try_new() {
+        Self::with(Far::None)
+    }
+
+    fn with(far: Far) -> Option<Lab> {
+        match Self::try_new(far) {
             Ok(l) => Some(l),
             Err(e) => {
                 if std::env::var("ROBODR_REQUIRE_NETNS").as_deref() == Ok("1") {
@@ -101,7 +161,7 @@ impl Lab {
         }
     }
 
-    fn try_new() -> Result<Lab, String> {
+    fn try_new(far: Far) -> Result<Lab, String> {
         if !is_root() {
             return Err("not root".into());
         }
@@ -114,9 +174,10 @@ impl Lab {
         let dir = std::env::temp_dir().join(format!("robodr-executor-netns-{id}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let lab = Lab {
+        let mut lab = Lab {
             robot: robot.clone(),
             peer: peer.clone(),
+            far: None,
             dir,
         };
         let va = format!("rva{id}");
@@ -152,8 +213,83 @@ impl Lab {
         for (ns, dev) in [(&robot, &va), (&peer, &vb)] {
             sh(&["ip", "-n", ns, "link", "set", dev, "up"])?;
             sh(&["ip", "-n", ns, "link", "set", "lo", "up"])?;
+            // Multicast leaves through the lab link.
+            sh(&["ip", "-n", ns, "route", "add", "224.0.0.0/4", "dev", dev])?;
+        }
+        if far != Far::None {
+            let f = format!("rdxf{id}");
+            sh(&["ip", "netns", "add", &f])?;
+            lab.far = Some(f.clone());
+            let fa = format!("rfa{id}");
+            let fb = format!("rfb{id}");
+            let (router, rnet, faddr, raddr) = match far {
+                Far::BehindRobot => (&robot, "10.98.0", FAR_BEHIND_ROBOT, "10.98.0.1"),
+                _ => (&peer, "10.97.0", FAR_BEHIND_PEER, "10.97.0.1"),
+            };
+            sh(&[
+                "ip", "link", "add", &fa, "netns", router, "type", "veth", "peer", "name", &fb,
+                "netns", &f,
+            ])?;
+            sh(&[
+                "ip",
+                "-n",
+                router,
+                "addr",
+                "add",
+                &format!("{raddr}/24"),
+                "dev",
+                &fa,
+            ])?;
+            sh(&[
+                "ip",
+                "-n",
+                &f,
+                "addr",
+                "add",
+                &format!("{faddr}/24"),
+                "dev",
+                &fb,
+            ])?;
+            if let Far::BehindPeer { mtu } = far {
+                let mtu = mtu.to_string();
+                sh(&["ip", "-n", router, "link", "set", &fa, "mtu", &mtu])?;
+                sh(&["ip", "-n", &f, "link", "set", &fb, "mtu", &mtu])?;
+            }
+            sh(&["ip", "-n", router, "link", "set", &fa, "up"])?;
+            sh(&["ip", "-n", &f, "link", "set", &fb, "up"])?;
+            sh(&["ip", "-n", &f, "link", "set", "lo", "up"])?;
+            sh(&["ip", "-n", &f, "route", "add", "default", "via", raddr])?;
+            sh(&[
+                "ip",
+                "netns",
+                "exec",
+                router,
+                "sh",
+                "-c",
+                "echo 1 > /proc/sys/net/ipv4/ip_forward",
+            ])?;
+            // The other end of the lab link routes the far network through
+            // the router.
+            let (other_ns, via) = match far {
+                Far::BehindRobot => (&peer, ROBOT),
+                _ => (&robot, OTHER),
+            };
+            sh(&[
+                "ip",
+                "-n",
+                other_ns,
+                "route",
+                "add",
+                &format!("{rnet}.0/24"),
+                "via",
+                via,
+            ])?;
         }
         Ok(lab)
+    }
+
+    fn far(&self) -> &str {
+        self.far.as_deref().expect("lab without a far namespace")
     }
 
     fn nft(&self) -> NftCommand {
@@ -189,15 +325,27 @@ impl Lab {
         d
     }
 
-    /// Send `count` datagrams from `src` (ns `from`) to `dst` and count what
+    /// Send 3 datagrams from `src` (ns `from`) to `dst` and count what
     /// arrives at `dst` (ns `to`).
     fn probe(&self, from: &str, src: &str, to: &str, dst: &str, payload: &[u8]) -> usize {
+        let hex: String = payload.iter().map(|b| format!("{b:02x}")).collect();
+        self.exchange(
+            to,
+            &format!("recv {dst} 700"),
+            from,
+            &format!("send {src} {dst} {hex}"),
+        )
+    }
+
+    /// Start the receiver `recv_spec` in ns `to`, run the sender
+    /// `send_spec` in ns `from`, and return the receiver's count.
+    fn exchange(&self, to: &str, recv_spec: &str, from: &str, send_spec: &str) -> usize {
         let exe = std::env::current_exe().unwrap();
         let mut rx = Command::new("ip")
             .args(["netns", "exec", to])
             .arg(&exe)
             .args(["--exact", "netns_helper", "--nocapture", "--test-threads=1"])
-            .env(HELPER_ENV, format!("recv {dst} 700"))
+            .env(HELPER_ENV, recv_spec)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -211,17 +359,16 @@ impl Lab {
             }
             assert!(Instant::now() < deadline, "receiver never got ready");
         }
-        let hex: String = payload.iter().map(|b| format!("{b:02x}")).collect();
         let st = Command::new("ip")
             .args(["netns", "exec", from])
             .arg(&exe)
             .args(["--exact", "netns_helper", "--nocapture", "--test-threads=1"])
-            .env(HELPER_ENV, format!("send {src} {dst} {hex}"))
+            .env(HELPER_ENV, send_spec)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .unwrap();
-        assert!(st.success(), "sender failed");
+        assert!(st.success(), "sender failed: {send_spec}");
         let mut count = None;
         for l in lines {
             let l = l.unwrap();
@@ -272,13 +419,39 @@ fn netns_helper() {
             let window = Duration::from_millis(ms.parse().unwrap());
             let end = Instant::now() + window;
             let mut n = 0;
-            let mut buf = [0u8; 2048];
+            let mut buf = vec![0u8; 65536];
             while Instant::now() < end {
                 if s.recv_from(&mut buf).is_ok() {
                     n += 1;
                 }
             }
             println!("HELPER:count={n}");
+        }
+        ["mrecv", group_port, ifaddr, ms] => {
+            let (group, port) = group_port.split_once(':').unwrap();
+            let group: std::net::Ipv4Addr = group.parse().unwrap();
+            let s = UdpSocket::bind(("0.0.0.0", port.parse::<u16>().unwrap())).unwrap();
+            s.join_multicast_v4(&group, &ifaddr.parse().unwrap())
+                .unwrap();
+            s.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+            println!("HELPER:ready");
+            let end = Instant::now() + Duration::from_millis(ms.parse().unwrap());
+            let mut n = 0;
+            let mut buf = vec![0u8; 65536];
+            while Instant::now() < end {
+                if s.recv_from(&mut buf).is_ok() {
+                    n += 1;
+                }
+            }
+            println!("HELPER:count={n}");
+        }
+        ["sendlen", src, dst, len] => {
+            let s = UdpSocket::bind(src).unwrap();
+            let bytes = vec![b'x'; len.parse().unwrap()];
+            for _ in 0..3 {
+                let _ = s.send_to(&bytes, dst);
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
         ["send", src, dst, hex] => {
             let s = UdpSocket::bind(src).unwrap();
@@ -305,8 +478,24 @@ fn rtps(guid: &str) -> Vec<u8> {
 }
 
 fn config(state_dir: &std::path::Path) -> robodr_executor::Resolved {
-    ExecutorConfig::parse(
-        &json!({
+    config_with(state_dir, |_| {})
+}
+
+/// The lab configuration, with `edit` applied to its JSON first.
+fn config_with(
+    state_dir: &std::path::Path,
+    edit: impl FnOnce(&mut Value),
+) -> robodr_executor::Resolved {
+    let mut v = config_json(state_dir);
+    edit(&mut v);
+    ExecutorConfig::parse(&v.to_string())
+        .unwrap()
+        .validate()
+        .unwrap()
+}
+
+fn config_json(state_dir: &std::path::Path) -> Value {
+    json!({
             "schema": "robodr-executor-config/v1",
             "robot_id": "lab-robot",
             "socket": state_dir.join("executor.sock"),
@@ -323,12 +512,7 @@ fn config(state_dir: &std::path::Path) -> robodr_executor::Resolved {
             },
             "ttl": {"default_s": 600, "max_s": 3600},
             "max_safety_age_ms": 1000
-        })
-        .to_string(),
-    )
-    .unwrap()
-    .validate()
-    .unwrap()
+    })
 }
 
 fn policy(m: Morphology, fsr: &[RestrictTarget]) -> ResponsePolicy {
@@ -594,19 +778,30 @@ fn restart_reconciliation_and_reboot_with_real_nftables() {
     assert_eq!(e.status("i-1").status, Status::Verified);
     assert_eq!(lab.ruleset(), applied);
     drop(e);
-    // Reboot (kernel ruleset empty, new boot id): re-applied, still blocks.
+    // Reboot (kernel ruleset empty, new boot id): held (nothing installed)
+    // until re-validated with a fresh safety state, then re-applied.
     lab.nft_cmd(&["delete", "table", "inet", "robodr"]).unwrap();
-    let e = open(&lab, &dir, "boot-2", Morphology::WheeledMobile, 3_000);
+    let mut e = open(&lab, &dir, "boot-2", Morphology::WheeledMobile, 3_000);
+    assert_eq!(e.status("i-1").status, Status::Held);
+    assert!(!nft::table_exists(&mut lab.nft()).unwrap());
+    e.rearm_held(
+        Ok(Current {
+            state: SafetyState::Idle,
+            age_ms: 3,
+        }),
+        3_100,
+    );
     assert_eq!(e.status("i-1").status, Status::Verified);
     assert_eq!(lab.ruleset(), applied);
     assert_eq!(lab.peer_to_robot(&format!("{OTHER}:0"), 9000, b"x"), 0);
     drop(e);
     // Operator emergency disable (same boot) while the executor is down:
-    // honoured, not re-applied.
+    // honoured, not re-applied, and orders wait for a re-arm.
     lab.nft_cmd(&["delete", "table", "inet", "robodr"]).unwrap();
     let mut e = open(&lab, &dir, "boot-2", Morphology::WheeledMobile, 4_000);
     assert_eq!(e.status("i-1").status, Status::RemovedExternally);
     assert_eq!(lab.peer_to_robot(&format!("{OTHER}:0"), 9000, b"x"), 3);
+    assert!(e.rearm("lab", 4_500).unwrap());
     // ... and while it runs.
     let i2 = order("i-2", ActionId::IsolateNetwork, Morphology::WheeledMobile);
     assert_eq!(e.submit(&i2, &mut idle(), 5_000).status, Status::Verified);
@@ -615,6 +810,7 @@ fn restart_reconciliation_and_reboot_with_real_nftables() {
     assert_eq!(e.status("i-2").status, Status::RemovedExternally);
     e.tick(60_000);
     assert!(!nft::table_exists(&mut lab.nft()).unwrap());
+    assert!(e.rearm("lab", 60_500).unwrap());
     // Drift: a rule removed by hand is put back.
     let i3 = order("i-3", ActionId::IsolateNetwork, Morphology::WheeledMobile);
     assert_eq!(e.submit(&i3, &mut idle(), 61_000).status, Status::Verified);
@@ -770,4 +966,778 @@ fn protocol_end_to_end_over_the_unix_socket() {
     stop.store(true, Ordering::SeqCst);
     let stats = server.join().unwrap();
     assert!(stats.rejected >= 1);
+}
+
+// --- Regressions of the executor v1 review -----------------------------------
+
+/// The effect of an isolation built directly (as a journal from an older
+/// version could hold it), rendered and installed without the engine.
+fn install_effect(lab: &Lab, effect: Value) {
+    let effect: robodr_executor::decision::Effect = serde_json::from_value(effect).unwrap();
+    let r = nft::render(&[nft::Active {
+        id: "direct",
+        effect: &effect,
+    }]);
+    nft::apply(&mut lab.nft(), &r).unwrap();
+}
+
+/// H1: a protected entry that names only a GUID prefix must never become an
+/// address-free accept: anyone can write that prefix into an RTPS header.
+#[test]
+fn h1_guid_only_protected_entry_opens_no_hole() {
+    let Some(lab) = Lab::new() else { return };
+    install_effect(
+        &lab,
+        json!({
+            "kind": "isolate",
+            "allow": [{"cidr": MGMT}],
+            "protected": [{"guid_prefix": GUID, "low_level": true}]
+        }),
+    );
+    assert_eq!(
+        lab.peer_to_robot(&format!("{OTHER}:0"), 7500, &rtps(GUID)),
+        0,
+        "RTPS carrying the protected prefix from a host outside every allow-list"
+    );
+    assert_eq!(
+        lab.probe(
+            &lab.robot,
+            &format!("{ROBOT}:0"),
+            &lab.peer,
+            &format!("{OTHER}:7500"),
+            &rtps(GUID)
+        ),
+        0,
+        "egress carrying the protected prefix"
+    );
+    // Through the engine: GUID + address, the GUID only narrows.
+    let dir = lab.state_dir("h1");
+    let cfg = config_with(&dir, |v| {
+        v["network"]["motion_control_path"] = json!([
+            {"cidr": MOTION, "udp_ports": [7400, 7600], "guid_prefix": GUID, "low_level": true}
+        ]);
+    });
+    let mut e = Engine::open(
+        cfg,
+        policy(Morphology::WheeledMobile, &[]),
+        Box::new(lab.nft()),
+        "boot-1",
+        1_000,
+    )
+    .unwrap();
+    let o = order(
+        "iso-h1",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+    );
+    let out = e.submit(&o, &mut idle(), 1_000);
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    assert_eq!(
+        lab.peer_to_robot(&format!("{OTHER}:0"), 7500, &rtps(GUID)),
+        0,
+        "protected prefix from another host"
+    );
+    assert_eq!(
+        lab.peer_to_robot(&format!("{MOTION}:40000"), 7500, &rtps(GUID)),
+        3,
+        "protected participant on its address"
+    );
+    assert_eq!(
+        lab.peer_to_robot(&format!("{MOTION}:40000"), 7500, b"not rtps"),
+        0,
+        "the GUID narrows the entry"
+    );
+}
+
+/// H2: a quarantine never cuts a low-level path, even when the low-level
+/// participant's traffic carries the quarantined GUID prefix (GUIDs change
+/// on restart and can collide).
+#[test]
+fn h2_quarantine_never_cuts_a_low_level_path() {
+    let Some(lab) = Lab::new() else { return };
+    let dir = lab.state_dir("h2");
+    let cfg = config_with(&dir, |v| {
+        v["network"]["motion_control_path"] =
+            json!([{"cidr": MOTION, "low_level": true, "note": "balance loop"}]);
+    });
+    let mut e = Engine::open(
+        cfg,
+        policy(Morphology::WheeledMobile, &[]),
+        Box::new(lab.nft()),
+        "boot-1",
+        1_000,
+    )
+    .unwrap();
+    let q = order("q-h2", ActionId::QuarantineNode, Morphology::WheeledMobile);
+    let out = e.submit(&q, &mut idle(), 1_000);
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    assert_eq!(
+        lab.peer_to_robot(&format!("{MOTION}:7410"), 7410, &rtps(GUID)),
+        3,
+        "low-level traffic carrying the quarantined prefix"
+    );
+    assert_eq!(
+        lab.probe(
+            &lab.robot,
+            &format!("{ROBOT}:7410"),
+            &lab.peer,
+            &format!("{MOTION}:7410"),
+            &rtps(GUID)
+        ),
+        3,
+        "low-level egress carrying the quarantined prefix"
+    );
+    // The quarantine still acts outside the low-level network.
+    assert_eq!(
+        lab.peer_to_robot(&format!("{OTHER}:0"), 7500, &rtps(GUID)),
+        0
+    );
+    assert_eq!(lab.peer_to_robot(&format!("{ROGUE}:7410"), 7500, b"x"), 0);
+}
+
+/// H3: isolation keeps the robot's own DDS discovery (SPDP multicast) and
+/// inbound discovery from the protected network.
+#[test]
+fn h3_isolation_keeps_dds_multicast_discovery() {
+    let Some(lab) = Lab::new() else { return };
+    let dir = lab.state_dir("h3");
+    let cfg = config_with(&dir, |v| {
+        // Unicast ports only: discovery must not depend on them.
+        v["network"]["motion_control_path"] = json!([{"cidr": MOTION, "udp_ports": [7410, 7600]}]);
+    });
+    let mut e = Engine::open(
+        cfg,
+        policy(Morphology::WheeledMobile, &[]),
+        Box::new(lab.nft()),
+        "boot-1",
+        1_000,
+    )
+    .unwrap();
+    let o = order(
+        "iso-h3",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+    );
+    assert_eq!(e.submit(&o, &mut idle(), 1_000).status, Status::Verified);
+    let mc = |from: &str, src: &str, to: &str, ifaddr: &str, port: u16| {
+        lab.exchange(
+            to,
+            &format!("mrecv 239.255.0.1:{port} {ifaddr} 700"),
+            from,
+            &format!("send {src} 239.255.0.1:{port} {}", hexs(&rtps(GUID))),
+        )
+    };
+    assert_eq!(
+        mc(
+            &lab.robot,
+            &format!("{ROBOT}:40000"),
+            &lab.peer,
+            MOTION,
+            7400
+        ),
+        3,
+        "the robot's SPDP to 239.255.0.1:7400"
+    );
+    assert_eq!(
+        mc(
+            &lab.robot,
+            &format!("{ROBOT}:40000"),
+            &lab.peer,
+            MOTION,
+            7401
+        ),
+        3,
+        "the robot's user multicast (7401)"
+    );
+    assert_eq!(
+        mc(
+            &lab.peer,
+            &format!("{MOTION}:40000"),
+            &lab.robot,
+            ROBOT,
+            7400
+        ),
+        3,
+        "SPDP from the protected network"
+    );
+    assert_eq!(
+        mc(
+            &lab.peer,
+            &format!("{OTHER}:40000"),
+            &lab.robot,
+            ROBOT,
+            7400
+        ),
+        0,
+        "SPDP from a host outside every allow-list"
+    );
+    assert_eq!(
+        mc(
+            &lab.robot,
+            &format!("{ROBOT}:40000"),
+            &lab.peer,
+            MOTION,
+            9999
+        ),
+        0,
+        "multicast to a port outside the DDS port map"
+    );
+}
+
+fn hexs(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// M6: fragments of a protected flow routed through the robot pass (the
+/// non-first fragments carry no UDP header to match a port on).
+#[test]
+fn m6_forwarded_fragments_of_a_protected_flow_pass() {
+    let Some(lab) = Lab::with(Far::BehindRobot) else {
+        return;
+    };
+    let dir = lab.state_dir("m6");
+    let cfg = config_with(&dir, |v| {
+        v["network"]["motion_control_path"] =
+            json!([{"cidr": FAR_BEHIND_ROBOT, "udp_ports": [7400, 7600]}]);
+    });
+    let mut e = Engine::open(
+        cfg,
+        policy(Morphology::WheeledMobile, &[]),
+        Box::new(lab.nft()),
+        "boot-1",
+        1_000,
+    )
+    .unwrap();
+    let o = order(
+        "iso-m6",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+    );
+    assert_eq!(e.submit(&o, &mut idle(), 1_000).status, Status::Verified);
+    let routed = |from: &str, src: &str, to: &str, dst: &str, len: usize| {
+        lab.exchange(
+            to,
+            &format!("recv {dst} 700"),
+            from,
+            &format!("sendlen {src} {dst} {len}"),
+        )
+    };
+    let far = lab.far().to_string();
+    let f_src = format!("{FAR_BEHIND_ROBOT}:7410");
+    assert_eq!(
+        routed(&far, &f_src, &lab.peer, &format!("{MOTION}:7410"), 100),
+        3,
+        "small datagram"
+    );
+    assert_eq!(
+        routed(&far, &f_src, &lab.peer, &format!("{MOTION}:7410"), 4000),
+        3,
+        "4000-byte datagram (fragmented)"
+    );
+    assert_eq!(
+        routed(
+            &lab.peer,
+            &format!("{MOTION}:7410"),
+            &far,
+            &format!("{FAR_BEHIND_ROBOT}:7410"),
+            4000
+        ),
+        3,
+        "4000-byte datagram towards the protected host"
+    );
+    assert_eq!(
+        routed(&far, &f_src, &lab.peer, &format!("{OTHER}:9000"), 4000),
+        0,
+        "fragments accepted by address never complete a datagram whose first \
+         fragment is dropped"
+    );
+}
+
+/// L5: isolation keeps the DHCP client and path MTU discovery working.
+#[test]
+fn l5_isolation_keeps_dhcp_client_and_path_mtu_discovery() {
+    let Some(lab) = Lab::with(Far::BehindPeer { mtu: 1280 }) else {
+        return;
+    };
+    let dir = lab.state_dir("l5");
+    let cfg = config_with(&dir, |v| {
+        v["network"]["management"] = json!([{"cidr": FAR_BEHIND_PEER}]);
+    });
+    let mut e = Engine::open(
+        cfg,
+        policy(Morphology::WheeledMobile, &[]),
+        Box::new(lab.nft()),
+        "boot-1",
+        1_000,
+    )
+    .unwrap();
+    let o = order(
+        "iso-l5",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+    );
+    assert_eq!(e.submit(&o, &mut idle(), 1_000).status, Status::Verified);
+    assert_eq!(
+        lab.peer_to_robot(&format!("{OTHER}:67"), 68, b"dhcp offer"),
+        3,
+        "DHCP server -> client"
+    );
+    assert_eq!(
+        lab.peer_to_robot(&format!("{OTHER}:67"), 69, b"x"),
+        0,
+        "port 67 to another port"
+    );
+    assert_eq!(
+        lab.probe(
+            &lab.robot,
+            &format!("{ROBOT}:68"),
+            &lab.peer,
+            &format!("{OTHER}:67"),
+            b"dhcp request"
+        ),
+        3,
+        "DHCP client -> server"
+    );
+    // Path MTU: 1400 bytes with DF towards the management host behind a
+    // 1280-byte link; the router's "fragmentation needed" must reach the
+    // robot.
+    let far = lab.far().to_string();
+    let got = lab.exchange(
+        &far,
+        &format!("recv {FAR_BEHIND_PEER}:9000 700"),
+        &lab.robot,
+        &format!("sendlen {ROBOT}:0 {FAR_BEHIND_PEER}:9000 1400"),
+    );
+    let route = sh(&["ip", "-n", &lab.robot, "route", "get", FAR_BEHIND_PEER]).unwrap();
+    assert!(
+        route.contains("mtu 1280"),
+        "the robot never learned the path MTU: {route}"
+    );
+    assert!(got >= 1, "nothing reached the management host after PMTU");
+}
+
+/// L2: a port rule matches the direction: the destination port for a
+/// request, the source port only for a reply.
+#[test]
+fn l2_port_rules_match_the_direction() {
+    let Some(lab) = Lab::new() else { return };
+    let dir = lab.state_dir("l2");
+    let cfg = config_with(&dir, |v| {
+        v["network"]["management"] = json!([{"cidr": MGMT, "proto": "udp", "port": 5000}]);
+    });
+    let mut e = Engine::open(
+        cfg,
+        policy(Morphology::WheeledMobile, &[]),
+        Box::new(lab.nft()),
+        "boot-1",
+        1_000,
+    )
+    .unwrap();
+    let o = order(
+        "iso-l2",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+    );
+    assert_eq!(e.submit(&o, &mut idle(), 1_000).status, Status::Verified);
+    assert_eq!(
+        lab.peer_to_robot(&format!("{MGMT}:5000"), 9000, b"x"),
+        0,
+        "source port 5000 to an arbitrary local port (no request seen)"
+    );
+    assert_eq!(
+        lab.peer_to_robot(&format!("{MGMT}:40001"), 5000, b"x"),
+        3,
+        "request to the local service on 5000"
+    );
+    assert_eq!(
+        lab.probe(
+            &lab.robot,
+            &format!("{ROBOT}:40002"),
+            &lab.peer,
+            &format!("{MGMT}:5000"),
+            b"q"
+        ),
+        3,
+        "request to the remote service on 5000"
+    );
+    assert_eq!(
+        lab.peer_to_robot(&format!("{MGMT}:5000"), 40002, b"a"),
+        3,
+        "its reply"
+    );
+    assert_eq!(
+        lab.peer_to_robot(&format!("{MOTION}:7410"), 9100, b"x"),
+        0,
+        "motion path source port to a port outside the range"
+    );
+    assert_eq!(
+        lab.peer_to_robot(&format!("{MOTION}:40003"), 7410, b"x"),
+        3,
+        "motion path destination port"
+    );
+}
+
+/// M3: an operator's `nft delete table inet robodr` is not undone by the
+/// next order or revert before the periodic check notices it.
+#[test]
+fn m3_operator_table_delete_is_not_undone_by_the_next_order() {
+    let Some(lab) = Lab::new() else { return };
+    let dir = lab.state_dir("m3");
+    let mut e = open(&lab, &dir, "boot-1", Morphology::WheeledMobile, 1_000);
+    let i = order("i-m3", ActionId::IsolateNetwork, Morphology::WheeledMobile);
+    assert_eq!(e.submit(&i, &mut idle(), 1_000).status, Status::Verified);
+    lab.nft_cmd(&["delete", "table", "inet", "robodr"]).unwrap();
+    let q = order("q-m3", ActionId::QuarantineNode, Morphology::WheeledMobile);
+    let out = e.submit(&q, &mut idle(), 1_100);
+    assert_eq!(out.status, Status::Refused, "{out:?}");
+    assert_eq!(out.refusal.unwrap().code, "operator_disabled");
+    assert!(!nft::table_exists(&mut lab.nft()).unwrap());
+    assert_eq!(e.status("i-m3").status, Status::RemovedExternally);
+    assert_eq!(lab.peer_to_robot(&format!("{OTHER}:0"), 9000, b"x"), 3);
+    // A revert of an action installed later, after another removal: the
+    // table stays gone.
+    assert!(e.rearm("lab", 1_200).unwrap());
+    let q2 = order("q-m3b", ActionId::QuarantineNode, Morphology::WheeledMobile);
+    let i2 = order("i-m3b", ActionId::IsolateNetwork, Morphology::WheeledMobile);
+    assert_eq!(e.submit(&q2, &mut idle(), 1_300).status, Status::Verified);
+    assert_eq!(e.submit(&i2, &mut idle(), 1_300).status, Status::Verified);
+    lab.nft_cmd(&["delete", "table", "inet", "robodr"]).unwrap();
+    assert_eq!(
+        e.revert("q-m3b", "lab", 1_400).status,
+        Status::RemovedExternally
+    );
+    assert!(!nft::table_exists(&mut lab.nft()).unwrap());
+    assert_eq!(lab.peer_to_robot(&format!("{OTHER}:0"), 9000, b"x"), 3);
+}
+
+/// M4: a start that fails after the rules were re-installed (here: the
+/// journal cannot be written, disk full) leaves no rule behind.
+#[test]
+fn m4_failed_start_on_a_full_disk_leaves_no_rule() {
+    let Some(lab) = Lab::new() else { return };
+    let t = Tmpfs::new(lab.dir.join("m4fs"), "256k");
+    let dir = t.0.clone();
+    let mut e = open(&lab, &dir, "boot-1", Morphology::WheeledMobile, 1_000);
+    let i = order("i-m4", ActionId::IsolateNetwork, Morphology::WheeledMobile);
+    assert_eq!(e.submit(&i, &mut idle(), 1_000).status, Status::Verified);
+    drop(e);
+    t.fill();
+    let r = Engine::open(
+        config(&dir),
+        policy(Morphology::WheeledMobile, &[]),
+        Box::new(lab.nft()),
+        "boot-1",
+        2_000,
+    );
+    assert!(r.is_err(), "the journal could not be written");
+    assert!(
+        !nft::table_exists(&mut lab.nft()).unwrap(),
+        "rules left without TTL enforcement after a failed start"
+    );
+    assert_eq!(lab.peer_to_robot(&format!("{OTHER}:0"), 9000, b"x"), 3);
+}
+
+/// M5: a revert whose journal write fails (disk full) is never reported
+/// `reverted`, and is completed once the disk has room again.
+#[test]
+fn m5_revert_on_a_full_disk_is_not_reported_reverted() {
+    let Some(lab) = Lab::new() else { return };
+    let t = Tmpfs::new(lab.dir.join("m5fs"), "256k");
+    let dir = t.0.clone();
+    let mut e = open(&lab, &dir, "boot-1", Morphology::WheeledMobile, 1_000);
+    let i = order("i-m5", ActionId::IsolateNetwork, Morphology::WheeledMobile);
+    assert_eq!(e.submit(&i, &mut idle(), 1_000).status, Status::Verified);
+    t.fill();
+    let out = e.revert("i-m5", "lab", 2_000);
+    assert_ne!(out.status, Status::Reverted, "{out:?}");
+    // The rules are lifted all the same (the revert does less, never more).
+    assert_eq!(lab.peer_to_robot(&format!("{OTHER}:0"), 9000, b"x"), 3);
+    e.tick(3_000);
+    assert_ne!(e.status("i-m5").status, Status::Reverted);
+    t.free();
+    e.tick(4_000);
+    assert_eq!(e.status("i-m5").status, Status::Reverted);
+    drop(e);
+    let e = open(&lab, &dir, "boot-1", Morphology::WheeledMobile, 5_000);
+    assert_eq!(e.status("i-m5").status, Status::Reverted);
+    assert!(!nft::table_exists(&mut lab.nft()).unwrap());
+}
+
+/// The files the real binary needs (config, key, policy) in `dir`.
+fn binary_files(dir: &std::path::Path, socket: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let key = dir.join("executor.key");
+    std::fs::write(&key, "5a".repeat(32)).unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let pol = dir.join("policy.json");
+    std::fs::write(
+        &pol,
+        serde_json::to_string(&policy(Morphology::WheeledMobile, &[])).unwrap(),
+    )
+    .unwrap();
+    let mut v = config_json(dir);
+    v["socket"] = json!(socket);
+    v["key_file"] = json!(key);
+    v["policy_path"] = json!(pol);
+    v["nft"] = json!(NFT);
+    let cfg = dir.join("executor.json");
+    std::fs::write(&cfg, v.to_string()).unwrap();
+    cfg
+}
+
+/// M4: the real binary deletes the table on a fatal start error (here the
+/// socket path is taken by a regular file), and `stop-cleanup` (systemd
+/// `ExecStopPost=`) does after any run that did not succeed.
+#[test]
+fn m4_binary_failed_start_and_stop_cleanup_leave_no_rule() {
+    let Some(lab) = Lab::new() else { return };
+    let dir = lab.state_dir("m4bin");
+    let sock = dir.join("taken.sock");
+    std::fs::write(&sock, b"not a socket").unwrap();
+    let cfg_path = binary_files(&dir, &sock);
+    let boot = robodr_executor::boot_id();
+    let cfg = robodr_executor::ExecutorConfig::parse(&std::fs::read_to_string(&cfg_path).unwrap())
+        .unwrap()
+        .validate()
+        .unwrap();
+    let install = |id: &str| {
+        let mut e = Engine::open(
+            cfg.clone(),
+            policy(Morphology::WheeledMobile, &[]),
+            Box::new(lab.nft()),
+            &boot,
+            robodr_executor::engine::Now::system(),
+        )
+        .unwrap();
+        let o = order(id, ActionId::IsolateNetwork, Morphology::WheeledMobile);
+        let out = e.submit(&o, &mut idle(), robodr_executor::engine::Now::system());
+        assert_eq!(out.status, Status::Verified, "{out:?}");
+        assert!(nft::table_exists(&mut lab.nft()).unwrap());
+    };
+    install("i-bin1");
+    let bin = env!("CARGO_BIN_EXE_robodr-executor");
+    let run = |args: &[&str], env: &[(&str, &str)]| {
+        let mut c = Command::new(IP);
+        c.args(["netns", "exec", &lab.robot, bin]).args(args);
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        c.stdin(Stdio::null()).output().unwrap()
+    };
+    let out = run(&["--config", cfg_path.to_str().unwrap()], &[]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        !nft::table_exists(&mut lab.nft()).unwrap(),
+        "a failed start left the rules: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let st = robodr_executor::journal::Journal::new(&dir).load();
+    match st {
+        robodr_executor::journal::Loaded::State(s) => {
+            assert!(s.entries.is_empty());
+            assert!(!s.operator_disabled);
+        }
+        other => panic!("{other:?}"),
+    }
+    // ExecStopPost= after a crash: the table goes, the journal says so.
+    install("i-bin2");
+    let out = run(
+        &["stop-cleanup", "--config", cfg_path.to_str().unwrap()],
+        &[("SERVICE_RESULT", "signal")],
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert!(!nft::table_exists(&mut lab.nft()).unwrap());
+    // ... but not after a clean stop.
+    std::fs::remove_file(&sock).unwrap();
+    install("i-bin3");
+    let out = run(
+        &["stop-cleanup", "--config", cfg_path.to_str().unwrap()],
+        &[("SERVICE_RESULT", "success")],
+    );
+    assert!(out.status.success());
+    assert!(nft::table_exists(&mut lab.nft()).unwrap());
+    let e = Engine::open(
+        cfg.clone(),
+        policy(Morphology::WheeledMobile, &[]),
+        Box::new(lab.nft()),
+        &boot,
+        robodr_executor::engine::Now::system(),
+    )
+    .unwrap();
+    assert_eq!(e.status("i-bin2").status, Status::Reverted);
+    assert_eq!(e.status("i-bin3").status, Status::Verified);
+}
+
+/// L4 and M3 through the protocol: actions held after a reboot are re-armed
+/// only when agentd's event poll supplies a fresh safety state; `rearm` ends
+/// an emergency disable.
+#[test]
+fn l4_m3_rearm_through_the_protocol() {
+    let Some(lab) = Lab::new() else { return };
+    let dir = lab.state_dir("rearm");
+    let cfgr = config(&dir);
+    let sock = cfgr.config.socket.clone();
+    let key_bytes = [0x5bu8; 32];
+    let now = robodr_executor::engine::Now::system;
+    let mut e = Engine::open(
+        cfgr.clone(),
+        policy(Morphology::WheeledMobile, &[]),
+        Box::new(lab.nft()),
+        "boot-1",
+        now(),
+    )
+    .unwrap();
+    let i = order("i-pr", ActionId::IsolateNetwork, Morphology::WheeledMobile);
+    assert_eq!(e.submit(&i, &mut idle(), now()).status, Status::Verified);
+    drop(e);
+    // Reboot.
+    lab.nft_cmd(&["delete", "table", "inet", "robodr"]).unwrap();
+    let engine = Engine::open(
+        cfgr,
+        policy(Morphology::WheeledMobile, &[]),
+        Box::new(lab.nft()),
+        "boot-2",
+        now(),
+    )
+    .unwrap();
+    let listener = robodr_executor::server::bind(&sock, 0o600).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let st = stop.clone();
+    let server = std::thread::spawn(move || {
+        let mut engine = engine;
+        let key = Key::from_bytes(key_bytes);
+        robodr_executor::server::serve(
+            &listener,
+            &mut engine,
+            &key,
+            "boot-2",
+            &|| st.load(Ordering::SeqCst),
+            &mut |_, _| {},
+        )
+    });
+    let client = Client::new(sock, Key::from_bytes(key_bytes), Duration::from_secs(5));
+    assert_eq!(client.health().unwrap().held, 1);
+    assert_eq!(client.status("i-pr").unwrap().status, Status::Held);
+    // A poll without a safety state, then with an engaged one: still held.
+    client.events(0).unwrap();
+    client
+        .events_with_safety(0, &mut || Ok((SafetyState::EStopActive, 2)))
+        .unwrap();
+    assert_eq!(client.status("i-pr").unwrap().status, Status::Held);
+    assert!(!nft::table_exists(&mut lab.nft()).unwrap());
+    // A fresh, known one: re-armed.
+    let evs = client
+        .events_with_safety(0, &mut || Ok((SafetyState::Idle, 2)))
+        .unwrap();
+    assert!(evs
+        .iter()
+        .any(|e| e.kind == robodr_executor::journal::EventKind::Held));
+    assert_eq!(client.status("i-pr").unwrap().status, Status::Verified);
+    assert_eq!(lab.peer_to_robot(&format!("{OTHER}:0"), 9000, b"x"), 0);
+    // Emergency disable, then a new order (refused), then rearm.
+    lab.nft_cmd(&["delete", "table", "inet", "robodr"]).unwrap();
+    let q = order("q-pr", ActionId::QuarantineNode, Morphology::WheeledMobile);
+    let out = client
+        .submit(&q, &mut || Ok((SafetyState::Idle, 2)))
+        .unwrap();
+    assert_eq!(out.refusal.unwrap().code, codes::OPERATOR_DISABLED);
+    assert!(client.health().unwrap().operator_disabled);
+    assert!(client.rearm("lab").unwrap());
+    assert!(!client.health().unwrap().operator_disabled);
+    let q2 = order("q-pr2", ActionId::QuarantineNode, Morphology::WheeledMobile);
+    let out = client
+        .submit(&q2, &mut || Ok((SafetyState::Idle, 2)))
+        .unwrap();
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    stop.store(true, Ordering::SeqCst);
+    server.join().unwrap();
+}
+
+/// IPv6 (this kernel may have none: the rules are still loaded and read
+/// back), interface-bound entries and the shipped examples render to rules
+/// that nft accepts and lists back exactly.
+#[test]
+fn ipv6_interface_and_example_renderings_read_back_exactly() {
+    let Some(lab) = Lab::new() else { return };
+    let dir = lab.state_dir("v6");
+    let cfg = config_with(&dir, |v| {
+        v["network"]["management"] = json!([
+            {"cidr": "fd00::10", "proto": "tcp", "port": 22},
+            {"cidr": "10.99.0.10", "proto": "udp", "port": 5000}
+        ]);
+        v["network"]["uplink"] = json!([{"cidr": "fd00:20::/64"}]);
+        v["network"]["control_buses"] =
+            json!({"exempt": true, "entries": [{"interface": "eth1", "proto": "udp"}]});
+        v["network"]["motion_control_path"] = json!([
+            {"interface": "eth1", "cidr": "fd00:1::/64", "udp_ports": [7400, 7600],
+             "guid_prefix": GUID, "low_level": true},
+            {"interface": "eth2", "udp_ports": [7410, 7410]}
+        ]);
+        v["network"]["discovery"] =
+            json!({"multicast_groups": ["239.255.0.1", "ff02::ffff:efff:1"], "domains": [0, 1]});
+    });
+    let mut e = Engine::open(
+        cfg,
+        policy(Morphology::WheeledMobile, &[]),
+        Box::new(lab.nft()),
+        "boot-1",
+        1_000,
+    )
+    .unwrap();
+    let i = order("i-v6", ActionId::IsolateNetwork, Morphology::WheeledMobile);
+    let out = e.submit(&i, &mut idle(), 1_000);
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    let mut q = order("q-v6", ActionId::QuarantineNode, Morphology::WheeledMobile);
+    q.target = Target::Participant {
+        guid_prefix: OTHER_GUID.parse().unwrap(),
+        locators: vec![Locator {
+            ip: "fd00:30::7".parse().unwrap(),
+            port: 7410,
+        }],
+    };
+    // Interface-only motion path entries cannot be proven: refused.
+    assert_eq!(
+        e.submit(&q, &mut idle(), 1_000).refusal.unwrap().code,
+        codes::MOTION_PATH
+    );
+    let listed = nft::read_table(&mut lab.nft()).unwrap();
+    assert_eq!(nft::verify(listed.as_deref(), &e.rendered()), Ok(()));
+    let text = lab.nft_cmd(&["list", "table", "inet", "robodr"]).unwrap();
+    for want in [
+        "frag frag-off != 0",
+        "ip6 daddr ff02::ffff:efff:1 udp dport { 7400, 7401, 7650, 7651 }",
+        "oifname \"eth1\" meta l4proto igmp",
+        "tcp flags != syn / syn,ack",
+        "ct state established",
+        "icmp type destination-unreachable icmp code frag-needed",
+        "udp sport 67 udp dport 68",
+        "udp sport 547 udp dport 546",
+    ] {
+        assert!(text.contains(want), "{want:?} missing in\n{text}");
+    }
+    assert_eq!(e.revert("i-v6", "lab", 2_000).status, Status::Reverted);
+    // The shipped examples.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config");
+    for name in ["executor.example.json", "executor.unitree-g1.example.json"] {
+        let mut v: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(name)).unwrap()).unwrap();
+        let d = lab.state_dir(name);
+        v["state_dir"] = json!(d);
+        let c = ExecutorConfig::parse(&v.to_string())
+            .unwrap()
+            .validate()
+            .unwrap();
+        let mut e = Engine::open(
+            c,
+            policy(Morphology::WheeledMobile, &[]),
+            Box::new(lab.nft()),
+            "boot-1",
+            1_000,
+        )
+        .unwrap();
+        let i = order("i-ex", ActionId::IsolateNetwork, Morphology::WheeledMobile);
+        let out = e.submit(&i, &mut idle(), 1_000);
+        assert_eq!(out.status, Status::Verified, "{name}: {out:?}");
+        assert_eq!(e.revert("i-ex", "lab", 2_000).status, Status::Reverted);
+    }
 }

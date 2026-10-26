@@ -23,7 +23,8 @@
     },
     "motion_control_path": [
       {"cidr": "192.168.10.0/24", "udp_ports": [7400, 7600], "note": "ROS 2 / DDS between the navigation and base controllers (illustrative)"}
-    ]
+    ],
+    "discovery": {"multicast_groups": ["239.255.0.1"], "domains": [0]}
   },
   "ttl": {"default_s": 900, "max_s": 86400},
   "max_safety_age_ms": 500,
