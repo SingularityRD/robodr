@@ -46,12 +46,14 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   responder's list (no `rollback_config`) and the control plane's (no
   `record_evidence`).
 - Response policy `morphology` (`humanoid`, `quadruped`,
-  `wheeled_mobile`, `arm`, `aerial`, `other`; default `other`). For a
-  humanoid, `safe_pause` / `request_safe_state` (which may damp or
-  de-energise the joints: the robot would fall) are never executable: the
-  planner lists them in the new `ResponsePlan::advisory` and contains the
-  threat with `limit_motion`, `isolate_network` and `quarantine_node`;
-  `check_invariants` rejects such plans
+  `wheeled_mobile`, `arm`, `aerial`, `other`; required once OEM-validated
+  or for platform `other`, otherwise `unspecified` = treated as humanoid,
+  see *Changed*). For a humanoid, `safe_pause` / `request_safe_state`
+  (which may damp or de-energise the joints: the robot would fall) are
+  never executable: the planner lists them in the new
+  `ResponsePlan::advisory` and contains the threat with `limit_motion`
+  (plus only the OEM's `fall_safe_restrict` targets), always for a human to
+  approve; `check_invariants` rejects such plans
   (`Violation::DeEnergisingOnFallProneMorphology`); the control plane
   refuses them (`fall_hazard`).
 - agentd `findings` section (`topic`, `data_source`) and
@@ -366,6 +368,53 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Changed
 
+- **Response policy morphology is fail-safe (breaking for policies).**
+  `morphology` is required when a policy is `oem_validated` or its
+  `platform` is `other`; absent elsewhere it reads as the new
+  `unspecified`, which gets the humanoid treatment (it was `other`, so a
+  humanoid policy that forgot the field got executable safe pause / safe
+  state). `ResponsePolicy::conservative_default` no longer claims a body
+  plan. New `Morphology::needs_active_balance` (humanoid, quadruped,
+  unspecified): `allow_terminate_when_idle` is rejected (a legged robot
+  balances while idle), a process quarantine always needs approval and is
+  never a termination, `limit_motion` never goes below the new
+  `min_motion_factor` (default 0.2, floor 0.05), and the control plane
+  refuses `rollback_config` (now flagged `may_de_energise`: a controller
+  restart) and near-stop `restrict_motion` caps with `fall_hazard`. A
+  humanoid's substitute containment always needs approval and adds only the
+  restrict targets in the new `fall_safe_restrict` (default none:
+  `isolate_network` / `quarantine_node` are balance-safe only when the
+  balance loop is not networked, e.g. not Unitree's `rt/lowcmd` writer).
+  `OperationalContext` carries `morphology`; `check_invariants` refuses a
+  plan made for another morphology, and `ExecutionRequest::recheck_for` /
+  `steps_without_approval_for` compare the executor's own policy. New
+  examples `config/response-policy.unitree-g1.example.json` (humanoid) and
+  `…unitree-go2.example.json` (quadruped).
+- Control plane: `record_evidence` is accepted in observe mode and while
+  the safety system is engaged, and is catalogued non-reversible (evidence
+  is never reverted); the robot snapshot lists its `morphology` and only
+  the actions not refused for it; `Approval::Single` still reads the old
+  name `analyst`.
+- **Findings contract 2.1.0** (minor): the rule catalog is versioned per
+  minor again. The 1.3 / 2.0 catalogs are restored to exactly what 1.3.0
+  shipped; the low-level joint-frame firewall ids and
+  `robot.motion.api_id_out_of_range` / `control_handover`, which had been
+  added to the 1.3 catalog by mistake, are 2.1 entries. 2.0.x messages
+  keep validating with their own catalog. Schema `$id` `/2.1.0`, aligned
+  with the validator (`log_name` not `.` / `..`, version parts ≤ 9
+  digits). The `robodr-contract-version` / `ocsf-version` headers are the
+  value's own versions. `data_source` is documented as an unauthenticated
+  label (never route tenants by it).
+- **Upgrade path for contract 1.x findings in flight**
+  (`robodr_ocsf::upgrade`): unsigned 1.x findings are upgraded to 2.0.0
+  (same identity) by `robodr-spool-export`, `robodr-diode-unpack` and
+  `robodr-kafka-publish` (`--upgrade-data-source`, `--upgrade-topic`);
+  signed ones are kept with "legacy 1.x signed record: re-sign required";
+  an intact 1.x diode batch that cannot be upgraded is quarantined
+  (`legacy_not_convertible`) and the unit's chain advances past it instead
+  of holding the next batch as a gap. Drain spool / outbox / importer
+  output before upgrading (`docs/OPERATIONS.md` §7).
+
 - Motion Firewall joint channels (breaking for joint configs): `rate`
   (with `min_interval_ns > 0`) is required; `max_age_ns` /
   `max_future_ns` are capped at 10 s; a humanoid joint channel refuses
@@ -393,8 +442,10 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   to `--topic` (relabelled ones counted as `topic_overridden`). The diode
   manifest check is a contract-version check (2.x) instead of "1.x only";
   the spool exporter checks the topic against the value.
-- The AutoSecOps-specific integration (a cancelled SOC integration) is
-  removed from code and docs: contracts are vendor-neutral
+- The old `autosecops2`-specific integration (its Kafka consumer and
+  `core/integrations/robot_edr/` client; cancelled — the GA SOC is
+  SingularityRD/AutoSecOps1, see `docs/GA-ROADMAP.md`) is removed from
+  code and docs: contracts are vendor-neutral
   (`docs/contracts/robodr.findings.md`,
   `docs/contracts/robodr.control-plane.md`); the 1.x contract texts moved
   to `docs/contracts/legacy/` marked superseded; examples use a generic

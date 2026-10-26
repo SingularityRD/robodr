@@ -2,12 +2,16 @@
 
 Turns a RoboDR `Deviation` into a **finding** for any SOC or SIEM: an OCSF
 1.1 **Detection Finding** (`class_uid` 2004, `category_uid` 2 *Findings*)
-wrapped in the vendor-neutral `robodr.findings` envelope (contract **2.0**),
+wrapped in the vendor-neutral `robodr.findings` envelope (contract **2.1**;
+the rule catalog is versioned per minor and a 2.0 message validates with the
+2.0 catalog),
 ready for a Kafka topic (default `robodr.findings`), an NDJSON ingest API or
 a diode batch. `data_source` (default `robodr`) and the topic are deployment
 configuration (`RobotContext::{data_source, topic}`). Contract 1.x
 (`robot-edr.findings`) messages are still parsed and validated with their
-fixed 1.x constants, never emitted.
+fixed 1.x constants, never emitted; `upgrade::upgrade_legacy` relabels an
+unsigned 1.x finding still in flight as contract 2.0.0 (same identity, full
+2.0 validation; signed ones are never upgraded).
 
 Contract: [`docs/contracts/robodr.findings.md`](../../docs/contracts/robodr.findings.md) ·
 Schema: [`robodr-finding.schema.json`](../../docs/contracts/robodr-finding.schema.json) ·

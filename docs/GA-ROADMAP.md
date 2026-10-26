@@ -55,7 +55,7 @@ paketleme (Reed-Solomon), reproducible build + SBOM + minisign release pipeline'
 | R6 | CI GitHub'da **hiç koşmadı** (org billing); release workflow'u hiç tetiklenmedi; `MINISIGN_SECRET_KEY` yok; `robodr-anchor-receiver` `.deb` zorunlu listesinde değil | `docs/BUILD.md:536-557`, `.github/workflows/release.yml` |
 | R7 | Ticari model yok: her şey Apache-2.0 (karar: tescilliye geçecek, D9 / S1); lisans anahtarı/aktivasyon yok; ihracat kontrol (Wassenaar 5A2) sınıflandırması yok; Pulsar GPL-2.0 eBPF hukuki incelemesi yok | `Cargo.toml:34`, `docs/SECURE-DELIVERY.md` §11 |
 | R8 | Elle yazılmış kritik bileşenler: SHA-256/HMAC, Reed-Solomon, Kafka wire istemcisi (API v≤8), HTTP/1.1 sunucusu, JSON-Schema eşleyici | `crates/robodr-blackbox/src/crypto.rs`, `crates/robodr-export/src/kafka/`, `crates/robodr-agentd/src/control/` |
-| R9 | Tutarsızlıklar: iki aksiyon listesi çelişiyor (`responder::autosecops` → `record_evidence` var/`rollback_config` yok; kontrol düzlemi tersi); `panic = "abort"` → her panik daemon'ı öldürür; çok sayıda bayat doküman | `crates/robodr-responder/src/autosecops.rs:74-110` vs `crates/robodr-agentd/src/control/api.rs:40-63` |
+| R9 | Tutarsızlıklar: ~~iki aksiyon listesi çelişiyor (`responder::autosecops` → `record_evidence` var/`rollback_config` yok; kontrol düzlemi tersi)~~ ✅ S1'de çözüldü: tek katalog `robodr-responder::actions`, kontrol düzleminin `ActionKind`'i onun yeniden ihracı (ed4f1ac); `panic = "abort"` → her panik daemon'ı öldürür (açık); bayat dokümanlar S1'de büyük ölçüde düzeltildi (c9512c1) | Eski kanıt (silinen dosya): `git show ed4f1ac^:crates/robodr-responder/src/autosecops.rs`; bugün `crates/robodr-responder/src/actions.rs` |
 | R10 | Müşteri dokümanı yok: kurulum/quick-start, destek matrisi, EULA, SLA; `robodr-maintainers@invalid`, `singularityrd.example` yer tutucuları; `robodr-threat-forward` README/man sayfası yok | `packaging/build-deb.sh:65`, `docs/contracts/robot-edr-finding.schema.json` |
 
 ### 1.2 AutoSecOps1
@@ -84,10 +84,16 @@ lisans token'ı** (`tracecat/licensing/`), Fargate Terraform, air-gapped doküma
 
 ### 1.3 İptal edilen eski entegrasyon — RoboDR'daki izler
 
-Eski AutoSecOps varsayımları şuralarda gömülü (S1'de temizlenecek):
+> **Durum (S1):** ✅ temizlendi — eski `autosecops2` entegrasyonu koddan ve
+> dokümanlardan söküldü (c9512c1, ed4f1ac, dae7993); `rg -i autosecops
+> crates/ fuzz/ scripts/ config/` boş döner. Aşağıdaki liste S1 öncesi
+> durumun tarihî kaydıdır; anılan satır numaraları ve silinen dosyalar
+> (ör. `responder/src/autosecops.rs`) artık yoktur.
+
+Eski AutoSecOps varsayımları şuralarda gömülüydü (S1'de temizlendi):
 
 - `crates/robodr-ocsf/` — `model.rs:30-55,224` (`KAFKA_TOPIC`, `DATA_SOURCE="robot_edr"`, "AutoSecOps ingestion envelope"), `validate.rs:382`, `builder.rs:28,44`, `kafka.rs:1,50`, `taint.rs:5,42,91,100`, `lib.rs`, `Cargo.toml:11`, README.
-- `crates/robodr-responder/src/autosecops.rs` (tüm modül, `lib.rs:44,53` re-export, `tests.rs:6,1658-1702`) — `robotics` kategorisi, `AUTONOMOUS_ELIGIBLE`, `robot_*` sınıf adları.
+- `crates/robodr-responder/src/autosecops.rs` (**silindi**, ed4f1ac; yerine `actions.rs`) (tüm modül, `lib.rs:44,53` re-export, `tests.rs:6,1658-1702`) — `robotics` kategorisi, `AUTONOMOUS_ELIGIBLE`, `robot_*` sınıf adları.
 - `crates/robodr-agentd/src/control/{mod.rs,api.rs}` — "AutoSecOps v1-draft" şekli, `soc:autosecops`, `/etc/robodr/soc/autosecops.pub`; `spool.rs:346`, `config.rs:286` topic gömülü.
 - `crates/robodr-export/src/publish.rs:59,135,477` (başka topic reddediliyor), `crates/robodr-diode/src/manifest.rs:72,123,223`, `crates/robodr-agent/src/{lib,config,replay,outcome}.rs`, `crates/robodr-events/src/lib.rs:257`.
 - Testler/fixtures: `crates/robodr-agentd/tests/{control_plane,example_configs}.rs`, `crates/robodr-ocsf/tests/*`, `fuzz/corpus/ocsf_parse_and_validate/*`, `scripts/kafka-it.sh`.
@@ -126,7 +132,7 @@ Eski AutoSecOps varsayımları şuralarda gömülü (S1'de temizlenecek):
 |---|---|---|
 | D1 Bulgu taşıma | **Birincil: AutoSecOps1'e native HTTPS ingest API** (`POST /robot-edr/v2/ingest`, imzalı NDJSON batch). Kafka → **opsiyonel genel SIEM ihracı** | AutoSecOps1'de Kafka yok; webhook NDJSON satır başına workflow başlatıyor (yavaş, dedup yok). Native modül dedup, imza doğrulama, robot kaydı ve case upsert'i tek yerde yapar |
 | D2 MVP köprüsü | S2–S3'te **webhook + workflow + `core.transform.deduplicate`** ile hızlı demo; S4'ten itibaren native modül | Erken uçtan uca demo, native modül paralel olgunlaşır |
-| D3 Sözleşme | `robodr.findings/2.0`: satıcıdan bağımsız zarf (`data_source="robodr"`), OCSF 1.3 Detection Finding (class 2004) gövdesi aynen, provenance/taint işaretleri korunur; 1.x **parse-only** bir sürüm desteklenir | Eski AutoSecOps alan adları kalkar; başka SIEM'ler de tüketebilir |
+| D3 Sözleşme | `robodr.findings/2.x` (bugün **2.1.0**; 2.1 yalnız kural kataloğu girdileri ekledi): satıcıdan bağımsız zarf (`data_source` varsayılanı `"robodr"`, yapılandırılabilir), OCSF **1.1.0** Detection Finding (class 2004; `metadata.version` = 1.1.0 — Detection Finding OCSF 1.1'de geldi) gövdesi aynen, provenance/taint işaretleri korunur; 1.x **parse-only**, uçuştaki imzasız 1.x bulgular 2.0'a yükseltilir. **Not:** zarf alan adları (`finding_id`, `external_id`, `title`, `description`, `severity`, `entity_context`, `mitre_predictions`, `evidence_links`, `adversary_controlled_fields`, …) **bilinçli olarak korundu** — satıcıya özgü olan yalnız sabit `data_source`/topic değerleriydi; alan adları nötr ve kimlik türetimi (`rf1-`/`re1-`) değişmedi | Eski AutoSecOps'a özgü sabitler kalkar; başka SIEM'ler de tüketebilir |
 | D4 Kontrol düzlemi | `robodr-control-plane/v2`: **mTLS (rustls)** + Ed25519 imzalı istek gövdesi, kalıcı istek durumu (kara kutu + sqlite/dosya journal), `executed`/`refused`/`reverted` gerçek durumlar | v1 düz HTTP, bellek-içi, yürütmüyor |
 | D5 Aksiyon kataloğu | Tek kaynak: `robodr-responder::actions` (satıcıdan bağımsız). GA'da **yürütülen**: `restrict_motion` (firewall gateway), `quarantine_node` (DDS participant ingress/egress drop, nftables), `isolate_network` (nftables, yönetim kanalı hariç), `record_evidence`. **Platform adaptörüyle yürütülen**: `safe_pause` (Nav2 / ros2_control / PX4 adaptörleri, OEM onaylı politika ile). **GA'da yalnız plan (yürütülmez)**: `request_safe_state`, `rollback_config` | Güvenlik sistemi asla aşılmaz; geri alınamaz aksiyonlar GA sonrası |
 | D6 Onay | Robot aksiyonları **asla otonom değil**; `requires_approval=True` UDF'ler; `safe_pause`/`rollback_config` için **iki-kişi kuralı** (AutoSecOps1'e eklenecek) | Fiziksel güvenlik |
@@ -184,7 +190,7 @@ sprint, AC'leri karşılanmadan kapanmaz.
 - **R:** `robodr-ocsf`: zarfı `robodr.findings/2.0`'a taşı (`data_source="robodr"`,
   AutoSecOps-özel alan isimleri yerine nötr `envelope`), `DATA_SOURCE`/`KAFKA_TOPIC`
   sabitlerini yapılandırılabilir yap; 1.x parse-only; JSON Schema `$id` gerçek alan adı
-  (`schemas.singularityrd.com/robodr/findings/2.0.0`).
+  (`schemas.singularityrd.com/robodr/findings/2.0.0`; bugün 2.1.0).
 - **R:** `robodr-export`, `robodr-diode`, `robodr-agentd` spool: topic zorunluluğunu
   kaldır, sözleşme sürümünü taşı; `soc:autosecops` → `soc:<id>` genel isimlendirme.
 - **R:** Tüm dokümanlarda §1.3 listesini temizle; `docs/contracts/robodr.findings.md`
@@ -197,6 +203,34 @@ sprint, AC'leri karşılanmadan kapanmaz.
 - **AC:** `rg -i autosecops crates/ fuzz/ scripts/ config/` yalnızca entegrasyon
   dokümanında anlamlı geçişler; tüm testler + fuzz smoke yeşil; schema/örnek/validator
   v2'de tutarlı; `cargo deny` yeşil.
+
+> **Durum (2026-10-26):** Sprint 1'in R kalemleri büyük ölçüde tamam; bağımsız
+> inceleme bulguları kapatıldı.
+>
+> - ✅ Tescilli lisans (D9): 24fe84c (kök `LICENSE`, workspace lisansı,
+>   `publish = false`, `deny.toml`, paket metadata'sı).
+> - ✅ `robodr-responder::actions` tek katalog: ed4f1ac; inceleme düzeltmeleri
+>   f134cc0 (morfoloji zorunlu/güvenli varsayılan, aktif dengeli robot kuralları,
+>   `fall_safe_restrict`, `min_motion_factor`, `rollback_config` = kontrolcü
+>   yeniden başlatma, executor kendi morfolojisini karşılaştırır).
+> - ✅ `robodr.findings/2.0` (dae7993) → 2.1.0, sürüm başına kural kataloğu ve
+>   şema hizalaması (4c455cf); 1.x uçuştaki kayıtlar için yükseltme yolu
+>   (bf93713).
+> - ✅ export / diode / agentd spool: topic zorunluluğu kalktı, sözleşme sürümü
+>   taşınıyor, `soc:<id>` isimlendirmesi (dae7993).
+> - ✅ Dokümanlar: v2 sözleşmeleri, eski sözleşmeler `docs/contracts/legacy/`
+>   altında, repo dışı tasarım doküman atıfları kaldırıldı, bayat dokümanlar
+>   düzeltildi, `robodr-threat-forward` README (c9512c1).
+> - ⬜ Açık: `robodr-threat-forward` **man sayfası** yok (`man/` altında yok).
+>
+> **AC sonuçları:** `rg -i autosecops crates/ fuzz/ scripts/ config/` → boş ✅;
+> `rg -n "Apache-2.0"` (vendor/LICENSES hariç) yalnız üçüncü taraf / Pulsar /
+> karar geçmişi bağlamında ✅; tüm workspace testleri (ROS 2/Pulsar'a bağlı üç
+> üye hariç), `cargo clippy -D warnings`, `cargo fmt --check`, ocsf fuzz smoke
+> testi ve `scripts/validate_rules.py --strict` yerelde yeşil ✅;
+> schema/örnek/validator 2.1'de tutarlı (contract testleri) ✅;
+> `cargo deny check` bu ortamda **koşturulamadı** (cargo-deny kurulu değil) ⬜ —
+> CI'da doğrulanmalı; GitHub CI'ın gerçek koşusu hâlâ S0 (billing) bekliyor.
 
 ### Sprint 2 — AutoSecOps1 MVP köprüsü (webhook yolu) + robot kaydı tasarımı
 
@@ -418,6 +452,36 @@ sunuculara telemetri gönderdiği raporlandı; Go1'de daha önce uzaktan tünel 
 bulunmuştu. RoboDR'ın karşılığı: `wpa_supplicant_restart.sh` altından beklenmeyen kabuk
 (Pulsar kuralı), robotun beklenmeyen dış bağlantıları (host + ağ sensörü), yeni DDS
 katılımcısı / `rt/lowcmd`'ye yetkisiz yazıcı, imzalı kara kutu ile adli kanıt.
+
+> **Durum (2026-10-26) — Unitree için bugün kodda olan:**
+>
+> - ✅ **Decoder'lar** (`robodr-cdr`, 958a2ae; inceleme düzeltmeleri 85c0223):
+>   SDK2 DDS tipleri — `unitree_go` / `unitree_hg` `LowCmd_`/`LowState_`,
+>   `SportModeState_`, `HandCmd_`/`HandState_`, `IMUState_`, `doubleIMUState_`,
+>   `MotorCmd(s)_`/`MotorState_`, `unitree_api` `Request_`/`Response_`,
+>   `WirelessController_` — model tablosu Go2/Go2-W/B2/B2-W/A2/AS2/H1/H2/G1/R1;
+>   Unitree CRC; sport/loco/arm API çağrı yorumlama. Eski UDP nesli (Go1 / A1 /
+>   Aliengo / B1, `unitree_legged_sdk` HighCmd/HighState/LowCmd/LowState);
+>   v3.8.6 "sıkıştırılmış" düşük seviye tel biçimi **çözülemez** olarak belgeli.
+> - ✅ **Motion Firewall eklem zarfı** (`check_joint`, 77bb77f; inceleme
+>   sertleştirmesi 8b93df1): slot başına q/dq/tau/kp/kd sınırları, adım ve PD
+>   tork sınırı, CRC, mod pin'leri, insansıda "hepsi gevşek" çerçeve reddi ve
+>   tutma (hold) eskalasyonu; örnekler `config/firewall.unitree-{g1,go2}.example.json`.
+> - ✅ **İnsansı / dört ayaklı yanıt kuralları** (ed4f1ac, f134cc0): insansıda
+>   `safe_pause`/`request_safe_state` yalnız tavsiye, ikame önlemler daima onaylı,
+>   ağ/katılımcı karantinası yalnız OEM'in `fall_safe_restrict` listesiyle;
+>   aktif dengeli robotlarda süreç sonlandırma yok, süreç karantinası onaylı,
+>   `rollback_config` reddedilir, `min_motion_factor` tabanı; örnek politikalar
+>   `config/response-policy.unitree-{g1,go2}.example.json`.
+>
+> **Kalan (dürüst durum):** firewall'ın **in-path gateway**'i yok (kütüphane
+> karar veriyor, `rt/lowcmd`'ye abone olup yeniden yayınlayan süreç yok);
+> decoder'lar ve kurallar **gerçek Go2/G1 trafiğiyle doğrulanmadı** (yalnız
+> yayımlanmış IDL ve el yapımı vektörler); **A2 / AS2** düşük seviye örneği
+> olmadığı için motor sayısı / IDL ailesi ve modele özgü kimlikler belirsiz;
+> **ajansız sensör kutusu** (S7) yok; decoder → firewall → responder → agentd
+> **canlı bağlantısı** (Unitree kanallarının agentd boru hattına bağlanması,
+> gecikme bütçesi ölçümü) yapılmadı; `restrict_motion` sport API adaptörü yok.
 
 **Unitree işleri sprint planına:**
 - **S0:** Go2 EDU + G1 EDU tedarik; firmware sürümlerini sabitle; ağ topolojisi ve

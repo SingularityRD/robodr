@@ -1,8 +1,11 @@
 # Topic contract: `robot-edr.findings` (superseded)
 
 > **Superseded — historical record only.** This is contract 1.x
-> (`robot-edr.findings`), written for an AutoSecOps integration that has
-> been **cancelled**. The current contract is
+> (`robot-edr.findings`), written for the old `autosecops2` integration
+> (its Kafka consumer `core/ingestion/kafka_consumer_service.py`), which
+> has been **cancelled**. The GA SOC is SingularityRD/AutoSecOps1, which
+> consumes the vendor-neutral contracts (see
+> [`docs/GA-ROADMAP.md`](../../GA-ROADMAP.md)). The current contract is
 > [`robodr.findings` 2.x](../robodr.findings.md). RoboDR still *parses and
 > validates* 1.x messages (fixed `data_source` `robot_edr`, topic
 > `robot-edr.findings`) but never emits them. Links and section references

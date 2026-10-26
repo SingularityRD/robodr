@@ -4,8 +4,10 @@ This breaks [`ROADMAP.md`](ROADMAP.md) into executable sprints: who builds what,
 in what order, and what "done" looks like for each. It is the layer the roadmap
 left open — task breakdown, ownership, dependencies and a per-sprint demo.
 
-> **SOC side.** The SOC tasks below were first written against one specific
-> SOC codebase; that integration is cancelled. RoboDR now speaks
+> **SOC side.** The SOC tasks below were first written against the old
+> `autosecops2` integration (Kafka consumer, `core/integrations/robot_edr/`);
+> that integration is cancelled. The GA SOC is SingularityRD/AutoSecOps1
+> (plan: [`GA-ROADMAP.md`](GA-ROADMAP.md)). RoboDR now speaks
 > vendor-neutral contracts
 > ([`robodr.findings`](contracts/robodr.findings.md) 2.x,
 > [`robodr.control-plane`](contracts/robodr.control-plane.md), the action

@@ -2,7 +2,10 @@
 
 > **Superseded — historical record only.** This is the first draft of the
 > control-plane contract, including the comparison with a client draft of
-> an AutoSecOps integration that has been **cancelled** (§9). The current
+> the old `autosecops2` integration (`core/integrations/robot_edr/`), which
+> has been **cancelled** (§9). The GA SOC is SingularityRD/AutoSecOps1,
+> which uses the vendor-neutral contract (see
+> [`docs/GA-ROADMAP.md`](../../GA-ROADMAP.md)). The current
 > contract is [`robodr.control-plane`](../robodr.control-plane.md) (same
 > API, vendor-neutral, seven catalog actions). Links below are not
 > maintained.
