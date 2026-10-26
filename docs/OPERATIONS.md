@@ -1201,6 +1201,142 @@ real network. Rollback and truncation become detectable, not prevented;
 the window is the newest marks that have not reached the receiver. No TLS:
 marks (hashes, sequence numbers) are visible on the wire.
 
+### 6.5 Executor v1 (`robodr-executor`, reversible actions)
+
+Off by default. With `executor.enabled` absent or `false`, every accepted
+control-plane request stays `recorded_not_executed` and nothing reaches
+the robot. Enable the executor only after commissioning (section 5), with
+an OEM-validated response policy, and after the acceptance check below.
+Design, safety argument and limits are in
+[`crates/robodr-executor/README.md`](../crates/robodr-executor/README.md).
+
+**What it does.** It executes two reversible actions, as nftables rules in
+its own table `inet robodr`, plus an evidence mark:
+
+| Action | Effect | Lifted |
+|---|---|---|
+| `isolate_network` | everything dropped except loopback, the management and uplink allow-lists, the control buses (configurable) and the motion control path | on revert or TTL |
+| `quarantine_node` | one DDS participant dropped (by RTPS GUID prefix, and by its locators when known) | on revert or TTL |
+| `record_evidence` | a signed black-box mark | never: evidence is not reverted |
+
+`restrict_motion` is recorded as advisory: there is no gateway yet. The
+executor never sends `safe_pause`, `request_safe_state` or
+`rollback_config`.
+
+**Capability model.**
+
+| Unit | User | Capabilities | Network |
+|---|---|---|---|
+| `robodr-agentd` | `robodr` | `CAP_NET_RAW` (capture) | AF_PACKET read, no IP |
+| `robodr-executor` | `robodr-exec` (group `robodr`) | `CAP_NET_ADMIN` only | AF_UNIX + AF_NETLINK, `IPAddressDeny=any` |
+
+agentd talks to the executor over `/run/robodr-executor/executor.sock`
+(0660, group `robodr`), using an HMAC-authenticated protocol with a key
+held only in `/etc/robodr/keys/executor.key`. Each unit receives the key
+as a systemd credential. The executor runs `/usr/sbin/nft` (JSON,
+argument vector, empty environment) and never touches any other nftables
+table.
+
+**Enable.**
+
+1. Install `nftables` (and `iproute2` for the checks below):
+   `apt install nftables iproute2`.
+2. Generate the protocol key:
+   `robodr-executor keygen --out /etc/robodr/keys/executor.key`
+   (written 0600; an existing key is never overwritten).
+3. Write `/etc/robodr/executor.json` from
+   `/usr/share/doc/robodr/examples/executor.example.json` (Unitree:
+   `config/executor.unitree-g1.example.json`). Set the following:
+   * `policy_path`: the **same** response policy file agentd uses. The
+     executor takes the robot's morphology and `fall_safe_restrict` from
+     it.
+   * `network.management`: required. Isolation is refused without it, so
+     it can never cut the SOC off. List the operator and SOC addresses,
+     the TLS terminator in front of the control plane, and, if the robot
+     depends on them, its DNS, NTP and DHCP servers.
+   * `network.uplink`: the findings uplink (`robodr-uplink`'s ingest API).
+   * `network.control_buses`: the robot's internal controller networks,
+     kept open while `exempt` is `true` (the default).
+   * `network.motion_control_path`: every address, interface, UDP port
+     range or DDS participant (`guid_prefix`) that carries motion
+     commands. These entries are never cut. Mark the low-level / balance
+     loop `low_level: true`: it is never cut, whatever the policy says.
+   * `ttl.default_s` / `ttl.max_s`: every executed action is lifted at its
+     TTL.
+4. Check the configuration:
+   `robodr-executor --config /etc/robodr/executor.json --check-config`.
+5. Give agentd the key with the drop-in example
+   `robodr-agentd.service.d/30-executor.conf.example` (section 6.4
+   explains how drop-ins are installed). Then add to `agentd.json`:
+   ```json
+   "executor": {
+     "enabled": true,
+     "socket": "/run/robodr-executor/executor.sock",
+     "key_file": "/run/credentials/robodr-agentd.service/executor.key",
+     "planner_orders": false
+   }
+   ```
+   `planner_orders: true` (the default) also hands the on-robot planner's
+   executable steps to the executor. These are Eligible plans that need no
+   human under the OEM-validated policy. Start with `false`, which limits
+   execution to SOC-approved requests.
+6. Run `systemctl enable --now robodr-executor`, then
+   `systemctl restart robodr-agentd`. agentd logs
+   `executor v1 enabled (...)`.
+
+**Acceptance check before relying on it** (on the robot, with the E-stop
+in reach):
+
+1. Submit `isolate_network` with `ttl_seconds: 60` from the SOC.
+2. Confirm the request state is `verified`.
+3. Confirm `nft list table inet robodr` shows the rules.
+4. Confirm management access and the robot's motion stack keep working.
+5. Confirm a host outside the allow-list cannot reach the robot.
+6. Confirm the state turns `reverted` after 60 s and the table is gone.
+
+**Emergency disable** (any time, as root):
+
+```sh
+nft delete table inet robodr
+```
+
+The running executor detects the missing table within
+`verify_interval_s`. It drops every action as `removed_externally` and
+re-installs nothing, also not after a restart within the same boot. To
+keep it from acting again:
+
+```sh
+systemctl disable --now robodr-executor
+```
+
+Then set `executor.enabled: false` and restart agentd.
+
+`systemctl stop robodr-executor` alone does **not** lift active actions:
+they stay in place until their revert or TTL at the next start. To lift
+every action with the service stopped:
+
+```sh
+robodr-executor revert-all --config /etc/robodr/executor.json --reason "<why>"
+```
+
+After a reboot the kernel ruleset is empty. At the next start the
+executor re-applies the actions whose TTL has not expired, and reverts
+the expired ones.
+
+**Watch.**
+
+* `status.json` `executor`: `verified`, `refused`, `failed`, `reverted`,
+  `revert_failures`, `unreachable`, `queue_full`, `dropped_unrecorded`.
+* The black-box notes `robodr.executor_event`. `revert_failed`, `drift`
+  and `removed_externally` are critical.
+* `robodr-executor status --config /etc/robodr/executor.json`: the journal
+  of active actions, their deadlines, history and events.
+* `journalctl -u robodr-executor`.
+
+A failed revert is retried every 500 ms until it verifies. Treat
+`revert_failures > 0` as urgent. The finding for it is not in the
+findings contract yet, so watch this counter instead.
+
 ## 7. Upgrade and rollback
 
 **Upgrade** (available). Verify the new release (section 2), then run
@@ -1641,6 +1777,10 @@ The package never deletes evidence or keys, not even on `apt purge`.
 | every control-plane request `refused` `observe_mode` | profile not enforced or policy not OEM-validated | section 5; the API never acts beyond what the policy allows |
 | High `robot.agent.control_plane_unauthenticated` | requests without a valid SOC signature | check `status.json` `control_plane.last_auth_failure`; treat repeated ones as an attempt to reach the robot |
 | every finding `[observe-only]` | profile unlocked, missing or invalid | section 5 |
+| executor: request `failed` "executor unreachable" | `robodr-executor` not running, wrong `executor.socket`, or the two keys differ | section 6.5: `systemctl status robodr-executor`; the same `/etc/robodr/keys/executor.key` must reach both units |
+| executor: `refused` `safety_state_stale` / `safety_state_changed` | agentd's safety state was older than `max_safety_age_ms`, or changed between judgment and apply | expected during transitions; re-judge (submit a new request); check the safety feed if persistent |
+| executor: `refused` `fall_hazard` / `motion_path` / `no_management_channel` | the executor's own safety rules (humanoid without `fall_safe_restrict`, a target on the motion path, no management allow-list) | section 6.5; these are by design, never override them |
+| executor: `revert_failures` rising, `drift` events | the table cannot be re-rendered (nft error), or something edits `inet robodr` | `journalctl -u robodr-executor`; if in doubt, `nft delete table inet robodr` (emergency disable) |
 | Critical `robot.ros2.profile_state_tampered` | anti-rollback state file deleted or rewritten (or agentd stopped mid operator rollback) | section 5.1: investigate; reinstall the recorded profile or roll back with `allow_rollback` |
 | `revocation list ... rollback refused` / `now missing` | an older list, or none, replaced the accepted one | section 5.3: install the newest list |
 | capture sees only `lo` | no default route on an air-gapped robot | list the DDS interfaces in `[module.robodr-sensor-ros2.capture] interfaces` |

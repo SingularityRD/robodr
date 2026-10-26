@@ -376,6 +376,33 @@ a plan".
 - **Status.** `status.json` and heartbeats carry `control_plane` (listeners,
   executor, counters, `last_auth_failure`).
 
+## Executor v1 (`executor`, off by default)
+
+Without an `executor` section, or with `"enabled": false`, the paragraphs
+above hold: nothing is executed. With `"enabled": true`
+(`src/executor_link.rs`), agentd hands work to the separate
+`robodr-executor` process (`crates/robodr-executor`). That process is the
+only RoboDR unit with `CAP_NET_ADMIN`; agentd gains no capability. Work
+goes over an HMAC-authenticated unix socket (`socket`, `key_file`):
+
+- **Control-plane requests.** An accepted request is first recorded in the
+  black box (until then it is only staged), then sent from a worker
+  thread through a bounded queue. The detection loop never waits on the
+  executor. Request states go `pending` → `verified` / `refused` (the
+  executor's own code) / `failed`, then `reverted` after a revert request,
+  TTL expiry or reconciliation (contract §6a).
+- **Planner steps** (`planner_orders`, default `true`). Steps of an
+  Eligible plan that `steps_without_approval_for` offers for the policy's
+  own morphology, with black-box evidence, become orders. These are
+  network isolation and participant quarantine only.
+- **Safety state.** Immediately before it applies anything, the executor
+  asks for the safety state. agentd answers from a cell its main loop
+  refreshes every iteration, together with the cell's age.
+- **`record_evidence`.** A critical black-box mark (`robodr.evidence_mark`)
+  naming the request's evidence.
+- **Events.** The executor's events are recorded as `robodr.executor_event`
+  notes. `status.json` carries `executor` counters.
+
 ## Outputs
 
 - **Black box** (`blackbox.dir`). It holds every deviation, plan note,

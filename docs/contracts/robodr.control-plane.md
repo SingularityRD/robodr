@@ -252,6 +252,51 @@ judged or recorded again); the same id for anything else is 409
 The revert answer carries the request's state with `status` replaced by the
 revert's result and `revert_evidence` (the note's black-box reference).
 
+## 6a. Executor v1 (`executor.enabled`)
+
+> Additive subsection for executor v1 (`crates/robodr-executor`). It only
+> applies when agentd's `executor.enabled` is `true`. Off by default:
+> without it, everything above holds unchanged (`recorded_not_executed`).
+
+With the executor enabled, the robot snapshot reports
+`"executor": "robodr-executor"` and `"executes_actions": true`. An accepted
+request (§4.1) is recorded first, then handed to the separate
+`robodr-executor` process. That process checks it again against its own
+policy and configuration and against the safety state **at the moment of
+apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
+
+| `status` | Meaning | Terminal |
+| --- | --- | --- |
+| `pending` | accepted, recorded, handed to the executor; read the state again with GET | no |
+| `verified` | the executor applied it and the read-back of its nftables rules matched; it stays in force until revert or TTL (`state.expires_at_ms`) | no |
+| `reverted` | removed again: revert request, TTL expiry, restart reconciliation, or an operator's emergency disable (`nft delete table inet robodr`) | yes |
+| `refused` | the executor's own check refused it; nothing was applied. `refusal.code` is one of `not_executor_action` (`safe_pause`, `request_safe_state`, `rollback_config`: never executed), `fall_hazard`, `needs_approval`, `motion_path`, `no_management_channel`, `unsupported_target` (a `node` target, or a process), `safety_state_changed`, `safety_state_stale`, `safety_state_unavailable`, `safety_system_engaged`, `morphology_mismatch`, `observe_mode`, `already_active`, `ttl_out_of_range`, `replay`, `invalid_order`, `id_conflict`, or `executor_refused` for a code this agentd does not know | yes |
+| `failed` | the executor was unreachable, its queue was full, or the apply did not verify and was rolled back (`state.error`); nothing is in force | yes |
+| `recorded_not_executed` | `restrict_motion` (advisory in v1: no motion gateway yet) | yes |
+
+* **Statuses by action.**
+  * `isolate_network` and `quarantine_node` (by `participant_guid`) can
+    reach `verified`.
+  * `record_evidence` becomes `verified` once a signed
+    `robodr.evidence_mark` note naming the request's evidence is in the
+    black box. It is never reverted.
+  * An action the executor never carries out is `refused`.
+* **Revert.** A revert of a `pending` or `verified` request answers
+  `pending`, and GET then shows `reverted`. A revert of a `reverted`
+  request answers `reverted`. The rows of §6 are unchanged.
+* **TTL.** Every executed action has a TTL: the request's `ttl_seconds`,
+  or the executor's `ttl.default_s` when the request names none. The
+  executor lifts the action at `expires_at_ms` without further requests.
+* **Client requirements.** Report `verified` (not `pending`) as "in
+  force". Treat `refused` and `failed` as "not applied" and show
+  `refusal.code`, `refusal.reason` and `state.error`. Poll GET for a
+  `pending` request.
+* **Evidence.** Each executor event (`applied`, `verified`, `refused`,
+  `failed`, `reverted`, `expired`, `revert_failed`, `drift`,
+  `removed_externally`, `reconciled`) is a `robodr.executor_event` note.
+  `revert_failed`, `drift` and `removed_externally` are critical
+  (fsynced). `status.json` carries `executor` counters.
+
 ## 7. HTTP errors
 
 `{"error": {"code": "...", "message": "..."}}` with 400 (body errors §4,

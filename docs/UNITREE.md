@@ -420,6 +420,52 @@ Start from `config/response-policy.unitree-{g1,go2}.example.json`; both are
 `oem_validated: false`, so every response is recorded, not acted on, until
 the policy is validated with Unitree's safety data.
 
+### 6.1 Executor v1 on a Unitree robot
+
+The executor (`robodr-executor`,
+[OPERATIONS.md section 6.5](OPERATIONS.md#65-executor-v1-robodr-executor-reversible-actions))
+is off by default. It installs nftables rules on the host it runs on, so
+it can only act where it runs **in the path**. Two consequences follow:
+
+* **On a sensor box (tap or mirror) it protects nothing**, because the box
+  is not in the path. Leave it disabled there.
+* **On the EDU development computer** it can isolate that computer or
+  quarantine a participant whose traffic crosses it. It never reaches the
+  closed motion controller.
+
+Rules for Unitree, all enforced in code:
+
+* **Never cut `rt/lowcmd` on a humanoid.** The balance loop of G1, H1, H2
+  and R1 is a DDS writer of `rt/lowcmd` on the robot network
+  (192.168.123.0/24). In `/etc/robodr/executor.json`, list that network
+  and the `rt/lowcmd` writer's GUID prefix in
+  `network.motion_control_path` with `"low_level": true`, as
+  `config/executor.unitree-g1.example.json` does:
+  * A `low_level` entry is never cut, whatever the response policy says.
+    Isolation keeps it open.
+  * A quarantine of a participant on it is refused (`motion_path`).
+* **G1 example policy: nothing is executed.** `fall_safe_restrict` is
+  empty, so on a humanoid both `isolate_network` and `quarantine_node` are
+  refused (`fall_hazard`) before any rule is written. Even an OEM that
+  lists them gets no execution without a human's approval: planner
+  orders are refused with `needs_approval`.
+* **Quadrupeds (Go2, B2).**
+  * A `quarantine_node` always needs a human's approval, because it may
+    cut a balance-relevant participant.
+  * List `rt/lowcmd` as `low_level` there too.
+  * `isolate_network` keeps the robot network open as long as it is
+    listed in `control_buses` or `motion_control_path`.
+* **What is never sent.** `safe_pause`, `request_safe_state` and
+  `rollback_config` (damp, stand-down, controller restart) are never sent
+  by the executor on any model. `restrict_motion` is advisory only: there
+  is no sport-API adapter (Sprint 8).
+* **Quarantine coverage.** Quarantine matches RTPS over UDP by GUID
+  prefix. Traffic between processes on the same computer over shared
+  memory is not covered.
+
+Take every address, port range and GUID prefix from your own
+commissioning captures (section 4). The example values are synthetic.
+
 ## 7. What the Unitree rules detect
 
 `rules/robodr/unitree.toml` (Pulsar host rules; they run only where
@@ -558,6 +604,10 @@ the contract's section 5.
   and sport client are covered.
 * **No in-path gateway**: joint envelopes record, they do not block
   (section 5). There is no `restrict_motion` adapter for the sport API yet.
+* **Executor v1 is untested on a Unitree robot.** It has run against real
+  nftables in network namespaces only. On a sensor box it has no effect,
+  because the box is not in the path. On a humanoid with the shipped
+  policy it executes nothing (section 6.1).
 * **Bluetooth is invisible to Pulsar** (no HCI or AF_BLUETOOTH events): the
   rules see user-space tools, files and the processes around them, not BLE
   traffic. A worm that talks to bluetoothd over D-Bus from an interpreter

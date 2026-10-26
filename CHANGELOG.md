@@ -12,6 +12,43 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Added
 
+- Executor v1 (`robodr-executor`, Sprint 7), **off by default**:
+  reversible actions only.
+  - `isolate_network` and `quarantine_node` are nftables rules in a
+    dedicated `inet robodr` table:
+    - isolation keeps loopback, the management / uplink allow-list, the
+      control buses and the motion control path open;
+    - quarantine drops RTPS by GUID prefix and UDP by SPDP locator.
+  - `record_evidence` is a signed black-box mark naming the request's
+    evidence.
+  - `restrict_motion` is recorded as advisory only (no gateway yet).
+  - Never executed: `safe_pause`, `request_safe_state`, `rollback_config`.
+  - Each action follows precheck against the executor's own response
+    policy and configuration → safety-state re-check immediately before
+    apply → write-ahead journal → one atomic `nft -j -f` transaction →
+    read-back verification → exact, idempotent revert, with TTL
+    auto-revert and a persisted deadline.
+  - Restart / reboot / crash reconciliation; an operator's
+    `nft delete table inet robodr` is honoured as an emergency disable.
+  - A humanoid gets nothing outside `fall_safe_restrict`, and nothing
+    without a human's approval.
+  - Separate unit `robodr-executor.service`: `CAP_NET_ADMIN` only, no IP
+    sockets, focal variant; new system user `robodr-exec`. agentd keeps
+    `CAP_NET_RAW` only.
+  - agentd `executor` section (`enabled`, `socket`, `key_file`,
+    `planner_orders`) uses an HMAC-authenticated unix-socket protocol.
+  - New control-plane statuses `verified` and `reverted` (contract §6a);
+    `status.json` `executor` counters; black-box notes
+    `robodr.executor_event` and `robodr.evidence_mark`.
+  - Examples: `config/executor.example.json`,
+    `config/executor.unitree-g1.example.json`.
+  - Tests:
+    - decision matrix;
+    - real nftables in network namespaces with UDP traffic between veth
+      peers;
+    - agentd end to end.
+  - Not yet: a High finding for a failed revert (needs a findings-contract
+    catalog bump) and SPDP locators from agentd.
 - `robodr-uplink` (crate `robodr-export`): producer of the AutoSecOps ingest
   API (`docs/contracts/robodr.ingest-api.md`, contract v1). Inputs as
   `robodr-kafka-publish` (agentd spool on a connected unit or sensor box, or
