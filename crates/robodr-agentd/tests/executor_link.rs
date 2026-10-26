@@ -319,7 +319,9 @@ fn start_executor(dir: &Path, sock: &Path, policy: &Path, model: &Model) -> Exec
                 "management": [{"cidr": "10.20.0.0/24"}],
                 "motion_control_path": [
                     {"cidr": "192.168.123.0/24", "guid_prefix": PROTECTED_GUID, "low_level": true}
-                ]
+                ],
+                // Executor review F4: where a quarantine may act.
+                "quarantine": {"cidrs": ["10.0.0.0/24"]}
             },
             "max_safety_age_ms": 2000,
             // Executor M1: its own copy of the SOC's public key.

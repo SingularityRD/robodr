@@ -20,7 +20,7 @@
 //! agentd → safety{state,age}  executor → outcome{...}
 //! agentd → events{since}      [executor → confirm{"rearm"} → agentd safety{..}, only while
 //!                              actions are held after a reboot]   executor → event_list
-//! agentd → revert / status / ping   executor → outcome / pong
+//! agentd → revert{id,reason,soc?} / status / ping   executor → outcome / pong
 //! operator (CLI) → rearm{reason}    executor → rearmed{was_disabled}
 //! ```
 //!
@@ -72,6 +72,10 @@ pub enum Msg {
     Revert {
         id: String,
         reason: String,
+        /// The SOC's signed revert request (control-plane reverts; review
+        /// finding F3): required to lift an action the SOC approved.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        soc: Option<Box<crate::soc::SocRequest>>,
     },
     Status {
         id: String,

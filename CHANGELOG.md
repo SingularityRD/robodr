@@ -12,6 +12,30 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Security
 
+- `robodr-executor` (review of M1, F3 medium): a revert of an action the
+  SOC approved needs the SOC's signed revert request, verified like a
+  submit (own keys, own robot id, window, own replay store, the revert of
+  that `request_id`, a strict revert body); agentd forwards it with the
+  revert (`Msg::Revert.soc`, `Client::revert_signed`). Unsigned reverts
+  stay for planner actions, TTL expiry, reconciliation and `revert-all`.
+- `robodr-executor` (F4): quarantine locators must lie in the new
+  `network.quarantine.cidrs` (empty: no quarantine; no `/0`, no overlap
+  with management / uplink) and on the robot's DDS ports
+  (`network.quarantine.udp_ports`, default the domains' RTPS ranges), one
+  address family; new refusal `locator_out_of_scope`. **Upgrade:** add
+  `network.quarantine.cidrs` to `executor.json` or every quarantine is
+  refused.
+- `robodr-executor` (F8): the replay-store fence is the start time plus
+  `soc.max_clock_skew_s`. (The same fix is needed in agentd's
+  `ReplayGuard`, done separately.)
+- `robodr-executor` (F9): `soc.robot_keys` (the robot's own public keys)
+  are never accepted as SOC keys; a held action is re-armed only while its
+  approving key is configured (`approval_key_removed`); a bad key file
+  refuses every control-plane order with `soc_keys_unavailable` (was
+  `config_unavailable`).
+- `robodr-executor`: site option `require_approval_for_all_containment`
+  (default `false`, `true` in the G1 example): planner containment orders
+  are refused on every morphology.
 - `robodr-firewall-gw` (review of the gateway channels, F1 high): the
   arm-SDK blend weight is rate limited, not only bounded: `0 → 1 → 0 → 1`
   snapped the arms between the locomotion pose and the SDK's targets. New

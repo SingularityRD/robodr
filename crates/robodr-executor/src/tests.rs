@@ -84,7 +84,8 @@ pub fn config_json(state_dir: &str) -> String {
                 {"cidr": "192.168.123.0/24", "udp_ports": [7400, 7600], "note": "robot DDS bus"},
                 {"cidr": "192.168.123.161", "guid_prefix": LOWCMD_GUID, "low_level": true,
                  "note": "rt/lowcmd writer"}
-            ]
+            ],
+            "quarantine": {"cidrs": ["10.0.0.0/24", "192.168.123.0/24"]}
         },
         "ttl": {"default_s": 600, "max_s": 3600},
         "soc": {"keys": [soc_key_path()]}
@@ -1875,8 +1876,9 @@ fn m1_matching_signed_order_is_applied_and_replay_refused_across_restarts() {
     assert_eq!(refusal_code(&out), codes::SOC_NONCE_REPLAYED, "{out:?}");
     assert!(nft.0.lock().unwrap().table.is_none());
     drop(e);
-    // The replay store removed while the journal exists: fenced, an old
-    // request is refused, a request signed after the start is accepted.
+    // The replay store removed while the journal exists: fenced up to the
+    // start + the skew window (F8), an old request is refused, a request
+    // signed after the fence is accepted.
     std::fs::remove_file(d.join(crate::soc::NONCE_FILE)).unwrap();
     let mut e = engine(&d, &nft, "b1", 3_000);
     let mut o2 = o.clone();
@@ -1888,8 +1890,16 @@ fn m1_matching_signed_order_is_applied_and_replay_refused_across_restarts() {
     );
     let mut o3 = o.clone();
     o3.id = "r-three".into();
-    let o3 = sign_at(o3, 4);
-    assert_eq!(e.submit(&o3, &mut idle(), 4_000).status, Status::Verified);
+    let o3 = sign_at(o3, 33);
+    assert_eq!(
+        refusal_code(&e.submit(&o3, &mut idle(), 33_000)),
+        codes::SOC_REQUEST_STALE,
+        "inside the skew window of the start"
+    );
+    let mut o3 = o.clone();
+    o3.id = "r-three-b".into();
+    let o3 = sign_at(o3, 34);
+    assert_eq!(e.submit(&o3, &mut idle(), 34_000).status, Status::Verified);
     drop(e);
     // A corrupt store fences too.
     std::fs::write(d.join(crate::soc::NONCE_FILE), b"{not json").unwrap();
@@ -1934,7 +1944,7 @@ fn m1_soc_keys_are_the_executors_own() {
         codes::SOC_SIGNATURE_INVALID
     );
     drop(e);
-    // A group-writable key file is not trusted (config_unavailable).
+    // A group-writable key file is not trusted (soc_keys_unavailable).
     let kp = d.join("soc-gw.pub");
     std::fs::write(
         &kp,
@@ -1961,7 +1971,7 @@ fn m1_soc_keys_are_the_executors_own() {
     let o = signed(wheeled("k2", ActionId::IsolateNetwork));
     assert_eq!(
         refusal_code(&e.submit(&o, &mut idle(), 1_000)),
-        codes::CONFIG_UNAVAILABLE
+        codes::SOC_KEYS_UNAVAILABLE
     );
     // A secret key file is refused too.
     let sk = robodr_blackbox::KeyFile::ed25519_from_seed(&SOC_SEED, Some(SOC_KEY_ID))
@@ -1972,6 +1982,444 @@ fn m1_soc_keys_are_the_executors_own() {
     let o = signed(wheeled("k3", ActionId::IsolateNetwork));
     assert_eq!(
         refusal_code(&e.submit(&o, &mut idle(), 1_000)),
-        codes::CONFIG_UNAVAILABLE
+        codes::SOC_KEYS_UNAVAILABLE
     );
+}
+
+// --- Review of the executor M1 (`fcd58b2`): F3, F4, F8, F9, design option ---
+
+/// An order on its own executor; the engine served over a real unix socket
+/// (agentd's path), with the system clock.
+fn served(
+    tag: &str,
+    edit: impl FnOnce(&mut Value),
+) -> (
+    std::path::PathBuf,
+    FakeNft,
+    crate::client::Client,
+    Arc<std::sync::atomic::AtomicBool>,
+    std::thread::JoinHandle<()>,
+) {
+    use crate::proto::Key;
+    let d = tmpdir(tag);
+    let nft = FakeNft::default();
+    let sock = d.join("executor.sock");
+    let mut v: Value = serde_json::from_str(&config_json(d.to_str().unwrap())).unwrap();
+    v["socket"] = json!(sock);
+    edit(&mut v);
+    let c = ExecutorConfig::parse(&v.to_string())
+        .unwrap()
+        .validate()
+        .unwrap();
+    let mut engine = Engine::open(
+        c,
+        policy(Morphology::WheeledMobile, true, &[]),
+        Box::new(nft.clone()),
+        "b1",
+        crate::proto::wall_ms(),
+    )
+    .unwrap();
+    let listener = crate::server::bind(&sock, 0o600).unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let st = stop.clone();
+    let server = std::thread::spawn(move || {
+        let key = Key::from_bytes([0x5a; 32]);
+        crate::server::serve(
+            &listener,
+            &mut engine,
+            &key,
+            "b1",
+            &|| st.load(std::sync::atomic::Ordering::SeqCst),
+            &mut |_, _| {},
+        );
+    });
+    let client = crate::client::Client::new(
+        sock,
+        Key::from_bytes([0x5a; 32]),
+        std::time::Duration::from_secs(5),
+    );
+    (d, nft, client, stop, server)
+}
+
+fn now_s() -> u64 {
+    crate::proto::wall_ms() / 1000
+}
+
+/// F3: a revert of a SOC-approved action needed no SOC signature: agentd
+/// (or anyone holding the protocol key) could lift a containment the SOC
+/// ordered. Over the real socket: an unsigned revert of a control-plane
+/// action is refused and the rules stay; TTL expiry and planner actions
+/// keep reverting without one.
+#[test]
+fn f3_control_plane_revert_needs_the_socs_signature() {
+    let (_d, nft, client, stop, server) = served("f3", |_| {});
+    let o = sign_at(
+        unsigned(
+            "r-f3",
+            ActionId::IsolateNetwork,
+            Morphology::WheeledMobile,
+            SafetyState::Idle,
+        ),
+        now_s(),
+    );
+    let out = client
+        .submit(&o, &mut || Ok((SafetyState::Idle, 3)))
+        .unwrap();
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    let out = client.revert("r-f3", "agentd says so").unwrap();
+    assert_eq!(
+        out.status,
+        Status::Verified,
+        "unsigned revert lifted it: {out:?}"
+    );
+    assert_eq!(refusal_code(&out), codes::SOC_SIGNATURE_INVALID, "{out:?}");
+    assert!(nft.0.lock().unwrap().table.is_some());
+    // Signed, but for another action / as a submit / by another key / with
+    // a non-strict body: refused, still in force.
+    let rv = |_: &str, seed: &[u8; 32], target: String, body: &str, nonce: &str| {
+        crate::soc::SocRequest::sign(
+            seed,
+            "ugv-007",
+            SOC_KEY_ID,
+            "POST",
+            &target,
+            now_s(),
+            nonce,
+            body,
+        )
+    };
+    let path = |id: &str| format!("/api/v2/robots/ugv-007/action-requests/{id}/revert");
+    let body = r#"{"reason":"contained","requested_by":"analyst"}"#;
+    for (k, (soc, want)) in [
+        (
+            rv(
+                "x",
+                &SOC_SEED,
+                path("r-other"),
+                body,
+                "f3-revert-nonce-0001",
+            ),
+            codes::ORDER_MISMATCH,
+        ),
+        (
+            rv(
+                "x",
+                &SOC_SEED,
+                "/api/v2/robots/ugv-007/action-requests".into(),
+                body,
+                "f3-revert-nonce-0002",
+            ),
+            codes::ORDER_MISMATCH,
+        ),
+        (
+            rv("x", &[9; 32], path("r-f3"), body, "f3-revert-nonce-0003"),
+            codes::SOC_SIGNATURE_INVALID,
+        ),
+        (
+            rv(
+                "x",
+                &SOC_SEED,
+                path("r-f3"),
+                r#"{"requested_by":"analyst","force":true}"#,
+                "f3-revert-nonce-0004",
+            ),
+            codes::ORDER_MISMATCH,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let out = client.revert_signed("r-f3", "x", Some(&soc)).unwrap();
+        assert_eq!(out.status, Status::Verified, "case {k}: {out:?}");
+        assert_eq!(refusal_code(&out), want, "case {k}: {out:?}");
+    }
+    assert!(nft.0.lock().unwrap().table.is_some());
+    // The SOC's signed revert of this action lifts it.
+    let good = rv("x", &SOC_SEED, path("r-f3"), body, "f3-revert-nonce-0005");
+    let out = client.revert_signed("r-f3", "x", Some(&good)).unwrap();
+    assert_eq!(out.status, Status::Reverted, "{out:?}");
+    assert!(nft.0.lock().unwrap().table.is_none());
+    // Replayed against another approved action: the nonce was used.
+    let o2 = sign_at(
+        unsigned(
+            "r-f3b",
+            ActionId::IsolateNetwork,
+            Morphology::WheeledMobile,
+            SafetyState::Idle,
+        ),
+        now_s(),
+    );
+    assert_eq!(
+        client
+            .submit(&o2, &mut || Ok((SafetyState::Idle, 3)))
+            .unwrap()
+            .status,
+        Status::Verified
+    );
+    let out = client.revert_signed("r-f3b", "x", Some(&good)).unwrap();
+    assert_eq!(out.status, Status::Verified);
+    assert_eq!(refusal_code(&out), codes::ORDER_MISMATCH, "{out:?}");
+    // A planner action reverts without a signature.
+    let mut p = unsigned(
+        "plan:f3",
+        ActionId::QuarantineNode,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    p.human_approved = false;
+    p.origin = Origin::Planner {
+        rule: "r".into(),
+        finding_id: None,
+    };
+    let out = client
+        .submit(&p, &mut || Ok((SafetyState::Idle, 3)))
+        .unwrap();
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    assert_eq!(
+        client.revert("plan:f3", "planner").unwrap().status,
+        Status::Reverted
+    );
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    server.join().unwrap();
+}
+
+/// F4: the participant's locators come from SPDP (unauthenticated); a
+/// forged locator could make a quarantine drop an arbitrary UDP endpoint
+/// (a DNS server, the SOC's syslog). Locators must lie in a configured
+/// quarantinable CIDR and in the robot's DDS port ranges, one address
+/// family.
+#[test]
+fn f4_quarantine_locators_are_scoped() {
+    let p = policy(Morphology::WheeledMobile, true, &[]);
+    let with = |q: Option<Value>| -> Resolved {
+        let mut v: Value = serde_json::from_str(&config_json("/tmp/f4")).unwrap();
+        match q {
+            Some(q) => v["network"]["quarantine"] = q,
+            None => {
+                v["network"].as_object_mut().unwrap().remove("quarantine");
+            }
+        }
+        ExecutorConfig::parse(&v.to_string())
+            .and_then(ExecutorConfig::validate)
+            .expect("network.quarantine is a config key")
+    };
+    let q = |locs: &[(&str, u16)]| {
+        let mut o = unsigned(
+            "q-f4",
+            ActionId::QuarantineNode,
+            Morphology::WheeledMobile,
+            SafetyState::Idle,
+        );
+        o.target = Target::Participant {
+            guid_prefix: GUID.parse().unwrap(),
+            locators: locs
+                .iter()
+                .map(|(ip, port)| Locator {
+                    ip: ip.parse().unwrap(),
+                    port: *port,
+                })
+                .collect(),
+        };
+        o
+    };
+    let scoped = with(Some(json!({"cidrs": ["10.0.0.0/24"]})));
+    // In scope: a DDS port of domain 0 in the quarantinable network.
+    assert!(precheck(&q(&[("10.0.0.7", 7410)]), &p, &scoped).is_ok());
+    for (what, locs) in [
+        ("not a DDS port", vec![("10.0.0.7", 53)]),
+        (
+            "outside the quarantinable CIDRs",
+            vec![("10.20.0.10", 7410)],
+        ),
+        (
+            "mixed families",
+            vec![("10.0.0.7", 7410), ("fd00::7", 7410)],
+        ),
+    ] {
+        let r = precheck(&q(&locs), &p, &scoped);
+        assert_eq!(
+            r.as_ref().map_err(|e| e.code.as_str()).err(),
+            Some("locator_out_of_scope"),
+            "{what}: {r:?}"
+        );
+    }
+    // No quarantinable network configured: no quarantine at all.
+    let r = precheck(&q(&[("10.0.0.7", 7410)]), &p, &with(None));
+    assert_eq!(
+        r.as_ref().map_err(|e| e.code.as_str()).err(),
+        Some("locator_out_of_scope"),
+        "{r:?}"
+    );
+}
+
+/// F8: the replay store's fence was the start time; a request signed up to
+/// `max_clock_skew_s` in the future (inside the window) before the store
+/// was lost could be replayed after the restart.
+#[test]
+fn f8_fence_covers_the_skew_window() {
+    let d = tmpdir("f8");
+    std::fs::write(d.join(crate::journal::FILE), b"{}").unwrap();
+    let mut s = crate::soc::ReplayStore::open(&d, 100, 30, true);
+    // Signed at 120 (20 s ahead of the clock at start, inside the 30 s
+    // window): it may have been presented before the store was lost.
+    let r = s.check("k", "nonce-nonce-nonce-01", 120, 101, 30);
+    assert_eq!(
+        r.map_err(|e| e.code),
+        Err(codes::SOC_REQUEST_STALE.to_string())
+    );
+    // Signed after start + skew: accepted.
+    assert!(s.check("k", "nonce-nonce-nonce-02", 131, 131, 30).is_ok());
+}
+
+/// F9 (a): a SOC key equal to one of the robot's own keys (its black-box /
+/// finding signing key) is refused: whoever holds the robot's key could
+/// otherwise approve containment.
+#[test]
+fn f9a_soc_key_equal_to_a_robot_key_is_refused() {
+    let d = tmpdir("f9a");
+    let nft = FakeNft::default();
+    let mut v: Value = serde_json::from_str(&config_json(d.to_str().unwrap())).unwrap();
+    v["soc"]["robot_keys"] = json!([soc_key_path()]);
+    let c = ExecutorConfig::parse(&v.to_string())
+        .and_then(ExecutorConfig::validate)
+        .expect("soc.robot_keys is a config key");
+    let mut e = Engine::open(
+        c,
+        policy(Morphology::WheeledMobile, true, &[]),
+        Box::new(nft.clone()),
+        "b1",
+        1_000,
+    )
+    .unwrap();
+    let o = order(
+        "f9a",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    let out = e.submit(&o, &mut idle(), 1_000);
+    assert_eq!(refusal_code(&out), "soc_keys_unavailable", "{out:?}");
+    assert!(nft.0.lock().unwrap().table.is_none());
+}
+
+/// F9 (b): an action held after a reboot is re-armed only while the SOC key
+/// that approved it is still configured.
+#[test]
+fn f9b_rearm_rechecks_the_approving_key() {
+    let d = tmpdir("f9b");
+    let nft = FakeNft::default();
+    let mut e = engine(&d, &nft, "b1", 1_000);
+    let i = order(
+        "i-f9b",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    assert_eq!(e.submit(&i, &mut idle(), 1_000).status, Status::Verified);
+    drop(e);
+    nft.0.lock().unwrap().table = None;
+    let mut v: Value = serde_json::from_str(&config_json(d.to_str().unwrap())).unwrap();
+    v["soc"] = json!({"keys": []});
+    let c = ExecutorConfig::parse(&v.to_string())
+        .unwrap()
+        .validate()
+        .unwrap();
+    let mut e = Engine::open(
+        c,
+        policy(Morphology::WheeledMobile, true, &[]),
+        Box::new(nft.clone()),
+        "b2",
+        2_000,
+    )
+    .unwrap();
+    e.rearm_held(
+        Ok(Current {
+            state: SafetyState::Idle,
+            age_ms: 5,
+        }),
+        2_100,
+    );
+    let st = e.status("i-f9b");
+    assert_eq!(
+        st.status,
+        Status::Reverted,
+        "re-armed without its key: {st:?}"
+    );
+    assert!(
+        st.note
+            .as_deref()
+            .unwrap_or("")
+            .contains("approval_key_removed"),
+        "{st:?}"
+    );
+    assert!(nft.0.lock().unwrap().table.is_none());
+}
+
+/// F9 (c): one unreadable SOC key file refuses every control-plane order
+/// (integrity first), with its own refusal code.
+#[test]
+fn f9c_bad_key_file_has_its_own_code() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tmpdir("f9c");
+    let nft = FakeNft::default();
+    let bad = d.join("bad.pub");
+    std::fs::write(&bad, b"{not a key").unwrap();
+    std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let mut v: Value = serde_json::from_str(&config_json(d.to_str().unwrap())).unwrap();
+    v["soc"]["keys"] = json!([soc_key_path(), bad]);
+    let c = ExecutorConfig::parse(&v.to_string())
+        .unwrap()
+        .validate()
+        .unwrap();
+    let mut e = Engine::open(
+        c,
+        policy(Morphology::WheeledMobile, true, &[]),
+        Box::new(nft.clone()),
+        "b1",
+        1_000,
+    )
+    .unwrap();
+    let o = order(
+        "f9c",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    assert_eq!(
+        refusal_code(&e.submit(&o, &mut idle(), 1_000)),
+        "soc_keys_unavailable"
+    );
+}
+
+/// Design option: a site may require a human's approval for every
+/// containment, on every morphology (planner orders refused).
+#[test]
+fn require_approval_for_all_containment_refuses_planner_orders() {
+    let p = policy(Morphology::WheeledMobile, true, &[]);
+    let mut v: Value = serde_json::from_str(&config_json("/tmp/x")).unwrap();
+    v["require_approval_for_all_containment"] = json!(true);
+    let strict = ExecutorConfig::parse(&v.to_string())
+        .and_then(ExecutorConfig::validate)
+        .expect("require_approval_for_all_containment is a config key");
+    let mut o = unsigned(
+        "plan:all",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    o.human_approved = false;
+    o.origin = Origin::Planner {
+        rule: "r".into(),
+        finding_id: None,
+    };
+    assert!(
+        precheck(&o, &p, &cfg("/tmp/x")).is_ok(),
+        "default: unchanged"
+    );
+    assert_eq!(
+        precheck(&o, &p, &strict).map_err(|e| e.code).err(),
+        Some(codes::NEEDS_APPROVAL.to_string())
+    );
+    o.human_approved = true;
+    assert!(precheck(&o, &p, &strict).is_ok());
 }

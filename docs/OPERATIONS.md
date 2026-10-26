@@ -1465,7 +1465,19 @@ table.
      every SOC approval itself with them (trust boundary M1): without
      them every control-plane order is refused (`soc_signature_invalid`).
      Rotate them together with agentd's. Keep `soc.max_clock_skew_s`
-     (default 30) at least agentd's `max_clock_skew_s`.
+     (default 30) at least agentd's `max_clock_skew_s`. One key file the
+     executor cannot read or refuses blocks **every** control-plane order
+     (`soc_keys_unavailable`, the start log names the file). Reverts of a
+     SOC-approved action need the SOC's signed revert request (agentd
+     forwards it; unsigned reverts are refused, the action stays).
+   * `soc.robot_keys`: the robot's own public keys (the black-box and
+     finding keys' public halves, e.g. `robodr-blackbox keygen` public
+     files): never accepted as SOC keys.
+   * `network.quarantine.cidrs`: the networks where a participant may be
+     quarantined (its SPDP locators must be there, on the robot's DDS
+     ports); empty refuses every quarantine (`locator_out_of_scope`).
+   * `require_approval_for_all_containment: true` makes every containment
+     wait for the SOC (the on-robot planner's orders are refused).
 4. Check the configuration:
    `robodr-executor --config /etc/robodr/executor.json --check-config`.
    The running executor re-reads the configuration and the response

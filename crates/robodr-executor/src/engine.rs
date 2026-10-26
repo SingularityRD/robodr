@@ -265,6 +265,7 @@ impl Engine {
         let soc_replay = crate::soc::ReplayStore::open(
             &cfg.config.state_dir,
             now.wall_ms / 1000,
+            cfg.config.soc.max_clock_skew_s,
             journal.path().exists(),
         );
         let mut e = Engine {
@@ -572,8 +573,41 @@ impl Engine {
                 "the journal entry holds no order to re-validate (written by executor v1.0)",
             ));
         };
+        // Review F9 (b): an approval is only as good as its key; a key the
+        // site removed (or that no longer loads) re-arms nothing.
+        if let crate::order::Origin::ControlPlane { key_id, .. } = &order.origin {
+            if order.human_approved {
+                let keys = self.soc_keys()?;
+                if !keys.iter().any(|k| &k.key_id == key_id) {
+                    return Err(Refusal::new(
+                        codes::APPROVAL_KEY_REMOVED,
+                        format!(
+                            "approved with SOC key {:?}, which is no longer configured \
+                             (soc.keys): not re-armed",
+                            crate::net::clip(key_id)
+                        ),
+                    ));
+                }
+            }
+        }
         let p = decision::precheck(order, &self.policy, &self.cfg)?;
         Ok(p.effect)
+    }
+
+    /// The configured SOC keys (`soc.keys`, minus nothing: one bad file or
+    /// a key equal to one of the robot's own refuses them all,
+    /// `soc_keys_unavailable`).
+    fn soc_keys(&self) -> Result<Vec<crate::soc::SocKey>, Refusal> {
+        let c = &self.cfg.config;
+        crate::soc::load_keys_checked(&c.soc.keys, &c.soc.robot_keys, &c.robot_id).map_err(|e| {
+            Refusal::new(
+                codes::SOC_KEYS_UNAVAILABLE,
+                format!(
+                    "the SOC key configuration cannot be trusted ({e}): every control-plane \
+                     order is refused until it is fixed"
+                ),
+            )
+        })
     }
 
     fn finish(&mut self, en: &Entry, result: Final, at_ms: u64, detail: &str) {
@@ -930,14 +964,7 @@ impl Engine {
                 }
             }
             crate::order::Origin::ControlPlane { .. } => {
-                let keys =
-                    crate::soc::load_keys(&self.cfg.config.soc.keys, &self.cfg.config.robot_id)
-                        .map_err(|e| {
-                            Refusal::new(
-                                codes::CONFIG_UNAVAILABLE,
-                                format!("the SOC keys could not be read: {e}"),
-                            )
-                        })?;
+                let keys = self.soc_keys()?;
                 let cx = crate::soc::Context {
                     keys: &keys,
                     robot_id: &self.cfg.config.robot_id,
@@ -1141,7 +1168,56 @@ impl Engine {
         o
     }
 
-    /// Revert one action (request, TTL, operator). Idempotent: an action
+    /// A revert **requested** over the protocol (agentd, for the SOC or
+    /// its own planner). An action the SOC approved (a control-plane
+    /// origin) is lifted only with the SOC's signed revert request
+    /// ([`crate::soc::verify_revert`], review finding F3); a refusal leaves
+    /// it in force and answers its status with the refusal. A planner
+    /// action, an unknown or finished id, and an action already reverting
+    /// are handled as [`Engine::revert`].
+    pub fn revert_request(
+        &mut self,
+        id: &str,
+        reason: &str,
+        soc: Option<&crate::soc::SocRequest>,
+        now: impl Into<Now>,
+    ) -> Outcome {
+        let now = now.into();
+        let needs = self.state.entry(id).and_then(|en| match &en.origin {
+            crate::order::Origin::ControlPlane { .. } if en.phase != Phase::Reverting => {
+                Some(en.action)
+            }
+            _ => None,
+        });
+        if let Some(action) = needs {
+            let checked = self.soc_keys().and_then(|keys| {
+                let cx = crate::soc::Context {
+                    keys: &keys,
+                    robot_id: &self.cfg.config.robot_id,
+                    max_skew_s: self.cfg.config.soc.max_clock_skew_s,
+                    now_ms: now.wall_ms,
+                };
+                crate::soc::verify_revert(id, soc, &cx, &mut self.soc_replay)
+            });
+            if let Err(r) = checked {
+                self.state.event(
+                    now.wall_ms,
+                    EventKind::Refused,
+                    Some(id),
+                    Some(action),
+                    format!("revert refused: {}: {}", r.code, r.reason),
+                );
+                let _ = self.save();
+                let mut o = self.status(id);
+                o.refusal = Some(r);
+                return o;
+            }
+        }
+        self.revert(id, reason, now)
+    }
+
+    /// Revert one action (TTL, reconciliation, operator, or a request that
+    /// [`Engine::revert_request`] authorised). Idempotent: an action
     /// already finished answers its final status. `reverted` is answered
     /// only once the journal records it (see [`crate::journal`]).
     pub fn revert(&mut self, id: &str, reason: &str, now: impl Into<Now>) -> Outcome {

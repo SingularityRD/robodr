@@ -35,6 +35,23 @@
 //!    no control characters), a `source` (`[a-z0-9_-]{1,32}`) and a
 //!    `reason` of at most 500 characters (`approval_missing`).
 //!
+//! **Reverts** (review finding F3): an action a SOC approved is lifted only
+//! by the SOC's own signed revert request ([`verify_revert`]): the same
+//! checks 1-4 (key, signature for this robot, timestamp, the same replay
+//! store), the request is `POST /api/v2/robots/<own robot id>/
+//! action-requests/<the action's id>/revert`, and its body is the
+//! contract's strict revert body (`requested_by`, optional `reason`).
+//! agentd forwards it with the revert. Reverts that need no signature:
+//! planner actions (never approved by anyone), TTL expiry, restart
+//! reconciliation and the operator's `robodr-executor revert-all` (local,
+//! root).
+//!
+//! **Keys** ([`load_keys`]): one key file that cannot be read or is refused
+//! refuses every control-plane order (`soc_keys_unavailable`): falling back
+//! to the remaining keys would silently change who can approve. A SOC key
+//! equal to one of the robot's own keys (`soc.robot_keys`, its black-box /
+//! finding signing keys) is refused the same way (review F9 a).
+//!
 //! Only then is `human_approved` true. An order from the on-robot planner
 //! carries no SOC request and can never claim an approval
 //! (`approval_missing`), so it is limited to what the response policy
@@ -259,8 +276,19 @@ pub fn load_key(path: &Path, robot_id: &str) -> Result<SocKey, String> {
     })
 }
 
-/// Load every configured SOC key (duplicate key ids refuse).
+/// Load every configured SOC key (duplicate key ids refuse). Any error
+/// refuses them all (module docs).
 pub fn load_keys(paths: &[PathBuf], robot_id: &str) -> Result<Vec<SocKey>, String> {
+    load_keys_checked(paths, &[], robot_id)
+}
+
+/// [`load_keys`], also refusing a SOC key whose public key equals one of
+/// the robot's own keys (`robot_keys`, read with the same file rules).
+pub fn load_keys_checked(
+    paths: &[PathBuf],
+    robot_keys: &[PathBuf],
+    robot_id: &str,
+) -> Result<Vec<SocKey>, String> {
     let mut out: Vec<SocKey> = Vec::new();
     for p in paths {
         let k = load_key(p, robot_id)?;
@@ -272,6 +300,17 @@ pub fn load_keys(paths: &[PathBuf], robot_id: &str) -> Result<Vec<SocKey>, Strin
             ));
         }
         out.push(k);
+    }
+    for p in robot_keys {
+        let own = load_key(p, robot_id).map_err(|e| format!("soc.robot_keys: {e}"))?;
+        if let Some(k) = out.iter().find(|k| k.public == own.public) {
+            return Err(format!(
+                "SOC key {:?} is the robot's own key {} (soc.robot_keys): whoever holds the \
+                 robot's key could approve containment",
+                crate::net::clip(&k.key_id),
+                p.display()
+            ));
+        }
     }
     Ok(out)
 }
@@ -529,6 +568,115 @@ pub fn verify(order: &Order, cx: &Context<'_>, replay: &mut ReplayStore) -> Resu
     Ok(())
 }
 
+/// The strict revert body (contract §6: `{"reason"?, "requested_by"}`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignedRevert {
+    #[serde(default)]
+    reason: Option<String>,
+    requested_by: String,
+}
+
+/// Verify the SOC's signed revert request for action `id` (module docs,
+/// F3). `Ok` means a SOC key holder asked for exactly this revert.
+pub fn verify_revert(
+    id: &str,
+    soc: Option<&SocRequest>,
+    cx: &Context<'_>,
+    replay: &mut ReplayStore,
+) -> Result<(), Refusal> {
+    let Some(soc) = soc else {
+        return Err(refuse(
+            codes::SOC_SIGNATURE_INVALID,
+            "the action was approved by the SOC: only the SOC's signed revert request lifts it \
+             (none was forwarded)",
+        ));
+    };
+    let sig = soc.well_formed().map_err(|e| {
+        refuse(
+            codes::SOC_SIGNATURE_INVALID,
+            format!("the SOC revert request is malformed ({e})"),
+        )
+    })?;
+    if cx.keys.is_empty() {
+        return Err(refuse(
+            codes::SOC_SIGNATURE_INVALID,
+            "no SOC key is configured in the executor (soc.keys): no revert can be verified",
+        ));
+    }
+    let Some(key) = cx.keys.iter().find(|k| k.key_id == soc.key_id) else {
+        return Err(refuse(
+            codes::SOC_SIGNATURE_INVALID,
+            format!(
+                "key id {:?} is not one of the executor's SOC keys",
+                crate::net::clip(&soc.key_id)
+            ),
+        ));
+    };
+    let msg = signing_message(
+        &soc.method,
+        &soc.target,
+        cx.robot_id,
+        &soc.key_id,
+        soc.timestamp,
+        &soc.nonce,
+        soc.body.as_bytes(),
+    );
+    if !robodr_blackbox::sign_ed25519::verify(&key.public, &msg, &sig) {
+        return Err(refuse(
+            codes::SOC_SIGNATURE_INVALID,
+            format!(
+                "the SOC revert signature does not verify for robot {}",
+                cx.robot_id
+            ),
+        ));
+    }
+    let now_s = cx.now_ms / 1000;
+    if soc.timestamp.abs_diff(now_s) > cx.max_skew_s {
+        return Err(refuse(
+            codes::SOC_REQUEST_STALE,
+            format!(
+                "the SOC revert was signed at {} (Unix s), the executor's clock reads {now_s}: \
+                 outside the {} s window",
+                soc.timestamp, cx.max_skew_s
+            ),
+        ));
+    }
+    let want = format!("/api/v2/robots/{}/action-requests/{id}/revert", cx.robot_id);
+    if soc.method != "POST" || pct_decode(&soc.target).as_deref() != Some(want.as_str()) {
+        return Err(refuse(
+            codes::ORDER_MISMATCH,
+            format!(
+                "the signed request is {} {:?}, not the revert of this action ({want})",
+                crate::net::clip(&soc.method),
+                crate::net::clip(&soc.target)
+            ),
+        ));
+    }
+    let body: SignedRevert = serde_json::from_str(&soc.body).map_err(|e| {
+        refuse(
+            codes::ORDER_MISMATCH,
+            format!("the signed body is not a strict revert request: {e}"),
+        )
+    })?;
+    let rb_ok = !body.requested_by.is_empty()
+        && body.requested_by.chars().count() <= 100
+        && !body.requested_by.chars().any(char::is_control);
+    let reason_ok = body
+        .reason
+        .as_deref()
+        .is_none_or(|r| r.chars().count() <= 500 && !r.chars().any(char::is_control));
+    if !rb_ok || !reason_ok {
+        return Err(refuse(
+            codes::APPROVAL_MISSING,
+            "the signed revert lacks a valid requested_by (1..=100 characters) or has an \
+             invalid reason",
+        ));
+    }
+    // Last, so a refused request does not burn its nonce.
+    replay.check(&soc.key_id, &soc.nonce, soc.timestamp, now_s, cx.max_skew_s)
+}
+
 /// One persisted (key, nonce) pair.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -566,7 +714,12 @@ impl ReplayStore {
     /// fences too. Never fails: a store that cannot be read or written
     /// refuses requests later, it does not stop the executor (reverts and
     /// TTL expiry must keep working).
-    pub fn open(dir: &Path, now_s: u64, state_existed: bool) -> Self {
+    ///
+    /// The fence is `now_s + skew_s` (review finding F8): a request signed
+    /// up to `skew_s` ahead of the clock was inside the window before the
+    /// start and may have been presented to the lost store.
+    pub fn open(dir: &Path, now_s: u64, skew_s: u64, state_existed: bool) -> Self {
+        let fence_at = now_s.saturating_add(skew_s);
         let mut s = ReplayStore {
             dir: dir.to_path_buf(),
             seen: BTreeMap::new(),
@@ -584,18 +737,18 @@ impl ReplayStore {
                         }
                     }
                 }
-                Ok(_) => s.fence(now_s, format!("{NONCE_FILE}: unknown schema")),
-                Err(e) => s.fence(now_s, format!("{NONCE_FILE}: {e}")),
+                Ok(_) => s.fence(fence_at, format!("{NONCE_FILE}: unknown schema")),
+                Err(e) => s.fence(fence_at, format!("{NONCE_FILE}: {e}")),
             },
             Err(_) if !p.exists() => {
                 if state_existed {
                     s.fence(
-                        now_s,
+                        fence_at,
                         format!("{NONCE_FILE} is missing while the executor's journal exists"),
                     );
                 }
             }
-            Err(e) => s.fence(now_s, e),
+            Err(e) => s.fence(fence_at, e),
         }
         // Start from a compact file (an error here is retried on the next
         // insert, which refuses if it fails again).

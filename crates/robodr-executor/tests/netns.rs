@@ -517,6 +517,24 @@ fn soc_key_path() -> std::path::PathBuf {
 
 static SOC_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// A public key file standing for the robot's own (black-box) key.
+fn robot_key_path() -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = std::env::temp_dir().join(format!("robodr-netns-robot-{}.pub", std::process::id()));
+    if !p.exists() {
+        let n = SOC_NONCE.fetch_add(1, Ordering::SeqCst);
+        let tmp = p.with_extension(format!("tmp{n}"));
+        std::fs::write(
+            &tmp,
+            robodr_executor::soc::testing::public_key_json(&[0x77; 32], "robot:blackbox"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::rename(&tmp, &p).unwrap();
+    }
+    p
+}
+
 /// Attach the lab SOC's signed request (at `ts_s`, a fresh nonce).
 fn sign_at(o: Order, ts_s: u64) -> Order {
     let n = SOC_NONCE.fetch_add(1, Ordering::SeqCst);
@@ -543,7 +561,9 @@ fn config_json(state_dir: &std::path::Path) -> Value {
                 "control_buses": {"exempt": true, "entries": []},
                 "motion_control_path": [
                     {"cidr": MOTION, "udp_ports": [7400, 7600], "note": "robot DDS bus"}
-                ]
+                ],
+                // F4: where a quarantine may act (ROGUE / OTHER, not MGMT).
+                "quarantine": {"cidrs": ["10.99.0.0/29", "fd00:30::/64"]}
             },
             "ttl": {"default_s": 600, "max_s": 3600},
             "max_safety_age_ms": 1000,
@@ -1086,9 +1106,29 @@ fn protocol_end_to_end_over_the_unix_socket() {
     );
     assert!(bad.revert("p-2", "x").is_err());
     assert_eq!(client.status("p-2").unwrap().status, Status::Verified);
-    // Revert through the protocol.
+    // Review F3: a revert without the SOC's signature (what agentd, or
+    // anyone holding the protocol key, could send) is refused and the
+    // isolation stays in force.
+    let out = client.revert("p-2", "lab").unwrap();
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    assert_eq!(out.refusal.unwrap().code, codes::SOC_SIGNATURE_INVALID);
+    assert_eq!(lab.peer_to_robot(&format!("{OTHER}:0"), 9000, b"x"), 0);
+    // The SOC's signed revert, through the protocol, lifts it.
+    let rv = robodr_executor::soc::SocRequest::sign(
+        &SOC_SEED,
+        "lab-robot",
+        SOC_KEY_ID,
+        "POST",
+        "/api/v2/robots/lab-robot/action-requests/p-2/revert",
+        now_s(),
+        &format!("lab-revert-{}-0001", std::process::id()),
+        r#"{"reason":"lab","requested_by":"analyst"}"#,
+    );
     assert_eq!(
-        client.revert("p-2", "lab").unwrap().status,
+        client
+            .revert_signed("p-2", "lab", Some(&rv))
+            .unwrap()
+            .status,
         Status::Reverted
     );
     assert_eq!(lab.peer_to_robot(&format!("{OTHER}:0"), 9000, b"x"), 3);
@@ -1890,8 +1930,10 @@ fn ipv6_interface_and_example_renderings_read_back_exactly() {
             serde_json::from_str(&std::fs::read_to_string(root.join(name)).unwrap()).unwrap();
         let d = lab.state_dir(name);
         v["state_dir"] = json!(d);
-        // The lab SOC's key in place of the example's path.
+        // The lab SOC's key in place of the example's path, and a robot key
+        // (another key: the example's robot key files do not exist here).
         v["soc"]["keys"] = json!([soc_key_path()]);
+        v["soc"]["robot_keys"] = json!([robot_key_path()]);
         v["robot_id"] = json!("lab-robot");
         let c = ExecutorConfig::parse(&v.to_string())
             .unwrap()

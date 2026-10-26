@@ -34,7 +34,10 @@
 //! 9. the target is one executor v1 can act on: a participant by GUID
 //!    prefix for `quarantine_node` (`unsupported_target` for a node name or
 //!    a process);
-//! 10. on a robot that falls when de-energised (humanoid, unspecified) the
+//! 10. with the site option `require_approval_for_all_containment`, every
+//!     containment needs a human's approval on every morphology
+//!     (`needs_approval`); otherwise, on a robot that falls when
+//!     de-energised (humanoid, unspecified) the
 //!     action must be in the policy's `fall_safe_restrict` (`fall_hazard`)
 //!     and approved by a human (`needs_approval`); on a robot that needs
 //!     active balance (quadruped too) a quarantine needs a human
@@ -43,10 +46,13 @@
 //!     the policy lists the target class in `fall_safe_restrict` and the
 //!     entry is not `low_level` (a `low_level` entry is never cut). For a
 //!     quarantine the order must carry the participant's SPDP unicast
-//!     locators (`locators_required`), and each must lie provably outside
+//!     locators (`locators_required`); each must lie provably outside
 //!     every non-cuttable entry: outside its `cidr`; an entry with an
 //!     `interface` and no `cidr` cannot be proven and refuses every
-//!     quarantine (`motion_path`). The non-cuttable entries are frozen into
+//!     quarantine (`motion_path`); and each must be in scope
+//!     (`locator_out_of_scope`, review F4: inside a
+//!     `network.quarantine.cidrs` entry, on one of the robot's DDS ports,
+//!     one address family for all). The non-cuttable entries are frozen into
 //!     the quarantine and rendered as accepts **before** its drops, so a
 //!     quarantine cannot act inside a low-level network even when traffic
 //!     there carries the quarantined GUID prefix;
@@ -117,9 +123,22 @@ pub mod codes {
     /// The approval evidence the contract requires is missing from the
     /// signed body, or a planner order claims a human approval.
     pub const APPROVAL_MISSING: &str = "approval_missing";
+    // --- Review of M1 (F4, F9) ----------------------------------------------
+    /// A quarantine locator outside `network.quarantine` (its CIDRs, the
+    /// robot's DDS ports, one address family), or no quarantinable network
+    /// configured.
+    pub const LOCATOR_OUT_OF_SCOPE: &str = "locator_out_of_scope";
+    /// The SOC key configuration cannot be trusted: a key file unreadable
+    /// or refused, or a SOC key equal to one of the robot's own keys. Every
+    /// control-plane order is refused until it is fixed (integrity first:
+    /// one bad file never silently drops to fewer keys).
+    pub const SOC_KEYS_UNAVAILABLE: &str = "soc_keys_unavailable";
+    /// An action held after a reboot was approved with a SOC key that is no
+    /// longer configured: not re-armed.
+    pub const APPROVAL_KEY_REMOVED: &str = "approval_key_removed";
 
     /// Every code, for mapping a wire string back to a static one.
-    pub const ALL: [&str; 27] = [
+    pub const ALL: [&str; 30] = [
         INVALID_ORDER,
         REPLAY,
         NOT_EXECUTOR_ACTION,
@@ -147,6 +166,9 @@ pub mod codes {
         SOC_REPLAY_STORE_UNAVAILABLE,
         ORDER_MISMATCH,
         APPROVAL_MISSING,
+        LOCATOR_OUT_OF_SCOPE,
+        SOC_KEYS_UNAVAILABLE,
+        APPROVAL_KEY_REMOVED,
     ];
 
     /// The static code for a wire string.
@@ -255,6 +277,52 @@ fn locator_unproven(e: &ProtectedEntry, l: &Locator) -> Option<String> {
         // Not a valid entry (config validation refuses it): never proven.
         (None, None) => Some("the entry names no address".into()),
     }
+}
+
+/// Review finding F4: every locator of a quarantine lies in a configured
+/// quarantinable network (`network.quarantine.cidrs`), on one of the
+/// robot's DDS ports, and all in one address family. A forged SPDP locator
+/// can then at most name a DDS endpoint of a network the site declared
+/// quarantinable, never an arbitrary UDP service (a DNS server, the SOC's
+/// syslog) that the quarantine's locator drops would blackhole.
+fn locators_in_scope(
+    q: &QuarantineSpec,
+    net: &crate::config::NetworkSection,
+) -> Result<(), Refusal> {
+    let scope = &net.quarantine;
+    let refuse = |why: String| {
+        Err(Refusal::new(
+            codes::LOCATOR_OUT_OF_SCOPE,
+            format!("participant {}: {why}; not quarantined", q.guid_prefix),
+        ))
+    };
+    if scope.cidrs.is_empty() {
+        return refuse(
+            "network.quarantine.cidrs is empty: the executor cannot tie any SPDP locator to \
+             a quarantinable participant"
+                .into(),
+        );
+    }
+    let v4 = q.locators.first().is_some_and(|l| l.ip.is_ipv4());
+    if q.locators.iter().any(|l| l.ip.is_ipv4() != v4) {
+        return refuse("its locators mix address families".into());
+    }
+    let ports = scope.ports(&net.discovery);
+    for l in &q.locators {
+        if !scope.cidrs.iter().any(|c| c.contains(l.ip)) {
+            return refuse(format!(
+                "locator {} is outside every network.quarantine.cidrs entry",
+                l.ip
+            ));
+        }
+        if !ports.iter().any(|r| r.contains(l.port)) {
+            return refuse(format!(
+                "locator port {} is not one of the robot's DDS ports",
+                l.port
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// May this protected entry be cut for `target` under `policy`?
@@ -402,6 +470,17 @@ pub fn precheck(
         }
     };
     let morph: Morphology = own;
+    if cfg.config.require_approval_for_all_containment && !order.human_approved {
+        return Err(Refusal::new(
+            codes::NEEDS_APPROVAL,
+            format!(
+                "this site requires a human's approval for every containment \
+                 (require_approval_for_all_containment): {} from the on-robot planner is not \
+                 executed",
+                order.action.as_str()
+            ),
+        ));
+    }
     if morph.falls_when_de_energised() {
         if !policy.fall_safe_restrict.contains(&class) {
             return Err(Refusal::new(
@@ -495,6 +574,9 @@ pub fn precheck(
                     }
                 }
             }
+            // F4: the locators come from SPDP (unauthenticated): they must
+            // be ones a quarantine may act on at all.
+            locators_in_scope(&q, net)?;
             q.protected = keep.into_iter().map(|(_, e)| e.clone()).collect();
             Effect::Quarantine(q)
         }

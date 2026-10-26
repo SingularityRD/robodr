@@ -19,5 +19,6 @@
     ]
   },
   "ttl": {"default_s": 600, "max_s": 3600},
-  "soc": {"keys": ["/etc/robodr/soc/soc.pub"]}
+  "soc": {"keys": ["/etc/robodr/soc/soc.pub"], "robot_keys": ["/etc/robodr/keys/blackbox.pub"]},
+  "require_approval_for_all_containment": true
 }

@@ -345,7 +345,7 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
 | `pending` | accepted, recorded, handed to the executor; read the state again with GET | no |
 | `verified` | the executor applied it and the read-back of its nftables rules matched; it stays in force until revert or TTL (`state.expires_at_ms`) | no |
 | `reverted` | removed again: revert request, TTL expiry, restart reconciliation, or an operator's emergency disable (`nft delete table inet robodr`) | yes |
-| `refused` | the executor's own check refused it; nothing was applied; `state.decision` then reads `refused`. `refusal.code` is one of `not_executor_action` (`safe_pause`, `request_safe_state`, `rollback_config`: never executed), `fall_hazard`, `needs_approval`, `motion_path`, `locators_required` (agentd has not seen the participant's SPDP locators), `no_management_channel`, `unsupported_target` (a `node` target, or a process), `safety_state_changed`, `safety_state_stale`, `safety_state_unavailable` (also: judged or current state `unknown`), `safety_system_engaged`, `morphology_mismatch`, `observe_mode`, `operator_disabled` (an operator removed the executor's table: nothing is executed until it is re-armed on the robot), `config_unavailable`, `already_active`, `ttl_out_of_range`, `replay`, `invalid_order`, `id_conflict`, `evidence_elsewhere`, the trust-boundary codes `soc_signature_invalid`, `soc_request_stale`, `soc_nonce_replayed`, `soc_replay_store_unavailable`, `order_mismatch`, `approval_missing` (below), or `executor_refused` for a code this agentd does not know | yes |
+| `refused` | the executor's own check refused it; nothing was applied; `state.decision` then reads `refused`. `refusal.code` is one of `not_executor_action` (`safe_pause`, `request_safe_state`, `rollback_config`: never executed), `fall_hazard`, `needs_approval`, `motion_path`, `locators_required` (agentd has not seen the participant's SPDP locators), `no_management_channel`, `unsupported_target` (a `node` target, or a process), `safety_state_changed`, `safety_state_stale`, `safety_state_unavailable` (also: judged or current state `unknown`), `safety_system_engaged`, `morphology_mismatch`, `observe_mode`, `operator_disabled` (an operator removed the executor's table: nothing is executed until it is re-armed on the robot), `config_unavailable`, `already_active`, `ttl_out_of_range`, `replay`, `invalid_order`, `id_conflict`, `evidence_elsewhere`, the trust-boundary codes `soc_signature_invalid`, `soc_request_stale`, `soc_nonce_replayed`, `soc_replay_store_unavailable`, `order_mismatch`, `approval_missing`, `soc_keys_unavailable`, `approval_key_removed` (below), `locator_out_of_scope` (a participant locator outside the executor's `network.quarantine` scope), or `executor_refused` for a code this agentd does not know | yes |
 | `failed` | the executor was unreachable, its queue was full, or the apply did not verify and was rolled back (`state.error`); nothing is in force | yes |
 | `recorded_not_executed` | `restrict_motion` (advisory in v1: the executor does not drive the separate motion firewall gateway, `robodr-firewall-gw`) | yes |
 
@@ -373,6 +373,16 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
   | `soc_replay_store_unavailable` | the executor's replay store is full of live pairs or could not record the pair |
   | `order_mismatch` | the signed request is not `POST /api/v2/robots/{robot_id}/action-requests` for this robot, or the order's `request_id`, `action`, `ttl_seconds`, target (`participant_guid` / `node`), key id or `requested_by` differ from the signed body |
   | `approval_missing` | the signed body lacks the approval evidence §4 requires (`authority: "request"`, `requested_by`, `source`, `reason` within its limits), or an order of the on-robot planner claims a human approval |
+  | `soc_keys_unavailable` | the executor's SOC key configuration cannot be trusted: a key file unreadable or refused, or a SOC key equal to one of the robot's own keys (`soc.robot_keys`); every control-plane order is refused until it is fixed |
+  | `approval_key_removed` | (after a robot reboot) the key that approved a held action is no longer configured: it is not re-armed and turns `reverted` |
+
+  The replay fence of a store found missing or damaged at start is the
+  start time **plus** `soc.max_clock_skew_s`: a request signed up to the
+  skew ahead of the clock may have been presented before; the SOC signs
+  again after the fence. A site may set
+  `require_approval_for_all_containment` in `executor.json`: then the
+  on-robot planner's containment orders are refused (`needs_approval`) on
+  every morphology.
 
   Nothing changes for a SOC that follows §2 and §10: the executor checks
   the same signature agentd checks. A SOC request is executed at most
@@ -384,6 +394,20 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
   (`revert_begin` / `revert_commit`, §9) **before** agentd sends it to the
   executor; one that is not recorded is never sent. The other rows of §6
   are unchanged.
+* **Signed reverts (executor review F3).** agentd forwards the SOC's
+  revert request (`POST .../action-requests/{request_id}/revert`) exactly
+  as it was signed, like a submit. The executor lifts an action the SOC
+  approved **only** with it, verified like the submit (its own keys, its
+  own robot id, the timestamp window, its own replay store) plus: the
+  target is the revert of that `request_id`, and the body is the strict
+  revert body (`requested_by` 1..=100 characters, optional `reason` ≤ 500
+  characters, no other field). A revert that fails these checks is
+  refused by the executor: the action stays in force (GET keeps reading
+  `verified`; `state.revert.result` stays `pending`) and the executor
+  records a `refused` event. Nothing changes for a SOC that follows §2:
+  every revert it sends is signed. Unsigned reverts remain only for the
+  on-robot planner's own actions, TTL expiry, restart reconciliation and
+  the operator's `revert-all` on the robot.
 * **Signed and persistent (v2).** Every answer carrying these statuses is
   signed with the finding key (§2, `X-RoboDR-Answer-Signature`) like any
   other answer. Each state the executor reports is journalled (§9,

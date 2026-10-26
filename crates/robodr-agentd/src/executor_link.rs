@@ -47,7 +47,7 @@ use robodr_executor::soc::SocRequest;
 use robodr_responder::{ActionId, Morphology, ResponseAction, RestrictTarget, SafetyState, Step};
 use serde::{Deserialize, Serialize};
 
-use crate::control::api::{AcceptedAction, ActionExecutor, ExecutorOutcome};
+use crate::control::api::{AcceptedAction, ActionExecutor, ExecutorOutcome, Meta};
 
 fn default_socket() -> PathBuf {
     PathBuf::from("/run/robodr-executor/executor.sock")
@@ -176,7 +176,7 @@ pub struct LinkStats {
 
 enum Job {
     Submit(Order),
-    Revert(String, String),
+    Revert(String, String, Option<Box<SocRequest>>),
     /// Ask the executor for the state of requests restored from agentd's
     /// journal (after a restart the link's outcomes are empty).
     Resync(Vec<String>),
@@ -226,8 +226,13 @@ impl Shared {
 pub enum Staged {
     /// Send once the request (or plan) is recorded.
     Submit(Order),
-    /// Send once the revert note is recorded.
-    Revert { id: String, reason: String },
+    /// Send once the revert note is recorded, with the SOC's signed revert
+    /// request (executor review F3).
+    Revert {
+        id: String,
+        reason: String,
+        soc: Option<Box<SocRequest>>,
+    },
     /// `record_evidence`: a black-box mark done by the main loop.
     Evidence(Order),
 }
@@ -296,19 +301,21 @@ impl ExecutorLink {
                             }
                             lock(&sh).put(out);
                         }
-                        Ok(Job::Revert(id, reason)) => match client.revert(&id, &reason) {
-                            Ok(out) => lock(&sh).put(out),
-                            Err(e) => {
-                                let mut g = lock(&sh);
-                                g.stats.unreachable += 1;
-                                g.stats.revert_failures += 1;
-                                // The executor still holds it (or its TTL
-                                // will lift it): report, keep watching.
-                                if let Some(o) = g.outcomes.get_mut(&id) {
-                                    o.error = Some(format!("revert not delivered: {e}"));
+                        Ok(Job::Revert(id, reason, soc)) => {
+                            match client.revert_signed(&id, &reason, soc.as_deref()) {
+                                Ok(out) => lock(&sh).put(out),
+                                Err(e) => {
+                                    let mut g = lock(&sh);
+                                    g.stats.unreachable += 1;
+                                    g.stats.revert_failures += 1;
+                                    // The executor still holds it (or its TTL
+                                    // will lift it): report, keep watching.
+                                    if let Some(o) = g.outcomes.get_mut(&id) {
+                                        o.error = Some(format!("revert not delivered: {e}"));
+                                    }
                                 }
                             }
-                        },
+                        }
                         Ok(Job::Resync(ids)) => {
                             for id in ids {
                                 if st.load(Ordering::SeqCst) {
@@ -419,7 +426,7 @@ impl ExecutorLink {
                 let id = o.id.clone();
                 (Job::Submit(o), id)
             }
-            Staged::Revert { id, reason } => (Job::Revert(id.clone(), reason), id),
+            Staged::Revert { id, reason, soc } => (Job::Revert(id.clone(), reason, soc), id),
             Staged::Evidence(_) => return,
         };
         let mut g = lock(&self.shared);
@@ -567,15 +574,21 @@ pub fn order_for(a: &AcceptedAction<'_>, own: Morphology, now_ms: u64) -> Order 
         // above is only a claim; the executor accepts it only when this
         // request verifies with its own copy of the SOC keys and matches
         // the order.
-        soc: Some(Box::new(SocRequest {
-            method: a.meta.method.clone(),
-            target: a.meta.target.clone(),
-            key_id: a.meta.key_id.clone(),
-            timestamp: a.meta.timestamp,
-            nonce: a.meta.nonce.clone(),
-            signature: a.meta.signature.clone(),
-            body: a.meta.body.clone(),
-        })),
+        soc: Some(Box::new(soc_request(a.meta))),
+    }
+}
+
+/// The SOC's request exactly as it was signed and received (forwarded to
+/// the executor, which verifies it with its own keys).
+pub fn soc_request(meta: &Meta) -> SocRequest {
+    SocRequest {
+        method: meta.method.clone(),
+        target: meta.target.clone(),
+        key_id: meta.key_id.clone(),
+        timestamp: meta.timestamp,
+        nonce: meta.nonce.clone(),
+        signature: meta.signature.clone(),
+        body: meta.body.clone(),
     }
 }
 
@@ -599,10 +612,11 @@ impl ActionExecutor for ControlExecutor {
         ExecutorOutcome::Pending
     }
 
-    fn revert(&mut self, request_id: &str, reason: &str) -> Option<ExecutorOutcome> {
+    fn revert(&mut self, request_id: &str, reason: &str, signed: &Meta) -> Option<ExecutorOutcome> {
         lock(&self.staged).push(Staged::Revert {
             id: request_id.to_string(),
             reason: reason.to_string(),
+            soc: Some(Box::new(soc_request(signed))),
         });
         Some(ExecutorOutcome::Pending)
     }

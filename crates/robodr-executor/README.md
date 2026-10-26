@@ -57,7 +57,14 @@ revert / TTL expiry ── journal (reverting) ── re-render without it ─�
      it. A matching GUID prefix refuses too. **A quarantine cannot act
      inside a low-level network**: the entries it may not cut are rendered
      as accepts before its drops, so traffic there passes even when it
-     carries the quarantined GUID prefix (GUIDs change on restart and can
+     carries the quarantined GUID prefix. **Every locator must also be in
+     scope** (review F4; `locator_out_of_scope`): inside a
+     `network.quarantine.cidrs` entry (none configured: no quarantine at
+     all), on one of the robot's DDS ports (`network.quarantine.udp_ports`,
+     default the RTPS port ranges of `network.discovery.domains`), all of
+     one address family. The locators are SPDP claims nobody signed; this
+     bounds what a forged one can name to a DDS endpoint of a network the
+     site declared quarantinable (GUIDs change on restart and can
      be forged).
    * Isolation needs a configured management channel.
    * The TTL must be within `1..=ttl.max_s`.
@@ -88,7 +95,9 @@ revert / TTL expiry ── journal (reverting) ── re-render without it ─�
    (re-rendered without it) and reported `failed`.
 6. **Commit.** The action becomes `active` with a persisted deadline
    (`applied + ttl`).
-7. **Revert** on request, at TTL expiry, or by `revert-all`. The action is
+7. **Revert** on request, at TTL expiry, or by `revert-all`. A requested
+   revert of an action the SOC approved needs the SOC's own signed revert
+   request (review F3, "Trust boundary"). The action is
    written as `reverting`, the table is re-rendered without it and read
    back, and the action is removed. Reverting an action that is already
    finished answers its final state. A revert that does not verify is
@@ -235,9 +244,46 @@ the executor's user, not group/other-writable, public Ed25519 only,
 | the approval evidence the contract requires is in the signed body: `authority: "request"`, `requested_by` (1..=100 characters), `source` (`[a-z0-9_-]{1,32}`), `reason` (≤ 500 characters) | `approval_missing` |
 
 A replay store that is missing while the executor's journal exists, or
-unreadable, **fences**: every request signed at or before that start is
-refused (`soc_request_stale`); the SOC signs again. The event log records
-it (`reconciled`, detail "SOC replay store untrusted").
+unreadable, **fences**: every request signed at or before that start
+**plus `soc.max_clock_skew_s`** is refused (`soc_request_stale`; review F8:
+a request signed up to the skew ahead of the clock was inside the window
+before the start and may have been presented to the lost store); the SOC
+signs again after the fence. The event log records it (`reconciled`,
+detail "SOC replay store untrusted"). The same fence applies to agentd's
+own `ReplayGuard` (fixed there separately).
+
+**Reverts** (review F3). An action the SOC approved (control-plane origin)
+is lifted on request **only with the SOC's signed revert request**:
+agentd forwards the SOC's `POST /api/v2/robots/<robot>/action-requests/
+<id>/revert` exactly as signed (`Msg::Revert.soc`), and the executor
+checks it like a submit (configured key, signature for its own robot id,
+timestamp window, the same replay store) plus: the target is the revert
+of **this** action, and the body is the contract's strict revert body
+(`requested_by` 1..=100 characters, optional `reason` ≤ 500; unknown
+fields refuse). A refused revert leaves the action in force and answers
+its status with the refusal (`soc_signature_invalid`, `soc_request_stale`,
+`soc_nonce_replayed`, `order_mismatch`, `approval_missing`); the journal
+records a `refused` event for it. **Without a signature** the executor
+still reverts: planner actions (nobody approved them), TTL expiry,
+restart reconciliation (and a held action the re-validation refuses), and
+the operator's `robodr-executor revert-all` (root, on the host).
+
+**Keys** (review F9). `soc.robot_keys[]` names the robot's **own** public
+keys (its black-box and finding signing keys, agentd's public key files,
+read only): a SOC key equal to one of them is refused, so whoever holds
+the robot's key cannot approve containment. One key file that cannot be
+read or is refused (permissions, owner, secret material, device binding)
+refuses **every** control-plane order with `soc_keys_unavailable` rather
+than dropping to the other keys (integrity first: a silently shorter key
+list changes who can approve; the start log and `check` say which file).
+An action held after a reboot is re-armed only while the SOC key that
+approved it is still configured (`approval_key_removed` otherwise:
+reverted).
+
+**Site option** `require_approval_for_all_containment` (default `false`;
+`true` in the G1 example): every containment needs the SOC's approval on
+every morphology, so on-robot planner orders are refused
+(`needs_approval`) even where the morphology rules would allow them.
 
 **Planner orders** (no SOC request) can never claim an approval
 (`approval_missing` when one does), so they stay limited to what the
@@ -258,11 +304,14 @@ or delay to forward an order (denial of service), and lie about what only
 agentd knows: the safety state and the operational context the request
 was judged in (the executor has no safety feed; it re-checks agentd's live
 state immediately before apply), and the participant's locators (re-checked
-against the motion control path; a wrong locator can only make a
-quarantine miss or refuse). It **cannot** obtain an action no SOC key
-holder approved, change what was approved (action, target, TTL), use an
-approval twice, use one signed for another robot, or turn a planner order
-into an approved one. Everything stays bounded by the executor's own rules
+against the motion control path and the configured quarantine scope: a
+wrong locator can only make a quarantine miss, refuse, or drop a DDS
+endpoint inside `network.quarantine.cidrs`). It **cannot** obtain an
+action no SOC key holder approved, change what was approved (action,
+target, TTL), use an approval twice, use one signed for another robot,
+turn a planner order into an approved one, or lift an action the SOC
+approved without the SOC's signed revert (F3). It can still let a TTL run
+out (it cannot shorten one) and run the planner's own actions. Everything stays bounded by the executor's own rules
 (reversible, TTL-bounded network restrictions; never a `low_level` entry;
 never an action that may de-energise; never while the safety system is
 engaged).
@@ -354,9 +403,16 @@ drops entries early. Only members of group `robodr` can connect.
 and `src/config.rs` for every field and its limits. agentd's side is the
 `executor` section of `agentd.json` (`crates/robodr-agentd/src/executor_link.rs`).
 
-* `soc.keys[]` (SOC public key files) and `soc.max_clock_skew_s`
-  (default 30, 1..=300): see "Trust boundary". Without keys every
-  control-plane order is refused.
+* `soc.keys[]` (SOC public key files), `soc.max_clock_skew_s`
+  (default 30, 1..=300) and `soc.robot_keys[]` (the robot's own public
+  keys, never accepted as SOC keys): see "Trust boundary". Without keys
+  every control-plane order is refused; one bad key file refuses them all
+  (`soc_keys_unavailable`).
+* `network.quarantine` (`cidrs`, `udp_ports`): where a quarantine may act
+  (review F4). `cidrs` may not be `/0` nor overlap a management / uplink
+  entry; empty refuses every quarantine.
+* `require_approval_for_all_containment` (default `false`): see "Trust
+  boundary".
 * `network.motion_control_path[]` entries need `cidr` and/or `interface`;
   `guid_prefix` and `udp_ports` only narrow them.
 * `network.discovery` (default `{"multicast_groups": ["239.255.0.1"],
@@ -405,7 +461,20 @@ and `src/config.rs` for every field and its limits. agentd's side is the
     approval; planner orders never on a balancing robot; a matching order
     applied; a SOC request replayed under another id, and after a restart
     with the journal lost; a removed or corrupt replay store fences; no
-    SOC key, a group-writable or secret key file.
+    SOC key, a group-writable or secret key file;
+  * review of M1 (each test written first and seen failing): F3 an
+    unsigned revert of a SOC-approved action refused over the real socket,
+    reverts signed for another action / as a submit / by another key /
+    with a non-strict body refused, the signed revert lifts it, the same
+    revert replayed on another action refused, a planner action reverted
+    unsigned; F4 locators outside `network.quarantine` (not a DDS port,
+    outside the CIDRs, mixed families, no scope configured); F8 the fence
+    covers the skew window; F9 a SOC key equal to a robot key, re-arm after
+    the approving key was removed, one bad key file
+    (`soc_keys_unavailable`); the `require_approval_for_all_containment`
+    option. Over real nftables the protocol test also checks that an
+    unsigned revert leaves the isolation in force and the signed one
+    restores traffic.
 * **Real nftables in network namespaces** (`tests/netns.rs`, needs root,
   `ip` and `nft`). These send real UDP between veth peers:
   * Isolation blocks another host in both directions and keeps

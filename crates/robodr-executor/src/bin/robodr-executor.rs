@@ -264,12 +264,16 @@ fn main() -> ExitCode {
     // Trust boundary M1: the SOC keys the executor verifies approvals with
     // (re-read before every order; a start never fails on them, reverts and
     // TTL expiry must keep working).
-    let soc_keys = robodr_executor::soc::load_keys(&cfg.config.soc.keys, &cfg.config.robot_id);
+    let soc_keys = robodr_executor::soc::load_keys_checked(
+        &cfg.config.soc.keys,
+        &cfg.config.soc.robot_keys,
+        &cfg.config.robot_id,
+    );
     match &soc_keys {
         Err(e) => {
             eprintln!(
                 "robodr-executor: soc.keys: {e}: every control-plane order is refused \
-                 (config_unavailable)"
+                 (soc_keys_unavailable)"
             );
             if a.check {
                 return ExitCode::from(2);

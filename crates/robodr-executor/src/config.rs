@@ -27,9 +27,18 @@
 //!     "discovery": {"multicast_groups": ["239.255.0.1"], "domains": [0]}
 //!   },
 //!   "ttl": {"default_s": 900, "max_s": 86400},
-//!   "soc": {"keys": ["/etc/robodr/soc/soc.pub"], "max_clock_skew_s": 30}
+//!   "soc": {"keys": ["/etc/robodr/soc/soc.pub"], "max_clock_skew_s": 30,
+//!           "robot_keys": ["/etc/robodr/keys/blackbox.pub"]},
+//!   "require_approval_for_all_containment": false
 //! }
 //! ```
+//!
+//! `network.quarantine` (review finding F4): the participant's locators an
+//! order carries come from SPDP (unauthenticated), so a quarantine drops
+//! UDP only to / from locators inside `cidrs` (the networks where DDS
+//! participants that may be quarantined live; empty: no quarantine at all)
+//! and on the robot's DDS ports (`udp_ports`, default the RTPS port ranges
+//! of `network.discovery.domains`), all of one address family.
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -114,6 +123,12 @@ pub struct ExecutorConfig {
     /// order is refused (`soc_signature_invalid`).
     #[serde(default)]
     pub soc: SocSection,
+    /// Site option: every containment (`isolate_network`,
+    /// `quarantine_node`) needs a human's (SOC-signed) approval, on every
+    /// morphology: on-robot planner orders are refused (`needs_approval`).
+    /// Default `false` (the morphology rules decide).
+    #[serde(default)]
+    pub require_approval_for_all_containment: bool,
 }
 
 fn default_soc_skew_s() -> u64 {
@@ -133,6 +148,12 @@ pub struct SocSection {
     /// host's clock (s, 1..=300; default 30, as agentd's).
     #[serde(default = "default_soc_skew_s")]
     pub max_clock_skew_s: u64,
+    /// The robot's **own** public keys (its black-box / finding signing
+    /// keys: agentd's public key files, read only). A SOC key equal to one
+    /// of them is refused (review finding F9 a): whoever holds the robot's
+    /// key must not be able to approve containment.
+    #[serde(default)]
+    pub robot_keys: Vec<PathBuf>,
 }
 
 impl Default for SocSection {
@@ -140,6 +161,7 @@ impl Default for SocSection {
         Self {
             keys: Vec::new(),
             max_clock_skew_s: default_soc_skew_s(),
+            robot_keys: Vec::new(),
         }
     }
 }
@@ -186,6 +208,42 @@ pub struct NetworkSection {
     /// multicast, IGMP, and SPDP from the protected networks).
     #[serde(default)]
     pub discovery: Discovery,
+    /// Where a quarantine may act (module docs, F4).
+    #[serde(default)]
+    pub quarantine: QuarantineScope,
+}
+
+/// The locators a quarantine may drop (review finding F4).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuarantineScope {
+    /// Networks of participants that may be quarantined (no `/0`, none
+    /// overlapping a management or uplink entry). Empty (default): every
+    /// quarantine is refused (`locator_out_of_scope`).
+    #[serde(default)]
+    pub cidrs: Vec<IpNet>,
+    /// The robot's DDS UDP ports; empty (default): the RTPS port ranges
+    /// (`7400 + 250 d ..= +249`) of `network.discovery.domains`.
+    #[serde(default)]
+    pub udp_ports: Vec<PortRange>,
+}
+
+impl QuarantineScope {
+    /// The DDS port ranges a quarantined locator must lie in.
+    pub fn ports(&self, discovery: &Discovery) -> Vec<PortRange> {
+        if !self.udp_ports.is_empty() {
+            return self.udp_ports.clone();
+        }
+        discovery
+            .domains
+            .iter()
+            .filter(|d| **d <= MAX_DOMAIN)
+            .filter_map(|d| {
+                let lo = 7400 + 250 * d;
+                PortRange::new(lo, lo + 249).ok()
+            })
+            .collect()
+    }
 }
 
 /// The robot's DDS discovery: what stays open while it is isolated, so the
@@ -421,6 +479,31 @@ impl ExecutorConfig {
             e.validate(&format!("network.motion_control_path[{i}]"))?;
         }
         n.discovery.validate()?;
+        if n.quarantine.cidrs.len() > MAX_ENTRIES || n.quarantine.udp_ports.len() > MAX_ENTRIES {
+            return Err(format!(
+                "network.quarantine: more than {MAX_ENTRIES} cidrs or port ranges"
+            ));
+        }
+        for (i, c) in n.quarantine.cidrs.iter().enumerate() {
+            if c.len == 0 {
+                return Err(format!(
+                    "network.quarantine.cidrs[{i}]: a /0 prefix would let a forged locator \
+                     blackhole any endpoint"
+                ));
+            }
+            let kept = n
+                .management
+                .iter()
+                .chain(&n.uplink)
+                .filter_map(|e| e.cidr)
+                .find(|m| m.overlaps(c));
+            if let Some(m) = kept {
+                return Err(format!(
+                    "network.quarantine.cidrs[{i}] ({c}) overlaps the management / uplink \
+                     entry {m}: a quarantine must never cut the SOC's path"
+                ));
+            }
+        }
         let t = &self.ttl;
         if t.max_s == 0 || t.max_s > MAX_TTL_S {
             return Err(format!("ttl.max_s must be 1..={MAX_TTL_S}"));
@@ -442,6 +525,15 @@ impl ExecutorConfig {
         }
         for k in &self.soc.keys {
             absolute("soc.keys[]", k)?;
+        }
+        if self.soc.robot_keys.len() > crate::soc::MAX_SOC_KEYS {
+            return Err(format!(
+                "soc.robot_keys: at most {} keys",
+                crate::soc::MAX_SOC_KEYS
+            ));
+        }
+        for k in &self.soc.robot_keys {
+            absolute("soc.robot_keys[]", k)?;
         }
         if !(1..=300).contains(&self.soc.max_clock_skew_s) {
             return Err("soc.max_clock_skew_s must be 1..=300".into());
