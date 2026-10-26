@@ -631,8 +631,9 @@ request.
 - **Control plane: tested locally only.** mTLS, signatures, the journal
   and the evidence API were exercised with an in-process client and an
   OpenSSL test PKI over loopback, not against a deployed SOC or across a
-  real network. TLS material is read at start (rotation = restart); there
-  is no CRL / OCSP for SOC certificates. The journal is checksummed, not
+  real network. TLS material is read at start (rotation = restart); SOC
+  certificate revocation is by CRL file only (`tls.client_crl`, no OCSP,
+  `nextUpdate` not enforced). The journal is checksummed, not
   signed (the black box is the signed record). The replay window needs NTP
   on robot and SOC. The `control_plane_request` fuzz target has run under
   the std-only smoke driver (about 90 000 inputs), not under libFuzzer.
