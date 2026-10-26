@@ -440,6 +440,15 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Changed
 
+- S10 hardening (R8): `robodr-blackbox::crypto` and `robodr-ocsf::hash` now
+  use the audited RustCrypto `sha2` / `hmac` crates (plus `subtle` for the
+  tag compare and `zeroize` for wiping) instead of the in-crate SHA-256 and
+  HMAC-SHA256. Output is byte-identical: differential tests against the old
+  code (kept as test-only oracles) over random inputs, keys and splits, plus
+  NIST CAVP / RFC 4231 / OpenSSL-computed vectors; existing chains, HMAC
+  tags and finding uids verify unchanged. murmur2 (Kafka partitioner) stays
+  in-crate.
+
 - `robodr.ingest` contract v1 draft clarified while implementing the
   producer (no change to a valid request): error codes for every status,
   `400` for malformed / missing headers and an empty body, `409
