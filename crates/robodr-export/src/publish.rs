@@ -67,16 +67,15 @@
 //! For a spool source the commit is the rename `ready/ → acked/` of the
 //! chunk's files (dead-lettered ones go to `<spool>/rejected/`).
 
+use crate::deadletter::DeadLetters;
 use crate::fsutil::{self, ReadError};
 use crate::kafka::{Outcome, ProduceError, ProduceRecord, Producer};
 use robodr_agentd::spool::SpoolRecord;
 use robodr_ocsf::{DEFAULT_DATA_SOURCE, DEFAULT_TOPIC};
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
@@ -283,18 +282,6 @@ impl Progress {
     }
 }
 
-/// 128-bit key of a dead-letter entry: `(source, position)`.
-pub(crate) fn dead_key(source: &str, pos: u64) -> u128 {
-    let h = |salt: u8| {
-        let mut st = DefaultHasher::new();
-        salt.hash(&mut st);
-        source.hash(&mut st);
-        pos.hash(&mut st);
-        st.finish()
-    };
-    (u128::from(h(1)) << 64) | u128::from(h(2))
-}
-
 /// What one run did.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
 pub struct PublishReport {
@@ -310,6 +297,9 @@ pub struct PublishReport {
     pub resumed_after: u64,
     /// Unsigned contract 1.x records upgraded to contract 2.0 and sent.
     pub legacy_upgraded: u64,
+    /// Malformed lines found in the dead-letter file when it was loaded in
+    /// this run (torn fragments, edits; [`crate::deadletter`]).
+    pub dead_letter_malformed: u64,
 }
 
 /// One input record, as the importer writes it (and as agentd spools it).
@@ -655,9 +645,9 @@ pub struct Publisher<S: Sink> {
     sink: S,
     progress: Progress,
     chunks_sent: u64,
-    /// `(source, position)` keys already in the dead-letter file; loaded on
-    /// the first dead letter.
-    dead_seen: Option<HashSet<u128>>,
+    /// The dead-letter file (dedup set loaded on the first dead letter).
+    dead: DeadLetters,
+    dead_loaded: bool,
 }
 
 pub(crate) fn valid_batch_name(n: &str) -> bool {
@@ -715,12 +705,14 @@ impl<S: Sink> Publisher<S> {
             Err(ReadError::Missing) => Progress::empty(),
             Err(e) => return Err(PublishError::State(format!("{}: {e}", path.display()))),
         };
+        let dead = DeadLetters::new(&cfg.state_dir, DEAD_LETTER_FILE, None);
         Ok(Self {
             cfg,
             sink,
             progress,
             chunks_sent: 0,
-            dead_seen: None,
+            dead,
+            dead_loaded: false,
         })
     }
 
@@ -743,29 +735,6 @@ impl<S: Sink> Publisher<S> {
         Ok(())
     }
 
-    /// Keys of the entries already in the dead-letter file (unparsable
-    /// lines are ignored).
-    fn load_dead_keys(&self) -> Result<HashSet<u128>, PublishError> {
-        #[derive(Deserialize)]
-        struct Key {
-            source: String,
-            position: u64,
-        }
-        let mut seen = HashSet::new();
-        let path = self.cfg.state_dir.join(DEAD_LETTER_FILE);
-        let f = match fs::File::open(&path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(seen),
-            Err(e) => return Err(e.into()),
-        };
-        for line in BufReader::new(f).split(b'\n') {
-            if let Ok(k) = serde_json::from_slice::<Key>(&line?) {
-                seen.insert(dead_key(&k.source, k.position));
-            }
-        }
-        Ok(seen)
-    }
-
     fn dead_letter(
         &mut self,
         context: &str,
@@ -774,15 +743,16 @@ impl<S: Sink> Publisher<S> {
         raw: &[u8],
         report: &mut PublishReport,
     ) -> Result<(), PublishError> {
-        if self.dead_seen.is_none() {
-            self.dead_seen = Some(self.load_dead_keys()?);
+        if !self.dead_loaded {
+            // Reported once per process, by the run that loads the file.
+            report.dead_letter_malformed = self.dead.stats()?.malformed;
+            self.dead_loaded = true;
         }
-        let key = dead_key(context, pos);
         // Counted either way: the earlier append's count was never saved
         // (its chunk's progress was lost, or we would not be here again).
         self.progress.dead_lettered_total += 1;
         report.dead_lettered += 1;
-        if self.dead_seen.as_ref().is_some_and(|s| s.contains(&key)) {
+        if self.dead.contains(context, pos)? {
             return Ok(());
         }
         let raw = String::from_utf8_lossy(&raw[..raw.len().min(self.cfg.max_record_bytes)]);
@@ -795,10 +765,7 @@ impl<S: Sink> Publisher<S> {
         }))
         .map_err(|e| PublishError::State(e.to_string()))?;
         line.push(b'\n');
-        fsutil::append_durable(&self.cfg.state_dir.join(DEAD_LETTER_FILE), &line)?;
-        if let Some(s) = self.dead_seen.as_mut() {
-            s.insert(key);
-        }
+        self.dead.append(context, pos, &line)?;
         Ok(())
     }
 
@@ -1088,12 +1055,5 @@ mod tests {
         }
         huge.push_str(r#"},"published_total":0,"dead_lettered_total":0}"#);
         assert!(Progress::parse(huge.as_bytes()).is_err());
-    }
-
-    #[test]
-    fn dead_keys_distinguish_source_and_position() {
-        assert_eq!(dead_key("a", 1), dead_key("a", 1));
-        assert_ne!(dead_key("a", 1), dead_key("a", 2));
-        assert_ne!(dead_key("a", 1), dead_key("b", 1));
     }
 }

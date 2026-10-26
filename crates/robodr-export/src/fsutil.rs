@@ -122,15 +122,69 @@ fn libc_o_nofollow() -> i32 {
     }
 }
 
-/// Append `line` (which must end in `\n`) to `path` and fsync it.
+/// Append one line (exactly one LF, at its end) to `path` and fsync it.
+///
+/// Torn lines never merge with the next one: if the file does not end in
+/// LF (a crash, or a write that failed half-way, left a fragment), an LF is
+/// written first, so the fragment stays a malformed line of its own (loaders
+/// count it, see [`crate::deadletter`]) and the new line is intact. A write
+/// that fails is truncated back to the previous length (best effort; the LF
+/// check covers the case where that fails too). When the call creates the
+/// file, the parent directory is fsynced so the new entry survives a crash.
 pub fn append_durable(path: &Path, line: &[u8]) -> io::Result<()> {
-    let mut f = OpenOptions::new()
+    use std::os::unix::fs::FileExt;
+    if line.last() != Some(&b'\n') || line.len() < 2 || line[..line.len() - 1].contains(&b'\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "append_durable: exactly one non-empty LF-terminated line",
+        ));
+    }
+    let (mut f, created) = match OpenOptions::new()
         .append(true)
-        .create(true)
+        .create_new(true)
         .mode(0o600)
-        .open(path)?;
-    f.write_all(line)?;
-    f.sync_all()
+        .custom_flags(libc_o_nofollow())
+        .open(path)
+    {
+        Ok(f) => (f, true),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (
+            OpenOptions::new()
+                .append(true)
+                .read(true)
+                .custom_flags(libc_o_nofollow())
+                .open(path)?,
+            false,
+        ),
+        Err(e) => return Err(e),
+    };
+    let meta = f.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    let len = meta.len();
+    let mut buf = Vec::with_capacity(line.len() + 1);
+    if len > 0 {
+        let mut last = [0u8; 1];
+        f.read_exact_at(&mut last, len - 1)?;
+        if last[0] != b'\n' {
+            buf.push(b'\n');
+        }
+    }
+    buf.extend_from_slice(line);
+    if let Err(e) = f.write_all(&buf).and_then(|()| f.sync_all()) {
+        // Do not leave a fragment for the next append to find.
+        if f.set_len(len).is_ok() {
+            let _ = f.sync_all();
+        }
+        return Err(e);
+    }
+    if created {
+        fsync_dir(parent(path))?;
+    }
+    Ok(())
 }
 
 /// Create (mode 0700) a directory and its parents.
@@ -180,6 +234,28 @@ mod tests {
         append_durable(&d.join("log"), b"a\n").unwrap();
         append_durable(&d.join("log"), b"b\n").unwrap();
         assert_eq!(fs::read(d.join("log")).unwrap(), b"a\nb\n");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A torn last line (a crash or a failed write left bytes without their
+    /// LF) is closed before the next append, so the next line stays a line
+    /// of its own instead of being merged into the fragment.
+    #[test]
+    fn append_after_a_torn_line_starts_a_new_line() {
+        let d = std::env::temp_dir().join(format!("robodr-export-torn-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        mkdir(&d).unwrap();
+        let p = d.join("log");
+        fs::write(&p, b"{\"a\":1}\n{\"torn\":").unwrap();
+        append_durable(&p, b"{\"b\":2}\n").unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"{\"a\":1}\n{\"torn\":\n{\"b\":2}\n");
+        // Already terminated: nothing added.
+        append_durable(&p, b"{\"c\":3}\n").unwrap();
+        assert!(fs::read(&p).unwrap().ends_with(b"{\"b\":2}\n{\"c\":3}\n"));
+        // A line must be exactly one LF-terminated line.
+        for bad in [&b""[..], b"x", b"a\nb\n", b"\n"] {
+            assert!(append_durable(&p, bad).is_err(), "{bad:?}");
+        }
         let _ = fs::remove_dir_all(&d);
     }
 }

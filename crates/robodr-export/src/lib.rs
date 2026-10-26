@@ -34,6 +34,7 @@
 //! `event-uid`.
 
 pub mod crc32c;
+pub mod deadletter;
 mod fsutil;
 pub mod kafka;
 pub mod publish;

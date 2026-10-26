@@ -64,10 +64,11 @@
 pub mod http;
 pub mod wire;
 
+use crate::deadletter::DeadLetters;
 use crate::fsutil::{self, ReadError};
 use crate::publish::{
-    check_record, dead_key, list_diode_batches, list_ready, read_spool_item, LineReader,
-    OpenRecordsError, Source, MAX_IN_FLIGHT,
+    check_record, list_diode_batches, list_ready, read_spool_item, LineReader, OpenRecordsError,
+    Source, MAX_IN_FLIGHT,
 };
 use http::{HttpRequest, Transport};
 use robodr_blackbox::crypto::{sha256, to_hex};
@@ -77,7 +78,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs;
-use std::io::{self, BufRead, BufReader};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use wire::{IngestResponse, RejectedLine};
@@ -427,6 +428,9 @@ pub struct UplinkReport {
     pub pending_dropped: u64,
     /// Diode batches finished in this run.
     pub batches_done: Vec<String>,
+    /// Malformed lines found in the dead-letter files when they were loaded
+    /// in this run (torn fragments, edits; [`crate::deadletter`]).
+    pub dead_letter_malformed: u64,
 }
 
 impl UplinkReport {
@@ -539,7 +543,9 @@ pub struct Uplink<T: Transport> {
     key: Ed25519SigningKey,
     key_id: String,
     state: UplinkState,
-    dead_seen: Option<HashSet<u128>>,
+    dead: DeadLetters,
+    dead_loaded: bool,
+    dead_malformed_unreported: u64,
     max_lines_now: usize,
     clock: Box<dyn FnMut() -> u64 + Send>,
     sleeper: Box<dyn FnMut(Duration) + Send>,
@@ -641,13 +647,16 @@ impl<T: Transport> Uplink<T> {
             }
         }
         let max_lines_now = cfg.max_lines;
+        let dead = DeadLetters::new(&cfg.state_dir, DEAD_LETTER_FILE, None);
         Ok(Self {
             cfg,
             transport,
             key,
             key_id,
             state,
-            dead_seen: None,
+            dead,
+            dead_loaded: false,
+            dead_malformed_unreported: 0,
             max_lines_now,
             clock: Box::new(fsutil::now_ms),
             sleeper: Box::new(std::thread::sleep),
@@ -712,27 +721,6 @@ impl<T: Transport> Uplink<T> {
         Ok(())
     }
 
-    fn load_dead_keys(&self) -> Result<HashSet<u128>, UplinkError> {
-        #[derive(Deserialize)]
-        struct Key {
-            source: String,
-            position: u64,
-        }
-        let mut seen = HashSet::new();
-        let path = self.cfg.state_dir.join(DEAD_LETTER_FILE);
-        let f = match fs::File::open(&path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(seen),
-            Err(e) => return Err(e.into()),
-        };
-        for line in BufReader::new(f).split(b'\n') {
-            if let Ok(k) = serde_json::from_slice::<Key>(&line?) {
-                seen.insert(dead_key(&k.source, k.position));
-            }
-        }
-        Ok(seen)
-    }
-
     /// Append a dead letter (deduplicated on `(context, pos)`).
     fn dead_letter(
         &mut self,
@@ -743,12 +731,22 @@ impl<T: Transport> Uplink<T> {
         batch_id: Option<&str>,
         raw: &[u8],
     ) -> Result<(), UplinkError> {
-        if self.dead_seen.is_none() {
-            self.dead_seen = Some(self.load_dead_keys()?);
+        if !self.dead_loaded {
+            let st = self.dead.stats()?;
+            self.dead_loaded = true;
+            if st.malformed > 0 {
+                // Reported by the run that loaded the file (run_once).
+                self.dead_malformed_unreported = st.malformed;
+                (self.log)(&format!(
+                    "{}: {} malformed line(s) (torn by a crash, or edited); their records \
+                     cannot be deduplicated and may be dead-lettered again",
+                    self.dead.path().display(),
+                    st.malformed
+                ));
+            }
         }
-        let key = dead_key(context, pos);
         self.state.dead_lettered_total += 1;
-        if self.dead_seen.as_ref().is_some_and(|s| s.contains(&key)) {
+        if self.dead.contains(context, pos)? {
             return Ok(());
         }
         let raw = String::from_utf8_lossy(&raw[..raw.len().min(self.cfg.max_record_bytes)]);
@@ -763,10 +761,7 @@ impl<T: Transport> Uplink<T> {
         }))
         .map_err(|e| UplinkError::State(e.to_string()))?;
         line.push(b'\n');
-        fsutil::append_durable(&self.cfg.state_dir.join(DEAD_LETTER_FILE), &line)?;
-        if let Some(s) = self.dead_seen.as_mut() {
-            s.insert(key);
-        }
+        self.dead.append(context, pos, &line)?;
         Ok(())
     }
 
@@ -1212,12 +1207,18 @@ impl<T: Transport> Uplink<T> {
     /// Deliver everything currently available.
     pub fn run_once(&mut self) -> Result<UplinkReport, UplinkError> {
         let mut report = UplinkReport::default();
-        self.resume(&mut report)?;
+        let r = self.run_inner(&mut report);
+        report.dead_letter_malformed = std::mem::take(&mut self.dead_malformed_unreported);
+        r.map(|()| report)
+    }
+
+    fn run_inner(&mut self, report: &mut UplinkReport) -> Result<(), UplinkError> {
+        self.resume(report)?;
         match self.cfg.source.clone() {
-            Source::DiodeOut(out) => self.run_diode(&out, &mut report)?,
-            Source::Spool(root) => self.run_spool(&root, &mut report)?,
+            Source::DiodeOut(out) => self.run_diode(&out, report)?,
+            Source::Spool(root) => self.run_spool(&root, report)?,
         }
-        Ok(report)
+        Ok(())
     }
 
     fn run_diode(&mut self, out: &Path, report: &mut UplinkReport) -> Result<(), UplinkError> {

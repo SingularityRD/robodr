@@ -801,3 +801,44 @@ fn sender_key_file_loading() {
         .unwrap();
     assert!(robodr_export::uplink::load_sender_key(&hmac).is_err());
 }
+
+/// A dead-letter file whose last line was torn by a crash: the fragment is
+/// counted (report + log), the next entry is appended as a line of its own
+/// and is found again when the file is reloaded (it used to be merged into
+/// the fragment and silently skipped by the loader, so dedup lost it).
+#[test]
+fn torn_dead_letter_line_is_counted_and_does_not_hide_the_next_entry() {
+    let r = Rig::new("torn-dl", Role::Uplink);
+    fs::create_dir_all(&r.state).unwrap();
+    fs::write(
+        r.state.join("dead-letter.jsonl"),
+        b"{\"source\":\"x\",\"position\":1}\n{\"source\":\"x\",\"pos",
+    )
+    .unwrap();
+    r.spool(OTHER_ROBOT, 0, 1, false); // rejected: robot_mismatch
+    let mut cfg = r.spool_cfg();
+    cfg.fail_point = Some(FailPoint::AfterResultSaved);
+    assert!(matches!(
+        r.uplink(cfg).run_once(),
+        Err(UplinkError::Injected)
+    ));
+    let rep = r.uplink(r.spool_cfg()).run_once().unwrap();
+    assert_eq!(rep.resumed, 1);
+    assert_eq!(rep.dead_letter_malformed, 1, "{rep:?}");
+    let text = fs::read_to_string(r.state.join("dead-letter.jsonl")).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 3, "{text}");
+    assert_eq!(lines[1], "{\"source\":\"x\",\"pos");
+    let dl: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+    assert_eq!(dl["code"], "robot_mismatch");
+    let mut reload =
+        robodr_export::deadletter::DeadLetters::new(&r.state, "dead-letter.jsonl", None);
+    let st = reload.stats().unwrap();
+    assert_eq!((st.entries, st.malformed), (2, 1));
+    assert!(reload
+        .contains(
+            dl["source"].as_str().unwrap(),
+            dl["position"].as_u64().unwrap()
+        )
+        .unwrap());
+}
