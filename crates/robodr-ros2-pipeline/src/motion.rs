@@ -113,8 +113,8 @@ use robodr_events::graph::{demangle, RosNameKind};
 use robodr_events::profile::Profile;
 use robodr_events::{Deviation, RobotEvent, Severity};
 use robodr_rtps::{
-    hex_guid, DatagramReport, EndpointKind, EntityId, FragmentEventKind, Guid, PayloadKind,
-    RtpsTime, SampleAddress, UserDataLimits, UserDataWalker, GUIDPREFIX_UNKNOWN,
+    hex_guid, DatagramReport, EndpointKind, EntityId, FragmentEventKind, Guid, GuidPrefix,
+    PayloadKind, RtpsTime, SampleAddress, UserDataLimits, UserDataWalker, GUIDPREFIX_UNKNOWN,
 };
 use serde::Serialize;
 
@@ -603,7 +603,12 @@ impl MotionTracker {
     /// (every reading, alternates included).
     /// Returns the [`rules::MOTION_COMMAND_TYPE_MISMATCH`] findings of the
     /// announcements (writers on profiled command channels only).
-    pub(crate) fn learn(&mut self, profile: &Profile, report: &DatagramReport) -> Vec<Deviation> {
+    /// Each finding with the GUID prefix of the endpoint it is about.
+    pub(crate) fn learn(
+        &mut self,
+        profile: &Profile,
+        report: &DatagramReport,
+    ) -> Vec<(Deviation, GuidPrefix)> {
         let mut found = Vec::new();
         for ep in &report.endpoints {
             let mut readings: Vec<(Guid, String, String)> = Vec::new();
@@ -619,16 +624,21 @@ impl MotionTracker {
                 let motion = self.classify(profile, &topic);
                 if let (EndpointKind::Writer, Some((channel, Role::Command))) = (ep.kind, &motion) {
                     if let Some(why) = self.command_type_problem(profile, channel, &type_name) {
-                        found.push(Deviation::new(
-                            rules::MOTION_COMMAND_TYPE_MISMATCH,
-                            Severity::High,
-                            format!(
+                        let mut prefix = [0u8; 12];
+                        prefix.copy_from_slice(&guid[..12]);
+                        found.push((
+                            Deviation::new(
+                                rules::MOTION_COMMAND_TYPE_MISMATCH,
+                                Severity::High,
+                                format!(
                                 "writer {} announces type {:?} on the profiled command channel \
                                  {}: {why}",
                                 hex_guid(&guid),
                                 short(&type_name),
                                 short(channel)
                             ),
+                            ),
+                            prefix,
                         ));
                     }
                 }

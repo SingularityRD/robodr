@@ -538,6 +538,7 @@ mod tests {
             src_ip: "10.77.10.66".into(),
             profile_model: "lab-ugv".into(),
             profile_status: "enforcing",
+            participant: None,
         }
     }
 
