@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 pub const CONTRACT_NAME: &str = "robodr.findings";
 /// Contract (envelope) schema version emitted, semver. See
 /// `docs/contracts/robodr.findings.md`.
-pub const CONTRACT_VERSION: &str = "2.0.0";
+pub const CONTRACT_VERSION: &str = "2.1.0";
 /// Contract major emitted and validated in full.
 pub const CONTRACT_MAJOR: u64 = 2;
 /// Older contract major still accepted on parse (replay, migration), never
@@ -83,7 +83,11 @@ pub struct FindingEnvelope {
     /// key.
     pub external_id: String,
     /// Producer label, default [`DEFAULT_DATA_SOURCE`] (configurable;
-    /// [`legacy_v1::DATA_SOURCE`] in contract 1.x).
+    /// [`legacy_v1::DATA_SOURCE`] in contract 1.x). **Unauthenticated**: no
+    /// key is bound to a label (a finding key is registered for a robot id),
+    /// so a consumer must never route tenants or choose a trust level by it;
+    /// route by the key that verified the finding instead (contract §2,
+    /// *Identity*).
     pub data_source: String,
     /// Rule title from the trusted rule catalog. Never contains tainted text.
     pub title: String,

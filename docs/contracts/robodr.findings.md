@@ -2,10 +2,10 @@
 
 | | |
 | --- | --- |
-| Contract | `robodr.findings`, version **2.0.0** (`contract_version` field, `robodr-contract-version` header); changes in §10 |
+| Contract | `robodr.findings`, version **2.1.0** (`contract_version` field, `robodr-contract-version` header); changes in §10 |
 | Producer | `robodr-agentd` (findings spool), `robodr-diode` importer (air-gapped sites), `robodr-kafka-publish` |
 | Consumer | Any SOC, SIEM or SOAR: the envelope is vendor-neutral and the body is a standard OCSF Detection Finding |
-| Value schema | [`robodr-finding.schema.json`](robodr-finding.schema.json) (JSON Schema 2020-12, `$id` `https://schemas.singularityrd.com/robodr/findings/2.0.0`) |
+| Value schema | [`robodr-finding.schema.json`](robodr-finding.schema.json) (JSON Schema 2020-12, `$id` `https://schemas.singularityrd.com/robodr/findings/2.1.0`; it also describes 2.0.x messages, whose only difference is the rule catalog the validator applies, §3) |
 | Golden example | [`robodr-finding.example.json`](robodr-finding.example.json) |
 | Reference implementation | `crates/robodr-ocsf` (`FindingBuilder`, `validate`, `kafka::record`, `sig`) |
 | Superseded | Contract 1.x (`robot-edr.findings`): [`legacy/robot-edr.findings.md`](legacy/robot-edr.findings.md); parse-only (§5) |
@@ -46,7 +46,7 @@ each one against the robot's current safety state and may refuse it.
 | `contract_version` | `2.y.z` |
 | `finding_id` | `ocsf.finding_info.uid`; deterministic (§2 *Identity*) |
 | `external_id` | `<robot_id>:<finding_id>`; with `data_source` the consumer's dedup key |
-| `data_source` | producer label, default `robodr`, configurable per deployment: `[a-z0-9][a-z0-9._-]{0,63}` |
+| `data_source` | producer label, default `robodr`, configurable per deployment: `[a-z0-9][a-z0-9._-]{0,63}`. **Unauthenticated**: not bound to any key (see *Identity* below) |
 | `title`, `description` | trusted catalog text + sensor-authored facts (never tainted text) |
 | `severity` | `low` \| `medium` \| `high` \| `critical` |
 | `timestamp` | RFC 3339 UTC, ms (= `ocsf.time`) |
@@ -71,7 +71,7 @@ each one against the robot's current safety state and may refuse it.
 | Header | Value |
 | --- | --- |
 | `content-type` | `application/json` |
-| `robodr-contract-version` | `2.0.0` |
+| `robodr-contract-version` | the value's own `contract_version` (`2.1.0` from this producer; a forwarded or replayed 2.0 message keeps `2.0.0`) |
 | `ocsf-version` | `1.1.0` |
 | `data-source` | the value's `data_source` (default `robodr`) |
 | `robot-id` | robot id (`[A-Za-z0-9._-]{1,64}`) |
@@ -86,7 +86,7 @@ not trust a header that disagrees with the value.
 
 ```json
 {
-  "contract_version": "2.0.0",
+  "contract_version": "2.1.0",
   "finding_id": "rf1-0d7e79aac05cfd23bcfbdd38ef617eba",
   "external_id": "ugv-007:rf1-0d7e79aac05cfd23bcfbdd38ef617eba",
   "data_source": "robodr",
@@ -238,6 +238,21 @@ OCSF `severity_id` enum: 0 Unknown, 1 Informational, 2 Low, 3 Medium, 4 High,
   RoboDR deployments feeding one SOC, give each its own `data_source`
   (e.g. `site-a.robodr`) or rely on the globally unique robot id inside
   `external_id`.
+* **`data_source` is an unauthenticated label.** It is whatever the
+  producing deployment was configured to write. It is inside the signed
+  value when a finding is signed (§2a), but no key is bound to a
+  `data_source`: the finding key is registered for a robot id, and any
+  holder of any robot's key — or anyone at all on a path where signatures
+  are optional — can write any well-formed label. A consumer **must not**
+  route tenants, pick a trust level or choose a keyring by `data_source`
+  (nor by the topic or the `data-source` header, which follow it). Route by
+  the authenticated identity instead: the key that verified the finding
+  (or the diode batch) → the robot id it is registered for → the tenant /
+  site that robot is enrolled in. A consumer that wants the label to mean
+  something should keep, per registered key or per robot, the set of
+  `data_source` labels that producer may use and reject (or quarantine)
+  findings outside it; neither the reference keyring nor the diode
+  importer does this today.
 * `ocsf.metadata.uid` (`event-uid` header) identifies one *emission*
   (hash of finding id, `last_seen_time`, `count`). Re-delivery of the same
   emission (producer retry, diode re-send) carries the same `event-uid`;
@@ -395,9 +410,17 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
   entry is a contract minor bump and needs the validator updated on both
   sides of the diode in step. The validator applies the catalog **of the
   message's own `contract_version`** (`robodr_ocsf::rule_info_for_contract`):
-  a 1.2 finding for a rule that only gained an entry in 1.3 carries the
-  generic entry and stays valid; a 1.3 or any 2.x finding must carry the new
-  entry.
+
+  | `contract_version` | catalog applied |
+  | --- | --- |
+  | 1.0 – 1.2 | base catalog |
+  | 1.3 – 1.x, 2.0 | base + the 1.3 entries, exactly as 1.3.0 shipped (2.0 did not change the catalog) |
+  | 2.1 and later | + the 2.1 entries: the low-level joint-frame firewall ids (`robot.firewall.joint_*`, `disabled_motor_energised`, `crc_invalid`) and `robot.motion.api_id_out_of_range`, `robot.motion.control_handover` |
+
+  A finding of an older minor for a rule that only gained an entry in a
+  later minor carries the generic entry and stays valid; a finding of that
+  later minor must carry the new entry, and relabelling either way is
+  rejected.
   Any `robot.correlate.*` id without its own entry (a deployment's custom
   correlation rule) gets the generic correlation entry.
 
@@ -430,6 +453,11 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
   parallel (e.g. a new topic) until consumers migrate.
 * `ocsf.metadata.version` moves independently; upgrading the OCSF version
   inside the envelope is a minor change only if it is additive for consumers.
+* **2.0 vs 2.1.** 2.1 only added rule-catalog entries (§3). A 2.1
+  validator accepts 2.0 messages with the 2.0 catalog; a 2.0 validator
+  accepts a 2.1 message for every rule both catalogs share and rejects one
+  for a rule that only 2.1 catalogues (title / data source differ): upgrade
+  consumers (and both sides of a diode) before producers.
 * **What 2.0 changed from 1.3** (`robot-edr.findings`): `data_source` is no
   longer the constant `robot_edr` but a deployment label (default
   `robodr`); the topic is no longer fixed to `robot-edr.findings` but
@@ -690,6 +718,25 @@ safely. Nothing here is specific to one product.
 
 ## 10. Changelog
 
+* **2.1.0** — rule-catalog entries only (minor):
+  - New entries: the low-level joint-frame firewall ids
+    (`robot.firewall.joint_position_out_of_envelope`,
+    `joint_velocity_out_of_envelope`, `joint_torque_out_of_envelope`,
+    `joint_gain_out_of_envelope`, `joint_gain_below_minimum`,
+    `joint_step_out_of_envelope`, `joint_pd_torque_out_of_envelope`,
+    `joint_mode_inconsistent`, `joint_mode_pin_mismatch`,
+    `joint_limp_frame`, `joint_hold_exceeded`, `joint_rate_violation`,
+    `disabled_motor_energised`, `crc_invalid`) and
+    `robot.motion.api_id_out_of_range`, `robot.motion.control_handover`.
+    They had been added to the 1.3 catalog by mistake after 1.3.0 and 2.0.0
+    were cut; the 1.3 / 2.0 catalogs are restored to exactly what 1.3.0
+    shipped and these entries apply from 2.1 on.
+  - Schema `$id` `https://schemas.singularityrd.com/robodr/findings/2.1.0`;
+    `contract_version` parts at most 9 digits and `ocsf.metadata.log_name`
+    not `.` / `..` (as the validator always required).
+  - `robodr-contract-version` / `ocsf-version` headers: the value's own
+    versions.
+  - `data_source` documented as an unauthenticated label (§2, *Identity*).
 * **2.0.0** — vendor-neutral contract `robodr.findings` (supersedes
   `robot-edr.findings` 1.3.0, see
   [`legacy/robot-edr.findings.md`](legacy/robot-edr.findings.md) for the

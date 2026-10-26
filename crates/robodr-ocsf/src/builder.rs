@@ -188,31 +188,47 @@ const GENERIC: RuleInfo = RuleInfo {
     techniques: &[],
 };
 
-/// Contract minor version that added [`catalog_1_3`]'s entries.
+/// Contract 1.x minor that added [`catalog_1_3`]'s entries.
 pub const CATALOG_1_3_MINOR: u64 = 3;
+/// Contract 2.x minor that added [`catalog_2_1`]'s entries.
+pub const CATALOG_2_1_MINOR: u64 = 1;
 
-/// The trusted rule catalog of the current contract. Unknown rule ids get a
-/// generic entry (the rule id itself is a `&'static str` from the detection
-/// core and is charset-checked by the validator).
+/// The trusted rule catalog of the current contract
+/// ([`crate::CONTRACT_VERSION`]). Unknown rule ids get a generic entry (the
+/// rule id itself is a `&'static str` from the detection core and is
+/// charset-checked by the validator).
 pub fn rule_info(rule: &str) -> RuleInfo {
     catalog_1_0(rule)
         .or_else(|| catalog_1_3(rule))
+        .or_else(|| catalog_2_1(rule))
         .unwrap_or(GENERIC)
 }
 
 /// The catalog as a validator for a message of `contract_version` must
 /// apply it: entries added in a later contract minor than the message's are
-/// not used (a 1.2 producer built such a finding with the generic entry, and
-/// it stays valid). Contract 2.x has the full catalog. A malformed version
-/// gets the current catalog.
+/// not used (its producer built such a finding with the generic entry, and
+/// it stays valid). Adding an entry is a contract minor bump:
+///
+/// | contract | catalog |
+/// |---|---|
+/// | 1.0 - 1.2 | base ([`catalog_1_0`]) |
+/// | 1.3+ (1.x), 2.0 | base + 1.3 ([`catalog_1_3`], exactly as released in 1.3) |
+/// | 2.1+ | base + 1.3 + 2.1 ([`catalog_2_1`]) |
+///
+/// A malformed version gets the current catalog (and is rejected anyway).
 pub fn rule_info_for_contract(rule: &str, contract_version: &str) -> RuleInfo {
     let mut parts = contract_version.split('.').map(|p| p.parse::<u64>().ok());
     let (major, minor) = (parts.next().flatten(), parts.next().flatten());
-    if major == Some(LEGACY_CONTRACT_MAJOR) && minor.is_some_and(|m| m < CATALOG_1_3_MINOR) {
-        catalog_1_0(rule).unwrap_or(GENERIC)
-    } else {
-        rule_info(rule)
-    }
+    let (Some(major), Some(minor)) = (major, minor) else {
+        return rule_info(rule);
+    };
+    let with_1_3 = major > LEGACY_CONTRACT_MAJOR || minor >= CATALOG_1_3_MINOR;
+    let with_2_1 =
+        major > CONTRACT_MAJOR || (major == CONTRACT_MAJOR && minor >= CATALOG_2_1_MINOR);
+    catalog_1_0(rule)
+        .or_else(|| with_1_3.then(|| catalog_1_3(rule)).flatten())
+        .or_else(|| with_2_1.then(|| catalog_2_1(rule)).flatten())
+        .unwrap_or(GENERIC)
 }
 
 /// Entries added in contract 1.3: wave-6 detectors (correlation engine,
@@ -330,9 +346,11 @@ fn catalog_1_3(rule: &str) -> Option<RuleInfo> {
 
 /// Entries added later in the (unreleased) 1.3 cycle: wave-7 detectors
 /// (safety-feed writer overflow, correlation eviction notice, black-box
-/// truncation) and every other `robot.*` id the in-repo detectors emit that
-/// used to fall back to the generic entry. Same contract minor as
-/// [`catalog_1_3`]: 1.3.0 had not been released when these were added.
+/// truncation) and every other `robot.*` id the in-repo detectors emitted
+/// then that used to fall back to the generic entry. Same contract minor as
+/// [`catalog_1_3`]: 1.3.0 had not been released when these were added. This
+/// list is frozen at what 1.3.0 shipped; later entries go to a 2.x catalog
+/// ([`catalog_2_1`]).
 fn catalog_1_3_wave7(rule: &str) -> Option<RuleInfo> {
     const GRAPH: &str = "ros2_dds_discovery";
     const MOTION: &str = "ros2_motion_commands";
@@ -649,18 +667,6 @@ fn catalog_1_3_wave7(rule: &str) -> Option<RuleInfo> {
             MOTION,
             &[],
         ),
-        "robot.motion.api_id_out_of_range" => e(
-            "Robot API request with an aliased call id",
-            "A robot API request carried a call id outside the 32-bit range the robot dispatches on, so the robot executes a different call than the one written.",
-            MOTION,
-            &[T0855],
-        ),
-        "robot.motion.control_handover" => e(
-            "Motor control handed to another channel",
-            "A command hands motor control to, or takes it from, another channel or controller (motion switcher release, user or arm SDK control).",
-            MOTION,
-            &[T0855],
-        ),
         // --- robodr-motion consistency monitor -----------------------------
         "robot.motion.feedback_divergence" => e(
             "Motion feedback diverges from commands",
@@ -800,6 +806,43 @@ fn catalog_1_3_wave7(rule: &str) -> Option<RuleInfo> {
             "The motion firewall's event buffer was full and events were dropped or evicted; this finding is as severe as the worst event lost.",
             MOTION,
             &[],
+        ),
+        _ => return None,
+    })
+}
+
+/// Entries added in contract **2.1**: the low-level joint-frame firewall ids
+/// (Unitree `LowCmd` envelope, humanoid no-zero rule) and the robot-API /
+/// control-handover motion ids. Not in 1.3 or 2.0: a 2.0 producer built
+/// such a finding with the generic entry, and the validator keeps applying
+/// that to a 2.0 message ([`rule_info_for_contract`]).
+fn catalog_2_1(rule: &str) -> Option<RuleInfo> {
+    const MOTION: &str = "ros2_motion_commands";
+    const fn e(
+        title: &'static str,
+        desc: &'static str,
+        data_source: &'static str,
+        techniques: &'static [(&'static str, &'static str)],
+    ) -> RuleInfo {
+        RuleInfo {
+            title,
+            desc,
+            data_source,
+            techniques,
+        }
+    }
+    Some(match rule {
+        "robot.motion.api_id_out_of_range" => e(
+            "Robot API request with an aliased call id",
+            "A robot API request carried a call id outside the 32-bit range the robot dispatches on, so the robot executes a different call than the one written.",
+            MOTION,
+            &[T0855],
+        ),
+        "robot.motion.control_handover" => e(
+            "Motor control handed to another channel",
+            "A command hands motor control to, or takes it from, another channel or controller (motion switcher release, user or arm SDK control).",
+            MOTION,
+            &[T0855],
         ),
         "robot.firewall.joint_position_out_of_envelope" => e(
             "Joint command position out of envelope",

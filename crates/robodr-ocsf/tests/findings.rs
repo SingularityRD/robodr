@@ -52,7 +52,7 @@ fn ocsf_class_constants() {
     assert_eq!(o.metadata.version, "1.1.0");
     assert_eq!(o.metadata.product.name, "RoboDR");
     assert_eq!(f.data_source, "robodr");
-    assert_eq!(f.contract_version, "2.0.0");
+    assert_eq!(f.contract_version, "2.1.0");
     assert_eq!(o.metadata.log_name, "robodr.findings");
     assert_eq!(f.timestamp, "2026-09-21T14:13:20.000Z");
     // Rogue participant -> ATT&CK for ICS T0848 (see README caveat).

@@ -692,3 +692,38 @@ fn schema_only_consumer_rejects_raw_hostile_strings() {
         assert!(must_reject(Kind::Text, raw), "{raw}");
     }
 }
+
+/// Review finding L2: the schema accepts exactly what the validator accepts
+/// for `ocsf.metadata.log_name` (not `.` / `..`) and `contract_version`
+/// (each part at most 9 digits).
+#[test]
+fn schema_and_validator_agree_on_log_name_and_contract_version() {
+    let f = common::example_finding();
+    let base: Value = serde_json::from_str(&robodr_ocsf::to_json(&f).unwrap()).unwrap();
+    let judge = |edit: &dyn Fn(&mut Value)| {
+        let mut v = base.clone();
+        edit(&mut v);
+        let schema_ok = schema_errors(&v).is_empty();
+        let validator_ok = robodr_ocsf::parse_and_validate(&v.to_string()).is_ok();
+        (schema_ok, validator_ok)
+    };
+    for bad in [".", ".."] {
+        let r = judge(&|v| v["ocsf"]["metadata"]["log_name"] = bad.into());
+        assert_eq!(r, (false, false), "log_name {bad:?}");
+    }
+    for bad in ["2.1234567890.0", "2.0.1234567890"] {
+        let r = judge(&|v| v["contract_version"] = bad.into());
+        assert_eq!(r, (false, false), "contract_version {bad:?}");
+    }
+    // Still accepted by both: dotted names that are not `.` / `..`, and
+    // 9-digit parts.
+    for ok in ["...", ".a", "..a"] {
+        let mut v = base.clone();
+        v["ocsf"]["metadata"]["log_name"] = ok.into();
+        assert!(schema_errors(&v).is_empty(), "log_name {ok:?}");
+        assert!(robodr_ocsf::validate::is_valid_topic(ok), "{ok:?}");
+    }
+    let mut v = base.clone();
+    v["contract_version"] = "2.123456789.0".into();
+    assert!(schema_errors(&v).is_empty());
+}
