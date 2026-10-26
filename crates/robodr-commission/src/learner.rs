@@ -2636,6 +2636,27 @@ impl Learner {
         for ch in Self::unwritable_motion_channels(&p) {
             p.motion_envelopes.remove(&ch);
         }
+        // The announced type of each motion channel, where every writer
+        // seen on it announced the same one (several types: left out, the
+        // consumer then cannot rely on it). A legacy channel's type is fixed
+        // by the channel.
+        for ch in p.motion_envelopes.keys() {
+            use robodr_cdr::unitree_legacy::{channels, LegacyKind};
+            let t = match ch.as_str() {
+                channels::HIGH_CMD => Some(LegacyKind::HighCmd.type_label().to_string()),
+                channels::LOW_CMD => Some(LegacyKind::LowCmd.type_label().to_string()),
+                _ => self
+                    .writers
+                    .get(ch)
+                    .filter(|e| e.type_names.len() == 1)
+                    .and_then(|e| e.type_names.first().cloned()),
+            };
+            if let Some(t) =
+                t.filter(|t| t.len() <= robodr_events::profile::MAX_MOTION_TYPE_NAME_LEN)
+            {
+                p.motion_types.insert(ch.clone(), t);
+            }
+        }
         p
     }
 
@@ -4309,6 +4330,29 @@ mod tests {
         for e in clean() {
             assert!(p.evaluate(&e).is_none(), "{e:?}");
         }
+    }
+
+    /// Review (Unitree live, M1 / M4): the learned profile records the
+    /// announced type of each motion channel when every writer agrees, and
+    /// leaves it out when they disagree.
+    #[test]
+    fn learns_motion_channel_types() {
+        let l = learn(cfg(), &clean());
+        let p = l.profile();
+        assert_eq!(
+            p.motion_types.get("/cmd_vel").map(String::as_str),
+            Some("geometry_msgs::msg::dds_::Twist_")
+        );
+        p.validate().unwrap();
+        // A second writer announcing another type: ambiguous, left out.
+        let mut evs = clean();
+        evs.push(RobotEvent::Ros2WriterDiscovered(Endpoint {
+            guid_prefix: B.into(),
+            topic: "rt/cmd_vel".into(),
+            type_name: "geometry_msgs::msg::dds_::TwistStamped_".into(),
+        }));
+        let p = learn(cfg(), &evs).profile();
+        assert!(p.motion_types.is_empty(), "{:?}", p.motion_types);
     }
 
     /// Review item 2: low-level joint commands are learned with their

@@ -31,6 +31,7 @@
 //!
 //! | When | Rule | Severity |
 //! |---|---|---|
+//! | a writer announced via SEDP on a **profiled command channel** with a type name other than the one the profile records for the channel (`Profile::motion_types`), a type name no decoder knows (its commands can never be inspected), or a feedback type | [`rules::MOTION_COMMAND_TYPE_MISMATCH`] | High, at the announcement, not rate limited, dedup by writer + type + channel |
 //! | a sample on a motion / feedback topic that cannot be inspected: undecodable payload (truncated, unknown encapsulation id (anything outside XTypes 1.3 Table 60), `PL_CDR`, over a cap, malformed string), unknown type name, a type of the wrong role for the topic (feedback type on a command channel or the reverse), non-standard payload, malformed DATA / inline QoS, fragments refused / evicted / conflicting, per-datagram sample cap | [`rules::MOTION_UNDECODABLE_SAMPLE`] | Medium, rate limited (`robot.motion.undecodable_sample` bucket), dedup by channel + writer + reason |
 //! | DATA addressed to a reader entity announced on a motion / feedback topic, from a writer **never announced via SEDP** (cannot be attributed, so cannot be checked against the profile) and still unannounced [`MotionOptions::unattributed_grace`] after its first sample (or at [`crate::Pipeline::finish`]) | [`rules::MOTION_UNATTRIBUTED_SAMPLE`] | High, dedup by writer + topic |
 //! | a decoded sample whose writer prefix is bound to other source IPs than the one it came from (binding table, [`crate::binding`]): somebody speaks for a profiled writer | [`rules::MOTION_SAMPLE_SOURCE_MISMATCH`] | Critical on a command channel, High on a feedback topic |
@@ -124,6 +125,11 @@ pub mod rules {
     /// A sample on a motion / feedback topic that could not be inspected.
     /// Medium, rate limited.
     pub const MOTION_UNDECODABLE_SAMPLE: &str = "robot.motion.undecodable_sample";
+    /// A writer on a profiled command channel announces (SEDP) a type name
+    /// other than the one the profile records for the channel
+    /// (`Profile::motion_types`), a type no decoder knows (its commands
+    /// cannot be inspected), or a feedback type. High.
+    pub const MOTION_COMMAND_TYPE_MISMATCH: &str = "robot.motion.command_type_mismatch";
     /// DATA to a motion / feedback reader from a writer never announced via
     /// SEDP. High.
     pub const MOTION_UNATTRIBUTED_SAMPLE: &str = "robot.motion.unattributed_sample";
@@ -595,7 +601,10 @@ impl MotionTracker {
 
     /// Learn writer / reader GUIDs from the SEDP announcements of `report`
     /// (every reading, alternates included).
-    pub(crate) fn learn(&mut self, profile: &Profile, report: &DatagramReport) {
+    /// Returns the [`rules::MOTION_COMMAND_TYPE_MISMATCH`] findings of the
+    /// announcements (writers on profiled command channels only).
+    pub(crate) fn learn(&mut self, profile: &Profile, report: &DatagramReport) -> Vec<Deviation> {
+        let mut found = Vec::new();
         for ep in &report.endpoints {
             let mut readings: Vec<(Guid, String, String)> = Vec::new();
             if let Some(g) = ep.guid {
@@ -608,6 +617,21 @@ impl MotionTracker {
             }
             for (guid, topic, type_name) in readings {
                 let motion = self.classify(profile, &topic);
+                if let (EndpointKind::Writer, Some((channel, Role::Command))) = (ep.kind, &motion) {
+                    if let Some(why) = self.command_type_problem(profile, channel, &type_name) {
+                        found.push(Deviation::new(
+                            rules::MOTION_COMMAND_TYPE_MISMATCH,
+                            Severity::High,
+                            format!(
+                                "writer {} announces type {:?} on the profiled command channel \
+                                 {}: {why}",
+                                hex_guid(&guid),
+                                short(&type_name),
+                                short(channel)
+                            ),
+                        ));
+                    }
+                }
                 let reading = Reading {
                     topic,
                     type_name,
@@ -642,6 +666,31 @@ impl MotionTracker {
                     }
                 }
             }
+        }
+        found
+    }
+
+    /// Why an announced command type on `channel` is suspicious, if it is.
+    fn command_type_problem(
+        &self,
+        profile: &Profile,
+        channel: &str,
+        type_name: &str,
+    ) -> Option<String> {
+        if let Some(expected) = profile.motion_types.get(channel) {
+            if expected != type_name {
+                return Some(format!(
+                    "the profile records {:?} for this channel",
+                    short(expected)
+                ));
+            }
+        }
+        match self.registry.kind(type_name) {
+            None => Some("no decoder knows this type, so its commands cannot be inspected".into()),
+            Some(k) if k.role() != MotionRole::Command => {
+                Some("it is a feedback type, not a command type".into())
+            }
+            Some(_) => None,
         }
     }
 

@@ -123,3 +123,42 @@ fn full_example_control_plane_loads_with_its_soc_key() {
     assert_eq!(cp.keys.len(), 1);
     assert!(cp.unix.unwrap().ends_with("run/control.sock"));
 }
+
+/// Review M6: every rule id a shipped response policy overrides
+/// (`rule_overrides[].rule` in `config/*.json` and the agent's example
+/// policy) is one some detector raises, i.e. in the OCSF rule catalog. An
+/// override of an id nothing emits silently does nothing (Pulsar host
+/// detections all arrive as `robot.host.pulsar_threat`).
+#[test]
+fn policy_overrides_name_cataloged_rules() {
+    let generic = robodr_ocsf::rule_info("robot.nope.nothing");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    for dir in ["config", "crates/robodr-agent/examples"] {
+        for e in std::fs::read_dir(root.join(dir)).unwrap() {
+            let p = e.unwrap().path();
+            if p.extension().is_some_and(|x| x == "json") {
+                files.push(p);
+            }
+        }
+    }
+    let mut checked = 0;
+    for f in files {
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&f).unwrap())
+            .unwrap_or_else(|e| panic!("{}: {e}", f.display()));
+        let Some(ovs) = v.get("rule_overrides").and_then(|o| o.as_array()) else {
+            continue;
+        };
+        for o in ovs {
+            let rule = o["rule"].as_str().unwrap();
+            assert_ne!(
+                robodr_ocsf::rule_info(rule).title,
+                generic.title,
+                "{}: override of {rule}, which no detector raises",
+                f.display()
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= 4, "{checked}");
+}

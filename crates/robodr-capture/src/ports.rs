@@ -244,9 +244,12 @@ pub enum MatchMode {
 ///
 /// Besides RTPS it can accept the raw UDP of Unitree's legacy
 /// (`unitree_legged_sdk`, Go1 generation) protocol: UDP whose source **or**
-/// destination port is in [`RtpsFilter::legacy_udp_ports`] and that is not
-/// RTPS is delivered tagged [`crate::PacketKind::UnitreeLegacy`]. Empty (the
-/// default) = off.
+/// destination port is in [`RtpsFilter::legacy_udp_ports`] is delivered
+/// tagged [`crate::PacketKind::UnitreeLegacy`] — **always**, also when it
+/// matches the RTPS rule as well (then flagged
+/// [`crate::RtpsPacket::also_rtps`], so the consumer inspects it on both
+/// paths): starting a payload with `RTPS` must not skip the legacy sender
+/// check. Empty (the default) = off.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct RtpsFilter {
     pub ports: RtpsPortMap,
@@ -282,8 +285,9 @@ impl RtpsFilter {
         self
     }
 
-    /// A non-RTPS UDP datagram of the Unitree legacy protocol: its source or
-    /// destination port is a configured legacy port.
+    /// A UDP datagram of the Unitree legacy protocol: its source or
+    /// destination port is a configured legacy port (whether or not it also
+    /// [`matches`](Self::matches) as RTPS).
     pub fn is_legacy(&self, d: &UdpDatagram<'_>) -> bool {
         !self.legacy_udp_ports.is_empty()
             && (self.legacy_udp_ports.contains(&d.src_port)

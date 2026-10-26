@@ -413,11 +413,7 @@ fn legacy_udp_at_the_pipeline() {
     let mut high = vec![0u8; robodr_cdr::unitree_legacy::LEGACY_HIGH_CMD_LEN];
     high[22] = 2; // mode: target-velocity walking
     high[53..57].copy_from_slice(&3.0f32.to_le_bytes()); // velocity[0]
-    let udp = LegacyUdp {
-        src_port: 8090,
-        dst_port: 8082,
-        dst_ip: "192.168.123.161".parse().unwrap(),
-    };
+    let udp = LegacyUdp::new(8090, 8082, "192.168.123.161".parse().unwrap());
     // Off.
     let mut off = Pipeline::new(profile.clone(), PipelineOptions::default());
     let o = off.process_legacy_at(&high, "192.168.123.15", &udp, Instant::now(), 1);

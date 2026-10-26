@@ -621,7 +621,11 @@ impl<R: Read> EventSource for PcapSource<R> {
             let position = self.datagrams.stats().frames;
             if pkt.kind == robodr_capture::PacketKind::UnitreeLegacy {
                 self.legacy_event(&pkt, position);
-                continue;
+                // RTPS on a legacy port (the sensor reports it): learned as
+                // RTPS too, as the sensor inspects it on both paths.
+                if !pkt.also_rtps {
+                    continue;
+                }
             }
             let Some(report) = self.frag.parse_datagram_detailed(&pkt.payload) else {
                 // Cyclone DDS sends a 1-byte datagram to its own receive

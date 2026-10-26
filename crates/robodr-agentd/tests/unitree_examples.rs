@@ -428,3 +428,176 @@ fn every_model_profile_loads_in_the_daemon_and_morphology_is_enforced() {
         assert!(e.contains("morphology"), "{s}: {e}");
     }
 }
+
+/// Rewrite a [`Root`]'s profile (locked and signed metadata as
+/// `Root::new` writes it).
+fn rewrite_profile(r: &Root, platform: &str, unit: &str, mut p: Profile) {
+    p.locked = true;
+    let mut md = metadata(1);
+    md.platform = platform.into();
+    md.unit_id = Some(unit.into());
+    p.metadata = Some(md);
+    write_profile(&r.dir.join("etc/profile.json"), &p);
+}
+
+/// Review M2: without `robot.robot_model` the morphology no longer fails
+/// open: a 35-slot (`unitree_hg`) joint channel needs a humanoid policy and
+/// firewall platform (every hg model is a humanoid), and a profile with
+/// Unitree low-level / API channels but no model is warned about.
+#[test]
+fn hg_joint_channel_requires_humanoid_without_robot_model() {
+    // Every hg model is a humanoid (the premise of the check).
+    for m in UnitreeModel::ALL {
+        if m.info().idl == Some(IdlFamily::Hg) {
+            assert_eq!(m.info().morphology, Morphology::Humanoid, "{m:?}");
+        }
+    }
+    let r = Root::new(
+        "unitree-m2",
+        UnitreeModel::G1,
+        "unitree-g1",
+        "unitree-g1-001",
+        "response-policy.unitree-g1.example.json",
+    );
+    std::fs::write(
+        r.dir.join("etc/firewall.json"),
+        example("firewall.unitree-g1.example.json"),
+    )
+    .unwrap();
+    let mut cfg = r.example("agentd.unitree-edu.example.json");
+    cfg["robot"].as_object_mut().unwrap().remove("robot_model");
+    // Humanoid everywhere, no model: loads, with a warning to set it.
+    let res = r.load(&cfg).unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        res.warnings
+            .iter()
+            .any(|w| w.contains("robot.robot_model") && w.contains("/lowcmd")),
+        "{:?}",
+        res.warnings
+    );
+    // Quadruped policy and firewall platform for a 35-slot channel: refused.
+    let mut pol: serde_json::Value =
+        serde_json::from_str(&example("response-policy.unitree-g1.example.json")).unwrap();
+    pol["morphology"] = "quadruped".into();
+    std::fs::write(
+        r.dir.join("etc/response-policy.json"),
+        serde_json::to_vec(&pol).unwrap(),
+    )
+    .unwrap();
+    let mut fw: serde_json::Value =
+        serde_json::from_str(&example("firewall.unitree-g1.example.json")).unwrap();
+    fw["platform"]["morphology"] = "quadruped".into();
+    fw["platform"]["fail_behaviour"] =
+        serde_json::json!({"hold_last": {"max_hold_ns": 100_000_000}});
+    std::fs::write(r.dir.join("etc/firewall.json"), fw.to_string()).unwrap();
+    let e = r.load(&cfg).expect_err("35-slot channel on a quadruped");
+    assert!(e.contains("humanoid") && e.contains("35"), "{e}");
+}
+
+/// Review M2: the slot count of a joint channel is checked by the profile's
+/// recorded type (any name), not only for `/lowcmd`, `/arm_sdk`,
+/// `/user_lowcmd`, and with or without a model.
+#[test]
+fn joint_slot_count_follows_the_recorded_type() {
+    let r = Root::new(
+        "unitree-m2-type",
+        UnitreeModel::Go2,
+        "unitree-go2",
+        "u-1",
+        "response-policy.unitree-go2.example.json",
+    );
+    // The Go2 firewall file (20 slots) on a channel recorded as hg LowCmd_.
+    let mut p = profile_example(UnitreeModel::Go2);
+    p.motion_types
+        .insert("/lowcmd".into(), "unitree_hg::msg::dds_::LowCmd_".into());
+    rewrite_profile(&r, "unitree-go2", "u-1", p);
+    std::fs::write(
+        r.dir.join("etc/firewall.json"),
+        example("firewall.unitree-go2.example.json"),
+    )
+    .unwrap();
+    let mut cfg = r.example("agentd.unitree-edu.example.json");
+    cfg["robot"].as_object_mut().unwrap().remove("robot_model");
+    cfg["sensor"]["profile_trust"]["expect_platform"] = "unitree-go2".into();
+    cfg["sensor"]["profile_trust"]["expect_unit_id"] = "u-1".into();
+    cfg["robot"]["id"] = "u-1".into();
+    let e = r.load(&cfg).expect_err("20 slots vs hg type");
+    assert!(e.contains("motor slots") && e.contains("LowCmd_"), "{e}");
+    // The right type loads.
+    let mut p = profile_example(UnitreeModel::Go2);
+    p.motion_types
+        .insert("/lowcmd".into(), "unitree_go::msg::dds_::LowCmd_".into());
+    rewrite_profile(&r, "unitree-go2", "u-1", p);
+    r.load(&cfg).unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// Review M2: a legacy (Go1) channel as a joint-firewall channel is refused:
+/// legacy frames carry no writer identity the firewall could authorise, so
+/// every frame would be rejected as an unknown source before its joints
+/// were checked (the profile envelope still checks them in the sensor).
+#[test]
+fn legacy_low_cmd_is_refused_as_a_joint_firewall_channel() {
+    let r = Root::new(
+        "unitree-m2-legacy",
+        UnitreeModel::Go1,
+        "unitree-go1",
+        "unitree-go1-001",
+        "response-policy.unitree-go2.example.json",
+    );
+    let mut fw: serde_json::Value =
+        serde_json::from_str(&example("firewall.unitree-go2.example.json")).unwrap();
+    let spec = fw["joint_channels"]["/lowcmd"].take();
+    fw["joint_channels"] = serde_json::json!({ "/unitree_legacy/low_cmd": spec });
+    std::fs::write(r.dir.join("etc/firewall.json"), fw.to_string()).unwrap();
+    let mut cfg = r.example("agentd.unitree-sensor-box.example.json");
+    cfg["firewall"] = serde_json::json!({"joint_config": r.dir.join("etc/firewall.json")});
+    let e = r.load(&cfg).expect_err("legacy joint channel");
+    assert!(e.contains("/unitree_legacy/low_cmd"), "{e}");
+}
+
+/// Review LOW: the SDK examples of Go2-W, H1, H2 and R1 switch modes
+/// through `rt/api/motion_switcher/request`; their profile examples carry it
+/// (writable, with a request envelope), as G1's and B2's do.
+#[test]
+fn motion_switcher_is_in_the_profile_examples() {
+    for m in [
+        UnitreeModel::Go2W,
+        UnitreeModel::H1,
+        UnitreeModel::H2,
+        UnitreeModel::R1,
+        UnitreeModel::G1,
+        UnitreeModel::B2,
+    ] {
+        let p = profile_example(m);
+        for t in [
+            "/api/motion_switcher/request",
+            "/api/motion_switcher/response",
+        ] {
+            assert!(p.writer_topics.contains(t), "{m:?}: {t}");
+        }
+        let env = &p.motion_envelopes["/api/motion_switcher/request"];
+        assert_eq!(env.max_joint_speed, None, "{m:?}");
+        assert!(env.max_linear_speed.is_some(), "{m:?}");
+    }
+}
+
+/// Review LOW: the sensor-box example does not present a Go1 internal
+/// computer (192.168.123.13 / .14 / .15) as the operator PC; its sender is
+/// labelled as an example.
+#[test]
+fn sensor_box_example_command_sender_is_labelled() {
+    let v: serde_json::Value =
+        serde_json::from_str(&example("agentd.unitree-sensor-box.example.json")).unwrap();
+    let senders = v["sensor"]["unitree_legacy"]["command_senders"]
+        .as_array()
+        .unwrap();
+    assert!(!senders.is_empty());
+    for s in senders {
+        let ip = s["ip"].as_str().expect("table form with a label");
+        assert!(
+            !["192.168.123.13", "192.168.123.14", "192.168.123.15"].contains(&ip),
+            "{ip} is a Go1 internal computer"
+        );
+        assert!(s["label"].as_str().unwrap().contains("EXAMPLE"), "{s}");
+    }
+}

@@ -148,9 +148,10 @@ pub enum PacketKind {
     /// RTPS (well-known port or `RTPS` magic).
     #[default]
     Rtps,
-    /// Raw UDP of the Unitree legacy protocol (`unitree_legged_sdk`, Go1
-    /// generation) on a configured legacy port
-    /// ([`RtpsFilter::legacy_udp_ports`]); not RTPS.
+    /// UDP on a configured Unitree legacy port
+    /// ([`RtpsFilter::legacy_udp_ports`], `unitree_legged_sdk`, Go1
+    /// generation), whatever its payload; [`RtpsPacket::also_rtps`] when it
+    /// is RTPS as well.
     UnitreeLegacy,
 }
 
@@ -175,6 +176,16 @@ pub struct RtpsPacket {
     /// datagrams, merged over every fragment (any non-loopback fragment
     /// makes the datagram non-loopback).
     pub ingress: IngressInfo,
+    /// Link-layer (MAC) source of the frame when its header carries one
+    /// (Ethernet, Linux cooked capture, the `AF_PACKET` source); `None` for
+    /// raw-IP captures and for reassembled datagrams (fragments may come
+    /// from different frames).
+    pub src_mac: Option<[u8; 6]>,
+    /// A [`PacketKind::UnitreeLegacy`] datagram that the [`RtpsFilter`]
+    /// also accepts as RTPS (well-known port or `RTPS` magic): a datagram
+    /// on a legacy port is always delivered as legacy, and this flag tells
+    /// the consumer to inspect it as RTPS as well.
+    pub also_rtps: bool,
     pub payload: Vec<u8>,
 }
 
@@ -229,6 +240,9 @@ pub struct CaptureStats {
     /// UDP datagrams accepted as Unitree legacy frames
     /// ([`RtpsFilter::legacy_udp_ports`]); not in `rtps`.
     pub legacy_udp: u64,
+    /// Of those, datagrams that also matched the RTPS filter
+    /// ([`RtpsPacket::also_rtps`]).
+    pub rtps_on_legacy_port: u64,
 }
 
 /// Iterator glue: packet source -> decoders -> reassembly -> RTPS filter.
@@ -418,7 +432,8 @@ fn process(
                   u: &UdpDatagram<'_>,
                   segment: &[u8],
                   reassembled,
-                  ingress: IngressInfo| {
+                  ingress: IngressInfo,
+                  src_mac: Option<[u8; 6]>| {
         if !udp_checksum_ok(udp_mode, stats, u, segment) {
             return None;
         }
@@ -428,12 +443,20 @@ fn process(
             stats.zenoh_last_src = Some(u.src);
             return None;
         }
-        let kind = if filter.matches(u) {
-            stats.rtps += 1;
-            PacketKind::Rtps
-        } else if filter.is_legacy(u) {
+        // A datagram on a configured legacy port is always a legacy
+        // datagram (an attacker must not be able to skip the legacy sender
+        // check by starting the payload with "RTPS"); if it is RTPS as well,
+        // the consumer inspects it on both paths.
+        let rtps = filter.matches(u);
+        let (kind, also_rtps) = if filter.is_legacy(u) {
             stats.legacy_udp += 1;
-            PacketKind::UnitreeLegacy
+            if rtps {
+                stats.rtps_on_legacy_port += 1;
+            }
+            (PacketKind::UnitreeLegacy, rtps)
+        } else if rtps {
+            stats.rtps += 1;
+            (PacketKind::Rtps, false)
         } else {
             stats.filtered_out += 1;
             return None;
@@ -448,6 +471,8 @@ fn process(
             port_class: filter.ports.classify(u.dst_port),
             reassembled,
             ingress,
+            src_mac,
+            also_rtps,
             payload: u.payload.to_vec(),
         })
     };
@@ -484,7 +509,14 @@ fn process(
     match d.decoded {
         Decoded::Udp(u) => {
             let segment = d.udp_segment.unwrap_or_default();
-            accept(stats, &u, segment, false, ingress)
+            accept(
+                stats,
+                &u,
+                segment,
+                false,
+                ingress,
+                decode::link_src_mac(link, data),
+            )
         }
         Decoded::Fragment(f) => {
             stats.fragments += 1;
@@ -505,7 +537,7 @@ fn process(
                 }),
             };
             match udp {
-                Ok((u, seg)) => accept(stats, &u, seg, true, ingress),
+                Ok((u, seg)) => accept(stats, &u, seg, true, ingress, None),
                 Err(e) => {
                     count_error(stats, e);
                     None
@@ -595,8 +627,10 @@ mod tests {
     }
 
     /// Unitree legacy UDP: off by default; with legacy ports, delivered as
-    /// `PacketKind::UnitreeLegacy` in both directions, RTPS on such a port
-    /// stays RTPS, and other UDP is still filtered.
+    /// `PacketKind::UnitreeLegacy` in both directions, other UDP is still
+    /// filtered, and a datagram on a legacy port is **always** delivered as
+    /// legacy (review H2: one that starts with `RTPS` is flagged
+    /// `also_rtps` so both paths inspect it, never only the RTPS one).
     #[test]
     fn glue_classifies_unitree_legacy_udp() {
         let pc = Ipv4Addr::new(192, 168, 123, 15);
@@ -626,19 +660,68 @@ mod tests {
         let mut on = RtpsDatagrams::new(VecSource::new(frames()), filter);
         let a = on.next_packet().unwrap();
         assert_eq!(
-            (a.kind, a.src_port, a.dst_port),
-            (PacketKind::UnitreeLegacy, 8090, 8082)
+            (a.kind, a.src_port, a.dst_port, a.also_rtps),
+            (PacketKind::UnitreeLegacy, 8090, 8082, false)
         );
         assert_eq!(a.payload.len(), 129);
+        assert_eq!(a.src_mac, Some([0x02, 0, 0, 0, 0, 2]), "Ethernet source");
         let b = on.next_packet().unwrap();
         assert_eq!(
             (b.kind, b.src, b.payload.len()),
             (PacketKind::UnitreeLegacy, IpAddr::V4(robot), 1087)
         );
-        assert_eq!(on.next_packet().unwrap().kind, PacketKind::Rtps);
+        let c = on.next_packet().unwrap();
+        assert_eq!(
+            (c.kind, c.also_rtps),
+            (PacketKind::UnitreeLegacy, true),
+            "RTPS on a legacy port goes to the legacy path too"
+        );
         assert!(on.next_packet().is_none());
         let s = *on.stats();
-        assert_eq!((s.legacy_udp, s.rtps, s.filtered_out), (2, 1, 1));
+        assert_eq!(
+            (s.legacy_udp, s.rtps, s.filtered_out, s.rtps_on_legacy_port),
+            (3, 0, 1, 1)
+        );
+    }
+
+    /// 802.1Q / 802.1ad tagged frames (one or two tags) reach the legacy
+    /// and RTPS classifiers from a pcap replay (Ethernet and Linux cooked
+    /// capture) and keep their link-layer source.
+    #[test]
+    fn glue_decodes_vlan_tagged_frames() {
+        let pc = Ipv4Addr::new(192, 168, 123, 15);
+        let robot = Ipv4Addr::new(192, 168, 123, 10);
+        let ip = synth::ipv4_udp(pc, robot, 8080, 8007, &[0x5a; 614]);
+        let ts = Duration::from_secs(1);
+        let mut inner = vec![0x20, 7];
+        inner.extend_from_slice(&0x0800u16.to_be_bytes());
+        inner.extend_from_slice(&ip);
+        let frames = vec![
+            (
+                ts,
+                LinkType::ETHERNET,
+                synth::ethernet_vlan(&[(0x8100, 123)], 0x0800, &ip),
+            ),
+            (
+                ts,
+                LinkType::ETHERNET,
+                synth::ethernet_vlan(&[(0x88a8, 10), (0x8100, 20)], 0x0800, &ip),
+            ),
+            (ts, LinkType::LINUX_SLL, synth::linux_sll(0x8100, &inner)),
+        ];
+        let filter = RtpsFilter::default().with_legacy_udp_ports([8007, 8080]);
+        let mut it = RtpsDatagrams::new(VecSource::new(frames), filter);
+        for n in 0..3 {
+            let p = it.next_packet().unwrap_or_else(|| panic!("frame {n}"));
+            assert_eq!(p.kind, PacketKind::UnitreeLegacy, "frame {n}");
+            assert_eq!(p.payload.len(), 614);
+            assert_eq!(
+                p.src_mac,
+                Some([0x02, 0, 0, 0, 0, if n == 2 { 1 } else { 2 }])
+            );
+        }
+        assert!(it.next_packet().is_none());
+        assert_eq!(it.stats().not_ip, 0);
     }
 
     #[test]

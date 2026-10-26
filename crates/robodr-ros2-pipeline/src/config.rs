@@ -185,7 +185,15 @@ pub struct Config {
 /// [module.robodr-sensor-ros2.unitree_legacy]
 /// enabled = true
 /// ports = [8007, 8080, 8082, 8090]          # default: the SDK's ports
-/// command_senders = ["192.168.123.15"]      # the operator's client PC(s)
+/// # The operator's client PC(s) (EXAMPLE address: the SDK docs set the
+/// # user PC to 192.168.123.162; .13 / .14 / .15 are the Go1's own internal
+/// # computers, list them only if their software sends commands). An entry
+/// # may bind the IP to the sender's MAC (checked where the capture sees
+/// # link-layer sources, e.g. AF_PACKET / Ethernet pcap).
+/// command_senders = [
+///   "192.168.123.162",
+///   { ip = "192.168.123.163", mac = "02:00:00:00:00:63", label = "lab PC" },
+/// ]
 /// robot_addresses = ["192.168.123.10", "192.168.123.161"]   # default
 /// ```
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -195,11 +203,62 @@ pub struct UnitreeLegacyConfig {
     pub enabled: bool,
     /// UDP ports (source or destination) carrying legacy frames.
     pub ports: Vec<u16>,
-    /// Source IPs allowed to send `HighCmd` / `LowCmd`.
-    pub command_senders: Vec<String>,
+    /// Source IPs allowed to send `HighCmd` / `LowCmd`, each optionally
+    /// bound to a MAC.
+    pub command_senders: Vec<LegacySenderEntry>,
     /// The robot's addresses (state senders).
     pub robot_addresses: Vec<String>,
 }
+
+/// One `unitree_legacy.command_senders` entry: an IP address, or a table
+/// `{ ip, mac?, label? }`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum LegacySenderEntry {
+    /// `"192.168.123.162"`.
+    Ip(String),
+    /// `{ ip = "...", mac = "aa:bb:cc:dd:ee:ff", label = "..." }`.
+    Detailed(LegacySender),
+}
+
+/// The table form of a [`LegacySenderEntry`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacySender {
+    pub ip: String,
+    /// The sender's link-layer source address (`aa:bb:cc:dd:ee:ff`).
+    /// Optional; see [`crate::legacy::rules::LEGACY_SENDER_MAC_MISMATCH`].
+    #[serde(default)]
+    pub mac: Option<String>,
+    /// Free text for the operator (not used by the sensor).
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+impl LegacySenderEntry {
+    fn ip(&self) -> &str {
+        match self {
+            LegacySenderEntry::Ip(ip) => ip,
+            LegacySenderEntry::Detailed(d) => &d.ip,
+        }
+    }
+
+    fn mac(&self) -> Option<&str> {
+        match self {
+            LegacySenderEntry::Ip(_) => None,
+            LegacySenderEntry::Detailed(d) => d.mac.as_deref(),
+        }
+    }
+}
+
+impl From<&str> for LegacySenderEntry {
+    fn from(ip: &str) -> Self {
+        LegacySenderEntry::Ip(ip.to_string())
+    }
+}
+
+/// Most characters of a `command_senders` label.
+pub const MAX_LEGACY_LABEL_CHARS: usize = 128;
 
 impl Default for UnitreeLegacyConfig {
     fn default() -> Self {
@@ -261,8 +320,49 @@ impl UnitreeLegacyConfig {
                 }
                 Ok(out)
             };
-        let command_senders = addrs("command_senders", &self.command_senders)?;
+        let sender_ips: Vec<String> = self
+            .command_senders
+            .iter()
+            .map(|e| e.ip().to_string())
+            .collect();
+        let command_senders = addrs("command_senders", &sender_ips)?;
         let robot_addresses = addrs("robot_addresses", &self.robot_addresses)?;
+        let mut sender_macs = std::collections::BTreeMap::new();
+        for e in &self.command_senders {
+            if let LegacySenderEntry::Detailed(d) = e {
+                if d.label
+                    .as_ref()
+                    .is_some_and(|l| l.chars().count() > MAX_LEGACY_LABEL_CHARS)
+                {
+                    return Err(format!(
+                        "unitree_legacy.command_senders label of {} is longer than \
+                         {MAX_LEGACY_LABEL_CHARS} characters",
+                        crate::sanitize::sanitize(&d.ip)
+                    ));
+                }
+            }
+            let Some(mac) = e.mac() else { continue };
+            let ip: IpAddr = e.ip().parse().map_err(|_| "unreachable".to_string())?;
+            let parsed = crate::legacy::parse_mac(mac)
+                .filter(|m| *m != [0; 6] && m[0] & 1 == 0)
+                .ok_or_else(|| {
+                    format!(
+                        "unitree_legacy.command_senders entry {ip}: mac {:?} is not a unicast \
+                         MAC address (aa:bb:cc:dd:ee:ff)",
+                        crate::sanitize::sanitize(mac)
+                    )
+                })?;
+            sender_macs.insert(ip, parsed);
+        }
+        if self.enabled && !sender_macs.is_empty() {
+            warnings.push(
+                "unitree_legacy.command_senders binds senders to a MAC: a mismatch is reported \
+                 only where the capture sees link-layer sources (AF_PACKET, Ethernet / cooked \
+                 pcap), and a host on the same L2 segment can forge a MAC as easily as an IP; \
+                 the binding raises the bar, it does not authenticate"
+                    .into(),
+            );
+        }
         if self.enabled {
             if command_senders.is_empty() {
                 warnings.push(
@@ -288,6 +388,7 @@ impl UnitreeLegacyConfig {
             enabled: self.enabled,
             ports,
             command_senders,
+            sender_macs,
             robot_addresses,
         })
     }
@@ -840,6 +941,29 @@ impl Config {
         let motion = self.motion.validate(&mut warnings)?;
         self.profile_trust.validate()?;
         let legacy = self.unitree_legacy.validate(&mut warnings)?;
+        if legacy.enabled {
+            // A legacy port inside the DDS port map would make one datagram
+            // RTPS by port and legacy by port: refused (choose another
+            // ROS_DOMAIN_ID / capture.domain_ids, or other legacy ports).
+            let domains: Vec<u16> = match &capture {
+                Some(c) => c.domain_ids.clone(),
+                None => u16::try_from(self.domain_id).into_iter().collect(),
+            };
+            let map = capture_port_map(&domains);
+            for p in &legacy.ports {
+                if let Some((lo, hi)) = map
+                    .port_ranges()
+                    .into_iter()
+                    .find(|(lo, hi)| (*lo..=*hi).contains(p))
+                {
+                    return Err(format!(
+                        "unitree_legacy.ports {p} lies inside the RTPS port range {lo}..={hi} of \
+                         DDS domain(s) {domains:?}: the capture could not tell DDS from legacy \
+                         traffic on it; use another ROS domain or other legacy ports"
+                    ));
+                }
+            }
+        }
         if legacy.enabled {
             match capture.as_mut() {
                 Some(c) => c.legacy_udp_ports = legacy.ports.clone(),
@@ -1600,5 +1724,70 @@ mod tests {
             Ok(_) => panic!("opening a missing file must fail"),
         };
         assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// Review LOW: a legacy port inside the DDS domain port map would make
+    /// the same datagram RTPS by port and legacy by port; refused.
+    #[test]
+    fn legacy_ports_inside_the_dds_port_map_are_refused() {
+        let base = r#""capture": {"enabled": true, "interfaces": ["eth0"]},
+                      "unitree_legacy": {"enabled": true, "command_senders": ["192.168.123.162"]}"#;
+        assert!(validate(&format!("{{{base}}}")).is_ok());
+        let e = validate(&format!(r#"{{"domain_id": 2, {base}}}"#)).unwrap_err();
+        assert!(e.contains("8007") && e.contains("domain"), "{e}");
+        // Also through capture.domain_ids.
+        let e = validate(
+            r#"{"capture": {"enabled": true, "interfaces": ["eth0"], "domain_ids": [0, 2]},
+                "unitree_legacy": {"enabled": true, "ports": [8090]}}"#,
+        )
+        .unwrap_err();
+        assert!(e.contains("8090"), "{e}");
+        // Off: not checked.
+        assert!(validate(
+            r#"{"domain_id": 2, "capture": {"enabled": true, "interfaces": ["eth0"]}}"#
+        )
+        .is_ok());
+    }
+
+    /// Review M3: `command_senders` entries may bind the sender IP to a MAC
+    /// (and carry a label); bad MACs and unknown keys are refused.
+    #[test]
+    fn legacy_command_senders_with_mac() {
+        let (s, w) = validate(
+            r#"{"capture": {"enabled": true, "interfaces": ["eth0"]},
+                "unitree_legacy": {"enabled": true, "command_senders": [
+                    "192.168.123.163",
+                    {"ip": "192.168.123.162", "mac": "02:00:00:00:00:62", "label": "operator PC"},
+                    {"ip": "192.168.123.164"}
+                ]}}"#,
+        )
+        .unwrap();
+        let l = &s.pipeline.legacy;
+        assert_eq!(l.command_senders.len(), 3);
+        assert_eq!(l.sender_macs.len(), 1);
+        assert_eq!(
+            l.sender_macs[&"192.168.123.162".parse::<IpAddr>().unwrap()],
+            [2, 0, 0, 0, 0, 0x62]
+        );
+        assert!(
+            w.iter().any(|w| w.contains("MAC") && w.contains("same L2")),
+            "{w:?}"
+        );
+        for bad in [
+            r#"{"ip": "192.168.123.162", "mac": "02:00:00:00:62"}"#,
+            r#"{"ip": "192.168.123.162", "mac": "zz:00:00:00:00:62"}"#,
+            r#"{"ip": "192.168.123.162", "mac": "00:00:00:00:00:00"}"#,
+            r#"{"ip": "192.168.123.162", "colour": "red"}"#,
+            r#"{"ip": "not-an-ip"}"#,
+        ] {
+            let j = format!(
+                r#"{{"capture": {{"enabled": true, "interfaces": ["eth0"]}},
+                    "unitree_legacy": {{"enabled": true, "command_senders": [{bad}]}}}}"#
+            );
+            let r = serde_json::from_str::<Config>(&j)
+                .map_err(|e| e.to_string())
+                .and_then(|c| c.validate_with(|| Some("eth0".into())).map(|_| ()));
+            assert!(r.is_err(), "{bad}");
+        }
     }
 }

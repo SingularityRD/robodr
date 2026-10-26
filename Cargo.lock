@@ -2309,6 +2309,7 @@ name = "robodr-agent"
 version = "0.1.0-alpha.1"
 dependencies = [
  "robodr-blackbox",
+ "robodr-cdr",
  "robodr-commission",
  "robodr-events",
  "robodr-firewall",

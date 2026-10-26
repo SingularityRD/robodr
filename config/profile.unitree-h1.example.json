@@ -7,6 +7,8 @@
   "writer_topics": [
     "/api/loco/request",
     "/api/loco/response",
+    "/api/motion_switcher/request",
+    "/api/motion_switcher/response",
     "/arm_sdk",
     "/lowcmd",
     "/lowstate",
@@ -15,6 +17,10 @@
   "motion_envelopes": {
     "/api/loco/request": {
       "max_linear_speed": 1.0,
+      "max_joint_speed": null
+    },
+    "/api/motion_switcher/request": {
+      "max_linear_speed": 0.0,
       "max_joint_speed": null
     },
     "/arm_sdk": {

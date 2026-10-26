@@ -52,7 +52,7 @@ level, and every path must be absolute.
 | `firewall` | Optional. `max_angular` (rad/s for every profiled Twist channel), `allow` (writer GUIDs per channel) and `joint_config` (a Motion Firewall JSON file whose `joint_channels` / `platform` check Unitree low-level joint frames, e.g. `config/firewall.unitree-g1.example.json`). Runs **recording-only** (see below). |
 | `motion_monitor` | Optional. `config_path` (strict `MonitorConfig`; default: the UGV defaults on the profile's motion channels) and `feedback_sources`. Feedback sources that are ROS topic names (`/odom`) are also decoded from the bus. |
 | `sensor.motion` | Optional. The live motion decode path: `enabled` (default true), `feedback_topics` (e.g. `["/odom"]`), `max_writers`, `max_samples_per_datagram` (`evaluate_commands` is accepted but the daemon always lets the agent evaluate). Unknown keys are refused. |
-| `sensor.unitree_legacy` | Optional, off by default. Unitree legacy UDP (Go1 generation): `enabled`, `ports` (default `[8007, 8080, 8082, 8090]`), `command_senders` (IPs allowed to send `HighCmd` / `LowCmd`), `robot_addresses` (default `192.168.123.10`, `192.168.123.161`). Needs `sensor.capture`. Unknown keys are refused. |
+| `sensor.unitree_legacy` | Optional, off by default. Unitree legacy UDP (Go1 generation): `enabled`, `ports` (default `[8007, 8080, 8082, 8090]`), `command_senders` (IPs allowed to send `HighCmd` / `LowCmd`, or tables `{"ip", "mac"?, "label"?}`; `mac` binds the sender to its link-layer source), `robot_addresses` (default `192.168.123.10`, `192.168.123.161`). Needs `sensor.capture`. Unknown keys are refused. |
 | `host_threats` | Optional. `socket_path` (the socket `robodr-threat-forward` writes Pulsar threats to), `socket_mode` (`"0600"` default or `"0660"`), `allowed_uids` (peers besides uid 0), `max_connections` (default 2, max 8). See "Host threats" below. |
 | `control_plane` | Optional, off when absent. The SOC action-request API: `listen_tcp` (loopback unless `allow_remote`), `unix_socket` (`socket_mode` `"0600"`/`"0660"`), `soc_keys` (Ed25519 public key files), `max_clock_skew_s` 30, `rate_per_minute` 30, `burst` 10, `max_connections` 4, `max_requests` 1024, `answer_timeout_ms` 5000. Requests are judged and recorded, **never executed**. See "Control plane" below. |
 | `daemon` | `queue_capacity` 4096 (max 65536), `queue_bytes` 33554432 (32 MiB; 1 MiB..=256 MiB), `tick_ms` 1000, `heartbeat_ms` 10000, `silence_ms` 30000, `lag_ms` 2000, `health_report_ms` 10000, `exit_when_inputs_end` false |
@@ -151,7 +151,22 @@ path:
   conservative `humanoid`, warned) too; a joint channel `/lowcmd`,
   `/arm_sdk` or `/user_lowcmd` whose slot count differs from the model's
   IDL (go 20, hg 35) is an error; legacy UDP on a DDS model (or the
-  reverse) is a warning.
+  reverse) is a warning. **Without** a model the morphology does not fail
+  open: a 35-slot (`unitree_hg`) joint channel needs a `humanoid` firewall
+  platform and a `humanoid` (or unspecified) policy, since every
+  `unitree_hg` robot is a humanoid; and a profile with `/lowcmd`,
+  `/arm_sdk`, `/user_lowcmd` or `/api/*` channels but no model is a
+  warning (`--check-config` and the start log). Any joint channel whose
+  profile-recorded type (`motion_types`, written by `robodr-commission
+  learn`) is a Unitree `LowCmd_` must have that layout's slot count,
+  whatever its name. A legacy channel (`/unitree_legacy/...`) is refused as
+  a `joint_config` channel: legacy frames carry no writer identity the
+  firewall could authorise, so every frame would be an unknown-source
+  rejection before its joints were checked (the sensor checks the sender
+  and the profile envelope checks the joints of every decodable frame).
+  With a `firewall` section, a twist / joint-velocity channel whose kind
+  neither the profile's recorded type nor its envelope tells (learned
+  `max_linear_speed: 0` plus a `max_joint_speed`) is refused.
 - **Legacy UDP (Go1).** With `sensor.unitree_legacy.enabled`, the capture
   (kernel BPF included) also accepts UDP on the legacy ports; the pipeline
   decodes `HighCmd` / `LowCmd` / `HighState` / `LowState` by length and maps
@@ -159,8 +174,14 @@ path:
   `low_state` (commands to the agent, feedback when listed in
   `feedback_topics`). A command from an IP not in `command_senders` is
   `robot.unitree.legacy_unknown_sender` (Critical; Medium for state from an
-  address not in `robot_addresses`), a compressed v3.8.6 low-level frame is
-  `robot.motion.undecodable_sample`. A profile is learned from a legacy
+  address not in `robot_addresses`) — also for a compressed v3.8.6
+  `LowCmd`, which is additionally `robot.motion.undecodable_sample`. More
+  than 16 unlisted senders of a class are aggregated
+  (`robot.unitree.legacy_sender_flood`); a MAC-bound sender seen with
+  another MAC is `robot.unitree.legacy_sender_mac_mismatch` (High); RTPS on
+  a legacy port is inspected on both paths
+  (`robot.unitree.legacy_port_rtps`, High). Legacy ports inside the DDS
+  domain's RTPS port range are refused. A profile is learned from a legacy
   capture with `robodr-commission learn --pcap ... --unitree-legacy`.
 - **Examples.** `config/profile.unitree-<model>.example.json` (one per
   model the decoders support; illustrative envelopes, the model label says
@@ -260,7 +281,11 @@ one JSON object per line:
   `credential_theft`, `trojaned_package_key_access`, `defense_tampering`,
   `host_process_persistence`) fire. A threat from `robodr-sensor-ros2` is
   dropped and counted (`daemon.host_threats_own_skipped`): the daemon has
-  it from its own pipeline.
+  it from its own pipeline. A response-policy `rule_overrides` entry is
+  matched on the finding's rule id, so it can only target
+  `robot.host.pulsar_threat` as a whole, never one Pulsar rule (the
+  shipped policy examples therefore no longer carry the former
+  `robot.host.unexpected_egress` override, which nothing emits).
 - **Peers.** The socket's directory must be owned by root or the daemon's
   user and not writable by group or others; an existing path must be a
   socket owned by the daemon's user. The socket is created `0600` or `0660`.

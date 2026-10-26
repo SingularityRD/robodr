@@ -498,18 +498,14 @@ impl Agent {
                 // twist / joint-velocity firewall gets the profile without
                 // it, the joint firewall the profile with only its channels.
                 let mut twist_profile = cfg.profile.clone();
-                twist_profile
-                    .motion_envelopes
-                    .retain(|k, _| !fs.joint_channels.contains_key(k));
+                twist_profile.retain_motion_channels(|k| !fs.joint_channels.contains_key(k));
                 let policy = Policy::compile(&twist_profile, fs.platform, &fs.channels)
                     .map_err(AgentError::Firewall)?;
                 let joint = if fs.joint_channels.is_empty() {
                     None
                 } else {
                     let mut joint_profile = cfg.profile.clone();
-                    joint_profile
-                        .motion_envelopes
-                        .retain(|k, _| fs.joint_channels.contains_key(k));
+                    joint_profile.retain_motion_channels(|k| fs.joint_channels.contains_key(k));
                     let jp = Policy::compile_with_joints(
                         &joint_profile,
                         fs.platform,

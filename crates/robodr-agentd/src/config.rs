@@ -1251,6 +1251,13 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
     if let (Some(fc), Some(fw)) = (&firewall_joint, &config.firewall) {
         check_joint_firewall(fc, fw, &t.loaded.profile, &mut warnings)?;
     }
+    check_profile_channels(
+        robot_model,
+        &t.loaded.profile,
+        config.firewall.as_ref(),
+        firewall_joint.as_ref(),
+        &mut warnings,
+    )?;
     let correlation = correlation_rules(&config.correlation, &mut warnings)?;
     let host_threats = match &config.host_threats {
         None => None,
@@ -1493,6 +1500,11 @@ fn firewall_morphology(m: robodr_firewall::Morphology) -> robodr_responder::Morp
 ///   low-level message (`unitree_go` 20, `unitree_hg` 35).
 /// * **Legacy UDP.** `sensor.unitree_legacy` on a DDS-generation model (or
 ///   a legacy model without it) is a warning.
+/// * **Without a model (fail closed).** A joint firewall channel with 35
+///   motor slots is a `unitree_hg` low-level message, and every `unitree_hg`
+///   model is a humanoid (`robodr_cdr::unitree::model`): the firewall
+///   platform must then be `humanoid` and the policy `humanoid` or
+///   unspecified, model or not.
 pub fn check_robot_model(
     model: Option<robodr_cdr::UnitreeModel>,
     policy: &ResponsePolicy,
@@ -1510,6 +1522,21 @@ pub fn check_robot_model(
                 "firewall.joint_config platform morphology {fm:?} contradicts the response \
                  policy's morphology {pm:?}"
             ));
+        }
+    }
+    if let Some(j) = joint {
+        let hg = robodr_cdr::unitree::MOTOR_SLOTS_HG;
+        if let Some((ch, _)) = j.joint_channels.iter().find(|(_, s)| s.motors.len() == hg) {
+            let pm = policy.morphology;
+            let fm = fw_morph.unwrap_or(R::Unspecified);
+            if fm != R::Humanoid || !matches!(pm, R::Humanoid | R::Unspecified) {
+                return Err(format!(
+                    "firewall.joint_config channel {ch:?} has {hg} motor slots, the unitree_hg \
+                     low-level layout, and every unitree_hg robot is a humanoid (falls when \
+                     de-energised); the firewall platform morphology is {fm:?} and the response \
+                     policy's {pm:?}: set both to humanoid"
+                ));
+            }
         }
     }
     let Some(model) = model else {
@@ -1572,6 +1599,133 @@ pub fn check_robot_model(
     Ok(())
 }
 
+/// Unitree channels whose meaning depends on the robot model (low-level
+/// joint commands, robot API requests).
+fn model_dependent_channel(ch: &str) -> bool {
+    matches!(ch, "/lowcmd" | "/arm_sdk" | "/user_lowcmd") || ch.starts_with("/api/")
+}
+
+/// The profile's channels against the model and the firewall (needs the
+/// loaded profile, so it runs after [`check_robot_model`]):
+///
+/// * a profile with Unitree low-level or API channels and no
+///   `robot.robot_model` is a warning (API ids and slot layouts are then
+///   interpreted without the model);
+/// * a joint firewall channel whose profile-recorded type
+///   (`motion_types`) is a Unitree `LowCmd_` must have that layout's slot
+///   count (`unitree_go` 20, `unitree_hg` 35), whatever its name, and the
+///   layout must be the model's;
+/// * a legacy UDP channel (`/unitree_legacy/...`) is refused as a joint
+///   firewall channel: legacy frames carry no writer identity the firewall
+///   could authorise, so every frame would be rejected as an unknown
+///   source before its joints were checked (the sensor still evaluates
+///   them against the profile envelope and checks the sender address);
+/// * with a `firewall` section, every twist / joint-velocity channel must
+///   have a kind the firewall can tell ([`robodr_agent::channel_kind`]).
+pub fn check_profile_channels(
+    model: Option<robodr_cdr::UnitreeModel>,
+    profile: &robodr_events::profile::Profile,
+    firewall: Option<&FirewallSection>,
+    joint: Option<&robodr_firewall::FirewallConfig>,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    use robodr_cdr::unitree::{IdlFamily, MOTOR_SLOTS_GO, MOTOR_SLOTS_HG};
+    use robodr_cdr::MessageKind;
+    if model.is_none() {
+        let mut chans: Vec<&str> = profile
+            .motion_envelopes
+            .keys()
+            .chain(profile.writer_topics.iter())
+            .map(String::as_str)
+            .filter(|c| model_dependent_channel(c))
+            .collect();
+        // Low-level channels first, then the API services.
+        chans.sort_unstable_by_key(|c| (c.starts_with("/api/"), *c));
+        chans.dedup();
+        if !chans.is_empty() {
+            let shown: Vec<&str> = chans.iter().take(6).copied().collect();
+            warnings.push(format!(
+                "the profile has Unitree channels ({}{}) but robot.robot_model is not set: API \
+                 call ids and low-level layouts are interpreted without the model, and the \
+                 morphology is only checked from the slot counts; set robot.robot_model",
+                shown.join(", "),
+                if chans.len() > shown.len() {
+                    ", ..."
+                } else {
+                    ""
+                }
+            ));
+        }
+    }
+    if let Some(j) = joint {
+        for (ch, spec) in &j.joint_channels {
+            if ch.starts_with(robodr_cdr::unitree_legacy::channels::PREFIX) {
+                return Err(format!(
+                    "firewall.joint_config channel {ch:?} is a Unitree legacy UDP channel: \
+                     legacy frames carry no writer identity the joint firewall could \
+                     authorise (the sender is a UDP address), so every frame would be rejected \
+                     as an unknown source before its joints were checked; leave it out of \
+                     joint_config (the sensor still checks the sender against \
+                     unitree_legacy.command_senders and the frame against the profile envelope)"
+                ));
+            }
+            let Some(t) = profile.motion_types.get(ch) else {
+                continue;
+            };
+            let layout = match MessageKind::from_type_name(t) {
+                Some(MessageKind::UnitreeGoLowCmd) => (IdlFamily::Go, MOTOR_SLOTS_GO),
+                Some(MessageKind::UnitreeHgLowCmd) => (IdlFamily::Hg, MOTOR_SLOTS_HG),
+                _ => continue,
+            };
+            if spec.motors.len() != layout.1 {
+                return Err(format!(
+                    "firewall.joint_config channel {ch:?} has {} motor slots, but the profile \
+                     records its type as {t} ({} motor slots)",
+                    spec.motors.len(),
+                    layout.1
+                ));
+            }
+            if let Some(m) = model {
+                let info = m.info();
+                if info.idl.is_some_and(|idl| idl != layout.0) {
+                    return Err(format!(
+                        "firewall.joint_config channel {ch:?}: the profile records its type as \
+                         {t}, which is not the low-level layout of robot.robot_model {}",
+                        info.name
+                    ));
+                }
+            }
+        }
+    }
+    if firewall.is_some() {
+        let legacy: Vec<&String> = profile
+            .motion_envelopes
+            .keys()
+            .filter(|c| c.starts_with(robodr_cdr::unitree_legacy::channels::PREFIX))
+            .collect();
+        if !legacy.is_empty() {
+            warnings.push(format!(
+                "firewall: the profile's Unitree legacy channels ({}) carry no writer identity, \
+                 so the firewall records every legacy command as from an unknown source; the \
+                 sensor's sender check (unitree_legacy.command_senders) is what authorises them",
+                legacy
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        for (ch, env) in &profile.motion_envelopes {
+            if joint.is_some_and(|j| j.joint_channels.contains_key(ch)) {
+                continue;
+            }
+            let (_, w) = robodr_agent::channel_kind(profile, ch, env)?;
+            warnings.extend(w);
+        }
+    }
+    Ok(())
+}
+
 /// Check `firewall.joint_config` against the profile as the daemon will
 /// run it, **with the platform as written** (so a humanoid configured with
 /// a damping / fail-open substitute is refused even though the daemon only
@@ -1597,9 +1751,7 @@ fn check_joint_firewall(
         }
     }
     let mut joint_profile = profile.clone();
-    joint_profile
-        .motion_envelopes
-        .retain(|k, _| fc.joint_channels.contains_key(k));
+    joint_profile.retain_motion_channels(|k| fc.joint_channels.contains_key(k));
     for ch in fc.joint_channels.keys() {
         if !profile.motion_envelopes.contains_key(ch) {
             return Err(format!(
@@ -1612,7 +1764,9 @@ fn check_joint_firewall(
                 "firewall.joint_config channel \"/arm_sdk\": the arm SDK sends mode 0 on every \
                  slot and still moves the arms; the joint firewall rejects a mode-0 slot with \
                  gains (joint_mode_inconsistent), so every arm-SDK frame becomes a would-have \
-                 rejection"
+                 rejection. Leave \"/arm_sdk\" out of firewall.joint_config: the profile \
+                 envelope still checks torque, kp and position step on every slot of every \
+                 arm-SDK frame (robot.motion.joint_over_envelope)"
                     .into(),
             );
         }

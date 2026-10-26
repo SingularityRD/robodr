@@ -844,6 +844,30 @@ fn catalog_2_1(rule: &str) -> Option<RuleInfo> {
             MOTION,
             &[T0855],
         ),
+        "robot.unitree.legacy_sender_flood" => e(
+            "Unitree legacy UDP frames from many unknown hosts",
+            "Unitree legacy (unitree_legged_sdk) UDP frames arrived from more unlisted source addresses than are reported one by one, or listed command senders appeared with many different wrong link-layer addresses; the frames are counted in aggregate. A spoofed-source flood or a scan of the robot's command ports.",
+            MOTION,
+            &[T0855],
+        ),
+        "robot.unitree.legacy_sender_mac_mismatch" => e(
+            "Unitree legacy command from a listed IP with the wrong MAC",
+            "A Unitree legacy UDP command came from a configured command sender IP, but its link-layer source address is not the MAC bound to that IP (or could not be verified because the datagram was reassembled from fragments): another host on the LAN may be using the sender's address.",
+            MOTION,
+            &[T0855],
+        ),
+        "robot.unitree.legacy_port_rtps" => e(
+            "RTPS traffic on a Unitree legacy UDP port",
+            "A datagram on a configured Unitree legacy UDP port also parses as RTPS; it was inspected on both paths. DDS traffic on the legacy command ports is not normal and can be an attempt to evade the legacy sender check.",
+            MOTION,
+            &[T0855],
+        ),
+        "robot.motion.command_type_mismatch" => e(
+            "Motion command writer with an unexpected type",
+            "A writer on a profiled motion command channel announced a type name other than the one the locked profile records for the channel, a type no decoder knows, or a feedback type: its commands cannot be checked as the profile intends.",
+            MOTION,
+            &[T0855],
+        ),
         "robot.motion.control_handover" => e(
             "Motor control handed to another channel",
             "A command hands motor control to, or takes it from, another channel or controller (motion switcher release, user or arm SDK control).",

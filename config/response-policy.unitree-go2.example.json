@@ -19,11 +19,6 @@
       "min_step": "restrict",
       "max_step": "limit_motion",
       "restrict": ["participant"]
-    },
-    {
-      "rule": "robot.host.unexpected_egress",
-      "max_step": "restrict",
-      "restrict": ["network"]
     }
   ],
   "auto_max_step": "limit_motion",

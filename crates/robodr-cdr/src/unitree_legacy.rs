@@ -732,6 +732,30 @@ pub enum LegacyKind {
 }
 
 impl LegacyKind {
+    /// A DDS-style type label for this frame (the legacy protocol has no
+    /// type names; used where a type name is expected, e.g.
+    /// `robodr_events::profile::Profile::motion_types`).
+    pub fn type_label(self) -> &'static str {
+        match self {
+            LegacyKind::HighCmd => "unitree_legged_sdk::HighCmd",
+            LegacyKind::HighState => "unitree_legged_sdk::HighState",
+            LegacyKind::LowCmd => "unitree_legged_sdk::LowCmd",
+            LegacyKind::LowState => "unitree_legged_sdk::LowState",
+        }
+    }
+
+    /// The legacy frame kind of a [`LegacyKind::type_label`].
+    pub fn from_type_label(label: &str) -> Option<Self> {
+        [
+            LegacyKind::HighCmd,
+            LegacyKind::HighState,
+            LegacyKind::LowCmd,
+            LegacyKind::LowState,
+        ]
+        .into_iter()
+        .find(|k| k.type_label() == label)
+    }
+
     /// The declared (`comm.h` packed `sizeof`) length of this frame.
     pub fn declared_len(self) -> usize {
         match self {

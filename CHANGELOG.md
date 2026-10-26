@@ -565,6 +565,80 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Fixed
 
+- Unitree live integration, independent review (regression test for each):
+  - **Legacy UDP sender check (H1).** A compressed 614-byte Go1 `LowCmd`
+    (how every real Go1 low-level command is sent) from an unlisted host
+    now raises `robot.unitree.legacy_unknown_sender` (Critical) before it
+    is reported as not inspected; the check runs on the class the payload
+    length announces. Unlisted-sender findings have their own per-class
+    budget outside the shared rate limiter (an `undecodable_sample` flood
+    cannot suppress them).
+  - **Spoofed-source floods (M3).** Beyond 16 unlisted senders per class
+    the findings are aggregated into `robot.unitree.legacy_sender_flood`
+    (Critical for commands) with frame counts at 1, 2, 4, 8, ... frames;
+    memory stays bounded. `unitree_legacy.command_senders` entries may be
+    tables `{ip, mac?, label?}`: a command from a MAC-bound sender with
+    another link-layer source (or reassembled from IP fragments) is
+    `robot.unitree.legacy_sender_mac_mismatch` (High) and not attributed.
+    `RtpsPacket::src_mac` / `LegacyUdp::src_mac` carry the source MAC
+    (Ethernet, Linux cooked capture, `AF_PACKET` `sll_addr`). A MAC can be
+    forged on the same L2 segment too: the binding raises the bar only.
+  - **RTPS on a legacy port (H2).** A datagram on a configured legacy port
+    is always delivered as legacy (`PacketKind::UnitreeLegacy`); one that
+    is also RTPS (`RtpsPacket::also_rtps`, `CaptureStats::rtps_on_legacy_port`)
+    is inspected on both paths with `robot.unitree.legacy_port_rtps`
+    (High) (`Pipeline::process_legacy_from_at`). The sensor configuration
+    refuses legacy ports inside the RTPS port range of a configured DDS
+    domain (e.g. domain 2 covers 8007 / 8080 / 8082 / 8090).
+  - **Command type names (M4).** The profile records the announced type of
+    each motion channel (`Profile::motion_types`, optional key, written by
+    `robodr-commission learn` where every writer agreed); a writer on a
+    profiled command channel announcing another type, an unknown type or a
+    feedback type is `robot.motion.command_type_mismatch` (High, at the
+    announcement) instead of only a rate-limited Medium per sample.
+  - **Firewall channel kind (M1).** `FirewallSettings::from_profile` takes a
+    channel's kind from the recorded type (`robodr_agent::channel_kind`,
+    `kind_of_type`), not from learned zeros: a twist channel whose learned
+    `max_linear_speed` is 0 no longer becomes a joint channel (an alarm
+    storm of `rejected_kind_mismatch`). Without a type an ambiguous
+    envelope (`max_linear_speed: 0` plus a `max_joint_speed`) is refused
+    with a clear message; `FirewallSettings::warnings` says when the type
+    had to decide.
+  - **Morphology without `robot_model` (M2).** A 35-slot (`unitree_hg`)
+    joint channel requires a humanoid firewall platform and policy (every
+    hg model is a humanoid); a profile with `/lowcmd`, `/arm_sdk`,
+    `/user_lowcmd` or `/api/*` channels and no `robot.robot_model` is
+    warned about; slot counts are checked by the recorded `LowCmd_` type
+    for any channel name; a legacy channel is refused as a `joint_config`
+    channel (legacy frames carry no writer identity the firewall could
+    authorise). Decoded legacy `LowCmd` frames now carry their 20-slot
+    joint frame.
+  - **Response-policy overrides (M6).** The shipped policies overrode
+    `robot.host.unexpected_egress` and `robot.motion.unexpected_source`,
+    which nothing emits. Host detections all arrive as
+    `robot.host.pulsar_threat` (an override cannot single out one Pulsar
+    rule), so the egress override is removed; the source override now
+    names `robot.motion.sample_source_mismatch`. A test checks every
+    override in `config/*.json` against the OCSF catalog.
+  - **Capture.** 802.1Q / 802.1ad frames whose inner tag the kernel left
+    in place are no longer dropped by `AF_PACKET` as non-IP: the source
+    hands each frame on behind a synthesized Linux cooked header
+    (`LinkType::LINUX_SLL`, keeping `sll_addr`), the kernel BPF accepts
+    tagged frames via `SKF_AD_PROTOCOL` and user space follows up to two
+    tags (`BpfProgram::run_with_protocol` for tests). The `AF_PACKET`
+    docs now say that a sensor box with a promiscuous capture NIC sees
+    other hosts' mirrored traffic.
+  - **Examples.** Go2-W, H1, H2 and R1 profile examples carry
+    `/api/motion_switcher/request`; the sensor-box example's command
+    sender is a labelled example operator PC (192.168.123.162), not a Go1
+    internal computer; the `/arm_sdk` joint-firewall warning says to leave
+    the channel out of `joint_config` (the profile envelope still checks
+    torque, kp and step on every slot).
+  - New rule ids (contract 2.1 OCSF catalog, correlation catalog):
+    `robot.unitree.legacy_sender_flood`,
+    `robot.unitree.legacy_sender_mac_mismatch`,
+    `robot.unitree.legacy_port_rtps`, `robot.motion.command_type_mismatch`.
+
 - Unitree decoders (`robodr-cdr`), review of the initial implementation:
   joint command frames are evaluated over **every** slot whatever the mode
   octet (`rt/arm_sdk` sends `mode = 0` and still moves the arms; a

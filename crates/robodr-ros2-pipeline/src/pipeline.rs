@@ -30,8 +30,9 @@
 //! | | [`rules::CAPTURE_UNSUPPORTED_MIDDLEWARE`]: Zenoh (`rmw_zenoh_cpp`) packets on the bus, which the sensor cannot decode | **High** while the capture has accepted no RTPS at all (the sensor is blind to this robot), Medium when RTPS is seen too (part of the bus is not inspected) |
 //! | the profile failed `Profile::validate`, or a locked profile file failed the commissioning file check (seal: edited after `lock`) or the trust check (signature, trust anchors, platform/unit, anti-rollback; see [`crate::profile_trust`]) (once, [`Pipeline::status_findings`]) | [`rules::PROFILE_REFUSED`] | High |
 //! | one input produced more than `max_findings_per_datagram` new findings | [`rules::FINDINGS_CAPPED`] | most severe suppressed, >= Medium |
+//! | a writer announced (SEDP) on a profiled command channel with a type other than the profile's `motion_types` entry, a type no decoder knows, or a feedback type ([`crate::motion`]) | [`rules::MOTION_COMMAND_TYPE_MISMATCH`] | High |
 //! | user DATA on a motion / feedback topic ([`crate::motion`]): undecodable, unattributed (writer never announced), from an IP outside the writer's binding; decoded commands through `Profile::evaluate` | [`rules::MOTION_UNDECODABLE_SAMPLE`], [`rules::MOTION_UNATTRIBUTED_SAMPLE`], [`rules::MOTION_SAMPLE_SOURCE_MISMATCH`], the profile's `robot.motion.*` rules | Medium (rate limited) / High / Critical (command) or High (feedback) / as the profile says |
-//! | Unitree legacy UDP ([`crate::legacy`], off by default): a frame from an unlisted sender, an undecodable payload on a legacy port; decoded commands through `Profile::evaluate` | [`rules::LEGACY_UNKNOWN_SENDER`], [`rules::MOTION_UNDECODABLE_SAMPLE`], the profile's `robot.motion.*` rules | Critical (command) / Medium (state); Medium (rate limited); as the profile says |
+//! | Unitree legacy UDP ([`crate::legacy`], off by default): a frame (decoded or compressed) from an unlisted sender, a spoofed-source flood, a MAC-bound sender with another MAC, RTPS on a legacy port, an undecodable payload on a legacy port; decoded commands through `Profile::evaluate` | [`rules::LEGACY_UNKNOWN_SENDER`], [`rules::LEGACY_SENDER_FLOOD`], [`rules::LEGACY_SENDER_MAC_MISMATCH`], [`rules::LEGACY_PORT_RTPS`], [`rules::MOTION_UNDECODABLE_SAMPLE`], the profile's `robot.motion.*` rules | Critical (command) / Medium (state); as the sender's class; High; High; Medium (rate limited); as the profile says |
 //!
 //! # Motion samples
 //!
@@ -120,7 +121,7 @@ use crate::binding::{
 };
 use crate::dedup::DedupSet;
 use crate::identity::{IdentityResolver, IdentityStats, Resolution};
-use crate::legacy::{self, LegacyOptions, LegacyStats};
+use crate::legacy::{self, LegacyOptions, LegacyStats, LegacyTracker};
 use crate::motion::{
     DatagramCtx, MotionOptions, MotionSample, MotionStats, MotionTracker, SampleAttribution,
 };
@@ -341,10 +342,13 @@ pub mod rules {
         ENDPOINT_SOURCE_MISMATCH, ENDPOINT_UNANNOUNCED_PARTICIPANT, PARTICIPANT_SOURCE_MISMATCH,
     };
     pub use crate::identity::rules::IDENTITY_INSTANCES_EXCEEDED;
-    pub use crate::legacy::rules::LEGACY_UNKNOWN_SENDER;
+    pub use crate::legacy::rules::{
+        LEGACY_PORT_RTPS, LEGACY_SENDER_FLOOD, LEGACY_SENDER_MAC_MISMATCH, LEGACY_UNKNOWN_SENDER,
+    };
     pub use crate::motion::rules::{
-        MOTION_API_ID_OUT_OF_RANGE, MOTION_DECODE_ANOMALY, MOTION_SAMPLE_SOURCE_MISMATCH,
-        MOTION_UNATTRIBUTED_SAMPLE, MOTION_UNDECODABLE_SAMPLE, MOTION_UNVERIFIABLE_COMMAND,
+        MOTION_API_ID_OUT_OF_RANGE, MOTION_COMMAND_TYPE_MISMATCH, MOTION_DECODE_ANOMALY,
+        MOTION_SAMPLE_SOURCE_MISMATCH, MOTION_UNATTRIBUTED_SAMPLE, MOTION_UNDECODABLE_SAMPLE,
+        MOTION_UNVERIFIABLE_COMMAND,
     };
 }
 
@@ -643,6 +647,8 @@ pub struct Pipeline {
     checksum_window: Option<(Instant, u64)>,
     /// User-DATA motion decode path.
     motion: MotionTracker,
+    /// Per-sender finding budgets of the legacy UDP path.
+    legacy: LegacyTracker,
     /// Fresh GUID prefixes -> the profile's stable identities. Resolved
     /// prefixes are added to `profile.participants` (the working copy) and
     /// removed again when they release the identity.
@@ -723,6 +729,7 @@ impl Pipeline {
             last_health: None,
             checksum_window: None,
             motion: MotionTracker::new(opts.motion.clone()),
+            legacy: LegacyTracker::default(),
             epoch: Instant::now(),
             identities: IdentityResolver::new(&profile),
             static_participants: profile.participants.clone(),
@@ -1042,7 +1049,9 @@ impl Pipeline {
         self.node_evidence(&report, now);
         self.protocol_findings(&report, src_ip, &ambiguity, &mut out);
         // Motion: learn this datagram's SEDP first, then its user DATA.
-        self.motion.learn(&self.profile, &report);
+        for dev in self.motion.learn(&self.profile, &report) {
+            self.push(&mut out, dev, src_ip);
+        }
         let ctx = DatagramCtx {
             src_ip,
             ip,
@@ -1072,9 +1081,10 @@ impl Pipeline {
         capture_ns: u64,
     ) -> ProcessOutput {
         if let Some(udp) = &datagram.legacy {
-            return self.process_legacy_at(
+            return self.process_legacy_from_at(
                 &datagram.payload,
                 &datagram.src_ip,
+                datagram.ingress,
                 udp,
                 Instant::now(),
                 capture_ns,
@@ -1094,6 +1104,8 @@ impl Pipeline {
     /// `motion.evaluate_commands`) and returned as a [`MotionSample`]
     /// (commands always; feedback when its channel is a configured
     /// feedback topic). Dropped (counted) while the legacy path is off.
+    /// The interface is unknown ([`Ingress::Unknown`]); see
+    /// [`Pipeline::process_legacy_from_at`].
     pub fn process_legacy_at(
         &mut self,
         payload: &[u8],
@@ -1102,6 +1114,33 @@ impl Pipeline {
         now: Instant,
         capture_ns: u64,
     ) -> ProcessOutput {
+        self.process_legacy_from_at(payload, src_ip, Ingress::Unknown, udp, now, capture_ns)
+    }
+
+    /// [`Pipeline::process_legacy_at`] for a datagram whose interface kind
+    /// is known. A legacy datagram that is also RTPS ([`LegacyUdp::also_rtps`]:
+    /// it starts with the RTPS magic or uses a well-known RTPS port) is
+    /// inspected on **both** paths, plus a High
+    /// [`rules::LEGACY_PORT_RTPS`] finding: nothing on a legacy port escapes
+    /// the legacy sender check by looking like RTPS. While the legacy path
+    /// is off, such a datagram is processed as RTPS only (as before).
+    pub fn process_legacy_from_at(
+        &mut self,
+        payload: &[u8],
+        src_ip: &str,
+        ingress: Ingress,
+        udp: &LegacyUdp,
+        now: Instant,
+        capture_ns: u64,
+    ) -> ProcessOutput {
+        let mut rtps = None;
+        if udp.also_rtps {
+            rtps = Some(self.process_with_motion_at(payload, src_ip, ingress, now, capture_ns));
+            if self.opts.legacy.enabled {
+                // One datagram, two paths: counted once.
+                self.stats.datagrams = self.stats.datagrams.saturating_sub(1);
+            }
+        }
         self.stats.datagrams += 1;
         self.stats.legacy.datagrams += 1;
         let mut out = Vec::new();
@@ -1109,15 +1148,35 @@ impl Pipeline {
         let mut motion = Vec::new();
         if !self.opts.legacy.enabled {
             self.stats.legacy.ignored += 1;
-            return ProcessOutput {
-                findings: self.emit(out, now),
-                motion,
-            };
+            let mut findings = self.emit(out, now);
+            if let Some(r) = rtps {
+                findings.extend(r.findings);
+                motion.extend(r.motion);
+            }
+            return ProcessOutput { findings, motion };
+        }
+        if udp.also_rtps {
+            self.stats.legacy.rtps_on_legacy_port += 1;
+            self.push(
+                &mut out,
+                Deviation::new(
+                    rules::LEGACY_PORT_RTPS,
+                    Severity::High,
+                    format!(
+                        "RTPS datagram from {src_ip}:{} to {}:{}, a Unitree legacy UDP port: \
+                         inspected as RTPS and as a legacy frame (DDS on the legacy ports is \
+                         not normal; an attempt to evade the legacy sender check?)",
+                        udp.src_port, udp.dst_ip, udp.dst_port
+                    ),
+                ),
+                src_ip,
+            );
         }
         let ip = parse_src_ip(src_ip);
         let r = legacy::process(
             &self.opts.legacy,
             &mut self.stats.legacy,
+            &mut self.legacy,
             payload,
             src_ip,
             ip,
@@ -1130,10 +1189,20 @@ impl Pipeline {
         if let Some((mut event, frame, allowed)) = r.event {
             let command = frame.is_command();
             let channel = frame.channel();
+            // A decoded (declared-layout) `LowCmd` carries its 20-slot
+            // frame for a joint firewall, like an SDK2 `LowCmd_`. The
+            // legacy protocol's CRC and mode fields are not checked here.
+            let mut joint = None;
             if let (RobotEvent::MotionCommand(c), Some(jf)) =
                 (&mut event, frame.joint_command_frame())
             {
                 self.motion.note_joint_frame(channel, jf, c);
+                joint = Some(crate::motion::JointCommandSample {
+                    frame: jf,
+                    crc_ok: None,
+                    mode_pr: None,
+                    mode_machine: None,
+                });
             }
             let wanted = command || self.opts.motion.feedback_topics.contains(channel);
             if command && self.opts.motion.evaluate_commands {
@@ -1158,14 +1227,16 @@ impl Pipeline {
                     } else {
                         SampleAttribution::Unbound
                     },
-                    joint: None,
+                    joint,
                 });
             }
         }
-        ProcessOutput {
-            findings: self.emit(out, now),
-            motion,
+        let mut findings = self.emit(out, now);
+        if let Some(r) = rtps {
+            findings.extend(r.findings);
+            motion.extend(r.motion);
         }
+        ProcessOutput { findings, motion }
     }
 
     fn expire_into(&mut self, now: Instant, out: &mut Vec<Candidate>) {
@@ -1344,9 +1415,10 @@ impl Pipeline {
         if let Some(udp) = &datagram.legacy {
             let capture_ns = self.default_capture_ns(Instant::now());
             return self
-                .process_legacy_at(
+                .process_legacy_from_at(
                     &datagram.payload,
                     &datagram.src_ip,
+                    datagram.ingress,
                     udp,
                     Instant::now(),
                     capture_ns,

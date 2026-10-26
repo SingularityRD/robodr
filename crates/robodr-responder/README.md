@@ -232,7 +232,7 @@ is at hand.
 | `morphology` | `humanoid`, `quadruped`, `wheeled_mobile`, `arm`, `aerial`, `other`. Required when `oem_validated` or `platform: other`; otherwise absent = `unspecified` (treated as humanoid). See *Morphology* |
 | `oem_validated` | `true` only after OEM sign-off; otherwise observe-only |
 | `matrix.<state>.<severity>` | Max step. States: `idle`, `moving_slow`, `moving_fast`, `collaborative_human_nearby`, `estop_active`, `safe_state_active`, `unknown`. All states/severities required; e-stop/safe-state rows must be `record` |
-| `rule_overrides[]` | `{rule, min_step?, max_step?, restrict?}` — clamps the matrix step for one rule id; ≤ 256, unique, `[A-Za-z0-9._-]{1,128}` |
+| `rule_overrides[]` | `{rule, min_step?, max_step?, restrict?}` — clamps the matrix step for one rule id (exact match on the finding's rule id); ≤ 256, unique, `[A-Za-z0-9._-]{1,128}`. Every Pulsar host detection arrives as **one** id, `robot.host.pulsar_threat` (the Pulsar rule name is only in the detail), so an override cannot single out one host rule (e.g. network egress): an override of `robot.host.pulsar_threat` applies to all of them. An id no detector raises is silently never matched; the shipped examples are tested against the OCSF catalog |
 | `auto_max_step` | Highest step executable without approval |
 | `limit_motion_factor` | Envelope scale for step 3, finite, in (0, 1]; ≥ `min_motion_factor` on humanoid / quadruped |
 | `min_motion_factor` | Default `0.2`, in [0.05, 1]: lowest envelope scale (planner and control-plane `restrict_motion` caps) on a robot that needs active balance |

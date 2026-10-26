@@ -5,6 +5,8 @@
     "0123456789abcdef01234567"
   ],
   "writer_topics": [
+    "/api/motion_switcher/request",
+    "/api/motion_switcher/response",
     "/api/sport/request",
     "/api/sport/response",
     "/arm_sdk",
@@ -14,6 +16,10 @@
     "/wirelesscontroller"
   ],
   "motion_envelopes": {
+    "/api/motion_switcher/request": {
+      "max_linear_speed": 0.0,
+      "max_joint_speed": null
+    },
     "/api/sport/request": {
       "max_linear_speed": 1.0,
       "max_joint_speed": null

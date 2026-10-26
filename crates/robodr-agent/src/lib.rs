@@ -69,8 +69,8 @@ pub use clock::{
     DEFAULT_CLOCK_JUMP_TOLERANCE_NS,
 };
 pub use config::{
-    profile_sha256, strict_from_str, AgentConfig, AgentError, FirewallSettings, MonitorSettings,
-    MAX_TRACKED_FINDINGS,
+    channel_kind, kind_of_type, profile_sha256, strict_from_str, AgentConfig, AgentError,
+    FirewallSettings, MonitorSettings, MAX_TRACKED_FINDINGS,
 };
 pub use evidence::{finding_refs, resolve_links, verify_blackbox, LinkReport};
 pub use executor::{ExecutionRequest, Executor, LoggingExecutor, NoopExecutor};

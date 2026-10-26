@@ -21,14 +21,9 @@
       "restrict": ["participant"]
     },
     {
-      "rule": "robot.motion.unexpected_source",
+      "rule": "robot.motion.sample_source_mismatch",
       "min_step": "restrict",
       "restrict": ["participant", "process"]
-    },
-    {
-      "rule": "robot.host.unexpected_egress",
-      "max_step": "restrict",
-      "restrict": ["network", "process"]
     }
   ],
   "auto_max_step": "limit_motion",

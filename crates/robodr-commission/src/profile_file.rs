@@ -87,8 +87,9 @@ pub const PROFILE_KEYS: [&str; 9] = [
     "raw_dds_topics",
 ];
 /// Optional top-level keys (`metadata` is written by `lock`;
-/// `participant_identities` by `learn`, omitted when empty).
-pub const OPTIONAL_PROFILE_KEYS: [&str; 2] = ["metadata", "participant_identities"];
+/// `participant_identities` and `motion_types` by `learn`, omitted when
+/// empty).
+pub const OPTIONAL_PROFILE_KEYS: [&str; 3] = ["metadata", "participant_identities", "motion_types"];
 /// Keys of one `participant_identities` entry; `ips` and `vendor` are
 /// required, the rest optional.
 pub const IDENTITY_KEYS: [&str; 5] = ["ips", "vendor", "enclave", "nodes", "max_instances"];
@@ -355,6 +356,20 @@ pub fn parse_profile_text(text: &str) -> Result<Profile, ProfileFileError> {
                     }
                     _ => {}
                 }
+            }
+        }
+    }
+    if let Some(t) = obj.get("motion_types") {
+        let t = t.as_object().ok_or_else(|| ProfileFileError::BadEnvelope {
+            channel: String::new(),
+            detail: "motion_types is not an object".into(),
+        })?;
+        for (channel, v) in t {
+            if !v.is_string() {
+                return Err(ProfileFileError::BadEnvelope {
+                    channel: channel.clone(),
+                    detail: "motion_types value is not a string".into(),
+                });
             }
         }
     }

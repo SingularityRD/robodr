@@ -251,18 +251,122 @@ pub struct FirewallSettings {
     /// in `channels` ([`FirewallSettings::with_joint_channels`]). Empty by
     /// default.
     pub joint_channels: BTreeMap<String, JointChannelSpec>,
+    /// Configuration warnings found while building the settings (e.g. a
+    /// channel whose envelope alone would not tell its kind; see
+    /// [`channel_kind`]). For the operator log / `--check-config`.
+    pub warnings: Vec<String>,
+}
+
+/// The firewall channel kind a command type name stands for: twist-like
+/// (`geometry_msgs` `Twist` / `TwistStamped`, Unitree API requests, the
+/// legacy `HighCmd`) or joint (`JointTrajectory`, Unitree `LowCmd_` /
+/// `HandCmd_` / `MotorCmds_` / `MotorCmd_`, the legacy `LowCmd`). `Err` for
+/// a known type that is not a command type; `Ok(None)` for a type this
+/// build does not know.
+pub fn kind_of_type(type_name: &str) -> Result<Option<ChannelKind>, String> {
+    use robodr_cdr::unitree_legacy::LegacyKind;
+    use robodr_cdr::MessageKind as K;
+    if let Some(k) = LegacyKind::from_type_label(type_name) {
+        return match k {
+            LegacyKind::HighCmd => Ok(Some(ChannelKind::Twist)),
+            LegacyKind::LowCmd => Ok(Some(ChannelKind::Joints { count: 1 })),
+            LegacyKind::HighState | LegacyKind::LowState => {
+                Err(format!("{type_name} is a state type, not a command type"))
+            }
+        };
+    }
+    let Some(k) = K::from_type_name(type_name) else {
+        return Ok(None);
+    };
+    match k {
+        K::Twist | K::TwistStamped | K::UnitreeApiRequest => Ok(Some(ChannelKind::Twist)),
+        K::JointTrajectory
+        | K::UnitreeGoLowCmd
+        | K::UnitreeHgLowCmd
+        | K::UnitreeHgHandCmd
+        | K::UnitreeGoMotorCmds
+        | K::UnitreeHgMotorCmd => Ok(Some(ChannelKind::Joints { count: 1 })),
+        K::Odometry
+        | K::Imu
+        | K::JointState
+        | K::UnitreeGoLowState
+        | K::UnitreeGoSportModeState
+        | K::UnitreeHgLowState
+        | K::UnitreeHgHandState
+        | K::UnitreeHgImuState
+        | K::UnitreeHgDoubleImuState
+        | K::UnitreeHgMotorState => Err(format!(
+            "{type_name} is a feedback type, not a command type"
+        )),
+    }
+}
+
+/// The firewall kind of profiled motion channel `channel` with envelope
+/// `env`, and a warning when the decision needed the recorded type.
+///
+/// The profile's recorded type ([`Profile::motion_types`]) decides when
+/// it is a known command type. Otherwise the envelope decides, as before:
+/// no `max_joint_speed` = twist; `max_joint_speed` without
+/// `max_linear_speed` = joint; a positive `max_linear_speed` = twist. An
+/// envelope with `max_linear_speed: 0` **and** a `max_joint_speed` is
+/// ambiguous (the commissioning learner writes 0 for every dimension a
+/// channel never exercised, so a twist channel that only turned in place
+/// and a joint channel look the same): refused, never guessed.
+pub fn channel_kind(
+    profile: &Profile,
+    channel: &str,
+    env: &robodr_events::profile::Envelope,
+) -> Result<(ChannelKind, Option<String>), String> {
+    let inferred = match (env.max_joint_speed, env.max_linear_speed) {
+        (None, _) => Some(ChannelKind::Twist),
+        (Some(_), None) => Some(ChannelKind::Joints { count: 1 }),
+        (Some(_), Some(v)) if v > 0.0 => Some(ChannelKind::Twist),
+        (Some(_), Some(_)) => None,
+    };
+    let typed = match profile.motion_types.get(channel) {
+        Some(t) => kind_of_type(t).map_err(|e| {
+            format!("firewall channel {channel:?}: the profile's motion_types entry: {e}")
+        })?,
+        None => None,
+    };
+    match (typed, inferred) {
+        (Some(k), None) => Ok((
+            k,
+            Some(format!(
+                "firewall channel {channel:?}: the envelope alone is ambiguous \
+                 (max_linear_speed 0 and a max_joint_speed, as the learner writes for unseen \
+                 dimensions); kind {k:?} taken from the profile's recorded type"
+            )),
+        )),
+        (Some(k), Some(i)) if k != i => Ok((
+            k,
+            Some(format!(
+                "firewall channel {channel:?}: the envelope suggests {i:?}, the profile's \
+                 recorded type says {k:?}; using {k:?}"
+            )),
+        )),
+        (Some(k), Some(_)) => Ok((k, None)),
+        (None, Some(i)) => Ok((i, None)),
+        (None, None) => Err(format!(
+            "firewall channel {channel:?}: cannot tell a twist channel from a joint channel: \
+             the envelope has max_linear_speed 0 and a max_joint_speed (the learner writes 0 \
+             for a dimension it never saw) and the profile records no known command type for \
+             it (motion_types); re-learn the profile with this version (it records the \
+             announced types), or set max_linear_speed to null for a joint channel / \
+             max_joint_speed to null for a twist channel"
+        )),
+    }
 }
 
 impl FirewallSettings {
     /// One spec per envelope channel of `profile`, with default limits
     /// (the envelope itself, 2x hard-reject factor, 200 ms max age).
     ///
-    /// Channel kind: `Joints { count: 1 }` if the envelope bounds joint
-    /// speed and allows no linear speed (no `max_linear_speed`, or `0`: the
-    /// learner bounds a dimension a joint channel never exercised at 0 =
-    /// deny), otherwise `Twist` (a `MotionCommand` carries only the max joint
-    /// speed, see [`crate::agent`]). A linear command on a joint channel is
-    /// a kind mismatch, so the `0` case still fails closed. Allowed sources come from
+    /// Channel kind: see [`channel_kind`] (the profile's recorded command
+    /// type, else an unambiguous envelope; an ambiguous one is a
+    /// configuration error). A `Joints` channel is `Joints { count: 1 }`
+    /// (a `MotionCommand` carries only the max joint speed, see
+    /// [`crate::agent`]). Allowed sources come from
     /// `allowed[channel]`; a channel without an entry allows **every
     /// participant in the profile** — permissive, meant for demos and
     /// replays. Production must list the real writer GUIDs.
@@ -293,17 +397,13 @@ impl FirewallSettings {
         joint: BTreeMap<String, JointChannelSpec>,
     ) -> Result<Self, AgentError> {
         let mut channels = BTreeMap::new();
+        let mut warnings = Vec::new();
         for (name, env) in &profile.motion_envelopes {
             if joint.contains_key(name) {
                 continue;
             }
-            let joint_only =
-                env.max_joint_speed.is_some() && env.max_linear_speed.is_none_or(|v| v == 0.0);
-            let kind = if joint_only {
-                ChannelKind::Joints { count: 1 }
-            } else {
-                ChannelKind::Twist
-            };
+            let (kind, warning) = channel_kind(profile, name, env).map_err(AgentError::Config)?;
+            warnings.extend(warning);
             let allowed_sources = allowed
                 .get(name)
                 .cloned()
@@ -344,6 +444,7 @@ impl FirewallSettings {
             platform: PlatformConfig::default(),
             channels,
             joint_channels: BTreeMap::new(),
+            warnings,
         };
         fs.validate().map_err(AgentError::Config)?;
         if joint.is_empty() {
@@ -553,6 +654,78 @@ mod tests {
         let mut fw = fw;
         fw.channels.get_mut("/cmd_vel").unwrap().max_angular_speed = None;
         assert!(fw.validate().unwrap_err().contains("max_angular_speed"));
+    }
+
+    /// Review M1: the learner writes 0 for a dimension it never saw, so a
+    /// twist channel that only ever turned in place has `max_linear_speed:
+    /// 0` and an explicit `max_joint_speed`; the channel kind comes from
+    /// the profile's recorded type, never from those zeros, and without a
+    /// type the ambiguous envelope is refused with a clear message.
+    #[test]
+    fn channel_kind_comes_from_the_recorded_type() {
+        let mut p = Profile {
+            model: "m".into(),
+            ..Profile::default()
+        };
+        p.participants.insert("0102030405060708090a0b0c".into());
+        for ch in ["/cmd_vel", "/lowcmd"] {
+            p.writer_topics.insert(ch.into());
+        }
+        // Learned twist channel: linear 0 (only rotation seen), joint 0.
+        p.motion_envelopes.insert(
+            "/cmd_vel".into(),
+            Envelope {
+                max_linear_speed: Some(0.0),
+                max_joint_speed: Some(0.0),
+                ..Default::default()
+            },
+        );
+        // Learned joint channel: linear 0 (never seen), joint bounded.
+        p.motion_envelopes.insert(
+            "/lowcmd".into(),
+            Envelope {
+                max_linear_speed: Some(0.0),
+                max_joint_speed: Some(30.0),
+                ..Default::default()
+            },
+        );
+        let angular = BTreeMap::from([("/cmd_vel".to_string(), 0.8)]);
+        // Without types: refused (ambiguous), naming the channel.
+        let e = FirewallSettings::from_profile(&p, &BTreeMap::new(), &angular).unwrap_err();
+        assert!(
+            e.to_string().contains("/cmd_vel") && e.to_string().contains("motion_types"),
+            "{e}"
+        );
+        p.motion_types
+            .insert("/cmd_vel".into(), "geometry_msgs::msg::dds_::Twist_".into());
+        p.motion_types
+            .insert("/lowcmd".into(), "unitree_hg::msg::dds_::LowCmd_".into());
+        let fw = FirewallSettings::from_profile(&p, &BTreeMap::new(), &angular).unwrap();
+        assert_eq!(fw.channels["/cmd_vel"].kind, ChannelKind::Twist);
+        assert_eq!(
+            fw.channels["/lowcmd"].kind,
+            ChannelKind::Joints { count: 1 }
+        );
+        // Both envelopes alone were ambiguous: said so.
+        assert_eq!(fw.warnings.len(), 2, "{:?}", fw.warnings);
+        assert!(fw.warnings.iter().all(|w| w.contains("ambiguous")));
+        // An unambiguous envelope needs no type (unchanged behaviour).
+        assert_eq!(
+            channel_kind(
+                &p,
+                "/nope",
+                &Envelope {
+                    max_linear_speed: None,
+                    max_joint_speed: Some(1.0),
+                    ..Default::default()
+                }
+            ),
+            Ok((ChannelKind::Joints { count: 1 }, None))
+        );
+        // A recorded type that is no command type: refused.
+        p.motion_types
+            .insert("/cmd_vel".into(), "nav_msgs::msg::dds_::Odometry_".into());
+        assert!(FirewallSettings::from_profile(&p, &BTreeMap::new(), &angular).is_err());
     }
 
     #[test]

@@ -421,6 +421,16 @@ pub struct Profile {
     /// For each motion/control topic, the envelope its commands must stay in.
     #[serde(default)]
     pub motion_envelopes: BTreeMap<String, Envelope>,
+    /// For a motion channel, the DDS type name its writers announce in SEDP
+    /// (`PID_TYPE_NAME`, e.g. `geometry_msgs::msg::dds_::Twist_`), as
+    /// learned at commissioning (only where every learned writer agreed).
+    /// A sensor reports a writer that announces another type on the
+    /// channel, and a consumer can tell a twist channel from a joint
+    /// channel without guessing from the envelope. Every key is a
+    /// `motion_envelopes` channel. Not serialised when empty, so profiles
+    /// written before this field existed keep their exact bytes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub motion_types: BTreeMap<String, String>,
     /// ROS service names (e.g. `/node/get_parameters`) that may have clients
     /// or servers on this robot. Every ROS 2 node exposes parameter services,
     /// so commissioning must learn these.
@@ -449,6 +459,8 @@ pub struct Profile {
 
 /// Most identities in one profile.
 pub const MAX_IDENTITIES: usize = 256;
+/// Longest [`Profile::motion_types`] type name, bytes.
+pub const MAX_MOTION_TYPE_NAME_LEN: usize = 256;
 /// Most source IPs of one identity.
 pub const MAX_IDENTITY_IPS: usize = 16;
 /// Most ROS nodes recorded for one identity.
@@ -659,12 +671,19 @@ pub enum ProfileError {
     /// A [`ParticipantIdentity`] (or its name) is malformed, or there are
     /// more than [`MAX_IDENTITIES`].
     InvalidIdentity { name: String, detail: String },
+    /// A [`Profile::motion_types`] entry names no `motion_envelopes`
+    /// channel, or its type name is empty, too long or has control
+    /// characters.
+    InvalidMotionType { channel: String, detail: String },
 }
 
 impl fmt::Display for ProfileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyModel => write!(f, "profile model name is empty"),
+            Self::InvalidMotionType { channel, detail } => {
+                write!(f, "motion_types entry {channel:?}: {detail}")
+            }
             Self::InvalidEnvelopeLimit {
                 channel,
                 field,
@@ -767,6 +786,15 @@ impl Profile {
         }
     }
 
+    /// Keep only the motion channels `keep` accepts: their envelopes and
+    /// their recorded types ([`Profile::motion_types`]), so the result
+    /// still validates (a type without its envelope is an error).
+    pub fn retain_motion_channels(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.motion_envelopes.retain(|k, _| keep(k));
+        let envelopes = &self.motion_envelopes;
+        self.motion_types.retain(|k, _| envelopes.contains_key(k));
+    }
+
     /// Load-time validation for the commissioning tool and the sensor. Returns
     /// every problem found (not just the first). Callers must refuse to
     /// enforce a profile that fails validation. See the module docs for the
@@ -825,6 +853,23 @@ impl Profile {
                         });
                     }
                 }
+            }
+        }
+        for (channel, type_name) in &self.motion_types {
+            let bad = |detail: &str| ProfileError::InvalidMotionType {
+                channel: channel.clone(),
+                detail: detail.to_owned(),
+            };
+            if !self.motion_envelopes.contains_key(channel) {
+                errs.push(bad("not a motion_envelopes channel"));
+            }
+            if type_name.trim().is_empty()
+                || type_name.len() > MAX_MOTION_TYPE_NAME_LEN
+                || type_name.chars().any(char::is_control)
+            {
+                errs.push(bad(
+                    "type name must be non-empty, at most 256 bytes, without control characters",
+                ));
             }
         }
         if let Some(m) = &self.metadata {

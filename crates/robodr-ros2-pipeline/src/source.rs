@@ -78,6 +78,50 @@ pub struct LegacyUdp {
     pub dst_port: u16,
     /// Destination address.
     pub dst_ip: IpAddr,
+    /// Link-layer (MAC) source of the frame, when the capture knows it
+    /// (`AF_PACKET` `sll_addr`, Ethernet / Linux cooked pcap); `None` for
+    /// raw-IP captures and reassembled datagrams.
+    pub src_mac: Option<[u8; 6]>,
+    /// Recovered from IP fragments.
+    pub reassembled: bool,
+    /// The payload also starts with the RTPS magic: the pipeline inspects
+    /// it on both paths and reports RTPS on a legacy port.
+    pub also_rtps: bool,
+}
+
+impl LegacyUdp {
+    /// Endpoints only (no MAC, not reassembled, not RTPS).
+    pub fn new(src_port: u16, dst_port: u16, dst_ip: IpAddr) -> Self {
+        Self {
+            src_port,
+            dst_port,
+            dst_ip,
+            src_mac: None,
+            reassembled: false,
+            also_rtps: false,
+        }
+    }
+
+    /// Set [`LegacyUdp::src_mac`].
+    #[must_use]
+    pub fn with_src_mac(mut self, mac: Option<[u8; 6]>) -> Self {
+        self.src_mac = mac;
+        self
+    }
+
+    /// Set [`LegacyUdp::reassembled`].
+    #[must_use]
+    pub fn with_reassembled(mut self, reassembled: bool) -> Self {
+        self.reassembled = reassembled;
+        self
+    }
+
+    /// Set [`LegacyUdp::also_rtps`].
+    #[must_use]
+    pub fn with_also_rtps(mut self, also_rtps: bool) -> Self {
+        self.also_rtps = also_rtps;
+        self
+    }
 }
 
 impl Datagram {
@@ -648,11 +692,12 @@ impl<S: PacketSource> DatagramSource for CaptureDatagramSource<S> {
                     .with_captured_at(p.ts);
                 d.interface = p.ingress.name;
                 if p.kind == PacketKind::UnitreeLegacy {
-                    d.legacy = Some(LegacyUdp {
-                        src_port: p.src_port,
-                        dst_port: p.dst_port,
-                        dst_ip: p.dst,
-                    });
+                    d.legacy = Some(
+                        LegacyUdp::new(p.src_port, p.dst_port, p.dst)
+                            .with_src_mac(p.src_mac)
+                            .with_reassembled(p.reassembled)
+                            .with_also_rtps(p.also_rtps),
+                    );
                 }
                 return Ok(Some(d));
             }

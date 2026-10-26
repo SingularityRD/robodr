@@ -7,6 +7,8 @@
   "writer_topics": [
     "/api/arm/request",
     "/api/arm/response",
+    "/api/motion_switcher/request",
+    "/api/motion_switcher/response",
     "/api/sport/request",
     "/api/sport/response",
     "/arm_sdk",
@@ -17,6 +19,10 @@
   ],
   "motion_envelopes": {
     "/api/arm/request": {
+      "max_linear_speed": 0.0,
+      "max_joint_speed": null
+    },
+    "/api/motion_switcher/request": {
       "max_linear_speed": 0.0,
       "max_joint_speed": null
     },

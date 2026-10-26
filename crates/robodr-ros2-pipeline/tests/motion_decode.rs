@@ -412,8 +412,17 @@ fn unknown_and_wrong_role_types_are_undecodable() {
         ],
     );
     let o = r.feed(&d, &robot_ip());
-    assert_eq!(rules_of(&o), vec![rules::MOTION_UNDECODABLE_SAMPLE]);
-    assert!(o.findings[0].deviation.detail.contains("no decoder"));
+    // The announcements themselves are High (review M4): an unknown type
+    // and a feedback type on a profiled command channel.
+    assert_eq!(
+        rules_of(&o),
+        vec![
+            rules::MOTION_COMMAND_TYPE_MISMATCH,
+            rules::MOTION_COMMAND_TYPE_MISMATCH,
+            rules::MOTION_UNDECODABLE_SAMPLE
+        ]
+    );
+    assert!(o.findings[2].deviation.detail.contains("no decoder"));
     let odom = cdrenc::odometry(
         robodr_cdr::Representation::CdrLe,
         &cdrenc::OdomSpec {
