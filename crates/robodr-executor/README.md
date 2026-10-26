@@ -249,8 +249,13 @@ unreadable, **fences**: every request signed at or before that start
 a request signed up to the skew ahead of the clock was inside the window
 before the start and may have been presented to the lost store); the SOC
 signs again after the fence. The event log records it (`reconciled`,
-detail "SOC replay store untrusted"). The same fence applies to agentd's
-own `ReplayGuard` (fixed there separately).
+detail "SOC replay store untrusted"). The store also persists a wall-clock
+high-water mark (the latest second it dropped dead pairs, `high_water_s`):
+a clock that reads below it, at start or while running, fences every
+request signed up to the mark **plus** the skew, since the dropped pairs'
+timestamps would be in the window again (as agentd's `ReplayGuard`,
+control plane v2 review finding 5). Unlike agentd, a store created on a
+first start (no executor journal either) does not fence.
 
 **Reverts** (review F3). An action the SOC approved (control-plane origin)
 is lifted on request **only with the SOC's signed revert request**:

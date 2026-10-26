@@ -2271,6 +2271,58 @@ fn f8_fence_covers_the_skew_window() {
     assert!(s.check("k", "nonce-nonce-nonce-02", 131, 131, 30).is_ok());
 }
 
+/// Like agentd's `ReplayGuard` (control plane v2 review, finding 5): once
+/// the store dropped a dead pair, a clock that goes back below that moment
+/// would bring the pair's timestamp back into the window. The store keeps
+/// a persisted high-water mark and fences up to it plus the skew, while
+/// running and after a restart.
+#[test]
+fn replay_store_fences_when_the_clock_goes_back() {
+    let d = tmpdir("hwm");
+    std::fs::write(d.join(crate::journal::FILE), b"{}").unwrap();
+    let mut s = crate::soc::ReplayStore::open(&d, 1_000, 30, false);
+    assert_eq!(s.fence_s(), None);
+    assert!(s
+        .check("k", "nonce-nonce-nonce-01", 1_000, 1_000, 30)
+        .is_ok());
+    // 100 s later the pair is dead and dropped by the next check.
+    assert!(s
+        .check("k", "nonce-nonce-nonce-02", 1_100, 1_100, 30)
+        .is_ok());
+    assert_eq!(s.len(), 1);
+    // The clock steps back to 1_005: the first request is in the window
+    // again, but its pair is gone. Fenced, not accepted.
+    let r = s.check("k", "nonce-nonce-nonce-01", 1_000, 1_005, 30);
+    assert_eq!(
+        r.map_err(|e| e.code),
+        Err(codes::SOC_REQUEST_STALE.to_string())
+    );
+    assert_eq!(s.fence_s(), Some(1_130));
+    drop(s);
+    // After a restart with the clock still behind: fenced again from the
+    // persisted mark.
+    let mut s = crate::soc::ReplayStore::open(&d, 1_005, 30, true);
+    assert_eq!(s.fence_s(), Some(1_130));
+    assert!(s.fenced_because.is_some());
+    let r = s.check("k", "nonce-nonce-nonce-01", 1_000, 1_005, 30);
+    assert_eq!(
+        r.map_err(|e| e.code),
+        Err(codes::SOC_REQUEST_STALE.to_string())
+    );
+    // A clock that does not go back is never fenced by the mark.
+    let d2 = tmpdir("hwm-fwd");
+    let mut s = crate::soc::ReplayStore::open(&d2, 1_000, 30, false);
+    assert!(s
+        .check("k", "nonce-nonce-nonce-01", 1_000, 1_000, 30)
+        .is_ok());
+    assert!(s
+        .check("k", "nonce-nonce-nonce-02", 1_100, 1_100, 30)
+        .is_ok());
+    drop(s);
+    let s = crate::soc::ReplayStore::open(&d2, 1_200, 30, true);
+    assert_eq!(s.fence_s(), None);
+}
+
 /// F9 (a): a SOC key equal to one of the robot's own keys (its black-box /
 /// finding signing key) is refused: whoever holds the robot's key could
 /// otherwise approve containment.

@@ -693,6 +693,10 @@ struct NonceFile {
     schema: String,
     #[serde(default)]
     fence_s: Option<u64>,
+    /// The latest wall-clock second at which the store dropped dead pairs
+    /// (absent in stores written before it existed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    high_water_s: Option<u64>,
     entries: Vec<NonceEntry>,
 }
 
@@ -706,6 +710,11 @@ pub struct ReplayStore {
     fence_s: Option<u64>,
     /// Why the store was fenced at start (reported once as an event).
     pub fenced_because: Option<String>,
+    /// The latest wall-clock second at which dead pairs were dropped
+    /// (persisted). A clock below it could bring their timestamps back
+    /// into the window, so it fences (as agentd's `ReplayGuard`, control
+    /// plane v2 review finding 5).
+    high_water_s: u64,
 }
 
 impl ReplayStore {
@@ -717,7 +726,9 @@ impl ReplayStore {
     ///
     /// The fence is `now_s + skew_s` (review finding F8): a request signed
     /// up to `skew_s` ahead of the clock was inside the window before the
-    /// start and may have been presented to the lost store.
+    /// start and may have been presented to the lost store. A clock that
+    /// reads below the persisted high-water mark (the latest second dead
+    /// pairs were dropped) fences up to `high-water + skew_s`.
     pub fn open(dir: &Path, now_s: u64, skew_s: u64, state_existed: bool) -> Self {
         let fence_at = now_s.saturating_add(skew_s);
         let mut s = ReplayStore {
@@ -725,16 +736,32 @@ impl ReplayStore {
             seen: BTreeMap::new(),
             fence_s: None,
             fenced_because: None,
+            high_water_s: 0,
         };
         let p = s.path();
         match crate::config::read_small(&p) {
             Ok(text) => match serde_json::from_str::<NonceFile>(&text) {
                 Ok(f) if f.schema == NONCE_SCHEMA => {
                     s.fence_s = f.fence_s;
+                    s.high_water_s = f.high_water_s.unwrap_or(0);
+                    let mut dropped = false;
                     for e in f.entries {
                         if e.dead_after >= now_s {
                             s.seen.insert((e.key_id, e.nonce), e.dead_after);
+                        } else {
+                            dropped = true;
                         }
+                    }
+                    if now_s < s.high_water_s {
+                        let hw = s.high_water_s;
+                        s.fence(
+                            hw.saturating_add(skew_s),
+                            format!(
+                                "the clock ({now_s}) reads below the store's high-water mark ({hw})"
+                            ),
+                        );
+                    } else if dropped {
+                        s.high_water_s = now_s;
                     }
                 }
                 Ok(_) => s.fence(fence_at, format!("{NONCE_FILE}: unknown schema")),
@@ -754,6 +781,15 @@ impl ReplayStore {
         // insert, which refuses if it fails again).
         let _ = s.save();
         s
+    }
+
+    /// The clock went back below the time dead pairs were dropped: fence
+    /// every timestamp up to the high-water mark plus the skew.
+    fn fence_if_clock_went_back(&mut self, now_s: u64, skew_s: u64) {
+        if now_s < self.high_water_s {
+            let f = self.high_water_s.saturating_add(skew_s);
+            self.fence_s = Some(self.fence_s.map_or(f, |o| o.max(f)));
+        }
     }
 
     fn fence(&mut self, now_s: u64, why: String) {
@@ -781,6 +817,7 @@ impl ReplayStore {
         let f = NonceFile {
             schema: NONCE_SCHEMA.into(),
             fence_s: self.fence_s,
+            high_water_s: (self.high_water_s > 0).then_some(self.high_water_s),
             entries: self
                 .seen
                 .iter()
@@ -818,11 +855,12 @@ impl ReplayStore {
         now_s: u64,
         skew_s: u64,
     ) -> Result<(), Refusal> {
+        self.fence_if_clock_went_back(now_s, skew_s);
         if self.fence_s.is_some_and(|f| timestamp <= f) {
             return Err(refuse(
                 codes::SOC_REQUEST_STALE,
-                "signed before the executor started with an untrusted SOC replay store: the SOC \
-                 must sign the request again",
+                "signed before the fence of the executor's SOC replay store (untrusted at start, \
+                 or the clock went back): the SOC must sign the request again",
             ));
         }
         let k = (key_id.to_string(), nonce.to_string());
@@ -832,7 +870,11 @@ impl ReplayStore {
                 "this SOC request (key, nonce) was already presented to the executor",
             ));
         }
+        let before = self.seen.len();
         self.seen.retain(|_, d| *d >= now_s);
+        if self.seen.len() < before {
+            self.high_water_s = self.high_water_s.max(now_s);
+        }
         if self.seen.len() >= MAX_NONCES {
             return Err(refuse(
                 codes::SOC_REPLAY_STORE_UNAVAILABLE,
