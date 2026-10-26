@@ -171,7 +171,7 @@
 //!   Pin the profiled prefixes to close all of this up front.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use robodr_events::graph::{ActionRole, RosNameKind};
@@ -459,6 +459,9 @@ pub type BindingFinding = (Deviation, String);
 struct Entry {
     bound_ips: VecDeque<IpAddr>,
     locator_ips: Vec<IpAddr>,
+    /// The SPDP unicast locators (metatraffic and default) with their ports,
+    /// as last announced through a trusted path ([`BindingTable::spdp_unicast`]).
+    unicast: Vec<SocketAddr>,
     last_refresh: Instant,
     lease: Duration,
 }
@@ -683,6 +686,22 @@ impl BindingTable {
     /// Is `prefix` contested (a profiled, unpinned prefix claimed by SPDP
     /// from more than one host)? Its every source is untrusted until it is
     /// pinned. See the module docs.
+    /// The SPDP unicast locators (ip:port, metatraffic and default) that
+    /// participant `prefix` announced through a path this table trusts:
+    /// empty when it is unknown, its lease expired, its prefix is contested
+    /// or pinned (`participant_ips` learn no locators). Used by agentd to
+    /// hand the executor a quarantine target it can check against the
+    /// motion control path.
+    pub fn spdp_unicast(&self, prefix: &GuidPrefix, now: Instant) -> Vec<SocketAddr> {
+        if self.contested.contains(prefix) {
+            return Vec::new();
+        }
+        match self.entries.get(prefix) {
+            Some(e) if !e.expired(now) => e.unicast.clone(),
+            _ => Vec::new(),
+        }
+    }
+
     pub fn is_contested(&self, prefix: &GuidPrefix) -> bool {
         self.contested.contains(prefix) && !self.opts.participant_ips.contains_key(prefix)
     }
@@ -953,6 +972,19 @@ impl BindingTable {
             }
             v
         };
+        let unicast: Vec<SocketAddr> = {
+            let mut v: Vec<SocketAddr> = Vec::new();
+            for l in spdp.metatraffic_unicast.iter().chain(&spdp.default_unicast) {
+                let port = u16::try_from(l.port).ok().filter(|p| *p != 0);
+                if let (Some(ip), Some(port)) = (locator_ip(l), port) {
+                    let sa = SocketAddr::new(ip, port);
+                    if !v.contains(&sa) && v.len() < MAX_LOCATOR_IPS {
+                        v.push(sa);
+                    }
+                }
+            }
+            v
+        };
         let lease = spdp
             .lease_duration
             .and_then(|d| d.to_std())
@@ -1007,6 +1039,7 @@ impl BindingTable {
                 Some(e) => {
                     let old = e.last_refresh;
                     e.locator_ips = locators;
+                    e.unicast = unicast;
                     e.last_refresh = now;
                     e.lease = lease;
                     self.stats.refreshed += 1;
@@ -1018,6 +1051,7 @@ impl BindingTable {
                         Entry {
                             bound_ips: VecDeque::new(),
                             locator_ips: locators,
+                            unicast,
                             last_refresh: now,
                             lease,
                         },
@@ -1054,6 +1088,7 @@ impl BindingTable {
                 let old = e.last_refresh;
                 e.add_bound(ip);
                 e.locator_ips = locators;
+                e.unicast = unicast;
                 e.last_refresh = now;
                 e.lease = lease;
                 self.stats.refreshed += 1;
@@ -1087,6 +1122,7 @@ impl BindingTable {
                 e.bound_ips.clear();
                 e.add_bound(ip);
                 e.locator_ips = locators;
+                e.unicast = unicast;
                 e.last_refresh = now;
                 e.lease = lease;
                 self.stats.rebound += 1;
@@ -1096,6 +1132,7 @@ impl BindingTable {
                 let mut e = Entry {
                     bound_ips: VecDeque::new(),
                     locator_ips: locators,
+                    unicast,
                     last_refresh: now,
                     lease,
                 };
@@ -1640,6 +1677,20 @@ mod tests {
         );
         assert_eq!(t.b.allows(&P1, ip(XIP)), Some(false));
         assert_eq!(t.b.allows(&P2, ip(RIP)), None);
+        // The announced unicast locators with their ports (for the
+        // executor's quarantine target); none for an unknown participant.
+        assert_eq!(
+            t.b.spdp_unicast(&P1, t.now),
+            vec![
+                SocketAddr::new(ip(RIP), 7410),
+                SocketAddr::new(ip(RLOC), 7410)
+            ]
+        );
+        assert!(t.b.spdp_unicast(&P2, t.now).is_empty());
+        assert!(t
+            .b
+            .spdp_unicast(&P1, t.now + Duration::from_secs(3600))
+            .is_empty());
         assert!(t.ep(&writer(P1), ip(RIP)).is_empty());
         assert!(t.ep(&writer(P1), ip(RLOC)).is_empty());
         assert_eq!(t.b.stats().learned, 1);

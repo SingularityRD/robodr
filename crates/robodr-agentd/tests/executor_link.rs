@@ -201,7 +201,9 @@ fn start_executor(dir: &Path, sock: &Path, policy: &Path, model: &Model) -> Exec
             "policy_path": policy,
             "network": {
                 "management": [{"cidr": "10.20.0.0/24"}],
-                "motion_control_path": [{"guid_prefix": PROTECTED_GUID, "low_level": true}]
+                "motion_control_path": [
+                    {"cidr": "192.168.123.0/24", "guid_prefix": PROTECTED_GUID, "low_level": true}
+                ]
             },
             "max_safety_age_ms": 2000
         })
@@ -315,8 +317,21 @@ fn accepted_requests_are_executed_verified_and_reverted_through_the_executor() {
     assert_eq!(v["executed"], true);
     assert!(model.0.lock().unwrap().is_some());
 
-    // quarantine_node of a participant: verified; of the protected rt/lowcmd
-    // writer: refused by the executor's own check.
+    // quarantine_node of a participant: verified once agentd has seen its
+    // SPDP locators (outside the protected network) and hands them on; of
+    // the protected rt/lowcmd writer: refused by the executor's own check.
+    let mut ev = wait_for(5, "event socket", || {
+        UnixStream::connect(s.dir.join("ev.sock")).ok()
+    });
+    writeln!(
+        ev,
+        "{{\"kind\":\"ros2_participant_discovered\",\"guid_prefix\":\"0110a2b3c4d5e6f701000000\",\
+         \"src_ip\":\"10.0.0.7\",\"locators\":[\"10.0.0.7:7410\"]}}"
+    )
+    .unwrap();
+    wait_for(10, "participant event", || {
+        (status(&s.spool)?["inputs"][0]["received"].as_u64()? >= 1).then_some(())
+    });
     submit(
         &control,
         "q-1",
@@ -325,6 +340,21 @@ fn accepted_requests_are_executed_verified_and_reverted_through_the_executor() {
         None,
     );
     wait_status(&control, "q-1", "verified");
+    let table = serde_json::to_string(&*model.0.lock().unwrap()).unwrap();
+    assert!(
+        table.contains("10.0.0.7"),
+        "locator rule installed: {table}"
+    );
+    // A participant agentd knows no locators for: refused by the executor.
+    submit(
+        &control,
+        "q-3",
+        "quarantine_node",
+        json!({"participant_guid": "0110a2b3c4d5e6f703000000"}),
+        None,
+    );
+    let v = wait_status(&control, "q-3", "refused");
+    assert_eq!(v["refusal"]["code"], "locators_required", "{v}");
     submit(
         &control,
         "q-2",

@@ -28,6 +28,7 @@
 //! never retried silently).
 
 use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender, TrySendError};
@@ -40,7 +41,7 @@ use robodr_executor::client::Client;
 use robodr_executor::decision::codes;
 use robodr_executor::engine::{Outcome, Status as ExStatus};
 use robodr_executor::journal::{Event, EventKind};
-use robodr_executor::order::{Order, Origin, Target};
+use robodr_executor::order::{Locator, Order, Origin, Target};
 use robodr_executor::proto::Key;
 use robodr_responder::{ActionId, Morphology, ResponseAction, RestrictTarget, SafetyState, Step};
 use serde::{Deserialize, Serialize};
@@ -167,6 +168,9 @@ pub struct LinkStats {
     pub evidence_marks: u64,
     /// Staged orders dropped because their request / plan was not recorded.
     pub dropped_unrecorded: u64,
+    /// The executor found its journal unreadable and reset it (High: what
+    /// was in force is gone; see `robodr-executor status`).
+    pub journal_resets: u64,
 }
 
 enum Job {
@@ -220,6 +224,8 @@ pub enum Staged {
 
 /// The link: worker thread, queue and shared state.
 pub struct ExecutorLink {
+    /// SPDP locators seen in participant events (see [`LocatorBook`]).
+    book: LocatorBook,
     shared: Arc<Mutex<Shared>>,
     staged: Arc<Mutex<Vec<Staged>>>,
     tx: Option<SyncSender<Job>>,
@@ -299,7 +305,9 @@ impl ExecutorLink {
                     // Events (TTL reverts, drift, revert failures) and the
                     // state of watched actions.
                     let since = lock(&sh).last_seq;
-                    if let Ok(evs) = client.events(since) {
+                    // The safety state goes along: actions the executor holds
+                    // after a reboot are re-armed only with a fresh one.
+                    if let Ok(evs) = client.events_with_safety(since, &mut || cell.get()) {
                         let mut changed = Vec::new();
                         {
                             let mut g = lock(&sh);
@@ -308,6 +316,9 @@ impl ExecutorLink {
                                 g.stats.events += 1;
                                 if ev.kind == EventKind::RevertFailed {
                                     g.stats.revert_failures += 1;
+                                }
+                                if ev.kind == EventKind::JournalReset {
+                                    g.stats.journal_resets += 1;
                                 }
                                 if let Some(id) = &ev.id {
                                     changed.push(id.clone());
@@ -332,6 +343,7 @@ impl ExecutorLink {
             })
             .map_err(|e| format!("executor link thread: {e}"))?;
         Ok(Self {
+            book: LocatorBook::default(),
             shared,
             staged: Arc::new(Mutex::new(Vec::new())),
             tx: Some(tx),
@@ -437,6 +449,8 @@ fn map(o: &Outcome) -> Option<ExecutorOutcome> {
         // be in force, so the request keeps its state (`revert_failures`
         // and the executor's events say why).
         ExStatus::Reverting => return None,
+        // Held after a reboot until re-validated with a fresh safety state.
+        ExStatus::Held => return None,
         ExStatus::Reverted | ExStatus::RemovedExternally => ExecutorOutcome::Reverted,
         ExStatus::Advisory => ExecutorOutcome::RecordedNotExecuted,
         ExStatus::Failed => ExecutorOutcome::Failed(
@@ -626,6 +640,112 @@ impl Executor for PlannerExecutor {
     }
 }
 
+// --- Quarantine locators (executor review H2) --------------------------------
+// The executor quarantines a participant only when the order carries its
+// SPDP unicast locators and they lie outside every motion-path entry it may
+// not cut. agentd fills them in when it dispatches an order: from the
+// pipeline's binding table (what the participant announced through a
+// trusted path), else from participant events of a JSONL input.
+
+/// Participants' SPDP unicast locators from `ros2_participant_discovered`
+/// events (bounded, oldest forgotten first).
+#[derive(Debug, Default)]
+pub struct LocatorBook {
+    map: HashMap<[u8; 12], Vec<Locator>>,
+    order: VecDeque<[u8; 12]>,
+}
+
+/// Participants remembered by the [`LocatorBook`].
+pub const MAX_BOOK: usize = 1024;
+
+impl LocatorBook {
+    /// Learn the locators of a participant event (`ip:port` strings).
+    pub fn observe(&mut self, p: &robodr_events::graph::Participant) {
+        let Ok(g) = p
+            .guid_prefix
+            .to_ascii_lowercase()
+            .parse::<robodr_executor::net::GuidPrefix>()
+        else {
+            return;
+        };
+        let locs: Vec<Locator> = p
+            .locators
+            .iter()
+            .filter_map(|l| l.parse::<SocketAddr>().ok())
+            .filter_map(locator)
+            .take(robodr_executor::order::MAX_LOCATORS)
+            .collect();
+        if locs.is_empty() {
+            return;
+        }
+        if self.map.insert(g.0, locs).is_none() {
+            self.order.push_back(g.0);
+            while self.order.len() > MAX_BOOK {
+                if let Some(old) = self.order.pop_front() {
+                    self.map.remove(&old);
+                }
+            }
+        }
+    }
+
+    pub fn get(&self, g: &[u8; 12]) -> Vec<Locator> {
+        self.map.get(g).cloned().unwrap_or_default()
+    }
+}
+
+fn locator(sa: SocketAddr) -> Option<Locator> {
+    let ip = sa.ip();
+    (sa.port() != 0 && !ip.is_unspecified() && !ip.is_multicast()).then_some(Locator {
+        ip,
+        port: sa.port(),
+    })
+}
+
+/// Fill a participant order's locators when it carries none: from
+/// `bound` (the pipeline's binding table), else from `book`.
+pub fn attach_locators(
+    mut o: Order,
+    bound: impl FnOnce(&[u8; 12]) -> Vec<SocketAddr>,
+    book: &LocatorBook,
+) -> Order {
+    if let Target::Participant {
+        guid_prefix,
+        locators,
+    } = &mut o.target
+    {
+        if locators.is_empty() {
+            let mut l: Vec<Locator> = bound(&guid_prefix.0)
+                .into_iter()
+                .filter_map(locator)
+                .take(robodr_executor::order::MAX_LOCATORS)
+                .collect();
+            if l.is_empty() {
+                l = book.get(&guid_prefix.0);
+            }
+            *locators = l;
+        }
+    }
+    o
+}
+
+impl ExecutorLink {
+    /// Remember the locators of a participant event.
+    pub fn observe_event(&mut self, ev: &robodr_events::RobotEvent) {
+        if let robodr_events::RobotEvent::Ros2ParticipantDiscovered(p) = ev {
+            self.book.observe(p);
+        }
+    }
+
+    /// [`attach_locators`] with this link's book.
+    pub fn with_locators(
+        &self,
+        o: Order,
+        bound: impl FnOnce(&[u8; 12]) -> Vec<SocketAddr>,
+    ) -> Order {
+        attach_locators(o, bound, &self.book)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -739,6 +859,70 @@ mod tests {
         assert_eq!(map(&o), None);
         o.status = ExStatus::Reverting;
         assert_eq!(map(&o), None, "a failing revert never reads as lifted");
+    }
+
+    #[test]
+    fn quarantine_orders_get_the_participants_spdp_locators() {
+        let g = "0110a2b3c4d5e6f701000000";
+        let o = Order {
+            id: "q".into(),
+            action: ActionId::QuarantineNode,
+            target: Target::Participant {
+                guid_prefix: g.parse().unwrap(),
+                locators: Vec::new(),
+            },
+            ttl_s: None,
+            judged_state: SafetyState::Idle,
+            context: ctx(Morphology::WheeledMobile),
+            plan_morphology: Morphology::WheeledMobile,
+            human_approved: true,
+            replay: false,
+            origin: Origin::Planner {
+                rule: "r".into(),
+                finding_id: None,
+            },
+            issued_ms: 0,
+        };
+        let locs = |o: &Order| match &o.target {
+            Target::Participant { locators, .. } => locators.clone(),
+            _ => panic!(),
+        };
+        let mut book = LocatorBook::default();
+        // Nothing known: none (the executor then refuses the quarantine).
+        assert!(locs(&attach_locators(o.clone(), |_| vec![], &book)).is_empty());
+        // From the binding table (multicast / port 0 dropped).
+        let out = attach_locators(
+            o.clone(),
+            |p| {
+                assert_eq!(robodr_blackbox::crypto::to_hex(p), g);
+                vec![
+                    "10.0.0.7:7410".parse().unwrap(),
+                    "239.255.0.1:7400".parse().unwrap(),
+                    "10.0.0.7:0".parse().unwrap(),
+                ]
+            },
+            &book,
+        );
+        assert_eq!(
+            locs(&out),
+            vec![Locator {
+                ip: "10.0.0.7".parse().unwrap(),
+                port: 7410
+            }]
+        );
+        // From a participant event when the binding has none.
+        book.observe(&robodr_events::graph::Participant {
+            guid_prefix: g.into(),
+            src_ip: "10.0.0.8".into(),
+            locators: vec!["10.0.0.8:7412".into(), "junk".into()],
+        });
+        assert_eq!(
+            locs(&attach_locators(o, |_| vec![], &book)),
+            vec![Locator {
+                ip: "10.0.0.8".parse().unwrap(),
+                port: 7412
+            }]
+        );
     }
 
     #[test]

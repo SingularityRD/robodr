@@ -1220,6 +1220,9 @@ impl<'a> Daemon<'a> {
             Payload::Host(crate::host::HostLine::Threat(t)) => self.host_threat(&t),
             Payload::Event(ev) => {
                 self.stats.events += 1;
+                if let Some(link) = self.executor.as_mut() {
+                    link.observe_event(&ev);
+                }
                 let safety = self.safety();
                 let now = self.clock.now();
                 let outs = self.agent.handle(now, &ev, safety);
@@ -2305,6 +2308,11 @@ impl Daemon<'_> {
                         robodr_executor::Origin::Planner { .. } => true,
                     };
                     if recorded {
+                        // A quarantine carries the participant's SPDP
+                        // unicast locators (the executor refuses it without).
+                        let now = std::time::Instant::now();
+                        let binding = self.pipeline.binding();
+                        let o = link.with_locators(o, |g| binding.spdp_unicast(g, now));
                         link.dispatch(Staged::Submit(o));
                     } else {
                         link.count_dropped();
@@ -2354,6 +2362,7 @@ impl Daemon<'_> {
                 robodr_executor::journal::EventKind::RevertFailed
                     | robodr_executor::journal::EventKind::Drift
                     | robodr_executor::journal::EventKind::RemovedExternally
+                    | robodr_executor::journal::EventKind::JournalReset
             );
             let now = self.clock.now();
             if self
