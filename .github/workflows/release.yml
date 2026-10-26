@@ -86,6 +86,25 @@ jobs:
             echo "::error file=CHANGELOG.md::no '## [$version]' section"
             exit 1
           fi
+          # The binaries print CARGO_PKG_VERSION (--version, agentd's
+          # product_version in every finding, the SBOM): it must be the
+          # released version, for every member (all inherit the workspace's).
+          python3 - "$version" <<'PY'
+          import glob, sys, tomllib
+          version = sys.argv[1]
+          ws = tomllib.load(open("Cargo.toml", "rb"))["workspace"]
+          bad = []
+          if ws.get("package", {}).get("version") != version:
+              bad.append(f"Cargo.toml [workspace.package] version = {ws.get('package', {}).get('version')!r}")
+          for pat in ws.get("members", []):
+              for m in sorted(glob.glob(pat)):
+                  v = tomllib.load(open(f"{m}/Cargo.toml", "rb"))["package"].get("version")
+                  if v != {"workspace": True} and v != version:
+                      bad.append(f"{m}/Cargo.toml version = {v!r}")
+          for b in bad:
+              print(f"::error file=Cargo.toml::{b}, VERSION is {version}")
+          sys.exit(1 if bad else 0)
+          PY
           if ! git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
             echo "::error file=Cargo.lock::Cargo.lock is not committed; a release cannot be --locked (docs/BUILD.md)"
             exit 1
