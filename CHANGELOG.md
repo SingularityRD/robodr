@@ -12,6 +12,32 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Security
 
+- Red team S11-lite (`tools/e2e/REDTEAM.md`), F1 (medium): a GUID spray
+  no longer amplifies into one finding, spool record and SOC case per
+  random prefix. agentd folds the per-participant discovery findings of a
+  flooding source (past 8 per source / 32 in total per 60 s) into one
+  `robot.ros2.discovery_flood` finding (new catalog entry, contract 2.1;
+  subject the source IP, so one case; count per rule, first / last seen,
+  sample GUID prefixes; reported at 1, 2, 4, ... and when the flood ends),
+  while every folded finding stays in the black box and feeds the
+  correlator. Critical findings are never folded, and the spool keeps the
+  last eighth of its bounds for Critical findings so a flood of lesser
+  ones can no longer make a Critical finding black-box-only. 3000 sprayed
+  prefixes: 23 spool records (was one per prefix until the spool filled).
+  Regression: `crates/robodr-agentd/tests/redteam_regressions.rs`.
+- Red team F3: a SOC `quarantine_node` of a rogue that had left (dispose,
+  lease expiry) or been evicted from the binding table by a GUID spray was
+  refused `locators_required`: agentd only passed the locators of a live
+  binding. The binding table now remembers each prefix's own last trusted
+  SPDP unicast locators (1024 prefixes, 24 h; SPDP-only prefixes forgotten
+  first) and agentd hands those over, minus any locator another live or
+  profiled participant (or a pin) claims; contested and pinned prefixes
+  still get none. Regressions:
+  `crates/robodr-ros2-pipeline/tests/redteam_regressions.rs`,
+  `crates/robodr-agentd/tests/executor_link.rs`
+  (`a_rogue_pushed_out_by_a_guid_spray_is_still_quarantined_by_its_own_locators`).
+- `robodr-uplink` no longer labels a plain-HTTP loopback URL "(CA bundle)"
+  (end-to-end results D2).
 - Secure delivery, independent adversarial review of Sprint 13a
   (`docs/SECURE-DELIVERY.md` §3.5 "Review of 13a"); every finding has a
   regression test replaying its attack

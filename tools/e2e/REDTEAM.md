@@ -68,6 +68,13 @@ At the end:
   - Suggested fix: aggregate `unknown_participant` per source IP / vendor
     and time window once a threshold is passed, and raise one
     `discovery_flood` finding.
+  - **Fixed** (after this run): agentd folds a flooding source's
+    per-participant discovery findings into one `robot.ros2.discovery_flood`
+    finding (every folded one stays in the black box), and the spool keeps
+    1/8 of its bounds for Critical findings. Replayed in
+    `crates/robodr-agentd/tests/redteam_regressions.rs`: 3000 sprayed
+    prefixes give 23 spool records and the later Critical finding is
+    spooled.
 - **F2:** listed in SOAK.md (live-capture timestamps). It also affects any
   red-team step timed on a 500 Hz channel.
 - **F3 (robodr, needs investigation): no locators on control-plane
@@ -80,3 +87,14 @@ At the end:
   marked contested, or its entry is not kept. In both cases a SOC cannot
   quarantine the most typical rogue. The executor's refusal is the safe
   behavior; the gap is upstream.
+  - **Root cause and fix** (after this run): not the contested case. The
+    rogue is bound with its own locators while live, but agentd asked only
+    the *live* binding; by the time a SOC order arrives the rogue has
+    disposed itself, its lease has run out, or the GUID spray (R2) has
+    evicted it. The binding table now remembers each prefix's own last
+    trusted locators (bounded, 24 h, never a locator another live or
+    profiled participant claims, none for a contested or pinned prefix).
+    Replayed on `fastrtps_gz_rogue_cmd_vel.pcap` in
+    `crates/robodr-ros2-pipeline/tests/redteam_regressions.rs`, and
+    through agentd and the executor in
+    `crates/robodr-agentd/tests/executor_link.rs`.

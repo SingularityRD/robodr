@@ -224,9 +224,11 @@ GET /cases/3fb2dca9-.../attachments -> [('robodr-evidence-2143c6a30b9f6ad0.txt',
   result.
 - **D2 (robodr, Low).** `crates/robodr-export/src/bin/robodr-uplink.rs:334-342`
   prints `(CA bundle)` for a plain-HTTP loopback URL that has no CA bundle.
+  **Fixed:** it prints `plain HTTP to loopback, no TLS`.
 - **D3 (robodr docs, Low).** `docs/OPERATIONS.md:2189` says the AutoSecOps
   side of the fleet API "is not built yet". It is built, and enrollment
-  works end to end as shown above.
+  works end to end as shown above. **Fixed** there and in the customer
+  docs, README and GA roadmap.
 - **Note.** `robodr-uplink` refuses a key file whose `key_id` is not the
   derived `ed25519:<16 hex>` id. Keys made with `robodr-blackbox keygen
   --key-id X` cannot be uplink keys, and the error message says so.
