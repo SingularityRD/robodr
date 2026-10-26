@@ -86,14 +86,17 @@ pub fn run(args: Vec<String>) -> i32 {
         println!("robodr-release {}", env!("CARGO_PKG_VERSION"));
         return 0;
     }
+    // Help only as the whole command line: a stray -h spliced into a
+    // verify command must never turn a refusal into exit 0 (13a review
+    // finding 8).
+    if matches!(args.as_slice(), [a] if a == "--help" || a == "-h") {
+        println!("{USAGE}");
+        return 0;
+    }
     let mut it = args.into_iter();
     let Some(cmd) = it.next() else {
         return usage("missing command");
     };
-    if cmd == "--help" || cmd == "-h" {
-        println!("{USAGE}");
-        return 0;
-    }
     let rest: Vec<String> = it.collect();
     let r = match cmd.as_str() {
         "keygen" => keygen(rest),
@@ -115,8 +118,7 @@ pub fn run(args: Vec<String>) -> i32 {
     match r {
         Ok(()) => 0,
         Err(Cmd::Usage(m)) if m == "help" => {
-            println!("{USAGE}");
-            0
+            usage("--help is only accepted alone (robodr-release --help)")
         }
         Err(Cmd::Usage(m)) => usage(&m),
         Err(Cmd::Fail(e)) => fail(e),

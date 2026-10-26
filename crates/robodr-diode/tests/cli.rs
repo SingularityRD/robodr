@@ -426,7 +426,15 @@ fn version_and_help_exit_0() {
             String::from_utf8_lossy(&o.stdout).contains(name),
             "{name} --help prints the usage on stdout"
         );
-        for bad in [&["--version", "--bogus"][..], &["--bogus"][..]] {
+        // --help (or -h) next to other arguments is a usage error, not a
+        // successful no-op (13a review finding 8).
+        for bad in [
+            &["--version", "--bogus"][..],
+            &["--bogus"][..],
+            &["--outbox", "/nonexistent", "-h"][..],
+            &["-h", "--outbox", "/nonexistent"][..],
+            &["--help", "--help"][..],
+        ] {
             let o = std::process::Command::new(exe).args(bad).output().unwrap();
             assert_eq!(o.status.code(), Some(2), "{name} {bad:?}");
             assert!(o.stdout.is_empty(), "{name} {bad:?}");
