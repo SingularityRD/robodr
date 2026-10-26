@@ -7,6 +7,11 @@
 #   ./install-bundle.sh install [--pubkey robodr-release.pub] [--tarball T]
 #   ./install-bundle.sh list                 (releases kept for rollback)
 #   ./install-bundle.sh rollback <version>   (reinstall a kept release)
+#   ./install-bundle.sh ring                 (SOC update-ring information)
+#
+# Options of install / rollback: --blackbox-dir DIR (repeatable; default
+# /var/lib/robodr/blackbox and /var/lib/robodr/fleet/journal), the
+# black-box directories whose segment format the release must read.
 #
 # verify   checks SHA256SUMS of the extracted bundle. With --pubkey and
 #          --tarball it first checks the tarball's minisign signature
@@ -20,11 +25,33 @@
 # rollback reinstall a kept release (dpkg downgrade). Config files (conffiles)
 #          and evidence are untouched; see OPERATIONS.md "Rollback".
 #
-# Exit: 0 ok, 1 verification failed, 2 usage or environment error.
+# Black-box format gate (install and rollback): every package states the
+# black-box segment formats it writes and reads (/usr/share/robodr/formats,
+# e.g. blackbox_read=RBF1:1; a release without the file is a legacy release
+# that reads RBF1:1 only). Before dpkg runs, the first frame of every
+# segment file in the black-box directories is read (magic + record format
+# version); a release that cannot read one of them is REFUSED with the
+# segment named: it could neither verify nor extend that evidence. Export
+# and archive the chain first (OPERATIONS.md 7), or install a release that
+# reads it. There is no override.
+#
+# Ring information (Sprint 9): if robodr-enroll recorded the SOC's
+# update-ring information (/var/lib/robodr/fleet/ring.env), install and
+# ring print it. It is information only: nothing here is triggered by it.
+#
+# ROBODR_ROOT=DIR (staging and the packaging test only) prefixes every
+# path and runs dpkg with --root=DIR (its own dpkg database under DIR).
+#
+# Exit: 0 ok, 1 verification failed or refused, 2 usage or environment error.
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
-releases=/var/lib/robodr/releases
+root=${ROBODR_ROOT:-}
+releases=$root/var/lib/robodr/releases
+ring_env=$root/var/lib/robodr/fleet/ring.env
+# Formats of a release without /usr/share/robodr/formats (every release
+# before the file existed wrote and read record format 1 only).
+legacy_read="RBF1:1"
 
 die() { echo "install-bundle: $2" >&2; exit "$1"; }
 
@@ -54,6 +81,80 @@ verify_sums() {
     echo "install-bundle: checksums OK"
 }
 
+dpkg_() {
+    if [ -n "$root" ]; then dpkg --root="$root" "$@"; else dpkg "$@"; fi
+}
+
+dpkg_query() {
+    if [ -n "$root" ]; then dpkg-query --admindir="$root/var/lib/dpkg" "$@"; else dpkg-query "$@"; fi
+}
+
+# The formats file of a .deb on stdout (empty for a legacy release).
+deb_formats() { # deb
+    dpkg-deb --fsys-tarfile "$1" | tar -xOf - ./usr/share/robodr/formats 2>/dev/null || true
+}
+
+# The black-box formats a formats file says it reads.
+reads_of() { # formats-file
+    r=$(sed -n 's/^blackbox_read=//p' "$1" | tr ',' ' ')
+    [ -n "$r" ] || r=$legacy_read
+    echo "$r"
+}
+
+# "<format> <segment>" for the first frame of every segment file: RBF1:<v>,
+# or unknown:<hex of the first 4 bytes> for another frame magic.
+ondisk_formats() {
+    for d in $bb_dirs; do
+        [ -d "$d" ] || continue
+        find "$d" -type f -name 'seg-*.rbb' -size +8c | LC_ALL=C sort | while IFS= read -r f; do
+            h=$(od -An -tx1 -N9 "$f" | tr -d ' \n')
+            case "$h" in
+            52424631????????*) echo "RBF1:$(printf '%d' "0x${h#????????????????}") $f" ;;
+            *) echo "unknown:$(printf '%s' "$h" | cut -c1-8) $f" ;;
+            esac
+        done
+    done
+}
+
+# Refuse a release that cannot read the black box on this unit.
+check_formats() { # formats-file version
+    reads=$(reads_of "$1")
+    bad=$(ondisk_formats | while read -r fmt seg; do
+        case " $reads " in *" $fmt "*) ;; *) echo "$fmt $seg" ;; esac
+    done)
+    if [ -n "$bad" ]; then
+        first=$(echo "$bad" | head -n1)
+        echo "install-bundle: REFUSED: release $2 reads black-box formats [$reads], but ${first#* } is ${first%% *} (written by a newer release; $(echo "$bad" | wc -l) segment(s) affected). $2 could neither verify nor extend this evidence. Export and archive the chain first (robodr-blackbox export; move the directory aside, OPERATIONS.md section 7), or install a release that reads ${first%% *}." >&2
+        return 1
+    fi
+    echo "install-bundle: black-box formats OK for $2 (reads: $reads)"
+}
+
+# Print the SOC ring information recorded by robodr-enroll (information only).
+ring_note() { # [deb-version]
+    [ -r "$ring_env" ] || return 0
+    rv=$(sed -n 's/^ring=//p' "$ring_env")
+    tv=$(sed -n 's/^target_version=//p' "$ring_env")
+    st=$(sed -n 's/^stale=//p' "$ring_env")
+    echo "install-bundle: SOC ring information (information only): ring ${rv:-?}, target ${tv:--}${st:+, expired=$st}"
+    if [ -n "${1:-}" ] && [ -n "$tv" ]; then
+        up=${1%-*}
+        if [ "$up" = "$(echo "$tv" | sed 's/-/~/')" ]; then
+            echo "install-bundle: this release matches the ring target"
+        else
+            echo "install-bundle: note: installing $1, the ring target is $tv (information only; installation proceeds)"
+        fi
+    fi
+    bs=$(sed -n 's/^bundle_sha256=//p' "$ring_env")
+    if [ -n "${tarball:-}" ] && [ -n "$bs" ] && [ -f "$tarball" ]; then
+        if [ "$(sha256sum "$tarball" | cut -d' ' -f1)" = "$bs" ]; then
+            echo "install-bundle: the tarball is the ring's bundle ($bs)"
+        else
+            echo "install-bundle: note: the tarball is not the ring's bundle $bs (information only)"
+        fi
+    fi
+}
+
 # The bundle holds one package: robodr, or robodr-focal (static build for
 # systemd 245 hosts). The two conflict; dpkg replaces one with the other.
 find_deb() {
@@ -70,18 +171,26 @@ find_deb() {
 
 pubkey=""
 tarball=""
+bb_dirs=""
 cmd=${1:-}
-[ -n "$cmd" ] || die 2 "usage: $0 verify|install|list|rollback ..."
+[ -n "$cmd" ] || die 2 "usage: $0 verify|install|list|rollback|ring ..."
 shift
 version_arg=""
 while [ $# -gt 0 ]; do
     case "$1" in
     --pubkey) [ $# -ge 2 ] || die 2 "--pubkey needs a value"; pubkey=$2; shift 2 ;;
     --tarball) [ $# -ge 2 ] || die 2 "--tarball needs a value"; tarball=$2; shift 2 ;;
+    --blackbox-dir)
+        [ $# -ge 2 ] || die 2 "--blackbox-dir needs a value"
+        case "$2" in *[[:space:]]*) die 2 "--blackbox-dir must not contain white space" ;; esac
+        bb_dirs="$bb_dirs $2"
+        shift 2
+        ;;
     -*) die 2 "unknown option $1" ;;
     *) version_arg=$1; shift ;;
     esac
 done
+[ -n "$bb_dirs" ] || bb_dirs="$root/var/lib/robodr/blackbox $root/var/lib/robodr/fleet/journal"
 
 do_verify() {
     if [ -n "$pubkey" ] || [ -n "$tarball" ]; then
@@ -111,22 +220,38 @@ install)
     ver=$(dpkg-deb -f "$deb" Version)
     prev=""
     for p in robodr robodr-focal; do
-        v=$(dpkg-query -W -f '${db:Status-Abbrev} ${Version}' "$p" 2>/dev/null || true)
+        # shellcheck disable=SC2016 # dpkg-query format, not a shell expansion
+        v=$(dpkg_query -W -f '${db:Status-Abbrev} ${Version}' "$p" 2>/dev/null || true)
         case "$v" in ii*) prev="$prev $p ${v##* }" ;; esac
     done
     echo "install-bundle: installing $pkg $ver (currently installed:${prev:- none})"
-    dpkg -i "$deb"
+    ring_note "$ver"
+    fmt=$(mktemp)
+    deb_formats "$deb" >"$fmt"
+    check_formats "$fmt" "$ver" || { rm -f "$fmt"; exit 1; }
+    dpkg_ -i "$deb"
     install -d -m 0750 "$releases/$ver"
     # One package per kept version: the variant installed last (robodr and
     # robodr-focal share version numbers).
     rm -f "$releases/$ver"/robodr_*.deb "$releases/$ver"/robodr-focal_*.deb
     install -m 0644 "$deb" "$releases/$ver/"
     (cd "$here" && install -m 0644 SHA256SUMS "$releases/$ver/SHA256SUMS")
+    if [ -s "$fmt" ]; then install -m 0644 "$fmt" "$releases/$ver/formats"; fi
+    rm -f "$fmt"
     echo "install-bundle: kept $releases/$ver for rollback"
     ;;
 list)
     [ -d "$releases" ] || die 1 "no releases kept in $releases"
-    ls -1 "$releases"
+    for d in "$releases"/*/; do
+        [ -d "$d" ] || continue
+        v=$(basename "$d")
+        if [ -f "$d/formats" ]; then r=$(reads_of "$d/formats"); else r="$legacy_read (legacy)"; fi
+        echo "$v  black-box formats read: $r"
+    done
+    ;;
+ring)
+    [ -r "$ring_env" ] || die 1 "no ring information recorded ($ring_env; robodr-enroll ring)"
+    ring_note ""
     ;;
 rollback)
     need_root
@@ -142,10 +267,14 @@ rollback)
         n=$((n + 1))
     done
     [ "$n" -eq 1 ] || die 1 "expected exactly one .deb in $dir, found $n"
+    fmt=$(mktemp)
+    if [ -f "$dir/formats" ]; then cp "$dir/formats" "$fmt"; else deb_formats "$deb" >"$fmt"; fi
+    check_formats "$fmt" "$version_arg" || { rm -f "$fmt"; exit 1; }
+    rm -f "$fmt"
     echo "install-bundle: rolling back to $(dpkg-deb -f "$deb" Package) $version_arg"
-    dpkg -i "$deb"
+    dpkg_ -i "$deb"
     ;;
 *)
-    die 2 "unknown command $cmd (verify|install|list|rollback)"
+    die 2 "unknown command $cmd (verify|install|list|rollback|ring)"
     ;;
 esac

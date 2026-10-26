@@ -32,6 +32,8 @@
 #             requires them)
 #             robodr-anchor-receiver (pure; base-station side of the remote
 #             head anchor, installed with its unit when built)
+#             robodr-enroll (pure; fleet enrollment, key rotation, SOC
+#             profiles; usr/sbin, root-only tool, no unit)
 # A unit file is only installed together with its binary. ROBODR_DEB_REQUIRE
 # (space separated) makes optional binaries mandatory; the release workflow
 # sets it so a release can never silently ship without the daemon.
@@ -222,6 +224,13 @@ if [[ "$variant" == standard ]] && install_bin robodr-anchor-receiver usr/bin 0;
     install -D -m 0644 "$here/systemd/robodr-anchor-receiver.service" \
         "$pkg/$units/robodr-anchor-receiver.service"
 fi
+
+# Fleet lifecycle (Sprint 9): robodr-enroll and its configuration example.
+# (config/fleet.example.json goes to the examples with the other configs.)
+install_bin robodr-enroll usr/sbin 0 || true
+# On-disk formats this release writes and reads (install-bundle.sh's
+# black-box format gate on install and rollback).
+install -D -m 0644 "$here/formats" "$pkg/usr/share/robodr/formats"
 
 install -D -m 0644 "$here/tmpfiles.d/robodr.conf" "$pkg/usr/lib/tmpfiles.d/robodr.conf"
 install -D -m 0644 "$here/sysusers.d/robodr.conf" "$pkg/usr/lib/sysusers.d/robodr.conf"

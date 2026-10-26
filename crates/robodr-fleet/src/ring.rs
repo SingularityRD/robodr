@@ -79,6 +79,7 @@ pub fn accept(ctx: &Ctx, bytes: &[u8]) -> Result<RingStatus, String> {
             envelope: text,
         },
     )?;
+    write_env(ctx, &info)?;
     let installed = env!("CARGO_PKG_VERSION").to_string();
     let status = RingStatus {
         update_available: info
@@ -101,4 +102,22 @@ pub fn accept(ctx: &Ctx, bytes: &[u8]) -> Result<RingStatus, String> {
     }))?;
     j.close()?;
     Ok(status)
+}
+
+/// `ring.env`: the verified ring information as plain `key=value` lines for
+/// `install-bundle.sh` (which prints it and never sources it). Every value
+/// has passed [`RingInfo::parse`] (restricted character sets).
+fn write_env(ctx: &Ctx, info: &RingInfo) -> Result<(), String> {
+    let text = format!(
+        "# robodr-enroll: SOC update-ring information (verified). Information only.\n\
+         serial={}\nring={}\ntarget_version={}\nbundle_sha256={}\nexpires_at_ms={}\nstale={}\n",
+        info.serial,
+        info.ring,
+        info.target_version.as_deref().unwrap_or(""),
+        info.bundle_sha256.as_deref().unwrap_or(""),
+        info.expires_at_ms,
+        ctx.now() > info.expires_at_ms
+    );
+    let p = ctx.path("ring.env");
+    crate::fsx::write_atomic(&p, text.as_bytes()).map_err(|e| format!("{}: {e}", p.display()))
 }
