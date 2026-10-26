@@ -1686,27 +1686,80 @@ fn evidence_call(
                     "another evidence index or export is running; retry shortly",
                 ));
             };
+            // Review finding 7: the bundle is streamed into a temp export
+            // (never held in memory), within the storage quota and the
+            // free-space headroom, and within a build deadline.
             let src = evidence::DirSource(svc.blackbox.clone());
-            let built = match evidence::index(&src).and_then(|ix| {
+            let (ix, lo, hi, refs) = match evidence::index(&src).and_then(|ix| {
                 let (lo, hi, refs) = evidence::select(&ix, &req.selector)?;
-                evidence::build(&src, &ix, lo, hi, refs, svc.spec.max_export_bytes)
+                Ok((ix, lo, hi, refs))
             }) {
-                Ok(b) => b,
+                Ok(v) => v,
                 Err(e) => return Reply::error(&e),
             };
-            let used = lock().bytes();
-            if used.saturating_add(built.bundle.len() as u64) > svc.spec.max_storage_bytes {
-                return Reply::error(&ApiError::new(
+            let estimate = evidence::selection_bytes(&ix, lo, hi);
+            let storage_full = |used: u64, bytes: u64| {
+                Reply::error(&ApiError::new(
                     507,
                     "storage_full",
                     format!(
-                        "the kept exports use {used} bytes; this one ({} bytes) would exceed \
-                         max_storage_bytes; delete exports first",
-                        built.bundle.len()
+                        "the kept exports use {used} bytes; this one ({bytes} bytes) would exceed \
+                         max_storage_bytes; delete exports first"
                     ),
-                ));
+                ))
+            };
+            let (used, exports_dir) = {
+                let g = lock();
+                (g.bytes(), g.dir.clone())
+            };
+            if estimate <= svc.spec.max_export_bytes
+                && used.saturating_add(estimate) > svc.spec.max_storage_bytes
+            {
+                return storage_full(used, estimate);
             }
-            let binfo = evidence::bundle_info(&built.bundle, svc.spec.chunk_bytes);
+            if let Err(e) = evidence::check_free_space(evidence::free_bytes(&exports_dir), estimate)
+            {
+                return Reply::error(&e);
+            }
+            let unstorable = |e: std::io::Error| {
+                Reply::error(&ApiError::new(
+                    503,
+                    "evidence_unavailable",
+                    format!("the export could not be stored ({e}); retry later"),
+                ))
+            };
+            let tmp = match evidence::TempExport::create(&exports_dir) {
+                Ok(t) => t,
+                Err(e) => return unstorable(e),
+            };
+            let deadline = Instant::now() + evidence::BUILD_DEADLINE;
+            let cancel = || sh.stop.load(Ordering::Relaxed) || Instant::now() > deadline;
+            let built = tmp.bundle_file().map_err(|e| unstorable(e)).and_then(|f| {
+                let mut w = std::io::BufWriter::new(f);
+                let r = evidence::build_into(
+                    &src,
+                    &ix,
+                    lo,
+                    hi,
+                    refs,
+                    svc.spec.max_export_bytes,
+                    svc.spec.chunk_bytes,
+                    &mut w,
+                    &cancel,
+                )
+                .map_err(|e| Reply::error(&e))?;
+                let f = w.into_inner().map_err(|e| unstorable(e.into_error()))?;
+                f.sync_all().map_err(unstorable)?;
+                Ok(r)
+            });
+            let (binfo, built) = match built {
+                Ok(b) => b,
+                Err(r) => return r,
+            };
+            let used = lock().bytes();
+            if used.saturating_add(binfo.bytes) > svc.spec.max_storage_bytes {
+                return storage_full(used, binfo.bytes);
+            }
             let note = json!({
                 "kind": "robodr.control_plane_evidence_export",
                 "api": auth::API_VERSION,
@@ -1782,24 +1835,13 @@ fn evidence_call(
                     "the manifest could not be signed; nothing was exported",
                 ));
             };
-            let exports_dir = lock().dir.clone();
-            match evidence::write_export(
-                &exports_dir,
-                manifest,
-                manifest_bytes,
-                signature,
-                &built.bundle,
-            ) {
+            match tmp.finish(manifest, manifest_bytes, signature) {
                 Ok(st) => {
                     let r = manifest_reply(201, &st);
                     lock().insert(st);
                     r
                 }
-                Err(e) => Reply::error(&ApiError::new(
-                    503,
-                    "evidence_unavailable",
-                    format!("the export could not be stored ({e}); retry later"),
-                )),
+                Err(e) => unstorable(e),
             }
         }
         _ => busy("unroutable"),

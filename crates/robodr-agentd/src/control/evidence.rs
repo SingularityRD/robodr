@@ -92,6 +92,15 @@ pub const DEFAULT_CONTEXT_RECORDS: u64 = 16;
 pub const MAX_TIME_SPAN_MS: u64 = 7 * 24 * 3600 * 1000;
 /// Longest `finding_id`.
 pub const MAX_FINDING_ID_LEN: usize = 256;
+/// Largest `max_export_bytes` a robot may be configured with (review
+/// finding 7: an export is built on the robot, next to the detection loop).
+pub const MAX_EXPORT_BYTES_LIMIT: u64 = 256 * 1024 * 1024;
+/// Free space an export must leave on the state directory's filesystem,
+/// so the request and nonce journals (same directory) never starve.
+pub const FREE_SPACE_HEADROOM: u64 = 64 * 1024 * 1024;
+/// Longest an export build may take; past it (or when the daemon stops)
+/// the build is abandoned, so shutdown is never held by an export.
+pub const BUILD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn default_max_export() -> u64 {
     64 * 1024 * 1024
@@ -119,7 +128,7 @@ fn default_chunk_burst() -> u32 {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceSection {
-    /// Largest bundle, 64 KiB..=1 GiB.
+    /// Largest bundle, 64 KiB..=256 MiB ([`MAX_EXPORT_BYTES_LIMIT`]).
     #[serde(default = "default_max_export")]
     pub max_export_bytes: u64,
     /// Chunk size, 16 KiB..=4 MiB; at most 4096 chunks per export.
@@ -172,7 +181,7 @@ impl EvidenceSection {
             "max_export_bytes",
             self.max_export_bytes,
             64 * 1024,
-            1024 * 1024 * 1024,
+            MAX_EXPORT_BYTES_LIMIT,
         )?;
         range("chunk_bytes", self.chunk_bytes, 16 * 1024, 4 * 1024 * 1024)?;
         if self.max_export_bytes.div_ceil(self.chunk_bytes) > MAX_CHUNKS {
@@ -906,18 +915,116 @@ pub struct ChainInfo {
     pub signing_key: KeyRef,
 }
 
-/// Pass 2: copy the frames of `[lo, hi]` and build the bundle, at most
-/// `max_bytes` of frames.
-pub fn build(
+/// What a build found besides the bundle bytes.
+#[derive(Debug, Clone)]
+pub struct BuiltMeta {
+    pub records: RecordsInfo,
+    pub anchor: Option<AnchorInfo>,
+    pub referenced: Vec<RecordRef>,
+    pub chain: ChainInfo,
+}
+
+/// Bytes of frames a selection exports (the bundle adds a small header).
+pub fn selection_bytes(ix: &Index, lo: usize, hi: usize) -> u64 {
+    ix.records
+        .get(lo..=hi)
+        .map(|sel| sel.iter().map(|r| r.frame_len).sum())
+        .unwrap_or(0)
+}
+
+/// A writer that hashes the whole stream and each `chunk_bytes` chunk of
+/// it as it goes (the manifest's bundle section, without holding the
+/// bundle in memory).
+struct ChunkHasher<'a> {
+    out: &'a mut dyn Write,
+    chunk_bytes: u64,
+    total: robodr_blackbox::crypto::Sha256,
+    chunk: robodr_blackbox::crypto::Sha256,
+    chunk_len: u64,
+    bytes: u64,
+    chunks: Vec<ChunkInfo>,
+}
+
+impl<'a> ChunkHasher<'a> {
+    fn new(out: &'a mut dyn Write, chunk_bytes: u64) -> Self {
+        Self {
+            out,
+            chunk_bytes: chunk_bytes.max(1),
+            total: robodr_blackbox::crypto::Sha256::new(),
+            chunk: robodr_blackbox::crypto::Sha256::new(),
+            chunk_len: 0,
+            bytes: 0,
+            chunks: Vec::new(),
+        }
+    }
+
+    fn end_chunk(&mut self) {
+        let h = std::mem::replace(&mut self.chunk, robodr_blackbox::crypto::Sha256::new());
+        self.chunks.push(ChunkInfo {
+            index: self.chunks.len() as u64,
+            offset: self.bytes - self.chunk_len,
+            bytes: self.chunk_len,
+            sha256: to_hex(&h.finalize()),
+        });
+        self.chunk_len = 0;
+    }
+
+    fn put(&mut self, data: &[u8]) -> io::Result<()> {
+        self.out.write_all(data)?;
+        self.total.update(data);
+        let mut rest = data;
+        while !rest.is_empty() {
+            let room = (self.chunk_bytes - self.chunk_len) as usize;
+            let n = room.min(rest.len());
+            self.chunk.update(&rest[..n]);
+            self.chunk_len += n as u64;
+            self.bytes += n as u64;
+            rest = &rest[n..];
+            if self.chunk_len == self.chunk_bytes {
+                self.end_chunk();
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> BundleInfo {
+        if self.chunk_len > 0 {
+            self.end_chunk();
+        }
+        BundleInfo {
+            format: BUNDLE_FORMAT.into(),
+            bytes: self.bytes,
+            sha256: to_hex(&self.total.finalize()),
+            chunk_bytes: self.chunk_bytes,
+            chunks: self.chunks,
+        }
+    }
+}
+
+/// Pass 2: copy the frames of `[lo, hi]` into a bundle written to `out`
+/// as it is read (one black-box segment in memory at a time, never the
+/// bundle; review finding 7), at most `max_bytes` of frames. Returns the
+/// bundle's manifest section (`chunk_bytes` chunks) and what it holds.
+/// `cancel` is asked before every record: `true` (past the build deadline,
+/// or the daemon is stopping) abandons the build with 503
+/// `evidence_timeout`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_into(
     src: &dyn SegmentSource,
     ix: &Index,
     lo: usize,
     hi: usize,
     referenced: Vec<RecordRef>,
     max_bytes: u64,
-) -> Result<Built, ApiError> {
-    let sel = &ix.records[lo..=hi];
-    let total: u64 = sel.iter().map(|r| r.frame_len).sum();
+    chunk_bytes: u64,
+    out: &mut dyn Write,
+    cancel: &dyn Fn() -> bool,
+) -> Result<(BundleInfo, BuiltMeta), ApiError> {
+    let sel = ix.records.get(lo..=hi).unwrap_or_default();
+    let (Some(f), Some(l)) = (sel.first(), sel.last()) else {
+        return Err(unavailable("empty selection"));
+    };
+    let total = selection_bytes(ix, lo, hi);
     if total > max_bytes {
         return Err(ApiError::new(
             413,
@@ -929,11 +1036,23 @@ pub fn build(
             ),
         ));
     }
-    let mut frames = Vec::with_capacity(total as usize);
-    let mut first_prev: Option<Hash> = None;
+    let io_err = |e: io::Error| unavailable(format!("writing the export: {e}"));
+    let mut w = ChunkHasher::new(out, chunk_bytes);
+    let mut anchor: Option<Anchor> = None;
     let mut cur: Option<(u64, Vec<u8>)> = None;
     let changed = || unavailable("the black box changed while exporting (retention); retry");
     for m in sel {
+        if cancel() {
+            return Err(ApiError::new(
+                503,
+                "evidence_timeout",
+                format!(
+                    "the export was abandoned: it took longer than {} s or the daemon is \
+                     stopping; select fewer records",
+                    BUILD_DEADLINE.as_secs()
+                ),
+            ));
+        }
         if cur.as_ref().is_none_or(|(i, _)| *i != m.segment) {
             let b = src
                 .read(m.segment)
@@ -955,44 +1074,133 @@ pub fn build(
         if rec.seq != m.seq || rec.hash != m.hash || rec.chain_id != ix.chain_id {
             return Err(changed());
         }
-        if first_prev.is_none() {
-            first_prev = Some(rec.prev_hash);
+        if m.seq == f.seq {
+            // The header (it carries the anchor: the first record's
+            // predecessor), in the bundle's own encoding: a bundle without
+            // frames ends with its frame length (0), which is replaced.
+            anchor = (f.seq > 0).then(|| Anchor {
+                chain_id: ix.chain_id,
+                seq: f.seq - 1,
+                hash: rec.prev_hash,
+            });
+            let mut head = Bundle {
+                identity: ix.identity.clone(),
+                anchor: anchor.clone(),
+                frames: Vec::new(),
+            }
+            .to_bytes();
+            let cut = head.len().saturating_sub(8);
+            head.truncate(cut);
+            head.extend_from_slice(&total.to_be_bytes());
+            w.put(&head).map_err(io_err)?;
         }
-        frames.extend_from_slice(frame);
+        w.put(frame).map_err(io_err)?;
     }
-    let (f, l) = (&sel[0], &sel[sel.len() - 1]);
-    let anchor = (f.seq > 0).then(|| Anchor {
-        chain_id: ix.chain_id,
-        seq: f.seq - 1,
-        hash: first_prev.unwrap_or([0; 32]),
-    });
-    let bundle = Bundle {
-        identity: ix.identity.clone(),
-        anchor: anchor.clone(),
-        frames,
-    }
-    .to_bytes();
+    w.out.flush().map_err(io_err)?;
+    let info = w.finish();
+    Ok((
+        info,
+        BuiltMeta {
+            records: RecordsInfo {
+                first_seq: f.seq,
+                last_seq: l.seq,
+                count: sel.len() as u64,
+                first_wall_ms: f.wall_ms,
+                last_wall_ms: l.wall_ms,
+                last_sha256: to_hex(&l.hash),
+            },
+            anchor: anchor.map(|a| AnchorInfo {
+                seq: a.seq,
+                sha256: to_hex(&a.hash),
+            }),
+            referenced,
+            chain: ChainInfo {
+                chain_id: to_hex(&ix.chain_id),
+                identity: ix.identity.clone(),
+                signing_key: ix.key_at(f.seq),
+            },
+        },
+    ))
+}
+
+/// [`build_into`] a buffer (tests, the contract vectors).
+pub fn build(
+    src: &dyn SegmentSource,
+    ix: &Index,
+    lo: usize,
+    hi: usize,
+    referenced: Vec<RecordRef>,
+    max_bytes: u64,
+) -> Result<Built, ApiError> {
+    let mut bundle = Vec::new();
+    let (_, m) = build_into(
+        src,
+        ix,
+        lo,
+        hi,
+        referenced,
+        max_bytes,
+        4 * 1024 * 1024,
+        &mut bundle,
+        &|| false,
+    )?;
     Ok(Built {
         bundle,
-        records: RecordsInfo {
-            first_seq: f.seq,
-            last_seq: l.seq,
-            count: sel.len() as u64,
-            first_wall_ms: f.wall_ms,
-            last_wall_ms: l.wall_ms,
-            last_sha256: to_hex(&l.hash),
-        },
-        anchor: anchor.map(|a| AnchorInfo {
-            seq: a.seq,
-            sha256: to_hex(&a.hash),
-        }),
-        referenced,
-        chain: ChainInfo {
-            chain_id: to_hex(&ix.chain_id),
-            identity: ix.identity.clone(),
-            signing_key: ix.key_at(f.seq),
-        },
+        records: m.records,
+        anchor: m.anchor,
+        referenced: m.referenced,
+        chain: m.chain,
     })
+}
+
+/// Free bytes for an unprivileged writer on the filesystem holding `dir`
+/// (`statvfs`; `None` where it is not available).
+#[allow(unsafe_code)]
+pub fn free_bytes(dir: &Path) -> Option<u64> {
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        extern "C" {
+            fn statvfs(path: *const std::ffi::c_char, buf: *mut u64) -> std::ffi::c_int;
+        }
+        let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+        // Larger than `struct statvfs` on every 64-bit Linux libc (glibc,
+        // musl: 112 bytes); its first fields are f_bsize, f_frsize,
+        // f_blocks, f_bfree, f_bavail, all 64-bit here.
+        let mut buf = [0u64; 32];
+        // SAFETY: `c` is a NUL-terminated path that outlives the call;
+        // `buf` is a writable, 8-byte aligned buffer larger than the
+        // struct the call fills.
+        let rc = unsafe { statvfs(c.as_ptr(), buf.as_mut_ptr()) };
+        if rc != 0 {
+            return None;
+        }
+        let (frsize, bavail) = (buf[1], buf[4]);
+        Some(frsize.saturating_mul(bavail))
+    }
+    #[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
+/// Whether storing `need` more bytes leaves [`FREE_SPACE_HEADROOM`] free
+/// (`free`: [`free_bytes`]; unknown = not checked). 507 `storage_full`
+/// otherwise.
+pub fn check_free_space(free: Option<u64>, need: u64) -> Result<(), ApiError> {
+    match free {
+        Some(f) if f < need.saturating_add(FREE_SPACE_HEADROOM) => Err(ApiError::new(
+            507,
+            "storage_full",
+            format!(
+                "the state directory's filesystem has {f} bytes free; this export ({need} \
+                 bytes) must leave {FREE_SPACE_HEADROOM} free for the request and nonce \
+                 journals; delete exports or free space first"
+            ),
+        )),
+        _ => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1250,8 +1458,75 @@ impl Store {
     }
 }
 
-/// Write a finished export under `exports_dir` (temp directory, files
-/// fsynced, rename, directory fsynced); the [`Stored`] to insert.
+/// An export being written: `<exports_dir>/.tmp-<random>/`, removed on
+/// drop unless [`TempExport::finish`]ed. The bundle is streamed into
+/// [`TempExport::bundle_file`] while it is built (review finding 7).
+#[derive(Debug)]
+pub struct TempExport {
+    exports_dir: PathBuf,
+    dir: PathBuf,
+    done: bool,
+}
+
+impl TempExport {
+    pub fn create(exports_dir: &Path) -> io::Result<Self> {
+        let dir = exports_dir.join(format!(".tmp-{}", fsutil::random_hex16()?));
+        fsutil::create_dir_private(&dir)?;
+        Ok(Self {
+            exports_dir: exports_dir.to_path_buf(),
+            dir,
+            done: false,
+        })
+    }
+
+    /// The bundle file (created exclusively, 0600); the caller fsyncs it.
+    pub fn bundle_file(&self) -> io::Result<File> {
+        fsutil::create_new_private(&self.dir.join(BUNDLE_FILE))
+    }
+
+    /// Write the manifest and its signature, fsync, rename into place,
+    /// fsync the directory; the [`Stored`] to insert.
+    pub fn finish(
+        mut self,
+        manifest: Manifest,
+        manifest_bytes: Vec<u8>,
+        signature: String,
+    ) -> io::Result<Stored> {
+        let fin = self.exports_dir.join(export_dir_name(&manifest.export_id));
+        for (f, data) in [
+            (MANIFEST_FILE, manifest_bytes.as_slice()),
+            (MANIFEST_SIG_FILE, signature.as_bytes()),
+        ] {
+            let mut h = fsutil::create_new_private(&self.dir.join(f))?;
+            h.write_all(data)?;
+            h.sync_all()?;
+        }
+        fsutil::sync_dir(&self.dir)?;
+        remove_dir(&fin)?;
+        std::fs::rename(&self.dir, &fin)?;
+        self.done = true;
+        fsutil::sync_dir(&self.exports_dir)?;
+        Ok(Stored {
+            dir: fin,
+            digest: selector_digest(&manifest.selector),
+            manifest,
+            manifest_bytes,
+            signature,
+        })
+    }
+}
+
+impl Drop for TempExport {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = remove_dir(&self.dir);
+        }
+    }
+}
+
+/// Write a finished export from an in-memory bundle under `exports_dir`
+/// (temp directory, files fsynced, rename, directory fsynced); the
+/// [`Stored`] to insert.
 pub fn write_export(
     exports_dir: &Path,
     manifest: Manifest,
@@ -1259,36 +1534,11 @@ pub fn write_export(
     signature: String,
     bundle: &[u8],
 ) -> io::Result<Stored> {
-    let name = export_dir_name(&manifest.export_id);
-    let tmp = exports_dir.join(format!(".tmp-{}", fsutil::random_hex16()?));
-    let fin = exports_dir.join(&name);
-    let res = (|| -> io::Result<()> {
-        fsutil::create_dir_private(&tmp)?;
-        for (f, data) in [
-            (BUNDLE_FILE, bundle),
-            (MANIFEST_FILE, manifest_bytes.as_slice()),
-            (MANIFEST_SIG_FILE, signature.as_bytes()),
-        ] {
-            let mut h = fsutil::create_new_private(&tmp.join(f))?;
-            h.write_all(data)?;
-            h.sync_all()?;
-        }
-        fsutil::sync_dir(&tmp)?;
-        remove_dir(&fin)?;
-        std::fs::rename(&tmp, &fin)?;
-        fsutil::sync_dir(exports_dir)
-    })();
-    if let Err(e) = res {
-        let _ = remove_dir(&tmp);
-        return Err(e);
-    }
-    Ok(Stored {
-        dir: fin,
-        digest: selector_digest(&manifest.selector),
-        manifest,
-        manifest_bytes,
-        signature,
-    })
+    let t = TempExport::create(exports_dir)?;
+    let mut f = t.bundle_file()?;
+    f.write_all(bundle)?;
+    f.sync_all()?;
+    t.finish(manifest, manifest_bytes, signature)
 }
 
 /// Read chunk `index` of `s` and check it against the manifest.
@@ -2033,5 +2283,97 @@ mod tests {
             .uri(ROBOT)
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Review finding 7: robots cap `max_export_bytes` at 256 MiB.
+    #[test]
+    fn max_export_bytes_is_capped_on_robots() {
+        let mut e = EvidenceSection {
+            max_export_bytes: 512 * 1024 * 1024,
+            max_storage_bytes: 1024 * 1024 * 1024,
+            chunk_bytes: 4 * 1024 * 1024,
+            ..EvidenceSection::default()
+        };
+        let err = e.validate().unwrap_err();
+        assert!(err.contains("268435456"), "{err}");
+        e.max_export_bytes = MAX_EXPORT_BYTES_LIMIT;
+        e.validate().unwrap();
+    }
+
+    /// Review finding 7: the bundle is streamed (to a file here) with its
+    /// manifest section computed on the way; the bytes are the bundle
+    /// format exactly, and an abandoned temp export leaves nothing.
+    #[test]
+    fn a_streamed_build_is_the_bundle_and_its_manifest_section() {
+        let d = tmp("stream");
+        let mut r = recorder(&d, 64);
+        notes(&mut r, 0, 120);
+        drop(r);
+        let src = DirSource(d.clone());
+        let ix = index(&src).unwrap();
+        let (lo, hi, refs) = select(
+            &ix,
+            &Selector::SeqRange {
+                from_seq: 7,
+                to_seq: 100,
+            },
+        )
+        .unwrap();
+        let exports = d.join("exports-test");
+        std::fs::create_dir_all(&exports).unwrap();
+        let t = TempExport::create(&exports).unwrap();
+        let mut f = std::io::BufWriter::new(t.bundle_file().unwrap());
+        let (info, meta) = build_into(&src, &ix, lo, hi, refs, 1 << 30, 16 * 1024, &mut f, &|| {
+            false
+        })
+        .unwrap();
+        drop(f);
+        let bytes = std::fs::read(t.dir.join(BUNDLE_FILE)).unwrap();
+        assert_eq!(info, bundle_info(&bytes, 16 * 1024));
+        assert!(info.chunks.len() > 1);
+        let bundle = Bundle::from_bytes(&bytes).unwrap();
+        assert_eq!(bundle.to_bytes(), bytes, "the bundle format, byte for byte");
+        let rep = bundle.verify_with_key(&ring(), None, Some(ROBOT), Some(&meta.chain.signing_key));
+        assert!(rep.is_intact(), "{rep:?}");
+        assert_eq!(meta.records.count, 94);
+        let tmpdir = t.dir.clone();
+        drop(t);
+        assert!(!tmpdir.exists(), "an unfinished export is removed");
+        // Past the deadline / stopping: abandoned.
+        let mut sink = Vec::new();
+        let (lo, hi, refs) = select(
+            &ix,
+            &Selector::SeqRange {
+                from_seq: 7,
+                to_seq: 100,
+            },
+        )
+        .unwrap();
+        let e = build_into(
+            &src,
+            &ix,
+            lo,
+            hi,
+            refs,
+            1 << 30,
+            16 * 1024,
+            &mut sink,
+            &|| true,
+        )
+        .unwrap_err();
+        assert_eq!((e.status, e.code), (503, "evidence_timeout"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Review finding 7: an export must leave the free-space headroom.
+    #[test]
+    fn exports_leave_free_space_headroom() {
+        let mib = 1024 * 1024;
+        assert!(check_free_space(None, 500 * mib).is_ok());
+        assert!(check_free_space(Some(1024 * mib), 500 * mib).is_ok());
+        let e = check_free_space(Some(100 * mib), 50 * mib).unwrap_err();
+        assert_eq!((e.status, e.code), (507, "storage_full"));
+        #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+        assert!(free_bytes(&std::env::temp_dir()).is_some_and(|f| f > 0));
     }
 }
