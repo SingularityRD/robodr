@@ -1,7 +1,7 @@
 //! libFuzzer target: Kafka wire decoders (ApiVersions / Metadata / Produce, RecordBatch v2).
 //!
-//! The harness (input format, invariants) is `fuzz/harness/kafka_wire.rs`. It has no
-//! std-only smoke test (see the harness docs): it runs under libFuzzer only.
+//! The harness (input format, invariants) is `fuzz/harness/kafka_wire.rs`; its std-only
+//! smoke test is `crates/robodr-export/tests/fuzz_smoke.rs`.
 //!
 //! Run: `cargo +nightly fuzz run kafka_wire` (seeds: `fuzz/corpus/kafka_wire/`).
 #![no_main]

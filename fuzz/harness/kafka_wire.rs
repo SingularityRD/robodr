@@ -22,8 +22,7 @@
 //! * record batches: a decoded batch has at most one record per 7 bytes,
 //!   and the CRC-fixed variant fails only on structure, never on the CRC.
 //!
-//! This target has no std-only smoke test: `crates/robodr-export` is
-//! changed by other work (S10 constraint); it runs under libFuzzer only.
+//! Std-only smoke test: `crates/robodr-export/tests/fuzz_smoke.rs`.
 #![allow(dead_code)]
 
 use robodr_export::crc32c::crc32c;

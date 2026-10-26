@@ -25,12 +25,12 @@ violated output invariant (documented at the top of its harness file).
 | `diode_fec` | robodr-diode | Reed-Solomon parameters, data and an erasure mask: encode, erase, rebuild, all against the `reed-solomon` 0.2.1 oracle (dev-only) | same |
 | `correlate_rules` | robodr-correlate | `rules JSON \0 signal records` to `RuleSet::from_json` and a `Correlator` driven by the result (finding invariants) | `crates/robodr-correlate/tests/fuzz_smoke.rs` |
 | `safety_feed` | robodr-agentd | `safety_feed JSON \0 records`: safety-socket lines, RTPS datagrams (through the sensor pipeline, then `SafetyFeed::observe_datagram`), clock steps; "never less conservative than a fresh socket report" | `crates/robodr-agentd/tests/fuzz_smoke.rs` |
-| `kafka_wire` | robodr-export | a selector + body to the Kafka decoders: ApiVersions / Metadata v1-8 / Produce v3-8 responses (decode-encode-decode identity), RecordBatch v2 (CRC fixed up or not), request header + Metadata / Produce requests, wire primitives | none (see below) |
+| `kafka_wire` | robodr-export | a selector + body to the Kafka decoders: ApiVersions / Metadata v1-8 / Produce v3-8 responses (decode-encode-decode identity), RecordBatch v2 (CRC fixed up or not), request header + Metadata / Produce requests, wire primitives | `crates/robodr-export/tests/fuzz_smoke.rs` |
 | `firewall_gw_packet` | robodr-firewall-gw | a flags byte + framed records (each wrapped in IPv4 / UDP) to `Gateway::process` (strict RTPS walk, SEDP learning, `LowCmd_` / sport `Request_` / Go1 decode, firewall decision, in-place rewrite), and the bytes to the NFQUEUE netlink parser | `crates/robodr-firewall-gw/tests/fuzz_smoke.rs` |
 
-`kafka_wire` has no std-only smoke test: it was added while
-`crates/robodr-export` was being changed by parallel work, so nothing was
-added under that crate; it runs under libFuzzer only (and in CI's fuzz job).
+`kafka_wire` got its std-only smoke test after the fact (it was added while
+`crates/robodr-export` was being changed by parallel work); it also checks
+that every seed still takes its decoder's success path.
 
 The firewall crate has no file format of its own (and no serde): its policy
 is compiled from the profile JSON the agent parses, so that target and its
@@ -108,9 +108,8 @@ additions).
 
 ### Smoke runs
 
-* all targets except `kafka_wire` are compiled and run in `cargo test` by
-  their crate's `tests/fuzz_smoke.rs` (so `clippy -D warnings` covers them);
-  `kafka_wire` compiles warning-free under `cargo fuzz build`;
+* all targets are compiled and run in `cargo test` by their crate's
+  `tests/fuzz_smoke.rs` (so `clippy -D warnings` covers them);
 * the smoke tests (same harness code) pass in debug in `cargo test`; two
   longer release runs of the first 12 targets (2026-10-16, PRNG seeds
   default and `0x5eed2`, up to 2 M inputs or 40-60 s per target, about 26 M
