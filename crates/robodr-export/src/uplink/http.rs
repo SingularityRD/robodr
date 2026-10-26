@@ -622,10 +622,14 @@ fn read_line<R: BufRead>(r: &mut R, budget: &mut usize) -> io::Result<String> {
             "connection closed before a complete response",
         ));
     }
+    // At most `*budget + 1` bytes were read: one more than allowed means the
+    // head is too large, whether or not that byte ends the line (checked
+    // before subtracting: a line of exactly `budget + 1` bytes must not
+    // underflow the budget).
+    if n > *budget {
+        return Err(bad("response head too large"));
+    }
     if buf.last() != Some(&b'\n') {
-        if n > *budget {
-            return Err(bad("response head too large"));
-        }
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "connection closed inside the response head",
@@ -741,6 +745,12 @@ pub fn read_response<R: BufRead>(r: &mut R) -> io::Result<HttpResponse> {
     }
 }
 
+/// Body length after appending a chunk of `size` bytes (`None` on overflow,
+/// possible on 32-bit targets: 8 hex digits are up to 4 GiB).
+fn body_len_after(len: usize, size: usize) -> Option<usize> {
+    len.checked_add(size)
+}
+
 fn read_chunked<R: BufRead>(r: &mut R) -> io::Result<Vec<u8>> {
     let mut body = Vec::new();
     let mut budget = MAX_HEAD_BYTES;
@@ -762,11 +772,12 @@ fn read_chunked<R: BufRead>(r: &mut R) -> io::Result<Vec<u8>> {
                 }
             }
         }
-        if body.len() + size > MAX_RESPONSE_BODY {
-            return Err(bad("response body is too large"));
-        }
+        let end = match body_len_after(body.len(), size) {
+            Some(end) if end <= MAX_RESPONSE_BODY => end,
+            _ => return Err(bad("response body is too large")),
+        };
         let start = body.len();
-        body.resize(start + size, 0);
+        body.resize(end, 0);
         r.read_exact(&mut body[start..])?;
         let mut crlf = [0u8; 2];
         r.read_exact(&mut crlf)?;
@@ -904,5 +915,76 @@ mod tests {
         // Interim response flood.
         let flood = b"HTTP/1.1 100 Continue\r\n\r\n".repeat(MAX_INTERIM + 1);
         assert!(parse(&flood).is_err());
+    }
+
+    /// A head of `total` bytes: status line, one `X:` header padded so the
+    /// whole head (CRLFs included) is exactly `total` bytes, empty line.
+    fn head_of(total: usize) -> Vec<u8> {
+        let status = b"HTTP/1.1 204 No Content\r\n";
+        let fixed = status.len() + "X: \r\n".len() + 2;
+        let mut h = status.to_vec();
+        h.extend_from_slice(b"X: ");
+        h.extend(std::iter::repeat_n(b'a', total - fixed));
+        h.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(h.len(), total);
+        h
+    }
+
+    /// The head budget is exact: `MAX_HEAD_BYTES` bytes of head are read,
+    /// one more byte is refused, and a line ending exactly one byte past the
+    /// budget is an error, never an arithmetic underflow (a panic in debug
+    /// builds, a wrapped budget in release builds).
+    #[test]
+    fn head_budget_boundaries_never_underflow() {
+        let r = parse(&head_of(MAX_HEAD_BYTES)).unwrap();
+        assert_eq!(r.status, 204);
+        let e = parse(&head_of(MAX_HEAD_BYTES + 1)).unwrap_err();
+        assert!(e.to_string().contains("too large"), "{e}");
+        // read_line directly: a line (LF included) of budget + 1 bytes.
+        for (input, budget, ok) in [
+            (&b"abcde\n"[..], 6usize, true),
+            (b"abcde\n", 5, false),
+            (b"abcd\r\n", 5, false),
+            (b"\n", 0, false),
+            (b"\n", 1, true),
+        ] {
+            let mut b = budget;
+            let r = read_line(&mut BufReader::new(input), &mut b);
+            assert_eq!(r.is_ok(), ok, "{input:?} {budget}: {r:?}");
+            if ok {
+                assert_eq!(b, budget - input.len());
+            }
+        }
+    }
+
+    /// Chunk sizes: the largest accepted hex size (8 digits) after some
+    /// body bytes is refused as too large without allocating or
+    /// overflowing; the chunk-line budget is shared with the trailers.
+    #[test]
+    fn huge_chunk_sizes_are_refused_without_overflow() {
+        for size in ["ffffffff", "FFFFFFFF", "100001", "fffff;x=y"] {
+            let msg = format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n{size}\r\n"
+            );
+            let e = parse(msg.as_bytes()).unwrap_err();
+            assert!(e.to_string().contains("too large"), "{size}: {e}");
+        }
+        // Exactly MAX_RESPONSE_BODY in two chunks: accepted.
+        let half = MAX_RESPONSE_BODY / 2;
+        let mut msg = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for _ in 0..2 {
+            msg.extend_from_slice(format!("{half:x}\r\n").as_bytes());
+            msg.extend(std::iter::repeat_n(b'z', half));
+            msg.extend_from_slice(b"\r\n");
+        }
+        msg.extend_from_slice(b"0\r\n\r\n");
+        assert_eq!(parse(&msg).unwrap().body.len(), MAX_RESPONSE_BODY);
+        // One byte more: refused.
+        let mut over = msg[..msg.len() - 5].to_vec();
+        over.extend_from_slice(b"1\r\nz\r\n0\r\n\r\n");
+        assert!(parse(&over).is_err());
+        // The addition itself is checked.
+        assert_eq!(body_len_after(usize::MAX - 1, 2), None);
+        assert_eq!(body_len_after(1, 2), Some(3));
     }
 }
