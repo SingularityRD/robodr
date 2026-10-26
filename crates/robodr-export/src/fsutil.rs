@@ -187,6 +187,51 @@ pub fn append_durable(path: &Path, line: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+mod sys {
+    //! `flock(2)`, declared by hand as `robodr-diode` and `robodr-blackbox`
+    //! do (no libc crate offline); std links libc on every unix target.
+    pub const LOCK_EX: i32 = 2;
+    pub const LOCK_NB: i32 = 4;
+    extern "C" {
+        pub fn flock(fd: i32, operation: i32) -> i32;
+    }
+}
+
+/// Take an exclusive, non-blocking `flock` on `p` (created mode 0600 if
+/// missing, never through a symlink, never truncated or removed). `Ok(None)`
+/// if another process (or another open file description in this one) holds
+/// it. The lock lives as long as the returned file; the kernel drops it when
+/// the process dies, so a crash never leaves a stale lock behind.
+pub fn try_lock(p: &Path) -> io::Result<Option<File>> {
+    use std::os::unix::io::AsRawFd;
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc_o_nofollow())
+        .open(p)?;
+    if !f.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", p.display()),
+        ));
+    }
+    // SAFETY: `flock` only reads its two integer arguments; the descriptor
+    // is owned by `f`, which outlives the call.
+    let rc = unsafe { sys::flock(f.as_raw_fd(), sys::LOCK_EX | sys::LOCK_NB) };
+    if rc == 0 {
+        return Ok(Some(f));
+    }
+    let e = io::Error::last_os_error();
+    if e.kind() == io::ErrorKind::WouldBlock {
+        Ok(None)
+    } else {
+        Err(e)
+    }
+}
+
 /// Create (mode 0700) a directory and its parents.
 pub fn mkdir(p: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
@@ -234,6 +279,23 @@ mod tests {
         append_durable(&d.join("log"), b"a\n").unwrap();
         append_durable(&d.join("log"), b"b\n").unwrap();
         assert_eq!(fs::read(d.join("log")).unwrap(), b"a\nb\n");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn lock_is_exclusive_and_released_on_drop() {
+        let d = std::env::temp_dir().join(format!("robodr-export-lock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        mkdir(&d).unwrap();
+        let lp = d.join("x.lock");
+        let held = try_lock(&lp).unwrap().expect("first lock");
+        // flock locks belong to the open file description: a second open in
+        // this process conflicts like another process would.
+        assert!(try_lock(&lp).unwrap().is_none());
+        drop(held);
+        assert!(try_lock(&lp).unwrap().is_some());
+        std::os::unix::fs::symlink(&lp, d.join("ln.lock")).unwrap();
+        assert!(try_lock(&d.join("ln.lock")).is_err());
         let _ = fs::remove_dir_all(&d);
     }
 

@@ -62,9 +62,11 @@
 //! caller retries later with the same pending batch.
 
 pub mod http;
+pub mod reinject;
+pub mod service;
 pub mod wire;
 
-use crate::deadletter::DeadLetters;
+use crate::deadletter::{DeadLetters, Rotation};
 use crate::fsutil::{self, ReadError};
 use crate::publish::{
     check_record, list_diode_batches, list_ready, read_spool_item, LineReader, OpenRecordsError,
@@ -80,6 +82,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use wire::{IngestResponse, RejectedLine};
 
@@ -87,11 +90,28 @@ const STATE_FORMAT: &str = "robodr-uplink-state/1";
 pub const STATE_FILE: &str = "uplink-state.json";
 pub const DONE_DIR: &str = "done";
 pub const DEAD_LETTER_FILE: &str = "dead-letter.jsonl";
+/// Lock file of a state directory (`flock`, held for the process lifetime).
+pub const LOCK_FILE: &str = "uplink.lock";
+/// Directory of re-injected record streams ([`reinject`]).
+pub const REINJECT_DIR: &str = "reinject";
+/// Smallest dead-letter rotation size (a single larger entry is still
+/// written whole: rotation happens before an append, never inside one).
+pub const MIN_DEAD_LETTER_BYTES: u64 = 64 * 1024;
+/// Default dead-letter rotation: 64 MiB per file, 4 rotated files kept.
+pub const DEFAULT_DEAD_LETTER_ROTATION: Rotation = Rotation {
+    max_bytes: 64 * 1024 * 1024,
+    keep: 4,
+};
 /// Dead-letter code of a record refused by the local validation.
 pub const LOCAL_CODE: &str = "local";
 /// Smallest `max_body_bytes`: a single maximal line (64 KiB value, every
 /// byte escaped as `\u00XX`, plus a signature) always fits.
 pub const MIN_BODY_BYTES: usize = 1024 * 1024;
+
+/// Longest `Retry-After` honoured (contract §7): a server value above it is
+/// treated as this bound (an absurd value must not park the uplink for
+/// years); anything up to it is honoured in full, never shortened.
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(24 * 3600);
 
 /// Retry and backoff settings for one batch within one run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,10 +121,8 @@ pub struct RetryPolicy {
     pub max_attempts: u32,
     /// First backoff step.
     pub base: Duration,
-    /// Backoff cap.
+    /// Backoff cap (a `Retry-After` may be longer: it wins).
     pub max: Duration,
-    /// Cap on an honoured `Retry-After`.
-    pub max_retry_after: Duration,
 }
 
 impl Default for RetryPolicy {
@@ -113,7 +131,6 @@ impl Default for RetryPolicy {
             max_attempts: 6,
             base: Duration::from_millis(500),
             max: Duration::from_secs(60),
-            max_retry_after: Duration::from_secs(600),
         }
     }
 }
@@ -131,17 +148,25 @@ pub fn backoff_delay(p: &RetryPolicy, retry: u32, rand: u64) -> Duration {
 }
 
 /// `Retry-After` as delay-seconds (contract §2.4; the HTTP-date form is not
-/// used by the contract and is ignored).
+/// used by the contract and is ignored). Any number of digits is a valid
+/// delay: values too large for a `u64` saturate (and are then honoured as
+/// [`MAX_RETRY_AFTER`]); they are never ignored, which would retry sooner.
 pub fn parse_retry_after(v: &str) -> Option<Duration> {
     let v = v.trim();
-    if v.is_empty() || v.len() > 10 || !v.bytes().all(|b| b.is_ascii_digit()) {
+    if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    v.parse::<u64>().ok().map(Duration::from_secs)
+    Some(Duration::from_secs(v.parse::<u64>().unwrap_or(u64::MAX)))
+}
+
+/// A server `Retry-After` as the producer honours it: in full, values over
+/// [`MAX_RETRY_AFTER`] treated as that bound.
+pub fn honoured_retry_after(ra: Duration) -> Duration {
+    ra.min(MAX_RETRY_AFTER)
 }
 
 /// The wait before retry number `retry`: the backoff, but never sooner than
-/// the server's `Retry-After` (capped at `max_retry_after`).
+/// the server's `Retry-After` ([`honoured_retry_after`]).
 pub fn retry_delay(
     p: &RetryPolicy,
     retry: u32,
@@ -150,7 +175,7 @@ pub fn retry_delay(
 ) -> Duration {
     let b = backoff_delay(p, retry, rand);
     match retry_after {
-        Some(ra) => b.max(ra.min(p.max_retry_after)),
+        Some(ra) => b.max(honoured_retry_after(ra)),
         None => b,
     }
 }
@@ -172,6 +197,8 @@ pub struct UplinkConfig {
     /// Topic (`ocsf.metadata.log_name`) an upgraded 1.x record names.
     pub upgrade_topic: String,
     pub retry: RetryPolicy,
+    /// Dead-letter rotation (`None`: one growing file).
+    pub dead_letter_rotation: Option<Rotation>,
     /// Test hook: fail with [`UplinkError::Injected`] at this point (once).
     #[doc(hidden)]
     pub fail_point: Option<FailPoint>,
@@ -188,6 +215,7 @@ impl UplinkConfig {
             upgrade_data_source: robodr_ocsf::DEFAULT_DATA_SOURCE.into(),
             upgrade_topic: robodr_ocsf::DEFAULT_TOPIC.into(),
             retry: RetryPolicy::default(),
+            dead_letter_rotation: Some(DEFAULT_DEAD_LETTER_ROTATION),
             fail_point: None,
         }
     }
@@ -222,12 +250,58 @@ pub enum UplinkError {
     /// A `200` that does not account for the batch: nothing acknowledged.
     Protocol(String),
     /// Retries exhausted for this run (the batch stays pending).
+    /// `retry_after`: the server's `Retry-After` on the last attempt, which
+    /// the caller must honour before the next run ([`Self::retry_after`]).
     GaveUp {
         attempts: u32,
         last: String,
+        retry_after: Option<Duration>,
     },
+    /// Another process holds the state directory's lock.
+    Locked(PathBuf),
     #[doc(hidden)]
     Injected,
+}
+
+impl UplinkError {
+    /// The server's `Retry-After` the next attempt must wait for (already
+    /// bounded by [`MAX_RETRY_AFTER`]).
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::GaveUp { retry_after, .. } => retry_after.map(honoured_retry_after),
+            _ => None,
+        }
+    }
+
+    /// A failure that a retry soon may fix (network, `408`, `429`, `5xx`
+    /// exhausted for this run). Everything else (refusals, a malformed
+    /// `200`, local state or I/O errors) needs a change somewhere and is
+    /// retried on the long backoff ([`service`]).
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::GaveUp { .. })
+    }
+
+    /// Short machine-readable class (status file, `STATUS=`).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Config(_) => "config",
+            Self::State(_) => "state",
+            Self::Io(_) => "io",
+            Self::Refused { .. } => "refused",
+            Self::Protocol(_) => "protocol",
+            Self::GaveUp { .. } => "gave_up",
+            Self::Locked(_) => "locked",
+            Self::Injected => "injected",
+        }
+    }
+
+    /// HTTP status and server code of a refusal.
+    pub fn refusal(&self) -> Option<(u16, &str)> {
+        match self {
+            Self::Refused { status, code, .. } => Some((*status, code.as_str())),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for UplinkError {
@@ -258,9 +332,27 @@ impl fmt::Display for UplinkError {
                 }
             }
             Self::Protocol(m) => write!(f, "server response: {m}"),
-            Self::GaveUp { attempts, last } => {
-                write!(f, "giving up after {attempts} attempt(s): {last}")
+            Self::GaveUp {
+                attempts,
+                last,
+                retry_after,
+            } => {
+                write!(f, "giving up after {attempts} attempt(s): {last}")?;
+                match retry_after {
+                    Some(ra) => write!(
+                        f,
+                        " (server Retry-After {} s honoured before the next attempt)",
+                        honoured_retry_after(*ra).as_secs()
+                    ),
+                    None => Ok(()),
+                }
             }
+            Self::Locked(p) => write!(
+                f,
+                "{} is held by another robodr-uplink (the service, or a --once or reinject \
+                 run on the same --state-dir); stop it first (systemctl stop robodr-uplink)",
+                p.display()
+            ),
             Self::Injected => write!(f, "injected failure"),
         }
     }
@@ -330,6 +422,11 @@ pub struct UplinkState {
     pub format: String,
     /// Diode batch → lines committed (bounded by [`MAX_IN_FLIGHT`]).
     pub in_flight: BTreeMap<String, u64>,
+    /// Re-injected stream (generation, [`reinject`]) → lines committed.
+    /// Absent from the file while empty, so a state written without
+    /// re-injections stays readable by earlier versions.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reinject: BTreeMap<String, u64>,
     pub pending: Option<Pending>,
     pub sent_lines_total: u64,
     pub accepted_total: u64,
@@ -342,6 +439,7 @@ impl UplinkState {
         Self {
             format: STATE_FORMAT.into(),
             in_flight: BTreeMap::new(),
+            reinject: BTreeMap::new(),
             pending: None,
             sent_lines_total: 0,
             accepted_total: 0,
@@ -355,8 +453,11 @@ impl UplinkState {
         if s.format != STATE_FORMAT {
             return Err(format!("unknown format {:?}", wire::trunc(&s.format)));
         }
-        if s.in_flight.len() > MAX_IN_FLIGHT {
+        if s.in_flight.len() > MAX_IN_FLIGHT || s.reinject.len() > MAX_IN_FLIGHT {
             return Err(format!("more than {MAX_IN_FLIGHT} in-flight batches"));
+        }
+        if s.reinject.keys().any(|g| !reinject::is_valid_generation(g)) {
+            return Err("invalid re-injection generation name".into());
         }
         if let Some(p) = &s.pending {
             if p.positions.is_empty() || p.positions.len() > wire::MAX_LINES {
@@ -428,6 +529,8 @@ pub struct UplinkReport {
     pub pending_dropped: u64,
     /// Diode batches finished in this run.
     pub batches_done: Vec<String>,
+    /// Re-injected streams finished in this run ([`reinject`]).
+    pub reinjected_done: Vec<String>,
     /// Malformed lines found in the dead-letter files when they were loaded
     /// in this run (torn fragments, edits; [`crate::deadletter`]).
     pub dead_letter_malformed: u64,
@@ -437,6 +540,65 @@ impl UplinkReport {
     /// Whether anything happened (for logging).
     pub fn is_empty(&self) -> bool {
         self == &Self::default()
+    }
+}
+
+/// The input stream a batch comes from (its `source` string).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stream<'a> {
+    /// `spool`: the agentd spool's `ready/`.
+    Spool,
+    /// `diode:<batch>`: `out/<batch>/records.jsonl`.
+    Diode(&'a str),
+    /// `reinject:<generation>`: `<state>/reinject/<generation>/records.jsonl`.
+    Reinject(&'a str),
+}
+
+impl<'a> Stream<'a> {
+    fn of(source: &'a str) -> Option<Self> {
+        if source == "spool" {
+            return Some(Self::Spool);
+        }
+        if let Some(b) = source.strip_prefix("diode:") {
+            return Some(Self::Diode(b));
+        }
+        source
+            .strip_prefix(reinject::SOURCE_PREFIX)
+            .filter(|g| reinject::is_valid_generation(g))
+            .map(Self::Reinject)
+    }
+
+    /// Line-numbered streams (diode, re-injected) commit a line count.
+    fn is_lines(self) -> bool {
+        !matches!(self, Self::Spool)
+    }
+}
+
+/// The exclusive lock on a state directory (`<state>/uplink.lock`,
+/// `flock`). Held by the service for its whole lifetime and by every
+/// `--once` / `reinject` run, so two processes never share a state
+/// directory. Released when dropped (and by the kernel when the process
+/// dies: never stale).
+#[derive(Debug)]
+pub struct StateLock {
+    path: PathBuf,
+    _file: fs::File,
+}
+
+impl StateLock {
+    /// Take the lock of `state_dir` (created if missing), or fail with
+    /// [`UplinkError::Locked`].
+    pub fn acquire(state_dir: &Path) -> Result<Self, UplinkError> {
+        fsutil::mkdir(state_dir)?;
+        let path = state_dir.join(LOCK_FILE);
+        match fsutil::try_lock(&path)? {
+            Some(f) => Ok(Self { path, _file: f }),
+            None => Err(UplinkError::Locked(path)),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -538,6 +700,7 @@ pub type LogFn = Box<dyn FnMut(&str) + Send>;
 
 /// See the module docs.
 pub struct Uplink<T: Transport> {
+    _lock: Arc<StateLock>,
     cfg: UplinkConfig,
     transport: T,
     key: Ed25519SigningKey,
@@ -564,11 +727,31 @@ fn random_u64() -> u64 {
 }
 
 impl<T: Transport> Uplink<T> {
+    /// Open with the state directory's lock taken here ([`StateLock`]).
     pub fn open(
         cfg: UplinkConfig,
         transport: T,
         key: Ed25519SigningKey,
     ) -> Result<Self, UplinkError> {
+        let lock = Arc::new(StateLock::acquire(&cfg.state_dir)?);
+        Self::open_locked(cfg, transport, key, lock)
+    }
+
+    /// Open under a lock the caller already holds (a long-running service
+    /// keeps it between runs; it must be the lock of `cfg.state_dir`).
+    pub fn open_locked(
+        cfg: UplinkConfig,
+        transport: T,
+        key: Ed25519SigningKey,
+        lock: Arc<StateLock>,
+    ) -> Result<Self, UplinkError> {
+        if lock.path() != cfg.state_dir.join(LOCK_FILE) {
+            return Err(UplinkError::Config(format!(
+                "the lock {} is not the one of {}",
+                lock.path().display(),
+                cfg.state_dir.display()
+            )));
+        }
         if !(1..=wire::MAX_LINES).contains(&cfg.max_lines) {
             return Err(UplinkError::Config(format!(
                 "max_lines must be in 1..={}",
@@ -592,6 +775,14 @@ impl<T: Transport> Uplink<T> {
             return Err(UplinkError::Config(
                 "upgrade topic / data source must be valid deployment labels".into(),
             ));
+        }
+        if cfg
+            .dead_letter_rotation
+            .is_some_and(|r| r.keep == 0 || r.max_bytes < MIN_DEAD_LETTER_BYTES)
+        {
+            return Err(UplinkError::Config(format!(
+                "dead-letter rotation: keep >= 1 and max_bytes >= {MIN_DEAD_LETTER_BYTES} required"
+            )));
         }
         let r = &cfg.retry;
         if r.max_attempts == 0 || r.base.is_zero() || r.max < r.base {
@@ -632,11 +823,12 @@ impl<T: Transport> Uplink<T> {
             Err(e) => return Err(UplinkError::State(format!("{}: {e}", path.display()))),
         };
         if let Some(p) = &state.pending {
-            let kind_ok = match (&cfg.source, p.source.as_str()) {
-                (Source::Spool(_), "spool") => true,
-                (Source::DiodeOut(_), s) => s.starts_with("diode:"),
-                _ => false,
-            };
+            let kind_ok = matches!(
+                (&cfg.source, Stream::of(&p.source)),
+                (_, Some(Stream::Reinject(_)))
+                    | (Source::Spool(_), Some(Stream::Spool))
+                    | (Source::DiodeOut(_), Some(Stream::Diode(_)))
+            );
             if !kind_ok {
                 return Err(UplinkError::State(format!(
                     "{}: pending batch from a {:?} source, configured source differs \
@@ -647,8 +839,9 @@ impl<T: Transport> Uplink<T> {
             }
         }
         let max_lines_now = cfg.max_lines;
-        let dead = DeadLetters::new(&cfg.state_dir, DEAD_LETTER_FILE, None);
+        let dead = DeadLetters::new(&cfg.state_dir, DEAD_LETTER_FILE, cfg.dead_letter_rotation);
         Ok(Self {
+            _lock: lock,
             cfg,
             transport,
             key,
@@ -704,6 +897,41 @@ impl<T: Transport> Uplink<T> {
 
     pub fn key_id(&self) -> &str {
         &self.key_id
+    }
+
+    /// Pending batch, backlog and totals, for the status file
+    /// ([`service`]).
+    pub fn snapshot(&self) -> Result<service::Snapshot, UplinkError> {
+        let mut backlog = service::Backlog::default();
+        match &self.cfg.source {
+            Source::Spool(root) => {
+                backlog.spool_ready = Some(list_ready(&root.join("ready"))?.len() as u64);
+            }
+            Source::DiodeOut(out) => {
+                let done = self.cfg.state_dir.join(DONE_DIR);
+                let n = list_diode_batches(out)?
+                    .iter()
+                    .filter(|b| fs::symlink_metadata(done.join(b)).is_err())
+                    .count();
+                backlog.diode_batches = Some(n as u64);
+            }
+        }
+        backlog.reinject_generations =
+            reinject::list_generations(&self.cfg.state_dir.join(REINJECT_DIR))?
+                .iter()
+                .filter(|g| !g.done)
+                .count() as u64;
+        let p = self.state.pending.as_ref();
+        Ok(service::Snapshot {
+            pending_batch_id: p.map(|p| p.batch_id.clone()),
+            pending_source: p.map(|p| p.source.clone()),
+            pending_lines: p.map_or(0, |p| p.positions.len() as u64),
+            backlog,
+            sent_lines_total: self.state.sent_lines_total,
+            accepted_total: self.state.accepted_total,
+            rejected_total: self.state.rejected_total,
+            dead_lettered_total: self.state.dead_lettered_total,
+        })
     }
 
     fn fail(&mut self, at: FailPoint) -> Result<(), UplinkError> {
@@ -768,9 +996,10 @@ impl<T: Transport> Uplink<T> {
     /// Dead-letter context of a source: the diode batch name, or the spool
     /// root (as `robodr-kafka-publish` does).
     fn context(&self, source: &str) -> String {
-        match source.strip_prefix("diode:") {
-            Some(b) => b.to_string(),
-            None => match &self.cfg.source {
+        match Stream::of(source) {
+            Some(Stream::Diode(b)) => b.to_string(),
+            Some(Stream::Reinject(_)) => source.to_string(),
+            _ => match &self.cfg.source {
                 Source::Spool(root) => root.display().to_string(),
                 Source::DiodeOut(out) => out.display().to_string(),
             },
@@ -853,7 +1082,7 @@ impl<T: Transport> Uplink<T> {
         };
         Ok(Some(Cut {
             source: source.to_string(),
-            last: if source.starts_with("diode:") {
+            last: if Stream::of(source).is_some_and(Stream::is_lines) {
                 last
             } else {
                 0
@@ -914,6 +1143,7 @@ impl<T: Transport> Uplink<T> {
                 return Err(UplinkError::GaveUp {
                     attempts: attempt,
                     last: why,
+                    retry_after,
                 });
             }
             let d = retry_delay(&self.cfg.retry, attempt, retry_after, (self.rng)());
@@ -930,10 +1160,19 @@ impl<T: Transport> Uplink<T> {
 
     /// Commit a cut that has no body (only local dead letters).
     fn commit_empty(&mut self, cut: &Cut) -> Result<(), UplinkError> {
-        if let Some(name) = cut.source.strip_prefix("diode:") {
-            self.state.set_committed(name, cut.last);
-        }
+        self.commit_lines(&cut.source.clone(), cut.last);
         self.save()
+    }
+
+    /// Record the committed line count of a line-numbered stream.
+    fn commit_lines(&mut self, source: &str, last: u64) {
+        match Stream::of(source) {
+            Some(Stream::Diode(name)) => self.state.set_committed(name, last),
+            Some(Stream::Reinject(g)) => {
+                self.state.reinject.insert(g.to_string(), last);
+            }
+            _ => {}
+        }
     }
 
     /// Send a cut (pending already saved or saved here) and apply the
@@ -1029,6 +1268,8 @@ impl<T: Transport> Uplink<T> {
         self.fail(FailPoint::AfterResultSaved)?;
         let rejected = p.result.clone().unwrap_or_default();
         let context = self.context(&p.source);
+        let stream = Stream::of(&p.source)
+            .ok_or_else(|| UplinkError::State(format!("pending source {:?}", p.source)))?;
         let mut is_rejected = vec![false; p.positions.len()];
         for r in &rejected {
             let idx = (r.line - 1) as usize;
@@ -1036,7 +1277,7 @@ impl<T: Transport> Uplink<T> {
             let pos = p.positions[idx];
             let raw = match (raws.get(&pos), &self.cfg.source) {
                 (Some(r), _) => r.clone(),
-                (None, Source::Spool(root)) => {
+                (None, Source::Spool(root)) if !stream.is_lines() => {
                     let path = root.join("ready").join(spool_file(pos));
                     if fs::symlink_metadata(&path).is_err() {
                         // Already moved by an earlier apply, after its dead
@@ -1045,7 +1286,7 @@ impl<T: Transport> Uplink<T> {
                     }
                     read_spool_item(&path, pos, self.cfg.max_record_bytes)?.unwrap_or_default()
                 }
-                (None, Source::DiodeOut(_)) => Vec::new(),
+                (None, _) => Vec::new(),
             };
             let detail = if r.detail.is_empty() {
                 format!("rejected by the server ({})", r.code)
@@ -1054,16 +1295,14 @@ impl<T: Transport> Uplink<T> {
             };
             self.dead_letter(&context, pos, &r.code, &detail, Some(&p.batch_id), &raw)?;
         }
-        match &self.cfg.source {
-            Source::DiodeOut(_) => {
-                let name = p
-                    .source
-                    .strip_prefix("diode:")
-                    .unwrap_or_default()
-                    .to_string();
-                self.state.set_committed(&name, p.last);
+        match (&self.cfg.source, stream.is_lines()) {
+            (_, true) => self.commit_lines(&p.source, p.last),
+            (Source::DiodeOut(_), false) => {
+                return Err(UplinkError::State(
+                    "spool batch pending with a diode source".into(),
+                ))
             }
-            Source::Spool(root) => {
+            (Source::Spool(root), false) => {
                 let ready = root.join("ready");
                 let acked = root.join("acked");
                 let rej = root.join("rejected");
@@ -1096,8 +1335,15 @@ impl<T: Transport> Uplink<T> {
     /// the input no longer yields the same body.
     fn rebuild(&mut self, p: &Pending) -> Result<Option<Cut>, UplinkError> {
         let mut lines = Vec::with_capacity(p.positions.len());
-        match &self.cfg.source {
-            Source::Spool(root) => {
+        let stream = Stream::of(&p.source)
+            .ok_or_else(|| UplinkError::State(format!("pending source {:?}", p.source)))?;
+        let lines_dir = match (stream, &self.cfg.source) {
+            (Stream::Diode(name), Source::DiodeOut(out)) => Some((out.clone(), name)),
+            (Stream::Reinject(g), _) => Some((self.cfg.state_dir.join(REINJECT_DIR), g)),
+            _ => None,
+        };
+        match (&self.cfg.source, lines_dir) {
+            (Source::Spool(root), None) => {
                 let ready = root.join("ready");
                 for &pos in &p.positions {
                     let path = ready.join(spool_file(pos));
@@ -1112,9 +1358,9 @@ impl<T: Transport> Uplink<T> {
                     });
                 }
             }
-            Source::DiodeOut(out) => {
-                let name = p.source.strip_prefix("diode:").unwrap_or_default();
-                let reader = LineReader::open(out, name, self.cfg.max_record_bytes);
+            (Source::DiodeOut(_), None) => return Ok(None),
+            (_, Some((dir, name))) => {
+                let reader = LineReader::open(&dir, name, self.cfg.max_record_bytes);
                 let mut reader = match reader {
                     Ok(Some(r)) => r,
                     Ok(None) | Err(OpenRecordsError::NotRegular(_)) => return Ok(None),
@@ -1218,6 +1464,48 @@ impl<T: Transport> Uplink<T> {
             Source::DiodeOut(out) => self.run_diode(&out, report)?,
             Source::Spool(root) => self.run_spool(&root, report)?,
         }
+        self.run_reinjected(report)
+    }
+
+    /// Re-injected streams ([`reinject`]), oldest generation first; each is
+    /// marked done (and forgotten by the state) once fully acknowledged.
+    fn run_reinjected(&mut self, report: &mut UplinkReport) -> Result<(), UplinkError> {
+        let dir = self.cfg.state_dir.join(REINJECT_DIR);
+        let gens = reinject::list_generations(&dir)?;
+        let before = self.state.reinject.len();
+        let open: Vec<&String> = gens.iter().filter(|g| !g.done).map(|g| &g.name).collect();
+        self.state.reinject.retain(|g, _| open.contains(&g));
+        if self.state.reinject.len() != before {
+            self.save()?;
+        }
+        for g in gens.into_iter().filter(|g| !g.done) {
+            let reader = LineReader::open(&dir, &g.name, self.cfg.max_record_bytes).map_err(
+                |e| match e {
+                    OpenRecordsError::NotRegular(m) => UplinkError::State(m),
+                    OpenRecordsError::Io(e) => UplinkError::Io(e),
+                },
+            )?;
+            let mut feed = Feed {
+                buf: VecDeque::new(),
+                src: FeedSrc::Diode(reader),
+            };
+            let skip = self.state.reinject.get(&g.name).copied().unwrap_or(0);
+            while feed.buf.is_empty() {
+                match feed.next()? {
+                    Some(it) if it.pos <= skip => continue,
+                    Some(it) => feed.push_front(vec![it]),
+                    None => break,
+                }
+            }
+            let source = format!("{}{}", reinject::SOURCE_PREFIX, g.name);
+            while let Some(cut) = self.cut(&mut feed, &source, report)? {
+                self.deliver(cut, Some(&mut feed), report)?;
+            }
+            reinject::mark_done(&dir, &g.name)?;
+            self.state.reinject.remove(&g.name);
+            self.save()?;
+            report.reinjected_done.push(g.name);
+        }
         Ok(())
     }
 
@@ -1302,7 +1590,6 @@ mod tests {
             max_attempts: 10,
             base: Duration::from_millis(100),
             max: Duration::from_millis(1000),
-            max_retry_after: Duration::from_secs(5),
         };
         for (retry, d) in [
             (1, 100u64),
@@ -1342,32 +1629,45 @@ mod tests {
             max_attempts: 3,
             base: Duration::from_millis(100),
             max: Duration::from_secs(1),
-            max_retry_after: Duration::from_secs(30),
         };
         assert_eq!(parse_retry_after("7"), Some(Duration::from_secs(7)));
         assert_eq!(parse_retry_after(" 0 "), Some(Duration::ZERO));
-        for bad in [
-            "",
-            "-1",
-            "1.5",
-            "Wed, 21 Oct 2015 07:28:00 GMT",
-            "99999999999",
-        ] {
+        for bad in ["", "-1", "1.5", "Wed, 21 Oct 2015 07:28:00 GMT", "+5"] {
             assert_eq!(parse_retry_after(bad), None, "{bad}");
+        }
+        // Long values saturate (honoured as the 24 h bound), never ignored.
+        for long in ["99999999999", "18446744073709551616", &"9".repeat(100)] {
+            let d = parse_retry_after(long).unwrap();
+            assert_eq!(honoured_retry_after(d), MAX_RETRY_AFTER, "{long}");
         }
         assert_eq!(
             retry_delay(&p, 1, Some(Duration::from_secs(7)), 0),
             Duration::from_secs(7)
         );
         assert_eq!(
-            retry_delay(&p, 1, Some(Duration::from_secs(3600)), 0),
-            Duration::from_secs(30),
-            "capped"
-        );
-        assert_eq!(
             retry_delay(&p, 4, Some(Duration::ZERO), 0),
             Duration::from_millis(400),
             "never sooner than the backoff"
+        );
+    }
+
+    /// Review F1: a `Retry-After` longer than the backoff is never cut
+    /// short by a configured cap; only values over the documented 24 h
+    /// producer bound are clamped (contract §7).
+    #[test]
+    fn retry_after_is_never_shortened() {
+        let p = RetryPolicy {
+            max_attempts: 3,
+            base: Duration::from_millis(100),
+            max: Duration::from_secs(1),
+        };
+        assert_eq!(
+            retry_delay(&p, 1, Some(Duration::from_secs(3600)), 0),
+            Duration::from_secs(3600)
+        );
+        assert_eq!(
+            retry_delay(&p, 1, Some(Duration::from_secs(9_999_999_999)), 0),
+            Duration::from_secs(24 * 3600)
         );
     }
 

@@ -65,6 +65,11 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
+# sd_notify STATUS= (blocked queue, last error, backlog: `systemctl status
+# robodr-uplink`); the full state is /var/lib/robodr/export/uplink/
+# uplink-status.json. Exit 3 = failing longer than --exit-when-stuck-s
+# (off unless set in ROBODR_UPLINK_ARGS): restarted like any failure.
+NotifyAccess=main
 EnvironmentFile=/etc/robodr/uplink.env
 # ${ROBODR_UPLINK_URL} is one argument (empty if unset: a usage error, exit
 # 2); $ROBODR_UPLINK_ARGS is split on white space and may be empty.

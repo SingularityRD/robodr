@@ -143,7 +143,6 @@ impl Rig {
             max_attempts: 5,
             base: Duration::from_millis(100),
             max: Duration::from_secs(2),
-            max_retry_after: Duration::from_secs(60),
         };
         c
     }
@@ -444,7 +443,8 @@ fn attempts_exhausted_keep_the_batch_pending_with_its_id() {
     }
     assert_eq!(r.ready().len(), 2, "nothing acknowledged");
     let pending = u.state().pending.clone().unwrap();
-    // The next run (server back) re-sends the same batch id.
+    drop(u); // releases the state directory's lock
+             // The next run (server back) re-sends the same batch id.
     let rep = r.uplink(r.spool_cfg()).run_once().unwrap();
     assert_eq!(rep.resumed, 1);
     let seen = r.requests();
@@ -487,6 +487,7 @@ fn refusals_acknowledge_nothing() {
         assert_eq!(r.ready().len(), 2);
         assert!(r.dead_letters().is_empty());
         let id = u.state().pending.clone().unwrap().batch_id;
+        drop(u);
         let rep = r.uplink(r.spool_cfg()).run_once().unwrap();
         assert_eq!(rep.created, 2);
         assert_eq!(hdr(&r.requests()[1], wire::H_BATCH_ID), id);
@@ -561,6 +562,7 @@ fn crash_before_send_resends_same_batch_id() {
     let mut u = r.uplink(cfg);
     assert!(matches!(u.run_once(), Err(UplinkError::Injected)));
     let id = u.state().pending.clone().unwrap().batch_id;
+    drop(u);
     assert!(r.requests().is_empty());
     // New records arrive meanwhile: the pending batch keeps its cut.
     r.spool(UNIT, 3, 2, false);
@@ -642,6 +644,7 @@ fn changed_input_drops_the_pending_batch() {
     let mut u = r.uplink(cfg);
     assert!(matches!(u.run_once(), Err(UplinkError::Injected)));
     let id = u.state().pending.clone().unwrap().batch_id;
+    drop(u);
     let first = r.ready()[0].clone();
     fs::rename(
         r.spool.join("ready").join(&first),
@@ -731,6 +734,7 @@ fn diode_output_relay_with_offsets_and_done_markers() {
     let n = r.requests().len();
     assert!(u.run_once().unwrap().is_empty());
     assert_eq!(r.requests().len(), n);
+    drop(u);
 
     // A new batch, crash after the result was saved: resumes at the offset.
     diode_batch(&r.out, "rdd_ugv-007_0000000000000002", UNIT, 10, 4, None);
@@ -758,6 +762,7 @@ fn diode_crash_before_send_resends_same_batch_id() {
     let mut u = r.uplink(cfg);
     assert!(u.run_once().is_err());
     let p = u.state().pending.clone().unwrap();
+    drop(u);
     assert_eq!(p.positions, [2, 3]);
     assert_eq!(p.last, 3);
     let rep = r
@@ -841,4 +846,497 @@ fn torn_dead_letter_line_is_counted_and_does_not_hide_the_next_entry() {
             dl["position"].as_u64().unwrap()
         )
         .unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// Review F1: Retry-After after the last attempt; F2: status, backoff, stuck;
+// F8: state-directory lock, dead-letter rotation; re-injection.
+// ---------------------------------------------------------------------------
+
+use robodr_export::uplink::reinject::{self, ReinjectOptions};
+use robodr_export::uplink::service::{self, Env, ServiceConfig, Status};
+
+fn status_of(r: &Rig) -> Status {
+    serde_json::from_slice(&fs::read(r.state.join(service::STATUS_FILE)).unwrap()).unwrap()
+}
+
+/// What a service run did (recorded by the test `Env`).
+#[derive(Default)]
+struct Recorded {
+    sleeps: Vec<Duration>,
+    notes: Vec<String>,
+    logs: Vec<String>,
+}
+
+/// Run the service loop for `runs` iterations (then `stop`), the wall clock
+/// advancing `step_ms` per reading.
+fn run_service(r: &Rig, cfg: &ServiceConfig, runs: usize, step_ms: u64) -> (u8, Recorded) {
+    let rec = Arc::new(Mutex::new(Recorded::default()));
+    let clock = Arc::new(AtomicU64::new(NOW));
+    let mut left = runs;
+    let (r1, r2, r3) = (rec.clone(), rec.clone(), rec.clone());
+    let c = clock.clone();
+    let mut env = Env {
+        now_ms: Box::new(move || c.fetch_add(step_ms, Ordering::SeqCst)),
+        sleep: Box::new(move |d| r1.lock().unwrap().sleeps.push(d)),
+        rng: Box::new(|| 0),
+        notify: Box::new(move |m| r2.lock().unwrap().notes.push(m.to_string())),
+        log: Box::new(move |m| r3.lock().unwrap().logs.push(m.to_string())),
+        report: Box::new(|_| {}),
+        stop: Box::new(move || {
+            left -= 1;
+            left == 0
+        }),
+    };
+    let code = service::run(cfg, &r.state, || Ok(r.uplink(r.spool_cfg())), &mut env);
+    drop(env);
+    let rec = Arc::try_unwrap(rec).ok().unwrap().into_inner().unwrap();
+    (code, rec)
+}
+
+fn svc() -> ServiceConfig {
+    ServiceConfig {
+        interval: Duration::from_secs(2),
+        transient_backoff_max: Duration::from_secs(60),
+        refused_backoff_max: Duration::from_secs(900),
+        exit_when_stuck_after: None,
+        once: false,
+    }
+}
+
+/// F1: a `429` with `Retry-After` on the run's last attempt: the error
+/// carries it and the service waits at least that long before the next run
+/// (it used to wait only its own backoff, ≤ 60 s). Over 24 h: 24 h.
+#[test]
+fn retry_after_on_the_last_attempt_is_honoured_by_the_service() {
+    for (ra, want) in [("3600", 3600u64), ("999999999999", 24 * 3600)] {
+        let r = Rig::new("ra-last", Role::Uplink);
+        r.spool(UNIT, 0, 1, false);
+        for _ in 0..5 {
+            r.c().script.push_back(Script::Status(
+                429,
+                Some(ra.into()),
+                "{\"code\":\"rate_limited\"}".into(),
+            ));
+        }
+        match r.uplink(r.spool_cfg()).run_once() {
+            Err(e @ UplinkError::GaveUp { .. }) => {
+                assert_eq!(e.retry_after(), Some(Duration::from_secs(want)), "{ra}");
+                assert!(e.is_transient());
+            }
+            other => panic!("{other:?}"),
+        }
+        // Within the run the retries waited Retry-After too.
+        assert!(r
+            .sleeps
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|d| *d == Duration::from_secs(want)));
+        for _ in 0..5 {
+            r.c().script.push_back(Script::Status(
+                429,
+                Some(ra.into()),
+                "{\"code\":\"rate_limited\"}".into(),
+            ));
+        }
+        let (code, rec) = run_service(&r, &svc(), 1, 1000);
+        assert_eq!(code, 0);
+        assert_eq!(rec.sleeps, [Duration::from_secs(want)], "{ra}");
+        let st = status_of(&r);
+        assert_eq!(st.state, "retrying");
+        assert_eq!(st.last_error.unwrap().retry_after_s, Some(want));
+    }
+}
+
+/// F2: refusals back off to the long cap; transient failures to the short
+/// one; never below the poll interval.
+#[test]
+fn failure_backoff_classes() {
+    let cfg = svc();
+    let refused = UplinkError::Refused {
+        status: 401,
+        code: "unknown_key".into(),
+        detail: String::new(),
+    };
+    let transient = UplinkError::GaveUp {
+        attempts: 6,
+        last: "HTTP 503".into(),
+        retry_after: None,
+    };
+    for f in 1..40u32 {
+        for rand in [0u64, u64::MAX, 12345] {
+            let d = service::failure_delay(&cfg, f, &refused, rand);
+            assert!(
+                d >= Duration::from_secs(1) && d <= Duration::from_secs(900),
+                "{f} {d:?}"
+            );
+            let t = service::failure_delay(&cfg, f, &transient, rand);
+            assert!(t <= Duration::from_secs(60), "{f} {t:?}");
+        }
+    }
+    // After ~10 refusals in a row the wait is at least half the cap.
+    assert!(service::failure_delay(&cfg, 12, &refused, 0) >= Duration::from_secs(450));
+    // At the cap, even the shortest jittered wait (half the cap) means at
+    // most 192 refused requests a day (it was ~1440 at a 60 s cap).
+    let shortest = service::failure_delay(&cfg, 30, &refused, 0);
+    assert_eq!(shortest, Duration::from_secs(450));
+    assert!(86_400 / shortest.as_secs() <= 192);
+}
+
+/// F2: a batch the server keeps refusing is visible: status file (state,
+/// error, stuck_since, pending batch, failed runs, backlog), `STATUS=` and
+/// a log line per run; the backoff grows; the streak survives a restart;
+/// a later success clears it.
+#[test]
+fn a_refused_batch_is_visible_in_the_status_file_and_sd_notify() {
+    let r = Rig::new("status", Role::Uplink);
+    r.spool(UNIT, 0, 2, false);
+    for _ in 0..3 {
+        r.c().script.push_back(Script::Status(
+            401,
+            None,
+            "{\"code\":\"unknown_key\",\"detail\":\"not registered\"}".into(),
+        ));
+    }
+    let (code, rec) = run_service(&r, &svc(), 3, 1000);
+    assert_eq!(code, 0);
+    let st = status_of(&r);
+    assert_eq!(st.format, service::STATUS_FORMAT);
+    assert_eq!(st.state, "blocked");
+    let e = st.last_error.clone().unwrap();
+    assert_eq!(
+        (e.kind.as_str(), e.status, e.code.as_deref()),
+        ("refused", Some(401), Some("unknown_key"))
+    );
+    assert_eq!(st.consecutive_failures, 3);
+    assert_eq!(st.pending_failed_runs, 3);
+    let since = st.stuck_since_ms.unwrap();
+    assert!((NOW..NOW + 10_000).contains(&since), "{since}");
+    assert_eq!(st.snapshot.pending_lines, 2);
+    assert!(st
+        .snapshot
+        .pending_batch_id
+        .as_deref()
+        .unwrap()
+        .starts_with("rdu1-"));
+    assert_eq!(st.snapshot.backlog.spool_ready, Some(2));
+    assert!(st.last_success_at_ms.is_none());
+    assert!(st.next_attempt_at_ms.is_some());
+    assert_eq!(rec.sleeps.len(), 3);
+    assert!(
+        rec.sleeps.windows(2).all(|w| w[1] >= w[0]),
+        "{:?}",
+        rec.sleeps
+    );
+    assert_eq!(rec.notes.len(), 3);
+    assert!(
+        rec.notes[2].starts_with("STATUS=blocked"),
+        "{}",
+        rec.notes[2]
+    );
+    assert!(
+        rec.notes[2].contains("HTTP 401 unknown_key"),
+        "{}",
+        rec.notes[2]
+    );
+    assert!(rec.logs.iter().any(|l| l.contains("401")));
+    // Restart, still refused: the streak start and failed-run count carry
+    // over (same pending batch).
+    r.c().script.push_back(Script::Status(
+        401,
+        None,
+        "{\"code\":\"unknown_key\"}".into(),
+    ));
+    let (_, _) = run_service(&r, &svc(), 1, 1000);
+    let st2 = status_of(&r);
+    assert_eq!(st2.stuck_since_ms, Some(since));
+    assert_eq!(st2.pending_failed_runs, 4);
+    // Fixed: delivered, streak cleared.
+    let (_, rec) = run_service(&r, &svc(), 1, 1000);
+    let st3 = status_of(&r);
+    assert_eq!(st3.state, "ok");
+    assert!(st3.stuck_since_ms.is_none() && st3.last_delivery_at_ms.is_some());
+    assert_eq!(st3.snapshot.pending_batch_id, None);
+    assert_eq!(st3.snapshot.backlog.spool_ready, Some(0));
+    assert_eq!(st3.snapshot.accepted_total, 2);
+    assert_eq!(rec.sleeps, [Duration::from_secs(2)], "poll interval");
+    assert!(rec.notes[0].starts_with("STATUS=ok"));
+}
+
+/// F2: optional exit once failures lasted the configured time.
+#[test]
+fn exit_when_stuck() {
+    let r = Rig::new("stuck-exit", Role::Uplink);
+    r.spool(UNIT, 0, 1, false);
+    for _ in 0..10 {
+        r.c().script.push_back(Script::Status(
+            400,
+            None,
+            "{\"code\":\"bad_header\"}".into(),
+        ));
+    }
+    let mut cfg = svc();
+    cfg.exit_when_stuck_after = Some(Duration::from_secs(60));
+    // 30 s per clock reading: the third failure is 60 s into the streak.
+    let (code, rec) = run_service(&r, &cfg, 100, 30_000);
+    assert_eq!(code, service::EXIT_STUCK);
+    assert!(rec.logs.iter().any(|l| l.contains("exiting with status 3")));
+    assert_eq!(r.ready().len(), 1, "nothing acknowledged");
+    // --once: one run, exit 1 on failure, status written.
+    let mut once = svc();
+    once.once = true;
+    let (code, rec) = run_service(&r, &once, 100, 1000);
+    assert_eq!(code, 1);
+    assert!(rec.sleeps.is_empty());
+    assert_eq!(status_of(&r).state, "blocked");
+}
+
+/// F8: one process per state directory.
+#[test]
+fn state_directory_is_locked() {
+    let r = Rig::new("lock", Role::Uplink);
+    let u = r.uplink(r.spool_cfg());
+    let t = MockTransport {
+        consumer: r.consumer.clone(),
+        fail_next: 0,
+    };
+    match Uplink::open(r.spool_cfg(), t, sender()) {
+        Err(e @ UplinkError::Locked(_)) => {
+            assert!(
+                e.to_string().contains("held by another robodr-uplink"),
+                "{e}"
+            );
+        }
+        other => panic!("{:?}", other.err()),
+    }
+    let o = reinject_opts(&r, Source::Spool(r.spool.clone()));
+    assert!(matches!(
+        reinject::reinject(&o),
+        Err(UplinkError::Locked(_))
+    ));
+    // A lock of another directory is refused by open_locked.
+    let other = Rig::new("lock-other", Role::Uplink);
+    let l = Arc::new(robodr_export::uplink::StateLock::acquire(&other.state).unwrap());
+    let t = MockTransport {
+        consumer: r.consumer.clone(),
+        fail_next: 0,
+    };
+    drop(u);
+    assert!(matches!(
+        Uplink::open_locked(r.spool_cfg(), t, sender(), l),
+        Err(UplinkError::Config(_))
+    ));
+    // Released on drop.
+    drop(r.uplink(r.spool_cfg()));
+    let _again = r.uplink(r.spool_cfg());
+}
+
+/// F8: the uplink's dead-letter file rotates (keep N); deduplication and
+/// re-injection read the rotated files too.
+#[test]
+fn dead_letters_rotate() {
+    let r = Rig::new("dl-rotate", Role::Relay);
+    r.c().reg.robots.remove(OTHER_ROBOT);
+    r.spool(OTHER_ROBOT, 0, 120, false); // all unknown_robot
+    let mut cfg = r.spool_cfg();
+    let rot = robodr_export::deadletter::Rotation {
+        max_bytes: robodr_export::uplink::MIN_DEAD_LETTER_BYTES,
+        keep: 2,
+    };
+    cfg.dead_letter_rotation = Some(rot);
+    let rep = r.uplink(cfg.clone()).run_once().unwrap();
+    assert_eq!(rep.rejected, 120);
+    let files = robodr_export::deadletter::files(&r.state, "dead-letter.jsonl").unwrap();
+    let names: Vec<String> = files
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "dead-letter.jsonl.2",
+            "dead-letter.jsonl.1",
+            "dead-letter.jsonl"
+        ]
+    );
+    for f in &files {
+        assert!(fs::metadata(f).unwrap().len() <= rot.max_bytes);
+    }
+    let mut dl = robodr_export::deadletter::DeadLetters::new(&r.state, "dead-letter.jsonl", None);
+    let st = dl.stats().unwrap();
+    assert!(st.entries >= 3 && st.entries < 120, "{st:?}");
+    assert_eq!(st.malformed, 0);
+    // Re-injection over every kept file: the rotated-out entries are gone.
+    r.c().reg.robots.insert(OTHER_ROBOT.into(), false);
+    let mut o = reinject_opts(&r, Source::Spool(r.spool.clone()));
+    o.dead_letters = files;
+    let a = reinject::reinject(&o).unwrap();
+    assert_eq!(a.queued, st.entries);
+    // Invalid rotation settings are refused.
+    for bad in [
+        robodr_export::deadletter::Rotation {
+            max_bytes: 10,
+            keep: 1,
+        },
+        robodr_export::deadletter::Rotation {
+            max_bytes: 1 << 20,
+            keep: 0,
+        },
+    ] {
+        let mut c = cfg.clone();
+        c.dead_letter_rotation = Some(bad);
+        let t = MockTransport {
+            consumer: r.consumer.clone(),
+            fail_next: 0,
+        };
+        assert!(matches!(
+            Uplink::open(c, t, sender()),
+            Err(UplinkError::Config(_))
+        ));
+    }
+}
+
+fn reinject_opts(r: &Rig, source: Source) -> ReinjectOptions {
+    ReinjectOptions {
+        state_dir: r.state.clone(),
+        source,
+        dead_letters: vec![r.state.join("dead-letter.jsonl")],
+        codes: reinject::DEFAULT_CODES
+            .iter()
+            .map(|c| c.to_string())
+            .collect(),
+        max_record_bytes: 1024 * 1024,
+        dry_run: false,
+        now_ms: NOW,
+    }
+}
+
+/// Re-injection (spool): rejected records are re-queued from `rejected/`,
+/// sent under new batch ids, rejected again until the registration is
+/// fixed, then accepted; every step is idempotent.
+#[test]
+fn reinject_spool_records_after_the_registration_is_fixed() {
+    let r = Rig::new("reinject-spool", Role::Relay);
+    r.c().reg.robots.remove(OTHER_ROBOT);
+    r.spool(UNIT, 0, 2, false);
+    r.spool(OTHER_ROBOT, 0, 2, false); // unknown_robot
+    r.spool_garbage(); // local: not re-injected by default
+    let rep = r.uplink(r.spool_cfg()).run_once().unwrap();
+    assert_eq!(
+        (rep.created, rep.rejected, rep.dead_lettered_local),
+        (2, 2, 1)
+    );
+    let first_ids: Vec<String> = r
+        .requests()
+        .iter()
+        .map(|s| hdr(s, wire::H_BATCH_ID).to_string())
+        .collect();
+
+    // Dry run: nothing written.
+    let mut o = reinject_opts(&r, Source::Spool(r.spool.clone()));
+    o.dry_run = true;
+    let dry = reinject::reinject(&o).unwrap();
+    assert_eq!((dry.queued, dry.other_code, dry.generation), (2, 1, None));
+    assert!(!r.state.join("reinject").exists());
+
+    // Not fixed yet: re-sent under a new batch id, rejected again.
+    o.dry_run = false;
+    let a = reinject::reinject(&o).unwrap();
+    assert_eq!((a.queued, a.from_input, a.from_dead_letter), (2, 2, 0));
+    let gen_a = a.generation.clone().unwrap();
+    assert!(reinject::is_valid_generation(&gen_a));
+    let again = reinject::reinject(&o).unwrap();
+    assert_eq!(
+        (again.queued, again.already_queued, again.generation),
+        (0, 2, None),
+        "idempotent"
+    );
+    let rep = r.uplink(r.spool_cfg()).run_once().unwrap();
+    assert_eq!((rep.created, rep.rejected), (0, 2));
+    assert_eq!(rep.reinjected_done, std::slice::from_ref(&gen_a));
+    let id = hdr(r.requests().last().unwrap(), wire::H_BATCH_ID).to_string();
+    assert!(!first_ids.contains(&id), "new batch id");
+    let dl = r.dead_letters();
+    let again_dl: Vec<&serde_json::Value> = dl
+        .iter()
+        .filter(|d| d["source"] == format!("reinject:{gen_a}"))
+        .collect();
+    assert_eq!(again_dl.len(), 2);
+    assert_eq!(again_dl[0]["code"], "unknown_robot");
+    assert!(r.state.join("reinject").join(&gen_a).join("done").exists());
+    assert!(u_is_idle(&r));
+
+    // Fixed: the second-round dead letters are re-injected (from the first
+    // generation's lines) and accepted; the originals stay queued once.
+    r.c().reg.robots.insert(OTHER_ROBOT.into(), false);
+    let b = reinject::reinject(&o).unwrap();
+    assert_eq!((b.queued, b.from_input, b.already_queued), (2, 2, 2));
+    let rep = r.uplink(r.spool_cfg()).run_once().unwrap();
+    assert_eq!((rep.created, rep.rejected), (2, 0));
+    assert_eq!(r.c().finding_count(), 4);
+    let ids: std::collections::BTreeSet<String> = r
+        .requests()
+        .iter()
+        .map(|s| hdr(s, wire::H_BATCH_ID).to_string())
+        .collect();
+    assert_eq!(ids.len(), r.requests().len(), "every batch id is new");
+    let none = reinject::reinject(&o).unwrap();
+    assert_eq!((none.queued, none.already_queued), (0, 4));
+    assert!(u_is_idle(&r));
+    // The original spool files stay where they were.
+    assert_eq!(r.rejected().len(), 3);
+}
+
+/// Nothing left to send: a run makes no request.
+fn u_is_idle(r: &Rig) -> bool {
+    let n = r.requests().len();
+    let rep = r.uplink(r.spool_cfg()).run_once().unwrap();
+    rep.is_empty() && r.requests().len() == n
+}
+
+/// Re-injection (diode): lines re-read from `records.jsonl`, or from the
+/// dead letter's copy when the batch directory is gone; a crash after the
+/// pending batch was saved re-sends the same (new) batch id.
+#[test]
+fn reinject_diode_records_and_resume_after_a_crash() {
+    let r = Rig::new("reinject-diode", Role::Relay);
+    r.c().reg.robots.remove(OTHER_ROBOT);
+    diode_batch(
+        &r.out,
+        "rdd_ugv-008_0000000000000001",
+        OTHER_ROBOT,
+        0,
+        2,
+        None,
+    );
+    diode_batch(
+        &r.out,
+        "rdd_ugv-008_0000000000000002",
+        OTHER_ROBOT,
+        5,
+        1,
+        None,
+    );
+    let cfg = r.cfg(Source::DiodeOut(r.out.clone()));
+    let rep = r.uplink(cfg.clone()).run_once().unwrap();
+    assert_eq!(rep.rejected, 3);
+    fs::remove_dir_all(r.out.join("rdd_ugv-008_0000000000000002")).unwrap();
+    r.c().reg.robots.insert(OTHER_ROBOT.into(), false);
+    let o = reinject_opts(&r, Source::DiodeOut(r.out.clone()));
+    let a = reinject::reinject(&o).unwrap();
+    assert_eq!((a.queued, a.from_input, a.from_dead_letter), (3, 2, 1));
+    let mut crash = cfg.clone();
+    crash.fail_point = Some(FailPoint::AfterPendingSaved);
+    let mut u = r.uplink(crash);
+    assert!(matches!(u.run_once(), Err(UplinkError::Injected)));
+    let p = u.state().pending.clone().unwrap();
+    drop(u);
+    assert!(p.source.starts_with("reinject:rj-"), "{}", p.source);
+    let n = r.requests().len();
+    let rep = r.uplink(cfg.clone()).run_once().unwrap();
+    assert_eq!((rep.resumed, rep.created), (1, 3));
+    assert_eq!(hdr(&r.requests()[n], wire::H_BATCH_ID), p.batch_id);
+    assert_eq!(r.c().finding_count(), 3);
+    assert!(r.uplink(cfg).state().reinject.is_empty());
 }

@@ -302,7 +302,6 @@ impl Site {
             max_attempts: 3,
             base: Duration::from_millis(10),
             max: Duration::from_millis(50),
-            max_retry_after: Duration::from_secs(60),
         };
         c.fail_point = fp;
         c
@@ -715,4 +714,132 @@ fn cli_once_over_https() {
         .unwrap();
     assert!(o.status.success());
     assert!(String::from_utf8_lossy(&o.stdout).starts_with("robodr-uplink "));
+}
+
+/// The binary: one process per state directory (a `--once` or `reinject`
+/// while the service runs fails clearly), the status file, the removed
+/// `--max-retry-after-s`, and `reinject`.
+#[test]
+fn cli_lock_status_and_reinject() {
+    let srv = Server::start("127.0.0.1", None, consumer());
+    let site = Site::new("cli-lock");
+    site.spool(UNIT, 0, 2);
+    site.spool(OTHER_ROBOT, 0, 1); // robot_mismatch (uplink key of UNIT)
+    let key = site.state.parent().unwrap().join("uplink.key");
+    robodr_blackbox::KeyFile::ed25519_from_seed(&SENDER_SEED, None)
+        .unwrap()
+        .write_new(&key)
+        .unwrap();
+    let bin = env!("CARGO_BIN_EXE_robodr-uplink");
+    let url = format!("http://127.0.0.1:{}", srv.port);
+    let base = |extra: &[&str]| {
+        let mut c = std::process::Command::new(bin);
+        c.args(["--url", &url])
+            .arg("--key-file")
+            .arg(&key)
+            .arg("--state-dir")
+            .arg(&site.state)
+            .arg("--spool")
+            .arg(&site.spool)
+            .args(extra);
+        c
+    };
+    // Removed flag: a usage error that says why.
+    let o = base(&["--max-retry-after-s", "5", "--once"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("removed"));
+
+    // The service holds the lock while it runs (also between runs).
+    let mut svc = base(&["--interval-ms", "200"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let status_path = site.state.join("uplink-status.json");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !status_path.exists() {
+        assert!(std::time::Instant::now() < deadline, "no status file");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let o = base(&["--once"]).output().unwrap();
+    let err = String::from_utf8_lossy(&o.stderr).to_string();
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(err.contains("held by another robodr-uplink"), "{err}");
+    let dl = site.state.join("dead-letter.jsonl");
+    let reinject = |extra: &[&str]| {
+        std::process::Command::new(bin)
+            .arg("reinject")
+            .arg("--state-dir")
+            .arg(&site.state)
+            .arg("--spool")
+            .arg(&site.spool)
+            .arg("--dead-letter")
+            .arg(&dl)
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let o = reinject(&[]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("held by another"));
+    svc.kill().unwrap();
+    svc.wait().unwrap();
+
+    // Status file after the service's runs.
+    let st: serde_json::Value = serde_json::from_slice(&fs::read(&status_path).unwrap()).unwrap();
+    assert_eq!(st["format"], "robodr-uplink-status/1");
+    assert_eq!(st["state"], "ok");
+    assert_eq!(st["accepted_total"], 2);
+    assert_eq!(st["rejected_total"], 1);
+    assert_eq!(st["backlog"]["spool_ready"], 0);
+
+    // reinject: usage errors, then a re-queue that is idempotent.
+    for bad in [
+        vec!["reinject", "--state-dir", "s", "--spool", "p"],
+        vec![
+            "reinject",
+            "--state-dir",
+            "s",
+            "--spool",
+            "p",
+            "--dead-letter",
+            "d",
+            "--codes",
+            "Bad Code",
+        ],
+        vec!["reinject", "--bogus"],
+    ] {
+        let o = std::process::Command::new(bin).args(&bad).output().unwrap();
+        assert_eq!(o.status.code(), Some(2), "{bad:?}");
+    }
+    let o = reinject(&["--codes", "robot_mismatch", "--dry-run"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let r: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(
+        (r["queued"].as_u64(), r["generation"].is_null()),
+        (Some(1), true)
+    );
+    let o = reinject(&["--codes", "robot_mismatch"]);
+    assert!(o.status.success());
+    let r: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(r["queued"], 1);
+    assert!(r["generation"].as_str().unwrap().starts_with("rj-"));
+    let o = reinject(&["--codes", "robot_mismatch"]);
+    let r: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(
+        (r["queued"].as_u64(), r["already_queued"].as_u64()),
+        (Some(0), Some(1))
+    );
+    // The re-queued record is sent (and rejected again: still the wrong
+    // robot for this key) by the next run, under a new batch id.
+    let before = srv.requests.lock().unwrap().len();
+    let o = base(&["--once"]).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(srv.requests.lock().unwrap().len(), before + 1);
+    let rep: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&o.stdout).lines().next().unwrap()).unwrap();
+    assert_eq!(rep["rejected"], 1);
+    assert_eq!(rep["reinjected_done"].as_array().unwrap().len(), 1);
 }
