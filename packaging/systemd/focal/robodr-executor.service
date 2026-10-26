@@ -99,7 +99,7 @@ Group=robodr
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN
 NoNewPrivileges=yes
-UMask=0007
+UMask=0027
 
 # --- Key material ------------------------------------------------------------
 # robodr-load-credential (root, '+' prefix, outside the sandbox) places a

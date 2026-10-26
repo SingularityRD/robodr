@@ -82,7 +82,7 @@ Group=robodr
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN
 NoNewPrivileges=yes
-UMask=0007
+UMask=0027
 
 # --- Key material ------------------------------------------------------------
 LoadCredential=executor.key:/etc/robodr/keys/executor.key

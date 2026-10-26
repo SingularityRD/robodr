@@ -110,6 +110,13 @@ impl Outcome {
     }
 }
 
+/// More of the action's TTL is left than it was ever given: the wall clock
+/// moved back. The action is treated as expired (the safe direction), so a
+/// clock step can never make an action outlive its TTL.
+fn clock_moved_back(e: &Entry, now_ms: u64) -> bool {
+    e.deadline_ms.saturating_sub(now_ms) > e.ttl_s.saturating_mul(1000)
+}
+
 /// The executor core.
 pub struct Engine {
     cfg: Resolved,
@@ -212,7 +219,6 @@ impl Engine {
 
     fn reconcile(&mut self, now_ms: u64) -> Result<(), String> {
         let same_boot = self.state.boot_id == self.boot_id;
-        let max_ms = self.cfg.config.ttl.max_s.saturating_mul(1000);
         let mut summary = Vec::new();
         let entries = std::mem::take(&mut self.state.entries);
         let mut keep = Vec::new();
@@ -245,10 +251,7 @@ impl Engine {
                     );
                     summary.push(format!("{} revert completed", en.id));
                 }
-                Phase::Active
-                    if en.deadline_ms <= now_ms
-                        || en.deadline_ms.saturating_sub(now_ms) > max_ms =>
-                {
+                Phase::Active if en.deadline_ms <= now_ms || clock_moved_back(&en, now_ms) => {
                     self.state.event(
                         now_ms,
                         EventKind::Expired,
@@ -686,14 +689,12 @@ impl Engine {
         for id in reverting {
             self.finish_revert(&id, "revert retried", now_ms);
         }
-        let max_ms = self.cfg.config.ttl.max_s.saturating_mul(1000);
         let expired: Vec<(String, ActionId)> = self
             .state
             .entries
             .iter()
             .filter(|e| {
-                e.phase == Phase::Active
-                    && (e.deadline_ms <= now_ms || e.deadline_ms.saturating_sub(now_ms) > max_ms)
+                e.phase == Phase::Active && (e.deadline_ms <= now_ms || clock_moved_back(e, now_ms))
             })
             .map(|e| (e.id.clone(), e.action))
             .collect();

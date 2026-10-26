@@ -432,7 +432,11 @@ impl Drop for ExecutorLink {
 fn map(o: &Outcome) -> Option<ExecutorOutcome> {
     Some(match o.status {
         ExStatus::Verified => ExecutorOutcome::Verified,
-        ExStatus::Applying | ExStatus::Reverting => ExecutorOutcome::Pending,
+        ExStatus::Applying => ExecutorOutcome::Pending,
+        // A revert in progress (or failing and retried): the rules may still
+        // be in force, so the request keeps its state (`revert_failures`
+        // and the executor's events say why).
+        ExStatus::Reverting => return None,
         ExStatus::Reverted | ExStatus::RemovedExternally => ExecutorOutcome::Reverted,
         ExStatus::Advisory => ExecutorOutcome::RecordedNotExecuted,
         ExStatus::Failed => ExecutorOutcome::Failed(
@@ -733,6 +737,8 @@ mod tests {
         assert_eq!(map(&o), Some(ExecutorOutcome::Reverted));
         o.status = ExStatus::Unknown;
         assert_eq!(map(&o), None);
+        o.status = ExStatus::Reverting;
+        assert_eq!(map(&o), None, "a failing revert never reads as lifted");
     }
 
     #[test]

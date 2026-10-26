@@ -673,6 +673,35 @@ fn ttl_expiry_reverts_and_survives_restart() {
 }
 
 #[test]
+fn a_clock_step_back_never_extends_an_action() {
+    let d = tmpdir("clock");
+    let nft = FakeNft::default();
+    let mut e = engine(&d, &nft, "b1", 100_000);
+    let i = order(
+        "i1",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    assert_eq!(e.submit(&i, &mut idle(), 100_000).status, Status::Verified);
+    // The wall clock jumps 50 s back: 60 s TTL would now last 110 s.
+    e.tick(50_000);
+    assert_eq!(e.status("i1").status, Status::Reverted);
+    assert!(nft.0.lock().unwrap().table.is_none());
+    // Same at restart.
+    let i2 = order(
+        "i2",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    assert_eq!(e.submit(&i2, &mut idle(), 100_000).status, Status::Verified);
+    drop(e);
+    let e = engine(&d, &nft, "b1", 10_000);
+    assert_eq!(e.status("i2").status, Status::Reverted);
+}
+
+#[test]
 fn reboot_reapplies_but_operator_removal_is_honoured() {
     let d = tmpdir("reboot");
     let nft = FakeNft::default();
