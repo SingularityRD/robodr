@@ -2616,11 +2616,23 @@ impl Daemon<'_> {
                         // A quarantine carries the participant's SPDP
                         // unicast locators (the executor refuses it
                         // without): its own last trusted ones, also after
-                        // it left (red team F3; never another
-                        // participant's, none for a contested prefix).
+                        // it left (red team F3), only on addresses it was
+                        // seen sending from, never another participant's,
+                        // none for a contested prefix (review H1, H2, M5);
+                        // a GUID-prefix-only quarantine is vouched for when
+                        // none is left. A SOC request keeps the named
+                        // prefix's locators remembered (review M6).
+                        if let (
+                            robodr_executor::Origin::ControlPlane { .. },
+                            robodr_executor::order::Target::Participant { guid_prefix, .. },
+                        ) = (&o.origin, &o.target)
+                        {
+                            self.pipeline.note_soc_reference(&guid_prefix.0);
+                        }
                         let now = self.pipeline_now();
                         let binding = self.pipeline.binding();
-                        let o = link.with_locators(o, |g| binding.quarantine_locators(g, now));
+                        let o =
+                            link.with_locators(o, crate::executor_link::vouch_with(binding, now));
                         link.dispatch(Staged::Submit(o));
                     } else {
                         link.count_dropped();

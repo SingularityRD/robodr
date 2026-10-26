@@ -28,7 +28,7 @@
 //! never retried silently).
 
 use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender, TrySendError};
@@ -41,10 +41,11 @@ use robodr_executor::client::Client;
 use robodr_executor::decision::codes;
 use robodr_executor::engine::{Outcome, Status as ExStatus};
 use robodr_executor::journal::{Event, EventKind};
-use robodr_executor::order::{Locator, Order, Origin, Target};
+use robodr_executor::order::{ExcludedLocator, Locator, Order, Origin, Target};
 use robodr_executor::proto::Key;
 use robodr_executor::soc::SocRequest;
 use robodr_responder::{ActionId, Morphology, ResponseAction, RestrictTarget, SafetyState, Step};
+use robodr_ros2_pipeline::{BindingTable, QuarantineTarget};
 use serde::{Deserialize, Serialize};
 
 use crate::control::api::{AcceptedAction, ActionExecutor, ExecutorOutcome, Meta};
@@ -547,6 +548,8 @@ pub fn order_for(a: &AcceptedAction<'_>, own: Morphology, now_ms: u64) -> Order 
                 Ok(guid_prefix) => Target::Participant {
                     guid_prefix,
                     locators: Vec::new(),
+                    guid_only: false,
+                    excluded: Vec::new(),
                 },
                 Err(_) => Target::Node { name: g.clone() },
             },
@@ -679,6 +682,8 @@ pub fn orders_for_plan(req: &ExecutionRequest<'_>, own: Morphology, now_ms: u64)
                     Target::Participant {
                         guid_prefix: g,
                         locators: Vec::new(),
+                        guid_only: false,
+                        excluded: Vec::new(),
                     },
                 ),
                 // A source that is not a GUID prefix cannot be quarantined.
@@ -733,19 +738,34 @@ impl Executor for PlannerExecutor {
     }
 }
 
-// --- Quarantine locators (executor review H2) --------------------------------
+// --- Quarantine locators (executor review H2, review of the F3 fix) ---------
 // The executor quarantines a participant only when the order carries its
-// SPDP unicast locators and they lie outside every motion-path entry it may
-// not cut. agentd fills them in when it dispatches an order: from the
-// pipeline's binding table (what the participant announced through a
-// trusted path), else from participant events of a JSONL input.
+// SPDP unicast locators (or agentd vouches for a GUID-prefix-only
+// quarantine) and they lie outside every motion-path entry it may not cut.
+// agentd fills them in when it dispatches an order from the pipeline's
+// binding table ([`BindingTable::quarantine_target`]: only the prefix's own
+// locators on addresses it was seen sending from, never another
+// participant's, none for a contested, pinned or profiled-by-a-foreign-host
+// prefix). A participant event of a JSONL input is asked only for a prefix
+// the binding table does not know at all, and its locators go through the
+// same filters ([`BindingTable::vouch_external`], review M7): it can never
+// override the table's answer.
 
-/// Participants' SPDP unicast locators from `ros2_participant_discovered`
-/// events (bounded, oldest forgotten first).
+/// Participants' SPDP unicast locators (and the event's source address)
+/// from `ros2_participant_discovered` events (bounded, oldest forgotten
+/// first).
 #[derive(Debug, Default)]
 pub struct LocatorBook {
-    map: HashMap<[u8; 12], Vec<Locator>>,
+    map: HashMap<[u8; 12], BookEntry>,
     order: VecDeque<[u8; 12]>,
+}
+
+/// One participant event's locators and source address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BookEntry {
+    pub locators: Vec<SocketAddr>,
+    /// The event's `src_ip` (the only observed evidence for the locators).
+    pub src: Option<IpAddr>,
 }
 
 /// Participants remembered by the [`LocatorBook`].
@@ -761,17 +781,21 @@ impl LocatorBook {
         else {
             return;
         };
-        let locs: Vec<Locator> = p
+        let locators: Vec<SocketAddr> = p
             .locators
             .iter()
             .filter_map(|l| l.parse::<SocketAddr>().ok())
-            .filter_map(locator)
+            .filter(|sa| locator(*sa).is_some())
             .take(robodr_executor::order::MAX_LOCATORS)
             .collect();
-        if locs.is_empty() {
+        if locators.is_empty() {
             return;
         }
-        if self.map.insert(g.0, locs).is_none() {
+        let e = BookEntry {
+            locators,
+            src: robodr_ros2_pipeline::binding::parse_src_ip(&p.src_ip),
+        };
+        if self.map.insert(g.0, e).is_none() {
             self.order.push_back(g.0);
             while self.order.len() > MAX_BOOK {
                 if let Some(old) = self.order.pop_front() {
@@ -781,8 +805,8 @@ impl LocatorBook {
         }
     }
 
-    pub fn get(&self, g: &[u8; 12]) -> Vec<Locator> {
-        self.map.get(g).cloned().unwrap_or_default()
+    pub fn get(&self, g: &[u8; 12]) -> Option<&BookEntry> {
+        self.map.get(g)
     }
 }
 
@@ -794,28 +818,41 @@ fn locator(sa: SocketAddr) -> Option<Locator> {
     })
 }
 
-/// Fill a participant order's locators when it carries none: from
-/// `bound` (the pipeline's binding table), else from `book`.
+/// Fill a participant order's locators when it carries none, with what
+/// `vouch` answers for its prefix (and the [`LocatorBook`] entry, if any):
+/// the locators, whether a GUID-prefix-only quarantine is vouched for, and
+/// what was left out and why (carried in the order as evidence).
 pub fn attach_locators(
     mut o: Order,
-    bound: impl FnOnce(&[u8; 12]) -> Vec<SocketAddr>,
+    vouch: impl FnOnce(&[u8; 12], Option<&BookEntry>) -> QuarantineTarget,
     book: &LocatorBook,
 ) -> Order {
     if let Target::Participant {
         guid_prefix,
         locators,
+        guid_only,
+        excluded,
     } = &mut o.target
     {
         if locators.is_empty() {
-            let mut l: Vec<Locator> = bound(&guid_prefix.0)
+            let t = vouch(&guid_prefix.0, book.get(&guid_prefix.0));
+            *locators = t
+                .locators
                 .into_iter()
                 .filter_map(locator)
                 .take(robodr_executor::order::MAX_LOCATORS)
                 .collect();
-            if l.is_empty() {
-                l = book.get(&guid_prefix.0);
-            }
-            *locators = l;
+            *guid_only = t.guid_only;
+            *excluded = t
+                .excluded
+                .into_iter()
+                .take(robodr_executor::order::MAX_EXCLUDED)
+                .map(|(sa, why)| ExcludedLocator {
+                    ip: sa.ip(),
+                    port: sa.port(),
+                    reason: why.into(),
+                })
+                .collect();
         }
     }
     o
@@ -833,9 +870,22 @@ impl ExecutorLink {
     pub fn with_locators(
         &self,
         o: Order,
-        bound: impl FnOnce(&[u8; 12]) -> Vec<SocketAddr>,
+        vouch: impl FnOnce(&[u8; 12], Option<&BookEntry>) -> QuarantineTarget,
     ) -> Order {
-        attach_locators(o, bound, &self.book)
+        attach_locators(o, vouch, &self.book)
+    }
+}
+
+/// [`attach_locators`]'s `vouch` for agentd: the binding table's answer,
+/// or, for a prefix it does not know, the event's locators through the
+/// table's filters.
+pub fn vouch_with(
+    binding: &BindingTable,
+    now: std::time::Instant,
+) -> impl FnOnce(&[u8; 12], Option<&BookEntry>) -> QuarantineTarget + '_ {
+    move |g, entry| match entry {
+        Some(e) => binding.vouch_external(g, &e.locators, e.src, now),
+        None => binding.quarantine_target(g, now),
     }
 }
 
@@ -1015,6 +1065,8 @@ mod tests {
             target: Target::Participant {
                 guid_prefix: g.parse().unwrap(),
                 locators: Vec::new(),
+                guid_only: false,
+                excluded: Vec::new(),
             },
             ttl_s: None,
             judged_state: SafetyState::Idle,
@@ -1034,18 +1086,36 @@ mod tests {
             _ => panic!(),
         };
         let mut book = LocatorBook::default();
-        // Nothing known: none (the executor then refuses the quarantine).
-        assert!(locs(&attach_locators(o.clone(), |_| vec![], &book)).is_empty());
-        // From the binding table (multicast / port 0 dropped).
+        let table = BindingTable::new(
+            robodr_ros2_pipeline::BindingOptions::default(),
+            &robodr_events::profile::Profile::default(),
+        );
+        let now = std::time::Instant::now();
+        // Nothing known: none, nothing vouched (the executor refuses).
+        let out = attach_locators(o.clone(), vouch_with(&table, now), &book);
+        assert!(locs(&out).is_empty());
+        assert!(matches!(
+            out.target,
+            Target::Participant {
+                guid_only: false,
+                ..
+            }
+        ));
+        // What the vouch answers is carried over (multicast / port 0 dropped).
         let out = attach_locators(
             o.clone(),
-            |p| {
+            |p, _| {
                 assert_eq!(robodr_blackbox::crypto::to_hex(p), g);
-                vec![
-                    "10.0.0.7:7410".parse().unwrap(),
-                    "239.255.0.1:7400".parse().unwrap(),
-                    "10.0.0.7:0".parse().unwrap(),
-                ]
+                QuarantineTarget {
+                    locators: vec![
+                        "10.0.0.7:7410".parse().unwrap(),
+                        "239.255.0.1:7400".parse().unwrap(),
+                        "10.0.0.7:0".parse().unwrap(),
+                    ],
+                    excluded: vec![("10.0.0.9:7410".parse().unwrap(), "why")],
+                    known: true,
+                    guid_only: true,
+                }
             },
             &book,
         );
@@ -1056,14 +1126,33 @@ mod tests {
                 port: 7410
             }]
         );
-        // From a participant event when the binding has none.
+        match &out.target {
+            Target::Participant {
+                guid_only,
+                excluded,
+                ..
+            } => {
+                assert!(guid_only);
+                assert_eq!(excluded[0].reason, "why");
+            }
+            _ => panic!(),
+        }
+        // A participant event for a prefix the table does not know: its
+        // locators through the table's filters (only those on the event's
+        // source address).
         book.observe(&robodr_events::graph::Participant {
             guid_prefix: g.into(),
             src_ip: "10.0.0.8".into(),
-            locators: vec!["10.0.0.8:7412".into(), "junk".into()],
+            locators: vec![
+                "10.0.0.8:7412".into(),
+                "10.0.0.50:7410".into(),
+                "127.0.0.1:7410".into(),
+                "junk".into(),
+            ],
         });
+        let out = attach_locators(o, vouch_with(&table, now), &book);
         assert_eq!(
-            locs(&attach_locators(o, |_| vec![], &book)),
+            locs(&out),
             vec![Locator {
                 ip: "10.0.0.8".parse().unwrap(),
                 port: 7412

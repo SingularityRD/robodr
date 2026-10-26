@@ -177,6 +177,32 @@ impl Outcome {
     }
 }
 
+/// What a quarantine left out (review of the F3 fix, H2): the locators not
+/// acted on and why, and whether only the GUID-prefix drop is in force.
+fn quarantine_note(e: &Effect) -> Option<String> {
+    let Effect::Quarantine(q) = e else {
+        return None;
+    };
+    let mut parts = Vec::new();
+    if q.locators.is_empty() {
+        parts.push(format!(
+            "GUID-prefix drop only for participant {} (no locator could be vouched for)",
+            q.guid_prefix
+        ));
+    }
+    if !q.excluded.is_empty() {
+        parts.push(format!(
+            "locators left out (not acted on): {}",
+            q.excluded
+                .iter()
+                .map(|x| format!("{}:{} ({})", x.ip, x.port, x.reason))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
 /// More of the action's TTL is left than it was ever given: the wall clock
 /// moved back. The action is treated as expired (the safe direction), so a
 /// clock step can never make an action outlive its TTL.
@@ -933,7 +959,10 @@ impl Engine {
             EventKind::Applied,
             Some(&order.id),
             Some(order.action),
-            format!("installed in table inet robodr, ttl {ttl} s"),
+            match quarantine_note(&planned.effect) {
+                Some(n) => format!("installed in table inet robodr, ttl {ttl} s; {n}"),
+                None => format!("installed in table inet robodr, ttl {ttl} s"),
+            },
         );
         self.state.event(
             now_ms,
@@ -1444,6 +1473,7 @@ impl Engine {
             o.action = Some(en.action);
             o.applied_ms = Some(en.applied_ms);
             o.deadline_ms = Some(en.deadline_ms);
+            o.note = quarantine_note(&en.effect);
             return o;
         }
         if let Some(f) = self.state.finished(id) {

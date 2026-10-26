@@ -137,6 +137,8 @@ pub fn unsigned(id: &str, action: ActionId, m: Morphology, state: SafetyState) -
                     ip: "10.0.0.7".parse().unwrap(),
                     port: 7410,
                 }],
+                guid_only: false,
+                excluded: Vec::new(),
             },
             _ => Target::None,
         },
@@ -185,18 +187,26 @@ impl Tgt {
             Tgt::Outside => Target::Participant {
                 guid_prefix: GUID.parse().unwrap(),
                 locators: vec![loc("10.0.0.7")],
+                guid_only: false,
+                excluded: Vec::new(),
             },
             Tgt::InsideBus => Target::Participant {
                 guid_prefix: GUID.parse().unwrap(),
                 locators: vec![loc("192.168.123.50")],
+                guid_only: false,
+                excluded: Vec::new(),
             },
             Tgt::ProtectedGuid => Target::Participant {
                 guid_prefix: LOWCMD_GUID.parse().unwrap(),
                 locators: vec![loc("10.0.0.7")],
+                guid_only: false,
+                excluded: Vec::new(),
             },
             Tgt::NoLocators => Target::Participant {
                 guid_prefix: GUID.parse().unwrap(),
                 locators: vec![],
+                guid_only: false,
+                excluded: Vec::new(),
             },
         }
     }
@@ -565,6 +575,8 @@ fn motion_control_path_is_never_cut() {
             ip: "192.168.123.161".parse().unwrap(),
             port: 7411,
         }],
+        guid_only: false,
+        excluded: Vec::new(),
     };
     assert_eq!(
         precheck(&o, &wheeled, &c).unwrap_err().code,
@@ -579,6 +591,8 @@ fn motion_control_path_is_never_cut() {
             ip: "192.168.123.161".parse().unwrap(),
             port: 9000,
         }],
+        guid_only: false,
+        excluded: Vec::new(),
     };
     assert_eq!(
         precheck(&o, &wheeled, &c).unwrap_err().code,
@@ -591,6 +605,8 @@ fn motion_control_path_is_never_cut() {
             ip: "10.0.0.7".parse().unwrap(),
             port: 7410,
         }],
+        guid_only: false,
+        excluded: Vec::new(),
     };
     match precheck(&o, &wheeled, &c).unwrap().effect {
         Effect::Quarantine(q) => assert_eq!(q.protected.len(), 2),
@@ -600,6 +616,8 @@ fn motion_control_path_is_never_cut() {
     o.target = Target::Participant {
         guid_prefix: GUID.parse().unwrap(),
         locators: vec![],
+        guid_only: false,
+        excluded: Vec::new(),
     };
     assert_eq!(
         precheck(&o, &wheeled, &c).unwrap_err().code,
@@ -617,6 +635,8 @@ fn motion_control_path_is_never_cut() {
     o.target = Target::Participant {
         guid_prefix: LOWCMD_GUID.parse().unwrap(),
         locators: vec![],
+        guid_only: false,
+        excluded: Vec::new(),
     };
     assert_eq!(
         precheck(&o, &humanoid, &c).unwrap_err().code,
@@ -2219,6 +2239,8 @@ fn f4_quarantine_locators_are_scoped() {
                     port: *port,
                 })
                 .collect(),
+            guid_only: false,
+            excluded: Vec::new(),
         };
         o
     };
@@ -2231,10 +2253,6 @@ fn f4_quarantine_locators_are_scoped() {
             "outside the quarantinable CIDRs",
             vec![("10.20.0.10", 7410)],
         ),
-        (
-            "mixed families",
-            vec![("10.0.0.7", 7410), ("fd00::7", 7410)],
-        ),
     ] {
         let r = precheck(&q(&locs), &p, &scoped);
         assert_eq!(
@@ -2242,6 +2260,31 @@ fn f4_quarantine_locators_are_scoped() {
             Some("locator_out_of_scope"),
             "{what}: {r:?}"
         );
+    }
+    // Review of the F3 fix (H2b): one bad locator next to good ones is left
+    // out (listed, never acted on) instead of refusing the whole order.
+    let r = precheck(
+        &q(&[
+            ("10.0.0.7", 7410),
+            ("fd00::7", 7410),
+            ("10.0.0.7", 53),
+            ("10.20.0.10", 7410),
+            ("127.0.0.1", 7410),
+        ]),
+        &p,
+        &scoped,
+    );
+    match r.map(|x| x.effect) {
+        Ok(Effect::Quarantine(qs)) => {
+            assert_eq!(qs.locators.len(), 1, "{qs:?}");
+            assert_eq!(qs.locators[0].ip.to_string(), "10.0.0.7");
+            assert_eq!(qs.excluded.len(), 4, "{qs:?}");
+            assert!(qs
+                .excluded
+                .iter()
+                .all(|x| x.reason.starts_with("executor: ")));
+        }
+        e => panic!("{e:?}"),
     }
     // No quarantinable network configured: no quarantine at all.
     let r = precheck(&q(&[("10.0.0.7", 7410)]), &p, &with(None));
@@ -2474,4 +2517,118 @@ fn require_approval_for_all_containment_refuses_planner_orders() {
     );
     o.human_approved = true;
     assert!(precheck(&o, &p, &strict).is_ok());
+}
+
+/// Review of the F3 fix (H2): agentd vouches for a GUID-prefix-only
+/// quarantine (`guid_only`) when no locator can be vouched for (a decoy
+/// contested them). The executor then quarantines by the GUID-prefix drop
+/// alone, but every one of its own refusals still applies, and an order
+/// whose every locator lies on the motion control path is still refused.
+#[test]
+fn review_guid_only_quarantine_keeps_every_refusal() {
+    let c = cfg("/tmp/unused");
+    let wheeled = policy(Morphology::WheeledMobile, true, &[]);
+    let target = |g: &str, locs: &[(&str, u16)], guid_only: bool| Target::Participant {
+        guid_prefix: g.parse().unwrap(),
+        locators: locs
+            .iter()
+            .map(|(ip, port)| Locator {
+                ip: ip.parse().unwrap(),
+                port: *port,
+            })
+            .collect(),
+        guid_only,
+        excluded: vec![crate::order::ExcludedLocator {
+            ip: "10.0.0.66".parse().unwrap(),
+            port: 7410,
+            reason: "contested: another live participant was seen at this address".into(),
+        }],
+    };
+    let mut o = order(
+        "g1",
+        ActionId::QuarantineNode,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    // Vouched, nothing left: the GUID-prefix drop alone.
+    o.target = target(GUID, &[], true);
+    match precheck(&o, &wheeled, &c).unwrap().effect {
+        Effect::Quarantine(q) => {
+            assert!(q.locators.is_empty());
+            assert_eq!(q.excluded.len(), 1);
+            assert!(
+                q.excluded[0].reason.starts_with("agentd: contested"),
+                "{q:?}"
+            );
+            let r = crate::nft::render(&[crate::nft::Active {
+                id: "g1",
+                effect: &Effect::Quarantine(q.clone()),
+            }]);
+            let text = format!("{r:?}");
+            assert!(!text.contains("10.0.0.66"), "{text}");
+        }
+        e => panic!("{e:?}"),
+    }
+    // Not vouched: refused as before.
+    o.target = target(GUID, &[], false);
+    assert_eq!(
+        precheck(&o, &wheeled, &c).unwrap_err().code,
+        codes::LOCATORS_REQUIRED
+    );
+    // Vouched, but every locator on the motion control path: refused.
+    o.target = target(GUID, &[("192.168.123.50", 7410)], true);
+    assert_eq!(
+        precheck(&o, &wheeled, &c).unwrap_err().code,
+        codes::MOTION_PATH
+    );
+    // A motion-path locator next to one outside: left out, the rest acted on.
+    o.target = target(GUID, &[("192.168.123.50", 7410), ("10.0.0.7", 7410)], false);
+    match precheck(&o, &wheeled, &c).unwrap().effect {
+        Effect::Quarantine(q) => {
+            assert_eq!(q.locators.len(), 1);
+            assert!(q
+                .excluded
+                .iter()
+                .any(|x| x.reason.contains("motion control path")));
+        }
+        e => panic!("{e:?}"),
+    }
+    // The low-level writer's own prefix: refused, vouched or not.
+    o.target = target(LOWCMD_GUID, &[], true);
+    assert_eq!(
+        precheck(&o, &wheeled, &c).unwrap_err().code,
+        codes::MOTION_PATH
+    );
+    // A humanoid: a human must approve, vouched or not.
+    let humanoid = policy(Morphology::Humanoid, true, &[RestrictTarget::Participant]);
+    let mut h = unsigned(
+        "g2",
+        ActionId::QuarantineNode,
+        Morphology::Humanoid,
+        SafetyState::Idle,
+    );
+    h.target = target(GUID, &[], true);
+    h.human_approved = false;
+    assert_eq!(
+        precheck(&h, &humanoid, &c).unwrap_err().code,
+        codes::NEEDS_APPROVAL
+    );
+    // An interface-only motion-path entry: nothing can be proven outside it.
+    let mut v: Value = serde_json::from_str(&config_json("/tmp/unused")).unwrap();
+    v["network"]["motion_control_path"] = json!([{"interface": "eth2"}]);
+    let iface = ExecutorConfig::parse(&v.to_string())
+        .unwrap()
+        .validate()
+        .unwrap();
+    o.target = target(GUID, &[], true);
+    assert_eq!(
+        precheck(&o, &wheeled, &iface).unwrap_err().code,
+        codes::MOTION_PATH
+    );
+    // Excluded reasons are bounded text.
+    let mut bad = o.clone();
+    if let Target::Participant { excluded, .. } = &mut bad.target {
+        excluded[0].reason = "line\nbreak".into();
+    }
+    assert!(bad.validate().is_err());
 }

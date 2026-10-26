@@ -15,6 +15,8 @@ use crate::net::{clip, id_ok, GuidPrefix};
 
 /// Most locators per participant target.
 pub const MAX_LOCATORS: usize = 16;
+/// Most left-out locators listed per participant target.
+pub const MAX_EXCLUDED: usize = 32;
 /// Longest free-text field of an origin.
 pub const MAX_TEXT: usize = 200;
 
@@ -24,6 +26,15 @@ pub const MAX_TEXT: usize = 200;
 pub struct Locator {
     pub ip: IpAddr,
     pub port: u16,
+}
+
+/// A locator left out of a quarantine, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExcludedLocator {
+    pub ip: IpAddr,
+    pub port: u16,
+    pub reason: String,
 }
 
 /// What an action acts on.
@@ -39,6 +50,17 @@ pub enum Target {
         guid_prefix: GuidPrefix,
         #[serde(default)]
         locators: Vec<Locator>,
+        /// agentd vouches that the participant was seen and is not one of
+        /// the robot's own (profiled, pinned or contested): when no locator
+        /// is left, the executor may quarantine it by its GUID-prefix
+        /// payload drop alone (which matches RTPS sent by that prefix only).
+        /// `false`: no locator left is `locators_required`, as before.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        guid_only: bool,
+        /// Announced locators agentd left out, and why (evidence only; the
+        /// executor never acts on them).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        excluded: Vec<ExcludedLocator>,
     },
     /// A ROS 2 node by name (not resolvable by executor v1: refused).
     Node { name: String },
@@ -115,9 +137,21 @@ impl Order {
         }
         match &self.target {
             Target::None => {}
-            Target::Participant { locators, .. } => {
+            Target::Participant {
+                locators, excluded, ..
+            } => {
                 if locators.len() > MAX_LOCATORS {
                     return Err(format!("more than {MAX_LOCATORS} locators"));
+                }
+                if excluded.len() > MAX_EXCLUDED
+                    || excluded
+                        .iter()
+                        .any(|x| x.reason.is_empty() || !text_ok(&x.reason))
+                {
+                    return Err(format!(
+                        "more than {MAX_EXCLUDED} excluded locators, or a reason empty, too long \
+                         or with control characters"
+                    ));
                 }
                 for l in locators {
                     if l.port == 0 {

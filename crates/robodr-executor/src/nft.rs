@@ -965,6 +965,7 @@ mod tests {
                 ip: "10.0.0.7".parse().unwrap(),
                 port: 7410,
             }],
+            excluded: vec![],
             protected: vec![],
         })
     }

@@ -612,6 +612,8 @@ fn unsigned(id: &str, action: ActionId, m: Morphology) -> Order {
                     ip: ROGUE.parse().unwrap(),
                     port: 7410,
                 }],
+                guid_only: false,
+                excluded: Vec::new(),
             }
         } else {
             Target::None
@@ -1901,6 +1903,8 @@ fn ipv6_interface_and_example_renderings_read_back_exactly() {
             ip: "fd00:30::7".parse().unwrap(),
             port: 7410,
         }],
+        guid_only: false,
+        excluded: Vec::new(),
     };
     // Interface-only motion path entries cannot be proven: refused.
     assert_eq!(

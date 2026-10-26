@@ -854,3 +854,228 @@ fn a_rogue_pushed_out_by_a_guid_spray_is_still_quarantined_by_its_own_locators()
     assert!(!table.contains("10.0.0.77"), "never the sprayer's: {table}");
     finish(stop, h);
 }
+
+// --- Review of the red-team fixes (wt/redfix, H1, H2, M7) -------------------
+// The reviewer's proofs of concept through the real agentd and the real
+// (in-process) executor: the quarantine of a rogue never cuts another
+// participant's address, and the rogue cannot make itself unquarantinable.
+
+const LEGIT_HEX_: &str = common::pcap::LEGIT_HEX;
+const DECOY: [u8; 12] = [0xc7; 12];
+const DECOY_HEX: &str = "c7c7c7c7c7c7c7c7c7c7c7c7";
+
+fn v4(d: u8) -> std::net::Ipv4Addr {
+    std::net::Ipv4Addr::new(10, 0, 0, d)
+}
+
+/// SPDP for `prefix` sent from `src`, announcing locators on `ips`.
+fn spdp_from(src: std::net::Ipv4Addr, prefix: [u8; 12], ips: &[std::net::Ipv4Addr]) -> Vec<u8> {
+    use common::pcap::{datagram, spdp_sub};
+    frame(
+        src,
+        SPDP_GROUP,
+        7400,
+        &datagram(prefix, &[spdp_sub(prefix, ips)]),
+    )
+}
+
+fn writer_from(src: std::net::Ipv4Addr, prefix: [u8; 12]) -> Vec<u8> {
+    frame(
+        src,
+        v4(10),
+        7410,
+        &sedp_datagram(prefix, "rt/cmd_vel", TWIST),
+    )
+}
+
+/// The request's state once the executor answered (verified / refused /
+/// failed).
+fn wait_final(via: Via<'_>, id: &str) -> Value {
+    wait_for(10, "executor answer", || {
+        let v = get(via, id);
+        matches!(
+            v["status"].as_str(),
+            Some("verified" | "refused" | "failed")
+        )
+        .then_some(v)
+    })
+}
+
+/// Replay `frames` (`step` apart), optionally feed participant `events`
+/// (JSONL), then quarantine `guid` from the SOC. The request's final state
+/// and the nftables model's table (`"null"` when nothing is installed).
+fn soc_quarantine(
+    tag: &str,
+    frames: &[Vec<u8>],
+    step: std::time::Duration,
+    events: &[&str],
+    guid: &str,
+) -> (Value, String) {
+    let s = setup(tag, &robot_profile(true));
+    let safety = s.dir.join("safety.sock");
+    let control = s.dir.join("control.sock");
+    let exec_sock = s.dir.join("executor.sock");
+    let model = Model::default();
+    let _exec = start_executor(&s.dir, &exec_sock, &s.policy, &model);
+    let mut cfg = exec_config(&s, &control, None, &safety, &exec_sock);
+    cfg["sensor"]["capture"] = json!({"enabled": true, "pcap_replay": s.pcap_spaced(frames, step)});
+    let (stop, h) = spawn(s.resolve(&cfg));
+    let _plc = plc_idle(&s, &safety, &control);
+    wait_for(30, "capture replayed", || {
+        let st = status(&s.spool)?;
+        (st["daemon"]["datagrams"].as_u64()? >= frames.len() as u64).then_some(())
+    });
+    if !events.is_empty() {
+        let mut ev = wait_for(5, "event socket", || {
+            UnixStream::connect(s.dir.join("ev.sock")).ok()
+        });
+        for e in events {
+            writeln!(ev, "{e}").unwrap();
+        }
+        wait_for(10, "participant events", || {
+            (status(&s.spool)?["inputs"][0]["received"].as_u64()? >= events.len() as u64)
+                .then_some(())
+        });
+    }
+    let ux = Via::Unix(&control);
+    submit(
+        ux,
+        "q-review",
+        "quarantine_node",
+        json!({"participant_guid": guid}),
+        None,
+    );
+    let v = wait_final(ux, "q-review");
+    let table = serde_json::to_string(&*model.0.lock().unwrap()).unwrap();
+    finish(stop, h);
+    (v, table)
+}
+
+/// H1 (PoC 2): the profiled participant's lease ran out; one SPDP for its
+/// prefix from the attacker's host, then a decoy announcing the robot
+/// participant's address next to its own. The SOC quarantines the decoy:
+/// the robot participant's address must never be cut.
+#[test]
+fn review_h1_quarantine_of_a_decoy_never_cuts_the_profiled_participant() {
+    let frames = vec![
+        spdp_from(v4(10), common::pcap::LEGIT, &[v4(10)]),
+        spdp_from(v4(66), common::pcap::LEGIT, &[v4(66)]),
+        spdp_from(v4(66), DECOY, &[v4(66), v4(10)]),
+    ];
+    let (v, table) = soc_quarantine(
+        "rv-h1",
+        &frames,
+        std::time::Duration::from_secs(120),
+        &[],
+        DECOY_HEX,
+    );
+    assert!(
+        !table.contains("\"10.0.0.10\""),
+        "the robot participant's address was cut: {v}\n{table}"
+    );
+    assert_eq!(v["status"], "verified", "{v}");
+    assert!(table.contains("\"10.0.0.66\""), "{table}");
+}
+
+/// H2a: a live decoy prefix (from its own address) copies the rogue's
+/// locators. The rogue's quarantine used to be refused
+/// (`locators_required`).
+#[test]
+fn review_h2a_a_decoy_cannot_make_the_rogue_unquarantinable() {
+    let frames = vec![
+        spdp_from(v4(66), ROGUE, &[v4(66)]),
+        writer_from(v4(66), ROGUE),
+        spdp_from(v4(67), DECOY, &[v4(66)]),
+    ];
+    let (v, table) = soc_quarantine(
+        "rv-h2a",
+        &frames,
+        std::time::Duration::from_millis(10),
+        &[],
+        ROGUE_HEX,
+    );
+    assert_eq!(v["status"], "verified", "{v}");
+    assert!(table.contains("\"10.0.0.66\""), "{table}");
+    assert!(!table.contains("\"10.0.0.67\""), "{table}");
+}
+
+/// H2a, spoofed variant: the decoy's SPDP is sent with the rogue's source
+/// address, so both prefixes have evidence at the same ip:port and neither
+/// gets it (it may be a legitimate participant's). The quarantine still
+/// goes ahead with the GUID-prefix payload drop (it cannot hit another
+/// prefix) instead of being refused.
+#[test]
+fn review_h2a_a_spoofed_decoy_still_leaves_the_guid_prefix_drop() {
+    let frames = vec![
+        spdp_from(v4(66), ROGUE, &[v4(66)]),
+        writer_from(v4(66), ROGUE),
+        spdp_from(v4(66), DECOY, &[v4(66)]),
+    ];
+    let (v, table) = soc_quarantine(
+        "rv-h2a-spoof",
+        &frames,
+        std::time::Duration::from_millis(10),
+        &[],
+        ROGUE_HEX,
+    );
+    assert_eq!(v["status"], "verified", "{v}");
+    assert!(table.contains("robodr quarantine_node"), "{table}");
+    assert!(!table.contains("\"10.0.0.66\""), "contested: {table}");
+}
+
+/// H2b: the rogue announces (and sends SPDP from) a locator outside the
+/// quarantine scope and one inside the motion control path, plus a loopback
+/// one. They used to make the executor refuse the whole order; they are
+/// now dropped (with the reason in the answer's note) and the rest, plus
+/// the GUID-prefix drop, is quarantined.
+#[test]
+fn review_h2b_poison_locators_are_dropped_not_a_reason_to_refuse() {
+    let far = std::net::Ipv4Addr::new(10, 99, 0, 1);
+    let motion = std::net::Ipv4Addr::new(192, 168, 123, 5);
+    let lo = std::net::Ipv4Addr::LOCALHOST;
+    let ips = [v4(66), far, motion, lo];
+    let frames = vec![
+        spdp_from(v4(66), ROGUE, &ips),
+        spdp_from(far, ROGUE, &ips),
+        spdp_from(motion, ROGUE, &ips),
+        writer_from(v4(66), ROGUE),
+    ];
+    let (v, table) = soc_quarantine(
+        "rv-h2b",
+        &frames,
+        std::time::Duration::from_millis(10),
+        &[],
+        ROGUE_HEX,
+    );
+    assert_eq!(v["status"], "verified", "{v}");
+    assert!(table.contains("\"10.0.0.66\""), "{table}");
+    for bad in ["10.99.0.1", "192.168.123.5", "127.0.0.1"] {
+        assert!(!table.contains(&format!("\"{bad}\"")), "{bad}: {table}");
+    }
+}
+
+/// M7: a JSONL participant event used to fill the locators of a prefix the
+/// binding table deliberately gave none (here the profiled prefix,
+/// contested by a second host): the robot participant's quarantine was
+/// executed on whatever the event announced.
+#[test]
+fn review_m7_an_event_input_does_not_bypass_the_binding_tables_refusal() {
+    let frames = vec![
+        spdp_from(v4(10), common::pcap::LEGIT, &[v4(10)]),
+        spdp_from(v4(66), common::pcap::LEGIT, &[v4(66)]),
+    ];
+    let ev = format!(
+        "{{\"kind\":\"ros2_participant_discovered\",\"guid_prefix\":\"{LEGIT_HEX_}\",\
+         \"src_ip\":\"10.0.0.66\",\"locators\":[\"10.0.0.66:7410\",\"10.0.0.10:7410\"]}}"
+    );
+    let (v, table) = soc_quarantine(
+        "rv-m7",
+        &frames,
+        std::time::Duration::from_millis(10),
+        &[&ev],
+        LEGIT_HEX_,
+    );
+    assert_eq!(v["status"], "refused", "{v}\n{table}");
+    assert_eq!(v["refusal"]["code"], "locators_required", "{v}");
+    assert_eq!(table, "null");
+}
