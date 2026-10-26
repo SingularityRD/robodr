@@ -124,7 +124,8 @@ written for that target; the component dependency order is unchanged.
  robodr-diode      one-way export (air-gap)                   [~]
  robodr-fleet      control plane · attestation verifier · console [ ]
  robodr-depot      air-gap fleet delivery (SECURE-DELIVERY)   [ ]
-   ├ robodr-pkg       RPK / bundle / deployment formats       [ ]
+   ├ robodr-pkg       RPK / bundle / deployment formats       [P] (13a)
+   ├ robodr-release   build / sign / verify bundles (connected) [P] (13a)
    ├ robodr-deliverd  on-unit install, rollback, safety gate  [ ]
    └ robodr-seal      TPM-sealed payload keys, crypto-erase   [ ]
                  │ OCSF findings  (robodr-ocsf mapper          [P])

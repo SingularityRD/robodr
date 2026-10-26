@@ -1,0 +1,25 @@
+[package]
+name = "robodr-release"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# Not published (crates.io disallows path deps); also lets cargo-deny
+# accept version-less path dependencies (deny.toml, allow-wildcard-paths).
+publish = false
+repository.workspace = true
+description = "Connected-side release tool (docs/SECURE-DELIVERY.md §4.1): build RPKs, sign with a key quorum, assemble chained release bundles with Reed-Solomon parity, verify and repair them."
+
+[dependencies]
+robodr-pkg = { workspace = true }
+robodr-blackbox = { workspace = true }
+# `--flag value` argument parser shared with the diode binaries.
+robodr-diode = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "robodr-release"
+path = "src/main.rs"
+# Same crate name as the library: keep it out of rustdoc to avoid a collision.
+doc = false

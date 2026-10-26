@@ -27,6 +27,11 @@ violated output invariant (documented at the top of its harness file).
 | `safety_feed` | robodr-agentd | `safety_feed JSON \0 records`: safety-socket lines, RTPS datagrams (through the sensor pipeline, then `SafetyFeed::observe_datagram`), clock steps; "never less conservative than a fresh socket report" | `crates/robodr-agentd/tests/fuzz_smoke.rs` |
 | `kafka_wire` | robodr-export | a selector + body to the Kafka decoders: ApiVersions / Metadata v1-8 / Produce v3-8 responses (decode-encode-decode identity), RecordBatch v2 (CRC fixed up or not), request header + Metadata / Produce requests, wire primitives | `crates/robodr-export/tests/fuzz_smoke.rs` |
 | `firewall_gw_packet` | robodr-firewall-gw | a flags byte + framed records (each wrapped in IPv4 / UDP) to `Gateway::process` (strict RTPS walk, SEDP learning, `LowCmd_` / sport `Request_` / Go1 decode, firewall decision, in-place rewrite), and the bytes to the NFQUEUE netlink parser | `crates/robodr-firewall-gw/tests/fuzz_smoke.rs` |
+| `pkg_rpk` | robodr-pkg | `MANIFEST.json \0 MANIFEST.sig` to `parse_manifest` (canonical, every value rule), `rpk_digest`, `SignatureSet::parse`, `verify_manifest` against a fixed harness site (release quorum of the programme owning the package, policy), `verify_content` | `crates/robodr-pkg/tests/fuzz_smoke.rs` |
+| `pkg_bundle` | robodr-pkg | `bundle.json \0 bundle.sig` to `parse_bundle` (path grammar, parity plan), `verify_bundle_manifest` (programme scope of signers and packages), and `check_chain` against genesis and several heads (gap / replay / equivocation / broken-link rules as invariants) | same |
+| `pkg_deployment` | robodr-pkg | `deployment \0 sig` to `parse_deployment`, `verify_deployment` (depot + operator quorum; lab quorum only for units the trust file assigns to that ring), `check_seq` | same |
+| `pkg_trust` | robodr-pkg | `trust \0 sig \0 next \0 next sig` to `parse_trust` (disjoint roles, expiry bounds, quorum caps, programme scopes and package ownership), `verify_trust_pinned` (pins, site, expiry) and `verify_trust_update` from the harness site (monotonic revocations, serials and floors; unexpired) | same |
+| `pkg_parity` | robodr-pkg | `k`, `m`, an erasure mask and data files to `parity::layout`, `encode_group`, `rebuild_group` (`robodr-diode`'s RS code): erased members come back byte for byte | same |
 
 `kafka_wire` got its std-only smoke test after the fact (it was added while
 `crates/robodr-export` was being changed by parallel work); it also checks
@@ -106,6 +111,53 @@ been run under libFuzzer yet (CI's `fuzz` job runs each for 60 s).
 Grown corpora were not committed (README rule: only `cmin`-minimised
 additions).
 
+### libFuzzer runs (Sprint 13a, 2026-10-26)
+
+The five `pkg_*` targets and, again, `diode_fec` (its Reed-Solomon code is
+what bundle parity reuses): `nightly-2026-09-01`, `cargo-fuzz` 0.13.1,
+AddressSanitizer + debug assertions, `-max_total_time=300
+-rss_limit_mb=2048`, seeded from `fuzz/corpus/<target>/` (copied, so the
+grown corpora stay out of the repository), three targets at a time on a
+4-core sandbox that was also compiling (exec/s are shared-CPU figures).
+The harnesses were those of commit `4d31dc9`; the later chain-state
+change (`trust_version` / `trust_digest`) only adds two members to a
+value the `pkg_bundle` harness builds itself. **No crash, leak, timeout
+or invariant violation:**
+
+| target | runs | exec/s | coverage (edges) | corpus at end |
+|---|---:|---:|---:|---:|
+| `pkg_bundle` | 2 895 655 | 9 620 | 5 361 | 2 623 |
+| `pkg_deployment` | 2 804 612 | 9 317 | 5 082 | 2 665 |
+| `pkg_rpk` | 2 052 839 | 6 820 | 6 393 | 3 444 |
+| `pkg_parity` | 442 414 | 1 469 | 600 | 215 |
+| `pkg_trust` | 337 370 | 1 120 | 3 770 | 1 529 |
+| `diode_fec` | 57 550 | 191 | 963 | 596 |
+
+`pkg_trust` is slow by design (every input that parses decodes up to
+nine Ed25519 keys and checks signatures twice). Five minutes per target
+is a first run, not an acceptance run: the 1 h nightly and 24 h
+campaigns of the roadmap still apply.
+
+### libFuzzer runs (13a review fixes, 2026-10-26)
+
+After the fixes for the independent review of Sprint 13a changed the
+trust file (site pin, `expires_at`, programme scopes, rings,
+`revoked_serials`), the deployment quorum rule and the chain state, the
+five `pkg_*` harnesses and seeds were updated (`seeds_are_current`
+passes) and each target re-run: `nightly-2026-09-01`, `cargo-fuzz`
+0.13.1, AddressSanitizer + debug assertions, `-max_total_time=150
+-rss_limit_mb=2048`, seeded from `fuzz/corpus/<target>/` (copied), two
+targets at a time on a 4-core sandbox. **No crash, leak, timeout or
+invariant violation:**
+
+| target | runs | exec/s | coverage (edges) | corpus at end |
+|---|---:|---:|---:|---:|
+| `pkg_bundle` | 1 582 320 | 10 478 | 5 695 | 2 233 |
+| `pkg_deployment` | 2 203 276 | 14 591 | 5 417 | 2 460 |
+| `pkg_rpk` | 1 162 425 | 7 698 | 6 619 | 2 910 |
+| `pkg_parity` | 355 437 | 2 353 | 600 | 203 |
+| `pkg_trust` | 176 570 | 1 169 | 4 371 | 1 198 |
+
 ### Smoke runs
 
 * all targets are compiled and run in `cargo test` by their crate's
@@ -121,6 +173,9 @@ additions).
   panic, no invariant violation. Writing its read-size invariant exposed
   that the HTTP head bound depended on how the peer's bytes were split into
   reads (fixed before the target landed).
+* `pkg_*` (Sprint 13a): the default debug smoke run, 20 000 inputs each
+  (`pkg_trust` about 1 000: each input costs about 10 ms in debug), no
+  panic, no invariant violation.
 
 The deterministic mutator is not coverage-guided: it finds shallow bugs
 cheaply but is no substitute for libFuzzer runs (CI's `fuzz` job runs every
@@ -212,6 +267,17 @@ All seeds are SYNTHETIC (no real robot data):
 * `kafka_wire/`: responses and requests (one per decoder and version class)
   written by `fuzz/seedgen/kafka_wire.py` from the layouts the encoders in
   `robodr-export` use.
+* `pkg_rpk/`, `pkg_bundle/`, `pkg_deployment/`, `pkg_trust/`,
+  `pkg_parity/`: built by each harness's `seeds()` and signed with the
+  harness site's fixed Ed25519 keys (`fuzz/harness/pkg_common.rs`): a
+  `files` RPK signed by the release quorum and a `deb` RPK with an SBOM
+  signed once; a bundle with parity signed by the quorum and a chained
+  bundle 2 signed once; a lab deployment with its quorum and a production
+  one short of it; the harness trust file followed by a signed version-2
+  update; parity file sets and a parity file name. Written by
+  `regenerate_seeds` in `crates/robodr-pkg/tests/fuzz_smoke.rs`
+  (`--ignored`); `seeds_are_current` fails when the committed seeds
+  differ.
 
 Each smoke test also checks its seeds take the success path (pcaps reach the
 RTPS parser, fragments reassemble, chains verify, findings validate, the

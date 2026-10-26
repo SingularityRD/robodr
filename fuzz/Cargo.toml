@@ -33,6 +33,7 @@ robodr-firewall = { path = "../crates/robodr-firewall" }
 robodr-firewall-gw = { path = "../crates/robodr-firewall-gw", features = ["testkit"] }
 robodr-fleet = { path = "../crates/robodr-fleet" }
 robodr-ocsf = { path = "../crates/robodr-ocsf" }
+robodr-pkg = { path = "../crates/robodr-pkg" }
 robodr-ros2-pipeline = { path = "../crates/robodr-ros2-pipeline" }
 robodr-rtps = { path = "../crates/robodr-rtps" }
 # Test oracle of the diode_fec target (never shipped; see crates/robodr-diode/src/fec.rs).
@@ -195,6 +196,41 @@ bench = false
 [[bin]]
 name = "fleet_envelope"
 path = "fuzz_targets/fleet_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pkg_rpk"
+path = "fuzz_targets/pkg_rpk.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pkg_bundle"
+path = "fuzz_targets/pkg_bundle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pkg_deployment"
+path = "fuzz_targets/pkg_deployment.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pkg_trust"
+path = "fuzz_targets/pkg_trust.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pkg_parity"
+path = "fuzz_targets/pkg_parity.rs"
 test = false
 doc = false
 bench = false

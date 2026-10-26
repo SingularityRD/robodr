@@ -129,6 +129,15 @@ crates/
                           uplink-status.json + sd_notify STATUS= show a
                           blocked queue; `reinject` re-queues dead letters
                           after a registration fix.
+  robodr-pkg/             Secure delivery formats (docs/SECURE-DELIVERY.md §3):
+                          pure, fuzzed parsers for RPK packages, release
+                          bundles, deployments, the site trust file and quorum
+                          signature sets. Sprint 13a.
+  robodr-release/         Connected-side release tool: build RPKs, sign with a
+                          key quorum, assemble chained bundles with parity,
+                          verify anywhere, repair from parity. Binary:
+                          robodr-release. Sprint 13a; no sealing, no unit
+                          agent, no depot yet.
   robodr-sensor-ros2/     Thin Pulsar module wrapping robodr-ros2-pipeline.
                           Pulsar-dependent: built, linted and tested against
                           vendor/pulsar in CI's `pulsar` job (needs Pulsar's

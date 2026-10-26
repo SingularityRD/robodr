@@ -2520,6 +2520,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "robodr-pkg"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "curve25519-dalek",
+ "robodr-blackbox",
+ "robodr-diode",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "robodr-pulsard"
 version = "0.1.0-alpha.1"
 dependencies = [
@@ -2530,6 +2541,17 @@ dependencies = [
  "robodr-sensor-ros2",
  "robodr-threat-forward",
  "tokio",
+]
+
+[[package]]
+name = "robodr-release"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "robodr-blackbox",
+ "robodr-diode",
+ "robodr-pkg",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
