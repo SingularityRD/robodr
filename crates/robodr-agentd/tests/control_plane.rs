@@ -298,6 +298,22 @@ fn state_dir(s: &Setup) -> PathBuf {
     let d = s.dir.join("cp-state");
     std::fs::create_dir_all(&d).unwrap();
     std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // A replay store from an earlier run (an hour ago): a store created at
+    // start is fenced for the clock skew (CP review finding 5).
+    let ago = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 3600;
+    drop(
+        robodr_agentd::control::auth::ReplayGuard::persistent(
+            &d,
+            30,
+            robodr_agentd::control::auth::MAX_NONCES,
+            ago,
+        )
+        .unwrap(),
+    );
     d
 }
 
@@ -844,6 +860,8 @@ fn state_survives_a_restart_and_replays_stay_refused() {
         "soc_keys": [soc_pub],
         "rate_per_minute": 600,
         "burst": 100,
+        // A short window: the fence below lasts for it.
+        "max_clock_skew_s": 2,
     });
     let requests = format!("/api/v2/robots/{ROBOT}/action-requests");
     let id = "robot_restrict_motion:ugv-007:restart";
@@ -896,15 +914,19 @@ fn state_survives_a_restart_and_replays_stay_refused() {
     assert_eq!(notes(&s.blackbox, "robodr.control_plane_request").len(), 1);
 
     // The replay store removed while the request journal stays: the
-    // restart fences (requests signed before it are refused, fresh ones
-    // are fine).
+    // restart fences up to now + skew (a request accepted before may have
+    // been signed up to the skew ahead; CP review finding 5): requests
+    // signed before it are refused, fresh ones once the window has passed.
     let old = signed("GET", &get_target, b"");
     std::fs::remove_file(s.dir.join("cp-state/nonces.journal")).unwrap();
     let (stop, h) = spawn(s.resolve(&cfg));
     wait_for(5, "control socket", || UnixStream::connect(&control).ok());
     let r = unix(&control, &old);
     assert_eq!(r.body["error"]["code"], "stale_timestamp", "{}", r.body);
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // Signed now: still inside the fence (wire code stale_timestamp).
+    let r = unix(&control, &signed("GET", &get_target, b""));
+    assert_eq!(r.body["error"]["code"], "stale_timestamp", "{}", r.body);
+    std::thread::sleep(std::time::Duration::from_millis(3100));
     let r = unix(&control, &signed("GET", &get_target, b""));
     assert_eq!(r.status, 200, "{}", r.body);
     let st = status(&s.spool).unwrap();

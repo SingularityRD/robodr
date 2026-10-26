@@ -264,7 +264,10 @@ pub fn verify(
     }
 }
 
-/// One persisted (key, nonce) pair.
+/// One persisted (key, nonce) pair (`t: "nonce"`), or the wall-clock
+/// high-water mark (`t: "clock"`, empty key and nonce, `dead_after` = the
+/// latest Unix second at which the store dropped dead pairs; written with
+/// every compaction, which is where pairs are dropped).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NonceEntry {
@@ -272,7 +275,7 @@ pub struct NonceEntry {
     pub key_id: String,
     pub nonce: String,
     /// Unix second after which the pair is dead (its timestamp left the
-    /// window).
+    /// window); for `clock`, the high-water mark.
     pub dead_after: u64,
 }
 
@@ -286,6 +289,10 @@ pub struct ReplayLoad {
     pub torn_bytes: u64,
     pub damaged: usize,
     pub created: bool,
+    /// The persisted wall-clock high-water mark found (Unix seconds).
+    pub high_water: Option<u64>,
+    /// The wall clock read below the high-water mark at start.
+    pub clock_went_back: bool,
     /// The fence set (Unix seconds), if any.
     pub fence: Option<u64>,
 }
@@ -305,6 +312,10 @@ pub struct ReplayGuard {
     /// Compact (dropping dead pairs) when the journal reaches this many
     /// lines: twice the live set after the last compaction, plus 1024.
     compact_at: usize,
+    /// The latest wall-clock second at which dead pairs were dropped
+    /// (persisted as the `clock` entry of every compaction). A clock below
+    /// it could bring their timestamps back into the window.
+    high_water: u64,
 }
 
 impl ReplayGuard {
@@ -318,19 +329,35 @@ impl ReplayGuard {
             fence: None,
             store_errors: 0,
             compact_at: 1024,
+            high_water: 0,
         }
     }
 
-    /// A guard persisted in `dir/nonces.journal`. `fence_if_created`: the
-    /// caller knows state existed before (the request journal is there), so
-    /// a missing nonce journal means it was removed: fence. Damage fences
-    /// too. `now_s` drops dead pairs and is the fence value.
+    /// Refuse every timestamp up to `at + skew` (whatever was accepted
+    /// before `at` had a timestamp at most `skew` ahead of the clock).
+    fn fence_from(&mut self, at: u64) {
+        let f = at.saturating_add(self.skew_s);
+        self.fence = Some(self.fence.map_or(f, |o| o.max(f)));
+    }
+
+    /// A guard persisted in `dir/nonces.journal`, fenced (control plane v2
+    /// review, finding 5) whenever pairs it should know may be missing:
+    ///
+    /// * the journal had to be created: a first install and a removed or
+    ///   wiped state directory look the same;
+    /// * the journal was damaged;
+    /// * the wall clock reads below the persisted high-water mark, the
+    ///   latest second at which dead pairs were dropped (they would live
+    ///   again).
+    ///
+    /// The fence refuses every timestamp up to `max(now, high-water) +
+    /// skew`: a request accepted before may carry a timestamp up to `skew`
+    /// ahead of the clock that accepted it.
     pub fn persistent(
         dir: &Path,
         skew_s: u64,
         max: usize,
         now_s: u64,
-        fence_if_created: bool,
     ) -> std::io::Result<(Self, ReplayLoad)> {
         let (journal, loaded): (Journal, Loaded<NonceEntry>) =
             Journal::open(dir, NONCE_JOURNAL, "nonces")?;
@@ -341,7 +368,12 @@ impl ReplayGuard {
             created: loaded.created,
             ..ReplayLoad::default()
         };
+        let mut hwm: Option<u64> = None;
         for e in loaded.entries {
+            if e.t == "clock" && e.key_id.is_empty() && e.nonce.is_empty() {
+                hwm = Some(hwm.map_or(e.dead_after, |h| h.max(e.dead_after)));
+                continue;
+            }
             if e.t != "nonce" {
                 load.damaged += 1;
                 continue;
@@ -353,9 +385,16 @@ impl ReplayGuard {
             g.seen.insert((e.key_id, e.nonce), e.dead_after);
         }
         load.restored = g.seen.len();
-        if load.damaged > 0 || (loaded.created && fence_if_created) {
-            g.fence = Some(now_s);
-            load.fence = Some(now_s);
+        load.high_water = hwm;
+        let high = hwm.unwrap_or(0);
+        load.clock_went_back = now_s < high;
+        if load.damaged > 0 || loaded.created || load.clock_went_back {
+            g.fence_from(now_s.max(high));
+            load.fence = g.fence;
+        }
+        g.high_water = high;
+        if load.expired > 0 {
+            g.high_water = g.high_water.max(now_s);
         }
         g.journal = Some(journal);
         // Start from a compact file.
@@ -380,10 +419,20 @@ impl ReplayGuard {
     }
 
     fn compact(&mut self, now_s: u64) {
+        let before = self.seen.len();
+        self.seen.retain(|_, dead_after| *dead_after >= now_s);
+        if self.seen.len() < before {
+            self.high_water = self.high_water.max(now_s);
+        }
         let Some(j) = self.journal.as_mut() else {
             return;
         };
-        self.seen.retain(|_, dead_after| *dead_after >= now_s);
+        let clock = NonceEntry {
+            t: "clock".into(),
+            key_id: String::new(),
+            nonce: String::new(),
+            dead_after: self.high_water,
+        };
         let mut live: Vec<NonceEntry> = self
             .seen
             .iter()
@@ -397,6 +446,7 @@ impl ReplayGuard {
         live.sort_by(|a, b| {
             (a.dead_after, &a.key_id, &a.nonce).cmp(&(b.dead_after, &b.key_id, &b.nonce))
         });
+        live.insert(0, clock);
         if j.compact(&live).is_err() {
             self.store_errors += 1;
         }
@@ -414,6 +464,11 @@ impl ReplayGuard {
         timestamp: u64,
         now_s: u64,
     ) -> Result<(), AuthFailure> {
+        // The clock went back below the time dead pairs were dropped: they
+        // could be replayed (review finding 5).
+        if now_s < self.high_water {
+            self.fence_from(self.high_water);
+        }
         if timestamp.abs_diff(now_s) > self.skew_s {
             return Err(AuthFailure::StaleTimestamp);
         }
@@ -425,7 +480,9 @@ impl ReplayGuard {
             return Err(AuthFailure::Replayed);
         }
         if self.seen.len() >= self.max {
-            self.seen.retain(|_, dead_after| *dead_after >= now_s);
+            // Dropping pairs: compact, which persists the high-water mark
+            // with the live set.
+            self.compact(now_s);
             if self.seen.len() >= self.max {
                 return Err(AuthFailure::ReplayCacheFull);
             }
@@ -684,18 +741,27 @@ mod tests {
         d
     }
 
+    /// A store created long before (a first start then has nothing to
+    /// fear): opened again at `now` it is not fenced.
+    fn seasoned(tag: &str, now: u64) -> std::path::PathBuf {
+        let d = tmp(tag);
+        let (_, l) = ReplayGuard::persistent(&d, 30, 100, now - 500).unwrap();
+        assert!(l.created && l.fence.is_some());
+        d
+    }
+
     /// A nonce accepted before a restart is still a replay after it, for as
     /// long as its timestamp is in the window; dead pairs are dropped.
     #[test]
     fn replay_after_restart_is_refused() {
-        let d = tmp("restart");
-        let (mut g, l) = ReplayGuard::persistent(&d, 30, 100, 1000, false).unwrap();
-        assert!(l.created && l.fence.is_none());
+        let d = seasoned("restart", 1000);
+        let (mut g, l) = ReplayGuard::persistent(&d, 30, 100, 1000).unwrap();
+        assert!(!l.created && l.fence.is_none(), "{l:?}");
         assert_eq!(g.check("k", "nonce-aaaaaaaaaaaaaaaa", 1000, 1000), Ok(()));
         assert_eq!(g.check("k", "nonce-bbbbbbbbbbbbbbbb", 995, 1000), Ok(()));
         drop(g);
         // Restart 10 s later: both still live, both refused.
-        let (mut g, l) = ReplayGuard::persistent(&d, 30, 100, 1010, true).unwrap();
+        let (mut g, l) = ReplayGuard::persistent(&d, 30, 100, 1010).unwrap();
         assert_eq!((l.restored, l.expired, l.fence), (2, 0, None));
         assert_eq!(
             g.check("k", "nonce-aaaaaaaaaaaaaaaa", 1000, 1010),
@@ -705,8 +771,9 @@ mod tests {
         drop(g);
         // Restart after the window: the old pairs are dead (dropped), and
         // the window alone refuses their timestamps.
-        let (mut g, l) = ReplayGuard::persistent(&d, 30, 100, 1035, true).unwrap();
+        let (mut g, l) = ReplayGuard::persistent(&d, 30, 100, 1035).unwrap();
         assert_eq!((l.restored, l.expired), (1, 2));
+        assert_eq!(l.high_water, Some(0));
         assert_eq!(
             g.check("k", "nonce-aaaaaaaaaaaaaaaa", 1000, 1035),
             Err(AuthFailure::StaleTimestamp)
@@ -718,43 +785,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// An untrusted store (damaged, or missing while other state exists)
-    /// fences: nothing signed at or before the start is accepted.
+    /// An untrusted store (damaged, missing, or behind a clock that went
+    /// back) fences: nothing that may have been accepted before is.
     #[test]
     fn an_untrusted_store_fences() {
-        let d = tmp("fence");
-        let (mut g, _) = ReplayGuard::persistent(&d, 30, 100, 1000, false).unwrap();
+        let d = seasoned("fence", 1000);
+        let (mut g, _) = ReplayGuard::persistent(&d, 30, 100, 1000).unwrap();
         g.check("k", "nonce-aaaaaaaaaaaaaaaa", 1000, 1000).unwrap();
         g.check("k", "nonce-bbbbbbbbbbbbbbbb", 1000, 1000).unwrap();
         drop(g);
-        // Damage the first nonce line (a good line follows it).
+        // Damage the first entry after the header (a good line follows).
         let p = d.join(NONCE_JOURNAL);
         let mut b = std::fs::read(&p).unwrap();
         let second = b.iter().position(|&c| c == b'\n').unwrap() + 1;
         b[second + 80] ^= 1;
         std::fs::write(&p, &b).unwrap();
-        let (mut g, l) = ReplayGuard::persistent(&d, 30, 100, 1005, true).unwrap();
+        let (mut g, l) = ReplayGuard::persistent(&d, 30, 100, 1005).unwrap();
         assert_eq!(l.damaged, 1);
-        assert_eq!(l.fence, Some(1005));
-        // The lost nonce is refused by the fence, a fresh request accepted.
+        assert_eq!(l.fence, Some(1035), "now + skew");
+        // The lost nonce is refused by the fence, and so is a timestamp
+        // up to the skew ahead; past it a fresh request is accepted.
         assert_eq!(
             g.check("k", "nonce-aaaaaaaaaaaaaaaa", 1000, 1005),
             Err(AuthFailure::Fenced)
         );
         assert_eq!(
-            g.check("k", "nonce-dddddddddddddddd", 1005, 1005),
+            g.check("k", "nonce-dddddddddddddddd", 1035, 1005),
             Err(AuthFailure::Fenced)
         );
-        assert_eq!(g.check("k", "nonce-dddddddddddddddd", 1006, 1006), Ok(()));
+        assert_eq!(g.check("k", "nonce-dddddddddddddddd", 1036, 1006), Ok(()));
         drop(g);
-        // Removed while the request journal exists: fenced too; a first
-        // start (nothing else there) is not.
+        // Removed (or a first start: the same to the store): fenced.
         std::fs::remove_file(&p).unwrap();
-        let (_, l) = ReplayGuard::persistent(&d, 30, 100, 1010, true).unwrap();
-        assert_eq!(l.fence, Some(1010));
-        std::fs::remove_file(&p).unwrap();
-        let (_, l) = ReplayGuard::persistent(&d, 30, 100, 1010, false).unwrap();
-        assert_eq!(l.fence, None);
+        let (_, l) = ReplayGuard::persistent(&d, 30, 100, 1010).unwrap();
+        assert_eq!(l.fence, Some(1040));
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -763,7 +827,7 @@ mod tests {
     #[test]
     fn a_failing_store_refuses() {
         let d = tmp("fail");
-        let (mut g, _) = ReplayGuard::persistent(&d, 30, 100, 1000, false).unwrap();
+        let (mut g, _) = ReplayGuard::persistent(&d, 30, 100, 900).unwrap();
         crate::control::fsutil::fault::arm("survive.journal.append.short_write", 1);
         let r = g.check("k", "nonce-aaaaaaaaaaaaaaaa", 1000, 1000);
         assert_eq!(r, Err(AuthFailure::ReplayStoreUnavailable));
@@ -779,7 +843,7 @@ mod tests {
     #[test]
     fn the_store_is_compacted() {
         let d = tmp("compact");
-        let (mut g, _) = ReplayGuard::persistent(&d, 30, 100_000, 1000, false).unwrap();
+        let (mut g, _) = ReplayGuard::persistent(&d, 30, 100_000, 900).unwrap();
         for i in 0..3000u64 {
             let now = 1000 + i / 10;
             g.check("k", &format!("nonce-{i:016}"), now, now).unwrap();

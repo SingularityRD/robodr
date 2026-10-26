@@ -693,19 +693,13 @@ impl ControlPlane {
         engine.stats.journal_damaged = st.journal_damaged as u64;
         engine.refuse_ids(lost, st.refusing_new_request_ids.clone());
         // The replay store: fenced if it cannot be trusted.
-        let (replay, rload) = ReplayGuard::persistent(
-            dir,
-            spec.skew_s,
-            auth::MAX_NONCES,
-            now_s,
-            !st.journal_created,
-        )
-        .map_err(|e| {
-            format!(
-                "control_plane.state_dir: {}: {e}",
-                dir.join(auth::NONCE_JOURNAL).display()
-            )
-        })?;
+        let (replay, rload) = ReplayGuard::persistent(dir, spec.skew_s, auth::MAX_NONCES, now_s)
+            .map_err(|e| {
+                format!(
+                    "control_plane.state_dir: {}: {e}",
+                    dir.join(auth::NONCE_JOURNAL).display()
+                )
+            })?;
         st.replay = rload;
         // Evidence exports.
         let evidence = match &spec.evidence {

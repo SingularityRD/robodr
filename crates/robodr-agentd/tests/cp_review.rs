@@ -212,13 +212,14 @@ fn nonce_journal_tail_damage_fences_the_store() {
     use robodr_agentd::control::auth::{AuthFailure, ReplayGuard, MAX_NONCES, NONCE_JOURNAL};
     let dir = tmp("nonces");
     let now = 1_800_000_000;
-    let (mut g, _) = ReplayGuard::persistent(&dir, 30, MAX_NONCES, now, false).unwrap();
+    drop(ReplayGuard::persistent(&dir, 30, MAX_NONCES, now - 3600).unwrap());
+    let (mut g, _) = ReplayGuard::persistent(&dir, 30, MAX_NONCES, now).unwrap();
     for n in 0..3 {
         g.check("soc-1", &format!("nonce-{n}"), now, now).unwrap();
     }
     drop(g);
     corrupt_last_lines(&dir.join(NONCE_JOURNAL), 2);
-    let (mut g, load) = ReplayGuard::persistent(&dir, 30, MAX_NONCES, now + 1, true).unwrap();
+    let (mut g, load) = ReplayGuard::persistent(&dir, 30, MAX_NONCES, now + 1).unwrap();
     assert!(load.damaged >= 2, "{load:?}");
     assert!(load.fence.is_some(), "{load:?}");
     for n in 0..3 {
@@ -275,4 +276,85 @@ fn unreconciled_request_ids_are_refused() {
     );
     assert_eq!(d.body["duplicate"], true, "{}", d.body);
     assert_eq!(h.notes.len(), 1);
+}
+
+/// Review finding 5: the replay fence must cover every timestamp that may
+/// have been accepted before: (a) up to now + skew, not now; (b) whenever
+/// the nonce journal had to be created (a wiped state directory looks
+/// like a first install); (c) when the wall clock went back below the
+/// persisted high-water mark (entries dropped while it was ahead).
+#[test]
+fn the_replay_fence_covers_the_window_creation_and_clock_steps() {
+    use robodr_agentd::control::auth::{AuthFailure, ReplayGuard, MAX_NONCES, NONCE_JOURNAL};
+    let skew = 30;
+    let t = 1_800_000_000u64;
+    // (b) + (a): a created journal fences up to now + skew.
+    let dir = tmp("fence-created");
+    let (mut g, load) = ReplayGuard::persistent(&dir, skew, MAX_NONCES, t).unwrap();
+    assert!(load.created);
+    assert_eq!(load.fence, Some(t + skew), "{load:?}");
+    assert_eq!(
+        g.check("soc-1", "n-future", t + skew, t),
+        Err(AuthFailure::Fenced),
+        "a request signed up to skew ahead may have been seen before the wipe"
+    );
+    assert_eq!(g.check("soc-1", "n-fresh", t + skew + 1, t + 1), Ok(()));
+    drop(g);
+    // (a) on damage too.
+    let p = dir.join(NONCE_JOURNAL);
+    let mut text = std::fs::read(&p).unwrap();
+    let mid = text.iter().position(|b| *b == b'\n').unwrap() + 70;
+    text[mid] ^= 1;
+    std::fs::write(&p, &text).unwrap();
+    let (_, load) = ReplayGuard::persistent(&dir, skew, MAX_NONCES, t + 2).unwrap();
+    assert_eq!(load.fence, Some(t + 2 + skew), "{load:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // (c) across a restart: a nonce accepted at t, dropped (expired) while
+    // the clock read t + 100, replayed after the clock went back to t.
+    let dir = tmp("fence-clock");
+    let (g, _) = ReplayGuard::persistent(&dir, skew, MAX_NONCES, t - 3600).unwrap();
+    drop(g);
+    let (mut g, load) = ReplayGuard::persistent(&dir, skew, MAX_NONCES, t).unwrap();
+    assert_eq!(load.fence, None, "{load:?}");
+    g.check("soc-1", "n-1", t, t).unwrap();
+    drop(g);
+    let (g, load) = ReplayGuard::persistent(&dir, skew, MAX_NONCES, t + 100).unwrap();
+    assert_eq!((load.expired, load.fence), (1, None), "{load:?}");
+    drop(g);
+    let (mut g, load) = ReplayGuard::persistent(&dir, skew, MAX_NONCES, t).unwrap();
+    assert_eq!(load.fence, Some(t + 100 + skew), "{load:?}");
+    assert_eq!(
+        g.check("soc-1", "n-1", t, t),
+        Err(AuthFailure::Fenced),
+        "replayed after the clock went back"
+    );
+    drop(g);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // (c) while running: pairs dropped (cache full) while the clock read
+    // t + 100, then the clock steps back to t.
+    let dir = tmp("fence-run");
+    let (g, _) = ReplayGuard::persistent(&dir, skew, 2, t - 3600).unwrap();
+    drop(g);
+    let (mut g, _) = ReplayGuard::persistent(&dir, skew, 2, t).unwrap();
+    g.check("soc-1", "n-a", t, t).unwrap();
+    g.check("soc-1", "n-b", t, t).unwrap();
+    g.check("soc-1", "n-c", t + 100, t + 100).unwrap();
+    assert_eq!(
+        g.check("soc-1", "n-a", t, t),
+        Err(AuthFailure::Fenced),
+        "replayed after the clock went back while running"
+    );
+    assert_eq!(g.fence(), Some(t + 100 + skew));
+    // A step back with nothing dropped since is harmless (no fence).
+    let dir2 = tmp("fence-run2");
+    let (g, _) = ReplayGuard::persistent(&dir2, skew, MAX_NONCES, t - 3600).unwrap();
+    drop(g);
+    let (mut g, _) = ReplayGuard::persistent(&dir2, skew, MAX_NONCES, t + 1).unwrap();
+    g.check("soc-1", "n-x", t + 1, t + 1).unwrap();
+    assert_eq!(g.check("soc-1", "n-y", t, t), Ok(()));
+    assert_eq!(g.fence(), None);
+    let _ = std::fs::remove_dir_all(&dir2);
+    let _ = std::fs::remove_dir_all(&dir);
 }

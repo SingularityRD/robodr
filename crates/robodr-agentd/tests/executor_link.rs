@@ -387,6 +387,22 @@ fn state_dir(s: &Setup) -> PathBuf {
     let d = s.dir.join("cp-state");
     std::fs::create_dir_all(&d).unwrap();
     std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // A replay store from an earlier run (an hour ago): a store created at
+    // start is fenced for the clock skew (CP review finding 5).
+    let ago = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 3600;
+    drop(
+        robodr_agentd::control::auth::ReplayGuard::persistent(
+            &d,
+            30,
+            robodr_agentd::control::auth::MAX_NONCES,
+            ago,
+        )
+        .unwrap(),
+    );
     d
 }
 
