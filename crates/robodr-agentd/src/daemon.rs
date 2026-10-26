@@ -181,7 +181,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use robodr_agent::{
-    Agent, AgentConfig, AgentStats, Detector, Finished, FirewallSettings, MonitorSettings, Outcome,
+    Agent, AgentConfig, AgentStats, Detector, Finished, FirewallSettings, JointInput,
+    MonitorSettings, Outcome,
 };
 use robodr_blackbox::{Clock, RecorderConfig, SystemClock, TimeSource, Timestamp};
 use robodr_correlate::{CorrelatedFinding, Correlator, EntityKind, Limits, Signal};
@@ -252,6 +253,9 @@ pub fn effective_state(status: &serde_json::Value, now_mono_ms: u64, boot_id: &s
 pub struct DaemonStats {
     pub datagrams: u64,
     pub events: u64,
+    /// Decoded low-level joint frames handed to the agent's joint firewall
+    /// (with their command; also counted in `motion_events`).
+    pub joint_frames: u64,
     /// Motion commands / feedback decoded from datagrams and handed to the
     /// agent.
     pub motion_events: u64,
@@ -645,9 +649,23 @@ impl<'a> Daemon<'a> {
         acfg.data_source = cfg.findings.data_source.clone();
         match (&cfg.firewall, validated) {
             (Some(fw), true) => {
-                let mut fs =
-                    FirewallSettings::from_profile(&acfg.profile, &fw.allow, &fw.max_angular)
-                        .map_err(DaemonError::Agent)?;
+                // Low-level joint channels (Unitree LowCmd) come with the
+                // file's platform (morphology, hold time, ...).
+                let joint = r
+                    .firewall_joint
+                    .as_ref()
+                    .map(|fc| fc.joint_channels.clone())
+                    .unwrap_or_default();
+                let mut fs = FirewallSettings::from_profile_and_joints(
+                    &acfg.profile,
+                    &fw.allow,
+                    &fw.max_angular,
+                    joint,
+                )
+                .map_err(DaemonError::Agent)?;
+                if let Some(fc) = &r.firewall_joint {
+                    fs.platform = fc.platform;
+                }
                 // Not inline: verdicts are recorded would-haves only.
                 fs.platform.fail_behaviour = FailBehaviour::PassThroughObserveOnly;
                 acfg.firewall = Some(fs);
@@ -1135,8 +1153,11 @@ impl<'a> Daemon<'a> {
                 self.feed_findings(fed);
                 self.sync_identities();
                 self.sensor_findings(out.findings);
+                let captured_ns = d
+                    .captured_at
+                    .map(|t| u64::try_from(t.as_nanos()).unwrap_or(u64::MAX));
                 for s in out.motion {
-                    self.motion_sample(s);
+                    self.motion_sample(s, captured_ns.unwrap_or(capture_ns));
                 }
             }
             Payload::Safety(report) => {
@@ -1191,16 +1212,33 @@ impl<'a> Daemon<'a> {
     /// source-mismatched; the pipeline already raised the finding) loses its
     /// writer GUID first: the firewall model then sees an unknown source, so
     /// a GUID claimed by a spoofer never authorises a command.
-    fn motion_sample(&mut self, mut s: MotionSample) {
+    ///
+    /// A decoded low-level joint frame (Unitree `LowCmd`, ...) goes with its
+    /// command to the agent's joint firewall (recording-only, like every
+    /// verdict here), stamped `joint_stamp_ns`: the datagram's capture
+    /// time, so the firewall's rate / gap checks see the real inter-arrival
+    /// times, not the daemon's processing times.
+    fn motion_sample(&mut self, mut s: MotionSample, joint_stamp_ns: u64) {
         self.stats.motion_events += 1;
         if s.attribution.is_refused() {
             if let RobotEvent::MotionCommand(c) = &mut s.event {
                 c.source_guid = None;
             }
         }
+        let joint = s.joint.and_then(|j| {
+            Some(JointInput {
+                frame: joint_frame(&j)?,
+                stamp_ns: joint_stamp_ns,
+            })
+        });
+        if joint.is_some() {
+            self.stats.joint_frames += 1;
+        }
         let safety = self.safety();
         let now = self.clock.now();
-        let outs = self.agent.handle(now, &s.event, safety);
+        let outs = self
+            .agent
+            .handle_with_joint(now, &s.event, joint.as_ref(), safety);
         for o in outs {
             self.emit(o);
         }
@@ -2160,4 +2198,34 @@ impl cp_api::Host for Daemon<'_> {
             }
         }
     }
+}
+
+/// A decoded Unitree joint command frame as the Motion Firewall's
+/// [`robodr_firewall::JointFrame`]: every slot on the wire (mode octet via
+/// `MotorMode::from_u8`: any non-zero mode is enabled), the decoder's CRC
+/// verdict and the hg `LowCmd`'s `mode_pr` / `mode_machine`. `None` only for
+/// a frame wider than the firewall's `MAX_MOTORS` (35, the widest Unitree
+/// layout), which the decoder never produces: such a frame is not checked
+/// (and counted as a missing joint frame by the agent) rather than cut.
+pub fn joint_frame(
+    j: &robodr_ros2_pipeline::JointCommandSample,
+) -> Option<robodr_firewall::JointFrame> {
+    use robodr_firewall::{JointFrame, MotorCmd, MotorMode};
+    let motors: Vec<MotorCmd> = j
+        .frame
+        .as_slice()
+        .iter()
+        .map(|m| MotorCmd {
+            mode: MotorMode::from_u8(m.mode),
+            q: f64::from(m.q),
+            dq: f64::from(m.dq),
+            tau: f64::from(m.tau),
+            kp: f64::from(m.kp),
+            kd: f64::from(m.kd),
+        })
+        .collect();
+    let mut f = JointFrame::from_slice(&motors, j.crc_ok)?;
+    f.mode_pr = j.mode_pr;
+    f.mode_machine = j.mode_machine;
+    Some(f)
 }

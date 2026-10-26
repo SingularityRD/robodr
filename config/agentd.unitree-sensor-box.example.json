@@ -1,0 +1,29 @@
+{
+  "robot": { "id": "unitree-go1-001", "site": "site-a", "model": "unitree-go1", "robot_model": "Go1" },
+  "sensor": {
+    "profile_path": "/etc/robodr/profile.json",
+    "listen_spdp": false,
+    "capture": { "enabled": true, "interfaces": ["eth1"] },
+    "unitree_legacy": {
+      "enabled": true,
+      "ports": [8007, 8080, 8082, 8090],
+      "command_senders": ["192.168.123.15"],
+      "robot_addresses": ["192.168.123.10", "192.168.123.161"]
+    },
+    "profile_trust": {
+      "trusted_keys": "/etc/robodr/profile-trust.json",
+      "state_file": "/var/lib/robodr/profile-state/agentd.json",
+      "expect_platform": "unitree-go1",
+      "expect_unit_id": "unitree-go1-001"
+    }
+  },
+  "policy_path": "/etc/robodr/response-policy.json",
+  "blackbox": {
+    "dir": "/var/lib/robodr/blackbox/agentd",
+    "key_file": "/run/credentials/robodr-agentd.service/blackbox.key"
+  },
+  "spool": { "dir": "/var/lib/robodr/spool/agentd" },
+  "context": { "safety_state": "unknown", "control": "teleop" },
+  "correlation": { "enabled": true, "include_default_rules": true },
+  "daemon": { "tick_ms": 1000, "heartbeat_ms": 10000, "silence_ms": 30000 }
+}

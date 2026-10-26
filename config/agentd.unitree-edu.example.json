@@ -1,0 +1,32 @@
+{
+  "robot": { "id": "unitree-g1-001", "site": "site-a", "model": "unitree-g1-edu", "robot_model": "G1" },
+  "sensor": {
+    "profile_path": "/etc/robodr/profile.json",
+    "listen_spdp": false,
+    "capture": { "enabled": true, "interfaces": ["eth0"] },
+    "profile_trust": {
+      "trusted_keys": "/etc/robodr/profile-trust.json",
+      "state_file": "/var/lib/robodr/profile-state/agentd.json",
+      "expect_platform": "unitree-g1",
+      "expect_unit_id": "unitree-g1-001"
+    }
+  },
+  "policy_path": "/etc/robodr/response-policy.json",
+  "blackbox": {
+    "dir": "/var/lib/robodr/blackbox/agentd",
+    "key_file": "/run/credentials/robodr-agentd.service/blackbox.key"
+  },
+  "spool": { "dir": "/var/lib/robodr/spool/agentd" },
+  "context": { "safety_state": "unknown", "control": "autonomous" },
+  "firewall": {
+    "joint_config": "/etc/robodr/firewall.json",
+    "max_angular": {
+      "/api/sport/request": 1.0,
+      "/api/arm/request": 0.0,
+      "/api/agv/request": 0.5,
+      "/api/motion_switcher/request": 0.0
+    }
+  },
+  "correlation": { "enabled": true, "include_default_rules": true },
+  "daemon": { "tick_ms": 1000, "heartbeat_ms": 10000, "silence_ms": 30000 }
+}

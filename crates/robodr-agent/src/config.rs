@@ -19,7 +19,7 @@ use std::fmt;
 
 use robodr_blackbox::RecorderConfig;
 use robodr_events::profile::{Profile, ProfileError};
-use robodr_firewall::{ChannelKind, ChannelSpec, PlatformConfig};
+use robodr_firewall::{ChannelKind, ChannelSpec, JointChannelSpec, PlatformConfig};
 use robodr_motion::{FeedbackSource, MonitorConfig};
 use robodr_ocsf::{AttestationStatus, RobotInfo};
 use robodr_responder::{OperationalContext, PolicyError, ResponsePolicy};
@@ -245,15 +245,24 @@ impl MonitorSettings {
 pub struct FirewallSettings {
     pub platform: PlatformConfig,
     pub channels: BTreeMap<String, ChannelSpec>,
+    /// Low-level joint channels (Unitree `LowCmd`), checked frame by frame
+    /// with `Firewall::check_joint` when a decoded frame accompanies the
+    /// command ([`crate::Agent::handle_with_joint`]). A channel here is not
+    /// in `channels` ([`FirewallSettings::with_joint_channels`]). Empty by
+    /// default.
+    pub joint_channels: BTreeMap<String, JointChannelSpec>,
 }
 
 impl FirewallSettings {
     /// One spec per envelope channel of `profile`, with default limits
     /// (the envelope itself, 2x hard-reject factor, 200 ms max age).
     ///
-    /// Channel kind: `Twist` if the envelope constrains linear speed,
-    /// otherwise `Joints { count: 1 }` (a `MotionCommand` carries only the
-    /// max joint speed, see [`crate::agent`]). Allowed sources come from
+    /// Channel kind: `Joints { count: 1 }` if the envelope bounds joint
+    /// speed and allows no linear speed (no `max_linear_speed`, or `0`: the
+    /// learner bounds a dimension a joint channel never exercised at 0 =
+    /// deny), otherwise `Twist` (a `MotionCommand` carries only the max joint
+    /// speed, see [`crate::agent`]). A linear command on a joint channel is
+    /// a kind mismatch, so the `0` case still fails closed. Allowed sources come from
     /// `allowed[channel]`; a channel without an entry allows **every
     /// participant in the profile** — permissive, meant for demos and
     /// replays. Production must list the real writer GUIDs.
@@ -270,12 +279,30 @@ impl FirewallSettings {
         allowed: &BTreeMap<String, Vec<String>>,
         max_angular: &BTreeMap<String, f64>,
     ) -> Result<Self, AgentError> {
+        Self::from_profile_and_joints(profile, allowed, max_angular, BTreeMap::new())
+    }
+
+    /// [`FirewallSettings::from_profile`] for the profile's channels that
+    /// are not in `joint`, plus `joint` as low-level joint channels (see
+    /// [`FirewallSettings::with_joint_channels`]). A joint channel needs no
+    /// `max_angular` (and may not have one).
+    pub fn from_profile_and_joints(
+        profile: &Profile,
+        allowed: &BTreeMap<String, Vec<String>>,
+        max_angular: &BTreeMap<String, f64>,
+        joint: BTreeMap<String, JointChannelSpec>,
+    ) -> Result<Self, AgentError> {
         let mut channels = BTreeMap::new();
         for (name, env) in &profile.motion_envelopes {
-            let kind = if env.max_linear_speed.is_some() || env.max_joint_speed.is_none() {
-                ChannelKind::Twist
-            } else {
+            if joint.contains_key(name) {
+                continue;
+            }
+            let joint_only =
+                env.max_joint_speed.is_some() && env.max_linear_speed.is_none_or(|v| v == 0.0);
+            let kind = if joint_only {
                 ChannelKind::Joints { count: 1 }
+            } else {
+                ChannelKind::Twist
             };
             let allowed_sources = allowed
                 .get(name)
@@ -299,6 +326,11 @@ impl FirewallSettings {
                 },
             );
         }
+        if let Some(j) = max_angular.keys().find(|k| joint.contains_key(*k)) {
+            return Err(AgentError::Config(format!(
+                "firewall max_angular_speed given for {j:?}, which is a low-level joint channel"
+            )));
+        }
         if let Some(extra) = max_angular
             .keys()
             .find(|k| !matches!(channels.get(*k), Some(c) if c.kind == ChannelKind::Twist))
@@ -311,9 +343,46 @@ impl FirewallSettings {
         let fs = Self {
             platform: PlatformConfig::default(),
             channels,
+            joint_channels: BTreeMap::new(),
         };
         fs.validate().map_err(AgentError::Config)?;
-        Ok(fs)
+        if joint.is_empty() {
+            Ok(fs)
+        } else {
+            fs.with_joint_channels(profile, joint, max_angular)
+        }
+    }
+
+    /// Check `joint` channels with the low-level joint-frame firewall
+    /// instead of the twist / joint-velocity model: each is removed from
+    /// [`FirewallSettings::channels`] (a channel has one kind). Every joint
+    /// channel must be a profiled motion channel (the envelope's
+    /// `max_joint_speed` tightens its `dq_max`), and a twist-only setting
+    /// for it (`max_angular`) is a configuration error, as a typo would be.
+    pub fn with_joint_channels(
+        mut self,
+        profile: &Profile,
+        joint: BTreeMap<String, JointChannelSpec>,
+        max_angular: &BTreeMap<String, f64>,
+    ) -> Result<Self, AgentError> {
+        for name in joint.keys() {
+            if !profile.motion_envelopes.contains_key(name) {
+                return Err(AgentError::Config(format!(
+                    "firewall joint channel {name:?} is not a profiled motion channel \
+                     (motion_envelopes)"
+                )));
+            }
+            if max_angular.contains_key(name) {
+                return Err(AgentError::Config(format!(
+                    "firewall max_angular_speed given for {name:?}, which is a low-level joint \
+                     channel"
+                )));
+            }
+            self.channels.remove(name);
+        }
+        self.joint_channels = joint;
+        self.validate().map_err(AgentError::Config)?;
+        Ok(self)
     }
 
     /// Refuse limits the firewall would accept but that disable protection:
@@ -323,6 +392,16 @@ impl FirewallSettings {
     pub fn validate(&self) -> Result<(), String> {
         if self.platform.event_capacity == 0 {
             return Err("firewall event_capacity must be >= 1".into());
+        }
+        if let Some(dup) = self
+            .joint_channels
+            .keys()
+            .find(|k| self.channels.contains_key(*k))
+        {
+            return Err(format!(
+                "firewall channel {dup:?} is both a twist / joint-velocity and a low-level joint \
+                 channel"
+            ));
         }
         for (name, c) in &self.channels {
             let limits = [

@@ -153,7 +153,8 @@ pub struct FindingOutput {
 /// Summary of one Motion Firewall verdict, as recorded in the black box.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FirewallVerdictRecord {
-    /// Always `robodr.firewall_verdict`.
+    /// `robodr.firewall_verdict` (twist / joint-velocity command) or
+    /// `robodr.firewall_joint_verdict` (low-level joint frame).
     pub kind: &'static str,
     pub channel: String,
     pub source_guid: Option<String>,
@@ -172,6 +173,25 @@ pub struct FirewallVerdictRecord {
     pub output_speed: Option<f64>,
     /// Whether the firewall was enforcing (profile locked, not pass-through).
     pub enforcing: bool,
+    /// For a low-level joint frame (`kind` = `robodr.firewall_joint_verdict`,
+    /// limit reasons `position` / `velocity` / `torque` / `gain` / `step` /
+    /// `pd_torque`, `output_speed` = max |dq| over output slots with
+    /// `kd != 0`): the frame-level facts. Absent for twist verdicts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub joint: Option<JointVerdictDetail>,
+}
+
+/// Frame-level facts of a joint verdict ([`FirewallVerdictRecord::joint`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct JointVerdictDetail {
+    /// Motor slots in the frame.
+    pub slots: usize,
+    /// The decoder's CRC verdict.
+    pub crc_ok: Option<bool>,
+    pub mode_pr: Option<u8>,
+    pub mode_machine: Option<u8>,
+    /// The joint firewall's `now` / frame stamp, ns.
+    pub stamp_ns: u64,
 }
 
 impl FirewallVerdictRecord {

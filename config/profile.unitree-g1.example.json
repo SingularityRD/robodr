@@ -1,0 +1,103 @@
+{
+  "model": "unitree-g1-EXAMPLE-replace-with-OEM-data",
+  "locked": false,
+  "participants": [
+    "0123456789abcdef01234567"
+  ],
+  "writer_topics": [
+    "/api/agv/request",
+    "/api/agv/response",
+    "/api/arm/request",
+    "/api/arm/response",
+    "/api/motion_switcher/request",
+    "/api/motion_switcher/response",
+    "/api/sport/request",
+    "/api/sport/response",
+    "/arm_sdk",
+    "/dex3/left/cmd",
+    "/dex3/left/state",
+    "/dex3/right/cmd",
+    "/dex3/right/state",
+    "/hand_sdk",
+    "/lf/dex3/left/state",
+    "/lf/dex3/right/state",
+    "/lowcmd",
+    "/lowstate",
+    "/secondary_imu",
+    "/user_lowcmd",
+    "/waistpitchcmd",
+    "/waistpitchstate",
+    "/wirelesscontroller"
+  ],
+  "motion_envelopes": {
+    "/api/agv/request": {
+      "max_linear_speed": 0.5,
+      "max_joint_speed": null
+    },
+    "/api/arm/request": {
+      "max_linear_speed": 0.0,
+      "max_joint_speed": null
+    },
+    "/api/motion_switcher/request": {
+      "max_linear_speed": 0.0,
+      "max_joint_speed": null
+    },
+    "/api/sport/request": {
+      "max_linear_speed": 1.0,
+      "max_joint_speed": null
+    },
+    "/arm_sdk": {
+      "max_linear_speed": null,
+      "max_joint_speed": 37.0,
+      "max_joint_torque": 25.0,
+      "max_joint_kp": 300.0,
+      "max_joint_position_step": 0.15
+    },
+    "/dex3/left/cmd": {
+      "max_linear_speed": null,
+      "max_joint_speed": 10.0,
+      "max_joint_torque": 2.0,
+      "max_joint_kp": 2.0,
+      "max_joint_position_step": 0.2
+    },
+    "/dex3/right/cmd": {
+      "max_linear_speed": null,
+      "max_joint_speed": 10.0,
+      "max_joint_torque": 2.0,
+      "max_joint_kp": 2.0,
+      "max_joint_position_step": 0.2
+    },
+    "/hand_sdk": {
+      "max_linear_speed": null,
+      "max_joint_speed": 10.0,
+      "max_joint_torque": 5.0,
+      "max_joint_kp": 10.0,
+      "max_joint_position_step": 0.2
+    },
+    "/lowcmd": {
+      "max_linear_speed": null,
+      "max_joint_speed": 37.0,
+      "max_joint_torque": 139.0,
+      "max_joint_kp": 300.0,
+      "max_joint_position_step": 0.15
+    },
+    "/user_lowcmd": {
+      "max_linear_speed": null,
+      "max_joint_speed": 37.0,
+      "max_joint_torque": 139.0,
+      "max_joint_kp": 300.0,
+      "max_joint_position_step": 0.15
+    },
+    "/waistpitchcmd": {
+      "max_linear_speed": null,
+      "max_joint_speed": 10.0,
+      "max_joint_torque": 50.0,
+      "max_joint_kp": 500.0,
+      "max_joint_position_step": 0.1
+    }
+  },
+  "services": [],
+  "actions": [],
+  "reader_topics": [],
+  "raw_dds_topics": []
+}

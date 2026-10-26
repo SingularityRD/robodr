@@ -1,0 +1,40 @@
+{
+  "model": "unitree-r1-EXAMPLE-replace-with-OEM-data",
+  "locked": false,
+  "participants": [
+    "0123456789abcdef01234567"
+  ],
+  "writer_topics": [
+    "/api/sport/request",
+    "/api/sport/response",
+    "/arm_sdk",
+    "/lowcmd",
+    "/lowstate",
+    "/secondary_imu",
+    "/wirelesscontroller"
+  ],
+  "motion_envelopes": {
+    "/api/sport/request": {
+      "max_linear_speed": 1.0,
+      "max_joint_speed": null
+    },
+    "/arm_sdk": {
+      "max_linear_speed": null,
+      "max_joint_speed": 30.0,
+      "max_joint_torque": 40.0,
+      "max_joint_kp": 300.0,
+      "max_joint_position_step": 0.15
+    },
+    "/lowcmd": {
+      "max_linear_speed": null,
+      "max_joint_speed": 30.0,
+      "max_joint_torque": 120.0,
+      "max_joint_kp": 300.0,
+      "max_joint_position_step": 0.15
+    }
+  },
+  "services": [],
+  "actions": [],
+  "reader_topics": [],
+  "raw_dds_topics": []
+}

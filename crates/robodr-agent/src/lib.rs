@@ -61,8 +61,8 @@ pub mod outcome;
 pub mod replay;
 
 pub use agent::{
-    guard, ocsf_safety, source_key, Agent, AgentStats, Finished, BLACKBOX_REOPEN_BACKOFF_NS,
-    MAX_RETAINED_FAULTS,
+    guard, ocsf_safety, source_key, Agent, AgentStats, Finished, JointInput,
+    BLACKBOX_REOPEN_BACKOFF_NS, MAX_RETAINED_FAULTS,
 };
 pub use clock::{
     Clock, ClockAnomaly, ReplayClock, TimeGuard, TimeSource, Timestamp,
@@ -76,5 +76,5 @@ pub use evidence::{finding_refs, resolve_links, verify_blackbox, LinkReport};
 pub use executor::{ExecutionRequest, Executor, LoggingExecutor, NoopExecutor};
 pub use outcome::{
     AgentFault, Detector, Disposition, EvidenceLinks, FaultKind, FindingOutput,
-    FirewallVerdictRecord, Outcome,
+    FirewallVerdictRecord, JointVerdictDetail, Outcome,
 };
