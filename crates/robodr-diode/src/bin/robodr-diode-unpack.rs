@@ -4,6 +4,9 @@
 //! per-entry I/O error (listed in the report; the run went on),
 //! 1 error, 2 usage.
 
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+
 use robodr_diode::cli;
 use robodr_diode::unpack::{ImportConfig, Importer};
 use std::path::{Path, PathBuf};

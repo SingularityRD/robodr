@@ -1921,14 +1921,10 @@ pub fn read_boot_id() -> String {
         .unwrap_or_else(|| "unknown-boot".into())
 }
 
-extern "C" {
-    fn geteuid() -> u32;
-}
-
-/// The effective uid of this process.
+/// The effective uid of this process (the one FFI declaration lives in
+/// `robodr_blackbox::keys`; agentd itself needs no `unsafe` for it).
 pub fn effective_uid() -> u32 {
-    // SAFETY: geteuid takes no arguments, cannot fail and touches no memory.
-    unsafe { geteuid() }
+    robodr_blackbox::keys::effective_uid()
 }
 
 /// [`read_key_material`] without the key id.

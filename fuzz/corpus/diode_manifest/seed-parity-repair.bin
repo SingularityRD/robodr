@@ -1,0 +1,52 @@
+{
+  "format": "robodr-diode/1",
+  "contract_version": "2.1.0",
+  "unit_id": "ugv-007",
+  "batch_seq": 1,
+  "prev_batch_hash": null,
+  "created_at": "2026-09-21T14:15:00.000Z",
+  "created_at_ms": 1790000100000,
+  "key_id": "diode-ugv-007",
+  "algorithm": "hmac-sha256",
+  "finding_count": 2,
+  "first_time": 1790000000000,
+  "last_time": 1790000000001,
+  "files": [
+    {
+      "name": "findings.jsonl",
+      "kind": "findings",
+      "size": 12486,
+      "sha256": "17508f5b2ad5da46f74cd8d2a30b2c8944ed4889ab7a2ec233d1eac5b45f849d"
+    },
+    {
+      "name": "bundle-0001.rbbx",
+      "kind": "blackbox_bundle",
+      "size": 1100,
+      "sha256": "61931865ebebd425a510b6b85b49f6dc4f89f79e7843e4be0d27c299f45f8af0"
+    },
+    {
+      "name": "bundle-0002.rbbx",
+      "kind": "blackbox_bundle",
+      "size": 923,
+      "sha256": "95434162a087be7ed8210c6504614bf3b11909434cc29c39412982bf321946a5"
+    },
+    {
+      "name": "parity-01.rbpar",
+      "kind": "parity",
+      "size": 12800,
+      "sha256": "db5da829d8daad3bdc020656fb0d2914e68f44ffadaaa645267af3f5369ee0ba"
+    },
+    {
+      "name": "parity-02.rbpar",
+      "kind": "parity",
+      "size": 12800,
+      "sha256": "18ff4cccb6d3b886d5f9716297a15d9da93a9b087f17c7295ca610f853768f25"
+    }
+  ],
+  "parity": {
+    "scheme": "rs-gf256-0x11d/1",
+    "data_shards": 3,
+    "parity_shards": 2,
+    "shard_size": 512
+  }
+}

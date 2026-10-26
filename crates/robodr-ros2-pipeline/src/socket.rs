@@ -52,9 +52,11 @@ pub fn bind_spdp_multicast(
         target_arch = "riscv64"
     )
 ))]
+// FFI: std cannot set `SO_REUSEADDR` before `bind` (module docs).
+#[allow(unsafe_code)]
 pub fn bind_reuseaddr(addr: SocketAddrV4) -> io::Result<UdpSocket> {
     use std::ffi::{c_int, c_void};
-    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     // asm-generic values, identical on x86_64, aarch64 and riscv64 (the
     // architectures Pulsar's bpf-builder supports).
@@ -72,6 +74,7 @@ pub fn bind_reuseaddr(addr: SocketAddrV4) -> io::Result<UdpSocket> {
         sin_addr: u32,
         sin_zero: [u8; 8],
     }
+    const _: () = assert!(std::mem::size_of::<SockAddrIn>() == 16);
 
     extern "C" {
         fn socket(domain: c_int, ty: c_int, protocol: c_int) -> c_int;
@@ -85,20 +88,24 @@ pub fn bind_reuseaddr(addr: SocketAddrV4) -> io::Result<UdpSocket> {
         fn bind(fd: c_int, addr: *const SockAddrIn, len: u32) -> c_int;
     }
 
-    // SAFETY: plain syscall wrapper; the result is checked before use.
+    // SAFETY: `socket(2)` takes three integers and touches no caller
+    // memory; a negative result is handled before the value is used.
     let fd = unsafe { socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: `fd` is a freshly created, valid descriptor we exclusively own;
-    // `OwnedFd` closes it on every early return below.
+    // SAFETY: `fd` is a freshly created, valid descriptor that nothing else
+    // owns; `OwnedFd` takes sole ownership and closes it on every early
+    // return below. Only `owned` is used from here on.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
 
     let one: c_int = 1;
-    // SAFETY: `one` outlives the call and the length matches its type.
+    // SAFETY: `owned` is an open socket; `one` is a live, initialised
+    // `c_int` for the duration of the call and the length passed is exactly
+    // its size, so the kernel reads only those bytes.
     let rc = unsafe {
         setsockopt(
-            fd,
+            owned.as_raw_fd(),
             SOL_SOCKET,
             SO_REUSEADDR,
             (&one as *const c_int).cast(),
@@ -115,8 +122,16 @@ pub fn bind_reuseaddr(addr: SocketAddrV4) -> io::Result<UdpSocket> {
         sin_addr: u32::from_ne_bytes(addr.ip().octets()),
         sin_zero: [0; 8],
     };
-    // SAFETY: `sa` is a valid sockaddr_in and the length matches it.
-    let rc = unsafe { bind(fd, &sa, std::mem::size_of::<SockAddrIn>() as u32) };
+    // SAFETY: `owned` is an open socket; `sa` is a live, initialised
+    // `struct sockaddr_in` (layout asserted above) and the length passed is
+    // exactly its size; the kernel only reads it.
+    let rc = unsafe {
+        bind(
+            owned.as_raw_fd(),
+            &sa,
+            std::mem::size_of::<SockAddrIn>() as u32,
+        )
+    };
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }

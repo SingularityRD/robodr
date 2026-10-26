@@ -5,6 +5,9 @@
 //! Exit codes: 0 ok, 1 error (including "another instance holds the
 //! lock"), 2 usage.
 
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+
 use robodr_diode::cli::{self, MAX_INPUT_FILE};
 use robodr_diode::pack::{PackConfig, Packer};
 use std::path::Path;

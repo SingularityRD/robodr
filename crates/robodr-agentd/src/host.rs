@@ -482,6 +482,8 @@ const SO_PEERCRED: std::ffi::c_int = 17;
 
 /// The connected peer's uid (`SO_PEERCRED`: the credentials of the process
 /// that connected, taken by the kernel at `connect`).
+// FFI: `UnixStream::peer_cred` is still unstable in std.
+#[allow(unsafe_code)]
 pub fn peer_uid(s: &UnixStream) -> io::Result<u32> {
     let mut cred = UCred {
         pid: 0,

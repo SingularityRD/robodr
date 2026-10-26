@@ -64,6 +64,13 @@
 //! See `README.md` in this crate for the threat model and honest limits
 //! (notably: signing keys are files on the unit, not TPM-held).
 
+// S10: `unsafe` is denied crate-wide; each item that needs it (FFI to libc
+// symbols std already links) carries a local `#[allow(unsafe_code)]` and a
+// `// SAFETY:` comment on every block.
+#![deny(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 pub mod cli;
 pub mod fec;
 mod fsutil;

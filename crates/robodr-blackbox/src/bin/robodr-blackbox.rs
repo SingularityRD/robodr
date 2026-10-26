@@ -69,6 +69,9 @@
 //! Secrets are never accepted on the command line (argv is visible to every
 //! process through /proc).
 
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+
 use robodr_blackbox::crypto::to_hex;
 use robodr_blackbox::keys::{public_key_path, KeyFile, Keyring};
 use robodr_blackbox::record::KeyRef;

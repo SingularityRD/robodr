@@ -446,13 +446,13 @@ impl PacketSource for AfPacketSource {
         let (len, addr) = loop {
             let mut addr = SockaddrLl::default();
             let mut alen = size_of::<SockaddrLl>() as u32;
+            let room = &mut self.buf[SLL_HDR_LEN..];
             // SAFETY: `room` (the buffer behind the cooked header) is valid
             // writable memory of `room.len()` bytes;
             // `addr`/`alen` are valid for writes and `alen` holds the size of
             // `addr`, so the kernel writes within bounds. With MSG_TRUNC the
             // return value may exceed `room.len()` but nothing beyond the
             // buffer is written. `fd` is an open socket we own.
-            let room = &mut self.buf[SLL_HDR_LEN..];
             let n = unsafe {
                 sys::recvfrom(
                     self.fd.as_raw_fd(),

@@ -788,6 +788,56 @@ loop is restarted. Its `status.json` carries `updated_mono_ms`, `boot_id` and
 keep-alives), so a hung, still-alive pulsard is not restarted automatically.
 Monitor the findings and heartbeat flow on the fleet side.
 
+#### Crashes and restarts (`panic = "abort"`)
+
+Release binaries are built with `panic = "abort"` (`Cargo.toml`,
+`[profile.release]`): a panic anywhere, in any thread, ends the whole
+process with `SIGABRT` at once. Nothing unwinds, no destructor runs, the
+black box is **not** sealed and no `robodr.agentd_stop` note is written.
+A hung main loop ends the same way: when no `WATCHDOG=1` arrives for
+`WatchdogSec=60s`, systemd sends `WatchdogSignal=` (default `SIGABRT`).
+
+What happens then, for `robodr-agentd`:
+
+| Step | Behaviour |
+|---|---|
+| Exit | Killed by `SIGABRT` (core dump if enabled); systemd records `Result=core-dump` / `signal` (or `watchdog`). |
+| Restart | `Restart=on-failure` restarts it after `RestartSec=5s`. Exit code 2 (configuration error) is never restarted (`RestartPreventExitStatus=2`). |
+| Give up | More than `StartLimitBurst=5` starts in `StartLimitIntervalSec=300` leave the unit **failed**: alert on it (the robot is unwatched, its own operation is unaffected). |
+| Evidence | The black box keeps every record that reached disk; the restarted daemon authenticates the unsealed tail and chains onto the aborted run (a torn tail is handled as for any crash, see `crates/robodr-blackbox/README.md`), and the next graceful stop seals the whole chain. Findings already in the spool stay there. |
+| Status | Until the restart, `status.json` still says `"running": true` with an old `updated_mono_ms`: consumers must treat it as stale (`unknown`), see 6.1. |
+
+The process-level test `crates/robodr-agentd/tests/abort_restart.rs` does
+exactly this with the real binary: record, `SIGABRT`, restart on the same
+state, record, graceful stop, then verify the whole chain end to end and
+both findings in the spool.
+
+The control plane's request journal and replay store (6.4) are fsynced
+before an answer leaves agentd, so a SOC sees the same request states after
+the restart; a request whose executor order was staged but not yet sent
+stays `pending` (the order is dropped, never sent late).
+
+For `robodr-executor` (6.5) a crash or watchdog abort runs the unit's
+`ExecStopPost=robodr-executor stop-cleanup`, which deletes the `inet robodr`
+table: no action stays in force without a process that can revert it.
+`Restart=always` (`RestartSec=2s`, exit code 2 not restarted) brings it
+back, and it reconciles its journal against the table at start (6.5). Only
+a clean `systemctl stop` keeps actions in force for the next start.
+
+Panics are kept out of the daemon's code paths by lint and by fuzzing:
+`robodr-agentd`, `robodr-agent`, `robodr-ros2-pipeline`, `robodr-capture`
+and `robodr-rtps` (and their binaries) deny `unwrap` / `expect` / `panic!` /
+`unreachable!` / `todo!` / `unimplemented!` outside tests, every integer
+division on those paths has a non-zero divisor by construction, and the
+parsers that read bus or file input have libFuzzer targets (`fuzz/`).
+`robodr-executor` (library and binary) denies the same calls; its order
+protocol has no libFuzzer target yet.
+Slice indexing and overflowing arithmetic are not denied by lint (several
+hundred reviewed sites; overflow does not panic in release builds, which do
+not enable `overflow-checks`): they rely on review and fuzzing. Other units
+(`robodr-uplink`, `robodr-spool-export`, `robodr-pulsard`) follow the same
+`Restart=on-failure` rules.
+
 ### 6.2 Pulsar API / CLI
 
 The API socket is `/run/robodr-pulsard/pulsar.sock`, set in `pulsar.toml`.

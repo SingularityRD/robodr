@@ -36,6 +36,23 @@
 //! of these equations form a Vandermonde system in the erased symbols with
 //! distinct nodes `α^(n-1-t)`, which is invertible; its inverse times the
 //! syndrome contributions of the known symbols is the [`Decoder`]'s matrix.
+//!
+//! # Why in-crate (S10 review, R8)
+//!
+//! The parity bytes are part of the signed on-wire batch format
+//! ([`crate::manifest::PARITY_SCHEME`]), so a replacement must produce the
+//! same bytes. The audited general-purpose crates do not:
+//! `reed-solomon-erasure` 6 encodes with a Vandermonde-derived systematic
+//! matrix and `reed-solomon-simd` 3 with the Leopard GF(2^16) FFT code; for
+//! `k = 4, m = 2` and data column `[11, 48, 85, 122]` they give parity
+//! `[26, 89]` and `[142, 154]`, this code (and the BCH-view `reed-solomon`
+//! 0.2.1 crate) `[236, 248]`. Switching would make every parity file already
+//! shipped unrepairable, so the code stays here and is pinned instead:
+//! `tests/fec_oracle.rs` checks the field exhaustively against a table-free
+//! multiplier and the encoder and erasure decoder byte for byte against
+//! `reed-solomon` 0.2.1 (an independent implementation of the same code,
+//! dev-dependency only: unmaintained since 2018, so never shipped), and the
+//! `diode_fec` libFuzzer target (`fuzz/`) runs the same oracle comparison.
 
 use std::fmt;
 

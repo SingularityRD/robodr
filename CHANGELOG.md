@@ -124,6 +124,12 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
     and configuration are re-read per order (L7); purge removes the
     executor journal; a corrupt journal is a High notice (critical
     `journal_reset` event, `executor.journal_resets`, status flag).
+- Fuzzing (S10): seven new libFuzzer targets with std-only smoke tests
+  (`kafka_wire`: libFuzzer only): `cdr_payload` (every CDR decoder),
+  `diode_manifest`, `diode_import` (a whole batch through the importer),
+  `diode_fec` (against an oracle), `correlate_rules`, `safety_feed`,
+  `kafka_wire`; each ran 10 minutes under libFuzzer without a crash
+  (fuzz/README.md).
 - `robodr-uplink` (crate `robodr-export`): producer of the AutoSecOps ingest
   API (`docs/contracts/robodr.ingest-api.md`, contract v1). Inputs as
   `robodr-kafka-publish` (agentd spool on a connected unit or sensor box, or
@@ -601,6 +607,30 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   it with an exact apt version (`scripts/ci-install-clang.sh`); builds
   record `TOOLCHAIN.txt`. docs/BUILD.md "C toolchain": pins, air-gapped
   prerequisites, independent verification.
+- S10 hardening (R8): `robodr-blackbox::crypto` and `robodr-ocsf::hash` now
+  use the audited RustCrypto `sha2` / `hmac` crates (plus `subtle` for the
+  tag compare and `zeroize` for wiping) instead of the in-crate SHA-256 and
+  HMAC-SHA256. Output is byte-identical: differential tests against the old
+  code (kept as test-only oracles) over random inputs, keys and splits, plus
+  NIST CAVP / RFC 4231 / OpenSSL-computed vectors; existing chains, HMAC
+  tags and finding uids verify unchanged. murmur2 (Kafka partitioner) stays
+  in-crate.
+- S10 hardening (R8/R9): `#![forbid(unsafe_code)]` in every crate and
+  binary without `unsafe`; the rest (`blackbox`, `capture`, `diode`,
+  `ros2-pipeline`, `agentd`) deny it crate-wide with a reviewed
+  `#[allow(unsafe_code)]` + `SAFETY` comment per FFI site and
+  `unsafe_op_in_unsafe_fn` denied. The daemon crates (`agentd`, `agent`,
+  `ros2-pipeline`, `capture`, `rtps`) deny `unwrap` / `expect` / `panic!`
+  family calls outside tests; crash and restart behaviour under
+  `panic = "abort"` is documented (docs/OPERATIONS.md) and tested with the
+  real binary (`tests/abort_restart.rs`). The diode's Reed-Solomon code
+  stays in-crate (its parity bytes are on-wire format) and is pinned byte
+  for byte to an independent codec (`tests/fec_oracle.rs`).
+- S10 policy extended to the code merged alongside it: `robodr-executor`
+  (library and binary) forbids `unsafe` and denies the panic-family calls
+  outside tests; `robodr-export` denies `unsafe` crate-wide (its one
+  `flock` FFI site is allowed locally with a `SAFETY` comment) and its
+  binaries forbid it.
 
 - `robodr.ingest` contract v1 draft clarified while implementing the
   producer (no change to a valid request): error codes for every status,
@@ -791,6 +821,11 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Fixed
 
+- `robodr-diode` state lock and `robodr-uplink` state lock: a lock
+  that looks held only because a child forked by another thread still has
+  the descriptor (until it execs) is retried for up to 25 x 10 ms before it
+  is reported held, like the black box's recorder lock; a lock held by
+  another live process is still refused.
 - `robodr-agentd` unix sockets (event input, safety feed, host threats,
   control plane) are no longer briefly connectable with the umask's
   permissions between `bind` and `chmod`: each is bound in a fresh 0700

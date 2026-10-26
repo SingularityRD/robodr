@@ -192,6 +192,9 @@
 //! integer arithmetic (enforced by clippy `deny` lints on the engine module)
 //! and only bounded loops. See the crate README for measured latency.
 
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+
 mod command;
 mod config;
 mod engine;

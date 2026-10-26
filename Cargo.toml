@@ -94,8 +94,18 @@ thiserror = "2"
 # wiped on drop) are its defaults, spelled out. No `rand_core`: seeds come
 # from getrandom(2) via robodr_blackbox::crypto::fill_random.
 ed25519-dalek = { version = "2.1", default-features = false, features = ["fast", "std", "zeroize"] }
-# SHA-512 (the same implementation ed25519-dalek uses internally).
+# SHA-256 / SHA-512 (RustCrypto; the same implementation ed25519-dalek uses
+# internally). Replaces the earlier in-crate SHA-256 of robodr-blackbox and
+# robodr-ocsf (S10, R8).
 sha2 = "0.10"
+# HMAC-SHA256 for the legacy symmetric black-box keys (RustCrypto, same digest
+# 0.10 traits as sha2; replaces the earlier in-crate HMAC).
+hmac = "0.12"
+# Volatile wipe of secrets and of the hasher state above (already in the graph
+# through ed25519-dalek's `zeroize` feature).
+zeroize = "1"
+# Constant-time tag comparison (already in the graph through ed25519-dalek).
+subtle = { version = "2", default-features = false }
 # TLS for robodr-uplink (crates/robodr-export, ingest API client). rustls with
 # the `ring` provider only: no aws-lc-rs (CMake + a large C library), no
 # `logging` (no `log` output of handshake details), TLS 1.3 and 1.2 (rustls

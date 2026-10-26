@@ -54,6 +54,9 @@
 //! See `README.md` in this crate for the policy format and what is not yet
 //! verified (OEM validation, real platform safe-state interfaces).
 
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+
 pub mod action;
 pub mod actions;
 pub mod escalation;

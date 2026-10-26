@@ -107,6 +107,25 @@
 //!   SPAN/TAP captures.
 
 #![deny(unsafe_code)]
+// S10: no implicit unsafe scope in an `unsafe fn`, and every block needs a
+// `// SAFETY:` comment.
+#![deny(unsafe_op_in_unsafe_fn)]
+#![warn(clippy::undocumented_unsafe_blocks)]
+// S10 (R9): release builds use `panic = "abort"`, so any panic kills the
+// daemon (systemd restarts it; docs/OPERATIONS.md, "Crashes and restarts").
+// Non-test code has no unwrap / expect / panic!-family call; slice indexing
+// and arithmetic are left to review and fuzzing (fuzz/README.md).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 
 #[cfg(all(
     target_os = "linux",

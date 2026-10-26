@@ -19,6 +19,17 @@ violated output invariant (documented at the top of its harness file).
 | `firewall_policy` | robodr-agent / robodr-firewall | `profile JSON \0 command bytes` to `strict_from_str`, `FirewallSettings::from_profile`, `Policy::compile`, `Firewall::check` | `crates/robodr-agent/tests/fuzz_smoke.rs` |
 | `pipeline_config` | robodr-ros2-pipeline | sensor `Config` (JSON) to `validate_with`, a `Pipeline` over RTPS fixtures, `/proc/net/route` parsing | `crates/robodr-ros2-pipeline/tests/fuzz_smoke.rs` |
 | `control_plane_request` | robodr-agentd | raw bytes from a control-plane peer (read-step byte + request) to the bounded HTTP parser (`control::http::read_request`, re-encode round trip, read sizes do not matter), `auth::credentials` + signature check, `control::route`, `api::parse_submit` / `parse_revert`, `evidence::parse_export` / `parse_link` | `crates/robodr-agentd/tests/fuzz_smoke.rs` |
+| `cdr_payload` | robodr-cdr | a limits selector + one payload to every `MessageKind` decoder (ROS 2 standard kinds and Unitree), `decode_by_type_name`, the built-in `Registry`, `decode_std` (`std_msgs`), `Encapsulation::parse`, event conversion | `crates/robodr-cdr/tests/fuzz_smoke.rs` |
+| `diode_manifest` | robodr-diode | `MANIFEST.json \0 MANIFEST.sig` to the manifest / signature-file parsers, `check` / `check_import`, `batch_hash`, round trips | `crates/robodr-diode/tests/fuzz_smoke.rs` |
+| `diode_import` | robodr-diode | a flattened batch directory (optionally signed by the harness key) through `Importer::run`: authentication, sequence and file checks, findings / bundles, parity repair, emission | same |
+| `diode_fec` | robodr-diode | Reed-Solomon parameters, data and an erasure mask: encode, erase, rebuild, all against the `reed-solomon` 0.2.1 oracle (dev-only) | same |
+| `correlate_rules` | robodr-correlate | `rules JSON \0 signal records` to `RuleSet::from_json` and a `Correlator` driven by the result (finding invariants) | `crates/robodr-correlate/tests/fuzz_smoke.rs` |
+| `safety_feed` | robodr-agentd | `safety_feed JSON \0 records`: safety-socket lines, RTPS datagrams (through the sensor pipeline, then `SafetyFeed::observe_datagram`), clock steps; "never less conservative than a fresh socket report" | `crates/robodr-agentd/tests/fuzz_smoke.rs` |
+| `kafka_wire` | robodr-export | a selector + body to the Kafka decoders: ApiVersions / Metadata v1-8 / Produce v3-8 responses (decode-encode-decode identity), RecordBatch v2 (CRC fixed up or not), request header + Metadata / Produce requests, wire primitives | none (see below) |
+
+`kafka_wire` has no std-only smoke test: it was added while
+`crates/robodr-export` was being changed by parallel work, so nothing was
+added under that crate; it runs under libFuzzer only (and in CI's fuzz job).
 
 The firewall crate has no file format of its own (and no serde): its policy
 is compiled from the profile JSON the agent parses, so that target and its
@@ -56,28 +67,60 @@ This crate is **not** part of the main workspace: `Cargo.toml` has its own
 `[workspace]` table, so `cargo build --workspace` / `cargo test --workspace`
 at the repo root never touch it and never need nightly or `libfuzzer-sys`.
 
-## Status: libFuzzer not run in the development sandbox
+## Status
 
-`control_plane_request` (added 2026-10-26) has likewise only run under the
-std-only smoke driver: about 90 000 inputs in a 240 s debug run (PRNG seed
-`7`), no panic, no invariant violation. Writing its read-size invariant exposed that
-the HTTP head bound depended on how the peer's bytes were split into reads
-(fixed before the target landed).
+### libFuzzer runs (S10, 2026-10-26)
 
-`libfuzzer-sys` (crates.io) and the nightly toolchain with `cargo-fuzz` were
-unreachable where this was written, so **no target has been run under
-libFuzzer**. What was verified:
+First runs under libFuzzer: `nightly-2026-09-01` (CI's `FUZZ_TOOLCHAIN`),
+`cargo-fuzz` 0.13.1, AddressSanitizer + debug assertions (cargo-fuzz
+defaults), one process per target, `-max_total_time=630 -rss_limit_mb=2560`,
+seeded from `fuzz/corpus/<target>/`, three or four targets in parallel on a
+4-core sandbox (exec/s are shared-CPU figures). **No crash, leak, timeout or
+invariant violation** in any run:
 
-* all 11 targets compile and pass `clippy -D warnings` against a local
-  stand-in for `libfuzzer-sys` that only provides the `fuzz_target!` macro
-  (as a `main` that replays files), and replay their whole seed corpus
-  without a panic or invariant violation;
+| target | runs | exec/s | coverage (edges) | corpus at end |
+|---|---:|---:|---:|---:|
+| `kafka_wire` | 9 281 801 | 14 709 | 1 486 | 689 |
+| `parse_datagram` | 2 599 153 | 4 119 | 1 701 | 1 004 |
+| `diode_manifest` | 2 425 143 | 3 843 | 2 683 | 2 206 |
+| `pcap_reader` | 1 914 399 | 3 033 | 2 136 | 627 |
+| `capture_reassembly` | 1 489 440 | 2 360 | 2 680 | 1 069 |
+| `safety_feed` | 166 347 | 263 | 6 889 | 1 359 |
+| `cdr_payload` | 145 678 | 230 | 3 586 | 381 |
+| `diode_import` | 30 704 | 48 | 7 928 | 712 |
+| `diode_fec` | 28 448 | 45 | 958 | 579 |
+| `correlate_rules` | 7 870 + 19 329 | 12 / 30 | 4 312 | 582 |
+
+`correlate_rules` ran twice: the second run (after capping the signal stream
+at 512 records and dropping a redundant re-validation, which doubled the
+rate) started from the first run's corpus. The slow targets do real work per
+input (`diode_import` writes and imports a whole batch directory;
+`diode_fec` decodes every codeword through the oracle as well), so they need
+longer campaigns than ten minutes: the roadmap's 1 h per target in a nightly
+job and the 24 h acceptance run still stand. The other existing targets
+(`cdr_unitree`, `blackbox_segments`, `ocsf_parse_and_validate`,
+`events_profile`, `commission_*`, `firewall_policy`, `pipeline_config`,
+and `control_plane_request`, which came with control plane v2) have not
+been run under libFuzzer yet (CI's `fuzz` job runs each for 60 s).
+Grown corpora were not committed (README rule: only `cmin`-minimised
+additions).
+
+### Smoke runs
+
+* all targets except `kafka_wire` are compiled and run in `cargo test` by
+  their crate's `tests/fuzz_smoke.rs` (so `clippy -D warnings` covers them);
+  `kafka_wire` compiles warning-free under `cargo fuzz build`;
 * the smoke tests (same harness code) pass in debug in `cargo test`; two
-  longer release runs (2026-10-16, PRNG seeds default and `0x5eed2`, up to
-  2 M inputs or 40-60 s per target, about 26 M inputs in total:
-  `blackbox_segments` 1.0 M, `commission_jsonl` and `ocsf_parse_and_validate`
-  2.0 M each, the others 3 M each) found no panic and no invariant
-  violation.
+  longer release runs of the first 12 targets (2026-10-16, PRNG seeds
+  default and `0x5eed2`, up to 2 M inputs or 40-60 s per target, about 26 M
+  inputs in total: `blackbox_segments` 1.0 M, `commission_jsonl` and
+  `ocsf_parse_and_validate` 2.0 M each, the others 3 M each) found no panic
+  and no invariant violation;
+* `control_plane_request` (added 2026-10-26 with control plane v2): about
+  90 000 inputs in a 240 s debug run of the smoke driver (PRNG seed `7`), no
+  panic, no invariant violation. Writing its read-size invariant exposed
+  that the HTTP head bound depended on how the peer's bytes were split into
+  reads (fixed before the target landed).
 
 The deterministic mutator is not coverage-guided: it finds shallow bugs
 cheaply but is no substitute for libFuzzer runs (CI's `fuzz` job runs every
@@ -150,6 +193,25 @@ All seeds are SYNTHETIC (no real robot data):
   the harness's read-step byte. Written by the `regenerate_seeds` test in
   `crates/robodr-agentd/tests/fuzz_smoke.rs` (`--ignored`); the smoke test
   fails when the committed seeds differ from it.
+* `cdr_payload/`: one payload of each standard ROS 2 kind (Twist,
+  TwistStamped, Odometry, Imu, JointState, JointTrajectory) in CDR LE, CDR BE
+  and D_CDR2 LE, plus `std_msgs` Bool / UInt8 / String; built from the crate's
+  test encoder by `regenerate_payload_seeds` in
+  `crates/robodr-cdr/tests/fuzz_smoke.rs`.
+* `diode_import/`, `diode_manifest/`: real `Packer` output (findings only;
+  findings + bundles with two parity files; the same with a data file missing
+  and the signature left to the harness), by `regenerate_seeds` in
+  `crates/robodr-diode/tests/fuzz_smoke.rs`; `diode_fec/`: two codes
+  (k=4/m=2 and k=31/m=10).
+* `correlate_rules/`: the shipped `rules/default.json` followed by signal
+  streams that make it fire (`regenerate_seeds` in
+  `crates/robodr-correlate/tests/fuzz_smoke.rs`).
+* `safety_feed/`: hand-built SPDP / SEDP / Bool / UInt8 / String / Odometry
+  samples and socket lines, with the built-in and a custom configuration
+  (`regenerate_seeds` in `crates/robodr-agentd/tests/fuzz_smoke.rs`).
+* `kafka_wire/`: responses and requests (one per decoder and version class)
+  written by `fuzz/seedgen/kafka_wire.py` from the layouts the encoders in
+  `robodr-export` use.
 
 Each smoke test also checks its seeds take the success path (pcaps reach the
 RTPS parser, fragments reassemble, chains verify, findings validate, the

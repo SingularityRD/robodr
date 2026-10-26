@@ -1,0 +1,231 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "robot.correlate.coordinated_intrusion",
+      "title": "Coordinated intrusion: unknown participant, foreign motion writer and host process anomaly",
+      "description": "Within 60 s: an unknown DDS participant joined the graph, a writer outside the profile appeared on a motion topic, and a host-side (Pulsar) process anomaly fired. Network and host sensors agree independently; a single one of these may be commissioning noise, all three together are an intrusion reaching for motion authority.",
+      "severity": "critical",
+      "window_secs": 60,
+      "group_by": null,
+      "pattern": {
+        "kind": "co_occurrence",
+        "all_of": [
+          { "rules": ["robot.ros2.unknown_participant"], "domain": "network" },
+          { "rules": ["robot.ros2.unauthorized_motion_writer"], "domain": "network" },
+          {
+            "domain": "host",
+            "rules": [
+              "RoboDR: Interactive shell started on robot controller",
+              "RoboDR: Login shell started on robot controller",
+              "RoboDR: Shell or netcat-style tool opened a network connection",
+              "RoboDR: ROS 2 process connects outside the robot's networks",
+              "RoboDR: Program executed from a temporary directory",
+              "RoboDR: Program executed from a file descriptor or /proc path",
+              "RoboDR: Program executed through a non-canonical path",
+              "RoboDR: Interpreter one-liner executed",
+              "RoboDR: Interactive or stdin-fed Python interpreter started",
+              "RoboDR: Pseudo-terminal wrapper executed on robot controller",
+              "RoboDR: Debugger or tracer started on robot controller",
+              "RoboDR: Process memory written through /proc",
+              "RoboDR: ROS 2 process loaded a library from outside the allowlisted library paths",
+              "RoboDR: ROS 2 process mapped an ELF from outside the allowlisted paths",
+              "RoboDR: ROS 2 process loaded /etc/ld.so.preload",
+              "RoboDR: Unexpected ROS 2 middleware (RMW) library loaded",
+              "RoboDR: ROS 2 process imported Python code from outside the allowlisted paths"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "robot.correlate.sensor_evasion",
+      "title": "Sensor evasion attempt: repeated capture refusals with uninspected discovery",
+      "description": "Within 120 s: at least three capture / reassembly refusals or evictions (the sensor ran out of budget and did not inspect traffic) together with discovery data that could not be inspected. Each alone can be a busy or lossy network; together they match an attempt to blind the sensor while an announcement slips through.",
+      "severity": "high",
+      "window_secs": 120,
+      "group_by": null,
+      "pattern": {
+        "kind": "co_occurrence",
+        "all_of": [
+          {
+            "rules": [
+              "robot.capture.ip_fragment_refused",
+              "robot.capture.ip_reassembly_evicted",
+              "robot.rtps.discovery_fragment_rejected",
+              "robot.rtps.discovery_fragment_evicted"
+            ],
+            "count": 3
+          },
+          { "rules": ["robot.rtps.discovery_not_inspected"] }
+        ]
+      }
+    },
+    {
+      "id": "robot.correlate.credential_theft",
+      "title": "Credential theft: SROS 2 private key read, then an unknown participant joined",
+      "description": "An SROS 2 private key was read by an unexpected process (host, Pulsar) and within 10 minutes an unknown or source-mismatched DDS participant joined the graph (network). This is the stolen-identity rejoin pattern (Sakib et al., MILCOM 2025).",
+      "severity": "critical",
+      "window_secs": 600,
+      "group_by": null,
+      "pattern": {
+        "kind": "sequence",
+        "steps": [
+          {
+            "domain": "host",
+            "rules": [
+              "RoboDR: SROS 2 enclave private key read by a process outside the ROS stack",
+              "RoboDR: SROS 2 CA private key accessed on robot",
+              "RoboDR: Link created to an SROS 2 private key"
+            ]
+          },
+          {
+            "domain": "network",
+            "rules": [
+              "robot.ros2.unknown_participant",
+              "robot.ros2.participant_source_mismatch"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "robot.correlate.trojaned_package_key_access",
+      "title": "Package installation followed by SROS 2 key access",
+      "description": "A package was installed or a maintainer script ran, and within 10 minutes an SROS 2 private key was read outside the ROS stack: the trojaned-package path to key theft.",
+      "severity": "critical",
+      "window_secs": 600,
+      "group_by": null,
+      "pattern": {
+        "kind": "sequence",
+        "steps": [
+          {
+            "domain": "host",
+            "rules": [
+              "RoboDR: Debian package installed on robot controller",
+              "RoboDR: Debian package maintainer script executed",
+              "RoboDR: Python package installed on robot controller"
+            ]
+          },
+          {
+            "domain": "host",
+            "rules": [
+              "RoboDR: SROS 2 enclave private key read by a process outside the ROS stack",
+              "RoboDR: SROS 2 CA private key accessed on robot"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "robot.correlate.spoofed_motion_source",
+      "title": "Spoofed source followed by a foreign motion writer from the same address",
+      "description": "From one source IP: a participant or endpoint whose announced locators do not match the sender (spoofing / relay indicator), then a writer outside the profile on a motion topic, within 30 s.",
+      "severity": "critical",
+      "window_secs": 30,
+      "group_by": "ip",
+      "pattern": {
+        "kind": "sequence",
+        "steps": [
+          {
+            "rules": [
+              "robot.ros2.participant_source_mismatch",
+              "robot.ros2.endpoint_source_mismatch",
+              "robot.ros2.endpoint_unannounced_participant"
+            ]
+          },
+          { "rules": ["robot.ros2.unauthorized_motion_writer"] }
+        ]
+      }
+    },
+    {
+      "id": "robot.correlate.motion_hijack",
+      "title": "Foreign motion source followed by uncommanded or inconsistent motion",
+      "description": "A foreign writer on a motion topic or a firewall rejection of an unauthorised source, then within 30 s the motion monitor saw motion that the authorised commands do not explain.",
+      "severity": "critical",
+      "window_secs": 30,
+      "group_by": null,
+      "pattern": {
+        "kind": "sequence",
+        "steps": [
+          {
+            "rules": [
+              "robot.ros2.unauthorized_motion_writer",
+              "robot.firewall.rejected_unauthorized_source",
+              "robot.firewall.rejected_unknown_source"
+            ]
+          },
+          {
+            "rules": [
+              "robot.motion.uncommanded_motion",
+              "robot.motion.feedback_divergence",
+              "robot.motion.multiple_feedback_publishers"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "robot.correlate.defense_tampering",
+      "title": "RoboDR or Pulsar tampering while a sensor input went silent",
+      "description": "Within 120 s: a host rule saw the RoboDR / Pulsar configuration changed or the service being stopped, and the agent reported an input silent or ended. The agent signals are observe-only, so this finding is observe-only too: it is reported, never acted on.",
+      "severity": "high",
+      "window_secs": 120,
+      "group_by": null,
+      "pattern": {
+        "kind": "co_occurrence",
+        "all_of": [
+          {
+            "domain": "host",
+            "rules": [
+              "RoboDR: Attempt to stop the Pulsar or RoboDR service",
+              "RoboDR: RoboDR or Pulsar protected file written",
+              "RoboDR: RoboDR or Pulsar protected file deleted",
+              "RoboDR: RoboDR or Pulsar protected file or directory renamed",
+              "RoboDR: RoboDR or Pulsar protected directory deleted"
+            ]
+          },
+          {
+            "domain": "agent",
+            "rules": ["robot.agent.input_silent", "robot.agent.input_ended"]
+          }
+        ]
+      }
+    },
+    {
+      "id": "robot.correlate.discovery_flood",
+      "title": "Unknown participants from many source addresses",
+      "description": "Unknown DDS participants announced from 8 distinct source IPs within 60 s: a discovery flood or scan, possibly aimed at exhausting per-source state.",
+      "severity": "high",
+      "window_secs": 60,
+      "group_by": null,
+      "pattern": {
+        "kind": "distinct_sources",
+        "match": { "rules": ["robot.ros2.unknown_participant"] },
+        "distinct_by": "ip",
+        "count": 8
+      }
+    },
+    {
+      "id": "robot.correlate.host_process_persistence",
+      "title": "One process tripped several host rules",
+      "description": "The same host process raised three host-side (Pulsar) detections within 5 minutes. Escalated one level above the strongest of them.",
+      "severity": "medium",
+      "escalate_by": 1,
+      "window_secs": 300,
+      "group_by": "process",
+      "pattern": {
+        "kind": "threshold",
+        "match": { "domain": "host", "prefixes": ["RoboDR: "] },
+        "count": 3
+      }
+    }
+  ]
+}
+  vû‡ 1ñ‘Rh[{ç|O ¥
+ŒMª¬ >›K6*»ì*›q”Æ Š b½ ©Nƒ!ò~²w£ ÔL‹
+0 ¼Eg“½¢$‰/»£îñ7×«“Å÷Î z\ip)_
+Ï¼õªÑ OE Ü3Ps†ïFŒ®¯»g¬»z6¿1)À;î
+¶B* 8°Š~Gš‹È€— È*îû6 •.›šŒÌŠ8Ÿ¶ —+‰ 6Œ„C¥ Î e£ 3®š0ÅXñËÿ [ôù ÐÈ AÔ˜e( ÊÊéˆßÕÑF  kIªÆvÂUhÄ`Ë¼‡‰ `òº“OöõãÛ'á§\É‡.{ ç¾%Ðaú0s ¯•´   ¨–pAƒì4Ž¶÷i?È5 oxö£xZÌ©¸Î
+¬]WD~ßÆ =¼ygõ"õœê {Œc ªf
+ Ý›Ì¼ùÁ­ìcÉ ²-‘ŽÚ' üÔ ‰LQ )8¥,,«ð~¢åœ„$deür=%D`ôLoç	Jýéë?5Ù&Ó€“ð”6pŠ-º­ "k oÊm ˜˜@ÚF= ¾Xî öLÕÔ7 g¬så?OŠ=.^s ðá@ª^-q?E òí¡üà É¨ÿÆÅ ý>îY 8DŠç Á×Vò^(®M[•æv}ÁSÖ Ä.ú¿» 	Úr4HžÞLÝ´Kh?Ú!Jï„>qu°} Ì®¬%Íp\¥­ JÄ1ïèÀ0#§ËQ&EŽQV, ¸kôOp :â¼ÂLA ét• qJÑ¦ýÅq¥ý“ x¶N °§ K–H z®CŸ¤ !N™×¨ ¥¤NÛÌ’ ¨w| Áe:\
