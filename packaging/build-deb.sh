@@ -209,6 +209,14 @@ if install_bin robodr-agentd usr/sbin 0; then
         install -D -m 0644 "$here/sensor-box/$f" "$pkg/usr/share/doc/robodr/examples/sensor-box/$f"
     done
 fi
+# executor v1 (off unless agentd's executor.enabled; not enabled by the
+# package): the only CAP_NET_ADMIN unit, plus agentd's key drop-in example.
+if install_bin robodr-executor usr/sbin 0; then
+    install -D -m 0644 "$unit_src/robodr-executor.service" "$pkg/$units/robodr-executor.service"
+    install -D -m 0644 "$unit_src/robodr-agentd.service.d/30-executor.conf.example" \
+        "$pkg/usr/share/doc/robodr/examples/robodr-agentd.service.d/30-executor.conf.example"
+    install -D -m 0644 "$root/config/executor.example.json" "$pkg/$ex/executor.example.json"
+fi
 # Base-station side of the remote head anchor (not enabled by the package).
 if [[ "$variant" == standard ]] && install_bin robodr-anchor-receiver usr/bin 0; then
     install -D -m 0644 "$here/systemd/robodr-anchor-receiver.service" \

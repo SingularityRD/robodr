@@ -4,6 +4,7 @@ Architecture: @ARCH@
 Maintainer: @MAINTAINER@
 Installed-Size: @INSTALLED_SIZE@
 Depends: @DEPENDS@
+Suggests: nftables, iproute2
 Conflicts: @OTHER_PACKAGE@
 Replaces: @OTHER_PACKAGE@
 Section: admin

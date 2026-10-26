@@ -46,6 +46,7 @@ FOCAL_UNITS = (
     "robodr-spool-export.service",
     "robodr-kafka-publish.service",
     "robodr-uplink.service",
+    "robodr-executor.service",
 )
 
 # Directives a focal unit may use: all exist in systemd 245 (version in

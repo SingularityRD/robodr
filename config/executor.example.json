@@ -1,0 +1,31 @@
+{
+  "schema": "robodr-executor-config/v1",
+  "robot_id": "ugv-007",
+  "socket": "/run/robodr-executor/executor.sock",
+  "socket_mode": "0660",
+  "key_file": "/run/credentials/robodr-executor.service/executor.key",
+  "state_dir": "/var/lib/robodr/executor",
+  "policy_path": "/etc/robodr/response-policy.json",
+  "nft": "/usr/sbin/nft",
+  "network": {
+    "management": [
+      {"cidr": "10.20.0.0/24", "proto": "tcp", "port": 22, "note": "operator SSH (illustrative)"},
+      {"cidr": "10.20.0.5", "proto": "tcp", "port": 443, "note": "SOC / TLS terminator in front of the control plane (illustrative)"}
+    ],
+    "uplink": [
+      {"cidr": "10.20.0.10", "proto": "tcp", "port": 443, "note": "AutoSecOps ingest API (robodr-uplink, illustrative)"}
+    ],
+    "control_buses": {
+      "exempt": true,
+      "entries": [
+        {"interface": "eth1", "note": "robot-internal Ethernet to the motor controllers (illustrative)"}
+      ]
+    },
+    "motion_control_path": [
+      {"cidr": "192.168.10.0/24", "udp_ports": [7400, 7600], "note": "ROS 2 / DDS between the navigation and base controllers (illustrative)"}
+    ]
+  },
+  "ttl": {"default_s": 900, "max_s": 86400},
+  "max_safety_age_ms": 500,
+  "verify_interval_s": 10
+}

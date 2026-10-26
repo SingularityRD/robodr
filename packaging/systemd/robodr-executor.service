@@ -1,0 +1,130 @@
+# robodr-executor: RoboDR executor v1. Carries out the REVERSIBLE catalog
+# actions agentd hands it (isolate_network, quarantine_node) as nftables
+# rules in its own table `inet robodr`, verifies them by reading them back,
+# and reverts them on request or when their TTL expires.
+#
+# PROTECTIVE ONLY. It never de-energises anything (safe_pause,
+# request_safe_state and rollback_config are refused), never touches another
+# nftables table, never cuts the management / uplink allow-list or the motion
+# control path of /etc/robodr/executor.json, re-checks the robot's safety
+# state immediately before every apply, and acts on a humanoid only with
+# what the response policy lists in fall_safe_restrict (and a human's
+# approval). Off unless agentd's `executor.enabled` is true.
+#
+# Capability model: this unit is the ONLY RoboDR process with CAP_NET_ADMIN
+# (robodr-agentd keeps CAP_NET_RAW only). It runs `nft` (absolute path from
+# the config, empty environment, argument vector, JSON on stdin), which
+# inherits the ambient CAP_NET_ADMIN. It has no IP networking at all
+# (AF_UNIX for agentd's socket, AF_NETLINK for nft).
+#
+# Emergency disable (any time, as root):
+#     nft delete table inet robodr
+# The running executor sees the table gone, drops every action and does not
+# re-install anything (also not after a restart within the same boot).
+# `systemctl stop robodr-executor` alone does NOT lift active actions (they
+# stay until revert / TTL at the next start); see OPERATIONS.md.
+#
+# Checked against crates/robodr-executor:
+#   * CLI: `robodr-executor --config <executor.json> [--check-config]`;
+#     exit 0 clean stop, 1 runtime failure, 2 usage/configuration error.
+#     No signal handler: the journal is written ahead of every nft
+#     transaction, so SIGTERM (or a crash) at any point is recovered by the
+#     reconciliation at the next start.
+#   * /etc/robodr/executor.json (robodr-executor-config/v1) must set
+#       "socket":    "/run/robodr-executor/executor.sock",
+#       "key_file":  "/run/credentials/robodr-executor.service/executor.key",
+#       "state_dir": "/var/lib/robodr/executor",
+#       "policy_path": the response policy agentd uses (root-owned).
+#   * The shared protocol key (`robodr-executor keygen --out
+#     /etc/robodr/keys/executor.key`) reaches agentd through the drop-in
+#     example robodr-agentd.service.d/30-executor.conf.example.
+#   * sd_notify: READY=1 after the restart reconciliation, WATCHDOG=1 every
+#     housekeeping pass (<= 1 s), STATUS=<n> active.
+#   * It reads /proc/sys/kernel/random/boot_id (a reboot re-applies active
+#     actions, an operator's removal within one boot is honoured), so
+#     ProcSubset=pid must NOT be set.
+#
+# Verify after editing: systemd-analyze verify robodr-executor.service
+#                       systemd-analyze security robodr-executor.service
+
+[Unit]
+Description=RoboDR executor v1 (reversible containment, nftables table inet robodr)
+Documentation=file:/usr/share/doc/robodr/OPERATIONS.md
+AssertPathExists=/etc/robodr/executor.json
+After=local-fs.target network-pre.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/sbin/robodr-executor --config /etc/robodr/executor.json
+# Always: TTL auto-revert needs the process. A configuration error (exit 2)
+# is not retried.
+Restart=always
+RestartSec=2s
+RestartPreventExitStatus=2
+TimeoutStopSec=10s
+WatchdogSec=30s
+
+# --- Memory ------------------------------------------------------------------
+# Small and bounded (journal <= a few hundred KiB, one nft call at a time).
+OOMScoreAdjust=200
+MemoryHigh=48M
+MemoryMax=64M
+TasksMax=16
+
+# --- Identity and capabilities ---------------------------------------------
+# Dedicated system user (packaging/sysusers.d/robodr.conf); group robodr so
+# agentd can reach the 0660 socket in the 0750 runtime directory.
+User=robodr-exec
+Group=robodr
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+UMask=0007
+
+# --- Key material ------------------------------------------------------------
+LoadCredential=executor.key:/etc/robodr/keys/executor.key
+InaccessiblePaths=-/etc/robodr/keys
+
+# --- Filesystem --------------------------------------------------------------
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ReadWritePaths=/var/lib/robodr/executor
+# Nothing of the evidence or the exporters is the executor's business.
+InaccessiblePaths=-/var/lib/robodr/blackbox -/var/lib/robodr/spool -/var/lib/robodr/export
+RuntimeDirectory=robodr-executor
+RuntimeDirectoryMode=0750
+ProtectProc=invisible
+# No ProcSubset=pid: it reads /proc/sys/kernel/random/boot_id.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# --- Network -----------------------------------------------------------------
+# The host's network namespace (the rules must apply to it), but no IP
+# sockets: AF_UNIX (agentd, journal) and AF_NETLINK (nft) only.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+IPAddressDeny=any
+
+# --- Kernel interfaces / syscalls -------------------------------------------
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete @mount @swap @reboot @raw-io @cpu-emulation @clock @module @debug
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

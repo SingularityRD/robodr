@@ -14,6 +14,10 @@ configure)
         adduser --system --group --home /var/lib/robodr --no-create-home \
             --shell /usr/sbin/nologin robodr
     fi
+    if ! command -v systemd-sysusers >/dev/null 2>&1 && ! getent passwd robodr-exec >/dev/null; then
+        adduser --system --ingroup robodr --home /var/lib/robodr/executor --no-create-home \
+            --shell /usr/sbin/nologin robodr-exec
+    fi
     if command -v systemd-tmpfiles >/dev/null 2>&1; then
         systemd-tmpfiles --create /usr/lib/tmpfiles.d/robodr.conf
     fi
@@ -22,7 +26,8 @@ configure)
         if [ -n "$2" ]; then
             # Upgrade: restart only what was running.
             for u in robodr-pulsard.service robodr-agentd.service robodr-anchor-receiver.service \
-                robodr-spool-export.service robodr-kafka-publish.service robodr-uplink.service; do
+                robodr-spool-export.service robodr-kafka-publish.service robodr-uplink.service \
+                robodr-executor.service; do
                 systemctl try-restart "$u" || true
             done
         else
