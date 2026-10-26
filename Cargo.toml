@@ -17,6 +17,7 @@ members = [
     "crates/robodr-fleet",
     "crates/robodr-motion",
     "crates/robodr-ocsf",
+    "crates/robodr-pkg",
     "crates/robodr-responder",
     "crates/robodr-ros2-pipeline",
     "crates/robodr-rtps",
@@ -67,6 +68,7 @@ robodr-firewall-gw = { path = "crates/robodr-firewall-gw" }
 robodr-fleet = { path = "crates/robodr-fleet" }
 robodr-motion = { path = "crates/robodr-motion" }
 robodr-ocsf = { path = "crates/robodr-ocsf" }
+robodr-pkg = { path = "crates/robodr-pkg" }
 robodr-responder = { path = "crates/robodr-responder" }
 robodr-ros2-pipeline = { path = "crates/robodr-ros2-pipeline" }
 robodr-sensor-ros2 = { path = "crates/robodr-sensor-ros2" } # Pulsar-dependent

@@ -1,0 +1,20 @@
+[package]
+name = "robodr-pkg"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# Not published (crates.io disallows path deps); also lets cargo-deny
+# accept version-less path dependencies (deny.toml, allow-wildcard-paths).
+publish = false
+repository.workspace = true
+description = "Secure delivery formats (docs/SECURE-DELIVERY.md §3): pure parsers and validators for RPK packages, release bundles, deployments and the delivery trust file, quorum signature checks and bundle parity."
+
+[dependencies]
+# Ed25519 (strict verification), SHA-256, key fingerprints: the one RoboDR
+# key format and crypto wrapper (robodr-blackbox, ed25519-dalek + sha2).
+robodr-blackbox = { workspace = true }
+# Reed-Solomon `rs-gf256-0x11d/1` (src/fec.rs) and the parity-length rule.
+robodr-diode = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

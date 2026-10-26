@@ -2520,6 +2520,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "robodr-pkg"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "robodr-blackbox",
+ "robodr-diode",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "robodr-pulsard"
 version = "0.1.0-alpha.1"
 dependencies = [
