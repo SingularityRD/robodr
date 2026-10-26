@@ -122,6 +122,19 @@ A revoked or expired key authenticates nothing from its revocation time on.
 Key ids are unique per workspace. A robot may be marked
 `require_finding_signature` (§4 step 5.4).
 
+* **Site scope (relay).** A `relay` key may carry an optional `site`: it then
+  may send findings only for robots registered with that site (a sensor box
+  watching several robots of one site gets a site-scoped relay key, not an
+  `uplink` key). Without `site` it covers the whole workspace.
+* **Origin-vouching relay.** A `relay` key may be marked `vouches_origin`.
+  Only the SOC-side diode importer gets this flag: it has already verified
+  the robot's Ed25519-signed diode batch, so findings it relays satisfy
+  `require_finding_signature` without a per-finding `sig` (the diode format
+  carries none). Any other relay is held to the per-finding rule.
+* **Rotation.** A robot may have more than one active key per role at a
+  time (overlap during rotation); each authenticates independently until
+  revoked.
+
 ## 4. Processing (consumer)
 
 In this order; the first step that fails decides the response:
@@ -180,6 +193,9 @@ In this order; the first step that fails decides the response:
   `occurrence_count` and payload are updated, severity only ever rises, and
   the case gets an event (`updated`).
 * Known `external_id`, known event uid → nothing changes (`duplicate`).
+* Out-of-order events: `last_seen` only moves forward (`max`), the stored
+  payload is the one with the latest `last_seen_time`, `occurrence_count`
+  is the largest seen; an older event is still recorded as a case event.
 * Severity: OCSF `severity_id` 0–6 / 99 maps one-to-one onto the case
   severity (unknown, informational, low, medium, high, critical, fatal,
   other); priority follows severity.
@@ -290,6 +306,13 @@ every request through a reference consumer of this text
 
 ## 10. Changelog
 
+* **v1 draft, 2026-10-26, decisions** (coordinator, after the first
+  producer's open questions): site-scoped and origin-vouching `relay` keys,
+  overlapping keys for rotation (§3); out-of-order events and `last_seen`
+  (§5); the consumer commits each batch's effects and its stored response
+  in one database transaction, so a `5xx` means nothing was stored (§4).
+  Re-injecting dead-lettered lines (new batch id) is producer tooling, not
+  a contract change.
 * **v1 draft, 2026-10-26** (with the first producer, `robodr-uplink`):
   clarifications found while implementing it, no change to the wire format
   of a valid request.
