@@ -2423,6 +2423,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "robodr-executor"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "robodr-blackbox",
+ "robodr-executor",
+ "robodr-responder",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "robodr-export"
 version = "0.1.0-alpha.1"
 dependencies = [

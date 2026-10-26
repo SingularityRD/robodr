@@ -1,0 +1,32 @@
+[package]
+name = "robodr-executor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# Not published (crates.io disallows path deps); also lets cargo-deny
+# accept version-less path dependencies (deny.toml, allow-wildcard-paths).
+publish = false
+repository.workspace = true
+description = "RoboDR executor v1: reversible containment actions (isolate_network, quarantine_node via nftables in a dedicated `inet robodr` table; record_evidence; restrict_motion advisory) with precheck / apply / verify / revert / TTL, run as a separate CAP_NET_ADMIN-only process behind an authenticated unix-socket protocol."
+
+# Pure crate: std + RoboDR crates + serde only. nftables is driven through the
+# `nft` binary (JSON in and out), never through a shell.
+[dependencies]
+robodr-blackbox = { workspace = true }
+robodr-responder = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+# Test-only crash points inside the apply / revert sequence (the crate's own
+# tests prove recovery from a crash between `nft -f` and the journal write).
+# Never enable in a deployed build.
+fault-injection = []
+
+[dev-dependencies]
+robodr-executor = { path = ".", features = ["fault-injection"] }
+
+[[bin]]
+name = "robodr-executor"
+path = "src/bin/robodr-executor.rs"
