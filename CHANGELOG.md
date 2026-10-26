@@ -12,6 +12,27 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Added
 
+- `robodr-focal` package for hosts below glibc 2.39 / systemd 247 (Ubuntu
+  20.04 and 22.04, NVIDIA JetPack 5 / 6, e.g. Unitree EDU computers):
+  static musl binaries (`scripts/build-static.sh`, rust-lld, both arches,
+  checked for no interpreter and no shared library; no libc6 dependency),
+  systemd 245 units (`packaging/systemd/focal/`, kept in step by
+  `scripts/check-focal-units.py`) with `robodr-load-credential` in place of
+  `LoadCredential=`; agentd-only EDU mode (no `robodr-pulsard`: it needs a
+  BTF kernel). CI `static` job and release `build-static` job (debs,
+  bundles, `SHA256SUMS-focal-<arch>`). Verified in a container (build,
+  repro, qemu smoke runs, dpkg install); not yet on a Jetson.
+- `robodr-spool-export.service` (diode sites, no network) and
+  `robodr-kafka-publish.service` (connected sites, on the unit or sensor
+  box; broker-set drop-in example), env examples and tmpfiles directories
+  under `/var/lib/robodr/export/`; the two units conflict.
+- Unitree rules (`rules/robodr/unitree.toml`, 8 new): provisioning script
+  opened (covers `sh /path/wpa_supplicant_restart.sh` and `system()`);
+  boot / network / udev hooks and shell startup files written, moved or
+  linked; a program in a writable directory connecting to a public
+  address. Service rules now cover `/usr/local/lib/systemd` and systemd
+  generators; library rules cover pip-vendored `cyclonedds.libs/`.
+
 - Unitree live in `robodr-agentd` (recording only; synthetic traffic and
   IDL-derived vectors, no real Unitree capture yet): the SDK2 topics
   (`rt/lowcmd`, `rt/arm_sdk`, `rt/user_lowcmd`, `rt/hand_sdk`, `rt/dex3/*`,
@@ -394,6 +415,13 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   safety rules, known limits) shipped in the `.deb` and the offline bundle.
 
 ### Changed
+
+- docs/UNITREE.md: the UniPwn rules fire only where the BLE provisioning
+  service runs (very likely the closed controller, not the EDU Jetson); the
+  released `robodr` package needs glibc 2.39, so current Unitree EDU images
+  run `robodr-focal`, agentd only. Sensor-box examples now name the capture
+  NIC `eth1` and the uplink `eth0` everywhere, and the nftables example
+  allows a Kafka broker set instead of one collector address.
 
 - `robodr_agent::FirewallSettings::from_profile`: an envelope that bounds
   joint speed and allows no linear speed (`max_linear_speed` absent **or

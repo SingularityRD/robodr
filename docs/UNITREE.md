@@ -55,11 +55,11 @@ revision and from your own commissioning captures.
 
 | | Sensor box (default) | EDU agent |
 |---|---|---|
-| Where it runs | A separate arm64 or amd64 box with two NICs, on a tap or switch mirror port of the robot network (192.168.123.0/24) | The EDU development computer inside the robot (Jetson, arm64) |
+| Where it runs | A separate arm64 or amd64 box with two NICs, on a tap or switch mirror port of the robot network (192.168.123.0/24) | The EDU development computer inside the robot (Jetson, arm64): today the static `robodr-focal` package, agentd only (section 3.2) |
 | Touches the robot | No: no software on the robot, no firmware change | Installs a package on the development computer |
 | Models | **All**, and the **only** option for Air / Pro and any model whose computers you cannot install software on | EDU models only (the main motion controller is closed) |
-| Sees | DDS discovery and data on the mirrored link: participants, writers of `rt/lowcmd` and the other profiled topics, API requests, decoded motion where the channel is wired | The same for the development computer's own interface, **plus** host behaviour on the development computer (the Pulsar rules, section 7) |
-| Privileges | `robodr-agentd` with `CAP_NET_RAW` only, all IP denied | `robodr-agentd` as above, plus `robodr-pulsard` (root, bounded capabilities, eBPF) |
+| Sees | DDS discovery and data on the mirrored link: participants, writers of `rt/lowcmd` and the other profiled topics, API requests, decoded motion where the channel is wired | The same for the development computer's own interface, **plus**, only where `robodr-pulsard` can run (a BTF kernel and a matching build, section 3.2), host behaviour on the development computer (the Pulsar rules, section 7). Agentd-only mode, the only option on current Unitree images, has no host view. |
+| Privileges | `robodr-agentd` with `CAP_NET_RAW` only, all IP denied | `robodr-agentd` as above, plus `robodr-pulsard` (root, bounded capabilities, eBPF) where the kernel has BTF |
 
 Both modes can run together: an EDU agent on the development computer and a
 sensor box on the robot's uplink.
@@ -87,11 +87,16 @@ Verify the release at the entry station first ([OPERATIONS.md section 2](OPERATI
 
 ### 3.1 Sensor box
 
-1. **Prepare the box.** Ubuntu 22.04 or 24.04 (the package needs glibc 2.35
-   and systemd 247 or newer; `Promiscuous=` in systemd-networkd needs 248),
-   installed with full-disk encryption. Work through the
-   [hardening checklist](#sensor-box-hardening-checklist) before connecting
-   it to the robot.
+1. **Prepare the box.** Ubuntu 24.04 for the regular `robodr` package: as
+   released it is built on Ubuntu 24.04 and needs glibc 2.39 (the libc6
+   floor in its `Depends:`, read from the binaries) and systemd 247 or
+   newer. On Ubuntu 20.04 or 22.04 use the static `robodr-focal` package
+   (section 3.2): no glibc dependency, systemd 245 or newer. `Promiscuous=`
+   in systemd-networkd needs 248 (22.04 and later); on 20.04 set promiscuous
+   mode with the oneshot alternative named in the networkd example. Install
+   with full-disk encryption. Work
+   through the [hardening checklist](#sensor-box-hardening-checklist) before
+   connecting it to the robot.
 2. **Install the bundle** ([OPERATIONS.md section 3](OPERATIONS.md#3-install-on-an-air-gapped-host)):
 
    ```sh
@@ -104,28 +109,37 @@ Verify the release at the entry station first ([OPERATIONS.md section 2](OPERATI
    robot (it watches the host it runs on); enabling it on the box to watch
    the box itself is optional.
 3. **Capture NIC: silent and promiscuous.** Copy the networkd example, set
-   the interface name, and apply it:
+   the interface name, and apply it. The examples (networkd file, nftables,
+   drop-in, `agentd.unitree-sensor-box.example.json`) all name the capture
+   NIC `eth1` and the uplink `eth0`; use your box's names (`ip link`) in
+   every one of them:
 
    ```sh
    E=/usr/share/doc/robodr/examples
    sudo install -D -m 0644 $E/sensor-box/10-robodr-capture.network.example \
        /etc/systemd/network/10-robodr-capture.network
    sudoedit /etc/systemd/network/10-robodr-capture.network   # [Match] Name=
-   sudo networkctl reload && sudo networkctl reconfigure enp2s0
-   ip -d link show enp2s0      # PROMISC and NOARP, state UP
-   ip addr show enp2s0         # no inet / inet6 lines
+   sudo networkctl reload && sudo networkctl reconfigure eth1
+   ip -d link show eth1        # PROMISC and NOARP, state UP
+   ip addr show eth1           # no inet / inet6 lines
    ```
 
    `robodr-agentd` never enables promiscuous mode itself and has no
    `CAP_NET_ADMIN`; without it the NIC drops the mirrored frames that are
    addressed to other hosts.
 4. **Host firewall.** Copy `$E/sensor-box/nftables.conf.example` to
-   `/etc/nftables.conf`, set the interface names, the SOC collector, the NTP
-   server and the admin network, check it with `sudo nft -c -f
+   `/etc/nftables.conf`, set the interface names, the Kafka broker set, the
+   NTP server and the admin network, check it with `sudo nft -c -f
    /etc/nftables.conf`, then `sudo systemctl enable --now nftables`. The
    capture NIC is dropped in both directions (this does not affect capture:
    AF_PACKET sees frames before netfilter), the uplink only reaches the
-   collector, NTP and admin SSH, and nothing is forwarded.
+   brokers, NTP and admin SSH, and nothing is forwarded. List **every**
+   broker of the Kafka cluster, not one collector address: the publisher
+   connects to the leader of each partition at the address the cluster
+   advertises, so a missing broker stalls its partitions after the next
+   leader change. The box resolves no DNS, so the brokers must advertise
+   IP-literal listeners (or be in `/etc/hosts`). A diode site exports files
+   (`robodr-spool-export`) and needs no Kafka rule at all.
 5. **Keys** as in [OPERATIONS.md section 4](OPERATIONS.md#4-keys).
 6. **agentd configuration.** Start from
    `$E/agentd.unitree-sensor-box.example.json`: capture enabled on the
@@ -151,6 +165,11 @@ Verify the release at the entry station first ([OPERATIONS.md section 2](OPERATI
    Optionally uncomment its `BindsTo=` / `After=` lines for the capture NIC.
 8. **Commission** (section 4), then enable: `sudo systemctl enable --now
    robodr-agentd`.
+9. **Export** (section 8): on a connected site `robodr-kafka-publish.service`
+   (settings in `/etc/robodr/kafka-publish.env`, the broker set in its
+   `50-brokers.conf` drop-in, the same set as in the nftables file); on a
+   diode site `robodr-spool-export.service`. Enable one of them, never both
+   (they conflict: one consumer per spool).
 
 #### Sensor box hardening checklist
 
@@ -167,8 +186,8 @@ Verify the release at the entry station first ([OPERATIONS.md section 2](OPERATI
 - [ ] **Passive tap preferred** over a SPAN port: a tap cannot transmit into
       the robot network even if the box is compromised. With a SPAN port,
       make the mirror destination port receive-only on the switch.
-- [ ] **Uplink firewall**: default drop; out only to the SOC collector and
-      NTP by address (no DNS); in only SSH from the admin network
+- [ ] **Uplink firewall**: default drop; out only to the Kafka broker set
+      and NTP by address (no DNS); in only SSH from the admin network
       (nftables example).
 - [ ] **Full-disk encryption** (LUKS) for the root and the data partition
       holding `/var/lib/robodr` (black box, spool, profile state); unlock
@@ -189,42 +208,118 @@ Verify the release at the entry station first ([OPERATIONS.md section 2](OPERATI
 
 ### 3.2 EDU agent (development computer)
 
-1. **Check the development computer.** The package needs arm64 Ubuntu with
-   **glibc 2.35 and systemd 247 or newer** (Ubuntu 22.04 or later), a kernel
-   with BTF for `robodr-pulsard`, and bpffs:
+**Which package.** What the development computer can run depends on its
+NVIDIA JetPack image, not on the robot model:
+
+| Image on the Jetson | glibc / systemd / kernel | Package | What runs |
+|---|---|---|---|
+| JetPack 5 (L4T 35.x, Ubuntu 20.04): reported as the stock image of current Go2 / G1 EDU units (check yours) | 2.31 / 245 / 5.10, usually **no BTF** | `robodr-focal` (static musl binaries, systemd 245 units) | **agentd-only EDU mode**: `robodr-agentd` and the tools; no `robodr-pulsard`, no host rules |
+| JetPack 6 (L4T 36.x, Ubuntu 22.04) | 2.35 / 249 / 5.15 | `robodr-focal` today | agentd-only EDU mode. `robodr-pulsard` with the host rules needs **both** a BTF kernel (check below) **and** a `robodr` build against glibc 2.35, which the release does not produce yet |
+
+The regular `robodr` package installs on neither: as released it is built
+on Ubuntu 24.04 and its binaries need glibc 2.39 (dpkg refuses the package,
+and ld.so would refuse the binaries), and its units use `LoadCredential=`
+(systemd 247), which JetPack 5 lacks. A `robodr` build for Ubuntu 22.04
+(glibc 2.35, with Pulsar's clang/eBPF toolchain) is an open release
+decision ([BUILD.md, arm64 section](BUILD.md#arm64-cross-compiled-2026-10-18));
+until it exists, host rules on a Jetson are not available from a release.
+
+`robodr-pulsard` loads eBPF programs that need the kernel's BTF type information
+(`CONFIG_DEBUG_INFO_BTF=y`, `/sys/kernel/btf/vmlinux`); NVIDIA's L4T 35
+kernels are normally built without it, so on JetPack 5 the daemon could not
+start even if it were installed, and it is not part of `robodr-focal`.
+Rebuilding the L4T kernel with BTF is possible but is a change to the
+robot's image (and Unitree's support terms), not something RoboDR does.
+Neither the BTF status of Unitree's JetPack 6 images nor any RoboDR package
+has been checked on a real Unitree Jetson yet: run the checks below on your
+unit.
+
+1. **Check the development computer**:
 
    ```sh
    lsb_release -ds; ldd --version | head -1; systemctl --version | head -1
-   test -e /sys/kernel/btf/vmlinux && echo BTF ok
+   cat /etc/nv_tegra_release                 # R35 = JetPack 5, R36 = JetPack 6
+   test -e /sys/kernel/btf/vmlinux && echo "BTF ok (robodr-pulsard possible)"
    findmnt -t bpf /sys/fs/bpf
    ```
 
-   Development computers on an Ubuntu 20.04-based image (glibc 2.31,
-   systemd 245) cannot install the package; use a sensor box for them. A
-   kernel without BTF cannot run `robodr-pulsard`; `robodr-agentd` still
-   works. Check with Unitree whether installing software on the development
+   Check with Unitree whether installing software on the development
    computer affects warranty or support terms.
-2. **Install the bundle** as in step 2 of section 3.1.
-3. **agentd configuration.** Start from `$E/agentd.unitree-edu.example.json`:
+2. **Install the bundle** as in step 2 of section 3.1, with the
+   `robodr-focal-<version>-arm64-offline.tar.gz` bundle (same
+   `install-bundle.sh install --pubkey ... --tarball ...`; it installs
+   whichever package the bundle holds). `robodr` and `robodr-focal`
+   conflict and replace each other, so a later move to the regular package
+   is one bundle install; configuration, keys and evidence stay.
+3. **Keys** as in [OPERATIONS.md section 4](OPERATIONS.md#4-keys): the
+   black-box key is `/etc/robodr/keys/agentd-blackbox.key`, `0600
+   root:root`, in both packages. On systemd 245 the `robodr-focal` units
+   replace `LoadCredential=` with `/usr/lib/robodr/robodr-load-credential`
+   (run as root with the `+` prefix in `ExecStartPre=`): it copies the key
+   to the same `/run/credentials/robodr-agentd.service/blackbox.key` path,
+   `0400` owned by `robodr` in a root-owned directory, and removes it when
+   the unit stops. The `0640 root:robodr` group-readable fallback is **not**
+   used: agentd refuses a key file with any group or other permission bit.
+   Differences to `LoadCredential=`: the copy is on `/run` (tmpfs, can be
+   swapped: encrypt swap or run without it) instead of a private ramfs.
+4. **agentd configuration.** Start from `$E/agentd.unitree-edu.example.json`:
    capture on the development computer's interface on 192.168.123.0/24 (TUNE
    the name). Install and check it as in step 6 of section 3.1. Do **not**
-   install the sensor-box drop-in here.
-4. **Host rules.** `robodr-pulsard` loads every rule under
-   `/usr/share/robodr/rules`, including `robodr/unitree.toml`. Set the
-   TUNE values (section 7) in the rule source, validate it
+   install the sensor-box drop-in here. The configuration is the same for
+   both packages.
+5. **Host rules (only where `robodr-pulsard` runs: a BTF kernel and the
+   regular package).** `robodr-pulsard` loads every
+   rule under `/usr/share/robodr/rules`, including `robodr/unitree.toml`.
+   Set the TUNE values (section 7) in the rule source, validate it
    (`python3 scripts/validate_rules.py --strict --pulsar-src vendor/pulsar`)
    and ship it in a signed bundle. Do not edit the installed rule files: the
    edit fires the self-protection rules and the next upgrade replaces it.
    To get Pulsar's threats into agentd's findings and correlation, enable
    the host-threat input ([OPERATIONS.md section 6.4](OPERATIONS.md#64-agentd-features-etcrobodragentdjson), "Host threats").
-5. **SDK locations.** The library-load and Python-import rules
-   (`runtime_hooking.toml`) fire when an rclpy node or `python3` loads code
-   from outside the allowlisted trees, which includes `unitree_sdk2_python`
-   and a `unitree_ros2` workspace in a home directory. Install the SDKs into
-   the image at commissioning (system site-packages, `/opt/unitree_robotics`)
-   or add their directories to those rules' TUNE lists.
-6. **Commission** (section 4), then enable: `sudo systemctl enable --now
-   robodr-pulsard robodr-agentd`.
+6. **SDK locations (with host rules).** The library-load and
+   Python-import rules (`runtime_hooking.toml`) fire when an rclpy node or
+   `python3` loads code from outside the allowlisted trees, which includes
+   `unitree_sdk2_python` and a `unitree_ros2` workspace in a home directory.
+   Install the SDKs into the image at commissioning (system site-packages,
+   `/opt/unitree_robotics`) or add their directories to those rules' TUNE
+   lists.
+7. **Commission** (section 4), then enable: `sudo systemctl enable --now
+   robodr-pulsard robodr-agentd` (with host rules), or `sudo systemctl
+   enable --now robodr-agentd` (agentd-only mode).
+
+**Agentd-only EDU mode covers** what agentd sees on the
+development computer's interface: new or unknown DDS participants,
+unauthorised writers of `rt/lowcmd` and of the API request topics,
+off-profile topics, the decoded motion checks and the joint envelopes
+(recording), with signed evidence and the export units. It **does not
+cover** anything on the host itself: no process, file or connection
+events, so none of the section 7 rules (UniPwn script, tunnels,
+persistence, outbound connections, library tampering) run. A compromise of
+the development computer is visible only through what it then sends on the
+robot network. Pair it with a sensor box on the robot's uplink where
+possible.
+
+**systemd 245 differences** (`robodr-focal` units, `packaging/systemd/focal/`;
+`scripts/check-focal-units.py` keeps them identical to the regular units
+otherwise): no `ProtectProc=` / `ProcSubset=` (247), so the services see
+every process in `/proc`; on Ubuntu 20.04's default hybrid cgroup layout
+`MemoryHigh=` has no effect and `MemoryMax=` becomes the v1 memory limit;
+`IPAddressDeny=` needs the kernel's cgroup BPF support: if the journal
+says "Proceeding WITHOUT firewalling in effect!" after the first start, it
+is not enforced on that kernel (agentd still opens no IP connection itself,
+and `robodr-spool-export` uses `PrivateNetwork=yes`, which does not depend
+on it). These units have been checked with `systemd-analyze verify` on
+systemd 255 and their start sequence simulated without systemd; they have
+**not** run under a real systemd 245 or on a Jetson yet.
+
+**Static binaries.** `robodr-focal` contains static musl executables
+(`scripts/build-static.sh`; docs/BUILD.md "Static (musl) build"): no
+program interpreter and no shared library, so they run on any glibc. The
+arm64 ones are static but not position-independent (the Rust
+`aarch64-unknown-linux-musl` target has no static-pie): the executable image
+is not address-randomised, the stack, heap and mappings are. The amd64 ones
+are static-pie. The musl resolver does not read `nsswitch.conf`: give
+`robodr-kafka-publish` IP literals (it then needs no resolver at all).
 
 ## 4. Commissioning: learn, then lock
 
@@ -238,7 +333,7 @@ For Unitree:
    robot-network interface:
 
    ```sh
-   sudo tcpdump -i enp2s0 -w run1.pcapng udp
+   sudo tcpdump -i eth1 -w run1.pcapng udp
    ```
 
 2. **Learn** with the model name you use across the fleet, e.g.:
@@ -311,17 +406,35 @@ the policy is validated with Unitree's safety data.
 
 ## 7. What the Unitree rules detect
 
-`rules/robodr/unitree.toml` (Pulsar host rules, EDU agent mode only)
+`rules/robodr/unitree.toml` (Pulsar host rules; they run only where
+`robodr-pulsard` runs, i.e. not in agentd-only EDU mode, section 3.2)
 complements `radio_provisioning.toml` (Bluetooth / Wi-Fi tools and wireless
 configuration files) and the generic rule files. The full table with false
 positives is in [`rules/README.md`](../rules/README.md#unitreetoml-unitree-hosts-unipwn-2025-g1-telemetry-go1-tunnel).
 
+**Where the UniPwn rules apply, honestly.** UniPwn attacks the BLE Wi-Fi
+provisioning service. On the robots studied that service is very likely on
+the **closed main controller**, not on the EDU Jetson; nobody has shown it
+running on the Jetson. The five rules about the provisioning script and
+bluetoothd (script executed, script opened, bluetoothd or the script
+connecting out, pairing keys written or moved in) therefore fire **only if
+the provisioning service (or a copy of it) runs on the host where pulsard
+runs**. On an EDU computer without it they stay silent, and their silence
+says nothing about the controller. What covers a closed controller is the
+**network view**, from agentd on the EDU computer or a sensor box: a new or
+unknown DDS participant, an unauthorised writer of `rt/lowcmd` or of an API
+request topic, off-profile topics, and motion outside the envelopes, i.e.
+what a compromised controller or a wormed neighbour does on the robot
+network. If the attacker pivots from the controller onto the EDU computer,
+the generic host rules (tunnels, persistence, outbound connections from
+writable directories, library tampering) apply there.
+
 | Threat (public research) | What fires |
 |---|---|
-| **UniPwn** (Makris & Finisterre, Sept 2025, CVE-2025-35027): hardcoded keys in the BLE Wi-Fi provisioning service and command injection into `wpa_supplicant_restart.sh`, giving root; wormable across Go2, B2, G1 and H1 | the provisioning script running at all (medium: audit trail of every BLE re-provisioning); the script's own process or bluetoothd opening an IP connection (critical: an injected `/dev/tcp` reverse shell); planted Bluetooth bonding keys or a relaxed pairing policy; plus the BlueZ / Wi-Fi tool and wireless-config rules in `radio_provisioning.toml` |
+| **UniPwn** (Makris & Finisterre, Sept 2025, CVE-2025-35027): hardcoded keys in the BLE Wi-Fi provisioning service and command injection into `wpa_supplicant_restart.sh`, giving root; wormable across Go2, B2, G1 and H1 | *If the provisioning service runs on this host* (see above): the provisioning script executed or opened by an interpreter (medium: audit trail of every BLE re-provisioning; the open covers `sh /path/wpa_supplicant_restart.sh` and `system()` strings); the script's own process or bluetoothd opening an IP connection (critical: an injected `/dev/tcp` reverse shell); planted Bluetooth bonding keys or a relaxed pairing policy; plus the BlueZ / Wi-Fi tool and wireless-config rules in `radio_provisioning.toml`. *On a closed controller*: only the network detections (agentd / sensor box) |
 | Reported **G1 telemetry** to external servers | a Unitree process (under `/unitree/`, `/opt/unitree_robotics/` or an SDK tree) connecting outside the destination allowlist |
-| The earlier **Go1 remote-tunnel backdoor** (a CloudSail-like vendor tunnel) and post-exploitation tunnels | reverse-tunnel clients (frpc, cloudflared, bore, rathole, ...), `ssh` / `dbclient` reverse or SOCKS tunnels in bundled form, overlay VPNs, and new, replaced or enabled systemd units, init scripts, `rc.local` and autostart entries |
-| Tampering with the robot's middleware | writes, renames and links of Cyclone DDS configuration (`*cyclonedds.xml`, the `unitree_ros2` setup scripts that set `CYCLONEDDS_URI`) and of the Unitree SDK and Cyclone DDS libraries |
+| The earlier **Go1 remote-tunnel backdoor** (a CloudSail-like vendor tunnel) and post-exploitation tunnels | reverse-tunnel clients (frpc, cloudflared, bore, rathole, ...), `ssh` / `dbclient` reverse or SOCKS tunnels in bundled form and overlay VPNs, all **by name**; and, whatever the name, any program in a writable directory (`/tmp`, `/var/tmp`, `/dev/shm`, `/run/user`, home directories) connecting to a public address. Persistence: new, replaced or enabled systemd units (also under `/usr/local/lib/systemd`) and generators, init scripts, `rc.local`, autostart entries, udev rules (`RUN+=`), ifupdown / NetworkManager dispatcher / dhclient / ppp hooks, and shell startup files (`/etc/profile.d`, `~/.bashrc`, `/etc/environment`, ...) |
+| Tampering with the robot's middleware | writes, renames and links of Cyclone DDS configuration (`*cyclonedds.xml`, the `unitree_ros2` setup scripts that set `CYCLONEDDS_URI`, and the shell startup files where `CYCLONEDDS_URI` is often exported) and of the Unitree SDK and Cyclone DDS libraries, including a pip wheel's vendored `cyclonedds.libs/libddsc-*.so` (what `unitree_sdk2_python` loads) |
 
 Network-side detections (both modes) come from `robodr-agentd`: a new or
 unknown DDS participant, an unauthorised writer of `rt/lowcmd` or of an API
@@ -340,9 +453,11 @@ script is matched by file name, not directory. `/unitree/` is the reported
 onboard layout and is unverified; it only widens which processes the
 outbound rule watches. Pulsar's `Exec` event carries no parent image, so "a
 shell spawned by the BLE daemon" cannot be a rule; the rules watch the
-script being run and what its own process does, and the SOC correlates
-`parent_pid`. Running the script as `sh /full/path/wpa_supplicant_restart.sh`
-is a known gap of the script rule.
+script being run or opened and what its own process does, and the SOC
+correlates `parent_pid`. The tunnel, VPN and SSH rules match names and
+options only; a renamed tool is caught by the writable-directory outbound
+rule only if it runs from such a directory, and interpreted code (a script
+run by `/usr/bin/python3`) is not caught by that rule at all.
 
 ## 8. How findings reach the SOC
 
@@ -358,11 +473,20 @@ Findings use the `robodr.findings` contract, version **2.1.0**
   (`robot.ros2.*`, `robot.motion.*`, `robot.firewall.*`; the joint-frame
   and `robot.motion.api_id_out_of_range` entries are new in 2.1).
 * **Transport.** agentd writes signed findings to its spool and black box.
-  On an air-gapped site, `robodr-spool-export` packs them into signed diode
-  batches ([OPERATIONS.md section 8](OPERATIONS.md#8-log-and-evidence-export-via-the-diode)); on a connected
-  site (for example the sensor box's uplink), `robodr-kafka-publish` sends
-  them to the `robodr.findings` topic. agentd itself never opens an IP
-  connection; restrict the exporter to the collector address.
+  Two units, shipped disabled in both packages, carry them off the host
+  ([OPERATIONS.md section 8.3](OPERATIONS.md#83-findings-batches)); enable
+  exactly one (they conflict):
+  * air-gapped site: `robodr-spool-export.service` packs them into signed
+    diode batches in `/var/lib/robodr/export/diode` (no network at all:
+    `PrivateNetwork=yes`); `robodr-kafka-publish` then runs on the SOC
+    (high) side after `robodr-diode-unpack`;
+  * connected site (for example the sensor box's uplink):
+    `robodr-kafka-publish.service` runs **on the unit or sensor box** and
+    publishes agentd's spool to the `robodr.findings` topic. Its
+    `50-brokers.conf` drop-in allows exactly the Kafka broker set (every
+    broker, IP literals) and nothing else.
+
+  agentd itself never opens an IP connection.
 
 A consumer must accept contract 2.1 to validate the 2.1 rule entries; see
 the contract's section 5.
@@ -377,6 +501,21 @@ the contract's section 5.
 * **The sensor box mode is not field-tested**: capture of mirrored frames
   addressed to other hosts on a promiscuous NIC, and the drop-in under a
   real systemd, have not run on hardware.
+* **No host rules on current Unitree EDU images.** JetPack 5 (Ubuntu
+  20.04, L4T kernel without BTF) runs agentd only (`robodr-focal`); the
+  released `robodr` package needs glibc 2.39, so JetPack 6 also gets
+  agentd only until a glibc 2.35 build of `robodr` (with
+  `robodr-pulsard`) exists (section 3.2).
+* **`robodr-focal` has not run on a Jetson or under a real systemd 245.**
+  Its static binaries were built and smoke-run (amd64 natively, arm64 under
+  qemu-user: `--version`, `--check-config`, a short agentd run, black-box
+  verification), its units pass `systemd-analyze verify` (systemd 255) and
+  their credential start sequence was simulated without systemd. The arm64
+  binaries are static non-PIE (no ASLR of the executable image).
+* **The UniPwn script and bluetoothd rules prove nothing about a closed
+  controller.** They fire only where the provisioning service runs on the
+  pulsard host (section 7); the controller itself is covered only by the
+  network detections.
 * **Go2 app channel (WebRTC) is not decoded.** The mobile app's channel is
   encrypted media/data over WebRTC; RoboDR does not see its content, and on
   Wi-Fi or cellular it is not on the Ethernet link at all.

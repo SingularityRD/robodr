@@ -9,6 +9,7 @@ Contents: [Toolchain](#toolchain) · [Developer build](#developer-build) ·
 [Pulsar / eBPF prerequisites](#pulsar--ebpf-prerequisites) ·
 [Cargo.lock policy](#cargolock-policy) · [Air-gapped builds](#air-gapped-builds) ·
 [SBOM](#sbom) · [Reproducible builds](#reproducible-builds) ·
+[Static (musl) build](#static-musl-build) ·
 [Licensing](#licensing) · [CI jobs](#ci-jobs) ·
 [Local CI verification](#local-ci-verification) ·
 [Verification status](#verification-status)
@@ -23,6 +24,7 @@ Contents: [Toolchain](#toolchain) · [Developer build](#developer-build) ·
 | MSRV | **1.87** (`u*::is_multiple_of`; Pulsar's own floor is 1.85, edition 2024) | `[workspace.package] rust-version`, `MSRV` in `.github/workflows/ci.yml` |
 | Edition (RoboDR crates) | 2021 | `[workspace.package]` |
 | Targets | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` | `rust-toolchain.toml` |
+| Static targets (`robodr-focal`) | `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` (`rustup target add`; not in `rust-toolchain.toml`) | `scripts/build-static.sh` |
 
 `pulsar-core` is compiled *inside* this workspace (path dependency on the
 `vendor/pulsar` submodule), so RoboDR pins exactly the compiler Pulsar is tested
@@ -276,6 +278,72 @@ The Pulsar-bound binary (`pulsard` with RoboDR modules, embedding eBPF objects
 built by clang) is **not** covered yet: clang/LLVM output must be pinned and
 checked separately.
 
+## Static (musl) build
+
+**Why.** The release `.deb` is built on Ubuntu 24.04 and its binaries need
+glibc 2.39 (see [arm64](#arm64-cross-compiled-2026-10-18)); its units need
+systemd 247. Robot computers on older images cannot run it: NVIDIA JetPack 5
+(Ubuntu 20.04: glibc 2.31, systemd 245), the image of current Unitree EDU
+computers, and JetPack 6 / Ubuntu 22.04 (glibc 2.35). For them the pure
+binaries are built as **static musl executables** and shipped in the
+`robodr-focal` package (packaging/README.md), with systemd 245 units.
+`robodr-pulsard` is not built this way (it links libsqlite3/OpenSSL, embeds
+clang-built eBPF objects, and needs a BTF kernel that JetPack 5 lacks).
+
+```bash
+rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+scripts/build-static.sh x86_64-unknown-linux-musl     # -> dist/static/x86_64-unknown-linux-musl/
+scripts/build-static.sh aarch64-unknown-linux-musl    # cross, from any x86-64 host
+packaging/build-deb.sh --variant focal --bin-dir dist/static/aarch64-unknown-linux-musl --arch arm64 --out dist
+```
+
+`scripts/build-static.sh` builds exactly the set `ci-repro.sh` builds (the
+pure workspace) for the musl target with the release flags (`--locked`,
+`SOURCE_DATE_EPOCH`, `--remap-path-prefix`), links with **rust-lld** from
+the Rust toolchain for both targets (self-contained musl CRT and libc from
+the target's rust-std; the pure crates have no C code, so no C cross
+compiler or `musl-gcc` is needed), then **refuses** any `robodr-*` binary
+that is not an ELF for the target machine, has a `PT_INTERP` program
+header or a `DT_NEEDED` entry, and writes the binaries and `SHA256SUMS`
+to `dist/static/<triple>/`. `build-deb.sh --variant focal` repeats the
+static check, so a dynamic binary can never reach `robodr-focal`, whose
+only dependency is `systemd (>= 245)`.
+
+| | x86_64-unknown-linux-musl | aarch64-unknown-linux-musl |
+|---|---|---|
+| Linker | rust-lld | rust-lld (cross) |
+| Layout | static-pie (ASLR of the image) | static, **not PIE**: the Rust target has no static-pie support, so the executable image is at a fixed address (stack, heap and mappings are still randomised) |
+| Reproducible | yes (`CARGO_BUILD_TARGET=<triple>` + `CARGO_TARGET_<TRIPLE>_LINKER=rust-lld` with `scripts/ci-repro.sh`) | same |
+
+Runtime differences from the glibc build to keep in mind: the musl resolver
+reads `/etc/hosts` and `/etc/resolv.conf` but not `nsswitch.conf` (give
+`robodr-kafka-publish` IP literals); musl's allocator is slower than glibc's
+under contention (agentd's hot path is single-threaded; not measured on a
+robot).
+
+**Verified on 2026-10-26** (Ubuntu 24.04 container, x86-64, Rust 1.98.1):
+
+- Both targets built with `scripts/build-static.sh` (10 binaries each,
+  every check passed). `file`: `ELF 64-bit LSB pie executable, x86-64,
+  static-pie linked, stripped` and `ELF 64-bit LSB executable, ARM aarch64,
+  statically linked, stripped`; `ldd`: `statically linked`; no `INTERP`, no
+  `NEEDED`.
+- `scripts/ci-repro.sh` with `CARGO_BUILD_TARGET=x86_64-unknown-linux-musl`:
+  10 binaries bit-identical across the two paths, and identical to
+  `build-static.sh`'s output from the same commit.
+- Smoke runs, amd64 natively and arm64 under `qemu-aarch64-static` 8.2:
+  `--version` of agentd / commission / ros2-watch; `robodr-blackbox keygen`;
+  `robodr-agentd --check-config` on `agentd.unitree-edu.example.json` (paths
+  pointed at the G1 example profile, policy and firewall); a 5 s agentd run
+  capturing on `lo`, then `robodr-blackbox verify`: `INTACT, CLEAN`.
+- `robodr-focal` `.deb` for both arches (`Depends: systemd (>= 245)`), built
+  twice with the same `SOURCE_DATE_EPOCH`: identical. Installed with dpkg in
+  the container; its units pass `systemd-analyze verify`; the credential
+  start sequence and agentd / spool-export as user `robodr` were run
+  without systemd (packaging/README.md, "Not verified").
+- Not done: the musl test suite (`cargo test --target ...-musl`; no disk
+  space in the sandbox), any run on a Jetson or under systemd 245.
+
 ## Licensing
 
 - RoboDR crates: `license = "LicenseRef-Proprietary"` (`[workspace.package]`;
@@ -299,7 +367,7 @@ checked separately.
 | Job | Required | What |
 |---|---|---|
 | `lockfile` | yes | Committed `Cargo.lock` has no local/patched/git/unknown sources; if none is committed, generate + upload the bootstrap lock and **fail** (every other job also fails without it) |
-| `scripts` | yes | Python self-tests of the CI scripts, Pulsar rule validation, `shellcheck scripts/*.sh packaging/*.sh` |
+| `scripts` | yes | Python self-tests of the CI scripts, Pulsar rule validation, `scripts/check-focal-units.py` (systemd 245 unit variants in step), `shellcheck` of `scripts/*.sh`, `packaging/*.sh`, the maintainer scripts and the focal credential helper |
 | `pure` | yes | `fmt --check`, `clippy -D warnings`, `test` for every member except Pulsar-bound ones |
 | `pulsar` | yes | Installs Pulsar's build packages, then `build` / `clippy -D warnings` / `test` of every Pulsar-bound member (`robodr-sensor-ros2`, `robodr-pulsard`). No kernel load |
 | `msrv` | informational | `cargo +1.87.0 check` of the pure crates |
@@ -307,6 +375,7 @@ checked separately.
 | `sbom` | yes | CycloneDX via cargo-cyclonedx **and** the std-only fallback; uploaded as artifact |
 | `fuzz` | yes | If `fuzz/` exists: every `cargo fuzz` target for 60 s on a pinned nightly; crashes uploaded |
 | `reproducible` | yes | `scripts/ci-repro.sh`; hashes uploaded |
+| `static` | yes | Per musl target: `ci-repro.sh` for the target, `scripts/build-static.sh`, built == reproduced, smoke run (arm64 under qemu-user), `robodr-focal` `.deb` (`Depends: systemd (>= 245)`, helper present, no `robodr-pulsard`); hashes uploaded. `release.yml`'s `build-static` job does the same and publishes `robodr-focal` debs and bundles with `SHA256SUMS-focal-<arch>` |
 
 All third-party actions are pinned by full commit SHA (resolved with
 `git ls-remote --tags` from the upstream repositories), with the tag in a

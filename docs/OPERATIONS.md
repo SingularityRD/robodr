@@ -27,9 +27,10 @@ Status labels used below:
 |---|---|
 | Kernel | Linux 5.5 or newer with BPF and **BTF** (`/sys/kernel/btf/vmlinux` must exist). Kernels before 5.8 need the `CAP_SYS_ADMIN` drop-in (section 6.3). |
 | bpffs | mounted at `/sys/fs/bpf` (systemd does this at boot) |
-| systemd | 247 or newer (`LoadCredential=`). Ubuntu 22.04 and 24.04 qualify. |
+| systemd | 247 or newer (`LoadCredential=`) for the `robodr` package. |
 | Arch | amd64 or arm64, Debian or Ubuntu (`dpkg`) |
-| Runtime libs | glibc, libgcc-s1, libsqlite3-0 (the `.deb` declares them) |
+| Runtime libs | glibc, libgcc-s1, libsqlite3-0 (the `.deb` declares them). The libc6 floor is read from the binaries: a release built on Ubuntu 24.04 needs **glibc 2.39**, i.e. Ubuntu 24.04 or newer. |
+| Older hosts | Ubuntu 20.04 / 22.04 (glibc 2.31 / 2.35, systemd 245 / 249), e.g. NVIDIA JetPack 5 / 6: the **`robodr-focal`** package, static musl binaries with systemd 245 units, **without `robodr-pulsard`** (agentd and the tools only). See [UNITREE.md section 3.2](UNITREE.md#32-edu-agent-development-computer). |
 | Tools on the robot | `sha256sum` (coreutils), `dpkg`; `minisign` if signatures are checked on the robot itself |
 
 Check before installing:
@@ -125,9 +126,12 @@ short:
   `examples/sensor-box/nftables.conf.example`. Install the drop-in only on
   a sensor box, never on a robot. Hardening checklist: UNITREE.md section
   3.1.
-* **EDU agent.** The package on the EDU development computer (arm64; needs
-  Ubuntu 22.04 or later for glibc 2.35 and systemd 247), with
-  `robodr-pulsard` for the host rules.
+* **EDU agent.** On the EDU development computer (Jetson, arm64). Current
+  Unitree images (JetPack 5, Ubuntu 20.04, kernel without BTF; JetPack 6 is
+  Ubuntu 22.04) cannot install the regular package (glibc 2.39, systemd
+  247): they take `robodr-focal`, agentd only, no host rules.
+  `robodr-pulsard` with the host rules needs a BTF kernel and a `robodr`
+  build for the image's glibc (UNITREE.md section 3.2).
 
 ## 4. Keys
 
@@ -265,6 +269,11 @@ robodr-diode-pack --outbox OUT --state pack-state.json --unit ugv-07 \
   --key-file /etc/robodr/keys/diode-ugv-07.key --findings findings.jsonl
 # carry /etc/robodr/keys/diode-ugv-07.key.pub to the SOC on vetted media
 ```
+
+`robodr-spool-export.service` (section 8.3) reads its key from the fixed
+path `/etc/robodr/keys/diode.key` (handed over by systemd as a credential):
+generate it there (`--key-id` as above), or link nothing and copy the unit's
+key to that name; symlinks are refused.
 
 SOC keyring file (one line per unit key; several keys per unit during a
 rotation are fine):
@@ -1336,19 +1345,49 @@ mode comes with the bundle exporter.
 Kafka 3.9.1 and 4.1.0 brokers, see below). Two binaries carry
 agentd's findings to the SOC (contract section 8.1):
 
-```sh
-# Robot side (low side): spool -> signed diode batches in the outbox.
-# Runs as robodr (it renames ready/ -> acked/ in agentd's spool).
-sudo -u robodr robodr-spool-export --spool /var/lib/robodr/spool/agentd \
-    --outbox /var/lib/robodr/export/diode --state /var/lib/robodr/export/spool-export-state.json \
-    --pack-state /var/lib/robodr/export/pack-state.json --unit ugv-07 \
-    --key-file /etc/robodr/keys/diode-ugv-07.key [--interval-ms 5000] [--once]
+Both ship as systemd units (installed disabled, in `robodr` and
+`robodr-focal`); they consume the same spool, so they conflict: enable
+exactly one.
 
-# SOC side (high side), after robodr-diode-unpack has imported the batches:
-robodr-kafka-publish --bootstrap kafka1:9092 --state-dir /var/lib/robodr-soc/publish \
+```sh
+# Air-gapped / diode site, robot side (low side): spool -> signed diode
+# batches in /var/lib/robodr/export/diode. Runs as robodr (it renames
+# ready/ -> acked/ in agentd's spool), with no network at all.
+sudo robodr-blackbox keygen --out /etc/robodr/keys/diode.key   # .pub -> SOC importer
+sudo install -m 0640 -o root -g robodr \
+    /usr/share/doc/robodr/examples/spool-export.env.example /etc/robodr/spool-export.env
+sudoedit /etc/robodr/spool-export.env                          # ROBODR_UNIT_ID=
+sudo systemctl enable --now robodr-spool-export
+# The unit runs (key handed over by systemd, man robodr-spool-export(1)):
+#   robodr-spool-export --spool /var/lib/robodr/spool/agentd \
+#     --outbox /var/lib/robodr/export/diode \
+#     --state /var/lib/robodr/export/spool-export/state.json \
+#     --pack-state /var/lib/robodr/export/spool-export/pack-state.json \
+#     --unit $ROBODR_UNIT_ID --key-file /run/credentials/robodr-spool-export.service/diode.key
+
+# Diode site, SOC side (high side), after robodr-diode-unpack has imported
+# the batches (a SOC host with its own layout; no unit is shipped for it):
+robodr-kafka-publish --bootstrap 10.0.0.5:9092 --state-dir /var/lib/robodr-soc/publish \
     --diode-out /var/lib/robodr-soc/import/out [--topic robodr.findings] [--once]
-# A connected site publishes straight from a spool copy instead: --spool DIR
+
+# Connected site: publish agentd's spool straight from the unit or sensor box.
+sudo install -m 0640 -o root -g robodr \
+    /usr/share/doc/robodr/examples/kafka-publish.env.example /etc/robodr/kafka-publish.env
+sudoedit /etc/robodr/kafka-publish.env                         # ROBODR_KAFKA_BOOTSTRAP=
+sudo install -D -m 0644 \
+    /usr/share/doc/robodr/examples/robodr-kafka-publish.service.d/50-brokers.conf.example \
+    /etc/systemd/system/robodr-kafka-publish.service.d/50-brokers.conf
+sudoedit /etc/systemd/system/robodr-kafka-publish.service.d/50-brokers.conf  # every broker
+sudo systemctl daemon-reload && sudo systemctl enable --now robodr-kafka-publish
 ```
+
+The connected-site publisher connects to the bootstrap brokers **and** to
+every broker the cluster advertises (each partition's leader), so
+`IPAddressAllow=` in `50-brokers.conf` (and a host firewall, e.g. the
+sensor-box nftables example) must hold every broker's advertised address;
+one bootstrap address is not enough and fails at the first leader change.
+The unit allows no other address, DNS servers included: use IP literals
+and IP-literal advertised listeners, or `/etc/hosts`.
 
 `robodr-spool-export` takes `ready/` records in order, re-validates them,
 packs one diode batch per step with `robodr-diode-pack`'s format (Ed25519
@@ -1369,8 +1408,10 @@ broker-rejected records go to a dead-letter file. **No TLS / SASL** and
 **idempotence off** (at-least-once: consumers drop duplicates on
 `event-uid`): run it on an isolated SOC network or through a local TLS
 proxy. Without `--once` it loops every `--interval-ms` (default 2000).
-Neither binary ships a systemd unit; run them from the site's transfer
-procedure or a timer.
+`robodr-spool-export.service` and `robodr-kafka-publish.service` run the
+loop (no timer needed: both binaries retry on their own; exit 2, a usage
+error, is not restarted); the transfer of `/var/lib/robodr/export/diode`
+to the diode stays the site's procedure.
 
 Before the first deployment, and after a Kafka upgrade, run the real-broker
 test against the SOC's Kafka version (needs docker and the source tree):
