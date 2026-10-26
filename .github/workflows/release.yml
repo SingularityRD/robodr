@@ -152,6 +152,8 @@ jobs:
           clang --version
       - name: Install toolchain (rust-toolchain.toml)
         run: rustup toolchain install
+      - name: Pinned C compiler (clang 18.1.3, ring's C/assembly; scripts/c-toolchain.sh)
+        run: scripts/ci-install-clang.sh
       - name: Setup (mirror, --locked, Pulsar-bound excludes)
         run: scripts/ci-setup.sh
       - name: Reproducibility proof (pure binaries, two paths)
@@ -162,10 +164,17 @@ jobs:
         run: |
           export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           export RUSTFLAGS="--remap-path-prefix=$PWD=/build/robodr --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
+          # ring compiled with the pinned clang, exactly as ci-repro.sh did
+          # (fails if it is missing or another version).
+          . scripts/c-toolchain.sh
+          robodr_pin_cc "$(rustc -vV | sed -n 's/^host: //p')" release
           # Two invocations, so feature unification for the pure binaries is
           # exactly the one ci-repro.sh built (Pulsar's dependency graph
           # must not change their bytes).
           cargo build --release --workspace $PURE_EXCLUDES $CARGO_LOCKED
+          # Pulsar-bound members: built as ci.yml's pulsar job does (its
+          # reproducibility is not claimed), without the ring pin.
+          unset "CC_$(rustc -vV | sed -n 's/^host: //p' | tr '-' '_')"
           pkgs=$(printf '%s\n' $PURE_EXCLUDES | grep -v '^--exclude$' || true)
           for p in $pkgs; do
             cargo build --release -p "$p" $CARGO_LOCKED
@@ -250,11 +259,10 @@ jobs:
         run: scripts/ci-setup.sh
       - name: Linker (rust-lld, self-contained musl)
         run: echo "CARGO_TARGET_$(printf '%s' "$TARGET" | tr 'a-z-' 'A-Z_')_LINKER=rust-lld" >> "$GITHUB_ENV"
-      - name: C compiler (clang, for ring's C/assembly; both triples)
-        run: |
-          command -v clang >/dev/null || { sudo apt-get update && sudo apt-get install -y --no-install-recommends clang; }
-          echo "CC_$(printf '%s' "$TARGET" | tr '-' '_')=clang" >> "$GITHUB_ENV"
-          clang --version
+      - name: Pinned C compiler (clang 18.1.3, ring's C/assembly; scripts/c-toolchain.sh)
+        # ci-repro.sh / build-static.sh set CC_<triple> to it and fail on
+        # any other compiler (no fallback to cc).
+        run: scripts/ci-install-clang.sh
       - name: Reproducibility proof (pure binaries, two paths, musl)
         env:
           REPRO_REQUIRE_BINARIES: "1"

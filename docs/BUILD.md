@@ -6,6 +6,7 @@ verified so far. CI is `.github/workflows/ci.yml`; every procedure below is a
 script that CI runs, so the lab and CI cannot drift apart.
 
 Contents: [Toolchain](#toolchain) · [Developer build](#developer-build) ·
+[C toolchain](#c-toolchain) ·
 [Pulsar / eBPF prerequisites](#pulsar--ebpf-prerequisites) ·
 [Cargo.lock policy](#cargolock-policy) · [Air-gapped builds](#air-gapped-builds) ·
 [SBOM](#sbom) · [Reproducible builds](#reproducible-builds) ·
@@ -78,9 +79,80 @@ Binaries built from the pure set (all shipped in the `.deb`, all checked by
 
 C in the pure set: only `ring` (the crypto provider of rustls, linked into
 `robodr-uplink` for TLS) compiles C and assembly through the `cc` crate,
-so a C compiler is needed (`cc`/gcc for the native glibc build, clang for
-the musl cross builds, see [Static (musl) build](#static-musl-build)).
-Everything else is pure Rust.
+so a C compiler is needed. A developer build uses whatever `cc` is
+installed; **release and reproducibility builds use the pinned clang**
+for every target ([C toolchain](#c-toolchain)). Everything else is pure
+Rust.
+
+## C toolchain
+
+ring's C and assembly objects end up in the shipped `robodr-uplink`, so
+the release bytes depend on the C compiler, not only on the Rust
+toolchain. The C toolchain is therefore pinned like Rust is
+(`scripts/c-toolchain.sh` is the single source; this table repeats it):
+
+| Tool | Pin | Used for | Enforced |
+|---|---|---|---|
+| clang | **`clang-18` 18.1.3**, Ubuntu 24.04 package `clang-18=1:18.1.3-1ubuntu1` (release pocket: amd64 and arm64) | ring, every target: `x86_64`/`aarch64` `-linux-gnu` and `-linux-musl` (`CC_<triple>`) | yes: `scripts/ci-repro.sh`, `scripts/build-static.sh` and `release.yml` fail (exit 1) when `clang-18` is missing or reports another version; a `CC_<triple>` you set is checked the same way. No fallback to `cc`. |
+| gcc | 13.3.0 (Ubuntu 24.04 `gcc-13`) | the link driver of the `-linux-gnu` builds (`cc`) | documented, recorded |
+| binutils | 2.42 (Ubuntu 24.04) | GNU `ld` behind gcc (`-linux-gnu`); `ar` archives ring's objects before rustc reads them | documented, recorded |
+| rust-lld | from the Rust 1.98.1 toolchain | the linker of the musl builds | with the Rust pin |
+
+CI and release jobs install the pin with `scripts/ci-install-clang.sh`
+(`apt-get install clang-18=1:18.1.3-1ubuntu1`, `apt-mark hold`, then the
+version check). Each build writes the versions it actually used to
+`TOOLCHAIN.txt` next to its `SHA256SUMS` (`dist/repro/`,
+`dist/static/<triple>/`). `ROBODR_ALLOW_UNPINNED_CC=1` accepts another
+clang for local experiments only: the scripts then say "NOT a release
+build", and the hashes are not expected to match a release. The
+Pulsar-bound `robodr-pulsard` keeps its own clang-20 (eBPF) and is built
+without the ring pin; its reproducibility is not claimed.
+
+Changing a pin is a release-visible change: edit `scripts/c-toolchain.sh`,
+this table and the verification notes in one commit.
+
+**Air-gapped build hosts.** Besides the Rust toolchain and the vendored
+crates ([Air-gapped builds](#air-gapped-builds)), bring the C toolchain
+from a connected Ubuntu 24.04 host of the same architecture:
+
+```bash
+# On a connected noble host (amd64 or arm64, as the build host):
+apt-get download clang-18=1:18.1.3-1ubuntu1 \
+  $(apt-cache depends --recurse --no-recommends --no-suggests --no-conflicts \
+      --no-breaks --no-replaces --no-enhances clang-18=1:18.1.3-1ubuntu1 | grep '^\w' | sort -u)
+sha256sum ./*.deb > SHA256SUMS      # carry both through the entry station
+# On the build host (Ubuntu 24.04, same arch):
+sha256sum -c SHA256SUMS && sudo apt-get install ./*.deb   # or dpkg -i
+sudo apt-mark hold clang-18
+clang-18 --version | head -n1       # Ubuntu clang version 18.1.3 (1ubuntu1)
+```
+
+The `.deb` files are signed through Ubuntu's archive (`Release.gpg` →
+`Packages` → per-package SHA-256): verify them on the connected host
+(`apt-get download` does) before carrying them over. gcc 13 and binutils
+2.42 are part of a standard Ubuntu 24.04 build host (`build-essential`).
+
+**Independent verification of a release** (what a third party, or the
+air-gapped site, does to confirm the published binaries come from the
+tagged source):
+
+1. Ubuntu 24.04 (amd64, or arm64 for the arm64 assets), clean user, the
+   pinned C toolchain above, `rustup` with the toolchain of
+   `rust-toolchain.toml` (1.98.1) and, for `robodr-focal`, the musl
+   targets.
+2. `git clone --recurse-submodules` the repository and check out the
+   release tag; do **not** regenerate `Cargo.lock`.
+3. `scripts/ci-repro.sh dist/repro` (glibc binaries of the main `.deb`) and,
+   for `robodr-focal`, `CARGO_BUILD_TARGET=<triple>
+   CARGO_TARGET_<TRIPLE>_LINKER=rust-lld scripts/ci-repro.sh
+   dist/repro-static` or `scripts/build-static.sh <triple>`.
+4. Compare `dist/repro*/SHA256SUMS` with the release's `SHA256SUMS-<arch>`
+   (and the binaries extracted from the `.deb` with `dpkg-deb -x`); check
+   `TOOLCHAIN.txt` names the pinned versions. Verify the release's minisign
+   signatures as described below.
+
+A mismatch with every pin in place is a finding: report it (do not
+install).
 
 The submodule must be checked out even for the pure crates: cargo loads the
 whole workspace manifest, and `pulsar-core` is a path dependency.
@@ -265,15 +337,17 @@ script then compares `target/<triple>/release/robodr-*`. Controlled:
 | Source of drift | Control |
 |---|---|
 | Compiler | `rust-toolchain.toml` pin |
+| C compiler (ring) | pinned clang 18.1.3 for every target, enforced ([C toolchain](#c-toolchain)) |
 | Dependency versions | committed `Cargo.lock` (required), `--locked` |
 | Absolute paths (checkout, `CARGO_HOME`) | `--remap-path-prefix` to `/build/robodr` and `/cargo` |
 | Timestamps | `SOURCE_DATE_EPOCH` = HEAD commit time |
 | Codegen non-determinism | `codegen-units = 1`, `incremental = false`, `CARGO_INCREMENTAL=0` |
 | Debug info / symbols | `debug = false`, `strip = true` (`[profile.release]`) |
 
-To verify a published release independently: check out the tag with
-submodules, install Rust 1.98.1, run `scripts/ci-repro.sh`, and compare its
-`SHA256SUMS` with the one published for the release. Signing (the other
+To verify a published release independently: follow
+[C toolchain](#c-toolchain), "Independent verification of a release"
+(the tag with submodules, Rust 1.98.1, the pinned clang,
+`scripts/ci-repro.sh`, compare its `SHA256SUMS` with the release's). Signing (the other
 half of the Sprint 1 assurance item) is implemented in `release.yml`'s
 `publish` job: `SHA256SUMS` plus a minisign signature (`*.minisig`) for every
 asset, verifiable offline with the public key in the repository variable
@@ -310,9 +384,10 @@ pure workspace) for the musl target with the release flags (`--locked`,
 the Rust toolchain for both targets (self-contained musl CRT and libc from
 the target's rust-std; no `musl-gcc`), compiles the one piece of C,
 `ring`'s C and assembly (rustls' crypto provider, `robodr-uplink`), with
-**clang** for both triples (`CC_<triple>`, default `clang`; ring needs no
-libc headers beyond what clang finds, verified 2026-10-26 with clang 18 for
-both triples), then **refuses** any `robodr-*` binary
+the **pinned clang** for both triples (`CC_<triple>` = `clang-18` 18.1.3,
+[C toolchain](#c-toolchain): missing or another version fails the build;
+ring needs no libc headers beyond what clang finds, verified 2026-10-26
+with clang 18 for both triples), then **refuses** any `robodr-*` binary
 that is not an ELF for the target machine, has a `PT_INTERP` program
 header or a `DT_NEEDED` entry, and writes the binaries and `SHA256SUMS`
 to `dist/static/<triple>/`. `build-deb.sh --variant focal` repeats the
@@ -323,8 +398,8 @@ only dependency is `systemd (>= 245)`.
 |---|---|---|
 | Linker | rust-lld | rust-lld (cross) |
 | Layout | static-pie (ASLR of the image) | static, **not PIE**: the Rust target has no static-pie support, so the executable image is at a fixed address (stack, heap and mappings are still randomised) |
-| C compiler (ring) | clang | clang (cross, `--target` added by the `cc` crate) |
-| Reproducible | yes (`CARGO_BUILD_TARGET=<triple>` + `CARGO_TARGET_<TRIPLE>_LINKER=rust-lld` with `scripts/ci-repro.sh`, which defaults `CC_<triple>` to clang like `build-static.sh`) | same |
+| C compiler (ring) | pinned `clang-18` 18.1.3 | pinned `clang-18` 18.1.3 (cross, `--target` added by the `cc` crate) |
+| Reproducible | yes (`CARGO_BUILD_TARGET=<triple>` + `CARGO_TARGET_<TRIPLE>_LINKER=rust-lld` with `scripts/ci-repro.sh`, which pins `CC_<triple>` like `build-static.sh`) | same |
 
 Runtime differences from the glibc build to keep in mind: the musl resolver
 reads `/etc/hosts` and `/etc/resolv.conf` but not `nsswitch.conf` (give

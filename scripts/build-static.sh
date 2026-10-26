@@ -25,9 +25,13 @@
 #
 # C compiler: one dependency has C and assembly, `ring` (the crypto provider
 # of rustls, used by robodr-uplink's TLS); everything else is pure Rust.
-# `ring` is compiled with clang (CC_<triple>, default `clang`, which
-# cross-compiles for both triples; ring needs no libc headers beyond what
-# clang finds). Set CC_<triple> yourself to override.
+# `ring` is compiled with the PINNED clang (scripts/c-toolchain.sh: clang-18,
+# 18.1.3; it cross-compiles for both triples and needs no libc headers
+# beyond what clang finds). CC_<triple> defaults to it; a CC_<triple> you
+# set must be the same version. A missing or different clang FAILS the
+# build (exit 1) — no fallback to `cc` — unless ROBODR_ALLOW_UNPINNED_CC=1
+# (local experiments; the result is not a release build). The toolchain
+# versions are written to DIR/TOOLCHAIN.txt.
 #
 # Executable layout: x86_64-unknown-linux-musl links static-pie (ASLR of the
 # image); the Rust aarch64-unknown-linux-musl target does not support
@@ -86,14 +90,10 @@ linker_var="CARGO_TARGET_$(printf '%s' "$triple" | tr 'a-z-' 'A-Z_')_LINKER"
 if [[ -z "${!linker_var:-}" ]]; then
     export "$linker_var=rust-lld"
 fi
+# shellcheck source=scripts/c-toolchain.sh disable=SC1091
+. "$here/c-toolchain.sh"
+robodr_pin_cc "$triple" build-static || exit 1
 cc_var="CC_$(printf '%s' "$triple" | tr '-' '_')"
-if [[ -z "${!cc_var:-}" ]]; then
-    if ! command -v clang >/dev/null; then
-        echo "build-static: clang not found: it compiles ring's C/assembly for $triple (or set $cc_var)" >&2
-        exit 2
-    fi
-    export "$cc_var=clang"
-fi
 echo "build-static: $triple, linker ${!linker_var}, C compiler ${!cc_var}, SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" >&2
 
 if ! rustup target list --installed 2>/dev/null | grep -qx "$triple"; then
@@ -141,5 +141,6 @@ for b in "${bins[@]}"; do
     install -m 0755 "$bin_dir/$b" "$out/$b"
 done
 (cd "$out" && sha256sum "${bins[@]}" >SHA256SUMS)
+robodr_toolchain_report >"$out/TOOLCHAIN.txt"
 echo "build-static: ${#bins[@]} static binaries checked, copied to $out" >&2
 cat "$out/SHA256SUMS"
