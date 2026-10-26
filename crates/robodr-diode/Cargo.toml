@@ -18,6 +18,11 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 robodr-events = { workspace = true }
+# TEST ORACLE ONLY (tests/fec_oracle.rs): an independent BCH-view
+# Reed-Solomon codec over GF(2^8)/0x11D, the same code as src/fec.rs, used to
+# pin our parity bytes. Never a runtime dependency: it is unmaintained since
+# 2018 and not audited. See src/fec.rs, "Why in-crate".
+reed-solomon = "0.2.1"
 
 [[bin]]
 name = "robodr-diode-pack"
