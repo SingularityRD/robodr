@@ -1,6 +1,9 @@
 //! `robodr-spool-export`: agentd findings spool -> diode packer outbox.
 //! See `robodr_export::spool_export`.
 
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+
 use robodr_diode::cli::{argv, load_signer, parse_args_with_switches, Args};
 use robodr_diode::{PackConfig, Packer};
 use robodr_export::{now_ms, ExportConfig, Exporter};

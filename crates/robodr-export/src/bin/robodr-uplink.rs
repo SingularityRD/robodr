@@ -3,6 +3,9 @@
 //! `robodr_export::uplink` (delivery), `uplink::service` (the loop, status
 //! file, backoff) and `uplink::reinject` (the `reinject` subcommand).
 
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+
 use robodr_agentd::notify::Notifier;
 use robodr_blackbox::sign_ed25519::Ed25519SigningKey;
 use robodr_diode::cli::{argv, parse_args_with_switches, Args};

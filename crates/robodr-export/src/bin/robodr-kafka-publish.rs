@@ -1,6 +1,9 @@
 //! `robodr-kafka-publish`: diode importer output (or a site spool) ->
 //! Kafka (`--topic`, default `robodr.findings`). See `robodr_export::publish`.
 
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+
 use robodr_diode::cli::{argv, parse_args_with_switches, Args};
 use robodr_export::kafka::{Producer, ProducerConfig};
 use robodr_export::{PublishConfig, Publisher, Source};
