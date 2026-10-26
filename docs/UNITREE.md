@@ -151,6 +151,17 @@ Verify the release at the entry station first ([OPERATIONS.md section 2](OPERATI
    sudo robodr-agentd --config /etc/robodr/agentd.json --check-config
    ```
 
+   For a Go1 (legacy UDP), list the hosts allowed to command the robot in
+   `sensor.unitree_legacy.command_senders`, each as `{ "ip": …, "mac": …,
+   "label": … }` (`mac` and `label` optional). A command from an unlisted IP
+   is Critical (`robot.unitree.legacy_unknown_sender`; more than 16 distinct
+   unknown senders are aggregated into `legacy_sender_flood`); a listed IP
+   seen with another MAC is High (`legacy_sender_mac_mismatch`) and is not
+   attributed. A MAC can still be forged by a host on the same L2 segment.
+   Legacy ports that fall inside a configured DDS domain's RTPS port range
+   are refused at `--check-config`; an RTPS-looking datagram on a legacy
+   port is inspected on both paths and raises `legacy_port_rtps`.
+
 7. **Sensor-box drop-in.** It restates the `CAP_NET_RAW`-only floor, resets
    any `IPAddressAllow=` so agentd has no IP access at all, and orders agentd
    after the writable data mount (`RequiresMountsFor=/var/lib/robodr`):
@@ -399,6 +410,11 @@ policy says (details in
 * **No process termination on balancing robots**, a process quarantine
   always needs approval (it may be the balance controller), and the control
   plane refuses `rollback_config` (a controller restart) with `fall_hazard`.
+
+Response-policy overrides match a finding's rule id exactly. Every Pulsar
+(host) detection reaches the planner as `robot.host.pulsar_threat`, so a
+policy cannot single out one host rule (the example policies therefore carry
+no host-egress override).
 
 Start from `config/response-policy.unitree-{g1,go2}.example.json`; both are
 `oem_validated: false`, so every response is recorded, not acted on, until

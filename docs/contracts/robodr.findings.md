@@ -415,7 +415,7 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
   | --- | --- |
   | 1.0 – 1.2 | base catalog |
   | 1.3 – 1.x, 2.0 | base + the 1.3 entries, exactly as 1.3.0 shipped (2.0 did not change the catalog) |
-  | 2.1 and later | + the 2.1 entries: the low-level joint-frame firewall ids (`robot.firewall.joint_*`, `disabled_motor_energised`, `crc_invalid`), `robot.motion.api_id_out_of_range`, `robot.motion.control_handover` and `robot.unitree.legacy_unknown_sender` |
+  | 2.1 and later | + the 2.1 entries: the low-level joint-frame firewall ids (`robot.firewall.joint_*`, `disabled_motor_energised`, `crc_invalid`), `robot.motion.api_id_out_of_range`, `robot.motion.control_handover`, `robot.motion.command_type_mismatch` and the Unitree legacy-UDP ids `robot.unitree.legacy_unknown_sender`, `legacy_sender_flood`, `legacy_sender_mac_mismatch`, `legacy_port_rtps` |
 
   A finding of an older minor for a rule that only gained an entry in a
   later minor carries the generic entry and stays valid; a finding of that
@@ -754,6 +754,13 @@ safely. Nothing here is specific to one product.
     generation: a command or state frame from a host the sensor
     configuration does not list). Added while 2.1.0 was still unreleased;
     a producer of an earlier 2.1 build reported it with the generic entry.
+  - Also added while 2.1.0 was unreleased (same caveat):
+    `robot.unitree.legacy_sender_flood` (unknown legacy senders aggregated
+    after 16 distinct sources per class), `robot.unitree.legacy_sender_mac_mismatch`
+    (a listed sender IP seen with another MAC), `robot.unitree.legacy_port_rtps`
+    (an RTPS-looking datagram on a configured legacy port) and
+    `robot.motion.command_type_mismatch` (a changed, unknown or feedback type
+    announced on a profiled command channel).
   - Schema `$id` `https://schemas.singularityrd.com/robodr/findings/2.1.0`;
     `contract_version` parts at most 9 digits and `ocsf.metadata.log_name`
     not `.` / `..` (as the validator always required).

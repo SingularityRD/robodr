@@ -436,14 +436,14 @@ yalnızca bir kısmını kutudan çıkar çıkmaz yapar. Unitree'nin SDK2'si ve 
 paketi **Cyclone DDS 0.10.x** üzerinde çalışır (Go2, B2, H1, G1); RoboDR'ın RTPS
 ayrıştırıcısı Cyclone trafiğini zaten gerçek yakalamalarla doğrulanmış şekilde okuyor.
 
-| Yetenek | Bugün | Unitree için gereken |
+| Yetenek | Bugün (2026-10-26) | Kalan |
 |---|---|---|
-| DDS grafiği, rogue participant / bilinmeyen yayıncı tespiti (`rt/lowcmd` vb.) | ✅ Protokol düzeyinde çalışmalı (Cyclone) — **Unitree trafiğiyle doğrulanmadı** | Gerçek Go2/G1 yakalamaları, profil öğrenme |
-| Hareket içeriğini okuma (CDR) | ❌ Yalnız standart ROS tipleri (Twist, JointTrajectory, …) | Unitree IDL decoder'ları: `unitree_go::msg::dds_::LowCmd_/LowState_/SportModeState_`, `unitree_hg::msg::dds_::LowCmd_/LowState_` (G1/H1-2), `unitree_api::msg::dds_::Request_` (sport API, JSON parametreli) — tip adları lab'da doğrulanacak |
-| Motion Firewall zarfı | ❌ Twist/trajectory zarfı | Eklem başına q/dq/tau/kp/kd sınırları, LowCmd CRC kontrolü, sport API `Move` hız sınırları; 500 Hz–1 kHz düşük seviye döngü için gecikme bütçesi |
-| Host izleme (Pulsar) | Robot üstü Linux gerekir | Yalnız **EDU** modellerinde erişilebilen geliştirme bilgisayarı (Jetson, arm64); L4T çekirdeğinde BTF/eBPF doğrulanmalı. Ana hareket kontrolcüsü kapalı → kurulamaz |
-| Agentless mod | Tasarım var (Sentinel Box) | Robotun 192.168.123.0/24 Ethernet'ine port-mirror / tap ile pasif sensör — firmware'e dokunmadan; Air/Pro gibi kapalı modeller için tek yol |
-| Yanıt | ❌ | `quarantine_node`/`isolate_network` (dış kutuda nftables); `restrict_motion` sport API üzerinden; **insansıda `safe_pause` = düşme riski** → G1/H1'de GA'da yürütülmez, yalnız plan |
+| DDS grafiği, rogue participant / bilinmeyen yayıncı tespiti (`rt/lowcmd` vb.) | ✅ Canlı (agentd), sentetik Cyclone trafiğiyle uçtan uca test | Gerçek Go2/G1 yakalamaları |
+| Hareket içeriğini okuma (CDR) | ✅ Tüm SDK2 tipleri + eski UDP (Go1); bağımsız vektörlerle doğrulandı | Gerçek trafikle doğrulama; Go1 sıkıştırılmış düşük seviye çerçeve |
+| Motion Firewall zarfı | ✅ Eklem başına q/dq/tau/kp/kd, adım/PD tork, CRC, mod pin'leri; 1 kHz'te p99 ≈ 7–9 µs (VM) — **yalnız kayıt modu** | In-path gateway; Jetson/RT çekirdekte ölçüm |
+| Host izleme (Pulsar) | ✅ Kural paketi (`rules/robodr/unitree.toml`); JetPack 5/6 için statik `robodr-focal` paketi (agentd-only) | `robodr-pulsard` için BTF'li çekirdek + glibc 2.35 build; kapalı ana kontrolcü kapsanamaz |
+| Agentless mod | ✅ Sensör kutusu yapılandırması, systemd drop-in, networkd/nftables örnekleri, VLAN | Referans donanım imajı (S7), sahada deneme |
+| Yanıt | ✅ İnsansıda enerji kesen aksiyon yok, ikameler onaylı, `min_motion_factor`; hepsi plan/kayıt | Yürütücü (S7), `restrict_motion` sport API adaptörü (S8) |
 
 **Unitree'ye özgü tehditler (satış argümanı):** UniPwn (Eyl 2025) — BLE Wi-Fi
 yapılandırma servisinde sabit anahtarlar ve komut enjeksiyonu (CVE-2025-35027) ile
@@ -511,6 +511,20 @@ katılımcısı / `rt/lowcmd`'ye yetkisiz yazıcı, imzalı kara kutu ile adli k
 > **ajansız sensör kutusu** referans imajı (S7) yok (örnek yapılandırma var);
 > Unitree döngü hızında **gecikme bütçesi ölçümü** yapılmadı;
 > Pulsar sensörü `robot_model` almıyor; `restrict_motion` sport API adaptörü yok.
+>
+> **Bağımsız inceleme turları (2026-10-26):** her parça kodu yazmayan ayrı bir
+> ajan tarafından Unitree'nin kendi kaynaklarına karşı denetlendi; bulunan
+> kritik/yüksek bulguların tamamı test-önce düzeltildi: firewall (8b93df1),
+> decoder'lar (85c0223 — kol SDK `mode=0`, tork/kp komutları, `api_id`
+> 32-bit takma adı), yanıt kuralları (f134cc0), sözleşme sürümleme (4c455cf,
+> bf93713), canlı entegrasyon (fe9acb7 — sıkıştırılmış Go1 komutunda gönderici
+> kontrolü, eski UDP portunda RTPS kılığı, kanal türü, morfoloji varsayılanı,
+> sahte kaynak seli, VLAN), paketleme/kurallar (efdac01, da81991, 23ce654 —
+> Ubuntu 20.04/22.04 EDU için statik musl `robodr-focal` paketi, systemd 245
+> birimleri, eksik kalıcılık/tünel kuralları). Son durum: 2196+ test, 0 hata;
+> 86 kural, 659 fixture, benign korpusta 0 yanlış pozitif; `cargo deny` temiz.
+> Ek kalan sınırlar: eski UDP komutlarında firewall kaynak kimliği yok (yalnız
+> zarf + gönderici kontrolü); MAC bağlama aynı L2'de sahtelenebilir.
 
 **Unitree işleri sprint planına:**
 - **S0:** Go2 EDU + G1 EDU tedarik; firmware sürümlerini sabitle; ağ topolojisi ve
