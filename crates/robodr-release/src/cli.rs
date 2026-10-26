@@ -195,6 +195,14 @@ fn now(a: &Args) -> Result<u64, Cmd> {
 fn keygen(args: Vec<String>) -> Result<(), Cmd> {
     let a = parse(args, &["out", "key-id"], &[])?;
     let out = PathBuf::from(req(&a, "out")?);
+    if let Some(id) = opt(&a, "key-id")? {
+        // The delivery formats' key-id rule (stricter than the key file's).
+        if !robodr_pkg::common::is_key_id(id) {
+            return Err(Cmd::Usage(format!(
+                "--key-id {id:?} is not [A-Za-z0-9._:-]{{1,64}}"
+            )));
+        }
+    }
     let k = KeyFile::generate_ed25519(opt(&a, "key-id")?).map_err(|e| Fail::Io(e.to_string()))?;
     let pub_path = public_key_path(&out);
     let public = k.to_public().map_err(|e| Fail::Io(e.to_string()))?;

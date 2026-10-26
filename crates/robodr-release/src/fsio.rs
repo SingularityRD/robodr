@@ -17,6 +17,10 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+/// Most entries (files and directories) [`walk`] lists: a bundle's file
+/// cap plus room for its directories.
+pub const MAX_ENTRIES: usize = robodr_pkg::bundle::MAX_FILES + robodr_pkg::bundle::MAX_RPKS * 2 + 2;
+
 /// Buffer for streaming hashes and copies.
 pub const IO_BUF: usize = 1024 * 1024;
 
@@ -140,10 +144,14 @@ pub fn walk(root: &Path) -> Result<Tree, Fail> {
     let mut t = Tree::default();
     let mut stack = vec![(root.to_path_buf(), String::new())];
     while let Some((dir, rel)) = stack.pop() {
-        let mut entries: Vec<_> = fs::read_dir(&dir)
-            .map_err(|e| io_err(&dir, e))?
-            .collect::<Result<_, _>>()
-            .map_err(|e| io_err(&dir, e))?;
+        let mut entries = Vec::new();
+        for e in fs::read_dir(&dir).map_err(|e| io_err(&dir, e))? {
+            entries.push(e.map_err(|e| io_err(&dir, e))?);
+            // Bounded before the whole listing is held in memory.
+            if t.files.len() + t.dirs.len() + entries.len() > MAX_ENTRIES {
+                return Err(refuse(Code::TooLarge, root, "too many entries"));
+            }
+        }
         entries.sort_by_key(|e| e.file_name());
         for e in entries {
             let name = e.file_name().into_string().map_err(|n| {
@@ -154,9 +162,6 @@ pub fn walk(root: &Path) -> Result<Tree, Fail> {
             } else {
                 format!("{rel}/{name}")
             };
-            if t.files.len() + t.dirs.len() > robodr_pkg::bundle::MAX_FILES * 2 {
-                return Err(refuse(Code::TooLarge, root, "too many entries"));
-            }
             let ft = e.file_type().map_err(|x| io_err(&e.path(), x))?;
             if ft.is_dir() {
                 stack.push((e.path(), r.clone()));

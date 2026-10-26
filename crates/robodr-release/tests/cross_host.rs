@@ -464,4 +464,18 @@ fn cli_usage_and_version() {
         run(&["sign", "--key", "/nonexistent", "--target", "/nonexistent"]).0,
         1
     );
+    // A key id the delivery formats would refuse is refused at keygen.
+    let tmp = Tmp::new("keygen");
+    let k = tmp.path().join("k.key");
+    assert_eq!(run(&["keygen", "--out", s(&k), "--key-id", "a b"]).0, 2);
+    assert_eq!(
+        run(&["keygen", "--out", s(&k), "--key-id", &"k".repeat(65)]).0,
+        2
+    );
+    assert!(!k.exists());
+    // The derived id (no --key-id) is accepted.
+    let v = ok(&["keygen", "--out", s(&k)]);
+    assert!(v["key_id"].as_str().unwrap().starts_with("ed25519:"));
+    // keygen never overwrites.
+    assert_eq!(run(&["keygen", "--out", s(&k)]).0, 1);
 }
