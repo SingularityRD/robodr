@@ -596,6 +596,14 @@ impl ActionExecutor for ControlExecutor {
     fn refresh(&mut self, request_id: &str) -> Option<ExecutorOutcome> {
         lock(&self.shared).outcomes.get(request_id).and_then(map)
     }
+
+    // control plane v2 review, finding 3.
+    fn discard(&mut self, request_id: &str, revert: bool) {
+        lock(&self.staged).retain(|s| match s {
+            Staged::Submit(o) | Staged::Evidence(o) => revert || o.id != request_id,
+            Staged::Revert { id, .. } => !revert || id != request_id,
+        });
+    }
 }
 
 /// The planner's executor: the steps a real executor may request without
@@ -792,6 +800,26 @@ impl ExecutorLink {
     ) -> Order {
         attach_locators(o, bound, &self.book)
     }
+}
+
+// --- control plane v2 review, finding 3 ---------------------------------------
+/// Whether the daemon may release a staged control-plane order: its
+/// request must be stored (recorded in the black box and journalled), still
+/// `pending` (never handed out before), and be the request the order was
+/// made for (same action, TTL and SOC key): a stale order staged by a call
+/// that failed can never ride on a later request with the same id.
+pub fn release_ok(o: &Order, stored: Option<&crate::control::api::Stored>) -> bool {
+    let Some(s) = stored else {
+        return false;
+    };
+    let key_ok = match &o.origin {
+        Origin::ControlPlane { key_id, .. } => *key_id == s.key_id,
+        Origin::Planner { .. } => false,
+    };
+    key_ok
+        && s.status == crate::control::api::Status::Pending
+        && s.request.action == o.action
+        && s.request.ttl_seconds == o.ttl_s
 }
 
 #[cfg(test)]

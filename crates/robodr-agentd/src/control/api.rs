@@ -931,6 +931,11 @@ pub trait ActionExecutor {
     fn refresh(&mut self, _request_id: &str) -> Option<ExecutorOutcome> {
         None
     }
+    /// Forget what [`Self::submit`] (`revert: false`) or [`Self::revert`]
+    /// (`revert: true`) staged for `request_id`: the engine calls this on
+    /// every path that answers `failed` / 503 after asking, so an order for
+    /// a request that was never recorded can never be released.
+    fn discard(&mut self, _request_id: &str, _revert: bool) {}
 }
 
 /// Executes nothing: every accepted request stays a recorded plan.
@@ -1397,6 +1402,7 @@ impl Engine {
             Ok(d) => d,
             Err(e) => {
                 self.stats.journal_refusals += 1;
+                self.executor.discard(&req.request_id, false);
                 return failed(
                     "state_unavailable",
                     format!("no randomness for a decision id ({e}); nothing was decided"),
@@ -1408,6 +1414,7 @@ impl Engine {
             stored: super::state::PStored::of(&stored),
         }) {
             self.stats.journal_refusals += 1;
+            self.executor.discard(&req.request_id, false);
             return failed(
                 "state_unavailable",
                 "the request journal did not take the request; nothing was decided or stored, \
@@ -1444,6 +1451,7 @@ impl Engine {
                 // A failed abort is settled at the next start: the black
                 // box holds no note with this decision id.
                 let _ = self.journal(&super::state::Entry::Abort { decision_id });
+                self.executor.discard(&req.request_id, false);
                 return failed(
                     "evidence_unavailable",
                     format!(
@@ -1554,6 +1562,7 @@ impl Engine {
                 Ok(d) => d,
                 Err(_) => {
                     self.stats.journal_refusals += 1;
+                    self.executor.discard(id, true);
                     return Answer::error(&ApiError::new(
                         503,
                         "state_unavailable",
@@ -1574,6 +1583,7 @@ impl Engine {
             };
             if !self.journal(&begin) {
                 self.stats.journal_refusals += 1;
+                self.executor.discard(id, true);
                 return Answer::error(&ApiError::new(
                     503,
                     "state_unavailable",
@@ -1609,6 +1619,7 @@ impl Engine {
                 if let Some(d) = decision_id {
                     let _ = self.journal(&super::state::Entry::RevertAbort { decision_id: d });
                 }
+                self.executor.discard(id, true);
                 return Answer::ok(json!({
                     "request_id": id,
                     "status": "failed",

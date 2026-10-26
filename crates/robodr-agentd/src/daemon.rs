@@ -2478,11 +2478,14 @@ impl Daemon<'_> {
                     // is stored (i.e. recorded); a planner order's plan was
                     // recorded before the agent offered it.
                     let recorded = match &o.origin {
-                        robodr_executor::Origin::ControlPlane { .. } => self
-                            .control
-                            .as_ref()
-                            .and_then(|c| c.engine.get(&o.id))
-                            .is_some(),
+                        // CP review finding 3: the stored request must be
+                        // the one this order was made for.
+                        robodr_executor::Origin::ControlPlane { .. } => {
+                            crate::executor_link::release_ok(
+                                &o,
+                                self.control.as_ref().and_then(|c| c.engine.get(&o.id)),
+                            )
+                        }
                         robodr_executor::Origin::Planner { .. } => true,
                     };
                     if recorded {
@@ -2513,6 +2516,7 @@ impl Daemon<'_> {
                         .control
                         .as_ref()
                         .and_then(|c| c.engine.get(&o.id))
+                        .filter(|s| crate::executor_link::release_ok(&o, Some(s)))
                         .map(|s| vec![s.evidence.clone()])
                         .unwrap_or_default();
                     if refs.is_empty() {
