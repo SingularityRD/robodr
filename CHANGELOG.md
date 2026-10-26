@@ -19,18 +19,21 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   its deterministic vectors `docs/contracts/fixtures/fleet/` (generator,
   byte-identical test, replay through a reference SOC) specify it.
   - Enrollment with a single-use token signed by the SOC fleet key (robot
-    id, site, workspace, validity <= 7 days, 256-bit secret): the unit's
-    uplink, finding and black-box keys are generated on the unit (0600) and
-    registered by a request signed with the new uplink key and MAC'd with
-    the token secret (the token never leaves the unit); online over HTTPS
-    (robodr-uplink's client) or as files on vetted media (air-gapped).
+    id, site, workspace, validity <= 7 days, 256-bit secret), read from a
+    root-only file or standard input (never argv): the unit's uplink,
+    finding and black-box keys are generated on the unit (0600) and
+    registered by a request signed by all three new keys (proof of
+    possession) and MAC'd with the token secret (the token never leaves the
+    unit); online over HTTPS (robodr-uplink's client) or as files on vetted
+    media (air-gapped).
     Local checks: SOC signature, validity, workspace / robot / site binding,
     local replay guard; the answer must match the request exactly.
   - `rotate --role uplink|finding`: overlap (the old key stays valid until
     the SOC confirms), atomic swap, old key kept in `retired/` until the
     SOC retires it, then shredded; crash-safe journal (resumes at every
     step; the crash points are tested); a key handover signed by both keys
-    over the fleet journal's head.
+    over the fleet journal's head. A sent rotation is never abandoned
+    locally: `rotate --cancel` ends it at the SOC (signed by the old key).
   - Fleet journal: a robodr-blackbox chain signed with the black-box key
     (`/var/lib/robodr/fleet/journal`) recording every lifecycle step.
   - `revocations`: the root-signed revocation list from the SOC, verified
@@ -39,17 +42,22 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
     profile would be refused.
   - `profile publish | fetch | stage | approve`: SOC-published signed
     profiles are verified with agentd's own trust inputs and staged, never
-    enforced; only an operator running `approve` with a SOC-signed approval
-    for this robot and digest (unexpired, single use) installs them.
-  - `ring`: update-ring information (0/1/2), information only.
+    enforced; only an operator running `approve` with an approval signed by
+    the SOC's separate approval key (`soc.approval_keys`) for this robot and
+    digest (valid <= 7 days, unexpired, single use) installs them.
+  - `ring`: update-ring information (0/1/2), information only, except its
+    minimum release, which raises the unit's security floor.
   - Fuzz targets `fleet_token` and `fleet_envelope` with std-only smoke
     tests.
 - `install-bundle.sh`: black-box format gate on install and rollback (each
   package ships `/usr/share/robodr/formats`; a release that cannot read a
-  segment on the unit is refused, naming it), `list` shows the formats each
-  kept release reads, `ring` prints the SOC ring information; tested against
-  the real `dpkg` (install -> upgrade -> rollback, refused rollback across a
-  format change) in `crates/robodr-fleet/tests/packaging.rs`.
+  recognised segment format on the unit is refused, naming it;
+  `--accept-unreadable SEG` accepts one segment; unknown frames are
+  reported and do not block), `list` shows the formats each kept release
+  reads and the security floor, `ring` prints the SOC ring information;
+  tested against the real `dpkg` (install -> upgrade -> rollback, refused
+  rollback across a format change, downgrade and floor, signed install) in
+  `crates/robodr-fleet/tests/packaging.rs`.
 - `robodr-uplink`'s HTTPS transport takes a method and request target
   (`HttpsTransport::request`, `Endpoint::parse_with_path`), shared with
   `robodr-enroll`; ingest behaviour unchanged.
@@ -939,6 +947,39 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 - `robodr-agentd` test `queue_overflow_is_counted_and_reported` was flaky:
   it stopped the daemon before the socket reader had read every line. It
   now waits for `received == 5000` in the status file first.
+
+
+### Security
+
+- Fleet lifecycle and offline bundle, review fixes before the first
+  release that ships them:
+  - `install-bundle.sh install|verify --pubkey --tarball` verifies the
+    tarball (and the release `SHA256SUMS.minisig` when it lies next to it),
+    extracts it into a private `mktemp -d` and installs from there; an
+    extracted bundle directory the script runs from must equal the signed
+    content (a signed tarball next to a modified extraction was accepted
+    before). The package installs `/usr/lib/robodr/install-bundle.sh` as
+    the trusted verifier for upgrades; OPERATIONS 3 now says to verify
+    before extracting.
+  - Downgrades through `install` need `--allow-downgrade`; a per-unit
+    security floor (bundle `security-floor`, ring `min_version`; only
+    rises) is enforced by install and rollback with no override.
+  - `rollback <version>` takes a version, never a path; `--blackbox-dir`
+    refuses glob characters and is no longer word-split.
+  - `robodr-enroll`: the token is refused on argv; the token file must be
+    root-only. Rotations persist a `sent` mark and are cancelled at the SOC
+    instead of being abandoned locally (a lost answer no longer blocks
+    every later rotation). Approvals come from a separate SOC approval key
+    and are valid at most 7 days. SOC key files must be root-owned in a
+    private directory. Files for agentd get owner and mode on the
+    descriptor before the rename, in a directory not writable by others; a
+    damaged installed revocation list is reinstalled. Ring information
+    issued in the future is refused.
+  - Contract `robodr.fleet-api` draft v1 revised (§11): proof of possession
+    of every key at enrollment, SOC-wide key uniqueness, cancel endpoint,
+    authenticating key of uplink rotations (`401 wrong_key`), SOC key
+    rotation and revocation, replay note; vectors regenerated (cases
+    15-17).
 
 ## [0.1.0-alpha.1] - 2026-10-16
 

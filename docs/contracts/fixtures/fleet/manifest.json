@@ -353,7 +353,7 @@
       "role": "root"
     }
   ],
-  "run": "each case starts from an empty workspace whose SOC fleet key is keys/soc.key; register the setup tokens (as issued: the token file), serve the setup publications verbatim (revocations by platform, offers and rings by robot, approvals by digest hex), then send the requests in order with the server clock at server_time_ms; target includes base_path",
+  "run": "each case starts from an empty workspace whose SOC fleet key is keys/soc.key and approval key keys/soc-approval.key (approvals are served verbatim); register the setup tokens (as issued: the token file), serve the setup publications verbatim (revocations by platform, offers and rings by robot, approvals by digest hex), then send the requests in order with the server clock at server_time_ms; target includes base_path",
   "soc_key": "keys/soc.key.pub",
   "tokens": [
     {

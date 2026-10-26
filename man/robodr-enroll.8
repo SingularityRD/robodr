@@ -7,19 +7,17 @@ robodr\-enroll \- enroll a RoboDR unit with the SOC, rotate its keys, take revoc
 .SH SYNOPSIS
 .B robodr\-enroll
 .RB [ enroll ]
-.RB ( \-\-token
-.I TOKEN
+.RB ( \-\-token\-file
+.I FILE
 |
-.B \-\-token\-file
-.IR FILE )
+.BR "\-\-token \-" )
 .RB [ \-\-reuse\-existing\-keys ]
 .br
 .B robodr\-enroll request
-.RB ( \-\-token
-.I TOKEN
+.RB ( \-\-token\-file
+.I FILE
 |
-.B \-\-token\-file
-.IR FILE )
+.BR "\-\-token \-" )
 .B \-\-out
 .I FILE
 .br
@@ -29,6 +27,15 @@ robodr\-enroll \- enroll a RoboDR unit with the SOC, rotate its keys, take revoc
 .B robodr\-enroll rotate \-\-role
 .BR uplink | finding
 .RB [ \-\-finish ]
+.RB [ \-\-request\-out
+.I FILE
+|
+.B \-\-answer
+.IR FILE ]
+.br
+.B robodr\-enroll rotate \-\-role
+.BR uplink | finding
+.B \-\-cancel
 .RB [ \-\-request\-out
 .I FILE
 |
@@ -102,8 +109,20 @@ and
 Ed25519 keys on the unit (mode 0600, the public halves as
 .IR .pub ),
 sends the enrollment request (public keys, agentd version, profile digest;
-signed by the new uplink key, with an HMAC under the token secret; the token
-itself is never sent) and verifies the SOC-signed answer. An existing key
+signed by each of the three new keys, proving possession of each, with an
+HMAC under the token secret; the token itself is never sent) and verifies
+the SOC-signed answer.
+.PP
+The token is a secret until the SOC consumes it and is never accepted on
+the command line (it would show in
+.IR /proc/<pid>/cmdline ,
+sudo logs and the shell history):
+.B \-\-token\-file
+names a file that must be owned by root and not accessible by group or
+others (mode 0600; destroy it afterwards with
+.BR "shred \-u" ),
+.B "\-\-token \-"
+reads it from standard input. An existing key
 file is refused unless
 .B \-\-reuse\-existing\-keys
 (e.g. the black-box key of an agentd that already runs). A token is used
@@ -139,9 +158,19 @@ step is journaled; after a crash the same command resumes.
 and
 .B \-\-answer
 do the same with files.
+.PP
+Once the rotate request has been sent (or written with
+.BR \-\-request\-out ),
+the SOC may hold the rotation even when its answer was lost, so the
+rotation is never abandoned locally:
 .B \-\-abort
-discards a rotation the SOC has not registered. The black-box key is not
-rotated by this tool (OPERATIONS 4.3).
+only discards a rotation whose request never left the unit. Otherwise run
+the same command again (the SOC answers with its stored answer), or
+.B rotate \-\-role R \-\-cancel
+to end it at the SOC: the cancel request is signed by the old key, the SOC
+retires the new key (or records the rotation id as cancelled if it never
+saw it), and the unit shreds the new key; the old key stays active. The
+black-box key is not rotated by this tool (OPERATIONS 4.3).
 .SS Revocation lists, profiles, ring
 .B revocations
 fetches the root-signed revocation list for the unit's platform, verifies it
@@ -162,16 +191,29 @@ it: it is not enforced.
 .B profile approve
 installs the staged profile at agentd's
 .I profile_path
-only with an approval artefact signed by the SOC for exactly this robot and
-profile digest, unexpired and not used before; restart agentd to enforce it.
+only with an approval artefact signed by a SOC
+.B approval key
+.RI ( soc.approval_keys ,
+never the online fleet key) for exactly this robot and profile digest,
+valid at most 7 days, unexpired and not used before; restart agentd to
+enforce it. The new profile and
+.I .sig
+are both written completely before the two renames
+.RI ( .sig
+first); a crash between them leaves a pair agentd refuses (observe-only)
+until
+.B approve
+is run again.
 .PP
 .B ring
-fetches the SOC's update-ring information (ring 0/1/2, target release),
-verifies it and writes
+fetches the SOC's update-ring information (ring 0/1/2, target release,
+minimum release), verifies it (a document issued in the future is refused)
+and writes
 .I /var/lib/robodr/fleet/ring.env
 for
-.BR install\-bundle.sh .
-Information only: nothing is downloaded or installed.
+.BR install\-bundle.sh ,
+which raises the unit's security floor to the minimum release. Otherwise
+information only: nothing is downloaded or installed.
 .SH OPTIONS
 .TP
 .BI \-\-config " FILE"
@@ -189,8 +231,21 @@ the SOC's CA certificate(s), the only TLS trust anchor.
 .BI \-\-spki\-sha256 " HEX"
 pin the SOC server key (repeatable).
 .TP
+.BI \-\-token\-file " FILE"
+the enrollment token, in a file owned by root, mode 0600.
+.TP
+.B "\-\-token \-"
+read the enrollment token from standard input (any other value of
+.B \-\-token
+is refused).
+.TP
 .BI \-\-soc\-key " FILE"
-SOC fleet public key file (repeatable).
+SOC fleet public key file (repeatable): owned by root, not writable by
+group or others, in a directory not writable by group or others.
+.TP
+.BI \-\-approval\-key " FILE"
+SOC approval public key file (repeatable; the same rules): the only keys a
+profile approval is accepted from; never one of the fleet keys.
 .TP
 .BI \-\-agentd\-config " FILE"
 agentd's configuration (robot id, site, profile path and trust inputs).
@@ -199,6 +254,9 @@ agentd's configuration (robot id, site, profile path and trust inputs).
 .I /etc/robodr/fleet.json
 configuration (example:
 .IR /usr/share/doc/robodr/examples/fleet.example.json ).
+.TP
+.IR /etc/robodr/fleet\-soc.pub ", " /etc/robodr/fleet\-approval.pub
+the SOC's fleet key and approval key (from the SOC on vetted media).
 .TP
 .I /var/lib/robodr/fleet/
 state: enrollment, rotation journals, staged profile, replay guards, the

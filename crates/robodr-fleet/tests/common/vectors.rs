@@ -741,7 +741,7 @@ pub fn files() -> Vec<(String, Vec<u8>)> {
         "base_path": BASE,
         "soc_key": "keys/soc.key.pub",
         "approval_key": "keys/soc-approval.key.pub",
-        "run": "each case starts from an empty workspace whose SOC fleet key is keys/soc.key; register the setup tokens (as issued: the token file), serve the setup publications verbatim (revocations by platform, offers and rings by robot, approvals by digest hex), then send the requests in order with the server clock at server_time_ms; target includes base_path",
+        "run": "each case starts from an empty workspace whose SOC fleet key is keys/soc.key and approval key keys/soc-approval.key (approvals are served verbatim); register the setup tokens (as issued: the token file), serve the setup publications verbatim (revocations by platform, offers and rings by robot, approvals by digest hex), then send the requests in order with the server clock at server_time_ms; target includes base_path",
         "compare": "status; error bodies by code; 200 envelopes by type, signer list and decoded payload (JSON value equality; the committed body bytes are the reference's, Ed25519 is deterministic so an implementation serialising payloads as compact JSON in the contract's key order reproduces them exactly); other 200 bodies byte-exact (body_sha256)",
         "keys": keys,
         "tokens": toks,

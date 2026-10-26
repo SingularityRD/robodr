@@ -71,33 +71,65 @@ isolated network are scanned, before anything moves inward.
    `robodr-pulsard`'s reproducibility is not verified yet.
 
 Move into the isolated network only: the offline tarball, its `.minisig`,
-and the public key from your trusted store. The tarball holds the `.deb`,
-`install-bundle.sh`, SBOMs, these docs and an inner `SHA256SUMS`.
+optionally the release `SHA256SUMS` with its `.minisig`, and the public key
+from your trusted store. The tarball holds the `.deb`, `install-bundle.sh`,
+`security-floor`, SBOMs, these docs and an inner `SHA256SUMS`.
 
 ## 3. Install on an air-gapped host
 
 **available**
 
+The script that checks a bundle must itself be trusted: a script taken from
+an unverified extraction can be modified to skip every check. So **verify
+the tarball before extracting it**, and run the verifier from a trusted
+copy.
+
+*First installation* (no RoboDR on the unit yet):
+
 ```sh
-tar -xzf robodr-$V-$A-offline.tar.gz
-cd robodr-$V-$A
-sudo ./install-bundle.sh install \
+minisign -V -p /etc/robodr-trust/robodr-release.pub -m robodr-$V-$A-offline.tar.gz
+sudo mkdir -m 0700 /root/robodr-$V && sudo tar -xzf robodr-$V-$A-offline.tar.gz -C /root/robodr-$V
+sudo sh /root/robodr-$V/robodr-$V-$A/install-bundle.sh install \
     --pubkey /etc/robodr-trust/robodr-release.pub \
-    --tarball ../robodr-$V-$A-offline.tar.gz
+    --tarball robodr-$V-$A-offline.tar.gz
 ```
 
-`install-bundle.sh install`:
+*Upgrades* use the copy the previous, verified release installed:
 
-1. checks the tarball's signature (with `--pubkey` and `--tarball`; without
-   them it refuses unless `ROBODR_ALLOW_UNSIGNED=1`, which is for labs only);
-2. checks every file against the inner `SHA256SUMS`, and fails if any file is
-   not listed;
-3. runs `dpkg -i`. The package creates the `robodr` user (sysusers) and the
-   directories (tmpfiles), and installs the units **disabled**;
-4. keeps the `.deb` under `/var/lib/robodr/releases/<version>/` for
+```sh
+sudo sh /usr/lib/robodr/install-bundle.sh install \
+    --pubkey /etc/robodr-trust/robodr-release.pub \
+    --tarball robodr-$V-$A-offline.tar.gz
+```
+
+`install-bundle.sh install --pubkey … --tarball …`:
+
+1. checks the tarball's minisign signature against the pinned key; if the
+   release's `SHA256SUMS` and `SHA256SUMS.minisig` lie next to the tarball,
+   checks that signature too and that the tarball is listed in it with its
+   hash. Without `--pubkey`/`--tarball` it refuses unless
+   `ROBODR_ALLOW_UNSIGNED=1` (labs only; the bundle is then the directory
+   the script runs from);
+2. extracts the verified tarball into a **private** directory (`mktemp -d`,
+   0700; removed afterwards) and checks every file there against the inner
+   `SHA256SUMS` (any unlisted file fails). Everything below uses that copy,
+   never an already extracted directory. If the script runs from an
+   extracted bundle directory, that directory must be identical to the
+   signed content, otherwise it was modified after extraction and the run
+   is **refused**;
+3. refuses a **downgrade** (a release older than the installed one) unless
+   `--allow-downgrade`, and anything below the unit's **security floor**
+   (section 7), with no override;
+4. runs the black-box format gate (section 7);
+5. runs `dpkg -i`. The package creates the `robodr` user (sysusers) and the
+   directories (tmpfiles), installs the units **disabled**, and installs
+   `/usr/lib/robodr/install-bundle.sh`, the trusted verifier for the next
+   upgrade;
+6. keeps the `.deb` under `/var/lib/robodr/releases/<version>/` for
    rollback.
 
-If `minisign` is not on the robot, verify on the entry station (section 2)
+If `minisign` is not on the robot, verify on the entry station (section 2),
+extract the verified tarball into a fresh root-only directory on the robot
 and install with `ROBODR_ALLOW_UNSIGNED=1`. Record in the site log that the
 signature was checked at the entry station.
 
@@ -1346,7 +1378,8 @@ findings contract yet, so watch this counter instead.
 ## 7. Upgrade and rollback
 
 **Upgrade** (available). Verify the new release (section 2), then run
-`install-bundle.sh install` from the new bundle. `dpkg` keeps local edits to
+`sudo sh /usr/lib/robodr/install-bundle.sh install --pubkey … --tarball …`
+(the trusted copy the installed release brought; section 3). `dpkg` keeps local edits to
 `/etc/robodr/pulsar.toml` (a conffile) and asks before replacing an edited
 one. Services that were running are restarted on the new binaries.
 `/etc/robodr` (profile, keys, configs) and `/var/lib/robodr` (evidence) are
@@ -1411,12 +1444,24 @@ rolling the package back does not touch the anti-rollback state.
 **Rollback** (available):
 
 ```sh
-sudo /path/to/bundle/install-bundle.sh list          # versions kept on this robot
-sudo /path/to/bundle/install-bundle.sh rollback 0.1.0~alpha.1-1
+sudo sh /usr/lib/robodr/install-bundle.sh list       # versions kept on this robot, security floor
+sudo sh /usr/lib/robodr/install-bundle.sh rollback 0.1.0~alpha.1-1
 ```
 
-Rollback reinstalls the kept `.deb` after re-checking its hashes. Evidence
+Rollback reinstalls the kept `.deb` after re-checking its hashes. The
+version must be one `list` shows (a version string, never a path). Evidence
 written by the newer version stays in place.
+
+**Downgrades and the security floor.** `install` of a release older than
+the installed one is refused as a downgrade (it may bring back fixed
+vulnerabilities); `rollback` to a kept release is the normal way back, and
+`install --allow-downgrade` makes a deliberate downgrade possible. Neither
+goes below the unit's **security floor**
+(`/var/lib/robodr/releases/security-floor`, shown by `list`): the highest
+`min_version` ever seen in an installed bundle's `security-floor` file
+(covered by the release signature) or in the SOC's signed ring information
+(`robodr-enroll ring`, 8.6). The floor only rises and has no override:
+releases below it are known to be vulnerable.
 
 **Black-box format gate** (install and rollback). Every package states the
 black-box formats it writes and reads (`/usr/share/robodr/formats`, e.g.
@@ -1424,22 +1469,28 @@ black-box formats it writes and reads (`/usr/share/robodr/formats`, e.g.
 format so far). Before `dpkg` runs, `install-bundle.sh` reads the first
 frame of every segment in `/var/lib/robodr/blackbox` and
 `/var/lib/robodr/fleet/journal` (or the `--blackbox-dir` given) and
-**refuses** a release that cannot read one of them, naming the segment and
-its format: an older agent could neither verify nor extend that chain.
-There is no override. To roll back across a format change, export the
-chain (section 8.2) and archive the directory as in a key rotation (section
-4.3, step 3) first, then roll back; or install a release that reads the
-format. `install-bundle.sh list` shows what each kept release reads. Tested
-against the real `dpkg` (install, upgrade, rollback, a refused rollback
-across a simulated format change, a refused downgrade by `install`, a
-tampered kept release) in `crates/robodr-fleet/tests/packaging.rs`; not yet
-on a robot.
+**refuses** a release that cannot read a segment in a recognised format
+(`RBF1:<version>`), naming the segment and its format: an older agent could
+neither verify nor extend that chain. To roll back across a format change,
+export the chain (section 8.2) and archive the directory as in a key
+rotation (section 4.3, step 3) first, then roll back; or install a release
+that reads the format; or, knowingly, accept that one segment with
+`--accept-unreadable <segment path>` (the release will neither verify nor
+extend it). A file that does not start with a RoboDR frame at all (damaged,
+or not RoboDR's) is reported as such and does not block: check it with
+`robodr-blackbox verify`. `install-bundle.sh list` shows what each kept
+release reads. Tested against the real `dpkg` (install, upgrade, rollback,
+a refused rollback across a simulated format change, a refused downgrade,
+the security floor, unknown frames, a signed install from a tampered
+extracted directory refused, a tampered kept release) in
+`crates/robodr-fleet/tests/packaging.rs`; not yet on a robot.
 
 **Ring information.** When `robodr-enroll ring` has recorded the SOC's
 update-ring information (8.6), `install-bundle.sh install` prints the ring
 and whether the release (and, with `--tarball`, the tarball) is the ring's
-target; `install-bundle.sh ring` shows it. It is information only: the
-installation proceeds (or not) exactly as without it.
+target; `install-bundle.sh ring` shows it. Apart from its minimum release,
+which raises the security floor, it is information only: the installation
+proceeds (or not) exactly as without it.
 
 ## 8. Log and evidence export via the diode
 
@@ -1787,33 +1838,50 @@ agentd's own check at its next start.
 **Configuration** (`/etc/robodr/fleet.json`, from
 `/usr/share/doc/robodr/examples/fleet.example.json`): the SOC URL, CA
 bundle (the uplink's) and optional SPKI pins, the **SOC fleet public key**
-(`/etc/robodr/fleet-soc.pub`, `0644`, copied from the SOC on vetted media
-like the CA bundle: it signs tokens, answers, approvals and ring
-information, and is never taken from a token), the expected workspace, and
+(`/etc/robodr/fleet-soc.pub`: it signs tokens, answers and ring
+information, and is never taken from a token), the **SOC approval public
+key** (`/etc/robodr/fleet-approval.pub`: the only key profile approvals are
+accepted from; a separate, offline key of the SOC, never the fleet key),
+the expected workspace, and
 the key paths (defaults: `/etc/robodr/keys/uplink.key`,
 `agentd-finding.key`, `agentd-blackbox.key`). Robot id, site, profile path
-and the profile trust inputs are read from `/etc/robodr/agentd.json`.
+and the profile trust inputs are read from `/etc/robodr/agentd.json`. Both
+SOC keys come from the SOC on vetted media like the CA bundle and must be
+root-owned, `0644`, in a directory not writable by group or others
+(`robodr-enroll` refuses them otherwise). Rotating or revoking a SOC key
+means installing the new public file next to the old one, then removing the
+old one (contract section 2.7); nothing is ever replaced over the network.
 
 **Enroll (once).** In AutoSecOps, add the robot (id, site); the SOC shows a
 single-use token (`rdet1.…`, valid at most 7 days). On the unit:
 
 ```sh
-sudo install -m 0644 fleet-soc.pub /etc/robodr/fleet-soc.pub      # from the SOC, vetted media
-sudo robodr-enroll --token-file token.txt                          # token in a file, not argv
+sudo install -o root -m 0644 fleet-soc.pub /etc/robodr/fleet-soc.pub            # from the SOC, vetted media
+sudo install -o root -m 0644 fleet-approval.pub /etc/robodr/fleet-approval.pub
+sudo install -o root -m 0600 token.txt /root/token.txt                          # the token is a secret
+sudo robodr-enroll --token-file /root/token.txt
 #   key uplink: ed25519:… (generated) …   enrolled: robot ugv-007 in workspace …
+sudo shred -u /root/token.txt
 ```
+
+The token is never accepted on the command line (`--token TOKEN` is
+refused: argv shows in `/proc`, sudo logs and the shell history). Give it as
+a file owned by root with mode `0600` (anything readable by group or others
+is refused), or on standard input with `--token -`. Destroy the file
+afterwards (`shred -u`; on flash media see the limits below).
 
 It checks the token's SOC signature, validity (on the unit's clock: set the
 clock first), workspace, robot id and site against the unit, generates the
 uplink, finding and black-box keys **on the unit** (0600; the `.pub` files
 0644), and registers their public halves, the agentd version and the
-profile digest with the SOC. The token never leaves the unit (the request
-carries an HMAC under it). An existing key file is refused unless
+profile digest with the SOC; the request is signed by each of the three
+keys (proof that the unit holds them). The token never leaves the unit (the
+request carries an HMAC under it). An existing key file is refused unless
 `--reuse-existing-keys` (for example the black-box key of an agentd that
 ran before enrollment). Then install the finding-key drop-in
 (`20-finding-key.conf`, section 6.4) and enable `robodr-uplink` (8.5).
 
-*Air-gapped units*: `sudo robodr-enroll request --token-file token.txt --out
+*Air-gapped units*: `sudo robodr-enroll request --token-file /root/token.txt --out
 enroll-request.json`, carry the file to the SOC's import (it holds public
 keys and signatures only), bring the answer back and run `sudo
 robodr-enroll accept --answer enroll-answer.json`. The SOC must import the
@@ -1849,9 +1917,16 @@ waits in `/etc/robodr/keys/retired/` until `--finish`. For `finding`, run
 `--finish` only when the findings signed with the old key have reached the
 SOC (the spool is drained): the SOC verifies them with the old key until it
 is retired. Every phase is journaled; after a crash or a lost answer, run the
-same command again. `rotate --role R --abort` discards a rotation the SOC
-never registered. Air-gapped: `--request-out FILE` and `--answer FILE` on
-both steps. Shredding overwrites the old key file before unlinking it; on
+same command again: the request is resent unchanged and the SOC answers with
+its stored answer. Once the rotate request has been sent (or written with
+`--request-out`), the SOC may hold the rotation even if no answer came back,
+so it is never discarded locally: `rotate --role R --abort` works only for a
+rotation whose request never left the unit. To give up a sent rotation, run
+`rotate --role R --cancel`: the cancel request is signed by the old key, the
+SOC retires the new key (or records the rotation as cancelled if it never
+received it), and the unit shreds the new key; the old key stays active and
+a new rotation can start. Air-gapped: `--request-out FILE` and `--answer
+FILE` on every step (rotate, `--finish`, `--cancel`). Shredding overwrites the old key file before unlinking it; on
 flash storage with wear levelling the old blocks may survive (full-disk
 encryption is the remedy). The black-box key is rotated as in section 4.3,
 not with this tool.
@@ -1876,10 +1951,14 @@ sudo systemctl restart robodr-agentd             # agentd verifies it again and 
 
 `fetch` verifies the profile with exactly agentd's trust inputs and
 anti-rollback state and only stages it. `approve` installs it at agentd's
-`profile_path` only with an approval signed by the SOC for this robot, this
-exact digest, version and platform, unexpired and never used before; the
-previous profile and `.sig` are kept under
-`/var/lib/robodr/fleet/profile/backup-<ms>/`. The observe -> enforce
+`profile_path` only with an approval signed by the SOC's **approval key**
+for this robot, this exact digest, version and platform, valid at most 7
+days, unexpired and never used before; the previous profile and `.sig` are
+kept under `/var/lib/robodr/fleet/profile/backup-<ms>/`. The new `.sig` and
+profile are both written completely before they are renamed into place
+(`.sig` first); two files cannot be swapped in one atomic step, so a crash
+between the two renames leaves a pair agentd refuses (observe-only) until
+`approve` is run again with the same approval. The observe -> enforce
 transition therefore always needs the SOC's approval (its own policy, e.g.
 two operators) **and** an operator on the unit. Air-gapped: `profile stage
 --profile FILE [--sig FILE]` and `approve --approval FILE`.
@@ -1887,8 +1966,12 @@ two operators) **and** an operator on the unit. Air-gapped: `profile stage
 **Update ring.** `sudo robodr-enroll ring` shows the ring the SOC put the
 unit in (0 canary, 1 early, 2 broad) and its target release, and writes
 `/var/lib/robodr/fleet/ring.env`, which `install-bundle.sh install` and
-`install-bundle.sh ring` print. Information only: installing stays the
-local, signature-checked step of section 7.
+`install-bundle.sh ring` print; "update available" compares the target
+with the release dpkg has installed. Information only, with one
+restriction: the SOC's minimum release raises the unit's security floor
+(section 7). Installing stays the local, signature-checked step of section
+7. Ring information issued in the future (beyond 5 minutes of clock skew)
+is refused.
 
 | Exit | Meaning |
 |---|---|
@@ -1941,6 +2024,12 @@ The package never deletes evidence or keys, not even on `apt purge`.
 | `robodr-enroll`: `already used on this unit` / SOC `409 token_used` | a token is single use | ask the SOC for a new token; remove `enroll-pending.json` only after the SOC confirms (8.6) |
 | `robodr-enroll`: `is for workspace` / `is for robot` / `is for site` | the token was issued for another workspace, robot or site | issue the token for this unit's `robot.id` / `robot.site` (agentd.json) |
 | `robodr-enroll`: `signed by no configured SOC key` | `fleet-soc.pub` missing, wrong, or the document is forged | re-copy the SOC fleet key from the SOC on vetted media; treat repeated failures as an attack |
+| `robodr-enroll`: `the enrollment token is not accepted on the command line` | `--token TOKEN` | put the token in a root-only file (`--token-file`, mode 0600) or pipe it (`--token -`) (8.6) |
+| `robodr-enroll profile approve`: `approvals are accepted from a SOC approval key only` | the approval is signed by the fleet key, or `fleet-approval.pub` is missing or wrong | install the SOC's approval public key (8.6); an approval signed by the fleet key is never accepted |
+| `robodr-enroll rotate --abort`: `may have reached the SOC` | the rotate request was sent (answer lost) or written out | run `rotate --role R` again (stored answer), or `rotate --role R --cancel` (8.6) |
+| SOC `409 rotation_in_progress` on a new rotation | an earlier rotation is still open at the SOC | finish it, or `rotate --role R --cancel` on the unit that started it |
+| `install-bundle: REFUSED: … differs from the signed tarball` | the extracted bundle directory was modified after extraction | extract the verified tarball again into a fresh directory, or run `/usr/lib/robodr/install-bundle.sh` (section 3) |
+| `install-bundle: REFUSED: … a downgrade` / `below this unit's security floor` | an older release, or one below the floor | `rollback` or `--allow-downgrade` for a deliberate downgrade; nothing goes below the floor (section 7) |
 | `robodr-enroll rotate`: `holds key … but the SOC has …` | the key file was replaced by hand | restore the registered key, or re-enroll |
-| `install-bundle: REFUSED: release … reads black-box formats` | rollback/downgrade across a black-box format change | section 7: export and archive the chain first |
+| `install-bundle: REFUSED: release … reads black-box formats` | rollback/downgrade across a black-box format change | section 7: export and archive the chain first, or `--accept-unreadable <segment>` |
 | capture sees only `lo` | no default route on an air-gapped robot | list the DDS interfaces in `[module.robodr-sensor-ros2.capture] interfaces` |

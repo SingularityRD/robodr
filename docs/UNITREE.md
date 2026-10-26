@@ -100,10 +100,15 @@ Verify the release at the entry station first ([OPERATIONS.md section 2](OPERATI
 2. **Install the bundle** ([OPERATIONS.md section 3](OPERATIONS.md#3-install-on-an-air-gapped-host)):
 
    ```sh
-   sudo ./install-bundle.sh install \
+   minisign -V -p /etc/robodr-trust/robodr-release.pub -m robodr-$V-$A-offline.tar.gz
+   sudo mkdir -m 0700 /root/robodr-$V && sudo tar -xzf robodr-$V-$A-offline.tar.gz -C /root/robodr-$V
+   sudo sh /root/robodr-$V/robodr-$V-$A/install-bundle.sh install \
        --pubkey /etc/robodr-trust/robodr-release.pub \
-       --tarball ../robodr-$V-$A-offline.tar.gz
+       --tarball robodr-$V-$A-offline.tar.gz
    ```
+
+   Verify before extracting; upgrades run `/usr/lib/robodr/install-bundle.sh`
+   (OPERATIONS.md section 3).
 
    The units are installed disabled. `robodr-pulsard` is not needed for the
    robot (it watches the host it runs on); enabling it on the box to watch

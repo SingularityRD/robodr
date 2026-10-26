@@ -30,6 +30,7 @@ head ≤ 32 KiB, body ≤ 1 MiB.
 | `POST` | `/robot-edr/v2/fleet/enroll` | token MAC + uplink signature (§3) | `enroll-request` envelope | `enroll-answer` envelope |
 | `POST` | `/robot-edr/v2/fleet/keys/rotate` | request auth (§2.5) | `rotate-request` envelope | `rotate-answer` envelope |
 | `POST` | `/robot-edr/v2/fleet/keys/retire` | request auth | `retire-request` envelope | `retire-answer` envelope |
+| `POST` | `/robot-edr/v2/fleet/keys/cancel` | request auth | `cancel-request` envelope | `cancel-answer` envelope |
 | `GET` | `/robot-edr/v2/fleet/revocations/{platform}` | request auth | — | the `robodr-profile-revocations/v2` file, verbatim |
 | `POST` | `/robot-edr/v2/fleet/profiles/drafts` | request auth | a draft profile file, verbatim | `{"digest":"sha256:…","status":"received"}` |
 | `GET` | `/robot-edr/v2/fleet/profiles/current` | request auth | — | profile offer (§6.2) |
@@ -75,8 +76,9 @@ Every signed document (except the compact token, §3.1) is an envelope:
 * `mac`: present **only** on an `enroll-request` (and required there):
   exactly `alg` (`"hmac-sha256"`), `token_id`, `mac` (64 lower-case hex).
 * `type`: one of `enroll-request`, `enroll-answer`, `rotate-request`,
-  `rotate-answer`, `retire-request`, `retire-answer`, `profile-approval`,
-  `ring-info` (and `enroll-token`, used only in signatures of §3.1). A
+  `rotate-answer`, `retire-request`, `retire-answer`, `cancel-request`,
+  `cancel-answer`, `profile-approval`, `ring-info` (and `enroll-token`,
+  used only in signatures of §3.1). A
   reader expects one type per place and refuses any other.
 * Exactly these keys (`format`, `type`, `payload`, `sigs`, plus `mac` on a
   request), no duplicate key at any depth, at most one final LF and no other
@@ -133,8 +135,19 @@ Processing, first failure decides: a missing, repeated or malformed header
 → `400 bad_header`; key unknown, retired or not of role `uplink` → `401
 unknown_key`; |server time − timestamp| > 300 000 ms → `401
 stale_timestamp`; signature → `401 bad_signature`. During a rotation
-overlap (§5) both uplink keys are active and either authenticates. Every
-`401` is an audit-log entry (key id, source address, reason).
+overlap (§5) both uplink keys are active and either authenticates the
+endpoints that do not name a key; rotate, retire and cancel of an `uplink`
+rotation name the key that must authenticate them (§5.1, §5.3, §5.5:
+otherwise `401 wrong_key`). Every `401` is an audit-log entry (key id,
+source address, reason).
+
+**Replay.** A captured request authenticates again within the 300 000 ms
+window. Every `GET` is read-only and every `POST` is idempotent by its own
+identifiers (a replayed rotate, retire or cancel request gets the stored
+answer, nothing more), so a replay changes nothing. A SOC should still keep
+a replay cache of (`X-RoboDR-Key-Id`, `X-RoboDR-Signature`) for the skew
+window and may answer a repeat with `401 replayed_request` (a robot never
+reuses headers: it signs every send anew); the vectors do not exercise it.
 
 ### 2.6 Errors
 
@@ -146,14 +159,44 @@ a robot treats an unknown code by its status.
 | Status | Codes | Robot behaviour |
 | --- | --- | --- |
 | `400` | `bad_request`, `bad_header`, `invalid_profile` | refused (exit 1); a robot bug or a tampered file |
-| `401` | `bad_token`, `bad_signature`, `unknown_key`, `stale_timestamp` | refused; fix the token, registration or clock |
+| `401` | `bad_token`, `bad_signature`, `unknown_key`, `stale_timestamp`, `wrong_key`, `replayed_request` | refused; fix the token, registration or clock |
 | `403` | `workspace_mismatch`, `robot_mismatch` | refused |
 | `404` | `no_list`, `no_profile`, `no_approval`, `no_ring`, `unknown_rotation`, `not_found` | nothing published yet |
-| `409` | `token_used`, `key_conflict`, `rotation_in_progress`, `rotation_id_reuse`, `stale_key`, `already_retired` | refused; see the step |
+| `409` | `token_used`, `key_conflict`, `rotation_in_progress`, `rotation_id_reuse`, `stale_key`, `already_retired`, `rotation_cancelled`, `already_cancelled` | refused; see the step |
 | `410` | `token_expired` | refused; a new token is needed |
 | `413` | `too_large` | refused |
 | `415` | `unsupported_media_type` | refused (a robot bug) |
 | `429`, `5xx`, no response | any | retry later with the **same** stored request (exit 3 = SOC not reachable) |
+
+### 2.7 SOC keys
+
+The SOC holds two kinds of Ed25519 keys, with derived key ids (§2.1):
+
+| Key | Signs | Held | On the robot |
+| --- | --- | --- | --- |
+| **fleet key** | tokens (§3.1), enroll / rotate / retire / cancel answers, ring information (§7) | online (the API signs with it) | `fleet.json` `soc.keys` |
+| **approval key** | profile approvals (§6.3) only | offline or in an HSM, used only after the SOC's approval policy (e.g. two operators) is met | `fleet.json` `soc.approval_keys` |
+
+They are distinct keys: a robot refuses an approval signed by anything but a
+configured approval key, and refuses a configuration that lists one key as
+both. A compromised online fleet key therefore cannot make a robot enforce
+a profile. The public keys reach the robot out of band (vetted media, like
+the CA bundle), as root-owned files not writable by group or others in a
+directory that is not either; nothing in this API distributes or replaces
+them (a signed "key update" would let a stolen key keep itself trusted).
+
+* **Rotation** (planned, either key): the SOC generates the new key; the
+  operators install its public file on every unit **next to** the old one
+  (`soc.keys` / `soc.approval_keys` take several files); the SOC switches
+  to signing with the new key; once every unit has it, the old public file
+  is removed from the units and the old secret destroyed. Documents keep
+  verifying throughout because the robot accepts any configured key.
+* **Revocation** (compromise): remove the public file from every unit
+  immediately and rotate as above. Until a unit is updated, a stolen fleet
+  key can issue tokens, forge answers and ring information for it (not
+  approvals); a stolen approval key can approve any profile that also
+  passes agentd's own profile trust (it cannot make one). Tokens already
+  issued under a revoked fleet key stop working on updated units.
 
 ## 3. Enrollment
 
@@ -184,7 +227,9 @@ soc_key_id`, by the SOC fleet key. The token is a bearer credential until
 consumed: show it once, store only what §3.3 needs (the nonce, to check
 MACs), never log it. The robot trims surrounding spaces, tabs, CR and LF;
 anything else (a second `.`, padding, another prefix) is refused. The token
-is ≤ 4 KiB.
+is ≤ 4 KiB. On the unit it is read from a root-only file or from standard
+input, never from the command line (argv shows in `/proc`, sudo logs and
+shell history).
 
 The robot checks before generating any key: the signature under a
 **configured** SOC fleet key (`fleet.json` `soc.keys`, installed out of
@@ -209,8 +254,11 @@ The robot generates its keys on the unit (§4), then builds the payload
 | `profile_digest` | digest of agentd's current profile file, or `null` |
 | `keys` | exactly three objects `{"role","key_id","public_hex","fingerprint"}` in the order `uplink`, `finding`, `blackbox`; `public_hex` 64 lower-case hex; `key_id` and `fingerprint` must be the ones derived from `public_hex`; the three keys distinct |
 
-The envelope (`type = "enroll-request"`) is signed by the new **uplink**
-key only (proof of possession) and carries the token MAC:
+The envelope (`type = "enroll-request"`) is signed by **each of the three
+new keys**, in the order `uplink`, `finding`, `blackbox` (three signatures:
+proof of possession of every key registered; a robot cannot register a
+public key it does not hold, e.g. another unit's) and carries the token
+MAC:
 
 ```text
 mac_key = SHA-256("robodr-fleet/token-mac-key/v1" 0x00 || nonce)       (nonce: the 32 bytes)
@@ -232,7 +280,8 @@ First failure decides:
    `mac.token_id` ≠ `token_id` → `400 bad_request`.
 3. Token lookup by `token_id` (unknown → `401 bad_token`); MAC (constant
    time) → `401 bad_token`.
-4. The envelope must be signed by exactly the request's uplink key and
+4. The envelope must be signed by exactly the request's three keys, in
+   the order `uplink`, `finding`, `blackbox`, and every signature must
    verify → `401 bad_signature`.
 5. Replay: a consumed token whose stored request digest (digest of the
    payload bytes) equals this one → `200` with the **stored** answer, byte
@@ -243,8 +292,8 @@ First failure decides:
    days).
 7. `workspace` ≠ the token's → `403 workspace_mismatch`; `robot_id` or
    `site` ≠ the token's → `403 robot_mismatch`.
-8. Any key id or fingerprint already registered in the workspace → `409
-   key_conflict`.
+8. Any key id or fingerprint already registered **anywhere on the SOC**
+   (any workspace, any robot, active or retired) → `409 key_conflict`.
 9. Effects, atomically with consuming the token and storing the answer:
    every key previously registered for the robot is retired (a
    re-enrollment replaces them), the three keys are registered active with
@@ -270,7 +319,7 @@ pending. It then writes `enrollment.json` and the fleet journal record.
 ### 3.4 Air-gapped enrollment
 
 The same bytes travel as files on vetted media: `robodr-enroll request
---token … --out request.json` writes the request envelope (no secret in
+--token-file token.txt --out request.json` writes the request envelope (no secret in
 it); the SOC imports it with exactly the §3.3 processing (its import time is
 "server time") and exports the answer envelope; `robodr-enroll accept
 --answer answer.json` verifies it. Nothing else differs.
@@ -292,7 +341,10 @@ it); the SOC imports it with exactly the §3.3 processing (its import time is
 * A `blackbox` key authenticates nothing at the ingest API (it is to be
   treated like a wrong-role key there: `401 unknown_key`); a `finding` key
   authenticates no batch and no fleet request.
-* Key ids are unique per workspace; fingerprints too.
+* Key ids and fingerprints are unique **across the whole SOC** (every
+  workspace, active and retired keys alike): the SOC enforces it at
+  enrollment (§3.3) and rotation (§5.1) with `409 key_conflict`, so a key
+  id always names one key of one robot.
 
 ### 4.1 Revocation list (`GET …/revocations/{platform}`)
 
@@ -318,17 +370,20 @@ Payload `robodr-fleet-rotate-request/v1`: `format`, `rotation_id`,
 `old_fingerprint`, `new_key_id`, `new_public_hex`, `new_fingerprint`,
 `created_at_ms`. Envelope `rotate-request` signed by the **old** key, then
 the **new** key (two signatures, in that order): possession of both. The
-HTTP request is authenticated (§2.5) by an active uplink key of the robot
-(for `role = uplink`: the old key).
+HTTP request is authenticated (§2.5) by an active uplink key of the robot;
+for `role = uplink` by **the old key** (`old_key_id`).
 
 Processing (after §2.5): envelope / payload syntax → `400 bad_request`;
 `workspace` or `robot_id` not the authenticated robot's → `403
-robot_mismatch`; replay: a known `rotation_id` with the same payload digest
-→ the stored answer, with another digest → `409 rotation_id_reuse`; old key
-not an active key of that robot and role with that fingerprint → `409
-stale_key`; signatures → `401 bad_signature`; another open rotation of the
-same robot and role → `409 rotation_in_progress`; new key id or
-fingerprint already registered → `409 key_conflict`. Effects: the new key is
+robot_mismatch`; `role = uplink` and the authenticating key is not
+`old_key_id` → `401 wrong_key`; a `rotation_id` that was cancelled (§5.5)
+→ `409 rotation_cancelled`; replay: a known `rotation_id` with the same
+payload digest → the stored answer, with another digest → `409
+rotation_id_reuse`; old key not an active key of that robot and role with
+that fingerprint → `409 stale_key`; signatures → `401 bad_signature`;
+another open (neither retired nor cancelled) rotation of the same robot and
+role → `409 rotation_in_progress`; new key id or fingerprint already
+registered (§4) → `409 key_conflict`. Effects: the new key is
 registered **active** — both keys are now valid (overlap) — and the answer
 is stored with the rotation.
 
@@ -348,9 +403,13 @@ done       the SOC answered "retired": old key shredded, enrollment updated
 
 Each phase is persisted before the next step; requests are resent
 unchanged after a crash (the SOC answers from the stored rotation); every
-step is idempotent. A `prepared` rotation can be aborted locally (the new
-key is shredded) only while the SOC has not registered it; if the request
-may have reached the SOC, finish it instead. Services read keys at start:
+step is idempotent. The robot persists a `sent` mark **before** it first
+submits the rotate request (or writes it to a file for the air-gapped
+flow). A `prepared` rotation that was never sent can be aborted locally
+(the new key is shredded). Once sent, the SOC may hold the rotation even if
+no answer came back (a lost answer), so the robot never abandons it
+locally: it resends the request (stored answer) and finishes, or cancels
+the rotation at the SOC (§5.5). Services read keys at start:
 after the swap the operator restarts `robodr-uplink` (role `uplink`) or
 `robodr-agentd` (role `finding`) and retires the old key only once the
 service runs with the new key — for `finding`, also once the findings
@@ -362,12 +421,14 @@ with the old key until it is retired).
 Payload `robodr-fleet-retire-request/v1`: `format`, `rotation_id`,
 `workspace`, `robot_id`, `role`, `old_key_id`, `new_key_id`,
 `created_at_ms`; envelope `retire-request` signed by the **new** key only;
-the HTTP request is authenticated by an active uplink key (for `role =
-uplink`: the new one). Processing: syntax → `400`; unknown rotation → `404
-unknown_rotation`; another robot's → `403 robot_mismatch`; fields not the
-rotation's → `400 bad_request`; signature → `401 bad_signature`; already
-retired with the same request digest → stored answer, with another → `409
-already_retired`. Effects: the old key is retired (authenticates nothing
+the HTTP request is authenticated by an active uplink key; for `role =
+uplink` by **the new key** (`new_key_id`). Processing: syntax → `400`;
+unknown rotation → `404 unknown_rotation`; another robot's → `403
+robot_mismatch`; fields not the rotation's → `400 bad_request`; `role =
+uplink` and the authenticating key is not `new_key_id` → `401 wrong_key`;
+cancelled rotation → `409 rotation_cancelled`; signature → `401
+bad_signature`; already retired with the same request digest → stored
+answer, with another → `409 already_retired`. Effects: the old key is retired (authenticates nothing
 from now on, ingest included). Answer `retire-answer` (payload
 `robodr-fleet-retire-answer/v1`, same keys as the rotate answer) with
 `status` = `"retired"`.
@@ -390,6 +451,41 @@ or `genesis`), one by the old key and one by the new key, followed by a
 seal. The journal therefore proves which key handed over to which, at which
 point of the chain; it verifies with `robodr-blackbox verify` and the
 black-box public key.
+
+### 5.5 Cancel
+
+A rotation the robot will not complete (its answer was lost and the
+operator decides against it, or the request may have reached the SOC but
+the robot cannot tell) is ended at the SOC, never by the robot alone: the
+SOC would otherwise keep it open and refuse every later rotation of the
+role (`409 rotation_in_progress`).
+
+Payload `robodr-fleet-cancel-request/v1`: `format`, `rotation_id`,
+`request_digest` (digest of the rotate request payload being cancelled),
+`workspace`, `robot_id`, `role`, `old_key_id`, `new_key_id`,
+`created_at_ms`; envelope `cancel-request` signed by the **old** key only
+(the key that stays); the HTTP request is authenticated by an active uplink
+key, for `role = uplink` by the old key. Processing (after §2.5): syntax →
+`400 bad_request`; `workspace` / `robot_id` not the authenticated robot's
+→ `403 robot_mismatch`; `role = uplink` and the authenticating key is not
+`old_key_id` → `401 wrong_key`; a known rotation whose role, key ids or
+`request_digest` differ → `400 bad_request`; old key not a key of that robot
+and role → `409 stale_key`; signature → `401 bad_signature`; already
+cancelled with the same cancel digest → the stored answer, with another →
+`409 already_cancelled`; already retired → `409 already_retired`; old key
+retired → `409 stale_key`. Effects: if the SOC registered the rotation, its
+new key is **retired** (authenticates nothing from now on) and the rotation
+is closed as cancelled; if it never received the rotate request, it records
+the `rotation_id` as cancelled, so that request is refused if it arrives
+later (`409 rotation_cancelled`). Either way the old key stays active and a
+new rotation of the role can start. Answer `cancel-answer` (payload
+`robodr-fleet-cancel-answer/v1`, the keys of the rotate answer) with
+`status` = `"cancelled"`.
+
+The robot builds the cancel request once (stored byte-exact, resent
+unchanged), only while the active key file still holds the old key (after
+the swap the rotation is finished instead); on the verified answer it
+shreds the new key and closes the rotation.
 
 ## 6. Profiles
 
@@ -423,8 +519,9 @@ profile is **not** enforced.
 ### 6.3 Approval (observe → enforce)
 
 `GET …/profiles/approvals/{hex}` answers the approval envelope
-(`profile-approval`, signed by a SOC fleet key) for that digest; the same
-envelope can travel as a file. Payload `robodr-fleet-profile-approval/v1`:
+(`profile-approval`, signed by a SOC **approval key**, §2.7, never by the
+online fleet key) for that digest; the same envelope can travel as a file.
+Payload `robodr-fleet-profile-approval/v1`:
 
 | Key | Value |
 | --- | --- |
@@ -433,16 +530,22 @@ envelope can travel as a file. Payload `robodr-fleet-profile-approval/v1`:
 | `platform`, `profile_digest`, `profile_version` | the exact profile |
 | `transition` | `"enforce"` |
 | `approved_by` | 1–8 distinct operator ids (the SOC enforces its own approval policy, e.g. two-person, before signing) |
-| `issued_at_ms`, `expires_at_ms` | validity window |
+| `issued_at_ms`, `expires_at_ms` | validity window; `0 < expires − issued ≤ 7 days` (604 800 000 ms) |
 
 The robot installs only when the operator runs `robodr-enroll profile
-approve` with it, and only if: signed by a configured SOC fleet key;
+approve` with it, and only if: signed by a configured SOC approval key
+(and that key is not also configured as a fleet key); validity at most 7
+days;
 workspace and robot are the unit's enrollment; digest, version and platform
 equal the staged profile; not expired (robot clock; `issued_at_ms ≤ now +
 300 000`); the approval id was not used on the unit; and the staged profile
 verifies again **at that moment**. Install: previous profile and `.sig`
-backed up, `.sig` then profile written atomically at agentd's
-`profile_path` (owner and mode kept). agentd enforces it only after its
+backed up; the new `.sig` and profile are written completely as temp files
+(owner and mode kept, set on the descriptors) and then renamed into place
+at agentd's `profile_path` back to back, `.sig` first. Two files cannot be
+replaced in one atomic step: a crash between the two renames leaves a pair
+that does not verify, which agentd refuses (observe-only, fail closed);
+running `approve` again with the same approval completes the install. agentd enforces it only after its
 next start, where it verifies it once more. Nothing in this API makes a
 robot enforce anything by itself.
 
@@ -452,14 +555,21 @@ robot enforce anything by itself.
 `robodr-fleet-ring/v1`: `format`, `serial` (≥ 1, monotonic per robot),
 `workspace`, `robot_id`, `ring` (0 canary, 1 early, 2 broad), `target_version`
 (version or `null`), `bundle_sha256` (64 hex of the offline bundle tarball, or
-`null`), `issued_at_ms`, `expires_at_ms`.
+`null`), `min_version` (version or `null`: the lowest release this robot
+may run, releases below it being known to be vulnerable), `issued_at_ms`,
+`expires_at_ms`.
 
 **Information only** (SECURE-DELIVERY 13a scope): the robot verifies it,
-refuses a lower serial or the same serial with other content, records it,
-and tells the operator whether the target differs from the installed
-release and whether the information has expired (withholding becomes
-visible). It never downloads or installs anything; installation stays
-`install-bundle.sh install` with its signature check, run locally.
+refuses a lower serial, the same serial with other content and a document
+issued in the future (`issued_at_ms > now + 300 000`), records it, and
+tells the operator whether the target differs from the installed release
+(dpkg's record of the package) and whether the information has expired
+(withholding becomes visible). It never downloads or installs anything;
+installation stays `install-bundle.sh install` with its signature check,
+run locally. The one effect is a restriction: `min_version` raises the
+unit's **security floor**, below which `install-bundle.sh` neither installs
+nor rolls back (the floor only rises; the signed offline bundle carries a
+floor too).
 
 ## 8. Limits
 
@@ -468,6 +578,7 @@ visible). It never downloads or installs anything; installation stays
 | envelope / enroll body | 64 KiB (`413 too_large`) |
 | decoded payload | 32 KiB |
 | token | 4 KiB; validity ≤ 7 days |
+| approval validity | ≤ 7 days |
 | draft profile body | 8 MiB |
 | profile offer | 2 MiB (robot side) |
 | clock skew (§2.5, token / approval issue time) | 300 000 ms, inclusive |
@@ -487,14 +598,16 @@ and a major change.
 text requires:
 
 * `manifest.json` — how to run them (each case starts from an empty
-  workspace with the SOC fleet key `keys/soc.key`; register the case's
+  workspace with the SOC fleet key `keys/soc.key` and approval key
+  `keys/soc-approval.key`; register the case's
   setup tokens, serve its setup publications verbatim; requests in order,
   server clock per request), the comparison rule (status; error bodies by
   `code`; envelopes by type, signer list and decoded payload; other `200`
   bodies byte-exact), the keys, tokens and cases.
 * `keys/` — fixed-seed **test** key files (secret and `.pub`): the SOC
-  fleet key, robots `ugv-001` / `ugv-002` (`uplink`, `finding`, `blackbox`,
-  and `ugv-001`'s next uplink key), a profile signer and a trust root.
+  fleet key, the SOC approval key, robots `ugv-001` / `ugv-002` (`uplink`,
+  `finding`, `blackbox`, and `ugv-001`'s next uplink keys), a profile
+  signer and a trust root.
   Never register them anywhere real.
 * `tokens/` — the cases' tokens (their nonces are also in the manifest).
 * `cases/<name>/<n>.request.json` (method, target with base path, headers,
@@ -505,8 +618,14 @@ text requires:
   key conflict, null site), rotation and retirement with overlap, rotate
   refusals (missing new-key signature, replay, rotation in progress, stale
   old key), request authentication (valid, stale timestamp, signature for
-  another path, finding key, repeated header, no headers) and distribution
-  (revocation list, offer, approval, ring, draft publish).
+  another path, finding key, repeated header, no headers), distribution
+  (revocation list, offer, approval, ring, draft publish), proof of
+  possession at enrollment (uplink signature only, wrong order), cancel
+  (wrong signer, wrong authenticating key, stored answer, cancelled
+  rotation resent, the new key no longer authenticating, a new rotation
+  after it, cancel of a rotation never received, cancel after retire) and
+  the authenticating key of an uplink rotation (rotate by the new key,
+  retire by the old key: `401 wrong_key`).
 
 They are generated deterministically by `cargo run -p robodr-fleet
 --example fleet_vectors`; the RoboDR test suite fails when the committed
@@ -519,3 +638,22 @@ Cases are only ever added.
 * **v1 draft, 2026-10-26** (Sprint 9, robot side): first text, written with
   `robodr-enroll`. Not yet implemented on the SOC side; the vectors are
   what an AutoSecOps implementation must reproduce.
+* **v1 draft, 2026-10-26, review revision** (before any SOC
+  implementation, so the v1 formats were changed in place; vectors
+  regenerated, cases 15–17 added):
+  * enrollment request signed by all three new keys in order (proof of
+    possession); key ids and fingerprints unique across the whole SOC;
+  * new `POST …/keys/cancel` (`cancel-request` / `cancel-answer`, §5.5),
+    codes `409 rotation_cancelled` and `409 already_cancelled`; the robot
+    never abandons a sent rotation locally;
+  * the authenticating key of an `uplink` rotation is enforced (rotate and
+    cancel: old key; retire: new key; `401 wrong_key`);
+  * SOC keys (§2.7): approvals are signed by a separate approval key,
+    never the online fleet key; rotation and revocation of SOC keys;
+  * approval validity ≤ 7 days;
+  * ring information: new `min_version` key (security floor), documents
+    issued in the future refused;
+  * replay note for request authentication (`401 replayed_request`
+    optional);
+  * profile install: both files staged before the two renames (the
+    remaining window stated).
