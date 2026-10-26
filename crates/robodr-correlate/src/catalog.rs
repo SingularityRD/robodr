@@ -197,6 +197,23 @@ pub const PULSAR_RULES: &[&str] = &[
     "RoboDR: File created in the system or ROS Python environment outside the package manager",
     "RoboDR: File moved into the system or ROS Python environment outside the package manager",
     "RoboDR: Link created in the system or ROS Python environment outside the package manager",
+    // unitree.toml
+    "RoboDR: Unitree Wi-Fi provisioning script executed",
+    "RoboDR: Bluetooth daemon or Wi-Fi provisioning script opened an IP connection",
+    "RoboDR: Bluetooth pairing keys or configuration modified outside bluetoothd",
+    "RoboDR: Bluetooth pairing keys or configuration moved into place outside bluetoothd",
+    "RoboDR: Service or autostart entry written outside the package manager",
+    "RoboDR: Service or autostart entry moved into place outside the package manager",
+    "RoboDR: Service enabled, masked or linked outside the package manager",
+    "RoboDR: Unitree robot process connects outside the allowlisted destinations",
+    "RoboDR: Reverse tunnel client executed on robot",
+    "RoboDR: SSH reverse or dynamic tunnel with bundled options",
+    "RoboDR: Remote-access overlay VPN started on robot",
+    "RoboDR: Unitree DDS configuration modified",
+    "RoboDR: Unitree DDS configuration moved into place",
+    "RoboDR: Unitree SDK or Cyclone DDS library modified outside the package manager",
+    "RoboDR: Unitree SDK or Cyclone DDS library moved into place outside the package manager",
+    "RoboDR: Unitree SDK or Cyclone DDS library linked outside the package manager",
 ];
 
 /// Is `id` a known signal id (either list)?
