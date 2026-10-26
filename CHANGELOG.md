@@ -365,6 +365,17 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 - `SECURITY.md`, this changelog, and `docs/OPERATIONS.md` (air-gapped
   install, key generation and rotation, commissioning, upgrade and rollback,
   evidence export).
+- Unitree platform pack (host side): `rules/robodr/unitree.toml`, 16 Pulsar
+  rules for the EDU computer (UniPwn provisioning-script path, bluetoothd /
+  script IP connections, Bluetooth bond and policy tampering, new or enabled
+  services, outbound connections of Unitree processes outside a tunable
+  allowlist, reverse tunnels and overlay VPNs, Cyclone DDS configuration and
+  Unitree SDK / Cyclone library tampering) with 117 fixtures and a Unitree
+  benign-corpus scenario; passive sensor-box mode for `robodr-agentd`
+  (example drop-in `40-sensor-box.conf.example`, capture-NIC networkd file
+  and host firewall under `examples/sensor-box/`, shipped in the `.deb`);
+  `docs/UNITREE.md` (models, deployment modes, install, commissioning,
+  safety rules, known limits) shipped in the `.deb` and the offline bundle.
 
 ### Changed
 

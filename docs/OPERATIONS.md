@@ -103,6 +103,32 @@ signature was checked at the entry station.
 After installing, nothing runs yet. Continue with keys (section 4) and
 commissioning (section 5).
 
+### 3.1 Unitree robots and the passive sensor box
+
+Unitree robots (Go2, B2, G1, H1 and relatives) have their own guide,
+[`UNITREE.md`](UNITREE.md): supported models, the two deployment modes, the
+Unitree host rules (`rules/robodr/unitree.toml`) and the known limits. In
+short:
+
+* **Sensor box (default; the only option for Air / Pro).** A separate box
+  watches the robot network (192.168.123.0/24) on a tap or switch mirror
+  port and installs nothing on the robot. `robodr-agentd` runs with the
+  example drop-in
+  `/usr/share/doc/robodr/examples/robodr-agentd.service.d/40-sensor-box.conf.example`
+  (install it as
+  `/etc/systemd/system/robodr-agentd.service.d/40-sensor-box.conf`):
+  `CAP_NET_RAW` only, all IP denied (it also resets any `IPAddressAllow=`),
+  started only once the writable `/var/lib/robodr` mount is there. The
+  capture NIC is made silent and promiscuous by
+  `examples/sensor-box/10-robodr-capture.network.example` (systemd-networkd),
+  and the box's firewall comes from
+  `examples/sensor-box/nftables.conf.example`. Install the drop-in only on
+  a sensor box, never on a robot. Hardening checklist: UNITREE.md section
+  3.1.
+* **EDU agent.** The package on the EDU development computer (arm64; needs
+  Ubuntu 22.04 or later for glibc 2.35 and systemd 247), with
+  `robodr-pulsard` for the host rules.
+
 ## 4. Keys
 
 ### 4.1 What keys exist
