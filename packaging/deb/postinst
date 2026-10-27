@@ -5,6 +5,43 @@
 # services that were running are restarted on the new binaries.
 set -e
 
+# >>> migrate_agentd_tree (tests/review2_13b.rs runs this block)
+# migrate_agentd_tree DIR OLD_OWNER NEW_OWNER GROUP
+#
+# Give agentd's tree DIR (owned by OLD_OWNER, the user agentd and the
+# exporters shared before review H1) to NEW_OWNER:GROUP. Every step is
+# idempotent, so an interrupted run is simply repeated:
+#   1. a symlink, FIFO, socket or device in the tree is removed (agentd
+#      creates none there; a planted link would otherwise be followed);
+#   2. a regular file with more than one link is replaced by a copy (same
+#      owner, mode and times), so the inode shared with a file elsewhere is
+#      left alone and keeps its owner;
+#   3. entries of OLD_OWNER get NEW_OWNER:GROUP (chown -h, find -P: no
+#      symlink is ever followed, no other file system is entered);
+#   4. group/other write is removed everywhere, setuid/setgid from files.
+# Directory modes and the spool queues' group write and setgid bit come
+# back from tmpfiles afterwards.
+migrate_agentd_tree() {
+    mt_dir=$1
+    mt_old=$2
+    mt_owner=$3:$4
+    if [ ! -d "$mt_dir" ] || [ -L "$mt_dir" ]; then
+        return 0
+    fi
+    find -P "$mt_dir" -xdev -mindepth 1 ! -type f ! -type d -exec rm -f -- {} +
+    find -P "$mt_dir" -xdev -type f -links +1 -exec sh -c '
+        for f do
+            t="$f.robodr-migrate"
+            rm -f -- "$t"
+            cp -P --preserve=mode,ownership,timestamps -- "$f" "$t"
+            mv -f -- "$t" "$f"
+        done' sh {} +
+    find -P "$mt_dir" -xdev -user "$mt_old" -exec chown -h "$mt_owner" {} +
+    find -P "$mt_dir" -xdev \( -type f -o -type d \) -perm /022 -exec chmod go-w {} +
+    find -P "$mt_dir" -xdev -type f -perm /6000 -exec chmod ug-s {} +
+}
+# <<< migrate_agentd_tree
+
 case "$1" in
 configure)
     if command -v systemd-sysusers >/dev/null 2>&1; then
@@ -27,20 +64,41 @@ configure)
         getent group robodr-safety >/dev/null || addgroup --system robodr-safety
     fi
     # Upgrade from a version where robodr-agentd ran as robodr (review H1):
-    # agentd's own trees move to its own user, once, before tmpfiles sets
-    # the directory modes. Contents keep their modes; the spool queues get
-    # group robodr and the setgid bit from tmpfiles.
-    for d in /var/lib/robodr/blackbox/agentd /var/lib/robodr/spool/agentd \
-        /var/lib/robodr/profile-state /var/lib/robodr/control-plane/agentd; do
-        if [ -d "$d" ] && [ ! -L "$d" ] && [ "$(stat -c %U "$d")" = robodr ]; then
-            chown -R --no-dereference robodr-agentd:robodr "$d"
+    # agentd's own trees move to its own user before tmpfiles sets the
+    # directory modes. Review L-E: the exporters ran as robodr too, so
+    # anything in those trees may have been planted by one of them. The
+    # migration therefore runs with agentd and the exporters stopped, never
+    # follows a symlink, breaks hardlinks, strips group/other write and
+    # setuid/setgid from files, and is resumable: it runs until it has
+    # completed once (the marker in the root-owned /var/lib/robodr).
+    migrated=/var/lib/robodr/.agentd-user-migrated
+    stopped=""
+    if [ ! -e "$migrated" ]; then
+        if [ -d /run/systemd/system ]; then
+            for u in robodr-spool-export.service robodr-kafka-publish.service \
+                robodr-uplink.service robodr-agentd.service; do
+                if systemctl is-active --quiet "$u"; then
+                    systemctl stop "$u"
+                    stopped="$stopped $u"
+                fi
+            done
         fi
-    done
+        for d in /var/lib/robodr/blackbox/agentd /var/lib/robodr/spool/agentd \
+            /var/lib/robodr/profile-state /var/lib/robodr/control-plane/agentd; do
+            migrate_agentd_tree "$d" robodr robodr-agentd robodr
+        done
+        mkdir -p /var/lib/robodr
+        : >"$migrated"
+    fi
     if command -v systemd-tmpfiles >/dev/null 2>&1; then
         systemd-tmpfiles --create /usr/lib/tmpfiles.d/robodr.conf
     fi
     if [ -d /run/systemd/system ]; then
         systemctl daemon-reload || true
+        # What the migration stopped starts again on the new binaries.
+        for u in $stopped; do
+            systemctl start "$u" || true
+        done
         if [ -n "$2" ]; then
             # Upgrade: restart only what was running.
             for u in robodr-pulsard.service robodr-agentd.service robodr-anchor-receiver.service \

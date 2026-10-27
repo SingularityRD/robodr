@@ -1,5 +1,5 @@
 //! Regressions from the second independent review of Sprint 13b
-//! (`13b-review2`, findings H-A, M-A, M-B, L-A, L-B, L-F and the Info
+//! (`13b-review2`, findings H-A, M-A, M-B, L-A, L-B, L-E, L-F and the Info
 //! items I-B and rules uniqueness). Each test reproduces the finding; every
 //! one of them failed on the code before its fix (the commit messages
 //! record the runs).
@@ -13,7 +13,7 @@ mod common;
 use common::*;
 use robodr_deliverd::runner::{self, Limits, ProbeLimits, RunAs};
 use robodr_pkg::rpk::Kind;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -451,6 +451,96 @@ fn lb_reanchor_takes_the_black_box_key_file() {
         String::from_utf8_lossy(&o.stderr)
     );
     assert!(u.cfg.anchor_path().exists());
+}
+
+// ------------------------------------------------------------------ L-E --
+
+/// The `migrate_agentd_tree` function of the package's postinst (between
+/// its `>>> migrate_agentd_tree` and `<<< migrate_agentd_tree` markers).
+fn postinst_migration() -> String {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/deb/postinst");
+    let s = std::fs::read_to_string(&p).unwrap();
+    let a = s
+        .find("# >>> migrate_agentd_tree")
+        .expect("postinst has no migrate_agentd_tree block");
+    let b = s.find("# <<< migrate_agentd_tree").unwrap();
+    s[a..b].to_string()
+}
+
+/// L-E. The ownership migration of agentd's trees (old agentd user ->
+/// robodr-agentd) followed whatever an exporter (same old user) had
+/// planted: a hardlink to its own file became agentd's, symlinks stayed,
+/// group-writable modes stayed. Run here on a temporary tree with
+/// numeric ids (needs root for chown; never the host's users).
+#[test]
+fn le_the_postinst_migration_breaks_links_and_normalises_modes() {
+    if !robodr_deliverd::users::is_root() {
+        if std::env::var("ROBODR_REQUIRE_DPKG_TEST").is_ok_and(|v| v == "1") {
+            panic!("le_postinst: needs root");
+        }
+        eprintln!("SKIPPED le_postinst: needs root");
+        return;
+    }
+    let f = postinst_migration();
+    let t = Tmp::new("le");
+    let (old, new, grp) = (43_101u32, 43_102u32, 43_103u32);
+    let tree = t.path().join("agentd");
+    let outside = t.path().join("exporter");
+    std::fs::create_dir_all(tree.join("sub")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let w = |p: &Path, b: &str, mode: u32| {
+        std::fs::write(p, b).unwrap();
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    w(&tree.join("agentd.json"), "floor", 0o664);
+    w(&tree.join("sub/seg"), "seg", 0o640);
+    w(&outside.join("mine"), "exporter", 0o600);
+    std::fs::hard_link(outside.join("mine"), tree.join("sub/linked")).unwrap();
+    std::os::unix::fs::symlink(outside.join("mine"), tree.join("sub/sym")).unwrap();
+    std::fs::set_permissions(tree.join("sub"), std::fs::Permissions::from_mode(0o2775)).unwrap();
+    for p in [
+        tree.clone(),
+        tree.join("sub"),
+        tree.join("agentd.json"),
+        tree.join("sub/seg"),
+        outside.join("mine"),
+    ] {
+        std::os::unix::fs::lchown(&p, Some(old), Some(old)).unwrap();
+    }
+    std::os::unix::fs::lchown(tree.join("sub/sym"), Some(old), Some(old)).unwrap();
+    let script = format!(
+        "set -e\n{f}\nmigrate_agentd_tree \"$1\" {old} {new} {grp}\nmigrate_agentd_tree \"$1\" {old} {new} {grp}\n"
+    );
+    let o = Command::new("/bin/sh")
+        .args(["-c", &script, "sh"])
+        .arg(&tree)
+        .output()
+        .unwrap();
+    assert!(
+        o.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let md = |p: &Path| std::fs::symlink_metadata(p).unwrap();
+    // The exporter's own inode keeps its owner; agentd's copy is separate.
+    assert_eq!(md(&outside.join("mine")).uid(), old);
+    let linked = md(&tree.join("sub/linked"));
+    assert_eq!(linked.nlink(), 1);
+    assert_ne!(linked.ino(), md(&outside.join("mine")).ino());
+    assert_eq!((linked.uid(), linked.gid()), (new, grp));
+    assert!(std::fs::symlink_metadata(tree.join("sub/sym")).is_err());
+    for p in [
+        tree.clone(),
+        tree.join("sub"),
+        tree.join("agentd.json"),
+        tree.join("sub/seg"),
+    ] {
+        let m = md(&p);
+        assert_eq!((m.uid(), m.gid()), (new, grp), "{}", p.display());
+        assert_eq!(m.mode() & 0o022, 0, "{} keeps group/other write", p.display());
+    }
+    assert_eq!(std::fs::read_to_string(tree.join("agentd.json")).unwrap(), "floor");
 }
 
 // ------------------------------------------------------------------ L-F --
