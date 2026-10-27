@@ -32,12 +32,16 @@
 //! pinned: an impersonation such as `participant_source_mismatch` on a
 //! pinned prefix, a forged dispose, an endpoint attributed to it from a
 //! foreign host) are never hidden, but they are bounded (review R2-1): the
-//! first [`PROTECTED_PER_KEY`] per (participant, source, rule) and window
-//! are reported one by one, at most [`PROTECTED_PER_PREFIX`] per
-//! participant and window; the rest is folded into a **Critical** aggregate
-//! per (source, participant) whose text names the participant as its
-//! subject ("about the robot's own participant <prefix>"), never as a
-//! sample GUID prefix. A new rule from the same source passes again.
+//! first [`PROTECTED_PER_KEY`] High or Critical ones per (participant,
+//! source, rule) and window are reported one by one, at most
+//! [`PROTECTED_PER_PREFIX`] per participant and window; the rest is
+//! folded into a **Critical** aggregate per (source, participant) whose
+//! text names the participant as its subject ("about the robot's own
+//! participant <prefix>"), never as a sample GUID prefix. A new rule from
+//! the same source passes again. Findings below High about them (a
+//! legitimate participant leaving reports one Low `discovery_removal` per
+//! endpoint) have far larger budgets ([`PROTECTED_LOW_PER_KEY`],
+//! [`PROTECTED_LOW_PER_PREFIX`]) and an aggregate of their own severity.
 //!
 //! The other findings are counted per source IP and per **class**
 //! (Critical, and below Critical) in a window ([`WINDOW`], 60 s):
@@ -70,8 +74,8 @@
 //!   O(log n) records for n folded findings.
 //! - Each flood **episode** is its own finding: its subject is the source IP
 //!   plus a synthetic node name `discovery_flood/<class>/<episode start>`
-//!   (`discovery_flood/protected/<prefix>/<episode start>` for a protected
-//!   participant's; [`FloodReport::episode`]), so every report of one
+//!   (`discovery_flood/protected-<class>/<prefix>/<episode start>` for a
+//!   protected participant's; [`FloodReport::episode`]), so every report of one
 //!   episode updates one SOC case, and a later flood (after the first
 //!   ended) opens a new case instead of reopening one the SOC may have
 //!   closed.
@@ -142,13 +146,18 @@ pub const MAX_SOURCES: usize = 128;
 /// motion writer each: about 6 packets/s sustained, with the 128 sources)
 /// before a genuine rogue's Critical finding is folded.
 pub const FRESH_CRITICAL: u32 = 128;
-/// Findings about one of the robot's own participants (profiled or
-/// pinned) reported one by one per (participant, source, rule) and window
-/// (review R2-1).
+/// High or Critical findings about one of the robot's own participants
+/// (profiled or pinned) reported one by one per (participant, source,
+/// rule) and window (review R2-1).
 pub const PROTECTED_PER_KEY: u32 = 4;
-/// Findings about one protected participant reported one by one per
-/// window, every source and rule together.
+/// High or Critical findings about one protected participant reported one
+/// by one per window, every source and rule together.
 pub const PROTECTED_PER_PREFIX: u32 = 64;
+/// The same for findings below High about a protected participant (a
+/// legitimate participant leaving reports one `discovery_removal` per
+/// endpoint): far larger, they never use the spool's Critical share.
+pub const PROTECTED_LOW_PER_KEY: u32 = 256;
+pub const PROTECTED_LOW_PER_PREFIX: u32 = 1024;
 /// (protected participant, source, rule) counters per window.
 pub const MAX_PROTECTED_KEYS: usize = 512;
 /// Sources with their own aggregate (beyond: the "many sources" one).
@@ -218,7 +227,8 @@ pub struct Item<'a> {
 }
 
 /// (source, Critical class, protected participant): source `None` = many
-/// sources; a protected participant's aggregate is always Critical.
+/// sources; for a protected participant the class is "High or above",
+/// and its aggregate is Critical.
 type Key = (Option<String>, bool, Option<[u8; 12]>);
 
 #[derive(Debug, Clone)]
@@ -254,10 +264,11 @@ pub struct FloodGuard {
     passed: u32,
     /// Critical findings passed by name from sources beyond MAX_SOURCES.
     fresh_critical: u32,
-    /// Per window: (protected participant, source, rule) -> passed.
-    protected_keys: HashMap<([u8; 12], String, String), u32>,
-    /// Per window: protected participant -> passed.
-    protected_prefix: HashMap<[u8; 12], u32>,
+    /// Per window: (protected participant, source, rule, High or above)
+    /// -> passed.
+    protected_keys: HashMap<([u8; 12], String, String, bool), u32>,
+    /// Per window: (protected participant, High or above) -> passed.
+    protected_prefix: HashMap<([u8; 12], bool), u32>,
     /// Open floods ([`Key`]).
     aggs: BTreeMap<Key, Agg>,
     /// Closing reports of ended episodes not handed out yet (next tick).
@@ -396,10 +407,13 @@ impl FloodGuard {
     }
 
     /// A finding about one of the robot's own participants (review R2-1):
-    /// the first [`PROTECTED_PER_KEY`] per (participant, source, rule) and
-    /// window, at most [`PROTECTED_PER_PREFIX`] per participant, are
-    /// reported one by one; the rest is folded into a **Critical**
-    /// aggregate per (source, participant) that names the participant.
+    /// the first [`PROTECTED_PER_KEY`] High or Critical ones per
+    /// (participant, source, rule) and window, at most
+    /// [`PROTECTED_PER_PREFIX`] per participant, are reported one by one
+    /// (below High: [`PROTECTED_LOW_PER_KEY`], [`PROTECTED_LOW_PER_PREFIX`]);
+    /// the rest is folded into an aggregate per (source, participant,
+    /// class) that names the participant: **Critical** for the High and
+    /// Critical ones.
     fn admit_protected(
         &mut self,
         it: Item<'_>,
@@ -407,20 +421,34 @@ impl FloodGuard {
         mono_ns: u64,
         wall_ms: u64,
     ) -> Admit {
+        let high = it.deviation.severity >= Severity::High;
+        let (per_key, per_prefix) = if high {
+            (PROTECTED_PER_KEY, PROTECTED_PER_PREFIX)
+        } else {
+            (PROTECTED_LOW_PER_KEY, PROTECTED_LOW_PER_PREFIX)
+        };
         let mut reports = Vec::new();
-        let own: Key = (Some(it.src_ip.to_owned()), true, Some(*participant));
+        let own: Key = (Some(it.src_ip.to_owned()), high, Some(*participant));
         self.close_if_quiet(&own, mono_ns, &mut reports);
         let k = (
             *participant,
             it.src_ip.to_owned(),
             it.deviation.rule_str().to_owned(),
+            high,
         );
         let n = self.protected_keys.get(&k).copied();
-        let total = self.protected_prefix.get(participant).copied().unwrap_or(0);
+        let total = self
+            .protected_prefix
+            .get(&(*participant, high))
+            .copied()
+            .unwrap_or(0);
         let room = n.is_some() || self.protected_keys.len() < MAX_PROTECTED_KEYS;
-        if room && n.unwrap_or(0) < PROTECTED_PER_KEY && total < PROTECTED_PER_PREFIX {
+        if room && n.unwrap_or(0) < per_key && total < per_prefix {
             *self.protected_keys.entry(k).or_insert(0) += 1;
-            *self.protected_prefix.entry(*participant).or_insert(0) += 1;
+            *self
+                .protected_prefix
+                .entry((*participant, high))
+                .or_insert(0) += 1;
             self.stats.protected_passed += 1;
             return self.pass(reports);
         }
@@ -428,7 +456,7 @@ impl FloodGuard {
         let key = if self.aggs.contains_key(&own) || self.open_own() < MAX_KEYS {
             own
         } else {
-            (None, true, Some(*participant))
+            (None, high, Some(*participant))
         };
         self.fold(key, it, participant, mono_ns, wall_ms, reports)
     }
@@ -487,7 +515,12 @@ impl FloodGuard {
             samples: Vec::new(),
             sources: Vec::new(),
             episode: match &key.2 {
-                Some(p) => format!("discovery_flood/protected/{}/{}", hex(p), utc(wall_ms)),
+                Some(p) => format!(
+                    "discovery_flood/protected-{}/{}/{}",
+                    if critical { "critical" } else { "other" },
+                    hex(p),
+                    utc(wall_ms)
+                ),
                 None => format!(
                     "discovery_flood/{}/{}",
                     if critical { "critical" } else { "other" },
@@ -988,7 +1021,9 @@ mod tests {
                 "{d}"
             );
             assert!(!d.contains("sample GUID prefixes"), "{d}");
-            assert!(r.episode.starts_with("discovery_flood/protected/aaaa"));
+            assert!(r
+                .episode
+                .starts_with("discovery_flood/protected-critical/aaaa"));
         }
         let d = Deviation::new(
             "robot.ros2.participant_source_mismatch",
@@ -996,6 +1031,15 @@ mod tests {
             "x",
         );
         assert_eq!(protected(&mut f, &d, "10.5.0.1", legit, 2000), Admit::Pass);
+        // The legitimate participant leaving: one Low finding per endpoint.
+        for i in 0..200u32 {
+            let d = Deviation::new(
+                "robot.rtps.discovery_removal",
+                Severity::Low,
+                format!("writer {i} disposed"),
+            );
+            assert_eq!(protected(&mut f, &d, "10.5.0.9", legit, 3000), Admit::Pass);
+        }
         // Many sources: bounded per participant too.
         let mut f = FloodGuard::default();
         let mut passed = 0u32;
