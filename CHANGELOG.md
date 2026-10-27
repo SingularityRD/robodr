@@ -12,6 +12,53 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Security
 
+- Secure delivery on a unit, second independent review of Sprint 13b
+  (`docs/SECURE-DELIVERY.md` §10 "Second independent review of 13b");
+  every fixed finding has a regression test that failed before the fix
+  (`crates/robodr-deliverd/tests/review2_13b.rs`, agentd
+  `input::tests::a_supplementary_feeder_group_is_accepted`):
+  - **Floor bypass through dpkg relations (high, H-A):** a `deb` RPK's
+    `.deb` may name only its own package in `Conflicts`, `Breaks`,
+    `Replaces` and `Provides` (RoboDR's own `robodr` / `robodr-focal`
+    pair excepted, from `install.robodr_programme` only). After every
+    `dpkg --install` every other deb package the state records must still
+    be installed at its recorded version; otherwise it is reinstalled, the
+    switch fails (rollback or `robot.deliver.rollback_blocked_floor`) and
+    a package that cannot be restored raises a Critical finding.
+  - **Lock lifted by deleting the state twice (medium, M-A) and older
+    high-water record accepted (medium, M-B):** the signed high-water
+    record carries the lock and a monotonic `generation`, noted in the
+    delivery journal at every write (`robodr.deliver.highwater`) and in
+    the state file. A record older than the journal or the state, a
+    locked record, or a missing or invalid record while the state file or
+    the journal exists locks the agent; a locked start writes a locked
+    record. Deleting the journal as well is still not detected (TPM
+    counter, 14b).
+  - **reanchor (low, L-A, L-B):** refuses a trust file older than the
+    newest version the journal saw and rebuilds the deployment sequence,
+    chain heads, time floor and floors from the journal; `reanchor --key
+    FILE` loads the black-box key file directly (the configured key is a
+    systemd credential that exists only while the service runs).
+  - **Safety feeder groups (low, L-D):** agentd accepts a feeder whose
+    allowed group is a supplementary one (`SO_PEERGROUPS`), so the
+    documented `SupplementaryGroups=robodr-safety` gateway works; it
+    refuses to start with the exporters' group `robodr` as `socket_group`
+    or in `allowed_gids`.
+  - **Upgrade migration (low, L-E):** the postinst ownership migration of
+    agentd's trees runs with agentd and the exporters stopped, removes
+    symlinks and special files, breaks hardlinks, strips group/other
+    write and setuid/setgid, and is resumable (marker
+    `/var/lib/robodr/.agentd-user-migrated`). **Upgrade note (focal):**
+    operator drop-ins copied from older examples that pass `robodr` to
+    `robodr-load-credential load robodr-agentd.service` keep working (the
+    helper hands agentd's credentials to `robodr-agentd` and warns);
+    change them to `robodr-agentd` (`docs/OPERATIONS.md` §11.5).
+  - **Probe reaper (low, L-F):** leftovers are killed with their process
+    groups until none is left or 10 s pass (no 64-round limit).
+  - Info: `pack_digest` no longer follows symlinks, does not block on a
+    FIFO and hashes at most 64 MiB per file; rule names must be unique
+    across all installed `robodr-rules` packages.
+
 - Secure delivery on a unit, independent adversarial review of Sprint 13b
   (`docs/SECURE-DELIVERY.md` §10 "Independent adversarial review of
   13b"); every fixed finding has a regression test that failed before

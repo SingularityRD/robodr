@@ -14,7 +14,7 @@ robodr-deliverd run          --config FILE      # the daemon (robodr-deliverd.se
 robodr-deliverd once         --config FILE      # one pass, JSON report
 robodr-deliverd check-config --config FILE
 robodr-deliverd init-anchor  --config FILE --trust TRUST.json   # once, at enrolment
-robodr-deliverd reanchor     --config FILE --trust TRUST.json   # lift the lock after a lost state
+robodr-deliverd reanchor     --config FILE --trust TRUST.json [--key FILE]   # lift the lock after a lost state
 robodr-deliverd status       --config FILE
 robodr-deliverd confirm      --config FILE --deployment DIGEST --package NAME
 robodr-safety-replay --socket PATH --file REPORTS.jsonl [--repeat-ms N] [--hold-ms N] [--check]
@@ -66,15 +66,19 @@ Exit codes: 0 ok, 1 refused or error, 2 usage. `man robodr-deliverd(8)`,
    reason; `robot.deliver.deferred_safety`, Low, Medium when repeated).
 4. **Intent, floor, switch.** The write-ahead intent and the raised floor
    are fsynced in the state file before the switch (`current` /
-   `rules_active/<name>` symlink swap, or `dpkg --install`).
+   `rules_active/<name>` symlink swap, or `dpkg --install`). A `.deb` may
+   name only its own package in `Conflicts` / `Breaks` / `Replaces` /
+   `Provides`, and after every `dpkg --install` every other recorded deb
+   package must still be installed at its recorded version (otherwise it
+   is reinstalled and the switch fails).
 5. **Health gate.** The RPK's checks (`service_active`, `file_present`,
    `probe`: argv executed without a shell, as the probe user's UID (a
    regular account, `1000..=59999` by default) with supplementary groups
    dropped, fixed environment, rlimits (CPU, address space, open files,
    processes), own process group killed on timeout, output bounded, and
    this process a child subreaper while it runs, so anything it leaves
-   behind, even in a new session, is killed and fails it) plus agentd
-   healthy.
+   behind, even in a new session, is killed with its process group until
+   none is left (at most 10 s) and fails it) plus agentd healthy.
 6. **Install or roll back.** Pass: installed (`robot.deliver.installed`).
    Fail: back to the previous version if it is at or above the floor and
    still in the store (`robot.deliver.health_failed`, also gated by the
@@ -102,9 +106,15 @@ checks the state after the crash and after recovery. The state file is
 replaced atomically and never written with a lower floor. The floors,
 deployment sequence, time floor and chain heads are also in a signed
 high-water record (`<blackbox.dir>/highwater.json`, written first, never
-rotated): a missing or older state file is restored from it (and from
-the journal's floor notes); without it, after the unit had a history,
-the agent locks itself until `reanchor`.
+rotated), which also carries the lock and a generation counter noted in
+the journal (`robodr.deliver.highwater`) and the state file: a missing
+or older state file is restored from a current record (and from the
+journal's floor notes). A record older than the journal or the state
+file, a locked one, or a missing / invalid one while the state file or
+the journal exists locks the agent until `reanchor`, which rebuilds the
+deployment sequence and chain heads from the journal and refuses a trust
+file older than the journal has seen (`--key`: the black-box key file,
+since the configured one is a systemd credential).
 
 ## Modules
 
@@ -133,8 +143,11 @@ the agent locks itself until `reanchor`.
 * No soak window and no attestation check in the health gate (§6.2):
   14a / Sprint 12.
 * Floors are in the state file, the signed high-water record and the
-  black box, not a TPM NV counter (14b): root can delete all of them (the
-  agent then locks until re-anchored).
+  black box, not a TPM NV counter (14b): root deleting or rolling back the
+  state file or the record makes the agent lock until re-anchored; root
+  deleting the journal too (or flooding it and then putting an older
+  record back) is not detected. The record is signed with agentd's
+  black-box key (13b review 2, L-C, open).
 * Probe users come from the passwd file only (no NSS).
 * The safety state is taken from agentd's user (or root) only; whoever
   controls root, `robodr-agentd` or a configured safety feeder can still
@@ -176,5 +189,10 @@ are skipped; `ROBODR_REQUIRE_DPKG_TEST=1` makes that a failure):
   directories through the writer's test seam, kept-version equivocation,
   detached and limited probes, system-account probe users, untrusted
   clock windows, corrected packs under the same name).
+* `review2_13b.rs`: the second review's findings (dpkg relations and the
+  post-install invariant, the signed lock and generation, older records
+  and states, reanchor rebuild / older trust / `--key`, the postinst
+  migration, the deep leftover chain, the bounded pack digest, rule names
+  across packages).
 * `crash.rs`, `kinds.rs` (deb with dpkg, rules), `binary.rs`,
   `fuzz_smoke.rs` (`deliverd_state`, `deliverd_inputs`).

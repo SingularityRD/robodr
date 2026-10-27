@@ -23,6 +23,8 @@ robodr\-deliverd \- install verified RoboDR delivery packages on a unit, behind 
 .I FILE
 .B \-\-trust
 .I TRUST.json
+.RB [ \-\-key
+.IR KEYFILE ]
 .br
 .B robodr\-deliverd status \-\-config
 .I FILE
@@ -102,7 +104,17 @@ symlink swap, or
 The RPK's health checks then decide: pass, installed; fail, automatic
 rollback to the previous version at or above the floor, or, when there is
 none, the unit stays on the failing version and a Critical finding asks an
-operator to act.
+operator to act. A
+.B deb
+package's
+.BR Conflicts ", " Breaks ", " Replaces " and " Provides
+may name only its own package (RoboDR's own pair excepted, from the
+designated programme only); after every
+.B dpkg \-\-install
+every other recorded
+.B deb
+package must still be installed at its recorded version, otherwise it is
+reinstalled and the switch fails.
 .PP
 Every step is recorded in the agent's black box
 .RI ( /var/lib/robodr/blackbox/deliverd ,
@@ -141,17 +153,28 @@ Once, at enrolment; refuses to overwrite an existing anchor (it moves
 forward only by accepted rotations carried in media packs).
 .TP
 .B reanchor
-Lift the lock the agent sets when its state file was lost and its signed
-high-water record
+Lift the lock the agent sets (no import, install or rollback until then)
+when it cannot show that its state is current: its signed high-water
+record
 .RI ( blackbox.dir /highwater.json:
-floors, deployment sequence, time floor, chain heads) is missing or does
-not verify while the black box shows the unit had a history (no import,
-install or rollback until then). Accepts the site's current trust file
-as the anchor, a rotation of it, or a new anchor when none is left, takes
-its signed
+floors, deployment sequence, time floor, chain heads, the lock and a
+generation counter noted in the black box and the state file) is older
+than the black box or the state file says, is locked, or is missing or
+does not verify while the state file or the black box exists. Accepts the
+site's current trust file as the anchor, a rotation of it, or a new
+anchor when none is left, but never one older than the newest version
+the black box has seen; rebuilds the newest accepted deployment, the
+chain heads, the time floor and the floors from the black box; takes the
+trust file's signed
 .B issued_at
-as the time floor and records the step. Stop the service first (the
-journal is single-writer).
+as a time floor too and records the step. Stop the service first (the
+journal is single-writer). The configured
+.B blackbox.key
+is usually a systemd credential that exists only while the service runs:
+pass the key file itself with
+.B \-\-key
+.RI ( /etc/robodr/keys/agentd\-blackbox.key ;
+a regular file of the invoking user without group or other permissions).
 .TP
 .B status
 Print the state: installed versions, kept rollback targets, floors, the
@@ -220,7 +243,8 @@ groups dropped, in their own process group, which is killed when the
 timeout expires, under resource limits (CPU: the timeout plus one second;
 .BR health.probe_max_memory_mb ", " probe_max_open_files ", " probe_max_processes ),
 with the agent as their subreaper: any process a probe leaves behind,
-even in a session of its own, is killed and fails it; output beyond
+even in a session of its own, is killed with its process group (until
+none is left, at most 10 seconds) and fails it; output beyond
 .I max_output_bytes
 is read and discarded. The probe user is resolved from the passwd file at
 staging (never UID or GID 0, never
@@ -275,7 +299,9 @@ Enable after commissioning and
 Kinds
 .BR oci\-image ", " model ", " robodr\-profile ", " os\-image
 and sealed RPKs are refused. Floors live in the state file, the signed
-high-water record and the black box, not in a TPM. The safety state is
+high-water record and the black box, not in a TPM: root deleting the
+black box together with the other two, or flooding it and putting an
+older record back, is not detected. The safety state is
 taken from agentd's user only; whoever controls root, that user or a
 configured safety feeder can still claim
 .BR idle .

@@ -673,10 +673,17 @@ Two different things, deliberately kept apart:
 On a unit (13b), the floor, the accepted deployment's sequence, the time
 floor and the bundle chain heads are written to a **signed high-water
 record** next to the black box before every state write that moves them;
-it is never rotated (the black box's floor notes are, review M1). A lost
-state file is restored from it; if it is gone too while the black box
-shows the unit had a history, the unit **locks** (no import, install or
-rollback) until an operator re-anchors it with a current trust file.
+it is never rotated (the black box's floor notes are, review M1). Every
+write gives it the next **generation**, noted in the black box and in the
+state file, and the lock is part of the record (review 2, M-A / M-B). A
+lost state file is restored from a current record. When the record is
+older than the black box or the state file says, is locked, or is missing
+or invalid while the state file or the black box exists, the unit
+**locks** (no import, install or rollback) until an operator re-anchors
+it with a current trust file; re-anchoring rebuilds the deployment
+sequence and chain heads from the black box and refuses a trust file
+older than the black box has seen. Root deleting the black box as well
+is not detected (TPM NV counter, 14b).
 
 Automatic rollback therefore only ever goes to the previous serial **at or
 above** the floor. If none exists the unit stays on the failing version,
@@ -718,13 +725,20 @@ Within that, the unit keeps what the release declares honest (review
 H2): a `deb` RPK's `name` is its dpkg `Package` and its `arch` the dpkg
 `Architecture` (`all` allowed under any arch); a `.deb` that says
 otherwise, a `Package` the unit records under another RPK name, a higher
-serial carrying a lower dpkg `Version`, and a `.deb` that is, conflicts
-with, breaks, replaces or provides one of RoboDR's own packages
-(`robodr`, `robodr-focal`) are refused. The last is allowed only for RPKs
-from bundles of the **designated RoboDR programme**
-(`install.robodr_programme` in the unit's configuration; default none, so
-RoboDR itself is updated with `install-bundle.sh`). Floors apply to the
-dpkg identity because it is the RPK name.
+serial carrying a lower dpkg `Version`, a `.deb` whose `Conflicts`,
+`Breaks`, `Replaces` or `Provides` names any package but its own (review
+2, H-A: such a relation lets dpkg take over or remove a floored package,
+or another programme's, while the state still records it), and a `.deb`
+that is one of RoboDR's own packages (`robodr`, `robodr-focal`) are
+refused. RoboDR's own packages, which conflict with and replace each
+other, are allowed only for RPKs from bundles of the **designated RoboDR
+programme** (`install.robodr_programme` in the unit's configuration;
+default none, so RoboDR itself is updated with `install-bundle.sh`).
+Floors apply to the dpkg identity because it is the RPK name. After
+every `dpkg --install` the unit checks with `dpkg-query` that every other
+deb package it recorded is still installed at its recorded version; one
+that is not is reinstalled and the switch fails (rollback, or
+`rollback_blocked_floor` when there is no earlier version).
 
 Hardening of `robodr-deliverd.service` (review I1), kept where it does not
 break an ordinary (script-less) install: `RestrictSUIDSGID=` is **not**
@@ -1118,7 +1132,9 @@ Decisions taken where the design left room:
 * **Evidence**: a black-box chain of the agent's own (single-writer
   recorder), signed with the unit's black-box key; a missing or older
   state file is restored from the signed high-water record (and the
-  floors noted in the chain), or the unit locks (§6.4).
+  floors noted in the chain) only when the record is current (its
+  generation, noted in the chain and the state file); otherwise the unit
+  locks (§6.4; review 2, M-A / M-B).
 * **Kinds** `files` / `config` (versioned directory, `current` symlink
   swap; `config` only under `config_root`), `robodr-rules` (versions in
   the state directory, one symlink per package in `rules_active`, Pulsar
@@ -1160,6 +1176,28 @@ but M3 (the SOC side) are fixed; each has a regression test in
 | **L3** With `clock: untrusted` the window used the system clock | the window is judged only on a trusted clock or a signed current time (none in 13b): closed otherwise | `l3_with_an_untrusted_clock_a_maintenance_window_stays_closed` |
 | **L4** A refusal was remembered by directory name and `deployment.json` | packs are remembered by the digest of their whole content (oldest evicted first) | `l4_a_corrected_pack_under_the_same_name_is_judged_again` |
 | **I1** The deb sandbox is not a boundary; some hardening broke ordinary packages | §6.7 states that release signers are root-equivalent for `deb`; `RestrictSUIDSGID=` dropped, `MemoryDenyWriteExecute=` and `ProtectKernelTunables=` kept with their trade-offs | (documentation, unit files; `scripts/check-focal-units.py`) |
+
+**Second independent review of 13b (2026-10-27).** A second review of
+the fixes above found one high, two medium, six low and three
+informational issues. All are fixed except L-C (key custody, below) and
+M3 (SOC side, unchanged); each fix has a regression test in
+`crates/robodr-deliverd/tests/review2_13b.rs` (agentd: in
+`crates/robodr-agentd/src/input.rs`) that failed before it.
+
+| Finding | Fix | Regression test |
+|---|---|---|
+| **H-A** H2 bypass through dpkg relations: a `.deb` under another RPK name with `Replaces` / `Conflicts` / `Breaks` / `Provides` against a floored package took over its files or removed it | relations may name only the RPK's own package (RoboDR's pair only from `install.robodr_programme`); after every `dpkg --install` (and a deb rollback) every other recorded deb package must still be installed at its recorded version (`dpkg-query`), otherwise it is reinstalled and the switch fails; one that cannot be restored is unhealthy with a Critical `rollback_blocked_floor` | `ha_a_deb_with_relations_on_another_package_is_refused` (four relation variants), `ha_an_install_that_changes_another_recorded_package_fails` |
+| **M-A** The lock lived only in `state.json`; the first locked start wrote an unlocked record, so deleting `state.json` twice lifted it | `locked` is part of the signed record; a locked start writes a locked record | `ma_the_lock_survives_deleting_the_state_twice` |
+| **M-B** An older signed record (or an older `state.json` with the record deleted) was accepted | the record's monotonic `generation` is noted in the journal (`robodr.deliver.highwater`, with the baseline) after every write and in `state.json`; a record older than either, or a missing / invalid record while the state file or the journal exists, locks | `mb_an_older_signed_record_locks`, `mb_an_older_state_and_a_deleted_record_lock`, `mb_an_older_state_with_the_current_record_is_raised` |
+| **L-A** `reanchor` did not rebuild the anti-replay baseline and accepted an older trust file with no anchor left | rebuilds the newest deployment, chain heads, time floor and floors from the journal (`pack_imported` now notes expiry and heads); refuses a trust file older than the newest version the journal saw | `la_reanchor_rebuilds_the_sequence_and_chain_heads_from_the_journal`, `la_reanchor_refuses_a_trust_file_older_than_the_journal_saw` |
+| **L-B** The documented `reanchor` could not load the key (a systemd credential, present only while the service runs) | `reanchor --key FILE` (root's file, no group / other bits); OPERATIONS §11.3 | `lb_reanchor_takes_the_black_box_key_file` |
+| L-C deliverd signs its record with agentd's black-box key | **open** (documented, OPERATIONS §11.4): a compromised agentd could forge a record but cannot write it into place; a key of deliverd's own is a packaging change for 14b | — |
+| **L-D** The feeder check saw only the primary gid, so `SupplementaryGroups=robodr-safety` was refused; nothing refused the exporters' group | supplementary groups from `SO_PEERGROUPS` (taken at `connect` like `SO_PEERCRED`: no pid reuse, no `/proc`, which `ProtectProc=invisible` hides); agentd refuses `robodr` as `socket_group` / in `allowed_gids` | agentd `input::tests::a_supplementary_feeder_group_is_accepted`, `safety` section test |
+| **L-E** The postinst migration ran with agentd and the exporters running, kept modes, followed hardlinks and ran only while the top directory was unchanged | `migrate_agentd_tree`: services stopped, symlinks / special files removed, hardlinked files replaced by copies, `chown -h` with `find -P -xdev` of old-owner entries only, `go-w` and no setuid / setgid; resumable with a marker | `le_the_postinst_migration_breaks_links_and_normalises_modes` |
+| **L-F** The probe reaper gave up after 64 rounds | kills leftovers with their process groups until none is left or 10 s pass, reaping without blocking | `lf_a_deep_chain_of_leftovers_does_not_outlive_the_reaper` (101 processes; 37 survived before) |
+| I-B `pack_digest` followed symlinks, could block on a FIFO and hashed without a cap | `O_NOFOLLOW` / `O_NONBLOCK`, same inode as the walk, at most 64 MiB per file and 16 GiB per pack | `ib_pack_digest_caps_the_bytes_it_hashes` |
+| I-C Doc inaccuracies; focal drop-ins from old examples hand agentd's credentials to `robodr` | unit headers and OPERATIONS corrected; the focal credential helper hands `robodr-agentd.service`'s credentials to `robodr-agentd` (with a warning); upgrade notes OPERATIONS §11.5 | (`shellcheck`, `scripts/check-focal-units.py`) |
+| I (rules) Rule names unique only within one package | also across the active versions of every other installed `robodr-rules` package | `a_rule_name_used_by_another_installed_rules_package_is_refused` |
 
 Not in 13b: sealed RPKs and key wraps (13c), the depot and LAN delivery
 (14a), the soak window and attestation in the health gate (14a / Sprint

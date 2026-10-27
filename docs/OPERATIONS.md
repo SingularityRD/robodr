@@ -2423,7 +2423,7 @@ robot, an air-gapped site or a depot (14a).
    (`/run/robodr-agentd/status.sock`, in every shipped example); the
    delivery agent reads the safety state only there and only from
    agentd's own user (`SO_PEERCRED`), never from `status.json` in the
-   spool, which the exporters' group can write. Without the socket every
+   spool (a file, for people and tools). Without the socket every
    install waits.
    * agentd runs as its own user **`robodr-agentd`** (group
      `robodr-agentd`, member of `robodr`); the exporters
@@ -2438,9 +2438,12 @@ robot, an air-gapped site or a depot (14a).
      `"socket_mode": "0660", "socket_group": <gid>, "allowed_gids": [<gid>]`
      (`getent group robodr-safety`), plus `SupplementaryGroups=robodr-safety`
      for both `robodr-agentd.service` (a drop-in) and the gateway's unit.
-     Every connection is checked with `SO_PEERCRED`: an exporter (or any
-     other user) that connects is closed before a byte is read and shows
-     as malformed input in agentd's health.
+     Every connection is checked with `SO_PEERCRED` and `SO_PEERGROUPS`:
+     the allowed group counts as the peer's primary or a supplementary
+     group. An exporter (or any other user) that connects is closed
+     before a byte is read and shows as malformed input in agentd's
+     health. Never use the exporters' group `robodr` as `socket_group` or
+     in `allowed_gids`: agentd refuses to start with it.
 2. Write `/etc/robodr/deliverd.json` from
    `/usr/share/doc/robodr/examples/deliverd.example.json`: the unit id
    (as in the trust file's `rings` and the deployments), the site, model,
@@ -2457,9 +2460,11 @@ robot, an air-gapped site or a depot (14a).
    `1000..=59999` (`health.probe_uid_min`), so a system account (a PLC or
    database user) never runs a probe unless you lower it explicitly.
    `install.robodr_programme` names the one trust-file programme whose
-   `deb` RPKs may be, conflict with, break, replace or provide RoboDR's
-   own packages (`robodr`, `robodr-focal`); leave it `null` to keep
+   `deb` RPKs may be RoboDR's own packages (`robodr`, `robodr-focal`, and
+   then name the other one in their relations); leave it `null` to keep
    RoboDR itself out of delivery (update it with `install-bundle.sh`).
+   Every other `.deb` may name only its own package in `Conflicts`,
+   `Breaks`, `Replaces` and `Provides`.
    `robodr-deliverd check-config --config /etc/robodr/deliverd.json`.
 3. Enrol the trust anchor once, from the site's trust file on vetted
    media:
@@ -2520,28 +2525,49 @@ The floors, the accepted deployment's sequence, the time floor and the
 bundle chain heads are also kept in a **signed high-water record**,
 `/var/lib/robodr/blackbox/deliverd/highwater.json` (signed with the
 unit's black-box key, rewritten before every state write that moves
-them, never rotated). If `state.json` is deleted or replaced by an older
-copy, the agent restores all of them from it (and the floors noted in the
-journal) and reports it (`robot.deliver.refused`, `state_restored`);
-downgrades, replayed or expired deployments stay refused.
+them, never rotated). Each write gives the record the next
+**generation**, which is noted in the journal
+(`robodr.deliver.highwater`) and in `state.json`. If `state.json` is
+deleted, the agent restores all of them from a current record (and the
+floors noted in the journal) and reports it (`robot.deliver.refused`,
+`state_restored`); an older `state.json` next to a current record is
+raised to it. Downgrades, replayed or expired deployments stay refused.
 
-If `state.json` is gone **and** the high-water record is missing or does
-not verify while the journal shows the unit had a history, the agent
-**locks itself** (`robot.deliver.refused`, `state_lost`; `status` shows
-`locked`): it imports nothing and installs or rolls back nothing. To
-lift the lock, find out why the state was lost, then, with the service
-stopped:
+The agent **locks itself** (`robot.deliver.refused`, `state_lost`;
+`status` shows `locked`), importing nothing and installing or rolling
+back nothing, when it cannot show that what it has is current:
+
+* the record is older than the generation the journal or `state.json`
+  noted (an older copy was put back);
+* the record is missing or does not verify while `state.json` or the
+  journal exists (for example an older `state.json` put back and the
+  record deleted);
+* `state.json` and the record are both gone while the journal has
+  records.
+
+The lock is part of the signed record, so deleting `state.json` (again)
+does not lift it. To lift it, find out why the state was lost, then,
+with the service stopped:
 
 ```bash
 sudo systemctl stop robodr-deliverd
-sudo robodr-deliverd reanchor --config /etc/robodr/deliverd.json --trust /media/usb/trust.json
+sudo robodr-deliverd reanchor --config /etc/robodr/deliverd.json \
+    --key /etc/robodr/keys/agentd-blackbox.key --trust /media/usb/trust.json
 sudo systemctl start robodr-deliverd
 ```
 
-`reanchor` accepts the site's **current** trust file (the anchor or a
-newer rotation, under the pinned roots; a new anchor if none is left),
-takes its signed `issued_at` as the time floor and records the step
-(`robodr.deliver.reanchored`). Floors are then those of the trust file
+`--key` is needed because the configured `blackbox.key`
+(`/run/credentials/robodr-deliverd.service/blackbox.key`) is a systemd
+credential that exists only while the service runs; the key file must be
+root's, with no group or other permissions. `reanchor` accepts the
+site's **current** trust file (the anchor or a newer rotation, under the
+pinned roots; a new anchor if none is left) and refuses one older than
+the newest version the journal has seen. It rebuilds the newest accepted
+deployment, the bundle chain heads, the time floor and the floors from
+the notes still in the journal, takes the trust file's signed
+`issued_at` as a time floor too, and records the step
+(`robodr.deliver.reanchored`). What the journal no longer holds (it is
+cyclic) is not restored: floors are then those of the trust file
 (`floors`), which the depot should set for every package that has one;
 deliver the newest deployment first. Do not delete
 `/var/lib/robodr/deliverd` or the black-box directory.
@@ -2559,8 +2585,13 @@ deliver the newest deployment first. Do not delete
   content (`docs/SECURE-DELIVERY.md` §6.7). A `deb` RPK's name and
   architecture are its dpkg `Package` and `Architecture`; a `.deb` that
   says otherwise, a package another RPK name already owns, a higher
-  serial with a lower dpkg version, and anything touching RoboDR's own
-  packages outside `install.robodr_programme` are refused.
+  serial with a lower dpkg version, a `.deb` whose `Conflicts`,
+  `Breaks`, `Replaces` or `Provides` names another package, and anything
+  touching RoboDR's own packages outside `install.robodr_programme` are
+  refused. After every `dpkg --install` the agent checks that every
+  other deb package it installed is still installed at its version; if
+  not, it reinstalls it and fails the switch (`robot.deliver.health_failed`
+  or, without an earlier version, `robot.deliver.rollback_blocked_floor`).
 * `deb` maintainer scripts run only when the release quorum allowed them
   (recorded in the black box), as root under the unit's capability set,
   without network. They cannot write `/proc/sys` (`ProtectKernelTunables=`:
@@ -2570,11 +2601,42 @@ deliver the newest deployment first. Do not delete
 * Probes run as their (non-system) user with their own limits (CPU =
   timeout + 1 s, `health.probe_max_memory_mb`, `probe_max_open_files`,
   `probe_max_processes`); whatever a probe leaves behind, even a process
-  in its own session, is killed and fails the probe.
+  in its own session, is killed with its process group (until none is
+  left, at most 10 s) and fails the probe.
 * Floors are in the state file, the signed high-water record and the
-  black box, not a TPM counter (14b): root can still delete all of them;
-  the agent then locks until re-anchored. Sealed RPKs, models, OCI images and OS images are refused until
-  13c / 14a / 14c.
+  black box, not a TPM counter (14b). Root deleting or putting back older
+  copies of the state file or the record makes the agent lock until
+  re-anchored, as long as the journal still shows the unit's history.
+  Root deleting the journal too (or flooding it with notes signed with
+  the black-box key until the generation notes are evicted, then putting
+  an older record back) is **not** detected; the TPM counter closes that.
+  The high-water record is signed with agentd's black-box key, so a
+  compromised agentd could forge one, though it cannot write it into
+  place (`blackbox/deliverd` is root's). Sealed RPKs, models, OCI images
+  and OS images are refused until 13c / 14a / 14c.
 * `robodr-safety-replay` (tests and demos) writes safety states into
   agentd's socket; it is not in the package and must never run on a
   fielded robot.
+
+### 11.5 Upgrading from a release where agentd ran as `robodr`
+
+* The package moves agentd's black box, spool, profile state and
+  control-plane state to `robodr-agentd` once (`postinst`). It stops
+  `robodr-agentd` and the exporters for that and starts them again; the
+  migration removes symlinks, FIFOs and devices from those trees,
+  replaces hardlinked files by copies, removes group/other write and
+  setuid/setgid bits, and is repeated until it has completed (marker
+  `/var/lib/robodr/.agentd-user-migrated`). Do not create the marker by
+  hand.
+* **Focal (`robodr-focal`):** operator drop-ins under
+  `/etc/systemd/system/robodr-agentd.service.d/` copied from older
+  examples load agentd's credentials for the user `robodr`
+  (`robodr-load-credential load robodr-agentd.service robodr ...`). The
+  helper now hands credentials of `robodr-agentd.service` to
+  `robodr-agentd` regardless and logs a warning, so agentd still starts;
+  change the drop-ins to `robodr-agentd` (as in the shipped
+  `*.conf.example` files) and run `systemctl daemon-reload`.
+* A safety gateway set up with `SupplementaryGroups=robodr-safety` (§11.1)
+  is accepted from this release on; remove any workaround such as
+  `allowed_gids` = the `robodr` gid (agentd now refuses to start with
+  it).
