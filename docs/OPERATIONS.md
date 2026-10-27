@@ -2636,6 +2636,15 @@ deliver the newest deployment first. Do not delete
   `robodr-agentd` regardless and logs a warning, so agentd still starts;
   change the drop-ins to `robodr-agentd` (as in the shipped
   `*.conf.example` files) and run `systemctl daemon-reload`.
+* **Focal (`robodr-focal`), `robodr-deliverd`:** the helper used to refuse
+  every credential for `root`, so the focal `robodr-deliverd.service`
+  (`User=root`, `robodr-load-credential load robodr-deliverd.service root
+  ...`) failed in `ExecStartPre=` and never started. The helper now allows
+  `root` for `robodr-deliverd.service` only (its `root_units` list;
+  `scripts/check-focal-units.py` keeps it in step with the focal units);
+  for every other unit `root` is still refused. Nothing to change on the
+  unit; after the upgrade, start it with `systemctl start robodr-deliverd`
+  if it is enabled.
 * A safety gateway set up with `SupplementaryGroups=robodr-safety` (§11.1)
   is accepted from this release on; remove any workaround such as
   `allowed_gids` = the `robodr` gid (agentd now refuses to start with

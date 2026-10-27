@@ -1302,6 +1302,17 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Fixed
 
+- `robodr-focal`: `robodr-deliverd` could not start, because
+  `robodr-load-credential` refused to hand its black-box key to `root`
+  (the unit's `User=`). The helper now allows `root` for
+  `robodr-deliverd.service` only (explicit allow-list `root_units`); every
+  other unit still refuses `root`, and the path, symlink, mode and
+  directory checks are unchanged. `scripts/check-focal-units.py` checks
+  that the allow-list names exactly the focal units that load credentials
+  for root; new `scripts/test-load-credential.sh` (CI `scripts` job, as
+  root on a copy of the helper rooted in a temporary directory) covers
+  the exception, the refusals and the existing checks
+  (`docs/OPERATIONS.md` §11.5).
 - `--version` (prints `<name> <version>`) and `--help` (usage on stdout)
   exit 0 on `robodr-anchor-receiver`, `robodr-blackbox`,
   `robodr-diode-pack`, `robodr-diode-unpack`, `robodr-kafka-publish`,
