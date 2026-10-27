@@ -785,17 +785,35 @@ safely. Nothing here is specific to one product.
       lesser findings are two separate aggregates.
     - **Subject**: `src_ip` = the flooding source (absent for the "many
       sources" aggregate) and `node` = a synthetic, sensor-authored name
-      `discovery_flood/<critical|other>/<episode start, RFC 3339 UTC ms>`
-      (it is not a ROS node). Every report of one flood episode therefore
-      has one `finding_id` (one case, updated with `count` /
-      `last_seen_time`), and a flood after the previous one ended (a full
-      60 s quiet) has a new `finding_id`.
+      `discovery_flood/<critical|other>/<episode start, RFC 3339 UTC ms>`,
+      or `discovery_flood/protected-<critical|other>/<24 hex GUID
+      prefix>/<episode start>` for findings about one of the robot's own
+      participants (it is not a ROS node). Every report of one flood
+      episode therefore has one `finding_id` (one case, updated with
+      `count` / `last_seen_time`), and a flood after the previous one
+      ended (a full 60 s quiet) has a new `finding_id`.
     - **Detail** (tainted, at most 400 characters, never cut mid-text):
       the folded count per rule, first and last seen, up to 4 sample GUID
       prefixes taken from the parsed announcements (never from text), and
-      for the "many sources" aggregate up to 4 sample source addresses.
-    - Never folded into it: findings that are not about one participant,
-      and findings about a profiled or pinned participant.
+      for the "many sources" aggregate up to 4 sample source addresses
+      (the **latest** ones, and the latest sample prefixes, motion writers
+      kept first: "latest sample sources: ...", "latest sample GUID
+      prefixes: ..."). An aggregate of findings about one of the robot's
+      own (profiled or pinned) participants names that participant as its
+      subject ("about the robot's own participant <prefix> (profiled or
+      pinned)") and lists **no** sample GUID prefixes: a SOC must not take
+      that prefix as a quarantine target from this finding (it is the
+      impersonated one).
+    - Findings about a profiled or pinned participant (review R2-1 of the
+      redfix) are folded only past 4 High / Critical ones per
+      (participant, source, rule) and 60 s window, or 64 per participant
+      (below High: 256 / 1024); their aggregate is `critical` for the High
+      / Critical ones. Never folded: findings that are not about one
+      participant, and a Critical finding from a source first seen after
+      128 sources in the window, up to 128 such per window (review R2-2).
+    - The catalog title ("... unknown participants aggregated") predates
+      these per-endpoint and protected-participant aggregates; it is frozen
+      and mirrored, so it stays (the detail says which rules were folded).
     - No new field.
   - Schema `$id` `https://schemas.singularityrd.com/robodr/findings/2.1.0`;
     `contract_version` parts at most 9 digits and `ocsf.metadata.log_name`

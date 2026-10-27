@@ -108,7 +108,7 @@ reviewer's proof of concept and failed before the fix.
 | # | Sev | Attack | Fix | Regression |
 |---|-----|--------|-----|------------|
 | H1 | High | One SPDP for the profiled prefix after its lease ran out, from the attacker's host, overwrote its remembered locators silently; the SOC's quarantine of a decoy announcing the robot's address then cut the robot participant (executor `verified`). | A profiled prefix with no live binding, announced from an address its remembered evidence never saw, becomes contested (Critical `participant_source_mismatch`); its locators are never written by a foreign host. Locators are handed out only on addresses the participant was seen sending from. | `crates/robodr-ros2-pipeline/tests/review_redfix.rs` `h1_*`; `crates/robodr-agentd/tests/executor_link.rs` `review_h1_*` |
-| H2a | High | A live decoy prefix announcing the rogue's locators made them "claimed by another participant": `locators_required`. | Another prefix takes an ip:port away only if it was seen at that address (live, or remembered later). A decoy spoofing the rogue's own address contests the locator, and agentd vouches for a GUID-prefix-only quarantine (`guid_only`). | `review_redfix.rs` `h2a_*`; `executor_link.rs` `review_h2a_*` (both variants) |
+| H2a | High | A live decoy prefix announcing the rogue's locators made them "claimed by another participant": `locators_required`. | Another prefix takes an ip:port away only if it was seen at that address (live, or remembered later). A decoy at the rogue's own address contested the locator, and agentd vouches for a GUID-prefix-only quarantine (`guid_only`). (Superseded by R2-3: a same-address claim no longer contests.) | `review_redfix.rs` `h2a_*`; `executor_link.rs` `review_h2a_*` (both variants) |
 | H2b | High | One locator outside the quarantine scope, on the motion path or loopback in the rogue's SPDP: the executor refused the whole order. | Unobserved and loopback locators never leave the binding table; the executor leaves any out-of-scope, other-family or motion-path locator out (listed with the reason) and quarantines the rest; it still refuses when every locator is on the motion path. | `review_redfix.rs` `h2b_*`; `executor_link.rs` `review_h2b_*`; executor `review_guid_only_quarantine_keeps_every_refusal` |
 | H3 | High | 600 sprayed prefixes with a `cmd_vel` writer each: 600 Critical findings, the Critical spool share full, a later genuine rogue's Critical finding dropped. | Critical per-participant findings are aggregated per source after the first 8 (a Critical `discovery_flood`); one source may hold at most a quarter of the Critical spool share. | `crates/robodr-agentd/tests/redteam_regressions.rs` `review_h3_*` |
 | H4 | High | ~40 packets a minute from 12 addresses used up the global budget: a later rogue's `unknown_participant` and a pinned prefix's impersonation were folded into a sourceless aggregate. | Only a source past its own share is folded; a late source still reports its first finding; findings about profiled / pinned participants are never folded. | `redteam_regressions.rs` `review_h4_*` |
@@ -123,4 +123,32 @@ Still open (documented limits): the evidence is source addresses, which
 can be forged (a rogue spoofing an absent unprofiled participant's
 address and announcing its exact ip:port gets it); the binding memory and
 flood state are not persisted across an agentd restart.
+
+## Second review of the F1 / F3 fixes
+
+A second independent review of the round-2 fixes (`2a0e232..db4162f`)
+found two High, two Medium and four Low issues. Each has a regression
+test that failed before its fix (output in the fixing commit's message
+where useful).
+
+| # | Sev | Attack | Fix | Regression |
+|---|-----|--------|-----|------------|
+| R2-1 | High | Findings about a profiled / pinned participant were never folded: 750 SEDP announcements "for" the (contested) robot participant with distinct topics from 5 addresses gave a Critical `endpoint_source_mismatch` plus a High `unknown_writer_topic` each; a 400-file spool filled (402 records, 1103 dropped) and the genuine rogue's Critical finding was dropped. | Per (participant, source, rule) and 60 s window the first 4 High / Critical findings pass by name (64 per participant; below High 256 / 1024, so a legitimate participant leaving is never folded); the rest is a Critical aggregate per (source, participant) that names the participant as its subject, never as a sample. The last quarter of the spool's Critical share takes only a source with no record in it yet. Now 93 records, none dropped, the rogue spooled. | `crates/robodr-agentd/tests/redteam_regressions.rs` `review2_r2_1_*`; `src/flood.rs` `protected_findings_are_bounded_and_name_the_participant`; `src/spool.rs` `the_last_part_of_the_critical_share_is_for_new_sources` |
+| R2-2 | High | 128 spoofed SPDPs (about 2 packets/s) filled the per-window source table; 4 more spoofed motion writers seeded the sourceless Critical aggregate; the real rogue's `unauthorized_motion_writer` was folded into it unnamed. | A Critical finding from a source beyond the 128 still passes by name, up to 128 per window (exhausting it takes about 6.4 packets/s sustained); the "many sources" aggregate keeps the latest samples, motion writers first. | `redteam_regressions.rs` `review2_r2_2_*`; `src/flood.rs` `a_full_source_table_does_not_fold_a_new_sources_critical_finding` |
+| R2-3 | Medium | IP-level quarantine was optional for the rogue: its own second prefix from its address contested its locators (no spoofing), locators on an address it never sends from, or a re-announce from a second address after its lease (which wiped a SOC-named history); the SOC read `verified` / `in_force: true` while only the GUID-prefix drop was in force. | Same-address claims share the host (both get the ip:port); a prefix ranked High or above keeps its evidence, locators and rank on a re-announce (merged, bounded); the SOC answer carries `containment` (`full` / `partial` / `guid_only` / `unknown`) and `state.quarantine` {`locators`, `excluded`} (contract §6a, journalled). | `crates/robodr-ros2-pipeline/tests/review_redfix.rs` `r2_3a_*`, `r2_3c_*`; `executor_link.rs` `review2_r2_3_*`, `review_h2a_a_self_decoy_*` |
+| R2-4 | Medium | 1100 Critical-ranked prefixes from 10 addresses evicted a departed Critical rogue (`known: false`, `locators_required`). | Global eviction takes the fullest per-source bucket first; a SOC-named entry is never evicted for a lower-ranked one. | `review_redfix.rs` `r2_4_*`; binding `global_eviction_takes_the_fullest_bucket_first` |
+| R2-5 | Low | A decoy spoofing a present profiled host's address got that host's other ports (protection was per ip:port). | For a non-profiled target, no port on a profiled participant's host address is handed out (`PROFILED_HOST`). | `review_redfix.rs` `r2_5_*` |
+| R2-6 | Low | agentd cut the locators to the order's 16 silently. | The rest is listed in `excluded` ("over the order's locator limit (16)"). | `executor_link.rs` `review2_r2_6_*` |
+| R2-7 | Low | A new agentd's `guid_only` / `excluded` order is not understood by an older executor (strict order format). | Documented upgrade order: executor first (CHANGELOG, contract §14, UNITREE, OPERATIONS). The older executor drops the order unanswered (`failed`, executor unreachable), so agentd cannot tell it from a lost answer and does not resend a changed order. | executor `outcomes_stay_readable_across_versions` (the answer side stays tolerant) |
+| R2-8 | Low | Doc inaccuracies: "spoofed" decoy, "the answer's note", contested lifetime, "hundreds of addresses", catalog title. | Corrected in the binding, flood and executor docs, the READMEs and the findings contract; the mis-titled test is renamed. | — |
+
+Still open after the second review (documented): a spoofed-source spray
+above about 6.4 packets/s can still fold a genuine rogue's Critical
+finding into the "many sources" aggregate (named there while among the
+latest samples, always in the black box); a spoofed spray from more than
+1024 addresses can evict an un-named rogue's remembered locators; a rogue
+that announces locators only on addresses it never sends from is
+quarantined by GUID prefix only (now visible to the SOC as `guid_only`);
+a merged history keeps a moved unknown participant's old address for
+24 h.
 

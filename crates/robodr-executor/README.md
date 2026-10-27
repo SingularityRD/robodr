@@ -57,7 +57,9 @@ revert / TTL expiry ── journal (reverting) ── re-render without it ─�
      ports (`network.quarantine.udp_ports`, default the RTPS port ranges of
      `network.discovery.domains`), not loopback, one address family. Any
      other locator is **left out** (review of the F3 fix, H2b: listed with
-     its reason in the plan, the `applied` event and the answer's `note`;
+     its reason in the plan, the `applied` event, and the state the
+     executor answers agentd (`note`, and `quarantine.excluded`, which
+     agentd passes on to the SOC as `state.quarantine`, contract §6a);
      nothing is rendered for it) instead of refusing the whole order, so
      one bad locator in a rogue's own SPDP cannot make it unquarantinable.
      **Still refused**: a GUID prefix of a motion-path entry it may not cut,
@@ -438,14 +440,18 @@ and `src/config.rs` for every field and its limits. agentd's side is the
   "Quarantine locators"): what the participant itself last announced
   through a path the binding trusts, also after it left, its lease expired
   or a prefix flood evicted it (kept 24 h), **only on addresses it was seen
-  sending from**; never a locator a profiled participant announces or an
-  address pinned to another prefix, never one another participant seen at
-  that address also announces; none for a contested or pinned prefix. It
+  sending from**; never a locator a profiled participant announces, any
+  port on a profiled participant's host address (for a non-profiled
+  target), or an address pinned to another prefix; none for a contested
+  or pinned prefix. Another prefix seen at the same address announcing the
+  same ip:port does not take it away (review R2-3: the rogue's own second
+  prefix is the same host, no spoofing needed). It
   also sets `guid_only` when the binding table saw the prefix and it is not
   one of the robot's own (profiled, pinned, contested): with no locator
   left the executor then quarantines by the GUID-prefix drop alone (it
   matches RTPS sent by that prefix only). The locators agentd left out are
-  listed in the order (`excluded`, with the reason). A
+  listed in the order (`excluded`, with the reason; locators beyond the
+  order's 16 too, review R2-6). A
   `ros2_participant_discovered` event of a JSONL input is used only for a
   prefix the binding table does not know at all, through the same filters
   with the event's `src_ip` as the only evidence (review M7). Without any
@@ -569,7 +575,11 @@ and `src/config.rs` for every field and its limits. agentd's side is the
   GUID rule and the to-locator rule apply to it).
 * **Quarantine needs locators** agentd has seen (binding table or
   participant events), or agentd's `guid_only` vouch (a participant it saw
-  and that is not one of the robot's own; then by GUID prefix only). A
+  and that is not one of the robot's own; then by GUID prefix only, which
+  `INFO_SRC` re-attribution or a new prefix evades: the state answer's
+  `quarantine` (no locators) lets agentd tell the SOC `containment:
+  "guid_only"`). A rogue that announces its locators only on addresses it
+  never sends from gets exactly that. A
   participant whose SPDP agentd never saw cannot be quarantined
   (`locators_required`). A `node`-named quarantine is refused
   (`unsupported_target`).

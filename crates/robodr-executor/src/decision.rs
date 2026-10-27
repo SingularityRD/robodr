@@ -52,8 +52,10 @@
 //!     (review F4: inside a `network.quarantine.cidrs` entry, on one of the
 //!     robot's DDS ports, not loopback, one address family). Review of the
 //!     F3 fix (H2b): a locator failing either check is **left out** (listed
-//!     in the plan, the `applied` event and the answer's note, nothing
-//!     rendered for it) instead of refusing the whole order, so one bad
+//!     in the plan, the `applied` event and the state the executor answers
+//!     agentd: its `note` and `quarantine.excluded`, which agentd passes on
+//!     to the SOC as `state.quarantine` / `containment`, review R2-3;
+//!     nothing rendered for it) instead of refusing the whole order, so one bad
 //!     locator in the rogue's own SPDP cannot make it unquarantinable. Still
 //!     refused: an order whose every locator is on the motion control path
 //!     (`motion_path`: the participant may be on it); an empty

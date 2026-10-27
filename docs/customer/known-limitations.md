@@ -43,9 +43,15 @@
     prefix alone when none can be vouched for. RTPS over TCP or shared
     memory, a sender that changes its GUID prefix, and a rogue on the same
     host over loopback are not covered. Source addresses are not
-    authenticated: a rogue that forges an *absent* unprofiled host's
-    address and announces its exact ip:port can get that ip:port into its
-    own quarantine (never a profiled or pinned participant's).
+    authenticated: a rogue that forges an unprofiled host's address and
+    announces its exact ip:port can get that ip:port into its own
+    quarantine (never an address of a profiled participant's host or a
+    pinned one). A rogue that announces its locators only on addresses it
+    never sends from is quarantined by GUID prefix only, which it can
+    evade; the SOC's answer then says `containment: "guid_only"`.
+  - Upgrade the executor before agentd: an older executor drops an order
+    with the newer quarantine fields unanswered (the request reads
+    `failed`, nothing is applied).
   - Bridged traffic is isolated only with `br_netfilter` loaded.
   - It verifies the SOC's signed request itself (its own copy of the SOC
     keys, its own replay store) before it executes a control-plane order,

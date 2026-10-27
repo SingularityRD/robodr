@@ -1428,13 +1428,20 @@ acceptance check below.
 Design, safety argument and limits are in
 [`crates/robodr-executor/README.md`](../crates/robodr-executor/README.md).
 
+**Upgrade order: the executor before agentd.** An agentd from the
+red-team fixes on may send quarantine orders with `guid_only` / `excluded`;
+an older executor drops them unanswered (the request reads `failed`,
+"executor unreachable", nothing applied). Upgrade `robodr-executor`
+first; with an older executor a verified quarantine's `containment` reads
+`unknown`.
+
 **What it does.** It executes two reversible actions, as nftables rules in
 its own table `inet robodr`, plus an evidence mark:
 
 | Action | Effect | Lifted |
 |---|---|---|
 | `isolate_network` | everything dropped except loopback, the management and uplink allow-lists, the control buses (configurable), the motion control path, the robot's DDS discovery (SPDP multicast, IGMP), the DHCP client, path MTU discovery and IPv6 neighbour / router discovery | on revert or TTL |
-| `quarantine_node` | one DDS participant dropped (by RTPS GUID prefix and by its SPDP locators, which agentd must have seen and which must lie outside the motion control path; that path is never cut, even by traffic carrying the quarantined prefix) | on revert or TTL |
+| `quarantine_node` | one DDS participant dropped (by RTPS GUID prefix and by its SPDP locators on addresses agentd saw it sending from, which must lie outside the motion control path; that path is never cut, even by traffic carrying the quarantined prefix). The SOC's answer says how far it reaches: `containment` `full`, `partial` or `guid_only` (GUID-prefix drop only, evadable), with `state.quarantine` listing what was cut and left out (contract §6a) | on revert or TTL |
 | `record_evidence` | a signed black-box mark | never: evidence is not reverted |
 
 `restrict_motion` is recorded as advisory: the executor does not drive the

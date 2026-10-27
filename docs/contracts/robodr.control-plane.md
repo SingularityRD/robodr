@@ -343,6 +343,8 @@ whether the action is **being enforced on the robot now**: `true` only for
 `false` for every other status. `executed` stays "it took effect at some
 point" (`true` for `reverted` too). `state.executor_state: "held"` appears
 only on a `verified` request whose action the executor holds (§6a).
+`containment` (top level) and `state.quarantine` say how far a
+`quarantine_node` reaches (§6a, "Quarantine scope"); `in_force` does not.
 
 | `status` | Meaning | Terminal |
 | --- | --- | --- |
@@ -402,9 +404,10 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
     participant's SPDP unicast locators it has seen (from the pipeline's
     binding table: the prefix's own last trusted announcement, also after
     the participant left or was evicted, for 24 h, only on addresses it
-    was seen sending from, minus any locator a profiled participant, a pin
-    or another participant seen at that address claims, none for a
-    contested or pinned prefix; from `ros2_participant_discovered` events
+    was seen sending from, minus any locator a profiled participant
+    announces, any port on a profiled participant's host (for another
+    prefix) and any pinned address, none for a contested or pinned prefix;
+    from `ros2_participant_discovered` events
     only for a prefix the binding table does not know, through the same
     filters). With no locator left, agentd vouches for a GUID-prefix-only
     quarantine of a participant it saw that is not one of the robot's own
@@ -412,7 +415,8 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
     (`locators_required`). The executor leaves out (never refuses for) a
     locator outside its quarantine scope or on the motion control path,
     and refuses an order whose every locator is on the motion control path
-    (`motion_path`).
+    (`motion_path`). How far a verified quarantine reaches is in the
+    answer (below, "Quarantine scope").
   * `record_evidence` becomes `verified` once a signed
     `robodr.evidence_mark` note naming the request's evidence is in the
     black box. It is never reverted.
@@ -481,12 +485,38 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
 * **TTL.** Every executed action has a TTL: the request's `ttl_seconds`,
   or the executor's `ttl.default_s` when the request names none. The
   executor lifts the action at `expires_at_ms` without further requests.
+* **Quarantine scope** (review R2-3 of the red-team fixes). A
+  `quarantine_node` is enforced as UDP drops to and from the locators the
+  executor cuts **plus** a drop of RTPS whose header carries the
+  participant's GUID prefix. The GUID-prefix drop alone is weak: a sender
+  can re-attribute its submessages with `INFO_SRC` or restart under a new
+  prefix. So every answer of a `quarantine_node` request says what is cut:
+
+  | Field | Where | Present | Value |
+  | --- | --- | --- | --- |
+  | `containment` | top level, next to `in_force` | on a `quarantine_node` request whose `status` is `verified` or `applied` (held or not); absent otherwise | `"full"`: locators cut and none left out; `"partial"`: locators cut, some announced locators left out (`state.quarantine.excluded`); `"guid_only"`: **no locator cut**, only the GUID-prefix drop is in force (not IP-contained); `"unknown"`: the executor did not report the scope (an executor older than this revision) |
+  | `state.quarantine` | `state` | once the executor reported the scope (kept after a revert; journalled, survives a restart) | object, below |
+  | `state.quarantine.locators` | | always in the object | array (0..=16) of `"ip:port"` strings (IPv6 as `"[addr]:port"`): the UDP endpoints the executor cuts |
+  | `state.quarantine.excluded` | | always in the object (may be empty) | array (0..=64) of `{"locator": "ip:port", "reason": string}` (reason ≤ 200 characters, no control characters, tainted text: display only): announced locators agentd or the executor left out, e.g. "the participant was never seen sending from this address (announced only)", "address of a profiled participant's host (the robot's own computer)", "over the order's locator limit (16): not acted on", "outside every network.quarantine.cidrs entry" |
+
+  `containment` is derived from `state.quarantine`: `guid_only` iff
+  `locators` is empty, else `partial` iff `excluded` is not empty, else
+  `full`. Both fields are additive: a client that ignores them keeps
+  working, and answers without them (any other action, any other status,
+  an older agentd) are unchanged. The fields are inside the signed body
+  (§2).
 * **Client requirements.** Report "in force" exactly when `in_force` is
   `true` (a `verified` request the executor does not hold); a `verified`
   request with `in_force: false` and `state.executor_state: "held"` is
-  "held after a reboot, not enforced" (keep polling GET). Treat `refused`
-  and `failed` as "not applied" and show `refusal.code`, `refusal.reason`
-  and `state.error`. Poll GET for a `pending` request.
+  "held after a reboot, not enforced" (keep polling GET). For a
+  `quarantine_node` in force, show the containment: `full` as contained;
+  `partial` as "partially contained" with the left-out locators and
+  reasons; `guid_only` as "partially contained: GUID-prefix drop only, not
+  IP-contained" (the participant can evade it; consider `isolate_network`
+  or on-site action); `unknown` as "in force, scope not reported". Never
+  show `guid_only`, `partial` or `unknown` as fully contained. Treat
+  `refused` and `failed` as "not applied" and show `refusal.code`,
+  `refusal.reason` and `state.error`. Poll GET for a `pending` request.
 * **Evidence.** Each executor event (`applied`, `verified`, `refused`,
   `failed`, `reverted`, `expired`, `revert_failed`, `drift`,
   `removed_externally`, `reconciled`, `journal_reset`, `held`, `rearmed`,
@@ -667,8 +697,14 @@ of §2 (the latest second at which expired pairs were dropped). An agentd
 older than this revision reads a `clock` entry as damage and fences once.
 
 **Executor states** (executor v1, §6a) are one entry each,
-`{"t":"executor","request_id":...,"status":...,"error":...,"refusal":...}`,
-appended (fsync) before the new state is answered. They are the executor's
+`{"t":"executor","request_id":...,"status":...,"error":...,"refusal":...}`
+plus, for a verified quarantine whose scope the executor reported,
+`"quarantine": {"locators": [...], "excluded": [...]}` (§6a; absent
+otherwise, and in the `stored` snapshot likewise), appended (fsync) before
+the new state is answered. An agentd older than that revision reads an
+entry with `quarantine` as damage and rebuilds from the black box (§9,
+"After damage"; the scope is then asked from the executor again on
+resync). They are the executor's
 word, not a decision of agentd (the executor and agentd's
 `robodr.executor_event` notes are their evidence), so they have no
 begin / commit pair. An entry for a request whose decision is still
@@ -699,7 +735,9 @@ What a SOC integration must do to use this API correctly:
   report it as not applied, never as success, and never poll it. Report an
   action as in force only when the answer says `"in_force": true`
   (`verified` and not held, §6a); `verified` with `in_force: false` and
-  `state.executor_state: "held"` is "held, not enforced".
+  `state.executor_state: "held"` is "held, not enforced". A
+  `quarantine_node` in force is fully contained only with
+  `"containment": "full"` (§6a, "Quarantine scope").
 * **Retries.** On 503 `busy` or a lost answer, resubmit with the same
   `request_id` and body and a fresh nonce (§7); never a new `request_id`
   for the same intent unless the first answer was a final `failed`.
@@ -1062,3 +1100,40 @@ it applies only with `executor.enabled` (§6a). What a SOC client sees:
   (§5): use a new `request_id`.
 * `require_approval_for_all_containment` (site option): planner orders are
   refused, SOC requests unaffected.
+
+### Revision: quarantine scope (red-team fix review R2-3, 2026-10)
+
+Additive, no version change (`robodr-control-plane/v2`); it applies only
+with `executor.enabled` (§6a). What a SOC client sees:
+
+* **New top-level answer field `containment`** (string: `"full"`,
+  `"partial"`, `"guid_only"` or `"unknown"`) on every answer of a
+  `quarantine_node` request whose `status` is `verified` or `applied`
+  (submit, GET, revert answers; also while held). Before this revision a
+  quarantine that cut no locator (the participant announced its locators
+  only on addresses it never sends from, or every locator was left out)
+  read `verified` / `in_force: true` like a full one.
+* **New `state.quarantine`** object `{"locators": ["ip:port", ...],
+  "excluded": [{"locator": "ip:port", "reason": "..."}]}` once the
+  executor reported the scope (§6a table: at most 16 locators, 64
+  left-out entries, reasons ≤ 200 characters).
+* `in_force`, `status`, `executed` and every other field keep their
+  meaning; vectors (§12) are unchanged (none is a verified quarantine).
+* Client requirement (§6a, §10): show `guid_only` as "partially
+  contained: GUID-prefix drop only, not IP-contained", `partial` as
+  "partially contained" with the left-out locators, `unknown` as "scope
+  not reported"; only `full` is contained.
+* Robot side: the executor's state answer to agentd carries
+  `quarantine: {locators, excluded}` (`robodr_executor::engine::Outcome`;
+  an older agentd ignores it). agentd lists locators beyond the order's 16
+  in `excluded` ("over the order's locator limit (16): not acted on")
+  instead of dropping them silently (review R2-6).
+* **Upgrade order** (review R2-7): upgrade `robodr-executor` **before**
+  `robodr-agentd`. An order carrying `guid_only` or `excluded` (since the
+  previous redfix revision) is not understood by an older executor, which
+  drops the message unanswered (its order format is strict); agentd then
+  answers the request `failed` ("executor unreachable") and nothing is
+  applied. agentd does not retry such an order in the older format: an
+  unanswered order cannot be told apart from an executor that applied it
+  and lost the answer, and resending a changed order under the same
+  `request_id` could be answered `id_conflict` for an action in force.
