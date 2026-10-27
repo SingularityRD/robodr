@@ -1079,3 +1079,136 @@ fn review_m7_an_event_input_does_not_bypass_the_binding_tables_refusal() {
     assert_eq!(v["refusal"]["code"], "locators_required", "{v}");
     assert_eq!(table, "null");
 }
+
+// --- Second review of the red-team fixes (wt/redfix, R2-3, R2-6) ------------
+
+/// R2-3: the rogue announced its locators only on an address it never
+/// sends from (no spoofing), so the executor installed the RTPS-header
+/// GUID-prefix drop alone (bypassable with INFO_SRC or a new prefix). The
+/// SOC still read `verified` / `in_force: true` with no hint of the scope.
+/// The answer now says how far the quarantine reaches (`containment`) and
+/// what was cut and left out (`state.quarantine`).
+#[test]
+fn review2_r2_3_the_soc_answer_carries_the_quarantine_scope() {
+    // GUID prefix only: every locator is on an address it never sent from.
+    let frames = vec![
+        spdp_from(v4(66), ROGUE, &[v4(68)]),
+        writer_from(v4(66), ROGUE),
+    ];
+    let (v, _) = soc_quarantine(
+        "rv2-r2-3-guid",
+        &frames,
+        std::time::Duration::from_millis(10),
+        &[],
+        ROGUE_HEX,
+    );
+    assert_eq!(v["status"], "verified", "{v}");
+    assert_eq!(v["in_force"], true, "{v}");
+    assert_eq!(v["containment"], "guid_only", "{v}");
+    let q = &v["state"]["quarantine"];
+    assert_eq!(q["locators"], json!([]), "{v}");
+    let ex = q["excluded"].as_array().unwrap_or_else(|| panic!("{v}"));
+    assert!(
+        ex.iter().any(|x| x["locator"] == "10.0.0.68:7410"
+            && x["reason"].as_str().unwrap().contains("never seen sending")),
+        "{v}"
+    );
+    // Full: every announced locator cut.
+    let frames = vec![
+        spdp_from(v4(66), ROGUE, &[v4(66)]),
+        writer_from(v4(66), ROGUE),
+    ];
+    let (v, _) = soc_quarantine(
+        "rv2-r2-3-full",
+        &frames,
+        std::time::Duration::from_millis(10),
+        &[],
+        ROGUE_HEX,
+    );
+    assert_eq!(v["containment"], "full", "{v}");
+    assert_eq!(
+        v["state"]["quarantine"]["locators"],
+        json!(["10.0.0.66:7410", "10.0.0.66:7411"]),
+        "{v}"
+    );
+    // Partial: one announced locator outside the executor's scope.
+    let far = std::net::Ipv4Addr::new(10, 99, 0, 1);
+    let frames = vec![
+        spdp_from(v4(66), ROGUE, &[v4(66), far]),
+        spdp_from(far, ROGUE, &[v4(66), far]),
+        writer_from(v4(66), ROGUE),
+    ];
+    let (v, _) = soc_quarantine(
+        "rv2-r2-3-part",
+        &frames,
+        std::time::Duration::from_millis(10),
+        &[],
+        ROGUE_HEX,
+    );
+    assert_eq!(v["containment"], "partial", "{v}");
+    let ex = v["state"]["quarantine"]["excluded"].as_array().unwrap();
+    assert!(ex.iter().any(|x| x["locator"] == "10.99.0.1:7410"), "{v}");
+}
+
+/// R2-6: agentd cut the binding's locators to the order's limit (16)
+/// silently: the rogue could push its real port out with 16 decoy ports on
+/// its own address, and nothing said why it was not cut.
+#[test]
+fn review2_r2_6_locators_over_the_order_limit_are_listed_as_left_out() {
+    use robodr_agentd::executor_link::{attach_locators, LocatorBook};
+    use robodr_executor::order::{Order, Origin, Target};
+    let o = Order {
+        id: "q".into(),
+        action: robodr_responder::ActionId::QuarantineNode,
+        target: Target::Participant {
+            guid_prefix: ROGUE_HEX.parse().unwrap(),
+            locators: Vec::new(),
+            guid_only: false,
+            excluded: Vec::new(),
+        },
+        ttl_s: None,
+        judged_state: robodr_responder::SafetyState::Idle,
+        context: robodr_responder::OperationalContext {
+            platform: robodr_responder::PlatformFamily::Ugv,
+            morphology: robodr_responder::Morphology::WheeledMobile,
+            phase: robodr_responder::MissionPhase::Transit,
+            connectivity: robodr_responder::Connectivity::Connected,
+            control: robodr_responder::ControlMode::Autonomous,
+            operator_present: true,
+            profile_locked: true,
+        },
+        plan_morphology: robodr_responder::Morphology::WheeledMobile,
+        human_approved: true,
+        replay: false,
+        origin: Origin::Planner {
+            rule: "r".into(),
+            finding_id: None,
+        },
+        issued_ms: 0,
+        soc: None,
+    };
+    let all: Vec<std::net::SocketAddr> = (0..20u16)
+        .map(|i| format!("10.0.0.66:{}", 7400 + i).parse().unwrap())
+        .collect();
+    let out = attach_locators(
+        o,
+        |_, _| robodr_ros2_pipeline::QuarantineTarget {
+            locators: all.clone(),
+            excluded: Vec::new(),
+            known: true,
+            guid_only: true,
+        },
+        &LocatorBook::default(),
+    );
+    let Target::Participant {
+        locators, excluded, ..
+    } = &out.target
+    else {
+        panic!()
+    };
+    assert_eq!(locators.len(), robodr_executor::order::MAX_LOCATORS);
+    let left: Vec<u16> = excluded.iter().map(|x| x.port).collect();
+    assert_eq!(left, vec![7416, 7417, 7418, 7419], "{excluded:?}");
+    assert!(excluded.iter().all(|x| x.reason.contains("limit")));
+    out.validate().unwrap();
+}

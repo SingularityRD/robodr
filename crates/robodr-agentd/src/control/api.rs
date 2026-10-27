@@ -872,6 +872,64 @@ pub struct AcceptedAction<'a> {
     pub context: &'a OperationalContext,
 }
 
+/// How far an applied `quarantine_node` reaches (review R2-3), from the
+/// executor's word: answered as `state.quarantine` and summarised by the
+/// top-level `containment` (contract §6a).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuarantineScope {
+    /// `ip:port` the executor cuts (UDP to and from); empty: the
+    /// GUID-prefix payload drop alone.
+    pub locators: Vec<String>,
+    /// Announced locators not acted on, and why.
+    #[serde(default)]
+    pub excluded: Vec<ScopeExcluded>,
+}
+
+/// One locator a quarantine left out ([`QuarantineScope::excluded`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeExcluded {
+    pub locator: String,
+    pub reason: String,
+}
+
+/// Most locators / left-out locators kept in a [`QuarantineScope`].
+pub const MAX_SCOPE_LOCATORS: usize = 16;
+pub const MAX_SCOPE_EXCLUDED: usize = 64;
+/// Longest reason kept per left-out locator.
+pub const MAX_SCOPE_REASON: usize = 200;
+
+impl QuarantineScope {
+    /// `guid_only` (no locator cut: only RTPS whose header carries the
+    /// prefix is dropped), `partial` (locators cut, some announced ones
+    /// left out) or `full`.
+    pub fn containment(&self) -> &'static str {
+        if self.locators.is_empty() {
+            "guid_only"
+        } else if !self.excluded.is_empty() {
+            "partial"
+        } else {
+            "full"
+        }
+    }
+
+    /// Within the bounds a stored request keeps (and the journal takes).
+    pub fn bounded(mut self) -> Self {
+        self.locators.truncate(MAX_SCOPE_LOCATORS);
+        self.excluded.truncate(MAX_SCOPE_EXCLUDED);
+        for x in &mut self.excluded {
+            x.reason = x
+                .reason
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(MAX_SCOPE_REASON)
+                .collect();
+        }
+        self
+    }
+}
+
 /// What an executor did with an accepted request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutorOutcome {
@@ -881,6 +939,8 @@ pub enum ExecutorOutcome {
     Failed(String),
     // --- executor v1 -------------------------------------------------------
     Verified,
+    /// Verified, and the executor said how far the quarantine reaches.
+    VerifiedQuarantine(QuarantineScope),
     Reverted,
     /// The executor's own checks refused it (nothing applied).
     Refused {
@@ -889,19 +949,27 @@ pub enum ExecutorOutcome {
     },
 }
 
-/// Status, error and refusal a stored request takes for an executor
-/// outcome (executor v1).
+/// Status, error, refusal and quarantine scope a stored request takes for
+/// an executor outcome (executor v1). The scope is `None` unless the
+/// executor reported one (a later outcome without one keeps the stored
+/// scope: see [`Engine`]'s refresh).
 fn outcome_status(
     out: ExecutorOutcome,
     state: SafetyState,
-) -> (Status, Option<String>, Option<Refusal>) {
+) -> (
+    Status,
+    Option<String>,
+    Option<Refusal>,
+    Option<QuarantineScope>,
+) {
     match out {
-        ExecutorOutcome::RecordedNotExecuted => (Status::RecordedNotExecuted, None, None),
-        ExecutorOutcome::Pending => (Status::Pending, None, None),
-        ExecutorOutcome::Applied => (Status::Applied, None, None),
-        ExecutorOutcome::Failed(e) => (Status::Failed, Some(e), None),
-        ExecutorOutcome::Verified => (Status::Verified, None, None),
-        ExecutorOutcome::Reverted => (Status::Reverted, None, None),
+        ExecutorOutcome::RecordedNotExecuted => (Status::RecordedNotExecuted, None, None, None),
+        ExecutorOutcome::Pending => (Status::Pending, None, None, None),
+        ExecutorOutcome::Applied => (Status::Applied, None, None, None),
+        ExecutorOutcome::Failed(e) => (Status::Failed, Some(e), None, None),
+        ExecutorOutcome::Verified => (Status::Verified, None, None, None),
+        ExecutorOutcome::VerifiedQuarantine(q) => (Status::Verified, None, None, Some(q.bounded())),
+        ExecutorOutcome::Reverted => (Status::Reverted, None, None, None),
         ExecutorOutcome::Refused { code, reason } => (
             Status::Refused,
             None,
@@ -910,6 +978,7 @@ fn outcome_status(
                 reason,
                 safety_state: state,
             }),
+            None,
         ),
     }
 }
@@ -1061,6 +1130,10 @@ pub struct Stored {
     pub evidence: String,
     pub executor: &'static str,
     pub revert: Option<RevertRecord>,
+    /// The executor's word on how far an applied quarantine reaches
+    /// (review R2-3; `None`: not a quarantine, not applied, or an executor
+    /// that does not report it).
+    pub quarantine: Option<QuarantineScope>,
 }
 
 /// Engine counters (`status.json`, heartbeat).
@@ -1230,10 +1303,15 @@ impl Engine {
         let Some(out) = self.executor.refresh(id) else {
             return;
         };
-        let (status, err, refusal) = outcome_status(out, s.safety_state);
+        let (status, err, refusal, quarantine) = outcome_status(out, s.safety_state);
         let error = err.or_else(|| s.error.clone());
         let refusal = refusal.or_else(|| s.refusal.clone());
-        if status == s.status && error == s.error && refusal == s.refusal {
+        let quarantine = quarantine.or_else(|| s.quarantine.clone());
+        if status == s.status
+            && error == s.error
+            && refusal == s.refusal
+            && quarantine == s.quarantine
+        {
             return;
         }
         let entry = super::state::Entry::Executor {
@@ -1241,6 +1319,7 @@ impl Engine {
             status: status.as_str().to_string(),
             error: error.clone(),
             refusal: refusal.as_ref().map(super::state::PRefusal::of),
+            quarantine: quarantine.clone(),
         };
         if !self.journal(&entry) {
             return;
@@ -1249,6 +1328,7 @@ impl Engine {
             s.status = status;
             s.error = error;
             s.refusal = refusal;
+            s.quarantine = quarantine;
         }
         self.maybe_compact(false);
     }
@@ -1402,8 +1482,8 @@ impl Engine {
                 caps: host.caps(),
             },
         );
-        let (status, refusal, accepted, error) = match decision {
-            Decision::Refuse(r) => (Status::Refused, Some(r), None, None),
+        let (status, refusal, accepted, error, quarantine) = match decision {
+            Decision::Refuse(r) => (Status::Refused, Some(r), None, None, None),
             Decision::Accept(a) => {
                 let out = self.executor.submit(&AcceptedAction {
                     request: req,
@@ -1414,8 +1494,8 @@ impl Engine {
                     safety_state: state,
                     context: &ctx,
                 });
-                let (st, err, refusal) = outcome_status(out, state);
-                (st, refusal, Some(a), err)
+                let (st, err, refusal, quarantine) = outcome_status(out, state);
+                (st, refusal, Some(a), err, quarantine)
             }
         };
         let received_ms = host.wall_ms();
@@ -1432,6 +1512,7 @@ impl Engine {
             evidence: String::new(),
             executor: self.executor.name(),
             revert: None,
+            quarantine,
         };
         let failed = |code: &str, message: String| {
             Answer::ok(json!({
@@ -1774,6 +1855,10 @@ pub fn answer_of(s: &Stored, robot_id: &str, duplicate: bool, now_ms: u64, held:
     if held && enforcing {
         state["executor_state"] = json!("held");
     }
+    // Review R2-3: how far a quarantine reaches (contract §6a).
+    if let Some(q) = &s.quarantine {
+        state["quarantine"] = json!(q);
+    }
     let mut out = json!({
         "request_id": s.request.request_id,
         "status": s.status.as_str(),
@@ -1781,6 +1866,12 @@ pub fn answer_of(s: &Stored, robot_id: &str, duplicate: bool, now_ms: u64, held:
         "in_force": enforcing && !held,
         "state": state,
     });
+    if enforcing && s.request.action == ActionKind::QuarantineNode {
+        out["containment"] = json!(s
+            .quarantine
+            .as_ref()
+            .map_or("unknown", QuarantineScope::containment));
+    }
     if duplicate {
         out["duplicate"] = json!(true);
     }
@@ -3052,7 +3143,17 @@ mod tests {
         // x-1 verified (queried), x-2 verified and only synced (nobody
         // asked), x-3 refused by the executor's own check.
         x.set("x-1", ExecutorOutcome::Verified);
-        x.set("x-2", ExecutorOutcome::Verified);
+        // Review R2-3: the quarantine's scope is journalled with it.
+        x.set(
+            "x-2",
+            ExecutorOutcome::VerifiedQuarantine(QuarantineScope {
+                locators: vec!["10.0.0.66:7410".into()],
+                excluded: vec![ScopeExcluded {
+                    locator: "10.0.0.68:7410".into(),
+                    reason: "never seen sending from it".into(),
+                }],
+            }),
+        );
         x.set(
             "x-3",
             ExecutorOutcome::Refused {
@@ -3076,7 +3177,15 @@ mod tests {
         let x = Scripted::default();
         let mut e = restart_exec(&d, &h, &x);
         assert_eq!(get(&mut e, &mut h, "x-1").body, v1);
-        assert_eq!(get(&mut e, &mut h, "x-2").body["status"], "verified");
+        assert!(v1.get("containment").is_none(), "not a quarantine: {v1}");
+        let v2 = get(&mut e, &mut h, "x-2").body;
+        assert_eq!(v2["status"], "verified");
+        assert_eq!(v2["containment"], "partial", "{v2}");
+        assert_eq!(v2["state"]["quarantine"]["locators"][0], "10.0.0.66:7410");
+        assert_eq!(
+            v2["state"]["quarantine"]["excluded"][0]["locator"],
+            "10.0.0.68:7410"
+        );
         assert_eq!(get(&mut e, &mut h, "x-3").body, v3);
         // A revert: staged (`pending`), then the executor reports it.
         let rv = Call::Revert(

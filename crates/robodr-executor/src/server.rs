@@ -245,6 +245,7 @@ fn bad_id(id: &str) -> Outcome {
         deadline_ms: None,
         duplicate: false,
         note: None,
+        quarantine: None,
     };
     o.error = Some(format!("bad id {:?}", crate::net::clip(id)));
     o

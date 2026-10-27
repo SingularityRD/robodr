@@ -141,6 +141,10 @@ pub struct PStored {
     pub evidence: String,
     pub executor: String,
     pub revert: Option<PRevert>,
+    /// Review R2-3 (absent when `None`, so a journal without quarantine
+    /// scopes reads as before).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantine: Option<super::api::QuarantineScope>,
 }
 
 impl PRefusal {
@@ -176,6 +180,7 @@ impl PStored {
             evidence: s.evidence.clone(),
             executor: s.executor.to_string(),
             revert: s.revert.as_ref().map(PRevert::of),
+            quarantine: s.quarantine.clone(),
         }
     }
 
@@ -208,6 +213,10 @@ impl PStored {
             evidence: self.evidence.clone(),
             executor: static_executor(&self.executor)?,
             revert,
+            quarantine: self
+                .quarantine
+                .clone()
+                .map(super::api::QuarantineScope::bounded),
         })
     }
 }
@@ -267,12 +276,15 @@ pub enum Entry {
         decision_id: String,
     },
     /// executor v1: the executor's word on a stored request (its status,
-    /// error and refusal after it).
+    /// error and refusal after it, and how far an applied quarantine
+    /// reaches: review R2-3, absent when unknown).
     Executor {
         request_id: String,
         status: String,
         error: Option<String>,
         refusal: Option<PRefusal>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quarantine: Option<super::api::QuarantineScope>,
     },
 }
 
@@ -285,6 +297,7 @@ fn apply_executor(
     status: &str,
     error: &Option<String>,
     refusal: &Option<PRefusal>,
+    quarantine: &Option<super::api::QuarantineScope>,
 ) -> bool {
     let Some(status) = parse_status(status) else {
         return false;
@@ -300,6 +313,9 @@ fn apply_executor(
         s.status = status;
         s.error = error.clone();
         s.refusal = refusal;
+        if quarantine.is_some() {
+            s.quarantine = quarantine.clone().map(super::api::QuarantineScope::bounded);
+        }
     }
     true
 }
@@ -415,8 +431,16 @@ pub fn open(dir: &Path, max: usize) -> std::io::Result<(RequestJournal, Restored
                 status,
                 error,
                 refusal,
+                quarantine,
             } => {
-                if !apply_executor(&mut store, &request_id, &status, &error, &refusal) {
+                if !apply_executor(
+                    &mut store,
+                    &request_id,
+                    &status,
+                    &error,
+                    &refusal,
+                    &quarantine,
+                ) {
                     r.damaged += 1;
                 } else if !store.contains_key(&request_id) {
                     // Its decision is still dangling (a commit that did not
@@ -427,6 +451,9 @@ pub fn open(dir: &Path, max: usize) -> std::io::Result<(RequestJournal, Restored
                             p.status.clone_from(&status);
                             p.error.clone_from(&error);
                             p.refusal.clone_from(&refusal);
+                            if quarantine.is_some() {
+                                p.quarantine.clone_from(&quarantine);
+                            }
                         }
                     }
                 }
@@ -478,6 +505,7 @@ fn stored_from_note(n: &super::evidence::RequestNote) -> Option<Stored> {
         evidence: n.evidence.clone(),
         executor: v.get("executor")?.as_str()?.to_string(),
         revert: None,
+        quarantine: None,
     };
     p.to_stored()
 }
@@ -696,7 +724,8 @@ mod tests {
                 "absent",
                 "refused",
                 &None,
-                &Some(p)
+                &Some(p),
+                &None
             ));
         }
         for s in ["pending", "verified", "reverted", "failed", "refused"] {

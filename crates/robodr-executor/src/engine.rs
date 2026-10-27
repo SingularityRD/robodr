@@ -159,6 +159,30 @@ pub struct Outcome {
     pub duplicate: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// What an active quarantine reaches (review R2-3): the locators it
+    /// cuts (empty: the GUID-prefix payload drop alone) and the announced
+    /// ones left out, with the reason. Only on the state of an applied
+    /// `quarantine_node`; an older agentd ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantine: Option<QuarantineScope>,
+}
+
+/// See [`Outcome::quarantine`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuarantineScope {
+    pub locators: Vec<crate::order::Locator>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded: Vec<crate::order::ExcludedLocator>,
+}
+
+fn quarantine_scope(e: &Effect) -> Option<QuarantineScope> {
+    match e {
+        Effect::Quarantine(q) => Some(QuarantineScope {
+            locators: q.locators.clone(),
+            excluded: q.excluded.clone(),
+        }),
+        _ => None,
+    }
 }
 
 impl Outcome {
@@ -173,6 +197,7 @@ impl Outcome {
             deadline_ms: None,
             duplicate: false,
             note: None,
+            quarantine: None,
         }
     }
 }
@@ -1474,6 +1499,7 @@ impl Engine {
             o.applied_ms = Some(en.applied_ms);
             o.deadline_ms = Some(en.deadline_ms);
             o.note = quarantine_note(&en.effect);
+            o.quarantine = quarantine_scope(&en.effect);
             return o;
         }
         if let Some(f) = self.state.finished(id) {

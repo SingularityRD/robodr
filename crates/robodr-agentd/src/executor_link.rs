@@ -48,7 +48,9 @@ use robodr_responder::{ActionId, Morphology, ResponseAction, RestrictTarget, Saf
 use robodr_ros2_pipeline::{BindingTable, QuarantineTarget};
 use serde::{Deserialize, Serialize};
 
-use crate::control::api::{AcceptedAction, ActionExecutor, ExecutorOutcome, Meta};
+use crate::control::api::{
+    AcceptedAction, ActionExecutor, ExecutorOutcome, Meta, QuarantineScope, ScopeExcluded,
+};
 
 fn default_socket() -> PathBuf {
     PathBuf::from("/run/robodr-executor/executor.sock")
@@ -272,6 +274,7 @@ fn unreachable_outcome(id: &str, e: &str) -> Outcome {
         deadline_ms: None,
         duplicate: false,
         note: None,
+        quarantine: None,
     }
 }
 
@@ -500,7 +503,25 @@ impl Drop for ExecutorLink {
 
 fn map(o: &Outcome) -> Option<ExecutorOutcome> {
     Some(match o.status {
-        ExStatus::Verified => ExecutorOutcome::Verified,
+        // Review R2-3: how far a quarantine reaches goes to the SOC.
+        ExStatus::Verified => match &o.quarantine {
+            Some(q) => ExecutorOutcome::VerifiedQuarantine(QuarantineScope {
+                locators: q
+                    .locators
+                    .iter()
+                    .map(|l| SocketAddr::new(l.ip, l.port).to_string())
+                    .collect(),
+                excluded: q
+                    .excluded
+                    .iter()
+                    .map(|x| ScopeExcluded {
+                        locator: SocketAddr::new(x.ip, x.port).to_string(),
+                        reason: x.reason.clone(),
+                    })
+                    .collect(),
+            }),
+            None => ExecutorOutcome::Verified,
+        },
         ExStatus::Applying => ExecutorOutcome::Pending,
         // A revert in progress (or failing and retried): the rules may still
         // be in force, so the request keeps its state (`revert_failures`
@@ -786,7 +807,7 @@ impl LocatorBook {
             .iter()
             .filter_map(|l| l.parse::<SocketAddr>().ok())
             .filter(|sa| locator(*sa).is_some())
-            .take(robodr_executor::order::MAX_LOCATORS)
+            .take(robodr_ros2_pipeline::binding::MAX_LOCATOR_IPS)
             .collect();
         if locators.is_empty() {
             return;
@@ -818,6 +839,11 @@ fn locator(sa: SocketAddr) -> Option<Locator> {
     })
 }
 
+/// Why a vouched locator is not in the order (review R2-6).
+pub const OVER_LIMIT: &str = "over the order's locator limit (16): not acted on";
+pub const NOT_UNICAST: &str = "not a unicast locator (port 0, unspecified or multicast)";
+const _: () = assert!(robodr_executor::order::MAX_LOCATORS == 16);
+
 /// Fill a participant order's locators when it carries none, with what
 /// `vouch` answers for its prefix (and the [`LocatorBook`] entry, if any):
 /// the locators, whether a GUID-prefix-only quarantine is vouched for, and
@@ -836,15 +862,20 @@ pub fn attach_locators(
     {
         if locators.is_empty() {
             let t = vouch(&guid_prefix.0, book.get(&guid_prefix.0));
-            *locators = t
-                .locators
-                .into_iter()
-                .filter_map(locator)
-                .take(robodr_executor::order::MAX_LOCATORS)
-                .collect();
+            let mut left: Vec<(SocketAddr, &str)> = t.excluded;
+            // Review R2-6: what does not fit the order (or is not a unicast
+            // locator) is listed as left out, never dropped silently.
+            for sa in t.locators {
+                match locator(sa) {
+                    Some(l) if locators.len() < robodr_executor::order::MAX_LOCATORS => {
+                        locators.push(l);
+                    }
+                    Some(_) => left.push((sa, OVER_LIMIT)),
+                    None => left.push((sa, NOT_UNICAST)),
+                }
+            }
             *guid_only = t.guid_only;
-            *excluded = t
-                .excluded
+            *excluded = left
                 .into_iter()
                 .take(robodr_executor::order::MAX_EXCLUDED)
                 .map(|(sa, why)| ExcludedLocator {
@@ -1016,6 +1047,23 @@ mod tests {
         ));
         o.status = ExStatus::Verified;
         assert_eq!(map(&o), Some(ExecutorOutcome::Verified));
+        // Review R2-3: the quarantine's reach goes along.
+        o.quarantine = Some(robodr_executor::engine::QuarantineScope {
+            locators: Vec::new(),
+            excluded: vec![ExcludedLocator {
+                ip: "10.0.0.68".parse().unwrap(),
+                port: 7410,
+                reason: "why".into(),
+            }],
+        });
+        match map(&o) {
+            Some(ExecutorOutcome::VerifiedQuarantine(q)) => {
+                assert_eq!(q.containment(), "guid_only");
+                assert_eq!(q.excluded[0].locator, "10.0.0.68:7410");
+            }
+            other => panic!("{other:?}"),
+        }
+        o.quarantine = None;
         o.status = ExStatus::RemovedExternally;
         assert_eq!(map(&o), Some(ExecutorOutcome::Reverted));
         o.status = ExStatus::Unknown;

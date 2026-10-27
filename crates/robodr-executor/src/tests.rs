@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use crate::config::{ExecutorConfig, Resolved};
 use crate::decision::{codes, precheck, recheck_safety, Current, Effect};
-use crate::engine::{Engine, FixedSafety, Status};
+use crate::engine::{Engine, FixedSafety, Outcome, Status};
 use crate::fault::{self, Point};
 use crate::journal::EventKind;
 use crate::nft::Nft;
@@ -1116,6 +1116,10 @@ fn l4_reboot_reapply_needs_revalidation_and_a_fresh_safety_check() {
     e.rearm_held(cur(SafetyState::MovingSlow), 2_400);
     assert_eq!(e.status("i1").status, Status::Verified);
     assert_eq!(e.status("q1").status, Status::Verified);
+    // Review R2-3: the state of an applied quarantine says what it cuts.
+    let q = e.status("q1").quarantine.expect("quarantine scope");
+    assert!(!q.locators.is_empty(), "{q:?}");
+    assert!(e.status("i1").quarantine.is_none());
     let listed = crate::nft::read_table(&mut nft.clone()).unwrap();
     assert!(crate::nft::verify(listed.as_deref(), &e.rendered()).is_ok());
     drop(e);
@@ -2631,4 +2635,31 @@ fn review_guid_only_quarantine_keeps_every_refusal() {
         excluded[0].reason = "line\nbreak".into();
     }
     assert!(bad.validate().is_err());
+}
+
+/// Review R2-3 / R2-7: the answer's new `quarantine` field is skipped when
+/// absent, and an answer carrying fields this build does not know still
+/// parses (an older agentd reads a newer executor's answers; the order
+/// itself stays strict, so the executor is upgraded first).
+#[test]
+fn outcomes_stay_readable_across_versions() {
+    let o = Outcome {
+        id: "x".into(),
+        status: Status::Verified,
+        action: None,
+        refusal: None,
+        error: None,
+        applied_ms: None,
+        deadline_ms: None,
+        duplicate: false,
+        note: None,
+        quarantine: None,
+    };
+    let text = serde_json::to_string(&o).unwrap();
+    assert!(!text.contains("quarantine"), "{text}");
+    let newer: Outcome = serde_json::from_str(
+        r#"{"id":"x","status":"verified","quarantine":{"locators":[]},"from_the_future":1}"#,
+    )
+    .unwrap();
+    assert_eq!(newer.quarantine.unwrap().locators.len(), 0);
 }
