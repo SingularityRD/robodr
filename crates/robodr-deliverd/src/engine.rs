@@ -279,10 +279,12 @@ impl Engine {
                 });
             }
         }
-        let hw_gen = history
-            .hw_generation
-            .max(state_gen)
-            .max(hw.as_ref().ok().and_then(Option::as_ref).map_or(0, |h| h.generation));
+        let hw_gen = history.hw_generation.max(state_gen).max(
+            hw.as_ref()
+                .ok()
+                .and_then(Option::as_ref)
+                .map_or(0, |h| h.generation),
+        );
         let store = Store::open(&cfg.state_dir)?;
         let mut e = Self {
             cfg,
@@ -373,8 +375,7 @@ impl Engine {
     pub fn reanchor(&mut self, trust: &std::path::Path) -> R<serde_json::Value> {
         let now = self.sys_now()?;
         let history = Journal::history(&self.cfg.blackbox.dir);
-        let (doc, sig) =
-            robodr_release::ops::read_trust_files(trust).map_err(|e| e.to_string())?;
+        let (doc, sig) = robodr_release::ops::read_trust_files(trust).map_err(|e| e.to_string())?;
         let presented = robodr_pkg::trust::verify_trust_pinned(
             &doc,
             &sig,
@@ -1213,8 +1214,7 @@ impl Engine {
             .iter()
             .map(String::as_str)
             .filter(|r| {
-                *r != d.package
-                    && !(own_robodr && crate::install::ROBODR_PACKAGES.contains(r))
+                *r != d.package && !(own_robodr && crate::install::ROBODR_PACKAGES.contains(r))
             })
             .collect();
         if !foreign.is_empty() {
@@ -1278,7 +1278,10 @@ impl Engine {
                     n.clone(),
                     d.package.clone(),
                     d.version.clone(),
-                    seen.map_or_else(|| "unknown to dpkg".to_string(), |(st, v)| format!("{st} {v}")),
+                    seen.map_or_else(
+                        || "unknown to dpkg".to_string(),
+                        |(st, v)| format!("{st} {v}"),
+                    ),
                 )),
             }
         }

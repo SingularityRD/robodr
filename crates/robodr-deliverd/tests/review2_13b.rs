@@ -125,9 +125,7 @@ fn ha_a_deb_with_relations_on_another_package_is_refused() {
         );
         assert!(!e.state().installed.contains_key("nav-ng"), "{rel:?}");
         assert!(
-            u.rules_found()
-                .iter()
-                .any(|r| r == "robot.deliver.refused"),
+            u.rules_found().iter().any(|r| r == "robot.deliver.refused"),
             "{rel:?}"
         );
     }
@@ -188,7 +186,8 @@ fn ha_an_install_that_changes_another_recorded_package_fails() {
     assert!(
         rules
             .iter()
-            .any(|r| r == "robot.deliver.rollback_blocked_floor" || r == "robot.deliver.health_failed"),
+            .any(|r| r == "robot.deliver.rollback_blocked_floor"
+                || r == "robot.deliver.health_failed"),
         "{rules:?}"
     );
     let notes = u.notes_of("robodr.deliver.rollback_blocked");
@@ -538,9 +537,17 @@ fn le_the_postinst_migration_breaks_links_and_normalises_modes() {
     ] {
         let m = md(&p);
         assert_eq!((m.uid(), m.gid()), (new, grp), "{}", p.display());
-        assert_eq!(m.mode() & 0o022, 0, "{} keeps group/other write", p.display());
+        assert_eq!(
+            m.mode() & 0o022,
+            0,
+            "{} keeps group/other write",
+            p.display()
+        );
     }
-    assert_eq!(std::fs::read_to_string(tree.join("agentd.json")).unwrap(), "floor");
+    assert_eq!(
+        std::fs::read_to_string(tree.join("agentd.json")).unwrap(),
+        "floor"
+    );
 }
 
 // ------------------------------------------------------------------ L-F --
@@ -673,7 +680,8 @@ fn a_rule_name_used_by_another_installed_rules_package_is_refused() {
     let mut e = u.open();
     let reps = u.run(&mut e, 4);
     assert!(
-        reps.iter().any(|r| r.installed == vec!["rules-a 1".to_string()]),
+        reps.iter()
+            .any(|r| r.installed == vec!["rules-a 1".to_string()]),
         "{reps:?}"
     );
     let b = u.rpk(

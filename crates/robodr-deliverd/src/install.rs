@@ -272,10 +272,7 @@ impl Installer<'_> {
         // only within one: Pulsar would refuse the reload, or let one rule
         // shadow another's detection.
         let others = self.active_rule_names(&m.name)?;
-        if let Some((n, pkg)) = names
-            .iter()
-            .find_map(|n| others.get(n).map(|p| (n, p)))
-        {
+        if let Some((n, pkg)) = names.iter().find_map(|n| others.get(n).map(|p| (n, p))) {
             return Err(PrepError::Refused(format!(
                 "rule name {:?} is already used by the installed rules package {pkg}",
                 robodr_pkg::common::trunc(n)
@@ -338,7 +335,9 @@ impl Installer<'_> {
                 continue;
             }
             let vdir = match self.active_version(Kind::RobodrRules, &pkg) {
-                Ok(Some((serial, Some(d)))) => self.version_dir(Kind::RobodrRules, &pkg, serial, &d),
+                Ok(Some((serial, Some(d)))) => {
+                    self.version_dir(Kind::RobodrRules, &pkg, serial, &d)
+                }
                 Ok(Some((serial, None))) => self
                     .versions_root(Kind::RobodrRules)
                     .join(&pkg)
@@ -348,7 +347,8 @@ impl Installer<'_> {
             let mut list = Vec::new();
             files(&vdir, 0, &mut list);
             for f in list {
-                let Ok(b) = robodr_release::fsio::read_capped(&f, crate::rules::MAX_RULE_FILE_BYTES)
+                let Ok(b) =
+                    robodr_release::fsio::read_capped(&f, crate::rules::MAX_RULE_FILE_BYTES)
                 else {
                     continue;
                 };

@@ -101,9 +101,9 @@ impl History {
                 if let Ok(d) = serde_json::from_value(v["last_deployment"].clone()) {
                     self.deployment(d);
                 }
-                if let Ok(cs) =
-                    serde_json::from_value::<Vec<robodr_pkg::bundle::ChainState>>(v["chains"].clone())
-                {
+                if let Ok(cs) = serde_json::from_value::<Vec<robodr_pkg::bundle::ChainState>>(
+                    v["chains"].clone(),
+                ) {
                     for c in cs {
                         self.chain(c);
                     }
@@ -131,9 +131,9 @@ impl History {
                         });
                     }
                 }
-                if let Ok(cs) =
-                    serde_json::from_value::<Vec<robodr_pkg::bundle::ChainState>>(v["heads"].clone())
-                {
+                if let Ok(cs) = serde_json::from_value::<Vec<robodr_pkg::bundle::ChainState>>(
+                    v["heads"].clone(),
+                ) {
                     for c in cs {
                         self.chain(c);
                     }

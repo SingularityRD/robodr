@@ -337,10 +337,7 @@ fn reap_leftovers(uid: u32) -> (usize, bool) {
             // session, which a leftover could have joined).
             unsafe {
                 let g = getpgid(*pid);
-                if g > 1
-                    && g != own_group
-                    && u32::try_from(g).is_ok_and(|g| !live.contains(&g))
-                {
+                if g > 1 && g != own_group && u32::try_from(g).is_ok_and(|g| !live.contains(&g)) {
                     kill(-g, SIGKILL);
                 }
                 kill(*pid, SIGKILL);
