@@ -373,7 +373,7 @@ fn check(root: &Value, schema: &Value, inst: &Value, path: &str, errs: &mut Vec<
 }
 
 fn schema_errors(inst: &Value) -> Vec<String> {
-    let schema: Value = serde_json::from_str(&load("robot-edr-finding.schema.json"))
+    let schema: Value = serde_json::from_str(&load("robodr-finding.schema.json"))
         .expect("schema file is valid JSON");
     let mut errs = vec![];
     check(&schema, &schema, inst, "", &mut errs);
@@ -401,7 +401,7 @@ fn produced_finding_contains_every_required_schema_key() {
     let inst: Value = serde_json::from_str(&robodr_ocsf::to_json(&f).unwrap()).unwrap();
     let errs = schema_errors(&inst);
     assert!(errs.is_empty(), "schema violations:\n{}", errs.join("\n"));
-    let schema: Value = serde_json::from_str(&load("robot-edr-finding.schema.json")).unwrap();
+    let schema: Value = serde_json::from_str(&load("robodr-finding.schema.json")).unwrap();
     assert!(
         count_required(&schema) > 80,
         "schema lost its required lists"
@@ -477,9 +477,9 @@ fn schema_checker_detects_missing_and_undeclared_keys() {
 fn contract_example_file_is_exactly_what_the_builder_produces() {
     let f = common::example_finding();
     let produced = serde_json::to_string_pretty(&f).unwrap() + "\n";
-    let on_disk = load("robot-edr-finding.example.json");
+    let on_disk = load("robodr-finding.example.json");
     if produced != on_disk {
-        eprintln!("---- regenerate docs/contracts/robot-edr-finding.example.json ----\n{produced}");
+        eprintln!("---- regenerate docs/contracts/robodr-finding.example.json ----\n{produced}");
     }
     assert_eq!(produced, on_disk, "contract example is stale");
     // And the example itself passes the strict validator.
@@ -489,7 +489,7 @@ fn contract_example_file_is_exactly_what_the_builder_produces() {
 // ------------------------------------------------------- SR-TAINT patterns --
 
 fn schema() -> Value {
-    serde_json::from_str(&load("robot-edr-finding.schema.json")).unwrap()
+    serde_json::from_str(&load("robodr-finding.schema.json")).unwrap()
 }
 
 fn collect_patterns(v: &Value, out: &mut Vec<String>) {
@@ -691,4 +691,39 @@ fn schema_only_consumer_rejects_raw_hostile_strings() {
     for raw in [raws[9], raws[10], raws[11]] {
         assert!(must_reject(Kind::Text, raw), "{raw}");
     }
+}
+
+/// Review finding L2: the schema accepts exactly what the validator accepts
+/// for `ocsf.metadata.log_name` (not `.` / `..`) and `contract_version`
+/// (each part at most 9 digits).
+#[test]
+fn schema_and_validator_agree_on_log_name_and_contract_version() {
+    let f = common::example_finding();
+    let base: Value = serde_json::from_str(&robodr_ocsf::to_json(&f).unwrap()).unwrap();
+    let judge = |edit: &dyn Fn(&mut Value)| {
+        let mut v = base.clone();
+        edit(&mut v);
+        let schema_ok = schema_errors(&v).is_empty();
+        let validator_ok = robodr_ocsf::parse_and_validate(&v.to_string()).is_ok();
+        (schema_ok, validator_ok)
+    };
+    for bad in [".", ".."] {
+        let r = judge(&|v| v["ocsf"]["metadata"]["log_name"] = bad.into());
+        assert_eq!(r, (false, false), "log_name {bad:?}");
+    }
+    for bad in ["2.1234567890.0", "2.0.1234567890"] {
+        let r = judge(&|v| v["contract_version"] = bad.into());
+        assert_eq!(r, (false, false), "contract_version {bad:?}");
+    }
+    // Still accepted by both: dotted names that are not `.` / `..`, and
+    // 9-digit parts.
+    for ok in ["...", ".a", "..a"] {
+        let mut v = base.clone();
+        v["ocsf"]["metadata"]["log_name"] = ok.into();
+        assert!(schema_errors(&v).is_empty(), "log_name {ok:?}");
+        assert!(robodr_ocsf::validate::is_valid_topic(ok), "{ok:?}");
+    }
+    let mut v = base.clone();
+    v["contract_version"] = "2.123456789.0".into();
+    assert!(schema_errors(&v).is_empty());
 }

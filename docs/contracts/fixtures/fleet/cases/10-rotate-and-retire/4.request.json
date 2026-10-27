@@ -1,0 +1,25 @@
+{
+  "body_file": "4.body",
+  "body_sha256": "f10bdaae9448580af2b6f50caf8f70e6f40449a0a5c464f72315a54eb1fb22e7",
+  "headers": [
+    [
+      "Content-Type",
+      "application/json"
+    ],
+    [
+      "X-RoboDR-Key-Id",
+      "ed25519:caf521a404f9a7bf"
+    ],
+    [
+      "X-RoboDR-Timestamp",
+      "1790000110000"
+    ],
+    [
+      "X-RoboDR-Signature",
+      "11bce67809031d56369698e7af74e06f7fa64a0273e686063cc4dd7b416cdc42c626bd025f1f4298939860ce91471cff554f533ca608820494d5ac74ccda5002"
+    ]
+  ],
+  "method": "POST",
+  "server_time_ms": 1790000110000,
+  "target": "/api/robot-edr/v2/fleet/keys/retire"
+}

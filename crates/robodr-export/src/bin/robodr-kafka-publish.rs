@@ -1,7 +1,10 @@
 //! `robodr-kafka-publish`: diode importer output (or a site spool) ->
-//! Kafka `robot-edr.findings`. See `robodr_export::publish`.
+//! Kafka (`--topic`, default `robodr.findings`). See `robodr_export::publish`.
 
-use robodr_diode::cli::{argv, parse_args_with_switches, Args};
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+
+use robodr_diode::cli::{argv, is_version_request, parse_args_with_switches, Args};
 use robodr_export::kafka::{Producer, ProducerConfig};
 use robodr_export::{PublishConfig, Publisher, Source};
 use std::process::ExitCode;
@@ -10,7 +13,10 @@ use std::time::Duration;
 const USAGE: &str = "usage: robodr-kafka-publish --bootstrap HOST:PORT [--bootstrap ...] \
 --state-dir DIR (--diode-out DIR | --spool DIR) [--topic T] [--chunk N] [--client-id S] \
 [--request-timeout-ms N] [--produce-timeout-ms N] [--delivery-timeout-ms N] [--retries N] [--max-request-bytes N] \
-[--interval-ms N] [--once]\n\
+[--interval-ms N] [--once] [--upgrade-data-source LABEL]\n\
+Unsigned contract 1.x records are upgraded to contract 2.0 (data_source --upgrade-data-source, \
+default robodr; topic --topic); signed ones are dead-lettered \
+(\"legacy 1.x signed record: re-sign required\").\n\
 No TLS/SASL: run on an isolated SOC network or through a local TLS proxy (stunnel).";
 
 struct Opts {
@@ -56,6 +62,9 @@ fn opts(a: &Args) -> Result<Opts, String> {
     if let Some(n) = a.num("chunk")? {
         c.chunk_records = n;
     }
+    if let Some(l) = a.one("upgrade-data-source")? {
+        c.upgrade_data_source = l.into();
+    }
     let interval: u64 = a.num("interval-ms")?.unwrap_or(2_000);
     if interval == 0 {
         return Err("--interval-ms must be > 0".into());
@@ -84,33 +93,46 @@ fn run(o: &Opts) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
-    let parsed = argv().and_then(|v| {
-        parse_args_with_switches(
-            v,
-            &[
-                "bootstrap",
-                "state-dir",
-                "diode-out",
-                "spool",
-                "topic",
-                "chunk",
-                "client-id",
-                "request-timeout-ms",
-                "produce-timeout-ms",
-                "delivery-timeout-ms",
-                "retries",
-                "max-request-bytes",
-                "interval-ms",
-            ],
-            &["once"],
-        )
-    });
+    let v = match argv() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("robodr-kafka-publish: {e}");
+            eprintln!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    if is_version_request(&v) {
+        println!("robodr-kafka-publish {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+    let parsed = parse_args_with_switches(
+        v,
+        &[
+            "bootstrap",
+            "state-dir",
+            "diode-out",
+            "spool",
+            "topic",
+            "chunk",
+            "client-id",
+            "request-timeout-ms",
+            "produce-timeout-ms",
+            "delivery-timeout-ms",
+            "retries",
+            "max-request-bytes",
+            "interval-ms",
+            "upgrade-data-source",
+        ],
+        &["once"],
+    );
     let o = match parsed.and_then(|a| opts(&a)) {
         Ok(o) => o,
+        Err(e) if e == "help" => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
         Err(e) => {
-            if e != "help" {
-                eprintln!("robodr-kafka-publish: {e}");
-            }
+            eprintln!("robodr-kafka-publish: {e}");
             eprintln!("{USAGE}");
             return ExitCode::from(2);
         }

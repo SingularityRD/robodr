@@ -172,6 +172,21 @@ impl Setup {
         std::fs::write(&p, pcap::pcap(frames)).unwrap();
         p
     }
+
+    /// [`Setup::pcap`] with the records `step` apart (replays are judged
+    /// on their packet timestamps).
+    pub fn pcap_spaced(&self, frames: &[Vec<u8>], step: Duration) -> PathBuf {
+        let p = self.dir.join("capture.pcap");
+        std::fs::write(&p, pcap::pcap_spaced(frames, step)).unwrap();
+        p
+    }
+
+    /// [`Setup::pcap`] with each record at its own offset from the start.
+    pub fn pcap_timed(&self, frames: &[(Duration, Vec<u8>)]) -> PathBuf {
+        let p = self.dir.join("capture.pcap");
+        std::fs::write(&p, pcap::pcap_timed(frames)).unwrap();
+        p
+    }
 }
 
 fn merge(a: &mut serde_json::Value, b: serde_json::Value) {

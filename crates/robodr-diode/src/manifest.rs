@@ -69,7 +69,8 @@ const BATCH_HASH_DOMAIN: &[u8] = b"robodr-diode/batch-hash/v1\0";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileKind {
-    /// JSON Lines of `robot-edr.findings` values (compact JSON, `\n`-terminated).
+    /// JSON Lines of findings values (`robodr.findings` contract, compact
+    /// JSON, `\n`-terminated).
     Findings,
     /// A `robodr-blackbox` export bundle (`RBBXBND1` bytes).
     BlackboxBundle,
@@ -120,7 +121,8 @@ pub struct FileEntry {
 pub struct Manifest {
     /// [`FORMAT`].
     pub format: String,
-    /// `robot-edr.findings` contract version of the findings inside.
+    /// Findings contract version of the findings inside (see
+    /// [`is_supported_contract_version`]).
     pub contract_version: String,
     /// Exporting unit (robot or air-gapped site console), `[A-Za-z0-9._-]{1,64}`.
     pub unit_id: String,
@@ -220,24 +222,44 @@ fn is_bundle_name(s: &str) -> bool {
         .is_some_and(|d| d.len() == 4 && d.bytes().all(|b| b.is_ascii_digit()) && d != "0000")
 }
 
-/// Accepts `1.y.z` (the `robot-edr.findings` major this crate understands).
+/// Accepts a findings contract version whose findings this crate packs and
+/// imports: the major [`robodr_ocsf`] emits (`2.y.z`). The check is on the
+/// contract version only; the topic and `data_source` the findings name are
+/// deployment labels, validated per finding. Contract 1.x batches
+/// (`robot-edr.findings`) are refused here with a clear reason: 1.x
+/// findings are parse-only and can no longer be published.
 pub fn is_supported_contract_version(v: &str) -> bool {
-    let parts: Vec<&str> = v.split('.').collect();
-    parts.len() == 3
-        && parts[0] == "1"
-        && parts
-            .iter()
-            .all(|p| !p.is_empty() && p.len() <= 9 && p.bytes().all(|b| b.is_ascii_digit()))
+    robodr_ocsf::validate::is_emittable_contract_version(v)
+}
+
+/// A contract 1.x version: batches a 1.x packer published before the
+/// upgrade. The importer still takes them (it authenticates and chains
+/// them like any batch and upgrades their findings to contract 2.0, see
+/// `crate::unpack`); the packer never writes one.
+pub fn is_legacy_contract_version(v: &str) -> bool {
+    robodr_ocsf::upgrade::is_legacy_version(v)
 }
 
 impl Manifest {
-    /// Structural checks that need nothing but the manifest itself.
-    /// Returns a human-readable reason on failure.
+    /// Structural checks that need nothing but the manifest itself, for a
+    /// manifest this crate writes (contract 2.x only). Returns a
+    /// human-readable reason on failure.
     pub fn check(&self) -> Result<(), String> {
+        self.check_with(false)
+    }
+
+    /// [`check`](Self::check) for a manifest the importer reads: also
+    /// accepts a contract 1.x batch published before an upgrade.
+    pub fn check_import(&self) -> Result<(), String> {
+        self.check_with(true)
+    }
+
+    fn check_with(&self, allow_legacy: bool) -> Result<(), String> {
         if self.format != FORMAT {
             return Err(format!("unsupported format {:?}", trunc(&self.format)));
         }
-        if !is_supported_contract_version(&self.contract_version) {
+        let legacy_ok = allow_legacy && is_legacy_contract_version(&self.contract_version);
+        if !is_supported_contract_version(&self.contract_version) && !legacy_ok {
             return Err(format!(
                 "unsupported contract_version {:?}",
                 trunc(&self.contract_version)
@@ -399,7 +421,7 @@ mod tests {
     fn m() -> Manifest {
         Manifest {
             format: FORMAT.into(),
-            contract_version: "1.1.0".into(),
+            contract_version: robodr_ocsf::CONTRACT_VERSION.into(),
             unit_id: "ugv-007".into(),
             batch_seq: 1,
             prev_batch_hash: None,
@@ -563,8 +585,12 @@ mod tests {
     fn check_rejects_bad_manifests() {
         let cases: Vec<(&str, Mutation)> = vec![
             ("format", Box::new(|m| m.format = "x".into())),
-            ("major", Box::new(|m| m.contract_version = "2.0.0".into())),
-            ("semver", Box::new(|m| m.contract_version = "1.1".into())),
+            ("major", Box::new(|m| m.contract_version = "3.0.0".into())),
+            (
+                "legacy major",
+                Box::new(|m| m.contract_version = "1.3.0".into()),
+            ),
+            ("semver", Box::new(|m| m.contract_version = "2.0".into())),
             ("unit", Box::new(|m| m.unit_id = "a/b".into())),
             ("seq0", Box::new(|m| m.batch_seq = 0)),
             (
@@ -648,10 +674,34 @@ mod tests {
     }
 
     #[test]
+    fn importer_also_takes_legacy_batches() {
+        let mut x = m();
+        x.contract_version = "1.3.0".into();
+        assert!(x.check().is_err(), "the packer never writes 1.x");
+        x.check_import().unwrap();
+        for bad in ["3.0.0", "0.9.0", "1.3", "1.3.0-rc1"] {
+            x.contract_version = bad.into();
+            assert!(x.check_import().is_err(), "{bad}");
+        }
+        assert!(is_legacy_contract_version("1.0.0"));
+        assert!(!is_legacy_contract_version("2.0.0"));
+    }
+
+    #[test]
     fn contract_versions() {
-        assert!(is_supported_contract_version("1.1.0"));
-        assert!(is_supported_contract_version("1.0.0"));
-        for v in ["2.0.0", "1.1", "1.1.0-rc1", "", "1..0", "01.1.0x"] {
+        assert!(is_supported_contract_version("2.0.0"));
+        assert!(is_supported_contract_version("2.4.1"));
+        assert!(is_supported_contract_version(robodr_ocsf::CONTRACT_VERSION));
+        for v in [
+            "1.1.0",
+            "1.0.0",
+            "3.0.0",
+            "2.0",
+            "2.0.0-rc1",
+            "",
+            "2..0",
+            "02.0.0x",
+        ] {
             assert!(!is_supported_contract_version(v), "{v}");
         }
     }

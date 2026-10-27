@@ -1,0 +1,25 @@
+{
+  "body_file": "2.body",
+  "body_sha256": "b789ef6b2e92b853ac7aed45921560be3ed9071cebdb2a9241717534fe5b9902",
+  "headers": [
+    [
+      "Content-Type",
+      "application/json"
+    ],
+    [
+      "X-RoboDR-Key-Id",
+      "ed25519:7bf642b114c6afa2"
+    ],
+    [
+      "X-RoboDR-Timestamp",
+      "1790000100000"
+    ],
+    [
+      "X-RoboDR-Signature",
+      "3f9cb2202cf54bb473dd9c7559ab09f1cfe421d97d642ce7913ded196432859afa5dbdb6eae4e3dee5cbaa361f1efd40c0f81f6e436b4f7ee4ec2dd5f55f8c06"
+    ]
+  ],
+  "method": "POST",
+  "server_time_ms": 1790000100000,
+  "target": "/api/robot-edr/v2/fleet/keys/rotate"
+}

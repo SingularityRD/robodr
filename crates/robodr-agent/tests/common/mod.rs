@@ -113,6 +113,7 @@ pub fn validated_policy() -> ResponsePolicy {
 pub fn context() -> OperationalContext {
     OperationalContext {
         platform: robodr_responder::PlatformFamily::Ugv,
+        morphology: robodr_responder::Morphology::WheeledMobile,
         phase: MissionPhase::Transit,
         connectivity: Connectivity::Connected,
         control: ControlMode::Autonomous,

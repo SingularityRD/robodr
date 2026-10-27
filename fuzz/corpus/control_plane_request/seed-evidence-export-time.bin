@@ -1,0 +1,10 @@
+ÿPOST /api/v2/robots/ugv-007/evidence/exports HTTP/1.1
+Host: robot
+Content-Type: application/json
+Content-Length: 141
+X-RoboDR-Key-Id: soc:soc-a:1
+X-RoboDR-Timestamp: 1800000000
+X-RoboDR-Nonce: seed-nonce-000000007
+X-RoboDR-Signature: b470e569b23f3421b8a41ca1a302d6f83c065afae775e673e3aed799d5ea08b9d5a19ee61aeb3bf2997ddcdd96531ac3d6eb8ab71859825430096428601d8e0f
+
+{"export_id": "case-42:range", "selector": {"time_range": {"from_ms": 1800000000000, "to_ms": 1800000060000}}, "requested_by": "analyst@soc"}

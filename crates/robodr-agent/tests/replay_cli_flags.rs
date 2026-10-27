@@ -548,9 +548,11 @@ fn accepted_forms_inline_values_explicit_run_and_valid_enums() {
 
 #[test]
 fn help_and_empty_invocations() {
+    // --help is not an error: the usage goes to stdout.
     let o = bin().arg("--help").output().unwrap();
     assert_eq!(o.status.code(), Some(0));
-    assert!(stderr(&o).contains("USAGE"));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("USAGE"));
+    assert!(o.stderr.is_empty());
     let o = bin().args(["run", "--help"]).output().unwrap();
     assert_eq!(o.status.code(), Some(0));
     let o = bin().args(["verify", "--help"]).output().unwrap();

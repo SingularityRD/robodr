@@ -8,10 +8,11 @@ license.workspace = true
 # accept version-less path dependencies (deny.toml, allow-wildcard-paths).
 publish = false
 repository.workspace = true
-description = "Maps RoboDR deviations to OCSF findings for the AutoSecOps robot-edr.findings contract."
+description = "Maps RoboDR deviations to OCSF Detection Findings in the vendor-neutral robodr.findings contract."
 
 [dependencies]
 robodr-blackbox = { workspace = true }
 robodr-events = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }

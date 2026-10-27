@@ -1,8 +1,11 @@
 //! # robodr-ocsf
 //!
 //! Maps RoboDR [`Deviation`](robodr_events::Deviation)s to **OCSF Detection
-//! Findings** wrapped in the AutoSecOps ingestion envelope, for the
-//! `robot-edr.findings` Kafka topic (design doc, *AI SOC entegrasyonu*).
+//! Findings** wrapped in the vendor-neutral `robodr.findings` envelope
+//! (contract 2.x, `docs/contracts/robodr.findings.md`): what the robot sends
+//! a SOC or SIEM is correlated findings with links to black-box evidence,
+//! not raw telemetry. Contract 1.x (`robot-edr.findings`) messages are still
+//! parsed and validated, never emitted.
 //!
 //! * [`model`] — typed, serde-derived wire structs ([`FindingEnvelope`]).
 //! * [`builder`] — [`FindingBuilder::from_deviation`], deterministic ids,
@@ -21,14 +24,31 @@
 //! `robodr-blackbox` [`Signer`](robodr_blackbox::Signer) /
 //! [`Verifier`](robodr_blackbox::Verifier) traits). Given the same inputs it
 //! produces byte-identical JSON. The JSON Schema in
-//! `docs/contracts/robot-edr-finding.schema.json` and the example in
-//! `docs/contracts/robot-edr-finding.example.json` are checked against the
+//! `docs/contracts/robodr-finding.schema.json` and the example in
+//! `docs/contracts/robodr-finding.example.json` are checked against the
 //! builder's output by the integration tests.
 //!
 //! Protective scope: a finding *describes* a deviation. Nothing here commands
-//! the robot; AutoSecOps actions go to the control plane and the on-robot agent
-//! has the final say (design doc: "AI SOC robota hiçbir zaman doğrudan hareket
-//! komutu göndermez").
+//! the robot. A SOC never sends a motion command to a robot: approved actions
+//! go to the control plane and the on-robot agent has the final say.
+
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+// Review L3 (S10, R9): agentd links this library and release builds use
+// `panic = "abort"`, so a panic here kills the daemon. Non-test code has no
+// unwrap / expect / panic!-family call; slice indexing and arithmetic are
+// left to review and fuzzing.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 
 pub mod builder;
 pub mod hash;
@@ -36,6 +56,7 @@ pub mod kafka;
 pub mod model;
 pub mod sig;
 pub mod taint;
+pub mod upgrade;
 pub mod validate;
 
 pub use builder::{
@@ -50,4 +71,7 @@ pub use sig::{
     VerifiedFinding, VerifierByUnit, SIG_HEADER,
 };
 pub use taint::{Charset, Provenance, Tainted, TAINT_LABEL};
+pub use upgrade::{
+    upgrade_legacy, upgrade_legacy_json, UpgradeError, LEGACY_SIGNED_REASON, UPGRADE_TARGET_VERSION,
+};
 pub use validate::{parse_and_validate, validate, validate_for_emit, ValidationError};

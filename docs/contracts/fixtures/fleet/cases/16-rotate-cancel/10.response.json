@@ -1,0 +1,23 @@
+{
+  "body_file": "10.response.body",
+  "body_sha256": "f9996ee8596b78edef2f7b61a8ce476de392167476d01f41ac1a39d4a5bd0d90",
+  "envelope": {
+    "payload": {
+      "at_ms": 1790000108000,
+      "format": "robodr-fleet-cancel-answer/v1",
+      "new_key_id": "ed25519:5229cc84fa78c5b4",
+      "old_key_id": "ed25519:7bf642b114c6afa2",
+      "request_digest": "sha256:4d129654bf5680d789d4450054d6a7b2584ba409ca4ff37feb83ca96ccdd6f02",
+      "robot_id": "ugv-001",
+      "role": "uplink",
+      "rotation_id": "rfr1-03030303030303030303030303030303",
+      "status": "cancelled",
+      "workspace": "ws-test-0001"
+    },
+    "signed_by": [
+      "ed25519:370ede82195fa32b"
+    ],
+    "type": "cancel-answer"
+  },
+  "status": 200
+}

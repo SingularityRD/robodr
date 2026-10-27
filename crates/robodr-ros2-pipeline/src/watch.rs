@@ -505,6 +505,7 @@ pub fn run(args: &WatchArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result
                 port_map,
                 read_timeout: args.read_timeout,
                 queue_capacity: 1,
+                legacy_udp_ports: Default::default(),
             };
             let src = settings.open(stop).map_err(|e| {
                 format!(

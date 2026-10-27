@@ -1,0 +1,26 @@
+{
+  "answer": {
+    "answer_message": "robodr-control-plane/v2 answer\n0317035e620ccc95e0e6f1df55d572edff5614191a8b7a91e6faff0b6d978438a37c980de6d8a0827a95c1530dfab829b053271504a069863c7c8ad768950a0f\n200\n3e895f67dd8da2fcefbbd74daab98a26a41f08c8d9ecf3870904429e078e9ffd",
+    "body_file": "answers/03-get-request.body.json",
+    "body_sha256": "3e895f67dd8da2fcefbbd74daab98a26a41f08c8d9ecf3870904429e078e9ffd",
+    "content_type": "application/json",
+    "status": 200,
+    "x_robodr_answer_signature": "ed25519;key_id=finding:ugv-007:1;sig=7e39b9e428ff59cfe57ffe1f7f2e8db4dc2a475b53e96c523444ce948040c37959b5972b06fe63124f0db77aa80ea4ed5d2d9010cc2175c704e73f99a20e400c"
+  },
+  "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "description": "request state, percent-encoded request id",
+  "expect": {
+    "authenticated": true,
+    "id": "robot_safe_pause:ugv-007:0001",
+    "route": "get"
+  },
+  "key_id": "soc:soc-a:1",
+  "method": "GET",
+  "name": "03-get-request",
+  "nonce": "contract-nonce-0003",
+  "robot_id": "ugv-007",
+  "signature": "0317035e620ccc95e0e6f1df55d572edff5614191a8b7a91e6faff0b6d978438a37c980de6d8a0827a95c1530dfab829b053271504a069863c7c8ad768950a0f",
+  "signing_message": "robodr-control-plane/v2\nGET\n/api/v2/robots/ugv-007/action-requests/robot_safe_pause%3Augv-007%3A0001\nugv-007\nsoc:soc-a:1\n1800000000\ncontract-nonce-0003\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "target": "/api/v2/robots/ugv-007/action-requests/robot_safe_pause%3Augv-007%3A0001",
+  "timestamp": 1800000000
+}

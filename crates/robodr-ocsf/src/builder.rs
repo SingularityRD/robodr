@@ -25,7 +25,7 @@
 //!     .expect("valid finding");
 //! assert_eq!(finding.ocsf.severity_id, 4);
 //! let json = to_json(&finding).unwrap();
-//! assert!(json.contains("\"data_source\":\"robot_edr\""));
+//! assert!(json.contains("\"data_source\":\"robodr\""));
 //! ```
 //!
 //! ## Identity and deduplication
@@ -41,8 +41,16 @@
 //! * `metadata.uid` = `re1-` + hash(finding uid, last_seen, count) identifies
 //!   one emission, so a replayed message (e.g. after a diode re-send) is
 //!   recognisably the same event.
-//! * The AutoSecOps dedup key is `(data_source, external_id)` =
-//!   `("robot_edr", "<robot_id>:<finding_id>")` (design doc schema table).
+//! * The consumer's dedup key is `(data_source, external_id)` =
+//!   `("robodr", "<robot_id>:<finding_id>")` with the default data source
+//!   ([`RobotContext::data_source`]).
+//!
+//! ## Deployment labels
+//!
+//! [`RobotContext::data_source`] (default [`DEFAULT_DATA_SOURCE`]) and
+//! [`RobotContext::topic`] (default [`DEFAULT_TOPIC`], written to
+//! `ocsf.metadata.log_name` and used by [`crate::record`]) are trusted
+//! configuration; the builder refuses values the validator would.
 //!
 //! ## Trusted vs tainted text
 //!
@@ -77,6 +85,11 @@ pub struct RobotContext {
     pub mode: Mode,
     /// `metadata.product.version`; defaults to this crate's version.
     pub product_version: String,
+    /// Envelope `data_source`; defaults to [`DEFAULT_DATA_SOURCE`].
+    pub data_source: String,
+    /// Topic the finding is published on (`ocsf.metadata.log_name`, the
+    /// Kafka record topic); defaults to [`DEFAULT_TOPIC`].
+    pub topic: String,
 }
 
 impl RobotContext {
@@ -86,6 +99,8 @@ impl RobotContext {
             profile,
             mode,
             product_version: env!("CARGO_PKG_VERSION").to_string(),
+            data_source: DEFAULT_DATA_SOURCE.to_string(),
+            topic: DEFAULT_TOPIC.to_string(),
         }
     }
 }
@@ -173,32 +188,54 @@ const GENERIC: RuleInfo = RuleInfo {
     techniques: &[],
 };
 
-/// Contract minor version that added [`catalog_1_3`]'s entries.
+/// Contract 1.x minor that added [`catalog_1_3`]'s entries.
 pub const CATALOG_1_3_MINOR: u64 = 3;
+/// Contract 2.x minor that added [`catalog_2_1`]'s entries.
+pub const CATALOG_2_1_MINOR: u64 = 1;
+/// Contract 2.x minor that added [`catalog_2_2`]'s entries.
+pub const CATALOG_2_2_MINOR: u64 = 2;
 
-/// The trusted rule catalog of the current contract. Unknown rule ids get a
-/// generic entry (the rule id itself is a `&'static str` from the detection
-/// core and is charset-checked by the validator).
+/// The trusted rule catalog of the current contract
+/// ([`crate::CONTRACT_VERSION`]). Unknown rule ids get a generic entry (the
+/// rule id itself is a `&'static str` from the detection core and is
+/// charset-checked by the validator).
 pub fn rule_info(rule: &str) -> RuleInfo {
     catalog_1_0(rule)
         .or_else(|| catalog_1_3(rule))
+        .or_else(|| catalog_2_1(rule))
+        .or_else(|| catalog_2_2(rule))
         .unwrap_or(GENERIC)
 }
 
 /// The catalog as a validator for a message of `contract_version` must
 /// apply it: entries added in a later contract minor than the message's are
-/// not used (a 1.2 producer built such a finding with the generic entry, and
-/// it stays valid). A malformed version gets the current catalog.
+/// not used (its producer built such a finding with the generic entry, and
+/// it stays valid). Adding an entry is a contract minor bump:
+///
+/// | contract | catalog |
+/// |---|---|
+/// | 1.0 - 1.2 | base ([`catalog_1_0`]) |
+/// | 1.3+ (1.x), 2.0 | base + 1.3 ([`catalog_1_3`], exactly as released in 1.3) |
+/// | 2.1 | base + 1.3 + 2.1 ([`catalog_2_1`]) |
+/// | 2.2+ | base + 1.3 + 2.1 + 2.2 ([`catalog_2_2`]) |
+///
+/// A malformed version gets the current catalog (and is rejected anyway).
 pub fn rule_info_for_contract(rule: &str, contract_version: &str) -> RuleInfo {
-    let minor = contract_version
-        .split('.')
-        .nth(1)
-        .and_then(|m| m.parse::<u64>().ok());
-    if minor.is_some_and(|m| m < CATALOG_1_3_MINOR) {
-        catalog_1_0(rule).unwrap_or(GENERIC)
-    } else {
-        rule_info(rule)
-    }
+    let mut parts = contract_version.split('.').map(|p| p.parse::<u64>().ok());
+    let (major, minor) = (parts.next().flatten(), parts.next().flatten());
+    let (Some(major), Some(minor)) = (major, minor) else {
+        return rule_info(rule);
+    };
+    let with_1_3 = major > LEGACY_CONTRACT_MAJOR || minor >= CATALOG_1_3_MINOR;
+    let with_2_1 =
+        major > CONTRACT_MAJOR || (major == CONTRACT_MAJOR && minor >= CATALOG_2_1_MINOR);
+    let with_2_2 =
+        major > CONTRACT_MAJOR || (major == CONTRACT_MAJOR && minor >= CATALOG_2_2_MINOR);
+    catalog_1_0(rule)
+        .or_else(|| with_1_3.then(|| catalog_1_3(rule)).flatten())
+        .or_else(|| with_2_1.then(|| catalog_2_1(rule)).flatten())
+        .or_else(|| with_2_2.then(|| catalog_2_2(rule)).flatten())
+        .unwrap_or(GENERIC)
 }
 
 /// Entries added in contract 1.3: wave-6 detectors (correlation engine,
@@ -316,9 +353,11 @@ fn catalog_1_3(rule: &str) -> Option<RuleInfo> {
 
 /// Entries added later in the (unreleased) 1.3 cycle: wave-7 detectors
 /// (safety-feed writer overflow, correlation eviction notice, black-box
-/// truncation) and every other `robot.*` id the in-repo detectors emit that
-/// used to fall back to the generic entry. Same contract minor as
-/// [`catalog_1_3`]: 1.3.0 had not been released when these were added.
+/// truncation) and every other `robot.*` id the in-repo detectors emitted
+/// then that used to fall back to the generic entry. Same contract minor as
+/// [`catalog_1_3`]: 1.3.0 had not been released when these were added. This
+/// list is frozen at what 1.3.0 shipped; later entries go to a 2.x catalog
+/// ([`catalog_2_1`]).
 fn catalog_1_3_wave7(rule: &str) -> Option<RuleInfo> {
     const GRAPH: &str = "ros2_dds_discovery";
     const MOTION: &str = "ros2_motion_commands";
@@ -779,6 +818,231 @@ fn catalog_1_3_wave7(rule: &str) -> Option<RuleInfo> {
     })
 }
 
+/// Entries added in contract **2.1**: the low-level joint-frame firewall ids
+/// (Unitree `LowCmd` envelope, humanoid no-zero rule), the robot-API /
+/// control-handover motion ids, the Unitree legacy UDP sender ids and the
+/// discovery-flood aggregate. Not in 1.3 or 2.0: a 2.0 producer built
+/// such a finding with the generic entry, and the validator keeps applying
+/// that to a 2.0 message ([`rule_info_for_contract`]).
+fn catalog_2_1(rule: &str) -> Option<RuleInfo> {
+    const MOTION: &str = "ros2_motion_commands";
+    const fn e(
+        title: &'static str,
+        desc: &'static str,
+        data_source: &'static str,
+        techniques: &'static [(&'static str, &'static str)],
+    ) -> RuleInfo {
+        RuleInfo {
+            title,
+            desc,
+            data_source,
+            techniques,
+        }
+    }
+    Some(match rule {
+        "robot.motion.api_id_out_of_range" => e(
+            "Robot API request with an aliased call id",
+            "A robot API request carried a call id outside the 32-bit range the robot dispatches on, so the robot executes a different call than the one written.",
+            MOTION,
+            &[T0855],
+        ),
+        "robot.unitree.legacy_unknown_sender" => e(
+            "Unitree legacy UDP frame from an unknown host",
+            "A Unitree legacy (unitree_legged_sdk, Go1 generation) UDP command or state frame came from a source address the sensor configuration does not list; the protocol is unauthenticated, so an unlisted command sender can drive the robot.",
+            MOTION,
+            &[T0855],
+        ),
+        "robot.unitree.legacy_sender_flood" => e(
+            "Unitree legacy UDP frames from many unknown hosts",
+            "Unitree legacy (unitree_legged_sdk) UDP frames arrived from more unlisted source addresses than are reported one by one, or listed command senders appeared with many different wrong link-layer addresses; the frames are counted in aggregate. A spoofed-source flood or a scan of the robot's command ports.",
+            MOTION,
+            &[T0855],
+        ),
+        "robot.unitree.legacy_sender_mac_mismatch" => e(
+            "Unitree legacy command from a listed IP with the wrong MAC",
+            "A Unitree legacy UDP command came from a configured command sender IP, but its link-layer source address is not the MAC bound to that IP (or could not be verified because the datagram was reassembled from fragments): another host on the LAN may be using the sender's address.",
+            MOTION,
+            &[T0855],
+        ),
+        "robot.unitree.legacy_port_rtps" => e(
+            "RTPS traffic on a Unitree legacy UDP port",
+            "A datagram on a configured Unitree legacy UDP port also parses as RTPS; it was inspected on both paths. DDS traffic on the legacy command ports is not normal and can be an attempt to evade the legacy sender check.",
+            MOTION,
+            &[T0855],
+        ),
+        "robot.ros2.discovery_flood" => e(
+            "Discovery flood: unknown participants aggregated",
+            "One source address (or many) announced more new DDS participants than are reported one by one; their per-participant findings are folded into this one, with the count per rule, first and last seen and sample GUID prefixes, and each is still recorded in the black box. A GUID spray or a discovery scan, possibly aimed at flooding the findings path.",
+            "ros2_dds_discovery",
+            &[T0848],
+        ),
+        "robot.motion.command_type_mismatch" => e(
+            "Motion command writer with an unexpected type",
+            "A writer on a profiled motion command channel announced a type name other than the one the locked profile records for the channel, a type no decoder knows, or a feedback type: its commands cannot be checked as the profile intends.",
+            MOTION,
+            &[T0855],
+        ),
+        "robot.motion.control_handover" => e(
+            "Motor control handed to another channel",
+            "A command hands motor control to, or takes it from, another channel or controller (motion switcher release, user or arm SDK control).",
+            MOTION,
+            &[T0855],
+        ),
+        "robot.firewall.joint_position_out_of_envelope" => e(
+            "Joint command position out of envelope",
+            "The motion firewall found a low-level joint command whose position target lies outside the joint's envelope and clamped or rejected it (in observe mode: would have).",
+            MOTION,
+            &[T0831],
+        ),
+        "robot.firewall.joint_velocity_out_of_envelope" => e(
+            "Joint command velocity out of envelope",
+            "The motion firewall found a low-level joint command whose velocity target exceeds the joint's bound and clamped or rejected it (in observe mode: would have).",
+            MOTION,
+            &[T0831],
+        ),
+        "robot.firewall.joint_torque_out_of_envelope" => e(
+            "Joint command torque out of envelope",
+            "The motion firewall found a low-level joint command whose feed-forward torque exceeds the joint's bound and clamped or rejected it (in observe mode: would have).",
+            MOTION,
+            &[T0831],
+        ),
+        "robot.firewall.joint_gain_out_of_envelope" => e(
+            "Joint command gain out of envelope",
+            "The motion firewall found a low-level joint command whose stiffness or damping gain lies outside the joint's range; gains are only ever lowered, a gain below its minimum is rejected (in observe mode: would have).",
+            MOTION,
+            &[T0831],
+        ),
+        "robot.firewall.disabled_motor_energised" => e(
+            "Disabled motor energised",
+            "A low-level joint command energises a motor slot the profile marks as unused (non-zero torque or gain); the motion firewall rejected it (in observe mode: would have).",
+            MOTION,
+            &[T0831, T0855],
+        ),
+        "robot.firewall.crc_invalid" => e(
+            "Joint command integrity check failed",
+            "A low-level joint command arrived with an invalid frame checksum, or unchecked where the channel requires one; the motion firewall rejected it (in observe mode: would have).",
+            MOTION,
+            &[T0855],
+        ),
+        "robot.firewall.joint_rate_violation" => e(
+            "Joint command stream gap",
+            "The gap between two low-level joint commands on a channel exceeded its configured maximum interval; recorded only, the late frame is still decided normally.",
+            MOTION,
+            &[],
+        ),
+        "robot.firewall.joint_gain_below_minimum" => e(
+            "Joint command gain below minimum",
+            "The motion firewall rejected a low-level joint command whose stiffness or damping gain is below the joint's minimum (a disabled motor counts as zero gains); gains are never raised (in observe mode: would have rejected).",
+            MOTION,
+            &[T0831],
+        ),
+        "robot.firewall.joint_step_out_of_envelope" => e(
+            "Joint command position step out of envelope",
+            "The motion firewall found a low-level joint command whose position target moved further from the previous accepted target than the joint's per-frame step bound and stepped or rejected it (in observe mode: would have).",
+            MOTION,
+            &[T0831],
+        ),
+        "robot.firewall.joint_pd_torque_out_of_envelope" => e(
+            "Joint command proportional torque out of envelope",
+            "The motion firewall found a low-level joint command whose stiffness times position step exceeds the joint's proportional torque bound and stepped or rejected it (in observe mode: would have).",
+            MOTION,
+            &[T0831],
+        ),
+        "robot.firewall.joint_mode_inconsistent" => e(
+            "Joint command mode inconsistent",
+            "A low-level joint command switches a motor off while carrying non-zero gains or torque for it; the motion firewall rejected it rather than forward unchecked values (in observe mode: would have).",
+            MOTION,
+            &[T0831, T0855],
+        ),
+        "robot.firewall.joint_mode_pin_mismatch" => e(
+            "Joint command operating mode changed",
+            "A low-level joint command carries a frame-level mode (ankle control mode or robot variant) other than the one the channel is pinned to, which changes what the joint envelope means; the motion firewall rejected it (in observe mode: would have).",
+            MOTION,
+            &[T0831, T0855],
+        ),
+        "robot.firewall.joint_limp_frame" => e(
+            "Humanoid joint command would go limp",
+            "A low-level joint command for a humanoid leaves every enabled joint without stiffness or damping, which makes the robot fall; the motion firewall rejected it and held the last valid frame (in observe mode: would have).",
+            MOTION,
+            &[T0831, T0855],
+        ),
+        "robot.firewall.joint_hold_exceeded" => e(
+            "Humanoid joint hold exceeded its time limit",
+            "The motion firewall has been holding a humanoid's last valid joint frame for longer than the configured hold time because newer frames keep being rejected; it keeps holding with the feed-forward torque removed and needs escalation.",
+            MOTION,
+            &[],
+        ),
+        _ => return None,
+    })
+}
+
+/// Entries added in contract **2.2**: the secure-delivery findings of the
+/// on-unit agent `robodr-deliverd` (`docs/SECURE-DELIVERY.md` §9, Sprint
+/// 13b), data source `robodr_delivery`. Not in 2.1 or earlier: a 2.1
+/// validator applies the generic entry to these ids, and so does a 2.2
+/// validator to a 2.1 message ([`rule_info_for_contract`]).
+fn catalog_2_2(rule: &str) -> Option<RuleInfo> {
+    const DELIVERY: &str = "robodr_delivery";
+    const fn e(
+        title: &'static str,
+        desc: &'static str,
+        data_source: &'static str,
+        techniques: &'static [(&'static str, &'static str)],
+    ) -> RuleInfo {
+        RuleInfo {
+            title,
+            desc,
+            data_source,
+            techniques,
+        }
+    }
+    Some(match rule {
+        "robot.deliver.installed" => e(
+            "Delivered package installed",
+            "The unit's delivery agent installed a release-signed package that a depot and operator quorum assigned to it, and the package passed its health gate. Informational: the evidence trail of what runs on the unit.",
+            DELIVERY,
+            &[],
+        ),
+        "robot.deliver.deferred_safety" => e(
+            "Delivery deferred by the robot's safety state",
+            "The unit's delivery agent deferred an install or rollback because the robot's live safety state was not idle or safe-state (moving, human nearby, e-stop or unknown); downloading and staging continue and the install waits for a safe window. Repeated deferrals mean the unit never reaches one.",
+            DELIVERY,
+            &[],
+        ),
+        "robot.deliver.health_failed" => e(
+            "Delivered package failed its health gate; rolled back",
+            "A package installed by the unit's delivery agent failed its health checks; the agent rolled back automatically to the previous version at or above the anti-rollback floor.",
+            DELIVERY,
+            &[],
+        ),
+        "robot.deliver.rollback_blocked_floor" => e(
+            "Failed package cannot be rolled back",
+            "A package installed by the unit's delivery agent failed its health checks and there is no earlier version at or above the anti-rollback floor (or the rollback itself failed); the unit stays on the failing version until an operator acts.",
+            DELIVERY,
+            &[],
+        ),
+        "robot.deliver.refused" => e(
+            "Delivery refused",
+            "The unit's delivery agent refused a media pack, deployment or package: a signature, quorum, revocation, floor, scope (unit, ring, site), platform or hash check failed, or its state had to be restored. Nothing was installed from it.",
+            DELIVERY,
+            &[],
+        ),
+        "robot.deliver.stale" => e(
+            "No fresh deployment or trust file",
+            "The unit's newest deployment or its site trust file expired without a fresh one arriving: updates or revocations may be withheld from the unit.",
+            DELIVERY,
+            &[],
+        ),
+        "robot.deliver.chain_gap" => e(
+            "Release bundle chain gap or equivocation",
+            "The unit's delivery agent saw a release bundle that skips bundles it never received, or two different bundles with the same sequence number, or one that does not follow the accepted bundle.",
+            DELIVERY,
+            &[],
+        ),
+        _ => return None,
+    })
+}
+
 /// The contract 1.0 - 1.2 catalog.
 fn catalog_1_0(rule: &str) -> Option<RuleInfo> {
     const GRAPH: &str = "ros2_dds_discovery";
@@ -1229,7 +1493,7 @@ impl<'a> FindingBuilder<'a> {
                     version: ctx.product_version.clone(),
                 },
                 uid: event_uid(&uid, last, self.count),
-                log_name: KAFKA_TOPIC.into(),
+                log_name: ctx.topic.clone(),
             },
             finding_info: FindingInfo {
                 uid: uid.clone(),
@@ -1265,7 +1529,7 @@ impl<'a> FindingBuilder<'a> {
             contract_version: CONTRACT_VERSION.into(),
             finding_id: uid.clone(),
             external_id: format!("{robot_id}:{uid}"),
-            data_source: DATA_SOURCE.into(),
+            data_source: ctx.data_source.clone(),
             title,
             description,
             severity: dev.severity,

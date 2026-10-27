@@ -1,0 +1,41 @@
+# EXAMPLE systemd-networkd configuration for the CAPTURE NIC of a RoboDR
+# sensor box (docs/UNITREE.md, "Sensor box"). Not active as shipped. To use:
+#   install -D -m 0644 10-robodr-capture.network.example \
+#       /etc/systemd/network/10-robodr-capture.network
+#   (edit Name= below), then: networkctl reload && networkctl reconfigure <nic>
+#
+# The capture NIC is connected to a network tap or a switch mirror (SPAN)
+# port of the robot network. It must be invisible on that network: no IPv4
+# or IPv6 address (not even link-local), no DHCP, no router solicitations,
+# no ARP replies. It must be promiscuous, or the NIC drops the mirrored
+# frames addressed to other hosts before robodr-agentd's AF_PACKET socket
+# sees them (agentd never enables promiscuous mode itself and has no
+# CAP_NET_ADMIN). Netfilter does not affect AF_PACKET capture, so the host
+# firewall can drop everything on this interface.
+#
+# Needs systemd-networkd >= 248 for Promiscuous= (Ubuntu 22.04 ships 249).
+# On older systems set it from a oneshot unit instead:
+#   ExecStart=/usr/sbin/ip link set dev <nic> promisc on arp off
+#
+# Verify on the box: ip -d link show <nic>   (PROMISC, NOARP, state UP)
+#                    ip addr show <nic>      (no inet / inet6 lines)
+
+[Match]
+# TUNE: the capture NIC (by name, or better by MACAddress= / Path=);
+# eth1 as in agentd.unitree-sensor-box.example.json.
+Name=eth1
+
+[Link]
+Promiscuous=yes
+ARP=no
+# Not needed for this machine to be "online" (it has no address on purpose).
+RequiredForOnline=no
+
+[Network]
+DHCP=no
+LinkLocalAddressing=no
+IPv6AcceptRA=no
+LLMNR=no
+MulticastDNS=no
+LLDP=no
+EmitLLDP=no

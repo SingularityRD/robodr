@@ -1,7 +1,8 @@
 //! Contract 1.3 catalog entries (wave-6 detectors) and the validator's
 //! per-minor catalog: a 1.2 message for a rule that only gained an entry in
-//! 1.3 keeps validating with the generic entry; a 1.3 message must carry the
-//! new entry; a downgraded `contract_version` cannot smuggle either way.
+//! 1.3 keeps validating with the generic entry; a 1.3 (and every 2.x)
+//! message must carry the new entry; a downgraded `contract_version` cannot
+//! smuggle either way.
 
 mod common;
 
@@ -38,7 +39,7 @@ fn build(rule: &str) -> String {
 
 fn load_schema() -> Value {
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../docs/contracts/robot-edr-finding.schema.json");
+        .join("../../docs/contracts/robodr-finding.schema.json");
     serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
 }
 
@@ -70,7 +71,7 @@ fn every_new_id_has_its_own_entry_and_validates() {
         let json = build(id);
         let env = robodr_ocsf::parse_and_validate(&json).unwrap_or_else(|e| panic!("{id}: {e:?}"));
         assert_eq!(env.title, info.title);
-        assert_eq!(env.contract_version, "1.3.0");
+        assert_eq!(env.contract_version, robodr_ocsf::CONTRACT_VERSION);
     }
 }
 
@@ -109,6 +110,9 @@ fn older_minor_uses_the_older_catalog() {
         let old = rule_info_for_contract(id, "1.2.0");
         assert_eq!(old.data_source, "robodr", "{id}");
         assert_eq!(rule_info_for_contract(id, "1.3.0"), rule_info(id));
+        // Every 2.x has the full catalog, whatever its minor.
+        assert_eq!(rule_info_for_contract(id, "2.0.0"), rule_info(id));
+        assert_eq!(rule_info_for_contract(id, "2.2.0"), rule_info(id));
         // Malformed versions get the current (strictest) catalog.
         assert_eq!(rule_info_for_contract(id, "x"), rule_info(id));
     }
@@ -142,7 +146,9 @@ fn a_1_2_message_with_the_generic_entry_stays_valid() {
         "robot.ros2.profile_state_tampered",
         "robot.correlate.defense_tampering",
     ] {
-        let v13 = build(id);
+        let v2 = build(id);
+        let v13 = common::to_v1_json(&v2, "1.3.0");
+        robodr_ocsf::parse_and_validate(&v13).unwrap_or_else(|e| panic!("{id}: {e:?}"));
         let v12 = as_1_2(&v13, id);
         assert_ne!(v12, v13);
         robodr_ocsf::parse_and_validate(&v12).unwrap_or_else(|e| panic!("{id}: {e:?}"));
@@ -164,6 +170,24 @@ fn a_1_2_message_with_the_generic_entry_stays_valid() {
             robodr_ocsf::parse_and_validate(&downgraded).is_err(),
             "{id}"
         );
+        // A 2.x message relabelled 1.x without the 1.x constants is
+        // rejected. (A 1.3 message relabelled 2.x is a valid 2.x message:
+        // its fixed 1.x labels are legal 2.x deployment labels.)
+        let relabelled = v2.replace(
+            &format!("\"contract_version\":\"{}\"", robodr_ocsf::CONTRACT_VERSION),
+            "\"contract_version\":\"1.3.0\"",
+        );
+        assert!(
+            robodr_ocsf::parse_and_validate(&relabelled).is_err(),
+            "{id}"
+        );
+        let upgraded = v13.replace(
+            "\"contract_version\":\"1.3.0\"",
+            &format!("\"contract_version\":\"{}\"", robodr_ocsf::CONTRACT_VERSION),
+        );
+        let up = robodr_ocsf::parse_and_validate(&upgraded).unwrap();
+        assert_eq!(up.data_source, "robot_edr");
+        assert!(robodr_ocsf::to_json(&up).is_ok());
     }
 }
 

@@ -1,0 +1,32 @@
+{
+  "model": "unitree-b2w-EXAMPLE-replace-with-OEM-data",
+  "locked": false,
+  "participants": [
+    "0123456789abcdef01234567"
+  ],
+  "writer_topics": [
+    "/api/sport/request",
+    "/api/sport/response",
+    "/lowcmd",
+    "/lowstate",
+    "/sportmodestate",
+    "/wirelesscontroller"
+  ],
+  "motion_envelopes": {
+    "/api/sport/request": {
+      "max_linear_speed": 2.5,
+      "max_joint_speed": null
+    },
+    "/lowcmd": {
+      "max_linear_speed": null,
+      "max_joint_speed": 23.0,
+      "max_joint_torque": 200.0,
+      "max_joint_kp": 300.0,
+      "max_joint_position_step": 0.2
+    }
+  },
+  "services": [],
+  "actions": [],
+  "reader_topics": [],
+  "raw_dds_topics": []
+}

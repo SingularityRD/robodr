@@ -1,0 +1,1 @@
+{"executed":false,"in_force":false,"request_id":"robot_safe_pause:ugv-007:0001","state":{"action":"safe_pause","decision":"accepted","evidence":"robodr-blackbox://ugv-007/0/10?sha256=5222417f54f88cdc49b40a84ffbc362064dba2e3629cbced22c22a4d7c16f50f","executed":false,"executor":"recording","robot_id":"ugv-007"},"status":"recorded_not_executed"}

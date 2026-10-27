@@ -1,0 +1,29 @@
+# EXAMPLE drop-in, not active as shipped. To use it:
+#   install -D -m 0644 30-control-plane.conf.example \
+#       /etc/systemd/system/robodr-agentd.service.d/30-control-plane.conf
+#   (edit IPAddressAllow= below for your SOC network)
+#   systemctl daemon-reload && systemctl restart robodr-agentd
+#
+# The control-plane API robodr-control-plane/v2 (docs/contracts/
+# robodr.control-plane.md, docs/OPERATIONS.md section 6.4
+# "Control-plane API"):
+#   * its persistent state (request journal, replay store, evidence
+#     exports) in control_plane.state_dir, created 0700 robodr-agentd:robodr by
+#     packaging/tmpfiles.d/robodr.conf:
+#       "state_dir": "/var/lib/robodr/control-plane/agentd"
+#   * the robot's TLS server key, handed over like the black-box key:
+#     systemd (PID 1) reads the root-only file and exposes a private copy at
+#       /run/credentials/robodr-agentd.service/cp-tls.key
+#     which agentd.json names as control_plane.tls.key_file. If the source
+#     file is missing the unit fails to start: install this drop-in only
+#     together with the key (or remove the line for a unix-socket-only API);
+#   * the SOC's network: the unit has IPAddressDeny=any, so a mutual-TLS
+#     listener (control_plane.listen_tcp + tls) is reachable only from the
+#     networks allowed here. Replace the documentation prefix below with the
+#     SOC's address(es); keep it as narrow as possible.
+# Answers are signed with the finding key: the finding-key drop-in
+# (20-finding-key.conf.example) is required too.
+[Service]
+ReadWritePaths=/var/lib/robodr/control-plane/agentd
+LoadCredential=cp-tls.key:/etc/robodr/keys/agentd-cp-tls.key
+IPAddressAllow=192.0.2.0/24

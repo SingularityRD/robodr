@@ -8,15 +8,18 @@ license.workspace = true
 # accept version-less path dependencies (deny.toml, allow-wildcard-paths).
 publish = false
 repository.workspace = true
-description = "Exporters for robot-edr.findings: agentd spool -> diode packer (robot side), and diode importer output / site spool -> Kafka (SOC side, std-only Kafka producer)."
+description = "Exporters for robodr.findings: agentd spool -> diode packer (robot side); diode importer output / site spool -> Kafka (std-only Kafka producer) or -> the AutoSecOps ingest API over TLS (robodr-uplink)."
 
-# Pure crate: std + RoboDR crates + serde only. The Kafka client is a minimal
-# in-crate implementation (no TLS/SASL; see README).
+# Pure Rust crates + RoboDR crates + serde; the Kafka client is a minimal
+# in-crate implementation (no TLS/SASL; see README). rustls (+ ring) is the
+# TLS stack of robodr-uplink only (ingest API client, README "robodr-uplink").
 [dependencies]
 robodr-agentd = { workspace = true }
 robodr-blackbox = { workspace = true }
 robodr-diode = { workspace = true }
 robodr-ocsf = { workspace = true }
+rustls = { workspace = true }
+webpki = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
@@ -38,3 +41,7 @@ path = "src/bin/robodr-spool-export.rs"
 [[bin]]
 name = "robodr-kafka-publish"
 path = "src/bin/robodr-kafka-publish.rs"
+
+[[bin]]
+name = "robodr-uplink"
+path = "src/bin/robodr-uplink.rs"

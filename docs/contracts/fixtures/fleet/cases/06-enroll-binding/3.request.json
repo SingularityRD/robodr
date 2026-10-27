@@ -1,0 +1,13 @@
+{
+  "body_file": "3.body",
+  "body_sha256": "08eeb870ee00b2357129bce915bd17f365188325e8064866dbb5e742d0f461e4",
+  "headers": [
+    [
+      "Content-Type",
+      "application/json"
+    ]
+  ],
+  "method": "POST",
+  "server_time_ms": 1790000060000,
+  "target": "/api/robot-edr/v2/fleet/enroll"
+}

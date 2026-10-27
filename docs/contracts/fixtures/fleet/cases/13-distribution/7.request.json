@@ -1,0 +1,21 @@
+{
+  "body_file": "7.body",
+  "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "headers": [
+    [
+      "X-RoboDR-Key-Id",
+      "ed25519:7bf642b114c6afa2"
+    ],
+    [
+      "X-RoboDR-Timestamp",
+      "1790000060000"
+    ],
+    [
+      "X-RoboDR-Signature",
+      "2af07a4b119d74024c8a2bc1f2ee5e92a8fc1445ef0c1bd68e33ada33f0e3bc46e4445eb8379a71b78f31fb0dfd8101de7a24720b39d93a542a8f386cbe45c0b"
+    ]
+  ],
+  "method": "GET",
+  "server_time_ms": 1790000060000,
+  "target": "/api/robot-edr/v2/fleet/ring"
+}

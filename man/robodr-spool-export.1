@@ -30,6 +30,10 @@ robodr\-spool\-export \- move robodr\-agentd findings from its spool into signed
 .RB [ \-\-interval\-ms
 .IR N ]
 .RB [ \-\-once ]
+.RB [ \-\-upgrade\-data\-source
+.IR LABEL ]
+.RB [ \-\-upgrade\-topic
+.IR TOPIC ]
 .SH DESCRIPTION
 Robot\-side (low side) exporter. It takes the records in
 .IB DIR /ready/
@@ -107,6 +111,15 @@ Loop interval, > 0 (default 5000).
 .TP
 .B \-\-once
 One step, then exit.
+.TP
+.BI \-\-upgrade\-data\-source " LABEL\fR, " \-\-upgrade\-topic " TOPIC"
+An unsigned contract 1.x record (spooled before an upgrade) is upgraded to
+contract 2.0 with these labels (defaults
+.B robodr
+and
+.BR robodr.findings ),
+keeping its identity. A signed 1.x record is moved to the rejected directory
+with the reason "legacy 1.x signed record: re\-sign required".
 .SH EXIT STATUS
 .TP
 .B 0
@@ -120,6 +133,30 @@ Error with
 .TP
 .B 2
 Usage error.
+.SH SYSTEMD UNIT
+The package ships
+.B robodr\-spool\-export.service
+(installed disabled) for the robot side of a diode site. It runs as user
+.B robodr
+with no network
+.RB ( PrivateNetwork=yes ),
+reads
+.I /var/lib/robodr/spool/agentd
+and writes batches to
+.IR /var/lib/robodr/export/diode ,
+state under
+.IR /var/lib/robodr/export/spool\-export/ .
+The key
+.I /etc/robodr/keys/diode.key
+is handed over as
+.IR /run/credentials/robodr\-spool\-export.service/diode.key ;
+the unit id and extra flags come from
+.I /etc/robodr/spool\-export.env
+.RB ( ROBODR_UNIT_ID ,
+.BR ROBODR_SPOOL_EXPORT_ARGS ).
+It conflicts with
+.B robodr\-kafka\-publish.service
+(one consumer per spool).
 .SH SEE ALSO
 .BR robodr\-agentd (8),
 .BR robodr\-diode\-pack (1),

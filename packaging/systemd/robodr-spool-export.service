@@ -1,0 +1,116 @@
+# robodr-spool-export: robot-side (low side) findings exporter. Moves
+# robodr-agentd's spooled findings into signed one-way diode batches
+# (man robodr-spool-export(1), docs/OPERATIONS.md section 8.3).
+#
+# Air-gapped / diode sites. On a CONNECTED site use robodr-kafka-publish.service
+# instead: both consume the same spool, so the two units conflict.
+#
+# Checked against crates/robodr-export (robodr-spool-export --help):
+#   * CLI: --spool DIR --outbox DIR --state FILE --pack-state FILE --unit ID
+#     --key-file FILE [--interval-ms N] [--once] ...; without --once it loops
+#     every --interval-ms (default 5000 ms) and retries after errors itself;
+#     exit 2 = usage error.
+#   * It renames <spool>/ready/* to acked/ (and invalid ones to rejected/),
+#     so it runs as User=robodr, through the spool's group (agentd
+#     itself runs as robodr-agentd: an exporter cannot write its black
+#     box, its state or its sockets).
+#   * --key-file: the unit's diode signing key, a `robodr-blackbox keygen`
+#     secret key file (Ed25519). Same rule as agentd's key: regular file, no
+#     group/other access, owned by root or the process's uid; the systemd
+#     credential copy satisfies it. Use a dedicated key, never agentd's
+#     black-box key.
+#   * The batches land in /var/lib/robodr/export/diode (0750 robodr:robodr,
+#     tmpfiles.d): the transfer to the diode reads them from there.
+#
+# Site settings: /etc/robodr/spool-export.env (0640 root:robodr), from
+# /usr/share/doc/robodr/examples/spool-export.env.example:
+#   ROBODR_UNIT_ID=<unit id written into every manifest>     (required)
+#   ROBODR_SPOOL_EXPORT_ARGS="--interval-ms 5000"            (optional extra flags)
+# Key: /etc/robodr/keys/diode.key (0600 root:root).
+#
+# Installed disabled. Enable after commissioning:
+#   systemctl enable --now robodr-spool-export
+# Verify after editing: systemd-analyze verify robodr-spool-export.service
+#                       systemd-analyze security robodr-spool-export.service
+
+[Unit]
+Description=RoboDR findings exporter (agentd spool to signed diode batches)
+Documentation=man:robodr-spool-export(1) file:/usr/share/doc/robodr/OPERATIONS.md
+AssertPathExists=/etc/robodr/spool-export.env
+After=local-fs.target robodr-agentd.service
+# One consumer per spool: the connected-site publisher and uplink read the same one.
+Conflicts=robodr-kafka-publish.service robodr-uplink.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/robodr/spool-export.env
+# ${ROBODR_UNIT_ID} is one argument (empty if unset: a usage error, exit 2);
+# $ROBODR_SPOOL_EXPORT_ARGS is split on white space and may be empty.
+ExecStart=/usr/bin/robodr-spool-export --spool /var/lib/robodr/spool/agentd --outbox /var/lib/robodr/export/diode --state /var/lib/robodr/export/spool-export/state.json --pack-state /var/lib/robodr/export/spool-export/pack-state.json --unit ${ROBODR_UNIT_ID} --key-file /run/credentials/robodr-spool-export.service/diode.key $ROBODR_SPOOL_EXPORT_ARGS
+Restart=on-failure
+RestartSec=10s
+# Exit 2 = usage error (bad flags, unit id or key): restarting cannot fix it.
+RestartPreventExitStatus=2
+TimeoutStopSec=30s
+# Never the reason the motion stack is OOM-killed (as robodr-agentd).
+OOMScoreAdjust=300
+MemoryHigh=192M
+MemoryMax=256M
+TasksMax=32
+# Background work: below the robot's processes for CPU and disk.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+# --- Identity and capabilities ---------------------------------------------
+User=robodr
+Group=robodr
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+UMask=0027
+
+# --- Key material ------------------------------------------------------------
+# systemd (PID 1) copies the root-only key for this unit alone:
+#   /run/credentials/robodr-spool-export.service/diode.key
+LoadCredential=diode.key:/etc/robodr/keys/diode.key
+InaccessiblePaths=-/etc/robodr/keys
+
+# --- Filesystem --------------------------------------------------------------
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ReadWritePaths=/var/lib/robodr/spool/agentd /var/lib/robodr/export/diode /var/lib/robodr/export/spool-export
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# --- Network: none at all ------------------------------------------------------
+# The exporter only writes files; the diode transfer is a separate step.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+# --- Kernel interfaces / syscalls -------------------------------------------
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete @mount @swap @reboot @raw-io @cpu-emulation @clock @module @debug
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

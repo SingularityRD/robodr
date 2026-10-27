@@ -13,8 +13,14 @@
 //! For each batch:
 //!
 //! 1. Take `ready/` files in name (= sequence) order. Each is parsed as a
-//!    [`SpoolRecord`], checked (`schema`, `seq` = file name, topic) and its
-//!    `value` re-validated with [`robodr_ocsf::parse_and_validate`]. A record
+//!    [`SpoolRecord`], checked (`schema`, `seq` = file name, topic = the
+//!    value's `ocsf.metadata.log_name`) and its `value` re-validated with
+//!    [`robodr_ocsf::parse_and_validate`]. A contract 1.x record (spooled
+//!    by an agentd before the upgrade) is upgraded to contract 2.0 when it
+//!    is unsigned ([`robodr_ocsf::upgrade_legacy`], labels
+//!    [`ExportConfig::upgrade_data_source`] / `upgrade_topic`); a signed
+//!    one is rejected with the reason "legacy 1.x signed record: re-sign
+//!    required". A record
 //!    that fails is **moved** to `<spool>/rejected/` with a `.reason.json`
 //!    beside it (never deleted). The batch is cut so the packer is
 //!    guaranteed to write it as **one** diode batch (same size/count rule
@@ -85,7 +91,7 @@ use robodr_diode::manifest::{
     MAX_MANIFEST_BYTES,
 };
 use robodr_diode::{PackConfig, PackError, Packer, PublishedBatch};
-use robodr_ocsf::{FindingEnvelope, KAFKA_TOPIC};
+use robodr_ocsf::FindingEnvelope;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
@@ -128,6 +134,13 @@ pub struct ExportConfig {
     pub parity_shards: usize,
     /// Must equal the packer's `shard_size` (used only with parity).
     pub shard_size: u64,
+    /// `data_source` an unsigned contract 1.x record (spooled by an agentd
+    /// before the upgrade) gets when it is upgraded to contract 2.0
+    /// (default [`robodr_ocsf::DEFAULT_DATA_SOURCE`]).
+    pub upgrade_data_source: String,
+    /// Topic (`ocsf.metadata.log_name`) an upgraded 1.x record gets
+    /// (default [`robodr_ocsf::DEFAULT_TOPIC`]).
+    pub upgrade_topic: String,
     #[doc(hidden)]
     pub fail_point: Option<FailPoint>,
 }
@@ -145,6 +158,8 @@ impl ExportConfig {
             max_findings_per_batch: robodr_diode::pack::DEFAULT_MAX_FINDINGS_PER_BATCH,
             parity_shards: 0,
             shard_size: robodr_diode::pack::DEFAULT_SHARD_SIZE,
+            upgrade_data_source: robodr_ocsf::DEFAULT_DATA_SOURCE.into(),
+            upgrade_topic: robodr_ocsf::DEFAULT_TOPIC.into(),
             fail_point: None,
         }
     }
@@ -427,6 +442,13 @@ impl Exporter {
     }
 
     fn open_inner(cfg: ExportConfig, packer: Packer) -> Result<Self, ExportError> {
+        if !robodr_ocsf::validate::is_valid_data_source(&cfg.upgrade_data_source)
+            || !robodr_ocsf::validate::is_valid_topic(&cfg.upgrade_topic)
+        {
+            return Err(ExportError::Config(
+                "upgrade data source / topic must be valid deployment labels".into(),
+            ));
+        }
         if cfg.max_findings_per_batch == 0 {
             return Err(ExportError::Config(
                 "max_findings_per_batch must be >= 1".into(),
@@ -643,12 +665,6 @@ impl Exporter {
         if rec.seq != seq {
             return Ok(Err(format!("seq {} does not match file name", rec.seq)));
         }
-        if rec.topic != KAFKA_TOPIC {
-            return Ok(Err(format!(
-                "topic {:?}, expected {KAFKA_TOPIC}",
-                rec.topic
-            )));
-        }
         let env = match robodr_ocsf::parse_and_validate(&rec.value) {
             Ok(e) => e,
             Err(errs) => {
@@ -659,10 +675,53 @@ impl Exporter {
         if rec.key != env.finding_id {
             return Ok(Err("record key is not the finding id".into()));
         }
+        if rec.topic != env.ocsf.metadata.log_name {
+            return Ok(Err(format!(
+                "topic {:?} is not the one the value names ({:?})",
+                rec.topic, env.ocsf.metadata.log_name
+            )));
+        }
+        // A contract 1.x record spooled before the upgrade: an unsigned one
+        // is upgraded to contract 2.0 (same identity, see
+        // `robodr_ocsf::upgrade`); a signed one cannot be (the signature
+        // covers the 1.x bytes) and is kept in `rejected/`.
+        let env = if robodr_ocsf::upgrade::is_legacy_version(&env.contract_version) {
+            if !matches!(robodr_ocsf::signature_header(&rec.headers), Ok(None)) {
+                return Ok(Err(format!(
+                    "{} (contract {}; the finding signature covers the 1.x value, so it \
+                     cannot be upgraded here: re-sign it on the robot or drain the spool \
+                     before upgrading)",
+                    robodr_ocsf::LEGACY_SIGNED_REASON,
+                    env.contract_version
+                )));
+            }
+            match robodr_ocsf::upgrade_legacy(
+                &env,
+                &self.cfg.upgrade_data_source,
+                &self.cfg.upgrade_topic,
+            ) {
+                Ok(up) => up,
+                Err(e) => {
+                    return Ok(Err(format!(
+                        "legacy contract {} record not upgraded: {e}",
+                        env.contract_version
+                    )))
+                }
+            }
+        } else {
+            env
+        };
         // Exactly what the packer will write (it re-serialises with to_json).
         let line = match robodr_ocsf::to_json(&env) {
             Ok(l) => l,
-            Err(_) => return Ok(Err("finding cannot be emitted (to_json)".into())),
+            Err(e) => {
+                let first: Vec<String> = e.iter().take(3).map(|e| e.to_string()).collect();
+                return Ok(Err(format!(
+                    "contract {} finding cannot be emitted: {}",
+                    env.contract_version,
+                    first.join("; ")
+                )));
+            }
         };
         Ok(Ok((env, line)))
     }

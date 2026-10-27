@@ -1,0 +1,16 @@
+# EXAMPLE drop-in for the robodr-focal package (systemd 245), not active as
+# shipped. Same purpose as the regular package's 30-executor.conf.example
+# (packaging/systemd/robodr-agentd.service.d/), with
+# /usr/lib/robodr/robodr-load-credential in place of LoadCredential=
+# (systemd 247). To use it:
+#   install -D -m 0644 30-executor.conf.example \
+#       /etc/systemd/system/robodr-agentd.service.d/30-executor.conf
+#   systemctl daemon-reload && systemctl restart robodr-agentd
+#
+# Hands robodr-agentd the shared key of the agentd <-> robodr-executor
+# protocol as /run/credentials/robodr-agentd.service/executor.key (0400,
+# owned by robodr); agentd.json names it in "executor": {"key_file": ...}.
+# This line runs after the unit's own ExecStartPre= lines (drop-ins append);
+# ExecStopPost= of the unit removes every copy.
+[Service]
+ExecStartPre=+/usr/lib/robodr/robodr-load-credential load robodr-agentd.service robodr-agentd executor.key:/etc/robodr/keys/executor.key

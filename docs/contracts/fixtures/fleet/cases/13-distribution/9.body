@@ -1,0 +1,25 @@
+{
+  "seal": "sha256:05438755adfc4a144a96e28db13f7e1047c4add4f520ea7d30bbe54a025d3f73",
+  "model": "ugv-test",
+  "locked": true,
+  "metadata": {
+    "schema_version": 1,
+    "profile_version": 4,
+    "platform": "ugv-x1",
+    "unit_id": "ugv-001",
+    "locked_by": "op-a",
+    "locked_at": 1790000000,
+    "parent_digest": null
+  },
+  "participants": [
+    "01103f5a8c2e000000000101"
+  ],
+  "writer_topics": [
+    "/cmd_vel"
+  ],
+  "motion_envelopes": {},
+  "services": [],
+  "actions": [],
+  "reader_topics": [],
+  "raw_dds_topics": []
+}

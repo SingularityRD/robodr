@@ -39,13 +39,14 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use robodr_capture::reassembly::ReassemblyStats;
 
 pub use crate::binding::Ingress;
 use robodr_capture::{
-    CaptureError, CaptureFile, CaptureStats, MatchMode, PacketSource, RtpsDatagrams, RtpsFilter,
-    RtpsPortMap,
+    CaptureError, CaptureFile, CaptureStats, MatchMode, PacketKind, PacketSource, RtpsDatagrams,
+    RtpsFilter, RtpsPortMap,
 };
 
 /// One received datagram (UDP payload, starting at `RTPS`) with the source
@@ -60,6 +61,67 @@ pub struct Datagram {
     /// Name of the interface it arrived on, when the source knows it
     /// (evidence only; trust decisions use [`Datagram::ingress`]).
     pub interface: Option<String>,
+    /// `Some` for a Unitree legacy UDP datagram (not RTPS) accepted on a
+    /// configured legacy port ([`crate::legacy`]); `None` (RTPS) from
+    /// [`Datagram::new`].
+    pub legacy: Option<LegacyUdp>,
+    /// When the capture saw it (pcap record time, or the live capture
+    /// thread's receive time, wall clock); `None` when the source has no
+    /// timestamp (SPDP socket, in-memory sources).
+    pub captured_at: Option<Duration>,
+}
+
+/// UDP endpoints of a Unitree legacy datagram (see [`Datagram::legacy`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegacyUdp {
+    pub src_port: u16,
+    pub dst_port: u16,
+    /// Destination address.
+    pub dst_ip: IpAddr,
+    /// Link-layer (MAC) source of the frame, when the capture knows it
+    /// (`AF_PACKET` `sll_addr`, Ethernet / Linux cooked pcap); `None` for
+    /// raw-IP captures and reassembled datagrams.
+    pub src_mac: Option<[u8; 6]>,
+    /// Recovered from IP fragments.
+    pub reassembled: bool,
+    /// The payload also starts with the RTPS magic: the pipeline inspects
+    /// it on both paths and reports RTPS on a legacy port.
+    pub also_rtps: bool,
+}
+
+impl LegacyUdp {
+    /// Endpoints only (no MAC, not reassembled, not RTPS).
+    pub fn new(src_port: u16, dst_port: u16, dst_ip: IpAddr) -> Self {
+        Self {
+            src_port,
+            dst_port,
+            dst_ip,
+            src_mac: None,
+            reassembled: false,
+            also_rtps: false,
+        }
+    }
+
+    /// Set [`LegacyUdp::src_mac`].
+    #[must_use]
+    pub fn with_src_mac(mut self, mac: Option<[u8; 6]>) -> Self {
+        self.src_mac = mac;
+        self
+    }
+
+    /// Set [`LegacyUdp::reassembled`].
+    #[must_use]
+    pub fn with_reassembled(mut self, reassembled: bool) -> Self {
+        self.reassembled = reassembled;
+        self
+    }
+
+    /// Set [`LegacyUdp::also_rtps`].
+    #[must_use]
+    pub fn with_also_rtps(mut self, also_rtps: bool) -> Self {
+        self.also_rtps = also_rtps;
+        self
+    }
 }
 
 impl Datagram {
@@ -69,7 +131,23 @@ impl Datagram {
             src_ip: src_ip.into(),
             ingress: Ingress::Unknown,
             interface: None,
+            legacy: None,
+            captured_at: None,
         }
+    }
+
+    /// Mark the datagram as Unitree legacy UDP (see [`Datagram::legacy`]).
+    #[must_use]
+    pub fn with_legacy(mut self, legacy: LegacyUdp) -> Self {
+        self.legacy = Some(legacy);
+        self
+    }
+
+    /// Set the capture timestamp (see [`Datagram::captured_at`]).
+    #[must_use]
+    pub fn with_captured_at(mut self, at: Duration) -> Self {
+        self.captured_at = Some(at);
+        self
     }
 
     /// Tag the datagram with the kind of interface it arrived on.
@@ -536,12 +614,18 @@ impl<S: PacketSource> CaptureDatagramSource<S> {
 impl CaptureDatagramSource<CaptureFile<BufReader<File>>> {
     /// Replay a pcap or pcapng file (format detected from its magic).
     pub fn open_file(path: impl AsRef<Path>, port_map: RtpsPortMap) -> io::Result<Self> {
+        Self::open_file_with_filter(path, rtps_filter(port_map))
+    }
+
+    /// [`CaptureDatagramSource::open_file`] with an explicit filter (e.g.
+    /// with Unitree legacy UDP ports, [`RtpsFilter::with_legacy_udp_ports`]).
+    pub fn open_file_with_filter(path: impl AsRef<Path>, filter: RtpsFilter) -> io::Result<Self> {
         let path = path.as_ref();
         let file = CaptureFile::open(path).map_err(|e| {
             let e = capture_to_io(&e);
             io::Error::new(e.kind(), format!("{}: {e}", path.display()))
         })?;
-        Ok(Self::new(file, rtps_filter(port_map)))
+        Ok(Self::new(file, filter))
     }
 }
 
@@ -572,8 +656,18 @@ impl CaptureDatagramSource<robodr_capture::afpacket::AfPacketSource> {
         port_map: RtpsPortMap,
         read_timeout: std::time::Duration,
     ) -> io::Result<Self> {
+        Self::open_live_with_filter(interfaces, rtps_filter(port_map), read_timeout)
+    }
+
+    /// [`CaptureDatagramSource::open_live`] with an explicit filter; the
+    /// kernel BPF filter is compiled from the same filter (Unitree legacy
+    /// ports included).
+    pub fn open_live_with_filter(
+        interfaces: &[String],
+        filter: RtpsFilter,
+        read_timeout: std::time::Duration,
+    ) -> io::Result<Self> {
         use robodr_capture::afpacket::{AfPacketConfig, AfPacketSource};
-        let filter = rtps_filter(port_map);
         let cfg = AfPacketConfig {
             interfaces: interfaces.to_vec(),
             kernel_filter: robodr_capture::bpf::rtps_filter_program(&filter).ok(),
@@ -594,8 +688,17 @@ impl<S: PacketSource> DatagramSource for CaptureDatagramSource<S> {
             }
             if let Some(p) = self.inner.next_packet() {
                 let mut d = Datagram::new(p.payload, p.src.to_string())
-                    .with_ingress(ingress_of_packet(&p.ingress, self.ingress));
+                    .with_ingress(ingress_of_packet(&p.ingress, self.ingress))
+                    .with_captured_at(p.ts);
                 d.interface = p.ingress.name;
+                if p.kind == PacketKind::UnitreeLegacy {
+                    d.legacy = Some(
+                        LegacyUdp::new(p.src_port, p.dst_port, p.dst)
+                            .with_src_mac(p.src_mac)
+                            .with_reassembled(p.reassembled)
+                            .with_also_rtps(p.also_rtps),
+                    );
+                }
                 return Ok(Some(d));
             }
             if self.inner.is_finished() {

@@ -31,6 +31,7 @@
 //!
 //! | When | Rule | Severity |
 //! |---|---|---|
+//! | a writer announced via SEDP on a **profiled command channel** with a type name other than the one the profile records for the channel (`Profile::motion_types`), a type name no decoder knows (its commands can never be inspected), or a feedback type | [`rules::MOTION_COMMAND_TYPE_MISMATCH`] | High, at the announcement, not rate limited, dedup by writer + type + channel |
 //! | a sample on a motion / feedback topic that cannot be inspected: undecodable payload (truncated, unknown encapsulation id (anything outside XTypes 1.3 Table 60), `PL_CDR`, over a cap, malformed string), unknown type name, a type of the wrong role for the topic (feedback type on a command channel or the reverse), non-standard payload, malformed DATA / inline QoS, fragments refused / evicted / conflicting, per-datagram sample cap | [`rules::MOTION_UNDECODABLE_SAMPLE`] | Medium, rate limited (`robot.motion.undecodable_sample` bucket), dedup by channel + writer + reason |
 //! | DATA addressed to a reader entity announced on a motion / feedback topic, from a writer **never announced via SEDP** (cannot be attributed, so cannot be checked against the profile) and still unannounced [`MotionOptions::unattributed_grace`] after its first sample (or at [`crate::Pipeline::finish`]) | [`rules::MOTION_UNATTRIBUTED_SAMPLE`] | High, dedup by writer + topic |
 //! | a decoded sample whose writer prefix is bound to other source IPs than the one it came from (binding table, [`crate::binding`]): somebody speaks for a profiled writer | [`rules::MOTION_SAMPLE_SOURCE_MISMATCH`] | Critical on a command channel, High on a feedback topic |
@@ -38,7 +39,20 @@
 //! | a decoded sample whose writer was announced via SEDP but whose participant has **no binding** (no SPDP seen, not pinned, binding expired) or whose datagram source IP does not parse, while the binding check is on | [`rules::MOTION_UNATTRIBUTED_SAMPLE`] | High |
 //! | a decoded command whose speed cannot be bounded from the message (`JointTrajectory` with no velocities and fewer than two points with positions; `robodr_cdr::DecodeAnomaly::UnverifiableCommand`): no envelope can check it | [`rules::MOTION_UNVERIFIABLE_COMMAND`] | Medium, dedup by channel + writer |
 //! | a decoded sample with more bytes after the message than XCDR end padding explains (> 3, `robodr_cdr::DecodeAnomaly::ExcessTrailingBytes`): DDS readers ignore them, nothing standard sends them | [`rules::MOTION_DECODE_ANOMALY`] | Low, dedup by channel + writer + kind (byte count not in the dedup key) |
-//! | every decoded `MotionCommand` (if `evaluate_commands`) | the profile's motion rules (`robot.motion.linear_over_envelope`, `angular_over_envelope`, `joint_over_envelope`, `non_finite_command`, `unprofiled_channel`, `robot.profile.invalid_envelope`) | as `robodr-events` decides (Critical for over-envelope / non-finite) |
+//! | a decoded Unitree API request whose `api_id` does not fit `int32` (`robodr_cdr::DecodeAnomaly::ApiIdOutOfRange`): the robot executes its low 32 bits | [`rules::MOTION_API_ID_OUT_OF_RANGE`] | High, dedup by channel + writer |
+//! | every decoded `MotionCommand` (if `evaluate_commands`) | the profile's motion rules (`robot.motion.linear_over_envelope`, `angular_over_envelope`, `joint_over_envelope` (joint speed, torque, kp, position step), `non_finite_command`, `unprofiled_channel`, `unverifiable_command` (API tricks / trajectories / unknown calls, joint terms the envelope cannot bound), `control_handover`, `robot.profile.invalid_envelope`) | as `robodr-events` decides (Critical for over-envelope / non-finite) |
+//!
+//! # Joint commands
+//!
+//! A decoded low-level joint command (Unitree `LowCmd_`, `HandCmd_`,
+//! `MotorCmds_`, `MotorCmd_`) carries `joint_speed`, `joint_torque` and
+//! `joint_kp` over every slot (`robodr_cdr`), and this module adds
+//! `joint_position_step`: the largest `|Δq|` of an acting position target
+//! (`kp != 0`) against the **previous frame decoded on the same channel**,
+//! from any writer (the pipeline observes, it does not block, so the
+//! previous frame is the one the robot received). The first frame on a
+//! channel has no step. At most [`MAX_JOINT_FRAME_CHANNELS`] channels are
+//! tracked.
 //!
 //! A writer on a motion topic that is not in the profile is already the
 //! discovery rule `robot.ros2.unauthorized_motion_writer` (Critical); its
@@ -91,13 +105,16 @@ use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use robodr_cdr::{DecodeAnomaly, DecodeError, EventContext, Limits, MotionRole, Registry};
+use robodr_cdr::{
+    DecodeAnomaly, DecodeError, EventContext, JointCommandFrame, Limits, MotionRole, Registry,
+    UnitreeModel,
+};
 use robodr_events::graph::{demangle, RosNameKind};
 use robodr_events::profile::Profile;
 use robodr_events::{Deviation, RobotEvent, Severity};
 use robodr_rtps::{
-    hex_guid, DatagramReport, EndpointKind, EntityId, FragmentEventKind, Guid, PayloadKind,
-    RtpsTime, SampleAddress, UserDataLimits, UserDataWalker, GUIDPREFIX_UNKNOWN,
+    hex_guid, DatagramReport, EndpointKind, EntityId, FragmentEventKind, Guid, GuidPrefix,
+    PayloadKind, RtpsTime, SampleAddress, UserDataLimits, UserDataWalker, GUIDPREFIX_UNKNOWN,
 };
 use serde::Serialize;
 
@@ -108,6 +125,11 @@ pub mod rules {
     /// A sample on a motion / feedback topic that could not be inspected.
     /// Medium, rate limited.
     pub const MOTION_UNDECODABLE_SAMPLE: &str = "robot.motion.undecodable_sample";
+    /// A writer on a profiled command channel announces (SEDP) a type name
+    /// other than the one the profile records for the channel
+    /// (`Profile::motion_types`), a type no decoder knows (its commands
+    /// cannot be inspected), or a feedback type. High.
+    pub const MOTION_COMMAND_TYPE_MISMATCH: &str = "robot.motion.command_type_mismatch";
     /// DATA to a motion / feedback reader from a writer never announced via
     /// SEDP. High.
     pub const MOTION_UNATTRIBUTED_SAMPLE: &str = "robot.motion.unattributed_sample";
@@ -120,7 +142,16 @@ pub mod rules {
     /// A decoded sample with an oddity that does not stop decoding (e.g.
     /// trailing bytes beyond XCDR end padding). Low.
     pub const MOTION_DECODE_ANOMALY: &str = "robot.motion.decode_anomaly";
+    /// A Unitree API request whose wire `api_id` (`int64`) is outside
+    /// `int32`: the robot dispatches it on the low 32 bits, so it executes
+    /// another id than the one written (an evasion attempt). High.
+    pub const MOTION_API_ID_OUT_OF_RANGE: &str = "robot.motion.api_id_out_of_range";
 }
+
+/// Most command channels whose previous joint frame is kept (for
+/// `MotionCommand::joint_position_step`); beyond it a new channel gets no
+/// step (the profile has far fewer motion channels in practice).
+pub const MAX_JOINT_FRAME_CHANNELS: usize = 256;
 
 /// Default [`MotionOptions::max_writers`] / `max_readers`.
 pub const DEFAULT_MAX_ENDPOINTS: usize = 4096;
@@ -160,6 +191,13 @@ pub struct MotionOptions {
     /// noted before [`rules::MOTION_UNATTRIBUTED_SAMPLE`] is raised (see the
     /// module docs, "Data before discovery is normal"). Zero = at once.
     pub unattributed_grace: Duration,
+    /// The robot's Unitree model, when known (`robodr-agentd`
+    /// `robot.robot_model`): Unitree API requests are then interpreted with
+    /// the model's API tables, so model-specific ids (G1
+    /// `SwitchToUserCtrl`, Go2 `FrontFlip`, ...) are classified instead of
+    /// `Unknown` (High). `None` (default): only ids that mean the same on
+    /// every model are interpreted.
+    pub robot_model: Option<UnitreeModel>,
 }
 
 impl Default for MotionOptions {
@@ -173,6 +211,7 @@ impl Default for MotionOptions {
             cdr_limits: Limits::default(),
             user_data: UserDataLimits::default(),
             unattributed_grace: DEFAULT_UNATTRIBUTED_GRACE,
+            robot_model: None,
         }
     }
 }
@@ -205,6 +244,26 @@ pub struct MotionSample {
     /// [`SampleAttribution::Bound`] means the writer GUID may be taken at
     /// its word; see [`SampleAttribution::is_trusted`].
     pub attribution: SampleAttribution,
+    /// The per-motor frame of a Unitree low-level joint command (`LowCmd_`,
+    /// `HandCmd_`, `MotorCmds_`, `MotorCmd_`), for a joint firewall
+    /// (`robodr-agentd` feeds it to `Firewall::check_joint`). `None` for
+    /// every other sample.
+    pub joint: Option<JointCommandSample>,
+}
+
+/// A decoded low-level joint command frame with the frame-level fields a
+/// joint firewall checks.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JointCommandSample {
+    /// Every slot on the wire, in slot order.
+    pub frame: JointCommandFrame,
+    /// The decoder's CRC verdict (`Some` for go / hg `LowCmd_`, `None` for
+    /// types without a CRC). Advisory: see `robodr_cdr::unitree::crc`.
+    pub crc_ok: Option<bool>,
+    /// `mode_pr` of an hg `LowCmd_` (ankle control mode), else `None`.
+    pub mode_pr: Option<u8>,
+    /// `mode_machine` of an hg `LowCmd_` (robot variant), else `None`.
+    pub mode_machine: Option<u8>,
 }
 
 /// How a decoded sample's source was judged against the participant
@@ -386,6 +445,8 @@ pub struct MotionTracker {
     /// Unannounced writers seen sending to a motion reader, in their grace
     /// window ([`MotionOptions::unattributed_grace`]).
     pending_unattributed: HashMap<Guid, PendingUnattributed>,
+    /// Previous joint frame per command channel (`joint_position_step`).
+    last_joint_frames: HashMap<String, JointCommandFrame>,
     stats: MotionStats,
 }
 
@@ -471,6 +532,7 @@ impl MotionTracker {
             readers: Table::new(opts.max_readers),
             motion_reader_entities: HashMap::new(),
             pending_unattributed: HashMap::new(),
+            last_joint_frames: HashMap::new(),
             stats: MotionStats::default(),
             opts,
         }
@@ -539,7 +601,15 @@ impl MotionTracker {
 
     /// Learn writer / reader GUIDs from the SEDP announcements of `report`
     /// (every reading, alternates included).
-    pub(crate) fn learn(&mut self, profile: &Profile, report: &DatagramReport) {
+    /// Returns the [`rules::MOTION_COMMAND_TYPE_MISMATCH`] findings of the
+    /// announcements (writers on profiled command channels only).
+    /// Each finding with the GUID prefix of the endpoint it is about.
+    pub(crate) fn learn(
+        &mut self,
+        profile: &Profile,
+        report: &DatagramReport,
+    ) -> Vec<(Deviation, GuidPrefix)> {
+        let mut found = Vec::new();
         for ep in &report.endpoints {
             let mut readings: Vec<(Guid, String, String)> = Vec::new();
             if let Some(g) = ep.guid {
@@ -552,6 +622,26 @@ impl MotionTracker {
             }
             for (guid, topic, type_name) in readings {
                 let motion = self.classify(profile, &topic);
+                if let (EndpointKind::Writer, Some((channel, Role::Command))) = (ep.kind, &motion) {
+                    if let Some(why) = self.command_type_problem(profile, channel, &type_name) {
+                        let mut prefix = [0u8; 12];
+                        prefix.copy_from_slice(&guid[..12]);
+                        found.push((
+                            Deviation::new(
+                                rules::MOTION_COMMAND_TYPE_MISMATCH,
+                                Severity::High,
+                                format!(
+                                "writer {} announces type {:?} on the profiled command channel \
+                                 {}: {why}",
+                                hex_guid(&guid),
+                                short(&type_name),
+                                short(channel)
+                            ),
+                            ),
+                            prefix,
+                        ));
+                    }
+                }
                 let reading = Reading {
                     topic,
                     type_name,
@@ -586,6 +676,31 @@ impl MotionTracker {
                     }
                 }
             }
+        }
+        found
+    }
+
+    /// Why an announced command type on `channel` is suspicious, if it is.
+    fn command_type_problem(
+        &self,
+        profile: &Profile,
+        channel: &str,
+        type_name: &str,
+    ) -> Option<String> {
+        if let Some(expected) = profile.motion_types.get(channel) {
+            if expected != type_name {
+                return Some(format!(
+                    "the profile records {:?} for this channel",
+                    short(expected)
+                ));
+            }
+        }
+        match self.registry.kind(type_name) {
+            None => Some("no decoder knows this type, so its commands cannot be inspected".into()),
+            Some(k) if k.role() != MotionRole::Command => {
+                Some("it is a feedback type, not a command type".into())
+            }
+            Some(_) => None,
         }
     }
 
@@ -774,6 +889,20 @@ impl MotionTracker {
                                 ),
                             ));
                         }
+                        DecodeAnomaly::ApiIdOutOfRange { .. } => {
+                            // Value-free detail (dedup key is rule + detail).
+                            self.stats.anomalies += 1;
+                            out.deviations.push(Deviation::new(
+                                rules::MOTION_API_ID_OUT_OF_RANGE,
+                                Severity::High,
+                                format!(
+                                    "API request on {} from writer {writer} carries an api_id \
+                                     outside int32; the robot dispatches its low 32 bits, so \
+                                     the call it executes is not the one written",
+                                    short(&channel)
+                                ),
+                            ));
+                        }
                         DecodeAnomaly::ExcessTrailingBytes { allowed, .. } => {
                             // Value-free detail: the dedup key is rule + detail.
                             self.stats.anomalies += 1;
@@ -791,11 +920,29 @@ impl MotionTracker {
                         }
                     }
                 }
-                let event = decoded.message.to_event(&EventContext {
-                    channel: &channel,
-                    writer_guid: Some(&writer),
-                    timestamp_ns: ctx.capture_ns,
-                });
+                let mut event = decoded.message.to_event_for_model(
+                    &EventContext {
+                        channel: &channel,
+                        writer_guid: Some(&writer),
+                        timestamp_ns: ctx.capture_ns,
+                    },
+                    self.opts.robot_model,
+                );
+                let mut joint = None;
+                if role == Role::Command {
+                    if let (RobotEvent::MotionCommand(c), Some(frame)) =
+                        (&mut event, decoded.message.joint_command_frame())
+                    {
+                        self.note_joint_frame(&channel, frame, c);
+                        let modes = decoded.message.unitree_frame_modes();
+                        joint = Some(JointCommandSample {
+                            frame,
+                            crc_ok: decoded.message.unitree_crc_ok(),
+                            mode_pr: modes.map(|m| m.0),
+                            mode_machine: modes.map(|m| m.1),
+                        });
+                    }
+                }
                 let attribution =
                     self.attribute(&mut out, binding, ctx, &s.address, role, &channel);
                 match role {
@@ -819,6 +966,7 @@ impl MotionTracker {
                     from_fragments: s.from_fragments,
                     trailing_bytes: decoded.trailing_bytes,
                     attribution,
+                    joint,
                 });
             }
         }
@@ -827,6 +975,22 @@ impl MotionTracker {
 }
 
 impl MotionTracker {
+    /// Fill `c.joint_position_step` from the previous frame on `channel`
+    /// and remember `frame` as the new previous one.
+    pub(crate) fn note_joint_frame(
+        &mut self,
+        channel: &str,
+        frame: JointCommandFrame,
+        c: &mut robodr_events::MotionCommand,
+    ) {
+        if let Some(prev) = self.last_joint_frames.get_mut(channel) {
+            c.joint_position_step = frame.max_position_step(prev);
+            *prev = frame;
+        } else if self.last_joint_frames.len() < MAX_JOINT_FRAME_CHANNELS {
+            self.last_joint_frames.insert(channel.to_string(), frame);
+        }
+    }
+
     /// Judge a decoded sample's source against the binding and raise the
     /// finding for anything but a bound source (same rule as the safety
     /// feed: only `allows_from == Some(true)` is trusted; unbound and

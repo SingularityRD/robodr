@@ -94,11 +94,21 @@
 //!   `{"socket_path": "/run/robodr-agentd/host-threats.sock"}`, the socket
 //!   the `robodr-threat-forward` Pulsar module writes Pulsar threats to (see
 //!   [`crate::host`]). Its path must differ from every other socket input.
+//! * `findings` (optional, [`FindingsSection`]): `{"topic":
+//!   "robodr.findings", "data_source": "robodr"}` (the defaults), the
+//!   deployment labels every finding carries (`ocsf.metadata.log_name`, the
+//!   spooled record's topic, the envelope `data_source`). The response
+//!   policy (`policy_path`) carries the robot's `morphology` (a humanoid
+//!   never gets an executable safe pause / safe state; see
+//!   `robodr-responder`).
 //! * `control_plane` (optional, [`crate::control::ControlPlaneSection`]; off
-//!   when absent): the SOC action-request API, `listen_tcp` (loopback unless
-//!   `allow_remote`) and / or `unix_socket`, `soc_keys` (Ed25519 public key
-//!   files, not group/other-writable, not this robot's own keys). Requests
-//!   are judged and recorded, never executed; see [`crate::control`].
+//!   when absent): the SOC action-request and evidence API
+//!   (`robodr-control-plane/v2`), `listen_tcp` (loopback, or any address
+//!   with `tls`: mutual TLS) and / or `unix_socket`, `state_dir` (private
+//!   persistent state), `soc_keys` (Ed25519 public key files, not
+//!   group/other-writable, not this robot's own keys), optional `evidence`.
+//!   Needs `finding_signing` (answers are signed). Requests are judged and
+//!   recorded, never executed; see [`crate::control`].
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -149,7 +159,10 @@ pub const SENSOR_KEYS: &[&str] = &[
     "binding",
     "motion",
     "profile_trust",
+    "unitree_legacy",
 ];
+/// Keys of `sensor.unitree_legacy` (Unitree legacy UDP, Go1 generation).
+pub const SENSOR_LEGACY_KEYS: &[&str] = &["enabled", "ports", "command_senders", "robot_addresses"];
 /// Keys of `sensor.capture`.
 pub const SENSOR_CAPTURE_KEYS: &[&str] = &[
     "enabled",
@@ -229,6 +242,14 @@ pub struct DaemonConfig {
     /// default) = no listener.
     #[serde(default)]
     pub control_plane: Option<crate::control::ControlPlaneSection>,
+    /// Findings topic and `data_source` (see [`FindingsSection`]).
+    #[serde(default)]
+    pub findings: FindingsSection,
+    /// executor v1: the link to `robodr-executor` (see
+    /// [`crate::executor_link`]); absent or `enabled: false` (the default)
+    /// = nothing is executed.
+    #[serde(default)]
+    pub executor: Option<crate::executor_link::ExecutorSection>,
 }
 
 /// `correlation`: the `robodr-correlate` engine over every finding the
@@ -283,9 +304,54 @@ pub struct RobotSection {
     /// [`resolve`] instead of a generic "unknown field".
     #[serde(default)]
     pub profile_version: Option<serde_json::Value>,
-    /// Kafka partition count of `robot-edr.findings`, if known.
+    /// Kafka partition count of the findings topic, if known.
     #[serde(default)]
     pub kafka_partitions: Option<u32>,
+    /// The robot's Unitree model (`robodr_cdr::UnitreeModel` name: `Go2`,
+    /// `Go2-W`, `B2`, `B2-W`, `A2`, `AS2`, `H1`, `H1-2`, `H2`, `G1`, `R1`,
+    /// `Go1`, ...; case, `-` and `_` ignored). Optional. When set, Unitree
+    /// API requests are interpreted with the model's API tables
+    /// (model-specific ids are classified instead of `Unknown`), and the
+    /// configuration is checked for consistency with it (see
+    /// [`check_robot_model`]).
+    #[serde(default)]
+    pub robot_model: Option<String>,
+}
+
+fn default_findings_topic() -> String {
+    robodr_ocsf::DEFAULT_TOPIC.into()
+}
+fn default_data_source() -> String {
+    robodr_ocsf::DEFAULT_DATA_SOURCE.into()
+}
+
+/// `findings` (optional): the deployment labels of the findings this robot
+/// emits (`robodr.findings` contract 2.x). Both default to the contract
+/// defaults, so a config without the section is unchanged.
+///
+/// ```json
+/// "findings": { "topic": "robodr.findings", "data_source": "robodr" }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FindingsSection {
+    /// Topic named in every finding (`ocsf.metadata.log_name`) and in its
+    /// spooled record; `[A-Za-z0-9._-]{1,249}`.
+    #[serde(default = "default_findings_topic")]
+    pub topic: String,
+    /// Envelope `data_source` (with `external_id` the SOC's dedup key);
+    /// `[a-z0-9][a-z0-9._-]{0,63}`.
+    #[serde(default = "default_data_source")]
+    pub data_source: String,
+}
+
+impl Default for FindingsSection {
+    fn default() -> Self {
+        Self {
+            topic: default_findings_topic(),
+            data_source: default_data_source(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -493,6 +559,14 @@ pub struct SpoolSection {
     /// Bound on `ready/` + `acked/` files (default 10000).
     #[serde(default = "default_spool_files")]
     pub max_files: u64,
+    /// Optional unix socket (created 0600) on which the daemon serves its
+    /// current status (the bytes of `status.json`) to every connection,
+    /// e.g. `/run/robodr-agentd/status.sock`. `robodr-deliverd` reads the
+    /// robot's safety state here and checks the peer with `SO_PEERCRED`
+    /// (review H1): unlike `status.json` in the spool, which the
+    /// exporters' user can replace, only this process can serve it.
+    #[serde(default)]
+    pub status_socket: Option<PathBuf>,
 }
 
 fn default_spool_bytes() -> u64 {
@@ -578,6 +652,16 @@ pub struct FirewallSection {
     /// Per channel: allowed writer GUIDs (default: every profiled participant).
     #[serde(default)]
     pub allow: BTreeMap<String, Vec<String>>,
+    /// A Motion Firewall JSON file (`robodr_firewall::FirewallConfig`, e.g.
+    /// `config/firewall.unitree-g1.example.json`) whose `joint_channels`
+    /// (low-level joint frames, Unitree `LowCmd`) and `platform`
+    /// (morphology, substitutes) are used. Its `channels` must be empty:
+    /// twist channels come from the profile and `max_angular` / `allow`.
+    /// Checked as written (a humanoid's unsafe substitutes are refused) and
+    /// then run **recording-only** like every firewall verdict of the
+    /// daemon.
+    #[serde(default)]
+    pub joint_config: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -680,6 +764,13 @@ pub struct Resolved {
     pub host_threats: Option<crate::host::HostThreatsSpec>,
     /// The validated control-plane API (listeners, SOC keys), if configured.
     pub control_plane: Option<crate::control::ControlPlaneSpec>,
+    /// executor v1: the enabled executor link (`None` = off).
+    pub executor: Option<crate::executor_link::ExecutorSpec>,
+    /// `firewall.joint_config`, parsed (its `platform` and
+    /// `joint_channels`).
+    pub firewall_joint: Option<robodr_firewall::FirewallConfig>,
+    /// `robot.robot_model`, resolved.
+    pub robot_model: Option<robodr_cdr::UnitreeModel>,
     /// Non-fatal warnings to log at start.
     pub warnings: Vec<String>,
 }
@@ -846,6 +937,9 @@ pub fn sensor_settings(v: &serde_json::Value) -> Result<(Settings, Vec<String>),
     if let Some(t) = v.get("profile_trust") {
         check_keys("sensor.profile_trust", t, SENSOR_TRUST_KEYS)?;
     }
+    if let Some(l) = v.get("unitree_legacy") {
+        check_keys("sensor.unitree_legacy", l, SENSOR_LEGACY_KEYS)?;
+    }
     let cfg: robodr_ros2_pipeline::Config =
         serde_json::from_value(v.clone()).map_err(|e| format!("sensor: {e}"))?;
     if let Some(p) = &cfg.capture.pcap_replay {
@@ -902,6 +996,18 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
             robodr_ros2_pipeline::sanitize(&config.robot.id)
         ));
     }
+    if !robodr_ocsf::validate::is_valid_topic(&config.findings.topic) {
+        return Err(format!(
+            "findings.topic {:?} must match [A-Za-z0-9._-]{{1,249}}",
+            robodr_ros2_pipeline::sanitize(&config.findings.topic)
+        ));
+    }
+    if !robodr_ocsf::validate::is_valid_data_source(&config.findings.data_source) {
+        return Err(format!(
+            "findings.data_source {:?} must match [a-z0-9][a-z0-9._-]{{0,63}}",
+            robodr_ros2_pipeline::sanitize(&config.findings.data_source)
+        ));
+    }
     require_abs("policy_path", &config.policy_path)?;
     require_abs("blackbox.dir", &config.blackbox.dir)?;
     require_abs("blackbox.key_file", &config.blackbox.key_file)?;
@@ -909,8 +1015,14 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
     if config.spool.max_bytes < 64 * 1024 {
         return Err("spool.max_bytes must be >= 65536".into());
     }
-    if config.spool.max_files == 0 {
-        return Err("spool.max_files must be >= 1".into());
+    // Review L10: a spool below 8 files would have no share kept for
+    // Critical findings (max_files / 8 == 0).
+    if config.spool.max_files < crate::spool::CRITICAL_RESERVE_DIVISOR {
+        return Err(format!(
+            "spool.max_files must be >= {} (1/{} of it is kept for Critical findings)",
+            crate::spool::CRITICAL_RESERVE_DIVISOR,
+            crate::spool::CRITICAL_RESERVE_DIVISOR
+        ));
     }
     check_daemon_dirs(&config, None, |p| Ok(resolve_path(p)))?;
     validate_daemon(&config.daemon)?;
@@ -919,6 +1031,21 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
     }
     let mut stdin_seen = false;
     let mut socket_paths: Vec<&Path> = Vec::new();
+    if let Some(p) = &config.spool.status_socket {
+        require_abs("spool.status_socket", p)?;
+        if p.file_name().is_none() || p.parent().is_none() {
+            return Err("spool.status_socket must name a file in a directory".into());
+        }
+        for (what, d) in [
+            ("spool.dir", &config.spool.dir),
+            ("blackbox.dir", &config.blackbox.dir),
+        ] {
+            if resolve_path(p).starts_with(resolve_path(d)) {
+                return Err(format!("spool.status_socket must not be inside {what}"));
+            }
+        }
+        socket_paths.push(p);
+    }
     for i in &config.event_inputs {
         match i {
             EventInputConfig::Stdin => {
@@ -937,7 +1064,10 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
                     ));
                 }
                 if socket_paths.contains(&path.as_path()) {
-                    return Err("event_inputs: a socket path is listed twice".into());
+                    return Err(
+                        "event_inputs: a socket path is listed twice (or is spool.status_socket)"
+                            .into(),
+                    );
                 }
                 socket_paths.push(path);
             }
@@ -989,6 +1119,55 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
             }
         }
     }
+    let robot_model = match &config.robot.robot_model {
+        None => None,
+        Some(name) => Some(robodr_cdr::UnitreeModel::from_name(name).ok_or_else(|| {
+            format!(
+                "robot.robot_model {:?} is not a known Unitree model (one of: {})",
+                robodr_ros2_pipeline::sanitize(name),
+                robodr_cdr::UnitreeModel::ALL
+                    .iter()
+                    .map(|m| m.info().name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?),
+    };
+    sensor.pipeline.motion.robot_model = robot_model;
+    let firewall_joint = match config
+        .firewall
+        .as_ref()
+        .and_then(|f| f.joint_config.as_ref())
+    {
+        None => None,
+        Some(p) => {
+            require_abs("firewall.joint_config", p)?;
+            let text = read_capped(p, MAX_CONFIG_BYTES)?;
+            let fc = robodr_firewall::FirewallConfig::from_json(&text)
+                .map_err(|e| format!("{}: {e}", p.display()))?;
+            if !fc.channels.is_empty() {
+                return Err(format!(
+                    "{}: firewall.joint_config may only define joint_channels and platform; \
+                     twist channels come from the profile (firewall.max_angular / allow)",
+                    p.display()
+                ));
+            }
+            if fc.joint_channels.is_empty() {
+                return Err(format!(
+                    "{}: firewall.joint_config defines no joint_channels",
+                    p.display()
+                ));
+            }
+            Some(fc)
+        }
+    };
+    check_robot_model(
+        robot_model,
+        &policy,
+        firewall_joint.as_ref(),
+        &sensor,
+        &mut warnings,
+    )?;
     let KeyMaterial {
         key,
         key_id: file_key_id,
@@ -1111,6 +1290,16 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
             }
         }),
     };
+    if let (Some(fc), Some(fw)) = (&firewall_joint, &config.firewall) {
+        check_joint_firewall(fc, fw, &t.loaded.profile, &mut warnings)?;
+    }
+    check_profile_channels(
+        robot_model,
+        &t.loaded.profile,
+        config.firewall.as_ref(),
+        firewall_joint.as_ref(),
+        &mut warnings,
+    )?;
     let correlation = correlation_rules(&config.correlation, &mut warnings)?;
     let host_threats = match &config.host_threats {
         None => None,
@@ -1190,18 +1379,28 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
                     );
                 }
             }
-            for p in spec.unix.iter().chain(c.soc_keys.iter()) {
+            for p in c.paths() {
                 for (what, d) in [
                     ("spool.dir", &config.spool.dir),
                     ("blackbox.dir", &config.blackbox.dir),
                 ] {
-                    if resolve_path(p).starts_with(resolve_path(d)) {
+                    if resolve_path(p).starts_with(resolve_path(d))
+                        || (p == c.state_dir && resolve_path(d).starts_with(resolve_path(p)))
+                    {
                         return Err(format!(
-                            "control_plane: {} must not be inside {what}",
+                            "control_plane: {} must not be inside (or contain) {what}",
                             sanitize_path(&p.display().to_string())
                         ));
                     }
                 }
+            }
+            if finding_key.is_none() {
+                return Err(
+                    "control_plane needs finding_signing: in robodr-control-plane/v2 every \
+                     answer to an authenticated request (and every evidence manifest) is signed \
+                     with the finding key"
+                        .into(),
+                );
             }
             if !policy.oem_validated {
                 warnings.push(
@@ -1210,14 +1409,39 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
                         .into(),
                 );
             }
-            if spec.tcp.is_some_and(|a| !a.ip().is_loopback()) {
-                warnings.push(
-                    "control_plane.listen_tcp is not a loopback address: requests are signed but \
-                     travel in clear text, and answers are only signed with finding_signing"
-                        .into(),
-                );
+            if spec.tcp.is_some_and(|a| !a.ip().is_loopback()) && spec.tls.is_some() {
+                warnings.push(format!(
+                    "control_plane.listen_tcp {} is reachable off the robot (mutual TLS): the \
+                     unit's IPAddressDeny=any needs an IPAddressAllow= drop-in for the SOC \
+                     network (packaging/systemd/robodr-agentd.service.d/30-control-plane.conf.example)",
+                    spec.tcp.map(|a| a.to_string()).unwrap_or_default()
+                ));
             }
             Some(spec)
+        }
+    };
+    // --- executor v1 -------------------------------------------------------
+    let executor = match &config.executor {
+        None => None,
+        Some(e) => {
+            let spec = e.resolve()?;
+            if let Some(x) = &spec {
+                if !policy.oem_validated {
+                    warnings.push(
+                        "executor: the response policy is not OEM-validated, so the executor \
+                         refuses every action (observe_mode)"
+                            .into(),
+                    );
+                }
+                if control_plane.is_none() && !x.planner_orders {
+                    warnings.push(
+                        "executor: enabled, but without control_plane and with planner_orders \
+                         false nothing is ever handed to it"
+                            .into(),
+                    );
+                }
+            }
+            spec
         }
     };
     match &config.blackbox.head_anchor {
@@ -1297,6 +1521,24 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
                 .unwrap_or_else(|| Err("not a remote anchor".into()))?;
         }
     }
+    if let Some(p) = &config.spool.status_socket {
+        let clash = safety_feed
+            .as_ref()
+            .and_then(|f| f.socket.as_ref())
+            .is_some_and(|s| s.path == *p)
+            || host_threats.as_ref().is_some_and(|h| h.path == *p)
+            || control_plane
+                .as_ref()
+                .and_then(|c| c.unix.as_ref())
+                .is_some_and(|u| u == p);
+        if clash {
+            return Err(
+                "spool.status_socket is also a safety_feed, host_threats or control_plane socket \
+                 path"
+                    .into(),
+            );
+        }
+    }
     Ok(Resolved {
         config,
         sensor,
@@ -1317,8 +1559,322 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         finding_key,
         host_threats,
         control_plane,
+        executor,
+        firewall_joint,
+        robot_model,
         warnings,
     })
+}
+
+/// The responder morphology a firewall platform morphology means.
+fn firewall_morphology(m: robodr_firewall::Morphology) -> robodr_responder::Morphology {
+    use robodr_firewall::Morphology as F;
+    use robodr_responder::Morphology as R;
+    match m {
+        F::Humanoid => R::Humanoid,
+        F::Quadruped => R::Quadruped,
+        F::Wheeled => R::WheeledMobile,
+        F::Arm => R::Arm,
+        F::Other => R::Other,
+    }
+}
+
+/// Consistency of `robot.robot_model` with the rest of the configuration.
+///
+/// * **Morphology (fail closed).** A humanoid model (G1, H1, H1-2, H2, R1)
+///   needs a response policy whose `morphology` is `humanoid` (or left
+///   unspecified, which the responder treats as humanoid) and, with a
+///   joint firewall, a `humanoid` firewall platform: anything else would
+///   allow a de-energising response (safe pause, damping substitute) that
+///   makes the robot fall, so it is a configuration error. A legged
+///   quadruped (Go2, Go2-W, B2, B2-W, A2, AS2, Go1, ...) balances actively
+///   too: a policy or firewall morphology other than `quadruped` /
+///   `humanoid` / unspecified is an error; `humanoid` is accepted (more
+///   conservative) with a warning.
+/// * **Low-level layout.** A joint firewall channel `/lowcmd`, `/arm_sdk`
+///   or `/user_lowcmd` must have as many motor slots as the model's
+///   low-level message (`unitree_go` 20, `unitree_hg` 35).
+/// * **Legacy UDP.** `sensor.unitree_legacy` on a DDS-generation model (or
+///   a legacy model without it) is a warning.
+/// * **Without a model (fail closed).** A joint firewall channel with 35
+///   motor slots is a `unitree_hg` low-level message, and every `unitree_hg`
+///   model is a humanoid (`robodr_cdr::unitree::model`): the firewall
+///   platform must then be `humanoid` and the policy `humanoid` or
+///   unspecified, model or not.
+pub fn check_robot_model(
+    model: Option<robodr_cdr::UnitreeModel>,
+    policy: &ResponsePolicy,
+    joint: Option<&robodr_firewall::FirewallConfig>,
+    sensor: &Settings,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    use robodr_cdr::unitree::{Generation, Morphology as M};
+    use robodr_responder::Morphology as R;
+    let fw_morph = joint.map(|j| firewall_morphology(j.platform.morphology));
+    if let Some(fm) = fw_morph {
+        let pm = policy.morphology;
+        if pm != R::Unspecified && fm != pm {
+            return Err(format!(
+                "firewall.joint_config platform morphology {fm:?} contradicts the response \
+                 policy's morphology {pm:?}"
+            ));
+        }
+    }
+    if let Some(j) = joint {
+        let hg = robodr_cdr::unitree::MOTOR_SLOTS_HG;
+        if let Some((ch, _)) = j.joint_channels.iter().find(|(_, s)| s.motors.len() == hg) {
+            let pm = policy.morphology;
+            let fm = fw_morph.unwrap_or(R::Unspecified);
+            if fm != R::Humanoid || !matches!(pm, R::Humanoid | R::Unspecified) {
+                return Err(format!(
+                    "firewall.joint_config channel {ch:?} has {hg} motor slots, the unitree_hg \
+                     low-level layout, and every unitree_hg robot is a humanoid (falls when \
+                     de-energised); the firewall platform morphology is {fm:?} and the response \
+                     policy's {pm:?}: set both to humanoid"
+                ));
+            }
+        }
+    }
+    let Some(model) = model else {
+        return Ok(());
+    };
+    let info = model.info();
+    let name = info.name;
+    let checks = [
+        ("response policy", Some(policy.morphology)),
+        ("firewall.joint_config platform", fw_morph),
+    ];
+    for (what, m) in checks {
+        let Some(m) = m else { continue };
+        match (info.morphology, m) {
+            (_, R::Unspecified) => {}
+            (M::Humanoid, R::Humanoid) => {}
+            (M::Humanoid, other) => {
+                return Err(format!(
+                    "robot.robot_model {name} is a humanoid, but the {what} morphology is \
+                     {other:?}: a humanoid falls when de-energised; set morphology humanoid"
+                ))
+            }
+            (M::Quadruped | M::WheeledQuadruped, R::Quadruped) => {}
+            (M::Quadruped | M::WheeledQuadruped, R::Humanoid) => warnings.push(format!(
+                "robot.robot_model {name} is a legged quadruped, but the {what} morphology is \
+                 humanoid (more conservative than needed)"
+            )),
+            (M::Quadruped | M::WheeledQuadruped, other) => {
+                return Err(format!(
+                    "robot.robot_model {name} is a legged quadruped (it balances actively), but \
+                     the {what} morphology is {other:?}; set morphology quadruped"
+                ))
+            }
+        }
+    }
+    if let (Some(j), Some(slots)) = (joint, info.motor_slots) {
+        for (ch, spec) in &j.joint_channels {
+            let low = matches!(ch.as_str(), "/lowcmd" | "/arm_sdk" | "/user_lowcmd");
+            if low && info.generation == Generation::Sdk2Dds && spec.motors.len() != slots {
+                return Err(format!(
+                    "firewall.joint_config channel {ch:?} has {} motor slots, but the \
+                     {name}'s low-level message has {slots}",
+                    spec.motors.len()
+                ));
+            }
+        }
+    }
+    let legacy = sensor.pipeline.legacy.enabled;
+    match (info.generation, legacy) {
+        (Generation::Sdk2Dds, true) => warnings.push(format!(
+            "sensor.unitree_legacy is enabled, but robot.robot_model {name} speaks DDS \
+             (unitree_sdk2), not the legacy UDP protocol"
+        )),
+        (Generation::LegacyUdp, false) => warnings.push(format!(
+            "robot.robot_model {name} speaks the legacy UDP protocol (unitree_legged_sdk); \
+             enable sensor.unitree_legacy to inspect its commands"
+        )),
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Unitree channels whose meaning depends on the robot model (low-level
+/// joint commands, robot API requests).
+fn model_dependent_channel(ch: &str) -> bool {
+    matches!(ch, "/lowcmd" | "/arm_sdk" | "/user_lowcmd") || ch.starts_with("/api/")
+}
+
+/// The profile's channels against the model and the firewall (needs the
+/// loaded profile, so it runs after [`check_robot_model`]):
+///
+/// * a profile with Unitree low-level or API channels and no
+///   `robot.robot_model` is a warning (API ids and slot layouts are then
+///   interpreted without the model);
+/// * a joint firewall channel whose profile-recorded type
+///   (`motion_types`) is a Unitree `LowCmd_` must have that layout's slot
+///   count (`unitree_go` 20, `unitree_hg` 35), whatever its name, and the
+///   layout must be the model's;
+/// * a legacy UDP channel (`/unitree_legacy/...`) is refused as a joint
+///   firewall channel: legacy frames carry no writer identity the firewall
+///   could authorise, so every frame would be rejected as an unknown
+///   source before its joints were checked (the sensor still evaluates
+///   them against the profile envelope and checks the sender address);
+/// * with a `firewall` section, every twist / joint-velocity channel must
+///   have a kind the firewall can tell ([`robodr_agent::channel_kind`]).
+pub fn check_profile_channels(
+    model: Option<robodr_cdr::UnitreeModel>,
+    profile: &robodr_events::profile::Profile,
+    firewall: Option<&FirewallSection>,
+    joint: Option<&robodr_firewall::FirewallConfig>,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    use robodr_cdr::unitree::{IdlFamily, MOTOR_SLOTS_GO, MOTOR_SLOTS_HG};
+    use robodr_cdr::MessageKind;
+    if model.is_none() {
+        let mut chans: Vec<&str> = profile
+            .motion_envelopes
+            .keys()
+            .chain(profile.writer_topics.iter())
+            .map(String::as_str)
+            .filter(|c| model_dependent_channel(c))
+            .collect();
+        // Low-level channels first, then the API services.
+        chans.sort_unstable_by_key(|c| (c.starts_with("/api/"), *c));
+        chans.dedup();
+        if !chans.is_empty() {
+            let shown: Vec<&str> = chans.iter().take(6).copied().collect();
+            warnings.push(format!(
+                "the profile has Unitree channels ({}{}) but robot.robot_model is not set: API \
+                 call ids and low-level layouts are interpreted without the model, and the \
+                 morphology is only checked from the slot counts; set robot.robot_model",
+                shown.join(", "),
+                if chans.len() > shown.len() {
+                    ", ..."
+                } else {
+                    ""
+                }
+            ));
+        }
+    }
+    if let Some(j) = joint {
+        for (ch, spec) in &j.joint_channels {
+            if ch.starts_with(robodr_cdr::unitree_legacy::channels::PREFIX) {
+                return Err(format!(
+                    "firewall.joint_config channel {ch:?} is a Unitree legacy UDP channel: \
+                     legacy frames carry no writer identity the joint firewall could \
+                     authorise (the sender is a UDP address), so every frame would be rejected \
+                     as an unknown source before its joints were checked; leave it out of \
+                     joint_config (the sensor still checks the sender against \
+                     unitree_legacy.command_senders and the frame against the profile envelope)"
+                ));
+            }
+            let Some(t) = profile.motion_types.get(ch) else {
+                continue;
+            };
+            let layout = match MessageKind::from_type_name(t) {
+                Some(MessageKind::UnitreeGoLowCmd) => (IdlFamily::Go, MOTOR_SLOTS_GO),
+                Some(MessageKind::UnitreeHgLowCmd) => (IdlFamily::Hg, MOTOR_SLOTS_HG),
+                _ => continue,
+            };
+            if spec.motors.len() != layout.1 {
+                return Err(format!(
+                    "firewall.joint_config channel {ch:?} has {} motor slots, but the profile \
+                     records its type as {t} ({} motor slots)",
+                    spec.motors.len(),
+                    layout.1
+                ));
+            }
+            if let Some(m) = model {
+                let info = m.info();
+                if info.idl.is_some_and(|idl| idl != layout.0) {
+                    return Err(format!(
+                        "firewall.joint_config channel {ch:?}: the profile records its type as \
+                         {t}, which is not the low-level layout of robot.robot_model {}",
+                        info.name
+                    ));
+                }
+            }
+        }
+    }
+    if firewall.is_some() {
+        let legacy: Vec<&String> = profile
+            .motion_envelopes
+            .keys()
+            .filter(|c| c.starts_with(robodr_cdr::unitree_legacy::channels::PREFIX))
+            .collect();
+        if !legacy.is_empty() {
+            warnings.push(format!(
+                "firewall: the profile's Unitree legacy channels ({}) carry no writer identity, \
+                 so the firewall records every legacy command as from an unknown source; the \
+                 sensor's sender check (unitree_legacy.command_senders) is what authorises them",
+                legacy
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        for (ch, env) in &profile.motion_envelopes {
+            if joint.is_some_and(|j| j.joint_channels.contains_key(ch)) {
+                continue;
+            }
+            let (_, w) = robodr_agent::channel_kind(profile, ch, env)?;
+            warnings.extend(w);
+        }
+    }
+    Ok(())
+}
+
+/// Check `firewall.joint_config` against the profile as the daemon will
+/// run it, **with the platform as written** (so a humanoid configured with
+/// a damping / fail-open substitute is refused even though the daemon only
+/// records verdicts: the same file must be safe for the in-path gateway).
+fn check_joint_firewall(
+    fc: &robodr_firewall::FirewallConfig,
+    fw: &FirewallSection,
+    profile: &robodr_events::profile::Profile,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    if profile.validate().is_err() {
+        // The daemon disables the firewall for an invalid profile.
+        return Ok(());
+    }
+    // The joint part on its own: the twist part (max_angular for every twist
+    // channel) is checked when the daemon starts, as without a joint file.
+    for ch in fw.max_angular.keys() {
+        if fc.joint_channels.contains_key(ch) {
+            return Err(format!(
+                "firewall.max_angular names {ch:?}, a low-level joint channel of \
+                 firewall.joint_config"
+            ));
+        }
+    }
+    let mut joint_profile = profile.clone();
+    joint_profile.retain_motion_channels(|k| fc.joint_channels.contains_key(k));
+    for ch in fc.joint_channels.keys() {
+        if !profile.motion_envelopes.contains_key(ch) {
+            return Err(format!(
+                "firewall.joint_config channel {ch:?} is not a profiled motion channel \
+                 (motion_envelopes)"
+            ));
+        }
+        if ch == "/arm_sdk" {
+            warnings.push(
+                "firewall.joint_config channel \"/arm_sdk\": the arm SDK sends mode 0 on every \
+                 slot and still moves the arms; the joint firewall rejects a mode-0 slot with \
+                 gains (joint_mode_inconsistent), so every arm-SDK frame becomes a would-have \
+                 rejection. Leave \"/arm_sdk\" out of firewall.joint_config: the profile \
+                 envelope still checks torque, kp and position step on every slot of every \
+                 arm-SDK frame (robot.motion.joint_over_envelope)"
+                    .into(),
+            );
+        }
+    }
+    robodr_firewall::Policy::compile_with_joints(
+        &joint_profile,
+        fc.platform,
+        &BTreeMap::new(),
+        &fc.joint_channels,
+    )
+    .map_err(|e| format!("firewall.joint_config: {e}"))?;
+    Ok(())
 }
 
 /// Build the correlation rule set from the `correlation` section: the
@@ -1415,14 +1971,10 @@ pub fn read_boot_id() -> String {
         .unwrap_or_else(|| "unknown-boot".into())
 }
 
-extern "C" {
-    fn geteuid() -> u32;
-}
-
-/// The effective uid of this process.
+/// The effective uid of this process (the one FFI declaration lives in
+/// `robodr_blackbox::keys`; agentd itself needs no `unsafe` for it).
 pub fn effective_uid() -> u32 {
-    // SAFETY: geteuid takes no arguments, cannot fail and touches no memory.
-    unsafe { geteuid() }
+    robodr_blackbox::keys::effective_uid()
 }
 
 /// [`read_key_material`] without the key id.
@@ -1808,7 +2360,9 @@ mod tests {
         let oom: i32 = value("OOMScoreAdjust=").unwrap().parse().unwrap();
         assert!(oom >= 0, "OOMScoreAdjust={oom}");
         assert!(value("MemoryMax=").is_some());
-        // ... and tmpfiles.d creates the state directory for User=robodr.
+        // ... and tmpfiles.d creates the state directory for agentd's own
+        // user (review H1: not the exporters' robodr).
+        assert_eq!(value("User="), Some("robodr-agentd"));
         let tmpfiles = std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/tmpfiles.d/robodr.conf"),
         )
@@ -1819,9 +2373,9 @@ mod tests {
                 f.len() >= 5
                     && f[0] == "d"
                     && Path::new(f[1]) == state.parent().unwrap()
-                    && f[3] == "robodr"
+                    && f[3] == "robodr-agentd"
             }),
-            "tmpfiles.d does not create {:?} for robodr",
+            "tmpfiles.d does not create {:?} for robodr-agentd",
             state.parent()
         );
         // Wave-6 keys: revocation / trust roots (full example only), safety
@@ -1863,6 +2417,45 @@ mod tests {
         assert!(dropin
             .lines()
             .any(|l| l.starts_with("LoadCredential=finding.key:/etc/robodr/keys/")));
+        // The control plane (full example): its state directory is writable
+        // through the shipped drop-in and created private by tmpfiles.d, and
+        // its TLS key arrives as that drop-in's credential.
+        let cp = c.control_plane.as_ref().expect("control_plane");
+        let cpdrop =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                "../../packaging/systemd/robodr-agentd.service.d/30-control-plane.conf.example",
+            ))
+            .unwrap();
+        let rw: Vec<&str> = cpdrop
+            .lines()
+            .filter_map(|l| l.strip_prefix("ReadWritePaths="))
+            .flat_map(str::split_whitespace)
+            .collect();
+        assert!(rw.iter().any(|p| Path::new(p) == cp.state_dir), "{rw:?}");
+        assert!(
+            tmpfiles.lines().any(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                f.len() >= 5
+                    && f[0] == "d"
+                    && Path::new(f[1]) == cp.state_dir
+                    && f[2] == "0700"
+                    && f[3] == "robodr-agentd"
+            }),
+            "tmpfiles.d does not create {:?} 0700 for robodr-agentd",
+            cp.state_dir
+        );
+        let tls = cp.tls.as_ref().expect("tls");
+        let cred = tls
+            .key_file
+            .strip_prefix("/run/credentials/robodr-agentd.service/")
+            .expect("the TLS key is a credential")
+            .to_str()
+            .unwrap();
+        assert!(cpdrop
+            .lines()
+            .any(|l| l.starts_with(&format!("LoadCredential={cred}:/etc/robodr/keys/"))));
+        assert!(cpdrop.lines().any(|l| l.starts_with("IPAddressAllow=")));
+        assert!(cp.evidence.is_some());
     }
 
     #[test]
@@ -1933,6 +2526,35 @@ mod tests {
             },
         ] {
             assert!(validate_daemon(&d).is_err(), "{d:?}");
+        }
+    }
+
+    #[test]
+    fn findings_section_defaults_and_validation() {
+        let base = r#"{"robot":{"id":"r1","site":"s"},"sensor":{},"policy_path":"/p",
+            "blackbox":{"dir":"/b","key_file":"/k"},"spool":{"dir":"/s"}}"#;
+        let c = parse(base).unwrap();
+        assert_eq!(c.findings, FindingsSection::default());
+        assert_eq!(c.findings.topic, "robodr.findings");
+        assert_eq!(c.findings.data_source, "robodr");
+        let with = |f: &str| {
+            base.replace(
+                r#""spool":{"dir":"/s"}"#,
+                &format!(r#""spool":{{"dir":"/s"}},"findings":{f}"#),
+            )
+        };
+        let c = parse(&with(r#"{"topic":"site-b.findings"}"#)).unwrap();
+        assert_eq!(c.findings.topic, "site-b.findings");
+        assert_eq!(c.findings.data_source, "robodr");
+        assert!(parse(&with(r#"{"topc":"x"}"#)).is_err(), "unknown key");
+        for (bad, what) in [
+            (r#"{"topic":"a b"}"#, "findings.topic"),
+            (r#"{"topic":""}"#, "findings.topic"),
+            (r#"{"data_source":"RoboDR"}"#, "findings.data_source"),
+            (r#"{"data_source":"kafka:x"}"#, "findings.data_source"),
+        ] {
+            let e = resolve(parse(&with(bad)).unwrap()).err().unwrap();
+            assert!(e.contains(what), "{bad}: {e}");
         }
     }
 

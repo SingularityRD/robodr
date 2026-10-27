@@ -4,6 +4,9 @@
 //! per-entry I/O error (listed in the report; the run went on),
 //! 1 error, 2 usage.
 
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+
 use robodr_diode::cli;
 use robodr_diode::unpack::{ImportConfig, Importer};
 use std::path::{Path, PathBuf};
@@ -14,7 +17,9 @@ usage: robodr-diode-unpack --inbox DIR --out DIR --quarantine DIR \\
          --processed DIR --state FILE --keyring FILE \\
          [--bundle-key UNIT:PUBLIC_KEY_FILE]... [--allow-hmac] [--partitions N] \\
          [--accept-gap UNIT:SEQ]... [--max-accept-gap N] [--max-batch-bytes N] \\
-         [--held-max-age-s N] [--in-transit-max-age-s N]
+         [--held-max-age-s N] [--in-transit-max-age-s N] \\
+         [--upgrade-data-source LABEL] [--upgrade-topic TOPIC]
+       robodr-diode-unpack --version
 
 Keyring file: one `<unit_id> <public-key-file>` per line (# comments; the
 older `<unit_id> <key_id> <key-file>` also works, the id must match the
@@ -36,7 +41,12 @@ the run.
 (recorded in the state; the skipped batches will then be refused); at most
 --max-accept-gap (default 100000) batches may be skipped.
 Held batches older than --held-max-age-s (default 30 days) and dot-entries
-older than --in-transit-max-age-s (default 24 h) are quarantined; 0 disables.";
+older than --in-transit-max-age-s (default 24 h) are quarantined; 0 disables.
+Contract 1.x batches (published before an upgrade) are authenticated and
+chained like any batch; their findings are upgraded to contract 2.0 with
+--upgrade-data-source (default robodr) and --upgrade-topic (default
+robodr.findings). An intact 1.x batch whose findings cannot be upgraded is
+quarantined (legacy_not_convertible) and the unit's chain moves on past it.";
 
 const FLAGS: &[&str] = &[
     "inbox",
@@ -52,12 +62,25 @@ const FLAGS: &[&str] = &[
     "max-batch-bytes",
     "held-max-age-s",
     "in-transit-max-age-s",
+    "upgrade-data-source",
+    "upgrade-topic",
 ];
 
 const SWITCHES: &[&str] = &["allow-hmac"];
 
 fn main() -> ExitCode {
-    let args = match cli::argv().and_then(|v| cli::parse_args_with_switches(v, FLAGS, SWITCHES)) {
+    let argv = match cli::argv() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    if cli::is_version_request(&argv) {
+        println!("robodr-diode-unpack {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+    let args = match cli::parse_args_with_switches(argv, FLAGS, SWITCHES) {
         Ok(a) => a,
         Err(e) if e == "help" => {
             println!("{USAGE}");
@@ -105,6 +128,12 @@ fn run(args: &cli::Args) -> Result<bool, String> {
     }
     if let Some(s) = args.num::<u64>("in-transit-max-age-s")? {
         cfg.in_transit_max_age_ms = (s > 0).then(|| s.saturating_mul(1000));
+    }
+    if let Some(l) = args.one("upgrade-data-source")? {
+        cfg.upgrade_data_source = l.into();
+    }
+    if let Some(t) = args.one("upgrade-topic")? {
+        cfg.upgrade_topic = t.into();
     }
     let mut importer = Importer::open(cfg, keyring).map_err(|e| e.to_string())?;
     for bk in args.all("bundle-key") {

@@ -68,10 +68,33 @@
 //! The RTPS parser and this pipeline have only been exercised on synthetic
 //! datagrams, not on captures from real DDS stacks yet.
 
+// S10: `unsafe` is denied crate-wide; each item that needs it (FFI to libc
+// symbols std already links) carries a local `#[allow(unsafe_code)]` and a
+// `// SAFETY:` comment on every block.
+#![deny(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+#![warn(clippy::undocumented_unsafe_blocks)]
+// S10 (R9): release builds use `panic = "abort"`, so any panic kills the
+// daemon (systemd restarts it; docs/OPERATIONS.md, "Crashes and restarts").
+// Non-test code has no unwrap / expect / panic!-family call; slice indexing
+// and arithmetic are left to review and fuzzing (fuzz/README.md).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
+
 pub mod binding;
 pub mod config;
 pub mod dedup;
 pub mod identity;
+pub mod legacy;
 pub mod motion;
 pub mod pipeline;
 pub mod profile_trust;
@@ -81,13 +104,15 @@ pub mod socket;
 pub mod source;
 pub mod watch;
 
-pub use binding::{BindingOptions, BindingStats, BindingTable, Ingress};
+pub use binding::{BindingOptions, BindingStats, BindingTable, Ingress, QuarantineTarget, Rank};
 pub use config::{
     BindingConfig, CaptureConfig, CaptureInput, CaptureSettings, Config, Settings, SpdpSettings,
+    UnitreeLegacyConfig,
 };
 pub use dedup::DedupSet;
 pub use identity::{IdentityResolver, IdentityStats, NodeEvidence, Resolution};
-pub use motion::{MotionOptions, MotionSample, MotionStats, SampleAttribution};
+pub use legacy::{LegacyOptions, LegacyStats};
+pub use motion::{JointCommandSample, MotionOptions, MotionSample, MotionStats, SampleAttribution};
 pub use pipeline::{
     load_profile, rules, Finding, LoadedProfile, Pipeline, PipelineOptions, PipelineStats,
     ProcessOutput, ProfileStatus, ThreatExtra, OBSERVE_ONLY_TAG,
@@ -97,8 +122,8 @@ pub use profile_trust::{
 };
 pub use sanitize::{sanitize, MAX_TEXT_CHARS};
 pub use source::{
-    CaptureDatagramSource, CaptureHealth, Datagram, DatagramSource, MergedDatagramSource,
-    SharedHealth, VecDatagramSource,
+    CaptureDatagramSource, CaptureHealth, Datagram, DatagramSource, LegacyUdp,
+    MergedDatagramSource, SharedHealth, VecDatagramSource,
 };
 
 // Re-exported so the Pulsar glue needs no direct dependency on these crates.

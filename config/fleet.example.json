@@ -1,0 +1,18 @@
+{
+  "format": "robodr-fleet-config/v1",
+  "state_dir": "/var/lib/robodr/fleet",
+  "agentd_config": "/etc/robodr/agentd.json",
+  "soc": {
+    "url": "https://soc.example.org/api",
+    "ca_bundle": "/etc/robodr/uplink-ca.pem",
+    "spki_sha256": [],
+    "keys": ["/etc/robodr/fleet-soc.pub"],
+    "approval_keys": ["/etc/robodr/fleet-approval.pub"]
+  },
+  "workspace": null,
+  "keys": {
+    "uplink": "/etc/robodr/keys/uplink.key",
+    "finding": "/etc/robodr/keys/agentd-finding.key",
+    "blackbox": "/etc/robodr/keys/agentd-blackbox.key"
+  }
+}

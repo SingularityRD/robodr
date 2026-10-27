@@ -498,7 +498,7 @@ mod tests {
             }],
             topics: vec![TopicMeta {
                 error_code: 0,
-                name: "robot-edr.findings".into(),
+                name: "robodr.findings".into(),
                 partitions: vec![
                     PartitionMeta {
                         error_code: 0,

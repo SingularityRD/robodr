@@ -87,8 +87,9 @@ pub const PROFILE_KEYS: [&str; 9] = [
     "raw_dds_topics",
 ];
 /// Optional top-level keys (`metadata` is written by `lock`;
-/// `participant_identities` by `learn`, omitted when empty).
-pub const OPTIONAL_PROFILE_KEYS: [&str; 2] = ["metadata", "participant_identities"];
+/// `participant_identities` and `motion_types` by `learn`, omitted when
+/// empty).
+pub const OPTIONAL_PROFILE_KEYS: [&str; 3] = ["metadata", "participant_identities", "motion_types"];
 /// Keys of one `participant_identities` entry; `ips` and `vendor` are
 /// required, the rest optional.
 pub const IDENTITY_KEYS: [&str; 5] = ["ips", "vendor", "enclave", "nodes", "max_instances"];
@@ -107,13 +108,16 @@ pub const METADATA_KEYS: [&str; 7] = [
 pub const OPTIONAL_METADATA_KEYS: [&str; 1] = ["attestation"];
 /// Keys of one envelope object; both must be present.
 pub const ENVELOPE_KEYS: [&str; 2] = ["max_linear_speed", "max_joint_speed"];
-/// Optional per-axis limit keys of an envelope (number or null when
-/// present). Absent = `None`; `Envelope` does not serialise them when
+/// Optional per-axis and joint-term limit keys of an envelope (number or
+/// null when present). Absent = `None`; `Envelope` does not serialise them when
 /// `None`, so files written before they existed are byte-identical.
-pub const OPTIONAL_ENVELOPE_LIMIT_KEYS: [&str; 3] = [
+pub const OPTIONAL_ENVELOPE_LIMIT_KEYS: [&str; 6] = [
     "max_lateral_speed",
     "max_vertical_speed",
     "max_roll_pitch_rate",
+    "max_joint_torque",
+    "max_joint_kp",
+    "max_joint_position_step",
 ];
 /// Optional boolean key of an envelope (absent = `false`).
 pub const ENVELOPE_HOLONOMIC_KEY: &str = "holonomic";
@@ -355,6 +359,20 @@ pub fn parse_profile_text(text: &str) -> Result<Profile, ProfileFileError> {
             }
         }
     }
+    if let Some(t) = obj.get("motion_types") {
+        let t = t.as_object().ok_or_else(|| ProfileFileError::BadEnvelope {
+            channel: String::new(),
+            detail: "motion_types is not an object".into(),
+        })?;
+        for (channel, v) in t {
+            if !v.is_string() {
+                return Err(ProfileFileError::BadEnvelope {
+                    channel: channel.clone(),
+                    detail: "motion_types value is not a string".into(),
+                });
+            }
+        }
+    }
     if let Some(ids) = obj.get("participant_identities") {
         let ids = ids
             .as_object()
@@ -442,9 +460,13 @@ pub fn parse_profile_text(text: &str) -> Result<Profile, ProfileFileError> {
 pub fn sealed_text(profile: &Profile) -> Result<String, serde_json::Error> {
     let body = to_json(profile)?;
     let digest = sha256_hex(body.as_bytes());
-    let rest = body
-        .strip_prefix("{\n")
-        .expect("serde_json pretty output of a struct starts with \"{\\n\"");
+    // serde_json's pretty output of a struct always starts with "{\n";
+    // refuse rather than abort if that ever changes.
+    let rest = body.strip_prefix("{\n").ok_or_else(|| {
+        <serde_json::Error as serde::ser::Error>::custom(
+            "canonical profile JSON does not start with \"{\\n\"",
+        )
+    })?;
     Ok(format!("{SEAL_PREFIX}{digest}{SEAL_SUFFIX}{rest}"))
 }
 

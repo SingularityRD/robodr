@@ -241,15 +241,57 @@ pub enum MatchMode {
 
 /// The user-space RTPS datagram filter (also the fallback when the kernel
 /// BPF filter cannot be attached).
+///
+/// Besides RTPS it can accept the raw UDP of Unitree's legacy
+/// (`unitree_legged_sdk`, Go1 generation) protocol: UDP whose source **or**
+/// destination port is in [`RtpsFilter::legacy_udp_ports`] is delivered
+/// tagged [`crate::PacketKind::UnitreeLegacy`] — **always**, also when it
+/// matches the RTPS rule as well (then flagged
+/// [`crate::RtpsPacket::also_rtps`], so the consumer inspects it on both
+/// paths): starting a payload with `RTPS` must not skip the legacy sender
+/// check. Empty (the default) = off.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct RtpsFilter {
     pub ports: RtpsPortMap,
     pub mode: MatchMode,
+    /// UDP ports of the Unitree legacy protocol (both directions); empty =
+    /// none accepted.
+    pub legacy_udp_ports: BTreeSet<u16>,
 }
+
+/// Most ports [`RtpsFilter::legacy_udp_ports`] may hold (each costs six
+/// kernel BPF instructions).
+pub const MAX_LEGACY_UDP_PORTS: usize = 32;
 
 impl RtpsFilter {
     pub fn new(ports: RtpsPortMap, mode: MatchMode) -> Self {
-        Self { ports, mode }
+        Self {
+            ports,
+            mode,
+            legacy_udp_ports: BTreeSet::new(),
+        }
+    }
+
+    /// Also accept Unitree legacy UDP on `ports` (source or destination).
+    /// At most [`MAX_LEGACY_UDP_PORTS`] are kept (the lowest).
+    #[must_use]
+    pub fn with_legacy_udp_ports(mut self, ports: impl IntoIterator<Item = u16>) -> Self {
+        self.legacy_udp_ports = ports
+            .into_iter()
+            .collect::<BTreeSet<u16>>()
+            .into_iter()
+            .take(MAX_LEGACY_UDP_PORTS)
+            .collect();
+        self
+    }
+
+    /// A UDP datagram of the Unitree legacy protocol: its source or
+    /// destination port is a configured legacy port (whether or not it also
+    /// [`matches`](Self::matches) as RTPS).
+    pub fn is_legacy(&self, d: &UdpDatagram<'_>) -> bool {
+        !self.legacy_udp_ports.is_empty()
+            && (self.legacy_udp_ports.contains(&d.src_port)
+                || self.legacy_udp_ports.contains(&d.dst_port))
     }
 
     pub fn matches(&self, d: &UdpDatagram<'_>) -> bool {

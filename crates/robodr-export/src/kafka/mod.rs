@@ -1,5 +1,5 @@
 //! A minimal std-only Kafka producer: just enough of the protocol to
-//! publish `robot-edr.findings` records with `acks=all`.
+//! publish findings records with `acks=all`.
 //!
 //! * [`wire`]: primitive types and zig-zag varints.
 //! * [`batch`]: RecordBatch v2 encoding (CRC-32C, headers, no compression).

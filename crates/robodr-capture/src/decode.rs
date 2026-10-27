@@ -325,6 +325,20 @@ fn link_payload(link: LinkType, frame: &[u8]) -> Result<(Option<u8>, &[u8]), Dec
     }
 }
 
+/// The link-layer (MAC) source address of a captured frame, when its
+/// header carries a 6-byte one: Ethernet (bytes 6..12), Linux cooked
+/// capture v1 / v2 (`sll_addr` with `halen == 6`). `None` for every other
+/// link type (raw IP, loopback headers) or a shorter frame.
+pub fn link_src_mac(link: LinkType, frame: &[u8]) -> Option<[u8; 6]> {
+    let mac = |at: usize| -> Option<[u8; 6]> { frame.get(at..at + 6)?.try_into().ok() };
+    match link {
+        LinkType::ETHERNET if frame.len() >= 14 => mac(6),
+        LinkType::LINUX_SLL if frame.len() >= 16 && be16(frame, 4) == Some(6) => mac(6),
+        LinkType::LINUX_SLL2 if frame.len() >= 20 && frame[11] == 6 => mac(12),
+        _ => None,
+    }
+}
+
 /// BSD address family -> IP version. AF_INET6 differs per OS: 10 (Linux),
 /// 24 (NetBSD/OpenBSD), 28 (FreeBSD/DragonFly), 30 (macOS).
 fn family_to_version(family: u32) -> Result<u8, DecodeError> {

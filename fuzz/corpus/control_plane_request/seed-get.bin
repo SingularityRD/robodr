@@ -1,0 +1,9 @@
+ÿGET /api/v2/robots/ugv-007/action-requests/robot_restrict_motion%3Augv-007%3A00112233aabbccdd HTTP/1.1
+Host: robot
+Content-Type: application/json
+Content-Length: 0
+X-RoboDR-Key-Id: soc:soc-a:1
+X-RoboDR-Timestamp: 1800000000
+X-RoboDR-Nonce: seed-nonce-000000003
+X-RoboDR-Signature: 966ed4e4a9934bf1ff7ad7eda339dda473907c376e0327e312f7752411a5baf0ef31e5468b84e5ab8535ca97f89ec0fec2d986f02704dc326176dcf58adb9f05
+

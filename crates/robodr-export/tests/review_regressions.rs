@@ -41,7 +41,7 @@ fn spool_findings(spool: &Path, from: u64, n: u64) {
                 .map(|(k, v)| (k.to_string(), v))
                 .collect(),
         };
-        s.write(&out, false).unwrap();
+        s.write(&out, robodr_agentd::SpoolClass::Normal).unwrap();
     }
 }
 

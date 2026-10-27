@@ -2,6 +2,22 @@
 # Assemble the robodr .deb from already-built release binaries.
 #
 #   packaging/build-deb.sh --bin-dir target/release --arch amd64 [--out dist]
+#   packaging/build-deb.sh --variant focal --bin-dir dist/static/aarch64-unknown-linux-musl --arch arm64
+#
+# Variants:
+#   standard (default) package "robodr": glibc binaries (libc6 floor read
+#            from them, at least 2.35), systemd >= 247 units (LoadCredential=,
+#            ProtectProc=), robodr-pulsard and its rules when built.
+#   focal    package "robodr-focal": for systemd 245 / glibc 2.31 hosts
+#            (Ubuntu 20.04, NVIDIA JetPack 5 on Unitree EDU computers). Every
+#            binary must be STATIC (scripts/build-static.sh, musl): no
+#            program interpreter, no shared library, hence no libc6
+#            dependency. Units from packaging/systemd/focal/ (LoadCredential=
+#            replaced by /usr/lib/robodr/robodr-load-credential, kept in step
+#            by scripts/check-focal-units.py). No robodr-pulsard (needs a BTF
+#            kernel; JetPack 5 has none) and no robodr-anchor-receiver
+#            (base-station role: use the standard package there). The two
+#            packages conflict with (and replace) each other.
 #
 # Reproducible: every file mtime is SOURCE_DATE_EPOCH (default: HEAD commit
 # time), ownership is root:root (--root-owner-group), modes are normalised,
@@ -12,16 +28,24 @@
 #   optional: robodr-pulsard (Pulsar-bound; needs the clang/eBPF toolchain)
 #             robodr-agentd, robodr-blackbox, robodr-diode-pack,
 #             robodr-diode-unpack, robodr-spool-export,
-#             robodr-kafka-publish (pure crates; the release requires them)
+#             robodr-kafka-publish, robodr-uplink (pure crates; the release
+#             requires them)
 #             robodr-anchor-receiver (pure; base-station side of the remote
 #             head anchor, installed with its unit when built)
+#             robodr-firewall-gw (pure; in-path inline-bridge gateway for
+#             a sensor box, installed with its two units, never enabled)
+#             robodr-enroll (pure; fleet enrollment, key rotation, SOC
+#             profiles; usr/sbin, root-only tool, no unit)
+#             robodr-deliverd (pure; on-unit delivery agent, usr/sbin, with
+#             its unit, installed disabled; robodr-safety-replay, the test
+#             tool of the same crate, is never packaged)
 # A unit file is only installed together with its binary. ROBODR_DEB_REQUIRE
 # (space separated) makes optional binaries mandatory; the release workflow
 # sets it so a release can never silently ship without the daemon.
 #
 # Environment:
 #   SOURCE_DATE_EPOCH   timestamp for every file
-#   DEB_DEPENDS         Depends: field (default below; Rust binaries link
+#   DEB_DEPENDS         Depends: field of the standard variant (default below; Rust binaries link
 #                       glibc + libgcc_s, robodr-pulsard also libsqlite3
 #                       unless built with Pulsar's sqlite3-vendored feature;
 #                       the default libc6 floor is the newest GLIBC_x.y
@@ -37,8 +61,10 @@ root="$(cd "$here/.." && pwd)"
 bin_dir=""
 arch=""
 out="dist"
+variant="standard"
 while [[ $# -gt 0 ]]; do
     case "$1" in
+    --variant) variant="$2"; shift 2 ;;
     --bin-dir) bin_dir="$2"; shift 2 ;;
     --arch) arch="$2"; shift 2 ;;
     --out) out="$2"; shift 2 ;;
@@ -49,6 +75,27 @@ done
 [[ -n "$bin_dir" && -n "$arch" ]] || { echo "build-deb: --bin-dir and --arch are required" >&2; exit 2; }
 [[ -d "$bin_dir" ]] || { echo "build-deb: $bin_dir is not a directory" >&2; exit 2; }
 case "$arch" in amd64 | arm64) ;; *) echo "build-deb: unsupported arch $arch" >&2; exit 2 ;; esac
+case "$variant" in
+standard)
+    package=robodr
+    other_package=robodr-focal
+    unit_src="$here/systemd"
+    synopsis="RoboDR - Robot Detection \& Response (protective only)"
+    ;;
+focal)
+    package=robodr-focal
+    other_package=robodr
+    unit_src="$here/systemd/focal"
+    synopsis="RoboDR - Robot Detection \& Response, static build for systemd 245 (protective only)"
+    for b in robodr-pulsard robodr-anchor-receiver; do
+        if [[ " ${ROBODR_DEB_REQUIRE:-} " == *" $b "* ]]; then
+            echo "build-deb: $b is not part of the focal variant (ROBODR_DEB_REQUIRE)" >&2
+            exit 2
+        fi
+    done
+    ;;
+*) echo "build-deb: unknown variant '$variant' (standard | focal)" >&2; exit 2 ;;
+esac
 command -v dpkg-deb >/dev/null || { echo "build-deb: dpkg-deb not found" >&2; exit 2; }
 
 upstream="$(tr -d '[:space:]' <"$root/VERSION")"
@@ -68,7 +115,7 @@ mkdir -p "$out"
 out="$(cd "$out" && pwd)"
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
-pkg="$stage/robodr_${deb_version}_${arch}"
+pkg="$stage/${package}_${deb_version}_${arch}"
 mkdir -p "$pkg/DEBIAN"
 
 # ELF e_machine (little-endian u16 at offset 18) each binary must carry, so an
@@ -102,12 +149,41 @@ install_bin() { # name dest-dir required(0/1)
 for b in robodr-commission robodr-replay robodr-ros2-watch; do
     install_bin "$b" usr/bin 1
 done
-for b in robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish; do
+for b in robodr-blackbox robodr-diode-pack robodr-diode-unpack; do
     install_bin "$b" usr/bin 0 || true
 done
 
 units=usr/lib/systemd/system
-if install_bin robodr-pulsard usr/sbin 0; then
+ex=usr/share/doc/robodr/examples
+# Exporters: robot side (diode), connected-site Kafka publisher and ingest
+# API uplink, each with its unit, installed disabled. The units conflict
+# (one consumer per spool).
+if install_bin robodr-spool-export usr/bin 0; then
+    install -D -m 0644 "$unit_src/robodr-spool-export.service" "$pkg/$units/robodr-spool-export.service"
+    install -D -m 0644 "$here/etc/spool-export.env.example" "$pkg/$ex/spool-export.env.example"
+fi
+if install_bin robodr-kafka-publish usr/bin 0; then
+    install -D -m 0644 "$unit_src/robodr-kafka-publish.service" "$pkg/$units/robodr-kafka-publish.service"
+    install -D -m 0644 "$here/etc/kafka-publish.env.example" "$pkg/$ex/kafka-publish.env.example"
+    install -D -m 0644 "$here/systemd/robodr-kafka-publish.service.d/50-brokers.conf.example" \
+        "$pkg/$ex/robodr-kafka-publish.service.d/50-brokers.conf.example"
+fi
+# Ingest API uplink (connected sites; conflicts with both units above).
+if install_bin robodr-uplink usr/bin 0; then
+    install -D -m 0644 "$unit_src/robodr-uplink.service" "$pkg/$units/robodr-uplink.service"
+    install -D -m 0644 "$here/etc/uplink.env.example" "$pkg/$ex/uplink.env.example"
+    install -D -m 0644 "$here/systemd/robodr-uplink.service.d/50-soc.conf.example" \
+        "$pkg/$ex/robodr-uplink.service.d/50-soc.conf.example"
+fi
+if [[ "$variant" == focal ]]; then
+    for b in robodr-pulsard robodr-anchor-receiver; do
+        if [[ -e "$bin_dir/$b" ]]; then
+            echo "build-deb: - $b is not part of the focal variant, skipped" >&2
+        fi
+    done
+    # LoadCredential= stand-in for systemd 245 (packaging/focal/).
+    install -D -m 0755 "$here/focal/robodr-load-credential" "$pkg/usr/lib/robodr/robodr-load-credential"
+elif install_bin robodr-pulsard usr/sbin 0; then
     install -D -m 0644 "$here/systemd/robodr-pulsard.service" "$pkg/$units/robodr-pulsard.service"
     install -D -m 0644 "$here/systemd/robodr-pulsard.service.d/10-cap-sys-admin.conf.example" \
         "$pkg/usr/share/doc/robodr/examples/robodr-pulsard.service.d/10-cap-sys-admin.conf.example"
@@ -129,15 +205,57 @@ if install_bin robodr-pulsard usr/sbin 0; then
     find "$pkg/usr/share/robodr/rules" -type f -exec chmod 0644 {} +
 fi
 if install_bin robodr-agentd usr/sbin 0; then
-    install -D -m 0644 "$here/systemd/robodr-agentd.service" "$pkg/$units/robodr-agentd.service"
-    install -D -m 0644 "$here/systemd/robodr-agentd.service.d/20-finding-key.conf.example" \
+    install -D -m 0644 "$unit_src/robodr-agentd.service" "$pkg/$units/robodr-agentd.service"
+    install -D -m 0644 "$unit_src/robodr-agentd.service.d/20-finding-key.conf.example" \
         "$pkg/usr/share/doc/robodr/examples/robodr-agentd.service.d/20-finding-key.conf.example"
+    install -D -m 0644 "$unit_src/robodr-agentd.service.d/30-control-plane.conf.example" \
+        "$pkg/usr/share/doc/robodr/examples/robodr-agentd.service.d/30-control-plane.conf.example"
+    # Passive sensor box (tap / port mirror; docs/UNITREE.md): agentd drop-in,
+    # capture-NIC networkd file and host firewall. Examples, never active.
+    install -D -m 0644 "$here/systemd/robodr-agentd.service.d/40-sensor-box.conf.example" \
+        "$pkg/usr/share/doc/robodr/examples/robodr-agentd.service.d/40-sensor-box.conf.example"
+    for f in 10-robodr-capture.network.example nftables.conf.example; do
+        install -D -m 0644 "$here/sensor-box/$f" "$pkg/usr/share/doc/robodr/examples/sensor-box/$f"
+    done
+fi
+# executor v1 (off unless agentd's executor.enabled; not enabled by the
+# package): with robodr-firewall-gw, the only CAP_NET_ADMIN units; plus
+# agentd's key drop-in example.
+if install_bin robodr-executor usr/sbin 0; then
+    install -D -m 0644 "$unit_src/robodr-executor.service" "$pkg/$units/robodr-executor.service"
+    install -D -m 0644 "$unit_src/robodr-agentd.service.d/30-executor.conf.example" \
+        "$pkg/usr/share/doc/robodr/examples/robodr-agentd.service.d/30-executor.conf.example"
+    install -D -m 0644 "$root/config/executor.example.json" "$pkg/$ex/executor.example.json"
+fi
+# In-path Motion Firewall gateway (inline bridge on a sensor box,
+# crates/robodr-firewall-gw): the gateway and its ruleset unit, installed
+# disabled (enforcing must follow commissioning; OPERATIONS.md 6.6).
+if install_bin robodr-firewall-gw usr/sbin 0; then
+    for u in robodr-firewall-gw.service robodr-firewall-gw-rules.service; do
+        install -D -m 0644 "$unit_src/$u" "$pkg/$units/$u"
+    done
 fi
 # Base-station side of the remote head anchor (not enabled by the package).
-if install_bin robodr-anchor-receiver usr/bin 0; then
+if [[ "$variant" == standard ]] && install_bin robodr-anchor-receiver usr/bin 0; then
     install -D -m 0644 "$here/systemd/robodr-anchor-receiver.service" \
         "$pkg/$units/robodr-anchor-receiver.service"
 fi
+
+# On-unit delivery agent (Sprint 13b, docs/SECURE-DELIVERY.md): installed
+# disabled; enabled after commissioning and enrolment (init-anchor).
+if install_bin robodr-deliverd usr/sbin 0; then
+    install -D -m 0644 "$unit_src/robodr-deliverd.service" "$pkg/$units/robodr-deliverd.service"
+fi
+# Fleet lifecycle (Sprint 9): robodr-enroll and its configuration example.
+# (config/fleet.example.json goes to the examples with the other configs.)
+install_bin robodr-enroll usr/sbin 0 || true
+# A trusted copy of the bundle installer for the next upgrade: it verifies a
+# new tarball's signature and installs from a private extraction
+# (OPERATIONS.md section 3; never run the copy inside an unverified bundle).
+install -D -m 0755 "$here/install-bundle.sh" "$pkg/usr/lib/robodr/install-bundle.sh"
+# On-disk formats this release writes and reads (install-bundle.sh's
+# black-box format gate on install and rollback).
+install -D -m 0644 "$here/formats" "$pkg/usr/share/robodr/formats"
 
 install -D -m 0644 "$here/tmpfiles.d/robodr.conf" "$pkg/usr/lib/tmpfiles.d/robodr.conf"
 install -D -m 0644 "$here/sysusers.d/robodr.conf" "$pkg/usr/lib/sysusers.d/robodr.conf"
@@ -156,14 +274,30 @@ done
 
 doc="$pkg/usr/share/doc/robodr"
 install -d "$doc/examples"
-for f in docs/OPERATIONS.md SECURITY.md CHANGELOG.md README.md packaging/README.md; do
+for f in docs/OPERATIONS.md docs/UNITREE.md SECURITY.md CHANGELOG.md README.md packaging/README.md; do
     [[ -f "$root/$f" ]] || continue
     case "$f" in
     packaging/README.md) install -m 0644 "$root/$f" "$doc/PACKAGING.md" ;;
     *) install -m 0644 "$root/$f" "$doc/$(basename "$f")" ;;
     esac
 done
+# The control-plane contract (man robodr-agentd(8) points here).
+install -D -m 0644 "$root/docs/contracts/robodr.control-plane.md" \
+    "$doc/contracts/robodr.control-plane.md"
+# The delivery design (man robodr-deliverd(8) points here), when the agent is in.
+if [[ -e "$pkg/usr/sbin/robodr-deliverd" ]]; then
+    install -D -m 0644 "$root/docs/SECURE-DELIVERY.md" "$doc/SECURE-DELIVERY.md"
+fi
+# The fleet contract (man robodr-enroll(8) points here), when the tool is in.
+if [[ -e "$pkg/usr/sbin/robodr-enroll" ]]; then
+    install -D -m 0644 "$root/docs/contracts/robodr.fleet-api.md" \
+        "$doc/contracts/robodr.fleet-api.md"
+fi
 install -m 0644 "$root/LICENSE" "$doc/copyright"
+install -d "$doc/licenses"
+for f in "$root"/LICENSES/*; do
+    install -m 0644 "$f" "$doc/licenses/"
+done
 for f in "$root"/config/*.example*; do
     install -m 0644 "$f" "$doc/examples/"
 done
@@ -186,7 +320,23 @@ find "$pkg" -type d -exec chmod 0755 {} +
 # glibc >= 2.39 host; the reference is weak, but its version need is not, so
 # ld.so refuses to start the binary on an older glibc. A hard-coded floor
 # below that would let dpkg install a package that cannot run.
-if [[ -n "${DEB_DEPENDS:-}" ]]; then
+if [[ "$variant" == focal ]]; then
+    # Static binaries only: no PT_INTERP, no DT_NEEDED, hence no libc6 (or
+    # any other library) dependency. systemd >= 245 for sysusers, tmpfiles
+    # and the focal units (scripts/check-focal-units.py).
+    command -v readelf >/dev/null || { echo "build-deb: readelf (binutils) not found" >&2; exit 2; }
+    while IFS= read -r f; do
+        if readelf -lW "$f" | grep -q 'INTERP' || readelf -dW "$f" 2>/dev/null | grep -q '(NEEDED)'; then
+            echo "build-deb: ${f#"$pkg"/} is dynamically linked; the focal variant takes static binaries only (scripts/build-static.sh)" >&2
+            exit 1
+        fi
+    done < <(find "$pkg/usr/bin" "$pkg/usr/sbin" -type f 2>/dev/null | LC_ALL=C sort)
+    if [[ -n "${DEB_DEPENDS:-}" ]]; then
+        echo "build-deb: DEB_DEPENDS is ignored for the focal variant" >&2
+    fi
+    depends="systemd (>= 245)"
+    echo "build-deb: static binaries, Depends: $depends" >&2
+elif [[ -n "${DEB_DEPENDS:-}" ]]; then
     depends="$DEB_DEPENDS"
 else
     command -v readelf >/dev/null || { echo "build-deb: readelf (binutils) not found; needed for the libc6 floor (or set DEB_DEPENDS)" >&2; exit 2; }
@@ -201,9 +351,21 @@ else
 fi
 
 installed_kb="$(du -sk --exclude=DEBIAN "$pkg" | cut -f1)"
-sed -e "s|@VERSION@|$deb_version|" -e "s|@ARCH@|$arch|" \
+sed -e "s|@PACKAGE@|$package|" -e "s|@OTHER_PACKAGE@|$other_package|g" \
+    -e "s|@SYNOPSIS@|$synopsis|" -e "s|@VERSION@|$deb_version|" -e "s|@ARCH@|$arch|" \
     -e "s|@MAINTAINER@|$maintainer|" -e "s|@DEPENDS@|$depends|" \
     -e "s|@INSTALLED_SIZE@|$installed_kb|" "$here/deb/control.in" >"$pkg/DEBIAN/control"
+if [[ "$variant" == focal ]]; then
+    # Continuation of the Description (the last field of control.in).
+    cat >>"$pkg/DEBIAN/control" <<'CONTROL'
+ .
+ This is the robodr-focal variant for hosts with systemd 245 and glibc
+ 2.31 (Ubuntu 20.04, NVIDIA JetPack 5, e.g. Unitree EDU computers): static
+ (musl) binaries and systemd 245 units. It does not contain robodr-pulsard
+ (eBPF, needs a BTF kernel) or robodr-anchor-receiver (base station). See
+ /usr/share/doc/robodr/UNITREE.md, section 3.2.
+CONTROL
+fi
 
 # md5sums (dpkg --verify), sorted for determinism.
 (cd "$pkg" && find . -path ./DEBIAN -prune -o -type f -print | LC_ALL=C sort |
@@ -213,6 +375,6 @@ chmod 0644 "$pkg/DEBIAN/control" "$pkg/DEBIAN/md5sums"
 
 find "$pkg" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 
-deb="$out/robodr_${deb_version}_${arch}.deb"
+deb="$out/${package}_${deb_version}_${arch}.deb"
 dpkg-deb --root-owner-group -Zxz --build "$pkg" "$deb" >&2
 echo "$deb"

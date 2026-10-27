@@ -1,0 +1,8 @@
+# On-disk formats this RoboDR release writes and reads, installed as
+# /usr/share/robodr/formats. install-bundle.sh refuses to install or roll
+# back to a release that cannot read the black-box segments on the unit.
+# Format names: <frame magic>:<record format version> of
+# crates/robodr-blackbox/src/record.rs (FRAME_MAGIC, FORMAT_VERSION); kept
+# in step by crates/robodr-fleet/tests/packaging.rs. Comma-separated lists.
+blackbox_write=RBF1:1
+blackbox_read=RBF1:1

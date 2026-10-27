@@ -16,7 +16,7 @@
     "dir": "/var/lib/robodr/blackbox/agentd",
     "key_file": "/run/credentials/robodr-agentd.service/blackbox.key"
   },
-  "spool": { "dir": "/var/lib/robodr/spool/agentd" },
+  "spool": { "dir": "/var/lib/robodr/spool/agentd", "status_socket": "/run/robodr-agentd/status.sock" },
   "event_inputs": [ { "kind": "unix_socket", "path": "/run/robodr-agentd/events.sock" } ],
   "context": { "safety_state": "unknown", "control": "autonomous" },
   "safety_feed": {

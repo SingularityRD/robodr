@@ -30,6 +30,17 @@
 //!   policy not OEM-validated) → Record only, with the would-have plan
 //!   attached.
 //! * Safe behaviours must be valid for the platform family.
+//! * On a [`Morphology`] that falls when its actuators are damped or
+//!   de-energised (a humanoid, or a morphology left unspecified),
+//!   `SafePause` / `RequestSafeState` are never executable: they appear only
+//!   in the plan's `advisory` list, and the substitute containment
+//!   (`LimitMotion` plus the policy's `fall_safe_restrict` targets) always
+//!   needs human approval.
+//! * On a morphology that needs active balance (humanoid, quadruped,
+//!   unspecified) no process is terminated, a process quarantine needs
+//!   approval and `LimitMotion` never goes below `min_motion_factor`.
+//! * A plan made for another morphology than the checker's own
+//!   (`OperationalContext::morphology`) never acts.
 //!
 //! The policy is validated at load ([`ResponsePolicy::validate`]) and the
 //! plan is re-checked at the end of planning
@@ -37,11 +48,32 @@
 //! violating plan is replaced by Record + approval, so failure modes only ever
 //! make the response *less* active.
 //!
+//! [`actions`] is the vendor-neutral action catalog (names, approval tier,
+//! reversibility, GA execution) shared with the agentd control plane.
+//!
 //! See `README.md` in this crate for the policy format and what is not yet
 //! verified (OEM validation, real platform safe-state interfaces).
 
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+// Review L3 (S10, R9): agentd links this library and release builds use
+// `panic = "abort"`, so a panic here kills the daemon. Non-test code has no
+// unwrap / expect / panic!-family call; slice indexing and arithmetic are
+// left to review and fuzzing.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
+
 pub mod action;
-pub mod autosecops;
+pub mod actions;
 pub mod escalation;
 pub mod planner;
 pub mod policy;
@@ -50,14 +82,15 @@ pub mod state;
 pub use action::{
     Rationale, Reason, ResponseAction, ResponsePlan, RestrictTarget, SafeBehaviour, Step,
 };
-pub use autosecops::{action_class, ActionClass, Approval, Reversibility};
+pub use actions::{ActionId, ActionSpec, Approval, GaExecution, CATALOG};
 pub use escalation::Responder;
 pub use planner::{check_invariants, check_invariants_for_deviation, plan_stateless, Violation};
 pub use policy::{
     EscalationPolicy, Matrix, PolicyError, ResponsePolicy, RuleOverride, SeverityRow,
 };
 pub use state::{
-    Connectivity, ControlMode, MissionPhase, OperationalContext, PlatformFamily, SafetyState,
+    Connectivity, ControlMode, MissionPhase, Morphology, OperationalContext, PlatformFamily,
+    SafetyState,
 };
 
 #[cfg(test)]

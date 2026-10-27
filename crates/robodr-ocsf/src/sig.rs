@@ -1,11 +1,11 @@
-//! Detached per-finding signatures (contract `robot-edr.findings` ≥ 1.2).
+//! Detached per-finding signatures (findings contract ≥ 1.2, all of 2.x).
 //!
 //! # Why
 //!
 //! The validator ([`validate`](mod@crate::validate)) proves a finding is *well formed*: it
 //! matches the rule catalog, its tainted fields are neutralised, its ids are
 //! derived correctly. It cannot prove *who* produced it. On a connected
-//! (non-diode) path anyone who can produce to `robot-edr.findings` can forge a
+//! (non-diode) path anyone who can produce to the findings topic can forge a
 //! finding that matches the catalog exactly (a fake "all quiet", or a fake
 //! alarm naming another robot). This module adds an optional, detached
 //! Ed25519 signature made by the robot's finding key, and a verifier that

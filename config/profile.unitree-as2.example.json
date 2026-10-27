@@ -1,0 +1,23 @@
+{
+  "model": "unitree-as2-EXAMPLE-replace-with-OEM-data",
+  "locked": false,
+  "participants": [
+    "0123456789abcdef01234567"
+  ],
+  "writer_topics": [
+    "/api/sport/request",
+    "/api/sport/response",
+    "/lf/sportmodestate",
+    "/wirelesscontroller"
+  ],
+  "motion_envelopes": {
+    "/api/sport/request": {
+      "max_linear_speed": 1.5,
+      "max_joint_speed": null
+    }
+  },
+  "services": [],
+  "actions": [],
+  "reader_topics": [],
+  "raw_dds_topics": []
+}

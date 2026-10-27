@@ -1,0 +1,25 @@
+{
+  "answer": {
+    "answer_message": "robodr-control-plane/v2 answer\ne4bde9ac5d9830e3a936260ce7bf2813bfefbff2e6c45e6385430e4f2c5225517c388995d25c303d247089545dd1f18335b80465ad7803ffdffb66e75132de05\n200\n5e68e5430d7cff92d4f3f15130e088194483cb70b538242ae2b4232e80d526eb",
+    "body_file": "answers/01-robot.body.json",
+    "body_sha256": "5e68e5430d7cff92d4f3f15130e088194483cb70b538242ae2b4232e80d526eb",
+    "content_type": "application/json",
+    "status": 200,
+    "x_robodr_answer_signature": "ed25519;key_id=finding:ugv-007:1;sig=3de85e0e0f287d674b28fabd13a85239043451ed70c266df73b22ad956f2ecd68489abcdd6eb9023d4ddb44e112aa95bbffae32ffbd310bd9edb2f3cb033de0d"
+  },
+  "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "description": "robot snapshot",
+  "expect": {
+    "authenticated": true,
+    "route": "robot"
+  },
+  "key_id": "soc:soc-a:1",
+  "method": "GET",
+  "name": "01-robot",
+  "nonce": "contract-nonce-0001",
+  "robot_id": "ugv-007",
+  "signature": "e4bde9ac5d9830e3a936260ce7bf2813bfefbff2e6c45e6385430e4f2c5225517c388995d25c303d247089545dd1f18335b80465ad7803ffdffb66e75132de05",
+  "signing_message": "robodr-control-plane/v2\nGET\n/api/v2/robots/ugv-007\nugv-007\nsoc:soc-a:1\n1800000000\ncontract-nonce-0001\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "target": "/api/v2/robots/ugv-007",
+  "timestamp": 1800000000
+}

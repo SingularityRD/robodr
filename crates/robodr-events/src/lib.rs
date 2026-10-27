@@ -58,6 +58,24 @@
 //!   [`RobotEvent::MotionFeedback`] was added before any downstream crate
 //!   matched exhaustively.
 
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+// Review L3 (S10, R9): agentd links this library and release builds use
+// `panic = "abort"`, so a panic here kills the daemon. Non-test code has no
+// unwrap / expect / panic!-family call; slice indexing and arithmetic are
+// left to review and fuzzing.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
+
 pub mod graph;
 pub mod profile;
 
@@ -143,12 +161,80 @@ pub struct MotionCommand {
     /// Commanded pitch rate in rad/s, signed (`Twist.angular.y`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub angular_y: Option<f64>,
+    /// Low-level joint commands only: the largest feed-forward torque
+    /// `|tau|` (N·m) over the command's joint slots. A Unitree motor applies
+    /// `T = kp·(q − q_measured) + kd·(dq − dq_measured) + tau`, so a
+    /// torque-only command (`kp = kd = 0`) moves a joint without any
+    /// commanded speed. Bounded by the envelope's `max_joint_torque`.
+    /// `None` for commands that carry no joint torque (Twist, API calls).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joint_torque: Option<f64>,
+    /// Low-level joint commands only: the largest position gain `|kp|`
+    /// over the command's joint slots (stiffness of the position loop).
+    /// Bounded by the envelope's `max_joint_kp`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joint_kp: Option<f64>,
+    /// Low-level joint commands only: the largest position-target step
+    /// `|q − q_previous|` (rad) over the joints whose position target acts
+    /// (`kp != 0`) in this and the previous command on the channel. Needs
+    /// state, so only a stateful producer (the ROS 2 pipeline) fills it;
+    /// `None` on the first command of a channel. Bounded by the envelope's
+    /// `max_joint_position_step`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joint_position_step: Option<f64>,
+    /// For commands decoded from a robot API call (e.g. a Unitree sport /
+    /// loco request): what kind of effect the call has. `None` for plain
+    /// velocity / joint messages. [`profile::Profile::evaluate`] reports the
+    /// classes whose motion the envelope cannot bound (see
+    /// [`CommandClass`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_class: Option<CommandClass>,
+    /// The API call's name (`"FrontFlip"`, `"api_id 4242"`, ...), for the
+    /// finding's detail. Informational only: never matched by a rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_name: Option<String>,
+}
+
+/// What kind of effect a robot API call has on motion (carried in
+/// [`MotionCommand::command_class`]). Mirrors `robodr_cdr::unitree::ApiClass`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandClass {
+    /// Commands a body velocity (the command's speed fields carry it).
+    Velocity,
+    /// Stops motion.
+    Stop,
+    /// Changes posture through the robot's own controller.
+    Posture,
+    /// Changes gait / speed level / control parameters.
+    Config,
+    /// A pre-programmed whole-body motion (flip, jump, dance, arm action):
+    /// nothing in the request bounds it. `robot.motion.unverifiable_command`
+    /// (High).
+    Trick,
+    /// Goes to a target position / follows a path: no speed in the
+    /// request. `robot.motion.unverifiable_command` (Medium).
+    Trajectory,
+    /// Hands motor control to / takes it from another channel (motion
+    /// switcher release, user control, arm SDK). `robot.motion.control_handover`
+    /// (High).
+    ControlHandover,
+    /// Reads state; no motion.
+    Query,
+    /// Not a known call of a motion service. `robot.motion.unverifiable_command`
+    /// (High).
+    Unknown,
+    /// A known motion call whose arguments cannot be read.
+    /// `robot.motion.unverifiable_command` (High).
+    Malformed,
 }
 
 impl MotionCommand {
     /// Every signed component with its name, for checks that must look at
-    /// all of them (non-finite detection).
-    pub fn components(&self) -> [(&'static str, Option<f64>); 7] {
+    /// all of them (non-finite detection): the seven motion axes, then the
+    /// three joint-command magnitudes (`joint_torque`, `joint_kp`,
+    /// `joint_position_step`).
+    pub fn components(&self) -> [(&'static str, Option<f64>); 10] {
         [
             ("linear", self.linear_speed),
             ("joint", self.joint_speed),
@@ -157,6 +243,9 @@ impl MotionCommand {
             ("linear_z", self.linear_z),
             ("angular_x", self.angular_x),
             ("angular_y", self.angular_y),
+            ("joint_torque", self.joint_torque),
+            ("joint_kp", self.joint_kp),
+            ("joint_position_step", self.joint_position_step),
         ]
     }
 
@@ -254,7 +343,8 @@ pub struct MotionFeedback {
     pub timestamp_ns: u64,
 }
 
-/// Severity of a deviation, mapped 1:1 onto Pulsar/AutoSecOps severities.
+/// Severity of a deviation, mapped 1:1 onto Pulsar severities and the
+/// findings contract's `severity` (OCSF `severity_id` 2..=5).
 /// Ordered by declaration: `Low < Medium < High < Critical`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

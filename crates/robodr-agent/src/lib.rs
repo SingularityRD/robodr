@@ -10,7 +10,7 @@
 //!   → ResponsePlan + Disposition
 //!   → robodr_blackbox::Recorder                 (event, firewall verdict, deviation, plan)
 //!   → robodr_ocsf::FindingBuilder               (evidence links = the black-box refs)
-//!   → validated robot-edr.findings record (key + JSON)
+//!   → validated robodr.findings record (key + JSON)
 //!   → Executor::submit                          (no-op / dry-run log: nothing is executed)
 //! ```
 //!
@@ -40,15 +40,35 @@
 //!   ROS 2 sensor (`robodr-sensor-ros2`) and Pulsar glue do not call it yet.
 //! * The response policy, motion monitor thresholds and firewall limits are
 //!   unvalidated engineering defaults (see each crate's README).
-//! * The black box authenticates with HMAC-SHA256 (shared key): a
-//!   placeholder for an asymmetric, TPM-held key.
+//! * The black box signs with whatever key the caller supplies: Ed25519
+//!   (agentd's default, via `ed25519-dalek`) or legacy HMAC-SHA256 (the
+//!   `robodr-replay` default, kept for compatibility). Keys are files, not
+//!   TPM-held.
 //! * Findings are validated by the in-repo OCSF validator only, not by an
-//!   OCSF schema server or a running AutoSecOps consumer.
+//!   OCSF schema server or a running SOC consumer.
 //! * `MotionCommand` has no source stamp and no angular/per-joint values, so
 //!   the firewall's stale/future checks and angular limits are not exercised
 //!   through this path (see [`agent`] for the mapping).
 //! * Black-box recovery after a real disk failure (ENOSPC, EIO) is tested
 //!   only with simulated failures (a failing signer, a removed directory).
+
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+// S10 (R9): release builds use `panic = "abort"`, so any panic kills the
+// daemon (systemd restarts it; docs/OPERATIONS.md, "Crashes and restarts").
+// Non-test code has no unwrap / expect / panic!-family call; slice indexing
+// and arithmetic are left to review and fuzzing (fuzz/README.md).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 
 pub mod agent;
 pub mod clock;
@@ -59,20 +79,20 @@ pub mod outcome;
 pub mod replay;
 
 pub use agent::{
-    guard, ocsf_safety, source_key, Agent, AgentStats, Finished, BLACKBOX_REOPEN_BACKOFF_NS,
-    MAX_RETAINED_FAULTS,
+    guard, ocsf_safety, source_key, Agent, AgentStats, Finished, JointInput,
+    BLACKBOX_REOPEN_BACKOFF_NS, MAX_RETAINED_FAULTS,
 };
 pub use clock::{
     Clock, ClockAnomaly, ReplayClock, TimeGuard, TimeSource, Timestamp,
     DEFAULT_CLOCK_JUMP_TOLERANCE_NS,
 };
 pub use config::{
-    profile_sha256, strict_from_str, AgentConfig, AgentError, FirewallSettings, MonitorSettings,
-    MAX_TRACKED_FINDINGS,
+    channel_kind, kind_of_type, profile_sha256, strict_from_str, AgentConfig, AgentError,
+    FirewallSettings, MonitorSettings, MAX_TRACKED_FINDINGS,
 };
 pub use evidence::{finding_refs, resolve_links, verify_blackbox, LinkReport};
 pub use executor::{ExecutionRequest, Executor, LoggingExecutor, NoopExecutor};
 pub use outcome::{
     AgentFault, Detector, Disposition, EvidenceLinks, FaultKind, FindingOutput,
-    FirewallVerdictRecord, Outcome,
+    FirewallVerdictRecord, JointVerdictDetail, Outcome,
 };

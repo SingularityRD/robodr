@@ -13,7 +13,7 @@ use std::fmt;
 use robodr_events::Severity;
 use serde::{Deserialize, Serialize};
 
-use crate::state::{PlatformFamily, SafetyState};
+use crate::state::{Morphology, PlatformFamily, SafetyState};
 
 /// One rung of the Cyber-Jidoka ladder. Ordered: `Record < Restrict <
 /// LimitMotion < SafePause < RequestSafeState`. `RequestSafeState` is the top:
@@ -229,6 +229,25 @@ pub enum Reason {
     /// motion-affecting actions were dropped; its Record/Restrict actions,
     /// which target its own source, are kept.
     MotionAlreadyRequested { step: Step, since_ms: u64 },
+    /// The robot's morphology falls when its actuators are de-energised
+    /// (humanoid, unspecified): the `safe_pause` / `request_safe_state` part
+    /// of the plan was moved to `advisory` (never executed); the executable
+    /// plan was capped at `limit_motion` plus the policy's
+    /// `fall_safe_restrict` targets and awaits human approval.
+    DeEnergisingAdvisoryOnly { morphology: Morphology, step: Step },
+    /// The context's morphology (the caller's own configuration) does not
+    /// match the policy's; only Record.
+    MorphologyMismatch {
+        policy: Morphology,
+        context: Morphology,
+    },
+    /// A process quarantine on a robot that needs active balance (the
+    /// process may be its balance controller; it balances while idle):
+    /// approval required, never terminated.
+    ProcessQuarantineNeedsApproval { morphology: Morphology },
+    /// The policy's `limit_motion_factor` is below its `min_motion_factor`
+    /// on a robot that needs active balance: dropped, approval required.
+    MotionFactorBelowFloor { morphology: Morphology },
     /// The source shares the overflow bucket (source table full). Its shared
     /// escalation `level` / hold `held` would have made the plan await
     /// approval; the plan a fresh source gets (`result`, auto-executable) was
@@ -294,6 +313,25 @@ impl fmt::Display for Reason {
                 f,
                 "{step:?} already requested robot-wide {since_ms} ms ago: motion part dropped"
             ),
+            Reason::DeEnergisingAdvisoryOnly { morphology, step } => write!(
+                f,
+                "{morphology:?} falls when de-energised: {step:?} advisory only, contained with \
+                 limit_motion and the policy's fall_safe_restrict targets: approval required"
+            ),
+            Reason::MorphologyMismatch { policy, context } => write!(
+                f,
+                "morphology mismatch (policy {policy:?}, robot {context:?}): record only"
+            ),
+            Reason::ProcessQuarantineNeedsApproval { morphology } => write!(
+                f,
+                "{morphology:?} balances while idle: a process quarantine may stop its balance \
+                 controller: approval required, never terminated"
+            ),
+            Reason::MotionFactorBelowFloor { morphology } => write!(
+                f,
+                "limit-motion factor below min_motion_factor on {morphology:?}: dropped, approval \
+                 required"
+            ),
             Reason::OverflowStateNotApplied {
                 level,
                 held,
@@ -345,6 +383,11 @@ impl fmt::Display for Rationale {
 ///   approves; everything else waits.
 /// * Plans are cumulative and never relax anything: a later, lower plan does
 ///   not lift an earlier restriction. Lifting is an operator action.
+/// * `advisory` actions are **never executed** by anyone acting on the
+///   plan: they are recommendations for the operator and the platform's own
+///   safety function (today: `safe_pause` / `request_safe_state` on a
+///   humanoid, see [`Morphology`]). A plan with advisory entries always
+///   requires human approval.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResponsePlan {
     pub rule: String,
@@ -364,6 +407,15 @@ pub struct ResponsePlan {
     /// In observe mode: what enforcement mode would have done.
     pub would_have: Option<Box<ResponsePlan>>,
     pub rationale: Rationale,
+    /// The policy's morphology (omitted when `unspecified`; a plan record
+    /// without it reads as `unspecified`, the most conservative). An
+    /// executor never trusts it alone: [`crate::check_invariants`] compares
+    /// it with the context's.
+    #[serde(default, skip_serializing_if = "Morphology::is_unspecified")]
+    pub morphology: Morphology,
+    /// Recommended-only actions: never executed (omitted when empty).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub advisory: Vec<ResponseAction>,
 }
 
 impl ResponsePlan {

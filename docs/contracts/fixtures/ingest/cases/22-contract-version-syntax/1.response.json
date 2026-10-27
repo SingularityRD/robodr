@@ -1,0 +1,33 @@
+{
+  "body": {
+    "accepted": 1,
+    "batch_id": "rdu1-4d415756811573ec7667f92fa2b4b34a",
+    "created": 1,
+    "duplicates": 0,
+    "rejected": [
+      {
+        "code": "unsupported_contract",
+        "line": 1
+      },
+      {
+        "code": "invalid_finding",
+        "line": 2
+      },
+      {
+        "code": "invalid_finding",
+        "line": 3
+      },
+      {
+        "code": "invalid_finding",
+        "line": 4
+      },
+      {
+        "code": "invalid_finding",
+        "line": 5
+      }
+    ],
+    "replayed": false,
+    "updated": 0
+  },
+  "status": 200
+}

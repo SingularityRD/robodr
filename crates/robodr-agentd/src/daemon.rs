@@ -55,8 +55,17 @@
 //! and the configured feedback topics into `MotionCommand` /
 //! `MotionFeedback` events (see `robodr_ros2_pipeline::motion`), stamped
 //! with the daemon clock's monotonic time at the moment the datagram is
-//! handled. Each event goes through `Agent::handle`, exactly like a JSONL
-//! event: `Profile::evaluate` (envelope), the Motion Firewall, the motion
+//! handled (live capture). A **pcap replay** is stamped on its own
+//! timeline instead: each packet's record timestamp, offset onto the
+//! daemon's monotonic clock at the first replayed packet and held
+//! non-decreasing ([`ReplayTimeline`]). The file is read as fast as the
+//! daemon can, so its handling time says nothing about when the robot sent
+//! what: with handling time, the motion monitor's latency and persistence
+//! windows (and the firewall's rate checks) judged the replay by host load.
+//! The same timeline is the detection time of every event handled while
+//! the replay runs ([`robodr_agent::Agent::handle_with_joint_at`]);
+//! evidence keeps the daemon clock. Each event goes through
+//! `Agent::handle`, exactly like a JSONL event: `Profile::evaluate` (envelope), the Motion Firewall, the motion
 //! monitor (commands and per-publisher feedback), the black box and the
 //! spool. So the pipeline's own envelope evaluation is switched off here
 //! (`evaluate_commands = false`), to report each over-envelope command once,
@@ -151,21 +160,29 @@
 //!
 //! # What the daemon does with a plan
 //!
-//! Nothing. The agent's executor is the default `NoopExecutor`: plans
-//! (dispositions, `would_have`) are recorded in the black box and carried in
-//! the finding, never executed. Wiring an executor is future work and must
-//! follow `robodr_agent::executor`'s contract.
+//! By default nothing. The agent's executor is the default `NoopExecutor`:
+//! plans (dispositions, `would_have`) are recorded in the black box and
+//! carried in the finding, never executed. With `executor.enabled` and
+//! `planner_orders` (executor v1, [`crate::executor_link`]) the eligible
+//! network steps of a recorded plan are handed to `robodr-executor`.
 //!
 //! # Control-plane requests
 //!
-//! With `control_plane` ([`crate::control`]), listener threads authenticate
-//! SOC action requests and hand them over a bounded channel; the main loop
+//! With `control_plane` ([`crate::control`], `robodr-control-plane/v2`),
+//! listener threads terminate mutual TLS, authenticate SOC action requests
+//! and hand them over a bounded channel (evidence exports are built on the
+//! listener threads; only their black-box note comes here); the main loop
 //! takes up to [`crate::control::CALLS_PER_POLL`] per iteration and judges
 //! each against the safety state *at that moment* (the live feed is
 //! re-evaluated first), the operational context and the response policy,
 //! records request and decision as a `robodr.control_plane_request` note
-//! (fsynced) and answers. The executor is the recording one: an accepted
-//! request is answered `recorded_not_executed`, nothing reaches the robot.
+//! (fsynced), journaled around it in `control_plane.state_dir` (so the
+//! state survives a restart), and answers. Without executor v1 the executor
+//! is the recording one: an accepted request is answered
+//! `recorded_not_executed`, nothing reaches the robot. With it, accepted
+//! requests are staged and dispatched to `robodr-executor` once stored, and
+//! every outcome the link reports is journalled at once
+//! ([`crate::control::api::Engine::sync`]).
 //! Failed authentications and authenticated invalid requests become the
 //! observe-only self-health findings
 //! `robot.agent.control_plane_unauthenticated` (High) and
@@ -181,7 +198,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use robodr_agent::{
-    Agent, AgentConfig, AgentStats, Detector, Finished, FirewallSettings, MonitorSettings, Outcome,
+    Agent, AgentConfig, AgentStats, Detector, Finished, FirewallSettings, JointInput,
+    MonitorSettings, Outcome,
 };
 use robodr_blackbox::{Clock, RecorderConfig, SystemClock, TimeSource, Timestamp};
 use robodr_correlate::{CorrelatedFinding, Correlator, EntityKind, Limits, Signal};
@@ -205,7 +223,7 @@ use crate::health::{
 use crate::input::{self, Feed, InputStats, Msg, Payload, QueueBudget};
 use crate::notify::{monotonic_ms, Notifier};
 use crate::safety::{FeedFinding, FeedStatus, SafetyFeed, Transition};
-use crate::spool::{Spool, SpoolError, SpoolStats};
+use crate::spool::{Spool, SpoolClass, SpoolError, SpoolStats};
 
 /// Most queued items handled between two clock checks.
 pub const BATCH: usize = 256;
@@ -252,6 +270,9 @@ pub fn effective_state(status: &serde_json::Value, now_mono_ms: u64, boot_id: &s
 pub struct DaemonStats {
     pub datagrams: u64,
     pub events: u64,
+    /// Decoded low-level joint frames handed to the agent's joint firewall
+    /// (with their command; also counted in `motion_events`).
+    pub joint_frames: u64,
     /// Motion commands / feedback decoded from datagrams and handed to the
     /// agent.
     pub motion_events: u64,
@@ -411,6 +432,8 @@ struct Status<'a> {
     pipeline: &'a PipelineStats,
     agent: AgentStats,
     spool: SpoolStats,
+    /// Discovery-flood aggregation (red team F1, [`crate::flood`]).
+    discovery_flood: crate::flood::FloodStats,
     /// Correlation engine counters (absent when correlation is disabled).
     #[serde(skip_serializing_if = "Option::is_none")]
     correlation: Option<robodr_correlate::Stats>,
@@ -424,6 +447,9 @@ struct Status<'a> {
     /// The control-plane API's counters (absent when it is off).
     #[serde(skip_serializing_if = "Option::is_none")]
     control_plane: Option<ControlStatus>,
+    /// executor v1 link counters (absent when the executor is off).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    executor: Option<crate::executor_link::LinkStats>,
 }
 
 /// The agent's view of the profile: what the pipeline enforces. A profile
@@ -458,6 +484,10 @@ struct Daemon<'a> {
     capture_health: SharedHealth,
     rx: Receiver<Msg>,
     stop_inputs: Arc<AtomicBool>,
+    /// The latest status (the bytes of `status.json`), served on
+    /// `spool.status_socket`.
+    status_snapshot: Arc<std::sync::Mutex<Arc<Vec<u8>>>>,
+    status_server: Option<std::thread::JoinHandle<()>>,
     budget: Arc<QueueBudget>,
     /// Every sender of the queue is gone (all input threads exited).
     inputs_gone: bool,
@@ -476,6 +506,8 @@ struct Daemon<'a> {
     profile_accepted: Option<robodr_commission::trust::AcceptedState>,
     /// The correlation engine (`None` = disabled).
     correlator: Option<Correlator>,
+    /// Discovery-flood aggregation of pipeline findings ([`crate::flood`]).
+    flood: crate::flood::FloodGuard,
     /// `groups_evicted + groups_refused` at the last pressure report.
     correlation_pressure_reported: u64,
     /// When the last pressure finding was raised (daemon ms).
@@ -492,6 +524,55 @@ struct Daemon<'a> {
     /// (unauthenticated, invalid).
     control_reported: [u64; 2],
     control_reported_at_ms: [Option<u64>; 2],
+    /// executor v1: the link to robodr-executor (`None` = off).
+    executor: Option<crate::executor_link::ExecutorLink>,
+    /// The packet timeline of a pcap replay (`None` for a live capture:
+    /// handling time is the observation time there).
+    replay: Option<ReplayTimeline>,
+}
+
+/// A replayed capture's packet timeline on the daemon's clocks.
+///
+/// The first replayed packet with a timestamp anchors the capture's clock
+/// to the daemon's (monotonic ns and `Instant` at that moment); every
+/// later packet is placed at `anchor + (its timestamp - the first's)`,
+/// independent of when the daemon gets to handle it. Out-of-order or
+/// earlier records (merged interfaces, a stepped capture clock) are held at
+/// the latest position: the timeline never goes back.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ReplayTimeline {
+    /// (capture ns, daemon mono ns, `Instant`) of the first timestamped
+    /// packet.
+    origin: Option<(u64, u64, Instant)>,
+    /// Offset of the latest position from the anchor (ns).
+    offset: u64,
+}
+
+impl ReplayTimeline {
+    /// Place a packet captured at `captured_ns` (record time); `mono_now`
+    /// and `instant_now` anchor the timeline on the first call. Returns
+    /// the packet's position (daemon mono ns).
+    fn place(&mut self, captured_ns: u64, mono_now: u64, instant_now: Instant) -> u64 {
+        let (c0, m0, _) = *self
+            .origin
+            .get_or_insert((captured_ns, mono_now, instant_now));
+        self.offset = self.offset.max(captured_ns.saturating_sub(c0));
+        m0.saturating_add(self.offset)
+    }
+
+    /// The current position (daemon mono ns), once anchored.
+    fn position(&self) -> Option<u64> {
+        self.origin.map(|(_, m0, _)| m0.saturating_add(self.offset))
+    }
+
+    /// The current position as an `Instant` (the pipeline's clock), once
+    /// anchored.
+    fn instant(&self) -> Option<Instant> {
+        self.origin.map(|(_, _, i0)| {
+            i0.checked_add(Duration::from_nanos(self.offset))
+                .unwrap_or(i0)
+        })
+    }
 }
 
 fn ms(d: Duration) -> u64 {
@@ -578,6 +659,7 @@ impl<'a> Daemon<'a> {
         let validated = !matches!(pipeline.status(), ProfileStatus::Refused(_));
         let context = OperationalContext {
             platform: r.policy.platform,
+            morphology: r.policy.morphology,
             phase: cfg.context.phase,
             connectivity: cfg.context.connectivity,
             control: cfg.context.control,
@@ -640,11 +722,27 @@ impl<'a> Daemon<'a> {
         );
         acfg.attestation = AttestationStatus::Unknown;
         acfg.kafka_partitions = cfg.robot.kafka_partitions;
+        acfg.findings_topic = cfg.findings.topic.clone();
+        acfg.data_source = cfg.findings.data_source.clone();
         match (&cfg.firewall, validated) {
             (Some(fw), true) => {
-                let mut fs =
-                    FirewallSettings::from_profile(&acfg.profile, &fw.allow, &fw.max_angular)
-                        .map_err(DaemonError::Agent)?;
+                // Low-level joint channels (Unitree LowCmd) come with the
+                // file's platform (morphology, hold time, ...).
+                let joint = r
+                    .firewall_joint
+                    .as_ref()
+                    .map(|fc| fc.joint_channels.clone())
+                    .unwrap_or_default();
+                let mut fs = FirewallSettings::from_profile_and_joints(
+                    &acfg.profile,
+                    &fw.allow,
+                    &fw.max_angular,
+                    joint,
+                )
+                .map_err(DaemonError::Agent)?;
+                if let Some(fc) = &r.firewall_joint {
+                    fs.platform = fc.platform;
+                }
                 // Not inline: verdicts are recorded would-haves only.
                 fs.platform.fail_behaviour = FailBehaviour::PassThroughObserveOnly;
                 acfg.firewall = Some(fs);
@@ -675,6 +773,35 @@ impl<'a> Daemon<'a> {
             .map_err(|e| DaemonError::Config(format!("finding key: {e}")))?;
             agent = agent.with_finding_signer(fs).map_err(DaemonError::Agent)?;
         }
+        // executor v1 (off unless `executor.enabled`): the link to the
+        // separate robodr-executor process; the planner's eligible steps go
+        // to it when `planner_orders` is set.
+        let executor = match &r.executor {
+            None => None,
+            Some(spec) => {
+                let link = crate::executor_link::ExecutorLink::start(
+                    spec,
+                    crate::executor_link::SafetyCell::default(),
+                )
+                .map_err(DaemonError::Io)?;
+                if link.planner_orders {
+                    agent =
+                        agent.with_executor(Box::new(link.planner_executor(r.policy.morphology)));
+                }
+                let _ = writeln!(
+                    log,
+                    "robodr-agentd: executor v1 enabled ({}): accepted requests{} are handed \
+                     to robodr-executor",
+                    spec.socket.display(),
+                    if link.planner_orders {
+                        " and eligible plan steps"
+                    } else {
+                        ""
+                    }
+                );
+                Some(link)
+            }
+        };
         let correlator = r
             .correlation
             .clone()
@@ -684,30 +811,100 @@ impl<'a> Daemon<'a> {
             .map_err(|e| DaemonError::Io(format!("spool {}: {e}", cfg.spool.dir.display())))?;
 
         // The control plane (before the input threads: a bind failure then
-        // leaves nothing running). Answers are signed with the finding key.
+        // leaves nothing running). Answers and evidence manifests are signed
+        // with the finding key (required with control_plane, config.rs).
         let control = match &r.control_plane {
             None => None,
             Some(spec) => {
-                let signer = match &r.finding_key {
-                    Some((key, key_id)) => Some(
-                        crate::config::signer_for(
-                            robodr_blackbox::sign_ed25519::ED25519,
-                            key,
-                            Some(key_id),
-                        )
-                        .map_err(|e| DaemonError::Config(format!("finding key: {e}")))?,
-                    ),
-                    None => None,
+                let Some((key, key_id)) = &r.finding_key else {
+                    return Err(DaemonError::Config(
+                        "control_plane needs finding_signing: every answer is signed with the \
+                         finding key"
+                            .into(),
+                    ));
                 };
-                let cp =
-                    ControlPlane::start(spec, &cfg.robot.id, signer).map_err(DaemonError::Io)?;
-                let _ = writeln!(
+                let signer = crate::config::signer_for(
+                    robodr_blackbox::sign_ed25519::ED25519,
+                    key,
+                    Some(key_id),
+                )
+                .map_err(|e| DaemonError::Config(format!("finding key: {e}")))?;
+                let bb_dir = agent.blackbox_dir().to_path_buf();
+                let robot = cfg.robot.id.clone();
+                let reconcile = |ids: &[String]| {
+                    crate::control::evidence::find_decision_notes(
+                        &crate::control::evidence::DirSource(bb_dir.clone()),
+                        &robot,
+                        ids,
+                    )
+                };
+                let mut cp = ControlPlane::start(spec, &cfg.robot.id, signer, &bb_dir, &reconcile)
+                    .map_err(DaemonError::Io)?;
+                // executor v1: accepted requests go to robodr-executor; the
+                // requests restored from the journal keep the executor's
+                // last journalled word.
+                if let Some(link) = &executor {
+                    cp.engine
+                        .set_executor(Box::new(link.control_executor(r.policy.morphology)));
+                    // What happened while agentd was down (a TTL lifted, a
+                    // pending order verified): asked once, journalled as
+                    // the answers come in.
+                    link.resync(cp.engine.open_executor_requests());
+                }
+                let st = cp.state_status().clone();
+                let _ =
+                    writeln!(
                     log,
-                    "robodr-agentd: control plane on {} ({} SOC key(s)); requests are judged and \
-                     recorded, never executed",
+                    "robodr-agentd: control plane ({}) on {} ({} SOC key(s){}{}); requests are \
+                     judged and recorded, {}; state: {} request(s) restored, \
+                     {} dangling decision(s) settled from the black box",
+                    crate::control::auth::API_VERSION,
                     cp.status().listening.join(", "),
-                    spec.keys.len()
+                    spec.keys.len(),
+                    if spec.tls.is_some() { ", mutual TLS" } else { "" },
+                    if spec.evidence.is_some() { ", evidence API" } else { "" },
+                    if executor.is_some() {
+                        "accepted ones are handed to robodr-executor (executor v1)"
+                    } else {
+                        "never executed"
+                    },
+                    st.restored,
+                    st.resolved_committed + st.resolved_aborted,
                 );
+                if st.journal_damaged > 0 || st.replay.damaged > 0 {
+                    let _ = writeln!(
+                        log,
+                        "robodr-agentd: control plane: the state journals were damaged \
+                         ({} request entr(ies), {} nonce entr(ies) skipped; copy in {}); \
+                         requests signed before this start are refused",
+                        st.journal_damaged,
+                        st.replay.damaged,
+                        st.journal_quarantined.as_deref().unwrap_or("quarantine/")
+                    );
+                }
+                if st.rebuilt_from_blackbox + st.rebuilt_reverts + st.lost_request_ids > 0 {
+                    let _ = writeln!(
+                        log,
+                        "robodr-agentd: control plane: request journal rebuilt from the black \
+                         box: {} request(s), {} revert record(s) restored, {} request id(s) \
+                         unreadable (refused)",
+                        st.rebuilt_from_blackbox, st.rebuilt_reverts, st.lost_request_ids
+                    );
+                }
+                if let Some(why) = &st.refusing_new_request_ids {
+                    let _ = writeln!(
+                        log,
+                        "robodr-agentd: control plane: {why}: every new request id is refused \
+                         until a restart reconciles the journal"
+                    );
+                }
+                if let Some(f) = st.replay.fence {
+                    let _ = writeln!(
+                        log,
+                        "robodr-agentd: control plane: replay store fenced at {f}: requests \
+                         signed at or before it are refused"
+                    );
+                }
                 Some(cp)
             }
         };
@@ -809,7 +1006,13 @@ impl<'a> Daemon<'a> {
         }
         let feed = r.safety_feed.clone().map(SafetyFeed::new);
         if let Some(sock) = r.safety_feed.as_ref().and_then(|f| f.socket.as_ref()) {
-            let l = input::bind_event_socket(&sock.path).map_err(|e| {
+            // Review L-D: never the exporters' group as a feeder group.
+            sock.check_feeder_groups(crate::host::group_gid(
+                std::path::Path::new("/etc/group"),
+                "robodr",
+            ))
+            .map_err(DaemonError::Config)?;
+            let l = input::bind_socket(&sock.path, sock.mode, sock.group).map_err(|e| {
                 DaemonError::Io(format!("safety socket {}: {e}", sock.path.display()))
             })?;
             let input_feed = add(
@@ -818,10 +1021,20 @@ impl<'a> Daemon<'a> {
                 true,
             );
             let (stop, max) = (stop_inputs.clone(), sock.max_connections);
+            // Review H1: only root, this daemon's uid and the configured
+            // feeders may report a safety state (never another service).
+            let policy = sock.peer_policy(crate::config::effective_uid());
             spawns.push((
                 input_feed,
                 Box::new(move |f| {
-                    input::run_unix_listener_with(l, max, stop, f, input::parse_safety_line)
+                    input::run_unix_listener_peers(
+                        l,
+                        max,
+                        stop,
+                        f,
+                        input::parse_safety_line,
+                        Some(policy),
+                    )
                 }),
             ));
         }
@@ -849,11 +1062,28 @@ impl<'a> Daemon<'a> {
                         stop,
                         f,
                         crate::host::parse_host_line,
-                        Some(allowed),
+                        Some(input::PeerPolicy::uids(allowed)),
                     )
                 }),
             ));
         }
+        // The status socket (review H1): the robot's safety state, from this
+        // process alone, for robodr-deliverd (which checks SO_PEERCRED).
+        let status_snapshot: Arc<std::sync::Mutex<Arc<Vec<u8>>>> = Arc::default();
+        let status_server = match &cfg.spool.status_socket {
+            None => None,
+            Some(p) => {
+                let l = input::bind_event_socket(p)
+                    .map_err(|e| DaemonError::Io(format!("status socket {}: {e}", p.display())))?;
+                let (stop, snap) = (stop_inputs.clone(), status_snapshot.clone());
+                Some(
+                    std::thread::Builder::new()
+                        .name("agentd-status".into())
+                        .spawn(move || serve_status(l, stop, snap))
+                        .map_err(|e| DaemonError::Io(format!("spawning status thread: {e}")))?,
+                )
+            }
+        };
         drop(tx);
         for (i, (feed, body)) in spawns.into_iter().enumerate() {
             let h = std::thread::Builder::new()
@@ -898,6 +1128,7 @@ impl<'a> Daemon<'a> {
             tick_max_age_ms: 0,
             profile_accepted: None,
             correlator,
+            flood: crate::flood::FloodGuard::default(),
             correlation_pressure_reported: 0,
             correlation_pressure_at_ms: None,
             incidents_reported: None,
@@ -905,6 +1136,15 @@ impl<'a> Daemon<'a> {
             control,
             control_reported: [0; 2],
             control_reported_at_ms: [None; 2],
+            executor,
+            replay: r
+                .sensor
+                .capture
+                .as_ref()
+                .filter(|c| matches!(c.input, CaptureInput::Replay { .. }))
+                .map(|_| ReplayTimeline::default()),
+            status_snapshot,
+            status_server,
         };
         #[derive(Serialize)]
         struct StartNote<'b> {
@@ -937,6 +1177,30 @@ impl<'a> Daemon<'a> {
         if let Err(e) = d.agent.record_note(now, "start note", &note, true) {
             d.stats.note_errors += 1;
             let _ = writeln!(d.log, "robodr-agentd: start note not recorded: {e:?}");
+        }
+        // The control plane's state at start (restored requests, settled
+        // decisions, journal damage, replay fence) is evidence too.
+        if let Some(cp) = d.control.as_ref() {
+            let st = cp.status();
+            let note = serde_json::json!({
+                "kind": "robodr.control_plane_start",
+                "api": st.api,
+                "listening": st.listening,
+                "tls": st.tls,
+                "evidence_api": st.evidence.is_some(),
+                "state": st.state,
+            });
+            let now = d.clock.now();
+            if let Err(e) = d
+                .agent
+                .record_note(now, "control-plane start note", &note, true)
+            {
+                d.stats.note_errors += 1;
+                let _ = writeln!(
+                    d.log,
+                    "robodr-agentd: control-plane start note not recorded: {e:?}"
+                );
+            }
         }
         d.profile_witness(accepted_ok);
         d.evidence_incidents();
@@ -1038,6 +1302,7 @@ impl<'a> Daemon<'a> {
                 self.receive(wait, next_tick);
             }
             self.control_poll();
+            self.executor_poll();
             let now = Instant::now();
             if now >= next_tick {
                 let delay = ms(now.duration_since(next_tick));
@@ -1116,8 +1381,24 @@ impl<'a> Daemon<'a> {
         match m.payload {
             Payload::Datagram(d) => {
                 self.stats.datagrams += 1;
-                let capture_ns = self.clock.now().mono_ns;
-                let out = self.pipeline.process_datagram_with_motion(&d, capture_ns);
+                let captured_ns = d
+                    .captured_at
+                    .map(|t| u64::try_from(t.as_nanos()).unwrap_or(u64::MAX));
+                let handled_ns = self.clock.now().mono_ns;
+                // A replayed packet is observed at its own record time (see
+                // "Live motion data"); a live one when it is handled.
+                let replayed = self
+                    .inputs
+                    .get(m.input)
+                    .is_some_and(|i| i.kind == InputKind::Capture);
+                let capture_ns = match (self.replay.as_mut(), captured_ns) {
+                    (Some(tl), Some(c)) if replayed => tl.place(c, handled_ns, Instant::now()),
+                    _ => handled_ns,
+                };
+                let pipeline_now = self.pipeline_now();
+                let out =
+                    self.pipeline
+                        .process_datagram_with_motion_at(&d, pipeline_now, capture_ns);
                 // The feed's tap after the pipeline (binding updated from
                 // this datagram), before anything of it is planned.
                 let fed = match self.feed.as_mut() {
@@ -1133,7 +1414,7 @@ impl<'a> Daemon<'a> {
                 self.sync_identities();
                 self.sensor_findings(out.findings);
                 for s in out.motion {
-                    self.motion_sample(s);
+                    self.motion_sample(s, captured_ns.unwrap_or(capture_ns));
                 }
             }
             Payload::Safety(report) => {
@@ -1151,9 +1432,15 @@ impl<'a> Daemon<'a> {
             Payload::Host(crate::host::HostLine::Threat(t)) => self.host_threat(&t),
             Payload::Event(ev) => {
                 self.stats.events += 1;
+                if let Some(link) = self.executor.as_mut() {
+                    link.observe_event(&ev);
+                }
                 let safety = self.safety();
                 let now = self.clock.now();
-                let outs = self.agent.handle(now, &ev, safety);
+                let detect_ns = self.detect_ns();
+                let outs = self
+                    .agent
+                    .handle_with_joint_at(now, detect_ns, &ev, None, safety);
                 for o in outs {
                     self.emit(o);
                 }
@@ -1188,24 +1475,89 @@ impl<'a> Daemon<'a> {
     /// source-mismatched; the pipeline already raised the finding) loses its
     /// writer GUID first: the firewall model then sees an unknown source, so
     /// a GUID claimed by a spoofer never authorises a command.
-    fn motion_sample(&mut self, mut s: MotionSample) {
+    ///
+    /// A decoded low-level joint frame (Unitree `LowCmd`, ...) goes with its
+    /// command to the agent's joint firewall (recording-only, like every
+    /// verdict here), stamped `joint_stamp_ns`: the datagram's capture
+    /// time, so the firewall's rate / gap checks see the real inter-arrival
+    /// times, not the daemon's processing times.
+    fn motion_sample(&mut self, mut s: MotionSample, joint_stamp_ns: u64) {
         self.stats.motion_events += 1;
         if s.attribution.is_refused() {
             if let RobotEvent::MotionCommand(c) = &mut s.event {
                 c.source_guid = None;
             }
         }
+        let joint = s.joint.and_then(|j| {
+            Some(JointInput {
+                frame: joint_frame(&j)?,
+                stamp_ns: joint_stamp_ns,
+            })
+        });
+        if joint.is_some() {
+            self.stats.joint_frames += 1;
+        }
         let safety = self.safety();
         let now = self.clock.now();
-        let outs = self.agent.handle(now, &s.event, safety);
+        let detect_ns = self.detect_ns();
+        let outs =
+            self.agent
+                .handle_with_joint_at(now, detect_ns, &s.event, joint.as_ref(), safety);
         for o in outs {
             self.emit(o);
         }
     }
 
-    /// Pipeline findings -> agent -> spool.
+    /// The detection time for the agent's time-dependent detectors: the
+    /// replay's packet timeline while one runs (so events handled between
+    /// packets do not move the motion monitor along the daemon's clock),
+    /// else `None` (the event's own time).
+    fn detect_ns(&self) -> Option<u64> {
+        self.replay.as_ref().and_then(ReplayTimeline::position)
+    }
+
+    /// [`Self::detect_ns`], or the daemon clock: the time of a correlation
+    /// signal.
+    fn signal_ns(&self) -> u64 {
+        self.detect_ns().unwrap_or_else(|| self.clock.now().mono_ns)
+    }
+
+    /// The pipeline's clock: the replay's packet timeline while one runs
+    /// (discovery expiry and grace windows), else now.
+    fn pipeline_now(&self) -> Instant {
+        self.replay
+            .as_ref()
+            .and_then(ReplayTimeline::instant)
+            .unwrap_or_else(Instant::now)
+    }
+
+    /// Pipeline findings -> agent -> spool; per-participant discovery
+    /// findings of a flooding source are folded into one aggregate
+    /// ([`crate::flood`]): recorded in the black box and correlated, not
+    /// reported one by one.
     fn sensor_findings(&mut self, found: Vec<Finding>) {
         for f in found {
+            let ns = self.signal_ns();
+            let wall_ms = self.clock.now().wall_ns / 1_000_000;
+            let protected = f
+                .participant
+                .is_some_and(|p| self.pipeline.binding().is_protected(&p));
+            let item = crate::flood::Item {
+                deviation: &f.deviation,
+                src_ip: &f.src_ip,
+                participant: f.participant.as_ref(),
+                protected,
+            };
+            match self.flood.admit(item, ns, wall_ms) {
+                crate::flood::Admit::Pass => {}
+                crate::flood::Admit::Fold(reports) => {
+                    self.fold(&f);
+                    for r in reports {
+                        self.flood_report(r);
+                    }
+                    continue;
+                }
+            }
             let safety = self.safety();
             let now = self.clock.now();
             let subject = Subject {
@@ -1222,6 +1574,63 @@ impl<'a> Daemon<'a> {
                 safety,
             );
             self.emit(o);
+        }
+    }
+
+    /// A folded finding: its deviation record in the black box (as the
+    /// agent writes it for a reported one) and its correlation signal.
+    fn fold(&mut self, f: &Finding) {
+        let now = self.clock.now();
+        let r = match self
+            .agent
+            .record_deviation(now, Detector::Sensor, &f.deviation)
+        {
+            Ok(r) => Some(r),
+            Err(_) => {
+                self.stats.note_errors += 1;
+                None
+            }
+        };
+        let source = format!("src:{}", f.src_ip);
+        self.correlate_deviation(&f.deviation, &source, r.as_ref());
+    }
+
+    /// A discovery-flood aggregate: reported like a pipeline finding.
+    fn flood_report(&mut self, r: crate::flood::FloodReport) {
+        let safety = self.safety();
+        let now = self.clock.now();
+        let source = match &r.src_ip {
+            Some(ip) => format!("src:{ip}"),
+            None => "flood:many_sources".to_string(),
+        };
+        // One finding id per flood episode (review L10): the subject is
+        // the source plus the episode's synthetic node name.
+        let subject = Subject {
+            src_ip: r.src_ip.clone(),
+            node: Some(r.episode.clone()),
+            ..Subject::default()
+        };
+        let o = self.agent.handle_external(
+            now,
+            Detector::Sensor,
+            &source,
+            subject,
+            r.deviation,
+            safety,
+        );
+        self.emit(o);
+    }
+
+    /// Close quiet floods (tick) or every flood (`all`, at stop).
+    fn flood_close(&mut self, all: bool) {
+        let reports = if all {
+            self.flood.flush()
+        } else {
+            let ns = self.signal_ns();
+            self.flood.tick(ns)
+        };
+        for r in reports {
+            self.flood_report(r);
         }
     }
 
@@ -1309,9 +1718,18 @@ impl<'a> Daemon<'a> {
 
     fn emit(&mut self, o: Outcome) {
         self.stats.outcomes += 1;
-        let reserve = o.detector == Detector::SelfHealth;
+        // Critical findings have a share of the spool lesser ones cannot
+        // fill (red team F1, `spool` module docs); health findings their
+        // own reserve.
+        let class = if o.detector == Detector::SelfHealth {
+            SpoolClass::Health
+        } else if o.deviation.severity >= robodr_events::Severity::Critical {
+            SpoolClass::Critical
+        } else {
+            SpoolClass::Normal
+        };
         match &o.finding {
-            Some(f) => match self.spool.write(f, reserve) {
+            Some(f) => match self.spool.write_from(f, class, &o.source) {
                 Ok(_) => self.stats.findings_spooled += 1,
                 Err(SpoolError::Full) => {}
                 Err(e) => {
@@ -1392,7 +1810,7 @@ impl<'a> Daemon<'a> {
             t.deviation(),
             safety,
         );
-        let mut sig = Signal::host(self.clock.now().mono_ns, t.rule.clone(), t.severity())
+        let mut sig = Signal::host(self.signal_ns(), t.rule.clone(), t.severity())
             .with_mode(o.deviation.mode)
             .with_entity(EntityKind::Process, t.process_entity());
         if let Some(r) = &o.evidence.deviation {
@@ -1411,7 +1829,17 @@ impl<'a> Daemon<'a> {
     /// and host-threat findings (fed as their Pulsar rule by
     /// [`Self::host_threat`]) are not fed here.
     fn correlate(&mut self, o: &Outcome) {
-        let rule = o.deviation.rule_str();
+        self.correlate_deviation(&o.deviation, &o.source, o.evidence.deviation.as_ref());
+    }
+
+    /// One deviation (reported or folded) into the correlator.
+    fn correlate_deviation(
+        &mut self,
+        dev: &robodr_events::Deviation,
+        source: &str,
+        evidence: Option<&robodr_ocsf::BlackBoxRef>,
+    ) {
+        let rule = dev.rule_str();
         if self.correlator.is_none()
             || rule.starts_with(robodr_correlate::RULE_ID_PREFIX)
             || rule == health_rules::CORRELATION_PRESSURE
@@ -1419,13 +1847,13 @@ impl<'a> Daemon<'a> {
         {
             return;
         }
-        let mut sig = Signal::from_deviation(self.clock.now().mono_ns, &o.deviation);
-        if let Some(ip) = o.source.strip_prefix("src:") {
+        let mut sig = Signal::from_deviation(self.signal_ns(), dev);
+        if let Some(ip) = source.strip_prefix("src:") {
             sig = sig.with_entity(EntityKind::Ip, ip);
-        } else if let Some(p) = o.source.strip_prefix("participant:") {
+        } else if let Some(p) = source.strip_prefix("participant:") {
             sig = sig.with_entity(EntityKind::Participant, p);
         }
-        if let Some(r) = &o.evidence.deviation {
+        if let Some(r) = evidence {
             sig = sig.with_evidence_ref(r.uri(&self.r.config.robot.id));
         }
         self.observe_signal(&sig);
@@ -1451,15 +1879,13 @@ impl<'a> Daemon<'a> {
     /// participants, IPs bound or pinned to them): their pending state is
     /// best protected from eviction.
     fn correlation_known(&mut self) {
+        let now = self.pipeline_now();
         let Some(c) = self.correlator.as_mut() else {
             return;
         };
         let participants = self.pipeline.profile().participants.clone();
         c.set_known_entities(EntityKind::Participant, participants);
-        let ips = self
-            .pipeline
-            .binding()
-            .profiled_ips(std::time::Instant::now());
+        let ips = self.pipeline.binding().profiled_ips(now);
         c.set_known_entities(EntityKind::Ip, ips.iter().map(|ip| ip.to_string()));
     }
 
@@ -1604,7 +2030,7 @@ impl<'a> Daemon<'a> {
     /// rising eviction / refusal count (rate-limited like other health
     /// counters).
     fn correlation_tick(&mut self) {
-        let now_ns = self.clock.now().mono_ns;
+        let now_ns = self.signal_ns();
         self.correlation_known();
         let Some(c) = self.correlator.as_mut() else {
             return;
@@ -1747,12 +2173,14 @@ impl<'a> Daemon<'a> {
         self.stats.ticks += 1;
         // Staleness is noticed (and recorded) even on a quiet bus.
         self.safety();
-        let mut found = self.pipeline.tick();
+        let now = self.pipeline_now();
+        let mut found = self.pipeline.tick_at(now);
         self.sync_identities();
         if let Some(h) = self.capture_health.latest() {
             found.extend(self.pipeline.capture_findings(&h));
         }
         self.sensor_findings(found);
+        self.flood_close(false);
         self.handle_ended();
 
         let spool = self.spool.stats();
@@ -1970,6 +2398,7 @@ impl<'a> Daemon<'a> {
             pipeline: self.pipeline.stats(),
             agent: self.agent.stats(),
             spool: self.spool.stats(),
+            discovery_flood: self.flood.stats(),
             correlation: self.correlator.as_ref().map(|c| *c.stats()),
             signs_findings: self.agent.signs_findings(),
             evidence_degraded: self.agent.evidence_degraded(),
@@ -1988,10 +2417,17 @@ impl<'a> Daemon<'a> {
             queue_bytes: self.budget.used(),
             queue_bytes_max: self.budget.max(),
             control_plane: self.control.as_ref().map(ControlPlane::status),
+            executor: self.executor.as_ref().map(|l| l.stats()),
         };
         let res = serde_json::to_vec_pretty(&status)
             .map_err(std::io::Error::other)
-            .and_then(|b| self.spool.write_side_file(STATUS_FILE, &b));
+            .and_then(|b| {
+                let b = Arc::new(b);
+                if let Ok(mut g) = self.status_snapshot.lock() {
+                    *g = b.clone();
+                }
+                self.spool.write_side_file(STATUS_FILE, &b)
+            });
         if let Err(e) = res {
             let _ = writeln!(self.log, "robodr-agentd: writing status: {e}");
         }
@@ -2052,6 +2488,9 @@ impl<'a> Daemon<'a> {
             cp.shutdown();
         }
         self.stop_inputs.store(true, Ordering::SeqCst);
+        if let Some(h) = self.status_server.take() {
+            let _ = h.join();
+        }
         // Join inputs that poll the stop flag (bounded by their timeouts);
         // stdin may block forever and is left behind.
         for i in &mut self.inputs {
@@ -2071,6 +2510,7 @@ impl<'a> Daemon<'a> {
         }
         found.extend(self.pipeline.finish());
         self.sensor_findings(found);
+        self.flood_close(true);
         self.heartbeat("robodr.agentd_stop");
         self.write_status(false);
         let pipeline = *self.pipeline.stats();
@@ -2116,6 +2556,7 @@ impl cp_api::Host for Daemon<'_> {
         let c = &self.r.config.context;
         OperationalContext {
             platform: self.r.policy.platform,
+            morphology: self.r.policy.morphology,
             phase: c.phase,
             connectivity: c.connectivity,
             control: c.control,
@@ -2155,5 +2596,296 @@ impl cp_api::Host for Daemon<'_> {
                 Err(e.join("; "))
             }
         }
+    }
+}
+
+/// A decoded Unitree joint command frame as the Motion Firewall's
+/// [`robodr_firewall::JointFrame`]: every slot on the wire (mode octet via
+/// `MotorMode::from_u8`: any non-zero mode is enabled), the decoder's CRC
+/// verdict and the hg `LowCmd`'s `mode_pr` / `mode_machine`. `None` only for
+/// a frame wider than the firewall's `MAX_MOTORS` (35, the widest Unitree
+/// layout), which the decoder never produces: such a frame is not checked
+/// (and counted as a missing joint frame by the agent) rather than cut.
+pub fn joint_frame(
+    j: &robodr_ros2_pipeline::JointCommandSample,
+) -> Option<robodr_firewall::JointFrame> {
+    use robodr_firewall::{JointFrame, MotorCmd, MotorMode};
+    let motors: Vec<MotorCmd> = j
+        .frame
+        .as_slice()
+        .iter()
+        .map(|m| MotorCmd {
+            mode: MotorMode::from_u8(m.mode),
+            q: f64::from(m.q),
+            dq: f64::from(m.dq),
+            tau: f64::from(m.tau),
+            kp: f64::from(m.kp),
+            kd: f64::from(m.kd),
+        })
+        .collect();
+    let mut f = JointFrame::from_slice(&motors, j.crc_ok)?;
+    f.mode_pr = j.mode_pr;
+    f.mode_machine = j.mode_machine;
+    Some(f)
+}
+
+// --- executor v1 -------------------------------------------------------------
+// Kept apart from the control-plane code: the link to robodr-executor
+// (`executor.enabled`, crate::executor_link).
+impl Daemon<'_> {
+    /// Publish the safety state for the executor's apply-time re-check,
+    /// dispatch staged orders whose request / plan is in the black box, do
+    /// `record_evidence` marks, and record the executor's events.
+    fn executor_poll(&mut self) {
+        let Some(link) = self.executor.take() else {
+            return;
+        };
+        let state = self.safety();
+        link.safety().set(state);
+        for st in link.take_staged() {
+            use crate::executor_link::Staged;
+            match st {
+                Staged::Submit(o) => {
+                    // A control-plane order goes out only once its request
+                    // is stored (i.e. recorded); a planner order's plan was
+                    // recorded before the agent offered it.
+                    let recorded = match &o.origin {
+                        // CP review finding 3: the stored request must be
+                        // the one this order was made for.
+                        robodr_executor::Origin::ControlPlane { .. } => {
+                            crate::executor_link::release_ok(
+                                &o,
+                                self.control.as_ref().and_then(|c| c.engine.get(&o.id)),
+                            )
+                        }
+                        robodr_executor::Origin::Planner { .. } => true,
+                    };
+                    if recorded {
+                        // A quarantine carries the participant's SPDP
+                        // unicast locators (the executor refuses it
+                        // without): its own last trusted ones, also after
+                        // it left (red team F3), only on addresses it was
+                        // seen sending from, never another participant's,
+                        // none for a contested prefix (review H1, H2, M5);
+                        // a GUID-prefix-only quarantine is vouched for when
+                        // none is left. A SOC request keeps the named
+                        // prefix's locators remembered (review M6).
+                        if let (
+                            robodr_executor::Origin::ControlPlane { .. },
+                            robodr_executor::order::Target::Participant { guid_prefix, .. },
+                        ) = (&o.origin, &o.target)
+                        {
+                            self.pipeline.note_soc_reference(&guid_prefix.0);
+                        }
+                        let now = self.pipeline_now();
+                        let binding = self.pipeline.binding();
+                        let o =
+                            link.with_locators(o, crate::executor_link::vouch_with(binding, now));
+                        link.dispatch(Staged::Submit(o));
+                    } else {
+                        link.count_dropped();
+                    }
+                }
+                Staged::Revert { id, reason, soc } => {
+                    let recorded = self
+                        .control
+                        .as_ref()
+                        .and_then(|c| c.engine.get(&id))
+                        .is_some_and(|s| s.revert.is_some());
+                    if recorded {
+                        link.dispatch(Staged::Revert { id, reason, soc });
+                    } else {
+                        link.count_dropped();
+                    }
+                }
+                Staged::Evidence(o) => {
+                    let refs: Vec<String> = self
+                        .control
+                        .as_ref()
+                        .and_then(|c| c.engine.get(&o.id))
+                        .filter(|s| crate::executor_link::release_ok(&o, Some(s)))
+                        .map(|s| vec![s.evidence.clone()])
+                        .unwrap_or_default();
+                    if refs.is_empty() {
+                        link.count_dropped();
+                        continue;
+                    }
+                    let robot = self.r.config.robot.id.clone();
+                    let now_ms = cp_api::Host::wall_ms(self);
+                    let mut sink = EvidenceSink {
+                        daemon: self,
+                        robot: &robot,
+                    };
+                    let out = robodr_executor::evidence::record(&o, &refs, &mut sink, now_ms);
+                    link.put(out);
+                }
+            }
+        }
+        // Journal every changed outcome at once (control plane v2): a
+        // request that reached `verified` reads `verified` after a restart
+        // even if nobody asked for it before.
+        let changed = link.take_changed();
+        if let Some(cp) = self.control.as_mut() {
+            for id in changed {
+                cp.engine.sync(&id);
+            }
+        }
+        for ev in link.take_events() {
+            let note = serde_json::json!({
+                "kind": "robodr.executor_event",
+                "event": ev,
+            });
+            let critical = matches!(
+                ev.kind,
+                robodr_executor::journal::EventKind::RevertFailed
+                    | robodr_executor::journal::EventKind::Drift
+                    | robodr_executor::journal::EventKind::RemovedExternally
+                    | robodr_executor::journal::EventKind::JournalReset
+            );
+            let now = self.clock.now();
+            if self
+                .agent
+                .record_note(now, "executor event", &note, critical)
+                .is_err()
+            {
+                self.stats.note_errors += 1;
+            }
+            let _ = writeln!(
+                self.log,
+                "robodr-agentd: executor: {:?} {} {}",
+                ev.kind,
+                sanitize(ev.id.as_deref().unwrap_or("-")),
+                sanitize(&ev.detail)
+            );
+        }
+        self.executor = Some(link);
+    }
+}
+
+/// The black box as the `record_evidence` adapter's sink.
+struct EvidenceSink<'d, 'a> {
+    daemon: &'d mut Daemon<'a>,
+    robot: &'d str,
+}
+
+impl robodr_executor::evidence::EvidenceSink for EvidenceSink<'_, '_> {
+    fn mark(&mut self, note: &serde_json::Value) -> Result<String, String> {
+        // Critical: fsynced before the reference is returned.
+        cp_api::Host::record(self.daemon, "evidence mark", note)
+    }
+
+    fn verify(&mut self, reference: &str) -> Result<(), String> {
+        let prefix = format!("robodr-blackbox://{}/", self.robot);
+        let hash = reference.rsplit_once("?sha256=").map(|(_, h)| h);
+        if reference.starts_with(&prefix)
+            && hash.is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "unexpected evidence reference {}",
+                sanitize(reference)
+            ))
+        }
+    }
+}
+
+/// Serve the latest status on the status socket (`spool.status_socket`,
+/// review H1): every connection gets the current `status.json` bytes and
+/// is closed; nothing is read from it. A connection that does not take the
+/// bytes within a second is dropped. Until the first status is written a
+/// connection is closed empty (the reader treats that as `unknown`).
+/// Removes the socket file on exit, if it is still the one bound here.
+fn serve_status(
+    sock: input::EventSocket,
+    stop: Arc<AtomicBool>,
+    snapshot: Arc<std::sync::Mutex<Arc<Vec<u8>>>>,
+) {
+    while !stop.load(Ordering::Relaxed) {
+        match sock.listener.accept() {
+            Ok((mut conn, _)) => {
+                let bytes = snapshot.lock().map(|g| g.clone()).unwrap_or_default();
+                if conn.set_nonblocking(false).is_ok()
+                    && conn.set_write_timeout(Some(Duration::from_secs(1))).is_ok()
+                {
+                    let _ = conn.write_all(&bytes);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
+    sock.remove_if_ours();
+}
+
+#[cfg(test)]
+mod status_socket_tests {
+    use super::*;
+    use std::io::Read;
+
+    /// Review H1: the status socket serves the latest status bytes, from
+    /// this process (the reader checks SO_PEERCRED), empty before the
+    /// first status.
+    #[test]
+    fn serves_the_latest_status() {
+        let d = std::env::temp_dir().join(format!("agentd-status-sock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let path = d.join("status.sock");
+        let l = input::bind_event_socket(&path).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let snap: Arc<std::sync::Mutex<Arc<Vec<u8>>>> = Arc::default();
+        let h = {
+            let (stop, snap) = (stop.clone(), snap.clone());
+            std::thread::spawn(move || serve_status(l, stop, snap))
+        };
+        let read = || {
+            let mut c = std::os::unix::net::UnixStream::connect(&path).unwrap();
+            assert_eq!(
+                crate::host::peer_uid(&c).unwrap(),
+                crate::config::effective_uid()
+            );
+            let mut b = Vec::new();
+            c.read_to_end(&mut b).unwrap();
+            b
+        };
+        assert!(read().is_empty());
+        *snap.lock().unwrap() = Arc::new(b"{\"running\":true}".to_vec());
+        assert_eq!(read(), b"{\"running\":true}");
+        stop.store(true, Ordering::SeqCst);
+        h.join().unwrap();
+        assert!(!path.exists(), "the socket is removed at stop");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod replay_timeline_tests {
+    use super::ReplayTimeline;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn packets_are_placed_by_record_time_not_by_handling_time() {
+        let i0 = Instant::now();
+        let mut tl = ReplayTimeline::default();
+        assert_eq!(tl.position(), None);
+        assert_eq!(tl.instant(), None);
+        // Anchored at the first packet: capture 5 s -> daemon 100 ms.
+        assert_eq!(tl.place(5_000_000_000, 100_000_000, i0), 100_000_000);
+        // Handled "much later" or "at once": only the record time counts.
+        assert_eq!(
+            tl.place(5_250_000_000, 9_000_000_000, i0 + Duration::from_secs(9)),
+            350_000_000
+        );
+        assert_eq!(tl.place(6_000_000_000, 0, i0), 1_100_000_000);
+        assert_eq!(tl.position(), Some(1_100_000_000));
+        assert_eq!(tl.instant(), Some(i0 + Duration::from_secs(1)));
+        // An earlier record (merged interfaces) never moves it back.
+        assert_eq!(tl.place(5_500_000_000, 0, i0), 1_100_000_000);
+        assert_eq!(tl.place(1, 0, i0), 1_100_000_000);
+        assert_eq!(tl.position(), Some(1_100_000_000));
     }
 }

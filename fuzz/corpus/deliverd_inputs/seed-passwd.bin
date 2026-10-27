@@ -1,0 +1,2 @@
+root:x:0:0:root:/root:/bin/bash
+probe:x:1500:1500::/nonexistent:/usr/sbin/nologin

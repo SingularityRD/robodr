@@ -22,6 +22,7 @@ use crate::command::{
 };
 use crate::config::{ChannelKind, FailBehaviour, FaultPolicy, ForeignSourceAction, Limits, Policy};
 use crate::events::{policy_mode, reject_rule, rules, EventAction, EventBuffer, FirewallEvent};
+use crate::joint_engine::JointChanState;
 use crate::verdict::{LimitReasons, RejectReason, Substitute, SubstituteKind, Verdict, WouldHave};
 use robodr_events::{Deviation, Severity};
 
@@ -31,7 +32,8 @@ const ZERO_RAW: Raw = [0.0; MAX_JOINTS];
 /// Relative tolerance of the internal post-condition check.
 const POST_CHECK_TOL: f64 = 1e-9;
 
-/// Counters since construction (never reset; saturating).
+/// Counters since construction (never reset; saturating), plus one gauge
+/// (`joint_hold_age_ns`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stats {
     pub checked: u64,
@@ -41,6 +43,17 @@ pub struct Stats {
     /// Passed with a would-have verdict (observe / pass-through / fail-open).
     pub would_have: u64,
     pub faults: u64,
+    /// Low-level joint channels: hold episodes started. An episode is a run
+    /// of hold substitutes on one channel between two accepted frames (or
+    /// until a damping substitute).
+    pub joint_hold_episodes: u64,
+    /// Humanoid joint channels: hold episodes that outlived `max_hold_ns`
+    /// (each also raised one `joint_hold_exceeded` event).
+    pub joint_holds_exceeded: u64,
+    /// Gauge: age (`now` − acceptance of the held frame, ns) of the most
+    /// recent hold substitute on any joint channel; back to 0 when that
+    /// channel accepts a frame (or damps).
+    pub joint_hold_age_ns: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -68,11 +81,11 @@ impl ChanState {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct PairState {
+pub(crate) struct PairState {
     rate_init: bool,
     credit_ns: u64,
     refill_at: u64,
-    last_stamp: Option<u64>,
+    pub(crate) last_stamp: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -118,14 +131,18 @@ struct Accepted {
 /// The Motion Firewall. See the crate docs for the decision semantics.
 #[derive(Debug)]
 pub struct Firewall {
-    policy: Policy,
-    observe: bool,
+    pub(crate) policy: Policy,
+    pub(crate) observe: bool,
     chans: Vec<ChanState>,
-    pairs: Vec<PairState>,
-    nsrc: usize,
-    last_now: Option<u64>,
+    /// Per low-level joint channel (index = joint index, see
+    /// `Policy::joint_index`).
+    pub(crate) jchans: Vec<JointChanState>,
+    /// Per (channel, source) over **all** channel ids (both kinds).
+    pub(crate) pairs: Vec<PairState>,
+    pub(crate) nsrc: usize,
+    pub(crate) last_now: Option<u64>,
     events: EventBuffer,
-    stats: Stats,
+    pub(crate) stats: Stats,
     #[cfg(test)]
     pub(crate) inject_fault: bool,
 }
@@ -310,7 +327,8 @@ impl Firewall {
         Self {
             observe,
             chans: vec![ChanState::INIT; nch],
-            pairs: vec![PairState::default(); nch.saturating_mul(nsrc)],
+            jchans: vec![JointChanState::INIT; policy.joint_channels.len()],
+            pairs: vec![PairState::default(); policy.channel_count().saturating_mul(nsrc)],
             nsrc,
             last_now: None,
             events,
@@ -388,6 +406,73 @@ impl Firewall {
         self.fault(cmd, now)
     }
 
+    /// Source, rate and timestamp check of a request that commands **no
+    /// motion** on a twist channel (a query, an allowlisted non-velocity
+    /// call): stages 0-6 of [`Self::check`] for `cmd` (its motion should be
+    /// a zero twist), with the channel's **motion state left as it was**
+    /// (last output, acceleration, hold value): such a request says nothing
+    /// about the robot's velocity, so it must neither reset the reference
+    /// the next velocity command is ramped from nor count as a stop.
+    /// Accepted: the (channel, source) rate credit and stamp are stored,
+    /// `true`. Refused: the rejection event is recorded (no substitute:
+    /// the request carries none), `false`. Observe mode: recorded as
+    /// would-have, `true`.
+    pub fn check_access(&mut self, cmd: &Command, now: u64) -> bool {
+        self.stats.checked = self.stats.checked.saturating_add(1);
+        let ch_idx = usize::from(cmd.channel.0);
+        match self.evaluate(cmd, now, ch_idx) {
+            Ok(acc) => {
+                if let Some(p) = self.pairs.get_mut(acc.pair_idx) {
+                    *p = acc.pair_new;
+                }
+                self.stats.passed = self.stats.passed.saturating_add(1);
+                true
+            }
+            Err(rej) => {
+                let (rule, sev) = reject_rule(rej.reason);
+                if self.observe {
+                    self.push_event(
+                        rule,
+                        sev,
+                        cmd,
+                        now,
+                        EventAction::ObservedOnly,
+                        rej.value,
+                        rej.limit,
+                    );
+                    self.stats.passed = self.stats.passed.saturating_add(1);
+                    self.stats.would_have = self.stats.would_have.saturating_add(1);
+                    return true;
+                }
+                self.push_event(
+                    rule,
+                    sev,
+                    cmd,
+                    now,
+                    EventAction::Rejected(None),
+                    rej.value,
+                    rej.limit,
+                );
+                self.stats.rejected = self.stats.rejected.saturating_add(1);
+                false
+            }
+        }
+    }
+
+    /// The platform is known to be at rest on twist channel `channel` as of
+    /// `now` (a velocity command whose duration ended: the robot stopped on
+    /// its own). The next command is acceleration limited from zero, and a
+    /// hold can no longer hold the earlier velocity. No-op for an unknown
+    /// channel.
+    pub fn twist_at_rest(&mut self, channel: ChannelId, now: u64) {
+        if let Some(st) = self.chans.get_mut(usize::from(channel.0)) {
+            st.last_out = ZERO_RAW;
+            st.last_out_at = Some(now);
+            st.a_prev = [0.0; 2];
+            st.accepted = None;
+        }
+    }
+
     /// Check one command. Never allocates, never panics, bounded time.
     ///
     /// `now` is the gateway's monotonic clock in nanoseconds, in the same
@@ -447,8 +532,20 @@ impl Firewall {
         }
         self.last_now = Some(now);
 
-        // 1. Channel.
+        // 1. Channel. A low-level joint channel is checked by
+        //    `check_joint`; a `Command` on it is a kind mismatch (after the
+        //    source checks, so a foreign source is still reported as such).
         let Some(ch) = self.policy.channels.get(ch_idx) else {
+            if self.policy.is_joint_channel(cmd.channel) {
+                let src_idx = usize::from(cmd.source.0);
+                if cmd.source == SourceId::UNKNOWN || src_idx >= self.nsrc {
+                    return Err(Rejection::new(RejectReason::UnknownSource));
+                }
+                if !self.policy.allows(cmd.channel, cmd.source) {
+                    return Err(Rejection::new(RejectReason::UnauthorizedSource));
+                }
+                return Err(Rejection::new(RejectReason::KindMismatch));
+            }
             return Err(Rejection::new(RejectReason::UnknownChannel));
         };
 
@@ -646,25 +743,45 @@ impl Firewall {
         value: f64,
         limit: f64,
     ) {
-        let authorised = cmd.source != SourceId::UNKNOWN
-            && usize::from(cmd.source.0) < self.nsrc
-            && self
-                .policy
-                .channels
-                .get(usize::from(cmd.channel.0))
-                .is_some_and(|ch| ch.allows(cmd.source));
+        self.record(
+            rule,
+            sev,
+            (cmd.channel, cmd.source),
+            now,
+            action,
+            (value, limit),
+            None,
+        );
+    }
+
+    /// Record one event (shared by both command kinds).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record(
+        &mut self,
+        rule: &'static str,
+        sev: Severity,
+        (channel, source): (ChannelId, SourceId),
+        now: u64,
+        action: EventAction,
+        (value, limit): (f64, f64),
+        slot: Option<u8>,
+    ) {
+        let authorised = source != SourceId::UNKNOWN
+            && usize::from(source.0) < self.nsrc
+            && self.policy.allows(channel, source);
         self.events.push(FirewallEvent {
             rule,
             severity: sev,
             at_ns: now,
-            channel: cmd.channel,
-            source: cmd.source,
+            channel,
+            source,
             action,
             value,
             limit,
             authorised,
             count: 1,
             last_at_ns: now,
+            slot,
         });
     }
 

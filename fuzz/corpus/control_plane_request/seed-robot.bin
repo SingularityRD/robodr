@@ -1,0 +1,9 @@
+ÿGET /api/v2/robots/ugv-007 HTTP/1.1
+Host: robot
+Content-Type: application/json
+Content-Length: 0
+X-RoboDR-Key-Id: soc:soc-a:1
+X-RoboDR-Timestamp: 1800000000
+X-RoboDR-Nonce: seed-nonce-000000001
+X-RoboDR-Signature: f48eae8134c62b18780fc14fefd3722907197f754323670d3aee25e7a7b29d0cb33d5648d188f05ead17d9b273163fa5a6d66bf662ce560041f65aecb5c3bb04
+

@@ -1,0 +1,126 @@
+# robodr-kafka-publish: CONNECTED-site findings publisher. Reads
+# robodr-agentd's spool on this host (the robot's companion computer or a
+# sensor box) and produces every finding to the robodr.findings Kafka topic
+# (man robodr-kafka-publish(1), docs/OPERATIONS.md section 8.3).
+#
+# Where robodr-kafka-publish runs:
+#   * Connected site: HERE, on the unit or the sensor box, with --spool
+#     (this unit). Findings leave over the uplink to the brokers only.
+#   * Air-gapped / diode site: on the SOC (high) side, after
+#     robodr-diode-unpack, with --diode-out. That host has its own layout;
+#     give it its own unit (e.g. copy this one, change ExecStart= and
+#     User=). This unit is not for that case.
+# Both units consume agentd's spool, so this one conflicts with
+# robodr-spool-export.service.
+#
+# Checked against crates/robodr-export (robodr-kafka-publish --help):
+#   * CLI: --bootstrap HOST:PORT (repeatable) --state-dir DIR --spool DIR
+#     [--topic T] [--interval-ms N] [--once] ...; without --once it loops
+#     every --interval-ms (default 2000 ms) and retries after errors itself;
+#     exit 2 = usage error.
+#   * With --spool it renames <spool>/ready/* to acked/ after the broker
+#     acknowledged them, so it runs as User=robodr, through the spool's group
+#     (agentd itself runs as robodr-agentd: an exporter cannot write its
+#     black box, its state or its sockets).
+#   * PLAINTEXT Kafka only (no TLS, no SASL): use an isolated SOC network or
+#     a local TLS proxy. It connects to the bootstrap brokers AND to every
+#     broker the metadata advertises (each partition leader), so the
+#     IPAddressAllow= drop-in must list every broker, not just one.
+#   * Name resolution: IP literals are used directly; host names go through
+#     the system resolver, which IPAddressDeny=any blocks unless the DNS
+#     server is allowed too. Use IP literals for --bootstrap AND have the
+#     brokers advertise IP-literal listeners (advertised.listeners), or put
+#     the broker names in /etc/hosts.
+#
+# Site settings: /etc/robodr/kafka-publish.env (0640 root:robodr), from
+# /usr/share/doc/robodr/examples/kafka-publish.env.example:
+#   ROBODR_KAFKA_BOOTSTRAP="--bootstrap 192.0.2.21:9092 --bootstrap 192.0.2.22:9092"  (required)
+#   ROBODR_KAFKA_PUBLISH_ARGS="--topic robodr.findings"                               (optional)
+# Network: install the drop-in example
+#   /usr/share/doc/robodr/examples/robodr-kafka-publish.service.d/50-brokers.conf.example
+# with every broker address. Without it this unit can reach no address at
+# all (IPAddressDeny=any below) and fails closed.
+#
+# Installed disabled. Enable after commissioning:
+#   systemctl enable --now robodr-kafka-publish
+# Verify after editing: systemd-analyze verify robodr-kafka-publish.service
+#                       systemd-analyze security robodr-kafka-publish.service
+
+[Unit]
+Description=RoboDR findings publisher (agentd spool to Kafka, connected sites)
+Documentation=man:robodr-kafka-publish(1) file:/usr/share/doc/robodr/OPERATIONS.md
+AssertPathExists=/etc/robodr/kafka-publish.env
+After=local-fs.target network-online.target robodr-agentd.service
+Wants=network-online.target
+# One consumer per spool: the diode exporter and the uplink read the same one.
+Conflicts=robodr-spool-export.service robodr-uplink.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/robodr/kafka-publish.env
+# Both variables are split on white space; an empty ROBODR_KAFKA_BOOTSTRAP
+# leaves no --bootstrap, a usage error (exit 2).
+ExecStart=/usr/bin/robodr-kafka-publish $ROBODR_KAFKA_BOOTSTRAP --state-dir /var/lib/robodr/export/kafka-publish --spool /var/lib/robodr/spool/agentd $ROBODR_KAFKA_PUBLISH_ARGS
+Restart=on-failure
+RestartSec=10s
+# Exit 2 = usage error: restarting cannot fix it.
+RestartPreventExitStatus=2
+TimeoutStopSec=30s
+OOMScoreAdjust=300
+MemoryHigh=192M
+MemoryMax=256M
+TasksMax=32
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+# --- Identity and capabilities ---------------------------------------------
+User=robodr
+Group=robodr
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+UMask=0027
+
+# --- Filesystem --------------------------------------------------------------
+# No key: the findings already carry agentd's per-finding signature header
+# when finding signing is on (contract section 2a); the publisher forwards it.
+InaccessiblePaths=-/etc/robodr/keys
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ReadWritePaths=/var/lib/robodr/spool/agentd /var/lib/robodr/export/kafka-publish
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# --- Network ---------------------------------------------------------------------
+# Deny every IP address; the 50-brokers.conf drop-in adds IPAddressAllow=
+# for the broker set (systemd: an address on IPAddressAllow= is allowed even
+# though IPAddressDeny=any also matches it).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+
+# --- Kernel interfaces / syscalls -------------------------------------------
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete @mount @swap @reboot @raw-io @cpu-emulation @clock @module @debug
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

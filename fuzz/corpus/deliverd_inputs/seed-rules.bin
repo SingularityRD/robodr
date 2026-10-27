@@ -1,0 +1,7 @@
+[[rules]]
+name = "r"
+type = "Exec"
+condition = 'payload.filename ENDS_WITH "/nc"'
+category = "execution"
+severity = "low"
+description = "d"

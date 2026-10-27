@@ -1,0 +1,10 @@
+POST /api/v2/robots/ugv-007/action-requests HTTP/1.1
+Host: ugv-007.robots.example
+Content-Type: application/json
+Content-Length: 185
+X-RoboDR-Key-Id: soc:soc-a:1
+X-RoboDR-Timestamp: 1800000000
+X-RoboDR-Nonce: contract-nonce-0002
+X-RoboDR-Signature: c321412b6762746ad684ba04025820fbfd5b405cc43a5f37f417e60636fe1719fbbf26efc687fd11c02d0b695980de6f750cb76083b43ed2c634d8b0fd64380b
+
+{"action":"safe_pause","authority":"request","parameters":{},"reason":"rogue /cmd_vel writer","request_id":"robot_safe_pause:ugv-007:0001","requested_by":"analyst@soc","source":"soc-a"}

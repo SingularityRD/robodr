@@ -2,6 +2,7 @@
   "schema": "robodr.response-policy/v1",
   "model": "ugv-demo-x1",
   "platform": "ugv",
+  "morphology": "wheeled_mobile",
   "oem_validated": true,
   "matrix": {
     "idle": {
@@ -57,18 +58,10 @@
       ]
     },
     {
-      "rule": "robot.motion.unexpected_source",
+      "rule": "robot.motion.sample_source_mismatch",
       "min_step": "restrict",
       "restrict": [
         "participant",
-        "process"
-      ]
-    },
-    {
-      "rule": "robot.host.unexpected_egress",
-      "max_step": "restrict",
-      "restrict": [
-        "network",
         "process"
       ]
     }

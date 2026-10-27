@@ -1,0 +1,41 @@
+{
+  "body": {
+    "accepted": 2,
+    "batch_id": "rdu1-346e1d034443ab238d1a0e40b6889cb9",
+    "created": 2,
+    "duplicates": 0,
+    "rejected": [
+      {
+        "code": "invalid_line",
+        "line": 1
+      },
+      {
+        "code": "invalid_line",
+        "line": 2
+      },
+      {
+        "code": "invalid_line",
+        "line": 3
+      },
+      {
+        "code": "invalid_line",
+        "line": 4
+      },
+      {
+        "code": "invalid_line",
+        "line": 5
+      },
+      {
+        "code": "invalid_line",
+        "line": 6
+      },
+      {
+        "code": "invalid_line",
+        "line": 8
+      }
+    ],
+    "replayed": false,
+    "updated": 0
+  },
+  "status": 200
+}

@@ -30,7 +30,9 @@
 //! | | [`rules::CAPTURE_UNSUPPORTED_MIDDLEWARE`]: Zenoh (`rmw_zenoh_cpp`) packets on the bus, which the sensor cannot decode | **High** while the capture has accepted no RTPS at all (the sensor is blind to this robot), Medium when RTPS is seen too (part of the bus is not inspected) |
 //! | the profile failed `Profile::validate`, or a locked profile file failed the commissioning file check (seal: edited after `lock`) or the trust check (signature, trust anchors, platform/unit, anti-rollback; see [`crate::profile_trust`]) (once, [`Pipeline::status_findings`]) | [`rules::PROFILE_REFUSED`] | High |
 //! | one input produced more than `max_findings_per_datagram` new findings | [`rules::FINDINGS_CAPPED`] | most severe suppressed, >= Medium |
+//! | a writer announced (SEDP) on a profiled command channel with a type other than the profile's `motion_types` entry, a type no decoder knows, or a feedback type ([`crate::motion`]) | [`rules::MOTION_COMMAND_TYPE_MISMATCH`] | High |
 //! | user DATA on a motion / feedback topic ([`crate::motion`]): undecodable, unattributed (writer never announced), from an IP outside the writer's binding; decoded commands through `Profile::evaluate` | [`rules::MOTION_UNDECODABLE_SAMPLE`], [`rules::MOTION_UNATTRIBUTED_SAMPLE`], [`rules::MOTION_SAMPLE_SOURCE_MISMATCH`], the profile's `robot.motion.*` rules | Medium (rate limited) / High / Critical (command) or High (feedback) / as the profile says |
+//! | Unitree legacy UDP ([`crate::legacy`], off by default): a frame (decoded or compressed) from an unlisted sender, a spoofed-source flood, a MAC-bound sender with another MAC, RTPS on a legacy port, an undecodable payload on a legacy port; decoded commands through `Profile::evaluate` | [`rules::LEGACY_UNKNOWN_SENDER`], [`rules::LEGACY_SENDER_FLOOD`], [`rules::LEGACY_SENDER_MAC_MISMATCH`], [`rules::LEGACY_PORT_RTPS`], [`rules::MOTION_UNDECODABLE_SAMPLE`], the profile's `robot.motion.*` rules | Critical (command) / Medium (state); as the sender's class; High; High; Medium (rate limited); as the profile says |
 //!
 //! # Motion samples
 //!
@@ -86,8 +88,10 @@
 //! - No rate limit on *distinct* profile / binding findings: an attacker
 //!   announcing new GUIDs produces up to `max_findings_per_datagram` findings
 //!   per datagram (each a true positive, the dedup set stays bounded).
-//!   Downstream consumers should aggregate. Protocol and capture findings are
-//!   rate limited.
+//!   Downstream consumers should aggregate (robodr-agentd does: its
+//!   discovery-flood guard, red team F1, keyed by the structured
+//!   [`Finding::participant`] each per-participant / per-endpoint finding
+//!   carries). Protocol and capture findings are rate limited.
 //! - Duplicate identity parameters: the RTPS parser keeps the first value
 //!   and records the conflict as an anomaly without the other value. The
 //!   pipeline cannot judge the other topic itself; it raises
@@ -107,22 +111,25 @@ use std::time::{Duration, Instant};
 
 use robodr_commission::ProfileFileError;
 use robodr_events::profile::{Profile, ProfileError};
-use robodr_events::{Deviation, Mode, Severity};
+use robodr_events::{Deviation, Mode, RobotEvent, Severity};
 use robodr_rtps::{
     hex12, hex_guid, Anomaly, DatagramReport, EndpointKind, FragmentEventKind, FragmentReassembler,
-    ReassemblyLimits,
+    GuidPrefix, ReassemblyLimits,
 };
 use serde::Serialize;
 
 use crate::binding::{
-    parse_src_ip, BindingFinding, BindingOptions, BindingStats, BindingTable, Ingress,
+    parse_prefix, parse_src_ip, BindingFinding, BindingOptions, BindingStats, BindingTable, Ingress,
 };
 use crate::dedup::DedupSet;
 use crate::identity::{IdentityResolver, IdentityStats, Resolution};
-use crate::motion::{DatagramCtx, MotionOptions, MotionSample, MotionStats, MotionTracker};
+use crate::legacy::{self, LegacyOptions, LegacyStats, LegacyTracker};
+use crate::motion::{
+    DatagramCtx, MotionOptions, MotionSample, MotionStats, MotionTracker, SampleAttribution,
+};
 use crate::ratelimit::{self, RateLimiter};
 use crate::sanitize::sanitize;
-use crate::source::{CaptureHealth, Datagram};
+use crate::source::{CaptureHealth, Datagram, LegacyUdp};
 
 /// Prefix added to the threat description of every observe-only finding.
 pub const OBSERVE_ONLY_TAG: &str = "[observe-only] ";
@@ -154,7 +161,9 @@ const MAX_CAPPED_RULES_LISTED: usize = 16;
 
 /// A raw deviation and the source IP it is attributed to, before dedup,
 /// ordering, the per-datagram cap and the rate limit ([`Pipeline::emit`]).
-type Candidate = (Deviation, String);
+/// The third element is the GUID prefix a per-participant / per-endpoint
+/// discovery finding is about ([`Finding::participant`]).
+type Candidate = (Deviation, String, Option<GuidPrefix>);
 
 /// DDSI-RTPS parameter ids whose value decides *what* an announcement is
 /// (topic, type, endpoint / participant identity, instance, liveliness).
@@ -337,9 +346,13 @@ pub mod rules {
         ENDPOINT_SOURCE_MISMATCH, ENDPOINT_UNANNOUNCED_PARTICIPANT, PARTICIPANT_SOURCE_MISMATCH,
     };
     pub use crate::identity::rules::IDENTITY_INSTANCES_EXCEEDED;
+    pub use crate::legacy::rules::{
+        LEGACY_PORT_RTPS, LEGACY_SENDER_FLOOD, LEGACY_SENDER_MAC_MISMATCH, LEGACY_UNKNOWN_SENDER,
+    };
     pub use crate::motion::rules::{
-        MOTION_DECODE_ANOMALY, MOTION_SAMPLE_SOURCE_MISMATCH, MOTION_UNATTRIBUTED_SAMPLE,
-        MOTION_UNDECODABLE_SAMPLE, MOTION_UNVERIFIABLE_COMMAND,
+        MOTION_API_ID_OUT_OF_RANGE, MOTION_COMMAND_TYPE_MISMATCH, MOTION_DECODE_ANOMALY,
+        MOTION_SAMPLE_SOURCE_MISMATCH, MOTION_UNATTRIBUTED_SAMPLE, MOTION_UNDECODABLE_SAMPLE,
+        MOTION_UNVERIFIABLE_COMMAND,
     };
 }
 
@@ -367,6 +380,9 @@ pub struct PipelineOptions {
     pub max_findings_per_datagram: usize,
     /// The user-DATA motion decode path ([`crate::motion`]).
     pub motion: MotionOptions,
+    /// Unitree legacy UDP (Go1 generation, [`crate::legacy`]); off by
+    /// default.
+    pub legacy: LegacyOptions,
 }
 
 impl Default for PipelineOptions {
@@ -381,6 +397,7 @@ impl Default for PipelineOptions {
             rate_limit_interval: ratelimit::DEFAULT_INTERVAL,
             max_findings_per_datagram: DEFAULT_MAX_FINDINGS_PER_DATAGRAM,
             motion: MotionOptions::default(),
+            legacy: LegacyOptions::default(),
         }
     }
 }
@@ -509,6 +526,11 @@ pub struct Finding {
     pub profile_model: String,
     /// [`ProfileStatus::as_str`] at the time.
     pub profile_status: &'static str,
+    /// The GUID prefix a per-participant / per-endpoint discovery finding
+    /// is about (structured, from the parsed announcement; never parsed
+    /// back from the detail text, which carries attacker-chosen names).
+    /// `None` for every other finding.
+    pub participant: Option<GuidPrefix>,
 }
 
 /// Structured data attached to a threat (`Threat::extra` in Pulsar) and the
@@ -600,6 +622,8 @@ pub struct PipelineStats {
     pub binding: BindingStats,
     /// The motion decode path.
     pub motion: MotionStats,
+    /// The Unitree legacy UDP path.
+    pub legacy: LegacyStats,
     /// Run-time participant identity resolution ([`crate::identity`]).
     pub identity: IdentityStats,
 }
@@ -632,6 +656,8 @@ pub struct Pipeline {
     checksum_window: Option<(Instant, u64)>,
     /// User-DATA motion decode path.
     motion: MotionTracker,
+    /// Per-sender finding budgets of the legacy UDP path.
+    legacy: LegacyTracker,
     /// Fresh GUID prefixes -> the profile's stable identities. Resolved
     /// prefixes are added to `profile.participants` (the working copy) and
     /// removed again when they release the identity.
@@ -712,6 +738,7 @@ impl Pipeline {
             last_health: None,
             checksum_window: None,
             motion: MotionTracker::new(opts.motion.clone()),
+            legacy: LegacyTracker::default(),
             epoch: Instant::now(),
             identities: IdentityResolver::new(&profile),
             static_participants: profile.participants.clone(),
@@ -850,20 +877,39 @@ impl Pipeline {
             src_ip: src_ip.to_string(),
             profile_model: self.profile.model.clone(),
             profile_status: self.status.as_str(),
+            participant: None,
         }
     }
 
     /// Queue one raw deviation; [`Pipeline::emit`] decides what is reported.
     fn push(&mut self, out: &mut Vec<Candidate>, deviation: Deviation, src_ip: &str) {
+        self.push_for(out, deviation, src_ip, None);
+    }
+
+    /// [`Pipeline::push`] for a finding about participant `p`.
+    fn push_for(
+        &mut self,
+        out: &mut Vec<Candidate>,
+        deviation: Deviation,
+        src_ip: &str,
+        p: Option<GuidPrefix>,
+    ) {
         self.stats.raw_findings += 1;
-        out.push((deviation, src_ip.to_string()));
+        out.push((deviation, src_ip.to_string(), p));
     }
 
     fn push_binding(&mut self, out: &mut Vec<Candidate>, found: Vec<BindingFinding>) {
-        for (dev, ip) in found {
-            self.push(out, dev, &ip);
+        for (dev, ip, p) in found {
+            self.push_for(out, dev, &ip, p);
         }
         self.stats.binding = *self.binding.stats();
+    }
+
+    /// A SOC request names participant `p` (`quarantine_node`): its
+    /// remembered quarantine locators outlast prefixes nobody named
+    /// ([`BindingTable::note_soc_reference`], review M6).
+    pub fn note_soc_reference(&mut self, p: &GuidPrefix) {
+        self.binding.note_soc_reference(p);
     }
 
     /// Turn the candidates of one call (one datagram, tick, finish or
@@ -882,15 +928,21 @@ impl Pipeline {
     /// ordering guarantees that the most severe findings (e.g. a Critical
     /// rogue motion writer) are never the ones crowded out.
     fn emit(&mut self, cands: Vec<Candidate>, now: Instant) -> Vec<Finding> {
-        let mut fresh: Vec<(String, Deviation, String)> = Vec::with_capacity(cands.len());
+        let mut fresh: Vec<(String, Deviation, String, Option<GuidPrefix>)> =
+            Vec::with_capacity(cands.len());
         let mut batch_keys = HashSet::new();
-        for (dev, ip) in cands {
+        for (dev, ip, p) in cands {
+            // A participant that raised a High / Critical finding keeps its
+            // remembered quarantine locators longer (review M6).
+            if let Some(p) = &p {
+                self.binding.note_finding(p, dev.severity);
+            }
             let key = format!("{}|{}", dev.rule, dev.detail);
             if self.seen.contains(&key) || !batch_keys.insert(key.clone()) {
                 self.stats.duplicates += 1;
                 continue;
             }
-            fresh.push((key, dev, ip));
+            fresh.push((key, dev, ip, p));
         }
         fresh.sort_by_key(|c| std::cmp::Reverse(c.1.severity));
         let cap = self
@@ -901,7 +953,7 @@ impl Pipeline {
         let mut capped: BTreeMap<String, u64> = BTreeMap::new();
         let mut capped_max = Severity::Low;
         let mut capped_n = 0u64;
-        for (key, mut dev, ip) in fresh {
+        for (key, mut dev, ip, p) in fresh {
             if out.len() >= cap {
                 capped_n += 1;
                 capped_max = capped_max.max(dev.severity);
@@ -916,7 +968,9 @@ impl Pipeline {
             }
             self.seen.insert(&key);
             self.stats.findings += 1;
-            out.push(self.finding(dev, &ip));
+            let mut f = self.finding(dev, &ip);
+            f.participant = p;
+            out.push(f);
         }
         if capped_n > 0 {
             self.stats.capped += capped_n;
@@ -1031,7 +1085,9 @@ impl Pipeline {
         self.node_evidence(&report, now);
         self.protocol_findings(&report, src_ip, &ambiguity, &mut out);
         // Motion: learn this datagram's SEDP first, then its user DATA.
-        self.motion.learn(&self.profile, &report);
+        for (dev, p) in self.motion.learn(&self.profile, &report) {
+            self.push_for(&mut out, dev, src_ip, Some(p));
+        }
         let ctx = DatagramCtx {
             src_ip,
             ip,
@@ -1060,13 +1116,175 @@ impl Pipeline {
         datagram: &Datagram,
         capture_ns: u64,
     ) -> ProcessOutput {
+        self.process_datagram_with_motion_at(datagram, Instant::now(), capture_ns)
+    }
+
+    /// [`Pipeline::process_datagram_with_motion`] at an explicit pipeline
+    /// time `now` (a capture replay's own timeline, so discovery expiry and
+    /// grace windows do not depend on how fast the file is read).
+    pub fn process_datagram_with_motion_at(
+        &mut self,
+        datagram: &Datagram,
+        now: Instant,
+        capture_ns: u64,
+    ) -> ProcessOutput {
+        if let Some(udp) = &datagram.legacy {
+            return self.process_legacy_from_at(
+                &datagram.payload,
+                &datagram.src_ip,
+                datagram.ingress,
+                udp,
+                now,
+                capture_ns,
+            );
+        }
         self.process_with_motion_at(
             &datagram.payload,
             &datagram.src_ip,
             datagram.ingress,
-            Instant::now(),
+            now,
             capture_ns,
         )
+    }
+
+    /// One Unitree legacy UDP datagram ([`crate::legacy`]): decoded by its
+    /// length, its sender checked, the command evaluated (if
+    /// `motion.evaluate_commands`) and returned as a [`MotionSample`]
+    /// (commands always; feedback when its channel is a configured
+    /// feedback topic). Dropped (counted) while the legacy path is off.
+    /// The interface is unknown ([`Ingress::Unknown`]); see
+    /// [`Pipeline::process_legacy_from_at`].
+    pub fn process_legacy_at(
+        &mut self,
+        payload: &[u8],
+        src_ip: &str,
+        udp: &LegacyUdp,
+        now: Instant,
+        capture_ns: u64,
+    ) -> ProcessOutput {
+        self.process_legacy_from_at(payload, src_ip, Ingress::Unknown, udp, now, capture_ns)
+    }
+
+    /// [`Pipeline::process_legacy_at`] for a datagram whose interface kind
+    /// is known. A legacy datagram that is also RTPS ([`LegacyUdp::also_rtps`]:
+    /// it starts with the RTPS magic or uses a well-known RTPS port) is
+    /// inspected on **both** paths, plus a High
+    /// [`rules::LEGACY_PORT_RTPS`] finding: nothing on a legacy port escapes
+    /// the legacy sender check by looking like RTPS. While the legacy path
+    /// is off, such a datagram is processed as RTPS only (as before).
+    pub fn process_legacy_from_at(
+        &mut self,
+        payload: &[u8],
+        src_ip: &str,
+        ingress: Ingress,
+        udp: &LegacyUdp,
+        now: Instant,
+        capture_ns: u64,
+    ) -> ProcessOutput {
+        let mut rtps = None;
+        if udp.also_rtps {
+            rtps = Some(self.process_with_motion_at(payload, src_ip, ingress, now, capture_ns));
+            if self.opts.legacy.enabled {
+                // One datagram, two paths: counted once.
+                self.stats.datagrams = self.stats.datagrams.saturating_sub(1);
+            }
+        }
+        self.stats.datagrams += 1;
+        self.stats.legacy.datagrams += 1;
+        let mut out = Vec::new();
+        self.expire_into(now, &mut out);
+        let mut motion = Vec::new();
+        if !self.opts.legacy.enabled {
+            self.stats.legacy.ignored += 1;
+            let mut findings = self.emit(out, now);
+            if let Some(r) = rtps {
+                findings.extend(r.findings);
+                motion.extend(r.motion);
+            }
+            return ProcessOutput { findings, motion };
+        }
+        if udp.also_rtps {
+            self.stats.legacy.rtps_on_legacy_port += 1;
+            self.push(
+                &mut out,
+                Deviation::new(
+                    rules::LEGACY_PORT_RTPS,
+                    Severity::High,
+                    format!(
+                        "RTPS datagram from {src_ip}:{} to {}:{}, a Unitree legacy UDP port: \
+                         inspected as RTPS and as a legacy frame (DDS on the legacy ports is \
+                         not normal; an attempt to evade the legacy sender check?)",
+                        udp.src_port, udp.dst_ip, udp.dst_port
+                    ),
+                ),
+                src_ip,
+            );
+        }
+        let ip = parse_src_ip(src_ip);
+        let r = legacy::process(
+            &self.opts.legacy,
+            &mut self.stats.legacy,
+            &mut self.legacy,
+            payload,
+            src_ip,
+            ip,
+            udp,
+            capture_ns,
+        );
+        for dev in r.deviations {
+            self.push(&mut out, dev, src_ip);
+        }
+        if let Some((mut event, frame, allowed)) = r.event {
+            let command = frame.is_command();
+            let channel = frame.channel();
+            // A decoded (declared-layout) `LowCmd` carries its 20-slot
+            // frame for a joint firewall, like an SDK2 `LowCmd_`. The
+            // legacy protocol's CRC and mode fields are not checked here.
+            let mut joint = None;
+            if let (RobotEvent::MotionCommand(c), Some(jf)) =
+                (&mut event, frame.joint_command_frame())
+            {
+                self.motion.note_joint_frame(channel, jf, c);
+                joint = Some(crate::motion::JointCommandSample {
+                    frame: jf,
+                    crc_ok: None,
+                    mode_pr: None,
+                    mode_machine: None,
+                });
+            }
+            let wanted = command || self.opts.motion.feedback_topics.contains(channel);
+            if command && self.opts.motion.evaluate_commands {
+                if let Some(dev) = self.profile.evaluate(&event) {
+                    self.push(&mut out, dev, src_ip);
+                }
+            }
+            if wanted {
+                motion.push(MotionSample {
+                    event,
+                    src_ip: src_ip.to_string(),
+                    writer_guid: format!("udp:{src_ip}:{}", udp.src_port),
+                    topic: channel.to_string(),
+                    type_name: legacy::type_label(frame.kind()).to_string(),
+                    sequence_number: 0,
+                    source_timestamp: None,
+                    capture_ns,
+                    from_fragments: false,
+                    trailing_bytes: 0,
+                    attribution: if allowed {
+                        SampleAttribution::Bound
+                    } else {
+                        SampleAttribution::Unbound
+                    },
+                    joint,
+                });
+            }
+        }
+        let mut findings = self.emit(out, now);
+        if let Some(r) = rtps {
+            findings.extend(r.findings);
+            motion.extend(r.motion);
+        }
+        ProcessOutput { findings, motion }
     }
 
     fn expire_into(&mut self, now: Instant, out: &mut Vec<Candidate>) {
@@ -1196,10 +1414,11 @@ impl Pipeline {
                         sanitize(&identity),
                         held.join(", ")
                     );
-                    self.push(
+                    self.push_for(
                         out,
                         Deviation::new(rules::IDENTITY_INSTANCES_EXCEEDED, Severity::High, detail),
                         src_ip,
+                        Some(p),
                     );
                 }
                 Resolution::Refreshed | Resolution::NoMatch => {}
@@ -1239,8 +1458,22 @@ impl Pipeline {
     }
 
     /// Process a [`Datagram`] from a [`crate::DatagramSource`], including
-    /// its [`Ingress`].
+    /// its [`Ingress`]. A Unitree legacy UDP datagram ([`Datagram::legacy`])
+    /// goes to [`Pipeline::process_legacy_at`].
     pub fn process_datagram(&mut self, datagram: &Datagram) -> Vec<Finding> {
+        if let Some(udp) = &datagram.legacy {
+            let capture_ns = self.default_capture_ns(Instant::now());
+            return self
+                .process_legacy_from_at(
+                    &datagram.payload,
+                    &datagram.src_ip,
+                    datagram.ingress,
+                    udp,
+                    Instant::now(),
+                    capture_ns,
+                )
+                .findings;
+        }
         self.process_from_at(
             &datagram.payload,
             &datagram.src_ip,
@@ -1258,7 +1491,14 @@ impl Pipeline {
         for event in report.to_events(src_ip) {
             self.stats.events += 1;
             if let Some(dev) = self.profile.evaluate(&event) {
-                self.push(out, dev, src_ip);
+                let p = match &event {
+                    RobotEvent::Ros2ParticipantDiscovered(x) => parse_prefix(&x.guid_prefix),
+                    RobotEvent::Ros2WriterDiscovered(x) | RobotEvent::Ros2ReaderDiscovered(x) => {
+                        parse_prefix(&x.guid_prefix)
+                    }
+                    _ => None,
+                };
+                self.push_for(out, dev, src_ip, p);
             }
         }
     }
@@ -1338,10 +1578,11 @@ impl Pipeline {
                 let detail = format!(
                     "profiled participant {guid} announced as {what}{by} from {src_ip}{unbound}"
                 );
-                self.push(
+                self.push_for(
                     out,
                     Deviation::new(rules::PARTICIPANT_REMOVED, Severity::Medium, detail),
                     src_ip,
+                    Some(r.guid_prefix),
                 );
             } else {
                 let sev = if consistent == Some(false) {
@@ -1352,10 +1593,11 @@ impl Pipeline {
                 let detail = format!(
                     "unprofiled participant {guid} announced as {what}{by} from {src_ip}{unbound}"
                 );
-                self.push(
+                self.push_for(
                     out,
                     Deviation::new(rules::DISCOVERY_REMOVAL, sev, detail),
                     src_ip,
+                    Some(r.guid_prefix),
                 );
             }
         }
@@ -1389,10 +1631,11 @@ impl Pipeline {
                 "{kind} {id} of participant {} announced as {what} from {src_ip}{note}",
                 hex12(&r.participant)
             );
-            self.push(
+            self.push_for(
                 out,
                 Deviation::new(rules::DISCOVERY_REMOVAL, sev, detail),
                 src_ip,
+                Some(r.participant),
             );
         }
     }

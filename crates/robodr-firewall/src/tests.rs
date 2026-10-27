@@ -110,3 +110,82 @@ fn fault_verdict_follows_policy() {
         }
     );
 }
+
+/// A humanoid joint channel on a policy whose fault policy is forced (past
+/// the compile-time refusal) to `FailOpen` / `FailSafe`: a fault still holds
+/// the last valid frame, never forwards the input nor damps.
+#[test]
+fn humanoid_joint_fault_holds_whatever_the_fault_policy() {
+    let mut p = Profile {
+        model: "humanoid".into(),
+        locked: true,
+        ..Default::default()
+    };
+    p.participants.insert(P.into());
+    p.writer_topics.insert("/lowcmd".into());
+    p.motion_envelopes.insert(
+        "/lowcmd".into(),
+        Envelope {
+            max_joint_speed: Some(30.0),
+            ..Default::default()
+        },
+    );
+    let motor = MotorLimits {
+        kp_min: 5.0,
+        max_dq_step: Some(0.5),
+        ..MotorLimits::enabled((-1.0, 1.0), 10.0, 20.0, 100.0, 5.0)
+    };
+    let spec = JointChannelSpec {
+        allowed_sources: vec![format!("{P}00000103")],
+        motors: vec![motor; 4],
+        rate: Some(JointRate::around(500.0)),
+        ..Default::default()
+    };
+    let platform = PlatformConfig {
+        morphology: Morphology::Humanoid,
+        fail_behaviour: FailBehaviour::HoldLast {
+            max_hold_ns: 50 * MS,
+        },
+        fault_policy: FaultPolicy::FailHold,
+        ..Default::default()
+    };
+    for forced in [FaultPolicy::FailOpen, FaultPolicy::FailSafe] {
+        let mut pol = Policy::compile_with_joints(
+            &p,
+            platform,
+            &BTreeMap::new(),
+            &BTreeMap::from([("/lowcmd".to_string(), spec.clone())]),
+        )
+        .unwrap();
+        pol.platform.fault_policy = forced;
+        let mut fw = Firewall::new(pol);
+        let s = fw.source_id(&format!("{P}00000103")).unwrap();
+        let c = fw.channel_id("/lowcmd").unwrap();
+        let m = MotorCmd::enabled(0.1, 0.0, 1.0, 40.0, 1.0);
+        let frame = JointFrame::from_slice(&[m; 4], Some(true)).unwrap();
+        let first = JointCommand::new(s, c, 10 * MS, frame);
+        assert!(fw.check_joint(&first, 10 * MS).is_passed());
+        // A gateway-declared fault.
+        let v = fw.joint_fault_verdict(&JointCommand::new(s, c, 12 * MS, frame), 12 * MS);
+        assert_eq!(v.reject_reason(), Some(RejectReason::InternalFault));
+        assert_eq!(
+            v.substitute_kind(),
+            Some(SubstituteKind::HoldLast),
+            "{forced:?}"
+        );
+        // A failed post-condition inside `check_joint`.
+        fw.inject_fault = true;
+        let v = fw.check_joint(&JointCommand::new(s, c, 14 * MS, frame), 14 * MS);
+        assert_eq!(v.reject_reason(), Some(RejectReason::InternalFault));
+        assert_eq!(
+            v.substitute_kind(),
+            Some(SubstituteKind::HoldLast),
+            "{forced:?}"
+        );
+        assert!(fw
+            .events()
+            .as_slice()
+            .iter()
+            .all(|e| e.action != EventAction::ObservedOnly));
+    }
+}

@@ -11,7 +11,7 @@ name = "robodr-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
-license = "Apache-2.0"
+license = "LicenseRef-Proprietary"
 
 [package.metadata]
 cargo-fuzz = true
@@ -20,14 +20,26 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 serde_json = "1"
 robodr-agent = { path = "../crates/robodr-agent" }
+robodr-agentd = { path = "../crates/robodr-agentd" }
 robodr-blackbox = { path = "../crates/robodr-blackbox" }
 robodr-capture = { path = "../crates/robodr-capture" }
+robodr-cdr = { path = "../crates/robodr-cdr" }
 robodr-commission = { path = "../crates/robodr-commission" }
+robodr-correlate = { path = "../crates/robodr-correlate" }
+robodr-deliverd = { path = "../crates/robodr-deliverd" }
+robodr-diode = { path = "../crates/robodr-diode" }
 robodr-events = { path = "../crates/robodr-events" }
+robodr-export = { path = "../crates/robodr-export" }
 robodr-firewall = { path = "../crates/robodr-firewall" }
+robodr-firewall-gw = { path = "../crates/robodr-firewall-gw", features = ["testkit"] }
+robodr-fleet = { path = "../crates/robodr-fleet" }
 robodr-ocsf = { path = "../crates/robodr-ocsf" }
+robodr-pkg = { path = "../crates/robodr-pkg" }
+robodr-responder = { path = "../crates/robodr-responder" }
 robodr-ros2-pipeline = { path = "../crates/robodr-ros2-pipeline" }
 robodr-rtps = { path = "../crates/robodr-rtps" }
+# Test oracle of the diode_fec target (never shipped; see crates/robodr-diode/src/fec.rs).
+reed-solomon = "0.2.1"
 
 [[bin]]
 name = "parse_datagram"
@@ -39,6 +51,13 @@ bench = false
 [[bin]]
 name = "pcap_reader"
 path = "fuzz_targets/pcap_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cdr_unitree"
+path = "fuzz_targets/cdr_unitree.rs"
 test = false
 doc = false
 bench = false
@@ -106,8 +125,134 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "control_plane_request"
+path = "fuzz_targets/control_plane_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "diode_manifest"
+path = "fuzz_targets/diode_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "diode_import"
+path = "fuzz_targets/diode_import.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "diode_fec"
+path = "fuzz_targets/diode_fec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "correlate_rules"
+path = "fuzz_targets/correlate_rules.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "safety_feed"
+path = "fuzz_targets/safety_feed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kafka_wire"
+path = "fuzz_targets/kafka_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cdr_payload"
+path = "fuzz_targets/cdr_payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "firewall_gw_packet"
+path = "fuzz_targets/firewall_gw_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fleet_token"
+path = "fuzz_targets/fleet_token.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fleet_envelope"
+path = "fuzz_targets/fleet_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pkg_rpk"
+path = "fuzz_targets/pkg_rpk.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pkg_bundle"
+path = "fuzz_targets/pkg_bundle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pkg_deployment"
+path = "fuzz_targets/pkg_deployment.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pkg_trust"
+path = "fuzz_targets/pkg_trust.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pkg_parity"
+path = "fuzz_targets/pkg_parity.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]
 
 [profile.release]
 debug = 1
+
+[[bin]]
+name = "deliverd_state"
+path = "fuzz_targets/deliverd_state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "deliverd_inputs"
+path = "fuzz_targets/deliverd_inputs.rs"
+test = false
+doc = false
+bench = false

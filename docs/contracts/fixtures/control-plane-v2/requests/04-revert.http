@@ -1,0 +1,10 @@
+POST /api/v2/robots/ugv-007/action-requests/robot_safe_pause%3Augv-007%3A0001/revert HTTP/1.1
+Host: ugv-007.robots.example
+Content-Type: application/json
+Content-Length: 56
+X-RoboDR-Key-Id: soc:soc-a:1
+X-RoboDR-Timestamp: 1800000000
+X-RoboDR-Nonce: contract-nonce-0004
+X-RoboDR-Signature: 5f7f683294944f9b8ee3a0f3411b2e6e894e3fa33338a027554fc051126fd4a42ffea97459072f43220b5eb7eea6b30ec91c2448fc5720ddf009cc09cda29b0b
+
+{"reason":"false positive","requested_by":"analyst@soc"}

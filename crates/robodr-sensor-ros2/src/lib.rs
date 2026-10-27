@@ -84,6 +84,11 @@
 //! frames, IP fragment conflicts and drops) becomes `robot.capture.*`
 //! findings. External sources have no health counters.
 
+// S10 (review I3): no `unsafe` code here (checked with grep; the only
+// macros used, `tokio::main` / `tokio::select!` and derives, compile under
+// `forbid(unsafe_code)`), and it must stay that way.
+#![forbid(unsafe_code)]
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -533,6 +538,7 @@ mod tests {
             src_ip: "10.77.10.66".into(),
             profile_model: "lab-ugv".into(),
             profile_status: "enforcing",
+            participant: None,
         }
     }
 

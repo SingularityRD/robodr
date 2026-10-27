@@ -6751,5 +6751,3887 @@
     "hard_link": true
    }
   }
+ },
+ {
+  "rule": "RoboDR: Unitree Wi-Fi provisioning script executed",
+  "note": "UniPwn path: daemon runs the script directly (shebang, injected text in argv)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/vendor/wifi/wpa_supplicant_restart.sh"
+   },
+   "payload": {
+    "filename": "/opt/vendor/wifi/wpa_supplicant_restart.sh",
+    "argc": 4,
+    "argv": [
+     "/bin/sh",
+     "/opt/vendor/wifi/wpa_supplicant_restart.sh",
+     "lab-ssid",
+     "x;id;"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree Wi-Fi provisioning script executed",
+  "note": "run as 'sh wpa_supplicant_restart.sh ssid psk' from its directory",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/bin/sh"
+   },
+   "payload": {
+    "filename": "/bin/sh",
+    "argc": 4,
+    "argv": [
+     "sh",
+     "wpa_supplicant_restart.sh",
+     "lab-ssid",
+     "psk"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree Wi-Fi provisioning script executed",
+  "note": "run as './wpa_supplicant_restart.sh' from its directory",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/vendor/wifi/wpa_supplicant_restart.sh"
+   },
+   "payload": {
+    "filename": "/opt/vendor/wifi/wpa_supplicant_restart.sh",
+    "argc": 4,
+    "argv": [
+     "/bin/bash",
+     "./wpa_supplicant_restart.sh",
+     "lab-ssid",
+     "psk"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree Wi-Fi provisioning script executed",
+  "note": "wpa_supplicant daemon itself (started at boot) does not match",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/sbin/wpa_supplicant"
+   },
+   "payload": {
+    "filename": "/usr/sbin/wpa_supplicant",
+    "argc": 6,
+    "argv": [
+     "/usr/sbin/wpa_supplicant",
+     "-B",
+     "-i",
+     "wlan0",
+     "-c",
+     "/etc/wpa_supplicant/wpa_supplicant.conf"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree Wi-Fi provisioning script executed",
+  "note": "a different script with a similar name does not match",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/opt/vendor/wifi/wpa_supplicant_restart.sh.bak"
+   },
+   "payload": {
+    "filename": "/opt/vendor/wifi/wpa_supplicant_restart.sh.bak",
+    "argc": 2,
+    "argv": [
+     "/bin/sh",
+     "/opt/vendor/wifi/wpa_supplicant_restart.sh.bak"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree Wi-Fi provisioning script executed",
+  "note": "KNOWN GAP of this Exec rule: 'sh /full/path/wpa_supplicant_restart.sh' (argv element is the full, firmware-specific path); covered by the 'provisioning script opened' rule",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/bin/sh"
+   },
+   "payload": {
+    "filename": "/bin/sh",
+    "argc": 4,
+    "argv": [
+     "sh",
+     "/opt/vendor/wifi/wpa_supplicant_restart.sh",
+     "lab-ssid",
+     "psk"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Bluetooth daemon or Wi-Fi provisioning script opened an IP connection",
+  "note": "injected 'bash >& /dev/tcp/...' runs inside the script's own process",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/vendor/wifi/wpa_supplicant_restart.sh"
+   },
+   "payload": {
+    "destination": {
+     "ip": "203.0.113.7",
+     "port": 4444
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Bluetooth daemon or Wi-Fi provisioning script opened an IP connection",
+  "note": "script process attacks a neighbour robot on the robot LAN (not excluded)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/vendor/wifi/wpa_supplicant_restart.sh"
+   },
+   "payload": {
+    "destination": {
+     "ip": "192.168.123.18",
+     "port": 22
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Bluetooth daemon or Wi-Fi provisioning script opened an IP connection",
+  "note": "bluetoothd opens an IP connection",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/lib/bluetooth/bluetoothd"
+   },
+   "payload": {
+    "destination": {
+     "ip": "198.51.100.20",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Bluetooth daemon or Wi-Fi provisioning script opened an IP connection",
+  "note": "bluetoothd under /usr/libexec",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/libexec/bluetooth/bluetoothd"
+   },
+   "payload": {
+    "destination": {
+     "ip": "10.0.0.9",
+     "port": 8080
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Bluetooth daemon or Wi-Fi provisioning script opened an IP connection",
+  "note": "DHCP client child of the script has its own image",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/sbin/dhclient"
+   },
+   "payload": {
+    "destination": {
+     "ip": "192.168.12.1",
+     "port": 67
+    },
+    "is_tcp": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Bluetooth daemon or Wi-Fi provisioning script opened an IP connection",
+  "note": "KNOWN GAP: script run as 'sh script' -- image is /bin/sh (the ros2_stack shell rule covers it)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/bin/sh"
+   },
+   "payload": {
+    "destination": {
+     "ip": "203.0.113.7",
+     "port": 4444
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Bluetooth pairing keys or configuration modified outside bluetoothd",
+  "note": "pairing key planted by a script",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.10"
+   },
+   "payload": {
+    "filename": "/var/lib/bluetooth/00:00:5E:00:53:01/00:00:5E:00:53:02/info",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Bluetooth pairing keys or configuration modified outside bluetoothd",
+  "note": "main.conf relaxed with sed (in-place open)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vi"
+   },
+   "payload": {
+    "filename": "/etc/bluetooth/main.conf",
+    "flags": [
+     "O_RDWR"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Bluetooth pairing keys or configuration modified outside bluetoothd",
+  "note": "binary merely named bluetoothd elsewhere is not excluded",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/tmp/bluetoothd"
+   },
+   "payload": {
+    "filename": "/var/lib/bluetooth/00:00:5E:00:53:01/00:00:5E:00:53:02/info",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Bluetooth pairing keys or configuration modified outside bluetoothd",
+  "note": "bluetoothd saving a bond (exact image) is excluded",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/lib/bluetooth/bluetoothd"
+   },
+   "payload": {
+    "filename": "/var/lib/bluetooth/00:00:5E:00:53:01/00:00:5E:00:53:02/info.ABC123",
+    "flags": [
+     "O_RDWR",
+     "O_CREAT",
+     "O_EXCL"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Bluetooth pairing keys or configuration modified outside bluetoothd",
+  "note": "/usr/sbin/bluetoothd spelling is excluded",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/sbin/bluetoothd"
+   },
+   "payload": {
+    "filename": "/var/lib/bluetooth/00:00:5E:00:53:01/settings",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Bluetooth pairing keys or configuration modified outside bluetoothd",
+  "note": "read-only open of main.conf",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cat"
+   },
+   "payload": {
+    "filename": "/etc/bluetooth/main.conf",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Bluetooth pairing keys or configuration modified outside bluetoothd",
+  "note": "dpkg installing bluez conffile",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "filename": "/etc/bluetooth/main.conf.dpkg-new",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_EXCL"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Bluetooth pairing keys or configuration moved into place outside bluetoothd",
+  "note": "bond file staged in /tmp and moved into place",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/tmp/info",
+    "destination": "/var/lib/bluetooth/00:00:5E:00:53:01/00:00:5E:00:53:02/info"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Bluetooth pairing keys or configuration moved into place outside bluetoothd",
+  "note": "relaxed main.conf moved into place by sed -i",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/sed"
+   },
+   "payload": {
+    "source": "/etc/bluetooth/sedAbC12",
+    "destination": "/etc/bluetooth/main.conf"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Bluetooth pairing keys or configuration moved into place outside bluetoothd",
+  "note": "bluetoothd atomic save (temp + rename) excluded",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/lib/bluetooth/bluetoothd"
+   },
+   "payload": {
+    "source": "/var/lib/bluetooth/00:00:5E:00:53:01/00:00:5E:00:53:02/info.ABC123",
+    "destination": "/var/lib/bluetooth/00:00:5E:00:53:01/00:00:5E:00:53:02/info"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Bluetooth pairing keys or configuration moved into place outside bluetoothd",
+  "note": "dpkg conffile rename excluded",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "source": "/etc/bluetooth/main.conf.dpkg-new",
+    "destination": "/etc/bluetooth/main.conf"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Bluetooth pairing keys or configuration moved into place outside bluetoothd",
+  "note": "bond file moved OUT of the directory (not a plant)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/var/lib/bluetooth/00:00:5E:00:53:01/00:00:5E:00:53:02/info",
+    "destination": "/tmp/info"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry written outside the package manager",
+  "note": "new system unit for a reverse tunnel",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/tee"
+   },
+   "payload": {
+    "filename": "/etc/systemd/system/net-helper.service",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry written outside the package manager",
+  "note": "user unit in the robot account",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.10"
+   },
+   "payload": {
+    "filename": "/home/unitree/.config/systemd/user/updater.service",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry written outside the package manager",
+  "note": "rc.local appended",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/bin/bash"
+   },
+   "payload": {
+    "filename": "/etc/rc.local",
+    "flags": [
+     "O_WRONLY",
+     "O_APPEND"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry written outside the package manager",
+  "note": "SysV init script",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/etc/init.d/tunnel",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry written outside the package manager",
+  "note": "XDG autostart entry (desktop session on the dev computer)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/home/unitree/.config/autostart/helper.desktop",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry written outside the package manager",
+  "note": "vendor unit dir overwritten in place",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vi"
+   },
+   "payload": {
+    "filename": "/lib/systemd/system/ssh.service",
+    "flags": [
+     "O_RDWR"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry written outside the package manager",
+  "note": "PID 1 reading a unit file",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/lib/systemd/systemd"
+   },
+   "payload": {
+    "filename": "/etc/systemd/system/net-helper.service",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry written outside the package manager",
+  "note": "dpkg writing a unit .dpkg-new",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "filename": "/usr/lib/systemd/system/bluetooth.service.dpkg-new",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_EXCL"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry written outside the package manager",
+  "note": "binary named dpkg elsewhere is not excluded",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/root/.cache/dpkg"
+   },
+   "payload": {
+    "filename": "/etc/systemd/system/net-helper.service",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry written outside the package manager",
+  "note": "system.control (set-property) is not in scope (self_protection covers robodr-*)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/lib/systemd/systemd"
+   },
+   "payload": {
+    "filename": "/etc/systemd/system.control/ssh.service.d/50-CPUQuota.conf",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry moved into place outside the package manager",
+  "note": "systemctl edit override saved by rename",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/systemctl"
+   },
+   "payload": {
+    "source": "/etc/systemd/system/ssh.service.d/.#override.conf3f2a",
+    "destination": "/etc/systemd/system/ssh.service.d/override.conf"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry moved into place outside the package manager",
+  "note": "unit staged in /tmp and moved into place",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/tmp/x.service",
+    "destination": "/etc/systemd/system/x.service"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry moved into place outside the package manager",
+  "note": "user unit moved into place",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/tmp/x.service",
+    "destination": "/home/unitree/.config/systemd/user/x.service"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry moved into place outside the package manager",
+  "note": "dpkg rename of a unit excluded",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "source": "/usr/lib/systemd/system/bluetooth.service.dpkg-new",
+    "destination": "/usr/lib/systemd/system/bluetooth.service"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry moved into place outside the package manager",
+  "note": "rename elsewhere",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/home/unitree/a.txt",
+    "destination": "/home/unitree/b.txt"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service enabled, masked or linked outside the package manager",
+  "note": "systemctl enable via PID 1 (wants link)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/lib/systemd/systemd"
+   },
+   "payload": {
+    "source": "/etc/systemd/system/multi-user.target.wants/net-helper.service",
+    "destination": "/etc/systemd/system/net-helper.service",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service enabled, masked or linked outside the package manager",
+  "note": "systemctl mask of a security service",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/lib/systemd/systemd"
+   },
+   "payload": {
+    "source": "/etc/systemd/system/robot-audit.service",
+    "destination": "/dev/null",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service enabled, masked or linked outside the package manager",
+  "note": "hard link of a staged unit",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/etc/systemd/system/x.service",
+    "destination": "/tmp/x.service",
+    "hard_link": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service enabled, masked or linked outside the package manager",
+  "note": "deb-systemd-helper enabling a packaged unit at install",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/deb-systemd-helper"
+   },
+   "payload": {
+    "source": "/etc/systemd/system/bluetooth.target.wants/bluetooth.service",
+    "destination": "/lib/systemd/system/bluetooth.service",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service enabled, masked or linked outside the package manager",
+  "note": "dpkg link excluded",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "source": "/usr/lib/systemd/system/dbus-org.bluez.service",
+    "destination": "bluetooth.service",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service enabled, masked or linked outside the package manager",
+  "note": "PID 1 per-start invocation link in /run is out of scope",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/lib/systemd/systemd"
+   },
+   "payload": {
+    "source": "/run/systemd/units/invocation:ssh.service",
+    "destination": "0123456789abcdef0123456789abcdef",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree robot process connects outside the allowlisted destinations",
+  "note": "SDK2 program connects to a public address (telemetry / exfiltration)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/home/unitree/unitree_sdk2/build/bin/go2_sport_client"
+   },
+   "payload": {
+    "destination": {
+     "ip": "203.0.113.50",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree robot process connects outside the allowlisted destinations",
+  "note": "vendor process under /unitree/ connects out",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/unitree/module/telemetry/agent"
+   },
+   "payload": {
+    "destination": {
+     "ip": "198.51.100.77",
+     "port": 8883
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree robot process connects outside the allowlisted destinations",
+  "note": "SDK install prefix process over IPv6 global",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/unitree_robotics/bin/service"
+   },
+   "payload": {
+    "destination": {
+     "ip": "2001:db8::25",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree robot process connects outside the allowlisted destinations",
+  "note": "IPv4-mapped public address",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/home/unitree/unitree_sdk2/build/bin/go2_sport_client"
+   },
+   "payload": {
+    "destination": {
+     "ip": "::ffff:203.0.113.50",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree robot process connects outside the allowlisted destinations",
+  "note": "CGNAT / overlay range 100.64/10 is not allowlisted",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/home/unitree/unitree_ros2/cyclonedds_ws/install/bridge/lib/bridge/bridge_node"
+   },
+   "payload": {
+    "destination": {
+     "ip": "100.100.100.100",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree robot process connects outside the allowlisted destinations",
+  "note": "DDS to the robot LAN 192.168.123.161",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/home/unitree/unitree_sdk2/build/bin/go2_sport_client"
+   },
+   "payload": {
+    "destination": {
+     "ip": "192.168.123.161",
+     "port": 7400
+    },
+    "is_tcp": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree robot process connects outside the allowlisted destinations",
+  "note": "SPDP multicast",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/home/unitree/unitree_sdk2/build/bin/go2_sport_client"
+   },
+   "payload": {
+    "destination": {
+     "ip": "239.255.0.1",
+     "port": 7400
+    },
+    "is_tcp": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree robot process connects outside the allowlisted destinations",
+  "note": "loopback",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/home/unitree/unitree_sdk2/build/bin/go2_sport_client"
+   },
+   "payload": {
+    "destination": {
+     "ip": "127.0.0.1",
+     "port": 7410
+    },
+    "is_tcp": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree robot process connects outside the allowlisted destinations",
+  "note": "IPv4-mapped robot LAN address",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/home/unitree/unitree_sdk2/build/bin/go2_sport_client"
+   },
+   "payload": {
+    "destination": {
+     "ip": "::ffff:192.168.123.161",
+     "port": 7400
+    },
+    "is_tcp": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree robot process connects outside the allowlisted destinations",
+  "note": "IPv6 link-local",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/home/unitree/unitree_sdk2/build/bin/go2_sport_client"
+   },
+   "payload": {
+    "destination": {
+     "ip": "fe80::1",
+     "port": 7400
+    },
+    "is_tcp": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree robot process connects outside the allowlisted destinations",
+  "note": "limited broadcast",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/home/unitree/unitree_sdk2/build/bin/go2_sport_client"
+   },
+   "payload": {
+    "destination": {
+     "ip": "255.255.255.255",
+     "port": 9999
+    },
+    "is_tcp": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree robot process connects outside the allowlisted destinations",
+  "note": "non-Unitree process to a public address (NTP) is out of scope",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/sbin/chronyd"
+   },
+   "payload": {
+    "destination": {
+     "ip": "203.0.113.10",
+     "port": 123
+    },
+    "is_tcp": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree robot process connects outside the allowlisted destinations",
+  "note": "KNOWN GAP: attacker binary outside the Unitree trees (left to tunnel/shell rules)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/tmp/.x/agent"
+   },
+   "payload": {
+    "destination": {
+     "ip": "203.0.113.50",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Reverse tunnel client executed on robot",
+  "note": "frpc executed",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/local/bin/frpc"
+   },
+   "payload": {
+    "filename": "/usr/local/bin/frpc",
+    "argc": 3,
+    "argv": [
+     "frpc",
+     "-c",
+     "x.toml"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Reverse tunnel client executed on robot",
+  "note": "frps executed",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/opt/frp/frps"
+   },
+   "payload": {
+    "filename": "/opt/frp/frps",
+    "argc": 3,
+    "argv": [
+     "frps",
+     "-c",
+     "x.toml"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Reverse tunnel client executed on robot",
+  "note": "cloudflared executed",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cloudflared"
+   },
+   "payload": {
+    "filename": "/usr/bin/cloudflared",
+    "argc": 3,
+    "argv": [
+     "cloudflared",
+     "-c",
+     "x.toml"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Reverse tunnel client executed on robot",
+  "note": "bore executed",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/home/unitree/.cargo/bin/bore"
+   },
+   "payload": {
+    "filename": "/home/unitree/.cargo/bin/bore",
+    "argc": 3,
+    "argv": [
+     "bore",
+     "-c",
+     "x.toml"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Reverse tunnel client executed on robot",
+  "note": "rathole executed",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/local/bin/rathole"
+   },
+   "payload": {
+    "filename": "/usr/local/bin/rathole",
+    "argc": 3,
+    "argv": [
+     "rathole",
+     "-c",
+     "x.toml"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Reverse tunnel client executed on robot",
+  "note": "inlets executed",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/local/bin/inlets"
+   },
+   "payload": {
+    "filename": "/usr/local/bin/inlets",
+    "argc": 3,
+    "argv": [
+     "inlets",
+     "-c",
+     "x.toml"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Reverse tunnel client executed on robot",
+  "note": "npc executed",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/tmp/npc"
+   },
+   "payload": {
+    "filename": "/tmp/npc",
+    "argc": 3,
+    "argv": [
+     "npc",
+     "-c",
+     "x.toml"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Reverse tunnel client executed on robot",
+  "note": "zrok executed",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/local/bin/zrok"
+   },
+   "payload": {
+    "filename": "/usr/local/bin/zrok",
+    "argc": 3,
+    "argv": [
+     "zrok",
+     "-c",
+     "x.toml"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Reverse tunnel client executed on robot",
+  "note": "autossh executed",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/autossh"
+   },
+   "payload": {
+    "filename": "/usr/bin/autossh",
+    "argc": 3,
+    "argv": [
+     "autossh",
+     "-c",
+     "x.toml"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Reverse tunnel client executed on robot",
+  "note": "frpc config file opened by an editor is not an exec of frpc",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vi"
+   },
+   "payload": {
+    "filename": "/usr/bin/vi",
+    "argc": 2,
+    "argv": [
+     "vi",
+     "/etc/frp/frpc.toml"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Reverse tunnel client executed on robot",
+  "note": "name containing but not ending in the tool name",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/boretest"
+   },
+   "payload": {
+    "filename": "/usr/bin/boretest",
+    "argc": 1,
+    "argv": [
+     "boretest"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: SSH reverse or dynamic tunnel with bundled options",
+  "note": "ssh -fNR 2222:localhost:22 relay",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ssh"
+   },
+   "payload": {
+    "filename": "/usr/bin/ssh",
+    "argc": 4,
+    "argv": [
+     "ssh",
+     "-fNR",
+     "2222:localhost:22",
+     "relay.example"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: SSH reverse or dynamic tunnel with bundled options",
+  "note": "ssh -NR",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ssh"
+   },
+   "payload": {
+    "filename": "/usr/bin/ssh",
+    "argc": 4,
+    "argv": [
+     "ssh",
+     "-NR",
+     "2222:localhost:22",
+     "relay.example"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: SSH reverse or dynamic tunnel with bundled options",
+  "note": "ssh -NfD 1080 (SOCKS)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ssh"
+   },
+   "payload": {
+    "filename": "/usr/bin/ssh",
+    "argc": 4,
+    "argv": [
+     "ssh",
+     "-NfD",
+     "1080",
+     "relay.example"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: SSH reverse or dynamic tunnel with bundled options",
+  "note": "dbclient -R (Dropbear, not covered upstream)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dbclient"
+   },
+   "payload": {
+    "filename": "/usr/bin/dbclient",
+    "argc": 4,
+    "argv": [
+     "dbclient",
+     "-R",
+     "2222:localhost:22",
+     "relay.example"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: SSH reverse or dynamic tunnel with bundled options",
+  "note": "dbclient -fNR",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/sbin/dbclient"
+   },
+   "payload": {
+    "filename": "/usr/sbin/dbclient",
+    "argc": 4,
+    "argv": [
+     "dbclient",
+     "-fNR",
+     "2222:localhost:22",
+     "relay.example"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: SSH reverse or dynamic tunnel with bundled options",
+  "note": "plain ssh -R is left to Pulsar's own rule (no duplicate alert)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ssh"
+   },
+   "payload": {
+    "filename": "/usr/bin/ssh",
+    "argc": 4,
+    "argv": [
+     "ssh",
+     "-R",
+     "2222:localhost:22",
+     "relay.example"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: SSH reverse or dynamic tunnel with bundled options",
+  "note": "ordinary ssh login",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ssh"
+   },
+   "payload": {
+    "filename": "/usr/bin/ssh",
+    "argc": 2,
+    "argv": [
+     "ssh",
+     "unitree@192.168.123.18"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: SSH reverse or dynamic tunnel with bundled options",
+  "note": "ssh -N -T (no forward)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ssh"
+   },
+   "payload": {
+    "filename": "/usr/bin/ssh",
+    "argc": 3,
+    "argv": [
+     "ssh",
+     "-NT",
+     "relay.example"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: SSH reverse or dynamic tunnel with bundled options",
+  "note": "KNOWN GAP: attached form -R2222:localhost:22",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ssh"
+   },
+   "payload": {
+    "filename": "/usr/bin/ssh",
+    "argc": 4,
+    "argv": [
+     "ssh",
+     "-fN",
+     "-R2222:localhost:22",
+     "relay.example"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Remote-access overlay VPN started on robot",
+  "note": "tailscaled started",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/sbin/tailscaled"
+   },
+   "payload": {
+    "filename": "/usr/sbin/tailscaled",
+    "argc": 2,
+    "argv": [
+     "tailscaled",
+     "--state=/var/lib/tailscale/tailscaled.state"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Remote-access overlay VPN started on robot",
+  "note": "tailscale up",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/tailscale"
+   },
+   "payload": {
+    "filename": "/usr/bin/tailscale",
+    "argc": 2,
+    "argv": [
+     "tailscale",
+     "up"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Remote-access overlay VPN started on robot",
+  "note": "zerotier-one",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/sbin/zerotier-one"
+   },
+   "payload": {
+    "filename": "/usr/sbin/zerotier-one",
+    "argc": 2,
+    "argv": [
+     "zerotier-one",
+     "-d"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Remote-access overlay VPN started on robot",
+  "note": "openvpn client",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/sbin/openvpn"
+   },
+   "payload": {
+    "filename": "/usr/sbin/openvpn",
+    "argc": 3,
+    "argv": [
+     "openvpn",
+     "--config",
+     "/tmp/c.ovpn"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Remote-access overlay VPN started on robot",
+  "note": "wg-quick up",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/wg-quick"
+   },
+   "payload": {
+    "filename": "/usr/bin/wg-quick",
+    "argc": 3,
+    "argv": [
+     "wg-quick",
+     "up",
+     "wg0"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Remote-access overlay VPN started on robot",
+  "note": "wg show (status only) does not match",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/wg"
+   },
+   "payload": {
+    "filename": "/usr/bin/wg",
+    "argc": 2,
+    "argv": [
+     "wg",
+     "show"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree DDS configuration modified",
+  "note": "cyclonedds.xml rewritten (interface moved)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.10"
+   },
+   "payload": {
+    "filename": "/home/unitree/unitree_ros2/cyclonedds_ws/src/cyclonedds.xml",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree DDS configuration modified",
+  "note": "custom-prefixed CYCLONEDDS_URI file",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vi"
+   },
+   "payload": {
+    "filename": "/etc/robot/go2_cyclonedds.xml",
+    "flags": [
+     "O_RDWR"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree DDS configuration modified",
+  "note": "unitree_ros2 setup.sh (sets CYCLONEDDS_URI) edited",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/nano"
+   },
+   "payload": {
+    "filename": "/home/unitree/unitree_ros2/setup.sh",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree DDS configuration modified",
+  "note": "setup_local.sh",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/bin/bash"
+   },
+   "payload": {
+    "filename": "/home/unitree/unitree_ros2/setup_local.sh",
+    "flags": [
+     "O_WRONLY",
+     "O_APPEND"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree DDS configuration modified",
+  "note": "node reading the DDS config",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/home/unitree/unitree_sdk2/build/bin/go2_sport_client"
+   },
+   "payload": {
+    "filename": "/home/unitree/unitree_ros2/cyclonedds_ws/src/cyclonedds.xml",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree DDS configuration modified",
+  "note": "another project's setup.sh",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/nano"
+   },
+   "payload": {
+    "filename": "/home/unitree/other_ws/setup.sh",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree DDS configuration modified",
+  "note": "dpkg excluded",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "filename": "/opt/ros/humble/share/x/cyclonedds.xml.dpkg-new",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_EXCL"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree DDS configuration modified",
+  "note": "KNOWN GAP: CYCLONEDDS_URI file with another name (add it at commissioning)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vi"
+   },
+   "payload": {
+    "filename": "/etc/robot/dds.xml",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree DDS configuration moved into place",
+  "note": "sed -i on cyclonedds.xml",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/sed"
+   },
+   "payload": {
+    "source": "/home/unitree/unitree_ros2/cyclonedds_ws/src/sedX1y2Z3",
+    "destination": "/home/unitree/unitree_ros2/cyclonedds_ws/src/cyclonedds.xml"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree DDS configuration moved into place",
+  "note": "setup_default.sh replaced",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/tmp/s",
+    "destination": "/home/unitree/unitree_ros2/setup_default.sh"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree DDS configuration moved into place",
+  "note": "editor backup rename (old file moved away) is not a new config",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vim.basic"
+   },
+   "payload": {
+    "source": "/home/unitree/unitree_ros2/cyclonedds_ws/src/cyclonedds.xml",
+    "destination": "/home/unitree/unitree_ros2/cyclonedds_ws/src/cyclonedds.xml~"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree DDS configuration moved into place",
+  "note": "dpkg excluded",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "source": "/opt/ros/humble/share/x/cyclonedds.xml.dpkg-new",
+    "destination": "/opt/ros/humble/share/x/cyclonedds.xml"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library modified outside the package manager",
+  "note": "libddsc.so.0 overwritten in the SDK thirdparty tree",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/home/unitree/unitree_sdk2/thirdparty/lib/aarch64/libddsc.so.0",
+    "flags": [
+     "O_RDWR"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library modified outside the package manager",
+  "note": "libunitree_sdk2.a trojaned (static, affects future builds)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/opt/unitree_robotics/lib/libunitree_sdk2.a",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library modified outside the package manager",
+  "note": "anything under /opt/unitree_robotics",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/sed"
+   },
+   "payload": {
+    "filename": "/opt/unitree_robotics/include/unitree/robot/channel/channel_factory.hpp",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library modified outside the package manager",
+  "note": "libddscxx in /usr/local/lib (make install target)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/install"
+   },
+   "payload": {
+    "filename": "/usr/local/lib/libddscxx.so.0.10.5",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library modified outside the package manager",
+  "note": "unitree_sdk2py native crc library",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3.10"
+   },
+   "payload": {
+    "filename": "/home/unitree/unitree_sdk2_python/unitree_sdk2py/utils/lib/crc_aarch64.so",
+    "flags": [
+     "O_RDWR"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library modified outside the package manager",
+  "note": "legacy legged SDK library",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/home/unitree/unitree_legged_sdk/lib/cpp/arm64/libunitree_legged_sdk.a",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library modified outside the package manager",
+  "note": "SDK2 program loading libddsc read-only",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/home/unitree/unitree_sdk2/build/bin/go2_sport_client"
+   },
+   "payload": {
+    "filename": "/home/unitree/unitree_sdk2/thirdparty/lib/aarch64/libddsc.so.0",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library modified outside the package manager",
+  "note": "colcon build of unitree_go msgs (libunitree_go__rosidl_*) is not an SDK library",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/aarch64-linux-gnu-ld.bfd"
+   },
+   "payload": {
+    "filename": "/home/unitree/unitree_ros2/cyclonedds_ws/build/unitree_go/libunitree_go__rosidl_typesupport_c.so",
+    "flags": [
+     "O_RDWR",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library modified outside the package manager",
+  "note": "dpkg writing ros-humble-cyclonedds",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "filename": "/opt/ros/humble/lib/libddsc.so.0.10.5.dpkg-new",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_EXCL"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library modified outside the package manager",
+  "note": "Python source in unitree_sdk2py is not a native library",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vi"
+   },
+   "payload": {
+    "filename": "/home/unitree/unitree_sdk2_python/unitree_sdk2py/core/channel.py",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library moved into place outside the package manager",
+  "note": "hook moved over libddsc.so.0",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/tmp/h.so",
+    "destination": "/usr/local/lib/libddsc.so.0"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library moved into place outside the package manager",
+  "note": "file moved into /opt/unitree_robotics",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/tmp/x",
+    "destination": "/opt/unitree_robotics/lib/libunitree_sdk2.a"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library moved into place outside the package manager",
+  "note": "dpkg excluded",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "source": "/opt/ros/humble/lib/libddsc.so.0.10.5.dpkg-new",
+    "destination": "/opt/ros/humble/lib/libddsc.so.0.10.5"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library moved into place outside the package manager",
+  "note": "library moved out (source only)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/usr/local/lib/libddsc.so.0",
+    "destination": "/tmp/ddsc.bak"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library moved into place outside the package manager",
+  "note": "KNOWN NOISE: a backup renamed to a libddsc-named file anywhere also fires (names match anywhere)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/usr/local/lib/libddsc.so.0",
+    "destination": "/tmp/libddsc.so.0.bak"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library linked outside the package manager",
+  "note": "libddsc.so.0 symlinked to a hook",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/usr/local/lib/libddsc.so.0",
+    "destination": "/home/unitree/.cache/h.so",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library linked outside the package manager",
+  "note": "ldconfig making a link to an absolute path is not excluded",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/sbin/ldconfig.real"
+   },
+   "payload": {
+    "source": "/usr/local/lib/libddsc.so.0",
+    "destination": "/tmp/h.so",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library linked outside the package manager",
+  "note": "hard link into /opt/unitree_robotics",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/opt/unitree_robotics/lib/libunitree_sdk2.a",
+    "destination": "/tmp/x.a",
+    "hard_link": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library linked outside the package manager",
+  "note": "ldconfig soname link (bare target) excluded",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/sbin/ldconfig.real"
+   },
+   "payload": {
+    "source": "/usr/local/lib/libddsc.so.0",
+    "destination": "libddsc.so.0.10.5",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library linked outside the package manager",
+  "note": "dpkg link excluded",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "source": "/opt/ros/humble/lib/libddsc.so",
+    "destination": "libddsc.so.0",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library linked outside the package manager",
+  "note": "unrelated link",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/home/unitree/notes.txt",
+    "destination": "/home/unitree/a.txt",
+    "hard_link": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree Wi-Fi provisioning script opened",
+  "note": "sh /full/path/wpa_supplicant_restart.sh: the interpreter opens the script",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dash"
+   },
+   "payload": {
+    "filename": "/opt/vendor/wifi/wpa_supplicant_restart.sh",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree Wi-Fi provisioning script opened",
+  "note": "system(\"bash -c '... /unitree/x/wpa_supplicant_restart.sh'\"): bash opens it",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/bash"
+   },
+   "payload": {
+    "filename": "/unitree/module/net/wpa_supplicant_restart.sh",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree Wi-Fi provisioning script opened",
+  "note": "script overwritten (tampering)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/opt/vendor/wifi/wpa_supplicant_restart.sh",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree Wi-Fi provisioning script opened",
+  "note": "dpkg ships the script (exact image)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "filename": "/opt/vendor/wifi/wpa_supplicant_restart.sh",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree Wi-Fi provisioning script opened",
+  "note": "KNOWN NOISE: a lookalike dpkg path is not excluded (fails safe)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/tmp/dpkg"
+   },
+   "payload": {
+    "filename": "/opt/vendor/wifi/wpa_supplicant_restart.sh",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree Wi-Fi provisioning script opened",
+  "note": "another script in the same directory",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dash"
+   },
+   "payload": {
+    "filename": "/opt/vendor/wifi/wpa_supplicant_start.sh",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree Wi-Fi provisioning script opened",
+  "note": "backup copy does not end with the script name",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cat"
+   },
+   "payload": {
+    "filename": "/opt/vendor/wifi/wpa_supplicant_restart.sh.bak",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree Wi-Fi provisioning script opened",
+  "note": "name only as a suffix of another file name",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dash"
+   },
+   "payload": {
+    "filename": "/opt/vendor/wifi/old_wpa_supplicant_restart.shx",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry written outside the package manager",
+  "note": "unit dropped into /usr/local/lib/systemd/system",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/usr/local/lib/systemd/system/telemetry.service",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry written outside the package manager",
+  "note": "user unit in /usr/local/lib/systemd/user",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/tee"
+   },
+   "payload": {
+    "filename": "/usr/local/lib/systemd/user/agent.service",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry written outside the package manager",
+  "note": "system generator planted in /etc/systemd/system-generators",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/etc/systemd/system-generators/zz-net",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry written outside the package manager",
+  "note": "system generator in /usr/lib/systemd/system-generators",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/install"
+   },
+   "payload": {
+    "filename": "/usr/lib/systemd/system-generators/x-gen",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry written outside the package manager",
+  "note": "system generator in /lib/systemd/system-generators (non-usrmerged)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/bin/cp"
+   },
+   "payload": {
+    "filename": "/lib/systemd/system-generators/x-gen",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry written outside the package manager",
+  "note": "system generator in /usr/local/lib/systemd/system-generators",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/usr/local/lib/systemd/system-generators/x-gen",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry written outside the package manager",
+  "note": "user generator in /etc/systemd/user-generators",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/etc/systemd/user-generators/x",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry written outside the package manager",
+  "note": "user generator in /usr/lib/systemd/user-generators",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/usr/lib/systemd/user-generators/x",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry written outside the package manager",
+  "note": "dpkg installs a generator",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "filename": "/usr/lib/systemd/system-generators/systemd-fstab-generator.dpkg-new",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry written outside the package manager",
+  "note": "PID 1 runs generators: read-only open",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/lib/systemd/systemd"
+   },
+   "payload": {
+    "filename": "/usr/lib/systemd/system-generators/systemd-fstab-generator",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry written outside the package manager",
+  "note": "generator OUTPUT in /run/systemd/generator is not watched (written every boot)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/lib/systemd/system-generators/systemd-fstab-generator"
+   },
+   "payload": {
+    "filename": "/run/systemd/generator/local-fs.target.wants/x.mount",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry written outside the package manager",
+  "note": "/usr/local/lib other files are not units",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/pip3"
+   },
+   "payload": {
+    "filename": "/usr/local/lib/python3.10/dist-packages/x.py",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry moved into place outside the package manager",
+  "note": "generator moved into /etc/systemd/system-generators",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/tmp/g",
+    "destination": "/etc/systemd/system-generators/zz-net"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry moved into place outside the package manager",
+  "note": "unit moved into /usr/local/lib/systemd/system",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/home/u/t.service",
+    "destination": "/usr/local/lib/systemd/system/t.service"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service or autostart entry moved into place outside the package manager",
+  "note": "dpkg renames a generator into place",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "source": "/usr/lib/systemd/system-generators/x.dpkg-new",
+    "destination": "/usr/lib/systemd/system-generators/x"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service enabled, masked or linked outside the package manager",
+  "note": "generator symlinked to a home script",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/etc/systemd/system-generators/zz",
+    "destination": "/home/u/gen.sh",
+    "hard_link": "false"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service enabled, masked or linked outside the package manager",
+  "note": "unit linked into /usr/local/lib/systemd/system",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/usr/local/lib/systemd/system/t.service",
+    "destination": "/tmp/t.service",
+    "hard_link": "false"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Service enabled, masked or linked outside the package manager",
+  "note": "masking a generator by dpkg",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "source": "/etc/systemd/system-generators/x",
+    "destination": "/dev/null",
+    "hard_link": "false"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook written outside the package manager",
+  "note": "udev rule with RUN+= in /etc/udev/rules.d",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/tee"
+   },
+   "payload": {
+    "filename": "/etc/udev/rules.d/99-x.rules",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook written outside the package manager",
+  "note": "udev rule in /usr/lib/udev/rules.d",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/usr/lib/udev/rules.d/99-x.rules",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook written outside the package manager",
+  "note": "udev rule in /lib/udev/rules.d",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/bin/cp"
+   },
+   "payload": {
+    "filename": "/lib/udev/rules.d/99-x.rules",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook written outside the package manager",
+  "note": "udev rule in /usr/local/lib/udev/rules.d",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/usr/local/lib/udev/rules.d/99-x.rules",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook written outside the package manager",
+  "note": "ifupdown if-up.d hook",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/etc/network/if-up.d/tunnel",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook written outside the package manager",
+  "note": "ifupdown if-pre-up.d hook",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/etc/network/if-pre-up.d/x",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook written outside the package manager",
+  "note": "NetworkManager dispatcher script",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vi"
+   },
+   "payload": {
+    "filename": "/etc/NetworkManager/dispatcher.d/90-tunnel",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook written outside the package manager",
+  "note": "NetworkManager pre-up dispatcher script",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vi"
+   },
+   "payload": {
+    "filename": "/etc/NetworkManager/dispatcher.d/pre-up.d/10-x",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook written outside the package manager",
+  "note": "NetworkManager dispatcher in /usr/lib",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/usr/lib/NetworkManager/dispatcher.d/90-x",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook written outside the package manager",
+  "note": "dhclient exit hook",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/etc/dhcp/dhclient-exit-hooks.d/x",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook written outside the package manager",
+  "note": "dhclient enter hook",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/etc/dhcp/dhclient-enter-hooks.d/x",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook written outside the package manager",
+  "note": "ppp ip-up.d hook (cellular modem)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/etc/ppp/ip-up.d/0tunnel",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook written outside the package manager",
+  "note": "O_RDWR open counts as a write",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3"
+   },
+   "payload": {
+    "filename": "/etc/udev/rules.d/70-x.rules",
+    "flags": [
+     "O_RDWR"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook written outside the package manager",
+  "note": "dpkg installs a udev rule",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "filename": "/usr/lib/udev/rules.d/99-nv-l4t.rules.dpkg-new",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook written outside the package manager",
+  "note": "dpkg (/bin spelling) installs an ifupdown hook",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/bin/dpkg"
+   },
+   "payload": {
+    "filename": "/etc/network/if-up.d/ethtool.dpkg-new",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook written outside the package manager",
+  "note": "udevd reads its rules",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/lib/systemd/systemd-udevd"
+   },
+   "payload": {
+    "filename": "/usr/lib/udev/rules.d/60-persistent-storage.rules",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook written outside the package manager",
+  "note": "NetworkManager dispatcher reads a script",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/lib/NetworkManager/nm-dispatcher"
+   },
+   "payload": {
+    "filename": "/etc/NetworkManager/dispatcher.d/01-ifupdown",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook written outside the package manager",
+  "note": "/etc/network/interfaces is not a hook directory",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vi"
+   },
+   "payload": {
+    "filename": "/etc/network/interfaces",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook written outside the package manager",
+  "note": "dhclient lease file is not a hook",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/sbin/dhclient"
+   },
+   "payload": {
+    "filename": "/var/lib/dhcp/dhclient.eth0.leases",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook written outside the package manager",
+  "note": "KNOWN NOISE: a dpkg lookalike is not excluded",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/root/.cache/dpkg"
+   },
+   "payload": {
+    "filename": "/etc/udev/rules.d/99-x.rules",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook moved into place outside the package manager",
+  "note": "sed -i of a udev rule (temp + rename)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/sed"
+   },
+   "payload": {
+    "source": "/etc/udev/rules.d/sedAb12Cd",
+    "destination": "/etc/udev/rules.d/99-x.rules"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook moved into place outside the package manager",
+  "note": "hook moved into if-up.d",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/tmp/x",
+    "destination": "/etc/network/if-up.d/x"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook moved into place outside the package manager",
+  "note": "dispatcher script moved into place",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/home/u/x",
+    "destination": "/etc/NetworkManager/dispatcher.d/90-x"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook moved into place outside the package manager",
+  "note": "dpkg renames a udev rule into place",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "source": "/usr/lib/udev/rules.d/99-x.rules.dpkg-new",
+    "destination": "/usr/lib/udev/rules.d/99-x.rules"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook moved into place outside the package manager",
+  "note": "hook moved OUT of the directory is not an install",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/etc/network/if-up.d/x",
+    "destination": "/tmp/x"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook linked outside the package manager",
+  "note": "dispatcher symlink to a home script",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/etc/NetworkManager/dispatcher.d/90-x",
+    "destination": "/home/u/x.sh",
+    "hard_link": "false"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook linked outside the package manager",
+  "note": "udev rule hard link",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/etc/udev/rules.d/99-x.rules",
+    "destination": "/tmp/x.rules",
+    "hard_link": "true"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook linked outside the package manager",
+  "note": "masking a udev rule with /dev/null by dpkg",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "source": "/etc/udev/rules.d/80-net-setup-link.rules",
+    "destination": "/dev/null",
+    "hard_link": "false"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Boot, network or udev hook linked outside the package manager",
+  "note": "link elsewhere",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/update-alternatives"
+   },
+   "payload": {
+    "source": "/etc/alternatives/editor",
+    "destination": "/usr/bin/vim.basic",
+    "hard_link": "false"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file modified",
+  "note": "export CYCLONEDDS_URI appended to ~/.bashrc",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/bash",
+    "uid": 1000
+   },
+   "payload": {
+    "filename": "/home/unitree/.bashrc",
+    "flags": [
+     "O_WRONLY",
+     "O_APPEND"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file modified",
+  "note": "root's .profile",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vi"
+   },
+   "payload": {
+    "filename": "/root/.profile",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file modified",
+  "note": "~/.bash_profile",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vi"
+   },
+   "payload": {
+    "filename": "/home/u/.bash_profile",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file modified",
+  "note": "~/.bash_login",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vi"
+   },
+   "payload": {
+    "filename": "/home/u/.bash_login",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file modified",
+  "note": "~/.zshrc",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vi"
+   },
+   "payload": {
+    "filename": "/home/u/.zshrc",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file modified",
+  "note": "~/.zshenv",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vi"
+   },
+   "payload": {
+    "filename": "/home/u/.zshenv",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file modified",
+  "note": "~/.zprofile",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vi"
+   },
+   "payload": {
+    "filename": "/home/u/.zprofile",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file modified",
+  "note": "~/.pam_environment",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vi"
+   },
+   "payload": {
+    "filename": "/home/u/.pam_environment",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file modified",
+  "note": "/etc/profile.d drop-in",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/tee"
+   },
+   "payload": {
+    "filename": "/etc/profile.d/zz-x.sh",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file modified",
+  "note": "/etc/profile",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3"
+   },
+   "payload": {
+    "filename": "/etc/profile",
+    "flags": [
+     "O_RDWR"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file modified",
+  "note": "/etc/bash.bashrc",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vi"
+   },
+   "payload": {
+    "filename": "/etc/bash.bashrc",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file modified",
+  "note": "/etc/environment (LD_PRELOAD=...)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/tee"
+   },
+   "payload": {
+    "filename": "/etc/environment",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file modified",
+  "note": "/etc/zsh/zshenv",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vi"
+   },
+   "payload": {
+    "filename": "/etc/zsh/zshenv",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file modified",
+  "note": "dpkg ships a profile.d script",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "filename": "/etc/profile.d/bash_completion.sh.dpkg-new",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file modified",
+  "note": "bash reads ~/.bashrc",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/bash",
+    "uid": 1000
+   },
+   "payload": {
+    "filename": "/home/unitree/.bashrc",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file modified",
+  "note": "bash writes history (not a startup file)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/bash",
+    "uid": 1000
+   },
+   "payload": {
+    "filename": "/home/unitree/.bash_history",
+    "flags": [
+     "O_WRONLY",
+     "O_APPEND"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file modified",
+  "note": "editor backup ~/.bashrc~ is not the startup file",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vi"
+   },
+   "payload": {
+    "filename": "/home/u/.bashrc~",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file modified",
+  "note": "skeleton in /etc/skel is not live",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vi"
+   },
+   "payload": {
+    "filename": "/etc/skel/.bashrc",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file modified",
+  "note": "/etc/profile.dpkg-old is not /etc/profile",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/etc/profile.dpkg-old",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file modified",
+  "note": "rc file outside /home and /root",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vi"
+   },
+   "payload": {
+    "filename": "/opt/app/.bashrc",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file moved into place",
+  "note": "sed -i ~/.bashrc (temp + rename)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/sed"
+   },
+   "payload": {
+    "source": "/home/u/sedXy12Zq",
+    "destination": "/home/u/.bashrc"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file moved into place",
+  "note": "/etc/environment replaced",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/tmp/env",
+    "destination": "/etc/environment"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file moved into place",
+  "note": "profile.d drop-in moved in",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/tmp/x.sh",
+    "destination": "/etc/profile.d/x.sh"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file moved into place",
+  "note": "dpkg renames /etc/bash.bashrc into place",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "source": "/etc/bash.bashrc.dpkg-new",
+    "destination": "/etc/bash.bashrc"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file moved into place",
+  "note": "vim saves its backup (rename away from the rc file)",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/vim.basic"
+   },
+   "payload": {
+    "source": "/home/u/.bashrc",
+    "destination": "/home/u/.bashrc~"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file linked",
+  "note": "~/.bashrc -> /tmp/x",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/home/u/.bashrc",
+    "destination": "/tmp/x",
+    "hard_link": "false"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file linked",
+  "note": "/etc/profile.d symlink",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/etc/profile.d/x.sh",
+    "destination": "/home/u/x.sh",
+    "hard_link": "false"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file linked",
+  "note": "dpkg creates a profile.d link",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/dpkg"
+   },
+   "payload": {
+    "source": "/etc/profile.d/x.sh",
+    "destination": "/usr/share/x/x.sh",
+    "hard_link": "false"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Shell startup or login environment file linked",
+  "note": "link elsewhere in home",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/home/u/.config/nvim/init.vim",
+    "destination": "/home/u/dotfiles/init.vim",
+    "hard_link": "false"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program in a user-writable directory connects to a public address",
+  "note": "renamed tunnel client in /tmp to a public relay",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/tmp/.x/kworker"
+   },
+   "payload": {
+    "destination": {
+     "ip": "203.0.113.7",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program in a user-writable directory connects to a public address",
+  "note": "implant in /dev/shm",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/dev/shm/a"
+   },
+   "payload": {
+    "destination": {
+     "ip": "198.51.100.9",
+     "port": 8443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program in a user-writable directory connects to a public address",
+  "note": "binary in /var/tmp",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/var/tmp/u"
+   },
+   "payload": {
+    "destination": {
+     "ip": "198.51.100.9",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program in a user-writable directory connects to a public address",
+  "note": "binary in /run/user",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/run/user/1000/x"
+   },
+   "payload": {
+    "destination": {
+     "ip": "198.51.100.9",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program in a user-writable directory connects to a public address",
+  "note": "binary in /run/lock",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/run/lock/x"
+   },
+   "payload": {
+    "destination": {
+     "ip": "198.51.100.9",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program in a user-writable directory connects to a public address",
+  "note": "binary in /var/crash",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/var/crash/x"
+   },
+   "payload": {
+    "destination": {
+     "ip": "198.51.100.9",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program in a user-writable directory connects to a public address",
+  "note": "downloaded agent in a home directory, public IPv6",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/home/unitree/.local/bin/agent"
+   },
+   "payload": {
+    "destination": {
+     "ip": "2001:db8::5",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program in a user-writable directory connects to a public address",
+  "note": "root's home",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/root/x"
+   },
+   "payload": {
+    "destination": {
+     "ip": "198.51.100.9",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program in a user-writable directory connects to a public address",
+  "note": "public UDP (connected socket)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/home/unitree/x"
+   },
+   "payload": {
+    "destination": {
+     "ip": "198.51.100.9",
+     "port": 53
+    },
+    "is_tcp": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program in a user-writable directory connects to a public address",
+  "note": "just above 172.16/12 is public",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/tmp/x"
+   },
+   "payload": {
+    "destination": {
+     "ip": "172.32.0.1",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program in a user-writable directory connects to a public address",
+  "note": "IPv4-mapped public address",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/tmp/x"
+   },
+   "payload": {
+    "destination": {
+     "ip": "::ffff:198.51.100.9",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program in a user-writable directory connects to a public address",
+  "note": "SDK binary in home to the robot LAN",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/home/unitree/unitree_sdk2/build/bin/go2_sport_client"
+   },
+   "payload": {
+    "destination": {
+     "ip": "192.168.123.161",
+     "port": 7410
+    },
+    "is_tcp": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program in a user-writable directory connects to a public address",
+  "note": "home binary to loopback",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/home/u/x"
+   },
+   "payload": {
+    "destination": {
+     "ip": "127.0.0.1",
+     "port": 8080
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program in a user-writable directory connects to a public address",
+  "note": "home binary to DDS multicast",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/home/u/x"
+   },
+   "payload": {
+    "destination": {
+     "ip": "239.255.0.1",
+     "port": 7400
+    },
+    "is_tcp": false
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program in a user-writable directory connects to a public address",
+  "note": "home binary to a ULA peer",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/home/u/x"
+   },
+   "payload": {
+    "destination": {
+     "ip": "fd00::5",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program in a user-writable directory connects to a public address",
+  "note": "home binary to IPv6 link-local",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/home/u/x"
+   },
+   "payload": {
+    "destination": {
+     "ip": "fe80::1",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program in a user-writable directory connects to a public address",
+  "note": "system binary to public is another rule's business",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/curl"
+   },
+   "payload": {
+    "destination": {
+     "ip": "198.51.100.9",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program in a user-writable directory connects to a public address",
+  "note": "/opt binary to public is not in scope",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/opt/vendor/bin/x"
+   },
+   "payload": {
+    "destination": {
+     "ip": "198.51.100.9",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program in a user-writable directory connects to a public address",
+  "note": "/homework is not /home/",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/homework/x"
+   },
+   "payload": {
+    "destination": {
+     "ip": "198.51.100.9",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Program in a user-writable directory connects to a public address",
+  "note": "/tmpfs-like prefix without slash",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/tmpx/y"
+   },
+   "payload": {
+    "destination": {
+     "ip": "198.51.100.9",
+     "port": 443
+    },
+    "is_tcp": true
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library modified outside the package manager",
+  "note": "pip-vendored libddsc in cyclonedds.libs overwritten",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/cp"
+   },
+   "payload": {
+    "filename": "/usr/local/lib/python3.8/dist-packages/cyclonedds.libs/libddsc-a1b2c3d4.so.0.10.2",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library modified outside the package manager",
+  "note": "pip install cyclonedds into a venv writes cyclonedds.libs (commissioning audit trail)",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/home/unitree/venv/bin/python3"
+   },
+   "payload": {
+    "filename": "/home/unitree/venv/lib/python3.8/site-packages/cyclonedds.libs/libddsc-a1b2c3d4.so.0.10.2",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library modified outside the package manager",
+  "note": "vendored libcrypto in cyclonedds.libs",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3"
+   },
+   "payload": {
+    "filename": "/usr/local/lib/python3.8/dist-packages/cyclonedds.libs/libcrypto-0e1f2a3b.so.3",
+    "flags": [
+     "O_RDWR"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library modified outside the package manager",
+  "note": "python loads the vendored libddsc read-only",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3"
+   },
+   "payload": {
+    "filename": "/usr/local/lib/python3.8/dist-packages/cyclonedds.libs/libddsc-a1b2c3d4.so.0.10.2",
+    "flags": [
+     "O_RDONLY"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library modified outside the package manager",
+  "note": "cyclonedds package python source is not a library",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3"
+   },
+   "payload": {
+    "filename": "/usr/local/lib/python3.8/dist-packages/cyclonedds/__init__.py",
+    "flags": [
+     "O_WRONLY",
+     "O_CREAT",
+     "O_TRUNC"
+    ]
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library moved into place outside the package manager",
+  "note": "pip renames a vendored lib into cyclonedds.libs",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/python3"
+   },
+   "payload": {
+    "source": "/usr/local/lib/python3.8/dist-packages/cyclonedds.libs/tmpab12",
+    "destination": "/usr/local/lib/python3.8/dist-packages/cyclonedds.libs/libddsc-a1b2c3d4.so.0.10.2"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library moved into place outside the package manager",
+  "note": "unrelated .libs directory",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/mv"
+   },
+   "payload": {
+    "source": "/tmp/x",
+    "destination": "/usr/local/lib/python3.8/dist-packages/numpy.libs/libopenblas-r0.so"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library linked outside the package manager",
+  "note": "vendored libddsc replaced by a symlink to a hook",
+  "expect": true,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/usr/local/lib/python3.8/dist-packages/cyclonedds.libs/libddsc-a1b2c3d4.so.0.10.2",
+    "destination": "/home/x/hook.so",
+    "hard_link": "false"
+   }
+  }
+ },
+ {
+  "rule": "RoboDR: Unitree SDK or Cyclone DDS library linked outside the package manager",
+  "note": "link in another wheel's .libs",
+  "expect": false,
+  "event": {
+   "header": {
+    "image": "/usr/bin/ln"
+   },
+   "payload": {
+    "source": "/usr/local/lib/python3.8/dist-packages/numpy.libs/x.so",
+    "destination": "/tmp/x.so",
+    "hard_link": "false"
+   }
+  }
  }
 ]

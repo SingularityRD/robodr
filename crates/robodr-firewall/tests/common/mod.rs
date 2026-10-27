@@ -155,3 +155,191 @@ impl Rng {
         self.range(0.0, 1.0) < p
     }
 }
+
+// ------------------------------------------------------------ joint frames
+
+/// Envelope `max_joint_speed` of the low-level channel (tightens `dq_max`).
+pub const ENV_DQ: f64 = 30.0;
+pub const Q_LIM: f64 = 1.0;
+pub const DQ_MAX: f64 = 10.0;
+pub const TAU_MAX: f64 = 20.0;
+pub const KP_MAX: f64 = 100.0;
+pub const KD_MAX: f64 = 5.0;
+
+/// Fixture with a low-level joint channel `/lowcmd` (allowed: `ctl`) next
+/// to a twist channel `/cmd_vel` (allowed: `nav`).
+pub struct JFx {
+    pub fw: Firewall,
+    pub ctl: SourceId,
+    pub nav: SourceId,
+    pub low: ChannelId,
+    pub base: ChannelId,
+    pub slots: usize,
+    pub active: usize,
+}
+
+pub fn joint_profile(locked: bool) -> Profile {
+    let mut p = Profile {
+        model: "legged-test".into(),
+        locked,
+        ..Default::default()
+    };
+    p.participants.insert(PREFIX.into());
+    p.writer_topics.insert("/cmd_vel".into());
+    p.motion_envelopes.insert(
+        "/cmd_vel".into(),
+        Envelope {
+            max_linear_speed: Some(LIN),
+            ..Default::default()
+        },
+    );
+    p.writer_topics.insert("/lowcmd".into());
+    p.motion_envelopes.insert(
+        "/lowcmd".into(),
+        Envelope {
+            max_joint_speed: Some(ENV_DQ),
+            ..Default::default()
+        },
+    );
+    p
+}
+
+/// Fixture `max_dq_step`: wider than any in-range move, so only the tests
+/// that set their own step bound see one.
+pub const STEP_MAX: f64 = 100.0;
+
+/// The fixture rate: 1 kHz, a 1 ns minimum interval (frames 1 ns apart are
+/// still accepted) and no practical maximum, so only the tests that set
+/// their own rate see the window.
+pub fn wide_rate() -> JointRate {
+    JointRate {
+        expected_hz: 1000.0,
+        min_interval_ns: 1,
+        max_interval_ns: 60_000 * MS,
+    }
+}
+
+/// `slots` motor slots, the first `active` enabled with the test limits
+/// (gain minimums zero with an explicit `allow_limp`, so the same spec
+/// compiles for a humanoid; `max_dq_step` = [`STEP_MAX`]).
+pub fn joint_spec(slots: usize, active: usize) -> JointChannelSpec {
+    JointChannelSpec {
+        allowed_sources: vec![guid("00000103")],
+        motors: (0..slots)
+            .map(|i| {
+                if i < active {
+                    MotorLimits {
+                        allow_limp: true,
+                        max_dq_step: Some(STEP_MAX),
+                        ..MotorLimits::enabled((-Q_LIM, Q_LIM), DQ_MAX, TAU_MAX, KP_MAX, KD_MAX)
+                    }
+                } else {
+                    MotorLimits::disabled()
+                }
+            })
+            .collect(),
+        rate: Some(wide_rate()),
+        ..Default::default()
+    }
+}
+
+pub fn joint_specs(spec: JointChannelSpec) -> BTreeMap<String, JointChannelSpec> {
+    BTreeMap::from([("/lowcmd".to_string(), spec)])
+}
+
+pub fn twist_specs() -> BTreeMap<String, ChannelSpec> {
+    BTreeMap::from([(
+        "/cmd_vel".to_string(),
+        ChannelSpec {
+            allowed_sources: vec![guid("00000203")],
+            max_angular_speed: Some(ANG),
+            ..Default::default()
+        },
+    )])
+}
+
+pub fn humanoid() -> PlatformConfig {
+    PlatformConfig {
+        morphology: Morphology::Humanoid,
+        fail_behaviour: FailBehaviour::HoldLast {
+            max_hold_ns: 50 * MS,
+        },
+        fault_policy: FaultPolicy::FailHold,
+        ..Default::default()
+    }
+}
+
+pub fn quadruped(fail_behaviour: FailBehaviour) -> PlatformConfig {
+    PlatformConfig {
+        morphology: Morphology::Quadruped,
+        fail_behaviour,
+        ..Default::default()
+    }
+}
+
+pub fn build_joint(
+    platform: PlatformConfig,
+    locked: bool,
+    slots: usize,
+    active: usize,
+    tweak: impl FnOnce(&mut JointChannelSpec),
+) -> JFx {
+    let mut spec = joint_spec(slots, active);
+    tweak(&mut spec);
+    let pol = Policy::compile_with_joints(
+        &joint_profile(locked),
+        platform,
+        &twist_specs(),
+        &joint_specs(spec),
+    )
+    .expect("joint policy compiles");
+    let fw = Firewall::new(pol);
+    JFx {
+        ctl: fw.source_id(&guid("00000103")).unwrap(),
+        nav: fw.source_id(&guid("00000203")).unwrap(),
+        low: fw.channel_id("/lowcmd").unwrap(),
+        base: fw.channel_id("/cmd_vel").unwrap(),
+        fw,
+        slots,
+        active,
+    }
+}
+
+/// An in-envelope motor command.
+pub fn good() -> MotorCmd {
+    MotorCmd::enabled(0.2, 1.0, 2.0, 50.0, 1.0)
+}
+
+/// A frame of `slots` slots: `f(i)` for active ones, OFF for the rest.
+/// Allocation-free (the allocation test builds frames inside its measured
+/// region).
+pub fn jframe(slots: usize, active: usize, f: impl Fn(usize) -> MotorCmd) -> JointFrame {
+    let mut ms = [MotorCmd::OFF; MAX_MOTORS];
+    for (i, m) in ms.iter_mut().enumerate().take(active.min(slots)) {
+        *m = f(i);
+    }
+    JointFrame::from_slice(&ms[..slots], Some(true)).unwrap()
+}
+
+impl JFx {
+    /// A nominal frame from the allowed source.
+    pub fn nominal(&self, stamp: u64) -> JointCommand {
+        JointCommand::new(
+            self.ctl,
+            self.low,
+            stamp,
+            jframe(self.slots, self.active, |_| good()),
+        )
+    }
+
+    /// The nominal frame with slot `slot` replaced by `m`.
+    pub fn with_slot(&self, stamp: u64, slot: usize, m: MotorCmd) -> JointCommand {
+        let mut c = self.nominal(stamp);
+        *c.frame.motor_mut(slot).unwrap() = m;
+        c
+    }
+}
+
+pub fn jout(v: &JointVerdict) -> JointFrame {
+    v.output().expect("verdict emits a frame").frame
+}

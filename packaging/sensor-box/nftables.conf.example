@@ -1,0 +1,72 @@
+#!/usr/sbin/nft -f
+# EXAMPLE host firewall for a RoboDR sensor box (docs/UNITREE.md, "Sensor
+# box"). Not active as shipped. To use: copy to /etc/nftables.conf, set the
+# TUNE values, check with 'nft -c -f /etc/nftables.conf', then
+# 'systemctl enable --now nftables'.
+#
+# Policy: drop by default in every direction.
+#   * Capture NIC: nothing in, nothing out, ever. This does not affect
+#     capture: AF_PACKET taps see frames before netfilter.
+#   * Uplink NIC: out only to the findings receiver (the SOC ingest API,
+#     robodr-uplink.service, HTTPS; or the Kafka brokers,
+#     robodr-kafka-publish.service) and NTP; in only SSH from the admin
+#     network. No forwarding: the box is not a router between the robot
+#     network and the uplink.
+# Kafka: the publisher connects to the bootstrap broker AND to every broker
+# the cluster advertises (the leader of each partition), so KAFKA_BROKERS
+# must hold every broker's advertised address, not one "collector" IP; a
+# leader that is missing here stalls its partitions after the next leader
+# change. Keep it equal to the IPAddressAllow= of the publisher's
+# 50-brokers.conf drop-in. A diode site exports with robodr-spool-export
+# (files, no network) and needs no Kafka rule at all: delete it.
+# Ingest API (robodr-uplink): SOC_INGEST = the address(es) the URL's host
+# resolves to (put that name in /etc/hosts), equal to the IPAddressAllow= of
+# the uplink's 50-soc.conf drop-in. Keep the rule of the export you enable
+# and delete the other one.
+# All addresses below are documentation placeholders (RFC 5737) and must be
+# replaced. Use addresses, not host names: the box resolves no DNS, so the
+# brokers must advertise IP-literal listeners (advertised.listeners) or be
+# listed in /etc/hosts.
+# Interface names: eth1 = capture NIC, eth0 = uplink, as in
+# agentd.unitree-sensor-box.example.json; use your box's names (ip link).
+# If the uplink uses DHCP or IPv6, add the DHCP (udp 67/68) and ICMPv6
+# neighbour discovery rules it needs; nothing here permits them.
+
+flush ruleset
+
+# TUNE
+define CAPTURE_IF = "eth1"
+define UPLINK_IF = "eth0"
+define KAFKA_BROKERS = { 192.0.2.21, 192.0.2.22, 192.0.2.23 }
+define KAFKA_PORT = 9092
+define SOC_INGEST = { 192.0.2.40 }
+define SOC_INGEST_PORT = 443
+define NTP_SERVER = 192.0.2.123
+define ADMIN_NET = 192.0.2.64/28
+
+table inet robodr_sensor_box {
+    chain input {
+        type filter hook input priority filter; policy drop;
+        iif "lo" accept
+        iifname $CAPTURE_IF drop
+        ct state invalid drop
+        ct state established,related accept
+        iifname $UPLINK_IF ip saddr $ADMIN_NET tcp dport 22 ct state new accept
+        iifname $UPLINK_IF icmp type { echo-request, destination-unreachable, time-exceeded } accept
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority filter; policy drop;
+        oif "lo" accept
+        oifname $CAPTURE_IF drop
+        ct state invalid drop
+        ct state established,related accept
+        oifname $UPLINK_IF ip daddr $KAFKA_BROKERS tcp dport $KAFKA_PORT ct state new accept
+        oifname $UPLINK_IF ip daddr $SOC_INGEST tcp dport $SOC_INGEST_PORT ct state new accept
+        oifname $UPLINK_IF ip daddr $NTP_SERVER udp dport 123 ct state new accept
+    }
+}

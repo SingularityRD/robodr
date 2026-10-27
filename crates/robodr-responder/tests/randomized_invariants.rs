@@ -21,6 +21,7 @@ fn random_policy(rng: &mut XorShift) -> ResponsePolicy {
     let platform = *rng.pick(&PlatformFamily::ALL);
     let mut p = ResponsePolicy::conservative_default(platform);
     p.oem_validated = !rng.chance(1, 8);
+    p.morphology = *rng.pick(&Morphology::ALL);
     let row = |rng: &mut XorShift| SeverityRow {
         low: *rng.pick(&Step::ALL),
         medium: *rng.pick(&Step::ALL),
@@ -33,8 +34,18 @@ fn random_policy(rng: &mut XorShift) -> ResponsePolicy {
     p.matrix.collaborative_human_nearby = row(rng);
     p.matrix.unknown = row(rng);
     p.auto_max_step = *rng.pick(&Step::ALL);
-    p.allow_terminate_when_idle = rng.chance(1, 2);
+    if p.morphology.is_unspecified() && (p.oem_validated || platform == PlatformFamily::Other) {
+        p.morphology = stable(platform);
+    }
+    p.allow_terminate_when_idle = rng.chance(1, 2) && !p.morphology.needs_active_balance();
     p.limit_motion_factor = (rng.below(1000) + 1) as f64 / 1000.0;
+    p.min_motion_factor = (rng.below(451) + 50) as f64 / 1000.0;
+    if p.morphology.needs_active_balance() {
+        p.limit_motion_factor = p.limit_motion_factor.max(p.min_motion_factor);
+    }
+    if p.morphology.falls_when_de_energised() && rng.chance(1, 2) {
+        p.fall_safe_restrict = vec![RestrictTarget::Network];
+    }
     let mut targets: Vec<RestrictTarget> = RestrictTarget::ALL
         .into_iter()
         .filter(|_| rng.chance(1, 2))
@@ -136,11 +147,15 @@ fn random_ops(rng: &mut XorShift, policy: &ResponsePolicy) -> Vec<Op> {
         };
         let ctxs = all_contexts(platform);
         // Mostly the nominal context so enforcement paths are exercised.
-        let ctx = if rng.chance(1, 2) {
+        let mut ctx = if rng.chance(1, 2) {
             ctx(platform)
         } else {
             *rng.pick(&ctxs)
         };
+        // Mostly the policy's own morphology, sometimes a mismatch.
+        if !rng.chance(1, 20) {
+            ctx.morphology = policy.morphology;
+        }
         ops.push(Op::Plan {
             dev: dev(rng.pick(&rules), sev, mode),
             source,

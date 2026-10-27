@@ -1,0 +1,51 @@
+[package]
+name = "robodr-deliverd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# Not published (crates.io disallows path deps); also lets cargo-deny
+# accept version-less path dependencies (deny.toml, allow-wildcard-paths).
+publish = false
+repository.workspace = true
+description = "On-unit delivery agent (docs/SECURE-DELIVERY.md §4.2, §6, Sprint 13b): imports per-unit media packs only through the verified-copy path, installs files / config / deb / robodr-rules RPKs from a content-addressed store behind agentd's live safety-state gate, health gate with automatic rollback, anti-rollback floors, black-box evidence and robot.deliver.* findings; plus the safety-report replay helper for tests and demos."
+
+# Formats and every content rule are robodr-pkg's; the verified-copy import
+# and the trust anchor are robodr-release's (the 13a code, reused, not
+# copied); evidence is a robodr-blackbox chain of its own; findings are
+# robodr-ocsf records spooled into agentd's spool (robodr-agentd::spool
+# format); the safety state is read from agentd's status.json.
+[dependencies]
+robodr-agentd = { workspace = true }
+robodr-blackbox = { workspace = true }
+# `--flag value` argument parser shared with the diode and release binaries.
+robodr-diode = { workspace = true }
+robodr-events = { workspace = true }
+robodr-ocsf = { workspace = true }
+robodr-pkg = { workspace = true }
+robodr-release = { workspace = true }
+robodr-responder = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# robodr-rules payloads: structural check of Pulsar rule files (already in
+# the lock through Pulsar; parse + serde only, bounded recursion).
+toml = { workspace = true }
+
+[dev-dependencies]
+# tests/agentd_replay.rs runs a real robodr-agentd with agentd's own test
+# setup (crates/robodr-agentd/tests/common, included by path), which needs
+# these.
+robodr-agent = { workspace = true }
+robodr-capture = { workspace = true }
+robodr-commission = { workspace = true }
+
+[[bin]]
+name = "robodr-deliverd"
+path = "src/bin/robodr-deliverd.rs"
+# Same crate name as the library: keep it out of rustdoc to avoid a collision.
+doc = false
+
+[[bin]]
+name = "robodr-safety-replay"
+path = "src/bin/robodr-safety-replay.rs"
+doc = false

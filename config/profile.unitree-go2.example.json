@@ -1,0 +1,52 @@
+{
+  "model": "unitree-go2-EXAMPLE-replace-with-OEM-data",
+  "locked": false,
+  "participants": [
+    "0123456789abcdef01234567"
+  ],
+  "writer_topics": [
+    "/api/obstacles_avoid/request",
+    "/api/obstacles_avoid/response",
+    "/api/robot_state/request",
+    "/api/robot_state/response",
+    "/api/sport/request",
+    "/api/sport/response",
+    "/api/uwbswitch/request",
+    "/api/uwbswitch/response",
+    "/lf/lowstate",
+    "/lf/sportmodestate",
+    "/lowcmd",
+    "/lowstate",
+    "/sportmodestate",
+    "/wirelesscontroller"
+  ],
+  "motion_envelopes": {
+    "/api/obstacles_avoid/request": {
+      "max_linear_speed": 1.0,
+      "max_joint_speed": null
+    },
+    "/api/robot_state/request": {
+      "max_linear_speed": 0.0,
+      "max_joint_speed": null
+    },
+    "/api/sport/request": {
+      "max_linear_speed": 1.5,
+      "max_joint_speed": null
+    },
+    "/api/uwbswitch/request": {
+      "max_linear_speed": 0.0,
+      "max_joint_speed": null
+    },
+    "/lowcmd": {
+      "max_linear_speed": null,
+      "max_joint_speed": 30.1,
+      "max_joint_torque": 45.43,
+      "max_joint_kp": 100.0,
+      "max_joint_position_step": 0.2
+    }
+  },
+  "services": [],
+  "actions": [],
+  "reader_topics": [],
+  "raw_dds_topics": []
+}

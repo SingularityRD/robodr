@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 # Build the offline (air-gapped) install bundle for one architecture.
 #
-#   packaging/make-bundle.sh --deb dist/robodr_<v>_<arch>.deb \
+#   packaging/make-bundle.sh --deb dist/<package>_<v>_<arch>.deb \
 #       [--sbom-dir dist/sbom] [--out dist]
 #
-# Produces robodr-<version>-<arch>-offline.tar.gz containing:
-#   robodr-<version>-<arch>/
-#     robodr_<debver>_<arch>.deb
+# <package> is robodr, or robodr-focal for the static systemd-245 variant
+# (packaging/build-deb.sh --variant focal), read from the .deb itself.
+# Produces <package>-<version>-<arch>-offline.tar.gz containing:
+#   <package>-<version>-<arch>/
+#     <package>_<debver>_<arch>.deb
 #     install-bundle.sh            (verify + install + rollback, POSIX sh)
+#     security-floor               (min_version=<debver>: no install or
+#                                   rollback below it, packaging/security-floor)
 #     sbom/*.cdx.json              (CycloneDX, when --sbom-dir is given)
-#     doc/OPERATIONS.md SECURITY.md CHANGELOG.md
+#     doc/OPERATIONS.md UNITREE.md SECURITY.md CHANGELOG.md
 #     SHA256SUMS                   (every file above, relative paths)
 # The release workflow signs the tarball and SHA256SUMS separately
 # (minisign); the bundle never carries the public key it is verified with:
@@ -38,6 +42,8 @@ done
 
 version="$(tr -d '[:space:]' <"$root/VERSION")"
 arch="$(dpkg-deb -f "$deb" Architecture)"
+package="$(dpkg-deb -f "$deb" Package)"
+case "$package" in robodr | robodr-focal) ;; *) echo "make-bundle: unexpected package $package" >&2; exit 2 ;; esac
 if [[ -z "${SOURCE_DATE_EPOCH:-}" ]]; then
     SOURCE_DATE_EPOCH="$(git -C "$root" log -1 --format=%ct 2>/dev/null || echo 0)"
 fi
@@ -46,13 +52,14 @@ mkdir -p "$out"
 out="$(cd "$out" && pwd)"
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
-name="robodr-$version-$arch"
+name="$package-$version-$arch"
 b="$stage/$name"
 mkdir -p "$b/doc"
 
 install -m 0644 "$deb" "$b/"
 install -m 0755 "$here/install-bundle.sh" "$b/install-bundle.sh"
-for f in docs/OPERATIONS.md SECURITY.md CHANGELOG.md; do
+install -m 0644 "$here/security-floor" "$b/security-floor"
+for f in docs/OPERATIONS.md docs/UNITREE.md SECURITY.md CHANGELOG.md; do
     [[ -f "$root/$f" ]] && install -m 0644 "$root/$f" "$b/doc/"
 done
 if [[ -n "$sbom_dir" ]]; then

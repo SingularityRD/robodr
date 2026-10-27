@@ -1,0 +1,13 @@
+{
+  "model": "ugv-test",
+  "locked": false,
+  "participants": [],
+  "writer_topics": [
+    "/cmd_vel"
+  ],
+  "motion_envelopes": {},
+  "services": [],
+  "actions": [],
+  "reader_topics": [],
+  "raw_dds_topics": []
+}

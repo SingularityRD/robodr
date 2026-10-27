@@ -1,0 +1,25 @@
+{
+  "body_file": "8.body",
+  "body_sha256": "e12895470cd65ab71a5d2e7e8a5299f66cea58c6aed7f47fab51205203914fb8",
+  "headers": [
+    [
+      "Content-Type",
+      "application/json"
+    ],
+    [
+      "X-RoboDR-Key-Id",
+      "ed25519:7bf642b114c6afa2"
+    ],
+    [
+      "X-RoboDR-Timestamp",
+      "1790000060000"
+    ],
+    [
+      "X-RoboDR-Signature",
+      "1dabaf6c16c143a4d6ff13d70579a8258e611c79b818cea8f7434ef8fee9f416ac8278971cb9320c8de93857b5d35b8519ae8cb2ba0ad3437df5467ec8d98108"
+    ]
+  ],
+  "method": "POST",
+  "server_time_ms": 1790000060000,
+  "target": "/api/robot-edr/v2/fleet/profiles/drafts"
+}

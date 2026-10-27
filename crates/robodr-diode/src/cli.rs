@@ -36,8 +36,6 @@ pub struct Args {
     switches: Vec<String>,
 }
 
-/// Parse `--flag value` pairs; every flag must be in `known`.
-/// `--help`/`-h` yields `Err("help")`.
 /// The process arguments (without the program name) as UTF-8 strings. An
 /// argument that is not valid UTF-8 is an error (a usage error for the
 /// binaries), never a panic as with `std::env::args()`.
@@ -51,8 +49,24 @@ pub fn argv() -> Result<Vec<String>, String> {
         .collect()
 }
 
+/// True when the arguments are exactly `--version` (or `-V`): the
+/// binaries then print `<name> <version>` on stdout and exit 0. Anywhere
+/// else (or next to other flags) it stays a usage error.
+pub fn is_version_request(args: &[String]) -> bool {
+    matches!(args, [a] if a == "--version" || a == "-V")
+}
+
+/// Parse `--flag value` pairs; every flag must be in `known`.
+/// `--help`/`-h` as the **only** argument yields `Err("help")` (the binaries
+/// print the usage and exit 0); next to other arguments it is a usage error,
+/// so a wrapper that splices a stray `-h` into a real command line (an
+/// unquoted variable) never turns the command into a successful no-op.
 pub fn parse_args(args: impl IntoIterator<Item = String>, known: &[&str]) -> Result<Args, String> {
     parse_args_with_switches(args, known, &[])
+}
+
+fn is_help(a: &str) -> bool {
+    a == "--help" || a == "-h"
 }
 
 /// [`parse_args`] plus value-less `--switch`es (each at most once).
@@ -61,11 +75,15 @@ pub fn parse_args_with_switches(
     known: &[&str],
     switches: &[&str],
 ) -> Result<Args, String> {
+    let args: Vec<String> = args.into_iter().collect();
+    if matches!(args.as_slice(), [a] if is_help(a)) {
+        return Err("help".into());
+    }
     let mut it = args.into_iter();
     let mut out = Args::default();
     while let Some(a) = it.next() {
-        if a == "--help" || a == "-h" {
-            return Err("help".into());
+        if is_help(&a) {
+            return Err(format!("{a} is only accepted alone"));
         }
         let Some(flag) = a.strip_prefix("--") else {
             return Err(format!("unexpected argument {a:?}"));
@@ -338,6 +356,26 @@ mod tests {
         assert!(parse_args(s(&["--a"]), &["a"]).is_err());
         assert!(parse_args(s(&["pos"]), &["a"]).is_err());
         assert_eq!(parse_args(s(&["-h"]), &["a"]).unwrap_err(), "help");
+        assert_eq!(parse_args(s(&["--help"]), &["a"]).unwrap_err(), "help");
+        // Help next to other arguments is a usage error, never "help"
+        // (13a review finding 8: a spliced -h must not exit 0).
+        for args in [
+            &["--a", "1", "-h"][..],
+            &["-h", "--a", "1"],
+            &["--help", "--help"],
+            &["--a", "1", "--help"],
+        ] {
+            let e = parse_args(s(args), &["a"]).unwrap_err();
+            assert_ne!(e, "help", "{args:?}");
+        }
+        // As a flag's value it is just a value.
+        let a = parse_args(s(&["--a", "-h"]), &["a"]).unwrap();
+        assert_eq!(a.one("a").unwrap(), Some("-h"));
+        assert!(is_version_request(&s(&["--version"])));
+        assert!(is_version_request(&s(&["-V"])));
+        assert!(!is_version_request(&s(&[])));
+        assert!(!is_version_request(&s(&["--version", "--a", "1"])));
+        assert!(parse_args(s(&["--version", "--a", "1"]), &["a"]).is_err());
         // Switches take no value and appear at most once.
         let a = parse_args_with_switches(s(&["--x", "--a", "1"]), &["a"], &["x"]).unwrap();
         assert!(a.flag("x") && !a.flag("a"));

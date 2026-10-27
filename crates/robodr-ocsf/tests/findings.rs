@@ -51,7 +51,9 @@ fn ocsf_class_constants() {
     assert_eq!((o.status_id, o.status.as_str()), (1, "New"));
     assert_eq!(o.metadata.version, "1.1.0");
     assert_eq!(o.metadata.product.name, "RoboDR");
-    assert_eq!(f.data_source, "robot_edr");
+    assert_eq!(f.data_source, "robodr");
+    assert_eq!(f.contract_version, "2.2.0");
+    assert_eq!(o.metadata.log_name, "robodr.findings");
     assert_eq!(f.timestamp, "2026-09-21T14:13:20.000Z");
     // Rogue participant -> ATT&CK for ICS T0848 (see README caveat).
     assert_eq!(f.mitre_predictions[0].technique_id, "T0848");
@@ -157,7 +159,22 @@ fn dedup_key_differs_per_robot_rule_and_subject() {
 fn partition_by_robot_id_not_by_key() {
     let f = example_finding();
     let rec = record(&f, Some(12)).unwrap();
-    assert_eq!(rec.topic, "robot-edr.findings");
+    assert_eq!(rec.topic, "robodr.findings");
+    assert!(rec.headers.contains(&("data-source", "robodr".into())));
+    assert!(rec.headers.contains(&(
+        "robodr-contract-version",
+        robodr_ocsf::CONTRACT_VERSION.into()
+    )));
+    // L4: the header is the value's own version, not the producer's.
+    let mut older = f.clone();
+    older.contract_version = "2.0.0".into();
+    assert!(
+        robodr_ocsf::kafka::headers(&older).contains(&("robodr-contract-version", "2.0.0".into()))
+    );
+    older.contract_version = "2.7.1".into();
+    assert!(
+        robodr_ocsf::kafka::headers(&older).contains(&("robodr-contract-version", "2.7.1".into()))
+    );
     assert_eq!(rec.key, f.finding_id);
     assert_eq!(rec.partition, partition_for("ugv-007", 12));
     assert_eq!(rec.headers[0], ("content-type", "application/json".into()));
@@ -447,7 +464,7 @@ fn validator_rejects_tampered_or_hostile_deserialised_findings() {
         ("category uid", |v| v["ocsf"]["category_uid"] = 1.into()),
         ("type uid", |v| v["ocsf"]["type_uid"] = 200401.into()),
         ("data source", |v| {
-            v["data_source"] = "kafka:robot-edr.findings".into()
+            v["data_source"] = "kafka:robodr.findings".into()
         }),
         ("finding id mismatch", |v| {
             v["finding_id"] = "rf1-00000000000000000000000000000000".into()
@@ -475,7 +492,22 @@ fn validator_rejects_tampered_or_hostile_deserialised_findings() {
         ("resource label removed", |v| {
             v["ocsf"]["resources"][0]["labels"] = serde_json::json!([]);
         }),
-        ("contract major", |v| v["contract_version"] = "2.0.0".into()),
+        ("contract major", |v| v["contract_version"] = "3.0.0".into()),
+        ("legacy major without legacy constants", |v| {
+            v["contract_version"] = "1.3.0".into()
+        }),
+        ("legacy data source on 2.x", |v| {
+            v["data_source"] = "robot_edr_x y".into()
+        }),
+        ("upper-case data source", |v| {
+            v["data_source"] = "RoboDR".into()
+        }),
+        ("topic with a space", |v| {
+            v["ocsf"]["metadata"]["log_name"] = "robodr findings".into()
+        }),
+        ("empty topic", |v| {
+            v["ocsf"]["metadata"]["log_name"] = "".into()
+        }),
         ("anomaly score", |v| v["anomaly_score"] = 3.0.into()),
         ("control char in key", |v| {
             v["ocsf"]["unmapped"]["robodr"]["ros"]
@@ -506,4 +538,63 @@ fn unknown_rule_gets_generic_trusted_text() {
     assert_eq!(f.title, "RoboDR model-profile deviation");
     assert!(f.mitre_predictions.is_empty());
     assert_eq!(f.ocsf.finding_info.analytic.uid, "robot.bus.new_can_id");
+}
+
+#[test]
+fn data_source_and_topic_are_deployment_configuration() {
+    let dev = Deviation::new("robot.ros2.unknown_participant", Severity::High, "x");
+    let mut c = ctx();
+    c.data_source = "site-7.robodr".into();
+    c.topic = "soc.ingest.robots".into();
+    let f = FindingBuilder::from_deviation(&dev, &c)
+        .seen(T0, T0)
+        .build()
+        .unwrap();
+    assert_eq!(f.data_source, "site-7.robodr");
+    assert_eq!(f.ocsf.metadata.log_name, "soc.ingest.robots");
+    let rec = record(&f, Some(3)).unwrap();
+    assert_eq!(rec.topic, "soc.ingest.robots");
+    assert!(rec
+        .headers
+        .contains(&("data-source", "site-7.robodr".into())));
+    assert_eq!(dedup_key(&f).0, "site-7.robodr");
+    assert_eq!(parse_and_validate(&rec.value).unwrap(), f);
+    // Labels the validator would reject are refused at build time.
+    for (ds, topic) in [
+        ("Site 7", "robodr.findings"),
+        ("kafka:robodr", "robodr.findings"),
+        ("robodr", "robodr findings"),
+        ("robodr", ""),
+    ] {
+        let mut c = ctx();
+        c.data_source = ds.into();
+        c.topic = topic.into();
+        assert!(
+            FindingBuilder::from_deviation(&dev, &c)
+                .seen(T0, T0)
+                .build()
+                .is_err(),
+            "{ds:?} {topic:?}"
+        );
+    }
+}
+
+#[test]
+fn legacy_1_x_findings_parse_but_are_never_emitted() {
+    for version in ["1.1.0", "1.2.0", "1.3.0"] {
+        let mut v = serde_json::to_value(example_finding()).unwrap();
+        to_v1(&mut v, version);
+        let f = parse_and_validate(&v.to_string()).unwrap();
+        assert_eq!(f.data_source, legacy_v1::DATA_SOURCE);
+        assert!(to_json(&f).is_err(), "{version}");
+        assert!(record(&f, Some(12)).is_err(), "{version}");
+        // 1.x keeps its fixed labels: a 1.x message with 2.x labels is
+        // rejected.
+        let mut w = v.clone();
+        w["data_source"] = DEFAULT_DATA_SOURCE.into();
+        assert!(parse_and_validate(&w.to_string()).is_err(), "{version}");
+        let mut w = v.clone();
+        w["ocsf"]["metadata"]["log_name"] = DEFAULT_TOPIC.into();
+        assert!(parse_and_validate(&w.to_string()).is_err(), "{version}");
+    }
 }

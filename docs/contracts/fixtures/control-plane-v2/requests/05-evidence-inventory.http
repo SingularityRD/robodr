@@ -1,0 +1,9 @@
+GET /api/v2/robots/ugv-007/evidence HTTP/1.1
+Host: ugv-007.robots.example
+Content-Type: application/json
+Content-Length: 0
+X-RoboDR-Key-Id: soc:soc-a:1
+X-RoboDR-Timestamp: 1800000000
+X-RoboDR-Nonce: contract-nonce-0005
+X-RoboDR-Signature: 29ced1c645013c375ca21591f9e0f0c2cb4f598c94e1af98616901cf1449f5995efb25fc193a40eb51117ca8f86a327614ae40908c125992b7120c0b98e57001
+

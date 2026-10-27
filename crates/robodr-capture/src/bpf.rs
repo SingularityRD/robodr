@@ -8,10 +8,20 @@
 //!
 //! The program accepts:
 //! - IPv4 UDP with a destination port inside the port map's ranges, or (if the
-//!   mode includes the magic) whose payload starts with `"RTPS"`;
+//!   mode includes the magic) whose payload starts with `"RTPS"`, or whose
+//!   source or destination port is one of the filter's Unitree legacy UDP
+//!   ports ([`RtpsFilter::legacy_udp_ports`], empty by default);
 //! - IPv4 UDP *fragments* (MF set or offset != 0) — the UDP header or magic
 //!   may not be in this fragment, so user space reassembles and decides;
 //! - IPv6 UDP directly after the fixed header, same port/magic rule;
+//! - frames whose `skb->protocol` (the `SKF_AD_PROTOCOL` ancillary load) is
+//!   an 802.1Q / 802.1ad tag protocol ([`VLAN_TPIDS`]): the kernel strips
+//!   the outer tag of a received frame (hardware offload or
+//!   `skb_vlan_untag`), so an untagged or single-tagged frame arrives as
+//!   plain IP and is judged like any other, while the inner tag of a
+//!   double-tagged (QinQ) frame is still at offset 0. Following it in cBPF
+//!   would double the program, so such frames all go to user space, which
+//!   follows up to two tags ([`crate::decode`]);
 //! - IPv6 packets whose first next-header is an extension header (incl.
 //!   fragment): cBPF cannot loop over the chain, so user space decides. These
 //!   are rare on a robot LAN;
@@ -70,6 +80,17 @@ pub const BPF_JGE: u16 = 0x30;
 pub const BPF_JSET: u16 = 0x40;
 // Operand source.
 pub const BPF_K: u16 = 0x00;
+
+/// Base of the kernel's ancillary-data loads (`SKF_AD_OFF`, -0x1000).
+pub const SKF_AD_OFF: u32 = 0xffff_f000;
+/// `SKF_AD_PROTOCOL`: `ldh [SKF_AD_OFF + 0]` loads `ntohs(skb->protocol)`.
+pub const SKF_AD_PROTOCOL: u32 = 0;
+
+/// 802.1Q / 802.1ad (and the pre-standard 0x9100) tag protocols. A frame
+/// whose `skb->protocol` is one of these still carries a tag at offset 0
+/// (the kernel strips only the outer one), so the program accepts it and
+/// user space classifies it.
+pub const VLAN_TPIDS: [u16; 3] = [0x8100, 0x88a8, 0x9100];
 
 /// Kernel limit on cBPF program length (`BPF_MAXINSNS`).
 pub const BPF_MAXINSNS: usize = 4096;
@@ -196,8 +217,21 @@ impl BpfProgram {
 
     /// Interpret the program on `packet` (offset 0 = IP header) and return
     /// the accepted length (0 = drop), with kernel semantics: an out-of-bounds
-    /// load drops the packet.
+    /// load drops the packet. `skb->protocol` (for the `SKF_AD_PROTOCOL`
+    /// load) is taken from the IP version nibble (0x0800 / 0x86dd, else 0);
+    /// see [`BpfProgram::run_with_protocol`] for tagged frames.
     pub fn run(&self, packet: &[u8]) -> u32 {
+        let proto = match packet.first().map(|b| b >> 4) {
+            Some(4) => 0x0800,
+            Some(6) => 0x86dd,
+            _ => 0,
+        };
+        self.run_with_protocol(packet, proto)
+    }
+
+    /// [`BpfProgram::run`] with an explicit `skb->protocol` (host order),
+    /// e.g. 0x8100 for a frame whose inner VLAN tag is still at offset 0.
+    pub fn run_with_protocol(&self, packet: &[u8], protocol: u16) -> u32 {
         let (mut a, mut x) = (0u32, 0u32);
         let mut pc = 0usize;
         let load = |off: u64, size: usize| -> Option<u32> {
@@ -212,6 +246,13 @@ impl BpfProgram {
                     Some(v) => a = v,
                     None => return 0,
                 },
+                LDH_ABS if i.k >= SKF_AD_OFF => {
+                    if i.k == SKF_AD_OFF + SKF_AD_PROTOCOL {
+                        a = u32::from(protocol);
+                    } else {
+                        return 0;
+                    }
+                }
                 LDH_ABS => match load(u64::from(i.k), 2) {
                     Some(v) => a = v,
                     None => return 0,
@@ -263,6 +304,14 @@ pub fn rtps_filter_program(filter: &RtpsFilter) -> Result<BpfProgram, BpfError> 
     let drop = stmt(RET_K, 0);
 
     let mut p = vec![
+        // A frame that still carries a VLAN tag at offset 0 (the inner tag
+        // of a double-tagged frame; the kernel strips the outer one): user
+        // space follows the tags (see the module docs).
+        stmt(LDH_ABS, SKF_AD_OFF + SKF_AD_PROTOCOL),
+        jump(JEQ_K, u32::from(VLAN_TPIDS[0]), 2, 0),
+        jump(JEQ_K, u32::from(VLAN_TPIDS[1]), 1, 0),
+        jump(JEQ_K, u32::from(VLAN_TPIDS[2]), 0, 1),
+        accept,
         // Version nibble.
         stmt(LDB_ABS, 0),
         stmt(RSH_K, 4),
@@ -308,6 +357,18 @@ pub fn rtps_filter_program(filter: &RtpsFilter) -> Result<BpfProgram, BpfError> 
             p.push(jump(JGT_K, u32::from(hi), 1, 0));
             p.push(accept);
         }
+    }
+    // Unitree legacy UDP (source or destination port), when configured.
+    for port in &filter.legacy_udp_ports {
+        let port = u32::from(*port);
+        p.extend_from_slice(&[
+            stmt(LDH_IND, 2), // destination port
+            jump(JEQ_K, port, 0, 1),
+            accept,
+            stmt(LDH_IND, 0), // source port
+            jump(JEQ_K, port, 0, 1),
+            accept,
+        ]);
     }
     if use_magic {
         // Last: an out-of-bounds load drops, which is right for a payload
@@ -388,30 +449,51 @@ mod tests {
         ))
         .unwrap();
         let i = prog.instructions();
+        // The VLAN prologue, then the IP program (offset H).
+        const H: usize = 5;
+        let expect_prologue = [
+            (0x28, 0, 0, SKF_AD_OFF), // ldh [SKF_AD_PROTOCOL]
+            (0x15, 2, 0, 0x8100),     // jeq #0x8100 -> accept
+            (0x15, 1, 0, 0x88a8),     // jeq #0x88a8 -> accept
+            (0x15, 0, 1, 0x9100),     // jeq #0x9100 -> accept, else IP
+            (0x06, 0, 0, ACCEPT_LEN), // accept (user space follows the tags)
+        ];
+        for (n, &(code, jt, jf, k)) in expect_prologue.iter().enumerate() {
+            assert_eq!(i[n], SockFilter { code, jt, jf, k }, "instruction {n}");
+        }
         let expect_head = [
-            (0x30, 0, 0, 0),      // ldb [0]
-            (0x74, 0, 0, 4),      // rsh #4
-            (0x15, 0, 8, 4),      // jeq #4, else +8 to IPv6
-            (0x30, 0, 0, 9),      // ldb [9]
-            (0x15, 1, 0, 17),     // jeq #17
-            (0x05, 0, 0, i[5].k), // ja -> TCP/v4 (checked below)
-            (0x28, 0, 0, 6),      // ldh [6]
-            (0x45, 0, 1, 0x3fff), // jset #0x3fff
+            (0x30, 0, 0, 0),          // ldb [0]
+            (0x74, 0, 0, 4),          // rsh #4
+            (0x15, 0, 8, 4),          // jeq #4, else +8 to IPv6
+            (0x30, 0, 0, 9),          // ldb [9]
+            (0x15, 1, 0, 17),         // jeq #17
+            (0x05, 0, 0, i[H + 5].k), // ja -> TCP/v4 (checked below)
+            (0x28, 0, 0, 6),          // ldh [6]
+            (0x45, 0, 1, 0x3fff),     // jset #0x3fff
             (0x06, 0, 0, ACCEPT_LEN),
             (0xb1, 0, 0, 0),  // ldxb 4*([0]&0xf)
             (0x05, 0, 0, 12), // ja -> shared (skip 12 IPv6 instructions)
             (0x15, 1, 0, 6),  // jeq #6
         ];
         for (n, &(code, jt, jf, k)) in expect_head.iter().enumerate() {
-            assert_eq!(i[n], SockFilter { code, jt, jf, k }, "instruction {n}");
+            assert_eq!(
+                i[H + n],
+                SockFilter { code, jt, jf, k },
+                "instruction {}",
+                H + n
+            );
         }
-        assert_eq!(i[20].code, JA, "other IPv6 next headers -> TCP/v6");
+        assert_eq!(i[H + 20].code, JA, "other IPv6 next headers -> TCP/v6");
         // Shared tail: ldh [x+2], 2 ranges * 3, ld [x+8], jeq RTPS, ret, ret 0,
         // then the 6 + 4 + 9 instructions of the Zenoh TCP blocks.
-        let shared = &i[23..];
-        assert_eq!(6 + i[5].k as usize, 23 + 11, "ja lands on the TCP/v4 block");
+        let shared = &i[H + 23..];
         assert_eq!(
-            21 + i[20].k as usize,
+            6 + i[H + 5].k as usize,
+            23 + 11,
+            "ja lands on the TCP/v4 block"
+        );
+        assert_eq!(
+            21 + i[H + 20].k as usize,
             23 + 11 + 6,
             "ja lands on the TCP/v6 block"
         );
@@ -619,6 +701,86 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// With Unitree legacy ports the kernel filter accepts exactly what the
+    /// user-space filter accepts as RTPS **or** legacy, in both directions
+    /// (source or destination port), and nothing more.
+    #[test]
+    fn interpreter_agrees_with_userspace_filter_with_legacy_ports() {
+        let s4 = Ipv4Addr::new(192, 168, 123, 161);
+        let d4 = Ipv4Addr::new(192, 168, 123, 15);
+        let s6: Ipv6Addr = "fd00::1".parse().unwrap();
+        let d6: Ipv6Addr = "fd00::2".parse().unwrap();
+        let payloads: [&[u8]; 3] = [b"RTPS\x02\x03\x01\x0f", &[0xfe; 129], b""];
+        let ports = [8007u16, 8080, 8082, 8090, 7400, 7411, 5353, 0, 65535];
+        for mode in [
+            MatchMode::PortsOnly,
+            MatchMode::MagicOnly,
+            MatchMode::PortsOrMagic,
+        ] {
+            let filter = RtpsFilter::new(RtpsPortMap::new([0], 4), mode)
+                .with_legacy_udp_ports([8007, 8080, 8082, 8090]);
+            let prog = rtps_filter_program(&filter).unwrap();
+            prog.validate().unwrap();
+            for &sport in &ports {
+                for &dport in &ports {
+                    for payload in payloads {
+                        for pkt in [
+                            synth::ipv4_udp(s4, d4, sport, dport, payload),
+                            synth::ipv6_udp(s6, d6, sport, dport, &[], payload),
+                        ] {
+                            let user = match decode_ip(&pkt) {
+                                Ok(Decoded::Udp(u)) => filter.matches(&u) || filter.is_legacy(&u),
+                                other => panic!("{other:?}"),
+                            };
+                            let kernel = prog.run(&pkt) != 0;
+                            assert_eq!(
+                                kernel, user,
+                                "mode {mode:?} {sport}->{dport} payload {payload:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Without legacy ports nothing changes.
+        let plain = RtpsFilter::new(RtpsPortMap::new([0], 4), MatchMode::PortsOrMagic);
+        let legacy = synth::ipv4_udp(s4, d4, 8082, 8090, &[0xfe; 129]);
+        assert_eq!(rtps_filter_program(&plain).unwrap().run(&legacy), 0);
+    }
+
+    /// 802.1Q / 802.1ad frames whose (inner) tag the kernel did not strip
+    /// arrive on a `SOCK_DGRAM` socket with the tag protocol in
+    /// `sll_protocol` and the TCI at offset 0. cBPF cannot follow the tag
+    /// cheaply, so the program accepts every such frame (by the
+    /// `SKF_AD_PROTOCOL` ancillary load) and user space classifies it.
+    #[test]
+    fn interpreter_accepts_tagged_frames_for_user_space() {
+        let filter = RtpsFilter::default().with_legacy_udp_ports([8007]);
+        let prog = rtps_filter_program(&filter).unwrap();
+        prog.validate().unwrap();
+        let s4 = Ipv4Addr::new(192, 168, 123, 15);
+        let ip = synth::ipv4_udp(s4, s4, 8080, 8007, &[0x5a; 614]);
+        for tci_pcp in [0x00u8, 0x40, 0x60, 0xe0] {
+            let mut tagged = vec![tci_pcp, 7];
+            tagged.extend_from_slice(&0x0800u16.to_be_bytes());
+            tagged.extend_from_slice(&ip);
+            for proto in [0x8100u16, 0x88a8, 0x9100] {
+                assert_ne!(
+                    prog.run_with_protocol(&tagged, proto),
+                    0,
+                    "tag {proto:#06x} pcp byte {tci_pcp:#04x}"
+                );
+            }
+            // The same bytes announced as IPv4 are judged as IPv4 (and
+            // dropped: not a valid IPv4 header).
+            assert_eq!(prog.run_with_protocol(&tagged, 0x0800), 0);
+        }
+        // An untagged frame (the kernel stripped the only tag) is judged
+        // normally.
+        assert_ne!(prog.run_with_protocol(&ip, 0x0800), 0);
+        assert_eq!(prog.run(&ip), prog.run_with_protocol(&ip, 0x0800));
     }
 
     #[test]

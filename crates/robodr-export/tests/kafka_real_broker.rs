@@ -9,7 +9,7 @@
 //!
 //! | topic | partitions | config |
 //! | --- | --- | --- |
-//! | `robot-edr.findings` | 12 | defaults |
+//! | `robodr.findings` | 12 | defaults |
 //! | `robodr-it-small` | 1 | `max.message.bytes=4096` |
 //! | `robodr-it-denied` | 1 | ACL: DENY `User:ANONYMOUS` WRITE |
 //!
@@ -368,7 +368,8 @@ fn spool(
         expect.partition = robodr_ocsf::record(&env, Some(PARTITIONS))
             .unwrap()
             .partition;
-        s.write(&output(rec), false).unwrap();
+        s.write(&output(rec), robodr_agentd::SpoolClass::Normal)
+            .unwrap();
         want.insert(expect.key.clone(), expect);
     }
     want

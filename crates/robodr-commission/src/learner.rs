@@ -207,6 +207,29 @@ pub const MAX_STORED_ANOMALIES: usize = 1000;
 pub const DEFAULT_HARD_CAP_LINEAR: f64 = 10.0;
 /// Default hard cap on any learned joint envelope, rad/s.
 pub const DEFAULT_HARD_CAP_JOINT: f64 = 10.0;
+/// Default hard cap on a learned `max_joint_torque`, N·m (above the
+/// largest joint torque in Unitree's published specifications; set
+/// `--hard-cap-torque` to the platform's motors).
+pub const DEFAULT_HARD_CAP_TORQUE: f64 = 400.0;
+/// Default hard cap on a learned `max_joint_kp` (the SDK examples use up to
+/// 500, `example/g1/g1d/g1d_waist_example.cpp`).
+pub const DEFAULT_HARD_CAP_KP: f64 = 1000.0;
+/// Default hard cap on a learned `max_joint_position_step`, rad per
+/// command (a 500 Hz controller moves far less).
+pub const DEFAULT_HARD_CAP_POSITION_STEP: f64 = 0.5;
+
+/// The low-level joint-command terms learned besides linear / joint speed
+/// (`MotionCommand::joint_torque`, `joint_kp`, `joint_position_step`):
+/// `(dimension, unit)`. Learned like a speed (`max * margin`, capped by
+/// the term's hard cap) but only on channels whose commands carry the term:
+/// a term never observed stays `None`, which `Profile::evaluate` reports as
+/// `robot.motion.unverifiable_command` for a command that uses it (never as
+/// "unlimited").
+pub const JOINT_TERMS: [(&str, &str); 3] = [
+    ("joint_torque", "N·m"),
+    ("joint_kp", ""),
+    ("joint_position_step", "rad"),
+];
 /// A participant announced fewer times than this is quarantined.
 pub const DEFAULT_MIN_PARTICIPANT_ANNOUNCEMENTS: u64 = 2;
 /// With capture timestamps, a participant observed for less than this (in
@@ -468,6 +491,12 @@ pub struct LearnConfig {
     pub hard_cap_linear: f64,
     /// Absolute cap on any learned joint envelope (rad/s), always applied.
     pub hard_cap_joint: f64,
+    /// Absolute cap on a learned `max_joint_torque` (N·m).
+    pub hard_cap_torque: f64,
+    /// Absolute cap on a learned `max_joint_kp`.
+    pub hard_cap_kp: f64,
+    /// Absolute cap on a learned `max_joint_position_step` (rad).
+    pub hard_cap_position_step: f64,
     /// Minimum valid samples per dimension for an envelope to be trusted
     /// without sign-off.
     pub min_samples: u64,
@@ -511,6 +540,9 @@ impl Default for LearnConfig {
             ceiling_joint: None,
             hard_cap_linear: DEFAULT_HARD_CAP_LINEAR,
             hard_cap_joint: DEFAULT_HARD_CAP_JOINT,
+            hard_cap_torque: DEFAULT_HARD_CAP_TORQUE,
+            hard_cap_kp: DEFAULT_HARD_CAP_KP,
+            hard_cap_position_step: DEFAULT_HARD_CAP_POSITION_STEP,
             min_samples: DEFAULT_MIN_SAMPLES,
             learn_readers: false,
             min_participant_announcements: DEFAULT_MIN_PARTICIPANT_ANNOUNCEMENTS,
@@ -626,6 +658,9 @@ impl LearnConfig {
         for (dimension, value) in [
             ("linear", self.hard_cap_linear),
             ("joint", self.hard_cap_joint),
+            ("torque", self.hard_cap_torque),
+            ("kp", self.hard_cap_kp),
+            ("position step", self.hard_cap_position_step),
         ] {
             if !value.is_finite() || value <= 0.0 {
                 return Err(ConfigError::InvalidHardCap { dimension, value });
@@ -700,6 +735,15 @@ impl LearnConfig {
             (self.ceiling_linear, self.hard_cap_linear)
         };
         ceiling.map_or(hard, |c| c.min(hard))
+    }
+
+    /// The hard caps of the [`JOINT_TERMS`], in that order.
+    pub fn joint_term_caps(&self) -> [f64; 3] {
+        [
+            self.hard_cap_torque,
+            self.hard_cap_kp,
+            self.hard_cap_position_step,
+        ]
     }
 }
 
@@ -992,6 +1036,8 @@ struct SourceStat {
     commands: u64,
     linear: DimStat,
     joint: DimStat,
+    /// [`JOINT_TERMS`], in order.
+    terms: [DimStat; 3],
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -1003,6 +1049,8 @@ struct MotionAcc {
     /// `(speed, source index)`.
     linear: SampleBuffer<(f64, u32)>,
     joint: SampleBuffer<(f64, u32)>,
+    /// [`JOINT_TERMS`], in order.
+    terms: [SampleBuffer<(f64, u32)>; 3],
 }
 
 impl MotionAcc {
@@ -1521,6 +1569,13 @@ impl Learner {
                 };
                 let linear = self.speed_sample(at, &c.channel, "linear", lin);
                 let joint = self.speed_sample(at, &c.channel, "joint", c.joint_speed);
+                let term_values = [c.joint_torque, c.joint_kp, c.joint_position_step];
+                let mut terms = [None; 3];
+                for (slot, ((dim, _), v)) in
+                    terms.iter_mut().zip(JOINT_TERMS.iter().zip(term_values))
+                {
+                    *slot = self.speed_sample(at, &c.channel, dim, v);
+                }
                 let Some(acc) = admit(&mut self.motion, &c.channel, lim.max_motion_channels) else {
                     self.overflowed(at, "motion_channels", &c.channel);
                     return;
@@ -1540,6 +1595,14 @@ impl Learner {
                 if let Some(v) = joint {
                     st.joint.record(v);
                     acc.joint.push((v, tag), lim.max_samples);
+                }
+                for (i, v) in terms.into_iter().enumerate() {
+                    if let (Some(v), Some(s), Some(b)) =
+                        (v, st.terms.get_mut(i), acc.terms.get_mut(i))
+                    {
+                        s.record(v);
+                        b.push((v, tag), lim.max_samples);
+                    }
                 }
             }
             // Feedback is consumed by robodr-motion's consistency monitor; it
@@ -1676,6 +1739,9 @@ impl Learner {
                     st.commands = st.commands.saturating_add(m.stats[i].commands);
                     st.linear.absorb(&m.stats[i].linear);
                     st.joint.absorb(&m.stats[i].joint);
+                    for (mine, theirs) in st.terms.iter_mut().zip(&m.stats[i].terms) {
+                        mine.absorb(theirs);
+                    }
                 } else {
                     dropped.push(("motion_sources", c.clone(), 1));
                 }
@@ -1689,6 +1755,13 @@ impl Learner {
             for &(v, tag) in m.joint.retained() {
                 if let Some(Some(j)) = map.get(tag as usize) {
                     acc.joint.push((v, *j as u32), lim.max_samples);
+                }
+            }
+            for (mine, theirs) in acc.terms.iter_mut().zip(&m.terms) {
+                for &(v, tag) in theirs.retained() {
+                    if let Some(Some(j)) = map.get(tag as usize) {
+                        mine.push((v, *j as u32), lim.max_samples);
+                    }
                 }
             }
         }
@@ -2415,12 +2488,64 @@ impl Learner {
     }
 
     fn dim_bound(&self, d: &DimStat, joint: bool) -> Option<(f64, f64, bool)> {
+        self.capped_bound(d, self.config.effective_cap(joint))
+    }
+
+    /// `(max, bound, capped)` of a dimension with `cap`; `None` if never
+    /// observed.
+    fn capped_bound(&self, d: &DimStat, cap: f64) -> Option<(f64, f64, bool)> {
         if d.n == 0 {
             return None;
         }
-        let cap = self.config.effective_cap(joint);
         let (bound, capped) = envelope_bound(d.max, self.config.margin, Some(cap));
         Some((d.max, bound, capped))
+    }
+
+    /// Accepted stats of a channel's [`JOINT_TERMS`].
+    fn accepted_terms(m: &MotionAcc, accepted: &BTreeSet<&str>) -> [DimStat; 3] {
+        let mut out = [DimStat::default(); 3];
+        for (src, st) in m.sources.iter().zip(&m.stats) {
+            if Self::source_accepted(src, accepted) {
+                for (o, s) in out.iter_mut().zip(&st.terms) {
+                    o.absorb(s);
+                }
+            }
+        }
+        out
+    }
+
+    /// Percentile stats of a channel's [`JOINT_TERMS`] (accepted sources).
+    fn accepted_term_stats(m: &MotionAcc, accepted: &BTreeSet<&str>) -> [Option<SpeedStats>; 3] {
+        let d = Self::accepted_terms(m, accepted);
+        let idx: BTreeSet<u32> = m
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| Self::source_accepted(s, accepted))
+            .map(|(i, _)| i as u32)
+            .collect();
+        let mut out: [Option<SpeedStats>; 3] = [None, None, None];
+        for ((o, buf), d) in out.iter_mut().zip(&m.terms).zip(&d) {
+            let retained: Vec<f64> = buf
+                .retained()
+                .iter()
+                .filter(|(_, t)| idx.contains(t))
+                .map(|(v, _)| *v)
+                .collect();
+            *o = SpeedStats::from_parts(d.n, d.min, d.max, &retained, buf.is_decimated());
+        }
+        out
+    }
+
+    /// The learned bounds of a channel's [`JOINT_TERMS`] (`None` for a term
+    /// never observed).
+    fn term_bounds(&self, terms: &[DimStat; 3]) -> [Option<f64>; 3] {
+        let caps = self.config.joint_term_caps();
+        let mut out = [None; 3];
+        for ((o, d), cap) in out.iter_mut().zip(terms).zip(caps) {
+            *o = self.capped_bound(d, cap).map(|t| t.1);
+        }
+        out
     }
 
     fn build_profile(&self, assessed: &BTreeMap<String, Assessment>) -> Profile {
@@ -2475,13 +2600,32 @@ impl Learner {
                 None if observed_any => Some(self.unobserved_bound(joint)),
                 None => None,
             };
+            // Joint terms (Unitree low-level commands): learned where
+            // observed, else left `None` (= a command using the term is
+            // reported unverifiable, never treated as unlimited).
+            let [torque, kp, step] = self.term_bounds(&Self::accepted_terms(m, accepted));
             let env = Envelope {
                 max_linear_speed: bound(&l, false),
                 max_joint_speed: bound(&j, true),
+                max_joint_torque: torque,
+                max_joint_kp: kp,
+                max_joint_position_step: step,
                 ..Default::default()
             };
             p.motion_envelopes.insert(ch.clone(), env);
         }
+        // Unitree legacy UDP channels (Go1 generation) have no DDS writer to
+        // learn: the protocol has no discovery. A learned legacy channel is
+        // writable by construction (only the legacy UDP path of the sensor
+        // ever produces commands on it); the sender IPs are configured in
+        // the sensor's `unitree_legacy.command_senders`.
+        let legacy: Vec<String> = p
+            .motion_envelopes
+            .keys()
+            .filter(|ch| robodr_cdr::unitree_legacy::channels::ALL.contains(&ch.as_str()))
+            .cloned()
+            .collect();
+        p.writer_topics.extend(legacy);
         // A motion channel whose writers were not learned (no accepted
         // participant announced a writer on it) cannot be enveloped: every
         // legitimate publisher would be an unknown writer, and
@@ -2491,6 +2635,27 @@ impl Learner {
         // (`motion_envelope_dropped_no_writer`).
         for ch in Self::unwritable_motion_channels(&p) {
             p.motion_envelopes.remove(&ch);
+        }
+        // The announced type of each motion channel, where every writer
+        // seen on it announced the same one (several types: left out, the
+        // consumer then cannot rely on it). A legacy channel's type is fixed
+        // by the channel.
+        for ch in p.motion_envelopes.keys() {
+            use robodr_cdr::unitree_legacy::{channels, LegacyKind};
+            let t = match ch.as_str() {
+                channels::HIGH_CMD => Some(LegacyKind::HighCmd.type_label().to_string()),
+                channels::LOW_CMD => Some(LegacyKind::LowCmd.type_label().to_string()),
+                _ => self
+                    .writers
+                    .get(ch)
+                    .filter(|e| e.type_names.len() == 1)
+                    .and_then(|e| e.type_names.first().cloned()),
+            };
+            if let Some(t) =
+                t.filter(|t| t.len() <= robodr_events::profile::MAX_MOTION_TYPE_NAME_LEN)
+            {
+                p.motion_types.insert(ch.clone(), t);
+            }
         }
         p
     }
@@ -2652,6 +2817,56 @@ impl Learner {
                              the cap, the clean run itself will deviate",
                             d.max,
                             self.config.effective_cap(joint)
+                        ),
+                    ));
+                }
+            }
+            // The joint terms: same sign-off rules, their own caps.
+            let terms = Self::accepted_terms(m, accepted);
+            let term_stats = Self::accepted_term_stats(m, accepted);
+            let term_env = [
+                env.max_joint_torque,
+                env.max_joint_kp,
+                env.max_joint_position_step,
+            ];
+            for ((((dim, unit), d), st), (bound, cap)) in JOINT_TERMS
+                .iter()
+                .zip(&terms)
+                .zip(&term_stats)
+                .zip(term_env.into_iter().zip(self.config.joint_term_caps()))
+            {
+                if let Some((max, p99)) = self.outlier(st) {
+                    items.push(SignoffItem::new(
+                        "envelope_outlier",
+                        &format!("{ch} {dim}"),
+                        format!(
+                            "{ch} {dim}: max {max} {unit} is more than {}x the p99 {p99} {unit}; \
+                             the envelope {} {unit} rests on outlier sample(s) (a stray or \
+                             injected command?): confirm the maximum, or re-commission",
+                            self.config.outlier_ratio,
+                            bound.map_or_else(|| "-".to_string(), |b| b.to_string())
+                        ),
+                    ));
+                }
+                if d.n > 0 && d.n < self.config.min_samples {
+                    items.push(SignoffItem::new(
+                        "few_motion_samples",
+                        &format!("{ch} {dim}"),
+                        format!(
+                            "{ch} {dim} envelope rests on {} sample(s) (< {}): confirm the \
+                             bound or record a longer run",
+                            d.n, self.config.min_samples
+                        ),
+                    ));
+                }
+                if d.n > 0 && d.max > cap {
+                    items.push(SignoffItem::new(
+                        "observed_exceeds_cap",
+                        &format!("{ch} {dim}"),
+                        format!(
+                            "{ch}: observed {dim} max {} exceeds the cap {cap}; envelope held \
+                             at the cap, the clean run itself will deviate",
+                            d.max
                         ),
                     ));
                 }
@@ -3506,6 +3721,54 @@ impl Learner {
                     format!("{ch}: no valid speed sample; envelope empty, lock will refuse"),
                 );
             }
+            let terms = Self::accepted_terms(m, accepted);
+            let term_stats = Self::accepted_term_stats(m, accepted);
+            for ((((dim, unit), d), st), cap) in JOINT_TERMS
+                .iter()
+                .zip(&terms)
+                .zip(&term_stats)
+                .zip(self.config.joint_term_caps())
+            {
+                if !in_profile {
+                    break;
+                }
+                if d.n > 0 && d.n < self.config.min_samples {
+                    warn(
+                        Warn,
+                        "few_motion_samples",
+                        ch,
+                        format!(
+                            "motion channel {ch} has {} {dim} samples (< {}): envelope not trustworthy",
+                            d.n, self.config.min_samples
+                        ),
+                    );
+                }
+                if d.n > 0 && d.max > cap {
+                    warn(
+                        Warn,
+                        "observed_exceeds_ceiling",
+                        ch,
+                        format!(
+                            "{ch}: observed {dim} max {} {unit} exceeds the hard cap {cap}; \
+                             envelope held at the cap, the clean run itself would deviate",
+                            d.max
+                        ),
+                    );
+                }
+                if let Some((max, p99)) = self.outlier(st) {
+                    warn(
+                        Warn,
+                        "envelope_outlier",
+                        ch,
+                        format!(
+                            "{ch}: {dim} max {max} is more than {}x the p99 {p99}: the envelope \
+                             rests on outlier sample(s)",
+                            self.config.outlier_ratio
+                        ),
+                    );
+                }
+            }
+            let [joint_torque, joint_kp, joint_position_step] = term_stats;
             motion_channels.insert(
                 ch.clone(),
                 MotionReport {
@@ -3518,6 +3781,9 @@ impl Learner {
                     envelope: env,
                     linear_capped_by_ceiling: capped_flags[0],
                     joint_capped_by_ceiling: capped_flags[1],
+                    joint_torque,
+                    joint_kp,
+                    joint_position_step,
                     in_profile,
                     excluded_sources,
                     excluded_commands,
@@ -3533,6 +3799,9 @@ impl Learner {
                 ceiling_joint: self.config.ceiling_joint,
                 hard_cap_linear: self.config.hard_cap_linear,
                 hard_cap_joint: self.config.hard_cap_joint,
+                hard_cap_torque: self.config.hard_cap_torque,
+                hard_cap_kp: self.config.hard_cap_kp,
+                hard_cap_position_step: self.config.hard_cap_position_step,
                 min_samples: self.config.min_samples,
                 learn_readers: self.config.learn_readers,
                 min_participant_announcements: self.config.min_participant_announcements,
@@ -3592,6 +3861,12 @@ pub struct ReportConfig {
     pub ceiling_joint: Option<f64>,
     pub hard_cap_linear: f64,
     pub hard_cap_joint: f64,
+    #[serde(default)]
+    pub hard_cap_torque: f64,
+    #[serde(default)]
+    pub hard_cap_kp: f64,
+    #[serde(default)]
+    pub hard_cap_position_step: f64,
     pub min_samples: u64,
     pub learn_readers: bool,
     pub min_participant_announcements: u64,
@@ -3679,6 +3954,15 @@ pub struct MotionReport {
     pub envelope: Envelope,
     pub linear_capped_by_ceiling: bool,
     pub joint_capped_by_ceiling: bool,
+    /// Low-level joint commands: stats of the commanded max |tau| (N·m),
+    /// max |kp| and position-target step (rad) ([`JOINT_TERMS`]); `None`
+    /// on channels whose commands do not carry the term.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joint_torque: Option<SpeedStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joint_kp: Option<SpeedStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joint_position_step: Option<SpeedStats>,
     /// The channel is in the profile (some command came from an accepted
     /// source).
     pub in_profile: bool,
@@ -3891,6 +4175,28 @@ impl fmt::Display for CommissioningReport {
                     )?;
                 }
             }
+            for ((dim, unit), s, env) in [
+                (JOINT_TERMS[0], &m.joint_torque, m.envelope.max_joint_torque),
+                (JOINT_TERMS[1], &m.joint_kp, m.envelope.max_joint_kp),
+                (
+                    JOINT_TERMS[2],
+                    &m.joint_position_step,
+                    m.envelope.max_joint_position_step,
+                ),
+            ] {
+                if let Some(s) = s {
+                    writeln!(
+                        f,
+                        "    {dim}: n={} min={} p50={} p99={} max={} -> envelope {} {unit}",
+                        s.samples,
+                        s.min,
+                        s.p50,
+                        s.p99,
+                        s.max,
+                        opt(env)
+                    )?;
+                }
+            }
         }
         writeln!(f, "\nAnomalies: {}", self.anomalies_total)?;
         for a in &self.anomalies {
@@ -4024,6 +4330,98 @@ mod tests {
         for e in clean() {
             assert!(p.evaluate(&e).is_none(), "{e:?}");
         }
+    }
+
+    /// Review (Unitree live, M1 / M4): the learned profile records the
+    /// announced type of each motion channel when every writer agrees, and
+    /// leaves it out when they disagree.
+    #[test]
+    fn learns_motion_channel_types() {
+        let l = learn(cfg(), &clean());
+        let p = l.profile();
+        assert_eq!(
+            p.motion_types.get("/cmd_vel").map(String::as_str),
+            Some("geometry_msgs::msg::dds_::Twist_")
+        );
+        p.validate().unwrap();
+        // A second writer announcing another type: ambiguous, left out.
+        let mut evs = clean();
+        evs.push(RobotEvent::Ros2WriterDiscovered(Endpoint {
+            guid_prefix: B.into(),
+            topic: "rt/cmd_vel".into(),
+            type_name: "geometry_msgs::msg::dds_::TwistStamped_".into(),
+        }));
+        let p = learn(cfg(), &evs).profile();
+        assert!(p.motion_types.is_empty(), "{:?}", p.motion_types);
+    }
+
+    /// Review item 2: low-level joint commands are learned with their
+    /// torque / gain / position-step terms, and a locked profile then
+    /// catches a torque-only or gain-only attack.
+    #[test]
+    fn learns_joint_terms_of_low_level_commands() {
+        let joint = |tau: f64, kp: f64, step: Option<f64>| {
+            RobotEvent::MotionCommand(MotionCommand {
+                channel: "/lowcmd".into(),
+                source_guid: Some(A.into()),
+                joint_speed: Some(0.5),
+                joint_torque: Some(tau),
+                joint_kp: Some(kp),
+                joint_position_step: step,
+                ..Default::default()
+            })
+        };
+        let mut evs = clean();
+        evs.push(writer(A, "rt/lowcmd"));
+        for i in 0..40 {
+            let s = (i > 0).then_some(0.01);
+            evs.push(joint(10.0 + f64::from(i) * 0.25, 60.0, s));
+        }
+        let l = learn(cfg(), &evs);
+        let mut p = l.profile();
+        let env = &p.motion_envelopes["/lowcmd"];
+        // max * 1.1, rounded up.
+        assert_eq!(env.max_joint_torque, Some(21.725));
+        assert_eq!(env.max_joint_kp, Some(66.0));
+        assert_eq!(env.max_joint_position_step, Some(0.011));
+        // A Twist channel never carries the terms: left unset.
+        let tw = &p.motion_envelopes["/cmd_vel"];
+        assert_eq!(tw.max_joint_torque, None);
+        assert_eq!(tw.max_joint_kp, None);
+        let r = l.report();
+        assert_eq!(r.warn_count(), 0, "{r}");
+        assert!(r.motion_channels["/lowcmd"].joint_torque.is_some());
+        assert!(r.to_string().contains("joint_torque"));
+        // learn -> lock -> check over the same run is clean ...
+        p.locked = true;
+        for e in &evs {
+            assert!(p.evaluate(e).is_none(), "{e:?}");
+        }
+        // ... and the attack frames deviate.
+        for e in [
+            joint(500.0, 0.0, None),
+            joint(0.0, 500.0, Some(0.0)),
+            joint(0.0, 60.0, Some(1.0)),
+        ] {
+            assert_eq!(
+                p.evaluate(&e).map(|d| d.rule.to_string()),
+                Some("robot.motion.joint_over_envelope".to_string()),
+                "{e:?}"
+            );
+        }
+        // A term above its hard cap is held at the cap and needs sign-off.
+        let mut c = cfg();
+        c.hard_cap_torque = 15.0;
+        let out = learn(c, &evs).finish();
+        assert_eq!(
+            out.profile.motion_envelopes["/lowcmd"].max_joint_torque,
+            Some(15.0)
+        );
+        assert!(out
+            .signoff
+            .items
+            .iter()
+            .any(|i| i.id == "observed_exceeds_cap:/lowcmd joint_torque"));
     }
 
     #[test]

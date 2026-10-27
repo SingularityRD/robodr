@@ -1,0 +1,9 @@
+ÿGET /api/v2/robots/ugv-007/evidence/exports/case-42%3Aev-1/chunks/3 HTTP/1.1
+Host: robot
+Content-Type: application/json
+Content-Length: 0
+X-RoboDR-Key-Id: soc:soc-a:1
+X-RoboDR-Timestamp: 1800000000
+X-RoboDR-Nonce: seed-nonce-000000008
+X-RoboDR-Signature: 19b292bd40c64849d78c294d20ca746536c9e058859c137765a668ba79d2eeec89b81cc567be68ff43e905ebcd86215ea26272b44fb64ba2ba6a2d0140a79500
+

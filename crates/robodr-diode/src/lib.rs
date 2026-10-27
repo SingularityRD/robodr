@@ -1,9 +1,9 @@
 //! # robodr-diode
 //!
 //! One-way export of RoboDR findings and black-box evidence from an
-//! air-gapped robot or fleet console to the SOC (AutoSecOps), across a data
+//! air-gapped robot or fleet console to the SOC, across a data
 //! diode or on controlled removable media. Implements the "Air-gapped
-//! transport" section of `docs/contracts/robot-edr.findings.md`.
+//! transport" section of `docs/contracts/robodr.findings.md`.
 //!
 //! * [`pack`] (low side): [`Packer`] turns validated
 //!   [`FindingEnvelope`](robodr_ocsf::FindingEnvelope)s and
@@ -19,7 +19,7 @@
 //!   re-validates every finding with [`robodr_ocsf::parse_and_validate`],
 //!   checks that every finding's robot (and every bundle's device) is the
 //!   unit or on the unit's allow-list, and emits Kafka-ready records (JSON
-//!   Lines) for the `robot-edr.findings` publisher. Bad batches go to
+//!   Lines) for the findings publisher. Bad batches go to
 //!   `quarantine/<unique>/` with a reason file; a problem with one inbox
 //!   entry never stops the others from being imported.
 //! * [`manifest`]: the wire format and its limits.
@@ -63,6 +63,29 @@
 //!
 //! See `README.md` in this crate for the threat model and honest limits
 //! (notably: signing keys are files on the unit, not TPM-held).
+
+// S10: `unsafe` is denied crate-wide; each item that needs it (FFI to libc
+// symbols std already links) carries a local `#[allow(unsafe_code)]` and a
+// `// SAFETY:` comment on every block.
+#![deny(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+#![warn(clippy::undocumented_unsafe_blocks)]
+// Review L3 (S10, R9): robodr-uplink and the diode pack / unpack tools
+// link this library and release builds use `panic = "abort"`, so a panic
+// here kills the process. Non-test code has no unwrap / expect /
+// panic!-family call; slice indexing and arithmetic are left to review and
+// fuzzing.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 
 pub mod cli;
 pub mod fec;

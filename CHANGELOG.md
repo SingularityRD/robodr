@@ -10,12 +10,911 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ## [Unreleased]
 
+### Security
+
+- Third review of the F1 / F3 fixes (`tools/e2e/REDTEAM.md`, "Third
+  review of the F1 / F3 fixes"); each fixed finding has a regression test
+  that failed before its fix:
+  - R3-1 (high): **`containment: "full"` overstated a quarantine.** The
+    inbound locator rule matched the announced source port only, and Fast
+    DDS sends from ephemeral ports, so a "fully contained" participant was
+    held back inbound only by the evadable GUID-prefix drop. The executor
+    now also cuts the participant's observed source addresses whole (all
+    UDP to and from the robot's DDS ports, any source port, never over
+    loopback, after every exclusion). `full` now means every observed
+    source address and every announced locator is covered by such a drop
+    (contract §6a, one definition in `robodr_executor::decision`); the
+    answer's `state.quarantine` gains `addresses`, `excluded_addresses`
+    and `evidence_truncated`. A quarantine that cuts locators but not the
+    address, and a scope journalled before this change, now read
+    `partial`. Shared-host caveat: cutting an address cuts every DDS
+    participant on that host. **Upgrade `robodr-executor` before
+    `robodr-agentd`** (orders carry new fields). New test helper
+    `robodr_executor::nftmodel` evaluates a rendered or listed table for a
+    packet.
+  - R3-2 (medium): the 128 by-name Critical findings beyond the source
+    table were one shared budget, which one address could spend. Charged
+    per source now (2 per address, 128 addresses per window).
+  - R3-6 (low): an attacker that announced a profiled prefix first had its
+    address treated as the robot's own computer, shielding its rogues'
+    locators. Only pinned addresses and this host's own shield other
+    ports now; a learned profiled address is never cut whole (`partial`).
+  - R3-3, R3-4, R3-5: accepted, documented limits (spoofed decoy on a
+    present unprofiled host; spool reserve for new Critical sources;
+    one-source-per-prefix eviction of an un-named rogue).
+- Second independent review of the F1 / F3 fixes (`tools/e2e/REDTEAM.md`,
+  "Second review of the F1 / F3 fixes"); every finding has a regression
+  test that failed before its fix:
+  - R2-1 (high): findings about the robot's own (profiled / pinned)
+    participants were never folded, so SEDP announcements "for" the robot
+    participant with distinct topics refilled the spool (750 datagrams from
+    5 addresses: a 400-file spool full, the genuine rogue's Critical
+    finding dropped). They are now bounded: 4 High / Critical ones per
+    (participant, source, rule) and 64 per participant per 60 s window by
+    name (below High 256 / 1024), the rest in a Critical
+    `robot.ros2.discovery_flood` that names the participant (subject node
+    `discovery_flood/protected-<class>/<prefix>/<start>`). The last quarter
+    of the spool's Critical share takes only a source new to it.
+  - R2-2 (high): 128 spoofed sources (about 2 packets/s) filled agentd's
+    per-window source table and a genuine rogue's motion writer was folded
+    unnamed. A Critical finding from a source beyond the table still passes
+    by name (128 per window; about 6.4 packets/s sustained to exhaust), and
+    the "many sources" aggregate names the latest samples.
+  - R2-3 (medium): a rogue could reduce its quarantine to the GUID-prefix
+    drop (its own second prefix from its address, a re-announce from a
+    second address after its lease, locators on an address it never sends
+    from), and the SOC still read `verified` / `in_force: true`. Same-address
+    claims now share the host; a prefix ranked High or above keeps (merges)
+    its evidence and rank; **the control-plane answer of a
+    `quarantine_node` carries `containment` (`full` / `partial` /
+    `guid_only` / `unknown`) and `state.quarantine`** (contract §6a, §14;
+    AutoSecOps mirrors it).
+  - R2-4 (medium): 1100 Critical-ranked prefixes from 10 addresses evicted
+    a departed rogue's remembered locators. Global eviction now takes the
+    fullest per-source bucket first; a SOC-named entry is never evicted for
+    a lower-ranked one.
+  - R2-5 / R2-6 (low): a decoy spoofing a present profiled host's address
+    no longer gets that host's other ports; locators beyond an order's 16
+    are listed as left out instead of dropped silently.
+  - R2-7 (low): **upgrade `robodr-executor` before `robodr-agentd`**: an
+    older executor drops quarantine orders carrying `guid_only` /
+    `excluded` unanswered (the request reads `failed`, nothing applied).
+  - R2-8 (low): documentation corrected (the "spoofed" self-decoy, where
+    left-out locators are visible, the contested-prefix lifetime, the
+    source-table numbers).
+- Independent adversarial review of the F1 / F3 fixes below
+  (`tools/e2e/REDTEAM.md`, "Review of the F1 / F3 fixes"); every finding
+  has a regression test replaying the reviewer's proof of concept:
+  - H1 (high): one SPDP for a profiled prefix after its lease ran out, from
+    a foreign host, silently overwrote its remembered locators, and a
+    decoy's quarantine then cut the robot participant. The prefix is now
+    contested with a Critical `participant_source_mismatch`, its locators
+    kept.
+  - H2 (high): a decoy copying the rogue's locators, or one bad locator in
+    the rogue's own SPDP, made every quarantine of it refused. Quarantine
+    locators are now only those on addresses the participant was seen
+    sending from (ties between prefixes broken by that evidence); the
+    executor leaves out-of-scope, loopback, other-family and motion-path
+    locators out (listed with the reason) instead of refusing the order;
+    agentd vouches for a GUID-prefix-only quarantine of a participant it
+    saw that is not one of the robot's own (`guid_only` in the order). The
+    executor still refuses a motion-path GUID, an interface-only motion
+    path, an order whose every locator is on the motion path, and an order
+    with nothing it may act on.
+  - H3 (high): the GUID spray with a `cmd_vel` writer per prefix gave one
+    Critical finding per GUID and filled the Critical spool share. Critical
+    per-participant findings are now aggregated per source too (the first
+    8 one by one, then a Critical `discovery_flood`), and one source may
+    hold at most a quarter of the Critical share.
+  - H4 (high): ~40 packets a minute from a dozen addresses folded every
+    later discovery finding robot-wide into a sourceless aggregate. Only a
+    source past its own share is folded now; a source first seen late
+    still reports its first finding; findings about profiled or pinned
+    participants were never folded (bounded since R2-1 above).
+  - M5 / M6 / M7: an absent legitimate host's address is no longer in a
+    rogue's quarantine set; a rogue that raised a Critical finding (or that
+    a SOC request named) is not evicted by an active-prefix spray (ranked
+    eviction, 128 prefixes per source address); JSONL participant events
+    are used only for prefixes the binding table does not know, through the
+    same filters.
+  - L9 / L10: aggregate sample GUIDs come from the structured prefix (a
+    topic name can no longer forge one) and the detail fits its cap; each
+    flood episode is its own finding (subject node
+    `discovery_flood/<class>/<start>`); `spool.max_files` below 8 is
+    refused.
+- Red team S11-lite (`tools/e2e/REDTEAM.md`), F1 (medium): a GUID spray
+  no longer amplifies into one finding, spool record and SOC case per
+  random prefix. agentd folds the per-participant discovery findings of a
+  flooding source (past 8 per source / 32 in total per 60 s) into one
+  `robot.ros2.discovery_flood` finding (new catalog entry, contract 2.1;
+  subject the source IP, so one case; count per rule, first / last seen,
+  sample GUID prefixes; reported at 1, 2, 4, ... and when the flood ends),
+  while every folded finding stays in the black box and feeds the
+  correlator. Critical findings are never folded, and the spool keeps the
+  last eighth of its bounds for Critical findings so a flood of lesser
+  ones can no longer make a Critical finding black-box-only. 3000 sprayed
+  prefixes: 23 spool records (was one per prefix until the spool filled).
+  Regression: `crates/robodr-agentd/tests/redteam_regressions.rs`.
+- Red team F3: a SOC `quarantine_node` of a rogue that had left (dispose,
+  lease expiry) or been evicted from the binding table by a GUID spray was
+  refused `locators_required`: agentd only passed the locators of a live
+  binding. The binding table now remembers each prefix's own last trusted
+  SPDP unicast locators (1024 prefixes, 24 h; SPDP-only prefixes forgotten
+  first) and agentd hands those over, minus any locator another live or
+  profiled participant (or a pin) claims; contested and pinned prefixes
+  still get none. Regressions:
+  `crates/robodr-ros2-pipeline/tests/redteam_regressions.rs`,
+  `crates/robodr-agentd/tests/executor_link.rs`
+  (`a_rogue_pushed_out_by_a_guid_spray_is_still_quarantined_by_its_own_locators`).
+- `robodr-uplink` no longer labels a plain-HTTP loopback URL "(CA bundle)"
+  (end-to-end results D2).
+- Merge of Sprint 13b with the red-team F1 / F3 fixes: `robodr-deliverd`'s
+  `robot.deliver.*` records now honour agentd's Critical spool share
+  (`crates/robodr-deliverd/src/findings.rs`, "Critical findings first").
+  A finding below Critical is no longer written once `ready/` holds 7/8 of
+  `findings.max_ready_files`; `robot.deliver.rollback_blocked_floor` (and
+  any finding at Critical severity) may use the last eighth, up to one
+  source's cap. agentd's own writes keep the per-source Critical cap and
+  claim record names with no-replace links.
+- Secure delivery on a unit, third independent review of Sprint 13b
+  (`docs/SECURE-DELIVERY.md` §10 "Third independent review of 13b");
+  every fix has a regression test that failed before it
+  (`crates/robodr-deliverd/tests/review3_13b.rs`):
+  - **Floor bypass through dpkg path aliasing (high, H-R3-1):** on a
+    merged-/usr system a `deb` RPK under another name could write a
+    floored package's files through `/lib -> usr/lib` without a dpkg
+    conflict. Before every `dpkg --install` the agent now resolves every
+    path of the `.deb` through the root's symlinks and refuses one that
+    another package owns or that lies below the agent's trees, RoboDR's
+    install paths, `/etc/dpkg`, `/etc/apt` or `/var/lib/dpkg`. dpkg runs
+    with `--refuse-all` (then only the forces the agent needs) and
+    `--refuse-overwrite`. After the install, every other recorded
+    package's `dpkg --verify` output and file list must match what they
+    were right after its own install, or it is restored and the switch
+    fails.
+  - **`force-overwrite` in `dpkg.cfg.d` (low, L-R3-2):** overridden on
+    the command line; `.deb`s shipping dpkg or apt configuration are
+    refused.
+  - **Black-box key rotation (low, L-R3-3):** new `robodr-deliverd rekey
+    --config FILE --old-key FILE --new-key FILE` carries the journal and
+    the high-water record (floors, deployment sequence, chain heads, time
+    floor) to the new key and archives the old journal
+    (`docs/OPERATIONS.md` §4.3 step 6, §11.3). Run it after every
+    rotation; never delete `blackbox/deliverd`.
+  - **Behaviour change:** a recorded deb package changed outside the
+    agent (apt, unattended-upgrades) is no longer reinstalled (downgraded)
+    by the next deb install: it is reported (`robot.deliver.refused`,
+    High, `changed_outside`) and deb installs wait until it is back at its
+    recorded version or a release of it is delivered.
+  - Info: the journal history counts only notes signed with the unit's
+    key; probes run in a session of their own and the reaper signals only
+    groups outside the agent's session; `pack_digest` hashes at most 4 GiB
+    per pack by default (new `pack_digest_max_mb`).
+
+- Secure delivery on a unit, second independent review of Sprint 13b
+  (`docs/SECURE-DELIVERY.md` §10 "Second independent review of 13b");
+  every fixed finding has a regression test that failed before the fix
+  (`crates/robodr-deliverd/tests/review2_13b.rs`, agentd
+  `input::tests::a_supplementary_feeder_group_is_accepted`):
+  - **Floor bypass through dpkg relations (high, H-A):** a `deb` RPK's
+    `.deb` may name only its own package in `Conflicts`, `Breaks`,
+    `Replaces` and `Provides` (RoboDR's own `robodr` / `robodr-focal`
+    pair excepted, from `install.robodr_programme` only). After every
+    `dpkg --install` every other deb package the state records must still
+    be installed at its recorded version; otherwise it is reinstalled, the
+    switch fails (rollback or `robot.deliver.rollback_blocked_floor`) and
+    a package that cannot be restored raises a Critical finding.
+  - **Lock lifted by deleting the state twice (medium, M-A) and older
+    high-water record accepted (medium, M-B):** the signed high-water
+    record carries the lock and a monotonic `generation`, noted in the
+    delivery journal at every write (`robodr.deliver.highwater`) and in
+    the state file. A record older than the journal or the state, a
+    locked record, or a missing or invalid record while the state file or
+    the journal exists locks the agent; a locked start writes a locked
+    record. Deleting the journal as well is still not detected (TPM
+    counter, 14b).
+  - **reanchor (low, L-A, L-B):** refuses a trust file older than the
+    newest version the journal saw and rebuilds the deployment sequence,
+    chain heads, time floor and floors from the journal; `reanchor --key
+    FILE` loads the black-box key file directly (the configured key is a
+    systemd credential that exists only while the service runs).
+  - **Safety feeder groups (low, L-D):** agentd accepts a feeder whose
+    allowed group is a supplementary one (`SO_PEERGROUPS`), so the
+    documented `SupplementaryGroups=robodr-safety` gateway works; it
+    refuses to start with the exporters' group `robodr` as `socket_group`
+    or in `allowed_gids`.
+  - **Upgrade migration (low, L-E):** the postinst ownership migration of
+    agentd's trees runs with agentd and the exporters stopped, removes
+    symlinks and special files, breaks hardlinks, strips group/other
+    write and setuid/setgid, and is resumable (marker
+    `/var/lib/robodr/.agentd-user-migrated`). **Upgrade note (focal):**
+    operator drop-ins copied from older examples that pass `robodr` to
+    `robodr-load-credential load robodr-agentd.service` keep working (the
+    helper hands agentd's credentials to `robodr-agentd` and warns);
+    change them to `robodr-agentd` (`docs/OPERATIONS.md` §11.5).
+  - **Probe reaper (low, L-F):** leftovers are killed with their process
+    groups until none is left or 10 s pass (no 64-round limit).
+  - Info: `pack_digest` no longer follows symlinks, does not block on a
+    FIFO and hashes at most 64 MiB per file; rule names must be unique
+    across all installed `robodr-rules` packages.
+
+- Secure delivery on a unit, independent adversarial review of Sprint 13b
+  (`docs/SECURE-DELIVERY.md` §10 "Independent adversarial review of
+  13b"); every fixed finding has a regression test that failed before
+  the fix (`crates/robodr-deliverd/tests/review_13b.rs`):
+  - **Forged safety state (high, H1):** `robodr-agentd` runs as its own
+    system user `robodr-agentd` (group `robodr-agentd`, member of
+    `robodr`), no longer as the exporters' `robodr`; the package creates
+    it and moves agentd's black box, spool, profile state and
+    control-plane state on upgrade. agentd serves its status on
+    `spool.status_socket` (`/run/robodr-agentd/status.sock`, in the
+    shipped examples) and `robodr-deliverd` takes the safety state only
+    from there and only from that user or root (`SO_PEERCRED`; a status
+    file only if it and its directory are owned by that user or root and
+    writable by nobody else). agentd's `safety_feed.socket` accepts
+    reports only from root, itself and the new `allowed_uids` /
+    `allowed_gids` (with `socket_mode` / `socket_group`; group
+    `robodr-safety` for the PLC gateway). The spool is `2750`, its
+    queues `2770`, setgid `robodr`; `/run/robodr-agentd` is `0751`. The
+    Pulsar host-threats drop-in uses `SupplementaryGroups=robodr-agentd`.
+  - **deb identity (high, H2):** a `deb` RPK's name and arch are its dpkg
+    `Package` and `Architecture` (or `all`); a mismatch, a package another
+    RPK name owns, a higher serial with a lower dpkg version and a `.deb`
+    that is or conflicts / breaks / replaces / provides `robodr` or
+    `robodr-focal` (unless from `install.robodr_programme`) are refused.
+  - **Floor durability (medium, M1):** floors, deployment sequence, time
+    floor and chain heads are kept in a signed, never-rotated high-water
+    record (`<blackbox.dir>/highwater.json`) and restored from it; when
+    the state file and the record are both lost the agent locks until
+    `robodr-deliverd reanchor`.
+  - **Root in the spool (medium, M2):** findings are written through
+    directory descriptors (`O_TMPFILE`, no-replace `linkat`);
+    `tmp.deliverd/` is no longer used.
+  - **Kept versions (medium, M4):** version directories are
+    `<serial>-<digest>`; the same serial with other content is refused
+    while installed, kept or being switched.
+  - **Probes (low, L1/L2):** probes run under rlimits (CPU, address
+    space, open files, processes; `health.probe_max_*`) with the agent as
+    their subreaper: leftovers, even detached ones, are killed and fail
+    the probe. The default probe UID minimum is 1000; `robodr-agentd` is
+    always denied.
+  - **Untrusted clock (low, L3):** with `trust.clock: untrusted` a
+    maintenance window stays closed (no signed current time).
+  - **Media (low, L4):** handled packs are remembered by content digest,
+    so a corrected pack under the same name is judged again.
+  - **Unit hardening (I1):** `RestrictSUIDSGID=` removed and `@resources`
+    no longer filtered in `robodr-deliverd.service` (and its focal
+    variant); `MemoryDenyWriteExecute=` and `ProtectKernelTunables=`
+    kept. SECURE-DELIVERY §6.7 states that release signers are
+    root-equivalent for `deb`.
+  - Contract `robodr.findings` 2.2: the full catalog is now documented
+    (§3a); no change to the entries.
+- Secure delivery, independent adversarial review of Sprint 13a
+  (`docs/SECURE-DELIVERY.md` §3.5 "Review of 13a"); every finding has a
+  regression test replaying its attack
+  (`crates/robodr-release/tests/review_13a.rs`). The formats changed
+  before any release:
+  - **Another site's trust file (high):** trust files are pinned by site
+    as well as by root fingerprints (`--site`, required wherever trust is
+    pinned); the bundle chain state records the site. Roots shared by
+    several sites no longer let one site's file stand in for another's.
+  - **Trust rollback and freeze (medium):** one site-wide trust anchor
+    (`--trust-anchor`, created by `verify trust --init-anchor`, advanced
+    only by an accepted rotation) for every command (`verify rpk`,
+    `verify bundle`, `verify deployment`, `repair`, `import`, `build
+    bundle`, `sign`); working without it needs `--no-trust-anchor` and is
+    refused with `--state`. Trust files carry a mandatory `expires_at`
+    (at most 366 days); revocations and floors can no longer be dropped
+    on the state path.
+  - **Release keys scoped to programmes (medium):** `programmes` name
+    their release keys and packages; one programme's release quorum
+    cannot sign another's RPKs or bundles.
+  - **Ring bound to targets (medium):** the trust file assigns units to
+    rings; the `lab` operator quorum applies only to units assigned to
+    the deployment's ring (a canary is one unit, groups need the
+    production quorum).
+  - **Mixed-order twin keys (medium):** `robodr-blackbox` refuses Ed25519
+    public keys that are not torsion-free everywhere keys are loaded, so
+    one secret cannot count as two signers (also hardens
+    `robodr-commission` quorums).
+  - **Verify-then-use on media (medium):** new `robodr-release import
+    --from MEDIA --to DIR` copies, verifies the copy and publishes only
+    the copy.
+  - Low: listed files are size-checked before hashing and never read past
+    their size; `-h` / `--help` exits 0 only as the whole command line
+    (also in `robodr-diode-pack` / `-unpack` and the `robodr-export`
+    binaries); quorums are capped at the 16-entry signature set; a clock
+    before 1970 is an error; `sign` verifies a bundle's RPKs and every
+    existing signature before adding one; RPKs can be revoked by package
+    and serial (`revoked_serials`).
+
+- Control plane v2 review (agentd, `robodr-control-plane/v2`):
+  - **TLS read deadline (high):** the handshake and request deadlines now
+    bound every socket read (rustls' `complete_io` loops reused one socket
+    timeout, so a peer dripping one byte per timeout held a slot for
+    hours).
+  - **Connection slots (medium):** the unix socket has its own slots; TCP
+    counts handshakes / unauthenticated connections apart from
+    authenticated ones, and one source address holds at most
+    `max_connections_per_source` (new, default 2). Idle TCP peers can no
+    longer lock out the root-only unix socket.
+  - **No order without a record (medium):** a request answered `failed`
+    leaves nothing staged for the executor (submit and revert); the daemon
+    releases a control-plane order only if the stored request is still
+    `pending` and matches it (a retry with the same `request_id` and
+    another action used to dispatch both).
+  - **Journal damage (medium):** only one trailing line of a request or
+    nonce journal can be a torn append; more is damage (quarantined). The
+    replay store then fences; the request journal is rebuilt from the
+    black box's request / revert notes, and refuses new request ids if
+    the black box cannot be read (committed requests were forgotten and
+    judged again after a restart).
+  - **Replay fence (low-medium):** the fence covers now + skew, is set
+    whenever the nonce store is created (a first start refuses requests
+    for `max_clock_skew_s`), and when the clock goes back below the
+    store's persisted high-water mark.
+  - **Held is not in force (medium):** answers carry `in_force` and, for
+    an action the executor holds after a reboot,
+    `state.executor_state: "held"` (contract §5 / §6a; vectors 02 and 03
+    regenerated).
+  - **Evidence limits (low):** exports are streamed to disk (never held in
+    memory), `max_export_bytes` is capped at 256 MiB, an export must leave
+    64 MiB free for the journals (507 `storage_full`), a build is
+    abandoned after 60 s or at shutdown (503 `evidence_timeout`); a
+    corrupt-chunk read never deletes a re-created export.
+  - Optional `control_plane.tls.client_crl` (SOC client certificate
+    revocation); `%XX` path decoding refuses a sign; answer-signature
+    coverage and 503 `busy` semantics documented.
+- `robodr-executor` (review of M1, F3 medium): a revert of an action the
+  SOC approved needs the SOC's signed revert request, verified like a
+  submit (own keys, own robot id, window, own replay store, the revert of
+  that `request_id`, a strict revert body); agentd forwards it with the
+  revert (`Msg::Revert.soc`, `Client::revert_signed`). Unsigned reverts
+  stay for planner actions, TTL expiry, reconciliation and `revert-all`.
+- `robodr-executor` (F4): quarantine locators must lie in the new
+  `network.quarantine.cidrs` (empty: no quarantine; no `/0`, no overlap
+  with management / uplink) and on the robot's DDS ports
+  (`network.quarantine.udp_ports`, default the domains' RTPS ranges), one
+  address family; new refusal `locator_out_of_scope`. **Upgrade:** add
+  `network.quarantine.cidrs` to `executor.json` or every quarantine is
+  refused.
+- `robodr-executor` (F8): the replay-store fence is the start time plus
+  `soc.max_clock_skew_s` (agentd's `ReplayGuard` got the same fence in
+  the control plane v2 review, finding 5 above). Like agentd's, the
+  executor's store now persists a wall-clock high-water mark
+  (`high_water_s` in `soc_nonces.json`, the latest second it dropped dead
+  pairs) and fences up to it plus the skew when the clock reads below it,
+  at start or while running (`soc_request_stale`).
+- `robodr-executor` (F9): `soc.robot_keys` (the robot's own public keys)
+  are never accepted as SOC keys; a held action is re-armed only while its
+  approving key is configured (`approval_key_removed`); a bad key file
+  refuses every control-plane order with `soc_keys_unavailable` (was
+  `config_unavailable`).
+- `robodr-executor`: site option `require_approval_for_all_containment`
+  (default `false`, `true` in the G1 example): planner containment orders
+  are refused on every morphology.
+- `robodr-firewall-gw` (review of the gateway channels, F1 high): the
+  arm-SDK blend weight is rate limited, not only bounded: `0 → 1 → 0 → 1`
+  snapped the arms between the locomotion pose and the SDK's targets. New
+  per channel `max_weight_step` (default 0.02 per accepted frame) and
+  `max_weight_rate_per_s` (default 0.5 /s); a weight rising from 0 is
+  accepted only when every weighted target is within `engage_max_q_error`
+  (0.1 rad) of the robot's `rt/lowstate` (observed, `lowstate_max_age_ms`
+  50), else only by `engage_first_step` until `engage_stable_frames` frames
+  of stable targets. Beyond: integrity failure, the humanoid holds. New
+  counters `arm_weight_step_rejected`, `arm_weight_rate_rejected`,
+  `arm_engage_rejected`. **Behaviour change:** a controller that engages
+  in one frame (the SDK example) needs `rt/lowstate` and an opened-up
+  step / rate.
+- `robodr-firewall-gw` (F2, medium-high): the unknown-writer probe
+  classifies leniently (any representation, padding and trailing octets
+  ignored, element counts from the length) and the sample is then decided
+  strictly, so a non-canonical twist (XCDR2, trailing zeros) or Dex3 frame
+  from a foreign GUID is suppressed instead of passed. Writers SEDP
+  announced on another topic are now persisted in `rtps.state_file`.
+- `robodr-firewall-gw` (F5): the Dex3 mode octet must be the SDK's
+  (motor id = index, status 1, timeout 0 / 1); the hand-SDK weight
+  (`cmds[0].mode`) is bounded to 100 and step / rate limited; other mode
+  octets must be 0 (`hand_mode_rejected`).
+- `robodr-firewall` / `robodr-firewall-gw` (F6): new joint channel flag
+  `balance_critical` (default `true`); `false` lifts the humanoid all-limp
+  rule, so a hand can be released (`stopMotors`, `kp = kd = 0`). The
+  gateway accepts it on hand codecs only.
+- `robodr-firewall-gw` (F7): the robot's own SPDP / SEDP is observed (an
+  NFLOG copy of every UDP datagram entering from the robot port, never
+  queued or dropped; new `observe.enabled` / `observe.nflog_group`, a
+  `ROBODR_GW_OBS` chain in the rendered ruleset) and runs through the
+  unqueued-locator check (`discovery.robot_unqueued_locators`). The
+  commissioning capture of both bridge ports is a documented required step.
+- `robodr-firewall-gw` (F10): a loco `SetVelocity` ends after its duration
+  (`Firewall::twist_at_rest`, `velocity_expired`); queries and allowlisted
+  calls are checked for source / rate only (`Firewall::check_access`)
+  instead of feeding a zero twist; a malformed `SetVelocity` / `Move` is
+  suppressed, never turned into a substitute; rewritten numbers never read
+  back above the limit as a `float`; **`Start` (G1 500, H1 204, H2 601, R1
+  811) now needs `allowed_fsm_ids`**; new codec `unitree_arm_request` (G1 /
+  H2 arm actions on `rt/api/arm/request`: every call but `GetActionList`
+  refused unless in `allowed_api_ids`).
+
+- `robodr-executor` (M1, trust boundary): the executor no longer takes
+  agentd's word for a SOC approval. agentd forwards the SOC's signed
+  `robodr-control-plane/v2` request with every control-plane order; the
+  executor verifies the Ed25519 signature with its own copy of the SOC
+  public keys (new `soc.keys`, `soc.max_clock_skew_s` in `executor.json`),
+  its own robot id, the timestamp window and its own persisted replay
+  store (`<state_dir>/soc_nonces.json`), and that the order's id, action,
+  target and TTL are the signed ones. New refusal codes
+  `soc_signature_invalid`, `soc_request_stale`, `soc_nonce_replayed`,
+  `soc_replay_store_unavailable`, `order_mismatch`, `approval_missing`
+  (control-plane contract §6a). **Upgrade:** add the SOC public key files
+  to `executor.json` (`soc.keys`); without them every control-plane order
+  is refused. Planner orders can no longer claim an approval.
+
+- `robodr-firewall-gw` (review F1, critical): a spoofed DATA with the
+  motion writer's GUID and a far-future sequence number no longer poisons
+  the stream. Sequence / replay state is bound to (GUID, authorised
+  source, source IP, source MAC — the MAC from `NFQA_HWADDR`) and only
+  samples forwarded from that binding advance it; foreign samples never
+  touch it and never carry a substitute under an authorised GUID; the same
+  GUID from another (IP, MAC) is a binding conflict while the bound side is
+  live (`rtps.binding_takeover_ns`, default 1 s); a jump beyond
+  `rtps.max_sn_jump` (default 64) is held until confirmed by the next
+  sample; a writer restart (lower number after an SEDP re-announcement from
+  the bound IP) is accepted once. New channel option `allowed_src_macs`.
+- `robodr-firewall-gw` (review F2, high): DATA_FRAG, key-only and
+  non-standard samples of a writer with no SEDP / persisted classification
+  are suppressed in enforce mode (`unknown_writers: probe`): the content
+  probe cannot read them.
+- `robodr-firewall-gw` (review F3, medium): a go `LowCmd_` with
+  `bms_cmd.off != 0` (`0xA5` = battery off) is refused (decided as an
+  integrity failure, so the substitute with the last accepted frame's
+  non-motor fields applies) unless the channel sets `allow_battery_off`;
+  the other non-motor fields are documented with SDK evidence.
+- New status counters `binding_conflicts`, `sn_jumps`, `writer_restarts`,
+  `unknown_undecidable`, `non_motor_rejected`; fuzz invariants for F2 / F3;
+  netns e2e for F1 (attacker namespace, spoofed IP with its own MAC).
+
 ### Added
+
+- Secure delivery, Sprint 13b (unit agent, local; `docs/SECURE-DELIVERY.md`
+  §4.2, §6, §10 "13b status"):
+  - `robodr-deliverd` (new crate and daemon, `/usr/sbin`, unit
+    `robodr-deliverd.service` installed disabled, focal variant): imports
+    per-unit media packs (`robodr-media-pack/1`) only through the 13a
+    verified-copy path under the unit's own trust anchor (`init-anchor`),
+    checks the deployment against the unit (depot + operator quorum, unit
+    id, its own ring, groups for production rings only, rollout within the
+    ring, sequence), and installs `files`, `config`, `deb` and
+    `robodr-rules` RPKs from a content-addressed store: safety-state gate
+    on agentd's live safety feed (`idle` / `safe_state_active` only,
+    re-read right before the switch), maintenance window, operator
+    confirmation (`confirm`), write-ahead intent and anti-rollback floor
+    before the switch, health gate (probes as an argv without a shell, as
+    an unprivileged UID, bounded in time and output), automatic rollback
+    at or above the floor, crash recovery, staleness with a trusted or
+    untrusted clock; every step in its own black-box chain.
+  - `robodr-safety-replay` (test tool, not packaged): replays recorded
+    JSONL safety reports into agentd's `safety_feed` socket.
+  - Findings contract `robodr.findings` **2.2.0**: catalog entries
+    `robot.deliver.installed`, `deferred_safety`, `health_failed`,
+    `rollback_blocked_floor`, `refused`, `stale`, `chain_gap` (data source
+    `robodr_delivery`); 2.0 / 2.1 messages keep their own catalogs.
+    Upgrade SOC-side validators (and both sides of a diode) first.
+  - tmpfiles: `/var/lib/robodr/deliverd`, `/var/lib/robodr/deliverd-media`,
+    `/var/lib/robodr/blackbox/deliverd`, `/opt/robodr-delivered`,
+    `/etc/robodr-delivered`, `/etc/robodr-delivered-rules`; example
+    `deliverd.example.json`; man page `robodr-deliverd(8)`;
+    `docs/OPERATIONS.md` section 11. Releases require `robodr-deliverd` in
+    both packages.
+  - Fuzz targets `deliverd_state`, `deliverd_inputs` with std-only smoke
+    runs.
+  - `robodr-agentd` (changed): spool records are published with
+    no-replace hard links (a taken name moves on to the next number), so
+    a second producer (`robodr-deliverd`) can share the findings spool
+    without either overwriting the other's records. `robodr.spool/v1` is
+    unchanged.
+
+- Secure delivery, Sprint 13a (formats and release signing,
+  `docs/SECURE-DELIVERY.md` §3, §3.5, §10):
+  - `robodr-pkg` (new, pure): strict parsers and validators for RPK
+    packages (`robodr-pkg/1`), release bundles (`robodr-bundle/1`),
+    deployments (`robodr-deployment/1`), the site delivery trust file
+    (`robodr-delivery-trust/1`) and detached signature sets
+    (`robodr-sigset/1`). One canonical encoding per document, size caps
+    before parsing, release / depot / operator / root roles kept disjoint,
+    quorum counted by key fingerprint, revocation by fingerprint and RPK
+    digest, floors, TUF-style root rotation, per-programme bundle chain
+    (gap, replay, equivocation, broken link refused), Reed-Solomon bundle
+    parity with `robodr-diode`'s code.
+  - `robodr-release` (new binary): `keygen`, `fingerprint`, `build rpk`
+    (deterministic), `build bundle` (verifies the copied RPKs, lists every
+    file, adds parity), `sign` (checks the document and its files before
+    adding a signature), `verify rpk|bundle|trust|deployment` (pinned
+    roots, explicit chain mode, exact tree, every hash) and `repair`
+    (rebuilds damaged files from parity after authenticating the bundle).
+  - Fuzzing: libFuzzer targets `pkg_rpk`, `pkg_bundle`, `pkg_deployment`,
+    `pkg_trust`, `pkg_parity` with std-only smoke runs in
+    `crates/robodr-pkg/tests/fuzz_smoke.rs`.
+  - Not in 13a: sealed (encrypted) RPKs and wrapped keys (13c), the unit
+    agent (13b), the depot (14a).
+
+- `robodr-firewall-gw`: new channels. `unitree_loco_request` (humanoid
+  locomotion client: G1 / H2 / R1 on `rt/api/sport/request`, H1 on
+  `rt/api/loco/request`): `SetVelocity` limited by the twist firewall and
+  its duration capped (`max_velocity_duration_s`, default 1 s; `Move(...,
+  continuous)` sends 864000 s); every `SetFsmId` but the model's `Start`
+  (`ZeroTorque`, `Damp`, posture changes) and every hand-over / trick call
+  refused unless allowlisted (`allowed_fsm_ids`, `allowed_api_ids`).
+  `unitree_hg_arm_sdk` / `unitree_go_arm_sdk` (`rt/arm_sdk`): mode-0 slots
+  with gains decided against the joint envelope, the blend-weight slot
+  bounded. `unitree_dex3_hand_cmd` / `unitree_hand_sdk`: decided, passed or
+  suppressed. `ros2_twist` / `ros2_twist_stamped` (`rt/cmd_vel`).
+  `rtps.extra_port_ranges` queues non-default DDS ports, and discovery
+  announcing a locator outside every queued range raises
+  `discovery.unqueued_locators` and the status flag `port_bypass_risk`.
+  A humanoid configured with `unitree_sport_request` is refused (its loco
+  calls need `unitree_loco_request`); a `SetVelocity` on a sport channel is
+  now decided as a velocity.
+- `robodr-rtps`: SEDP endpoint locators (`PID_UNICAST_LOCATOR`,
+  `PID_MULTICAST_LOCATOR`) in `EndpointInfo`.
+- `config/firewall-gw.unitree-{g1,go2}.channels.example.json` and
+  `config/firewall.unitree-{g1,go2}.channels.example.json`: the new
+  channels enabled (G1: arm SDK, loco, both Dex3 hands, arm actions; Go2:
+  sport, ROS 2 `/cmd_vel`), each channel explained in its new `note` field.
+- `robodr-firewall-gw` fuzz target: the new channels (fixture flag 4) and
+  the robot-side observation path, NFLOG parser, invariants for the arm
+  weight step, loco calls, hand mode octets and canonical twists.
+
+- Control plane `robodr-control-plane/v2` in `robodr-agentd` (GA sprints 4
+  and 5, robot side; contract `docs/contracts/robodr.control-plane.md`):
+  - **Mutual TLS** on the TCP listener (`control_plane.tls`: rustls + ring,
+    the uplink's crates and versions): the SOC's client certificate must
+    chain to `client_ca`, be valid and permit `clientAuth`; optional SHA-256
+    SPKI pins in addition; no session resumption. Failed handshakes count as
+    failed authentication (`tls_failures`, the High
+    `robot.agent.control_plane_unauthenticated` finding). The Ed25519
+    request signature stays required on every listener.
+  - **Persistent state** (`control_plane.state_dir`, private 0700): a
+    checksummed append-only request journal (`robodr-cp-journal/v1`) with
+    begin / commit / abort around the black-box note — a decision a crash
+    left half-journaled is settled from the black box at the next start —
+    crash-safe compaction and quarantine of damaged journals; a status
+    query after a restart answers as before it. The nonce store is
+    persisted (fsync before the request proceeds; full or unwritable:
+    refused) and fences requests signed before the start when it cannot be
+    trusted.
+  - **Evidence API** (`control_plane.evidence`): inventory of the retained
+    black-box records; exports of a finding's evidence links (plus context),
+    a seq or a time range as `RBBXBND1` bundles of the frames exactly as
+    stored, with a manifest signed by the finding key
+    (`X-RoboDR-Manifest-Signature`), downloaded in signed, size-bounded,
+    resumable chunks; limits on size, count, storage and age; a
+    `robodr.control_plane_evidence_export` note per export.
+  - `robodr.control_plane_start` black-box note (listeners, TLS identity,
+    restored state, settled decisions, journal damage, replay fence);
+    `status.json` gains `tls_failures`, `answer_sign_failures`, `tls`,
+    `replay_*`, `state`, `evidence` and journal counters.
+  - Contract test vectors `docs/contracts/fixtures/control-plane-v2/`
+    (signed requests of every route and negative cases, signed answers, an
+    evidence export with manifest, chunks and a tampered copy), generated by
+    `cargo run -p robodr-agentd --example control_plane_vectors` and checked
+    byte for byte by `tests/control_plane_vectors.rs`.
+  - cargo-fuzz target `control_plane_request` (bounded HTTP parser,
+    credentials, routing, strict bodies) with a std-only smoke test.
+  - Packaging: `30-control-plane.conf.example` drop-in (regular and focal:
+    state directory, TLS key credential, `IPAddressAllow=`), tmpfiles entry
+    for `/var/lib/robodr/control-plane/agentd` (0700 robodr), the contract
+    installed under `/usr/share/doc/robodr/contracts/`.
+- `robodr-blackbox verify BUNDLE`: verifies an `RBBXBND1` export bundle file
+  (e.g. one downloaded through the evidence API) with a keyring
+  (`--signing-key` for a bundle that starts after a key rotation).
+- Fleet lifecycle on the robot (Sprint 9): new crate `robodr-fleet`, binary
+  `robodr-enroll` (`/usr/sbin`, root-only, man page `robodr-enroll(8)`,
+  `config/fleet.example.json`, OPERATIONS 8.6). The SOC side is not built
+  yet; the new contract `docs/contracts/robodr.fleet-api.md` (draft v1) and
+  its deterministic vectors `docs/contracts/fixtures/fleet/` (generator,
+  byte-identical test, replay through a reference SOC) specify it.
+  - Enrollment with a single-use token signed by the SOC fleet key (robot
+    id, site, workspace, validity <= 7 days, 256-bit secret), read from a
+    root-only file or standard input (never argv): the unit's uplink,
+    finding and black-box keys are generated on the unit (0600) and
+    registered by a request signed by all three new keys (proof of
+    possession) and MAC'd with the token secret (the token never leaves the
+    unit); online over HTTPS (robodr-uplink's client) or as files on vetted
+    media (air-gapped).
+    Local checks: SOC signature, validity, workspace / robot / site binding,
+    local replay guard; the answer must match the request exactly.
+  - `rotate --role uplink|finding`: overlap (the old key stays valid until
+    the SOC confirms), atomic swap, old key kept in `retired/` until the
+    SOC retires it, then shredded; crash-safe journal (resumes at every
+    step; the crash points are tested); a key handover signed by both keys
+    over the fleet journal's head. A sent rotation is never abandoned
+    locally: `rotate --cancel` ends it at the SOC (signed by the old key).
+  - Fleet journal: a robodr-blackbox chain signed with the black-box key
+    (`/var/lib/robodr/fleet/journal`) recording every lifecycle step.
+  - `revocations`: the root-signed revocation list from the SOC, verified
+    with robodr-commission against agentd's trust roots, rollback /
+    equivocation refused, installed atomically; warns when the active
+    profile would be refused.
+  - `profile publish | fetch | stage | approve`: SOC-published signed
+    profiles are verified with agentd's own trust inputs and staged, never
+    enforced; only an operator running `approve` with an approval signed by
+    the SOC's separate approval key (`soc.approval_keys`) for this robot and
+    digest (valid <= 7 days, unexpired, single use) installs them.
+  - `ring`: update-ring information (0/1/2), information only, except its
+    minimum release, which raises the unit's security floor.
+  - Fuzz targets `fleet_token` and `fleet_envelope` with std-only smoke
+    tests.
+  - S10 policy: `unsafe` denied crate-wide (the one FFI call, `flock(2)`
+    of the state-directory lock, has a local allow and a `SAFETY` comment,
+    and retries a held lock briefly for the fork window like
+    `robodr-export`'s), `robodr-enroll` forbids it; `unwrap` / `expect` /
+    `panic!`-family calls are denied in non-test code (payload and envelope
+    serialisation return errors; the token nonce is decoded once at parse
+    time).
+  - The package installs the contract as
+    `/usr/share/doc/robodr/contracts/robodr.fleet-api.md` (with
+    `robodr-enroll`).
+- `install-bundle.sh`: black-box format gate on install and rollback (each
+  package ships `/usr/share/robodr/formats`; a release that cannot read a
+  recognised segment format on the unit is refused, naming it;
+  `--accept-unreadable SEG` accepts one segment; unknown frames are
+  reported and do not block), `list` shows the formats each kept release
+  reads and the security floor, `ring` prints the SOC ring information;
+  tested against the real `dpkg` (install -> upgrade -> rollback, refused
+  rollback across a format change, downgrade and floor, signed install) in
+  `crates/robodr-fleet/tests/packaging.rs`. Only black-box segments
+  (`seg-*.rbb` under `/var/lib/robodr/blackbox` and
+  `/var/lib/robodr/fleet/journal`) are gated; the executor and control-plane
+  journals, evidence exports and gateway state are not black-box chains and
+  are neither gated nor reported (tested). A refused format no longer leaks
+  the temporary formats file (the refusal message reused its variable).
+- `robodr-uplink`'s HTTPS transport takes a method and request target
+  (`HttpsTransport::request`, `Endpoint::parse_with_path`), shared with
+  `robodr-enroll`; ingest behaviour unchanged.
+- Executor v1 (`robodr-executor`, Sprint 7), **off by default**:
+  reversible actions only.
+  - `isolate_network` and `quarantine_node` are nftables rules in a
+    dedicated `inet robodr` table:
+    - isolation keeps loopback, the management / uplink allow-list, the
+      control buses and the motion control path open;
+    - quarantine drops RTPS by GUID prefix and UDP by SPDP locator.
+  - `record_evidence` is a signed black-box mark naming the request's
+    evidence.
+  - `restrict_motion` is recorded as advisory only (no gateway yet).
+  - Never executed: `safe_pause`, `request_safe_state`, `rollback_config`.
+  - Each action follows precheck against the executor's own response
+    policy and configuration → safety-state re-check immediately before
+    apply → write-ahead journal → one atomic `nft -j -f` transaction →
+    read-back verification → exact, idempotent revert, with TTL
+    auto-revert and a persisted deadline.
+  - Restart / reboot / crash reconciliation; an operator's
+    `nft delete table inet robodr` is honoured as an emergency disable.
+  - A humanoid gets nothing outside `fall_safe_restrict`, and nothing
+    without a human's approval.
+  - Separate unit `robodr-executor.service`: `CAP_NET_ADMIN` only, no IP
+    sockets, focal variant; new system user `robodr-exec`. agentd keeps
+    `CAP_NET_RAW` only.
+  - agentd `executor` section (`enabled`, `socket`, `key_file`,
+    `planner_orders`) uses an HMAC-authenticated unix-socket protocol.
+  - New control-plane statuses `verified` and `reverted` (contract §6a) on
+    control plane v2: signed answers like every other state; every
+    executor state change is an `executor` entry of the v2 request journal
+    (fsync before it is answered; agentd also journals outcomes nobody
+    asked for and asks the executor once after a restart), so a `verified`
+    or `reverted` request reads the same after a restart; an executor
+    revert is journalled with `revert_begin` / `revert_commit`.
+    `status.json` `executor` counters; black-box notes
+    `robodr.executor_event` and `robodr.evidence_mark`.
+  - Examples: `config/executor.example.json`,
+    `config/executor.unitree-g1.example.json`.
+  - Tests:
+    - decision matrix;
+    - real nftables in network namespaces with UDP traffic between veth
+      peers;
+    - agentd end to end.
+  - Not yet: a High finding for a failed revert or a journal reset
+    (needs a findings-contract catalog bump), and executor-side
+    verification of the SOC signature (after the control-plane v2 merge).
+- Executor v1 review fixes (each with a regression test that failed
+  first):
+  - A motion-path entry needs `cidr` and/or `interface`; `guid_prefix`
+    only narrows it (H1). Entries a quarantine may not cut are accepted
+    before any drop in every chain; `quarantine_node` needs the
+    participant's SPDP unicast locators (`locators_required`), each
+    outside those entries; agentd attaches them from the pipeline's
+    binding table or participant events (H2).
+  - Isolation keeps the robot's DDS discovery (`network.discovery`,
+    default 239.255.0.1, domain 0), IGMP / MLD, the DHCP / DHCPv6 client,
+    path MTU discovery and IPv6 router / neighbour discovery (H3, L5);
+    port rules match by direction (L2); fragments of protected flows pass
+    (M6).
+  - Server: housekeeping on its own thread, an absolute 5 s deadline per
+    message, at most 8 connections, nonces on the monotonic clock (M2,
+    L3). TTLs on CLOCK_BOOTTIME within a boot (L1).
+  - An operator's `nft delete table inet robodr` is honoured by every
+    path and refuses orders until `robodr-executor rearm` (M3); any
+    failed start and `ExecStopPost=robodr-executor stop-cleanup` delete
+    the table (M4); a revert is `reverted` only once journalled (M5).
+  - After a reboot actions are re-validated and held until a fresh
+    safety state (L4); `unknown` safety states refuse (L6); the policy
+    and configuration are re-read per order (L7); purge removes the
+    executor journal; a corrupt journal is a High notice (critical
+    `journal_reset` event, `executor.journal_resets`, status flag).
+- Fuzzing (S10): seven new libFuzzer targets with std-only smoke tests
+  (`kafka_wire`: libFuzzer only): `cdr_payload` (every CDR decoder),
+  `diode_manifest`, `diode_import` (a whole batch through the importer),
+  `diode_fec` (against an oracle), `correlate_rules`, `safety_feed`,
+  `kafka_wire`; each ran 10 minutes under libFuzzer without a crash
+  (fuzz/README.md).
+- `robodr-firewall-gw` (new crate + binary): the first **in-path**
+  enforcement point. An inline bridge on the sensor box hands every UDP
+  datagram of a configured motion channel that enters from the controller
+  side to an NFQUEUE (br_netfilter + iptables `physdev` / `NFQUEUE`,
+  ruleset rendered from the gateway configuration by `robodr-firewall-gw
+  ruleset`), decides it with `robodr-firewall` and answers ACCEPT, DROP or
+  ACCEPT with a same-length rewritten payload. Channels: Unitree SDK2
+  `rt/lowcmd` (`unitree_go` / `unitree_hg` `LowCmd_`, strict RTPS walk and
+  canonical-CDR decode, limited frames rewritten in place with the CRC
+  recomputed and verified), sport API `Move` (parameter rewritten, other
+  calls by allowlist, aliased api ids refused) and Go1 legacy UDP
+  `HighCmd` / uncompressed `LowCmd`. Substitutes (humanoid: hold, never
+  damping or limp) are written into the rejected sample itself (same
+  writer, sequence number and length; the gateway never originates a
+  datagram or a sequence number); a sample with nothing to emit becomes a
+  PAD; retransmissions / replays re-emit the cached decision; undecidable
+  payloads are integrity failures; DATA_FRAG of a motion channel is
+  suppressed. Writer → topic learned from SEDP (persisted), SPDP identities,
+  source-IP binding, kernel arrival timestamps as the firewall clock, fault
+  verdict for late packets. `queue.on_gateway_down`: `fail_closed`
+  (default) or `bypass` (refused for a humanoid joint channel). In-tree
+  NFQUEUE netlink client (std + `extern "C"`, fuzzed); units
+  `robodr-firewall-gw.service` / `robodr-firewall-gw-rules.service` (+
+  systemd 245 variants); example configurations
+  `config/firewall-gw.unitree-{g1,go2}.example.json`; fuzz target
+  `firewall_gw_packet`; latency harness `examples/gw_latency.rs`; an
+  end-to-end test through real network namespaces, bridge and NFQUEUE
+  (`tests/netns_e2e.rs`, `--ignored`, root). Docs: crate README (design,
+  "what hold means on the wire", latency), UNITREE.md 5.1, OPERATIONS.md
+  6.6. Not validated on a robot; not a safety-rated device.
+  S10 policy as for the other daemons: `#![deny(unsafe_code)]` with local
+  allows only on the NFQUEUE netlink socket and `signal` / `clock_gettime`
+  (SAFETY comment on every block; `struct timespec` refused on 32-bit
+  targets), `#![forbid(unsafe_code)]` on the binary, panic-family clippy
+  lints denied outside tests; the test fixtures (`testkit`) are behind a
+  test-only feature and not in the shipped binary.
+- `robodr-uplink` (crate `robodr-export`): producer of the AutoSecOps ingest
+  API (`docs/contracts/robodr.ingest-api.md`, contract v1). Inputs as
+  `robodr-kafka-publish` (agentd spool on a connected unit or sensor box, or
+  `robodr-diode-unpack` output on the SOC side), same re-validation; NDJSON
+  batches (≤ 1000 lines / 4 MiB) signed with an Ed25519 key file, the
+  per-finding signature carried as `sig` (`null` across a diode).
+  At-least-once with a persisted in-flight batch: records are acknowledged
+  only after a `200` that accounts for every line; rejected lines go to a
+  dead-letter file with the server's code; retries resend the same body
+  and batch id, re-signed, with exponential backoff and jitter honouring
+  `Retry-After`; `413` halves the batch. Batch ids are derived from the
+  input positions and the body, so a crash-restart re-sends the same batch
+  under the same id (server-side replay, nothing processed twice). TLS via
+  rustls + ring with a configured CA bundle as the only trust anchor and
+  optional SHA-256 SPKI pins; plain `http://` only to a loopback IP literal;
+  connect / per-request deadlines. Unit `robodr-uplink.service` (+ systemd
+  245 variant), `uplink.env.example`, SOC drop-in example, man page,
+  OPERATIONS 8.5. Conflicts with the two other spool consumers.
+- Shared contract test vectors `docs/contracts/fixtures/ingest/` (fixed-seed
+  test keys, 26 cases: requests, bodies, expected responses), generated by
+  `cargo run -p robodr-export --example ingest_vectors`; a test asserts the
+  committed files are byte-identical and runs them through a reference
+  consumer of the contract.
+- `robodr-uplink` after an independent review:
+  - `uplink-status.json` in the state directory (state ok / retrying /
+    blocked, last success and delivery, last error with HTTP status and
+    server code, `stuck_since_ms`, pending batch, backlog, next attempt)
+    and `sd_notify` `STATUS=` (units: `NotifyAccess=main`), so a batch the
+    server keeps refusing — which blocks every later finding — is visible;
+    optional `--exit-when-stuck-s` (exit 3).
+  - `robodr-uplink reinject`: re-queues dead-lettered records (default
+    codes `unknown_robot`, `robot_mismatch`, `site_mismatch`,
+    `missing_finding_signature`, `bad_finding_signature`) after a
+    registration fix; sent under new batch ids, idempotent, crash-safe.
+  - One process per state directory (`flock` on `uplink.lock`; `--once`
+    and `reinject` while the service runs fail clearly).
+  - `dead-letter.jsonl` rotation (`--dead-letter-max-bytes`, default 64 MiB;
+    `--dead-letter-keep`, default 4); deduplication reads rotated files.
+  - Contract vectors 20–26 (additive): origin-vouching and site-scoped
+    relays, `contract_version` syntax, lone surrogates, duplicate keys in
+    `sig`, `sig.key_id` with a space, repeated header, timestamp bound,
+    missing `Content-Type`, 4 MiB + 1 body.
+
+- `robodr-focal` package for hosts below glibc 2.39 / systemd 247 (Ubuntu
+  20.04 and 22.04, NVIDIA JetPack 5 / 6, e.g. Unitree EDU computers):
+  static musl binaries (`scripts/build-static.sh`, rust-lld, both arches,
+  checked for no interpreter and no shared library; no libc6 dependency),
+  systemd 245 units (`packaging/systemd/focal/`, kept in step by
+  `scripts/check-focal-units.py`) with `robodr-load-credential` in place of
+  `LoadCredential=`; agentd-only EDU mode (no `robodr-pulsard`: it needs a
+  BTF kernel). CI `static` job and release `build-static` job (debs,
+  bundles, `SHA256SUMS-focal-<arch>`). Verified in a container (build,
+  repro, qemu smoke runs, dpkg install); not yet on a Jetson.
+- `robodr-spool-export.service` (diode sites, no network) and
+  `robodr-kafka-publish.service` (connected sites, on the unit or sensor
+  box; broker-set drop-in example), env examples and tmpfiles directories
+  under `/var/lib/robodr/export/`; the two units conflict.
+- Unitree rules (`rules/robodr/unitree.toml`, 8 new): provisioning script
+  opened (covers `sh /path/wpa_supplicant_restart.sh` and `system()`);
+  boot / network / udev hooks and shell startup files written, moved or
+  linked; a program in a writable directory connecting to a public
+  address. Service rules now cover `/usr/local/lib/systemd` and systemd
+  generators; library rules cover pip-vendored `cyclonedds.libs/`.
+
+- Unitree live in `robodr-agentd` (recording only; synthetic traffic and
+  IDL-derived vectors, no real Unitree capture yet): the SDK2 topics
+  (`rt/lowcmd`, `rt/arm_sdk`, `rt/user_lowcmd`, `rt/hand_sdk`, `rt/dex3/*`,
+  `rt/waistpitch*`, `rt/api/<svc>/request`, state topics) decode end to
+  end; decoded low-level frames reach a **joint firewall**
+  (`firewall.joint_config`, `Agent::handle_with_joint`,
+  `robodr.firewall_joint_verdict`, clock = capture time, no in-path
+  gateway yet); `robot.robot_model` classifies model-specific API ids and
+  refuses a humanoid model with a non-humanoid policy / firewall
+  morphology (and a joint channel with the wrong slot count); Unitree
+  legacy UDP (Go1) through `sensor.unitree_legacy` (capture classifier
+  incl. kernel BPF, `robot.unitree.legacy_unknown_sender`, contract 2.1
+  catalog entry) and `robodr-commission learn --unitree-legacy`; example
+  profiles for every supported model and
+  `config/agentd.unitree-{sensor-box,edu}.example.json`.
+
+- Motion Firewall low-level joint path (`check_joint`), review fixes:
+  per-slot `max_dq_step` / `tau_pd_max` bounds on the position target
+  relative to the previous accepted target (stepped within the hard
+  factor, rejected beyond; new rule ids `joint_step_out_of_envelope`,
+  `joint_pd_torque_out_of_envelope`); `MotorMode::from_u8` (any non-zero
+  mode octet is enabled, e.g. Unitree `0x0A`); a mode-off slot carrying
+  `kp` / `kd` / `tau` is rejected (`joint_mode_inconsistent`); optional
+  `JointFrame::mode_pr` / `mode_machine` with channel pins
+  (`pinned_mode_pr` / `pinned_mode_machine`, `joint_mode_pin_mismatch`);
+  humanoid limp protection (a frame with every enabled joint limp is
+  rejected, `joint_limp_frame`); humanoid hold escalation past
+  `max_hold_ns` (Critical `joint_hold_exceeded` once per episode, held
+  feed-forward torque zeroed, never released) with `Stats`
+  `joint_hold_episodes` / `joint_holds_exceeded` / `joint_hold_age_ns`;
+  substitutes rate-bounded by `min_interval_ns` since the last emission;
+  gain-below-minimum rejections get their own id
+  (`joint_gain_below_minimum`, coalescing keeps the smallest gain). All new
+  ids are in the correlation and OCSF catalogs.
+
+- Vendor-neutral action catalog `robodr_responder::actions` (replaces
+  `robodr_responder::autosecops`): one list of seven robot actions —
+  `restrict_motion`, `quarantine_node`, `isolate_network`,
+  `record_evidence`, `safe_pause`, `request_safe_state`,
+  `rollback_config` — each with its wire name (`robot_<name>`, unchanged),
+  ladder step, reversibility, TTL rule, approval tier (`single` /
+  `two_person`), `autonomous: false`, `executable_in_ga` /
+  `ga_execution` (executor for the four reversible actions, platform
+  adapter only for `safe_pause`, plan-only for `request_safe_state` and
+  `rollback_config`). The agentd control plane uses it (`ActionKind` =
+  `ActionId`) and so now also accepts `record_evidence`; a test asserts
+  the two agree. This resolves the earlier contradiction between the
+  responder's list (no `rollback_config`) and the control plane's (no
+  `record_evidence`).
+- Response policy `morphology` (`humanoid`, `quadruped`,
+  `wheeled_mobile`, `arm`, `aerial`, `other`; required once OEM-validated
+  or for platform `other`, otherwise `unspecified` = treated as humanoid,
+  see *Changed*). For a humanoid, `safe_pause` / `request_safe_state`
+  (which may damp or de-energise the joints: the robot would fall) are
+  never executable: the planner lists them in the new
+  `ResponsePlan::advisory` and contains the threat with `limit_motion`
+  (plus only the OEM's `fall_safe_restrict` targets), always for a human to
+  approve; `check_invariants` rejects such plans
+  (`Violation::DeEnergisingOnFallProneMorphology`); the control plane
+  refuses them (`fall_hazard`).
+- agentd `findings` section (`topic`, `data_source`) and
+  `AgentConfig::{findings_topic, data_source}`.
+- `crates/robodr-threat-forward/README.md`.
 
 - Control-plane action API in `robodr-agentd` (`control_plane`, off by
   default; `src/control/`, contract
-  `docs/contracts/robot-edr.control-plane.md`, API
-  `robodr-control-plane/v1`): the four calls of AutoSecOps' `v1-draft`
+  `docs/contracts/robodr.control-plane.md`, API
+  `robodr-control-plane/v1`): four calls
   (`GET /api/v1/robots/{id}`, `POST .../action-requests`, `GET
   .../action-requests/{rid}`, `POST .../{rid}/revert`) over a bounded,
   std-only HTTP/1.1 listener on a unix socket and / or a loopback TCP
@@ -36,9 +935,9 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   (High) and `robot.agent.control_plane_invalid` (Medium) (correlate catalog
   and OCSF 1.3 entries); `status.json` / heartbeat `control_plane` counters;
   `config/agentd.full.example.json` gains the section. Conformance: run
-  against AutoSecOps' own executor and client (branch `robodr-integration`)
-  with a request-signing transport: the client must learn the
-  `recorded_not_executed` status and Ed25519 request signing (contract §9).
+  against an earlier SOC client draft with a request-signing transport (that
+  integration was later cancelled; the client requirements are now in the
+  contract's §9).
 - Second set of real ROS 2 Jazzy lab captures
   (`fixtures/captures/ros2-jazzy/`, README "Second set"; tooling in
   `tools/lab-capture/`: `capture_gz.sh`, `capture_frag.sh`,
@@ -317,8 +1216,192 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 - `SECURITY.md`, this changelog, and `docs/OPERATIONS.md` (air-gapped
   install, key generation and rotation, commissioning, upgrade and rollback,
   evidence export).
+- Unitree platform pack (host side): `rules/robodr/unitree.toml`, 16 Pulsar
+  rules for the EDU computer (UniPwn provisioning-script path, bluetoothd /
+  script IP connections, Bluetooth bond and policy tampering, new or enabled
+  services, outbound connections of Unitree processes outside a tunable
+  allowlist, reverse tunnels and overlay VPNs, Cyclone DDS configuration and
+  Unitree SDK / Cyclone library tampering) with 117 fixtures and a Unitree
+  benign-corpus scenario; passive sensor-box mode for `robodr-agentd`
+  (example drop-in `40-sensor-box.conf.example`, capture-NIC networkd file
+  and host firewall under `examples/sensor-box/`, shipped in the `.deb`);
+  `docs/UNITREE.md` (models, deployment modes, install, commissioning,
+  safety rules, known limits) shipped in the `.deb` and the offline bundle.
 
 ### Changed
+
+- **Breaking: control plane v1 removed.** `robodr-agentd` serves only
+  `robodr-control-plane/v2` (`/api/v2/...`, signing domain
+  `robodr-control-plane/v2`; a v1 request is refused). Answers to
+  authenticated requests are always signed, so `control_plane` now requires
+  `finding_signing`, and `control_plane.state_dir` is required.
+  `control_plane.allow_remote` is removed (refused with a pointer to `tls`):
+  a non-loopback `listen_tcp` needs mutual TLS. `config/agentd.full.example.json`
+  shows the mTLS listener, the state directory and the evidence API.
+- `robodr-agentd` links rustls + ring (C and assembly) like `robodr-uplink`.
+- `robodr-cdr`: the Unitree CRC (`crc32_core`, `frame_crc`, every
+  `crc_ok`) is computed a byte at a time from a 256-entry table instead of
+  bit by bit; results are identical (checked against the SDK loop for every
+  byte value in every word position and the independent vectors). The
+  in-path gateway computes it on every frame it decodes or rewrites; its
+  per-frame decision went from about 28 µs to about 10 µs (p50, 35 slots).
+- `robodr-uplink`: `Retry-After` is honoured in full (up to a documented
+  24 h bound, contract §7), also when it came with a run's last attempt;
+  `--max-retry-after-s` is **removed** (it could only make retries sooner
+  than the server asked; passing it is a usage error). Refusals and other
+  non-transient failures back off up to `--refused-backoff-max-s` (default
+  15 min) instead of 60 s (under 200 `401` audit entries a day on the SOC
+  instead of ~1440).
+- Contract `robodr.ingest` v1 (draft, 2026-10-26 review): line code
+  `site_mismatch`; the `vouches_origin` exception in §4 step 5.4; explicit
+  registry fields; the `contract_version` rule of the Rust validator
+  (leading zeros allowed, major compared as a number); lone surrogates and
+  duplicate `sig` keys are `invalid_line`; `sig.key_id` has no space; the
+  per-finding signature is over the `robodr.findings` §2a framed message.
+- Release and reproducibility builds compile ring (the only C in the pure
+  set) with a pinned clang (`clang-18` 18.1.3, Ubuntu
+  `1:18.1.3-1ubuntu1`) for every target, glibc included;
+  `scripts/ci-repro.sh`, `scripts/build-static.sh` and `release.yml` fail
+  when it is missing or another version (no fallback to `cc`); CI installs
+  it with an exact apt version (`scripts/ci-install-clang.sh`); builds
+  record `TOOLCHAIN.txt`. docs/BUILD.md "C toolchain": pins, air-gapped
+  prerequisites, independent verification.
+- S10 hardening (R8): `robodr-blackbox::crypto` and `robodr-ocsf::hash` now
+  use the audited RustCrypto `sha2` / `hmac` crates (plus `subtle` for the
+  tag compare and `zeroize` for wiping) instead of the in-crate SHA-256 and
+  HMAC-SHA256. Output is byte-identical: differential tests against the old
+  code (kept as test-only oracles) over random inputs, keys and splits, plus
+  NIST CAVP / RFC 4231 / OpenSSL-computed vectors; existing chains, HMAC
+  tags and finding uids verify unchanged. murmur2 (Kafka partitioner) stays
+  in-crate.
+- S10 hardening (R8/R9): `#![forbid(unsafe_code)]` in every crate and
+  binary without `unsafe`; the rest (`blackbox`, `capture`, `diode`,
+  `ros2-pipeline`, `agentd`) deny it crate-wide with a reviewed
+  `#[allow(unsafe_code)]` + `SAFETY` comment per FFI site and
+  `unsafe_op_in_unsafe_fn` denied. The daemon crates (`agentd`, `agent`,
+  `ros2-pipeline`, `capture`, `rtps`) deny `unwrap` / `expect` / `panic!`
+  family calls outside tests; crash and restart behaviour under
+  `panic = "abort"` is documented (docs/OPERATIONS.md) and tested with the
+  real binary (`tests/abort_restart.rs`). The diode's Reed-Solomon code
+  stays in-crate (its parity bytes are on-wire format) and is pinned byte
+  for byte to an independent codec (`tests/fec_oracle.rs`).
+- S10 policy extended to the code merged alongside it: `robodr-executor`
+  (library and binary) forbids `unsafe` and denies the panic-family calls
+  outside tests; `robodr-export` denies `unsafe` crate-wide (its one
+  `flock` FFI site is allowed locally with a `SAFETY` comment) and its
+  binaries forbid it.
+
+- `robodr.ingest` contract v1 draft clarified while implementing the
+  producer (no change to a valid request): error codes for every status,
+  `400` for malformed / missing headers and an empty body, `409
+  batch_id_reuse` for a known batch id with another body, processing order
+  of the syntax checks, line splitting and `invalid_line` cases,
+  `too_large` / `unsupported_contract` definitions, lines processed in
+  order, inclusive clock-skew bound, `Retry-After` as delay-seconds.
+- `ring` (C and assembly) is now part of the pure build: the musl builds
+  compile it with clang (`scripts/build-static.sh`, `scripts/ci-repro.sh`,
+  CI/release static jobs install clang if missing).
+- `robodr-spool-export.service` and `robodr-kafka-publish.service` also
+  conflict with `robodr-uplink.service`.
+- docs/UNITREE.md: the UniPwn rules fire only where the BLE provisioning
+  service runs (very likely the closed controller, not the EDU Jetson); the
+  released `robodr` package needs glibc 2.39, so current Unitree EDU images
+  run `robodr-focal`, agentd only. Sensor-box examples now name the capture
+  NIC `eth1` and the uplink `eth0` everywhere, and the nftables example
+  allows a Kafka broker set instead of one collector address.
+
+- `robodr_agent::FirewallSettings::from_profile`: an envelope that bounds
+  joint speed and allows no linear speed (`max_linear_speed` absent **or
+  0**, as the learner writes for a never-exercised dimension) is a
+  joint-velocity channel, no longer a Twist channel needing
+  `max_angular`.
+
+- **Response policy morphology is fail-safe (breaking for policies).**
+  `morphology` is required when a policy is `oem_validated` or its
+  `platform` is `other`; absent elsewhere it reads as the new
+  `unspecified`, which gets the humanoid treatment (it was `other`, so a
+  humanoid policy that forgot the field got executable safe pause / safe
+  state). `ResponsePolicy::conservative_default` no longer claims a body
+  plan. New `Morphology::needs_active_balance` (humanoid, quadruped,
+  unspecified): `allow_terminate_when_idle` is rejected (a legged robot
+  balances while idle), a process quarantine always needs approval and is
+  never a termination, `limit_motion` never goes below the new
+  `min_motion_factor` (default 0.2, floor 0.05), and the control plane
+  refuses `rollback_config` (now flagged `may_de_energise`: a controller
+  restart) and near-stop `restrict_motion` caps with `fall_hazard`. A
+  humanoid's substitute containment always needs approval and adds only the
+  restrict targets in the new `fall_safe_restrict` (default none:
+  `isolate_network` / `quarantine_node` are balance-safe only when the
+  balance loop is not networked, e.g. not Unitree's `rt/lowcmd` writer).
+  `OperationalContext` carries `morphology`; `check_invariants` refuses a
+  plan made for another morphology, and `ExecutionRequest::recheck_for` /
+  `steps_without_approval_for` compare the executor's own policy. New
+  examples `config/response-policy.unitree-g1.example.json` (humanoid) and
+  `…unitree-go2.example.json` (quadruped).
+- Control plane: `record_evidence` is accepted in observe mode and while
+  the safety system is engaged, and is catalogued non-reversible (evidence
+  is never reverted); the robot snapshot lists its `morphology` and only
+  the actions not refused for it; `Approval::Single` still reads the old
+  name `analyst`.
+- **Findings contract 2.1.0** (minor): the rule catalog is versioned per
+  minor again. The 1.3 / 2.0 catalogs are restored to exactly what 1.3.0
+  shipped; the low-level joint-frame firewall ids and
+  `robot.motion.api_id_out_of_range` / `control_handover`, which had been
+  added to the 1.3 catalog by mistake, are 2.1 entries. 2.0.x messages
+  keep validating with their own catalog. Schema `$id` `/2.1.0`, aligned
+  with the validator (`log_name` not `.` / `..`, version parts ≤ 9
+  digits). The `robodr-contract-version` / `ocsf-version` headers are the
+  value's own versions. `data_source` is documented as an unauthenticated
+  label (never route tenants by it).
+- **Upgrade path for contract 1.x findings in flight**
+  (`robodr_ocsf::upgrade`): unsigned 1.x findings are upgraded to 2.0.0
+  (same identity) by `robodr-spool-export`, `robodr-diode-unpack` and
+  `robodr-kafka-publish` (`--upgrade-data-source`, `--upgrade-topic`);
+  signed ones are kept with "legacy 1.x signed record: re-sign required";
+  an intact 1.x diode batch that cannot be upgraded is quarantined
+  (`legacy_not_convertible`) and the unit's chain advances past it instead
+  of holding the next batch as a gap. Drain spool / outbox / importer
+  output before upgrading (`docs/OPERATIONS.md` §7).
+
+- Motion Firewall joint channels (breaking for joint configs): `rate`
+  (with `min_interval_ns > 0`) is required; `max_age_ns` /
+  `max_future_ns` are capped at 10 s; a humanoid joint channel refuses
+  `fault_policy: fail_open` (and a fault always holds there), needs
+  `max_dq_step` on every enabled slot and a non-zero `kp_min` or `kd_min`
+  unless the slot sets `allow_limp: true`. An accepted future-stamped frame
+  advances the out-of-order watermark only to `now`. The G1 example gives
+  the arms non-zero gain minimums and pins `mode_pr`; both Unitree examples
+  set step bounds.
+
+- **Findings contract 2.0 (`robodr.findings`)**, superseding
+  `robot-edr.findings` 1.3: vendor-neutral envelope; `data_source` is a
+  deployment label (default `robodr`, was the constant `robot_edr`); the
+  topic is configurable (default `robodr.findings`, was fixed
+  `robot-edr.findings`) and named in `ocsf.metadata.log_name`; schema
+  `$id` `https://schemas.singularityrd.com/robodr/findings/2.0.0`
+  (`docs/contracts/robodr-finding.schema.json`, contract
+  `docs/contracts/robodr.findings.md`). The OCSF 1.1 Detection Finding
+  body, identity, SR-TAINT and signatures are unchanged. 1.x messages are
+  parse-only (validated, never emitted, packed or published).
+  `KAFKA_TOPIC` / `DATA_SOURCE` → `DEFAULT_TOPIC` / `DEFAULT_DATA_SOURCE`
+  (+ `legacy_v1`); `Record::topic` is a `String` derived from the value.
+- `robodr-kafka-publish` no longer refuses records for other topics: the
+  record topic must match its value, 1.x is refused, and records are sent
+  to `--topic` (relabelled ones counted as `topic_overridden`). The diode
+  manifest check is a contract-version check (2.x) instead of "1.x only";
+  the spool exporter checks the topic against the value.
+- The old `autosecops2`-specific integration (its Kafka consumer and
+  `core/integrations/robot_edr/` client; cancelled — the GA SOC is
+  SingularityRD/AutoSecOps1, see `docs/GA-ROADMAP.md`) is removed from
+  code and docs: contracts are vendor-neutral
+  (`docs/contracts/robodr.findings.md`,
+  `docs/contracts/robodr.control-plane.md`); the 1.x contract texts moved
+  to `docs/contracts/legacy/` marked superseded; examples use a generic
+  SOC (`soc:<id>`, `/etc/robodr/soc/soc.pub`); code comments no longer
+  cite an out-of-repo design document.
+- Stale documentation fixed: README Pulsar crate status, SPRINTS header,
+  release signing in BUILD.md, agentd exporter note, Sprint 9 black-box
+  key note, real-capture notes in the pipeline and commissioning READMEs.
 
 - **Security (`robodr-blackbox`)**: Ed25519 now uses the audited
   `ed25519-dalek` 2.x crate (`curve25519-dalek` 4, `zeroize`; SHA-512 from
@@ -397,6 +1480,170 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Fixed
 
+- `robodr-focal`: `robodr-deliverd` could not start, because
+  `robodr-load-credential` refused to hand its black-box key to `root`
+  (the unit's `User=`). The helper now allows `root` for
+  `robodr-deliverd.service` only (explicit allow-list `root_units`); every
+  other unit still refuses `root`, and the path, symlink, mode and
+  directory checks are unchanged. `scripts/check-focal-units.py` checks
+  that the allow-list names exactly the focal units that load credentials
+  for root; new `scripts/test-load-credential.sh` (CI `scripts` job, as
+  root on a copy of the helper rooted in a temporary directory) covers
+  the exception, the refusals and the existing checks
+  (`docs/OPERATIONS.md` §11.5).
+- `--version` (prints `<name> <version>`) and `--help` (usage on stdout)
+  exit 0 on `robodr-anchor-receiver`, `robodr-blackbox`,
+  `robodr-diode-pack`, `robodr-diode-unpack`, `robodr-kafka-publish`,
+  `robodr-replay`, `robodr-spool-export` and `robodr-firewall-gw` (they
+  exited 2; `robodr-replay --help` printed to stderr). Usage errors still
+  exit 2. `scripts/release-dry-run.sh` now runs `deb-install-smoke.sh
+  --strict`, so a shipped binary without them fails the dry run.
+- `robodr-agentd` with `capture.pcap_replay`: replayed packets are judged on
+  the capture's own timeline (each record's timestamp, offset onto the
+  daemon clock at the first packet, never going back) instead of the time
+  the daemon handled them. The file is read as fast as possible, so the
+  motion monitor's latency / persistence windows, the firewall's rate
+  checks, correlation windows and the pipeline's discovery expiry judged a
+  replay by host load (`real_captures_lab` raised an extra
+  `robot.motion.feedback_divergence` on the Cyclone DDS Gazebo rogue run
+  under load). On the true timeline the Fast DDS rogue run reports one
+  Medium under-motion divergence and the Cyclone DDS run none, on every
+  run. Live capture is unchanged (handling time). New
+  `robodr_agent::Agent::handle_with_joint_at` (explicit detection time) and
+  `robodr_ros2_pipeline::Pipeline::process_datagram_with_motion_at`.
+- `robodr-diode` state lock and `robodr-uplink` state lock: a lock
+  that looks held only because a child forked by another thread still has
+  the descriptor (until it execs) is retried for up to 25 x 10 ms before it
+  is reported held, like the black box's recorder lock; a lock held by
+  another live process is still refused.
+- `robodr-agentd` unix sockets (event input, safety feed, host threats,
+  control plane) are no longer briefly connectable with the umask's
+  permissions between `bind` and `chmod`: each is bound in a fresh 0700
+  directory, given its final mode there and hard-linked into place.
+- Control-plane HTTP: whether a head ending at the 8 KiB bound was accepted
+  depended on how the peer's bytes were split into reads; the bound is now
+  exact and independent of read sizes (linear delimiter search). Answers
+  have one total write deadline (30 s), so a slow reader cannot hold a
+  connection slot for long.
+- `robodr-uplink` HTTP client: a response-head line of exactly the
+  remaining budget + 1 bytes underflowed the budget (panic in debug builds,
+  a wrapped budget in release builds); the chunk length is added with
+  `checked_add`.
+- Dead-letter files (`robodr-uplink`, `robodr-kafka-publish`): a line torn
+  by a crash is closed before the next append (it used to swallow the next
+  entry, which deduplication then lost); a failed write is truncated back;
+  the directory is fsynced when the file is created; malformed lines are
+  counted and reported (`dead_letter_malformed`) instead of skipped
+  silently.
+
+- Unitree live integration, independent review (regression test for each):
+  - **Legacy UDP sender check (H1).** A compressed 614-byte Go1 `LowCmd`
+    (how every real Go1 low-level command is sent) from an unlisted host
+    now raises `robot.unitree.legacy_unknown_sender` (Critical) before it
+    is reported as not inspected; the check runs on the class the payload
+    length announces. Unlisted-sender findings have their own per-class
+    budget outside the shared rate limiter (an `undecodable_sample` flood
+    cannot suppress them).
+  - **Spoofed-source floods (M3).** Beyond 16 unlisted senders per class
+    the findings are aggregated into `robot.unitree.legacy_sender_flood`
+    (Critical for commands) with frame counts at 1, 2, 4, 8, ... frames;
+    memory stays bounded. `unitree_legacy.command_senders` entries may be
+    tables `{ip, mac?, label?}`: a command from a MAC-bound sender with
+    another link-layer source (or reassembled from IP fragments) is
+    `robot.unitree.legacy_sender_mac_mismatch` (High) and not attributed.
+    `RtpsPacket::src_mac` / `LegacyUdp::src_mac` carry the source MAC
+    (Ethernet, Linux cooked capture, `AF_PACKET` `sll_addr`). A MAC can be
+    forged on the same L2 segment too: the binding raises the bar only.
+  - **RTPS on a legacy port (H2).** A datagram on a configured legacy port
+    is always delivered as legacy (`PacketKind::UnitreeLegacy`); one that
+    is also RTPS (`RtpsPacket::also_rtps`, `CaptureStats::rtps_on_legacy_port`)
+    is inspected on both paths with `robot.unitree.legacy_port_rtps`
+    (High) (`Pipeline::process_legacy_from_at`). The sensor configuration
+    refuses legacy ports inside the RTPS port range of a configured DDS
+    domain (e.g. domain 2 covers 8007 / 8080 / 8082 / 8090).
+  - **Command type names (M4).** The profile records the announced type of
+    each motion channel (`Profile::motion_types`, optional key, written by
+    `robodr-commission learn` where every writer agreed); a writer on a
+    profiled command channel announcing another type, an unknown type or a
+    feedback type is `robot.motion.command_type_mismatch` (High, at the
+    announcement) instead of only a rate-limited Medium per sample.
+  - **Firewall channel kind (M1).** `FirewallSettings::from_profile` takes a
+    channel's kind from the recorded type (`robodr_agent::channel_kind`,
+    `kind_of_type`), not from learned zeros: a twist channel whose learned
+    `max_linear_speed` is 0 no longer becomes a joint channel (an alarm
+    storm of `rejected_kind_mismatch`). Without a type an ambiguous
+    envelope (`max_linear_speed: 0` plus a `max_joint_speed`) is refused
+    with a clear message; `FirewallSettings::warnings` says when the type
+    had to decide.
+  - **Morphology without `robot_model` (M2).** A 35-slot (`unitree_hg`)
+    joint channel requires a humanoid firewall platform and policy (every
+    hg model is a humanoid); a profile with `/lowcmd`, `/arm_sdk`,
+    `/user_lowcmd` or `/api/*` channels and no `robot.robot_model` is
+    warned about; slot counts are checked by the recorded `LowCmd_` type
+    for any channel name; a legacy channel is refused as a `joint_config`
+    channel (legacy frames carry no writer identity the firewall could
+    authorise). Decoded legacy `LowCmd` frames now carry their 20-slot
+    joint frame.
+  - **Response-policy overrides (M6).** The shipped policies overrode
+    `robot.host.unexpected_egress` and `robot.motion.unexpected_source`,
+    which nothing emits. Host detections all arrive as
+    `robot.host.pulsar_threat` (an override cannot single out one Pulsar
+    rule), so the egress override is removed; the source override now
+    names `robot.motion.sample_source_mismatch`. A test checks every
+    override in `config/*.json` against the OCSF catalog.
+  - **Capture.** 802.1Q / 802.1ad frames whose inner tag the kernel left
+    in place are no longer dropped by `AF_PACKET` as non-IP: the source
+    hands each frame on behind a synthesized Linux cooked header
+    (`LinkType::LINUX_SLL`, keeping `sll_addr`), the kernel BPF accepts
+    tagged frames via `SKF_AD_PROTOCOL` and user space follows up to two
+    tags (`BpfProgram::run_with_protocol` for tests). The `AF_PACKET`
+    docs now say that a sensor box with a promiscuous capture NIC sees
+    other hosts' mirrored traffic.
+  - **Examples.** Go2-W, H1, H2 and R1 profile examples carry
+    `/api/motion_switcher/request`; the sensor-box example's command
+    sender is a labelled example operator PC (192.168.123.162), not a Go1
+    internal computer; the `/arm_sdk` joint-firewall warning says to leave
+    the channel out of `joint_config` (the profile envelope still checks
+    torque, kp and step on every slot).
+  - New rule ids (contract 2.1 OCSF catalog, correlation catalog):
+    `robot.unitree.legacy_sender_flood`,
+    `robot.unitree.legacy_sender_mac_mismatch`,
+    `robot.unitree.legacy_port_rtps`, `robot.motion.command_type_mismatch`.
+
+- Unitree decoders (`robodr-cdr`), review of the initial implementation:
+  joint command frames are evaluated over **every** slot whatever the mode
+  octet (`rt/arm_sdk` sends `mode = 0` and still moves the arms; a
+  non-finite field in any slot poisons the frame); torque-only and
+  position-gain commands are no longer "speed 0" — `MotionCommand` gains
+  `joint_torque`, `joint_kp`, `joint_position_step` (filled by the ROS 2
+  pipeline and the commissioning pcap reader from the previous frame on the
+  channel) and `command_class` / `command_name`, the profile envelope gains
+  optional `max_joint_torque`, `max_joint_kp`, `max_joint_position_step`
+  (checked as `robot.motion.joint_over_envelope`; absent → a command using
+  the term is `robot.motion.unverifiable_command`, Medium), and
+  `robodr-commission` learns, caps (`--hard-cap-torque`, `--hard-cap-kp`,
+  `--hard-cap-position-step`), locks, merges and diffs them; API calls are
+  dispatched on the low 32 bits of `api_id` as the SDK server does, and an
+  id outside `int32` is the new High finding
+  `robot.motion.api_id_out_of_range`; API tricks / trajectories / unknown /
+  malformed motion calls are `robot.motion.unverifiable_command` and
+  control handovers the new `robot.motion.control_handover` (High); new
+  velocity services Go2 `obstacles_avoid` `Move` and G1 `agv` `Move`, plus
+  `robot_state` / `uwbswitch` handovers, R1 `SetArmTask` and the
+  Python-only FSM ids; new decoders `unitree_go` `MotorCmds_`
+  (`rt/hand_sdk`) and standalone `unitree_hg` `MotorCmd_` / `MotorState_`
+  (`rt/waistpitch*`), `rt/user_lowcmd` in the model table, Dex3 mode
+  bitfield (`Dex3Mode`); the API `parameter` / `data` strings are capped at
+  the 16 KiB JSON cap and may be top-level JSON arrays (B2
+  `TrajectoryFollow`); the Unitree types are `@final`, so a `D_CDR2`
+  header no longer makes the decoder expect struct DHEADERs; `crc_ok` is
+  documented as advisory (C++ padding can be indeterminate); legacy
+  `HighCmd` / `LowCmd` map to `MotionCommand` and `LegacyCrcMode::EncryptCrc`
+  is supported; CRC tests use independent vectors; the fuzz harness runs
+  with the default limits too. The README states the exact coverage
+  (published IDL + independent vectors; not yet verified on robot
+  captures).
+
 - `robot.motion.unattributed_sample` (High) on a legitimate writer whose
   DATA reached a remote reader before its own SEDP announcement (Fast DDS
   Gazebo bridge `/odom`, 47 ms): an unannounced writer is now reported only
@@ -468,6 +1715,39 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 - `robodr-agentd` test `queue_overflow_is_counted_and_reported` was flaky:
   it stopped the daemon before the socket reader had read every line. It
   now waits for `received == 5000` in the status file first.
+
+
+### Security
+
+- Fleet lifecycle and offline bundle, review fixes before the first
+  release that ships them:
+  - `install-bundle.sh install|verify --pubkey --tarball` verifies the
+    tarball (and the release `SHA256SUMS.minisig` when it lies next to it),
+    extracts it into a private `mktemp -d` and installs from there; an
+    extracted bundle directory the script runs from must equal the signed
+    content (a signed tarball next to a modified extraction was accepted
+    before). The package installs `/usr/lib/robodr/install-bundle.sh` as
+    the trusted verifier for upgrades; OPERATIONS 3 now says to verify
+    before extracting.
+  - Downgrades through `install` need `--allow-downgrade`; a per-unit
+    security floor (bundle `security-floor`, ring `min_version`; only
+    rises) is enforced by install and rollback with no override.
+  - `rollback <version>` takes a version, never a path; `--blackbox-dir`
+    refuses glob characters and is no longer word-split.
+  - `robodr-enroll`: the token is refused on argv; the token file must be
+    root-only. Rotations persist a `sent` mark and are cancelled at the SOC
+    instead of being abandoned locally (a lost answer no longer blocks
+    every later rotation). Approvals come from a separate SOC approval key
+    and are valid at most 7 days. SOC key files must be root-owned in a
+    private directory. Files for agentd get owner and mode on the
+    descriptor before the rename, in a directory not writable by others; a
+    damaged installed revocation list is reinstalled. Ring information
+    issued in the future is refused.
+  - Contract `robodr.fleet-api` draft v1 revised (§11): proof of possession
+    of every key at enrollment, SOC-wide key uniqueness, cancel endpoint,
+    authenticating key of uplink rotations (`401 wrong_key`), SOC key
+    rotation and revocation, replay note; vectors regenerated (cases
+    15-17).
 
 ## [0.1.0-alpha.1] - 2026-10-16
 

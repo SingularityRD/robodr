@@ -1,0 +1,23 @@
+# EXAMPLE drop-in for the robodr-focal package (systemd 245), not active as
+# shipped. Same purpose as the regular package's 20-finding-key.conf.example
+# (packaging/systemd/robodr-agentd.service.d/), with
+# /usr/lib/robodr/robodr-load-credential in place of LoadCredential=
+# (systemd 247). To use it:
+#   install -D -m 0644 20-finding-key.conf.example \
+#       /etc/systemd/system/robodr-agentd.service.d/20-finding-key.conf
+#   systemctl daemon-reload && systemctl restart robodr-agentd
+#
+# Hands robodr-agentd its dedicated per-finding signing key (contract §2a,
+# docs/OPERATIONS.md section 6.4): the helper (root, '+' prefix) copies the
+# root-only file to
+#   /run/credentials/robodr-agentd.service/finding.key
+# (0400, owned by robodr), which agentd.json then names:
+#   "finding_signing": { "key_file": "/run/credentials/robodr-agentd.service/finding.key" }
+# The key must be an Ed25519 `robodr-blackbox keygen` secret key file, not the
+# black-box key. If the source file is missing, the helper fails and the unit
+# does not start, so install this drop-in only together with the key.
+# This line runs after the unit's own ExecStartPre= lines (drop-ins append),
+# i.e. after the black-box key was loaded; ExecStopPost= of the unit removes
+# both copies.
+[Service]
+ExecStartPre=+/usr/lib/robodr/robodr-load-credential load robodr-agentd.service robodr-agentd finding.key:/etc/robodr/keys/agentd-finding.key

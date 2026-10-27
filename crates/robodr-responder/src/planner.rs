@@ -8,10 +8,19 @@
 //! 2. per-rule override clamps it into `[min_step, max_step]`;
 //! 3. escalation adds rungs (bounded by `escalation.ceiling` and the override);
 //! 4. hold: never below what this source already earned (no auto de-escalation);
-//! 5. context caps: platform mismatch or engaged safety system → Record only;
+//! 5. context caps: platform or morphology mismatch (policy vs. the
+//!    context the caller built from its own configuration) or engaged
+//!    safety system → Record only;
 //! 6. approval gates: unknown state, human in command, take-off/landing,
 //!    above `auto_max_step`;
-//! 7. build the cumulative action list (Record .. max step);
+//! 7. build the cumulative action list (Record .. max step). On a
+//!    morphology that falls when de-energised (humanoid, unspecified)
+//!    `SafePause` / `RequestSafeState` go to `advisory` instead, the
+//!    substitute containment (`LimitMotion` plus the policy's
+//!    `fall_safe_restrict` targets) always needs approval. On a morphology
+//!    that needs active balance (humanoid, quadruped, unspecified) a
+//!    process is never terminated, a process quarantine needs approval and
+//!    `LimitMotion` never goes below `min_motion_factor`;
 //! 8. observe mode (deviation in [`robodr_events::Mode::Observe`], profile
 //!    unlocked or policy not OEM-validated) → Record only, with the
 //!    would-have plan attached;
@@ -23,8 +32,8 @@ use std::fmt;
 
 use robodr_events::Deviation;
 
-use crate::action::{Rationale, Reason, ResponseAction, ResponsePlan, Step};
-use crate::policy::ResponsePolicy;
+use crate::action::{Rationale, Reason, ResponseAction, ResponsePlan, RestrictTarget, Step};
+use crate::policy::{ResponsePolicy, MIN_MOTION_FACTOR_FLOOR};
 use crate::state::{Connectivity, OperationalContext, SafetyState};
 
 /// Plan once, with no escalation memory. Equivalent to the first deviation a
@@ -112,6 +121,14 @@ pub(crate) fn plan_with(
         step = Step::Record;
         approval = true;
     }
+    if ctx.morphology != policy.morphology {
+        why.push(Reason::MorphologyMismatch {
+            policy: policy.morphology,
+            context: ctx.morphology,
+        });
+        step = Step::Record;
+        approval = true;
+    }
     if state.safety_system_engaged() {
         why.push(Reason::SafetySystemHasAuthority);
         step = Step::Record;
@@ -139,27 +156,54 @@ pub(crate) fn plan_with(
         approval = true;
     }
 
-    // 7. Build the cumulative action list.
+    // 7. Build the cumulative action list. On a morphology that falls when
+    //    de-energised (humanoid), the safe-pause / safe-state part is
+    //    advisory only and the threat is contained with the balance-keeping
+    //    steps instead: limit motion plus the restrict targets the OEM
+    //    validated as balance-safe (`fall_safe_restrict`), always for a
+    //    human to approve (cutting a networked balance loop's writer makes
+    //    the robot fall). On a morphology that needs active balance a
+    //    process is never terminated (it balances while idle) and a process
+    //    quarantine waits for a human (it may be the balance controller).
+    let morphology = policy.morphology;
+    let balance = morphology.needs_active_balance();
+    let no_de_energise = morphology.falls_when_de_energised() && step >= Step::SafePause;
+    let mut contain_targets = targets.to_vec();
+    if no_de_energise {
+        why.push(Reason::DeEnergisingAdvisoryOnly { morphology, step });
+        contain_targets.extend(policy.fall_safe_restrict.iter().copied());
+        approval = true;
+    }
+    let targets = contain_targets.as_slice();
     let mut actions = vec![ResponseAction::Record];
+    let mut advisory = Vec::new();
     if step >= Step::Restrict {
-        let terminate_ok = state.is_idle() && policy.allow_terminate_when_idle;
+        let terminate_ok = state.is_idle() && policy.allow_terminate_when_idle && !balance;
         let mut ts = targets.to_vec();
         ts.sort();
         ts.dedup();
         for t in ts {
+            if balance && t == RestrictTarget::Process {
+                why.push(Reason::ProcessQuarantineNeedsApproval { morphology });
+                approval = true;
+            }
             actions.push(ResponseAction::Restrict {
                 target: t,
-                terminate_process: terminate_ok && t == crate::action::RestrictTarget::Process,
+                terminate_process: terminate_ok && t == RestrictTarget::Process,
             });
         }
     }
     if step >= Step::LimitMotion {
         let f = policy.limit_motion_factor;
-        if f.is_finite() && f > 0.0 && f <= 1.0 {
-            actions.push(ResponseAction::LimitMotion { factor: f });
-        } else {
+        let floor = policy.min_motion_factor.max(MIN_MOTION_FACTOR_FLOOR);
+        if !(f.is_finite() && f > 0.0 && f <= 1.0) {
             why.push(Reason::InvalidLimitFactor);
             approval = true;
+        } else if balance && f < floor {
+            why.push(Reason::MotionFactorBelowFloor { morphology });
+            approval = true;
+        } else {
+            actions.push(ResponseAction::LimitMotion { factor: f });
         }
     }
     for (s, b) in [
@@ -170,10 +214,15 @@ pub(crate) fn plan_with(
             break;
         }
         if b.allowed_for(ctx.platform) {
-            actions.push(match s {
+            let a = match s {
                 Step::SafePause => ResponseAction::SafePause { behaviour: b },
                 _ => ResponseAction::RequestSafeState { behaviour: b },
-            });
+            };
+            if no_de_energise {
+                advisory.push(a);
+            } else {
+                actions.push(a);
+            }
         } else {
             why.push(Reason::InvalidSafeBehaviour { behaviour: b });
             approval = true;
@@ -200,6 +249,8 @@ pub(crate) fn plan_with(
         suppressed: false,
         would_have: None,
         rationale: why,
+        morphology: policy.morphology,
+        advisory,
     };
 
     // 8. Observe mode. The deviation's own mode comes first: a detector that
@@ -223,6 +274,7 @@ pub(crate) fn plan_with(
             observe_only: true,
             would_have: Some(Box::new(plan.clone())),
             rationale,
+            advisory: Vec::new(),
             ..plan
         };
     }
@@ -270,6 +322,27 @@ pub enum Violation {
     /// The deviation was raised in observe mode but the plan is not an
     /// observe-only, Record-only plan.
     ObserveOnlyDeviationActed,
+    /// An executable action that may de-energise actuators
+    /// (`SafePause` / `RequestSafeState`) on a morphology that falls when
+    /// de-energised (humanoid).
+    DeEnergisingOnFallProneMorphology,
+    /// An `advisory` entry that is not a `SafePause` / `RequestSafeState`
+    /// valid for the platform, or advisory entries on an observe-only plan.
+    BadAdvisory,
+    /// The plan acts but was made for another morphology than the one the
+    /// checking component knows (`ctx.morphology`).
+    MorphologyMismatch,
+    /// A process termination on a morphology that needs active balance.
+    TerminateOnBalancingRobot,
+    /// A process quarantine on a morphology that needs active balance,
+    /// without human approval.
+    ProcessQuarantineWithoutApproval,
+    /// A `LimitMotion` factor below [`MIN_MOTION_FACTOR_FLOOR`] on a
+    /// morphology that needs active balance.
+    MotionBelowFloor,
+    /// A substitute containment (non-empty `advisory`) on a morphology that
+    /// falls when de-energised, without human approval.
+    SubstituteWithoutApproval,
 }
 
 impl fmt::Display for Violation {
@@ -334,18 +407,40 @@ pub fn check_invariants(
     {
         return Err(Violation::MotionWithoutApproval);
     }
+    if plan.morphology != ctx.morphology && !only_record {
+        return Err(Violation::MorphologyMismatch);
+    }
+    // Both the plan's and the checker's own morphology count: whichever is
+    // more fall-prone wins.
+    let falls =
+        plan.morphology.falls_when_de_energised() || ctx.morphology.falls_when_de_energised();
+    let balance = plan.morphology.needs_active_balance() || ctx.morphology.needs_active_balance();
     for x in a {
         match *x {
             ResponseAction::Restrict {
                 target,
                 terminate_process: true,
             } => {
-                if target != crate::action::RestrictTarget::Process {
+                if target != RestrictTarget::Process {
                     return Err(Violation::TerminateNonProcess);
                 }
                 if !state.is_idle() {
                     return Err(Violation::TerminateWhileNotIdle);
                 }
+                if balance {
+                    return Err(Violation::TerminateOnBalancingRobot);
+                }
+            }
+            ResponseAction::Restrict {
+                target: RestrictTarget::Process,
+                ..
+            } if balance && !plan.requires_human_approval => {
+                return Err(Violation::ProcessQuarantineWithoutApproval);
+            }
+            ResponseAction::LimitMotion { factor }
+                if balance && factor.is_finite() && factor < MIN_MOTION_FACTOR_FLOOR =>
+            {
+                return Err(Violation::MotionBelowFloor);
             }
             ResponseAction::LimitMotion { factor }
                 if !(factor.is_finite() && factor > 0.0 && factor <= 1.0) =>
@@ -359,6 +454,26 @@ pub fn check_invariants(
                 return Err(Violation::SafeBehaviourInvalidForPlatform);
             }
             _ => {}
+        }
+    }
+    if falls
+        && a.iter()
+            .any(|x| crate::actions::for_action(x).may_de_energise())
+    {
+        return Err(Violation::DeEnergisingOnFallProneMorphology);
+    }
+    if falls && !plan.advisory.is_empty() && !plan.requires_human_approval {
+        return Err(Violation::SubstituteWithoutApproval);
+    }
+    if plan.observe_only && !plan.advisory.is_empty() {
+        return Err(Violation::BadAdvisory);
+    }
+    for x in &plan.advisory {
+        match *x {
+            ResponseAction::SafePause { behaviour }
+            | ResponseAction::RequestSafeState { behaviour }
+                if behaviour.allowed_for(ctx.platform) => {}
+            _ => return Err(Violation::BadAdvisory),
         }
     }
     if let Some(w) = &plan.would_have {

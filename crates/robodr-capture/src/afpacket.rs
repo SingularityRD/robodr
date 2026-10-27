@@ -4,19 +4,35 @@
 //! attaches a classic BPF program ([`crate::bpf`]) with `SO_ATTACH_FILTER`,
 //! and only *then* binds to `ETH_P_ALL` on one interface or on all of them —
 //! so no unfiltered packet is ever queued. `SOCK_DGRAM` means the kernel
-//! strips the link-layer header and frames arrive as raw IP
-//! ([`LinkType::RAW`]), identical for Ethernet, VLAN-offloaded NICs, Wi-Fi,
-//! tunnels and loopback.
+//! strips the link-layer header (identical for Ethernet, VLAN-offloaded
+//! NICs, Wi-Fi, tunnels and loopback); each frame is handed on behind a
+//! Linux cooked-capture (SLL v1, [`LinkType::LINUX_SLL`]) header built from
+//! the `sockaddr_ll` the kernel fills in, so the link-layer **source MAC**
+//! (`sll_addr`) and the protocol travel with it.
 //!
 //! # Read-only guarantee
 //! The only libc symbols declared are `socket`, `bind`, `setsockopt`,
 //! `getsockopt`, `recvfrom`, `if_nametoindex` and `if_indextoname`; the
 //! descriptor is closed by [`OwnedFd`]. There is no `send`, `sendto`, `write` or `PACKET_TX_RING` in
-//! this crate, so it cannot inject. The socket does not enable promiscuous
-//! mode, so it sees what this host sends and receives (plus broadcast and
-//! subscribed multicast) — exactly the robot's own DDS traffic. Watching a
-//! SPAN/TAP port on a separate sensor box would need promiscuous mode, which
-//! is deliberately not implemented here.
+//! this crate, so it cannot inject. The socket itself never enables
+//! promiscuous mode (no `PACKET_ADD_MEMBERSHIP`). On the robot it therefore
+//! sees what this host sends and receives (plus broadcast and subscribed
+//! multicast) — the robot's own traffic. On a **sensor box** watching a
+//! SPAN / mirror port or a passive tap, the capture NIC is put in
+//! promiscuous mode by the operating system (the packaged systemd-networkd
+//! example does this), and the socket then also sees the mirrored traffic
+//! of **other hosts** (operator PCs, the robot's other computers). Source
+//! addresses there are as forgeable as anywhere on the LAN.
+//!
+//! # VLAN tags
+//! The kernel strips the outer 802.1Q / 802.1ad tag of a received frame
+//! (hardware offload or `skb_vlan_untag`) before the socket sees it, so a
+//! single-tagged frame arrives as plain IP. The inner tag of a
+//! double-tagged (QinQ) frame stays in the data, with the tag protocol in
+//! `sll_protocol`; such frames are kept (the kernel filter accepts them,
+//! [`crate::bpf`]) and the decoder follows up to two tags
+//! ([`crate::decode`]). Frames of any other non-IP protocol are skipped
+//! (`skipped_non_ip`).
 //!
 //! # Privileges
 //! Opening the socket needs `CAP_NET_RAW` (root has it). Grant it to the
@@ -126,6 +142,29 @@ const IF_NAMESIZE: usize = 16;
 /// Receive buffer: larger than any IP packet (64 KiB) incl. loopback GSO.
 const RECV_BUF: usize = 1 << 18;
 
+/// Length of the synthesized Linux cooked-capture (SLL v1) header in front
+/// of each frame.
+const SLL_HDR_LEN: usize = 16;
+
+/// The protocols handed on: IPv4, IPv6, and the VLAN tag protocols (a frame
+/// that still carries its inner tag; the decoder follows it).
+fn delivered_protocol(proto: u16) -> bool {
+    proto == ETH_P_IP || proto == ETH_P_IPV6 || crate::bpf::VLAN_TPIDS.contains(&proto)
+}
+
+/// A Linux cooked-capture v1 header (`pkttype(2) hatype(2) halen(2)
+/// addr(8) protocol(2)`, big-endian) for a frame received with `addr`.
+fn cooked_header(addr: &SockaddrLl) -> [u8; SLL_HDR_LEN] {
+    let mut h = [0u8; SLL_HDR_LEN];
+    h[0..2].copy_from_slice(&u16::from(addr.pkttype).to_be_bytes());
+    h[2..4].copy_from_slice(&addr.hatype.to_be_bytes());
+    h[4..6].copy_from_slice(&u16::from(addr.halen.min(8)).to_be_bytes());
+    h[6..14].copy_from_slice(&addr.addr);
+    // `sll_protocol` is already in network byte order.
+    h[14..16].copy_from_slice(&u16::from_be(addr.protocol).to_be_bytes());
+    h
+}
+
 /// `struct sockaddr_ll`.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
@@ -176,6 +215,7 @@ fn cvt(ret: c_int) -> io::Result<c_int> {
 
 /// `setsockopt` with a `#[repr(C)]` value. Private: only called with the
 /// option structs above.
+#[allow(unsafe_code)] // setsockopt(2) FFI
 fn setsockopt<T>(fd: &OwnedFd, level: c_int, name: c_int, val: &T) -> io::Result<()> {
     // SAFETY: `val` is a valid, initialised `T` borrowed for the duration of
     // the call, and we pass its exact size; the kernel only reads that many
@@ -194,6 +234,7 @@ fn setsockopt<T>(fd: &OwnedFd, level: c_int, name: c_int, val: &T) -> io::Result
 }
 
 /// Resolve an interface name to its index.
+#[allow(unsafe_code)] // if_nametoindex(3) FFI
 pub fn interface_index(name: &str) -> Result<u32, CaptureError> {
     let c = CString::new(name)
         .map_err(|_| CaptureError::Unsupported(format!("interface name {name:?} contains NUL")))?;
@@ -210,6 +251,7 @@ pub fn interface_index(name: &str) -> Result<u32, CaptureError> {
 
 /// Resolve an interface index to its name (`None` if there is no such
 /// interface, e.g. it was removed).
+#[allow(unsafe_code)] // if_indextoname(3) FFI
 pub fn interface_name(index: u32) -> Option<String> {
     if index == 0 {
         return None;
@@ -284,6 +326,7 @@ pub struct AfPacketSource {
 
 impl AfPacketSource {
     /// Open the socket. Needs `CAP_NET_RAW`.
+    #[allow(unsafe_code)] // socket(2) FFI, fd ownership, bind(2)
     pub fn open(cfg: &AfPacketConfig) -> Result<Self, CaptureError> {
         let ifindexes = cfg
             .interfaces
@@ -359,7 +402,7 @@ impl AfPacketSource {
 
         Ok(Self {
             fd,
-            buf: vec![0; RECV_BUF],
+            buf: vec![0; SLL_HDR_LEN + RECV_BUF],
             ifindexes,
             filter_attached,
             filter_error,
@@ -384,6 +427,7 @@ impl AfPacketSource {
 
     /// Kernel counters `(packets, drops)` since the previous call (reading
     /// resets them). Drops mean the sensor fell behind.
+    #[allow(unsafe_code)] // getsockopt(2) FFI
     pub fn kernel_stats(&self) -> Result<(u32, u32), CaptureError> {
         let mut st = TpacketStats::default();
         let mut len = size_of::<TpacketStats>() as u32;
@@ -403,20 +447,23 @@ impl AfPacketSource {
 }
 
 impl PacketSource for AfPacketSource {
+    #[allow(unsafe_code)] // recvfrom(2) FFI
     fn next_packet(&mut self) -> Result<Option<Packet<'_>>, CaptureError> {
         let (len, addr) = loop {
             let mut addr = SockaddrLl::default();
             let mut alen = size_of::<SockaddrLl>() as u32;
-            // SAFETY: `buf` is valid writable memory of `buf.len()` bytes;
+            let room = &mut self.buf[SLL_HDR_LEN..];
+            // SAFETY: `room` (the buffer behind the cooked header) is valid
+            // writable memory of `room.len()` bytes;
             // `addr`/`alen` are valid for writes and `alen` holds the size of
             // `addr`, so the kernel writes within bounds. With MSG_TRUNC the
-            // return value may exceed `buf.len()` but nothing beyond the
+            // return value may exceed `room.len()` but nothing beyond the
             // buffer is written. `fd` is an open socket we own.
             let n = unsafe {
                 sys::recvfrom(
                     self.fd.as_raw_fd(),
-                    self.buf.as_mut_ptr().cast::<c_void>(),
-                    self.buf.len(),
+                    room.as_mut_ptr().cast::<c_void>(),
+                    room.len(),
                     MSG_TRUNC,
                     (&mut addr as *mut SockaddrLl).cast::<c_void>(),
                     &mut alen,
@@ -434,7 +481,7 @@ impl PacketSource for AfPacketSource {
             }
             self.stats.received += 1;
             let proto = u16::from_be(addr.protocol);
-            if proto != ETH_P_IP && proto != ETH_P_IPV6 {
+            if !delivered_protocol(proto) {
                 self.stats.skipped_non_ip += 1;
                 continue;
             }
@@ -448,9 +495,10 @@ impl PacketSource for AfPacketSource {
             }
             break (n as usize, addr);
         };
-        if len > self.buf.len() {
+        if len > self.buf.len() - SLL_HDR_LEN {
             self.stats.truncated += 1;
         }
+        self.buf[..SLL_HDR_LEN].copy_from_slice(&cooked_header(&addr));
         self.stats.delivered += 1;
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -467,9 +515,9 @@ impl PacketSource for AfPacketSource {
         let name = self.names.get(&addr.ifindex).and_then(|n| n.as_deref());
         Ok(Some(Packet {
             ts,
-            linktype: LinkType::RAW,
-            data: &self.buf[..len.min(self.buf.len())],
-            orig_len: u32::try_from(len).unwrap_or(u32::MAX),
+            linktype: LinkType::LINUX_SLL,
+            data: &self.buf[..SLL_HDR_LEN.saturating_add(len).min(self.buf.len())],
+            orig_len: u32::try_from(SLL_HDR_LEN.saturating_add(len)).unwrap_or(u32::MAX),
             ingress: PacketIngress {
                 ifindex,
                 name,
@@ -506,6 +554,44 @@ mod tests {
             }
             Err(e) => panic!("unexpected error opening AF_PACKET: {e}"),
         }
+    }
+
+    /// A frame as `recvfrom` returns it (`SOCK_DGRAM`: link header
+    /// stripped) is handed on behind a synthesized Linux cooked (SLL v1)
+    /// header built from its `sockaddr_ll`: the source MAC (`sll_addr`)
+    /// survives, and a frame whose remaining (inner) 802.1Q tag the kernel
+    /// did not strip (`sll_protocol` 0x8100 / 0x88a8) decodes instead of
+    /// being dropped as "not IP".
+    #[test]
+    fn cooked_header_keeps_mac_and_vlan() {
+        use crate::decode::{decode_udp, LinkType};
+        let s4 = std::net::Ipv4Addr::new(192, 168, 123, 162);
+        let d4 = std::net::Ipv4Addr::new(192, 168, 123, 10);
+        let ip = crate::synth::ipv4_udp(s4, d4, 8080, 8007, &[0x5a; 614]);
+        let mut tagged = vec![0x00, 20];
+        tagged.extend_from_slice(&ETH_P_IP.to_be_bytes());
+        tagged.extend_from_slice(&ip);
+        for (proto, data) in [(ETH_P_IP, &ip), (0x8100, &tagged), (0x88a8, &tagged)] {
+            assert!(delivered_protocol(proto), "{proto:#06x}");
+            let addr = SockaddrLl {
+                family: AF_PACKET as u16,
+                protocol: proto.to_be(),
+                ifindex: 3,
+                hatype: 1,
+                pkttype: 0,
+                halen: 6,
+                addr: [0x02, 0, 0, 0, 0, 0x62, 0, 0],
+            };
+            let mut frame = cooked_header(&addr).to_vec();
+            frame.extend_from_slice(data);
+            let u = decode_udp(LinkType::LINUX_SLL, &frame).unwrap();
+            assert_eq!((u.src_port, u.dst_port, u.payload.len()), (8080, 8007, 614));
+            assert_eq!(
+                crate::decode::link_src_mac(LinkType::LINUX_SLL, &frame),
+                Some([0x02, 0, 0, 0, 0, 0x62])
+            );
+        }
+        assert!(!delivered_protocol(0x0806), "ARP");
     }
 
     #[test]

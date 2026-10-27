@@ -1,1 +1,15 @@
 Cargo.lock merge=binary
+# Contract test vectors are compared byte for byte (crates/robodr-export/
+# tests/ingest_vectors.rs) and include CRLF, an invalid UTF-8 byte and
+# no-final-LF bodies on purpose: never convert line endings.
+docs/contracts/fixtures/ingest/** -text
+docs/contracts/fixtures/ingest/**/*.body binary
+# Control-plane v2 vectors (crates/robodr-agentd/tests/control_plane_vectors.rs):
+# raw HTTP requests with CRLF, binary bundles, chunks and segments.
+docs/contracts/fixtures/control-plane-v2/** -text
+docs/contracts/fixtures/control-plane-v2/**/*.http binary
+docs/contracts/fixtures/control-plane-v2/**/*.bin binary
+docs/contracts/fixtures/control-plane-v2/**/*.rbb binary
+docs/contracts/fixtures/control-plane-v2/**/*.rbbx binary
+# The control-plane fuzz seeds are raw HTTP (CRLF).
+fuzz/corpus/control_plane_request/** binary

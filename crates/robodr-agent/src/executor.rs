@@ -25,14 +25,29 @@
 //!    (DDS/host enforcement, the Motion Firewall gateway, the mission
 //!    executive, the safety controller) through an abstract interface. An
 //!    executor never writes actuator commands, never commands motion, and
-//!    never overrides the e-stop or the platform's command authority.
+//!    never overrides the e-stop or the platform's command authority;
+//! 7. compare the robot's morphology **from its own response policy** with
+//!    the plan's and the request context's, and act on nothing if they
+//!    differ ([`ExecutionRequest::recheck_for`],
+//!    [`ExecutionRequest::steps_without_approval_for`]). A plan's own
+//!    `morphology` field is never trusted alone: a plan made (or relabelled)
+//!    for a wheeled robot must not reach a humanoid. On a robot that falls
+//!    when de-energised (humanoid) an executor never executes `advisory`
+//!    actions, and never executes a substitute containment without a
+//!    human's approval; on one that needs active balance (humanoid,
+//!    quadruped) it never terminates a process and never quarantines one
+//!    without approval (see `robodr_responder::Morphology`).
 //!
-//! [`ExecutionRequest::steps_without_approval_at`] encodes rules 1-5 for the
-//! steps a real executor may request without a human: it re-derives the
-//! disposition from the plan (a mislabelled request offers nothing), re-runs
-//! the invariants, refuses replays, and refuses when the *current* safety
-//! state differs from the one the plan was made for or the safety system is
-//! engaged (the plan must then be re-made, not reused).
+//! [`ExecutionRequest::steps_without_approval_for`] encodes rules 1-5 and 7
+//! for the steps a real executor may request without a human: it re-derives
+//! the disposition from the plan (a mislabelled request offers nothing),
+//! re-runs the invariants against the executor's own morphology, refuses
+//! replays, and refuses when the *current* safety state differs from the one
+//! the plan was made for or the safety system is engaged (the plan must then
+//! be re-made, not reused). [`ExecutionRequest::steps_without_approval_at`]
+//! is the same without the executor's own morphology (it checks the plan
+//! against the request context only); a real executor must use the `_for`
+//! form.
 //!
 //! Executors run synchronously inside [`crate::Agent::handle`]: a slow
 //! executor slows detection (natural backpressure, nothing queues without
@@ -43,7 +58,7 @@ use std::io::Write;
 
 use robodr_ocsf::BlackBoxRef;
 use robodr_responder::{
-    check_invariants, OperationalContext, ResponsePlan, SafetyState, Step, Violation,
+    check_invariants, Morphology, OperationalContext, ResponsePlan, SafetyState, Step, Violation,
 };
 
 use crate::outcome::Disposition;
@@ -67,9 +82,27 @@ pub struct ExecutionRequest<'a> {
 }
 
 impl ExecutionRequest<'_> {
-    /// The mandatory re-check (see module docs).
+    /// The re-check against the request context only (see module docs; a
+    /// real executor uses [`recheck_for`](Self::recheck_for)).
     pub fn recheck(&self) -> Result<(), Violation> {
         check_invariants(self.plan, self.safety_state, self.context)
+    }
+
+    /// The mandatory re-check (rules 1 and 7): the invariants hold for the
+    /// request context **and** for the same context with the robot's
+    /// morphology as the executor's own policy declares it (`own`), and the
+    /// request context's morphology is `own`. Any mismatch is
+    /// [`Violation::MorphologyMismatch`].
+    pub fn recheck_for(&self, own: Morphology) -> Result<(), Violation> {
+        if self.context.morphology != own || self.plan.morphology != own {
+            return Err(Violation::MorphologyMismatch);
+        }
+        self.recheck()?;
+        let mine = OperationalContext {
+            morphology: own,
+            ..*self.context
+        };
+        check_invariants(self.plan, self.safety_state, &mine)
     }
 
     /// Steps an executor could request without a human, if the safety
@@ -87,6 +120,21 @@ impl ExecutionRequest<'_> {
     /// the state the plan was made for; the safety system is not engaged.
     /// `Record` is excluded (already done).
     pub fn steps_without_approval_at(&self, current: SafetyState) -> Vec<Step> {
+        self.offer(current, None)
+    }
+
+    /// What a real executor may request right now without a human: as
+    /// [`steps_without_approval_at`](Self::steps_without_approval_at), and
+    /// empty unless [`recheck_for`](Self::recheck_for) passes with the
+    /// robot's morphology from the executor's **own** policy (`own`).
+    pub fn steps_without_approval_for(&self, current: SafetyState, own: Morphology) -> Vec<Step> {
+        self.offer(current, Some(own))
+    }
+
+    fn offer(&self, current: SafetyState, own: Option<Morphology>) -> Vec<Step> {
+        if own.is_some_and(|m| self.recheck_for(m).is_err()) {
+            return Vec::new();
+        }
         if self.replay
             || self.disposition != Disposition::Eligible
             || Disposition::of(self.plan) != Disposition::Eligible
@@ -195,6 +243,7 @@ mod tests {
     fn ctx(locked: bool) -> OperationalContext {
         OperationalContext {
             platform: PlatformFamily::Ugv,
+            morphology: Morphology::WheeledMobile,
             phase: MissionPhase::Transit,
             connectivity: Connectivity::Connected,
             control: ControlMode::Autonomous,
@@ -207,6 +256,7 @@ mod tests {
     fn logging_executor_describes_without_acting() {
         let mut pol = ResponsePolicy::conservative_default(PlatformFamily::Ugv);
         pol.oem_validated = true;
+        pol.morphology = Morphology::WheeledMobile;
         let c = ctx(true);
         let dev = Deviation::new("robot.x", Severity::High, "d");
         let plan = plan_stateless(&pol, &dev, "s", SafetyState::MovingSlow, &c);
@@ -246,7 +296,8 @@ mod tests {
 
     #[test]
     fn observe_only_offers_nothing() {
-        let pol = ResponsePolicy::conservative_default(PlatformFamily::Ugv);
+        let mut pol = ResponsePolicy::conservative_default(PlatformFamily::Ugv);
+        pol.morphology = Morphology::WheeledMobile;
         let c = ctx(false);
         let dev = Deviation::new("robot.x", Severity::Critical, "d");
         let plan = plan_stateless(&pol, &dev, "s", SafetyState::MovingFast, &c);
@@ -268,6 +319,7 @@ mod tests {
     fn eligible_plan(c: &OperationalContext) -> ResponsePlan {
         let mut pol = ResponsePolicy::conservative_default(PlatformFamily::Ugv);
         pol.oem_validated = true;
+        pol.morphology = Morphology::WheeledMobile;
         let dev = Deviation::new("robot.x", Severity::High, "d");
         plan_stateless(&pol, &dev, "s", SafetyState::MovingSlow, c)
     }
@@ -353,6 +405,7 @@ mod tests {
         let c = ctx(true);
         let mut pol = ResponsePolicy::conservative_default(PlatformFamily::Ugv);
         pol.oem_validated = true;
+        pol.morphology = Morphology::WheeledMobile;
         for sev in [
             Severity::Low,
             Severity::Medium,
@@ -368,5 +421,49 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn executor_compares_its_own_morphology() {
+        // M4: the plan and its request context say wheeled; an executor
+        // whose own policy says humanoid is offered nothing and its
+        // re-check fails, whatever the plan claims about itself.
+        let c = ctx(true);
+        let plan = eligible_plan(&c);
+        let req = ExecutionRequest {
+            plan: &plan,
+            disposition: Disposition::of(&plan),
+            safety_state: SafetyState::MovingSlow,
+            context: &c,
+            evidence: &[],
+            finding_id: None,
+            replay: false,
+        };
+        assert_eq!(
+            req.steps_without_approval_for(SafetyState::MovingSlow, Morphology::WheeledMobile),
+            vec![Step::Restrict, Step::LimitMotion]
+        );
+        assert_eq!(req.recheck_for(Morphology::WheeledMobile), Ok(()));
+        for own in [
+            Morphology::Humanoid,
+            Morphology::Quadruped,
+            Morphology::Unspecified,
+        ] {
+            assert_eq!(req.recheck_for(own), Err(Violation::MorphologyMismatch));
+            assert!(req
+                .steps_without_approval_for(SafetyState::MovingSlow, own)
+                .is_empty());
+        }
+        // A plan relabelled as humanoid under a wheeled context is refused too.
+        let mut relabelled = plan.clone();
+        relabelled.morphology = Morphology::Humanoid;
+        let req = ExecutionRequest {
+            plan: &relabelled,
+            ..req
+        };
+        assert!(req.recheck().is_err());
+        assert!(req
+            .steps_without_approval_for(SafetyState::MovingSlow, Morphology::Humanoid)
+            .is_empty());
     }
 }

@@ -15,6 +15,7 @@ use std::collections::{HashMap, VecDeque};
 
 use robodr_events::profile::Profile;
 use robodr_events::Severity;
+use robodr_responder::policy::MIN_MOTION_FACTOR_FLOOR;
 use robodr_responder::{
     check_invariants, OperationalContext, Rationale, ResponseAction, ResponsePlan, ResponsePolicy,
     RestrictTarget, SafetyState, Step,
@@ -37,82 +38,26 @@ pub const MAX_SPEED_CAP: f64 = 10.0;
 /// never a finding, so not a `robot.*` rule id).
 pub const PLAN_RULE: &str = "control_plane:action_request";
 
-/// The six action classes (AutoSecOps `robot_<name>`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ActionKind {
-    RestrictMotion,
-    QuarantineNode,
-    IsolateNetwork,
-    SafePause,
-    RequestSafeState,
-    RollbackConfig,
-}
+/// The action classes are the responder's vendor-neutral catalog
+/// ([`robodr_responder::actions`]): names, ladder step, reversibility and
+/// the TTL rule come from there, so the control plane and the planner can
+/// never disagree on what an action is (`catalog_matches_the_responder`
+/// test). On the wire a request names an action by its namespace-free name
+/// (`restrict_motion`); a SOC that registers actions under the catalog's
+/// `robot_<name>` wire names maps them back with
+/// [`ActionKind::parse_wire`].
+pub use robodr_responder::ActionId as ActionKind;
 
-impl ActionKind {
-    pub const ALL: [ActionKind; 6] = [
-        ActionKind::RestrictMotion,
-        ActionKind::QuarantineNode,
-        ActionKind::IsolateNetwork,
-        ActionKind::SafePause,
-        ActionKind::RequestSafeState,
-        ActionKind::RollbackConfig,
-    ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ActionKind::RestrictMotion => "restrict_motion",
-            ActionKind::QuarantineNode => "quarantine_node",
-            ActionKind::IsolateNetwork => "isolate_network",
-            ActionKind::SafePause => "safe_pause",
-            ActionKind::RequestSafeState => "request_safe_state",
-            ActionKind::RollbackConfig => "rollback_config",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|a| a.as_str() == s)
-    }
-
-    /// Needs a `ttl_seconds` (1..=[`MAX_TTL_SECONDS`]); the others refuse one.
-    pub fn time_limited(self) -> bool {
-        matches!(
-            self,
-            ActionKind::RestrictMotion | ActionKind::IsolateNetwork
-        )
-    }
-
-    /// Can be reverted by a later request (an operator restarts after a
-    /// safe state; a rollback is not undone).
-    pub fn reversible(self) -> bool {
-        !matches!(
-            self,
-            ActionKind::RequestSafeState | ActionKind::RollbackConfig
-        )
-    }
-
-    /// The Cyber-Jidoka ladder step the action stands on.
-    pub fn step(self) -> Step {
-        match self {
-            ActionKind::QuarantineNode
-            | ActionKind::IsolateNetwork
-            | ActionKind::RollbackConfig => Step::Restrict,
-            ActionKind::RestrictMotion => Step::LimitMotion,
-            ActionKind::SafePause => Step::SafePause,
-            ActionKind::RequestSafeState => Step::RequestSafeState,
-        }
-    }
-
-    /// Parameters the action may carry.
-    pub fn allowed_params(self) -> &'static [&'static str] {
-        match self {
-            ActionKind::RestrictMotion => {
-                &["max_linear_speed", "max_joint_speed", "workspace_zone"]
-            }
-            ActionKind::QuarantineNode => &["participant_guid", "node"],
-            ActionKind::RollbackConfig => &["config", "to_version"],
-            _ => &[],
-        }
+/// Parameters each action may carry (the others refuse every parameter).
+pub fn allowed_params(action: ActionKind) -> &'static [&'static str] {
+    match action {
+        ActionKind::RestrictMotion => &["max_linear_speed", "max_joint_speed", "workspace_zone"],
+        ActionKind::QuarantineNode => &["participant_guid", "node"],
+        ActionKind::RollbackConfig => &["config", "to_version"],
+        ActionKind::IsolateNetwork
+        | ActionKind::RecordEvidence
+        | ActionKind::SafePause
+        | ActionKind::RequestSafeState => &[],
     }
 }
 
@@ -184,7 +129,8 @@ struct RawRevert {
 }
 
 /// The validated parameters of an action.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Params {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_linear_speed: Option<f64>,
@@ -203,7 +149,8 @@ pub struct Params {
 }
 
 /// One validated action request.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActionRequest {
     pub request_id: String,
     pub action: ActionKind,
@@ -373,7 +320,7 @@ pub fn parse_submit(body: &[u8]) -> Result<ActionRequest, ApiError> {
     let stray: Vec<&str> = present
         .iter()
         .copied()
-        .filter(|n| !action.allowed_params().contains(n))
+        .filter(|n| !allowed_params(action).contains(n))
         .collect();
     if !stray.is_empty() {
         return Err(bad(
@@ -562,7 +509,8 @@ pub struct Refusal {
 }
 
 /// An accepted request: its ladder step and the plan actions it stands for.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Accepted {
     pub step: Step,
     pub actions: Vec<ResponseAction>,
@@ -604,19 +552,32 @@ fn state_name(s: SafetyState) -> String {
 /// Judge one request against the robot's current safety state, its
 /// operational context and the response policy (Cyber-Jidoka), in order:
 ///
+/// 0. `record_evidence` is evidence capture only (a Record-only plan, it
+///    sends nothing to the platform): accepted in every state, including
+///    observe mode and while the safety system is engaged;
 /// 1. the safety system is engaged (e-stop / safe state): refused, the
 ///    safety system has authority and gets no competing request;
 /// 2. observe mode (profile not locked or policy not OEM-validated):
-///    refused, RoboDR only records;
+///    refused, RoboDR only records; a context whose morphology differs from
+///    the policy's: refused (`morphology_mismatch`);
 /// 3. a motion-affecting step (`limit_motion` and up) while a human holds
 ///    command (teleop / manual) or in take-off / landing: refused, the
 ///    person in command decides;
-/// 4. `rollback_config` while the robot is not `idle`: refused (no program
+/// 4. an action refused for the robot's morphology
+///    ([`ActionKind::refused_for`]): `safe_pause` / `request_safe_state` on
+///    a robot that falls when de-energised (humanoid) and `rollback_config`
+///    (a controller restart) on any robot that needs active balance
+///    (humanoid, quadruped) — refused (`fall_hazard`) whatever the safety
+///    state, `idle` included (a legged robot balances while idle);
+///    `rollback_config` while the robot is not `idle`: refused (no program
 ///    or profile change in motion);
 /// 5. a step above what the policy's matrix allows in this state for any
 ///    severity: refused;
 /// 6. a `restrict_motion` cap above the profile's envelope: refused (it
-///    would not restrict);
+///    would not restrict); on a robot that needs active balance, a cap
+///    below the policy's `min_motion_factor` of the envelope, or a cap with
+///    no envelope to judge it against: refused (`fall_hazard`, a near-stop
+///    envelope also stops the balance corrections);
 /// 7. the plan it stands for must pass `robodr_responder::check_invariants`
 ///    (as a human-approved plan: the SOC's approval).
 ///
@@ -632,6 +593,18 @@ pub fn judge(req: &ActionRequest, key_id: &str, s: &Situation<'_>) -> Decision {
     };
     let step = req.action.step();
     let name = state_name(s.state);
+    let morphology = s.policy.morphology;
+    if req.action == ActionKind::RecordEvidence {
+        return Decision::Accept(Accepted {
+            step: Step::Record,
+            actions: vec![ResponseAction::Record],
+            notes: vec![
+                "evidence capture only: nothing is sent to the platform (accepted in every \
+                 safety state and in observe mode)"
+                    .into(),
+            ],
+        });
+    }
     if s.state.safety_system_engaged() {
         return refuse(
             "safety_system_engaged",
@@ -656,6 +629,17 @@ pub fn judge(req: &ActionRequest, key_id: &str, s: &Situation<'_>) -> Decision {
                 .into(),
         );
     }
+    if s.context.morphology != morphology {
+        return refuse(
+            "morphology_mismatch",
+            format!(
+                "the robot's context says {} but the response policy says {}: RoboDR does not \
+                 act on a plan made for another body",
+                s.context.morphology.as_str(),
+                morphology.as_str()
+            ),
+        );
+    }
     if step.is_motion_affecting() {
         if s.context.control.human_in_command() {
             return refuse(
@@ -671,6 +655,23 @@ pub fn judge(req: &ActionRequest, key_id: &str, s: &Situation<'_>) -> Decision {
                 "take-off / landing: interrupting motion now is itself a hazard".into(),
             );
         }
+    }
+    if req.action.refused_for(morphology) {
+        let why = if req.action == ActionKind::RollbackConfig {
+            "restarts the controller whose configuration it rolls back"
+        } else {
+            "may damp or de-energise the actuators"
+        };
+        return refuse(
+            "fall_hazard",
+            format!(
+                "{} {why}, and this robot is configured as {} (it balances actively, also while \
+                 idle): it would fall. Never executed here; ask the operator / the platform's \
+                 own safety function, or use restrict_motion within min_motion_factor",
+                req.action.as_str(),
+                morphology.as_str()
+            ),
+        );
     }
     if req.action == ActionKind::RollbackConfig && s.state != SafetyState::Idle {
         return refuse(
@@ -712,6 +713,17 @@ pub fn judge(req: &ActionRequest, key_id: &str, s: &Situation<'_>) -> Decision {
                         )
                     }
                     Some(cap) => factor = factor.min(want / cap),
+                    None if morphology.needs_active_balance() => {
+                        return refuse(
+                            "fall_hazard",
+                            format!(
+                                "{what}: the profile has no envelope to judge the cap against, \
+                                 and this robot ({}) balances actively: a cap that may be a \
+                                 near-stop is not accepted",
+                                morphology.as_str()
+                            ),
+                        )
+                    }
                     None => notes.push(format!(
                         "{what}: the profile has no envelope to compare with; the cap is \
                          recorded as given"
@@ -722,6 +734,18 @@ pub fn judge(req: &ActionRequest, key_id: &str, s: &Situation<'_>) -> Decision {
                 return refuse(
                     "invalid_parameter",
                     "the requested caps do not give a valid envelope scale".into(),
+                );
+            }
+            let floor = s.policy.min_motion_factor.max(MIN_MOTION_FACTOR_FLOOR);
+            if morphology.needs_active_balance() && factor < floor {
+                return refuse(
+                    "fall_hazard",
+                    format!(
+                        "the requested caps scale the envelope to {factor} of the profile's, below \
+                         this {} robot's min_motion_factor {floor}: a near-stop envelope also \
+                         stops the balance corrections it needs",
+                        morphology.as_str()
+                    ),
                 );
             }
             if let Some(z) = &p.workspace_zone {
@@ -746,8 +770,10 @@ pub fn judge(req: &ActionRequest, key_id: &str, s: &Situation<'_>) -> Decision {
         ActionKind::RequestSafeState => actions.push(ResponseAction::RequestSafeState {
             behaviour: s.policy.safe_state,
         }),
-        // No ladder action: the rollback itself is recorded with the request.
-        ActionKind::RollbackConfig => {}
+        // No ladder action beyond Record: evidence capture is the Record
+        // step itself (handled above); the rollback is recorded with the
+        // request.
+        ActionKind::RecordEvidence | ActionKind::RollbackConfig => {}
     }
     if s.state == SafetyState::Unknown && step.is_motion_affecting() {
         notes.push(
@@ -773,6 +799,8 @@ pub fn judge(req: &ActionRequest, key_id: &str, s: &Situation<'_>) -> Decision {
         suppressed: false,
         would_have: None,
         rationale: Rationale::default(),
+        morphology: s.policy.morphology,
+        advisory: Vec::new(),
     };
     if let Err(v) = check_invariants(&plan, s.state, s.context) {
         return refuse(
@@ -802,9 +830,20 @@ pub enum Status {
     Refused,
     /// An executor failed (no such executor here).
     Failed,
+    // --- executor v1 (robodr-executor, `executor.enabled`) ---------------
+    /// The executor applied it and the read-back matched.
+    Verified,
+    /// The executor removed it again (revert request, TTL, reconciliation).
+    Reverted,
 }
 
 impl Status {
+    /// The request took effect on the robot (applied, verified, or applied
+    /// and reverted since).
+    pub fn executed(self) -> bool {
+        matches!(self, Status::Applied | Status::Verified | Status::Reverted)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Status::RecordedNotExecuted => "recorded_not_executed",
@@ -812,6 +851,8 @@ impl Status {
             Status::Applied => "applied",
             Status::Refused => "refused",
             Status::Failed => "failed",
+            Status::Verified => "verified",
+            Status::Reverted => "reverted",
         }
     }
 }
@@ -821,10 +862,124 @@ impl Status {
 pub struct AcceptedAction<'a> {
     pub request: &'a ActionRequest,
     pub key_id: &'a str,
+    /// The SOC's signed request exactly as received (method, target,
+    /// credentials, body): forwarded to the executor, which verifies the
+    /// approval itself (executor M1).
+    pub meta: &'a Meta,
     pub step: Step,
     pub actions: &'a [ResponseAction],
     pub safety_state: SafetyState,
     pub context: &'a OperationalContext,
+}
+
+/// How far an applied `quarantine_node` reaches (review R2-3), from the
+/// executor's word: answered as `state.quarantine` and summarised by the
+/// top-level `containment` (contract §6a).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuarantineScope {
+    /// `ip:port` the executor cuts (UDP to and from); empty: the
+    /// GUID-prefix payload drop alone.
+    pub locators: Vec<String>,
+    /// Announced locators not acted on, and why.
+    #[serde(default)]
+    pub excluded: Vec<ScopeExcluded>,
+    /// Review R3-1: source addresses the executor cuts whole (all UDP from
+    /// them to the robot's DDS ports and to them on those ports, any
+    /// source port). Absent in journals before this revision (then the
+    /// quarantine cut locators only).
+    #[serde(default)]
+    pub addresses: Vec<String>,
+    /// Observed source addresses not cut whole, and why.
+    #[serde(default)]
+    pub excluded_addresses: Vec<ScopeExcludedAddress>,
+    /// Some observed source address or announced locator was forgotten
+    /// (agentd's per-participant caps): never `full`.
+    #[serde(default)]
+    pub evidence_truncated: bool,
+}
+
+/// One locator a quarantine left out ([`QuarantineScope::excluded`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeExcluded {
+    pub locator: String,
+    pub reason: String,
+}
+
+/// One source address a quarantine did not cut whole
+/// ([`QuarantineScope::excluded_addresses`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeExcludedAddress {
+    pub address: String,
+    pub reason: String,
+}
+
+/// Most locators / left-out locators kept in a [`QuarantineScope`].
+pub const MAX_SCOPE_LOCATORS: usize = 16;
+pub const MAX_SCOPE_EXCLUDED: usize = 64;
+/// Most addresses / left-out addresses kept in a [`QuarantineScope`].
+pub const MAX_SCOPE_ADDRESSES: usize = 16;
+pub const MAX_SCOPE_EXCLUDED_ADDRESSES: usize = 32;
+/// Longest reason kept per left-out locator.
+pub const MAX_SCOPE_REASON: usize = 200;
+
+impl QuarantineScope {
+    /// Contract §6a, with the executor's own definition
+    /// ([`robodr_executor::decision::containment_of`]): `full` when at
+    /// least one address is cut whole, nothing was left out or forgotten,
+    /// and every cut locator lies on a cut address; `guid_only` when
+    /// neither an address nor a locator is cut (only RTPS whose header
+    /// carries the prefix is dropped); `partial` otherwise.
+    pub fn containment(&self) -> &'static str {
+        let ip = |s: &str| {
+            s.parse::<std::net::IpAddr>()
+                .ok()
+                .or_else(|| s.parse::<std::net::SocketAddr>().ok().map(|a| a.ip()))
+        };
+        let addresses: Vec<std::net::IpAddr> =
+            self.addresses.iter().filter_map(|a| ip(a)).collect();
+        let locators: Vec<std::net::IpAddr> = self.locators.iter().filter_map(|l| ip(l)).collect();
+        // Anything unparseable counts as left out (never `full`).
+        let left_out = !self.excluded.is_empty()
+            || !self.excluded_addresses.is_empty()
+            || self.evidence_truncated
+            || addresses.len() != self.addresses.len()
+            || locators.len() != self.locators.len();
+        robodr_executor::decision::containment_of(&addresses, &locators, left_out).as_str()
+    }
+
+    /// Within the bounds a stored request keeps (and the journal takes).
+    /// Cutting a list only ever drops cut addresses or locators, or
+    /// left-out entries while others remain: never towards `full`.
+    pub fn bounded(mut self) -> Self {
+        if self.locators.len() > MAX_SCOPE_LOCATORS {
+            self.locators.truncate(MAX_SCOPE_LOCATORS);
+            self.evidence_truncated = true;
+        }
+        self.excluded.truncate(MAX_SCOPE_EXCLUDED);
+        if self.addresses.len() > MAX_SCOPE_ADDRESSES {
+            self.addresses.truncate(MAX_SCOPE_ADDRESSES);
+            self.evidence_truncated = true;
+        }
+        self.excluded_addresses
+            .truncate(MAX_SCOPE_EXCLUDED_ADDRESSES);
+        for x in &mut self.excluded {
+            x.reason = clean_reason(&x.reason);
+        }
+        for x in &mut self.excluded_addresses {
+            x.reason = clean_reason(&x.reason);
+        }
+        self
+    }
+}
+
+fn clean_reason(r: &str) -> String {
+    r.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_SCOPE_REASON)
+        .collect()
 }
 
 /// What an executor did with an accepted request.
@@ -834,6 +989,50 @@ pub enum ExecutorOutcome {
     Pending,
     Applied,
     Failed(String),
+    // --- executor v1 -------------------------------------------------------
+    Verified,
+    /// Verified, and the executor said how far the quarantine reaches.
+    VerifiedQuarantine(QuarantineScope),
+    Reverted,
+    /// The executor's own checks refused it (nothing applied).
+    Refused {
+        code: &'static str,
+        reason: String,
+    },
+}
+
+/// Status, error, refusal and quarantine scope a stored request takes for
+/// an executor outcome (executor v1). The scope is `None` unless the
+/// executor reported one (a later outcome without one keeps the stored
+/// scope: see [`Engine`]'s refresh).
+fn outcome_status(
+    out: ExecutorOutcome,
+    state: SafetyState,
+) -> (
+    Status,
+    Option<String>,
+    Option<Refusal>,
+    Option<QuarantineScope>,
+) {
+    match out {
+        ExecutorOutcome::RecordedNotExecuted => (Status::RecordedNotExecuted, None, None, None),
+        ExecutorOutcome::Pending => (Status::Pending, None, None, None),
+        ExecutorOutcome::Applied => (Status::Applied, None, None, None),
+        ExecutorOutcome::Failed(e) => (Status::Failed, Some(e), None, None),
+        ExecutorOutcome::Verified => (Status::Verified, None, None, None),
+        ExecutorOutcome::VerifiedQuarantine(q) => (Status::Verified, None, None, Some(q.bounded())),
+        ExecutorOutcome::Reverted => (Status::Reverted, None, None, None),
+        ExecutorOutcome::Refused { code, reason } => (
+            Status::Refused,
+            None,
+            Some(Refusal {
+                code,
+                reason,
+                safety_state: state,
+            }),
+            None,
+        ),
+    }
 }
 
 /// Receives accepted requests. A real executor must follow
@@ -846,6 +1045,36 @@ pub trait ActionExecutor {
     /// Whether it can act on the robot at all.
     fn executes(&self) -> bool;
     fn submit(&mut self, a: &AcceptedAction<'_>) -> ExecutorOutcome;
+    // --- executor v1 -------------------------------------------------------
+    /// Ask for a revert of an accepted request; `None` (the default): this
+    /// executor cannot revert. `signed` is the SOC's revert request exactly
+    /// as received (the executor lifts a SOC-approved action only with it,
+    /// executor review F3).
+    fn revert(
+        &mut self,
+        _request_id: &str,
+        _reason: &str,
+        _signed: &Meta,
+    ) -> Option<ExecutorOutcome> {
+        None
+    }
+    /// The executor's latest word on a request it was given (`None`:
+    /// nothing new). Asked before a request's state is answered.
+    fn refresh(&mut self, _request_id: &str) -> Option<ExecutorOutcome> {
+        None
+    }
+    /// Forget what [`Self::submit`] (`revert: false`) or [`Self::revert`]
+    /// (`revert: true`) staged for `request_id`: the engine calls this on
+    /// every path that answers `failed` / 503 after asking, so an order for
+    /// a request that was never recorded can never be released.
+    fn discard(&mut self, _request_id: &str, _revert: bool) {}
+    /// Whether the executor holds an applied action without enforcing it
+    /// (after its own restart, until re-armed with a fresh safety state).
+    /// Answered (`in_force: false`, `state.executor_state: "held"`), never
+    /// journalled: the stored status stays what the executor last reported.
+    fn held(&self, _request_id: &str) -> bool {
+        false
+    }
 }
 
 /// Executes nothing: every accepted request stays a recorded plan.
@@ -873,6 +1102,9 @@ pub enum Call {
     Revert(String, RevertRequest),
     /// Authenticated but refused before judgment (bad body): recorded.
     Invalid(ApiError),
+    /// Record an evidence export's note (`robodr.control_plane_evidence_export`);
+    /// answered `{"evidence": "<reference>"}` or 503 `evidence_unavailable`.
+    EvidenceNote(Box<Value>),
 }
 
 /// Who sent a call and how (recorded with it, so the black box can prove
@@ -950,6 +1182,10 @@ pub struct Stored {
     pub evidence: String,
     pub executor: &'static str,
     pub revert: Option<RevertRecord>,
+    /// The executor's word on how far an applied quarantine reaches
+    /// (review R2-3; `None`: not a quarantine, not applied, or an executor
+    /// that does not report it).
+    pub quarantine: Option<QuarantineScope>,
 }
 
 /// Engine counters (`status.json`, heartbeat).
@@ -967,6 +1203,20 @@ pub struct EngineStats {
     /// Oldest requests dropped from the store when it was full.
     pub evicted: u64,
     pub stored: u64,
+    /// Requests restored from the journal at start.
+    pub restored: u64,
+    /// Dangling decisions settled at start from the black box: recorded
+    /// (committed) or not (aborted).
+    pub resolved_committed: u64,
+    pub resolved_aborted: u64,
+    /// Damaged journal entries skipped at start.
+    pub journal_damaged: u64,
+    /// Journal appends / compactions that failed.
+    pub journal_errors: u64,
+    /// Requests answered `failed` because the journal could not take them.
+    pub journal_refusals: u64,
+    /// Evidence exports recorded.
+    pub evidence_exports: u64,
 }
 
 /// The main-thread half: judges, records, stores and answers.
@@ -976,6 +1226,13 @@ pub struct Engine {
     order: VecDeque<String>,
     max: usize,
     executor: Box<dyn ActionExecutor>,
+    /// The persistent request state (`None`: in memory only, unit tests).
+    journal: Option<super::state::RequestJournal>,
+    /// Review finding 4: request ids whose state the damaged journal lost
+    /// and the black box could not restore, and (`refuse_new`) the reason
+    /// every unknown id is refused when the black box could not be read.
+    lost_ids: std::collections::HashSet<String>,
+    refuse_new: Option<String>,
     pub stats: EngineStats,
 }
 
@@ -1000,12 +1257,158 @@ impl Engine {
             order: VecDeque::new(),
             max: max.max(1),
             executor,
+            journal: None,
+            lost_ids: std::collections::HashSet::new(),
+            refuse_new: None,
             stats: EngineStats::default(),
         }
     }
 
+    /// An engine on a persistent journal, with the requests it restored
+    /// (oldest first; dangling decisions already resolved).
+    pub fn with_journal(
+        robot_id: &str,
+        max: usize,
+        executor: Box<dyn ActionExecutor>,
+        journal: super::state::RequestJournal,
+        restored: Vec<Stored>,
+    ) -> Self {
+        let mut e = Self::new(robot_id, max, executor);
+        for s in restored {
+            e.insert(s);
+        }
+        e.stats.evicted = 0;
+        e.stats.restored = e.store.len() as u64;
+        e.journal = Some(journal);
+        e.maybe_compact(true);
+        e
+    }
+
+    /// Compact the journal when it holds more than twice the store (or
+    /// `force`).
+    fn maybe_compact(&mut self, force: bool) {
+        let live = self.store.len();
+        let Some(j) = self.journal.as_mut() else {
+            return;
+        };
+        if force || j.lines() > 2 * live + 64 {
+            let order = &self.order;
+            let store = &self.store;
+            if j.compact(order.iter().filter_map(|id| store.get(id)))
+                .is_err()
+            {
+                self.stats.journal_errors += 1;
+            }
+        }
+    }
+
+    /// Append to the journal (if any); `false` on failure (counted).
+    fn journal(&mut self, e: &super::state::Entry) -> bool {
+        match self.journal.as_mut() {
+            None => true,
+            Some(j) => {
+                if j.append(e).is_ok() {
+                    true
+                } else {
+                    self.stats.journal_errors += 1;
+                    false
+                }
+            }
+        }
+    }
+
+    /// Refuse submissions of `lost` request ids, and with `refuse_new`, of
+    /// every id not stored (the journal was damaged and could not be
+    /// reconciled with the black box).
+    pub fn refuse_ids(&mut self, lost: Vec<String>, refuse_new: Option<String>) {
+        self.lost_ids = lost.into_iter().collect();
+        self.refuse_new = refuse_new;
+    }
+
     pub fn executor_name(&self) -> &'static str {
         self.executor.name()
+    }
+
+    // --- executor v1 -------------------------------------------------------
+    /// Replace the executor (agentd's `executor.enabled`).
+    pub fn set_executor(&mut self, executor: Box<dyn ActionExecutor>) {
+        self.executor = executor;
+    }
+
+    /// Take the executor's latest word on a stored request. A change is
+    /// journalled before it is taken (and answered): a request that read
+    /// `verified` still reads `verified` after a restart, when the link's
+    /// in-memory outcomes are gone. If the journal does not take it, the
+    /// stored state stays as it was (counted in `journal_errors`) and the
+    /// next query asks again: no answer claims a state the robot could
+    /// forget.
+    fn refresh(&mut self, id: &str) {
+        let Some(s) = self.store.get(id) else {
+            return;
+        };
+        if !matches!(
+            s.status,
+            Status::Pending | Status::Applied | Status::Verified
+        ) {
+            return;
+        }
+        let Some(out) = self.executor.refresh(id) else {
+            return;
+        };
+        let (status, err, refusal, quarantine) = outcome_status(out, s.safety_state);
+        let error = err.or_else(|| s.error.clone());
+        let refusal = refusal.or_else(|| s.refusal.clone());
+        let quarantine = quarantine.or_else(|| s.quarantine.clone());
+        if status == s.status
+            && error == s.error
+            && refusal == s.refusal
+            && quarantine == s.quarantine
+        {
+            return;
+        }
+        let entry = super::state::Entry::Executor {
+            request_id: id.to_string(),
+            status: status.as_str().to_string(),
+            error: error.clone(),
+            refusal: refusal.as_ref().map(super::state::PRefusal::of),
+            quarantine: quarantine.clone(),
+        };
+        if !self.journal(&entry) {
+            return;
+        }
+        if let Some(s) = self.store.get_mut(id) {
+            s.status = status;
+            s.error = error;
+            s.refusal = refusal;
+            s.quarantine = quarantine;
+        }
+        self.maybe_compact(false);
+    }
+
+    /// Take (and journal) the executor's latest word on a request now, not
+    /// only when it is next queried (the daemon calls this for every
+    /// outcome the executor link reports).
+    pub fn sync(&mut self, id: &str) {
+        self.refresh(id);
+    }
+
+    /// Stored requests this engine's executor may still change (`pending`,
+    /// `applied`, `verified`), oldest first: after a restart the executor
+    /// is asked for their state.
+    pub fn open_executor_requests(&self) -> Vec<String> {
+        let name = self.executor.name();
+        self.order
+            .iter()
+            .filter_map(|id| self.store.get(id))
+            .filter(|s| {
+                s.executor == name
+                    && matches!(
+                        s.status,
+                        Status::Pending | Status::Applied | Status::Verified
+                    )
+            })
+            .map(|s| s.request.request_id.clone())
+            .collect()
     }
 
     pub fn executes(&self) -> bool {
@@ -1020,11 +1423,32 @@ impl Engine {
         match call {
             Call::Robot => self.robot(host),
             Call::Submit(req) => self.submit(req, meta, host),
-            Call::Get(id) => match self.store.get(id) {
-                Some(s) => Answer::ok(self.answer(s, false, host.wall_ms())),
-                None => Answer::error(&unknown_request()),
-            },
+            Call::Get(id) => {
+                self.refresh(id);
+                match self.store.get(id) {
+                    Some(s) => Answer::ok(self.answer(s, false, host.wall_ms())),
+                    None => Answer::error(&unknown_request()),
+                }
+            }
             Call::Revert(id, rv) => self.revert(id, rv, meta, host),
+            Call::EvidenceNote(note) => match host.record("control-plane evidence export", note) {
+                Ok(uri) => {
+                    self.stats.evidence_exports += 1;
+                    Answer::ok(json!({"evidence": uri}))
+                }
+                Err(e) => {
+                    self.stats.record_failures += 1;
+                    Answer::error(&ApiError::new(
+                        503,
+                        "evidence_unavailable",
+                        format!(
+                            "the black box did not take the export note ({}); nothing was \
+                                 exported, retry later",
+                            robodr_ros2_pipeline::sanitize(&e)
+                        ),
+                    ))
+                }
+            },
             Call::Invalid(e) => {
                 self.stats.invalid += 1;
                 let note = json!({
@@ -1061,12 +1485,20 @@ impl Engine {
             "health": host.health(),
             "executor": self.executor.name(),
             "executes_actions": self.executor.executes(),
-            "actions": ActionKind::ALL.map(ActionKind::as_str),
+            "morphology": host.policy().morphology.as_str(),
+            // Only what this robot may be asked for: an action refused for
+            // its morphology (`fall_hazard`) is not advertised.
+            "actions": ActionKind::ALL
+                .into_iter()
+                .filter(|a| !a.refused_for(host.policy().morphology))
+                .map(ActionKind::as_str)
+                .collect::<Vec<_>>(),
         }))
     }
 
     fn submit(&mut self, req: &ActionRequest, meta: &Meta, host: &mut dyn Host) -> Answer {
         let digest = req.digest();
+        self.refresh(&req.request_id);
         if let Some(s) = self.store.get(&req.request_id) {
             if s.digest == digest {
                 self.stats.duplicates += 1;
@@ -1077,6 +1509,16 @@ impl Engine {
                 409,
                 "request_id_conflict",
                 "this request_id was already used for another action, parameters or ttl",
+            ));
+        }
+        if self.refuse_new.is_some() || self.lost_ids.contains(&req.request_id) {
+            self.stats.journal_refusals += 1;
+            return Answer::error(&ApiError::new(
+                503,
+                "state_unavailable",
+                "the request journal was damaged and this request id cannot be reconciled with \
+                 the black box; it is not judged again (an operator restarts agentd once the \
+                 black box is readable)",
             ));
         }
         self.stats.submitted += 1;
@@ -1092,31 +1534,76 @@ impl Engine {
                 caps: host.caps(),
             },
         );
-        let (status, refusal, accepted, error) = match decision {
-            Decision::Refuse(r) => (Status::Refused, Some(r), None, None),
+        let (status, refusal, accepted, error, quarantine) = match decision {
+            Decision::Refuse(r) => (Status::Refused, Some(r), None, None, None),
             Decision::Accept(a) => {
                 let out = self.executor.submit(&AcceptedAction {
                     request: req,
                     key_id: &meta.key_id,
+                    meta,
                     step: a.step,
                     actions: &a.actions,
                     safety_state: state,
                     context: &ctx,
                 });
-                let (st, err) = match out {
-                    ExecutorOutcome::RecordedNotExecuted => (Status::RecordedNotExecuted, None),
-                    ExecutorOutcome::Pending => (Status::Pending, None),
-                    ExecutorOutcome::Applied => (Status::Applied, None),
-                    ExecutorOutcome::Failed(e) => (Status::Failed, Some(e)),
-                };
-                (st, None, Some(a), err)
+                let (st, err, refusal, quarantine) = outcome_status(out, state);
+                (st, refusal, Some(a), err, quarantine)
             }
         };
         let received_ms = host.wall_ms();
+        let mut stored = Stored {
+            request: req.clone(),
+            digest,
+            key_id: meta.key_id.clone(),
+            status,
+            refusal: refusal.clone(),
+            safety_state: state,
+            accepted: accepted.clone(),
+            error: error.clone(),
+            received_ms,
+            evidence: String::new(),
+            executor: self.executor.name(),
+            revert: None,
+            quarantine,
+        };
+        let failed = |code: &str, message: String| {
+            Answer::ok(json!({
+                "request_id": req.request_id,
+                "status": "failed",
+                "executed": false,
+                "state": {"error": {"code": code, "message": message}}
+            }))
+        };
+        // 1. The journal learns of the decision before anything records it.
+        let decision_id = match super::fsutil::random_hex16() {
+            Ok(d) => d,
+            Err(e) => {
+                self.stats.journal_refusals += 1;
+                self.executor.discard(&req.request_id, false);
+                return failed(
+                    "state_unavailable",
+                    format!("no randomness for a decision id ({e}); nothing was decided"),
+                );
+            }
+        };
+        if !self.journal(&super::state::Entry::Begin {
+            decision_id: decision_id.clone(),
+            stored: super::state::PStored::of(&stored),
+        }) {
+            self.stats.journal_refusals += 1;
+            self.executor.discard(&req.request_id, false);
+            return failed(
+                "state_unavailable",
+                "the request journal did not take the request; nothing was decided or stored, \
+                 retry later"
+                    .into(),
+            );
+        }
         let note = json!({
             "kind": "robodr.control_plane_request",
             "api": API_VERSION,
             "robot_id": self.robot_id,
+            "decision_id": decision_id,
             "request": req,
             "authority": "request",
             "auth": meta,
@@ -1128,53 +1615,45 @@ impl Engine {
             "refusal": refusal,
             "plan": accepted,
             "executor": self.executor.name(),
-            "executed": status == Status::Applied,
+            "executed": status.executed(),
             "status": status.as_str(),
             "error": error,
         });
+        // 2. The black box.
         let evidence = match host.record("control-plane request", &note) {
             Ok(uri) => uri,
             Err(e) => {
                 // Fail closed: nothing is claimed that is not in evidence.
                 self.stats.record_failures += 1;
-                return Answer::ok(json!({
-                    "request_id": req.request_id,
-                    "status": "failed",
-                    "executed": false,
-                    "state": {
-                        "error": {
-                            "code": "evidence_unavailable",
-                            "message": format!(
-                                "the black box did not take the request ({}); nothing was \
-                                 decided or stored, retry later",
-                                robodr_ros2_pipeline::sanitize(&e)
-                            ),
-                        }
-                    }
-                }));
+                // A failed abort is settled at the next start: the black
+                // box holds no note with this decision id.
+                let _ = self.journal(&super::state::Entry::Abort { decision_id });
+                self.executor.discard(&req.request_id, false);
+                return failed(
+                    "evidence_unavailable",
+                    format!(
+                        "the black box did not take the request ({}); nothing was decided or \
+                         stored, retry later",
+                        robodr_ros2_pipeline::sanitize(&e)
+                    ),
+                );
             }
         };
+        // 3. Commit. A failed commit is settled at the next start from the
+        // black box (the note exists), so the state is still answered.
+        let _ = self.journal(&super::state::Entry::Commit {
+            decision_id,
+            evidence: evidence.clone(),
+        });
         match status {
             Status::Refused => self.stats.refused += 1,
             Status::RecordedNotExecuted => self.stats.recorded_not_executed += 1,
             _ => {}
         }
-        let stored = Stored {
-            request: req.clone(),
-            digest,
-            key_id: meta.key_id.clone(),
-            status,
-            refusal,
-            safety_state: state,
-            accepted,
-            error,
-            received_ms,
-            evidence,
-            executor: self.executor.name(),
-            revert: None,
-        };
+        stored.evidence = evidence;
         let answer = self.answer(&stored, false, received_ms);
         self.insert(stored);
+        self.maybe_compact(false);
         Answer::ok(answer)
     }
 
@@ -1196,19 +1675,27 @@ impl Engine {
 
     fn revert(&mut self, id: &str, rv: &RevertRequest, meta: &Meta, host: &mut dyn Host) -> Answer {
         let now = host.wall_ms();
+        // executor v1: judge the revert by the executor's latest word (a TTL
+        // may have lifted it already).
+        self.refresh(id);
         let Some(s) = self.store.get(id) else {
             return Answer::error(&unknown_request());
         };
         self.stats.reverts += 1;
         let (result, refusal): (&'static str, Option<Refusal>) = if !s.request.action.reversible() {
+            let reason = if s.request.action == ActionKind::RecordEvidence {
+                "record_evidence is evidence capture: evidence is never reverted".to_string()
+            } else {
+                format!(
+                    "{} is not reversible by request: an operator restores the robot",
+                    s.request.action.as_str()
+                )
+            };
             (
                 "refused",
                 Some(Refusal {
                     code: "not_reversible",
-                    reason: format!(
-                        "{} is not reversible by request: an operator restores the robot",
-                        s.request.action.as_str()
-                    ),
+                    reason,
                     safety_state: s.safety_state,
                 }),
             )
@@ -1217,23 +1704,82 @@ impl Engine {
                 Status::RecordedNotExecuted | Status::Refused | Status::Failed => {
                     ("not_applied", None)
                 }
-                Status::Pending | Status::Applied => (
-                    "refused",
-                    Some(Refusal {
-                        code: "revert_unsupported",
-                        reason: format!(
-                            "the {} executor cannot revert requests",
-                            self.executor.name()
+                Status::Reverted => ("reverted", None),
+                Status::Pending | Status::Applied | Status::Verified => {
+                    // executor v1: the executor reverts (or queues it).
+                    match self.executor.revert(id, &rv.reason, meta) {
+                        Some(ExecutorOutcome::Reverted) => ("reverted", None),
+                        Some(ExecutorOutcome::Pending) => ("pending", None),
+                        Some(ExecutorOutcome::Failed(_)) => ("failed", None),
+                        _ => (
+                            "refused",
+                            Some(Refusal {
+                                code: "revert_unsupported",
+                                reason: format!(
+                                    "the {} executor cannot revert requests",
+                                    self.executor.name()
+                                ),
+                                safety_state: s.safety_state,
+                            }),
                         ),
-                        safety_state: s.safety_state,
-                    }),
-                ),
+                    }
+                }
             }
+        };
+        // What changes the stored state is journalled first: the first
+        // revert record (`not_applied`, or an executor revert `pending` /
+        // `reverted`: the daemon dispatches a staged executor revert only
+        // once this record exists) and a status that becomes `reverted`.
+        let sets_revert =
+            matches!(result, "not_applied" | "pending" | "reverted") && s.revert.is_none();
+        let sets_status = result == "reverted" && s.status != Status::Reverted;
+        let changes = sets_revert || sets_status;
+        let decision_id = if changes {
+            let d = match super::fsutil::random_hex16() {
+                Ok(d) => d,
+                Err(_) => {
+                    self.stats.journal_refusals += 1;
+                    self.executor.discard(id, true);
+                    return Answer::error(&ApiError::new(
+                        503,
+                        "state_unavailable",
+                        "no randomness for a decision id; nothing was recorded, retry later",
+                    ));
+                }
+            };
+            let begin = super::state::Entry::RevertBegin {
+                decision_id: d.clone(),
+                request_id: id.to_string(),
+                revert: super::state::PRevert::of(&RevertRecord {
+                    requested_by: rv.requested_by.clone(),
+                    reason: rv.reason.clone(),
+                    at_ms: now,
+                    result,
+                    evidence: String::new(),
+                }),
+            };
+            if !self.journal(&begin) {
+                self.stats.journal_refusals += 1;
+                self.executor.discard(id, true);
+                return Answer::error(&ApiError::new(
+                    503,
+                    "state_unavailable",
+                    "the request journal did not take the revert; nothing was recorded, retry \
+                     later",
+                ));
+            }
+            Some(d)
+        } else {
+            None
+        };
+        let Some(s) = self.store.get(id) else {
+            return Answer::error(&unknown_request());
         };
         let note = json!({
             "kind": "robodr.control_plane_revert",
             "api": API_VERSION,
             "robot_id": self.robot_id,
+            "decision_id": decision_id,
             "request_id": id,
             "action": s.request.action,
             "revert": rv,
@@ -1247,6 +1793,10 @@ impl Engine {
             Ok(uri) => uri,
             Err(e) => {
                 self.stats.record_failures += 1;
+                if let Some(d) = decision_id {
+                    let _ = self.journal(&super::state::Entry::RevertAbort { decision_id: d });
+                }
+                self.executor.discard(id, true);
                 return Answer::ok(json!({
                     "request_id": id,
                     "status": "failed",
@@ -1256,11 +1806,21 @@ impl Engine {
                 }));
             }
         };
+        if let Some(d) = decision_id {
+            let _ = self.journal(&super::state::Entry::RevertCommit {
+                decision_id: d,
+                evidence: evidence.clone(),
+            });
+        }
         let robot_id = self.robot_id.clone();
+        let held = self.store.get(id).is_some_and(|s| self.held(s));
         let Some(s) = self.store.get_mut(id) else {
             return Answer::error(&unknown_request());
         };
-        if result == "not_applied" && s.revert.is_none() {
+        if sets_status {
+            s.status = Status::Reverted;
+        }
+        if sets_revert && s.revert.is_none() {
             s.revert = Some(RevertRecord {
                 requested_by: rv.requested_by.clone(),
                 reason: rv.reason.clone(),
@@ -1269,7 +1829,7 @@ impl Engine {
                 evidence: evidence.clone(),
             });
         }
-        let mut body = answer_of(s, &robot_id, false, now);
+        let mut body = answer_of(s, &robot_id, false, now, held);
         body["status"] = json!(result);
         body["revert_evidence"] = json!(evidence);
         match refusal {
@@ -1284,7 +1844,12 @@ impl Engine {
     }
 
     fn answer(&self, s: &Stored, duplicate: bool, now_ms: u64) -> Value {
-        answer_of(s, &self.robot_id, duplicate, now_ms)
+        answer_of(s, &self.robot_id, duplicate, now_ms, self.held(s))
+    }
+
+    /// The executor holds this request's action (review finding 6).
+    fn held(&self, s: &Stored) -> bool {
+        s.executor == self.executor.name() && self.executor.held(&s.request.request_id)
     }
 }
 
@@ -1296,8 +1861,13 @@ fn unknown_request() -> ApiError {
     )
 }
 
-/// The request-state answer for a stored request.
-pub fn answer_of(s: &Stored, robot_id: &str, duplicate: bool, now_ms: u64) -> Value {
+/// The request-state answer for a stored request. `held`: the executor
+/// holds the action without enforcing it (review finding 6).
+///
+/// `in_force` (top level, every answer) says whether the action is being
+/// enforced on the robot now: only a `verified` (or `applied`) request the
+/// executor does not hold. `executed` stays "it took effect at some point".
+pub fn answer_of(s: &Stored, robot_id: &str, duplicate: bool, now_ms: u64, held: bool) -> Value {
     let expires = s
         .request
         .ttl_seconds
@@ -1314,7 +1884,7 @@ pub fn answer_of(s: &Stored, robot_id: &str, duplicate: bool, now_ms: u64) -> Va
         "decision": if s.refusal.is_some() { "refused" } else { "accepted" },
         "safety_state": s.safety_state,
         "executor": s.executor,
-        "executed": s.status == Status::Applied,
+        "executed": s.status.executed(),
         "evidence": s.evidence,
     });
     if let Some(a) = &s.accepted {
@@ -1333,12 +1903,27 @@ pub fn answer_of(s: &Stored, robot_id: &str, duplicate: bool, now_ms: u64) -> Va
     if let Some(r) = &s.revert {
         state["revert"] = json!(r);
     }
+    let enforcing = matches!(s.status, Status::Verified | Status::Applied);
+    if held && enforcing {
+        state["executor_state"] = json!("held");
+    }
+    // Review R2-3: how far a quarantine reaches (contract §6a).
+    if let Some(q) = &s.quarantine {
+        state["quarantine"] = json!(q);
+    }
     let mut out = json!({
         "request_id": s.request.request_id,
         "status": s.status.as_str(),
-        "executed": s.status == Status::Applied,
+        "executed": s.status.executed(),
+        "in_force": enforcing && !held,
         "state": state,
     });
+    if enforcing && s.request.action == ActionKind::QuarantineNode {
+        out["containment"] = json!(s
+            .quarantine
+            .as_ref()
+            .map_or("unknown", QuarantineScope::containment));
+    }
     if duplicate {
         out["duplicate"] = json!(true);
     }
@@ -1351,11 +1936,12 @@ pub fn answer_of(s: &Stored, robot_id: &str, duplicate: bool, now_ms: u64) -> Va
 #[cfg(test)]
 mod tests {
     use super::*;
-    use robodr_responder::{Connectivity, ControlMode, MissionPhase, PlatformFamily};
+    use robodr_responder::{Connectivity, ControlMode, MissionPhase, Morphology, PlatformFamily};
 
     fn ctx() -> OperationalContext {
         OperationalContext {
             platform: PlatformFamily::Ugv,
+            morphology: Morphology::WheeledMobile,
             phase: MissionPhase::Transit,
             connectivity: Connectivity::Connected,
             control: ControlMode::Autonomous,
@@ -1367,7 +1953,21 @@ mod tests {
     fn policy() -> ResponsePolicy {
         let mut p = ResponsePolicy::conservative_default(PlatformFamily::Ugv);
         p.oem_validated = true;
+        p.morphology = Morphology::WheeledMobile;
         p
+    }
+
+    /// A policy and matching context for morphology `m`.
+    fn body_plan(m: Morphology) -> (OperationalContext, ResponsePolicy) {
+        let mut p = policy();
+        p.morphology = m;
+        (
+            OperationalContext {
+                morphology: m,
+                ..ctx()
+            },
+            p,
+        )
     }
 
     fn body(action: &str, params: Value, ttl: Option<u64>) -> Vec<u8> {
@@ -1378,7 +1978,7 @@ mod tests {
             "ttl_seconds": ttl,
             "reason": "rogue writer on /cmd_vel",
             "requested_by": "analyst@soc",
-            "source": "autosecops",
+            "source": "soc-a",
             "authority": "request",
         }))
         .unwrap()
@@ -1556,7 +2156,7 @@ mod tests {
             "invalid_field"
         );
         v["requested_by"] = json!("a");
-        v["source"] = json!("AutoSecOps");
+        v["source"] = json!("SOC A");
         assert_eq!(
             code(parse_submit(&serde_json::to_vec(&v).unwrap())),
             "invalid_field"
@@ -1625,6 +2225,25 @@ mod tests {
         c: &OperationalContext,
         p: &ResponsePolicy,
     ) -> Decision {
+        judged_caps(
+            r,
+            state,
+            c,
+            p,
+            EnvelopeCaps {
+                linear: Some(1.0),
+                joint: None,
+            },
+        )
+    }
+
+    fn judged_caps(
+        r: &ActionRequest,
+        state: SafetyState,
+        c: &OperationalContext,
+        p: &ResponsePolicy,
+        caps: EnvelopeCaps,
+    ) -> Decision {
         judge(
             r,
             "soc-1",
@@ -1632,10 +2251,7 @@ mod tests {
                 state,
                 context: c,
                 policy: p,
-                caps: EnvelopeCaps {
-                    linear: Some(1.0),
-                    joint: None,
-                },
+                caps,
             },
         )
     }
@@ -1647,10 +2263,224 @@ mod tests {
         }
     }
 
+    /// A request for `a` with the parameters and TTL it needs.
+    fn valid_req(a: ActionKind) -> ActionRequest {
+        match a {
+            ActionKind::RestrictMotion => req(
+                "restrict_motion",
+                json!({"max_linear_speed": 0.5}),
+                Some(60),
+            ),
+            ActionKind::QuarantineNode => req("quarantine_node", json!({"node": "/n"}), None),
+            ActionKind::IsolateNetwork => req("isolate_network", json!({}), Some(60)),
+            _ => req(a.as_str(), json!({}), None),
+        }
+    }
+
     #[test]
-    fn engaged_safety_system_refuses_everything() {
+    fn catalog_matches_the_responder() {
+        use robodr_responder::actions::{ActionId, CATALOG};
+        // One list: every catalog action is accepted by the request parser
+        // under its catalog name, and nothing else is.
+        assert_eq!(ActionKind::ALL, ActionId::ALL);
+        assert_eq!(ActionKind::ALL.len(), CATALOG.len());
+        for spec in CATALOG {
+            let a = ActionKind::parse(spec.name).expect("catalog name parses");
+            assert_eq!(a, spec.id);
+            assert_eq!(a.step(), spec.step);
+            assert_eq!(a.reversible(), spec.reversible);
+            assert_eq!(a.time_limited(), spec.time_limited);
+            assert!(!spec.autonomous);
+            let r = valid_req(a);
+            assert_eq!(r.action, a, "{}", spec.name);
+            assert_eq!(serde_json::to_value(r.action).unwrap(), json!(spec.name));
+        }
+        for wire in CATALOG.map(|c| c.wire_name) {
+            assert_eq!(
+                code(parse_submit(&body(wire, json!({}), None))),
+                "unknown_action",
+                "the request names the action, not its wire name: {wire}"
+            );
+        }
+    }
+
+    #[test]
+    fn record_evidence_is_accepted_as_a_record_only_plan() {
+        let r = req("record_evidence", json!({}), None);
+        assert_eq!(r.action, ActionKind::RecordEvidence);
+        assert_eq!(
+            code(parse_submit(&body(
+                "record_evidence",
+                json!({"node": "/n"}),
+                None
+            ))),
+            "parameter_not_allowed"
+        );
+        assert_eq!(
+            code(parse_submit(&body("record_evidence", json!({}), Some(60)))),
+            "ttl_not_allowed"
+        );
+        match judged(&r, SafetyState::MovingFast, &ctx(), &policy()) {
+            Decision::Accept(a) => {
+                assert_eq!(a.actions, vec![ResponseAction::Record]);
+            }
+            Decision::Refuse(x) => panic!("refused: {x:?}"),
+        }
+    }
+
+    #[test]
+    fn humanoid_refuses_de_energising_actions() {
+        let (c, p) = body_plan(Morphology::Humanoid);
+        for a in ActionKind::ALL {
+            let r = valid_req(a);
+            let d = judged(&r, SafetyState::MovingSlow, &c, &p);
+            if a.may_de_energise() {
+                assert_eq!(refusal(d), "fall_hazard", "{a:?}");
+            } else {
+                assert!(
+                    !matches!(d, Decision::Refuse(ref x) if x.code == "fall_hazard"),
+                    "{a:?}"
+                );
+            }
+        }
+        // Every other morphology keeps its safe pause.
+        for m in Morphology::ALL {
+            if m.falls_when_de_energised() {
+                continue;
+            }
+            let (c, p) = body_plan(m);
+            let r = req("safe_pause", json!({}), None);
+            assert!(
+                matches!(
+                    judged(&r, SafetyState::MovingSlow, &c, &p),
+                    Decision::Accept(_)
+                ),
+                "{m:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn balancing_robots_refuse_rollback_even_when_idle() {
+        // M3 / H2: a rollback restarts the controller; a legged robot
+        // reports idle while it balances.
+        let rb = req("rollback_config", json!({}), None);
+        for m in [Morphology::Humanoid, Morphology::Quadruped] {
+            let (c, p) = body_plan(m);
+            let d = judged(&rb, SafetyState::Idle, &c, &p);
+            assert_eq!(refusal(d), "fall_hazard", "{m:?}");
+        }
+        let (c, p) = body_plan(Morphology::WheeledMobile);
+        assert!(matches!(
+            judged(&rb, SafetyState::Idle, &c, &p),
+            Decision::Accept(_)
+        ));
+    }
+
+    #[test]
+    fn balancing_robots_refuse_near_stop_motion_caps() {
+        // M2: a near-zero joint speed cap makes a balancing robot fall.
+        let caps = EnvelopeCaps {
+            linear: Some(1.0),
+            joint: Some(2.0),
+        };
+        let tiny = req(
+            "restrict_motion",
+            json!({"max_joint_speed": 1e-9}),
+            Some(60),
+        );
+        let ok = req("restrict_motion", json!({"max_joint_speed": 1.0}), Some(60));
+        for m in [Morphology::Humanoid, Morphology::Quadruped] {
+            let (c, p) = body_plan(m);
+            let d = judged_caps(&tiny, SafetyState::MovingSlow, &c, &p, caps);
+            assert_eq!(refusal(d), "fall_hazard", "{m:?}");
+            // 0.39 of the envelope: below the 0.4 the OEM configured.
+            let mut q = p.clone();
+            q.min_motion_factor = 0.4;
+            q.limit_motion_factor = 0.5;
+            let low = req(
+                "restrict_motion",
+                json!({"max_joint_speed": 0.78}),
+                Some(60),
+            );
+            assert_eq!(
+                refusal(judged_caps(&low, SafetyState::MovingSlow, &c, &q, caps)),
+                "fall_hazard"
+            );
+            match judged_caps(&ok, SafetyState::MovingSlow, &c, &p, caps) {
+                Decision::Accept(a) => assert_eq!(
+                    a.actions,
+                    vec![
+                        ResponseAction::Record,
+                        ResponseAction::LimitMotion { factor: 0.5 }
+                    ]
+                ),
+                d => panic!("{m:?}: {d:?}"),
+            }
+            // No envelope to judge a joint cap against: refused, not
+            // recorded as given.
+            let none = EnvelopeCaps {
+                linear: Some(1.0),
+                joint: None,
+            };
+            assert_eq!(
+                refusal(judged_caps(&ok, SafetyState::MovingSlow, &c, &p, none)),
+                "fall_hazard"
+            );
+        }
+        // A wheeled robot may be slowed to a crawl.
+        let (c, p) = body_plan(Morphology::WheeledMobile);
+        assert!(matches!(
+            judged_caps(&tiny, SafetyState::MovingSlow, &c, &p, caps),
+            Decision::Accept(_)
+        ));
+    }
+
+    #[test]
+    fn record_evidence_is_accepted_in_observe_mode_and_while_engaged() {
+        // L3: evidence capture sends nothing to the platform.
+        let r = req("record_evidence", json!({}), None);
+        let mut observe = ctx();
+        observe.profile_locked = false;
+        let mut unvalidated = policy();
+        unvalidated.oem_validated = false;
+        for (state, c, p) in [
+            (SafetyState::EStopActive, ctx(), policy()),
+            (SafetyState::SafeStateActive, ctx(), policy()),
+            (SafetyState::MovingSlow, observe, policy()),
+            (SafetyState::MovingSlow, ctx(), unvalidated),
+        ] {
+            match judged(&r, state, &c, &p) {
+                Decision::Accept(a) => assert_eq!(a.actions, vec![ResponseAction::Record]),
+                Decision::Refuse(x) => panic!("{state:?}: refused {x:?}"),
+            }
+        }
+        // Everything else is still refused there.
+        let q = req("isolate_network", json!({}), Some(60));
+        assert_eq!(
+            refusal(judged(&q, SafetyState::EStopActive, &ctx(), &policy())),
+            "safety_system_engaged"
+        );
+    }
+
+    #[test]
+    fn morphology_mismatch_is_refused() {
+        let mut p = policy();
+        p.morphology = Morphology::Humanoid;
+        let q = req("isolate_network", json!({}), Some(60));
+        assert_eq!(
+            refusal(judged(&q, SafetyState::MovingSlow, &ctx(), &p)),
+            "morphology_mismatch"
+        );
+    }
+
+    #[test]
+    fn engaged_safety_system_refuses_everything_but_evidence() {
         let (c, p) = (ctx(), policy());
         for a in ActionKind::ALL {
+            if a == ActionKind::RecordEvidence {
+                continue;
+            }
             let r = match a {
                 ActionKind::RestrictMotion => req(
                     "restrict_motion",
@@ -1985,6 +2815,37 @@ mod tests {
         assert_eq!(a.body["safety_state"]["safety_system_engaged"], true);
         assert_eq!(a.body["executes_actions"], false);
         assert_eq!(a.body["mode"], "enforce");
+        assert_eq!(a.body["actions"].as_array().unwrap().len(), 7);
+    }
+
+    #[test]
+    fn robot_snapshot_does_not_advertise_refused_actions() {
+        // L4: a humanoid never advertises safe_pause / request_safe_state /
+        // rollback_config; a quadruped never rollback_config.
+        let e = engine();
+        for (m, gone) in [
+            (
+                Morphology::Humanoid,
+                &["safe_pause", "request_safe_state", "rollback_config"][..],
+            ),
+            (Morphology::Quadruped, &["rollback_config"][..]),
+            (Morphology::WheeledMobile, &[][..]),
+        ] {
+            let mut h = FakeHost::new(SafetyState::Idle);
+            (h.ctx, h.policy) = body_plan(m);
+            let a = e.robot(&mut h);
+            let listed: Vec<&str> = a.body["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            for g in gone {
+                assert!(!listed.contains(g), "{m:?} advertises {g}");
+            }
+            assert_eq!(listed.len(), 7 - gone.len(), "{m:?}: {listed:?}");
+            assert_eq!(a.body["morphology"], m.as_str());
+        }
     }
 
     /// The status mapping a future executor would get (none exists).
@@ -2013,5 +2874,441 @@ mod tests {
         assert_eq!(a.body["status"], "applied");
         assert_eq!(a.body["executed"], true);
         assert!(a.body["state"].get("note").is_none());
+    }
+
+    // --- Persistence: the request journal (state.rs) ---------------------
+
+    use crate::control::fsutil::fault;
+    use crate::control::state;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("robodr-cp-st-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The black-box references of `h`'s notes that carry `ids` (what the
+    /// daemon's reconciliation finds in the real black box).
+    fn found_in(h: &FakeHost, ids: &[String]) -> std::collections::BTreeMap<String, String> {
+        let mut out = std::collections::BTreeMap::new();
+        for (i, n) in h.notes.iter().enumerate() {
+            if let Some(d) = n["decision_id"].as_str() {
+                if ids.iter().any(|x| x == d) {
+                    out.insert(
+                        d.to_string(),
+                        format!("robodr-blackbox://ugv-007/0/{}?sha256=00", i + 1),
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    /// Restart: open the journal, settle dangling decisions against `h`.
+    fn restart(dir: &std::path::Path, h: &FakeHost, max: usize) -> (Engine, (usize, usize)) {
+        let (mut j, mut r) = state::open(dir, max).unwrap();
+        let ids: Vec<String> = r
+            .pending
+            .keys()
+            .chain(r.pending_reverts.keys())
+            .cloned()
+            .collect();
+        let settled = state::resolve(&mut j, &mut r, &found_in(h, &ids), max).unwrap();
+        (
+            Engine::with_journal("ugv-007", max, Box::new(RecordingExecutor), j, r.stored),
+            settled,
+        )
+    }
+
+    fn sub(id: &str, action: &str, params: Value, ttl: Option<u64>) -> Call {
+        let mut b: Value = serde_json::from_slice(&body(action, params, ttl)).unwrap();
+        b["request_id"] = json!(id);
+        Call::Submit(parse_submit(&serde_json::to_vec(&b).unwrap()).unwrap())
+    }
+
+    fn get(e: &mut Engine, h: &mut FakeHost, id: &str) -> Answer {
+        e.handle(&Call::Get(id.into()), &meta(), h)
+    }
+
+    #[test]
+    fn request_state_survives_a_restart() {
+        let d = tmp("restart");
+        let mut h = FakeHost::new(SafetyState::MovingSlow);
+        let (mut e, _) = restart(&d, &h, 16);
+        let a1 = e.handle(
+            &sub(
+                "r-1",
+                "restrict_motion",
+                json!({"max_linear_speed": 0.5}),
+                Some(600),
+            ),
+            &meta(),
+            &mut h,
+        );
+        assert_eq!(a1.body["status"], "recorded_not_executed", "{}", a1.body);
+        h.state = SafetyState::EStopActive;
+        let a2 = e.handle(&sub("r-2", "safe_pause", json!({}), None), &meta(), &mut h);
+        assert_eq!(a2.body["status"], "refused");
+        let rv = Call::Revert(
+            "r-1".into(),
+            parse_revert(br#"{"requested_by": "analyst@soc", "reason": "fp"}"#).unwrap(),
+        );
+        let a3 = e.handle(&rv, &meta(), &mut h);
+        assert_eq!(a3.body["status"], "not_applied");
+        let before: Vec<Value> = ["r-1", "r-2"]
+            .iter()
+            .map(|id| get(&mut e, &mut h, id).body)
+            .collect();
+        let notes = h.notes.len();
+        drop(e);
+        // A restart: the same answers, a resubmission is a duplicate (not
+        // judged or recorded again), another body under the id a conflict.
+        let (mut e, settled) = restart(&d, &h, 16);
+        assert_eq!(settled, (0, 0));
+        assert_eq!(e.stats.restored, 2);
+        for (id, b) in ["r-1", "r-2"].iter().zip(&before) {
+            assert_eq!(&get(&mut e, &mut h, id).body, b, "{id}");
+        }
+        assert!(before[0]["state"]["revert"]["evidence"].is_string());
+        let dup = e.handle(
+            &sub(
+                "r-1",
+                "restrict_motion",
+                json!({"max_linear_speed": 0.5}),
+                Some(600),
+            ),
+            &meta(),
+            &mut h,
+        );
+        assert_eq!(dup.body["duplicate"], true);
+        assert_eq!(h.notes.len(), notes);
+        let c = e.handle(
+            &sub(
+                "r-1",
+                "restrict_motion",
+                json!({"max_linear_speed": 0.4}),
+                Some(600),
+            ),
+            &meta(),
+            &mut h,
+        );
+        assert_eq!(
+            (c.status, c.body["error"]["code"].as_str()),
+            (409, Some("request_id_conflict"))
+        );
+        // The second revert after the restart: the first one is kept.
+        let again = e.handle(&rv, &meta(), &mut h);
+        assert_eq!(again.body["state"]["revert"], before[0]["state"]["revert"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Crash between the black-box note and the journal commit: the
+    /// decision is in the black box, so the restart commits it with that
+    /// note's reference; the answer the SOC got stays true.
+    #[test]
+    fn crash_after_the_note_before_the_commit_is_committed_from_the_black_box() {
+        let d = tmp("commit");
+        let mut h = FakeHost::new(SafetyState::MovingSlow);
+        let (mut e, _) = restart(&d, &h, 16);
+        // Appends: 1 = begin, 2 = commit (torn: the process dies there).
+        fault::arm("journal.append.torn", 2);
+        let a = e.handle(&sub("c-1", "safe_pause", json!({}), None), &meta(), &mut h);
+        assert!(fault::fired());
+        assert_eq!(a.body["status"], "recorded_not_executed");
+        drop(e);
+        let (mut e, settled) = restart(&d, &h, 16);
+        assert_eq!(settled, (1, 0));
+        let g = get(&mut e, &mut h, "c-1");
+        assert_eq!(g.body["status"], "recorded_not_executed");
+        assert_eq!(g.body["state"]["evidence"], a.body["state"]["evidence"]);
+        // Settled durably: the next restart has nothing dangling.
+        drop(e);
+        let (_, settled) = restart(&d, &h, 16);
+        assert_eq!(settled, (0, 0));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Crash between the journal begin and the black-box note: nothing was
+    /// recorded, so the restart aborts it; a resubmission is judged anew.
+    #[test]
+    fn crash_after_the_begin_before_the_note_is_aborted() {
+        let d = tmp("abort");
+        let mut h = FakeHost::new(SafetyState::MovingSlow);
+        let (mut e, _) = restart(&d, &h, 16);
+        // The black box refuses (no note) and the abort append is torn (the
+        // process dies): only the begin is durable.
+        h.fail = true;
+        fault::arm("journal.append.torn", 2);
+        let a = e.handle(&sub("a-1", "safe_pause", json!({}), None), &meta(), &mut h);
+        assert_eq!(a.body["status"], "failed");
+        assert_eq!(a.body["state"]["error"]["code"], "evidence_unavailable");
+        drop(e);
+        h.fail = false;
+        let (mut e, settled) = restart(&d, &h, 16);
+        assert_eq!(settled, (0, 1));
+        assert_eq!(get(&mut e, &mut h, "a-1").status, 404);
+        let a = e.handle(&sub("a-1", "safe_pause", json!({}), None), &meta(), &mut h);
+        assert_eq!(a.body["status"], "recorded_not_executed");
+        assert!(a.body.get("duplicate").is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A journal that cannot take the begin refuses the request before
+    /// anything is decided or recorded (fail closed).
+    #[test]
+    fn a_failing_journal_refuses_before_recording() {
+        let d = tmp("refuse");
+        let mut h = FakeHost::new(SafetyState::MovingSlow);
+        let (mut e, _) = restart(&d, &h, 16);
+        fault::arm("journal.append.torn", 1);
+        let a = e.handle(&sub("f-1", "safe_pause", json!({}), None), &meta(), &mut h);
+        assert_eq!(a.body["status"], "failed");
+        assert_eq!(a.body["state"]["error"]["code"], "state_unavailable");
+        assert!(h.notes.is_empty(), "nothing recorded");
+        assert_eq!(e.stats.journal_refusals, 1);
+        assert_eq!(get(&mut e, &mut h, "f-1").status, 404);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Crash between a revert's note and its commit: settled from the
+    /// black box like a request.
+    #[test]
+    fn crash_during_a_revert_is_settled_from_the_black_box() {
+        let d = tmp("revert");
+        let mut h = FakeHost::new(SafetyState::MovingSlow);
+        let (mut e, _) = restart(&d, &h, 16);
+        e.handle(&sub("v-1", "safe_pause", json!({}), None), &meta(), &mut h);
+        // Appends from here: 1 = revert_begin, 2 = revert_commit (torn).
+        fault::arm("journal.append.torn", 2);
+        let rv = Call::Revert(
+            "v-1".into(),
+            parse_revert(br#"{"requested_by": "analyst@soc"}"#).unwrap(),
+        );
+        let a = e.handle(&rv, &meta(), &mut h);
+        assert!(fault::fired());
+        assert_eq!(a.body["status"], "not_applied");
+        drop(e);
+        let (mut e, settled) = restart(&d, &h, 16);
+        assert_eq!(settled, (1, 0));
+        let g = get(&mut e, &mut h, "v-1");
+        assert_eq!(
+            g.body["state"]["revert"]["evidence"],
+            a.body["revert_evidence"]
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The journal is compacted to the live store and keeps the newest
+    /// `max_requests` across restarts.
+    #[test]
+    fn journal_is_bounded_by_compaction() {
+        let d = tmp("bounded");
+        let mut h = FakeHost::new(SafetyState::MovingSlow);
+        let (mut e, _) = restart(&d, &h, 16);
+        for i in 0..200 {
+            e.handle(
+                &sub(&format!("b-{i}"), "safe_pause", json!({}), None),
+                &meta(),
+                &mut h,
+            );
+        }
+        assert!(e.stats.journal_errors == 0);
+        drop(e);
+        let lines = std::fs::read_to_string(d.join(state::REQUEST_JOURNAL))
+            .unwrap()
+            .lines()
+            .count();
+        assert!(lines <= 2 * 16 + 64 + 3, "{lines}");
+        let (mut e, _) = restart(&d, &h, 16);
+        assert_eq!(e.stats.restored, 16);
+        assert_eq!(get(&mut e, &mut h, "b-199").status, 200);
+        assert_eq!(get(&mut e, &mut h, "b-184").status, 200);
+        assert_eq!(get(&mut e, &mut h, "b-183").status, 404);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// executor v1 on the v2 journal: an executor that answers through
+    /// `refresh` (as `executor_link::ControlExecutor` does).
+    #[derive(Clone, Default)]
+    struct Scripted(std::sync::Arc<std::sync::Mutex<HashMap<String, ExecutorOutcome>>>);
+
+    impl Scripted {
+        fn set(&self, id: &str, o: ExecutorOutcome) {
+            self.0.lock().unwrap().insert(id.into(), o);
+        }
+    }
+
+    impl ActionExecutor for Scripted {
+        fn name(&self) -> &'static str {
+            "robodr-executor"
+        }
+        fn executes(&self) -> bool {
+            true
+        }
+        fn submit(&mut self, _: &AcceptedAction<'_>) -> ExecutorOutcome {
+            ExecutorOutcome::Pending
+        }
+        fn revert(&mut self, _: &str, _: &str, _: &Meta) -> Option<ExecutorOutcome> {
+            Some(ExecutorOutcome::Pending)
+        }
+        fn refresh(&mut self, id: &str) -> Option<ExecutorOutcome> {
+            self.0.lock().unwrap().get(id).cloned()
+        }
+    }
+
+    /// A restart with the executor link's memory empty (a fresh
+    /// [`Scripted`]).
+    fn restart_exec(dir: &std::path::Path, h: &FakeHost, x: &Scripted) -> Engine {
+        let (mut e, _) = restart(dir, h, 16);
+        e.set_executor(Box::new(x.clone()));
+        e
+    }
+
+    #[test]
+    fn executor_states_are_journalled_and_survive_a_restart() {
+        let d = tmp("exec");
+        let mut h = FakeHost::new(SafetyState::Idle);
+        let x = Scripted::default();
+        let mut e = restart_exec(&d, &h, &x);
+        let a = e.handle(
+            &sub("x-1", "isolate_network", json!({}), Some(600)),
+            &meta(),
+            &mut h,
+        );
+        assert_eq!(a.body["status"], "pending", "{}", a.body);
+        e.handle(
+            &sub(
+                "x-2",
+                "quarantine_node",
+                json!({"node": "/rogue/teleop_node"}),
+                None,
+            ),
+            &meta(),
+            &mut h,
+        );
+        e.handle(
+            &sub("x-3", "isolate_network", json!({}), Some(60)),
+            &meta(),
+            &mut h,
+        );
+        // x-1 verified (queried), x-2 verified and only synced (nobody
+        // asked), x-3 refused by the executor's own check.
+        x.set("x-1", ExecutorOutcome::Verified);
+        // Review R2-3: the quarantine's scope is journalled with it.
+        x.set(
+            "x-2",
+            ExecutorOutcome::VerifiedQuarantine(QuarantineScope {
+                locators: vec!["10.0.0.66:7410".into()],
+                excluded: vec![ScopeExcluded {
+                    locator: "10.0.0.68:7410".into(),
+                    reason: "never seen sending from it".into(),
+                }],
+                addresses: vec!["10.0.0.66".into()],
+                excluded_addresses: Vec::new(),
+                evidence_truncated: false,
+            }),
+        );
+        x.set(
+            "x-3",
+            ExecutorOutcome::Refused {
+                code: "no_management_channel",
+                reason: "no management channel".into(),
+            },
+        );
+        let v1 = get(&mut e, &mut h, "x-1").body;
+        assert_eq!(v1["status"], "verified");
+        assert_eq!(v1["executed"], true);
+        e.sync("x-2");
+        let v3 = get(&mut e, &mut h, "x-3").body;
+        assert_eq!(v3["refusal"]["code"], "no_management_channel", "{v3}");
+        assert_eq!(
+            e.open_executor_requests(),
+            vec!["x-1".to_string(), "x-2".to_string()]
+        );
+        drop(e);
+
+        // Restart: the link knows nothing; the journal does.
+        let x = Scripted::default();
+        let mut e = restart_exec(&d, &h, &x);
+        assert_eq!(get(&mut e, &mut h, "x-1").body, v1);
+        assert!(v1.get("containment").is_none(), "not a quarantine: {v1}");
+        let v2 = get(&mut e, &mut h, "x-2").body;
+        assert_eq!(v2["status"], "verified");
+        assert_eq!(v2["containment"], "partial", "{v2}");
+        assert_eq!(v2["state"]["quarantine"]["locators"][0], "10.0.0.66:7410");
+        assert_eq!(
+            v2["state"]["quarantine"]["excluded"][0]["locator"],
+            "10.0.0.68:7410"
+        );
+        // Review R3-1: the addresses cut whole are journalled too.
+        assert_eq!(v2["state"]["quarantine"]["addresses"][0], "10.0.0.66");
+        assert_eq!(get(&mut e, &mut h, "x-3").body, v3);
+        // A revert: staged (`pending`), then the executor reports it.
+        let rv = Call::Revert(
+            "x-1".into(),
+            parse_revert(br#"{"requested_by": "analyst@soc", "reason": "done"}"#).unwrap(),
+        );
+        assert_eq!(e.handle(&rv, &meta(), &mut h).body["status"], "pending");
+        x.set("x-1", ExecutorOutcome::Reverted);
+        let r1 = get(&mut e, &mut h, "x-1").body;
+        assert_eq!(r1["status"], "reverted");
+        assert_eq!(r1["state"]["revert"]["result"], "pending");
+        // Asked again: already reverted, nothing new is journalled.
+        assert_eq!(e.handle(&rv, &meta(), &mut h).body["status"], "reverted");
+        drop(e);
+        let x = Scripted::default();
+        let mut e = restart_exec(&d, &h, &x);
+        assert_eq!(get(&mut e, &mut h, "x-1").body, r1);
+        assert_eq!(e.stats.journal_damaged, 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A journal that cannot take the executor's word keeps the stored
+    /// state (never answered, so never forgotten); the next query retries.
+    #[test]
+    fn an_executor_state_the_journal_does_not_take_is_not_answered() {
+        let d = tmp("exec-fail");
+        let mut h = FakeHost::new(SafetyState::Idle);
+        let x = Scripted::default();
+        let mut e = restart_exec(&d, &h, &x);
+        e.handle(
+            &sub("y-1", "isolate_network", json!({}), Some(60)),
+            &meta(),
+            &mut h,
+        );
+        x.set("y-1", ExecutorOutcome::Verified);
+        fault::arm("survive.journal.append.short_write", 1);
+        assert_eq!(get(&mut e, &mut h, "y-1").body["status"], "pending");
+        assert_eq!(e.stats.journal_errors, 1);
+        assert_eq!(get(&mut e, &mut h, "y-1").body["status"], "verified");
+        drop(e);
+        let mut e = restart_exec(&d, &h, &Scripted::default());
+        assert_eq!(get(&mut e, &mut h, "y-1").body["status"], "verified");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn persisted_entries_that_do_not_convert_back_are_damage() {
+        let d = tmp("convert");
+        let mut h = FakeHost::new(SafetyState::MovingSlow);
+        let (mut e, _) = restart(&d, &h, 16);
+        e.handle(&sub("k-1", "safe_pause", json!({}), None), &meta(), &mut h);
+        drop(e);
+        // A snapshot with a refusal code this code never writes.
+        let (mut j, r) = state::open(&d, 16).unwrap();
+        let mut p = state::PStored::of(&r.stored[0]);
+        p.request.request_id = "k-2".into();
+        p.refusal = Some(state::PRefusal {
+            code: "override_granted".into(),
+            reason: String::new(),
+            safety_state: SafetyState::MovingSlow,
+        });
+        j.append(&state::Entry::Stored { stored: p }).unwrap();
+        drop(j);
+        let (_, r) = state::open(&d, 16).unwrap();
+        assert_eq!(r.stored.len(), 1);
+        assert_eq!(r.damaged, 1);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -652,6 +652,31 @@ struct Ctx<'a> {
     segments: &'a [SegmentData],
     items: Vec<Item>,
     findings: Vec<Finding>,
+    /// What [`Ctx::rec`] returns for a position that holds no record. Never
+    /// reached (callers only pass positions whose hash was checked, i.e.
+    /// records); if it ever is, `invariant_broken` fails the report closed
+    /// instead of aborting the daemon that links this verifier (review L3).
+    placeholder: Record,
+    invariant_broken: std::cell::Cell<bool>,
+}
+
+/// See [`Ctx::placeholder`].
+fn placeholder_record() -> Record {
+    Record {
+        chain_id: [0; 32],
+        seq: 0,
+        time: crate::time::Timestamp {
+            wall_ns: 0,
+            mono_ns: 0,
+            source: crate::time::TimeSource::Unknown,
+        },
+        kind: RecordKind::Event,
+        critical: false,
+        payload: Vec::new(),
+        prev_hash: [0; 32],
+        hash: [0; 32],
+        sig: Vec::new(),
+    }
 }
 
 impl Ctx<'_> {
@@ -670,7 +695,13 @@ impl Ctx<'_> {
         self.findings.push(Finding::new(kind, loc));
     }
     fn rec(&self, pos: usize) -> &Record {
-        self.items[pos].rec.as_ref().expect("record item")
+        match self.items.get(pos).and_then(|it| it.rec.as_ref()) {
+            Some(r) => r,
+            None => {
+                self.invariant_broken.set(true);
+                &self.placeholder
+            }
+        }
     }
 }
 
@@ -723,6 +754,8 @@ pub fn verify_segments(
         segments,
         items: Vec::new(),
         findings: Vec::new(),
+        placeholder: placeholder_record(),
+        invariant_broken: std::cell::Cell::new(false),
     };
     let nseg = segments.len();
 
@@ -1115,9 +1148,9 @@ pub fn verify_segments(
     };
 
     // 6. Head / anchor.
-    if let Some(&head) = order.first() {
+    if let (Some(&head), Some(&last_pos)) = (order.first(), order.last()) {
         let (s0, prev0) = (cx.rec(head).seq, cx.rec(head).prev_hash);
-        let last_seq = cx.rec(*order.last().expect("non-empty")).seq;
+        let last_seq = cx.rec(last_pos).seq;
         match &opts.trusted_anchor {
             Some(a) if Some(a.chain_id) != expected_chain => {
                 cx.add(
@@ -1448,13 +1481,25 @@ pub fn verify_segments(
         prev_mono = Some(mono_ns);
     }
 
+    let first_seq = order.first().map(|&p| cx.rec(p).seq);
+    if cx.invariant_broken.get() {
+        cx.add(
+            FindingKind::Malformed {
+                reason: "internal verifier error: a record position held no record; \
+                         the verdict is not trustworthy"
+                    .into(),
+                len: 0,
+            },
+            None,
+        );
+    }
     let mut findings = std::mem::take(&mut cx.findings);
     findings.sort_by_key(|f| f.location.as_ref().map_or(usize::MAX, |l| l.position));
     Report {
         findings,
         frames,
         verified_records: order.len(),
-        first_seq: order.first().map(|&p| cx.rec(p).seq),
+        first_seq,
         last_seq: last.map(|(s, _)| s),
         last_hash: last.map(|(_, h)| to_hex(&h)),
         chain_id: expected_chain.map(|c| to_hex(&c)),
@@ -1582,6 +1627,27 @@ mod tests {
     use crate::record::{RecoveryPayload, TruncationPayload};
     use crate::sign::{HmacSha256Key, Signer};
     use crate::time::{TimeSource, Timestamp};
+
+    // Review L3: a broken internal invariant fails the report closed, it
+    // does not abort the daemon.
+    #[test]
+    fn rec_on_a_non_record_position_flags_instead_of_panicking() {
+        let cx = Ctx {
+            segments: &[],
+            items: vec![Item {
+                seg: 0,
+                offset: 0,
+                rec: None,
+            }],
+            findings: Vec::new(),
+            placeholder: placeholder_record(),
+            invariant_broken: std::cell::Cell::new(false),
+        };
+        assert_eq!(cx.rec(0).seq, 0);
+        assert!(cx.invariant_broken.get());
+        let _ = cx.rec(7);
+        assert!(cx.invariant_broken.get());
+    }
     use robodr_events::Severity;
 
     fn key() -> HmacSha256Key {

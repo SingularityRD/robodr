@@ -6,9 +6,11 @@ verified so far. CI is `.github/workflows/ci.yml`; every procedure below is a
 script that CI runs, so the lab and CI cannot drift apart.
 
 Contents: [Toolchain](#toolchain) · [Developer build](#developer-build) ·
+[C toolchain](#c-toolchain) ·
 [Pulsar / eBPF prerequisites](#pulsar--ebpf-prerequisites) ·
 [Cargo.lock policy](#cargolock-policy) · [Air-gapped builds](#air-gapped-builds) ·
 [SBOM](#sbom) · [Reproducible builds](#reproducible-builds) ·
+[Static (musl) build](#static-musl-build) ·
 [Licensing](#licensing) · [CI jobs](#ci-jobs) ·
 [Local CI verification](#local-ci-verification) ·
 [Verification status](#verification-status)
@@ -23,6 +25,7 @@ Contents: [Toolchain](#toolchain) · [Developer build](#developer-build) ·
 | MSRV | **1.87** (`u*::is_multiple_of`; Pulsar's own floor is 1.85, edition 2024) | `[workspace.package] rust-version`, `MSRV` in `.github/workflows/ci.yml` |
 | Edition (RoboDR crates) | 2021 | `[workspace.package]` |
 | Targets | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` | `rust-toolchain.toml` |
+| Static targets (`robodr-focal`) | `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` (`rustup target add`; not in `rust-toolchain.toml`) | `scripts/build-static.sh` |
 
 `pulsar-core` is compiled *inside* this workspace (path dependency on the
 `vendor/pulsar` submodule), so RoboDR pins exactly the compiler Pulsar is tested
@@ -71,7 +74,87 @@ workspace-wide (no list to maintain).
 Binaries built from the pure set (all shipped in the `.deb`, all checked by
 `scripts/ci-repro.sh`): `robodr-replay`, `robodr-agentd`, `robodr-blackbox`,
 `robodr-commission`, `robodr-diode-pack`, `robodr-diode-unpack`,
-`robodr-ros2-watch`. Pulsar-bound: `robodr-pulsard`.
+`robodr-ros2-watch`, `robodr-spool-export`, `robodr-kafka-publish`,
+`robodr-uplink`, `robodr-anchor-receiver`. Pulsar-bound: `robodr-pulsard`.
+
+C in the pure set: only `ring` (the crypto provider of rustls, linked into
+`robodr-uplink` and `robodr-agentd` for TLS — the agent's mutual-TLS
+control plane) compiles C and assembly through the `cc` crate,
+so a C compiler is needed. A developer build uses whatever `cc` is
+installed; **release and reproducibility builds use the pinned clang**
+for every target ([C toolchain](#c-toolchain)). Everything else is pure
+Rust.
+
+## C toolchain
+
+ring's C and assembly objects end up in the shipped `robodr-uplink` and
+`robodr-agentd`, so
+the release bytes depend on the C compiler, not only on the Rust
+toolchain. The C toolchain is therefore pinned like Rust is
+(`scripts/c-toolchain.sh` is the single source; this table repeats it):
+
+| Tool | Pin | Used for | Enforced |
+|---|---|---|---|
+| clang | **`clang-18` 18.1.3**, Ubuntu 24.04 package `clang-18=1:18.1.3-1ubuntu1` (release pocket: amd64 and arm64) | ring, every target: `x86_64`/`aarch64` `-linux-gnu` and `-linux-musl` (`CC_<triple>`) | yes: `scripts/ci-repro.sh`, `scripts/build-static.sh` and `release.yml` fail (exit 1) when `clang-18` is missing or reports another version; a `CC_<triple>` you set is checked the same way. No fallback to `cc`. |
+| gcc | 13.3.0 (Ubuntu 24.04 `gcc-13`) | the link driver of the `-linux-gnu` builds (`cc`) | documented, recorded |
+| binutils | 2.42 (Ubuntu 24.04) | GNU `ld` behind gcc (`-linux-gnu`); `ar` archives ring's objects before rustc reads them | documented, recorded |
+| rust-lld | from the Rust 1.98.1 toolchain | the linker of the musl builds | with the Rust pin |
+
+CI and release jobs install the pin with `scripts/ci-install-clang.sh`
+(`apt-get install clang-18=1:18.1.3-1ubuntu1`, `apt-mark hold`, then the
+version check). Each build writes the versions it actually used to
+`TOOLCHAIN.txt` next to its `SHA256SUMS` (`dist/repro/`,
+`dist/static/<triple>/`). `ROBODR_ALLOW_UNPINNED_CC=1` accepts another
+clang for local experiments only: the scripts then say "NOT a release
+build", and the hashes are not expected to match a release. The
+Pulsar-bound `robodr-pulsard` keeps its own clang-20 (eBPF) and is built
+without the ring pin; its reproducibility is not claimed.
+
+Changing a pin is a release-visible change: edit `scripts/c-toolchain.sh`,
+this table and the verification notes in one commit.
+
+**Air-gapped build hosts.** Besides the Rust toolchain and the vendored
+crates ([Air-gapped builds](#air-gapped-builds)), bring the C toolchain
+from a connected Ubuntu 24.04 host of the same architecture:
+
+```bash
+# On a connected noble host (amd64 or arm64, as the build host):
+apt-get download clang-18=1:18.1.3-1ubuntu1 \
+  $(apt-cache depends --recurse --no-recommends --no-suggests --no-conflicts \
+      --no-breaks --no-replaces --no-enhances clang-18=1:18.1.3-1ubuntu1 | grep '^\w' | sort -u)
+sha256sum ./*.deb > SHA256SUMS      # carry both through the entry station
+# On the build host (Ubuntu 24.04, same arch):
+sha256sum -c SHA256SUMS && sudo apt-get install ./*.deb   # or dpkg -i
+sudo apt-mark hold clang-18
+clang-18 --version | head -n1       # Ubuntu clang version 18.1.3 (1ubuntu1)
+```
+
+The `.deb` files are signed through Ubuntu's archive (`Release.gpg` →
+`Packages` → per-package SHA-256): verify them on the connected host
+(`apt-get download` does) before carrying them over. gcc 13 and binutils
+2.42 are part of a standard Ubuntu 24.04 build host (`build-essential`).
+
+**Independent verification of a release** (what a third party, or the
+air-gapped site, does to confirm the published binaries come from the
+tagged source):
+
+1. Ubuntu 24.04 (amd64, or arm64 for the arm64 assets), clean user, the
+   pinned C toolchain above, `rustup` with the toolchain of
+   `rust-toolchain.toml` (1.98.1) and, for `robodr-focal`, the musl
+   targets.
+2. `git clone --recurse-submodules` the repository and check out the
+   release tag; do **not** regenerate `Cargo.lock`.
+3. `scripts/ci-repro.sh dist/repro` (glibc binaries of the main `.deb`) and,
+   for `robodr-focal`, `CARGO_BUILD_TARGET=<triple>
+   CARGO_TARGET_<TRIPLE>_LINKER=rust-lld scripts/ci-repro.sh
+   dist/repro-static` or `scripts/build-static.sh <triple>`.
+4. Compare `dist/repro*/SHA256SUMS` with the release's `SHA256SUMS-<arch>`
+   (and the binaries extracted from the `.deb` with `dpkg-deb -x`); check
+   `TOOLCHAIN.txt` names the pinned versions. Verify the release's minisign
+   signatures as described below.
+
+A mismatch with every pin in place is a finding: report it (do not
+install).
 
 The submodule must be checked out even for the pure crates: cargo loads the
 whole workspace manifest, and `pulsar-core` is a path dependency.
@@ -256,41 +339,140 @@ script then compares `target/<triple>/release/robodr-*`. Controlled:
 | Source of drift | Control |
 |---|---|
 | Compiler | `rust-toolchain.toml` pin |
+| C compiler (ring) | pinned clang 18.1.3 for every target, enforced ([C toolchain](#c-toolchain)) |
 | Dependency versions | committed `Cargo.lock` (required), `--locked` |
 | Absolute paths (checkout, `CARGO_HOME`) | `--remap-path-prefix` to `/build/robodr` and `/cargo` |
 | Timestamps | `SOURCE_DATE_EPOCH` = HEAD commit time |
 | Codegen non-determinism | `codegen-units = 1`, `incremental = false`, `CARGO_INCREMENTAL=0` |
 | Debug info / symbols | `debug = false`, `strip = true` (`[profile.release]`) |
 
-To verify a published release independently: check out the tag with
-submodules, install Rust 1.98.1, run `scripts/ci-repro.sh`, and compare its
-`SHA256SUMS` with the one published for the release. Signing the release (the
-other half of the Sprint 1 assurance item) is not implemented yet.
+To verify a published release independently: follow
+[C toolchain](#c-toolchain), "Independent verification of a release"
+(the tag with submodules, Rust 1.98.1, the pinned clang,
+`scripts/ci-repro.sh`, compare its `SHA256SUMS` with the release's). Signing (the other
+half of the Sprint 1 assurance item) is implemented in `release.yml`'s
+`publish` job: `SHA256SUMS` plus a minisign signature (`*.minisig`) for every
+asset, verifiable offline with the public key in the repository variable
+`ROBODR_MINISIGN_PUBKEY`. It has never run on GitHub: the
+`MINISIGN_SECRET_KEY` / `MINISIGN_PASSWORD` secrets are not provisioned and
+no release has been cut. It passed a local dry run with a throwaway key
+([Release dry run](#release-dry-run-2026-10-26)); the procedure and key
+ceremony are in [docs/RELEASE.md](RELEASE.md).
+cosign / SLSA provenance is a TODO in the workflow.
 
 The Pulsar-bound binary (`pulsard` with RoboDR modules, embedding eBPF objects
 built by clang) is **not** covered yet: clang/LLVM output must be pinned and
 checked separately.
 
+## Static (musl) build
+
+**Why.** The release `.deb` is built on Ubuntu 24.04 and its binaries need
+glibc 2.39 (see [arm64](#arm64-cross-compiled-2026-10-18)); its units need
+systemd 247. Robot computers on older images cannot run it: NVIDIA JetPack 5
+(Ubuntu 20.04: glibc 2.31, systemd 245), the image of current Unitree EDU
+computers, and JetPack 6 / Ubuntu 22.04 (glibc 2.35). For them the pure
+binaries are built as **static musl executables** and shipped in the
+`robodr-focal` package (packaging/README.md), with systemd 245 units.
+`robodr-pulsard` is not built this way (it links libsqlite3/OpenSSL, embeds
+clang-built eBPF objects, and needs a BTF kernel that JetPack 5 lacks).
+
+```bash
+rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+scripts/build-static.sh x86_64-unknown-linux-musl     # -> dist/static/x86_64-unknown-linux-musl/
+scripts/build-static.sh aarch64-unknown-linux-musl    # cross, from any x86-64 host
+packaging/build-deb.sh --variant focal --bin-dir dist/static/aarch64-unknown-linux-musl --arch arm64 --out dist
+```
+
+`scripts/build-static.sh` builds exactly the set `ci-repro.sh` builds (the
+pure workspace) for the musl target with the release flags (`--locked`,
+`SOURCE_DATE_EPOCH`, `--remap-path-prefix`), links with **rust-lld** from
+the Rust toolchain for both targets (self-contained musl CRT and libc from
+the target's rust-std; no `musl-gcc`), compiles the one piece of C,
+`ring`'s C and assembly (rustls' crypto provider, `robodr-uplink` and
+`robodr-agentd`), with
+the **pinned clang** for both triples (`CC_<triple>` = `clang-18` 18.1.3,
+[C toolchain](#c-toolchain): missing or another version fails the build;
+ring needs no libc headers beyond what clang finds, verified 2026-10-26
+with clang 18 for both triples), then **refuses** any `robodr-*` binary
+that is not an ELF for the target machine, has a `PT_INTERP` program
+header or a `DT_NEEDED` entry, and writes the binaries and `SHA256SUMS`
+to `dist/static/<triple>/`. `build-deb.sh --variant focal` repeats the
+static check, so a dynamic binary can never reach `robodr-focal`, whose
+only dependency is `systemd (>= 245)`.
+
+| | x86_64-unknown-linux-musl | aarch64-unknown-linux-musl |
+|---|---|---|
+| Linker | rust-lld | rust-lld (cross) |
+| Layout | static-pie (ASLR of the image) | static, **not PIE**: the Rust target has no static-pie support, so the executable image is at a fixed address (stack, heap and mappings are still randomised) |
+| C compiler (ring) | pinned `clang-18` 18.1.3 | pinned `clang-18` 18.1.3 (cross, `--target` added by the `cc` crate) |
+| Reproducible | yes (`CARGO_BUILD_TARGET=<triple>` + `CARGO_TARGET_<TRIPLE>_LINKER=rust-lld` with `scripts/ci-repro.sh`, which pins `CC_<triple>` like `build-static.sh`) | same |
+
+Runtime differences from the glibc build to keep in mind: the musl resolver
+reads `/etc/hosts` and `/etc/resolv.conf` but not `nsswitch.conf` (give
+`robodr-kafka-publish` IP literals, and map `robodr-uplink`'s host name in
+`/etc/hosts`); musl's allocator is slower than glibc's
+under contention (agentd's hot path is single-threaded; not measured on a
+robot).
+
+**Verified on 2026-10-26** (Ubuntu 24.04 container, x86-64, Rust 1.98.1):
+
+- Both targets built with `scripts/build-static.sh` (10 binaries each,
+  every check passed). `file`: `ELF 64-bit LSB pie executable, x86-64,
+  static-pie linked, stripped` and `ELF 64-bit LSB executable, ARM aarch64,
+  statically linked, stripped`; `ldd`: `statically linked`; no `INTERP`, no
+  `NEEDED`.
+- `scripts/ci-repro.sh` with `CARGO_BUILD_TARGET=x86_64-unknown-linux-musl`:
+  10 binaries bit-identical across the two paths, and identical to
+  `build-static.sh`'s output from the same commit.
+- Smoke runs, amd64 natively and arm64 under `qemu-aarch64-static` 8.2:
+  `--version` of agentd / commission / ros2-watch; `robodr-blackbox keygen`;
+  `robodr-agentd --check-config` on `agentd.unitree-edu.example.json` (paths
+  pointed at the G1 example profile, policy and firewall); a 5 s agentd run
+  capturing on `lo`, then `robodr-blackbox verify`: `INTACT, CLEAN`.
+- `robodr-focal` `.deb` for both arches (`Depends: systemd (>= 245)`), built
+  twice with the same `SOURCE_DATE_EPOCH`: identical. Installed with dpkg in
+  the container; its units pass `systemd-analyze verify`; the credential
+  start sequence and agentd / spool-export as user `robodr` were run
+  without systemd (packaging/README.md, "Not verified").
+- Not done: the musl test suite (`cargo test --target ...-musl`; no disk
+  space in the sandbox), any run on a Jetson or under systemd 245.
+
+**Re-verified on 2026-10-26 with `robodr-uplink`** (rustls + ring, the first
+C in the pure set; Ubuntu 24.04 container, Rust 1.98.1, clang 18.1.3):
+`scripts/build-static.sh x86_64-unknown-linux-musl`: 11 binaries, all
+static-pie, no `INTERP`, no `NEEDED`; `scripts/ci-repro.sh` with
+`CARGO_BUILD_TARGET=x86_64-unknown-linux-musl`: 11 binaries bit-identical
+across the two paths (ring's C objects included); the aarch64 musl build of
+`robodr-uplink` links (clang cross-compiling ring), not run (no qemu in the
+container). The static `robodr-uplink --once` delivered a spool to an
+OpenSSL-based (Python `ssl`) HTTPS server through the test CA, a host name
+and an SPKI pin. `cargo +1.87.0 check -p robodr-export --all-targets`
+passes (MSRV).
+
 ## Licensing
 
-- Rust crates: `license = "Apache-2.0"` (`[workspace.package]`), a valid SPDX
-  expression for cargo, cargo-deny and the SBOM.
-- eBPF probe C sources (`*.bpf.c`): GPL-2.0-only, declared per file with an
-  `SPDX-License-Identifier` header. They are separate kernel programs, not Rust
-  crates. See `LICENSE` and `LICENSES/`.
+- RoboDR crates: `license = "LicenseRef-Proprietary"` (`[workspace.package]`;
+  `LICENSE` is the SingularityRD proprietary license). Every crate is
+  `publish = false`, so cargo-deny ignores our own crates
+  (`[licenses.private]`) and checks only third-party ones.
+- eBPF probe C sources (`*.bpf.c`, all from Pulsar): GPL-2.0-only, declared per
+  file with an `SPDX-License-Identifier` header. They are separate kernel
+  programs, not Rust crates; the corresponding source is offered with every
+  release (`LICENSE`, `LICENSES/`).
 - Pulsar uses the free-text string "Apache-2.0 WITH BPF probes exception under
   GPL-2.0", which is not SPDX; `deny.toml` clarifies Pulsar's Rust crates as
   Apache-2.0 so cargo-deny can evaluate them, and the fallback SBOM records the
   raw string as a named license.
-- `deny.toml` allows only permissive licenses for userspace crates; any
-  GPL/LGPL/AGPL (and MPL-2.0 without a reviewed exception) fails CI.
+- `deny.toml` allows only permissive licenses for third-party userspace
+  crates; any GPL/LGPL/AGPL (and MPL-2.0 without a reviewed exception) fails
+  CI, which keeps proprietary distribution of the linked binaries possible.
 
 ## CI jobs
 
 | Job | Required | What |
 |---|---|---|
 | `lockfile` | yes | Committed `Cargo.lock` has no local/patched/git/unknown sources; if none is committed, generate + upload the bootstrap lock and **fail** (every other job also fails without it) |
-| `scripts` | yes | Python self-tests of the CI scripts, Pulsar rule validation, `shellcheck scripts/*.sh packaging/*.sh` |
+| `scripts` | yes | Python self-tests of the CI scripts, Pulsar rule validation, `scripts/check-focal-units.py` (systemd 245 unit variants in step), `shellcheck` of `scripts/*.sh`, `packaging/*.sh`, the maintainer scripts and the focal credential helper |
 | `pure` | yes | `fmt --check`, `clippy -D warnings`, `test` for every member except Pulsar-bound ones |
 | `pulsar` | yes | Installs Pulsar's build packages, then `build` / `clippy -D warnings` / `test` of every Pulsar-bound member (`robodr-sensor-ros2`, `robodr-pulsard`). No kernel load |
 | `msrv` | informational | `cargo +1.87.0 check` of the pure crates |
@@ -298,6 +480,7 @@ checked separately.
 | `sbom` | yes | CycloneDX via cargo-cyclonedx **and** the std-only fallback; uploaded as artifact |
 | `fuzz` | yes | If `fuzz/` exists: every `cargo fuzz` target for 60 s on a pinned nightly; crashes uploaded |
 | `reproducible` | yes | `scripts/ci-repro.sh`; hashes uploaded |
+| `static` | yes | Per musl target: `ci-repro.sh` for the target, `scripts/build-static.sh`, built == reproduced, smoke run (arm64 under qemu-user), `robodr-focal` `.deb` (`Depends: systemd (>= 245)`, helper present, no `robodr-pulsard`); hashes uploaded. `release.yml`'s `build-static` job does the same and publishes `robodr-focal` debs and bundles with `SHA256SUMS-focal-<arch>` |
 
 All third-party actions are pinned by full commit SHA (resolved with
 `git ls-remote --tags` from the upstream repositories), with the tag in a
@@ -503,6 +686,84 @@ Not checked on arm64:
 - That ld.so really refuses the binaries on glibc < 2.39. This follows from
   the `readelf -V` output above and was not run on an old system.
 
+### Release dry run (2026-10-26)
+
+`release.yml` replayed end to end with `scripts/release-dry-run.sh`
+(procedure and scope: [docs/RELEASE.md](RELEASE.md), section 4) on Ubuntu
+24.04 amd64 (4 cores), source `04663a0` plus the dry run's release commit
+for the simulated tag `v0.1.0-rc.0-dryrun` (no git tag created), signed
+with a throwaway, test-only minisign key. Result: **PASS**.
+
+| Job / check | Result | Notes |
+|---|---|---|
+| guard: wrong tag, `Cargo.toml` version != `VERSION` | refused | the second guard failed before `6e69f91` (fix below) |
+| `prepare` | pass | draft prerelease, notes from the CHANGELOG section |
+| `build` amd64 | pass (22 min) | clang-20 installed from noble-updates for eBPF (not the fallback); 14 pure binaries reproducible; `robodr-pulsard` built `--locked`; 22 SBOMs (cargo-cyclonedx 0.5.9); `libc6 (>= 2.39)` |
+| `build` arm64 | pass (21 min) | **cross-compiled** (adaptations below); 14 reproducible; `robodr-pulsard` cross-built against multiarch `libssl-dev:arm64`/`libsqlite3-dev:arm64` |
+| `build-static` amd64 / arm64 | pass (12 / 15 min) | 14 static binaries each, reproducible, built == reproduced, smoke run (arm64 under qemu-aarch64-static 8.2) |
+| `publish` | pass | per-arch hashes, `SHA256SUMS`, 15 signatures with a password-protected key through the secret path, self-verify with the `RW...` string |
+| acceptance | pass | 15 assets + 15 `.minisig`; `minisign -V -p` on each; `install-bundle.sh verify --pubkey --tarball` on the 4 bundles (2 signatures each); a tampered bundle and a foreign key refused |
+| `scripts/deb-install-smoke.sh` | pass, 38 findings | all 4 `.deb`s unpack into a throwaway dpkg root, `dpkg --verify` clean, sysusers/tmpfiles apply, every binary starts (amd64 native, arm64 under qemu), `systemd-analyze verify` (systemd 255) clean on 9 regular / 7 focal units. Findings: see below |
+
+Adaptations of the arm64 `build` job (GitHub runs it natively on
+`ubuntu-24.04-arm`): `CARGO_BUILD_TARGET=aarch64-unknown-linux-gnu`,
+linker `aarch64-linux-gnu-gcc` 13.3.0 (`libc6-dev-arm64-cross`), pkg-config
+for the arm64 multiarch libraries, `target/release` read as
+`target/aarch64-unknown-linux-gnu/release` and the host triple as the
+target triple in its step scripts, and `cargo install` without
+`CARGO_BUILD_TARGET`. ring is still compiled with the pinned clang-18.
+In every job, `ln -sf ... /usr/local/bin/` writes into the dry run's own
+`bin/`.
+
+Defects found and fixed:
+
+- `release.yml` `prepare` accepted a release commit whose `Cargo.toml`
+  `[workspace.package] version` was not `VERSION`: every binary's
+  `--version`, agentd's `product_version` and the SBOMs would have named the
+  previous release inside packages labelled with the new one. Now refused
+  (`6e69f91`).
+- `release.yml` `ROBODR_DEB_REQUIRE` omitted `robodr-executor`,
+  `robodr-firewall-gw` and `robodr-anchor-receiver` (focal: the first two),
+  so a build that stopped producing them would have shipped without them
+  (`ccbcecc`).
+- `scripts/ci-repro.sh` never deleted its default scratch directory (two
+  source copies with their `target/`, ~0.6 GB per run) (`803f177`).
+- Dry-run tooling itself: `cargo install` inherited the cross target and
+  replaced the host's `cargo-cyclonedx` with an aarch64 binary
+  (`04663a0`); the smoke test's root needed systemd's units, `/bin/sh`,
+  `--path-include` and conffile handling (`f351533`).
+
+Findings (crate code), fixed after this run: `--version` exited 2 on
+`robodr-anchor-receiver`, `robodr-blackbox`, `robodr-diode-pack`,
+`robodr-diode-unpack`, `robodr-kafka-publish`, `robodr-replay`,
+`robodr-spool-export`, `robodr-firewall-gw`; `--help` exited 2 on
+`robodr-kafka-publish` and `robodr-spool-export`. All of them started and
+printed their usage. Every shipped binary now prints `<name> <version>` for
+`--version` and its usage on stdout for `--help`, both with exit 0, so
+`scripts/release-dry-run.sh` runs the smoke test with `--strict` (any such
+finding fails the dry run).
+
+Published set (test-only signatures; these hashes are of a dry run, never
+of a release):
+
+```text
+8498348  94377543dd85fa24bfc14b4fb04a4a4db01a973829cc3748916dac372c3c2c17  robodr_0.1.0~rc.0-dryrun-1_amd64.deb
+6442828  d298c6cf1e72b1ca85f703eb7a7fc47dd48a42539012521b94cd242a23b4458b  robodr_0.1.0~rc.0-dryrun-1_arm64.deb
+6338068  bafce6961973010c0977ebd2a85066dd4c29f717a66e4f1533836521d109f01d  robodr-focal_0.1.0~rc.0-dryrun-1_amd64.deb
+4359708  cef244f22cfbd38246b0902af69c15498d72017cdb68cb7c61f4cec91d26e1c8  robodr-focal_0.1.0~rc.0-dryrun-1_arm64.deb
+8797258  e7d9a3a2fa7b37c1bbdf7ead1261dbbb76ec9a3894e125a555f94b5a22fcf894  robodr-0.1.0-rc.0-dryrun-amd64-offline.tar.gz
+6738175  4c505c3156db1ae170e03a08c27a2dfebb259837536fe79d04179e4469cd9d00  robodr-0.1.0-rc.0-dryrun-arm64-offline.tar.gz
+6637206  bca429a243aa4ac478e29d2c81ba708637a7d681b13bd9a95d1b5949638700ba  robodr-focal-0.1.0-rc.0-dryrun-amd64-offline.tar.gz
+4658985  6b709ec98404abffeac49ad5132bc9032fa7b3b1d1110922eb5a8ce352e55ea8  robodr-focal-0.1.0-rc.0-dryrun-arm64-offline.tar.gz
+ 186469  4a989bdbdb77a3d512d86862ce0bbfa9378f44eb3be1263015be9dc510155e4b  robodr-0.1.0-rc.0-dryrun-amd64-sbom.tar.gz
+ 182493  8e81507ce1dee065ad6e22310d64275a964bbf4c77509bd55f3d7cd1e1c46d2d  robodr-0.1.0-rc.0-dryrun-arm64-sbom.tar.gz
+```
+
+Not covered by the dry run: see [docs/RELEASE.md](RELEASE.md), "What only
+a real CI run can prove". Commits after `04663a0` (the executor/firewall-gw
+merge `6dc3613` and later) were not re-run; they change no packaging
+script, unit or workflow.
+
 ## Verification status
 
 Be precise about what has and has not been exercised. Last updated with the CI
@@ -554,5 +815,9 @@ cargo-cyclonedx / cargo-deny / shellcheck installed):
   the case). The Pulsar-bound crates were not checked at all.
 - The air-gapped procedures (mirror, vendored tarball, offline toolchain,
   advisory-DB snapshot) are documented, not yet rehearsed in the lab.
-- Release signing is not implemented. Reproducibility of the Pulsar-bound
-  binary (eBPF objects from clang) is not checked.
+- Release signing (minisign in `release.yml`'s `publish` job) has never run
+  on GitHub: no signing key is provisioned and no release was cut. The whole
+  workflow passed a local dry run with a throwaway key on 2026-10-26
+  ([Release dry run](#release-dry-run-2026-10-26)).
+  Reproducibility of the Pulsar-bound binary (eBPF objects from clang) is not
+  checked.

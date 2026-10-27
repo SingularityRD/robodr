@@ -5,6 +5,9 @@
 //! Exit codes: 0 ok, 1 error (including "another instance holds the
 //! lock"), 2 usage.
 
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+
 use robodr_diode::cli::{self, MAX_INPUT_FILE};
 use robodr_diode::pack::{PackConfig, Packer};
 use std::path::Path;
@@ -17,6 +20,7 @@ usage: robodr-diode-pack --outbox DIR --state FILE --unit UNIT_ID \\
          [--max-batch-bytes N] [--max-findings N] [--now-ms MS] \
          [--parity M] [--shard-size BYTES] [--archive-keep N]
        robodr-diode-pack resend --outbox DIR --state FILE --unit UNIT_ID --seq N
+       robodr-diode-pack --version
 
 --key-file is a robodr-blackbox secret key file (`robodr-blackbox keygen`,
 ed25519; mode 0600, owned by this user or root, else refused). --key-id, if
@@ -65,6 +69,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if cli::is_version_request(&argv) {
+        println!("robodr-diode-pack {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     if argv.first().map(String::as_str) == Some("resend") {
         let args = match cli::parse_args(argv.into_iter().skip(1), RESEND_FLAGS) {
             Ok(a) => a,

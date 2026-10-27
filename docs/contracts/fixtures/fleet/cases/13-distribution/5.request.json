@@ -1,0 +1,21 @@
+{
+  "body_file": "5.body",
+  "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "headers": [
+    [
+      "X-RoboDR-Key-Id",
+      "ed25519:7bf642b114c6afa2"
+    ],
+    [
+      "X-RoboDR-Timestamp",
+      "1790000060000"
+    ],
+    [
+      "X-RoboDR-Signature",
+      "b24c051dc90d54e569142998ac991e7d922da02d0e3003d1056880d0a83255262a6e79065038e55b51cfcdeb1c6f17f4a729bdda4ca0e4f12425fb2190ab8c0f"
+    ]
+  ],
+  "method": "GET",
+  "server_time_ms": 1790000060000,
+  "target": "/api/robot-edr/v2/fleet/profiles/approvals/74f11807fc52af6b7b274348ebce77307bd2af34800e3bcdf4b62e2957c3f1c7"
+}

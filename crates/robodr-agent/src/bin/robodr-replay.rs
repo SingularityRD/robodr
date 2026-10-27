@@ -18,6 +18,24 @@
 //! Keys are never accepted on the command line: argv is readable by every
 //! process through /proc.
 
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+// S10 (R9): release builds use `panic = "abort"`, so any panic kills the
+// daemon (systemd restarts it; docs/OPERATIONS.md, "Crashes and restarts").
+// Non-test code has no unwrap / expect / panic!-family call; slice indexing
+// and arithmetic are left to review and fuzzing (fuzz/README.md).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
+
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -49,6 +67,7 @@ USAGE:
                 [--record-all-events] [--partitions N] [--log-plans]
   robodr-replay verify --blackbox DIR --key-file FILE
                 [--robot-id ID] [--findings findings.jsonl]
+  robodr-replay --help | --version
 
   STATE:  idle | moving_slow | moving_fast | collaborative_human_nearby |
           estop_active | safe_state_active | unknown (default unknown)
@@ -507,6 +526,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if argv.len() == 1 && matches!(argv[0].as_str(), "-V" | "--version") {
+        println!("robodr-replay {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     let (cmd, rest) = match argv.first().map(String::as_str) {
         Some("verify") => ("verify", &argv[1..]),
         Some("run") => ("run", &argv[1..]),
@@ -519,9 +542,13 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if args.has("help") || rest.is_empty() {
+    if args.has("help") {
+        print!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
+    if rest.is_empty() {
         eprint!("{USAGE}");
-        return ExitCode::from(if args.has("help") { 0 } else { 2 });
+        return ExitCode::from(2);
     }
     let res = if cmd == "verify" {
         verify_cmd(&args)

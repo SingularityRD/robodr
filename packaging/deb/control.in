@@ -1,13 +1,16 @@
-Package: robodr
+Package: @PACKAGE@
 Version: @VERSION@
 Architecture: @ARCH@
 Maintainer: @MAINTAINER@
 Installed-Size: @INSTALLED_SIZE@
 Depends: @DEPENDS@
+Suggests: nftables, iproute2
+Conflicts: @OTHER_PACKAGE@
+Replaces: @OTHER_PACKAGE@
 Section: admin
 Priority: optional
 Homepage: https://github.com/SingularityRD/robodr
-Description: RoboDR - Robot Detection & Response (protective only)
+Description: @SYNOPSIS@
  Runtime security for ROS 2 robots built on the Pulsar eBPF runtime: a
  Pulsar daemon with the RoboDR ROS 2 sensor (robodr-pulsard), the decision
  chain agent (robodr-agentd, when built), commissioning, replay and capture

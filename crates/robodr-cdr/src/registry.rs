@@ -4,7 +4,10 @@
 //! `<pkg>::msg::dds_::<Type>_` (that is what SEDP `PID_TYPE_NAME` carries and
 //! what `robodr_events::graph::Endpoint::type_name` holds). The registry is
 //! keyed by that exact string; [`Registry::with_builtin`] also registers the
-//! ROS spelling `<pkg>/msg/<Type>` for configuration convenience.
+//! ROS spelling `<pkg>/msg/<Type>` for configuration convenience. The
+//! built-in set includes the Unitree motion types
+//! (`unitree_go::msg::dds_::LowCmd_`, `unitree_hg::msg::dds_::LowCmd_`,
+//! `unitree_api::msg::dds_::Request_`, ...; see [`crate::unitree`]).
 
 use std::collections::BTreeMap;
 
@@ -43,6 +46,25 @@ kind_decoder!(dec_odometry, MessageKind::Odometry);
 kind_decoder!(dec_imu, MessageKind::Imu);
 kind_decoder!(dec_joint_state, MessageKind::JointState);
 kind_decoder!(dec_joint_trajectory, MessageKind::JointTrajectory);
+kind_decoder!(dec_unitree_go_low_cmd, MessageKind::UnitreeGoLowCmd);
+kind_decoder!(dec_unitree_go_low_state, MessageKind::UnitreeGoLowState);
+kind_decoder!(
+    dec_unitree_go_sport_state,
+    MessageKind::UnitreeGoSportModeState
+);
+kind_decoder!(dec_unitree_hg_low_cmd, MessageKind::UnitreeHgLowCmd);
+kind_decoder!(dec_unitree_hg_low_state, MessageKind::UnitreeHgLowState);
+kind_decoder!(dec_unitree_hg_hand_cmd, MessageKind::UnitreeHgHandCmd);
+kind_decoder!(dec_unitree_hg_hand_state, MessageKind::UnitreeHgHandState);
+kind_decoder!(dec_unitree_hg_imu, MessageKind::UnitreeHgImuState);
+kind_decoder!(
+    dec_unitree_hg_double_imu,
+    MessageKind::UnitreeHgDoubleImuState
+);
+kind_decoder!(dec_unitree_api_request, MessageKind::UnitreeApiRequest);
+kind_decoder!(dec_unitree_go_motor_cmds, MessageKind::UnitreeGoMotorCmds);
+kind_decoder!(dec_unitree_hg_motor_cmd, MessageKind::UnitreeHgMotorCmd);
+kind_decoder!(dec_unitree_hg_motor_state, MessageKind::UnitreeHgMotorState);
 
 /// The built-in decoder for a kind.
 pub fn builtin_decoder(kind: MessageKind) -> DecodeFn {
@@ -53,6 +75,19 @@ pub fn builtin_decoder(kind: MessageKind) -> DecodeFn {
         MessageKind::Imu => dec_imu,
         MessageKind::JointState => dec_joint_state,
         MessageKind::JointTrajectory => dec_joint_trajectory,
+        MessageKind::UnitreeGoLowCmd => dec_unitree_go_low_cmd,
+        MessageKind::UnitreeGoLowState => dec_unitree_go_low_state,
+        MessageKind::UnitreeGoSportModeState => dec_unitree_go_sport_state,
+        MessageKind::UnitreeHgLowCmd => dec_unitree_hg_low_cmd,
+        MessageKind::UnitreeHgLowState => dec_unitree_hg_low_state,
+        MessageKind::UnitreeHgHandCmd => dec_unitree_hg_hand_cmd,
+        MessageKind::UnitreeHgHandState => dec_unitree_hg_hand_state,
+        MessageKind::UnitreeHgImuState => dec_unitree_hg_imu,
+        MessageKind::UnitreeHgDoubleImuState => dec_unitree_hg_double_imu,
+        MessageKind::UnitreeApiRequest => dec_unitree_api_request,
+        MessageKind::UnitreeGoMotorCmds => dec_unitree_go_motor_cmds,
+        MessageKind::UnitreeHgMotorCmd => dec_unitree_hg_motor_cmd,
+        MessageKind::UnitreeHgMotorState => dec_unitree_hg_motor_state,
     }
 }
 

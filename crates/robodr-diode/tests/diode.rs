@@ -83,7 +83,7 @@ fn round_trip_findings_and_bundle() {
     assert_eq!(recs.len(), 5);
     for (rec, env) in recs.iter().zip(&fs_in) {
         let expected = robodr_ocsf::record(env, Some(12)).unwrap();
-        assert_eq!(rec["topic"], "robot-edr.findings");
+        assert_eq!(rec["topic"], robodr_ocsf::DEFAULT_TOPIC);
         assert_eq!(rec["key"], expected.key.as_str());
         assert_eq!(rec["value"], expected.value.as_str());
         assert_eq!(rec["partition"], expected.partition.unwrap());

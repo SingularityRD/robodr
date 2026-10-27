@@ -22,6 +22,7 @@ is tested offline. The same code runs in three places:
 | `source` | `Datagram` and `DatagramSource`: a blocking, std-only seam. `CaptureDatagramSource` wraps `robodr_capture::rtps_datagrams` for live `AF_PACKET` (`open_live`, Linux, `CAP_NET_RAW`) and for pcap/pcapng files (`open_file`). It takes an optional stop flag. `VecDatagramSource` is the in-memory source. |
 | `pipeline` | `Pipeline` runs `FragmentReassembler::parse_datagram_detailed`, using **one long-lived, bounded reassembler**. Then `Profile::evaluate` + removal, anomaly and fragmentation findings, then bounded dedup, then `Finding`s stamped `enforce` or `observe`. Also holds `load_profile`, `ProfileStatus` and `ThreatExtra`, the flat `extra` table and JSON line. |
 | `motion` | The live motion decode path. Learns writer GUID → (topic, type) and reader GUID → topic from SEDP (bounded tables), walks user DATA / DATA_FRAG with `robodr-rtps`'s `UserDataWalker`, decodes samples on the profile's motion channels and on `motion.feedback_topics` with `robodr-cdr`, and returns `MotionCommand` / `MotionFeedback` samples (`Pipeline::process_with_motion_at`, `ProcessOutput::motion`). Commands go through `Profile::evaluate` (envelope). |
+| `legacy` | Unitree legacy UDP (Go1 generation, `unitree_legged_sdk`), off by default (`unitree_legacy` sub-table). The capture filter (and its kernel BPF) also accepts UDP on the configured legacy ports; `Pipeline::process_datagram_with_motion` hands those datagrams (`Datagram::legacy`) to `Pipeline::process_legacy_from_at`: sender check on the class the length announces (a compressed 614-byte `LowCmd` is still a command), optional IP→MAC binding, decode by length (`robodr_cdr::unitree_legacy::LegacyFrame`), commands on `/unitree_legacy/high_cmd` / `low_cmd` as `MotionSample`s (a decoded `LowCmd` with its 20-slot joint frame; feedback when its channel is a feedback topic). A datagram on a legacy port is **always** a legacy datagram; one that is also RTPS (`LegacyUdp::also_rtps`) is inspected on both paths and reported. Unlisted senders have their own bounded finding budget (aggregated beyond 16 per class), outside the shared rate limiter. |
 | `config` | `Config`, i.e. `[module.robodr-sensor-ros2]` plus the `[...capture]` sub-table, and its validation. Domain id gives the SPDP port. Capture domain ids give the `RtpsPortMap`. Default capture interfaces are `lo` plus the interface of the `/proc/net/route` default route. `CaptureSettings::open` opens the configured source. |
 | `socket` | Receive-only SPDP multicast socket. It sets `SO_REUSEADDR` before `bind` and binds to the group address, so it coexists with the robot's DDS participants. |
 | `sanitize`, `dedup` | Attacker-controlled text is control-escaped and capped at 512 chars. The dedup set is O(capacity) and stores keyed hashes. |
@@ -51,12 +52,27 @@ is tested offline. The same code runs in three places:
 | `robot.motion.undecodable_sample` | Medium, rate limited | a sample on a motion / feedback topic was not inspected: undecodable CDR, unknown type, wrong-role type, malformed DATA / inline QoS, fragments refused / evicted / conflicting, per-datagram sample cap |
 | `robot.motion.unattributed_sample` | High | DATA to a reader announced on a motion / feedback topic from a writer never announced via SEDP |
 | `robot.motion.sample_source_mismatch` | Critical (command topic) / High (feedback) | a decoded motion sample whose writer prefix is bound (SPDP / `participant_ips`) to other IPs than its source |
+| `robot.motion.command_type_mismatch` | High | a writer announced on a profiled command channel with a type other than the profile's `motion_types` entry, a type no decoder knows, or a feedback type; at the announcement, never rate limited |
+| `robot.unitree.legacy_unknown_sender` | Critical (command, decoded or compressed) / Medium (state, or no legacy length) | a Unitree legacy UDP frame from an IP not in `unitree_legacy.command_senders` (commands) / `robot_addresses` (state); the legacy protocol is unauthenticated. Not in the shared rate limiter: one finding per sender for the first 16 senders of a class |
+| `robot.unitree.legacy_sender_flood` | Critical (commands) / Medium | frames from more unlisted senders than the 16 reported one by one (or a MAC-bound sender seen with many wrong MACs): one finding with the frame count at 1, 2, 4, 8, ... frames; bounded memory |
+| `robot.unitree.legacy_sender_mac_mismatch` | High | a command from a listed sender whose `command_senders` entry binds a MAC, with another link-layer source (or reassembled from fragments, so unverifiable); the frame is not attributed |
+| `robot.unitree.legacy_port_rtps` | High | a datagram on a legacy port that also parses as RTPS (inspected on both paths) |
 
 Each distinct finding (rule + detail) is reported once. Dedup is bounded, so
 eviction can only cause a re-report.
 
 ### Flood limits
 
+- Every per-participant / per-endpoint finding names its GUID prefix as
+  structured data (`Finding::participant`), never to be parsed back from
+  the detail text: robodr-agentd aggregates a flooding source's findings
+  by it (discovery-flood guard), and a participant that raised a High or
+  Critical finding keeps its remembered quarantine locators longer, and
+  keeps them (merged) when it comes back from a new address
+  (`src/binding.rs`, "Quarantine locators"). Under global pressure the
+  remembered locators of the fullest per-source bucket go first, so a
+  spray from a few addresses evicts its own entries, never a SOC-named
+  rogue's.
 - **Per-datagram cap** (`max_findings_per_datagram`, default 64): new
   findings of one datagram (or tick / end of replay / capture-health update)
   are ordered most severe first and at most this many are reported; the rest
@@ -118,8 +134,35 @@ datagram ─► discovery parse ─► SEDP: writer GUID → (topic, type), read
 Configuration (`[module.robodr-sensor-ros2.motion]` / agentd `sensor.motion`):
 `enabled` (default true), `feedback_topics` (ROS names, e.g. `["/odom"]`),
 `evaluate_commands` (default true), `max_writers` (4096),
-`max_samples_per_datagram` (256).
+`max_samples_per_datagram` (256). `MotionOptions::robot_model` has no key
+here: `robodr-agentd` sets it from `robot.robot_model` (the Pulsar sensor
+runs without it, so model-specific Unitree API ids are `Unknown` there).
 
+Unitree legacy UDP (`[module.robodr-sensor-ros2.unitree_legacy]` / agentd
+`sensor.unitree_legacy`): `enabled` (default false), `ports` (default
+`[8007, 8080, 8082, 8090]`; refused when one lies inside the RTPS port
+range of a configured DDS domain, e.g. domain 2 covers 7900-8149),
+`command_senders` (IPs, or tables `{ip, mac?, label?}`: `mac` binds the
+sender to its link-layer source, checked where the capture sees one —
+`AF_PACKET`, Ethernet / Linux cooked pcap — and a raise of the bar only,
+since a host on the same L2 segment can forge a MAC too), `robot_addresses`
+(default `192.168.123.10`, `192.168.123.161`). Needs `capture`; `Datagram`
+carries `legacy` (UDP ports, source MAC, reassembled, also-RTPS) and
+`captured_at` (the capture timestamp, which `robodr-agentd` uses as the
+joint firewall's clock).
+
+- **Unitree.** Unitree SDK2 topics are plain DDS topics named `rt/...`
+  and de-mangle like ROS topics (`rt/lowcmd` -> `/lowcmd`,
+  `rt/api/sport/request` -> `/api/sport/request`, `rt/dex3/left/cmd` ->
+  `/dex3/left/cmd`); their types decode by the SEDP type name
+  (`unitree_go::msg::dds_::LowCmd_`, ...). A decoded low-level joint
+  command also carries its per-slot frame in `MotionSample::joint`
+  (`JointCommandSample`: every slot, the decoder's CRC verdict, the hg
+  `mode_pr` / `mode_machine`) for a joint firewall, and
+  `MotionOptions::robot_model` interprets Unitree API requests with the
+  model's API tables (model-specific ids are otherwise `Unknown`). Every
+  SDK2 topic of the decoder's model matrix is exercised by
+  `tests/unitree_topics.rs`.
 - The event time is the **capture** time the caller passes (the plain
   `process*` methods use nanoseconds since the pipeline was built). The
   INFO_TS source timestamp is exposed in `MotionSample::source_timestamp`
@@ -155,6 +198,22 @@ sudo robodr-ros2-watch --profile profile.json --interface lo --interface eth0 --
 
 ## Tests
 
+`tests/unitree_topics.rs` (4): every Unitree SDK2 topic of the model matrix
+(low-level, arm SDK, user control, hand SDK, Dex3, waist, IMU, sport state,
+API) de-mangles, decodes by its SEDP type and maps to a command / feedback
+(joint frames carry their slots, CRC verdict, `mode_pr` / `mode_machine`);
+model-specific API ids with and without `robot_model`; the legacy UDP path
+(off, unknown sender, over envelope, compressed frame, dedup).
+
+`tests/review6_unitree_live_regressions.rs` (10): a compressed `LowCmd`
+from an unknown host is Critical, and an `undecodable_sample` flood does not
+suppress it; a 5000-address spoofed-source flood gives 16 per-sender and a
+few aggregated findings; IP→MAC binding (match, mismatch, unknown,
+fragmented); RTPS on a legacy port from a pcap is inspected on both paths;
+unknown / feedback / changed types on a profiled command channel are High;
+a decoded legacy `LowCmd` carries its joint frame. The config tests also
+cover legacy ports inside the DDS port map and `command_senders` tables.
+
 The counts below are from before the motion path; it added 23 tests:
 16 in `tests/motion_decode.rs` (Twist on `rt/cmd_vel` from a profiled writer
 within / over the envelope, NaN, an unprofiled writer (Critical discovery
@@ -189,14 +248,23 @@ There were 73 tests before:
   `config/robodr.toml.example` keys are known and parse.
 - **1 test in `tests/live_capture.rs`.** It catches a rogue SEDP on `lo`
   live. It needs `CAP_NET_RAW` and is otherwise SKIPPED.
+- **`tests/real_captures.rs` and `tests/real_captures_lab.rs`.** They run
+  real ROS 2 Jazzy captures (`fixtures/captures/ros2-jazzy/`, Fast DDS 2.14
+  and Cyclone DDS 0.10, recorded in a container lab): learn a profile from
+  one run with `robodr-commission`, replay another run in which every
+  process has a new GUID prefix, and catch the rogue `/cmd_vel` publisher;
+  a headless Gazebo Harmonic robot (rogue `/cmd_vel`, DATA before SEDP);
+  fragmented discovery and a fragmented JointTrajectory (`DATA_FRAG`, both
+  vendors); a `rmw_zenoh_cpp` robot reported as a blind spot.
 
 ## Limits
 
-- The traffic is synthetic, built from the spec. The pipeline has **not**
-  been run against captures from real Fast DDS, Cyclone DDS or Connext.
-  That includes the motion decode path: the user-DATA framing and the CDR
-  payloads in its tests are hand-built; no real `ros2 topic pub /cmd_vel`
-  capture was decoded.
+- Most tests use synthetic traffic built from the spec. Real traffic is
+  limited to the container-lab captures above (Fast DDS and Cyclone DDS on
+  ROS 2 Jazzy, a Gazebo simulation, no physical robot); RTI Connext has not
+  been captured. On the motion decode path the XCDR1 `Twist` decode is
+  confirmed on real Fast DDS and Cyclone DDS samples; XCDR2 / `D_CDR2` and
+  the other message types only on hand-built vectors.
 - Some traffic is invisible or opaque to it:
   - shared-memory transports;
   - RTPS over TCP;
@@ -207,5 +275,7 @@ There were 73 tests before:
   finding per GUID. Memory stays bounded.
 - Dedup is "until evicted": a participant that leaves and rejoins is not
   re-reported.
-- Live capture sees what this host sends and receives. It does not use
-  promiscuous mode.
+- Live capture sees what this host sends and receives. The socket does not
+  enable promiscuous mode itself; on a sensor box whose capture NIC the OS
+  puts in promiscuous mode (mirror / tap port) it sees the mirrored traffic
+  of other hosts too. 802.1Q / 802.1ad tags (up to two) are followed.

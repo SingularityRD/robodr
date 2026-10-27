@@ -391,7 +391,7 @@ fn contract_1_0_messages_without_the_new_fields_still_parse_when_ascii() {
         }
     }
     let mut v = serde_json::to_value(example_finding()).unwrap();
-    v["contract_version"] = "1.0.0".into();
+    to_v1(&mut v, "1.0.0");
     strip(&mut v);
     let f = parse_and_validate(&v.to_string()).unwrap();
     assert!(!f.entity_context.ros.topic.unwrap().non_ascii);

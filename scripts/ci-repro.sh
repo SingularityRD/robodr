@@ -20,11 +20,19 @@
 # Environment:
 #   REPRO_SRC=dir          tree to copy (default: repo root)
 #   CARGO_FLAGS="..."      extra cargo flags, e.g. "--offline"
-#   REPRO_WORK=dir         scratch dir (default: mktemp -d)
+#   REPRO_WORK=dir         scratch dir, kept afterwards (default: a mktemp -d
+#                          dir, deleted when the script exits)
 #   SOURCE_DATE_EPOCH      override the commit timestamp
 #   CARGO_BUILD_TARGET     cross build (e.g. aarch64-unknown-linux-gnu): the
 #                          binaries are then read from target/<triple>/release
 #                          (cargo's layout); unset = native target/release
+#   ROBODR_ALLOW_UNPINNED_CC=1  local experiments only: accept another clang
+#                          than the pinned one (not a release proof)
+# C compiler: ring's C/assembly (robodr-uplink) is compiled with the PINNED
+# clang (scripts/c-toolchain.sh) for the target triple, native glibc builds
+# included (CC_<triple>; as scripts/build-static.sh and release.yml). A
+# missing or different clang FAILS (exit 1): no fallback to `cc`. The
+# versions used are written to OUT_DIR/TOOLCHAIN.txt.
 #   REPRO_ALLOW_NO_LOCK=1  local experiments only: without a committed lock,
 #                          let EACH copy resolve on its own (no --locked); the
 #                          result does not prove a release is rebuildable
@@ -39,7 +47,14 @@ out="${1:-dist/repro}"
 mkdir -p "$out"
 out="$(cd "$out" && pwd)"
 read -r -a cargo_flags <<<"${CARGO_FLAGS:-}"
-work="${REPRO_WORK:-$(mktemp -d)}"
+if [[ -n "${REPRO_WORK:-}" ]]; then
+    work="$REPRO_WORK"
+else
+    # Our own scratch dir: two full source copies with their target/
+    # directories (hundreds of MB); removed on every exit.
+    work="$(mktemp -d)"
+    trap 'rm -rf "$work"' EXIT
+fi
 mkdir -p "$work"
 work="$(cd "$work" && pwd)"
 cargo_home="${CARGO_HOME:-$HOME/.cargo}"
@@ -49,6 +64,17 @@ if [[ -z "${SOURCE_DATE_EPOCH:-}" ]]; then
 fi
 export SOURCE_DATE_EPOCH
 echo "repro: SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" >&2
+
+# ring (rustls' crypto provider, robodr-uplink) has C and assembly: compile
+# it with the pinned clang for the target triple, whatever the target.
+# shellcheck source=scripts/c-toolchain.sh disable=SC1091
+. "$here/c-toolchain.sh"
+target_triple="${CARGO_BUILD_TARGET:-$(rustc -vV | sed -n 's/^host: //p')}"
+if [[ -z "$target_triple" ]]; then
+    echo "repro: FAIL: cannot tell the target triple (rustc -vV)" >&2
+    exit 1
+fi
+robodr_pin_cc "$target_triple" repro || exit 1
 
 # Copy the tree twice (submodules included, build outputs and VCS excluded).
 dirs=("$work/a/robodr" "$work/bb-longer-path/robodr")
@@ -77,6 +103,7 @@ fi
 excludes="$(cd "${dirs[0]}" && cargo metadata --no-deps --format-version 1 "${locked[@]}" "${cargo_flags[@]}" |
     python3 "$here/ci-pure-excludes.py" -)"
 read -r -a exclude_args <<<"$excludes"
+
 
 # cargo puts --target / CARGO_BUILD_TARGET output under target/<triple>/.
 rel="release"
@@ -126,6 +153,7 @@ if [[ ${#bins_a[@]} -eq 0 ]]; then
     exit 0
 fi
 
+robodr_toolchain_report >"$out/TOOLCHAIN.txt"
 rc=0
 : >"$out/SHA256SUMS"
 for b in "${bins_a[@]}"; do

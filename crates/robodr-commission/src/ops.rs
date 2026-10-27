@@ -54,7 +54,10 @@
 //! manifest).
 
 use crate::input::{EventSource, InputError};
-use crate::learner::{DEFAULT_HARD_CAP_JOINT, DEFAULT_HARD_CAP_LINEAR};
+use crate::learner::{
+    DEFAULT_HARD_CAP_JOINT, DEFAULT_HARD_CAP_KP, DEFAULT_HARD_CAP_LINEAR,
+    DEFAULT_HARD_CAP_POSITION_STEP, DEFAULT_HARD_CAP_TORQUE,
+};
 use crate::profile_file::parse_profile_text;
 use crate::signoff::{
     draft_digest, motion_items, required_items, satisfies, sha256_hex, verify_signoff_signatures,
@@ -78,6 +81,12 @@ pub struct HardCaps {
     pub linear: f64,
     /// rad/s.
     pub joint: f64,
+    /// N·m (`max_joint_torque`).
+    pub torque: f64,
+    /// `max_joint_kp`.
+    pub kp: f64,
+    /// rad (`max_joint_position_step`).
+    pub position_step: f64,
 }
 
 impl Default for HardCaps {
@@ -85,6 +94,9 @@ impl Default for HardCaps {
         Self {
             linear: DEFAULT_HARD_CAP_LINEAR,
             joint: DEFAULT_HARD_CAP_JOINT,
+            torque: DEFAULT_HARD_CAP_TORQUE,
+            kp: DEFAULT_HARD_CAP_KP,
+            position_step: DEFAULT_HARD_CAP_POSITION_STEP,
         }
     }
 }
@@ -96,6 +108,13 @@ fn over_caps(p: &Profile, caps: &HardCaps) -> Vec<(String, &'static str, f64, f6
         for (dim, v, cap) in [
             ("linear", env.max_linear_speed, caps.linear),
             ("joint", env.max_joint_speed, caps.joint),
+            ("joint_torque", env.max_joint_torque, caps.torque),
+            ("joint_kp", env.max_joint_kp, caps.kp),
+            (
+                "joint_position_step",
+                env.max_joint_position_step,
+                caps.position_step,
+            ),
         ] {
             // NaN / negative bounds are reported by `Profile::validate`;
             // a NaN cap (caller bug) refuses everything.
@@ -750,6 +769,9 @@ pub fn lockable_with_caps(profile: &Profile, caps: &HardCaps) -> Vec<LockRefusal
                             EnvelopeField::MaxLateralSpeed => "lateral",
                             EnvelopeField::MaxVerticalSpeed => "vertical",
                             EnvelopeField::MaxRollPitchRate => "roll_pitch",
+                            EnvelopeField::MaxJointTorque => "joint_torque",
+                            EnvelopeField::MaxJointKp => "joint_kp",
+                            EnvelopeField::MaxJointPositionStep => "joint_position_step",
                         }
                         .into(),
                     }
@@ -893,6 +915,10 @@ pub fn merge_profiles_with_caps(
             let e = out.motion_envelopes.entry(ch.clone()).or_default();
             e.max_linear_speed = max_opt(e.max_linear_speed, env.max_linear_speed);
             e.max_joint_speed = max_opt(e.max_joint_speed, env.max_joint_speed);
+            e.max_joint_torque = max_opt(e.max_joint_torque, env.max_joint_torque);
+            e.max_joint_kp = max_opt(e.max_joint_kp, env.max_joint_kp);
+            e.max_joint_position_step =
+                max_opt(e.max_joint_position_step, env.max_joint_position_step);
         }
     }
     Ok(out)
@@ -1033,6 +1059,13 @@ pub fn diff(old: &Profile, new: &Profile) -> ProfileDiff {
                 for (dim, a, b) in [
                     ("linear", o.max_linear_speed, env.max_linear_speed),
                     ("joint", o.max_joint_speed, env.max_joint_speed),
+                    ("joint_torque", o.max_joint_torque, env.max_joint_torque),
+                    ("joint_kp", o.max_joint_kp, env.max_joint_kp),
+                    (
+                        "joint_position_step",
+                        o.max_joint_position_step,
+                        env.max_joint_position_step,
+                    ),
                 ] {
                     let direction = match (a, b) {
                         (Some(x), Some(y)) if y > x => Direction::Loosened,
@@ -1065,11 +1098,23 @@ fn bound(v: Option<f64>) -> String {
 }
 
 fn env_str(e: &Envelope) -> String {
-    format!(
+    let mut s = format!(
         "linear {} m/s, joint {} rad/s",
         bound(e.max_linear_speed),
         bound(e.max_joint_speed)
-    )
+    );
+    // Joint terms only when set (keeps the historic text for other
+    // envelopes).
+    for (name, v, unit) in [
+        ("joint torque", e.max_joint_torque, " N·m"),
+        ("joint kp", e.max_joint_kp, ""),
+        ("joint position step", e.max_joint_position_step, " rad"),
+    ] {
+        if let Some(v) = v {
+            s.push_str(&format!(", {name} {v}{unit}"));
+        }
+    }
+    s
 }
 
 impl fmt::Display for ProfileDiff {

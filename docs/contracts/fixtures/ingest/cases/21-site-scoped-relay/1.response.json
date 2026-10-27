@@ -1,0 +1,25 @@
+{
+  "body": {
+    "accepted": 1,
+    "batch_id": "rdu1-20665f8d313a875c416ee153194a0bf0",
+    "created": 1,
+    "duplicates": 0,
+    "rejected": [
+      {
+        "code": "site_mismatch",
+        "line": 2
+      },
+      {
+        "code": "unknown_robot",
+        "line": 3
+      },
+      {
+        "code": "missing_finding_signature",
+        "line": 4
+      }
+    ],
+    "replayed": false,
+    "updated": 0
+  },
+  "status": 200
+}

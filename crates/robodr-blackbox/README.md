@@ -10,9 +10,15 @@ crashes, can run as a ring buffer or stop when full, and exports verifiable
 bundles through a one-way path. The crate only records and proves what
 happened. It never acts on the robot.
 
-Dependencies: std, `serde`/`serde_json`, `robodr-events`. No crypto crates are
-available offline, so SHA-256 and HMAC-SHA256 are implemented in `src/crypto.rs`
-and pinned to the NIST FIPS 180-4 examples and RFC 4231 test cases 1 to 7.
+Dependencies: std, `serde`/`serde_json`, `robodr-events`, and the audited
+RustCrypto / dalek crates: `ed25519-dalek`, `sha2` (SHA-256 and SHA-512),
+`hmac` (HMAC-SHA256), `subtle` (constant-time compare), `zeroize` (key
+wiping). `src/crypto.rs` keeps a small API over them. Until S10 SHA-256 and
+HMAC-SHA256 were implemented in that file; `tests/crypto_differential.rs`
+proves the RustCrypto output is byte-for-byte the old code's (kept there as a
+test-only oracle) over random inputs, keys and streaming splits, plus the
+NIST FIPS 180-4 / CAVP examples and RFC 4231 test cases 1 to 7, so existing
+chains, checkpoints and HMAC tags verify unchanged.
 
 ## Status: Ed25519 is the default; HMAC is legacy
 
@@ -661,9 +667,12 @@ tamper finding.
 - **Wall-clock truth.** Timestamps are evidence, not authenticators. The
   time-source tag says how far to trust them. The verifier only warns about
   monotonic regressions within one run.
-- **Side channels and memory disclosure.** The in-crate SHA-256/HMAC are
-  portable implementations. Key wiping and the constant-time compare use
-  `std::hint::black_box`, which is best-effort.
+- **Side channels and memory disclosure.** SHA-256 comes from `sha2`;
+  HMAC-SHA256 is RFC 2104 written over a `sha2` wrapper that wipes its state
+  on drop (the `hmac` crate left keyed temporaries unwiped); the tag compare
+  from `subtle`, key wiping from `zeroize`. Wiping is best effort:
+  temporaries inside `sha2`, register / stack copies and swapped-out pages
+  are not covered.
 - **Concurrent writers that ignore the lock.** `flock` is advisory: it stops
   a second `Recorder`, not a process that writes the files directly.
 

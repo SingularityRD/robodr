@@ -7,13 +7,14 @@ hardware. It is the Phase 1/2 demo in software.
 RobotEvent
   -> Profile::evaluate            (robodr-events)  ┐
   -> Firewall::check              (robodr-firewall, MotionCommand only, optional)
+     or Firewall::check_joint     (low-level joint channel + decoded frame, handle_with_joint)
   -> ConsistencyMonitor           (robodr-motion, commands + feedback, optional)
   -> Deviation, stamped with the profile's observe/enforce mode
   -> Responder::plan              (robodr-responder: SafetyState, OperationalContext, ResponsePolicy)
   -> backstop: check_invariants + observe-only guard -> ResponsePlan + Disposition
   -> Recorder                     (robodr-blackbox: event, firewall verdict, deviation, plan note)
   -> FindingBuilder               (robodr-ocsf, evidence links = the black-box seq/hash)
-  -> validated robot-edr.findings record (Kafka key + JSON value)
+  -> validated robodr.findings record (Kafka key + JSON value)
   -> Executor::submit             (no-op or dry-run log: the agent executes nothing)
 ```
 
@@ -240,6 +241,34 @@ limiting. Use `--step-ms 6000` to see each one graded on its own.
   vector filled with the max joint speed. Its
   stamp is the observation time, so stale and future checks cannot fire
   through this path.
+- Low-level joint channels (`FirewallSettings::joint_channels`, Unitree
+  `LowCmd`) are checked by a separate joint-frame firewall instance:
+  `Agent::handle_with_joint(now, event, Some(&JointInput { frame,
+  stamp_ns }), safety)` runs `Firewall::check_joint` on the decoded frame
+  (every slot, CRC verdict, `mode_pr` / `mode_machine`) with the frame's
+  observation time as its clock (non-decreasing; an older stamp is
+  clamped and counted, never a clock regression), and records
+  `robodr.firewall_joint_verdict` (limit reasons `position` / `velocity`
+  / `torque` / `gain` / `step` / `pd_torque`, substitute `hold_last` /
+  `zero`, the frame's slot count, `crc_ok` and modes). A command on a
+  joint channel without its frame is not checked by the firewall
+  (`AgentStats::joint_frames_missing`); the profile still evaluates it.
+  `FirewallSettings::from_profile_and_joints` builds both kinds.
+- Channel kind (`robodr_agent::channel_kind`): the profile's recorded
+  command type (`Profile::motion_types`, written by `robodr-commission
+  learn`: `geometry_msgs` `Twist` / `TwistStamped`, Unitree API requests and
+  the legacy `HighCmd` are twist channels; `JointTrajectory`, Unitree
+  `LowCmd_` / `HandCmd_` / `MotorCmds_` / `MotorCmd_` and the legacy
+  `LowCmd` joint channels) decides; without it an unambiguous envelope
+  does (no `max_joint_speed` = twist, `max_joint_speed` without
+  `max_linear_speed` = joint, a positive `max_linear_speed` = twist). The
+  learner writes 0 for a dimension it never saw, so `max_linear_speed: 0`
+  with a `max_joint_speed` (a twist channel that only turned in place
+  looks like a joint channel) is ambiguous: refused with a configuration
+  error when no type is recorded, and a warning
+  (`FirewallSettings::warnings`) when the type had to decide. Inferring
+  `Joints` there used to turn every twist command into a
+  `rejected_kind_mismatch`.
 - In the finding, commanded speeds are reported as `|v|` of `linear_speed`
   (the forward component) and `joint_speed`; the lateral / vertical /
   roll-pitch axes are not in the findings contract yet (the deviation detail
@@ -306,8 +335,9 @@ firewall limits, zero partitions and unusable labels are refused.
   default) or, legacy, HMAC (a shared key, so the verifier can forge; warned).
   The Ed25519 seed is a file, not a TPM-held key (the arithmetic is the
   audited `ed25519-dalek` crate). No external checkpoint store exists. The replay verifies against the checkpoint it just produced.
-- Findings were not checked against an OCSF schema server, a Kafka broker or
-  AutoSecOps. Nothing is published to Kafka.
+- Findings were not checked against an OCSF schema server or a running SOC
+  consumer. The agent publishes nothing itself (agentd spools records;
+  `robodr-export` delivers them).
 - No executor exists. Nothing is requested from DDS, the host, the Motion
   Firewall gateway, the mission executive or the safety controller.
 - Black-box recovery was exercised with simulated failures only (failing

@@ -8,7 +8,7 @@
 //!     Responder::plan(deviation, source, SafetyState, OperationalContext, mono ms) ─► ResponsePlan
 //!     backstop: check_invariants + observe-only guard ─► (plan, Disposition)
 //!     Recorder: event (once per event) + firewall verdict + deviation + plan note ─► BlackBoxRef(s)
-//!     FindingBuilder(... evidence = those refs) ─► validated robot-edr.findings record
+//!     FindingBuilder(... evidence = those refs) ─► validated robodr.findings record
 //!     Executor::submit(plan)  — dry-run / no-op; the agent executes nothing
 //! ```
 //!
@@ -64,6 +64,14 @@
 //! reads it from the injected clock. Times pass through a
 //! [`crate::clock::TimeGuard`]: `mono_ns` never goes backwards and wall jumps
 //! are reported (see [`crate::clock`]).
+//!
+//! The detectors that measure time between events (the Motion Firewall's
+//! rate checks and the motion monitor's latency / persistence windows) use
+//! the event's `mono_ns` by default. [`Agent::handle_with_joint_at`] gives
+//! them an explicit detection time instead, on the timeline the events
+//! were *observed* on: a capture replayed faster or slower than it was
+//! recorded must be judged by its own packet timestamps, not by how fast
+//! this process happened to read it. Evidence keeps the guarded `now`.
 //!
 //! # Mapping `MotionCommand` to the firewall and the motion monitor
 //!
@@ -130,8 +138,9 @@ use robodr_blackbox::{
 use robodr_events::profile::Profile;
 use robodr_events::{Deviation, Mode, MotionCommand, RobotEvent, Severity};
 use robodr_firewall::{
-    ChannelId, ChannelKind, Command, Firewall, JointVelocities, LimitReasons, Motion, Policy,
-    SourceId, SubstituteKind, Twist, Vec3, Verdict,
+    ChannelId, ChannelKind, Command, Firewall, JointCommand, JointFrame, JointLimitReasons,
+    JointVelocities, JointVerdict, JointWouldHave, LimitReasons, Motion, Policy, SourceId,
+    SubstituteKind, Twist, Vec3, Verdict,
 };
 use robodr_motion::{CommandSample, ConsistencyMonitor, FeedbackSample};
 use robodr_ocsf::{
@@ -187,6 +196,32 @@ pub struct AgentStats {
     pub feedback_magnitude_dropped: u64,
     /// Feedback publishers beyond [`MAX_INTERNED_PUBLISHERS`] (hashed ids).
     pub publishers_hashed: u64,
+    /// Low-level joint frames checked by the joint firewall
+    /// ([`Agent::handle_with_joint`]); also counted in `firewall_checks`.
+    pub joint_firewall_checks: u64,
+    /// Commands on a low-level joint channel that came without their decoded
+    /// frame (e.g. a JSONL event): the joint firewall could not check them
+    /// (the profile envelope still did).
+    pub joint_frames_missing: u64,
+    /// Joint frames whose stamp was older than the joint firewall's clock
+    /// (capture timestamps out of order): checked at the clock's time
+    /// instead, never as a clock regression.
+    pub joint_clock_clamped: u64,
+}
+
+/// A decoded low-level joint frame that accompanies a `MotionCommand` (see
+/// [`Agent::handle_with_joint`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JointInput {
+    /// Every slot on the wire, with the decoder's CRC verdict and the
+    /// frame-level `mode_pr` / `mode_machine`.
+    pub frame: JointFrame,
+    /// When the frame was observed, ns, in the joint firewall's own clock
+    /// domain (e.g. capture timestamps). Used as both the frame stamp and
+    /// the firewall's `now`, so the rate / gap checks measure the real
+    /// inter-arrival time, not the agent's processing time. Must be
+    /// non-decreasing; an older stamp is clamped (counted).
+    pub stamp_ns: u64,
 }
 
 /// A signer shared between the agent and every recorder it opens, so a
@@ -317,6 +352,23 @@ struct FirewallState {
     /// now ([`Agent::set_source_identities`]): a restarted writer with a
     /// fresh GUID is matched against `identity:<name>` sources.
     identities: BTreeMap<String, String>,
+    /// The low-level joint-frame firewall (its own instance: its clock is
+    /// the frames' observation time, see [`JointInput::stamp_ns`]).
+    joint: Option<JointFirewall>,
+}
+
+struct JointFirewall {
+    fw: Firewall,
+    channels: std::collections::BTreeSet<String>,
+    last_now: Option<u64>,
+}
+
+impl FirewallState {
+    fn is_joint_channel(&self, channel: &str) -> bool {
+        self.joint
+            .as_ref()
+            .is_some_and(|j| j.channels.contains(channel))
+    }
 }
 
 struct MonitorState {
@@ -450,8 +502,31 @@ impl Agent {
         let firewall = match cfg.firewall {
             None => None,
             Some(fs) => {
-                let policy = Policy::compile(&cfg.profile, fs.platform, &fs.channels)
+                // A joint channel is checked by the joint firewall only: the
+                // twist / joint-velocity firewall gets the profile without
+                // it, the joint firewall the profile with only its channels.
+                let mut twist_profile = cfg.profile.clone();
+                twist_profile.retain_motion_channels(|k| !fs.joint_channels.contains_key(k));
+                let policy = Policy::compile(&twist_profile, fs.platform, &fs.channels)
                     .map_err(AgentError::Firewall)?;
+                let joint = if fs.joint_channels.is_empty() {
+                    None
+                } else {
+                    let mut joint_profile = cfg.profile.clone();
+                    joint_profile.retain_motion_channels(|k| fs.joint_channels.contains_key(k));
+                    let jp = Policy::compile_with_joints(
+                        &joint_profile,
+                        fs.platform,
+                        &BTreeMap::new(),
+                        &fs.joint_channels,
+                    )
+                    .map_err(AgentError::Firewall)?;
+                    Some(JointFirewall {
+                        fw: Firewall::new(jp),
+                        channels: fs.joint_channels.keys().cloned().collect(),
+                        last_now: None,
+                    })
+                };
                 let kinds = fs
                     .channels
                     .iter()
@@ -461,6 +536,7 @@ impl Agent {
                     fw: Firewall::new(policy),
                     kinds,
                     identities: BTreeMap::new(),
+                    joint,
                 })
             }
         };
@@ -478,7 +554,7 @@ impl Agent {
         } else {
             OcsfMode::Observe
         };
-        let ocsf = RobotContext::new(
+        let mut ocsf = RobotContext::new(
             cfg.robot,
             ProfileRef {
                 version: cfg.profile_version,
@@ -486,6 +562,8 @@ impl Agent {
             },
             mode,
         );
+        ocsf.data_source = cfg.data_source;
+        ocsf.topic = cfg.findings_topic;
         let start = clock.now();
         // Fail at start, not on every finding, if the trusted labels (model,
         // site, profile version, ...) cannot produce a valid finding.
@@ -707,9 +785,47 @@ impl Agent {
         event: &RobotEvent,
         safety: SafetyState,
     ) -> Vec<Outcome> {
+        self.handle_with_joint(now, event, None, safety)
+    }
+
+    /// [`Agent::handle`] for a `MotionCommand` decoded from a low-level
+    /// joint frame (Unitree `LowCmd`): on a channel the firewall settings
+    /// list as a joint channel ([`crate::FirewallSettings::joint_channels`])
+    /// the frame is checked slot by slot with `Firewall::check_joint` (its
+    /// verdict recorded as `robodr.firewall_joint_verdict`) instead of the
+    /// twist / joint-velocity model. A command on a joint channel without a
+    /// frame is not checked by the firewall (counted in
+    /// [`AgentStats::joint_frames_missing`]); `joint` on any other channel is
+    /// ignored. Profile evaluation and the motion monitor are unchanged.
+    pub fn handle_with_joint(
+        &mut self,
+        now: Timestamp,
+        event: &RobotEvent,
+        joint: Option<&JointInput>,
+        safety: SafetyState,
+    ) -> Vec<Outcome> {
+        self.handle_with_joint_at(now, None, event, joint, safety)
+    }
+
+    /// [`Agent::handle_with_joint`] with an explicit detection time
+    /// `detect_ns` (monotonic ns on the event's observation timeline) for
+    /// the time-dependent detectors: the twist firewall's rate checks and
+    /// the motion monitor (commands, feedback, safety-stop grace, expiry).
+    /// `None` uses the guarded `now.mono_ns`, as [`Agent::handle_with_joint`]
+    /// does. Every caller must keep `detect_ns` on one non-decreasing
+    /// timeline (the monitor holds a regression; it never rewinds).
+    /// Evidence (black box, findings) is stamped with `now` either way.
+    pub fn handle_with_joint_at(
+        &mut self,
+        now: Timestamp,
+        detect_ns: Option<u64>,
+        event: &RobotEvent,
+        joint: Option<&JointInput>,
+        safety: SafetyState,
+    ) -> Vec<Outcome> {
         let now = self.observe_time(now);
         self.stats.events = self.stats.events.saturating_add(1);
-        let mono = now.mono_ns;
+        let mono = detect_ns.unwrap_or(now.mono_ns);
         let mode = self.profile.mode();
 
         // 1. Detection.
@@ -720,10 +836,32 @@ impl Agent {
         let mut verdict: Option<FirewallVerdictRecord> = None;
         if let RobotEvent::MotionCommand(c) = event {
             if let Some(fs) = self.firewall.as_mut() {
-                let (rec, devs) = check_firewall(fs, c, mono);
-                self.stats.firewall_checks = self.stats.firewall_checks.saturating_add(1);
-                verdict = Some(rec);
-                found.extend(devs.into_iter().map(|d| (Detector::Firewall, d)));
+                if fs.is_joint_channel(&c.channel) {
+                    match joint {
+                        Some(j) => {
+                            let (rec, devs, clamped) = check_joint_firewall(fs, c, j);
+                            self.stats.firewall_checks =
+                                self.stats.firewall_checks.saturating_add(1);
+                            self.stats.joint_firewall_checks =
+                                self.stats.joint_firewall_checks.saturating_add(1);
+                            if clamped {
+                                self.stats.joint_clock_clamped =
+                                    self.stats.joint_clock_clamped.saturating_add(1);
+                            }
+                            verdict = Some(rec);
+                            found.extend(devs.into_iter().map(|d| (Detector::Firewall, d)));
+                        }
+                        None => {
+                            self.stats.joint_frames_missing =
+                                self.stats.joint_frames_missing.saturating_add(1);
+                        }
+                    }
+                } else {
+                    let (rec, devs) = check_firewall(fs, c, mono);
+                    self.stats.firewall_checks = self.stats.firewall_checks.saturating_add(1);
+                    verdict = Some(rec);
+                    found.extend(devs.into_iter().map(|d| (Detector::Firewall, d)));
+                }
             }
         }
         if let Some(ms) = self.monitor.as_mut() {
@@ -873,6 +1011,32 @@ impl Agent {
             EvidenceLinks::default(),
             None,
         )
+    }
+
+    /// Record a deviation in the black box only, exactly as
+    /// [`Agent::handle_external`] records it (same mode rule, same record
+    /// kind and criticality), but without a response plan, a finding or an
+    /// executor submission. For deviations a caller folds into one
+    /// aggregate finding (agentd's discovery-flood guard): each one stays
+    /// evidence. Returns the record's reference, or why it was not written.
+    pub fn record_deviation(
+        &mut self,
+        now: Timestamp,
+        detector: Detector,
+        dev: &Deviation,
+    ) -> Result<BlackBoxRef, Vec<String>> {
+        self.observe_time(now);
+        let observe = detector == Detector::SelfHealth
+            || dev.is_observe_only()
+            || self.profile.mode() == Mode::Observe;
+        let dev = dev.clone().with_mode(if observe {
+            Mode::Observe
+        } else {
+            Mode::Enforce
+        });
+        let mut errors = Vec::new();
+        self.append("deviation", &mut errors, |r| r.append_deviation(&dev))
+            .ok_or(errors)
     }
 
     /// Append a free-form JSON note to the black box at `now` (e.g. a
@@ -1264,7 +1428,7 @@ impl Agent {
                 }
                 (
                     Some(FindingOutput {
-                        topic: rec.topic.to_string(),
+                        topic: rec.topic,
                         key: rec.key,
                         partition: rec.partition,
                         value: rec.value,
@@ -1389,26 +1553,32 @@ pub fn ocsf_safety(s: SafetyState) -> robodr_ocsf::SafetyState {
     }
 }
 
+/// The firewall source of a command's GUID: the exact endpoint GUID first;
+/// then its 24-hex-char participant prefix, so a spec that lists a
+/// participant authorises that participant's writers; last, the participant
+/// identity its prefix holds (`identity:<name>`). `SourceId::UNKNOWN` when
+/// nothing matches (or there is no GUID).
+fn resolve_source(
+    fw: &Firewall,
+    identities: &BTreeMap<String, String>,
+    guid: Option<&str>,
+) -> SourceId {
+    guid.and_then(|g| {
+        fw.source_id(g)
+            .or_else(|| g.get(..24).and_then(|p| fw.source_id(p)))
+            .or_else(|| {
+                let name = identities.get(&g.get(..24)?.to_ascii_lowercase())?;
+                fw.source_id(&format!(
+                    "{}{name}",
+                    robodr_firewall::IDENTITY_SOURCE_PREFIX
+                ))
+            })
+    })
+    .unwrap_or(SourceId::UNKNOWN)
+}
+
 fn to_firewall_command(fs: &FirewallState, c: &MotionCommand, now: u64) -> Command {
-    // Exact endpoint GUID first; then its 24-hex-char participant prefix, so
-    // a spec that lists a participant authorises that participant's writers.
-    // Last, the participant identity its prefix holds (`identity:<name>`).
-    let source = c
-        .source_guid
-        .as_deref()
-        .and_then(|g| {
-            fs.fw
-                .source_id(g)
-                .or_else(|| g.get(..24).and_then(|p| fs.fw.source_id(p)))
-                .or_else(|| {
-                    let name = fs.identities.get(&g.get(..24)?.to_ascii_lowercase())?;
-                    fs.fw.source_id(&format!(
-                        "{}{name}",
-                        robodr_firewall::IDENTITY_SOURCE_PREFIX
-                    ))
-                })
-        })
-        .unwrap_or(SourceId::UNKNOWN);
+    let source = resolve_source(&fs.fw, &fs.identities, c.source_guid.as_deref());
     let channel = fs.fw.channel_id(&c.channel).unwrap_or(ChannelId(u16::MAX));
     // Signed body-frame values, as on the wire (REP 103), on all six axes:
     // the firewall bounds the norm of each vector, so a holonomic (or
@@ -1507,6 +1677,7 @@ fn check_firewall(
         substitute: None,
         output_speed: v.output().map(output_speed),
         enforcing: fs.fw.is_enforcing(),
+        joint: None,
     };
     match &v {
         Verdict::Passed { would_have, .. } => {
@@ -1536,6 +1707,114 @@ fn check_firewall(
     (rec, fs.fw.drain_deviations())
 }
 
+/// Check one low-level joint frame with the joint firewall (see
+/// [`Agent::handle_with_joint`]). Returns the verdict record, the drained
+/// deviations and whether the stamp was clamped to the firewall's clock.
+fn check_joint_firewall(
+    fs: &mut FirewallState,
+    c: &MotionCommand,
+    j: &JointInput,
+) -> (FirewallVerdictRecord, Vec<Deviation>, bool) {
+    let identities = &fs.identities;
+    let Some(jf) = fs.joint.as_mut() else {
+        // Unreachable: only called for a joint channel.
+        return (
+            FirewallVerdictRecord {
+                kind: "robodr.firewall_joint_verdict",
+                channel: c.channel.clone(),
+                source_guid: c.source_guid.clone(),
+                verdict: "not_checked",
+                reject_reason: None,
+                limit_reasons: Vec::new(),
+                would_have: None,
+                substitute: None,
+                output_speed: None,
+                enforcing: false,
+                joint: None,
+            },
+            Vec::new(),
+            false,
+        );
+    };
+    // The joint firewall's clock is the frames' observation time, kept
+    // non-decreasing: two capture threads may interleave their stamps.
+    let (now, clamped) = match jf.last_now {
+        Some(last) if j.stamp_ns < last => (last, true),
+        _ => (j.stamp_ns, false),
+    };
+    jf.last_now = Some(now);
+    let source = resolve_source(&jf.fw, identities, c.source_guid.as_deref());
+    let channel = jf.fw.channel_id(&c.channel).unwrap_or(ChannelId(u16::MAX));
+    let cmd = JointCommand::new(source, channel, now, j.frame);
+    let v = jf.fw.check_joint(&cmd, now);
+    let output_speed = v.output().map(|o| {
+        o.frame
+            .motors()
+            .iter()
+            .filter(|m| m.kd != 0.0)
+            .fold(0.0_f64, |m, x| m.max(x.dq.abs()))
+    });
+    let mut rec = FirewallVerdictRecord {
+        kind: "robodr.firewall_joint_verdict",
+        channel: c.channel.clone(),
+        source_guid: c.source_guid.clone(),
+        verdict: "passed",
+        reject_reason: None,
+        limit_reasons: Vec::new(),
+        would_have: None,
+        substitute: None,
+        output_speed,
+        enforcing: jf.fw.is_enforcing(),
+        joint: Some(crate::outcome::JointVerdictDetail {
+            slots: j.frame.slots(),
+            crc_ok: j.frame.crc_ok,
+            mode_pr: j.frame.mode_pr,
+            mode_machine: j.frame.mode_machine,
+            stamp_ns: now,
+        }),
+    };
+    match &v {
+        JointVerdict::Passed { would_have, .. } => {
+            rec.would_have = would_have.as_ref().map(|w| match w {
+                JointWouldHave::Limited { reasons, .. } => {
+                    format!("limited: {}", joint_limit_names(*reasons).join(", "))
+                }
+                JointWouldHave::Rejected { reason } => format!("rejected: {reason:?}"),
+            });
+        }
+        JointVerdict::Limited { reasons, .. } => {
+            rec.verdict = "limited";
+            rec.limit_reasons = joint_limit_names(*reasons);
+        }
+        JointVerdict::Rejected { reason, substitute } => {
+            rec.verdict = "rejected";
+            rec.reject_reason = Some(format!("{reason:?}"));
+            rec.substitute = substitute.map(|s| match s.kind {
+                SubstituteKind::Zero => "zero",
+                SubstituteKind::HoldLast => "hold_last",
+            });
+        }
+    }
+    (rec, jf.fw.drain_deviations(), clamped)
+}
+
+/// The names of a joint limit set (`position`, `velocity`, `torque`, `gain`,
+/// `step`, `pd_torque`).
+fn joint_limit_names(reasons: JointLimitReasons) -> Vec<&'static str> {
+    [
+        (JointLimitReasons::POSITION, "position"),
+        (JointLimitReasons::VELOCITY, "velocity"),
+        (JointLimitReasons::TORQUE, "torque"),
+        (JointLimitReasons::GAIN, "gain"),
+        (JointLimitReasons::STEP, "step"),
+        (JointLimitReasons::PD_TORQUE, "pd_torque"),
+    ]
+    .into_iter()
+    .filter(|(bit, _)| reasons.contains(*bit))
+    .map(|(_, name)| name)
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1548,6 +1827,7 @@ mod tests {
     fn ctx(locked: bool) -> OperationalContext {
         OperationalContext {
             platform: PlatformFamily::Ugv,
+            morphology: robodr_responder::Morphology::WheeledMobile,
             phase: MissionPhase::Transit,
             connectivity: Connectivity::Connected,
             control: ControlMode::Autonomous,
@@ -1560,6 +1840,7 @@ mod tests {
     fn guard_passes_valid_plans_unchanged() {
         let mut pol = ResponsePolicy::conservative_default(PlatformFamily::Ugv);
         pol.oem_validated = true;
+        pol.morphology = robodr_responder::Morphology::WheeledMobile;
         let dev = Deviation::new("robot.x", Severity::Critical, "d");
         let p = plan_stateless(&pol, &dev, "s", SafetyState::MovingFast, &ctx(true));
         let (q, v) = guard(p.clone(), &dev, SafetyState::MovingFast, &ctx(true));
@@ -1586,6 +1867,8 @@ mod tests {
             suppressed: false,
             would_have: None,
             rationale: Rationale::default(),
+            morphology: Default::default(),
+            advisory: Vec::new(),
         };
         let (q, v) = guard(bad, &dev, SafetyState::EStopActive, &ctx(true));
         assert!(v.unwrap().contains("ActionWhileSafetySystemEngaged"));
@@ -1600,6 +1883,7 @@ mod tests {
         // (what would happen if the agent forgot to downgrade the context).
         let mut pol = ResponsePolicy::conservative_default(PlatformFamily::Ugv);
         pol.oem_validated = true;
+        pol.morphology = robodr_responder::Morphology::WheeledMobile;
         let dev = Deviation::new("robot.x", Severity::High, "d").with_mode(Mode::Observe);
         // The responder itself now refuses to act on an observe-mode
         // deviation, so build the acting plan from its enforce-mode twin.

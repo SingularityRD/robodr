@@ -5,6 +5,24 @@
 //! sealed, ...); 2 usage or configuration error (nothing was started).
 //! Keys are never taken from the command line: see `blackbox.key_file`.
 
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+// S10 (R9): release builds use `panic = "abort"`, so any panic kills the
+// daemon (systemd restarts it; docs/OPERATIONS.md, "Crashes and restarts").
+// Non-test code has no unwrap / expect / panic!-family call; slice indexing
+// and arithmetic are left to review and fuzzing (fuzz/README.md).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 

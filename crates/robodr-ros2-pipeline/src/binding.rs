@@ -136,12 +136,150 @@
 //! - SPDP relayed by a configured discovery server teaches the locators only
 //!   (the server's own IP is never bound to the relayed prefix).
 //!
+//! # Quarantine locators
+//!
+//! The executor quarantines a participant by dropping UDP to / from its
+//! SPDP unicast locators (it proves them outside the motion control path)
+//! plus RTPS sent by its GUID prefix. [`BindingTable::quarantine_target`]
+//! gives agentd those locators. A SOC's order comes minutes after the
+//! detection, when the rogue has usually left (dispose, lease expiry) or
+//! been evicted by a prefix flood; the live binding alone then has nothing
+//! (red team F3). So the table also remembers, per prefix, the unicast
+//! locators of its last **trusted** SPDP (sent by the participant itself
+//! from a bound or fresh address, or relayed by a configured discovery
+//! server) and the **observed evidence**: the source addresses its own
+//! SPDP and its accepted endpoint announcements arrived from. Kept for
+//! [`LOCATOR_RETENTION`], bounded by [`MAX_LOCATOR_HISTORY`] prefixes and
+//! [`MAX_LOCATOR_HISTORY_PER_SOURCE`] per first observed source address,
+//! evicted by [`Rank`] then age: SPDP-only < active (announced an endpoint)
+//! < raised a High finding < raised a Critical finding < named by a SOC
+//! request < profiled (review M6: a spray, even of active prefixes from
+//! one address, cannot push out a rogue that raised a Critical finding).
+//! When the whole table is full, the **fullest per-source bucket** gives up
+//! its lowest-ranked, oldest entry first (review R2-4: a spray of
+//! Critical-ranked prefixes from 10 addresses evicts its own entries, not
+//! a lone departed rogue's); a SOC-named entry is never evicted for a
+//! lower-ranked one and a profiled one never.
+//!
+//! What is handed out (review of the F3 fix, H1, H2, M5, M7):
+//!
+//! - **Only addresses the participant was seen sending from.** An
+//!   announced locator whose address is not among the prefix's observed
+//!   source addresses is left out: SPDP is unauthenticated, so a rogue can
+//!   announce anyone's address, but to get it handed out it must also send
+//!   from it (source spoofing). This keeps an absent legitimate host's
+//!   address (M5), a poison locator outside the quarantine scope or on the
+//!   motion path, and loopback (always left out) out of the set (H2b).
+//! - **Never the robot's own.** A locator a profiled participant announces
+//!   (live, or remembered: even while its lease has run out) or an address
+//!   pinned to another prefix is left out. A profiled prefix's remembered
+//!   locators are **never written by a foreign host**: an SPDP for a
+//!   profiled prefix with no live binding from an address its evidence
+//!   never saw (nor a locator address, nor same-host loopback) makes the
+//!   prefix **contested** with a Critical `participant_source_mismatch`
+//!   (H1; before, it silently re-bound and overwrote them).
+//! - **Never the robot's computer** (review R2-5): for a prefix that is
+//!   not itself profiled, no port on this host's own address or on an
+//!   address pinned to a profiled participant is handed out: a decoy
+//!   spoofing the robot computer's address cannot get the ports of the
+//!   robot's other, unprofiled participants there. Review R3-6: an
+//!   address a profiled participant was only **learned** at (first-come
+//!   SPDP) may be an attacker's that announced the profiled prefix before
+//!   the real participant (or after its evidence lapsed), so it no longer
+//!   shields other ports; it is never cut whole (below). Pin the profiled
+//!   prefixes (or rely on this host's addresses) to keep R2-5 for every
+//!   host.
+//! - **Source addresses** (review R3-1): [`QuarantineTarget::addresses`]
+//!   are the prefix's observed source addresses the executor may cut
+//!   **whole** (all UDP to and from the robot's DDS ports, any source
+//!   port: Fast DDS sends from ephemeral ports, which a locator rule never
+//!   matches). Left out, with the reason: loopback, this host's addresses,
+//!   an address pinned to another prefix, a profiled participant's pinned
+//!   address, a profile identity's `ips`, and any address a profiled
+//!   participant (other than the target) was learned at. A whole-address
+//!   drop cuts every participant on that host (shared-host caveat, control
+//!   plane contract §6a). [`QuarantineTarget::evidence_truncated`] says an
+//!   observed address or announced locator was forgotten (per-prefix
+//!   caps): such a quarantine is never `full`.
+//! - **Claims do not take a locator away; evidence decides.** A decoy
+//!   copying the rogue's locators from another address was never seen at
+//!   them and changes nothing (H2a). Two prefixes seen at the **same**
+//!   address announcing one ip:port share that host (review R2-3): both
+//!   get it, whether the second one is the rogue's own self-decoy (no
+//!   spoofing needed; before, each contested the other and the rogue was
+//!   quarantined by GUID prefix only), its next prefix after a restart,
+//!   or a decoy spoofing its address.
+//! - **A named rogue keeps its history.** A prefix ranked High or above
+//!   (in a locked profile every unknown participant raises a High finding)
+//!   that is re-announced from a new address after its lease ran out keeps
+//!   its remembered evidence, locators and rank: the new ones are merged in
+//!   (bounded: [`MAX_BOUND_IPS`] sources, [`MAX_LOCATOR_IPS`] locators,
+//!   newest first). Before (review R2-3), the fresh re-bind replaced them,
+//!   so a rogue the SOC had named could reduce its quarantine to its second
+//!   address.
+//! - **GUID-prefix-only.** [`QuarantineTarget::guid_only`] tells the
+//!   executor that the prefix was seen and is not one of the robot's own
+//!   (profiled, pinned, contested): with no locator left it may quarantine
+//!   by the GUID-prefix payload drop alone, which matches RTPS sent by that
+//!   prefix only and is rendered after every motion-path accept.
+//! - A **contested** or **pinned** prefix gets nothing, and no GUID-only.
+//! - Every left-out locator is listed with its reason ([`excluded`]).
+//! - Another input's locators (agentd's `ros2_participant_discovered`
+//!   events) are used only for a prefix the table does not know, through
+//!   the same filters with the event's source as evidence
+//!   ([`BindingTable::vouch_external`], M7).
+//! - The executor still re-checks every locator against its motion control
+//!   path and quarantine scope and the humanoid / approval rules.
+//!
 //! # Limits (be honest)
 //!
 //! - **UDP source addresses are not authenticated.** An attacker on the same
 //!   L2 segment can forge the victim's source IP; this check then passes.
 //!   It raises the bar (an attacker must forge the IP *and* the prefix, and
 //!   cannot receive replies), it does not replace DDS-Security.
+//! - **Quarantine locators** (module docs above) rest on observed source
+//!   addresses, which can be forged too: a rogue that spoofs the address of
+//!   an unprofiled participant (present or absent), and announces its exact
+//!   ip:port, gets that ip:port handed out (since review R2-3 a live owner
+//!   no longer contests it: a same-address claim is the same host) and,
+//!   since review R3-1, that address cut whole when it is inside the
+//!   executor's quarantine scope (accepted limit R3-3). This host's
+//!   address and an address pinned to a profiled participant are never
+//!   handed out to another prefix; a profile identity's or a learned
+//!   profiled host's address is never cut whole. The evidence is per address, not per
+//!   port (RTPS datagrams reach the table without their source port). A
+//!   participant known only through a discovery server has no evidence:
+//!   GUID-prefix-only. So is a rogue that announces its locators only on
+//!   addresses it never sends from: the SOC's answer then says
+//!   `containment: "guid_only"` (control-plane contract §6a). The memory
+//!   is not persisted: after an agentd restart a departed rogue is
+//!   quarantined by GUID prefix only (the executor refuses if agentd does
+//!   not know the prefix at all).
+//! - A merged history (above) also keeps a moved unknown participant's old
+//!   address for [`LOCATOR_RETENTION`]: a quarantine of that prefix may cut
+//!   a host that took the address over in the meantime (within the
+//!   executor's quarantine scope, never a profiled host or the motion
+//!   path).
+//! - A spray from more source addresses than [`MAX_LOCATOR_HISTORY`] /
+//!   [`MAX_LOCATOR_HISTORY_PER_SOURCE`] buckets (spoofed sources) can still
+//!   evict a departed rogue's memory unless the SOC named it first.
+//! - A profiled participant that comes back (lease run out, or after a
+//!   dispose) from an address its remembered evidence never saw (a new
+//!   DHCP lease) makes its prefix **contested** for the life of the table
+//!   (below; only pinning resolves it). The trigger itself lapses with the
+//!   remembered evidence ([`LOCATOR_RETENTION`], 24 h): after that, an SPDP
+//!   for the prefix from a new address binds first-come again (loud only
+//!   when the real participant returns and contests it).
+//! - **First-come profiled addresses** (review R3-6). An attacker that
+//!   announces a profiled prefix first (before the real participant, or
+//!   after its evidence lapsed) is learned at its address. That address is
+//!   then never cut **whole** for another prefix (it might be the robot's
+//!   computer: RoboDR cannot tell until the real participant contests the
+//!   prefix, and not even then which host is which), so a rogue there is
+//!   quarantined by its own locators and the GUID-prefix drop only
+//!   (`containment: "partial"`, reason "learned, not commissioned"). Only
+//!   pins (`participant_ips`) and this host's addresses are trusted as the
+//!   robot's own; pin the profiled prefixes to close this.
 //! - Every participant on one host shares that host's IPs, so a process on
 //!   the robot's own computer can speak for any participant there. That is
 //!   host compromise, which Pulsar's process monitoring covers, not this.
@@ -171,7 +309,7 @@
 //!   Pin the profiled prefixes to close all of this up front.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use robodr_events::graph::{ActionRole, RosNameKind};
@@ -222,6 +360,16 @@ pub const MAX_DISCOVERY_SERVERS: usize = 32;
 pub const MAX_LOCAL_ADDRESSES: usize = 64;
 /// Lease used when SPDP carries none (RTPS default `leaseDuration`).
 pub const DEFAULT_LEASE: Duration = Duration::from_secs(100);
+/// Participants whose last trusted SPDP unicast locators are remembered
+/// after their binding is gone ([`BindingTable::quarantine_locators`]).
+pub const MAX_LOCATOR_HISTORY: usize = 1024;
+/// How long those locators are kept after the participant's last trusted
+/// SPDP announcement.
+pub const LOCATOR_RETENTION: Duration = Duration::from_secs(24 * 3600);
+/// Remembered prefixes per observed source address (the first address a
+/// prefix was seen sending from): a spray from one address can push out
+/// only its own (review M6).
+pub const MAX_LOCATOR_HISTORY_PER_SOURCE: usize = 128;
 /// Lease clamp.
 pub const MIN_LEASE: Duration = Duration::from_secs(10);
 pub const MAX_LEASE: Duration = Duration::from_secs(600);
@@ -327,6 +475,18 @@ pub struct BindingStats {
     pub local_learned: u64,
     /// Profiled prefixes that became contested (claimed by a second host).
     pub contested: u64,
+    /// Remembered quarantine locators forgotten to stay within
+    /// [`MAX_LOCATOR_HISTORY`] / [`MAX_LOCATOR_HISTORY_PER_SOURCE`].
+    pub locators_forgotten: u64,
+    /// Profiled prefixes announced, after their lease ran out, from a host
+    /// their remembered evidence never saw (made contested; review H1).
+    pub foreign_rebinds: u64,
+    /// Prefixes ranked High or above re-announced from a new address after
+    /// their lease ran out: evidence merged, not replaced (review R2-3).
+    pub evidence_merged: u64,
+    /// Prefixes not remembered because every entry left was SOC-named or
+    /// profiled (review R2-4).
+    pub locators_not_remembered: u64,
 }
 
 /// Is `ip` a loopback address (`127.0.0.0/8`, `::1`, or an IPv4-mapped
@@ -453,14 +613,21 @@ pub fn is_motion_topic(profile: &Profile, topic: &str) -> bool {
 
 /// A finding produced by the binding check: the deviation and the source IP
 /// it is attributed to.
-pub type BindingFinding = (Deviation, String);
+/// The third element is the GUID prefix the finding is about (structured,
+/// never parsed from text: agentd's discovery-flood aggregate names it).
+pub type BindingFinding = (Deviation, String, Option<GuidPrefix>);
 
 #[derive(Debug, Clone)]
 struct Entry {
     bound_ips: VecDeque<IpAddr>,
     locator_ips: Vec<IpAddr>,
+    /// The SPDP unicast locators (metatraffic and default) with their ports,
+    /// as last announced through a trusted path ([`BindingTable::spdp_unicast`]).
+    unicast: Vec<SocketAddr>,
     last_refresh: Instant,
     lease: Duration,
+    /// A bound source address was forgotten ([`MAX_BOUND_IPS`]).
+    forgot: bool,
 }
 
 impl Entry {
@@ -476,10 +643,143 @@ impl Entry {
         if !self.bound_ips.contains(&ip) {
             if self.bound_ips.len() >= MAX_BOUND_IPS {
                 self.bound_ips.pop_front();
+                self.forgot = true;
             }
             self.bound_ips.push_back(ip);
         }
     }
+}
+
+/// The SPDP unicast locators a participant last announced through a
+/// trusted path, kept after its binding is gone (lease expiry, dispose,
+/// eviction) for a later quarantine ([`BindingTable::quarantine_locators`]).
+#[derive(Debug, Clone)]
+struct LastLocators {
+    unicast: Vec<SocketAddr>,
+    /// Observed evidence: the source addresses this prefix's own SPDP (not
+    /// relayed) and its accepted endpoint announcements arrived from
+    /// (bounded by [`MAX_BOUND_IPS`]). Only locators on one of these are
+    /// handed out for a quarantine.
+    sources: VecDeque<IpAddr>,
+    /// Its last trusted SPDP.
+    at: Instant,
+    /// How long it is kept under pressure (module docs).
+    rank: Rank,
+    /// Per-source eviction bucket: the first address it was seen sending
+    /// from (`None`: learned through a discovery server only).
+    bucket: Option<IpAddr>,
+    /// An observed source address or an announced locator was forgotten
+    /// ([`MAX_BOUND_IPS`], [`MAX_LOCATOR_IPS`]): a quarantine of the prefix
+    /// can never be `full` (review R3-1).
+    forgot: bool,
+}
+
+impl LastLocators {
+    fn add_source(&mut self, ip: IpAddr) {
+        if !self.sources.contains(&ip) {
+            if self.sources.len() >= MAX_BOUND_IPS {
+                self.sources.pop_front();
+                self.forgot = true;
+            }
+            self.sources.push_back(ip);
+        }
+    }
+
+    /// Was `ip` seen for this prefix: an observed source or an announced
+    /// locator address?
+    fn knows(&self, ip: IpAddr) -> bool {
+        self.sources.contains(&ip) || self.unicast.iter().any(|l| canonical_ip(l.ip()) == ip)
+    }
+}
+
+/// Eviction rank of remembered quarantine locators: the lowest go first
+/// (oldest first within a rank). Module docs, "Quarantine locators".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Rank {
+    /// Only SPDP was seen.
+    SpdpOnly,
+    /// It announced an endpoint from a bound source.
+    Active,
+    /// It raised a High finding.
+    High,
+    /// It raised a Critical finding.
+    Critical,
+    /// A SOC request named it (`quarantine_node`).
+    SocReferenced,
+    /// A profiled participant (the robot's own): never evicted by others.
+    Profiled,
+}
+
+/// Why a remembered locator is not handed out for a quarantine
+/// ([`QuarantineTarget::excluded`]). Stable strings (they reach the
+/// executor's answer).
+pub mod excluded {
+    pub const LOOPBACK: &str = "loopback address";
+    pub const NOT_OBSERVED: &str =
+        "the participant was never seen sending from this address (announced only)";
+    pub const PINNED_ELSEWHERE: &str = "address pinned to another participant (participant_ips)";
+    pub const PROFILED: &str = "announced by a profiled participant (the robot's own)";
+    /// Review R2-5: any port on an address a profiled participant was seen
+    /// on, or announced (the robot computer's own address). Since review
+    /// R3-6 only an address pinned to a profiled participant
+    /// (`participant_ips`); this host's own is [`THIS_HOST`].
+    pub const PROFILED_HOST: &str =
+        "address of a profiled participant's host (the robot's own computer)";
+    /// Review R3-1 / R3-6: an address a profiled participant was learned
+    /// at (first-come SPDP, not commissioned) is never cut whole: it may be
+    /// the robot's computer, or an attacker's that announced a profiled
+    /// prefix first. Its exact locators may still be cut.
+    pub const LEARNED_PROFILED_HOST: &str =
+        "address a profiled participant was learned at (not commissioned): never cut whole; \
+         pin it (participant_ips) or commission the identity's ips";
+    /// Review R3-1: this host's own address: never cut whole, and none of
+    /// its ports for a non-profiled prefix (review R2-5).
+    pub const THIS_HOST: &str = "this host's own address (the computer RoboDR runs on)";
+    /// Review R3-1: an address a profile identity lists (commissioned for
+    /// the robot's participants) is never cut whole. A non-profiled
+    /// prefix's own locators there may be cut (a rogue matching the
+    /// identity from that address, red team F3).
+    pub const IDENTITY_HOST: &str =
+        "address listed in a profile identity's ips (the robot's own): never cut whole";
+    /// No longer produced (review R2-3): two prefixes seen at the same
+    /// address announcing one ip:port share a host and both get it. Kept
+    /// for consumers matching the string.
+    pub const CONTESTED_LIVE: &str =
+        "contested: another live participant was seen at this address announcing it";
+    /// No longer produced (review R2-3), see [`CONTESTED_LIVE`].
+    pub const CONTESTED_LATER: &str =
+        "contested: another participant announced it later from this address";
+    pub const OTHER_FAMILY: &str = "address family differs from the other locators";
+}
+
+/// What agentd may hand the executor for a quarantine of one GUID prefix
+/// ([`BindingTable::quarantine_target`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuarantineTarget {
+    /// Locators the executor may cut (it re-checks every one).
+    pub locators: Vec<SocketAddr>,
+    /// Announced locators left out, and why ([`excluded`]).
+    pub excluded: Vec<(SocketAddr, &'static str)>,
+    /// The table knows this prefix (live, remembered, profiled, pinned or
+    /// contested). When `false` another source (agentd's event input) may
+    /// be asked, filtered by [`BindingTable::vouch_external`].
+    pub known: bool,
+    /// The prefix may be quarantined by its GUID-prefix payload drop alone
+    /// when no locator is left: it was seen, and it is not one of the
+    /// robot's own (profiled, pinned or contested). The drop matches RTPS
+    /// sent by that prefix only, so it cannot cut another participant.
+    pub guid_only: bool,
+    /// Review R3-1: the source addresses the prefix was seen sending from
+    /// that the executor may cut whole (all UDP to and from the robot's
+    /// DDS ports, any source port): not loopback, not this host's, not
+    /// pinned to another prefix, not a profiled participant's host
+    /// (commissioned or learned). One address family, the locators'.
+    pub addresses: Vec<IpAddr>,
+    /// Observed source addresses left out, and why ([`excluded`]).
+    pub excluded_addresses: Vec<(IpAddr, &'static str)>,
+    /// Some observed source address or announced locator of the prefix was
+    /// forgotten (per-prefix caps): its quarantine is never `full`.
+    pub evidence_truncated: bool,
 }
 
 /// An SEDP announcement waiting for its participant's SPDP. Only what is
@@ -556,6 +856,17 @@ pub struct BindingTable {
     contested: BTreeSet<GuidPrefix>,
     /// This host's addresses (configured, detected, learned on loopback).
     local: Vec<IpAddr>,
+    /// The profile's commissioned participant addresses (every identity's
+    /// `ips`; review R3-6).
+    identity_ips: BTreeSet<IpAddr>,
+    /// Last trusted unicast locators per prefix, bounded by
+    /// [`MAX_LOCATOR_HISTORY`] (module docs, "Quarantine locators").
+    history: HashMap<GuidPrefix, LastLocators>,
+    /// Eviction order of `history` per source bucket: `(rank, at,
+    /// prefix)`, lowest rank first, oldest first
+    /// ([`MAX_LOCATOR_HISTORY_PER_SOURCE`]; under global pressure the
+    /// fullest bucket goes first: O(buckets) ≤ [`MAX_LOCATOR_HISTORY`]).
+    history_by_source: HashMap<Option<IpAddr>, BTreeSet<(Rank, Instant, GuidPrefix)>>,
     stats: BindingStats,
 }
 
@@ -616,8 +927,16 @@ impl BindingTable {
                 local.push(ip);
             }
         }
+        let identity_ips = profile
+            .participant_identities
+            .values()
+            .flat_map(|id| id.ips.iter())
+            .filter_map(|s| s.parse::<IpAddr>().ok())
+            .map(canonical_ip)
+            .collect();
         Self {
             local,
+            identity_ips,
             profiled: profile
                 .participants
                 .iter()
@@ -629,6 +948,8 @@ impl BindingTable {
             held: VecDeque::new(),
             held_count: HashMap::new(),
             contested: BTreeSet::new(),
+            history: HashMap::new(),
+            history_by_source: HashMap::new(),
             stats: BindingStats::default(),
         }
     }
@@ -675,9 +996,516 @@ impl BindingTable {
         }
         if profiled {
             self.profiled.insert(prefix);
+            self.raise_rank(&prefix, Rank::Profiled);
         } else {
             self.profiled.remove(&prefix);
+            if let Some(mut h) = self.history.remove(&prefix) {
+                self.unindex_history(prefix, &h);
+                h.rank = Rank::Active;
+                self.index_history(prefix, &h);
+                self.history.insert(prefix, h);
+            }
         }
+    }
+
+    /// The SPDP unicast locators (ip:port, metatraffic and default) that
+    /// participant `prefix` currently announces through a path this table
+    /// trusts: empty when it is unknown, its lease expired, its prefix is
+    /// contested or pinned (`participant_ips` learn no locators). For a
+    /// quarantine target use [`BindingTable::quarantine_locators`].
+    pub fn spdp_unicast(&self, prefix: &GuidPrefix, now: Instant) -> Vec<SocketAddr> {
+        if self.contested.contains(prefix) {
+            return Vec::new();
+        }
+        match self.entries.get(prefix) {
+            Some(e) if !e.expired(now) => e.unicast.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The locators agentd hands the executor for a quarantine of `prefix`:
+    /// [`BindingTable::quarantine_target`]'s `locators`.
+    pub fn quarantine_locators(&self, prefix: &GuidPrefix, now: Instant) -> Vec<SocketAddr> {
+        self.quarantine_target(prefix, now).locators
+    }
+
+    /// What agentd may hand the executor for a quarantine of `prefix`
+    /// (module docs, "Quarantine locators"). Candidates are the unicast
+    /// locators of the prefix's own last trusted SPDP, live or remembered
+    /// for [`LOCATOR_RETENTION`]. A candidate is handed out only when the
+    /// prefix was **observed sending from its address** (SPDP source, or an
+    /// accepted endpoint announcement), it is not loopback, not pinned to
+    /// another prefix, not announced by a profiled participant, and no
+    /// other participant was seen at that address announcing the same
+    /// ip:port (live, or later than this prefix); one address family only.
+    /// Every left-out locator is listed with its reason. None at all for a
+    /// contested or pinned prefix.
+    pub fn quarantine_target(&self, prefix: &GuidPrefix, now: Instant) -> QuarantineTarget {
+        let pinned = self.opts.participant_ips.contains_key(prefix);
+        let contested = self.contested.contains(prefix);
+        let profiled = self.profiled.contains(prefix);
+        let mut t = QuarantineTarget {
+            known: pinned || contested || profiled,
+            ..QuarantineTarget::default()
+        };
+        if pinned || contested {
+            return t;
+        }
+        let remembered = self
+            .history
+            .get(prefix)
+            .filter(|h| now.saturating_duration_since(h.at) <= LOCATOR_RETENTION);
+        let (cands, sources, forgot): (&[SocketAddr], Vec<IpAddr>, bool) = match remembered {
+            Some(h) => (&h.unicast, h.sources.iter().copied().collect(), h.forgot),
+            None => match self.entries.get(prefix).filter(|e| !e.expired(now)) {
+                Some(e) => (&e.unicast, e.bound_ips.iter().copied().collect(), e.forgot),
+                None => return t,
+            },
+        };
+        t.known = true;
+        t.guid_only = !profiled;
+        t.evidence_truncated = forgot;
+        self.filter_candidates(prefix, cands, &sources, &mut t);
+        t
+    }
+
+    /// [`BindingTable::quarantine_target`] for locators of a prefix this
+    /// table does not know, announced by another input (agentd's
+    /// `ros2_participant_discovered` events): the same filters, with the
+    /// event's source address as the only observed evidence. A prefix the
+    /// table knows gets the table's own answer (the other input never
+    /// overrides it).
+    pub fn vouch_external(
+        &self,
+        prefix: &GuidPrefix,
+        cands: &[SocketAddr],
+        src: Option<IpAddr>,
+        now: Instant,
+    ) -> QuarantineTarget {
+        let own = self.quarantine_target(prefix, now);
+        if own.known {
+            return own;
+        }
+        let mut t = QuarantineTarget {
+            known: true,
+            guid_only: true,
+            ..QuarantineTarget::default()
+        };
+        let sources: Vec<IpAddr> = src.map(canonical_ip).into_iter().collect();
+        self.filter_candidates(prefix, cands, &sources, &mut t);
+        t
+    }
+
+    fn filter_candidates(
+        &self,
+        prefix: &GuidPrefix,
+        cands: &[SocketAddr],
+        sources: &[IpAddr],
+        t: &mut QuarantineTarget,
+    ) {
+        // Review R2-5 / R3-6: a non-profiled target never gets any port of
+        // a **commissioned** host of a profiled participant (pins, identity
+        // ips). A profiled target is the robot's own: only its siblings'
+        // exact ip:ports are left out.
+        let profiled = self.profiled.contains(prefix);
+        let commissioned = self.commissioned_host_ips(prefix);
+        let host = |ip: IpAddr| {
+            if self.is_local(ip) {
+                Some(excluded::THIS_HOST)
+            } else {
+                commissioned
+                    .contains(&ip)
+                    .then_some(excluded::PROFILED_HOST)
+            }
+        };
+        for l in cands {
+            let ip = canonical_ip(l.ip());
+            let l = SocketAddr::new(ip, l.port());
+            let why = if ip.is_loopback() {
+                Some(excluded::LOOPBACK)
+            } else if !sources.contains(&ip) {
+                Some(excluded::NOT_OBSERVED)
+            } else {
+                self.claimed_by_other(prefix, &l)
+                    .or_else(|| if profiled { None } else { host(ip) })
+            };
+            match why {
+                Some(w) => t.excluded.push((l, w)),
+                None if !t.locators.contains(&l) => t.locators.push(l),
+                None => {}
+            }
+        }
+        // Review R3-1: the observed source addresses, cut whole by the
+        // executor (any source port to the robot's DDS ports): never this
+        // host, a pinned address of another prefix, or any address a
+        // profiled participant other than the target is known at
+        // (commissioned or learned: a whole-address drop there could cut
+        // the robot's own participants).
+        let learned = self.learned_profiled_ips(prefix);
+        let mut seen: Vec<IpAddr> = Vec::new();
+        for ip in sources.iter().map(|ip| canonical_ip(*ip)) {
+            if seen.contains(&ip) {
+                continue;
+            }
+            seen.push(ip);
+            let why = if ip.is_loopback() {
+                Some(excluded::LOOPBACK)
+            } else if self
+                .opts
+                .participant_ips
+                .iter()
+                .any(|(p, ips)| p != prefix && ips.contains(&ip))
+            {
+                Some(excluded::PINNED_ELSEWHERE)
+            } else if let Some(w) = host(ip) {
+                Some(w)
+            } else if self.identity_ips.contains(&ip) {
+                Some(excluded::IDENTITY_HOST)
+            } else if learned.contains(&ip) {
+                Some(excluded::LEARNED_PROFILED_HOST)
+            } else {
+                None
+            };
+            match why {
+                Some(w) => t.excluded_addresses.push((ip, w)),
+                None => t.addresses.push(ip),
+            }
+        }
+        // One address family (the executor refuses a mix): IPv4 if any.
+        if t.locators.iter().any(SocketAddr::is_ipv4) || t.addresses.iter().any(IpAddr::is_ipv4) {
+            let (keep, drop): (Vec<SocketAddr>, Vec<SocketAddr>) =
+                t.locators.iter().partition(|l| l.is_ipv4());
+            t.locators = keep;
+            t.excluded
+                .extend(drop.into_iter().map(|l| (l, excluded::OTHER_FAMILY)));
+            let (keep, drop): (Vec<IpAddr>, Vec<IpAddr>) =
+                t.addresses.iter().partition(|a| a.is_ipv4());
+            t.addresses = keep;
+            t.excluded_addresses
+                .extend(drop.into_iter().map(|a| (a, excluded::OTHER_FAMILY)));
+        }
+    }
+
+    /// Does a participant other than `prefix` claim locator `l` (see
+    /// [`BindingTable::quarantine_target`])? Pinned to another prefix, or
+    /// announced by a profiled participant (live or remembered). Another
+    /// unprofiled prefix seen at the same address announcing the same
+    /// ip:port does **not** take it away (review R2-3): both were seen
+    /// sending from that host, so they share it, whether it is the rogue's
+    /// own second prefix (a self-decoy) or its successor on the port.
+    fn claimed_by_other(&self, prefix: &GuidPrefix, l: &SocketAddr) -> Option<&'static str> {
+        let ip = l.ip();
+        if self
+            .opts
+            .participant_ips
+            .iter()
+            .any(|(p, ips)| p != prefix && ips.contains(&ip))
+        {
+            return Some(excluded::PINNED_ELSEWHERE);
+        }
+        let announces = |u: &[SocketAddr]| {
+            u.iter()
+                .any(|x| canonical_ip(x.ip()) == ip && x.port() == l.port())
+        };
+        // The robot's own: a profiled participant's live or remembered
+        // locators (its history is never written by a foreign host).
+        let profiled_claims = self.profiled.iter().any(|p| {
+            p != prefix
+                && (self.history.get(p).is_some_and(|h| announces(&h.unicast))
+                    || self.entries.get(p).is_some_and(|e| announces(&e.unicast)))
+        });
+        profiled_claims.then_some(excluded::PROFILED)
+    }
+
+    /// The **pinned** addresses of the robot's own computers (reviews R2-5,
+    /// R3-6): the pins of every profiled prefix other than `except`.
+    /// Nothing an SPDP can write: an attacker that announces a profiled
+    /// prefix first (before the real participant, or after its evidence
+    /// lapsed) is bound first-come, and its address must not shield its
+    /// other participants. (This host's own addresses, and for whole-address
+    /// drops the profile identities' `ips`, are checked besides.)
+    fn commissioned_host_ips(&self, except: &GuidPrefix) -> BTreeSet<IpAddr> {
+        let mut out = BTreeSet::new();
+        for p in self.profiled.iter().filter(|p| *p != except) {
+            if let Some(pins) = self.opts.participant_ips.get(p) {
+                out.extend(pins.iter().copied());
+            }
+        }
+        out.retain(|ip| !ip.is_loopback());
+        out
+    }
+
+    /// The addresses profiled participants other than `except` were
+    /// **learned** at: their remembered evidence and announced locator
+    /// addresses, and the bound source addresses of their live bindings
+    /// (contested ones included). Never cut whole (it may be the robot's
+    /// computer), but no longer a reason to leave a non-profiled target's
+    /// own locators there out (review R3-6). Small: the profile's
+    /// participants times the per-entry caps.
+    fn learned_profiled_ips(&self, except: &GuidPrefix) -> BTreeSet<IpAddr> {
+        let mut out = BTreeSet::new();
+        for p in self.profiled.iter().filter(|p| *p != except) {
+            if let Some(h) = self.history.get(p) {
+                out.extend(h.sources.iter().copied());
+                out.extend(h.unicast.iter().map(|l| canonical_ip(l.ip())));
+            }
+            if let Some(e) = self.entries.get(p) {
+                out.extend(e.bound_ips.iter().copied());
+                out.extend(e.locator_ips.iter().copied());
+            }
+        }
+        out.retain(|ip| !ip.is_loopback());
+        out
+    }
+
+    fn history_key(p: GuidPrefix, h: &LastLocators) -> (Rank, Instant, GuidPrefix) {
+        (h.rank, h.at, p)
+    }
+
+    fn unindex_history(&mut self, p: GuidPrefix, h: &LastLocators) {
+        let k = Self::history_key(p, h);
+        if let Some(b) = self.history_by_source.get_mut(&h.bucket) {
+            b.remove(&k);
+            if b.is_empty() {
+                self.history_by_source.remove(&h.bucket);
+            }
+        }
+    }
+
+    fn index_history(&mut self, p: GuidPrefix, h: &LastLocators) {
+        let k = Self::history_key(p, h);
+        self.history_by_source
+            .entry(h.bucket)
+            .or_default()
+            .insert(k);
+    }
+
+    fn forget(&mut self, victim: GuidPrefix) {
+        if let Some(h) = self.history.remove(&victim) {
+            self.unindex_history(victim, &h);
+            self.stats.locators_forgotten += 1;
+        }
+    }
+
+    /// Remember `p`'s unicast locators from a trusted SPDP sent from `src`
+    /// (`None`: relayed by a discovery server). `fresh`: a new owner (the
+    /// prefix was re-bound after its lease ran out), whose evidence
+    /// replaces the old one, unless the prefix is ranked High or above
+    /// (it raised a High / Critical finding, or a SOC named it): then the
+    /// evidence, locators and rank are **merged** (review R2-3: a rogue
+    /// re-announcing its prefix from a second address after its lease does
+    /// not wipe the first one; bounded by [`MAX_BOUND_IPS`] sources and
+    /// [`MAX_LOCATOR_IPS`] locators, the newest kept). A set without
+    /// locators keeps the previous one.
+    fn remember(
+        &mut self,
+        p: GuidPrefix,
+        unicast: &[SocketAddr],
+        src: Option<IpAddr>,
+        fresh: bool,
+        now: Instant,
+    ) {
+        if unicast.is_empty() {
+            if let Some(ip) = src {
+                self.note_evidence(&p, ip);
+            }
+            return;
+        }
+        let old = self.history.remove(&p);
+        if let Some(o) = &old {
+            self.unindex_history(p, o);
+        }
+        let floor = if self.profiled.contains(&p) {
+            Rank::Profiled
+        } else {
+            Rank::SpdpOnly
+        };
+        let mut h = match old {
+            Some(o) if !fresh => LastLocators {
+                unicast: unicast.to_vec(),
+                at: now,
+                rank: o.rank.max(floor),
+                ..o
+            },
+            Some(o) if o.rank >= Rank::High => {
+                self.stats.evidence_merged += 1;
+                let mut merged = unicast.to_vec();
+                let mut forgot = o.forgot;
+                for l in &o.unicast {
+                    if merged.contains(l) {
+                        continue;
+                    }
+                    if merged.len() >= MAX_LOCATOR_IPS {
+                        forgot = true;
+                        break;
+                    }
+                    merged.push(*l);
+                }
+                LastLocators {
+                    unicast: merged,
+                    at: now,
+                    rank: o.rank.max(floor),
+                    forgot,
+                    ..o
+                }
+            }
+            _ => LastLocators {
+                unicast: unicast.to_vec(),
+                sources: VecDeque::new(),
+                at: now,
+                rank: floor,
+                bucket: src,
+                forgot: false,
+            },
+        };
+        if let Some(ip) = src {
+            h.add_source(ip);
+        }
+        // Per source first: a spray from one address pushes out only its
+        // own, lowest rank first. Profiled participants are never counted.
+        if h.rank < Rank::Profiled {
+            loop {
+                let victim = self.history_by_source.get(&h.bucket).and_then(|b| {
+                    (b.len() >= MAX_LOCATOR_HISTORY_PER_SOURCE)
+                        .then(|| b.first().map(|k| k.2))
+                        .flatten()
+                });
+                match victim {
+                    Some(v)
+                        if self
+                            .history
+                            .get(&v)
+                            .is_some_and(|x| x.rank < Rank::Profiled) =>
+                    {
+                        self.forget(v)
+                    }
+                    _ => break,
+                }
+            }
+        }
+        // Global pressure (review R2-4): evict from the fullest per-source
+        // bucket, lowest rank then oldest first, so a spray from N
+        // addresses pushes out its own entries before a lone rogue's.
+        // Profiled entries are never evicted, SOC-named ones only for
+        // another SOC-named one; if nothing may go, `p` is not remembered.
+        while self.history.len() >= MAX_LOCATOR_HISTORY {
+            let victim = self
+                .history_by_source
+                .values()
+                .filter_map(|b| {
+                    b.iter()
+                        .find(|k| {
+                            k.0 < Rank::Profiled
+                                && (k.0 < Rank::SocReferenced || h.rank >= Rank::SocReferenced)
+                        })
+                        .map(|k| (b.len(), *k))
+                })
+                .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))
+                .map(|(_, k)| k.2);
+            match victim {
+                Some(v) => self.forget(v),
+                None => {
+                    self.stats.locators_not_remembered += 1;
+                    return;
+                }
+            }
+        }
+        self.index_history(p, &h);
+        self.history.insert(p, h);
+    }
+
+    /// `ip` was seen sending for `p` (an accepted, non-relayed SPDP or
+    /// endpoint announcement): evidence for its locators on that address.
+    fn note_evidence(&mut self, p: &GuidPrefix, ip: IpAddr) {
+        if let Some(h) = self.history.get_mut(p) {
+            h.add_source(ip);
+        }
+    }
+
+    /// Raise `p`'s eviction rank to at least `rank` (it never drops).
+    fn raise_rank(&mut self, p: &GuidPrefix, rank: Rank) {
+        let Some(h) = self.history.get(p) else {
+            return;
+        };
+        if h.rank >= rank {
+            return;
+        }
+        let Some(mut h) = self.history.remove(p) else {
+            return;
+        };
+        self.unindex_history(*p, &h);
+        h.rank = rank;
+        self.index_history(*p, &h);
+        self.history.insert(*p, h);
+    }
+
+    /// `p` raised a finding of `severity` (the pipeline calls this): a
+    /// High or Critical one keeps its remembered locators longer under a
+    /// prefix flood (review M6).
+    pub fn note_finding(&mut self, p: &GuidPrefix, severity: Severity) {
+        match severity {
+            Severity::Critical => self.raise_rank(p, Rank::Critical),
+            Severity::High => self.raise_rank(p, Rank::High),
+            _ => {}
+        }
+    }
+
+    /// A SOC request named `p` (agentd calls this for `quarantine_node`):
+    /// its remembered locators outlast every prefix that was not named
+    /// (bounded by [`MAX_LOCATOR_HISTORY`] like the rest).
+    pub fn note_soc_reference(&mut self, p: &GuidPrefix) {
+        self.raise_rank(p, Rank::SocReferenced);
+    }
+
+    /// The eviction rank of `p`'s remembered locators, if any (tests,
+    /// status).
+    pub fn locator_rank(&self, p: &GuidPrefix) -> Option<Rank> {
+        self.history.get(p).map(|h| h.rank)
+    }
+
+    /// Is `p` one of the robot's own: profiled or pinned?
+    pub fn is_protected(&self, p: &GuidPrefix) -> bool {
+        self.profiled.contains(p) || self.opts.participant_ips.contains_key(p)
+    }
+
+    /// `p` announced an endpoint from `ip`, accepted by its binding: its
+    /// remembered locators are evicted after those of SPDP-only prefixes,
+    /// and `ip` (unless relayed) is evidence.
+    fn mark_active(&mut self, p: &GuidPrefix, ip: Option<IpAddr>) {
+        self.raise_rank(p, Rank::Active);
+        if let Some(ip) = ip {
+            self.note_evidence(p, ip);
+        }
+    }
+
+    /// A profiled prefix with no live binding announced from `ip`, which
+    /// its remembered evidence never saw (neither a source nor a locator
+    /// address, nor same-host loopback for a same-host participant): a
+    /// foreign host (review H1).
+    fn foreign_to_profiled(
+        &self,
+        p: &GuidPrefix,
+        ip: IpAddr,
+        ingress: Ingress,
+        now: Instant,
+    ) -> bool {
+        if !self.profiled.contains(p) || self.entries.get(p).is_some_and(|e| !e.expired(now)) {
+            return false;
+        }
+        let Some(h) = self
+            .history
+            .get(p)
+            .filter(|h| now.saturating_duration_since(h.at) <= LOCATOR_RETENTION)
+        else {
+            return false;
+        };
+        let local = h
+            .sources
+            .iter()
+            .copied()
+            .chain(h.unicast.iter().map(|l| canonical_ip(l.ip())))
+            .any(|x| self.is_local(x));
+        !(h.knows(ip) || (self.same_host_loopback(ip, ingress) && local))
     }
 
     /// Is `prefix` contested (a profiled, unpinned prefix claimed by SPDP
@@ -890,6 +1718,7 @@ impl BindingTable {
         (
             Deviation::new(rules::ENDPOINT_SOURCE_MISMATCH, severity, detail),
             ip.to_string(),
+            Some(*participant),
         )
     }
 
@@ -918,6 +1747,7 @@ impl BindingTable {
         (
             Deviation::new(rules::ENDPOINT_UNANNOUNCED_PARTICIPANT, severity, detail),
             h.src_ip.to_string(),
+            Some(h.participant),
         )
     }
 
@@ -953,6 +1783,27 @@ impl BindingTable {
             }
             v
         };
+        // More distinct unicast locators than are kept: a quarantine of
+        // the prefix can never be `full` (review R3-1).
+        let mut over = false;
+        let unicast: Vec<SocketAddr> = {
+            let mut v: Vec<SocketAddr> = Vec::new();
+            for l in spdp.metatraffic_unicast.iter().chain(&spdp.default_unicast) {
+                let port = u16::try_from(l.port).ok().filter(|p| *p != 0);
+                if let (Some(ip), Some(port)) = (locator_ip(l), port) {
+                    let sa = SocketAddr::new(ip, port);
+                    if v.contains(&sa) {
+                        continue;
+                    }
+                    if v.len() < MAX_LOCATOR_IPS {
+                        v.push(sa);
+                    } else {
+                        over = true;
+                    }
+                }
+            }
+            v
+        };
         let lease = spdp
             .lease_duration
             .and_then(|d| d.to_std())
@@ -977,6 +1828,7 @@ impl BindingTable {
             out.push((
                 Deviation::new(rules::PARTICIPANT_SOURCE_MISMATCH, severity, detail),
                 ip.to_string(),
+                Some(p),
             ));
         };
 
@@ -1003,10 +1855,22 @@ impl BindingTable {
             if self.opts.participant_ips.contains_key(&p) {
                 return;
             }
+            // A profiled prefix with no live binding relayed with locators
+            // none of which it was ever seen on: a foreign host (H1).
+            if !locators.is_empty()
+                && locators
+                    .iter()
+                    .all(|l| self.foreign_to_profiled(&p, *l, Ingress::Unknown, now))
+            {
+                self.contest_foreign(p, out, &reject);
+                return;
+            }
+            self.remember(p, &unicast, None, false, now);
             match self.entries.get_mut(&p) {
                 Some(e) => {
                     let old = e.last_refresh;
                     e.locator_ips = locators;
+                    e.unicast = unicast;
                     e.last_refresh = now;
                     e.lease = lease;
                     self.stats.refreshed += 1;
@@ -1018,12 +1882,17 @@ impl BindingTable {
                         Entry {
                             bound_ips: VecDeque::new(),
                             locator_ips: locators,
+                            unicast,
                             last_refresh: now,
                             lease,
+                            forgot: false,
                         },
                     );
                     self.stats.learned += 1;
                 }
+            }
+            if over {
+                self.mark_forgot(&p);
             }
             self.resolve_held(profile, &p, out);
             return;
@@ -1048,12 +1917,30 @@ impl BindingTable {
             return;
         }
 
+        // Review H1: a foreign host never takes over a profiled prefix's
+        // remembered locators, even after its lease ran out.
+        if self.foreign_to_profiled(&p, ip, ingress, now) {
+            self.contest_foreign(p, out, &reject);
+            return;
+        }
         let allowed = self.allows_from(&p, ip, ingress) == Some(true);
+        let accepted = match self.entries.get(&p) {
+            Some(e) => allowed || e.expired(now),
+            None => true,
+        };
+        if accepted {
+            // A new owner (re-bound after its lease ran out, or after it
+            // left, from an address it was never seen on): its evidence
+            // replaces the old one.
+            let fresh = !allowed && !self.history.get(&p).is_some_and(|h| h.knows(ip));
+            self.remember(p, &unicast, Some(ip), fresh, now);
+        }
         match self.entries.get_mut(&p) {
             Some(e) if allowed => {
                 let old = e.last_refresh;
                 e.add_bound(ip);
                 e.locator_ips = locators;
+                e.unicast = unicast;
                 e.last_refresh = now;
                 e.lease = lease;
                 self.stats.refreshed += 1;
@@ -1085,8 +1972,10 @@ impl BindingTable {
                 // Lease expired: the old participant is gone, re-bind.
                 let old = e.last_refresh;
                 e.bound_ips.clear();
+                e.forgot = false;
                 e.add_bound(ip);
                 e.locator_ips = locators;
+                e.unicast = unicast;
                 e.last_refresh = now;
                 e.lease = lease;
                 self.stats.rebound += 1;
@@ -1096,15 +1985,52 @@ impl BindingTable {
                 let mut e = Entry {
                     bound_ips: VecDeque::new(),
                     locator_ips: locators,
+                    unicast,
                     last_refresh: now,
                     lease,
+                    forgot: false,
                 };
                 e.add_bound(ip);
                 self.insert(p, e);
                 self.stats.learned += 1;
             }
         }
+        if over {
+            self.mark_forgot(&p);
+        }
         self.resolve_held(profile, &p, out);
+    }
+
+    /// Some of `p`'s announced locators were not kept.
+    fn mark_forgot(&mut self, p: &GuidPrefix) {
+        if let Some(h) = self.history.get_mut(p) {
+            h.forgot = true;
+        }
+        if let Some(e) = self.entries.get_mut(p) {
+            e.forgot = true;
+        }
+    }
+
+    /// Review H1: `p` (profiled, no live binding) was announced from a host
+    /// its remembered evidence never saw. It becomes contested (no source
+    /// is trusted for it until it is pinned), its remembered locators are
+    /// kept, and a Critical `participant_source_mismatch` is raised.
+    fn contest_foreign(
+        &mut self,
+        p: GuidPrefix,
+        out: &mut Vec<BindingFinding>,
+        reject: &dyn Fn(&mut Self, &str, &mut Vec<BindingFinding>),
+    ) {
+        self.contested.insert(p);
+        self.stats.contested += 1;
+        self.stats.foreign_rebinds += 1;
+        reject(
+            self,
+            "after its lease ran out (or it left), from a host it was never seen on: another host \
+             claims its GUID prefix, which is now contested (no source is trusted for it until it \
+             is pinned in participant_ips; its last locators are kept)",
+            out,
+        );
     }
 
     /// Keep the eviction index in step with an entry's `last_refresh`.
@@ -1205,7 +2131,10 @@ impl BindingTable {
         };
         self.learn_local(ip, ingress);
         match self.judge(&ep.participant, ip, ingress, ep.relayed(), ep.guid_conflict) {
-            Verdict::Ok => {}
+            Verdict::Ok => {
+                let direct = !ep.relayed() && !ep.guid_conflict;
+                self.mark_active(&ep.participant, direct.then_some(ip));
+            }
             Verdict::Mismatch(why) => {
                 let f = self.mismatch_finding(
                     profile,
@@ -1471,6 +2400,8 @@ mod tests {
             type_names: vec!["t".into()],
             alternates: Vec::new(),
             from_fragments: false,
+            unicast_locators: Vec::new(),
+            multicast_locators: Vec::new(),
         }
     }
 
@@ -1640,6 +2571,20 @@ mod tests {
         );
         assert_eq!(t.b.allows(&P1, ip(XIP)), Some(false));
         assert_eq!(t.b.allows(&P2, ip(RIP)), None);
+        // The announced unicast locators with their ports (for the
+        // executor's quarantine target); none for an unknown participant.
+        assert_eq!(
+            t.b.spdp_unicast(&P1, t.now),
+            vec![
+                SocketAddr::new(ip(RIP), 7410),
+                SocketAddr::new(ip(RLOC), 7410)
+            ]
+        );
+        assert!(t.b.spdp_unicast(&P2, t.now).is_empty());
+        assert!(t
+            .b
+            .spdp_unicast(&P1, t.now + Duration::from_secs(3600))
+            .is_empty());
         assert!(t.ep(&writer(P1), ip(RIP)).is_empty());
         assert!(t.ep(&writer(P1), ip(RLOC)).is_empty());
         assert_eq!(t.b.stats().learned, 1);
@@ -2297,5 +3242,468 @@ mod tests {
         assert!(t.ep_in(&writer(P2), lo4(), Ingress::Loopback).is_empty());
         let f = t.spdp(&spdp(P2, &[XIP], None), ip(XIP));
         one(&f, rules::ENDPOINT_SOURCE_MISMATCH, Severity::Critical);
+    }
+
+    // ---- quarantine locators (red team F3) ------------------------------
+
+    #[test]
+    fn quarantine_locators_outlive_the_binding_and_stay_the_prefixs_own() {
+        const P3: GuidPrefix = [0x33; 12];
+        const P3IP: [u8; 4] = [192, 168, 50, 67];
+        let mut t = T::new(BindingOptions::default());
+        let at = |a: [u8; 4]| SocketAddr::new(ip(a), 7410);
+        assert!(t.spdp(&spdp(P2, &[XIP], Some(10)), ip(XIP)).is_empty());
+        assert_eq!(t.b.quarantine_locators(&P2, t.now), vec![at(XIP)]);
+        // A conflicting SPDP for the live prefix from another host is
+        // rejected and changes nothing.
+        let f = t.spdp(&spdp(P2, &[DS], Some(10)), ip(DS));
+        assert_eq!(f.len(), 1, "{f:#?}");
+        assert_eq!(t.b.quarantine_locators(&P2, t.now), vec![at(XIP)]);
+        // It disposes itself: the binding is gone, its locators are kept.
+        assert_eq!(
+            t.b.observe_participant_removal(&removal(P2, P2), Some(ip(XIP)), Ingress::Unknown),
+            Some(true)
+        );
+        assert!(!t.b.is_bound(&P2));
+        assert!(t.b.spdp_unicast(&P2, t.now).is_empty());
+        assert_eq!(t.b.quarantine_locators(&P2, t.now), vec![at(XIP)]);
+        // ...for the retention period only.
+        let late = t.now + LOCATOR_RETENTION + Duration::from_secs(1);
+        assert!(t.b.quarantine_locators(&P2, late).is_empty());
+        // Never seen: nothing.
+        assert!(t.b.quarantine_locators(&P3, t.now).is_empty());
+
+        // P3 copies the robot's (profiled P1) locator next to its own: it
+        // never gets the robot's, live or after the robot's lease ran out.
+        assert!(t.spdp(&spdp(P1, &[RIP], Some(10)), ip(RIP)).is_empty());
+        assert!(t
+            .spdp(&spdp(P3, &[RIP, P3IP], Some(10)), ip(P3IP))
+            .is_empty());
+        assert_eq!(t.b.quarantine_locators(&P3, t.now), vec![at(P3IP)]);
+        t.advance(Duration::from_secs(60));
+        assert!(t.b.spdp_unicast(&P1, t.now).is_empty(), "P1 expired");
+        assert_eq!(t.b.quarantine_locators(&P3, t.now), vec![at(P3IP)]);
+        // P3 left and P1 is back: P1 keeps its own locator.
+        assert_eq!(t.b.quarantine_locators(&P1, t.now), vec![at(RIP)]);
+    }
+
+    #[test]
+    fn a_contested_or_pinned_prefix_gets_no_quarantine_locators() {
+        let mut t = T::new(BindingOptions::default());
+        assert!(t.spdp(&spdp(P1, &[RIP], None), ip(RIP)).is_empty());
+        assert!(!t.b.quarantine_locators(&P1, t.now).is_empty());
+        // A second host claims the profiled prefix: contested, nothing
+        // (neither live nor remembered), so a quarantine never cuts the
+        // legitimate owner.
+        let f = t.spdp(&spdp(P1, &[XIP], None), ip(XIP));
+        one(&f, rules::PARTICIPANT_SOURCE_MISMATCH, Severity::Critical);
+        assert!(t.b.is_contested(&P1));
+        assert!(t.b.quarantine_locators(&P1, t.now).is_empty());
+        t.advance(Duration::from_secs(3600));
+        assert!(t.b.quarantine_locators(&P1, t.now).is_empty());
+
+        // A pinned prefix learns no locators; its pinned address is never
+        // handed out for another prefix either.
+        let mut pins = BTreeMap::new();
+        pins.insert(P1, vec![ip(RIP)]);
+        let mut t = T::new(BindingOptions {
+            participant_ips: pins,
+            ..Default::default()
+        });
+        assert!(t.spdp(&spdp(P1, &[RIP], None), ip(RIP)).is_empty());
+        assert!(t.b.quarantine_locators(&P1, t.now).is_empty());
+        assert!(t.spdp(&spdp(P2, &[RIP, XIP], None), ip(XIP)).is_empty());
+        assert_eq!(
+            t.b.quarantine_locators(&P2, t.now),
+            vec![SocketAddr::new(ip(XIP), 7410)]
+        );
+    }
+
+    #[test]
+    fn spdp_only_prefixes_are_forgotten_before_active_ones() {
+        let mut t = T::new(BindingOptions::default());
+        assert!(t.spdp(&spdp(P2, &[XIP], None), ip(XIP)).is_empty());
+        assert!(t.ep(&writer(P2), ip(XIP)).len() <= 1);
+        for i in 0..(MAX_LOCATOR_HISTORY as u32 + 10) {
+            let mut g = [0x44; 12];
+            g[..4].copy_from_slice(&i.to_be_bytes());
+            t.advance(Duration::from_millis(1));
+            t.spdp(&spdp(g, &[DS], None), ip(DS));
+        }
+        assert!(t.b.stats().locators_forgotten >= 10);
+        assert!(t.b.history.len() <= MAX_LOCATOR_HISTORY);
+        assert_eq!(
+            t.b.quarantine_locators(&P2, t.now),
+            vec![SocketAddr::new(ip(XIP), 7410)]
+        );
+    }
+
+    // ---- review of the F3 fix (H1, H2, M5, M6, M7) ----------------------
+
+    const P3: GuidPrefix = [0x33; 12];
+
+    fn sa(a: [u8; 4]) -> SocketAddr {
+        SocketAddr::new(ip(a), 7410)
+    }
+
+    #[test]
+    fn a_profiled_participant_back_from_its_own_addresses_is_not_contested() {
+        let mut t = T::new(BindingOptions::default());
+        assert!(t
+            .spdp(&spdp(P1, &[RIP, RLOC], Some(10)), ip(RIP))
+            .is_empty());
+        t.advance(Duration::from_secs(60));
+        // Back from its bound address, then (lease run out again) from its
+        // second interface, an announced locator address.
+        assert!(t
+            .spdp(&spdp(P1, &[RIP, RLOC], Some(10)), ip(RIP))
+            .is_empty());
+        t.advance(Duration::from_secs(60));
+        assert!(t
+            .spdp(&spdp(P1, &[RIP, RLOC], Some(10)), ip(RLOC))
+            .is_empty());
+        // It disposes itself and comes back.
+        assert_eq!(
+            t.b.observe_participant_removal(&removal(P1, P1), Some(ip(RLOC)), Ingress::Unknown),
+            Some(true)
+        );
+        assert!(t
+            .spdp(&spdp(P1, &[RIP, RLOC], Some(10)), ip(RIP))
+            .is_empty());
+        assert!(!t.b.is_contested(&P1));
+        assert_eq!(t.b.stats().foreign_rebinds, 0);
+        assert_eq!(t.b.quarantine_locators(&P1, t.now), vec![sa(RIP), sa(RLOC)]);
+        assert_eq!(t.b.locator_rank(&P1), Some(Rank::Profiled));
+        // After a dispose, a foreign host is caught too.
+        assert_eq!(
+            t.b.observe_participant_removal(&removal(P1, P1), Some(ip(RIP)), Ingress::Unknown),
+            Some(true)
+        );
+        let f = t.spdp(&spdp(P1, &[XIP], Some(10)), ip(XIP));
+        one(&f, rules::PARTICIPANT_SOURCE_MISMATCH, Severity::Critical);
+        assert_eq!(f[0].2, Some(P1), "structured participant");
+        assert!(t.b.is_contested(&P1));
+        assert_eq!(t.b.stats().foreign_rebinds, 1);
+    }
+
+    #[test]
+    fn a_relayed_foreign_announcement_of_a_profiled_prefix_contests_it() {
+        let mut t = T::new(BindingOptions {
+            discovery_servers: vec![ip(DS)],
+            ..Default::default()
+        });
+        assert!(t.spdp(&spdp(P1, &[RIP], Some(10)), ip(RIP)).is_empty());
+        t.advance(Duration::from_secs(60));
+        let mut relayed = spdp(P1, &[XIP], Some(10));
+        relayed.source = P2;
+        let f = t.spdp(&relayed, ip(DS));
+        one(&f, rules::PARTICIPANT_SOURCE_MISMATCH, Severity::Critical);
+        assert!(t.b.is_contested(&P1));
+        // The robot's remembered locator is still protected.
+        assert!(t.spdp(&spdp(P2, &[XIP, RIP], None), ip(RIP)).is_empty());
+        let q = t.b.quarantine_target(&P2, t.now);
+        assert!(q.locators.is_empty(), "{q:?}");
+        assert_eq!(q.excluded[1], (sa(RIP), excluded::PROFILED), "{q:?}");
+    }
+
+    #[test]
+    fn quarantine_target_reasons_and_guid_only() {
+        let mut t = T::new(BindingOptions::default());
+        assert!(t.spdp(&spdp(P1, &[RIP], None), ip(RIP)).is_empty());
+        let lo = [127, 0, 0, 1];
+        let far = [10, 99, 0, 1];
+        assert!(t
+            .spdp(&spdp(P2, &[XIP, lo, far, RIP], None), ip(XIP))
+            .is_empty());
+        let q = t.b.quarantine_target(&P2, t.now);
+        assert_eq!(q.locators, vec![sa(XIP)]);
+        assert!(q.known && q.guid_only);
+        assert_eq!(
+            q.excluded,
+            vec![
+                (sa(lo), excluded::LOOPBACK),
+                (sa(far), excluded::NOT_OBSERVED),
+                (sa(RIP), excluded::NOT_OBSERVED),
+            ]
+        );
+        // The robot's own: its locators, never by GUID prefix alone.
+        let q = t.b.quarantine_target(&P1, t.now);
+        assert_eq!(q.locators, vec![sa(RIP)]);
+        assert!(q.known && !q.guid_only);
+        // Spoofed from the robot's address (an announced locator, so the
+        // binding accepts it): still never the robot's ip:port...
+        assert!(t.spdp(&spdp(P2, &[XIP, RIP], None), ip(RIP)).is_empty());
+        let q = t.b.quarantine_target(&P2, t.now);
+        assert_eq!(q.locators, vec![sa(XIP)]);
+        assert_eq!(q.excluded, vec![(sa(RIP), excluded::PROFILED)]);
+        // ...while the robot's own quarantine (a deliberate SOC choice)
+        // still gets its ip:port: two prefixes seen at one address share
+        // the host (review R2-3).
+        let q = t.b.quarantine_target(&P1, t.now);
+        assert_eq!(q.locators, vec![sa(RIP)]);
+        // Unknown: nothing, and nothing by GUID prefix.
+        let q = t.b.quarantine_target(&P3, t.now);
+        assert!(!q.known && !q.guid_only && q.locators.is_empty());
+    }
+
+    /// Review R2-3 (a): a second prefix seen at the rogue's own address
+    /// (its self-decoy, no spoofing needed) announcing the same ip:port
+    /// shares the host: both get it (before, neither did, and the rogue's
+    /// quarantine was by GUID prefix only).
+    #[test]
+    fn a_same_host_decoy_shares_the_locator() {
+        let mut t = T::new(BindingOptions::default());
+        assert!(t.spdp(&spdp(P2, &[XIP], None), ip(XIP)).is_empty());
+        // From another address: no evidence, no effect (H2a).
+        assert!(t.spdp(&spdp(P3, &[XIP], None), ip(DS)).is_empty());
+        assert_eq!(t.b.quarantine_locators(&P2, t.now), vec![sa(XIP)]);
+        assert!(t.b.quarantine_locators(&P3, t.now).is_empty());
+        // From the rogue's own address: the same host.
+        assert!(t.spdp(&spdp(P3, &[XIP], None), ip(XIP)).is_empty());
+        for p in [P2, P3] {
+            let q = t.b.quarantine_target(&p, t.now);
+            assert_eq!(q.locators, vec![sa(XIP)], "{q:?}");
+            assert!(q.excluded.is_empty() && q.guid_only, "{q:?}");
+        }
+    }
+
+    /// A departed prefix's port is handed out also once a successor on the
+    /// same host announces it (review R2-3: the rogue rotating its prefix,
+    /// or staggering a self-decoy, is the same host).
+    #[test]
+    fn a_departed_prefixs_port_stays_its_own_with_a_successor_on_the_host() {
+        let mut t = T::new(BindingOptions::default());
+        assert!(t.spdp(&spdp(P2, &[XIP], Some(10)), ip(XIP)).is_empty());
+        t.advance(Duration::from_secs(60));
+        assert!(t.spdp(&spdp(P3, &[XIP], Some(10)), ip(XIP)).is_empty());
+        assert_eq!(t.b.quarantine_locators(&P3, t.now), vec![sa(XIP)]);
+        assert_eq!(t.b.quarantine_locators(&P2, t.now), vec![sa(XIP)]);
+        t.advance(Duration::from_secs(60));
+        assert_eq!(t.b.quarantine_locators(&P2, t.now), vec![sa(XIP)]);
+    }
+
+    /// Review R2-5: a non-profiled prefix never gets any port of the
+    /// robot's own computer; the robot's own quarantine keeps its exact
+    /// ip:ports only. Since review R3-6 "the robot's own computer" is an
+    /// address an SPDP cannot claim: this host's, or one pinned to a
+    /// profiled participant
+    /// (`a_first_come_claim_of_a_profiled_prefix_does_not_shield_the_attackers_host`):
+    /// an address a profiled participant was only learned at is never cut
+    /// whole (R3-1), but a non-profiled prefix's own locators there are.
+    #[test]
+    fn a_profiled_hosts_other_ports_are_protected() {
+        let decoy = |t: &mut T| {
+            assert!(t.spdp(&spdp(P1, &[RIP], None), ip(RIP)).is_empty());
+            let mut d = spdp(P2, &[RIP, XIP], None);
+            d.metatraffic_unicast[0].port = 7412;
+            assert!(t.spdp(&d, ip(RIP)).is_empty());
+            t.spdp(&d, ip(XIP));
+            t.b.quarantine_target(&P2, t.now)
+        };
+        // This host: commissioned.
+        let mut t = T::local();
+        let q = decoy(&mut t);
+        assert_eq!(q.locators, vec![sa(XIP)]);
+        assert_eq!(
+            q.excluded,
+            vec![(SocketAddr::new(ip(RIP), 7412), excluded::THIS_HOST)]
+        );
+        assert_eq!(q.addresses, vec![ip(XIP)]);
+        assert_eq!(q.excluded_addresses, vec![(ip(RIP), excluded::THIS_HOST)]);
+        // Learned only: the decoy's own port there is cut, the address
+        // never whole.
+        let mut t = T::new(BindingOptions::default());
+        let q = decoy(&mut t);
+        assert_eq!(q.locators, vec![SocketAddr::new(ip(RIP), 7412), sa(XIP)]);
+        assert_eq!(q.addresses, vec![ip(XIP)]);
+        assert_eq!(
+            q.excluded_addresses,
+            vec![(ip(RIP), excluded::LEARNED_PROFILED_HOST)]
+        );
+    }
+
+    /// Review R3-6: an attacker that announces a profiled prefix first
+    /// (before the real participant appears, or after its remembered
+    /// evidence lapsed) is bound first-come, and its address counted as
+    /// "the robot's own computer": every port there was left out of a
+    /// rogue's quarantine (`PROFILED_HOST`). Only addresses an SPDP cannot
+    /// claim (pins, this host's) shield other ports now; a learned one (and
+    /// a profile identity's ips) is only never cut **whole** (it may be the
+    /// robot's computer), so the rogue's own locators there are cut and the
+    /// answer says `partial`.
+    #[test]
+    fn a_first_come_claim_of_a_profiled_prefix_does_not_shield_the_attackers_host() {
+        let mut t = T::new(BindingOptions::default());
+        // The attacker announces the robot's prefix first, then a rogue on
+        // another port of the same host.
+        assert!(t.spdp(&spdp(P1, &[XIP], None), ip(XIP)).is_empty());
+        let mut r = spdp(P2, &[XIP], None);
+        r.metatraffic_unicast[0].port = 7412;
+        assert!(t.spdp(&r, ip(XIP)).is_empty());
+        let rogue = SocketAddr::new(ip(XIP), 7412);
+        let q = t.b.quarantine_target(&P2, t.now);
+        assert_eq!(q.locators, vec![rogue], "{q:?}");
+        assert!(q.excluded.is_empty(), "{q:?}");
+        assert!(q.addresses.is_empty(), "{q:?}");
+        assert_eq!(
+            q.excluded_addresses,
+            vec![(ip(XIP), excluded::LEARNED_PROFILED_HOST)]
+        );
+        // The real participant appears: contested (Critical); nothing about
+        // the attacker's host changes.
+        let f = t.spdp(&spdp(P1, &[RIP], None), ip(RIP));
+        one(&f, rules::PARTICIPANT_SOURCE_MISMATCH, Severity::Critical);
+        assert!(t.b.is_contested(&P1));
+        assert_eq!(t.b.quarantine_target(&P2, t.now).locators, vec![rogue]);
+
+        // Pinned (commissioned): the attacker's claim is never learned, the
+        // pinned address is protected, the attacker's is cut whole.
+        let mut t = T::new(BindingOptions {
+            participant_ips: [(P1, vec![ip(RIP)])].into_iter().collect(),
+            ..Default::default()
+        });
+        let f = t.spdp(&spdp(P1, &[XIP], None), ip(XIP));
+        one(&f, rules::PARTICIPANT_SOURCE_MISMATCH, Severity::High);
+        let mut d = spdp(P2, &[XIP, RIP], None);
+        d.metatraffic_unicast[1].port = 7412;
+        assert!(t.spdp(&d, ip(XIP)).is_empty());
+        t.spdp(&d, ip(RIP));
+        let q = t.b.quarantine_target(&P2, t.now);
+        assert_eq!(q.locators, vec![sa(XIP)], "{q:?}");
+        assert_eq!(
+            q.excluded,
+            vec![(SocketAddr::new(ip(RIP), 7412), excluded::PINNED_ELSEWHERE)]
+        );
+        assert_eq!(q.addresses, vec![ip(XIP)], "{q:?}");
+        assert_eq!(
+            q.excluded_addresses,
+            vec![(ip(RIP), excluded::PINNED_ELSEWHERE)]
+        );
+
+        // A profile identity's ips are never cut whole (its own locators
+        // there may be: a rogue matching the identity, red team F3).
+        let mut prof = profile();
+        prof.participant_identities.insert(
+            "robot".into(),
+            robodr_events::profile::ParticipantIdentity {
+                ips: [RIP].iter().map(|a| ip(*a).to_string()).collect(),
+                vendor: "010f".into(),
+                enclave: None,
+                nodes: Default::default(),
+                max_instances: 1,
+            },
+        );
+        let mut b = BindingTable::new(BindingOptions::default(), &prof);
+        let mut out = Vec::new();
+        b.observe_spdp(&prof, &d, Some(ip(RIP)), Ingress::Unknown, t.now, &mut out);
+        b.observe_spdp(&prof, &d, Some(ip(XIP)), Ingress::Unknown, t.now, &mut out);
+        let q = b.quarantine_target(&P2, t.now);
+        assert_eq!(
+            q.locators,
+            vec![sa(XIP), SocketAddr::new(ip(RIP), 7412)],
+            "{q:?}"
+        );
+        assert_eq!(q.addresses, vec![ip(XIP)], "{q:?}");
+        assert_eq!(
+            q.excluded_addresses,
+            vec![(ip(RIP), excluded::IDENTITY_HOST)]
+        );
+    }
+
+    /// Review R2-3 (c): a prefix ranked High or above that comes back
+    /// from a new address after its lease keeps its evidence and rank
+    /// (merged); a lower-ranked one is a new owner (replaced).
+    #[test]
+    fn a_reannounce_merges_the_evidence_of_a_high_ranked_prefix() {
+        let mut t = T::new(BindingOptions::default());
+        let other = [192, 168, 50, 67];
+        assert!(t.spdp(&spdp(P2, &[XIP], Some(10)), ip(XIP)).is_empty());
+        assert!(t.spdp(&spdp(P3, &[DS], Some(10)), ip(DS)).is_empty());
+        t.b.note_soc_reference(&P2);
+        t.b.note_finding(&P2, Severity::Critical);
+        t.advance(Duration::from_secs(60));
+        assert!(t.spdp(&spdp(P2, &[other], Some(10)), ip(other)).is_empty());
+        assert!(t.spdp(&spdp(P3, &[other], Some(10)), ip(other)).is_empty());
+        assert_eq!(t.b.locator_rank(&P2), Some(Rank::SocReferenced));
+        assert_eq!(
+            t.b.quarantine_locators(&P2, t.now),
+            vec![sa(other), sa(XIP)]
+        );
+        assert_eq!(t.b.locator_rank(&P3), Some(Rank::SpdpOnly));
+        assert_eq!(t.b.quarantine_locators(&P3, t.now), vec![sa(other)]);
+        assert_eq!(t.b.stats().evidence_merged, 1);
+    }
+
+    /// Review R2-4: under global pressure the fullest per-source bucket
+    /// is evicted first; a SOC-named prefix is never evicted for others.
+    #[test]
+    fn global_eviction_takes_the_fullest_bucket_first() {
+        let mut t = T::new(BindingOptions::default());
+        assert!(t.spdp(&spdp(P2, &[XIP], None), ip(XIP)).is_empty());
+        t.b.note_finding(&P2, Severity::Critical);
+        for i in 0..(MAX_LOCATOR_HISTORY as u32 + 100) {
+            let src = [10, 0, 1, (i % 10) as u8 + 1];
+            let mut g = [0x44; 12];
+            g[..4].copy_from_slice(&i.to_be_bytes());
+            t.advance(Duration::from_millis(1));
+            t.spdp(&spdp(g, &[src], None), ip(src));
+            t.b.note_finding(&g, Severity::Critical);
+        }
+        assert_eq!(t.b.history.len(), MAX_LOCATOR_HISTORY);
+        assert_eq!(t.b.quarantine_locators(&P2, t.now), vec![sa(XIP)]);
+        // One address per sprayed prefix (spoofed): the lone rogue is the
+        // oldest of the fullest buckets now, unless the SOC named it.
+        t.b.note_soc_reference(&P2);
+        for i in 0..(2 * MAX_LOCATOR_HISTORY as u32) {
+            let src = [10, 1, (i >> 8) as u8, (i & 255) as u8];
+            let mut g = [0x45; 12];
+            g[..4].copy_from_slice(&i.to_be_bytes());
+            t.advance(Duration::from_millis(1));
+            t.spdp(&spdp(g, &[src], None), ip(src));
+            t.b.note_finding(&g, Severity::Critical);
+        }
+        assert_eq!(t.b.quarantine_locators(&P2, t.now), vec![sa(XIP)]);
+        assert!(t.b.history.len() <= MAX_LOCATOR_HISTORY);
+    }
+
+    #[test]
+    fn vouch_external_applies_the_same_filters_and_never_overrides_the_table() {
+        let mut t = T::new(BindingOptions::default());
+        assert!(t.spdp(&spdp(P1, &[RIP], None), ip(RIP)).is_empty());
+        let lo = [127, 0, 0, 1];
+        let q =
+            t.b.vouch_external(&P3, &[sa(XIP), sa(RIP), sa(lo)], Some(ip(XIP)), t.now);
+        assert_eq!(q.locators, vec![sa(XIP)]);
+        assert!(q.guid_only);
+        let q = t.b.vouch_external(&P3, &[sa(RIP)], Some(ip(RIP)), t.now);
+        assert_eq!(q.excluded, vec![(sa(RIP), excluded::PROFILED)]);
+        // A prefix the table knows: the table's answer (here contested).
+        t.spdp(&spdp(P1, &[XIP], None), ip(XIP));
+        assert!(t.b.is_contested(&P1));
+        let q = t.b.vouch_external(&P1, &[sa(XIP)], Some(ip(XIP)), t.now);
+        assert!(q.known && q.locators.is_empty() && !q.guid_only, "{q:?}");
+    }
+
+    #[test]
+    fn ranks_and_the_per_source_cap_keep_a_rogue_under_a_spray() {
+        let mut t = T::new(BindingOptions::default());
+        assert!(t.spdp(&spdp(P2, &[XIP], None), ip(XIP)).is_empty());
+        assert_eq!(t.b.locator_rank(&P2), Some(Rank::SpdpOnly));
+        t.b.note_finding(&P2, Severity::Critical);
+        t.b.note_finding(&P2, Severity::High);
+        assert_eq!(t.b.locator_rank(&P2), Some(Rank::Critical), "never lowered");
+        // A spray from one address keeps at most its own share.
+        let spray = [10, 0, 0, 77];
+        for i in 0..(MAX_LOCATOR_HISTORY as u32 + 200) {
+            let mut g = [0x44; 12];
+            g[..4].copy_from_slice(&i.to_be_bytes());
+            t.advance(Duration::from_millis(1));
+            t.spdp(&spdp(g, &[spray], None), ip(spray));
+            t.b.note_finding(&g, Severity::Critical);
+        }
+        assert!(t.b.history.len() <= MAX_LOCATOR_HISTORY_PER_SOURCE + 1);
+        assert_eq!(t.b.quarantine_locators(&P2, t.now), vec![sa(XIP)]);
+        t.b.note_soc_reference(&P2);
+        assert_eq!(t.b.locator_rank(&P2), Some(Rank::SocReferenced));
     }
 }

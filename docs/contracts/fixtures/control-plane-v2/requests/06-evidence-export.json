@@ -1,0 +1,26 @@
+{
+  "answer": {
+    "answer_message": "robodr-control-plane/v2 answer\n49932dc59e5e407d0d5ee892c5e407a6ec8edec898ad4ece2063839e6613f0ecc902d3b26419a27f76e717d851b2f24e7669c00d84a2e7fb7a77a9268a784808\n201\n70f6a98613ca2a631fd7351aeee9ed04ca66a71b921723bc61afddbda189fe2a",
+    "body_file": "answers/06-evidence-export.body.json",
+    "body_sha256": "70f6a98613ca2a631fd7351aeee9ed04ca66a71b921723bc61afddbda189fe2a",
+    "content_type": "application/json",
+    "status": 201,
+    "x_robodr_answer_signature": "ed25519;key_id=finding:ugv-007:1;sig=99adca808a0171f40d2acf181d1ea37b1c0331128988984172410c85cac68316585bc6ebf931237e381a8664c752da5afc95691476e0cd23ee5c10c05bacab0c",
+    "x_robodr_manifest_signature": "ed25519;key_id=finding:ugv-007:1;sig=537c85f8ee2bcbf5bbf7e34f1506b10a1a79b5f3c7c025957951bbeb0010f8b5e419cf38825793cd8b4d95975f0e290eba7b417e52c218065b58fdede5a9040b"
+  },
+  "body_sha256": "15971456cd4164a368c531ecd1b1b2eead4d656604ea3adf90a33a5e16ceff9b",
+  "description": "export of a finding's evidence (seqs 10 and 12, 3 context records each side); answer 201 = the manifest bytes",
+  "expect": {
+    "authenticated": true,
+    "route": "evidence_create"
+  },
+  "key_id": "soc:soc-a:1",
+  "method": "POST",
+  "name": "06-evidence-export",
+  "nonce": "contract-nonce-0006",
+  "robot_id": "ugv-007",
+  "signature": "49932dc59e5e407d0d5ee892c5e407a6ec8edec898ad4ece2063839e6613f0ecc902d3b26419a27f76e717d851b2f24e7669c00d84a2e7fb7a77a9268a784808",
+  "signing_message": "robodr-control-plane/v2\nPOST\n/api/v2/robots/ugv-007/evidence/exports\nugv-007\nsoc:soc-a:1\n1800000000\ncontract-nonce-0006\n15971456cd4164a368c531ecd1b1b2eead4d656604ea3adf90a33a5e16ceff9b",
+  "target": "/api/v2/robots/ugv-007/evidence/exports",
+  "timestamp": 1800000000
+}

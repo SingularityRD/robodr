@@ -1,0 +1,18 @@
+# EXAMPLE drop-in, not active as shipped. The SOC ingest endpoint(s) that
+# robodr-uplink may reach (docs/OPERATIONS.md section 8.5). To use it:
+#   install -D -m 0644 50-soc.conf.example \
+#       /etc/systemd/system/robodr-uplink.service.d/50-soc.conf
+#   (set the addresses below), then:
+#   systemctl daemon-reload && systemctl restart robodr-uplink
+#
+# List the address(es) the URL's host resolves to (the AutoSecOps front end,
+# e.g. its Caddy). The unit denies every other address, DNS servers
+# included: either map the URL's host name in /etc/hosts (recommended), or
+# add the DNS server(s) here as well. The host name must be the one the
+# server certificate is issued for; an IP-literal URL works only with a
+# certificate that names that IP.
+#
+# All addresses below are documentation placeholders (RFC 5737): replace them.
+
+[Service]
+IPAddressAllow=192.0.2.40/32

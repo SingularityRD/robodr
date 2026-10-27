@@ -33,6 +33,9 @@
 //! loaders run (see `robodr_commission::trust`). Signing keys are read only
 //! from mode-0600 key files, never from the command line.
 
+// S10: this crate has no `unsafe` code and must stay that way.
+#![forbid(unsafe_code)]
+
 use robodr_blackbox::keys::public_key_path;
 use robodr_commission::input::{self, InputSpec};
 use robodr_commission::learner::DiscoveryServer;
@@ -69,12 +72,15 @@ USAGE:
                           [--model NAME] [--margin 1.1] [--min-samples 30]
                           [--ceiling-linear M_PER_S] [--ceiling-joint RAD_PER_S]
                           [--hard-cap-linear 10] [--hard-cap-joint 10]
+                          [--hard-cap-torque 400] [--hard-cap-kp 1000]
+                          [--hard-cap-position-step 0.5]
                           [--min-announcements 2] [--min-duration SECS]
                           [--outlier-ratio 3]
                           [--accept-participant GUID]... [--motion-topic /T]...
                           [--discovery-server PREFIX|PREFIX@IP|IP]...
                           [--trusted-discovery-server PREFIX@IP|IP]...
                           [--learn-readers] [--no-identities]
+                          [--unitree-legacy] [--unitree-legacy-port N]...
                           --out profile.json [--signoff signoff.json]
                           [--report report.json] [--quiet] [--force]
   robodr-commission lock    --in profile.json --signoff signoff.json --out locked.json
@@ -84,6 +90,8 @@ USAGE:
                           [--sign-key signing.key] [--trusted-keys trust.json]
                           [--locked-at UNIX_SECS]
                           [--hard-cap-linear 10] [--hard-cap-joint 10] [--force]
+                          [--hard-cap-torque 400] [--hard-cap-kp 1000]
+                          [--hard-cap-position-step 0.5]
   robodr-commission sign    --profile locked.json --sign-key signing.key
                           [--operators operators.json] [--allow-unattested] [--force]
   robodr-commission verify-profile --profile locked.json --trusted-keys trust.json
@@ -114,13 +122,22 @@ USAGE:
                           [--motion-quorum N] [--force]
   robodr-commission diff    <old.json> <new.json> [--json]
   robodr-commission check   --profile locked.json (--events <f> | --pcap <f>) [...] [--json]
+                          [--unitree-legacy] [--unitree-legacy-port N]...
   robodr-commission merge   --out merged.json <a.json> <b.json> [...]
                           [--hard-cap-linear 10] [--hard-cap-joint 10] [--force]
+                          [--hard-cap-torque 400] [--hard-cap-kp 1000]
+                          [--hard-cap-position-step 0.5]
 
   --events: JSON Lines of RobotEvent. --pcap: pcap or pcapng capture of the
   robot bus (discovery, plus Twist / TwistStamped / JointTrajectory commands
   decoded from user data for envelopes). Both repeat and
   mix; every file is one run.
+  --unitree-legacy: also decode Unitree legacy UDP (Go1 generation,
+  unitree_legged_sdk) in every --pcap, on the SDK's ports 8007 8080 8082
+  8090 (--unitree-legacy-port N...: exactly these): HighCmd / decodable
+  LowCmd become commands on /unitree_legacy/high_cmd and
+  /unitree_legacy/low_cmd (envelopes learned as usual; the report lists
+  the command senders' IPs for the sensor's unitree_legacy.command_senders).
   --learn-readers: also learn reader_topics, which turns reader-topic
   enforcement on (off by default: a policy choice for the OEM).
   Identities: DDS draws a new GUID prefix per process start, so learn also
@@ -132,8 +149,10 @@ USAGE:
   times (or, in captures, seen for less than --min-duration seconds) are
   quarantined: not learned, nor their endpoints or motion samples. Use
   --accept-participant to override (it becomes a sign-off item). No
-  envelope exceeds --hard-cap-linear / --hard-cap-joint, and lock and merge
-  refuse any bound above them (pass the same values used for learn). A
+  envelope exceeds --hard-cap-linear / --hard-cap-joint (and, for low-level
+  joint commands, --hard-cap-torque / --hard-cap-kp /
+  --hard-cap-position-step), and lock and merge refuse any bound above them
+  (pass the same values used for learn). A
   dimension never observed on a channel is bounded at its ceiling or 0
   (deny), never left unlimited. --outlier-ratio: max > ratio x p99 on an
   envelope needs sign-off. Endpoints announced under another participant's
@@ -196,6 +215,11 @@ USAGE:
 
 EXIT: 0 ok/clean, 1 deviations / differences / lock refused, 2 error.
 ";
+
+/// The legacy UDP ports of `unitree_legged_sdk` (`udp.h` and its
+/// examples): 8007 low-level server, 8082 high-level server, 8080 / 8090
+/// client. Same list as the sensor's default.
+const UNITREE_LEGACY_DEFAULT_PORTS: [u16; 4] = [8007, 8080, 8082, 8090];
 
 /// Max size of a sign-off file we are willing to load.
 const MAX_SIGNOFF_BYTES: u64 = 16 << 20;
@@ -289,6 +313,30 @@ impl Args {
                     .map_err(|_| format!("--{name}: {v:?} is not a non-negative integer"))
             })
             .transpose()
+    }
+
+    /// `--unitree-legacy` (the SDK's default legacy UDP ports) and / or
+    /// `--unitree-legacy-port N`... (exactly these ports).
+    fn input_options(&self) -> Result<input::InputOptions, String> {
+        let mut o = input::InputOptions::default();
+        for v in self.all("unitree-legacy-port") {
+            let p = v
+                .parse::<u16>()
+                .ok()
+                .filter(|p| *p != 0)
+                .ok_or_else(|| format!("--unitree-legacy-port: {v:?} is not a UDP port"))?;
+            o.unitree_legacy_ports.insert(p);
+        }
+        if self.switch("unitree-legacy") && o.unitree_legacy_ports.is_empty() {
+            o.unitree_legacy_ports = UNITREE_LEGACY_DEFAULT_PORTS.into_iter().collect();
+        }
+        if o.unitree_legacy_ports.len() > robodr_capture::MAX_LEGACY_UDP_PORTS {
+            return Err(format!(
+                "--unitree-legacy-port: at most {} ports",
+                robodr_capture::MAX_LEGACY_UDP_PORTS
+            ));
+        }
+        Ok(o)
     }
 
     fn inputs(&self) -> Result<Vec<InputSpec>, String> {
@@ -433,12 +481,17 @@ fn precheck_outputs(paths: &[&str], force: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// `--hard-cap-linear` / `--hard-cap-joint` (defaults: learn's defaults).
+/// `--hard-cap-linear` / `--hard-cap-joint` / `--hard-cap-torque` /
+/// `--hard-cap-kp` / `--hard-cap-position-step` (defaults: learn's
+/// defaults).
 fn hard_caps(a: &Args) -> Result<HardCaps, String> {
     let mut caps = HardCaps::default();
     for (name, slot) in [
         ("hard-cap-linear", &mut caps.linear),
         ("hard-cap-joint", &mut caps.joint),
+        ("hard-cap-torque", &mut caps.torque),
+        ("hard-cap-kp", &mut caps.kp),
+        ("hard-cap-position-step", &mut caps.position_step),
     ] {
         if let Some(v) = a.f64_opt(name)? {
             if v <= 0.0 {
@@ -544,6 +597,9 @@ fn cmd_learn(argv: &[String]) -> Outcome {
             "signoff",
             "hard-cap-linear",
             "hard-cap-joint",
+            "hard-cap-torque",
+            "hard-cap-kp",
+            "hard-cap-position-step",
             "min-announcements",
             "min-duration",
             "accept-participant",
@@ -551,8 +607,15 @@ fn cmd_learn(argv: &[String]) -> Outcome {
             "outlier-ratio",
             "discovery-server",
             "trusted-discovery-server",
+            "unitree-legacy-port",
         ],
-        &["quiet", "learn-readers", "no-identities", "force"],
+        &[
+            "quiet",
+            "learn-readers",
+            "no-identities",
+            "force",
+            "unitree-legacy",
+        ],
     )?;
     if let Some(p) = a.positionals.first() {
         return Err(format!("unexpected argument {p:?}").into());
@@ -576,6 +639,15 @@ fn cmd_learn(argv: &[String]) -> Outcome {
     }
     if let Some(v) = a.f64_opt("hard-cap-joint")? {
         cfg.hard_cap_joint = v;
+    }
+    if let Some(v) = a.f64_opt("hard-cap-torque")? {
+        cfg.hard_cap_torque = v;
+    }
+    if let Some(v) = a.f64_opt("hard-cap-kp")? {
+        cfg.hard_cap_kp = v;
+    }
+    if let Some(v) = a.f64_opt("hard-cap-position-step")? {
+        cfg.hard_cap_position_step = v;
     }
     if let Some(v) = a.f64_opt("outlier-ratio")? {
         cfg.outlier_ratio = v;
@@ -622,9 +694,10 @@ fn cmd_learn(argv: &[String]) -> Outcome {
     // Refuse now, not after learning (and never leave a partial set).
     precheck_outputs(&outputs, force)?;
 
+    let input_opts = a.input_options()?;
     let mut learner = Learner::new(cfg).map_err(|e| e.to_string())?;
     for spec in &inputs {
-        let mut src = input::open(spec).map_err(|e| e.to_string())?;
+        let mut src = input::open_with_options(spec, &input_opts).map_err(|e| e.to_string())?;
         learner.ingest(src.as_mut()).map_err(|e| e.to_string())?;
     }
     let c = learner.finish();
@@ -819,6 +892,9 @@ fn cmd_lock(argv: &[String]) -> Outcome {
             "signoff",
             "hard-cap-linear",
             "hard-cap-joint",
+            "hard-cap-torque",
+            "hard-cap-kp",
+            "hard-cap-position-step",
             "platform",
             "unit-id",
             "profile-version",
@@ -1718,7 +1794,11 @@ fn cmd_diff(argv: &[String]) -> Outcome {
 }
 
 fn cmd_check(argv: &[String]) -> Outcome {
-    let a = Args::parse(argv, &["profile", "events", "pcap"], &["json"])?;
+    let a = Args::parse(
+        argv,
+        &["profile", "events", "pcap", "unitree-legacy-port"],
+        &["json", "unitree-legacy"],
+    )?;
     if let Some(p) = a.positionals.first() {
         return Err(format!("unexpected argument {p:?}").into());
     }
@@ -1746,9 +1826,10 @@ fn cmd_check(argv: &[String]) -> Outcome {
         }
     }
     let inputs = a.inputs()?;
+    let input_opts = a.input_options()?;
     let mut checker = Checker::new(&profile);
     for spec in &inputs {
-        let mut src = input::open(spec).map_err(|e| e.to_string())?;
+        let mut src = input::open_with_options(spec, &input_opts).map_err(|e| e.to_string())?;
         checker.ingest(src.as_mut()).map_err(|e| e.to_string())?;
     }
     let r = checker.finish();
@@ -1989,7 +2070,14 @@ fn cmd_operators(argv: &[String]) -> Outcome {
 fn cmd_merge(argv: &[String]) -> Outcome {
     let a = Args::parse(
         argv,
-        &["out", "hard-cap-linear", "hard-cap-joint"],
+        &[
+            "out",
+            "hard-cap-linear",
+            "hard-cap-joint",
+            "hard-cap-torque",
+            "hard-cap-kp",
+            "hard-cap-position-step",
+        ],
         &["force"],
     )?;
     let caps = hard_caps(&a)?;

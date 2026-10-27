@@ -1,0 +1,313 @@
+{
+  "cases": [
+    {
+      "description": "uplink key, one unsigned finding of its own robot",
+      "name": "01-valid-single",
+      "requests": [
+        "cases/01-valid-single/1"
+      ]
+    },
+    {
+      "description": "per-finding signatures; lines are processed in order: line 3 repeats line 1 (duplicate), line 4 is a new emission of line 1's finding (updated)",
+      "name": "02-signed-multi",
+      "requests": [
+        "cases/02-signed-multi/1"
+      ]
+    },
+    {
+      "description": "uplink key bound to ugv-001; line 2 names ugv-002",
+      "name": "03-wrong-robot",
+      "requests": [
+        "cases/03-wrong-robot/1"
+      ]
+    },
+    {
+      "description": "relay key: any registered robot; ugv-099 is not registered; ugv-002 requires per-finding signatures",
+      "name": "04-relay",
+      "requests": [
+        "cases/04-relay/1"
+      ]
+    },
+    {
+      "description": "line 1: signature over other bytes; line 2: key not registered; line 3: finding key of another robot; line 4: valid",
+      "name": "05-bad-finding-sig",
+      "requests": [
+        "cases/05-bad-finding-sig/1"
+      ]
+    },
+    {
+      "description": "line objects: missing sig; unknown key; value not a string; duplicate key; not an object; malformed sig object (alg); key order value/sig swapped (valid: JSON objects are unordered) ; invalid UTF-8; valid",
+      "name": "06-invalid-line",
+      "requests": [
+        "cases/06-invalid-line/1"
+      ]
+    },
+    {
+      "description": "value not JSON; external_id not <robot_id>:<finding_id>; valid",
+      "name": "07-invalid-finding",
+      "requests": [
+        "cases/07-invalid-finding/1"
+      ]
+    },
+    {
+      "description": "contract_version 3.0.0 and 1.3.0 (only 2.x is ingested; the producer upgrades unsigned 1.x before sending); valid",
+      "name": "08-unsupported-contract",
+      "requests": [
+        "cases/08-unsupported-contract/1"
+      ]
+    },
+    {
+      "description": "decoded value of 256 KiB + 1 bytes (too_large, before validation); exactly 256 KiB (validated: over the findings contract's 64 KiB, invalid_finding); valid",
+      "name": "09-oversize-value",
+      "requests": [
+        "cases/09-oversize-value/1"
+      ]
+    },
+    {
+      "description": "an empty line between two valid ones",
+      "name": "10-empty-line",
+      "requests": [
+        "cases/10-empty-line/1"
+      ]
+    },
+    {
+      "description": "CRLF line ends: every line carries a CR and is refused",
+      "name": "11-crlf",
+      "requests": [
+        "cases/11-crlf/1"
+      ]
+    },
+    {
+      "description": "the final LF is optional",
+      "name": "12-no-final-lf",
+      "requests": [
+        "cases/12-no-final-lf/1"
+      ]
+    },
+    {
+      "description": "the same batch (same key, batch id and body) re-sent with a new timestamp and signature: the stored response, replayed: true, nothing changes",
+      "name": "13-replay",
+      "requests": [
+        "cases/13-replay/1",
+        "cases/13-replay/2"
+      ]
+    },
+    {
+      "description": "a known batch id with a different body: 409, nothing processed",
+      "name": "14-batch-id-reuse",
+      "requests": [
+        "cases/14-batch-id-reuse/1",
+        "cases/14-batch-id-reuse/2"
+      ]
+    },
+    {
+      "description": "401s: bad batch signature; timestamp 300 001 ms behind and ahead of the server clock; unknown key; a finding key as sender (wrong role). Last: 300 000 ms skew is accepted (the bound is inclusive)",
+      "name": "15-auth",
+      "requests": [
+        "cases/15-auth/1",
+        "cases/15-auth/2",
+        "cases/15-auth/3",
+        "cases/15-auth/4",
+        "cases/15-auth/5",
+        "cases/15-auth/6"
+      ]
+    },
+    {
+      "description": "Content-Type must be the media type application/x-ndjson without parameters",
+      "name": "16-content-type",
+      "requests": [
+        "cases/16-content-type/1",
+        "cases/16-content-type/2"
+      ]
+    },
+    {
+      "description": "1001 lines: 413 before anything else is looked at (a 4 MiB + 1 byte body gets 413 body_too_large the same way; not stored here)",
+      "name": "17-too-many-lines",
+      "requests": [
+        "cases/17-too-many-lines/1"
+      ]
+    },
+    {
+      "description": "400 bad_header: batch id with a space; 65-char batch id; timestamp with a leading zero; with a sign; upper-case signature hex; no signature header; upper-case key id hex; non-ed25519 key id",
+      "name": "18-bad-header",
+      "requests": [
+        "cases/18-bad-header/1",
+        "cases/18-bad-header/2",
+        "cases/18-bad-header/3",
+        "cases/18-bad-header/4",
+        "cases/18-bad-header/5",
+        "cases/18-bad-header/6",
+        "cases/18-bad-header/7",
+        "cases/18-bad-header/8"
+      ]
+    },
+    {
+      "description": "a zero-byte body: 400 empty_batch",
+      "name": "19-empty-body",
+      "requests": [
+        "cases/19-empty-body/1"
+      ]
+    },
+    {
+      "description": "request 1, origin-vouching relay (relay-diode): ugv-002 requires                           per-finding signatures, sig null is accepted (vouches_origin); a                           present sig is still verified (signed with ugv-001's finding key:                           bad_finding_signature); vouching does not register robots (ugv-099:                           unknown_robot). Request 2, plain relay (relay-soc): ugv-002 with sig                           null is missing_finding_signature; ugv-001 is accepted",
+      "name": "20-vouching-relay",
+      "requests": [
+        "cases/20-vouching-relay/1",
+        "cases/20-vouching-relay/2"
+      ]
+    },
+    {
+      "description": "relay key scoped to site test-range: ugv-001 (test-range) accepted; ugv-003 (registered with range-b) site_mismatch; ugv-099 (not registered) unknown_robot, checked before the site; ugv-002 (test-range, requires signatures) with sig null: missing_finding_signature (a site-scoped relay does not vouch)",
+      "name": "21-site-scoped-relay",
+      "requests": [
+        "cases/21-site-scoped-relay/1"
+      ]
+    },
+    {
+      "description": "MAJOR.MINOR.PATCH, each part 1-9 ASCII digits, leading zeros allowed, MAJOR read as a number: 1.03.0 is major 1 (unsupported_contract); 2.1, a 10-digit part, a sign and a suffix are not well formed, so the value is validated and fails (invalid_finding); 02.1.0 is major 2 and validates like 2.1.0 (accepted)",
+      "name": "22-contract-version-syntax",
+      "requests": [
+        "cases/22-contract-version-syntax/1"
+      ]
+    },
+    {
+      "description": "a lone high surrogate escape and a lone low surrogate escape in value (the decoded value must be valid UTF-8): invalid_line; a key twice inside sig: invalid_line; sig.key_id with a space (key ids are ASCII 0x21-0x7E): invalid_line; valid",
+      "name": "23-line-syntax",
+      "requests": [
+        "cases/23-line-syntax/1"
+      ]
+    },
+    {
+      "description": "X-RoboDR-Batch-Id twice (same value): 400 bad_header; timestamp 2^64 (20 digits, over 2^64-1): 400 bad_header; timestamp exactly 2^64-1, correctly signed: well formed, 401 stale_timestamp",
+      "name": "24-header-syntax",
+      "requests": [
+        "cases/24-header-syntax/1",
+        "cases/24-header-syntax/2",
+        "cases/24-header-syntax/3"
+      ]
+    },
+    {
+      "description": "no Content-Type header: 415 unsupported_media_type (step 1.1, before the X-RoboDR-* headers)",
+      "name": "25-no-content-type",
+      "requests": [
+        "cases/25-no-content-type/1"
+      ]
+    },
+    {
+      "description": "a body of 4 MiB + 1 bytes (4 194 305, one line): 413 body_too_large, nothing processed",
+      "name": "26-body-too-large",
+      "requests": [
+        "cases/26-body-too-large/1"
+      ]
+    }
+  ],
+  "contract": "robodr.ingest HTTP API v1 (docs/contracts/robodr.ingest-api.md)",
+  "format": "robodr-ingest-vectors/1",
+  "generator": "cargo run -p robodr-export --example ingest_vectors",
+  "how_to_run": [
+    "Each case starts from an EMPTY workspace holding exactly `workspace` (robots and keys below) and no findings, batches or rate-limit state.",
+    "Run the case's requests in order against the same workspace. Set the server clock to the request's `server_time_ms` (the 401 stale_timestamp vectors depend on it). Rate limiting must not trigger.",
+    "Send `headers` exactly (names case-insensitive) and the body file byte for byte to `path`.",
+    "Compare the HTTP status, then the JSON body: 200 bodies field by field except that each `rejected` entry's free-text `detail` is not compared (and absent here); error bodies by `code` only (`detail` is free text). Unknown extra response fields are allowed (contract §8)."
+  ],
+  "keys": [
+    {
+      "key_id": "ed25519:b3f6da01b39959ac",
+      "name": "uplink-ugv-001",
+      "public_key_file": "keys/uplink-ugv-001.key.pub",
+      "public_key_hex": "137c63afb8e3baef8cdfa165b789b87697d48bc799d1b84854c55f2563d54441",
+      "robot": "ugv-001",
+      "role": "uplink",
+      "secret_key_file": "keys/uplink-ugv-001.key",
+      "site": null,
+      "vouches_origin": false
+    },
+    {
+      "key_id": "ed25519:3e947af06619d448",
+      "name": "relay-soc",
+      "public_key_file": "keys/relay-soc.key.pub",
+      "public_key_hex": "08dc4bcd3803f2be7ad97279537f0520916b9f3a0945890de259cfb451d24a54",
+      "robot": null,
+      "role": "relay",
+      "secret_key_file": "keys/relay-soc.key",
+      "site": null,
+      "vouches_origin": false
+    },
+    {
+      "key_id": "ed25519:5a69450b4649b671",
+      "name": "finding-ugv-001",
+      "public_key_file": "keys/finding-ugv-001.key.pub",
+      "public_key_hex": "a942e19ce02cefda143eda46a8ccb2b0aca57c4f33e7872b84392cf1dd5a7710",
+      "robot": "ugv-001",
+      "role": "finding",
+      "secret_key_file": "keys/finding-ugv-001.key",
+      "site": null,
+      "vouches_origin": false
+    },
+    {
+      "key_id": "ed25519:303cc249b51a15ff",
+      "name": "finding-ugv-002",
+      "public_key_file": "keys/finding-ugv-002.key.pub",
+      "public_key_hex": "3c4932dae89e5b4728368f2ca2fd9a2805eef8b53a21844bf621a9dd54d56845",
+      "robot": "ugv-002",
+      "role": "finding",
+      "secret_key_file": "keys/finding-ugv-002.key",
+      "site": null,
+      "vouches_origin": false
+    },
+    {
+      "key_id": "ed25519:7880251560860a5c",
+      "name": "unregistered",
+      "public_key_file": "keys/unregistered.key.pub",
+      "public_key_hex": "ac30220519add62d5400c61576a13248a0d05d7afcf6b3b11a3e317640e67ddb",
+      "robot": null,
+      "role": "unregistered",
+      "secret_key_file": "keys/unregistered.key",
+      "site": null,
+      "vouches_origin": false
+    },
+    {
+      "key_id": "ed25519:033466ca936386e7",
+      "name": "relay-diode",
+      "public_key_file": "keys/relay-diode.key.pub",
+      "public_key_hex": "6f3b031f44cbf2d61f60a283d0f953a7859396f1cebd41d33cb29b899afcdab4",
+      "robot": null,
+      "role": "relay",
+      "secret_key_file": "keys/relay-diode.key",
+      "site": null,
+      "vouches_origin": true
+    },
+    {
+      "key_id": "ed25519:413bca4a0ca2be64",
+      "name": "relay-site-test-range",
+      "public_key_file": "keys/relay-site-test-range.key.pub",
+      "public_key_hex": "297ae402902539e950f33c79fc47968e5e5aa1b4d0a26278804bc6be3a0dee34",
+      "robot": null,
+      "role": "relay",
+      "secret_key_file": "keys/relay-site-test-range.key",
+      "site": "test-range",
+      "vouches_origin": false
+    }
+  ],
+  "warning": "TEST KEYS ONLY. The secret key files are published on purpose so the vectors can be regenerated; never register them anywhere real.",
+  "workspace": {
+    "keys": "every entry of `keys` whose role is uplink, relay or finding (role `unregistered` is NOT registered), with its `robot` (uplink, finding), and for relay keys its `site` scope (null: the whole workspace) and `vouches_origin` flag (contract section 3)",
+    "robots": [
+      {
+        "id": "ugv-001",
+        "require_finding_signature": false,
+        "site": "test-range"
+      },
+      {
+        "id": "ugv-002",
+        "require_finding_signature": true,
+        "site": "test-range"
+      },
+      {
+        "id": "ugv-003",
+        "require_finding_signature": false,
+        "site": "range-b"
+      }
+    ]
+  }
+}

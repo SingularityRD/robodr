@@ -321,7 +321,7 @@ fn write_all_deadline(s: &mut TcpStream, mut buf: &[u8], deadline: Instant) -> i
 /// Resolve `addr` (`host:port`). IP literals never touch the resolver;
 /// host names are resolved on a helper thread waited for at most `timeout`
 /// (see the module docs).
-fn resolve(addr: &str, timeout: Duration) -> io::Result<Vec<SocketAddr>> {
+pub(crate) fn resolve(addr: &str, timeout: Duration) -> io::Result<Vec<SocketAddr>> {
     if let Ok(a) = addr.parse::<SocketAddr>() {
         return Ok(vec![a]);
     }
@@ -772,17 +772,26 @@ impl Producer {
 
     fn conn_for(&mut self, node: i32) -> Result<&mut Conn, NetError> {
         self.close_idle();
-        if !self.conns.contains_key(&node) {
-            let addr = self
-                .brokers
-                .get(&node)
-                .cloned()
-                .ok_or_else(|| NetError::Protocol(format!("unknown broker {node}")))?;
-            self.stats.connects += 1;
-            let c = Conn::open(&addr, &self.cfg, &mut self.corr)?;
-            self.conns.insert(node, c);
+        let Self {
+            conns,
+            brokers,
+            cfg,
+            corr,
+            stats,
+            ..
+        } = self;
+        match conns.entry(node) {
+            std::collections::hash_map::Entry::Occupied(o) => Ok(o.into_mut()),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                let addr = brokers
+                    .get(&node)
+                    .cloned()
+                    .ok_or_else(|| NetError::Protocol(format!("unknown broker {node}")))?;
+                stats.connects += 1;
+                let c = Conn::open(&addr, cfg, corr)?;
+                Ok(slot.insert(c))
+            }
         }
-        Ok(self.conns.get_mut(&node).expect("inserted above"))
     }
 
     /// Produce `records` (`(partition, record)`) to `topic` with
@@ -973,7 +982,12 @@ impl Producer {
         let Self {
             conns, cfg, corr, ..
         } = self;
-        let conn = conns.get_mut(&leader).expect("connected above");
+        // Connected above; if it is gone anyway, report trouble (the caller
+        // retries) rather than abort.
+        let Some(conn) = conns.get_mut(&leader) else {
+            res.trouble = Some(format!("broker {leader}: connection lost before produce"));
+            return Ok(res);
+        };
         let resp = conn
             .exchange(cfg, corr, proto::API_PRODUCE, v, &body)
             .and_then(|b| proto::decode_produce_response(v, &b).map_err(NetError::from));
@@ -1001,7 +1015,12 @@ impl Producer {
             };
             match classify(pr.error_code) {
                 ErrorClass::None => {
-                    let q = queues.get_mut(&p).expect("planned from queue");
+                    // `plan` is built from `queues`; skip (the records stay
+                    // undecided and are retried) rather than abort.
+                    let Some(q) = queues.get_mut(&p) else {
+                        res.trouble = Some(format!("partition {p}: no queue for planned records"));
+                        continue;
+                    };
                     for (k, &i) in idx.iter().enumerate() {
                         q.pop_front();
                         out[i] = Some(Outcome::Delivered {
@@ -1025,7 +1044,12 @@ impl Producer {
                     res.progress = true;
                 }
                 ErrorClass::Record => {
-                    let q = queues.get_mut(&p).expect("planned from queue");
+                    // `plan` is built from `queues`; skip (the records stay
+                    // undecided and are retried) rather than abort.
+                    let Some(q) = queues.get_mut(&p) else {
+                        res.trouble = Some(format!("partition {p}: no queue for planned records"));
+                        continue;
+                    };
                     q.pop_front();
                     if q.is_empty() {
                         queues.remove(&p);

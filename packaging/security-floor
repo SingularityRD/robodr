@@ -1,0 +1,7 @@
+# Security floor of RoboDR releases (copied into every offline bundle; the
+# bundle's signature covers it). install-bundle.sh records the highest
+# min_version it has seen on a unit and from then on refuses to install or
+# roll back to any release below it, with no override: raise it to the
+# first release that fixes a vulnerability which must never come back.
+# Debian version syntax (a pre-release "-" is "~", build-deb.sh).
+min_version=0.1.0~alpha.1-1
