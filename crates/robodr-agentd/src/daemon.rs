@@ -1002,6 +1002,12 @@ impl<'a> Daemon<'a> {
         }
         let feed = r.safety_feed.clone().map(SafetyFeed::new);
         if let Some(sock) = r.safety_feed.as_ref().and_then(|f| f.socket.as_ref()) {
+            // Review L-D: never the exporters' group as a feeder group.
+            sock.check_feeder_groups(crate::host::group_gid(
+                std::path::Path::new("/etc/group"),
+                "robodr",
+            ))
+            .map_err(DaemonError::Config)?;
             let l = input::bind_socket(&sock.path, sock.mode, sock.group).map_err(|e| {
                 DaemonError::Io(format!("safety socket {}: {e}", sock.path.display()))
             })?;

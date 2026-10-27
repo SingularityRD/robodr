@@ -529,7 +529,8 @@ impl EventSocket {
 pub struct PeerPolicy {
     /// Peer uids allowed.
     pub uids: Vec<u32>,
-    /// Peer (effective, primary) gids allowed.
+    /// Peer gids allowed: the peer's effective (primary) gid or any of
+    /// its supplementary groups (`SO_PEERGROUPS`, 13b review 2, L-D).
     pub gids: Vec<u32>,
 }
 
@@ -545,6 +546,11 @@ impl PeerPolicy {
     /// `uid` / `gid` may connect.
     pub fn allows(&self, uid: u32, gid: u32) -> bool {
         self.uids.contains(&uid) || self.gids.contains(&gid)
+    }
+
+    /// `uid` / `gid` with the supplementary groups `groups` may connect.
+    pub fn allows_with_groups(&self, uid: u32, gid: u32, groups: &[u32]) -> bool {
+        self.allows(uid, gid) || groups.iter().any(|g| self.gids.contains(g))
     }
 }
 
@@ -760,9 +766,18 @@ pub fn run_unix_listener_peers(
                 if let Some(allowed) = &allowed {
                     let refused = match crate::host::peer_cred(&conn) {
                         Ok((uid, gid)) if allowed.allows(uid, gid) => None,
+                        // A feeder may hold the group as a supplementary
+                        // one (SupplementaryGroups=, review L-D).
+                        Ok((uid, gid))
+                            if !allowed.gids.is_empty()
+                                && crate::host::peer_groups(&conn)
+                                    .is_ok_and(|g| allowed.allows_with_groups(uid, gid, &g)) =>
+                        {
+                            None
+                        }
                         Ok((uid, gid)) => Some(format!(
                             "connection from uid {uid} gid {gid} refused (allowed uids: {:?}, \
-                             gids: {:?})",
+                             gids: {:?}, primary or supplementary)",
                             allowed.uids, allowed.gids
                         )),
                         Err(e) => Some(format!(
@@ -1051,6 +1066,84 @@ mod tests {
         let conns: BTreeSet<u64> = got.iter().map(|(c, _)| *c).collect();
         assert_eq!(conns.len(), 2, "{got:?}");
         assert!(conns.iter().all(|c| *c >= 1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 13b review 2, L-D: a feeder that holds the allowed group only as a
+    /// supplementary group (the documented `SupplementaryGroups=` setup) is
+    /// accepted; SO_PEERCRED alone reports only the primary gid. The peer
+    /// runs under `setpriv --groups` (root only).
+    #[test]
+    fn a_supplementary_feeder_group_is_accepted() {
+        use std::process::Command;
+        let have = |t: &str| {
+            Command::new("sh")
+                .args(["-c", &format!("command -v {t}")])
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        if crate::config::effective_uid() != 0 || !have("setpriv") || !have("python3") {
+            eprintln!("SKIPPED a_supplementary_feeder_group: needs root, setpriv and python3");
+            return;
+        }
+        const GROUP: u32 = 43_211;
+        let dir = std::env::temp_dir().join(format!("robodr-agentd-groups-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        const HB: &str = r#"{"kind":"heartbeat","v":1,"sent":0,"dropped":0}"#;
+        for (groups, accepted) in [("43212", false), ("43212,43211", true)] {
+            let path = dir.join(format!("g{accepted}.sock"));
+            let sock = bind_event_socket(&path).unwrap();
+            let (f, rx, st) = feed(16);
+            let stop = Arc::new(AtomicBool::new(false));
+            let s2 = stop.clone();
+            let h = std::thread::spawn(move || {
+                run_unix_listener_peers(
+                    sock,
+                    2,
+                    s2,
+                    f,
+                    crate::host::parse_host_line,
+                    Some(PeerPolicy {
+                        uids: vec![],
+                        gids: vec![GROUP],
+                    }),
+                );
+            });
+            let o = Command::new("setpriv")
+                .args(["--groups", groups, "--", "python3", "-c"])
+                .arg(
+                    "import socket,sys\n\
+                     s=socket.socket(socket.AF_UNIX)\n\
+                     s.connect(sys.argv[1])\n\
+                     s.sendall(sys.argv[2].encode()+b'\\n')\n\
+                     s.close()\n",
+                )
+                .arg(&path)
+                .arg(HB)
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while st.received.load(Ordering::Relaxed) == 0
+                && st.rejected_connections.load(Ordering::Relaxed) == 0
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            stop.store(true, Ordering::Relaxed);
+            h.join().unwrap();
+            let got = rx
+                .try_iter()
+                .filter(|m| matches!(m.payload, Payload::Host(_)))
+                .count();
+            assert_eq!(got, usize::from(accepted), "groups {groups}");
+            assert_eq!(
+                st.rejected_connections.load(Ordering::Relaxed),
+                u64::from(!accepted),
+                "groups {groups}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

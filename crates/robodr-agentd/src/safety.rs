@@ -465,6 +465,24 @@ pub struct SocketSpec {
 }
 
 impl SocketSpec {
+    /// 13b review 2, L-D: the exporters' group (`robodr`, whose gid on
+    /// this host is `exporters`) is never a feeder group. Its members are
+    /// the network-facing exporters (and agentd itself, as a supplementary
+    /// group), so naming it as `socket_group` or in `allowed_gids` would let
+    /// every exporter report the robot's safety state.
+    pub fn check_feeder_groups(&self, exporters: Option<u32>) -> Result<(), String> {
+        let Some(g) = exporters else {
+            return Ok(());
+        };
+        if self.group == Some(g) || self.allowed_gids.contains(&g) {
+            return Err(format!(
+                "safety_feed.socket: gid {g} is the exporters' group (robodr), never a feeder \
+                 group: give the safety gateway its own group (robodr-safety)"
+            ));
+        }
+        Ok(())
+    }
+
     /// The peer policy of the listener: root, `own_uid` and the
     /// configured feeders.
     pub fn peer_policy(&self, own_uid: u32) -> crate::input::PeerPolicy {
@@ -1938,6 +1956,13 @@ mod tests {
         let p = sock.peer_policy(4242);
         assert!(p.allows(5000, 990) && p.allows(1200, 7));
         assert!(!p.allows(4001, 4001));
+        // Review L-D: a supplementary feeder group counts; the exporters'
+        // group is never a feeder group.
+        assert!(p.allows_with_groups(5000, 5000, &[17, 990]));
+        assert!(!p.allows_with_groups(5000, 5000, &[17]));
+        assert!(sock.check_feeder_groups(Some(991)).is_ok());
+        assert!(sock.check_feeder_groups(None).is_ok());
+        assert!(sock.check_feeder_groups(Some(990)).is_err());
         // Three topics are not profiled writer topics.
         assert_eq!(w.len(), 3, "{w:?}");
         // The angular threshold defaults; spinning in place is moving.
