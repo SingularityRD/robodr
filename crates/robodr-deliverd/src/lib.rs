@@ -35,7 +35,7 @@
 //! `model`, `robodr-profile` and `os-image` (refused as `unsupported`).
 
 // S10: `unsafe` is denied crate-wide; the items that need it (FFI to
-// libc, which std already links: `kill(2)` and `prctl` / `setrlimit` in
+// libc, which std already links: `kill(2)`, `prctl`, `setrlimit`, `setsid` and `getsid` in
 // `runner`, the `*at` calls of `fdio`) carry a local
 // `#[allow(unsafe_code)]` and a `// SAFETY:` comment.
 #![deny(unsafe_code)]
@@ -59,6 +59,7 @@
 pub mod cli;
 pub mod clock;
 pub mod config;
+pub mod debfs;
 pub mod engine;
 pub mod fault;
 pub mod fdio;
@@ -69,6 +70,7 @@ pub mod highwater;
 pub mod install;
 pub mod journal;
 pub mod media;
+pub mod rekey;
 pub mod replay;
 pub mod rules;
 pub mod runner;

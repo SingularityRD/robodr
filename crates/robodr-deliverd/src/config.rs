@@ -448,6 +448,15 @@ pub struct Config {
     /// Loop interval of `run`, milliseconds (100..=3_600_000).
     #[serde(default = "d_interval")]
     pub interval_ms: u64,
+    /// Most bytes hashed to recognise a media pack by its content, MiB
+    /// (64..=65536, default 4096); a larger pack is recognised by its tree
+    /// stamp (names, sizes, times) instead.
+    #[serde(default = "d_pack_digest_max_mb")]
+    pub pack_digest_max_mb: u64,
+}
+
+fn d_pack_digest_max_mb() -> u64 {
+    crate::media::MAX_PACK_DIGEST_BYTES / (1024 * 1024)
 }
 
 /// A normalised absolute path: starts with `/`, no `.`, `..` or empty
@@ -657,6 +666,9 @@ impl Config {
         }
         if !(100..=3_600_000).contains(&self.interval_ms) {
             return Err("interval_ms: 100..=3600000".into());
+        }
+        if !(64..=65_536).contains(&self.pack_digest_max_mb) {
+            return Err("pack_digest_max_mb: 64..=65536".into());
         }
         Ok(())
     }

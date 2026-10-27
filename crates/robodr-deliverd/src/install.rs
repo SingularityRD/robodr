@@ -38,15 +38,40 @@
 //! is the dpkg `Architecture` (an RPK for `amd64` or `arm64` may also carry
 //! an `Architecture: all` package; an RPK for `all` only that). A `.deb`
 //! whose control fields say anything else is refused ([`DebInfo`] records
-//! the package, version and relations), so a floor on an RPK name is a floor on that dpkg package and an
-//! RPK under another name cannot carry an older `.deb` of it. The engine
-//! also refuses a `Package` the state already records under another RPK
-//! name, a higher serial carrying a lower dpkg `Version`, and a `.deb`
-//! that is, conflicts with, breaks, replaces or provides one of RoboDR's
-//! own packages ([`ROBODR_PACKAGES`]) unless the RPK came in a bundle of
-//! the designated RoboDR programme (`install.robodr_programme`).
+//! the package, version and relations), so a floor on an RPK name is a
+//! floor on that dpkg package and an RPK under another name cannot carry
+//! an older `.deb` **of that package**. The engine also refuses a
+//! `Package` the state already records under another RPK name, a higher
+//! serial carrying a lower dpkg `Version`, and a `.deb` that is, conflicts
+//! with, breaks, replaces or provides one of RoboDR's own packages
+//! ([`ROBODR_PACKAGES`]) unless the RPK came in a bundle of the designated
+//! RoboDR programme (`install.robodr_programme`).
+//!
+//! # The files of a `deb` RPK (review H-R3-1, L-R3-2)
+//!
+//! A `.deb` under another name could still carry older *files* of a
+//! floored package: dpkg detects conflicts by path name, and on a
+//! merged-/usr system `lib/nav/ok` lands on `/usr/lib/nav/ok` through the
+//! `/lib -> usr/lib` symlink without a conflict. So, right before every
+//! `dpkg --install` ([`Installer::check_deb_paths`], [`crate::debfs`]):
+//! every path of the `.deb` is resolved through the target root's
+//! symlinks and refused if another package owns it, or it lies below the
+//! agent's own trees, RoboDR's install paths, `/etc/dpkg`, `/etc/apt` or
+//! `/var/lib/dpkg`. dpkg runs with every force option reset on its command
+//! line ([`DPKG_INSTALL_FLAGS`]: `--refuse-all`, then only what the agent
+//! needs, then `--refuse-overwrite` explicitly), which overrides any
+//! `force-*` in `dpkg.cfg.d`. After the install the engine checks every
+//! other recorded package with `dpkg --verify` (its **output**, not its
+//! exit status: [`Installer::deb_verify`]) and against the file list
+//! recorded at its install ([`Installer::deb_files_digest`]).
+//!
+//! What this does not cover (release signers are root-equivalent for
+//! `deb`, `docs/SECURE-DELIVERY.md` §6.7): maintainer scripts (when the
+//! release allowed them) and files a `.deb` adds that change the system's
+//! behaviour elsewhere (units, cron, setuid files).
 
 use crate::config::Config;
+use crate::debfs;
 use crate::fsx;
 use crate::runner::{self, Limits};
 use crate::state::{DebInfo, Ver};
@@ -55,6 +80,7 @@ use robodr_pkg::common::is_safe_rel_path;
 use robodr_pkg::rpk::{Kind, Manifest};
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -122,6 +148,24 @@ pub fn relation_names(v: &str) -> Option<Vec<String>> {
     }
     Some(out)
 }
+
+/// The options of every `dpkg --install` (review H-R3-1, L-R3-2), after
+/// `--root`. Options on the command line override `dpkg.cfg.d`, read
+/// first: `--refuse-all` resets every force option a configuration file
+/// (or a `.deb` that shipped one) may have set, then only what the agent
+/// needs is forced again (`security-mac` and `downgrade` are dpkg's
+/// defaults; a rollback installs an older version; conffiles keep local
+/// changes), and `--refuse-overwrite` is repeated explicitly.
+pub const DPKG_INSTALL_FLAGS: [&str; 8] = [
+    "--refuse-all",
+    "--force-security-mac",
+    "--force-downgrade",
+    "--force-confdef",
+    "--force-confold",
+    "--refuse-overwrite",
+    "--refuse-overwrite-dir",
+    "--refuse-overwrite-diverted",
+];
 
 /// Maintainer-script members of a `.deb`'s control area.
 pub const MAINTAINER_SCRIPTS: [&str; 6] = [
@@ -363,11 +407,24 @@ impl Installer<'_> {
         Ok(out)
     }
 
+    /// The root dpkg installs into (`install.dpkg_root`, or `/`).
+    pub fn dpkg_root(&self) -> PathBuf {
+        self.cfg
+            .install
+            .dpkg_root
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("/"))
+    }
+
+    /// dpkg's database directory, always passed explicitly (never taken
+    /// from a configuration file).
+    pub fn admindir(&self) -> PathBuf {
+        self.dpkg_root().join("var/lib/dpkg")
+    }
+
     fn dpkg_query_argv(&self, package: &str) -> Vec<String> {
         let mut a = vec![self.cfg.install.dpkg_query.to_string_lossy().into_owned()];
-        if let Some(r) = &self.cfg.install.dpkg_root {
-            a.push(format!("--admindir={}", r.join("var/lib/dpkg").display()));
-        }
+        a.push(format!("--admindir={}", self.admindir().display()));
         a.extend([
             "-W".to_string(),
             "-f".to_string(),
@@ -517,6 +574,8 @@ impl Installer<'_> {
             package,
             version,
             relations,
+            files: None,
+            verify: None,
         });
         Ok(())
     }
@@ -555,6 +614,194 @@ impl Installer<'_> {
         Some((status.to_string(), version.to_string()))
     }
 
+    /// Review H-R3-1 (a): where every path of the prepared `.deb` of `v`
+    /// would land, refused when another package owns it or it is
+    /// protected ([`crate::debfs`]). `robodr_own`: the `.deb` is one of
+    /// RoboDR's own packages from the designated programme. Run right
+    /// before the switch (the owners can change between passes).
+    pub fn check_deb_paths(
+        &self,
+        m: &Manifest,
+        v: &Ver,
+        robodr_own: bool,
+    ) -> Result<(), PrepError> {
+        let Some(d) = &v.deb else {
+            return Ok(());
+        };
+        // A .deb that is not prepared is not installed either: the switch
+        // fails on it (`activate`), as it did before this check.
+        let Ok(deb) = self.deb_path(m, v) else {
+            return Ok(());
+        };
+        let argv = [
+            self.cfg.install.dpkg_deb.to_string_lossy().into_owned(),
+            "--fsys-tarfile".into(),
+            deb.to_string_lossy().into_owned(),
+        ];
+        let entries = runner::run_reader(
+            &argv,
+            Duration::from_secs(u64::from(self.cfg.install.dpkg_timeout_s)),
+            |r| {
+                let e = debfs::parse_tar(r)?;
+                // The rest is padding; read it so dpkg-deb exits cleanly.
+                std::io::copy(&mut r.take(1024 * 1024), &mut std::io::sink())
+                    .map_err(|e| e.to_string())?;
+                Ok(e)
+            },
+        )
+        .map_err(|e| PrepError::Refused(format!("listing the .deb's files: {e}")))?;
+        // Nothing below one of its own symlinks.
+        let links: BTreeSet<&str> = entries
+            .iter()
+            .filter(|e| e.kind == debfs::EntryKind::Symlink)
+            .map(|e| e.path.as_str())
+            .collect();
+        for e in &entries {
+            let mut p = e.path.as_str();
+            while let Some((parent, _)) = p.rsplit_once('/') {
+                if links.contains(parent) {
+                    return Err(PrepError::Refused(format!(
+                        "the .deb ships {} below its own symlink {parent}",
+                        robodr_pkg::common::trunc(&e.path)
+                    )));
+                }
+                p = parent;
+            }
+        }
+        let root = self.dpkg_root();
+        let host_root = fs::canonicalize(&root).map_err(|e| io(&root, e))?;
+        let mut roots: Vec<(&str, PathBuf)> = Vec::new();
+        for (what, p) in [
+            ("state_dir", &self.cfg.state_dir),
+            ("media_dir", &self.cfg.media_dir),
+            ("install.files_root", &self.cfg.install.files_root),
+            ("install.config_root", &self.cfg.install.config_root),
+            ("install.rules_active", &self.cfg.install.rules_active),
+            ("blackbox.dir", &self.cfg.blackbox.dir),
+            ("findings.spool", &self.cfg.findings.spool),
+        ] {
+            roots.push((what, p.clone()));
+            if let Ok(c) = fs::canonicalize(p) {
+                if c != *p {
+                    roots.push((what, c));
+                }
+            }
+        }
+        let mut res = debfs::Resolver::new(&root);
+        let mut wanted: std::collections::BTreeMap<String, String> = Default::default();
+        for e in entries.iter().filter(|e| e.kind != debfs::EntryKind::Dir) {
+            let c = res
+                .canonical(&e.path)
+                .map_err(|x| PrepError::Refused(format!("{}: {x}", e.path)))?;
+            if let Some(why) = debfs::protected(&c, &host_root.join(&c), &roots, robodr_own) {
+                return Err(PrepError::Refused(format!(
+                    "the .deb's {} lands on /{}: {why}",
+                    robodr_pkg::common::trunc(&e.path),
+                    robodr_pkg::common::trunc(&c)
+                )));
+            }
+            wanted.entry(c).or_insert_with(|| e.path.clone());
+        }
+        let keys: BTreeSet<String> = wanted.keys().cloned().collect();
+        let mut ignore: BTreeSet<String> = BTreeSet::from([d.package.clone()]);
+        if robodr_own {
+            ignore.extend(
+                d.relations
+                    .iter()
+                    .filter(|r| ROBODR_PACKAGES.contains(&r.as_str()))
+                    .cloned(),
+            );
+        }
+        let owned =
+            debfs::owners(&self.admindir(), &mut res, &keys, &ignore).map_err(PrepError::Io)?;
+        if !owned.is_empty() {
+            let what: Vec<String> = owned
+                .iter()
+                .take(8)
+                .map(|(c, pkgs)| {
+                    format!(
+                        "{} lands on /{c}, a file of package {}",
+                        wanted.get(c).map_or(c.as_str(), String::as_str),
+                        pkgs.iter().cloned().collect::<Vec<_>>().join(", ")
+                    )
+                })
+                .collect();
+            return Err(PrepError::Refused(format!(
+                "the .deb writes files of other packages ({} path(s)): {}",
+                owned.len(),
+                what.join("; ")
+            )));
+        }
+        Ok(())
+    }
+
+    /// Review H-R3-1 (c): what `dpkg --verify` reports for `package`,
+    /// conffiles excepted (an operator may edit those). dpkg 1.22 exits 0
+    /// even when it reports changed files, so the **output** decides:
+    /// every other line (a changed or missing file, a warning) is
+    /// returned. `Err`: dpkg could not verify it.
+    pub fn deb_verify(&self, package: &str) -> Result<Vec<String>, String> {
+        let r = runner::run(
+            &[
+                self.cfg.install.dpkg.to_string_lossy().into_owned(),
+                format!("--root={}", self.dpkg_root().display()),
+                "--verify".into(),
+                package.into(),
+            ],
+            None,
+            Limits {
+                timeout: Duration::from_secs(u64::from(self.cfg.install.dpkg_timeout_s)),
+                max_output: 64 * 1024,
+            },
+        );
+        if !r.success() {
+            return Err(format!("dpkg --verify {package}: {}", r.summary()));
+        }
+        let mut out: Vec<String> = r
+            .output
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            // `<9 check characters> <attribute> <path>`; attribute `c`:
+            // a conffile.
+            .filter(|l| !(l.len() > 11 && l.as_bytes()[10] == b'c' && l.as_bytes()[9] == b' '))
+            .map(robodr_pkg::common::trunc)
+            .collect();
+        if r.truncated {
+            out.push("(more output)".into());
+        }
+        Ok(out)
+    }
+
+    /// Review H-R3-1 (c): SHA-256 (hex) of `dpkg-query -L package` (its
+    /// files, conffiles and diversions as dpkg lists them).
+    pub fn deb_files_digest(&self, package: &str) -> Result<String, String> {
+        let r = runner::run(
+            &[
+                self.cfg.install.dpkg_query.to_string_lossy().into_owned(),
+                format!("--admindir={}", self.admindir().display()),
+                "-L".into(),
+                "--".into(),
+                package.into(),
+            ],
+            None,
+            Limits {
+                timeout: Duration::from_secs(120),
+                max_output: 64 * 1024 * 1024,
+            },
+        );
+        if !r.success() || r.truncated {
+            return Err(format!("dpkg-query -L {package}: {}", r.summary()));
+        }
+        let mut lines: Vec<&str> = r.output.lines().collect();
+        lines.sort_unstable();
+        let mut h = robodr_blackbox::crypto::Sha256::new();
+        for l in lines {
+            h.update(l.as_bytes());
+            h.update(b"\n");
+        }
+        Ok(robodr_blackbox::crypto::to_hex(&h.finalize()))
+    }
+
     /// `a` is an earlier dpkg version than `b` (`dpkg --compare-versions`).
     pub fn deb_version_lt(&self, a: &str, b: &str) -> Result<bool, String> {
         let r = self.tool(
@@ -579,16 +826,12 @@ impl Installer<'_> {
         match v.kind {
             Kind::Deb => {
                 let deb = self.deb_path(m, v)?;
-                let mut a = vec![self.cfg.install.dpkg.to_string_lossy().into_owned()];
-                if let Some(r) = &self.cfg.install.dpkg_root {
-                    a.push(format!("--root={}", r.display()));
-                }
-                a.extend([
-                    "--force-confdef".into(),
-                    "--force-confold".into(),
-                    "--install".into(),
-                    deb.to_string_lossy().into_owned(),
-                ]);
+                let mut a = vec![
+                    self.cfg.install.dpkg.to_string_lossy().into_owned(),
+                    format!("--root={}", self.dpkg_root().display()),
+                ];
+                a.extend(DPKG_INSTALL_FLAGS.iter().map(|f| f.to_string()));
+                a.extend(["--install".into(), deb.to_string_lossy().into_owned()]);
                 let r = self.tool(&a, u64::from(self.cfg.install.dpkg_timeout_s));
                 if r.success() {
                     Ok(())

@@ -68,17 +68,27 @@ Exit codes: 0 ok, 1 refused or error, 2 usage. `man robodr-deliverd(8)`,
    are fsynced in the state file before the switch (`current` /
    `rules_active/<name>` symlink swap, or `dpkg --install`). A `.deb` may
    name only its own package in `Conflicts` / `Breaks` / `Replaces` /
-   `Provides`, and after every `dpkg --install` every other recorded deb
-   package must still be installed at its recorded version (otherwise it
-   is reinstalled and the switch fails).
+   `Provides`. Right before the switch, every path of the `.deb` is
+   resolved through the root's symlinks (merged-/usr aliases such as
+   `/lib -> usr/lib`) and refused when another package owns it or it lies
+   below the agent's trees, RoboDR's install paths, `/etc/dpkg`,
+   `/etc/apt` or `/var/lib/dpkg` (`debfs`); every other recorded deb
+   package must be as the agent left it (one changed outside the agent is
+   reported, `changed_outside`, and deb installs wait; it is never
+   downgraded). dpkg runs with `--refuse-all`, the needed forces and
+   `--refuse-overwrite`. After every `dpkg --install` every other recorded
+   deb package must still be installed at its recorded version, with the
+   `dpkg --verify` output and file list it had right after its own
+   install (otherwise it is reinstalled and the switch fails).
 5. **Health gate.** The RPK's checks (`service_active`, `file_present`,
    `probe`: argv executed without a shell, as the probe user's UID (a
    regular account, `1000..=59999` by default) with supplementary groups
    dropped, fixed environment, rlimits (CPU, address space, open files,
-   processes), own process group killed on timeout, output bounded, and
+   processes), own session and process group killed on timeout, output bounded, and
    this process a child subreaper while it runs, so anything it leaves
-   behind, even in a new session, is killed with its process group until
-   none is left (at most 10 s) and fails it) plus agentd healthy.
+   behind, even in a new session, is killed with its process group (only
+   groups outside the agent's session) until none is left (at most 10 s)
+   and fails it) plus agentd healthy.
 6. **Install or roll back.** Pass: installed (`robot.deliver.installed`).
    Fail: back to the previous version if it is at or above the floor and
    still in the store (`robot.deliver.health_failed`, also gated by the
@@ -114,7 +124,12 @@ file, a locked one, or a missing / invalid one while the state file or
 the journal exists locks the agent until `reanchor`, which rebuilds the
 deployment sequence and chain heads from the journal and refuses a trust
 file older than the journal has seen (`--key`: the black-box key file,
-since the configured one is a systemd credential).
+since the configured one is a systemd credential). Only journal notes
+that verify with the unit's key count. After a rotation of the black-box
+key, `rekey --old-key FILE --new-key FILE` (service stopped) verifies the
+journal and the record with the old key, archives the journal as
+`<blackbox.dir>.archived-g<N>` and starts a new journal and record under
+the new key carrying the whole baseline.
 
 ## Modules
 
@@ -123,7 +138,9 @@ since the configured one is a systemd credential).
 | `config` | `robodr-deliverd-config/1`: unit identity, pinned roots, clock trust, paths (disjoint trees), tools, health limits |
 | `media` | media pack layout, verified-copy import, unit / ring / rollout / item checks, bundle chain heads per programme |
 | `store` | content-addressed store, hash-checked materialisation |
-| `install` | installers per kind (prepare, switch, active version) |
+| `install` | installers per kind (prepare, switch, active version); dpkg flags, `dpkg --verify` and file-list baselines |
+| `debfs` | a `.deb`'s paths (strict tar reader), resolution through the root's symlinks, owners from dpkg's file lists, protected paths |
+| `rekey` | carrying the journal and the record over a black-box key rotation |
 | `safety` | agentd's status, from agentd only (socket + `SO_PEERCRED`, or an owner-checked file) → safety state (fresh, this boot, live feed) |
 | `health`, `runner`, `users` | health checks; bounded argv execution (probes: rlimits, subreaper); probe users by UID |
 | `highwater` | the signed high-water record (floors, sequence, time floor, chain heads) |
@@ -194,5 +211,10 @@ are skipped; `ROBODR_REQUIRE_DPKG_TEST=1` makes that a failure):
   and states, reanchor rebuild / older trust / `--key`, the postinst
   migration, the deep leftover chain, the bounded pack digest, rule names
   across packages).
+* `review3_13b.rs`: the third review's findings (merged-/usr path
+  aliasing, protected paths, explicit dpkg refusals, `dpkg --verify` and
+  file-list damage, `path-exclude` baselines, packages changed outside
+  the agent, the probe session and the reaper, `rekey`, signed journal
+  history, the pack digest cap).
 * `crash.rs`, `kinds.rs` (deb with dpkg, rules), `binary.rs`,
   `fuzz_smoke.rs` (`deliverd_state`, `deliverd_inputs`).

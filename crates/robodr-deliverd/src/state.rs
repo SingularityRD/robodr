@@ -55,6 +55,17 @@ pub struct DebInfo {
     /// and `Provides` (review H2; empty in a state written before it).
     #[serde(default)]
     pub relations: Vec<String>,
+    /// SHA-256 (hex) of `dpkg-query -L <package>` right after its install
+    /// (review H-R3-1): a later change of the list (a path that moved to
+    /// another package, a diversion) is damage. Absent in a state written
+    /// before it, and until the install is judged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<String>,
+    /// SHA-256 (hex) of what `dpkg --verify <package>` reported (conffiles
+    /// aside, sorted) right after its install (review H-R3-1): any later
+    /// difference is damage. Absent as `files`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify: Option<String>,
 }
 
 /// One version of a package that is (or was) installed and is in the
@@ -323,6 +334,8 @@ impl State {
                         && !d.package.is_empty()
                         && d.relations.len() <= 256
                         && d.relations.iter().all(|r| !r.is_empty() && r.len() <= 128)
+                        && d.files.as_deref().is_none_or(is_hex64)
+                        && d.verify.as_deref().is_none_or(is_hex64)
                 })
         };
         if self.floors.len() > MAX_PACKAGES

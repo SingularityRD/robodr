@@ -648,12 +648,19 @@ fn ib_pack_digest_caps_the_bytes_it_hashes() {
     let pack = t.path().join("pack");
     std::fs::create_dir_all(&pack).unwrap();
     std::fs::write(pack.join("deployment.json"), b"{}").unwrap();
-    assert!(robodr_deliverd::media::pack_digest(&pack).is_some());
+    assert!(robodr_deliverd::media::pack_digest(
+        &pack,
+        robodr_deliverd::media::MAX_PACK_DIGEST_BYTES
+    )
+    .is_some());
     let f = std::fs::File::create(pack.join("huge")).unwrap();
     // Larger than any member of a valid pack (64 MiB, the SBOM cap).
     f.set_len(65 * 1024 * 1024).unwrap();
     drop(f);
-    assert_eq!(robodr_deliverd::media::pack_digest(&pack), None);
+    assert_eq!(
+        robodr_deliverd::media::pack_digest(&pack, robodr_deliverd::media::MAX_PACK_DIGEST_BYTES),
+        None
+    );
 }
 
 const RULE_X: &str = r#"[[rules]]

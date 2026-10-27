@@ -15,6 +15,7 @@ usage:
   robodr-deliverd check-config --config FILE
   robodr-deliverd init-anchor  --config FILE --trust TRUST.json
   robodr-deliverd reanchor     --config FILE --trust TRUST.json [--key FILE]
+  robodr-deliverd rekey        --config FILE --old-key FILE --new-key FILE
   robodr-deliverd status       --config FILE
   robodr-deliverd confirm      --config FILE --deployment DIGEST --package NAME
   robodr-deliverd --version
@@ -42,6 +43,14 @@ reanchor      after a lost state file the agent locks itself (no import,
               itself with --key (/etc/robodr/keys/agentd-blackbox.key;
               a regular file of the invoking user, no group or other
               permissions).
+rekey         after the unit's black-box key was rotated (OPERATIONS
+              §4.3): verify the delivery journal and the high-water
+              record with the old key, archive the journal next to it
+              (<blackbox.dir>.archived-g<N>) and start a new one, and a
+              new record, signed with the new key, carrying the floors,
+              the deployment sequence, the chain heads and the time
+              floor. Stop the service first; both key files as for
+              --key. Never delete the black-box directory instead.
 status        print the state (installed versions, floors, deployment).
 confirm       record a local operator's confirmation for an RPK that
               requires one (install.requires_operator_present).
@@ -96,6 +105,7 @@ pub fn run_deliverd(args: Vec<String>) -> i32 {
     let known: &[&str] = match cmd.as_str() {
         "init-anchor" => &["config", "trust"],
         "reanchor" => &["config", "trust", "key"],
+        "rekey" => &["config", "old-key", "new-key"],
         "confirm" => &["config", "deployment", "package"],
         "run" | "once" | "check-config" | "status" => &["config"],
         other => {
@@ -127,6 +137,7 @@ pub fn run_deliverd(args: Vec<String>) -> i32 {
         }
         "init-anchor" => init_anchor(&cfg, &a),
         "reanchor" => reanchor(cfg, &a),
+        "rekey" => rekey(&cfg, &a),
         "status" => status(&cfg),
         "confirm" => confirm(&cfg, &a),
         "once" => once(cfg),
@@ -178,6 +189,15 @@ fn reanchor(mut cfg: Config, a: &Args) -> Result<(), String> {
     let closed = e.close().map_err(|e| e.0);
     print(v?);
     closed
+}
+
+fn rekey(cfg: &Config, a: &Args) -> Result<(), String> {
+    let old = Path::new(a.req("old-key")?);
+    let new = Path::new(a.req("new-key")?);
+    check_key_file(old).map_err(|e| format!("--old-{}", e.trim_start_matches("--")))?;
+    check_key_file(new).map_err(|e| format!("--new-{}", e.trim_start_matches("--")))?;
+    print(crate::rekey::rekey(cfg, old, new)?);
+    Ok(())
 }
 
 /// `--key`: an absolute path to a regular file (not a symlink) owned by

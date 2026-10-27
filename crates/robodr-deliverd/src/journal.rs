@@ -11,8 +11,8 @@
 //! anything on the robot changes (no unrecorded install).
 
 use robodr_blackbox::{
-    AppendOutcome, FsyncPolicy, KeyFile, Recorder, RecorderConfig, RetentionMode, SystemClock,
-    TimeSource,
+    AppendOutcome, FsyncPolicy, KeyFile, Recorder, RecorderConfig, RetentionMode, Signer,
+    SystemClock, TimeSource,
 };
 use robodr_ocsf::BlackBoxRef;
 use serde_json::{Map, Value};
@@ -43,6 +43,11 @@ pub mod kinds {
     /// generation, digest and baseline (deployment, chain heads, time
     /// floor).
     pub const HIGHWATER: &str = "robodr.deliver.highwater";
+    /// The first note of a journal started by `robodr-deliverd rekey`
+    /// (review L-R3-3): the baseline the archived journal held (floors,
+    /// generation, trust version, deployment, chain heads, time floor),
+    /// carried over under the new key.
+    pub const REKEYED: &str = "robodr.deliver.rekeyed";
 }
 
 /// What the notes still in the journal say about the unit's history
@@ -98,6 +103,29 @@ impl History {
             kinds::HIGHWATER => {
                 self.hw_generation = self.hw_generation.max(u("generation").unwrap_or(0));
                 self.time_floor = self.time_floor.max(u("time_floor").unwrap_or(0));
+                if let Ok(d) = serde_json::from_value(v["last_deployment"].clone()) {
+                    self.deployment(d);
+                }
+                if let Ok(cs) = serde_json::from_value::<Vec<robodr_pkg::bundle::ChainState>>(
+                    v["chains"].clone(),
+                ) {
+                    for c in cs {
+                        self.chain(c);
+                    }
+                }
+            }
+            kinds::REKEYED => {
+                self.hw_generation = self.hw_generation.max(u("generation").unwrap_or(0));
+                self.trust_version = self.trust_version.max(u("trust_version").unwrap_or(0));
+                self.time_floor = self.time_floor.max(u("time_floor").unwrap_or(0));
+                if let Some(m) = v["floors"].as_object() {
+                    for (n, f) in m {
+                        if let (true, Some(f)) = (robodr_pkg::common::is_pkg_name(n), f.as_u64()) {
+                            let e = self.floors.entry(n.clone()).or_insert(0);
+                            *e = (*e).max(f);
+                        }
+                    }
+                }
                 if let Ok(d) = serde_json::from_value(v["last_deployment"].clone()) {
                     self.deployment(d);
                 }
@@ -216,13 +244,22 @@ impl Journal {
     }
 
     /// Floors recorded by `floor_raised` notes still in the journal
-    /// (the baseline when the state file is missing or behind).
-    pub fn recorded_floors(dir: &Path) -> std::collections::BTreeMap<String, u64> {
-        Self::history(dir).floors
+    /// (the baseline when the state file is missing or behind) that
+    /// verify with `key`.
+    pub fn recorded_floors(
+        dir: &Path,
+        key: &dyn Signer,
+    ) -> std::collections::BTreeMap<String, u64> {
+        Self::history(dir, key).floors
     }
 
     /// What the notes still in the journal in `dir` say ([`History`]).
-    pub fn history(dir: &Path) -> History {
+    /// Only records whose hash is right and whose signature verifies with
+    /// `key` (the unit's black-box key) count (Info of review 3): a note
+    /// written into the directory by anyone without the key is ignored.
+    /// Chain linkage is not required (the journal is cyclic: evicted
+    /// segments leave gaps).
+    pub fn history(dir: &Path, key: &dyn Signer) -> History {
         let mut h = History::default();
         let Ok(segs) = robodr_blackbox::verify::read_segments(dir) else {
             return h;
@@ -232,7 +269,16 @@ impl Journal {
                 let robodr_blackbox::record::ScanItem::Record(r) = item else {
                     continue;
                 };
-                if let Ok(v) = serde_json::from_slice::<Value>(&r.record.payload) {
+                let rec = &r.record;
+                let authentic = rec.compute_hash() == rec.hash
+                    && key.verify_own(
+                        &robodr_blackbox::record::signing_message(&rec.hash),
+                        &rec.sig,
+                    ) == Some(true);
+                if !authentic {
+                    continue;
+                }
+                if let Ok(v) = serde_json::from_slice::<Value>(&rec.payload) {
                     h.note(&v);
                 }
             }

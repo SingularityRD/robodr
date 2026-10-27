@@ -281,8 +281,11 @@ pub fn pack_stamp(pack: &Path) -> Option<String> {
 /// bundle manifests at most 32 MiB). A pack with a larger file is keyed
 /// by its tree stamp instead (the import refuses it anyway).
 pub const MAX_PACK_FILE_BYTES: u64 = robodr_pkg::rpk::MAX_SBOM_BYTES;
-/// Most bytes [`pack_digest`] hashes over a whole pack.
-pub const MAX_PACK_DIGEST_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+/// Most bytes [`pack_digest`] hashes over a whole pack by default
+/// (`pack_digest_max_mb`; Info of review 3: 16 GiB let a root-only media
+/// directory stall a pass for minutes). A larger pack is keyed by its
+/// tree stamp instead.
+pub const MAX_PACK_DIGEST_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// The **content** digest of a pack (review L4): SHA-256 over every
 /// entry's relative path and type, and the SHA-256 of each regular file's
@@ -295,8 +298,9 @@ pub const MAX_PACK_DIGEST_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 /// It runs before the import judges the pack (review I-B), so it never
 /// follows a symlink (`O_NOFOLLOW`; the opened file must be the inode the
 /// walk saw), never blocks on a FIFO (`O_NONBLOCK`), and hashes at most
-/// [`MAX_PACK_FILE_BYTES`] per file and [`MAX_PACK_DIGEST_BYTES`] in all.
-pub fn pack_digest(pack: &Path) -> Option<String> {
+/// [`MAX_PACK_FILE_BYTES`] per file and `max_total` bytes in all
+/// (`pack_digest_max_mb`, default [`MAX_PACK_DIGEST_BYTES`]).
+pub fn pack_digest(pack: &Path, max_total: u64) -> Option<String> {
     use std::io::Read;
     use std::os::unix::fs::MetadataExt;
     let mut h = robodr_blackbox::crypto::Sha256::new();
@@ -310,7 +314,7 @@ pub fn pack_digest(pack: &Path) -> Option<String> {
                 return None;
             }
             total = total.saturating_add(md.len());
-            if total > MAX_PACK_DIGEST_BYTES {
+            if total > max_total {
                 return None;
             }
             let f = crate::fdio::open_read(&p).ok()?;

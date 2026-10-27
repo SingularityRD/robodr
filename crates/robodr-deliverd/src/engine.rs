@@ -154,11 +154,11 @@ impl Engine {
         crate::fsx::ensure_dir(&cfg.state_dir, 0o700)
             .map_err(|e| format!("{}: {e}", cfg.state_dir.display()))?;
         let had_records = Journal::has_records(&cfg.blackbox.dir);
-        let history = Journal::history(&cfg.blackbox.dir);
-        let journal = Journal::open(&cfg.blackbox.dir, &cfg.unit.id, &cfg.blackbox.key)?;
         let hw_key = robodr_blackbox::KeyFile::load_secret(&cfg.blackbox.key)
             .and_then(|k| k.signer())
             .map_err(|e| format!("black-box key {}: {e}", cfg.blackbox.key.display()))?;
+        let history = Journal::history(&cfg.blackbox.dir, hw_key.as_ref());
+        let journal = Journal::open(&cfg.blackbox.dir, &cfg.unit.id, &cfg.blackbox.key)?;
         let signer = match &cfg.findings.finding_key {
             Some(p) => Some(
                 robodr_blackbox::KeyFile::load_secret(p)
@@ -374,7 +374,7 @@ impl Engine {
     /// lifted; it is only ever raised.
     pub fn reanchor(&mut self, trust: &std::path::Path) -> R<serde_json::Value> {
         let now = self.sys_now()?;
-        let history = Journal::history(&self.cfg.blackbox.dir);
+        let history = Journal::history(&self.cfg.blackbox.dir, self.hw_key.as_ref());
         let (doc, sig) = robodr_release::ops::read_trust_files(trust).map_err(|e| e.to_string())?;
         let presented = robodr_pkg::trust::verify_trust_pinned(
             &doc,
@@ -629,7 +629,8 @@ impl Engine {
         }
         // A pack beyond the walk's bounds is keyed by its stamp: the
         // import refuses its layout anyway.
-        let digest = media::pack_digest(path).unwrap_or_else(|| stamp.clone());
+        let max = self.cfg.pack_digest_max_mb.saturating_mul(1024 * 1024);
+        let digest = media::pack_digest(path, max).unwrap_or_else(|| stamp.clone());
         if self.media_cache.len() >= 4 * crate::state::MAX_SEEN_MEDIA {
             self.media_cache.clear();
         }
@@ -1059,6 +1060,37 @@ impl Engine {
                 rep,
             );
         }
+        // 5b. A deb (review H-R3-1, Info of review 3), right before the
+        // switch: every other recorded package must be as the agent left
+        // it (one changed outside the agent, e.g. updated by apt, is
+        // reported and blocks deb installs: the agent never downgrades it
+        // on its own), and no path of the .deb may land on another
+        // package's file or a protected path.
+        if ver.kind == robodr_pkg::rpk::Kind::Deb {
+            let outside = self.deb_damage(&it.name, &ver);
+            if !outside.is_empty() {
+                return self.changed_outside(idx, &outside, seen.state, rep);
+            }
+            let own = ver
+                .deb
+                .as_ref()
+                .is_some_and(|d| crate::install::ROBODR_PACKAGES.contains(&d.package.as_str()));
+            match self.installer().check_deb_paths(&m, &ver, own) {
+                Ok(()) => {}
+                Err(PrepError::Refused(e)) => return self.refuse_item(idx, "invalid", e, rep),
+                Err(PrepError::Io(e)) => {
+                    let k = format!("paths:{}:{e}", it.name);
+                    if self.reported.insert(k) {
+                        self.journal.note(
+                            kinds::REFUSED,
+                            json!({"stage": "paths", "name": it.name, "transient": true, "detail": e}),
+                        )?;
+                    }
+                    rep.deferred = Some(format!("{} {}: {e}", it.name, it.serial));
+                    return Ok(());
+                }
+            }
+        }
         // 6. Intent and floor, durable before anything changes.
         let from = self.state.installed.get(&it.name).map(|i| i.ver.clone());
         let old_floor = self.state.raise_floor(&it.name, m.security_floor);
@@ -1253,10 +1285,96 @@ impl Engine {
         None
     }
 
-    /// Recorded deb packages other than `name` that dpkg no longer has
-    /// installed at their recorded version (review H-A): `(RPK name,
-    /// package, recorded version, what dpkg says)`. When `to` is one of
-    /// RoboDR's own packages, the other one it may replace is not checked.
+    /// Why the recorded deb package `d` is not as the agent installed it
+    /// (review H-A, H-R3-1 (c)), or `None`: dpkg must have it installed at
+    /// the recorded version, and `dpkg --verify` (conffiles aside) and its
+    /// file list must say what they said right after its install.
+    fn deb_intact(&self, d: &crate::state::DebInfo) -> Option<String> {
+        let inst = self.installer();
+        match inst.deb_state(&d.package) {
+            Some((st, v)) if st == "installed" && v == d.version => {}
+            seen => {
+                return Some(seen.map_or_else(
+                    || "unknown to dpkg".to_string(),
+                    |(st, v)| format!("{st} {v}"),
+                ))
+            }
+        }
+        // Compared with what `dpkg --verify` said right after its install
+        // (files left out by a `path-exclude` show as `missing` from the
+        // start); a package recorded before that baseline is checked for
+        // its file list only until the next install records it.
+        match inst.deb_verify(&d.package) {
+            Ok(lines) if d.verify.as_ref().is_none_or(|b| *b == lines_digest(&lines)) => {}
+            Ok(lines) => {
+                return Some(format!(
+                    "installed {}: dpkg --verify: {}",
+                    d.version,
+                    lines
+                        .iter()
+                        .take(4)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                ))
+            }
+            Err(e) => return Some(format!("installed {}: {e}", d.version)),
+        }
+        if let Some(want) = &d.files {
+            match inst.deb_files_digest(&d.package) {
+                Ok(got) if got == *want => {}
+                Ok(_) => {
+                    return Some(format!(
+                        "installed {}: its file list changed since its install",
+                        d.version
+                    ))
+                }
+                Err(e) => return Some(format!("installed {}: {e}", d.version)),
+            }
+        }
+        None
+    }
+
+    /// Defer item `idx` because recorded deb packages were changed outside
+    /// the agent (Info of review 3: apt, unattended-upgrades, an operator):
+    /// reported once per change (`robot.deliver.refused`, High), never
+    /// "restored" (downgraded) on the agent's own. Deb installs wait until
+    /// the package is back at its recorded version (by the operator) or a
+    /// release of that package is delivered.
+    fn changed_outside(
+        &mut self,
+        idx: usize,
+        outside: &[(String, String, String, String)],
+        safety: SafetyState,
+        rep: &mut TickReport,
+    ) -> R<()> {
+        let what = describe_damage(outside);
+        let k = format!("outside:{what}");
+        if self.reported.insert(k) {
+            let ev = self.journal.note(
+                kinds::REFUSED,
+                json!({"stage": "switch", "code": "changed_outside", "transient": true,
+                       "detail": format!("recorded packages changed outside the agent: {what}")}),
+            )?;
+            self.finding_in(
+                rules::REFUSED,
+                Severity::High,
+                format!(
+                    "changed_outside: recorded deb packages were changed outside the agent \
+                     ({what}); deb installs wait until they are back at their recorded version \
+                     or a release of them is delivered"
+                ),
+                Some(ev),
+                safety,
+            );
+        }
+        self.defer(idx, format!("deb_changed_outside: {what}"), None, rep)
+    }
+
+    /// Recorded deb packages other than `name` that are not as the agent
+    /// installed them ([`Self::deb_intact`]): `(RPK name, package,
+    /// recorded version, what dpkg says)`. When `to` is one of RoboDR's
+    /// own packages, the other one it may replace is not checked.
     fn deb_damage(&self, name: &str, to: &Ver) -> Vec<(String, String, String, String)> {
         let robodr = crate::install::ROBODR_PACKAGES;
         let skip: Vec<&str> = to
@@ -1272,17 +1390,8 @@ impl Engine {
             if n == name || d.package == name || skip.contains(&d.package.as_str()) {
                 continue;
             }
-            match self.installer().deb_state(&d.package) {
-                Some((st, v)) if st == "installed" && v == d.version => {}
-                seen => out.push((
-                    n.clone(),
-                    d.package.clone(),
-                    d.version.clone(),
-                    seen.map_or_else(
-                        || "unknown to dpkg".to_string(),
-                        |(st, v)| format!("{st} {v}"),
-                    ),
-                )),
+            if let Some(seen) = self.deb_intact(d) {
+                out.push((n.clone(), d.package.clone(), d.version.clone(), seen));
             }
         }
         out
@@ -1312,10 +1421,10 @@ impl Engine {
                 self.installer().activate(n, &v, &m)
             });
             let ok = res.is_ok()
-                && self
-                    .installer()
-                    .deb_state(pkg)
-                    .is_some_and(|(st, v)| st == "installed" && v == *version);
+                && i.ver
+                    .deb
+                    .as_ref()
+                    .is_some_and(|d| self.deb_intact(d).is_none());
             let ev = self.journal.note(
                 kinds::ROLLBACK,
                 json!({"name": n, "phase": "restore", "package": pkg, "version": version,
@@ -1422,7 +1531,7 @@ impl Engine {
 
     fn judge(
         &mut self,
-        txn: Txn,
+        mut txn: Txn,
         m: &Manifest,
         safety: SafetyState,
         rep: &mut TickReport,
@@ -1459,6 +1568,31 @@ impl Engine {
                     rep,
                 );
             }
+            // Review H-R3-1 (c): the file list it was installed with, and
+            // that of recorded packages from before it was recorded.
+            self.record_files(&mut txn.to);
+            self.state.txn = Some(txn.clone());
+            let names: Vec<String> = self.state.installed.keys().cloned().collect();
+            for n in names {
+                let Some(mut v) = self
+                    .state
+                    .installed
+                    .get(&n)
+                    .map(|i| i.ver.clone())
+                    .filter(|v| {
+                        v.deb
+                            .as_ref()
+                            .is_some_and(|d| d.files.is_none() || d.verify.is_none())
+                    })
+                else {
+                    continue;
+                };
+                self.record_files(&mut v);
+                if let Some(i) = self.state.installed.get_mut(&n) {
+                    i.ver = v;
+                }
+            }
+            self.save()?;
         }
         let report = health::run(&self.cfg, &m.health, &txn.to);
         let ev = self.journal.note(
@@ -1471,6 +1605,19 @@ impl Engine {
             return self.finish(txn, ev, safety, rep);
         }
         self.failed(txn, report.first_failure(), safety, rep)
+    }
+
+    /// Record the baseline of the deb `v` in it (review H-R3-1): its file
+    /// list and what `dpkg --verify` says, right after its install.
+    fn record_files(&self, v: &mut Ver) {
+        if let Some(d) = v.deb.as_mut() {
+            if let Ok(f) = self.installer().deb_files_digest(&d.package) {
+                d.files = Some(f);
+            }
+            if let Ok(lines) = self.installer().deb_verify(&d.package) {
+                d.verify = Some(lines_digest(&lines));
+            }
+        }
     }
 
     fn finish(
@@ -1713,6 +1860,12 @@ impl Engine {
                 }
             }
         }
+        if v.deb
+            .as_ref()
+            .is_some_and(|d| d.files.is_none() || d.verify.is_none())
+        {
+            self.record_files(&mut v);
+        }
         fault::hit("after_rollback_switch")?;
         let report = health::run(&self.cfg, &m.health, &v);
         self.state.installed.insert(
@@ -1910,6 +2063,18 @@ impl Engine {
         }
         Ok(())
     }
+}
+
+/// SHA-256 (hex) of `dpkg --verify` lines, sorted (review H-R3-1).
+fn lines_digest(lines: &[String]) -> String {
+    let mut v: Vec<&str> = lines.iter().map(String::as_str).collect();
+    v.sort_unstable();
+    let mut h = robodr_blackbox::crypto::Sha256::new();
+    for l in v {
+        h.update(l.as_bytes());
+        h.update(b"\n");
+    }
+    robodr_blackbox::crypto::to_hex(&h.finalize())
 }
 
 /// `"<package> <recorded version> -> <what dpkg says>"`, joined.

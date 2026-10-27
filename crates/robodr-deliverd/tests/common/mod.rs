@@ -843,7 +843,15 @@ pub fn flood_journal(u: &Unit) {
     }
     j.close().unwrap();
     assert!(
-        robodr_deliverd::journal::Journal::recorded_floors(&u.cfg.blackbox.dir).is_empty(),
+        robodr_deliverd::journal::Journal::recorded_floors(
+            &u.cfg.blackbox.dir,
+            robodr_blackbox::KeyFile::load_secret(&u.cfg.blackbox.key)
+                .unwrap()
+                .signer()
+                .unwrap()
+                .as_ref()
+        )
+        .is_empty(),
         "the flood did not evict the floor notes"
     );
 }

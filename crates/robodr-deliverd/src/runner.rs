@@ -11,7 +11,12 @@
 //!   supplementary group when it changes the UID of a root process) and
 //!   `setuid` before `execve` (tested: `tests` below runs `id`).
 //! * Its own process group; on timeout the **whole group** gets `SIGKILL`,
-//!   so a probe that forks a child to keep running is killed with it.
+//!   so a probe that forks a child to keep running is killed with it. A
+//!   probe gets a **session** of its own (`setsid`, which also makes it a
+//!   group leader), so nothing it leaves behind can join a process group
+//!   of the agent's session (Info of review 3: the reaper's group kill
+//!   reached the agent's own non-probe descendants that a leftover had
+//!   joined).
 //! * stdout and stderr are read concurrently; at most `max_output` bytes
 //!   are kept, the rest is read and discarded (a flood never blocks the
 //!   child, never grows memory). A probe that exits but leaves processes
@@ -31,7 +36,9 @@
 //!   such process (child of this process, running as the probe's UID, not
 //!   a run in progress; found through this process's own `children`
 //!   lists, which `ProtectProc=invisible` does not hide) is killed and
-//!   reaped, together with their process groups, until none is left or
+//!   reaped, together with their process groups (only groups of a
+//!   session other than the agent's, i.e. created by the probe or its
+//!   descendants), until none is left or
 //!   [`REAP_DEADLINE`] passes (review L-F), and the probe fails
 //!   (`left_processes`). They can be told apart
 //!   safely: a process cannot change its UID without privileges (and the
@@ -183,6 +190,8 @@ extern "C" {
     fn setrlimit(resource: i32, rlim: *const RLimit) -> i32;
     fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
     fn getpgid(pid: i32) -> i32;
+    fn getsid(pid: i32) -> i32;
+    fn setsid() -> i32;
 }
 
 /// Children of this process spawned by [`run`] and not yet reaped (never
@@ -315,6 +324,8 @@ fn reap_leftovers(uid: u32) -> (usize, bool) {
     // SAFETY: getpgid(0) takes an integer and returns this process's
     // process group; no memory is passed.
     let own_group = unsafe { getpgid(0) };
+    // SAFETY: as above (getsid(0): this process's session).
+    let own_session = unsafe { getsid(0) };
     let mut killed = 0;
     loop {
         let l = leftovers(uid);
@@ -333,11 +344,19 @@ fn reap_leftovers(uid: u32) -> (usize, bool) {
             // is not reaped yet, so neither it nor its process group (of
             // which it is a member) can have been reused by an unrelated
             // process. The group is never this process's own, nor that of
-            // a run in progress (a dpkg run is a group of its own in this
-            // session, which a leftover could have joined).
+            // a run in progress, and only a group of another session than
+            // this process's: a probe starts a session of its own, and a
+            // process can join only groups of its own session, so such a
+            // group holds only the probe's descendants (review 3, Info).
             unsafe {
                 let g = getpgid(*pid);
-                if g > 1 && g != own_group && u32::try_from(g).is_ok_and(|g| !live.contains(&g)) {
+                let s = getsid(*pid);
+                if g > 1
+                    && g != own_group
+                    && s > 0
+                    && s != own_session
+                    && u32::try_from(g).is_ok_and(|g| !live.contains(&g))
+                {
                     kill(-g, SIGKILL);
                 }
                 kill(*pid, SIGKILL);
@@ -403,6 +422,88 @@ pub fn run(argv: &[String], user: Option<RunAs>, limits: Limits) -> RunResult {
     }
 }
 
+/// Run `argv` (as this process's user, in a process group of its own,
+/// with the fixed environment) and hand its **stdout** to `read` as it
+/// arrives, so output of any size is consumed without being kept (stderr
+/// is discarded). The whole group is killed after `timeout` (`read` then
+/// sees the end of the stream). `Err`: `read` failed, the program could
+/// not start, timed out, or did not exit 0.
+pub fn run_reader<T>(
+    argv: &[String],
+    timeout: Duration,
+    read: impl FnOnce(&mut dyn Read) -> Result<T, String>,
+) -> Result<T, String> {
+    let start = Instant::now();
+    let prog = argv.first().ok_or("empty argv")?;
+    if !prog.starts_with('/') {
+        return Err("argv[0] is not an absolute path".into());
+    }
+    let mut cmd = Command::new(prog);
+    cmd.args(&argv[1..])
+        .env_clear()
+        .env("PATH", FIXED_PATH)
+        .env("LC_ALL", "C")
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0);
+    let mut live = lock(&LIVE);
+    let mut child = cmd.spawn().map_err(|e| {
+        format!(
+            "{prog}: not started: {}",
+            robodr_pkg::common::trunc(&e.to_string())
+        )
+    })?;
+    live.insert(child.id());
+    drop(live);
+    let pgid = child.id();
+    let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel::<()>();
+    let f2 = fired.clone();
+    // Kills the group if `read` is still reading at the deadline. Joined
+    // before the child is reaped, so the group id is still the child's.
+    let watchdog = std::thread::spawn(move || {
+        if let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(timeout) {
+            f2.store(true, std::sync::atomic::Ordering::SeqCst);
+            kill_group(pgid);
+        }
+    });
+    let res = match child.stdout.take() {
+        Some(mut out) => read(&mut out),
+        None => Err("no stdout".into()),
+    };
+    let _ = tx.send(());
+    let _ = watchdog.join();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) => {}
+            Err(_) => break None,
+        }
+        if start.elapsed() >= timeout {
+            fired.store(true, std::sync::atomic::Ordering::SeqCst);
+            kill_group(pgid);
+            let _ = child.kill();
+            break child.wait().ok();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    lock(&LIVE).remove(&pgid);
+    if fired.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(format!(
+            "{prog}: killed after the timeout ({} ms)",
+            timeout.as_millis()
+        ));
+    }
+    let v = res?;
+    match status {
+        Some(st) if st.success() => Ok(v),
+        Some(st) => Err(format!("{prog}: {st}")),
+        None => Err(format!("{prog}: lost")),
+    }
+}
+
 /// Run `argv` as the probe user `user` with `rl` (see the module docs).
 pub fn run_probe(argv: &[String], user: RunAs, limits: Limits, rl: ProbeLimits) -> RunResult {
     reaper_acquire();
@@ -441,12 +542,16 @@ fn run_inner(argv: &[String], user: Option<(RunAs, ProbeLimits)>, limits: Limits
         .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
+        .stderr(Stdio::piped());
     if let Some((u, rl)) = user {
+        // A session of its own (`setsid` in `set_limits`; it makes the
+        // probe the leader of a new group too, so `process_group` is not
+        // set: setsid fails in a group leader).
         cmd.gid(u.gid).uid(u.uid);
         let cpu = limits.timeout.as_secs().saturating_add(1);
         set_limits(&mut cmd, cpu, rl);
+    } else {
+        cmd.process_group(0);
     }
     // Registered before it can exit, so no concurrent run takes it for a
     // leftover.
@@ -532,8 +637,8 @@ fn run_inner(argv: &[String], user: Option<(RunAs, ProbeLimits)>, limits: Limits
     res
 }
 
-/// Set the probe's limits in the child, after it dropped to the probe user
-/// and before `execve`.
+/// Start a new session and set the probe's limits in the child, after it
+/// dropped to the probe user and before `execve`.
 // FFI: std has no setrlimit; `pre_exec` is unsafe by contract.
 #[allow(unsafe_code)]
 fn set_limits(cmd: &mut Command, cpu_s: u64, rl: ProbeLimits) {
@@ -544,10 +649,13 @@ fn set_limits(cmd: &mut Command, cpu_s: u64, rl: ProbeLimits) {
         (RLIMIT_NPROC, rl.processes),
     ];
     // SAFETY: the closure runs in the forked child before `execve`; it
-    // only calls setrlimit(2) (async-signal-safe) on values computed
-    // before the fork, allocates nothing and takes no lock.
+    // only calls setsid(2) and setrlimit(2) (async-signal-safe) on values
+    // computed before the fork, allocates nothing and takes no lock.
     unsafe {
         cmd.pre_exec(move || {
+            if setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             for (res, v) in set {
                 let v = std::ffi::c_ulong::try_from(v).unwrap_or(std::ffi::c_ulong::MAX);
                 let l = RLimit { cur: v, max: v };
