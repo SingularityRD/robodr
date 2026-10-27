@@ -682,8 +682,13 @@ or invalid while the state file or the black box exists, the unit
 **locks** (no import, install or rollback) until an operator re-anchors
 it with a current trust file; re-anchoring rebuilds the deployment
 sequence and chain heads from the black box and refuses a trust file
-older than the black box has seen. Root deleting the black box as well
-is not detected (TPM NV counter, 14b).
+older than the black box has seen. Only black-box notes that verify with
+the unit's key count (review 3). Root deleting the black box as well
+is not detected (TPM NV counter, 14b). A rotation of the black-box key
+(OPERATIONS §4.3) is carried over by `robodr-deliverd rekey`: the old
+journal and record must verify with the old key; the journal is archived
+next to it and a new one, and a new record one generation newer, are
+signed with the new key and carry the whole baseline (review 3, L-R3-3).
 
 Automatic rollback therefore only ever goes to the previous serial **at or
 above** the floor. If none exists the unit stays on the failing version,
@@ -713,9 +718,9 @@ on unit ugv-07, who approved it, and when" from evidence alone.
 
 For kind `deb` the release signers are **fully trusted: root-equivalent on
 every unit that installs their package.** A `.deb` without maintainer
-scripts can still install systemd units, cron entries, `/etc/dpkg/dpkg.cfg.d`
-hooks, setuid files, or `Conflicts` / `Replaces` that remove other
-packages (running their scripts); the delivery agent runs as root and can
+scripts can still install systemd units, cron entries or setuid files
+(`Conflicts` / `Replaces` against other packages and files under
+`/etc/dpkg` or `/etc/apt` are refused, below); the delivery agent runs as root and can
 reach PID 1. The "no maintainer scripts" rule, the unit's capability set
 and its system-call filter limit accidents and what a compromised agent
 does directly; they are not a boundary for release-approved content.
@@ -734,11 +739,37 @@ refused. RoboDR's own packages, which conflict with and replace each
 other, are allowed only for RPKs from bundles of the **designated RoboDR
 programme** (`install.robodr_programme` in the unit's configuration;
 default none, so RoboDR itself is updated with `install-bundle.sh`).
-Floors apply to the dpkg identity because it is the RPK name. After
-every `dpkg --install` the unit checks with `dpkg-query` that every other
-deb package it recorded is still installed at its recorded version; one
-that is not is reinstalled and the switch fails (rollback, or
-`rollback_blocked_floor` when there is no earlier version).
+Floors apply to the dpkg identity because it is the RPK name, so an RPK
+under another name cannot carry an older `.deb` **of** a floored package.
+It also cannot carry older **files** of one (review 3, H-R3-1): dpkg
+detects file conflicts by path name only, and on a merged-/usr system a
+`.deb` that ships `lib/nav/ok` writes through `/lib -> usr/lib` onto
+`/usr/lib/nav/ok`, owned by `nav`, without a conflict. Right before every
+`dpkg --install` the unit lists the `.deb`'s paths (`dpkg-deb
+--fsys-tarfile`, read with a strict tar reader), resolves their parent
+directories through the target root's symlinks (never leaving the root),
+resolves every other package's file list the same way, and refuses a
+path another package owns, a path below the agent's own trees, RoboDR's
+install paths, `/etc/dpkg`, `/etc/apt` or `/var/lib/dpkg` (a
+`force-overwrite` in `dpkg.cfg.d` would defeat the overwrite check, L-R3-2),
+and a path below one of the `.deb`'s own symlinks. dpkg runs with
+`--refuse-all` and then only the force options the agent needs, plus an
+explicit `--refuse-overwrite`, on its command line, which overrides
+`dpkg.cfg.d`. Before the switch every other deb package the unit recorded
+must be as the unit left it; one changed outside the agent (apt,
+unattended-upgrades, an operator) is reported (`robot.deliver.refused`,
+High, `changed_outside`) and deb installs wait: the unit never downgrades
+it on its own. After every `dpkg --install` the unit checks every other
+recorded deb package: installed at its recorded version (`dpkg-query`),
+what `dpkg --verify` reports (its **output**: dpkg 1.22 exits 0 even when
+it prints `??5??????`; conffiles aside) and its file list (`dpkg-query
+-L`) must both be what they were right after its own install. One that
+changed is reinstalled and the switch fails (rollback, or
+`rollback_blocked_floor` when there is no earlier version). What stays
+root-equivalent: release-allowed maintainer scripts (a `preinst` can
+`dpkg-divert --rename` a floored package's file; the file-list check then
+sees the diversion and fails the switch, but the script has run) and
+anything a `.deb` installs that changes the system elsewhere.
 
 Hardening of `robodr-deliverd.service` (review I1), kept where it does not
 break an ordinary (script-less) install: `RestrictSUIDSGID=` is **not**
@@ -1198,6 +1229,21 @@ M3 (SOC side, unchanged); each fix has a regression test in
 | I-B `pack_digest` followed symlinks, could block on a FIFO and hashed without a cap | `O_NOFOLLOW` / `O_NONBLOCK`, same inode as the walk, at most 64 MiB per file and 16 GiB per pack | `ib_pack_digest_caps_the_bytes_it_hashes` |
 | I-C Doc inaccuracies; focal drop-ins from old examples hand agentd's credentials to `robodr` | unit headers and OPERATIONS corrected; the focal credential helper hands `robodr-agentd.service`'s credentials to `robodr-agentd` (with a warning); upgrade notes OPERATIONS §11.5 | (`shellcheck`, `scripts/check-focal-units.py`) |
 | I (rules) Rule names unique only within one package | also across the active versions of every other installed `robodr-rules` package | `a_rule_name_used_by_another_installed_rules_package_is_refused` |
+
+**Third independent review of 13b (2026-10-27).** A third review found
+one high, two low and four informational issues. All are fixed (L-C
+stays open as above); each has a regression test in
+`crates/robodr-deliverd/tests/review3_13b.rs` that failed before its fix.
+
+| Finding | Fix | Regression test |
+|---|---|---|
+| **H-R3-1** The H2 floor bypassed through dpkg path aliasing: on merged-/usr a `.deb` under another name shipping `lib/nav/ok` overwrote `/usr/lib/nav/ok` of the floored `nav` (dpkg compares names; nav still `ii 2.0`) | (a) before the switch every path of the `.deb` is resolved through the root's symlinks (within the root) and refused when another package owns it (their file lists resolved the same way) or it is below the agent's trees, RoboDR's install paths, `/etc/dpkg`, `/etc/apt`, `/var/lib/dpkg` or one of the `.deb`'s own symlinks (`debfs.rs`); (b) every `dpkg --install` runs with `--refuse-all`, the needed forces, and `--refuse-overwrite`; (c) after it, every other recorded package's `dpkg --verify` output and `dpkg-query -L` list must be what they were right after its own install (a baseline in the state), otherwise restored and the switch fails | `hr3_a_path_aliased_onto_a_floored_package_is_refused`, `hr3_dpkg_runs_with_explicit_refusals`, `hr3_post_install_verify_catches_changed_content`, `hr3_post_install_file_list_change_is_damage`, `hr3_path_excluded_files_are_part_of_the_baseline` (no false alarm with `path-exclude`) |
+| **L-R3-2** A `force-overwrite` in `dpkg.cfg.d` (which a `.deb` could ship) defeated the overwrite check | `--refuse-all` / `--refuse-overwrite` on the command line override it (dpkg reads its configuration first; it has no option to skip it, `--root` does not change where it is read); `.deb`s shipping files under `/etc/dpkg`, `/etc/apt` or `/var/lib/dpkg` are refused | `hr3_l3r2_a_deb_into_protected_paths_is_refused`, `hr3_dpkg_runs_with_explicit_refusals` |
+| **L-R3-3** Rotating the black-box key (OPERATIONS §4.3) left deliverd locked with no procedure; deleting `blackbox/deliverd` would discard the anti-rollback history | `robodr-deliverd rekey --old-key --new-key`: verifies the journal and the record with the old key, closes the old journal with a hand-over note, archives it as `<dir>.archived-g<N>`, starts a new journal (first note `robodr.deliver.rekeyed` with the baseline) and record (next generation) under the new key; resumable; OPERATIONS §4.3, §11.3 | `lr3_rekey_carries_the_floors_to_the_new_key` |
+| I `Journal::history` did not verify signatures | only records whose hash is right and whose signature verifies with the unit's key count | `info_history_counts_only_notes_signed_with_the_units_key` |
+| I The reaper's group kill could reach the agent's own non-probe descendants that a leftover joined | probes run in a session of their own (`setsid`); the reaper kills only groups of a session other than the agent's | `info_the_reaper_never_kills_a_group_outside_the_probe_session` |
+| I A recorded package updated by apt was "restored" (downgraded) by the next unrelated deb install | checked before the switch: reported (`robot.deliver.refused`, High, `changed_outside`), deb installs deferred until it is back or a release of it is delivered; never downgraded by the agent | `info_a_package_updated_outside_the_agent_is_reported_not_downgraded` |
+| I `pack_digest` hashed up to 16 GiB per pack | 4 GiB by default, `pack_digest_max_mb` (64..=65536) | `info_pack_digest_cap_is_proportionate_and_configurable` |
 
 Not in 13b: sealed RPKs and key wraps (13c), the depot and LAN delivery
 (14a), the soak window and attestation in the health gate (14a / Sprint

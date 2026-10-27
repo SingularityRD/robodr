@@ -1,7 +1,7 @@
 .\" robodr-deliverd(8). Source of truth: the USAGE text in
 .\" crates/robodr-deliverd/src/cli.rs, the crate docs and
 .\" docs/SECURE-DELIVERY.md (sections 4.2, 6 and 10). Keep them in sync.
-.TH ROBODR\-DELIVERD 8 "2026-10-26" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
+.TH ROBODR\-DELIVERD 8 "2026-10-27" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
 .SH NAME
 robodr\-deliverd \- install verified RoboDR delivery packages on a unit, behind the robot's safety-state gate
 .SH SYNOPSIS
@@ -25,6 +25,13 @@ robodr\-deliverd \- install verified RoboDR delivery packages on a unit, behind 
 .I TRUST.json
 .RB [ \-\-key
 .IR KEYFILE ]
+.br
+.B robodr\-deliverd rekey \-\-config
+.I FILE
+.B \-\-old\-key
+.I KEYFILE
+.B \-\-new\-key
+.I KEYFILE
 .br
 .B robodr\-deliverd status \-\-config
 .I FILE
@@ -109,12 +116,31 @@ operator to act. A
 package's
 .BR Conflicts ", " Breaks ", " Replaces " and " Provides
 may name only its own package (RoboDR's own pair excepted, from the
-designated programme only); after every
+designated programme only). Right before the switch every path of the
+.B .deb
+is resolved through the target root's symlinks (merged-/usr aliases such
+as
+.IR "/lib \-> usr/lib" )
+and refused when another package owns it, or when it lies below the
+agent's own trees, RoboDR's install paths,
+.IR /etc/dpkg ", " /etc/apt " or " /var/lib/dpkg ;
+dpkg runs with
+.B \-\-refuse\-all
+(then only the force options the agent needs) and
+.BR \-\-refuse\-overwrite ,
+which override
+.IR dpkg.cfg.d .
+A recorded package changed outside the agent (apt, an operator) is
+reported
+.RB ( changed_outside )
+and deb installs wait; the agent never downgrades it. After every
 .B dpkg \-\-install
 every other recorded
 .B deb
-package must still be installed at its recorded version, otherwise it is
-reinstalled and the switch fails.
+package must still be installed at its recorded version, and its
+.B dpkg \-\-verify
+output and file list must be those it had right after its own install,
+otherwise it is reinstalled and the switch fails.
 .PP
 Every step is recorded in the agent's black box
 .RI ( /var/lib/robodr/blackbox/deliverd ,
@@ -176,6 +202,21 @@ pass the key file itself with
 .RI ( /etc/robodr/keys/agentd\-blackbox.key ;
 a regular file of the invoking user without group or other permissions).
 .TP
+.B rekey
+After the unit's black-box key was rotated (the journal and the
+high-water record are signed with it): verify the journal and the record
+with the old key, note the hand-over in the old journal, archive it as
+.IR blackbox.dir .archived\-g N
+and start a new journal and a new record, one generation newer, signed
+with the new key and carrying the floors, the deployment sequence, the
+chain heads, the time floor and any lock. Refused when anything does not
+verify with the old key (re-anchor with
+.B \-\-key
+first). Stop the service first; both key files as for
+.BR \-\-key .
+Run it again to finish an interrupted run. Never delete the black-box
+directory instead.
+.TP
 .B status
 Print the state: installed versions, kept rollback targets, floors, the
 deployment being worked on, the intent in progress, staleness.
@@ -228,7 +269,10 @@ and spool, no
 .B install.robodr_programme
 (no deb RPK may touch RoboDR's own packages). With
 .B trust.clock: untrusted
-a maintenance window never opens. Paths must be absolute and normalised; the state, media and
+a maintenance window never opens.
+.B pack_digest_max_mb
+(default 4096) bounds the bytes hashed to recognise a media pack by its
+content. Paths must be absolute and normalised; the state, media and
 install trees must be disjoint.
 .SH HEALTH CHECKS
 .B probe
@@ -239,12 +283,13 @@ no shell, no
 lookup, environment
 .BR PATH=/usr/sbin:/usr/bin:/sbin:/bin " and " LC_ALL=C ,
 working directory /) as the probe user's UID and GID with supplementary
-groups dropped, in their own process group, which is killed when the
+groups dropped, in a session and process group of their own, which is killed when the
 timeout expires, under resource limits (CPU: the timeout plus one second;
 .BR health.probe_max_memory_mb ", " probe_max_open_files ", " probe_max_processes ),
 with the agent as their subreaper: any process a probe leaves behind,
-even in a session of its own, is killed with its process group (until
-none is left, at most 10 seconds) and fails it; output beyond
+even in a session of its own, is killed with its process group (only
+groups outside the agent's session; until none is left, at most 10
+seconds) and fails it; output beyond
 .I max_output_bytes
 is read and discarded. The probe user is resolved from the passwd file at
 staging (never UID or GID 0, never

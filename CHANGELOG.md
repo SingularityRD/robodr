@@ -12,6 +12,41 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Security
 
+- Secure delivery on a unit, third independent review of Sprint 13b
+  (`docs/SECURE-DELIVERY.md` §10 "Third independent review of 13b");
+  every fix has a regression test that failed before it
+  (`crates/robodr-deliverd/tests/review3_13b.rs`):
+  - **Floor bypass through dpkg path aliasing (high, H-R3-1):** on a
+    merged-/usr system a `deb` RPK under another name could write a
+    floored package's files through `/lib -> usr/lib` without a dpkg
+    conflict. Before every `dpkg --install` the agent now resolves every
+    path of the `.deb` through the root's symlinks and refuses one that
+    another package owns or that lies below the agent's trees, RoboDR's
+    install paths, `/etc/dpkg`, `/etc/apt` or `/var/lib/dpkg`. dpkg runs
+    with `--refuse-all` (then only the forces the agent needs) and
+    `--refuse-overwrite`. After the install, every other recorded
+    package's `dpkg --verify` output and file list must match what they
+    were right after its own install, or it is restored and the switch
+    fails.
+  - **`force-overwrite` in `dpkg.cfg.d` (low, L-R3-2):** overridden on
+    the command line; `.deb`s shipping dpkg or apt configuration are
+    refused.
+  - **Black-box key rotation (low, L-R3-3):** new `robodr-deliverd rekey
+    --config FILE --old-key FILE --new-key FILE` carries the journal and
+    the high-water record (floors, deployment sequence, chain heads, time
+    floor) to the new key and archives the old journal
+    (`docs/OPERATIONS.md` §4.3 step 6, §11.3). Run it after every
+    rotation; never delete `blackbox/deliverd`.
+  - **Behaviour change:** a recorded deb package changed outside the
+    agent (apt, unattended-upgrades) is no longer reinstalled (downgraded)
+    by the next deb install: it is reported (`robot.deliver.refused`,
+    High, `changed_outside`) and deb installs wait until it is back at its
+    recorded version or a release of it is delivered.
+  - Info: the journal history counts only notes signed with the unit's
+    key; probes run in a session of their own and the reaper signals only
+    groups outside the agent's session; `pack_digest` hashes at most 4 GiB
+    per pack by default (new `pack_digest_max_mb`).
+
 - Secure delivery on a unit, second independent review of Sprint 13b
   (`docs/SECURE-DELIVERY.md` §10 "Second independent review of 13b");
   every fixed finding has a regression test that failed before the fix

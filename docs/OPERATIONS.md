@@ -282,7 +282,26 @@ one**. No evidence is lost or rewritten.
    the verifiers. This is also how an HMAC unit moves to Ed25519.
 5. `sudo systemctl start robodr-agentd`, then check the journal for the new
    chain's genesis.
-6. Verify the archived chain once more with the retired key
+6. **Units running `robodr-deliverd`** (§11): the delivery agent signs its
+   journal (`blackbox/deliverd`) and its high-water record with the same
+   key. Keep the retired secret key file until this step is done; do not
+   move or delete `blackbox/deliverd`. With `robodr-deliverd` stopped:
+
+   ```sh
+   sudo systemctl stop robodr-deliverd
+   sudo robodr-deliverd rekey --config /etc/robodr/deliverd.json \
+       --old-key /etc/robodr/keys/retired/agentd-blackbox-$old.key \
+       --new-key /etc/robodr/keys/agentd-blackbox.key
+   sudo systemctl start robodr-deliverd
+   ```
+
+   It verifies the journal and the record with the old key, archives the
+   journal as `blackbox/deliverd.archived-g<N>` and starts a new one and a
+   new record, signed with the new key, that carry the floors, the
+   deployment sequence, the chain heads and the time floor (§11.3).
+   Without it the agent cannot open its journal and locks itself. Verify
+   the archive like agentd's (step 7) and keep it with the same retention.
+7. Verify the archived chain once more with the retired key
    (`robodr-blackbox verify <archive dir> --keyring <retired key>.pub`, or
    the retired HMAC key file). The key id is read from the key file. Then
    follow the site's retention rule: keep the retired public key (HMAC: the
@@ -2509,7 +2528,8 @@ deferrals, installed versions, floors and any switch in progress.
   updates or revocations.
 * A refused pack is remembered by its **content**: copying a corrected
   pack under the same directory name is enough for it to be judged again
-  (no need to rename it). While a pack is being copied it may be judged,
+  (no need to rename it). Packs larger than `pack_digest_max_mb` (default
+  4096) are recognised by their file names, sizes and times instead. While a pack is being copied it may be judged,
   and refused, more than once; copy it under another name and rename it
   into place when complete.
 
@@ -2572,6 +2592,25 @@ cyclic) is not restored: floors are then those of the trust file
 deliver the newest deployment first. Do not delete
 `/var/lib/robodr/deliverd` or the black-box directory.
 
+Only notes whose signature verifies with the unit's black-box key count
+when the agent reads its history (at start and in `reanchor`).
+
+**Black-box key rotation.** The journal and the record are signed with
+the unit's black-box key (§4.3). After a rotation, run `robodr-deliverd
+rekey --config ... --old-key <retired key file> --new-key <new key file>`
+with the service stopped (§4.3, step 6). It refuses unless the journal
+verifies completely with the old key and the record verifies with it and
+is current (a locked agent: `reanchor --key <old key>` first, then
+`rekey`). It notes the hand-over in the old journal
+(`robodr.deliver.key_retired`), renames it to
+`blackbox/deliverd.archived-g<N>` (it still verifies with the retired
+key), and starts a new journal whose first note
+(`robodr.deliver.rekeyed`) carries the baseline, with a record one
+generation newer signed with the new key; a lock in the record is kept.
+If it is interrupted, run it again: it finishes the swap from
+`blackbox/deliverd.rekey-new`. Both key files must be root's with no group
+or other permissions, as for `--key`.
+
 ### 11.4 Trust and limits
 
 * The safety state comes from agentd alone (status socket, `SO_PEERCRED`
@@ -2580,7 +2619,8 @@ deliver the newest deployment first. Do not delete
   `robodr-agentd` user or a configured feeder can still claim `idle`.
 * **Release signers are fully trusted for `deb`** (root-equivalent on
   the unit): a `.deb` without maintainer scripts can still install
-  systemd units, cron entries, dpkg hooks or setuid files, and the agent
+  systemd units, cron entries or setuid files (dpkg and apt configuration
+  are refused, below), and the agent
   runs as root. The unit's hardening limits accidents, not approved
   content (`docs/SECURE-DELIVERY.md` §6.7). A `deb` RPK's name and
   architecture are its dpkg `Package` and `Architecture`; a `.deb` that
@@ -2588,10 +2628,32 @@ deliver the newest deployment first. Do not delete
   serial with a lower dpkg version, a `.deb` whose `Conflicts`,
   `Breaks`, `Replaces` or `Provides` names another package, and anything
   touching RoboDR's own packages outside `install.robodr_programme` are
-  refused. After every `dpkg --install` the agent checks that every
-  other deb package it installed is still installed at its version; if
-  not, it reinstalls it and fails the switch (`robot.deliver.health_failed`
-  or, without an earlier version, `robot.deliver.rollback_blocked_floor`).
+  refused. A `.deb` under another name also cannot write files of
+  another package, not even through a merged-/usr alias such as
+  `/lib -> usr/lib`: before the switch every path of the `.deb` is
+  resolved through the root's symlinks and refused when another package
+  owns it, or when it lies below the agent's own trees, RoboDR's install
+  paths (`/etc/robodr*`, `/var/lib/robodr`, `/usr/lib/robodr`,
+  `robodr*` binaries and units), `/etc/dpkg`, `/etc/apt` or
+  `/var/lib/dpkg`. dpkg runs with `--refuse-all` (then only
+  `security-mac`, `downgrade`, `confdef`, `confold`) and
+  `--refuse-overwrite` on its command line, so a `force-*` in
+  `/etc/dpkg/dpkg.cfg.d` does not apply to the agent's installs.
+* After every `dpkg --install` the agent checks every other deb package
+  it installed: installed at its version, and `dpkg --verify` (conffiles
+  aside) and its file list (`dpkg-query -L`) the same as right after its
+  own install. If not, it reinstalls it and fails the switch
+  (`robot.deliver.health_failed` or, without an earlier version,
+  `robot.deliver.rollback_blocked_floor`). **Let the agent own those
+  packages:** if apt (unattended-upgrades) or an operator changes one,
+  the agent does not downgrade it; it reports `robot.deliver.refused`
+  (High, `changed_outside`) and defers every deb install until the
+  package is back at its recorded version or a release of it is
+  delivered. Hold them in apt (`apt-mark hold`) or leave them out of
+  unattended-upgrades.
+* Release-allowed maintainer scripts stay root-equivalent: a `preinst`
+  can divert a floored package's file (the file-list check then fails the
+  switch, but the script has run).
 * `deb` maintainer scripts run only when the release quorum allowed them
   (recorded in the black box), as root under the unit's capability set,
   without network. They cannot write `/proc/sys` (`ProtectKernelTunables=`:
@@ -2600,9 +2662,11 @@ deliver the newest deployment first. Do not delete
   (`RestrictSUIDSGID=` is not set, review I1).
 * Probes run as their (non-system) user with their own limits (CPU =
   timeout + 1 s, `health.probe_max_memory_mb`, `probe_max_open_files`,
-  `probe_max_processes`); whatever a probe leaves behind, even a process
-  in its own session, is killed with its process group (until none is
-  left, at most 10 s) and fails the probe.
+  `probe_max_processes`), in a session of their own; whatever a probe
+  leaves behind, even a process in another new session, is killed with
+  its process group (until none is left, at most 10 s) and fails the
+  probe. Only groups outside the agent's own session are signalled, so
+  the agent's other processes are never hit.
 * Floors are in the state file, the signed high-water record and the
   black box, not a TPM counter (14b). Root deleting or putting back older
   copies of the state file or the record makes the agent lock until
@@ -2610,6 +2674,8 @@ deliver the newest deployment first. Do not delete
   Root deleting the journal too (or flooding it with notes signed with
   the black-box key until the generation notes are evicted, then putting
   an older record back) is **not** detected; the TPM counter closes that.
+  Notes in the journal directory that do not verify with the black-box
+  key are ignored.
   The high-water record is signed with agentd's black-box key, so a
   compromised agentd could forge one, though it cannot write it into
   place (`blackbox/deliverd` is root's). Sealed RPKs, models, OCI images
