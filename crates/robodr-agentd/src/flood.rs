@@ -55,12 +55,17 @@
 //!   busy bus never hides another source's findings.
 //! - At most [`MAX_SOURCES`] (128) sources are counted per window. A
 //!   **Critical** finding from a source beyond them is still reported by
-//!   name, up to [`FRESH_CRITICAL`] (128) per window (review R2-2: 128
-//!   spoofed SPDPs used to push a genuine rogue's motion writer into the
-//!   sourceless aggregate). Exhausting that budget takes the 128 sources
-//!   plus 128 more Critical findings, i.e. an SPDP and a motion writer
-//!   each from yet another address: about 384 datagrams a minute (6.4
-//!   packets/s) sustained.
+//!   name (review R2-2: 128 spoofed SPDPs used to push a genuine rogue's
+//!   motion writer into the sourceless aggregate), up to
+//!   [`FRESH_CRITICAL_PER_SOURCE`] (2) per source and window, for at most
+//!   [`FRESH_CRITICAL_SOURCES`] (128) such sources ([`FRESH_CRITICAL`],
+//!   256 by name per window in all). The budget is charged per source
+//!   (review R3-2: it used to be one counter, which a single untracked
+//!   address could spend). Exhausting it takes the 128 counted sources
+//!   plus 128 **more distinct** source addresses with a Critical finding
+//!   each, i.e. an SPDP and a motion writer from each: about 384
+//!   datagrams a minute (6.4 packets/s) sustained, from 256 addresses
+//!   (spoofed).
 //! - Past its share a source is **flooding**: its findings of that class are
 //!   folded into one aggregate per (source, class), reported as
 //!   [`FLOOD_RULE`] (`robot.ros2.discovery_flood`): **Critical** for the
@@ -108,10 +113,13 @@
 //!   most `PER_WINDOW + MAX_SOURCES * FRESH_PER_SOURCE + FRESH_CRITICAL`
 //!   individual findings per class and window (plus
 //!   `PROTECTED_PER_PREFIX` per protected participant), plus the
-//!   aggregates. One that sustains more than about 6 packets/s of spoofed
-//!   SPDP and motion writers can push a genuine rogue's Critical finding
-//!   into the "many sources" aggregate; it is named there only while it
-//!   is among the latest samples (and always in the black box).
+//!   aggregates; one address beyond the source table puts at most
+//!   [`FRESH_CRITICAL_PER_SOURCE`] Critical findings by name into the
+//!   spool per window. A spray from 256 or more distinct (spoofed)
+//!   addresses that sustains about 6.4 packets/s of SPDP and motion
+//!   writers can push a genuine rogue's Critical finding into the "many
+//!   sources" aggregate; it is named there only while it is among the
+//!   latest samples (and always in the black box).
 //! - The counters and open aggregates are in memory: after a restart a
 //!   flood starts a new episode (the folded findings are in the black box).
 //! - The catalog title of `robot.ros2.discovery_flood` ("Discovery flood:
@@ -140,12 +148,20 @@ pub const FRESH_PER_SOURCE: u32 = 1;
 /// Sources counted per window (beyond: the "many sources" aggregate, or,
 /// for a Critical finding, [`FRESH_CRITICAL`]).
 pub const MAX_SOURCES: usize = 128;
-/// Critical findings from sources beyond [`MAX_SOURCES`] reported one by
-/// one per window (review R2-2): a spoofed-source spray that fills the
-/// source table must send this many more Critical findings (an SPDP and a
-/// motion writer each: about 6 packets/s sustained, with the 128 sources)
-/// before a genuine rogue's Critical finding is folded.
-pub const FRESH_CRITICAL: u32 = 128;
+/// Critical findings from one source beyond [`MAX_SOURCES`] reported one
+/// by one per window (review R3-2: the budget is charged per source, so
+/// one address cannot spend it all).
+pub const FRESH_CRITICAL_PER_SOURCE: u8 = 2;
+/// Sources beyond [`MAX_SOURCES`] whose Critical findings are counted per
+/// window (review R2-2, R3-2): a spoofed-source spray that fills the source
+/// table must then bring this many **more distinct addresses**, each with
+/// a Critical finding (an SPDP and a motion writer: two datagrams), before
+/// a genuine rogue's Critical finding from yet another address is folded:
+/// 128 + 128 × 2 = 384 datagrams a window, about 6.4 packets/s sustained.
+pub const FRESH_CRITICAL_SOURCES: usize = 128;
+/// Critical findings from sources beyond [`MAX_SOURCES`] reported by name
+/// per window, at most.
+pub const FRESH_CRITICAL: u32 = FRESH_CRITICAL_SOURCES as u32 * FRESH_CRITICAL_PER_SOURCE as u32;
 /// High or Critical findings about one of the robot's own participants
 /// (profiled or pinned) reported one by one per (participant, source,
 /// rule) and window (review R2-1).
@@ -186,7 +202,8 @@ pub struct FloodStats {
     /// Critical aggregate that names it.
     pub protected_folded: u64,
     /// Critical findings from sources beyond [`MAX_SOURCES`] reported one by
-    /// one ([`FRESH_CRITICAL`]).
+    /// one ([`FRESH_CRITICAL_PER_SOURCE`] per source, [`FRESH_CRITICAL`] in
+    /// all).
     pub fresh_critical_passed: u64,
 }
 
@@ -262,8 +279,10 @@ pub struct FloodGuard {
     window_start: Option<u64>,
     per_source: HashMap<String, Count>,
     passed: u32,
-    /// Critical findings passed by name from sources beyond MAX_SOURCES.
-    fresh_critical: u32,
+    /// Per window: Critical findings passed by name per source beyond
+    /// [`MAX_SOURCES`] (at most [`FRESH_CRITICAL_SOURCES`] sources, a byte
+    /// each; review R3-2).
+    fresh_critical: HashMap<String, u8>,
     /// Per window: (protected participant, source, rule, High or above)
     /// -> passed.
     protected_keys: HashMap<([u8; 12], String, String, bool), u32>,
@@ -317,6 +336,16 @@ fn note_sample<T: PartialEq + Clone>(v: &mut Vec<(T, bool)>, x: &T, motion: bool
     }
 }
 
+/// May a Critical finding from `src` (beyond [`MAX_SOURCES`]) pass by name?
+/// Its own count below [`FRESH_CRITICAL_PER_SOURCE`], and room for it among
+/// the [`FRESH_CRITICAL_SOURCES`] counted sources (review R3-2).
+fn fresh_critical_room(counts: &HashMap<String, u8>, src: &str) -> bool {
+    match counts.get(src) {
+        Some(n) => *n < FRESH_CRITICAL_PER_SOURCE,
+        None => counts.len() < FRESH_CRITICAL_SOURCES,
+    }
+}
+
 /// A finding that names a writer able to command motion.
 fn is_motion(d: &Deviation) -> bool {
     d.rule_str() == "robot.ros2.unauthorized_motion_writer"
@@ -344,7 +373,7 @@ impl FloodGuard {
             self.window_start = Some(mono_ns);
             self.per_source.clear();
             self.passed = 0;
-            self.fresh_critical = 0;
+            self.fresh_critical.clear();
             self.protected_keys.clear();
             self.protected_prefix.clear();
         }
@@ -393,10 +422,12 @@ impl FloodGuard {
             }
             Some(_) => own,
             // Beyond MAX_SOURCES in this window (review R2-2): a Critical
-            // finding from a source not seen yet still passes by name,
-            // within its own per-window budget.
-            None if critical && self.fresh_critical < FRESH_CRITICAL => {
-                self.fresh_critical += 1;
+            // finding from a source not seen yet still passes by name, up
+            // to FRESH_CRITICAL_PER_SOURCE per source, for at most
+            // FRESH_CRITICAL_SOURCES sources (review R3-2: one address can
+            // no longer spend the whole budget).
+            None if critical && fresh_critical_room(&self.fresh_critical, it.src_ip) => {
+                *self.fresh_critical.entry(it.src_ip.to_owned()).or_insert(0) += 1;
                 self.passed = self.passed.saturating_add(1);
                 self.stats.fresh_critical_passed += 1;
                 return self.pass(reports);
@@ -1084,8 +1115,9 @@ mod tests {
             admit(&mut f, &writer(7777), "10.0.0.66", g(7777), 3),
             Admit::Pass
         );
-        // The budget is bounded; beyond it, the latest are named.
-        for i in 0..(FRESH_CRITICAL + 50) {
+        // The budget is bounded (one finding from each of many sources
+        // fills the source set first); beyond it, the latest are named.
+        for i in 0..(FRESH_CRITICAL_SOURCES as u32 + 50) {
             admit(
                 &mut f,
                 &writer(1000 + i),
@@ -1094,7 +1126,10 @@ mod tests {
                 4,
             );
         }
-        assert_eq!(f.stats().fresh_critical_passed, u64::from(FRESH_CRITICAL));
+        assert_eq!(
+            f.stats().fresh_critical_passed,
+            FRESH_CRITICAL_SOURCES as u64
+        );
         reports(admit(&mut f, &unknown(9000), "10.0.0.67", g(9000), 5));
         assert!(matches!(
             admit(&mut f, &writer(9001), "10.0.0.68", g(9001), 5),
@@ -1107,5 +1142,31 @@ mod tests {
             .unwrap();
         let d = &crit.deviation.detail;
         assert!(d.contains("10.0.0.68") && d.contains(&hex(&g(9001))), "{d}");
+    }
+
+    /// Review R3-2: the beyond-[`MAX_SOURCES`] Critical budget was one
+    /// counter per window, so a single untracked address could spend all of
+    /// it (128 Critical findings by name, into the spool and to the SOC) and
+    /// a later rogue's Critical finding from another address went to the
+    /// "many sources" aggregate. It is now charged per untracked source.
+    #[test]
+    fn one_untracked_source_cannot_exhaust_the_fresh_critical_budget() {
+        let mut f = FloodGuard::default();
+        for i in 0..MAX_SOURCES as u32 {
+            admit(&mut f, &unknown(i), &format!("10.60.0.{i}"), g(i), 1);
+        }
+        // One address beyond the source table, many Critical findings.
+        let mut passed = 0u32;
+        for i in 0..200u32 {
+            if admit(&mut f, &writer(2000 + i), "10.70.0.1", g(2000 + i), 2) == Admit::Pass {
+                passed += 1;
+            }
+        }
+        assert!(passed <= 2, "one untracked source passed {passed} by name");
+        // A genuine rogue from another address is still named.
+        assert_eq!(
+            admit(&mut f, &writer(7777), "10.0.0.66", g(7777), 3),
+            Admit::Pass
+        );
     }
 }
