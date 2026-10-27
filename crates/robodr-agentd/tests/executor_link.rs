@@ -999,20 +999,20 @@ fn review_h2a_a_decoy_cannot_make_the_rogue_unquarantinable() {
     assert!(!table.contains("\"10.0.0.67\""), "{table}");
 }
 
-/// H2a, spoofed variant: the decoy's SPDP is sent with the rogue's source
-/// address, so both prefixes have evidence at the same ip:port and neither
-/// gets it (it may be a legitimate participant's). The quarantine still
-/// goes ahead with the GUID-prefix payload drop (it cannot hit another
-/// prefix) instead of being refused.
+/// H2a from the rogue's own address (review R2-3 (a); it was mis-titled
+/// "spoofed": the rogue's second prefix needs no spoofing). Both prefixes
+/// have evidence at the same ip:port; it used to be handed to neither, so
+/// the rogue was quarantined by GUID prefix only. They share the host: the
+/// rogue's address is cut.
 #[test]
-fn review_h2a_a_spoofed_decoy_still_leaves_the_guid_prefix_drop() {
+fn review_h2a_a_self_decoy_does_not_reduce_the_quarantine_to_guid_only() {
     let frames = vec![
         spdp_from(v4(66), ROGUE, &[v4(66)]),
         writer_from(v4(66), ROGUE),
         spdp_from(v4(66), DECOY, &[v4(66)]),
     ];
     let (v, table) = soc_quarantine(
-        "rv-h2a-spoof",
+        "rv-h2a-self",
         &frames,
         std::time::Duration::from_millis(10),
         &[],
@@ -1020,7 +1020,7 @@ fn review_h2a_a_spoofed_decoy_still_leaves_the_guid_prefix_drop() {
     );
     assert_eq!(v["status"], "verified", "{v}");
     assert!(table.contains("robodr quarantine_node"), "{table}");
-    assert!(!table.contains("\"10.0.0.66\""), "contested: {table}");
+    assert!(table.contains("\"10.0.0.66\""), "self-decoy: {table}");
 }
 
 /// H2b: the rogue announces (and sends SPDP from) a locator outside the
