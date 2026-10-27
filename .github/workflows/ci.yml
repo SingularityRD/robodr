@@ -115,6 +115,10 @@ jobs:
         # JetPack 5): same directives as the regular units except the
         # LoadCredential= stand-in, and nothing newer than systemd 245.
         run: python3 scripts/check-focal-units.py
+      - name: focal credential helper (robodr-load-credential)
+        # Runs a copy of the helper whose /run/credentials is a temporary
+        # directory; root because the helper requires it and chowns.
+        run: sudo sh scripts/test-load-credential.sh
       - name: Validate Pulsar rules (rules/) against vendor/pulsar
         # One rule that fails to load disables Pulsar's whole rules-engine.
         run: python3 scripts/validate_rules.py --pulsar-src vendor/pulsar --strict
@@ -448,14 +452,14 @@ jobs:
             sudo apt-get install -y --no-install-recommends qemu-user-static
             run=qemu-aarch64-static
           fi
-          for b in robodr-agentd robodr-commission robodr-ros2-watch robodr-uplink robodr-enroll robodr-executor; do
+          for b in robodr-agentd robodr-commission robodr-ros2-watch robodr-uplink robodr-enroll robodr-executor robodr-deliverd; do
             $run "dist/static/$TARGET/$b" --version
           done
           $run "dist/static/$TARGET/robodr-blackbox" keygen --out "$RUNNER_TEMP/k"
           test -s "$RUNNER_TEMP/k.pub"
       - name: robodr-focal .deb (static binaries, systemd 245 units)
         env:
-          ROBODR_DEB_REQUIRE: robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish robodr-uplink robodr-enroll
+          ROBODR_DEB_REQUIRE: robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish robodr-uplink robodr-enroll robodr-deliverd
         run: |
           export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           deb=$(packaging/build-deb.sh --variant focal --bin-dir "dist/static/$TARGET" --arch "$ARCH" --out dist/focal)

@@ -148,6 +148,147 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   (`a_rogue_pushed_out_by_a_guid_spray_is_still_quarantined_by_its_own_locators`).
 - `robodr-uplink` no longer labels a plain-HTTP loopback URL "(CA bundle)"
   (end-to-end results D2).
+- Merge of Sprint 13b with the red-team F1 / F3 fixes: `robodr-deliverd`'s
+  `robot.deliver.*` records now honour agentd's Critical spool share
+  (`crates/robodr-deliverd/src/findings.rs`, "Critical findings first").
+  A finding below Critical is no longer written once `ready/` holds 7/8 of
+  `findings.max_ready_files`; `robot.deliver.rollback_blocked_floor` (and
+  any finding at Critical severity) may use the last eighth, up to one
+  source's cap. agentd's own writes keep the per-source Critical cap and
+  claim record names with no-replace links.
+- Secure delivery on a unit, third independent review of Sprint 13b
+  (`docs/SECURE-DELIVERY.md` §10 "Third independent review of 13b");
+  every fix has a regression test that failed before it
+  (`crates/robodr-deliverd/tests/review3_13b.rs`):
+  - **Floor bypass through dpkg path aliasing (high, H-R3-1):** on a
+    merged-/usr system a `deb` RPK under another name could write a
+    floored package's files through `/lib -> usr/lib` without a dpkg
+    conflict. Before every `dpkg --install` the agent now resolves every
+    path of the `.deb` through the root's symlinks and refuses one that
+    another package owns or that lies below the agent's trees, RoboDR's
+    install paths, `/etc/dpkg`, `/etc/apt` or `/var/lib/dpkg`. dpkg runs
+    with `--refuse-all` (then only the forces the agent needs) and
+    `--refuse-overwrite`. After the install, every other recorded
+    package's `dpkg --verify` output and file list must match what they
+    were right after its own install, or it is restored and the switch
+    fails.
+  - **`force-overwrite` in `dpkg.cfg.d` (low, L-R3-2):** overridden on
+    the command line; `.deb`s shipping dpkg or apt configuration are
+    refused.
+  - **Black-box key rotation (low, L-R3-3):** new `robodr-deliverd rekey
+    --config FILE --old-key FILE --new-key FILE` carries the journal and
+    the high-water record (floors, deployment sequence, chain heads, time
+    floor) to the new key and archives the old journal
+    (`docs/OPERATIONS.md` §4.3 step 6, §11.3). Run it after every
+    rotation; never delete `blackbox/deliverd`.
+  - **Behaviour change:** a recorded deb package changed outside the
+    agent (apt, unattended-upgrades) is no longer reinstalled (downgraded)
+    by the next deb install: it is reported (`robot.deliver.refused`,
+    High, `changed_outside`) and deb installs wait until it is back at its
+    recorded version or a release of it is delivered.
+  - Info: the journal history counts only notes signed with the unit's
+    key; probes run in a session of their own and the reaper signals only
+    groups outside the agent's session; `pack_digest` hashes at most 4 GiB
+    per pack by default (new `pack_digest_max_mb`).
+
+- Secure delivery on a unit, second independent review of Sprint 13b
+  (`docs/SECURE-DELIVERY.md` §10 "Second independent review of 13b");
+  every fixed finding has a regression test that failed before the fix
+  (`crates/robodr-deliverd/tests/review2_13b.rs`, agentd
+  `input::tests::a_supplementary_feeder_group_is_accepted`):
+  - **Floor bypass through dpkg relations (high, H-A):** a `deb` RPK's
+    `.deb` may name only its own package in `Conflicts`, `Breaks`,
+    `Replaces` and `Provides` (RoboDR's own `robodr` / `robodr-focal`
+    pair excepted, from `install.robodr_programme` only). After every
+    `dpkg --install` every other deb package the state records must still
+    be installed at its recorded version; otherwise it is reinstalled, the
+    switch fails (rollback or `robot.deliver.rollback_blocked_floor`) and
+    a package that cannot be restored raises a Critical finding.
+  - **Lock lifted by deleting the state twice (medium, M-A) and older
+    high-water record accepted (medium, M-B):** the signed high-water
+    record carries the lock and a monotonic `generation`, noted in the
+    delivery journal at every write (`robodr.deliver.highwater`) and in
+    the state file. A record older than the journal or the state, a
+    locked record, or a missing or invalid record while the state file or
+    the journal exists locks the agent; a locked start writes a locked
+    record. Deleting the journal as well is still not detected (TPM
+    counter, 14b).
+  - **reanchor (low, L-A, L-B):** refuses a trust file older than the
+    newest version the journal saw and rebuilds the deployment sequence,
+    chain heads, time floor and floors from the journal; `reanchor --key
+    FILE` loads the black-box key file directly (the configured key is a
+    systemd credential that exists only while the service runs).
+  - **Safety feeder groups (low, L-D):** agentd accepts a feeder whose
+    allowed group is a supplementary one (`SO_PEERGROUPS`), so the
+    documented `SupplementaryGroups=robodr-safety` gateway works; it
+    refuses to start with the exporters' group `robodr` as `socket_group`
+    or in `allowed_gids`.
+  - **Upgrade migration (low, L-E):** the postinst ownership migration of
+    agentd's trees runs with agentd and the exporters stopped, removes
+    symlinks and special files, breaks hardlinks, strips group/other
+    write and setuid/setgid, and is resumable (marker
+    `/var/lib/robodr/.agentd-user-migrated`). **Upgrade note (focal):**
+    operator drop-ins copied from older examples that pass `robodr` to
+    `robodr-load-credential load robodr-agentd.service` keep working (the
+    helper hands agentd's credentials to `robodr-agentd` and warns);
+    change them to `robodr-agentd` (`docs/OPERATIONS.md` §11.5).
+  - **Probe reaper (low, L-F):** leftovers are killed with their process
+    groups until none is left or 10 s pass (no 64-round limit).
+  - Info: `pack_digest` no longer follows symlinks, does not block on a
+    FIFO and hashes at most 64 MiB per file; rule names must be unique
+    across all installed `robodr-rules` packages.
+
+- Secure delivery on a unit, independent adversarial review of Sprint 13b
+  (`docs/SECURE-DELIVERY.md` §10 "Independent adversarial review of
+  13b"); every fixed finding has a regression test that failed before
+  the fix (`crates/robodr-deliverd/tests/review_13b.rs`):
+  - **Forged safety state (high, H1):** `robodr-agentd` runs as its own
+    system user `robodr-agentd` (group `robodr-agentd`, member of
+    `robodr`), no longer as the exporters' `robodr`; the package creates
+    it and moves agentd's black box, spool, profile state and
+    control-plane state on upgrade. agentd serves its status on
+    `spool.status_socket` (`/run/robodr-agentd/status.sock`, in the
+    shipped examples) and `robodr-deliverd` takes the safety state only
+    from there and only from that user or root (`SO_PEERCRED`; a status
+    file only if it and its directory are owned by that user or root and
+    writable by nobody else). agentd's `safety_feed.socket` accepts
+    reports only from root, itself and the new `allowed_uids` /
+    `allowed_gids` (with `socket_mode` / `socket_group`; group
+    `robodr-safety` for the PLC gateway). The spool is `2750`, its
+    queues `2770`, setgid `robodr`; `/run/robodr-agentd` is `0751`. The
+    Pulsar host-threats drop-in uses `SupplementaryGroups=robodr-agentd`.
+  - **deb identity (high, H2):** a `deb` RPK's name and arch are its dpkg
+    `Package` and `Architecture` (or `all`); a mismatch, a package another
+    RPK name owns, a higher serial with a lower dpkg version and a `.deb`
+    that is or conflicts / breaks / replaces / provides `robodr` or
+    `robodr-focal` (unless from `install.robodr_programme`) are refused.
+  - **Floor durability (medium, M1):** floors, deployment sequence, time
+    floor and chain heads are kept in a signed, never-rotated high-water
+    record (`<blackbox.dir>/highwater.json`) and restored from it; when
+    the state file and the record are both lost the agent locks until
+    `robodr-deliverd reanchor`.
+  - **Root in the spool (medium, M2):** findings are written through
+    directory descriptors (`O_TMPFILE`, no-replace `linkat`);
+    `tmp.deliverd/` is no longer used.
+  - **Kept versions (medium, M4):** version directories are
+    `<serial>-<digest>`; the same serial with other content is refused
+    while installed, kept or being switched.
+  - **Probes (low, L1/L2):** probes run under rlimits (CPU, address
+    space, open files, processes; `health.probe_max_*`) with the agent as
+    their subreaper: leftovers, even detached ones, are killed and fail
+    the probe. The default probe UID minimum is 1000; `robodr-agentd` is
+    always denied.
+  - **Untrusted clock (low, L3):** with `trust.clock: untrusted` a
+    maintenance window stays closed (no signed current time).
+  - **Media (low, L4):** handled packs are remembered by content digest,
+    so a corrected pack under the same name is judged again.
+  - **Unit hardening (I1):** `RestrictSUIDSGID=` removed and `@resources`
+    no longer filtered in `robodr-deliverd.service` (and its focal
+    variant); `MemoryDenyWriteExecute=` and `ProtectKernelTunables=`
+    kept. SECURE-DELIVERY §6.7 states that release signers are
+    root-equivalent for `deb`.
+  - Contract `robodr.findings` 2.2: the full catalog is now documented
+    (§3a); no change to the entries.
 - Secure delivery, independent adversarial review of Sprint 13a
   (`docs/SECURE-DELIVERY.md` §3.5 "Review of 13a"); every finding has a
   regression test replaying its attack
@@ -334,6 +475,44 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   netns e2e for F1 (attacker namespace, spoofed IP with its own MAC).
 
 ### Added
+
+- Secure delivery, Sprint 13b (unit agent, local; `docs/SECURE-DELIVERY.md`
+  §4.2, §6, §10 "13b status"):
+  - `robodr-deliverd` (new crate and daemon, `/usr/sbin`, unit
+    `robodr-deliverd.service` installed disabled, focal variant): imports
+    per-unit media packs (`robodr-media-pack/1`) only through the 13a
+    verified-copy path under the unit's own trust anchor (`init-anchor`),
+    checks the deployment against the unit (depot + operator quorum, unit
+    id, its own ring, groups for production rings only, rollout within the
+    ring, sequence), and installs `files`, `config`, `deb` and
+    `robodr-rules` RPKs from a content-addressed store: safety-state gate
+    on agentd's live safety feed (`idle` / `safe_state_active` only,
+    re-read right before the switch), maintenance window, operator
+    confirmation (`confirm`), write-ahead intent and anti-rollback floor
+    before the switch, health gate (probes as an argv without a shell, as
+    an unprivileged UID, bounded in time and output), automatic rollback
+    at or above the floor, crash recovery, staleness with a trusted or
+    untrusted clock; every step in its own black-box chain.
+  - `robodr-safety-replay` (test tool, not packaged): replays recorded
+    JSONL safety reports into agentd's `safety_feed` socket.
+  - Findings contract `robodr.findings` **2.2.0**: catalog entries
+    `robot.deliver.installed`, `deferred_safety`, `health_failed`,
+    `rollback_blocked_floor`, `refused`, `stale`, `chain_gap` (data source
+    `robodr_delivery`); 2.0 / 2.1 messages keep their own catalogs.
+    Upgrade SOC-side validators (and both sides of a diode) first.
+  - tmpfiles: `/var/lib/robodr/deliverd`, `/var/lib/robodr/deliverd-media`,
+    `/var/lib/robodr/blackbox/deliverd`, `/opt/robodr-delivered`,
+    `/etc/robodr-delivered`, `/etc/robodr-delivered-rules`; example
+    `deliverd.example.json`; man page `robodr-deliverd(8)`;
+    `docs/OPERATIONS.md` section 11. Releases require `robodr-deliverd` in
+    both packages.
+  - Fuzz targets `deliverd_state`, `deliverd_inputs` with std-only smoke
+    runs.
+  - `robodr-agentd` (changed): spool records are published with
+    no-replace hard links (a taken name moves on to the next number), so
+    a second producer (`robodr-deliverd`) can share the findings spool
+    without either overwriting the other's records. `robodr.spool/v1` is
+    unchanged.
 
 - Secure delivery, Sprint 13a (formats and release signing,
   `docs/SECURE-DELIVERY.md` §3, §3.5, §10):
@@ -1301,6 +1480,17 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Fixed
 
+- `robodr-focal`: `robodr-deliverd` could not start, because
+  `robodr-load-credential` refused to hand its black-box key to `root`
+  (the unit's `User=`). The helper now allows `root` for
+  `robodr-deliverd.service` only (explicit allow-list `root_units`); every
+  other unit still refuses `root`, and the path, symlink, mode and
+  directory checks are unchanged. `scripts/check-focal-units.py` checks
+  that the allow-list names exactly the focal units that load credentials
+  for root; new `scripts/test-load-credential.sh` (CI `scripts` job, as
+  root on a copy of the helper rooted in a temporary directory) covers
+  the exception, the refusals and the existing checks
+  (`docs/OPERATIONS.md` §11.5).
 - `--version` (prints `<name> <version>`) and `--help` (usage on stdout)
   exit 0 on `robodr-anchor-receiver`, `robodr-blackbox`,
   `robodr-diode-pack`, `robodr-diode-unpack`, `robodr-kafka-publish`,

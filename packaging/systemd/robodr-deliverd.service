@@ -1,0 +1,152 @@
+# robodr-deliverd: the on-unit delivery agent (docs/SECURE-DELIVERY.md
+# §4.2, §6; man robodr-deliverd(8); docs/OPERATIONS.md section 11).
+# Installs release-signed, depot- and operator-approved RPKs (files, config,
+# deb, robodr-rules) from per-unit media packs put under
+# /var/lib/robodr/deliverd-media, only while robodr-agentd's LIVE safety
+# state is idle or safe_state_active, with a health gate, automatic
+# rollback and anti-rollback floors. It never becomes a dependency of the
+# motion stack: a failed delivery leaves the unit on its previous software.
+#
+# Checked against crates/robodr-deliverd:
+#   * CLI: `robodr-deliverd run --config <deliverd.json>`; exit 0 clean
+#     stop (SIGTERM / SIGINT, handled between passes), 1 runtime failure
+#     (an evidence or state write failed; the write-ahead intent in the
+#     state file is resumed at the next start), 2 usage / configuration.
+#   * /etc/robodr/deliverd.json (robodr-deliverd-config/1, example in
+#     /usr/share/doc/robodr/examples/deliverd.example.json) names the unit,
+#     its site and the pinned delivery root fingerprints; enrol once with
+#     `robodr-deliverd init-anchor --config /etc/robodr/deliverd.json
+#     --trust <site trust.json>` before enabling.
+#   * Black box: its own chain in /var/lib/robodr/blackbox/deliverd, signed
+#     with the unit's black-box key (the same key file as agentd's, handed
+#     over as /run/credentials/robodr-deliverd.service/blackbox.key).
+#   * Findings: robot.deliver.* records in agentd's spool
+#     /var/lib/robodr/spool/agentd (no-replace record names), exported by
+#     the existing exporters. Contract robodr.findings 2.2 on the SOC side.
+#   * Safety state: agentd's status socket /run/robodr-agentd/status.sock
+#     (agentd's spool.status_socket), accepted only when SO_PEERCRED says
+#     it is served by robodr-agentd (or root), never from a file the
+#     exporters could write (review H1); with a configured safety_feed. No
+#     socket, another peer, no feed or a stale status reads unknown and
+#     every install waits.
+#   * sd_notify: READY=1 once the state and the black box are open (no
+#     watchdog: one pass may run dpkg or a health probe for minutes).
+#   * It reads /proc/sys/kernel/random/boot_id (the freshness of agentd's
+#     status), so ProcSubset=pid must NOT be set.
+#
+# Why root and no ProtectSystem=: the deb kind runs dpkg, which writes
+# /usr, /etc and /var/lib/dpkg; files / config / rules versions go to
+# /opt/robodr-delivered, /etc/robodr-delivered and
+# /etc/robodr-delivered-rules; probes drop to an unprivileged UID
+# (setgid / setgroups / setuid). The capability bounding set below is
+# what those need (and what a release-allowed maintainer script gets).
+#
+# NOT A BOUNDARY FOR deb CONTENT (review I1): release signers are fully
+# trusted for kind deb, i.e. root-equivalent on the unit. A .deb without
+# maintainer scripts can still install systemd units, cron entries,
+# /etc/dpkg/dpkg.cfg.d hooks or setuid files, and this unit runs as root
+# and can reach PID 1 (systemctl). The options below limit what goes wrong
+# by accident and what a compromised agent does directly; they do not
+# contain release-approved content (docs/SECURE-DELIVERY.md §6.7).
+#
+# Hardening review (review I1), kept unless it breaks an ordinary install:
+#   * RestrictSUIDSGID= is NOT set: dpkg could not create the setuid /
+#     setgid files that ordinary packages ship (a script-less .deb with a
+#     setgid helper failed and rolled back). Release signers decide what a
+#     .deb contains (above).
+#   * SystemCallFilter= no longer denies @resources: probes get their own
+#     rlimits (setrlimit / prlimit64, review L1).
+#   * MemoryDenyWriteExecute= stays: dpkg, dpkg-deb and script-less
+#     installs never need W+X memory. A probe or a release-allowed
+#     maintainer script that runs a JIT (Java, Node.js, LuaJIT) fails and
+#     the release rolls back: give such a check its own service and use
+#     service_active.
+#   * ProtectKernelTunables= stays: script-less installs do not write
+#     /proc/sys or /sys. A release-allowed maintainer script that runs
+#     `sysctl -w` fails; ship a /etc/sysctl.d/*.conf file instead (applied
+#     by systemd-sysctl at boot, or by an operator).
+#
+# Installed disabled. Enable after commissioning and enrolment:
+#   systemctl enable --now robodr-deliverd
+# Verify after editing: systemd-analyze verify robodr-deliverd.service
+#                       systemd-analyze security robodr-deliverd.service
+
+[Unit]
+Description=RoboDR delivery agent (verified installs behind the safety-state gate)
+Documentation=man:robodr-deliverd(8) file:/usr/share/doc/robodr/OPERATIONS.md
+AssertPathExists=/etc/robodr/deliverd.json
+After=local-fs.target robodr-agentd.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/sbin/robodr-deliverd run --config /etc/robodr/deliverd.json
+Restart=on-failure
+RestartSec=10s
+# Exit 2 = usage / configuration error: restarting cannot fix it.
+RestartPreventExitStatus=2
+# A pass in progress finishes (or is recovered from its intent after a kill).
+TimeoutStopSec=5min
+# Never the reason the motion stack is OOM-killed; below the robot's
+# processes for CPU and disk.
+OOMScoreAdjust=300
+MemoryHigh=384M
+MemoryMax=512M
+TasksMax=64
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+# --- Identity and capabilities ---------------------------------------------
+User=root
+Group=root
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_FSETID CAP_KILL CAP_SETUID CAP_SETGID
+AmbientCapabilities=
+NoNewPrivileges=yes
+UMask=0022
+
+# --- Key material ------------------------------------------------------------
+# systemd (PID 1) copies the root-only key for this unit alone:
+#   /run/credentials/robodr-deliverd.service/blackbox.key
+LoadCredential=blackbox.key:/etc/robodr/keys/agentd-blackbox.key
+InaccessiblePaths=-/etc/robodr/keys
+
+# --- Filesystem --------------------------------------------------------------
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectProc=invisible
+# No ProcSubset=pid: it reads /proc/sys/kernel/random/boot_id.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# --- Network: none at all ------------------------------------------------------
+# Media packs are files; systemctl (service_active checks, rules reload)
+# reaches PID 1 over its file-system socket.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+# --- Kernel interfaces / syscalls -------------------------------------------
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RemoveIPC=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# @privileged stays allowed: chown (dpkg, spool records) and setuid /
+# setgid / setgroups (dropping to the probe user) are in it. @resources
+# stays allowed: setrlimit / prlimit64 set each probe's limits (review L1).
+SystemCallFilter=~@obsolete @mount @swap @reboot @raw-io @cpu-emulation @clock @module @debug
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

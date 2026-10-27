@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 pub const CONTRACT_NAME: &str = "robodr.findings";
 /// Contract (envelope) schema version emitted, semver. See
 /// `docs/contracts/robodr.findings.md`.
-pub const CONTRACT_VERSION: &str = "2.1.0";
+pub const CONTRACT_VERSION: &str = "2.2.0";
 /// Contract major emitted and validated in full.
 pub const CONTRACT_MAJOR: u64 = 2;
 /// Older contract major still accepted on parse (replay, migration), never

@@ -36,6 +36,9 @@
 #             a sensor box, installed with its two units, never enabled)
 #             robodr-enroll (pure; fleet enrollment, key rotation, SOC
 #             profiles; usr/sbin, root-only tool, no unit)
+#             robodr-deliverd (pure; on-unit delivery agent, usr/sbin, with
+#             its unit, installed disabled; robodr-safety-replay, the test
+#             tool of the same crate, is never packaged)
 # A unit file is only installed together with its binary. ROBODR_DEB_REQUIRE
 # (space separated) makes optional binaries mandatory; the release workflow
 # sets it so a release can never silently ship without the daemon.
@@ -238,6 +241,11 @@ if [[ "$variant" == standard ]] && install_bin robodr-anchor-receiver usr/bin 0;
         "$pkg/$units/robodr-anchor-receiver.service"
 fi
 
+# On-unit delivery agent (Sprint 13b, docs/SECURE-DELIVERY.md): installed
+# disabled; enabled after commissioning and enrolment (init-anchor).
+if install_bin robodr-deliverd usr/sbin 0; then
+    install -D -m 0644 "$unit_src/robodr-deliverd.service" "$pkg/$units/robodr-deliverd.service"
+fi
 # Fleet lifecycle (Sprint 9): robodr-enroll and its configuration example.
 # (config/fleet.example.json goes to the examples with the other configs.)
 install_bin robodr-enroll usr/sbin 0 || true
@@ -276,6 +284,10 @@ done
 # The control-plane contract (man robodr-agentd(8) points here).
 install -D -m 0644 "$root/docs/contracts/robodr.control-plane.md" \
     "$doc/contracts/robodr.control-plane.md"
+# The delivery design (man robodr-deliverd(8) points here), when the agent is in.
+if [[ -e "$pkg/usr/sbin/robodr-deliverd" ]]; then
+    install -D -m 0644 "$root/docs/SECURE-DELIVERY.md" "$doc/SECURE-DELIVERY.md"
+fi
 # The fleet contract (man robodr-enroll(8) points here), when the tool is in.
 if [[ -e "$pkg/usr/sbin/robodr-enroll" ]]; then
     install -D -m 0644 "$root/docs/contracts/robodr.fleet-api.md" \

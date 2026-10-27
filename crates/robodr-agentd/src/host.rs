@@ -482,9 +482,14 @@ const SO_PEERCRED: std::ffi::c_int = 17;
 
 /// The connected peer's uid (`SO_PEERCRED`: the credentials of the process
 /// that connected, taken by the kernel at `connect`).
+pub fn peer_uid(s: &UnixStream) -> io::Result<u32> {
+    peer_cred(s).map(|(uid, _)| uid)
+}
+
+/// The connected peer's uid and (primary, effective) gid (`SO_PEERCRED`).
 // FFI: `UnixStream::peer_cred` is still unstable in std.
 #[allow(unsafe_code)]
-pub fn peer_uid(s: &UnixStream) -> io::Result<u32> {
+pub fn peer_cred(s: &UnixStream) -> io::Result<(u32, u32)> {
     let mut cred = UCred {
         pid: 0,
         uid: u32::MAX,
@@ -509,7 +514,63 @@ pub fn peer_uid(s: &UnixStream) -> io::Result<u32> {
     if len as usize != std::mem::size_of::<UCred>() {
         return Err(io::Error::other("SO_PEERCRED returned a short struct"));
     }
-    Ok(cred.uid)
+    Ok((cred.uid, cred.gid))
+}
+
+#[cfg(target_arch = "sparc64")]
+const SO_PEERGROUPS: std::ffi::c_int = 0x3d;
+#[cfg(not(target_arch = "sparc64"))]
+const SO_PEERGROUPS: std::ffi::c_int = 59;
+
+/// The connected peer's supplementary groups (`SO_PEERGROUPS`, Linux 4.13;
+/// 13b review 2, L-D). Like `SO_PEERCRED` the kernel takes them from the
+/// connecting process's credentials at `connect`, so they cannot belong to
+/// another process that reused the peer's pid later, and they need no
+/// `/proc` access (agentd runs with `ProtectProc=invisible`, which hides
+/// the feeder's `/proc/<pid>`). At most 65536 groups.
+// FFI: std has no SO_PEERGROUPS.
+#[allow(unsafe_code)]
+pub fn peer_groups(s: &UnixStream) -> io::Result<Vec<u32>> {
+    let mut n: usize = 64;
+    loop {
+        let mut buf = vec![0u32; n];
+        let mut len = u32::try_from(n * 4).map_err(|_| io::Error::other("too many groups"))?;
+        // SAFETY: `buf` is a writable, u32-aligned buffer of `len` bytes
+        // that outlives the call; the fd is a live socket borrowed from
+        // `s`. The kernel writes at most `len` bytes and sets `len` to the
+        // size it needs (ERANGE when the buffer is too small).
+        let rc = unsafe {
+            getsockopt(
+                s.as_raw_fd(),
+                SOL_SOCKET,
+                SO_PEERGROUPS,
+                buf.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        if rc == 0 {
+            buf.truncate(len as usize / 4);
+            return Ok(buf);
+        }
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() == Some(34) && n < 65_536 {
+            // ERANGE: `len` now holds the size needed.
+            n = (len as usize / 4).clamp(n + 1, 65_536);
+            continue;
+        }
+        return Err(e);
+    }
+}
+
+/// The gid of group `name` in the group file `path` (`/etc/group`), if
+/// it is listed.
+pub fn group_gid(path: &std::path::Path, name: &str) -> Option<u32> {
+    let s = std::fs::read_to_string(path).ok()?;
+    s.lines().find_map(|l| {
+        let mut f = l.split(':');
+        (f.next()? == name).then_some(())?;
+        f.nth(1)?.parse().ok()
+    })
 }
 
 /// The peer policy of a listener: `true` if `uid` may send.

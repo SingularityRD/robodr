@@ -14,10 +14,26 @@
 //!
 //! * Read `ready/*.json` in name order (= creation order). Each file is one
 //!   complete JSON object ([`SpoolRecord`]); it appears atomically (written
-//!   under `tmp/`, `fsync`ed, renamed, directory `fsync`ed), so a file seen
-//!   in `ready/` is never partial.
+//!   under `tmp/`, `fsync`ed, linked into `ready/`, directory `fsync`ed), so
+//!   a file seen in `ready/` is never partial.
+//!
+//! # Several producers
+//!
 //! * After the record is delivered, **ack** it by renaming it into `acked/`
 //!   (same file system, atomic). The daemon never deletes from `ready/`.
+//!
+//! # Several producers
+//!
+//! A record name is claimed with a **no-replace** hard link (`link(2)`
+//! fails when the name exists), never a `rename` over it, and a taken name
+//! moves on to the next sequence number ([`publish_record`]). So another
+//! producer on the same spool (since 13b `robodr-deliverd`, which writes its
+//! `robot.deliver.*` findings into `ready/` from an unnamed file through
+//! directory descriptors) can never have a record overwritten, nor
+//! overwrite one of agentd's. `robodr-deliverd` applies the same Critical
+//! share to its own records (below, [`reserve_files_for`],
+//! [`source_cap_for`]; it is one source and counts `ready/` against its
+//! own `max_ready_files`).
 //!
 //! # Bounds
 //!
@@ -87,6 +103,8 @@ pub enum SpoolClass {
 }
 /// Spool record schema id.
 pub const SPOOL_SCHEMA: &str = "robodr.spool/v1";
+/// Record names tried before a write gives up (several producers).
+const MAX_NAME_TRIES: usize = 64;
 /// Minimum interval between two directory scans forced by a full spool.
 const RESCAN_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -206,6 +224,40 @@ pub fn atomic_write(tmp: &Path, dir: &Path, name: &str, bytes: &[u8]) -> io::Res
         let _ = fs::remove_file(&t);
     }
     res
+}
+
+/// Publish `bytes` as record `dir/name` without ever replacing an existing
+/// file: write `tmp/<name>.tmp`, `fsync`, hard-link it to `dir/name`
+/// (fails with [`io::ErrorKind::AlreadyExists`] if the name is taken),
+/// remove the temporary name, `fsync` `dir`.
+pub fn publish_record(tmp: &Path, dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+    let t = tmp.join(format!("{name}.tmp"));
+    let _ = fs::remove_file(&t);
+    let mut f = OpenOptions::new().write(true).create_new(true).open(&t)?;
+    let res = f
+        .write_all(bytes)
+        .and_then(|()| f.sync_all())
+        .and_then(|()| fs::hard_link(&t, dir.join(name)));
+    let _ = fs::remove_file(&t);
+    res?;
+    sync_dir(dir)
+}
+
+/// Files of a spool bounded to `max_files` that are kept for Critical
+/// findings: an eighth, at least one (when the bound is two or more). Shared
+/// with the other producer on the spool (`robodr-deliverd`), which applies
+/// the same shares to its own records.
+pub fn reserve_files_for(max_files: u64) -> u64 {
+    (max_files / CRITICAL_RESERVE_DIVISOR)
+        .max(1)
+        .min(max_files.saturating_sub(1))
+}
+
+/// Records one source may hold in the Critical share of a spool bounded to
+/// `max_files` (at least one); also the size of the last part of the share,
+/// which takes only sources that hold nothing in it yet (module docs).
+pub fn source_cap_for(max_files: u64) -> u64 {
+    (reserve_files_for(max_files) / RESERVE_SOURCES).max(1)
 }
 
 impl Spool {
@@ -333,12 +385,9 @@ impl Spool {
         }
     }
 
-    /// Files kept for Critical findings: an eighth, at least one (when the
-    /// spool holds two or more).
+    /// Files kept for Critical findings ([`reserve_files_for`]).
     fn reserve_files(&self) -> u64 {
-        (self.max_files / CRITICAL_RESERVE_DIVISOR)
-            .max(1)
-            .min(self.max_files.saturating_sub(1))
+        reserve_files_for(self.max_files)
     }
 
     /// Spool one finding within the share of its `class` (see the module
@@ -396,7 +445,7 @@ impl Spool {
         if !in_reserve {
             self.reserve_use.clear();
         } else if class == SpoolClass::Critical {
-            let cap = (self.reserve_files() / RESERVE_SOURCES).max(1);
+            let cap = source_cap_for(self.max_files);
             let held = self.reserve_use.get(source).copied().unwrap_or(0);
             // Review R2-1 / R2-2: the last part of the Critical share (as
             // large as one source's cap) takes only a source that holds
@@ -412,23 +461,41 @@ impl Spool {
                 return Err(SpoolError::Full);
             }
         }
-        let name = format!("{seq:020}.json");
-        match atomic_write(&self.tmp, &self.ready, &name, &bytes) {
-            Ok(()) => {
-                self.next_seq = seq.saturating_add(1);
-                self.stats.written += 1;
-                self.stats.ready_files += 1;
-                self.stats.ready_bytes += len;
-                if in_reserve && class == SpoolClass::Critical {
-                    *self.reserve_use.entry(source.to_owned()).or_insert(0) += 1;
+        // Another producer may have taken this number (and later ones):
+        // move on, never overwrite (13b). The record's `seq` is the file
+        // name's.
+        let mut seq = seq;
+        let mut rec = rec;
+        let mut bytes = bytes;
+        for _ in 0..MAX_NAME_TRIES {
+            let name = format!("{seq:020}.json");
+            match publish_record(&self.tmp, &self.ready, &name, &bytes) {
+                Ok(()) => {
+                    self.next_seq = seq.saturating_add(1);
+                    self.stats.written += 1;
+                    self.stats.ready_files += 1;
+                    self.stats.ready_bytes += bytes.len() as u64;
+                    if in_reserve && class == SpoolClass::Critical {
+                        *self.reserve_use.entry(source.to_owned()).or_insert(0) += 1;
+                    }
+                    return Ok(self.ready.join(name));
                 }
-                Ok(self.ready.join(name))
-            }
-            Err(e) => {
-                self.stats.write_errors += 1;
-                Err(SpoolError::Io(e))
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    seq = seq.saturating_add(1);
+                    rec.seq = seq;
+                    bytes = serde_json::to_vec(&rec)
+                        .map_err(|e| SpoolError::Io(io::Error::other(e)))?;
+                }
+                Err(e) => {
+                    self.stats.write_errors += 1;
+                    return Err(SpoolError::Io(e));
+                }
             }
         }
+        self.stats.write_errors += 1;
+        Err(SpoolError::Io(io::Error::other(
+            "no free record name: another producer holds the next numbers",
+        )))
     }
 
     /// Atomically replace `<spool>/<name>` (status, checkpoint).
@@ -456,6 +523,30 @@ mod tests {
             value: format!("{{\"x\":\"{}\"}}", "v".repeat(n)),
             headers: vec![("h".into(), "v".into())],
         }
+    }
+
+    #[test]
+    fn a_record_of_another_producer_is_never_overwritten() {
+        let d = tmp("multi");
+        let mut s = Spool::open(&d, 1 << 20, 1000).unwrap();
+        let first = s.write(&rec(1), SpoolClass::Normal).unwrap();
+        assert!(first.ends_with(format!("{:020}.json", 1)));
+        // Another producer (robodr-deliverd) took 2 and 3.
+        for n in [2u64, 3] {
+            fs::write(s.ready_dir().join(format!("{n:020}.json")), b"other").unwrap();
+        }
+        let p = s.write(&rec(2), SpoolClass::Normal).unwrap();
+        assert!(p.ends_with(format!("{:020}.json", 4)), "{}", p.display());
+        let r: SpoolRecord = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+        assert_eq!(r.seq, 4, "the record's seq follows its name");
+        for n in [2u64, 3] {
+            assert_eq!(
+                fs::read(s.ready_dir().join(format!("{n:020}.json"))).unwrap(),
+                b"other"
+            );
+        }
+        assert!(fs::read_dir(d.join("tmp")).unwrap().next().is_none());
+        let _ = fs::remove_dir_all(&d);
     }
 
     fn ack_all(s: &Spool) {

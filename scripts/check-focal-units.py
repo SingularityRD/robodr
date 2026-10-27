@@ -21,7 +21,12 @@ unless, for every focal unit:
      SystemCallFilter= group too (an unknown key is ignored by systemd with
      a warning, which would silently drop a protection or a credential);
   3. every regular unit that uses LoadCredential=, ProtectProc= or
-     ProcSubset= and ships in the focal package has a focal variant.
+     ProcSubset= and ships in the focal package has a focal variant;
+  4. the helper's root allow-list (``root_units=`` in
+     packaging/focal/robodr-load-credential) names exactly the focal units
+     and drop-in examples that load credentials for root: the helper
+     refuses root for every other unit, so a missing entry would keep that
+     unit from starting and an extra one would widen the exception.
 
 The focal drop-in examples (packaging/systemd/focal/*.service.d/*) get
 check 2 and must not use LoadCredential=.
@@ -39,6 +44,7 @@ import sys
 from pathlib import Path
 
 HELPER = "/usr/lib/robodr/robodr-load-credential"
+HELPER_SRC = Path("focal") / "robodr-load-credential"  # under packaging/
 
 # Units the focal package ships (packaging/build-deb.sh --variant focal).
 FOCAL_UNITS = (
@@ -49,6 +55,7 @@ FOCAL_UNITS = (
     "robodr-executor.service",
     "robodr-firewall-gw.service",
     "robodr-firewall-gw-rules.service",
+    "robodr-deliverd.service",
 )
 
 # Directives a focal unit may use: all exist in systemd 245 (version in
@@ -203,8 +210,42 @@ def compare(unit: str, regular: str, focal: str) -> list[str]:
     return errs
 
 
+def root_loads(ds: list[tuple[str, str]]) -> set[str]:
+    """Units that the helper lines in ds load credentials for root."""
+    out = set()
+    for k, v in ds:
+        argv = helper_line(k, v)
+        if argv and argv[0] == "load" and len(argv) >= 3 and argv[2] == "root":
+            out.add(argv[1])
+    return out
+
+
+def helper_root_units(helper: str) -> set[str] | None:
+    """The helper's root_units='...' allow-list, or None if not found once."""
+    found = [
+        line.strip()[len("root_units=") :]
+        for line in helper.splitlines()
+        if line.strip().startswith("root_units=")
+    ]
+    if len(found) != 1 or len(found[0]) < 2 or found[0][0] != "'" or found[0][-1] != "'":
+        return None
+    return set(found[0][1:-1].split())
+
+
+def check_root_units(loads: set[str], allowed: set[str] | None) -> list[str]:
+    if allowed is None:
+        return [f"{HELPER_SRC}: no single root_units='...' line"]
+    errs = []
+    for u in sorted(loads - allowed):
+        errs.append(f"{u}: loads credentials for root but is not in the helper's root_units")
+    for u in sorted(allowed - loads):
+        errs.append(f"{HELPER_SRC}: root_units lists {u}, which loads no credential for root")
+    return errs
+
+
 def run(packaging: Path) -> list[str]:
     errs: list[str] = []
+    loads: set[str] = set()
     sysd = packaging / "systemd"
     focal = sysd / "focal"
     for unit in FOCAL_UNITS:
@@ -216,12 +257,19 @@ def run(packaging: Path) -> list[str]:
             errs.append(f"{foc}: missing (the focal package ships {unit})")
             continue
         errs += compare(unit, reg.read_text(), foc.read_text())
+        loads |= root_loads(directives(foc.read_text()))
     # Every focal unit is one the focal package ships.
     for f in sorted(focal.glob("*.service")):
         if f.name not in FOCAL_UNITS:
             errs.append(f"{f}: not in FOCAL_UNITS (add it there and to build-deb.sh)")
     for f in sorted(focal.glob("*.service.d/*")):
         errs += check_known(f"focal/{f.parent.name}/{f.name}", directives(f.read_text()))
+        loads |= root_loads(directives(f.read_text()))
+    helper = packaging / HELPER_SRC
+    if not helper.is_file():
+        errs.append(f"{helper}: missing")
+    else:
+        errs += check_root_units(loads, helper_root_units(helper.read_text()))
     return errs
 
 
@@ -281,7 +329,26 @@ SystemCallFilter=~@privileged @debug
     if not check_known("d", directives("[Service]\nLoadCredential=a:/b\n")):
         failed += 1
         print("self-test FAIL: LoadCredential in a drop-in not caught", file=sys.stderr)
-    total = len(cases) + 2
+    # Root allow-list of the helper (check 4).
+    root_unit = good.replace("User=robodr", "User=root").replace("u.service robodr", "u.service root")
+    loads = root_loads(directives(root_unit))
+    root_cases = [
+        ("root load listed", "root_units='u.service'\n", True),
+        ("root load listed among others", "root_units='a.service u.service'\n", False),
+        ("root load not listed", "root_units='a.service'\n", False),
+        ("empty allow-list", "root_units=''\n", False),
+        ("allow-list missing", "base=/run/credentials\n", False),
+        ("allow-list twice", "root_units='u.service'\nroot_units='u.service'\n", False),
+    ]
+    for name, helper, ok in root_cases:
+        errs = check_root_units(loads, helper_root_units(helper))
+        if (not errs) != ok:
+            failed += 1
+            print(f"self-test FAIL: {name}: errors {errs}", file=sys.stderr)
+    if root_loads(directives(good)) or check_root_units(set(), helper_root_units("root_units=''\n")):
+        failed += 1
+        print("self-test FAIL: non-root load counted, or empty allow-list refused", file=sys.stderr)
+    total = len(cases) + 2 + len(root_cases) + 1
     print(f"self-test: {total - failed}/{total} passed")
     return 1 if failed else 0
 

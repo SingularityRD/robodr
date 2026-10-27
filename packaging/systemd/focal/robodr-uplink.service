@@ -41,7 +41,9 @@
 #     key / CA bundle could not be loaded (restarted by systemd).
 #   * With --spool it renames <spool>/ready/* to acked/ (rejected/ for
 #     lines the server or the local validation refused) only after a 200
-#     names them, so it runs as the daemon's user (User=robodr).
+#     names them, so it runs as User=robodr, through the spool's group
+#     (agentd itself runs as robodr-agentd: an exporter cannot write its
+#     black box, its state or its sockets).
 #   * --key-file: an Ed25519 secret key file (`robodr-blackbox keygen`,
 #     derived key id), registered in AutoSecOps as this robot's `uplink`
 #     key. Regular file, no group/other access, owned by root or the

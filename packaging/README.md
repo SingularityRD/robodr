@@ -20,10 +20,10 @@ operator installs on a robot. The procedures that use it are in
 | `systemd/robodr-uplink.service.d/50-soc.conf.example` | `/usr/share/doc/robodr/examples/` | `IPAddressAllow=` for the SOC ingest address(es) (map the URL's host name in `/etc/hosts`: DNS is not reachable) |
 | `etc/spool-export.env.example`, `etc/kafka-publish.env.example`, `etc/uplink.env.example` | `/usr/share/doc/robodr/examples/` | the three exporter units' site settings (unit id; bootstrap brokers; ingest URL and pin) |
 | `systemd/focal/*.service`, `systemd/focal/robodr-agentd.service.d/{20-finding-key,30-control-plane}.conf.example` | `/usr/lib/systemd/system/` (and examples) of **`robodr-focal`** | systemd 245 variants (Ubuntu 20.04 / JetPack 5): `LoadCredential=` replaced by `robodr-load-credential`, no `ProtectProc=` / `ProcSubset=`; otherwise identical, enforced by `scripts/check-focal-units.py` |
-| `focal/robodr-load-credential` | `/usr/lib/robodr/` of **`robodr-focal`** | POSIX sh helper run as root (`ExecStartPre=+`): copies a root-only key to `/run/credentials/<unit>/<name>`, `0400` owned by the service user, in a root-owned `0711` directory; `clear` on stop |
+| `focal/robodr-load-credential` | `/usr/lib/robodr/` of **`robodr-focal`** | POSIX sh helper run as root (`ExecStartPre=+`): copies a root-only key to `/run/credentials/<unit>/<name>`, `0400` owned by the service user, in a root-owned `0711` directory; `clear` on stop. Refuses `root` as the owner except for `robodr-deliverd.service` (`root_units`, checked by `scripts/check-focal-units.py`; tests: `scripts/test-load-credential.sh`) |
 | `systemd/robodr-anchor-receiver.service` | `/usr/lib/systemd/system/` | **base station only**: remote head-anchor receiver (only if the binary is built; OPERATIONS 6.4, "Remote anchor"). Not yet checked with `systemd-analyze` |
 | `systemd/robodr-pulsard.service.d/10-cap-sys-admin.conf.example` | `/usr/share/doc/robodr/examples/` | opt-in for kernels < 5.8 |
-| `systemd/robodr-pulsard.service.d/30-host-threats.conf.example` | `/usr/share/doc/robodr/examples/` | optional drop-in: `SupplementaryGroups=robodr` so `robodr-threat-forward` can reach agentd's `0660` host-threat socket (OPERATIONS 6.4) |
+| `systemd/robodr-pulsard.service.d/30-host-threats.conf.example` | `/usr/share/doc/robodr/examples/` | optional drop-in: `SupplementaryGroups=robodr-agentd` so `robodr-threat-forward` can reach agentd's `0660` host-threat socket (OPERATIONS 6.4) |
 | `tmpfiles.d/robodr.conf` | `/usr/lib/tmpfiles.d/` | directories, modes, owners |
 | `sysusers.d/robodr.conf` | `/usr/lib/sysusers.d/` | the `robodr` system user |
 | `etc/pulsar.base.toml` | header of `/etc/robodr/pulsar.toml` | daemon config (conffile) |
@@ -44,10 +44,11 @@ The units, tmpfiles and sysusers fragments were checked with
 | Program | How it runs | Why |
 |---|---|---|
 | `robodr-pulsard` | systemd service, root with a bounded capability set | Pulsar requires euid 0 and loads eBPF |
-| `robodr-agentd` | systemd service, user `robodr`, `CAP_NET_RAW` only | long-running decision chain; needs nothing else |
+| `robodr-agentd` | systemd service, user `robodr-agentd` (member of `robodr`), `CAP_NET_RAW` only | long-running decision chain; needs nothing else |
 | `robodr-commission` | **not a service**: run by an operator, as needed | commissioning is a deliberate, human-reviewed act (learn, sign off, lock). A timer or unit that re-learns a profile automatically would let an attacker who is present during learning become "normal". |
 | `robodr-replay`, `robodr-ros2-watch` | operator tools | offline analysis and lab replay |
 | `robodr-enroll` | **not a service**: root-only operator tool (`/usr/sbin`) | enrollment, key rotation, revocation lists, SOC profiles and ring information (OPERATIONS 8.6); every step is a deliberate operator act, nothing is applied by the SOC on its own |
+| `robodr-deliverd` | systemd service on the **unit**, root with a bounded capability set, no network | installs delivered RPKs (dpkg, `/opt` / `/etc` install roots, dropping to probe users); runs only after commissioning and `init-anchor` (OPERATIONS 11) |
 | `robodr-anchor-receiver` | systemd service on a **base station**, dynamic user, no capabilities; never enabled on a robot | holds the robots' black-box head marks off the robots |
 | `robodr-spool-export` | systemd service (`User=robodr`, no network, no capabilities) on the **unit or sensor box** of a diode site | loops on agentd's spool and writes signed diode batches; the transfer to the diode is the site's procedure |
 | `robodr-kafka-publish` | systemd service (`User=robodr`, brokers only) on the **unit or sensor box** of a connected site; on a diode site it runs on the **SOC (high) side** after `robodr-diode-unpack`, from the SOC's own unit or procedure (`--diode-out`) | publishes findings to Kafka; one consumer per spool, so it conflicts with `robodr-spool-export` and `robodr-uplink` |
@@ -122,27 +123,37 @@ Neither watchdog has been exercised under a real systemd yet.
     └── retired/                 0700 root:root     rotated keys kept for verification
 /var/lib/robodr/                 0750 root:robodr
 ├── blackbox/                    0750 root:robodr
-│   ├── agentd/                  0750 robodr:robodr single writer: robodr-agentd
+│   ├── agentd/                  0750 robodr-agentd:robodr single writer: robodr-agentd
+│   ├── deliverd/                0750 root:robodr   single writer: robodr-deliverd (delivery evidence, signed highwater.json)
 │   └── pulsard/                 0750 root:robodr   single writer: robodr-pulsard
 ├── spool/                       0750 root:robodr   OCSF findings awaiting export
-│   ├── agentd/                  0750 robodr:robodr
+│   ├── agentd/                  2750 robodr-agentd:robodr  written by agentd (and robodr-deliverd through fds)
+│   │   └── ready/ acked/ rejected/  2770 robodr-agentd:robodr  exporters (robodr) read and rename here
 │   └── pulsard/                 0750 root:robodr
 ├── control-plane/               0750 root:robodr
-│   └── agentd/                  0700 robodr:robodr control_plane.state_dir: request journal, replay store, evidence exports
-├── profile-state/               0750 robodr:robodr profile anti-rollback state of robodr-agentd
+│   └── agentd/                  0700 robodr-agentd:robodr control_plane.state_dir: request journal, replay store, evidence exports
+├── profile-state/               0750 robodr-agentd:robodr profile anti-rollback state of robodr-agentd
 ├── profile-state-pulsard/       0750 root:robodr   profile anti-rollback state of the Pulsar sensor
 ├── commission/                  0750 root:robodr   operator workspace: runs, drafts, sign-offs
 ├── export/                      0750 root:robodr   bundles staged for the diode / media
 ├── archive/                     0750 root:robodr   black boxes closed by a key rotation
 ├── executor/                    0700 robodr-exec:robodr journal of robodr-executor (active actions, TTL deadlines)
 ├── fleet/                       0700 root:root     robodr-enroll state, staged profile, fleet journal (black box)
+├── deliverd/                    0700 root:root     robodr-deliverd: state, trust anchor, content-addressed store, imported packs
+├── deliverd-media/              0700 root:root     media packs put here for robodr-deliverd (untrusted)
 ├── releases/<version>/          0750 root:root     .deb kept for rollback (install-bundle.sh)
 └── releases/security-floor      0644 root:root     lowest release install/rollback may reach (only rises)
 /run/robodr-pulsard/pulsar.sock                     Pulsar API socket (RuntimeDirectory)
 /run/robodr-executor/executor.sock                  agentd -> robodr-executor (0660 robodr-exec:robodr, dir 0750)
+/run/robodr-agentd/                                 agentd's sockets (0751 robodr-agentd:robodr-agentd): status.sock
+                                                    (0600, read by robodr-deliverd, SO_PEERCRED), safety.sock (0600, or
+                                                    0660 group robodr-safety; SO_PEERCRED), events.sock, host-threats.sock
 /run/credentials/<unit>/blackbox.key                key copy for the service (systemd)
 /usr/share/robodr/rules/{robodr,pulsar}/            Pulsar rules, read-only
 /usr/share/robodr/formats                           black-box formats the release writes / reads (install-bundle.sh gate)
+/opt/robodr-delivered/<name>/{<serial>-<digest>,current}  delivered files (robodr-deliverd only)
+/etc/robodr-delivered/<name>/{<serial>-<digest>,current}  delivered configuration (robodr-deliverd only)
+/etc/robodr-delivered-rules/<name>                  link to the active delivered Pulsar rules
 ```
 
 `tmpfiles.d/robodr.conf` creates every directory and **resets** mode and owner
@@ -156,7 +167,14 @@ Why each directory has the owner and mode it has:
   and each service's `ReadWritePaths=` names only its own subdirectory.
 - **Group `robodr` can read** state and spool. This lets the export tooling
   and an operator in group `robodr` read evidence without root. It cannot
-  modify evidence: only the owner can write.
+  modify evidence: only the owner can write. The exporters may write only
+  agentd's spool queues (`ready/`, `acked/`, `rejected/`, setgid so
+  records keep group `robodr`).
+- **agentd is not the exporters' user.** `robodr-agentd` (agentd) and
+  `robodr` (the exporters, two of them network-facing) are different
+  users, so a compromised exporter cannot write agentd's black box, its
+  state, its sockets or the safety state the delivery agent gates on
+  (SECURE-DELIVERY §6.3).
 - **`/var/lib/robodr/releases` is root-only**. It holds what `dpkg -i` will
   install on a rollback.
 
@@ -247,6 +265,12 @@ this was checked with stub binaries (`robodr`) and with the real static
 binaries (`robodr-focal`, arm64).
 
 ## Not verified
+
+- `robodr-deliverd.service` and its focal variant (added 2026-10-26, Sprint
+  13b) pass `scripts/check-focal-units.py` and `systemd-analyze verify`
+  apart from the missing binary; not started by systemd. Its tests run the
+  agent itself on temporary directories, `deb` with the host's dpkg
+  against a separate dpkg root.
 
 - No unit has been started on a real kernel. In particular these are
   unverified: the capability set, `SystemCallFilter=`, the read-only `/sys`

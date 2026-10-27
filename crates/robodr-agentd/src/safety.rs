@@ -28,7 +28,12 @@
 //! * **A unix socket** (`safety_feed.socket`): JSON lines
 //!   `{"state":"estop_active"}` from a local safety-PLC gateway. The socket
 //!   is created mode 0600 (only the daemon's user and root can connect),
-//!   like the event socket. Every connection is its own writer
+//!   or `0660` with `socket_group` (the gateway's dedicated group,
+//!   `robodr-safety` in the packaging), and every connection's peer is
+//!   checked with `SO_PEERCRED`: only root, the daemon's own uid and the
+//!   configured `allowed_uids` / `allowed_gids` may report a state; any
+//!   other peer (an exporter, which runs as another user since review H1)
+//!   is closed before a byte is read. Every connection is its own writer
 //!   ([`SafetyFeed::observe_report_from`]): redundant gateways are combined
 //!   most-conservative like topic writers, each with its own staleness, so
 //!   a fresh `estop_active` from one connection is never overwritten by
@@ -358,20 +363,48 @@ fn default_angular() -> f64 {
 }
 
 /// The safety-PLC gateway socket.
+///
+/// ```json
+/// "socket": { "path": "/run/robodr-agentd/safety.sock", "socket_mode": "0660",
+///             "socket_group": 990, "allowed_gids": [990] }
+/// ```
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SocketSourceSection {
-    /// Absolute path; created mode 0600 by the daemon.
+    /// Absolute path; created by the daemon with `socket_mode`.
     pub path: PathBuf,
     #[serde(default = "default_socket_connections")]
     pub max_connections: usize,
     #[serde(default)]
     pub stale_after_ms: Option<u64>,
+    /// `"0600"` (default: only the daemon's user and root can connect) or
+    /// `"0660"` (also the socket's group, `socket_group`).
+    #[serde(default = "default_socket_mode")]
+    pub socket_mode: String,
+    /// Numeric gid the socket is given (the gateway's dedicated group;
+    /// the daemon must be a member: `SupplementaryGroups=`). Default: the
+    /// daemon's primary group.
+    #[serde(default)]
+    pub socket_group: Option<u32>,
+    /// Peer uids allowed to report a state besides root and the daemon's
+    /// own uid (`SO_PEERCRED`).
+    #[serde(default)]
+    pub allowed_uids: Vec<u32>,
+    /// Peer (effective, primary) gids allowed to report a state.
+    #[serde(default)]
+    pub allowed_gids: Vec<u32>,
 }
 
 fn default_socket_connections() -> usize {
     2
 }
+
+fn default_socket_mode() -> String {
+    "0600".into()
+}
+
+/// Most entries of `allowed_uids` / `allowed_gids`.
+pub const MAX_SOCKET_PEERS: usize = 16;
 
 /// How a topic source turns a sample into a claim.
 #[derive(Debug, Clone, PartialEq)]
@@ -423,6 +456,45 @@ pub struct SocketSpec {
     pub path: PathBuf,
     pub max_connections: usize,
     pub stale_after_ms: u64,
+    /// `0o600` or `0o660`.
+    pub mode: u32,
+    pub group: Option<u32>,
+    /// Peer uids allowed besides root and the daemon's own uid.
+    pub allowed_uids: Vec<u32>,
+    pub allowed_gids: Vec<u32>,
+}
+
+impl SocketSpec {
+    /// 13b review 2, L-D: the exporters' group (`robodr`, whose gid on
+    /// this host is `exporters`) is never a feeder group. Its members are
+    /// the network-facing exporters (and agentd itself, as a supplementary
+    /// group), so naming it as `socket_group` or in `allowed_gids` would let
+    /// every exporter report the robot's safety state.
+    pub fn check_feeder_groups(&self, exporters: Option<u32>) -> Result<(), String> {
+        let Some(g) = exporters else {
+            return Ok(());
+        };
+        if self.group == Some(g) || self.allowed_gids.contains(&g) {
+            return Err(format!(
+                "safety_feed.socket: gid {g} is the exporters' group (robodr), never a feeder \
+                 group: give the safety gateway its own group (robodr-safety)"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The peer policy of the listener: root, `own_uid` and the
+    /// configured feeders.
+    pub fn peer_policy(&self, own_uid: u32) -> crate::input::PeerPolicy {
+        let mut uids = self.allowed_uids.clone();
+        uids.extend([0, own_uid]);
+        uids.sort_unstable();
+        uids.dedup();
+        crate::input::PeerPolicy {
+            uids,
+            gids: self.allowed_gids.clone(),
+        }
+    }
 }
 
 /// The validated feed configuration.
@@ -670,10 +742,38 @@ impl SafetyFeedSection {
                     Some(v) => check_stale("safety_feed.socket.stale_after_ms", v)?,
                     None => default_stale,
                 };
+                let mode = match s.socket_mode.as_str() {
+                    "0600" => 0o600,
+                    "0660" => 0o660,
+                    _ => {
+                        return Err(
+                            "safety_feed.socket.socket_mode must be \"0600\" or \"0660\"".into(),
+                        )
+                    }
+                };
+                if s.allowed_uids.len() > MAX_SOCKET_PEERS
+                    || s.allowed_gids.len() > MAX_SOCKET_PEERS
+                {
+                    return Err(format!(
+                        "safety_feed.socket: at most {MAX_SOCKET_PEERS} allowed_uids and \
+                         allowed_gids"
+                    ));
+                }
+                if s.socket_group == Some(0) || s.allowed_gids.contains(&0) {
+                    return Err(
+                        "safety_feed.socket: gid 0 is not a feeder group (root is always \
+                         allowed)"
+                            .into(),
+                    );
+                }
                 Some(SocketSpec {
                     path: s.path.clone(),
                     max_connections: s.max_connections,
                     stale_after_ms: stale,
+                    mode,
+                    group: s.socket_group,
+                    allowed_uids: s.allowed_uids.clone(),
+                    allowed_gids: s.allowed_gids.clone(),
                 })
             }
         };
@@ -1589,6 +1689,10 @@ mod tests {
                 path: "/run/x.sock".into(),
                 max_connections: 1,
                 stale_after_ms: stale,
+                mode: 0o600,
+                group: None,
+                allowed_uids: Vec::new(),
+                allowed_gids: Vec::new(),
             }),
         })
     }
@@ -1750,6 +1854,10 @@ mod tests {
                 path: "/run/x.sock".into(),
                 max_connections: 2,
                 stale_after_ms: 100,
+                mode: 0o600,
+                group: None,
+                allowed_uids: Vec::new(),
+                allowed_gids: Vec::new(),
             }),
         });
         let r = |state| SafetyReport { state };
@@ -1830,6 +1938,31 @@ mod tests {
             d => panic!("{d:?}"),
         }
         assert_eq!(spec.socket.as_ref().unwrap().max_connections, 2);
+        // Review H1: by default only root and the daemon's own uid may
+        // report a state on the socket (0600).
+        let sock = spec.socket.as_ref().unwrap();
+        assert_eq!(sock.mode, 0o600);
+        let p = sock.peer_policy(4242);
+        assert!(p.allows(0, 0) && p.allows(4242, 4242));
+        assert!(!p.allows(4001, 4001), "another service's uid");
+        // A dedicated feeder group, socket 0660.
+        let (feeder, _) = section(with_writers(serde_json::json!({
+            "socket": {"path": "/run/robodr/safety.sock", "socket_mode": "0660",
+                       "socket_group": 990, "allowed_gids": [990], "allowed_uids": [1200]}
+        })))
+        .unwrap();
+        let sock = feeder.socket.as_ref().unwrap();
+        assert_eq!((sock.mode, sock.group), (0o660, Some(990)));
+        let p = sock.peer_policy(4242);
+        assert!(p.allows(5000, 990) && p.allows(1200, 7));
+        assert!(!p.allows(4001, 4001));
+        // Review L-D: a supplementary feeder group counts; the exporters'
+        // group is never a feeder group.
+        assert!(p.allows_with_groups(5000, 5000, &[17, 990]));
+        assert!(!p.allows_with_groups(5000, 5000, &[17]));
+        assert!(sock.check_feeder_groups(Some(991)).is_ok());
+        assert!(sock.check_feeder_groups(None).is_ok());
+        assert!(sock.check_feeder_groups(Some(990)).is_err());
         // Three topics are not profiled writer topics.
         assert_eq!(w.len(), 3, "{w:?}");
         // The angular threshold defaults; spinning in place is moving.
@@ -1906,6 +2039,9 @@ mod tests {
             serde_json::json!({"socket": {"path": "relative.sock"}}),
             serde_json::json!({"socket": {"path": "/a.sock", "max_connections": 0}}),
             serde_json::json!({"socket": {"path": "/a.sock"}, "stale_after_ms": 999999999}),
+            serde_json::json!({"socket": {"path": "/a.sock", "socket_mode": "0666"}}),
+            serde_json::json!({"socket": {"path": "/a.sock", "socket_group": 0}}),
+            serde_json::json!({"socket": {"path": "/a.sock", "allowed_gids": [0]}}),
         ];
         for b in bad {
             // With writers added, each still fails for its own reason (an

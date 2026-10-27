@@ -13,4 +13,4 @@
 # This line runs after the unit's own ExecStartPre= lines (drop-ins append);
 # ExecStopPost= of the unit removes every copy.
 [Service]
-ExecStartPre=+/usr/lib/robodr/robodr-load-credential load robodr-agentd.service robodr executor.key:/etc/robodr/keys/executor.key
+ExecStartPre=+/usr/lib/robodr/robodr-load-credential load robodr-agentd.service robodr-agentd executor.key:/etc/robodr/keys/executor.key

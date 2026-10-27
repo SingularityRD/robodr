@@ -1,0 +1,1 @@
+{"boot_id":"fuzz-boot","kind":"robodr.agentd_status","robot_id":"ugv-07","running":true,"safety_feed":{"sources":[{"age_ms":120,"claim":"moving_slow","name":"socket"}],"state":"moving_slow","stats":{"reports":10}},"safety_state":"moving_slow","stale_after_ms":4000,"state":"ok","updated_mono_ms":49800,"uptime_ms":40000,"wall_ms":1790000000000}

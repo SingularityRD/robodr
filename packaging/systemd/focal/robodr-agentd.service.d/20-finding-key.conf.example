@@ -20,4 +20,4 @@
 # i.e. after the black-box key was loaded; ExecStopPost= of the unit removes
 # both copies.
 [Service]
-ExecStartPre=+/usr/lib/robodr/robodr-load-credential load robodr-agentd.service robodr finding.key:/etc/robodr/keys/agentd-finding.key
+ExecStartPre=+/usr/lib/robodr/robodr-load-credential load robodr-agentd.service robodr-agentd finding.key:/etc/robodr/keys/agentd-finding.key

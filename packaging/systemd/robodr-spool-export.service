@@ -11,7 +11,9 @@
 #     every --interval-ms (default 5000 ms) and retries after errors itself;
 #     exit 2 = usage error.
 #   * It renames <spool>/ready/* to acked/ (and invalid ones to rejected/),
-#     so it runs as the daemon's user (User=robodr), like agentd.
+#     so it runs as User=robodr, through the spool's group (agentd
+#     itself runs as robodr-agentd: an exporter cannot write its black
+#     box, its state or its sockets).
 #   * --key-file: the unit's diode signing key, a `robodr-blackbox keygen`
 #     secret key file (Ed25519). Same rule as agentd's key: regular file, no
 #     group/other access, owned by root or the process's uid; the systemd

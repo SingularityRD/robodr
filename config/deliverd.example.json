@@ -1,0 +1,70 @@
+{
+  "format": "robodr-deliverd-config/1",
+  "unit": {
+    "id": "ugv-07",
+    "site": "site-a",
+    "model": "ugv-x1",
+    "platform": "ugv-x1",
+    "arch": "arm64",
+    "hw": null,
+    "ring": null,
+    "groups": []
+  },
+  "trust": {
+    "roots": [
+      "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+      "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+      "sha256:0000000000000000000000000000000000000000000000000000000000000003"
+    ],
+    "clock": "trusted"
+  },
+  "state_dir": "/var/lib/robodr/deliverd",
+  "media_dir": "/var/lib/robodr/deliverd-media",
+  "install": {
+    "files_root": "/opt/robodr-delivered",
+    "config_root": "/etc/robodr-delivered",
+    "rules_active": "/etc/robodr-delivered-rules",
+    "rules_reload": ["/usr/bin/systemctl", "try-restart", "robodr-pulsard.service"],
+    "rules_validator": null,
+    "dpkg": "/usr/bin/dpkg",
+    "dpkg_deb": "/usr/bin/dpkg-deb",
+    "dpkg_query": "/usr/bin/dpkg-query",
+    "dpkg_root": null,
+    "dpkg_timeout_s": 900,
+    "keep_versions": 2,
+    "robodr_programme": null
+  },
+  "health": {
+    "passwd": "/etc/passwd",
+    "probe_uid_min": 1000,
+    "probe_uid_max": 59999,
+    "deny_users": [],
+    "systemctl": "/usr/bin/systemctl",
+    "require_agentd_ok": true,
+    "max_output_bytes": 65536,
+    "service_timeout_s": 30,
+    "probe_max_memory_mb": 1024,
+    "probe_max_open_files": 256,
+    "probe_max_processes": 64
+  },
+  "safety": {
+    "agentd_status": "/run/robodr-agentd/status.sock",
+    "agentd_user": "robodr-agentd",
+    "passwd": "/etc/passwd",
+    "boot_id": "/proc/sys/kernel/random/boot_id"
+  },
+  "blackbox": {
+    "dir": "/var/lib/robodr/blackbox/deliverd",
+    "key": "/run/credentials/robodr-deliverd.service/blackbox.key"
+  },
+  "findings": {
+    "spool": "/var/lib/robodr/spool/agentd",
+    "data_source": "robodr",
+    "topic": "robodr.findings",
+    "max_ready_files": 10000,
+    "stale_grace_s": 86400,
+    "deferral_medium_after": 10,
+    "finding_key": null
+  },
+  "interval_ms": 5000
+}

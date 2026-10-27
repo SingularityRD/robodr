@@ -559,6 +559,14 @@ pub struct SpoolSection {
     /// Bound on `ready/` + `acked/` files (default 10000).
     #[serde(default = "default_spool_files")]
     pub max_files: u64,
+    /// Optional unix socket (created 0600) on which the daemon serves its
+    /// current status (the bytes of `status.json`) to every connection,
+    /// e.g. `/run/robodr-agentd/status.sock`. `robodr-deliverd` reads the
+    /// robot's safety state here and checks the peer with `SO_PEERCRED`
+    /// (review H1): unlike `status.json` in the spool, which the
+    /// exporters' user can replace, only this process can serve it.
+    #[serde(default)]
+    pub status_socket: Option<PathBuf>,
 }
 
 fn default_spool_bytes() -> u64 {
@@ -1023,6 +1031,21 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
     }
     let mut stdin_seen = false;
     let mut socket_paths: Vec<&Path> = Vec::new();
+    if let Some(p) = &config.spool.status_socket {
+        require_abs("spool.status_socket", p)?;
+        if p.file_name().is_none() || p.parent().is_none() {
+            return Err("spool.status_socket must name a file in a directory".into());
+        }
+        for (what, d) in [
+            ("spool.dir", &config.spool.dir),
+            ("blackbox.dir", &config.blackbox.dir),
+        ] {
+            if resolve_path(p).starts_with(resolve_path(d)) {
+                return Err(format!("spool.status_socket must not be inside {what}"));
+            }
+        }
+        socket_paths.push(p);
+    }
     for i in &config.event_inputs {
         match i {
             EventInputConfig::Stdin => {
@@ -1041,7 +1064,10 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
                     ));
                 }
                 if socket_paths.contains(&path.as_path()) {
-                    return Err("event_inputs: a socket path is listed twice".into());
+                    return Err(
+                        "event_inputs: a socket path is listed twice (or is spool.status_socket)"
+                            .into(),
+                    );
                 }
                 socket_paths.push(path);
             }
@@ -1493,6 +1519,24 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
             }
             a.remote_config(&config.robot.id)
                 .unwrap_or_else(|| Err("not a remote anchor".into()))?;
+        }
+    }
+    if let Some(p) = &config.spool.status_socket {
+        let clash = safety_feed
+            .as_ref()
+            .and_then(|f| f.socket.as_ref())
+            .is_some_and(|s| s.path == *p)
+            || host_threats.as_ref().is_some_and(|h| h.path == *p)
+            || control_plane
+                .as_ref()
+                .and_then(|c| c.unix.as_ref())
+                .is_some_and(|u| u == p);
+        if clash {
+            return Err(
+                "spool.status_socket is also a safety_feed, host_threats or control_plane socket \
+                 path"
+                    .into(),
+            );
         }
     }
     Ok(Resolved {
@@ -2316,7 +2360,9 @@ mod tests {
         let oom: i32 = value("OOMScoreAdjust=").unwrap().parse().unwrap();
         assert!(oom >= 0, "OOMScoreAdjust={oom}");
         assert!(value("MemoryMax=").is_some());
-        // ... and tmpfiles.d creates the state directory for User=robodr.
+        // ... and tmpfiles.d creates the state directory for agentd's own
+        // user (review H1: not the exporters' robodr).
+        assert_eq!(value("User="), Some("robodr-agentd"));
         let tmpfiles = std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/tmpfiles.d/robodr.conf"),
         )
@@ -2327,9 +2373,9 @@ mod tests {
                 f.len() >= 5
                     && f[0] == "d"
                     && Path::new(f[1]) == state.parent().unwrap()
-                    && f[3] == "robodr"
+                    && f[3] == "robodr-agentd"
             }),
-            "tmpfiles.d does not create {:?} for robodr",
+            "tmpfiles.d does not create {:?} for robodr-agentd",
             state.parent()
         );
         // Wave-6 keys: revocation / trust roots (full example only), safety
@@ -2393,9 +2439,9 @@ mod tests {
                     && f[0] == "d"
                     && Path::new(f[1]) == cp.state_dir
                     && f[2] == "0700"
-                    && f[3] == "robodr"
+                    && f[3] == "robodr-agentd"
             }),
-            "tmpfiles.d does not create {:?} 0700 for robodr",
+            "tmpfiles.d does not create {:?} 0700 for robodr-agentd",
             cp.state_dir
         );
         let tls = cp.tls.as_ref().expect("tls");
