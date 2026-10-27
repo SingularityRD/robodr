@@ -22,8 +22,18 @@
 #     without group/other bits and owned by root or the daemon's uid, which
 #     the systemd credential copy satisfies. An optional unix_socket event
 #     input belongs under /run/robodr-agentd/ (RuntimeDirectory= below; the
-#     socket is created 0600, so producers must run as User=robodr); so does
-#     the optional safety_feed socket (safety-PLC gateway).
+#     socket is created 0600, so producers must run as robodr-agentd or
+#     root); so does the optional safety_feed socket (safety-PLC gateway:
+#     0600 by default, or 0660 with socket_group = the robodr-safety gid,
+#     and every connection is checked with SO_PEERCRED against root, this
+#     daemon's uid and safety_feed.socket.allowed_uids / allowed_gids, so
+#     the exporters (User=robodr) cannot report a safety state; give this
+#     unit and the gateway SupplementaryGroups=robodr-safety for that).
+#   * spool.status_socket /run/robodr-agentd/status.sock: the status (and
+#     the live safety state) served to robodr-deliverd, which accepts it
+#     only from this unit's user (SO_PEERCRED; review H1). status.json in
+#     the spool is for people and tools, not for the delivery gate: the
+#     exporters' group can write the spool.
 #   * Optional per-finding signing key (finding_signing.key_file): installed
 #     with the drop-in example 20-finding-key.conf.example (LoadCredential=
 #     finding.key), never the black-box key. Only agentd.full.example.json
@@ -81,9 +91,13 @@ MemoryHigh=384M
 MemoryMax=512M
 
 # --- Identity and capabilities ---------------------------------------------
-# Dedicated, unprivileged system user (packaging/sysusers.d/robodr.conf).
-User=robodr
-Group=robodr
+# Dedicated, unprivileged system user of its own (packaging/sysusers.d/
+# robodr.conf), distinct from the exporters' robodr (review H1). Member of
+# robodr for /etc/robodr, its findings spool (setgid robodr, read and acked
+# by the exporters) and the executor's socket.
+User=robodr-agentd
+Group=robodr-agentd
+SupplementaryGroups=robodr
 # The only privilege: read-only passive capture (AF_PACKET) of the robot's
 # DDS traffic. Ambient so the unprivileged process actually holds it;
 # bounded so it can never hold anything else.
@@ -96,7 +110,7 @@ UMask=0027
 # systemd (PID 1, root) reads the root-only key file and exposes a copy to
 # this service alone, on a non-swappable ramfs, readable only by User=:
 #   /run/credentials/robodr-agentd.service/blackbox.key
-# The robodr user itself has no access to /etc/robodr/keys.
+# The robodr-agentd user itself has no access to /etc/robodr/keys.
 LoadCredential=blackbox.key:/etc/robodr/keys/agentd-blackbox.key
 InaccessiblePaths=-/etc/robodr/keys
 
@@ -111,9 +125,12 @@ DevicePolicy=closed
 # Without it the daemon cannot record the accepted profile and, failing
 # closed, runs observe-only.
 ReadWritePaths=/var/lib/robodr/blackbox/agentd /var/lib/robodr/spool/agentd /var/lib/robodr/profile-state
-# For an optional unix_socket event input (/run/robodr-agentd/events.sock).
+# Sockets: events.sock (optional event input), safety.sock (safety-PLC
+# gateway), host-threats.sock (Pulsar forwarder), status.sock (deliverd).
+# 0751: other users may reach a socket they are allowed to (its own mode
+# and the SO_PEERCRED checks decide), not list the directory.
 RuntimeDirectory=robodr-agentd
-RuntimeDirectoryMode=0750
+RuntimeDirectoryMode=0751
 ProtectProc=invisible
 # No ProcSubset=pid: agentd reads /proc/sys/kernel/random/boot_id and
 # /proc/net/{route,fib_trie,if_inet6} (see the header).

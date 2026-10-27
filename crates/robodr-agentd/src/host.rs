@@ -482,9 +482,14 @@ const SO_PEERCRED: std::ffi::c_int = 17;
 
 /// The connected peer's uid (`SO_PEERCRED`: the credentials of the process
 /// that connected, taken by the kernel at `connect`).
+pub fn peer_uid(s: &UnixStream) -> io::Result<u32> {
+    peer_cred(s).map(|(uid, _)| uid)
+}
+
+/// The connected peer's uid and (primary, effective) gid (`SO_PEERCRED`).
 // FFI: `UnixStream::peer_cred` is still unstable in std.
 #[allow(unsafe_code)]
-pub fn peer_uid(s: &UnixStream) -> io::Result<u32> {
+pub fn peer_cred(s: &UnixStream) -> io::Result<(u32, u32)> {
     let mut cred = UCred {
         pid: 0,
         uid: u32::MAX,
@@ -509,7 +514,7 @@ pub fn peer_uid(s: &UnixStream) -> io::Result<u32> {
     if len as usize != std::mem::size_of::<UCred>() {
         return Err(io::Error::other("SO_PEERCRED returned a short struct"));
     }
-    Ok(cred.uid)
+    Ok((cred.uid, cred.gid))
 }
 
 /// The peer policy of a listener: `true` if `uid` may send.

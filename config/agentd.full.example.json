@@ -26,7 +26,7 @@
       "min_increment_interval_ms": 60000
     }
   },
-  "spool": { "dir": "/var/lib/robodr/spool/agentd" },
+  "spool": { "dir": "/var/lib/robodr/spool/agentd", "status_socket": "/run/robodr-agentd/status.sock" },
   "findings": { "topic": "robodr.findings", "data_source": "robodr" },
   "event_inputs": [ { "kind": "unix_socket", "path": "/run/robodr-agentd/events.sock" } ],
   "context": { "safety_state": "unknown", "control": "autonomous" },

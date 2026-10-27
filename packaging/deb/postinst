@@ -18,6 +18,24 @@ configure)
         adduser --system --ingroup robodr --home /var/lib/robodr/executor --no-create-home \
             --shell /usr/sbin/nologin robodr-exec
     fi
+    if ! command -v systemd-sysusers >/dev/null 2>&1; then
+        if ! getent passwd robodr-agentd >/dev/null; then
+            adduser --system --group --home /var/lib/robodr --no-create-home \
+                --shell /usr/sbin/nologin robodr-agentd
+        fi
+        adduser robodr-agentd robodr >/dev/null
+        getent group robodr-safety >/dev/null || addgroup --system robodr-safety
+    fi
+    # Upgrade from a version where robodr-agentd ran as robodr (review H1):
+    # agentd's own trees move to its own user, once, before tmpfiles sets
+    # the directory modes. Contents keep their modes; the spool queues get
+    # group robodr and the setgid bit from tmpfiles.
+    for d in /var/lib/robodr/blackbox/agentd /var/lib/robodr/spool/agentd \
+        /var/lib/robodr/profile-state /var/lib/robodr/control-plane/agentd; do
+        if [ -d "$d" ] && [ ! -L "$d" ] && [ "$(stat -c %U "$d")" = robodr ]; then
+            chown -R --no-dereference robodr-agentd:robodr "$d"
+        fi
+    done
     if command -v systemd-tmpfiles >/dev/null 2>&1; then
         systemd-tmpfiles --create /usr/lib/tmpfiles.d/robodr.conf
     fi

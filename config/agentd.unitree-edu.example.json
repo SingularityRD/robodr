@@ -16,7 +16,7 @@
     "dir": "/var/lib/robodr/blackbox/agentd",
     "key_file": "/run/credentials/robodr-agentd.service/blackbox.key"
   },
-  "spool": { "dir": "/var/lib/robodr/spool/agentd" },
+  "spool": { "dir": "/var/lib/robodr/spool/agentd", "status_socket": "/run/robodr-agentd/status.sock" },
   "context": { "safety_state": "unknown", "control": "autonomous" },
   "firewall": {
     "joint_config": "/etc/robodr/firewall.json",

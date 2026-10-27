@@ -8,7 +8,7 @@
 # robodr.control-plane.md, docs/OPERATIONS.md section 6.4
 # "Control-plane API"):
 #   * its persistent state (request journal, replay store, evidence
-#     exports) in control_plane.state_dir, created 0700 robodr:robodr by
+#     exports) in control_plane.state_dir, created 0700 robodr-agentd:robodr by
 #     packaging/tmpfiles.d/robodr.conf:
 #       "state_dir": "/var/lib/robodr/control-plane/agentd"
 #   * the robot's TLS server key, handed over like the black-box key:

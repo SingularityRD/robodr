@@ -482,6 +482,10 @@ struct Daemon<'a> {
     capture_health: SharedHealth,
     rx: Receiver<Msg>,
     stop_inputs: Arc<AtomicBool>,
+    /// The latest status (the bytes of `status.json`), served on
+    /// `spool.status_socket`.
+    status_snapshot: Arc<std::sync::Mutex<Arc<Vec<u8>>>>,
+    status_server: Option<std::thread::JoinHandle<()>>,
     budget: Arc<QueueBudget>,
     /// Every sender of the queue is gone (all input threads exited).
     inputs_gone: bool,
@@ -998,7 +1002,7 @@ impl<'a> Daemon<'a> {
         }
         let feed = r.safety_feed.clone().map(SafetyFeed::new);
         if let Some(sock) = r.safety_feed.as_ref().and_then(|f| f.socket.as_ref()) {
-            let l = input::bind_event_socket(&sock.path).map_err(|e| {
+            let l = input::bind_socket(&sock.path, sock.mode, sock.group).map_err(|e| {
                 DaemonError::Io(format!("safety socket {}: {e}", sock.path.display()))
             })?;
             let input_feed = add(
@@ -1007,10 +1011,20 @@ impl<'a> Daemon<'a> {
                 true,
             );
             let (stop, max) = (stop_inputs.clone(), sock.max_connections);
+            // Review H1: only root, this daemon's uid and the configured
+            // feeders may report a safety state (never another service).
+            let policy = sock.peer_policy(crate::config::effective_uid());
             spawns.push((
                 input_feed,
                 Box::new(move |f| {
-                    input::run_unix_listener_with(l, max, stop, f, input::parse_safety_line)
+                    input::run_unix_listener_peers(
+                        l,
+                        max,
+                        stop,
+                        f,
+                        input::parse_safety_line,
+                        Some(policy),
+                    )
                 }),
             ));
         }
@@ -1038,11 +1052,28 @@ impl<'a> Daemon<'a> {
                         stop,
                         f,
                         crate::host::parse_host_line,
-                        Some(allowed),
+                        Some(input::PeerPolicy::uids(allowed)),
                     )
                 }),
             ));
         }
+        // The status socket (review H1): the robot's safety state, from this
+        // process alone, for robodr-deliverd (which checks SO_PEERCRED).
+        let status_snapshot: Arc<std::sync::Mutex<Arc<Vec<u8>>>> = Arc::default();
+        let status_server = match &cfg.spool.status_socket {
+            None => None,
+            Some(p) => {
+                let l = input::bind_event_socket(p)
+                    .map_err(|e| DaemonError::Io(format!("status socket {}: {e}", p.display())))?;
+                let (stop, snap) = (stop_inputs.clone(), status_snapshot.clone());
+                Some(
+                    std::thread::Builder::new()
+                        .name("agentd-status".into())
+                        .spawn(move || serve_status(l, stop, snap))
+                        .map_err(|e| DaemonError::Io(format!("spawning status thread: {e}")))?,
+                )
+            }
+        };
         drop(tx);
         for (i, (feed, body)) in spawns.into_iter().enumerate() {
             let h = std::thread::Builder::new()
@@ -1101,6 +1132,8 @@ impl<'a> Daemon<'a> {
                 .as_ref()
                 .filter(|c| matches!(c.input, CaptureInput::Replay { .. }))
                 .map(|_| ReplayTimeline::default()),
+            status_snapshot,
+            status_server,
         };
         #[derive(Serialize)]
         struct StartNote<'b> {
@@ -2275,7 +2308,13 @@ impl<'a> Daemon<'a> {
         };
         let res = serde_json::to_vec_pretty(&status)
             .map_err(std::io::Error::other)
-            .and_then(|b| self.spool.write_side_file(STATUS_FILE, &b));
+            .and_then(|b| {
+                let b = Arc::new(b);
+                if let Ok(mut g) = self.status_snapshot.lock() {
+                    *g = b.clone();
+                }
+                self.spool.write_side_file(STATUS_FILE, &b)
+            });
         if let Err(e) = res {
             let _ = writeln!(self.log, "robodr-agentd: writing status: {e}");
         }
@@ -2336,6 +2375,9 @@ impl<'a> Daemon<'a> {
             cp.shutdown();
         }
         self.stop_inputs.store(true, Ordering::SeqCst);
+        if let Some(h) = self.status_server.take() {
+            let _ = h.join();
+        }
         // Join inputs that poll the stop flag (bounded by their timeouts);
         // stdin may block forever and is left behind.
         for i in &mut self.inputs {
@@ -2616,6 +2658,78 @@ impl robodr_executor::evidence::EvidenceSink for EvidenceSink<'_, '_> {
                 sanitize(reference)
             ))
         }
+    }
+}
+
+/// Serve the latest status on the status socket (`spool.status_socket`,
+/// review H1): every connection gets the current `status.json` bytes and
+/// is closed; nothing is read from it. A connection that does not take the
+/// bytes within a second is dropped. Until the first status is written a
+/// connection is closed empty (the reader treats that as `unknown`).
+/// Removes the socket file on exit, if it is still the one bound here.
+fn serve_status(
+    sock: input::EventSocket,
+    stop: Arc<AtomicBool>,
+    snapshot: Arc<std::sync::Mutex<Arc<Vec<u8>>>>,
+) {
+    while !stop.load(Ordering::Relaxed) {
+        match sock.listener.accept() {
+            Ok((mut conn, _)) => {
+                let bytes = snapshot.lock().map(|g| g.clone()).unwrap_or_default();
+                if conn.set_nonblocking(false).is_ok()
+                    && conn.set_write_timeout(Some(Duration::from_secs(1))).is_ok()
+                {
+                    let _ = conn.write_all(&bytes);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
+    sock.remove_if_ours();
+}
+
+#[cfg(test)]
+mod status_socket_tests {
+    use super::*;
+    use std::io::Read;
+
+    /// Review H1: the status socket serves the latest status bytes, from
+    /// this process (the reader checks SO_PEERCRED), empty before the
+    /// first status.
+    #[test]
+    fn serves_the_latest_status() {
+        let d = std::env::temp_dir().join(format!("agentd-status-sock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let path = d.join("status.sock");
+        let l = input::bind_event_socket(&path).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let snap: Arc<std::sync::Mutex<Arc<Vec<u8>>>> = Arc::default();
+        let h = {
+            let (stop, snap) = (stop.clone(), snap.clone());
+            std::thread::spawn(move || serve_status(l, stop, snap))
+        };
+        let read = || {
+            let mut c = std::os::unix::net::UnixStream::connect(&path).unwrap();
+            assert_eq!(
+                crate::host::peer_uid(&c).unwrap(),
+                crate::config::effective_uid()
+            );
+            let mut b = Vec::new();
+            c.read_to_end(&mut b).unwrap();
+            b
+        };
+        assert!(read().is_empty());
+        *snap.lock().unwrap() = Arc::new(b"{\"running\":true}".to_vec());
+        assert_eq!(read(), b"{\"running\":true}");
+        stop.store(true, Ordering::SeqCst);
+        h.join().unwrap();
+        assert!(!path.exists(), "the socket is removed at stop");
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }
 

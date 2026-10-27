@@ -24,7 +24,7 @@
     "dir": "/var/lib/robodr/blackbox/agentd",
     "key_file": "/run/credentials/robodr-agentd.service/blackbox.key"
   },
-  "spool": { "dir": "/var/lib/robodr/spool/agentd" },
+  "spool": { "dir": "/var/lib/robodr/spool/agentd", "status_socket": "/run/robodr-agentd/status.sock" },
   "context": { "safety_state": "unknown", "control": "teleop" },
   "correlation": { "enabled": true, "include_default_rules": true },
   "daemon": { "tick_ms": 1000, "heartbeat_ms": 10000, "silence_ms": 30000 }
