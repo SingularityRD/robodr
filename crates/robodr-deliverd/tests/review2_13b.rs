@@ -1,5 +1,5 @@
 //! Regressions from the second independent review of Sprint 13b
-//! (`13b-review2`, findings H-A, M-A, M-B, L-A, L-B, L-E, L-F and the Info
+//! (`13b-review2`, findings H-A, M-A, M-B, L-A, L-B, L-F and the Info
 //! items I-B and rules uniqueness). Each test reproduces the finding; every
 //! one of them failed on the code before its fix (the commit messages
 //! record the runs).
@@ -11,9 +11,12 @@
 mod common;
 
 use common::*;
+use robodr_deliverd::runner::{self, Limits, ProbeLimits, RunAs};
+use robodr_pkg::rpk::Kind;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 // ------------------------------------------------------------------ H-A --
 
@@ -448,4 +451,155 @@ fn lb_reanchor_takes_the_black_box_key_file() {
         String::from_utf8_lossy(&o.stderr)
     );
     assert!(u.cfg.anchor_path().exists());
+}
+
+// ------------------------------------------------------------------ L-F --
+
+/// L-F. The probe reaper gave up after 64 rounds. A chain deeper than
+/// that (each process the parent of the next; the reaper sees one level
+/// per round, as each kill re-parents the next) outlived it as a child of
+/// the agent, running as the probe user.
+#[test]
+fn lf_a_deep_chain_of_leftovers_does_not_outlive_the_reaper() {
+    if !robodr_deliverd::users::is_root() {
+        if std::env::var("ROBODR_REQUIRE_DPKG_TEST").is_ok_and(|v| v == "1") {
+            panic!("lf_reaper: needs root");
+        }
+        eprintln!("SKIPPED lf_reaper: needs root");
+        return;
+    }
+    let t = Tmp::new("lf");
+    std::fs::set_permissions(t.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    let chain = t.path().join("chain.sh");
+    let done = t.path().join("done");
+    std::fs::write(
+        &chain,
+        format!(
+            "#!/bin/sh\nn=$1\nif [ \"$n\" -gt 0 ]; then\n  \"$0\" $((n - 1)) </dev/null >/dev/null 2>&1 &\nelse\n  : > {}\nfi\nexec sleep 60\n",
+            done.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&chain, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let probe = format!(
+        "setsid {} 100 </dev/null >/dev/null 2>&1 &\nwhile [ ! -e {} ]; do sleep 0.05; done\nexit 0\n",
+        chain.display(),
+        done.display()
+    );
+    let r = runner::run_probe(
+        &["/bin/sh".to_string(), "-c".to_string(), probe],
+        RunAs {
+            uid: 65_534,
+            gid: 65_534,
+        },
+        Limits {
+            timeout: Duration::from_secs(60),
+            max_output: 4096,
+        },
+        ProbeLimits {
+            processes: 512,
+            ..ProbeLimits::default()
+        },
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    let marker = chain.to_string_lossy().into_owned();
+    let mut left = Vec::new();
+    for e in std::fs::read_dir("/proc").unwrap().flatten() {
+        let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        let Ok(st) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            continue;
+        };
+        let field = |k: &str| {
+            st.lines()
+                .find_map(|l| l.strip_prefix(k))
+                .map(|v| v.split_whitespace().next().unwrap_or("").to_string())
+                .unwrap_or_default()
+        };
+        if field("Uid:") != "65534" || field("State:") == "Z" {
+            continue;
+        }
+        let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        let cmd = String::from_utf8_lossy(&cmd).into_owned();
+        // A node of the chain: the script, or the sleep it became.
+        if cmd.contains(&marker) || cmd == "sleep\u{0}60\u{0}" {
+            left.push(pid);
+        }
+    }
+    // Do not leak them into the other tests.
+    for pid in &left {
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    }
+    assert!(r.left_processes, "{r:?}");
+    assert!(!r.success());
+    assert!(
+        left.is_empty(),
+        "{} processes of the chain survived the reaper: {left:?}",
+        left.len()
+    );
+}
+
+// ----------------------------------------------------------- I-B, rules --
+
+/// I-B. `pack_digest` hashed every byte of every file before the import
+/// judged the pack (a huge file stalled each pass). It now caps a file at
+/// the largest member a pack can have and falls back to the tree stamp.
+#[test]
+fn ib_pack_digest_caps_the_bytes_it_hashes() {
+    let t = Tmp::new("ib");
+    let pack = t.path().join("pack");
+    std::fs::create_dir_all(&pack).unwrap();
+    std::fs::write(pack.join("deployment.json"), b"{}").unwrap();
+    assert!(robodr_deliverd::media::pack_digest(&pack).is_some());
+    let f = std::fs::File::create(pack.join("huge")).unwrap();
+    // Larger than any member of a valid pack (64 MiB, the SBOM cap).
+    f.set_len(65 * 1024 * 1024).unwrap();
+    drop(f);
+    assert_eq!(robodr_deliverd::media::pack_digest(&pack), None);
+}
+
+const RULE_X: &str = r#"[[rules]]
+name = "robodr-shared-name"
+type = "Exec"
+condition = 'payload.filename ENDS_WITH "/nc"'
+category = "execution"
+severity = "medium"
+description = "delivered test rule"
+"#;
+
+/// Rule names must be unique across **all** installed rules packages,
+/// not only within one (Pulsar would refuse the reload, or shadow one
+/// detection with the other).
+#[test]
+fn a_rule_name_used_by_another_installed_rules_package_is_refused() {
+    let u = Unit::new("rules-x");
+    let a = u.rpk(
+        &spec("rules-a", 1, Kind::RobodrRules),
+        &[("robodr/a.toml", RULE_X.as_bytes())],
+    );
+    let b1 = u.bundle(1, None, std::slice::from_ref(&a));
+    u.pack("p1", 1, &[a], std::slice::from_ref(&b1));
+    let mut e = u.open();
+    let reps = u.run(&mut e, 4);
+    assert!(
+        reps.iter().any(|r| r.installed == vec!["rules-a 1".to_string()]),
+        "{reps:?}"
+    );
+    let b = u.rpk(
+        &spec("rules-b", 1, Kind::RobodrRules),
+        &[("robodr/b.toml", RULE_X.as_bytes())],
+    );
+    let b2 = u.bundle(2, Some(bundle_hash(&b1)), std::slice::from_ref(&b));
+    u.pack("p2", 2, &[b], &[b2]);
+    let reps = u.run(&mut e, 4);
+    assert!(
+        reps.iter().all(|r| r.installed.is_empty()),
+        "a duplicate rule name across packages was installed: {reps:?}"
+    );
+    assert!(
+        reps.iter()
+            .any(|r| r.refused.iter().any(|x| x.contains("rules-a"))),
+        "{reps:?}"
+    );
 }

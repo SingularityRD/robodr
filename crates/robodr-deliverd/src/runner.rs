@@ -31,7 +31,8 @@
 //!   such process (child of this process, running as the probe's UID, not
 //!   a run in progress; found through this process's own `children`
 //!   lists, which `ProtectProc=invisible` does not hide) is killed and
-//!   reaped, repeatedly until none is left, and the probe fails
+//!   reaped, together with their process groups, until none is left or
+//!   [`REAP_DEADLINE`] passes (review L-F), and the probe fails
 //!   (`left_processes`). They can be told apart
 //!   safely: a process cannot change its UID without privileges (and the
 //!   unit sets `NoNewPrivileges=`), and a child's pid cannot be reused
@@ -181,6 +182,7 @@ extern "C" {
     fn prctl(option: i32, ...) -> i32;
     fn setrlimit(resource: i32, rlim: *const RLimit) -> i32;
     fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+    fn getpgid(pid: i32) -> i32;
 }
 
 /// Children of this process spawned by [`run`] and not yet reaped (never
@@ -294,41 +296,66 @@ fn leftovers(uid: u32) -> Vec<(i32, bool)> {
     out
 }
 
-/// Kill and reap everything a probe running as `uid` left behind; the
-/// number of live processes killed.
+/// How long the reaper keeps killing a probe's leftovers before it gives
+/// up (review L-F); the probe has failed by then either way.
+pub const REAP_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Kill and reap everything a probe running as `uid` left behind, until
+/// none is left or [`REAP_DEADLINE`] passes (review L-F: a fixed number of
+/// rounds let a deep tree or a fork-and-exit chain outlast it). Each round
+/// signals every leftover **and its process group**: the members of a
+/// tree or chain share a group (unless each one calls `setsid`), so one
+/// signal reaches those not yet re-parented here too; then every leftover
+/// is reaped without waiting on any one of them. Returns the number of
+/// live processes killed and whether none is left.
 // FFI: std can signal and wait only for the `Child` it spawned.
 #[allow(unsafe_code)]
-fn reap_leftovers(uid: u32) -> usize {
+fn reap_leftovers(uid: u32) -> (usize, bool) {
+    let deadline = Instant::now() + REAP_DEADLINE;
+    // SAFETY: getpgid(0) takes an integer and returns this process's
+    // process group; no memory is passed.
+    let own_group = unsafe { getpgid(0) };
     let mut killed = 0;
-    for _ in 0..64 {
+    loop {
         let l = leftovers(uid);
         if l.is_empty() {
-            break;
+            return (killed, true);
         }
+        if Instant::now() >= deadline {
+            return (killed, false);
+        }
+        let live = lock(&LIVE).clone();
         for (pid, zombie) in &l {
-            if !zombie && *pid > 1 {
-                // SAFETY: integers only. `pid` is a child of this process
-                // that is not reaped yet, so the pid cannot have been
-                // reused by an unrelated process.
-                unsafe {
-                    kill(*pid, SIGKILL);
-                }
-                killed += 1;
+            if *zombie || *pid <= 1 {
+                continue;
             }
+            // SAFETY: integers only. `pid` is a child of this process that
+            // is not reaped yet, so neither it nor its process group (of
+            // which it is a member) can have been reused by an unrelated
+            // process. The group is never this process's own, nor that of
+            // a run in progress (a dpkg run is a group of its own in this
+            // session, which a leftover could have joined).
+            unsafe {
+                let g = getpgid(*pid);
+                if g > 1
+                    && g != own_group
+                    && u32::try_from(g).is_ok_and(|g| !live.contains(&g))
+                {
+                    kill(-g, SIGKILL);
+                }
+                kill(*pid, SIGKILL);
+            }
+            killed += 1;
         }
         for (pid, _) in &l {
-            for _ in 0..500 {
-                let mut st: i32 = 0;
-                // SAFETY: `st` is a valid, writable i32 for the call.
-                let r = unsafe { waitpid(*pid, &mut st, WNOHANG) };
-                if r != 0 {
-                    break; // reaped (r == pid) or not our child (-1)
-                }
-                std::thread::sleep(Duration::from_millis(2));
+            let mut st: i32 = 0;
+            // SAFETY: `st` is a valid, writable i32 for the call.
+            unsafe {
+                waitpid(*pid, &mut st, WNOHANG);
             }
         }
+        std::thread::sleep(Duration::from_millis(1));
     }
-    killed
 }
 
 /// `SIGKILL` the process group `pgid` (`kill(-pgid, SIGKILL)`).
@@ -477,7 +504,8 @@ fn run_inner(argv: &[String], user: Option<(RunAs, ProbeLimits)>, limits: Limits
     // A probe's leftovers, wherever they went (own session, no pipes):
     // re-parented here by the subreaper, killed and reaped.
     if let Some((u, _)) = user {
-        if reap_leftovers(u.uid) > 0 {
+        let (killed, gone) = reap_leftovers(u.uid);
+        if killed > 0 || !gone {
             res.left_processes = true;
         }
     }

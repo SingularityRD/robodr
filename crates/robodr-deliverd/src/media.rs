@@ -276,24 +276,51 @@ pub fn pack_stamp(pack: &Path) -> Option<String> {
     Some(robodr_blackbox::crypto::to_hex(&h.finalize()))
 }
 
+/// Largest file [`pack_digest`] hashes: the largest member a valid pack
+/// can have (an SBOM, `robodr_pkg::rpk::MAX_SBOM_BYTES`; chunks are 4 MiB,
+/// bundle manifests at most 32 MiB). A pack with a larger file is keyed
+/// by its tree stamp instead (the import refuses it anyway).
+pub const MAX_PACK_FILE_BYTES: u64 = robodr_pkg::rpk::MAX_SBOM_BYTES;
+/// Most bytes [`pack_digest`] hashes over a whole pack.
+pub const MAX_PACK_DIGEST_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
 /// The **content** digest of a pack (review L4): SHA-256 over every
 /// entry's relative path and type, and the SHA-256 of each regular file's
 /// bytes (a symlink's target for a symlink). The agent remembers packs it
 /// has handled by this digest, not by their directory name, so a
 /// corrected pack copied under the same name is judged again, and the
-/// same pack under another name is not reported twice. `None`: unreadable
-/// or beyond the walk's bounds.
+/// same pack under another name is not reported twice. `None`: unreadable,
+/// beyond the walk's bounds, or changed while it was read.
+///
+/// It runs before the import judges the pack (review I-B), so it never
+/// follows a symlink (`O_NOFOLLOW`; the opened file must be the inode the
+/// walk saw), never blocks on a FIFO (`O_NONBLOCK`), and hashes at most
+/// [`MAX_PACK_FILE_BYTES`] per file and [`MAX_PACK_DIGEST_BYTES`] in all.
 pub fn pack_digest(pack: &Path) -> Option<String> {
     use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
     let mut h = robodr_blackbox::crypto::Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
+    let mut total: u64 = 0;
     for (rel, md) in walk(pack)? {
         h.update(format!("{rel}\0{}\0", kind_of(&md)).as_bytes());
         let p = pack.join(&rel);
         if md.file_type().is_file() {
-            let mut f = fs::File::open(&p).ok()?;
+            if md.len() > MAX_PACK_FILE_BYTES {
+                return None;
+            }
+            total = total.saturating_add(md.len());
+            if total > MAX_PACK_DIGEST_BYTES {
+                return None;
+            }
+            let f = crate::fdio::open_read(&p).ok()?;
+            let fm = f.metadata().ok()?;
+            if !fm.file_type().is_file() || fm.dev() != md.dev() || fm.ino() != md.ino() {
+                return None;
+            }
             let mut fh = robodr_blackbox::crypto::Sha256::new();
             let mut n: u64 = 0;
+            let mut f = f.take(md.len().saturating_add(1));
             loop {
                 match f.read(&mut buf) {
                     Ok(0) => break,
@@ -304,6 +331,9 @@ pub fn pack_digest(pack: &Path) -> Option<String> {
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(_) => return None,
                 }
+            }
+            if n != md.len() {
+                return None;
             }
             h.update(format!("{n}\0").as_bytes());
             h.update(&fh.finalize());

@@ -10,7 +10,9 @@
 //!   `description`), no other key;
 //! * `category` is a Pulsar `Category`, `severity` a Pulsar `Severity`,
 //!   `type` a `PayloadDiscriminant`;
-//! * names are unique across the package.
+//! * names are unique across the package **and** across every other
+//!   installed rules package (`install`, the active versions below
+//!   `rules_active`).
 //!
 //! The condition DSL and its type checking (steps 4–5) are not
 //! re-implemented here: the release side runs `validate_rules.py` before

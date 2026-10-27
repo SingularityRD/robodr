@@ -268,6 +268,19 @@ impl Installer<'_> {
                 .map_err(|e| PrepError::Refused(e.to_string()))?;
             crate::rules::check_file(&f.path, &b, &mut names).map_err(PrepError::Refused)?;
         }
+        // Rule names are unique across every installed rules package, not
+        // only within one: Pulsar would refuse the reload, or let one rule
+        // shadow another's detection.
+        let others = self.active_rule_names(&m.name)?;
+        if let Some((n, pkg)) = names
+            .iter()
+            .find_map(|n| others.get(n).map(|p| (n, p)))
+        {
+            return Err(PrepError::Refused(format!(
+                "rule name {:?} is already used by the installed rules package {pkg}",
+                robodr_pkg::common::trunc(n)
+            )));
+        }
         if let Some(v) = &self.cfg.install.rules_validator {
             let mut argv = v.clone();
             argv.push(dir.to_string_lossy().into_owned());
@@ -287,6 +300,67 @@ impl Installer<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Rule names of the active versions of every other rules package
+    /// (below `rules_active`), name -> package. Files that do not parse
+    /// are skipped (they passed this check when they were installed).
+    fn active_rule_names(
+        &self,
+        except: &str,
+    ) -> Result<std::collections::BTreeMap<String, String>, PrepError> {
+        fn files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+            let Ok(rd) = fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                if out.len() >= robodr_pkg::rpk::MAX_CONTENT_FILES {
+                    return;
+                }
+                let Ok(t) = e.file_type() else { continue };
+                if t.is_dir() && depth < 16 {
+                    files(&e.path(), depth + 1, out);
+                } else if t.is_file() {
+                    out.push(e.path());
+                }
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        let dir = &self.cfg.install.rules_active;
+        let rd = match fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(io(dir, e)),
+        };
+        for e in rd.flatten() {
+            let Some(pkg) = e.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if pkg == except || !robodr_pkg::common::is_pkg_name(&pkg) {
+                continue;
+            }
+            let vdir = match self.active_version(Kind::RobodrRules, &pkg) {
+                Ok(Some((serial, Some(d)))) => self.version_dir(Kind::RobodrRules, &pkg, serial, &d),
+                Ok(Some((serial, None))) => self
+                    .versions_root(Kind::RobodrRules)
+                    .join(&pkg)
+                    .join(serial.to_string()),
+                _ => continue,
+            };
+            let mut list = Vec::new();
+            files(&vdir, 0, &mut list);
+            for f in list {
+                let Ok(b) = robodr_release::fsio::read_capped(&f, crate::rules::MAX_RULE_FILE_BYTES)
+                else {
+                    continue;
+                };
+                let mut names = BTreeSet::new();
+                if crate::rules::check_file("installed", &b, &mut names).is_ok() {
+                    for n in names {
+                        out.entry(n).or_insert_with(|| pkg.clone());
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn dpkg_query_argv(&self, package: &str) -> Vec<String> {

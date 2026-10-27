@@ -143,6 +143,12 @@ pub fn open_dir_at(dir: &File, name: &str) -> io::Result<File> {
     )
 }
 
+/// Open the file at `path` for reading: its last component must not be a
+/// symlink, and a FIFO does not block the open.
+pub fn open_read(path: &Path) -> io::Result<File> {
+    open_raw(AT_FDCWD, &cpath(path)?, O_RDONLY | O_NOFOLLOW | O_NONBLOCK, 0)
+}
+
 /// Open the file `name` inside `dir` for reading (not a symlink; a FIFO
 /// does not block the open).
 pub fn open_read_at(dir: &File, name: &str) -> io::Result<File> {
