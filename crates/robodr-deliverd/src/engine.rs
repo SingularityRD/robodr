@@ -1069,6 +1069,36 @@ impl Engine {
                 }
             }
         }
+        // Relations (review H-A): `Conflicts`, `Breaks`, `Replaces` and
+        // `Provides` may name only the RPK's own package. One naming another
+        // package lets `dpkg --install` take over that package's files or
+        // remove it (a floored package, another programme's package) while
+        // the state still records it. The one exception is RoboDR's own
+        // pair (`robodr` <-> `robodr-focal`), and only for a RoboDR package
+        // from the designated programme (checked below).
+        let own_robodr = crate::install::ROBODR_PACKAGES.contains(&d.package.as_str());
+        let foreign: Vec<&str> = d
+            .relations
+            .iter()
+            .map(String::as_str)
+            .filter(|r| {
+                *r != d.package
+                    && !(own_robodr && crate::install::ROBODR_PACKAGES.contains(r))
+            })
+            .collect();
+        if !foreign.is_empty() {
+            return Some(format!(
+                "the .deb conflicts with, breaks, replaces or provides {}: a deb RPK may name only \
+                 its own package ({}) in these fields",
+                foreign
+                    .iter()
+                    .take(8)
+                    .map(|r| robodr_pkg::common::trunc(r))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                d.package
+            ));
+        }
         // RoboDR's own packages: only from the designated programme.
         let touched: Vec<&str> = crate::install::ROBODR_PACKAGES
             .iter()
@@ -1090,6 +1120,96 @@ impl Engine {
             }
         }
         None
+    }
+
+    /// Recorded deb packages other than `name` that dpkg no longer has
+    /// installed at their recorded version (review H-A): `(RPK name,
+    /// package, recorded version, what dpkg says)`. When `to` is one of
+    /// RoboDR's own packages, the other one it may replace is not checked.
+    fn deb_damage(&self, name: &str, to: &Ver) -> Vec<(String, String, String, String)> {
+        let robodr = crate::install::ROBODR_PACKAGES;
+        let skip: Vec<&str> = to
+            .deb
+            .iter()
+            .filter(|d| robodr.contains(&d.package.as_str()))
+            .flat_map(|d| d.relations.iter().map(String::as_str))
+            .filter(|r| robodr.contains(r))
+            .collect();
+        let mut out = Vec::new();
+        for (n, i) in &self.state.installed {
+            let Some(d) = &i.ver.deb else { continue };
+            if n == name || d.package == name || skip.contains(&d.package.as_str()) {
+                continue;
+            }
+            match self.installer().deb_state(&d.package) {
+                Some((st, v)) if st == "installed" && v == d.version => {}
+                seen => out.push((
+                    n.clone(),
+                    d.package.clone(),
+                    d.version.clone(),
+                    seen.map_or_else(|| "unknown to dpkg".to_string(), |(st, v)| format!("{st} {v}")),
+                )),
+            }
+        }
+        out
+    }
+
+    /// Reinstall the recorded version of every damaged package
+    /// ([`Self::deb_damage`]); those that could not be restored are marked
+    /// unhealthy and raise `robot.deliver.rollback_blocked_floor`
+    /// (Critical). Returns them.
+    fn restore_debs(
+        &mut self,
+        damage: &[(String, String, String, String)],
+        safety: SafetyState,
+    ) -> R<Vec<String>> {
+        let mut failed = Vec::new();
+        for (n, pkg, version, seen) in damage {
+            let Some(i) = self.state.installed.get(n).cloned() else {
+                continue;
+            };
+            let res = self.store.manifest(&i.ver.digest).and_then(|m| {
+                let mut v = i.ver.clone();
+                if !self.prepared(n, &v) {
+                    self.installer()
+                        .prepare(&m, &mut v)
+                        .map_err(|e| e.to_string())?;
+                }
+                self.installer().activate(n, &v, &m)
+            });
+            let ok = res.is_ok()
+                && self
+                    .installer()
+                    .deb_state(pkg)
+                    .is_some_and(|(st, v)| st == "installed" && v == *version);
+            let ev = self.journal.note(
+                kinds::ROLLBACK,
+                json!({"name": n, "phase": "restore", "package": pkg, "version": version,
+                       "observed": seen, "restored": ok,
+                       "error": res.as_ref().err()}),
+            )?;
+            if ok {
+                continue;
+            }
+            failed.push(format!("{pkg} {version}"));
+            if let Some(x) = self.state.installed.get_mut(n) {
+                x.healthy = false;
+            }
+            self.save()?;
+            self.finding_in(
+                rules::ROLLBACK_BLOCKED_FLOOR,
+                Severity::Critical,
+                format!(
+                    "{n} {}: dpkg changed it during another package's install ({seen}) and it \
+                     could not be restored{}",
+                    i.ver.serial,
+                    res.err().map(|e| format!(": {e}")).unwrap_or_default()
+                ),
+                Some(ev),
+                safety,
+            );
+        }
+        Ok(failed)
     }
 
     fn prepared(&self, name: &str, v: &Ver) -> bool {
@@ -1173,6 +1293,39 @@ impl Engine {
         safety: SafetyState,
         rep: &mut TickReport,
     ) -> R<()> {
+        // Review H-A: a `dpkg --install` must leave every other deb package
+        // the state records installed at its recorded version. One it
+        // changed anyway is restored, and the switch counts as failed.
+        if txn.to.kind == robodr_pkg::rpk::Kind::Deb {
+            let damage = self.deb_damage(&txn.name, &txn.to);
+            if !damage.is_empty() {
+                let what = describe_damage(&damage);
+                let seen = safety::observe(&self.cfg.safety);
+                if !seen.allows_install() {
+                    // Still in phase `health`: judged (and restored) again
+                    // at the next pass.
+                    rep.deferred = Some(format!(
+                        "restoring {what}: safety_state:{}",
+                        state_name(seen.state)
+                    ));
+                    return Ok(());
+                }
+                let not_restored = self.restore_debs(&damage, seen.state)?;
+                self.journal.note(
+                    kinds::REFUSED,
+                    json!({"stage": "switch", "name": txn.name, "serial": txn.to.serial,
+                           "code": "collateral",
+                           "detail": format!("dpkg --install changed other recorded packages: {what}"),
+                           "not_restored": not_restored}),
+                )?;
+                return self.failed(
+                    txn,
+                    format!("dpkg --install changed other recorded packages: {what}"),
+                    safety,
+                    rep,
+                );
+            }
+        }
         let report = health::run(&self.cfg, &m.health, &txn.to);
         let ev = self.journal.note(
             kinds::HEALTH,
@@ -1409,6 +1562,23 @@ impl Engine {
         if let Err(e) = self.installer().activate(&txn.name, &v, &m) {
             return self.rollback_failed(txn, e, rep);
         }
+        if v.kind == robodr_pkg::rpk::Kind::Deb {
+            let damage = self.deb_damage(&txn.name, &v);
+            if !damage.is_empty() {
+                let what = describe_damage(&damage);
+                let not_restored = self.restore_debs(&damage, seen.state)?;
+                if !not_restored.is_empty() {
+                    return self.rollback_failed(
+                        txn,
+                        format!(
+                            "the rollback changed other recorded packages ({what}); not restored: {}",
+                            not_restored.join("; ")
+                        ),
+                        rep,
+                    );
+                }
+            }
+        }
         fault::hit("after_rollback_switch")?;
         let report = health::run(&self.cfg, &m.health, &v);
         self.state.installed.insert(
@@ -1606,6 +1776,14 @@ impl Engine {
         }
         Ok(())
     }
+}
+
+/// `"<package> <recorded version> -> <what dpkg says>"`, joined.
+fn describe_damage(d: &[(String, String, String, String)]) -> String {
+    d.iter()
+        .map(|(_, p, v, seen)| format!("{p} {v} -> {seen}"))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Where `robodr-deliverd confirm` drops an operator confirmation for

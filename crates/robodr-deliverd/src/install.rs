@@ -469,6 +469,18 @@ impl Installer<'_> {
             .ok_or_else(|| PrepError::Refused(format!("dpkg-deb: bad {field} field")))
     }
 
+    /// dpkg's status (`installed`, `not-installed`, `half-configured`, ...)
+    /// and version of `package` (`dpkg-query`). `None`: dpkg does not know
+    /// the package, or the query failed.
+    pub fn deb_state(&self, package: &str) -> Option<(String, String)> {
+        let r = self.tool(&self.dpkg_query_argv(package), 60);
+        if !r.success() {
+            return None;
+        }
+        let (status, version) = r.output.trim().split_once('\t')?;
+        Some((status.to_string(), version.to_string()))
+    }
+
     /// `a` is an earlier dpkg version than `b` (`dpkg --compare-versions`).
     pub fn deb_version_lt(&self, a: &str, b: &str) -> Result<bool, String> {
         let r = self.tool(
@@ -620,12 +632,7 @@ impl Installer<'_> {
         else {
             return Ok(None);
         };
-        let r = self.tool(&self.dpkg_query_argv(&pkg), 60);
-        if !r.success() {
-            return Ok(None);
-        }
-        let out = r.output.trim();
-        let Some((status, version)) = out.split_once('\t') else {
+        let Some((status, version)) = self.deb_state(&pkg) else {
             return Ok(None);
         };
         if status != "installed" {

@@ -20,7 +20,7 @@ mod common;
 
 use common::*;
 use robodr_deliverd::runner::{self, Limits, RunAs};
-use robodr_pkg::rpk::{Arch, HealthCheck, Kind};
+use robodr_pkg::rpk::Arch;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -190,101 +190,6 @@ fn h1_a_forged_idle_status_written_by_another_robodr_service_is_unknown() {
 
 // ------------------------------------------------------------------- H2 --
 
-fn have(tool: &str) -> bool {
-    Command::new("sh")
-        .args(["-c", &format!("command -v {tool}")])
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
-
-fn dpkg_ok(test: &str) -> bool {
-    let ok = robodr_deliverd::users::is_root() && have("dpkg") && have("dpkg-deb");
-    if !ok {
-        if std::env::var("ROBODR_REQUIRE_DPKG_TEST").is_ok_and(|v| v == "1") {
-            panic!("{test}: needs root and dpkg (ROBODR_REQUIRE_DPKG_TEST=1)");
-        }
-        eprintln!("SKIPPED {test}: needs root and dpkg");
-    }
-    ok
-}
-
-fn dpkg_root(u: &Unit) -> PathBuf {
-    let root = u.cfg.install.dpkg_root.clone().unwrap();
-    for d in [
-        "var/lib/dpkg/info",
-        "var/lib/dpkg/updates",
-        "var/lib/dpkg/triggers",
-    ] {
-        std::fs::create_dir_all(root.join(d)).unwrap();
-    }
-    std::fs::write(root.join("var/lib/dpkg/status"), "").unwrap();
-    std::fs::write(root.join("var/lib/dpkg/available"), "").unwrap();
-    root
-}
-
-/// A stub `.deb` of dpkg package `package` (`usr/lib/<package>/ok`).
-fn deb_of(u: &Unit, package: &str, version: &str, arch: &str, extra: &str) -> Vec<u8> {
-    let st = u.work.join(format!("st-{package}-{version}-{arch}"));
-    let _ = std::fs::remove_dir_all(&st);
-    std::fs::create_dir_all(st.join("DEBIAN")).unwrap();
-    std::fs::create_dir_all(st.join(format!("usr/lib/{package}"))).unwrap();
-    std::fs::write(
-        st.join("DEBIAN/control"),
-        format!(
-            "Package: {package}\nVersion: {version}\nArchitecture: {arch}\n{extra}\
-             Maintainer: RoboDR tests <tests@invalid>\nDescription: stub\n"
-        ),
-    )
-    .unwrap();
-    std::fs::write(st.join(format!("usr/lib/{package}/ok")), version).unwrap();
-    let out = u.work.join(format!("{package}_{version}_{arch}.deb"));
-    let o = Command::new("dpkg-deb")
-        .args(["--root-owner-group", "-Zxz", "--build"])
-        .arg(&st)
-        .arg(&out)
-        .output()
-        .unwrap();
-    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    std::fs::read(&out).unwrap()
-}
-
-fn deb_spec(
-    u: &Unit,
-    name: &str,
-    serial: u64,
-    floor: u64,
-    checks: &str,
-) -> robodr_release::ops::RpkSpec {
-    let mut s = spec(name, serial, Kind::Deb);
-    s.sbom_path = Some("sbom.cdx.json".into());
-    s.security_floor = floor;
-    s.health = vec![HealthCheck::FilePresent {
-        path: format!(
-            "{}/usr/lib/{checks}/ok",
-            u.cfg.install.dpkg_root.as_ref().unwrap().display()
-        ),
-    }];
-    s
-}
-
-fn dpkg_version(u: &Unit, package: &str) -> String {
-    let o = Command::new("dpkg-query")
-        .arg(format!(
-            "--admindir={}",
-            u.cfg
-                .install
-                .dpkg_root
-                .as_ref()
-                .unwrap()
-                .join("var/lib/dpkg")
-                .display()
-        ))
-        .args(["-W", "-f", "${Version}", package])
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&o.stdout).into_owned()
-}
-
 /// H2. Floors are keyed on the RPK name, but `dpkg -i` acts on the
 /// `.deb`'s own `Package`. An RPK under another name carrying an older
 /// `.deb` of a floored package must not downgrade it.
@@ -396,49 +301,6 @@ fn h2_the_deb_architecture_must_be_the_rpks() {
 }
 
 // ------------------------------------------------------------------- M1 --
-
-/// Fill the delivery journal past its cyclic retention (16 x 1 MiB).
-fn flood_journal(u: &Unit) {
-    let mut j =
-        robodr_deliverd::journal::Journal::open(&u.cfg.blackbox.dir, UNIT, &u.cfg.blackbox.key)
-            .unwrap();
-    let pad = "x".repeat(60_000);
-    for i in 0..300 {
-        j.note("robodr.test.flood", serde_json::json!({"i": i, "pad": pad}))
-            .unwrap();
-    }
-    j.close().unwrap();
-    assert!(
-        robodr_deliverd::journal::Journal::recorded_floors(&u.cfg.blackbox.dir).is_empty(),
-        "the flood did not evict the floor notes"
-    );
-}
-
-fn remove_named(dir: &Path, prefix: &str) {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in rd.flatten() {
-        let p = e.path();
-        if e.file_type().unwrap().is_dir() {
-            remove_named(&p, prefix);
-        } else if e.file_name().to_string_lossy().starts_with(prefix) {
-            std::fs::remove_file(&p).unwrap();
-        }
-    }
-}
-
-fn installed_v5_floor_5(u: &Unit) -> (robodr_deliverd::Engine, PathBuf) {
-    let mut s = files_spec(u, "nav-stack", 5, true);
-    s.security_floor = 5;
-    let r5 = u.rpk(&s, &[("ok", b"v5")]);
-    let b1 = u.bundle(1, None, std::slice::from_ref(&r5));
-    u.pack("p1", 1, &[r5], std::slice::from_ref(&b1));
-    let mut e = u.open();
-    u.run(&mut e, 4);
-    assert_eq!(e.state().floor("nav-stack"), 5);
-    (e, b1)
-}
 
 /// M1. The black-box copy of the floors is cyclic: flooded with notes it
 /// forgets them. Floors, the deployment sequence and the time floor must
