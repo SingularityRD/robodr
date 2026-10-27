@@ -14,6 +14,7 @@ robodr-deliverd run          --config FILE      # the daemon (robodr-deliverd.se
 robodr-deliverd once         --config FILE      # one pass, JSON report
 robodr-deliverd check-config --config FILE
 robodr-deliverd init-anchor  --config FILE --trust TRUST.json   # once, at enrolment
+robodr-deliverd reanchor     --config FILE --trust TRUST.json   # lift the lock after a lost state
 robodr-deliverd status       --config FILE
 robodr-deliverd confirm      --config FILE --deployment DIGEST --package NAME
 robodr-safety-replay --socket PATH --file REPORTS.jsonl [--repeat-ms N] [--hold-ms N] [--check]
@@ -36,28 +37,44 @@ Exit codes: 0 ok, 1 refused or error, 2 usage. `man robodr-deliverd(8)`,
    than the accepted one; each bundle goes through
    `robodr_release::ops::import_bundle` (copy bounded by listed sizes,
    hash while copying, verify the copy). Only then is the copy renamed to
-   `packs/<seq>-<digest>`. A refused pack is reported once.
+   `packs/<seq>-<digest>`. A pack is remembered by its **content digest**
+   (not its directory name): a refused pack is reported once, a corrected
+   copy under the same name is judged again.
 2. **Item by item.** Each RPK the deployment names (by digest) must fit
    the unit (architecture, platform, hardware, kind, evaluable health
    checks, the unit's and the site's floors, revocations, `requires` /
    `conflicts`). It is copied into the content-addressed store (every
    chunk hashed as it is written) and **prepared** next to the running
-   version (files / config / rules: a version directory; deb: the `.deb`,
-   inspected with `dpkg-deb`, maintainer scripts refused unless the release
-   allowed them).
-3. **Gate.** The deployment's maintenance window, an operator
-   confirmation when the RPK requires one, and agentd's live safety state
-   (`status.json`, fresh, this boot, a live `safety_feed`): only `idle` and
-   `safe_state_active` let the switch happen, read again immediately before
-   it. Otherwise the item is deferred (staging stays; a note per change of
+   version (files / config / rules: a version directory named
+   `<serial>-<digest>`; deb: the `.deb`, inspected with `dpkg-deb`,
+   maintainer scripts refused unless the release allowed them). A serial
+   that is installed, kept as a rollback target or in a switch with other
+   content is refused (`equivocation`). For `deb` the RPK name and arch
+   **are** the dpkg `Package` and `Architecture` (or `all`); a package
+   another RPK name owns, a higher serial with a lower dpkg version and a
+   `.deb` that is or conflicts / breaks / replaces / provides RoboDR's own
+   packages (unless from `install.robodr_programme`) are refused.
+3. **Gate.** The deployment's maintenance window (judged on the system
+   clock only when it is trusted; with `trust.clock: untrusted` it stays
+   closed, there being no signed current time), an operator confirmation
+   when the RPK requires one, and agentd's live safety state, **from agentd
+   only**: its status socket (`SO_PEERCRED`: agentd's user
+   `robodr-agentd` or root) or a status file that only that user or root
+   can have written; fresh, this boot, a live `safety_feed`. Only `idle`
+   and `safe_state_active` let the switch happen, read again immediately
+   before it. Otherwise the item is deferred (staging stays; a note per change of
    reason; `robot.deliver.deferred_safety`, Low, Medium when repeated).
 4. **Intent, floor, switch.** The write-ahead intent and the raised floor
    are fsynced in the state file before the switch (`current` /
    `rules_active/<name>` symlink swap, or `dpkg --install`).
 5. **Health gate.** The RPK's checks (`service_active`, `file_present`,
-   `probe`: argv executed without a shell, as the probe user's UID with
-   supplementary groups dropped, fixed environment, own process group
-   killed on timeout, output bounded) plus agentd healthy.
+   `probe`: argv executed without a shell, as the probe user's UID (a
+   regular account, `1000..=59999` by default) with supplementary groups
+   dropped, fixed environment, rlimits (CPU, address space, open files,
+   processes), own process group killed on timeout, output bounded, and
+   this process a child subreaper while it runs, so anything it leaves
+   behind, even in a new session, is killed and fails it) plus agentd
+   healthy.
 6. **Install or roll back.** Pass: installed (`robot.deliver.installed`).
    Fail: back to the previous version if it is at or above the floor and
    still in the store (`robot.deliver.health_failed`, also gated by the
@@ -71,7 +88,9 @@ Exit codes: 0 ok, 1 refused or error, 2 usage. `man robodr-deliverd(8)`,
 
 Every step is a critical note (`robodr.deliver.*`) in the agent's own
 black-box chain (`/var/lib/robodr/blackbox/deliverd`, the unit's black-box
-key); findings go into agentd's spool with no-replace record names.
+key); findings go into agentd's spool with no-replace record names,
+written through directory descriptors (`O_TMPFILE` + `linkat`), never a
+path in the directory agentd's user owns.
 
 ## Crash safety
 
@@ -80,8 +99,12 @@ One switch per pass; the intent moves `activating` → `health` →
 active (`current` link, `dpkg-query`) and finishes or undoes the switch;
 `tests/crash.rs` crashes at every step of a good and a bad release and
 checks the state after the crash and after recovery. The state file is
-replaced atomically and never written with a lower floor; a missing or
-older state file takes the floors recorded in the black box.
+replaced atomically and never written with a lower floor. The floors,
+deployment sequence, time floor and chain heads are also in a signed
+high-water record (`<blackbox.dir>/highwater.json`, written first, never
+rotated): a missing or older state file is restored from it (and from
+the journal's floor notes); without it, after the unit had a history,
+the agent locks itself until `reanchor`.
 
 ## Modules
 
@@ -91,8 +114,10 @@ older state file takes the floors recorded in the black box.
 | `media` | media pack layout, verified-copy import, unit / ring / rollout / item checks, bundle chain heads per programme |
 | `store` | content-addressed store, hash-checked materialisation |
 | `install` | installers per kind (prepare, switch, active version) |
-| `safety` | agentd `status.json` → safety state (fresh, this boot, live feed) |
-| `health`, `runner`, `users` | health checks; bounded argv execution; probe users by UID |
+| `safety` | agentd's status, from agentd only (socket + `SO_PEERCRED`, or an owner-checked file) → safety state (fresh, this boot, live feed) |
+| `health`, `runner`, `users` | health checks; bounded argv execution (probes: rlimits, subreaper); probe users by UID |
+| `highwater` | the signed high-water record (floors, sequence, time floor, chain heads) |
+| `fdio` | `openat` / `linkat` / `unlinkat` relative to held directory descriptors |
 | `rules` | structural check of Pulsar rule files (what decides whether they load) |
 | `state`, `fault` | durable state, monotonic floors, write-ahead intent; crash points for tests |
 | `journal`, `findings` | black-box notes; `robot.deliver.*` findings into the agentd spool |
@@ -107,13 +132,19 @@ older state file takes the floors recorded in the black box.
   declaring one is refused before anything is installed.
 * No soak window and no attestation check in the health gate (§6.2):
   14a / Sprint 12.
-* Floors are in the state file and the black box, not a TPM NV counter
-  (14b): root can delete both.
+* Floors are in the state file, the signed high-water record and the
+  black box, not a TPM NV counter (14b): root can delete all of them (the
+  agent then locks until re-anchored).
 * Probe users come from the passwd file only (no NSS).
-* The safety state is agentd's `status.json`: whoever controls the
-  `robodr` user can claim `idle` to agentd's responder and to this gate.
-* `deb` maintainer scripts, when the release allows them, run as root
-  under the unit's capability bounding set.
+* The safety state is taken from agentd's user (or root) only; whoever
+  controls root, `robodr-agentd` or a configured safety feeder can still
+  claim `idle`.
+* Release signers are fully trusted for `deb` (root-equivalent on the
+  unit): the unit's hardening does not contain approved content
+  (`docs/SECURE-DELIVERY.md` §6.7). Maintainer scripts, when the release
+  allows them, run as root under the unit's capability bounding set.
+* With `trust.clock: untrusted` maintenance windows never open (no
+  signed current time in 13b).
 * `robodr-rules`: the condition DSL is not type-checked on the unit
   unless `install.rules_validator` runs `validate_rules.py`; Pulsar's own
   compile on reload is the last check (a failed reload rolls back).
@@ -139,5 +170,11 @@ are skipped; `ROBODR_REQUIRE_DPKG_TEST=1` makes that a failure):
   config RPK outside its root, replays, equivocation, chain gaps, trust
   rollback, expiry, untrusted clock, operator confirmation, maintenance
   window, deleted state file, rotated revocations, the single-agent lock.
+* `review_13b.rs`: the self-review regressions and the independent
+  review's findings H1-L4 (forged status from another service's user,
+  `deb` identity, flooded journal and lost state, swapped spool
+  directories through the writer's test seam, kept-version equivocation,
+  detached and limited probes, system-account probe users, untrusted
+  clock windows, corrected packs under the same name).
 * `crash.rs`, `kinds.rs` (deb with dpkg, rules), `binary.rs`,
   `fuzz_smoke.rs` (`deliverd_state`, `deliverd_inputs`).

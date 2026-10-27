@@ -544,9 +544,9 @@ fields that 13b will act on are in §10 ("13b requirements").
 
 | `kind` | Installer on the unit | Atomicity |
 |---|---|---|
-| `deb` | `dpkg` (maintainer scripts only if allowed, §3.2) | previous `.deb` kept in the store for rollback |
+| `deb` | `dpkg` (maintainer scripts only if allowed, §3.2); the RPK `name` and `arch` declare the dpkg `Package` and `Architecture` (13b review H2); release signers are root-equivalent here (§6.7) | previous `.deb` kept in the store for rollback |
 | `oci-image` | import into the unit's local containerd / podman store; or the depot's local registry when units pull | image digest switch; old image retained |
-| `files` | write into a versioned directory under `/opt/robodr-delivered/<name>/<serial>/`, atomic `current` symlink swap | symlink swap is atomic |
+| `files` | write into a versioned directory under `/opt/robodr-delivered/<name>/<serial>-<digest>/` (named by RPK digest too, 13b review M4), atomic `current` symlink swap | symlink swap is atomic |
 | `model` | as `files`, into the sealed runtime volume (§7.4) only | symlink swap |
 | `config` | as `files` under `/etc/robodr-delivered/` | symlink swap |
 | `robodr-profile` | handed to the existing profile path; `robodr-commission verify-profile` rules still apply (its own signatures, floors and operator attestation) | existing |
@@ -643,6 +643,17 @@ the deployment's maintenance window, and, for kinds marked
 update never interrupts motion. Deferrals are findings, so a unit that never
 reaches a safe window is visible.
 
+The gate is only as good as its input (13b review H1). The state is taken
+from **agentd itself**: agentd runs as its own system user
+(`robodr-agentd`), not the user of the network-facing exporters, and
+serves its status on a unix socket; `robodr-deliverd` checks the serving
+process with `SO_PEERCRED` and treats anything it cannot attribute to that
+user (or root) as `Unknown`. agentd in turn accepts safety reports on its
+PLC-gateway socket only from root, itself and the configured feeders
+(socket mode and group, `SO_PEERCRED`). A maintenance window is judged
+only on a time no local process can set: with an untrusted clock and no
+signed current time it stays closed (review L3).
+
 ### 6.4 Rollback and anti-rollback
 
 Two different things, deliberately kept apart:
@@ -658,6 +669,14 @@ Two different things, deliberately kept apart:
   otherwise in the state file and the black box, with the same honest limit as
   `robodr-commission`'s state file (root can delete it; the black box records
   that it happened).
+
+On a unit (13b), the floor, the accepted deployment's sequence, the time
+floor and the bundle chain heads are written to a **signed high-water
+record** next to the black box before every state write that moves them;
+it is never rotated (the black box's floor notes are, review M1). A lost
+state file is restored from it; if it is gone too while the black box
+shows the unit had a history, the unit **locks** (no import, install or
+rollback) until an operator re-anchors it with a current trust file.
 
 Automatic rollback therefore only ever goes to the previous serial **at or
 above** the floor. If none exists the unit stays on the failing version,
@@ -682,6 +701,38 @@ Every step (deployment accepted, chunk verified, staged, deferred, installed,
 health result, rollback, floor raised, refusal and why) is a signed black-box
 record and an OCSF finding (§9). The SOC can answer "what exactly is running
 on unit ugv-07, who approved it, and when" from evidence alone.
+
+### 6.7 What the release quorum is trusted with (13b review I1)
+
+For kind `deb` the release signers are **fully trusted: root-equivalent on
+every unit that installs their package.** A `.deb` without maintainer
+scripts can still install systemd units, cron entries, `/etc/dpkg/dpkg.cfg.d`
+hooks, setuid files, or `Conflicts` / `Replaces` that remove other
+packages (running their scripts); the delivery agent runs as root and can
+reach PID 1. The "no maintainer scripts" rule, the unit's capability set
+and its system-call filter limit accidents and what a compromised agent
+does directly; they are not a boundary for release-approved content.
+Depot and operators decide *where and when*, never *what*.
+
+Within that, the unit keeps what the release declares honest (review
+H2): a `deb` RPK's `name` is its dpkg `Package` and its `arch` the dpkg
+`Architecture` (`all` allowed under any arch); a `.deb` that says
+otherwise, a `Package` the unit records under another RPK name, a higher
+serial carrying a lower dpkg `Version`, and a `.deb` that is, conflicts
+with, breaks, replaces or provides one of RoboDR's own packages
+(`robodr`, `robodr-focal`) are refused. The last is allowed only for RPKs
+from bundles of the **designated RoboDR programme**
+(`install.robodr_programme` in the unit's configuration; default none, so
+RoboDR itself is updated with `install-bundle.sh`). Floors apply to the
+dpkg identity because it is the RPK name.
+
+Hardening of `robodr-deliverd.service` (review I1), kept where it does not
+break an ordinary (script-less) install: `RestrictSUIDSGID=` is **not**
+set (dpkg must create the setuid / setgid files ordinary packages ship);
+`@resources` is no longer denied (probes get rlimits);
+`MemoryDenyWriteExecute=` and `ProtectKernelTunables=` stay (they only
+affect release-allowed maintainer scripts and probes: no JIT, no
+`sysctl -w`; ship `/etc/sysctl.d/` files instead).
 
 ---
 
@@ -1018,11 +1069,14 @@ The 13b requirements above, as implemented:
    environment, `/` as working directory, stdin `/dev/null`; tested with
    `$(...)`, backticks, `;`, `|`, `&&`, globs (`probe_argv_with_shell_metacharacters_is_not_interpreted`).
 2. Probe user resolved at staging from the passwd file (files only),
-   refused for UID / GID 0, outside the configured range, `root`,
-   `robodr`, `robodr-exec`, configured names, duplicates; resolved again
-   before each run; `setgid`, `setgroups(0)`, `setuid` (tested with `id`).
-   Own process group killed on timeout, output bounded
-   (`a_probe_that_hangs_…`, `a_probe_that_floods_output_is_bounded`).
+   refused for UID / GID 0, outside the configured range (default
+   `1000..=59999`, never a system account; review L2), `root`, `robodr`,
+   `robodr-agentd`, `robodr-exec`, configured names, duplicates; resolved
+   again before each run; `setgid`, `setgroups(0)`, `setuid` (tested with
+   `id`). Own process group killed on timeout, output bounded
+   (`a_probe_that_hangs_…`, `a_probe_that_floods_output_is_bounded`);
+   since review L1 also rlimits and a subreaper that kills whatever a
+   probe leaves behind.
 3. Rollout: a deployment whose targets, batch size or failure threshold
    exceed the unit's ring (when the trust file assigns it) is refused.
 4. Ring: from the trust file's `rings`, else enrolment (`unit.ring`, a
@@ -1055,14 +1109,16 @@ Decisions taken where the design left room:
 * **The floor is raised before the switch** (in the intent's write), so
   a failing release that raised it has no rollback target below it
   (§6.4: Critical, operator decides). Rollbacks pass the safety gate too.
-* **Safety state source**: agentd's `status.json` (fresh by
-  `CLOCK_MONOTONIC`, this boot, a live `safety_feed`); without a live feed
-  the state is `unknown`.
+* **Safety state source**: agentd's status (fresh by `CLOCK_MONOTONIC`,
+  this boot, a live `safety_feed`), since the review served by agentd on
+  its status socket and accepted only from agentd's own user (§6.3);
+  without a live feed the state is `unknown`.
 * **Findings share agentd's spool**: agentd and the agent claim record
   names with no-replace hard links (agentd changed from `rename`).
 * **Evidence**: a black-box chain of the agent's own (single-writer
   recorder), signed with the unit's black-box key; a missing or older
-  state file takes the floors recorded there.
+  state file is restored from the signed high-water record (and the
+  floors noted in the chain), or the unit locks (§6.4).
 * **Kinds** `files` / `config` (versioned directory, `current` symlink
   swap; `config` only under `config_root`), `robodr-rules` (versions in
   the state directory, one symlink per package in `rules_active`, Pulsar
@@ -1083,6 +1139,27 @@ deployments and bundles; trust rollback after a rotation; site
 revocations; expiry and staleness (Medium, then High); operator
 confirmation; maintenance window; a second agent on the same state.
 Fuzzing: `deliverd_state`, `deliverd_inputs` (`fuzz/README.md`).
+
+**Independent adversarial review of 13b (2026-10-27).** A code review of
+`robodr-deliverd`, the agentd spool change, the units and the packaging
+found two high, four medium, four low and one informational issue. All
+but M3 (the SOC side) are fixed; each has a regression test in
+`crates/robodr-deliverd/tests/review_13b.rs` that failed before the fix
+(M2 is driven through the writer's test seam, so it is deterministic).
+
+| Finding | Fix | Regression test |
+|---|---|---|
+| **H1** The gate trusted any `status.json` of the right shape in a spool the network-facing exporters (`User=robodr`, agentd's user too) could write; they could also write agentd's PLC safety socket | agentd runs as its own user `robodr-agentd` (sysusers; `postinst` moves its trees; units, focal variants, tmpfiles: spool `2750`/queues `2770` setgid `robodr`); agentd serves its status on `spool.status_socket` and deliverd accepts it only from that user or root (`SO_PEERCRED`), a status file only if it and its directory are owned by that user or root and writable by nobody else; agentd's safety socket takes reports only from root, itself and `allowed_uids` / `allowed_gids` (`socket_mode`, `socket_group`, group `robodr-safety`) | `h1_a_forged_idle_status_written_by_another_robodr_service_is_unknown`; agentd `safety::tests::config_validation`, `status_socket_tests` |
+| **H2** The dpkg `Package` was never tied to the RPK: another RPK name could downgrade a floored package or replace RoboDR | the RPK `name` / `arch` are the dpkg `Package` / `Architecture` (or `all`); refused: a mismatch, a `Package` owned by another RPK name, a higher serial with a lower dpkg `Version`, a `.deb` that is or conflicts / breaks / replaces / provides `robodr` or `robodr-focal` unless from `install.robodr_programme` (§6.7) | `h2_an_rpk_under_another_name_cannot_downgrade_a_floored_deb`, `h2_robodrs_own_package_is_not_replaced_by_a_deb_rpk`, `h2_a_deb_that_conflicts_with_robodr_is_refused`, `h2_the_deb_architecture_must_be_the_rpks` |
+| **M1** Floor recovery depended on cyclic journal notes and restored floors only | signed high-water record (floors, deployment sequence, time floor, chain heads) written before every state write that moves them, never rotated; restored from on a lost state; without it the unit locks until `robodr-deliverd reanchor` | `m1_floors_and_sequence_survive_a_flooded_journal_and_a_lost_state_file`, `m1_a_lost_state_without_a_complete_record_refuses_installs` |
+| **M2** Root linked and removed by path in `tmp.deliverd/`, inside a directory agentd's user owns | records written through held directory descriptors: `O_TMPFILE` in `ready/`, `fchown` / `fsync` on the descriptor, no-replace `linkat` from it (fallback: `O_EXCL` hidden name, linked from the descriptor, unlinked relative to `ready/`); `tmp.deliverd/` is gone | `m2_a_swapped_tmp_directory_in_the_spool_is_never_followed` (both paths) |
+| M3 AutoSecOps has no catalog 2.2 entries | **open**: SOC-side work (`robodr.findings` 2.2 is fully specified in `docs/contracts/robodr.findings.md` §3a) | — |
+| **M4** Kept version directories were named by serial: the same serial with other content overwrote a rollback target | version directories `<serial>-<digest>`; the same serial with other content is refused while installed, kept or in a switch | `m4_the_same_serial_as_a_kept_target_with_other_content_is_refused` |
+| **L1** A detached probe's process survived; no probe resource limits | while a probe runs the agent is a child subreaper; leftovers of the probe's UID are killed, reaped and fail it; `RLIMIT_CPU` (timeout + 1 s), `RLIMIT_AS`, `RLIMIT_NOFILE`, `RLIMIT_NPROC` (configurable); `@resources` no longer filtered | `l1_a_probe_that_detaches_fails_and_its_process_is_killed`, `l1_a_probe_runs_under_resource_limits` |
+| **L2** System accounts (UID 100–999) could be probe users | default `probe_uid_min` 1000; `robodr-agentd` always denied | `l2_system_accounts_are_not_probe_users_by_default` |
+| **L3** With `clock: untrusted` the window used the system clock | the window is judged only on a trusted clock or a signed current time (none in 13b): closed otherwise | `l3_with_an_untrusted_clock_a_maintenance_window_stays_closed` |
+| **L4** A refusal was remembered by directory name and `deployment.json` | packs are remembered by the digest of their whole content (oldest evicted first) | `l4_a_corrected_pack_under_the_same_name_is_judged_again` |
+| **I1** The deb sandbox is not a boundary; some hardening broke ordinary packages | §6.7 states that release signers are root-equivalent for `deb`; `RestrictSUIDSGID=` dropped, `MemoryDenyWriteExecute=` and `ProtectKernelTunables=` kept with their trade-offs | (documentation, unit files; `scripts/check-focal-units.py`) |
 
 Not in 13b: sealed RPKs and key wraps (13c), the depot and LAN delivery
 (14a), the soak window and attestation in the health gate (14a / Sprint

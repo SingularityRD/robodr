@@ -422,7 +422,7 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
   | 1.0 – 1.2 | base catalog |
   | 1.3 – 1.x, 2.0 | base + the 1.3 entries, exactly as 1.3.0 shipped (2.0 did not change the catalog) |
   | 2.1 | + the 2.1 entries: the low-level joint-frame firewall ids (`robot.firewall.joint_*`, `disabled_motor_energised`, `crc_invalid`), `robot.motion.api_id_out_of_range`, `robot.motion.control_handover`, `robot.motion.command_type_mismatch` and the Unitree legacy-UDP ids `robot.unitree.legacy_unknown_sender`, `legacy_sender_flood`, `legacy_sender_mac_mismatch`, `legacy_port_rtps` |
-  | 2.2 and later | + the 2.2 entries: the secure-delivery ids `robot.deliver.installed` (Low: the contract has no informational severity), `deferred_safety` (Low, Medium when repeated), `health_failed` (High), `rollback_blocked_floor` (Critical), `refused` (High), `stale` (Medium, High after the grace period), `chain_gap` (High), data source `robodr_delivery` |
+  | 2.2 and later | + the 2.2 entries: the secure-delivery ids `robot.deliver.installed` (Low: the contract has no informational severity), `deferred_safety` (Low, Medium when repeated), `health_failed` (High), `rollback_blocked_floor` (Critical), `refused` (High), `stale` (Medium, High after the grace period), `chain_gap` (High), data source `robodr_delivery`, no techniques; titles and catalog sentences in §3a |
 
   A finding of an older minor for a rule that only gained an entry in a
   later minor carries the generic entry and stays valid; a finding of that
@@ -430,6 +430,60 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
   rejected.
   Any `robot.correlate.*` id without its own entry (a deployment's custom
   correlation rule) gets the generic correlation entry.
+
+## 3a. Rule catalog 2.2: secure delivery (`robot.deliver.*`)
+
+The complete 2.2 addition, as `robodr_ocsf::rule_info_for_contract` applies
+it to a message whose `contract_version` is 2.2.x (or later 2.x). Every
+entry has:
+
+* **data source** `robodr_delivery`: `finding_info.data_sources` is
+  exactly `["robodr_delivery"]`, `finding_info.types` exactly
+  `["robot_deviation", "robodr_delivery"]`;
+* **techniques: none.** `mitre_predictions` and `attacks` are empty
+  lists (a delivery event is evidence of what changed on the unit, not
+  an attributed ATT&CK technique); a message that lists any technique
+  for these ids is rejected;
+* **producer** `robodr-deliverd` only (agentd's spool, §1);
+* **profile** (`entity_context.profile`): the delivery trust file the
+  finding was judged under, `version` `delivery-trust-<n>` and its
+  `sha256` digest (`delivery-trust-none` and 64 zeros before any trust
+  file was accepted), not a model profile;
+* **subject**: empty; the package, serial and reason travel only in the
+  tainted `detail` (SR-TAINT, §3), never in the title or the catalog
+  sentence of `description`.
+
+| Rule id | `title` (exact) | Severity emitted |
+| --- | --- | --- |
+| `robot.deliver.installed` | Delivered package installed | Low (catalogue meaning: informational; the contract has no informational severity) |
+| `robot.deliver.deferred_safety` | Delivery deferred by the robot's safety state | Low; Medium from the `findings.deferral_medium_after`-th deferral of one item (default 10) and for a deferred rollback |
+| `robot.deliver.health_failed` | Delivered package failed its health gate; rolled back | High |
+| `robot.deliver.rollback_blocked_floor` | Failed package cannot be rolled back | Critical |
+| `robot.deliver.refused` | Delivery refused | High |
+| `robot.deliver.stale` | No fresh deployment or trust file | Medium; High after `findings.stale_grace_s` (default 86400 s) |
+| `robot.deliver.chain_gap` | Release bundle chain gap or equivocation | High |
+
+Catalog sentence (the leading sentence of `description`, exact):
+
+* `robot.deliver.installed`: The unit's delivery agent installed a release-signed package that a depot and operator quorum assigned to it, and the package passed its health gate. Informational: the evidence trail of what runs on the unit.
+* `robot.deliver.deferred_safety`: The unit's delivery agent deferred an install or rollback because the robot's live safety state was not idle or safe-state (moving, human nearby, e-stop or unknown); downloading and staging continue and the install waits for a safe window. Repeated deferrals mean the unit never reaches one.
+* `robot.deliver.health_failed`: A package installed by the unit's delivery agent failed its health checks; the agent rolled back automatically to the previous version at or above the anti-rollback floor.
+* `robot.deliver.rollback_blocked_floor`: A package installed by the unit's delivery agent failed its health checks and there is no earlier version at or above the anti-rollback floor (or the rollback itself failed); the unit stays on the failing version until an operator acts.
+* `robot.deliver.refused`: The unit's delivery agent refused a media pack, deployment or package: a signature, quorum, revocation, floor, scope (unit, ring, site), platform or hash check failed, or its state had to be restored. Nothing was installed from it.
+* `robot.deliver.stale`: The unit's newest deployment or its site trust file expired without a fresh one arriving: updates or revocations may be withheld from the unit.
+* `robot.deliver.chain_gap`: The unit's delivery agent saw a release bundle that skips bundles it never received, or two different bundles with the same sequence number, or one that does not follow the accepted bundle.
+
+Reasons a `robot.deliver.refused` finding names in its detail (the code
+before the first `:`; informational for the SOC, not validated): the
+import and item codes of `robodr_pkg::Code` (`bad_signature`,
+`quorum_not_met`, `revoked_key`, `revoked_rpk`, `below_floor`,
+`wrong_scope`, `expired`, `digest_mismatch`, `file_mismatch`,
+`unexpected_file`, `missing_file`, `invalid`, `unsupported`, ...), and
+the agent's own: `equivocation` (a serial already on the unit with other
+content), `state_restored` (the state file was missing or behind and was
+restored from the signed high-water record), `state_lost` (it could not
+be restored completely: the unit refuses imports and installs until it is
+re-anchored), `highwater_invalid` (the high-water record did not verify).
 
 ## 4. Ordering and partitioning
 
@@ -770,6 +824,9 @@ safely. Nothing here is specific to one product.
   - Schema `$id` `https://schemas.singularityrd.com/robodr/findings/2.2.0`.
   - The `robot.seal.*` ids of §9 have no entry yet (nothing emits them
     before Sprint 13c / 14b).
+  - The complete 2.2 catalog (ids, exact titles and catalog sentences,
+    data source, severities, techniques) is §3a; documented after the
+    13b review, the entries themselves are unchanged.
 * **2.1.0** — rule-catalog entries only (minor):
   - New entries: the low-level joint-frame firewall ids
     (`robot.firewall.joint_position_out_of_envelope`,

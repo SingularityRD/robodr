@@ -121,7 +121,9 @@ sudo sh /usr/lib/robodr/install-bundle.sh install \
    `--allow-downgrade`, and anything below the unit's **security floor**
    (section 7), with no override;
 4. runs the black-box format gate (section 7);
-5. runs `dpkg -i`. The package creates the `robodr` user (sysusers) and the
+5. runs `dpkg -i`. The package creates the users `robodr` (exporters),
+   `robodr-agentd` (agentd), `robodr-exec` and the group `robodr-safety`
+   (sysusers) and the
    directories (tmpfiles), installs the units **disabled**, and installs
    `/usr/lib/robodr/install-bundle.sh`, the trusted verifier for the next
    upgrade;
@@ -549,7 +551,7 @@ Work in `/var/lib/robodr/commission/<date>/` as root.
    findings is the signed `metadata.profile_version`; delete the key.
 
    The anti-rollback state file must be writable by the daemon. The package
-   creates `/var/lib/robodr/profile-state` (`robodr:robodr`, agentd's
+   creates `/var/lib/robodr/profile-state` (`robodr-agentd:robodr`, agentd's
    `agentd.json`) and `/var/lib/robodr/profile-state-pulsard` (`root:robodr`,
    the Pulsar sensor's `pulsard.json`; separate so the `robodr` user cannot
    rewrite the root daemon's floor), and each unit lists its directory in
@@ -921,8 +923,11 @@ With one, agentd reads it **passively**: ROS 2 topics decoded from captured
 user DATA (`std_msgs/Bool`, `UInt8`, `String` mapped to states;
 `nav_msgs/Odometry` speed with hysteresis to idle / moving slow / moving
 fast), and/or a `0600` unix socket of JSON lines from a safety-PLC gateway
-(`{"state":"estop_active"}`; put it under `/run/robodr-agentd/`, the
-gateway must run as `robodr`). A stale source reads `unknown`; disagreeing
+(`{"state":"estop_active"}`; put it under `/run/robodr-agentd/`; only
+root, agentd's own user `robodr-agentd` and the configured feeders may
+report: `socket_mode` / `socket_group` / `allowed_uids` /
+`allowed_gids`, every connection checked with `SO_PEERCRED`, section
+11.1). A stale source reads `unknown`; disagreeing
 sources resolve to the most conservative state. Every topic source must
 list its commissioned `writers` (GUID prefixes or writer GUIDs; the
 configuration is refused without them). A sample is used only if its
@@ -2414,13 +2419,47 @@ robot, an air-gapped site or a depot (14a).
    `/etc/robodr/agentd.json`: the safety socket a PLC gateway writes, or
    commissioned ROS 2 safety topics). Without a feed every install waits
    (`unknown`): a configured `context.safety_state` is not a reading.
+   agentd serves its status on **`spool.status_socket`**
+   (`/run/robodr-agentd/status.sock`, in every shipped example); the
+   delivery agent reads the safety state only there and only from
+   agentd's own user (`SO_PEERCRED`), never from `status.json` in the
+   spool, which the exporters' group can write. Without the socket every
+   install waits.
+   * agentd runs as its own user **`robodr-agentd`** (group
+     `robodr-agentd`, member of `robodr`); the exporters
+     (`robodr-spool-export`, `robodr-kafka-publish`, `robodr-uplink`) keep
+     running as `robodr`. The package creates the user and, on upgrade,
+     moves agentd's black box, spool, profile state and control-plane
+     state to it (`postinst`).
+   * The PLC gateway that writes `safety_feed.socket`: by default the
+     socket is `0600` and only root and agentd may report a state. For a
+     gateway running as its own user, put it in the group
+     `robodr-safety` (created by the package) and set
+     `"socket_mode": "0660", "socket_group": <gid>, "allowed_gids": [<gid>]`
+     (`getent group robodr-safety`), plus `SupplementaryGroups=robodr-safety`
+     for both `robodr-agentd.service` (a drop-in) and the gateway's unit.
+     Every connection is checked with `SO_PEERCRED`: an exporter (or any
+     other user) that connects is closed before a byte is read and shows
+     as malformed input in agentd's health.
 2. Write `/etc/robodr/deliverd.json` from
    `/usr/share/doc/robodr/examples/deliverd.example.json`: the unit id
    (as in the trust file's `rings` and the deployments), the site, model,
    platform and architecture, and the delivery **root fingerprints**
    (carried to the site out of band, as for `robodr-release --root`).
    `trust.clock`: `trusted` only if the clock is disciplined (GPS / PTP,
-   or set at commissioning and checked); otherwise `untrusted`.
+   or set at commissioning and checked); otherwise `untrusted`. With
+   `untrusted`, a deployment's **maintenance window never opens** (the
+   unit has no signed current time in 13b, and whoever sets the system
+   clock must not decide the window): deploy to such units without a
+   window and use `install.requires_operator_present` where a person
+   must be there.
+   Probe users must be regular accounts: the default probe UID range is
+   `1000..=59999` (`health.probe_uid_min`), so a system account (a PLC or
+   database user) never runs a probe unless you lower it explicitly.
+   `install.robodr_programme` names the one trust-file programme whose
+   `deb` RPKs may be, conflict with, break, replace or provide RoboDR's
+   own packages (`robodr`, `robodr-focal`); leave it `null` to keep
+   RoboDR itself out of delivery (update it with `install-bundle.sh`).
    `robodr-deliverd check-config --config /etc/robodr/deliverd.json`.
 3. Enrol the trust anchor once, from the site's trust file on vetted
    media:
@@ -2448,7 +2487,8 @@ for it; remove the media afterwards. `sudo robodr-deliverd status --config
 deferrals, installed versions, floors and any switch in progress.
 
 * **Deferred** items wait for `idle` / `safe_state_active` (and the
-  deployment's maintenance window, UTC). Staging continues. A unit that
+  deployment's maintenance window, UTC; never open with
+  `trust.clock: untrusted`). Staging continues. A unit that
   never reaches a safe window shows `robot.deliver.deferred_safety`
   (Medium after `findings.deferral_medium_after` deferrals).
 * RPKs with `install.requires_operator_present` wait for a local
@@ -2462,6 +2502,11 @@ deferrals, installed versions, floors and any switch in progress.
 * `robot.deliver.stale` means no fresh deployment (or trust file) arrived
   before the last one expired: the depot or courier may be withholding
   updates or revocations.
+* A refused pack is remembered by its **content**: copying a corrected
+  pack under the same directory name is enough for it to be judged again
+  (no need to rename it). While a pack is being copied it may be judged,
+  and refused, more than once; copy it under another name and rename it
+  into place when complete.
 
 ### 11.3 Evidence and recovery
 
@@ -2469,21 +2514,66 @@ Every step is a note in `/var/lib/robodr/blackbox/deliverd` (verify with
 `robodr-blackbox verify /var/lib/robodr/blackbox/deliverd --keyring
 <agentd-blackbox.key.pub>`). A crash or power loss during a switch is
 resumed at the next start from the intent in `state.json`
-(`robodr.deliver.recovered`). If `state.json` is deleted or replaced by an
-older copy, the agent takes the floors recorded in the black box and
-reports it (`robot.deliver.refused`, `state_restored`); downgrades below
-them stay refused. Do not delete `/var/lib/robodr/deliverd`.
+(`robodr.deliver.recovered`).
+
+The floors, the accepted deployment's sequence, the time floor and the
+bundle chain heads are also kept in a **signed high-water record**,
+`/var/lib/robodr/blackbox/deliverd/highwater.json` (signed with the
+unit's black-box key, rewritten before every state write that moves
+them, never rotated). If `state.json` is deleted or replaced by an older
+copy, the agent restores all of them from it (and the floors noted in the
+journal) and reports it (`robot.deliver.refused`, `state_restored`);
+downgrades, replayed or expired deployments stay refused.
+
+If `state.json` is gone **and** the high-water record is missing or does
+not verify while the journal shows the unit had a history, the agent
+**locks itself** (`robot.deliver.refused`, `state_lost`; `status` shows
+`locked`): it imports nothing and installs or rolls back nothing. To
+lift the lock, find out why the state was lost, then, with the service
+stopped:
+
+```bash
+sudo systemctl stop robodr-deliverd
+sudo robodr-deliverd reanchor --config /etc/robodr/deliverd.json --trust /media/usb/trust.json
+sudo systemctl start robodr-deliverd
+```
+
+`reanchor` accepts the site's **current** trust file (the anchor or a
+newer rotation, under the pinned roots; a new anchor if none is left),
+takes its signed `issued_at` as the time floor and records the step
+(`robodr.deliver.reanchored`). Floors are then those of the trust file
+(`floors`), which the depot should set for every package that has one;
+deliver the newest deployment first. Do not delete
+`/var/lib/robodr/deliverd` or the black-box directory.
 
 ### 11.4 Trust and limits
 
-* The safety state is agentd's `status.json`: whoever controls the
-  `robodr` user can claim `idle` to agentd and to the delivery agent.
+* The safety state comes from agentd alone (status socket, `SO_PEERCRED`
+  against `robodr-agentd`); agentd takes safety reports only from root,
+  itself and the configured feeders. Whoever controls root, the
+  `robodr-agentd` user or a configured feeder can still claim `idle`.
+* **Release signers are fully trusted for `deb`** (root-equivalent on
+  the unit): a `.deb` without maintainer scripts can still install
+  systemd units, cron entries, dpkg hooks or setuid files, and the agent
+  runs as root. The unit's hardening limits accidents, not approved
+  content (`docs/SECURE-DELIVERY.md` §6.7). A `deb` RPK's name and
+  architecture are its dpkg `Package` and `Architecture`; a `.deb` that
+  says otherwise, a package another RPK name already owns, a higher
+  serial with a lower dpkg version, and anything touching RoboDR's own
+  packages outside `install.robodr_programme` are refused.
 * `deb` maintainer scripts run only when the release quorum allowed them
   (recorded in the black box), as root under the unit's capability set,
-  without network; `.deb`s with setuid / setgid files fail to install
-  under `RestrictSUIDSGID=` and roll back.
-* Floors are in the state file and the black box, not a TPM counter
-  (14b). Sealed RPKs, models, OCI images and OS images are refused until
+  without network. They cannot write `/proc/sys` (`ProtectKernelTunables=`:
+  ship `/etc/sysctl.d/` files instead) or run a JIT
+  (`MemoryDenyWriteExecute=`); `.deb`s with setuid / setgid files install
+  (`RestrictSUIDSGID=` is not set, review I1).
+* Probes run as their (non-system) user with their own limits (CPU =
+  timeout + 1 s, `health.probe_max_memory_mb`, `probe_max_open_files`,
+  `probe_max_processes`); whatever a probe leaves behind, even a process
+  in its own session, is killed and fails the probe.
+* Floors are in the state file, the signed high-water record and the
+  black box, not a TPM counter (14b): root can still delete all of them;
+  the agent then locks until re-anchored. Sealed RPKs, models, OCI images and OS images are refused until
   13c / 14a / 14c.
 * `robodr-safety-replay` (tests and demos) writes safety states into
   agentd's socket; it is not in the package and must never run on a

@@ -19,6 +19,11 @@ robodr\-deliverd \- install verified RoboDR delivery packages on a unit, behind 
 .B \-\-trust
 .I TRUST.json
 .br
+.B robodr\-deliverd reanchor \-\-config
+.I FILE
+.B \-\-trust
+.I TRUST.json
+.br
 .B robodr\-deliverd status \-\-config
 .I FILE
 .br
@@ -135,6 +140,19 @@ from a trust file accepted under the pinned roots and the unit's site.
 Once, at enrolment; refuses to overwrite an existing anchor (it moves
 forward only by accepted rotations carried in media packs).
 .TP
+.B reanchor
+Lift the lock the agent sets when its state file was lost and its signed
+high-water record
+.RI ( blackbox.dir /highwater.json:
+floors, deployment sequence, time floor, chain heads) is missing or does
+not verify while the black box shows the unit had a history (no import,
+install or rollback until then). Accepts the site's current trust file
+as the anchor, a rotation of it, or a new anchor when none is left, takes
+its signed
+.B issued_at
+as the time floor and records the step. Stop the service first (the
+journal is single-writer).
+.TP
 .B status
 Print the state: installed versions, kept rollback targets, floors, the
 deployment being worked on, the intent in progress, staleness.
@@ -178,9 +196,16 @@ package writes) and
 .I /etc/robodr\-delivered\-rules
 (one symlink per rules package to its active version: point Pulsar's
 .I rules_path
-or a link below it there), probe UID range 100..59999, agentd's
-.I status.json
-and spool. Paths must be absolute and normalised; the state, media and
+or a link below it there), probe UID range 1000..59999 (never a system
+account), agentd's status socket
+.I /run/robodr\-agentd/status.sock
+(accepted only from the user
+.BR robodr\-agentd " or root, checked with " SO_PEERCRED )
+and spool, no
+.B install.robodr_programme
+(no deb RPK may touch RoboDR's own packages). With
+.B trust.clock: untrusted
+a maintenance window never opens. Paths must be absolute and normalised; the state, media and
 install trees must be disjoint.
 .SH HEALTH CHECKS
 .B probe
@@ -192,11 +217,14 @@ lookup, environment
 .BR PATH=/usr/sbin:/usr/bin:/sbin:/bin " and " LC_ALL=C ,
 working directory /) as the probe user's UID and GID with supplementary
 groups dropped, in their own process group, which is killed when the
-timeout expires; output beyond
+timeout expires, under resource limits (CPU: the timeout plus one second;
+.BR health.probe_max_memory_mb ", " probe_max_open_files ", " probe_max_processes ),
+with the agent as their subreaper: any process a probe leaves behind,
+even in a session of its own, is killed and fails it; output beyond
 .I max_output_bytes
 is read and discarded. The probe user is resolved from the passwd file at
 staging (never UID or GID 0, never
-.BR root ", " robodr ", " robodr\-exec ,
+.BR root ", " robodr ", " robodr\-agentd ", " robodr\-exec ,
 inside the configured range) and must resolve the same way at probe time.
 .B service_active
 runs
@@ -231,7 +259,9 @@ Where media packs are put (untrusted).
 .TP
 .I /var/lib/robodr/blackbox/deliverd/
 The delivery black box (verify with
-.BR "robodr\-blackbox verify" ).
+.BR "robodr\-blackbox verify" )
+and the signed high-water record
+.IR highwater.json .
 .SH SYSTEMD UNIT
 .B robodr\-deliverd.service
 (installed disabled) runs as root with a bounded capability set, no
@@ -244,13 +274,14 @@ Enable after commissioning and
 .SH LIMITS
 Kinds
 .BR oci\-image ", " model ", " robodr\-profile ", " os\-image
-and sealed RPKs are refused. Floors live in the state file and the black
-box, not in a TPM. The safety state is agentd's status file: whoever
-controls the
-.B robodr
-user can claim
-.B idle
-to agentd and to this agent alike.
+and sealed RPKs are refused. Floors live in the state file, the signed
+high-water record and the black box, not in a TPM. The safety state is
+taken from agentd's user only; whoever controls root, that user or a
+configured safety feeder can still claim
+.BR idle .
+Release signers are root-equivalent for
+.B deb
+packages: the unit's hardening does not contain approved content.
 .SH SEE ALSO
 .BR robodr\-agentd (8),
 .BR robodr\-blackbox (1),
