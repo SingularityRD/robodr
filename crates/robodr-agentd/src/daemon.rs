@@ -1690,7 +1690,7 @@ impl<'a> Daemon<'a> {
             SpoolClass::Normal
         };
         match &o.finding {
-            Some(f) => match self.spool.write(f, class, &o.source) {
+            Some(f) => match self.spool.write_from(f, class, &o.source) {
                 Ok(_) => self.stats.findings_spooled += 1,
                 Err(SpoolError::Full) => {}
                 Err(e) => {

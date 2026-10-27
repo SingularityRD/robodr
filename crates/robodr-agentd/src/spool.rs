@@ -335,9 +335,15 @@ impl Spool {
     }
 
     /// Spool one finding within the share of its `class` (see the module
+    /// docs), with no source key ([`Spool::write_from`]).
+    pub fn write(&mut self, f: &FindingOutput, class: SpoolClass) -> Result<PathBuf, SpoolError> {
+        self.write_from(f, class, "")
+    }
+
+    /// Spool one finding within the share of its `class` (see the module
     /// docs). `source`: who it is about (agentd's source key, e.g.
     /// `src:<ip>`), for the per-source part of the Critical share.
-    pub fn write(
+    pub fn write_from(
         &mut self,
         f: &FindingOutput,
         class: SpoolClass,
@@ -446,13 +452,13 @@ mod tests {
     fn writes_atomically_and_numbers_across_reopen() {
         let d = tmp("reopen");
         let mut s = Spool::open(&d, 1 << 20, 100).unwrap();
-        let p = s.write(&rec(3), SpoolClass::Normal, "t").unwrap();
+        let p = s.write_from(&rec(3), SpoolClass::Normal, "t").unwrap();
         assert!(p.ends_with("ready/00000000000000000001.json"));
         let r: SpoolRecord = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
         assert_eq!(r.seq, 1);
         assert_eq!(r.value, rec(3).value);
         assert_eq!(r.schema, SPOOL_SCHEMA);
-        s.write(&rec(3), SpoolClass::Normal, "t").unwrap();
+        s.write_from(&rec(3), SpoolClass::Normal, "t").unwrap();
         ack_all(&s);
         // Junk in the dirs is ignored; a leftover tmp file is removed.
         fs::write(d.join("ready/notes.txt"), b"x").unwrap();
@@ -460,7 +466,7 @@ mod tests {
         drop(s);
         let mut s = Spool::open(&d, 1 << 20, 100).unwrap();
         assert_eq!(fs::read_dir(d.join("tmp")).unwrap().count(), 0);
-        let p = s.write(&rec(1), SpoolClass::Normal, "t").unwrap();
+        let p = s.write_from(&rec(1), SpoolClass::Normal, "t").unwrap();
         assert!(p.ends_with("ready/00000000000000000003.json"));
         assert_eq!(s.stats().acked_files, 2);
         assert_eq!(s.stats().ready_files, 1);
@@ -474,23 +480,23 @@ mod tests {
         // Critical records may use the whole bound (one source each: the
         // per-source part of the Critical share is one file here).
         for i in 0..3 {
-            s.write(&rec(i), SpoolClass::Critical, &format!("s{i}"))
+            s.write_from(&rec(i), SpoolClass::Critical, &format!("s{i}"))
                 .unwrap();
         }
         // Nothing acked: the 4th is dropped, ready/ untouched.
         assert!(matches!(
-            s.write(&rec(9), SpoolClass::Critical, "s9"),
+            s.write_from(&rec(9), SpoolClass::Critical, "s9"),
             Err(SpoolError::Full)
         ));
         assert_eq!(s.stats().dropped_full, 1);
         assert_eq!(list(s.ready_dir()).unwrap().len(), 3);
         // A health finding may use the reserve.
-        s.write(&rec(9), SpoolClass::Health, "t").unwrap();
+        s.write_from(&rec(9), SpoolClass::Health, "t").unwrap();
         assert_eq!(list(s.ready_dir()).unwrap().len(), 4);
         // Ack everything: the oldest acked files make room.
         ack_all(&s);
         std::thread::sleep(RESCAN_INTERVAL);
-        s.write(&rec(1), SpoolClass::Critical, "u").unwrap();
+        s.write_from(&rec(1), SpoolClass::Critical, "u").unwrap();
         let acked: Vec<u64> = list(s.acked_dir()).unwrap().iter().map(|x| x.0).collect();
         assert_eq!(acked, vec![3, 4], "oldest acked pruned first");
         assert_eq!(s.stats().pruned, 2);
@@ -504,7 +510,7 @@ mod tests {
         let mut s = Spool::open(&d, 1 << 20, 16).unwrap();
         // A flood of non-Critical records stops at 7/8 of the files...
         let mut n = 0;
-        while s.write(&rec(1), SpoolClass::Normal, "t").is_ok() {
+        while s.write_from(&rec(1), SpoolClass::Normal, "t").is_ok() {
             n += 1;
             assert!(n <= 16);
         }
@@ -513,25 +519,27 @@ mod tests {
         // ...so Critical findings still fit, up to the full bound (one per
         // source here: the share is 2 files, a source may hold a quarter,
         // at least one).
-        s.write(&rec(2), SpoolClass::Critical, "src:a").unwrap();
+        s.write_from(&rec(2), SpoolClass::Critical, "src:a")
+            .unwrap();
         assert!(matches!(
-            s.write(&rec(2), SpoolClass::Critical, "src:a"),
+            s.write_from(&rec(2), SpoolClass::Critical, "src:a"),
             Err(SpoolError::Full)
         ));
         assert_eq!(s.stats().dropped_reserve_cap, 1);
-        s.write(&rec(2), SpoolClass::Critical, "src:b").unwrap();
+        s.write_from(&rec(2), SpoolClass::Critical, "src:b")
+            .unwrap();
         assert!(matches!(
-            s.write(&rec(2), SpoolClass::Critical, "src:c"),
+            s.write_from(&rec(2), SpoolClass::Critical, "src:c"),
             Err(SpoolError::Full)
         ));
         // A health finding still has its own reserve beyond that.
-        s.write(&rec(3), SpoolClass::Health, "t").unwrap();
+        s.write_from(&rec(3), SpoolClass::Health, "t").unwrap();
         assert_eq!(list(s.ready_dir()).unwrap().len(), 17);
         // Once the exporter acks, a lesser record prunes acked ones until
         // it fits its own share (the Critical share stays free).
         ack_all(&s);
         std::thread::sleep(RESCAN_INTERVAL);
-        s.write(&rec(1), SpoolClass::Normal, "t").unwrap();
+        s.write_from(&rec(1), SpoolClass::Normal, "t").unwrap();
         assert!(s.stats().acked_files + s.stats().ready_files <= 14);
         let _ = fs::remove_dir_all(&d);
     }
@@ -543,25 +551,26 @@ mod tests {
         let d = tmp("crit-per-source");
         let mut s = Spool::open(&d, 1 << 22, 400).unwrap();
         let mut n = 0;
-        while s.write(&rec(1), SpoolClass::Normal, "src:x").is_ok() {
+        while s.write_from(&rec(1), SpoolClass::Normal, "src:x").is_ok() {
             n += 1;
         }
         assert_eq!(n, 350, "400 - 400 / 8");
         let mut crit = 0;
         while s
-            .write(&rec(2), SpoolClass::Critical, "src:sprayer")
+            .write_from(&rec(2), SpoolClass::Critical, "src:sprayer")
             .is_ok()
         {
             crit += 1;
         }
         assert_eq!(crit, 12, "a quarter of the 50-file share");
-        s.write(&rec(2), SpoolClass::Critical, "src:rogue").unwrap();
+        s.write_from(&rec(2), SpoolClass::Critical, "src:rogue")
+            .unwrap();
         // A spool too small for an eighth still keeps one file.
         let d2 = tmp("crit-tiny");
         let mut t = Spool::open(&d2, 1 << 20, 2).unwrap();
-        t.write(&rec(1), SpoolClass::Normal, "a").unwrap();
-        assert!(t.write(&rec(1), SpoolClass::Normal, "a").is_err());
-        t.write(&rec(2), SpoolClass::Critical, "a").unwrap();
+        t.write_from(&rec(1), SpoolClass::Normal, "a").unwrap();
+        assert!(t.write_from(&rec(1), SpoolClass::Normal, "a").is_err());
+        t.write_from(&rec(2), SpoolClass::Critical, "a").unwrap();
         let _ = fs::remove_dir_all(&d);
         let _ = fs::remove_dir_all(&d2);
     }
@@ -571,7 +580,7 @@ mod tests {
         let d = tmp("bytes");
         let mut s = Spool::open(&d, 2_000, 1000).unwrap();
         let mut n = 0;
-        while s.write(&rec(200), SpoolClass::Critical, "t").is_ok() {
+        while s.write_from(&rec(200), SpoolClass::Critical, "t").is_ok() {
             n += 1;
             assert!(n < 100);
         }
